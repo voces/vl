@@ -27,6 +27,7 @@ import {
   TyArray,
   TyFunc,
   TyObj,
+  TyVar,
   bindGenWalk,
   blockHasBareReturn,
   canonEmitName,
@@ -48,6 +49,7 @@ import {
   nodeTyMapName,
   nodeTyName,
   nodeTyNestedElemIsBoolPrim,
+  nodeTyWidenedRepName,
   recordClonedIsVarTy,
   recordClonedIsVarTyIx,
   recordClonedNodeTy,
@@ -1134,6 +1136,120 @@ function monoSubstLetType(
   letType
 }
 
+// The instance's closure-pinned parameters, name beside concrete type. Module state around
+// the `monoCloneBody` call, like `monoInstIsFirst`: the shared body carries the checker's
+// inference hole for such a parameter, so only the frame being cloned names the closure.
+let monoCloPinNames: string[] = []
+let monoCloPinTys: i32[] = []
+
+// The concrete function type expression `ix` names by reading a closure-pinned parameter,
+// or -1. Matched on the parameter's name, like the inferred-return-list rung beside it,
+// with the shadow guard that name matching needs.
+function monoCloPinTyOfExpr(ix: i32): i32 {
+  if ix < 0 { return -1 }
+  const rd = unwrapParen(ix)
+  if rd < 0 || rd >= P.nodes.length { return -1 }
+  const e = P.nodes[rd]
+  if e is Ident {
+    // A read the checker typed is not this parameter: a body-local binding shadowing the
+    // name resolves to its own concrete type, and only the un-annotated parameter is left
+    // the inference hole. Without this test the name match reached a shadow and annotated
+    // an i32 list as a closure one — check-clean invalid wasm.
+    const rt = nodeTyIxOf(rd)
+    if rt >= 0 {
+      const rtt = T.tys[rt]
+      if !(rtt is TyVar) { return -1 }
+    }
+    let i = 0
+    while i < monoCloPinNames.length {
+      if monoCloPinNames[i] == e.identName { return monoCloPinTys[i] }
+      i = i + 1
+    }
+  }
+  -1
+}
+
+// One field's type spelling for the shape annotation below: the pinned closure where the
+// value reads one, else the type the checker recorded. "" declines the whole annotation,
+// since a shape missing one field's spelling is not a shape.
+function monoCloPinFieldTyName(ix: i32): string {
+  const pt = monoCloPinTyOfExpr(ix)
+  if pt >= 0 { return tyToEmitName(pt) }
+  // A literal-typed value widens to its base scalar, the rep the field stores: an annotation
+  // spelling the literal itself names a type the field's own value does not lower as.
+  const wn = nodeTyWidenedRepName(ix)
+  if wn != "" { return wn }
+  const rt = nodeTyIxOf(ix)
+  if rt < 0 { return "" }
+  tyToEmitName(rt)
+}
+
+// The initializer node a container rung may read, or -1: this instance must bind a pin at
+// all, and the node must be in range. The shared entry of the two rungs below.
+function monoCloPinInitNode(initIx: i32): i32 {
+  if initIx < 0 { return -1 }
+  if monoCloPinNames.length == 0 { return -1 }
+  const rd = unwrapParen(initIx)
+  if rd < 0 || rd >= P.nodes.length { return -1 }
+  rd
+}
+
+// The array annotation an un-annotated LIST literal over closure-pinned parameters owes:
+// `[a]` becomes `((i32) => i32)[]`. Without it the element types i32 and the list's read is
+// not a callable. -1 when any element does not pin, since one literal is one row (D1664).
+function monoCloPinListAnn(initIx: i32): i32 {
+  const rd = monoCloPinInitNode(initIx)
+  if rd < 0 { return -1 }
+  const e = P.nodes[rd]
+  if e is ArrayLit {
+    if e.arrElems.length < 1 { return -1 }
+    let ety = -1
+    let i = 0
+    while i < e.arrElems.length {
+      const et = monoCloPinTyOfExpr(e.arrElems[i])
+      if et < 0 { return -1 }
+      if ety < 0 { ety = et }
+      else if ety != et { return -1 }
+      i = i + 1
+    }
+    const en = tyToEmitName(ety)
+    if en == "" { return -1 }
+    return synthTypeRef("(" + en + ")[]", 0 - 1)
+  }
+  -1
+}
+
+// Its object-literal twin, a rung of its own because the annotation is built from a
+// different grammar — a field list, each field spelled in turn, not one element type. At
+// least one field must pin, or an unrelated literal gains an annotation it never had.
+function monoCloPinShapeAnn(initIx: i32): i32 {
+  const rd = monoCloPinInitNode(initIx)
+  if rd < 0 { return -1 }
+  const e = P.nodes[rd]
+  if e is ObjLit {
+    if e.objFields.length < 1 { return -1 }
+    let anyPin = false
+    let txt = "{"
+    let j = 0
+    while j < e.objFields.length {
+      const f = P.nodes[e.objFields[j]]
+      if f is FieldInit {
+        if monoCloPinTyOfExpr(f.fiValue) >= 0 { anyPin = true }
+        const ftn = monoCloPinFieldTyName(f.fiValue)
+        if ftn == "" { return -1 }
+        if j > 0 { txt = txt + ", " }
+        txt = txt + f.fiName + ": " + ftn
+      } else {
+        return -1
+      }
+      j = j + 1
+    }
+    if !anyPin { return -1 }
+    return synthTypeRef(txt + "}", 0 - 1)
+  }
+  -1
+}
+
 // Clone a monomorphized instance's body, substituting every `LetDecl` type-param
 // annotation through the binding. Only the statement spine is rebuilt; every leaf
 // expression, a nested lambda included, is shared, so no new function node is created.
@@ -1189,6 +1305,10 @@ function monoCloneBody(
         }
       }
     }
+    // The closure-pin rungs, for the same reason and at the same moment: an un-annotated
+    // container over a pinned parameter has no other source for its element type (D1664).
+    if nt < 0 { nt = monoCloPinListAnn(n.letInit) }
+    if nt < 0 { nt = monoCloPinShapeAnn(n.letInit) }
     if nt == n.letType { return ix }
     return mkLet(n.letKw, n.letName, nt, n.letInit, n.pos)
   }
@@ -3445,6 +3565,26 @@ function monoMakeInstance(
     let instFe = origFe
     if count > 0 { instName = fn.fnName + "$" + i32ToStr(count) }
     const noTyParams: string[] = []
+    // The closure-pinned parameter column this instance binds, read by the body clone's
+    // container rung. Rebuilt per instance, since the pin is what differs between them.
+    monoCloPinNames = []
+    monoCloPinTys = []
+    let cp = 0
+    while cp < params.length {
+      const cpp = P.nodes[params[cp]]
+      if cpp is Param {
+        if cp < pinKinds.length && cp < pinTys.length {
+          if pinKinds[cp] == PIN_SIGKEY && pinTys[cp] >= 0 {
+            const cpt = T.tys[pinTys[cp]]
+            if cpt is TyFunc {
+              monoCloPinNames.push(cpp.parName)
+              monoCloPinTys.push(pinTys[cp])
+            }
+          }
+        }
+      }
+      cp = cp + 1
+    }
     // Substitute type-param annotations in the body's `LetDecl`s for this instance (a
     // `const out: T[]` becomes `const out: f64[]`); shares the body wholesale when it has
     // no such annotation.
