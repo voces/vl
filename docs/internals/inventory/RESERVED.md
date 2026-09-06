@@ -41,6 +41,6 @@ D1670-D1679  vl-c3  2026-09-05  coordinator lanes 2026-09-05 night (D1667-D1669 
 D1700-D1709  vl-c3  2026-09-06  coordinator lanes 2026-09-06 (arena-reader twin of D1696, D1697 list-of-list key, D1692 declaration refusal, D1686/D1687 residues)
 D1710-D1719  vl-c3  2026-09-06  coordinator lanes 2026-09-06 (D1707/D1708 predictions, D1686/D1687 covariant residues, D1680 nullable map, later residues)
 D1720-D1729  vl-c3  2026-09-06  coordinator lanes 2026-09-06 morning (optchain D1677/D1681 residues, D1686/D1687 covariant residues, D1712/D1680 rulings, later residues)
-D1730-D1739  vl-c3  2026-09-06  coordinator lanes 2026-09-06 (index-place narrowing residues, const-subscript place rule, string-list .get, later residues)
 D1740-D1749  vl-c3  2026-09-06  coordinator lanes 2026-09-06 (D1732 '+' floor, D1733 if-join at print, D1720/D1723/D1734 residues, later residues)
 D1750-D1759  vl-c3  2026-09-06  next lanes (D1664/D1665, D1733 route, residues)
+D1760-D1779  vl-c3  2026-09-06  fix and discovery lanes, 2026-09-06 afternoon

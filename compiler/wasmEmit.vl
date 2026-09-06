@@ -627,6 +627,7 @@ import {
   globalNameIsNonConst,
   globalNameIsNonConstSid,
   globalNulListCellRead,
+  identCellSlot,
   identCellVKind,
   identChainTyBoxedUnion,
   identChainTyMapArmUnion,
@@ -7188,12 +7189,19 @@ function emitMapRecvKey(body: i32[], recvIx: i32, keyIx: i32, fnIx: i32) {
   // The KEY expression must match the receiver's key rep. The checker proves the pair
   // agrees, so a mismatch here means the receiver's shape resolved wrong — reject
   // loudly rather than emit a string ref into an i32 keys array (invalid wasm).
+  let keyAtom = false
   if mapShapeKeyI32(mshape) {
     if exprString(keyIx, fnIx) {
       return emitFail("emitProgram: i32-keyed map indexed with a string key")
     }
   } else if !exprString(keyIx, fnIx) {
-    return emitFail("emitProgram: map key is not a string")
+    // An atom-repped literal-union key is a string VALUE whose rep is the interned id, so it is
+    // widened to its member text at the boundary rather than refused — the same widen `print`
+    // performs, through the one home both consumers share (D1724).
+    if !exprIsLitAtom(keyIx, fnIx) {
+      return emitFail("emitProgram: map key is not a string")
+    }
+    keyAtom = true
   }
   // The receiver expr is emitted OUTSIDE the context (it is map-op-free by
   // construction — an Ident/global/constructor).
@@ -7204,7 +7212,12 @@ function emitMapRecvKey(body: i32[], recvIx: i32, keyIx: i32, fnIx: i32) {
   // op in the key expression also clobbers `cmSlot`, so pin it afterwards.
   const savedKeyLU = pendingLitUnion
   pendingLitUnion = 0
-  const kr = emitExpr(body, keyIx, fnIx)
+  let kr = 0
+  if keyAtom {
+    kr = emitAtomToStr(body, keyIx, fnIx)
+  } else {
+    kr = emitExpr(body, keyIx, fnIx)
+  }
   pendingLitUnion = savedKeyLU
   if kr < 0 { return -1 }
   cmSlot = mshape
@@ -14757,8 +14770,22 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
       if nulNicheRecoverOwed(identCellVKind(lhsIx, fnIx), a.binRight, fnIx) {
         fbRefAsNonNull()
       }
-      // A narrowed union arm arrives here as its box and is stored whole: this boundary has
-      // no unbox, where the binding and the argument ones do. D1685 carries the gap.
+      // the narrowed-arm unbox at the ASSIGNMENT boundary, the binding boundary's twin: the
+      // destination cell's own `(kind, slot)` columns are the destination, read through the
+      // slot rather than the expression's type — the cell is a `variant` for an inferred
+      // union's arm and `structIndexOfExpr` answers -1 for it (D1685).
+      if narrowedArmNeedsUnbox(a.binRight, fnIx) {
+        const asgSlot = identCellSlot(lhsIx)
+        if (
+          asgSlot >= 0 &&
+          asgSlot < localIsRef.length &&
+          asgSlot < localStructIdx.length
+        ) {
+          emitNarrowedArmUnboxTo(
+            armDestHeapOf(localIsRef[asgSlot], localStructIdx[asgSlot]),
+          )
+        }
+      }
       fbLocalSet(idx) // 0x21 local.set
       return 0
     }
@@ -14954,6 +14981,16 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
         if emitStrValue(body, a.binRight, fnIx) < 0 { return -1 }
       } else {
         if emitExpr(body, a.binRight, fnIx) < 0 { return -1 }
+      }
+      // the narrowed-arm unbox at the ELEMENT-assignment boundary, the binding boundary's
+      // twin one container over: the element's own variant or struct row is where the arm
+      // lands, and those two seeds are what the value emits under (D1685).
+      if narrowedArmNeedsUnbox(a.binRight, fnIx) {
+        if storeVariantIdx >= 0 {
+          emitNarrowedArmUnboxTo(armDestHeapOf("variant", storeVariantIdx))
+        } else if storeStructIdx >= 0 {
+          emitNarrowedArmUnboxTo(armDestHeapOf("struct", storeStructIdx))
+        }
       }
       pendingStructIdx = -1
       pendingVariantIdx = savedSVI

@@ -100,9 +100,12 @@ PY
 : > "$OUT/results.txt"
 for f in "$OUT"/cells/*.vl; do
   "$VL" check --codegen "$f" --compiler "$COMP" >/dev/null 2>&1 && c=0 || c=$?
-  out="$("$VL" run "$f" --compiler "$COMP" 2>&1 || true)"
+  # OK is decided by the EXIT CODE, not by the absence of an "Error:" line: a run the box
+  # killed under load prints nothing, matched no pattern and scored OK, so the grid reported
+  # a cell as passing that had not run. Seen as 163/98 once against 162/99 twice, same seed.
+  out="$("$VL" run "$f" --compiler "$COMP" 2>&1)" && rc=0 || rc=$?
   if printf '%s' "$out" | grep -q "Invalid input WebAssembly\|index outside the bounds"; then k=BAD
-  elif printf '%s' "$out" | grep -q "^Error:"; then k=REJECT
+  elif [ "$rc" -ne 0 ]; then k=REJECT
   else k=OK; fi
   printf '%s\t%s\tcheck=%s\n' "$k" "$(basename "$f" .vl)" "$c" >> "$OUT/results.txt"
 done
