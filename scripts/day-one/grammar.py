@@ -303,6 +303,12 @@ AXES = [
     # function, which no single-file plan can express. D1593 / D1595 / D1596.
     {"id": "modules_split", "weight": 5, "faces": ["single", "split"],
      "generator": "modules"},
+    # ONE std import vs TWO in the same module. Also a `generator` axis, and for the same
+    # reason: what it varies is the IMPORT LIST, which no plan drawn above has. D1514 is
+    # the shape — `std:fs` 18 ms alone, `std:array` 40 ms alone, both together 5,006 ms —
+    # and a one-import benchmark cannot see it. `imports.py`.
+    {"id": "imports_pair", "weight": 4, "faces": ["alone", "together"],
+     "generator": "imports"},
 ]
 
 AXIS_IDS = [a["id"] for a in AXES]

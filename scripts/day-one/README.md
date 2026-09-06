@@ -13,7 +13,8 @@ This directory generates that population instead of writing it.
     python3 scripts/day-one/minimise.py run.jsonl
     python3 scripts/day-one/file_row.py run.jsonl --index 7 --title "…"
     python3 scripts/day-one/sample.py --replay run.jsonl     # the regression half
-    python3 scripts/day-one/sample.py --control              # the five controls
+    python3 scripts/day-one/sample.py --imports-report run.jsonl   # D1514's timing shape
+    python3 scripts/day-one/sample.py --control              # the controls
 
 Full rationale, the axes, what it cannot sample, and the first sample's numbers:
 **`docs/internals/day-one-sampler.md`**.
@@ -37,8 +38,9 @@ never reached.
 | --- | --- |
 | `grammar.py` | the ordinary shapes, as DATA — values, reads, positions, sources, scopes, scenery, axes |
 | `modules.py` | the `modules_split` axis's OWN grammar — one program as one file and as two |
+| `imports.py` | the `imports_pair` axis's OWN grammar — one std import against two in a module |
 | `render.py` | plan + axis faces → one program; `make_pair` is the unit |
-| `sample.py` | draw, grade, tabulate, JSONL, `--replay`, `--control`, `--report` |
+| `sample.py` | draw, grade, tabulate, JSONL, `--replay`, `--control`, `--report`, `--imports-report` |
 | `minimise.py` | greedy line removal to a minimal witness, then ablation BY AXIS |
 | `file_row.py` | a minimal witness → an inventory row draft + a standing capability probe |
 
@@ -47,10 +49,16 @@ cell and a hand-written probe are read on one scale.
 
 ## The controls are SYNTHETIC, on purpose
 
-`--control` grades five pairs. Three are synthetic and rest on rules the design will always
+`--control` grades eleven pairs. Four are synthetic and rest on rules the design will always
 enforce — a type error, a bounds-checked index, an exact output contract — and they are what
-prove the sampler can still SEE and CLASSIFY a disagreement. Two are closed rows (D1473,
-D1500) kept as AGREE pins.
+prove the sampler can still SEE and CLASSIFY a disagreement. The rest are AGREE pins: closed
+rows (D1473, D1500, D1593, D1595, D1596) and one per generator axis, proving its renderer
+still builds both faces.
+
+**AN AGREE PIN'S CONTRACT IS WRITTEN OUT, NEVER TAKEN FROM THE RENDERER IT PINS.** The
+`imports_pair` pin first read its `want` from the same `render` call it was grading, and a
+sabotage that made the two-import face drop its second import passed — both faces rendered
+the same program AND the same expectation. Spelled by hand, the same sabotage names it.
 
 **A control built on a live defect evaporates the day the defect is fixed.** This suite used
 D1473 for liveness, D1473 closed two days later, its pair started grading `AGREE`, and the
@@ -68,10 +76,17 @@ delegates to `modules.make_pair`, and its split face is one source string carryi
 `// file:` markers — the same spelling `scripts/check-filed-witnesses.py` grades a two-file
 witness with, so a hit can be pasted into an inventory row without being re-typed.
 
+`imports_pair` is the second, and what it varies is the IMPORT LIST: one std module against
+two in the same file (D1514 — `std:fs` 18 ms alone, `std:array` 40 ms alone, both together
+5,006 ms). Its TIMING half needs a third program, the second module ALONE, which no pair can
+carry — so `--imports-report` re-renders alone(A), alone(B) and together(A,B) from a saved
+sample's spec, times `vl build` on each, and flags a pair above 3× the sum.
+
 ## Adding to the grammar
 
 Add a record to `VALUES`, `SOURCES`, `POSITIONS`, `SCOPES` or `SCENERY` — or to `modules.py`'s
-`UNITS` / `REPORTS` — nothing else needs touching, and `tests/vl_day_one_sampler_test.ts`
+`UNITS` / `REPORTS`, or to `imports.py`'s `MODULES` — nothing else needs touching, and
+`tests/vl_day_one_sampler_test.ts`
 will tell you if an axis you add cannot be generated. Weight toward what a TUTORIAL would contain: the 1-in-20 rate came
 from programs written to be ordinary, and the hit was the most textbook shape in the
 batch. A grammar that optimises for coverage of the type lattice drifts exotic and the
