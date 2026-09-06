@@ -243,6 +243,7 @@ import {
   memberPathKeyOf,
   moduleBindsLoopVar,
   moduleLocalLetOf,
+  moduleLocalLetOfUnique,
   nameIsBareMap,
   nameIsClosureArray,
   nameIsClosureArrayTy,
@@ -1689,6 +1690,26 @@ export function nulVariantIdxOfExpr(exprIx: i32, fnIx: i32) {
         return nulVariantIdxOfExpr(g.letInit, -1)
       }
     }
+    // The frame's own `let`, and the module frame's, last for the reason the rung above them
+    // is not enough: neither storage class is a global, and the declared-locals table that
+    // would answer speaks only while that frame's body is emitted (D1635). Read in the frame
+    // that OWNS the binding, so a nested initialiser resolves where it is written.
+    const fli = frameLetOf(fnIx, e.identName)
+    if fli >= 0 { return nulVariantIdxOfLetIn(fli, fnIx) }
+    const mli = moduleLocalLetOfUnique(emitRootIx, e.identName)
+    if mli >= 0 { return nulVariantIdxOfLetIn(mli, -1) }
+  }
+  -1
+}
+
+// The nullable-variant row a `LetDecl` binds, read in the frame `ownerIx` that owns it — the
+// annotation, else the initializer. The shared tail of `nulVariantIdxOfExpr`'s three binding
+// rungs, so a global, a frame `let` and a module-frame `let` cannot answer from three ladders.
+function nulVariantIdxOfLetIn(letIx: i32, ownerIx: i32) {
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 { return nulVariantIndexOf(d.letType) }
+    return nulVariantIdxOfExpr(d.letInit, ownerIx)
   }
   -1
 }
@@ -22797,6 +22818,14 @@ export function exprNullableVariant(exprIx: i32, fnIx: i32) {
         return exprNullableVariant(g.letInit, -1)
       }
     }
+    // The frame's own `let` and the module frame's, arm for arm with `nulVariantIdxOfExpr`'s
+    // legs: a kind without its row is `ref valtype with no interned shape`, so the two land
+    // together (D21). Neither storage class is a global, and the declared-locals table that
+    // would answer speaks only while that frame's body is emitted (D1635).
+    const fli = frameLetOf(fnIx, e.identName)
+    if fli >= 0 { return nulVariantOfLetIn(fli, fnIx) }
+    const mli = moduleLocalLetOfUnique(emitRootIx, e.identName)
+    if mli >= 0 { return nulVariantOfLetIn(mli, -1) }
     return false
   }
   // A nested-shape field read whose target is a union arm — the arm this twin never had,
@@ -22836,6 +22865,18 @@ export function exprNullableVariant(exprIx: i32, fnIx: i32) {
       return mvValVariantOf(crv) >= 0 &&
         coalesceStaysNullable(exprIx, crv, fnIx)
     }
+  }
+  false
+}
+
+// Whether a `LetDecl` binds the nullable-variant niche, read in the frame `ownerIx` that
+// owns it — the annotation, else the initializer. The kind half of `nulVariantIdxOfLetIn`,
+// so a frame `let` and a module-frame `let` answer the pair from one ladder.
+function nulVariantOfLetIn(letIx: i32, ownerIx: i32) {
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 { return retNulVariantFlag(d.letType) == 1 }
+    return exprNullableVariant(d.letInit, ownerIx)
   }
   false
 }
@@ -23857,6 +23898,14 @@ export function structIndexOfExpr(exprIx: i32, fnIx: i32) {
     if fli >= 0 && !letIsVariant(fli, fnIx) {
       return structIndexOfLet(fli, fnIx)
     }
+    // The module frame's own `let`, which the leg above cannot reach: a module-scope BLOCK
+    // binding is no frame's `fnBody` and no global. Annotated only — an initializer resolves
+    // against the frame it is written in, so reading one from outside can name a row other
+    // than the local's, while an annotation reads the same anywhere (D1636).
+    const mli = moduleLocalLetOfUnique(emitRootIx, e.identName)
+    if mli >= 0 && letHasAnnotation(mli) && !letIsVariant(mli, -1) {
+      return structIndexOfLet(mli, -1)
+    }
     -1
   }
   // `xs[i]` over a struct-element ref list yields that list's element struct. The
@@ -23972,6 +24021,15 @@ export function structIndexOfExpr(exprIx: i32, fnIx: i32) {
     }
   }
   -1
+}
+
+// True if the `LetDecl` at `letIx` carries a type annotation — the frame-independent half of
+// a binding. Its initializer resolves against the frame it is written in; the annotation
+// reads the same from anywhere, which is what a cross-frame resolver may rely on.
+function letHasAnnotation(letIx: i32) {
+  const d = P.nodes[letIx]
+  if d is LetDecl { return d.letType >= 0 }
+  false
 }
 
 // The struct table index a struct-typed `LetDecl` binds: from its annotation if
@@ -31089,6 +31147,10 @@ function calleeCloSigKeySid(sid: i32, fnIx: i32) {
     if cfn is FuncDecl { letIx = parentLetOfSid(cfn.fnBody, csid) }
   }
   if letIx < 0 { letIx = globalLetOfSidIn(fnIx, csid) }
+  // The module frame, the third scope this ladder must reach, exactly as `identClosureFeSid`
+  // reaches it (D1350): a binding in a module-scope BLOCK lives in no `fnBody` and is not a
+  // global. The unique reader, since a sig chosen off the first of two same-named blocks is D1596.
+  if letIx < 0 { letIx = moduleLocalLetOfUnique(emitRootIx, name) }
   if letIx >= 0 {
     const cd = P.nodes[letIx]
     if cd is LetDecl {
@@ -31097,10 +31159,20 @@ function calleeCloSigKeySid(sid: i32, fnIx: i32) {
         if cty >= 0 {
           const ct = T.tys[cty]
           if ct is TyFunc { return sigKeyOfTy(cty) }
+          // The nullable twin (`letInitTyIsNulFunc`'s shape): a bare `const t = m[k]` read of
+          // a function-valued map records `TyFunc | null`, and the narrowed call runs at the
+          // inner signature — so the key is the inner's, not "" (D1662).
+          if ct is TyNullable { return sigKeyOfTy(ct.nInner) }
         }
       }
     }
   }
+  // The capture channel, last: a captured callee's binding lives in an ENCLOSING frame, which
+  // none of the rungs above asks about — they read `fnIx`'s own params and body, the globals
+  // registry and the module frame. Re-asked against the frame that owns the binding, so a
+  // captured void closure resolves its `>v` sig and its call stays a statement (D1634).
+  const cowner = capturedBindingFrameOf(fnIx, name)
+  if cowner >= 0 && cowner != fnIx { return calleeCloSigKeySid(sid, cowner) }
   ""
 }
 
