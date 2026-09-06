@@ -61,6 +61,16 @@ section. Its witness above no longer reproduces: `stash(cats, …)` is a loud re
 #1456's width gate. What survives it is the union-widening family, which is check-clean invalid wasm
 and is a REPRESENTATION gap, not a variance one.
 
+**STATUS 2026-09-06: the F2 witness the two entries below cite as "confirmed live at HEAD" no
+longer reproduces either.** Re-run verbatim (`type K = "aa" | "bb"; const x: K | f64 = "aa"; if
+x is K { const y: K = x; print(y) }`): `vl check` rc 0, `vl run` rc 0, prints `aa` — where both
+entries' "Cost of waiting" sections say `vl build` should fail `type mismatch: expected i32,
+found (ref $type)`. Confirmed pre-existing rather than part of this sweep's own PR range (the
+same program also runs clean against the compiler built from `13ae7ff3d`, one commit before this
+review's batch, using the current seed as bootstrap). F1 and F3 were not re-run. Whoever owns
+litunion work should re-derive both `A16-*` entries below before scheduling either ruling — the
+"16 INVALID-WASM cells" population they price may be smaller or gone.
+
 ### A16-tag-scheme-kind-vs-band
 
 **A16 §7.1 — the litunion tag scheme: a 14th value-atom kind, or a third slot band (an ABI-wide tag re-base)**  
@@ -130,6 +140,14 @@ accepted and ignored on a numeric cast today (D1041), and the build item with it
 migrate-`as!`-first sequencing is in ROADMAP §Next. The filing below is kept as it was
 verified; the diagnostic half of the ask (a source-located trap message for `as!`) still
 stands as part of the build.
+
+**STATUS 2026-09-06: `as%` IS BUILT — re-run on the current seed.** `x as% i32` over an
+integer source wraps (`(4294967296 + 5) as% i32` prints `5`); over a float source it is a
+loud checker refusal (`` `as%` wraps between integer widths, and f64 is a float — use the
+exact family ``), not a silent ignore. Closed by #2542 (2026-09-04, "`x as% T` — the wrap
+cast, the fourth member of the `as` family"), which predates this sweep's own PR range but
+was caught re-running this entry's own claim. The diagnostic half (a source-located `as!`
+trap message) was not re-verified here.
 
 **Out-of-range `f64 as i32` — trap, saturate, or wrap** (as filed)  
 `/workspace/ROADMAP.md:748-754`
