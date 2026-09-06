@@ -9255,6 +9255,48 @@ export function optChainStructIdxOf(exprIx: i32, fnIx: i32) {
   structIndexOfExpr(exprIx, fnIx)
 }
 
+// True if `exprIx` is a re-readable place — a bare name, or a `.`/`?.` chain bottoming out
+// in a name. Such a receiver is an effect-free `local.get`/`struct.get` sequence, so a `?.`
+// lowering may emit it twice; anything else is staged once (`optChainStagesRecv`).
+export function optRecvReReadable(exprIx: i32) {
+  const e = P.nodes[unwrapParen(exprIx)]
+  if e is Ident { return true }
+  if e is Member { return optRecvReReadable(e.memObj) }
+  if e is OptMember { return optRecvReReadable(e.omObj) }
+  // The default is named, not fallen through: see `optRecvNotAPlace`.
+  optRecvNotAPlace()
+}
+
+// Every `Node` kind `optRecvReReadable`'s ladder does not test, as one answer: not a place.
+// A call, an index, an operator and a literal are all VALUES, so a second emission of one
+// recomputes it — cheaply for a literal, observably for a call. Fails closed on purpose: an
+// unclassified kind is staged rather than re-emitted.
+function optRecvNotAPlace(): boolean { false }
+
+// The bottom of the `?.` chain at `exprIx` — the receiver that is not itself a `?.`, and the
+// only arbitrary expression in the chain (every link above it is a `struct.get`). -1 when
+// `exprIx` is no chain at all.
+export function optChainBaseOf(exprIx: i32) {
+  const inner = unwrapParen(exprIx)
+  if inner < 0 { return -1 }
+  const e = P.nodes[inner]
+  if e is OptMember {
+    const b = optChainBaseOf(e.omObj)
+    if b >= 0 { return b }
+    return unwrapParen(e.omObj)
+  }
+  -1
+}
+
+// Is the node at `ix` a `?.` whose chain base must be STAGED — evaluated once into
+// `optRecvSlot` — because it is not a re-readable place? One home for the question, so the
+// slot reserved and the code emitted cannot disagree (D1671).
+export function optChainStagesRecv(ix: i32): boolean {
+  const b = optChainBaseOf(ix)
+  if b < 0 { return false }
+  !optRecvReReadable(b)
+}
+
 // The value-atom kind the concrete (non-box) side of a union `==` compares under — the
 // same ladder `emitUnionCoerce` uses — or -1 when the operand has no atom rep (a struct,
 // a map, a void call). -1 is a real "cannot classify" answer, never an in-band `"i32"`
@@ -10132,20 +10174,37 @@ function exprIsMultiFieldReboxCall(exprIx: i32, fnIx: i32): boolean {
   structIdxHasReboxVariant(ssi)
 }
 
-// Whether the tree at `ix` contains a multi-field struct-returning call that must be
-// re-boxed into a variant-box union arm (`exprIsMultiFieldReboxCall`), so the function
-// reserves `variantReboxSlot`. Mirrors `blockHasCallRef`'s traversal; under-reservation
-// fails loudly (never invalid wasm), so exact flow-position matching isn't needed.
-export function blockHasVariantRebox(ix: i32, fnIx: i32): boolean {
+// The two `(ref null struct)` stashes a frame may need, each asked of one node by
+// `stashHitAt`: a multi-field struct call re-boxed into a variant arm, and a `?.` chain
+// base that is not re-readable. One traversal answers both, so a node kind taught to the
+// walk cannot reach one reservation and miss the other (D1667).
+export type StashWant = "rebox" | "optrecv"
+
+// Does the single node at `ix` need the stash `want` names?
+function stashHitAt(ix: i32, fnIx: i32, want: StashWant): boolean {
+  match want {
+    "rebox" => {
+      return exprIsMultiFieldReboxCall(ix, fnIx)
+    }
+    "optrecv" => {
+      return optChainStagesRecv(ix)
+    }
+  }
+}
+
+// Whether the tree at `ix` holds a node needing the `want` stash, so the function reserves
+// its slot. Mirrors `blockHasCallRef`'s traversal; under-reserving the rebox slot fails
+// loudly and the `?.` one is invalid wasm, so the walk over-approximates for both.
+export function blockHasStash(ix: i32, fnIx: i32, want: StashWant): boolean {
   if ix < 0 { return false }
-  if exprIsMultiFieldReboxCall(ix, fnIx) { return true }
+  if stashHitAt(ix, fnIx, want) { return true }
   const n = P.nodes[ix]
   if n is Call {
-    if blockHasVariantRebox(n.callFn, fnIx) { return true }
+    if blockHasStash(n.callFn, fnIx, want) { return true }
     const args = n.callArgs
     let i = 0
     while i < args.length {
-      if blockHasVariantRebox(args[i], fnIx) { return true }
+      if blockHasStash(args[i], fnIx, want) { return true }
       i = i + 1
     }
     return false
@@ -10154,53 +10213,56 @@ export function blockHasVariantRebox(ix: i32, fnIx: i32): boolean {
     const stmts = n.blkStmts
     let i = 0
     while i < stmts.length {
-      if blockHasVariantRebox(stmts[i], fnIx) { return true }
+      if blockHasStash(stmts[i], fnIx, want) { return true }
       i = i + 1
     }
     return false
   }
   if n is LetDecl {
-    if n.letInit >= 0 { return blockHasVariantRebox(n.letInit, fnIx) }
+    if n.letInit >= 0 { return blockHasStash(n.letInit, fnIx, want) }
     return false
   }
   if n is RetStmt {
-    if n.retArg >= 0 { return blockHasVariantRebox(n.retArg, fnIx) }
+    if n.retArg >= 0 { return blockHasStash(n.retArg, fnIx, want) }
     return false
   }
   if n is IfStmt {
-    if blockHasVariantRebox(n.ifCond, fnIx) { return true }
-    if blockHasVariantRebox(n.ifThen, fnIx) { return true }
-    if n.ifElse >= 0 { return blockHasVariantRebox(n.ifElse, fnIx) }
+    if blockHasStash(n.ifCond, fnIx, want) { return true }
+    if blockHasStash(n.ifThen, fnIx, want) { return true }
+    if n.ifElse >= 0 { return blockHasStash(n.ifElse, fnIx, want) }
     return false
   }
   if n is WhileStmt {
-    if blockHasVariantRebox(n.whileCond, fnIx) { return true }
-    return blockHasVariantRebox(n.whileBody, fnIx)
+    if blockHasStash(n.whileCond, fnIx, want) { return true }
+    return blockHasStash(n.whileBody, fnIx, want)
   }
   if n is ForRange {
-    if blockHasVariantRebox(n.frFrom, fnIx) { return true }
-    if blockHasVariantRebox(n.frTo, fnIx) { return true }
+    if blockHasStash(n.frFrom, fnIx, want) { return true }
+    if blockHasStash(n.frTo, fnIx, want) { return true }
     if n.frStep >= 0 {
-      if blockHasVariantRebox(n.frStep, fnIx) { return true }
+      if blockHasStash(n.frStep, fnIx, want) { return true }
     }
-    return blockHasVariantRebox(n.frBody, fnIx)
+    return blockHasStash(n.frBody, fnIx, want)
   }
   if n is ForIn {
-    if blockHasVariantRebox(n.fiIter, fnIx) { return true }
-    return blockHasVariantRebox(n.fiBody, fnIx)
+    if blockHasStash(n.fiIter, fnIx, want) { return true }
+    return blockHasStash(n.fiBody, fnIx, want)
   }
   if n is BinExpr {
-    if blockHasVariantRebox(n.binLeft, fnIx) { return true }
-    return blockHasVariantRebox(n.binRight, fnIx)
+    if blockHasStash(n.binLeft, fnIx, want) { return true }
+    return blockHasStash(n.binRight, fnIx, want)
   }
-  if n is Unary { return blockHasVariantRebox(n.unArg, fnIx) }
-  if n is Paren { return blockHasVariantRebox(n.parInner, fnIx) }
-  if n is IsExpr { return blockHasVariantRebox(n.isObj, fnIx) }
-  if n is AsExpr { return blockHasVariantRebox(n.asObj, fnIx) }
-  if n is Member { return blockHasVariantRebox(n.memObj, fnIx) }
+  if n is Unary { return blockHasStash(n.unArg, fnIx, want) }
+  if n is Paren { return blockHasStash(n.parInner, fnIx, want) }
+  if n is IsExpr { return blockHasStash(n.isObj, fnIx, want) }
+  if n is AsExpr { return blockHasStash(n.asObj, fnIx, want) }
+  if n is Member { return blockHasStash(n.memObj, fnIx, want) }
+  // A `?.` RECEIVER is lowered exactly as a `.` one is, so a stash needed under it belongs
+  // to the enclosing frame (D1667).
+  if n is OptMember { return blockHasStash(n.omObj, fnIx, want) }
   if n is Index {
-    if blockHasVariantRebox(n.idxArr, fnIx) { return true }
-    return blockHasVariantRebox(n.idxIndex, fnIx)
+    if blockHasStash(n.idxArr, fnIx, want) { return true }
+    return blockHasStash(n.idxIndex, fnIx, want)
   }
   if n is ObjLit {
     const fields = n.objFields
@@ -10208,7 +10270,7 @@ export function blockHasVariantRebox(ix: i32, fnIx: i32): boolean {
     while i < fields.length {
       const f = P.nodes[fields[i]]
       if f is FieldInit {
-        if blockHasVariantRebox(f.fiValue, fnIx) { return true }
+        if blockHasStash(f.fiValue, fnIx, want) { return true }
       }
       i = i + 1
     }
@@ -10218,12 +10280,18 @@ export function blockHasVariantRebox(ix: i32, fnIx: i32): boolean {
     const elems = n.arrElems
     let i = 0
     while i < elems.length {
-      if blockHasVariantRebox(elems[i], fnIx) { return true }
+      if blockHasStash(elems[i], fnIx, want) { return true }
       i = i + 1
     }
     return false
   }
   false
+}
+
+// The variant-rebox reservation's own question (`variantReboxSlot`), the walk's first
+// claimant.
+export function blockHasVariantRebox(ix: i32, fnIx: i32): boolean {
+  blockHasStash(ix, fnIx, "rebox")
 }
 
 // The bounds-check frame kind for a scalar list element kind (`scalarListElemKind`
