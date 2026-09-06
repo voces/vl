@@ -4641,7 +4641,7 @@ function writeStorageTy(ix: i32) {
     if !npInsideBarrier(slot) { return -1 }
     const noNames: string[] = []
     const noTys: i32[] = []
-    return placeElemTy(placeCurTy(n.idxArr, noNames, noTys))
+    return placeCellStoreTy(placeCurTy(n.idxArr, noNames, noTys))
   }
   -1
 }
@@ -4941,7 +4941,7 @@ function isNulBoolTy(ty: i32) {
 // and -1 propagates. Nested nullables collapse, since reading a map whose value is already nullable
 // mints `mkNullableTy(T | null)` and a single peel would leave an inner `T?` a narrowed field
 // access rejects. A one-member union around a nullable is not peeled here — the emitter boxes it.
-function nonNullTy(ty: i32) {
+export function nonNullTy(ty: i32) {
   if ty < 0 { return -1 }
   let cur = ty
   while true {
@@ -4993,10 +4993,10 @@ function arrElemValueTy(et: i32): i32 {
   et
 }
 
-// The type of an element read off `baseTy` for narrowing purposes (no diagnostics) —
-// `placeFieldTy`'s index twin. -1 when unresolvable, which is how "no fact" is spelled. Arrays
-// only, and the omission is chosen: a map read is already `V | null` whatever the key, so keying
-// `m[0]` would narrow a nullability the storage never dropped (inventory-2 D451).
+// The type of an element READ off `baseTy` for narrowing purposes (no diagnostics) —
+// `placeFieldTy`'s index twin. -1 when unresolvable, which is how "no fact" is spelled. A map
+// cell reads `V | null` because the key may be absent, and `!= null` proves it present for
+// exactly as long as `callInvalidatesReal`'s remover rule lets the narrowing stand (D1734).
 function placeElemTy(baseTy: i32) {
   if baseTy < 0 { return -1 }
   const bt = T.tys[baseTy]
@@ -5004,7 +5004,53 @@ function placeElemTy(baseTy: i32) {
     if primNameOf(bt.aElem) == "u8" { return -1 }
     return bt.aElem
   }
+  // The other indexable container, which is its own function so this one keeps a single
+  // arm: a map cell's read type is not its storage type, and the two questions differ
+  // enough that a second arm here would read as one rule (D1734).
+  placeMapCellTy(baseTy)
+}
+
+// The map half of `placeElemTy`: a cell READS `V | null`, because the key may be absent, and
+// -1 for a value shape the guarded read cannot honour — a miss that is a numeric zero rather
+// than a `null`, and an OBJECT-shaped value whose narrowed place read is unwired (D1735).
+function placeMapCellTy(baseTy: i32) {
+  const bt = T.tys[baseTy]
+  if bt is TyMap {
+    if mapValMissIsZero(bt.mVal) { return -1 }
+    if mapValIsObjShape(bt.mVal) { return -1 }
+    return mkNullableTy(bt.mVal)
+  }
   -1
+}
+
+// Whether a map whose value type is `vt` MISSES as a numeric zero — the three scalar-backed
+// value reps the emitter cannot hand a `null` back for. The checker's copy of
+// `mapReadNarrowableSlot`'s kind exclusion, kept as a type question so both sides refuse the
+// same cells (D1734).
+function mapValMissIsZero(vt: i32): boolean {
+  const p = primNameOf(vt)
+  p == "f64" || p == "i64" || p == "f32"
+}
+
+// Whether `vt` is object-shaped — an object, or a nullable one, peeled with the checker's own
+// `nonNullTy` rather than a second walk. Such a cell holds a bare ref whose layout the map's
+// slot decides and the guarded read has no rung for it; a nullable SCALAR is a box and reads
+// back fine. The bound is the SHAPE, not "is it a union arm", which the checker cannot say (D1735).
+function mapValIsObjShape(vt: i32): boolean {
+  const core = nonNullTy(vt)
+  if core < 0 { return false }
+  const t = T.tys[core]
+  t is TyObj
+}
+
+// The type an index place STORES, for `writeStorageTy` — an array element as it reads, and a
+// map cell WITHOUT the `| null` its read manufactures for an absent key. One function
+// answering both would widen what `m[k] = …` accepts to include `null` (D1734).
+function placeCellStoreTy(baseTy: i32) {
+  if baseTy < 0 { return -1 }
+  const bt = T.tys[baseTy]
+  if bt is TyMap { return bt.mVal }
+  placeElemTy(baseTy)
 }
 
 // The type of field `prop` read off `baseTy` for narrowing purposes (no diagnostics): an optional

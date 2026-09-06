@@ -38,9 +38,8 @@ D1560-D1579  vl-cb  2026-09-03  glean rows VL-025 (D1560), sampler residue (D156
 D1600-D1619  vl-cb  2026-09-04  glean VL-046 (D1600), the comment sweep's residue rows and follow-ups
 D1628-D1639  vl-cb  2026-09-05  second-pass fix follow-ups
 D1670-D1679  vl-c3  2026-09-05  coordinator lanes 2026-09-05 night (D1667-D1669 clause-1 fixes, D1664/D1665 residues)
-D1680-D1689  vl-c3  2026-09-05  coordinator lanes 2026-09-06 (optchain residues D1676/D1677, covariant residues D1658/D1659, f32/field-arm residues)
 D1700-D1709  vl-c3  2026-09-06  coordinator lanes 2026-09-06 (arena-reader twin of D1696, D1697 list-of-list key, D1692 declaration refusal, D1686/D1687 residues)
 D1710-D1719  vl-c3  2026-09-06  coordinator lanes 2026-09-06 (D1707/D1708 predictions, D1686/D1687 covariant residues, D1680 nullable map, later residues)
 D1720-D1729  vl-c3  2026-09-06  coordinator lanes 2026-09-06 morning (optchain D1677/D1681 residues, D1686/D1687 covariant residues, D1712/D1680 rulings, later residues)
-D1730-D1739  vl-c3  2026-09-06  coordinator lanes 2026-09-06 (index-place narrowing residues, const-subscript place rule, string-list .get, later residues)
 D1740-D1749  vl-c3  2026-09-06  coordinator lanes 2026-09-06 (D1732 '+' floor, D1733 if-join at print, D1720/D1723/D1734 residues, later residues)
+D1750-D1759  vl-c3  2026-09-06  next lanes (D1664/D1665, D1733 route, residues)

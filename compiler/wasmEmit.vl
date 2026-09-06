@@ -473,6 +473,7 @@ import {
 } from "./emit_bytes"
 import {
   annRowOfNode,
+  annValtypeSlotOf,
   anonLeafRetMovedOf,
   anonLeafSupersedeOf,
   arrElemLitUnionTy,
@@ -626,6 +627,7 @@ import {
   globalNameIsNonConst,
   globalNameIsNonConstSid,
   globalNulListCellRead,
+  identCellSlot,
   identCellVKind,
   identChainTyBoxedUnion,
   identChainTyMapArmUnion,
@@ -6040,7 +6042,16 @@ function emitMem(body: i32[], memIx: i32, fnIx: i32) {
   // `memNarrowVariantIndex` lets a multi-variant survivor set reach the dispatch below instead.
   if memIsNarrowed(memIx) {
     if memNarrowVariantIndex(memIx) >= 0 {
-      return emitNarrowedMem(body, memIx, fnIx)
+      // …and only where the receiver IS a box. A place whose declared type is the ARM
+      // itself carries the bare ref, so its narrowing renames the rep rather than changing
+      // it, and unwrapping would read a box the module never built. The same pairing
+      // `narrowedArmNeedsUnbox` makes on the delivery side (D1734).
+      const m0n = P.nodes[memIx]
+      if m0n is Member {
+        if exprUnion(m0n.memObj, fnIx) {
+          return emitNarrowedMem(body, memIx, fnIx)
+        }
+      }
     }
   }
   // A field read on a VARIANT-typed param `o.field` (`o: TyObj`) reads the variant
@@ -14747,6 +14758,22 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
       if nulNicheRecoverOwed(identCellVKind(lhsIx, fnIx), a.binRight, fnIx) {
         fbRefAsNonNull()
       }
+      // the narrowed-arm unbox at the ASSIGNMENT boundary, the binding boundary's twin: the
+      // destination cell's own `(kind, slot)` columns are the destination, read through the
+      // slot rather than the expression's type — the cell is a `variant` for an inferred
+      // union's arm and `structIndexOfExpr` answers -1 for it (D1685).
+      if narrowedArmNeedsUnbox(a.binRight, fnIx) {
+        const asgSlot = identCellSlot(lhsIx)
+        if (
+          asgSlot >= 0 &&
+          asgSlot < localIsRef.length &&
+          asgSlot < localStructIdx.length
+        ) {
+          emitNarrowedArmUnboxTo(
+            armDestHeapOf(localIsRef[asgSlot], localStructIdx[asgSlot]),
+          )
+        }
+      }
       fbLocalSet(idx) // 0x21 local.set
       return 0
     }
@@ -14942,6 +14969,16 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
         if emitStrValue(body, a.binRight, fnIx) < 0 { return -1 }
       } else {
         if emitExpr(body, a.binRight, fnIx) < 0 { return -1 }
+      }
+      // the narrowed-arm unbox at the ELEMENT-assignment boundary, the binding boundary's
+      // twin one container over: the element's own variant or struct row is where the arm
+      // lands, and those two seeds are what the value emits under (D1685).
+      if narrowedArmNeedsUnbox(a.binRight, fnIx) {
+        if storeVariantIdx >= 0 {
+          emitNarrowedArmUnboxTo(armDestHeapOf("variant", storeVariantIdx))
+        } else if storeStructIdx >= 0 {
+          emitNarrowedArmUnboxTo(armDestHeapOf("struct", storeStructIdx))
+        }
       }
       pendingStructIdx = -1
       pendingVariantIdx = savedSVI
@@ -17140,6 +17177,22 @@ function emitReturnValue(body: i32[], retArg: i32, fnIx: i32) {
     // twin. Same slot shape, same unbox owed, a struct row instead of a variant one.
     if retNulRefFlag(fn.fnRet) == 1 {
       retArmHeap = armDestHeapOf("nulstruct", retNulRefIndex(fn.fnRet))
+    }
+    // The plain-struct twin of the two above: `function g(): A` returning a narrowed arm of
+    // an inferred union, whose arm no seed above can find. The annotation's own rep and slot
+    // are the destination, as the parameter's are at the call boundary (D1723).
+    if retArmHeap < 0 && fn.fnRet >= 0 {
+      retArmHeap = armDestHeapOf(
+        vtKindOfType(fn.fnRet),
+        annValtypeSlotOf(fn.fnRet),
+      )
+    }
+    // Its un-annotated twin: the destination is then the classified return pair,
+    // the same `(kind, slot)` the functype's result valtype is emitted from.
+    if retArmHeap < 0 && fn.fnRet < 0 {
+      if fnPos >= 0 && fnPos < fRetKind.length && fnPos < fRetStructIdx.length {
+        retArmHeap = armDestHeapOf(fRetKind[fnPos], fRetStructIdx[fnPos])
+      }
     }
     // An INFERRED variant return (a `.map` lambda collapsing to one variant): seed it from
     // the checker's recorded return shape so the else-arm's `{ … }` literal builds the bare
@@ -20961,6 +21014,10 @@ function emitDirectCall(body: i32[], callIx: i32, fnIx: i32, target: i32) {
     // box `{tag, value}`. Unbox to the param's variant struct — `struct.get $box 1 ; ref.cast
     // (ref $var)` — a statically safe cast since control reached this call only when narrowed to it.
     let cVi = -1
+    // The parameter's own rep and table slot, carried to the narrowed-arm unbox below: the
+    // inner block that reads `cParams` closes before it.
+    let cArgParamKind: VKind = "i32"
+    let cArgParamRow = -1
     // A non-null struct param position (kind 1, `(ref $S)`): a nullable-REP
     // argument needs `ref.as_non_null` at the boundary (see below).
     let cParamStruct = false
@@ -21048,6 +21105,8 @@ function emitDirectCall(body: i32[], callIx: i32, fnIx: i32, target: i32) {
           // (`pendingLitUnion`), a `null` arg as the i32 sentinel `-1` (`pendingNulLitUnion`).
           if nodeTyIsNulLitUnion(cpnb.parType) { cParamNulLitUnion = true }
         }
+        cArgParamKind = vtKindOfParam(cParams[i])
+        cArgParamRow = paramStructIdxOf(cParams[i])
         if vtKindOfParam(cParams[i]) == "str" { cParamStr = true }
         if (
           vtKindOfParam(cParams[i]) == "struct" ||
@@ -21274,6 +21333,15 @@ function emitDirectCall(body: i32[], callIx: i32, fnIx: i32, target: i32) {
         if exprUnion(args[i], fnIx) {
           fbStructGet(uBoxIdx, 1)  // 0xfb 0x02 <box ht> field 1: value (anyref)
           fbRefCast(uVarHeap[cVi]) // 0xfb 0x16 <variant struct> ref.cast (non-null)
+        }
+      }
+      // The same unbox for a param whose annotation names a plain struct: an inferred
+      // union's arm is no registered member, so `cVi` is -1 and the box went in whole. The
+      // parameter's own (kind, slot) is the destination, as the cell's is at the binding
+      // boundary; guarded so the three arms cannot both fire (D1723).
+      if cVi < 0 && cParamNulVariantIdx < 0 {
+        if narrowedArmNeedsUnbox(args[i], fnIx) {
+          emitNarrowedArmUnboxTo(armDestHeapOf(cArgParamKind, cArgParamRow))
         }
       }
       pendingStructIdx = -1
