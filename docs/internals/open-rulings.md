@@ -490,7 +490,9 @@ literal". (a) costs the formatter a new invariant for a form almost nobody write
 the one honest use case worse. Grading: `tests/cases/strings/*` and `vl fmt --check` over the
 tree, both of which exercise every current backtick.
 
-### D1680 / D1665 — is a nullable MAP a type the design admits everywhere?
+### D1680 / D1665 — is a nullable MAP a type the design admits everywhere? — RULED 2026-09-06
+
+**Ruling (owner, 2026-09-06):** yes, everywhere — a map is a reference like a struct. D1680 and D1665 are capability rows.
 
 A nullable map already RUNS as a local (`const m: {[string]: i32} | null`) and as an
 ANNOTATED struct field (D1665's control); it refuses under a standalone `?.` (D1680) and in an
@@ -499,7 +501,9 @@ no ruling — D1665 is on a fix lane now. **Recommendation: yes** — the altern
 never nullable; use an empty map) is a rule the checker does not state and two running
 spellings already contradict.
 
-### D1712 — is `A | i32` the same type as `i32 | A`?
+### D1712 — is `A | i32` the same type as `i32 | A`? — RULED 2026-09-06
+
+**Ruling (owner, 2026-09-06):** (a) — a union is a SET; order never matters. The registry keys a canonical member order and box tags are positional in that order. D1712 closes as a capability row once the keying lands.
 
 The `??` join keys its registry row on the OPERAND's member order, so the same union declared
 the other way round is a different key and check-clean invalid wasm. The standing ABI note
@@ -514,7 +518,9 @@ expects it; the cost is one canonicalisation at registration and a rule that a b
 member's index in the CANONICAL sequence. D1737/D1738/D1733's closes (#2754, #2760) were built
 so they invent no order and are neutral to this ruling.
 
-### D1730 — may a `const` NAME key a narrowed place?
+### D1730 — may a `const` NAME key a narrowed place? — RULED 2026-09-06
+
+**Ruling (owner, 2026-09-06):** (a) — yes for a `const` index, never for `let`, and ONLY where the subscript is the built-in list or map index: index dispatch is user-definable (`"[]"` free functions, B13/B14) and a user `"[]"` is a call, never narrowed. The message is corrected regardless.
 
 `if xs[i] is A { print(xs[i].r) }` with `const i = 0` accepts the `is` test and refuses the
 read it narrowed, telling the author to do the thing they did (the MESSAGE is wrong either way
@@ -524,7 +530,9 @@ a name-derived key needs a definite-assignment argument the narrowing stack does
 `let i` must be excluded by a rule that does not exist. **Recommendation: yes, for `const`
 bindings only** (a `let` index keeps the refusal, with a message that says why).
 
-### D1736 — does an `is T` pin survive a `while` loop's re-execution barrier?
+### D1736 — does an `is T` pin survive a `while` loop's re-execution barrier? — RULED 2026-09-06
+
+**Ruling (owner, 2026-09-06):** (a) — yes; an `is` pin at a loop head is the null strip's twin, retired by a write to the receiver exactly as `!= null` is. D1736 is a capability row.
 
 `while v != null { … }` narrows the body; `while v is A { … }` refuses. The code's stated
 reason ("only a null strip re-narrows, never an `is T` pin; the body is re-tested every
@@ -533,7 +541,9 @@ the write-retire machinery covers a body that assigns. **Recommendation: yes** �
 is a null strip's twin at the loop head, with the same retirement on a write to the receiver.
 If the answer is no, the row closes as DESIGN with a message that names the loop, not the `is`.
 
-### D1686 / D1687 — what does the design owe a covariant list the closure cannot follow?
+### D1686 / D1687 — what does the design owe a covariant list the closure cannot follow? — RULED 2026-09-06
+
+**Ruling (owner, 2026-09-06):** (a) — a read-only list view that is covariant; mutable lists stay invariant. The view is SHALLOW: it forbids writes to the list's shape (`push`/`pop`/`clear`/index assignment/`"[]="`) and says nothing about an element's own fields, as Kotlin's `List` and C#'s `IReadOnlyList` do. The keyword's spelling (`readonly T[]` proposed) and whether a parameter defaults to read-only are the build's questions, not this ruling's. D1686/D1687 close as DESIGN today and reopen as the view's grading list.
 
 The covariant-write analysis licenses a read-only copy of a `Circle[]` delivered as `Shape[]`
 only where it can see every write; it declines a container reached through an unnamed call
