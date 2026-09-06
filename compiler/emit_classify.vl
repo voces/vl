@@ -1553,6 +1553,10 @@ export function letIsNulRef(letIx: i32, fnIx: i32) {
   if d is LetDecl {
     if d.letType >= 0 {
       if retNulRefFlag(d.letType) == 1 { return true }
+      // A value-union annotation pins the cell to the box whatever the init produces — D1606's
+      // rule one niche over. Without it a `S | null` init under a `string | S | null`
+      // annotation declares a `(ref null $S)` cell the boxed store cannot fill.
+      if letAnnIsUnion(letIx) { return false }
     }
     return exprNullableStruct(d.letInit, fnIx)
   }
@@ -1567,6 +1571,10 @@ export function letIsNulVariant(letIx: i32, fnIx: i32) {
   if d is LetDecl {
     if d.letType >= 0 {
       if retNulVariantFlag(d.letType) == 1 { return true }
+      // The same annotation pin its struct twin takes: a `V | null` init under a
+      // `string | V | null` annotation is boxed at the store, so classifying from the init
+      // declares a `(ref null $uVarHeap[vi])` cell with no variant index to name (D1721).
+      if letAnnIsUnion(letIx) { return false }
     }
     return exprNullableVariant(d.letInit, fnIx)
   }
@@ -2271,6 +2279,11 @@ export function letIsNulString(letIx: i32, fnIx: i32) {
 // by the `!= null` `ref.is_null` path and the assignment/return/arg null-seeding.
 export function exprNullableString(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return false }
+  // The typed-IR leg its `exprNulBool` sibling already has, and additive for the same reason:
+  // the checker recorded this node as `string | null`. It recovers the niche for a form the
+  // syntactic arms below cannot trace — an else-less `if` printed directly, whose join is the
+  // niche and which otherwise falls past every arm to the non-null string print (D1766).
+  if nodeTyIsNullableString(exprIx) { return true }
   // An if-expression whose arm is itself nullable — see `nulIfArmNullableValueIx` (D1560).
   const nlIfStr = nulIfArmNullableValueIx(exprIx)
   if nlIfStr >= 0 {
@@ -2839,13 +2852,14 @@ function letInitProjKind(letIx: i32): VKind | null {
   null
 }
 
-// That map arm's companion — the mv slot the recorded value type names. A FIND, never a
-// mint, and read off the type rather than the spelling, so it answers in a frame the
-// syntactic resolver cannot reach.
+// That map arm's companion — the mv slot the recorded value type names, a FIND and never a
+// mint. Gated on the KIND its twin answers, not on which of that twin's two rungs answered:
+// the descriptor covers a nested map and not a struct-valued shallow one, and a `"map"` cell
+// whose shape stays -1 is the mono map, a different layout (D1772).
 function letInitProjMapShape(letIx: i32): i32 {
   const ini = letInitProjNode(letIx)
   if ini < 0 { return -1 }
-  if annRepKindOf(ini) != null { return -1 }
+  if letInitProjKind(letIx) != "map" { return -1 }
   if nodeTyIsMap(ini) { return mapFindShapeOfNodeTy(ini) }
   -1
 }
@@ -4309,6 +4323,12 @@ export function captureValKind(fe: i32, name: string): VKind {
           // field read's nullable slot goes unseen exactly where the ladder cannot ask. This
           // one is frame-blind: the field's storage decides it, not the scope (D1759).
           if initIsNestedStructFieldRead(b) { return nicheK }
+        }
+        // An initialiser committing a literal-union ATOM decides the env field whatever the
+        // annotation renders: an INLINE member set softens to `string` while a litunion array
+        // element arrives as the interned i32. Frame-blind, like the niche rung above (D1768).
+        if letInitIsLitAtom(b, parentBindingFrameArenaOf(fe, name)) {
+          return "i32"
         }
       }
       return annK
@@ -10814,6 +10834,11 @@ export function unionLitIsStashSlot() {
 export function unionEqStashSlot2() {
   scratchSlot(15, "i32", 0, SCRATCH_BY_CODE)
 }
+
+// D1721 — the nullable-niche box stash, code 19: an `anyref` slot parking a `V | null` value
+// so the null test and the payload read share ONE evaluation. `anyref` rather than the
+// niche's own heap, since the box payload is `anyref` and every niche rep is a subtype of it.
+export function nulNicheBoxSlot() { scratchSlot(19, "i32", 0, SCRATCH_BY_CODE) }
 
 // D974 — a struct-heap-typed stash pair, code 16, keyed by struct-table row (the right
 // operand `row + 1024`). A struct union's arm may carry a nested shape field, and that
@@ -21507,6 +21532,13 @@ export function exprIsLitAtom(exprIx: i32, fnIx: i32) {
     if cloCallResultLitUnion(unwrapParen(exprIx), fnIx) { return true }
     const callee = P.nodes[e.callFn]
     if callee is Ident {
+      // A CLOSURE call, whose result rep is what the lifted body yields and not what a
+      // spelling renders — so the alias arms above miss an INLINE member set. `fRetLitAtom`
+      // is the banked answer the named rung below reads, asked of the lambda (D1768).
+      const cloFe = identClosureFeSid(sidOfNode(e.callFn), fnIx)
+      if cloFe >= 0 && cloFe < fRetLitAtom.length {
+        if fRetLitAtom[cloFe] == 1 { return true }
+      }
       const target = fnIndexOfSid(sidOfNode(e.callFn))
       if target >= 0 {
         const cf = P.nodes[fnStmts[target]]
@@ -25870,7 +25902,7 @@ export function coalesceResultUnionName(ix: i32): string {
 
 // Is the operand of a `??` one of the nullable-REF niches — a bare `(ref null $H)` cell rather
 // than a box or an i32 sentinel? These are the reps `emitCoalesceNulRefCtx` serves.
-function coalesceNulRefNicheOperand(ix: i32, fnIx: i32): boolean {
+export function coalesceNulRefNicheOperand(ix: i32, fnIx: i32): boolean {
   if exprNullableString(ix, fnIx) { return true }
   if exprNullableRefNiche(ix, fnIx) { return true }
   if exprNullableList(ix, fnIx) { return true }
@@ -25909,6 +25941,22 @@ function nodeRegisteredUnionName(ix: i32): string {
     if t.uMembers.length < 2 { return "" }
     const u = unRowOfCanon(ty)
     if u >= 0 { return unNames[u] }
+  }
+  // A nullable union is a union too: `string | A | null` interns as `TyNullable` over the
+  // non-null members, so the arm above never sees the row the arena walk registered under the
+  // whole spelling. The niche is reserved for a single non-null member, so an inner of two or
+  // more is the box with `null` as a member tag (D1721).
+  if t is TyNullable {
+    // The inner is an arena HOLE for a never-filled `let x = null` (`mkNullableTy(-1)`), so
+    // the index is bound-tested before the read — unguarded it trapped the compiler (D1721).
+    if t.nInner < 0 { return "" }
+    const it = T.tys[t.nInner]
+    if it is TyUnion {
+      if it.uMembers.length < 2 { return "" }
+      if tyIsLitUnion(t.nInner) { return "" }
+      const nu = unRowOfCanon(ty)
+      if nu >= 0 { return unNames[nu] }
+    }
   }
   ""
 }
