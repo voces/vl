@@ -2807,6 +2807,32 @@ function letInitTyStructRow(letIx: i32): i32 {
   -1
 }
 
+// The variant row the checker recorded for an UN-annotated binding's initializer, or -1 —
+// the narrowed-arm spelling, whose init produces the union box while the checker types the
+// binding at the arm. `exprVariantIndex` answers the init's REP and so declines here; the
+// binding boundary's own unbox is what lands the box in the arm cell (D1741).
+export function letInitTyVariantRow(letIx: i32): i32 {
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 { return -1 }
+    if d.letInit < 0 { return -1 }
+    return variantRowOfTy(nodeTyIxOf(d.letInit))
+  }
+  -1
+}
+
+// The predicate half of that pair, gated on the init being the union box: without the gate a
+// bare variant-valued init would take this rung instead of `letIsVariant`'s, which reads the
+// same row from the rep and owes no unbox.
+export function letInitTyIsNarrowedArm(letIx: i32, fnIx: i32): boolean {
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    if letInitTyVariantRow(letIx) < 0 { return false }
+    return exprUnion(d.letInit, fnIx)
+  }
+  false
+}
+
 // The nullable twin: the initializer carries a `TyNullable` over a `TyFunc`, which a bare
 // `const t = m[k]` read of a function-valued map is and no syntactic arm claims (D1621).
 function letInitTyIsNulFunc(letIx: i32): boolean {
@@ -2848,6 +2874,11 @@ function letInitCellKind(letIx: i32, fnIx: i32): VKind {
   // A `??` niche JOIN binds the union BOX. Ahead of every rung below, since those read the
   // OPERAND's rep and give the slot its niche — a bare `(ref $S)` holding a box (D1714).
   if letInitJoinsToUnionBox(letIx, fnIx) { return "union" }
+  // An un-annotated binding of a NARROWED arm (D1741): the init hands over the union box and
+  // the checker typed the binding at the arm, so the cell is the arm and the boundary unboxes.
+  // Above every rung reading the init's own rep, each of which would give the cell a box that
+  // the consumers all read as the arm; below the `??` join, whose result IS the box.
+  if letInitTyIsNarrowedArm(letIx, fnIx) { return "variant" }
   // A nullable map, before `letIsMap`, whose `(ref $mapStruct)` cell cannot hold null.
   if letIsNulMap(letIx, fnIx) { return "nulmap" }
   // A bare `const t = m[k]` read of a list- or nested-map-valued map binds the value's
@@ -4255,6 +4286,7 @@ export function captureValStructIdx(fe: i32, name: string) {
       // slot arguments `collectLocals` passes `addLocalName` for the same bindings. A kind
       // without its slot is a loud reject and not a fallback: `fbValtype`'s bounds guard
       // turns a -1 on any ref kind into `ref valtype with no interned shape` (D21).
+      if letInitTyIsNarrowedArm(b, pf) { return letInitTyVariantRow(b) }
       if letIsNulMap(b, pf) { return nulMapShapeOf(b, pf) }
       if letNulMapReadValKind(b, pf) != null {
         return letNulMapReadSlotArg(b, pf)
