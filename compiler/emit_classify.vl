@@ -16959,13 +16959,20 @@ function fieldCodeOfSpelling(t: string, litNode: i32) {
   nulRefListFieldCodeOfNode(litNode)
 }
 
-// The `S[] | null` FIELD code (28) the ARENA decides, or -1. Ref-ELEMENT lists only: that is
-// the one nullable-list code whose name test needs a table, and every other element kind is
-// already decided by a spelling that carries its own answer (D1293).
+// The `S[] | null` FIELD code (28) the ARENA decides for a field's annotation node, or -1 —
+// the node-taking face of `nulRefListFieldCodeOfTy`, canon-routed so a rewritten annotation
+// asks about the type it now carries (D1293).
 function nulRefListFieldCodeOfNode(litNode: i32): i32 {
   if litNode < 0 { return -1 }
   let ty = nodeTyIxOf(litNode)
   if canonRewroteNode(litNode) { ty = canonTyIxOf(litNode) }
+  nulRefListFieldCodeOfTy(ty)
+}
+
+// The `S[] | null` FIELD code (28) the ARENA decides, or -1. Ref-ELEMENT lists only: that is
+// the one nullable-list code whose name test needs a table, and every other element kind is
+// already decided by a spelling that carries its own answer (D1293).
+function nulRefListFieldCodeOfTy(ty: i32): i32 {
   if ty < 0 { return -1 }
   const t = T.tys[ty]
   if t is TyNullable {
@@ -19142,11 +19149,17 @@ function fieldCodeOfTy(ty: i32): i32 {
 }
 
 // `nameFieldCode` with the caller's recorded arena type for the field — arena rung first,
-// the spelling ladder unchanged behind it.
+// the spelling ladder unchanged behind it, then the arena's `S[] | null` rung last.
 export function nameFieldCodeTy(t: string, ty: i32): i32 {
   const a = fieldCodeOfTy(ty)
   if a != -2 { return a }
-  nameFieldCode(t)
+  const c = nameFieldCode(t)
+  if c >= 0 { return c }
+  // The last rung of the NODE ladder, which this one lacked: `nameIsNulRefList` resolves
+  // through the struct table, so a shape whose field is `S[] | null` coded -1 whenever it is
+  // classified before `S` has a row — and the mint refused a spelling the declared field
+  // codes 28 (D1692). Last, exactly as in `fieldCodeOfSpelling`, so no name arm can move.
+  nulRefListFieldCodeOfTy(ty)
 }
 
 export function nameFieldCode(t: string) {
@@ -19450,11 +19463,16 @@ export function funcTypeShapeLowerable(nm: string): boolean {
   okAll && fieldCount > 0
 }
 
-// Whether the inline shape text `nm` will intern cleanly as a nested struct at the
-// `collectA` phase — the pure, intern-free mirror of `internInlineShape`'s acceptance,
-// usable during `collectU` before the struct table exists. Acceptance here obligates the
-// `collectA` variant-field pass to intern `nm`, and is monotone-safe: a field code can only improve from -1.
-export function variantNestedShapeOk(nm: string): boolean {
+// Whether the field spelled `ftxt`, of recorded type `ty`, will intern cleanly as a nested
+// struct at the `collectA` phase — the pure, intern-free mirror of `internInlineShapeTy`'s
+// acceptance, usable during `collectU` before the struct table exists. Acceptance here
+// obligates the `collectA` variant-field pass to intern it, and is monotone-safe: a field code can only improve from -1.
+export function variantNestedShapeOkTy(ftxt: string, ty: i32): boolean {
+  // The `| null` peel belongs here, not at the callers, so name and arena are peeled together
+  // and the recursion's own fields keep an arena to ask (D1692). `tyStepNulIf` leaves a
+  // non-nullable spelling's type alone.
+  const nm = nonNulBaseOf(ftxt)
+  const nmTy = tyStepNulIf(ty, ftxt, nm)
   if !nameIsShapeSpanEnds(nm) { return false }
   const fnames: string[] = []
   const ftexts: string[] = []
@@ -19466,12 +19484,11 @@ export function variantNestedShapeOk(nm: string): boolean {
     if fnames[fi] == "" {
       okAll = false
     } else {
-      const ftxt = ftexts[fi]
-      if nameFieldCode(ftxt) < 0 {
+      const fty = tyFieldTyOf(nmTy, fnames[fi])
+      if nameFieldCodeTy(ftexts[fi], fty) < 0 {
         // A nested inline-shape field (`g: {h: i32}` / `g: {h: i32} | null`):
         // lowerable only if ITS shape is.
-        const base = nonNulBaseOf(ftxt)
-        if !variantNestedShapeOk(base) { okAll = false }
+        if !variantNestedShapeOkTy(ftexts[fi], fty) { okAll = false }
       }
       fieldCount = fieldCount + 1
     }
@@ -19535,7 +19552,7 @@ export function armFieldDeferredRowOk(base: string): boolean {
 
 // The arm render's fields, coded, with `variantStructHeapTwinAt`'s own layout guard applied
 // (D1518): a gate narrowed ahead of its lowering buys check-clean invalid wasm instead, so
-// the two must apply the same rule. Stricter than `variantNestedShapeOk` on purpose: that
+// the two must apply the same rule. Stricter than `variantNestedShapeOkTy` on purpose: that
 // predicate answers "will this intern", this one "will the interned row be the arm's".
 function armPlainLayoutShapeOk(nm: string, depth: i32): boolean {
   if depth > 8 { return false }
@@ -20047,6 +20064,11 @@ export function internInlineShapeTy(nm: string, tyIx: i32) {
             if structIndexByName(uw5) >= 0 { e5 = uw5 }
           }
         }
+        // The two rungs above both ask the struct table, which a nested inline shape is
+        // classified BEFORE, so a struct element with no row yet leaves them both empty. The
+        // deferred key is what the declared field and the anonymous mint record for the same
+        // element, and an unkeyed ref-list field cannot resolve its slot at emit (D1692).
+        if e5 == "" { e5 = shapeFieldElemName(texts[pi], 5) }
       }
       sFieldElemName.push(e5)
       recordSFieldElemRow(e5, fkI32) // D5 + B6b
@@ -20062,6 +20084,9 @@ export function internInlineShapeTy(nm: string, tyIx: i32) {
         // so the guard is dischargeable and the routing stays legal.
         const raw28 = arrElemNameRaw(nullablePartOf(texts[pi]))
         if structIndexByName(raw28) >= 0 { e28 = raw28 }
+        // The code-5 arm's deferred fallback, for the same reason: the struct table cannot
+        // answer for an element declared after the shape that lists it (D1692).
+        if e28 == "" { e28 = shapeFieldElemName(texts[pi], 28) }
       }
       sFieldElemName.push(e28)
       recordSFieldElemRow(e28, fkI32) // D5 + B6b
