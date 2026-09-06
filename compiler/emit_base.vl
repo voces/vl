@@ -194,6 +194,12 @@ let mllDup: {[string]: boolean} = Map()
 // common name has exactly one binding and must not pay for a list.
 let mllMoreNames: string[] = []
 let mllMoreIxs: i32[] = []
+// The module-scope BLOCK node owning each binding above, parallel to the two columns and to
+// `mllMap` — the second half of a reader's scope test, since a binding is denoted only from
+// inside the block that owns it (D1751). The arena is post-order, so a block's own index is
+// the last index in its subtree and `atIx <= owner` IS "has not left the block".
+let mllOwner: {[string]: i32} = Map()
+let mllMoreOwners: i32[] = []
 
 // Records `name` as naming a function without waiting for the fold to reach its node — the
 // escape hatch for the one writer that renames a `FuncDecl` in place after the arena already
@@ -229,6 +235,8 @@ export function resetParentLetCache() {
   mllDup = Map()
   mllMoreNames = []
   mllMoreIxs = []
+  mllOwner = Map()
+  mllMoreOwners = []
   mllAny = false
   0
 }
@@ -299,34 +307,36 @@ function plRecordLoopVar(name: string, ix: i32) {
 // `mlvSet`, and every module-scope block-local `LetDecl` into `mllMap` (D1244). Descends
 // bodies sharing the module's local frame (loops, `if` arms, bare blocks) and stops at a
 // `FuncDecl`. `mlvBuild` skips a top-level `LetDecl` first — that is a global, its own storage class.
-function mlvScanStmt(ix: i32) {
+function mlvScanStmt(ix: i32, owner: i32) {
   if ix < 0 { return 0 }
   const st = P.nodes[ix]
   if st is LetDecl {
     if (mllMap[st.letName] ?? -1) < 0 {
       mllMap[st.letName] = ix
+      mllOwner[st.letName] = owner
       mllAny = true
     } else {
       mllDup[st.letName] = true
       mllMoreNames.push(st.letName)
       mllMoreIxs.push(ix)
+      mllMoreOwners.push(owner)
     }
   } else if st is ForRange {
     if st.frVar != "" { mlvSet[st.frVar] = true }
-    mlvScanStmt(st.frBody)
+    mlvScanStmt(st.frBody, st.frBody)
   } else if st is ForIn {
     if st.fiVar != "" { mlvSet[st.fiVar] = true }
-    mlvScanStmt(st.fiBody)
+    mlvScanStmt(st.fiBody, st.fiBody)
   } else if st is WhileStmt {
-    mlvScanStmt(st.whileBody)
+    mlvScanStmt(st.whileBody, st.whileBody)
   } else if st is IfStmt {
-    mlvScanStmt(st.ifThen)
-    if st.ifElse >= 0 { mlvScanStmt(st.ifElse) }
+    mlvScanStmt(st.ifThen, st.ifThen)
+    if st.ifElse >= 0 { mlvScanStmt(st.ifElse, st.ifElse) }
   } else if st is Block {
     const stmts = st.blkStmts
     let i = 0
     while i < stmts.length {
-      mlvScanStmt(stmts[i])
+      mlvScanStmt(stmts[i], ix)
       i = i + 1
     }
   }
@@ -355,7 +365,7 @@ function mlvBuild(rootIx: i32) {
     let i = 0
     while i < stmts.length {
       const s = P.nodes[stmts[i]]
-      if s is LetDecl {} else { mlvScanStmt(stmts[i]) }
+      if s is LetDecl {} else { mlvScanStmt(stmts[i], rootIx) }
       i = i + 1
     }
   }
@@ -372,15 +382,12 @@ export function moduleLocalLetOf(rootIx: i32, name: string) {
   mllMap[name] ?? -1
 }
 
-// `moduleLocalLetOf`, but -1 when the module scope binds `name` in more than one block. The
-// map is first-wins over a walk with no notion of which block a reader sits in, so its answer
-// denotes the binding only while the name is unambiguous. D1596: the monomorphizer's pin
-// needs the denoted binding — taking the first turned a working two-block program into invalid wasm.
+// `moduleLocalLetOf`, but -1 when the module scope binds `name` in more than one block — the
+// unpositioned rung of `moduleLocalLetOfAt`, whose answer denotes the binding only while the
+// name is unambiguous. D1596: the monomorphizer's pin needs the denoted binding — taking the
+// first turned a working two-block program into invalid wasm.
 export function moduleLocalLetOfUnique(rootIx: i32, name: string) {
-  const ix = moduleLocalLetOf(rootIx, name)
-  if ix < 0 { return -1 }
-  if mllDup[name] == true { return -1 }
-  ix
+  moduleLocalLetOfAt(rootIx, name, -1)
 }
 
 // Every module-scope block-local binding of `name`, in walk order, appended to `out`. The
@@ -400,6 +407,46 @@ export function moduleLocalLetAll(rootIx: i32, name: string, out: i32[]) {
     i = i + 1
   }
   0
+}
+
+// The owning block of each binding `moduleLocalLetAll` reports, in the same order and the
+// same length — the two are read as one row per binding.
+export function moduleLocalLetAllOwners(rootIx: i32, name: string, out: i32[]) {
+  mlvBuild(rootIx)
+  if !mllAny { return 0 }
+  const first = mllMap[name] ?? -1
+  if first < 0 { return 0 }
+  out.push(mllOwner[name] ?? -1)
+  if mllDup[name] != true { return 0 }
+  let i = 0
+  while i < mllMoreNames.length {
+    if mllMoreNames[i] == name { out.push(mllMoreOwners[i]) }
+    i = i + 1
+  }
+  0
+}
+
+// The module-scope block-local binding of `name` that a reader at arena node `atIx` denotes:
+// the LAST one that precedes it and whose block it has not left, so two sibling blocks
+// binding one name denote two cells rather than the first one twice (D1751). `-1` when the
+// name is ambiguous and no candidate is in scope, which is `moduleLocalLetOfUnique`'s answer.
+export function moduleLocalLetOfAt(rootIx: i32, name: string, atIx: i32) {
+  const first = moduleLocalLetOf(rootIx, name)
+  if first < 0 { return -1 }
+  if mllDup[name] != true { return first }
+  if atIx < 0 { return -1 }
+  const all: i32[] = []
+  const owners: i32[] = []
+  moduleLocalLetAll(rootIx, name, all)
+  moduleLocalLetAllOwners(rootIx, name, owners)
+  if owners.length != all.length { return -1 }
+  let best = -1
+  let i = 0
+  while i < all.length {
+    if all[i] < atIx && atIx <= owners[i] && all[i] > best { best = all[i] }
+    i = i + 1
+  }
+  best
 }
 
 function plBuildLetMap(blockIx: i32) { plScanStmt(blockIx) }
