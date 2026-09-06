@@ -9026,15 +9026,18 @@ function anonValueFitsField(vc: i32, sc: i32, valIx: i32, si: i32, mfi: i32) {
   }
   // Composite value codes, anon rows only (a declared row's codes can differ through
   // adoption). Each widens into one nullable spelling of its own backing: `i32[] | null`,
-  // `((…) => …) | null`, f64 for f32, `f64[] | null`, `i64[] | null`. A nested-struct
-  // ref (15) matches only code 15 or the union box (16).
+  // `((…) => …) | null`, f64 for f32, `f64[] | null`, `i64[] | null`.
   if !anonRow { return true }
   if vc == 4 { return sc == 18 }
   if vc == 14 { return sc == 22 }
   if vc == 24 { return sc == 17 }
   if vc == 25 { return sc == 32 }
   if vc == 26 { return sc == 33 }
-  if vc == 15 { return false }
+  // A named-heap value (`fieldCodeRefsElemHeapC`: a nested struct, a ref list, its `| null`
+  // niche) fits only its own code, handled above, or the union box, handled at the top. The
+  // slot is a `(ref $x)` at code 5 and a `(ref null $x)` at 28, so the two are two layouts and
+  // an anon row minted for one may not take the other (D1663).
+  if fieldCodeRefsElemHeapC(vc) { return false }
   true
 }
 
@@ -18678,10 +18681,15 @@ function anonNulListFieldCodeOfElem(elem: i32): i32 {
 // element node to read a row off; `repRowOfTyStruct` turns the recorded element type into
 // the row the emitter interns through instead.
 function anonRefListElemRow(valIx: i32): i32 {
-  if valIx < 0 { return -1 }
-  const ty = nodeTyIxOf(valIx)
-  if ty < 0 { return -1 }
-  const t = T.tys[ty]
+  anonRefListElemRowOfTy(nodeTyIxOf(valIx))
+}
+
+// That row asked of the ARRAY type rather than of the node, so the plain field and the
+// `| null` niche share one rung: the niche's own recorded type is the `TyNullable`, and its
+// array lives one peel further in (D1663).
+function anonRefListElemRowOfTy(arrTy: i32): i32 {
+  if arrTy < 0 { return -1 }
+  const t = T.tys[arrTy]
   if t is TyArray { return repRowOfTyStruct(t.aElem, sScanLim()) }
   -1
 }
@@ -18691,10 +18699,18 @@ function anonRefListElemRow(valIx: i32): i32 {
 // it is the field's recorded type rendered NOMINALLY and cut the way `shapeFieldElemName`
 // cuts the declared text; "" for a cyclic or nameless type, which stays refused.
 function anonRefListElemKeyOf(valIx: i32): string {
-  if valIx < 0 { return "" }
-  const ty = nodeTyIxOf(valIx)
-  if ty < 0 { return "" }
-  const nm = tyToNominalName(ty)
+  anonRefListElemKeyOfTy(nodeTyIxOf(valIx))
+}
+
+// The whole key ladder over an ARRAY type: the element's own struct row names it, else the
+// nominal render cut to its element. The plain code-5 field and the code-28 niche both come
+// through here, so ONE element type is ONE key at both codes; two renderers would key one
+// list two ways and the two columns could not be compared (D1663).
+function anonRefListElemKeyOfTy(arrTy: i32): string {
+  if arrTy < 0 { return "" }
+  const row = anonRefListElemRowOfTy(arrTy)
+  if row >= 0 { return sNames[row] }
+  const nm = tyToNominalName(arrTy)
   if nm == "" { return "" }
   if tyNomNameCycled() { return "" }
   refArrElemKeyDeferred(nm)
@@ -18890,23 +18906,15 @@ export function anonFieldElemName(valIx: i32, code: i32) {
       const esi = structIndexOfObj(av.arrElems[0])
       if esi >= 0 { return sNames[esi] }
     }
-    // D1515 — the arena, once the literal route has declined: a list produced by anything
-    // but an array literal of object literals has no element node, so the recorded element type names the same row.
-    const ari = anonRefListElemRow(valIx)
-    if ari >= 0 { return sNames[ari] }
-    // D1688 — an element no struct row names: a union, a nullable ref, a list, a map.
-    return anonRefListElemKeyOf(valIx)
+    // D1515/D1688 — the arena, once the literal route has declined: a list produced by
+    // anything but an array literal of object literals has no element node, so the recorded
+    // element type names the row, or, for an element no row names, its own nominal key.
+    return anonRefListElemKeyOfTy(nodeTyIxOf(valIx))
   }
   // A nullable ref-list field (code 28) records its ELEMENT's key, read off the type rather
-  // than the `| null` spelling the literal does not carry — the same column
-  // `shapeFieldElemName` strips, through the same deferred fallback (D1627).
-  if code == 28 {
-    const nnt = anonNulInnerTyOf(valIx)
-    if nnt < 0 { return "" }
-    const nit = T.tys[nnt]
-    if nit is TyArray { return refArrElemKeyDeferred(tyToEmitName(nnt)) }
-    return ""
-  }
+  // than the `| null` spelling the literal does not carry — the same ladder code 5 uses, on
+  // the peeled inner array, so one element type is one key at both codes (D1627, D1663).
+  if code == 28 { return anonRefListElemKeyOfTy(anonNulInnerTyOf(valIx)) }
   if code != 15 { return "" }
   const si = structIndexOfObj(valIx)
   if si >= 0 { return sNames[si] }
