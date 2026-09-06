@@ -121,6 +121,9 @@ ROWS = [
     ("fnChildIndex", ["fnChildHead"], "probe", "ALL:" +
      "  if fnChildHead.length != fnStmts.length { buildFnChildIndex() }" + "\x00" +
      "  buildFnChildIndex()"),
+    ("elemRowsCaptureWalk", ["ercGenP", "ercStamp"], "pass-stamped",
+     ("    if ercVal[slot] == 0 - 2 { return true }",
+      "    if true { return true }")),
     ("covarValueWriteState", ["cwArenaLen", "cwRootNames", "cwRootFrames"], "probe",
      ("  if root == \"\" { return 2 }\n  if P.nodes.length != cwArenaLen {",
       "  if root == \"\" { return 2 }\n  if true {")),
