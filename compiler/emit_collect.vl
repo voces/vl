@@ -10231,7 +10231,13 @@ function registerInlineUnionAt(stmts: i32[], name: string, site: i32, ty: i32) {
   // registration would corrupt this union's variant slice — which the arena-driven walk guarantees.
   uDeclared = true
   unNamesPush(name)
-  unTyIx.push(declTyIxOfName(name)) // B-1 step 1: resolve ONCE at mint, like `sTyIx`
+  // B-1 step 1: resolve ONCE at mint, like `sTyIx` — from the name, else from the arena index
+  // the caller holds. An INFERRED union has no declaration for `declTyIxOfName` to find, so its
+  // row would carry -1 and `unRowOfCanon`, the one reader keyed on the arena rather than the
+  // spelling, could never match it (D1709).
+  let mintTyIx = declTyIxOfName(name)
+  if mintTyIx < 0 { mintTyIx = ty }
+  unTyIx.push(mintTyIx)
   unKey.push(canonUnionKeyOfName(name)) // D-UNIONKEY: obtained from canon, never rendered
   unDeclIx.push(-1) // inline union: no declaration node
   unMemberSetPush(name)
@@ -10634,6 +10640,26 @@ function registerCollapsedUnionName(stmts: i32[], node: i32) {
   0
 }
 
+// Registers the MIXED union an un-annotated binding inferred, from the INITIALIZER's arena type
+// — a `LetDecl` records none of its own, and that index is the one the value's readers hand
+// `unRowOfCanon`. The mint the inferred RETURN takes, so the two never become two producers.
+function registerInferLetMixedUnion(stmts: i32[], letIx: i32) {
+  if letIx < 0 { return 0 }
+  const d = P.nodes[letIx]
+  if !(d is LetDecl) { return 0 }
+  const ity = nodeTyIxOf(d.letInit)
+  if ity < 0 { return 0 }
+  // The NOMINAL render, not the structural one: `is A` asks the row for `A`'s arm, and a row
+  // whose member is the anonymous `{r:i32}` has no interned arm to answer with. The same
+  // renderer the inferred RETURN's name is built from, so the two mints spell one union alike.
+  const inm = tyToNominalName(ity)
+  if inm == "" { return 0 }
+  if tyNomNameCycled() { return 0 }
+  if isUNameAB(46, inm, ity) { return 0 }
+  if collectTyMembersReach(stmts, ity, 15, false) < 0 { return -1 }
+  registerInlineUnionAt(stmts, inm, 46, ity)
+}
+
 // The inferred-return twin of the same-shape annotation fallback above: an un-annotated
 // function whose returns join to a struct-union is inferred structurally with no nominal
 // identity, so the recorded name (not the anonymous arena render) is the only nominal
@@ -11034,11 +11060,15 @@ export function collectU(stmts: i32[]) {
   // when `nliInferIfLet` is the only consumer. Self-gating, like the returns.
   let ilu = 0
   while ilu < inferLetCount() {
-    registerValueUnionNameAB(
-      23,
-      inferLetTyAt(ilu),
-      nodeTyIxOf(inferLetIxAt(ilu)),
-    )
+    if inferLetTyAt(ilu) == "" {
+      if registerInferLetMixedUnion(stmts, inferLetIxAt(ilu)) < 0 { return -1 }
+    } else {
+      registerValueUnionNameAB(
+        23,
+        inferLetTyAt(ilu),
+        nodeTyIxOf(inferLetIxAt(ilu)),
+      )
+    }
     ilu = ilu + 1
   }
   // Inferred array-element unions (the literal twin of the two loops above): an un-annotated
