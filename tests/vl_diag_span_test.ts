@@ -472,6 +472,56 @@ const jsonDiags = async (file: string): Promise<Diag[]> => {
   }
 };
 
+// A MERGED PROGRAM'S ANCHOR IS RESOLVED INSIDE ITS OWN MODULE, and no single two-module
+// program can prove it. `tokIndexAt` binary-searches `P.toks` for a byte offset, a merge
+// appends each module's tokens carrying that module's own offsets, and whether the search
+// still lands on the right token is a coincidence of the shape ahead of it — a one-line
+// dependency answers correctly, a fifteen-line one does not. So the SWEEP is the control:
+// over every dependency size, `for i in 0 to -1` must anchor at the `to` keyword, which
+// `forToKwTok` recovers from the bound's own start token (D1652, D1588).
+const TO_ANCHOR_DEPS = 16;
+
+Deno.test({
+  name: "diagnostic spans: the `to` anchor survives a merge at every dependency size",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = await Deno.makeTempDir({ prefix: "vl_to_anchor_" });
+    try {
+      const bad: string[] = [];
+      // `for i in 0 to -1 {` — `to` is the 12th column, and the line is the 3rd.
+      const entry = 'import { d0 } from "./dep"\n\nfor i in 0 to -1 {\n  print(d0(i))\n}\n';
+      for (let n = 1; n <= TO_ANCHOR_DEPS; n++) {
+        let dep = "";
+        for (let i = 0; i < n; i++) {
+          dep += `export function d${i}(a: i32): i32 { a + ${i + 1} }\n`;
+        }
+        await Deno.writeTextFile(`${dir}/dep.vl`, dep);
+        await Deno.writeTextFile(`${dir}/entry.vl`, entry);
+        const diags = await jsonDiags(`${dir}/entry.vl`);
+        const d = diags.find((x) => x.message.includes("this range never runs"));
+        if (!d) {
+          bad.push(`dep=${n}: no range diagnostic — got ${diags.length}`);
+          continue;
+        }
+        if (d.line !== 3 || d.col !== 12 || d.endCol !== 14) {
+          bad.push(
+            `dep=${n}: want 3:[12, 14) (the \`to\`), got ${d.line}:[${d.col}, ${d.endCol})`,
+          );
+        }
+      }
+      if (bad.length) {
+        throw new Error(
+          `${bad.length} of ${TO_ANCHOR_DEPS} dependency sizes mis-anchored:\n  ${
+            bad.join("\n  ")
+          }`,
+        );
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
+
 Deno.test({
   name: "diagnostic spans: every node kind's caret covers what its message names",
   ignore: !ENABLED,

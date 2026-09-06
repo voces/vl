@@ -27,9 +27,13 @@
 //     run — invisible to `lintSrc`, so read separately; see `readRedun`).
 //     Strict per severity in both directions. An error-tier or multi-file case
 //     skips the lint tier — see the gate at the call site for why.
-//   - @error-at matches the LINE only. Column anchors diverge between the two
-//     checkers on ~80 corpus files (the checker-parity sweep) — column
-//     matching is residue for the span rungs (ROADMAP H-M "Spans").
+//   - @error-at is `<line>:<col> <text>`, and all three are asserted. LINE and COL
+//     are both 0-BASED — the lexer's convention, which `diagCol` carries and every
+//     renderer shifts once (docs/internals/cli-design.md). The column was parsed and
+//     ignored while two checkers disagreed about anchors; the TS compiler is retired,
+//     so the span is the spec like everything else here. A malformed directive is an
+//     ERROR, not a silent drop: `@error-at <line>` alone asserted nothing for eight
+//     files, five of which had drifted a line off.
 //   - @emit-error asserts the FULL compile (`compileSrc`) fails at the EMIT
 //     stage (rc 3) with a message containing TEXT — the emitter's fail-loudly
 //     rejects (shapes the checker accepts but the emitter has no rep for),
@@ -206,14 +210,18 @@ const parseDirectives = (src: string): Directives => {
         d.hints.push(rest);
         break;
       case "error-at": {
-        const at = rest.match(/^(\d+):(\d+)\s+(.*)$/);
-        if (at) {
-          d.errorsAt.push({
-            line: Number(at[1]),
-            col: Number(at[2]),
-            text: at[3],
-          });
+        const at = rest.match(/^(\d+):(\d+)\s+(\S.*)$/);
+        if (!at) {
+          throw new Error(
+            `malformed @error-at: expected \`<line>:<col> <text>\` (both 0-based), ` +
+              `got \`@error-at ${rest}\``,
+          );
         }
+        d.errorsAt.push({
+          line: Number(at[1]),
+          col: Number(at[2]),
+          text: at[3],
+        });
         break;
       }
       case "log":
@@ -447,15 +455,22 @@ const assertCase = async (
     }
   }
   for (const want of d.errorsAt) {
-    // Directive lines are 0-based (the TS diagnostic range convention);
-    // `diagLine` is 1-based. LINE-only matching — see the header.
-    const hit = r.diags.some((di) =>
+    // Both directive numbers are 0-based; `diagLine` is 1-based and `diagCol` already
+    // 0-based, so only the line shifts. The COLUMN is asserted — see the header.
+    const onLine = r.diags.filter((di) =>
       di.line - 1 === want.line && matches(di.message, want.text)
     );
-    if (!hit) {
+    if (onLine.length === 0) {
       throw new Error(
         `expected an error on line ${want.line} containing "${want.text}", ` +
           `got: ${fmtDiags(r.diags)}`,
+      );
+    }
+    if (!onLine.some((di) => di.col === want.col)) {
+      throw new Error(
+        `@error-at ${want.line}:${want.col} — the message is on that line but at ` +
+          `column ${onLine.map((di) => di.col).join("/")}. Both numbers are 0-based; ` +
+          `fix the directive or the span, not the base: ${fmtDiags(onLine)}`,
       );
     }
   }
