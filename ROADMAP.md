@@ -35,6 +35,73 @@ corpus are the de-facto spec · `tests/` — `.vl` corpus + runner · `docs/` ·
 
 ---
 
+## Ranked open items (2026-09-06)
+
+Every item below was RE-GRADED against a seed built from master's own compiler source on
+2026-09-06: its claim was RUN, not read. The criterion is **programs that RUN per unit of
+effort** — an item that turns a refusal into a running program outranks one that makes an
+existing program faster or an existing diagnostic louder, and a cheap item outranks a dear one
+at equal reach. Items that need an owner ruling are **not** ranked here; they are listed
+after the table with the one question each still owes. Effort is in the code-quality survey's
+units: **hours** · **half-day** · **days**.
+
+| # | item | witness, run today | region | effort |
+| --- | --- | --- | --- | --- |
+| 1 | **A-OPMOD — a user-defined binary operator dispatches only in a SINGLE-FILE program, and `std:` counts** | `function "+"(self: V, b: V)` + `print((a + b).x)` prints `3`; add ONE `import { toString } from "std:fmt"` and nothing else → `operator '+' is not defined for V and V`. The roadmap's own witness (a LOCAL import) reproduces identically | `driver.vl:441 modRenameTo` × `ast.vl:1442 isBinOpFuncName` × `typecheck.vl:20007 opSelfFnTy`. The row's mangling attribution is explicitly uninstrumented — confirm it first | days |
+| 2 | **B15 — a nested capturing function cannot be taken as a value** | `function o(n) { function k(x) x + n; k(1) }` → `emitProgram: cannot take the generic function \`k\` as a value … Call sites pin \`k\` at (i32)` | `wasmEmit.vl:1506` — the item says exactly ONE arm | **hours** |
+| 3 | **D1775 — a `type` alias over a negation type reps as a union BOX with a scalar value** | `type N = !string; const x: N = 5` → `vl check` rc 0, then `type mismatch: expected (ref $type), found i32`. `wasm-dis`: `(global $global$0 (mut (ref $1)) (i32.const 5))`. The INLINE spelling runs | `typecheck.vl` / `emit_classify.vl` rep classification of an alias body | hours–half-day |
+| 4 | **D1744 — a deep-`is` site anywhere flattens the union alias** | `f` alone checks clean; add an UNUSED `g` whose body is `e is Cfg` → `` `is` check type 'J' is not a variant of … `` | `typecheck.vl` ~33795 (`jsonDeepIsSite` / `isWidenNotVariant`) | hours–half-day |
+| 5 | **B21.1 — `match` payload renaming and nested destructuring** | `Move{x: a}` → `parse error … match payload binding must be a field name` | `parser.vl:2847`; `match-design.md` measures both as one-branch extensions | hours (renaming) / half-day (nesting) |
+| 6 | **B7 R3 — `.backwards()` over a string** | `"abc".backwards()` → `no method '.backwards' on string` | `std/str.vl`; §Codepoints already specifies it | **hours** |
+| 7 | **B6c — `as!` over a `string \| null`** | `function f(): string \| null` + `f() as! string` → `emitProgram: \`as string\` needs a BOXED union operand — a niche-repped one carries no tag to test`. The NUMERIC twin now runs (`3`), so the item's stated blocker is half closed | `wasmEmit.vl:13156` | half-day |
+| 8 | **A-robust — an unbound generic return parameter refuses at EMIT, not at check** | `function mk<T>(): T[] { return [] }; mk()` → `emitProgram: monomorphize: a return type parameter of \`mk\` is not bound by any parameter` | move it to the check tier beside `solveUnannotParams`' "cannot infer — annotate" family | **hours** |
+| 9 | **the `parseIf` `then` arm is not marked lossless** | `if c then print(1)` + a type error → the parse error ONLY; `if c print(1)` + the same → BOTH | `parser.vl:2652` needs `dgMarkLossless(P.diags.length)`, as `parseBracedBody:2633` has | **hours** |
+| 10 | **`vl build` with no `-o` writes a file instead of stdout** | `vl build p.vl > out.bin` → `out.bin` holds `wrote p.wasm (147 bytes)` | `scripts/vl-host/src/main.rs` build arm; already "decided: yes" | **hours** |
+| 11 | **Organize Imports drops an unused specifier but not a DUPLICATE one** | `server.ts:1491 .filter((d) => d.code === "unused-import")` | `lsp/src/server.ts:1489-1500` | **hours** |
+| 12 | **B17 — no lint for division by a constant zero** | `print(toString(x / 0))` → `vl check` clean, then `wasm trap: integer divide by zero` | `lint.vl`, beside `for-step-zero` at :784 | **hours** |
+| 13 | **B-ci — `build.rs` bakes `VL_SEED_KEY`, so every seed push recompiles the crate** | `scripts/vl-host/build.rs:76` `println!("cargo:rustc-env=VL_SEED_KEY={h:016x}")` | `scripts/vl-host/build.rs` | **hours** |
+| 14 | **B-chore — three split-form list stores never re-fused** | `emit_rep.vl:3151 / :3347 / :3369` still carry the split form and its comment | `rtGo` / `rtOfNullable` / `rtOfMap` | **hours** (verify the store fix has published first) |
+| 15 | **A-exhaust — the provably-true final discriminant is still emitted** | `wasm-dis`: `(if (i32.eq (struct.get $3 0 …) (i32.const 1)) …)` then `(unreachable)` | `emitIs` (`wasmEmit.vl:2533`) fed by `ifChainExhausts` (`typecheck.vl:22741`) — the analysis exists, only the elision is missing | half-day |
+| 16 | **A6 residue — `is` over two ref arms is a tag compare, not `ref.test`** | `grep -rn "ref\.test" compiler/*.vl` → 0 hits | `emitIs`, `wasmEmit.vl:2533` | half-day (pure perf) |
+| 17 | **A5 — `x?.f()` and `x?.y.z`** | `p?.f() ?? 0` → `called value is not a function`; `o?.y.z` → `member access '.z' on non-object Inner \| null` (`x?.y?.z` runs) | `OptMember` in `emit_rewrite.vl:570/1039/1177`, `check_query.vl:14` | half-day each |
+| 18 | **B8 — four `for` gaps, one member per row** | objects → `for-in expects an array or map, got P`; `for v, i in xs` → parse error; expression step → `undeclared identifier 'i'`; float bounds → `for-range bounds must be i32` | `typecheck.vl:34100/34156`, `parser.vl` for-head | half-day each |
+| 19 | **B6a — an i32-keyed map in four container positions** | `const u: {[i32]: f64} \| i32 = 5` → `emitProgram: an i32-keyed Map/Set is supported as … not inside '{[i32]:f64}\|i32'`; same for `[][]`, closure array, map value | `emit_collect.vl:4707 i32MapSpellingLowerable` | days (position matrix, build-then-narrow per D965) |
+| 20 | **A9 — no element-converting / field-dropping container copy** | `Cat[]` into an `Animal[]` param → `…type-valid (structural width subtyping) but not yet supported by codegen…` | `typecheck.vl` refusals + the converting-copy lowering; wire every delivery position BEFORE narrowing the gate | days |
+| 21 | **H4.6 / B6 — array spread in call position** | `xs.push(...ys)` → `parse error … expected an expression but found DOT` | `parser.vl` (no spread) + variadics | days |
+| 22 | **B-debug — a trap names a wasm function index, not a VL location** | `print(a[7])` → `vl!<wasm function 4>` and `out of bounds array access` with no index and no length | `scripts/vl-host/src/main.rs` trap formatting + the name section | days |
+| 23 | **D9.11 — `///` docs are not rendered in hover** | `server.ts:1002-1004` says so; no doc-text export exists in `compiler/` | `check_query.vl` + `entry.vl` export list, `lsp/src/server.ts` ~1002 | days |
+| 24 | **dogfood `match` over the compiler's own kind ladders** | the load-bearing dependency is MET: `match` over `{c:i32}\|{d:i32}` prints **5**, over `i32\|string` prints **1** | `emit_classify.vl` field-code ladders; measured by `ladder-budget.py` (430 + 8 today) | days |
+| 25 | **structural-tolerant emitter (rep architecture step 1)** | half migrated: `structIndexOfTypeName` 50 uses vs `structIndexByName` 56 | `emit_classify.vl` (53 of the nominal uses) | days, opportunistic |
+| 26 | **a module-GLOBAL string accumulator is still quadratic** | 200k **0.793 s** → 400k **3.674 s** (ratio **4.63**); the same loop inside a function at 400k is **0.020 s** (184×) | `wasmEmit.vl:10006 strAccScan` has ONE caller, `emitFuncBody:19005`; `emit_sections.vl:1635 emitStartFnCode` never calls it | half-day–days |
+| 27 | **E3 — user wasm runs on the playground's MAIN thread** | `playground/src/runtime.ts:21` instantiates there; `main.ts:36` says so | `playground/src/{runtime,playground,main}.ts` | days |
+| 28 | **F-tiers / J1 — collapse the redundant corpus runner** | 8 files execute emitted wasm under V8 via `tests/support/runWasm.ts` | `tests/support/casesWasmOracle.ts` + 4 shards + 4 standalone suites | days |
+| 29 | **F-day-one — five grammar axes still absent** | `day-one-sampler.md:90-92`: `match`, operator overloading, multi-param generics, recursive types, mixed-width arithmetic | `scripts/day-one/grammar.py` (91 records) | half-day per axis |
+| 30 | **Host ABI (4) process spawn, (5) env + exit** | no `std` export for spawn/exec/env/exit; the orchestrator scripts still shell out | three hosts + the declaration in `wasmEmit.vl` | days |
+
+### Open items that need an owner ruling first — listed, not decided
+
+| item | the one question it still owes |
+| --- | --- |
+| `as` trio over a `Json` value | Whether `as` propagates `JsonError { kind: "shape", path }` (DECISIONS.md:4194). The runtime half already exists — `json_walk.vl` generates the value-BUILDING `__vlJsonGet_<k>` beside `__vlJsonIs_<k>` — and the other three sub-rules were settled by the `is` build, so this is the only blocker. |
+| A4 (a) open-world negation | Whether open-world negation tracking is built at all. (A4's clause-1 half is D1775 above and needs no ruling.) |
+| A13 literal-union operands | The row says so itself: the fully-annotated twin rejects too. Separately, whether a `"+"`-named struct FIELD is spellable — today it is a parse error, not the WasmGC width wall the row names. |
+| A14 opaque identity | Giving a newtype a runtime tag reverses the erasure design ("no emitter file changed"). |
+| A17 `never` | Three questions the row names: does `never` enter the surface vocabulary, what wasm result does a `never` function declare, what does `const x = loop(1)` mean. |
+| A10 const generics | No grammar or semantics recorded for a value type parameter. |
+| B5 typed numeric literals | No design record of the `4<i64>` spelling anywhere but that line. |
+| B8 user-defined iterators | No iterator-protocol decision recorded. |
+| B13 callable objects · B13a multi-index | Both are surface decisions; B13a is marked low priority. |
+| B14 `c.area` as a bound value | Bound-value-vs-call is a surface decision. |
+| B16 ad-hoc overloading | `DECISIONS.md:1569` records the default "no"; the open half is whether to revisit. |
+| B17 discarded call result | The escape-hatch spelling (`_ = work()`) is undecided. |
+| B21.2 `match` over literal members | Two routes offered, neither chosen. |
+| B-mem `__store_string__` / `__log_string__` | `buffer-design.md` O8: delete or lower. |
+| B7 R4 `utf8Length` | A breaking std removal; also triggers the `std-api-reviewer` gate. |
+| C5 distribution · F5 the name · H5 versioning · H-M2 · J2 runner · J3 port target · D field-level hints · F9 baseline scope | Each already carries its question in its own row. |
+| registry-by-key step 5 | Blocked on D1492's write-seam question. |
+
+---
+
 ## Next (highest leverage)
 
 ### Modernization program (owner, 2026-09-02)
@@ -84,8 +151,8 @@ Five items, in order. (0) is shipped; the rest are scheduled against it.
 - ✅ **8. A ladder over a closed kind set is exhaustive or names its default — DONE.**
   `kind-ladder-incomplete` / `kind-ladder-split` in `compiler/lint.vl`, the ratchet
   `scripts/ladder-budget.py --check` (440 + 9 today), the census `scripts/ladder-census.py`.
-  See the fuller row below. **STATUS 2026-09-06: ratchet now 435 + 8**, moved by the
-  covariant-write closure work (#2685 and neighbours).
+  See the fuller row below. **STATUS 2026-09-06: ratchet now 430 + 8** — it was 435 + 8 when this line was written
+  the same day, which is how fast a quoted ratchet goes stale.
 - ✅ **8b. A table read bound-tests its index, or takes a reader whose miss cannot be a
   real row — DONE.** `sentinel-index-unguarded` / `sentinel-index-strict-untested` in
   `compiler/lint.vl`, the ratchet `scripts/sentinel-budget.py --check` (386 + 0 today),
@@ -423,9 +490,14 @@ Five items, in order. (0) is shipped; the rest are scheduled against it.
   accessor helper (json-design §6 q1 = (a), "until we have an actual consumer"); the
   decoder is the operator: `if doc is Cfg { doc.server.port }` / `doc as Cfg` (trio
   semantics), a compiler-derived per-`T` shape walk that BUILDS the `T`-repped value from
-  the tree. Measured today: `is` is a tag test — a struct RHS is refused as "not a variant",
-  and a refinement of an arm (`["xyz"] is string[]`) is check-clean and answers `false`
-  unconditionally (**D1035**, this item's witness). Design + four sub-rules (copy
+  the tree. **STATUS 2026-09-06: the `is` half is BUILT and this paragraph was stale.** D1035 CLOSED
+  2026-09-02 and its own repro now prints `3`; `json_walk.vl` generates the value-BUILDING
+  `__vlJsonGet_<k>` beside the predicate `__vlJsonIs_<k>`, so the runtime half of `as` exists
+  too. What is left is ONE owner ruling — whether `as` propagates
+  `JsonError { kind: "shape", path }` (DECISIONS.md §"Deep `is` / `as` over a `Json` value";
+  S3 was ruled 2026-09-02 and the `is` build settled copy-semantics and integral fields in
+  practice). Today `d as Cfg` over a `Json` is a loud
+  `` `as Cfg` names a type that is not a member of Json ``. Design + four sub-rules (copy
   semantics; integral `i32` fields — the same predicate as q2's exact `as`; **S3 RULED
   2026-09-02: an absent key matches a `T | null` field and reads `null` — VL's own map
   read already does, and a nullable field is not a REQUIRED key for OQ-7's arm rule**;
@@ -653,8 +725,9 @@ Five items, in order. (0) is shipped; the rest are scheduled against it.
   never leak into pipes/files/copies): Node's split — bare strings always raw, rendered
   values colored, escapes emitted only by the TTY-detected sink, `NO_COLOR`/`--color`
   honored, renderer strings stay ANSI-free forever. Full policy + staging in
-  `docs/serde-design.md` §"Print, templates, and color". Stage C0 (primitive coloring,
-  host-side, small) can land any time; composite coloring rides serde Stage 2.
+  `docs/serde-design.md` §"Print, templates, and color". **Stage C0 (primitive coloring,
+  host-side) SHIPPED #2198** — `Palette` / `color_ok` in `scripts/vl-host/src/main.rs`, every
+  print builtin routed through `palette.emit`; composite coloring rides serde Stage 2.
 - **Reference identity — RULED 2026-09-01, ten decisions taken one at a time**
   (`docs/identity-design.md` §0 carries the rulings, `docs/internals/identity-critique-synthesis.md`
   the evidence). `===`/`!==` on every reference kind INCLUDING functions — inverted from A15's
@@ -1228,7 +1301,12 @@ in-language GC knobs.
   (not compiler module) in the tree"* — demand-driven dogfooding.
 
 - ⬜ **Host ABI for VL scripts (dogfooding).** *Not* a test-runner blocker (above) — this is about the
-  12 shell scripts. VL programs today can **compute and print, nothing else**: the entire import
+  12 shell scripts. **STATUS 2026-09-06: slots (1), (2) and (3) below have SHIPPED** —
+  `std:fs` (#1813, 11 exports incl. `readTextFile`/`writeTextFile`/`listDir`) and `std:args`
+  (#1820, `programArgs()`); measured, `programArgs()` answers and `listDir("std")` returns 13.
+  What remains is (4) and (5). The dogfooding has NOT been taken up: `scripts/fuzz-vl.sh:81`
+  still sed-rewrites the VL source. The original text, now stale, read: VL programs can
+  **compute and print, nothing else**, the entire import
   surface is seven print builtins, so `scripts/fuzzgen.vl` writes to stdout and the shell splits it,
   and `fuzz-vl.sh` passes parameters by **sed-rewriting the VL source before compiling it**
   (`s/^let RICHVALUES = .*/let RICHVALUES = $VALUES/` — rename that `let` and the flag silently stops
@@ -1241,9 +1319,10 @@ in-language GC knobs.
   Miss one and a script runs under the CLI and fails under `deno task test`. Keep the ABI tiny, land it
   as one batch. These are the same syscalls a `vl` CLI written in VL needs, so it is step 1 of Track H.
 
-- ✅ **`match` over ALL unions, not just literal unions.** Verified at `cd69bd9`: a litunion scrutinee
-  works, and both other union kinds are rejected by the checker —
-  `match scrutinee must be a literal union, got {c: i32} | {d: i32}` and `…got i32 | string`. The
+- ✅ **`match` over ALL unions, not just literal unions — SHIPPED #1131.** **STATUS
+  2026-09-06: the "verified at `cd69bd9`" note below was stale and contradicted this file's own
+  B21 entry.** Both refusals are gone: `match` over `{c: i32} | {d: i32}` prints `5` and over
+  `i32 | string` prints `1`, rc 0 both. The
   workaround is an `is`-chain, which works but is not exhaustiveness-checked — so the one property that
   makes `match` worth adopting in the compiler's own kind ladders (a missing arm is a *compile* error,
   not a runtime "no interned slot") is exactly the property unavailable on the unions the compiler
@@ -1536,8 +1615,28 @@ in-language GC knobs.
 ## Track A — Type system (`typecheck.vl`)
 *Blueprint: Elixir v1.20 set-theoretic types, fully-typed (no gradual escape hatch).*
 
-- ⬜ **A-OPMOD. A user-defined binary operator dispatches ONLY in a single-file program.**
-  MEASURED 2026-08-29 while closing D491, on master `c6eb736c`. This runs and prints `99`:
+- ⬜ **A-OPMOD. A user-defined binary operator dispatches ONLY in a single-file program —
+  and importing `std:fmt` is enough to lose it.** MEASURED 2026-08-29 while closing D491 on
+  master `c6eb736c`; RE-RUN 2026-09-06, unchanged, and the reach is wider than filed: the
+  import that costs you the operator does not have to be a LOCAL one. Any program that
+  imports `std:fmt` — that is, nearly every real program — has no user-defined operators.
+
+  Repro:
+
+      // file: main.vl
+      import { toString } from "std:fmt"
+      type V = { x: i32 }
+      function "+"(self: V, b: V): V { return { x: self.x + b.x } }
+      const a: V = { x: 1 }
+      const b: V = { x: 2 }
+      print(toString((a + b).x))
+      // check reject: operator '+' is not defined for V and V
+      // DELETE the import line (and the toString call) and the same program prints 3
+
+  `scripts/capability-probes/operator-dispatch-under-std-import.vl` is that witness, so
+  `run.py` re-grades it on every seed; it reads `check refuses` today.
+
+  The original local-import measurement, unchanged. This runs and prints `99`:
 
       type V = { x: i32 }
       function "+"(self: V, other: V): i32 { return 99 }
@@ -2190,7 +2289,11 @@ in-language GC knobs.
   belong in the stage that moves the unit; and the UTF-8 encode/decode half of **H-M2** (killing
   the Rust host), which now exists in the emitter as `__utf8_dec__`/`__utf8_enc__`. Weigh against the loss of word-at-a-time scanning (`memory-gc-design.md` §2.2) — resolved
   here by pushing that work to `Buffer` rather than to `string`.
-- 🟡 **B8. Loops.** REMAINING: `for…in` over objects/maps; `for val, i in arr` and `for , v in obj`
+- 🟡 **B8. Loops.** **STATUS 2026-09-06: this item's own programs spell the range head
+  `for i = 1 to 5`; the language spells it `for i in 1 to 5`** (`tests/cases/loops/for-step.vl:8`),
+  so running them verbatim gives a parse error unrelated to the gap. Re-graded with the real
+  spelling, `for…in` over a MAP works (#568); objects, `for v, i in`, an expression `step` and
+  float bounds all still refuse. REMAINING: `for…in` over objects/maps; `for val, i in arr` and `for , v in obj`
   destructuring forms; **expression `step`** on a counter range (`for i = 1 to 5 step i * 2` — a
   multiplicative/variable step, not just a const increment), distinct from the const-step
   build-loop-fusion descriptor (DECISIONS) and the `step 0` lint (B17);
@@ -2640,7 +2743,7 @@ in-language GC knobs.
 
 ## Track C — CLI (`vl` / `vital`)
 
-*The NATIVE `vl` exists (`scripts/vl-host`, ~150 lines of frozen Rust over wasmtime): `vl build`
+*The NATIVE `vl` exists (`scripts/vl-host`, **5,704 lines** of Rust over wasmtime — measured 2026-09-06; this file said ~150 for months): `vl build`
 (`-O` via wasm-opt) / `vl check` (parse+typecheck only) / `vl run` (incl. `.wasm` passthrough) /
 `vl fmt` (`-w`/`--check`, AST-driven via `format.vl` — the sole formatter; the TS `format.ts` is
 retired), brains in `build/vl-compiler.wasm`. Iteration: `scripts/refresh-compiler.sh` refreshes the
@@ -2839,8 +2942,8 @@ generic wasm runtime. **Distribution does NOT require self-hosting** (the two ti
 independent).*
 
 - 🟡 **H0. Module system.** Phase 1 done — see `CHANGELOG.md`.
-  - **Phase 2 (⬜):** the `std:` scheme + embedded `.vl` std over the two-primitive intrinsic floor
-    (collections, `std:fmt`, `std:testing`).
+  - **Phase 2 (✅ — STATUS 2026-09-06):** the `std:` scheme + embedded `.vl` std SHIPPED.
+    `vl std` reports `12 modules, c79b2b70232e980a` and `embedded: 12 modules … (identical)`.
   - **Phase 3 (🟡):** cross-file / std LSP. Module-aware DIAGNOSTICS landed (`lsp/src/moduleGraph.ts`):
     the open file is analyzed as the entry module — its imports resolve through a workspace
     `ModuleReader` (open buffers + disk), so imported names no longer flag "undeclared" and genuine
@@ -2856,10 +2959,13 @@ independent).*
     `deno.json`, `package.json`, or `.git` (at most 6 levels); `.git`, `node_modules`, `dist`,
     `.claude`, `reference` dirs are skipped; at most 500 `.vl` files read per request
     (`MAX_DISK_FILES`); open-buffer text wins over disk for any file open in the editor.
-    REMAINING: the `std:` scheme (phase 2).
+    **STATUS 2026-09-06: DONE — #2072** wired `std:NAME` → `vl-std:/NAME.vl` in
+    `lsp/src/moduleGraph.ts`, so go-to-definition on a std export opens the embedded source.
   - **Deferred:** import maps, namespace/default imports, export-all, re-exports.
-- 🟡 **H2. Make VL expressive enough to write a compiler.** REMAINING: maps (B6a), enum tag for
-  literal-unions (A16).
+- 🟡 **H2. Make VL expressive enough to write a compiler.** **STATUS 2026-09-06: both named
+  remainders are met** — maps run and the compiler itself uses them 182 times (`typecheck.vl` 73,
+  `wasmEmit.vl` 27), and a literal union reps as an interned i32 atom (#688). A16's own
+  remainder is the enum REPRESENTATION question, which is a rep optimisation, not expressiveness.
 - 🟡 **H3. The self-host compiler (`compiler/*.vl`).** Corpus parity REACHED (sweep 312/316, the
   residue is the parked soundness xfails — see "Kill the TS host" in Next; history →
   `CHANGELOG.md`). The port compiles ITSELF to a byte-exact native fixpoint (stage3 == stage4,
@@ -2877,7 +2983,10 @@ independent).*
     literal, a `{[string]: i32}` parameter, `Circle | Rect` `==`) also run today; the PR that
     closed each was not re-derived, so treat this bullet as the shape of the burn-down rather
     than a current failure list — the `…` may still hide gaps nobody has probed.
-  - ⬜ **H4.1. No `byte`/`u8` type (ergonomic/representation gap, not a blocker).** Bytes are
+  - ⬜ **H4.1. No `byte`/`u8` VALUE type (ergonomic gap, not a blocker).** **STATUS 2026-09-06:
+    the old headline ("No `byte`/`u8` type") was false** — `const b: u8[] = [1, 200, 255]` runs
+    and prints `200` / `3`. A `u8` VALUE is refused by a DESIGN sentence, not a capability one
+    ("`u8` is a storage type, not a value type"). Bytes are
     represented as `i32` masked `& 0xff` in `wasmEmit.vl` and round-trip/instantiate fine; a real
     packed byte buffer (B7/B6 `(array i8)`) would drop the 4×-wide detour. (detail: `docs/internals/selfhost-gaps.md` §H4.1)
   - ⬜ **H4.6. Array spread / concat in call position (worked around).** A small `appendAll()` loop
@@ -2911,7 +3020,7 @@ independent).*
   diagnostics via `fd_write`; (3) `print` lowers to `fd_write` so EMITTED user programs also run
   under any stock engine. Then the only dependency is a prebuilt conforming engine binary (any
   GC+WASI engine — wasmtime today), same trust/distribution model as deno now, and
-  `scripts/vl-host` is deleted. Low priority while the interim host is ~150 frozen lines.
+  `scripts/vl-host` is deleted. **STATUS 2026-09-06: the host is 5,704 lines, not ~150** (`main.rs` 5,678 + `std_embedded.rs` 26), so "low priority while it is small" no longer describes it.
 - ⬜ **H5. Versioning — deferred; rustup/Volta model, not nvm** (→ `DECISIONS.md`). Make the H-M1
   install path version-stamped so a launcher can slot in later.
 
@@ -2945,7 +3054,7 @@ piece that can land early, fully decoupled).
   finish folding the corpus RUN + CHECK verdicts onto the native/wasmtime tier (this is F-tiers +
   Next step 2) so no gate depends on Deno-as-an-engine. Then the only thing left for Deno is
   *orchestration*, not execution.
-- ⬜ **J2 — the test harness (the hard core).** All 52 `tests/*.ts` are `Deno.test`. Split by what
+- ⬜ **J2 — the test harness (the hard core).** All **130** `tests/*.ts` (re-counted 2026-09-06; this said 52) are `Deno.test`. Split by what
   they test:
   - **Behavioral `.vl` corpus** (`cases_test`/`cases_wasm_test`, `selfhost_*`) → migrate to the
     native runner + `*.test.vl` under **`vl test`** (already designed/charted — see Next +
@@ -2956,9 +3065,10 @@ piece that can land early, fully decoupled).
     once `vl test` has absorbed the behavioral corpus.
 - 🟡 **J3 — build/dev scripts.** Nearly done by attrition: `build-binary.ts`→`.sh`, and
   `smoke-binary`/`perf*`/`checker-parity-sweep`/`native-golden-check` are all deleted (retired with
-  the TS compiler / as redundant). The ONLY remaining `scripts/*.ts` is **`gen-std.ts`** (embeds the
-  `.vl` std into `std/embedded.ts`) — load-bearing; port to `.vl` (dogfood) once VL has the file I/O
-  it needs, or move to Node. Audit for `Deno.*` globals when ported.
+  the TS compiler / as redundant). **STATUS 2026-09-06: TWO remain, not one** — `gen-std.ts` (embeds the
+  `.vl` std into `std/embedded.ts`) and `shared-instance-probe.ts`, load-bearing in its own right
+  ("compile two programs in ONE compiler instance — the shape no other instrument has", D864).
+  Both: port to `.vl` (dogfood) once VL has the file I/O it needs, or move to Node. Audit for `Deno.*` globals when ported.
 - ⬜ **J4 — bundling (independent; can land anytime).** The LSP (`cd lsp && deno task build`) and
   the playground (`playground/build.ts`) are esbuild-under-Deno; their deps are already
   node-resolvable (binaryen, vscode-languageserver*, monaco). Swap to esbuild-on-Node (`npm`
