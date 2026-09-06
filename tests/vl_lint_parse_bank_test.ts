@@ -13,21 +13,17 @@
 // lint: a `match` and a template hole rewrite an arena slot, a literal-union annotation and
 // an `as` over an alias rewrite a spelling in place, `__callsite__` appends nodes past the
 // parse's tail, and a deep `is` runs a whole second pass over a generated fragment.
-const SEED = new URL("../build/vl-compiler.wasm", import.meta.url).pathname;
+//
+// GATING: the seed wasm, like the other native `vl_*` suites — the plain `ci` job builds
+// none, so every case here is `ignored` there and runs under ci-native.
+import { COMPILER, exists } from "./support/tree.ts";
 
-const seedExists = (() => {
-  try {
-    Deno.statSync(SEED);
-    return true;
-  } catch {
-    return false;
-  }
-})();
+const ENABLED = exists(COMPILER);
 
 type Exports = Record<string, (...args: number[]) => number>;
 
-const module = seedExists
-  ? new WebAssembly.Module(Deno.readFileSync(SEED))
+const module = ENABLED
+  ? new WebAssembly.Module(Deno.readFileSync(COMPILER))
   : undefined;
 
 const pushString = (push: (cp: number) => number, text: string) => {
@@ -63,7 +59,10 @@ const findings = (exp: Exports, src: string, check: boolean): string => {
 
 // Each case is a whole program; the name says which arena write it exercises.
 const CASES: [string, string][] = [
-  ["plain", `function f(a: i32): i32 { a + 1 }\nlet unusedOne = 2\nprint(f(3))\n`],
+  [
+    "plain",
+    `function f(a: i32): i32 { a + 1 }\nlet unusedOne = 2\nprint(f(3))\n`,
+  ],
   [
     "match desugar (a slot rewrite)",
     `type Move = { x: i32 }\ntype Stop = { why: string }\ntype Cmd = Move | Stop\n` +
@@ -77,7 +76,7 @@ const CASES: [string, string][] = [
   ],
   [
     "template hole (a slot rewrite)",
-    "function name(): string { \"vl\" }\nprint(`hello ${name()}`)\n",
+    'function name(): string { "vl" }\nprint(`hello ${name()}`)\n',
   ],
   [
     "literal union annotation (a spelling rewrite)",
@@ -100,38 +99,48 @@ const CASES: [string, string][] = [
 ];
 
 for (const [name, src] of CASES) {
-  Deno.test(`parse bank: lint after check == lint alone — ${name}`, () => {
-    if (!module) throw new Error(`no seed at ${SEED}`);
-    // ONE instance for both arms: a fresh instance per arm would also pass with the bank
-    // permanently dead, which is the failure mode this file exists to see.
-    const exp = new WebAssembly.Instance(module, {})
-      .exports as unknown as Exports;
-    const alone = findings(exp, src, false);
-    const afterCheck = findings(exp, src, true);
-    if (alone !== afterCheck) {
-      throw new Error(
-        `lint findings differ with a preceding checkSrc\n` +
-          `--- lint alone ---\n${alone}\n--- after check ---\n${afterCheck}`,
-      );
-    }
+  Deno.test({
+    name: `parse bank: lint after check == lint alone — ${name}`,
+    ignore: !ENABLED,
+    fn: () => {
+      if (!module) throw new Error(`no seed at ${COMPILER}`);
+      // ONE instance for both arms: a fresh instance per arm would also pass with the bank
+      // permanently dead, which is the failure mode this file exists to see.
+      const exp = new WebAssembly.Instance(module, {})
+        .exports as unknown as Exports;
+      const alone = findings(exp, src, false);
+      const afterCheck = findings(exp, src, true);
+      if (alone !== afterCheck) {
+        throw new Error(
+          `lint findings differ with a preceding checkSrc\n` +
+            `--- lint alone ---\n${alone}\n--- after check ---\n${afterCheck}`,
+        );
+      }
+    },
   });
 }
 
 // The same question over a program the check REWRITES and one it does not, back to back on
 // one instance: a bank that survived a second program's parse would answer here.
-Deno.test("parse bank: a second program does not inherit the first's tree", () => {
-  if (!module) throw new Error(`no seed at ${SEED}`);
-  const exp = new WebAssembly.Instance(module, {})
-    .exports as unknown as Exports;
-  const want = CASES.map(([, src]) => findings(exp, src, false));
-  const got: string[] = [];
-  for (const [, src] of CASES) got.push(findings(exp, src, true));
-  for (let i = 0; i < want.length; i++) {
-    if (want[i] !== got[i]) {
-      throw new Error(
-        `program ${i} (${CASES[i][0]}) differs after a run of every other program\n` +
-          `--- want ---\n${want[i]}\n--- got ---\n${got[i]}`,
-      );
+Deno.test({
+  name: "parse bank: a second program does not inherit the first's tree",
+  ignore: !ENABLED,
+  fn: () => {
+    if (!module) throw new Error(`no seed at ${COMPILER}`);
+    const exp = new WebAssembly.Instance(module, {})
+      .exports as unknown as Exports;
+    const want = CASES.map(([, src]) => findings(exp, src, false));
+    const got: string[] = [];
+    for (const [, src] of CASES) got.push(findings(exp, src, true));
+    for (let i = 0; i < want.length; i++) {
+      if (want[i] !== got[i]) {
+        throw new Error(
+          `program ${i} (${
+            CASES[i][0]
+          }) differs after a run of every other program\n` +
+            `--- want ---\n${want[i]}\n--- got ---\n${got[i]}`,
+        );
+      }
     }
-  }
+  },
 });
