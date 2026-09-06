@@ -12345,19 +12345,30 @@ function pushIndexMapNullNarrow(idxIx: i32, fnIx: i32) {
   false
 }
 
-// Retire every live narrowing whose key is a cell of the receiver keyed `root` — the
+// Is `k` a place BELOW `tgt` — `tgt[…]`, `tgt.f`, or anything under those? The emitter's
+// copy of `writeRetiresNarrowing`'s prefix legs, in both separators, so a write retires the
+// same keys on both sides of the compiler.
+function keyIsBelow(k: string, tgt: string): boolean {
+  const bx = tgt + "["
+  if k.length > bx.length {
+    if k.slice(0, bx.length) == bx { return true }
+  }
+  const dt = tgt + "."
+  if k.length > dt.length {
+    if k.slice(0, dt.length) == dt { return true }
+  }
+  false
+}
+
+// Retire every live narrowing whose key is a place below the one keyed `root` — the
 // emitter twin of `retireNarrowingsForWrite`'s prefix rule. Needed because the checker
 // retires and re-types a write's reads at the declared rep, which for a niche cell is one
 // `print` renders fine, so the program stays check-clean while the stale emit-side entry traps.
 function retireNarrowForIndexCells(root: string) {
   if root == "" { return 0 }
-  const pfx = root + "["
   let i = 0
   while i < narrowTop {
-    const k = narrowNames[i]
-    if k.length > pfx.length {
-      if k.slice(0, pfx.length) == pfx { narrowRetired[i] = 1 }
-    }
+    if keyIsBelow(narrowNames[i], root) { narrowRetired[i] = 1 }
     i = i + 1
   }
   0
@@ -13092,26 +13103,28 @@ export function pushPostGuardNarrow(stmtIx: i32, fnIx: i32) {
       // No complement push, unlike the Ident arm: a member path isn't a
       // `narrowBareIdentOnly` name, so `pushNarrowRep` would decline it anyway.
       if tgt is Member {
+        const mtk = memberPathKeyOf(s.binLeft)
+        // The cells and fields BELOW the written path go unconditionally, as the Ident arm's
+        // do: a new value at `w.f` says nothing about what the old one's `w.f[0]` held.
+        retireNarrowForIndexCells(mtk)
         if rhsNullable {
-          const mtk = memberPathKeyOf(s.binLeft)
           if mtk != "" { retireNarrowFor(mtk) }
         }
       }
-      // The index target: a literal subscript names its cell, so only the exact key
-      // retires (`indexPathKeyOf` mints no key for a nested receiver, so no prefix leg can
-      // catch it). A variable subscript names no cell and may have hit any of them, so it
-      // retires the receiver's whole family, matching the checker's `tgtKey == ""` branch.
+      // The index target: a literal subscript names its cell, so the exact key retires on a
+      // write the narrowing does not admit and everything BELOW it retires either way — a
+      // nested cell keys now (D1722). A variable subscript names no cell and may have hit any
+      // of them, so it retires the receiver's whole family, as the checker's `tgtKey == ""` does.
       if tgt is Index {
-        if rhsNullable {
-          const itk = indexPathKeyOf(s.binLeft)
-          if itk != "" {
-            retireNarrowFor(itk)
-          } else {
-            const iroot = P.nodes[unwrapParen(tgt.idxArr)]
-            if iroot is Ident { retireNarrowForIndexCells(iroot.identName) }
-            if iroot is Member {
-              retireNarrowForIndexCells(memberPathKeyOf(tgt.idxArr))
-            }
+        const itk = indexPathKeyOf(s.binLeft)
+        if itk != "" {
+          retireNarrowForIndexCells(itk)
+          if rhsNullable { retireNarrowFor(itk) }
+        } else {
+          const iroot = P.nodes[unwrapParen(tgt.idxArr)]
+          if iroot is Ident { retireNarrowForIndexCells(iroot.identName) }
+          if iroot is Member {
+            retireNarrowForIndexCells(memberPathKeyOf(tgt.idxArr))
           }
         }
       }
