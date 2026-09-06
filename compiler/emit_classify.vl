@@ -9063,28 +9063,105 @@ function declRowFieldFits(vc: i32, sc: i32, valIx: i32, si: i32, mfi: i32) {
   elemRowsCaptureCompat(vn, fn)
 }
 
-// May the value's element row `vn` be re-interned at the destination row `dn`? Two things a
-// re-intern cannot do: invent a field the source lacks, and renumber a box's positional tags.
-// It CAN drop a field the destination does not want and widen one it does, which is the
-// accepting side of the object-shape floor and stays lenient here (D1694, D1696).
-function elemRowsCaptureCompat(vn: string, dn: string): boolean {
-  elemRowsCaptureCompatAt(vn, dn, 64)
+// An open-addressed pair table, generation-stamped so a new walk costs no clearing: a slot is
+// live only while its stamp equals the walk id, and the capacity is sized once per emit pass.
+// The arrays are the caller's, so two users cannot share a slot (D1705).
+function pxSized(cap: i32, keyA: i32[], keyB: i32[], stamp: i32[], val: i32[]) {
+  while keyA.length < cap {
+    keyA.push(-1)
+    keyB.push(-1)
+    stamp.push(-1)
+    val.push(-1)
+  }
+  0
 }
 
-// The same question one nesting level at a time: a nested-struct field is asked of its own
-// two element rows, so a box or a missing field at ANY depth refutes. `depth` bounds a
-// self-recursive type, whose rows would otherwise walk each other forever; running out is
-// lenient, which is the same answer an unresolvable row gets (D1705).
-function elemRowsCaptureCompatAt(vn: string, dn: string, depth: i32): boolean {
+// The capacity for a table over `want` keys: a power of two at least four times it, so the
+// probe stays short, floored at 1024 and capped so one table cannot outgrow the heap.
+function pxCapFor(want: i32): i32 {
+  let cap = 1024
+  while cap < want * 4 {
+    if cap >= 262144 { return 262144 }
+    cap = cap * 2
+  }
+  cap
+}
+
+// The slot `(a, b)` occupies on walk `walk`, or the free slot it would take; -1 when the probe
+// finds neither, which is the caller's named default. Reading a free slot back is how a caller
+// answers "not seen", so both callers read the slot rather than a boolean.
+function pxSlotOf(
+  keyA: i32[],
+  keyB: i32[],
+  stamp: i32[],
+  cap: i32,
+  walk: i32,
+  a: i32,
+  b: i32,
+): i32 {
+  if cap < 16 { return -1 }
+  if keyA.length < cap { return -1 }
+  let h = (a + 3) * 1000003 + b
+  h = h % cap
+  if h < 0 { h = h + cap }
+  let steps = 0
+  while steps < cap {
+    if stamp[h] != walk { return h }
+    if keyA[h] == a {
+      if keyB[h] == b { return h }
+    }
+    h = h + 1
+    if h == cap { h = 0 }
+    steps = steps + 1
+  }
+  -1
+}
+
+// May the value's element row `vn` be re-interned at the destination row `dn`? A re-intern
+// cannot invent a field the source lacks or renumber a box's positional tags; it CAN drop a
+// field and widen one, which is the object-shape floor's accepting side and stays lenient.
+function elemRowsCaptureCompat(vn: string, dn: string): boolean {
+  if ercBusy == 0 {
+    if ercGenP != emitPassGen {
+      ercCap = pxCapFor(sScanLim())
+      ercKeyV = []
+      ercKeyD = []
+      ercStamp = []
+      ercVal = []
+      pxSized(ercCap, ercKeyV, ercKeyD, ercStamp, ercVal)
+      ercGenP = emitPassGen
+      ercWalk = 0
+    }
+    ercWalk = ercWalk + 1
+  }
+  ercBusy = ercBusy + 1
+  const ercAns = elemRowsCaptureCompatAt(vn, dn)
+  ercBusy = ercBusy - 1
+  ercAns
+}
+
+// The walk's visited-pair index: `-2` marks a pair whose answer is still being computed, which
+// is the cycle guard a self-recursive type needs. Termination is the PAIR's, so a program's own
+// shape bounds the walk and no depth counter does (D1705).
+let ercBusy: i32 = 0
+let ercCap: i32 = 0
+let ercGenP: i32 = 0 - 1
+let ercWalk: i32 = 0
+let ercKeyV: i32[] = []
+let ercKeyD: i32[] = []
+let ercStamp: i32[] = []
+let ercVal: i32[] = []
+
+// The same question one nesting level at a time: a nested-struct field is asked of its own two
+// element rows, so a box or a missing field at ANY depth refutes. A pair the index cannot hold
+// answers leniently, the same answer an unresolvable row gets.
+function elemRowsCaptureCompatAt(vn: string, dn: string): boolean {
   if vn == dn { return true }
-  if depth <= 0 { return true }
   // A CONTAINER key names no row, so peel both and ask about their elements: a list of lists
   // records `A[]`, which `structIndexByName` cannot resolve and the walk would skip (D1697).
   const vPeel = refArrElemKeyDeferred(vn)
   const dPeel = refArrElemKeyDeferred(dn)
-  if vPeel != "" && dPeel != "" {
-    return elemRowsCaptureCompatAt(vPeel, dPeel, depth - 1)
-  }
+  if vPeel != "" && dPeel != "" { return elemRowsCaptureCompatAt(vPeel, dPeel) }
   const vi = structIndexByName(vn)
   const di = structIndexByName(dn)
   if vi < 0 || di < 0 {
@@ -9094,26 +9171,49 @@ function elemRowsCaptureCompatAt(vn: string, dn: string, depth: i32): boolean {
     if vi < 0 && di < 0 { return vn == dn }
     return true
   }
+  const slot = pxSlotOf(ercKeyV, ercKeyD, ercStamp, ercCap, ercWalk, vi, di)
+  if slot < 0 { return true }
+  if ercStamp[slot] == ercWalk {
+    if ercVal[slot] == 0 - 2 { return true }
+    return ercVal[slot] == 1
+  }
+  ercKeyV[slot] = vi
+  ercKeyD[slot] = di
+  ercStamp[slot] = ercWalk
+  ercVal[slot] = 0 - 2
+  let fits = true
   let k = 0
   while k < sFieldCount[di] {
     const at = sFieldStart[di] + k
     const vj = sFieldIndex(vi, sFieldNames[at])
-    if vj < 0 { return false }
-    const dcode = sFieldTypes[at]
-    if dcode == sFieldTypeAt(vi, vj) {
-      const dv = sFieldElemName[at]
-      const vv = sFieldElemNameAt(vi, vj)
-      if dv != "" && vv != "" {
-        if dcode == 16 {
-          if !unionMemberSetsCompat(dv, vv) { return false }
-        } else if dcode == 15 {
-          if !elemRowsCaptureCompatAt(vv, dv, depth - 1) { return false }
+    if vj < 0 {
+      fits = false
+    } else {
+      const dcode = sFieldTypes[at]
+      if dcode == sFieldTypeAt(vi, vj) {
+        const dv = sFieldElemName[at]
+        const vv = sFieldElemNameAt(vi, vj)
+        if dv != "" && vv != "" {
+          if dcode == 16 {
+            if !unionMemberSetsCompat(dv, vv) { fits = false }
+          } else if dcode == 15 {
+            if !elemRowsCaptureCompatAt(vv, dv) { fits = false }
+          }
         }
       }
     }
     k = k + 1
   }
-  true
+  // The recursion may have re-probed and moved nothing, but a nested walk can have filled the
+  // table past this slot, so the answer is written back through a fresh probe.
+  const back = pxSlotOf(ercKeyV, ercKeyD, ercStamp, ercCap, ercWalk, vi, di)
+  if back >= 0 {
+    ercKeyV[back] = vi
+    ercKeyD[back] = di
+    ercStamp[back] = ercWalk
+    if fits { ercVal[back] = 1 } else { ercVal[back] = 0 }
+  }
+  fits
 }
 
 // True if struct-table row `si` is an anonymous shape — one `collectAnonShapes` minted
