@@ -444,6 +444,98 @@ the 48,002-line file, against 0.56% and 0.00% for the lex. It is a different pro
 `checkProgram` and `jwSecondPass` may move the shared node arena, so reusing the checked arena
 needs a statement about what the check leaves behind, not a bank.
 
+### B6c · What the check leaves behind, and the second parse
+
+B6b's next term is the lint's own `parseProgram`. Reusing the checked arena needs a statement
+of what the check leaves there, so that is the first half, and it is a MEASUREMENT: a probe
+hashes every table the parser fills right after `parseProgram` and again after the whole check,
+over the 2,991 `tests/cases` files a single-source `checkSrc` grades.
+
+| table | files whose digest moved | what moves it |
+| --- | ---: | --- |
+| `P.toks`, `P.toks.length`, `P.pos` | 3 | `jwSecondPass` tokenizes its generated fragment ONTO the stream and parses it |
+| `P.nodes.length`, `nodeToks` | 39 | APPENDS: `csPreMintLocs`' call-site `ObjLit`s, the lowerings' minted nodes, the deep-`is` fragment |
+| `P.nodes`, as `formatProgram` renders it from the root | 44 | those appends, plus the four IN-PLACE slot rewrites below |
+| `declNameTok` | 3 | the generated fragment's own declarations |
+| the spelling arena (`tsKind` … `tsKids`) | 3 | the fragment's annotations |
+| `annTsNode`/`annTsRoot`, `udTsNode`/`udTsRoot` | 471 | `canonEmitTypeNames` drops a rewritten node's spelling root |
+| `callSiteLoc` | 5 | `csPreMintLocs` records the `ObjLit` it minted per call |
+| `tplHole`, `P.diags`, `vcDg*`, `declGp*`, `bodyTyDeclNode`, the bound tables, the extern tables | 0 | untouched |
+| the LINT's own findings over that arena | 3 | two deep-`is` files and one `match` |
+
+A counter inside the sweep adds the row a digest cannot separate: `canonEmitTypeNames` rewrote a
+name in place on **560** of the 2,991.
+
+**So "the parse tree plus appended rows" is FALSE, and a pop is not the whole answer.** The tree
+holds exactly six `P.nodes[<ix>] = …` sites — the flat-layout member fold, the `string` template
+hole, the match arm splice and the match desugar in `typecheck.vl`, and the deep-`is`
+substitution and site rewrite in `json_walk.vl` — and each REPLACES a node the parser built with
+one minted during the check; the desugar's if-chain is reachable only through the slot it
+overwrote, so popping its rows without noticing would leave the lint reading a dangling index.
+Canon adds four in-place SPELLING writes on nodes that stay: `TypeRef.tyName`,
+`UnionDecl.udVariants[k]`, `IsExpr.isVariant` and `AsExpr.asTy`, all four read by
+`collectTypeNameRefs`.
+
+**The fix separates the two, because they are undoable in different senses.** A slot rewrite
+cannot be undone by popping, so each of the six stamps a monotone counter (`arenaEpochNow`,
+`ast.vl`) through `arenaReplaceNode` / `arenaSetNode` and the bank retires. `parseProgram`
+stamps it as well, so ANY re-parse of anything retires the bank rather than a list of call sites
+having to stay complete, and `jwSecondPass` stamps it before it appends its first token. The
+four spelling writes CAN be undone — the sweep already records which nodes it rewrote — so each
+banks the string it replaced and `canonRestoreSpellings` writes them back, newest first.
+`lintSrc` then pops `P.nodes` / `nodeToks` / `declNameTok` / `tplHole` to the lengths the parser
+left and lints the tree where it stands. Only a diagnostic-free parse banks, and
+`vcLoadToksEntry`, `vcLoadToksMod` and `modCompile` all release it.
+
+**The canon undo is a PERFORMANCE measure, not a correctness one, and the control says so.** A
+build that dropped `canonRestoreSpellings` and let the lint read the sweep's names moved **0
+findings of 10,898** source files; the same harness on a build where the slot rewrites do not
+stamp moves **23 of 3,002** in `tests/cases` and fails two cases of
+`tests/vl_lint_parse_bank_test.ts`, so it is the harness that is validated, not the undo that is
+idle. What the undo buys is the REPLAY RATE: the sweep rewrites a name on 560 of 2,991 files, so
+retiring the bank there instead of banking it reads **79%** where banking reads **97.8%**
+(2,943 of 3,008; 99.1% over all 10,898 `.vl` files), and leaves `parseProgram` under `lintSrc`
+at 1.31% of a `tests/cases` run instead of 0.59% — both read off the intermediate build that
+did exactly that.
+
+Guest shares, `--names` seeds, warm, both arms on one box:
+
+| witness | frame | master | after |
+| --- | --- | ---: | ---: |
+| `vl check tests/cases --severity info` (3,008 files) | `parseProgram` incl | 11.60% | 8.64% |
+| | — under `lintSrc` | 4.12% | **0.59%** |
+| | — under `checkSrc` | 3.45% | 3.47% |
+| | `lintSrc` incl | 24.28% | 20.40% |
+| `vl check` one 48,002-line importless file | `parseProgram` incl | 21.15% | 9.98% |
+| | — under `lintSrc` | 9.38% | **0.00%** |
+| | `lintSrc` incl | 32.45% | 22.80% |
+| `vl check compiler/typecheck.vl` (26 modules) | `parseProgram` incl | 6.67% | 6.20% |
+| | — under `lintSrc` | 0.00% | 0.00% |
+
+CPU, `/usr/bin/time` user+sys, minimum of interleaved reps against two fixpoint seeds, on a box
+at load 7 – 16:
+
+| workload | reps | master | after | ratio |
+| --- | ---: | ---: | ---: | ---: |
+| `vl check tests/cases --severity info` | 11 | 2.36 s | 2.28 s | 0.966 |
+| `vl check` the 48,002-line file | 11 | 0.68 s | 0.62 s | 0.912 |
+| `vl check compiler/entry.vl` | 7 | 3.50 s | 3.50 s | 1.000 |
+| `vl check compiler/typecheck.vl` | 9 | 0.78 s | 0.78 s | 1.000 |
+
+The two module-mode rows are the control and read 1.000 on a quiet box; across five sittings at
+box load 13 to 213 they read 0.797 – 1.054, which is what a shared box does to a ratio rather
+than anything about the change. The PROFILE is the sharper statement for them either way: it
+puts `lintSrc` at 0.00% inclusive in both arms, because a graph check never reaches the
+single-source path at all. L2 self-compile CPU is a wash (min 4.55 s against 4.12 s over five
+interleaved rounds), as it must be — the compiler's own modules import, so its check never
+enters this path either.
+
+The proof is lint OUTPUT identity: per-file `vl check --severity info --json` over all 10,898
+source `.vl` files is byte-identical between the two seeds, rc included, with the three matrix
+templates that trap under `vl check` normalised only for their wasm frame offsets and the seed's
+byte size; `compile(candidate, master source)` is `cmp`-equal to master's own fixpoint and all
+3,008 `tests/cases` modules are identical, since neither the lint nor the bank feeds codegen.
+
 ### B7 · `collectA`'s three phases, and which one a suffix can extend
 
 `monoRebuild`'s stamp (#2594) removed the DUPLICATE rebuild after each minted instance;
