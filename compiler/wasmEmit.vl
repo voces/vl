@@ -934,13 +934,27 @@ function mvScalarValKind(slot: i32): VKind | null {
   return null
 }
 
+// Every `VKind` the four scalar-list descriptors below do not name, as one answer: a
+// recorded failure plus the i32 list's own index, so the module stays well-formed while the
+// refusal is what a user reads. A SILENT i32 answer here emitted a `string[]` against the
+// i32 backing at `vl check` rc 0 (D1684).
+function scalarListKindUnlisted(fallback: i32): i32 {
+  emitFail(
+    "emitProgram: a list op has no rep for this element kind — i32, boolean, string, f64, i64, f32 and u8 elements are the ones it speaks",
+  )
+  fallback
+}
+
 // The wrapper struct heap type for a scalar element kind.
 function scalarListWrap(elemKind: VKind) {
   if elemKind == "u8list" { return bl8TypeIdx }
   if elemKind == "f64" { return fl64TypeIdx }
   if elemKind == "i64" { return il64TypeIdx }
   if elemKind == "f32" { return fl32TypeIdx }
-  lTypeIdx
+  // The string list's wrapper is the map's keys-list type, which any `string[]` shares.
+  if elemKind == "str" { return mkListIdx }
+  if elemKind == "i32" { return lTypeIdx }
+  scalarListKindUnlisted(lTypeIdx)
 }
 
 // The backing `(array (mut <elem>))` heap type for a scalar element kind.
@@ -949,28 +963,43 @@ function scalarListBack(elemKind: VKind) {
   if elemKind == "f64" { return fa64TypeIdx }
   if elemKind == "i64" { return ia64TypeIdx }
   if elemKind == "f32" { return fa32TypeIdx }
-  aTypeIdx
+  if elemKind == "str" { return mkArrIdx }
+  if elemKind == "i32" { return aTypeIdx }
+  scalarListKindUnlisted(aTypeIdx)
+}
+
+// Open the value-typed `if` a fused `?? d` list read joins on, at the element's own rep. A
+// string element is a REF, so it takes `fbIfRef` where every other kind takes a valtype
+// byte; one speller, so the two arms of the read cannot disagree about the join type.
+function fbIfForScalarListElem(elemKind: VKind) {
+  if elemKind == "str" { return fbIfRef(sTypeIdx) }
+  fbIf(scalarListBlocktype(elemKind))
 }
 
 // The `array.get` result blocktype byte for a scalar element kind (i32 `0x7f`, f64
-// `0x7c`, i64 `0x7e`) — the value-typed-`if` rep a fused `?? d` read joins on. A `u8[]`
-// element reads as i32 (`array.get_u` widens), so it shares the plain i32 blocktype.
+// `0x7c`, i64 `0x7e`). A `u8[]` element reads as i32 (`array.get_u` widens), so it shares
+// the plain i32 blocktype; a `string` element has no byte and goes through `fbIfRef`.
 function scalarListBlocktype(elemKind: VKind) {
   if elemKind == "u8list" { return 127 }
   if elemKind == "f64" { return 124 }
   if elemKind == "i64" { return 126 }
   if elemKind == "f32" { return 125 }
-  127
+  if elemKind == "i32" { return 127 }
+  scalarListKindUnlisted(127)
 }
 
 // Whether the module-global list types for a scalar element kind are collected — the
-// loud-fail guard every list op shares.
+// loud-fail guard every list op shares. An unlisted kind answers false, which is the
+// caller's own loud refusal rather than a silent read at the i32 list's types.
 function scalarListUsed(elemKind: VKind) {
   if elemKind == "u8list" { return ba8Used }
   if elemKind == "f64" { return fa64Used }
   if elemKind == "i64" { return ia64Used }
   if elemKind == "f32" { return fa32Used }
-  lUsed
+  // The string-ref list is minted for any `string[]` field and for the map's keys list.
+  if elemKind == "str" { return slUsed || mUsed }
+  if elemKind == "i32" { return lUsed }
+  false
 }
 
 // Emit `exprIx` coerced to a scalar element kind's value rep — the f64/i64 widen of a
@@ -16055,7 +16084,12 @@ function emitListGetOrGo(body: i32[], getIx: i32, defIx: i32, fnIx: i32) {
       }
       // The scalar element kind (i32 / f64 / i64) selects the list types + read rep — one
       // descriptor lookup instead of an `isF64 ? … : …` fork (so i64 is a descriptor arm).
-      const ek = scalarListElemKind(callee.memObj, fnIx)
+      let ek = scalarListElemKind(callee.memObj, fnIx)
+      // The string list, for `u8list`'s reason one rep over: its element is a REF, and
+      // `exprArray`'s typed-IR fast path claims ANY array, so the classifier answers "i32"
+      // for a `string[]` and this read would take the i32 backing (D1684). Asked here and
+      // not in the classifier, whose ten other callers each route a string list already.
+      if exprStringArray(callee.memObj, fnIx) { ek = "str" }
       if ek == null {
         return emitFail("emitProgram: .get receiver is not a scalar list")
       }
@@ -16070,17 +16104,20 @@ function emitListGetOrGo(body: i32[], getIx: i32, defIx: i32, fnIx: i32) {
       // cond: idx u< len  (one unsigned compare covers negative + past-len)
       if emitListGetIdx(body, c.callArgs[0], fnIx) < 0 { return -1 }
       if emitListGetRecv(body, callee.memObj, fnIx, lTy) < 0 { return -1 }
-      fbStructGet(lTy, 1)           // field 1: len
-      fbI32Bin(73)                  // 0x49 i32.lt_u
-      fbIf(scalarListBlocktype(ek)) // 0x04 if, the element's result blocktype
+      fbStructGet(lTy, 1)       // field 1: len
+      fbI32Bin(73)              // 0x49 i32.lt_u
+      fbIfForScalarListElem(ek) // 0x04 if, the element's own result rep
       ctrlEnter()
       if emitListGetRecv(body, callee.memObj, fnIx, lTy) < 0 { return -1 }
-      fbStructGet(lTy, 0)           // field 0: backing
+      fbStructGet(lTy, 0)       // field 0: backing
       if emitListGetIdx(body, c.callArgs[0], fnIx) < 0 { return -1 }
-      fbArrayGet(aTy)               // 0xfb 0x0b array.get — the element
-      fbElse()                      // 0x05 else
+      fbArrayGet(aTy)           // 0xfb 0x0b array.get — the element
+      // A string backing's element slot is `(ref null $str)` while the `if` joins on the
+      // non-null rep the consumer reads; an in-range element of a live list is never null.
+      if ek == "str" { fbRefAsNonNull() }
+      fbElse() // 0x05 else
       if emitScalarValue(body, defIx, fnIx, ek) < 0 { return -1 }
-      fbEnd()                       // 0x0b end
+      fbEnd()  // 0x0b end
       ctrlLeave()
       return 0
     }
