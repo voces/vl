@@ -328,6 +328,7 @@ import {
   letIsNulClosure,
   letIsNulList,
   letIsSet,
+  letRepAnnOf,
   paramArray,
   paramF32Array,
   paramF64Array,
@@ -4312,7 +4313,10 @@ export function captureValKind(fe: i32, name: string): VKind {
   const bn = P.nodes[b]
   if bn is Param { return vtKindOfType(bn.parType) }
   if bn is LetDecl {
-    if bn.letType >= 0 {
+    // `annNamesRep`: the env field must be the LOCAL's own cell, and a negation names no rep,
+    // so both take the initializer's — without this the local is an f64 and the field an
+    // i32 (D1784).
+    if annNamesRep(bn.letType) {
       const annK = vtKindOfType(bn.letType)
       // The env field must match the LOCAL's own cell, not re-derive from the annotation:
       // a narrowed nullable initialiser keeps its niche through the binding, because the
@@ -4369,7 +4373,9 @@ export function captureValStructIdx(fe: i32, name: string) {
   // merged row too. The third resolver of the same owner; see `anonLeafParamRowOf`.
   if bn is Param { return anonLeafParamRowOf(b, annValtypeSlotOf(bn.parType)) }
   if bn is LetDecl {
-    if bn.letType >= 0 { return annValtypeSlotOf(bn.letType) }
+    // `annNamesRep`, paired with `captureValKind`'s own guard: a kind and its slot must come
+    // from one ladder, so a negation sends both to the initializer (D1784).
+    if annNamesRep(bn.letType) { return annValtypeSlotOf(bn.letType) }
     if bn.letInit >= 0 {
       // The owning frame as an arena index — the same conversion `captureValKind`'s
       // un-annotated arm makes, and for the same reason: `letIsMap`, `letIsNulRef` and
@@ -11269,7 +11275,9 @@ function declaredF32(name: string) { declaredKind(name) == "f32" }
 export function letInfersF32(letIx: i32, fnIx: i32) {
   const d = P.nodes[letIx]
   if d is LetDecl {
-    if d.letType >= 0 { return false }
+    // `letRepAnnOf`, so a negation-annotated binding infers its slot as an un-annotated one
+    // does — the annotation names no rep to override it with (D1784).
+    if letRepAnnOf(letIx) >= 0 { return false }
     if d.letInit < 0 { return false }
     return exprIsF32(d.letInit, fnIx)
   }
@@ -11280,7 +11288,10 @@ export function letInfersF32(letIx: i32, fnIx: i32) {
 function globalIsF32Sid(fnIx: i32, sid: i32) {
   const li = globalLetOfSidIn(fnIx, sid)
   if li < 0 { return false }
-  letIsF32(li)
+  if letIsF32(li) { return true }
+  // The inference fallback `letIsF64`'s twin has built in: with no annotation naming the rep,
+  // the cell came from the initializer (`globalKind`'s f32 arm) and the read asks it too (D1784).
+  letInfersF32(li, -1)
 }
 
 // Is the expression at `exprIx` a float number literal, peeling grouping parens and a
@@ -21179,7 +21190,11 @@ export function letIsLitUnion(letIx: i32) {
 export function letInitIsLitAtom(letIx: i32, fnIx: i32) {
   const d = P.nodes[letIx]
   if d is LetDecl {
-    if d.letType < 0 && d.letInit >= 0 { return exprIsLitAtom(d.letInit, fnIx) }
+    // `letRepAnnOf`, so a negation-annotated binding is read as the un-annotated one it is:
+    // the annotation names no rep, and the initializer's atom is what the cell holds (D1784).
+    if letRepAnnOf(letIx) < 0 && d.letInit >= 0 {
+      return exprIsLitAtom(d.letInit, fnIx)
+    }
     // The annotated face, at any scope: the INITIALIZER is the gate, not the scope. An
     // annotation that softens to `string` over a non-atom init produces no atom, so this
     // declines it and the loud refusal stands for that shape (D1752).
@@ -21346,6 +21361,11 @@ function litAtomMemberTyAt(exprIx: i32, fnIx: i32, depth: i32): i32 {
     }
     const pTy = nodeTyIxOf(paramTypeNode(fnIx, e.identName))
     if tyIsLitUnion(pTy) { return pTy }
+    // The module-global channel, the third storage class: `exprIsLitAtom` claims a global
+    // atom through `globalLetOfIn`, so the widen's texts come from that same binding — the
+    // kind and its member set must resolve through one declaration (D1784).
+    const gli = globalLetOfIn(fnIx, e.identName)
+    if gli >= 0 { return declLitUnionTyAt(gli, fnIx, depth, false) }
   }
   0 - 1
 }
@@ -21361,13 +21381,16 @@ function declLitUnionTyAt(
 ): i32 {
   const d = P.nodes[declIx]
   if d is LetDecl {
-    if d.letType >= 0 {
+    // `letRepAnnOf`: a negation names no rep and so no member set either, and the atom's
+    // membership is the companion its kind cannot ship without — the initializer has it (D1784).
+    const mAnn = letRepAnnOf(declIx)
+    if mAnn >= 0 {
       if wantElem {
-        const aTy = nodeArrayElemTyIx(d.letType)
+        const aTy = nodeArrayElemTyIx(mAnn)
         if tyIsLitUnion(aTy) { return aTy }
         return 0 - 1
       }
-      const lTy = nodeTyIxOf(d.letType)
+      const lTy = nodeTyIxOf(mAnn)
       if tyIsLitUnion(lTy) { return lTy }
       return 0 - 1
     }
@@ -24301,7 +24324,9 @@ export function letIsNulNone(letIx: i32, fnIx: i32): boolean {
   if letIx < 0 { return false }
   const s = P.nodes[letIx]
   if s is LetDecl {
-    if s.letType >= 0 || s.letInit < 0 { return false }
+    // `letRepAnnOf`, not `s.letType`: the comment above holds for every annotation that names
+    // a rep, and a negation names none, so its binding is the un-annotated one (D1784).
+    if letRepAnnOf(letIx) >= 0 || s.letInit < 0 { return false }
     const ini = P.nodes[unwrapParen(s.letInit)]
     if ini is NullLit { return letNullHoleUnfilled(letIx) }
     return exprIsNulNone(s.letInit, fnIx)
@@ -31941,13 +31966,16 @@ export function letIsString(letIx: i32, fnIx: i32) {
 export function letIsI64(letIx: i32, fnIx: i32) {
   const d = P.nodes[letIx]
   if d is LetDecl {
-    if d.letType >= 0 {
-      const lt = P.nodes[d.letType]
+    // `letRepAnnOf`, not `d.letType`: a negation annotation names no rep, so the binding is
+    // classified from its initializer exactly as an un-annotated one is (D1784).
+    const iAnn = letRepAnnOf(letIx)
+    if iAnn >= 0 {
+      const lt = P.nodes[iAnn]
       if lt is TypeRef {
         // Canon's banked type (B144): `nodeTyPrimName` disagrees for an i64 literal union that
         // softens to the spelling `i64`, so the arena type of the softened spelling is used instead.
-        let liTy = nodeTyIxOf(d.letType)
-        if canonRewroteNode(d.letType) { liTy = canonTyIxOf(d.letType) }
+        let liTy = nodeTyIxOf(iAnn)
+        if canonRewroteNode(iAnn) { liTy = canonTyIxOf(iAnn) }
         if tyScalarBaseIs(liTy, "i64") { return true }
       }
       return false
@@ -31966,13 +31994,16 @@ export function letIsI64(letIx: i32, fnIx: i32) {
 export function letIsF64(letIx: i32, fnIx: i32) {
   const d = P.nodes[letIx]
   if d is LetDecl {
-    if d.letType >= 0 {
-      const lt = P.nodes[d.letType]
+    // `letRepAnnOf`, not `d.letType`: a negation annotation names no rep, so the binding is
+    // classified from its initializer exactly as an un-annotated one is (D1784).
+    const fAnn = letRepAnnOf(letIx)
+    if fAnn >= 0 {
+      const lt = P.nodes[fAnn]
       if lt is TypeRef {
         // Canon's banked type (B144): a numeric literal type/union softens to `f64` (never to
         // `i64`), so the arena type of the softened spelling is used, as `letIsI64` does for i64.
-        let lfTy = nodeTyIxOf(d.letType)
-        if canonRewroteNode(d.letType) { lfTy = canonTyIxOf(d.letType) }
+        let lfTy = nodeTyIxOf(fAnn)
+        if canonRewroteNode(fAnn) { lfTy = canonTyIxOf(fAnn) }
         if tyScalarBaseIs(lfTy, "f64") { return true }
       }
       return false
