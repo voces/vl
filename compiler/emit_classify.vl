@@ -2795,6 +2795,49 @@ function letInitIsNestedStructField(letIx: i32): boolean {
   false
 }
 
+// An un-annotated binding's PROJECTION initializer node, or -1 — an index or a field read,
+// the two shapes that commit no rep for the `letIs*` ladder to read. The gate on the arena
+// rungs below: every other initializer shape commits one, and letting the arena claim those
+// would overrule an answer the syntactic ladder already gives (D1758).
+function letInitProjNode(letIx: i32): i32 {
+  if letIx < 0 || letIx >= P.nodes.length { return -1 }
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 { return -1 }
+    if d.letInit < 0 { return -1 }
+    const pr = unwrapParen(d.letInit)
+    if pr < 0 || pr >= P.nodes.length { return -1 }
+    const e = P.nodes[pr]
+    if e is Index { return d.letInit }
+    if e is Member { return d.letInit }
+  }
+  -1
+}
+
+// The rep such an initializer commits, or `null` — `annRepKindOf` is `vtKindOfType`'s own
+// first leg, so the un-annotated face and the annotated one derive the kind from one place
+// and cannot answer differently. The map arm is its own because the descriptor leaves
+// `TyMap` uncovered; its companion is `letInitProjMapShape` (D1758).
+function letInitProjKind(letIx: i32): VKind | null {
+  const ini = letInitProjNode(letIx)
+  if ini < 0 { return null }
+  const rk = annRepKindOf(ini)
+  if rk != null { return rk }
+  if nodeTyIsMap(ini) { return "map" }
+  null
+}
+
+// That map arm's companion — the mv slot the recorded value type names. A FIND, never a
+// mint, and read off the type rather than the spelling, so it answers in a frame the
+// syntactic resolver cannot reach.
+function letInitProjMapShape(letIx: i32): i32 {
+  const ini = letInitProjNode(letIx)
+  if ini < 0 { return -1 }
+  if annRepKindOf(ini) != null { return -1 }
+  if nodeTyIsMap(ini) { return mapFindShapeOfNodeTy(ini) }
+  -1
+}
+
 // The struct row that rung names, or -1 — the companion index `fbValtype` reads for a
 // `"struct"` cell.
 function letInitTyStructRow(letIx: i32): i32 {
@@ -2962,6 +3005,10 @@ function letInitCellKind(letIx: i32, fnIx: i32): VKind {
   // recorded the type. Paired with `captureValStructIdx`'s own, since a kind whose slot
   // stays -1 is a different refusal rather than half a fix.
   if letInitTyIsStruct(letIx) { return "struct" }
+  // The rest of that rung's family, one derivation for every rep the struct arm does not
+  // reach — a union box, a map, and the scalars and lists below whose answer it repeats.
+  const projK = letInitProjKind(letIx)
+  if projK != null { return projK }
   if letIsArray(letIx, fnIx) { return "list" }
   if letIsNulString(letIx, fnIx) { return "nulstr" }
   if letIsString(letIx, fnIx) { return "str" }
@@ -4315,6 +4362,10 @@ export function captureValStructIdx(fe: i32, name: string) {
       // initialiser's struct row comes from the type the checker recorded, since
       // `structIndexOfLet` reads a spelling the projection does not carry (D1476).
       if letInitTyIsStruct(b) { return letInitTyStructRow(b) }
+      // Its map twin, paired with `letInitProjKind`'s own map arm: a `"map"` cell whose
+      // shape stays -1 is the mono map, which is a different layout and not half a fix.
+      const pms = letInitProjMapShape(b)
+      if pms != -1 { return pms }
     }
   }
   -1
@@ -21070,21 +21121,14 @@ export function letInitIsLitAtom(letIx: i32, fnIx: i32) {
   const d = P.nodes[letIx]
   if d is LetDecl {
     if d.letType < 0 && d.letInit >= 0 { return exprIsLitAtom(d.letInit, fnIx) }
-    // The module global's face, and only it (D1541): a top-level `const v: "a" | "b" = xs[0]`
-    // is already slotted as the atom, so declining here made the read side disagree with the
-    // store side. Gated on `globalLetOf`, not `fnIx < 0`, since a module-scope `for`/`if` body
-    // has `fnIx == -1` too but its binding is a start-fn local, where the string ref stands.
+    // The annotated face, at any scope: the INITIALIZER is the gate, not the scope. An
+    // annotation that softens to `string` over a non-atom init produces no atom, so this
+    // declines it and the loud refusal stands for that shape (D1752).
     if d.letInit >= 0 {
-      if globalLetOf(d.letName) == letIx {
-        if tyIsLitUnion(nodeTyIxOf(d.letType)) {
-          return exprIsLitAtom(d.letInit, fnIx)
-        }
+      if tyIsLitUnion(nodeTyIxOf(d.letType)) {
+        return exprIsLitAtom(d.letInit, fnIx)
       }
     }
-    // The annotated face inside a frame is deliberately not claimed (D1196): an annotation
-    // that softens to `string` refuses loudly in `checkLocalI32` rather than re-slotting as
-    // an atom local, since the store would then write the softened string ref into an atom
-    // slot — invalid wasm. Loud-to-silent is the one trade this repo refuses.
   }
   false
 }
@@ -21106,6 +21150,14 @@ export function bindingIsLitAtom(bindIx: i32, ownerFnIx: i32) {
     return letIsLitUnion(bindIx) || letInitIsLitAtom(bindIx, ownerFnIx)
   }
   false
+}
+
+// Does the local at `slot` hold an interned atom? The flag `collectLocals` actually wrote,
+// read back rather than re-derived, so a store at the binding boundary and the slot it writes
+// into cannot answer differently — the disagreement D1196 priced (D1752).
+export function localSlotIsLitAtom(slot: i32): boolean {
+  if slot < 0 || slot >= localLitUnion.length { return false }
+  localLitUnion[slot] == 1
 }
 
 // The `K | null` NICHE dual of `bindingIsLitAtom`: the binding holds the same i32 atom with
