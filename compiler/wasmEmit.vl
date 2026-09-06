@@ -706,6 +706,7 @@ import {
   narrowedStructArmVi,
   narrowedValueAtomOf,
   nliNameOf,
+  nodeMixedUnionName,
   nonNulBaseOf,
   nulFieldInnerCode,
   nulMapShapeOf,
@@ -21963,6 +21964,11 @@ function emitCoalesceGo(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
           if cResEmit != "" {
             if isValueUnionName(cResEmit) { cResN = cResEmit }
           }
+          // A MIXED union (`i32 | A`) is a union the language has, so its `??` result is a box
+          // too — `isValueUnionName` declines it because a struct is not a value ATOM, and the
+          // render is structural, so the name comes off the canon index. Tags are
+          // program-global, so the operand's own box stands in the join unchanged (D1703).
+          if cResN == "" { cResN = nodeMixedUnionName(exprIx) }
           if cResN != "" || coalesceDefaultNullable(e.binRight, fnIx) {
             let cCoerceN = cResN
             if cCoerceN == "" { cCoerceN = cunm }
@@ -22063,11 +22069,25 @@ function emitCoalesceGo(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
             return -1 // the box, evaluated ONCE
           }
           fbLocalSet(coalesceCallSlot)
-          // A nullable default keeps the result boxed — the same decision the re-evaluating
-          // ident arm makes (`coalesceDefaultNullable`), taken here too because both arms are
-          // one lowering over one rep and must declare the same block type. Neither arm
-          // unboxes: the default is a box, and the stash already holds the lhs box.
-          if coalesceDefaultNullable(e.binRight, fnIx) {
+          // The result rep is the CHECKER's, read exactly as the re-evaluating ident arm reads
+          // it: a union result is a box whatever made it one, a wider default widens the whole
+          // expression. Both arms are one lowering over one rep and must decide alike (D1701).
+          let kResN = ""
+          const kResEmit = tyToEmitName(nodeTyPinIxOf(exprIx))
+          if kResEmit != "" {
+            if isValueUnionName(kResEmit) { kResN = kResEmit }
+          }
+          if kResN == "" { kResN = nodeMixedUnionName(exprIx) }
+          let kRk = kak
+          if kResEmit != "" {
+            const kRkN = valueAtomKind(kResEmit)
+            if kRkN >= 0 && kRkN != nullValKind() { kRk = kRkN }
+          }
+          // A union result keeps the box — the default is coerced into the RESULT union, and
+          // the stash already holds the operand's, whose tags are program-global.
+          if kResN != "" || coalesceDefaultNullable(e.binRight, fnIx) {
+            let kCoerceN = kResN
+            if kCoerceN == "" { kCoerceN = kunm }
             fbLocalGet(coalesceCallSlot)
             fbStructGet(uBoxIdx, 0) // field 0: tag
             fbI32Const(nullBoxTag())
@@ -22078,7 +22098,7 @@ function emitCoalesceGo(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
             // and taken here for the reason this arm and that one share every other
             // decision: one lowering over one rep, so a bare `null` default must box
             // identically at both spellings.
-            if emitUnionCoerce(body, kunm, e.binRight, fnIx) < 0 {
+            if emitUnionCoerce(body, kCoerceN, e.binRight, fnIx) < 0 {
               return -1 // d, its own box
             }
             fbElse() // 0x05 else — present → the stashed box
@@ -22091,9 +22111,9 @@ function emitCoalesceGo(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
           fbStructGet(uBoxIdx, 0)       // field 0: tag
           fbI32Const(nullBoxTag())
           fbI32Bin(70)                  // 0x46 i32.eq → null?
-          fbIf(valBlockTypeOfKind(kak)) // 0x04 if, value blocktype
+          fbIf(valBlockTypeOfKind(kRk)) // 0x04 if, value blocktype
           ctrlEnter()
-          if emitExprAsKind(body, e.binRight, kak, fnIx) < 0 { return -1 }
+          if emitExprAsKind(body, e.binRight, kRk, fnIx) < 0 { return -1 }
           fbElse()                      // 0x05 else — present → unbox the stash
           fbLocalGet(coalesceCallSlot)
           fbStructGet(uBoxIdx, 1)       // field 1: value (anyref)
@@ -22103,6 +22123,7 @@ function emitCoalesceGo(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
           }
           fbRefCast(kvb)
           fbStructGet(kvb, 0) // the scalar payload
+          if coalWidenUnboxed(kak, kRk) < 0 { return -1 }
           fbEnd()             // 0x0b end
           ctrlLeave()
           return 0
