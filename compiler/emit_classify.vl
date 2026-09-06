@@ -7386,6 +7386,8 @@ export function exprHasStrOp(exprIx: i32, fnIx: i32) {
     if tyKindOf(nodeTyIxOf(exprIx)) == 3 {
       if ifChainHasAtomArm(exprIx, fnIx) { return true }
     }
+    // The same widening reached through the arms, where the join records one arm's type.
+    if ifJoinAtomMeetsString(exprIx, fnIx) { return true }
     if blockHasStrOp(e.ifThen, fnIx) { return true }
     if e.ifElse >= 0 { return blockHasStrOp(e.ifElse, fnIx) }
     return false
@@ -10802,6 +10804,32 @@ function ifRepArmValueIx(ifIx: i32) {
   tv
 }
 
+// The else arm's tail value of the if-expression at `ifIx`, or -1 when the else is absent or
+// is an `else if` chain rather than a block. The then arm's twin, needed wherever the join's
+// rep is a question about BOTH arms rather than about the one that decides it.
+function ifElseValueIx(ifIx: i32) {
+  const s = P.nodes[ifIx]
+  if s is IfStmt {
+    if s.ifElse >= 0 {
+      if P.nodes[s.ifElse] is Block { return ifArmValueExpr(s.ifElse) }
+    }
+  }
+  -1
+}
+
+// True when one arm of the join at `ifIx` holds an interned atom and the other a string: the
+// join is the string ref and the atom arm widens to its member text. The recorded-type rung
+// cannot see this inside a generic body, where the join's type is one ARM's and every other
+// predicate reads the THEN arm alone (D1728).
+function ifJoinAtomMeetsString(ifIx: i32, fnIx: i32) {
+  const tv = ifThenValueIx(ifIx)
+  const ev = ifElseValueIx(ifIx)
+  if tv < 0 || ev < 0 { return false }
+  if exprIsLitAtom(tv, fnIx) { return exprString(ev, fnIx) }
+  if exprIsLitAtom(ev, fnIx) { return exprString(tv, fnIx) }
+  false
+}
+
 // The `fbValtype` kind of a ref-typed if-expression join — string, string-list, f64-list,
 // ref-list, i32-list, or struct — classified from the then arm's tail value. -1 for a
 // numeric join and for a value-union/concrete-variant join (handled upstream). The array
@@ -10816,6 +10844,10 @@ export function ifExprRefKind(ifIx: i32, fnIx: i32): VKind | null {
   // join (an atom + a string/member-literal arm, either order) is the string ref kind even
   // when the then arm alone doesn't classify stringy; the atom arm widens later.
   if tyKindOf(nodeTyIxOf(ifIx)) == 3 { return "str" }
+  // The same signal read off the ARMS, for the body where the rung above is blind: a hole
+  // arm absorbs the join, so the `if` records that arm's type. Both arms are asked, so a join
+  // of two atoms keeps the i32 rep its own rungs give it (D1728).
+  if ifJoinAtomMeetsString(ifIx, fnIx) { return "str" }
   if exprString(tv, fnIx) { return "str" }
   if exprStringArray(tv, fnIx) { return "strlist" }
   // Scalar lists in `scalarListElemKind`'s own order — f32 before f64, since
@@ -31419,6 +31451,10 @@ export function exprString(exprIx: i32, fnIx: i32) {
     // The join's checked type is arm-order-independent: a `string`-typed join may lead with
     // an atom arm, which widens at `emitRefIfArm` — so the value is still a string.
     if tyKindOf(nodeTyIxOf(exprIx)) == 3 { return true }
+    // The arm-read of that same signal, for the body where the recorded join type is one
+    // arm's — the three sites this one decision moves through (`ifExprRefKind`,
+    // `exprHasStrOp`, here), or the rep and its readers disagree.
+    if ifJoinAtomMeetsString(exprIx, fnIx) { return true }
     const tv = ifThenValueIx(exprIx)
     return tv >= 0 && exprString(tv, fnIx)
   }
@@ -31488,7 +31524,10 @@ export function exprString(exprIx: i32, fnIx: i32) {
     // A value-union ident is a string only when narrowed to the `string` atom — an
     // un-narrowed union binding is the box, even when its init is a string literal.
     const uk = unionIdentReadKind(exprIx, fnIx)
-    if uk != -3 { return uk == 2 }
+    // ...unless the locals table slotted this binding as the string ref. The union resolver
+    // reads the CHECKER's type, which a hole-armed join records as one arm's; the slot is the
+    // rep, so where the two disagree about a binding the emitter itself sized, it wins (D1728).
+    if uk != -3 && !declaredString(e.identName) { return uk == 2 }
     if paramString(fnIx, e.identName) { return true }
     if declaredString(e.identName) { return true }
     // A captured string reads as a string ref (kind 3), like a string param/local; `nulstr`
