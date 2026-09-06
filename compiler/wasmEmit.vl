@@ -2471,6 +2471,34 @@ function emitDiscrimFieldEq(
   )
 }
 
+// The outer union's tag for each arm of `tty`, in flatten order, with the arm's variant row
+// beside it (-1 for a value atom). A union alias member is a SUBSET of the outer box's tags
+// and never a nested box, so every membership test over one is this list `i32.or`ed together.
+// False when an arm has no tag at all — the caller names its own refusal (D1774).
+function unionArmTagsOfTy(tty: i32, tags: i32[], vis: i32[]): boolean {
+  const armTys: i32[] = []
+  flattenVariantsInto(tty, armTys)
+  if armTys.length == 0 { return false }
+  let at = 0
+  while at < armTys.length {
+    const aty = armTys[at]
+    let t1 = isArmTagOfTy(aty)
+    // a struct arm is a variant: its box tag is `uTags[vi]`, the rank assigned at
+    // construction, not an `isArmTagOfTy` value-atom kind.
+    let vi = -1
+    if t1 < 0 {
+      const armNm = nominalStructNameOfTy(aty)
+      if armNm != "" { vi = variantIndexOf(armNm) }
+      if vi >= 0 { t1 = uTags[vi] }
+    }
+    if t1 < 0 { return false }
+    tags.push(t1)
+    vis.push(vi)
+    at = at + 1
+  }
+  true
+}
+
 // The membership half of `x is A` (D1023) — emitted after the arm's tag test and `i32.and`ed
 // onto it, for each field the tag alone cannot settle. `A`'s tag names the shape; where two
 // declared types share a shape, the ruling makes `is` a question about the value. It emits
@@ -2864,6 +2892,34 @@ function emitIs(body: i32[], isIx: i32, fnIx: i32) {
       isVariantSpelling(nd.isVariant, isVarTyIxOf(isIx)),
     )
     if vi < 0 {
+      // A union alias arm has no single variant row because it is a SUBSET of the outer
+      // box's tags, so the test is the tag chain `as?` already emits for a sub-union target
+      // (D1774). A layout-twin arm is excluded: its tag alone does not settle membership,
+      // and the per-arm discriminant test has no home inside a chain.
+      const isTags: i32[] = []
+      const isVis: i32[] = []
+      if unionArmTagsOfTy(isVarTyIxOf(isIx), isTags, isVis) {
+        let chainOk = isTags.length > 1 &&
+          exprUnion(nd.isObj, fnIx) &&
+          unionEqOperandOk(nd.isObj)
+        let ci = 0
+        while ci < isVis.length {
+          if variantHasDiscrimField(isVis[ci]) { chainOk = false }
+          ci = ci + 1
+        }
+        if chainOk {
+          let ti = 0
+          while ti < isTags.length {
+            if emitExpr(body, nd.isObj, fnIx) < 0 { return -1 }
+            fbStructGet(uBoxIdx, 0)
+            fbI32Const(isTags[ti])
+            fbI32Bin(70)
+            if ti > 0 { fbI32Bin(114) }
+            ti = ti + 1
+          }
+          return 0
+        }
+      }
       if tyIsUnionMemberOf(nodeTyIxOf(nd.isObj), isVarTyIxOf(isIx)) {
         return emitFail(
           "emitProgram: `is` names a declared union member with no interned arm representation (deferred value-union composition)",
@@ -13128,39 +13184,27 @@ function emitAsCast(body: i32[], e: AsExpr, _exprIx: i32, fnIx: i32) {
     if e.asMode == "null" { tty = tyPeelNul(tty) }
     // the target's arms, flattened rather than tested as `TyUnion`: a sub-union target
     // only widens the membership test (a tag chain), with no unbox at all.
-    const armTys: i32[] = []
-    flattenVariantsInto(tty, armTys)
-    const subUnion = armTys.length > 1
     const wantTags: i32[] = []
+    const wantVis: i32[] = []
+    if !unionArmTagsOfTy(tty, wantTags, wantVis) {
+      return emitFail(
+        "emitProgram: `as " +
+          tgt +
+          "` is supported for a value-union arm or a struct-variant arm; this arm is neither — write the explicit `if x is " +
+          tgt +
+          " { … }` ladder for it",
+      )
+    }
+    const subUnion = wantTags.length > 1
     let armVi = -1
     let ak = 0
-    if !subUnion { ak = unMemAtomKind(tty) }
-    let at = 0
-    while at < armTys.length {
-      const aty = armTys[at]
-      let t1 = isArmTagOfTy(aty)
-      // a struct arm is a variant: its box tag is `uTags[vi]`, the rank assigned at
-      // construction, not an `isArmTagOfTy` value-atom kind.
-      let vi = -1
-      if t1 < 0 {
-        const armNm = nominalStructNameOfTy(aty)
-        if armNm != "" { vi = variantIndexOf(armNm) }
-        if vi >= 0 { t1 = uTags[vi] }
-      }
-      if t1 < 0 {
-        return emitFail(
-          "emitProgram: `as " +
-            tgt +
-            "` is supported for a value-union arm or a struct-variant arm; this arm is neither — write the explicit `if x is " +
-            tgt +
-            " { … }` ladder for it",
-        )
-      }
-      if !subUnion { armVi = vi }
-      wantTags.push(t1)
-      at = at + 1
+    if !subUnion {
+      ak = unMemAtomKind(tty)
+      armVi = wantVis[0]
     }
-    if wantTags.length < 1 || (!subUnion && armVi < 0 && ak < 0) {
+    // `unionArmTagsOfTy` owns the empty-arm case, so what is left is a single arm the tag
+    // reached but neither the variant table nor the atom kinds can name.
+    if !subUnion && armVi < 0 && ak < 0 {
       return emitFail(
         "emitProgram: `as " +
           tgt +
