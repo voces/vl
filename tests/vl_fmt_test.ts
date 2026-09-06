@@ -2610,3 +2610,90 @@ Deno.test({
     }
   },
 });
+
+// The object-literal METHOD SHORTHAND is a surface form `vl fmt` canonicalises to the arrow
+// field it desugars to. Both spellings are legal and the corpus is formatted, so the shorthand
+// survives only in a test that reads its text — this one. `tests/cases/objects/method-*` hold
+// the arrow spelling the formatter produces.
+Deno.test({
+  name: "vl-fmt: object method shorthand canonicalises to an arrow field, and the two agree",
+  ignore: !ENABLED,
+  fn: async () => {
+    // Block body, expression body, and a parameterised one with a return annotation.
+    const shorthand = [
+      "const o = {",
+      "  base: 7,",
+      "  f() {",
+      '    "ok"',
+      "  },",
+      "  triple(x: i32) x + x + x,",
+      "  add(a: i32, b: i32): i32 {",
+      "    return a + b",
+      "  },",
+      "}",
+      "print(o.f())",
+      "print(o.triple(10))",
+      "print(o.add(1, 2))",
+      "print(o.base)",
+      "",
+    ].join("\n");
+    const r = await run([], shorthand);
+    if (r.code !== 0) {
+      throw new Error(`vl fmt rejected the shorthand (rc ${r.code}):\n${r.err}`);
+    }
+    for (
+      const arrow of [
+        "f: () => {",
+        "triple: (x: i32) => x + x + x,",
+        "add: (a: i32, b: i32): i32 => {",
+      ]
+    ) {
+      if (!r.out.includes(arrow)) {
+        throw new Error(`the shorthand did not canonicalise to \`${arrow}\`:\n${r.out}`);
+      }
+    }
+    const again = await run([], r.out);
+    if (again.out !== r.out) {
+      throw new Error(`the arrow form is not a fixed point:\n${again.out}`);
+    }
+    // THE SPELLINGS AGREE, which is what makes the canonicalisation a formatting change and
+    // not a rewrite: the same printed output, and the same wasm byte for byte.
+    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_shorthand_" });
+    try {
+      const a = `${dir}/a.vl`;
+      const b = `${dir}/b.vl`;
+      await Deno.writeTextFile(a, shorthand);
+      await Deno.writeTextFile(b, r.out);
+      const ra = await runOn("run", a);
+      const rb = await runOn("run", b);
+      if (ra.code !== 0 || rb.code !== 0) {
+        throw new Error(`a spelling did not run (${ra.code}/${rb.code}):\n${ra.err}${rb.err}`);
+      }
+      if (ra.out !== rb.out) {
+        throw new Error(`the two spellings printed differently:\n${ra.out}\n---\n${rb.out}`);
+      }
+      const bytesOf = async (file: string): Promise<Uint8Array> => {
+        const out = `${file}.wasm`;
+        const { code, stderr } = await new Deno.Command(VL, {
+          args: ["build", file, "-o", out, "--compiler", COMPILER],
+          stdout: "piped",
+          stderr: "piped",
+          env: nativeEnv({ NO_COLOR: "1" }),
+        }).output();
+        if (code !== 0) {
+          throw new Error(`build failed for ${file}: ${new TextDecoder().decode(stderr)}`);
+        }
+        return await Deno.readFile(out);
+      };
+      const wa = await bytesOf(a);
+      const wb = await bytesOf(b);
+      if (wa.length !== wb.length || !wa.every((v, i) => v === wb[i])) {
+        throw new Error(
+          `the two spellings emitted different wasm (${wa.length} vs ${wb.length} bytes)`,
+        );
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
