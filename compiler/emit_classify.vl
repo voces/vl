@@ -248,6 +248,7 @@ import {
   memberPathKeyOf,
   moduleBindsLoopVar,
   moduleLocalLetOf,
+  moduleLocalLetOfAt,
   moduleLocalLetOfUnique,
   nameIsBareMap,
   nameIsClosureArray,
@@ -4161,7 +4162,13 @@ export function parentBindingOf(fe: i32, name: string) {
   // chain for a closure written in a module-scope block and every ref-repped capture there
   // takes `captureValKind`'s i32 default. `moduleLocalLetOf` excludes top-level bindings,
   // which are globals and never captures.
-  if par < 0 { return moduleLocalLetOf(emitRootIx, name) }
+  if par < 0 {
+    // The reader is the lifted function's own declaration node, which is what picks among
+    // sibling blocks binding one name; an out-of-range `fe` has no position to offer.
+    let atIx = -1
+    if fe >= 0 && fe < fnStmts.length { atIx = fnStmts[fe] }
+    return moduleLocalLetOfAt(emitRootIx, name, atIx)
+  }
   const pfn = P.nodes[fnStmts[par]]
   if pfn is FuncDecl {
     const params = pfn.fnParams
@@ -11837,7 +11844,7 @@ export function cloCallSigKey(callIx: i32, fnIx: i32) {
     // The syntactic resolvers — fast (no type render): a function-typed binding/param Ident, a struct
     // field closure, an indexed closure-array element.
     if cre is Ident {
-      const k = calleeCloSigKeySid(sidOfNode(cfx), fnIx)
+      const k = calleeCloSigKeyAt(sidOfNode(cfx), fnIx, cfx)
       if k != "" {
         // The interned-divergence override: the syntactic resolvers are name-shaped, and a
         // name cannot always answer what a type can — a litunion whose spelling softened keys
@@ -32358,6 +32365,13 @@ export function identClosureFe(name: string, fnIx: i32) {
 // even when the caller has no arena index to offer — with one (`sidOfNode`), it replaces
 // two with zero.
 export function identClosureFeSid(sid: i32, fnIx: i32) {
+  identClosureFeAt(sid, fnIx, -1)
+}
+
+// The positioned form: `atIx` is the reader's own arena node, which is what picks among
+// sibling module-scope blocks binding one name. Every other scope is keyed by its frame
+// already, so the module rung is the only one that reads it.
+export function identClosureFeAt(sid: i32, fnIx: i32, atIx: i32) {
   if fnIx >= 0 {
     const fn = P.nodes[fnIx]
     if fn is FuncDecl {
@@ -32375,7 +32389,7 @@ export function identClosureFeSid(sid: i32, fnIx: i32) {
   }
   // The module frame (D1350), the third scope this resolver must reach: `fnIx < 0` is the
   // start function, whose locals live in no `fnBody` and are not globals either.
-  const ml = moduleLocalLetOf(emitRootIx, sidText(sid))
+  const ml = moduleLocalLetOfAt(emitRootIx, sidText(sid), atIx)
   if ml >= 0 {
     const md = P.nodes[ml]
     if md is LetDecl { return fieldValueFeOf(md.letInit) }
@@ -32528,6 +32542,12 @@ function calleeCloSigKey(name: string, fnIx: i32) {
 // hash-and-probes — and the ~14 `calleeRetKind` call sites hand it the callee node's id
 // straight from the carrier, paying none at all.
 function calleeCloSigKeySid(sid: i32, fnIx: i32) {
+  calleeCloSigKeyAt(sid, fnIx, -1)
+}
+
+// The positioned form: `atIx` is the callee identifier's own arena node, threaded to the two
+// rungs that resolve a module-scope block-local binding by name (D1751).
+function calleeCloSigKeyAt(sid: i32, fnIx: i32, atIx: i32) {
   const name = sidText(sid)
   // A union binding narrowed to a bare-closure arm (`if x is () => i64 { x() }`): the arm's
   // function-type name interns the SAME `$fnsig` an annotated closure would — so the `call_ref`
@@ -32564,7 +32584,7 @@ function calleeCloSigKeySid(sid: i32, fnIx: i32) {
     const ak = cloNameSigKey(an)
     if ak != "" { return ak }
   }
-  const fe = identClosureFeSid(csid, fnIx)
+  const fe = identClosureFeAt(csid, fnIx, atIx)
   // The extended key (not just `fnSigKeyOf`) so a void-returning binding resolves its `>v`
   // sig, interned above; a value-eligible binding takes the same key `fnSigKeyOf` would.
   if fe >= 0 { return cloSigKeyExt(fe) }
@@ -32582,8 +32602,8 @@ function calleeCloSigKeySid(sid: i32, fnIx: i32) {
   if letIx < 0 { letIx = globalLetOfSidIn(fnIx, csid) }
   // The module frame, the third scope this ladder must reach, exactly as `identClosureFeSid`
   // reaches it (D1350): a binding in a module-scope BLOCK lives in no `fnBody` and is not a
-  // global. The unique reader, since a sig chosen off the first of two same-named blocks is D1596.
-  if letIx < 0 { letIx = moduleLocalLetOfUnique(emitRootIx, name) }
+  // global. Positioned, since a sig chosen off the first of two same-named blocks is D1596.
+  if letIx < 0 { letIx = moduleLocalLetOfAt(emitRootIx, name, atIx) }
   if letIx >= 0 {
     const cd = P.nodes[letIx]
     if cd is LetDecl {
@@ -32605,7 +32625,9 @@ function calleeCloSigKeySid(sid: i32, fnIx: i32) {
   // registry and the module frame. Re-asked against the frame that owns the binding, so a
   // captured void closure resolves its `>v` sig and its call stays a statement (D1634).
   const cowner = capturedBindingFrameOf(fnIx, name)
-  if cowner >= 0 && cowner != fnIx { return calleeCloSigKeySid(sid, cowner) }
+  if cowner >= 0 && cowner != fnIx {
+    return calleeCloSigKeyAt(sid, cowner, atIx)
+  }
   ""
 }
 
