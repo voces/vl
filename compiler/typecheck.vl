@@ -579,6 +579,10 @@ const HD_BINOP = 4
 // else arm of `if a is T` reads. `subtractTy` cannot answer at a hole — there is no member
 // list to remove from — so the remainder is deferred to the pin. D1243.
 const HD_GNOT = 5
+// The `??` result over a hole left operand: the non-null face of the pin when the default
+// fits it, else the join of the two — the concrete arm's own tail, deferred because neither
+// half can be computed until the pin. `hdInner` carries the default's type. D1693.
+const HD_COAL = 6
 let hdKind: i32[] = []
 let hdField: string[] = []
 let hdInner: i32[] = []
@@ -5532,6 +5536,17 @@ function placeHasOptionalHop(ix: i32) {
   false
 }
 
+// The non-null face of a place at a narrowing: `nonNullTy` for a type that has one, and a
+// deferred subtraction of `null` for a hole, which is not a `TyNullable` and would otherwise come
+// straight back un-narrowed. Every fact collector reads this one, so the null-test spellings agree
+// about what a guarded read sees and the pin re-asks its floors against the narrowed type (D1693).
+function nonNullNarrowTy(cur: i32) {
+  const inner = nonNullTy(cur)
+  if inner != cur { return inner }
+  if tyIsHole(cur) { return mkDerivedHole(HD_GNOT, "", -1, TY_NULL, cur) }
+  inner
+}
+
 // For a guard on an optional chain (`x?.y is T`), the truthy branch also implies every `?.`
 // receiver is non-null — push those facts innermost-first, each resolving against an
 // already-narrowed receiver, so the body's regular `x.y` reads resolve. Then branch only.
@@ -5544,7 +5559,7 @@ function pushOptChainThenFacts(placeIx: i32, names: string[], tys: i32[]) {
   if n is OptMember {
     pushOptChainThenFacts(n.omObj, names, tys)
     const cur = placeCurTy(n.omObj, names, tys)
-    const inner = nonNullTy(cur)
+    const inner = nonNullNarrowTy(cur)
     if inner >= 0 && inner != cur { pushNarrowFact(n.omObj, inner, names, tys) }
     return 0
   }
@@ -5647,7 +5662,7 @@ function collectThenNarrows(condIx: i32, names: string[], tys: i32[]) {
       if placeIx >= 0 {
         pushOptChainThenFacts(placeIx, names, tys)
         const cur = placeCurTy(placeIx, names, tys)
-        const inner = nonNullTy(cur)
+        const inner = nonNullNarrowTy(cur)
         if inner >= 0 && inner != cur {
           pushNarrowFact(placeIx, inner, names, tys)
         }
@@ -5683,7 +5698,7 @@ function collectThenNarrows(condIx: i32, names: string[], tys: i32[]) {
     if gArg >= 0 {
       pushOptChainThenFacts(gArg, names, tys)
       const gCur = placeCurTy(gArg, names, tys)
-      const gInner = nonNullTy(gCur)
+      const gInner = nonNullNarrowTy(gCur)
       if gInner >= 0 && gInner != gCur {
         pushNarrowFact(gArg, gInner, names, tys)
       }
@@ -5719,15 +5734,8 @@ function collectElseNarrows(condIx: i32, names: string[], tys: i32[]) {
     if placeHasOptionalHop(cond.isObj) { return 0 }
     const cur = placeCurTy(cond.isObj, names, tys)
     if cond.isVariant == "null" {
-      let inner = nonNullTy(cur)
-      // The null face of the same hole (D1243): `nonNullTy` peels a `TyNullable` and a hole is
-      // not one, so `if a is null { … } else { … }` would lose the else arm exactly as the typed
-      // complement below does. `TY_NULL` is what the pin subtracts.
-      if inner == cur {
-        if tyIsHole(cur) {
-          inner = mkDerivedHole(HD_GNOT, "", -1, TY_NULL, cur)
-        }
-      }
+      // The null face of the same hole (D1243), now the shared reader's — see its header.
+      const inner = nonNullNarrowTy(cur)
       if inner >= 0 && inner != cur {
         pushNarrowFact(cond.isObj, inner, names, tys)
       }
@@ -5771,7 +5779,7 @@ function collectElseNarrows(condIx: i32, names: string[], tys: i32[]) {
       if placeIx >= 0 {
         if !placeHasOptionalHop(placeIx) {
           const cur = placeCurTy(placeIx, names, tys)
-          const inner = nonNullTy(cur)
+          const inner = nonNullNarrowTy(cur)
           if inner >= 0 && inner != cur {
             pushNarrowFact(placeIx, inner, names, tys)
           }
@@ -5806,7 +5814,7 @@ function collectElseNarrows(condIx: i32, names: string[], tys: i32[]) {
     if gArg >= 0 {
       if !placeHasOptionalHop(gArg) {
         const gCur = placeCurTy(gArg, names, tys)
-        const gInner = nonNullTy(gCur)
+        const gInner = nonNullNarrowTy(gCur)
         if gInner >= 0 && gInner != gCur {
           pushNarrowFact(gArg, gInner, names, tys)
         }
@@ -7177,6 +7185,7 @@ function holeBaseTy(tyIx: i32) {
   }
   if k == HD_GALT { return holeBaseTy(hdBase[row]) }
   if k == HD_GNOT { return holeBaseTy(hdBase[row]) }
+  if k == HD_COAL { return holeBaseTy(hdBase[row]) }
   tyIx
 }
 
@@ -19290,6 +19299,9 @@ function hdRenderName(
   // The tested type rides the name because it is the derivation: two `else` arms over one
   // hole testing different types are different remainders.
   if kind == HD_GNOT { return "?gnot." + i32ToStr(alt) + "." + baseName }
+  // The default's type rides the name for the same reason: two `??` sites over one hole with
+  // different defaults reach different answers and are different holes.
+  if kind == HD_COAL { return "?coal." + i32ToStr(inner) + "." + baseName }
   "?galt." + i32ToStr(inner) + "." + i32ToStr(alt) + "." + baseName
 }
 
@@ -19375,11 +19387,35 @@ export function pinnedHoleTyOf(tyIx: i32): i32 {
   holePinTys[t.tvName] ?? -1
 }
 
+// The type of the expression at node `ix` at this pin: its recorded type, resolved through the
+// hole's banked pin when the recorded type is a hole exactly one call pinned, else the recorded
+// type unchanged. A LIST-level classifier may read this; a SCALAR one may not, because a
+// monomorphized callback clone shares its nodes with the generic body (D1693).
+export function nodeTyPinIxOf(ix: i32): i32 {
+  const ty = nodeTyIxOf(ix)
+  const p = pinnedHoleTyOf(ty)
+  if p >= 0 { return p }
+  ty
+}
+
+// `substHoleTyReal`, banking the answer for a DERIVED hole under its own name the way the
+// direct-binding rung already banks its own. A derived hole is what the emitter reads back for a
+// narrowed or projected parameter (`nodeTyPinIxOf`), and without a row of its own it reads an
+// unresolved `TyVar` and classifies the value by its declared rep instead (D1693).
+function substHoleTy(tyIx: i32, bNames: string[], bTys: i32[]) {
+  const r = substHoleTyReal(tyIx, bNames, bTys)
+  if r >= 0 && hdRowOf(tyIx) >= 0 && !tyIsHole(r) {
+    const t = T.tys[tyIx]
+    if t is TyVar { notePinnedHole(t.tvName, r) }
+  }
+  r
+}
+
 // Resolves a (possibly derived) hole against a call's bindings: a direct binding on its name
 // wins; a return derivation collapses to the pinned function's return; a field derivation to
 // the pinned object's field. A base that resolves to another hole re-bases onto it
 // (`rebaseDerivedHole`) instead of going unresolved — the two-level chain where dropping the link let an i32 reach a `string` param with no diagnostic. -1 = unresolved.
-function substHoleTy(tyIx: i32, bNames: string[], bTys: i32[]) {
+function substHoleTyReal(tyIx: i32, bNames: string[], bTys: i32[]) {
   if tyIx < 0 { return -1 }
   const t = T.tys[tyIx]
   if !(t is TyVar) { return -1 }
@@ -19414,6 +19450,18 @@ function substHoleTy(tyIx: i32, bNames: string[], bTys: i32[]) {
     const nRest = subtractTy(nPin, nAlt)
     if nRest >= 0 { return nRest }
     return nPin
+  }
+  // The `??` result, deferred: the pin's non-null face when the default fits it, else the join
+  // — `checkBinExprNodeReal`'s own coalesce tail, which needs both sides concrete to decide.
+  if kind == HD_COAL {
+    const cPin = substHoleTy(hdBase[row], bNames, bTys)
+    if cPin < 0 { return -1 }
+    if tyIsHole(cPin) { return rebaseDerivedHole(row, cPin) }
+    const cInner = nonNullTy(cPin)
+    const cDft = substTyDeep(hdInner[row], bNames, bTys)
+    if cDft < 0 || tyHasHole(cDft) { return cInner }
+    if assignable(cDft, cInner) { return cInner }
+    return joinTys(cInner, cDft)
   }
   if kind == HD_RET {
     const inner = substHoleTy(hdBase[row], bNames, bTys)
@@ -30931,6 +30979,11 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
       if assignableExpr(n.binRight, rt, innerFull) { return innerFull }
       return joinTys(innerFull, rt)
     }
+    // A hole left operand has no non-null part yet, so the whole tail above defers to the pin
+    // (`HD_COAL`); answering `lt` instead kept the null the operator just removed, and every
+    // floor the pin re-asks then refused a receiver whose type after `??` is non-null (D1693).
+    const cd = mkDerivedHole(HD_COAL, "", rt, -1, lt)
+    if cd >= 0 { return cd }
     return lt
   }
   // Equality: result bool; requires mutual compatibility.
