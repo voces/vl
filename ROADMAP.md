@@ -47,17 +47,16 @@ units: **hours** · **half-day** · **days**.
 
 | # | item | witness, run today | region | effort |
 | --- | --- | --- | --- | --- |
-| 1 | **A-OPMOD — a user-defined binary operator dispatches only in a SINGLE-FILE program, and `std:` counts** | `function "+"(self: V, b: V)` + `print((a + b).x)` prints `3`; add ONE `import { toString } from "std:fmt"` and nothing else → `operator '+' is not defined for V and V`. The roadmap's own witness (a LOCAL import) reproduces identically | `driver.vl:441 modRenameTo` × `ast.vl:1442 isBinOpFuncName` × `typecheck.vl:20007 opSelfFnTy`. The row's mangling attribution is explicitly uninstrumented — confirm it first | days |
-| 2 | **B15 — a nested capturing function cannot be taken as a value.** **RE-PRICED 2026-09-06: gated on [D1780](internals/inventory/D1780.md), not `hours`** — the floor is load-bearing over a clause-1 miscompile and lifting it first ships more of them | `function o(n) { function k(x) { return x + n }; return k(1) }` → `emitProgram: cannot take the generic function \`k\` as a value`; the annotated twin runs at ONE pin, and at TWO pins it is invalid wasm (D1780) | `wasmEmit.vl:1475 emitClosureValue` reached via `emitCapturedCall:21404`; the instancing is `emit_mono.vl` and its decline is NOT yet instrumented | days (D1780 first) |
-| 3 | **D1775 — a `type` alias over a negation type reps as a union BOX with a scalar value** | `type N = !string; const x: N = 5` → `vl check` rc 0, then `type mismatch: expected (ref $type), found i32`. `wasm-dis`: `(global $global$0 (mut (ref $1)) (i32.const 5))`. The INLINE spelling runs | `typecheck.vl` / `emit_classify.vl` rep classification of an alias body | hours–half-day |
-| 4 | **D1744 — a deep-`is` site anywhere flattens the union alias** | `f` alone checks clean; add an UNUSED `g` whose body is `e is Cfg` → `` `is` check type 'J' is not a variant of … `` | `typecheck.vl` ~33795 (`jsonDeepIsSite` / `isWidenNotVariant`) | hours–half-day |
-| 5 | **B21.1 — `match` payload renaming and nested destructuring** | `Move{x: a}` → `parse error … match payload binding must be a field name` | `parser.vl:2847`; `match-design.md` measures both as one-branch extensions | hours (renaming) / half-day (nesting) |
-| 6 | **B7 R3 — `.backwards()` over a string** | `"abc".backwards()` → `no method '.backwards' on string` | `std/str.vl`; §Codepoints already specifies it | **hours** |
-| 7 | **B6c — `as!` over a `string \| null`** | `function f(): string \| null` + `f() as! string` → `emitProgram: \`as string\` needs a BOXED union operand — a niche-repped one carries no tag to test`. The NUMERIC twin now runs (`3`), so the item's stated blocker is half closed | `wasmEmit.vl:13156` | half-day |
-| 8 | **A-robust — an unbound generic return parameter refuses at EMIT, not at check** | `function mk<T>(): T[] { return [] }; mk()` → `emitProgram: monomorphize: a return type parameter of \`mk\` is not bound by any parameter` | move it to the check tier beside `solveUnannotParams`' "cannot infer — annotate" family | **hours** |
-| 9 | **the `parseIf` `then` arm is not marked lossless** | `if c then print(1)` + a type error → the parse error ONLY; `if c print(1)` + the same → BOTH | `parser.vl:2652` needs `dgMarkLossless(P.diags.length)`, as `parseBracedBody:2633` has | **hours** |
-| 10 | **`vl build` with no `-o` writes a file instead of stdout** | `vl build p.vl > out.bin` → `out.bin` holds `wrote p.wasm (147 bytes)` | `scripts/vl-host/src/main.rs` build arm; already "decided: yes" | **hours** |
-| 11 | **Organize Imports drops an unused specifier but not a DUPLICATE one** | `server.ts:1491 .filter((d) => d.code === "unused-import")` | `lsp/src/server.ts:1489-1500` | **hours** |
+| 1 | **B15 — a nested capturing function cannot be taken as a value.** **RE-PRICED 2026-09-06: gated on [D1780](internals/inventory/D1780.md), not `hours`** — the floor is load-bearing over a clause-1 miscompile and lifting it first ships more of them | `function o(n) { function k(x) { return x + n }; return k(1) }` → `emitProgram: cannot take the generic function \`k\` as a value`; the annotated twin runs at ONE pin, and at TWO pins it is invalid wasm (D1780) | `wasmEmit.vl:1475 emitClosureValue` reached via `emitCapturedCall:21404`; the instancing is `emit_mono.vl` and its decline is NOT yet instrumented | days (D1780 first) |
+| 2 | **D1775 — a `type` alias over a negation type reps as a union BOX with a scalar value** | `type N = !string; const x: N = 5` → `vl check` rc 0, then `type mismatch: expected (ref $type), found i32`. `wasm-dis`: `(global $global$0 (mut (ref $1)) (i32.const 5))`. The INLINE spelling runs | `typecheck.vl` / `emit_classify.vl` rep classification of an alias body | hours–half-day |
+| 3 | **D1744 — a deep-`is` site anywhere flattens the union alias** | `f` alone checks clean; add an UNUSED `g` whose body is `e is Cfg` → `` `is` check type 'J' is not a variant of … `` | `typecheck.vl` ~33795 (`jsonDeepIsSite` / `isWidenNotVariant`) | hours–half-day |
+| 4 | **B21.1 — `match` payload renaming and nested destructuring** | `Move{x: a}` → `parse error … match payload binding must be a field name` | `parser.vl:2847`; `match-design.md` measures both as one-branch extensions | hours (renaming) / half-day (nesting) |
+| 5 | **B7 R3 — `.backwards()` over a string** | `"abc".backwards()` → `no method '.backwards' on string` | `std/str.vl`; §Codepoints already specifies it | **hours** |
+| 6 | **B6c — `as!` over a `string \| null`** | `function f(): string \| null` + `f() as! string` → `emitProgram: \`as string\` needs a BOXED union operand — a niche-repped one carries no tag to test`. The NUMERIC twin now runs (`3`), so the item's stated blocker is half closed | `wasmEmit.vl:13156` | half-day |
+| 7 | **A-robust — an unbound generic return parameter refuses at EMIT, not at check** | `function mk<T>(): T[] { return [] }; mk()` → `emitProgram: monomorphize: a return type parameter of \`mk\` is not bound by any parameter` | move it to the check tier beside `solveUnannotParams`' "cannot infer — annotate" family | **hours** |
+| 8 | **the `parseIf` `then` arm is not marked lossless** | `if c then print(1)` + a type error → the parse error ONLY; `if c print(1)` + the same → BOTH | `parser.vl:2652` needs `dgMarkLossless(P.diags.length)`, as `parseBracedBody:2633` has | **hours** |
+| 9 | **`vl build` with no `-o` writes a file instead of stdout** | `vl build p.vl > out.bin` → `out.bin` holds `wrote p.wasm (147 bytes)` | `scripts/vl-host/src/main.rs` build arm; already "decided: yes" | **hours** |
+| 10 | **Organize Imports drops an unused specifier but not a DUPLICATE one** | `server.ts:1491 .filter((d) => d.code === "unused-import")` | `lsp/src/server.ts:1489-1500` | **hours** |
 | 12 | **B17 — no lint for division by a constant zero** | `print(toString(x / 0))` → `vl check` clean, then `wasm trap: integer divide by zero` | `lint.vl`, beside `for-step-zero` at :784 | **hours** |
 | 13 | **B-ci — `build.rs` bakes `VL_SEED_KEY`, so every seed push recompiles the crate** | `scripts/vl-host/build.rs:76` `println!("cargo:rustc-env=VL_SEED_KEY={h:016x}")` | `scripts/vl-host/build.rs` | **hours** |
 | 14 | **B-chore — three split-form list stores never re-fused** | `emit_rep.vl:3151 / :3347 / :3369` still carry the split form and its comment | `rtGo` / `rtOfNullable` / `rtOfMap` | **hours** (verify the store fix has published first) |
@@ -1615,8 +1614,14 @@ in-language GC knobs.
 ## Track A — Type system (`typecheck.vl`)
 *Blueprint: Elixir v1.20 set-theoretic types, fully-typed (no gradual escape hatch).*
 
-- ⬜ **A-OPMOD. A user-defined binary operator dispatches ONLY in a single-file program —
-  and importing `std:fmt` is enough to lose it.** MEASURED 2026-08-29 while closing D491 on
+- ✅ **A-OPMOD. CLOSED 2026-09-06 ([D1770](internals/inventory/D1770.md)) — both the
+  checker's and the emitter's lookups asked the UNMANGLED name a merge had renamed, and
+  both now resolve through the one key resolver the UFCS gate already used. The mangling
+  attribution below was confirmed by probe, not inherited; every operator `isBinOpFuncName`
+  admits is graded at all three import faces, 10 of 30 cells to 30 of 30. The measurement
+  that follows is kept as the record of what it cost.**
+  A user-defined binary operator dispatched ONLY in a single-file program, and
+  importing `std:fmt` was enough to lose it. MEASURED 2026-08-29 while closing D491 on
   master `c6eb736c`; RE-RUN 2026-09-06, unchanged, and the reach is wider than filed: the
   import that costs you the operator does not have to be a LOCAL one. Any program that
   imports `std:fmt` — that is, nearly every real program — has no user-defined operators.
