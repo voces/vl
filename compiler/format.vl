@@ -50,6 +50,7 @@ import {
   UnionDecl,
   WhileStmt,
 } from "./ast"
+import { TokKind } from "./lexer"
 import { P, isBodyTyDecl, nodeEndOf } from "./ast"
 // The free index-operator declaration-name encoding — the formatter prints the operator
 // back in its source spelling, not the name it declares under.
@@ -155,6 +156,16 @@ let outBuf: string[] = []
 // and the first statement match the source. `emitStatements` consumes it on entry and
 // resets it to 0, so nested calls are unaffected.
 let topPrevLine = 0
+
+// Token indices of each `extern function` declaration's first and last token, in source
+// order, with `extCursor` the next one to place. An extern mints no arena node, so the
+// walk that prints the program cannot see it and dropped it (D1653); it is recovered here
+// as `import` is, and placed by source line, since it may be written anywhere at top level.
+let extRecStart: i32[] = []
+let extRecStop: i32[] = []
+let extRecLp: i32[] = []
+let extRecRp: i32[] = []
+let extCursor = 0
 
 function fmtEmitRaw(s: string) {
   outBuf.push(s)
@@ -453,11 +464,17 @@ function flushRemaining(indent: i32) {
 // structure, since collapsing would splice the following code and the closing brace onto
 // the comment's line. Such a slice is reproduced verbatim and its span recorded.
 function sliceFallback(ix: i32) {
-  const start = nodePos(ix)
-  const stop = nodeEndOf(ix)
-  if !commentInCharSpan(start, stop) { return collapseWs(sliceNode(ix)) }
+  sliceSpanFallback(nodePos(ix), nodeEndOf(ix))
+}
+
+// `sliceFallback` over a raw char span — the form the token-recovered constructs need,
+// which have no arena node to take a span from.
+function sliceSpanFallback(start: i32, stop: i32) {
+  if start < 0 || stop < 0 || stop > fmtSrc.length || start > stop { return "" }
+  const text = fmtSrc.slice(start, stop)
+  if !commentInCharSpan(start, stop) { return collapseWs(text) }
   markVerbatim(start, stop)
-  rstripWsAll(sliceNode(ix))
+  rstripWsAll(text)
 }
 
 // Whether any pending comment starts on a line within `[startLine, stopLine]`.
@@ -482,6 +499,7 @@ export function formatProgram(progRoot: i32) {
   cmtCursor = 0
   vbStart = []
   vbStop = []
+  collectExterns()
   if progRoot < 0 || progRoot >= P.nodes.length { return "" }
   const root = P.nodes[progRoot]
   if root is Program {
@@ -642,6 +660,119 @@ function emitImports() {
   prevLine
 }
 
+// Whether a token of this kind ends a top-level declaration outside any parentheses: a
+// line break, a `;` separator, or the end of input. A token of any other kind is part of
+// the declaration's own text and is taken with it.
+function externEndsDecl(kind: TokKind) {
+  kind == "NEWLINE" || kind == "SEMI" || kind == "EOF"
+}
+
+// Record the token span of every `extern function` / `export extern function` declaration
+// in `P.toks`, which the parser consumes without building a node. The extent runs to the
+// first terminator at paren depth 0, so a parameter list wrapped over lines is taken whole.
+function collectExterns() {
+  extRecStart = []
+  extRecStop = []
+  extRecLp = []
+  extRecRp = []
+  extCursor = 0
+  let i = 0
+  while i < P.toks.length {
+    if P.toks[i].kind == "EXTERN" {
+      let start = i
+      if i > 0 && P.toks[i - 1].kind == "EXPORT" { start = i - 1 }
+      let k = i
+      let last = i
+      let lp = -1
+      let rp = -1
+      let depth = 0
+      let going = true
+      while going && k < P.toks.length {
+        const kind = P.toks[k].kind
+        let keep = true
+        if kind == "LPAREN" {
+          if depth == 0 { lp = k }
+          depth = depth + 1
+        } else if kind == "RPAREN" {
+          depth = depth - 1
+          if depth == 0 { rp = k }
+        } else if kind == "NEWLINE" {
+          keep = false
+        }
+        if depth <= 0 && externEndsDecl(kind) {
+          going = false
+        } else {
+          if keep { last = k }
+          k = k + 1
+        }
+      }
+      extRecStart.push(start)
+      extRecStop.push(last)
+      extRecLp.push(lp)
+      extRecRp.push(rp)
+      i = last + 1
+    } else {
+      i = i + 1
+    }
+  }
+  0
+}
+
+// Rebuild recovered extern `k` as canonical source: the `export extern function name`
+// head, the parameter list reflowed through `wrapList` (one line when it fits, else one
+// per line), and the `: T` return tail. A comment inside the declaration takes the
+// verbatim path instead — collapsing it would splice the return type onto a `//` line.
+function fmtExtern(k: i32) {
+  const t = P.toks[extRecStart[k]]
+  const e = P.toks[extRecStop[k]]
+  const stop = e.start + e.text.length
+  const lp = extRecLp[k]
+  const rp = extRecRp[k]
+  if lp < 0 || rp < 0 || commentInCharSpan(t.start, stop) {
+    return sliceSpanFallback(t.start, stop)
+  }
+  const lparen = P.toks[lp]
+  const rparen = P.toks[rp]
+  const head = collapseWs(fmtSrc.slice(t.start, lparen.start))
+  const tail = collapseWs(fmtSrc.slice(rparen.start + rparen.text.length, stop))
+  const items: string[] = []
+  const parts = splitTopLevel(
+    fmtSrc.slice(lparen.start + lparen.text.length, rparen.start),
+    ",",
+  )
+  let p = 0
+  while p < parts.length {
+    const it = collapseWs(parts[p])
+    if it.length > 0 { items.push(it) }
+    p = p + 1
+  }
+  head + wrapList("(", items, ")", 0, dispWidth(head) + dispWidth(tail)) + tail
+}
+
+// Whether a recovered extern is still unplaced and starts before source `line`.
+function externPendingBefore(line: i32) {
+  if extCursor >= extRecStart.length { return false }
+  P.toks[extRecStart[extCursor]].line < line
+}
+
+// Emit recovered extern `k` at top level: the blank-line policy a statement gets against
+// `prevLine`, then its own leading comments, then the declaration sliced from the source.
+// Answers the new `prevLine`.
+function emitExternAt(k: i32, prevLine: i32, forceBlank: boolean) {
+  const t = P.toks[extRecStart[k]]
+  const e = P.toks[extRecStop[k]]
+  const startLine = t.line
+  const leading = peekLeadingCount(startLine)
+  if outBuf.length > 0 {
+    if forceBlank || (prevLine > 0 && startLine - prevLine > 1 + leading) {
+      fmtEmitRaw("\n")
+    }
+  }
+  emitLeadingComments(0, startLine)
+  emitLine(0, fmtExtern(k) + trailerSuffix(e.line))
+  e.line
+}
+
 // Concatenate all of `outBuf` into one exactly-sized code-point buffer,
 // materialized once — O(n) total allocation (see `joinLinesRange` for why the
 // single buffer beats both the O(n²) running accumulator and the O(n log n)
@@ -710,6 +841,14 @@ function emitStatements(stmts: i32[], indent: i32) {
     // previous one. (`< 1` not `== 0`: a bare `== 0` if-cond whose body reassigns
     // trips a frozen-host emitter quirk — see the format.vl header gotchas.)
     if sLine < 1 { sLine = prevLine + 1 }
+    // A recovered `extern function` has no node to sequence, so every one written before
+    // this statement is placed here, in source order.
+    while indent == 0 && externPendingBefore(sLine) {
+      prevLine = emitExternAt(extCursor, prevLine, afterImports)
+      afterImports = false
+      extCursor = extCursor + 1
+      skipCovered()
+    }
     // Preserve a single blank line before this statement's leading comment block
     // (or the statement itself, if none): measure the gap to the first pending
     // comment, not the statement, so a blank line within the comment block is
@@ -761,6 +900,13 @@ function emitStatements(stmts: i32[], indent: i32) {
       if sl == 0 { prevLine = sLine } else { prevLine = sl }
       i = i + 1
     }
+  }
+  // Externs written after the last statement — a module that only declares its host
+  // boundary has no statement to place them before.
+  while indent == 0 && extCursor < extRecStart.length {
+    prevLine = emitExternAt(extCursor, prevLine, afterImports)
+    afterImports = false
+    extCursor = extCursor + 1
   }
   0
 }
