@@ -38,3 +38,4 @@ D1560-D1579  vl-cb  2026-09-03  glean rows VL-025 (D1560), sampler residue (D156
 D1600-D1619  vl-cb  2026-09-04  glean VL-046 (D1600), the comment sweep's residue rows and follow-ups
 D1628-D1639  vl-cb  2026-09-05  second-pass fix follow-ups
 D1657-D1669  vl-c3  2026-09-05  coordinator lanes 2026-09-05 evening (cw* per-query scans perf, UFCS merge residues, formatter follow-ups)
+D1670-D1679  vl-c3  2026-09-05  coordinator lanes 2026-09-05 night (D1667-D1669 clause-1 fixes, D1664/D1665 residues)
