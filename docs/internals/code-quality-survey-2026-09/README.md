@@ -24,7 +24,7 @@ diagnostic column base); the rest stand on the surveys' own measurements.
 | # | finding | where | value | proof |
 | --- | --- | --- | --- | --- |
 | 7 | `letListBuildKind` and `letListBuildSlot` run one scoped destination walk twice, back to back, at all three sites | emitter #1 | ~16% of a self-compile | byte-identical seed, corpus `cmp` — **partly landed #2567**; remaining: epoch-stamped memo (step 2) |
-| 8 | `nodeChildren` allocates and walks 25 tag compares per node; 45.5% of nodes reach no arm | front end #1 | 11.75% of self time; DONE 2026-09-04 at self **8.16% → 3.51%** — the ALLOCATION was the cost, not the ladder, and `dsScopeWalk`'s reach is 32 distinct-key walks, not an unmemoised repeat (front end §5.1) | fixture byte identity, profile A/B — **partly landed #2570**; remaining: O(1) index (campaign) |
+| 8 | `nodeChildren` allocates and walks 25 tag compares per node; 45.5% of nodes reach no arm | front end #1 | 11.75% of self time; DONE — the ALLOCATION was the cost, not the ladder (#2570, self **8.16% → 3.51%**), and the reach index this row called a campaign is `dsgDestSlot` (#2607). Re-measured 2026-09-06 over two self-compile profiles: `nodeChildren` **0.47 / 0.67%** inclusive, `dsScopeWalk` **0.02 / 0.00%**, and the index pass that replaced it **0.70 / 0.73%** (front end §5.1) | fixture byte identity, profile A/B — **landed #2570, #2607** |
 | 9 | `fnDetectScratch` runs 12 whole-body walks per function; `dupScanRun` repeats the set per shadowed name | emitter #2 | 21% inclusive | byte-identical seed, `regress.py` — **partly landed #2580**; remaining: ~2.5% memo, eqCoreKindOfBin |
 | 10 | `nestedFnDeclaredInFrame` is the un-indexed twin of `nestedFnDeclaredIn`, which already has the child index | emitter #5 | O(children) per rung; one arena-scan ratchet entry retires | byte-identical seed — **landed #2583** |
 | 11 | definite assignment keeps a name-keyed `string[]` rebuilt per write, with every module binding in it | front end #2 | the call-site `O(n^1.5)` the perf survey never attributed | the scaling-shape ladder — **landed #2584** |
@@ -60,7 +60,7 @@ Rows 19 and 20 are rulings, not work.
 | 5 | landed | #2581 |
 | 6 | landed | #2563 |
 | 7 | partly landed | #2567 |
-| 8 | partly landed | #2570 |
+| 8 | landed | #2570, #2607 |
 | 9 | partly landed | #2580 |
 | 10 | landed | #2583 |
 | 11 | landed | #2584 |
