@@ -145,6 +145,13 @@ Deno.test({
         "block_while_capture",
         "block_bare",
         "block_bare_capture",
+        // The `*_place` three, added for D1729: every position above binds the delivery to
+        // `v` and proves over that name, so the receiver each proof presents is an Ident.
+        // D1719 and D1729 are both narrowed reads at a non-Ident receiver, and the whole
+        // grid above graded them green on both seeds while they were live.
+        "array_element_place",
+        "map_value_place",
+        "struct_field_place",
       ]
     ) {
       if (!positions.has(p)) {
