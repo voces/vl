@@ -313,7 +313,7 @@ On 2026-08-30: **runs 3,704 / 7,021 (52.76%)**, clause 1 **92**, clause 2 **314*
 and **45** check rejects that concede type-validity — **451 cells against the goal**. It also
 counts the distinct MESSAGE LITERALS in `compiler/*.vl` that concede the program is type-valid
 (`has no lowering`, `not yet supported by codegen`, `not supported yet`, `not yet implemented`,
-one reading `this program is type-valid but cannot build`) — **24** on 2026-09-01. That is the
+one reading `this program is type-valid but cannot build`) — **22** on 2026-09-05. That is the
 direction that hides: a capability gap moved into the checker stops looking like a gap, the
 program compiles no better than before, and the script counts it the same as an emit-side one.
 
@@ -335,13 +335,23 @@ sources of error push the estimate UP, not down: a time-boxed UNDECIDED favours
 unreachable-by-argument over live (which needs a program nobody has written), and the frame
 excludes the already-known-live sites.
 
-The population itself was mis-derived three times, most recently by me: **504 call sites**
-(`emitFail`/`emitFailAt` is the only emit-side channel), **434 distinct message templates**,
-**472 distinct literals** — of which **91 are FRAGMENTS** of interpolated messages that can
-never be a whole message. "511 literals" is not reproducible from any argument-scoped
-derivation; it came from an 8-line WINDOW grep that swept in neighbouring code. That is
-*"a line is not a message"* one level out — the unit you count has to be the thing a user
-receives, and the literal unit still overstates messages by ~20%.
+**THE DERIVATION IS A SCRIPT — `scripts/emit-refusal-sites.py`.** Every hand-derivation of this
+population has been wrong, including both of the ones this paragraph used to quote: "511
+literals" came from an 8-line WINDOW grep that swept in neighbouring code, and **504 sites is
+not reproducible either** — the script reads **521** on the very tree that doc measured, with
+the per-file split off in BOTH directions. Today, 2026-09-05: **533 call sites**
+(`emitFail`/`emitFailAt` is the only emit-side channel), **466 templates**, **519 argument-scoped
+literals**. The unit you count has to be the thing a user receives, so count sites and templates
+and re-run the script rather than a grep.
+
+**AND THE WORDING COUNT IS BOTH A FLOOR AND POINTED THE WRONG WAY.** It matches **16 of the 533**
+sites; the other **517 (97%) say nothing about legality**, and a seeded sample of 48 of them
+grades **21 LIVE / 20 UNREACHABLE / 7 UNDECIDED** — **≈226–302 reachable** (95% envelope
+159–368), while thirteen of the fourteen literals the predicate DOES match were witnessed as
+floors on 2026-09-02. **`scripts/capability-probes/live-sites.json` is the honest count**: one
+row per refusal literal a witness reaches, 21 of them, all invisible to the wording list;
+`run.py --live-sites` re-grades them and `tests/vl_live_sites_test.ts` refuses a row with no
+probe. `docs/internals/emit-refusal-wording-2026-09.md`.
 
 **And the distilled corpus contributes ZERO emit-side evidence** — `baseline.jsonl` is 4,620
 `runs` plus 2,944 `loud check reject`, with no emit rejects and no silent cells. That is why
@@ -361,7 +371,7 @@ those appear in internal invariant failures and in genuine DESIGN rules, and a p
 place only if it admits the refused program was legal.
 
 **AND `runs` CAN REACH 100% WITH THE GOAL UNMET — the script says by how much.** The corpus is
-generated over fixed axes, so it scores only the gaps it has a program for. **All 24
+generated over fixed axes, so it scores only the gaps it has a program for. **All 22
 literals are reached by NO corpus cell** — the element-widening container copy among them,
 which refuses by hand and costs the scoreboard nothing. Each ZERO row in `--sites` needs a
 hand-written probe, and none will arrive on its own. Do not read a rising `runs` as the whole

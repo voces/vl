@@ -101,3 +101,29 @@ separate step. A gap found today should be measurable today. If a probe's family
 be large enough to deserve an axis, that is a good reason to add the axis and re-distil — but
 the probe stays either way, because a distilled representative can be collapsed away and a
 named file cannot.
+
+## `live-sites.json` — the witness-backed count, beside the wording one
+
+`goal-scoreboard.py` has always counted the refusal literals whose SENTENCE concedes the
+refused program was legal. **A refusal is not obliged to concede.** `emitProgram:
+fromCodePoints argument must be a named i32[] binding` fired on a `vl check`-clean program
+the whole time and matched no phrase, and #2665 closed it without the count moving by one in
+either direction. Re-derived 2026-09-05: **517 of the compiler's 533 emit-side refusal sites
+(97%) say nothing about legality**, so the wording count is a floor and nothing more.
+
+`live-sites.json` is the other count: refusal literals a WITNESS reaches. One row per
+literal, each naming a probe in this directory that reaches it, and the scoreboard prints
+both numbers with the wording one labelled as the lower bound it is.
+
+    python3 scripts/capability-probes/run.py --live-sites   # re-grade every row
+    deno test -A --no-check tests/vl_live_sites_test.ts     # the structural half, in ms
+
+**It is a ratchet in one direction.** A row may only be ADDED with a probe that reaches its
+literal — the test refuses a row whose probe does not exist or whose header does not quote
+the literal. A row comes OFF when its witness starts RUNNING, in the PR that closed the gap;
+`--live-sites` reds until it does, and also on a witness that drifted onto another message or
+a literal that has left `compiler/*.vl`.
+
+`python3 scripts/emit-refusal-sites.py` re-derives the population the list is a subset of:
+sites, templates, and which ones the wording predicate misses, grouped by the verb they reach
+for. `docs/internals/emit-refusal-wording-2026-09.md` is the measurement that built the list.
