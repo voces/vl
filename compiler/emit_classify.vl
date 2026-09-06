@@ -55,6 +55,7 @@ import {
   TyVar,
   annUnionAtomsOf,
   anyLitUnionUsed,
+  cUserTypesVer,
   canonRewroteNode,
   canonTyIxOf,
   canonUnionKey,
@@ -16089,6 +16090,19 @@ export function isStructOfTy(ty: i32): boolean {
 // ref-list element kind a name's shape decides, or -1 when no shape arm claims it — the
 // caller's own base arm then answers. The paren-grouped niche arms are resolved once here.
 function refArrShapeKind(name: string): i32 {
+  const slot = rasBegin(name)
+  let k = rasIntAt(rasKind, slot, name, -2)
+  if k == -2 {
+    k = refArrShapeKindGo(name)
+    rasPut(slot, name, -1, k, "", 0)
+  }
+  rasDepth = rasDepth - 1
+  k
+}
+
+// The ladder itself, behind the index above: the ref-list element kind a name's shape
+// decides, or -1 when no shape arm claims it.
+function refArrShapeKindGo(name: string): i32 {
   // `i32[][]`, `boolean[][]`, and literal-union `K[][]` all carry the i32-list wrapper element
   // (kind 4) — one i32[] backing (`nameIsI32ListArray`), not three special cases.
   if nameIsI32ListArray(name) { return 4 }
@@ -16207,47 +16221,170 @@ function shapeElemDeclaredStructIdx(base: string) {
   si
 }
 
-// ── the ref-array ladder's per-call memo ─────────────────────────────────────
-// `nameIsRefArray` reaches itself twice per array level: `refArrShapeKind`'s nested-ref
-// arm asks it of `refArrElemName(name)`, which asked it of that same element already, so
-// one outermost call re-derives every level about 2^depth times where depth+1 would do.
-let rsmDepth = 0
-let rsmN = 0
-const rsmName: string[] = []
-const rsmRef: i32[] = []
+// ── the ref-array ladder's answer index ───────────────────────────────────────────────
+// The three entries below are asked the same handful of spellings once per node, and each
+// ask walks a ladder that re-enters itself, so a row is what keeps one spelling's
+// classification to once per generation (`docs/internals/perf-opportunities-2026-09.md`).
+const rasSlots = 2048
+let rasDepth = 0
+let rasGen = 1
+let rasRowGen: i32[] = []
+let rasName: string[] = []
+let rasRef: i32[] = []
+let rasKind: i32[] = []
+let rasElem: string[] = []
+let rasElemHave: i32[] = []
 
-// This call's recorded answer for `name` — 1 yes, 0 no, -1 not asked yet. One outermost
-// call asks about the suffix-strips of a single spelling, so `rsmN` is a handful and the
-// scan is a length test per row.
-function rsmRefOf(name: string): i32 {
-  let i = 0
-  while i < rsmN {
-    if rsmName[i] == name { return rsmRef[i] }
-    i = i + 1
-  }
-  -1
+// Has any input an arm reads changed since the rows' last stamp? The arena's in-place
+// epoch and the declared-type version, the LENGTH of every collect table an arm consults,
+// and the PASS — a column a later pass fills in place moves none of the others, so an
+// answer may not outlive its own pass (D1655).
+let rasGenTy = -1
+let rasGenUV = -1
+let rasGenS = -1
+let rasGenSF = -1
+let rasGenU = -1
+let rasGenV = -1
+let rasGenN = -1
+let rasGenP = -1
+
+function rasStale() {
+  if rasGenTy != tyMutEpoch { return true }
+  if rasGenUV != cUserTypesVer { return true }
+  if rasGenS != sNames.length { return true }
+  if rasGenSF != sFieldCount.length { return true }
+  if rasGenU != unNames.length { return true }
+  if rasGenV != uVariants.length { return true }
+  if rasGenP != emitPassGen { return true }
+  rasGenN != P.nodes.length
 }
 
-// Record `v` as this call's answer for `name`, appending a row when the name is new.
-// Rows are reused across calls by resetting `rsmN` rather than the arrays, so the steady
-// state allocates nothing.
-function rsmPutRef(name: string, v: i32) {
+function rasStamp() {
+  rasGenTy = tyMutEpoch
+  rasGenUV = cUserTypesVer
+  rasGenS = sNames.length
+  rasGenSF = sFieldCount.length
+  rasGenU = unNames.length
+  rasGenV = uVariants.length
+  rasGenN = P.nodes.length
+  rasGenP = emitPassGen
+  0
+}
+
+// Forget every row in one step — a row answers only while its own stamp equals the live
+// generation. The columns are grown once and never emptied, so a drop allocates nothing.
+function rasDrop() {
+  rasGen = rasGen + 1
+  // A wrapped generation could alias a row's old stamp; restarting from empty columns
+  // cannot. Unreachable in a compile, cheap to make impossible.
+  if rasGen < 0 {
+    rasGen = 1
+    rasRowGen = []
+    rasName = []
+    rasRef = []
+    rasKind = []
+    rasElem = []
+    rasElemHave = []
+  }
+  while rasRowGen.length < rasSlots { rasGrow() }
+  rasStamp()
+}
+
+// One empty row, appended to every column at once.
+function rasGrow() {
+  rasRowGen.push(0)
+  rasName.push("")
+  rasRef.push(-1)
+  rasKind.push(-2)
+  rasElem.push("")
+  rasElemHave.push(0)
+  0
+}
+
+// The row `name` maps to — its length, then up to nine characters spanning the whole
+// spelling, so one leaf's array dimensions (`S[]`, `S[][]`, `S[][][]`) and two shapes
+// differing in a late field land on different rows. A collision costs a re-derivation.
+function rasSlotOf(name: string): i32 {
+  const n = name.length
+  let h = n
+  let step = 1
+  if n > 8 { step = n / 8 }
   let i = 0
-  while i < rsmN {
-    if rsmName[i] == name {
-      rsmRef[i] = v
-      return 0
-    }
-    i = i + 1
+  while i < n {
+    h = h * 31 + name[i]
+    i = i + step
   }
-  if rsmN < rsmName.length {
-    rsmName[rsmN] = name
-    rsmRef[rsmN] = v
-  } else {
-    rsmName.push(name)
-    rsmRef.push(v)
+  h & (rasSlots - 1)
+}
+
+// Open a ladder call: only the TOP of a walk re-stamps, since inside one the rows are what
+// stop the ladder re-deriving the same spelling once per arm. Returns the row.
+function rasBegin(name: string): i32 {
+  while rasRowGen.length < rasSlots { rasGrow() }
+  if rasDepth == 0 {
+    if rasStale() { rasDrop() }
   }
-  rsmN = rsmN + 1
+  rasDepth = rasDepth + 1
+  rasSlotOf(name)
+}
+
+// Does row `slot` hold `name` under the live generation? The columns grow together in
+// `rasDrop`, so this one bound test stands for all of them.
+function rasHas(slot: i32, name: string): boolean {
+  if slot < 0 { return false }
+  if slot >= rasRowGen.length { return false }
+  if rasRowGen[slot] != rasGen { return false }
+  rasName[slot] == name
+}
+
+// One i32 column of row `slot`, or `miss` when the row is another name's or out of range.
+function rasIntAt(col: i32[], slot: i32, name: string, miss: i32): i32 {
+  if !rasHas(slot, name) { return miss }
+  if slot >= col.length { return miss }
+  col[slot]
+}
+
+// The element-name column of row `slot`, or "" — `rasIntAt` over `rasElemHave` says which
+// of "not asked" and "asked, nothing resolved" a "" means.
+function rasElemAt(slot: i32, name: string): string {
+  if !rasHas(slot, name) { return "" }
+  if slot >= rasElem.length { return "" }
+  rasElem[slot]
+}
+
+// Make row `slot` hold `name`, keeping its columns when it already does — a sibling column
+// the recursion under this call filled must survive the write that follows it.
+function rasClaim(slot: i32, name: string) {
+  if slot < 0 { return 0 }
+  if slot >= rasRowGen.length { return 0 }
+  if rasHas(slot, name) { return 0 }
+  rasRowGen[slot] = rasGen
+  rasName[slot] = name
+  rasRef[slot] = -1
+  rasKind[slot] = -2
+  rasElem[slot] = ""
+  rasElemHave[slot] = 0
+  0
+}
+
+// Record `name`'s `nameIsRefArray` (0/1), shape kind and element name in row `slot`.
+function rasPut(
+  slot: i32,
+  name: string,
+  ref: i32,
+  kind: i32,
+  elem: string,
+  haveElem: i32,
+) {
+  rasClaim(slot, name)
+  if slot < 0 { return 0 }
+  if slot >= rasRowGen.length { return 0 }
+  if ref >= 0 { rasRef[slot] = ref }
+  if kind > -2 { rasKind[slot] = kind }
+  if haveElem == 1 {
+    rasElem[slot] = elem
+    rasElemHave[slot] = 1
+  }
   0
 }
 
@@ -16256,17 +16393,14 @@ function rsmPutRef(name: string, v: i32) {
 // (a map-struct element). Lowers to the `{ backing: (ref $raTypeIdx), len, cap }` wrapper
 // over a `(ref null $elem)` backing (G7-ref). A non-`[]` name or an `i32[]` is not a ref array.
 export function nameIsRefArray(name: string) {
-  // The memo lives for exactly one outermost call, which is what makes it sound with no
-  // generation stamp: no writer of `sNames`, `unNames` or `uVariants` is reachable from
-  // the ladder, so nothing it reads can move while a call is on the stack.
-  if rsmDepth == 0 { rsmN = 0 }
-  const memo = rsmRefOf(name)
-  if memo >= 0 { return memo == 1 }
-  rsmDepth = rsmDepth + 1
-  let v = 0
-  if nameIsRefArrayGo(name) { v = 1 }
-  rsmDepth = rsmDepth - 1
-  rsmPutRef(name, v)
+  const slot = rasBegin(name)
+  let v = rasIntAt(rasRef, slot, name, -1)
+  if v < 0 {
+    v = 0
+    if nameIsRefArrayGo(name) { v = 1 }
+    rasPut(slot, name, v, -2, "", 0)
+  }
+  rasDepth = rasDepth - 1
   v == 1
 }
 
@@ -17690,6 +17824,19 @@ export function arrLitElemName(arrIx: i32) {
 // with the trailing `[]` removed — the struct or union alias name. Mirrors `refArrElemKind`
 // but yields the table key.
 export function refArrElemName(name: string) {
+  const slot = rasBegin(name)
+  let e = rasElemAt(slot, name)
+  if rasIntAt(rasElemHave, slot, name, 0) == 0 {
+    e = refArrElemNameGo(name)
+    rasPut(slot, name, -1, -2, e, 1)
+  }
+  rasDepth = rasDepth - 1
+  e
+}
+
+// The ladder itself, behind the index above: the element name a ref-array spelling keys
+// its slot on, or "" when nothing resolves.
+function refArrElemNameGo(name: string) {
   const ranp = nullablePartOf(name)
   if ranp != "" && nameIsArray(ranp) { return refArrElemName(ranp) }
   // `i32[][]` -> `i32[]`, `boolean[][]` -> `boolean[]`, `K[][]` -> `K[]`: the immediate i32-backed
