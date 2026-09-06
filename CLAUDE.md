@@ -541,7 +541,7 @@ an unbounded recursion or a fixpoint that does not converge, and that is the def
 **Three gates now catch this class, at three different moments.** `arena-scan-outside-pass`
 (`compiler/lint.vl` + `scripts/scan-budget.py`'s ratchet) fires at REVIEW time on a loop
 bounded by a whole-program table outside a pass — 132 stand, the count may only fall.
-`tests/vl_scaling_shape_test.ts` compiles nine pairs of same-work-different-shape programs
+`tests/vl_scaling_shape_test.ts` compiles ten pairs of same-work-different-shape programs (the tenth, `covariant bindings`, joined with #2685)
 and grades the ratio of the two arms' CPU, so machine speed and load cancel and the failure
 NAMES the axis. **A ratio cancels a UNIFORM slowdown and the gate's fan-out is not one** —
 the arms run at different moments, so a burst inflates one alone: the `functions` pair read
