@@ -210,3 +210,49 @@ Deno.test({
     });
   },
 });
+
+// D1678: `vl build` used to VALIDATE by re-reading the `-o` path off disk, so an
+// output path that cannot be read back (`/dev/null`, a pipe, a write-only mount)
+// failed a check-clean build with "unexpected end-of-file" at rc 70 — the write had
+// already succeeded, only the re-read to check it had not. Fixed by validating the
+// buffer the host already holds; the control below proves it reports the SAME byte
+// count a real-file build does, which the old `fs::metadata` read on `/dev/null`
+// (always 0) could not.
+Deno.test({
+  name:
+    "vl-build-validate: -o /dev/null validates the buffer in hand, not a re-read of the path (D1678)",
+  ignore: !ENABLED,
+  fn: async () => {
+    await withCase(VALID_SRC, async (srcPath, outPath) => {
+      // Control: an ordinary build to a real file, for the byte count to compare against.
+      const toFile = await vl(["build", srcPath, "-o", outPath]);
+      if (toFile.code !== 0) {
+        throw new Error(`control build to a real file failed (rc ${toFile.code}):\n${toFile.err}`);
+      }
+      const fileBytes = toFile.out.match(/\((\d+) bytes\)/)?.[1];
+      if (!fileBytes) {
+        throw new Error(`expected a "wrote ... (N bytes)" line, got: ${JSON.stringify(toFile.out)}`);
+      }
+
+      const toDevNull = await vl(["build", srcPath, "-o", "/dev/null"]);
+      if (toDevNull.code !== 0) {
+        throw new Error(
+          `-o /dev/null must build a check-clean program clean, got rc ${toDevNull.code}:\n` +
+            toDevNull.err,
+        );
+      }
+      const devNullMatch = toDevNull.out.match(/^wrote \/dev\/null \((\d+) bytes\)$/m);
+      if (!devNullMatch) {
+        throw new Error(
+          `expected the "wrote /dev/null (N bytes)" report, got: ${JSON.stringify(toDevNull.out)}`,
+        );
+      }
+      if (devNullMatch[1] !== fileBytes) {
+        throw new Error(
+          `the reported length must be the buffer's own length, matching the real-file build: ` +
+            `file said ${fileBytes} bytes, /dev/null said ${devNullMatch[1]} bytes`,
+        );
+      }
+    });
+  },
+});
