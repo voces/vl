@@ -4807,16 +4807,18 @@ function mvValLowersTy(ty: i32): i32 {
 
 // The recorded-type twin of `mapValKindLowerable`. The name rung renders the value and
 // classifies the render, so this asks the arena first and falls through to the render only
-// for a value kind `mvValLowersTy` declines.
+// for a value kind `mvValLowersTy` declines. False for a type that is not a map at all.
+function mapTyValKindLowerable(mty: i32) {
+  if mty < 0 { return false }
+  const mt = T.tys[mty]
+  if !(mt is TyMap) { return false }
+  if mvValLowersTy(mt.mVal) == 1 { return true }
+  mvValKindOfName(tyToEmitName(mt.mVal)) != -3
+}
+
+// `mapTyValKindLowerable` asked of a node's recorded type.
 function mapNodeValKindLowerable(ix: i32) {
-  const mty = nodeTyIxOf(ix)
-  if mty >= 0 {
-    const mt = T.tys[mty]
-    if mt is TyMap {
-      if mvValLowersTy(mt.mVal) == 1 { return true }
-    }
-  }
-  mvValKindOfName(nodeTyMapValName(ix)) != -3
+  mapTyValKindLowerable(nodeTyIxOf(ix))
 }
 
 // The mv value kind of a map value type-name — the one enumeration of which value types a
@@ -9401,11 +9403,12 @@ function structIndexOfObjCtxGo(objIx: i32, fnIx: i32) {
                 // An i64-coded value (a magnitude literal, or one adopted to i64 by
                 // the checker) must not match an i32-field shape and store an i64 into it.
                 if sc != 23 && sc != 16 { ok = false }
-              } else if vc == 19 {
-                // An mv slot's identity is the (key, value) pair, so a `Map()` field value
-                // aligns only with a map field whose row names that same pair, not just any map.
-                if sc != 19 && sc != 16 { ok = false }
-                if sc == 19 {
+              } else if vc == 19 || vc == 29 {
+                // An mv slot's identity is the (key, value) pair, so a map field value
+                // aligns only with a map field of its own nullability — plain 19 or niche 29
+                // — whose row names that same pair, not just any map (D1665).
+                if sc != vc && sc != 16 { ok = false }
+                if sc == vc {
                   if (
                     sFieldElemKeyI32At(si, mfi) !=
                     anonFieldElemKeyI32(f.fiValue, vc)
@@ -14826,7 +14829,12 @@ function shapeFieldTypeCompatK(
     if nameIsLitUnionArray(t) != nameIsLitUnionArray(elem) { return false }
     return true
   }
-  if want == 19 && elem != "" { return mvValNamesCompat(mapValNameOf(t), elem) }
+  // A map field's row identity is its (key, value) pair, so a render naming a different
+  // value is a different row — at the plain code (19) and at the `| null` niche (29), whose
+  // value name comes off the same cut the recorder used (D1665).
+  if want == 19 || want == 29 {
+    if elem != "" { return mvValNamesCompat(shapeFieldElemName(t, want), elem) }
+  }
   if want == 16 && elem != "" {
     // The name-side twin of `anonValueFitsField`'s box arm: a box's member sequence decides
     // its tags, so a render naming a different one is a different row. Without it an
@@ -19069,8 +19077,10 @@ function anonNulFieldCodeOfTy(ty: i32): i32 {
       return anonNulListFieldCodeOfElem(it.aElem)
     }
     TyMap => {
-      // A nullable map reps as code 29; no cell reaches this arm today, since its own type
-      // is not recorded as a `TyNullable`. D1665.
+      // A nullable map field is code 29, the nullable ref to the value type's mv struct —
+      // the rep the declared `{[K]: V} | null` spelling already codes. Gated to the value
+      // kinds the mv layer lowers, so an unrepresentable value keeps refusing loudly (D1665).
+      if mapTyValKindLowerable(inner) { return 29 }
     }
     TyUnion => {
       // A union plus null is the box, not a niche — `anonUnionFieldName` claims it above.
@@ -19243,6 +19253,9 @@ function anonCodeAdmitsValue(c: i32, valIx: i32) {
   // ref-list element's, and 30 the union whose members its i32 atom is an id into — a
   // self-contained slot would lose that membership (D1627, D1710).
   if c == 15 || c == 28 || c == 30 { return anonFieldElemName(valIx, c) != "" }
+  // Code 29 the same way: the nullable map's slot is a ref to its value type's mv struct, so
+  // the value name is the companion the emitter re-finds that slot by (D1665).
+  if c == 29 { return anonFieldElemName(valIx, c) != "" }
   // Code 5 the same way, once its companion can name a non-struct element (D1688). The
   // struct-row rung stays its own disjunct: an EMPTY array literal resolves a row and names
   // no element, so folding the two would refuse a shape that mints today.
@@ -19396,6 +19409,10 @@ function anonFieldCodeSyn(valIx: i32) {
 // records the nested struct's table name. "" otherwise.
 export function anonFieldElemName(valIx: i32, code: i32) {
   if code == 19 { return nodeTyMapValName(valIx) }
+  // A nullable map field (code 29) records the `| null`-peeled map's value name — the same
+  // mv-slot key `shapeFieldElemName`'s code-29 arm reads off the declared spelling, so one
+  // map value type is one key at both codes (D1665).
+  if code == 29 { return tyToEmitName(tyMapValOf(anonNulInnerTyOf(valIx))) }
   // A value-union field (code 16) records its member set, the same column
   // `shapeFieldElemName` fills from the declared spelling. Supplying it is what admits
   // code 16 to `anonFieldCode` at all (D1242).
@@ -19452,11 +19469,12 @@ export function anonFieldElemName(valIx: i32, code: i32) {
   ""
 }
 
-// The key column of an anonymous-shape field row: true only for an i32-keyed map field,
-// whose (key, value) pair is the mv slot's identity — every other code is string-keyed by
-// construction. Read off the checker's recorded type, the literal's only spelling of the map.
+// The key column of an anonymous-shape field row: true only for a map field, plain (19) or
+// nullable (29), whose (key, value) pair is the mv slot's identity — every other code is
+// string-keyed by construction. Read off the checker's recorded type, the literal's only
+// spelling of the map; `nodeTyMapKeyIsI32` peels the `| null` the declared twin reads.
 export function anonFieldElemKeyI32(valIx: i32, code: i32) {
-  if code != 19 { return false }
+  if code != 19 && code != 29 { return false }
   nodeTyMapKeyIsI32(valIx)
 }
 
@@ -25384,10 +25402,10 @@ export function exprUnion(exprIx: i32, fnIx: i32) {
   // destination the binding took a scalar cell and the box went into it — invalid wasm. The
   // arms share the checker's join type, so the then arm classifies the whole if-expression.
   if e is IfStmt {
-    // …unless the JOIN is a union neither arm is, which a MIXED one is: `if c { st() } else { 7 }`
-    // has a struct then arm and an i32 else arm and joins to `A | i32`. Asked of the node's own
-    // registered row, so it answers only where the join really minted one (D1709).
-    if nodeMixedUnionName(exprIx) != "" { return true }
+    // …unless the JOIN is a union neither arm is: `if c { "green" } else { 7 }` joins to
+    // `string | i32` and neither arm is a union, so the then arm answers false for a node
+    // whose own type is a box. Asked of the node's recorded type, which is the join (D1733).
+    if coalesceResultUnionName(exprIx) != "" { return true }
     const iuTv = ifThenValueIx(exprIx)
     if iuTv >= 0 { return exprUnion(iuTv, fnIx) }
     return false
@@ -26938,6 +26956,14 @@ export function unionHasAtomTy(
   // the refusal below is reached exactly as before (`unABAtomRetry`).
   const r = unABAtomRetry(name, want, arr)
   if r >= 0 { return r == 1 }
+  // The RENDERED member set, when the name is one: an inferred join has no registered row,
+  // and its render is the checker's own member list, so reading it invents neither a row nor
+  // an order. A name with no top-level `|` is an alias and still refuses (D1733).
+  if tyTopIndexOf(name, '|', 0, 0) >= 0 {
+    let spell = want
+    if arr { spell = want + "[]" }
+    return unionHasAtom(name, spell)
+  }
   emitFail(
     "emitProgram: union box atom test on a union with no recorded members: " +
       name,
@@ -28039,13 +28065,17 @@ export function sharedUnionFieldPlan(
 function memFieldTypeCode(memIx: i32, fnIx: i32) {
   const e = P.nodes[memIx]
   if e is Member {
+    // Only a narrowing that names a VARIANT re-homes the field onto the variant tables; one
+    // that does not leaves the receiver at its own shape, so it falls through to the rungs
+    // below rather than answering -1. A place narrowed to a plain struct is that case, and
+    // its `string` field read then classified as an i32 at `print` (D1735).
     if memIsNarrowed(memIx) {
       const vi = memNarrowVariantIndex(memIx)
       if vi >= 0 {
         const vfi = variantFieldIndex(vi, e.memProp)
         if vfi >= 0 { return variantFieldTypeAt(vi, vfi) }
+        return -1
       }
-      return -1
     }
     // A field read on a variant-typed param `o.field` reads the variant struct's field type
     // directly, off the unboxed param rather than a `narrowName` ident.
@@ -31518,13 +31548,17 @@ function declaredString(name: string) {
 function memberFieldCode(memIx: i32, fnIx: i32) {
   const e = P.nodes[memIx]
   if e is Member {
+    // Only a narrowing that names a VARIANT re-homes the field onto the variant tables; one
+    // that does not leaves the receiver at its own shape, so it falls through to the rungs
+    // below rather than answering -1. A place narrowed to a plain struct is that case, and
+    // its `string` field read then classified as an i32 at `print` (D1735).
     if memIsNarrowed(memIx) {
       const vi = memNarrowVariantIndex(memIx)
       if vi >= 0 {
         const vfi = variantFieldIndex(vi, e.memProp)
         if vfi >= 0 { return variantFieldTypeAt(vi, vfi) }
+        return -1
       }
-      return -1
     }
     const pvi = exprVariantIndex(e.memObj, fnIx)
     if pvi >= 0 {
@@ -31664,6 +31698,13 @@ export function exprString(exprIx: i32, fnIx: i32) {
     // has no typed-IR fast path (canon softens a literal union to `string`), unlike its siblings.
     const iuk = indexUnionReadKind(exprIx, fnIx)
     if iuk != -3 { return iuk == 2 }
+    // A string-valued MAP cell, and only once a guard has proved the key present: the read is
+    // `V | null` until then, which `exprNullableString` owns. `indexPlaceNonNull` is the same
+    // question the ref-list arm of the index READ asks before it recovers non-null (D1735).
+    const smv = mapReadMvSlot(exprIx, fnIx)
+    if smv >= 0 {
+      if mvValKind[smv] == 3 { return indexPlaceNonNull(exprIx) }
+    }
   }
   // A field read `p.f` where `f` is a STRING struct field yields a string ref (gap #2:
   // `let k = t.kind` must give `k` the string type, not i32).
