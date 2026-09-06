@@ -9062,7 +9062,7 @@ function declRowFieldFits(vc: i32, sc: i32, valIx: i32, si: i32, mfi: i32) {
 // It CAN drop a field the destination does not want and widen one it does, which is the
 // accepting side of the object-shape floor and stays lenient here (D1694, D1696).
 function elemRowsCaptureCompat(vn: string, dn: string): boolean {
-  elemRowsCaptureCompatAt(vn, dn, 8)
+  elemRowsCaptureCompatAt(vn, dn, 24)
 }
 
 // The same question one nesting level at a time: a nested-struct field is asked of its own
@@ -9072,10 +9072,22 @@ function elemRowsCaptureCompat(vn: string, dn: string): boolean {
 function elemRowsCaptureCompatAt(vn: string, dn: string, depth: i32): boolean {
   if vn == dn { return true }
   if depth <= 0 { return true }
+  // A CONTAINER key names no row, so peel both and ask about their elements: a list of lists
+  // records `A[]`, which `structIndexByName` cannot resolve and the walk would skip (D1697).
+  const vPeel = refArrElemKeyDeferred(vn)
+  const dPeel = refArrElemKeyDeferred(dn)
+  if vPeel != "" && dPeel != "" {
+    return elemRowsCaptureCompatAt(vPeel, dPeel, depth - 1)
+  }
   const vi = structIndexByName(vn)
-  if vi < 0 { return true }
   const di = structIndexByName(dn)
-  if di < 0 { return true }
+  if vi < 0 || di < 0 {
+    // Neither key names a row and neither peeled as a container — a closure, a map, a
+    // nullable ref. Both sides are then SPELLINGS of the same producer, so comparing them is
+    // comparing like with like; one side resolving and the other not stays lenient (D1697).
+    if vi < 0 && di < 0 { return vn == dn }
+    return true
+  }
   let k = 0
   while k < sFieldCount[di] {
     const at = sFieldStart[di] + k
@@ -14099,12 +14111,18 @@ function fieldElemTyOfQueryTy(ty: i32, code: i32): i32 {
 // side is never a conflict. Nominal, not canon, is the point — `Circle` (a union arm) and
 // its exact layout twin `Dot` share one canon key but are two declarations (DECISIONS.md).
 function fieldElemDeclConflict(qElemTy: i32, si: i32, fj: i32): boolean {
-  const qn = declNominalOfTy(qElemTy)
-  if qn == "" { return false }
   let rn = declNominalOfTy(sFieldElemTyIxAt(si, fj))
   if rn == "" { rn = sFieldElemNameAt(si, fj) }
   if rn == "" { return false }
-  qn != rn
+  const qn = declNominalOfTy(qElemTy)
+  if qn != "" { return qn != rn }
+  // A CONTAINER element declares no nominal of its own, so the two keys go to the node
+  // reader's comparator instead of declining — one container or one nesting level at a
+  // time, and lenient wherever it cannot resolve a side (D1697).
+  const qk = tyToNominalName(qElemTy)
+  if qk == "" { return false }
+  if tyNomNameCycled() { return false }
+  !elemRowsCaptureCompat(qk, rn)
 }
 
 // `fieldElemDeclConflict`'s union-box twin: every box field is code 16 whatever it boxes, so
