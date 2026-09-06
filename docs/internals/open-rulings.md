@@ -553,6 +553,22 @@ wrapped at the column) for lists whose elements are ALL scalar literals; (b) one
 always. **Recommendation: (a)**, scalar literals only — anything with a struct, closure or
 nested list element keeps one-per-line, so the rule is decidable from the element kinds alone.
 
+### D1773 — a negation type in a many-values-per-slot position: refused, by design or by gap?
+
+`type N = !string` is a checker-only refinement with no rep of its own, so a BINDING takes its
+initializer's rep and now runs (D1775, #2790; D1773's nine owed cells, #2807). The ten cells
+left refusing are positions that hold ONE rep for MANY values: a parameter (`p: !string` called
+with `5` and `1.5`), an array element (`[1, 1.5]` in one `(!string)[]`), a struct field and a
+map value. The witnesses are mixed-value programs `vl check` accepts, and no single slot rep
+exists to choose. **Options.** (a) rule it DESIGN: a negation type is legal only where one
+value's rep is in hand, and the checker refuses a negation annotation on a parameter, element,
+field or map value with a sentence that says so (today the refusal is the emitter's); (b) rule
+it CAPABILITY: those positions box the value (a negation over `string` is `anything-but-string`
+and would need the value-union box with every non-string rep as an arm), which is D1721's box
+one step wider and costs a heap type per negation. **Recommendation: (a)** — a negation is a
+constraint on a type, not a type with a runtime shape, and (b) buys a boxed `i32` for a feature
+almost nothing uses. If (a), the checker owes the sentence and D1773 closes as DESIGN.
+
 ### code-quality survey rows 19 and 20 — re-grade before ruling
 
 Row 19 (the seed anchors on the CWD, std on the EXE's tree) predates std shipping INSIDE the
