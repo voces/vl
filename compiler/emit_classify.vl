@@ -165,6 +165,7 @@ import {
   tyIsLitUnionAlias,
   tyIsLitUnionArray,
   tyIsLitUnionOrLit,
+  tyIsNegation,
   tyIsNewtypeBrand,
   tyIsNullableLitUnion,
   tyIsU8ArrayTy,
@@ -317,7 +318,7 @@ import {
   blockLastStmtExits,
   exprIsIfStmt,
   firstValuedReturn,
-  globalHasTypeAnn,
+  globalAnnNamesCell,
   globalIsNonConst,
   ifArmValueExpr,
   ifExprCollectAtoms,
@@ -3054,7 +3055,10 @@ function letInitCellKind(letIx: i32, fnIx: i32): VKind {
 function letCellKind(letIx: i32, fnIx: i32): VKind {
   const d = P.nodes[letIx]
   if d is LetDecl {
-    if d.letType >= 0 { return vtKindOfType(d.letType) }
+    // A NEGATION annotation names no rep, so the cell is the initializer's, exactly as an
+    // un-annotated binding's is — the annotation constrains which values may arrive, never
+    // how the one that did is stored (D1773).
+    if annNamesRep(d.letType) { return vtKindOfType(d.letType) }
     if d.letInit >= 0 { return letInitCellKind(letIx, fnIx) }
   }
   "i32"
@@ -15344,7 +15348,7 @@ function boundBoolByName(name: string, fnIx: i32) {
       if li >= 0 {
         const d = P.nodes[li]
         if d is LetDecl {
-          if d.letType >= 0 { return tyIsBool(d.letType) }
+          if annNamesRep(d.letType) { return tyIsBool(d.letType) }
           return exprIsBool(d.letInit, fnIx)
         }
       }
@@ -15354,11 +15358,19 @@ function boundBoolByName(name: string, fnIx: i32) {
   if gi >= 0 {
     const g = P.nodes[gi]
     if g is LetDecl {
-      if g.letType >= 0 { return tyIsBool(g.letType) }
+      if annNamesRep(g.letType) { return tyIsBool(g.letType) }
       return exprIsBool(g.letInit, -1)
     }
   }
   false
+}
+
+// Whether annotation node `n` NAMES A REP. Absent, it does not; nor does a NEGATION, which is
+// a checker-only refinement with no positive type of its own — so a ladder reading an
+// annotation for a cell or a print arm must read through it to the initializer (D1773).
+export function annNamesRep(n: i32): boolean {
+  if n < 0 { return false }
+  !tyIsNegation(nodeTyIxOf(n))
 }
 
 export function retNulRefFlag(tyIx: i32) {
@@ -16488,7 +16500,7 @@ function globalCellKindGo(letIx: i32): VKind {
     // `nullref`. Checked first, outside the annotation split: the binding has no
     // annotation by construction, so the un-annotated arm would read the init as i32.
     if letIsNulNone(letIx, -1) { return "nulnone" }
-    if globalHasTypeAnn(letIx) {
+    if globalAnnNamesCell(letIx) {
       // A NULLABLE-function global (`let g: ((i32) => i32) | null = inc`) is a nullable
       // closure cell (kind 19) — checked BEFORE the bare-function kind 14, mirroring
       // `vtKindOfType` / `fieldTypeCode`: `((i32) => i32) | null` is a nullable function,
@@ -16593,7 +16605,7 @@ function globalCellKindGo(letIx: i32): VKind {
 export function globalCellStructIdx(letIx: i32) {
   const d = P.nodes[letIx]
   if d is LetDecl {
-    if globalHasTypeAnn(letIx) {
+    if globalAnnNamesCell(letIx) {
       // The annotated twin of the variant leg below: a kind-8 slot IS the variant index,
       // named directly by the annotation. Before `structIndexOfLet`, which answers -1 for
       // a variant by construction (the struct table doesn't hold one).
