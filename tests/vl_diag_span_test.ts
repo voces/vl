@@ -217,6 +217,57 @@ const GRID: Row[] = [
     endCol: 4,
     underlines: "match k {\n    1 => print(1)\n    2 => print(2)\n  }",
   },
+  // ── a MERGED program: the span is this file's node, not another file's token ──
+  // `nodeStartTok` used to binary-search every module's tokens for the node's byte offset,
+  // and a merge appends each module's tokens carrying that module's OWN offsets — so the
+  // search could answer with a token from `std:` and place the diagnostic anywhere (D1652).
+  // Every row here imports a module; a template hole imports `std:fmt` by itself.
+  {
+    // `print(`v=\{[1]}`)` — the hole is the array literal at 12, its `]` at 14.
+    // Before D1652 this underlined the `]` alone.
+    name: "merged: a hole on line 1 spans the hole",
+    src: "print(`v=\\{[1]}`)\n",
+    frag: "an interpolation hole is",
+    line: 1,
+    col: 12,
+    endCol: 15,
+    underlines: "[1]",
+  },
+  {
+    // The same hole under a preamble. Before D1652 this reported 2:3 — a column inside the
+    // COMMENT block, three lines above any code, which is what a wrong module's token gives.
+    name: "merged: a hole under a preamble stays on the hole's own line",
+    src:
+      '// c0\n// c1\n// c2\ntype P = { x: i32 }\nconst p: P = { x: 1 }\nprint(`v=\\{p}`)\n',
+    frag: "an interpolation hole is",
+    line: 6,
+    col: 12,
+    endCol: 13,
+    underlines: "p",
+  },
+  {
+    // A hole on the template's SECOND line: `two \{p} three` puts `p` at column 7.
+    name: "merged: a hole on the template's second line spans that line's hole",
+    src:
+      '// c0\n// c1\ntype P = { x: i32 }\nconst p: P = { x: 1 }\nprint(`one\ntwo \\{p} three`)\n',
+    frag: "an interpolation hole is",
+    line: 6,
+    col: 7,
+    endCol: 8,
+    underlines: "p",
+  },
+  {
+    // The family is the MERGE, not the template: an ordinary `import` is enough. `xs[0]` at
+    // 19, its `]` at 23 — the anchor the raise fell back to when the search found nothing.
+    name: "merged: an imported module's file spans its own node",
+    src:
+      'import { reverse } from "std:array"\nconst xs = reverse([1, 2])\nconst s: string = xs[0]\nprint(s)\n',
+    frag: "cannot assign",
+    line: 3,
+    col: 19,
+    endCol: 24,
+    underlines: "xs[0]",
+  },
   // ── exception 1: a declaration's own NAME ─────────────────────────────────
   {
     // `function f(a: i32): i32 { a }` — the second `f` at 10.
