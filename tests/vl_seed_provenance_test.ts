@@ -65,6 +65,74 @@ Deno.test("seed provenance: every verdict fires on a specimen that must produce 
   }
 });
 
+const RECORD = `${ROOT}/scripts/record-seed-provenance.sh`;
+
+/** Run the recorder against a throwaway seed path; returns its rc, output and sidecar state. */
+async function record(env: Record<string, string>) {
+  const seed = await Deno.makeTempFile({ suffix: ".wasm" });
+  const { code, stdout, stderr } = await new Deno.Command("bash", {
+    args: [RECORD, seed],
+    cwd: ROOT,
+    env,
+    stdout: "piped",
+    stderr: "piped",
+  }).output();
+  const d = new TextDecoder();
+  let sidecar: string | null = null;
+  try {
+    sidecar = await Deno.readTextFile(`${seed}.src`);
+  } catch { /* the refusal path leaves none, which is the point */ }
+  await Deno.remove(seed).catch(() => {});
+  await Deno.remove(`${seed}.src`).catch(() => {});
+  return { code, out: d.decode(stdout) + d.decode(stderr), sidecar };
+}
+
+Deno.test("seed provenance: a `python3` that cannot start falls back rather than skipping", async () => {
+  // The box this was found on has a Homebrew python3 first on PATH that exits before running a
+  // line. `/bin/false` stands in for it: same observable — rc != 0, nothing recorded.
+  const { code, out, sidecar } = await record({ PYTHON: "/bin/false" });
+  if (code !== 0) throw new Error(`want rc 0 via the fallback, got ${code}:\n${out}`);
+  if (sidecar === null) throw new Error(`the fallback recorded no sidecar; output:\n${out}`);
+  if (!/^[0-9a-f]{16}\n/.test(sidecar)) {
+    throw new Error(`want a 16-hex identity as the sidecar's first line, got:\n${sidecar}`);
+  }
+  if (!out.includes("could not run")) {
+    throw new Error(`the fallback must say which interpreter failed; got:\n${out}`);
+  }
+});
+
+Deno.test("seed provenance: with no working interpreter it REFUSES and leaves no sidecar", async () => {
+  // The control this guard would otherwise never be watched refuse. A stale sidecar would be
+  // worse than none — a grader reads it as THIS seed's identity — so the refusal must clear it.
+  const { code, out, sidecar } = await record({
+    PYTHON: "/bin/false",
+    PYTHON_FALLBACK: "/bin/false",
+  });
+  if (code === 0) throw new Error(`want a non-zero refusal, got rc 0:\n${out}`);
+  if (sidecar !== null) throw new Error(`the refusal left a sidecar behind:\n${sidecar}`);
+  if (!out.includes("PYTHON")) {
+    throw new Error(`the refusal must name PYTHON so the fix is in the message; got:\n${out}`);
+  }
+});
+
+Deno.test("seed provenance: refresh-compiler.sh does not degrade the miss to a note", async () => {
+  // The regression this pair exists for: the step ran with `|| echo note:`, so a seed with no
+  // recorded identity shipped while the refresh reported success. Assert the wiring, not trust.
+  const src = await Deno.readTextFile(`${ROOT}/scripts/refresh-compiler.sh`);
+  if (!src.includes("record-seed-provenance.sh")) {
+    throw new Error(
+      "refresh-compiler.sh must record the seed's provenance through " +
+        "scripts/record-seed-provenance.sh, which fails loud when no interpreter runs",
+    );
+  }
+  if (/seed_provenance\.py[^\n]*\|\|/.test(src)) {
+    throw new Error(
+      "refresh-compiler.sh swallows the provenance step's failure with `||` — a seed with " +
+        "no sidecar would ship while the refresh reports success",
+    );
+  }
+});
+
 Deno.test("seed provenance: the graders consult it", async () => {
   // The guard is worthless if nobody calls it. Assert the wiring rather than trusting it —
   // a helper with a green self-test and no caller is the shape this repo has shipped before.
