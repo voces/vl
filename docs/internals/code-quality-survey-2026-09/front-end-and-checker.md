@@ -412,12 +412,18 @@ Attribution of the reach: **94.6% of `nodeChildren`'s samples come from one call
   self-compile, so it buys nothing measurable and costs a per-program table.
 * **What removes the 12.2M is an INDEX over `(root, fnIx, want)`**, answering every name from
   one pass — D1514's shape, and the reason this row's prescription was wrong is D1514's own
-  lesson one level out. Its blocker is named rather than guessed: every one of
-  `dsDestSlotAt`'s seven forms is invertible (each reads its name off an `Ident` in a fixed
-  slot), but inverting the `Call` form calls `fnParamKindListSlot` — itself a whole-arena scan
-  — once per `Ident` argument at every `Call` node, which is a larger cost than the walk it
-  replaces. Closing it needs `fnParamKindListSlot`, `destLetOf`/`globalLetOf` and
-  `rlSlotByName` to be O(1) first, which is a campaign, not a commit.
+  lesson one level out. This paragraph used to end "a campaign, not a commit", on a blocker
+  that inverting `dsDestSlotAt`'s `Call` form costs more than the walk it replaces.
+
+  **Built as `dsgDestSlot` in #2607 and NOT by inverting anything** — one pre-order pass
+  (`dsgWalk`) descends where `dsScopeWalk` prunes and drops each site at its row, so the
+  forward walk fills the index and the inversion the blocker was about is never needed;
+  `letRefListDestSlotK` routes the module-scope case to it and keeps the walk for the rest.
+  16.3M node visits to 1.2M. **Re-measured 2026-09-06** over two guest profiles of a
+  self-compile (5,716 and 8,173 samples), inclusive: `nodeChildren` **0.47% / 0.67%**,
+  `dsScopeWalk` **0.02% / 0.00%**, `dsgWalk` (the index build) **0.70% / 0.73%**, and the
+  whole `letRefListDestSlotK` subtree **0.70% / 0.76%**. Against 11.75% self and 30.29%
+  inclusive at survey time, the row is closed and the blocker was routed around, not cleared.
 
 Size M. Risk low (the function is pure over the arena). Proof: the emitted module for every
 `tests/cases` program byte-identical, `regress.py` 0 `runs → not-runs`, `--prove-fixpoint`, and
