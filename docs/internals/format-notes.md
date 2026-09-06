@@ -262,3 +262,30 @@ renders multi-line, so it fails "every preceding argument fits on one line"
 and the whole call breaks; a lambda that is not last fails "the last argument
 is a block lambda". Neither needs a rule of its own.
 ```
+
+## an `import { … }` name list is SORTED; statements and annotated lists are not
+
+Moved from `compiler/format.vl`'s `fmtImport`, and extended with the two non-rules the
+printer's own comment left implicit (D1651).
+
+```text
+Sort the names (a `{ … }` list is a set — order is not significant), so the
+wrapped one-per-line block reads alphabetically and duplicate/stale imports are
+easy to spot. Case-sensitive ASCII: capitalised types/singletons (`P`, `T`,
+`Tok`) sort before lowercase functions. An `a as b` item sorts by its full text
+(i.e. the source name `a`).
+```
+
+Two things the sort deliberately does NOT reach, because a formatter must not re-order what
+the language treats as ordered:
+
+* **import STATEMENTS keep source order.** `emitImports` walks the token stream, so the
+  statement written first is printed first, whatever its path.
+* **a comment inside the braces suppresses the sort.** A comment-bearing import takes the
+  verbatim path (which is what keeps such an import byte-exact), so an author who annotated the
+  order keeps it.
+
+The rule reaches only what the fmt gate reaches. `lint-self.sh`'s fmt half runs
+`find compiler std scripts`; `tests/` and `bench/` are passed to nothing, which is how ten
+checked-in fixtures sat with unsorted import lists — see D1651 for the whole-tree count and
+which buckets are deliberate.
