@@ -23,7 +23,7 @@ diagnostic column base); the rest stand on the surveys' own measurements.
 
 | # | finding | where | value | proof |
 | --- | --- | --- | --- | --- |
-| 7 | `letListBuildKind` and `letListBuildSlot` run one scoped destination walk twice, back to back, at all three sites | emitter #1 | ~16% of a self-compile | byte-identical seed, corpus `cmp` — **partly landed #2567**; remaining: epoch-stamped memo (step 2) |
+| 7 | `letListBuildKind` and `letListBuildSlot` run one scoped destination walk twice, back to back, at all three sites | emitter #1 | filed ~16% of a self-compile; #2567 merged both into `letListBuild`, and re-measuring THAT name 2026-09-06 reads **1.58% inclusive** — the epoch-stamped memo still scheduled as step 2 is worth under two points, not sixteen | byte-identical seed, corpus `cmp` — **partly landed #2567**; remaining: epoch-stamped memo (step 2), re-priced |
 | 8 | `nodeChildren` allocates and walks 25 tag compares per node; 45.5% of nodes reach no arm | front end #1 | 11.75% of self time; DONE — the ALLOCATION was the cost, not the ladder (#2570, self **8.16% → 3.51%**), and the reach index this row called a campaign is `dsgDestSlot` (#2607). Re-measured 2026-09-06 over two self-compile profiles: `nodeChildren` **0.47 / 0.67%** inclusive, `dsScopeWalk` **0.02 / 0.00%**, and the index pass that replaced it **0.70 / 0.73%** (front end §5.1) | fixture byte identity, profile A/B — **landed #2570, #2607** |
 | 9 | `fnDetectScratch` runs 12 whole-body walks per function; `dupScanRun` repeats the set per shadowed name | emitter #2 | 21% inclusive | byte-identical seed, `regress.py` — **partly landed #2580**; remaining: ~2.5% memo, eqCoreKindOfBin |
 | 10 | `nestedFnDeclaredInFrame` is the un-indexed twin of `nestedFnDeclaredIn`, which already has the child index | emitter #5 | O(children) per rung; one arena-scan ratchet entry retires | byte-identical seed — **landed #2583** |
@@ -73,3 +73,215 @@ Rows 19 and 20 are rulings, not work.
 | 18 | landed | #2579 |
 | 19 | ruling pending | (owner) |
 | 20 | ruling pending | (owner) |
+
+## Measurements — every number above, re-runnable
+
+This survey is a scheduling document made of numbers, and until 2026-09-06 nothing re-ran
+any of them. It went stale the way the defect inventory does, one-directionally: the person
+who lands a fix is not the person editing this page. Row 8 said "campaign" for work #2607
+had already shipped, and its 11.75% had fallen under 1% with no one reading it.
+
+So each row below carries the command that produces its number and the number that command
+should read. `python3 scripts/survey-regrade.py docs/internals/code-quality-survey-2026-09/README.md`
+re-runs the cheap ones and prints `row · filed · today · verdict`. A block that shells out
+to another script writes `"$PYTHON"`, which the runner binds to its own interpreter. It fails when a number is
+NOT RE-RUNNABLE — no block, an unparseable one, a command that errors — and merely REPORTS a
+row that moved, in either direction, because movement is the finding this page exists to
+carry. `--profile <guest-profile.json>` adds the share rows; `--strict` makes a moved row a
+failure too, which is the periodic "is this page current" pass.
+
+A `filed:` number is what the row's claim implies TODAY, never the historical reading that
+motivated the row: for an open row the cost it still carries, for a landed one the invariant
+its fix established. That is what makes a reverted fix show up here. `dir:` says which
+direction of movement is a finding — a share moves both ways, an invariant one.
+
+### row 1 — `gate.sh`'s TIME column is per gate
+
+Measure:
+
+    kind: shell
+    cmd: grep -q 'WALL' scripts/gate.sh && grep -q 'CPU' scripts/gate.sh && echo 1 || echo 0
+    filed: 1
+    tol: 0
+    dir: at-least
+
+### row 2 — the two frame builders agree
+
+The row's 19-vs-2 split was an instrument reading the wrong reset function. What must hold
+now is the thing the instrument was built to see: no flag one builder clears and the other
+does not.
+
+Measure:
+
+    kind: shell
+    cmd: "$PYTHON" scripts/emitter-state-audit.py | grep -E 'emitFuncCode (yes|no) +emitStartFnCode (yes|no)' | grep -v 'yes *emitStartFnCode yes' | wc -l
+    filed: 0
+    tol: 0
+    dir: at-most
+
+### row 3 — one diagnostic column contract
+
+Measure:
+
+    kind: none
+    why: the contract is pinned by tests/vl_invalid_module_position_test.ts, which the gate runs; there is no count to re-read
+
+### row 4 — `Tok` carries no dead field
+
+Measure:
+
+    kind: shell
+    cmd: awk '/^type Tok = \{/,/^\}/' compiler/lexer.vl | grep -c ':'
+    filed: 5
+    tol: 0
+    dir: at-most
+
+### row 5 — no export is dead
+
+Measure:
+
+    kind: shell
+    cmd: "$PYTHON" scripts/export-budget.py --check
+    filed: 0
+    tol: 0
+    dir: at-most
+
+### row 6 — named arguments through a closure-typed parameter
+
+Measure:
+
+    kind: none
+    why: the defect is docs/internals/inventory/D1604.md and check-filed-witnesses.py re-runs its own program
+
+### row 7 — `letListBuild`'s scoped destination walk
+
+The row names `letListBuildKind` and `letListBuildSlot`; #2567 merged both into
+`letListBuild`, which returns a `ListBuild`. Re-measured 2026-09-06 over a self-compile
+profile: **1.58% inclusive**, not the ~16% the row still schedules against, so the
+epoch-stamped memo it calls step 2 is worth under two points.
+
+Measure:
+
+    kind: profile-incl
+    what: letListBuild
+    filed: 1.6
+    tol: 1.5
+    dir: both
+
+### row 8 — `nodeChildren`'s allocation
+
+Re-measured 2026-09-06: the allocation was the cost, and `dsgDestSlot` (#2607) is the reach
+index this row called a campaign. The subtree is under 1% and must stay there.
+
+Measure:
+
+    kind: profile-incl
+    what: nodeChildren
+    filed: 1.0
+    tol: 1.5
+    dir: at-most
+
+### row 9 — `fnDetectScratch`'s whole-body walks
+
+Measure:
+
+    kind: profile-incl
+    what: fnDetectScratch
+    filed: 21.3
+    tol: 4
+    dir: both
+
+### row 10 — `nestedFnDeclaredInFrame` is indexed
+
+Measure:
+
+    kind: none
+    why: the cost is held per file by scripts/scan-budget.py's arena-scan ratchet, which the gate runs
+
+### row 11 — definite assignment's name-keyed rebuild
+
+Measure:
+
+    kind: none
+    why: the row's own proof is tests/vl_scaling_shape_test.ts, a gate row that names the axis when it moves
+
+### row 12 — the seven-classifier ladder re-run
+
+Measure:
+
+    kind: profile-incl
+    what: listOpKindOfBin
+    filed: 10.8
+    tol: 4
+    dir: both
+
+### row 13 — `lint()` walks the arena once
+
+Measure:
+
+    kind: shell
+    cmd: grep -cE '^ *while .*< P\.nodes\.length' compiler/lint.vl
+    filed: 1
+    tol: 0
+    dir: at-most
+
+### row 14 — the cell-seed ladder has one resolver
+
+Measure:
+
+    kind: shell
+    cmd: grep -rho 'expCtxForCell' compiler/ | wc -l
+    filed: 8
+    tol: 4
+    dir: at-least
+
+### row 15 — the two largest checker functions
+
+Measure:
+
+    kind: shell
+    cmd: awk '/^function checkFuncDeclNode\(/{f=1} f{n++} f&&/^\}/{print n; exit}' compiler/typecheck.vl
+    filed: 549
+    tol: 60
+    dir: at-most
+
+### row 16 — one nominal/emit name renderer
+
+Measure:
+
+    kind: shell
+    cmd: grep -rho 'tyToNominalNameGo' compiler/ | wc -l
+    filed: 0
+    tol: 0
+    dir: at-most
+
+### row 17 — the test tree has one `ROOT`
+
+Measure:
+
+    kind: shell
+    cmd: grep -rl 'const ROOT *=' tests/ | wc -l
+    filed: 4
+    tol: 3
+    dir: at-most
+
+### row 18 — `moduleSurface` carries re-exports
+
+Measure:
+
+    kind: none
+    why: the row's proof is lsp_auto_import_test.ts, which the gate runs; the 86-of-86 figure described the tree before the fix
+
+### row 19 — the seed anchors on the CWD, std on the EXE's tree
+
+Measure:
+
+    kind: none
+    why: an owner ruling is pending; there is no number until the contract is chosen
+
+### row 20 — 100 single-call delegation wrappers
+
+Measure:
+
+    kind: none
+    why: an owner ruling on default parameter values is pending; the count is an argument for the language question, not a cost to hold

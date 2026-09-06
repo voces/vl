@@ -172,6 +172,13 @@ run "filed witnesses"          "$PY" scripts/check-filed-witnesses.py --strict d
 # `deno task test` and the ci-native `vl_*_test.ts` glob; its own row here so the table
 # names it rather than burying it in a suite of hundreds.
 run "inventory refs"           deno test -A --no-check tests/vl_inventory_refs_test.ts
+# THE SURVEY'S NUMBERS, re-read. `code-quality-survey-2026-09/` schedules work by share and
+# by count, and nothing re-ran one of them: row 8 said "campaign" for work #2607
+# had shipped, and row 7 named two functions #2567 merged away. This runs each row's own
+# `Measure:` block, and REDS only on a number that cannot be re-read at all — a row that
+# moved is printed, since movement is the finding. ~3-6s; the profile-share rows need
+# `--profile <guest-profile.json>` and are a deliberate manual pass, not a merge gate.
+run "survey measurements"      bash -c "\"$PY\" scripts/survey-regrade.py --self-test >/dev/null && \"$PY\" scripts/survey-regrade.py docs/internals/code-quality-survey-2026-09/README.md"
 run "conflict markers"         deno test -A --no-check tests/vl_no_conflict_markers_test.ts
 run "splice scan"              bash -c "\"$PY\" scripts/inventory/splice-scan.py --self-test >/dev/null && \"$PY\" scripts/inventory/splice-scan.py"
 run "distilled corpus"         "$PY" scripts/silent-sweep/distilled/regress.py build/vl-compiler.wasm
