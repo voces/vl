@@ -311,7 +311,10 @@ still emits a parseable `[]`.
 ```json
 [{"file":"src/a.vl","severity":"info","stage":"lint","code":"prefer-const",
   "line":3,"col":1,"endCol":4,
-  "message":"`x` is never reassigned; use `const` instead of `let`"}]
+  "message":"`x` is never reassigned; use `const` instead of `let`"},
+ {"file":"src/a.vl","severity":"error","stage":"type",
+  "line":6,"col":14,"endLine":8,"endCol":2,
+  "message":"cannot assign {x: string} to 'p' of type P"}]
 ```
 
 Fields:
@@ -335,10 +338,22 @@ Fields:
 - `code` — the stable machine id: the lint rule id (`prefer-const`,
   `unused-variable`, …) or `redundant-type` for the annotation hint. **Omitted**
   for compile (parse/type/emit/resolution) errors — those carry no code.
-- `line` (1-based), `col` (1-based, inclusive), `endCol` (1-based, EXCLUSIVE —
-  `endCol - col` is the caret-span length, ≥ 1). All three **omitted** for a
-  positionless diagnostic.
+- `line` (1-based), `col` (1-based, inclusive), `endCol` (1-based, EXCLUSIVE).
+  Both **omitted** for a positionless diagnostic.
+- `endLine` (1-based) — the line `endCol` counts from, present **only when the
+  span ends on a later line than `line`**. A single-line diagnostic's object is
+  therefore byte-for-byte what it was before spans grew a line, and a consumer
+  that never reads `endLine` keeps reading a one-line span correctly. `endCol -
+  col` is the caret-span length (≥ 1) only while `endLine` is absent: an end on a
+  later line is a column of THAT line and may sit anywhere, `0` included, so a
+  consumer must read the two together.
 - `message` — the diagnostic text, unstyled.
+
+A checker diagnostic spans the node its message names (#2659), and a node spans
+lines whenever the author wrote it over several — a call with its arguments on
+their own lines, a struct literal, an `if` condition, a template. The pretty
+renderer keeps its one-line block: it draws the FIRST line of the span and
+underlines from `col` to the end of that line's text.
 
 **`stage` is per DIAGNOSTIC; the summary's note is per FILE.** The human summary ends
 `Found 1 error. (type error)` from `cliLastStage`, which is the whole file's return

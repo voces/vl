@@ -99,6 +99,8 @@ import {
   nodeSpanEndTok,
   nodeStartTok,
   tokEndCol,
+  tokEndLine,
+  tokFirstLineEndCol,
   tokIndexAt,
 } from "./fmt_util"
 import { sidArrGet, sidArrPut, sidOf } from "./symbols"
@@ -348,16 +350,16 @@ export type Ty = TyPrim |
   TyLit |
   TyNeg
 
-// A type diagnostic: a message, the AST node it is raised at, and its SPAN — 1-based
-// `tline` (0 = no position) with 0-based `[tcol, tend)` columns. The raise records the end,
-// so an anchor it chose cannot drift from an end derived elsewhere. `tcode` is the stable
-// category code, `""` for a type-soundness rejection; `tdata` the structured payload.
+// A type diagnostic: a message, the node it is raised at, 1-based `tline` (0 = no position)
+// and 0-based `tcol` for the start, and `tendTok` — the TOKEN the span ends at, so
+// `diagEndLine` and `diagEndCol` read one token and cannot disagree; `-1` for no end.
+// `tcode` is the stable category code, `""` for a soundness verdict; `tdata` the payload.
 type TDiag = {
   tmsg: string,
   tat: i32,
   tline: i32,
   tcol: i32,
-  tend: i32,
+  tendTok: i32,
   tcode: string,
   tdata: string,
 }
@@ -6213,8 +6215,8 @@ function findingStartTok(ix: i32) {
 // span covers the construct the message names. Degrades to `tk`'s own end.
 function findingEndCol(ix: i32, tk: i32) {
   const end = nodeSpanEndTok(ix)
-  if end >= 0 { return tokEndCol(end) }
-  tokEndCol(tk)
+  if end >= 0 { return tokFirstLineEndCol(end) }
+  tokFirstLineEndCol(tk)
 }
 
 function rcoalReset() {
@@ -6746,26 +6748,26 @@ function tErrCodedData(msg: string, at: i32, code: string, data: string) {
   tErrPushNodeSpan(msg, at, code, data)
 }
 
-// Raise `msg` over node `at`'s whole span: its first token through the last of its tokens on
-// that first line, a report carrying one line. A node synthesized after parsing has no start
-// token and falls back to the `nodeToks` last-token anchor; a node with neither is positionless.
+// Raise `msg` over node `at`'s whole span: its first token through its last, across lines.
+// An end not AFTER the start names no span — a merged program restarts each module's lines,
+// so a last token can resolve behind its first — and falls back to the node's last token on
+// the start's own line. With no start token: the `nodeToks` anchor, else positionless.
 function tErrPushNodeSpan(msg: string, at: i32, code: string, data: string) {
   const first = nodeStartTok(at)
   if first >= 0 {
-    const end = tokEndCol(nodeSpanEndTok(at))
-    return tErrPush(
-      msg,
-      at,
-      P.toks[first].line,
-      P.toks[first].col,
-      end,
-      code,
-      data,
-    )
+    const ln = P.toks[first].line
+    const co = P.toks[first].col
+    let end = nodeLastTok(at)
+    if end < first { end = first }
+    const el = tokEndLine(end)
+    if el < ln || (el == ln && tokEndCol(end) <= co) {
+      end = nodeSpanEndTok(at)
+    }
+    return tErrPush(msg, at, ln, co, end, code, data)
   }
   const last = nodeLastTok(at)
   if last >= 0 { return tErrPushTok(msg, at, last, code, data) }
-  tErrPush(msg, at, 0, 0, 0, code, data)
+  tErrPush(msg, at, 0, 0, -1, code, data)
 }
 
 // Raise `msg` spanning exactly token `tk` — the caller has already decided the token is the
@@ -6777,7 +6779,7 @@ function tErrPushTok(
   code: string,
   data: string,
 ) {
-  tErrPush(msg, at, P.toks[tk].line, P.toks[tk].col, tokEndCol(tk), code, data)
+  tErrPush(msg, at, P.toks[tk].line, P.toks[tk].col, tk, code, data)
 }
 
 // D1585 — the reserved-name refusal, raised from one place by both faces: a single file's
@@ -6800,7 +6802,7 @@ function tErrPush(
   at: i32,
   ln: i32,
   co: i32,
-  end: i32,
+  endTok: i32,
   code: string,
   data: string,
 ) {
@@ -6820,7 +6822,7 @@ function tErrPush(
       tat: at,
       tline: ln,
       tcol: co,
-      tend: end,
+      tendTok: endTok,
       tcode: code,
       tdata: data,
     },

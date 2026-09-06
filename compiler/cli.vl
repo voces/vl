@@ -34,6 +34,7 @@ import {
   diagCol,
   diagCount,
   diagEndCol,
+  diagEndLine,
   diagLine,
   diagModule,
   diagStage,
@@ -315,11 +316,12 @@ let cliDirNameAcc: i32[] = []
 let cliDirWasDir = 0 // 1 if the last CMD_LIST_DIR target was a directory
 
 // The reported diagnostics, as parallel arrays (the compiler's own idiom): severity,
-// 1-based line (0 = positionless), 0-based col, 0-based end col, message. One entry
-// per index.
+// 1-based line (0 = positionless), 0-based col, the 1-based line the span ends on and its
+// 0-based end column on THAT line, message. One entry per index.
 let dgSev: string[] = []
 let dgLine: i32[] = []
 let dgCol: i32[] = []
+let dgEndLine: i32[] = []
 let dgEnd: i32[] = []
 let dgMsg: string[] = []
 // The table index of the module that owns each diagnostic (parallel to the arrays
@@ -489,6 +491,7 @@ export function cliArgReset() {
   dgSev = []
   dgLine = []
   dgCol = []
+  dgEndLine = []
   dgEnd = []
   dgMsg = []
   dgMod = []
@@ -652,9 +655,28 @@ function cliAddDiag(
   msg: string,
   mod: i32,
 ) {
+  cliAddDiagSpan(sev, stage, code, line, col, line, endc, msg, mod)
+}
+// The same, for a finding whose subject spans LINES: `endLine` is the line `endc` counts
+// from. `cliAddDiag` is this with the two lines equal, so a caller with a one-line span
+// never has to say so twice.
+function cliAddDiagSpan(
+  sev: string,
+  stage: string,
+  code: string,
+  line: i32,
+  col: i32,
+  endLine: i32,
+  endc: i32,
+  msg: string,
+  mod: i32,
+) {
   dgSev.push(sev)
   dgLine.push(line)
   dgCol.push(col)
+  let el = endLine
+  if el < line { el = line }
+  dgEndLine.push(el)
   dgEnd.push(endc)
   dgMsg.push(msg)
   dgMod.push(mod)
@@ -662,12 +684,12 @@ function cliAddDiag(
   dgStage.push(stage)
   0
 }
-// The redundant-annotation hint's exclusive end column: `redunS`..`redunE` is the range
-// `--fix` DELETES (the `:` through just before the `=`), so the caret covers exactly what
-// goes. An annotation spanning LINES has no end on the start line, and keeps a bare caret —
-// a report carries one line, and an end below the start would name a column it never covers.
+// The redundant-annotation hint's exclusive end column, on `redunELineAt(ri)`: `redunS`..
+// `redunE` is the range `--fix` DELETES (the `:` through just before the `=`), so the caret
+// covers exactly what goes. Only a span ending on the START line needs the one-column floor;
+// an annotation spanning lines ends at a column of its own on a line the report now carries.
 function cliRedunEndCol(ri: i32) {
-  if redunELineAt(ri) != redunSLineAt(ri) { return redunSColAt(ri) + 1 }
+  if redunELineAt(ri) != redunSLineAt(ri) { return redunEColAt(ri) }
   const e = redunEColAt(ri)
   if e <= redunSColAt(ri) { return redunSColAt(ri) + 1 }
   e
@@ -678,6 +700,7 @@ function cliClearDiags() {
   dgSev = []
   dgLine = []
   dgCol = []
+  dgEndLine = []
   dgEnd = []
   dgMsg = []
   dgMod = []
@@ -700,9 +723,9 @@ function cliFmtConcise(d: i32) {
     dgMsg[d]
 }
 // One diagnostic as a JSON object (the `--json` schema, `docs/internals/cli-design.md`):
-// file, severity, stage, the stable code where one exists (a compile error carries none
-// and the field is omitted), 1-based line and col with an exclusive 1-based endCol
-// (endCol - col is the caret span; all three omitted for a positionless one), message.
+// file, severity, stage, the stable code where one exists (a compile error carries none and
+// the field is omitted), 1-based line and col, an exclusive 1-based endCol, `endLine` only
+// where the span ends on a LATER line, and the message. Positionless: no position field.
 function cliFmtJson(d: i32) {
   let out = "{\"file\":\"" + cliJsonEsc(cliDiagFile(d)) + "\""
   out = out + ",\"severity\":\"" + cliJsonEsc(dgSev[d]) + "\""
@@ -712,15 +735,18 @@ function cliFmtJson(d: i32) {
   }
   if dgLine[d] > 0 {
     const col = dgCol[d]
+    const el = dgEndLine[d]
     let endc = dgEnd[d]
-    if endc < col + 1 { endc = col + 1 }
+    // The widen-to-one-column floor holds only on the start line: an end on a LATER line is
+    // a column in its own right and may sit anywhere, `0` included.
+    if el <= dgLine[d] && endc < col + 1 { endc = col + 1 }
     out = out +
       ",\"line\":" +
       i32ToStr(dgLine[d]) +
       ",\"col\":" +
-      i32ToStr(col + 1) +
-      ",\"endCol\":" +
-      i32ToStr(endc + 1)
+      i32ToStr(col + 1)
+    if el > dgLine[d] { out = out + ",\"endLine\":" + i32ToStr(el) }
+    out = out + ",\"endCol\":" + i32ToStr(endc + 1)
   }
   out + ",\"message\":\"" + cliJsonEsc(dgMsg[d]) + "\"}"
 }
@@ -780,6 +806,18 @@ function cliDiagSrcLines(d: i32) {
   }
   cliSrcLines
 }
+// The 0-based column just past `raw`'s last non-space byte — where a multi-line span's
+// first-line slice ends, so the caret stops at the code rather than running to the margin.
+function cliTrimEndCol(raw: string) {
+  let e = raw.length
+  while (
+    e > 0 &&
+    (raw[e - 1] == ' ' || raw[e - 1] == '\t' || raw[e - 1] == '\r')
+  ) {
+    e = e - 1
+  }
+  e
+}
 // Pretty rustc/Deno-style block: `[SEVERITY]: msg` / source line / caret /
 // `at file:line:col`. A positionless diagnostic drops the source+caret block.
 function cliFmtPretty(d: i32) {
@@ -801,6 +839,9 @@ function cliFmtPretty(d: i32) {
       out = out + "\n  " + shown
       const start = cliVisualWidth(raw, col)
       let endc = dgEnd[d]
+      // A span ending on a later line draws the first line's slice: the caret runs from the
+      // anchor to the end of the text on this line, which the `remaining` clamp below caps.
+      if dgEndLine[d] > dgLine[d] { endc = cliTrimEndCol(raw) }
       if endc < col + 1 { endc = col + 1 }
       const end = cliVisualWidth(raw, endc)
       let remaining = shown.length - start
@@ -1143,12 +1184,13 @@ function cliCheckCurFileRest() {
     // Capture the owning module and the producing stage before `lintSrc` resets
     // `P.toks` / `nodeToks`, which `diagModule` and `diagStage` resolve through.
     // Single-file mode is module 0, the entry.
-    cliAddDiag(
+    cliAddDiagSpan(
       "error",
       diagStage(i),
       "",
       diagLine(i),
       diagCol(i),
+      diagEndLine(i),
       diagEndCol(i),
       vcDiagMsg(i),
       diagModule(i),
@@ -1271,12 +1313,13 @@ function cliCheckCurFileRest() {
   let ri = 0
   while ri < redunCount() {
     if redunModuleAt(ri) == 0 {
-      cliAddDiag(
+      cliAddDiagSpan(
         "hint",
         "type",
         "redundant-type",
         redunSLineAt(ri),
         redunSColAt(ri),
+        redunELineAt(ri),
         cliRedunEndCol(ri),
         redunMsgAt(ri),
         0,
@@ -1586,12 +1629,13 @@ function cliTestCompileNow() {
     const n = diagCount()
     let i = 0
     while i < n {
-      cliAddDiag(
+      cliAddDiagSpan(
         "error",
         diagStage(i),
         "",
         diagLine(i),
         diagCol(i),
+        diagEndLine(i),
         diagEndCol(i),
         vcDiagMsg(i),
         diagModule(i),

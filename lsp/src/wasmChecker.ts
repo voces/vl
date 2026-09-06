@@ -2,7 +2,7 @@
 // Drives the SELF-HOSTED compiler seed (`build/vl-compiler.wasm`, the same one
 // `vl check` runs) through its driver exports: per-keystroke diagnostics
 // (`srcReset`/`srcPush` + `checkSrc` + the structured `diagCount`/`diagMsg*`/
-// `diagLine`/`diagCol`/`diagEndCol` reads), the H3 module-fetch protocol
+// `diagLine`/`diagCol`/`diagEndLine`/`diagEndCol` reads), the H3 module-fetch protocol
 // (`modReset`/`modKeyPush`/`modSrcPush`/`modCommit`/`modPending*`) wired to a
 // workspace reader so sibling imports resolve against open buffers, plus the
 // Stage-2/3 symbol/token/scope/member/inlay + format + lint query families.
@@ -1634,9 +1634,9 @@ export const createWasmChecker = (
   };
 
   // Read the error-tier diagnostic store (`diagCount`/`diagMsg*`/`diagLine`/
-  // `diagCol`/`diagEndCol`) — shared by `checkSrc` AND `compileSrc`, which write
-  // the same store — into LSP-shaped diagnostics. Native line is 1-based (0 =
-  // positionless); col 0-based.
+  // `diagCol`/`diagEndLine`/`diagEndCol`) — shared by `checkSrc` AND `compileSrc`,
+  // which write the same store — into LSP-shaped diagnostics. Native line is 1-based
+  // (0 = positionless); col 0-based, and the end column counts from `diagEndLine`.
   const readDiags = (exp: Exports): VLDiagnostic[] => {
     const count = exp.diagCount();
     const diags: VLDiagnostic[] = [];
@@ -1644,6 +1644,11 @@ export const createWasmChecker = (
     const endColOf = typeof exp.diagEndCol === "function"
       ? (i: number) => exp.diagEndCol(i)
       : (i: number) => exp.diagCol(i);
+    // `diagEndCol` is a column on `diagEndLine`, not on `diagLine`. A seed predating the
+    // end line reports every span on one line, which is what this fallback says.
+    const endLineOf = typeof exp.diagEndLine === "function"
+      ? (i: number) => exp.diagEndLine(i)
+      : (i: number) => exp.diagLine(i);
     // The stable per-diagnostic category code (`unsupported-lowering`, …) rides
     // the `diagCodeLen`/`diagCodeByte` exports; an older seed lacks them, so the
     // code is simply absent (editors show the bare message).
@@ -1659,9 +1664,16 @@ export const createWasmChecker = (
       const message = readString(exp.diagMsgLen(i), (j) => exp.diagMsgAt(i, j));
       const line = exp.diagLine(i); // 1-based; 0 = positionless
       const col = exp.diagCol(i); // 0-based
+      const endLine = Math.max(endLineOf(i), line);
       const lspLine = line > 0 ? line - 1 : 0;
+      const lspEndLine = line > 0 ? endLine - 1 : 0;
       const startChar = line > 0 ? col : 0;
-      const endChar = line > 0 ? Math.max(endColOf(i), col) : 0;
+      // The `col` floor holds only within one line: a span ending on a LATER line ends at
+      // a column of that line, which may sit anywhere, `0` included.
+      const rawEnd = endColOf(i);
+      const endChar = line > 0
+        ? (endLine > line ? rawEnd : Math.max(rawEnd, col))
+        : 0;
       const code = hasCodes
         ? readString(exp.diagCodeLen(i), (j) => exp.diagCodeByte(i, j))
         : "";
@@ -1677,7 +1689,7 @@ export const createWasmChecker = (
         ...(data !== undefined ? { data } : {}),
         range: {
           start: { line: lspLine, character: startChar },
-          end: { line: lspLine, character: endChar },
+          end: { line: lspEndLine, character: endChar },
         },
       });
     }
