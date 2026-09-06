@@ -7,6 +7,11 @@
 // predicates re-derived once per emitted FUNCTION were 59% of a self-compile, and the
 // functions pair below reads 5.81x on that compiler against 1.02x after.
 //
+// The ratio is of the child's CPU (user+sys), because a ratio cancels only a UNIFORM
+// slowdown and a fanned-out gate delivers bursts: the two arms run at different moments,
+// and the one a burst lands on is inflated alone. The last case below is the CONTROL, a
+// pair that must red, so a grader that stopped measuring cannot pass in silence.
+//
 // One pair per axis a pass could accidentally multiply over. The "many" arm spreads the
 // same work over N entities, the "one" arm over N/K. Method and profiles:
 // docs/internals/profiling-the-compiler.md.
@@ -181,27 +186,91 @@ const writeModules = (dir: string, mods: number, per: number, body: number): str
 
 // ── the runner ───────────────────────────────────────────────────────────────
 
-const build = async (src: string, out: string): Promise<number> => {
+// WHAT IS GRADED IS THE CHILD'S CPU, NOT THE CLOCK. A ratio cancels a UNIFORM slowdown,
+// and `gate.sh` does not deliver one: 24 rows fan out, so the two arms of a pair run at
+// different moments against a load that moves by the second, and the arm a burst lands on
+// is inflated alone. Measured beside a fanned-out gate, one arm's WALL reading moved 2.6x
+// while its own user+sys did not — the axes then read 3.69 and 6.54 against bars of 2.5
+// and 4.0 with nothing wrong. Contention costs a process waiting; it does not make it
+// execute more instructions, so user+sys is what a reshaped pair can be compared on.
+type Cost = { wall: number; cpu: number };
+
+// `times`' SECOND line is the shell's reaped children — this spawn's `vl` and nothing
+// else, the shell's own cost being the first line. A POSIX builtin, so this needs no
+// `/usr/bin/time` on the box; `gate.sh` reads its own rows' CPU the same way.
+const childCpu = (out: string): number => {
+  const rows = out.trimEnd().split("\n").filter((l) => /\dm[\d.]+s/.test(l));
+  let s = 0;
+  for (const m of (rows[rows.length - 1] ?? "").matchAll(/(\d+)m([\d.]+)s/g)) {
+    s += Number(m[1]) * 60 + Number(m[2]);
+  }
+  return s;
+};
+
+const spawn = async (what: string, argv: string[]): Promise<Cost> => {
   const t0 = Date.now();
-  const { code, stderr } = await new Deno.Command(VL, {
-    args: ["build", src, "-o", out, "--compiler", COMPILER],
-    stdout: "null",
+  const { code, stdout, stderr } = await new Deno.Command("/bin/sh", {
+    args: ["-c", '"$@"; rc=$?; times; exit $rc', "sh", VL, ...argv],
+    stdout: "piped",
     stderr: "piped",
     env: { RUST_BACKTRACE: "0", NO_COLOR: "1", VL_STD: `${ROOT}/std` },
   }).output();
+  const wall = (Date.now() - t0) / 1000;
   if (code !== 0) {
-    throw new Error(`vl build failed on ${src}: ${new TextDecoder().decode(stderr).slice(0, 400)}`);
+    throw new Error(`vl ${what} failed: ${new TextDecoder().decode(stderr).slice(0, 400)}`);
   }
-  return (Date.now() - t0) / 1000;
+  return { wall, cpu: childCpu(new TextDecoder().decode(stdout)) };
 };
 
-// The floor on the denominator keeps one scheduler spike on a sub-second arm from
-// dominating the quotient; every pair below is sized so the cheaper arm clears it on an
-// idle box, so the floor is a safety net and not the thing being measured. A suspicious
-// ratio is re-measured once with the per-side minimum taken — a spike does not repeat,
-// a quadratic does.
+const build = (src: string, out: string): Promise<Cost> =>
+  spawn(`build on ${src}`, ["build", src, "-o", out, "--compiler", COMPILER]);
+
+// The floor on the denominator keeps one spike on a sub-second arm from dominating the
+// quotient; every pair below is sized so the cheaper arm clears it on an idle box, so the
+// floor is a safety net and not the thing being measured. Its two values carry over from
+// the wall-clock reading unchanged, because an idle `vl build` spends what it takes: CPU
+// ran 4-8% over wall across every axis.
 const FLOOR = 0.4;
+const RUN_FLOOR = 0.05;
 const VERBOSE = Deno.env.get("VL_SCALING_VERBOSE") === "1";
+
+// A suspicious ratio buys one more INTERLEAVED round — many, one, many, one — and takes
+// the per-side minimum, so a burst that hits one arm is dropped rather than being divided
+// by an arm it missed. A spike does not repeat, a quadratic does.
+const grade = async (
+  axis: string,
+  bar: number,
+  note: string,
+  many: () => Promise<Cost>,
+  one: () => Promise<Cost>,
+  floor: number,
+): Promise<void> => {
+  const ms = [await many()], os = [await one()];
+  const least = (xs: Cost[], f: (c: Cost) => number) => Math.min(...xs.map(f));
+  const ratio = () => least(ms, (c) => c.cpu) / Math.max(least(os, (c) => c.cpu), floor);
+  if (ratio() > bar) {
+    ms.push(await many());
+    os.push(await one());
+  }
+  const say = (xs: Cost[]) =>
+    `${least(xs, (c) => c.cpu).toFixed(2)}s cpu (${least(xs, (c) => c.wall).toFixed(2)}s wall)`;
+  if (VERBOSE) {
+    console.log(
+      `[scaling] ${axis}: many ${say(ms)} one ${say(os)} ` +
+        `ratio ${ratio().toFixed(2)} bar ${bar}`,
+    );
+  }
+  if (ratio() > bar) {
+    throw new Error(
+      `${axis}: the many-entity arm cost ${say(ms)} against ${say(os)} for the same work ` +
+        `reshaped (ratio ${ratio().toFixed(2)}, bar ${bar}) — something is being ` +
+        `re-derived per ${axis} entity. ${note} Profile it with ` +
+        `docs/internals/profiling-the-compiler.md and bank the answer. (The ratio is of ` +
+        `CPU, so box load is not the explanation; wall far above cpu means only that the ` +
+        `run was starved.)`,
+    );
+  }
+};
 
 const gradePair = async (
   axis: string,
@@ -213,27 +282,14 @@ const gradePair = async (
   const dir = await Deno.makeTempDir({ prefix: `vl_scale_${axis}_` });
   try {
     const [manySrc, oneSrc] = await mk(dir);
-    let tMany = await build(manySrc, `${dir}/many.wasm`);
-    let tOne = await build(oneSrc, `${dir}/one.wasm`);
-    const bad = () => tMany > bar * Math.max(tOne, floor);
-    if (bad()) {
-      tMany = Math.min(tMany, await build(manySrc, `${dir}/many.wasm`));
-      tOne = Math.min(tOne, await build(oneSrc, `${dir}/one.wasm`));
-    }
-    if (VERBOSE) {
-      console.log(
-        `[scaling] ${axis}: many ${tMany.toFixed(2)}s one ${tOne.toFixed(2)}s ` +
-          `ratio ${(tMany / Math.max(tOne, floor)).toFixed(2)} bar ${bar}`,
-      );
-    }
-    if (bad()) {
-      throw new Error(
-        `${axis}: the many-entity arm cost ${tMany}s against ${tOne}s for the same work ` +
-          `reshaped (ratio ${(tMany / Math.max(tOne, floor)).toFixed(2)}, bar ${bar}) — ` +
-          `something is being re-derived per ${axis} entity. ${note} Profile it with ` +
-          `docs/internals/profiling-the-compiler.md and bank the answer.`,
-      );
-    }
+    await grade(
+      axis,
+      bar,
+      note,
+      () => build(manySrc, `${dir}/many.wasm`),
+      () => build(oneSrc, `${dir}/one.wasm`),
+      floor,
+    );
   } finally {
     await Deno.remove(dir, { recursive: true });
   }
@@ -368,21 +424,8 @@ axis("generic pins", 2.5, "`monoRebuild` re-runs a whole-program pass per minted
 // finish well under 0.4 s now, and `FLOOR` would divide the append arm by 0.4 and pass a
 // quadratic. Measured 2026-09-03 at 40,000 appends: **16.10 on master, 0.32 after** (the
 // append arm 0.805 s -> 0.02 s against the builder arm 0.028 s / 0.03 s). Bar 2.5.
-const runProg = async (src: string): Promise<number> => {
-  const t0 = Date.now();
-  const { code, stderr } = await new Deno.Command(VL, {
-    args: ["run", src, "--compiler", COMPILER],
-    stdout: "null",
-    stderr: "piped",
-    env: { RUST_BACKTRACE: "0", NO_COLOR: "1", VL_STD: `${ROOT}/std` },
-  }).output();
-  if (code !== 0) {
-    throw new Error(`vl run failed on ${src}: ${new TextDecoder().decode(stderr).slice(0, 400)}`);
-  }
-  return (Date.now() - t0) / 1000;
-};
-
-const RUN_FLOOR = 0.05;
+const runProg = (src: string): Promise<Cost> =>
+  spawn(`run on ${src}`, ["run", src, "--compiler", COMPILER]);
 
 const genAppendLoop = (n: number): string =>
   [
@@ -413,31 +456,79 @@ Deno.test({
   name: "scaling shape: string append loop",
   ignore: !ENABLED,
   fn: async () => {
-    const bar = 2.5;
     const dir = await Deno.makeTempDir({ prefix: "vl_scale_strappend_" });
     try {
       const [manySrc, oneSrc] = twoFiles(dir, genAppendLoop(40000), genJoinBuild(40000));
-      let tMany = await runProg(manySrc);
-      let tOne = await runProg(oneSrc);
-      const bad = () => tMany > bar * Math.max(tOne, RUN_FLOOR);
-      if (bad()) {
-        tMany = Math.min(tMany, await runProg(manySrc));
-        tOne = Math.min(tOne, await runProg(oneSrc));
-      }
-      if (VERBOSE) {
-        console.log(
-          `[scaling] string append loop: many ${tMany.toFixed(2)}s one ${tOne.toFixed(2)}s ` +
-            `ratio ${(tMany / Math.max(tOne, RUN_FLOOR)).toFixed(2)} bar ${bar}`,
+      await grade(
+        "string append loop",
+        2.5,
+        "40,000 appends against the same 800 KB string through std's builder: the " +
+          "loop-local accumulator lowering (`strAccScan` / `emitStrAccAppend`, " +
+          "compiler/wasmEmit.vl) stopped firing, so every append allocates an exact-fit " +
+          "backing and copies the whole prefix again. Check what disqualified the binding.",
+        () => runProg(manySrc),
+        () => runProg(oneSrc),
+        RUN_FLOOR,
+      );
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
+
+// ── the instrument's own control ─────────────────────────────────────────────
+// EVERY PAIR ABOVE PASSES, so nothing above can say whether the grader still reds. The
+// control is the same `grade` over a pair that must: one source, one literal different,
+// the many arm running its inner loop `n` times per outer step against the one arm's once
+// — so the many arm does n^2 units of the same work against the one arm's n.
+//
+// THE QUADRATIC IS THE PROGRAM'S OWN ALGORITHM, which is the whole point of choosing this
+// shape: a control built on a compiler GAP reds the gate the day somebody closes the gap,
+// and a gate that goes red on an improvement teaches people to distrust it. The inner term
+// reads the outer index, so it is not loop-invariant and no optimisation can hoist it. It
+// reads 13.8 for 0.7 s, and only a broken grader can move that.
+const genNestedLoop = (n: number, inner: number): string =>
+  [
+    "function work(n: i32, m: i32): i32 {",
+    "  let acc = 0",
+    "  let i = 0",
+    "  while i < n {",
+    "    let j = 0",
+    "    while j < m { acc = acc + (i + j) % 7 - 3; j = j + 1 }",
+    "    i = i + 1",
+    "  }",
+    "  return acc",
+    "}",
+    `print(work(${n}, ${inner}))`,
+    "",
+  ].join("\n");
+
+Deno.test({
+  name: "scaling shape: control — a quadratic arm reds",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = await Deno.makeTempDir({ prefix: "vl_scale_control_" });
+    try {
+      const [badSrc, okSrc] = twoFiles(dir, genNestedLoop(22000, 22000), genNestedLoop(22000, 1));
+      let red = "";
+      try {
+        await grade(
+          "control",
+          2.5,
+          "unreachable: the control exists to fail.",
+          () => runProg(badSrc),
+          () => runProg(okSrc),
+          RUN_FLOOR,
         );
+      } catch (e) {
+        red = String(e);
       }
-      if (bad()) {
+      if (!red) {
         throw new Error(
-          `string append loop: 40,000 appends cost ${tMany}s against ${tOne}s for the same ` +
-            `800 KB string through std's builder (ratio ` +
-            `${(tMany / Math.max(tOne, RUN_FLOOR)).toFixed(2)}, bar ${bar}) — the loop-local ` +
-            "accumulator lowering (`strAccScan` / `emitStrAccAppend`, compiler/wasmEmit.vl) " +
-            "stopped firing, so every append allocates an exact-fit backing and copies the " +
-            "whole prefix again. Check what disqualified the binding.",
+          "the control did not red: 22,000 x 22,000 iterations of a loop came in under 2.5x " +
+            "the same loop run 22,000 x 1 times. Nothing about the compiler can do that, so " +
+            "the grader has stopped measuring and every axis above is worth nothing — run " +
+            "with VL_SCALING_VERBOSE=1 and fix the grader, not this case.",
         );
       }
     } finally {
