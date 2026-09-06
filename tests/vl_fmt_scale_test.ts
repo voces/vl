@@ -123,10 +123,13 @@ Deno.test({
 // A single-line list with many ITEMS (one array literal, not many statements)
 // tripped a SEPARATE O(n²) hotspot: `wrapList`'s `oneLine = oneLine + item`
 // (and the wrapped-form `body = body + pad + item + ",\n"`) accumulators.
-// tests/cases/literals/long-literal-chunked.vl (a 10,001-element one-line
-// array) traps the compiler's non-freeing heap ("allocation size too large")
-// under the pre-fix quadratic form — the genSource() shape above (many small
-// statements) never exercises wrapList's single-list accumulation at all.
+// `genListSource` is where that shape lives, and it has to: the genSource()
+// shape above (many small statements) never exercises wrapList's single-list
+// accumulation at all. It used to be readable from the corpus too —
+// tests/cases/literals/long-literal-chunked.vl was a 10,001-element ONE-LINE
+// array, and traps the compiler's non-freeing heap ("allocation size too
+// large") under the pre-fix quadratic form — but `tests/` joined the fmt sweep,
+// so that file now carries the wrapped spelling and is a fixed point.
 const genListSource = (count: number): string => {
   const items: string[] = [];
   for (let i = 0; i < count; i++) items.push(String(i % 10));

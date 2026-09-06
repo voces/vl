@@ -25,7 +25,7 @@
 # is deliberately-INVALID fixtures, which `vl fmt --check` reports as rc 2, and rc 2 is
 # handled below as out of scope rather than as failure. The price of the exclusion was a
 # formatter defect nothing could see: `vl fmt` DELETED an `extern function` declaration
-# (D1653), and the seven fixtures that would have caught it were the ones not swept.
+# (D1653), and the fixtures that would have caught it were exactly the ones not swept.
 #
 # The two prunes, each for its own reason:
 #   * `scripts/silent-sweep/distilled/` — a corpus of deliberately odd programs; being
