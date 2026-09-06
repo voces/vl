@@ -156,6 +156,7 @@ import {
   objFieldSrcOrder,
   objFieldVal,
   objLitNeedsOrderStash,
+  placeNarrowKeyOf,
   quoteLex,
   retF32Flag,
   retF64Flag,
@@ -225,6 +226,7 @@ import {
   fnListEqRSlots,
   fnStmts,
   fnUsesAtomStage,
+  fnUsesListGet,
   fnUsesMapFilter,
   fnUsesMapKeys,
   fnUsesMapVals,
@@ -275,6 +277,12 @@ import {
   liBack,
   liKinds,
   liSlots,
+  listGetIdxSlot,
+  listGetIdxStagedIx,
+  listGetIdxStagedSet,
+  listGetRecvSlot,
+  listGetRecvStagedIx,
+  listGetRecvStagedSet,
   listIdxScratchBase,
   localIsRef,
   localStructIdx,
@@ -657,6 +665,7 @@ import {
   letNulMapReadUnionBox,
   letUnionNameOf,
   listElemIsBool,
+  listGetIdxReReadable,
   listIdxKindOf,
   listIdxWrapSlot,
   listOpKindOfBin,
@@ -724,6 +733,7 @@ import {
   optChainBaseOf,
   optChainStagesRecv,
   optChainStructIdxOf,
+  optRecvReReadable,
   paramStructIdxOf,
   pendingLitUnion,
   printUnionArmsUnrenderable,
@@ -927,13 +937,27 @@ function mvScalarValKind(slot: i32): VKind | null {
   return null
 }
 
+// Every `VKind` the four scalar-list descriptors below do not name, as one answer: a
+// recorded failure plus the i32 list's own index, so the module stays well-formed while the
+// refusal is what a user reads. A SILENT i32 answer here emitted a `string[]` against the
+// i32 backing at `vl check` rc 0 (D1684).
+function scalarListKindUnlisted(fallback: i32): i32 {
+  emitFail(
+    "emitProgram: a list op has no rep for this element kind — i32, boolean, string, f64, i64, f32 and u8 elements are the ones it speaks",
+  )
+  fallback
+}
+
 // The wrapper struct heap type for a scalar element kind.
 function scalarListWrap(elemKind: VKind) {
   if elemKind == "u8list" { return bl8TypeIdx }
   if elemKind == "f64" { return fl64TypeIdx }
   if elemKind == "i64" { return il64TypeIdx }
   if elemKind == "f32" { return fl32TypeIdx }
-  lTypeIdx
+  // The string list's wrapper is the map's keys-list type, which any `string[]` shares.
+  if elemKind == "str" { return mkListIdx }
+  if elemKind == "i32" { return lTypeIdx }
+  scalarListKindUnlisted(lTypeIdx)
 }
 
 // The backing `(array (mut <elem>))` heap type for a scalar element kind.
@@ -942,28 +966,43 @@ function scalarListBack(elemKind: VKind) {
   if elemKind == "f64" { return fa64TypeIdx }
   if elemKind == "i64" { return ia64TypeIdx }
   if elemKind == "f32" { return fa32TypeIdx }
-  aTypeIdx
+  if elemKind == "str" { return mkArrIdx }
+  if elemKind == "i32" { return aTypeIdx }
+  scalarListKindUnlisted(aTypeIdx)
+}
+
+// Open the value-typed `if` a fused `?? d` list read joins on, at the element's own rep. A
+// string element is a REF, so it takes `fbIfRef` where every other kind takes a valtype
+// byte; one speller, so the two arms of the read cannot disagree about the join type.
+function fbIfForScalarListElem(elemKind: VKind) {
+  if elemKind == "str" { return fbIfRef(sTypeIdx) }
+  fbIf(scalarListBlocktype(elemKind))
 }
 
 // The `array.get` result blocktype byte for a scalar element kind (i32 `0x7f`, f64
-// `0x7c`, i64 `0x7e`) — the value-typed-`if` rep a fused `?? d` read joins on. A `u8[]`
-// element reads as i32 (`array.get_u` widens), so it shares the plain i32 blocktype.
+// `0x7c`, i64 `0x7e`). A `u8[]` element reads as i32 (`array.get_u` widens), so it shares
+// the plain i32 blocktype; a `string` element has no byte and goes through `fbIfRef`.
 function scalarListBlocktype(elemKind: VKind) {
   if elemKind == "u8list" { return 127 }
   if elemKind == "f64" { return 124 }
   if elemKind == "i64" { return 126 }
   if elemKind == "f32" { return 125 }
-  127
+  if elemKind == "i32" { return 127 }
+  scalarListKindUnlisted(127)
 }
 
 // Whether the module-global list types for a scalar element kind are collected — the
-// loud-fail guard every list op shares.
+// loud-fail guard every list op shares. An unlisted kind answers false, which is the
+// caller's own loud refusal rather than a silent read at the i32 list's types.
 function scalarListUsed(elemKind: VKind) {
   if elemKind == "u8list" { return ba8Used }
   if elemKind == "f64" { return fa64Used }
   if elemKind == "i64" { return ia64Used }
   if elemKind == "f32" { return fa32Used }
-  lUsed
+  // The string-ref list is minted for any `string[]` field and for the map's keys list.
+  if elemKind == "str" { return slUsed || mUsed }
+  if elemKind == "i32" { return lUsed }
+  false
 }
 
 // Emit `exprIx` coerced to a scalar element kind's value rep — the f64/i64 widen of a
@@ -2872,10 +2911,8 @@ function emitNarrowedMem(body: i32[], memIx: i32, fnIx: i32) {
     const recvN = P.nodes[unwrapParen(m.memObj)]
     if recvN is Ident { recvVar = narrowVariantFor(recvN.identName) }
 
-    if recvN is Member {
-      const pk = memberPathKeyOf(m.memObj)
-      if pk != "" { recvVar = narrowVariantFor(pk) }
-    }
+    const pk = placeNarrowKeyOf(m.memObj)
+    if pk != "" { recvVar = narrowVariantFor(pk) }
     const vi = variantIndexOf(recvVar)
     if vi < 0 {
       return emitFail("emitProgram: narrowed receiver names no union variant")
@@ -3076,6 +3113,89 @@ function optChainLeafBoxKind(code: i32): i32 {
   if code == 23 { return 3 }
   if code == 24 { return 5 }
   -1
+}
+
+// The four `.get` staging markers as one saved value, so a nested `.get` — one in a `?? d`
+// default arm — restores the outer call's marker instead of losing it. Packed rather than
+// four locals per site: the two indices are arena positions, the two flags are bits.
+function listGetStageSave(): i32[] {
+  const sv: i32[] = []
+  sv.push(listGetIdxStagedIx)
+  sv.push(if listGetIdxStagedSet { 1 } else { 0 })
+  sv.push(listGetRecvStagedIx)
+  sv.push(if listGetRecvStagedSet { 1 } else { 0 })
+  sv
+}
+
+// Put back what `listGetStageSave` took.
+function listGetStageRestore(sv: i32[]) {
+  listGetIdxStagedIx = sv[0]
+  listGetIdxStagedSet = sv[1] == 1
+  listGetRecvStagedIx = sv[2]
+  listGetRecvStagedSet = sv[3] == 1
+  0
+}
+
+// Mark a `.get(i)` call's index and receiver for staging, each when it is not a re-readable
+// place. Writes no bytes: the first read tees the value in, and every arm emits its bounds
+// compare before the element read, so the tee dominates (D1677).
+function listGetStageMark(callIx: i32) {
+  const c = P.nodes[unwrapParen(callIx)]
+  if c is Call {
+    const callee = P.nodes[unwrapParen(c.callFn)]
+    if callee is Member {
+      if !optRecvReReadable(callee.memObj) {
+        listGetRecvStagedIx = unwrapParen(callee.memObj)
+        listGetRecvStagedSet = false
+      }
+      if c.callArgs.length == 1 {
+        if !listGetIdxReReadable(c.callArgs[0]) {
+          listGetIdxStagedIx = unwrapParen(c.callArgs[0])
+          listGetIdxStagedSet = false
+        }
+      }
+    }
+  }
+  0
+}
+
+// Push a `.get` index: the i32 stash when this call staged it, teed in on the first read,
+// else the expression itself — byte for byte what an un-staged index has always emitted.
+function emitListGetIdx(body: i32[], idxIx: i32, fnIx: i32) {
+  if listGetIdxStagedIx < 0 || listGetIdxStagedIx != unwrapParen(idxIx) {
+    return emitExpr(body, idxIx, fnIx)
+  }
+  if listGetIdxStagedSet {
+    fbLocalGet(listGetIdxSlot)
+    return 0
+  }
+  if !fnUsesListGet {
+    return emitFailAt("emitProgram: `.get` operand stash not reserved", idxIx)
+  }
+  if emitExpr(body, idxIx, fnIx) < 0 { return -1 }
+  fbLocalTee(listGetIdxSlot)
+  listGetIdxStagedSet = true
+  0
+}
+
+// Push a `.get` receiver: the `(ref null struct)` stash cast back to the list's own wrapper
+// heap when this call staged it, else the expression itself. `heap` is that wrapper.
+function emitListGetRecv(body: i32[], objIx: i32, fnIx: i32, heap: i32) {
+  if listGetRecvStagedIx < 0 || listGetRecvStagedIx != unwrapParen(objIx) {
+    return emitExpr(body, objIx, fnIx)
+  }
+  if listGetRecvStagedSet {
+    fbLocalGet(listGetRecvSlot)
+  } else {
+    if !fnUsesListGet {
+      return emitFailAt("emitProgram: `.get` operand stash not reserved", objIx)
+    }
+    if emitExpr(body, objIx, fnIx) < 0 { return -1 }
+    fbLocalTee(listGetRecvSlot)
+    listGetRecvStagedSet = true
+  }
+  fbRefCast(heap)
+  0
 }
 
 // Lower a standalone optional chain `recv?.f` — in ordinary value position (a `const`/`let`
@@ -15202,6 +15322,13 @@ function listOpRecvLocal(
     if stageListRecv(body, objIx, fnIx, mb) < 0 { return -1 }
     return mb + 3
   }
+  // A CALL receiver stages exactly as a `Member` one does — the frame's `recvRef` slot holds
+  // the wrapper once, so the bounds compare and the element read share one evaluation (D1677).
+  if recv is Call {
+    const cb = listOpStageBase(base, refSlot)
+    if stageListRecv(body, objIx, fnIx, cb) < 0 { return -1 }
+    return cb + 3
+  }
   if allowIndex {
     // An INDEXED receiver (`g[0].push(x)` - push onto an INNER list of a nested array, or
     // onto a list read from a list-valued map). The classifiers upstream already recognize a
@@ -15635,7 +15762,7 @@ function pushTakeCond(
   fnIx: i32,
 ): i32 {
   if idxIx < 0 { return pushListLen(body, lIdx, lTy) }
-  if emitExpr(body, idxIx, fnIx) < 0 { return -1 }
+  if emitListGetIdx(body, idxIx, fnIx) < 0 { return -1 }
   pushListLen(body, lIdx, lTy)
   fbI32Bin(73) // 0x49 i32.lt_u
   0
@@ -15665,26 +15792,9 @@ function pushTakeElem(
     return 0
   }
   pushListBacking(body, lIdx, lTy)
-  if emitExpr(body, idxIx, fnIx) < 0 { return -1 }
+  if emitListGetIdx(body, idxIx, fnIx) < 0 { return -1 }
   fbArrayGet(aTy) // backing[i] — the read element
   0
-}
-
-// The `.get(i)` index purity gate: the index is emitted twice (bounds check + read), so
-// only a re-readable expression is admissible — a literal, a name, or a NEGATIVE literal
-// (`xs.get(-1)`), which the unsigned compare maps past `len` and so takes the absent arm.
-// `emitListGetOr`'s own gate is the same one; this is its unfused twin.
-function takeIdxRefusal(idxIx: i32): string {
-  const idxN = P.nodes[unwrapParen(idxIx)]
-  if idxN is NumLit { return "" }
-  if idxN is Ident { return "" }
-  if idxN is Unary {
-    if idxN.unOp == "-" {
-      const inner = P.nodes[unwrapParen(idxN.unArg)]
-      if inner is NumLit { return "" }
-    }
-  }
-  "emitProgram: .get index must be a literal or a name"
 }
 
 // `xs.pop()` and `xs.get(i)` — the two checked list reads, typed identically (`T | null`),
@@ -15692,6 +15802,20 @@ function takeIdxRefusal(idxIx: i32): string {
 // (`pushTakeCond`/`pushTakeElem`). `getIdx` is the `.get` index node, or -1 for `.pop`;
 // serving both from one body keeps `.get` reaching every rep `.pop` reaches (D1281).
 function emitPop(
+  body: i32[],
+  callIx: i32,
+  fnIx: i32,
+  nulBox: boolean,
+  getIdx: i32,
+) {
+  const pgSv = listGetStageSave()
+  const pgR = emitPopGo(body, callIx, fnIx, nulBox, getIdx)
+  listGetStageRestore(pgSv)
+  pgR
+}
+
+// The `.pop` / `.get` arms themselves, with the call's operands already marked for staging.
+function emitPopGo(
   body: i32[],
   callIx: i32,
   fnIx: i32,
@@ -15708,8 +15832,7 @@ function emitPop(
           return emitFail("emitProgram: .pop takes no arguments")
         }
       } else {
-        const idxBad = takeIdxRefusal(getIdx)
-        if idxBad != "" { return emitFail(idxBad) }
+        listGetStageMark(callIx)
       }
       const isRef = exprRefArray(callee.memObj, fnIx)
       const isStr = exprStringArray(callee.memObj, fnIx)
@@ -15947,6 +16070,14 @@ function emitClear(body: i32[], callIx: i32, fnIx: i32) {
 // `body`: one unsigned bounds compare selects the element read or the default, so the
 // `T | null` intermediate never materializes. Receiver a bare name, index a literal/name.
 function emitListGetOr(body: i32[], getIx: i32, defIx: i32, fnIx: i32) {
+  const lgSv = listGetStageSave()
+  const lgR = emitListGetOrGo(body, getIx, defIx, fnIx)
+  listGetStageRestore(lgSv)
+  lgR
+}
+
+// The fused `xs.get(i) ?? d` arm itself, with the call's operands already marked.
+function emitListGetOrGo(body: i32[], getIx: i32, defIx: i32, fnIx: i32) {
   const c = P.nodes[getIx]
   if c is Call {
     const callee = P.nodes[c.callFn]
@@ -15956,7 +16087,12 @@ function emitListGetOr(body: i32[], getIx: i32, defIx: i32, fnIx: i32) {
       }
       // The scalar element kind (i32 / f64 / i64) selects the list types + read rep — one
       // descriptor lookup instead of an `isF64 ? … : …` fork (so i64 is a descriptor arm).
-      const ek = scalarListElemKind(callee.memObj, fnIx)
+      let ek = scalarListElemKind(callee.memObj, fnIx)
+      // The string list, for `u8list`'s reason one rep over: its element is a REF, and
+      // `exprArray`'s typed-IR fast path claims ANY array, so the classifier answers "i32"
+      // for a `string[]` and this read would take the i32 backing (D1684). Asked here and
+      // not in the classifier, whose ten other callers each route a string list already.
+      if exprStringArray(callee.memObj, fnIx) { ek = "str" }
       if ek == null {
         return emitFail("emitProgram: .get receiver is not a scalar list")
       }
@@ -15965,43 +16101,26 @@ function emitListGetOr(body: i32[], getIx: i32, defIx: i32, fnIx: i32) {
       }
       const lTy = scalarListWrap(ek)
       const aTy = scalarListBack(ek)
-      const recvN = P.nodes[unwrapParen(callee.memObj)]
-      let okRecv = false
-      if recvN is Ident { okRecv = true }
-      if !okRecv {
-        return emitFail(
-          "emitProgram: .get receiver must be a named list binding",
-        )
-      }
-      const idxN = P.nodes[unwrapParen(c.callArgs[0])]
-      let okIdx = false
-      if idxN is NumLit { okIdx = true }
-      if idxN is Ident { okIdx = true }
-      if idxN is Unary {
-        // A NEGATIVE literal index (`xs.get(-1)`) is pure too — the unsigned
-        // bounds compare maps it past `len`, so it takes the default branch.
-        if idxN.unOp == "-" {
-          const idxArgN = P.nodes[unwrapParen(idxN.unArg)]
-          if idxArgN is NumLit { okIdx = true }
-        }
-      }
-      if !okIdx {
-        return emitFail("emitProgram: .get index must be a literal or a name")
-      }
+      // The index and the receiver are each emitted twice below, so a non-place operand is
+      // staged once in the `.get` stash rather than refused (D1677).
+      listGetStageMark(getIx)
       // cond: idx u< len  (one unsigned compare covers negative + past-len)
-      if emitExpr(body, c.callArgs[0], fnIx) < 0 { return -1 }
-      if emitExpr(body, callee.memObj, fnIx) < 0 { return -1 }
-      fbStructGet(lTy, 1)           // field 1: len
-      fbI32Bin(73)                  // 0x49 i32.lt_u
-      fbIf(scalarListBlocktype(ek)) // 0x04 if, the element's result blocktype
+      if emitListGetIdx(body, c.callArgs[0], fnIx) < 0 { return -1 }
+      if emitListGetRecv(body, callee.memObj, fnIx, lTy) < 0 { return -1 }
+      fbStructGet(lTy, 1)       // field 1: len
+      fbI32Bin(73)              // 0x49 i32.lt_u
+      fbIfForScalarListElem(ek) // 0x04 if, the element's own result rep
       ctrlEnter()
-      if emitExpr(body, callee.memObj, fnIx) < 0 { return -1 }
-      fbStructGet(lTy, 0)           // field 0: backing
-      if emitExpr(body, c.callArgs[0], fnIx) < 0 { return -1 }
-      fbArrayGet(aTy)               // 0xfb 0x0b array.get — the element
-      fbElse()                      // 0x05 else
+      if emitListGetRecv(body, callee.memObj, fnIx, lTy) < 0 { return -1 }
+      fbStructGet(lTy, 0)       // field 0: backing
+      if emitListGetIdx(body, c.callArgs[0], fnIx) < 0 { return -1 }
+      fbArrayGet(aTy)           // 0xfb 0x0b array.get — the element
+      // A string backing's element slot is `(ref null $str)` while the `if` joins on the
+      // non-null rep the consumer reads; an in-range element of a live list is never null.
+      if ek == "str" { fbRefAsNonNull() }
+      fbElse() // 0x05 else
       if emitScalarValue(body, defIx, fnIx, ek) < 0 { return -1 }
-      fbEnd()                       // 0x0b end
+      fbEnd()  // 0x0b end
       ctrlLeave()
       return 0
     }
@@ -21808,10 +21927,12 @@ function coalWidenUnboxed(from: i32, to: i32) {
 function emitCoalesce(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
   const coPrev = optRecvStagedIx
   const coPrevSet = optRecvStagedSet
+  const coSv = listGetStageSave()
   optRecvStageMark(e.binLeft)
   const coR = emitCoalesceGo(body, e, exprIx, fnIx)
   optRecvStagedIx = coPrev
   optRecvStagedSet = coPrevSet
+  listGetStageRestore(coSv)
   coR
 }
 
@@ -22614,40 +22735,30 @@ function emitCoalesceGo(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
                 "emitProgram: `?.` over a list .get supports only i32/boolean fields",
               )
             }
-            const gRecvN = P.nodes[unwrapParen(gCallee.memObj)]
-            let gOkRecv = false
-            if gRecvN is Ident { gOkRecv = true }
-            if !gOkRecv {
-              return emitFail(
-                "emitProgram: .get receiver must be a named list binding",
-              )
-            }
-            const gIdxN = P.nodes[unwrapParen(omGet.callArgs[0])]
-            let gOkIdx = false
-            if gIdxN is NumLit { gOkIdx = true }
-            if gIdxN is Ident { gOkIdx = true }
-            if !gOkIdx {
-              return emitFail(
-                "emitProgram: .get index must be a literal or a name",
-              )
-            }
             const gSlot = refListSlotOfExpr(gCallee.memObj, fnIx)
+            // The same two operands, emitted twice each below — staged, not refused (D1677).
+            listGetStageMark(unwrapParen(lhs.omObj))
             // cond: idx u< len
-            if emitExpr(body, omGet.callArgs[0], fnIx) < 0 { return -1 }
-            if emitExpr(body, gCallee.memObj, fnIx) < 0 { return -1 }
+            if emitListGetIdx(body, omGet.callArgs[0], fnIx) < 0 { return -1 }
+            const gWrap = rlWrapIdx[gSlot]
+            if emitListGetRecv(body, gCallee.memObj, fnIx, gWrap) < 0 {
+              return -1
+            }
             fbStructGet(rlWrapIdx[gSlot], 1) // field 1: len
             fbI32Bin(73)                     // 0x49 i32.lt_u
             fbIf(127)                        // 0x04 if, 0x7f i32 result blocktype
             ctrlEnter()
-            if emitExpr(body, gCallee.memObj, fnIx) < 0 { return -1 }
-            fbStructGet(rlWrapIdx[gSlot], 0) // field 0: backing
-            if emitExpr(body, omGet.callArgs[0], fnIx) < 0 { return -1 }
-            fbArrayGet(rlBackIdx[gSlot])     // → (ref null $elem)
-            fbRefAsNonNull()                 // a live in-range element is non-null
-            fbStructGet(sHeapIdx[gSi], gFi)  // .f
-            fbElse()                         // 0x05 else
+            if emitListGetRecv(body, gCallee.memObj, fnIx, gWrap) < 0 {
+              return -1
+            }
+            fbStructGet(gWrap, 0)           // field 0: backing
+            if emitListGetIdx(body, omGet.callArgs[0], fnIx) < 0 { return -1 }
+            fbArrayGet(rlBackIdx[gSlot])    // → (ref null $elem)
+            fbRefAsNonNull()                // a live in-range element is non-null
+            fbStructGet(sHeapIdx[gSi], gFi) // .f
+            fbElse()                        // 0x05 else
             if emitExpr(body, e.binRight, fnIx) < 0 { return -1 }
-            fbEnd()                          // 0x0b end
+            fbEnd()                         // 0x0b end
             ctrlLeave()
             return 0
           }

@@ -22,7 +22,8 @@ Text before the first marker is a free header. Sections:
     @@PROOF@@     statements over the bound name `v`, printing WANT
     @@TEST@@ @@HIT@@ @@MISS@@   a boolean over `v` plus its two branches; PROOF defaults to
                   `if TEST { HIT } else { MISS }`, and these UNLOCK the six discrimination
-                  positions (a template with no TEST skips them, with the reason printed)
+                  positions AND the three `*_place` ones, which re-read the delivery place
+                  instead of `v` (a template with no TEST skips them, with the reason printed)
     @@SETUP@@     statements emitted in the delivery's own scope before it
     @@GUARD@@     a boolean; the delivery nests inside `if GUARD { ... }` (a NARROWED value)
     @@FALLBACK@@  an expression of TYPE for the paths a GUARD leaves un-taken
@@ -97,6 +98,18 @@ class Tpl:
     def bind(self, name, expr, face, ty=None):
         return ("const %s: %s = %s" % (name, ty or self.ty, expr)) if face == "ann" \
             else "const %s = %s" % (name, expr)
+
+    def over(self, place):
+        """TEST/HIT/MISS rewritten to read `place` directly instead of the bound name `v`.
+
+        Every other position binds the delivery to `v` and proves over that name, so the
+        receiver every proof presents is an Ident. D1719 is a narrowed read whose receiver
+        is an INDEX and the whole delivery grid graded it green. Whole-word, so a name that
+        merely contains `v` is untouched.
+        """
+        sub = lambda s: re.sub(r"\bv\b", place, s)  # noqa: E731
+        return "if %s {\n%s\n} else {\n%s\n}" % (
+            sub(self.test), ind(sub(self.hit), 2), ind(sub(self.miss), 2))
 
 
 # ---------------------------------------------------------------- assembly
@@ -414,6 +427,44 @@ def p_else_if(t, face):
     return _disc(t, face, "const __z = 0\nif __z == 1 {\n  print(\"unreached\")\n} "
                  "else if %s {\n%s\n} else {\n%s\n}"
                  % (t.test, ind(t.hit, 2), ind(t.miss, 2)))
+
+
+# --- discrimination over the PLACE, with no rebinding ----------------------
+#
+# THE SHAPE THE OTHER TWENTY-SEVEN POSITIONS DO NOT HAVE. Every one of them binds the
+# delivered value to `v` and proves over that name, so the receiver every proof presents is
+# an Ident. D1719's receiver is an INDEX — `xs[0].r` under `if xs[0] is A` — and the whole
+# delivery grid graded it green on BOTH seeds while it was live; D1729 is the same blindness
+# at the complement of a literal `is`. Gated on TEST, like the six discrimination positions.
+
+@position("array_element_place", "the list binding")
+def p_array_element_place(t, face):
+    if not t.test:
+        return None, "the template declares no @@TEST@@/@@HIT@@/@@MISS@@"
+    xs = ("const xs: %s = [%s]" % (t.arr(), t.value)) if face == "ann" \
+        else "const xs = [%s]" % t.value
+    return assemble(t, body=[xs, t.over("xs[0]")])
+
+
+@position("map_value_place", "the map binding")
+def p_map_value_place(t, face):
+    # The null guard is the position's, not the template's: a bare `m[k]` is `V | null` by
+    # construction, so an un-guarded TEST is graded against a type the template never
+    # described. `map_value` guards the same way before binding; this one never binds.
+    if not t.test:
+        return None, "the template declares no @@TEST@@/@@HIT@@/@@MISS@@"
+    m = "const __m: { [string]: %s } = Map()" % t.ty if face == "ann" else "const __m = Map()"
+    guarded = ["if __m[\"k\"] != null {", ind(t.over("__m[\"k\"]"), 2), "}"]
+    return assemble(t, pre=[m], body=["__m[\"k\"] = %s" % t.value] + guarded)
+
+
+@position("struct_field_place", "the destination struct binding")
+def p_struct_field_place(t, face):
+    if not t.test:
+        return None, "the template declares no @@TEST@@/@@HIT@@/@@MISS@@"
+    decls = ["type __W = { f: %s }" % t.ty] if face == "ann" else []
+    w = "const w: __W = { f: %s }" % t.value if face == "ann" else "const w = { f: %s }" % t.value
+    return assemble(t, decls=decls, body=[w, t.over("w.f")])
 
 
 @position("early_return_guard", "the parameter")
