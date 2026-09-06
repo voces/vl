@@ -211,8 +211,9 @@ so.** That is the shape of the gap this instrument closed, not an incidental rea
 
 Three, and they fire at different moments. Profiling is what you do AFTER one of them does.
 
-* **`tests/vl_scaling_shape_test.ts`** — eight pairs, the same work reshaped along one axis
-  (functions, types, unions, call sites, closures, callback slots, modules, generic pins),
+* **`tests/vl_scaling_shape_test.ts`** — nine pairs, the same work reshaped along one axis
+  (functions, types, unions, call sites, closures, callback slots, modules, generic pins,
+  covariant bindings),
   graded on the ratio of the two arms' CPU (user+sys) so machine speed and box load cancel.
   **The ratio has to be of CPU, because `gate.sh`'s fan-out is not a uniform slowdown**: the
   two arms run at different moments and a burst inflates whichever one it lands on. Measured
@@ -226,7 +227,8 @@ Three, and they fire at different moments. Profiling is what you do AFTER one of
   loop-local lowering declines, now filed as D1650) and a control built on a gap reds the
   gate the day someone closes the gap, which teaches people to distrust the row.
   Fires when a pass starts multiplying over an axis, and NAMES the axis. ~20–30 s; two of its axes red on the
-  pre-#2419 compiler and `callback slots` on the pre-D1514 one. Three axes are super-linear
+  pre-#2419 compiler, `callback slots` on the pre-D1514 one and `covariant bindings` on the
+  pre-D1657 one (12.95 against a bar of 2.5). Three axes are super-linear
   today and carry a bar above their measurement, each naming the function responsible — read
   those comments before widening a bar; `generic pins` left that list when `collectA` learned
   to resume, and its bar fell 6.0 to 2.5 with it. **An axis is only a guard for an entity it HAS**:
