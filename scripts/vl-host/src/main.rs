@@ -3996,19 +3996,23 @@ fn disassemble_to_wat(wasm_path: &str, wat_path: &str) -> Result<()> {
 /// build produced 0 validation failures, and the 12 that build-then-fail-to-run are
 /// all deliberate TRAP fixtures — a trap is a runtime failure of a VALID module.
 ///
-/// It reads the module back OFF DISK rather than validating the in-memory `bytes`
-/// so that `-O` is covered too: with `-O` the artifact is binaryen's output, not
-/// the emitter's, and the artifact is what the caller will run.
+/// Takes `bytes` — the module the caller already holds — rather than reading
+/// `path` back off disk (D1678). The write and the validation used to be coupled
+/// through the filesystem, so an output path that cannot be read back (`/dev/null`,
+/// a pipe, a write-only mount) made a check-clean program fail with "the emitted
+/// module failed to validate: unexpected end-of-file", rc 70 — the actual write had
+/// already succeeded. The one caller that still needs the disk copy (`-O`/`-O3`
+/// rewrites the file through the `wasm-opt` CLI, so the in-memory bytes go stale)
+/// reads it back itself and passes the fresh bytes in here; this function never
+/// touches `path` except to name it in the error.
 ///
 /// The file is left in place on failure, and this runs after `--wat`, because a
 /// module that fails to validate is precisely the one a compiler dev needs to
 /// disassemble. The exit code — not the artifact's absence — is what tells a
 /// caller not to use it. `--no-validate` restores the old write-and-bless path
 /// for anyone who wants the artifact without the gate.
-fn validate_written_module(engine: &Engine, path: &str) -> Result<()> {
-    let bytes = std::fs::read(path)
-        .map_err(|e| Error::from(e).context(format!("reading back `{path}` to validate it")))?;
-    Module::validate(engine, &bytes).map_err(|e| {
+fn validate_written_module(engine: &Engine, bytes: &[u8], path: &str) -> Result<()> {
+    Module::validate(engine, bytes).map_err(|e| {
         Error::from(e).context(format!(
             "`{path}` is not a valid WebAssembly module — it was written, but it cannot \
              instantiate (this is a compiler emit bug; `--no-validate` skips this check)"
@@ -5332,9 +5336,9 @@ fn cli_pump(args: &[String]) -> Result<()> {
                 // the driver's own `rbyte` readback channel, exactly as
                 // CMD_TEST_STASH reads them.
                 //
-                // In memory, not off disk: unlike `vl build` there is no artifact
-                // and no `-O` rung to cover, so the emitter's own bytes ARE what a
-                // caller would run.
+                // In memory, not off disk — same as `vl build`'s own unoptimized
+                // path since D1678. There is no artifact here and no `-O` rung to
+                // cover, so the emitter's own bytes ARE what a caller would run.
                 //
                 // The commit is probed HERE, not up front with the rest of the pump
                 // exports, so a seed that predates this command — and therefore
@@ -5621,16 +5625,30 @@ fn build_cmd(args: &[String]) -> Result<()> {
     // rungs, and `-O3` WINS when both are given — it is a superset of `-O`'s
     // effect on every measured shape, so running `-O` first would only cost a
     // process spawn. `-O3` is the release profile (`RELEASE_PASSES`), not a
-    // bare binaryen level.
-    if args.iter().any(|a| a == "-O3") {
-        optimize_in_place(&out, "-O3", RELEASE_PASSES)?;
+    // bare binaryen level. `wasm-opt` rewrites `out` itself (a subprocess, not
+    // this host), so `bytes` goes stale the moment either rung runs — `final_bytes`
+    // is Some(..) exactly when that happened, and is the one place left that still
+    // reads `out` back off disk, because it is the only source of the post-optimize
+    // bytes (D1678).
+    let opt_rung = if args.iter().any(|a| a == "-O3") {
+        Some(("-O3", RELEASE_PASSES))
     } else if args.iter().any(|a| a == "-O") {
-        optimize_in_place(&out, "-O", OPT_PASSES)?;
+        Some(("-O", OPT_PASSES))
+    } else {
+        None
+    };
+    let mut final_bytes: Option<Vec<u8>> = None;
+    if let Some((flag, passes)) = opt_rung {
+        optimize_in_place(&out, flag, passes)?;
+        final_bytes = Some(std::fs::read(&out).map_err(|e| {
+            Error::from(e).context(format!("reading back the {flag}'d `{out}`"))
+        })?);
     }
-    let len = std::fs::metadata(&out)
-        .map(|m| m.len())
-        .unwrap_or(bytes.len() as u64);
-    println!("wrote {out} ({len} bytes)");
+    let final_bytes: &[u8] = final_bytes.as_deref().unwrap_or(&bytes);
+    // The buffer's own length, not a filesystem stat of `out` — `-o /dev/null`
+    // (or any path that discards what it's given) reported "wrote ... (0 bytes)"
+    // for a build that had in fact produced a full module (D1678).
+    println!("wrote {out} ({} bytes)", final_bytes.len());
     // `--wat`: also write a `.wat` text dump beside the module (wasm-dis,
     // when present). Reflects the `-O`-optimized module if both are given.
     if args.iter().any(|a| a == "--wat") {
@@ -5639,9 +5657,12 @@ fn build_cmd(args: &[String]) -> Result<()> {
     }
     // The written module must be a module the engine will ACCEPT — see
     // `validate_written_module`. Runs LAST so `--wat` still dumps a broken
-    // module (that dump is how an emit bug gets diagnosed).
+    // module (that dump is how an emit bug gets diagnosed). Validates
+    // `final_bytes` — the buffer already in hand — rather than re-reading `out`,
+    // so a write-only or unreadable `-o` target no longer fails a check-clean
+    // build (D1678).
     if !args.iter().any(|a| a == "--no-validate") {
-        if let Err(e) = validate_written_module(&compile_engine, &out) {
+        if let Err(e) = validate_written_module(&compile_engine, final_bytes, &out) {
             // An OPTIMIZED artifact is binaryen's bytes, not the emitter's, so the
             // emitter's byte ranges do not describe it — keep the engine's own text
             // rather than naming a function off an offset that means something else.
