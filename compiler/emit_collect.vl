@@ -678,6 +678,7 @@ import {
   variantLitRepMismatch,
   variantLitRepUnifiable,
   variantNestedShapeOk,
+  variantRowOfTy,
   variantSig,
   variantSigMemoDrop,
 } from "./emit_classify"
@@ -5749,6 +5750,9 @@ export function collectAnnShapes() {
           root = nodeTyIxOf(ti)
         }
       }
+      // Ahead of the intern, which codes each field: an arm-typed field needs the arm's own
+      // row to exist before `armFieldStructRow` is asked for it (D1672).
+      internArmFieldShape(tn.tyName)
       internShapeDeepTy(tn.tyName, root)
     }
     ti = ti + 1
@@ -6071,6 +6075,10 @@ function collectAnonShapes() {
         while pk < pn.objFields.length {
           const pf = P.nodes[pn.objFields[pk]]
           if pf is FieldInit {
+            // The arm-shape mint an ANONYMOUS holder owes: `collectNestedFieldShapes` interns
+            // the row a DECLARED `f: P` field stores through, read off the annotation, and an
+            // inferred holder has none — so the field took no code and the literal no row (D1672).
+            internArmShapeRow(variantRowOfTy(nodeTyIxOf(pf.fiValue)))
             const pv = unwrapParen(pf.fiValue)
             if pv >= 0 && pv < nestOwner.length {
               const pvn = P.nodes[pv]
@@ -9292,11 +9300,31 @@ function internArmShapeAt(nm: string, depth: i32) {
   if nameIsArray(nm) { return internArmShapeAt(arrElemNameRaw(nm), depth + 1) }
   const mv = mapValNameOf(nm)
   if mv != "" { return internArmShapeAt(mv, depth + 1) }
+  // An INLINE shape names its fields' arms exactly as a `TypeDecl` does, so it earns the
+  // same descent: without it `const w: {f: P} = …` codes the field 15 over a row nothing
+  // mints (D1672).
+  if nameIsShapeSpanEnds(nm) { return internArmShapeFieldsAt(nm, depth) }
   internArmShapeOf(nm)
 }
 
-function internArmShapeOf(nm: string) {
-  const vi = variantIndexOf(nm)
+// The inline-shape descent of the peel above, split out so the field arrays are local to it.
+function internArmShapeFieldsAt(nm: string, depth: i32) {
+  const fnames: string[] = []
+  const ftexts: string[] = []
+  shapeInnerFieldSplit(groupInnerOf(nm), fnames, ftexts)
+  let fi = 0
+  while fi < ftexts.length {
+    internArmShapeAt(ftexts[fi], depth + 1)
+    fi = fi + 1
+  }
+  0
+}
+
+function internArmShapeOf(nm: string) { internArmShapeRow(variantIndexOf(nm)) }
+
+// The mint itself, keyed on the variant ROW: a declared field type reaches it by name, an
+// anonymous literal's field value by the arena type of the value (`variantRowOfTy`).
+function internArmShapeRow(vi: i32) {
   if vi < 0 { return 0 }
   if vi >= uVarTyIx.length { return 0 }
   const aty = uVarTyIx[vi]
