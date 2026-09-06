@@ -144,6 +144,7 @@ import {
   nodeTyWidenedRepName,
   nodeUnionName,
   nominalStructNameOfTy,
+  nonNullTy,
   nulFoldWrapperTyIxOf,
   numCastCanFail,
   numLitUnionArrayBaseName,
@@ -12324,6 +12325,26 @@ function pushIndexMapNarrow(
   true
 }
 
+// The `!= null` sense of the same place: the guard proves the key present AND the value
+// non-null, so the cell reads at the map value type's non-null face. `nonNullTy` is the
+// checker's own peel, asked here rather than re-derived — a map whose value is ITSELF
+// nullable narrows to `i32`, and pushing `i32 | null` leaves the box unboxed (D1734).
+function pushIndexMapNullNarrow(idxIx: i32, fnIx: i32) {
+  const ik = indexPathKeyOf(idxIx)
+  if ik == "" { return false }
+  if mapReadNarrowableSlot(idxIx, fnIx) < 0 { return false }
+  const e = P.nodes[unwrapParen(idxIx)]
+  if e is Index {
+    const vt = nonNullTy(tyMapValOf(nodeTyIxOf(unwrapParen(e.idxArr))))
+    if vt < 0 { return false }
+    const nm = tyToEmitName(vt)
+    if nm == "" || nm == "null" { return false }
+    pushNarrowRep(ik, nm, vt, -1)
+    return true
+  }
+  false
+}
+
 // Retire every live narrowing whose key is a cell of the receiver keyed `root` — the
 // emitter twin of `retireNarrowingsForWrite`'s prefix rule. Needed because the checker
 // retires and re-types a write's reads at the declared rep, which for a niche cell is one
@@ -12538,6 +12559,10 @@ export function setNarrowFromCond(condIx0: i32, fnIx: i32) {
       if incn is BinExpr {
         if incn.binOp == "!=" {
           if pushIndexNicheNarrow(mnull, fnIx) { return true }
+          // The MAP cell of the same test — `m["k"] != null` proves the key present, which
+          // is the recovery `emitNarrowedMapReadTail` already emits for the `is` sense. The
+          // checker narrows it the same way and retires it on the same removers (D1734).
+          if pushIndexMapNullNarrow(mnull, fnIx) { return true }
         }
       }
     }
@@ -12760,6 +12785,10 @@ export function setNarrowFromCondElse(condIx0: i32, fnIx: i32) {
       }
       if c.isVariant == "null" {
         if pushIndexNicheNarrow(eiix, fnIx) { return true }
+        // The map cell in the else of `m["k"] is null` — the third spelling of the same
+        // guard, beside `!= null` and the else of `== null`, and the one a `match` on a
+        // nullable cell reaches (D1734).
+        if pushIndexMapNullNarrow(eiix, fnIx) { return true }
       }
     }
     if mrecv is Member {
@@ -12948,6 +12977,10 @@ export function setNarrowFromCondElse(condIx0: i32, fnIx: i32) {
       if eincn is BinExpr {
         if eincn.binOp == "==" {
           if pushIndexNicheNarrow(emnull, fnIx) { return true }
+          // The MAP cell in the else of `m["k"] == null` — the same non-null face the
+          // `!=` sense pushes in `setNarrowFromCond`, which is the arm `!(m[k] == null)`
+          // routes here to reach (D1734).
+          if pushIndexMapNullNarrow(emnull, fnIx) { return true }
         }
       }
     }

@@ -448,14 +448,24 @@ def p_array_element_place(t, face):
 
 @position("map_value_place", "the map binding")
 def p_map_value_place(t, face):
-    # The null guard is the position's, not the template's: a bare `m[k]` is `V | null` by
-    # construction, so an un-guarded TEST is graded against a type the template never
-    # described. `map_value` guards the same way before binding; this one never binds.
+    """The place read with no rebinding, guarded only when the TEST is not itself a null test.
+
+    A bare `m[k]` is `V | null` by construction, so an unguarded TEST is graded against a
+    type the template never described — `map_value` guards the same way before binding.
+    But a template whose TEST already IS `v != null` needs no second one: with the cell
+    narrowed by the guard the inner test is `i32 != null`, which the checker refuses, and
+    the position would score its own shape rather than the compiler's.
+    """
     if not t.test:
         return None, "the template declares no @@TEST@@/@@HIT@@/@@MISS@@"
     m = "const __m: { [string]: %s } = Map()" % t.ty if face == "ann" else "const __m = Map()"
-    guarded = ["if __m[\"k\"] != null {", ind(t.over("__m[\"k\"]"), 2), "}"]
-    return assemble(t, pre=[m], body=["__m[\"k\"] = %s" % t.value] + guarded)
+    proof = t.over("__m[\"k\"]")
+    body = ["__m[\"k\"] = %s" % t.value]
+    if re.search(r"\bnull\b", t.test):
+        body.append(proof)
+    else:
+        body += ["if __m[\"k\"] != null {", ind(proof, 2), "}"]
+    return assemble(t, pre=[m], body=body)
 
 
 @position("struct_field_place", "the destination struct binding")
