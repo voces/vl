@@ -519,6 +519,8 @@ import {
   cloSigTypeIdxAt,
   coalesceDefaultNullable,
   coalesceLitUnionFits,
+  coalesceNicheJoinsToBox,
+  coalesceResultUnionName,
   criFnIsAnonLambda,
   ctrlEnter,
   ctrlLeave,
@@ -809,6 +811,7 @@ import {
   unionArmTyOfAtom,
   unionArmVariantForObj,
   unionArmVariantForStructExpr,
+  unionArmVariantWithHeap,
   unionClosureArmName,
   unionClosureArmTy,
   unionEqArmSlot,
@@ -934,13 +937,27 @@ function mvScalarValKind(slot: i32): VKind | null {
   return null
 }
 
+// Every `VKind` the four scalar-list descriptors below do not name, as one answer: a
+// recorded failure plus the i32 list's own index, so the module stays well-formed while the
+// refusal is what a user reads. A SILENT i32 answer here emitted a `string[]` against the
+// i32 backing at `vl check` rc 0 (D1684).
+function scalarListKindUnlisted(fallback: i32): i32 {
+  emitFail(
+    "emitProgram: a list op has no rep for this element kind — i32, boolean, string, f64, i64, f32 and u8 elements are the ones it speaks",
+  )
+  fallback
+}
+
 // The wrapper struct heap type for a scalar element kind.
 function scalarListWrap(elemKind: VKind) {
   if elemKind == "u8list" { return bl8TypeIdx }
   if elemKind == "f64" { return fl64TypeIdx }
   if elemKind == "i64" { return il64TypeIdx }
   if elemKind == "f32" { return fl32TypeIdx }
-  lTypeIdx
+  // The string list's wrapper is the map's keys-list type, which any `string[]` shares.
+  if elemKind == "str" { return mkListIdx }
+  if elemKind == "i32" { return lTypeIdx }
+  scalarListKindUnlisted(lTypeIdx)
 }
 
 // The backing `(array (mut <elem>))` heap type for a scalar element kind.
@@ -949,28 +966,43 @@ function scalarListBack(elemKind: VKind) {
   if elemKind == "f64" { return fa64TypeIdx }
   if elemKind == "i64" { return ia64TypeIdx }
   if elemKind == "f32" { return fa32TypeIdx }
-  aTypeIdx
+  if elemKind == "str" { return mkArrIdx }
+  if elemKind == "i32" { return aTypeIdx }
+  scalarListKindUnlisted(aTypeIdx)
+}
+
+// Open the value-typed `if` a fused `?? d` list read joins on, at the element's own rep. A
+// string element is a REF, so it takes `fbIfRef` where every other kind takes a valtype
+// byte; one speller, so the two arms of the read cannot disagree about the join type.
+function fbIfForScalarListElem(elemKind: VKind) {
+  if elemKind == "str" { return fbIfRef(sTypeIdx) }
+  fbIf(scalarListBlocktype(elemKind))
 }
 
 // The `array.get` result blocktype byte for a scalar element kind (i32 `0x7f`, f64
-// `0x7c`, i64 `0x7e`) — the value-typed-`if` rep a fused `?? d` read joins on. A `u8[]`
-// element reads as i32 (`array.get_u` widens), so it shares the plain i32 blocktype.
+// `0x7c`, i64 `0x7e`). A `u8[]` element reads as i32 (`array.get_u` widens), so it shares
+// the plain i32 blocktype; a `string` element has no byte and goes through `fbIfRef`.
 function scalarListBlocktype(elemKind: VKind) {
   if elemKind == "u8list" { return 127 }
   if elemKind == "f64" { return 124 }
   if elemKind == "i64" { return 126 }
   if elemKind == "f32" { return 125 }
-  127
+  if elemKind == "i32" { return 127 }
+  scalarListKindUnlisted(127)
 }
 
 // Whether the module-global list types for a scalar element kind are collected — the
-// loud-fail guard every list op shares.
+// loud-fail guard every list op shares. An unlisted kind answers false, which is the
+// caller's own loud refusal rather than a silent read at the i32 list's types.
 function scalarListUsed(elemKind: VKind) {
   if elemKind == "u8list" { return ba8Used }
   if elemKind == "f64" { return fa64Used }
   if elemKind == "i64" { return ia64Used }
   if elemKind == "f32" { return fa32Used }
-  lUsed
+  // The string-ref list is minted for any `string[]` field and for the map's keys list.
+  if elemKind == "str" { return slUsed || mUsed }
+  if elemKind == "i32" { return lUsed }
+  false
 }
 
 // Emit `exprIx` coerced to a scalar element kind's value rep — the f64/i64 widen of a
@@ -16055,7 +16087,12 @@ function emitListGetOrGo(body: i32[], getIx: i32, defIx: i32, fnIx: i32) {
       }
       // The scalar element kind (i32 / f64 / i64) selects the list types + read rep — one
       // descriptor lookup instead of an `isF64 ? … : …` fork (so i64 is a descriptor arm).
-      const ek = scalarListElemKind(callee.memObj, fnIx)
+      let ek = scalarListElemKind(callee.memObj, fnIx)
+      // The string list, for `u8list`'s reason one rep over: its element is a REF, and
+      // `exprArray`'s typed-IR fast path claims ANY array, so the classifier answers "i32"
+      // for a `string[]` and this read would take the i32 backing (D1684). Asked here and
+      // not in the classifier, whose ten other callers each route a string list already.
+      if exprStringArray(callee.memObj, fnIx) { ek = "str" }
       if ek == null {
         return emitFail("emitProgram: .get receiver is not a scalar list")
       }
@@ -16070,17 +16107,20 @@ function emitListGetOrGo(body: i32[], getIx: i32, defIx: i32, fnIx: i32) {
       // cond: idx u< len  (one unsigned compare covers negative + past-len)
       if emitListGetIdx(body, c.callArgs[0], fnIx) < 0 { return -1 }
       if emitListGetRecv(body, callee.memObj, fnIx, lTy) < 0 { return -1 }
-      fbStructGet(lTy, 1)           // field 1: len
-      fbI32Bin(73)                  // 0x49 i32.lt_u
-      fbIf(scalarListBlocktype(ek)) // 0x04 if, the element's result blocktype
+      fbStructGet(lTy, 1)       // field 1: len
+      fbI32Bin(73)              // 0x49 i32.lt_u
+      fbIfForScalarListElem(ek) // 0x04 if, the element's own result rep
       ctrlEnter()
       if emitListGetRecv(body, callee.memObj, fnIx, lTy) < 0 { return -1 }
-      fbStructGet(lTy, 0)           // field 0: backing
+      fbStructGet(lTy, 0)       // field 0: backing
       if emitListGetIdx(body, c.callArgs[0], fnIx) < 0 { return -1 }
-      fbArrayGet(aTy)               // 0xfb 0x0b array.get — the element
-      fbElse()                      // 0x05 else
+      fbArrayGet(aTy)           // 0xfb 0x0b array.get — the element
+      // A string backing's element slot is `(ref null $str)` while the `if` joins on the
+      // non-null rep the consumer reads; an in-range element of a live list is never null.
+      if ek == "str" { fbRefAsNonNull() }
+      fbElse() // 0x05 else
       if emitScalarValue(body, defIx, fnIx, ek) < 0 { return -1 }
-      fbEnd()                       // 0x0b end
+      fbEnd()  // 0x0b end
       ctrlLeave()
       return 0
     }
@@ -21651,6 +21691,132 @@ function coalesceNulCollArmCtx(lhsIx: i32, wrapIx: i32, fnIx: i32): ExpCtx {
   return c
 }
 
+// The value-atom code a nullable-scalar-list `VKind` carries once it is non-null — the atom
+// twin of `nulScalarListWrapHeap`'s wrapper table, one code per backing.
+function nulScalarListAtomKind(kind: VKind): i32 {
+  if kind == "nulstrlist" { return 9 }
+  if kind == "nulf64list" { return 8 }
+  if kind == "nuli64list" { return 10 }
+  if kind == "nulf32list" { return 12 }
+  if kind == "nulu8list" { return 13 }
+  -1
+}
+
+// The value-atom code the nullable-ref niche at `lhsIx` carries once it is non-null, or -1 for
+// a niche whose atom is not a scalar-backed one (a struct, a variant, a ref-element array).
+// Read off the NICHE, since the value is still nullable and classifies as no atom at all.
+function coalNicheAtomKind(lhsIx: i32, fnIx: i32): i32 {
+  if exprNullableString(lhsIx, fnIx) { return 2 }
+  if exprNullableList(lhsIx, fnIx) { return 7 }
+  const nsk = exprNulScalarListKind(lhsIx, fnIx)
+  if nsk != null { return nulScalarListAtomKind(nsk) }
+  -1
+}
+
+// The element spelling a ref value-atom code names — `valueAtomKind`'s inverse over exactly
+// the codes a nullable-ref niche can carry, for the union-membership test below. The code is
+// an array atom unless it is 2 (`string`), so the caller derives the array flag from it.
+function refAtomElemName(k: i32): string {
+  if k == 2 { return "string" }
+  if k == 7 { return "i32" }
+  if k == 8 { return "f64" }
+  if k == 9 { return "string" }
+  if k == 10 { return "i64" }
+  if k == 12 { return "f32" }
+  if k == 13 { return "u8" }
+  ""
+}
+
+// The result union's box tag for the OPERAND's own non-null rep, or -1 when no arm of that
+// union carries it. A miss is a loud refusal at the caller and never a fall-through: a box
+// tagged with an atom the union does not have is valid wasm whose `is` test is silently false.
+function coalNicheBoxTag(
+  joinSet: string,
+  lhsIx: i32,
+  heapIx: i32,
+  fnIx: i32,
+): i32 {
+  if exprNullableRefArray(lhsIx, fnIx) {
+    const rs = refListSlotOfExpr(lhsIx, fnIx)
+    if rs < 0 { return -1 }
+    if !unionHasRefArrayArmSlot(joinSet, rs) { return -1 }
+    return refArrSlotTag(rs)
+  }
+  const ak = coalNicheAtomKind(lhsIx, fnIx)
+  if ak >= 0 {
+    const en = refAtomElemName(ak)
+    if en == "" { return -1 }
+    if !unionHasAtomTy(joinSet, en, ak != 2) { return -1 }
+    return scalarTagOfKind(ak)
+  }
+  const vi = unionArmVariantWithHeap(joinSet, heapIx)
+  if vi >= 0 && vi < uTags.length { return uTags[vi] }
+  -1
+}
+
+// Will the DEFAULT reach the box rep? A struct-typed value that is neither an object literal
+// nor a resolvable arm of `joinSet` passes RAW through the box coercion, and a bare
+// `(ref $struct)` under a box blocktype is invalid wasm. Only that shape can, so only it is
+// asked; every other default either boxes or takes its own loud reject (D1720).
+function coalJoinDefaultBoxes(joinSet: string, defIx: i32, fnIx: i32): boolean {
+  const d = P.nodes[unwrapParen(defIx)]
+  if d is ObjLit { return true }
+  if !exprStruct(defIx, fnIx) { return true }
+  if unionArmVariantForStructExpr(joinSet, defIx, fnIx) >= 0 { return true }
+  exprVariantIndex(defIx, fnIx) >= 0
+}
+
+// The boxed twin of the core below, for a default that JOINS rather than fits: the checker
+// typed this `??` as a union, so the result is the value box and the operand's raw ref cannot
+// leave a `br_on_non_null` block as itself. Stage it once in the `?.` receiver slot — the
+// branch that boxes it has to read it back, which `br_on_non_null` cannot do (D1714).
+function emitCoalesceNulRefJoin(
+  body: i32[],
+  e: BinExpr,
+  exprIx: i32,
+  heapIx: i32,
+  lhsCtx: ExpCtx,
+  fnIx: i32,
+) {
+  const joinN = coalesceResultUnionName(exprIx)
+  let joinSet = unionMemberSetOf(joinN)
+  if joinSet == "" { joinSet = joinN }
+  const tag = coalNicheBoxTag(joinSet, unwrapParen(e.binLeft), heapIx, fnIx)
+  if tag < 0 {
+    return emitFailAt(
+      "emitProgram: `??` joins a nullable value into a union with no arm for the value's own type",
+      exprIx,
+    )
+  }
+  if !coalJoinDefaultBoxes(joinSet, e.binRight, fnIx) {
+    return emitFailAt(
+      "emitProgram: `??` default names no arm of the union its result is",
+      exprIx,
+    )
+  }
+  if !fnUsesOptRecv {
+    return emitFailAt("emitProgram: `??` operand stash not reserved", exprIx)
+  }
+  if emitExprExpect(body, e.binLeft, fnIx, lhsCtx) < 0 {
+    return -1 // the nullable ref, evaluated ONCE
+  }
+  fbLocalTee(optRecvSlot)
+  wU8(209)         // 0xd1 ref.is_null
+  fbIfRef(uBoxIdx) // 0x04 if, (ref $uBox) blocktype — the result's rep
+  ctrlEnter()
+  // Through `emitUnionBoxArg`, not `emitUnionCoerce`: a struct default that is already a
+  // kind-8 VARIANT local is a raw `(ref $variant)`, which the coerce hands back unboxed, and
+  // the box blocktype then holds a bare struct. The box-typed destinations share this entry.
+  if emitUnionBoxArg(body, joinN, e.binRight, fnIx) < 0 { return -1 }
+  fbElse()             // 0x05 else — present → the staged ref, boxed under its own arm's tag
+  fbI32Const(tag)
+  fbLocalGet(optRecvSlot)
+  fbStructNew(uBoxIdx) // { tag, the niche's own ref }
+  fbEnd()              // 0x0b end
+  ctrlLeave()
+  0
+}
+
 // The `br_on_non_null` core every nullable-ref-niche `??` shares, with both contexts and the
 // block's null-ness spelled out by the caller. `heapIx` is the cell's own heap type,
 // `nulBlock` whether the result may still be null, `lhsCtx` the context the one lhs evaluation
@@ -21663,12 +21829,18 @@ function coalesceNulCollArmCtx(lhsIx: i32, wrapIx: i32, fnIx: i32): ExpCtx {
 function emitCoalesceNulRefCtx(
   body: i32[],
   e: BinExpr,
+  exprIx: i32,
   heapIx: i32,
   nulBlock: boolean,
   lhsCtx: ExpCtx,
   defCtx: ExpCtx,
   fnIx: i32,
 ) {
+  // A default of another type makes the result the union box, which this block type cannot be:
+  // `br_on_non_null` branches with the raw ref it tested, so the boxed shape is its own arm.
+  if coalesceNicheJoinsToBox(exprIx, fnIx) {
+    return emitCoalesceNulRefJoin(body, e, exprIx, heapIx, lhsCtx, fnIx)
+  }
   wU8(2) // 0x02 block
   if nulBlock {
     wU8(99) // blocktype: (ref null $heapIx) — the result stays nullable
@@ -21695,6 +21867,7 @@ function emitCoalesceNulRefCtx(
 function emitCoalesceNulRef(
   body: i32[],
   e: BinExpr,
+  exprIx: i32,
   heapIx: i32,
   defCtx: ExpCtx,
   fnIx: i32,
@@ -21702,6 +21875,7 @@ function emitCoalesceNulRef(
   emitCoalesceNulRefCtx(
     body,
     e,
+    exprIx,
     heapIx,
     coalesceDefaultNullable(e.binRight, fnIx),
     expCtxHere(),
@@ -21947,6 +22121,7 @@ function emitCoalesceGo(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
     return emitCoalesceNulRef(
       body,
       e,
+      exprIx,
       cnclw,
       coalesceNulCollArmCtx(e.binLeft, cnclw, fnIx),
       fnIx,
@@ -21968,6 +22143,7 @@ function emitCoalesceGo(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
     return emitCoalesceNulRefCtx(
       body,
       e,
+      exprIx,
       sTypeIdx,
       coNul,
       rawCtx,
@@ -22599,7 +22775,7 @@ function emitCoalesceGo(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
     if cvi >= 0 && cvi < uVarHeap.length {
       const vDefCtx = expCtxHere()
       vDefCtx.variantIdx = cvi
-      return emitCoalesceNulRef(body, e, uVarHeap[cvi], vDefCtx, fnIx)
+      return emitCoalesceNulRef(body, e, exprIx, uVarHeap[cvi], vDefCtx, fnIx)
     }
   }
   // Generic nullable-struct `??`: a `S | null` value (ident/param binding, struct field, or
@@ -22613,7 +22789,7 @@ function emitCoalesceGo(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
       // one-evaluation shape are the nullable-ref-niche lowering the collections share.
       const defCtx = expCtxHere()
       defCtx.structIdx = csi
-      return emitCoalesceNulRef(body, e, sHeapIdx[csi], defCtx, fnIx)
+      return emitCoalesceNulRef(body, e, exprIx, sHeapIdx[csi], defCtx, fnIx)
     }
   }
   // D960 — `??` over a nullable value-union box whose operand cannot be re-read. The
