@@ -2205,3 +2205,241 @@ Deno.test({
     }
   },
 });
+
+// D1646 — A COMMENT KEEPS ITS PLACE AMONG `match` ARMS.
+//
+// `matchExprFmt` builds its arm lines as a string and had no comment flush of its own, so a
+// comment written between two arms was still pending when the next arm rendered. A braced arm
+// swallowed it into its BODY (one indent too deep, with a blank line after); a braceless arm
+// has no body block to fall into, so it left the `match` altogether and landed after the
+// closing brace — a comment about one arm describing the statement after the construct.
+//
+// The flush is per arm, at the arm's own indent, and the arm's own TRAILING comment is taken
+// first: a trailing comment shares its arm's line, which is earlier than the next arm's, so an
+// unconsumed one would be re-emitted as that arm's own-line lead.
+Deno.test({
+  name: "vl-fmt: a comment between `match` arms keeps its place",
+  ignore: !ENABLED,
+  fn: async () => {
+    const src = [
+      "type A = { a: i32 }",
+      "type B = { b: i32 }",
+      "type N = A | B",
+      "",
+      "function braced(n: N): i32 {",
+      "  match n {",
+      "    // above the first arm",
+      "    A => {",
+      "      return n.a",
+      "    }",
+      "    // between two braced arms",
+      "    B => {",
+      "      return n.b",
+      "    }",
+      "  }",
+      "}",
+      "function braceless(n: N): i32 {",
+      "  match n {",
+      "    A => 1 // trailing, on the arm's own line",
+      "    // between two braceless arms",
+      "    B => 2",
+      "    // after the last arm",
+      "  }",
+      "}",
+      "print(braced({ a: 10 }) + braceless({ b: 0 }))",
+      "",
+    ].join("\n");
+    const r = await run([], src);
+    if (r.code !== 0) {
+      throw new Error(`vl fmt rejected valid source (rc ${r.code}):\n${r.err}`);
+    }
+    if (r.out !== src) {
+      throw new Error(`a comment moved (or the source was reflowed):\n${r.out}`);
+    }
+    const again = await run([], r.out);
+    if (again.code !== 0 || again.out !== r.out) {
+      throw new Error(`not idempotent (rc ${again.code}):\n${again.out}`);
+    }
+    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_match_cmt_" });
+    const file = `${dir}/main.vl`;
+    await Deno.writeTextFile(file, r.out);
+    const ran = await runOn("run", file);
+    if (ran.code !== 0 || ran.out !== "12\n") {
+      throw new Error(
+        `formatted output did not run (rc ${ran.code}): ${JSON.stringify(ran.out)}\n${ran.err}`,
+      );
+    }
+  },
+});
+
+// D1647 — AN EMPTY `match` ARM BODY IS `{}`, like every other empty block in the language.
+//
+// `blockExpr` renders a block by emitting its statements into a swapped buffer and wrapping
+// the result in braces; with no statements the (empty) body still took a line of its own, so
+// an empty arm printed as three lines with a blank inside. Every other empty block —
+// `function f() {}`, `if c {}`, `if c {} else {}`, `while c {}`, `for v in xs {}` — reaches
+// `inlineBlockBody`, which answers `{}`.
+//
+// The collapse is the EMPTY case only. An arm whose body is a one-line non-empty block
+// (`A => { return n.a }`) still expands: that is the ordinary block rule, not this one, and
+// the control below pins it so a future widening has to be deliberate.
+Deno.test({
+  name: "vl-fmt: an empty `match` arm body prints as `{}`",
+  ignore: !ENABLED,
+  fn: async () => {
+    const src = [
+      "type A = { a: i32 }",
+      "type B = { b: i32 }",
+      "type C = { c: i32 }",
+      "type N = A | B | C",
+      "",
+      "function pick(n: N, cond: boolean): i32 {",
+      "  if cond {}",
+      "  if cond {} else {}",
+      "  while cond {}",
+      "  match n {",
+      "    A => {",
+      "      return n.a",
+      "    }",
+      "    B => {}",
+      "    _ => {}",
+      "  }",
+      "  0",
+      "}",
+      "function emptyFn() {}",
+      "print(pick({ a: 1 }, false))",
+      "",
+    ].join("\n");
+    const r = await run([], src);
+    if (r.code !== 0) {
+      throw new Error(`vl fmt rejected valid source (rc ${r.code}):\n${r.err}`);
+    }
+    if (r.out !== src) {
+      throw new Error(`an empty body was expanded (or the source reflowed):\n${r.out}`);
+    }
+    const again = await run([], r.out);
+    if (again.code !== 0 || again.out !== r.out) {
+      throw new Error(`not idempotent (rc ${again.code}):\n${again.out}`);
+    }
+    // The control: a one-line NON-empty arm body still expands. It is the ordinary block
+    // rule, and collapsing it is not this fix's business.
+    const nonEmpty = [
+      "type A = { a: i32 }",
+      "type B = { b: i32 }",
+      "type N = A | B",
+      "",
+      "function pick(n: N): i32 {",
+      "  match n {",
+      "    A => { return n.a }",
+      "    B => { return n.b }",
+      "  }",
+      "}",
+      "print(pick({ a: 1 }))",
+      "",
+    ].join("\n");
+    const c = await run([], nonEmpty);
+    if (c.code !== 0) throw new Error(`vl fmt rejected the control (rc ${c.code}):\n${c.err}`);
+    if (c.out.includes("A => { return n.a }")) {
+      throw new Error(`a one-line NON-empty arm body collapsed:\n${c.out}`);
+    }
+  },
+});
+
+// D1646, THIRD ITEM — A COMMENT IS NEVER RELOCATED ACROSS A CLAUSE BOUNDARY.
+//
+// The same defect as the `match` arms, in the `if` chain: a comment written between
+// `if a { … }` and `else if b { … }` migrated into the `else if` body, one indent too deep
+// with a blank line after. The row that filed the `match` defect listed this spelling as a
+// CONTROL that stays put; running it verbatim refuted that.
+//
+// The ruling (coordinator, 2026-09-05): a formatter never relocates a comment across a
+// structural boundary, so the comment is hosted where it was written and the canonical fused
+// `} else if` SPLITS — `}`, the comment lines, then the clause — but only when a comment sits
+// there. Every chain without one keeps the fusion, which the last two cases pin.
+Deno.test({
+  name: "vl-fmt: a comment between `if` clauses is hosted where it was written",
+  ignore: !ENABLED,
+  fn: async () => {
+    const kept = [
+      // between `if` and `else if`
+      [
+        "function p(a: boolean, b: boolean): i32 {",
+        "  if a {",
+        "    return 1",
+        "  }",
+        "  // between `if` and `else if`",
+        "  else if b {",
+        "    return 2",
+        "  }",
+        "  return 3",
+        "}",
+        "print(p(false, true))",
+        "",
+      ].join("\n"),
+      // between `else if` and `else`
+      [
+        "function p(a: boolean, b: boolean): i32 {",
+        "  if a {",
+        "    return 1",
+        "  } else if b {",
+        "    return 2",
+        "  }",
+        "  // between `else if` and `else`",
+        "  // and a second comment line",
+        "  else {",
+        "    return 3",
+        "  }",
+        "}",
+        "print(p(false, false))",
+        "",
+      ].join("\n"),
+    ];
+    for (const src of kept) {
+      const r = await run([], src);
+      if (r.code !== 0) {
+        throw new Error(`vl fmt rejected valid source (rc ${r.code}):\n${r.err}`);
+      }
+      if (r.out !== src) {
+        throw new Error(`the comment moved (or the source was reflowed):\n${r.out}`);
+      }
+      const again = await run([], r.out);
+      if (again.code !== 0 || again.out !== r.out) {
+        throw new Error(`not idempotent (rc ${again.code}):\n${again.out}`);
+      }
+      const dir = await Deno.makeTempDir({ prefix: "vl_fmt_chain_cmt_" });
+      const file = `${dir}/main.vl`;
+      await Deno.writeTextFile(file, r.out);
+      const ran = await runOn("run", file);
+      if (ran.code !== 0) {
+        throw new Error(`formatted output did not run (rc ${ran.code}):\n${ran.err}`);
+      }
+    }
+    // THE FUSION IS KEPT with no comment there — the split is comment-driven, not a new
+    // layout. A chain whose bodies are too long for the per-clause one-line collapse takes
+    // the block layout, which is where the fused `} else if` lives.
+    const fused = [
+      "function p(a: boolean, b: boolean): i32 {",
+      "  if a {",
+      "    const x = 1",
+      "    return x",
+      "  } else if b {",
+      "    const y = 2",
+      "    return y",
+      "  } else {",
+      "    const z = 3",
+      "    return z",
+      "  }",
+      "}",
+      "print(p(false, false))",
+      "",
+    ].join("\n");
+    const f = await run([], fused);
+    if (f.code !== 0) throw new Error(`vl fmt rejected the control (rc ${f.code}):\n${f.err}`);
+    if (f.out !== fused) {
+      throw new Error(`the fused chain was split with no comment to host:\n${f.out}`);
+    }
+    if (!f.out.includes("} else if b {") || !f.out.includes("} else {")) {
+      throw new Error(`the fusion was lost:\n${f.out}`);
+    }
+  },
+});
