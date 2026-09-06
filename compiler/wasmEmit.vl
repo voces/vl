@@ -227,6 +227,7 @@ import {
   fnUsesMapFilter,
   fnUsesMapKeys,
   fnUsesMapVals,
+  fnUsesOptRecv,
   fnUsesStrOp,
   fnUsesUnionLetSink,
   fnUsesUnionSink,
@@ -298,6 +299,9 @@ import {
   numCastF32Slot,
   numCastF64Slot,
   numCastI64Slot,
+  optRecvSlot,
+  optRecvStagedIx,
+  optRecvStagedSet,
   pendingF32,
   pendingF64,
   pendingI64,
@@ -713,6 +717,8 @@ import {
   nulVariantIndexOf,
   objOrderStashSlot,
   objVariantName,
+  optChainBaseOf,
+  optChainStagesRecv,
   optChainStructIdxOf,
   paramStructIdxOf,
   pendingLitUnion,
@@ -2136,7 +2142,12 @@ function emitNulIsNullTest(
   if !nicheOnly {
     const ncN = P.nodes[unwrapParen(refIx)]
     if ncN is OptMember {
+      const ncPrev = optRecvStagedIx
+      const ncPrevSet = optRecvStagedSet
+      optRecvStageMark(refIx)
       if emitOptChainIsNull(body, refIx, fnIx) < 0 { return -1 }
+      optRecvStagedIx = ncPrev
+      optRecvStagedSet = ncPrevSet
       if invert { fbI32Eqz() }
       return 1
     }
@@ -2669,6 +2680,9 @@ function emitIs(body: i32[], isIx: i32, fnIx: i32) {
           const oisFi = sFieldIndex(oisSi, vrecv.omProp)
           if oisFi >= 0 {
             if sFieldTypeAt(oisSi, oisFi) == 16 {
+              const oisPrev = optRecvStagedIx
+              const oisPrevSet = optRecvStagedSet
+              optRecvStageMark(vrecv.omObj)
               if emitOptChainIsNull(body, vrecv.omObj, fnIx) < 0 { return -1 }
               fbIf(127)
               ctrlEnter()
@@ -2681,6 +2695,8 @@ function emitIs(body: i32[], isIx: i32, fnIx: i32) {
               fbI32Bin(70)
               fbEnd()
               ctrlLeave()
+              optRecvStagedIx = oisPrev
+              optRecvStagedSet = oisPrevSet
               return 0
             }
           }
@@ -2902,16 +2918,50 @@ function emitNarrowedMem(body: i32[], memIx: i32, fnIx: i32) {
   emitFail("emitProgram: expected a field access")
 }
 
-// True if `exprIx` is a re-readable place — a bare name, or a `.`/`?.` chain bottoming out
-// in a name. Such a receiver is an effect-free `local.get`/`struct.get` sequence, so
-// `recv?.f ?? d` may read it twice without duplicating side effects.
-function optRecvReReadable(exprIx: i32) {
-  const e = P.nodes[unwrapParen(exprIx)]
-  if e is Ident { return true }
-  if e is Member { return optRecvReReadable(e.memObj) }
+// Is the `?.` chain base at `exprIx` the one currently staged in `optRecvSlot`?
+function optRecvStagedAt(exprIx: i32): boolean {
+  if optRecvStagedIx < 0 { return false }
+  optRecvStagedIx == unwrapParen(exprIx)
+}
 
-  if e is OptMember { return optRecvReReadable(e.omObj) }
-  false
+// Mark the base of the `?.` chain at `exprIx` for staging, when it is not a re-readable
+// place. Writes no bytes: the first `emitOptRecvBase` tees the value in, so an arm that
+// never re-reads the receiver — the fused map and `.get` forms — pays nothing.
+function optRecvStageMark(exprIx: i32) {
+  if !optChainStagesRecv(exprIx) { return 0 }
+  const base = optChainBaseOf(exprIx)
+  if base < 0 { return 0 }
+  optRecvStagedIx = base
+  optRecvStagedSet = false
+  0
+}
+
+// Push the `?.` chain base at `exprIx`: the stash when this chain stages it — teed in on the
+// first read, which every arm emits unconditionally before the branch that reads it again —
+// else the expression itself, byte for byte what an un-staged chain has always emitted.
+// `asRef` casts the stash back to the base's own struct row; `ref.is_null` needs no cast.
+function emitOptRecvBase(body: i32[], exprIx: i32, fnIx: i32, asRef: boolean) {
+  if !optRecvStagedAt(exprIx) { return emitExpr(body, exprIx, fnIx) }
+  if optRecvStagedSet {
+    fbLocalGet(optRecvSlot)
+  } else {
+    if !fnUsesOptRecv {
+      return emitFailAt("emitProgram: `?.` receiver stash not reserved", exprIx)
+    }
+    if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
+    fbLocalTee(optRecvSlot)
+    optRecvStagedSet = true
+  }
+  if !asRef { return 0 }
+  const sri = structIndexOfExpr(exprIx, fnIx)
+  if sri < 0 {
+    return emitFailAt(
+      "emitProgram: a staged `?.` receiver names no struct row",
+      exprIx,
+    )
+  }
+  fbRefCast(sHeapIdx[sri])
+  0
 }
 
 // Push 1 if the optional-chain value at `exprIx` is null — any null link folds `null`
@@ -2952,7 +3002,7 @@ function emitOptChainIsNull(body: i32[], exprIx: i32, fnIx: i32) {
     ctrlLeave()
     return 0
   }
-  if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
+  if emitOptRecvBase(body, exprIx, fnIx, false) < 0 { return -1 }
   wU8(209)
   0
 }
@@ -2977,6 +3027,11 @@ function emitOptChainValue(body: i32[], exprIx: i32, fnIx: i32) {
     fbRefAsNonNull()
     return 0
   }
+  // The cast off the stash already recovers a non-null ref; the in-place spelling recovers
+  // its own niche.
+  if optRecvStagedAt(exprIx) {
+    return emitOptRecvBase(body, exprIx, fnIx, true)
+  }
   if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
   if exprNullableRefNiche(exprIx, fnIx) { fbRefAsNonNull() }
   0
@@ -2987,14 +3042,20 @@ function emitOptChainValue(body: i32[], exprIx: i32, fnIx: i32) {
 // `F | null`. The shape is the fused `?? d` two-arm select with the default replaced by the
 // null of the result's own rep, so the arms below dispatch on rep (`repOfNode`), not field.
 function emitOptMemberValue(body: i32[], exprIx: i32, fnIx: i32) {
+  const omPrev = optRecvStagedIx
+  const omPrevSet = optRecvStagedSet
+  optRecvStageMark(exprIx)
+  const omR = emitOptMemberValueGo(body, exprIx, fnIx)
+  optRecvStagedIx = omPrev
+  optRecvStagedSet = omPrevSet
+  omR
+}
+
+// The standalone `?.` arms themselves, with the chain's base already staged when it needed
+// staging, so every arm below may read the receiver as often as its rep requires.
+function emitOptMemberValueGo(body: i32[], exprIx: i32, fnIx: i32) {
   const e = P.nodes[unwrapParen(exprIx)]
   if e is OptMember {
-    if !optRecvReReadable(e.omObj) {
-      return emitFailAt(
-        "emitProgram: `?.` needs a re-readable receiver (a name, or a field chain of names)",
-        exprIx,
-      )
-    }
     const osi = optChainStructIdxOf(e.omObj, fnIx)
     if osi < 0 {
       return emitFailAt(
@@ -21500,7 +21561,20 @@ function emitCoalesceNulRef(
   )
 }
 
+// `l ?? d`, with a `?.` chain on the left staged for the whole lowering when its base is not
+// a re-readable place — the fused arms read the receiver two and three times, and the stash
+// is what lets them do that to a call. One save/restore, since a default may hold a chain.
 function emitCoalesce(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
+  const coPrev = optRecvStagedIx
+  const coPrevSet = optRecvStagedSet
+  optRecvStageMark(e.binLeft)
+  const coR = emitCoalesceGo(body, e, exprIx, fnIx)
+  optRecvStagedIx = coPrev
+  optRecvStagedSet = coPrevSet
+  coR
+}
+
+function emitCoalesceGo(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
   // Unwrap a parenthesized lhs so `(m[k]) ?? d` / `(m.get(k)) ?? d` take the same fused
   // map-get path as the bare forms — parens must not change `??` semantics. `lhsIx` is the
   // unwrapped place every structural branch below dispatches on; the generic niche paths
@@ -22130,83 +22204,81 @@ function emitCoalesce(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
     }
     // `p?.f ?? d` over a nullable-struct receiver (`p: S | null`, or a nullable-struct field
     // read `n.next`): null selects the default, else the field read off the (non-null) struct.
-    // The receiver is a re-readable place (a name, or an effect-free member chain), re-read in
-    // the non-null branch. Scalar fields only (the value-typed `if` blocktype carries them).
-    if optRecvReReadable(lhs.omObj) {
-      if exprNullableStruct(lhs.omObj, fnIx) {
-        const nsi = structIndexOfExpr(lhs.omObj, fnIx)
-        if nsi >= 0 {
-          const nfi = sFieldIndex(nsi, lhs.omProp)
-          if nfi < 0 {
-            return emitFail("emitProgram: `?.` field is not on the struct")
-          }
-          // The blocktype is the whole restriction, and it is not one rep wide. Both arms of
-          // this `if` yield the field's rep, so it needs a blocktype spelling it —
-          // `fbIfForSharedField` already owns this over the same `sFieldTypeAt` codes for the
-          // shared-union-field dispatch. Hard-coding `fbIf(127)` refused `f64`/`i64`/`f32`/`string` fields here while the narrowed spelling ran fine at every one of them.
-          const nfCode = sFieldTypeAt(nsi, nfi)
-          // A nested-struct field (code 15) spells its `if` result from the field's own target
-          // row, which `fbIfForSharedField` cannot give from a code alone. Two null tests, not
-          // one: a code-15 slot is `(ref null $S)` at both declarations (D1180), and `o?.f ??
-          // d` must yield `d` when the field is null too — receiver-null or field-null, short-circuited through one i32 `if` so `struct.get` never runs on a null receiver.
-          if nfCode == 15 {
-            const ntg = sFieldTgtStructIdx(nsi, nfi)
-            if ntg < 0 {
-              return emitFail(
-                "emitProgram: `?.` over a nested-struct field names no struct row",
-              )
-            }
-            const nDefNul = coalesceDefaultNullable(e.binRight, fnIx)
-            if emitExpr(body, lhs.omObj, fnIx) < 0 { return -1 }
-            wU8(209) // 0xd1 ref.is_null — the receiver
-            fbIf(127)
-            ctrlEnter()
-            fbI32Const(1)
-            fbElse()
-            if emitExpr(body, lhs.omObj, fnIx) < 0 { return -1 }
-            fbStructGet(sHeapIdx[nsi], nfi)
-            wU8(209) // 0xd1 ref.is_null — the field slot
-            fbEnd()
-            ctrlLeave()
-            fbIfRefNul(sHeapIdx[ntg], nDefNul)
-            ctrlEnter()
-            if emitExpr(body, e.binRight, fnIx) < 0 { return -1 }
-            fbElse()
-            if emitExpr(body, lhs.omObj, fnIx) < 0 { return -1 }
-            fbStructGet(sHeapIdx[nsi], nfi)
-            if !nDefNul { fbRefAsNonNull() }
-            fbEnd()
-            ctrlLeave()
-            return 0
-          }
-          if !optChainFieldCodeOk(nfCode) {
+    // The receiver is read two or three times here, from `optRecvSlot` when it is a call and
+    // in place when it is a name. Scalar fields only (the value-typed `if` blocktype).
+    if exprNullableStruct(lhs.omObj, fnIx) {
+      const nsi = structIndexOfExpr(lhs.omObj, fnIx)
+      if nsi >= 0 {
+        const nfi = sFieldIndex(nsi, lhs.omProp)
+        if nfi < 0 {
+          return emitFail("emitProgram: `?.` field is not on the struct")
+        }
+        // The blocktype is the whole restriction, and it is not one rep wide. Both arms of
+        // this `if` yield the field's rep, so it needs a blocktype spelling it —
+        // `fbIfForSharedField` already owns this over the same `sFieldTypeAt` codes for the
+        // shared-union-field dispatch. Hard-coding `fbIf(127)` refused `f64`/`i64`/`f32`/`string` fields here while the narrowed spelling ran fine at every one of them.
+        const nfCode = sFieldTypeAt(nsi, nfi)
+        // A nested-struct field (code 15) spells its `if` result from the field's own target
+        // row, which `fbIfForSharedField` cannot give from a code alone. Two null tests, not
+        // one: a code-15 slot is `(ref null $S)` at both declarations (D1180), and `o?.f ??
+        // d` must yield `d` when the field is null too — receiver-null or field-null, short-circuited through one i32 `if` so `struct.get` never runs on a null receiver.
+        if nfCode == 15 {
+          const ntg = sFieldTgtStructIdx(nsi, nfi)
+          if ntg < 0 {
             return emitFail(
-              "emitProgram: `?.` over a nullable struct has no `if` blocktype for this field's rep",
+              "emitProgram: `?.` over a nested-struct field names no struct row",
             )
           }
-          if emitExpr(body, lhs.omObj, fnIx) < 0 { return -1 }
-          wU8(209) // 0xd1 ref.is_null
-          fbIfForSharedField(nfCode) // if (result <the field's own rep>)
+          const nDefNul = coalesceDefaultNullable(e.binRight, fnIx)
+          if emitOptRecvBase(body, lhs.omObj, fnIx, false) < 0 { return -1 }
+          wU8(209) // 0xd1 ref.is_null — the receiver
+          fbIf(127)
           ctrlEnter()
-          if (
-            emitOptChainDefault(
-              body,
-              e.binRight,
-              nfCode,
-              sFieldElemNameAt(nsi, nfi),
-              fnIx,
-            ) <
-            0
-          ) {
-            return -1
-          }
-          fbElse() // 0x05 else — present → the field
-          if emitExpr(body, lhs.omObj, fnIx) < 0 { return -1 }
+          fbI32Const(1)
+          fbElse()
+          if emitOptRecvBase(body, lhs.omObj, fnIx, true) < 0 { return -1 }
           fbStructGet(sHeapIdx[nsi], nfi)
-          fbEnd()  // 0x0b end
+          wU8(209) // 0xd1 ref.is_null — the field slot
+          fbEnd()
+          ctrlLeave()
+          fbIfRefNul(sHeapIdx[ntg], nDefNul)
+          ctrlEnter()
+          if emitExpr(body, e.binRight, fnIx) < 0 { return -1 }
+          fbElse()
+          if emitOptRecvBase(body, lhs.omObj, fnIx, true) < 0 { return -1 }
+          fbStructGet(sHeapIdx[nsi], nfi)
+          if !nDefNul { fbRefAsNonNull() }
+          fbEnd()
           ctrlLeave()
           return 0
         }
+        if !optChainFieldCodeOk(nfCode) {
+          return emitFail(
+            "emitProgram: `?.` over a nullable struct has no `if` blocktype for this field's rep",
+          )
+        }
+        if emitOptRecvBase(body, lhs.omObj, fnIx, false) < 0 { return -1 }
+        wU8(209) // 0xd1 ref.is_null
+        fbIfForSharedField(nfCode) // if (result <the field's own rep>)
+        ctrlEnter()
+        if (
+          emitOptChainDefault(
+            body,
+            e.binRight,
+            nfCode,
+            sFieldElemNameAt(nsi, nfi),
+            fnIx,
+          ) <
+          0
+        ) {
+          return -1
+        }
+        fbElse() // 0x05 else — present → the field
+        if emitOptRecvBase(body, lhs.omObj, fnIx, true) < 0 { return -1 }
+        fbStructGet(sHeapIdx[nsi], nfi)
+        fbEnd()  // 0x0b end
+        ctrlLeave()
+        return 0
       }
     }
     // A nested optional chain `o?.inner?.v ?? d` (niche nullable links): any null link selects
