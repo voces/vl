@@ -156,6 +156,41 @@ const genPins = (n: number, many: boolean): string => {
   return o.join("\n") + "\n";
 };
 
+// COVARIANT BINDINGS: N delivery functions either way, `cov` of them binding a covariant
+// list handle (`const b: Shape[] = a`) and the rest binding the same list at its own type.
+// The alias-closure answer is memoised per (root name, frame), so only the covariant ones
+// are a query, and the index behind them is what keeps a query off the whole arena (D1657).
+const genCovar = (n: number, cov: number): string => {
+  const o: string[] = [
+    "type Circle = { r: i32 }",
+    "type Sq = { s: i32 }",
+    "type Shape = Circle | Sq",
+    "type Box = { xs: Shape[] }",
+    "type CBox = { xs: Circle[] }",
+    // the unrelated write that makes the analysis run at all (`cwProgramHasWrite`)
+    "function other() {",
+    "  const w: Shape[] = []",
+    "  w.push({ s: 3 })",
+    "  print(w.length)",
+    "}",
+  ];
+  for (let i = 0; i < n; i++) {
+    const wide = i < cov;
+    o.push(
+      `function d${i}() {`,
+      `  const a${i}: Circle[] = [{ r: 7 }]`,
+      `  const b${i}: ${wide ? "Shape" : "Circle"}[] = a${i}`,
+      `  const s${i}: ${wide ? "Box" : "CBox"} = { xs: b${i} }`,
+      `  print(s${i}.xs.length)`,
+      "}",
+    );
+  }
+  o.push("let acc = 0");
+  for (let i = 0; i < n; i++) fill(o, i, 6);
+  o.push("print(acc)");
+  return o.join("\n") + "\n";
+};
+
 // MODULES: `mods` files of `per` functions each, every function `body` statements long,
 // all of them imported and called by one main. Holding `mods * per` fixed makes the two
 // arms the same program cut into a different number of files — they emit the same bytes.
@@ -410,6 +445,19 @@ axis(
 // bar STAYS at the family default rather than tracking a number the harness cannot measure.
 axis("generic pins", 2.5, "`monoRebuild` re-runs a whole-program pass per minted instance.", (d) =>
   twoFiles(d, genPins(400, true), genPins(400, false)));
+
+// 0.78 / 0.91 / 0.86, against 36.51 / 2.82 / 12.95 on the pre-D1657 compiler — the axis the
+// family was blind to. Each covariant binding is one `covarValueWriteState` query, and every
+// query walked the whole arena a dozen times over. Both arms declare the same functions and
+// lower the same statements; only how many of them WIDEN differs, so the query count is the
+// only thing that moves. The many arm is the CHEAPER one here (the widened cells emit less),
+// which is why the bar is the family default rather than something above a measurement.
+axis(
+  "covariant bindings",
+  2.5,
+  "The `cw*` alias closure is being re-derived per covariant binding rather than read off `cwIxBuild`'s index (D1628/D1657).",
+  (d) => twoFiles(d, genCovar(1400, 1400), genCovar(1400, 70)),
+);
 
 // ── the one RUNTIME axis ─────────────────────────────────────────────────────
 // Every pair above grades COMPILE time, because every cost above is the compiler's. String
