@@ -14769,12 +14769,49 @@ function cwFnDeclOf(fnName: string): i32 {
   cwIxFnDecl[sid]
 }
 
-// The parameter name at position `argIx` of the top-level function `fnName`, or "" when the
-// callee names no declared function or the position is past its parameter list. "" is a
-// decline, not "no parameter" — the caller turns it into the `2` answer.
-function cwParamName(fnName: string, argIx: i32): string {
-  const dIx = cwFnDeclOf(fnName)
-  if dIx < 0 { return "" }
+// The lambda `nm` is bound to in frame `fr`, or -1. The binding must be bound exactly once
+// and never re-pointed there, so one parameter list answers for every call through the name;
+// a binding initialised with anything else — a function-typed parameter, a call result — has
+// no parameter list in the arena and declines. D1683.
+function cwLambdaDeclOf(nm: string, fr: i32): i32 {
+  if nm == "" { return -1 }
+  cwIxBuild()
+  if !cwBoundOnce(nm, fr) { return -1 }
+  let r = cwIxChain(nm)
+  while r >= 0 {
+    if cwIxKind[r] == CW_OCC_BIND {
+      if cwSameFrame(cwIxFr[r], fr) {
+        const b = P.nodes[cwIxNode[r]]
+        if b is LetDecl {
+          const init = cwPeel(b.letInit)
+          if init >= 0 && init < P.nodes.length {
+            const f = P.nodes[init]
+            if f is FuncDecl { return init }
+          }
+        }
+      }
+    }
+    r = cwIxNext[r]
+  }
+  -1
+}
+
+// The `FuncDecl` a callee EXPRESSION resolves to: the declared function its name binds, or
+// the lambda a `const` in scope binds. A function VALUE's parameter list is in the arena
+// either way; the name-keyed index holds only declared functions. -1 for a callee this
+// cannot place, which is the decline the callers turn into the `2` answer. D1683.
+function cwCalleeDeclOf(callFnIx: i32): i32 {
+  const nm = covarRootName(callFnIx)
+  if nm == "" { return -1 }
+  const d = cwFnDeclOf(nm)
+  if d >= 0 { return d }
+  cwLambdaDeclOf(nm, covarRootFrame(callFnIx))
+}
+
+// The parameter name at position `argIx` of the `FuncDecl` `dIx`, or "" past its parameter
+// list. "" is a decline, not "no parameter" — the caller turns it into the `2` answer.
+function cwParamNameOfDecl(dIx: i32, argIx: i32): string {
+  if dIx < 0 || dIx >= P.nodes.length { return "" }
   const d = P.nodes[dIx]
   if d is FuncDecl {
     if argIx < d.fnParams.length {
@@ -14785,11 +14822,24 @@ function cwParamName(fnName: string, argIx: i32): string {
   ""
 }
 
+// The parameter a callee EXPRESSION delivers position `argIx` to — the spelling that reaches
+// a declared function and a function value alike.
+function cwParamNameAt(callFnIx: i32, argIx: i32): string {
+  cwParamNameOfDecl(cwCalleeDeclOf(callFnIx), argIx)
+}
+
 // The `FuncDecl` node of the top-level function `fnName`, or `CW_FR_UNKNOWN`. A parameter
 // declares into the frame its own function opens, so this is the frame the argument edge
 // binds the parameter in.
 function cwParamFrame(fnName: string): i32 {
   const dIx = cwFnDeclOf(fnName)
+  if dIx < 0 { return CW_FR_UNKNOWN }
+  dIx
+}
+
+// The same, for a callee EXPRESSION — a lambda opens a frame like any other `FuncDecl`.
+function cwParamFrameAt(callFnIx: i32): i32 {
+  const dIx = cwCalleeDeclOf(callFnIx)
   if dIx < 0 { return CW_FR_UNKNOWN }
   dIx
 }
@@ -14806,8 +14856,8 @@ function cwCallNamed(names: string[]): boolean {
 }
 
 // The parameter an expression consumed as a call ARGUMENT is delivered to, or "" where the
-// consuming call names no declared function this can read a parameter list off. The closure's
-// edge and the claim's own test read this one resolver, so neither can outrun the other. D1658.
+// consuming call names no callee this can read a parameter list off. The closure's edge and
+// the claim's own test read this one resolver, so neither can outrun the other. D1658.
 function cwArgParamName(x: i32): string {
   if x < 0 || x >= cwIxUpKind.length { return "" }
   if cwIxUpKind[x] != CW_UP_ARG { return "" }
@@ -14816,7 +14866,7 @@ function cwArgParamName(x: i32): string {
   const n = P.nodes[up]
   if n is Call {
     if cwCallNamed(n.callArgNames) { return "" }
-    return cwParamName(covarRootName(n.callFn), cwIxUpAux[x])
+    return cwParamNameAt(n.callFn, cwIxUpAux[x])
   }
   ""
 }
@@ -14827,13 +14877,48 @@ function cwArgParamFrame(x: i32): i32 {
   const up = cwIxUp[x]
   if up < 0 || up >= P.nodes.length { return CW_FR_UNKNOWN }
   const n = P.nodes[up]
-  if n is Call { return cwParamFrame(covarRootName(n.callFn)) }
+  if n is Call { return cwParamFrameAt(n.callFn) }
   CW_FR_UNKNOWN
 }
 
 // The `flds` entry an ARRAY or MAP escape records. No field name can spell it, so a
 // `Member` read never collides with the `Index` read it stands for.
 const CW_ELEM_FLD = "[]"
+
+// —— the escape key: a container name plus the path inside it (D1628, deepened by D1682) ——
+// Join two path segments. The one spelling rule the key has, so the side that FILES a key and
+// the side that recognises a handle cannot disagree about how a nested one is written.
+function cwJoinPath(a: string, b: string): string {
+  if a == "" { return b }
+  if b == "" { return a }
+  a + "." + b
+}
+
+// The identifier a projection chain bottoms out at, or -1 where it bottoms out at anything
+// else — a call result, a literal — which names no container.
+function cwProjRootNode(ix: i32): i32 {
+  const p = cwPeel(ix)
+  if p < 0 || p >= P.nodes.length { return -1 }
+  const n = P.nodes[p]
+  if n is Ident { return p }
+  if n is Member { return cwProjRootNode(n.memObj) }
+  if n is OptMember { return cwProjRootNode(n.omObj) }
+  if n is Index { return cwProjRootNode(n.idxArr) }
+  -1
+}
+
+// The dotted path from that root to `ix`: `"xs"` for `sf.xs`, `"inn.xs"` for `o.inn.xs`,
+// `CW_ELEM_FLD` for an index, `""` for the root name itself. An index position is not read,
+// so one recorded element makes every element a handle — the safe direction.
+function cwProjPath(ix: i32): string {
+  const p = cwPeel(ix)
+  if p < 0 || p >= P.nodes.length { return "" }
+  const n = P.nodes[p]
+  if n is Member { return cwJoinPath(cwProjPath(n.memObj), n.memProp) }
+  if n is OptMember { return cwJoinPath(cwProjPath(n.omObj), n.omProp) }
+  if n is Index { return cwJoinPath(cwProjPath(n.idxArr), CW_ELEM_FLD) }
+  ""
+}
 
 // —— naming the container a store delivers into (D1628) ——
 // The container expression a peeled store destination projects out of — `w` in `w.f`, `xs`
@@ -14848,28 +14933,24 @@ function cwEscapeObj(dst: i32): i32 {
 // name at the root, or a name re-bound in its frame, which would name two containers rather
 // than one. Nothing is then recorded and nothing is claimed.
 function cwEscapeOwner(dst: i32): string {
-  const obj = cwEscapeObj(dst)
-  if obj < 0 { return "" }
-  const onm = covarRootName(obj)
+  const rt = cwProjRootNode(cwEscapeObj(dst))
+  if rt < 0 { return "" }
+  const onm = covarRootName(rt)
   if onm == "" { return "" }
-  if !cwBoundOnce(onm, covarRootFrame(obj)) { return "" }
+  if !cwBoundOnce(onm, covarRootFrame(rt)) { return "" }
   onm
 }
 
 function cwEscapeFrame(dst: i32): i32 {
-  const obj = cwEscapeObj(dst)
-  if obj < 0 { return CW_FR_UNKNOWN }
-  covarRootFrame(obj)
+  covarRootFrame(cwProjRootNode(cwEscapeObj(dst)))
 }
 
 // The key the escape is filed under. `elem` forces the element key for a form whose member
 // name is not a field: a `push` callee spells the METHOD, and an index spells no name.
 function cwEscapeFld(dst: i32, elem: boolean): string {
-  if elem { return CW_ELEM_FLD }
+  if elem { return cwJoinPath(cwProjPath(cwEscapeObj(dst)), CW_ELEM_FLD) }
   if dst < 0 || dst >= P.nodes.length { return "" }
-  const n = P.nodes[dst]
-  if n is Member { return n.memProp }
-  CW_ELEM_FLD
+  cwProjPath(dst)
 }
 
 // Is `callFnIx` the callee of `xs.push(…)` on a container this analysis can name? `push` is
@@ -15023,8 +15104,147 @@ function cwFieldNameOf(fiIx: i32): string {
   ""
 }
 
-// `{ xs: b }` / `[b]`: the literal `lit` carries a member, so the binding it initialises is
-// the container the value is reached through. A literal bound to nothing names no container.
+// The destination one call of a returning function delivers its result to, added to
+// `names`/`frs`: a binding, a store to a plain name, or the parameter of a further call —
+// `cwGrow`'s own call-result edge. False for a result reaching a name this cannot spell.
+function cwCallDestName(c: i32, names: string[], frs: i32[]): boolean {
+  if c < 0 || c >= cwIxUpKind.length { return false }
+  const k = cwIxUpKind[c]
+  const up = cwIxUp[c]
+  if up < 0 || up >= P.nodes.length { return false }
+  if k == CW_UP_LETINIT {
+    const d = P.nodes[up]
+    if d is LetDecl {
+      cwAdd(names, frs, d.letName, cwFrameOfDecl(up))
+      return true
+    }
+    return false
+  }
+  if k == CW_UP_ASG_RHS {
+    const n = P.nodes[up]
+    if n is BinExpr {
+      const ln = covarRootName(n.binLeft)
+      if ln == "" { return false }
+      cwAdd(names, frs, ln, covarRootFrame(n.binLeft))
+      return true
+    }
+    return false
+  }
+  if k == CW_UP_ARG {
+    const pn = cwArgParamName(c)
+    if pn == "" { return false }
+    cwAdd(names, frs, pn, cwArgParamFrame(c))
+    return true
+  }
+  false
+}
+
+// Every name a call of the function `fnIx` delivers its RESULT to — the containers a literal
+// returned from it is reached through. False where some call hands the result on in a form
+// with no name, which leaves the container unidentified. D1682.
+function cwRetDestNames(fnIx: i32, names: string[], frs: i32[]): boolean {
+  if fnIx < 0 || fnIx >= P.nodes.length { return false }
+  const f = P.nodes[fnIx]
+  if f is FuncDecl {
+    const nm = f.fnName
+    if nm == "" { return false }
+    // A name a second declaration answers for resolves to that one, so calls of it are not
+    // this frame's — the same guard the call-result edge takes.
+    if cwParamFrame(nm) != fnIx { return false }
+    cwIxBuild()
+    let ok = true
+    let r = cwIxChain(nm)
+    while r >= 0 {
+      if cwIxKind[r] == CW_OCC_CALL {
+        if !cwCallDestName(cwIxNode[r], names, frs) { ok = false }
+      }
+      r = cwIxNext[r]
+    }
+    return ok
+  }
+  false
+}
+
+// The containers a literal is reached through, and the path to `fld` inside each. A literal
+// bound to a name is that name; one nested in another literal is the enclosing literal's own
+// containers with the field prepended; one RETURNED is every destination its function's calls
+// deliver to. False where the literal is consumed by a form with no container identity. D1682.
+function cwLitOwners(
+  lit: i32,
+  fld: string,
+  names: string[],
+  frs: i32[],
+  paths: string[],
+  depth: i32,
+): boolean {
+  if lit < 0 || lit >= cwIxUpKind.length { return false }
+  // Literal nesting is a tree in the arena and cannot cycle; the cap turns a surprise into a
+  // decline rather than a hang.
+  if depth > 64 { return false }
+  const k = cwIxUpKind[lit]
+  const up = cwIxUp[lit]
+  if k == CW_UP_LETINIT {
+    if up < 0 || up >= P.nodes.length { return false }
+    const d = P.nodes[up]
+    if d is LetDecl {
+      const ofr = cwFrameOfDecl(up)
+      if !cwBoundOnce(d.letName, ofr) { return false }
+      names.push(d.letName)
+      frs.push(ofr)
+      paths.push(fld)
+      return true
+    }
+    return false
+  }
+  if k == CW_UP_FIELD {
+    // A field this cannot name would leave the path unchanged, so the key would spell the
+    // inner container's own field for the outer one's. Decline instead.
+    const outer = cwJoinPath(cwFieldNameOf(cwIxUpAux[lit]), fld)
+    if outer == fld { return false }
+    return cwLitOwners(up, outer, names, frs, paths, depth + 1)
+  }
+  if k == CW_UP_ELEM {
+    return cwLitOwners(
+      up,
+      cwJoinPath(CW_ELEM_FLD, fld),
+      names,
+      frs,
+      paths,
+      depth + 1,
+    )
+  }
+  if k == CW_UP_RET {
+    return cwLitRetOwners(cwFrameOfDecl(up), fld, names, frs, paths)
+  }
+  if k == CW_UP_TAIL { return cwLitRetOwners(up, fld, names, frs, paths) }
+  false
+}
+
+// A literal returned by `fnIx`: its containers are the destinations of every call, each
+// holding the value at the same path.
+function cwLitRetOwners(
+  fnIx: i32,
+  fld: string,
+  names: string[],
+  frs: i32[],
+  paths: string[],
+): boolean {
+  const dest: string[] = []
+  const destFr: i32[] = []
+  if !cwRetDestNames(fnIx, dest, destFr) { return false }
+  if dest.length == 0 { return false }
+  let i = 0
+  while i < dest.length {
+    names.push(dest[i])
+    frs.push(destFr[i])
+    paths.push(fld)
+    i = i + 1
+  }
+  true
+}
+
+// `{ xs: b }` / `[b]`: the literal `lit` carries a member, so the containers it is reached
+// through hold that member at `fld`. A literal reached through nothing files no escape.
 function cwEscapeByLit(
   lit: i32,
   fld: string,
@@ -15032,15 +15252,14 @@ function cwEscapeByLit(
   ownerFrs: i32[],
   flds: string[],
 ) {
-  if lit < 0 || lit >= P.nodes.length { return 0 }
-  if cwIxUpKind[lit] != CW_UP_LETINIT { return 0 }
-  const li = cwIxUp[lit]
-  const d = P.nodes[li]
-  if d is LetDecl {
-    const ofr = cwFrameOfDecl(li)
-    if cwBoundOnce(d.letName, ofr) {
-      cwFileEscape(d.letName, ofr, fld, owners, ownerFrs, flds)
-    }
+  const names: string[] = []
+  const frs: i32[] = []
+  const paths: string[] = []
+  if !cwLitOwners(lit, fld, names, frs, paths, 0) { return 0 }
+  let i = 0
+  while i < names.length {
+    cwFileEscape(names[i], frs[i], paths[i], owners, ownerFrs, flds)
+    i = i + 1
   }
   0
 }
@@ -15111,11 +15330,7 @@ function cwEscapedHandleNodes(
     while r >= 0 {
       if cwIxKind[r] == CW_OCC_USE {
         if cwSameFrame(cwIxFr[r], ownerFrs[i]) {
-          const u = cwIxNode[r]
-          if cwIxUpKind[u] == CW_UP_OBJ {
-            const p = cwIxUp[u]
-            if cwProjFldOf(p) == flds[i] { out.push(p) }
-          }
+          cwHandleUpChain(cwIxNode[r], flds[i], out)
         }
       }
       r = cwIxNext[r]
@@ -15125,16 +15340,27 @@ function cwEscapedHandleNodes(
   0
 }
 
-// The escaped-field key a projection reads under: its member name, or the element key for an
-// index — whose position is not read, so one recorded element makes every element a handle,
-// over-approximating in the safe direction.
-function cwProjFldOf(p: i32): string {
-  if p < 0 || p >= P.nodes.length { return "" }
-  const n = P.nodes[p]
-  if n is Member { return n.memProp }
-  if n is OptMember { return n.omProp }
-  if n is Index { return CW_ELEM_FLD }
-  ""
+// Climb the projections above the occurrence `u` and push the one whose path off the
+// container spells `fld`. A chain that stops short — an intermediate handed a name of its own
+// — pushes nothing, and a write through that name is then one the scan declines on rather
+// than one it claims.
+function cwHandleUpChain(u: i32, fld: string, out: i32[]) {
+  let at = u
+  let steps = 0
+  while at >= 0 && at < cwIxUpKind.length && cwIxUpKind[at] == CW_UP_OBJ {
+    const p = cwIxUp[at]
+    if p < 0 || p >= P.nodes.length { return 0 }
+    if cwProjPath(p) == fld {
+      out.push(p)
+      return 0
+    }
+    at = p
+    steps = steps + 1
+    // A projection chain is only as deep as the source spells it; the cap turns a surprise
+    // into a decline rather than a hang.
+    if steps > 64 { return 0 }
+  }
+  0
 }
 
 // How usable is `nm` in frame `fr` as a container identity? 0 = not bound exactly once here,
@@ -15191,41 +15417,18 @@ function cwIsEscapedHandle(
   if flds.length == 0 { return false }
   const p = cwPeel(ix)
   if p < 0 || p >= P.nodes.length { return false }
-  const n = P.nodes[p]
-  if n is Member {
-    return cwEscapedPairHas(
-      covarRootName(n.memObj),
-      covarRootFrame(n.memObj),
-      n.memProp,
-      owners,
-      ownerFrs,
-      flds,
-    )
-  }
-  if n is OptMember {
-    return cwEscapedPairHas(
-      covarRootName(n.omObj),
-      covarRootFrame(n.omObj),
-      n.omProp,
-      owners,
-      ownerFrs,
-      flds,
-    )
-  }
-  // `nn[i]` against an array-literal escape. The index is not read: one recorded element
-  // makes every element of that container a handle, which over-approximates in the safe
-  // direction — a write found here is a write.
-  if n is Index {
-    return cwEscapedPairHas(
-      covarRootName(n.idxArr),
-      covarRootFrame(n.idxArr),
-      CW_ELEM_FLD,
-      owners,
-      ownerFrs,
-      flds,
-    )
-  }
-  false
+  const rt = cwProjRootNode(p)
+  // The root name itself is not a handle on what it holds, and a chain rooting at anything
+  // else — `f().xs`, `{ … }.xs` — names no container this can have filed.
+  if rt < 0 || rt == p { return false }
+  cwEscapedPairHas(
+    covarRootName(rt),
+    covarRootFrame(rt),
+    cwProjPath(p),
+    owners,
+    ownerFrs,
+    flds,
+  )
 }
 
 function cwEscapedPairHas(
@@ -15427,12 +15630,12 @@ function cwGrowCall(
     const cn = covarRootName(n.callFn)
     if cn == "" {
       // `xs.push(b)` into a once-bound named receiver is a container store like `xs[i] = b`,
-      // filed above. Any other unnamed callee — another method, a lambda-valued `fp(b)` —
-      // has a body that is not a parameter list this can read.
+      // filed above. Any other callee spelling no name — another method, a call result called
+      // straight through — has a body that is not a parameter list this can read.
       if !cwPushIntoNamed(n.callFn) { return 2 }
       return 0
     }
-    const cfr = cwParamFrame(cn)
+    const cfr = cwParamFrameAt(n.callFn)
     let grew = 0
     let k = 0
     while k < n.callArgs.length {
@@ -15447,7 +15650,7 @@ function cwGrowCall(
         carries = true
       }
       if carries {
-        const pn = cwParamName(cn, k)
+        const pn = cwParamNameAt(n.callFn, k)
         if pn == "" { return 2 }
         if cwAdd(set, setFr, pn, cfr) { grew = 1 }
       }
@@ -15458,14 +15661,60 @@ function cwGrowCall(
   0
 }
 
-// Is (`nm`, `fr`) usable as a container identity — every name that reaches it bound once,
-// never re-pointed, and used only by projecting out of it or by handing it a further name
-// this analysis files? `cwEscapedFields` files the escaped value under every one of those
-// names, so a handle the write scan cannot see is a form this declines on. D1628, D1658.
-function cwContainerSealed(nm: string, fr: i32): boolean {
+// Is `a` a whole-segment prefix of `b`? The escape key joins segments with a dot, so `"inn"`
+// is one of `"inn.xs"` and `"in"` is not.
+function cwPathPrefixOf(a: string, b: string): boolean {
+  if a.length + 1 >= b.length { return false }
+  if b.slice(0, a.length) != a { return false }
+  b[a.length] == '.'
+}
+
+// Walk the projections above `u`: every one whose path is a proper prefix of `path` is an
+// INTERMEDIATE container, and must be projected through or compared rather than handed a name
+// of its own — `const q = o.inn` is a handle on the same value that spells no filed key.
+function cwChainSealed(u: i32, path: string): boolean {
+  let at = u
+  let steps = 0
+  while at >= 0 && at < cwIxUpKind.length && cwIxUpKind[at] == CW_UP_OBJ {
+    const p = cwIxUp[at]
+    if p < 0 || p >= P.nodes.length { return true }
+    const pp = cwProjPath(p)
+    // The handle itself, and a chain reading something else, both end the walk.
+    if pp == path { return true }
+    if !cwPathPrefixOf(pp, path) { return true }
+    const k = cwIxUpKind[p]
+    if k != CW_UP_OBJ && k != CW_UP_CMP { return false }
+    at = p
+    steps = steps + 1
+    // A projection chain is only as deep as the source spells it; a surprise past the cap
+    // declines rather than claims.
+    if steps > 64 { return false }
+  }
+  true
+}
+
+// Is (`nm`, `fr`) usable as a container identity for a value held at `path` — every name that
+// reaches it bound once, never re-pointed, used only by projecting, and every intermediate on
+// the path projected through? `cwEscapedFields` files the escaped value under all those names,
+// so a handle the write scan cannot see is a form this declines on. D1628, D1658, D1682.
+function cwContainerSealed(nm: string, fr: i32, path: string): boolean {
   const names: string[] = []
   const frs: i32[] = []
-  cwContainerAliases(nm, fr, names, frs)
+  if !cwContainerAliases(nm, fr, names, frs) { return false }
+  let i = 0
+  while i < names.length {
+    let r = cwIxChain(names[i])
+    while r >= 0 {
+      if cwIxKind[r] == CW_OCC_USE {
+        if cwSameFrame(cwIxFr[r], frs[i]) {
+          if !cwChainSealed(cwIxNode[r], path) { return false }
+        }
+      }
+      r = cwIxNext[r]
+    }
+    i = i + 1
+  }
+  true
 }
 
 // Is (`v`, `list`) present? The membership test for the small `i32` lists this pass carries.
@@ -15478,26 +15727,31 @@ function cwIntHas(list: i32[], v: i32): boolean {
   false
 }
 
-// Is the literal `lit` delivered into a container the claim may pass through? `{ xs: b }`
-// and `[b]` are the two shapes `cwEscapedFields` records, and the container must be sealed:
-// one reachable under a second name hands out handles the write scan cannot see. D1628.
-function cwLitClaimed(lit: i32): boolean {
-  if lit < 0 || lit >= P.nodes.length { return false }
-  if cwIxUpKind[lit] != CW_UP_LETINIT { return false }
-  const li = cwIxUp[lit]
-  const d = P.nodes[li]
-  if d is LetDecl { return cwContainerSealed(d.letName, cwFrameOfDecl(li)) }
-  false
+// Is the literal `lit`, carrying the value at `fld`, delivered into a container the claim may
+// pass through? `cwLitOwners` is the same walk the escape filing takes, so what the claim
+// passes a delivery through is exactly what the write scan can see. D1628, D1682.
+function cwLitClaimed(lit: i32, fld: string): boolean {
+  const names: string[] = []
+  const frs: i32[] = []
+  const paths: string[] = []
+  if !cwLitOwners(lit, fld, names, frs, paths, 0) { return false }
+  if names.length == 0 { return false }
+  let i = 0
+  while i < names.length {
+    if !cwContainerSealed(names[i], frs[i], paths[i]) { return false }
+    i = i + 1
+  }
+  true
 }
 
 // Is the store destination `dst` a container the delivery into it may be claimed through?
 // The identity guard (`cwEscapeOwner`) plus the seal: `cwEscapedFields` files the handle
 // under the container's own name, so a container reachable under a second name has handles
-// the write scan would miss.
-function cwStoreSealed(dst: i32): boolean {
+// the write scan would miss. `elem` is `cwEscapeFld`'s own flag for a `push` callee.
+function cwStoreSealed(dst: i32, elem: boolean): boolean {
   const onm = cwEscapeOwner(dst)
   if onm == "" { return false }
-  cwContainerSealed(onm, cwEscapeFrame(dst))
+  cwContainerSealed(onm, cwEscapeFrame(dst), cwEscapeFld(dst, elem))
 }
 
 // Does every call of `fnIx` deliver its result to a name `cwGrow`'s call-result edge added —
@@ -15572,7 +15826,7 @@ function cwUseAccounted(u: i32, retOk: i32[]): boolean {
     if n is BinExpr {
       if covarRootName(n.binLeft) != "" { return true }
       // a store INTO a container: claimed only where the container is sealed
-      return cwStoreSealed(cwPeel(n.binLeft))
+      return cwStoreSealed(cwPeel(n.binLeft), false)
     }
     return false
   }
@@ -15582,12 +15836,12 @@ function cwUseAccounted(u: i32, retOk: i32[]): boolean {
       if covarRootName(c.callFn) != "" { return true }
       // A method call delivers into its RECEIVER, not into a parameter list: `xs.push(b)`
       // is a container store and is claimed on the container's terms.
-      return cwStoreSealed(cwPeel(c.callFn))
+      return cwStoreSealed(cwPeel(c.callFn), true)
     }
     return false
   }
-  if k == CW_UP_FIELD { return cwLitClaimed(up) }
-  if k == CW_UP_ELEM { return cwLitClaimed(up) }
+  if k == CW_UP_FIELD { return cwLitClaimed(up, cwFieldNameOf(cwIxUpAux[u])) }
+  if k == CW_UP_ELEM { return cwLitClaimed(up, CW_ELEM_FLD) }
   if k == CW_UP_RET { return cwIntHas(retOk, cwFrameOfDecl(up)) }
   if k == CW_UP_TAIL { return cwIntHas(retOk, up) }
   false
