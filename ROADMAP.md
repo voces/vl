@@ -84,14 +84,15 @@ Five items, in order. (0) is shipped; the rest are scheduled against it.
 - ✅ **8. A ladder over a closed kind set is exhaustive or names its default — DONE.**
   `kind-ladder-incomplete` / `kind-ladder-split` in `compiler/lint.vl`, the ratchet
   `scripts/ladder-budget.py --check` (440 + 9 today), the census `scripts/ladder-census.py`.
-  See the fuller row below.
+  See the fuller row below. **STATUS 2026-09-06: ratchet now 435 + 8**, moved by the
+  covariant-write closure work (#2685 and neighbours).
 - ✅ **8b. A table read bound-tests its index, or takes a reader whose miss cannot be a
   real row — DONE.** `sentinel-index-unguarded` / `sentinel-index-strict-untested` in
   `compiler/lint.vl`, the ratchet `scripts/sentinel-budget.py --check` (386 + 0 today),
   the census `scripts/sentinel-census.py`. The shape behind D1440, D1462, D1500 and
   #2498 — four compiler traps in one day, all `vl check` rc 0 — with each of those graded
   as a control on its own pre-fix tree and D1513 as the negative control.
-  `docs/internals/sentinel-index-lint.md`.
+  `docs/internals/sentinel-index-lint.md`. **STATUS 2026-09-06: ratchet now 375 + 0** (#2685).
 - 🟢 **7. String building — BOTH LOWERINGS SHIPPED; module-GLOBAL accumulators remain.**
   `docs/internals/perf-opportunities-2026-09.md` Part D priced what the owner asked for
   ("optimize string building at the compiler level, without the user having to use an actual
@@ -354,10 +355,13 @@ Five items, in order. (0) is shipped; the rest are scheduled against it.
   `uVariants`, `globalStmts`) inside a function that is neither a pass-table row nor
   allow-listed; a scan resuming from a memo is exempt, since that is the fix. 132 stand,
   ratcheted per file by `scripts/scan-budget.py --check`, which re-derives the pass list
-  from `runEmitPass` so the lint's copy cannot go stale. Byte-identical seed. **Merge
+  from `runEmitPass` so the lint's copy cannot go stale. Byte-identical seed. **STATUS
+  2026-09-06: ratchet now 88**, moved by #2629, #2654 and #2685. **Merge
   time**: `tests/vl_scaling_shape_test.ts` — seven pairs of the same work reshaped along
   one axis, graded on the TIME RATIO so machine speed and box load cancel. 16–25 s; the
   `functions` and `closures` pairs red on the pre-#2419 compiler (5.8× and 7.0×).
+  **STATUS 2026-09-06: TEN pairs now** — #2685/#2686 added a `covariant bindings` tenth
+  pair as the grader's own control (must red if the ratio stops measuring).
   **Bootstrap**: `scripts/self-compile-time.sh`, L2 CPU seconds against
   `scripts/self-compile-baseline.json` (6.3 s idle), tripping past 4× — half of which pays for
   contention, since the same build reads 12.2–12.7 s inside the fanned-out ladder. **What the family found
@@ -378,7 +382,8 @@ Five items, in order. (0) is shipped; the rest are scheduled against it.
   ladder that owns the rest. **`kind-ladder-split`**: two ladders over one set where the
   first's default hands the rest to the second, the second's hands none back, and the second
   drops a kind the first tests — D981's exact shape, and the control (`urcExprClean` /
-  `urcStmtFlags`, which hand back both ways) stays silent. **440 + 9 stand**, ratcheted per
+  `urcStmtFlags`, which hand back both ways) stays silent. **440 + 9 stand** [STATUS
+  2026-09-06: now 435 + 8, moved by #2685 and neighbours], ratcheted per
   file by `scripts/ladder-budget.py --check`, which re-derives every closed set from the
   `export type` that declares it and FAILS when the lint's copy has drifted.
   `scripts/ladder-census.py` is the discovery instrument — `--sets`, the ladder table,
@@ -2865,6 +2870,13 @@ independent).*
   - **The untested emitter long tail** — each fails loudly (nullable lists beyond `i32[]|null`,
     map-typed params / nullable map fields, struct-union `==`, `?.` beyond i32/boolean leaves,
     …); burned down demand-driven as real VL code (std, the compiler) hits them.
+    **STATUS 2026-09-06: re-run against the current seed — all four named examples now RUN.**
+    `?.` beyond i32/boolean leaves closed by D1676 (#2698, 2026-09-05):
+    `tests/cases/expressions/optchain-standalone-leaf-reps.vl` runs an f64/i64/f32 leaf and
+    every list leaf, both faces. The other three (`f64[] | null` through a return and a
+    literal, a `{[string]: i32}` parameter, `Circle | Rect` `==`) also run today; the PR that
+    closed each was not re-derived, so treat this bullet as the shape of the burn-down rather
+    than a current failure list — the `…` may still hide gaps nobody has probed.
   - ⬜ **H4.1. No `byte`/`u8` type (ergonomic/representation gap, not a blocker).** Bytes are
     represented as `i32` masked `& 0xff` in `wasmEmit.vl` and round-trip/instantiate fine; a real
     packed byte buffer (B7/B6 `(array i8)`) would drop the 4×-wide detour. (detail: `docs/internals/selfhost-gaps.md` §H4.1)
