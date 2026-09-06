@@ -40,3 +40,4 @@ D1628-D1639  vl-cb  2026-09-05  second-pass fix follow-ups
 D1670-D1679  vl-c3  2026-09-05  coordinator lanes 2026-09-05 night (D1667-D1669 clause-1 fixes, D1664/D1665 residues)
 D1680-D1689  vl-c3  2026-09-05  coordinator lanes 2026-09-06 (optchain residues D1676/D1677, covariant residues D1658/D1659, f32/field-arm residues)
 D1700-D1709  vl-c3  2026-09-06  coordinator lanes 2026-09-06 (arena-reader twin of D1696, D1697 list-of-list key, D1692 declaration refusal, D1686/D1687 residues)
+D1710-D1719  vl-c3  2026-09-06  coordinator lanes 2026-09-06 (D1707/D1708 predictions, D1686/D1687 covariant residues, D1680 nullable map, later residues)
