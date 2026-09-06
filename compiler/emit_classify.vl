@@ -18171,6 +18171,14 @@ export function anonFieldCode(valIx: i32) {
   // `nodeTyName` spells no union, so that gate would refuse the whole literal a row (D1242).
   // `anonUnionFieldName` supplies the companion column the admission rule needs.
   if anonUnionFieldName(valIx) != "" { return 16 }
+  // The niche-nullable rung, ahead of the spellability gate for the same reason code 16 is:
+  // `anonTySpellable` declines a `TyNullable` and `nodeTyName` spells no `| null`, so a
+  // nullable ref field reached neither ladder and cost the whole literal its row (D1627).
+  const anonNul = anonNulFieldCodeOfTy(nodeTyIxOf(valIx))
+  if anonNul >= 0 {
+    if !anonCodeAdmitsValue(anonNul, valIx) { return -1 }
+    return anonNul
+  }
   // The gate, then the arena, then the render: `anonTySpellable` keeps an unspellable type
   // out of both paths, which a naive hoist of the arena rung drops — regressing a
   // generic-alias reresolve to a loud reject. With the gate preserved, the render is built
@@ -18200,6 +18208,152 @@ export function anonFieldCode(valIx: i32) {
   }
   if !anonCodeAdmitsValue(c, valIx) { return -1 }
   c
+}
+
+// The inner type of node `valIx`'s recorded niche nullable, or -1 when it is not one — the
+// node-taking form of the peel `anonNulFieldCodeOfTy` makes on a type, so a code and its
+// companion column cannot resolve against different types.
+function anonNulInnerTyOf(valIx: i32): i32 {
+  const ty = nodeTyIxOf(valIx)
+  if ty < 0 { return -1 }
+  const t = T.tys[ty]
+  if t is TyNullable { return t.nInner }
+  -1
+}
+
+// The FIELD code of a niche-nullable type, from the arena, or -1 — the `| null` twin of
+// `fieldCodeOfTy`'s arms, in the order `fieldCodeOfSpelling` reads the same spellings. Only
+// the anonymous-literal path asks: a declared field carries a `| null` name the render
+// already codes, and this one has none to read (D1627).
+function anonNulFieldCodeOfTy(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  const t = T.tys[ty]
+  if !(t is TyNullable) { return -1 }
+  const inner = t.nInner
+  if inner < 0 { return -1 }
+  if tyIsLitUnionAlias(inner) { return 30 }
+  const it = T.tys[inner]
+  // Exhaustive over `Ty` and deliberately `_`-less: a twelfth arena variant breaks the
+  // self-compile here rather than taking the -1 that hands the literal to the render ladder.
+  // The deliberate leaves are empty arms carrying their reason.
+  match it {
+    TyPrim => {
+      if it.primName == "string" { return 20 }
+      if it.primName == "boolean" { return 21 }
+      // A scalar plus null is the value-union box, which the caller claimed above.
+    }
+    TyFunc => {
+      return 22
+    }
+    TyObj => {
+      return 15
+    }
+    TyArray => {
+      return anonNulListFieldCodeOfElem(it.aElem)
+    }
+    TyMap => {
+      // A nullable map reps as code 29; no cell reaches this arm today, since its own type
+      // is not recorded as a `TyNullable`. D1665.
+    }
+    TyUnion => {
+      // A union plus null is the box, not a niche — `anonUnionFieldName` claims it above.
+    }
+    TyNullable => {
+      // One niche per type: the checker collapses a doubly-nullable before it reaches here.
+    }
+    TyLit => {
+      // A bare literal plus null is the litunion niche, claimed by the alias test above.
+    }
+    TyVar => {
+      // An unsubstituted type parameter has no rep until the monomorphizer pins it.
+    }
+    TyNeg => {
+      // A negation is a checker-only refinement, with no field rep of its own.
+    }
+    TyErr => {
+      // The error hole — nothing to code.
+    }
+  }
+  -1
+}
+
+// The element half of `anonNulFieldCodeOfTy`'s list arm: the i32-backed leaves all fold onto
+// code 18, each distinct backing keeps its own wrapper (31..34), and a ref element is the
+// nullable ref list, code 28. An unrecognised element answers -1 rather than guessing.
+function anonNulListFieldCodeOfElem(elem: i32): i32 {
+  if elem < 0 { return -1 }
+  const et = T.tys[elem]
+  // Exhaustive over `Ty` and `_`-less, for the reason its caller is.
+  match et {
+    TyPrim => {
+      // Exhaustive over `PrimName`, `_`-less like its `Ty` parent. The i32-backed leaves
+      // fold onto code 18; each distinct backing keeps its own wrapper.
+      match et.primName {
+        "i32" => {
+          return 18
+        }
+        "boolean" => {
+          return 18
+        }
+        "string" => {
+          return 31
+        }
+        "f64" => {
+          return 32
+        }
+        "i64" => {
+          return 33
+        }
+        "f32" => {
+          return 34
+        }
+        "u8" => {
+          // The packed byte list rides code 35, claimed by its own spelling test.
+        }
+        "void" => {
+          // Not an element type.
+        }
+        "null" => {
+          // Not an element type: `(T | null)[] | null` folds onto the element family.
+        }
+        "never" => {
+          // Not an element type.
+        }
+      }
+    }
+    TyObj => {
+      return 28
+    }
+    TyUnion => {
+      return 28
+    }
+    TyFunc => {
+      return 28
+    }
+    TyArray => {
+      // A nested list and a map element are ref lists too, but no cell has graded their
+      // nullable field rep yet, so they refuse loudly rather than take code 28 on trust.
+    }
+    TyMap => {
+      // The other half of that pair, refused for the same reason.
+    }
+    TyNullable => {
+      // A nullable ELEMENT list has its own family, and folds onto a different code.
+    }
+    TyLit => {
+      // A literal element is a litunion list, claimed by the alias test in the caller.
+    }
+    TyVar => {
+      // An unsubstituted type parameter has no element rep yet.
+    }
+    TyNeg => {
+      // A negation is a checker-only refinement, never an element rep.
+    }
+    TyErr => {
+      // The error hole — nothing to code.
+    }
+  }
+  -1
 }
 
 // The struct row a code-5 (struct-ref list) field's element names, read from the arena, or
@@ -18232,7 +18386,21 @@ function anonCodeIsSelfContained(c: i32) {
 // hand (D1515).
 function anonCodeAdmitsValue(c: i32, valIx: i32) {
   if anonCodeIsSelfContained(c) { return true }
+  if anonNulCodeIsSelfContained(c) { return true }
+  // The two codes that need a companion and can supply it: a struct ref names its row and a
+  // ref list names its element's, both through `anonFieldElemName`, which the mint writes
+  // into `sFieldElemName` (D1627). Code 15 covers the nullable struct — `fieldCodeForMatch`
+  // folds `S | null` onto it — and code 28 the nullable ref list.
+  if c == 15 || c == 28 { return anonFieldElemName(valIx, c) != "" }
   c == 5 && anonRefListElemRow(valIx) >= 0
+}
+
+// The nullable half of `anonCodeIsSelfContained`: the niche codes whose slot is a
+// module-global heap type or a raw valtype, so the `| null` costs the field a nullable ref
+// and no companion column. Widening this set means widening `anonFieldElemName` with it.
+function anonNulCodeIsSelfContained(c: i32) {
+  if c == 18 || c == 20 || c == 21 || c == 22 { return true }
+  c == 31 || c == 32 || c == 33 || c == 34
 }
 
 // The width of an arithmetic field value, from the arena, falling back to i32 (D1586): the
@@ -18388,6 +18556,16 @@ export function anonFieldElemName(valIx: i32, code: i32) {
     // but an array literal of object literals has no element node, so the recorded element type names the same row.
     const ari = anonRefListElemRow(valIx)
     if ari >= 0 { return sNames[ari] }
+    return ""
+  }
+  // A nullable ref-list field (code 28) records its ELEMENT's key, read off the type rather
+  // than the `| null` spelling the literal does not carry — the same column
+  // `shapeFieldElemName` strips, through the same deferred fallback (D1627).
+  if code == 28 {
+    const nnt = anonNulInnerTyOf(valIx)
+    if nnt < 0 { return "" }
+    const nit = T.tys[nnt]
+    if nit is TyArray { return refArrElemKeyDeferred(tyToEmitName(nnt)) }
     return ""
   }
   if code != 15 { return "" }
