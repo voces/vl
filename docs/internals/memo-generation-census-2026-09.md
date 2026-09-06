@@ -57,6 +57,7 @@ tree ungraded.
 | `parentLetCache` (`plCacheBlock`/`plGen`) | the cached BLOCK index | the arena bodies the rewrites re-point inside that block | probe |
 | `anonLeafIndex` (`anonIxSeen`) | `P.nodes.length` | its own link columns | probe |
 | `fnChildIndex` | `fnChildHead.length` vs `fnStmts.length` | `fnParent`, written in place by `monomorphize` | probe |
+| `elemRowsCaptureWalk` (`ercGenP`/`ercStamp`) | **`emitPassGen`**, and a per-walk stamp so a new walk clears nothing | none: the table is rebuilt when the pass generation moves, and a slot is dead the moment its walk id is stale | pass-stamped |
 | `covarValueWriteState` (`cwArenaLen`) | `P.nodes.length` | its own `cwIx*` index, dropped with it; and `nodeRepTyIx`, a checker sidecar written in place | probe |
 
 ## The `probe` verdict is a measurement — one row at a time
