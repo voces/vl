@@ -67,6 +67,39 @@ Deno.test({ name: "wasm-checker: a type error carries a message and a non-empty 
   }
 });
 
+// A MULTI-LINE NODE UNDERLINES WHOLE. `diagEndCol` is a column on `diagEndLine`, so the
+// range the editor gets ends on the node's LAST line; before the end line rode the ABI the
+// same diagnostic collapsed to a one-column caret on the literal's opening `{`. The control
+// is the second assertion: the range must cover more than the line it starts on.
+Deno.test({ name: "wasm-checker: a multi-line node's range ends on its last line", ignore }, async () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  const src = 'type P = { x: i32 }\nconst p: P = {\n  x: "one",\n}\nprint(p.x)\n';
+  const diags = await checker.check(src, "/tmp/x.vl", noSiblings);
+  const d = diags.find((x) => x.severity === "error" && x.message.includes("cannot assign"));
+  if (d === undefined) {
+    throw new Error(`expected an assign error, got: ${diags.map((x) => x.message).join("; ")}`);
+  }
+  // 0-based LSP positions counted from `src`: `{` is the 14th column of line 2, and the
+  // closing `}` is the whole of line 4.
+  const want = { start: { line: 1, character: 13 }, end: { line: 3, character: 1 } };
+  if (JSON.stringify(d.range) !== JSON.stringify(want)) {
+    throw new Error(`want ${JSON.stringify(want)}, got ${JSON.stringify(d.range)}`);
+  }
+  if (d.range.end.line <= d.range.start.line) {
+    throw new Error(`the range never left its first line: ${JSON.stringify(d.range)}`);
+  }
+  // The text the range selects is the literal, newlines and all.
+  const lines = src.split("\n");
+  const picked = [
+    lines[d.range.start.line].slice(d.range.start.character),
+    ...lines.slice(d.range.start.line + 1, d.range.end.line),
+    lines[d.range.end.line].slice(0, d.range.end.character),
+  ].join("\n");
+  if (picked !== '{\n  x: "one",\n}') {
+    throw new Error(`the range selects ${JSON.stringify(picked)}`);
+  }
+});
+
 // D1590 (glean VL-039) — THE SUGGESTION REACHES THE EDITOR, because it rides the message
 // rather than a second channel. Same `unknown type` diagnostic the CLI prints, arriving
 // through the checker the LSP drives, so the assertion is on the exact text; the negative

@@ -14,6 +14,10 @@
 // Three exceptions to "span the node", each because the message names something narrower:
 // a declaration's declared NAME, a member access's PROPERTY, and the raises re-anchored on
 // a sub-node (a condition, an iterable, a subscript, an assignment's RHS).
+//
+// A node written over several LINES spans them: `endLine` rides the report beside `endCol`,
+// which counts from it. `endLine` is emitted only where it differs from `line`, so a row
+// that declares none is also asserting the field is absent.
 const ROOT = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
 const VL = `${ROOT}/scripts/vl-host/target/release/vl`;
 const COMPILER = `${ROOT}/build/vl-compiler.wasm`;
@@ -32,6 +36,7 @@ type Diag = {
   severity: string;
   line?: number;
   col?: number;
+  endLine?: number;
   endCol?: number;
   message: string;
 };
@@ -44,8 +49,26 @@ type Row = {
   first?: boolean; // this diagnostic must be the FIRST error the report prints
   line: number; // 1-based
   col: number; // 1-based, inclusive
-  endCol: number; // 1-based, EXCLUSIVE
-  underlines: string; // the source text `[col, endCol)` covers
+  endLine?: number; // 1-based; omitted when the span ends on `line`
+  endCol: number; // 1-based, EXCLUSIVE, a column on `endLine ?? line`
+  underlines: string; // the source text the span covers, newlines included
+};
+
+// The source text a row's span covers, cut out of the row's own `src`. A one-line span is
+// a slice of its line; a multi-line one is the first line from `col`, every whole line
+// between, and the last line up to `endCol`. This is what makes `underlines` a second
+// statement of the numbers rather than a restatement of them.
+const spanText = (row: Row): string => {
+  const lines = row.src.split("\n");
+  const endLine = row.endLine ?? row.line;
+  if (endLine === row.line) {
+    return (lines[row.line - 1] ?? "").slice(row.col - 1, row.endCol - 1);
+  }
+  return [
+    (lines[row.line - 1] ?? "").slice(row.col - 1),
+    ...lines.slice(row.line, endLine - 1),
+    (lines[endLine - 1] ?? "").slice(0, row.endCol - 1),
+  ].join("\n");
 };
 
 // `col`/`endCol` are 1-based with an exclusive end, so `endCol - col` is the caret width.
@@ -121,16 +144,78 @@ const GRID: Row[] = [
     endCol: 11,
     underlines: "n[0]",
   },
+  // -- a node that spans LINES spans them in the report too ------------------
+  // `endLine` rides the ABI beside `endCol`, so a multi-line construct underlines whole
+  // rather than collapsing to a caret on its opening token. The end column counts from
+  // `endLine`, which is why several of these end at column 2 -- the line's closing brace.
   {
-    // A node that spans LINES is clamped to its first: `const p: P = {` puts the
-    // only token of the literal on that line at column 14.
-    name: "multi-line node: the span clamps to the first line",
+    // `{` at 2:14 through the `}` on its own line 4, whose end column is 2.
+    name: "multi-line struct literal: the assign error spans the whole literal",
     src: 'type P = { x: i32 }\nconst p: P = {\n  x: "one",\n}\nprint(p.x)\n',
     frag: "cannot assign",
     line: 2,
     col: 14,
-    endCol: 15,
-    underlines: "{",
+    endLine: 4,
+    endCol: 2,
+    underlines: '{\n  x: "one",\n}',
+  },
+  {
+    // `f` at 2:1 through the `)` alone on line 4.
+    name: "multi-line call: the arity error spans the call across its lines",
+    src: "function f(a: i32, b: i32) { print(a + b) }\nf(\n  1,\n)\n",
+    frag: "wrong number of arguments",
+    line: 2,
+    col: 1,
+    endLine: 4,
+    endCol: 2,
+    underlines: "f(\n  1,\n)",
+  },
+  {
+    // The condition `1 +` / `  2` -- `1` at 1:4, the `2` at 2:3 ending at 2:4.
+    name: "multi-line condition: the if-condition error spans both its lines",
+    src: "if 1 +\n  2 {\n  print(1)\n}\n",
+    frag: "if-condition must be boolean",
+    line: 1,
+    col: 4,
+    endLine: 2,
+    endCol: 4,
+    underlines: "1 +\n  2",
+  },
+  {
+    // The whole `if ... { ... } else { ... }` initialiser: `if` at 2:16, its `}` on 6.
+    name: "multi-line if-expression: the assign error spans both arms",
+    src:
+      'const c = true\nconst n: i32 = if c {\n  "yes"\n} else {\n  "no"\n}\nprint(n)\n',
+    frag: "cannot assign string to 'n'",
+    line: 2,
+    col: 16,
+    endLine: 6,
+    endCol: 2,
+    underlines: 'if c {\n  "yes"\n} else {\n  "no"\n}',
+  },
+  {
+    // One TOKEN spanning lines: the template opens at 2:16 and its closing backtick ends
+    // at 3:11, so the end column is counted from the template's LAST line, not its first.
+    name: "multi-line template: the span follows the lexeme onto its last line",
+    src: "const n = 1\nconst s: i32 = `n is\n${n} here`\nprint(s)\n",
+    frag: "cannot assign string to 's'",
+    line: 2,
+    col: 16,
+    endLine: 3,
+    endCol: 11,
+    underlines: "`n is\n${n} here`",
+  },
+  {
+    // The `match` keyword at 2:3 through the closing `}` on line 5, ending at column 4.
+    name: "multi-line match: the exhaustiveness verdict spans the whole match",
+    src:
+      "function g(k: i32) {\n  match k {\n    1 => print(1)\n    2 => print(2)\n  }\n}\ng(1)\n",
+    frag: "non-exhaustive match",
+    line: 2,
+    col: 3,
+    endLine: 5,
+    endCol: 4,
+    underlines: "match k {\n    1 => print(1)\n    2 => print(2)\n  }",
   },
   // ── exception 1: a declaration's own NAME ─────────────────────────────────
   {
@@ -359,10 +444,22 @@ Deno.test({
           );
           continue;
         }
-        if (d.line !== row.line || d.col !== row.col || d.endCol !== row.endCol) {
+        // `endLine` is present ONLY on a span that ends on a later line, so a row
+        // declaring none requires the field to be absent -- that absence is what keeps a
+        // single-line diagnostic's JSON byte-identical to what it was before it existed.
+        if (
+          d.line !== row.line || d.col !== row.col ||
+          d.endCol !== row.endCol || d.endLine !== row.endLine
+        ) {
+          const got = d.endLine === undefined
+            ? `${d.line}`
+            : `${d.line}-${d.endLine}`;
+          const want = row.endLine === undefined
+            ? `${row.line}`
+            : `${row.line}-${row.endLine}`;
           bad.push(
-            `${row.name}: want ${row.line}:[${row.col}, ${row.endCol}), got ` +
-              `${d.line}:[${d.col}, ${d.endCol})`,
+            `${row.name}: want ${want}:[${row.col}, ${row.endCol}), got ` +
+              `${got}:[${d.col}, ${d.endCol})`,
           );
           continue;
         }
@@ -378,12 +475,11 @@ Deno.test({
             continue;
           }
         }
-        const srcLine = row.src.split("\n")[row.line - 1] ?? "";
-        const under = srcLine.slice(row.col - 1, row.endCol - 1);
+        const under = spanText(row);
         if (under !== row.underlines) {
           bad.push(
-            `${row.name}: [${row.col}, ${row.endCol}) on "${srcLine}" is ` +
-              `"${under}", but the row declares "${row.underlines}"`,
+            `${row.name}: the span cuts ${JSON.stringify(under)} out of the ` +
+              `source, but the row declares ${JSON.stringify(row.underlines)}`,
           );
         }
       }
