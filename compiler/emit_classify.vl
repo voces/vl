@@ -2810,6 +2810,18 @@ function letInitTyIsNulFunc(letIx: i32): boolean {
   false
 }
 
+// Does the binding at `letIx` take its value from a `??` whose niche operand joins to the
+// union box? The binding-side twin of the lowering's own gate, so the slot and the value
+// agree about the rep.
+export function letInitJoinsToUnionBox(letIx: i32, fnIx: i32): boolean {
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letInit < 0 { return false }
+    return coalesceNicheJoinsToBox(unwrapParen(d.letInit), fnIx)
+  }
+  false
+}
+
 // The `fbValtype` kind an un-annotated binding's initializer decides, through the same
 // per-`let` predicates `collectLocals` types the binding with and in the same order — the one
 // home of that ladder, shared by `captureValKind` and `letCellKind`. `"i32"` when no arm
@@ -2825,6 +2837,9 @@ function letInitCellKind(letIx: i32, fnIx: i32): VKind {
   // The `K | null` niche: the same i32 atom with the spare `-1` for null. Before
   // `letIsNulString`, since a litunion softens to `string`.
   if letNulLitUnion(letIx, fnIx) { return "i32" }
+  // A `??` niche JOIN binds the union BOX. Ahead of every rung below, since those read the
+  // OPERAND's rep and give the slot its niche — a bare `(ref $S)` holding a box (D1714).
+  if letInitJoinsToUnionBox(letIx, fnIx) { return "union" }
   // A nullable map, before `letIsMap`, whose `(ref $mapStruct)` cell cannot hold null.
   if letIsNulMap(letIx, fnIx) { return "nulmap" }
   // A bare `const t = m[k]` read of a list- or nested-map-valued map binds the value's
@@ -10425,7 +10440,12 @@ function stashHitAt(ix: i32, fnIx: i32, want: StashWant): boolean {
       return exprIsMultiFieldReboxCall(ix, fnIx)
     }
     "optrecv" => {
-      return optChainStagesRecv(ix)
+      if optChainStagesRecv(ix) { return true }
+      // The `??` niche join stages its operand in the SAME slot: it evaluates the nullable ref
+      // once, tests it and reads it back on the non-null path (D1714). Sharing the reservation
+      // is sound because the two never stage inside one another — a `?.` operand of a joining
+      // `??` has finished with its own base by the time the join tees over it.
+      return coalesceNicheJoinsToBox(ix, fnIx)
     }
   }
 }
@@ -25477,6 +25497,56 @@ export function nodeMixedUnionName(ix: i32): string {
   nm
 }
 
+// The registered name of a union carrying at least one struct VARIANT arm, or "". Wider than
+// `nodeMixedUnionName`, whose second clause also excludes an ALL-variant join (`A | B`); both
+// exclude a literal union, which is an interned i32 and not a box.
+export function nodeVariantUnionName(ix: i32): string {
+  const nm = nodeRegisteredUnionName(ix)
+  if nm == "" { return "" }
+  const u = unRowOfName(nm)
+  if u < 0 { return "" }
+  if unVarCount[u] < 1 { return "" }
+  nm
+}
+
+// The union a `??` RESULT reps as, or "": the checker's own type for the node when its render
+// names a value union, else the variant-bearing row keyed on the node's canon. One home, so
+// the lowering, the destination and the stash reservation cannot disagree about the rep.
+export function coalesceResultUnionName(ix: i32): string {
+  const nm = tyToEmitName(nodeTyPinIxOf(ix))
+  if nm != "" {
+    if isValueUnionName(nm) { return nm }
+  }
+  nodeVariantUnionName(ix)
+}
+
+// Is the operand of a `??` one of the nullable-REF niches — a bare `(ref null $H)` cell rather
+// than a box or an i32 sentinel? These are the reps `emitCoalesceNulRefCtx` serves.
+function coalesceNulRefNicheOperand(ix: i32, fnIx: i32): boolean {
+  if exprNullableString(ix, fnIx) { return true }
+  if exprNullableRefNiche(ix, fnIx) { return true }
+  if exprNullableList(ix, fnIx) { return true }
+  if exprNullableRefArray(ix, fnIx) { return true }
+  exprNulScalarListKind(ix, fnIx) != null
+}
+
+// Does the `??` at `ix` join a nullable-ref niche to a default of another type, so the result
+// is the union BOX and the operand cannot ride `br_on_non_null`'s raw ref out of the block?
+// Two or more non-null members is what makes the result a box; one is the niche itself (D1714).
+export function coalesceNicheJoinsToBox(ix: i32, fnIx: i32): boolean {
+  const e = P.nodes[ix]
+  if e is BinExpr {
+    if e.binOp != "??" { return false }
+    const jn = coalesceResultUnionName(ix)
+    if jn == "" { return false }
+    let js = unionMemberSetOf(jn)
+    if js == "" { js = jn }
+    if unionSetNonNullCount(js) < 2 { return false }
+    return coalesceNulRefNicheOperand(unwrapParen(e.binLeft), fnIx)
+  }
+  false
+}
+
 // The registered union a node's own type is, when its render cannot name it: an inference
 // (a desugared `??`, a hole-param call) renders its union arms structurally, so a name-keyed
 // registry scan finds nothing. `unRowOfCanon` answers from the canon-keyed reverse index
@@ -25663,6 +25733,12 @@ export function unionNameOfExpr(exprIx: i32, fnIx: i32) {
     // The name-typed mirror of `exprUnion`'s non-map `??` arm: needs the resulting member set
     // to narrow/unbox through, only when both operands share the same set (or default is `null`).
     if e.binOp == "??" {
+      // A niche JOIN's result is the union BOX, and the destination has to be told: a local
+      // slot typed from the operand's own niche holds a bare ref where the box lands, which
+      // is check-clean invalid wasm at every in-function position (D1714).
+      if coalesceNicheJoinsToBox(unwrapParen(exprIx), fnIx) {
+        return coalesceResultUnionName(unwrapParen(exprIx))
+      }
       const cln = unionNameOfExpr(e.binLeft, fnIx)
       if cln != "" && coalesceDefaultNullable(e.binRight, fnIx) {
         const crn = unionNameOfExpr(e.binRight, fnIx)
@@ -27092,7 +27168,7 @@ export function unionSetHasNull(set: string): boolean {
 }
 
 // CARDINALITY of a member set's non-`null` members, structurally.
-function unionSetNonNullCount(set: string): i32 {
+export function unionSetNonNullCount(set: string): i32 {
   const s = msSetOfText(set)
   if s >= 0 { return msNonNullCount(s) }
   nonNullMemberCountOf(set)
@@ -27663,6 +27739,21 @@ export function unionArmVariantForStructExpr(
       return -1
     }
     u = u + 1
+  }
+  -1
+}
+
+// The union variant arm (of `unionSet`) whose own heap type IS `heapIx`, or -1 — the rep dual
+// of the layout compare above. A value already built as the arm's heap type rides the box's
+// anyref unchanged, so its tag is the whole of what boxing it needs.
+export function unionArmVariantWithHeap(unionSet: string, heapIx: i32): i32 {
+  if heapIx < 0 { return -1 }
+  const u = unionRowOf(unionSet)
+  if u < 0 || u >= unVarStart.length || u >= unVarCount.length { return -1 }
+  let vi = unVarStart[u]
+  while vi < unVarStart[u] + unVarCount[u] {
+    if vi < uVarHeap.length && uVarHeap[vi] == heapIx { return vi }
+    vi = vi + 1
   }
   -1
 }
