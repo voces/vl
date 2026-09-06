@@ -563,6 +563,101 @@ Deno.test({
   }
 });
 
+// D1654 — THE SAME SENTENCE UNDER A MERGE, which is where it went missing. The gate asks
+// `fnDeclIx` for the declaration and a merge renames every one of them; the caller's alias
+// maps back only a `self`-function, which the `self`-NAME gate is by definition not. So a
+// file that imported ANYTHING got `no field 'skipTags' on Cursor` instead — the message
+// D1570 exists to replace — and its whole quick-fix payload with it. Both faces are here:
+// the declaration in the entry, and the declaration in the dependency, whose `declLine` /
+// `declCol` name a position in the OTHER file.
+
+Deno.test({
+  name: "diag-code: the `self`-name payload survives a merge (declaration in the entry)",
+  ignore,
+}, () => {
+  const exp = instantiate();
+  const { rc, diags } = checkGraph(
+    exp,
+    "/w/entry.vl",
+    [
+      'import { bump } from "./lib2"',
+      "type Cursor = { pos: i32 }",
+      "function skipTags(c: Cursor): i32 { return c.pos + bump(1) }",
+      "const cur: Cursor = { pos: 3 }",
+      "print(cur.skipTags())",
+      "",
+    ].join("\n"),
+    { "/w/lib2.vl": "export function bump(a: i32): i32 { a + 1 }\n" },
+  );
+  if (rc !== 2) throw new Error(`expected rc 2 (type stage), got ${rc}`);
+  if (diags.length !== 1) {
+    throw new Error(`expected 1 diagnostic, got: ${JSON.stringify(diags)}`);
+  }
+  if (diags[0].code !== "ufcs-not-method") {
+    throw new Error(
+      `the merge lost the category: ${JSON.stringify(diags[0])}`,
+    );
+  }
+  // `declLine` is 1-based and `declCol` 0-based, counted in the ENTRY: `function ` is 9
+  // characters, `skipTags` 8 more, then `(`, so `c` is column 18 of line 3.
+  sameData(
+    diags[0].data,
+    {
+      member: ["skipTags"],
+      recv: ["Cursor"],
+      reason: ["self-name"],
+      param: ["c"],
+      declLine: ["3"],
+      declCol: ["18"],
+    },
+    "the `self`-name gate under a merge",
+  );
+});
+
+Deno.test({
+  name: "diag-code: the `self`-name payload points into the DEPENDENCY that declares it",
+  ignore,
+}, () => {
+  const exp = instantiate();
+  const { rc, diags } = checkGraph(
+    exp,
+    "/w/entry.vl",
+    [
+      'import { Cursor, skipTags } from "./lib2"',
+      "const cur: Cursor = { pos: 3 }",
+      "print(cur.skipTags())",
+      "",
+    ].join("\n"),
+    {
+      "/w/lib2.vl": [
+        "export type Cursor = { pos: i32 }",
+        "export function skipTags(c: Cursor): i32 { return c.pos + 1 }",
+        "",
+      ].join("\n"),
+    },
+  );
+  if (rc !== 2) throw new Error(`expected rc 2 (type stage), got ${rc}`);
+  if (diags[0].code !== "ufcs-not-method") {
+    throw new Error(
+      `the merge lost the category: ${JSON.stringify(diags[0])}`,
+    );
+  }
+  // Counted in lib2.vl: `export ` 7 characters, `function ` 9 more, `skipTags` 8, then `(`,
+  // so `c` is column 25 of line 2 — a position in a file the entry never spells.
+  sameData(
+    diags[0].data,
+    {
+      member: ["skipTags"],
+      recv: ["Cursor"],
+      reason: ["self-name"],
+      param: ["c"],
+      declLine: ["2"],
+      declCol: ["25"],
+    },
+    "the `self`-name gate across a module boundary",
+  );
+});
+
 Deno.test({
   name: "diag-code: a `self` of another type reports `receiver`, not a missing field",
   ignore,

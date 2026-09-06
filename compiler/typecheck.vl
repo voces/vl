@@ -95,11 +95,9 @@ import { OP_INDEX_GET, OP_INDEX_SET, opDeclLabel, opDeclOpOf } from "./ast"
 // `nodeToks` alone anchors at its closing brace.
 import {
   nodeLastTok,
-  nodePos,
   nodeSpanEndTok,
   nodeStartTok,
   tokFirstLineEndCol,
-  tokIndexAt,
 } from "./fmt_util"
 import { sidArrGet, sidArrPut, sidLookup, sidOf } from "./symbols"
 import { arenaReplaceNode, isBinOpFuncName } from "./ast"
@@ -17447,6 +17445,17 @@ function ufcsNotImportedData(prop: string, specs: string, objTy: i32) {
   out + diagDataField("recv", demangleMsg(tyToStr(objTy)))
 }
 
+// The merged spelling of plain `prop` that `fnDeclIx` is keyed on, or "". A merge renames
+// every declaration and the caller's alias maps back only a `self`-function — which the
+// `self`-NAME gate is by definition not — so that gate arrived unmangled and missed (D1654).
+// `lookup` is the visibility test: a same-named function this file cannot see is not claimed.
+function ufcsMergedDeclOf(prop: string) {
+  for k in fnDeclIx.keys() {
+    if demangleName(k) == prop && lookup(k) >= 0 { return k }
+  }
+  ""
+}
+
 // D1570's gate classifier — which arm of the UFCS rule refused `recv.prop(argc args)`, given
 // that `prop` names a function in scope. 0 = no answer, 1 = the `self`-name rule, 2 = the
 // arity range, 3 = the receiver type. Mirrors `ufcsWouldDispatch` arm for arm, and stops
@@ -17473,15 +17482,14 @@ function ufcsNotMethodKind(name: string, recvTy: i32, argc: i32) {
 // The token spelling the first parameter's name in `name`'s declaration, or -1. The
 // identifier's own start, not the `Param` node's `nodeToks` anchor — that anchor is the
 // annotation's last token, so a rename quick-fix built on it would edit `Cursor`, not `c`.
-// `tokIndexAt` is sound here only while its caller cannot fire on a merged program (D1652).
+// Through `nodeStartTok`, which resolves inside the declaring module (D1652).
 function ufcsDeclParamTok(name: string) {
   const dIx = fnDeclIx[name] ?? -1
   if dIx < 0 { return -1 }
   const d = P.nodes[dIx]
   if d is FuncDecl {
     if d.fnParams.length == 0 { return -1 }
-    const sp = nodePos(d.fnParams[0])
-    if sp >= 0 { return tokIndexAt(sp) }
+    return nodeStartTok(d.fnParams[0])
   }
   -1
 }
@@ -17603,12 +17611,14 @@ function noteUfcsNotMethod(
   recvTy: i32,
   argc: i32,
 ) {
-  const kind = ufcsNotMethodKind(name, recvTy, argc)
+  let nm = name
+  if (fnDeclIx[nm] ?? -1) < 0 { nm = ufcsMergedDeclOf(prop) }
+  const kind = ufcsNotMethodKind(nm, recvTy, argc)
   if kind == 0 { return 0 }
   noteUfcsWhy(
     memIx,
-    ufcsNotMethodMsg(prop, name, recvTy, argc, kind),
-    ufcsNotMethodData(prop, name, recvTy, kind),
+    ufcsNotMethodMsg(prop, nm, recvTy, argc, kind),
+    ufcsNotMethodData(prop, nm, recvTy, kind),
   )
 }
 
