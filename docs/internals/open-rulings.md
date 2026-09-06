@@ -475,7 +475,9 @@ changes which program is legal rather than how a legal one compiles. None blocks
 recommendation is the coordinator's; the witness is the row's own `Repro:`, re-run by the
 `filed witnesses` gate, so a ruling can be graded the day it lands.
 
-### backtick-strings-second-form — do backticks earn their place beside `"…"`?
+### backtick-strings-second-form — do backticks earn their place beside `"…"`? — RULED 2026-09-06
+
+**Ruling (owner, 2026-09-06):** fold (Rust's rule): an ordinary `"…"` string may span lines and keeps the newline; a `\` before a newline joins the next line and strips its leading whitespace; backticks are removed. The formatter preserves interior newlines; an unterminated string is reported at its opening quote.
 
 **Measured 2026-09-05:** interpolation (`\{x}`) works in ordinary `"…"` strings; the ONLY
 thing a backtick literal adds is a literal newline inside the string. There is no raw-string
@@ -543,6 +545,8 @@ If the answer is no, the row closes as DESIGN with a message that names the loop
 
 ### D1686 / D1687 — what does the design owe a covariant list the closure cannot follow? — RULED 2026-09-06
 
+**Addendum (owner, 2026-09-06):** type-level readable/writable semantics were in the original plan as ROADMAP A9 ("Readable/Writable variance", unstarted; `modules-design.md` §exports depends on it). Priority is the coordinator's call: A9 is BACKLOGGED and the list view is built alone for now, spelled so A9 can subsume it.
+
 **Ruling (owner, 2026-09-06):** (a) — a read-only list view that is covariant; mutable lists stay invariant. The view is SHALLOW: it forbids writes to the list's shape (`push`/`pop`/`clear`/index assignment/`"[]="`) and says nothing about an element's own fields, as Kotlin's `List` and C#'s `IReadOnlyList` do. The keyword's spelling (`readonly T[]` proposed) and whether a parameter defaults to read-only are the build's questions, not this ruling's. D1686/D1687 close as DESIGN today and reopen as the view's grading list.
 
 The covariant-write analysis licenses a read-only copy of a `Circle[]` delivered as `Shape[]`
@@ -555,7 +559,9 @@ read-only in the type** (a `readonly Shape[]` parameter, or a distinct read-only
 until it exists**; the refusal today names a contract ("delivered to a callee whose body this
 program can point at, and to no other") and is honest.
 
-### fmt-fill-style-scalar-lists — how does `vl fmt` lay out a long scalar list?
+### fmt-fill-style-scalar-lists — how does `vl fmt` lay out a long scalar list? — RULED 2026-09-06
+
+**Ruling (owner, 2026-09-06):** (a), fill scalar-literal lists, with one deterministic intent rule: if the author's literal already has two or more rows and every row holds the same number of elements, the rows are kept (a 2-D table written as 1-D); otherwise fill. No opt-out comment.
 
 Today a list literal that does not fit on one line goes one element per line, so a 200-entry
 `u8[]` table is 200 lines. **Options.** (a) fill-style (as many elements per line as fit,
@@ -563,7 +569,9 @@ wrapped at the column) for lists whose elements are ALL scalar literals; (b) one
 always. **Recommendation: (a)**, scalar literals only — anything with a struct, closure or
 nested list element keeps one-per-line, so the rule is decidable from the element kinds alone.
 
-### D1773 — a negation type in a many-values-per-slot position: refused, by design or by gap?
+### D1773 — a negation type in a many-values-per-slot position: refused, by design or by gap? — RULED 2026-09-06
+
+**Ruling (owner, 2026-09-06):** a WRITTEN negation type (`!T` in any annotation — binding, alias, parameter, element, field, map value, return) is refused by the checker with one sentence; `x !is T` narrowing over a union stays, since there the "not T" is subtracted from a known set and is never written. Full negation tracking waits for A4/A12. D1773, D1775, D1784, D1785 and D1800 close as DESIGN; #2790's alias-transparency rungs are removed by the refusal lane; #2807 and #2813 were closed unmerged.
 
 `type N = !string` is a checker-only refinement with no rep of its own, so a BINDING takes its
 initializer's rep and now runs (D1775, #2790; D1773's nine owed cells, #2807). The ten cells
