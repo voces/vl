@@ -54,6 +54,13 @@ def main():
         print(__doc__.strip())
         return 2
     seed = sys.argv[1]
+    # THE SEED IS POSITIONAL, so a flag in slot 1 grades every cell against a path that
+    # cannot instantiate and reports the whole corpus as `runs -> NOT-RUNS`. That is a
+    # catastrophic-looking answer to a usage error, so it is a usage error.
+    if seed.startswith("-") or not os.path.isfile(seed):
+        print(f"regress.py: argv[1] is the SEED wasm, and {seed!r} is not a file — "
+              f"usage: regress.py <seed.wasm> [--verify-fresh] [...]")
+        return 2
     baseline = arg("--baseline", os.path.join(HERE, "baseline.jsonl"))
     out = arg("--json", os.path.join(HERE, ".last.json"))
 
