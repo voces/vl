@@ -260,22 +260,23 @@ of them is a violation with a test defending it.
 The probe runner moved **155 of 158 run · 3 refuse** → **155 of 180 run · 25 refuse**. Every new
 GAP is a program the type system accepts and codegen will not build.
 
-### Three clause-1 findings, verified, with no row yet
+### Three clause-1 findings, verified — D1667, D1668, D1669
 
 Found while hunting witnesses. Each is `vl check` rc 0 followed by an INVALID MODULE (exit 70),
-each was re-run independently, and each has a probe:
+each was re-run independently, and each has a probe and a filed row:
 
 * **`?.` over a call through a function VALUE** — `unknown local 0: local index out of bounds`.
   `mk()?.y` runs, and `const t = g(); t?.y` runs; the inline call under `?.` through a value
   binding is the ingredient, and a struct-field closure receiver reproduces it.
-  `optchain-over-fn-value-call-result.vl`.
+  `optchain-over-fn-value-call-result.vl`, D1667.
 * **An if-expression as an ARRAY-LITERAL element, beside a union declaration** — `type mismatch:
   expected i32, found (ref $type)`. Deleting the union makes it run. No `arrLitIsRef` rung claims
   an if-expression element, and `emitArr`'s own loud floor misses it the same way.
-  `if-expr-array-element-beside-a-union.vl`.
+  `if-expr-array-element-beside-a-union.vl`, D1668.
 * **`__array_new__` with an i64 fill, bound to a local and returned as `T[]` from a generic** —
   `type mismatch: expected i32, found (ref $type)` inside the instance. The i32 and f64 pins run,
-  and returning the call directly runs. `generic-array-new-i64-fill-returned-list.vl`.
+  returning the call directly runs, and annotating the local runs.
+  `generic-array-new-i64-fill-returned-list.vl`, D1669.
 
 ### Side-findings, not folded into the estimate
 
