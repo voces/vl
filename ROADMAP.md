@@ -48,7 +48,7 @@ units: **hours** · **half-day** · **days**.
 | # | item | witness, run today | region | effort |
 | --- | --- | --- | --- | --- |
 | 1 | **A-OPMOD — a user-defined binary operator dispatches only in a SINGLE-FILE program, and `std:` counts** | `function "+"(self: V, b: V)` + `print((a + b).x)` prints `3`; add ONE `import { toString } from "std:fmt"` and nothing else → `operator '+' is not defined for V and V`. The roadmap's own witness (a LOCAL import) reproduces identically | `driver.vl:441 modRenameTo` × `ast.vl:1442 isBinOpFuncName` × `typecheck.vl:20007 opSelfFnTy`. The row's mangling attribution is explicitly uninstrumented — confirm it first | days |
-| 2 | **B15 — a nested capturing function cannot be taken as a value** | `function o(n) { function k(x) x + n; k(1) }` → `emitProgram: cannot take the generic function \`k\` as a value … Call sites pin \`k\` at (i32)` | `wasmEmit.vl:1506` — the item says exactly ONE arm | **hours** |
+| 2 | **B15 — a nested capturing function cannot be taken as a value.** **RE-PRICED 2026-09-06: gated on [D1780](internals/inventory/D1780.md), not `hours`** — the floor is load-bearing over a clause-1 miscompile and lifting it first ships more of them | `function o(n) { function k(x) { return x + n }; return k(1) }` → `emitProgram: cannot take the generic function \`k\` as a value`; the annotated twin runs at ONE pin, and at TWO pins it is invalid wasm (D1780) | `wasmEmit.vl:1475 emitClosureValue` reached via `emitCapturedCall:21404`; the instancing is `emit_mono.vl` and its decline is NOT yet instrumented | days (D1780 first) |
 | 3 | **D1775 — a `type` alias over a negation type reps as a union BOX with a scalar value** | `type N = !string; const x: N = 5` → `vl check` rc 0, then `type mismatch: expected (ref $type), found i32`. `wasm-dis`: `(global $global$0 (mut (ref $1)) (i32.const 5))`. The INLINE spelling runs | `typecheck.vl` / `emit_classify.vl` rep classification of an alias body | hours–half-day |
 | 4 | **D1744 — a deep-`is` site anywhere flattens the union alias** | `f` alone checks clean; add an UNUSED `g` whose body is `e is Cfg` → `` `is` check type 'J' is not a variant of … `` | `typecheck.vl` ~33795 (`jsonDeepIsSite` / `isWidenNotVariant`) | hours–half-day |
 | 5 | **B21.1 — `match` payload renaming and nested destructuring** | `Move{x: a}` → `parse error … match payload binding must be a field name` | `parser.vl:2847`; `match-design.md` measures both as one-branch extensions | hours (renaming) / half-day (nesting) |
@@ -2362,10 +2362,23 @@ in-language GC knobs.
   materialize against, so it needs the callback's type inferred from the HOF's own BODY. The
   reject names the function, the un-annotated parameters, and the signatures the program's own
   call sites already pin (`error-generic-fn-value-inferred-hof.vl`). What a nested CAPTURING
-  function still owes this entry is exactly ONE arm and it is loud: a nested function whose OWN
-  parameter is un-annotated is lowered through the value ABI at the i32 default and hits that
-  reject even though it is only ever called directly by name (`function o(n) { function k(x) x +
-  n; k(1) }`). The f64/string half of that family was NEVER this ABI — it was the env FIELD and
+  function still owes this entry was filed as exactly ONE arm and it is loud: a nested function
+  whose OWN parameter is un-annotated is lowered through the value ABI at the i32 default and
+  hits that reject even though it is only ever called directly by name (`function o(n) {
+  function k(x) x + n; k(1) }` — the direct call reaches `emitClosureValue` through
+  `emitCapturedCall`, which synthesizes a closure so the captures survive).
+  **STATUS 2026-09-06: it is NOT one arm — the floor is load-bearing over
+  [D1780](internals/inventory/D1780.md) and must not be lifted first.** A nested function that
+  captures its enclosing function's parameter is lifted ONCE and shared across every
+  monomorphized instance, so at two pins `o$1` calls the one `$k` with the wrong captured type:
+  `vl check` rc 0, then invalid wasm, with `wasm-dis` showing `$o`, `$k`, `$o$1` and no `k$1`.
+  The refusal is over-broad at ONE pin — the annotated twin runs — and is the only thing standing
+  between the program and that miscompile at two. Build the per-instance nested clone, then
+  narrow the floor (the D965 order). Two source-read attributions were already refuted by
+  measurement, so instrument the decline rather than reading it: the `LetDecl`-vs-`FuncDecl` arm
+  is not it (both spellings fail) and neither is the `typarams.length == 0` early return (an
+  explicit `<T>` fails identically). And `monoPinnedSigsOf`'s message under-reports at two pins,
+  so "adopt the unique pinned signature" is not a sound fix either. The f64/string half of that family was NEVER this ABI — it was the env FIELD and
   the READ out of it being typed by different answers, closed under workboard D8; the tell is that
   annotating `k`'s parameter does not move it while annotating `o`'s does. Also open: an inline
   object shape that COINCIDES with a declared alias's shape is a separate emitter limit
