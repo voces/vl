@@ -2240,11 +2240,19 @@ function mkMapTy(key: i32, val: i32, isSet: i32) {
 // The one home of which hash a `Map`/`Set` key takes: the rep has exactly two, `string`
 // (element-wise, `__str_hash__`) and `i32` (the integer mix). Answers the arena type the keys
 // hash as, or -1 for a key the rep cannot hold, and every gate projects this answer. The test is
-// the lowering — a newtype hashes as its base, and a literal union is refused as ambiguous.
+// the LOWERING, so a newtype hashes as its base and a literal union as the i32 it reps as (D1748).
 export function mapKeyRepTy(k: i32) {
   if tyIsPrimNamed(k, "i32") { return TY_I32 }
   if tyIsPrimNamed(k, "string") { return TY_STR }
+  if tyLitUnionHashesI32(k) { return TY_I32 }
   -1
+}
+
+// A literal union whose values rep as an i32, so the integer mix hashes them: a string one as
+// the interned atom, a numeric one as its base, and only where that base is i32 (D1748).
+export function tyLitUnionHashesI32(k: i32): boolean {
+  if tyIsLitUnion(k) { return true }
+  numLitUnionBaseTy(k) == TY_I32
 }
 
 // The decision form of `mapKeyRepTy` — can the map rep hash this key at all. The caller that says
@@ -17654,11 +17662,13 @@ function bmArgMsg(form: i32, label: string, got: i32, want: i32, ctx: i32) {
 // Asking the plain predicate where the arm asks the expression invents a false reject — the
 // boolean-into-i32 coercion and float-literal-into-f32 rule live at the expression seam (D551).
 function bmArgPred(form: i32, got: i32, want: i32, argIx: i32) {
-  if form == BM_PUSH || form == BM_SETVAL {
+  if form == BM_PUSH || form == BM_SETVAL || form == BM_KEYMUST {
     return assignableExpr(argIx, got, want)
   }
   if form == BM_SETKEY {
-    if assignable(got, want) { return true }
+    // The expression form first: a MEMBER literal is a legal key of a literal-union-keyed
+    // map, and its own type is the member, not the `string` `checkNode` hands back (D1748).
+    if assignableExpr(argIx, got, want) { return true }
     return nomSlotAccepts(argIx, got, want)
   }
   assignable(got, want)
@@ -29243,6 +29253,13 @@ export function numLitUnionArrayBaseName(ty: i32): string {
 // Whether the named type `name` (a `type K = "a" | "b"` alias) is a literal union — the
 // emitter's annotation-side query (the checker preserves literal members even though the
 // emit-side `udVariants` are widened to `"string"`).
+// The spelling-side twin of `tyLitUnionHashesI32`, for the emitter's name-keyed key question.
+export function nameIsI32HashedLitUnion(name: string): boolean {
+  const hit = cUserTypes[name]
+  if hit is i32 { return tyLitUnionHashesI32(hit) }
+  nameIsInlineLitUnion(name)
+}
+
 export function nameIsLitUnionType(name: string) {
   const luHit = cUserTypes[name]
   if luHit is i32 {
@@ -33215,7 +33232,10 @@ function checkIndexNode(n: Index, ix: i32) {
   // A map index: the key must match the map's key type; a read yields the nullable value
   // (`V | null`), and an assignment target accepts a plain `V`.
   if at is TyMap {
-    if !assignable(idxTy, at.mKey) {
+    // The expression form, for the same reason `m.get`'s does: `m["green"]` on a
+    // literal-union-keyed map is a member of that union, and `checkNode` types a string
+    // literal as the widened `string` with no destination to narrow it against (D1748).
+    if !assignableExpr(n.idxIndex, idxTy, at.mKey) {
       tErr(
         "map key must be " + tyToStr(at.mKey) + ", got " + tyToStr(idxTy),
         n.idxIndex,

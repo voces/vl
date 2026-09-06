@@ -74,6 +74,9 @@ built. Relative imports between the sections resolve. See `split_files`.
 import json, re, subprocess, sys, tempfile, os
 from pathlib import Path
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import seed_provenance
+
 VL = "./scripts/vl-host/target/release/vl"
 COMPILER = "build/vl-compiler.wasm"
 
@@ -490,6 +493,11 @@ def main(argv):
     print(f"\n{len(results)} graded · {len(results)-len(moved)} as filed · "
           f"{len(moved)} MOVED · {len(ungradable)} not graded · "
           f"{len(unparsed)} UNPARSED")
+    # EVERY ROW ABOVE WAS GRADED AGAINST A SEED, so the summary names which one. A grade is a
+    # statement about the compiler that seed was built from, and on 2026-09-06 a hand run after
+    # a branch switch — no `refresh-compiler.sh` — reported three MOVED rows whose fixes had
+    # landed. `gate.sh` never hits it because it refreshes first; a hand run has no such step.
+    prov = seed_provenance.guard("check-filed-witnesses", len(moved), out=sys.stdout)
     if moved:
         print("\nRows whose filed behaviour no longer reproduces — re-grade the doc:")
         for r in moved:
@@ -525,7 +533,7 @@ def main(argv):
     if out_json:
         Path(out_json).write_text(json.dumps(results, indent=2))
         print(f"\nwrote {out_json}")
-    return 1 if (moved or unparsed or (ungradable and strict)) else 0
+    return prov or (1 if (moved or unparsed or (ungradable and strict)) else 0)
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv[1:]))

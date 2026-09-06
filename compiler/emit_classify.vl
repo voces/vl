@@ -248,6 +248,7 @@ import {
   memberPathKeyOf,
   moduleBindsLoopVar,
   moduleLocalLetOf,
+  moduleLocalLetOfAt,
   moduleLocalLetOfUnique,
   nameIsBareMap,
   nameIsClosureArray,
@@ -2782,17 +2783,28 @@ function letInitTyIsStruct(letIx: i32): boolean {
   false
 }
 
-// Whether that initializer is a nested-struct FIELD read — the one projection shape whose
-// slot is nullable, so the kind above it must be `nulstruct` and not `struct` (D1476).
-function letInitIsNestedStructField(letIx: i32): boolean {
+// Whether the initializer is a nested-struct FIELD read — the one projection shape whose slot
+// is nullable, so a cell over it is `nulstruct` and not `struct` (D1476). Annotation-blind:
+// the field's storage is what it is, and the capture classifier asks this of an ANNOTATED
+// binding too, where the annotation's own kind is the non-null twin (D1759).
+function initIsNestedStructFieldRead(letIx: i32): boolean {
   const d = P.nodes[letIx]
   if d is LetDecl {
-    if d.letType >= 0 { return false }
     if d.letInit < 0 { return false }
     const e = P.nodes[unwrapParen(d.letInit)]
     if e is Member { return isStructOfTy(nodeTyIxOf(d.letInit)) }
   }
   false
+}
+
+// The `letInitCellKind` rung's own entry: UN-annotated only, since an annotated binding's cell
+// is the annotation's and this ladder never sees one.
+function letInitIsNestedStructField(letIx: i32): boolean {
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 { return false }
+  }
+  initIsNestedStructFieldRead(letIx)
 }
 
 // An un-annotated binding's PROJECTION initializer node, or -1 — an index or a field read,
@@ -4161,7 +4173,13 @@ export function parentBindingOf(fe: i32, name: string) {
   // chain for a closure written in a module-scope block and every ref-repped capture there
   // takes `captureValKind`'s i32 default. `moduleLocalLetOf` excludes top-level bindings,
   // which are globals and never captures.
-  if par < 0 { return moduleLocalLetOf(emitRootIx, name) }
+  if par < 0 {
+    // The reader is the lifted function's own declaration node, which is what picks among
+    // sibling blocks binding one name; an out-of-range `fe` has no position to offer.
+    let atIx = -1
+    if fe >= 0 && fe < fnStmts.length { atIx = fnStmts[fe] }
+    return moduleLocalLetOfAt(emitRootIx, name, atIx)
+  }
   const pfn = P.nodes[fnStmts[par]]
   if pfn is FuncDecl {
     const params = pfn.fnParams
@@ -4287,6 +4305,10 @@ export function captureValKind(fe: i32, name: string): VKind {
         if nicheK != null {
           const initK = letInitCellKind(b, parentBindingFrameArenaOf(fe, name))
           if initK == nicheK { return nicheK }
+          // The rung above reads the frame, and a MODULE-frame block binding has none, so a
+          // field read's nullable slot goes unseen exactly where the ladder cannot ask. This
+          // one is frame-blind: the field's storage decides it, not the scope (D1759).
+          if initIsNestedStructFieldRead(b) { return nicheK }
         }
       }
       return annK
@@ -11837,7 +11859,7 @@ export function cloCallSigKey(callIx: i32, fnIx: i32) {
     // The syntactic resolvers — fast (no type render): a function-typed binding/param Ident, a struct
     // field closure, an indexed closure-array element.
     if cre is Ident {
-      const k = calleeCloSigKeySid(sidOfNode(cfx), fnIx)
+      const k = calleeCloSigKeyAt(sidOfNode(cfx), fnIx, cfx)
       if k != "" {
         // The interned-divergence override: the syntactic resolvers are name-shaped, and a
         // name cannot always answer what a type can — a litunion whose spelling softened keys
@@ -21197,6 +21219,18 @@ function capturedIsNulLitUnion(fnIx: i32, name: string) {
 // answers the litunion question falsely. Depth-bounded (32), since a declaration chain is a DAG.
 function declFallbackDepthCap() { 32 }
 
+// Does the list LITERAL at `arrIx` lower its elements as interned atoms? A non-literal array
+// is not this question and answers true, since its own declaration fixed the rep. The one place
+// the element-pin reader asks about a REP rather than a type (D1756).
+function arrLitElemRepIsAtom(arrIx: i32, fnIx: i32): boolean {
+  const a = P.nodes[unwrapParen(arrIx)]
+  if a is ArrayLit {
+    if a.arrElems.length < 1 { return true }
+    return exprIsLitAtom(a.arrElems[0], fnIx)
+  }
+  true
+}
+
 // The element arena type of the array expression `arrIx` when that element is a literal
 // union, or -1. `nodeArrayElemIsLitUnion` is exactly the `tyIsLitUnion` of its direct half.
 export function arrElemLitUnionTy(arrIx: i32, fnIx: i32) {
@@ -21216,7 +21250,13 @@ function arrElemLitUnionTyAt(arrIx: i32, fnIx: i32, depth: i32): i32 {
   // element — `const xs = [a]` over a hole parameter records `<hole>[]` — and every rung above
   // asks the container, so this is the only one that reaches the pinned litunion (D1725).
   const pinElemHole = pinnedHoleTyOf(nodeArrayElemTyIx(arrIx))
-  if tyIsLitUnion(pinElemHole) { return pinElemHole }
+  if tyIsLitUnion(pinElemHole) {
+    // A list LITERAL's rep comes from what its elements LOWER as, not from the type they pin
+    // to: a parameter pinned at the softened `string` carries the same literal union as one
+    // pinned at an alias, and only the first builds a string list. `exprIsLitAtom` is that rep
+    // question, and this reader has the frame it needs (D1756).
+    if arrLitElemRepIsAtom(arrIx, fnIx) { return pinElemHole }
+  }
   if depth >= declFallbackDepthCap() { return 0 - 1 }
   const n = P.nodes[unwrapParen(arrIx)]
   if n is Ident {
@@ -21302,6 +21342,28 @@ function declLitUnionTyAt(
   0 - 1
 }
 
+// Does index receiver `arrIx` denote a local bound to a list LITERAL whose elements lower as
+// string refs? An annotated binding is not this question — its annotation fixed the rep — and
+// neither is a parameter or a global, both of which reach their elements by another route.
+function idxRecvIsStrList(arrIx: i32, fnIx: i32) {
+  if fnIx < 0 { return false }
+  const n = P.nodes[unwrapParen(arrIx)]
+  if n is Ident {
+    const slot = declaredSlotOf(n.identName)
+    if slot < 0 || slot >= localDeclIx.length { return false }
+    const d = localDeclIx[slot]
+    if d < 0 { return false }
+    const dn = P.nodes[d]
+    if dn is LetDecl {
+      if dn.letType >= 0 { return false }
+      if dn.letInit < 0 { return false }
+      const iv = P.nodes[unwrapParen(dn.letInit)]
+      if iv is ArrayLit { return arrLitIsStr(dn.letInit, fnIx) }
+    }
+  }
+  false
+}
+
 // True if `exprIx` is a literal-union atom value (an i32 id) — a litunion-flagged local or a
 // litunion-annotated param. Distinguishes a real atom from a checker-inferred literal union.
 export function exprIsLitAtom(exprIx: i32, fnIx: i32) {
@@ -21343,6 +21405,11 @@ export function exprIsLitAtom(exprIx: i32, fnIx: i32) {
     }
   }
   if e is Index {
+    // Every rung below asks a TYPE, and a literal union's type does not carry its rep: a list
+    // built over a parameter pinned at the softened `string` holds string refs while its
+    // element type is the same union an atom list has. The receiver's own literal is the rep,
+    // and claiming an atom over it emits an i32 consumer for a `(ref $type)` (D1740).
+    if idxRecvIsStrList(e.idxArr, fnIx) { return false }
     // `xs[i]` over a literal-union array yields an atom element, through the declaration
     // fallback: a monomorphized instance's receiver records the generic's `T[]`, so the
     // direct probe answers false for an array it should claim. Without it, a generic
@@ -32313,6 +32380,13 @@ export function identClosureFe(name: string, fnIx: i32) {
 // even when the caller has no arena index to offer — with one (`sidOfNode`), it replaces
 // two with zero.
 export function identClosureFeSid(sid: i32, fnIx: i32) {
+  identClosureFeAt(sid, fnIx, -1)
+}
+
+// The positioned form: `atIx` is the reader's own arena node, which is what picks among
+// sibling module-scope blocks binding one name. Every other scope is keyed by its frame
+// already, so the module rung is the only one that reads it.
+export function identClosureFeAt(sid: i32, fnIx: i32, atIx: i32) {
   if fnIx >= 0 {
     const fn = P.nodes[fnIx]
     if fn is FuncDecl {
@@ -32330,7 +32404,7 @@ export function identClosureFeSid(sid: i32, fnIx: i32) {
   }
   // The module frame (D1350), the third scope this resolver must reach: `fnIx < 0` is the
   // start function, whose locals live in no `fnBody` and are not globals either.
-  const ml = moduleLocalLetOf(emitRootIx, sidText(sid))
+  const ml = moduleLocalLetOfAt(emitRootIx, sidText(sid), atIx)
   if ml >= 0 {
     const md = P.nodes[ml]
     if md is LetDecl { return fieldValueFeOf(md.letInit) }
@@ -32483,6 +32557,12 @@ function calleeCloSigKey(name: string, fnIx: i32) {
 // hash-and-probes — and the ~14 `calleeRetKind` call sites hand it the callee node's id
 // straight from the carrier, paying none at all.
 function calleeCloSigKeySid(sid: i32, fnIx: i32) {
+  calleeCloSigKeyAt(sid, fnIx, -1)
+}
+
+// The positioned form: `atIx` is the callee identifier's own arena node, threaded to the two
+// rungs that resolve a module-scope block-local binding by name (D1751).
+function calleeCloSigKeyAt(sid: i32, fnIx: i32, atIx: i32) {
   const name = sidText(sid)
   // A union binding narrowed to a bare-closure arm (`if x is () => i64 { x() }`): the arm's
   // function-type name interns the SAME `$fnsig` an annotated closure would — so the `call_ref`
@@ -32519,7 +32599,7 @@ function calleeCloSigKeySid(sid: i32, fnIx: i32) {
     const ak = cloNameSigKey(an)
     if ak != "" { return ak }
   }
-  const fe = identClosureFeSid(csid, fnIx)
+  const fe = identClosureFeAt(csid, fnIx, atIx)
   // The extended key (not just `fnSigKeyOf`) so a void-returning binding resolves its `>v`
   // sig, interned above; a value-eligible binding takes the same key `fnSigKeyOf` would.
   if fe >= 0 { return cloSigKeyExt(fe) }
@@ -32537,8 +32617,8 @@ function calleeCloSigKeySid(sid: i32, fnIx: i32) {
   if letIx < 0 { letIx = globalLetOfSidIn(fnIx, csid) }
   // The module frame, the third scope this ladder must reach, exactly as `identClosureFeSid`
   // reaches it (D1350): a binding in a module-scope BLOCK lives in no `fnBody` and is not a
-  // global. The unique reader, since a sig chosen off the first of two same-named blocks is D1596.
-  if letIx < 0 { letIx = moduleLocalLetOfUnique(emitRootIx, name) }
+  // global. Positioned, since a sig chosen off the first of two same-named blocks is D1596.
+  if letIx < 0 { letIx = moduleLocalLetOfAt(emitRootIx, name, atIx) }
   if letIx >= 0 {
     const cd = P.nodes[letIx]
     if cd is LetDecl {
@@ -32560,7 +32640,9 @@ function calleeCloSigKeySid(sid: i32, fnIx: i32) {
   // registry and the module frame. Re-asked against the frame that owns the binding, so a
   // captured void closure resolves its `>v` sig and its call stays a statement (D1634).
   const cowner = capturedBindingFrameOf(fnIx, name)
-  if cowner >= 0 && cowner != fnIx { return calleeCloSigKeySid(sid, cowner) }
+  if cowner >= 0 && cowner != fnIx {
+    return calleeCloSigKeyAt(sid, cowner, atIx)
+  }
   ""
 }
 
