@@ -7051,11 +7051,15 @@ function eqgListKindOfExpr(exprIx: i32, fnIx: i32) {
   -1
 }
 
+// `lopK` is this node's own `listOpKindOfBin`, passed in rather than re-derived: every caller
+// holds it. Threaded and not memoised — the answer reads the emitter's live tables and the
+// narrowing stack, so a memo would need a generation key a caller holding the value does not.
+
 // The generic-compare rep of a `==` or `!=` whose operands are both lists of one rep that has
 // no core of its own, or -1. Both must resolve to the same rep and the same ref-list slot, as
 // `catListKindOfBin` requires and for the same reason: two ref lists at different slots have
 // different wrapper and backing heap types, and one core cannot read both.
-export function eqgListKindOfBin(binIx: i32, fnIx: i32) {
+export function eqgListKindOfBin(binIx: i32, fnIx: i32, lopK: i32) {
   const e = P.nodes[binIx]
   if e is BinExpr {
     if e.binOp == "==" || e.binOp == "!=" {
@@ -7063,7 +7067,7 @@ export function eqgListKindOfBin(binIx: i32, fnIx: i32) {
       if P.nodes[unwrapParen(e.binLeft)] is NullLit { return -1 }
       if P.nodes[unwrapParen(e.binRight)] is NullLit { return -1 }
       // The three existing cores decide every shape they claim.
-      if listOpKindOfBin(binIx, fnIx) >= 0 { return -1 }
+      if lopK >= 0 { return -1 }
       // So does the checker's own token, the stronger of the two gates: `eqCmpKindOfOperand`
       // names the core the checker accepted this program for, so a token naming one of the old
       // three is that core's shape however the classifiers read it. A token of -1 is the opaque
@@ -7130,10 +7134,14 @@ export function listOpKindOfBin(binIx: i32, fnIx: i32) {
 }
 
 // ── `==` compare-core selection — the one home ───────────────────────────────
+
+// `lopK` is this node's own `listOpKindOfBin`, threaded in for the reason `eqgListKindOfBin`
+// states: both are asked of one node by callers that already hold the answer.
+
 // Which compare core a `==` needs, or -1 for none. Read by the frame-reservation scan and by
 // the core emitter, which must never disagree: a core the scan does not know about is emitted
 // against locals the function never declared. `nodeEqCmpKind` is the classifiers' fallback.
-export function eqCoreKindOfBin(binIx: i32, fnIx: i32) {
+export function eqCoreKindOfBin(binIx: i32, fnIx: i32, lopK: i32) {
   const e = P.nodes[binIx]
   if e is BinExpr {
     if e.binOp == "==" || e.binOp == "!=" {
@@ -7142,13 +7150,12 @@ export function eqCoreKindOfBin(binIx: i32, fnIx: i32) {
       // language and shift every local index after it.
       if P.nodes[unwrapParen(e.binLeft)] is NullLit { return -1 }
       if P.nodes[unwrapParen(e.binRight)] is NullLit { return -1 }
-      const lk = listOpKindOfBin(binIx, fnIx)
-      if lk >= 0 { return lk }
+      if lopK >= 0 { return lopK }
       // The generic list compare, above the string and closure rungs for the same reason the
       // three cores above it are: a list operand must be claimed by a list answer before a
       // scalar ladder reads it. Its own home declines every shape `listOpKindOfBin` claims, so
       // this rung can only add a rep that had no core at all.
-      if eqgListKindOfBin(binIx, fnIx) >= 0 { return 7 }
+      if eqgListKindOfBin(binIx, fnIx, lopK) >= 0 { return 7 }
       if exprIsStrEq(binIx, fnIx) { return 5 }
       if exprIsClosure(e.binLeft, fnIx) || exprIsClosure(e.binRight, fnIx) {
         return 6
@@ -21197,6 +21204,18 @@ function capturedIsNulLitUnion(fnIx: i32, name: string) {
 // answers the litunion question falsely. Depth-bounded (32), since a declaration chain is a DAG.
 function declFallbackDepthCap() { 32 }
 
+// Does the list LITERAL at `arrIx` lower its elements as interned atoms? A non-literal array
+// is not this question and answers true, since its own declaration fixed the rep. The one place
+// the element-pin reader asks about a REP rather than a type (D1756).
+function arrLitElemRepIsAtom(arrIx: i32, fnIx: i32): boolean {
+  const a = P.nodes[unwrapParen(arrIx)]
+  if a is ArrayLit {
+    if a.arrElems.length < 1 { return true }
+    return exprIsLitAtom(a.arrElems[0], fnIx)
+  }
+  true
+}
+
 // The element arena type of the array expression `arrIx` when that element is a literal
 // union, or -1. `nodeArrayElemIsLitUnion` is exactly the `tyIsLitUnion` of its direct half.
 export function arrElemLitUnionTy(arrIx: i32, fnIx: i32) {
@@ -21216,7 +21235,13 @@ function arrElemLitUnionTyAt(arrIx: i32, fnIx: i32, depth: i32): i32 {
   // element — `const xs = [a]` over a hole parameter records `<hole>[]` — and every rung above
   // asks the container, so this is the only one that reaches the pinned litunion (D1725).
   const pinElemHole = pinnedHoleTyOf(nodeArrayElemTyIx(arrIx))
-  if tyIsLitUnion(pinElemHole) { return pinElemHole }
+  if tyIsLitUnion(pinElemHole) {
+    // A list LITERAL's rep comes from what its elements LOWER as, not from the type they pin
+    // to: a parameter pinned at the softened `string` carries the same literal union as one
+    // pinned at an alias, and only the first builds a string list. `exprIsLitAtom` is that rep
+    // question, and this reader has the frame it needs (D1756).
+    if arrLitElemRepIsAtom(arrIx, fnIx) { return pinElemHole }
+  }
   if depth >= declFallbackDepthCap() { return 0 - 1 }
   const n = P.nodes[unwrapParen(arrIx)]
   if n is Ident {
@@ -21302,6 +21327,28 @@ function declLitUnionTyAt(
   0 - 1
 }
 
+// Does index receiver `arrIx` denote a local bound to a list LITERAL whose elements lower as
+// string refs? An annotated binding is not this question — its annotation fixed the rep — and
+// neither is a parameter or a global, both of which reach their elements by another route.
+function idxRecvIsStrList(arrIx: i32, fnIx: i32) {
+  if fnIx < 0 { return false }
+  const n = P.nodes[unwrapParen(arrIx)]
+  if n is Ident {
+    const slot = declaredSlotOf(n.identName)
+    if slot < 0 || slot >= localDeclIx.length { return false }
+    const d = localDeclIx[slot]
+    if d < 0 { return false }
+    const dn = P.nodes[d]
+    if dn is LetDecl {
+      if dn.letType >= 0 { return false }
+      if dn.letInit < 0 { return false }
+      const iv = P.nodes[unwrapParen(dn.letInit)]
+      if iv is ArrayLit { return arrLitIsStr(dn.letInit, fnIx) }
+    }
+  }
+  false
+}
+
 // True if `exprIx` is a literal-union atom value (an i32 id) — a litunion-flagged local or a
 // litunion-annotated param. Distinguishes a real atom from a checker-inferred literal union.
 export function exprIsLitAtom(exprIx: i32, fnIx: i32) {
@@ -21343,6 +21390,11 @@ export function exprIsLitAtom(exprIx: i32, fnIx: i32) {
     }
   }
   if e is Index {
+    // Every rung below asks a TYPE, and a literal union's type does not carry its rep: a list
+    // built over a parameter pinned at the softened `string` holds string refs while its
+    // element type is the same union an atom list has. The receiver's own literal is the rep,
+    // and claiming an atom over it emits an i32 consumer for a `(ref $type)` (D1740).
+    if idxRecvIsStrList(e.idxArr, fnIx) { return false }
     // `xs[i]` over a literal-union array yields an atom element, through the declaration
     // fallback: a monomorphized instance's receiver records the generic's `T[]`, so the
     // direct probe answers false for an array it should claim. Without it, a generic

@@ -285,9 +285,16 @@ classifiers claims, and **190 of 5,173** detection passes are `dupScanRun`'s per
 instead: the `k == 7` gate on the direct `eqgListKindOfBin`, one operator gate at
 `leqScanExpr`, and the list-op scan leading `fnDetectScratch` so every monotone-flag leg behind
 it is skipped once its flag is true — `fnDetectScratch` 24.47% → 20.16%, L2 user CPU −4.0%.
-**The remaining redundancy is inside `eqCoreKindOfBin` and `eqgListKindOfBin`
-(`emit_classify.vl`), which re-derive `listOpKindOfBin` for the same `(binIx, fnIx)`; a memo
-there is worth ~2.5% and is the follow-up this row leaves open.**
+**The remaining redundancy was inside `eqCoreKindOfBin` and `eqgListKindOfBin`
+(`emit_classify.vl`), which re-derived `listOpKindOfBin` for the same `(binIx, fnIx)`.**
+
+*Closed 2026-09-06, and NOT as a memo.* Every caller already holds the answer, so both take
+`lopK` as a parameter and the four asks per `==` become one; a memo would have needed a
+generation key, because the answer reads the emitter's live tables and the narrowing stack.
+Measured over two guest profiles of the same self-compile: `dupScanRun` **20.99% → 15.58%**
+inclusive, `fnDetectScratch` **20.87% → 15.44%**, `leqNoteBin` **13.33% → 7.50%**,
+`listOpKindOfBin` **10.78% → 4.79%**. Interleaved L2 CPU A/B, five pairs on a loaded box: the
+candidate is lower in 5 of 5, ratio 0.77–0.93, and the least-contended pair reads −7.5%.
 
 ### 5.3 `dsRebindsName` and the `parentLetOf` cache — the ring is REFUTED, the walk is an index
 

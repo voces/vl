@@ -176,9 +176,15 @@ run "inventory refs"           deno test -A --no-check tests/vl_inventory_refs_t
 # by count, and nothing re-ran one of them: row 8 said "campaign" for work #2607
 # had shipped, and row 7 named two functions #2567 merged away. This runs each row's own
 # `Measure:` block, and REDS only on a number that cannot be re-read at all — a row that
-# moved is printed, since movement is the finding. ~3-6s; the profile-share rows need
-# `--profile <guest-profile.json>` and are a deliberate manual pass, not a merge gate.
-run "survey measurements"      bash -c "\"$PY\" scripts/survey-regrade.py --self-test >/dev/null && \"$PY\" scripts/survey-regrade.py docs/internals/code-quality-survey-2026-09/README.md"
+# moved is printed, since movement is the finding.
+#
+# THE SHARE ROWS ARE IN IT, and `--strict` alone would not have put them there: without a
+# profile they report `skipped`, which is neither `moved` nor `broken`, so a run measuring
+# none of the four exits 0 and reads exactly like one measuring all four. `--require-profile`
+# is what makes that a failure. The cost was assumed to be minutes and measured 20 s — a
+# `--names` build at 4.1 s and a profiled compile at 9.5 s (2026-09-06) — against a gate whose
+# critical path is `distilled corpus` at ~155 s, so there is no reason to leave them ungated.
+run "survey measurements"      bash scripts/survey-profile.sh
 run "conflict markers"         deno test -A --no-check tests/vl_no_conflict_markers_test.ts
 run "splice scan"              bash -c "\"$PY\" scripts/inventory/splice-scan.py --self-test >/dev/null && \"$PY\" scripts/inventory/splice-scan.py"
 run "distilled corpus"         "$PY" scripts/silent-sweep/distilled/regress.py build/vl-compiler.wasm
