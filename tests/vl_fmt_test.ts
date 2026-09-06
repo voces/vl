@@ -2443,3 +2443,69 @@ Deno.test({
     }
   },
 });
+
+// D1651 — AN `import { … }` NAME LIST IS SORTED, and nothing else about an import moves.
+//
+// `fmtImport` reconstructs a braced import from the token stream and sorts its items before
+// `wrapList` reflows them: a `{ … }` list is a SET, order carries no meaning, and sorting makes
+// the wrapped one-per-line block read alphabetically so a duplicate or stale import stands out.
+// The key is case-sensitive code-point order over the item's FULL text, so a capitalised type
+// sorts before a lowercase function and an `a as b` item sorts by `a`.
+//
+// The two NON-rules are what this pins hardest, because a formatter must not re-order what the
+// language treats as ordered: import STATEMENTS keep source order, and a comment inside the
+// braces takes the verbatim path, which leaves the author's order alone.
+Deno.test({
+  name: "vl-fmt: an `import` name list is sorted; statements and annotated lists are not",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_imports_" });
+    await Deno.writeTextFile(
+      `${dir}/lib.vl`,
+      "export const a = 1\nexport const b = 2\nexport const c = 3\nexport type Box = { v: i32 }\n",
+    );
+    await Deno.writeTextFile(`${dir}/lib2.vl`, "export const z = 9\n");
+
+    const fmtFile = async (name: string, body: string) => {
+      const p = `${dir}/${name}`;
+      await Deno.writeTextFile(p, body);
+      const { code, out, err } = await runOn("fmt", p);
+      if (code !== 0) throw new Error(`vl fmt rejected ${name} (rc ${code}):\n${err}`);
+      return out;
+    };
+
+    // SORTED: a capitalised type before the lowercase names, by code point.
+    const unsorted = 'import { c, Box, a, b } from "./lib"\n\nprint(a + b + c)\n';
+    const sorted = 'import { Box, a, b, c } from "./lib"\n\nprint(a + b + c)\n';
+    const got = await fmtFile("sortme.vl", unsorted);
+    if (got !== sorted) {
+      throw new Error(`the name list was not sorted:\n${got}`);
+    }
+    // …and the sorted spelling is a fixed point.
+    const again = await fmtFile("sorted.vl", sorted);
+    if (again !== sorted) throw new Error(`not idempotent:\n${again}`);
+
+    // NOT re-ordered: two import STATEMENTS keep the order the author wrote.
+    const twoStmts = 'import { z } from "./lib2"\nimport { a, b, c } from "./lib"\n\n' +
+      "print(a + b + c + z)\n";
+    const kept = await fmtFile("stmts.vl", twoStmts);
+    if (kept !== twoStmts) {
+      throw new Error(`import statements were re-ordered:\n${kept}`);
+    }
+
+    // NOT re-ordered: a comment inside the braces takes the verbatim path, so the author's
+    // order — which the comment may be about — survives.
+    const annotated = "import {\n  c,\n  // c first: the comment is about this order\n" +
+      '  a,\n  b,\n} from "./lib"\n\nprint(a + b + c)\n';
+    const asWritten = await fmtFile("annotated.vl", annotated);
+    if (asWritten !== annotated) {
+      throw new Error(`an annotated name list was re-ordered:\n${asWritten}`);
+    }
+
+    // The sort never changes WHICH names are bound: the formatted program still runs.
+    const ran = await runOn("run", `${dir}/sortme.vl`);
+    if (ran.code !== 0 || ran.out !== "6\n") {
+      throw new Error(`formatted output did not run (rc ${ran.code}): ${JSON.stringify(ran.out)}`);
+    }
+  },
+});
