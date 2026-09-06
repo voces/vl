@@ -758,6 +758,13 @@ let memCstrIx: i32[] = []
 let memCstrFn: i32[] = []
 let memCstrDem: boolean[] = []
 
+// D1702 — the `HD_COAL` result holes a body minted, so the pin can substitute them. Nothing
+// else asks: a `??` result is not a constraint, so no validator reaches it and `substHoleTy`
+// never banks its pin. The emitter's `??` arm turns on that pin, so the rows exist to be
+// substituted for the BANK, not for a diagnostic; the answer is discarded.
+let coalHoleTy: i32[] = []
+let coalHoleFn: i32[] = []
+
 // D1005 — deferred UFCS-receiver constraints, the receiver's half of what `memCstrTy` asks.
 // `ufcsCallTy` gates dispatch on `assignable(recvTy, params[0])`, true for a `TyVar` on either
 // side, so a generic body selects by name alone. `ufcsCstrP0` banks the selected function's
@@ -3370,6 +3377,8 @@ export function initChecker() {
   memCstrIx = []
   memCstrFn = []
   memCstrDem = []
+  coalHoleTy = []
+  coalHoleFn = []
   ufcsCstrTy = []
   ufcsCstrProp = []
   ufcsCstrIx = []
@@ -18988,6 +18997,36 @@ function validateMemCstrs(
   0
 }
 
+// Substitutes every `HD_COAL` result hole this call resolves, for its BANK alone: the
+// substitution is what records the pin (`substHoleTy`), and `nodeTyPinIxOf` is what the
+// emitter's `??` arm then reads. No diagnostic here — the body owns the operand check, and a
+// hole two calls pin differently poisons its own row, which is the answer the emitter needs.
+function bankCoalHoles(bNames: string[], bTys: i32[], calleeFn: i32) {
+  let ci = 0
+  while ci < coalHoleTy.length {
+    if cstrOwnedBy(coalHoleFn[ci], calleeFn) {
+      substHoleTy(coalHoleTy[ci], bNames, bTys)
+    }
+    ci = ci + 1
+  }
+  0
+}
+
+// Records a `??` result hole so the pin can bank it. Stamped with the owning declaration for
+// the by-name `TyVar` reason `noteMemCstr` needs it; a row is kept once.
+function noteCoalResultHole(ty: i32) {
+  if ty < 0 { return 0 }
+  const owner = cstrOwnerTop()
+  let k = 0
+  while k < coalHoleTy.length {
+    if coalHoleTy[k] == ty && coalHoleFn[k] == owner { return 0 }
+    k = k + 1
+  }
+  coalHoleTy.push(ty)
+  coalHoleFn.push(owner)
+  0
+}
+
 // Do every deferred call-argument constraint THIS binding resolves hold (the pure-boolean
 // twin of `validateArgCstrs`, for `genericFnAssignable`)? An unresolved hole defers.
 function argCstrsHold(bNames: string[], bTys: i32[]) {
@@ -22259,6 +22298,9 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
       dhArgNode,
     )
     validateUfcsCstrs(bNames, bTys, ix, cstrCallee, cstrWho)
+    // Not a validation: the `??` result holes are substituted here for their BANK, which is
+    // the only route the emitter has to the type this call gave the expression (D1702).
+    bankCoalHoles(bNames, bTys, cstrCallee)
     // The bounds the callee declared, judged here in this site's own scope against the
     // types this site bound — not deferred, since a bound is written at the declaration:
     // there is nothing to record on the way in, only something to check on the way out.
@@ -30983,7 +31025,10 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
     // (`HD_COAL`); answering `lt` instead kept the null the operator just removed, and every
     // floor the pin re-asks then refused a receiver whose type after `??` is non-null (D1693).
     const cd = mkDerivedHole(HD_COAL, "", rt, -1, lt)
-    if cd >= 0 { return cd }
+    if cd >= 0 {
+      noteCoalResultHole(cd)
+      return cd
+    }
     return lt
   }
   // Equality: result bool; requires mutual compatibility.
