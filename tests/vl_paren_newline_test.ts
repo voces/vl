@@ -195,3 +195,69 @@ Deno.test({
     }
   },
 });
+
+// The NON-OPERATOR half of the continuing set: member access (`.`, `?.`), the `is` guard
+// and all four `as` casts. None of these tokens can begin an expression, so a line leading
+// with one continues the previous expression exactly as a binary operator does. `vl fmt`
+// joins the two lines, so the leading spelling is one it normalises AWAY — which is why
+// this lives here and not in `tests/cases/`, where the fixture that held it
+// (`parser/newline-leads-with-member-is-as.vl`) lost it the first time the corpus was
+// formatted. What has to hold is the same three things the D1581 test above asserts: the
+// spelling parses, fmt's output for it re-parses, and it means the same thing.
+Deno.test({
+  name: "vl-parse: a continuation line may lead with `.`, `?.`, `is` or an `as` cast",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = await Deno.makeTempDir({ prefix: "vl_leadmem_" });
+    try {
+      const src = "type Inner = { n: i32 }\n" +
+        "type Box = { inner: Inner | null }\n" +
+        "type A = { a: i32 }\n" +
+        "type B = { b: string }\n" +
+        "const p = { n: 3 }\n" +
+        "const fld = p\n  .n\n" +
+        "const xs = [1, 2, 3]\n" +
+        "const meth = xs\n  .map((v) => v * 2)\n" +
+        "const miss: Box = { inner: null }\n" +
+        "const opt = miss\n  .inner\n  ?.n\n" +
+        "function mk(): A | B { { a: 4 } }\n" +
+        "const v = mk()\n" +
+        "const isA = v\n  is A\n" +
+        "function widen(n: i32) {\n  n\n    as i64\n}\n" +
+        "const big: i64 = 9\n" +
+        "const nar = big\n  as! i32\n" +
+        "function tryNarrow(n: i64) {\n  n\n    as? i32\n}\n" +
+        "const wrapped = 300\n  as% u8\n" +
+        "print(fld)\nprint(meth[2])\nprint(opt)\nprint(isA)\n" +
+        "print(widen(5))\nprint(nar)\nprint(tryNarrow(11))\nprint(wrapped)\n";
+      const f = `${dir}/a.vl`;
+      await Deno.writeTextFile(f, src);
+      const r = await runVL("run", f);
+      if (r.code !== 0) {
+        throw new Error(`leading-member continuation should run, got code ${r.code}:\n${r.err}`);
+      }
+      const want = "3\n6\nnull\ntrue\n5\n9\n11\n44\n";
+      if (r.out !== want) {
+        throw new Error(`want ${JSON.stringify(want)}, got ${JSON.stringify(r.out)}`);
+      }
+      const fmt = await runVL("fmt", f);
+      if (fmt.code !== 0) throw new Error(`fmt failed: ${fmt.err}`);
+      if (fmt.out.includes("\n  .n")) {
+        throw new Error(`fmt left the continuation split, so this test measures nothing:\n${fmt.out}`);
+      }
+      const g = `${dir}/a.formatted.vl`;
+      await Deno.writeTextFile(g, fmt.out);
+      const again = await runVL("run", g);
+      if (again.code !== 0) {
+        throw new Error(`formatted output did not re-parse, code ${again.code}:\n${again.err}`);
+      }
+      if (again.out !== r.out) {
+        throw new Error(
+          `fmt changed the meaning: ${JSON.stringify(r.out)} vs ${JSON.stringify(again.out)}`,
+        );
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});

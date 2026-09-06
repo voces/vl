@@ -2509,3 +2509,191 @@ Deno.test({
     }
   },
 });
+
+// D1653 — AN `extern function` DECLARATION IS TOKEN-RECOVERED, NOT ARENA-WALKED.
+//
+// The parser banks an extern in the program-wide manifest and mints NO node (it has no body
+// and no local index), so the arena walk the printer runs could not see it and the formatted
+// program came back WITHOUT the declaration — `vl fmt` rc 0, and the output an `undeclared
+// identifier` at every call. Recovered from `P.toks` the way `import` is, and placed by
+// source line rather than hoisted, since an extern may be written anywhere at top level.
+Deno.test({
+  name: "vl-fmt: an `extern function` declaration survives, where it was written",
+  ignore: !ENABLED,
+  fn: async () => {
+    const src = [
+      "// A header.",
+      'import { pi } from "./lib"',
+      "",
+      "extern function nowMillis(): i64 // the host clock",
+      "",
+      "print(pi)",
+      "",
+      "// Declared after a statement, with its own comment.",
+      "export extern function hostEcho(x: i32): i32",
+      "",
+      "print(hostEcho(3))",
+      "",
+      "extern function wrapped(",
+      "  a: i32,",
+      "  b: i32,",
+      "): i32",
+      "",
+      "print(wrapped(1, 2))",
+      "",
+    ].join("\n");
+    const r = await run([], src);
+    if (r.code !== 0) {
+      throw new Error(`vl fmt rejected the source (rc ${r.code}):\n${r.err}`);
+    }
+    for (
+      const decl of [
+        "extern function nowMillis(): i64",
+        "export extern function hostEcho(x: i32): i32",
+        "extern function wrapped(a: i32, b: i32): i32",
+      ]
+    ) {
+      if (!r.out.includes(decl)) {
+        throw new Error(`fmt dropped or re-spelled \`${decl}\`:\n${r.out}`);
+      }
+    }
+    // POSITION, not just survival: `hostEcho` was written after the first `print`, so a
+    // printer that hoisted every extern to the import block would still pass the check above.
+    if (r.out.indexOf("hostEcho") < r.out.indexOf("print(pi)")) {
+      throw new Error(`the extern was hoisted out of its place:\n${r.out}`);
+    }
+    if (!r.out.includes("extern function nowMillis(): i64 // the host clock")) {
+      throw new Error(`the extern's trailing comment was lost:\n${r.out}`);
+    }
+    const again = await run([], r.out);
+    if (again.code !== 0 || again.out !== r.out) {
+      throw new Error(`not idempotent (rc ${again.code}):\n${again.out}`);
+    }
+    // The formatted program is still the same program: it re-parses and type-checks with
+    // every extern in scope. (A dropped declaration reads as `undeclared identifier`, not as
+    // a formatting difference, which is what made this silent.)
+    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_extern_" });
+    try {
+      await Deno.writeTextFile(`${dir}/lib.vl`, "export const pi = 3\n");
+      await Deno.writeTextFile(`${dir}/main.vl`, r.out);
+      const checked = await runOn("check", `${dir}/main.vl`);
+      if (checked.code !== 0) {
+        throw new Error(
+          `the formatted program no longer checks (rc ${checked.code}):\n${checked.out}${checked.err}`,
+        );
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+    // A comment INSIDE the declaration takes the verbatim path — collapsing it would splice
+    // the return type onto the `//` line.
+    const withComment = [
+      "extern function commented(",
+      "  // the first one",
+      "  a: i32,",
+      "  b: i32,",
+      "): i32",
+      "",
+      "print(commented(1, 2))",
+      "",
+    ].join("\n");
+    const c = await run([], withComment);
+    if (c.code !== 0) {
+      throw new Error(`vl fmt rejected the comment form (rc ${c.code}):\n${c.err}`);
+    }
+    if (!c.out.includes("// the first one") || !c.out.includes("): i32")) {
+      throw new Error(`the comment inside the parameter list was lost:\n${c.out}`);
+    }
+    const c2 = await run([], c.out);
+    if (c2.out !== c.out) {
+      throw new Error(`the comment form is not idempotent:\n${c2.out}`);
+    }
+  },
+});
+
+// The object-literal METHOD SHORTHAND is a surface form `vl fmt` canonicalises to the arrow
+// field it desugars to. Both spellings are legal and the corpus is formatted, so the shorthand
+// survives only in a test that reads its text — this one. `tests/cases/objects/method-*` hold
+// the arrow spelling the formatter produces.
+Deno.test({
+  name: "vl-fmt: object method shorthand canonicalises to an arrow field, and the two agree",
+  ignore: !ENABLED,
+  fn: async () => {
+    // Block body, expression body, and a parameterised one with a return annotation.
+    const shorthand = [
+      "const o = {",
+      "  base: 7,",
+      "  f() {",
+      '    "ok"',
+      "  },",
+      "  triple(x: i32) x + x + x,",
+      "  add(a: i32, b: i32): i32 {",
+      "    return a + b",
+      "  },",
+      "}",
+      "print(o.f())",
+      "print(o.triple(10))",
+      "print(o.add(1, 2))",
+      "print(o.base)",
+      "",
+    ].join("\n");
+    const r = await run([], shorthand);
+    if (r.code !== 0) {
+      throw new Error(`vl fmt rejected the shorthand (rc ${r.code}):\n${r.err}`);
+    }
+    for (
+      const arrow of [
+        "f: () => {",
+        "triple: (x: i32) => x + x + x,",
+        "add: (a: i32, b: i32): i32 => {",
+      ]
+    ) {
+      if (!r.out.includes(arrow)) {
+        throw new Error(`the shorthand did not canonicalise to \`${arrow}\`:\n${r.out}`);
+      }
+    }
+    const again = await run([], r.out);
+    if (again.out !== r.out) {
+      throw new Error(`the arrow form is not a fixed point:\n${again.out}`);
+    }
+    // THE SPELLINGS AGREE, which is what makes the canonicalisation a formatting change and
+    // not a rewrite: the same printed output, and the same wasm byte for byte.
+    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_shorthand_" });
+    try {
+      const a = `${dir}/a.vl`;
+      const b = `${dir}/b.vl`;
+      await Deno.writeTextFile(a, shorthand);
+      await Deno.writeTextFile(b, r.out);
+      const ra = await runOn("run", a);
+      const rb = await runOn("run", b);
+      if (ra.code !== 0 || rb.code !== 0) {
+        throw new Error(`a spelling did not run (${ra.code}/${rb.code}):\n${ra.err}${rb.err}`);
+      }
+      if (ra.out !== rb.out) {
+        throw new Error(`the two spellings printed differently:\n${ra.out}\n---\n${rb.out}`);
+      }
+      const bytesOf = async (file: string): Promise<Uint8Array> => {
+        const out = `${file}.wasm`;
+        const { code, stderr } = await new Deno.Command(VL, {
+          args: ["build", file, "-o", out, "--compiler", COMPILER],
+          stdout: "piped",
+          stderr: "piped",
+          env: nativeEnv({ NO_COLOR: "1" }),
+        }).output();
+        if (code !== 0) {
+          throw new Error(`build failed for ${file}: ${new TextDecoder().decode(stderr)}`);
+        }
+        return await Deno.readFile(out);
+      };
+      const wa = await bytesOf(a);
+      const wb = await bytesOf(b);
+      if (wa.length !== wb.length || !wa.every((v, i) => v === wb[i])) {
+        throw new Error(
+          `the two spellings emitted different wasm (${wa.length} vs ${wb.length} bytes)`,
+        );
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});

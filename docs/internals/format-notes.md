@@ -289,3 +289,51 @@ The rule reaches only what the fmt gate reaches. `lint-self.sh`'s fmt half runs
 `find compiler std scripts`; `tests/` and `bench/` are passed to nothing, which is how ten
 checked-in fixtures sat with unsorted import lists — see D1651 for the whole-tree count and
 which buckets are deliberate.
+
+## the token-recovered declarations — `import`, a re-export, and `extern function`
+
+Three constructs the parser consumes WITHOUT minting an arena node, so the printer's walk
+cannot see them and each has to be recovered from `P.toks`:
+
+| construct | why there is no node | how it is placed |
+| --- | --- | --- |
+| `import { … } from "…"` | the parser resolves it and moves on | the block at the top, before the statements |
+| `export { … } from "…"` (a re-export) | as above | with the imports |
+| `extern function name(…): T` | an extern has no body to run and no local index to occupy, so it is banked in the program-wide manifest (`ast.externAdd`) | by its own SOURCE LINE, among the statements |
+
+**The extern was missing until D1653, and `vl fmt` deleted it.** The failure was not a
+layout difference: the formatted program had no declaration, so every call became
+`undeclared identifier` — rc 0 from `vl fmt`, and a program that no longer checks.
+`tests/cases/extern/` carries seven such fixtures and none of them was in the fmt sweep,
+which is why nothing said so.
+
+The placement differs from the imports on purpose. An extern may be written anywhere at
+top level (`tests/cases/extern/exported-from-host-module/host.vl` puts three between
+comments, and a module may declare one after a statement), and a formatter that hoisted it
+would be moving code rather than printing it. `emitStatements` flushes every pending extern
+whose source line precedes the next statement's, and once more after the last statement —
+the shape a module that only declares its host boundary needs.
+
+The declaration is REBUILT rather than sliced when nothing stops it: the head, the parameter
+list through `wrapList` (one line when it fits, else one per line with a trailing comma), and
+the `: T` tail. A comment inside the parentheses takes the verbatim path, for the same reason
+a comment-bearing `import` does — collapsed to one line, the `//` would swallow the return
+type. The parameter TYPE syntax is recovered as written, like every other type in this file.
+
+## object method shorthand is CANONICALISED, and its coverage lives in the fmt test
+
+`{ f() { … } }` is a legal spelling — `parser.vl` desugars it to the function-valued field
+`{ f: () => { … } }`, and `docs/constraints-design.md` builds the `{ f(): string }` type-side
+bound on it — and the printer re-spells it as that field, at every position (const initialiser,
+argument, return, nested literal, array element, assignment). Measured rather than assumed:
+the two spellings print the same output and emit **byte-identical wasm**, so this is a
+formatting change and not a rewrite. The archived header block above still calls this a
+"residual host divergence" and spells the target `m: function(a) { … }`; the target has been
+the arrow since #531 retired the `function(…)` expression form.
+
+**What the canonicalisation costs, and where the price is paid.** A fixture written in the
+shorthand loses it the first time anyone formats the file, silently: #531 ran `vl fmt` over
+the corpus and `tests/cases/objects/method-shorthand.vl` and `-equiv.vl` have carried the
+arrow spelling — with comments still describing a shorthand — ever since. So the shorthand is
+pinned where a formatter cannot reach it: `tests/vl_fmt_test.ts` reads its text, asserts the
+canonicalisation, and proves the two spellings agree on output and on bytes.

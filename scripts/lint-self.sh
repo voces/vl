@@ -15,24 +15,34 @@
 # comments instead (D1601). `tests/` — the corpus of deliberately-malformed
 # fixtures — is excluded by construction (never passed in).
 #
-# fmt IS gated here too (below): `vl fmt --check` over the source `.vl`
-# (compiler/, std/, scripts/) — only `.vl` files are gathered, so the `.ts`/`.sh`
-# alongside scripts/ are ignored. `tests/` is excluded by construction (the
-# deliberately-malformed fixture corpus is never fmt-clean and is not source we
-# ship), and the `.vl` under `scripts/silent-sweep/distilled/` are PRUNED for exactly
-# that reason: a corpus of deliberately odd programs — being un-idiomatic is what each
-# cell is FOR — graded by `distilled/regress.py` and not shipped. The prune covers the
-# whole directory, not just `cells/`, because `named/` holds curated cells of the same
-# kind and a per-subdirectory prune silently stops covering the next one added.
-# `scripts/capability-probes/matrix/` is pruned for a different reason: a `*.matrix.vl` is a
-# TEMPLATE, not a program — `// @@SECTION@@` blocks holding a prelude, a bare type spelling
-# and free-text reasons, from which `matrix.py` GENERATES the programs a compiler sees. The
-# hand-written probes beside it are still checked. Unlike the lint above, fmt is PER-FILE (it needs no cross-file
-# resolution), so the files fan out over the cores (`xargs -P`) — the formatter
-# is the dominant cost of this gate and every file is independent — while the
-# module-graph check runs concurrently in the background. Same files, same
-# checks, same gates as running everything sequentially; only the schedule
-# differs.
+# fmt IS gated here too (below), and its scope is STATED, not inherited: every `.vl`
+# under `compiler/`, `std/`, `scripts/`, `tests/` and `bench/`, minus two named prunes.
+# Only `.vl` files are gathered, so the `.ts`/`.sh` alongside scripts/ are ignored.
+#
+# `tests/` and `bench/` joined the sweep in D1653's PR. They had been outside it —
+# `tests/` deliberately ("the fixture corpus is never fmt-clean"), `bench/` by omission —
+# and the claim was true of 58 files, not of the other 3,000: what the corpus really holds
+# is deliberately-INVALID fixtures, which `vl fmt --check` reports as rc 2, and rc 2 is
+# handled below as out of scope rather than as failure. The price of the exclusion was a
+# formatter defect nothing could see: `vl fmt` DELETED an `extern function` declaration
+# (D1653), and the fixtures that would have caught it were exactly the ones not swept.
+#
+# The two prunes, each for its own reason:
+#   * `scripts/silent-sweep/distilled/` — a corpus of deliberately odd programs; being
+#     un-idiomatic is what each cell is FOR. Graded by `distilled/regress.py`, not shipped.
+#     The prune covers the whole directory, not just `cells/`, because `named/` holds
+#     curated cells of the same kind and a per-subdirectory prune silently stops covering
+#     the next one added.
+#   * `scripts/capability-probes/matrix/` — a `*.matrix.vl` is a TEMPLATE, not a program:
+#     `// @@SECTION@@` blocks holding a prelude, a bare type spelling and free-text reasons,
+#     from which `matrix.py` GENERATES the programs a compiler sees. The hand-written probes
+#     beside it are still checked.
+#
+# Unlike the lint above, fmt is PER-FILE (it needs no cross-file resolution), so the files
+# fan out over the cores (`xargs -P`) — the formatter is the dominant cost of this gate and
+# every file is independent — while the module-graph check runs concurrently in the
+# background. Same files, same checks, same gates as running everything sequentially; only
+# the schedule differs.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -98,13 +108,38 @@ GRAPH_PID=$!
 # backgrounded graph check had already produced. The job then reported "fmt drift" alone
 # and the prefer-const/unused findings surfaced only on the next run. Both gates still fail
 # the script; only the order of reporting changed.
-echo "== fmt-check: compiler/ std/ scripts/ (parallel per file) =="
+echo "== fmt-check: compiler/ std/ scripts/ tests/ bench/ (parallel per file) =="
 FMT_RC=0
-find compiler std scripts \
+FMT_LOG="$WORK/fmt.log"
+: > "$FMT_LOG"
+# One `vl fmt --check` per file, classified by EXIT CODE: 0 clean, 1 drift, 2 the file does
+# not parse. rc 2 is out of scope, not a failure — `tests/cases/` holds deliberately-invalid
+# fixtures (a missing brace, an unterminated string) that exist to be refused, and the count
+# is printed so a file becoming unparseable by accident is still visible. Anything else is a
+# formatter crash and fails outright. Each worker prints one short line, which is under
+# PIPE_BUF and so lands whole under `-P`.
+find compiler std scripts tests bench \
     -path scripts/silent-sweep/distilled -prune -o \
     -path scripts/capability-probes/matrix -prune -o \
     -name '*.vl' -print0 \
-  | xargs -0 -n 1 -P "$(nproc)" "$VL" fmt --check || FMT_RC=$?
+  | xargs -0 -n 1 -P "$(nproc)" bash -c '
+      rc=0
+      "$0" fmt --check "$1" >/dev/null 2>&1 || rc=$?
+      case "$rc" in
+        0) ;;
+        1) printf "drift\t%s\n" "$1" ;;
+        2) printf "unparsed\t%s\n" "$1" ;;
+        *) printf "crash%s\t%s\n" "$rc" "$1" ;;
+      esac' "$VL" >> "$FMT_LOG"
+FMT_DRIFT=$(grep -c '^drift' "$FMT_LOG" || true)
+FMT_UNPARSED=$(grep -c '^unparsed' "$FMT_LOG" || true)
+FMT_CRASH=$(grep -c '^crash' "$FMT_LOG" || true)
+echo "fmt: $FMT_DRIFT drifting, $FMT_UNPARSED unparseable (out of scope), $FMT_CRASH crashed"
+if [ "$FMT_DRIFT" != 0 ] || [ "$FMT_CRASH" != 0 ]; then
+  grep -E '^(drift|crash)' "$FMT_LOG" | sort | sed 's/^/  /'
+  echo "  run: vl fmt -w <path>   (one path per run)"
+  FMT_RC=1
+fi
 
 echo "== self-lint: the compiler module graph (result) =="
 GRAPH_RC=0
