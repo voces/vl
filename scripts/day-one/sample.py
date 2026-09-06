@@ -27,6 +27,7 @@ import random
 import subprocess
 import sys
 import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -35,6 +36,7 @@ sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(ROOT, "scripts", "capability-probes"))
 
 import grammar as G  # noqa: E402
+import imports as I  # noqa: E402
 import modules as M  # noqa: E402
 import render as R  # noqa: E402
 import run as probes  # noqa: E402
@@ -277,6 +279,70 @@ def replay(path, compiler, jobs):
     return 1 if lost else 0
 
 
+def _build_ms(src, compiler, tmpdir, name, reps):
+    """MIN of `reps` `vl build` wall times, in ms. Compile only — a `vl run` would
+    fold the program's own execution into the number the report is about, and the
+    minimum is what a contended box lets you compare across rows."""
+    path = write_program(src, tmpdir, name)
+    out = os.path.join(tmpdir, name + ".wasm")
+    best = None
+    for _ in range(reps):
+        t = time.perf_counter()
+        subprocess.run([VL, "build", path, "-o", out, "--compiler", compiler],
+                       capture_output=True, text=True, env=env())
+        ms = (time.perf_counter() - t) * 1000.0
+        best = ms if best is None else min(best, ms)
+    return best
+
+
+def imports_report(paths, compiler, jobs, reps=3, factor=3.0):
+    """The `imports_pair` axis's TIMING half — D1514's shape, measured.
+
+    A pair carries two programs and this question needs three: `together` is read against
+    the SUM of the two ALONE times, so a module pair that is superlinear together shows up
+    even when each half is fast. Re-renders from the saved spec rather than the saved
+    source, so a grammar fix reaches an old sample.
+    """
+    seen, specs = set(), []
+    for p in (json.loads(l) for f in paths
+              for l in open(f, encoding="utf-8") if l.strip()):
+        if p.get("axis") != "imports_pair":
+            continue
+        key = tuple(sorted((p["spec"]["first"], p["spec"]["second"])))
+        if key in seen:
+            continue
+        seen.add(key)
+        specs.append(p["spec"])
+    if not specs:
+        print("no imports_pair pairs in %s — nothing to time" % ", ".join(paths))
+        return 0
+    rows = []
+    with tempfile.TemporaryDirectory(prefix="vl-day-one-time-") as td:
+        def one(iv):
+            i, spec = iv
+            tri = I.triple(spec)
+            ms = [_build_ms(src, compiler, td, "t%d_%d" % (i, k), reps)
+                  for k, (_, src) in enumerate(tri)]
+            return spec, ms
+        with ThreadPoolExecutor(max_workers=jobs) as ex:
+            rows = list(ex.map(one, enumerate(specs)))
+    print("\n%d module pair(s) · min of %d `vl build` runs each · times in ms"
+          % (len(rows), reps))
+    print("  %-14s %-14s %8s %8s %8s %7s" %
+          ("first", "second", "aloneA", "aloneB", "together", "ratio"))
+    flagged = []
+    for spec, (a, b, t) in sorted(rows, key=lambda r: -(r[1][2] / max(1e-6, r[1][0] + r[1][1]))):
+        ratio = t / max(1e-6, a + b)
+        mark = "  SUPERLINEAR" if ratio > factor else ""
+        if mark:
+            flagged.append((spec, a, b, t, ratio))
+        print("  %-14s %-14s %8.1f %8.1f %8.1f %7.2f%s" %
+              (I.BY_ID[spec["first"]]["module"], I.BY_ID[spec["second"]]["module"],
+               a, b, t, ratio, mark))
+    print("\n%d pair(s) over %.1fx the sum of the two alone-times" % (len(flagged), factor))
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # THE CONTROLS. An instrument that reports zero is worth nothing until something it
 # MUST see makes it speak — but A CONTROL BUILT ON A LIVE DEFECT EVAPORATES THE DAY
@@ -399,6 +465,14 @@ if true {
 MODULE_SIX = ('// file: a.vl\nexport function six(): i32 { return 6 }\n'
               '// file: main.vl\nimport { six } from "./a"\n')
 
+# TWO std imports in one module, both used — the `imports_pair` axis's own shape, for the
+# control that has to fail on a TYPE rather than on an unresolved name.
+IMPORTS_TWO = ('import { filled } from "std:array"\n'
+               'import { toString } from "std:fmt"\n')
+
+# A fixed module pair for the agree control, so the pin does not move with the RNG.
+IMPORTS_SPEC = {"first": "array", "second": "fmt"}
+
 
 def _split_pin(pair):
     single, split, want = pair
@@ -459,6 +533,30 @@ def _controls():
                 "want": ["42"], "face": "ill-typed"}},
          "DISAGREE", ("RUNS", "check refuses")),
 
+        # SYNTHETIC, check channel, WITH TWO STD IMPORTS IN ONE MODULE. Both faces import
+        # and USE both modules, so a writer that dropped the second import would fail the
+        # legal face on an unknown name rather than pass quietly; the disagreement itself
+        # is a `string` into an `i32`, a rule the design will always enforce.
+        ("synthetic/imports-check",
+         "a std `string` result into an `i32` destination, two imports deep",
+         {"a": {"src": IMPORTS_TWO + "const v: string = toString(filled(3, 0).length)\n"
+                                     "print(v)\n", "want": ["3"], "face": "legal"},
+          "b": {"src": IMPORTS_TWO + "const v: i32 = toString(filled(3, 0).length)\n"
+                                     "print(v)\n", "want": ["3"], "face": "ill-typed"}},
+         "DISAGREE", ("RUNS", "check refuses")),
+
+        # AGREE pin for the imports_pair axis, RENDERED FROM ITS OWN GRAMMAR — so it also
+        # proves the generator still builds both faces of a drawn module pair. THE WANT IS
+        # WRITTEN OUT, never taken from the same render: a pin whose contract comes from
+        # the thing under test cannot fail, and a renderer sabotage that dropped the second
+        # import passed this control until the lines below were spelled by hand.
+        ("imports_pair/agree", "one std import and two must agree at the same first half",
+         {"a": {"src": I.render(IMPORTS_SPEC, "alone")[0],
+                "want": ["3"], "face": "alone"},
+          "b": {"src": I.render(IMPORTS_SPEC, "together")[0],
+                "want": ["3", "41!"], "face": "together"}},
+         "AGREE-RUNS", ("RUNS", "RUNS")),
+
         # AGREE pins for the modules_split axis — the three rows the axis was built for.
         ("D1593/agree", "closed #2521 — a module's loop variable must not claim the "
                         "importer's block binding",
@@ -506,6 +604,9 @@ def main():
     ap.add_argument("--replay")
     ap.add_argument("--report", nargs="+",
                     help="re-print the tables from saved samples, grading nothing")
+    ap.add_argument("--imports-report", nargs="+",
+                    help="time alone(A), alone(B) and together(A,B) for every "
+                         "imports_pair in the saved samples (D1514's shape)")
     ap.add_argument("--control", action="store_true",
                     help="grade D1473 alone: the instrument's positive control")
     ap.add_argument("--no-cover", action="store_true")
@@ -515,13 +616,15 @@ def main():
     ap.add_argument("--json", action="store_true", help="machine-readable summary only")
     a = ap.parse_args()
 
-    R.EXCLUDE = M.EXCLUDE = {x for x in a.exclude.split(",") if x}
+    R.EXCLUDE = M.EXCLUDE = I.EXCLUDE = {x for x in a.exclude.split(",") if x}
     if a.control:
         return control(a.compiler, a.jobs)
     if a.report:
         report([json.loads(l) for f in a.report
                 for l in open(f, encoding="utf-8") if l.strip()])
         return 0
+    if a.imports_report:
+        return imports_report(a.imports_report, a.compiler, a.jobs)
     if a.replay:
         return replay(a.replay, a.compiler, a.jobs)
 
