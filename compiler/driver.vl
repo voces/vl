@@ -82,6 +82,8 @@ import {
   TS_MAP,
   TS_NAME,
   annTsOf,
+  arenaEpochBump,
+  arenaEpochNow,
   declBoundOf,
   declGpBaseOf,
   declGpParamsOf,
@@ -147,6 +149,7 @@ import {
 import { nameIdentChar, skipQuotedName } from "./tyname"
 import {
   T,
+  canonRestoreSpellings,
   checkProgram,
   demangleMsg,
   initChecker,
@@ -725,6 +728,7 @@ function vcEtDrop(): i32 {
 // re-lexing. Both sides need an empty `P.toks`, which is what makes a row's `pos` its own
 // index. The pop drops `jwSecondPass`'s generated tail, the one thing appended after a bank.
 function vcLoadToksEntry(src: string): i32 {
+  vcEpDrop()
   if P.toks.length == 0 && vcEtLen > 0 && vcEtSrc == src {
     P.toks = vcEtToks
     while P.toks.length > vcEtLen { P.toks.pop() }
@@ -741,12 +745,67 @@ function vcLoadToksEntry(src: string): i32 {
   }
   P.toks.length
 }
+// The entry parse, banked by reference: `P.nodes` and its three parallel columns ARE the
+// bank, so banking allocates nothing. `vcEpEpoch` is `arenaEpochNow()` as the parser left it
+// — a fresh parse and every in-place arena rewrite bump it — so a replay is offered only a
+// tree that is still the one banked, carrying rows appended past its lengths.
+let vcEpSrc = ""
+let vcEpRoot = -1
+let vcEpEpoch = -1
+let vcEpNodeN = 0
+let vcEpTokN = 0
+let vcEpDeclN = 0
+let vcEpTplN = 0
+
+// Releases the bank. Every entry token load takes it, since that load is what precedes a
+// fresh parse; module mode and the graph lint take it for the same reason, one module ahead.
+function vcEpDrop(): i32 {
+  vcEpSrc = ""
+  vcEpRoot = -1
+  vcEpEpoch = -1
+  0
+}
+
+// Bank the tree `parseProgram` just built for `src`. Only a diagnostic-free parse banks, so
+// a replay owes no diagnostic and the `vcDg*` side tables stay the ones this parse filled.
+function vcEpBank(src: string, root: i32): i32 {
+  if P.diags.length > 0 { return vcEpDrop() }
+  vcEpSrc = src
+  vcEpRoot = root
+  vcEpEpoch = arenaEpochNow()
+  vcEpNodeN = P.nodes.length
+  vcEpTokN = nodeToks.length
+  vcEpDeclN = declNameTok.length
+  vcEpTplN = tplHole.length
+  0
+}
+
+// The banked root for `src` when the check left that tree intact, or -1. What a check leaves,
+// table by table, is `perf-opportunities-2026-09.md` §B6c: rows APPENDED past these lengths,
+// which the pop drops; four spellings rewritten in place, which the sweep's own bank puts
+// back; and six slot rewrites, which the epoch retires the bank for.
+function vcEpReplay(src: string): i32 {
+  if vcEpEpoch < 0 || vcEpRoot < 0 { return -1 }
+  if arenaEpochNow() != vcEpEpoch { return -1 }
+  if vcEpSrc != src { return -1 }
+  if P.nodes.length < vcEpNodeN || nodeToks.length < vcEpTokN { return -1 }
+  if declNameTok.length < vcEpDeclN || tplHole.length < vcEpTplN { return -1 }
+  canonRestoreSpellings()
+  while P.nodes.length > vcEpNodeN { P.nodes.pop() }
+  while nodeToks.length > vcEpTokN { nodeToks.pop() }
+  while declNameTok.length > vcEpDeclN { declNameTok.pop() }
+  while tplHole.length > vcEpTplN { tplHole.pop() }
+  vcEpRoot
+}
 // ── deep `is` over a `Json` value — the second check pass (D1035) ────────────
 // `r is T` for a json-shape `T` not one of the union's arms is a runtime shape walk
 // the checker cannot lower: pass 1 records the sites, this pass generates one
 // predicate/builder per target as VL source and re-checks. No deep `is` means no second pass.
 function jwSecondPass(root: i32): i32 {
   if jwSiteNode.length == 0 { return 0 }
+  // The pass appends to `P.toks` before it writes a node, so the arena stamp alone would
+  // let a replay read the banked tree off a stream carrying the generated tail.
+  arenaEpochBump()
   const gen = jwGenerateSource()
   if gen == "" { return 0 }
   // The fragment is tokenized ONTO the existing stream (the module pipeline's
@@ -910,6 +969,7 @@ export function checkSrc(): i32 {
   vcLoadToksEntry(vcSource())
   const root = parseProgram()
   if vcParseBlocked() { return 1 }
+  vcEpBank(vcSource(), root)
   csPreMintLocs()
   checkProgram(root)
   // A lossless-recovered file reports BOTH streams and keeps rc 1 — the parse
@@ -932,6 +992,14 @@ export function checkSrc(): i32 {
 // or -1 on a lex/parse error; the host reads each via `lintCount`/`lintSev*`/`lintMsg*`.
 export function lintSrc(): i32 {
   symSetEnabled(0)
+  // The tree the check on this source already built, when it left it intact — the resets
+  // below are what a re-parse needs, and there is nothing to re-parse.
+  const banked = vcEpReplay(vcSource())
+  if banked >= 0 {
+    lintSetSource(vcSource())
+    lint(banked)
+    return lintCount()
+  }
   P.toks = []
   P.nodes = []
   sidReset()
@@ -1210,6 +1278,7 @@ export function checkSrcSym(): i32 {
   vcLoadToksEntry(vcSource())
   const root = parseProgram()
   if vcParseBlocked() { return 1 }
+  vcEpBank(vcSource(), root)
   csPreMintLocs()
   checkProgram(root)
   // Lossless recovery: the symbol tables ARE populated for the rc-1 result too,
@@ -2386,6 +2455,7 @@ function modScanCached(m: i32, key: string, src: string): i32 {
 // cached); on a miss, tokenizes and banks the stream if it produced no lex diags.
 // The miss covers a module the scan skipped or one whose lex diags made it unbankable.
 function vcLoadToksMod(m: i32): i32 {
+  vcEpDrop()
   const ci = modCacheLookup(modKeys[m], modSrcs[m])
   if ci >= 0 && modCacheTokOff[ci] >= 0 {
     let ti = modCacheTokOff[ci]
@@ -3245,6 +3315,7 @@ function modVisit(m: i32, depth: i32): i32 {
 // The whole module pipeline behind `compileSrc` (emit = 1) / `checkSrc` (0).
 function modCompile(emit: i32): i32 {
   vcEtDrop()
+  vcEpDrop()
   // 1. Order + validate (DFS from the entry, table index 0).
   modState = []
   modOrder = []
