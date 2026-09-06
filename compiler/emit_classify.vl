@@ -2021,6 +2021,13 @@ function nulRefArrayInnerSlot(exprIx: i32, fnIx: i32) {
     }
     return -1
   }
+  // The `?.` twin of the arm above, one code wider: the receiver's `| null` makes even a
+  // non-nullable ref-list field's read nullable, so code 5 answers here too (D1681).
+  if e is OptMember {
+    const orc = optChainLeafFieldCode(exprIx, fnIx)
+    if orc == 5 || orc == 28 { return refListSlotOfExpr(exprIx, fnIx) }
+    return -1
+  }
   if e is Index {
     const slot = refListSlotOfExpr(e.idxArr, fnIx)
     if slot >= 0 && slot < rlElemName.length { return rlElemInnerSlot(slot) }
@@ -9535,6 +9542,36 @@ export function optChainStagesRecv(ix: i32): boolean {
   !optRecvReReadable(b)
 }
 
+// A `.get` INDEX the lowering may emit twice: a literal, a name, or a NEGATIVE literal, whose
+// unsigned bounds compare maps it past `len` and so takes the absent arm. Anything else is
+// evaluated once into the index stash (D1677).
+export function listGetIdxReReadable(idxIx: i32): boolean {
+  const n = P.nodes[unwrapParen(idxIx)]
+  if n is NumLit { return true }
+  if n is Ident { return true }
+  if n is Unary {
+    if n.unOp == "-" {
+      const inner = P.nodes[unwrapParen(n.unArg)]
+      if inner is NumLit { return true }
+    }
+  }
+  false
+}
+
+// Is the node at `ix` a `.get(i)` whose index or receiver must be STAGED, because it is not a
+// re-readable place? One home for the question, so the slots reserved and the code emitted
+// cannot disagree (D1677).
+export function listGetStagesOperand(ix: i32): boolean {
+  const c = P.nodes[unwrapParen(ix)]
+  if !(c is Call) { return false }
+  const callee = P.nodes[unwrapParen(c.callFn)]
+  if !(callee is Member) { return false }
+  if callee.memProp != "get" { return false }
+  if !optRecvReReadable(callee.memObj) { return true }
+  if c.callArgs.length != 1 { return false }
+  !listGetIdxReReadable(c.callArgs[0])
+}
+
 // The value-atom kind the concrete (non-box) side of a union `==` compares under — the
 // same ladder `emitUnionCoerce` uses — or -1 when the operand has no atom rep (a struct,
 // a map, a void call). -1 is a real "cannot classify" answer, never an in-band `"i32"`
@@ -10416,7 +10453,7 @@ function exprIsMultiFieldReboxCall(exprIx: i32, fnIx: i32): boolean {
 // `stashHitAt`: a multi-field struct call re-boxed into a variant arm, and a `?.` chain
 // base that is not re-readable. One traversal answers both, so a node kind taught to the
 // walk cannot reach one reservation and miss the other (D1667).
-export type StashWant = "rebox" | "optrecv"
+export type StashWant = "rebox" | "optrecv" | "listget"
 
 // Does the single node at `ix` need the stash `want` names?
 function stashHitAt(ix: i32, fnIx: i32, want: StashWant): boolean {
@@ -10426,6 +10463,9 @@ function stashHitAt(ix: i32, fnIx: i32, want: StashWant): boolean {
     }
     "optrecv" => {
       return optChainStagesRecv(ix)
+    }
+    "listget" => {
+      return listGetStagesOperand(ix)
     }
   }
 }
