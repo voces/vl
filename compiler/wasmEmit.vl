@@ -3037,6 +3037,42 @@ function emitOptChainValue(body: i32[], exprIx: i32, fnIx: i32) {
   0
 }
 
+// The heap type a `?.` leaf of field code `code` delivers as `F | null`: the field's OWN
+// storage heap, read off the same table `pushFieldStorage` writes, so the value this arm
+// builds and the slot it reads cannot name different types. -1 when the leaf's rep is not a
+// ref — a scalar rides the box instead (`optChainLeafBoxKind`).
+function optChainLeafRefHeap(code: i32, si: i32, fi: i32): i32 {
+  // The nullable atom list (18) shares the i32 list's wrapper, as its field storage does.
+  if code == 4 || code == 18 { return lTypeIdx }
+  if code == 6 { return mkListIdx }
+  if code == 25 { return fl64TypeIdx }
+  if code == 26 { return il64TypeIdx }
+  if code == 27 { return fl32TypeIdx }
+  if code == 35 {
+    if !ba8Used { return -1 }
+    return bl8TypeIdx
+  }
+  if code == 5 || code == 28 {
+    const rs = sFieldRefSlot(si, fi)
+    if rs < 0 || rs >= rlWrapIdx.length { return -1 }
+    return rlWrapIdx[rs]
+  }
+  const nsl = nulScalarListFieldWrapHeap(code)
+  if nsl >= 0 { return nsl }
+  -1
+}
+
+// The value-atom kind a `?.` leaf of field code `code` boxes as, for the `F | null` box the
+// scalar nullables ride — `i32 | null` and `f64 | null` are the same rep with a different
+// tag. -1 when the leaf is not a scalar the box speaks.
+function optChainLeafBoxKind(code: i32): i32 {
+  if code == 0 { return 0 }
+  if code == 17 { return 4 }
+  if code == 23 { return 3 }
+  if code == 24 { return 5 }
+  -1
+}
+
 // Lower a standalone optional chain `recv?.f` — in ordinary value position (a `const`/`let`
 // initializer, an argument, a `??` left side) — as the value of its own recorded type
 // `F | null`. The shape is the fused `?? d` two-arm select with the default replaced by the
@@ -3068,6 +3104,7 @@ function emitOptMemberValueGo(body: i32[], exprIx: i32, fnIx: i32) {
       return emitFailAt("emitProgram: `?.` field is not on the struct", exprIx)
     }
     const oCode = sFieldTypeAt(osi, ofi)
+    const oRefHeap = optChainLeafRefHeap(oCode, osi, ofi)
 
     // The nested-struct leaf (code 15), the arm the `?.` producer needs (D1084). `o?.f` over
     // `o: T | null` with `T = {f: S}` has type `S | null`, and the rep for that is the nullable
@@ -3096,9 +3133,35 @@ function emitOptMemberValueGo(body: i32[], exprIx: i32, fnIx: i32) {
       ctrlLeave()
       return 0
     }
-    if oCode != 0 && oCode != 3 && oCode != 20 && oCode != 16 {
+
+    // A LIST leaf, the code-15 arm one table over: `T[] | null` is the list wrapper's own
+    // nullable ref, so a null link yields `ref.null $wrap` and a live one reads the field.
+    // A nullable-list field is already `(ref null $wrap)`, which the same blocktype accepts.
+    if oRefHeap >= 0 {
+      if emitOptChainIsNull(body, exprIx, fnIx) < 0 { return -1 }
+      fbIfRefNul(oRefHeap, true)
+      ctrlEnter()
+      fbRefNull(oRefHeap)
+      fbElse()
+      if emitOptChainValue(body, e.omObj, fnIx) < 0 { return -1 }
+      fbStructGet(sHeapIdx[osi], ofi)
+      fbEnd()
+      ctrlLeave()
+      return 0
+    }
+    // The leaf reps this arm can build, in the order the arms below take them: a nullable
+    // REF (a list, a nested struct, a string), the scalar box (i32/boolean/f64/i64/f32),
+    // and the value-union box. A map or closure leaf reaches neither and is named as such.
+    if (
+      oCode != 0 &&
+      oCode != 3 &&
+      oCode != 20 &&
+      oCode != 16 &&
+      optChainLeafBoxKind(oCode) < 0 &&
+      oRefHeap < 0
+    ) {
       return emitFailAt(
-        "emitProgram: a standalone `?.` supports only i32/boolean and string leaf fields — read it through `?? d` or a `!= null` guard",
+        "emitProgram: a standalone `?.` has no rep for a map or closure leaf field — read it through a `!= null` guard",
         exprIx,
       )
     }
@@ -3121,8 +3184,17 @@ function emitOptMemberValueGo(body: i32[], exprIx: i32, fnIx: i32) {
 
     // `i32 | null` (and a boxed code-16 leaf) rides the `{tag, payload}` box, `null` as the
     // null tag over an unread payload; both heap types are usage-gated against an uncollected union.
-    if oCode == 16 || (ord.rdKind == "union" && ord.rdNul == 4) {
-      const ovb = vbHeapIdxOfKind(0)
+    // A wide scalar leaf rides the same box: `f64 | null` and `i32 | null` are one rep with
+    // a different tag, so the kind comes from the leaf's own code and never from `i32`.
+    const oBoxKind = optChainLeafBoxKind(oCode)
+    if (
+      oCode == 16 ||
+      (ord.rdKind == "union" && ord.rdNul == 4) ||
+      (oBoxKind > 0 && ord.rdNul == 4)
+    ) {
+      let ovbKind = 0
+      if oBoxKind > 0 { ovbKind = oBoxKind }
+      const ovb = vbHeapIdxOfKind(ovbKind)
       if !uDeclared || (oCode != 16 && ovb < 0) {
         return emitFailAt(
           "emitProgram: `?.` yields a nullable scalar but its union box was not collected",
@@ -3144,7 +3216,7 @@ function emitOptMemberValueGo(body: i32[], exprIx: i32, fnIx: i32) {
         ctrlLeave()
         return 0
       }
-      fbI32Const(scalarTagOfKind(0))
+      fbI32Const(scalarTagOfKind(ovbKind))
       if emitOptChainValue(body, e.omObj, fnIx) < 0 { return -1 }
       fbStructGet(sHeapIdx[osi], ofi)
       fbStructNew(ovb)
