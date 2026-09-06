@@ -9041,6 +9041,47 @@ function anonValueFitsField(vc: i32, sc: i32, valIx: i32, si: i32, mfi: i32) {
   true
 }
 
+// May an object literal's field value (coded `vc`) be stored into DECLARED row `si`'s field
+// `mfi` (coded `sc`)? The one comparator both companion-bearing codes reach: a box by its
+// member SEQUENCE, a nested struct by whether its two element rows box one. Refutation-only,
+// and the caller asks it only for a row the literal's own destination does not name (D1694).
+function declRowFieldFits(vc: i32, sc: i32, valIx: i32, si: i32, mfi: i32) {
+  if vc != sc { return true }
+  const vn = anonFieldElemName(valIx, vc)
+  if vn == "" { return true }
+  const fn = sFieldElemNameAt(si, mfi)
+  if fn == "" { return true }
+  if sc == 16 { return unionMemberSetsCompat(vn, fn) }
+  elemRowsBoxCompat(vn, fn)
+}
+
+// Are two nested-struct element ROWS compatible for a capture? Only their union-BOX fields
+// are asked, and only where both rows name one: re-interning a literal at another row can
+// widen a field or drop one, but it cannot renumber a box's positional tags, so a box
+// disagreement is the one difference a capture may not paper over (D1694).
+function elemRowsBoxCompat(an: string, bn: string): boolean {
+  if an == bn { return true }
+  const ai = structIndexByName(an)
+  if ai < 0 { return true }
+  const bi = structIndexByName(bn)
+  if bi < 0 { return true }
+  let k = 0
+  while k < sFieldCount[ai] {
+    if sFieldTypes[sFieldStart[ai] + k] == 16 {
+      const bj = sFieldIndex(bi, sFieldNames[sFieldStart[ai] + k])
+      if bj >= 0 && sFieldTypeAt(bi, bj) == 16 {
+        const av = sFieldElemName[sFieldStart[ai] + k]
+        const bv = sFieldElemNameAt(bi, bj)
+        if av != "" && bv != "" {
+          if !unionMemberSetsCompat(av, bv) { return false }
+        }
+      }
+    }
+    k = k + 1
+  }
+  true
+}
+
 // True if struct-table row `si` is an anonymous shape — one `collectAnonShapes` minted
 // from an object literal under a synthetic `#anonN` name, rather than a declared `type`
 // or inline-shape annotation. An anon row's codes read directly off the literal (exact); a
@@ -9182,20 +9223,18 @@ function structIndexOfObjCtxGo(objIx: i32, fnIx: i32) {
                 // The remaining value axes, of which the f64 and i64 checks are special cases.
                 ok = false
               }
-              // A union-box field on a declared row: box tags are positional, so a literal
-              // boxing another member set reads its payload at the wrong tag. A preference
-              // for the row the literal's own destination names, not a refusal — a declared
-              // box field may be wider than the value's union, and delivery keeps it (D1690).
-              if sc == 16 && vc == 16 && ok {
+              // A companion-bearing field on a DECLARED row, asked only where the literal's
+              // own destination names a different row: a preference, not a refusal, since
+              // delivery is what earns a declared box's widening and a declared element's
+              // own spelling (D1690, D1694).
+              if ok && (sc == 16 || sc == 15) {
                 if !sIsAnonRow(si) {
                   if dstRow == 0 - 2 {
                     dstRow = repRowOfTyStruct(nodeRepTyIxOf(objIx), sLimA)
                   }
                   if si != dstRow {
-                    const dbv = anonFieldElemName(f.fiValue, 16)
-                    const dbf = sFieldElemNameAt(si, mfi)
-                    if dbv != "" && dbf != "" {
-                      if !unionMemberSetsCompat(dbv, dbf) { ok = false }
+                    if !declRowFieldFits(vc, sc, f.fiValue, si, mfi) {
+                      ok = false
                     }
                   }
                 }
@@ -14048,15 +14087,29 @@ function fieldElemDeclConflict(qElemTy: i32, si: i32, fj: i32): boolean {
   qn != rn
 }
 
+// `fieldElemDeclConflict`'s union-box twin: every box field is code 16 whatever it boxes, so
+// the field-set scan matches two boxes on their code alone. Two boxes are one layout only if
+// their member SEQUENCES are, the tags being positional. Refutation-only, like its sibling.
+function fieldBoxSetConflict(qTy: i32, si: i32, fj: i32): boolean {
+  if qTy < 0 { return false }
+  const qn = tyToEmitName(qTy)
+  if qn == "" { return false }
+  const rn = sFieldElemNameAt(si, fj)
+  if rn == "" { return false }
+  !unionMemberSetsCompat(qn, rn)
+}
+
 // Does struct row `si` carry a PROVEN element-declaration conflict against the query
-// object type's fields, on any of the named-heap field codes?
+// object type's fields, on any of the named-heap field codes or on a union box?
 function rowElemDeclConflicts(si: i32, fnames: string[], ftys: i32[]): boolean {
   let k = 0
   while k < fnames.length {
     const fj = sFieldIndex(si, fnames[k])
     if fj >= 0 {
       const code = sFieldTypeAt(si, fj)
-      if fieldCodeRefsElemHeapC(code) {
+      if code == 16 {
+        if fieldBoxSetConflict(ftys[k], si, fj) { return true }
+      } else if fieldCodeRefsElemHeapC(code) {
         if fieldElemDeclConflict(fieldElemTyOfQueryTy(ftys[k], code), si, fj) {
           return true
         }
