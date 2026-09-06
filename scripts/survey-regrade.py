@@ -71,6 +71,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import seed_provenance  # noqa: E402
+
 ROOT = Path(__file__).resolve().parent.parent
 ROW = re.compile(r"^###\s+row\s+(\d+)\b\s*(?:[-—]\s*(.*))?$")
 LEAD = re.compile(r"^Measure:\s*$")
@@ -176,7 +179,7 @@ def run_shell(cmd):
     return float(nums[-1]), p.stdout.strip().splitlines()[-1][:80]
 
 
-def grade(rows, prof, strict):
+def grade(rows, prof, strict, require_profile=False, provenance=True):
     incl = own = present = None
     if prof:
         incl, own, nsamp, present = profile_shares(prof)
@@ -260,6 +263,21 @@ def grade(rows, prof, strict):
           "%d NOT RE-RUNNABLE"
           % (len(graded), len(graded) - len(moved), len(moved), len(skipped),
              len(exempt), len(broken)))
+    # The shell rows are graded against the tree, but a profile row is graded against a SEED,
+    # so the summary names which one — the same rule the witness checker follows.
+    # The self-test grades SYNTHETIC specimens in a temp dir, so the real tree's seed says
+    # nothing about them; only a run over a real doc consults it.
+    prov = seed_provenance.guard("survey-regrade", len(moved), out=sys.stdout) \
+        if provenance else 0
+    # `--strict` ALONE IS VACUOUS FOR A SHARE ROW: without `--profile` those rows report
+    # `skipped`, and a skip is in neither `moved` nor `broken`, so a run that measured none of
+    # them exits 0 and reads exactly like one that measured all of them.
+    if require_profile and skipped:
+        print("\n--require-profile: %d share row(s) reported `skipped` because no profile was\n"
+              "  given. Take one with `scripts/perf/guest-profile.sh <dir> build "
+              "compiler/entry.vl`\n  and pass `--profile <dir>/entry.json`." % len(skipped))
+        for r in skipped:
+            print("  %s:%d  %s" % (r["doc"], r["line"], r["id"]))
     if moved:
         print("\nRows whose filed number no longer reads — re-grade the survey:")
         for r in moved:
@@ -273,7 +291,8 @@ def grade(rows, prof, strict):
             print("      %s" % why)
         print("      fix: give the row a `Measure:` block naming a kind, a filed number and "
               "a tolerance — or `kind: none` with a `why:` if no number is re-runnable.")
-    return 1 if (broken or (moved and strict)) else 0
+    return prov or (1 if (broken or (moved and strict) or (require_profile and skipped))
+                    else 0)
 
 
 SELF_TEST_DOC = """
@@ -382,7 +401,7 @@ def self_test():
         import contextlib
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            rc = grade(rows, str(prof), False)
+            rc = grade(rows, str(prof), False, provenance=False)
         out = buf.getvalue()
     bad = []
     for rid, verdict in want.items():
@@ -403,11 +422,13 @@ def self_test():
 
 
 def main(argv):
-    docs, prof, strict, out_json = [], None, False, None
+    docs, prof, strict, out_json, require_profile = [], None, False, None, False
     it = iter(argv)
     for a in it:
         if a == "--strict":
             strict = True
+        elif a == "--require-profile":
+            require_profile = True
         elif a == "--self-test":
             return self_test()
         elif a == "--profile":
@@ -427,7 +448,7 @@ def main(argv):
     if not rows:
         print("no `### row N` headings in %s" % ", ".join(docs))
         return 2
-    rc = grade(rows, prof, strict)
+    rc = grade(rows, prof, strict, require_profile)
     if out_json:
         Path(out_json).write_text(json.dumps(rows, indent=2, default=str))
         print("\nwrote %s" % out_json)
