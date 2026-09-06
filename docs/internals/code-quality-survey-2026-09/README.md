@@ -25,7 +25,7 @@ diagnostic column base); the rest stand on the surveys' own measurements.
 | --- | --- | --- | --- | --- |
 | 7 | `letListBuildKind` and `letListBuildSlot` run one scoped destination walk twice, back to back, at all three sites | emitter #1 | filed ~16% of a self-compile; #2567 merged both into `letListBuild`, and re-measuring THAT name 2026-09-06 reads **1.58% inclusive** — the epoch-stamped memo still scheduled as step 2 is worth under two points, not sixteen | byte-identical seed, corpus `cmp` — **partly landed #2567**; remaining: epoch-stamped memo (step 2), re-priced |
 | 8 | `nodeChildren` allocates and walks 25 tag compares per node; 45.5% of nodes reach no arm | front end #1 | 11.75% of self time; DONE — the ALLOCATION was the cost, not the ladder (#2570, self **8.16% → 3.51%**), and the reach index this row called a campaign is `dsgDestSlot` (#2607). Re-measured 2026-09-06 over two self-compile profiles: `nodeChildren` **0.47 / 0.67%** inclusive, `dsScopeWalk` **0.02 / 0.00%**, and the index pass that replaced it **0.70 / 0.73%** (front end §5.1) | fixture byte identity, profile A/B — **landed #2570, #2607** |
-| 9 | `fnDetectScratch` runs 12 whole-body walks per function; `dupScanRun` repeats the set per shadowed name | emitter #2 | 21% inclusive | byte-identical seed, `regress.py` — **partly landed #2580**; remaining: ~2.5% memo, eqCoreKindOfBin |
+| 9 | `fnDetectScratch` runs 12 whole-body walks per function; `dupScanRun` repeats the set per shadowed name | emitter #2 | 21% inclusive; DONE 2026-09-06 — the remainder was NOT a memo: `listOpKindOfBin` is threaded to the four callers that re-derived it, and `dupScanRun` goes **20.99% → 15.58%** inclusive (emitter §5.2) | byte-identical seed, `regress.py` — **landed #2580 and this PR** |
 | 10 | `nestedFnDeclaredInFrame` is the un-indexed twin of `nestedFnDeclaredIn`, which already has the child index | emitter #5 | O(children) per rung; one arena-scan ratchet entry retires | byte-identical seed — **landed #2583** |
 | 11 | definite assignment keeps a name-keyed `string[]` rebuilt per write, with every module binding in it | front end #2 | the call-site `O(n^1.5)` the perf survey never attributed | the scaling-shape ladder — **landed #2584** |
 | 12 | sixteen functions re-run the same seven-classifier ladder in the same order | emitter #4 | ~23% inclusive summed | byte-identical seed, corpus `cmp` — **partly landed #2583**; remaining: 14 sites refuted, not merged |
@@ -61,7 +61,7 @@ Rows 19 and 20 are rulings, not work.
 | 6 | landed | #2563 |
 | 7 | partly landed | #2567 |
 | 8 | landed | #2570, #2607 |
-| 9 | partly landed | #2580 |
+| 9 | landed | #2580, this PR |
 | 10 | landed | #2583 |
 | 11 | landed | #2584 |
 | 12 | partly landed | #2583 |
@@ -183,13 +183,17 @@ Measure:
 
 ### row 9 — `fnDetectScratch`'s whole-body walks
 
+Landed by this PR, so the filed number is no longer the cost the row carries but the
+invariant its fix established: `listOpKindOfBin` is asked once per node and threaded, and
+the share must not climb back. Re-measured on the rebased tree after the fix.
+
 Measure:
 
     kind: profile-incl
     what: fnDetectScratch
-    filed: 21.3
-    tol: 4
-    dir: both
+    filed: 16.28
+    tol: 3
+    dir: at-most
 
 ### row 10 — `nestedFnDeclaredInFrame` is indexed
 
@@ -207,12 +211,17 @@ Measure:
 
 ### row 12 — the seven-classifier ladder re-run
 
+This PR moved this row's number without closing it: threading `listOpKindOfBin` for row 9
+takes it from **10.8% to 4.49% inclusive**, measured on the same profile. The row's own
+remainder — 14 sites refuted, not merged — is unchanged, so the block is re-filed at the new
+cost rather than retired, in the PR that moved it.
+
 Measure:
 
     kind: profile-incl
     what: listOpKindOfBin
-    filed: 10.8
-    tol: 4
+    filed: 4.5
+    tol: 2
     dir: both
 
 ### row 13 — `lint()` walks the arena once
