@@ -13,6 +13,7 @@ import difflib
 import random
 
 import grammar as G
+import imports as I
 import modules as M
 
 IND = "  "
@@ -415,7 +416,7 @@ def render_spec(spec, faces):
 
 
 # Axes with a grammar of their own, keyed by the `generator` their record names.
-GENERATORS = {"modules": M.make_pair}
+GENERATORS = {"modules": M.make_pair, "imports": I.make_pair}
 
 
 def _generator_axes():

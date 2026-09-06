@@ -71,6 +71,11 @@ AXIS for the same reason, and prints `NOT EXERCISED` rather than a zero.
    start-function locals), every module's top level is lowered into ONE start function, and
    several by-name scans see only one class or only one module. D1593 / D1595 / D1596 all
    needed two files to appear and every instrument here was blind to them.
+10. **`imports_pair`** — the same program importing ONE std module and importing TWO. Also a
+    GENERATOR axis (`imports.py`), and for the same reason: what it varies is the IMPORT
+    LIST, which no plan above has. D1514 is the shape — `std:fs` compiled in 18 ms alone,
+    `std:array` in 40 ms alone, the module importing BOTH in 5,006 ms — and six sweep rows
+    were two features that each worked alone.
 
 Crossed with a **SOURCE** dimension — where the value comes from: a literal, a call, an
 index read, a field read, a map read, a `??`. Not interchangeable at the emitter: D1476
@@ -82,9 +87,12 @@ Stated plainly, because a zero from an instrument is only as good as its frame.
 
 * **Anything outside the grammar.** Seventeen value shapes, six sources, nine delivery
   positions, six scopes, five neighbours; the module axis adds twenty-four units and nine
-  reports. No generics with more than one parameter, no recursive types, no `match`, no
-  operator overloading, no `std:json`/`std:fs`, no i32/f64 mixed arithmetic, no strings
-  beyond `+`/`.length`. Each is a grammar record away, and none is there today.
+  reports, and the imports axis twelve std modules. No generics with more than one parameter,
+  no recursive types, no `match`, no operator overloading, no i32/f64 mixed arithmetic, no
+  strings beyond `+`/`.length`. `std:` reaches the single-file axes only as an unused import
+  (the `unused_import` neighbour) and the imports axis only as one call per module, so no
+  std VALUE — a `Json` tree, an `IoError`, a `Buf` — is ever delivered or read by the plans
+  above. Each is a grammar record away, and none is there today.
 * **More than TWO modules, and a print from an imported one.** The split moves a
   dependency-closed subset into one imported module and every `print` stays in the entry,
   so the two faces cannot differ merely because a module's start function ran first. A
@@ -122,6 +130,8 @@ So the controls split in two, and the split is the lesson:
 | `D1593/agree` | a module's loop variable beside the importer's block `const n` | `AGREE-RUNS`, `RUNS` / `RUNS` |
 | `D1595/agree` | the same collision at a string, where the scratch frame is detected | `AGREE-RUNS`, `RUNS` / `RUNS` |
 | `D1596/agree` | a hole parameter fed from a block `const` across the import | `AGREE-RUNS`, `RUNS` / `RUNS` |
+| `synthetic/imports-check` | a std `string` result into an `i32`, two std imports deep | `DISAGREE`, `RUNS` / `check refuses` |
+| `imports_pair/agree` | `std:array` alone against `std:array` + `std:fmt`, from the grammar | `AGREE-RUNS`, `RUNS` / `RUNS` |
 
 The three **synthetic** ones prove the sampler can still SEE and CLASSIFY a disagreement, and
 each rests on a rule the design will always enforce: a type error, a bounds-checked index, an
@@ -147,10 +157,18 @@ should compile or the CHECKER owed the diagnosis. No emit refusal is therefore a
 and none can be a permanent control. `synthetic/trap` covers what such a control would have
 given: a deterministic non-check channel that will still be there next year.
 
+**AN AGREE PIN'S CONTRACT IS WRITTEN OUT, NEVER TAKEN FROM THE RENDERER IT PINS.**
+`imports_pair/agree` was first written with `want` read from the same `I.render(…)` call it
+was grading, and the sabotage that MUST fire — making the two-import face drop its second
+import — passed, because the pin's expectation moved with the program. Spelled by hand
+(`["3"]` and `["3", "41!"]`) the same sabotage prints `imports_pair/agree … NOT SPEAKING`
+and exits 1. A control whose contract comes from the thing under test cannot fail; this is
+the same fault as a probe validated against no failing control, one layer up.
+
 Validated the way any control must be, against a sabotage that MUST fire: changing
 `synthetic/wrong`'s expected output so the pair agrees makes the suite print
 `synthetic/wrong … NOT SPEAKING` and exit 1, naming the want and the got.
-`tests/vl_day_one_sampler_test.ts` runs all five on every gate, and additionally requires at
+`tests/vl_day_one_sampler_test.ts` runs all eleven on every gate, and additionally requires at
 least three SYNTHETIC controls to be grading a disagreement — a suite of agree-pins alone
 passes on an instrument that has stopped speaking entirely.
 
@@ -331,6 +349,52 @@ pairs (12.5%)**, which is what a plain `sample.py --count N` will spend on it.
 Neither is reachable by the single-file axes: the `scope` axis picks ONE scope for the whole
 program, so no plan it draws composes a module-scope block with a module-scope global.
 
+## The `imports_pair` sample — the axis's whole population, and no D1514 shape left
+
+Graded 2026-09-06 against master `dcbf7521c`. Twelve std modules is **132 ordered pairs**, and
+`--axis imports_pair --count 300` draws every one of them, so this is not a sample of the
+axis — it is the axis:
+
+    132 pairs = 264 programs · 0 of them multi-module
+
+    pair verdicts
+      AGREE-RUNS                  132
+
+    program grades
+      RUNS                        264
+
+**Zero disagreements and zero both-fails.** A second std import in the same module changes no
+outcome at this grammar. Its natural share of a mixed run is **86 of 1,000 pairs (8.6%)**
+(seeds 6001–6002), also all `AGREE-RUNS`.
+
+The TIMING half is the reason the axis exists, and it is a separate report because it needs
+THREE programs — `together` read against the SUM of the two alone-times, which is what D1514
+measured and what no two-program pair can express:
+
+    python3 scripts/day-one/sample.py --imports-report run.jsonl
+
+66 unordered pairs, min of 3 `vl build` runs each, at `--jobs 2` on a contended box:
+
+| first | second | aloneA | aloneB | together | ratio |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `std:seed` | `std:args` | 14.0 | 41.7 | 72.0 | 1.29 |
+| `std:test` | `std:json` | 22.0 | 102.7 | 123.8 | 0.99 |
+| `std:json` | `std:base64` | 101.9 | 17.0 | 109.0 | 0.92 |
+| `std:array` | `std:fs` | 16.5 | 46.4 | 54.4 | 0.87 |
+| … | | | | | |
+| `std:base64` | `std:buffer` | 17.7 | 55.5 | 26.6 | 0.36 |
+
+**0 of 66 pairs over 3× the sum**, and most are BELOW 1.0 — two imports cost less than two
+one-import compiles because the seed's own start-up is paid once. The D1514 shape (`std:fs`
++ `std:array` at 5,006 ms against 58 ms of alone-time, a ratio of 86) does not survive
+anywhere in this pool: that pair reads **0.87** here.
+
+**Read the VERDICT, not a single row's milliseconds.** Three runs of this report on the same
+tree (`--jobs 6`, `--jobs 2` twice) all said `0 pair(s) over 3.0x`, but the worst ratio moved
+between **1.13 and 1.36** and which pair was worst changed each time — a min of three builds
+on a shared box still carries the neighbours' load. The bar is 3× for that reason: it is set
+to catch an 86, not to rank a 1.2.
+
 ## Running it
 
 `--count` counts PROGRAMS, so it is twice the number of pairs.
@@ -342,9 +406,10 @@ program, so no plan it draws composes a module-scope block with a module-scope g
     python3 scripts/day-one/file_row.py run.jsonl --index 7 --title "…" --write
     python3 scripts/day-one/sample.py --replay run.jsonl
     python3 scripts/day-one/sample.py --report run.jsonl other.jsonl
+    python3 scripts/day-one/sample.py --imports-report run.jsonl
 
 **The big sample is a DISCOVERY run, not a gate.** What is in the gate is
-`tests/vl_day_one_sampler_test.ts`: a fixed-seed 40-program sample plus the five controls,
+`tests/vl_day_one_sampler_test.ts`: a fixed-seed 40-program sample plus the eleven controls,
 **350 ms**, reached by `gate.sh`'s ci-native row and by CI's `tests/vl_*_test.ts` glob. It
 asserts four things, none of which is a hit count — the grade vocabulary (so `sample.py`
 and `capability-probes/run.py` cannot drift), that every axis the grammar declares was
