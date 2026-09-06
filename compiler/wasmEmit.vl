@@ -519,6 +519,8 @@ import {
   cloSigTypeIdxAt,
   coalesceDefaultNullable,
   coalesceLitUnionFits,
+  coalesceNicheJoinsToBox,
+  coalesceResultUnionName,
   criFnIsAnonLambda,
   ctrlEnter,
   ctrlLeave,
@@ -809,6 +811,7 @@ import {
   unionArmTyOfAtom,
   unionArmVariantForObj,
   unionArmVariantForStructExpr,
+  unionArmVariantWithHeap,
   unionClosureArmName,
   unionClosureArmTy,
   unionEqArmSlot,
@@ -21688,6 +21691,132 @@ function coalesceNulCollArmCtx(lhsIx: i32, wrapIx: i32, fnIx: i32): ExpCtx {
   return c
 }
 
+// The value-atom code a nullable-scalar-list `VKind` carries once it is non-null — the atom
+// twin of `nulScalarListWrapHeap`'s wrapper table, one code per backing.
+function nulScalarListAtomKind(kind: VKind): i32 {
+  if kind == "nulstrlist" { return 9 }
+  if kind == "nulf64list" { return 8 }
+  if kind == "nuli64list" { return 10 }
+  if kind == "nulf32list" { return 12 }
+  if kind == "nulu8list" { return 13 }
+  -1
+}
+
+// The value-atom code the nullable-ref niche at `lhsIx` carries once it is non-null, or -1 for
+// a niche whose atom is not a scalar-backed one (a struct, a variant, a ref-element array).
+// Read off the NICHE, since the value is still nullable and classifies as no atom at all.
+function coalNicheAtomKind(lhsIx: i32, fnIx: i32): i32 {
+  if exprNullableString(lhsIx, fnIx) { return 2 }
+  if exprNullableList(lhsIx, fnIx) { return 7 }
+  const nsk = exprNulScalarListKind(lhsIx, fnIx)
+  if nsk != null { return nulScalarListAtomKind(nsk) }
+  -1
+}
+
+// The element spelling a ref value-atom code names — `valueAtomKind`'s inverse over exactly
+// the codes a nullable-ref niche can carry, for the union-membership test below. The code is
+// an array atom unless it is 2 (`string`), so the caller derives the array flag from it.
+function refAtomElemName(k: i32): string {
+  if k == 2 { return "string" }
+  if k == 7 { return "i32" }
+  if k == 8 { return "f64" }
+  if k == 9 { return "string" }
+  if k == 10 { return "i64" }
+  if k == 12 { return "f32" }
+  if k == 13 { return "u8" }
+  ""
+}
+
+// The result union's box tag for the OPERAND's own non-null rep, or -1 when no arm of that
+// union carries it. A miss is a loud refusal at the caller and never a fall-through: a box
+// tagged with an atom the union does not have is valid wasm whose `is` test is silently false.
+function coalNicheBoxTag(
+  joinSet: string,
+  lhsIx: i32,
+  heapIx: i32,
+  fnIx: i32,
+): i32 {
+  if exprNullableRefArray(lhsIx, fnIx) {
+    const rs = refListSlotOfExpr(lhsIx, fnIx)
+    if rs < 0 { return -1 }
+    if !unionHasRefArrayArmSlot(joinSet, rs) { return -1 }
+    return refArrSlotTag(rs)
+  }
+  const ak = coalNicheAtomKind(lhsIx, fnIx)
+  if ak >= 0 {
+    const en = refAtomElemName(ak)
+    if en == "" { return -1 }
+    if !unionHasAtomTy(joinSet, en, ak != 2) { return -1 }
+    return scalarTagOfKind(ak)
+  }
+  const vi = unionArmVariantWithHeap(joinSet, heapIx)
+  if vi >= 0 && vi < uTags.length { return uTags[vi] }
+  -1
+}
+
+// Will the DEFAULT reach the box rep? A struct-typed value that is neither an object literal
+// nor a resolvable arm of `joinSet` passes RAW through the box coercion, and a bare
+// `(ref $struct)` under a box blocktype is invalid wasm. Only that shape can, so only it is
+// asked; every other default either boxes or takes its own loud reject (D1720).
+function coalJoinDefaultBoxes(joinSet: string, defIx: i32, fnIx: i32): boolean {
+  const d = P.nodes[unwrapParen(defIx)]
+  if d is ObjLit { return true }
+  if !exprStruct(defIx, fnIx) { return true }
+  if unionArmVariantForStructExpr(joinSet, defIx, fnIx) >= 0 { return true }
+  exprVariantIndex(defIx, fnIx) >= 0
+}
+
+// The boxed twin of the core below, for a default that JOINS rather than fits: the checker
+// typed this `??` as a union, so the result is the value box and the operand's raw ref cannot
+// leave a `br_on_non_null` block as itself. Stage it once in the `?.` receiver slot — the
+// branch that boxes it has to read it back, which `br_on_non_null` cannot do (D1714).
+function emitCoalesceNulRefJoin(
+  body: i32[],
+  e: BinExpr,
+  exprIx: i32,
+  heapIx: i32,
+  lhsCtx: ExpCtx,
+  fnIx: i32,
+) {
+  const joinN = coalesceResultUnionName(exprIx)
+  let joinSet = unionMemberSetOf(joinN)
+  if joinSet == "" { joinSet = joinN }
+  const tag = coalNicheBoxTag(joinSet, unwrapParen(e.binLeft), heapIx, fnIx)
+  if tag < 0 {
+    return emitFailAt(
+      "emitProgram: `??` joins a nullable value into a union with no arm for the value's own type",
+      exprIx,
+    )
+  }
+  if !coalJoinDefaultBoxes(joinSet, e.binRight, fnIx) {
+    return emitFailAt(
+      "emitProgram: `??` default names no arm of the union its result is",
+      exprIx,
+    )
+  }
+  if !fnUsesOptRecv {
+    return emitFailAt("emitProgram: `??` operand stash not reserved", exprIx)
+  }
+  if emitExprExpect(body, e.binLeft, fnIx, lhsCtx) < 0 {
+    return -1 // the nullable ref, evaluated ONCE
+  }
+  fbLocalTee(optRecvSlot)
+  wU8(209)         // 0xd1 ref.is_null
+  fbIfRef(uBoxIdx) // 0x04 if, (ref $uBox) blocktype — the result's rep
+  ctrlEnter()
+  // Through `emitUnionBoxArg`, not `emitUnionCoerce`: a struct default that is already a
+  // kind-8 VARIANT local is a raw `(ref $variant)`, which the coerce hands back unboxed, and
+  // the box blocktype then holds a bare struct. The box-typed destinations share this entry.
+  if emitUnionBoxArg(body, joinN, e.binRight, fnIx) < 0 { return -1 }
+  fbElse()             // 0x05 else — present → the staged ref, boxed under its own arm's tag
+  fbI32Const(tag)
+  fbLocalGet(optRecvSlot)
+  fbStructNew(uBoxIdx) // { tag, the niche's own ref }
+  fbEnd()              // 0x0b end
+  ctrlLeave()
+  0
+}
+
 // The `br_on_non_null` core every nullable-ref-niche `??` shares, with both contexts and the
 // block's null-ness spelled out by the caller. `heapIx` is the cell's own heap type,
 // `nulBlock` whether the result may still be null, `lhsCtx` the context the one lhs evaluation
@@ -21700,12 +21829,18 @@ function coalesceNulCollArmCtx(lhsIx: i32, wrapIx: i32, fnIx: i32): ExpCtx {
 function emitCoalesceNulRefCtx(
   body: i32[],
   e: BinExpr,
+  exprIx: i32,
   heapIx: i32,
   nulBlock: boolean,
   lhsCtx: ExpCtx,
   defCtx: ExpCtx,
   fnIx: i32,
 ) {
+  // A default of another type makes the result the union box, which this block type cannot be:
+  // `br_on_non_null` branches with the raw ref it tested, so the boxed shape is its own arm.
+  if coalesceNicheJoinsToBox(exprIx, fnIx) {
+    return emitCoalesceNulRefJoin(body, e, exprIx, heapIx, lhsCtx, fnIx)
+  }
   wU8(2) // 0x02 block
   if nulBlock {
     wU8(99) // blocktype: (ref null $heapIx) — the result stays nullable
@@ -21732,6 +21867,7 @@ function emitCoalesceNulRefCtx(
 function emitCoalesceNulRef(
   body: i32[],
   e: BinExpr,
+  exprIx: i32,
   heapIx: i32,
   defCtx: ExpCtx,
   fnIx: i32,
@@ -21739,6 +21875,7 @@ function emitCoalesceNulRef(
   emitCoalesceNulRefCtx(
     body,
     e,
+    exprIx,
     heapIx,
     coalesceDefaultNullable(e.binRight, fnIx),
     expCtxHere(),
@@ -21984,6 +22121,7 @@ function emitCoalesceGo(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
     return emitCoalesceNulRef(
       body,
       e,
+      exprIx,
       cnclw,
       coalesceNulCollArmCtx(e.binLeft, cnclw, fnIx),
       fnIx,
@@ -22005,6 +22143,7 @@ function emitCoalesceGo(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
     return emitCoalesceNulRefCtx(
       body,
       e,
+      exprIx,
       sTypeIdx,
       coNul,
       rawCtx,
@@ -22636,7 +22775,7 @@ function emitCoalesceGo(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
     if cvi >= 0 && cvi < uVarHeap.length {
       const vDefCtx = expCtxHere()
       vDefCtx.variantIdx = cvi
-      return emitCoalesceNulRef(body, e, uVarHeap[cvi], vDefCtx, fnIx)
+      return emitCoalesceNulRef(body, e, exprIx, uVarHeap[cvi], vDefCtx, fnIx)
     }
   }
   // Generic nullable-struct `??`: a `S | null` value (ident/param binding, struct field, or
@@ -22650,7 +22789,7 @@ function emitCoalesceGo(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
       // one-evaluation shape are the nullable-ref-niche lowering the collections share.
       const defCtx = expCtxHere()
       defCtx.structIdx = csi
-      return emitCoalesceNulRef(body, e, sHeapIdx[csi], defCtx, fnIx)
+      return emitCoalesceNulRef(body, e, exprIx, sHeapIdx[csi], defCtx, fnIx)
     }
   }
   // D960 — `??` over a nullable value-union box whose operand cannot be re-read. The
