@@ -101,7 +101,7 @@ import {
   tokFirstLineEndCol,
   tokIndexAt,
 } from "./fmt_util"
-import { sidArrGet, sidArrPut, sidOf } from "./symbols"
+import { sidArrGet, sidArrPut, sidLookup, sidOf } from "./symbols"
 import { arenaReplaceNode, isBinOpFuncName } from "./ast"
 // The extern manifest: parsed in any module, declared here, imported by the emitter.
 import {
@@ -14214,6 +14214,137 @@ function cwFrameReset() {
   cwFrameUp = []
   cwModHead = -1
   cwFramesBuilt = false
+  cwIxReset()
+  0
+}
+
+// —— the occurrence index every query below reads (D1628) ——
+// One grow pass over the arena, memoised beside the frame table and dropped with it, so a
+// question about a NAME costs that name's own occurrences rather than a walk of the program.
+// A whole-arena scan per binding is what made a self-compile non-terminating (D1090).
+const CW_OCC_USE = 0
+const CW_OCC_BIND = 1
+const CW_OCC_ASG = 2
+const CW_OCC_CALL = 3
+// Per interned name (`sidOf`), the head of its occurrence chain, or -1.
+let cwIxHead: i32[] = []
+// The chain's rows: the next row, the arena node, the frame it resolves in, and which of the
+// four kinds above it is. A `CW_OCC_CALL` row carries no frame.
+let cwIxNext: i32[] = []
+let cwIxNode: i32[] = []
+let cwIxFr: i32[] = []
+let cwIxKind: i32[] = []
+// Per arena node: the container a place projects out of (`w` in `w.f`) and -1 elsewhere;
+// whether the node IS such an object; and whether a named destination consumes this call.
+let cwIxObj: i32[] = []
+let cwIxIsObj: i32[] = []
+let cwIxHeld: i32[] = []
+// Every return site, as the frame it returns out of and the expression it hands back.
+let cwIxRetOwner: i32[] = []
+let cwIxRetExpr: i32[] = []
+let cwIxBuilt = false
+
+function cwIxReset() {
+  cwIxHead = []
+  cwIxNext = []
+  cwIxNode = []
+  cwIxFr = []
+  cwIxKind = []
+  cwIxObj = []
+  cwIxIsObj = []
+  cwIxHeld = []
+  cwIxRetOwner = []
+  cwIxRetExpr = []
+  cwIxBuilt = false
+  0
+}
+
+// File one occurrence of the name `sid`, newest first — order does not matter, every reader
+// counts the whole chain.
+function cwIxOcc(sid: i32, node: i32, fr: i32, kind: i32) {
+  while cwIxHead.length <= sid { cwIxHead.push(-1) }
+  cwIxNext.push(cwIxHead[sid])
+  cwIxNode.push(node)
+  cwIxFr.push(fr)
+  cwIxKind.push(kind)
+  cwIxHead[sid] = cwIxNext.length - 1
+  0
+}
+
+// Record that `at` projects out of `obj`. A child is appended to the arena before its parent,
+// so `obj` is already sized; where it is not, the flag is simply not set and the container
+// reads as unsealed, which is the conservative answer.
+function cwIxPlace(at: i32, obj: i32) {
+  const p = cwPeel(obj)
+  cwIxObj[at] = p
+  if p >= 0 && p < cwIxIsObj.length { cwIxIsObj[p] = 1 }
+  0
+}
+
+// Record that a named destination consumes the call at `p`, when `p` is one.
+function cwIxHold(p: i32) {
+  if p < 0 || p >= cwIxHeld.length { return 0 }
+  const n = P.nodes[p]
+  if n is Call { cwIxHeld[p] = 1 }
+  0
+}
+
+function cwIxRet(owner: i32, expr: i32) {
+  if owner < 0 || expr < 0 { return 0 }
+  cwIxRetOwner.push(owner)
+  cwIxRetExpr.push(expr)
+  0
+}
+
+// Every fact this index carries about the node `at`. A kind with no arm here contributes no
+// row and no flag, which is what the readers below read as "this analysis knows nothing
+// about it" — the same answer a bare name got before the index existed.
+function cwIxNote(at: i32) {
+  const n = P.nodes[at]
+  if n is Ident {
+    cwIxOcc(sidOf(n.identName), at, cwFrameOfUse(at, n.identName), CW_OCC_USE)
+  }
+  if n is Param {
+    cwIxOcc(sidOf(n.parName), at, cwFrameOfDecl(at), CW_OCC_BIND)
+  }
+  if n is Member { cwIxPlace(at, n.memObj) }
+  if n is OptMember { cwIxPlace(at, n.omObj) }
+  if n is Index { cwIxPlace(at, n.idxArr) }
+  if n is RetStmt { cwIxRet(cwFrameOfDecl(at), n.retArg) }
+  if n is FuncDecl { cwIxRet(at, cwFnTailStmt(at)) }
+  if n is LetDecl {
+    cwIxOcc(sidOf(n.letName), at, cwFrameOfDecl(at), CW_OCC_BIND)
+    if n.letInit >= 0 { cwIxHold(cwPeel(n.letInit)) }
+  }
+  if n is Call {
+    const cn = covarRootName(n.callFn)
+    if cn != "" { cwIxOcc(sidOf(cn), at, CW_FR_UNKNOWN, CW_OCC_CALL) }
+  }
+  if n is BinExpr {
+    if n.binOp == "=" {
+      const ln = covarRootName(n.binLeft)
+      if ln != "" {
+        cwIxOcc(sidOf(ln), at, covarRootFrame(n.binLeft), CW_OCC_ASG)
+        cwIxHold(cwPeel(n.binRight))
+      }
+    }
+  }
+  0
+}
+
+// Build the index once for this arena. A grow loop rather than a scan: it appends a row per
+// node and reads each node once, which is a pass, not a per-query walk.
+function cwIxBuild() {
+  if cwIxBuilt { return 0 }
+  cwBuildFrames()
+  while cwIxObj.length < P.nodes.length {
+    const at = cwIxObj.length
+    cwIxObj.push(-1)
+    cwIxIsObj.push(0)
+    cwIxHeld.push(0)
+    cwIxNote(at)
+  }
+  cwIxBuilt = true
   0
 }
 
@@ -14521,10 +14652,64 @@ function cwCallNamed(names: string[]): boolean {
   false
 }
 
-// —— the container-field edge (D852) ——
-// The field name a member of `set` is stored into by an object literal — the shape the
-// three name-to-name edges have neither end of: `{ xs: b }` puts the list inside a struct
-// and `bx.xs` takes it back out under a name the closure never saw, keyed by the container's name plus the field name.
+// The `flds` entry an ARRAY or MAP escape records. No field name can spell it, so a
+// `Member` read never collides with the `Index` read it stands for.
+const CW_ELEM_FLD = "[]"
+
+// —— naming the container a store delivers into (D1628) ——
+// The container expression a peeled store destination projects out of — `w` in `w.f`, `xs`
+// in `xs[i]` and in a `push` call's own callee — or -1 for a form with no container.
+function cwEscapeObj(dst: i32): i32 {
+  if dst < 0 || dst >= P.nodes.length { return -1 }
+  cwIxBuild()
+  cwIxObj[dst]
+}
+
+// The container's binding name, or "" exactly where this analysis cannot identify it — no
+// name at the root, or a name re-bound in its frame, which would name two containers rather
+// than one. Nothing is then recorded and nothing is claimed.
+function cwEscapeOwner(dst: i32): string {
+  const obj = cwEscapeObj(dst)
+  if obj < 0 { return "" }
+  const onm = covarRootName(obj)
+  if onm == "" { return "" }
+  if !cwBoundOnce(onm, covarRootFrame(obj)) { return "" }
+  onm
+}
+
+function cwEscapeFrame(dst: i32): i32 {
+  const obj = cwEscapeObj(dst)
+  if obj < 0 { return CW_FR_UNKNOWN }
+  covarRootFrame(obj)
+}
+
+// The key the escape is filed under. `elem` forces the element key for a form whose member
+// name is not a field: a `push` callee spells the METHOD, and an index spells no name.
+function cwEscapeFld(dst: i32, elem: boolean): string {
+  if elem { return CW_ELEM_FLD }
+  if dst < 0 || dst >= P.nodes.length { return "" }
+  const n = P.nodes[dst]
+  if n is Member { return n.memProp }
+  CW_ELEM_FLD
+}
+
+// Is `callFnIx` the callee of `xs.push(…)` on a container this analysis can name? `push` is
+// the only mutator that takes the value: `pop` and `clear` deliver nothing, and a map's store
+// is an index assignment.
+function cwPushIntoNamed(callFnIx: i32): boolean {
+  const cf = cwPeel(callFnIx)
+  if cf < 0 || cf >= P.nodes.length { return false }
+  const n = P.nodes[cf]
+  if n is Member {
+    if n.memProp == "push" { return cwEscapeOwner(cf) != "" }
+  }
+  false
+}
+
+// —— the container escape edge (D852, widened to arrays, maps and stores by D1628) ——
+// Where a member of `set` goes INSIDE something — `{ xs: b }`, `[b]`, `w.f = b`, `m[k] = b`,
+// `xs.push(b)` — and comes back out under a name the closure never saw. Keyed by the
+// container's binding name plus a field name, or `CW_ELEM_FLD` for an element.
 function cwEscapedFields(
   set: string[],
   setFr: i32[],
@@ -14558,42 +14743,138 @@ function cwEscapedFields(
             }
           }
         }
+        if lit is ArrayLit {
+          const afr = cwFrameOfDecl(i)
+          if cwBoundOnce(n.letName, afr) {
+            let e = 0
+            while e < lit.arrElems.length {
+              const en = covarRootName(lit.arrElems[e])
+              if en != "" {
+                if cwHas(set, setFr, en, covarRootFrame(lit.arrElems[e])) {
+                  owners.push(n.letName)
+                  ownerFrs.push(afr)
+                  flds.push(CW_ELEM_FLD)
+                }
+              }
+              e = e + 1
+            }
+          }
+        }
       }
     }
+    cwEscapeByStore(i, set, setFr, owners, ownerFrs, flds)
+    cwEscapeByPush(i, set, setFr, owners, ownerFrs, flds)
     i = i + 1
   }
   0
 }
 
-// Is `nm` bound exactly once in frame `fr`, and never assigned there? The guard that makes a
-// binding name usable as a container identity — a name re-pointed by `bx = other` is not an
-// identity at all. Per frame, not program-wide: a binding of the name in a function that
-// cannot see this one is a different container and must not spend the guard (D1610).
-function cwBoundOnce(nm: string, fr: i32): boolean {
-  let binds = 0
-  let i = 0
-  while i < P.nodes.length {
-    const n = P.nodes[i]
-    if n is LetDecl {
-      if n.letName == nm {
-        if cwSameFrame(cwFrameOfDecl(i), fr) { binds = binds + 1 }
-      }
-    }
-    if n is Param {
-      if n.parName == nm {
-        if cwSameFrame(cwFrameOfDecl(i), fr) { binds = binds + 1 }
-      }
-    }
-    if n is BinExpr {
-      if n.binOp == "=" {
-        if covarRootName(n.binLeft) == nm {
-          if cwSameFrame(covarRootFrame(n.binLeft), fr) { return false }
+// `w.f = b` / `xs[i] = b` / `m[k] = b` at `i`: the same escape by assignment rather than by a
+// literal, so the value inside is reached by the same `<owner>.<f>` / `<owner>[i]` handle.
+function cwEscapeByStore(
+  i: i32,
+  set: string[],
+  setFr: i32[],
+  owners: string[],
+  ownerFrs: i32[],
+  flds: string[],
+) {
+  const n = P.nodes[i]
+  if n is BinExpr {
+    if n.binOp == "=" {
+      const sn = covarRootName(n.binRight)
+      if sn != "" {
+        if cwHas(set, setFr, sn, covarRootFrame(n.binRight)) {
+          const dst = cwPeel(n.binLeft)
+          const onm = cwEscapeOwner(dst)
+          if onm != "" {
+            owners.push(onm)
+            ownerFrs.push(cwEscapeFrame(dst))
+            flds.push(cwEscapeFld(dst, false))
+          }
         }
       }
     }
-    i = i + 1
   }
-  binds == 1
+  0
+}
+
+// `xs.push(b)` at `i`: an element store whose destination has no place expression of its own.
+// The carrying test comes first: `cwEscapeOwner` walks the arena, and every `.push` in the
+// program would otherwise pay for it (D1090).
+function cwEscapeByPush(
+  i: i32,
+  set: string[],
+  setFr: i32[],
+  owners: string[],
+  ownerFrs: i32[],
+  flds: string[],
+) {
+  const n = P.nodes[i]
+  if n is Call {
+    let carriesArg = false
+    let a = 0
+    while a < n.callArgs.length {
+      const pn = covarRootName(n.callArgs[a])
+      if pn != "" {
+        if cwHas(set, setFr, pn, covarRootFrame(n.callArgs[a])) {
+          carriesArg = true
+        }
+      }
+      a = a + 1
+    }
+    if carriesArg {
+      const cf = cwPeel(n.callFn)
+      if cwPushIntoNamed(cf) {
+        owners.push(cwEscapeOwner(cf))
+        ownerFrs.push(cwEscapeFrame(cf))
+        flds.push(CW_ELEM_FLD)
+      }
+    }
+  }
+  0
+}
+
+// How usable is `nm` in frame `fr` as a container identity? 0 = not bound exactly once here,
+// or re-pointed by `bx = other`. 1 = a single binding. 2 = that, and every use of it projects
+// — a member read or an index — so the handles on what it holds are exactly the ones
+// `cwIsEscapedHandle` names. Per frame, not program-wide (D1610, D1628).
+function cwBoundOnceSealed(nm: string, fr: i32): i32 {
+  cwIxBuild()
+  let binds = 0
+  let uses = 0
+  let proj = 0
+  // Each projection has one object and each identifier one parent, so counting the two sides
+  // is the same answer as marking them, and it fits the one chain walk.
+  let r = cwIxChain(nm)
+  while r >= 0 {
+    if cwSameFrame(cwIxFr[r], fr) {
+      if cwIxKind[r] == CW_OCC_ASG { return 0 }
+      if cwIxKind[r] == CW_OCC_BIND { binds = binds + 1 }
+      if cwIxKind[r] == CW_OCC_USE {
+        uses = uses + 1
+        if cwIxIsObj[cwIxNode[r]] == 1 { proj = proj + 1 }
+      }
+    }
+    r = cwIxNext[r]
+  }
+  if binds != 1 { return 0 }
+  if uses == proj { return 2 }
+  1
+}
+
+// The head of `nm`'s occurrence chain, or -1 when the index holds none. Never mints an id:
+// a name the arena does not carry has no row to find.
+function cwIxChain(nm: string): i32 {
+  const sid = sidLookup(nm)
+  if sid < 0 || sid >= cwIxHead.length { return -1 }
+  cwIxHead[sid]
+}
+
+// Is `nm` bound exactly once in frame `fr`, and never assigned there? The guard that makes a
+// binding name usable as a container identity.
+function cwBoundOnce(nm: string, fr: i32): boolean {
+  cwBoundOnceSealed(nm, fr) >= 1
 }
 
 // Is `ix` a read of an escaped field (`<owner>.<f>` for a recorded pair)? Such a read is a
@@ -14629,6 +14910,19 @@ function cwIsEscapedHandle(
       flds,
     )
   }
+  // `nn[i]` against an array-literal escape. The index is not read: one recorded element
+  // makes every element of that container a handle, which over-approximates in the safe
+  // direction — a write found here is a write.
+  if n is Index {
+    return cwEscapedPairHas(
+      covarRootName(n.idxArr),
+      covarRootFrame(n.idxArr),
+      CW_ELEM_FLD,
+      owners,
+      ownerFrs,
+      flds,
+    )
+  }
   false
 }
 
@@ -14653,10 +14947,68 @@ function cwEscapedPairHas(
   false
 }
 
-// The alias closure: grows `set` until no new name joins, over three edges that carry a
-// list value from one name to another without putting it inside anything (a passthrough
-// binding, an assignment to a plain identifier, a call argument reaching a declared
-// function's parameter). Returns 0 when the closure completed, 2 when it hit a form it does not model.
+// The statement a function body's implicit return is: the last statement of its block, or
+// -1. The parser leaves a tail expression a bare statement, so the two return forms are this
+// one and an explicit `RetStmt`.
+function cwFnTailStmt(fnIx: i32): i32 {
+  if fnIx < 0 || fnIx >= P.nodes.length { return -1 }
+  const f = P.nodes[fnIx]
+  if f is FuncDecl {
+    if f.fnBody < 0 || f.fnBody >= P.nodes.length { return -1 }
+    const b = P.nodes[f.fnBody]
+    if b is Block {
+      if b.blkStmts.length == 0 { return -1 }
+      return b.blkStmts[b.blkStmts.length - 1]
+    }
+  }
+  -1
+}
+
+// The `FuncDecl` indices whose return hands a member of `set` back to the caller — the
+// frames whose call result the closure must root at. Reads the index's return sites, so it
+// costs the program's returns rather than its nodes, once per closure round (D1090).
+function cwRetFrames(set: string[], setFr: i32[], frames: i32[]) {
+  cwIxBuild()
+  let i = 0
+  while i < cwIxRetOwner.length {
+    const ret = cwIxRetExpr[i]
+    const owner = cwIxRetOwner[i]
+    const rn = covarRootName(ret)
+    if rn != "" {
+      if cwHas(set, setFr, rn, covarRootFrame(ret)) {
+        if !cwIntHas(frames, owner) { frames.push(owner) }
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// Does `ix` call a declared function that returns a member of the set? The call result is a
+// handle with no name of its own, so the destination it is delivered to joins the set.
+function cwCallResultCarries(ix: i32, frames: i32[]): boolean {
+  if frames.length == 0 { return false }
+  const p = cwPeel(ix)
+  if p < 0 || p >= P.nodes.length { return false }
+  const n = P.nodes[p]
+  if n is Call {
+    const cn = covarRootName(n.callFn)
+    if cn == "" { return false }
+    const fx = cwParamFrame(cn)
+    if fx < 0 { return false }
+    let i = 0
+    while i < frames.length {
+      if frames[i] == fx { return true }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// The alias closure: grows `set` until no new name joins, over four edges that carry a list
+// value on — a passthrough binding, an assignment to a plain identifier, a call argument
+// reaching a declared parameter, and a call result out of a function returning a member.
+// Returns 0 when the closure completed, 2 when it hit a form it does not model.
 function cwGrow(set: string[], setFr: i32[]): i32 {
   let changed = true
   let rounds = 0
@@ -14667,6 +15019,8 @@ function cwGrow(set: string[], setFr: i32[]): i32 {
     const fownerFrs: i32[] = []
     const flds: string[] = []
     cwEscapedFields(set, setFr, fowners, fownerFrs, flds)
+    const retFrames: i32[] = []
+    cwRetFrames(set, setFr, retFrames)
     // The set grows by at least one name per round or the loop ends, so the bound is the
     // number of names in the program — cheaper than proving it, and turns any surprise into
     // a decline rather than a hang.
@@ -14686,6 +15040,7 @@ function cwGrow(set: string[], setFr: i32[]): i32 {
           if cwIsEscapedHandle(n.letInit, fowners, fownerFrs, flds) {
             carries = true
           }
+          if cwCallResultCarries(n.letInit, retFrames) { carries = true }
           if carries {
             if cwAdd(set, setFr, n.letName, cwFrameOfDecl(i)) { changed = true }
           }
@@ -14703,13 +15058,18 @@ function cwGrow(set: string[], setFr: i32[]): i32 {
           if cwIsEscapedHandle(n.binRight, fowners, fownerFrs, flds) {
             carries = true
           }
+          if cwCallResultCarries(n.binRight, retFrames) { carries = true }
           if carries {
             const ln = covarRootName(n.binLeft)
-            // `m[k] = b` / `o.f = b` — the value goes inside something, and a later read
-            // out of that container is a handle this analysis cannot name.
-            if ln == "" { return 2 }
-            if cwAdd(set, setFr, ln, covarRootFrame(n.binLeft)) {
-              changed = true
+            if ln == "" {
+              // `m[k] = b` / `o.f = b` — the value goes inside something. Modelled where the
+              // container roots at a once-bound name, which `cwEscapedFields` has just filed
+              // and every read back out matches as a handle; otherwise it cannot be named.
+              if cwEscapeOwner(cwPeel(n.binLeft)) == "" { return 2 }
+            } else {
+              if cwAdd(set, setFr, ln, covarRootFrame(n.binLeft)) {
+                changed = true
+              }
             }
           }
         }
@@ -14732,28 +15092,32 @@ function cwGrow(set: string[], setFr: i32[]): i32 {
         if anyMember {
           if cwCallNamed(n.callArgNames) { return 2 }
           const cn = covarRootName(n.callFn)
-          // A method or a lambda-valued callee (`xs.push(b)`, `fp(b)`): the body that
-          // receives the value is not a declared parameter list this can read.
-          if cn == "" { return 2 }
-          const cfr = cwParamFrame(cn)
-          let k2 = 0
-          while k2 < n.callArgs.length {
-            const a2 = covarRootName(n.callArgs[k2])
-            let carries2 = false
-            if a2 != "" {
-              if cwHas(set, setFr, a2, covarRootFrame(n.callArgs[k2])) {
+          if cn == "" {
+            // `xs.push(b)` into a once-bound named receiver is a container store like
+            // `xs[i] = b`, filed above. Any other unnamed callee — another method, a
+            // lambda-valued `fp(b)` — has a body that is not a parameter list this can read.
+            if !cwPushIntoNamed(n.callFn) { return 2 }
+          } else {
+            const cfr = cwParamFrame(cn)
+            let k2 = 0
+            while k2 < n.callArgs.length {
+              const a2 = covarRootName(n.callArgs[k2])
+              let carries2 = false
+              if a2 != "" {
+                if cwHas(set, setFr, a2, covarRootFrame(n.callArgs[k2])) {
+                  carries2 = true
+                }
+              }
+              if cwIsEscapedHandle(n.callArgs[k2], fowners, fownerFrs, flds) {
                 carries2 = true
               }
+              if carries2 {
+                const pn = cwParamName(cn, k2)
+                if pn == "" { return 2 }
+                if cwAdd(set, setFr, pn, cfr) { changed = true }
+              }
+              k2 = k2 + 1
             }
-            if cwIsEscapedHandle(n.callArgs[k2], fowners, fownerFrs, flds) {
-              carries2 = true
-            }
-            if carries2 {
-              const pn = cwParamName(cn, k2)
-              if pn == "" { return 2 }
-              if cwAdd(set, setFr, pn, cfr) { changed = true }
-            }
-            k2 = k2 + 1
           }
         }
       }
@@ -14774,10 +15138,169 @@ function cwMark(idents: i32[], flags: i32[], ix: i32) {
   0
 }
 
+// Is (`nm`, `fr`) usable as a container identity — bound once, never re-pointed, and read
+// only by projecting out of it? `cwEscapedFields` files an escaped value under the
+// container's own name, so one reachable under a second name hands out handles the write
+// scan cannot see, and the delivery into it is not claimed. D1628.
+function cwContainerSealed(nm: string, fr: i32): boolean {
+  cwBoundOnceSealed(nm, fr) == 2
+}
+
+// Is (`v`, `list`) present? The membership test for the small `i32` lists this pass carries.
+function cwIntHas(list: i32[], v: i32): boolean {
+  let i = 0
+  while i < list.length {
+    if list[i] == v { return true }
+    i = i + 1
+  }
+  false
+}
+
+// Claim what an object or array literal delivers into the container binding `letIx` —
+// `{ xs: b }` and `[b]`, the two shapes `cwEscapedFields` records. Granted only into a
+// sealed container, and only when a member is actually in there, which keeps the O(arena)
+// seal test off every other binding in the program.
+function cwClaimContainer(
+  idents: i32[],
+  flags: i32[],
+  letIx: i32,
+  nm: string,
+  initIx: i32,
+  set: string[],
+  setFr: i32[],
+) {
+  const lit = cwPeel(initIx)
+  cwClaimObjFields(idents, flags, letIx, nm, lit, set, setFr)
+  cwClaimArrElems(idents, flags, letIx, nm, lit, set, setFr)
+  0
+}
+
+// The object-literal half: `{ xs: b }`.
+function cwClaimObjFields(
+  idents: i32[],
+  flags: i32[],
+  letIx: i32,
+  nm: string,
+  lit: i32,
+  set: string[],
+  setFr: i32[],
+) {
+  const o = P.nodes[lit]
+  if o is ObjLit {
+    let carries = false
+    let k = 0
+    while k < o.objFields.length {
+      const fn = P.nodes[o.objFields[k]]
+      if fn is FieldInit {
+        const rn = covarRootName(fn.fiValue)
+        if rn != "" {
+          if cwHas(set, setFr, rn, covarRootFrame(fn.fiValue)) {
+            carries = true
+          }
+        }
+      }
+      k = k + 1
+    }
+    if carries {
+      if cwContainerSealed(nm, cwFrameOfDecl(letIx)) {
+        k = 0
+        while k < o.objFields.length {
+          const fn = P.nodes[o.objFields[k]]
+          if fn is FieldInit { cwMark(idents, flags, fn.fiValue) }
+          k = k + 1
+        }
+      }
+    }
+  }
+  0
+}
+
+// The array-literal half: `[b]`.
+function cwClaimArrElems(
+  idents: i32[],
+  flags: i32[],
+  letIx: i32,
+  nm: string,
+  lit: i32,
+  set: string[],
+  setFr: i32[],
+) {
+  const arr = P.nodes[lit]
+  if arr is ArrayLit {
+    let carries = false
+    let e = 0
+    while e < arr.arrElems.length {
+      const en = covarRootName(arr.arrElems[e])
+      if en != "" {
+        if cwHas(set, setFr, en, covarRootFrame(arr.arrElems[e])) {
+          carries = true
+        }
+      }
+      e = e + 1
+    }
+    if carries {
+      if cwContainerSealed(nm, cwFrameOfDecl(letIx)) {
+        e = 0
+        while e < arr.arrElems.length {
+          cwMark(idents, flags, arr.arrElems[e])
+          e = e + 1
+        }
+      }
+    }
+  }
+  0
+}
+
+// Is the store destination `dst` a container the delivery into it may be claimed through?
+// The identity guard (`cwEscapeOwner`) plus the seal: `cwEscapedFields` files the handle
+// under the container's own name, so a container reachable under a second name has handles
+// the write scan would miss.
+function cwStoreSealed(dst: i32): boolean {
+  const onm = cwEscapeOwner(dst)
+  if onm == "" { return false }
+  cwContainerSealed(onm, cwEscapeFrame(dst))
+}
+
+// Does `ix` peel to an identifier this pass is accounting for? The cheap test that keeps the
+// two O(arena) seal predicates off every assignment and every method call in the program.
+function cwMarksAny(idents: i32[], ix: i32): boolean {
+  const p = cwPeel(ix)
+  let i = 0
+  while i < idents.length {
+    if idents[i] == p { return true }
+    i = i + 1
+  }
+  false
+}
+
+// Does every call of `fnIx` deliver its result to a name `cwGrow`'s call-result edge added?
+// A call whose result goes into an argument, a receiver or a container hands the value to a
+// handle no name reaches, so the return position stays unclaimed. Anonymous, and a name
+// another declaration answers for, are out: the closure resolves a callee by name.
+function cwReturnConsumed(fnIx: i32): boolean {
+  if fnIx < 0 || fnIx >= P.nodes.length { return false }
+  const f = P.nodes[fnIx]
+  if f is FuncDecl {
+    const nm = f.fnName
+    if nm == "" { return false }
+    if cwParamFrame(nm) != fnIx { return false }
+    cwIxBuild()
+    let r = cwIxChain(nm)
+    while r >= 0 {
+      if cwIxKind[r] == CW_OCC_CALL {
+        if cwIxHeld[cwIxNode[r]] == 0 { return false }
+      }
+      r = cwIxNext[r]
+    }
+    return true
+  }
+  false
+}
+
 // The accounting pass, a whitelist rather than a list of escapes — the only sound shape of
-// this test, since a form nobody thought of is silently treated as safe under the other
-// shape. Every occurrence of a member name must be a binding initializer, either side of an
-// assignment, a call argument, a member-access object, or an index array; anything else is left unclaimed, the `2` answer.
+// this test, since a form nobody thought of reads as safe under the other one. The single
+// home of "is this delivery claimed", for every delivery: a second predicate answering the
+// same question is what would let them disagree. Unclaimed is the `2` answer. D852, D1628.
 function cwClaimed(set: string[], setFr: i32[]): boolean {
   const idents: i32[] = []
   const flags: i32[] = []
@@ -14792,23 +15315,74 @@ function cwClaimed(set: string[], setFr: i32[]): boolean {
     }
     i = i + 1
   }
+  // The frames whose return the closure rooted a call result at AND every call of which
+  // delivers into such a destination: those returns are the fourth claimed delivery.
+  const retFrames: i32[] = []
+  cwRetFrames(set, setFr, retFrames)
+  const retOk: i32[] = []
+  let rf = 0
+  while rf < retFrames.length {
+    if cwReturnConsumed(retFrames[rf]) { retOk.push(retFrames[rf]) }
+    rf = rf + 1
+  }
   i = 0
   while i < P.nodes.length {
     const n = P.nodes[i]
+    if n is FuncDecl {
+      if cwIntHas(retOk, i) {
+        const tail = cwFnTailStmt(i)
+        if tail >= 0 { cwMark(idents, flags, tail) }
+      }
+    }
+    if n is RetStmt {
+      if n.retArg >= 0 {
+        if cwIntHas(retOk, cwFrameOfDecl(i)) { cwMark(idents, flags, n.retArg) }
+      }
+    }
     if n is LetDecl {
-      if n.letInit >= 0 { cwMark(idents, flags, n.letInit) }
+      if n.letInit >= 0 {
+        cwMark(idents, flags, n.letInit)
+        cwClaimContainer(idents, flags, i, n.letName, n.letInit, set, setFr)
+      }
     }
     if n is BinExpr {
       if n.binOp == "=" {
+        cwMark(idents, flags, n.binLeft)
+        if covarRootName(n.binLeft) != "" {
+          cwMark(idents, flags, n.binRight)
+        } else if cwMarksAny(idents, n.binRight) {
+          // a store INTO a container: claimed only where the container is sealed
+          if cwStoreSealed(cwPeel(n.binLeft)) {
+            cwMark(idents, flags, n.binRight)
+          }
+        }
+      }
+      // A comparison reads its operands and yields a boolean, so no handle leaves it —
+      // `m[k] != null` before the narrowed read is the shape that needs saying so.
+      if n.binOp == "==" || n.binOp == "!=" {
         cwMark(idents, flags, n.binLeft)
         cwMark(idents, flags, n.binRight)
       }
     }
     if n is Call {
-      let k = 0
-      while k < n.callArgs.length {
-        cwMark(idents, flags, n.callArgs[k])
-        k = k + 1
+      let sealed = true
+      if covarRootName(n.callFn) == "" {
+        let k0 = 0
+        let anyArg = false
+        while k0 < n.callArgs.length {
+          if cwMarksAny(idents, n.callArgs[k0]) { anyArg = true }
+          k0 = k0 + 1
+        }
+        // A method call delivers into its RECEIVER, not into a parameter list: `xs.push(b)`
+        // is a container store and is claimed on the container's terms.
+        if anyArg { sealed = cwStoreSealed(cwPeel(n.callFn)) }
+      }
+      if sealed {
+        let k = 0
+        while k < n.callArgs.length {
+          cwMark(idents, flags, n.callArgs[k])
+          k = k + 1
+        }
       }
     }
     if n is Member { cwMark(idents, flags, n.memObj) }
