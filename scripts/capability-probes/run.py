@@ -10,7 +10,7 @@ a `SILENT` cell is a clause-1 one, check-clean invalid wasm, and worse. README.m
 `matches`, `classify` and `grade` are the shared grading vocabulary; `matrix.py` imports
 them so a generated position cell and a hand-written probe are read on the same scale.
 """
-import argparse, os, re, subprocess, sys
+import argparse, json, os, re, subprocess, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
@@ -93,39 +93,133 @@ def classify(chk_rc, err):
     return where, detail
 
 
-def grade(path, compiler, want, vl=VL, env=None, timeout=120):
-    """Grade one program: (verdict, detail, stdout).
+def grade_full(path, compiler, want, vl=VL, env=None, timeout=120):
+    """Grade one program: (verdict, detail, stdout, the WHOLE refusal text).
 
     ONE `vl` invocation per healthy cell — `run` first, and `check` only when the run
     failed, since the rc is all a passing cell needs and only a failing one has a channel
     to name. Verdicts: RUNS · WRONG · check refuses · emit refuses · SILENT (check rc 0) ·
     COMPILER TRAP (check rc 0) · TIMEOUT. `env` defaults to this checkout's `std:`.
+
+    The fourth value is what `detail` is a 70-character slice of. `live-sites.json` asks
+    whether a refusal contains a given LITERAL, and a literal that is interpolated late in
+    its message (`… bound by a parameter — a layout constant is per-instance`) falls outside
+    that slice — so the question has to be asked of the whole text.
     """
     env = env or ENV
     try:
         run = subprocess.run([vl, "run", path, "--compiler", compiler],
                              capture_output=True, text=True, timeout=timeout, env=env)
     except subprocess.TimeoutExpired:
-        return "TIMEOUT", "no answer in %ss" % timeout, ""
+        return "TIMEOUT", "no answer in %ss" % timeout, "", ""
     out = run.stdout.strip()
     if run.returncode == 0:
         if want is None or matches(want, out):
-            return "RUNS", "", out
-        return "WRONG", out, out
+            return "RUNS", "", out, ""
+        return "WRONG", out, out, ""
     try:
         chk = subprocess.run([vl, "check", path, "--compiler", compiler],
                              capture_output=True, text=True, timeout=timeout, env=env)
     except subprocess.TimeoutExpired:
-        return "TIMEOUT", "check gave no answer in %ss" % timeout, out
+        return "TIMEOUT", "check gave no answer in %ss" % timeout, out, ""
     err = chk.stdout + chk.stderr + run.stdout + run.stderr
     where, detail = classify(chk.returncode, err)
-    return where, detail, out
+    return where, detail, out, err
+
+
+def grade(path, compiler, want, vl=VL, env=None, timeout=120):
+    """`grade_full` without the refusal text — the shape `matrix.py` and the runner use."""
+    verdict, detail, out, _err = grade_full(path, compiler, want, vl, env, timeout)
+    return verdict, detail, out
+
+
+LIVE_SITES = os.path.join(HERE, "live-sites.json")
+
+
+def load_live_sites(path=LIVE_SITES):
+    """The committed list of refusal literals a WITNESS has shown a check-clean program reaches.
+
+    `goal-scoreboard.py`'s other count reads the compiler's WORDING, and a refusal is not
+    obliged to admit it is a capability gap — `emitProgram: fromCodePoints argument must be a
+    named i32[] binding` fired on a `vl check`-clean program for months and matched no phrase.
+    So the wording count is a lower bound and this list is the population it cannot see. An
+    entry earns its place by naming a probe in this directory that reaches its literal; the
+    day that probe runs, the entry comes off.
+    """
+    with open(path, encoding="utf-8") as fh:
+        return json.load(fh)["sites"]
+
+
+def compiler_source(root):
+    """`compiler/*.vl` as one text, so a listed literal that has LEFT the tree is caught
+    rather than counted forever.
+
+    Searched for the QUOTED spelling rather than paired into literals: pairing quotes across
+    a whole file is thrown off by a single `"` inside a comment, and it silently lost
+    `emitProgram: function-value call arity has no interned signature` — a literal that is
+    plainly there.
+    """
+    src = os.path.join(root, "compiler")
+    return "\n".join(open(os.path.join(src, fn), encoding="utf-8").read()
+                     for fn in sorted(os.listdir(src)) if fn.endswith(".vl"))
+
+
+def check_live_sites(compiler, path=LIVE_SITES, root=ROOT):
+    """Grade every listed site's witness. Returns (rows, rc).
+
+    Four ways a row is wrong, and each names its own fix:
+      FELL   the probe RUNS — the gap closed, so delete the entry in the closing PR.
+      DRIFT  the probe still refuses, with a DIFFERENT message — the witness stopped
+             reaching the site it was written for, so it no longer evidences this literal.
+      GONE   the literal is no longer in `compiler/*.vl` — the site was deleted or reworded.
+      NOPROBE the named probe file does not exist, so the entry rests on nothing.
+    """
+    sites = load_live_sites(path)
+    src = compiler_source(root)
+    rows, bad = [], 0
+    for s in sites:
+        lit, probe = s["literal"], s["probe"]
+        p = os.path.join(HERE, probe)
+        if not os.path.exists(p):
+            rows.append(("NOPROBE", lit, probe, "no such file in scripts/capability-probes/"))
+            bad += 1
+            continue
+        if '"' + lit not in src:
+            rows.append(("GONE", lit, probe, "literal is no longer in compiler/*.vl"))
+            bad += 1
+            continue
+        verdict, detail, _out, err = grade_full(p, compiler, expected(p))
+        if verdict == "RUNS":
+            rows.append(("FELL", lit, probe, "the witness RUNS — delete this entry"))
+            bad += 1
+        elif lit not in err:
+            rows.append(("DRIFT", lit, probe, f"{verdict}: {detail}"))
+            bad += 1
+        else:
+            rows.append(("LIVE", lit, probe, verdict))
+    return rows, (1 if bad else 0)
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--compiler", default=SEED)
+    ap.add_argument("--live-sites", action="store_true",
+                    help="grade only the committed witness-backed refusal-site list")
     a = ap.parse_args()
+
+    if a.live_sites:
+        rows, rc = check_live_sites(a.compiler)
+        for verdict, lit, probe, detail in rows:
+            print(f"  {verdict:<7} {lit[:64]:<66} {probe}")
+            if verdict != "LIVE":
+                print(f"          {detail}")
+        live = len([r for r in rows if r[0] == "LIVE"])
+        print(f"\n{live} of {len(rows)} listed refusal sites still refuse a check-clean program")
+        if rc:
+            print("A row above is not what the list claims. The list is a RATCHET: a witness")
+            print("that starts running comes OFF it in the PR that closed the gap, and a row")
+            print("may only be ADDED with a probe that reaches its literal.")
+        return rc
 
     probes = sorted(f for f in os.listdir(HERE) if f.endswith(".vl"))
     if not probes:

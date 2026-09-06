@@ -27,7 +27,9 @@ import argparse, collections, json, os, re, subprocess, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "silent-sweep", "distilled"))
+sys.path.insert(0, os.path.join(HERE, "capability-probes"))
 from cellmap import load_cells  # noqa: E402
+from run import load_live_sites, LIVE_SITES  # noqa: E402
 
 DEFAULT_BASELINE = os.path.join(HERE, "silent-sweep", "distilled", "baseline.jsonl")
 
@@ -216,9 +218,17 @@ def main():
     corpus_text = " \n".join(v.get("msg", "") for v in cells.values())
     sites = capability_literals(root, corpus_text)
     blind = [r for r in sites if not r[2]]
-    print(f"  capability message literals in compiler/*.vl{len(sites):5d}")
-    print(f"    of those, reached by NO corpus cell       {len(blind):5d}  "
+    live = load_live_sites()
+    worded = {t for _loc, t, _hit in sites}
+    extra = [s for s in live if s["literal"] not in worded]
+    print(f"  {'capability refusal sites, by WORDING':<42}{len(sites):5d}  "
+          f"<- a LOWER BOUND, not the population")
+    print(f"    {'of those, reached by NO corpus cell':<40}{len(blind):5d}  "
           f"<- invisible to the scoreboard above")
+    print(f"  {'capability refusal sites, by WITNESS':<42}{len(live):5d}  "
+          f"<- live-sites.json, one probe each")
+    print(f"    {'of those the wording count cannot see':<40}{len(extra):5d}  "
+          f"<- clause-2 violations no phrase list finds")
     print()
     if blind:
         print("The corpus is generated over fixed axes, so it can only score a gap it has a")
@@ -227,11 +237,22 @@ def main():
         print("`python3 scripts/capability-probes/run.py` to grade the ones covered so far.")
         print()
     if a.sites:
+        print("  BY WORDING — every literal in compiler/*.vl whose SENTENCE concedes the")
+        print("  refused program was type-valid. A refusal is not obliged to concede, so this")
+        print("  is a floor: 517 of the compiler's 533 emit-side refusal sites say nothing")
+        print("  about legality and none of them can appear here.")
         for loc, text, hit in sites:
             print(f"  {'HIT ' if hit else 'ZERO'}  compiler/{loc:<22} {text[:60]!r}")
         print()
         print("  (a gap moved into typecheck.vl stops looking like a gap — the program")
         print("   compiles no better than before, so these count the same as emit-side ones)")
+        print()
+        print("  BY WITNESS — a refusal literal some check-clean program provably reaches.")
+        print("  `python3 scripts/capability-probes/run.py --live-sites` re-grades every row;")
+        print("  a witness that starts running comes OFF the list in the PR that closed it.")
+        for s in live:
+            seen = "WORDED" if s["literal"] in worded else "UNSEEN"
+            print(f"  {seen}  {s['literal'][:58]!r:<62} {s['probe']}")
         print()
 
     if a.json:
@@ -242,6 +263,8 @@ def main():
                        "clause2_conceded": len(conceded),
                        "capability_literals": len(sites),
                        "capability_literals_uncovered": len(blind),
+                       "capability_sites_witnessed": len(live),
+                       "capability_sites_witnessed_unworded": len(extra),
                        "by_class": dict(by)}, fh, indent=2, sort_keys=True)
         print(f"wrote {a.json}")
 
