@@ -16991,21 +16991,71 @@ function nulRefListFieldCodeOfTy(ty: i32): i32 {
     if tyIsLitUnionArray(inner) { return -1 }
     const it = T.tys[inner]
     if it is TyArray {
-      const e = it.aElem
-      if e < 0 { return -1 }
-      const et = T.tys[e]
-      if et is TyObj { return 28 }
-      if et is TyUnion { return 28 }
-      if et is TyFunc { return 28 }
-      if et is TyArray { return 28 }
-      if et is TyMap { return 28 }
-      // Every other `Ty` is deliberately not code 28: that backing is owed only by an
-      // element that is itself a reference. `TyPrim`, `TyLit`, `TyVar`, `TyErr`, and a
-      // nested `TyNullable` element carry no ref backing, so they fall to -1, which every
-      // caller reads as "not mine".
+      if tyElemIsRefListElem(it.aElem) { return 28 }
     }
   }
   -1
+}
+
+// Whether arena element `e` is one a ref list stores BY REFERENCE — a struct, a union, a
+// closure, a nested list or a map. The one home for that set, so a ref-list field code (5)
+// and its `| null` niche (28) cannot admit different elements (D1691).
+function tyElemIsRefListElem(e: i32): boolean {
+  if e < 0 { return false }
+  // A LITERAL union element is the i32 ATOM backing, never a ref — the same subtraction
+  // `fieldCodeOfTy` makes before its array arm. Without it a `(K | null)[] | null` field took
+  // the ref wrapper and the module failed validation, check-clean (D1691).
+  if tyIsLitUnion(e) { return false }
+  if tyIsLitUnionAlias(e) { return false }
+  const et = T.tys[e]
+  // Exhaustive over `Ty` and deliberately `_`-less, like the two ladders that ask it: a
+  // twelfth arena variant breaks the self-compile here rather than silently not being a ref.
+  match et {
+    TyObj => {
+      return true
+    }
+    TyUnion => {
+      return true
+    }
+    TyFunc => {
+      return true
+    }
+    TyArray => {
+      return true
+    }
+    TyMap => {
+      return true
+    }
+    TyNullable => {
+      // The nullable-ELEMENT family, which `tyElemIsNulRefListElem` claims instead.
+    }
+    TyPrim => {
+      // A scalar element has its own backing wrapper, one per width.
+    }
+    TyLit => {
+      // A bare literal element is the atom list, subtracted above with its alias.
+    }
+    TyVar => {
+      // An unsubstituted type parameter has no element rep until the monomorphizer pins it.
+    }
+    TyNeg => {
+      // A negation is a checker-only refinement, never an element rep.
+    }
+    TyErr => {
+      // The error hole — nothing to code.
+    }
+  }
+  false
+}
+
+// The nullable-ELEMENT twin: `(A | null)[]` stores the same wrapper as `A[]`, so its niche
+// codes 28 too. Kept apart from the set above because a `(K | null)[]` literal-union element
+// is the i32 ATOM backing instead, and only the inner kind tells the two apart.
+function tyElemIsNulRefListElem(e: i32): boolean {
+  if e < 0 { return false }
+  const et = T.tys[e]
+  if et is TyNullable { return tyElemIsRefListElem(et.nInner) }
+  false
 }
 
 // The struct-table row a field annotation's base type occupies — canon-routed, `| null`
@@ -18735,6 +18785,12 @@ function anonNulFieldCodeOfTy(ty: i32): i32 {
 // nullable ref list, code 28. An unrecognised element answers -1 rather than guessing.
 function anonNulListFieldCodeOfElem(elem: i32): i32 {
   if elem < 0 { return -1 }
+  // The ref-element set at its one home, so this niche cannot admit fewer elements than the
+  // plain code-5 field whose wrapper it shares. The render that would have answered for a
+  // nested list, a map or a nullable ref is unreachable here: `anonTySpellable` declines a
+  // `TyNullable`, so this ladder's decline is terminal and had to be complete (D1691).
+  if tyElemIsRefListElem(elem) { return 28 }
+  if tyElemIsNulRefListElem(elem) { return 28 }
   const et = T.tys[elem]
   // Exhaustive over `Ty` and `_`-less, for the reason its caller is.
   match et {
@@ -18775,23 +18831,24 @@ function anonNulListFieldCodeOfElem(elem: i32): i32 {
       }
     }
     TyObj => {
-      return 28
+      // The five ref kinds and the nullable-ref element are claimed by the two rungs above,
+      // which are the code-5 ladder's own set; these arms are unreachable and say so.
     }
     TyUnion => {
-      return 28
+      // Claimed above.
     }
     TyFunc => {
-      return 28
+      // Claimed above.
     }
     TyArray => {
-      // A nested list and a map element are ref lists too, but no cell has graded their
-      // nullable field rep yet, so they refuse loudly rather than take code 28 on trust.
+      // Claimed above.
     }
     TyMap => {
-      // The other half of that pair, refused for the same reason.
+      // Claimed above.
     }
     TyNullable => {
-      // A nullable ELEMENT list has its own family, and folds onto a different code.
+      // A nullable REF element is claimed above; what reaches here is a nullable SCALAR or
+      // literal element, whose list has its own i32-backed wrapper and its own code.
     }
     TyLit => {
       // A literal element is a litunion list, claimed by the alias test in the caller.
