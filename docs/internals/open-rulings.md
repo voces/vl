@@ -468,6 +468,99 @@ Explicitly left open by the owner pass and unimplemented. docs/error-handling-de
 
 ---
 
+## D. Pending owner rulings raised 2026-09-05/06 (vl-c3) — each has a witness row and a recommendation
+
+Every item here is a question an agent measured up to and then stopped at, because the answer
+changes which program is legal rather than how a legal one compiles. None blocks a merge. The
+recommendation is the coordinator's; the witness is the row's own `Repro:`, re-run by the
+`filed witnesses` gate, so a ruling can be graded the day it lands.
+
+### backtick-strings-second-form — do backticks earn their place beside `"…"`?
+
+**Measured 2026-09-05:** interpolation (`\{x}`) works in ordinary `"…"` strings; the ONLY
+thing a backtick literal adds is a literal newline inside the string. There is no raw-string
+semantics difference and no escape difference. The owner's stated preference: one variant.
+**Options.** (a) Fold: allow a newline inside `"…"` and retire backticks (one lexical form;
+a multi-line `"…"` reads oddly beside every other language, and the formatter must then
+preserve interior newlines it currently never sees). (b) Keep backticks as the *multiline-only*
+form and say so in the docs (two forms, one reason). (c) Retire backticks with no replacement
+(multi-line text is built with `+ "\n" +` or `std:fmt`).
+**Recommendation: (b)**, documented as "backticks exist for one reason: a newline in the
+literal". (a) costs the formatter a new invariant for a form almost nobody writes; (c) makes
+the one honest use case worse. Grading: `tests/cases/strings/*` and `vl fmt --check` over the
+tree, both of which exercise every current backtick.
+
+### D1680 / D1665 — is a nullable MAP a type the design admits everywhere?
+
+A nullable map already RUNS as a local (`const m: {[string]: i32} | null`) and as an
+ANNOTATED struct field (D1665's control); it refuses under a standalone `?.` (D1680) and in an
+INFERRED field (D1665). If the answer is "yes, everywhere", both are capability rows and need
+no ruling — D1665 is on a fix lane now. **Recommendation: yes** — the alternative (a map is
+never nullable; use an empty map) is a rule the checker does not state and two running
+spellings already contradict.
+
+### D1712 — is `A | i32` the same type as `i32 | A`?
+
+The `??` join keys its registry row on the OPERAND's member order, so the same union declared
+the other way round is a different key and check-clean invalid wasm. The standing ABI note
+(`vl-union-member-set-abi`) says a member set is never deduped and never reordered because box
+TAGS are positional — a statement about the ABI, not about type identity. Two readings:
+(a) identity is by SET, the registry keys a canonical member order (declaration order of the
+first declaration, or a total order over canon spellings) and tags are positional in THAT
+order; (b) identity is by SEQUENCE, `A | i32` and `i32 | A` are distinct types and assigning
+one to the other is a type error the checker owes today (it currently accepts it).
+**Recommendation: (a)**, because the checker already treats them as assignable and every user
+expects it; the cost is one canonicalisation at registration and a rule that a box tag is the
+member's index in the CANONICAL sequence. D1737/D1738/D1733's closes (#2754, #2760) were built
+so they invent no order and are neutral to this ruling.
+
+### D1730 — may a `const` NAME key a narrowed place?
+
+`if xs[i] is A { print(xs[i].r) }` with `const i = 0` accepts the `is` test and refuses the
+read it narrowed, telling the author to do the thing they did (the MESSAGE is wrong either way
+and is not part of the ruling). For: a `const` binding of an integer literal is as stable an
+address as the literal, and `retireNarrowForIndexCells` already retires on a write. Against:
+a name-derived key needs a definite-assignment argument the narrowing stack does not make, and
+`let i` must be excluded by a rule that does not exist. **Recommendation: yes, for `const`
+bindings only** (a `let` index keeps the refusal, with a message that says why).
+
+### D1736 — does an `is T` pin survive a `while` loop's re-execution barrier?
+
+`while v != null { … }` narrows the body; `while v is A { … }` refuses. The code's stated
+reason ("only a null strip re-narrows, never an `is T` pin; the body is re-tested every
+iteration") does not separate the two: both are re-tested at the top of each iteration, and
+the write-retire machinery covers a body that assigns. **Recommendation: yes** — an `is` pin
+is a null strip's twin at the loop head, with the same retirement on a write to the receiver.
+If the answer is no, the row closes as DESIGN with a message that names the loop, not the `is`.
+
+### D1686 / D1687 — what does the design owe a covariant list the closure cannot follow?
+
+The covariant-write analysis licenses a read-only copy of a `Circle[]` delivered as `Shape[]`
+only where it can see every write; it declines a container reached through an unnamed call
+result or an intermediate (D1686), and a callee whose parameter list the program does not
+spell — a function-typed parameter, a re-pointed binding (D1687). What would close them is
+either a whole-program flow analysis this pass is not, or **a way to SAY a parameter is
+read-only in the type** (a `readonly Shape[]` parameter, or a distinct read-only list type).
+**Recommendation: file the read-only marker as a language item and leave both rows DESIGN
+until it exists**; the refusal today names a contract ("delivered to a callee whose body this
+program can point at, and to no other") and is honest.
+
+### fmt-fill-style-scalar-lists — how does `vl fmt` lay out a long scalar list?
+
+Today a list literal that does not fit on one line goes one element per line, so a 200-entry
+`u8[]` table is 200 lines. **Options.** (a) fill-style (as many elements per line as fit,
+wrapped at the column) for lists whose elements are ALL scalar literals; (b) one-per-line
+always. **Recommendation: (a)**, scalar literals only — anything with a struct, closure or
+nested list element keeps one-per-line, so the rule is decidable from the element kinds alone.
+
+### code-quality survey rows 19 and 20 — re-grade before ruling
+
+Row 19 (the seed anchors on the CWD, std on the EXE's tree) predates std shipping INSIDE the
+binary (`b6eb19b9`) and `vl --version` naming the std hash (#2655); row 20 ("VL has no default
+parameter values") is contradicted by `function ld(self: {v: i32}, k: i32 = 5)` in
+`tests/cases/objects/ufcs-shadowed-callee-no-default-fill.vl`. Both should be re-measured
+against the tree and closed or re-worded before they are put to the owner.
+
 ## Dismissed — filed as owner rulings, verified NOT open
 
 Kept so the same 22 are not re-swept. `ALREADY-RULED` = the answer exists elsewhere; `SHIPPED` = the code already does it; `STALE-PREMISE` = the question rests on something no longer true; `NOT-AN-OWNER-CALL` = ordinary work, or a measurement settles it.
