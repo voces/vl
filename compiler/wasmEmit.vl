@@ -521,6 +521,7 @@ import {
   coalesceDefaultNullable,
   coalesceLitUnionFits,
   coalesceNicheJoinsToBox,
+  coalesceNulRefNicheOperand,
   coalesceResultUnionName,
   criFnIsAnonLambda,
   ctrlEnter,
@@ -725,6 +726,7 @@ import {
   nonNulBaseOf,
   nulFieldInnerCode,
   nulMapShapeOf,
+  nulNicheBoxSlot,
   nulNicheRecoverOwed,
   nulRefStructIdxOfLet,
   nulScalarListBuildKind,
@@ -4038,6 +4040,12 @@ export function emitUnionCoerce(
   const viaListArm = emitUnionListLitViaRefArm(body, unionName, exprIx, fnIx)
   if viaListArm < 0 { return -1 }
   if viaListArm == 1 { return 0 }
+  // A `V | null` niche delivered where the box is expected: the niche carries no tag of its
+  // own, so the ladder below reads it as no atom at all and boxes the ref under a numeric
+  // tag. Ahead of the value-atom gate, whose raw pass-through would deliver the bare ref.
+  const viaNulNiche = emitUnionBoxNulNiche(body, unionName, exprIx, fnIx)
+  if viaNulNiche < 0 { return -1 }
+  if viaNulNiche == 1 { return 0 }
   if unionName == "" || !unionHasValueAtom(unionName) {
     return emitExpr(body, exprIx, fnIx)
   }
@@ -21855,6 +21863,62 @@ function coalNicheBoxTag(
   const vi = unionArmVariantWithHeap(joinSet, heapIx)
   if vi >= 0 && vi < uTags.length { return uTags[vi] }
   -1
+}
+
+// The heap type a nullable-ref niche carries, or -1 — the same two tables the `??` niche
+// arms read (`exprNullableVariant` then `exprNullableStruct`), so the box stash and the
+// `br_on_non_null` block cannot disagree about the value's rep. -1 for every other niche,
+// whose tag `coalNicheBoxTag` resolves from its atom code instead of from a heap.
+function nulNicheValueHeap(exprIx: i32, fnIx: i32): i32 {
+  if exprNullableVariant(exprIx, fnIx) {
+    const nvi = nulVariantIdxOfExpr(exprIx, fnIx)
+    if nvi >= 0 && nvi < uVarHeap.length { return uVarHeap[nvi] }
+    return -1
+  }
+  if exprNullableStruct(exprIx, fnIx) {
+    const nsi = structIndexOfExpr(exprIx, fnIx)
+    if nsi >= 0 && nsi < sHeapIdx.length { return sHeapIdx[nsi] }
+  }
+  -1
+}
+
+// Box a `V | null` niche into a union carrying both `V`'s arm and `null`: 1 when it lowered,
+// 0 when the value is not that shape or the union has no arm for it, -1 on a refusal. One
+// evaluation is parked in the niche stash, and the null test picks the tag — the payload
+// rides unchanged, the box's slot being `anyref` (D1721).
+function emitUnionBoxNulNiche(
+  body: i32[],
+  unionName: string,
+  exprIx: i32,
+  fnIx: i32,
+): i32 {
+  if unionName == "" { return 0 }
+  if !unionSetHasNull(unionName) { return 0 }
+  const nnIx = unwrapParen(exprIx)
+  if !coalesceNulRefNicheOperand(nnIx, fnIx) { return 0 }
+  const nnTag = coalNicheBoxTag(
+    unionName,
+    nnIx,
+    nulNicheValueHeap(nnIx, fnIx),
+    fnIx,
+  )
+  if nnTag < 0 { return 0 }
+  const nnSlot = nulNicheBoxSlot()
+  if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
+  fbLocalTee(nnSlot)
+  wU8(209)         // 0xd1 ref.is_null
+  fbIfRef(uBoxIdx) // 0x04 if, (ref $uBox) blocktype — the box is the result either way
+  ctrlEnter()
+  fbI32Const(nullBoxTag())
+  fbRefNullNone()  // the payload slot is unread under the null tag
+  fbStructNew(uBoxIdx)
+  fbElse()         // 0x05 else — present → the niche's own ref, under its arm's tag
+  fbI32Const(nnTag)
+  fbLocalGet(nnSlot)
+  fbStructNew(uBoxIdx)
+  fbEnd()          // 0x0b end
+  ctrlLeave()
+  1
 }
 
 // Will the DEFAULT reach the box rep? A struct-typed value that is neither an object literal
