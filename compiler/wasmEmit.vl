@@ -21626,6 +21626,43 @@ function emitCoalesceNulRef(
   )
 }
 
+// Widen a `??`'s unboxed operand from its own atom kind to the RESULT's, for the case where a
+// wider default widened the whole expression (`i32 | null ?? 1.5` is an f64). Equal kinds emit
+// nothing; a pair with no conversion refuses loudly, the block type already being the
+// result's (D1699).
+function coalWidenUnboxed(from: i32, to: i32) {
+  if from == to { return 0 }
+  if from == 0 {
+    if to == 4 {
+      fbF64ConvertI32S() // i32 -> f64
+      return 0
+    }
+    if to == 5 {
+      fbF32ConvertI32S() // i32 -> f32
+      return 0
+    }
+    if to == 3 {
+      fbI64ExtendI32S() // i32 -> i64
+      return 0
+    }
+  }
+  if from == 5 {
+    if to == 4 {
+      fbF64PromoteF32() // f32 -> f64
+      return 0
+    }
+  }
+  if from == 3 {
+    if to == 4 {
+      fbF64ConvertI64S() // i64 -> f64
+      return 0
+    }
+  }
+  emitFail(
+    "emitProgram: `??` widens its operand to a result kind with no conversion",
+  )
+}
+
 // `l ?? d`, with a `?.` chain on the left staged for the whole lowering when its base is not
 // a re-readable place — the fused arms read the receiver two and three times, and the stash
 // is what lets them do that to a call. One save/restore, since a default may hold a chain.
@@ -21916,11 +21953,18 @@ function emitCoalesceGo(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
               "emitProgram: `??` over a string|null union is not supported yet",
             )
           }
-          // A nullable default keeps the result boxed (`coalesceDefaultNullable`). Both arms
-          // are already `(ref $uBoxIdx)`: the default is a box, and the lhs re-read is the
-          // same box with a non-null tag, so neither arm unboxes and the block type is the box
-          // itself — the lowering shape is otherwise identical, so the tag test above is shared.
-          if coalesceDefaultNullable(e.binRight, fnIx) {
+          // The result is a BOX exactly when the checker typed this `??` as a union — a
+          // nullable default keeps `T | null`, another type joins to `T | U`. The default is
+          // coerced into the RESULT union, not the operand's, which has no tag for it; the
+          // operand's own box needs none, tags being global atom codes (D1699).
+          let cResN = ""
+          const cResEmit = tyToEmitName(nodeTyIxOf(exprIx))
+          if cResEmit != "" {
+            if isValueUnionName(cResEmit) { cResN = cResEmit }
+          }
+          if cResN != "" || coalesceDefaultNullable(e.binRight, fnIx) {
+            let cCoerceN = cResN
+            if cCoerceN == "" { cCoerceN = cunm }
             if emitExpr(body, e.binLeft, fnIx) < 0 {
               return -1 // the box
             }
@@ -21933,7 +21977,7 @@ function emitCoalesceGo(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
             // the default has to arrive as one — a bare `null` has no rep of its own and would
             // take the loud `bare null needs a struct-typed context` reject. The coerce's
             // `NullLit` arm builds the null-tagged box instead; every non-null default passes through unchanged.
-            if emitUnionCoerce(body, cunm, e.binRight, fnIx) < 0 {
+            if emitUnionCoerce(body, cCoerceN, e.binRight, fnIx) < 0 {
               return -1 // d, its own box
             }
             fbElse() // 0x05 else — present → the LHS box, re-read
@@ -21942,15 +21986,24 @@ function emitCoalesceGo(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
             ctrlLeave()
             return 0
           }
+          // The result kind is the CHECKER's, not the operand's residual: a wider default
+          // widens the whole `??` (`i32 | null ?? 1.5` is an f64), and the block type has to be
+          // that. `cak` still drives the unbox, since the box holds the operand's own atom;
+          // the widen below carries it up to the result (D1699).
+          let cRk = cak
+          if cResEmit != "" {
+            const cRkN = valueAtomKind(cResEmit)
+            if cRkN >= 0 && cRkN != nullValKind() { cRk = cRkN }
+          }
           if emitExpr(body, e.binLeft, fnIx) < 0 {
             return -1 // the box
           }
           fbStructGet(uBoxIdx, 0)       // field 0: tag
           fbI32Const(nullBoxTag())
           fbI32Bin(70)                  // 0x46 i32.eq → null?
-          fbIf(valBlockTypeOfKind(cak)) // 0x04 if, value blocktype
+          fbIf(valBlockTypeOfKind(cRk)) // 0x04 if, value blocktype
           ctrlEnter()
-          if emitExprAsKind(body, e.binRight, cak, fnIx) < 0 { return -1 }
+          if emitExprAsKind(body, e.binRight, cRk, fnIx) < 0 { return -1 }
           fbElse()                      // 0x05 else — present → unbox
           // The banked code `cak` travels INTO the unbox: pre-#1128 this site rendered
           // the residual set for the parameter and the callee parsed the rendering
@@ -21958,6 +22011,7 @@ function emitCoalesceGo(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
           if emitValueUnionUnboxRead(body, lhs.identName, cak, fnIx) < 0 {
             return -1
           }
+          if coalWidenUnboxed(cak, cRk) < 0 { return -1 }
           fbEnd() // 0x0b end
           ctrlLeave()
           return 0
