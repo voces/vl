@@ -21138,6 +21138,18 @@ function capturedIsNulLitUnion(fnIx: i32, name: string) {
 // answers the litunion question falsely. Depth-bounded (32), since a declaration chain is a DAG.
 function declFallbackDepthCap() { 32 }
 
+// Does the list LITERAL at `arrIx` lower its elements as interned atoms? A non-literal array
+// is not this question and answers true, since its own declaration fixed the rep. The one place
+// the element-pin reader asks about a REP rather than a type (D1756).
+function arrLitElemRepIsAtom(arrIx: i32, fnIx: i32): boolean {
+  const a = P.nodes[unwrapParen(arrIx)]
+  if a is ArrayLit {
+    if a.arrElems.length < 1 { return true }
+    return exprIsLitAtom(a.arrElems[0], fnIx)
+  }
+  true
+}
+
 // The element arena type of the array expression `arrIx` when that element is a literal
 // union, or -1. `nodeArrayElemIsLitUnion` is exactly the `tyIsLitUnion` of its direct half.
 export function arrElemLitUnionTy(arrIx: i32, fnIx: i32) {
@@ -21157,7 +21169,13 @@ function arrElemLitUnionTyAt(arrIx: i32, fnIx: i32, depth: i32): i32 {
   // element — `const xs = [a]` over a hole parameter records `<hole>[]` — and every rung above
   // asks the container, so this is the only one that reaches the pinned litunion (D1725).
   const pinElemHole = pinnedHoleTyOf(nodeArrayElemTyIx(arrIx))
-  if tyIsLitUnion(pinElemHole) { return pinElemHole }
+  if tyIsLitUnion(pinElemHole) {
+    // A list LITERAL's rep comes from what its elements LOWER as, not from the type they pin
+    // to: a parameter pinned at the softened `string` carries the same literal union as one
+    // pinned at an alias, and only the first builds a string list. `exprIsLitAtom` is that rep
+    // question, and this reader has the frame it needs (D1756).
+    if arrLitElemRepIsAtom(arrIx, fnIx) { return pinElemHole }
+  }
   if depth >= declFallbackDepthCap() { return 0 - 1 }
   const n = P.nodes[unwrapParen(arrIx)]
   if n is Ident {
@@ -21243,6 +21261,28 @@ function declLitUnionTyAt(
   0 - 1
 }
 
+// Does index receiver `arrIx` denote a local bound to a list LITERAL whose elements lower as
+// string refs? An annotated binding is not this question — its annotation fixed the rep — and
+// neither is a parameter or a global, both of which reach their elements by another route.
+function idxRecvIsStrList(arrIx: i32, fnIx: i32) {
+  if fnIx < 0 { return false }
+  const n = P.nodes[unwrapParen(arrIx)]
+  if n is Ident {
+    const slot = declaredSlotOf(n.identName)
+    if slot < 0 || slot >= localDeclIx.length { return false }
+    const d = localDeclIx[slot]
+    if d < 0 { return false }
+    const dn = P.nodes[d]
+    if dn is LetDecl {
+      if dn.letType >= 0 { return false }
+      if dn.letInit < 0 { return false }
+      const iv = P.nodes[unwrapParen(dn.letInit)]
+      if iv is ArrayLit { return arrLitIsStr(dn.letInit, fnIx) }
+    }
+  }
+  false
+}
+
 // True if `exprIx` is a literal-union atom value (an i32 id) — a litunion-flagged local or a
 // litunion-annotated param. Distinguishes a real atom from a checker-inferred literal union.
 export function exprIsLitAtom(exprIx: i32, fnIx: i32) {
@@ -21284,6 +21324,11 @@ export function exprIsLitAtom(exprIx: i32, fnIx: i32) {
     }
   }
   if e is Index {
+    // Every rung below asks a TYPE, and a literal union's type does not carry its rep: a list
+    // built over a parameter pinned at the softened `string` holds string refs while its
+    // element type is the same union an atom list has. The receiver's own literal is the rep,
+    // and claiming an atom over it emits an i32 consumer for a `(ref $type)` (D1740).
+    if idxRecvIsStrList(e.idxArr, fnIx) { return false }
     // `xs[i]` over a literal-union array yields an atom element, through the declaration
     // fallback: a monomorphized instance's receiver records the generic's `T[]`, so the
     // direct probe answers false for an array it should claim. Without it, a generic
