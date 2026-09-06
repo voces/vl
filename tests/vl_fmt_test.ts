@@ -2084,3 +2084,124 @@ Deno.test({
     }
   },
 });
+
+// D1648 — A QUOTED OPERATOR NAME ROUND-TRIPS, and the way it did not is the declaration
+// printer taking a name from the NODE where it needed the SOURCE.
+//
+// `function "+"` and `function +` name the same function: the parser strips the quotes and
+// stores the bare operator, so the source spelling is gone from the node. `functionHeader`
+// rebuilt the header from that name and printed every quoted operator unquoted. For nine of
+// the ten that still re-parses, so the damage is a silent re-spelling; for `<` it is not —
+// the type-parameter list's own `<` follows immediately and `<<` lexes as one token, so the
+// output does not re-parse and `vl fmt` exits 3 leaving the file untouched. There is no legal
+// unquoted spelling of that declaration: `function <<T>(…)` written by hand does not parse.
+//
+// An INDEX operator escaped, because its name is re-minted with its receiver (`[]@V`) and
+// `opDeclOpOf` recognises that form and re-quotes it — the one family with a spelling.
+Deno.test({
+  name: "vl-fmt: a quoted operator name round-trips (quotes kept, `<` not fused)",
+  ignore: !ENABLED,
+  fn: async () => {
+    const src = [
+      "type P = { x: i32 }",
+      'function "<"<T>(self: P, other: P): boolean { return self.x < other.x }',
+      'function "+"(self: P, other: P): P { return { x: self.x + other.x } }',
+      "function -(self: P, other: P): P { return { x: self.x - other.x } }",
+      "const a: P = { x: 1 }",
+      "const b: P = { x: 2 }",
+      "print(a < b)",
+      "print((a + b).x)",
+      "print((b - a).x)",
+      "",
+    ].join("\n");
+    const r = await run([], src);
+    if (r.code !== 0) {
+      throw new Error(`vl fmt rejected valid source (rc ${r.code}):\n${r.err}`);
+    }
+    if (r.out.includes("function <<")) {
+      throw new Error(`the quotes were dropped and the two \`<\` fused:\n${r.out}`);
+    }
+    // Both spellings survive as WRITTEN: the quoted ones stay quoted, the bare one stays bare.
+    if (r.out !== src) {
+      throw new Error(`already-canonical source was reformatted:\n${r.out}`);
+    }
+    const again = await run([], r.out);
+    if (again.code !== 0 || again.out !== r.out) {
+      throw new Error(`not idempotent (rc ${again.code}):\n${again.out}`);
+    }
+    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_opname_" });
+    const file = `${dir}/main.vl`;
+    await Deno.writeTextFile(file, r.out);
+    const ran = await runOn("run", file);
+    if (ran.code !== 0 || ran.out !== "true\n3\n1\n") {
+      throw new Error(
+        `formatted output did not run (rc ${ran.code}): ${JSON.stringify(ran.out)}\n${ran.err}`,
+      );
+    }
+  },
+});
+
+// D1649 — `export` NEEDS A DECLARATION TO NAME, and a formatter never deletes a token.
+//
+// `parseStmt` consumed the keyword unconditionally and dropped it from the AST, so three
+// things were true at once: `export 55` checked clean, it exported nothing (there is no name
+// to export), and `vl fmt` — which prints from the AST — re-emitted the statement without the
+// token, silently turning the user's mistake into a different program under `vl fmt -w`.
+//
+// The refusal is at the parse stage, which is what makes the formatter's guarantee TOTAL
+// rather than per-printer: `formatSrc` bails on any parse diagnostic, so the file comes back
+// untouched for every statement form at once, including the ones nobody thought of.
+Deno.test({
+  name: "vl-fmt: `export` before a non-declaration is refused, and fmt does not delete it",
+  ignore: !ENABLED,
+  fn: async () => {
+    const strays = [
+      "export 55\nprint(1)\n",
+      "export print(1)\n",
+      "export (x: i32) => x\nprint(1)\n",
+      "export if true { print(1) }\n",
+      "export while false { }\nprint(1)\n",
+      "function g(): i32 {\n  export 55\n  return 1\n}\nprint(g())\n",
+    ];
+    for (const src of strays) {
+      const r = await run([], src);
+      // Unparseable input comes back VERBATIM (rc 2) — the token is still there.
+      if (r.code !== 2) {
+        throw new Error(`expected fmt rc 2 (unparseable), got ${r.code} for:\n${src}`);
+      }
+      if (!r.out.includes("export")) {
+        throw new Error(`fmt deleted the \`export\` token:\n${r.out}`);
+      }
+      const dir = await Deno.makeTempDir({ prefix: "vl_fmt_export_" });
+      const file = `${dir}/main.vl`;
+      await Deno.writeTextFile(file, src);
+      const checked = await runOn("check", file);
+      if (checked.code === 0) {
+        throw new Error(`\`export\` before a non-declaration was accepted:\n${src}`);
+      }
+      // Diagnostics go to stderr; the stream is not the point, the sentence is.
+      if (!(checked.out + checked.err).includes("`export` needs a declaration to name")) {
+        throw new Error(
+          `the refusal did not name the contract: ${checked.out}${checked.err}`,
+        );
+      }
+    }
+    // The controls: every spelling `export` may legally modify still formats and still runs.
+    const ok = [
+      "export const x = 1\nprint(x)\n",
+      "export let y = 2\nprint(y)\n",
+      "export function f(): i32 { return 3 }\nprint(f())\n",
+      "export type T = { a: i32 }\nconst t: T = { a: 4 }\nprint(t.a)\n",
+      "export flat type F = { a: i32 }\nprint(F.size)\n",
+    ];
+    for (const src of ok) {
+      const r = await run([], src);
+      if (r.code !== 0) {
+        throw new Error(`a legal \`export\` stopped formatting (rc ${r.code}):\n${src}`);
+      }
+      if (!r.out.startsWith("export ")) {
+        throw new Error(`fmt dropped a legal \`export\`:\n${r.out}`);
+      }
+    }
+  },
+});
