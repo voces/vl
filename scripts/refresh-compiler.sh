@@ -190,4 +190,11 @@ sidecars=0
 for side in "$OUT".*.cwasm; do
   if [ -f "$side" ]; then sidecars=$((sidecars + 1)); fi
 done
+# RECORD WHAT THIS SEED WAS BUILT FROM. A grade taken against `$OUT` is a grade of these
+# sources and nothing else could say so: a timestamp cannot, because `git archive`, `cp`, a
+# rebase and a checkout all hand a stale artifact a fresh mtime — CLAUDE.md's cargo rule,
+# verify behaviourally never by timestamp. `scripts/seed_provenance.py` recomputes the same
+# fold over the working tree, so a tool grading against a seed can refuse when they differ.
+"${PYTHON:-python3}" "$(dirname "$0")/seed_provenance.py" --write --seed "$OUT" >/dev/null \
+  || echo "  note: could not record the seed's source identity (seed_provenance.py)" >&2
 echo "refreshed $OUT ($(wc -c < "$OUT") bytes) from current compiler/*.vl; $sidecars engine-tag sidecar(s) warm"
