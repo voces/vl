@@ -753,7 +753,11 @@ function tailIsF64NoLocal(ix: i32, fnArenaIx: i32) {
   if e is Call {
     const callee = P.nodes[e.callFn]
     if callee is Ident {
-      const t = fnIndexOfSid(sidOfNode(e.callFn))
+      const t = fnIndexOfInScopeSid(
+        sidOfNode(e.callFn),
+        callee.identName,
+        fnArenaIx,
+      )
       if t >= 0 {
         if t < fRetKind.length { return fRetKind[t] == "f64" }
       }
@@ -3819,10 +3823,10 @@ function nestedFnDeclaredInFrame(name: string, pp: i32) {
   -1
 }
 
-// `fnIndexOf` but scope-aware for a name referenced as a value or a callback inside function
-// `fnIx`: when two lifted functions share a name, the flat `fnIndexOf` always returns the
-// first. Resolution walks outward from the calling frame and stops at the first scope that
-// declares `name`; running off the chain means the flat map's top-level answer is right.
+// `fnIndexOf` but scope-aware for a name referenced inside function `fnIx`: when two lifted
+// functions share a name — a monomorphized instance and its own per-pin clone, say — the flat
+// `fnIndexOf` always returns the first. Resolution walks outward from the calling frame and
+// stops at the first scope declaring `name`; off the chain, the flat answer is right (D1781).
 export function fnIndexOfInScope(name: string, fnIx: i32) {
   fnIndexOfInScopeSid(sidLookup(name), name, fnIx)
 }
@@ -11232,7 +11236,11 @@ export function exprIsI64(exprIx: i32, fnIx: i32) {
     if cloArrCallRetKind(exprIx, fnIx) == "i64" { return true }
     const callee = P.nodes[e.callFn]
     if callee is Ident {
-      const target = fnIndexOfSid(sidOfNode(e.callFn))
+      const target = fnIndexOfInScopeSid(
+        sidOfNode(e.callFn),
+        callee.identName,
+        fnIx,
+      )
       if target >= 0 { return fRetKind[target] == "i64" }
       // An i64-returning function value (a binding / `(…) => i64` param callee).
       return calleeReturnsI64Sid(sidOfNode(e.callFn), fnIx)
@@ -11391,7 +11399,11 @@ export function exprIsF32(exprIx: i32, fnIx: i32) {
   if e is Call {
     const callee = P.nodes[e.callFn]
     if callee is Ident {
-      const target = fnIndexOfSid(sidOfNode(e.callFn))
+      const target = fnIndexOfInScopeSid(
+        sidOfNode(e.callFn),
+        callee.identName,
+        fnIx,
+      )
       if target >= 0 { return fRetKind[target] == "f32" }
     }
     // An f32-returning field-closure call the typed-IR fast path can't see: the emitter's own
@@ -11527,7 +11539,11 @@ export function exprIsF64(exprIx: i32, fnIx: i32) {
     if cloArrCallRetKind(exprIx, fnIx) == "f64" { return true }
     const callee = P.nodes[e.callFn]
     if callee is Ident {
-      const target = fnIndexOfSid(sidOfNode(e.callFn))
+      const target = fnIndexOfInScopeSid(
+        sidOfNode(e.callFn),
+        callee.identName,
+        fnIx,
+      )
       if target >= 0 { return fRetKind[target] == "f64" }
       // A function-value (closure) callee returning f64 — its result routes as f64.
       return calleeReturnsF64Sid(sidOfNode(e.callFn), fnIx)
@@ -28178,9 +28194,11 @@ export function exprReReadable(exprIx: i32): boolean {
 // produces the i32 array (a `(ref $aTypeIdx)`) rather than an i32. An index read
 // `a[i]` and `a.length` are i32 (not arrays), so they are deliberately absent here.
 
-// True if the function `name` declares an array (`i32[]`) as its return type.
-function fnRetArraySid(sid: i32) {
-  const i = fnIndexOfSid(sid)
+// True if the function `name`, resolved from frame `fnIx`, declares or infers an `i32[]`
+// return. Scope-aware because a monomorphized instance's per-pin clone shares the template's
+// name, and the flat map answers the template (D1781).
+function fnRetArraySid(sid: i32, name: string, fnIx: i32) {
+  const i = fnIndexOfInScopeSid(sid, name, fnIx)
   if i < 0 { return false }
   fRetKind[i] == "list"
 }
@@ -28307,7 +28325,9 @@ export function exprArray(exprIx: i32, fnIx: i32) {
       // The intrinsic allocators yield an i32 list unless the fill is f64
       // (`arrNewIntrKind` 1 — then `exprF64Array` claims the call).
       if arrNewIntrKind(exprIx, fnIx) == 0 { return true }
-      if fnRetArraySid(sidOfNode(e.callFn)) { return true }
+      if fnRetArraySid(sidOfNode(e.callFn), callee.identName, fnIx) {
+        return true
+      }
       // A closure-value call (`g(x)` with `g: (i32) => i32[]`) whose resolved sig result is
       // the i32 list, so `const xs = g(x)` types `xs` as a list.
       return calleeRetKindSid(sidOfNode(e.callFn), fnIx) == "list"
@@ -30011,9 +30031,10 @@ function fnRetStringArraySid(sid: i32) {
 
 // True if function `name` declares (or, un-annotated, infers) an `f64[]` return — the f64
 // analogue of `fnRetStringArray`, so an untyped `let x = mk()` / a call argument classifies as
-// an f64 list (kind 12) instead of falling through to i32.
-function fnRetF64ArraySid(sid: i32) {
-  const i = fnIndexOfSid(sid)
+// an f64 list (kind 12) instead of falling through to i32. Resolved from frame `fnIx` for
+// `fnRetArraySid`'s reason.
+function fnRetF64ArraySid(sid: i32, name: string, fnIx: i32) {
+  const i = fnIndexOfInScopeSid(sid, name, fnIx)
   if i < 0 { return false }
   fRetKind[i] == "f64list"
 }
@@ -30407,7 +30428,9 @@ export function exprF64Array(exprIx: i32, fnIx: i32) {
     const callee = P.nodes[e.callFn]
     if callee is Ident {
       // A NAMED function returning `f64[]` (annotated or inferred, `"f64list"`).
-      if fnRetF64ArraySid(sidOfNode(e.callFn)) { return true }
+      if fnRetF64ArraySid(sidOfNode(e.callFn), callee.identName, fnIx) {
+        return true
+      }
       // A closure-VALUE call (`g(x)` with `g: (i32) => f64[]`) whose resolved sig
       // result is the f64 list (`>D`).
       return calleeRetKindSid(sidOfNode(e.callFn), fnIx) == "f64list"
