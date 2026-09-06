@@ -27,7 +27,7 @@ tree ungraded.
 
 | verdict | rows | what it means |
 | --- | --- | --- |
-| `pass-stamped` | 2 | the key reads `emitPassGen`, or a phase flag that is one |
+| `pass-stamped` | 3 | the key reads `emitPassGen`, or a phase flag that is one |
 | `no-refined-input` | 3 | every table its value reads is push-only or reset wholesale |
 | `resume-reseeds` | 2 | a resume bank that writes the refined columns back before reusing them |
 | `not-a-memo` | 8 | a visit mark or a per-row flag — no cached ANSWER to go stale |
@@ -38,6 +38,7 @@ tree ungraded.
 | memo | key reads | in-place-filled input after it can first be asked | verdict |
 | --- | --- | --- | --- |
 | `globalCellKind` | `tyMutEpoch`, `P.nodes.length`, 4 collect lengths, **`emitPassGen`** | `fRetKind` and its five siblings (D1655) | pass-stamped |
+| `refArrShapeIndex` (`ras*`) | `tyMutEpoch`, `cUserTypesVer`, `P.nodes.length`, 4 collect lengths, **`emitPassGen`** | none named; the row also carries the arena epoch and the declared-type version, and the identity proof is the compiler's own codegen plus 3,045 corpus modules | pass-stamped |
 | `dsgReady` (declared-struct graph) | `emitRootIx`, `P.nodes.length` | none reachable: the `emitArenaFinal` gate means no pass runs after it is built | pass-stamped |
 | `variantSig` | `uFieldNames`/`uFieldStart`/`uFieldCount` lengths | none: it reads field NAMES, and all three tables are push-only | no-refined-input |
 | `objVariantIndex` (`ovn*`) | `uVariants`/`uFieldStart`/`uFieldCount` lengths | none, the same three tables through `variantSig` | no-refined-input |

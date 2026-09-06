@@ -25,7 +25,7 @@ QUICK = a day, no design question. STRUCT = a design track.
 | 10 | `declaredSlotOf` → per-function side index built in `buildLocals` | **1.1%** self time | M | reset per function, 5 sites | byte-identical seed; `regress.py` | STRUCT |
 | 11 | `fnStmtsPosOf` → reverse index `nodeIx → fe` after mono: 19,106 calls, **25.9 M scan steps** | closures axis 2.22 → ~1 | M | 1 in-place write, `emit_mono.vl:6353` | byte-identical seed; the closures axis under its 3.2 bar | STRUCT |
 | 12 | Destringify type names — `tyTopIndexOf` is a per-CHARACTER walk over a type-name string, **4.94% self** | 4.9% plus most of `__str_eq__`'s tail | L | canon / rep | `docs/internals/registry-by-type-id.md` steps 4–6; byte-identity | STRUCT |
-| 13 | ✅ **LANDED (§G1 + §G2)** — but NOT as prescribed: the early-out never fires (0 of 5.4 M walks found a top-level `|`) and the suffix test already ran first. What the measurement supported is a byte pre-scan in front of `tyTopIndexOf`'s ladder, which serves every caller | §G1 `vl build` **0.568× / 0.725×** on the two outliers (medians of six interleaved readings), 0.922× on the control; §G2 a further **0.515× / 0.800×** on top, from the ladder's own 33.7× re-derivation | S | none — a sound over-approximation in front of the walk | byte-identical seed and codegen; `regress.py` no cell moved; all 2,996 corpus modules identical; `rep-fuzz-check.sh` | QUICK |
+| 13 | ✅ **LANDED (§G1 + §G2 + §G3)** — but NOT as prescribed: the early-out never fires (0 of 5.4 M walks found a top-level `|`) and the suffix test already ran first. What the measurement supported is a byte pre-scan in front of `tyTopIndexOf`'s ladder, which serves every caller | §G1 `vl build` **0.568× / 0.725×** on the two outliers (medians of six interleaved readings), 0.922× on the control; §G2 a further **0.515× / 0.800×** on top, from the ladder's own 33.7× re-derivation; §G3 a further **0.212× / 0.491×**, from one classification per spelling per generation | S | none — a sound over-approximation in front of the walk | byte-identical seed and codegen; `regress.py` no cell moved; all 2,996 corpus modules identical; `rep-fuzz-check.sh` | QUICK |
 
 Two corrections are load-bearing: **`vl check std/json.vl` is 40 ms, not 6.5 s** (§B1), and
 **`tyTopIndexOf` is not a name-keyed registry; `collectA` never calls it** (§B4).
@@ -1638,3 +1638,128 @@ bytes (+0.04%).
   needs the ladder's whole read-set — not just the three name tables but whatever
   `repRowOfName`, `structIndexOfTypeName`, `variantIndexOfOwnRender` and
   `nameIsLitUnionType` consult. That audit is the design question, and it is not done here.
+
+### G3 · The third term — one classification per spelling per generation, 2026-09-06
+
+§G2 closed by naming two terms and the design question each carries: **~11 `nameIsArray`
+walks per ladder call**, and **the outermost calls themselves** — 14,076 and 8,653 over 10
+and 5 distinct names, a repeat rate only a program-scoped cache reaches, whose generation
+"needs the ladder's whole read-set". The profile says which of the two to take, a counter
+build says why the other one cannot be taken the way it was described, and the generation
+turns out to be measurable rather than arguable. Numbers on `c17d0d53e`, by §G1's method
+— counters compiled into a scratch artifact, dumped from the tail of `emitProgram` through
+a distinctive `emitFail`, the seed never written.
+
+`VL_PROFILE_GUEST` against a `--names` seed, summed over 14 profiles per program so the
+share is a mechanism and not one build's luck:
+
+| frame | `arm-list-elem-pin-at-depth` | `global-reference-chain-cost` | control `deep-is-json-shape-walk` |
+| --- | ---: | ---: | ---: |
+| total samples | 1,190 | 1,253 | 2,392 |
+| `tyHasSepByte` self | **40.84%** | **21.39%** | 9.16% |
+| `__str_eq__` self | 11.01% | 14.13% | 12.04% |
+| `unionMemberCount` incl | 45.88% | 20.43% | — |
+| `nameIsArray` incl | 47.65% | 19.95% | — |
+| `nameIsRefArray` incl | 81.18% | 54.35% | — |
+| `refArrElemName` incl | 83.03% | 47.96% | — |
+
+The chain under the top frame is one edge deep at every hop, and it is the SAME chain on
+both outliers. `tyHasSepByte`'s immediate caller is `tyTopIndexOf` in **100%** of samples;
+the outermost `tyTopIndexOf` is entered from `unionMemberCount` in 79.8% / 71.3%; the
+outermost `unionMemberCount` from `nameIsArray` in 98.9% / 95.3%. So a third of the whole
+profile is `nameIsArray` asking the union counter whether a spelling it has already been
+asked about eleven times has a top-level `|`. The eleven are not one caller either — the
+outermost `nameIsArray` arrives from `arrElemNameRaw` 35.1%, `arrElemIsArrayOf` 29.3%,
+`arrElemIs` 10.6%, `refArrElemName` 6.0%, `nameIsI32ListArray` 6.0%, `refArrShapeKind`
+3.9%, `nameIsClosureArray` 3.5%, `parenUnionArrElemName` 2.8%, `nameIsMapArray` 2.5%.
+
+**The first term does not survive being taken as a memo, and that is measured rather than
+argued.** A direct-mapped answer cache on `nameIsArray` itself, in front of the union
+count and behind the O(1) suffix test, needs no generation at all — the body is a pure
+function of its argument. It hits **1,764,260 times against 16 misses** on the first
+outlier, and the build is **1.038× SLOWER**. The reason is the size of what it replaces: a
+`nameIsArray` call that reaches the counter costs one byte scan of about 12.6 characters,
+and a hashed row read plus a `__str_eq__` costs about the same. **A memo pays against a
+LADDER, not against a scan** — so the whole win has to come from making fewer ladder calls,
+and the first term is only reachable through span-taking predicates, which §G2 already
+named and which this does not do.
+
+**The second term's generation is 7 drops per program, not an audit.** A staleness key
+shaped like `gckStale`'s — the arena's in-place epoch `tyMutEpoch`, `cUserTypesVer`,
+`P.nodes.length`, four collect-table lengths, and `emitPassGen` — was instrumented on
+master and asked how often it would have invalidated a program-scoped cache:
+
+| | `arm-list-elem-pin-at-depth` | `global-reference-chain-cost` | control | self-compile |
+| --- | ---: | ---: | ---: | ---: |
+| outermost ladder calls | 14,076 | 8,653 | 15,113 | 49,386 |
+| distinct names at an outermost call | 10 | 3 | 24 | **943** |
+| generation drops over the whole compile | **7** | **5** | **15** | **57** |
+| of the outermost calls, after `emitArenaFinal` | 13,794 | 8,143 | 8,768 | 21,803 |
+
+So the read-set audit §G2 asked for is not what decides this. The tables the ladder reads
+barely move while it is being asked, and a row therefore survives essentially the whole
+compile. The `emitArenaFinal` row is there because a phase gate was the other candidate: it
+covers 98% of the outliers but only 44% of a self-compile, and the generation covers both,
+so the generation is what shipped.
+
+`nameIsRefArray`, `refArrShapeKind` and `refArrElemName` now answer from one 2,048-row
+direct-mapped index keyed on the spelling, three value columns to a row, dropped in one
+step when any stamp moves. It replaces §G2's per-call memo rather than sitting beside it:
+within one walk the generation cannot move, so the rows do that memo's job as well.
+
+| counter | before → after | | | |
+| --- | ---: | ---: | ---: | ---: |
+| | `arm-list-elem-pin-at-depth` | `global-reference-chain-cost` | control | self-compile |
+| `nameIsArray` calls | 1,989,230 → **8,067** | 717,102 → 20,259 | 399,687 → 137,392 | 1,981,626 → 1,256,444 |
+| `unionMemberCount` calls | 1,778,654 → 4,947 | 619,759 → 39,763 | 151,053 → 48,162 | 440,727 → 294,282 |
+| characters `tyHasSepByte` visited | 22,410,117 → **71,748** | 12,788,654 → 1,414,281 | 7,912,439 → 7,066,996 | 50,970,568 → 39,174,776 |
+| ladder calls | 184,586 → 14,226 | 69,899 → 8,701 | 36,091 → 15,295 | 120,902 → 51,534 |
+| ...per outermost call | 13.11 → **1.01** | 8.08 → 1.01 | 2.39 → 1.01 | 2.45 → 1.04 |
+
+One ladder call per ask is what an index is for, and it is the number to read: the
+outermost count is unchanged by construction, and everything under it is gone.
+
+`vl build` CPU, user+sys per build over 25-build batches so the 10 ms clock is not the
+resolution, min over seven interleaved batches per arm, at loads from 12 to 60. The three
+earlier readings were taken on an earlier shape of the same index:
+
+| program | A (master `9203d73db`) | B (this) | ratio | earlier readings |
+| --- | ---: | ---: | ---: | ---: |
+| `unions/arm-list-elem-pin-at-depth.vl` | 0.0848 s | 0.0179 s | **0.212** (4.74×) | 0.215, 0.213, 0.212 |
+| `globals/global-reference-chain-cost.vl` | 0.0943 s | 0.0463 s | **0.491** (2.04×) | 0.491, 0.488, 0.496 |
+| control `unions/deep-is-json-shape-walk.vl` | 0.1757 s | 0.1723 s | 0.980 | 0.979, 0.974, 0.977 |
+| `vl build compiler/entry.vl` (the L2 self-compile) | 3.9524 s | 3.9254 s | 0.993 | 0.998, 0.991 |
+| `vl check compiler/typecheck.vl` | 0.7759 s | 0.7880 s | 1.016 | 0.999, 0.996 |
+
+The self-compile is unchanged, and its counters say why rather than leaving it to
+inference: 949 distinct names against 51,534 ladder calls is a 54× repeat where the first
+outlier's is 1,400×, and 78% of its `nameIsArray` calls never reach the counter at all
+because the O(1) suffix test declines them. Per-test wall through the corpus oracle, min of
+6 interleaved rounds: **75 → 36 ms**, **80 → 57 ms**, control 109 → 107 ms.
+
+After, same instruments: `tyHasSepByte` self is **40.84% → 3.33%** on the first outlier and
+**21.39% → 6.68%** on the second, and the first outlier's whole profile falls from 85
+samples a build to 7.5. What tops the second outlier now is a different term —
+`tyToNameGo` 22.96% self with `__str_concat__` at 12.27%, the type-name RENDERER rather
+than its scanner.
+
+Identity, pinned to `9203d73db`: master is its own fixpoint, the candidate is its own
+fixpoint, and the candidate seed compiling the pinned master source reproduces master's
+fixpoint byte for byte. All 3,045 `tests/cases/**` modules are identical under both seeds —
+2,486 byte-for-byte, 559 refused with identical text, 0 differences. `regress.py` moved no
+cell and `--verify-fresh` is clean; `rep-fuzz-check.sh` is exact; the seed grows 1,884
+bytes (+0.085%).
+
+**What is left, named.**
+
+* **The ~11 `nameIsArray` walks per ladder call are still there**, they are just paid 13×
+  less often. On the two outliers what remains is 8,067 and 20,259 calls, which is noise;
+  on a self-compile it is 1.26 M, and taking it still needs span-taking or already-cut
+  variants in `tyname.vl`, or item 12's destringify.
+* **The renderer, not the scanner, is what the second outlier now spends on**:
+  `tyToNameGo` 22.96% self, `tyToEmitNameAt` 59.42% inclusive, `__str_concat__` 12.27%.
+  That is a rendered name being rebuilt per ask rather than a scan being repeated, so it is
+  a different fix from anything in §G.
+* **The index is keyed on the SPELLING, so two arenas that render one name share a row.**
+  That is sound only because the generation covers the arena; a future caller that wants an
+  answer to outlive a generation needs an arena-keyed index, not this one.
