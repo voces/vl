@@ -10458,6 +10458,11 @@ export function ifExprRefKind(ifIx: i32, fnIx: i32): VKind | null {
   // A map join's blocktype selects this value-shape's `$mapStruct`, so the slot is the
   // map shape (`ifExprRefSlot`'s map arm), not a struct-table index.
   if exprMap(tv, fnIx) { return "map" }
+  // A concrete union ARM join: its heap type is `uVarHeap`, which the struct rung cannot
+  // name. A program that also declares the union classifies the arm value as a variant, so
+  // `structIndexOfExpr` answers -1 and the ladder fell through to the numeric blocktype over
+  // a ref value (D1668). Ahead of the struct rung for the reason the nullable half says.
+  if exprVariantIndex(tv, fnIx) >= 0 { return "variant" }
   if structIndexOfExpr(tv, fnIx) >= 0 { return "struct" }
   // An object literal arm in a struct-typed context (return / binding seeds
   // `pendingStructIdx`) has no self-derivable struct index.
@@ -10500,7 +10505,13 @@ export function ifExprRefSlot(ifIx: i32, fnIx: i32, kind: VKind) {
   const tv = ifRepArmValueIx(ifIx)
   // A nullable-variant join: the row is the arm's own `uVarHeap` index. Without it the
   // struct arm below would claim the value and `fbValtype` would floor with no interned shape.
-  if kind == "variant" { return nulVariantIdxOfExpr(tv, fnIx) }
+  if kind == "variant" {
+    // The non-null resolver first: `nulVariantIdxOfExpr` answers only for a `T | null` arm,
+    // and the two rungs of `ifExprRefKind` that ask for this kind are exactly those two cases.
+    const dvi = exprVariantIndex(tv, fnIx)
+    if dvi >= 0 { return dvi }
+    return nulVariantIdxOfExpr(tv, fnIx)
+  }
   if kind == "struct" {
     const si = structIndexOfExpr(tv, fnIx)
     if si >= 0 { return si }
@@ -23685,7 +23696,39 @@ export function exprVariantIndex(exprIx: i32, fnIx: i32) {
       return exprVariantIndex(e.binRight, fnIx)
     }
   }
+  // An if-EXPRESSION whose every arm denotes ONE union row — the variant twin of
+  // `exprStruct`'s own `IfStmt` arm. Arms denoting DIFFERENT rows join to the union BOX,
+  // which `emitUnionCoerce`'s if-value path builds, so answering a concrete row for those
+  // would store a raw variant ref into a box cell (D1668).
+  if e is IfStmt {
+    const ivi = ifThenValueIx(exprIx)
+    if ivi >= 0 {
+      const tvi = exprVariantIndex(ivi, fnIx)
+      if tvi >= 0 {
+        if ifArmsAllVariantIdx(exprIx, fnIx, tvi) { return tvi }
+      }
+    }
+  }
   -1
+}
+
+// Does every arm of the if-expression at `ifIx` — an `else if` chain included — denote the
+// union row `vi`? False for an else-less `if`, whose missing arm is `null` and whose join is
+// the nullable niche, not this row.
+function ifArmsAllVariantIdx(ifIx: i32, fnIx: i32, vi: i32): boolean {
+  const s = P.nodes[ifIx]
+  if s is IfStmt {
+    const tv = ifArmValueExpr(s.ifThen)
+    if tv < 0 { return false }
+    if exprVariantIndex(tv, fnIx) != vi { return false }
+    if s.ifElse < 0 { return false }
+    const els = P.nodes[s.ifElse]
+    if els is IfStmt { return ifArmsAllVariantIdx(s.ifElse, fnIx, vi) }
+    const ev = ifArmValueExpr(s.ifElse)
+    if ev < 0 { return false }
+    return exprVariantIndex(ev, fnIx) == vi
+  }
+  false
 }
 
 // The union-variant table index a module global's cell holds, or -1 — the global sibling
