@@ -47,7 +47,7 @@ to 3 for anything that does run a full census block.
 
 **`scripts/gate.sh` runs the whole ladder and is the thing to run.** Every gate below is
 independent once the seed is built, so it fans them out and reports a per-gate table of wall
-time, CPU seconds and exit code. Twenty-four gates (25 on master); measured 2026-09-05 on a
+time, CPU seconds and exit code. Twenty-five gates (26 on master); measured 2026-09-05 on a
 box at load 27, the wall clock was **79.8 s**, set by `distilled corpus` alone at 79.8 s with
 `ci-native` next at 55.5 s — everything else finishes in well under a minute in parallel. The
 table has been per gate since #2564 (before that it read elapsed-to-report, and the old "68
