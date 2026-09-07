@@ -209,7 +209,9 @@ class Plan:
 
 
 def status_line(body):
-    """The row's first `**bold**` line — the grader's own rule, wrap included."""
+    """The row's first `**bold**` line — the grader's own rule, wrap included. The join runs
+    to the closing `**` and is bounded by the paragraph, through the grader's own
+    `status_join_continues`, so this and the grader cannot answer differently."""
     lines = body.split("\n")
     for i, ln in enumerate(lines):
         if not ln.startswith("**"):
@@ -217,12 +219,12 @@ def status_line(body):
         if ln.rstrip().endswith("**") and len(ln.rstrip()) > 2:
             return ln.strip("*").strip()
         parts = [ln]
-        for k in range(i + 1, min(i + 6, len(lines))):
+        for k in range(i + 1, len(lines)):
+            if not R.status_join_continues(lines[k]):
+                break
             parts.append(lines[k])
             if lines[k].rstrip().endswith("**"):
                 return " ".join(parts).strip("*").strip()
-            if not lines[k].strip():
-                break
         return None
     return None
 

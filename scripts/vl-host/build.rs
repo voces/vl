@@ -68,6 +68,11 @@ fn main() {
     // invocation would cost a visible slice of the very latency the cache exists to
     // remove. FNV-1a: no dependency, and the key only has to be stable and
     // collision-free across seeds, not cryptographic.
+    //
+    // This is NOT why an `embed-seed` build recompiles when the seed changes — that is
+    // the `rerun-if-changed` below, which cargo resolves by mtime, and which cannot go:
+    // the seed is `include_bytes!`d, so a changed seed MUST rebuild. Moving this key to
+    // run time was measured and changes nothing (perf-program.md §20).
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in &bytes {
         h ^= *b as u64;
