@@ -421,6 +421,20 @@ export type WasmChecker = {
     character: number,
   ) => Promise<string | undefined>;
   /**
+   * Hover DOCS (D9.11): the `///` block written directly above the declaration the
+   * name under the cursor resolves to, joined with newlines — a use shows its
+   * declaration's docs, not the docs above the use. undefined when the declaration
+   * carries none, which is also the answer for a `//` comment and for a block a blank
+   * line separates from the declaration, and when the seed predates the export.
+   */
+  docAt: (
+    source: string,
+    entryKey: string,
+    read: ModuleReader,
+    line: number,
+    character: number,
+  ) => Promise<string | undefined>;
+  /**
    * Semantic tokens (Stage 2): every classified IDENTIFIER occurrence in the
    * document (binding kind + declaration flag + span). Empty when the seed
    * predates the token exports — the host then falls back to its TS pass.
@@ -1203,6 +1217,24 @@ export const createWasmChecker = (
     const len = exp.typeAliasAt(line + 1, character);
     if (len <= 0) return undefined;
     return readString(len, (j) => exp.typeAliasCharAt(j));
+  };
+
+  const docAt = async (
+    source: string,
+    entryKey: string,
+    read: ModuleReader,
+    line: number,
+    character: number,
+  ): Promise<string | undefined> => {
+    const exp = instantiate();
+    if (exp === undefined || !speaksAbi(exp) || !hasSymbols(exp) ||
+      typeof exp.docAt !== "function") {
+      return undefined;
+    }
+    await ensurePrepared(exp, source, entryKey, read);
+    const len = exp.docAt(line + 1, character);
+    if (len <= 0) return undefined;
+    return readString(len, (j) => exp.docCharAt(j));
   };
 
   // The token exports ride the same Stage-2 seed as the symbol exports; an older
@@ -2023,6 +2055,7 @@ export const createWasmChecker = (
     memberTypeAt,
     signatureAt,
     typeAliasAt,
+    docAt,
     tokensAt,
     memberTokensAt,
     lexicalTokensAt,
