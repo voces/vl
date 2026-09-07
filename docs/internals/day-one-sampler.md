@@ -105,15 +105,32 @@ Crossed with a **SOURCE** dimension — where the value comes from: a literal, a
 index read, a field read, a map read, a `??`. Not interchangeable at the emitter: D1476
 needs a projection specifically, and a call initialiser runs.
 
+**MIXED-WIDTH arithmetic is a READ, not an axis**, for `match`'s reason one level down: a
+read composes with every axis above, so eleven of them cross the whole grammar at once,
+where an axis could only ever pair a widening against a widening. `numWidensName` allows
+exactly three lossless edges — `i32 -> i64`, `i32 -> f64`, `f32 -> f64` — and each read
+tags itself with the edge it exercises, so the report can say `widen_i32->f64` rather than
+counting agreements it cannot attribute. Every operand is a LITERAL, so no read adds a
+declaration and the scalar records keep declining `named_vs_inline` exactly as before. The
+`f32 -> f64` edge needed a new record: there is no f32 literal, so an f32 value has to come
+from an annotated return, which is also why that record has no `expr`.
+
+**Each mixed read has a same-width CONTROL beside it** (`same_add`, tagged `widen_same`), on
+the same record and in the same positions. A table of mixed pairs alone cannot tell a
+widening defect from a defect the record has at any width; the control is what makes
+`0 of 381` a statement about widening.
+
 ## What it CANNOT sample
 
 Stated plainly, because a zero from an instrument is only as good as its frame.
 
 * **Anything outside the grammar.** Seventeen value shapes, six sources, nine delivery
   positions, six scopes, five neighbours; the module axis adds twenty-four units and nine
-  reports, and the imports axis twelve std modules. No operator overloading, no i32/f64
-  mixed arithmetic, no strings beyond `+`/`.length`. Generics reach TWO parameters
-  (`pass2<A, B>`) and no further.
+  reports, and the imports axis twelve std modules. No operator overloading, no strings
+  beyond `+`/`.length`. Generics reach TWO parameters (`pass2<A, B>`) and no further.
+  Mixed-width arithmetic reaches only the three LOSSLESS edges and only with a literal on
+  one side; the lossy edges the design refuses are graded by hand (D1890), because both
+  faces of a pair refuse them together.
 
   **RECURSIVE types are in the grammar and bring their own limit**: `Node` (self-recursive
   through a nullable field), `Tree` (through a list) and the mutually-recursive `Leaf`/`Branch`
@@ -428,6 +445,34 @@ tree (`--jobs 6`, `--jobs 2` twice) all said `0 pair(s) over 3.0x`, but the wors
 between **1.13 and 1.36** and which pair was worst changed each time — a min of three builds
 on a shared box still carries the neighbours' load. The bar is 3× for that reason: it is set
 to catch an 86, not to rank a 1.2.
+
+## The mixed-width reads — 381 pairs, 0 disagreements, and the gap they did not find
+
+Eleven reads over four scalar records (`i32`, `i64`, `f64` and the new `f32`), at seeds
+601-608, 800 programs each:
+
+| | pairs | AGREE-RUNS | DISAGREE | BOTH-FAIL-SAME | BOTH-FAIL-DIFFER |
+| --- | --- | --- | --- | --- | --- |
+| before, whole sample | 3,200 | 3,037 | 75 | 78 | 10 |
+| after, whole sample | 3,200 | 3,058 | 62 | 64 | 16 |
+| after, on a mixed-width read | 381 | **381** | 0 | 0 | 0 |
+
+The whole-sample movement is the RNG stream re-shuffling, not a result: adding reads changes
+which programs each seed draws. The row that carries the finding is the third, and it splits
+`widen_i32->i64` 112, `widen_i32->f64` 90, `widen_same` 126, `widen_f32->f64` 30,
+`widen_lit->f32` 23 — every one at zero, across six delivery axes (117
+`annotated_vs_inferred`, 69 `scenery`, 62 `pinning`, 57 `scope`, 42 `fusion`, 34
+`init_vs_assign`). The three lossless edges are delivered correctly at every position the
+grammar reaches, and the control column is what makes that a statement about widening.
+
+**The gap is on the edges a pair cannot see.** A program the design refuses fails in BOTH
+faces, so the sampler reports it as a both-fail and never as a hit. Running the refused
+edges by hand — seven delivery positions over eight literal/target cells — found one row
+that should not refuse: `const a: f64 = 2147483648` is a `loud check reject` while `const a:
+f32 = 2147483648` runs, because the f32 target has an exactness-gated literal-adoption
+predicate and the f64 target rides the `i32 -> f64` lattice edge alone (D1890). The refused
+VALUE edges (`i64 -> f64`, `i32 -> f32`, every narrowing) refuse uniformly at all seven
+positions and are the design's rule, not a hole.
 
 ## Running it
 
