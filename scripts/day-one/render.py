@@ -114,8 +114,12 @@ def pick_plan(rng, axis_id=None):
             continue
         if src.get("no_nullable") and "nullable" in val["features"]:
             continue
+        sp = _weighted(rng, [x for x in G.SECOND_PIN
+                             if x["expr"] is not None or val["alt"]])
+        if sp is None:
+            return None
         plan = {"value": val, "read": read, "position": pos, "scenery": sc,
-                "source": src}
+                "source": src, "second_pin": sp}
         axes = applicable_axes(plan)
         if not axes:
             continue
@@ -134,7 +138,8 @@ def base_faces(rng, plan, axis):
         "annotated_vs_inferred": rng.choice(["annotated", "inferred"]),
         "narrowing": plan["read"]["id"],
         "fusion": "bound",
-        "pinning": rng.choices(["direct", "generic", "hole"], weights=[6, 2, 2])[0],
+        "pinning": rng.choices(["direct", "generic", "hole", "generic2"],
+                               weights=[6, 2, 2, 2])[0],
         "scope": pos.get("fixed_scope") or ("module" if pos["wraps"]
                                             else _weighted(rng, G.SCOPES)["id"]),
         "scenery": rng.choice(["bare", "neighbour"]),
@@ -165,7 +170,7 @@ def flip(rng, plan, axis, faces):
         opts = [s["id"] for s in G.SCOPES]
         return tuple(rng.sample(opts, 2))
     if aid == "pinning":
-        return "direct", rng.choice(["generic", "hole"])
+        return "direct", rng.choice(["generic", "hole", "generic2"])
     if aid == "named_vs_inline" and plan["read"].get("named_only"):
         # ASYMMETRIC: `is Rect` has no inline twin. Grade the twinless spelling
         # against the nearest legal one — on RUNS-ness, not on output.
@@ -231,6 +236,14 @@ def render(plan, faces):
     elif faces["pinning"] == "hole":
         decls.append("function passh(x) { return x }")
         expr = "passh(" + expr + ")"
+    elif faces["pinning"] == "generic2":
+        sp = plan["second_pin"]
+        # `same` binds BOTH holes to this value's own rep, through its `alt`. It is the
+        # control for the rest of the table: a defect needing the two to DIFFER agrees here.
+        second = sp["expr"] if sp["expr"] is not None else val["alt"]
+        decls.extend(sp["decls"])
+        decls.append("function pass2<A, B>(a: A, b: B): A { return a }")
+        expr = "pass2(" + expr + ", " + second + ")"
 
     body = _deliver(plan, faces, ty, expr, read, ann, decls, stmts)
     src = head + decls + body
@@ -398,7 +411,7 @@ def spec_of(plan):
     minimiser ablate by axis instead of only by line."""
     return {"value": plan["value"]["id"], "read": plan["read"]["id"],
             "position": plan["position"]["id"], "scenery": plan["scenery"]["id"],
-            "source": plan["source"]["id"]}
+            "source": plan["source"]["id"], "second_pin": plan["second_pin"]["id"]}
 
 
 def plan_of(spec):
@@ -408,7 +421,9 @@ def plan_of(spec):
             "position": next(p for p in G.POSITIONS if p["id"] == spec["position"]),
             "scenery": next(s for s in G.SCENERY if s["id"] == spec["scenery"]),
             "source": next(s for s in G.SOURCES
-                           if s["id"] == spec.get("source", "literal"))}
+                           if s["id"] == spec.get("source", "literal")),
+            "second_pin": next(s for s in G.SECOND_PIN
+                               if s["id"] == spec.get("second_pin", "i32"))}
 
 
 def render_spec(spec, faces):
@@ -455,7 +470,9 @@ def make_pair(rng, axis_id=None):
         "compare": "grade+output" if wantA == wantB else "grade",
         "features": sorted(set(plan["value"]["features"]) |
                            {plan["position"]["id"], plan["read"]["id"],
-                            fa["scope"]}),
+                            fa["scope"]} |
+                           ({"pin2_" + plan["second_pin"]["id"]}
+                            if "generic2" in (fa["pinning"], fb["pinning"]) else set())),
         "delta": delta(axis, fa, fb, plan, srcA, srcB),
     }
 

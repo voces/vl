@@ -325,6 +325,32 @@ SCENERY = [
 ]
 
 # ---------------------------------------------------------------------------
+# THE SECOND HOLE of a two-parameter generic. `pass<T>` binds ONE hole, so a defect that
+# needs two holes bound to DIFFERENT reps in one instance is out of frame however many
+# values the table holds — #2854's lesson, where a grid that never bound its hole at all
+# graded 46 of 46 green beside a check-clean invalid wasm. Each entry is the SECOND
+# argument, and the delivered value is the first; the rep classes are the ones that
+# disagree at the emitter (scalar / string / ref / list / nullable / f64).
+# ---------------------------------------------------------------------------
+
+SECOND_PIN = [
+    {"id": "i32", "weight": 3, "expr": "1", "decls": []},
+    {"id": "string", "weight": 3, "expr": '"s"', "decls": []},
+    {"id": "f64", "weight": 2, "expr": "1.5", "decls": []},
+    {"id": "boolean", "weight": 2, "expr": "true", "decls": []},
+    {"id": "list", "weight": 2, "expr": "[1]", "decls": []},
+    {"id": "struct", "weight": 2, "expr": "{ q: 1 }", "decls": []},
+    # A NULLABLE second hole, which is the pairing the single-parameter pin can never make:
+    # one instance whose two holes are a bare rep and a niche.
+    {"id": "nullable", "weight": 2, "expr": "nulOf()",
+     "decls": ["function nulOf(): i32 | null { return 2 }"]},
+    # The CONTROL of the set: both holes bound to the SAME rep, spelled with the value's own
+    # `alt`. A defect that needs the two to DIFFER agrees here, so an all-differing table
+    # could not tell "two holes disagree" from "two holes at all". `expr` is filled at render.
+    {"id": "same", "weight": 3, "expr": None, "decls": []},
+]
+
+# ---------------------------------------------------------------------------
 # AXES — the unit of generation is a PAIR, and this is what the pair varies.
 # Order is expected yield. `pins` forces another axis's face so the pair differs
 # in exactly one thing; `needs` names what a plan must offer for the axis to apply.
@@ -337,8 +363,11 @@ AXES = [
      "faces": ["annotated", "inferred"], "pins": {"fusion": "bound"}},
     {"id": "narrowing", "weight": 4, "faces": ["*"], "needs": "narrow_group"},
     {"id": "fusion", "weight": 3, "faces": ["fused", "bound"], "needs": "fusible"},
-    {"id": "pinning", "weight": 3, "faces": ["direct", "generic", "hole"],
-     "needs": "pinnable"},
+    # `generic2` is the TWO-parameter pin: `pass2<A, B>(a: A, b: B): A`, whose second hole
+    # is bound to a rep from `SECOND_PIN` while the first carries the delivered value. A
+    # one-parameter pin cannot express two holes disagreeing inside one instance.
+    {"id": "pinning", "weight": 3,
+     "faces": ["direct", "generic", "hole", "generic2"], "needs": "pinnable"},
     {"id": "scope", "weight": 3, "faces": ["module", "function", "fn_block",
                                            "module_block"], "needs": "free_scope"},
     {"id": "scenery", "weight": 3, "faces": ["bare", "neighbour"]},
