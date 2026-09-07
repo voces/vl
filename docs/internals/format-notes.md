@@ -316,10 +316,27 @@ Three consequences worth stating, because each is a decision and not a fall-out:
   element test reads the TOKEN stream (one literal token, or a sign and one) rather than
   laddering the node kinds.
 
-A comment inside the brackets pins its row: the literal is reproduced from source through
-`sliceFallback`, the same verbatim anchor `ifExpr` takes, so no reflow can move it (D1776).
-An object literal and a call argument list still eject one — that is D1777, deliberately not
-widened to here.
+## a comment in a bracketed list's PUNCTUATION pins its row
+
+All three bracketed lists — a list literal, an object literal and a call's argument list —
+reproduce themselves from source when a comment sits in their own punctuation, through
+`sliceFallback` / `sliceSpanFallback`, the verbatim anchor `ifExpr` takes for the same reason
+(D1776, D1777). `markVerbatim` records the span, so the placement helpers skip the comments
+inside it rather than re-emit them one construct later.
+
+```text
+The span tested is the GAPS between the items — before the first, between two,
+after the last — and NOT the whole node. An item renders itself and hosts its
+own comments (a block-bodied lambda flushes them through `blockExpr`), so a
+whole-span test freezes a construct that has no defect. `commentInListGaps`.
+```
+
+* **A call's anchor is the ARGUMENT LIST, not the call.** The callee is already rendered into
+  `head`, and the node's span reaches back over a whole receiver chain, so `callTail` slices
+  `[callArgOpenAt(node, ix), nodeEndOf(ix))` and leaves the chain layout untouched.
+* **An `import { … }` name list is not in the family.** `fmtImport` has its own verbatim path
+  for a comment-bearing list, which is what keeps such an import byte-exact — see the section
+  above.
 
 ## the token-recovered declarations — `import`, a re-export, and `extern function`
 

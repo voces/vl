@@ -207,6 +207,13 @@ export type Point = { x: f64, y: f64 }
   feature: the export's public type is the readable view, the module keeps the
   writable view. **A9 is unstarted (⬜)**, so encapsulated exports are gated on it;
   this design does **not** invent a parallel module-only readonly mechanism.
+  **One constructor now has the view, and it is not the boundary rule.** `readonly T[]`
+  shipped 2026-09-06 (D1686/D1687): a covariant, shallow, read-only LIST view, written by
+  hand at any type position. An exported `readonly T[]` therefore already gives importers a
+  list they cannot grow. That is a spelling, not the boundary mechanism — it says nothing
+  about a map, a struct, or an export whose public and private types differ — so encapsulated
+  exports stay gated on A9, which would generalise the split over every constructor and infer
+  it rather than requiring the marker.
 - Re-exports (`export … from`) are **deferred** (not needed to unblock H3).
 
 **Import — named imports, one line, from a specifier:**
