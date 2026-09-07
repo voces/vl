@@ -964,6 +964,11 @@ const NAR_KIND_GUARD = 1
 // union. A third kind, so `narGuardSlot` and dead-`??` keep seeing exactly the rows they had.
 const NAR_KIND_POSTGUARD = 2
 let narFnEpoch = 0
+// Bare names a write re-narrowed AWAY from the narrowing that covered them. A post-guard
+// residual claims the fall-through path holds the else narrowing, and an arm that wrote a
+// different member falsifies exactly that claim — which under the reads-only rule no type
+// check on the write itself can catch (D1736).
+let narClobKeys: string[] = []
 let asgDeclKeys: string[] = []
 let asgDeclTys: i32[] = []
 let asgDeclDepths: i32[] = []
@@ -1002,6 +1007,17 @@ function narDeclaredTy(name: string, kind: i32) {
 
 // The declared type of an assignment-narrowed name, or -1.
 function asgDeclaredTy(name: string) { narDeclaredTy(name, NAR_KIND_ASG) }
+
+// Did a write at or after `mark` re-narrow `name` away from its narrowing? `checkIfStmtNode`
+// asks it of its own subtree before handing a residual down (D1736).
+function narClobberedSince(mark: i32, name: string) {
+  let i = mark
+  while i < narClobKeys.length {
+    if narClobKeys[i] == name { return true }
+    i = i + 1
+  }
+  false
+}
 
 // The bank slot of the live guard-kind narrowing of `name`, or -1. Retirement writes through
 // this slot, so it must find exactly the entry `narDeclaredTy` reads.
@@ -2588,6 +2604,13 @@ let isParentTyIx: i32[] = []
 // (`setNarrowFromCond` and `setNarrowFromCondElse`) that never run together for one branch, so a
 // flag would be set by whichever site asked last.
 let isParentElseTyIx: i32[] = []
+// D1736 — the re-narrow sidecar: at an assignment whose accepted write retired the target's
+// narrowing, the type the bare name reads at afterwards. Keyed by the assignment node, sized
+// with `isVarTyIx`, read through `asgNarTyIxOf`; -1 means the read is at the declared type.
+let asgNarTyIx: i32[] = []
+// D1736 — the post-guard residual's veto, keyed by the `if` node: 1 when an arm wrote a
+// different member into a name the residual would describe, so neither half installs it.
+let pgVoid: i32[] = []
 // Context-resolved type sidecar, parallel to `nodeTyIx`: at the arena-pure adoption sites it
 // records the destination type a literal node widened into, which is the rep the emitter builds.
 // `nodeTyIx` keeps the checker's self-inferred type for its existing consumers; the emitter's rep
@@ -3463,6 +3486,8 @@ export function initChecker() {
   optCallRetTy = []
   optCallRetName = []
   isVarTyIx = []
+  asgNarTyIx = []
+  pgVoid = []
   isParentTyIx = []
   isParentElseTyIx = []
   nodeRepTyIx = []
@@ -3575,6 +3600,7 @@ export function initChecker() {
   asgDstStack = []
   tyToStrDepth = 0
   asgDeclKeys = []
+  narClobKeys = []
   asgDeclTys = []
   asgDeclDepths = []
   asgDeclKinds = []
@@ -4627,8 +4653,8 @@ function writeBarredErr(place: string, at: i32) {
     "'" +
       place +
       "' was narrowed by a guard OUTSIDE this loop, so this write would leave the " +
-      "reads before it reading null on the next iteration — move the write out of " +
-      "the loop, or make the guard on '" +
+      "reads before it reading the old narrowing on the next iteration — move the " +
+      "write out of the loop, or make the guard on '" +
       place +
       "' the loop's own condition",
     at,
@@ -4733,6 +4759,10 @@ function retireNarrowingsForWrite(tgtIx: i32, rt: i32, atIx: i32) {
     // what `pathRetiredByAssign` reads to decide whether the emitter can see the retirement.
     if writeRetiresNarrowing(tgtKey, rt, npKeys[i], npTys[i]) {
       npInvBy[i] = atIx
+      // The target's OWN narrowing going is what the emitter has to mirror; a path below it
+      // goes through the prefix rule both sides already apply. A retired path reads at its
+      // declared type, which is what `writeStorageTy` hands back here (D1736).
+      if npKeys[i] == tgtKey { recordAsgNarTyIx(atIx, writeStorageTy(tgtIx)) }
     }
     i = i + 1
   }
@@ -4742,14 +4772,51 @@ function retireNarrowingsForWrite(tgtIx: i32, rt: i32, atIx: i32) {
     const dcl = narDeclaredTy(nm, -1)
     if dcl >= 0 {
       if writeRetiresNarrowing(nm, rt, nm, lookup(nm)) {
-        // The declared type goes back into the scope the narrowing shadowed, so a later write to
-        // the same name is checked against the storage again.
+        // The RETIREMENT goes back in place, so it outlives whatever inner block holds the
+        // write: a narrowing the write falsified must not resurrect at that block's `}`.
         const d = lookupDepth(nm)
         if d >= 0 { T.scopes[d][nm] = dcl }
+        // The RE-NARROW — the one member of the declaration the written value can be — is a
+        // shadow in the CURRENT block instead, because that is exactly how long the emitter's
+        // own push lives (its `restoreNarrow` unwinds at the same `}`). Banked at the
+        // assignment node so both halves lower the reads after the write alike (D1736).
+        const rn = writeReNarrowTy(dcl, rt)
+        if rn != dcl {
+          noteNarShadow(nm, dcl, NAR_KIND_GUARD)
+          declare(nm, rn)
+        }
+        recordAsgNarTyIx(atIx, rn)
+        narClobKeys.push(nm)
       }
     }
   }
   0
+}
+
+// The type a bare name reads at after an accepted write retired its narrowing: the sole member
+// of its declared type the written value is assignable to. The declared type when the write
+// names no single member, which keeps every null-bearing write reading at the declaration —
+// the rep the emitter's own retirement leaves in place (D1736).
+function writeReNarrowTy(dcl: i32, rt: i32) {
+  if rt < 0 || dcl < 0 { return dcl }
+  if isNullTy(rt) { return dcl }
+  const rtT = T.tys[rt]
+  if rtT is TyNullable { return dcl }
+  const d = T.tys[dcl]
+  if d is TyUnion {
+    let hit = -1
+    let n = 0
+    let i = 0
+    while i < d.uMembers.length {
+      if assignable(rt, d.uMembers[i]) {
+        hit = d.uMembers[i]
+        n = n + 1
+      }
+      i = i + 1
+    }
+    if n == 1 { return hit }
+  }
+  dcl
 }
 
 // Mark every live narrowing the call at `callIx` invalidates. Runs after the call's own arguments
@@ -24544,6 +24611,7 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
   // be retired behind the capture's back. `narFnEpoch` is how the write side tells the two
   // apart (`writeStorageTy`).
   narFnEpoch = narFnEpoch + 1
+  narClobKeys = []
   // Check the body in a fresh scope sharing the parameters.
   pushScope(n.fnBody)
   // Paired with the `flushInferRetHoles` below, which must run while this scope is still
@@ -27657,6 +27725,8 @@ export function checkProgram(rootIx: i32) {
   isVarTyIx = []
   isParentTyIx = []
   isParentElseTyIx = []
+  asgNarTyIx = []
+  pgVoid = []
   cFuncPinTyIx = -1
   cObjPinTyIx = -1
   nodePinKind = []
@@ -27667,6 +27737,7 @@ export function checkProgram(rootIx: i32) {
     isVarTyIx.push(-1)
     isParentTyIx.push(-1)
     isParentElseTyIx.push(-1)
+    asgNarTyIx.push(-1)
     ntz = ntz + 1
   }
   checkExternDecls()
@@ -28296,6 +28367,38 @@ export function isVarTyIxOf(ix: i32) {
     if ix < isVarTyIx.length { return isVarTyIx[ix] }
   }
   -1
+}
+// The type the assignment at node `ix` re-narrows its bare-name target to, or -1 when the
+// write retired no narrowing and the reads after it are at the declared type. The emitter's
+// half of the reads-only rule: it pushes the member this names (D1736).
+export function asgNarTyIxOf(ix: i32) {
+  if ix >= 0 {
+    if ix < asgNarTyIx.length { return asgNarTyIx[ix] }
+  }
+  -1
+}
+// Bank `asgNarTyIxOf`'s answer at the assignment node.
+function recordAsgNarTyIx(ix: i32, ty: i32) {
+  if ix < 0 || ty < 0 { return 0 }
+  while asgNarTyIx.length <= ix { asgNarTyIx.push(-1) }
+  asgNarTyIx[ix] = ty
+  0
+}
+// Did the post-guard residual of the `if` at node `ix` drop, because an arm wrote a
+// different member into a name it narrows? The emitter pushes nothing for such an `if`, so
+// the reads after it stay at the declared rep the checker left them at (D1736).
+export function pgResidualVoidOf(ix: i32) {
+  if ix >= 0 {
+    if ix < pgVoid.length { return pgVoid[ix] == 1 }
+  }
+  false
+}
+// Bank `pgResidualVoidOf`'s answer at the `if` node.
+function recordPgResidualVoid(ix: i32) {
+  if ix < 0 { return 0 }
+  while pgVoid.length <= ix { pgVoid.push(0) }
+  pgVoid[ix] = 1
+  0
 }
 // The type the receiver of a member-path `is` test narrows to in the then branch — the
 // discriminant rule's answer, banked at the `is` node. -1 when the test does not discriminate
@@ -31727,20 +31830,15 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
         }
       }
     }
-    // A place accepts its storage type, not its current flow (narrowed) type — a narrowing
-    // must never shrink what the storage can hold, so a write is checked against storage.
+    // Narrowing applies to READS: a place accepts its storage type, never its current flow
+    // (narrowed) type, so every write is checked against storage and may flip the variant (D1736).
     let asgLt = lt
     let asgBarred = false
-    const rtN = T.tys[rt]
-    let rhsNullBearing = isNullTy(rt)
-    if rtN is TyNullable { rhsNullBearing = true }
-    if rhsNullBearing {
-      const asgDcl = writeStorageTy(n.binLeft)
-      if asgDcl >= 0 {
-        asgLt = asgDcl
-      } else {
-        asgBarred = writeBarredByLoop(n.binLeft)
-      }
+    const asgDcl = writeStorageTy(n.binLeft)
+    if asgDcl >= 0 {
+      asgLt = asgDcl
+    } else {
+      asgBarred = writeBarredByLoop(n.binLeft)
     }
     // A plain assignment pins the source's open holes, exactly as an annotated let-init, call
     // argument, or typed return already does — runs before `assignableExpr` so the pin applies first.
@@ -33044,6 +33142,8 @@ function checkIfStmtNode(n: IfStmt, ix: i32) {
   const isElseArm = ix >= 0 && ix == pgUpArmIx
   pgUpArmIx = -1
   const pgUpMark = pgUpKeys.length
+  // What this `if`'s own subtree writes; read by the post-guard leg below (D1736).
+  const clobMark = narClobKeys.length
   // An `if`/`else` in value position is an expression whose value is the join of its branch
   // tail values — capture whether THIS `if` sits in the function's return-tail position.
   const ifTail = retTailPos
@@ -33212,7 +33312,12 @@ function checkIfStmtNode(n: IfStmt, ix: i32) {
     while gi2 < enNames.length {
       const gKey = enNames[gi2]
       const gTy = enTys[gi2]
-      if isPathKey(gKey) {
+      if narClobberedSince(clobMark, gKey) {
+        // An arm on the fall-through path wrote a different member into `gKey`, so the
+        // residual would describe a value the place does not hold. Both halves drop it: the
+        // emitter reads `pgResidualVoidOf` at the same node (D1736).
+        recordPgResidualVoid(ix)
+      } else if isPathKey(gKey) {
         // Paths keep the no-`else` gate, and an else arm never hands one up either — an
         // `npKeys` entry is retired in place by a call/write inside the arm.
         if !daHasElse && !isElseArm {
@@ -33249,8 +33354,12 @@ function checkIfStmtNode(n: IfStmt, ix: i32) {
       let pu = pgUpKeys.length
       while pu > pgUpMark {
         pu = pu - 1
-        noteNarShadow(pgUpKeys[pu], lookup(pgUpKeys[pu]), NAR_KIND_POSTGUARD)
-        declare(pgUpKeys[pu], pgUpTys[pu])
+        if narClobberedSince(clobMark, pgUpKeys[pu]) {
+          recordPgResidualVoid(ix)
+        } else {
+          noteNarShadow(pgUpKeys[pu], lookup(pgUpKeys[pu]), NAR_KIND_POSTGUARD)
+          declare(pgUpKeys[pu], pgUpTys[pu])
+        }
       }
     }
   }
@@ -34769,8 +34878,10 @@ function checkWhileStmtNode(n: WhileStmt) {
   // Definite-assignment: a loop body may run zero times, so an in-body assignment is not
   // guaranteed to reach the fall-through — check the body live, then restore the pre-loop state.
   const daLoopMark = daMark()
-  // The body is a narrowing scope like an `if` then-arm, re-tested every iteration. Only a
-  // null strip re-narrows (never an `is T` pin), and only bare names (property paths can alias).
+  // The body is a narrowing scope like an `if` then-arm, re-tested every iteration — an `is T`
+  // pin as much as a null strip, since narrowing is a rule about reads and the write that flips
+  // the variant is checked against the declaration (D1736). Bare names only: a property path can
+  // alias, and the emitter's loop push declines one for the same reason.
   const wnNames: string[] = []
   const wnTys: i32[] = []
   collectThenNarrows(n.whileCond, wnNames, wnTys)
@@ -34779,10 +34890,8 @@ function checkWhileStmtNode(n: WhileStmt) {
   let wi = 0
   while wi < wnNames.length {
     if !isPathKey(wnNames[wi]) {
-      if wnTys[wi] == nonNullTy(lookup(wnNames[wi])) {
-        wbNames.push(wnNames[wi])
-        wbTys.push(wnTys[wi])
-      }
+      wbNames.push(wnNames[wi])
+      wbTys.push(wnTys[wi])
     }
     wi = wi + 1
   }
