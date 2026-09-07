@@ -55,6 +55,7 @@ import {
   TyVar,
   annUnionAtomsOf,
   anyLitUnionUsed,
+  asgNarTyIxOf,
   cUserTypesVer,
   canonRewroteNode,
   canonTyIxOf,
@@ -151,6 +152,7 @@ import {
   numLitUnionBaseName,
   numLitUnionBaseTy,
   numLitUnionHasBase,
+  pgResidualVoidOf,
   pinnedHoleTyOf,
   primNameOf,
   primNameStr,
@@ -478,7 +480,6 @@ import {
   narrowNames,
   narrowRetired,
   narrowSets,
-  narrowStripNullOnly,
   narrowTop,
   narrowTys,
   narrowVariants,
@@ -12759,9 +12760,9 @@ export function setNarrowFromCond(condIx0: i32, fnIx: i32) {
   // (including the `&&`-conjunct recursion) sees the bare condition shape.
   const condIx = unwrapParen(condIx0)
   const c = P.nodes[condIx]
-  // An `is T` test pins a variant rather than stripping `null`, so a consumer that only
-  // accepts strips (the loop body — see `narrowStripNullOnly`) skips this whole block.
-  if c is IsExpr && !narrowStripNullOnly {
+  // An `is T` test pins a variant. A loop body pins one too: narrowing is a rule about
+  // READS, and the write that flips the variant is checked against the declaration (D1736).
+  if c is IsExpr {
     const recv = P.nodes[c.isObj]
     if recv is Ident {
       if exprUnion(c.isObj, fnIx) {
@@ -12833,7 +12834,7 @@ export function setNarrowFromCond(condIx0: i32, fnIx: i32) {
   if c is BinExpr {
     // `s.kind == "circle"` — the discriminant in the spelling that needs no tag alias
     // declared. Same bank, same push as the `is` arm above.
-    if c.binOp == "==" && !narrowStripNullOnly {
+    if c.binOp == "==" {
       if pushDiscrimNarrow(unwrapParen(c.binLeft), condIx, fnIx, false) {
         return true
       }
@@ -12861,8 +12862,6 @@ export function setNarrowFromCond(condIx0: i32, fnIx: i32) {
     const cn = P.nodes[condIx]
     if cn is BinExpr {
       if cn.binOp == "==" {
-        // Pinning `x` to `null` is not a strip — skipped for a strip-only consumer.
-        if narrowStripNullOnly { return false }
         pushNarrow(nm, "null")
         return true
       }
@@ -12913,8 +12912,6 @@ export function setNarrowFromCond(condIx0: i32, fnIx: i32) {
           const icn = P.nodes[condIx]
           if icn is BinExpr {
             if icn.binOp == "==" {
-              // Pinning the cell to `null` is not a strip.
-              if narrowStripNullOnly { return false }
               pushNarrow(ik, "null")
               return true
             }
@@ -12948,8 +12945,6 @@ export function setNarrowFromCond(condIx0: i32, fnIx: i32) {
     const scn = P.nodes[condIx]
     if scn is BinExpr {
       if scn.binOp == "==" {
-        // Pinning `v` to `null` is not a strip — skipped for a strip-only consumer.
-        if narrowStripNullOnly { return false }
         pushNarrow(snm, "null")
         return true
       }
@@ -13111,8 +13106,8 @@ export function setNarrowFromCondElse(condIx0: i32, fnIx: i32) {
   const condIx = unwrapParen(condIx0)
   const c = P.nodes[condIx]
   // The else of `x is null` strips null (that is how `!(e is null)` narrows); the else of
-  // `x is T` subtracts `T`, which pins a variant. A strip-only consumer keeps the former.
-  if c is IsExpr && (c.isVariant == "null" || !narrowStripNullOnly) {
+  // `x is T` subtracts `T`, which pins a variant. A loop body takes both (D1736).
+  if c is IsExpr {
     // Member path checked first, outside the `valueAtomKind` gate: `o.y is T` over a
     // union-typed struct field strips `T` from the path's current set, unboxing the
     // else-arm's `o.y`. A struct variant fails `valueAtomKind` and a `Member` isn't an
@@ -13265,7 +13260,7 @@ export function setNarrowFromCondElse(condIx0: i32, fnIx: i32) {
     // The else arm of `s.kind == "circle"`: the test being false rules out the arms whose
     // tag can only be that literal. Same banked answer, same single-survivor bound as the
     // `is` complement above.
-    if c.binOp == "==" && !narrowStripNullOnly {
+    if c.binOp == "==" {
       if pushDiscrimNarrow(unwrapParen(c.binLeft), condIx, fnIx, true) {
         return true
       }
@@ -13284,8 +13279,6 @@ export function setNarrowFromCondElse(condIx0: i32, fnIx: i32) {
     const cn = P.nodes[condIx]
     if cn is BinExpr {
       if cn.binOp == "!=" {
-        // The else of `x != null` pins `null`, not a strip.
-        if narrowStripNullOnly { return false }
         pushNarrow(nm, "null")
         return true
       }
@@ -13365,8 +13358,6 @@ export function setNarrowFromCondElse(condIx0: i32, fnIx: i32) {
     const scn = P.nodes[condIx]
     if scn is BinExpr {
       if scn.binOp == "!=" {
-        // The else of `v != null` pins `null`, not a strip.
-        if narrowStripNullOnly { return false }
         pushNarrow(snm, "null")
         return true
       }
@@ -13398,6 +13389,10 @@ export function restoreNarrow(n: i32) {
 // `return` does and are how a loop-body guard is spelled, so both are checked here too.
 export function pushPostGuardNarrow(stmtIx: i32, fnIx: i32) {
   const s = P.nodes[stmtIx]
+  // An arm that wrote a different member into a name the residual describes falsifies it,
+  // and the checker dropped it there — push nothing, or the reads after the chain lower at
+  // an arm the value left (D1736).
+  if pgResidualVoidOf(stmtIx) { return 0 }
   if s is IfStmt {
     if s.ifElse < 0 {
       if blockAlwaysReturns(s.ifThen) || blockLastStmtExits(s.ifThen) {
@@ -13422,7 +13417,7 @@ export function pushPostGuardNarrow(stmtIx: i32, fnIx: i32) {
         if chainIx >= 0 {
           const armN = P.nodes[chainIx]
           if armN is IfStmt {
-            if blockLastStmtExits(armN.ifThen) {
+            if blockLastStmtExits(armN.ifThen) && !pgResidualVoidOf(chainIx) {
               setNarrowFromCondElse(armN.ifCond, fnIx)
               chainIx = armN.ifElse
               walking = true
@@ -13445,6 +13440,10 @@ export function pushPostGuardNarrow(stmtIx: i32, fnIx: i32) {
       // assignment for an answer nothing asks for.
       const tgtIsPlace = tgt is Ident || tgt is Member || tgt is Index
       const rhsNullable = tgtIsPlace && writeRhsIsNullBearing(s.binRight, fnIx)
+      // The checker's answer for the write that FLIPS the variant: the type the target reads
+      // at afterwards, or -1 when the write left its narrowing standing (D1736). Both place
+      // arms below retire on it; only a bare name re-narrows, as the checker only re-narrows one.
+      const asgNarTy = asgNarTyIxOf(stmtIx)
       if tgt is Ident {
         const un = unionNameOfIdentSid(sidOfNode(s.binLeft), fnIx)
         // A root rebind kills its cells unconditionally — `writeRetiresNarrowing`'s prefix
@@ -13453,6 +13452,11 @@ export function pushPostGuardNarrow(stmtIx: i32, fnIx: i32) {
         retireNarrowForIndexCells(tgt.identName)
         if rhsNullable {
           retireNarrowFor(tgt.identName)
+        } else if asgNarTy >= 0 {
+          // Retire first: reading at the declaration is the right answer whenever the banked
+          // type names no single member, and the push below only sharpens it.
+          retireNarrowFor(tgt.identName)
+          pushNarrowWriteReNarrow(tgt.identName, asgNarTy, un)
         } else if un != "" && isValueUnionName(un) && unionSetHasNull(un) {
           const asid = msSetOfText(un)
           if pushNarrowComplement(tgt.identName, asid, "null") == "" {
@@ -13472,7 +13476,7 @@ export function pushPostGuardNarrow(stmtIx: i32, fnIx: i32) {
         // The cells and fields BELOW the written path go unconditionally, as the Ident arm's
         // do: a new value at `w.f` says nothing about what the old one's `w.f[0]` held.
         retireNarrowForIndexCells(mtk)
-        if rhsNullable {
+        if rhsNullable || asgNarTy >= 0 {
           if mtk != "" { retireNarrowFor(mtk) }
         }
       }
@@ -13484,7 +13488,7 @@ export function pushPostGuardNarrow(stmtIx: i32, fnIx: i32) {
         const itk = indexPathKeyOf(s.binLeft)
         if itk != "" {
           retireNarrowForIndexCells(itk)
-          if rhsNullable { retireNarrowFor(itk) }
+          if rhsNullable || asgNarTy >= 0 { retireNarrowFor(itk) }
         } else {
           const iroot = P.nodes[unwrapParen(tgt.idxArr)]
           if iroot is Ident { retireNarrowForIndexCells(iroot.identName) }
@@ -27633,6 +27637,28 @@ export function msSubNull(s: i32): i32 {
   msSetIntern(u, mask)
 }
 
+// SELECTION of one member by arena TYPE: clear every member the type is not. The write
+// half of the reads-only rule needs a member the CHECKER named, and it names it by arena
+// index — `msSubAtom`'s spelling identity cannot answer for a type with no written atom.
+export function msKeepTy(s: i32, ty: i32): i32 {
+  if s < 0 || s >= msSetRow.length { return -1 }
+  if ty < 0 { return -1 }
+  const u = msSetRow[s]
+  const st = msRowStart(u)
+  if st < 0 { return -1 }
+  const n = unMemTyCount[u]
+  let mask = msSetMask[s]
+  let i = 0
+  while i < n {
+    if msBitSet(mask, i) {
+      if !tySame(unMemTys[st + i], ty) { mask = mask - (1 << i) }
+    }
+    i = i + 1
+  }
+  if mask == 0 { return -1 }
+  msSetIntern(u, mask)
+}
+
 // SUBTRACTION of a named member: clear every member whose interned IDENTITY is the
 // removed one. `msAtomIdOf` peels grouping parens on both sides, exactly as the
 // string surgery's `peelGroupParens` comparison did, so an `is () => i64` test still
@@ -27686,6 +27712,24 @@ function pushNarrowComplement(name: string, s: i32, removed: string): string {
   if txt == "" { return "" }
   pushNarrowRep(name, txt, -1, r)
   txt
+}
+
+// The reads-only rule's emit half: an accepted write re-narrows its bare-name target to the
+// member the checker banked at the assignment node, so the reads after it lower at that
+// member's rep rather than at the retired narrowing's. True when the push happened; a
+// caller whose write named no single member retires instead (D1736).
+function pushNarrowWriteReNarrow(name: string, ty: i32, un: string): boolean {
+  if ty < 0 || un == "" { return false }
+  // The DECLARED set, never the live narrowing's: the write is checked against the
+  // declaration, so the member it lands on is one of the declaration's. An `is`-pinned slot
+  // carries no set at all (`pushNarrowIs` banks a type), which is the common case here.
+  let r = msKeepTy(msSetOfText(un), ty)
+  if r < 0 { r = msKeepTy(msSetOfText(unionMemberSetOf(un)), ty) }
+  if r < 0 { return false }
+  const txt = msTextOf(r)
+  if txt == "" { return false }
+  pushNarrowRep(name, txt, -1, r)
+  true
 }
 
 // The interned set a binding is currently narrowed to — the set-ADT reading of
