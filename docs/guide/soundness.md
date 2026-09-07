@@ -128,6 +128,13 @@ at compile time or with a trap — would break every such idiom. Only what is
 knowable at compile time is refused. A `const` binding is *not* folded, so
 `const hi = 0; for i in 3 to hi { … }` still runs zero times silently.
 
+**A NON-CONSTANT `step` follows the same rule.** The step may be any i32
+expression; it is evaluated **once**, before the loop, and its sign picks the
+exit comparison at run time. A step that computes to `0` therefore runs the body
+**zero times** rather than refusing or spinning — it advances nothing, which is
+the wrong-order range's answer one operand over. The constant `step 0` stays a
+compile-time refusal, because that one *is* knowable.
+
 - rejected: `loops/range-never-runs-reject.vl`, `loops/empty-range.vl`,
   `lint/for-step-zero.vl`
 - sound: `loops/range-direction-legal.vl` (ascending, `step -1`, equal bounds,
