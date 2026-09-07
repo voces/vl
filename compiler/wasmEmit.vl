@@ -727,7 +727,9 @@ import {
   nulFieldInnerCode,
   nulMapShapeOf,
   nulNicheBoxSlot,
+  nulNicheCastWiredTy,
   nulNicheRecoverOwed,
+  nulRefNichePayloadTy,
   nulRefStructIdxOfLet,
   nulScalarListBuildKind,
   nulScalarListCodeKind,
@@ -13126,6 +13128,52 @@ function emitNumWrapCast(body: i32[], e: AsExpr, exprIx: i32, fnIx: i32) {
   0
 }
 
+// The `as` trio over a niche-repped `T | null` operand: `ref.null` is the whole encoding of
+// the absent arm, so there is no tag to test and no payload to unbox. `as!`'s ruled trap IS
+// `ref.as_non_null`, and `as?`'s result type is the operand's own rep (D1812).
+function emitAsNulNiche(body: i32[], e: AsExpr, fnIx: i32) {
+  const obj = e.asObj
+  if e.asTy == "null" {
+    return emitFail(
+      "emitProgram: `as null` names the ABSENT arm of a `T | null`, which is not a type a value casts into — test it with `x == null`",
+    )
+  }
+  const payload = nulRefNichePayloadTy(nodeTyIxOf(obj))
+  if payload < 0 {
+    return emitFail(
+      "emitProgram: `as " +
+        e.asTy +
+        "` needs a BOXED union operand or a nullable-REF one; this `| null` is a value niche whose null is a spare scalar, with neither a tag nor a ref to test",
+    )
+  }
+  if !nulNicheCastWiredTy(payload) {
+    return emitFail(
+      "emitProgram: `as " +
+        e.asTy +
+        "` over a `" +
+        e.asTy +
+        " | null` is lowered for a string, a list and a union variant; a standalone struct, map or closure cell has no lowering yet at an un-annotated destination — narrow it with `if x != null { … }`",
+    )
+  }
+  // `T | null` is exactly what the operand already is, so `as?` is the identity — the same
+  // cell, at the same rep, and every consumer reads the cast node's own `T | null` type.
+  if e.asMode == "null" { return emitExpr(body, obj, fnIx) }
+  if e.asMode == "trap" {
+    if emitExpr(body, obj, fnIx) < 0 { return -1 }
+    // One opcode and no heap index: `ref.as_non_null` traps on the miss, which is the ruled
+    // sad path, and hands the present value back at its own non-null heap type.
+    fbRefAsNonNull()
+    return 0
+  }
+  emitFail(
+    "emitProgram: `as " +
+      e.asTy +
+      "` over a `" +
+      e.asTy +
+      " | null` propagates the null to the caller, and only the trapping and coalescing forms are lowered for that operand — write `as!`, `as?`, or the explicit `if x == null { return null }`",
+  )
+}
+
 function emitAsCast(body: i32[], e: AsExpr, _exprIx: i32, fnIx: i32) {
   const obj = e.asObj
   const tgt = e.asTy
@@ -13177,6 +13225,9 @@ function emitAsCast(body: i32[], e: AsExpr, _exprIx: i32, fnIx: i32) {
     if !peep { return emitNumExactCast(body, e, _exprIx, fnIx) }
   }
   if asExprIsUnionCastIn(_exprIx, fnIx) {
+    // A niche-repped operand carries no tag, so none of the tag machinery below applies to
+    // it: the arm test is the null test, and the whole trio shares one lowering.
+    if !exprUnion(obj, fnIx) { return emitAsNulNiche(body, e, fnIx) }
     // the target arm's type is the cast node's own recorded type, the checker's proof; for
     // `as?` the node's type is `T | null`, so it is peeled to recover `T` — without the peel
     // the tag and heap derive from the wrong type.
@@ -13209,16 +13260,6 @@ function emitAsCast(body: i32[], e: AsExpr, _exprIx: i32, fnIx: i32) {
         "emitProgram: `as " +
           tgt +
           "` names no union arm this cast can test",
-      )
-    }
-    // The operand must actually carry the BOX. A niche-repped union (`T | null`) has no tag
-    // field to test, and `exprUnion` is the emitter's own answer to that question — the same
-    // one every other box consumer asks, rather than a second reading of the type.
-    if !exprUnion(obj, fnIx) {
-      return emitFail(
-        "emitProgram: `as " +
-          tgt +
-          "` needs a BOXED union operand — a niche-repped one carries no tag to test",
       )
     }
     if emitExpr(body, obj, fnIx) < 0 { return -1 }

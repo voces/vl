@@ -51,7 +51,6 @@ units: **hours** · **half-day** · **days**.
 | 2 | **D1775 — a `type` alias over a negation type reps as a union BOX with a scalar value** | `type N = !string; const x: N = 5` → `vl check` rc 0, then `type mismatch: expected (ref $type), found i32`. `wasm-dis`: `(global $global$0 (mut (ref $1)) (i32.const 5))`. The INLINE spelling runs | `typecheck.vl` / `emit_classify.vl` rep classification of an alias body | hours–half-day |
 | 4 | **B21.1 — `match` payload renaming and nested destructuring** | `Move{x: a}` → `parse error … match payload binding must be a field name` | `parser.vl:2847`; `match-design.md` measures both as one-branch extensions | hours (renaming) / half-day (nesting) |
 | 5 | **B7 R3 — `.backwards()` over a string** | `"abc".backwards()` → `no method '.backwards' on string` | `std/str.vl`; §Codepoints already specifies it | **hours** |
-| 6 | **B6c — `as!` over a `string \| null`** | `function f(): string \| null` + `f() as! string` → `emitProgram: \`as string\` needs a BOXED union operand — a niche-repped one carries no tag to test`. The NUMERIC twin now runs (`3`), so the item's stated blocker is half closed | `wasmEmit.vl:13156` | half-day |
 | 7 | **A-robust — an unbound generic return parameter refuses at EMIT, not at check** | `function mk<T>(): T[] { return [] }; mk()` → `emitProgram: monomorphize: a return type parameter of \`mk\` is not bound by any parameter` | move it to the check tier beside `solveUnannotParams`' "cannot infer — annotate" family | **hours** |
 | 8 | **the `parseIf` `then` arm is not marked lossless** | `if c then print(1)` + a type error → the parse error ONLY; `if c print(1)` + the same → BOTH | `parser.vl:2652` needs `dgMarkLossless(P.diags.length)`, as `parseBracedBody:2633` has | **hours** |
 | 9 | **`vl build` with no `-o` writes a file instead of stdout** | `vl build p.vl > out.bin` → `out.bin` holds `wrote p.wasm (147 bytes)` | `scripts/vl-host/src/main.rs` build arm; already "decided: yes" | **hours** |
@@ -2460,14 +2459,16 @@ in-language GC knobs.
 
     So this is not "unsafe for speed" — it is the same work with the box deleted, and the
     only thing given up is a recoverable miss, which is precisely what `as!` is for.
-  - **BLOCKED ON A PREREQUISITE, and it is not about maps.** Measured 2026-08-25: the `as`
-    trio does not accept `T | null` as a SOURCE at all — `f() as! i32` over a
-    `function f(): i32 | null` is `` `as` supports numeric conversions only ``, and so is
-    the `string | null` twin. The trio works on multi-arm unions (`Circle | Rect`) only. So
-    the order is: extend the trio to nullables FIRST (its own change, useful on its own),
-    then fuse the map-read case. Not measurable before that — there is nothing to compile.
-    Contrast `std:buffer`'s hoisted accessors (§M8), which kept their fence precisely because
-    dropping it bought nothing there.
+  - **THE PREREQUISITE IS BUILT (2026-09-06, #2829, [D1812](internals/inventory/D1812.md)).**
+    The `as` trio once refused `T | null` as a SOURCE outright; the numeric twin
+    (`f() as! i32` over `i32 | null`, which BOXES) has run for a while, and the niche-repped
+    cells — `string | null`, a nullable LIST, a nullable union VARIANT — now take
+    `ref.as_non_null` for `as!` and the identity for `as?`, graded at all 26 delivery
+    positions in both faces. Still refused, loudly and with `live-sites.json` rows: the
+    standalone struct, map and closure cells (their consumers read the CAST for the rep), and
+    the propagating bare `as`. The map-read fuse itself already exists
+    (`tests/cases/maps/map-read-as-bang-fast-path.vl`), so what remains here is the MEASUREMENT
+    below, not a lowering.
   - **Measure BEFORE building it.** Two of the three obvious customers may already be served:
     `m[k] ?? d` does NOT box (it probes the entry table and coalesces), and a `for k in m`
     loop already has the entry in hand. So the residual population might be small enough that
