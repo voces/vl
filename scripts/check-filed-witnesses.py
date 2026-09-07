@@ -362,6 +362,16 @@ def unparsed_row_heads(doc):
 # gradeable, because a block far below stood in.
 ANYHEAD = re.compile(r"^#{1,6}\s")
 
+# What ENDS a wrapped status line's join. A status line is one Markdown paragraph, so a blank
+# line closes it, and a heading closes the section it belongs to — an unterminated `**` opener
+# stops at either rather than swallowing the row below. This replaces a six-line cap, which
+# refused an 8-line status as `status line names no known outcome` and named no cause.
+def status_join_continues(line):
+    if not line.strip():
+        return False
+    return not (SEC.match(line) or ANYHEAD.match(line))
+
+
 def block_at(lines, i):
     """The indented program the `Repro` lead-in at `lines[i]` introduces, or "". The lead-in
     may WRAP onto further prose lines before the block (D16 does), so scan forward for the
@@ -399,19 +409,19 @@ def parse(doc):
             continue
         # A status line may WRAP (inventory #2's D3 does), and a wrapped one is still a
         # status line: joining it is the difference between grading that row and reporting
-        # it as `not graded` forever. Bounded, and it must actually close — an unterminated
-        # `**` opener is left alone rather than swallowing the section.
+        # it as `not graded` forever. The join runs to the closing `**` and is bounded by
+        # the PARAGRAPH, not by a line count — see `status_join_end`.
         if cur["status"] is None and ln.startswith("**"):
             if ln.rstrip().endswith("**") and len(ln.rstrip()) > 2:
                 cur["status"] = ln.strip("*").strip()
             else:
                 parts, k = [ln], i + 1
-                while k < len(lines) and k - i <= 5:
+                while k < len(lines):
+                    if not status_join_continues(lines[k]):
+                        break
                     parts.append(lines[k])
                     if lines[k].rstrip().endswith("**"):
                         cur["status"] = " ".join(parts).strip("*").strip()
-                        break
-                    if not lines[k].strip():
                         break
                     k += 1
         # A `Repro:` LEAD-IN AND NOTHING ELSE. The first indented block after the status

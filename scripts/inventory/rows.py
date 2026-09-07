@@ -36,6 +36,7 @@ declared_outcome = _CK.declared_outcome
 id_key = _CK.row_id_key             # `D9` before `D10`, `D661` before `D661A`
 resolve = _CK.resolve               # a monolith path, or a directory of one-row files
 unparsed_row_heads = _CK.unparsed_row_heads   # row-shaped headings `SEC` cannot parse
+status_join_continues = _CK.status_join_continues  # what ends a wrapped status line
 SECTION = re.compile(r"^#{1,2}\s")  # `#` / `##` — the only headings that end a row
 
 # The pointer a split directory keeps back to the monolith it came from, so a consumer
