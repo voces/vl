@@ -212,9 +212,22 @@ decides it is whether the fall-through value is a real answer:
 * **It is not** — a bare `0`/`""`/`false` nobody chose — the site owes a NAMED default first,
   and that is a fix rather than a refactor.
 
-A site whose scrutinee is `VKind | null` cannot convert at all until D1898 closes; that is what
-still holds `forceAnnLeafReps` and `collectMapFilterUse` as `if` chains, and it is the reason to
-record, not "litunions are not matchable".
+[D1898](inventory/D1898.md) is CLOSED, so a `VKind | null` scrutinee matches too — with `null`
+as one more member, named in the exhaustiveness sentence like any other. Both spellings were
+already the same interned i32 atom (`null` on the spare `-1`), so the emitter needed nothing:
+the whole gap was the scrutinee gate and the pattern vocabulary.
+
+**A LANGUAGE CHANGE CANNOT SHIP WITH ITS OWN FIRST CONSUMER.** Converting `forceAnnLeafReps`'s
+`VKind | null` chain in D1898's own PR makes the SEED unable to compile the source, and
+`refresh-compiler.sh` says exactly that: *"the seed predates a construct the source now uses …
+land the enabling change in smaller steps so each seed self-compiles the next (there is no TS
+re-mint — the project keeps no second compiler)"*. So a `match`-enabling change is always two
+landings: the checker, then the conversions, once a seed carrying it is on master. Budget for
+the second one when scheduling the first.
+
+`collectMapFilterUse` stays an `if` chain for a different reason that D1898 does not touch: it
+interleaves TWO subjects (`rk` then `rvk`), so it is not one dispatch. Of the pilot's two
+reasons for that site, only this one survives.
 
 ## Agreement, and why there are two implementations
 
