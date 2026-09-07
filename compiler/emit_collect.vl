@@ -513,9 +513,12 @@ import {
   fnStmtsPosOf,
   forInElemKind,
   forInMapValsSlot,
+  forInPairElemKind,
+  forInPairStructIdx,
   forInStringSrc,
   forInU8Src,
   forInVarStructIdx,
+  forRangeStepIsConst,
   forceCloResultListTypes,
   forceCloResultMapTypes,
   forceScalarListField,
@@ -3037,10 +3040,23 @@ export function computeRetInference() {
   0
 }
 
-// Declare the three locals a `for v in <iter>` needs, in the pre-order `emitForInStmt` consumes
-// them: the element var `v`, a hidden i32 cursor `v#i`, and a hidden `v#l` holding the iterable,
-// evaluated once. The `#` keeps the hidden names off any user identifier. Leaves `v` bound, for
-// the caller to `scopeUnbind`. One home: both scope walks must declare the same slots.
+// Declare the locals a `for v in A to B [step S]` needs, in the pre-order `emitForRangeStmt`
+// consumes them: the loop variable, a bound temp, and a step temp when the step is not a
+// folded constant. Leaves `v` bound, for the caller to `scopeUnbind`. ONE home — the start
+// function's walk and the in-function walk must declare the same slots.
+export function declareForRangeLocals(s: ForRange) {
+  const fvSlot = addLocalName(s.frVar, "i32", -1)
+  markLoopVarSlot(fvSlot)
+  scopeBind(s.frVar, fvSlot)
+  addLocalName(s.frVar + "#b", "i32", -1)
+  if !forRangeStepIsConst(s.frStep) { addLocalName(s.frVar + "#s", "i32", -1) }
+  0
+}
+
+// Declare the locals a `for v[, w] in <iter>` needs, in the pre-order `emitForInStmt` consumes
+// them: the element var `v`, a hidden cursor `v#i`, a hidden `v#l` holding the iterable, and
+// the SECOND name last when the source wrote one. Leaves each written name bound, one
+// `scopeUnbind` per name for the caller. One home: both scope walks declare the same slots.
 export function declareForInLocals(s: ForIn, fnIx: i32) {
   const fiEk = forInElemKind(s.fiIter, fnIx)
   if fiEk == null {
@@ -3159,6 +3175,22 @@ export function declareForInLocals(s: ForIn, fnIx: i32) {
     }
   }
   addLocalName(s.fiVar + "#l", fiLk, fiLs)
+  // The SECOND binding, minted LAST so a one-name loop keeps its three-slot shape byte for
+  // byte. An index binds a dense i32 counter of body executions rather than the cursor — a
+  // string's cursor is a backing offset and a set's skips tombstones, so the cursor is not
+  // the index at two of the three sequences.
+  if s.fiVar2 != "" {
+    const fiPk = forInPairElemKind(s.fiIter, fnIx)
+    if fiPk == null {
+      return emitFail("emitProgram: unsupported for-in second binding")
+    }
+    const fiP2 = addLocalName(
+      s.fiVar2,
+      fiPk,
+      forInPairStructIdx(s.fiIter, fnIx),
+    )
+    scopeBind(s.fiVar2, fiP2)
+  }
   return 0
 }
 
@@ -3463,13 +3495,7 @@ export function collectLocals(blockIx: i32, fnIx: i32) {
           return -1
         }
       } else if s is ForRange {
-        // A range `for` introduces two i32 slots in pre-order: the loop variable and a synthetic
-        // bound temp, since the `to` expression is evaluated once. The temp's name carries a `#`
-        // so it can never collide with a user identifier.
-        const fvSlot = addLocalName(s.frVar, "i32", -1)
-        markLoopVarSlot(fvSlot)
-        scopeBind(s.frVar, fvSlot)
-        addLocalName(s.frVar + "#b", "i32", -1)
+        declareForRangeLocals(s)
         if collectLocals(s.frBody, fnIx) < 0 {
           scopePop()
           return -1
@@ -3485,7 +3511,9 @@ export function collectLocals(blockIx: i32, fnIx: i32) {
           scopePop()
           return -1
         }
-        // The loop variable's scope is the loop (see `scopeUnbind`).
+        // The loop variables' scope is the loop (see `scopeUnbind`) — one release per name
+        // the source wrote, matching `declareForInLocals`' binds.
+        if s.fiVar2 != "" { scopeUnbind() }
         scopeUnbind()
       } else if s is RetStmt {
         // `return if c { … } else { … }` — the returned if-expression's arm preludes are the
@@ -3821,6 +3849,7 @@ export function collectMemberPopRefSlots(blockIx: i32, fnIx: i32) {
       } else if s is ForRange {
         collectMemberPopRefSlotsExpr(s.frFrom, fnIx)
         collectMemberPopRefSlotsExpr(s.frTo, fnIx)
+        collectMemberPopRefSlotsExpr(s.frStep, fnIx)
         collectMemberPopRefSlots(s.frBody, fnIx)
       } else {
         // Bare expression statement — a fall-through, not only the `BinExpr` and `Call` shapes.
@@ -7379,6 +7408,7 @@ function anonLeafFrameRebinds(root: i32, nm: string): boolean {
   }
   if n is ForIn {
     if n.fiVar == nm { return true }
+    if n.fiVar2 == nm { return true }
   }
   const kids = nodeChildren(root)
   let i = 0
