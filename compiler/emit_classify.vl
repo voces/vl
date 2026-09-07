@@ -13567,7 +13567,17 @@ export function pushPostGuardNarrow(stmtIx: i32, fnIx: i32) {
         // do: a new value at `w.f` says nothing about what the old one's `w.f[0]` held.
         retireNarrowForIndexCells(mtk)
         if rhsNullable || asgNarTy >= 0 {
-          if mtk != "" { retireNarrowFor(mtk) }
+          if mtk != "" {
+            retireNarrowFor(mtk)
+            // …and then the written member, the path twin of the Ident arm's push: the checker
+            // re-narrows a path the same way it re-narrows a name, so the reads after the write
+            // must lower at the same member here too (D1847).
+            pushNarrowWriteReNarrow(
+              mtk,
+              asgNarTy,
+              memberUnionFieldNameRead(s.binLeft, fnIx),
+            )
+          }
         }
       }
       // The index target: a literal subscript names its cell, so the exact key retires on a
@@ -13578,7 +13588,15 @@ export function pushPostGuardNarrow(stmtIx: i32, fnIx: i32) {
         const itk = indexPathKeyOf(s.binLeft)
         if itk != "" {
           retireNarrowForIndexCells(itk)
-          if rhsNullable || asgNarTy >= 0 { retireNarrowFor(itk) }
+          if rhsNullable || asgNarTy >= 0 {
+            retireNarrowFor(itk)
+            // The index twin of the member push above (D1847).
+            pushNarrowWriteReNarrow(
+              itk,
+              asgNarTy,
+              indexElemUnionName(s.binLeft, fnIx),
+            )
+          }
         } else {
           const iroot = P.nodes[unwrapParen(tgt.idxArr)]
           if iroot is Ident { retireNarrowForIndexCells(iroot.identName) }
@@ -16077,12 +16095,22 @@ export function tyAnnRefListKind(tyIx: i32) {
 // slot), or 0 when it isn't a ref-array annotation. Mirror of `tyAnnRefListKind` for the
 // slot; threads `pendingListSlot` so a ref-list literal builds the annotation's own element type.
 export function tyAnnRefListSlot(tyIx: i32) {
+  if repShadowOn { repABNote("clamp", "tyAnnRefListSlot", "call") }
   if tyIx >= 0 {
     // Which ref-list ROW holds this annotation's element — the recorded type first,
     // then the row the INTERN pass banked on the node. `| null`-tolerant, exactly as
     // the intern arm is.
     const raS = annRefArrSlot(tyIx)
     if raS >= 0 { return raS }
+  }
+  if repShadowOn {
+    // The distinction that decides the hazard: a clamp for an annotation that is NOT a ref
+    // list is the correct "no row of mine"; a clamp for one that IS is the missing row.
+    if retRefArrFlag(tyIx) == 1 || retNulRefArrFlag(tyIx) == 1 {
+      repABNote("clamp", "tyAnnRefListSlot", "CLAMPED-isRefList")
+    } else {
+      repABNote("clamp", "tyAnnRefListSlot", "CLAMPED-notRefList")
+    }
   }
   0
 }
@@ -17060,7 +17088,11 @@ function globalNulRefSupersede(letIx: i32, si: i32): i32 {
 // instead of both declaring the first's. 0 (slot fallback) if unresolvable.
 export function globalRefListSlot(letIx: i32) {
   const s = letRefListSlot(letIx, -1)
-  if s < 0 { return 0 }
+  if repShadowOn { repABNote("clamp", "globalRefListSlot", "call") }
+  if s < 0 {
+    if repShadowOn { repABNote("clamp", "globalRefListSlot", "CLAMPED") }
+    return 0
+  }
   s
 }
 
@@ -29429,7 +29461,11 @@ export function refListElemNameOfExpr(exprIx: i32, fnIx: i32) {
 export function refListSlotOfExpr(exprIx: i32, fnIx: i32) {
   const nm = refListElemNameOfExpr(exprIx, fnIx)
   const s = rlSlotByName(nm)
-  if s < 0 { return 0 }
+  if repShadowOn { repABNote("clamp", "refListSlotOfExpr", "call") }
+  if s < 0 {
+    if repShadowOn { repABNote("clamp", "refListSlotOfExpr", "CLAMPED") }
+    return 0
+  }
   s
 }
 
@@ -30521,6 +30557,7 @@ export function letAnnRefListSlot(letIx: i32) {
     }
     return tyAnnRefListSlot(d.letType)
   }
+  if repShadowOn { repABNote("clamp", "letAnnRefListSlot", "CLAMPED-notLet") }
   0
 }
 
@@ -33407,12 +33444,12 @@ function calleeReturnsF64Sid(sid: i32, fnIx: i32) {
   calleeRetKindSid(sid, fnIx) == "f64"
 }
 
-// True if the function-value callee `name` (in scope of `fnIx`) returns void — its resolved
-// `$fnsig` key carries the `>v` void marker (`sigKeyRetIsVoid`, not the `null` an unresolved
-// key also decodes to). A void closure call leaves nothing on the stack, so its statement
-// form must not `drop`.
-export function calleeReturnsVoid(name: string, fnIx: i32) {
-  sigKeyRetIsVoid(calleeCloSigKey(name, fnIx))
+// True if the function-VALUE callee at `sid` returns void — its resolved `$fnsig` key has no
+// result. POSITIONED at the callee's own arena node, which is what picks among sibling
+// module-scope blocks binding one closure name: unpositioned, the module rung declines on the
+// ambiguous name and the empty key reads as "returns a value" (D1862).
+export function calleeReturnsVoidAt(sid: i32, fnIx: i32, atIx: i32) {
+  sigKeyRetIsVoid(calleeCloSigKeyAt(sid, fnIx, atIx))
 }
 
 function calleeReturnsVoidSid(sid: i32, fnIx: i32) {
