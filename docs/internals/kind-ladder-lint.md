@@ -288,6 +288,32 @@ Once the scrutinee's type admits a `match`, the honesty test from the section ab
 convert when the fall-through is a real answer, and fix the default first when it is a bare
 `0`/`""`/`false` nobody chose.
 
+## The set column now reads the declaration too, so the rule above is the tool's
+
+The section above is a rule for a reader; this is the same rule inside both walks. They used to
+pick "the smallest closed set containing every tested member", and `"f64"` is a member of five
+sets — so that answer can name a set the scrutinee does not have, and a chain naming three
+members was graded EXHAUSTIVE over `BtKind`'s three while its parameter is a `VKind` with
+thirty-one. A parameter annotation is asked first now; the smallest-containing answer stays as
+the fallback for a subject with no annotation to read.
+
+Declined unless the declared set carries every arm: a declaration the arms do not belong to is
+a mis-parse, and the older answer is the safer one.
+
+**Measured before building, and the count does not move.** Nine sites change set —
+`pushKindBit` `MfKind` → `PushKind`, `mfResKindFromSigRet` `RtKind` → `VKind`,
+`scalarWidenConvOp`'s two `MfKind`/`BtKind` → `VKind`, `numWidensName`'s two → `PrimName`,
+`emitRefIfArm` and `expCtxForCell` `EqCmpKind` → `VKind`, `emitScalarValue` `BtKind` → `VKind`
+— and exactly one changes GRADE, `emitScalarValue` from `exhaustive` to `named`. Neither is
+reported, so `kind-ladder-incomplete` stays at 398 and `kind-ladder-split` at 8 on both sides.
+
+**A FIELD read (`t.primName`) is deliberately left out**, and it is where the remaining
+mis-attribution lives: six sites dispatch on a `PrimName`-typed field while graded over
+`BtKind` or `MfKind`, and two of those are graded exhaustive over three members when the field
+carries ten. Resolving a field needs the declaring type, which the lint — handed one module at
+a time — cannot see, so it would need a drift-gated table like the closed-set copy. That is a
+separate landing with its own measurement: **+2 hits, both real.**
+
 ## Agreement, and why there are two implementations
 
 `compiler/lint.vl` grades one module from the source the driver hands it; the census grades the
@@ -295,6 +321,13 @@ tree for the ratchet. Nothing else ties them together, so a change to either tha
 silently un-ratchets the tree. `tests/vl_kind_ladder_test.ts` runs BOTH over ten fixtures and
 compares the hit LINES, and `ladder-budget.py --check` re-derives every closed set from the
 `export type` that declares it and refuses to run when the lint's copy has drifted.
+
+**And ten fixtures is not the tree.** Comparing both walks over every compiler module, filtered
+to that module's own diagnostics, finds one site where they name different LINES for the same
+ladder while every total agrees ([D1899](inventory/D1899.md)) — `emitNumExactTest` tests
+`dom == "i32"` in two chains a dozen lines apart, and the two disagree about which is "first".
+The comparison is ten lines of script and is the thing to run when either walk changes; the
+suite cannot find a shape none of its fixtures has.
 
 ## Running it
 

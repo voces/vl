@@ -1666,15 +1666,23 @@ in-language GC knobs.
         each population (4,088 and 185), CONTRADICT 0. **Byte identity refuses it: 35 modules go
         `runs -> not-runs`, six of them compiler TRAPS** (`ref index access but ref array type
         not collected` x16, `ref valtype with no interned shape` x11, two collect-row refusals).
-        The rule it buys: **answering `reflist` is a PROMISE THAT A ROW EXISTS.** The descriptor
-        is read by the ref-list slot, shape and collect consumers too, and the collect pass mints
-        a row for a MAP and a NESTED-ARRAY element — which is why those two were byte-identical
-        — and none for a nullable one, so the answer is a claim the emitter cannot honour.
-        Covering it needs the collect pass to intern the row first, a build rather than a
-        projection ([D1837](internals/inventory/D1837.md), a refutation pin). A landing graded on
-        LEFT-ONLY and CONTRADICT alone would have shipped all 35. Remaining: the value-union box
-        (3,167 / 82), other union (133), one no-recorded-type module (166), and the nullable
-        element behind its build. No rung is deletable until the column is empty for the kind.
+        **The first diagnosis of that refusal was wrong and is corrected here**: the rows were
+        never missing — `refArrShapeKindGo` already interns nullable-element rows across the
+        board, and all five shapes run on master. The rule is the element's BACKING FAMILY:
+        `(string | null)[]` rides the STRING list, `(boolean | null)[]` and a litunion the i32
+        list, and only a nullable struct/map/ref-list element makes the list a ref list — which
+        a one-level variant switch cannot express ([D1837](internals/inventory/D1837.md)).
+        **And CONTRADICT 0 was partly VACUOUS**: a module that fails to emit runs no shadow
+        sweep, so the broken modules took their own counter-evidence with them — that is the
+        whole of the −627 in AGREE and the ~5,400 fewer invocations. Campaign §5.1 now requires
+        every oracle reading to be reported over the population that emitted under BOTH seeds,
+        with that count printed. **THE NARROW ARM LANDS**: the nullable-STRUCT element alone,
+        flat and tree together with the two-producer audit as the gate (flat-only reads
+        `DISAGREE kind flat=reflist tree=list/`; both read 0), byte-identical in 3,210 of 3,210
+        and 7,589 of 7,589. Remaining: the value-union box (3,167 / 82), other union (133), one
+        no-recorded-type module (166); a nullable string/boolean/litunion element is not a ref
+        list at all and is a different kind's question. No rung is deletable until the column is
+        empty for the kind.
         `docs/internals/rep-descriptor-campaign.md` §9.
      Two owner rulings gate how far items 2 and 6 can go: `one-literal-union-rep` and
      `nullable-rep-rule-stated-once` (`docs/internals/open-rulings.md` §D).
