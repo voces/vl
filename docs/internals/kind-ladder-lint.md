@@ -134,6 +134,37 @@ more useful half of the result — the census's set attribution is not a convers
 
 The remaining 25 are `Node` (38 members), which the rule above already excludes.
 
+## Where the `Ty` set ran out, and what an OR-PATTERN costs
+
+`emit_classify.vl`'s twenty-six `Ty` dispatches followed `emit_collect.vl`'s six: **134 → 108**,
+every one `_`-less with all eleven members named. The declining members are named together in
+one **or-pattern** arm carrying the shared reason, rather than one empty arm each.
+
+**That changes the price by twenty times.** Tranche 1 wrote a separate empty arm per member and
+paid ~79 seed bytes a ladder; tranche 2's or-pattern pays **+101 bytes over twenty-six
+conversions, ~3.9 each** — an or-pattern lowers to one rung for the whole group where separate
+arms lower to one each. The safety is identical: the checker sees every alternative, so a
+twelfth arena variant still breaks the self-compile. Prefer the or-pattern wherever the reason
+really is shared, and separate arms only where each member's reason differs.
+
+Byte identity held at every batch: 2,632 `tests/cases` + `std` modules (0 DIFFER, 0 LOST), and
+master's own 31 compiler modules `cmp`-equal under both seeds at each of the four checkpoints.
+
+**Of the file's 134 hits, 108 remain and the reason is the set, not the effort:**
+
+| set | left | why not converted |
+| --- | --- | --- |
+| `Node` (38) | 78 | the rule above excludes a walker answering about a few kinds |
+| `VKind` (31) | 17 | the sub-domain-litunion case: 28 empty alternatives for a site answering about three kinds is not honest. `retKindPri` (21/31), `fieldCodeOfVKind` (14/31) and `vkNulNicheOf` (12/31) may qualify on volume and need their own reading |
+| `MfKind` / `PrimName` (7 + 10) | 10 | `string` scrutinees — `match` needs a union |
+| `RtKind` (15), `EqCmpKind` (17) | 1 each | the same honesty question at a larger set |
+| `Ty` (11) | 1 | `mvValLowersTy`'s member loop: `tyIsLitUnion(ims[m2])` is a PREDICATE rung between two kind rungs, so it is not one dispatch |
+
+The `Ty` line is the useful one: **twenty-six of twenty-seven converted, and the twenty-seventh
+is excluded by the same rule that excluded `funcRetUnrepresentable`'s loop in tranche 1.** The
+census's set column names which closed set a chain's literals belong to, not whether the chain
+is a dispatch.
+
 ## Agreement, and why there are two implementations
 
 `compiler/lint.vl` grades one module from the source the driver hands it; the census grades the
