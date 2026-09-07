@@ -516,6 +516,20 @@ edge, so fewer values answer `2` at all — which is what makes (a)'s price affo
 measurable rather than a guess. Taking (a) first would refuse programs that rung 1 would have
 answered precisely.
 
+### trap-frame-path-spelling — how is a file spelled in a trap frame? — RULED (coordinator) 2026-09-07
+
+A trap frame now carries `name@file:line`, and the file needs one spelling. **(a)** relative to
+the cwd, as `vl check`'s diagnostics print it — but a name section is baked in at BUILD time
+while cwd is a RUN-time fact, so a module built in one directory and run from another prints a
+path relative to the wrong root. **(b)** relative to the ENTRY module's directory, the key the
+merged module graph already uses. **(c)** the path as written in the `import`.
+
+**Ruling (coordinator, 2026-09-07): (b)**, so a backtrace, a `vl check` diagnostic for an
+imported module and find-references all spell one file one way; the entry is its own bare file
+name. Measured stable across three working directories. **The owner can override it** — a
+spelling that appears in every backtrace is theirs to change, and only the renderer
+(`srcmapPathOf`) moves if they do.
+
 ### B6a-map-in-union-box — may a MAP be a union member, or does the box need a struct column? — raised 2026-09-07
 
 `const u: {[i32]: i32} | i32 = m` refuses with `an i32-keyed Map/Set is supported as … not

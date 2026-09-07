@@ -76,15 +76,19 @@ import {
   Unary,
   WhileStmt,
   annTsOf,
+  declNameTokOf,
   externArityAt,
   externCount,
   externNameAt,
   externParamAt,
   externRetAt,
+  i32ToStr,
   isDefaultGlobalRef,
+  nodeToks,
   tsMentionsAnyName,
 } from "./ast"
 import { numLexFitsI32, numLexIsFloat } from "./emit_bignum"
+import { srcmapFileOfTok, srcmapPathOf } from "./srcmap"
 import {
   NEW_FIXED_MAX,
   appendAll,
@@ -3223,6 +3227,37 @@ function emitF64RemFnCode(out: i32[]) {
   helpFrameBody(out, body)
 }
 
+// The start function's `@file:line`. Module 0 is the ENTRY and top-level statements live
+// there, so the frame names the entry at line 1; a single-file compile has no module key and
+// carries the line alone.
+function startLocSuffix(): string {
+  // Module 0 is the ENTRY, and the entry is where top-level statements live. NOT the module
+  // owning token 0: modules load dependency-first, so token 0 belongs to an IMPORT.
+  const file = srcmapPathOf(0)
+  if file == "" { return "@1" }
+  "@" + file + ":1"
+}
+
+// A function's `@file:line` — where it is DECLARED, never the trapping instruction, which
+// would need a per-instruction map. `anchorOk` says the caller vouches for the node's anchor
+// token as a declaration; see the block inside.
+function fnLocSuffix(nodeIx: i32, anchorOk: boolean): string {
+  // The name token, else the node's anchor when the caller says that anchor is the
+  // declaration. A LAMBDA has no name token and its anchor is its own text, so the anchor is
+  // right; a monomorphized CLONE has neither, and its anchor is the PIN — a line the reader
+  // did not write the function on — so the caller withholds it and the frame carries none.
+  let tk = declNameTokOf(nodeIx)
+  if tk < 0 && anchorOk {
+    if nodeIx >= 0 && nodeIx < nodeToks.length { tk = nodeToks[nodeIx] }
+  }
+  if tk < 0 || tk >= P.toks.length { return "" }
+  // A single-file compile never loads a module graph, so it has no key to spell and the
+  // frame carries the LINE alone — unambiguous, there being one file.
+  const file = srcmapFileOfTok(tk)
+  if file == "" { return "@" + i32ToStr(P.toks[tk].line) }
+  "@" + file + ":" + i32ToStr(P.toks[tk].line)
+}
+
 // Emits the wasm "name" custom section (id 0) so a wasmtime trap backtrace shows real
 // function names instead of `<wasm function N>`. Gated on `gEmitNames` — a no-op when off, so
 // the default emit path (goldens + fixpoints) is untouched. `n` is the user-function count and
@@ -3318,7 +3353,9 @@ function emitNameSection(n: i32) {
       // Prefer a lambda's DEBUG display name (its binding, `const foo = …` → "foo")
       // over the synthesized `__lambda_N`, so a trap backtrace reads `foo`.
       const disp = fnDispNames[fi]
-      if disp.length > 0 { wName(disp) } else { wName(fn.fnName) }
+      // A display name means a lambda, whose anchor token IS its declaration.
+      const loc = fnLocSuffix(fnStmts[fi], disp.length > 0)
+      if disp.length > 0 { wName(disp + loc) } else { wName(fn.fnName + loc) }
     }
     fi = fi + 1
   }
@@ -3328,7 +3365,9 @@ function emitNameSection(n: i32) {
   // a reader of `print(a[7])` sees.
   if startStmts.length > 0 {
     wULEB(gImports + n)
-    wName("__start__")
+    // Top-level statements have no declaration of their own, so the start frame names the
+    // ENTRY file at line 1 — the file a reader opens, which is what the frame is for.
+    wName("__start__" + startLocSuffix())
   }
   // The shared runtime helpers (module-tail indices — after the start fn and the
   // `__log__` decoder, so the namemap stays strictly increasing).
