@@ -367,3 +367,75 @@ Deno.test("DOCUMENTED parity gaps (informational)", () => {
     "a row marked knownGap is actually wired in main.ts — promote it.",
   );
 });
+
+// --- 4. gaps a FEATURE LABEL hides ------------------------------------------
+//
+// A `knownGap` row keys on `mainMarker`, so it can only describe a feature the
+// playground does not register AT ALL. It is blind to the other shape: the
+// Monaco provider IS registered and the adapter composes only PART of what the
+// LSP's own handler composes. Three of those stand, and all three sit under a
+// row this file already grades as in parity — "completion" and "code actions".
+//
+// The rows below name the helper `server.ts` composes and the playground does
+// not, with the same polarity as `knownGap`: each asserts the gap STILL HOLDS,
+// so closing one reds this test and forces the row to be promoted rather than
+// left behind as a stale TODO.
+const adapterSrc = read("../playground/src/lspAdapter.ts");
+
+type SubGap = {
+  under: string; // the in-parity FEATURES row whose label hides this
+  symbol: string; // the `lsp/src/*` helper server.ts composes
+  why: string;
+};
+
+const SUB_GAPS: SubGap[] = [
+  {
+    under: "completion",
+    symbol: "stdAutoImportCompletions",
+    why:
+      "the LSP offers unimported std names as completion items that add the " +
+      "import on accept; the playground's completion path offers neither",
+  },
+  {
+    under: "code actions (quick-fix / Auto Fix)",
+    symbol: "ufcsImportFixes",
+    why:
+      "the LSP offers 'import the module this method comes from' as a " +
+      "quick-fix; the playground's code-action path composes no UFCS fixes",
+  },
+  {
+    under: "code actions (quick-fix / Auto Fix)",
+    symbol: "organizeImportEdits",
+    why:
+      "the LSP serves source.organizeImports (unused AND duplicate specifiers " +
+      "dropped, survivors fmt-sorted); the playground has no organize path",
+  },
+];
+
+Deno.test("every sub-behaviour gap names a live LSP helper", () => {
+  for (const g of SUB_GAPS) {
+    assert(
+      serverSrc.includes(g.symbol),
+      `sub-gap "${g.symbol}": server.ts no longer composes it — the LSP side ` +
+        `was renamed or removed, so this row is stale. Update or delete it.`,
+    );
+    assert(
+      FEATURES.some((f) => f.feature === g.under && !f.knownGap),
+      `sub-gap "${g.symbol}": no in-parity FEATURES row named "${g.under}". ` +
+        `A sub-behaviour gap only means something under a row this file ` +
+        `otherwise reports as in parity.`,
+    );
+  }
+});
+
+Deno.test("DOCUMENTED sub-behaviour gaps still hold", () => {
+  for (const g of SUB_GAPS) {
+    console.log(`  sub-behaviour gap — ${g.under} / ${g.symbol}: ${g.why}`);
+    assert(
+      !adapterSrc.includes(g.symbol),
+      `SUB-GAP CLOSED: lspAdapter.ts now composes "${g.symbol}" under ` +
+        `"${g.under}". Delete this row from SUB_GAPS — and if the behaviour is ` +
+        `now graded end to end, say so where the feature row is asserted.`,
+    );
+  }
+});

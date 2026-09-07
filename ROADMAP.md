@@ -50,18 +50,16 @@ units: **hours** · **half-day** · **days**.
 | 1 | **B15 — a nested capturing function cannot be taken as a VALUE.** **NARROWED 2026-09-06: the DIRECT-call half is built** ([D1780](internals/inventory/D1780.md)/[D1781](internals/inventory/D1781.md)), the BINDING hop with it ([D1782](internals/inventory/D1782.md)), the ARRAY-element delivery at one pin ([D1794](internals/inventory/D1794.md)) and the ARGUMENT hop ([D1795](internals/inventory/D1795.md)); what stands is a closure that escapes its pin | `function o(n) { function k(x) { return x + n }; return k(1) }` runs at one pin and at two, and so do `const fs = [k]; fs[0](1)`, `function use(p) { return p(1) }; use(k)` and `const f = k; f(1)` at two pins; the array element at two pins still refuses ([D1816](internals/inventory/D1816.md)), and `return k` still refuses | `wasmEmit.vl emitClosureValue`; the binding hop is `calleeRetKindSid` and the `fnValTarget` family, which key on a name with no frame | half-day (D1782) |
 | 2 | **D1775 — a `type` alias over a negation type reps as a union BOX with a scalar value** | `type N = !string; const x: N = 5` → `vl check` rc 0, then `type mismatch: expected (ref $type), found i32`. `wasm-dis`: `(global $global$0 (mut (ref $1)) (i32.const 5))`. The INLINE spelling runs | `typecheck.vl` / `emit_classify.vl` rep classification of an alias body | hours–half-day |
 | 5 | **B7 R3 — `.backwards()` over a string** | `"abc".backwards()` → `no method '.backwards' on string` | `std/str.vl`; §Codepoints already specifies it | **hours** |
-| 10 | **Organize Imports drops an unused specifier but not a DUPLICATE one** | `server.ts:1491 .filter((d) => d.code === "unused-import")` | `lsp/src/server.ts:1489-1500` | **hours** |
 | 18 | **B8 — the two `for` gaps that need a RULING, not a build** | objects → `a struct's fields are not a sequence …`; float bounds/step → `a `for` range counts in i32 …`. The other two members BUILT 2026-09-07: `for v, i in xs` / `for k, v in m` and an expression `step` | `open-rulings.md` §B8-for-struct, §B8-for-float-range — each has options, peers and a recommendation; neither is a build until it is ruled | ruling |
 | 20 | **A9 — no element-converting / field-dropping container copy** | `Cat[]` into an `Animal[]` param → `…type-valid (structural width subtyping) but not yet supported by codegen…` | `typecheck.vl` refusals + the converting-copy lowering; wire every delivery position BEFORE narrowing the gate | days |
 | 22 | **B-debug — the trapping INSTRUCTION's line, in the PLAYGROUND (the native and Deno hosts are done, 2026-09-07)** | `vl run` and `deno task test` both print `at lib.vl:6:3  in \`boom$m1\`` under the trap, joined out of the emitter's `vl-src` custom section; the playground prints no such block | the section and the reader exist and `tests/support/vlSrcSection.ts` is host-agnostic, so the port is small — what is MISSING is a trap POSITION to join against: the browser gives `WebAssembly.RuntimeError` with a stack whose wasm frames V8 formats the same way, so the work is confirming that shape survives the playground's own bundling and wiring the block into its error surface. The message still carries no index or length | hours |
 | 24 | **dogfood `match` over the compiler's own kind ladders** | `emit_collect.vl` 38 → 31, `emit_classify.vl` 134 → 103, `emit_rep.vl` 13 → 12 — thirty-nine conversions over three tranches, every output population byte-identical at every batch. **A LITUNION SET IS MATCHABLE**, nullable included since [D1898](internals/inventory/D1898.md) closed, and **the deciding input is the scrutinee's DECLARED type**, not which set its literals belong to — re-derived that way, only **9** of the tree's 49 non-`Ty` sites are genuinely `string`-typed and the other 40 are matchable | remaining: 78 `Node` in `emit_classify.vl` (excluded by the rule), ~28 litunion-typed sites across the tree that are convertible and unscheduled, the 9 `string` ones (each needs its PRODUCER given a litunion return first — a rep decision), 2 with two interleaved subjects, 1 `Ty` with a predicate rung, 12 unread. `typecheck.vl` (152) is unsurveyed. `ladder-budget.py` reads 394 + 8 today | days |
-| 25 | **structural-tolerant emitter (rep architecture step 1)** — **20 of 37 caller sites CONVERTED; 17 remain and each has a measured reason** | the migration criterion is per site and is now measured, not guessed: a per-site oracle over 10,793 modules says 25 sites receive a structural name the nominal resolver declines, 12 never do. Of the 25, **20 convert byte-inert** and 5 are held back by witness — 4 lose builds, 1 moves a diagnostic | `emit_classify.vl`; the five held-back sites and their witnesses are `rep-descriptor-campaign.md` §11 | half-day for the five, each needs its own fix |
+| 25 | **structural-tolerant emitter (rep architecture step 1)** — **CLOSED OUT: 20 of 37 caller sites converted, 5 RULED, 12 left as a standing measurement** | the criterion is per site and is measured: a per-site oracle over 10,801 modules. The 20 converted byte-inert with the diagnostics grader clean on both populations. **All five held-back sites are ruled and NOT ONE was a rep gap** — an inverted predicate (D1857), two precedence rungs (D1858, D1920), a circular source (D1859), an unexercised widening, and one widening the population DOES exercise that still gains zero builds and worsens a diagnostic (D1921). The other 12 have never received a structural name in either population | `rep-descriptor-campaign.md` §11–§12 | the 12 are a measurement, not a backlog: convert one the day its RIGHT-ONLY column moves off zero |
 | 27 | **E3 — user wasm runs on the playground's MAIN thread** | `playground/src/runtime.ts:21` instantiates there; `main.ts:36` says so | `playground/src/{runtime,playground,main}.ts` | days |
 | 28 | **F-tiers / J1 — the corpus runner is NOT redundant; what was missing was the census (2026-09-07)** | nine files execute emitted user wasm — four oracle shards and five standalone suites — and each standalone one grades what the oracle cannot (a host memory view, a GLOBAL count, an EXPORT alias, cross-instance byte-identity, the process floor); the 34 cells a suite also runs go through the NATIVE `vl build` while the oracle compiles in-process, so they are a cross-path agreement check | done: `scripts/wasm-runner-census.py` derives the population, `tests/vl_wasm_runner_census_test.ts` fails on an unclassified runner, and `docs/internals/wasm-runner-tiers-2026-09.md` states the tiers. Residue is documentation drift, not duplication | — |
-| 29 | **F-day-one — ONE grammar axis still absent** | `day-one-sampler.md`: operator overloading (`match` landed as a `narrowing` spelling, D1885/D1886; multi-param generics as a `pinning` face, D1887/D1888; recursive types as four records with a non-recursive control, D1889; mixed-width arithmetic as eleven READS, 381 pairs at zero, D1890) | `scripts/day-one/grammar.py` | half-day per axis |
 | 30 | **Dogfood the orchestrator scripts onto the host ABI** | the ABI is COMPLETE (`std:process` `run`/`exit`, `std:env` `getEnv`, in all three hosts); 34,029 lines of Python and 2,536 of shell still do the work | `scripts/*.py` one port at a time; `scripts/seed-size.vl` is the first and is live, and the SECOND (`check-filed-witnesses.py`) is blocked on the three `dogfood:` rulings below | days |
 | 31 | **A-destructure — `let`/`const` and PARAMETER destructuring (owner ask, 2026-09-06 night; not scheduled)** | `const { x, y } = p`, `const [a, b] = xs`, `function f({ x, y }: Pt)` → `parse error … expected an identifier but found `{``; the `match` payload clause (pun, rename, nest — #2837) is the only destructuring today | `parser.vl` (a pattern in binding and parameter position, the payload clause's grammar reused), `typecheck.vl` (binding types from the pattern; for an UN-ANNOTATED parameter the pattern is a shape constraint `{a: ?, b: {c: ?}}` with hole leaves closed at the pin — the inference half is a second step), `format.vl` (byte-for-byte round trip), the desugar (one `const` per leaf, the `match` prelude's shape); list destructuring wants the multiple-returns question in `docs/guide/lambda-param-skip-design.md` answered first | days |
-| 32 | **the completion surfaces `///` docs do NOT reach: a user `type` NAME, and the playground's missing UFCS path** | measured 2026-09-08: `type Pt` documented and in scope is offered as no completion item at all (`symScopeAt` records variable/parameter/function bindings only), and the playground adapter's member path never calls `ufcsCandidatesAt`, so it offers no UFCS method to document. The UFCS third landed 2026-09-08 and the struct FIELD third with it | the type half is a NEW completion source, not a doc gap — types in scope at the cursor, over the scope walk `symScopeAt` already does, and the doc then rides `docForDeclTok` like the other three; the playground half is `ufcsCandidatesAt` in `playground/src/lspAdapter.ts`, pinned in `tests/lsp_ufcs_docs_test.ts` | hours each |
+| 32 | **the playground's completion offers no UFCS method, so there is none to document** | measured 2026-09-08: the adapter's member path is `memberCompletionsFromWasm` alone and never calls `ufcsCandidatesAt`, so `x.f(…)` over a free `self`-function is offered by the Node LSP and not by the playground. `playground_lsp_parity_test.ts` cannot see it — one marker per FEATURE, and UFCS is a behaviour inside "completion". The three doc surfaces row 32 named all landed 2026-09-08 | `ufcsCandidatesAt` in `playground/src/lspAdapter.ts`, passed through `ufcsCompletions`; the doc then rides `UfcsCandidate.doc` with no new query (pinned in `tests/lsp_ufcs_docs_test.ts`) | hours |
 
 ### Open items that need an owner ruling first — listed, not decided
 
@@ -1668,15 +1666,23 @@ in-language GC knobs.
         each population (4,088 and 185), CONTRADICT 0. **Byte identity refuses it: 35 modules go
         `runs -> not-runs`, six of them compiler TRAPS** (`ref index access but ref array type
         not collected` x16, `ref valtype with no interned shape` x11, two collect-row refusals).
-        The rule it buys: **answering `reflist` is a PROMISE THAT A ROW EXISTS.** The descriptor
-        is read by the ref-list slot, shape and collect consumers too, and the collect pass mints
-        a row for a MAP and a NESTED-ARRAY element — which is why those two were byte-identical
-        — and none for a nullable one, so the answer is a claim the emitter cannot honour.
-        Covering it needs the collect pass to intern the row first, a build rather than a
-        projection ([D1837](internals/inventory/D1837.md), a refutation pin). A landing graded on
-        LEFT-ONLY and CONTRADICT alone would have shipped all 35. Remaining: the value-union box
-        (3,167 / 82), other union (133), one no-recorded-type module (166), and the nullable
-        element behind its build. No rung is deletable until the column is empty for the kind.
+        **The first diagnosis of that refusal was wrong and is corrected here**: the rows were
+        never missing — `refArrShapeKindGo` already interns nullable-element rows across the
+        board, and all five shapes run on master. The rule is the element's BACKING FAMILY:
+        `(string | null)[]` rides the STRING list, `(boolean | null)[]` and a litunion the i32
+        list, and only a nullable struct/map/ref-list element makes the list a ref list — which
+        a one-level variant switch cannot express ([D1837](internals/inventory/D1837.md)).
+        **And CONTRADICT 0 was partly VACUOUS**: a module that fails to emit runs no shadow
+        sweep, so the broken modules took their own counter-evidence with them — that is the
+        whole of the −627 in AGREE and the ~5,400 fewer invocations. Campaign §5.1 now requires
+        every oracle reading to be reported over the population that emitted under BOTH seeds,
+        with that count printed. **THE NARROW ARM LANDS**: the nullable-STRUCT element alone,
+        flat and tree together with the two-producer audit as the gate (flat-only reads
+        `DISAGREE kind flat=reflist tree=list/`; both read 0), byte-identical in 3,210 of 3,210
+        and 7,589 of 7,589. Remaining: the value-union box (3,167 / 82), other union (133), one
+        no-recorded-type module (166); a nullable string/boolean/litunion element is not a ref
+        list at all and is a different kind's question. No rung is deletable until the column is
+        empty for the kind.
         `docs/internals/rep-descriptor-campaign.md` §9.
      Two owner rulings gate how far items 2 and 6 can go: `one-literal-union-rep` and
      `nullable-rep-rule-stated-once` (`docs/internals/open-rulings.md` §D).
@@ -3110,13 +3116,13 @@ seed from current `compiler/*.vl` in ~40s.*
     discarded). Retain the *as-written* type syntax (or its span) so the AST is lossless for
     types — also benefits hover/inlay rendering (D1/D6/D8).
 - 🟡 **D — Project-wide unused-export hints.** Core shipped: debounced workspace pass on save (+ 3 s idle), use-map over ≤500 `.vl` files, `hint`/`unnecessary` diagnostics for zero-reference exports. REMAINING: **struct field–level unused-export analysis** — deferred because VL's structural typing makes field-level usage tracking fuzzy (a field could be "used" via a widened receiver type without any import); a future refinement could cross-check field names against known call sites once structural subtyping is tightened.
-- ⬜ **D — Organize Imports should drop a DUPLICATE specifier too.** The `duplicate-import`
-  lint (#2393) already names every repeated specifier and its quick-fix removes one — but
-  `server.ts`'s Organize Imports filters the lint stream to `unused-import` alone, so a
-  one-key "organize" leaves the duplicate behind. Adding the code to that filter is one
-  line; what needs checking first is `organizeImportEdits` over TWO IDENTICAL ranges in
-  different statements (the unused case never produces two edits that delete the same
-  text), which is why this is a follow-up and not part of #2393.
+- ✅ **D — Organize Imports drops a DUPLICATE specifier too.** The filter now takes both
+  redundant codes. The thing this row said to check first does not arise: each
+  `duplicate-import` is anchored at its OWN occurrence, so two statements yield two
+  DISTINCT ranges, and the rewrite rebuilds a statement from its survivors rather than
+  deleting per range. Identical ranges do occur — the unused and duplicate lints can name
+  one token — and the rewrite dedupes them, dropping one specifier per pass and reaching a
+  fixpoint on the next. `tests/lsp_organize_imports_duplicate_test.ts` grades all of it.
 - ⬜ **D8. Hover verbosity step-expansion.** Alias-name preservation is done (see `CHANGELOG.md`).
   REMAINING: the interactive shallow↔deep verbosity stepper — expand one alias layer at a time
   on demand via the proposed LSP 3.18 hover-verbosity API (`HoverParams.context.verbosityLevel`
@@ -3140,17 +3146,26 @@ seed from current `compiler/*.vl` in ~40s.*
 ## Track F — Infrastructure & hygiene
 *Independent; do continuously.*
 
-- ⬜ **F-day-one. Grow the day-one sampler's grammar, and aim the next run by hit rate.**
+- ✅ **F-day-one. Grow the day-one sampler's grammar, and aim the next run by hit rate.**
+  DONE 2026-09-07: all five named axes are in, each with a control that can refute it —
+  `match` as a `narrowing` SPELLING (D1885/D1886), multi-param generics as a `pinning` face
+  whose `same`-rep column is the control (D1887/D1888), recursive types as four records with
+  `rec_flat` beside them (D1889), mixed-width arithmetic as eleven READS with a same-width
+  control, 381 pairs at zero (D1890), and operator overloading as the `operator_vs_call`
+  axis whose UFCS control held 69 of 69 while four mechanisms fell out (D1891-D1894). What
+  remains below is the grammar's standing frame, not this item.
   `scripts/day-one/` generates ORDINARY programs in PAIRS and grades agree/disagree, which is
   the only instrument here that can find a shape nobody named — the others each sample a
   population somebody already wrote down. First run (2026-09-03, 640 programs) filed D1474,
   D1475 and D1476 and reproduced both of its controls. **What it cannot sample is the whole
-  backlog**: no operator overloading, no `std:json`/`buffer`/`fs`, nothing over ~25 lines,
-  and nothing whose expected output Python cannot compute. Each is one record in
-  `grammar.py`. Generics reach TWO parameters and no further (D1887/D1888); recursive types
-  are four records with a non-recursive control (D1889); `match` landed as a `narrowing`
-  SPELLING and mixed-width arithmetic as eleven READS rather than as axes of their own —
-  both compose with every axis that way, where an axis could only pair each against itself.
+  backlog**: no `std:json`/`buffer`/`fs`, nothing over ~25 lines, and nothing whose expected
+  output Python cannot compute. Each is one record in `grammar.py`. Generics reach TWO
+  parameters and no further (D1887/D1888); recursive types are four records with a
+  non-recursive control (D1889); operator overloading is the `operator_vs_call` axis, whose
+  UFCS control stayed green over 69 pairs while four mechanisms fell out (D1891-D1894);
+  `match` landed as a `narrowing` SPELLING and mixed-width arithmetic as eleven READS rather
+  than as axes of their own — both compose with every axis that way, where an axis could
+  only pair each against itself.
   Aim by the per-feature rate the run prints — `discriminant` 27.8%,
   `is_narrow` 26.1%, `closure_capture` 17.9% at the top; `scalar`, `string`, `forin`,
   `map_value`, `global_init` at zero. Details and the untriaged hit list:

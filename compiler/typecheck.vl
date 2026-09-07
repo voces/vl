@@ -15,6 +15,7 @@ import {
   f32LitOverflows,
   f64LitOverflows,
   intLexemeIsExactF32,
+  intLexemeIsExactF64,
   numLexIsFloat,
   numLexRadixBits,
   parseI32,
@@ -7471,22 +7472,41 @@ function isFloatLitExpr(ix: i32) {
   false
 }
 
-// Is the expression at `ix`, peeling parens and a unary sign, an integer literal whose value f32
-// holds exactly? The integer half of the contextual-f32-literal rule, exactness-gated where the
-// float half is context-typed: turning `16777217` into `16777216` is the lossy implicit conversion
-// VL forbids. A char literal is not admitted — a code point in a float slot is a category confusion.
-function isExactF32IntLitExpr(ix: i32) {
-  if ix < 0 { return false }
+// The lexeme of the INTEGER literal at `ix`, peeling parens and a unary sign, or "" when the
+// expression is not one. One walk for both float grants, so f32 and f64 cannot drift apart on
+// what counts as a literal. A char literal is excluded — a code point in a float slot is a
+// category confusion — and the sign is dropped because exactness is symmetric.
+function intLitLexemeOf(ix: i32): string {
+  if ix < 0 { return "" }
   const e = P.nodes[ix]
-  if e is Paren { return isExactF32IntLitExpr(e.parInner) }
+  if e is Paren { return intLitLexemeOf(e.parInner) }
   if e is Unary {
-    if e.unOp == "-" { return isExactF32IntLitExpr(e.unArg) }
+    if e.unOp == "-" { return intLitLexemeOf(e.unArg) }
   }
   if e is NumLit {
-    if numLexIsFloat(e.numText) { return false }
-    return intLexemeIsExactF32(e.numText)
+    if numLexIsFloat(e.numText) { return "" }
+    return e.numText
   }
-  false
+  ""
+}
+
+// Is the expression at `ix` an integer literal whose value f32 holds exactly? The integer half of
+// the contextual-f32-literal rule, exactness-gated where the float half is context-typed: turning
+// `16777217` into `16777216` is the lossy implicit conversion VL forbids.
+function isExactF32IntLitExpr(ix: i32) {
+  const f32Lex = intLitLexemeOf(ix)
+  if f32Lex == "" { return false }
+  intLexemeIsExactF32(f32Lex)
+}
+
+// The f64 twin, which needs no float half: a `.`-literal already TYPES f64, so only the integer
+// side has a gap. It is the literals past the i32 range — `2147483648` up to 2^53 — that type
+// `i64` and so meet the widening lattice's lossy `i64 -> f64` edge, where f64 holds every one of
+// them exactly (D1890).
+function isExactF64IntLitExpr(ix: i32) {
+  const f64Lex = intLitLexemeOf(ix)
+  if f64Lex == "" { return false }
+  intLexemeIsExactF64(f64Lex)
 }
 
 // Does the expression at `ix` adopt an f32 context as a literal — either half of the
@@ -7505,6 +7525,10 @@ function cmpF32LitAdopts(n: BinExpr, olt: i32, ort: i32) {
   if primNameOf(olt) == "f32" && isF32AdoptingLitExpr(n.binRight) {
     return true
   }
+  if primNameOf(olt) == "f64" && isExactF64IntLitExpr(n.binRight) {
+    return true
+  }
+  if primNameOf(ort) == "f64" && isExactF64IntLitExpr(n.binLeft) { return true }
   primNameOf(ort) == "f32" && isF32AdoptingLitExpr(n.binLeft)
 }
 
@@ -7755,23 +7779,28 @@ export function isBoolLitExpr(ix: i32) {
   false
 }
 
-// True if `dstTy` has an f32 position a float literal can re-encode into: a bare `f32`, a nullable
-// `f32?` (its inner), or any f32 member of a union, recursively.
-function dstAdmitsF32(dstTy: i32) {
+// True if `dstTy` has a `prim` position a literal can re-encode into: the bare prim, a nullable
+// one (its inner), or any such member of a union, recursively. One walk for both float grants, so
+// the f32 and f64 destinations cannot drift apart.
+function dstAdmitsPrim(dstTy: i32, prim: PrimName) {
   if dstTy < 0 { return false }
-  if primNameOf(dstTy) == "f32" { return true }
+  if primNameOf(dstTy) == prim { return true }
   const t = T.tys[dstTy]
-  if t is TyNullable { return dstAdmitsF32(t.nInner) }
+  if t is TyNullable { return dstAdmitsPrim(t.nInner, prim) }
   if t is TyUnion {
     let i = 0
     while i < t.uMembers.length {
-      if dstAdmitsF32(t.uMembers[i]) { return true }
+      if dstAdmitsPrim(t.uMembers[i], prim) { return true }
       i = i + 1
     }
     return false
   }
   false
 }
+
+function dstAdmitsF32(dstTy: i32) { dstAdmitsPrim(dstTy, "f32") }
+
+function dstAdmitsF64(dstTy: i32) { dstAdmitsPrim(dstTy, "f64") }
 
 // Does function type `tyIx` carry an inference hole — a `TyVar` param or return? Such a type is a
 // generic, capability-bounded function value (`(a, b) => a + b`), not a concrete signature.
@@ -8489,6 +8518,12 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
   // integer half folds the lexeme into a bignum, while `dstAdmitsF32` is a short arena walk.
   if dstAdmitsF32(dstTy) {
     if isF32AdoptingLitExpr(srcExpr) { return true }
+  }
+  // The same grant one width up, and only its integer half: an i32-typed literal already rides
+  // the `i32 -> f64` lattice edge, so what this admits is the literals between 2^31 and 2^53 that
+  // type `i64` and would otherwise meet the lossy `i64 -> f64` refusal. D1890.
+  if dstAdmitsF64(dstTy) {
+    if isExactF64IntLitExpr(srcExpr) { return true }
   }
   // A `boolean` value flows into an i32 slot as 1/0 (A7) — a no-op in codegen, boolean riding in an
   // i32. One-directional, and a bare `true`/`false` literal is excluded. A float-literal array into
@@ -32929,6 +32964,11 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
   // checked before the general mixed rule so `x + 1` stays f32 rather than widening to f64.
   if primNameOf(lt) == "f32" && isF32AdoptingLitExpr(n.binRight) { return lt }
   if primNameOf(rt) == "f32" && isF32AdoptingLitExpr(n.binLeft) { return rt }
+  // The f64 twin, integer half only — a `.`-literal already types f64 and needs no arm. Without
+  // it `fv + 9000000000` is the mixed-numeric refusal while the same literal ASSIGNED to an f64
+  // is admitted, so the two faces of one grant would disagree (D1890).
+  if primNameOf(lt) == "f64" && isExactF64IntLitExpr(n.binRight) { return lt }
+  if primNameOf(rt) == "f64" && isExactF64IntLitExpr(n.binLeft) { return rt }
   // A mixed-numeric op widens the narrower operand to the wider one (`i32 op i64` -> i64, ...),
   // done before the same-type check so a compatible mixed pair is accepted (B2).
   if mixesNumeric(lt, rt) { return widerNumeric(lt, rt) }

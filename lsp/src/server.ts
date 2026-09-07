@@ -95,6 +95,7 @@ import {
   type OutlineSymbolKind,
   refCountLensTitle,
   scopeCompletionsFromBindings,
+  typeCompletionsFromWasm,
   SEMANTIC_TOKEN_LEGEND,
   semanticTokensDataFromWasm,
   snippetCompletions,
@@ -1399,6 +1400,17 @@ connection.onCompletion(async (params): Promise<CompletionItem[]> => {
     byName.set(c.name, c);
   }
   for (const c of scopeCompletionsFromBindings(bindings)) byName.set(c.name, c);
+  // The TYPE namespace, added last and never over a name a value already took: at a use
+  // site the value is what the author reaches for, and one label cannot mean both.
+  const typeNames = await wasmChecker
+    .typeNamesAt?.(text, entryKeyOf(uri), workspaceReader)
+    .catch((err) => {
+      connection.console.log(`[wasm-checker] typeNamesAt failed: ${err}`);
+      return [];
+    }) ?? [];
+  for (const c of typeCompletionsFromWasm(typeNames, (n) => byName.has(n))) {
+    byName.set(c.name, c);
+  }
   const identifiers = [...byName.values()].map((c) => toCompletionItem(c));
   const keywords = keywordCompletions(false).map((c) => toCompletionItem(c));
   const snippets = snippetCompletions(false).map((c) => toCompletionItem(c));
@@ -1503,19 +1515,26 @@ connection.onCodeAction((params): CodeAction[] => {
   }
 
   // Organize imports: per-STATEMENT rewrite aligned with `vl fmt`'s canon —
-  // unused specifiers dropped (from the lint tier, re-run against the
-  // request-time text so a stale cache can't misplace an edit), survivors
-  // fmt-sorted via the seed's own formatter, a specifier-less statement's line
-  // deleted whole. Statements are never merged or reordered (fmt preserves
-  // statement order). No edits — the file is already organized — means NO
-  // action: an empty organize on every save is noise.
+  // redundant specifiers dropped, unused and duplicate alike (from the lint
+  // tier, re-run against the request-time text so a stale cache can't misplace
+  // an edit), survivors fmt-sorted via the seed's own formatter, a
+  // specifier-less statement's line deleted whole. Statements are never merged
+  // or reordered (fmt preserves statement order). No edits — the file is
+  // already organized — means NO action: an empty organize on every save is
+  // noise.
   if (kindMatchesOnly(CodeActionKind.SourceOrganizeImports, only)) {
-    const unused = (wasmChecker?.lint(source) ?? [])
-      .filter((d) => d.code === "unused-import")
+    // BOTH redundant codes, not the unused one alone: a duplicate specifier
+    // introduces nothing either, and its lint is anchored at the second
+    // occurrence's imported-name token precisely so this rewrite applies to it
+    // unchanged.
+    const redundant = (wasmChecker?.lint(source) ?? [])
+      .filter((d) =>
+        d.code === "unused-import" || d.code === "duplicate-import"
+      )
       .map((d) => d.range);
     const edits = organizeImportEdits(
       source,
-      unused,
+      redundant,
       (stmt) => wasmChecker?.formatSrc?.(stmt),
     );
     if (edits.length > 0) {

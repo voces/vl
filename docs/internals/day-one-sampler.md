@@ -86,16 +86,33 @@ AXIS for the same reason, and prints `NOT EXERCISED` rather than a zero.
 7. **`scenery`** — the same program with and without a plausible UNRELATED neighbour: an
    `xs.push` (D1401), a `self`-function never called (D1430), an unused higher-order
    declaration (D1100), an unused `type`, an unused import.
-8. **`init_vs_assign`** — `const v = e` against `let v = <literal>` then `v = e`. The
+8. **`operator_vs_call`** — an OPERATOR against the direct call of a plain function with
+   the same body: `v + opW` against `plusVec(v, opW)`. Its faces are read ids, like
+   `narrowing`'s, because what differs is the one line that consumes the value, and both
+   declarations stand in both faces so a disagreement is about the CALL rather than about
+   declaring an operator at all. Grouping is by the OPERATOR and not by expected output —
+   `[]` and `[]=` are two groups on one record and several reads print the same number, so
+   a `want` key would pair a getter against a setter. `==` / `!=` are the design's bounded
+   exclusion (every type compares structurally, and the parser says so), so no record
+   declares one: both faces would refuse together and a both-fail is not a hit.
+
+   Five records, and the fifth is the CONTROL. `op_add` (`+`, same-type binary), `op_mul`
+   (`*` with an `i32` right operand), `op_cmp` (`<`, whose result leaves the receiver's
+   type), `op_index` (`[]` and `[]=`), and **`op_none`: no operator anywhere, a plain call
+   against its UFCS twin** — the other dispatch-by-receiver mechanism in the language, so a
+   disagreement it shares is about dispatch in general. The receiver is a `new` NOMINAL type
+   because the receiver type IS the dispatch key, which is also why these records carry
+   `no_inline`.
+9. **`init_vs_assign`** — `const v = e` against `let v = <literal>` then `v = e`. The
    literal pins the `let`'s rep and the assignment is where a differently-repped source
    disagrees with that pin.
-9. **`modules_split`** — the same program as ONE file and as TWO modules. A GENERATOR axis:
+10. **`modules_split`** — the same program as ONE file and as TWO modules. A GENERATOR axis:
    it has its own grammar (`modules.py`) rather than a face flipped on a plan drawn from the
    tables above, because module scope has two storage classes (wasm globals and
    start-function locals), every module's top level is lowered into ONE start function, and
    several by-name scans see only one class or only one module. D1593 / D1595 / D1596 all
    needed two files to appear and every instrument here was blind to them.
-10. **`imports_pair`** — the same program importing ONE std module and importing TWO. Also a
+11. **`imports_pair`** — the same program importing ONE std module and importing TWO. Also a
     GENERATOR axis (`imports.py`), and for the same reason: what it varies is the IMPORT
     LIST, which no plan above has. D1514 is the shape — `std:fs` compiled in 18 ms alone,
     `std:array` in 40 ms alone, the module importing BOTH in 5,006 ms — and six sweep rows
@@ -126,8 +143,10 @@ Stated plainly, because a zero from an instrument is only as good as its frame.
 
 * **Anything outside the grammar.** Seventeen value shapes, six sources, nine delivery
   positions, six scopes, five neighbours; the module axis adds twenty-four units and nine
-  reports, and the imports axis twelve std modules. No operator overloading, no strings
-  beyond `+`/`.length`. Generics reach TWO parameters (`pass2<A, B>`) and no further.
+  reports, and the imports axis twelve std modules. No strings beyond `+`/`.length`.
+  Generics reach TWO parameters (`pass2<A, B>`) and no further. Operator overloading reaches
+  `+ - * / %`, `< > <= >=` and `[]`/`[]=` on ONE nominal receiver; `==` / `!=` are refused by
+  the design, so no pair can be written for them.
   Mixed-width arithmetic reaches only the three LOSSLESS edges and only with a literal on
   one side; the lossy edges the design refuses are graded by hand (D1890), because both
   faces of a pair refuse them together.
@@ -473,6 +492,50 @@ f32 = 2147483648` runs, because the f32 target has an exactness-gated literal-ad
 predicate and the f64 target rides the `i32 -> f64` lattice edge alone (D1890). The refused
 VALUE edges (`i64 -> f64`, `i32 -> f32`, every narrowing) refuse uniformly at all seven
 positions and are the design's rule, not a hole.
+
+## The `operator_vs_call` sample — 443 pairs, 15 disagreements, and the control that stayed green
+
+Seeds 701-708, 800 programs each, before and after:
+
+| | pairs | AGREE-RUNS | DISAGREE | BOTH-FAIL-SAME | BOTH-FAIL-DIFFER |
+| --- | --- | --- | --- | --- | --- |
+| before, whole sample | 3,200 | 3,043 | 72 | 74 | 11 |
+| after, whole sample | 3,200 | 3,044 | 69 | 80 | 7 |
+
+The whole-sample numbers barely move — the RNG stream re-shuffles and the new records take
+their share of the draws — so the row that carries the result is the per-record one:
+
+| record | pairs | AGREE-RUNS | not AGREE |
+| --- | --- | --- | --- |
+| `op_add` | 117 | 109 | 6 DISAGREE · 2 both-fail |
+| `op_index` | 123 | 115 | 5 DISAGREE · 3 both-fail |
+| `op_mul` | 68 | 65 | 2 DISAGREE · 1 both-fail |
+| `op_cmp` | 66 | 64 | 2 DISAGREE |
+| **`op_none` (control)** | **69** | **69** | **0** |
+
+The control is the whole point of the table. `op_none` reaches the same function by a plain
+call and by UFCS, at the same positions and under the same axes, and every one of its 69
+pairs agreed — so the fifteen disagreements are about OPERATOR dispatch and not about
+dispatch, about nominal receivers, or about the `mkval` shape all five records share.
+
+**Every disagreement is at the `argument` position** — an un-annotated parameter — and none
+is at the other eight. Four ablated rows:
+
+| row | outcome | the sentence |
+| --- | --- | --- |
+| D1891 | loud check reject | `comparison expects numeric operands, got _ and Ord` |
+| D1892 | **loud EMIT reject**, `vl check` rc 0 | `emitProgram: index access but array type not collected` |
+| D1893 | loud check reject | `argument 1: operator '*' is not defined for Sca and i32` |
+| D1894 | loud check reject | `argument 1: expected {x: _}, got Pln` |
+
+They are four mechanisms, not one message split four ways. D1891 is the operator resolved on
+the LEFT operand alone, so a hole there never reaches the table — `opO < p` and the two-hole
+`p < q` both RUN, which is what says it is the position and not the operator. D1892 is the
+brackets going through CHECK and dying in the emitter, with three different sentences
+depending on unrelated module content. D1893 is scenery: **any** `std:` import (fmt, array,
+json, str all tested) makes an operator on a hole refuse where the identical import-free
+program prints `12`. D1894 is the solve synthesising a structural `{x: _}` from a field read
+and then refusing the `new`-branded argument, with no operator and no import in the witness.
 
 ## Running it
 
