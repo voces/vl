@@ -91,8 +91,8 @@ fn main() -> Result<()> {
         s.lock().unwrap().out.push(parts.join(" "));
     })?;
 
-    // ── the filesystem floor (`std:fs`) ──────────────────────────────────────
-    // The ten fs imports, registered only when the module declares them. This spike
+    // ── the host floor (`std:fs`, `std:args`, `std:process`, `std:env`) ──────
+    // The fifteen host imports, registered only when the module declares them. This spike
     // is not in CI and is built by nothing (see the header) — it carries them because
     // ROADMAP's host-ABI item requires every new import to land in all three hosts, and
     // because a parity harness that cannot instantiate a file-touching module cannot
@@ -278,7 +278,114 @@ fn main() -> Result<()> {
             Ok(())
         })?;
     }
+    // `__proc_exit__(code)` — end the process with `code`, answering nothing. This host
+    // BUFFERS output and prints it after instantiation, so the buffer is drained here
+    // first: an exit that skipped it would lose everything the program printed.
+    if let Some(ft) = fs_ty("__proc_exit__") {
+        let s = state.clone();
+        linker.func_new("imports", "__proc_exit__", ft, move |_c, a, _r| {
+            let Val::I32(code) = a[0] else {
+                bail!("__proc_exit__: expected an i32 code")
+            };
+            for line in s.lock().unwrap().out.iter() {
+                println!("{line}");
+            }
+            use std::io::Write;
+            std::io::stdout().flush().ok();
+            std::process::exit(code);
+        })?;
+    }
+    // The last `__proc_run__`'s captured streams — the reason `run` is three imports and
+    // not one, since a wasm import answers a single value.
+    let proc_io: Arc<Mutex<(Vec<u8>, Vec<u8>)>> = Arc::new(Mutex::new((Vec::new(), Vec::new())));
     if let Some((st, at)) = u8_types {
+        // `__proc_run__(argv)` — run a program and answer its exit code, or `-errno` when
+        // it could not be started. NUL SEPARATES the command from its arguments, there is
+        // no shell, and the child gets no stdin. A non-zero exit is an answer, not a
+        // failure: `errno` is 0 whenever the child ran at all.
+        if let Some(ft) = fs_ty("__proc_run__") {
+            let e = fs_errno.clone();
+            let io = proc_io.clone();
+            linker.func_new("imports", "__proc_run__", ft, move |mut c, a, r| {
+                use std::os::unix::ffi::OsStringExt;
+                let block = bytes_of(&mut c, &a[0])?;
+                let mut parts: Vec<Vec<u8>> = block.split(|b| *b == 0).map(<[u8]>::to_vec).collect();
+                *io.lock().unwrap() = (Vec::new(), Vec::new());
+                let mut code = 0i32;
+                let mut rc = 0i32;
+                if parts.is_empty() || parts[0].is_empty() {
+                    code = 28; // EINVAL
+                } else {
+                    let prog = std::ffi::OsString::from_vec(parts.remove(0));
+                    let mut cmd = std::process::Command::new(&prog);
+                    cmd.stdin(std::process::Stdio::null());
+                    for p in parts {
+                        cmd.arg(std::ffi::OsString::from_vec(p));
+                    }
+                    match cmd.output() {
+                        Err(err) => code = errno_of(&err),
+                        Ok(out) => {
+                            // A signal leaves no exit code; `128 + N` is the shell's answer.
+                            rc = match out.status.code() {
+                                Some(n) => n,
+                                None => {
+                                    use std::os::unix::process::ExitStatusExt;
+                                    128 + out.status.signal().unwrap_or(0)
+                                }
+                            };
+                            *io.lock().unwrap() = (out.stdout, out.stderr);
+                        }
+                    }
+                }
+                *e.lock().unwrap() = code;
+                r[0] = Val::I32(if code != 0 { -code } else { rc });
+                Ok(())
+            })?;
+        }
+        // The two stream fetches. Like `__args_count__` they cannot fail and so leave
+        // `errno` alone, keeping a failed spawn's reason readable afterwards.
+        if let Some(ft) = fs_ty("__proc_out__") {
+            let io = proc_io.clone();
+            let (st, at) = (st.clone(), at.clone());
+            linker.func_new("imports", "__proc_out__", ft, move |mut c, _a, r| {
+                let bytes = io.lock().unwrap().0.clone();
+                r[0] = mk_list(&mut c, &st, &at, &bytes)?;
+                Ok(())
+            })?;
+        }
+        if let Some(ft) = fs_ty("__proc_err__") {
+            let io = proc_io.clone();
+            let (st, at) = (st.clone(), at.clone());
+            linker.func_new("imports", "__proc_err__", ft, move |mut c, _a, r| {
+                let bytes = io.lock().unwrap().1.clone();
+                r[0] = mk_list(&mut c, &st, &at, &bytes)?;
+                Ok(())
+            })?;
+        }
+        // `__env_get__(name)` — the value as bytes, or EMPTY with `errno`: `ENOENT` when
+        // unset, `EINVAL` for a name no environment can hold. A variable set to the empty
+        // string answers empty with `errno` 0, which is what separates the two.
+        if let Some(ft) = fs_ty("__env_get__") {
+            let e = fs_errno.clone();
+            let (st, at) = (st.clone(), at.clone());
+            linker.func_new("imports", "__env_get__", ft, move |mut c, a, r| {
+                use std::os::unix::ffi::{OsStrExt, OsStringExt};
+                let name = bytes_of(&mut c, &a[0])?;
+                let mut out: Vec<u8> = Vec::new();
+                let mut code = 0i32;
+                if name.is_empty() || name.contains(&0) || name.contains(&b'=') {
+                    code = 28; // EINVAL
+                } else {
+                    match std::env::var_os(std::ffi::OsString::from_vec(name)) {
+                        None => code = 44, // ENOENT
+                        Some(v) => out = v.as_bytes().to_vec(),
+                    }
+                }
+                *e.lock().unwrap() = code;
+                r[0] = mk_list(&mut c, &st, &at, &out)?;
+                Ok(())
+            })?;
+        }
         if let Some(ft) = fs_ty("__fs_read__") {
             let e = fs_errno.clone();
             let (st, at) = (st.clone(), at.clone());

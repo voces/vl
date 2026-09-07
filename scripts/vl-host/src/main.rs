@@ -2817,8 +2817,8 @@ fn run_program_with(
     Ok(())
 }
 
-// ── the filesystem floor (`std:fs`) ──────────────────────────────────────────
-// Seven host imports. Unlike the print family they are OPTIONAL: the emitter declares
+// ── the host floor (`std:fs`, `std:args`, `std:process`, `std:env`) ──────────
+// Fifteen host imports. Unlike the print family they are OPTIONAL: the emitter declares
 // only the ones the program calls, so this side registers only what the module asks
 // for and a file-free program's instantiation is byte-for-byte the work it was before.
 //
@@ -3041,16 +3041,58 @@ fn os_path(bytes: &[u8]) -> Result<std::path::PathBuf, i32> {
     }
 }
 
-/// The bytes of one directory entry's name. Unix hands them over raw; elsewhere the
-/// name must be UTF-8 for the same reason `os_path` requires it.
+/// The raw bytes of an OS string — a directory entry's name, an environment value.
+/// Unix hands them over as they are; elsewhere the string must be UTF-8 for the same
+/// reason `os_path` requires it, and `None` is the caller's `EILSEQ`.
 #[cfg(unix)]
-fn entry_name_bytes(name: &std::ffi::OsStr) -> Option<Vec<u8>> {
+fn os_str_bytes(s: &std::ffi::OsStr) -> Option<Vec<u8>> {
     use std::os::unix::ffi::OsStrExt;
-    Some(name.as_bytes().to_vec())
+    Some(s.as_bytes().to_vec())
 }
 #[cfg(not(unix))]
-fn entry_name_bytes(name: &std::ffi::OsStr) -> Option<Vec<u8>> {
-    name.to_str().map(|s| s.as_bytes().to_vec())
+fn os_str_bytes(s: &std::ffi::OsStr) -> Option<Vec<u8>> {
+    s.to_str().map(|t| t.as_bytes().to_vec())
+}
+
+/// An OS string from guest bytes — a command name, one of its arguments, an environment
+/// variable's name. The Unix / non-Unix split is `os_path`'s and for the same reason: a
+/// Unix argv element is bytes, and where it is not, a non-UTF-8 one is `EILSEQ`.
+#[cfg(unix)]
+fn os_string(bytes: &[u8]) -> Result<std::ffi::OsString, i32> {
+    use std::os::unix::ffi::OsStringExt;
+    Ok(std::ffi::OsString::from_vec(bytes.to_vec()))
+}
+#[cfg(not(unix))]
+fn os_string(bytes: &[u8]) -> Result<std::ffi::OsString, i32> {
+    match std::str::from_utf8(bytes) {
+        Ok(s) => Ok(std::ffi::OsString::from(s)),
+        Err(_) => Err(25), // EILSEQ
+    }
+}
+
+/// The command and its arguments, out of `__proc_run__`'s one NUL-SEPARATED block.
+/// NUL SEPARATES, it does not terminate: `cmd` alone is a command with no arguments and
+/// `cmd\0` is a command with one EMPTY argument. An empty argv element is legal and a NUL
+/// inside one is not, which is what makes this encoding lossless.
+fn split_argv(block: &[u8]) -> Vec<Vec<u8>> {
+    block.split(|b| *b == 0).map(<[u8]>::to_vec).collect()
+}
+
+/// The exit code `__proc_run__` answers for a finished child. A child KILLED BY A SIGNAL has
+/// no exit code at all, and `128 + signal` is the shell's own answer for it — a number the
+/// caller can act on rather than an error, because the process did run.
+fn child_code(status: std::process::ExitStatus) -> i32 {
+    if let Some(c) = status.code() {
+        return c;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(sig) = status.signal() {
+            return 128 + sig;
+        }
+    }
+    128
 }
 
 /// Register the fs imports the module actually declares.
@@ -3079,6 +3121,11 @@ fn register_fs_imports(
         .collect();
     let has = |n: &str| declared.iter().find(|(name, _)| name == n).cloned();
     let types = u8_list_types(module);
+    // The last `__proc_run__`'s captured streams, for the two slots that fetch them. Held
+    // beside `errno` and for the same reason: a wasm import returns ONE value, and stdout,
+    // stderr and the exit code are three. Per instance, so a `--batch` case cannot read
+    // another's; cleared at the START of each run, so a failed spawn answers empty.
+    let proc_io: Arc<Mutex<(Vec<u8>, Vec<u8>)>> = Arc::new(Mutex::new((Vec::new(), Vec::new())));
 
     // `__fs_errno__()` — the out-of-band reason for the last failed call. Reads only.
     if let Some((_, ft)) = has("__fs_errno__") {
@@ -3198,6 +3245,22 @@ fn register_fs_imports(
                 }
             }
             Ok(())
+        })?;
+    }
+
+    // `__proc_exit__(code)` — end the process NOW with `code`, answering nothing. The one
+    // import that never returns, so the guest sees no result and there is no errno to set.
+    // Both streams are flushed first: a `println!` line sink is line-buffered, and an exit
+    // that dropped the program's own last line would be a silent loss.
+    if let Some((_, ft)) = has("__proc_exit__") {
+        linker.func_new("imports", "__proc_exit__", ft, move |_c, args, _r| {
+            let Val::I32(code) = args[0] else {
+                bail!("__proc_exit__: expected an i32 code");
+            };
+            use std::io::Write;
+            std::io::stdout().flush().ok();
+            std::io::stderr().flush().ok();
+            std::process::exit(code);
         })?;
     }
 
@@ -3436,7 +3499,7 @@ fn register_fs_imports(
                                     if name == "." || name == ".." {
                                         continue;
                                     }
-                                    match entry_name_bytes(&name) {
+                                    match os_str_bytes(&name) {
                                         None => {
                                             code = 25; // EILSEQ
                                             break;
@@ -3490,6 +3553,117 @@ fn register_fs_imports(
                     Vec::new()
                 }
             };
+            results[0] = make_u8_list(&mut c, &st, &at, &out)?;
+            Ok(())
+        })?;
+    }
+
+    // `__proc_run__(argv)` — run a program to completion and answer its exit code, or a
+    // negative `-errno` when it could not be started. NO SHELL, NO STDIN: the block is an
+    // argv and not a command line, so nothing here expands a glob or splits on a space, and
+    // the child's stdin is `/dev/null`. `errno` is 0 whenever the child ran, non-zero only
+    // when it did not — the exit code itself is an ANSWER, never a failure.
+    if let Some((_, ft)) = has("__proc_run__") {
+        let e = errno.clone();
+        let io = proc_io.clone();
+        linker.func_new("imports", "__proc_run__", ft, move |mut c, args, results| {
+            let block = read_u8_list(&mut c, &args[0])?;
+            let mut parts = split_argv(&block);
+            // Cleared before the spawn, so a failed one leaves the previous run's output
+            // unreadable rather than answering it a second time.
+            *io.lock().unwrap() = (Vec::new(), Vec::new());
+            let mut code = 0i32;
+            let mut rc = 0i32;
+            if parts.is_empty() || parts[0].is_empty() {
+                code = 28; // EINVAL — the block names no command
+            } else {
+                let prog = parts.remove(0);
+                match os_string(&prog) {
+                    Err(bad) => code = bad,
+                    Ok(p) => {
+                        let mut cmd = std::process::Command::new(&p);
+                        cmd.stdin(std::process::Stdio::null());
+                        for a in &parts {
+                            match os_string(a) {
+                                Err(bad) => {
+                                    code = bad;
+                                    break;
+                                }
+                                Ok(s) => {
+                                    cmd.arg(s);
+                                }
+                            }
+                        }
+                        if code == 0 {
+                            match cmd.output() {
+                                Err(err) => code = wasi_errno(&err),
+                                Ok(out) => {
+                                    rc = child_code(out.status);
+                                    *io.lock().unwrap() = (out.stdout, out.stderr);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            *e.lock().unwrap() = code;
+            results[0] = Val::I32(if code != 0 { -code } else { rc });
+            Ok(())
+        })?;
+    }
+
+    // `__proc_out__()` / `__proc_err__()` — the last `__proc_run__`'s captured streams,
+    // EMPTY before the first run and after a failed one. Neither can fail, so like
+    // `__args_count__` they leave `errno` alone: the reason the spawn failed stays readable
+    // after the caller has asked for the output.
+    if let Some((_, ft)) = has("__proc_out__") {
+        let io = proc_io.clone();
+        let (st, at) = (st.clone(), at.clone());
+        linker.func_new("imports", "__proc_out__", ft, move |mut c, _a, results| {
+            let bytes = io.lock().unwrap().0.clone();
+            results[0] = make_u8_list(&mut c, &st, &at, &bytes)?;
+            Ok(())
+        })?;
+    }
+    if let Some((_, ft)) = has("__proc_err__") {
+        let io = proc_io.clone();
+        let (st, at) = (st.clone(), at.clone());
+        linker.func_new("imports", "__proc_err__", ft, move |mut c, _a, results| {
+            let bytes = io.lock().unwrap().1.clone();
+            results[0] = make_u8_list(&mut c, &st, &at, &bytes)?;
+            Ok(())
+        })?;
+    }
+
+    // `__env_get__(name)` — the variable's value as bytes, or EMPTY with `errno` set:
+    // `ENOENT` when it is not set, `EINVAL` for a name no environment can hold (empty, or
+    // carrying `=` or NUL), `EILSEQ` for a value this platform cannot hand over as bytes.
+    // A variable set to the EMPTY string answers empty with `errno` 0, which is the split.
+    if let Some((_, ft)) = has("__env_get__") {
+        let e = errno.clone();
+        let (st, at) = (st.clone(), at.clone());
+        linker.func_new("imports", "__env_get__", ft, move |mut c, args, results| {
+            let name = read_u8_list(&mut c, &args[0])?;
+            let mut out: Vec<u8> = Vec::new();
+            let mut code = 0i32;
+            if name.is_empty() || name.contains(&0) || name.contains(&b'=') {
+                code = 28; // EINVAL
+            } else {
+                match os_string(&name) {
+                    Err(bad) => code = bad,
+                    Ok(n) => match std::env::var_os(&n) {
+                        None => code = 44, // ENOENT
+                        Some(v) => match os_str_bytes(&v) {
+                            None => code = 25, // EILSEQ
+                            Some(b) => out = b,
+                        },
+                    },
+                }
+            }
+            if code != 0 {
+                out.clear();
+            }
+            *e.lock().unwrap() = code;
             results[0] = make_u8_list(&mut c, &st, &at, &out)?;
             Ok(())
         })?;

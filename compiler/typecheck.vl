@@ -3693,8 +3693,8 @@ export function initChecker() {
   declare("__load_i64__", mkFuncTy([TY_I32], TY_I64))
   declare("__load_f32__", mkFuncTy([TY_I32], TY_F32))
   declare("__load_f64__", mkFuncTy([TY_I32], TY_F64))
-  // The filesystem floor (`std:fs`): ten host imports, which unlike everything above them do
-  // not lower to instructions — a syscall is the one thing wasm cannot express. Bytes, not
+  // The filesystem floor (`std:fs`, `std:args`), which unlike everything above it does not
+  // lower to instructions — a syscall is the one thing wasm cannot express. Bytes, not
   // strings, in both directions, so a payload crosses as one packed `u8[]` GC object. Errors are
   // out of band: a failing call answers an empty `u8[]` and `__fs_errno__()` carries WASI errno.
   const u8Arr = mkArrayTy(TY_U8)
@@ -3708,6 +3708,15 @@ export function initChecker() {
   declare("__args_count__", mkFuncTy(noParams, TY_I32))
   declare("__args_get__", mkFuncTy([TY_I32], u8Arr))
   declare("__fs_errno__", mkFuncTy(noParams, TY_I32))
+  // The process floor (`std:process`, `std:env`): five more host imports on the same
+  // out-of-band error channel. `__proc_run__` takes the command and its arguments as ONE
+  // NUL-separated block — the one byte an argv element cannot hold — and answers the
+  // child's exit code; its two captured streams are fetched by the slots after it.
+  declare("__proc_run__", mkFuncTy([u8Arr], TY_I32))
+  declare("__proc_out__", mkFuncTy(noParams, u8Arr))
+  declare("__proc_err__", mkFuncTy(noParams, u8Arr))
+  declare("__proc_exit__", mkFuncTy([TY_I32], TY_VOID))
+  declare("__env_get__", mkFuncTy([u8Arr], u8Arr))
   0
 }
 
@@ -3779,12 +3788,12 @@ export function nameIsMemStoreIntrinsic(name: string) {
   false
 }
 
-// ── the filesystem floor: one ordered list, six readers ──────────────────────
+// ── the host floor: one ordered list, six readers ────────────────────────────
 
-// The slot is the identity of an fs intrinsic everywhere downstream, and the order below is the
-// only place it is written, so a name added here appears in all six consumers or in none. The
-// order is append-only: slot k's import index is assigned by counting the used slots below k, so
-// inserting a name would move every later import's wasm function index. -1 for every other name.
+// The slot is the identity of a host intrinsic everywhere downstream — files, argv, processes
+// and the environment share one table because they share one lowering — and the order below is
+// the only place it is written, so a name added here appears in all six consumers or in none.
+// Append-only: inserting a name would move every later import's wasm index. -1 for a non-member.
 export function fsIntrinsicSlot(name: string): i32 {
   if name == "__fs_read__" { return 0 }
   if name == "__fs_write__" { return 1 }
@@ -3796,13 +3805,18 @@ export function fsIntrinsicSlot(name: string): i32 {
   if name == "__fs_read_range__" { return 7 }
   if name == "__fs_size__" { return 8 }
   if name == "__fs_read_into__" { return 9 }
+  if name == "__proc_run__" { return 10 }
+  if name == "__proc_out__" { return 11 }
+  if name == "__proc_err__" { return 12 }
+  if name == "__proc_exit__" { return 13 }
+  if name == "__env_get__" { return 14 }
   -1
 }
 
 // How many fs slots exist. Every parallel table the emitter keeps (`gFsUse`, `gFsIdx`) is exactly
 // this long, and every read of one is bound-checked against it — `emitFail` does not halt
 // emission, so an out-of-bounds read here would trap a compiler that had already decided to fail.
-export function fsIntrinsicCount(): i32 { 10 }
+export function fsIntrinsicCount(): i32 { 15 }
 
 // The name at slot `k` — the inverse of `fsIntrinsicSlot`, used by the import and name
 // sections, which iterate slots rather than spelling names. `""` for a slot out of
@@ -3818,6 +3832,11 @@ export function fsIntrinsicNameAt(k: i32): string {
   if k == 7 { return "__fs_read_range__" }
   if k == 8 { return "__fs_size__" }
   if k == 9 { return "__fs_read_into__" }
+  if k == 10 { return "__proc_run__" }
+  if k == 11 { return "__proc_out__" }
+  if k == 12 { return "__proc_err__" }
+  if k == 13 { return "__proc_exit__" }
+  if k == 14 { return "__env_get__" }
   ""
 }
 
@@ -3837,6 +3856,8 @@ export function fsArgIsU8List(k: i32, a: i32) {
   if k == 7 { return a == 0 }
   if k == 8 { return a == 0 }
   if k == 9 { return a == 0 }
+  if k == 10 { return a == 0 }
+  if k == 14 { return a == 0 }
   false
 }
 
@@ -3850,13 +3871,20 @@ export function fsIntrinsicArity(k: i32): i32 {
   if k == 7 { return 3 }
   if k == 8 { return 1 }
   if k == 9 { return 4 }
+  if k == 10 { return 1 }
+  if k == 11 { return 0 }
+  if k == 12 { return 0 }
+  if k == 13 { return 1 }
+  if k == 14 { return 1 }
   if k >= 0 && k <= 3 { return 1 }
   -1
 }
 
 // True when slot `k` returns a `u8[]` (the packed wrapper) rather than an i32 — the split the type
 // section's functype shapes and the emitter's result classification both turn on.
-export function fsRetIsU8List(k: i32) { k == 0 || k == 2 || k == 5 || k == 7 }
+export function fsRetIsU8List(k: i32) {
+  k == 0 || k == 2 || k == 5 || k == 7 || k == 11 || k == 12 || k == 14
+}
 
 // True when slot `k` takes an i64 in argument position `a` — a range read's byte offset into the
 // FILE, which an i32 cannot address past 2 GiB. Read beside `fsArgIsU8List` by the functype
@@ -3870,6 +3898,12 @@ export function fsArgIsI64(k: i32, a: i32) {
 // True when slot `k` returns an i64 rather than an i32 or the packed wrapper — a file size, for
 // the same addressing reason. Read beside `fsRetIsU8List` by the same two.
 export function fsRetIsI64(k: i32) { k == 8 }
+
+// True when slot `k` returns NOTHING — the one slot that never returns at all,
+// `__proc_exit__`. Read beside the two above by the functype writer, which otherwise
+// declares exactly one result per slot; a diverging import declared with a result would
+// oblige every host to leave a value on the stack it can never reach the code to push.
+export function fsRetIsVoid(k: i32) { k == 13 }
 
 // True when slot `k` writes into linear memory, so the module needs the memory emitted and
 // exported even when it contacts it nowhere else. Without this a program whose only memory

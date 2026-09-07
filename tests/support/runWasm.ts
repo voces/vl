@@ -28,6 +28,22 @@ export type RunResult = {
   exports: WebAssembly.Exports;
 };
 
+/**
+ * What `__proc_exit__` raises here. This harness has no process to end — `runWasm` is a
+ * function inside a test runner — so the one honest emulation of "never returns" is to
+ * unwind, carrying the code the guest asked for. It is NOT a `WebAssembly.RuntimeError`,
+ * so `mapTrap` passes it through unchanged and a caller can tell an exit from a trap.
+ */
+export class VLExitError extends Error {
+  /** The code the guest passed to `exit`. */
+  readonly code: number;
+  constructor(code: number) {
+    super(`the program called exit(${code})`);
+    this.name = "VLExitError";
+    this.code = code;
+  }
+}
+
 export class VLRuntimeError extends Error {
   /** The wasm function name (from the name section), when present in the trace. */
   readonly functionName?: string;
@@ -222,6 +238,14 @@ export const runWasm = async (wasm: Uint8Array): Promise<RunResult> => {
             "__args_count__",
             "__args_get__",
             "__fs_errno__",
+            // The process floor (`std:process`, `std:env`) is blocked by the SAME two
+            // walls: `__proc_run__` and `__env_get__` are handed a `u8[]`, and the three
+            // that answer one would have to build it. Only `__proc_exit__` is scalar in
+            // both directions, and it is implemented below.
+            "__proc_run__",
+            "__proc_out__",
+            "__proc_err__",
+            "__env_get__",
           ].map((name) => [name, () => {
             throw new Error(
               `${name} is not available under the V8 harness — WasmGC values are opaque to JS ` +
@@ -230,6 +254,13 @@ export const runWasm = async (wasm: Uint8Array): Promise<RunResult> => {
             );
           }]),
         ),
+        // `__proc_exit__(code)` — the one process import this harness CAN honour. It must
+        // not end the test runner's own process, so it unwinds as {@link VLExitError}
+        // instead; the guest sees a call that never returns either way. Placed after the
+        // spread so it is the definition, not a stub.
+        __proc_exit__: (code: number) => {
+          throw new VLExitError(code);
+        },
         __print_str_flush__: () => {
           // `TextDecoder` takes the whole buffer, so the chunking this used to need is
           // gone with its cause: `String.fromCodePoint(...spread)` blew the JS
