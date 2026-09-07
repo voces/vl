@@ -524,6 +524,59 @@ Deno.test({
   },
 });
 
+// The same axis at MODULE scope, where the accumulator is a wasm CELL rather than a slot.
+// `strAccScan` ran per function body and `emitStartFnCode` never called it, so a top-level
+// `let s = ""` kept the pairwise concat: 200,000 appends cost 0.844 s CPU against 400,000's
+// 3.530 s, a 4.18 ratio over a 2x input (ROADMAP row 26). Both arms build the same 800 KB
+// string, so the append arm has only to match the builder.
+const genGlobalAppendLoop = (n: number): string =>
+  [
+    'let s = ""',
+    "let i = 0",
+    `while i < ${n} { s = s + "0123456789abcdefghij"; i = i + 1 }`,
+    "print(s.length)",
+    "",
+  ].join("\n");
+
+const genGlobalJoinBuild = (n: number): string =>
+  [
+    'import { join } from "std:str"',
+    "let parts: string[] = []",
+    "let i = 0",
+    `while i < ${n} { parts.push("0123456789abcdefghij"); i = i + 1 }`,
+    'print(join(parts, "").length)',
+    "",
+  ].join("\n");
+
+Deno.test({
+  name: "scaling shape: module-global string append loop",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = await Deno.makeTempDir({ prefix: "vl_scale_gstrappend_" });
+    try {
+      const [manySrc, oneSrc] = twoFiles(
+        dir,
+        genGlobalAppendLoop(40000),
+        genGlobalJoinBuild(40000),
+      );
+      await grade(
+        "module-global string append loop",
+        2.5,
+        "40,000 appends to a TOP-LEVEL `let s = \"\"` against the same string built " +
+          "through std's builder: the accumulator lowering (`strAccScanStart` / " +
+          "`emitStrAccAppend`, compiler/wasmEmit.vl) stopped reaching the start function, so " +
+          "every append allocates an exact-fit backing and copies the whole prefix again. " +
+          "The function-scope pair above is the control for which half broke.",
+        () => runProg(manySrc),
+        () => runProg(oneSrc),
+        RUN_FLOOR,
+      );
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
+
 // ── the instrument's own control ─────────────────────────────────────────────
 // EVERY PAIR ABOVE PASSES, so nothing above can say whether the grader still reds. The
 // control is the same `grade` over a pair that must: one source, one literal different,
