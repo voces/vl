@@ -160,7 +160,9 @@ that block — no change to the chain, the narrowing, or the emitter.
 
 **Syntax.** A variant pattern may carry a PUNNED field list: `Move{x, y} => …`. The clause is
 `'{' IDENT (',' IDENT)* ','? '}'` immediately after the pattern's type atom, and it binds one
-arm-local `const` per field, named after the field. `Move{}` is legal and binds nothing.
+arm-local `const` per field, named after the field. An EMPTY clause is refused — `Move{}`
+means exactly `Move`, and one spelling per meaning is the ruling (`open-rulings.md`
+§match-empty-clause, B21.2).
 
 **Lowering — the if-chain twin, verbatim.** The recorded plan ("Why not a tag `switch`", above) is
 what shipped: `desugarMatchAt` PREPENDS the arm's `const x = scrut.x` statements to the block the
@@ -235,13 +237,15 @@ would rewrite the first into the second — a token deletion, which is the `vl f
 **Two refusals the richer forms add — both DECLINED as surface, not deferred.** A NESTED TYPE PATTERN (`{inner: Circle{r}}`) is refused by
 name: a clause reads a field, and a type before the brace would TEST it, so the arm would stop
 covering its own variant and exhaustiveness — the point of the whole construct — would need a rule
-nothing has ruled. An EMPTY nested clause (`{p: {}}`) is refused too: `Move{}` is legal because it
-says "this variant, no bindings", but `p: {}` reads a field, binds nothing, and leaves the
-formatter no declaration to print it back from, so the next `vl fmt` would silently delete it.
-Neither is a deferral. Each was already refused before this landing, by the generic "must be a
-field name"; what was added is a sentence. Reopening the first needs an exhaustiveness rule for
-an arm that no longer covers its variant, and the second a column to print an empty group back
-from — a decision each, not a branch.
+nothing has ruled. An EMPTY clause is refused at BOTH depths: `p: {}` reads a field, binds
+nothing, and leaves the formatter no declaration to print it back from, so the next `vl fmt`
+would silently delete it; `Move{}` binds nothing either and means exactly the bare `Move`, so it
+is a second spelling of one meaning with nothing for the formatter to choose between. Each names
+the form to write instead. Neither is a deferral. The nested one was already refused before the
+2b landing, by the generic "must be a field name", and what was added is a sentence; the
+top-level one was legal until B21.2 ruled one spelling per meaning. Reopening the first needs an
+exhaustiveness rule for an arm that no longer covers its variant, and the second a column to
+print an empty group back from — a decision each, not a branch.
 
 Both forms land in the arm's PRELUDE, so both work in value position (below) with no extra slice —
 nested destructuring especially, since it is the form that puts the most `const`s in one arm.

@@ -564,6 +564,7 @@ import {
 import { emitFail, emitFailAt } from "./emit_bytes"
 import {
   MV_ARM_NOHINT,
+  RepDesc,
   declTyIxOfName,
   fieldElemTyIxOfName,
   hcShapeSetId,
@@ -586,6 +587,8 @@ import {
   recordSTyIx,
   recordUnMemTys,
   repCanonId,
+  repDescNone,
+  repDescRet,
   repElemId,
   repElemIdOfNameTy,
   repKindOfSigTok,
@@ -1560,9 +1563,7 @@ function globalIsNulMapSid(fnIx: i32, sid: i32) {
 
 // True if the function `name` returns a nullable struct (`"nulstruct"`).
 function fnRetNulRefSid(sid: i32, name: string, fnIx: i32) {
-  const i = fnIndexOfInScopeSid(sid, name, fnIx)
-  if i < 0 { return false }
-  fRetKind[i] == "nulstruct"
+  repOfNameResult(sid, name, fnIx).rdKind == "nulstruct"
 }
 
 // True if the `LetDecl` at `letIx` declares a nullable-struct local: its annotation
@@ -2280,9 +2281,7 @@ function globalIsNulStringSid(fnIx: i32, sid: i32) {
 }
 
 function fnRetNulStringSid(sid: i32, name: string, fnIx: i32) {
-  const i = fnIndexOfInScopeSid(sid, name, fnIx)
-  if i < 0 { return false }
-  fRetKind[i] == "nulstr"
+  repOfNameResult(sid, name, fnIx).rdKind == "nulstr"
 }
 
 export function letIsNulString(letIx: i32, fnIx: i32) {
@@ -3888,6 +3887,36 @@ export function fnIndexOfInScopeSid(sid: i32, name: string, fnIx: i32) {
     }
   }
   fnIndexOfSid(sid)
+}
+
+// The rep of the RESULT of calling `name`, resolved in the frame `fnIx` reads it — the ONE
+// home for the walk (#2815's calling frame, #2840's origin hop) and for the three return
+// columns that answer after it. `rdCovered` 0 means the name resolves to no lifted function;
+// `rdNul` is unanswered, since these columns carry no null discipline.
+export function repOfNameResult(sid: i32, name: string, fnIx: i32): RepDesc {
+  const i = fnIndexOfInScopeSid(sid, name, fnIx)
+  if repShadowOn { repABNoteNameResult(sid, i) }
+  if i < 0 { return repDescNone() }
+  // The three columns are pushed together in `buildFnMap`'s one loop over `fnStmts`, so an
+  // index valid for any of them is valid for all three; reading them together is what makes
+  // this a descriptor rather than three lookups that can drift.
+  repDescRet(fRetKind[i], fRetStructIdx[i], fRetRArrElem[i])
+}
+
+// The oracle at this surface compares the FLAT map's answer against the frame-aware walk's:
+// a disagreement is one site where a per-pin clone would have adopted its template's rep,
+// which is the whole D1788 family in one measurement.
+function repABNoteNameResult(sid: i32, scoped: i32) {
+  const flat = fnIndexOfSid(sid)
+  if flat == scoped { return 0 }
+  repABNote("nameResult", repABRetWord(flat), repABRetWord(scoped))
+}
+
+// A resolved slot's stored return kind as a report word, or `declined` for no slot.
+function repABRetWord(i: i32): string {
+  if i < 0 { return "declined" }
+  if i >= fRetKind.length { return "declined" }
+  fRetKind[i]
 }
 
 // ── capture analysis (closures) ───────────────────────────────────────────────
@@ -24221,9 +24250,7 @@ export function variantFieldIndex(vi: i32, field: string) {
 // per-pin clone shares its template's name, and the flat lookup always answers the template,
 // so an i32 instance read the struct pin's kind and returned a ref it never built (D1788).
 function fnRetStructSid(sid: i32, name: string, fnIx: i32) {
-  const i = fnIndexOfInScopeSid(sid, name, fnIx)
-  if i < 0 { return false }
-  fRetKind[i] == "struct"
+  repOfNameResult(sid, name, fnIx).rdKind == "struct"
 }
 
 // True if the parameter `name` of function `fnIx` is the struct type.
@@ -25183,20 +25210,21 @@ function declaredStructIndex(name: string) {
 // Frame-aware for the same reason its kind companion is: the two must resolve to the SAME
 // function, or the kind says struct while the row is another instance's (D1788).
 function fnRetStructIndexSid(sid: i32, name: string, fnIx: i32) {
-  const i = fnIndexOfInScopeSid(sid, name, fnIx)
-  if i < 0 { return -1 }
+  const d = repOfNameResult(sid, name, fnIx)
+  if d.rdCovered == 0 { return -1 }
   // Kind-gated, like every other reader of the polymorphic companion slot: `fRetStructIdx`
   // holds four namespaces selected by `fRetKind` (struct row, variant index, ref-list slot,
   // map shape), and every sibling reader gates on the kind first (D26) — the producer needs
   // the same gate a misreading consumer already carries.
-  const k = fRetKind[i]
+  const k = d.rdKind
   if k != "struct" && k != "nulstruct" { return -1 }
   // D871 — the same redirect the map's value slot and the local's cell take: the row the
   // return annotation names is the row the `??` family superseded, and the callee's returned
   // literal is minted at the merged row instead. Safe under the four-namespace slot since the
   // kind gate above already establishes this one is a struct-table row.
-  if !anonLeafRetMovedOf(fnStmts[i]) { return fRetStructIdx[i] }
-  anonLeafSupersedeOf(fRetStructIdx[i])
+  const i = fnIndexOfInScopeSid(sid, name, fnIx)
+  if !anonLeafRetMovedOf(fnStmts[i]) { return d.rdSlot }
+  anonLeafSupersedeOf(d.rdSlot)
 }
 
 // The struct table index of a module global `name` (from its annotation/initializer),
@@ -25695,9 +25723,7 @@ export function structIndexOfLet(letIx: i32, fnIx: i32) {
 
 // True if function `name` declares the union as its return type.
 function fnRetUnionSid(sid: i32, name: string, fnIx: i32) {
-  const i = fnIndexOfInScopeSid(sid, name, fnIx)
-  if i < 0 { return false }
-  fRetKind[i] == "union"
+  repOfNameResult(sid, name, fnIx).rdKind == "union"
 }
 
 // True if the parameter `name` of function `fnIx` is the union type.
@@ -28545,9 +28571,7 @@ export function exprReReadable(exprIx: i32): boolean {
 // return. Scope-aware because a monomorphized instance's per-pin clone shares the template's
 // name, and the flat map answers the template (D1781).
 function fnRetArraySid(sid: i32, name: string, fnIx: i32) {
-  const i = fnIndexOfInScopeSid(sid, name, fnIx)
-  if i < 0 { return false }
-  fRetKind[i] == "list"
+  repOfNameResult(sid, name, fnIx).rdKind == "list"
 }
 
 // True if the already-collected declared local `name` is an i32-array ref (code `2`).
@@ -28803,9 +28827,7 @@ export function letIsArray(letIx: i32, fnIx: i32) {
 
 // True if function `name` declares a ref array (`S[]`/`N[]`) as its return type.
 function fnRetRefArraySid(sid: i32, name: string, fnIx: i32) {
-  const i = fnIndexOfInScopeSid(sid, name, fnIx)
-  if i < 0 { return false }
-  fRetKind[i] == "reflist"
+  repOfNameResult(sid, name, fnIx).rdKind == "reflist"
 }
 
 // True if the parameter `name` of function `fnIx` is a ref-array type.
@@ -28957,9 +28979,7 @@ function paramRefArrayName(fnIx: i32, name: string) {
 // The ref-list ELEMENT type-NAME a function `name` returns (from its `S[]`/`N[]` return
 // annotation, recorded in `fRetRArrElem`), or "".
 function fnRetRefArrayNameSid(sid: i32, name: string, fnIx: i32) {
-  const i = fnIndexOfInScopeSid(sid, name, fnIx)
-  if i < 0 { return "" }
-  fRetRArrElem[i]
+  repOfNameResult(sid, name, fnIx).rdListElem
 }
 
 // The INNER ref-list element type-NAME a function `name` returns when its return is a NULLABLE ref array
@@ -30394,9 +30414,7 @@ function declaredStringArray(name: string) { declaredKind(name) == "strlist" }
 // (`"strlist"`). Mirrors `fnRetArray`/`fnRetRefArray` — lets a `string[]`-returning call
 // classify so an untyped `let x = snap()` picks the string-list local kind (code `7`).
 function fnRetStringArraySid(sid: i32, name: string, fnIx: i32) {
-  const i = fnIndexOfInScopeSid(sid, name, fnIx)
-  if i < 0 { return false }
-  fRetKind[i] == "strlist"
+  repOfNameResult(sid, name, fnIx).rdKind == "strlist"
 }
 
 // True if function `name` declares (or, un-annotated, infers) an `f64[]` return — the f64
@@ -30404,18 +30422,14 @@ function fnRetStringArraySid(sid: i32, name: string, fnIx: i32) {
 // an f64 list (kind 12) instead of falling through to i32. Resolved from frame `fnIx` for
 // `fnRetArraySid`'s reason.
 function fnRetF64ArraySid(sid: i32, name: string, fnIx: i32) {
-  const i = fnIndexOfInScopeSid(sid, name, fnIx)
-  if i < 0 { return false }
-  fRetKind[i] == "f64list"
+  repOfNameResult(sid, name, fnIx).rdKind == "f64list"
 }
 
 // True if function `name` returns a string-keyed mono map (`{[string]: i32}`, annotated or
 // inferred — `"map"`). Lets `exprMap`/`mapShapeOfExpr` classify a call to it, so
 // `const r = mk()` (or `mk()[k]`) routes through the map lowering.
 function fnRetMapSid(sid: i32, name: string, fnIx: i32) {
-  const i = fnIndexOfInScopeSid(sid, name, fnIx)
-  if i < 0 { return false }
-  fRetKind[i] == "map"
+  repOfNameResult(sid, name, fnIx).rdKind == "map"
 }
 
 // True if evaluating the expression at `exprIx` yields a string list: a string-element
@@ -30943,18 +30957,16 @@ function globalIsF32ArraySid(fnIx: i32, sid: i32) {
   letIsF32Array(li, -1)
 }
 
-function fnRetF32ArraySid(sid: i32) {
-  const i = fnIndexOfSid(sid)
-  if i < 0 { return false }
-  fRetKind[i] == "f32list"
+function fnRetF32ArraySid(sid: i32, name: string, fnIx: i32) {
+  repOfNameResult(sid, name, fnIx).rdKind == "f32list"
 }
 
 // True if function `name` carries an annotated `f32[]` return — read straight off the
 // annotation node, since neither `fRetKind` (no f32-list arm) nor the typed-IR fast path
 // (`tyKindOf` carries no f32-array kind) can answer for f32. Gated on `fn.fnRet >= 0`: an
 // un-annotated `f32[]` return is a different, still-open defect.
-function fnRetAnnF32ArraySid(sid: i32) {
-  const i = fnIndexOfSid(sid)
+function fnRetAnnF32ArraySid(sid: i32, name: string, fnIx: i32) {
+  const i = fnIndexOfInScopeSid(sid, name, fnIx)
   if i < 0 || i >= fnStmts.length { return false }
   const fn = P.nodes[fnStmts[i]]
   if fn is FuncDecl {
@@ -31149,10 +31161,14 @@ export function exprF32Array(exprIx: i32, fnIx: i32) {
     }
     const callee = P.nodes[e.callFn]
     if callee is Ident {
-      if fnRetF32ArraySid(sidOfNode(e.callFn)) { return true }
+      if fnRetF32ArraySid(sidOfNode(e.callFn), callee.identName, fnIx) {
+        return true
+      }
       // A named function with an annotated `f32[]` return — the annotation read directly,
       // since f32 has neither channel its i64/f64 siblings use (`fnRetAnnF32ArraySid`).
-      if fnRetAnnF32ArraySid(sidOfNode(e.callFn)) { return true }
+      if fnRetAnnF32ArraySid(sidOfNode(e.callFn), callee.identName, fnIx) {
+        return true
+      }
       // A closure-VALUE call (`g()` with `g: () => f32[]`) whose resolved sig result is
       // the f32 list (`>F`) — the f32 dual of the i64/f64-list callee arms.
       return calleeRetKindSid(sidOfNode(e.callFn), fnIx) == "f32list"
@@ -32194,9 +32210,7 @@ function fnRetStringSid(sid: i32, name: string, fnIx: i32) {
   const spelled = sidText(sid)
   if spelled == "fromCodePoint" { return true }
   if spelled == "fromCodePoints" { return true }
-  const i = fnIndexOfInScopeSid(sid, name, fnIx)
-  if i < 0 { return false }
-  fRetKind[i] == "str"
+  repOfNameResult(sid, name, fnIx).rdKind == "str"
 }
 
 // True if the parameter `name` of function `fnIx` is `string`-typed.
