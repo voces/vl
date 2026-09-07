@@ -372,7 +372,7 @@ descriptor declines, which is exactly how much of the domain the descriptor cann
 | 2 | `repOfNameResult` — the name surface | new surface | a NAME plus the calling frame | ✅ DONE, closes D1834 |
 | 3 | `vtKindOfType`'s annotation ladder | domain-REMOVING | an annotation node the checker did NOT type | 🟡 15 kinds LEFT-ONLY, **147,945** queries. Deletion REFUSED (§6.3); five missing arms added, CONTRADICT 2,963 → 178 |
 | 4 | the field-code ladders — `fieldCodeOfTy` and its spelling siblings | domain-KEEPING | `fieldCodeOfTy` answers `-2` = *"the spelling ladder owns the rest"* — a NAMED decline, so the domain is explicit | ✅ **DONE** (§6.4): 0 CONTRADICT over 58,428 queries, byte-identical, a FOURTH numbering scheme collapsed into one `fieldCodeOfVKind` table. The domain-WIDENING variant was refused at a price of 8 modules |
-| 5 | the valtype ladders — `fbValtype` (31 arms), `fbValtypeNullable`, `fbRefNullForKind`, `fbHeapIdxForKind` | already a projection of `VKind` | a `VKind` member | low value alone; move it with item 4, since the two schemes translate into each other |
+| 5 | the valtype writers — `fbValtype`, `fbValtypeNullable`, `fbRefNullOfKind`, `fbRefNullForKind` | consumers of a `VKind`, not classifiers | a `VKind` member plus its slot | ✅ **DONE** (§6.5), and it corrected this row: a QUARTET not a trio, `fbHeapIdxForKind` does not exist, and three of the four were already `_`-less `match` tables. The fourth is now one too |
 | 6 | the `expr*` family — 48 classifiers, 927 call sites | domain-REMOVING | an EXPRESSION node, which the arena may not have typed (a monomorphized body carries the template's types) | blocked on item 7; convert by AXIS, never alphabetically |
 | 7 | `repOfName` for BINDINGS | new surface | a name plus the frame it is READ in → the declaration → its type | **BLOCKED, and the blocker is named**: `declaredSlotOf` takes a bare name with no frame; `paramTypeNode` and `globalLetOfSidIn` take `fnIx` only as a *frame-binds-this-name veto*, not as a scope-chain walk. Callee resolution has been frame-aware since D1781; binding resolution never was |
 | 8 | the slot layer — `structIndexOfExpr`, `rlSlot*`, `mvSlot*`, `exprVariantIndex` | domain-KEEPING, per resolver | a nominal table row | last: `rdSlot` is the field the descriptor least owns (`repOfTy` fills it from `repSlotOfTy` for `TyObj` alone) |
@@ -649,6 +649,60 @@ void field has no storage. The fourteen constants become one `fieldCodeOfVKind` 
 
 Byte-identical in **3,165 of 3,165** `tests/cases` modules and **7,589 of 7,589** corpus cells.
 Seed **+120 bytes (+0.005%)**.
+
+---
+
+### 6.5 The valtype writers — the un-gated member of a QUARTET, and a de-duplication refused
+
+The doc's own §5.2 called this family "the last numbering scheme with no translation table".
+**That was wrong, and the correction is the first thing measured here.** `fbValtype` and
+`fbValtypeNullable` are already `_`-less `match` tables over `VKind`; `fbHeapIdxForKind`, which
+this list and the ROADMAP both named, **does not exist**. What the family actually has is:
+
+* **four writers, not three.** `fbValtype`, `fbValtypeNullable`, `fbRefNullOfKind` and
+  `fbRefNullForKind` all take `(kind: VKind, structIdx: i32)` and write bytes for it.
+  `fbRefNullForKind`'s own comment calls itself *"the third member of the kind/slot pairing
+  trio"* — stale by one, and the miscount is why the fourth was never audited with the others.
+* **one of the four is not gated by the language.** Three are `_`-less `match`es; `fbRefNullForKind`
+  is an `if`/`else if` chain ending `else { wSLEB(aTypeIdx) }` — the array heap type, handed to
+  any `VKind` member with no arm. Its own comment already admitted it: *"the one an
+  exhaustiveness check does not cover (an `if`-chain)"*.
+* **a dead arm.** The chain tests `kind == "variant"` twice — once at the top paired with
+  `nulvariant`, once again 25 arms later with a bounds check of its own. The second is
+  unreachable.
+
+**The oracle does not apply to this family, and saying why matters.** These four do not
+CLASSIFY — they consume a `VKind` some classifier already produced. There is no
+descriptor-versus-ladder comparison to make, so the differential harness has nothing to
+measure. The instrument that fits is the LANGUAGE's own exhaustiveness check, and it is
+strictly stronger: a `_`-less `match` is verified over the whole 31-member set at compile time,
+where the oracle samples two corpora.
+
+**What shipped** is `fbRefNullForKind` as a `_`-less `match`, with the five scalars
+(`i32`, `nulbool`, `i64`, `f64`, `f32`) named rather than left to the fall-through — a scalar
+cell holds no ref to null, so its operand is a placeholder no consumer reads as a heap type —
+and the dead second `variant` arm gone. Byte-identical in **3,165 of 3,165** `tests/cases`
+modules and **7,589 of 7,589** corpus cells; the seed **SHRINKS 113 bytes**, and
+`kind-ladder-incomplete` falls by one in `emit_bytes.vl`.
+
+**And a de-duplication was built and refused, by three ratchets at once.** All four writers
+carry a byte-identical 14-line bounds guard over the same six slot-bearing kinds — the textbook
+case for one predicate. Extracting it to `fbSlotUnresolved(kind, structIdx)` compiles, is
+byte-identical, and shrinks the seed by 685 bytes. It also:
+
+* takes **`sentinel-index-unguarded` from 0 to 21** in `emit_bytes.vl`. The lint's contract is
+  *within one function*, so moving the bound test behind a helper leaves twenty-one table reads
+  with no comparison the checker can see — and that lint exists because four compiler TRAPS in
+  one day were exactly this shape;
+* takes **`kind-ladder-incomplete` from 1 to 2**, because the extracted predicate is itself an
+  `if`-chain over `VKind` with a bare `false` default;
+* trips **`comment-block-too-long`** three times.
+
+**The duplication was carrying something.** Each copy is the evidence a per-read lint needs at
+the read it guards, and folding four copies into one removes the evidence, not the risk. This
+is the campaign's bar in a third form: after *do not remove a domain* and *do not widen a
+domain*, **do not move a guard out of the reach of the checker that verifies it.** The
+candidate is kept in the record rather than shipped, with its price in the three ratchet counts.
 
 ---
 
