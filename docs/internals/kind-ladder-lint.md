@@ -165,6 +165,57 @@ is excluded by the same rule that excluded `funcRetUnrepresentable`'s loop in tr
 census's set column names which closed set a chain's literals belong to, not whether the chain
 is a dispatch.
 
+## A LITUNION SET IS MATCHABLE — the refusal is about NULLABLE, not literal
+
+Eleven of the thirteen closed sets are `lit` (`ladder-census.py --sets` says so in its second
+column): only `Node` and `Ty` are declared unions of object types. The pilot recorded that two
+`VKind` sites were refused with
+
+    match over a union with literal members is not supported — compare them with `==` in an if-chain
+
+and that sentence, read as written, retires every `lit` set from this campaign. **It is false at
+the plainest spelling, and the message's own tail says so — it prints `got K | null`.**
+
+Measured, one program per claim:
+
+| spelling | outcome |
+| --- | --- |
+| a declared alias, `_`-less and exhaustive | **runs** |
+| an inline `"a" \| "b" \| "c"` parameter | **runs** |
+| a local bound from a call | **runs** |
+| an or-pattern arm (`"b" \| "c" \| "d" => …`) | **runs** |
+| a `match` whose arm returns the litunion | **runs** |
+| arms covering a SUBSET, no `_` | `non-exhaustive match — missing "c" (add the arm or a `_`)` |
+| `K \| null`, un-narrowed | refused |
+| `K \| null` with an explicit `null` arm | refused identically |
+| `K \| null` after `if k == null { return … }` | **runs** |
+
+So the constraint is the NULLABLE litunion, not the literal one, and the checker's exhaustiveness
+gate works over a litunion by name. The refusal is filed as [D1898](inventory/D1898.md).
+
+### What the closed set is, and what a sub-domain may leave unnamed
+
+The set is the `export type`'s members, derived exactly as `ladder-budget.py --check` derives it
+— **31 for `VKind`, 15 for `RtKind`, 17 for `EqCmpKind`** — never the sub-domain a site happens
+to answer about. A chain answering for twelve of `VKind`'s thirty-one is still a chain over
+`VKind`.
+
+**The honesty test is the DEFAULT, not the count.** With the or-pattern, the nineteen members a
+site does not name cost one arm, so "twenty-eight empty arms" was never the real objection. What
+decides it is whether the fall-through value is a real answer:
+
+* **It is** — the site converts, and the or-pattern arm carries that answer with its reason.
+  `retKindPri`'s `0` is the cheap-fallback TIER (three of its own arms exist because a kind
+  reached the wrong tier: D937, D1562, D1622); `fieldCodeOfVKind`'s `-2` is "outside this
+  vocabulary, ask the spelling ladder"; `vkNulNicheOf`'s `null` is "no nullable niche is owed".
+  All three converted, `_`-less, 108 → 105.
+* **It is not** — a bare `0`/`""`/`false` nobody chose — the site owes a NAMED default first,
+  and that is a fix rather than a refactor.
+
+A site whose scrutinee is `VKind | null` cannot convert at all until D1898 closes; that is what
+still holds `forceAnnLeafReps` and `collectMapFilterUse` as `if` chains, and it is the reason to
+record, not "litunions are not matchable".
+
 ## Agreement, and why there are two implementations
 
 `compiler/lint.vl` grades one module from the source the driver hands it; the census grades the

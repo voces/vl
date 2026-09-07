@@ -44,10 +44,12 @@ import {
 import { emitProgram, sidKeyedTablesReset } from "./emit_sections"
 import {
   srcmapModOfTok,
+  srcmapPathOf,
   srcmapPush,
   srcmapReset,
   srcmapSetKeys,
 } from "./srcmap"
+import { wBytes, wName, wSection, wTarget, wULEB } from "./emit_bytes"
 import {
   W,
   emitErr,
@@ -61,6 +63,7 @@ import {
   fnDispNames,
   fnIndices,
   fnNames,
+  gEmitNames,
   globalNames,
   globalStmts,
   localNames,
@@ -240,6 +243,8 @@ import {
   symUfcsScanCount,
   symUfcsScanDetailCharAt,
   symUfcsScanDetailLen,
+  symUfcsScanDocCharAt,
+  symUfcsScanDocLen,
   symUfcsScanExportedAt,
   symUfcsScanNameCharAt,
   symUfcsScanNameLen,
@@ -954,6 +959,7 @@ export function compileSrc(): i32 {
   }
   const rc = emitProgram(root)
   if rc < 0 { return 3 }
+  emitSrcSection()
   0
 }
 export function rbyteLen(): i32 { W.bytes.length }
@@ -1702,6 +1708,12 @@ export function ufcsScanModuleAt(i: i32): i32 {
   modOfTok(tk)
 }
 export function ufcsScanExportedAt(i: i32): i32 { symUfcsScanExportedAt(i) }
+// The `///` block of UFCS candidate `i` — the same text `docAt` gives hover for that
+// declaration. 0 length when it carries none.
+export function ufcsScanDocLen(i: i32): i32 { symUfcsScanDocLen(i) }
+export function ufcsScanDocCharAt(i: i32, j: i32): i32 {
+  symUfcsScanDocCharAt(i, j)
+}
 
 // Builtin completions: the compiler's builtin surface — type names, builtin
 // functions, and linear-memory intrinsics — kept here beside the compiler that owns
@@ -2098,7 +2110,11 @@ function stmtAnchorTokIx(nodeIx: i32): i32 {
 export function emitFnSpanAt(off: i32): i32 {
   let i = 0
   while i < emitFnSpanStart.length {
-    if off >= emitFnSpanStart[i] && off < emitFnSpanEnd[i] { return i }
+    // Kind 5 is a per-statement row banked for the `vl-src` section. This lookup answers the
+    // invalid-module diagnostic, whose position is the declaration's by contract (D1578).
+    if emitFnSpanKindOf(i) != 5 {
+      if off >= emitFnSpanStart[i] && off < emitFnSpanEnd[i] { return i }
+    }
     i = i + 1
   }
   -1
@@ -2117,7 +2133,9 @@ function emitFnSpanTokIx(i: i32): i32 {
   // A module-scope statement anchors at its own node (D1594). The stamp test below
   // keeps a synthesized body positionless; a top-level statement is parsed, never
   // synthesized, so requiring a `declNameTok` would throw away its real position.
-  if emitFnSpanKindOf(i) == 1 { return stmtAnchorTokIx(emitFnSpanNode[i]) }
+  // Kind 5 anchors the way a module-scope statement does — at the statement itself.
+  const sk = emitFnSpanKindOf(i)
+  if sk == 1 || sk == 5 { return stmtAnchorTokIx(emitFnSpanNode[i]) }
   // The slot's pre-monomorphization original first: a mono instance, a lifted lambda
   // copy, and a pruned stub are all minted after parsing, so `addNode` anchors them
   // at the EOF token — a position that reads as real but points at the file's last
@@ -2159,6 +2177,67 @@ export function emitFnSpanModule(i: i32): i32 {
   if t >= 0 { return modOfTok(t) }
   0
 }
+// ── the `vl-src` custom section: a module byte offset → the source line ──────────
+// Serialises the `emitFnSpan*` table plus its per-statement rows, so a host turns a trap
+// frame's offset into the instruction's line with no compiler session. Rows are already
+// module-relative. Rides `--names` — DECISIONS.md §"The `vl-src` section rides `--names`".
+function emitSrcSection(): i32 {
+  if gEmitNames == 0 { return 0 }
+  if emitFnSpanStart.length == 0 { return 0 }
+  // The file table, in module order, through the one speller the name section's own suffix
+  // uses — so the two cannot spell a file two ways (open-rulings §trap-frame-path-spelling).
+  const files: string[] = []
+  let r = 0
+  while r < emitFnSpanStart.length {
+    const m = emitFnSpanModule(r)
+    while files.length <= m { files.push("") }
+    if files[m] == "" { files[m] = srcmapPathOf(m) }
+    r = r + 1
+  }
+  const payload: i32[] = []
+  const prev = wTarget(payload)
+  wULEB(files.length)
+  let f = 0
+  while f < files.length {
+    wName(files[f])
+    f = f + 1
+  }
+  // One row per span: the byte range, its anchor's line and column, and which file. A row
+  // with line 0 has no anchor at all, so it is dropped rather than written and skipped — and
+  // the count is a ULEB prefix, so the kept rows are counted before any are written.
+  let kept = 0
+  let c = 0
+  while c < emitFnSpanStart.length {
+    if emitFnSpanLine(c) > 0 { kept = kept + 1 }
+    c = c + 1
+  }
+  wULEB(kept)
+  let i = 0
+  while i < emitFnSpanStart.length {
+    const ln = emitFnSpanLine(i)
+    if ln > 0 {
+      wULEB(emitFnSpanStart[i])
+      wULEB(emitFnSpanEnd[i])
+      wULEB(ln)
+      wULEB(emitFnSpanCol(i))
+      wULEB(emitFnSpanModule(i))
+    }
+    i = i + 1
+  }
+  wTarget(prev)
+  const sec: i32[] = []
+  const secPrev = wTarget(sec)
+  wName("vl-src")
+  wBytes(payload)
+  wTarget(secPrev)
+  // Appended to the finished module: legal for a custom section, and it leaves every other
+  // section's bytes at the offsets the rows name.
+  const outPrev = wTarget(W.bytes)
+  wSection(0, sec)
+  wTarget(outPrev)
+  0
+}
+
 // The name the name section gives this body — a lambda's binding display name where
 // it has one, else the declared name — so the host's sentence and the engine's own
 // `function[N]::<name>` cannot disagree.
@@ -3606,6 +3685,7 @@ function modCompile(emit: i32): i32 {
   if emit != 0 {
     const rc = emitProgram(merged)
     if rc < 0 { return 3 }
+    emitSrcSection()
   }
   0
 }
