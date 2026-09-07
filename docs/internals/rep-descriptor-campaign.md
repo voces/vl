@@ -502,6 +502,68 @@ are the walk doing its job, not a defect, and no site outside the known family c
 on the merge-base and `rc=0` here — the conversion itself moves no byte, and the fix is
 observable only on the fixture it ships with, because no existing module had the shape.
 
+### 6.3 `vtKindOfType`'s ladder — five missing rungs closed, and a deletion REFUSED by its own oracle
+
+The doc's §5.2 item 2 said the work here is "widening `repOfTy` coverage until the fallback is
+unreachable, then deleting it". Measured, that sentence is half right, and the half that is
+wrong cost a candidate.
+
+**The measurement.** With the ladder computed beside the descriptor at every call, over
+`tests/cases` and the distilled corpus (10,734 modules, 1,082,293 queries):
+
+| | queries | kinds |
+| --- | --- | --- |
+| AGREE | 931,385 | — |
+| LEFT-ONLY (ladder answers, descriptor declines — the ladder is load-bearing) | 147,945 | 15 |
+| CONTRADICT (both answer, differently) | 2,963 | 6 |
+
+The LEFT-ONLY column is the descriptor's real coverage gap and is headed by `reflist`
+(111,683 queries in 876 modules), `i32` (17,358), `map` (4,437), `union` (3,358) and `str`
+(3,233). **Nine kinds appear in AGREE and never in LEFT-ONLY** — `struct` (117,609), `i64`
+(42,355), `closure` (15,574), `variant` (8,547), `f32` (5,619), `nulstr` (4,805), `u8list`
+(3,176), `nulclosure` (2,804), `f32list` (1,087), **201,576 queries** — which reads exactly
+like nine dead rungs.
+
+**The deletion was built, and its own oracle refused it.** Deleting all nine is
+byte-identical — `0 of 3,154` `tests/cases` modules and `0 of 7,589` corpus cells — and the
+two ordering pairs it touches (`nulclosure` before `closure`, `variant` before `struct`) are
+wholly inside the dead set, so no surviving rung changes what it sees. And then the oracle
+reads **CONTRADICT 2,963 → 204,539**: with the rungs gone, the ladder answers its `"i32"`
+default for all nine shapes, which is a valid-looking answer for a different rep at every one
+of them.
+
+**So "the descriptor always answers first" is not the deletion criterion.** The ladder's
+domain is *an annotation node the checker recorded no type on*, and for such a node the
+descriptor cannot answer by construction — `annRepKindOf` declines exactly there. The nine
+rungs are therefore not dead, they are **untested**: neither corpus contains an un-typed node
+of those nine shapes. Byte identity proves nothing breaks today and says nothing about the
+domain, which is why the deletion criterion has to be *unreachability* or *a named default*,
+not *no observed counterexample*. `tyKindOf` was safe to convert because it kept its DOMAIN
+and moved only the rep answer; this would have removed the domain.
+
+**What shipped instead is the fix the same measurement names.** Five of the six CONTRADICT
+classes are the five nullable scalar-list niches — `string[] | null`, `f64[] | null`,
+`i64[] | null`, `f32[] | null`, `u8[] | null` — for which the ladder had **no rung at all**,
+so each fell past every nullable arm to the `"i32"` default. `nulScalarListKindOfNode` is the
+predicate the local, param and global ladders already ask, and asking it here is what makes
+the two producers agree:
+
+```
+BEFORE  AGREE  931385  LEFT-ONLY  147945  CONTRADICT   2963  (6 classes)
+AFTER   AGREE  934170  LEFT-ONLY  147945  CONTRADICT    178  (1 classes)
+```
+
+Byte-identical in `3,154 of 3,154` and `7,589 of 7,589`. **It is hygiene, not a `runs` move**:
+no program was found that reaches the ladder at those shapes, and the arm's own control is the
+oracle, where it fires 2,785 times.
+
+**The one class left is the literal union, again.** `str -> i32` in two modules
+(`narrowed-litunion-param-atom-rep.vl`, `narrowed-litunion-fn-value-arg.vl`) — the ladder
+would say `str` because canon softens the member set to `string`, while the descriptor says
+the interned atom. It **cannot** be closed from the ladder's own domain: at an un-typed node
+the softened spelling is all there is, and the atom-ness is not recoverable from it. That is
+`one-literal-union-rep`'s cost measured a second time, at a second site.
+
 ---
 
 ## 7. Two design simplifications the campaign should be ruled on
