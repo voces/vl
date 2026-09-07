@@ -374,7 +374,7 @@ descriptor declines, which is exactly how much of the domain the descriptor cann
 | 4 | the field-code ladders — `fieldCodeOfTy` and its spelling siblings | domain-KEEPING | `fieldCodeOfTy` answers `-2` = *"the spelling ladder owns the rest"* — a NAMED decline, so the domain is explicit | ✅ **DONE** (§6.4): 0 CONTRADICT over 58,428 queries, byte-identical, a FOURTH numbering scheme collapsed into one `fieldCodeOfVKind` table. The domain-WIDENING variant was refused at a price of 8 modules |
 | 5 | the valtype writers — `fbValtype`, `fbValtypeNullable`, `fbRefNullOfKind`, `fbRefNullForKind` | consumers of a `VKind`, not classifiers | a `VKind` member plus its slot | ✅ **DONE** (§6.5), and it corrected this row: a QUARTET not a trio, `fbHeapIdxForKind` does not exist, and three of the four were already `_`-less `match` tables. The fourth is now one too |
 | 6 | the `expr*` family — 48 classifiers, 927 call sites | domain-REMOVING | an EXPRESSION node, which the arena may not have typed (a monomorphized body carries the template's types) | blocked on item 7; convert by AXIS, never alphabetically |
-| 7 | `repOfName` for BINDINGS | new surface | a name plus the frame it is READ in → the declaration → its type | **BLOCKED, and the blocker is named**: `declaredSlotOf` takes a bare name with no frame; `paramTypeNode` and `globalLetOfSidIn` take `fnIx` only as a *frame-binds-this-name veto*, not as a scope-chain walk. Callee resolution has been frame-aware since D1781; binding resolution never was |
+| 7 | `repOfName` for BINDINGS | new surface | a name plus the frame it is READ in → the declaration → its type | **BLOCKED, and §5.3 states the blocker and the change it needs**: `declaredSlotOf` takes a bare name; `paramTypeNode` and `globalLetOfSidIn` take `fnIx` only as a *frame-binds-this-name veto*. Callee resolution has been frame-aware since D1781; binding resolution never was |
 | 8 | the slot layer — `structIndexOfExpr`, `rlSlot*`, `mvSlot*`, `exprVariantIndex` | domain-KEEPING, per resolver | a nominal table row | last: `rdSlot` is the field the descriptor least owns (`repOfTy` fills it from `repSlotOfTy` for `TyObj` alone) |
 
 **Item 6 is the largest and it is domain-removing, which is the whole reason item 7 comes
@@ -391,6 +391,77 @@ its answer therefore could not remove a domain; §6.4 records that it could stil
 which is the half of the bar this family added. **Item 5 is next**, and it moves with what
 item 4 left: `fbValtype` and its three siblings translate `VKind` into the valtype/heap
 vocabulary, which is now the only rep numbering scheme with no single translation table.
+
+---
+
+### 5.3 The binding surface — item 7 stated as a step, with the change it needs
+
+Item 6 (`expr*`, 48 classifiers, 927 call sites) is the campaign's largest family and its
+`Ident` arm is the reason it is blocked. This section states the blocker precisely so the
+prerequisite is settled before anyone starts item 6, rather than discovered inside it.
+
+**Callee resolution is frame-aware; binding resolution is not.** That asymmetry is the whole
+blocker, and it has been true since D1781 gave callees the scope chain:
+
+| | how a NAME resolves today | frame-aware? |
+| --- | --- | --- |
+| a called function | `fnIndexOfInScopeSid(sid, name, fnIx)` — walks `fnParent`, then `fnInstOrigin`, then falls back to the flat map | **yes**, since D1781/D1817 |
+| a bound value | `declaredSlotOf(name)` → `localDeclIx[slot]` → the `LetDecl`'s type | **no** |
+
+**There is no single function that maps a name plus a frame to a binding's arena type.** Every
+classifier that needs one rebuilds the same ladder, and the most complete instance in the tree
+is `litAtomMemberTyAt` (`compiler/emit_classify.vl`), whose steps are:
+
+1. `nodeTyIxOf(unwrapParen(ix))` — the checker's own record, tried first. **Blind exactly where
+   the pin-context family bites**: a monomorphized clone shares its template's leaf expression
+   nodes, so the recorded type is the TEMPLATE's.
+2. `declaredSlotOf(name)` — `compiler/emit_classify.vl:8133`. `scopeSlotOf(name)` first, then a
+   flat linear scan of `localNames`. **A bare name, no frame argument.**
+3. `localLoopIter[slot]` — a `for-in` element has no declaration node; recurse into the iterable.
+4. `localDeclIx[slot]` — `compiler/emit_state.vl:409`, the `LetDecl` arena index. Its own header
+   already states why the slot is load-bearing: *"a monomorphized instance keeps its only
+   concrete type at the declaration, since every leaf expression node stays shared with the
+   generic body — the slot is the only route to it."*
+5. `d.letType >= 0` → `nodeTyIxOf(d.letType)` (or `annRowOfNode` where canon may have rewritten
+   the spelling); otherwise recurse into `d.letInit`.
+6. `paramTypeNode(fnIx, name)` — `compiler/emit_query.vl:778`. It TAKES `fnIx` and uses it only
+   as a veto: its second line is `if scopeSlotOf(name) >= 0 { return -1 }`.
+7. `globalLetOfSidIn(fnIx, sid)` — `compiler/emit_classify.vl:1439`, same veto shape.
+
+Two scoped variants already exist for cases the flat slot scan gets wrong — `frameLetOfLive`
+(`:1409`) and `startBlockLetOfSid` (`:26090`) — which is the tell that the flat scan is known
+to be insufficient and is being patched per site rather than replaced.
+
+**The change: one scope-chain walk keyed `(name, frame)`**, the binding twin of
+`fnIndexOfInScopeSid`, and `repOfName` as its descriptor projection:
+
+```
+bindingDeclInScope(sid, name, fnIx) -> the LetDecl arena index, or -1
+repOfName(name, fnIx)               -> repOfTy of that declaration's type
+```
+
+**The precedent exists and so does its trap.** #2629 already built a `(name, frame)` key for
+the covariant-write analysis: `cwDeclare` / `cwDeclSlotOf` / `cwFrameDeclares` /
+`cwFrameOfUse`, with an open-addressed `(frame, sid)` membership table and a memo keyed on the
+pair (`cwRootNames` beside `cwRootFrames`, so two functions' same-named handles get two rows).
+That is the shape to copy. **The trap is that the two halves of the compiler mean different
+things by "frame", and both are spelled `i32`:**
+
+* #2629's frame is a `FuncDecl` **arena node index**, with `CW_FR_MOD = -1` for module scope
+  and `CW_FR_UNKNOWN = -2` matching everything.
+* `fnIndexOfInScopeSid`'s frame is an **`fnStmts` position**, reached from `fnIx` by
+  `fnStmtsPosOf`, and it is the vocabulary `fnParent`, `fnInstOrigin`, `fnEnvIdx` and
+  `monoInstFe` are all indexed by.
+
+The binding walk must be in the SECOND vocabulary, because the chain it has to follow —
+parent frame, then an instance's origin frame — lives only there. Mixing them is a defect the
+type system cannot catch, and naming it here is the point of this section.
+
+**What it unblocks, and what it does not.** With `repOfName` built, `repOfExpr`'s `Ident` arm
+is a projection and item 6's four axes become domain-keeping conversions. It does **not** make
+item 6 a deletion: an `expr*` predicate's other arms are syntactic — a literal, a call, an
+index read — and several exist precisely because the arena has no type for that node. By §5.0's
+bar those arms stay.
 
 ---
 

@@ -622,8 +622,12 @@ import {
   forInMapRecv,
   forInMapValsSlot,
   forInMapWalksVals,
+  forInPairElemKind,
+  forInPairIsMapVal,
+  forInPairValsSlot,
   forInStringSrc,
   forInU8Src,
+  forRangeStepIsConst,
   globalCellKind,
   globalCellStructIdx,
   globalIndexOf,
@@ -9437,6 +9441,7 @@ function stmtReboundsName(ix: i32, name: string): boolean {
   }
   if s is ForIn {
     if s.fiVar == name { return true }
+    if s.fiVar2 == name { return true }
     if exprReboundsName(s.fiIter, name) { return true }
     return stmtReboundsName(s.fiBody, name)
   }
@@ -19017,12 +19022,21 @@ function emitWhileStmtStmt(body: i32[], s: WhileStmt, _stmtIx: i32, fnIx: i32) {
 function emitForRangeStmt(body: i32[], s: ForRange, _stmtIx: i32, fnIx: i32) {
   // `for v in A to B [step K] { body }` — an inclusive numeric range, lowered to the same
   // block/loop shape as `while`. The loop var `v` and a synthetic bound temp own the next
-  // two cursor slots. The step must be a constant integer literal; its sign picks the exit
-  // comparison (ascending: v > bound; descending: v < bound). The bound evaluates once.
+  // two cursor slots, and a non-constant step a third. A constant step's SIGN picks the exit
+  // comparison; a dynamic one picks it with a `select`. Bound and step evaluate once each.
   const vSlot = emitLetCursor
   emitLetCursor = emitLetCursor + 1
   const bSlot = emitLetCursor
   emitLetCursor = emitLetCursor + 1
+  // A step that is not a folded constant is evaluated ONCE into a third slot, minted in the
+  // same pre-order the collect pass mints it (`forRangeStepIsConst` is shared, or the two
+  // cursors disagree and every later local is off by one).
+  const dynStep = !forRangeStepIsConst(s.frStep)
+  let sSlot = -1
+  if dynStep {
+    sSlot = emitLetCursor
+    emitLetCursor = emitLetCursor + 1
+  }
   let paramN = 0
   if fnIx >= 0 {
     const fn = P.nodes[fnIx]
@@ -19030,11 +19044,12 @@ function emitForRangeStmt(body: i32[], s: ForRange, _stmtIx: i32, fnIx: i32) {
   }
   const vIdx = paramN + vSlot
   const bIdx = paramN + bSlot
+  const sIdx = paramN + sSlot
   // static step: default +1; `step <int>` / `step -<int>`. The lexeme must fit i32 before
   // the `parseI32` fold — the checker rejects an out-of-range step upstream; this is the
   // emitter's own never-silently-wrong-bytes backstop.
   let stepK = 1
-  if s.frStep >= 0 {
+  if s.frStep >= 0 && !dynStep {
     const st = P.nodes[s.frStep]
     if st is NumLit {
       if numLexIsFloat(st.numText) || !numLexFitsI32(st.numText) {
@@ -19067,7 +19082,7 @@ function emitForRangeStmt(body: i32[], s: ForRange, _stmtIx: i32, fnIx: i32) {
       return emitFail("emitProgram: for-range step must be a constant integer")
     }
   }
-  if stepK == 0 {
+  if !dynStep && stepK == 0 {
     return emitFail("emitProgram: for-range step must not be zero")
   }
   // v = A; bound = B (each evaluated once, in source order)
@@ -19075,6 +19090,10 @@ function emitForRangeStmt(body: i32[], s: ForRange, _stmtIx: i32, fnIx: i32) {
   fbLocalSet(vIdx)
   if emitExpr(body, s.frTo, fnIx) < 0 { return -1 }
   fbLocalSet(bIdx)
+  if dynStep {
+    if emitExpr(body, s.frStep, fnIx) < 0 { return -1 }
+    fbLocalSet(sIdx)
+  }
   // The hoist prologue runs AFTER the range bounds (whose expressions may do
   // anything) and BEFORE the loop variable is bound, so its receiver reads
   // resolve in the enclosing scope. `frVar` itself is never a candidate — the
@@ -19091,13 +19110,32 @@ function emitForRangeStmt(body: i32[], s: ForRange, _stmtIx: i32, fnIx: i32) {
   ctrlEnter()
   loopContDepth.push(ctrlDepth)
   loopContLabel.push(s.frLabel)
-  // continue-condition: le_s (ascending) / ge_s (descending), inverted to exit
-  fbLocalGet(vIdx)
-  fbLocalGet(bIdx)
-  if stepK > 0 {
-    fbI32Bin(76) // 0x4c i32.le_s
+  // continue-condition: le_s (ascending) / ge_s (descending), inverted to exit. A DYNAMIC
+  // step picks the direction with a `select` at run time, and a zero step makes the loop
+  // empty — it advances nothing, the same answer a backwards constant range already gives.
+  if dynStep {
+    fbLocalGet(vIdx)
+    fbLocalGet(bIdx)
+    fbI32Bin(76)  // 0x4c i32.le_s — the ascending test
+    fbLocalGet(vIdx)
+    fbLocalGet(bIdx)
+    fbI32Bin(78)  // 0x4e i32.ge_s — the descending test
+    fbLocalGet(sIdx)
+    fbI32Const(0)
+    fbI32Bin(74)  // 0x4a i32.gt_s
+    wU8(27)       // 0x1b select — the ascending test iff the step is positive
+    fbLocalGet(sIdx)
+    fbI32Eqz()
+    fbI32Eqz()    // step != 0
+    fbI32Bin(113) // 0x71 i32.and
   } else {
-    fbI32Bin(78) // 0x4e i32.ge_s
+    fbLocalGet(vIdx)
+    fbLocalGet(bIdx)
+    if stepK > 0 {
+      fbI32Bin(76) // 0x4c i32.le_s
+    } else {
+      fbI32Bin(78) // 0x4e i32.ge_s
+    }
   }
   fbI32Eqz() // 0x45 invert: exit when out of range
   fbBrIf(1)  // 0x0d br_if -> break out of block
@@ -19121,7 +19159,7 @@ function emitForRangeStmt(body: i32[], s: ForRange, _stmtIx: i32, fnIx: i32) {
   }
   // v = v + K
   fbLocalGet(vIdx)
-  fbI32Const(stepK)
+  if dynStep { fbLocalGet(sIdx) } else { fbI32Const(stepK) }
   fbI32Bin(106) // 0x6a i32.add
   fbLocalSet(vIdx)
   fbBr(0)       // continue loop
@@ -19140,10 +19178,10 @@ function emitForRangeStmt(body: i32[], s: ForRange, _stmtIx: i32, fnIx: i32) {
 }
 
 function emitForInStmt(body: i32[], s: ForIn, _stmtIx: i32, fnIx: i32) {
-  // `for v in <list> { body }` — iterate an i32 list, a string list, a struct ref list, or
-  // a map's ordered keys/values list. Three cursor slots in collect pre-order: the element
-  // var `v`, a hidden cursor `v#i`, and a hidden list temp `v#l` (the iterable evaluates
-  // once). Shape mirrors `while`: block/loop, exit on `cursor >= len`, cursor++.
+  // `for v[, w] in <list> { body }` — iterate an i32 list, a string list, a struct ref list,
+  // or a map's ordered keys/values list. Cursor slots in collect pre-order: the element var
+  // `v`, a hidden cursor `v#i`, a hidden list temp `v#l` (the iterable evaluates once), and
+  // the second name last. Shape mirrors `while`: block/loop, exit on `cursor >= len`, cursor++.
   const ek = forInElemKind(s.fiIter, fnIx)
   if ek == null { return emitFail("emitProgram: unsupported for-in iterable") }
   // A STRING iterable (`for ch in s`): the `#l` temp IS the raw `(ref $sTypeIdx)` array (no
@@ -19163,6 +19201,14 @@ function emitForInStmt(body: i32[], s: ForIn, _stmtIx: i32, fnIx: i32) {
   emitLetCursor = emitLetCursor + 1
   const lSlot = emitLetCursor
   emitLetCursor = emitLetCursor + 1
+  // The SECOND name's slot, minted last in the same pre-order the collect pass mints it.
+  const pairName = s.fiVar2
+  const hasPair = pairName != ""
+  let pSlot = -1
+  if hasPair {
+    pSlot = emitLetCursor
+    emitLetCursor = emitLetCursor + 1
+  }
   let paramN = 0
   if fnIx >= 0 {
     const fn = P.nodes[fnIx]
@@ -19171,6 +19217,33 @@ function emitForInStmt(body: i32[], s: ForIn, _stmtIx: i32, fnIx: i32) {
   const vIdx = paramN + vSlot
   const iIdx = paramN + iSlot
   const lIdx = paramN + lSlot
+  const pIdx = paramN + pSlot
+  // A map's second name is its VALUE; every other iterable's is a dense INDEX. The slot is
+  // the vals list's when there is one, and the plain i32 list's for a mono-value map.
+  const pairValsSlot = forInPairValsSlot(s.fiIter, fnIx)
+  const pairIsVal = hasPair && forInPairIsMapVal(s.fiIter, fnIx)
+  let pairWrapTy = lTypeIdx
+  let pairBackTy = aTypeIdx
+  if pairValsSlot >= 0 {
+    pairWrapTy = mvValsWrapOf(pairValsSlot)
+    pairBackTy = mvValsBackOf(pairValsSlot)
+  }
+  // The value kinds whose vals element is a non-null ref off a nullable slot — the same set
+  // the loop var recovers below, or one spelling recovers and the other traps on a stored null.
+  const pairEk = forInPairElemKind(s.fiIter, fnIx)
+  const pairRecover = pairIsVal &&
+    (pairEk == "str" ||
+    pairEk == "struct" ||
+    pairEk == "variant" ||
+    pairEk == "union" ||
+    pairEk == "list" ||
+    pairEk == "strlist" ||
+    pairEk == "f64list" ||
+    pairEk == "i64list" ||
+    pairEk == "f32list" ||
+    pairEk == "u8list" ||
+    pairEk == "closure" ||
+    pairEk == "reflist")
   let wrapTy = lTypeIdx
   let backTy = aTypeIdx
   if ek == "str" || ek == "nulstr" {
@@ -19276,7 +19349,14 @@ function emitForInStmt(body: i32[], s: ForIn, _stmtIx: i32, fnIx: i32) {
     fbI32Const(0)
   }
   fbLocalSet(iIdx)
+  if hasPair && !pairIsVal {
+    // A dense counter of body executions: the cursor is a backing offset for a string and
+    // skips tombstones for a set, so it is not the index at two of the three sequences.
+    fbI32Const(0)
+    fbLocalSet(pIdx)
+  }
   scopeBind(s.fiVar, vSlot)
+  if hasPair { scopeBind(pairName, pSlot) }
   fbBlock(64) // 0x02 block, void
   ctrlEnter()
   loopBrkDepth.push(ctrlDepth)
@@ -19354,6 +19434,19 @@ function emitForInStmt(body: i32[], s: ForIn, _stmtIx: i32, fnIx: i32) {
     wU8(212) // 0xd4 ref.as_non_null
   }
   fbLocalSet(vIdx)
+  if pairIsVal {
+    // `v = M.vals.backing[cursor]` — the value beside the key just bound, off the pinned
+    // mapRef the tombstone skip already reads, so the receiver is evaluated once.
+    cmSlot = mwShape
+    pushMapVals(body)
+    fbStructGet(pairWrapTy, 0)
+    fbLocalGet(iIdx)
+    fbArrayGet(pairBackTy)
+    if pairRecover {
+      wU8(212) // 0xd4 ref.as_non_null — a non-null value kind off a nullable element slot
+    }
+    fbLocalSet(pIdx)
+  }
   // Same INNER continue block as for-range: `continue` must still increment.
   const fiHasCont = blockHasContinueFor(s.fiBody, s.fiLabel, false)
   if fiHasCont {
@@ -19382,16 +19475,25 @@ function emitForInStmt(body: i32[], s: ForIn, _stmtIx: i32, fnIx: i32) {
   }
   fbI32Bin(106) // 0x6a i32.add
   fbLocalSet(iIdx)
-  fbBr(0)       // continue loop
-  fbEnd()       // end loop
+  if hasPair && !pairIsVal {
+    // Advanced on the path the BODY ran: the tombstone skip re-loops before reaching here,
+    // so a deleted entry does not consume an index.
+    fbLocalGet(pIdx)
+    fbI32Const(1)
+    fbI32Bin(106) // 0x6a i32.add
+    fbLocalSet(pIdx)
+  }
+  fbBr(0) // continue loop
+  fbEnd() // end loop
   ctrlLeave()
   loopContDepth.pop()
   loopContLabel.pop()
-  fbEnd()       // end block
+  fbEnd() // end block
   ctrlLeave()
   loopBrkDepth.pop()
   loopBrkLabel.pop()
-  // The loop variable's scope is the loop (see `scopeUnbind`).
+  // The loop variables' scope is the loop (see `scopeUnbind`) — one release per name.
+  if hasPair { scopeUnbind() }
   scopeUnbind()
   return 0
 }

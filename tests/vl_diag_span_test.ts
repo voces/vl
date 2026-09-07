@@ -349,7 +349,7 @@ const GRID: Row[] = [
     // `for x in n {` — the iterable `n` at 10, not the loop variable `x` at 5.
     name: "for-in: the iterable error spans the iterable",
     src: "const n = 5\nfor x in n {\n  print(x)\n}\n",
-    frag: "for-in expects an array or map",
+    frag: "for-in expects an array, a map or a string",
     line: 2,
     col: 10,
     endCol: 11,

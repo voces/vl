@@ -475,6 +475,88 @@ changes which program is legal rather than how a legal one compiles. None blocks
 recommendation is the coordinator's; the witness is the row's own `Repro:`, re-run by the
 `filed witnesses` gate, so a ruling can be graded the day it lands.
 
+### B8-for-struct — may a `for` loop iterate a STRUCT's fields? — raised 2026-09-07
+
+`const p: P = { a: 1, b: 2 }; for k in p { print(k) }` refuses with
+`for-in expects an array or map, got P`, and has since the form existed. ROADMAP row 18 lists it
+as one of B8's four `for` gaps, which reads as a capability owed; it is a language question
+first. A struct is a NOMINAL record whose fields have DIFFERENT types, so a loop variable over
+one has no single type to bind, and the operation an author actually wants — read the field the
+key names — needs a dynamic field read that VL has no rep for at any spelling.
+
+**Options.**
+(a) **Keep refusing, and name the fix in the sentence** — "a `for` loop iterates an array, a map
+or a string; a struct's fields are not a sequence — use a map (`{[string]: i32}`) for keyed
+iteration, or read the fields by name". `for k in p` stays a check error; nothing else moves.
+(b) **Bind the field NAMES, as `string`** — `for k in p` binds `k: string` over `"a"`, `"b"`.
+The loop then hands the author a key that no operation accepts: `p[k]` is
+`cannot index non-array P` today, so the useful half of the feature is a second, larger build
+(a dynamic field read, over a heterogeneous record, whose result type is a union of the field
+types).
+(c) **Allow it only for a HOMOGENEOUS struct, binding VALUES** — `type P = { a: i32, b: i32 }`
+would iterate `1`, `2` as `i32`, while `{ a: i32, b: string }` would keep refusing. Legality
+then depends on a coincidence between field types, and ADDING a field of a different type
+silently turns a working loop into a check error at a distance.
+
+**Peers.** No statically-typed peer iterates a struct with its `for`: Rust and Go have no such
+form (Go's `range` covers arrays, slices, maps, strings and channels; a struct needs `reflect`),
+Swift needs `Mirror`, and Kotlin needs a data-class `copy`/reflection. The dynamically-typed
+peers do — JS `for (const k in obj)` yields own+inherited enumerable string keys, and its modern
+replacement is `Object.entries(obj)`, a function that produces a SEQUENCE rather than a loop
+form that knows about objects. Python iterates a dict, not an object; `vars(o)` produces the
+dict first.
+
+**Recommendation: (a).** The refusal is right and only the sentence is wrong — it names two
+types the author may not have and no fix. (b) is the JS answer without the JS runtime: it costs
+a dynamic field read whose result is a union of every field type, which is a rep decision far
+larger than the loop. (c) makes a type's iterability depend on its field types agreeing, which
+is the kind of rule that breaks at a distance the day someone adds a `name: string`. If (a)
+lands, the whole deliverable is the sentence, and `for k in <map>` — which already works — is
+what it points at.
+
+### B8-for-float-range — may a `for` range count in floats? — raised 2026-09-07
+
+`for x in 0.0 to 1.0 { print(x) }` refuses with `for-range bounds must be i32, got f64 and f64`,
+and `for x in 0 to 10 step 0.5` with `for-range step must be i32, got f64`. ROADMAP row 18 lists
+the float bound as a gap. The refusal hides a question the language has not answered: **what is
+a float range's step, and what is its iteration COUNT?**
+
+A `for` range's step defaults to `+1`. Over `0.0 to 1.0` that default runs the body ONCE, at
+`x = 0.0` — a loop that looks like a bug at the call site and would be legal. With an explicit
+`step 0.1` the count depends on the lowering: accumulating `x = x + step` gives 11 iterations
+for some bounds and 10 for others, because `0.1` is not representable and the error accumulates;
+computing `x = from + k * step` off an integer counter gives a count that is exact and a last
+value that may overshoot `to`. Those are different languages, and the current i32-only rule is
+what has kept the question from being asked.
+
+**Options.**
+(a) **Keep refusing, and name the fix** — "a `for` range counts in i32; for a float sequence,
+count with an integer and scale: `for i in 0 to 10 { const x = i / 10.0 … }`". Both bounds and
+the step keep their refusals; only the sentences change.
+(b) **Allow it with a REQUIRED explicit step, lowered off an integer counter** —
+`for x in 0.0 to 1.0 step 0.1` binds `x = from + k * step` for `k` in `[0, n]` with
+`n = floor((to - from) / step)`, so the count is decided before the loop runs and no error
+accumulates. `for x in 0.0 to 1.0` with no step stays refused, because the `+1` default is not
+meaningful over floats.
+(c) **Allow it with accumulation** — `x = x + step`, the direct translation of the i32 lowering.
+Cheapest to build and the only one whose iteration count is a property of IEEE rounding rather
+than of the program.
+
+**Peers.** Rust refuses: `Range<f64>` deliberately does not implement `Iterator`, so
+`for x in 0.0..1.0` is a compile error, and the documented answer is to count integers and
+scale. Kotlin is the same — a `ClosedFloatingPointRange` is not iterable. Python's `range` is
+integers only; floats go through `numpy.arange` (accumulating, and documented as producing an
+inconsistent count) or `linspace` (count-first, which is (b)). Swift is the one peer that
+supports it, through the NAMED function `stride(from:to:by:)` rather than the range operator —
+i.e. it agrees the range operator is the wrong place for it.
+
+**Recommendation: (a), with (b) as the answer if the owner wants the feature.** (a) costs two
+sentences and no program: nothing in the tree or the corpus writes a float range, because it has
+never been legal. (b) is the only version whose count is predictable and it is a small lowering
+on top of the dynamic-step work — but it must REQUIRE the step, because the inherited `+1`
+default is what makes `for x in 0.0 to 1.0` a one-iteration loop nobody meant to write. (c) is
+the trap: it looks like the i32 loop and its count is not a property of the source.
+
 ### D1832 — should `[null]` infer `null[]`, or is a list of only `null` an error? — raised 2026-09-06
 
 `const e = [null]` infers **`null[]`** — pinned by forcing it into a diagnostic, which reads
