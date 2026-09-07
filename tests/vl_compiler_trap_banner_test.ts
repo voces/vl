@@ -230,6 +230,58 @@ Deno.test({
   },
 });
 
+// EVERY FRAME OF A USER TRAP CARRIES A NAME (ROADMAP B-debug, row 22).
+//
+// `vl run` already opts into the wasm `name` custom section, and the emitter already
+// names imports, user functions and the runtime helpers — but NOT the synthetic start
+// function a module's top-level statements compile into. So the plainest trapping
+// program there is, `print(a[7])` at top level, reported the one frame that mattered as
+// `vl!<wasm function 4>`: a name section that named everything except the code the
+// author wrote.
+//
+// Both directions are pinned. A top-level trap must name `__start__`, and a trap inside
+// a declared function must still name the function — a change that named the start
+// frame by renumbering the others would pass the first assertion alone.
+Deno.test({
+  name: "vl-compiler-trap-banner: a TOP-LEVEL trap names __start__, not a wasm index",
+  ignore: !ENABLED,
+  fn: async () => {
+    await withDir(async (dir) => {
+      const prog = `${dir}/probe.vl`;
+      await Deno.writeTextFile(prog, "const a: i32[] = [1, 2, 3]\nprint(a[7])\n");
+      const r = await vl(["run", prog]);
+      if (/<wasm function \d+>/.test(r.err)) {
+        throw new Error(`a frame is still an anonymous index\n${r.err}`);
+      }
+      if (!/vl!__start__/.test(r.err)) {
+        throw new Error(`want the start frame named __start__\n${r.err}`);
+      }
+    });
+  },
+});
+
+Deno.test({
+  name: "vl-compiler-trap-banner: a trap inside a declared function still names the function",
+  ignore: !ENABLED,
+  fn: async () => {
+    await withDir(async (dir) => {
+      const prog = `${dir}/probe.vl`;
+      await Deno.writeTextFile(
+        prog,
+        "function boom(xs: i32[]): i32 {\n  return xs[7]\n}\n" +
+          "const a: i32[] = [1, 2, 3]\nprint(boom(a))\n",
+      );
+      const r = await vl(["run", prog]);
+      if (/<wasm function \d+>/.test(r.err)) {
+        throw new Error(`a frame is still an anonymous index\n${r.err}`);
+      }
+      if (!/vl!boom/.test(r.err) || !/vl!__start__/.test(r.err)) {
+        throw new Error(`want both frames named (boom, then __start__)\n${r.err}`);
+      }
+    });
+  },
+});
+
 Deno.test({
   name:
     "vl-compiler-trap-banner: a compile DIAGNOSTIC is not a compiler crash — exit 1, no banner",
