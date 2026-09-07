@@ -770,14 +770,48 @@ function cloResultMaybeMixed(tyIx: i32): boolean {
   const fr = t.fnRet
   if fr < 0 { return false }
   const frt = T.tys[fr]
-  if frt is TyUnion { return unionArmsMixed(frt.uMembers) }
-  // A `| null` result is a wrapper here and an atom in the spelling; the mix question is
-  // about what is inside it.
-  if frt is TyNullable {
-    if frt.nInner < 0 { return false }
-    const it = T.tys[frt.nInner]
-    if it is TyUnion { return unionArmsMixed(it.uMembers) }
-    return false
+  // Exhaustive over `Ty` and `_`-less: only a union has arms to mix, and a new arena variant
+  // that might must be classified here rather than take the `false` below.
+  match frt {
+    TyUnion => {
+      return unionArmsMixed(frt.uMembers)
+    }
+    TyNullable => {
+      // A `| null` result is a wrapper here and an atom in the spelling; the mix question is
+      // about what is inside it.
+      if frt.nInner < 0 { return false }
+      const it = T.tys[frt.nInner]
+      if it is TyUnion { return unionArmsMixed(it.uMembers) }
+      return false
+    }
+    TyPrim => {
+      // A scalar result has one arm; nothing to mix.
+    }
+    TyLit => {
+      // A literal is a scalar arm on its own.
+    }
+    TyObj => {
+      // A composite result is one arm too; the mix is a property of a union, not a member.
+    }
+    TyArray => {
+      // As `TyObj`: one composite arm.
+    }
+    TyMap => {
+      // As `TyObj`: one composite arm.
+    }
+    TyFunc => {
+      // A closure result is composite and single; a mixed union under it is that type's own
+      // question, asked when the walk reaches it.
+    }
+    TyVar => {
+      // Unsubstituted here, so it names no arms.
+    }
+    TyErr => {
+      // The error hole claims no arms.
+    }
+    TyNeg => {
+      // A negation carries no member list.
+    }
   }
   false
 }
@@ -792,12 +826,43 @@ function unionArmsMixed(ms: i32[]): boolean {
   while i < ms.length {
     if ms[i] >= 0 {
       const m = T.tys[ms[i]]
-      if m is TyObj { hasComposite = true }
-      else if m is TyMap { hasComposite = true }
-      else if m is TyArray { hasComposite = true }
-      else if m is TyFunc { hasComposite = true }
-      else if m is TyPrim { hasScalar = true }
-      else if m is TyLit { hasScalar = true }
+      // Exhaustive over `Ty` and `_`-less: a new arena variant must be classified scalar or
+      // composite here, not fall into neither and report a mixed union as unmixed.
+      match m {
+        TyObj => {
+          hasComposite = true
+        }
+        TyMap => {
+          hasComposite = true
+        }
+        TyArray => {
+          hasComposite = true
+        }
+        TyFunc => {
+          hasComposite = true
+        }
+        TyPrim => {
+          hasScalar = true
+        }
+        TyLit => {
+          hasScalar = true
+        }
+        TyUnion => {
+          // A nested union's own arms are its own question; this one asks about `ms`.
+        }
+        TyNullable => {
+          // The `| null` wrapper, which the caller strips before asking.
+        }
+        TyVar => {
+          // Unsubstituted, so it is neither side of the mix.
+        }
+        TyErr => {
+          // The error hole is neither side.
+        }
+        TyNeg => {
+          // A negation has no rep of its own to mix.
+        }
+      }
     }
     i = i + 1
   }
@@ -10609,61 +10674,82 @@ function collectTyReachRegister(
 ) {
   if tyIx < 0 || depth <= 0 { return 0 }
   const t = T.tys[tyIx]
-  if t is TyNullable {
-    // Descends the inner union's members first, without registering the inner union itself, so
-    // the outer `…|null` name registers first (the arms' field unions must precede `collectVariantFields`).
-    if collectTyMembersReach(stmts, t.nInner, depth - 1, underFunc) < 0 {
-      return -1
-    }
-    // A niche nullable carries its own emit-name registration too, since recursing only the
-    // inner type misses it (`AB|null`'s inner registers `A|B`, not the outer name `isUName` looks up).
-    const nn = reachRegisterName(tyIx, underFunc)
-    if nn != "" {
-      if registerInlineUnionAt(stmts, nn, 41, tyIx) < 0 { return -1 }
-    }
-    return collectTyReachRegister(stmts, t.nInner, depth - 1, underFunc)
-  }
-  if t is TyArray {
-    return collectTyReachRegister(stmts, t.aElem, depth - 1, underFunc)
-  }
-  if t is TyMap {
-    return collectTyReachRegister(stmts, t.mVal, depth - 1, underFunc)
-  }
-  if t is TyObj {
-    const ftys = t.objFieldTypes
-    let i = 0
-    while i < ftys.length {
-      if collectTyReachRegister(stmts, ftys[i], depth - 1, underFunc) < 0 {
+  // Exhaustive over `Ty` and `_`-less: a new arena variant that can carry a union must get a
+  // descent here, not take the leaf `0` and drop every union beneath it.
+  match t {
+    TyNullable => {
+      // Descends the inner union's members first, without registering the inner union itself, so
+      // the outer `…|null` name registers first (the arms' field unions must precede `collectVariantFields`).
+      if collectTyMembersReach(stmts, t.nInner, depth - 1, underFunc) < 0 {
         return -1
       }
-      i = i + 1
+      // A niche nullable carries its own emit-name registration too, since recursing only the
+      // inner type misses it (`AB|null`'s inner registers `A|B`, not the outer name `isUName` looks up).
+      const nn = reachRegisterName(tyIx, underFunc)
+      if nn != "" {
+        if registerInlineUnionAt(stmts, nn, 41, tyIx) < 0 { return -1 }
+      }
+      return collectTyReachRegister(stmts, t.nInner, depth - 1, underFunc)
     }
-    return 0
-  }
-  if t is TyFunc {
-    // Inside a function type every reachable union sits in a litunion-keeping position, so
-    // descend with `underFunc = true` and let embedded litunion aliases render faithfully.
-    const ps = t.fnParamTypes
-    let i = 0
-    while i < ps.length {
-      if collectTyReachRegister(stmts, ps[i], depth - 1, true) < 0 { return -1 }
-      i = i + 1
+    TyArray => {
+      return collectTyReachRegister(stmts, t.aElem, depth - 1, underFunc)
     }
-    return collectTyReachRegister(stmts, t.fnRet, depth - 1, true)
-  }
-  if t is TyUnion {
-    // Descends into the members first: a struct arm's field may itself be a union, and the
-    // outer registration runs `collectVariantFields` synchronously, needing the arm fields registered first.
-    if collectTyMembersReach(stmts, tyIx, depth - 1, underFunc) < 0 {
-      return -1
+    TyMap => {
+      return collectTyReachRegister(stmts, t.mVal, depth - 1, underFunc)
     }
-    // A "" render (unresolvable nominal / over-deep recursion) declines silently; the name walk
-    // still covers those, since this walk only adds coverage.
-    const nm = reachRegisterName(tyIx, underFunc)
-    if nm != "" {
-      if registerInlineUnionAt(stmts, nm, 42, tyIx) < 0 { return -1 }
+    TyObj => {
+      const ftys = t.objFieldTypes
+      let i = 0
+      while i < ftys.length {
+        if collectTyReachRegister(stmts, ftys[i], depth - 1, underFunc) < 0 {
+          return -1
+        }
+        i = i + 1
+      }
+      return 0
     }
-    return 0
+    TyFunc => {
+      // Inside a function type every reachable union sits in a litunion-keeping position, so
+      // descend with `underFunc = true` and let embedded litunion aliases render faithfully.
+      const ps = t.fnParamTypes
+      let i = 0
+      while i < ps.length {
+        if collectTyReachRegister(stmts, ps[i], depth - 1, true) < 0 {
+          return -1
+        }
+        i = i + 1
+      }
+      return collectTyReachRegister(stmts, t.fnRet, depth - 1, true)
+    }
+    TyUnion => {
+      // Descends into the members first: a struct arm's field may itself be a union, and the
+      // outer registration runs `collectVariantFields` synchronously, needing the arm fields registered first.
+      if collectTyMembersReach(stmts, tyIx, depth - 1, underFunc) < 0 {
+        return -1
+      }
+      // A "" render (unresolvable nominal / over-deep recursion) declines silently; the name walk
+      // still covers those, since this walk only adds coverage.
+      const nm = reachRegisterName(tyIx, underFunc)
+      if nm != "" {
+        if registerInlineUnionAt(stmts, nm, 42, tyIx) < 0 { return -1 }
+      }
+      return 0
+    }
+    TyPrim => {
+      // A leaf scalar carries nothing to register.
+    }
+    TyLit => {
+      // A literal is a leaf too; its litunion alias registers where it is spelled.
+    }
+    TyVar => {
+      // Unsubstituted, so there is no concrete union under it yet.
+    }
+    TyErr => {
+      // The error hole has no shape to descend.
+    }
+    TyNeg => {
+      // A negation carries no member or element to reach.
+    }
   }
   0
 }
@@ -10680,23 +10766,52 @@ function collectTyMembersReach(
 ) {
   if tyIx < 0 || depth < 0 { return 0 }
   const t = T.tys[tyIx]
-  if t is TyUnion {
-    const members = t.uMembers
-    let i = 0
-    while i < members.length {
-      if collectTyReachRegister(stmts, members[i], depth, underFunc) < 0 {
-        return -1
+  // Exhaustive over `Ty` and `_`-less: a new arena variant that can carry a union owes this
+  // walk a descent, and a silent leaf here leaves the arms' field unions unregistered.
+  match t {
+    TyUnion => {
+      const members = t.uMembers
+      let i = 0
+      while i < members.length {
+        if collectTyReachRegister(stmts, members[i], depth, underFunc) < 0 {
+          return -1
+        }
+        i = i + 1
       }
-      i = i + 1
     }
-  }
-  // A collection carrying the union has no arm-field pre-descent of its own (the caller's
-  // registration recurses by name into it), so descend through it here to register the arms' field unions first.
-  if t is TyMap {
-    return collectTyMembersReach(stmts, t.mVal, depth - 1, underFunc)
-  }
-  if t is TyArray {
-    return collectTyMembersReach(stmts, t.aElem, depth - 1, underFunc)
+    TyMap => {
+      // A collection carrying the union has no arm-field pre-descent of its own (the caller's
+      // registration recurses by name into it), so descend through it here to register the arms' field unions first.
+      return collectTyMembersReach(stmts, t.mVal, depth - 1, underFunc)
+    }
+    TyArray => {
+      // As `TyMap`: the element carries the union.
+      return collectTyMembersReach(stmts, t.aElem, depth - 1, underFunc)
+    }
+    TyNullable => {
+      // The caller strips the `| null` and asks about the inner type.
+    }
+    TyObj => {
+      // A field union is reached through the registration walk, not this pre-descent.
+    }
+    TyFunc => {
+      // As `TyObj`: the sig walk owns a function type's members.
+    }
+    TyPrim => {
+      // A leaf carries no members.
+    }
+    TyLit => {
+      // A leaf carries no members.
+    }
+    TyVar => {
+      // Unsubstituted, so there are no members yet.
+    }
+    TyErr => {
+      // The error hole has no members.
+    }
+    TyNeg => {
+      // A negation carries no member list.
+    }
   }
   0
 }
@@ -10708,33 +10823,67 @@ function collectTyMembersReach(
 function funcRetUnrepresentable(retIx: i32): boolean {
   if retIx < 0 { return false }
   const t = T.tys[retIx]
-  if t is TyObj {
-    // `arenaEmitName` is the module's one render-then-canon hop; a `""` render fails
-    // `nameIsShapeOpen` without entering the rewriter.
-    const nm = arenaEmitName(retIx)
-    // `nameIsShapeOpen` bounds the name at 2, avoiding an out-of-bounds `nm[1]` read that a
-    // bare `length > 0` test would trap on for the single name `"{"`.
-    if nameIsShapeOpen(nm) { return !funcTypeShapeLowerable(nm) }
-    return false
-  }
-  if t is TyUnion {
-    const members = t.uMembers
-    if members.length < 2 { return false }
-    let hasScalar = false
-    let hasComposite = false
-    let i = 0
-    while i < members.length {
-      const mt = T.tys[members[i]]
-      if mt is TyPrim { hasScalar = true }
-      else if mt is TyLit { hasScalar = true }
-      else if tyIsLitUnion(members[i]) { hasScalar = true }
-      else if mt is TyObj { hasComposite = true }
-      else if mt is TyArray { hasComposite = true }
-      else if mt is TyMap { hasComposite = true }
-      else if mt is TyFunc { hasComposite = true }
-      i = i + 1
+  // Exhaustive over `Ty` and `_`-less: the two holes are an inline result struct and a
+  // heterogeneous value union, and a new arena variant with a third must say so here.
+  match t {
+    TyObj => {
+      // `arenaEmitName` is the module's one render-then-canon hop; a `""` render fails
+      // `nameIsShapeOpen` without entering the rewriter.
+      const nm = arenaEmitName(retIx)
+      // `nameIsShapeOpen` bounds the name at 2, avoiding an out-of-bounds `nm[1]` read that a
+      // bare `length > 0` test would trap on for the single name `"{"`.
+      if nameIsShapeOpen(nm) { return !funcTypeShapeLowerable(nm) }
+      return false
     }
-    return hasScalar && hasComposite
+    TyUnion => {
+      // The member classifier below stays an `if` chain on purpose: `tyIsLitUnion` is a
+      // PREDICATE rung between two kind rungs, so the chain is not one dispatch and a `match`
+      // cannot spell it.
+      const members = t.uMembers
+      if members.length < 2 { return false }
+      let hasScalar = false
+      let hasComposite = false
+      let i = 0
+      while i < members.length {
+        const mt = T.tys[members[i]]
+        if mt is TyPrim { hasScalar = true }
+        else if mt is TyLit { hasScalar = true }
+        else if tyIsLitUnion(members[i]) { hasScalar = true }
+        else if mt is TyObj { hasComposite = true }
+        else if mt is TyArray { hasComposite = true }
+        else if mt is TyMap { hasComposite = true }
+        else if mt is TyFunc { hasComposite = true }
+        i = i + 1
+      }
+      return hasScalar && hasComposite
+    }
+    TyNullable => {
+      // A `| null` result is a niche, representable through the value ABI.
+    }
+    TyArray => {
+      // A list result is representable.
+    }
+    TyMap => {
+      // A map result is representable.
+    }
+    TyFunc => {
+      // A closure result is representable; its own result is asked when the walk reaches it.
+    }
+    TyPrim => {
+      // A scalar result is representable.
+    }
+    TyLit => {
+      // A literal result rides its base scalar.
+    }
+    TyVar => {
+      // Unsubstituted; the instance's concrete result is what gets asked.
+    }
+    TyErr => {
+      // The error hole is already a checker reject.
+    }
+    TyNeg => {
+      // A negation is not a result type the ABI sees.
+    }
   }
   false
 }
@@ -10746,50 +10895,75 @@ function funcRetUnrepresentable(retIx: i32): boolean {
 function collectTyReachCloSigs(tyIx: i32, depth: i32) {
   if tyIx < 0 || depth <= 0 { return 0 }
   const t = T.tys[tyIx]
-  if t is TyNullable { return collectTyReachCloSigs(t.nInner, depth - 1) }
-  if t is TyArray { return collectTyReachCloSigs(t.aElem, depth - 1) }
-  if t is TyMap { return collectTyReachCloSigs(t.mVal, depth - 1) }
-  if t is TyObj {
-    const ftys = t.objFieldTypes
-    let i = 0
-    while i < ftys.length {
-      if collectTyReachCloSigs(ftys[i], depth - 1) < 0 { return -1 }
-      i = i + 1
+  // Exhaustive over `Ty` and `_`-less: a new arena variant that can hold a closure must get a
+  // descent, and a silent leaf here leaves its `$fnsig` un-interned.
+  match t {
+    TyNullable => {
+      return collectTyReachCloSigs(t.nInner, depth - 1)
     }
-    return 0
-  }
-  if t is TyUnion {
-    const members = t.uMembers
-    let i = 0
-    while i < members.length {
-      if collectTyReachCloSigs(members[i], depth - 1) < 0 { return -1 }
-      i = i + 1
+    TyArray => {
+      return collectTyReachCloSigs(t.aElem, depth - 1)
     }
-    return 0
-  }
-  if t is TyFunc {
-    // Interns this closure's sig from its arena render, the key the value-call site and a
-    // concrete lambda both derive; a mixed-union unregistered result is skipped so the call rejects loudly.
-    if !funcRetUnrepresentable(t.fnRet) {
-      // `sigKeyOfTy(tyIx)` gets the key directly off the type rather than parsing it back out of
-      // the render `arenaEmitName` would produce; only the mixed-union guard still reads the name.
-      const kAr = sigKeyOfTy(tyIx)
-      if kAr != "" && !cloResultMaybeMixed(tyIx) {
-        internCloSigKey(kAr, -1)
-      } else {
-        const nm = arenaEmitName(tyIx)
-        if nm != "" { internCloSigOfAtomTy(nm, kAr) }
+    TyMap => {
+      return collectTyReachCloSigs(t.mVal, depth - 1)
+    }
+    TyObj => {
+      const ftys = t.objFieldTypes
+      let i = 0
+      while i < ftys.length {
+        if collectTyReachCloSigs(ftys[i], depth - 1) < 0 { return -1 }
+        i = i + 1
       }
+      return 0
     }
-    // Descend params + result to reach closures nested inside them (a result struct's
-    // closure field, a param closure, a closure arm of a field union).
-    const ps = t.fnParamTypes
-    let i = 0
-    while i < ps.length {
-      if collectTyReachCloSigs(ps[i], depth - 1) < 0 { return -1 }
-      i = i + 1
+    TyUnion => {
+      const members = t.uMembers
+      let i = 0
+      while i < members.length {
+        if collectTyReachCloSigs(members[i], depth - 1) < 0 { return -1 }
+        i = i + 1
+      }
+      return 0
     }
-    return collectTyReachCloSigs(t.fnRet, depth - 1)
+    TyFunc => {
+      // Interns this closure's sig from its arena render, the key the value-call site and a
+      // concrete lambda both derive; a mixed-union unregistered result is skipped so the call rejects loudly.
+      if !funcRetUnrepresentable(t.fnRet) {
+        // `sigKeyOfTy(tyIx)` gets the key directly off the type rather than parsing it back out of
+        // the render `arenaEmitName` would produce; only the mixed-union guard still reads the name.
+        const kAr = sigKeyOfTy(tyIx)
+        if kAr != "" && !cloResultMaybeMixed(tyIx) {
+          internCloSigKey(kAr, -1)
+        } else {
+          const nm = arenaEmitName(tyIx)
+          if nm != "" { internCloSigOfAtomTy(nm, kAr) }
+        }
+      }
+      // Descend params + result to reach closures nested inside them (a result struct's
+      // closure field, a param closure, a closure arm of a field union).
+      const ps = t.fnParamTypes
+      let i = 0
+      while i < ps.length {
+        if collectTyReachCloSigs(ps[i], depth - 1) < 0 { return -1 }
+        i = i + 1
+      }
+      return collectTyReachCloSigs(t.fnRet, depth - 1)
+    }
+    TyPrim => {
+      // A leaf scalar holds no closure.
+    }
+    TyLit => {
+      // A leaf literal holds no closure.
+    }
+    TyVar => {
+      // Unsubstituted; the instance's concrete type is what gets walked.
+    }
+    TyErr => {
+      // The error hole has no shape to descend.
+    }
+    TyNeg => {
+      // A negation carries no member or element.
+    }
   }
   0
 }
