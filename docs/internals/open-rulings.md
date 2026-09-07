@@ -475,6 +475,48 @@ changes which program is legal rather than how a legal one compiles. None blocks
 recommendation is the coordinator's; the witness is the row's own `Repro:`, re-run by the
 `filed witnesses` gate, so a ruling can be graded the day it lands.
 
+### D1832 — should `[null]` infer `null[]`, or is a list of only `null` an error? — raised 2026-09-06
+
+`const e = [null]` infers **`null[]`** — pinned by forcing it into a diagnostic, which reads
+`cannot assign null[] to 'bad' of type i32` — and every use of one refuses at the LITERAL with
+`emitProgram: bare null needs a struct-typed context`, including `e.length`, before any element
+is read. The boundary is sharp: `[null, 42]` and `[42, null]` both run (D1830), so it is the
+ABSENCE of a non-null member and not the position of the `null`. The annotated spelling
+`const e: (i32 | null)[] = [null]` runs, and **every one of the 53 files in the tree that
+spells a null-only literal annotates its destination** — `const c: (K | null)[][] = [[null]]`
+and friends — as does every corpus cell (`d591t_let_nul_null`, `d341_sound_root_write`). No
+program in the tree or the corpus relies on an un-annotated `null[]`.
+
+**Options.**
+(a) **Refuse the literal** with a sentence that names the fix — "a list of only `null` has no
+element type; annotate it, e.g. `const e: (i32 | null)[] = [null]`". `const e = [null]` becomes
+a check error; `const e: (P | null)[] = [null]` is unaffected, which is every use in the tree.
+(b) **Let `null[]` exist and give it a rep** — a list whose every element is null: one wrapper,
+no element box, every read yields `null`, and `e.length` works. `const e = [null]; print(e.length)`
+would print `1`, and `e[0]` would be the `null` type.
+(c) **Infer from the first non-null USE** — `const e = [null]; e.push(42)` would pin the element
+to `i32 | null`, the way A-infer-null pins a scalar `let x = null`. VL's inference does this for
+a scalar binding but not for a literal's element, so this is new machinery in the checker. That
+push is a CHECK error today, `push: cannot add i32 to null[]`, which is worth noting twice over:
+it is the one place the type already reaches a user BY NAME, and it is the exact site (c) would
+have to turn into a pin.
+
+**Peers.** TypeScript under `strictNullChecks` infers `null[]` and allows it — legal but
+useless, and the same trap: `[null].push(1)` is an error there too. Kotlin infers
+`List<Nothing?>`, which is likewise assignable nowhere useful. Rust refuses to infer at all
+(`let v = vec![None];` needs a type annotation, `cannot infer type`), which is (a) with a
+different sentence. So (a) is the strictest peer and the one whose failure is at the literal
+rather than at a later use.
+
+**Recommendation: (a).** The type exists today and is worth nothing: every use refuses, at the
+literal, with a message about struct context that names neither the list nor the missing
+element type. Nothing in the tree or the corpus depends on it, so the cost of refusing is a
+message change and no program. (b) buys a rep for a type whose only inhabitant is a list of
+nulls, and would have to answer what `e.push(42)` does. (c) is the most useful answer and the
+most expensive: it needs an element hole a later use fills, which is A-infer-null's rule one
+level down and touches the literal's own inference, not just its registration. If (a) lands,
+the sentence is the whole deliverable and D1832 closes as a check reject.
+
 ### backtick-strings-second-form — do backticks earn their place beside `"…"`? — RULED 2026-09-06
 
 **Ruling (owner, 2026-09-06):** fold (Rust's rule): an ordinary `"…"` string may span lines and keeps the newline; a `\` before a newline joins the next line and strips its leading whitespace; backticks are removed. The formatter preserves interior newlines; an unterminated string is reported at its opening quote.
@@ -532,7 +574,9 @@ a name-derived key needs a definite-assignment argument the narrowing stack does
 `let i` must be excluded by a rule that does not exist. **Recommendation: yes, for `const`
 bindings only** (a `let` index keeps the refusal, with a message that says why).
 
-### D1736 — does an `is T` pin survive a `while` loop's re-execution barrier? — RULED 2026-09-06, REOPENED the same day
+### D1736 — does an `is T` pin survive a `while` loop's re-execution barrier? — RULED 2026-09-06, REOPENED the same day, BUILT 2026-09-06 night
+
+**BUILT 2026-09-06 (PR "narrowing applies to READS: a write is checked against the declared type and re-narrows the binding, so an `is` pin narrows a `while` body too").** The re-ruling as written: the assignment gate asks `writeStorageTy` unconditionally, `retireNarrowingsForWrite` puts the declared type back in place and shadows the written member in the current block, and the member is banked at the assignment node so the emitter selects it out of the declared set. `checkWhileStmtNode`'s null-strip filter and `narrowStripNullOnly` are both gone; `narrowBareIdentOnly` holds the loop body, mirroring the checker's `isPathKey` test, so a loop still declines a property path. The rule's one cost is the POST-GUARD RESIDUAL, which an arm's write can now falsify — both halves drop it for a clobbered name (`pgResidualVoidOf`), so `if x is string { return 0 } else { x = "clobbered" }` is legal and the read below the chain is at the declaration. `runs -> not-runs` 0, `-> silent` 0, byte-identical in 2,580 of 2,580 buildable modules. The contract fixture named below is now `tests/cases/loops/while-body-is-guard-narrows.vl` and asserts the narrowing; the two `soundness/*-narrowed-write-reject.vl` files are `soundness/guard-else-write-voids-residual.vl` and `soundness/elseif-chain-write-voids-residual.vl`. D1736 closes as a built capability row.
 
 **Reopened (2026-09-06, #2821):** built as ruled, the pin refuses the write that terminates a loop over a union — `while (x is i64) { … x = true }` (`tests/cases/unions/paren-is-narrow.vl`) became `cannot assign boolean to i64`, a `runs → not-runs` on a corpus program, and `tests/cases/loops/while-body-is-guard-not-narrowed.vl` is a standing contract that predicted it. The same rule holds in an `if` today (`if x is i64 { x = true }` is refused): a narrowed binding's type is also what it ACCEPTS. The question is about writes, not loops. **Options.** (a) narrowing applies to READS only; a write is checked against the declared type and re-narrows the binding to what was written — TypeScript's and Kotlin's rule; `if` and `while` then both narrow and the loop is legal; it changes what an `if` branch accepts today. (b) keep "the narrowed type is what it accepts"; `while` bodies stay un-narrowed by `is`; D1736 closes as DESIGN with the contract fixture as its witness. **Recommendation: (a).**
 
@@ -553,7 +597,9 @@ If the answer is no, the row closes as DESIGN with a message that names the loop
 
 Today no `...` token exists, no function is variadic, and `push` takes exactly one argument. ROADMAP row 21 (H4.6 / B6) sequenced spread behind variadics; the spread lane measured that premise on 2026-09-06 and confirmed it. **Options.** (A) variadics first, spread falls out; (B) a named bulk append, no new syntax; (C) `push(...ys)` alone. **Recommendation: (B) now, (A) when scheduled — never (C).**
 
-### match-empty-clause — is `Stop{}` a legal arm pattern? — ASKED 2026-09-06 night
+### match-empty-clause — is `Stop{}` a legal arm pattern? — RULED 2026-09-06 night
+
+**Ruling (owner, 2026-09-06 night):** (a) — BANNED. `Stop{}` is refused with the nested clause's sentence ("`Stop{}` binds nothing — write `Stop`"); one spelling per meaning. The owner also wants parameter and `let`/`const` destructuring EVENTUALLY, with the payload clause's grammar (pun, rename, nest) — ROADMAP rows 31/32.
 
 Today `Stop{}` is legal and means exactly `Stop` (a variant arm binding nothing), while the same shape NESTED (`Wrap{p: {}}`) is refused as binding nothing. **Options.** (a) refuse `Stop{}` with the nested clause's sentence ("`Stop{}` binds nothing — write `Stop`"), one spelling per meaning and nothing for `vl fmt` to choose between; (b) allow both levels (Rust allows `Stop {}`), and lift the nested refusal for consistency. **Recommendation: (a).**
 
@@ -606,6 +652,99 @@ and would need the value-union box with every non-string rep as an arm), which i
 one step wider and costs a heap type per negation. **Recommendation: (a)** — a negation is a
 constraint on a type, not a type with a runtime shape, and (b) buys a boxed `i32` for a feature
 almost nothing uses. If (a), the checker owes the sentence and D1773 closes as DESIGN.
+
+### one-literal-union-rep — should a literal union's TYPE carry its REP?
+
+Raised 2026-09-06 by the "one rep per node" campaign
+(`docs/internals/rep-descriptor-campaign.md`), whose first converted classifier measured the
+cost. **Nothing is broken while this waits** — every spelling below compiles today; what it
+decides is whether the rep descriptor can ever be total over literal unions, and therefore
+whether every classifier family after the second one pays this same carve-out again.
+
+**Measured 2026-09-06.** A literal union's rep is decided by ALIAS-NESS, not by its type:
+`repOfTyFlat`'s `TyUnion` arm covers a declared `type K = "a" | "b"` (the interned i32 atom)
+and DECLINES an inline `("a" | "b")`, because canon softens the inline spelling to `string`;
+and it declines a NUMERIC literal union (`type N = 1 | 2`) in both spellings, because that one
+reps as its base scalar and the collapse is checker metadata rather than structure. Over
+`tests/cases` the ladder-vs-descriptor oracle at the very first converted site
+(`tyKindOf`) reports **2,448 queries where the ladder answers and the descriptor declines,
+1,503 of them (48 modules) this exact collapse** — the single largest residue at the seam.
+The standing memory note is `vl-litunion-rep-cliff`: a literal union's TYPE does not carry
+its REP.
+
+**Options.**
+(a) **The type carries the rep.** A literal union's arena row records which of the three reps
+it takes (interned i32 atom / softened `string` / collapsed base scalar) at MINT time, so the
+descriptor answers structurally and no consumer re-derives it from alias-ness. Cost: canon
+must stop softening an inline member set to `string` at the positions where the atom rep is
+what is emitted, or record the softening as provenance rather than as a rewrite (the
+`tyLitUnionAliasIx` provenance stamp is half of this already).
+(b) **Alias-ness stays the deciding input, and it is written down as a rule** rather than
+inferred per site: an aliased literal union is the atom, an inline one is the softened base,
+a numeric one is its base scalar — one predicate, asked by every consumer, with the
+descriptor declining by design and the campaign's carve-outs kept forever.
+(c) **One rep for all three**: every literal union is the interned i32 atom, inline and
+numeric included. Simplest to state, and it changes what a program emits — an inline
+`("a"|"b")[]` becomes an atom list where it is a string list today.
+
+**Recommendation: (a).** The descriptor's whole thesis is that a rep is a function of a type;
+(b) writes the exception down honestly but keeps a permanent second producer at every one of
+the six conversion families, and the campaign's own measurement is that this residue is the
+largest one. (c) is the cleanest rule and the only one that moves emitted bytes, so it wants
+its own corpus grading before it is chosen, not a ruling on the strength of tidiness.
+
+Peers: TypeScript's string-literal types are erased entirely, so it has no rep question;
+Rust's `&'static str` constants and its enums are two different things and it never merges
+them; Kotlin's `enum class` is the atom rep with no inline spelling at all. VL is unusual in
+offering both spellings of one type, which is where the two reps came from.
+
+Grading: `tests/cases/literal-unions/*` (121 modules), plus the oracle's LEFT-ONLY bucket at
+`tyKindOf` and at `vtKindOfType`, which must fall to 0 under (a) or (c) and is permanent
+under (b).
+
+### nullable-rep-rule-stated-once — can niche-vs-box be one rule instead of eleven arms?
+
+Raised 2026-09-06 by the same campaign. **Nothing is broken while this waits**; the eleven
+arms are individually correct, and the per-rep audit's own finding is that a ladder naming
+three of them has named a quarter of the family.
+
+`VKind` carries **eleven** nullable members — `nulstruct`, `nulstr`, `nullist`, `nulbool`,
+`nulmap`, `nulreflist`, `nulclosure`, `nulvariant`, `nulu8list`, and the four distinct-backing
+scalar lists (`nulstrlist`, `nulf64list`, `nuli64list`, `nulf32list`) — and `RepDesc.rdNul`
+records four distinct null DISCIPLINES (ref niche, boolean/litunion i32 sentinel, boxed atom
+tag, none). `repOfNullable` decides between them by testing the inner variant arm by arm.
+Every arm is right; the question is whether the rule they collectively implement can be
+stated once, as a function of the inner rep's reference-ness and (for a union) its member
+count — so that a twelfth nullable shape gets its arm by construction rather than by
+somebody remembering.
+
+**Options.**
+(a) **State it once**: `rdNul` is derived from the inner descriptor — a reference rep takes the
+`(ref null …)` niche, an i32-repped one takes its spare-value sentinel, a value union takes
+the box tag — and `repOfNullable`'s arms become the derivation's inputs rather than its
+answer. A new nullable shape then needs no arm.
+(b) **Keep the arms and gate them**: add the missing-arm compile error instead of the rule, by
+making `repOfNullable` a `_`-less `match` over the inner variant (the language's own
+exhaustiveness check), so a twelfth shape breaks the self-compile rather than falling
+through. Cheaper, and it buys the same *safety* without the same *simplicity*.
+(c) Leave it. The eleven arms are correct and the audit that found them is the standing
+instrument.
+
+**Recommendation: (b) now, (a) as the campaign reaches step 5 of its order.** The measured
+hazard is a MISSING arm, not a wrong one — `nulvariant` had no rung (#2400) and
+`captureValKind` had two arms for a three-member set (D1370) — and (b) closes exactly that
+with the surface the repo already dogfoods. (a) is the better end state and is worth taking
+when the valtype ladders convert, because `fbValtypeNullable`/`fbRefNullForKind` are the same
+rule written a third and fourth time and should move with it, not before it.
+
+Peers: Kotlin's `T?` is one rule (a nullable reference) because every `T` is a reference;
+Rust's niche optimisation IS rule (a), computed structurally per type with no per-shape arm;
+C#'s split between `Nullable<T>` for values and plain null for references is rule (b) with two
+arms and a hard boundary. VL has four disciplines because it has four rep families, so (a) is
+Rust's answer and is reachable.
+
+Grading: the nullable half of `tests/cases/types/` and `tests/cases/unions/`, the 11
+`tests/cases/arrays/nullable-*` modules, and the rep-fuzz baseline, which is where a missing nullable arm has historically surfaced.
 
 ### code-quality survey rows 19 and 20 — re-grade before ruling
 

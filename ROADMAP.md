@@ -70,6 +70,8 @@ units: **hours** · **half-day** · **days**.
 | 28 | **F-tiers / J1 — collapse the redundant corpus runner** | 8 files execute emitted wasm under V8 via `tests/support/runWasm.ts` | `tests/support/casesWasmOracle.ts` + 4 shards + 4 standalone suites | days |
 | 29 | **F-day-one — five grammar axes still absent** | `day-one-sampler.md:90-92`: `match`, operator overloading, multi-param generics, recursive types, mixed-width arithmetic | `scripts/day-one/grammar.py` (91 records) | half-day per axis |
 | 30 | **Host ABI (4) process spawn, (5) env + exit** | no `std` export for spawn/exec/env/exit; the orchestrator scripts still shell out | three hosts + the declaration in `wasmEmit.vl` | days |
+| 31 | **A-destructure — `let`/`const` and PARAMETER destructuring (owner ask, 2026-09-06 night; not scheduled)** | `const { x, y } = p`, `const [a, b] = xs`, `function f({ x, y }: Pt)` → `parse error … expected an identifier but found `{``; the `match` payload clause (pun, rename, nest — #2837) is the only destructuring today | `parser.vl` (a pattern in binding and parameter position, the payload clause's grammar reused), `typecheck.vl` (binding types from the pattern; for an UN-ANNOTATED parameter the pattern is a shape constraint `{a: ?, b: {c: ?}}` with hole leaves closed at the pin — the inference half is a second step), `format.vl` (byte-for-byte round trip), the desugar (one `const` per leaf, the `match` prelude's shape); list destructuring wants the multiple-returns question in `docs/guide/lambda-param-skip-design.md` answered first | days |
+| 32 | **B21.2 — ban the empty top-level payload clause `Stop{}` (owner ruling 2026-09-06 night)** | `match c { Stop{} => 0 … }` runs today and means `Stop`; `Wrap{p: {}}` is already refused | `parser.vl` — refuse with the nested clause's sentence; retarget the `Move{}` fixture line in `payload-binding-*.vl` | hour |
 
 ### Open items that need an owner ruling first — listed, not decided
 
@@ -1509,6 +1511,42 @@ in-language GC knobs.
      (b5) value-union composite members (R3b/R7 — the genuine ABI-policy cluster); then
      migrate `vtKindOfType`/the valtype ladders onto `repTreeVKind` and delete the flat
      `RepDesc` when its last consumer moves.
+     **STAGE C — "one rep per node", the CONSUMER census and conversion. OPEN, owner-approved
+     2026-09-06; plan, order and numbers: `docs/internals/rep-descriptor-campaign.md`.**
+     Stage B widened the PRODUCER; Stage C converts the population on the other side of the
+     seam, which nothing had counted. `scripts/rep-classifier-census.py` derives it from the
+     tree: **519 rep classifiers over 2,962 call sites**, 138 reading the ARENA, 117 a NAME,
+     28 a SPELLING, 132 a TABLE column and 223 a FRAME. Every conversion is graded by the
+     **ladder-vs-descriptor agreement oracle** (`repABNote`/`repLadderABSweep`, riding
+     `$VL_REP_SHADOW`; buckets AGREE / CONTRADICT / LEFT-ONLY / RIGHT-ONLY) at **0 CONTRADICT
+     over `tests/cases` + the distilled corpus** before its ladder is deleted, then by byte
+     identity over both populations, `regress.py` (0 `runs → not-runs`, 0 `→ silent`),
+     `rep-fuzz-check.sh` exact, and `mono-tyaram-grid.sh` for anything touching the pin
+     context. The families, in the order they convert:
+     1. ✅ **`tyKindOf`** — the i32 code vocabulary (0/2/3/7/10/11/12/13/20), 18 call sites.
+        DONE: 3,366,947/3,366,947 queries agree, byte-identical in 3,148 + 7,589 modules.
+     2. ⬜ **`vtKindOfType`'s annotation ladder** — 25 predicate rungs. The `annRepKindOf` seam
+        already exists, so the work is widening `repOfTy` coverage until the fallback is
+        unreachable; the oracle's LEFT-ONLY bucket at this site is the burn-down list.
+     3. ⬜ **`repOfName(name, fnIx)`** — the missing surface, not a ladder: name → frame
+        (`fnStmtsPosOf`) → `fnIndexOfInScopeSid` (walking `fnParent` then `fnInstOrigin`) →
+        declaration → type. The five-row monomorphizer family (D1781, D1782, D1788, D1795,
+        D1817) is every site that should have called it. Lands before item 4.
+     4. ⬜ **The `expr*` family** — 48 classifiers, 927 call sites, 31% of all classifier call
+        sites. Converted by AXIS, since each is a closed set whose siblings must move
+        together: (a) the seven scalar-list predicates, (b) the six nullable niches, (c) the
+        three scalars, (d) the reference shapes.
+     5. ⬜ **The return-kind family** — `retResultVKind` + the fourteen `fnRet*Sid` readers;
+        `fRetKind` becomes a projection rather than a parallel column. `fnRetF32ArraySid` and
+        `fnRetAnnF32ArraySid` still read the flat `fnIndexOfSid` and move first.
+     6. ⬜ **The valtype and field-code ladders** — `fbValtype` (31 arms), `fbValtypeNullable`,
+        `fbRefNullForKind`, `fbHeapIdxForKind`; `fieldTypeCode`, `nameFieldCode`,
+        `anonFieldCode`. The remaining parallel numbering schemes.
+     7. ⬜ **The slot layer, last** — `structIndexOfExpr`, `rlSlot*`, `mvSlot*`,
+        `exprVariantIndex`. `rdSlot` is nominal where the rest of the descriptor is
+        structural, and nothing earlier depends on it.
+     Two owner rulings gate how far items 2 and 6 can go: `one-literal-union-rep` and
+     `nullable-rep-rule-stated-once` (`docs/internals/open-rulings.md` §D).
      REMAINING legacy items: (a) widen `repOfTy` coverage (typed-value maps,
      litunion/union-element arrays — subsumed by Stage B above); (e) the variant⇄struct-table
      seam, **re-measured 2026-08-26 while closing `silent-class-inventory` D32, and this row was
@@ -2119,7 +2157,18 @@ in-language GC knobs.
   Workboard D7.
 - 🟡 **B5. Objects.** REMAINING: methods via `self`+UFCS (B14); typed literals in object values
   (`{n: 4<i64>}`); Exact-by-default for values (A8).
-- 🟡 **B6. Collections — growable `T[]`.** REMAINING: representation inference (§VL.7 — lower never-grown
+- ⬜ **B6-ro. The `readonly` sweep of `std:array`'s pure readers.** `extend`'s `other` and
+  `concat`'s two parameters are declared `readonly T[]`; the eight other exports that only
+  READ their list are not — `indexOf`, `lastIndexOf`, `includes`, `count`, `reduce`,
+  `reverse`, `mapIndexed` and `sorted`. Widening each accepts a narrower source and a view
+  receiver at no call-site cost, and it is not a breaking change. Do it as one sweep with one
+  fixture per export rather than a module-wide rule in the header, which would state a
+  promise the eight unwidened exports do not keep.
+- 🟡 **B6. Collections — growable `T[]`.** In-place bulk append is **BUILT (2026-09-07)** as
+  `std:array`'s `extend<T>(self: T[], other: readonly T[])`, spelled `xs.extend(ys)`, and the
+  `xs.push(...ys)` spelling landed with variadics beside it — `push` is variadic, so a spread
+  argument appends in bulk through the same one-grow-then-`array.copy` shape `extend` uses.
+  REMAINING: representation inference (§VL.7 — lower never-grown
   values to a header-less fixed array); `map`/`filter` build-side generics for `Map`/`Set` (A10);
   `.vl`-std migration once a module system exists. (design: `docs/guide/collections-design.md`)
 - 🟡 **B6a. `Map` + `Set`.** The **struct/variant FIELD position is DONE** — `{[i32]: V}` now ships
@@ -3050,9 +3099,18 @@ independent).*
     ("`u8` is a storage type, not a value type"). Bytes are
     represented as `i32` masked `& 0xff` in `wasmEmit.vl` and round-trip/instantiate fine; a real
     packed byte buffer (B7/B6 `(array i8)`) would drop the 4×-wide detour. (detail: `docs/internals/selfhost-gaps.md` §H4.1)
-  - ✅ **H4.6. Array spread / concat in call position — BUILT** with variadics (B6): `...` is
-    one rule at three spellings, so `xs.push(...ys)`, `f(1, ...ys)` and `[...a, ...b]` all
-    run. `docs/internals/variadics-design.md` §5 names what is not built.
+  - ✅ **H4.6. Array spread / concat in call position — BUILT.** Bulk append is `std:array`'s
+    `extend` (B6), and `...` is one rule at three spellings, so `xs.push(...ys)`, `f(1, ...ys)`
+    and `[...a, ...b]` all run; `docs/internals/variadics-design.md` §5 names what is not.
+    **FOLLOW-UP, not taken here: 60 exact bulk-append loops**
+    (`while i < src.length { dst.push(src[i]); i = i + 1 }`) stand in `compiler/` and `std/` —
+    18 in `typecheck.vl`, 8 in `ast.vl`, 5 each in `emit_rep.vl` and `emit_collect.vl`, 4 in
+    `driver.vl`, 3 each in `wasmEmit.vl`, `format.vl`, `parser.vl` and `emit_mono.vl`, 2 each
+    in `json_walk.vl` and `std/array.vl`, 1 each in `emit_base.vl`, `emit_bignum.vl`,
+    `emit_classify.vl` and `std/fmt.vl`. Each is now `dst.push(...src)` in one line, but
+    migrating them is a code-quality refactor with its own byte-identity question — the
+    compiler's own bytes WOULD change, so the comment-trim proof does not apply.
+    (detail: `docs/internals/selfhost-gaps.md` §H4.6)
 - ⬜ **H-M2. Wasm-native distribution (end-state).** The `vl` binary becomes a wasm runtime
   (wasmtime — full WasmGC since v27) + a small host shim. No V8, no binaryen, no Deno.
   **Engine choice re-validated (2026 survey):** wasmtime remains the only standards-track
