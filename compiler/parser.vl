@@ -2880,16 +2880,30 @@ function parseMatchPattern(scrut: i32, binds: i32[]): i32 {
 function parseMatchPayload(scrut: i32): i32 {
   if peekKind() != "LBRACE" { return -1 }
   const bp = peekTok().start
+  const lets: i32[] = []
+  parseMatchPayloadFields(scrut, lets)
+  mkBlock(lets, bp)
+}
+
+// One `{ … }` level of a payload clause, appending one `const` per field it binds. `base` is
+// what the level reads from — the scrutinee at the top level, a `Member` into it one level
+// down, so `Move{p: {x}}` banks `const x = <scrut>.p.x`. The recursion is driven by braces the
+// source actually wrote, exactly as an object literal's is.
+function parseMatchPayloadFields(base: i32, lets: i32[]): i32 {
   advance() // "{"
   skipNewlines()
-  const lets: i32[] = []
   let going = peekKind() != "RBRACE" && peekKind() != "EOF"
   while going {
     const fp = peekTok().start
     if peekKind() == "IDENT" {
       const fname = advance().text
-      const mem = mkMember(scrut, fname, fp)
-      lets.push(mkLet("const", fname, -1, mem, fp))
+      if peekKind() == "COLON" {
+        advance() // ":"
+        skipNewlines()
+        parseMatchPayloadBound(base, fname, fp, lets)
+      } else {
+        lets.push(mkLet("const", fname, -1, mkMember(base, fname, fp), fp))
+      }
     } else {
       P.diags.push(
         { msg: "match payload binding must be a field name", at: P.pos },
@@ -2904,7 +2918,71 @@ function parseMatchPayload(scrut: i32): i32 {
     going = peekKind() != "RBRACE" && peekKind() != "EOF"
   }
   expectClose("RBRACE")
-  mkBlock(lets, bp)
+  0
+}
+
+// What may follow `field:` in a payload clause: a NAME to bind the field to (`Move{x: a}`), or
+// a nested clause reading through it (`Move{p: {x}}`). A TYPE before the brace would be a
+// nested type pattern, which discriminates instead of reading and would leave the arm no
+// longer covering its own variant — refused by name rather than parsed into a field read.
+function parseMatchPayloadBound(
+  base: i32,
+  fname: string,
+  fp: i32,
+  lets: i32[],
+): i32 {
+  if peekKind() == "LBRACE" {
+    if peek2Kind() == "RBRACE" {
+      P.diags.push(
+        {
+          msg: "`" +
+            fname +
+            ": {}` binds nothing — drop it, or name the fields to bind inside it",
+          at: P.pos,
+        },
+      )
+    }
+    return parseMatchPayloadFields(mkMember(base, fname, fp), lets)
+  }
+  if peekKind() == "IDENT" {
+    const bp = peekTok().start
+    const bname = advance().text
+    if peekKind() == "LBRACE" {
+      P.diags.push(
+        {
+          msg: "a payload clause reads fields, so `" +
+            fname +
+            ": " +
+            bname +
+            "{…}` is not a pattern here — bind the field with `" +
+            fname +
+            ": " +
+            bname +
+            "` and test it with `is` in the arm body",
+          at: P.pos,
+        },
+      )
+      return parseMatchPayloadFields(mkMember(base, fname, fp), lets)
+    }
+    // The `const` sits at the BINDING token, the field read at the FIELD token. A punned
+    // `{x}` writes one token so the two agree, which is how the formatter tells it from a
+    // same-named rename `{x: x}` without a column to carry the distinction.
+    lets.push(mkLet("const", bname, -1, mkMember(base, fname, fp), bp))
+    return 0
+  }
+  P.diags.push(
+    {
+      msg: "`" +
+        fname +
+        ":` in a payload clause takes a binding name (`" +
+        fname +
+        ": n`) or a nested clause (`" +
+        fname +
+        ": {…}`)",
+      at: P.pos,
+    },
+  )
+  0
 }
 
 // `"while" expr block` — `label` is the loop's label when dispatched from the
