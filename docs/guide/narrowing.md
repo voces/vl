@@ -39,9 +39,21 @@ while y is i64 { print(y + 1)   // a loop head narrows its body, re-tested every
 A write of a NON-member is still refused, and the diagnostic names the declared type:
 `x = "s"` above is `cannot assign string to i64 | boolean`. The receiver does not matter — a
 property path (`o.v`, `xs[0]`) takes the same rule as a bare name, checked against the field's
-or element's declared type and re-narrowed to what was written. One place the rule stops short:
-a write inside a NESTED block retires the narrowing for everything after that block rather than
-re-narrowing across it.
+or element's declared type and re-narrowed to what was written.
+
+A write inside a NESTED block does not re-narrow across that block; the arms of the `if` JOIN
+instead, so the code below reads at the join of what the surviving arms left the name at:
+
+```vl
+if x is i64 {
+  if c { x = true } else { x = false }   // both arms wrote `boolean`
+  if x { … }                             // …so `x` reads as boolean below
+}
+```
+
+With only ONE arm writing, the other path still holds what the guard proved, and the join says
+so: `if c { x = true }` alone leaves `x` at `i64 | boolean` below, and a read that demands one
+member is refused. A diverging arm contributes no path, so the surviving arm's own type stands.
 
 ## What narrows
 
