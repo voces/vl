@@ -362,6 +362,89 @@ Each now says so, in the shape the `concat`-vs-`+` bullet uses.
   floor intrinsic that does not exist, and a std wrapper for a syscall VL cannot make is
   a name that fails at emit.
 
+## `std:process`
+
+- **Which clause admits it, and there is no consumer yet.** `std-design.md` D2's INVENTORY
+  clause names "fs/io/args once WASI lands" and does NOT name process or env; ROADMAP row
+  30 does, and it also names the intended consumers — the orchestrator scripts — which is
+  a stronger warrant than `std:args` had. But no `.vl` outside `std/` imports either module
+  today, so the same sentence applies: the dogfooding is the FOLLOW-UP, not the warrant.
+  The first port is `scripts/seed-size.py`, and D1864 is why it has not landed yet.
+- **Why `runProgram` and not `run`.** VL has no namespace import, and a module that both
+  imports and declares a name is a HARD PARSE ERROR — the rule that made `std:args` export
+  `programArgs` rather than `args`. `run` is the most-claimed verb in exactly the population
+  this module serves (test runners, orchestrators, build scripts), so it is the stronger
+  case of the two, not the weaker. `exit` keeps its bare spelling deliberately: it is the
+  universal one (`Deno.exit`, `sys.exit`, `process::exit`) and nobody contests it.
+- **Why `ProcessOutput` and not `ProcResult`.** std's other two uses of "Result" —
+  `std:fs`'s `IoResult` and `std:json`'s internal `asResult` — both name the union that
+  CARRIES the failure. Naming the success arm with the same word would put both readings in
+  one file. Rust's is `std::process::Output` and Deno's is `CommandOutput`; both peers call
+  the `{code, stdout, stderr}` triple output.
+- **Why `runProgram` is three imports.** A wasm import answers ONE value and a finished
+  child has three. `__proc_run__` spawns and answers the code; `__proc_out__` /
+  `__proc_err__` read a per-instance cell it fills, cleared at the start of every run. The
+  alternative — one length-prefixed block — copies both streams twice and needs byte-slicing
+  in std; this shape copies once and the ambient cell never surfaces, because `runProgram`
+  makes all three calls itself. **The ORDER is load-bearing and invisible to a caller**: the
+  errno is `std:fs`'s shared cell, so it has to be read before the two stream fetches, which
+  is why they are the only floor calls in this module that deliberately leave it alone.
+- **Why NUL separates rather than terminates, and why std enforces the precondition.**
+  `cmd` alone is a command with no arguments and `cmd\0` is a command with one EMPTY
+  argument, which is lossless for a POSIX argv — but a VL `string` CAN carry a NUL
+  (`decodeUtf8([97, 0, 98])` succeeds with `.length == 3`), so the premise is about the
+  wrong type. Without the pre-flight `EINVAL` the child receives one more argument than the
+  caller wrote, silently, while both sibling modules refuse the same byte loudly. This is
+  the `emptyPathMsg` shape: one policy applied ahead of the host so the answer is the same
+  everywhere. `tests/vl_std_process_test.ts` grades the refusal and the empty-argument
+  round trip in one suite, because they are the two halves of the same encoding.
+- **`exit` is void because VL has no `never`, and because `__trap__` already is.**
+  `function pick(n: i32): i32 { __trap__("x") }` is `return type mismatch: expected i32,
+  got void` today, so `exit(code: i32): i32` would make `exit` the only diverging call in
+  the language that composes in a value position — and it would buy that by claiming an
+  `i32` no execution produces, which `const x = exit(1)` would then type-check. Two
+  divergence primitives that agree is no rule to memorise. If VL ever grows `never`, these
+  two move together, which stays true only while they agree now.
+- **`__proc_exit__` is the first host import returning nothing, and both emitter ladders
+  that name the void intrinsics one by one were blind to it** — `wasmEmit.vl`'s
+  statement-position `drop` decision and `emit_classify.vl`'s `stmtIsTailValue`, each a
+  `vl check`-clean program becoming invalid wasm (`exit(3)` and
+  `function bail(n: i32) { exit(n) }`). Both now ask `fsRetIsVoid` on the slot rather than
+  a spelling; the two positions are pinned by `tests/vl_std_process_test.ts`.
+- **Not here, and why:** no shell (the block is an argv, so nothing expands or splits); no
+  stdin; no streaming, pipelines or background processes; no working directory and no
+  environment overrides — the last two are the most likely next ask and neither of the two
+  scheduled script ports needs them.
+
+## `std:env`
+
+- **Which clause admits it.** ROADMAP row 30's slot (5), with `std:process`; see that
+  section — the warrant, the missing consumer and the follow-up are the same ones.
+- **Why there is no setter.** A setter changes what every later read in the program
+  answers, including reads made by code that never asked. The rubric is critical of
+  ambient/stateful APIs and this is the one place the criticism has a cheap answer: pass
+  the value. Stated in the header too, because a caller meets the absence.
+- **Why the signature is `string | IoError | null` and not the two-armed `string | null`
+  the brief wrote.** A value that is SET but not UTF-8, or a name no environment can hold,
+  would collapse to `null` and be indistinguishable from unset. That is the lossiness
+  `pathExists` refuses when it turns only `ENOENT`/`ENOTDIR` into `false`, and the one
+  `programArgs` refuses when a single non-UTF-8 argument fails the whole call. It still
+  composes: `getEnv("HOME") ?? "none"` narrows to `string | IoError`, so the default-value
+  idiom works without swallowing the error.
+- **It reads `std:fs`'s errno cell.** `__fs_errno__` is shared with the filesystem floor,
+  so `getEnv` reads it immediately after `__env_get__` and before anything else can fail.
+  The same coupling `std:args` documents, and the reason both modules keep their own
+  private `lastErrno` rather than importing one: exposing the cell would be a second error
+  channel next to `IoError`.
+- **`errnoName` was `std:fs`'s private `errName`.** Exporting it is what lets three modules
+  answer with one `IoError` vocabulary instead of each growing an errno table — the
+  alternative the brief forbids ("do not mint a second error type") applied one level down,
+  to the reason string rather than to the type. Each module re-exports the SUBSET of codes
+  it can actually answer with rather than all nine, because a re-export is a permanent
+  promise: `std:process` never answers `ENOSPC`. `errnoName` returns a name AND a sentence
+  (`"ENOENT (no such file or directory)"`), which under-promises against its name; a caller
+  wanting the bare symbol for a structured log field has no route to it today.
+
 ## `std:fmt`
 
 - **`toString` replaced an ambient builtin, by owner ruling** (DECISIONS.md). The compiler

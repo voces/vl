@@ -229,7 +229,10 @@ anything speculative without a consumer in the tree (no `std:http` before a
 network story), and anything the floor would have to grow for prematurely.
 Initial inventory: `std:fmt`, `std:test` (+ `std:test/runner`), `std:list`,
 `std:map`/`std:set`; first WASI-era additions: `std:fs`, `std:args`,
-`std:io` — gated on the error-handling design.
+`std:io` — gated on the error-handling design. `std:fs` and `std:args` shipped,
+and with them `std:process` (`runProgram`/`exit`) and `std:env` (`getEnv`), which
+complete the host ABI ROADMAP row 30 names; all four answer in `std:fs`'s
+`IoError` rather than minting error types of their own.
 
 ### D3. Source of truth + delivery (the embedding decision)
 
