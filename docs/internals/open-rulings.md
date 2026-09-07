@@ -475,7 +475,9 @@ changes which program is legal rather than how a legal one compiles. None blocks
 recommendation is the coordinator's; the witness is the row's own `Repro:`, re-run by the
 `filed witnesses` gate, so a ruling can be graded the day it lands.
 
-### backtick-strings-second-form — do backticks earn their place beside `"…"`?
+### backtick-strings-second-form — do backticks earn their place beside `"…"`? — RULED 2026-09-06
+
+**Ruling (owner, 2026-09-06):** fold (Rust's rule): an ordinary `"…"` string may span lines and keeps the newline; a `\` before a newline joins the next line and strips its leading whitespace; backticks are removed. The formatter preserves interior newlines; an unterminated string is reported at its opening quote.
 
 **Measured 2026-09-05:** interpolation (`\{x}`) works in ordinary `"…"` strings; the ONLY
 thing a backtick literal adds is a literal newline inside the string. There is no raw-string
@@ -530,7 +532,9 @@ a name-derived key needs a definite-assignment argument the narrowing stack does
 `let i` must be excluded by a rule that does not exist. **Recommendation: yes, for `const`
 bindings only** (a `let` index keeps the refusal, with a message that says why).
 
-### D1736 — does an `is T` pin survive a `while` loop's re-execution barrier? — RULED 2026-09-06
+### D1736 — does an `is T` pin survive a `while` loop's re-execution barrier? — RULED 2026-09-06, REOPENED the same day
+
+**Reopened (2026-09-06, #2821):** built as ruled, the pin refuses the write that terminates a loop over a union — `while (x is i64) { … x = true }` (`tests/cases/unions/paren-is-narrow.vl`) became `cannot assign boolean to i64`, a `runs → not-runs` on a corpus program, and `tests/cases/loops/while-body-is-guard-not-narrowed.vl` is a standing contract that predicted it. The same rule holds in an `if` today (`if x is i64 { x = true }` is refused): a narrowed binding's type is also what it ACCEPTS. The question is about writes, not loops. **Options.** (a) narrowing applies to READS only; a write is checked against the declared type and re-narrows the binding to what was written — TypeScript's and Kotlin's rule; `if` and `while` then both narrow and the loop is legal; it changes what an `if` branch accepts today. (b) keep "the narrowed type is what it accepts"; `while` bodies stay un-narrowed by `is`; D1736 closes as DESIGN with the contract fixture as its witness. **Recommendation: (a).**
 
 **Ruling (owner, 2026-09-06):** (a) — yes; an `is` pin at a loop head is the null strip's twin, retired by a write to the receiver exactly as `!= null` is. D1736 is a capability row.
 
@@ -542,6 +546,8 @@ is a null strip's twin at the loop head, with the same retirement on a write to 
 If the answer is no, the row closes as DESIGN with a message that names the loop, not the `is`.
 
 ### D1686 / D1687 — what does the design owe a covariant list the closure cannot follow? — RULED 2026-09-06
+
+**Addendum (owner, 2026-09-06):** type-level readable/writable semantics were in the original plan as ROADMAP A9 ("Readable/Writable variance", unstarted; `modules-design.md` §exports depends on it). Priority is the coordinator's call: A9 is BACKLOGGED and the list view is built alone for now, spelled so A9 can subsume it.
 
 **Ruling (owner, 2026-09-06):** (a) — a read-only list view that is covariant; mutable lists stay invariant. The view is SHALLOW: it forbids writes to the list's shape (`push`/`pop`/`clear`/index assignment/`"[]="`) and says nothing about an element's own fields, as Kotlin's `List` and C#'s `IReadOnlyList` do. The keyword's spelling (`readonly T[]` proposed) and whether a parameter defaults to read-only are the build's questions, not this ruling's. D1686/D1687 close as DESIGN today and reopen as the view's grading list.
 
@@ -555,7 +561,9 @@ read-only in the type** (a `readonly Shape[]` parameter, or a distinct read-only
 until it exists**; the refusal today names a contract ("delivered to a callee whose body this
 program can point at, and to no other") and is honest.
 
-### fmt-fill-style-scalar-lists — how does `vl fmt` lay out a long scalar list?
+### fmt-fill-style-scalar-lists — how does `vl fmt` lay out a long scalar list? — RULED 2026-09-06
+
+**Ruling (owner, 2026-09-06):** (a), fill scalar-literal lists, with one deterministic intent rule: if the author's literal already has two or more rows and every row holds the same number of elements, the rows are kept (a 2-D table written as 1-D); otherwise fill. No opt-out comment.
 
 Today a list literal that does not fit on one line goes one element per line, so a 200-entry
 `u8[]` table is 200 lines. **Options.** (a) fill-style (as many elements per line as fit,
@@ -563,7 +571,9 @@ wrapped at the column) for lists whose elements are ALL scalar literals; (b) one
 always. **Recommendation: (a)**, scalar literals only — anything with a struct, closure or
 nested list element keeps one-per-line, so the rule is decidable from the element kinds alone.
 
-### D1773 — a negation type in a many-values-per-slot position: refused, by design or by gap?
+### D1773 — a negation type in a many-values-per-slot position: refused, by design or by gap? — RULED 2026-09-06
+
+**Ruling (owner, 2026-09-06):** a WRITTEN negation type (`!T` in any annotation — binding, alias, parameter, element, field, map value, return) is refused by the checker with one sentence; `x !is T` narrowing over a union stays, since there the "not T" is subtracted from a known set and is never written. A negation as an INTERSECTION operand (`(0 | 1 | 2) & !2`) is the type-level subtraction from a known set and stays legal — the `&` fold subtracts it and the annotation's own type is the positive remainder; a stored `!T` (`A & (B | !C)`) is refused with the rest (#2818 measured six shipping fixtures on this line). Full negation tracking waits for A4/A12. D1773, D1775, D1784 (unfiled: D1784), D1785 (unfiled: D1785) and D1800 (unfiled: D1800) close as DESIGN — the last three were filed on PRs closed unmerged and are re-filed by the refusal lane; #2790's alias-transparency rungs are removed by the refusal lane; #2807 and #2813 were closed unmerged.
 
 `type N = !string` is a checker-only refinement with no rep of its own, so a BINDING takes its
 initializer's rep and now runs (D1775, #2790; D1773's nine owed cells, #2807). The ten cells
