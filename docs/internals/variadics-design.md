@@ -117,10 +117,22 @@ subtlety in the whole checker change:
 * a spread argument binds the **array** hole: `bindGenWalk(T[], argTy, …)`, the existing
   `TyArray` arm.
 
-Binding is first-use-wins, as everywhere else, so `f(1, "a")` into `...xs: T[]` pins `T = i32`
-from the first argument and refuses the second with `argument 2: expected i32, got string`. A
-join (`T = i32 | string`) is NOT computed; that would be a new inference rule and the ruling did
-not ask for one.
+**The element hole binds from the PACKED LIST, so it inherits the list literal's own join**,
+which is the whole of the "packs into a list" promise: `[1, 2.5]` is `f64[]` and `[1, true]` is
+`(i32 | boolean)[]`, so `f(1, 2.5)` and `f(1, true)` pin `T` to exactly those and run. This is
+measured; an earlier draft of this section said the second argument was refused by first-use-wins,
+which was read off `bindGenWalk` rather than run, and is false.
+
+What a type parameter cannot be pinned to is a union that **boxes**. `(i32 | boolean)` rides the
+i32 spine — both arms are i32-repped — and runs; `(i32 | string)` needs a box, and the instance
+the monomorphizer mints for that pin builds a module that does not validate. So a boxed join is
+refused at the pin, naming the concrete spelling that runs:
+
+> ``a rest parameter's element is inferred from the arguments, and these join to `i32 | string` — a boxed union a type parameter cannot be pinned to. Spell the element out, `...xs: (i32 | string)[]`, or pass one element type``
+
+The refusal is the CHECKER's on purpose. Left to the monomorphizer it is check-clean invalid
+wasm (D1851's twin, `g([1, "x"])` into `g<T>(xs: T[])`, is a loud emit reject at the explicit
+spelling — so the rest reached a pre-existing gap by a silent route).
 
 ### 2.5 The refusals, and the sentence each one prints
 
@@ -299,5 +311,7 @@ and array printers both route their items through `expr()`, one arm serves both 
 * **A rest parameter in a function TYPE** — §4.1, with the alternative stated.
 * **A rest parameter on an `extern`.** `parseExternParams` stores type spellings only and has no
   `Param` node to carry the marker; a host import's arity is its whole contract.
-* **Widening the rest element from several arguments.** `f(1, "a")` into `...xs: T[]` refuses at
-  argument 2 rather than pinning `T = i32 | string` (§2.4).
+* **A rest element hole pinned to a BOXED union** — §2.4. `f(1, "x")` into `...xs: T[]` is a
+  loud check reject naming `...xs: (i32 | string)[]`, which runs. The gap underneath it is
+  D1851's, not the rest parameter's: the same pin at the explicit-list spelling is a loud emit
+  reject on master.

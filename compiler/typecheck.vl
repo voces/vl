@@ -20701,6 +20701,55 @@ function restRequiredArity(dParams: i32[], restIx: i32) {
   req
 }
 
+// Whether a union rides the i32 SPINE rather than a value box: every non-null arm is an
+// `i32`- or `boolean`-repped primitive, or the whole union is a literal one. The spine cases
+// pin a rest element hole and run; a boxed one has no instance (D1851).
+function unionRidesI32Spine(tyIx: i32): boolean {
+  if tyIsLitUnion(tyIx) { return true }
+  if tyIx < 0 || tyIx >= T.tys.length { return false }
+  const t = T.tys[tyIx]
+  if t is TyUnion {
+    let i = 0
+    while i < t.uMembers.length {
+      const pn = primNameOf(t.uMembers[i])
+      if pn == null { return false }
+      if pn != "i32" && pn != "boolean" && pn != "null" { return false }
+      i = i + 1
+    }
+    return true
+  }
+  false
+}
+
+// True, having reported, when a rest parameter's element is an unbound HOLE and the packed
+// list's element joined to a union that BOXES. `T` would pin to that union and the instance
+// the monomorphizer mints for it misbuilds — check-clean invalid wasm, the worst outcome
+// there is — so it is refused at the pin, naming the concrete spelling that runs (D1851).
+function restHoleUnionErr(pTy: i32, packIx: i32, ix: i32): boolean {
+  const pe = tyArrayElemIx(pTy)
+  if pe < 0 || pe >= T.tys.length { return false }
+  const pt = T.tys[pe]
+  if pt is TyVar {
+    const at = tyArrayElemIx(checkNode(packIx))
+    if at < 0 || at >= T.tys.length { return false }
+    const a = T.tys[at]
+    if a is TyUnion {
+      if unionRidesI32Spine(at) { return false }
+      tErr(
+        "a rest parameter's element is inferred from the arguments, and these join to " +
+          tyToStr(at) +
+          " — a boxed union a type parameter cannot be pinned to. Spell the element out, " +
+          "`...xs: (" +
+          tyToStr(at) +
+          ")[]`, or pass one element type",
+        ix,
+      )
+      return true
+    }
+  }
+  false
+}
+
 // Rewrite `f(a, b, c)` into `f(a, [b, c])` when `f`'s last parameter is a rest one, in place,
 // so every later reader — this function's index-parallel loop, the monomorphizer's positional
 // column, the emitter's list-literal path — sees an ordinary fixed-arity call. Returns false
@@ -22971,6 +23020,9 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
       if !restCallPack(n, ix, restIx) { return retTy }
     }
     args = n.callArgs
+    if restIx < args.length {
+      if restHoleUnionErr(params[restIx], args[restIx], ix) { return retTy }
+    }
   } else if hasSpreadItem(args) {
     tErr(spreadNoRestMsg(calleeIdentName(cfn)), ix)
     return retTy
