@@ -575,6 +575,34 @@ nullable, inside a block, then narrowed — each ingredient load-bearing, filed 
 is exactly the cross-product blindness the sampler exists for: no single-feature fixture
 reaches it, and the non-null twin is its own control.
 
+## The operator x mixed-width cross — 372 pairs, 0 width-borne disagreements
+
+The second two-feature cross: an overloaded operator whose BODY crosses widths. `op_mixw_mul`
+is `"*"(self: Mw{x: i32}, k: f64): f64` — `self.x * k` widens `i32 -> f64` inside the
+dispatch; `op_mixw_add` is `"+"(self: Aw{x: i32}, k: i64): i64` for the `i32 -> i64` edge. Both
+join `operator_vs_call` (their `op`/`call` reads carry an `op` key) and tag `opw_mix`.
+`op_samew` is the same-shape control — the identical operator over an `f64` field, so
+`self.y * k` is `f64 * f64` with no widening — tagged `opw_same`. A record that only paired a
+mixed operator with itself would measure nothing; the same-width record is what makes a hit
+falsifiable.
+
+Seeds 901-908 x 800 (before/after) and a wider 911-916 x 1000:
+
+| | pairs | AGREE-RUNS | DISAGREE |
+| --- | --- | --- | --- |
+| after, on a mixed-width operator (`opw_mix`) | 132 | 129 | 3 |
+| after, same-width control (`opw_same`) | 58 | 58 | 0 |
+| wide, `opw_mix` | 124 | 124 | 1 |
+| wide, `opw_same` | 56 | 56 | 1 |
+
+**A clean negative.** The mixed-width operator bodies compose correctly at every delivery
+position and both spellings. Every disagreement — and there is one on the SAME-WIDTH control
+too — carries `` `take` prints its type parameter here ``: the operator reached through an
+un-annotated parameter with a `std:` import in the graph, which is [D1893](inventory/D1893.md)
+(fixed in flight), width-independent by construction. The plainest witness confirms it: the
+mixed `Mw` and the same-width `Sw` refuse identically with the import and run identically
+without it. Overloaded-operator dispatch does not care that the body widens.
+
 ## Running it
 
 `--count` counts PROGRAMS, so it is twice the number of pairs.
