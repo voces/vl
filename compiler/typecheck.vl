@@ -813,6 +813,9 @@ let solvedParamTys: {[string]: i32} = Map()
 // registry renders `i32 | "err"` as `i32|string`. `-2` marks a hole two calls pinned
 // differently — one wasm function serves both, so the reader must decline to narrow.
 let holePinTys: {[string]: i32} = Map()
+// The declaring function of each `TyVar` row. A pin is keyed on it, so two generics that both
+// call their variable `T` cannot poison each other's row.
+let tyVarOwner: {[i32]: string} = Map()
 // Argument demands parked on a hole: an argument whose type still rides an unsolved hole is
 // assignable to anything, so the comparison a concrete parameter deserves cannot be answered
 // where it is asked. Each row is re-asked as the hole takes a pin (D1821). `argPinDone` marks
@@ -2442,7 +2445,31 @@ function mapKeyTySupported(k: i32) { mapKeyRepTy(k) >= 0 }
 
 function mkTyVar(name: string) {
   const t: Ty = { tvName: name }
-  addTy(t)
+  const ix = addTy(t)
+  // The ambient body owns the row unless a site knows better (`mkTyVarOwned`).
+  tyVarOwner[ix] = curFnEscName
+  ix
+}
+
+// `mkTyVar` for a site that knows the function whose type variable this is.
+function mkTyVarOwned(name: string, owner: string) {
+  const ix = mkTyVar(name)
+  tyVarOwner[ix] = owner
+  ix
+}
+
+// The declaring function recorded for a `TyVar` row, or "" when unrecorded.
+function tyVarOwnerOf(tyIx: i32): string {
+  if tyIx < 0 { return "" }
+  tyVarOwner[tyIx] ?? ""
+}
+
+// A pin rides a key that carries the OWNING function, for the reason `holeWriteKey` does: a
+// declared type parameter is named `T`, so every generic in one program would share one row
+// and a second function's pin would poison the first's. An unowned row keeps the bare name.
+function holePinKey(owner: string, tvName: string): string {
+  if owner == "" { return tvName }
+  "!p!" + owner + "!" + tvName
 }
 
 // The canonical decimal form of an integer literal lexeme (`0x10` → `16`, `1_000` → `1000`,
@@ -3593,6 +3620,7 @@ export function initChecker() {
   ufcsWhyData = []
   solvedParamTys = Map()
   holePinTys = Map()
+  tyVarOwner = Map()
   argPinWant = []
   argPinGot = []
   argPinNode = []
@@ -19088,7 +19116,9 @@ function paramHoleName(fnName: string, fnIx: i32, pi: i32) {
 function unannotParamTy(holeName: string) {
   const s = solvedParamTys[holeName] ?? -1
   if s >= 0 { return s }
-  mkTyVar(holeName)
+  // `paramHoleName` already qualifies this name with its function, so the name IS the owner:
+  // two pins of it are one parameter's and can never be two functions'.
+  mkTyVarOwned(holeName, holeName)
 }
 
 // Is `name` the hole name of one of `fnIx`'s own parameters? A probe's body reaches
@@ -19549,7 +19579,7 @@ function tpDemandTy(recv: i32, calleeFn: i32) {
       if cstrOwnedBy(memCstrFn[k], calleeFn) {
         if !listHasStr(names, memCstrProp[k]) {
           names.push(memCstrProp[k])
-          tys.push(mkTyVar("?"))
+          tys.push(mkTyVarOwned("?", "#c" + i32ToStr(calleeFn)))
         }
       }
     }
@@ -19985,7 +20015,10 @@ function mkDerivedHole(
   if base < 0 { return -1 }
   const bt = T.tys[base]
   if !(bt is TyVar) { return -1 }
-  const ix = mkTyVar(hdRenderName(kind, field, inner, alt, bt.tvName))
+  const ix = mkTyVarOwned(
+    hdRenderName(kind, field, inner, alt, bt.tvName),
+    tyVarOwnerOf(base),
+  )
   const row = hdKind.length
   hdKind.push(kind)
   hdField.push(field)
@@ -20089,24 +20122,25 @@ function argPinRecheck(name: string, ty: i32) {
   0
 }
 
-// Banks the pin `ty` a hole named `name` took. First pin wins; a disagreeing second pin
-// poisons the row to `-2`, which `pinnedHoleTyOf` reads as "no answer" — the emitter lowers
-// one body for every call, so a rep read off one call's pin would miscompile at the other.
+// Banks the pin `ty` that `owner`'s hole named `name` took. First pin wins; a disagreeing
+// second pin poisons the row to `-2`, which `pinnedHoleTyOf` reads as "no answer" — one body
+// serves every call, so a rep read off one call's pin would miscompile at the other.
 // Never banked from a quiet probe: `solveUnannotParams` truncates its tables afterward.
-function notePinnedHole(name: string, ty: i32) {
+function notePinnedHole(name: string, ty: i32, owner: string) {
   if inferQuiet { return 0 }
   if ty < 0 { return 0 }
   argPinRecheck(name, ty)
-  const cur = holePinTys[name] ?? -1
+  const key = holePinKey(owner, name)
+  const cur = holePinTys[key] ?? -1
   if cur == -1 {
-    holePinTys[name] = ty
+    holePinTys[key] = ty
     return 0
   }
   if cur == ty { return 0 }
   if cur >= 0 {
     if tySame(cur, ty) { return 0 }
   }
-  holePinTys[name] = -2
+  holePinTys[key] = -2
   0
 }
 
@@ -20117,7 +20151,7 @@ export function pinnedHoleTyOf(tyIx: i32): i32 {
   if tyIx < 0 { return -1 }
   const t = T.tys[tyIx]
   if !(t is TyVar) { return -1 }
-  holePinTys[t.tvName] ?? -1
+  holePinTys[holePinKey(tyVarOwnerOf(tyIx), t.tvName)] ?? -1
 }
 
 // A function type with each hole in its signature at that hole's pin, minted once per row. The
@@ -20176,7 +20210,7 @@ function substHoleTy(tyIx: i32, bNames: string[], bTys: i32[]) {
   const r = substHoleTyReal(tyIx, bNames, bTys)
   if r >= 0 && hdRowOf(tyIx) >= 0 && !tyIsHole(r) {
     const t = T.tys[tyIx]
-    if t is TyVar { notePinnedHole(t.tvName, r) }
+    if t is TyVar { notePinnedHole(t.tvName, r, tyVarOwnerOf(tyIx)) }
   }
   r
 }
@@ -20191,7 +20225,7 @@ function substHoleTyReal(tyIx: i32, bNames: string[], bTys: i32[]) {
   if !(t is TyVar) { return -1 }
   const b = bindOf(bNames, bTys, t.tvName)
   if b >= 0 {
-    notePinnedHole(t.tvName, b)
+    notePinnedHole(t.tvName, b, tyVarOwnerOf(tyIx))
     return b
   }
   const row = hdRowOf(tyIx)
@@ -23609,14 +23643,19 @@ function annotPartOf(name: string) { return annotPart[name] ?? "" }
 function annotClashOf(name: string) { return annotClash[name] ?? "" }
 
 export function resolveAnnot(name: string, typarams: string[]) {
-  resolveAnnotTs(name, typarams, -1)
+  resolveAnnotTs(name, typarams, -1, "")
 }
 
 // `resolveAnnot`, with the annotation's spelling root threaded to the three legs that
 // actually resolve. `root < 0` is the name route — what the exported entry point (and its
 // `emit_rep.vl` callers) get, since a post-canon emit-time name has no live tree. The memo
 // stays keyed on the name regardless: a hit returns the same index whichever route minted it, and only a miss re-reads the tree.
-function resolveAnnotTs(name: string, typarams: string[], root: i32) {
+function resolveAnnotTs(
+  name: string,
+  typarams: string[],
+  root: i32,
+  owner: string,
+) {
   if typarams.length == 0 {
     if tpEnvNames.length == 0 {
       const hit = annotNameMemo[name] ?? -2
@@ -23653,7 +23692,7 @@ function resolveAnnotTs(name: string, typarams: string[], root: i32) {
   let i = 0
   while i < typarams.length {
     tpEnvNames.push(typarams[i])
-    tpEnvTys.push(mkTyVar(typarams[i]))
+    tpEnvTys.push(mkTyVarOwned(typarams[i], owner))
     i = i + 1
   }
   const r = annotResolve(name, root)
@@ -23668,10 +23707,15 @@ function resolveAnnotTs(name: string, typarams: string[], root: i32) {
 
 // `resolveAnnot` with resolution diagnostics anchored at node `at` (the
 // annotation's TypeRef) — see `annotDiagAt`.
-function resolveAnnotAt(name: string, typarams: string[], at: i32) {
+function resolveAnnotAt(
+  name: string,
+  typarams: string[],
+  at: i32,
+  owner: string,
+) {
   const saved = annotDiagAt
   annotDiagAt = at
-  const r = resolveAnnotTs(name, typarams, annTsOf(at))
+  const r = resolveAnnotTs(name, typarams, annTsOf(at), owner)
   annotDiagAt = saved
   // D1023 at the inline spelling: pass 0d catches a union with a declaration to walk, but an
   // inline `function f(): A | B` has none, so the arm-discriminability rule is asked again
@@ -24965,7 +25009,7 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
       if pNode.parType >= 0 {
         const ptn = P.nodes[pNode.parType]
         if ptn is TypeRef {
-          pt = resolveAnnotAt(ptn.tyName, n.fnTyParams, pNode.parType)
+          pt = resolveAnnotAt(ptn.tyName, n.fnTyParams, pNode.parType, n.fnName)
           if pt >= 0 && pt == collapsedTy { ptCollapsed = true }
           if pt < 0 {
             tErr(unknownTyText(ptn.tyName), pNode.parType)
@@ -25032,7 +25076,7 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
     if n.fnRet >= 0 {
       const rtn = P.nodes[n.fnRet]
       if rtn is TypeRef {
-        ret = resolveAnnotAt(rtn.tyName, n.fnTyParams, n.fnRet)
+        ret = resolveAnnotAt(rtn.tyName, n.fnTyParams, n.fnRet, n.fnName)
         // D1048's second hint: a declared return whose spelling collapsed marks the
         // DECLARATION, so an un-annotated `const r = f(…)` can inherit the provenance.
         // The pass-1 hoist below records the same fact for a top-level function; this
@@ -25929,7 +25973,12 @@ function checkProgramNode(n: Program) {
           if hpn.parType >= 0 {
             const hptn = P.nodes[hpn.parType]
             if hptn is TypeRef {
-              const r = resolveAnnotAt(hptn.tyName, s.fnTyParams, hpn.parType)
+              const r = resolveAnnotAt(
+                hptn.tyName,
+                s.fnTyParams,
+                hpn.parType,
+                s.fnName,
+              )
               if r >= 0 { t = r }
             }
           } else {
@@ -25950,7 +25999,7 @@ function checkProgramNode(n: Program) {
       if s.fnRet >= 0 {
         const hrtn = P.nodes[s.fnRet]
         if hrtn is TypeRef {
-          const r = resolveAnnotAt(hrtn.tyName, s.fnTyParams, s.fnRet)
+          const r = resolveAnnotAt(hrtn.tyName, s.fnTyParams, s.fnRet, s.fnName)
           // D1048's second hint, recorded order-independently: this hoist is the only pass
           // that resolves every top-level return before any body runs, so a `const r = f(…)`
           // written above `function f(): R` still inherits the provenance.
