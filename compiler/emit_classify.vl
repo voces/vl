@@ -2333,7 +2333,7 @@ export function exprNullableString(exprIx: i32, fnIx: i32) {
     // A `string | null`-returning field-closure call.
     if callee is Member {
       const ffe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
-      if ffe >= 0 { return fRetKind[ffe] == "nulstr" }
+      if ffe >= 0 { return repOfFnSlot(ffe).rdKind == "nulstr" }
     }
     // Fallback, scoped to a call: a `string | null`-returning closure value call whose callee
     // the cases above miss, such as an indexed closure-array element. `nodeTyIsNullableString`
@@ -2452,7 +2452,7 @@ export function exprNullableStruct(exprIx: i32, fnIx: i32) {
     // An `S | null`-returning field-closure call.
     if callee is Member {
       const ffe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
-      if ffe >= 0 && fRetKind[ffe] == "nulstruct" { return true }
+      if ffe >= 0 && repOfFnSlot(ffe).rdKind == "nulstruct" { return true }
     }
     // `xs.pop()` and `xs.get(i)` over a struct-element ref list yield `S | null` — a pop of
     // an empty list and an out-of-range get are both null.
@@ -3891,18 +3891,22 @@ export function fnIndexOfInScopeSid(sid: i32, name: string, fnIx: i32) {
   fnIndexOfSid(sid)
 }
 
-// The rep of the RESULT of calling `name`, resolved in the frame `fnIx` reads it — the ONE
-// home for the walk (#2815's calling frame, #2840's origin hop) and for the three return
-// columns that answer after it. `rdCovered` 0 means the name resolves to no lifted function;
-// `rdNul` is unanswered, since these columns carry no null discipline.
+// The rep of the RESULT of calling the lifted function at `fnStmts` slot `fe`, or an
+// uncovered descriptor for no slot. The three columns are pushed together in `buildFnMap`'s
+// one loop, so an index valid for any of them is valid for all three; reading them together
+// here is what makes this a descriptor rather than three lookups that can drift.
+export function repOfFnSlot(fe: i32): RepDesc {
+  if fe < 0 || fe >= fRetKind.length { return repDescNone() }
+  repDescRet(fRetKind[fe], fRetStructIdx[fe], fRetRArrElem[fe])
+}
+
+// The same rep, reached by NAME: the one home for the walk (#2815's calling frame, #2840's
+// origin hop). `rdCovered` 0 means the name resolves to no lifted function, and `rdNul` is
+// unanswered throughout, since these columns carry no null discipline.
 export function repOfNameResult(sid: i32, name: string, fnIx: i32): RepDesc {
   const i = fnIndexOfInScopeSid(sid, name, fnIx)
   if repShadowOn { repABNoteNameResult(sid, i) }
-  if i < 0 { return repDescNone() }
-  // The three columns are pushed together in `buildFnMap`'s one loop over `fnStmts`, so an
-  // index valid for any of them is valid for all three; reading them together is what makes
-  // this a descriptor rather than three lookups that can drift.
-  repDescRet(fRetKind[i], fRetStructIdx[i], fRetRArrElem[i])
+  repOfFnSlot(i)
 }
 
 // The oracle at this surface compares the FLAT map's answer against the frame-aware walk's:
@@ -11540,14 +11544,14 @@ export function exprIsI64(exprIx: i32, fnIx: i32) {
         callee.identName,
         fnIx,
       )
-      if target >= 0 { return fRetKind[target] == "i64" }
+      if target >= 0 { return repOfFnSlot(target).rdKind == "i64" }
       // An i64-returning function value (a binding / `(…) => i64` param callee).
       return calleeReturnsI64Sid(sidOfNode(e.callFn), fnIx)
     }
     // An i64-returning field-closure call (`o.f(x)` over an `(…) => i64` field).
     if callee is Member {
       const ffe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
-      if ffe >= 0 { return fRetKind[ffe] == "i64" }
+      if ffe >= 0 { return repOfFnSlot(ffe).rdKind == "i64" }
     }
     return false
   }
@@ -11703,14 +11707,14 @@ export function exprIsF32(exprIx: i32, fnIx: i32) {
         callee.identName,
         fnIx,
       )
-      if target >= 0 { return fRetKind[target] == "f32" }
+      if target >= 0 { return repOfFnSlot(target).rdKind == "f32" }
     }
     // An f32-returning field-closure call the typed-IR fast path can't see: the emitter's own
     // `dispatchRewrite` mints a `Call` with no arena entry for `x[i]` over a `"[]"` closure
     // field, so without this arm the f32 result bound into an i32 slot and failed validation.
     if callee is Member {
       const ffe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
-      if ffe >= 0 { return fRetKind[ffe] == "f32" }
+      if ffe >= 0 { return repOfFnSlot(ffe).rdKind == "f32" }
     }
     return false
   }
@@ -11843,7 +11847,7 @@ export function exprIsF64(exprIx: i32, fnIx: i32) {
         callee.identName,
         fnIx,
       )
-      if target >= 0 { return fRetKind[target] == "f64" }
+      if target >= 0 { return repOfFnSlot(target).rdKind == "f64" }
       // A function-value (closure) callee returning f64 — its result routes as f64.
       return calleeReturnsF64Sid(sidOfNode(e.callFn), fnIx)
     }
@@ -24446,7 +24450,7 @@ export function exprStruct(exprIx: i32, fnIx: i32) {
       ) {
         const cfe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
         if cfe >= 0 {
-          if fRetKind[cfe] == "struct" { return true }
+          if repOfFnSlot(cfe).rdKind == "struct" { return true }
         }
       }
     }
@@ -24512,7 +24516,7 @@ export function exprNullableVariant(exprIx: i32, fnIx: i32) {
       // `variantIndexOf` answers -1 there and the stored kind is stale for a variant return.
       const nvfe = fnIndexOfSid(sidOfNode(e.callFn))
       if nvfe >= 0 {
-        if fRetKind[nvfe] == "nulvariant" { return true }
+        if repOfFnSlot(nvfe).rdKind == "nulvariant" { return true }
         if nvfe < fnStmts.length {
           const nvfn = P.nodes[fnStmts[nvfe]]
           if nvfn is FuncDecl {
@@ -24528,7 +24532,7 @@ export function exprNullableVariant(exprIx: i32, fnIx: i32) {
     }
     if callee is Member {
       const ffe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
-      if ffe >= 0 { return fRetKind[ffe] == "nulvariant" }
+      if ffe >= 0 { return repOfFnSlot(ffe).rdKind == "nulvariant" }
     }
     return false
   }
@@ -24697,7 +24701,7 @@ export function exprIsNulNone(exprIx: i32, fnIx: i32): boolean {
     const cf = P.nodes[unwrapParen(e.callFn)]
     if cf is Ident {
       const t = fnIndexOfSid(sidOfNode(e.callFn))
-      if t >= 0 && t < fRetKind.length { return fRetKind[t] == "nulnone" }
+      if t >= 0 { return repOfFnSlot(t).rdKind == "nulnone" }
     }
     return false
   }
@@ -25931,7 +25935,7 @@ export function exprUnion(exprIx: i32, fnIx: i32) {
     // A union-returning FIELD-closure call.
     if callee is Member {
       const ffe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
-      if ffe >= 0 { return fRetKind[ffe] == "union" }
+      if ffe >= 0 { return repOfFnSlot(ffe).rdKind == "union" }
     }
     // A union-returning INDEXED closure-element call (`xs[i](1)` over a
     // `((i32) => A | B)[]`): the element signature's result token is the box (`>u`).
@@ -31555,7 +31559,7 @@ export function exprNullableMap(exprIx: i32, fnIx: i32) {
           if fn.fnRet >= 0 { return retNulMapFlag(fn.fnRet) == 1 }
           // The inferred return too, off the kind column `buildFnMap` recorded: without it a
           // caller's `const r = pick(…)` bound a non-null cell with nothing to narrow against. D937.
-          if target < fRetKind.length { return fRetKind[target] == "nulmap" }
+          return repOfFnSlot(target).rdKind == "nulmap"
         }
       }
     }
@@ -32473,7 +32477,7 @@ export function exprString(exprIx: i32, fnIx: i32) {
       if ffe >= 0 {
         // Except an aliased litunion whose checker type softens to `string`: same-fieldset
         // twin rows can alias onto the OTHER row's string-result lambda (invalid wasm otherwise). #991.
-        if fRetKind[ffe] == "str" {
+        if repOfFnSlot(ffe).rdKind == "str" {
           if nodeTyIsLitUnionAlias(exprIx) { return false }
           // A `{f: (…) => string}` field beside a boolean twin collapses to one layout heap
           // type, so trust the checker's recorded result type over the fe's kind when present.
