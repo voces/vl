@@ -1499,8 +1499,8 @@ in-language GC knobs.
      2026-09-06; plan, order and numbers: `docs/internals/rep-descriptor-campaign.md`.**
      Stage B widened the PRODUCER; Stage C converts the population on the other side of the
      seam, which nothing had counted. `scripts/rep-classifier-census.py` derives it from the
-     tree: **516 rep classifiers over 2,956 call sites**, 137 reading the ARENA, 116 a NAME,
-     28 a SPELLING, 131 a TABLE column and 220 a FRAME. Every conversion is graded by the
+     tree: **517 rep classifiers over 2,958 call sites**, 138 reading the ARENA, 117 a NAME,
+     28 a SPELLING, 132 a TABLE column and 221 a FRAME. Every conversion is graded by the
      **ladder-vs-descriptor agreement oracle** (`repABNote`/`repLadderABSweep`, riding
      `$VL_REP_SHADOW`; buckets AGREE / CONTRADICT / LEFT-ONLY / RIGHT-ONLY) at **0 CONTRADICT
      over `tests/cases` + the distilled corpus** before its ladder is deleted, then by byte
@@ -1508,7 +1508,7 @@ in-language GC knobs.
      `rep-fuzz-check.sh` exact, and `mono-tyaram-grid.sh` for anything touching the pin
      context. The families, in the order they convert:
      1. ✅ **`tyKindOf`** — the i32 code vocabulary (0/2/3/7/10/11/12/13/20), 18 call sites.
-        DONE: 3,366,947/3,366,947 queries agree, byte-identical in 3,145 + 7,589 modules.
+        DONE: 3,366,947/3,366,947 queries agree, byte-identical in 3,148 + 7,589 modules.
      2. ⬜ **`vtKindOfType`'s annotation ladder** — 25 predicate rungs. The `annRepKindOf` seam
         already exists, so the work is widening `repOfTy` coverage until the fallback is
         unreachable; the oracle's LEFT-ONLY bucket at this site is the burn-down list.

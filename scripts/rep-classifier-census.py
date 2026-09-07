@@ -632,6 +632,9 @@ def main():
     if a.reads:
         col = "deep" if a.deep else "reads"
         rows = [r for r in rows if a.reads.upper() in r[col]]
+        # Say so: every tally below now counts the FILTERED rows against the whole
+        # population, and a reader who missed the flag would read them as the census.
+        print(f"filter            {col} contains {a.reads.upper()}")
     if a.json:
         json.dump({"considered": considered, "rows": rows}, sys.stdout, indent=1)
         print()
