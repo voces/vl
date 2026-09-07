@@ -772,11 +772,19 @@ function tailIsF64NoLocal(ix: i32, fnArenaIx: i32) {
 // The lifted-function position (`fnStmts` index) of an object-literal field value that is
 // a function: an inline lambda (a `FuncDecl` node, lifted in place, so its arena index
 // appears in `fnStmts`) or a bare `Ident` naming a function. -1 for any other field value.
-export function fieldValueFeOf(valIx: i32) {
+export function fieldValueFeOf(valIx: i32) { fieldValueFeOfIn(valIx, -1) }
+
+// The positioned twin: `fnIx` is the frame the value is READ from, so a bare `Ident` naming a
+// function resolves through the scope chain. A monomorphized instance's per-pin clone shares
+// the template's name, and the flat map answers the template — the call then reaches the wrong
+// clone with the right signature, which validates and runs wrong (D1782).
+export function fieldValueFeOfIn(valIx: i32, fnIx: i32) {
   if valIx < 0 { return -1 }
   const v = P.nodes[valIx]
   if v is FuncDecl { return fnStmtsPosOf(valIx) }
-  if v is Ident { return fnIndexOfSid(sidOfNode(valIx)) }
+  if v is Ident {
+    return fnIndexOfInScopeSid(sidOfNode(valIx), v.identName, fnIx)
+  }
   -1
 }
 
@@ -1126,13 +1134,13 @@ export function fieldClosureFeOfRecv(recvIx: i32, prop: string, fnIx: i32) {
     if li >= 0 {
       const d = P.nodes[li]
       if d is LetDecl {
-        const ffe = fieldClosureFeOfInit(d.letInit, prop)
+        const ffe = fieldClosureFeOfInit(d.letInit, prop, fnIx)
         if ffe >= 0 { return ffe }
       }
     }
   }
   if e is Call {
-    const ffe2 = fieldClosureFeOfInit(unwrapParen(recvIx), prop)
+    const ffe2 = fieldClosureFeOfInit(unwrapParen(recvIx), prop, fnIx)
     if ffe2 >= 0 { return ffe2 }
   }
   // A hole param's receiver is its argument, which the struct-index fallback below cannot
@@ -1275,11 +1283,11 @@ function fieldCloCallIsBool(recvIx: i32, prop: string, fnIx: i32) {
 
 // Resolve `prop`'s closure through an initializer expression: an object literal reads its
 // own field, a call to a maker follows the maker's return expression. -1 otherwise.
-function fieldClosureFeOfInit(initIx: i32, prop: string) {
+function fieldClosureFeOfInit(initIx: i32, prop: string, fnIx: i32) {
   if initIx < 0 { return -1 }
   const e = P.nodes[unwrapParen(initIx)]
   if e is ObjLit {
-    return fieldValueFeOf(objFieldVal(unwrapParen(initIx), prop))
+    return fieldValueFeOfIn(objFieldVal(unwrapParen(initIx), prop), fnIx)
   }
   if e is Call {
     const callee = P.nodes[e.callFn]
@@ -32716,14 +32724,14 @@ export function identClosureFeAt(sid: i32, fnIx: i32, atIx: i32) {
       const li = parentLetOfSid(fn.fnBody, sid)
       if li >= 0 {
         const d = P.nodes[li]
-        if d is LetDecl { return fieldValueFeOf(d.letInit) }
+        if d is LetDecl { return fieldValueFeOfIn(d.letInit, fnIx) }
       }
     }
   }
   const gi = globalLetOfSidIn(fnIx, sid)
   if gi >= 0 {
     const gd = P.nodes[gi]
-    if gd is LetDecl { return fieldValueFeOf(gd.letInit) }
+    if gd is LetDecl { return fieldValueFeOfIn(gd.letInit, fnIx) }
   }
   // The module frame (D1350), the third scope this resolver must reach: `fnIx < 0` is the
   // start function, whose locals live in no `fnBody` and are not globals either.

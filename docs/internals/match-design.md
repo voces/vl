@@ -60,9 +60,10 @@ Phase 2a (now):
   `IsExpr`) and is the discrimination half of the C3 win. The BINDING half is phase 2b.
 
 Phase 2b (now):
-- **Payload binding** — `Move{x, y} => x + y`: a PUNNED field list after a variant pattern, binding
-  one arm-local `const` per named field. Field punning only (`{x, y}`, not `{x: a}` and not nested
-  patterns) — see "Phase 2b as built" for why the two richer forms are deferred rather than absent.
+- **Payload binding** — `Move{x, y} => x + y`: a field list after a variant pattern, binding one
+  arm-local `const` per named field. A field may be PUNNED (`{x}`), RENAMED (`{x: a}`) or read
+  THROUGH (`{p: {x, y}}`, to any depth) — see "Phase 2b as built". A clause always READS fields;
+  a type before the brace (`{inner: Circle{r}}`) would test one, and is refused by name.
 
 Phase 3 (now):
 - **Integer literal** — `0x10 => 14`, `-1 => 99` over an `i32`/`i64` scrutinee, with a MANDATORY
@@ -215,19 +216,37 @@ condition the desugar builds), so the scrutinee is still the whole union inside 
 `scrut.x` does not type. Rust's rule (identical bindings in every alternative) needs narrowing to a
 JOIN of the alternatives, which is item 4 of ROADMAP B21 — a pre-existing emitter gap.
 
-**Deferred, measured, not absent.**
-- **Renaming** `Move{x: a}` — the clause's binding name is read back off the `LetDecl` (`letName`)
-  by the formatter, so renaming is one parser branch plus a formatter that prints `field: name`
-  when they differ. Deferred because punning covers the command-dispatch shape the roadmap wants.
-- **Nested destructuring** `Move{p: {x, y}}` — needs the binding's initializer to be a `Member`
-  CHAIN and the checker to narrow through it; a real feature, still "only if a concrete need
-  appears" (see Deferred, above).
+**The two richer forms, as built.** Both were measured here as one-branch extensions and both
+shipped that way; neither needed a new emitter path, and every arm below is byte-identical to its
+hand-written if-chain twin.
 
-Neither gets EASIER from the value-position work below: renaming is still one parser branch plus a
-formatter print, and nested destructuring is still a `Member`-chain initializer plus narrowing
-through it. What they get is that whatever they bind lands in the arm's PRELUDE, so both work in
-value position on the day they ship rather than needing a second slice for it — nested
-destructuring especially, since it is the form that puts the most `const`s in one arm.
+- **Renaming** `Move{x: a}` — the field is read, the `const` takes the written name. One parser
+  branch plus a formatter that prints `field: name`.
+- **Nested destructuring** `Move{p: {x, y}}` — the initializer becomes a `Member` CHAIN
+  (`<scrut>.p.x`), to whatever depth the source writes. The predicted checker work did NOT
+  materialise: the arm has already narrowed the scrutinee and the field read through is concrete,
+  so `w.p.x` types for the same reason the hand-written twin does. Nothing narrows per level.
+
+**Punning is decided by POSITION, not by the names matching.** The parser mints the `const` at the
+BINDING token and the field read at the FIELD token, so one token written means one position
+shared. Without that, `{x: x}` and `{x}` are indistinguishable after parsing and the formatter
+would rewrite the first into the second — a token deletion, which is the `vl fmt` defect family.
+
+**Two refusals the richer forms add.** A NESTED TYPE PATTERN (`{inner: Circle{r}}`) is refused by
+name: a clause reads a field, and a type before the brace would TEST it, so the arm would stop
+covering its own variant and exhaustiveness — the point of the whole construct — would need a rule
+nothing has ruled. An EMPTY nested clause (`{p: {}}`) is refused too: `Move{}` is legal because it
+says "this variant, no bindings", but `p: {}` reads a field, binds nothing, and leaves the
+formatter no declaration to print it back from, so the next `vl fmt` would silently delete it.
+
+Both forms land in the arm's PRELUDE, so both work in value position (below) with no extra slice —
+nested destructuring especially, since it is the form that puts the most `const`s in one arm.
+
+**A nested clause re-reads its prefix, exactly as the source spelling does.** `Wrap{p: {x, y}}`
+emits `.p` twice, once per leaf, because each binding walks its own chain — and so does the
+hand-written `const x = w.p.x; const y = w.p.y`, which is why the two are byte-identical. Hoisting
+the prefix would be an optimization over BOTH spellings and would break that invariant; binaryen
+already does it (`wasm-opt -O3` takes the nested arm from 9 `struct.get` to 3).
 
 ## A binding arm in value position
 

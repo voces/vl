@@ -47,9 +47,8 @@ units: **hours** · **half-day** · **days**.
 
 | # | item | witness, run today | region | effort |
 | --- | --- | --- | --- | --- |
-| 1 | **B15 — a nested capturing function cannot be taken as a VALUE.** **NARROWED 2026-09-06: the DIRECT-call half is built** ([D1780](internals/inventory/D1780.md)/[D1781](internals/inventory/D1781.md)); the ARRAY-element delivery at one pin joins it ([D1794](internals/inventory/D1794.md)), and the ARGUMENT hop with it ([D1795](internals/inventory/D1795.md)); what stands is a closure that escapes its pin | `function o(n) { function k(x) { return x + n }; return k(1) }` runs at one pin and at two, and so does `const fs = [k]; fs[0](1)`, and so does `function use(p) { return p(1) }; use(k)`; `const f = k; f(1)` at two pins is still invalid wasm ([D1782](internals/inventory/D1782.md)), the array element at two pins still refuses ([D1816](internals/inventory/D1816.md)), and `return k` still refuses | `wasmEmit.vl emitClosureValue`; the binding hop is `calleeRetKindSid` and the `fnValTarget` family, which key on a name with no frame | half-day (D1782) |
+| 1 | **B15 — a nested capturing function cannot be taken as a VALUE.** **NARROWED 2026-09-06: the DIRECT-call half is built** ([D1780](internals/inventory/D1780.md)/[D1781](internals/inventory/D1781.md)), the BINDING hop with it ([D1782](internals/inventory/D1782.md)), the ARRAY-element delivery at one pin ([D1794](internals/inventory/D1794.md)) and the ARGUMENT hop ([D1795](internals/inventory/D1795.md)); what stands is a closure that escapes its pin | `function o(n) { function k(x) { return x + n }; return k(1) }` runs at one pin and at two, and so do `const fs = [k]; fs[0](1)`, `function use(p) { return p(1) }; use(k)` and `const f = k; f(1)` at two pins; the array element at two pins still refuses ([D1816](internals/inventory/D1816.md)), and `return k` still refuses | `wasmEmit.vl emitClosureValue`; the binding hop is `calleeRetKindSid` and the `fnValTarget` family, which key on a name with no frame | half-day (D1782) |
 | 2 | **D1775 — a `type` alias over a negation type reps as a union BOX with a scalar value** | `type N = !string; const x: N = 5` → `vl check` rc 0, then `type mismatch: expected (ref $type), found i32`. `wasm-dis`: `(global $global$0 (mut (ref $1)) (i32.const 5))`. The INLINE spelling runs | `typecheck.vl` / `emit_classify.vl` rep classification of an alias body | hours–half-day |
-| 4 | **B21.1 — `match` payload renaming and nested destructuring** | `Move{x: a}` → `parse error … match payload binding must be a field name` | `parser.vl:2847`; `match-design.md` measures both as one-branch extensions | hours (renaming) / half-day (nesting) |
 | 5 | **B7 R3 — `.backwards()` over a string** | `"abc".backwards()` → `no method '.backwards' on string` | `std/str.vl`; §Codepoints already specifies it | **hours** |
 | 8 | **the `parseIf` `then` arm is not marked lossless** | `if c then print(1)` + a type error → the parse error ONLY; `if c print(1)` + the same → BOTH | `parser.vl:2652` needs `dgMarkLossless(P.diags.length)`, as `parseBracedBody:2633` has | **hours** |
 | 9 | **`vl build` with no `-o` writes a file instead of stdout** | `vl build p.vl > out.bin` → `out.bin` holds `wrote p.wasm (147 bytes)` | `scripts/vl-host/src/main.rs` build arm; already "decided: yes" | **hours** |
@@ -2395,11 +2394,17 @@ in-language GC knobs.
   `emitClosureValueCore` — the generic-value floor guards a closure that ESCAPES its pin, and
   the one a direct call synthesizes is consumed by the call that pinned it. On the 264-cell
   nested-capture matrix that is 87 cells not-runs → runs with 0 runs lost.
-  REMAINING for this entry: the escape itself. `const f = k; f(1)` at two pins is check-clean
-  invalid wasm ([D1782](internals/inventory/D1782.md)) because a binding hop keys on the name
-  with no frame; `return k` still refuses, correctly, since nothing pins the parameter. A struct
-  at the TEMPLATE's pin is [D1788](internals/inventory/D1788.md), and a nested function calling
-  a SIBLING nested capturing function is [D1789](internals/inventory/D1789.md), which needs no
+  The BINDING half followed ([D1782](internals/inventory/D1782.md)): a binding's target was
+  read with the flat name map, so an instance's `const f = k; f(1)` called the template's clone
+  under a signature that validates. The positioned `fieldValueFeOfIn` resolves it from the frame
+  the value is read in, and the struct-field hop needed its own resolver to carry the frame too
+  — 20 more matrix cells to runs, and the matrix stands at 261 of 264.
+  REMAINING for this entry: two deliveries and one direction. `[k][0](1)` and `use(k)` each
+  carry their own row and their own close in flight — the first an inference-hole ingredient
+  rather than a pin-count one, the second the argument boundary; `return k` still refuses,
+  correctly, since nothing pins the parameter. A struct at
+  the TEMPLATE's pin is [D1788](internals/inventory/D1788.md), and a nested function calling a
+  SIBLING nested capturing function is [D1789](internals/inventory/D1789.md), which needs no
   generic at all. `monoPinnedSigsOf`'s message still under-reports at two pins, so "adopt the
   unique pinned signature" is not a sound fix for what is left. The f64/string half of that family was NEVER this ABI — it was the env FIELD and
   the READ out of it being typed by different answers, closed under workboard D8; the tell is that
@@ -2714,11 +2719,14 @@ in-language GC knobs.
   desugaring to the `const x = scrut.x` prepend the plan called for — byte-identical to the
   hand-written if-chain twin across 18 measured cells.
   REMAINING:
-  1. **Payload binding: the two richer clause forms.** ~~Flat punned binding~~ **DONE (phase 2b).**
-     Still open, both measured as one-branch extensions in `docs/internals/match-design.md`:
-     **renaming** (`Move{x: a}` — the formatter already reads the binding name off the `LetDecl`,
-     so it is a parser branch plus a `field: name` print) and **nested destructuring**
-     (`Move{p: {x, y}}` — needs a `Member` CHAIN initializer and narrowing through it).
+  1. ~~**Payload binding: the two richer clause forms.**~~ **DONE (B21.1, 2026-09-07)** — flat
+     punning (phase 2b), **renaming** (`Move{x: a}`) and **nested destructuring**
+     (`Move{p: {x, y}}`, to any depth) all ship. Both richer forms were one parser branch plus a
+     formatter print, as `docs/internals/match-design.md` predicted; the checker narrowing the
+     nested form was predicted to be needed and was NOT, the arm's own narrowing already making
+     the field read concrete. A nested TYPE pattern (`{inner: Circle{r}}`) is refused by name —
+     it would TEST a field rather than read one, so the arm would stop covering its own variant
+     and exhaustiveness would need a rule nobody has ruled.
      ~~Also open and NOT phase-2b-specific: a binding arm cannot be a `const` INITIALIZER~~
      **DONE (C6)** — an if-expression arm's value is now its LAST statement and everything before
      it is the arm's PRELUDE, so `const r = match u { A{a} => a … }` and the hand-written `if`
