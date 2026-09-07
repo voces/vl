@@ -571,7 +571,7 @@ nested list element keeps one-per-line, so the rule is decidable from the elemen
 
 ### D1773 — a negation type in a many-values-per-slot position: refused, by design or by gap? — RULED 2026-09-06
 
-**Ruling (owner, 2026-09-06):** a WRITTEN negation type (`!T` in any annotation — binding, alias, parameter, element, field, map value, return) is refused by the checker with one sentence; `x !is T` narrowing over a union stays, since there the "not T" is subtracted from a known set and is never written. Full negation tracking waits for A4/A12. D1773, D1775, D1784 (unfiled: D1784), D1785 (unfiled: D1785) and D1800 (unfiled: D1800) close as DESIGN — the last three were filed on PRs closed unmerged and are re-filed by the refusal lane; #2790's alias-transparency rungs are removed by the refusal lane; #2807 and #2813 were closed unmerged.
+**Ruling (owner, 2026-09-06):** a WRITTEN negation type (`!T` in any annotation — binding, alias, parameter, element, field, map value, return) is refused by the checker with one sentence; `x !is T` narrowing over a union stays, since there the "not T" is subtracted from a known set and is never written. Full negation tracking waits for A4/A12. D1773, D1775, D1784, D1785 and D1800 close as DESIGN — the last three were filed on PRs closed unmerged and are re-filed by the refusal lane; #2790's alias-transparency rungs are removed by the refusal lane; #2807 and #2813 were closed unmerged.
 
 `type N = !string` is a checker-only refinement with no rep of its own, so a BINDING takes its
 initializer's rep and now runs (D1775, #2790; D1773's nine owed cells, #2807). The ten cells
