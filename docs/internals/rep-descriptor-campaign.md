@@ -1551,16 +1551,78 @@ compensating directions. Byte-identical in **3,207 of 3,207** and **7,589 of 7,5
 `rep-fuzz` exact, `regress.py` no cell changed class, `mono-tyaram-grid` 161 OK / 100 REJECT /
 0 BAD.
 
-### 9.6 What is left in the column
+### 9.6 The NULLABLE element — a candidate REFUSED by its own byte-identity gate
+
+The third landing was built to the same recipe and **must not ship**. It is recorded here
+because the price it named is the finding.
+
+**The census first, which also audits §9.5**: the NESTED ARRAY reason reads **zero** in both
+populations, so that landing closed exactly what it claimed. The column stands at 7,739 —
+nullable 4,273 / 42 modules, value-union box 3,167 / 82, other union 133 / 6, no recorded type
+166 / 1.
+
+**The candidate.** A nullable cell is a reference — a `ref null` niche or a box — for every
+inner except the two that niche into a spare i32 (`boolean | null` at sentinel 2, a literal
+union at `-1`), which ride the i32 list. Decided from the inner's VARIANT one wrapper level
+down, respecting `repOfArray`'s stated invariant that it never consults the element's own
+descriptor.
+
+**And the oracle passed, convincingly.** `reflist` LEFT-ONLY falls 6,927 → 2,839 in
+`tests/cases` and 812 → 627 in the corpus — **−4,088 and −185, each exactly its census** — with
+**CONTRADICT 0** in both. On the two previous landings that was the whole story.
+
+**Byte identity refuses it: 19 modules in `tests/cases`, 16 in the corpus, and every one of the
+35 goes `runs → not-runs`.** Six are compiler TRAPS (`rc=70`); the other 29 are loud emit
+rejects, in four messages:
+
+| what the emitter says once the descriptor claims `reflist` | modules |
+| --- | --- |
+| `ref index access but ref array type not collected` | 16 |
+| `ref valtype with no interned shape` | 11 |
+| `ref indexed assignment but ref list type not collected` | 1 |
+| `ref .push but ref list type not collected` | 1 |
+| compiler trap (`rc=70`) | 6 |
+
+**The mechanism, and the rule it buys: answering `reflist` is a PROMISE THAT A ROW EXISTS.**
+The descriptor is not read only by `vtKindOfType` — the ref-list slot, shape and collect
+consumers read it too, and a `reflist` answer sends them to look up an interned row. The
+collect pass interns one for a map element and for a nested-array element, which is why those
+two landings were byte-identical; **it interns none for a nullable element**. So the coverage
+is not a coverage gain at all, it is a claim the rest of the emitter cannot honour.
+
+**This is why byte identity is the claim and not a formality.** The oracle is a comparison of
+two ANSWERS; it cannot see a consumer that needs more than an answer. A landing graded on
+LEFT-ONLY and CONTRADICT alone would have shipped 35 `runs → not-runs` modules and six compiler
+traps with a clean-looking scoreboard — which is §5.0's second form, a domain WIDENING, doing
+exactly what the bar predicts.
+
+**Its price needs no new named set, and checking that is the point.** CLAUDE.md's rule is that
+a refused candidate which named a set puts that set in `named/`. All 16 corpus cells this one
+moved are ALREADY `named/` members, from five earlier sets in the same territory (`d341` x8,
+`d451` x5, `d775`, `d812`, `d1630`) and none from the derived `cells/` half — so the standing
+gate carries them, and `regress.py` against the candidate says so directly:
+`REGRESSION — 16 behavioural class(es) stopped running`. The 19 `tests/cases` members are
+fixtures already. The rule applied and the answer was that the instrument was ahead of it.
+
+**The contract this leaves the descriptor**, recorded on [D1837](inventory/D1837.md): `reflist`
+is answered ONLY where the collect pass has interned the row. A producer that answers it for a
+shape collect never minted is making a promise the slot, shape and collect consumers cannot
+keep — and the failure is loud or trapping, not a wrong rep.
+
+**What the nullable element needs before it can be covered** is the collect pass interning a
+ref-list row for a nullable-element list, which is a build, not a projection. Until then the
+ladder is load-bearing here in the strong sense: it is the only producer whose answer the rest
+of the emitter is prepared for.
+
+### 9.7 What is left in the column
 
 **7,739 `reflist` queries over ~130 modules**: the NULLABLE element (4,273 / 42), the
 VALUE-UNION-BOX element (3,167 / 82), other union (133 / 6) and one module with no recorded
-type (166). The nullable element is the next landing, and it is `repOfArray`'s tail as well — the first
-draft of this paragraph said `repOfNullable` owns it, which reading the code refutes: an
-array whose ELEMENT is nullable never reaches `repOfNullable`, it falls past the union arm to
-the same tail the map and the nested array fell past. Whether it is the same three lines
-depends on the element word and on whether `rtListVKind` needs a `nul` arm, and that is a
-measurement, not a prediction.
+type (166). The nullable element was the next landing and is **refused** — §9.6 records the candidate and
+its price. `rtListVKind` DID need a `nul` arm, measured rather than predicted: with the flat arm
+alone the audit reads `DISAGREE kind flat=reflist tree=list/`, and `repOfTy` returns the right
+answer only because it falls back to flat when the tree declines, so the two producers drift
+while every scoreboard stays clean.
 
 **No rung is deletable yet**: deletion needs the column empty for the kind, and two reasons
 remain. The two landings so far have moved 104,792 of the 112,531 queries the column held for
@@ -1823,4 +1885,60 @@ The comment is corrected in place. Comment-only, and the seed is **byte-identica
 proof the trim campaign uses, applied to a one-block edit.
 
 Ruled, not scheduled: the fall-through stays nominal. D1859 pins the five modules.
+### 11.8 `structIndexOfExpr`'s two sites — and the WOULD-FLIP bar every remaining site is graded on
+
+**First, the label moved.** `structIndexOfExpr#2` is POSITIONAL, and tranche 1 converting the
+first occurrence renumbered the rest. The four loud refusals belong to today's
+`structIndexOfExpr` (`emit_classify.vl:26231`); today's `#2` (26325) is inert on all six
+modules. Identify a held-back site by its FAILURE, never by the label an earlier sweep printed.
+
+**Site A (26231) is D1858's shape.** Its ladder is nominal → arena (`repRowOfTyStruct`) → a
+gated `structIndexOfTypeName`, so the bridge is already rung 3, and converting rung 1 promotes
+the fieldset scan above the arena rung. The order test reproduces all four refusals message for
+message with no conversion at all — `bare null needs a struct-typed context`, `index receiver is
+not an array or string`, `field access receiver is not a struct` ×2. These land LOUD rather than
+as invalid wasm, which is a better failure and still a lost build. Pinned as D1920.
+
+That makes **precedence a family, not a one-off**: `rlElemStructRow` and `structIndexOfExpr`
+both have their bridge downstream, and both break the same way when the nominal rung is
+promoted. The grep that finds the shape is still one line — does the same function already name
+`structIndexOfTypeName`?
+
+### Site B (26325), and the bar it forced
+
+Its comment read *"this arm … looks unreachable on today's surface. Unverifiable, so it keeps
+the name path until a shape reaches it."* Both halves are now measured, and they disagree with
+each other:
+
+| reading | `tests/cases` | distilled corpus |
+| --- | ---: | ---: |
+| rung EXECUTES | 0 | **1,922 in 31 modules** |
+| `reached-nominal-hit` | 0 | 1,922 |
+| **`WOULD-FLIP`** | 0 | **0** |
+| conversion: DIFFERING FILES | 0 | 0 |
+| conversion: diagnostics CHANGED | 0 | 0 |
+
+**"Unreachable" was true only of the population its author checked** — the corpus runs the arm
+constantly. But the conversion is still not licensed, and this is where byte identity misleads:
+`DIFFERING FILES: 0` on 10,799 modules reads like a green light, and it is **vacuous**, because
+the domain the conversion would change is entered ZERO times. Every one of the 1,922 executions
+is a name the nominal table already holds.
+
+> **THE BAR, for every remaining site: print WOULD-FLIP beside DIFFERING FILES.** A
+> byte-identical conversion is evidence only if the population can contain the disagreement —
+> the dual-run population rule, applied to this grader. `DIFFERING FILES: 0` with
+> `WOULD-FLIP: 0` means *untested*, not *safe*; `DIFFERING FILES: 0` with a positive WOULD-FLIP
+> is the reading that licenses a conversion. This is §5.0's `vtKindOfType` result seen from the
+> grader's side: nine rungs agreed everywhere, deleting them was byte-identical, and the oracle
+> went 2,963 → 204,539 CONTRADICT because the domain was never exercised.
+
+So site B keeps the name path — not for the reason its comment gave, and the comment is
+corrected to the measured one. No row: nothing about it flips, so a pin over it could not fail,
+and a row that cannot fail is not a row.
+
+**Where the five stand.** `elemNameIsNominalAt` inverted predicate (§11.5, D1857);
+`rlElemStructRow` precedence (§11.6, D1858); `rlElemLitStructRow` circular source (§11.7,
+D1859); `structIndexOfExpr` precedence (§11.8, D1920); `structIndexOfExpr#2` unexercised
+widening (§11.8, comment only). **Not one of the five was a rep gap.** `refArrShapeKindGo`
+— the diagnostic-mover of §11.3 — is the last unexamined one.
 

@@ -10,6 +10,12 @@
 // path: the corpus passes no source map (it asserts trap REASONS, not positions —
 // `@trap` position directives are skipped via `isTrapPosition`), so the VLQ /
 // source-map decode machinery is omitted.
+//
+// It DOES carry the `vl-src` reader (ROADMAP row 22), because a per-instruction position is
+// not a source map: it is a custom section the emitter writes and both hosts join a trap
+// frame's byte offset against. `vlSrcSection.ts` is host-agnostic and shared.
+
+import { sourceFrames, wasmFrames } from "./vlSrcSection.ts";
 
 export type RunResult = {
   logs: string[];
@@ -49,33 +55,38 @@ export class VLRuntimeError extends Error {
   readonly functionName?: string;
   /** The raw wasm trap reason (e.g. `unreachable`, `divide by zero`). */
   readonly reason: string;
-  constructor(message: string, reason: string, functionName?: string) {
+  /**
+   * `at <file>:<line>:<col>  in \`fn\`` per wasm frame, innermost first — the line the
+   * trapping INSTRUCTION came from, joined out of the module's `vl-src` section. Empty for a
+   * module built without `--names`, which carries no section. Byte-for-byte the block the
+   * native host prints, and `vl_trap_source_frames_test.ts` grades both against one expected
+   * list so they cannot drift (ROADMAP row 22).
+   */
+  readonly sourceFrames: readonly string[];
+  constructor(
+    message: string,
+    reason: string,
+    functionName?: string,
+    sourceFrames: readonly string[] = [],
+  ) {
     super(message);
     this.name = "VLRuntimeError";
     this.reason = reason;
     this.functionName = functionName;
+    this.sourceFrames = sourceFrames;
   }
 }
 
-// Pull the function name out of a V8/Deno wasm stack frame. The first wasm frame
-// looks like:
-//   at <name> (wasm://wasm/<hash>:wasm-function[<idx>]:0x<offset>)
-// `<name>` is absent (anonymous) when the function is unnamed.
+// The INNERMOST wasm frame's function name, for the `runtime error in <fn>` sentence. The
+// frame shape (`at <name> (wasm://wasm/<hash>:wasm-function[<idx>]:0x<offset>)`) is parsed in
+// ONE place — `wasmFrames` in `vlSrcSection.ts`, which the source-frame block needs anyway —
+// so a V8 phrasing change cannot move one reader and leave the other behind.
 const parseWasmFrame = (
   stack: string | undefined,
 ): { functionName?: string } | undefined => {
-  if (!stack) return undefined;
-  for (const rawLine of stack.split("\n")) {
-    const line = rawLine.trim();
-    const m = line.match(
-      /at\s+(?:([^\s(]+)\s+\()?wasm:\/\/[^\s:]+:wasm-function\[\d+\]:0x([0-9a-fA-F]+)/,
-    );
-    if (m) {
-      const functionName = m[1] && m[1] !== "<anonymous>" ? m[1] : undefined;
-      return { functionName };
-    }
-  }
-  return undefined;
+  const frames = wasmFrames(stack);
+  if (frames.length === 0) return undefined;
+  return { functionName: frames[0].name };
 };
 
 // Map a raw wasm trap message to a friendlier VL reason. V8 phrasing varies by
@@ -112,21 +123,25 @@ const trapReason = (message: string): string => {
 // Turn a caught wasm `RuntimeError` into a `VLRuntimeError` carrying the trap
 // reason and (when present) a function-level name-section location. Non-wasm
 // errors pass through unchanged.
-const mapTrap = (err: unknown): unknown => {
+const mapTrap = (err: unknown, wasm?: Uint8Array): unknown => {
   const isRuntime = err instanceof WebAssembly.RuntimeError ||
     (err instanceof Error && err.name === "RuntimeError");
   if (!isRuntime) return err;
   const e = err as Error;
   const reason = trapReason(e.message);
   const frame = parseWasmFrame(e.stack);
+  // The per-instruction positions, when the module carries the section. `wasm` is optional
+  // only so a caller that has no bytes to hand still gets the reason it always got.
+  const frames = wasm ? sourceFrames(wasm, e.stack) : [];
   if (frame?.functionName && frame.functionName !== "__program__") {
     return new VLRuntimeError(
       `runtime error in ${frame.functionName} — ${reason}`,
       reason,
       frame.functionName,
+      frames,
     );
   }
-  return new VLRuntimeError(`runtime error — ${reason}`, reason);
+  return new VLRuntimeError(`runtime error — ${reason}`, reason, undefined, frames);
 };
 
 /**
@@ -273,7 +288,8 @@ export const runWasm = async (wasm: Uint8Array): Promise<RunResult> => {
     });
     exports = instance.exports;
   } catch (err) {
-    throw mapTrap(err);
+    // The module's own bytes, so a trap resolves to the line the instruction came from.
+    throw mapTrap(err, wasm);
   }
   return { logs, exports };
 };
