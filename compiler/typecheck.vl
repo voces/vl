@@ -2322,17 +2322,17 @@ function ifCondIsDiscriminating(ifCondIx: i32) {
   false
 }
 
-// True if executing the node at `ix` always produces a return value or diverges — control never
-// falls off its end without a value. Unlike `daBranchDiverges`, a bare trailing value expression
-// counts as an implicit return. A `Block` is total iff its last statement is, an `if`/`else` iff
-// both arms are, and a `while true { … }` is; every other loop or statement is not.
-function nodeIsTotal(ix: i32) {
+// True if executing `ix` always yields a return value or diverges. `tail` says a bare trailing
+// value expression IS the implicit return; inside a bare `{ … }` statement it is not. A `Block`
+// is total iff its last statement is, an `if`/`else` iff both arms are, a `while true { … }` is.
+// Unlike `daBranchDiverges`, this counts the implicit return.
+function nodeIsTotalAt(ix: i32, tail: boolean) {
   if ix < 0 { return false }
   const n = P.nodes[ix]
   if n is Block {
     const st = n.blkStmts
     if st.length == 0 { return false }
-    return nodeIsTotal(st[st.length - 1])
+    return nodeIsTotalAt(st[st.length - 1], tail)
   }
   if n is RetStmt { return true }
   if n is BreakStmt { return true }
@@ -2345,7 +2345,7 @@ function nodeIsTotal(ix: i32) {
       if ifCondIsDiscriminating(n.ifCond) { return true }
       return false
     }
-    return nodeIsTotal(n.ifThen) && nodeIsTotal(n.ifElse)
+    return nodeIsTotalAt(n.ifThen, tail) && nodeIsTotalAt(n.ifElse, tail)
   }
   if n is WhileStmt {
     // `while true { … }` never completes normally — it diverges or returns inside.
@@ -2353,8 +2353,25 @@ function nodeIsTotal(ix: i32) {
     if c is BoolLit { return c.boolVal != 0 }
     return false
   }
-  // A bare trailing value expression is the implicit return.
-  return !isStmtNode(ix)
+  // A bare trailing value expression is the implicit return — in a value position only.
+  if !tail { return false }
+  !isStmtNode(ix)
+}
+
+// Totality of a function BODY, which `emitFuncBody` trusts to pad a fall-through with
+// `unreachable`. A body ending in a bare `{ … }` has no implicit return — that block is a
+// statement, and `emitFuncBody`'s tail ladder drops its value — so only what DIVERGES inside it
+// makes the body total. A bare-block expression makes this arm `nodeIsTotalAt(last, true)` (D1902).
+function nodeIsTotal(ix: i32) {
+  const n = P.nodes[ix]
+  if n is Block {
+    const st = n.blkStmts
+    if st.length > 0 {
+      const last = st[st.length - 1]
+      if P.nodes[last] is Block { return nodeIsTotalAt(last, false) }
+    }
+  }
+  nodeIsTotalAt(ix, true)
 }
 
 // True if `name` resolves (innermost-first) to a `const` binding.
@@ -19730,9 +19747,55 @@ function validateMemCstrs(
       }
       if !tyHasHole(mr) {
         let skip = false
+        // A resolved index operator: BANK it on its site for the emitter's dispatch rewrite,
+        // or the read/write reaches the emitter as a raw Index over a receiver with no list
+        // rep — a clause-2 emit reject on a check-clean program (D1892). GET's site is the
+        // index node, SET's the assignment node; each constraint carries the right `memCstrIx`.
+        if opIdxDeclared() && !tyBuiltinIndexable(mr) {
+          if memCstrProp[ci] == OP_INDEX_GET {
+            const gfn = opIdxFnFor(OP_INDEX_GET, mr)
+            if gfn != "" {
+              opIdxBank(memCstrIx[ci], gfn)
+            } else {
+              // A SET-only receiver has no readable index: the inline arm refuses an annotated
+              // one here, so the hole path must too — `indexFloorMsg` answers "" for it (it
+              // sees the setter) and would fall silently to the emitter (D1932).
+              const sOnly = opIdxFnFor(OP_INDEX_SET, mr)
+              if sOnly != "" {
+                tErr(
+                  "operator " +
+                    opDeclLabel(sOnly) +
+                    " needs a matching \"" +
+                    OP_INDEX_GET +
+                    "\" operator — an index that cannot be READ cannot be written either",
+                  ix,
+                )
+                skip = true
+              }
+            }
+          } else if memCstrProp[ci] == OP_INDEX_SET {
+            const sfn = opIdxFnFor(OP_INDEX_SET, mr)
+            if sfn != "" {
+              opIdxBank(memCstrIx[ci], sfn)
+            } else if opIdxFnFor(OP_INDEX_GET, mr) != "" {
+              // A GET operator with no SET: name the missing half, as the inline arm does.
+              tErr(
+                "no \"" +
+                  OP_INDEX_SET +
+                  "\" operator for index assignment on " +
+                  tyToStr(mr),
+                ix,
+              )
+            }
+          }
+        }
         if memCstrProp[ci] == OP_INDEX_GET {
           if tyRefusesArrayDemand(mr) { skip = true }
         }
+        // `"[]="` is not a field name, so `memCstrMsg` cannot grade it; the assignment arm at
+        // check time owns a concrete receiver's write diagnostic, and a builtin-indexable pin
+        // is a real array/map write. The SET operator's own site is settled just above.
+        if memCstrProp[ci] == OP_INDEX_SET { skip = true }
         if !skip {
           const mMsg = memCstrMsg(mr, memCstrProp[ci])
           if mMsg != "" {
@@ -20855,6 +20918,33 @@ function opDeclKeyOf(op: string) {
   const merged = mergedDeclKeyOf(op)
   if merged == "" { return op }
   merged
+}
+
+// The `self` parameter's type for `op`'s declaration, or -1 when the operator names no
+// two-parameter `self`-function. The receiver half of `opSelfFnTy`'s own resolution, split out
+// so a hole on the LEFT can be seeded from the same declaration. A non-bracket operator may be
+// declared once per program (`redeclared <`), so the answer is unambiguous.
+function opSelfParamTy(op: string) {
+  const opKey = opDeclKeyOf(op)
+  const fnTy = lookup(opKey)
+  if fnTy < 0 { return -1 }
+  const dIx = fnDeclIx[opKey] ?? -1
+  if dIx < 0 { return -1 }
+  const d = P.nodes[dIx]
+  if d is FuncDecl {
+    if d.fnParams.length == 2 {
+      const p0 = P.nodes[d.fnParams[0]]
+      if p0 is Param {
+        if p0.parName == "self" {
+          const ft = T.tys[fnTy]
+          if ft is TyFunc {
+            if ft.fnParamTypes.length == 2 { return ft.fnParamTypes[0] }
+          }
+        }
+      }
+    }
+  }
+  -1
 }
 
 // Operator dispatch `a op b` over a struct left operand through the free `self`-function
@@ -32498,6 +32588,11 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
         // An index WRITE through a hole, filed like `xs.push(v)`: the read that typed the
         // receiver noted only that the body indexes it, which a view satisfies.
         noteArrayWriteDemand(arrH0.tvName)
+        // The write's own deferred constraint, keyed to the ASSIGNMENT node so the pin can
+        // BANK the `"[]="` operator there for the emitter — the read constraint the target
+        // records only covers `"[]"`, and `p[4] = v` needs the setter (D1892). Vacuous when
+        // the hole pins to a real array or map, which `validateMemCstrs` skips.
+        if opIdxDeclared() { noteMemCstr(arrTy0, OP_INDEX_SET, ix, false) }
         const hmw = holeMapOf(arrH0.tvName)
         if hmw >= 0 { arrTy0 = hmw }
       }
@@ -32840,6 +32935,11 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
         }
       }
     } else {
+      // A hole on the LEFT never reached the operator table at all: the lookup above is gated
+      // on the left operand ALREADY being an object, and it is `opSelfFnTy`'s own trailing
+      // `assignableExpr` that seeds a hole on the RIGHT. Record the mirror flow so the
+      // parameter solve binds it too — inert outside the solve, as `noteHoleFlow` is (D1891).
+      if tyIsHole(lt) { noteHoleFlow(lt, opSelfParamTy(op)) }
       // The site's own decision, recorded (D491): a non-object left operand takes the
       // language's own lowering with no declaration consulted — recorded for the declaration side.
       opBinSiteTook(op, false)
