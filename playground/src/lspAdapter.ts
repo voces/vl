@@ -48,6 +48,7 @@ import {
   ufcsCompletions,
 } from "../../lsp/src/typeFeatures.ts";
 import { STD_SOURCES } from "../../std/embedded.ts";
+import { removeCharAt, wordEndingBefore } from "../../lsp/src/editorText.ts";
 import {
   foldingRanges as computeFoldingRanges,
   type VlFoldingRange,
@@ -598,30 +599,4 @@ export const completion = async (
     (stmt) => checker?.formatSrc?.(stmt),
   ).map(toCompletionItem);
   return [...identifiers, ...autoImports, ...keywords, ...snippets];
-};
-
-// The identifier `[A-Za-z_][A-Za-z0-9_]*` immediately to the LEFT of `character`
-// on `line`, or null — the `<name>.` member-completion receiver. Mirrors
-// `server.ts`'s `wordEndingBefore`.
-const wordEndingBefore = (line: string, character: number): string | null => {
-  const isWordChar = (c: string) => /[A-Za-z0-9_]/.test(c);
-  const end = character;
-  let start = end;
-  while (start > 0 && isWordChar(line[start - 1])) start--;
-  if (start === end) return null;
-  const word = line.slice(start, end);
-  return /^[A-Za-z_]/.test(word) ? word : null;
-};
-
-// Remove the single character at (0-based line, 0-based col) — strips the trailing
-// `.` so the wasm member-completion path resolves the receiver as a bare
-// expression (the native parser isn't error-tolerant for `receiver.`). Mirrors
-// `server.ts`'s `removeCharAt`. A no-op if the position is out of range.
-const removeCharAt = (text: string, line: number, col: number): string => {
-  const lines = text.split("\n");
-  if (line < 0 || line >= lines.length) return text;
-  const l = lines[line];
-  if (col < 0 || col >= l.length) return text;
-  lines[line] = l.slice(0, col) + l.slice(col + 1);
-  return lines.join("\n");
 };

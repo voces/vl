@@ -108,6 +108,7 @@ import {
 } from "./typeFeatures.ts";
 import { STD_SOURCES } from "../../std/embedded.ts";
 import { invalidNewNameReason, planRenameAt, renameEdits } from "./rename.ts";
+import { removeCharAt, wordEndingBefore } from "./editorText.ts";
 import { foldingRanges, type VlFoldingKind } from "./folding.ts";
 import {
   callSiteAt,
@@ -1283,32 +1284,8 @@ const ufcsCandidatesForCursor = async (
     });
 };
 
-// The identifier `[A-Za-z_][A-Za-z0-9_]*` immediately to the LEFT of `character`
-// on `line`, or null. Used to find a `<name>.` member-completion receiver: we
-// scan back over `.` then the preceding word. (Cursor-on-word extraction is
-// `wordAt`; this is specifically "the word ending just before the cursor".)
-const wordEndingBefore = (line: string, character: number): string | null => {
-  const isWordChar = (c: string) => /[A-Za-z0-9_]/.test(c);
-  const end = character;
-  let start = end;
-  while (start > 0 && isWordChar(line[start - 1])) start--;
-  if (start === end) return null;
-  const word = line.slice(start, end);
-  return /^[A-Za-z_]/.test(word) ? word : null;
-};
-
-// Remove the single character at (0-based line, 0-based col) from `text` — used to
-// strip the trailing `.` so the wasm member-completion path can resolve the
-// receiver as a bare expression (the native parser isn't error-tolerant for the
-// incomplete `receiver.`). A no-op if the position is out of range.
-const removeCharAt = (text: string, line: number, col: number): string => {
-  const lines = text.split("\n");
-  if (line < 0 || line >= lines.length) return text;
-  const l = lines[line];
-  if (col < 0 || col >= l.length) return text;
-  lines[line] = l.slice(0, col) + l.slice(col + 1);
-  return lines.join("\n");
-};
+// `wordEndingBefore` (the `<name>.` receiver) and `removeCharAt` (strip the
+// trailing `.`) are shared with the playground — `./editorText.ts`.
 
 // Completion (D3): scope-aware identifier suggestions everywhere, structural
 // member suggestions after `.`, plus keyword and snippet completions for

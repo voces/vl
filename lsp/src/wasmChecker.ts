@@ -174,14 +174,6 @@ export type WasmExtent = {
   range: WasmRange;
 };
 
-/** {@link WasmLexicalToken.tokenClass} values, for the host's legend mapping. */
-export const WASM_LEX_KEYWORD = 0;
-export const WASM_LEX_OPERATOR = 1;
-export const WASM_LEX_NUMBER = 2;
-export const WASM_LEX_BOOLEAN = 3;
-export const WASM_LEX_COMMENT = 4;
-export const WASM_LEX_STRING = 5;
-
 /**
  * One in-scope binding from the wasm scope-at-position pass — a
  * variable/parameter/function visible at the cursor, the native counterpart of
