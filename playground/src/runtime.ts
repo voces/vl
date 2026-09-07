@@ -17,12 +17,20 @@ import { vlHostImports } from "../../compiler/vlHostImports.ts";
 /** Instantiate `wasm` and return the captured `print`/`log` lines. */
 export const runWasmBytes = async (wasm: Uint8Array): Promise<string[]> => {
   const logs: string[] = [];
-  // The ONLY imports any emitted module declares are the seven `__print_*__`
-  // sinks: a program that uses linear memory DEFINES and exports its own, and no
-  // module imports a host memory or the legacy log decoders. The playground
-  // provides no fs floor, so a program using it LinkErrors, which is the design's
-  // enforcement.
-  const { extern, imports } = vlHostImports(logs);
-  await WebAssembly.instantiate(wasm, { extern, imports });
+  // Compile first so the module's OWN declared imports drive the host object: a
+  // program with no `print` imports nothing under `imports`, so it instantiates
+  // against an EMPTY sink object rather than seven stubs it never calls — the
+  // zero-glue browser host (veldt surprise #4). A program using linear memory
+  // DEFINES and exports its own, and none imports a host memory or the legacy log
+  // decoders; the playground provides no fs floor, so a program using it
+  // LinkErrors, which is the design's enforcement.
+  // `as BufferSource` bridges the same `ArrayBufferLike`/`ArrayBuffer` variance
+  // gap `runWasm.ts` documents — invisible to this API, which accepts the bytes.
+  const module = await WebAssembly.compile(wasm as BufferSource);
+  const declared = WebAssembly.Module.imports(module)
+    .filter((i) => i.module === "imports")
+    .map((i) => i.name);
+  const { extern, imports } = vlHostImports(logs, declared);
+  await WebAssembly.instantiate(module, { extern, imports });
   return logs;
 };
