@@ -475,6 +475,48 @@ changes which program is legal rather than how a legal one compiles. None blocks
 recommendation is the coordinator's; the witness is the row's own `Repro:`, re-run by the
 `filed witnesses` gate, so a ruling can be graded the day it lands.
 
+### D1832 — should `[null]` infer `null[]`, or is a list of only `null` an error? — raised 2026-09-06
+
+`const e = [null]` infers **`null[]`** — pinned by forcing it into a diagnostic, which reads
+`cannot assign null[] to 'bad' of type i32` — and every use of one refuses at the LITERAL with
+`emitProgram: bare null needs a struct-typed context`, including `e.length`, before any element
+is read. The boundary is sharp: `[null, 42]` and `[42, null]` both run (D1830), so it is the
+ABSENCE of a non-null member and not the position of the `null`. The annotated spelling
+`const e: (i32 | null)[] = [null]` runs, and **every one of the 53 files in the tree that
+spells a null-only literal annotates its destination** — `const c: (K | null)[][] = [[null]]`
+and friends — as does every corpus cell (`d591t_let_nul_null`, `d341_sound_root_write`). No
+program in the tree or the corpus relies on an un-annotated `null[]`.
+
+**Options.**
+(a) **Refuse the literal** with a sentence that names the fix — "a list of only `null` has no
+element type; annotate it, e.g. `const e: (i32 | null)[] = [null]`". `const e = [null]` becomes
+a check error; `const e: (P | null)[] = [null]` is unaffected, which is every use in the tree.
+(b) **Let `null[]` exist and give it a rep** — a list whose every element is null: one wrapper,
+no element box, every read yields `null`, and `e.length` works. `const e = [null]; print(e.length)`
+would print `1`, and `e[0]` would be the `null` type.
+(c) **Infer from the first non-null USE** — `const e = [null]; e.push(42)` would pin the element
+to `i32 | null`, the way A-infer-null pins a scalar `let x = null`. VL's inference does this for
+a scalar binding but not for a literal's element, so this is new machinery in the checker. That
+push is a CHECK error today, `push: cannot add i32 to null[]`, which is worth noting twice over:
+it is the one place the type already reaches a user BY NAME, and it is the exact site (c) would
+have to turn into a pin.
+
+**Peers.** TypeScript under `strictNullChecks` infers `null[]` and allows it — legal but
+useless, and the same trap: `[null].push(1)` is an error there too. Kotlin infers
+`List<Nothing?>`, which is likewise assignable nowhere useful. Rust refuses to infer at all
+(`let v = vec![None];` needs a type annotation, `cannot infer type`), which is (a) with a
+different sentence. So (a) is the strictest peer and the one whose failure is at the literal
+rather than at a later use.
+
+**Recommendation: (a).** The type exists today and is worth nothing: every use refuses, at the
+literal, with a message about struct context that names neither the list nor the missing
+element type. Nothing in the tree or the corpus depends on it, so the cost of refusing is a
+message change and no program. (b) buys a rep for a type whose only inhabitant is a list of
+nulls, and would have to answer what `e.push(42)` does. (c) is the most useful answer and the
+most expensive: it needs an element hole a later use fills, which is A-infer-null's rule one
+level down and touches the literal's own inference, not just its registration. If (a) lands,
+the sentence is the whole deliverable and D1832 closes as a check reject.
+
 ### backtick-strings-second-form — do backticks earn their place beside `"…"`? — RULED 2026-09-06
 
 **Ruling (owner, 2026-09-06):** fold (Rust's rule): an ordinary `"…"` string may span lines and keeps the newline; a `\` before a newline joins the next line and strips its leading whitespace; backticks are removed. The formatter preserves interior newlines; an unterminated string is reported at its opening quote.
