@@ -41,7 +41,10 @@ becomes a different type within a branch. The fact is produced once (in the chec
   and every rep the concrete spelling handles this one handles too (D951).
 - **Literals:** `x == L` narrows then to `x & L`, else to `x − L`.
 - **`?.`:** `if x?.y is T { … }` narrows both the receiver (`x` non-null) and the path (`x.y` is `T`),
-  so the body reads `x.y` directly.
+  so the body reads `x.y` directly. One `?.` guards the WHOLE chain to its right — `o?.y.z` reads
+  as `o == null ? null : o.y.z` and `p?.f()` as `p == null ? null : p.f()`, so the result carries
+  the `| null` once, at the chain's end. A link that is nullable in its own right still needs its
+  own `?.`: `o?.y.z` over a `y` of type `Leaf | null` is refused, exactly as `o.y.z` would be.
 - **Exhaustiveness:** an `if/else if` chain that subtracts the discriminated place to `Never` has no
   reachable fall-through — no spurious `| null`, and codegen emits `unreachable` for the impossible
   path (`conditionsExhaust`).
