@@ -13567,7 +13567,17 @@ export function pushPostGuardNarrow(stmtIx: i32, fnIx: i32) {
         // do: a new value at `w.f` says nothing about what the old one's `w.f[0]` held.
         retireNarrowForIndexCells(mtk)
         if rhsNullable || asgNarTy >= 0 {
-          if mtk != "" { retireNarrowFor(mtk) }
+          if mtk != "" {
+            retireNarrowFor(mtk)
+            // …and then the written member, the path twin of the Ident arm's push: the checker
+            // re-narrows a path the same way it re-narrows a name, so the reads after the write
+            // must lower at the same member here too (D1847).
+            pushNarrowWriteReNarrow(
+              mtk,
+              asgNarTy,
+              memberUnionFieldNameRead(s.binLeft, fnIx),
+            )
+          }
         }
       }
       // The index target: a literal subscript names its cell, so the exact key retires on a
@@ -13578,7 +13588,15 @@ export function pushPostGuardNarrow(stmtIx: i32, fnIx: i32) {
         const itk = indexPathKeyOf(s.binLeft)
         if itk != "" {
           retireNarrowForIndexCells(itk)
-          if rhsNullable || asgNarTy >= 0 { retireNarrowFor(itk) }
+          if rhsNullable || asgNarTy >= 0 {
+            retireNarrowFor(itk)
+            // The index twin of the member push above (D1847).
+            pushNarrowWriteReNarrow(
+              itk,
+              asgNarTy,
+              indexElemUnionName(s.binLeft, fnIx),
+            )
+          }
         } else {
           const iroot = P.nodes[unwrapParen(tgt.idxArr)]
           if iroot is Ident { retireNarrowForIndexCells(iroot.identName) }
@@ -14079,6 +14097,16 @@ function mapReadMvSlot(exprIx: i32, fnIx: i32) {
       // one (D1012).
       const d12v = narrowVariantFor(ax.identName)
       if nameIsArray(d12v) { return -1 }
+      // The same answer when the narrow banked an ALIAS the name test cannot read through
+      // (`type JsonArr = Json[]`): render the slot's own arena row and re-ask, so an alias
+      // and its spelled-out twin classify the receiver alike (D1822).
+      const d12i = narrowSlotOf(ax.identName)
+      if d12i >= 0 {
+        const d12t = narrowSlotTy(d12i)
+        if d12t >= 0 {
+          if nameIsArray(tyToEmitName(d12t)) { return -1 }
+        }
+      }
       // …and the same for a `string` narrow (D1033): `k[0]` over `k` narrowed to the
       // union's string arm is a char read, not a map read (the index yields an i32) — and
       // claiming the map arm skipped the argument boundary's box.
@@ -26782,6 +26810,14 @@ export function narrowedRefArrayOf(name: string) {
   }
   if valueAtomKind(v) >= 0 { return "" }
   if nameIsRefArray(v) { return v }
+  // A SECOND narrowing over the same binding banks the alias the program wrote (`JsonArr`)
+  // where the first banked the rendered spelling, and a name test cannot see through it. The
+  // arena row already answered — `unMemIsRefElemArray` above — so render that rather than let
+  // the spelling veto it (D1822).
+  if ty >= 0 {
+    const rn = tyToEmitName(ty)
+    if nameIsRefArray(rn) { return rn }
+  }
   ""
 }
 
@@ -33382,12 +33418,12 @@ function calleeReturnsF64Sid(sid: i32, fnIx: i32) {
   calleeRetKindSid(sid, fnIx) == "f64"
 }
 
-// True if the function-value callee `name` (in scope of `fnIx`) returns void — its resolved
-// `$fnsig` key carries the `>v` void marker (`sigKeyRetIsVoid`, not the `null` an unresolved
-// key also decodes to). A void closure call leaves nothing on the stack, so its statement
-// form must not `drop`.
-export function calleeReturnsVoid(name: string, fnIx: i32) {
-  sigKeyRetIsVoid(calleeCloSigKey(name, fnIx))
+// True if the function-VALUE callee at `sid` returns void — its resolved `$fnsig` key has no
+// result. POSITIONED at the callee's own arena node, which is what picks among sibling
+// module-scope blocks binding one closure name: unpositioned, the module rung declines on the
+// ambiguous name and the empty key reads as "returns a value" (D1862).
+export function calleeReturnsVoidAt(sid: i32, fnIx: i32, atIx: i32) {
+  sigKeyRetIsVoid(calleeCloSigKeyAt(sid, fnIx, atIx))
 }
 
 function calleeReturnsVoidSid(sid: i32, fnIx: i32) {
