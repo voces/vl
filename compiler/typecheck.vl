@@ -3690,6 +3690,7 @@ export function initChecker() {
   inferLetNulBoolIx = []
   bodyChecked = Map()
   nodeTyIx = []
+  chainProvenCond = []
   optCallRetIx = []
   optCallRetTy = []
   optCallRetName = []
@@ -24030,6 +24031,82 @@ function redunTruncate(n: i32) {
 // non-coverable arm shape, an uncovered `null` path) — there is no member list to name then.
 let chainMissing = ""
 
+// A-exhaust: the arena nodes of `is` conditions `ifChainExhausts` PROVED true — the last arm
+// of an exhaustive chain, reached only when the value is one of the members no earlier arm
+// covers. The emitter reads it to lower that arm as the bare `else` the design names, rather
+// than re-deriving coverage from the arena.
+export let chainProvenCond: i32[] = []
+
+// Whether `ix` is a condition the exhaustiveness proof marked always-true.
+export function condProvenTrue(ix: i32) {
+  if ix < 0 { return false }
+  let i = 0
+  while i < chainProvenCond.length {
+    if chainProvenCond[i] == ix { return true }
+    i = i + 1
+  }
+  false
+}
+
+// The chain's LAST arm, or -1 when `ifIx` does not end in an else-less `IfStmt`.
+function chainLastArmOf(ifIx: i32) {
+  let cur = ifIx
+  let found = -1
+  let walking = true
+  while walking {
+    const n = P.nodes[cur]
+    if n is IfStmt {
+      if n.ifElse < 0 {
+        found = cur
+        walking = false
+      } else {
+        const nxt = P.nodes[n.ifElse]
+        if nxt is IfStmt { cur = n.ifElse } else { walking = false }
+      }
+    } else {
+      walking = false
+    }
+  }
+  found
+}
+
+// Mark the last arm's condition when reaching it PROVES the test: every member no EARLIER arm
+// covers must be covered by this arm, and there must be at least one such member (an arm the
+// earlier ones already cover is unreachable, not provably true, and is left alone).
+function markChainLastArmProven(ifIx: i32, members: i32[], testedTys: i32[]) {
+  const last = chainLastArmOf(ifIx)
+  if last < 0 { return 0 }
+  if testedTys.length < 2 { return 0 }
+  const lastTy = testedTys[testedTys.length - 1]
+  let residue = 0
+  let mi = 0
+  while mi < members.length {
+    let earlier = false
+    let ti = 0
+    while ti < testedTys.length - 1 {
+      if assignable(members[mi], testedTys[ti]) { earlier = true }
+      ti = ti + 1
+    }
+    if !earlier {
+      if !assignable(members[mi], lastTy) { return 0 }
+      residue = residue + 1
+    }
+    mi = mi + 1
+  }
+  if residue == 0 { return 0 }
+  const ln = P.nodes[last]
+  if ln is IfStmt {
+    const cix = condUnderParens(ln.ifCond)
+    const cnd = P.nodes[cix]
+    // Only an `is` test is elided: the proof is about member coverage, and a literal `==`
+    // arm's operand may be any expression the emitter must still evaluate.
+    if cnd is IsExpr {
+      if !condProvenTrue(ln.ifCond) { chainProvenCond.push(ln.ifCond) }
+    }
+  }
+  0
+}
+
 // Soundness: does the else-less `is`-chain rooted at `ifIx` cover every variant of `p`'s
 // union type? If so, fall-through is unreachable and needs no `else`; if not, a value falls
 // off the end. Decided over the discriminated place's declared union members, requiring every
@@ -24164,6 +24241,7 @@ function ifChainExhausts(ifIx: i32) {
       }
       mi = mi + 1
     }
+    if allCovered { markChainLastArmProven(ifIx, members, testedTys) }
     return allCovered
   }
   // A non-union place: an `is`-chain over it is degenerate; treat as covered
