@@ -1788,4 +1788,39 @@ element builds one level short. The arena rung is what tells them apart.
 > `structIndexOfTypeName`?
 
 Ruled, not scheduled: rung 2 stays nominal. D1858 pins the six modules.
+### 11.7 `rlElemLitStructRow` — a circular source, and a comment's reason that measurement refuted (D1859)
+
+Three sites in, three different shapes, and none of them a rep gap:
+
+| site | why the conversion is wrong |
+| --- | --- |
+| `elemNameIsNominalAt` (§11.5) | it is a predicate ABOUT nominality — the conversion INVERTS it |
+| `rlElemStructRow` (§11.6) | it is rung 2 of a ladder whose rung 4 is already the bridge — the conversion moves the PRECEDENCE |
+| `rlElemLitStructRow` (this) | its answer seeds the OVERRIDE for a field-shape match — producing it from one is CIRCULAR |
+
+**The circularity, stated from the caller.** `wasmEmit.vl` seeds `pendingStructIdx` with this
+row *"so a same-field-name sibling struct does not win the field-shape match."* The seed exists
+to override a field-shape match; `structIndexOfTypeName` IS a field-name-set scan. Supplying
+the override from the thing it overrides answers the disambiguation question with the one
+method that cannot disambiguate. The five flipping names are nested renderings whose inner and
+outer rows share a fieldset, which is precisely the sibling case, so the scan's first match
+returns the INNER row and the element builds one level short.
+
+**And the comment gave a different reason, which the note refuted.** It read *"a `-1` here
+routes on to the concrete-variant lookup, so widening the name leg would change which arm
+answers."* The routing is real — the caller does `if elemStructIdx < 0 { elemVariantIdx =
+variantIndexOf(rlen) }` — but the shadow-gated note reports `would-flip-no-variant` for **all
+five** flipping names and `would-flip-AND-ROUTES-TO-VARIANT` for **none**. The comment names a
+hazard that exists and that no measured cell pays.
+
+> **A comment's stated REASON is a claim, and it is graded like any other.** It can be true,
+> false, or — as here — true but not operative, which is the reading that costs the most,
+> because it looks like a confirmation. Both §11.6 and §11.7 turned on the note distinguishing
+> *would-flip* from *would-flip-AND-<the comment's reason>*, and in both the qualified bucket
+> came back empty. Instrument the comment's own predicate, not just the flip.
+
+The comment is corrected in place. Comment-only, and the seed is **byte-identical** — the
+proof the trim campaign uses, applied to a one-block edit.
+
+Ruled, not scheduled: the fall-through stays nominal. D1859 pins the five modules.
 
