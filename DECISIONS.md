@@ -5459,6 +5459,36 @@ materialisation anyway, so it either copies once more or lands in the same place
 The in-place form is strictly smaller and strictly more general.
 
 
+## The `vl-src` section rides `--names`, and is never in the default build (2026-09-07)
+
+A trap frame is an offset plus a name-section string (`0x118 - vl!boom@3`), and a name-section
+string can only be per FUNCTION — so the `@3` is where `boom` was DECLARED. The `vl-src` custom
+section is the join that turns the offset into the line the trapping INSTRUCTION came from
+(ROADMAP row 22): one row per body and per statement, `[from, to)` over the module's own bytes,
+carrying the line and column its source anchor sits on.
+
+**It is emitted only under `--names`, and the reason is measured, not aesthetic.** The section
+is one row per statement, and a statement is not cheap to describe: on the compiler itself it is
+**94,285 rows and 986,835 bytes — 27.7% of a 3,558,376-byte `--names` build**. Ten bytes a row is
+already close to the floor for five ULEBs, so the row COUNT is the size, and the row count is
+the program. Carrying that in every artifact to serve a failure that most runs never have is the
+wrong default.
+
+Under the `--names` gate the default path pays **zero** — the shipped seed is built without
+`--names` and carries no `vl-src` section at all, checked by decoding it — and the whole feature
+costs the seed **+1,257 bytes** of compiler code (2,345,385 → 2,346,642). Every golden and every fixpoint is byte-identical to a build
+without the feature, which is the same property the name section itself was given.
+
+**The gate is shared with the name section on purpose.** A line with no function name beside it
+is not a legible frame — the host prints ``at lib.vl:6:3  in `boom$m1` `` and the name half comes
+from the name section — so a build that wanted one without the other would get half a backtrace.
+One flag, one answer.
+
+**A host that does not read it loses nothing.** The section is a custom section: the engine
+ignores it, the module validates and runs identically, and a host with no reader prints exactly
+the backtrace it printed before. That is what makes it safe to emit from the one emitter that
+three hosts share.
+
 ## The seed's size is a per-landing number, gated at +3% (2026-09-03)
 
 `build/vl-compiler.wasm` is the compiler's codegen of its own source, so it prices every
