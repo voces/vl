@@ -152,6 +152,7 @@ monaco.languages.setMonarchTokensProvider(VL_LANGUAGE_ID, {
       // semantic tokens win over Monarch. Re-entering a hole here would need a
       // brace-depth state machine to know which `}` closes it.
       [/`(?:[^`\\]|\\.)*`/, "string"],
+      [/\.\.\./, "operator"],
       [/\b\d[\d_]*(?:\.\d[\d_]*)?\b/, "number"],
       [
         /[a-zA-Z_]\w*/,

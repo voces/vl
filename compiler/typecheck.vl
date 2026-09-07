@@ -53,6 +53,7 @@ import {
   Paren,
   Program,
   RetStmt,
+  Spread,
   StrLit,
   TPL_RENDER_LOCAL,
   TypeDecl,
@@ -60,12 +61,20 @@ import {
   Unary,
   UnionDecl,
   WhileStmt,
+  adoptNodeTok,
+  arenaEpochBump,
+  callIsRestPacked,
+  hasSpreadItem,
+  markCallRestPacked,
+  mkArrayLit,
   mkBinary,
   mkBlock,
   mkIf,
   mkNum,
   mkParen,
   nodeIsTplHole,
+  restParamIndex,
+  spreadArgOf,
 } from "./ast"
 import {
   CALLSITE_NAME,
@@ -20640,6 +20649,152 @@ function arityWantText(lo: i32, hi: i32) {
   i32ToStr(lo) + " to " + i32ToStr(hi)
 }
 
+// Why a list cannot be spread into a fixed-arity call, naming the callee when it has a name.
+// VL has no tuple type, so a list's length is never known at the call — TypeScript's own
+// condition — which is why the rest parameter is the whole of the rule and not half of it.
+function spreadNoRestMsg(who: string) {
+  let whom = "this call"
+  if who != "" { whom = "`" + who + "`" }
+  "`...` unpacks a list into a rest parameter, and " +
+    whom +
+    " has none — VL has no tuple type, so a list's length is not known at the call. " +
+    "Declare the last parameter `...xs: T[]`, or pass the elements one by one"
+}
+
+// The ELEMENT type a spread contributes: `...ys` over `ys: T[]` gives `T`. A `readonly` view
+// spreads too — the destination list is fresh, so nothing the view forbids is laundered.
+// Returns -1 for an empty-list source (element not yet known) and TY_ERR after refusing one
+// that is not a list at all.
+function spreadElemTy(spdIx: i32) {
+  const inner = spreadArgOf(spdIx)
+  if inner < 0 { return TY_ERR }
+  const st = checkNode(inner)
+  if st < 0 { return TY_ERR }
+  const t = T.tys[st]
+  if t is TyArray {
+    // `u8[]` is the one list whose ELEMENT does not identify its rep — its backing is
+    // `(array (mut i8))` where every other i32-element list is `(array (mut i32))` — so an
+    // un-annotated destination binds the i32 cell while the spread builds the packed one.
+    // Refused here rather than at the cell, so no spelling of it can reach the emitter (D1850).
+    if primNameOf(t.aElem) == "u8" {
+      tErr(
+        "a `u8[]` cannot be spread — its packed byte backing is not the list rep an " +
+          "un-annotated destination binds. `xs.slice(0)` copies one and is what to write here",
+        inner,
+      )
+      return TY_ERR
+    }
+    return t.aElem
+  }
+  let note = ""
+  if st == TY_STR { note = " — a string is not a list of characters in VL" }
+  tErr("`...` spreads a list, and this is " + tyToStr(st) + note, inner)
+  TY_ERR
+}
+
+// How many leading arguments a call to a variadic function must supply: the fixed head, less
+// any of it that carries a default. The rest parameter itself is never required — with no
+// argument reaching it, it is the empty list.
+function restRequiredArity(dParams: i32[], restIx: i32) {
+  const req = fnRequiredArity(dParams)
+  if req > restIx { return restIx }
+  req
+}
+
+// Whether a union rides the i32 SPINE rather than a value box: every non-null arm is an
+// `i32`- or `boolean`-repped primitive, or the whole union is a literal one. The spine cases
+// pin a rest element hole and run; a boxed one has no instance (D1851).
+function unionRidesI32Spine(tyIx: i32): boolean {
+  if tyIsLitUnion(tyIx) { return true }
+  if tyIx < 0 || tyIx >= T.tys.length { return false }
+  const t = T.tys[tyIx]
+  if t is TyUnion {
+    let i = 0
+    while i < t.uMembers.length {
+      const pn = primNameOf(t.uMembers[i])
+      if pn == null { return false }
+      if pn != "i32" && pn != "boolean" && pn != "null" { return false }
+      i = i + 1
+    }
+    return true
+  }
+  false
+}
+
+// True, having reported, when a rest parameter's element is an unbound HOLE and the packed
+// list's element joined to a union that BOXES. `T` would pin to that union and the instance
+// the monomorphizer mints for it misbuilds — check-clean invalid wasm, the worst outcome
+// there is — so it is refused at the pin, naming the concrete spelling that runs (D1851).
+function restHoleUnionErr(pTy: i32, packIx: i32, ix: i32): boolean {
+  const pe = tyArrayElemIx(pTy)
+  if pe < 0 || pe >= T.tys.length { return false }
+  const pt = T.tys[pe]
+  if pt is TyVar {
+    const at = tyArrayElemIx(checkNode(packIx))
+    if at < 0 || at >= T.tys.length { return false }
+    const a = T.tys[at]
+    if a is TyUnion {
+      if unionRidesI32Spine(at) { return false }
+      tErr(
+        "a rest parameter's element is inferred from the arguments, and these join to " +
+          tyToStr(at) +
+          " — a boxed union a type parameter cannot be pinned to. Spell the element out, " +
+          "`...xs: (" +
+          tyToStr(at) +
+          ")[]`, or pass one element type",
+        ix,
+      )
+      return true
+    }
+  }
+  false
+}
+
+// Rewrite `f(a, b, c)` into `f(a, [b, c])` when `f`'s last parameter is a rest one, in place,
+// so every later reader — this function's index-parallel loop, the monomorphizer's positional
+// column, the emitter's list-literal path — sees an ordinary fixed-arity call. Returns false
+// when it refused; `callIsRestPacked` is what stops it running twice.
+function restCallPack(n: Call, ix: i32, restIx: i32) {
+  const args = n.callArgs
+  if hasNamedArgs(n.callArgNames) {
+    tErr(
+      "a named argument binds one parameter and a rest parameter is many, so a call " +
+        "that reaches a rest parameter is positional",
+      ix,
+    )
+    return false
+  }
+  const head: i32[] = []
+  let i = 0
+  while i < restIx {
+    head.push(args[i])
+    i = i + 1
+  }
+  const tail: i32[] = []
+  while i < args.length {
+    tail.push(args[i])
+    i = i + 1
+  }
+  // The packed list reports at the first argument it swallows, so an element mismatch points
+  // there rather than at the end of the file; with nothing to swallow it takes the call's.
+  const lst = mkArrayLit(tail, n.pos)
+  if tail.length > 0 {
+    adoptNodeTok(lst, tail[0])
+  } else {
+    adoptNodeTok(lst, ix)
+  }
+  head.push(lst)
+  n.callArgs = head
+  const names: string[] = []
+  n.callArgNames = names
+  markCallRestPacked(ix)
+  // Stamp the arena: the parse bank must not serve a cached tree by popping the rows this
+  // appended, which would leave `callArgs` pointing past the truncation and make every name
+  // inside the packed list read as unused.
+  arenaEpochBump()
+  true
+}
+
 // Is `name` bound at MODULE scope by a `const`? `T.scopes[0]` is the module
 // frame, and asking IT rather than walking the chain is the point: a parameter
 // default's names resolve at the DECLARATION, and the declaration's own
@@ -21332,6 +21487,15 @@ function ufcsWouldDispatch(mangled: string, recvTy: i32, argc: i32) {
     const uDecl = declParamsAfterSelf(mangled)
     let uRequired = params.length - 1
     if uDecl.length == params.length - 1 { uRequired = fnRequiredArity(uDecl) }
+    // The rest arm of `ufcsCallTy`'s gate, mirrored: a variadic callee's upper bound is
+    // unbounded, and this speculative twin must agree about what dispatches.
+    const uRest = restParamIndex(uDecl)
+    if uRest >= 0 {
+      let uLo = uRequired
+      if uLo > uRest { uLo = uRest }
+      if argc < uLo { return false }
+      return assignable(recvTy, params[0])
+    }
     if argc < uRequired || argc + 1 > params.length { return false }
     return assignable(recvTy, params[0])
   }
@@ -21569,6 +21733,22 @@ function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
     // `fnRequiredArity` over the TAIL alone: `self` is never defaulted (it is
     // the receiver), so the tail's own required count IS the answer.
     if uDecl.length == params.length - 1 { uRequired = fnRequiredArity(uDecl) }
+    // A rest parameter packs here too: the receiver has already filled slot 0, so the pack
+    // starts one slot earlier in the member call's own argument list than in the
+    // declaration. Packing before the gate is what puts the two back in step.
+    const uRest = restParamIndex(uDecl)
+    if uRest >= 0 {
+      if !callIsRestPacked(ix) {
+        let uLo = uRequired
+        if uLo > uRest { uLo = uRest }
+        if args.length < uLo { return -1 }
+        if !restCallPack(n, ix, uRest) { return TY_ERR }
+      }
+      args = n.callArgs
+    } else if hasSpreadItem(args) {
+      tErr(spreadNoRestMsg(plainName), ix)
+      return TY_ERR
+    }
     if args.length < uRequired || args.length + 1 > params.length { return -1 }
     if !assignable(recvTy, params[0]) { return -1 }
     // The vacuous half of that gate, deferred: `assignable` answers true for a `TyVar` on
@@ -22056,30 +22236,52 @@ function checkMemberCallNode(
     }
     const margs = n.callArgs
     if prop == "push" {
-      if margs.length != 1 {
-        tErr("push expects 1 argument, got " + i32ToStr(margs.length), ix)
+      if margs.length < 1 {
+        tErr("push expects at least 1 argument, got 0", ix)
       } else {
-        // Contextual param inference for a pushed callback: `fs.push((n) => n + 1)` over a
-        // `((i32) => i32)[]` seeds the lambda's param from the element function type, so an
-        // un-annotated lambda infers `n` instead of erroring (mirrors the `.map`/`.filter`
-        // seeding). A non-function element / non-lambda arg is left untouched by `seedExpected`.
-        if rt.aElem >= 0 { seedExpected(margs[0], rt.aElem) }
-        const pat = checkNode(margs[0])
-        // The first `.push(v)` on a bare empty `[]` pins its element type to `typeof v` in
-        // place — the usage-driven inference that resolves an un-annotated `const xs = []`; a later conflicting push is then a clean type error.
-        if rt.aElem < 0 {
-          rt.aElem = pat
-          tyMutEpoch = tyMutEpoch + 1 // `.push` pinned the element in place
-        } else {
-          // The pushed value's own open holes pin from the element slot — the same rule
-          // `.set` / `m[k] = v` / `xs = e` apply at their own store positions.
-          constrainEmptyExpr(margs[0], pat, rt.aElem)
-          // Uses `assignableExpr`, not bare `assignable`, so a float-literal argument
-          // re-encodes into an `f32` element exactly as it does at a binding, and defers to
-          // the pin when a side is a hole (D582).
-          if !bmArgOk(BM_PUSH, "push", pat, rt.aElem, recvTy, margs[0]) {
-            tErr(bmArgMsg(BM_PUSH, "push", pat, rt.aElem, recvTy), ix)
+        // `push` is variadic — every argument appends, and a spread argument appends every
+        // element of its source. One loop covers both, so `xs.push(...ys)` needs no case of
+        // its own; the appends happen in argument order.
+        let mi = 0
+        while mi < margs.length {
+          const spd = spreadArgOf(margs[mi])
+          if spd >= 0 {
+            const set = spreadElemTy(margs[mi])
+            if rt.aElem < 0 {
+              if set >= 0 {
+                rt.aElem = set
+                tyMutEpoch = tyMutEpoch + 1 // a spread pinned the element in place
+              }
+            } else if set >= 0 {
+              if !bmArgOk(BM_PUSH, "push", set, rt.aElem, recvTy, spd) {
+                tErr(bmArgMsg(BM_PUSH, "push", set, rt.aElem, recvTy), ix)
+              }
+            }
+          } else {
+            // Contextual param inference for a pushed callback: `fs.push((n) => n + 1)` over a
+            // `((i32) => i32)[]` seeds the lambda's param from the element function type, so an
+            // un-annotated lambda infers `n` instead of erroring (mirrors the `.map`/`.filter`
+            // seeding). A non-function element / non-lambda arg is left untouched by `seedExpected`.
+            if rt.aElem >= 0 { seedExpected(margs[mi], rt.aElem) }
+            const pat = checkNode(margs[mi])
+            // The first `.push(v)` on a bare empty `[]` pins its element type to `typeof v` in
+            // place — the usage-driven inference that resolves an un-annotated `const xs = []`; a later conflicting push is then a clean type error.
+            if rt.aElem < 0 {
+              rt.aElem = pat
+              tyMutEpoch = tyMutEpoch + 1 // `.push` pinned the element in place
+            } else {
+              // The pushed value's own open holes pin from the element slot — the same rule
+              // `.set` / `m[k] = v` / `xs = e` apply at their own store positions.
+              constrainEmptyExpr(margs[mi], pat, rt.aElem)
+              // Uses `assignableExpr`, not bare `assignable`, so a float-literal argument
+              // re-encodes into an `f32` element exactly as it does at a binding, and defers to
+              // the pin when a side is a hole (D582).
+              if !bmArgOk(BM_PUSH, "push", pat, rt.aElem, recvTy, margs[mi]) {
+                tErr(bmArgMsg(BM_PUSH, "push", pat, rt.aElem, recvTy), ix)
+              }
+            }
           }
+          mi = mi + 1
         }
       }
       return TY_I32
@@ -22797,6 +22999,34 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
   // range [`fnRequiredArity`, `params.length`]. A call through a function value has no
   // declaration to read defaults from and keeps its exact-arity gate.
   const dParams = calleeDeclParams(n.callFn)
+  // A rest parameter is the one thing that makes the accepted arity unbounded above, and the
+  // pack below is what puts it back: after it the argument list is index-parallel with the
+  // parameter list again, which is the invariant everything from here down is written around.
+  let restIx = -1
+  if dParams.length == params.length { restIx = restParamIndex(dParams) }
+  if restIx >= 0 {
+    if !callIsRestPacked(ix) {
+      const lo = restRequiredArity(dParams, restIx)
+      if args.length < lo {
+        tErr(
+          "wrong number of arguments: expected at least " +
+            i32ToStr(lo) +
+            ", got " +
+            i32ToStr(args.length),
+          ix,
+        )
+        return retTy
+      }
+      if !restCallPack(n, ix, restIx) { return retTy }
+    }
+    args = n.callArgs
+    if restIx < args.length {
+      if restHoleUnionErr(params[restIx], args[restIx], ix) { return retTy }
+    }
+  } else if hasSpreadItem(args) {
+    tErr(spreadNoRestMsg(calleeIdentName(cfn)), ix)
+    return retTy
+  }
   let required = params.length
   if dParams.length == params.length { required = fnRequiredArity(dParams) }
   if args.length < required || args.length > params.length {
@@ -25969,6 +26199,12 @@ function checkNodeReal(ix: i32) {
     return checkMemberNode(n, ix)
   } else if n is ArrayLit {
     return checkArrayLitNode(n, ix)
+  } else if n is Spread {
+    // A spread the call and list-literal paths both declined — nothing here can unpack it.
+    // The operand is still checked, so an error inside it is reported rather than swallowed.
+    checkNode(n.spdArg)
+    tErr(spreadNoRestMsg(""), ix)
+    return TY_ERR
   } else if n is Index {
     return checkIndexNode(n, ix)
   } else if n is ObjLit {
@@ -34013,6 +34249,7 @@ function checkMemberNode(n: Member, ix: i32) {
 function checkArrayLitNode(n: ArrayLit, _ix: i32) {
   const elems = n.arrElems
   if elems.length < 1 { return mkArrayTy(-1) }
+  if hasSpreadItem(elems) { return checkSpreadArrayLit(elems) }
   // A `void` element has no value to store — poisoned to `TY_ERR` rather than joined, so an
   // annotated literal keeps one "cannot assign" message instead of a second one.
   let elemTy = checkNode(elems[0])
@@ -34031,6 +34268,31 @@ function checkArrayLitNode(n: ArrayLit, _ix: i32) {
     ei = ei + 1
   }
   return mkArrayTy(elemTy)
+}
+
+// `[...a, e, ...b]` — the element type joins every plain element's type with every spread
+// source's ELEMENT type. A spread of an empty list contributes nothing, so `[...[]]` stays an
+// unpinned `T[]` exactly as `[]` does, and a literal that is only spreads of empty lists is
+// pinned by its destination like any other empty one.
+function checkSpreadArrayLit(elems: i32[]) {
+  let elemTy = -1
+  let ei = 0
+  while ei < elems.length {
+    let et = -1
+    if spreadArgOf(elems[ei]) >= 0 {
+      et = spreadElemTy(elems[ei])
+    } else {
+      et = checkNode(elems[ei])
+      if voidValueSlotErr(et, elems[ei], "list element", elems[ei]) {
+        et = TY_ERR
+      }
+    }
+    if et >= 0 {
+      if elemTy < 0 { elemTy = et } else { elemTy = joinTys(elemTy, et) }
+    }
+    ei = ei + 1
+  }
+  mkArrayTy(elemTy)
 }
 // ── index `a[i]` ────────────────────────────────────────────────────────────
 
