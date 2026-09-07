@@ -33728,7 +33728,11 @@ function checkMatchExprNode(n: MatchExpr, ix: i32) {
     retTailPos = mTail
     return ri
   }
-  if !tyIsLitUnion(st) {
+  // D1898 — a NULLABLE literal union takes the member-string vocabulary too, with `null` as
+  // one more member: it is the same interned i32 atom as the bare set, `null` riding the spare
+  // `-1`, so the desugared `k is null` / `k == "a"` chain is what already lowers.
+  const nulLit = tyIsNullableLitUnion(st)
+  if !tyIsLitUnion(st) && !nulLit {
     // A third arm vocabulary (D1572): an integer scrutinee dispatches on literals, asked before
     // the union tests (which have no member set for one). A hole takes it too when arms are int literals.
     const uMems: i32[] = []
@@ -33742,9 +33746,14 @@ function checkMatchExprNode(n: MatchExpr, ix: i32) {
     retTailPos = mTail
     return TY_ERR
   }
-  // The member texts (inner, no quotes), and a parallel covered-flag.
+  // The member texts (inner, no quotes), and a parallel covered-flag. `K | null` interns as a
+  // `TyNullable` over the set while the expanded `"a" | "b" | null` interns as a `TyUnion` with
+  // a null member, so both forms are read here and the `null` member rides `nulCovered`.
   const members: string[] = []
-  const sty = T.tys[st]
+  let styIx = st
+  const styN = T.tys[st]
+  if styN is TyNullable { styIx = styN.nInner }
+  const sty = T.tys[styIx]
   if sty is TyUnion {
     let mi = 0
     while mi < sty.uMembers.length {
@@ -33759,6 +33768,7 @@ function checkMatchExprNode(n: MatchExpr, ix: i32) {
     covered.push(0)
     ci = ci + 1
   }
+  let nulCovered = false
   let hasWild = false
   // A pattern that is neither a member string literal nor the `_` wildcard covers nothing —
   // report it at the pattern and suppress the exhaustiveness error below (don't cascade).
@@ -33778,15 +33788,27 @@ function checkMatchExprNode(n: MatchExpr, ix: i32) {
         // parses as a type pattern, handled below), so this arm is the wildcard.
         hasWild = true
       } else if pn is IsExpr {
-        // A type pattern over a literal union: an identifier naming no type reaches this same
-        // arm too, so the wording must not silently claim to cover every member.
-        sawBadPat = true
-        tErr(
-          "invalid match pattern `" +
-            pn.isVariant +
-            "` — a pattern is a member string literal or the `_` wildcard",
-          patIx,
-        )
+        // D1898 — `null` is the one type pattern this vocabulary takes, and only where the
+        // scrutinee carries it; on a bare set it is not a member and keeps the wording below.
+        if nulLit && pn.isVariant == "null" {
+          if nulCovered {
+            tErr("redundant match arm: `null` is already covered", patIx)
+          } else {
+            nulCovered = true
+          }
+        } else {
+          // A type pattern over a literal union: an identifier naming no type reaches this same
+          // arm too, so the wording must not silently claim to cover every member.
+          sawBadPat = true
+          tErr(
+            "invalid match pattern `" +
+              pn.isVariant +
+              "` — a pattern is a member string literal" +
+              matchNulPatHint(nulLit) +
+              " or the `_` wildcard",
+            patIx,
+          )
+        }
       } else if pn is StrLit {
         // The member name is the pattern's inner text (quotes stripped) — an expression
         // lexeme, not `tyname.groupInnerOf`'s home (a degenerate lexeme stays whole here).
@@ -33853,6 +33875,11 @@ function checkMatchExprNode(n: MatchExpr, ix: i32) {
       }
       mk = mk + 1
     }
+    // The `null` member is named last, so the sentence reads in the order the spelling does.
+    if nulLit && !nulCovered {
+      if missing != "" { missing = missing + ", " }
+      missing = missing + "null"
+    }
     if missing != "" {
       tErr(
         "non-exhaustive match — missing " + missing + " (add the arm or a `_`)",
@@ -33864,6 +33891,13 @@ function checkMatchExprNode(n: MatchExpr, ix: i32) {
   if !inferQuiet { desugarMatchAt(ix) }
   retTailPos = mTail
   return matchTy
+}
+
+// The `null` clause of the litunion pattern vocabulary's message: named only where the
+// scrutinee carries a `null` member, so a bare set's sentence is unchanged (D1898).
+function matchNulPatHint(nulLit: boolean) {
+  if nulLit { return ", `null`" }
+  ""
 }
 
 function checkIfStmtNode(n: IfStmt, ix: i32) {

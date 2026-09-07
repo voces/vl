@@ -1801,3 +1801,88 @@ control you know should trigger it does.** Two of these three reported zero on a
 provably reaches the rung, and only a control separated "the rung did not fire" from "the
 instrument cannot speak."
 
+### 11.6 `rlElemStructRow` — already migrated, and a RIGHT-ONLY hit is not evidence (D1858)
+
+The second site, and a different answer from §11.5's. `elemNameIsNominalAt` was a predicate
+about nominality that the conversion INVERTED. This one is not a predicate at all: it is
+**rung 2 of a four-rung ladder whose rung 4 is already `structIndexOfTypeName`** — arena
+identity, nominal identity, the canon-key row off the recorded type, then the fieldset scan.
+Converting rung 2 does not add the structural bridge, it duplicates it at the wrong precedence.
+
+**The order test proves it without converting anything.** Leave the nominal call and the
+variant floor exactly as they are, and ask the function's own existing LAST rung one place
+earlier — ahead of `repRowOfTyStruct`, the arena rung. The identical six `structs/*twin*`
+modules go from building to check-clean invalid wasm:
+
+| module | base | rung REORDERED | rung 2 converted |
+| --- | --- | --- | --- |
+| `declared-twin-inline-elem-array-param` | builds | INVALID WASM | INVALID WASM |
+| `declared-twin-inline-elem-map-field-param` | builds | INVALID WASM | INVALID WASM |
+| `nested-null-hole-list-elem-twin` | builds | INVALID WASM | INVALID WASM |
+| `nested-null-hole-list-return-twin` | builds | INVALID WASM | INVALID WASM |
+| `nested-union-softening-list-elem-twin` | builds | INVALID WASM | INVALID WASM |
+| `nested-union-softening-list-return-twin` | builds | INVALID WASM | INVALID WASM |
+
+So the mechanism is rung ORDER, not nominal keying — and the variant floor is not involved:
+the shadow-gated note reports `would-flip` on all six and
+`would-flip-AND-IS-A-VARIANT` on **none**.
+
+**The faces invert the usual direction.** Three spellings of the same destination:
+
+| face | base | reordered / converted |
+| --- | --- | --- |
+| annotated, INLINE shape `{f: {f: i64 \| null}}[]` | runs `NULL` | **INVALID WASM** |
+| annotated by the ALIAS `T0[]` | runs `NULL` | runs `NULL` |
+| un-annotated, inference pins it | runs `NULL` | runs `NULL` |
+
+The ANNOTATED face is the fragile one here and the inferred face is safe — the opposite of the
+missing-annotation shape CLAUDE.md warns about. An inline structural annotation is the one
+spelling that hands the ladder a name only the fieldset scan can match, and where the inner and
+outer rows share the one-field fieldset `{f}` its first match falls to the INNER row and the
+element builds one level short. The arena rung is what tells them apart.
+
+> **The refinement §11.1's criterion needs: a RIGHT-ONLY hit is not evidence that a site is
+> UNMIGRATED.** The oracle asks *"would the structural resolver answer where the nominal one
+> declined?"* — which is true, and irrelevant, when the enclosing function asks the structural
+> resolver itself further down. There the nominal call is a rung with a PRECEDENCE, not a gap.
+> Two of the fourteen remaining sites are that shape (`rlElemStructRow` and the second call in
+> `structIndexOfExpr`), and the cheap test is one grep: does the same function already name
+> `structIndexOfTypeName`?
+
+Ruled, not scheduled: rung 2 stays nominal. D1858 pins the six modules.
+### 11.7 `rlElemLitStructRow` — a circular source, and a comment's reason that measurement refuted (D1859)
+
+Three sites in, three different shapes, and none of them a rep gap:
+
+| site | why the conversion is wrong |
+| --- | --- |
+| `elemNameIsNominalAt` (§11.5) | it is a predicate ABOUT nominality — the conversion INVERTS it |
+| `rlElemStructRow` (§11.6) | it is rung 2 of a ladder whose rung 4 is already the bridge — the conversion moves the PRECEDENCE |
+| `rlElemLitStructRow` (this) | its answer seeds the OVERRIDE for a field-shape match — producing it from one is CIRCULAR |
+
+**The circularity, stated from the caller.** `wasmEmit.vl` seeds `pendingStructIdx` with this
+row *"so a same-field-name sibling struct does not win the field-shape match."* The seed exists
+to override a field-shape match; `structIndexOfTypeName` IS a field-name-set scan. Supplying
+the override from the thing it overrides answers the disambiguation question with the one
+method that cannot disambiguate. The five flipping names are nested renderings whose inner and
+outer rows share a fieldset, which is precisely the sibling case, so the scan's first match
+returns the INNER row and the element builds one level short.
+
+**And the comment gave a different reason, which the note refuted.** It read *"a `-1` here
+routes on to the concrete-variant lookup, so widening the name leg would change which arm
+answers."* The routing is real — the caller does `if elemStructIdx < 0 { elemVariantIdx =
+variantIndexOf(rlen) }` — but the shadow-gated note reports `would-flip-no-variant` for **all
+five** flipping names and `would-flip-AND-ROUTES-TO-VARIANT` for **none**. The comment names a
+hazard that exists and that no measured cell pays.
+
+> **A comment's stated REASON is a claim, and it is graded like any other.** It can be true,
+> false, or — as here — true but not operative, which is the reading that costs the most,
+> because it looks like a confirmation. Both §11.6 and §11.7 turned on the note distinguishing
+> *would-flip* from *would-flip-AND-<the comment's reason>*, and in both the qualified bucket
+> came back empty. Instrument the comment's own predicate, not just the flip.
+
+The comment is corrected in place. Comment-only, and the seed is **byte-identical** — the
+proof the trim campaign uses, applied to a one-block edit.
+
+Ruled, not scheduled: the fall-through stays nominal. D1859 pins the five modules.
+

@@ -244,6 +244,88 @@ VALUES = [
                   {"id": "as_q", "lines": ["print({v} as? i32 ?? -1)"], "want": ["3"]},
                   {"id": "bare", "lines": ["print({v})"], "want": ["3"]}],
     },
+    # ── RECURSIVE types ────────────────────────────────────────────────────────────
+    # A recursive type has NO inline spelling by construction — expanding `Node` inside
+    # `Node` does not terminate — so these carry `no_inline` and the `named_vs_inline` axis
+    # declines them. That is a property of the feature, not a gap in the grammar, and it is
+    # why the CONTROL below is a non-recursive record of the same field shape: if the flat
+    # twin refuses too, the recursion is not the ingredient.
+    {
+        "id": "rec_node", "weight": 3, "no_inline": True,
+        "decls": [("Node", "{ v: i32, next: Node | null }")],
+        "named": "Node", "inline": "Node", "expr": None,
+        "mk": ["return { v: 1, next: { v: 2, next: null } }"],
+        "alt": "{ v: 9, next: null }",
+        "features": ["struct", "recursive", "nullable"],
+        "reads": [
+            {"id": "depth0", "lines": ["print({v}.v)"], "want": ["1"]},
+            {"id": "depth1",
+             "lines": ["const nx = {v}.next",
+                       "if nx != null { print(nx.v) } else { print(0) }"],
+             "want": ["2"]},
+            {"id": "depth2",
+             "lines": ["const n1 = {v}.next",
+                       "if n1 != null {",
+                       "  const n2 = n1.next",
+                       "  if n2 != null { print(n2.v) } else { print(0) }",
+                       "} else { print(0) }"],
+             "want": ["0"]},
+        ],
+    },
+    {
+        # Recursive through a LIST field rather than a nullable one: the cycle runs through
+        # the ref-list wrapper, which is a different interning path than the niche.
+        "id": "rec_tree", "weight": 2, "no_inline": True,
+        "decls": [("Tree", "{ t: i32, kids: Tree[] }")],
+        "named": "Tree", "inline": "Tree", "expr": None,
+        "mk": ["return { t: 7, kids: [] }"],
+        "alt": "{ t: 0, kids: [] }",
+        "features": ["struct", "recursive", "list"],
+        "reads": [{"id": "depth0", "lines": ["print({v}.t)"], "want": ["7"]},
+                  {"id": "kids", "lines": ["print({v}.kids.length)"], "want": ["0"]}],
+    },
+    {
+        # MUTUAL recursion: neither name closes on its own, so the interner must reach a
+        # fixpoint over a PAIR rather than over one declaration.
+        "id": "rec_mutual", "weight": 2, "no_inline": True,
+        "decls": [("Leaf", "{ w: i32, up: Branch | null }"),
+                  ("Branch", "{ kids: Leaf | null }")],
+        "named": "Branch", "inline": "Branch", "expr": None,
+        "mk": ["return { kids: { w: 5, up: null } }"],
+        "alt": "{ kids: null }",
+        "features": ["struct", "recursive", "nullable"],
+        "reads": [
+            {"id": "depth1",
+             "lines": ["const k = {v}.kids",
+                       "if k != null { print(k.w) } else { print(0) }"],
+             "want": ["5"]},
+            {"id": "depth2",
+             "lines": ["const k = {v}.kids",
+                       "if k != null {",
+                       "  const u = k.up",
+                       "  if u != null { print(1) } else { print(0) }",
+                       "} else { print(0) }"],
+             "want": ["0"]},
+        ],
+    },
+    {
+        # THE CONTROL of the recursive set: the same field shape and the same reads with the
+        # cycle CUT — `Tail` closes, so nothing here is recursive. A disagreement this record
+        # shares is not a recursion defect, which no all-recursive table could tell.
+        "id": "rec_flat", "weight": 2,
+        "decls": [("Tail", "{ v: i32 }"), ("Head", "{ v: i32, next: Tail | null }")],
+        "named": "Head", "inline": "{ v: i32, next: { v: i32 } | null }", "expr": None,
+        "mk": ["return { v: 1, next: { v: 2 } }"],
+        "alt": "{ v: 9, next: null }",
+        "features": ["struct", "nullable"],
+        "reads": [
+            {"id": "depth0", "lines": ["print({v}.v)"], "want": ["1"]},
+            {"id": "depth1",
+             "lines": ["const nx = {v}.next",
+                       "if nx != null { print(nx.v) } else { print(0) }"],
+             "want": ["2"]},
+        ],
+    },
     {
         # THREE members, which is the smallest union an OR-PATTERN can be written over:
         # `"b" | "c"` collapses two arms, and a two-member union has no such pair. Its
