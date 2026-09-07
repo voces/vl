@@ -19739,9 +19739,55 @@ function validateMemCstrs(
       }
       if !tyHasHole(mr) {
         let skip = false
+        // A resolved index operator: BANK it on its site for the emitter's dispatch rewrite,
+        // or the read/write reaches the emitter as a raw Index over a receiver with no list
+        // rep — a clause-2 emit reject on a check-clean program (D1892). GET's site is the
+        // index node, SET's the assignment node; each constraint carries the right `memCstrIx`.
+        if opIdxDeclared() && !tyBuiltinIndexable(mr) {
+          if memCstrProp[ci] == OP_INDEX_GET {
+            const gfn = opIdxFnFor(OP_INDEX_GET, mr)
+            if gfn != "" {
+              opIdxBank(memCstrIx[ci], gfn)
+            } else {
+              // A SET-only receiver has no readable index: the inline arm refuses an annotated
+              // one here, so the hole path must too — `indexFloorMsg` answers "" for it (it
+              // sees the setter) and would fall silently to the emitter (D1932).
+              const sOnly = opIdxFnFor(OP_INDEX_SET, mr)
+              if sOnly != "" {
+                tErr(
+                  "operator " +
+                    opDeclLabel(sOnly) +
+                    " needs a matching \"" +
+                    OP_INDEX_GET +
+                    "\" operator — an index that cannot be READ cannot be written either",
+                  ix,
+                )
+                skip = true
+              }
+            }
+          } else if memCstrProp[ci] == OP_INDEX_SET {
+            const sfn = opIdxFnFor(OP_INDEX_SET, mr)
+            if sfn != "" {
+              opIdxBank(memCstrIx[ci], sfn)
+            } else if opIdxFnFor(OP_INDEX_GET, mr) != "" {
+              // A GET operator with no SET: name the missing half, as the inline arm does.
+              tErr(
+                "no \"" +
+                  OP_INDEX_SET +
+                  "\" operator for index assignment on " +
+                  tyToStr(mr),
+                ix,
+              )
+            }
+          }
+        }
         if memCstrProp[ci] == OP_INDEX_GET {
           if tyRefusesArrayDemand(mr) { skip = true }
         }
+        // `"[]="` is not a field name, so `memCstrMsg` cannot grade it; the assignment arm at
+        // check time owns a concrete receiver's write diagnostic, and a builtin-indexable pin
+        // is a real array/map write. The SET operator's own site is settled just above.
+        if memCstrProp[ci] == OP_INDEX_SET { skip = true }
         if !skip {
           const mMsg = memCstrMsg(mr, memCstrProp[ci])
           if mMsg != "" {
@@ -32507,6 +32553,11 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
         // An index WRITE through a hole, filed like `xs.push(v)`: the read that typed the
         // receiver noted only that the body indexes it, which a view satisfies.
         noteArrayWriteDemand(arrH0.tvName)
+        // The write's own deferred constraint, keyed to the ASSIGNMENT node so the pin can
+        // BANK the `"[]="` operator there for the emitter — the read constraint the target
+        // records only covers `"[]"`, and `p[4] = v` needs the setter (D1892). Vacuous when
+        // the hole pins to a real array or map, which `validateMemCstrs` skips.
+        if opIdxDeclared() { noteMemCstr(arrTy0, OP_INDEX_SET, ix, false) }
         const hmw = holeMapOf(arrH0.tvName)
         if hmw >= 0 { arrTy0 = hmw }
       }
