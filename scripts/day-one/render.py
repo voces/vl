@@ -56,6 +56,11 @@ def applicable_axes(plan):
         need = ax.get("needs")
         if need == "decls" and not val["decls"]:
             continue
+        # A RECURSIVE type has no inline spelling — expanding the name inside itself does
+        # not terminate — so the axis declines rather than rendering a face that is a
+        # different program. NOT EXERCISED is the honest report for it.
+        if ax["id"] == "named_vs_inline" and val.get("no_inline"):
+            continue
         if need == "narrow_group" and len(_narrow_group(val, read)) < 2:
             continue
         if need == "fusible" and not _fusible(pos, read):

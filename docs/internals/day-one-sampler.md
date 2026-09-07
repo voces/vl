@@ -111,9 +111,19 @@ Stated plainly, because a zero from an instrument is only as good as its frame.
 
 * **Anything outside the grammar.** Seventeen value shapes, six sources, nine delivery
   positions, six scopes, five neighbours; the module axis adds twenty-four units and nine
-  reports, and the imports axis twelve std modules. No generics with more than one parameter,
-  no recursive types, no operator overloading, no i32/f64 mixed arithmetic, no strings beyond
-  `+`/`.length`. Generics reach TWO parameters (`pass2<A, B>`) and no further. `std:` reaches the single-file axes only as an unused import
+  reports, and the imports axis twelve std modules. No operator overloading, no i32/f64
+  mixed arithmetic, no strings beyond `+`/`.length`. Generics reach TWO parameters
+  (`pass2<A, B>`) and no further.
+
+  **RECURSIVE types are in the grammar and bring their own limit**: `Node` (self-recursive
+  through a nullable field), `Tree` (through a list) and the mutually-recursive `Leaf`/`Branch`
+  are records, and `named_vs_inline` DECLINES all three — expanding a name inside itself does
+  not terminate, so the axis reports `NOT EXERCISED` rather than rendering a face that is a
+  different program. They ship with `rec_flat`, a NON-recursive record of the same field shape
+  and the same reads: it is the control that lets a hit say *recursion* rather than *this field
+  shape*, and on the sample that found D1889 it stayed green while `rec_mutual` did not.
+
+  `std:` reaches the single-file axes only as an unused import
   (the `unused_import` neighbour) and the imports axis only as one call per module, so no
   std VALUE — a `Json` tree, an `IoError`, a `Buf` — is ever delivered or read by the plans
   above. Each is a grammar record away, and none is there today.
