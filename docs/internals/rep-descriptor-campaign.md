@@ -1076,51 +1076,75 @@ has no type for their nodes. **The next family can start; it just cannot start b
 
 ---
 
-### 7.6 The four clamped-to-`0` slot producers — what `rdCovered == 0` needs, precisely
+### 7.6 The clamped-to-`0` ref-list slot — STEP 1 MEASURED, and it narrows four producers to one
 
-§6.6 named these four and §6.7 corrected who unblocks them; this states the build so the next
-lane does not re-derive it.
+§6.6 named four producers that turn `rlSlotByName`'s honest `-1` into slot `0` — a real row
+with a real wrapper heap type, which is what D1040, D1106 and D1500 each cost. §6.7 corrected
+who unblocks them. **Step 1 is now measured rather than reasoned, and it removes three of the
+four from the hazard.**
 
-**The four, and what each clamps.** All four answer a REF-LIST slot — an index into bank B,
-whose key column is `rlElemName` and whose heap-type column is `rlWrapIdx`:
+**Which clamps actually fire.** A probe in each clamp path, armed by `$VL_REP_SHADOW` and
+reported through the campaign's own bucket channel, over `tests/cases` (3,177 modules) and the
+distilled corpus (7,589 cells):
 
-| producer | its miss today |
-| --- | --- |
-| `letAnnRefListSlot(letIx)` | falls through to `tyAnnRefListSlot(d.letType)`, and returns a bare `0` for a non-`LetDecl` |
-| `tyAnnRefListSlot(tyIx)` | a bare `0` |
-| `refListSlotOfExpr(exprIx, fnIx)` | `rlSlotByName(refListElemNameOfExpr(…))`, then **clamped**: a `-1` becomes `0` |
-| `globalRefListSlot(letIx)` | `letRefListSlot(letIx, -1)`, then `if s < 0 { return 0 }` |
+| producer | calls | CLAMPED | modules |
+| --- | --- | --- | --- |
+| `tyAnnRefListSlot` | 166,759 | 106,256 — **every one `notRefList`** | 7,015 |
+| `refListSlotOfExpr` | 187,095 | **197** | **29** |
+| `globalRefListSlot` | 3,602 | **0** | 0 |
+| `letAnnRefListSlot` (its own non-`LetDecl` tail) | — | **0** | 0 |
 
-**The reader they all bottom out in is `rlSlotByName`** (`compiler/emit_classify.vl`), which is
-`rlSlotByNameTyK(name, -1, -1)`: four sequential rungs over bank B — an exact `rlElemName`
-match, an `rlElemKey` structural scan, `rlSlotOfTyTwin`, then a rendered `structIndexOfTypeName`
-bridge — ending in a real `-1`. **The decline exists and is honest at the bottom; it is lost at
-the top**, where each of the four turns it into slot `0`.
+**Three of the four are not the hazard, and each for a different reason:**
 
-**Why `0` is not a missing answer.** Slot 0 is a real row with a real wrapper heap type. The
-code says so itself: *"0 is a wrong answer, not a missing one — two such globals would
-otherwise share slot 0's wrapper wrongly. D1040."* Two more rows name the same shape at their
-own positions (D1106; D1500, where a slot clamped to 0 indexed an EMPTY table and trapped).
+* **`tyAnnRefListSlot` clamps constantly and correctly.** Its 106,256 fires split
+  `CLAMPED-isRefList` **0** / `CLAMPED-notRefList` **106,256**: the annotation is not a ref
+  list at all, so `0` is this function's honest "no row of mine", not a wrong slot. The
+  ref-list case — the one that would be D1040's shape — **never clamps** across 10,766
+  modules. Its comment reads as though it were the hazard; it is not.
+* **`globalRefListSlot`'s clamp is DEAD.** `if s < 0 { return 0 }` fires zero times.
+* **`letAnnRefListSlot`'s bare-`0` tail is DEAD** on the same evidence.
 
-**What the build needs, in order:**
+**So the live clamp is exactly one: `refListSlotOfExpr`, 197 fires across 29 modules** — seven
+in `tests/cases` (`list-concat-every-rep`, `list-eq-every-rep`,
+`eq-concat-type-param-under-constructor-runs`, `place-narrowed-array-element-emit`,
+`place-narrowed-nullable-array-element`, `array-needle-nullable-niche`,
+`array-struct-list-needle`) and 22 corpus cells. **Every one of them RUNS today**, so the
+hazard is latent rather than live — which is why it needs a measurement rather than a bisect.
 
-1. **The callers already test a decline.** `refListSlotOfExprStrict` is the unclamped twin of
-   `refListSlotOfExpr` and returns `-1` today, so a `-1`-tolerant path exists and is exercised.
-   The work is to find, per call site of the four, whether the consumer tests `>= 0` or indexes
-   blind — the clamp exists because some consumer indexes blind, and that consumer is what must
-   move first.
-2. **The decline must be `rdCovered == 0`, not `-1`.** A bare `-1` is the in-band sentinel one
-   level down; the descriptor's `repDescNone()` already carries "no answer" out of band, and
-   `repOfTy`'s `rdSlot` is where a ref-list slot belongs once bank B is a descriptor field.
-3. **`repOfTy` fills `rdSlot` for `TyObj` alone today** (from `repSlotOfTy`). Bank B is not
-   wired to it at all, so this is a genuine widening of the descriptor, not a re-routing — and
-   by §5.0's bar it is domain-KEEPING only if every current `0` answer that a program reaches
-   keeps answering `0`. Byte identity over both populations is what decides that, and a
-   difference is a price to name, not automatically a defect.
+**Those 29 modules ARE the control**, and they are a better one than a synthetic program: they
+already make the walk miss, they are re-graded by the corpus gate on every PR, and the probe
+attributes each miss to its producer. A hand-written candidate is not free to get right — a
+plain `P[] == P[]` plus `P[] + P[]` calls `refListSlotOfExpr` 37 times and clamps **zero** of
+them, so the miss needs a narrowed element or a nullable niche, which is exactly what five of
+the seven `tests/cases` modules already spell.
 
-**What it is NOT blocked on.** Not the binding surface (§6.7 refutes that), and not a ruling.
-It is blocked only on the work, and on step 1 being done first — narrowing the clamp before the
-consumers can take a decline is the §6.4 mistake in its other direction.
+**And its 74 call sites, classified** (`scripts/refslot-consumer-census.py`, which reads the
+tree so the split is re-derivable):
+
+```
+call sites: 74 {'GUARDED': 35, 'BLIND': 31, 'DIRECT': 8}
+```
+
+* **35 GUARDED — and every one of those guards is DEAD.** They compare a value the clamp
+  guarantees is never negative. This is the in-band-sentinel shape exactly: a helper answering
+  `0` for "cannot answer" makes every caller-side guard unreachable, so the code *looks*
+  defended and is not. Narrowing the clamp is what turns these 35 back into live guards, and
+  it is the strongest single argument for doing it.
+* **31 BLIND** — the value flows into an index, a writer or a record with no test. **These are
+  the clause-1 risk and they move FIRST.** Narrowing the clamp before they can take a decline
+  converts a silent wrong slot into a trap, which is §6.4's mistake in the other direction.
+* **8 DIRECT** — returned straight out; the caller's caller owns the question.
+
+**What step 2 therefore is, and what it is not.** It is 31 call sites, one at a time, each
+made to take a decline before the clamp narrows — not a rewrite of the four producers, three of
+which are now known not to need one. **Step 3 (widening `repOfTy`'s `rdSlot` to bank B) is not
+needed for step 2 either**: the consumers here take an `i32` slot, so the decline they must
+learn is an explicit `-1` test, and only a consumer that is already a descriptor reader would
+want `rdCovered == 0`. Saying which is which per site is step 2's own first move.
+
+**The probe stays in the tree**, armed-only and costing one boolean test unarmed, because
+"which clamps fire" is a standing question and this measurement is the only thing that
+separates the one live clamp from the three that are not.
 
 
 ---
