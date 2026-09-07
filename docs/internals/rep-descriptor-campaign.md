@@ -1823,4 +1823,60 @@ The comment is corrected in place. Comment-only, and the seed is **byte-identica
 proof the trim campaign uses, applied to a one-block edit.
 
 Ruled, not scheduled: the fall-through stays nominal. D1859 pins the five modules.
+### 11.8 `structIndexOfExpr`'s two sites — and the WOULD-FLIP bar every remaining site is graded on
+
+**First, the label moved.** `structIndexOfExpr#2` is POSITIONAL, and tranche 1 converting the
+first occurrence renumbered the rest. The four loud refusals belong to today's
+`structIndexOfExpr` (`emit_classify.vl:26231`); today's `#2` (26325) is inert on all six
+modules. Identify a held-back site by its FAILURE, never by the label an earlier sweep printed.
+
+**Site A (26231) is D1858's shape.** Its ladder is nominal → arena (`repRowOfTyStruct`) → a
+gated `structIndexOfTypeName`, so the bridge is already rung 3, and converting rung 1 promotes
+the fieldset scan above the arena rung. The order test reproduces all four refusals message for
+message with no conversion at all — `bare null needs a struct-typed context`, `index receiver is
+not an array or string`, `field access receiver is not a struct` ×2. These land LOUD rather than
+as invalid wasm, which is a better failure and still a lost build. Pinned as D1920.
+
+That makes **precedence a family, not a one-off**: `rlElemStructRow` and `structIndexOfExpr`
+both have their bridge downstream, and both break the same way when the nominal rung is
+promoted. The grep that finds the shape is still one line — does the same function already name
+`structIndexOfTypeName`?
+
+### Site B (26325), and the bar it forced
+
+Its comment read *"this arm … looks unreachable on today's surface. Unverifiable, so it keeps
+the name path until a shape reaches it."* Both halves are now measured, and they disagree with
+each other:
+
+| reading | `tests/cases` | distilled corpus |
+| --- | ---: | ---: |
+| rung EXECUTES | 0 | **1,922 in 31 modules** |
+| `reached-nominal-hit` | 0 | 1,922 |
+| **`WOULD-FLIP`** | 0 | **0** |
+| conversion: DIFFERING FILES | 0 | 0 |
+| conversion: diagnostics CHANGED | 0 | 0 |
+
+**"Unreachable" was true only of the population its author checked** — the corpus runs the arm
+constantly. But the conversion is still not licensed, and this is where byte identity misleads:
+`DIFFERING FILES: 0` on 10,799 modules reads like a green light, and it is **vacuous**, because
+the domain the conversion would change is entered ZERO times. Every one of the 1,922 executions
+is a name the nominal table already holds.
+
+> **THE BAR, for every remaining site: print WOULD-FLIP beside DIFFERING FILES.** A
+> byte-identical conversion is evidence only if the population can contain the disagreement —
+> the dual-run population rule, applied to this grader. `DIFFERING FILES: 0` with
+> `WOULD-FLIP: 0` means *untested*, not *safe*; `DIFFERING FILES: 0` with a positive WOULD-FLIP
+> is the reading that licenses a conversion. This is §5.0's `vtKindOfType` result seen from the
+> grader's side: nine rungs agreed everywhere, deleting them was byte-identical, and the oracle
+> went 2,963 → 204,539 CONTRADICT because the domain was never exercised.
+
+So site B keeps the name path — not for the reason its comment gave, and the comment is
+corrected to the measured one. No row: nothing about it flips, so a pin over it could not fail,
+and a row that cannot fail is not a row.
+
+**Where the five stand.** `elemNameIsNominalAt` inverted predicate (§11.5, D1857);
+`rlElemStructRow` precedence (§11.6, D1858); `rlElemLitStructRow` circular source (§11.7,
+D1859); `structIndexOfExpr` precedence (§11.8, D1920); `structIndexOfExpr#2` unexercised
+widening (§11.8, comment only). **Not one of the five was a rep gap.** `refArrShapeKindGo`
+— the diagnostic-mover of §11.3 — is the last unexamined one.
 
