@@ -290,6 +290,37 @@ The rule reaches only what the fmt gate reaches. `lint-self.sh`'s fmt half runs
 checked-in fixtures sat with unsorted import lists — see D1651 for the whole-tree count and
 which buckets are deliberate.
 
+## a list literal of SCALAR literals is FILLED, and uniform author rows are a table
+
+The owner's ruling (#2814), implemented in `arrayLiteral` / `wrapFill`. It applies only to a
+list literal — an object literal, a call argument list and a parameter list keep `wrapList`.
+
+```text
+A list literal that does not fit one line is filled — as many elements per
+continuation line as fit the 80-column budget — when EVERY element is a scalar
+literal: a number, a string, a char, `true`/`false` or `null`, optionally behind
+a unary sign. One intent rule: a literal the author already wrote as two or more
+rows, every row the same width of at least two, keeps those rows exactly. There
+is no opt-out comment.
+```
+
+Three consequences worth stating, because each is a decision and not a fall-out:
+
+* **The row width is read BEFORE the one-line form.** A 4×4 identity matrix fits on one line,
+  and collapsing it destroys exactly the shape the intent rule exists to protect.
+* **A one-per-line list is NOT a table.** That is the wrapped form the printer itself emits,
+  so the uniform-row test requires two elements a row. Without that floor the rule would pin
+  its own output and reach no already-formatted file.
+* **Any non-literal element takes the whole literal back to one per line** — a struct, a
+  closure, a nested list, a name, a call. Those carry their own vertical structure, and the
+  element test reads the TOKEN stream (one literal token, or a sign and one) rather than
+  laddering the node kinds.
+
+A comment inside the brackets pins its row: the literal is reproduced from source through
+`sliceFallback`, the same verbatim anchor `ifExpr` takes, so no reflow can move it (D1776).
+An object literal and a call argument list still eject one — that is D1777, deliberately not
+widened to here.
+
 ## the token-recovered declarations — `import`, a re-export, and `extern function`
 
 Three constructs the parser consumes WITHOUT minting an arena node, so the printer's walk

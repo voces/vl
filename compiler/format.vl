@@ -77,7 +77,9 @@ import {
   isOwnLineComment,
   joinLines,
   leadingSpaces,
+  nodeLastTok,
   nodePos,
+  nodeStartTok,
   normalizeProgram,
   parenForChain,
   rstrip,
@@ -2357,15 +2359,85 @@ function fieldKeyText(ix: i32, name: string) {
   name
 }
 
-function arrayLiteral(_ix: i32, node: ArrayLit, indent: i32, column: i32) {
+// A list element is a scalar literal when its whole span is one literal token — a number,
+// a string, a char, `true`/`false` or `null` — behind at most a unary sign. Read off the
+// token stream, which names one closed vocabulary, rather than laddering the node kinds.
+function elemIsScalarLit(ix: i32) {
+  const first = nodeStartTok(ix)
+  const last = nodeLastTok(ix)
+  if first < 0 || last < first { return false }
+  let t = first
+  if last != first {
+    const sign = P.toks[first].text
+    if last != first + 1 || (sign != "-" && sign != "+") { return false }
+    t = last
+  }
+  const k = P.toks[t].kind
+  k == "NUMBER" ||
+    k == "STRING" ||
+    k == "CHAR" ||
+    k == "TRUE" ||
+    k == "FALSE" ||
+    k == "NULL"
+}
+
+// Whether every element is a scalar literal, which is what the FILL layout is for. A
+// struct, closure or nested-list element carries its own vertical structure and stays one
+// per line (owner ruling, #2814).
+function arrElemsAllScalar(elems: i32[]) {
+  let i = 0
+  while i < elems.length {
+    if !elemIsScalarLit(elems[i]) { return false }
+    i = i + 1
+  }
+  true
+}
+
+// The elements the author put on each source line, when the literal is a 2-D table written
+// as a 1-D list: two or more rows, every row the same width, and that width at least two.
+// 0 otherwise — including the one-per-line form the formatter itself emits, which is a
+// wrapped list and not a table, so it pins nothing and refills.
+function arrUniformRow(elems: i32[]) {
+  let per = 0
+  let row = 0
+  let ln = -1
+  let i = 0
+  while i < elems.length {
+    const p = nodePos(elems[i])
+    if p < 0 { return 0 }
+    const l = lineOf(p)
+    if l != ln {
+      if ln >= 0 {
+        if per == 0 { per = row }
+        if row != per { return 0 }
+      }
+      ln = l
+      row = 0
+    }
+    row = row + 1
+    i = i + 1
+  }
+  if per < 2 || row != per { return 0 }
+  per
+}
+
+function arrayLiteral(ix: i32, node: ArrayLit, indent: i32, column: i32) {
   if node.arrElems.length == 0 { return "[]" }
+  // A comment inside the brackets pins the row it annotates, and none of the three layouts
+  // below has anywhere to put it: a reflowed comment falls through to the statement
+  // printer, which emits it after the whole declaration. So a literal carrying one is
+  // reproduced from source, the anchor `ifExpr` takes for the same reason (D1776).
+  if commentInCharSpan(nodePos(ix), nodeEndOf(ix)) { return sliceFallback(ix) }
   const items: string[] = []
   let i = 0
   while i < node.arrElems.length {
     items.push(expr(node.arrElems[i], indent + 1, column))
     i = i + 1
   }
-  wrapList("[", items, "]", indent, column)
+  if !arrElemsAllScalar(node.arrElems) {
+    return wrapList("[", items, "]", indent, column)
+  }
+  wrapFill("[", items, "]", indent, column, arrUniformRow(node.arrElems))
 }
 
 // A parenthesised expression `( inner )`. The self-host keeps explicit parens.
@@ -2500,6 +2572,43 @@ function blockExpr(ix: i32, node: Block, indent: i32) {
 
 // ── list wrapping (calls / arrays / objects / params) ─────────────────────────
 
+// The one-line `open item, item, … close` form, or "" when it does not fit from `column`
+// or an item carries a break. Both list layouts try this first, so the fit test and the
+// build live here once; `open` is never empty, so "" cannot be a real answer.
+function oneLineList(
+  open: string,
+  items: string[],
+  close: string,
+  column: i32,
+) {
+  // Sum the one-line width first — no string allocation. When it cannot fit `fmtWidth`,
+  // skip straight to the wrapped form without materializing `oneLine`. `dispWidth` is
+  // O(text) but still cheaper than the concatenation it guards, and it is a width:
+  // `.length` counts an em dash as three columns. A running `s = s + item` is O(n²).
+  let oneLineLen = dispWidth(open) + dispWidth(close) + (items.length - 1) * 2
+  let li = 0
+  while li < items.length {
+    oneLineLen = oneLineLen + dispWidth(items[li])
+    li = li + 1
+  }
+  if column + oneLineLen > fmtWidth { return "" }
+  const buf: i32[] = []
+  pushCps(buf, open)
+  let ii = 0
+  while ii < items.length {
+    if ii > 0 {
+      buf.push(',')
+      buf.push(' ')
+    }
+    pushCps(buf, items[ii])
+    ii = ii + 1
+  }
+  pushCps(buf, close)
+  const oneLine = fromCodePoints(buf)
+  if hasNewline(oneLine) { return "" }
+  oneLine
+}
+
 // Render `open item, item, … close`, collapsing to one line when it fits from
 // `column`, else one item per continuation line with a trailing comma after every
 // item (the wrapped form). An empty list is `open+close` trimmed.
@@ -2511,32 +2620,8 @@ function wrapList(
   column: i32,
 ) {
   if items.length == 0 { return trimWs(open) + trimWs(close) }
-  // Sum the one-line width first — no string allocation. When it cannot fit `fmtWidth`,
-  // skip straight to the wrapped form without materializing `oneLine`. `dispWidth` is
-  // O(text) but still cheaper than the concatenation it guards, and it is a width:
-  // `.length` counts an em dash as three columns. A running `s = s + item` is O(n²).
-  let oneLineLen = dispWidth(open) + dispWidth(close) + (items.length - 1) * 2
-  let li = 0
-  while li < items.length {
-    oneLineLen = oneLineLen + dispWidth(items[li])
-    li = li + 1
-  }
-  if column + oneLineLen <= fmtWidth {
-    const buf: i32[] = []
-    pushCps(buf, open)
-    let ii = 0
-    while ii < items.length {
-      if ii > 0 {
-        buf.push(',')
-        buf.push(' ')
-      }
-      pushCps(buf, items[ii])
-      ii = ii + 1
-    }
-    pushCps(buf, close)
-    const oneLine = fromCodePoints(buf)
-    if !hasNewline(oneLine) { return oneLine }
-  }
+  const oneLine = oneLineList(open, items, close, column)
+  if oneLine.length > 0 { return oneLine }
   const pad = indentStr(indent + 1)
   const closePad = indentStr(indent)
   const openTok = rstrip(open)
@@ -2552,4 +2637,57 @@ function wrapList(
   }
   const body = fromCodePoints(bodyBuf)
   openTok + "\n" + body + closePad + closeTok
+}
+
+// Render `open item, item, … close` as a TABLE: exactly `perRow` items per continuation
+// line when the author wrote uniform rows, else one line when it fits from `column`, else
+// as many per line as fit `fmtWidth`. The row width is read BEFORE the one-line form, which
+// is what keeps a 4×4 matrix a matrix. Every row ends in a comma, as the wrapped form (#2814).
+function wrapFill(
+  open: string,
+  items: string[],
+  close: string,
+  indent: i32,
+  column: i32,
+  perRow: i32,
+) {
+  if perRow <= 0 {
+    const oneLine = oneLineList(open, items, close, column)
+    if oneLine.length > 0 { return oneLine }
+  }
+  const pad = indentStr(indent + 1)
+  const padW = dispWidth(pad)
+  const buf: i32[] = []
+  pushCps(buf, rstrip(open))
+  // `row` counts the items already on the line and `w` is that line's width, the pad
+  // included. The break test only fires once the row is non-empty, so an item wider than
+  // the whole budget still takes a line of its own rather than none.
+  let row = 0
+  let w = 0
+  let i = 0
+  while i < items.length {
+    const iw = dispWidth(items[i]) + 1
+    let brk = row == 0
+    if row > 0 {
+      if perRow > 0 { brk = row >= perRow } else { brk = w + 1 + iw > fmtWidth }
+    }
+    if brk {
+      buf.push('\n')
+      pushCps(buf, pad)
+      w = padW
+      row = 0
+    } else {
+      buf.push(' ')
+      w = w + 1
+    }
+    pushCps(buf, items[i])
+    buf.push(',')
+    w = w + iw
+    row = row + 1
+    i = i + 1
+  }
+  buf.push('\n')
+  pushCps(buf, indentStr(indent))
+  pushCps(buf, trimWsStart(close))
+  fromCodePoints(buf)
 }
