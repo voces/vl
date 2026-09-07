@@ -19,6 +19,7 @@ import {
   gaeLtAt,
   groupInnerOf,
   listElemNameOf,
+  mapSpellValName,
   nameIsArray,
   nameIsFuncTypeAtom,
   nameIsMapOpen,
@@ -4786,30 +4787,24 @@ export function mAssignTypeIndices(_n: i32) {
 // not the same as being collected — a spelling this accepts whose flag nothing sets still emits
 // a module with no i32-key scratch frame, `vl check` rc 0 and invalid wasm (ROADMAP B6a).
 function i32MapSpellingLowerable(name: string) {
-  let bare = name
-  // A top-level function type (`() => {[i32]: V}`) delegates to its return spelling: the
-  // closure-result boundary carries the map's shape (`cloRetValSlot`), the same key-paired slot
-  // every other boundary carries. The arrow must be top-level, so an array of such closures is
-  // not peeled here and stays a loud reject.
-  const fr = annRetNameOf(name)
-  if fr != "" { bare = fr }
-  // An array of maps (`{[i32]: V}[]`, and the `({[i32]: V} | null)[]` niche whose one layer of
-  // grouping parens `listElemNameOf` strips): peel to the element and ask the same question of
-  // it. One `[]` only, so `{[i32]: V}[][]`, whose inner-list element row is a ref-list slot of
-  // its own, keeps the loud reject rather than a guess.
-  const ae = listElemNameOf(bare)
-  if ae != "" { bare = ae }
-  const inner = nulMapInnerName(bare)
-  if inner != "" { bare = inner }
-  if nameIsMapSpanEnds(bare) && nameIsI32KeyedMap(bare) { return 0 }
+  const bare = i32MapPeelWrappers(name)
+  if nameIsMapSpanEnds(bare) {
+    if nameIsI32KeyedMap(bare) { return 0 }
+    // A map whose VALUE mentions an i32-keyed map (`{[string]: {[i32]: V}}`): the inner map is
+    // delivered exactly as any other map value is, so ask this same question of it.
+    const mv = mapSpellValName(bare)
+    if strContains(mv, "{[i32]:") { return i32MapSpellingLowerable(mv) }
+    return 0
+  }
   // A shape spelling — an inline struct annotation or an inline union arm — delegates to its
   // fields. This is the one position whose map is invisible to the scan that reaches this gate:
   // the whole shape is one `TypeRef` name. Each field text is asked this same question, so the
   // set a field may hold is exactly the set any other position may hold, and nothing wider.
   if nameIsShapeSpanEnds(bare) { return i32MapShapeFieldsLowerable(bare) }
   // A union spelling (`{f: {[i32]: V}} | i32`): every member that mentions an i32-keyed map must
-  // be a struct arm, asked as the shape above. A member that is the map itself, boxed, is
-  // deliberately not peeled — the box carries no map shape, so it stays a loud reject.
+  // be a struct arm, asked as the shape above. A member that IS the map stays refused — the box
+  // records no map STRUCT, so an `is {[i32]: V}` read casts to whichever the name scan claimed,
+  // which is invalid wasm rather than a diagnostic (`open-rulings.md` §B6a-map-in-union-box).
   if unionMemberCount(bare) > 1 {
     const atoms: string[] = []
     splitUnionAtoms(bare, atoms)
@@ -4828,17 +4823,57 @@ function i32MapSpellingLowerable(name: string) {
   i32MapSpellingUnsupported(name)
 }
 
+// Strip the wrappers that carry a map's shape through to its leaf, to a FIXPOINT: a function
+// type's return, one list layer, one `| null` niche, and a grouping paren that hides an arrow.
+// A fixpoint rather than one pass of each, so `{[i32]: V}[][]` and an array of map-returning
+// closures reach the same leaf their one-layer twins do.
+function i32MapPeelWrappers(name: string) {
+  let bare = name
+  let peeling = true
+  while peeling {
+    peeling = false
+    const fr = annRetNameOf(bare)
+    if fr != "" {
+      bare = fr
+      peeling = true
+    }
+    // A grouping paren is stripped only when it REVEALS a top-level arrow (the cut is
+    // `tyname.peelGroupParens`), so a parameter list is never mistaken for one.
+    if annRetNameOf(bare) == "" {
+      const gi = peelGroupParens(bare)
+      if gi != bare {
+        if annRetNameOf(gi) != "" {
+          bare = gi
+          peeling = true
+        }
+      }
+    }
+    const ae = listElemNameOf(bare)
+    if ae != "" {
+      bare = ae
+      peeling = true
+    }
+    const inner = nulMapInnerName(bare)
+    if inner != "" {
+      bare = inner
+      peeling = true
+    }
+  }
+  bare
+}
+
 // The gate's reject, named once: three sites raise it — the leaf test above, the union arm's
 // non-shape member, and a shape's field through the recursion — and the message must not drift
 // between them. Each position the message names is exercised by a corpus case and lowers today;
-// a map value is deliberately absent, since `{[string]: {[i32]: boolean}}` reaches this reject.
+// what it does NOT name is a union member that IS the map, whose box records no map struct.
 function i32MapSpellingUnsupported(name: string): i32 {
   emitFail(
     "emitProgram: an i32-keyed Map/Set is supported as a binding / parameter / " +
-      "return / `| null` / an ARRAY ELEMENT / a closure result — not inside '" +
+      "return / `| null` / an ARRAY ELEMENT at any depth / a closure result / a " +
+      "MAP VALUE / a struct or variant FIELD — not inside '" +
       name +
-      "'. A STRING-keyed map lowers in every position; otherwise bind the i32-keyed " +
-      "map on its own and pass it where you need it.",
+      "'. A union member that IS the map is the one position left: the box records no " +
+      "map struct. Bind the i32-keyed map on its own and pass it where you need it.",
   )
 }
 

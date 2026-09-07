@@ -475,6 +475,54 @@ changes which program is legal rather than how a legal one compiles. None blocks
 recommendation is the coordinator's; the witness is the row's own `Repro:`, re-run by the
 `filed witnesses` gate, so a ruling can be graded the day it lands.
 
+### B6a-map-in-union-box — may a MAP be a union member, or does the box need a struct column? — raised 2026-09-07
+
+`const u: {[i32]: i32} | i32 = m` refuses with `an i32-keyed Map/Set is supported as … not
+inside '{[i32]:i32}|i32'`, and it is the ONE container position left after B6a opened the other
+three (a nested array element, an array of map-returning closures, a map value). The refusal was
+argued from the rep and is now MEASURED: opening the arm made
+`tests/cases/maps/error-i32-keyed-position-union-member.vl` — an `is {[i32]: i32}` narrowed read
+through the box — `vl check` rc 0 and then invalid wasm, `type mismatch: expected (ref null
+$type), found (ref $type)`. So the position is a clause-1 miscompile away from legal, not a peel
+away.
+
+The mechanism is the box's shape. A union member lowers into `{tag, value}` with an `anyref`
+payload, and the tag records the MEMBER, not the map STRUCT — while a map's struct is per (key
+rep, value rep). The unbox at an `is`-narrowed read therefore casts to whichever struct the
+member NAME scan claimed, which is right only when the program has exactly one map struct.
+**The STRING-keyed twin runs today** — `{[string]: i32} | i32` is accepted — which is not
+evidence the position is sound: it is evidence that one map struct is the common case and the
+cast happens to hit it.
+
+**Options.**
+(a) **Keep refusing, with the sentence naming the fix** — as it does now: bind the map on its
+own and pass it where you need it, or wrap it in a one-field struct arm (`{m: {[i32]: i32}} |
+i32`, which runs today because a FIELD row carries the key). Costs nothing; the refusal is
+already loud and already names both spellings.
+(b) **Give the box a struct column** — a second immediate beside the tag, recording which map
+struct the payload holds, read by the unbox. Correct for every member kind, and the widest
+change: the box is the union rep's shared currency, so every producer and consumer of it moves,
+and the `{tag, anyref}` pair the whole union family is built on becomes `{tag, structIdx,
+anyref}`.
+(c) **Give a map member its own NICHE, not the box** — a union of exactly one map and one scalar
+could rep as a nullable map ref, the way `boolean | null` reps as an i32 sentinel and `S | null`
+as a nullable struct ref. Cheapest of the two builds and narrowest: it answers only for unions
+whose non-map members are all niche-able, and the general `{[i32]: V} | {[string]: V} | i32`
+still needs (b).
+
+**Peers.** TypeScript erases to one runtime `Map`, so the question does not arise. Rust's
+`enum` carries the variant's full type in its own payload — the equivalent of (b), paid for by
+every enum. Go's interface value is a (type pointer, data pointer) pair, which is exactly (b)'s
+struct column, and Go pays it everywhere. Swift's existential box is (b) as well, with a witness
+table. So every statically-typed peer that admits this either pays (b) globally or does not have
+a shared box at all.
+
+**Recommendation: (a) for now, (c) when a program needs it.** Nothing in the tree or the corpus
+spells a map union member, the refusal is loud and names two working spellings, and (b) is a
+change to the union rep's shared currency for one member kind. (c) is the honest middle and can
+be built the day a witness asks for it, without touching the box. What (a) must NOT do is stay
+UNDOCUMENTED: the position is the only one the message now excludes, so it is named there.
+
 ### B8-for-struct — may a `for` loop iterate a STRUCT's fields? — raised 2026-09-07
 
 `const p: P = { a: 1, b: 2 }; for k in p { print(k) }` refuses with
