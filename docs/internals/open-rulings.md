@@ -475,7 +475,9 @@ changes which program is legal rather than how a legal one compiles. None blocks
 recommendation is the coordinator's; the witness is the row's own `Repro:`, re-run by the
 `filed witnesses` gate, so a ruling can be graded the day it lands.
 
-### backtick-strings-second-form — do backticks earn their place beside `"…"`?
+### backtick-strings-second-form — do backticks earn their place beside `"…"`? — RULED 2026-09-06
+
+**Ruling (owner, 2026-09-06):** fold (Rust's rule): an ordinary `"…"` string may span lines and keeps the newline; a `\` before a newline joins the next line and strips its leading whitespace; backticks are removed. The formatter preserves interior newlines; an unterminated string is reported at its opening quote.
 
 **Measured 2026-09-05:** interpolation (`\{x}`) works in ordinary `"…"` strings; the ONLY
 thing a backtick literal adds is a literal newline inside the string. There is no raw-string
@@ -490,7 +492,9 @@ literal". (a) costs the formatter a new invariant for a form almost nobody write
 the one honest use case worse. Grading: `tests/cases/strings/*` and `vl fmt --check` over the
 tree, both of which exercise every current backtick.
 
-### D1680 / D1665 — is a nullable MAP a type the design admits everywhere?
+### D1680 / D1665 — is a nullable MAP a type the design admits everywhere? — RULED 2026-09-06
+
+**Ruling (owner, 2026-09-06):** yes, everywhere — a map is a reference like a struct. D1680 and D1665 are capability rows.
 
 A nullable map already RUNS as a local (`const m: {[string]: i32} | null`) and as an
 ANNOTATED struct field (D1665's control); it refuses under a standalone `?.` (D1680) and in an
@@ -499,7 +503,9 @@ no ruling — D1665 is on a fix lane now. **Recommendation: yes** — the altern
 never nullable; use an empty map) is a rule the checker does not state and two running
 spellings already contradict.
 
-### D1712 — is `A | i32` the same type as `i32 | A`?
+### D1712 — is `A | i32` the same type as `i32 | A`? — RULED 2026-09-06
+
+**Ruling (owner, 2026-09-06):** (a) — a union is a SET; order never matters. The registry keys a canonical member order and box tags are positional in that order. D1712 closes as a capability row once the keying lands.
 
 The `??` join keys its registry row on the OPERAND's member order, so the same union declared
 the other way round is a different key and check-clean invalid wasm. The standing ABI note
@@ -514,7 +520,9 @@ expects it; the cost is one canonicalisation at registration and a rule that a b
 member's index in the CANONICAL sequence. D1737/D1738/D1733's closes (#2754, #2760) were built
 so they invent no order and are neutral to this ruling.
 
-### D1730 — may a `const` NAME key a narrowed place?
+### D1730 — may a `const` NAME key a narrowed place? — RULED 2026-09-06
+
+**Ruling (owner, 2026-09-06):** (a) — yes for a `const` index, never for `let`, and ONLY where the subscript is the built-in list or map index: index dispatch is user-definable (`"[]"` free functions, B13/B14) and a user `"[]"` is a call, never narrowed. The message is corrected regardless.
 
 `if xs[i] is A { print(xs[i].r) }` with `const i = 0` accepts the `is` test and refuses the
 read it narrowed, telling the author to do the thing they did (the MESSAGE is wrong either way
@@ -524,7 +532,9 @@ a name-derived key needs a definite-assignment argument the narrowing stack does
 `let i` must be excluded by a rule that does not exist. **Recommendation: yes, for `const`
 bindings only** (a `let` index keeps the refusal, with a message that says why).
 
-### D1736 — does an `is T` pin survive a `while` loop's re-execution barrier?
+### D1736 — does an `is T` pin survive a `while` loop's re-execution barrier? — RULED 2026-09-06
+
+**Ruling (owner, 2026-09-06):** (a) — yes; an `is` pin at a loop head is the null strip's twin, retired by a write to the receiver exactly as `!= null` is. D1736 is a capability row.
 
 `while v != null { … }` narrows the body; `while v is A { … }` refuses. The code's stated
 reason ("only a null strip re-narrows, never an `is T` pin; the body is re-tested every
@@ -533,7 +543,11 @@ the write-retire machinery covers a body that assigns. **Recommendation: yes** �
 is a null strip's twin at the loop head, with the same retirement on a write to the receiver.
 If the answer is no, the row closes as DESIGN with a message that names the loop, not the `is`.
 
-### D1686 / D1687 — what does the design owe a covariant list the closure cannot follow?
+### D1686 / D1687 — what does the design owe a covariant list the closure cannot follow? — RULED 2026-09-06
+
+**Addendum (owner, 2026-09-06):** type-level readable/writable semantics were in the original plan as ROADMAP A9 ("Readable/Writable variance", unstarted; `modules-design.md` §exports depends on it). Priority is the coordinator's call: A9 is BACKLOGGED and the list view is built alone for now, spelled so A9 can subsume it.
+
+**Ruling (owner, 2026-09-06):** (a) — a read-only list view that is covariant; mutable lists stay invariant. The view is SHALLOW: it forbids writes to the list's shape (`push`/`pop`/`clear`/index assignment/`"[]="`) and says nothing about an element's own fields, as Kotlin's `List` and C#'s `IReadOnlyList` do. The keyword's spelling (`readonly T[]` proposed) and whether a parameter defaults to read-only are the build's questions, not this ruling's. D1686/D1687 close as DESIGN today and reopen as the view's grading list.
 
 The covariant-write analysis licenses a read-only copy of a `Circle[]` delivered as `Shape[]`
 only where it can see every write; it declines a container reached through an unnamed call
@@ -545,7 +559,9 @@ read-only in the type** (a `readonly Shape[]` parameter, or a distinct read-only
 until it exists**; the refusal today names a contract ("delivered to a callee whose body this
 program can point at, and to no other") and is honest.
 
-### fmt-fill-style-scalar-lists — how does `vl fmt` lay out a long scalar list?
+### fmt-fill-style-scalar-lists — how does `vl fmt` lay out a long scalar list? — RULED 2026-09-06
+
+**Ruling (owner, 2026-09-06):** (a), fill scalar-literal lists, with one deterministic intent rule: if the author's literal already has two or more rows and every row holds the same number of elements, the rows are kept (a 2-D table written as 1-D); otherwise fill. No opt-out comment.
 
 Today a list literal that does not fit on one line goes one element per line, so a 200-entry
 `u8[]` table is 200 lines. **Options.** (a) fill-style (as many elements per line as fit,
@@ -553,7 +569,9 @@ wrapped at the column) for lists whose elements are ALL scalar literals; (b) one
 always. **Recommendation: (a)**, scalar literals only — anything with a struct, closure or
 nested list element keeps one-per-line, so the rule is decidable from the element kinds alone.
 
-### D1773 — a negation type in a many-values-per-slot position: refused, by design or by gap?
+### D1773 — a negation type in a many-values-per-slot position: refused, by design or by gap? — RULED 2026-09-06
+
+**Ruling (owner, 2026-09-06):** a WRITTEN negation type (`!T` in any annotation — binding, alias, parameter, element, field, map value, return) is refused by the checker with one sentence; `x !is T` narrowing over a union stays, since there the "not T" is subtracted from a known set and is never written. Full negation tracking waits for A4/A12. D1773, D1775, D1784 (unfiled: D1784), D1785 (unfiled: D1785) and D1800 (unfiled: D1800) close as DESIGN — the last three were filed on PRs closed unmerged and are re-filed by the refusal lane; #2790's alias-transparency rungs are removed by the refusal lane; #2807 and #2813 were closed unmerged.
 
 `type N = !string` is a checker-only refinement with no rep of its own, so a BINDING takes its
 initializer's rep and now runs (D1775, #2790; D1773's nine owed cells, #2807). The ten cells
