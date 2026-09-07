@@ -166,7 +166,7 @@ per-landing number".
 measures and this row now needs the binary and a working seed where the Python needed neither.
 The port is graded by having run BESIDE the Python it replaced, output for output, and the
 three places they could not agree are named and asserted in
-`tests/vl_seed_size_port_test.ts` rather than tolerated: the rounding of the one-decimal
+`tests/vl_seed_size_test.ts` rather than tolerated: the rounding of the one-decimal
 percentage (`std:fmt` has no fixed-precision renderer — `open-rulings.md` §D
 `fmt-fixed-precision`), the tool its own regressed message names, and the STREAM a loud
 failure uses (VL has no stderr sink, so what the Python raised through `SystemExit` is printed

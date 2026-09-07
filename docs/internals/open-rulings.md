@@ -477,6 +477,45 @@ recommendation is the coordinator's; the witness is the row's own `Repro:`, re-r
 the exception that proves the shape: they are std API asks rather than defects, so their
 witness is a script in this tree that cannot be ported, cited by line.
 
+### cw-unknown-write-default — one column, two readers, opposite defaults on UNKNOWN — raised 2026-09-07
+
+`covarValueWriteState` answers a covariant list's write state as **0** (nothing writes it),
+**1** (something does) or **2** (unknown). Two callers read that one column and disagree about
+what `2` means.
+
+`covarWriteThrough` — the soundness gate on a covariant list assignment — gates on
+`covarValueWriteState(root, rootFr) != 1`, so an UNKNOWN answer falls through as "nothing
+writes it" and the assignment is **admitted**. Its sibling, the converting-copy licence in
+`objShapeAdapterless`, states the opposite convention in its own comment: *"An unknown write
+state (2) keeps the refusal."*
+
+The asymmetry is live, not theoretical. [D1799](inventory/D1799.md) is the witness: a write
+through a mutable generic list parameter at a monomorphization pin is `vl check`-clean and the
+write is silently lost (prints `1`, no trap), while the non-generic twin refuses `push: cannot
+add Shape to Circle[]`. An instrumented checker shows the closure answering honestly —
+`cwGrowCall` declines the UFCS callee, so the set never grows into the callee and the answer is
+`ans=2` — and `covarWriteThrough` then reading that `2` as a licence.
+
+**Options.**
+(a) **Both refuse on `2`.** Sound by default, and it closes every unknown-shaped hole at once
+    rather than one witness at a time. The cost is real and must be read before it is taken:
+    every covariant list assignment whose write state the closure cannot settle would begin to
+    refuse, and some of those run today. The corpus's check-reject columns are the instrument —
+    every new refusal listed by cell — and the number is not yet measured.
+(b) **Both admit on `2`.** Matches the permissive path already shipping and costs nothing today,
+    but it keeps D1799's hole open unless rungs 1 and 2 of that row close it on their own, and it
+    makes "unknown" mean "safe" in a soundness gate, which is the shape that produced D1799.
+(c) **Leave the asymmetry and document it** — the two callers genuinely want different defaults,
+    the licence being an optimisation (where `0` must be certain) and the gate a refusal (where
+    `1` must be certain). Cheapest, and it leaves a reader of the column unable to know which
+    convention applies without reading both callers.
+
+**Recommendation: (a), after D1799's rungs 1 and 2 land**, graded by the corpus's check-reject
+columns. Rungs 1+2 shrink the unknown population first — the closure stops declining the UFCS
+edge, so fewer values answer `2` at all — which is what makes (a)'s price affordable and
+measurable rather than a guess. Taking (a) first would refuse programs that rung 1 would have
+answered precisely.
+
 ### B6a-map-in-union-box — may a MAP be a union member, or does the box need a struct column? — raised 2026-09-07
 
 `const u: {[i32]: i32} | i32 = m` refuses with `an i32-keyed Map/Set is supported as … not
@@ -708,7 +747,7 @@ bindings only** (a `let` index keeps the refusal, with a message that says why).
 
 ### D1736 — does an `is T` pin survive a `while` loop's re-execution barrier? — RULED 2026-09-06, REOPENED the same day, BUILT 2026-09-06 night
 
-**BUILT 2026-09-06 (PR "narrowing applies to READS: a write is checked against the declared type and re-narrows the binding, so an `is` pin narrows a `while` body too").** The re-ruling as written: the assignment gate asks `writeStorageTy` unconditionally, `retireNarrowingsForWrite` puts the declared type back in place and shadows the written member in the current block, and the member is banked at the assignment node so the emitter selects it out of the declared set. `checkWhileStmtNode`'s null-strip filter and `narrowStripNullOnly` are both gone; `narrowBareIdentOnly` holds the loop body, mirroring the checker's `isPathKey` test, so a loop still declines a property path. The rule's one cost is the POST-GUARD RESIDUAL, which an arm's write can now falsify — both halves drop it for a clobbered name (`pgResidualVoidOf`), so `if x is string { return 0 } else { x = "clobbered" }` is legal and the read below the chain is at the declaration. `runs -> not-runs` 0, `-> silent` 0, byte-identical in 2,580 of 2,580 buildable modules. The contract fixture named below is now `tests/cases/loops/while-body-is-guard-narrows.vl` and asserts the narrowing; the two `soundness/*-narrowed-write-reject.vl` files are `soundness/guard-else-write-voids-residual.vl` and `soundness/elseif-chain-write-voids-residual.vl`. D1736 closes as a built capability row.
+**BUILT 2026-09-06 (PR "narrowing applies to READS: a write is checked against the declared type and re-narrows the binding, so an `is` pin narrows a `while` body too").** The re-ruling as written: the assignment gate asks `writeStorageTy` unconditionally, `retireNarrowingsForWrite` puts the declared type back in place and shadows the written member in the current block, and the member is banked at the assignment node so the emitter selects it out of the declared set. `checkWhileStmtNode`'s null-strip filter and `narrowStripNullOnly` are both gone; `narrowBareIdentOnly` held the loop body, mirroring the checker's `isPathKey` test, so a loop still declined a property path — the limit filed as D1845 and closed the next day. The rule's one cost is the POST-GUARD RESIDUAL, which an arm's write can now falsify — both halves drop it for a clobbered name (`pgResidualVoidOf`), so `if x is string { return 0 } else { x = "clobbered" }` is legal and the read below the chain is at the declaration. `runs -> not-runs` 0, `-> silent` 0, byte-identical in 2,580 of 2,580 buildable modules. The contract fixture named below is now `tests/cases/loops/while-body-is-guard-narrows.vl` and asserts the narrowing; the two `soundness/*-narrowed-write-reject.vl` files are `soundness/guard-else-write-voids-residual.vl` and `soundness/elseif-chain-write-voids-residual.vl`. D1736 closes as a built capability row.
 
 **Reopened (2026-09-06, #2821):** built as ruled, the pin refuses the write that terminates a loop over a union — `while (x is i64) { … x = true }` (`tests/cases/unions/paren-is-narrow.vl`) became `cannot assign boolean to i64`, a `runs → not-runs` on a corpus program, and `tests/cases/loops/while-body-is-guard-not-narrowed.vl` is a standing contract that predicted it. The same rule holds in an `if` today (`if x is i64 { x = true }` is refused): a narrowed binding's type is also what it ACCEPTS. The question is about writes, not loops. **Options.** (a) narrowing applies to READS only; a write is checked against the declared type and re-narrows the binding to what was written — TypeScript's and Kotlin's rule; `if` and `while` then both narrow and the loop is legal; it changes what an `if` branch accepts today. (b) keep "the narrowed type is what it accepts"; `while` bodies stay un-narrowed by `is`; D1736 closes as DESIGN with the contract fixture as its witness. **Recommendation: (a).**
 
