@@ -213,6 +213,11 @@ zero elements and is correct without a guard.
 one wasm type; a `Circle[]` into a `Shape[]` destination is a different heap type and needs
 D791's element-converting loop. See §5.
 
+`u8[]` is the one rep with no element that spells it — the backing is `(array (mut i8))` where
+every other i32-element list is `(array (mut i32))` — so every classifier that reads a literal's
+elements has to ask `spreadDestKind` instead. The module-global cell ladder is where that was
+missed (D1850); a mixed `[...bs, 9]` is still a loud refusal (D1852).
+
 ### 3.3 `push`
 
 `push` becomes variadic — conceptually `push(self: T[], ...vs: T[])` — but it is a builtin, not
@@ -299,11 +304,6 @@ and array printers both route their items through `expr()`, one arm serves both 
 
 ## 5. What is NOT built, named
 
-* **A `u8[]` SOURCE, at every spelling** — D1850. `u8[]` is the one list whose element does not
-  identify its rep (an `(array (mut i8))` backing where every other i32-element list is
-  `(array (mut i32))`), so an un-annotated destination binds the i32 cell while the spread
-  builds the packed wrapper. Refused in the checker rather than left as invalid wasm; the
-  sentence names `bs.slice(0)`, which copies one at every rep.
 * **A covariant spread source.** `Circle[]` spread into `...Shape[]` (where `Shape = Circle | Sq`)
   is refused, because `array.copy` relates one wasm array type and the two lists have different
   heap types. The element-converting copy D791 built for the ordinary covariant delivery is the
