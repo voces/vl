@@ -1573,9 +1573,24 @@ in-language GC knobs.
         `sentinel-index-unguarded` 0 → 21, because that lint's contract is within one function
         and the guard is the evidence it needs at each read. The campaign's bar in a third
         form: do not move a guard out of the reach of the checker that verifies it.
-     7. ⬜ **The slot layer, last** — `structIndexOfExpr`, `rlSlot*`, `mvSlot*`,
-        `exprVariantIndex`. `rdSlot` is nominal where the rest of the descriptor is
-        structural, and nothing earlier depends on it.
+     7. 🟡 **The slot layer** — SURVEYED, and it is two things. **183 PRODUCERS** over four
+        parallel-column banks (struct / ref-list / variant / map-value, each with 1-5 writers
+        and 100-174 readers), of which 42% take an AST node and 12% an arena type: they decide
+        a rep from raw input, none is a `match` because they PRODUCE the kind rather than
+        switch on it, and their `-1` tails are load-bearing. Converting them needs the
+        descriptor and therefore item 3's binding half — next phase, not this one. **A
+        13-function CONSUMER rim** takes a `VKind` and a slot together; four were `_`-less
+        matches after #2862 and the fifth, `armDestHeapOf`, is one now (byte-identical in
+        3,172 + 7,589, seed +14). Two hazards named for the next phase: four producers clamp a
+        miss to `0` rather than declining (D1040's shape), and the kind and the slot are
+        derived by two ladders that must agree (D244, D1737, D1040, D1106).
+     **PHASE 1 CLOSED.** Six landings, net seed **+4,073 bytes**, every one byte-identical on
+        both populations bar D1834's own fixture. Two contradictions found and closed (D1834;
+        `vtKindOfType`'s five missing nullable-scalar-list rungs, 2,963 → 178). The bar earned
+        three forms, each from a candidate an instrument refused: do not REMOVE a domain
+        (oracle 2,963 → 204,539), do not WIDEN one (8 modules `rc=0 → rc=1`), and do not move
+        a GUARD out of reach of the lint that verifies it (`sentinel-index-unguarded` 0 → 21).
+        Scoreboard: `docs/internals/rep-descriptor-campaign.md` §7.
      Two owner rulings gate how far items 2 and 6 can go: `one-literal-union-rep` and
      `nullable-rep-rule-stated-once` (`docs/internals/open-rulings.md` §D).
      REMAINING legacy items: (a) widen `repOfTy` coverage (typed-value maps,
