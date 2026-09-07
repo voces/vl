@@ -56,7 +56,7 @@ units: **hours** · **half-day** · **days**.
 | 22 | **B-debug — a trap frame names `function@file:line`; the LINE is the DECLARATION's, not the trapping instruction's (2026-09-07)** | `print(a[7])` → `vl!__start__@1`; a two-file program → `vl!boom$m1@lib.vl:1` and `vl!__start__@main.vl:1`. The message still carries no index or length, and a frame still cannot say WHICH line inside the function trapped | the per-instruction map is what remains: a name-section string is per FUNCTION, so the trapping line needs a real source map (a custom section the host reads) — and the host would then change, with the three-hosts rule | days |
 | 23 | **D9.11 — `///` docs reach HOVER; COMPLETION's `doc` field is still filled by nobody** | hover renders them in the editor and the playground (2026-09-07); `Completion.doc` in `lsp/src/typeFeatures.ts` is documented as the declaration's `///` block and no wasm-path producer sets it, so the completion panel shows the type alone | `symScopeAt` already banks the decl token per result (`scopeResTok[i]`), so `symScopeDoc(i)` is one accessor pair over the `docRunAbove` the hover query built, plus the `scopeAt` bridge and the scope→completion mapping | hours |
 | 24 | **dogfood `match` over the compiler's own kind ladders** | the `Ty` set is DONE in the two biggest files: `emit_collect.vl` 38 → 32 (six) and `emit_classify.vl` 134 → 108 (twenty-six), all `_`-less with every member named, every output population byte-identical. The per-file table of what is left and why is `kind-ladder-lint.md` §Where the `Ty` set ran out | remaining: `typecheck.vl` (152) is unsurveyed; `VKind`'s 31, `RtKind`'s 15 and `EqCmpKind`'s 17 each need the sub-domain-litunion ruling before a 31-arm match is honest; `Node`'s 38 is excluded by the rule. `ladder-budget.py` reads 401 + 8 today | days |
-| 25 | **structural-tolerant emitter (rep architecture step 1)** | half migrated: `structIndexOfTypeName` 50 uses vs `structIndexByName` 56 | `emit_classify.vl` (53 of the nominal uses) | days, opportunistic |
+| 25 | **structural-tolerant emitter (rep architecture step 1)** — **20 of 37 caller sites CONVERTED; 17 remain and each has a measured reason** | the migration criterion is per site and is now measured, not guessed: a per-site oracle over 10,793 modules says 25 sites receive a structural name the nominal resolver declines, 12 never do. Of the 25, **20 convert byte-inert** and 5 are held back by witness — 4 lose builds, 1 moves a diagnostic | `emit_classify.vl`; the five held-back sites and their witnesses are `rep-descriptor-campaign.md` §11 | half-day for the five, each needs its own fix |
 | 27 | **E3 — user wasm runs on the playground's MAIN thread** | `playground/src/runtime.ts:21` instantiates there; `main.ts:36` says so | `playground/src/{runtime,playground,main}.ts` | days |
 | 28 | **F-tiers / J1 — collapse the redundant corpus runner** | 8 files execute emitted wasm under V8 via `tests/support/runWasm.ts` | `tests/support/casesWasmOracle.ts` + 4 shards + 4 standalone suites | days |
 | 29 | **F-day-one — five grammar axes still absent** | `day-one-sampler.md:90-92`: `match`, operator overloading, multi-param generics, recursive types, mixed-width arithmetic | `scripts/day-one/grammar.py` (91 records) | half-day per axis |
@@ -1400,9 +1400,12 @@ in-language GC knobs.
      only ADDS resolution for structural shapes — so the gate validates safety even where the fixpoint
      (i32-only) can't. **First target — inline-shape nested struct field — DONE (#665):**
      `collectNestedFieldShapes` pre-pass + `fieldTypeCode`/`fieldRefElemName` resolving via
-     `structIndexOfTypeName`. The remaining `structIndexByName` sites stay nominal-only for now — migrate
-     each opportunistically when a structural name actually reaches it (premature otherwise: today they
-     all receive nominal names, so a blanket swap is a no-op with risk).
+     `structIndexOfTypeName`. **MEASURED 2026-09-07, and "today they all receive nominal names" was false**: a
+     per-site oracle over 10,793 modules found 25 of 37 sites receiving a structural name the
+     nominal resolver declines. The criterion this line states is right and is now
+     instrumented — 20 sites converted byte-inert, 5 held back by witness (4 lose builds, 1
+     moves a diagnostic), 12 never see a structural name and stay nominal. A blanket swap is
+     NOT a no-op: it costs 14 builds. `rep-descriptor-campaign.md` §11.
   2. 🟡 **Rep-bug burn-down — THE #1 PRIORITY (drive to 0).** ✅ **Soundness milestone holds:** every
      unsound class (INVALID-WASM, TRAP, MISMATCH) is **0**; the check is EXACT/bidirectional
      (`scripts/rep-fuzz-check.sh`: soundness never baselineable, new rejects + stale entries both

@@ -1479,3 +1479,103 @@ recommendation. Neither is decided here.
 
 Re-run the census before quoting it. A citation is a measurement with a date on it, and this
 document's own §1 will go stale the first time a family converts.
+
+## 11. The nominal→structural widening (ROADMAP row 25) — measured per SITE, and 5 of 25 refused
+
+§5.0 says *widen a domain never*. ROADMAP step 1 says migrate `structIndexByName` callers to
+`structIndexOfTypeName`, which is a widening by construction — the structural resolver calls
+the nominal one first and then falls back to a field-set match, so it is a strict superset.
+Both documents were right about something, and only a per-site measurement separates them.
+
+### 11.1 The criterion is per SITE, so the instrument is too
+
+Step 1 already states the rule: *migrate each opportunistically when a structural name
+actually reaches it*. That is a per-site question, so the oracle is per site — all 37 caller
+sites routed through a shadow-gated wrapper that, when the nominal resolver declines, asks
+whether the structural one would have answered (`RIGHT-ONLY`). Unarmed it is exactly
+`structIndexByName`; armed it writes to the report table `repLadderABSweep` drains.
+
+**The line's own parenthetical was false.** It reads *"today they all receive nominal names,
+so a blanket swap is a no-op with risk"*. Over 10,793 modules:
+
+| population | modules | sites firing | RIGHT-ONLY queries | sites with RIGHT-ONLY |
+| --- | ---: | ---: | ---: | ---: |
+| `tests/cases` | 3,204 | 32 | 6,669 | **25** |
+| distilled corpus | 7,589 | 29 | 6,798 | **16** (all a subset of the 25) |
+
+A six-line hand program reaches two of them. The swap is not a no-op; it is a live widening
+at 25 sites.
+
+### 11.2 And it is not free — the blanket swap costs 14 builds
+
+Converting all 25 at once:
+
+| | `tests/cases` | corpus |
+| --- | ---: | ---: |
+| BUILD LOST | **6** | **8** |
+| differ / output same | 2 | 0 |
+| build gained | 1 | 0 |
+
+Per site, graded alone against the 17 modules the blanket swap moved, four sites carry all of
+it — and they fail in four different ways, which is §5.0's point stated by witness:
+
+| site held back | lost | how it fails |
+| --- | ---: | --- |
+| `elemNameIsNominalAt` | 8 | **the compiler TRAPS** (exit 70) on eight `named/d361e0136*` cells |
+| `rlElemStructRow` | 6 | check-clean **invalid wasm** on six `structs/*twin*` modules |
+| `rlElemLitStructRow` | 5 | invalid wasm ×4, plus `emitProgram: nested struct fields are not supported` |
+| `structIndexOfExpr#2` | 4 | four LOUD emit refusals — `bare null needs a struct-typed context`, `index receiver is not an array or string`, `field access receiver is not a struct` ×2 |
+
+A nominal decline is an ANSWER routed to the spelling. Take it away and the caller's
+fall-through is gone; what arrives instead is a trap, an invalid module, or a refusal about
+something else entirely.
+
+### 11.3 The fifth refusal, and the blind spot that found it
+
+The 21 remaining sites graded **DIFFERING FILES: 1** on `tests/cases` (output identical) and
+**0** on the corpus — zero vetoes on the byte-and-output bar. The gate then went red on one
+fixture:
+
+```
+closures/error-nullable-elem-closure-field-array-lambda-sig-twin.vl
+  expected an emit error containing "list element has no rep"
+  got: ["12:9 emitProgram: callee is not a function name"]
+```
+
+**Byte identity is blind to a program that never produced bytes.** Both seeds fail to build
+that module, so it sat in the grader's `both-fail` bucket and was never compared — and for an
+`error-*` fixture the MESSAGE is the contract. A second grader over exactly that bucket found
+**1 changed diagnostic in 3,204 `tests/cases` modules and 0 in 7,589 corpus cells**, and a
+per-site run named `refArrShapeKindGo` as the only cause. Held back; the shipped set is 20.
+
+> **Add a fourth reading to §5.1: the DIAGNOSTIC, over the modules that do not build.** §8.2
+> already says byte identity and the oracle are not interchangeable. This is the same rule one
+> step further out — a population splits into modules that build and modules that do not, and
+> byte identity can only speak for the first. The second is where every `error-*` fixture
+> lives.
+
+### 11.4 What shipped, and what the 17 remaining sites are
+
+**20 sites converted.** Caller sites go `structIndexByName` 37 → 18 and `structIndexOfTypeName`
+24 → 44. (Both counts are CALL SITES; the row's old "50 vs 56" was a grep line count, and 16 of
+the 56 and 23 of the 50 were comments.)
+
+Final grade of the 20, both populations, all three readings:
+
+| reading | `tests/cases` | corpus |
+| --- | --- | --- |
+| byte + output | DIFFERING FILES **1**, `differ/output SAME`, VETO **0** | DIFFERING FILES **0**, VETO **0** |
+| diagnostics (the both-fail bucket) | CHANGED **0** | CHANGED **0** |
+
+The one differing module, `closures/closure-nullable-union-field-struct-elem-array-result.vl`,
+prints `7/NULL/hey/9/NULL0/5/2.5/NULL` under both and is **9 bytes smaller** after: the
+`wasm-dis` diff is a type-table renumbering where the nominal decline had minted a duplicate
+`(array (mut (ref null $3)))` row the structural resolver finds already interned. That is the
+widening doing exactly what it is for.
+
+**17 sites remain nominal, in two groups.** Twelve never received a structural name in either
+population — converting them is the no-op with risk the plan warned about, and they stay until
+one does. Five are refused by witness: the four in §11.2 and `refArrShapeKindGo` in §11.3. Each
+needs its own fix, not a wider gate; the trap in `elemNameIsNominalAt` is the one worth a row
+first, since a compiler trap is a defect wherever it comes from.
+
