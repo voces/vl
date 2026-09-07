@@ -331,6 +331,30 @@ So the two questions compose. First: does the scrutinee's declared type admit a 
 (§THE DECIDING INPUT). Second: is the fall-through a real answer (§The default test). A yes to
 both converts, whatever the member count — the arm order is yours to keep.
 
+## A FIELD read is a legal scrutinee, so a `primName` sequence converts too
+
+`match t.primName { … }` is a `match` over a member expression, which the language accepts, so
+the `if t.primName == "i32" { … }` sequences inside a `TyPrim` arm convert like any other
+single-subject dispatch — over `PrimName`'s ten, named, with the outer `return` (the value the
+fall-through already produced) as the last or-pattern arm. Ten such sites (seven `PrimName`
+field reads plus `tyPrimLeafListKind` over `PrimName | null` and `eqCmpKindOfNulInner` over
+`EqCmpKind`) converted byte-identically, mirroring each original's if / `||` structure so
+`desugarMatchAt`'s in-order lowering reproduces it.
+
+**The census still mis-attributes these** — it reads `t.primName`'s literals into `MfKind` or
+`BtKind` by the smallest-containing rule, because the declared-type read the census gained
+(§the set column) resolves a PARAMETER, not a field. A converted site is a `match` and the
+census stops reporting it regardless, so the conversion sidesteps the mis-attribution; the
+STANDING attribution is what the `PrimName`-field drift-gated table (its own +2-hit landing)
+still owes.
+
+**A large set tested at a few members is deferred, not converted.** `globalPromotable`
+(`VKind`, 4 of 31), the `VKind | null` and `TokKind` locals (2–4 of 31 / 74): a `_`-less match
+there is a 60-to-70-member or-pattern arm carrying one reason — honest, but noise, and its
+value (a forgotten member) is marginal for a guard. `binPrec` earned its 74-member match by
+dispatching over 25; these do not, so they wait for the attribution table that will grade them
+against their real set rather than a noise-arm conversion.
+
 ## Agreement, and why there are two implementations
 
 `compiler/lint.vl` grades one module from the source the driver hands it; the census grades the
