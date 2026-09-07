@@ -89,7 +89,7 @@ units: **hours** · **half-day** · **days**.
 | B14 `c.area` as a bound value | Bound-value-vs-call is a surface decision. |
 | B16 ad-hoc overloading | `DECISIONS.md:1569` records the default "no"; the open half is whether to revisit. |
 | B17 discarded call result | The escape-hatch spelling (`_ = work()`) is undecided. |
-| B21.2 `match` over literal members | Two routes offered, neither chosen. |
+| B21.3 `match` over literal members | Two routes offered, neither chosen. (Was B21.2 — the label collided with the empty-clause ban, which shipped under it.) |
 | B-mem `__store_string__` / `__log_string__` | `buffer-design.md` O8: delete or lower. |
 | B7 R4 `utf8Length` | A breaking std removal; also triggers the `std-api-reviewer` gate. |
 | C5 distribution · F5 the name · H5 versioning · H-M2 · J2 runner · J3 port target · D field-level hints · F9 baseline scope | Each already carries its question in its own row. |
@@ -2788,7 +2788,7 @@ in-language GC knobs.
      rejects naming the supported spelling. Widening either means teaching collect to walk
      expressions / global inits in emit's evaluation order — the slot pre-order is the whole
      constraint, and `armPreludeBlocks` is what keeps a mismatch loud instead of silent.
-  2. **Unions with LITERAL members** (`0 | 1 | 2`, `"x" | 7`) — refused at the type tier today
+  2. **B21.3 — unions with LITERAL members** (`0 | 1 | 2`, `"x" | 7`) — refused at the type tier today
      (`match over a union with literal members is not supported`) because an arm's test would be
      `n is 0`, which the emitter has no rep for (`literal \`is\` over a struct union is not
      supported`, on master too). Two ways out: teach the emitter the literal `is`, or route a
