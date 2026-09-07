@@ -1,0 +1,155 @@
+// @run
+// @log MOD-annot 4 true
+// @log MOD-infer 4 true
+// @log FN-annot 4 true
+// @log FN-infer 4 true
+// @log TWO-WRITES 4 true 10
+// @log PATH 4 true
+// @log AFTER-BLOCK 4 true
+// @log STR-UNION 4 done
+// @log INNER-BLOCK false
+// NARROWING APPLIES TO READS. Inside a region narrowed by `x is T`, a READ of `x` sees the
+// narrowed type and a WRITE is checked against `x`'s DECLARED type — so the write that flips
+// the variant is legal, and the reads after it see the member it wrote (owner ruling on
+// D1736; TypeScript's and Kotlin's rule, and the one the null strip already followed).
+//
+// THE EMITTER IS HALF THE CLAIM, which is why every row prints the value AFTER the write.
+// A union binding lives in a box, and a read under a narrowing unboxes at the pinned arm: if
+// only the checker re-narrowed, `print(x)` after `x = true` would `ref.cast` the boolean box
+// to the i64 one and trap. The checker banks the member at the assignment node
+// (`asgNarTyIxOf`) and the emitter pushes exactly that one, so the two cannot drift.
+//
+// The write itself is still checked, against the DECLARATION: `error-narrow-write-non-member.vl`
+// is the same program with a `string` written into an `i64 | boolean`.
+import { toString } from "std:fmt"
+
+function two(tag: string, a: string, b: string) {
+  print(tag + " " + a + " " + b)
+  0
+}
+
+// ---- module scope, annotated and inferred ----
+function pick(b: boolean): i64 | boolean {
+  if b { return 3 }
+  return false
+}
+
+let m1: i64 | boolean = 3
+let m1r = ""
+let m1w = ""
+if m1 is i64 {
+  m1r = toString(m1 + 1)
+  m1 = true
+  m1w = toString(m1)
+}
+two("MOD-annot", m1r, m1w)
+
+let m2 = pick(true)
+let m2r = ""
+let m2w = ""
+if m2 is i64 {
+  m2r = toString(m2 + 1)
+  m2 = true
+  m2w = toString(m2)
+}
+two("MOD-infer", m2r, m2w)
+
+// ---- function scope, annotated and inferred ----
+function fnAnnot() {
+  let x: i64 | boolean = 3
+  let r = ""
+  let w = ""
+  if x is i64 {
+    r = toString(x + 1)
+    x = true
+    w = toString(x)
+  }
+  two("FN-annot", r, w)
+}
+fnAnnot()
+
+function fnInfer() {
+  let x = pick(true)
+  let r = ""
+  let w = ""
+  if x is i64 {
+    r = toString(x + 1)
+    x = true
+    w = toString(x)
+  }
+  two("FN-infer", r, w)
+}
+fnInfer()
+
+// A SECOND write is checked against the declaration too, not against what the first one
+// left — the bank keeps the declared type while the scope shadow carries the narrowing.
+function twoWrites() {
+  let x: i64 | boolean = 3
+  let a = ""
+  let b = ""
+  let c = ""
+  if x is i64 {
+    a = toString(x + 1)
+    x = true
+    b = toString(x)
+    x = 9
+    c = toString(x + 1)
+  }
+  print("TWO-WRITES " + a + " " + b + " " + c)
+}
+twoWrites()
+
+// A COMPOUND PATH takes the same rule for the write — checked against the field's declared
+// type — and the narrowing simply retires, so the read after it is at the declaration.
+type O = { v: i64 | boolean }
+function pathWrite() {
+  const o: O = { v: 3 }
+  let n: i64 = 0
+  let w = ""
+  if o.v is i64 {
+    n = o.v + 1
+    o.v = true
+    w = toString(o.v)
+  }
+  two("PATH", toString(n), w)
+}
+pathWrite()
+
+// After the guard's block the binding is back at its declaration, and the box carries the
+// member the write put there.
+function afterBlock() {
+  let x: i64 | boolean = 3
+  let r = ""
+  if x is i64 {
+    r = toString(x + 1)
+    x = true
+  }
+  two("AFTER-BLOCK", r, toString(x))
+}
+afterBlock()
+
+// A non-numeric union, so the flip crosses a ref rep rather than two scalars.
+function strUnion() {
+  let x: i32 | string = 3
+  let r = ""
+  let w = ""
+  if x is i32 {
+    r = toString(x + 1)
+    x = "done"
+    w = x
+  }
+  two("STR-UNION", r, w)
+}
+strUnion()
+
+// A write in an INNER block retires the narrowing in place, so the reads after that block
+// are at the declaration on both sides — the emitter's `restoreNarrow` unwinds its push at
+// the same `}` the checker's shadow pops at.
+function innerBlock() {
+  let x: i64 | boolean = 3
+  if x is i64 {
+    if true { x = false }
+    print("INNER-BLOCK " + toString(x))
+  }
+}
+innerBlock()
