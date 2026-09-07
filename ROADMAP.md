@@ -50,7 +50,6 @@ units: **hours** · **half-day** · **days**.
 | 1 | **B15 — a nested capturing function cannot be taken as a VALUE.** **NARROWED 2026-09-06: the DIRECT-call half is built** ([D1780](internals/inventory/D1780.md)/[D1781](internals/inventory/D1781.md)), the BINDING hop with it ([D1782](internals/inventory/D1782.md)), the ARRAY-element delivery at one pin ([D1794](internals/inventory/D1794.md)) and the ARGUMENT hop ([D1795](internals/inventory/D1795.md)); what stands is a closure that escapes its pin | `function o(n) { function k(x) { return x + n }; return k(1) }` runs at one pin and at two, and so do `const fs = [k]; fs[0](1)`, `function use(p) { return p(1) }; use(k)` and `const f = k; f(1)` at two pins; the array element at two pins still refuses ([D1816](internals/inventory/D1816.md)), and `return k` still refuses | `wasmEmit.vl emitClosureValue`; the binding hop is `calleeRetKindSid` and the `fnValTarget` family, which key on a name with no frame | half-day (D1782) |
 | 2 | **D1775 — a `type` alias over a negation type reps as a union BOX with a scalar value** | `type N = !string; const x: N = 5` → `vl check` rc 0, then `type mismatch: expected (ref $type), found i32`. `wasm-dis`: `(global $global$0 (mut (ref $1)) (i32.const 5))`. The INLINE spelling runs | `typecheck.vl` / `emit_classify.vl` rep classification of an alias body | hours–half-day |
 | 5 | **B7 R3 — `.backwards()` over a string** | `"abc".backwards()` → `no method '.backwards' on string` | `std/str.vl`; §Codepoints already specifies it | **hours** |
-| 9 | **`vl build` with no `-o` writes a file instead of stdout** | `vl build p.vl > out.bin` → `out.bin` holds `wrote p.wasm (147 bytes)` | `scripts/vl-host/src/main.rs` build arm; already "decided: yes" | **hours** |
 | 10 | **Organize Imports drops an unused specifier but not a DUPLICATE one** | `server.ts:1491 .filter((d) => d.code === "unused-import")` | `lsp/src/server.ts:1489-1500` | **hours** |
 | 13 | **B-ci — `build.rs` bakes `VL_SEED_KEY`, so every seed push recompiles the crate** | `scripts/vl-host/build.rs:76` `println!("cargo:rustc-env=VL_SEED_KEY={h:016x}")` | `scripts/vl-host/build.rs` | **hours** |
 | 18 | **B8 — the two `for` gaps that need a RULING, not a build** | objects → `a struct's fields are not a sequence …`; float bounds/step → `a `for` range counts in i32 …`. The other two members BUILT 2026-09-07: `for v, i in xs` / `for k, v in m` and an expression `step` | `open-rulings.md` §B8-for-struct, §B8-for-float-range — each has options, peers and a recommendation; neither is a build until it is ruled | ruling |
@@ -2979,8 +2978,14 @@ seed from current `compiler/*.vl` in ~40s.*
   the seed embedded (`--features embed-seed`; `release.yml` builds all 5 targets, `build-binary.sh`
   locally) — the `deno compile cli.ts` path is retired. REMAINING: tag / brew tap / sha256 bump
   (the publish job + Formula are drafts) — decoupled from all compiler work, deferred to H5.
-- ⬜ **C-cli polish.** `vl build` to stdout when no `-o` (decided: yes, pipe-friendly); WAT output
-  (`--wat`, via wasm-tools or wasm-opt); surfacing diagnostics with spans once the spans rungs land.
+- ✅ **C-cli polish.** `--wat` ships. The output channel is RULED and BUILT (ranked row 9): the
+  status line is stderr on every path and `-o -` streams the module to stdout, while the
+  `<name>.wasm` default STANDS. That declines this bullet's own older parenthetical
+  ("to stdout when no `-o`, decided: yes, pipe-friendly") — `-o -` reaches the same
+  pipelines without breaking a documented surface for the 76 call sites that all pass `-o`,
+  and it is the convention `vl seed` already set. `docs/internals/cli-design.md`
+  §"The output channel is RULED" carries the decision and the alternative.
+  REMAINING: surfacing diagnostics with spans once the spans rungs land.
 
 ---
 

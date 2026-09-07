@@ -197,8 +197,8 @@ Deno.test({
       if (built.code !== 0) {
         throw new Error(`validation rejected a valid module (rc ${built.code}):\n${built.err}`);
       }
-      if (!/^wrote /m.test(built.out)) {
-        throw new Error(`expected the "wrote …" report, got: ${JSON.stringify(built.out)}`);
+      if (!/^wrote /m.test(built.err)) {
+        throw new Error(`expected the "wrote …" report on stderr, got: ${JSON.stringify(built.err)}`);
       }
       // The blessing must be worth something: the artifact instantiates and runs.
       const ran = await vl(["run", outPath]);
@@ -229,9 +229,9 @@ Deno.test({
       if (toFile.code !== 0) {
         throw new Error(`control build to a real file failed (rc ${toFile.code}):\n${toFile.err}`);
       }
-      const fileBytes = toFile.out.match(/\((\d+) bytes\)/)?.[1];
+      const fileBytes = toFile.err.match(/\((\d+) bytes\)/)?.[1];
       if (!fileBytes) {
-        throw new Error(`expected a "wrote ... (N bytes)" line, got: ${JSON.stringify(toFile.out)}`);
+        throw new Error(`expected a "wrote ... (N bytes)" line on stderr, got: ${JSON.stringify(toFile.err)}`);
       }
 
       const toDevNull = await vl(["build", srcPath, "-o", "/dev/null"]);
@@ -241,10 +241,10 @@ Deno.test({
             toDevNull.err,
         );
       }
-      const devNullMatch = toDevNull.out.match(/^wrote \/dev\/null \((\d+) bytes\)$/m);
+      const devNullMatch = toDevNull.err.match(/^wrote \/dev\/null \((\d+) bytes\)$/m);
       if (!devNullMatch) {
         throw new Error(
-          `expected the "wrote /dev/null (N bytes)" report, got: ${JSON.stringify(toDevNull.out)}`,
+          `expected the "wrote /dev/null (N bytes)" report on stderr, got: ${JSON.stringify(toDevNull.err)}`,
         );
       }
       if (devNullMatch[1] !== fileBytes) {
