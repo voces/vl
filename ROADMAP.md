@@ -47,7 +47,7 @@ units: **hours** · **half-day** · **days**.
 
 | # | item | witness, run today | region | effort |
 | --- | --- | --- | --- | --- |
-| 1 | **B15 — a nested capturing function cannot be taken as a VALUE.** **NARROWED 2026-09-06: the DIRECT-call half is built** ([D1780](internals/inventory/D1780.md)/[D1781](internals/inventory/D1781.md)); what stands is a closure that escapes its pin | `function o(n) { function k(x) { return x + n }; return k(1) }` runs at one pin and at two; `const f = k; f(1)` at two pins is still invalid wasm ([D1782](internals/inventory/D1782.md)), and `return k` still refuses | `wasmEmit.vl emitClosureValue`; the binding hop is `calleeRetKindSid` and the `fnValTarget` family, which key on a name with no frame | half-day (D1782) |
+| 1 | **B15 — a nested capturing function cannot be taken as a VALUE.** **NARROWED 2026-09-06: the direct-call and BINDING halves are built** ([D1780](internals/inventory/D1780.md)/[D1781](internals/inventory/D1781.md)/[D1782](internals/inventory/D1782.md)); what stands is two deliveries and a real escape | `const fs = [k]; fs[0](1)` and `function use(p) { return p(1) }; use(k)` each have their own row and their own close in flight; `return k` still refuses | the indexed-element callee is `cloArrCallRetKind` and the ref-list element sig; the argument boundary is the monomorphizer's closure pin (`PIN_SIGKEY`) — neither decline is instrumented | half-day each |
 | 2 | **D1775 — a `type` alias over a negation type reps as a union BOX with a scalar value** | `type N = !string; const x: N = 5` → `vl check` rc 0, then `type mismatch: expected (ref $type), found i32`. `wasm-dis`: `(global $global$0 (mut (ref $1)) (i32.const 5))`. The INLINE spelling runs | `typecheck.vl` / `emit_classify.vl` rep classification of an alias body | hours–half-day |
 | 4 | **B21.1 — `match` payload renaming and nested destructuring** | `Move{x: a}` → `parse error … match payload binding must be a field name` | `parser.vl:2847`; `match-design.md` measures both as one-branch extensions | hours (renaming) / half-day (nesting) |
 | 5 | **B7 R3 — `.backwards()` over a string** | `"abc".backwards()` → `no method '.backwards' on string` | `std/str.vl`; §Codepoints already specifies it | **hours** |
@@ -2379,11 +2379,17 @@ in-language GC knobs.
   `emitClosureValueCore` — the generic-value floor guards a closure that ESCAPES its pin, and
   the one a direct call synthesizes is consumed by the call that pinned it. On the 264-cell
   nested-capture matrix that is 87 cells not-runs → runs with 0 runs lost.
-  REMAINING for this entry: the escape itself. `const f = k; f(1)` at two pins is check-clean
-  invalid wasm ([D1782](internals/inventory/D1782.md)) because a binding hop keys on the name
-  with no frame; `return k` still refuses, correctly, since nothing pins the parameter. A struct
-  at the TEMPLATE's pin is [D1788](internals/inventory/D1788.md), and a nested function calling
-  a SIBLING nested capturing function is [D1789](internals/inventory/D1789.md), which needs no
+  The BINDING half followed ([D1782](internals/inventory/D1782.md)): a binding's target was
+  read with the flat name map, so an instance's `const f = k; f(1)` called the template's clone
+  under a signature that validates. The positioned `fieldValueFeOfIn` resolves it from the frame
+  the value is read in, and the struct-field hop needed its own resolver to carry the frame too
+  — 20 more matrix cells to runs, and the matrix stands at 261 of 264.
+  REMAINING for this entry: two deliveries and one direction. `[k][0](1)` and `use(k)` each
+  carry their own row and their own close in flight — the first an inference-hole ingredient
+  rather than a pin-count one, the second the argument boundary; `return k` still refuses,
+  correctly, since nothing pins the parameter. A struct at
+  the TEMPLATE's pin is [D1788](internals/inventory/D1788.md), and a nested function calling a
+  SIBLING nested capturing function is [D1789](internals/inventory/D1789.md), which needs no
   generic at all. `monoPinnedSigsOf`'s message still under-reports at two pins, so "adopt the
   unique pinned signature" is not a sound fix for what is left. The f64/string half of that family was NEVER this ABI — it was the env FIELD and
   the READ out of it being typed by different answers, closed under workboard D8; the tell is that
