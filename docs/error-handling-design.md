@@ -383,6 +383,17 @@ classifiers seeing through the cast to the NULLABLE kind, per rep. Since `as?` i
 the member this section itself calls lossy ("it DESTROYS the error value"), nothing
 load-bearing waits on it.
 
+**A `T | null` SOURCE (2026-09-06).** The trio's operand may be a nullable, not only a
+multi-arm union. A `T | null` whose `T` is a scalar BOXES, so it takes the ordinary tag
+chain; one whose `T` is a ref is a NICHE — `ref.null` is the whole encoding of the absent
+arm — and needs no tag at all: `x as! T` is `ref.as_non_null`, whose trap is this section's
+own ruled sad path, and `x as? T` is the identity, since `T | null` is what the operand
+already reps as. Lowered for the string, list and union-variant cells, graded at all 26
+delivery positions in both faces. Still refused: the standalone-struct, map and closure
+cells, whose consumers read the CAST node for the rep and find none, and the propagating
+bare `as`, whose sad path returns the enclosing function's null and so needs the operand
+staged at its own heap type. `docs/internals/inventory/D1812.md`.
+
 ### The unified `as` principle
 
 `as` is **one operator with one invariant: `x as T` always yields a `T`.** The
