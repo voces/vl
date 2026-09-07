@@ -1511,10 +1511,13 @@ in-language GC knobs.
      2. ⬜ **`vtKindOfType`'s annotation ladder** — 25 predicate rungs. The `annRepKindOf` seam
         already exists, so the work is widening `repOfTy` coverage until the fallback is
         unreachable; the oracle's LEFT-ONLY bucket at this site is the burn-down list.
-     3. ⬜ **`repOfName(name, fnIx)`** — the missing surface, not a ladder: name → frame
-        (`fnStmtsPosOf`) → `fnIndexOfInScopeSid` (walking `fnParent` then `fnInstOrigin`) →
-        declaration → type. The five-row monomorphizer family (D1781, D1782, D1788, D1795,
-        D1817) is every site that should have called it. Lands before item 4.
+     3. ✅ **`repOfNameResult(sid, name, fnIx)`** — the name surface, and narrower than this
+        list first guessed: only the return-kind readers wanted a REP, and the other three
+        rows wanted the SLOT or the `$fnsig` key, which `fnIndexOfInScope` already owns.
+        DONE: fourteen readers became projections, the two `#2815` left behind gained the
+        frame (closing D1834), byte-identical in 3,154 of 3,155 + 7,589 of 7,589, and the flat-vs-scoped
+        oracle contradicts in eight modules, all of them the pin-context fixtures. The
+        BINDING half — `declaredSlotOf` takes a bare name — is still owed, by item 4.
      4. ⬜ **The `expr*` family** — 48 classifiers, 927 call sites, 31% of all classifier call
         sites. Converted by AXIS, since each is a closed set whose siblings must move
         together: (a) the seven scalar-list predicates, (b) the six nullable niches, (c) the
