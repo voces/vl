@@ -54,6 +54,7 @@ const read = (rel: string): string =>
   Deno.readTextFileSync(new URL(rel, here));
 
 const serverSrc = read("../lsp/src/server.ts");
+const adapterSrc = read("../playground/src/lspAdapter.ts");
 const mainSrc = read("../playground/src/main.ts");
 
 // --- the feature parity table -----------------------------------------------
@@ -83,6 +84,14 @@ type Parity = {
   adapterExport: string | null;
   mainMarker: string | null;
   knownGap?: string;
+  /**
+   * A feature LABEL can hide more than one behaviour, and a row that grades the label alone
+   * cannot see one of them go missing: the playground offered no UFCS method for months
+   * while this table read green, because UFCS is a behaviour inside "completion". Each entry
+   * names one such behaviour and the symbol each side composes it from — both must be
+   * present, so a host that drops one reds here.
+   */
+  subBehaviours?: { name: string; symbol: string }[];
 };
 
 const FEATURES: Parity[] = [
@@ -140,6 +149,10 @@ const FEATURES: Parity[] = [
     // `completion` adapter export and a Monaco `CompletionItemProvider`
     // (`.`-triggered), matching the server's `completionProvider.triggerCharacters`.
     feature: "completion",
+    // Measured 2026-09-08 by grepping both files for the composing symbol. `builtins`,
+    // `scope bindings`, `keywords` and `snippets` are present on both sides and covered by
+    // the export marker; these are the ones a label alone would hide.
+    subBehaviours: [{ name: "UFCS method candidates", symbol: "ufcsCompletions" }],
     serverMarker: "connection.onCompletion",
     adapterExport: "completion",
     mainMarker: "registerCompletionItemProvider",
@@ -246,6 +259,28 @@ const FEATURES: Parity[] = [
 // the table track the LIVE LSP surface: a handler that's renamed/removed in
 // `server.ts` breaks here, and a row whose marker was a typo can't masquerade
 // as a real feature.
+// A behaviour named by `subBehaviours` must be composed by BOTH hosts. This is the check
+// the table could not make while every row graded one marker: the label said "completion"
+// and both sides had a `completion` export, so the playground's missing UFCS half was
+// invisible to it.
+Deno.test("every named sub-behaviour is composed by both hosts", () => {
+  for (const f of FEATURES) {
+    for (const b of f.subBehaviours ?? []) {
+      assert(
+        serverSrc.includes(b.symbol),
+        `feature "${f.feature}" / "${b.name}": server.ts no longer composes ` +
+          `"${b.symbol}" — update the row, or remove it if the LSP dropped the behaviour.`,
+      );
+      assert(
+        adapterSrc.includes(b.symbol),
+        `feature "${f.feature}" / "${b.name}": the playground adapter does not compose ` +
+          `"${b.symbol}", so the feature label is green while this behaviour is missing. ` +
+          `Wire it in playground/src/lspAdapter.ts, or move it to a knownGap row.`,
+      );
+    }
+  }
+});
+
 Deno.test("parity table matches the live LSP surface (server.ts)", () => {
   for (const f of FEATURES) {
     assert(
@@ -379,9 +414,8 @@ Deno.test("DOCUMENTED parity gaps (informational)", () => {
 // The rows below name the helper `server.ts` composes and the playground does
 // not, with the same polarity as `knownGap`: each asserts the gap STILL HOLDS,
 // so closing one reds this test and forces the row to be promoted rather than
-// left behind as a stale TODO.
-const adapterSrc = read("../playground/src/lspAdapter.ts");
-
+// left behind as a stale TODO. (`adapterSrc` is read once at the top of the
+// file, beside `serverSrc`/`mainSrc`.)
 type SubGap = {
   under: string; // the in-parity FEATURES row whose label hides this
   symbol: string; // the `lsp/src/*` helper server.ts composes
