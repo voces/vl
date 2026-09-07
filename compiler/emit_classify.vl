@@ -3942,7 +3942,10 @@ function capRecord(name: string, bound: string[], caps: string[]) {
       // The module scope is the one enclosing scope the frame walk cannot reach, and it has
       // a binding form that is not a global: a top-level `for` variable. Without it a closure
       // in a top-level loop body addresses the module function instead of the loop variable.
-      if !moduleBindsLoopVar(emitRootIx, name) { return 0 }
+      if !moduleBindsLoopVar(emitRootIx, name) {
+        capSiblingFrees(name, bound, caps)
+        return 0
+      }
     }
   }
   // The builtin-name exemption is positional and lives in `capScan`'s `Call` arm, not here:
@@ -3950,6 +3953,57 @@ function capRecord(name: string, bound: string[], caps: string[]) {
   // at every identifier would suppress a genuine capture of a local sharing the name.
   if capHas(caps, name) { return 0 }
   caps.push(name)
+  0
+}
+
+// The nested functions whose frees are being folded in, so two that call each other do not
+// recur forever. A stack rather than a set: the same sibling reached down two different paths
+// is folded in each time, which is what a capture set of names needs.
+const capSibStack: i32[] = []
+
+// A SIBLING nested function's free names are the caller's captures too: `j` calling `k` builds
+// `k`'s env inside `j`, so every name `k` needs from an outer frame must ride `j`'s env. Depth
+// already works through `capScan`'s `FuncDecl` arm, which folds a nested body's frees upward;
+// this is the sibling direction, which `capRecord` dropped with the function name (D1761).
+function capSiblingFrees(name: string, bound: string[], caps: string[]) {
+  if capFrame < 0 || capFrame >= fnStmts.length { return 0 }
+  // The same outward walk `fnIndexOfInScopeSid` takes, and for the same reason: only a
+  // NESTED function is found, so a module-level callee resolves to -1 and folds in nothing.
+  let pp = capFrame
+  let fe = 0 - 1
+  let steps = 0
+  while pp >= 0 && steps <= fnStmts.length {
+    const hit = nestedFnDeclaredInFrame(name, pp)
+    if hit >= 0 {
+      fe = hit
+      pp = 0 - 1
+    } else {
+      if pp < fnParent.length { pp = fnParent[pp] } else { pp = 0 - 1 }
+    }
+    steps = steps + 1
+  }
+  if fe < 0 { return 0 }
+  if fe == capFrame { return 0 }
+  let si = 0
+  while si < capSibStack.length {
+    if capSibStack[si] == fe { return 0 }
+    si = si + 1
+  }
+  capSibStack.push(fe)
+  // The sibling's own scan must not re-record narrowings: `capNarrowRecord` is keyed on the
+  // declaration node, and this walk reaches the same node from every caller of it.
+  const savedFrame = capFrame
+  const savedRec = cnRecording
+  cnRecording = false
+  const sub = capComputeNamesOf(fe)
+  cnRecording = savedRec
+  capFrame = savedFrame
+  capSibStack.pop()
+  let ci = 0
+  while ci < sub.length {
+    capRecord(sub[ci], bound, caps)
+    ci = ci + 1
+  }
   0
 }
 
@@ -16693,6 +16747,10 @@ function globalCellKindGo(letIx: i32): VKind {
     // orders them: this answers the value's nullable kind for every mv value rep at once.
     const gMapRead = letNulMapReadValKind(letIx, -1)
     if gMapRead != null { return gMapRead }
+    // A `??` that JOINS to the union box is the box cell whatever niche its operand had. The
+    // two niche rungs below read the OPERAND alone, so a global takes the niche while the
+    // lowering builds the box unless this asks first — the local ladder's own order (D1765).
+    if coalesceNicheJoinsToBox(d.letInit, -1) { return "union" }
     // D1106 — the kind-18 cell the un-annotated arm lacked: `const r = mk()` with `mk():
     // S[] | null` fell through to `globalKind`'s i32 guess, so a later `r != null` compare
     // had no rep to test against. Before `nullist`, exactly as the annotated ladder orders
@@ -19235,6 +19293,11 @@ export function anonFieldCode(valIx: i32) {
   // box rung below, since a literal union also registers as a union NAME and would otherwise
   // be minted as a `(ref)` box every reader of the row then lowers as an atom (D1757).
   if tyIsLitUnionAlias(nodeTyIxOf(valIx)) { return 0 }
+  // The INLINE spelling of that field is the string slot, code 3 — the other half of the split
+  // `fieldCodeOfSpelling` makes for the declared twin. Without it a member set with no alias
+  // reached the spellability gate, which declines a `TyUnion`, and cost the whole literal its
+  // row (D1783).
+  if tyIsLitUnion(nodeTyIxOf(valIx)) { return 3 }
   // A value-union field value is the shared box, code 16 — the same code the declared twin
   // gets from `isValueUnionName`. Checked ahead of the spellability gate on purpose:
   // `nodeTyName` spells no union, so that gate would refuse the whole literal a row (D1242).
@@ -19694,6 +19757,14 @@ export function anonFieldElemName(valIx: i32, code: i32) {
   // union records its NAME so the atom's membership survives the mint. Self-gating, since the
   // reader answers "" for the plain `i32` and `boolean` values that share code 0 (D1757).
   if code == 0 { return litUnionAliasNameOfTy(nodeTyIxOf(valIx)) }
+  // The inline twin's companion (code 3): the member set, recorded for the reason its declared
+  // twin records it — code 3 is layout-shared with a plain string field, so the membership is
+  // unrecoverable without it. Self-gating, since a plain string renders no member set (D1783).
+  if code == 3 {
+    const inl3 = tyToEmitName(nodeTyIxOf(valIx))
+    if nameIsInlineLitUnion(inl3) { return inl3 }
+    return ""
+  }
   if code != 15 { return "" }
   const si = structIndexOfObj(valIx)
   if si >= 0 { return sNames[si] }
@@ -26166,6 +26237,11 @@ export function unionNameOfExpr(exprIx: i32, fnIx: i32) {
       // miss falls THROUGH to the map and `?.` arms below, which own their own `??` shapes.
       const cmn = nodeMixedUnionName(exprIx)
       if cmn != "" { return cmn }
+      // An ALL-variant join (`A | B`) is the box too, and `nodeMixedUnionName` excludes it by
+      // design. The desugared face falls through to a wider producer, so the fused face needs
+      // the same rung or the box arm declines and the consumer's cell is not the box (D1764).
+      const cvn = nodeVariantUnionName(exprIx)
+      if cvn != "" { return cvn }
     }
   }
   if e is Call {
