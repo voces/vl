@@ -107,6 +107,33 @@ a comment written between two arms migrates into the following arm's body
 ([D1646](inventory/D1646.md)), and an empty arm body expands to three lines where `if c {}`
 stays on one ([D1647](inventory/D1647.md)).
 
+## The first conversion that earned its fall
+
+`emit_collect.vl`'s six `Ty` dispatches, rewritten `_`-less with all eleven members named and
+the declining ones as empty arms carrying their reason (`cloResultMaybeMixed`,
+`unionArmsMixed`, `collectTyReachRegister`, `collectTyMembersReach`, `funcRetUnrepresentable`'s
+outer dispatch, `collectTyReachCloSigs`). The file goes **38 → 32**; the seed grows **+475
+bytes (+0.020%)**, ~79 a ladder rather than the pilot's ~4, because the named empty arms are
+real `if` rungs after `desugarMatchAt`.
+
+**Both output populations are byte-identical**, which is what says a refactor happened and
+nothing else: 2,629 `tests/cases` + `std` modules with 0 DIFFER and 0 LOST, and the compiler's
+own 31 modules compiled by both seeds `cmp`-equal at 2,340,967 bytes. `vl fmt` round-trips the
+converted file byte-for-byte — no third formatter defect beside D1646/D1647, and both of those
+are avoided by construction: every comment lives INSIDE an arm body, never between two arms.
+
+**Seven non-`Node` sites remain in that file and none of them is convertible**, which is the
+more useful half of the result — the census's set attribution is not a conversion list:
+
+| site | census says | why not |
+| --- | --- | --- |
+| `anonLeafAtomWidth`, `anonLeafAtomOfText`, `anonLeafFoldedAtom` ×2 | `MfKind` / `PrimName` | a `string` scrutinee; `match` needs a union |
+| `funcRetUnrepresentable`'s member loop | `Ty` 6/11 | `tyIsLitUnion(members[i])` is a PREDICATE rung between two kind rungs |
+| `forceAnnLeafReps` | `VKind` 5/31 | a chain of NAME predicates; the inner `nsk == "nulstrlist"` literals are what the census reads |
+| `collectMapFilterUse` | `BtKind` 2/3 | TWO subjects interleaved (`rk` then `rvk`), both `VKind \| null`; the `BtKind` attribution is a coincidence of the literals `"f64"`/`"i64"`/`"f32"` |
+
+The remaining 25 are `Node` (38 members), which the rule above already excludes.
+
 ## Agreement, and why there are two implementations
 
 `compiler/lint.vl` grades one module from the source the driver hands it; the census grades the
