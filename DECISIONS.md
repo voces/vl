@@ -5873,3 +5873,28 @@ the `as` keyword, and `as` is read only directly after a postfix operand — so 
 binary operator always has a left operand and a `%` that spells the cast never does. `as` stays
 a contextual keyword, so a binding may still be named `as` and take an ordinary remainder.
 `tests/cases/numerics/as-pct-precedence.vl` is the fixture that pins both readings.
+
+## The union box's TAG is the only sound discriminator; `ref.test` is not a substitute (2026-09-07) — ROADMAP row 16, closed as DESIGN
+
+`emitIs` over a boxed union compares the box's tag, and ROADMAP row 16 asked whether WasmGC's
+`ref.test` on the arm's heap type should replace it — `grep -rn "ref\.test" compiler/*.vl` finds
+0 hits. Three measurements close it as DESIGN.
+
+**Two structurally identical arms are ONE WasmGC type.** `type A = { a: i32 }` and
+`type C = { a: i32 }` in one union emit a single `(struct (field (mut i32)))`, so
+`ref.test (ref $1)` answers `true` for both. The tag exists precisely because the arms may
+alias, and no cast-based test can replace it there.
+
+**Where there is no box there is no tag compare.** The nullable-ref niche (`A | null`) lowers to
+`(ref null $A)` and `is A` is `ref.is_null` + `i32.eqz`, with the narrowed read taking
+`ref.as_non_null` rather than `ref.cast`. A type test would be strictly more work than the null
+test it replaced, so the niche — the row's own candidate — has nothing to gain.
+
+**Where the arms ARE distinct, `ref.test` is a wash.** The same function assembled by hand at the
+same three types is **79 bytes with the tag compare and 79 bytes with `ref.test`**, and the
+narrowed read's `ref.cast` follows either way, so the type is checked twice in both.
+
+What would be a win is `br_on_cast_fail`, which tests and binds in one instruction and drops the
+second check — **74 bytes** on the same function, and available only where the arms are all
+distinct. That is filed as D1895, with the arms-alias analysis named as the work a close owes
+before it owes a lowering.
