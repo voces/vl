@@ -194,6 +194,12 @@ export type WasmScopeBinding = {
   name: string;
   kind: number; // 0=variable 1=parameter 2=function
   type: string; // rendered type, "" when none
+  /**
+   * The declaration's `///` block (D9.11), the same text `docAt` gives hover.
+   * Undefined when it carries none, or when the seed predates the export — so an
+   * old seed degrades to the type-only completion item it produced before.
+   */
+  doc?: string;
 };
 
 /**
@@ -1346,7 +1352,14 @@ export const createWasmChecker = (
       const type = typeLen <= 0
         ? ""
         : readString(typeLen, (j) => exp.scopeTypeCharAt(i, j));
-      out.push({ name, kind: exp.scopeKindAt(i), type });
+      // The doc pair is younger than the rest of the scope ABI, so it is probed
+      // per call rather than folded into `hasScope`: a seed that speaks scope but
+      // not docs must still answer with the bindings it does have.
+      const docLen = typeof exp.scopeDocLen === "function" ? exp.scopeDocLen(i) : 0;
+      const doc = docLen <= 0
+        ? undefined
+        : readString(docLen, (j) => exp.scopeDocCharAt(i, j));
+      out.push({ name, kind: exp.scopeKindAt(i), type, doc });
     }
     return out;
   };
