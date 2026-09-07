@@ -61,7 +61,7 @@ units: **hours** · **half-day** · **days**.
 | 18 | **B8 — four `for` gaps, one member per row** | objects → `for-in expects an array or map, got P`; `for v, i in xs` → parse error; expression step → `undeclared identifier 'i'`; float bounds → `for-range bounds must be i32` | `typecheck.vl:34100/34156`, `parser.vl` for-head | half-day each |
 | 19 | **B6a — an i32-keyed map in four container positions** | `const u: {[i32]: f64} \| i32 = 5` → `emitProgram: an i32-keyed Map/Set is supported as … not inside '{[i32]:f64}\|i32'`; same for `[][]`, closure array, map value | `emit_collect.vl:4707 i32MapSpellingLowerable` | days (position matrix, build-then-narrow per D965) |
 | 20 | **A9 — no element-converting / field-dropping container copy** | `Cat[]` into an `Animal[]` param → `…type-valid (structural width subtyping) but not yet supported by codegen…` | `typecheck.vl` refusals + the converting-copy lowering; wire every delivery position BEFORE narrowing the gate | days |
-| 21 | **H4.6 / B6 — variadics, then array spread (owner ruling 2026-09-06 night: (A), one rule)** | `xs.push(...ys)` → `parse error … expected an expression but found DOT`; no `...` token, no variadic function, `push` is arity-1 | `parser.vl` (rest parameter + `...` argument), `typecheck.vl` (packing at the call, refusal into fixed arity), emitter (list build at the call); `extend` in `std:array` ships the bulk-append value first | days |
+| 21 | **H4.6 / B6 — variadics, then array spread (owner ruling 2026-09-06 night: (A), one rule)** | `xs.push(...ys)` → `parse error … expected an expression but found DOT`; no `...` token, no variadic function, `push` is arity-1 | `parser.vl` (rest parameter + `...` argument), `typecheck.vl` (packing at the call, refusal into fixed arity), emitter (list build at the call); `extend` in `std:array` SHIPPED the bulk-append value (2026-09-07) | days |
 | 22 | **B-debug — a trap names a wasm function index, not a VL location** | `print(a[7])` → `vl!<wasm function 4>` and `out of bounds array access` with no index and no length | `scripts/vl-host/src/main.rs` trap formatting + the name section | days |
 | 23 | **D9.11 — `///` docs are not rendered in hover** | `server.ts:1002-1004` says so; no doc-text export exists in `compiler/` | `check_query.vl` + `entry.vl` export list, `lsp/src/server.ts` ~1002 | days |
 | 24 | **dogfood `match` over the compiler's own kind ladders** | the load-bearing dependency is MET: `match` over `{c:i32}\|{d:i32}` prints **5**, over `i32\|string` prints **1** | `emit_classify.vl` field-code ladders; measured by `ladder-budget.py` (430 + 8 today) | days |
@@ -2141,8 +2141,18 @@ in-language GC knobs.
   Workboard D7.
 - 🟡 **B5. Objects.** REMAINING: methods via `self`+UFCS (B14); typed literals in object values
   (`{n: 4<i64>}`); Exact-by-default for values (A8).
-- 🟡 **B6. Collections — growable `T[]`.** REMAINING: in-place bulk append (deferred — will be
-  `xs.push(...ys)` once variadics land); representation inference (§VL.7 — lower never-grown
+- ⬜ **B6-ro. The `readonly` sweep of `std:array`'s pure readers.** `extend`'s `other` and
+  `concat`'s two parameters are declared `readonly T[]`; the eight other exports that only
+  READ their list are not — `indexOf`, `lastIndexOf`, `includes`, `count`, `reduce`,
+  `reverse`, `mapIndexed` and `sorted`. Widening each accepts a narrower source and a view
+  receiver at no call-site cost, and it is not a breaking change. Do it as one sweep with one
+  fixture per export rather than a module-wide rule in the header, which would state a
+  promise the eight unwidened exports do not keep.
+- 🟡 **B6. Collections — growable `T[]`.** In-place bulk append is **BUILT (2026-09-07)** as
+  `std:array`'s `extend<T>(self: T[], other: readonly T[])`, spelled `xs.extend(ys)`; the
+  `xs.push(...ys)` spelling still needs a `...` token, a rest parameter and variadics, none of
+  which exist, and that trio is one owner decision rather than three items. REMAINING:
+  representation inference (§VL.7 — lower never-grown
   values to a header-less fixed array); `map`/`filter` build-side generics for `Map`/`Set` (A10);
   `.vl`-std migration once a module system exists. (design: `docs/guide/collections-design.md`)
 - 🟡 **B6a. `Map` + `Set`.** The **struct/variant FIELD position is DONE** — `{[i32]: V}` now ships
@@ -3073,8 +3083,17 @@ independent).*
     ("`u8` is a storage type, not a value type"). Bytes are
     represented as `i32` masked `& 0xff` in `wasmEmit.vl` and round-trip/instantiate fine; a real
     packed byte buffer (B7/B6 `(array i8)`) would drop the 4×-wide detour. (detail: `docs/internals/selfhost-gaps.md` §H4.1)
-  - ⬜ **H4.6. Array spread / concat in call position (worked around).** A small `appendAll()` loop
-    helper covers bulk-append today; `xs.push(...ys)` lands with variadics (B6). (detail: `docs/internals/selfhost-gaps.md` §H4.6)
+  - 🟡 **H4.6. Array spread / concat in call position.** Bulk append is BUILT as `std:array`'s
+    `extend` (B6); `xs.push(...ys)` still lands with variadics. **FOLLOW-UP, not taken here:
+    60 exact bulk-append loops** (`while i < src.length { dst.push(src[i]); i = i + 1 }`) stand
+    in `compiler/` and `std/` — 18 in `typecheck.vl`, 8 in `ast.vl`, 5 each in `emit_rep.vl` and
+    `emit_collect.vl`, 4 in `driver.vl`, 3 each in `wasmEmit.vl`, `format.vl`, `parser.vl` and
+    `emit_mono.vl`, 2 each in `json_walk.vl` and `std/array.vl`, 1 each in `emit_base.vl`,
+    `emit_bignum.vl`, `emit_classify.vl` and `std/fmt.vl`. Migrating them is a code-quality
+    refactor with its own byte-identity question — the compiler's own bytes WOULD change, so
+    the comment-trim proof does not apply — and `compiler/` importing `std:array` has bootstrap
+    implications (the seed would gain a std dependency it does not have today) that need a
+    ruling before the sweep, not during it. (detail: `docs/internals/selfhost-gaps.md` §H4.6)
 - ⬜ **H-M2. Wasm-native distribution (end-state).** The `vl` binary becomes a wasm runtime
   (wasmtime — full WasmGC since v27) + a small host shim. No V8, no binaryen, no Deno.
   **Engine choice re-validated (2026 survey):** wasmtime remains the only standards-track
