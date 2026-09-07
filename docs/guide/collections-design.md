@@ -147,9 +147,12 @@ SHALLOW, exactly as the read-only view is: the elements themselves are shared, s
 One thing `...` is not: it does not spread a **string** — a string is a byte sequence with a
 code-point iteration, not a list of characters.
 
-A `u8[]` spreads like any other list. The one form it does not take yet is a spread MIXED with
-a bare integer (`[...bs, 9]`), which infers `(u8 | i32)[]` and is refused — annotate the
-destination `u8[]` and it runs.
+**A list literal infers `i32[]` for small integers; a `u8[]` comes from an annotation or from
+copying one.** `[1, 2]` is `i32[]`, and so is `[bs[0], 9]` — reading an element of a `u8[]`
+gives you an `i32`. The one inferred exception is the copy `[...bs]`, which is the source's own
+type. So a spread MIXED with a plain element (`[...bs, 9]`) has no inferred element type and is
+refused; write the destination — `const c: u8[] = [...bs, 9]` — and it runs, accepting an
+integer element and range-checking a literal against `0..255`.
 
 ## Summary / recommendation
 
