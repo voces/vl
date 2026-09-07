@@ -174,10 +174,13 @@ critical path with a structural cause attached (`build.rs` emits
 the crate fingerprint every push). Runs 2 and 3 read **16 s and 19 s** for the
 same build — in line with the 15 s median it had inside `ci-native`, and with the
 13.77 s master reading I had called "variance or something not yet found". It was
-variance. The `VL_SEED_KEY` recompile is real and does happen every push; it is
+variance. The recompile is real and does happen every push; it is
 ~17 s, not ~48 s, and it does not make this job the critical path. **One
 observation was enough to name a cause and not enough to size it** — which is why
 item 8 of §3 demands several samples before anyone acts on it.
+
+**And the cause named in that same breath was wrong, which one observation was also
+not enough to settle.** `VL_SEED_KEY` is not why the crate recompiles; §20 measures it.
 
 **The one qualification that survived both samples: the pooling gave −8 s on CI,
 not the −15 s the local 2.8× predicted** (27 → 19/20 s). Four cores cap it, and
@@ -383,7 +386,7 @@ self-compile unless stated.
 | 5 | **Native-align: batch the `vl check` legs** the way RUN/TRAP is batched | the pooled version (shipped) took 27 → 19 s on CI; a `vl check` batch mode would take the remaining ~1,600 process spawns to a handful, and the 4-core cap stops applying | medium: a host `check --batch` mode + per-case verdict files | medium — the per-case verdict is the gate; a batch that blurs verdicts weakens it | the interleaved A/B in §1.5, plus the memo-key sabotage |
 | 6 | ~~**`vl check` allocates more than `vl build`** (649 MB vs 511 MB) while doing less~~ — **CLOSED, §18: the gap is GONE and its SIGN is inverted.** `vl check compiler/entry.vl` peaks at **282.8 MB** against `vl build`'s **504.6 MB**. The filed row was measured while `cli_pump` still used `Collector::Null`; the pump took a collecting collector four days later for an unrelated reason and closed this incidentally. The premise "in the LSP's own path" was also wrong — the LSP instantiates the seed in V8, never through the Rust host. **The excess allocation is real and still there** (`VL_PUMP_GC=null vl check` = 680.0 MB, +175 MB over `build`), it is simply no longer RESIDENT | filed 138 MB; **measured −221.8 MB** (check is 56% of build) | one measurement, no patch | none | fresh-child `wait4` per §2.1 — **with each collector class's sidecar warmed first**, or the cold-compile of §18.2 fabricates ~610 MB for a five-line file |
 | 7 | **Editor latency**: `vl check` on one compiler file is 231 ms | the LSP path; see §4 | unquantified | — | the §4 table |
-| 8 | **`ci-embed-seed` recompiles the whole crate every push** — `build.rs` emits `cargo:rustc-env=VL_SEED_KEY=<hash of the seed>`, so a changed seed invalidates the crate fingerprint by construction | ~17 s off a job that is NOT the critical path (42–74 s against `ci-native`'s 42–50 s) — so this is a "when it is free" item, not a lever | small: compute the key at startup instead — but read `build.rs`'s header first, it is baked in to avoid hashing ~1 MB per invocation | low, but it trades a CI second for a runtime millisecond, which is the wrong direction if done naively | several samples of `Finished \`release\` profile in Xs` — three readings were 48 s, 16 s and 19 s, so ONE sample cannot size this |
+| 8 | ~~**`ci-embed-seed` recompiles the whole crate every push** — `build.rs` emits `cargo:rustc-env=VL_SEED_KEY=<hash of the seed>`, so a changed seed invalidates the crate fingerprint by construction~~ — **REFUTED, §F7. The symptom is real and the CAUSE named here is not.** Cargo's own dirty reason is `stale: changed …/build/vl-compiler.wasm`, an MTIME comparison against `cargo:rerun-if-changed`; removing the baked key entirely and computing it at run time leaves a same-bytes `touch` recompiling exactly as before (3.7 s, `Compiling vl: 1`). The directive cannot go: dropping it makes the touch free (0.2 s) and silently ships a STALE seed — a 4 KB-larger seed on disk, the old one still in the binary, cargo reporting success | **zero.** Six master runs: `ci-embed-seed` 47–92 s against `ci-native`'s 156–204 s, so its whole 17–24 s cargo step is off the critical path — and the dev build and `ci-native` never recompile at all (0.1 s, nothing compiled), because `build.rs` returns before emitting any `rerun-if-changed` without the feature | **NOT SMALL AND NOT AVAILABLE**: the only change that meets the criterion is the unsafe one, and the filed one costs +0.85 ms per invocation of a distributed binary (item 4's measured 4-lane figure) to buy nothing | the four-candidate ablation and the six-run CI table, §20 |
 
 **Explicitly NOT on this list, and why:**
 
@@ -3868,3 +3871,96 @@ filed-vs-shipped split"*. Only the banded `bytes` column moved:
 that removes a call and adds one instruction should look like. `map-i32` and
 `str-eq` are dead-unmoved because neither path was touched, and that is the
 control saying the moved rows moved for the stated reason.
+
+## 20. Item 8 / ROADMAP row 13 — REFUTED. The symptom is real, the cause is not, and the filed fix is unsafe in the one form that works
+
+Filed as: *`build.rs` bakes `VL_SEED_KEY`, so every seed push recompiles the crate.* The
+direction attached to it was to compute the key at RUN time from the embedded bytes, so a
+seed push touches no Rust source. Four candidates were built and measured. **The filed fix
+changes nothing, and the only candidate that meets the criterion ships a stale binary.**
+
+### 20.1 The scope is narrower than filed: no dev build recompiles at all
+
+`build.rs` returns before it emits any `rerun-if-changed` unless `--features embed-seed` is
+on. The seed lives outside the package, so a plain `cargo build --release` cannot see it —
+which is every local build, every `gate.sh`, and `ci-native`.
+
+| dev build (no features) | wall | `Compiling vl` |
+| --- | ---: | ---: |
+| no change | 0.1 s | 0 |
+| after `touch build/vl-compiler.wasm` | 0.1 s | 0 |
+| after a real seed CONTENT change | 0.1 s | 0 |
+
+"Every seed push recompiles the crate" is true only of `--features embed-seed`.
+
+### 20.2 Cargo names the cause, and it is not the key
+
+With `CARGO_LOG=cargo::core::compiler::fingerprint=trace`, after a same-bytes `touch`:
+
+```
+INFO … fingerprint: stale: changed ".../scripts/vl-host/../../build/vl-compiler.wasm"
+INFO … fingerprint:           (vs) ".../target/release/build/vl-db55598ba3531c38/output"
+INFO … fingerprint:                FileTime { 1788792241 } < FileTime { 1788792244 }
+```
+
+An **mtime** comparison against the path in `cargo:rerun-if-changed`. The key's VALUE is
+never consulted; identical bytes are enough to dirty the unit.
+
+### 20.3 The ablation — four candidates, one table
+
+Same box, same warm target dir, `--features embed-seed`, seed touched with IDENTICAL bytes:
+
+| candidate | touch → wall | `Compiling vl` | correct? |
+| --- | ---: | ---: | --- |
+| master | 18.3 s | 1 | yes |
+| P1 · stage OUT_DIR only when the bytes differ | 6.7 s | 1 | yes |
+| **P2 · the filed fix** — no baked key, `seed_content_key(EMBEDDED_SEED)` at run time | **3.7 s** | **1** | yes, at +0.85 ms per invocation |
+| P3 · drop `cargo:rerun-if-changed` on the seed | **0.2 s** | **0** | **NO** |
+
+P2 is the brief's own direction applied in full — `VL_SEED_KEY` gone from `build.rs`, the
+cache named at run time — and it recompiles exactly as master does. P1 is not the cause
+either. **Only P3 meets the criterion, and P3 is the one that must never ship:**
+
+```
+P3-2 after the seed GREW by 4096 bytes        0.2s   Compiling vl: 0
+  on-disk seed: 2342381 bytes
+  embedded seed: 2338285 bytes
+```
+
+The binary keeps the OLD seed, cargo reports success, and nothing says so. That directive is
+load-bearing: the seed is compiled INTO the binary by `include_bytes!`, so **a genuinely
+changed seed MUST recompile** — the recompile is the correctness property, not the defect.
+What is left over is the same-bytes `touch`, an unavoidable false positive of any mtime-based
+dependency, costing one recompile and then settling (the next build is 0.2 s).
+
+### 20.4 And the saving would have been zero
+
+Six consecutive master runs, `gh run view --json jobs`:
+
+| run | `ci-native` | `ci-embed-seed` | its cargo step |
+| --- | ---: | ---: | ---: |
+| 34134118522 | 192 s | 47 s | 17 s |
+| 34133369580 | 204 s | 54 s | 24 s |
+| 34132916811 | 198 s | 47 s | 18 s |
+| 34132495836 | 198 s | 92 s | 24 s |
+| 34131721184 | 156 s | 53 s | 22 s |
+| 34131120665 | 171 s | 62 s | 22 s |
+
+`ci-embed-seed` finishes 100+ s before `ci-native` on every sample, so deleting its entire
+cargo step buys **no wall clock at all** — and `ci-embed-seed` restores `ci-native`'s
+target-dir cache, which by that job's own design never contains `embed-seed` artifacts, so it
+compiles the crate cold each run for a reason the seed key has nothing to do with.
+
+### 20.5 What this cost, and the rule it earns
+
+Item 8 already demanded several samples before anyone acted on it, and that guard worked —
+the SIZE was right. **The CAUSE was carried unmeasured for as long, in the same sentence, and
+nothing demanded a sample of it.** A cost has two halves and only one of them was ever
+instrumented here.
+
+> **A structural cause named beside a timing is a HYPOTHESIS with a number stapled to it.**
+> Ablate the named cause before scheduling the fix: build the candidate that removes exactly
+> it, and measure. It costs one build. Here it would have saved the whole item, and it
+> refuted the fix in a single reading — the filed change was already known to trade a CI
+> second for a runtime millisecond, and it turns out not to buy the second.
+
