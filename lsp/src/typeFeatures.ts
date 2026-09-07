@@ -1207,6 +1207,7 @@ export const VL_SOFT_KEYWORDS: readonly string[] = [
   "from",
   "in",
   "new",
+  "readonly",
   "step",
   "to",
 ];

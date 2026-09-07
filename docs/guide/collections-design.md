@@ -78,6 +78,46 @@ question**: `bytes.push(v)` keeps the low byte and never complains, `bytes.push(
 insists the value was already a byte. Whether the implicit store should require the cast is
 NOT decided — the store's truncation is unchanged by this ruling.
 
+**`readonly T[]` is a READ-ONLY VIEW of a list, and it is covariant** (owner ruling
+2026-09-06). It is spellable wherever a type is written — parameter, binding, struct field,
+return, map value, generic argument — and it is a view, not a copy: the same value at the
+same representation, so handing a `T[]` to a `readonly T[]` position costs nothing.
+
+```vl
+type Circle = { r: i32 }
+type Shape = Circle | { s: i32 }
+function total(xs: readonly Shape[]): i32 { xs.length }   // never writes its argument
+const circles: Circle[] = [{ r: 7 }]
+print(total(circles))                                     // covariant: a Circle[] passes
+```
+
+Two rules, and they are the whole feature:
+
+* **A view forbids writes to the LIST** — `push`, `pop`, `clear`, and index assignment
+  (`xs[0] = v`) are refused on a `readonly T[]` receiver. `.map`, `.filter` and `.slice`
+  build a NEW list and hand back an ordinary mutable `T[]`.
+* **A view is SHALLOW** — the marker is on the list, not on what the list holds. Writing an
+  element's own field through a view (`xs[0].r = 2`) is allowed and is visible through
+  every other handle on the same list, as Kotlin's `List` and C#'s `IReadOnlyList` are.
+
+`T[]` converts to `readonly T[]`; **`readonly T[]` never converts back to `T[]`**, at any
+position, or a single binding would launder every write the view forbids. `readonly` binds
+the outermost list, so `readonly T[][]` is a read-only list of ordinary mutable lists, and
+`(readonly T[])[]` is a mutable list of views. It is a contextual keyword: a declared type
+named `readonly` still resolves.
+
+One refusal is not the receiver's own: an un-annotated type parameter whose body writes the
+list (`function grow<T>(xs: T) { xs.push(1) }`) refuses a view at the CALL, because the body
+checked its write against a list the compiler synthesized for the hole and nothing else would
+compare that to the argument. Read-only uses through the same parameter (`xs[0]`, `xs.length`)
+are unaffected, and spelling the parameter `readonly T[]` says the body only reads.
+
+Covariance is where the view earns its place. A `Circle[]` delivered into a `Shape[]` needs
+an element-converting copy, which is only sound where nothing writes either list — and the
+compiler proves that by following every handle, which it cannot always do. A `readonly`
+parameter makes the proof unnecessary: nothing may write through it, so the delivery is
+licensed by the type rather than by an analysis (D1686, D1687).
+
 ## Summary / recommendation
 
 **VL has one user-facing collection, spelled `T[]`** — a growable, ordered,
