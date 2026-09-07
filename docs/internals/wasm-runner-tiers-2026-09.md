@@ -23,12 +23,15 @@ not from a comment. Two files that merely name one in prose (`module_gate_agreem
 | `vl_instance_state_leak_test.ts` | standalone | seed, one SHARED instance | emission byte-identity against a fresh-instance oracle |
 | `vl_reexport_abi_test.ts` | standalone | native `vl build` | the EXPORT section aliases the public name |
 | `vl_std_process_test.ts` | standalone | native `vl build` | `std:process` / `std:env` across both hosts |
+| `vl_trap_source_frames_test.ts` | standalone | native `vl build` | the trap's per-instruction source block, asserted for BOTH hosts |
 | `vl_seed_abi_test.ts` | seed ABI | none — instantiates the SEED | the seed's own export shape; not emitted user wasm |
 
-**Nine files execute emitted user wasm, not eight** — four shards and five standalone suites.
-The row said four standalone; `vl_std_process_test.ts` arrived and nothing was counting. That
-is the whole argument for deriving it: `tests/vl_wasm_runner_census_test.ts` now fails until a
-new runner is classified.
+**Ten files execute emitted user wasm** — four shards and six standalone suites. The row said
+four standalone; `vl_std_process_test.ts` had arrived and nothing was counting, and
+`vl_trap_source_frames_test.ts` became the sixth the same week. That is the whole argument for
+deriving it: `tests/vl_wasm_runner_census_test.ts` fails until a new runner is classified, and
+it has already earned that — the sixth arrived in a PR gated on a tree without this table, and
+the census went red on the merged master rather than letting the runner in unseen.
 
 ## Nothing in that table is redundant, and each claim was checked
 
@@ -68,14 +71,19 @@ Not byte identity — nothing here emits bytes to compare. **The graded-cell SET
 
 ```
 $ python3 scripts/wasm-runner-census.py --cells | head -1
-corpus cells graded by the oracle shards: 3100
+corpus cells graded by the oracle shards: 3102
 ```
 
-Validated against the oracle itself rather than trusted: the four shards report 776 + 770 + 768
-+ 774 = **3,088 passed** plus **13 ignored** = 3,101 registered tests, which is the 3,100 cells
-plus shard 0's stale-entry tripwire. A `.vl` glob answers 3,210 instead, because the oracle
-yields ONE case for a directory holding an `entry.vl` — a file count wearing a cell count's
-clothes, and the second test in the census suite exists to keep the two walks from drifting.
+**That is a reading with a date on it, not a constant** — the corpus grows, and it moved by two
+between this doc landing and the next master. What must not move without being seen is the SET
+across a refactor, which is why the instrument prints it rather than the doc asserting it.
+
+Validated against the oracle itself rather than trusted: measured at 3,100 cells, the four
+shards reported 776 + 770 + 768 + 774 = **3,088 passed** plus **13 ignored** = 3,101 registered
+tests, which is the cells plus shard 0's stale-entry tripwire. A `.vl` glob answered 3,210
+instead, because the oracle yields ONE case for a directory holding an `entry.vl` — a file
+count wearing a cell count's clothes, and the second test in the census suite exists to keep
+the two walks from drifting.
 
 ## What this PR changed, and what it did not
 
