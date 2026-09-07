@@ -1499,8 +1499,8 @@ in-language GC knobs.
      2026-09-06; plan, order and numbers: `docs/internals/rep-descriptor-campaign.md`.**
      Stage B widened the PRODUCER; Stage C converts the population on the other side of the
      seam, which nothing had counted. `scripts/rep-classifier-census.py` derives it from the
-     tree: **517 rep classifiers over 2,958 call sites**, 138 reading the ARENA, 117 a NAME,
-     28 a SPELLING, 132 a TABLE column and 221 a FRAME. Every conversion is graded by the
+     tree: **519 rep classifiers over 2,962 call sites**, 138 reading the ARENA, 117 a NAME,
+     28 a SPELLING, 132 a TABLE column and 223 a FRAME. Every conversion is graded by the
      **ladder-vs-descriptor agreement oracle** (`repABNote`/`repLadderABSweep`, riding
      `$VL_REP_SHADOW`; buckets AGREE / CONTRADICT / LEFT-ONLY / RIGHT-ONLY) at **0 CONTRADICT
      over `tests/cases` + the distilled corpus** before its ladder is deleted, then by byte
@@ -1516,7 +1516,7 @@ in-language GC knobs.
         (`fnStmtsPosOf`) → `fnIndexOfInScopeSid` (walking `fnParent` then `fnInstOrigin`) →
         declaration → type. The five-row monomorphizer family (D1781, D1782, D1788, D1795,
         D1817) is every site that should have called it. Lands before item 4.
-     4. ⬜ **The `expr*` family** — 48 classifiers, 926 call sites, 31% of all classifier call
+     4. ⬜ **The `expr*` family** — 48 classifiers, 927 call sites, 31% of all classifier call
         sites. Converted by AXIS, since each is a closed set whose siblings must move
         together: (a) the seven scalar-list predicates, (b) the six nullable niches, (c) the
         three scalars, (d) the reference shapes.

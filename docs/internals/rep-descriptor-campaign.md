@@ -1,6 +1,6 @@
 # One rep per node — the classifier census, the descriptor, and the conversion order
 
-The emitter answers *"what representation does this value have?"* in **517 places**. This
+The emitter answers *"what representation does this value have?"* in **519 places**. This
 document is the measured inventory of those places, the definition of the single descriptor
 they are to become projections of, the oracle that grades each conversion, and the order the
 conversions run in.
@@ -34,13 +34,13 @@ its type. `retResultVKind` is why — one `VKind` literal and THREE producers
 (`vtKindOfType(fn.fnRet)`, the `fnReturnsClosure` predicate, the `fRetKind` table), which is
 the exact shape this census exists to find and which an arm count cannot see.
 
-Quoted verbatim, run on `350c65237` (the merge-base):
+Quoted verbatim, run on `b7a666856` (the merge-base):
 
 ```
 $ python3 scripts/rep-classifier-census.py --summary
-population        2948 top-level functions in scope
-classifiers       517
-call sites        2958
+population        2949 top-level functions in scope
+classifiers       519
+call sites        2962
 vocabularies      VKind 31 members · Ty arena 11 variants
 
 by result class
@@ -48,21 +48,21 @@ by result class
   VKIND-LIT    170 classifiers     935 call sites
   SLOT          63 classifiers     285 call sites
   REPNAME       40 classifiers     179 call sites
-  REPBOOL      192 classifiers    1192 call sites
+  REPBOOL      194 classifiers    1196 call sites
 
 by ladder shape
   ARENA-IS      42
-  NODE-IS      203
+  NODE-IS      204
   VKIND-LIT    157
-  PREDICATE     85
+  PREDICATE     86
   MATCH         10
 
 by what it READS (DIRECTLY; a classifier may read several, so the sets are not disjoint)
   ARENA        138 classifiers     903 call sites
   NAME         117 classifiers     635 call sites
   SPELLING      28 classifiers     156 call sites
-  TABLE        132 classifiers    1148 call sites
-  FRAME        221 classifiers    1735 call sites
+  TABLE        132 classifiers    1149 call sites
+  FRAME        223 classifiers    1739 call sites
 
 the pairs that matter — a rep answered from two different producers
   ARENA + NAME         33
@@ -72,8 +72,8 @@ the pairs that matter — a rep answered from two different producers
   ARENA + FRAME        46
 
 by file
-  compiler/emit_classify.vl     356 classifiers    2396 call sites
-  compiler/wasmEmit.vl           57 classifiers     140 call sites
+  compiler/emit_classify.vl     356 classifiers    2397 call sites
+  compiler/wasmEmit.vl           59 classifiers     143 call sites
   compiler/emit_collect.vl       31 classifiers      60 call sites
   compiler/emit_rep.vl           22 classifiers     122 call sites
   compiler/emit_base.vl          16 classifiers     117 call sites
@@ -93,14 +93,14 @@ call graph, and **the answer is that it saturates**:
 
 ```
 $ python3 scripts/rep-classifier-census.py --summary --deep
-  ARENA        418 classifiers    2480 call sites
-  NAME         344 classifiers    2273 call sites
-  SPELLING     337 classifiers    2258 call sites
-  TABLE        361 classifiers    2359 call sites
-  FRAME        329 classifiers    2229 call sites
+  ARENA        420 classifiers    2484 call sites
+  NAME         346 classifiers    2277 call sites
+  SPELLING     339 classifiers    2262 call sites
+  TABLE        363 classifiers    2363 call sites
+  FRAME        331 classifiers    2233 call sites
 ```
 
-330-odd of the 517 read all five producers transitively. That is not a finding about the
+330-odd of the 519 read all five producers transitively. That is not a finding about the
 classifiers, it is a finding about the closure: **the transitive column cannot discriminate
 and must not be quoted as evidence.** The DIRECT column is the one that separates a
 classifier which decides from a spelling from one that decides from the arena. `--deep`
@@ -112,7 +112,7 @@ Grouped by name prefix, one line each, from the same run:
 
 | family | classifiers | call sites |
 | --- | --- | --- |
-| `expr*` | 48 | 926 |
+| `expr*` | 48 | 927 |
 | `ty*` | 25 | 69 |
 | `ret*` | 20 | 94 |
 | `letIs*` | 18 | 100 |
@@ -121,7 +121,7 @@ Grouped by name prefix, one line each, from the same run:
 | `union*` | 16 | 107 |
 | `clo*` | 15 | 78 |
 | `scalar*` | 12 | 55 |
-| (every other prefix) | 330 | 1346 |
+| (every other prefix) | 332 | 1349 |
 
 `expr*` is **31% of every classifier call site in the emitter** and is one question asked
 48 ways: `exprIsF64(e, fn)`, `exprMap(e, fn)`, `exprRefArray(e, fn)`, `exprNullableStruct(e,
@@ -394,7 +394,7 @@ queries                368695
 
 **3,366,947 of 3,366,947 queries agree, over 10,734 modules.** The ladder was then deleted.
 
-**Byte identity** on the MERGED tree (`350c65237` + this change), both arms built from one
+**Byte identity** on the MERGED tree (`b7a666856` + this change), both arms built from one
 seed — `A` from the merge-base's source, `B` from the candidate's — and every emitted module
 compared on sha256 and exit code:
 
@@ -405,7 +405,7 @@ files A=7589 B=7589
 DIFFERING FILES: 0
 ```
 
-The candidate compiler is 2,289,121 bytes against the merge-base's 2,286,406: **+2,715
+The candidate compiler is 2,289,457 bytes against the merge-base's 2,286,742: **+2,715
 (+0.12%)**, all of it the oracle scaffolding, since the conversion itself emits no byte
 differently.
 
@@ -470,7 +470,7 @@ recommendation. Neither is decided here.
 
 | number | instrument |
 | --- | --- |
-| 517 classifiers / 2,958 call sites / the reads columns | `scripts/rep-classifier-census.py`, on `350c65237` |
+| 519 classifiers / 2,962 call sites / the reads columns | `scripts/rep-classifier-census.py`, on `b7a666856` |
 | the per-family table | the same, `--json`, grouped by name prefix |
 | every AGREE / CONTRADICT count | `VL_REP_SHADOW=1 vl build`, aggregated over the two populations |
 | byte identity | two candidate compilers from ONE seed, sha256 per emitted module |
