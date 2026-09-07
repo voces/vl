@@ -5339,13 +5339,13 @@ export function mvShapeOfMapName(mapName: string) {
   mvShapeOfMapNameArmTy(mapName, -1)
 }
 
-// `mvShapeOfMapName` plus the arm-only type hint (D34). `armTy` is the map value's arena type
-// as the caller's node recorded it, used for exactly one question inside the mint — whether
-// the value is a declared union arm. It never reaches a slot lookup rung: a better answer at
-// the find rung skips the mint, while one consulted after cannot move which slot is minted.
+// `mvShapeOfMapName` plus the map value's arena type as the caller's node recorded it (D34).
+// It answers the arm question inside the mint, AND stands in for the row the value name would
+// resolve to: a RECURSIVE alias reaches here already rendered, so slicing its value out of the
+// spelling mints an unrolled anonymous twin of the declared type instead of finding it (D1865).
 export function mvShapeOfMapNameArmTy(mapName: string, armTy: i32) {
   const ki = nameIsI32KeyedMap(mapName)
-  const sh = mvShapeOfValNameArmTy(mapValNameOf(mapName), ki, -1, armTy)
+  const sh = mvShapeOfValNameArmTy(mapValNameOf(mapName), ki, armTy, armTy)
   // A mono value — i32, boolean, a literal-union atom or a nullable atom — rides the shared
   // i32 `vals` list and needs no per-value struct, so it is the `-1` string-keyed or `-4`
   // i32-keyed sentinel every value-blind classifier already reads as the mono rep.
@@ -17586,7 +17586,10 @@ function ensureRefElemKindTail(elemName: string, k: i32, ty: i32) {
     let mve = elemName
     const nme = nulMapInnerName(elemName)
     if nme != "" { mve = nme }
-    mvShapeOfMapName(mve)
+    // The element's own arena row carries the map value, so a RECURSIVE alias element
+    // resolves to the declared type rather than the unrolled anonymous twin its rendered
+    // spelling would mint (D1865). `-1` in, `-1` through: the unhinted call is unmoved.
+    mvShapeOfMapNameArmTy(mve, tyMapValOf(unMemPeelAliasWrapper(ty)))
     // The one home that also sets `mI32Used` for an i32-keyed map reached only through a
     // map-typed ref-list element — every other map-forcing site sets `mUsed`/`lUsed`/`aUsed`
     // alone. Without it the key temporary aliases the map-ref temporary at the same local
@@ -23169,14 +23172,15 @@ export function unionHasMapArmSlot(name: string, slot: i32) {
       isMap = a != "null" && nameIsMap(a)
     }
     if isMap {
-      // The arm's value type is already in hand when the arena decided the arm: `mems[i]`
-      // is this atom's `TyMap`, so the slot lookup takes one hop instead of re-parsing
-      // `mapValNameOf(a)`. An arena-blind row passes -1 and the name leg answers as before.
       let aVt = -1
-      if cov { aVt = tyMapValOf(mems[i]) }
-      if (mvCanonRepOf(mvSlotOfMapNameTy(a, aVt)) == mvCanonRepOf(slot)) {
-        return true
+      if cov { aVt = tyMapValOf(unMemPeelAliasWrapper(mems[i])) }
+      let armSlot = -1
+      if cov && !nameIsMap(a) {
+        armSlot = mvSlotOfMapRow(unMemPeelAliasWrapper(mems[i]))
+      } else {
+        armSlot = mvSlotOfMapNameTy(a, aVt)
       }
+      if (mvCanonRepOf(armSlot) == mvCanonRepOf(slot)) { return true }
     }
     i = i + 1
   }
@@ -28157,10 +28161,23 @@ export function unionSetNonNullCount(set: string): i32 {
 // carries is structural here for free: a union whose FIRST atom is a map renders as a
 // `{[`-prefixed name but IS a `TyUnion`, never a `TyMap`.
 export function unMemIsMap(m: i32): boolean {
+  unMemPeelAliasWrapper(m) >= 0 && tyIsMapRow(unMemPeelAliasWrapper(m))
+}
+
+function tyIsMapRow(m: i32): boolean {
   if m < 0 { return false }
   const t = T.tys[m]
   if t is TyMap { return true }
   false
+}
+
+export function unMemPeelAliasWrapper(m: i32): i32 {
+  if m < 0 { return m }
+  const t = T.tys[m]
+  if t is TyUnion {
+    if t.uMembers.length == 1 { return t.uMembers[0] }
+  }
+  m
 }
 
 // A bare-closure member (`(() => i64) | i32` — value-atom kind 11).
@@ -32352,6 +32369,15 @@ function mvSlotOfMapName(mapName: string): i32 {
 // The `Ty` form (D-MAPNODETY): `valTy` is the map VALUE's banked arena type when the caller
 // holds the node, else -1. There is deliberately NO intern-side twin of this — the intern
 // path is `mvShapeOfMapName`, and its header says why it does not get one.
+function mvSlotOfMapRow(row: i32): i32 {
+  const ki = tyMapKeyIsI32(row)
+  const vt = tyMapValOf(row)
+  if vt < 0 { return mapMonoShapeOfKey(ki) }
+  const sl = mvSlotOfMapValNameOrMonoKTy(tyToEmitName(vt), ki, vt)
+  if sl == -1 { return mapMonoShapeOfKey(ki) }
+  sl
+}
+
 function mvSlotOfMapNameTy(mapName: string, valTy: i32): i32 {
   // The KEY comes off the map spelling, exactly as on the intern side
   // (`mvShapeOfMapName`); a MONO value needs no slot on either key rep, so it is the
