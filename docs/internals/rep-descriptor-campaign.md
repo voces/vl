@@ -361,9 +361,11 @@ Ranked by blast radius ascending against disagreeing-producer count descending.
    `repSlotOfTy` for `TyObj` alone), and a slot is nominal where the rest of the descriptor is
    structural. Nothing earlier depends on it.
 
-**And separately, on the same clock: `repOfName(name, fnIx)`.** It is not a ladder conversion
-— it is the missing surface §3.3 names, and the five-row monomorphizer family is its
-evidence. It should land before step 3, because `repOfExpr`'s `Ident` arm is exactly it.
+**And separately, on the same clock: the name surface — BUILT, as `repOfNameResult`.** §6.2
+has its measurements and the one refinement it forced: of the five monomorphizer rows, only
+the return-kind readers wanted a REP. The other three wanted the SLOT and the `$fnsig` key,
+and the slot already has one home (`fnIndexOfInScope`). `repOfExpr`'s `Ident` arm still wants
+the binding-resolution half, which is a separate surface and is named in §6.2.
 
 ---
 
@@ -444,6 +446,60 @@ because a ruling could retire either:
   never has: a void expression has no arithmetic width to report.
 * a **string literal-union array element** — the interned i32 atom, which `repOfArray` reps as
   the i32 `list` and this vocabulary has never claimed.
+
+---
+
+### 6.2 The name surface — `repOfNameResult`, and what it did NOT need to be
+
+The five pin-context rows (D1781, D1782, D1788, D1795, D1817) each rebuilt a piece of one
+resolution by hand. Converting them onto a single surface answered a question this document
+could only guess at in §3.3: **only two of the five wanted a rep at all.**
+
+| row | what its rung actually wants | served by |
+| --- | --- | --- |
+| D1788, D1781 | the REP of the call's result | **`repOfNameResult`** — new |
+| D1782 | the `fnStmts` SLOT a binding's target resolves to | `fnIndexOfInScope`, already one home |
+| D1795 | the `$fnsig` KEY of a function value | `fnIndexOfInScope` + `fnSigKeyOf`, already one home |
+| D1817 | the walk itself | `fnIndexOfInScopeSid`'s `fnInstOrigin` hop, already one home |
+
+So the surface this campaign owed is narrower than "a rep for a name": it is **the rep of what
+calling a name in a frame yields**, and the walk under it was already unified. `repOfName` for
+a BINDING is a different and larger surface — `declaredSlotOf` takes a bare name, and
+`paramTypeNode` / `globalLetOfSidIn` take `fnIx` only as a frame-binds-this-name veto rather
+than as a scope-chain walk. That asymmetry (callee resolution frame-aware since D1781; binding
+resolution not) is what `repOfExpr`'s `Ident` arm will have to reconcile, and it is filed here
+rather than guessed at.
+
+**What it is.** `repOfNameResult(sid, name, fnIx) -> RepDesc` is the one home for the walk and
+for the three return columns that answer after it — `fRetKind` into `rdKind`, `fRetStructIdx`
+into `rdSlot`, `fRetRArrElem` into `rdListElem`. The columns are pushed together in
+`buildFnMap`'s single loop over `fnStmts`, so an index valid for one is valid for all three;
+reading them together is what makes this a descriptor rather than three lookups that can
+drift. `rdNul` is `REP_NUL_UNANSWERED` (-1), not 0: these columns carry no null discipline,
+and a 0 would read as one.
+
+**Fourteen readers became projections of it**, and the two `#2815` left behind gained the
+calling frame in the same move — which is the whole of D1834's fix.
+
+**The oracle at this surface compares the FLAT map against the frame-aware walk**, so a
+disagreement is one site where a per-pin clone would have adopted its template's rep:
+
+```
+tests/cases (3,150 modules)          distilled corpus (7,589 cells)
+  slot differs                3669     slot differs                   0
+  … and the KIND differs       814     … and the KIND differs         0
+```
+
+Every one of the 814 is in one of eight modules, and all eight are the pin-context fixtures
+themselves — `nested-capture-per-pin-container-kinds`, `-return-kinds`, `-clone`,
+`nested-lambda-in-generic-body-per-instance`, `pin-argument-recheck-ok`,
+`nested-named-fn-names-enclosing-typaram`, `nested-concrete-shadows-generic-homonym`, and one
+body-scope shadowing fixture. **No inventory row is owed by the oracle**: the contradictions
+are the walk doing its job, not a defect, and no site outside the known family contradicts.
+
+**Byte identity**, both arms from one seed: `3,150 of 3,150` `tests/cases` modules and
+`7,589 of 7,589` corpus cells identical — the conversion moves no byte, and D1834's fix is
+observable only on the fixture it ships with, because no existing module had the shape.
 
 ---
 
