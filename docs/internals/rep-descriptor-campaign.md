@@ -1149,7 +1149,7 @@ separates the one live clamp from the three that are not.
 
 ---
 
-### 7.7 Step 2 is VETOED, and the veto names the blocker — it is the NAME, not the consumers
+### 7.7 Step 2 was VETOED, and the veto named the NAME — right that far, wrong about why
 
 §7.6 set the order: convert the 31 BLIND consumers so they can take a decline, then narrow
 `refListSlotOfExpr`'s clamp. Step 2 was built in a scratch tree to find out which consumers
@@ -1171,12 +1171,18 @@ of the result and says the 31 BLIND sites are not reached with a miss by any pro
 
 **And the failure is not a consumer that cannot take a decline.** A probe on the name the walk
 looks up says so directly: in that module `refListSlotOfExpr` clamps **28 times, and the name
-is the EMPTY STRING every time.** Inside a monomorphized instance of `indexOf<T>(self: T[], …)`
-the receiver's element is a type variable, and a type variable renders as `""` — the same
-empty render D1794 recorded at the array-element position. So `rlSlotByName("")` misses, and
-the miss is not *"no row exists"* but *"the name that would have found it was never
-rendered"*. The clamp then hands back slot **0**, which is the right row here — so the program
-compiles and prints correctly. **The clamp is load-bearing, and load-bearing by luck.**
+is the EMPTY STRING every time.** So `rlSlotByName("")` misses, and the miss is not *"no row
+exists"* but *"the name that would have found it was never rendered"*. The clamp then hands
+back slot **0**, which is the right row here — so the program compiles and prints correctly.
+**The clamp is load-bearing, and load-bearing by luck.**
+
+**The cause this section then inferred is wrong, and §7.8 is the measurement that refutes it.**
+It read the empty name as a type variable rendering as `""` — D1794's shape at a new position —
+and named the fix as the pin (`pinnedHoleTyOf` / `pinResolvedFnTy`). A probe at the clamp
+reports the opposite: the monomorphizer has already rewritten the instance's annotations to
+concrete spellings, and the pin is not merely unread but **POISONED**, because `holePinTys` is
+keyed on the type-variable NAME alone and every generic in `std:array` calls its variable `T`.
+The name is empty for two ordinary reasons in the walk itself, neither of them a `TyVar`.
 
 That is the D1040/D1106/D1500 shape seen from the other side: an in-band sentinel silently
 *saving* a program instead of silently breaking one, and equally invisible either way.
@@ -1194,8 +1200,8 @@ the narrowing can validate them, which is after the name is fixed.
 
 **So the order §7.6 set is right and its first step is different from what it named:**
 
-1. **Fix the empty element render in a monomorphized generic body** (D1794's mechanism at this
-   position). Until then the clamp cannot narrow.
+1. **Resolve the element name in a monomorphized generic body.** Until then the clamp cannot
+   narrow. (§7.8 does this; the mechanism is not the one this list originally named.)
 2. Then narrow, which is the only thing that makes the 31 declines testable and turns
    §7.6's **35 dead guards** back into live ones.
 3. `repOfTy`'s `rdSlot` reaching bank B remains step 3 and is needed by neither.
@@ -1208,6 +1214,68 @@ isolated. A row whose `Repro` does not reproduce is worse than no row (D957 is t
 and the `filed witnesses` gate would run it and grade it wrong. **Minimising this witness is
 the first task of the next lane**, and the row follows the program, not the other way round.
 
+
+---
+
+### 7.8 Step 2 LANDS — the empty name was two declining rungs, not a type variable
+
+§7.7's veto was correct and its diagnosis was not. Probing the clamp instead of reading the
+code around it gives the input directly, and it says the pin is the wrong place to look.
+
+| what the probe reads at each of the 14 clamps in the minimised witness | value |
+| --- | --- |
+| `self`'s rewritten param annotation | `(i32[][]\|null)[]` — **concrete** |
+| `needle`'s rewritten param annotation | `(i32[][]\|null)` — **concrete** |
+| `pinnedHoleTyOf` of the node's own type | **POISONED (-2)** |
+| `paramRefArrayName(fnIx, "self")` | `i32[][]\|null` — **resolves** |
+
+**The pin is poisoned rather than missing, and that is structural, not incidental.**
+`holePinTys` is a `{[string]: i32}` keyed on the type-variable NAME across the whole program;
+`notePinnedHole` poisons a row to `-2` the moment two calls disagree. Every generic in
+`std:array` names its variable `T`, so `T` is poisoned in any program using two of them. This
+is the alias-set defect (#2629) one layer down — a table keyed on a NAME where the question is
+`(name, frame)` — and it means the pin route §7.7 named could not have worked here.
+
+**The two real rungs, both in `refListElemNameOfExpr`, both about a NULLABLE ref list:**
+
+* The `Index` arm asks `nameIsArray(outer)`. `outer` resolves correctly to `i32[][]|null`,
+  whose last two characters are `ll`, so the nested-array rung declines. The kind-18 nullable
+  rung above it is gated on `narrowVariantFor`, and `indexOf` compares `self[i] == needle`
+  with no null narrow.
+* The `Ident` arm reaches `paramNulRefArray`, which asks the ARENA and answers **true**, then
+  hands the SPELLING to `nullablePartOf`, which splits on a **depth-0** bar. The
+  monomorphizer's grouped `(i32[][]|null)` hides the bar at depth 1, so it answers `""`.
+
+The second is the campaign's own subject: **the arena and the name disagree about one type**,
+one saying "nullable ref array" and the other refusing to decompose it. Both fixes are local —
+peel the group before `nullablePartOf`, and give the `Index` arm the nullable-element rung its
+narrowed sibling already has. `nullablePartOf` itself is untouched: it has 76 callers, and the
+bar forbids widening a domain to fix one site.
+
+**Measured, on the two populations §6.5 used:**
+
+```
+fix vs fix+narrowing   tests/cases 3182/3182   distilled 7589/7589   DIFFERING FILES: 0
+master vs fix+narrowing tests/cases 3182/3182  distilled 7589/7589   DIFFERING FILES: 0
+```
+
+**Zero differing modules against master over 10,771 programs** — neither population contains a
+program that reaches these rungs, which is why the gap was never filed and why §7.7's one
+differing module was the only signal anywhere. With the names resolving, the narrowing is a
+**no-op**: step 2 lands, and §7.6's 35 guards are live.
+
+**And the gap is a real clause-1 defect, not only a blocker.** The clamp returns slot 0, which
+is correct exactly while row 0 is this list's. Interning one unrelated ref list first displaces
+it, and master then emits a **check-clean invalid module** (`vl check` rc 0, `vl run` rc 70).
+That is [D1835](inventory/D1835.md), now closed, with the displacer in its fixture. Its
+un-annotated face refuses earlier, in the monomorphizer, and is [D1836](inventory/D1836.md) —
+open, and a reminder that the `redundant type annotation` hint is the checker agreeing about
+the TYPE while three producers disagree about the REP.
+
+**One consequence worth recording.** With the clamp gone, `refListSlotOfExprStrict` and
+`refListSlotOfExpr` are the same answer — the clamp was the only thing that separated them —
+so the strict one is now an alias. That is one classifier pair collapsed by removing a
+sentinel rather than by building a descriptor, which is the cheaper half of this campaign.
 
 ---
 

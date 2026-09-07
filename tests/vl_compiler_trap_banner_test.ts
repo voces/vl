@@ -243,6 +243,35 @@ Deno.test({
 // a declared function must still name the function — a change that named the start
 // frame by renumbering the others would pass the first assertion alone.
 Deno.test({
+  name: "vl-compiler-trap-banner: a frame carries @file:line, each module naming ITS own file",
+  ignore: !ENABLED,
+  fn: async () => {
+    await withDir(async (dir) => {
+      await Deno.writeTextFile(
+        `${dir}/lib.vl`,
+        "export function boom(xs: i32[]): i32 {\n  return xs[7]\n}\n",
+      );
+      const main = `${dir}/main.vl`;
+      await Deno.writeTextFile(
+        main,
+        'import { boom } from "./lib"\nconst a: i32[] = [1, 2, 3]\nprint(boom(a))\n',
+      );
+      const r = await vl(["run", main]);
+      // The imported function names ITS file, not the entry's — the whole point of resolving
+      // the module through the same table find-references uses.
+      if (!/vl!boom[^@ ]*@lib\.vl:1/.test(r.err)) {
+        throw new Error(`want the imported frame at lib.vl:1\n${r.err}`);
+      }
+      // ...and the start frame names the ENTRY, which is NOT the module owning token 0:
+      // modules load dependency-first, so that token belongs to the import.
+      if (!/vl!__start__@main\.vl:1/.test(r.err)) {
+        throw new Error(`want the start frame at main.vl:1\n${r.err}`);
+      }
+    });
+  },
+});
+
+Deno.test({
   name: "vl-compiler-trap-banner: a TOP-LEVEL trap names __start__, not a wasm index",
   ignore: !ENABLED,
   fn: async () => {
