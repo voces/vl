@@ -139,9 +139,14 @@ export const semanticTokens = async (
 
 // ---- hover -----------------------------------------------------------------
 
-/** A resolved hover: the markdown-ish body plus the source range it covers. */
+/** A resolved hover: the markdown body plus the source range it covers. */
 export type HoverResult = {
-  /** `name: type` body, rendered by `main.ts` as a fenced `vital` code block. */
+  /**
+   * The hover body as MARKDOWN: the declaration's `///` block (D9.11) as prose above a
+   * fenced `vital` code block, composed by `docMarkdown` — the same layout `server.ts`
+   * and completion use. An undocumented declaration is exactly the bare fence, so
+   * `main.ts` renders this verbatim rather than fencing it a second time.
+   */
   contents: string;
   /** 0-based range of the hovered identifier/member, for Monaco's hover box. */
   range?: { start: LspPosition; end: LspPosition };
@@ -152,7 +157,8 @@ export type HoverResult = {
  * value binding (`hoverTypeAt`) → member access (`memberTypeAt`) → user `type`
  * alias (`typeAliasAt`) → builtin (the native builtin set). Returns `null` when
  * the cursor isn't on a typeable word (or the seed hasn't loaded). The hovered
- * word's range comes from a local scan so Monaco can highlight it.
+ * word's range comes from a local scan so Monaco can highlight it. The body is
+ * already markdown — see {@link HoverResult}.
  */
 export const hover = async (
   text: string,
@@ -175,12 +181,25 @@ export const hover = async (
   const t = displayableType(await at(checker.hoverTypeAt)) ??
     displayableType(await at(checker.memberTypeAt)) ??
     displayableType(await at(checker.typeAliasAt));
-  if (t) return { contents: `${word.text}: ${t}`, range: word.range };
+  if (t) {
+    // The `///` block above the declaration this name resolves to (D9.11), asked
+    // once for the whole ladder as `server.ts` does — the rungs disagree about which
+    // query answers the type, but they all name the same declaration.
+    const doc = await at(checker.docAt);
+    return {
+      contents: docMarkdown(`${word.text}: ${t}`, VL_LANGUAGE_ID, doc),
+      range: word.range,
+    };
+  }
 
-  // Builtin (`print`/`i32`/…): the word in the native builtin set.
+  // Builtin (`print`/`i32`/…): the word in the native builtin set. No user
+  // declaration, so no `///` block can be above it.
   const b = checker.builtinCompletions().find((x) => x.name === word.text);
   if (b && isDisplayableType(b.detail)) {
-    return { contents: `${word.text}: ${b.detail}`, range: word.range };
+    return {
+      contents: docMarkdown(`${word.text}: ${b.detail}`, VL_LANGUAGE_ID),
+      range: word.range,
+    };
   }
   return null;
 };

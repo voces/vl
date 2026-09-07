@@ -11,6 +11,7 @@ The language and CLI as a user mental model.
 - [`guide/soundness.md`](guide/soundness.md) — the type-safety guarantees.
 - [`guide/operators.md`](guide/operators.md) — what every operator means and on what operand types (`%` is the truncated remainder; the `as` / `as?` / `as!` / `as%` family).
 - [`guide/narrowing.md`](guide/narrowing.md) — flow narrowing (`is` / `?.` / null).
+- [`guide/doc-comments.md`](guide/doc-comments.md) — `///` vs `//`, what a doc block attaches to, and what the editor shows on hover.
 - [`guide/unions.md`](guide/unions.md) — union types and variant discrimination.
 - [`guide/collections-design.md`](guide/collections-design.md) — `T[]` / `Map` / `Set` syntax and semantics; §"What you write TODAY" is the shipped spelling table (a map TYPE is `{[K]: V}`, `Map()` is the constructor).
 - [`guide/strings-design.md`](guide/strings-design.md) — string representation and API.
