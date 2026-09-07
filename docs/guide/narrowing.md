@@ -37,8 +37,10 @@ while y is i64 { print(y + 1)   // a loop head narrows its body, re-tested every
 ```
 
 A write of a NON-member is still refused, and the diagnostic names the declared type:
-`x = "s"` above is `cannot assign string to i64 | boolean`. One place the rule stops short: a
-write inside a NESTED block retires the narrowing for everything after that block rather than
+`x = "s"` above is `cannot assign string to i64 | boolean`. The receiver does not matter — a
+property path (`o.v`, `xs[0]`) takes the same rule as a bare name, checked against the field's
+or element's declared type and re-narrowed to what was written. One place the rule stops short:
+a write inside a NESTED block retires the narrowing for everything after that block rather than
 re-narrowing across it.
 
 ## What narrows
