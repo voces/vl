@@ -22216,6 +22216,55 @@ function emitCoalesce(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
   coR
 }
 
+// Is `exprIx` a subscript read `a[i]`? The `??` box-unbox arm's bound: an element's rep comes
+// from its list's element slot, where a struct field's can come from a row the literal merged
+// onto (D1411).
+function isIndexRead(exprIx: i32): boolean {
+  const e = P.nodes[unwrapParen(exprIx)]
+  if e is Index { return true }
+  false
+}
+
+// The wasm result byte a value-box atom kind unboxes to, or -1 when the kind is not a
+// numeric scalar. `boolean` and `string` never reach the caller — each has its own niche —
+// and a ref atom rides the box's anyref rather than a per-rep value box (D1828).
+function nulBoxScalarValtype(kind: i32) {
+  if kind == 0 {
+    return 127 // i32
+  }
+  if kind == 3 {
+    return 126 // i64
+  }
+  if kind == 4 {
+    return 124 // f64
+  }
+  if kind == 5 {
+    return 125 // f32
+  }
+  -1
+}
+
+// The `?? d` default at the atom kind the present arm unboxes to, so the two arms of the
+// `if` agree: an i64/f64/f32 destination re-encodes its literal exactly as a union-box
+// argument does.
+function emitCoalesceScalarDefault(
+  body: i32[],
+  defIx: i32,
+  kind: i32,
+  fnIx: i32,
+) {
+  if kind == 3 { return emitExprAsI64(body, defIx, fnIx) }
+  if kind == 4 { return emitExprAsF64(body, defIx, fnIx) }
+  if kind == 5 {
+    const savedF32 = pendingF32
+    pendingF32 = true
+    const rcF32 = emitExprAsF32(body, defIx, fnIx)
+    pendingF32 = savedF32
+    return rcF32
+  }
+  emitExpr(body, defIx, fnIx)
+}
+
 function emitCoalesceGo(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
   // Unwrap a parenthesized lhs so `(m[k]) ?? d` / `(m.get(k)) ?? d` take the same fused
   // map-get path as the bare forms — parens must not change `??` semantics. `lhsIx` is the
@@ -23097,6 +23146,42 @@ function emitCoalesceGo(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
       wU8(212) // 0xd4 ref.as_non_null — the stash cell is nullable, the block type is not
       fbElse()
       if emitUnionCoerce(body, coNm, e.binRight, fnIx) < 0 { return -1 }
+      fbEnd()
+      ctrlLeave()
+      return 0
+    }
+  }
+  // A nullable value-union BOX operand whose `??` result is the bare scalar rather than
+  // another box: a `(i32 | null)[]` ELEMENT is the box, so `x ?? d` yields the element's own
+  // rep. Asked of the REP, since the element's TYPE reads `i32 | null` while what the read
+  // leaves is the box. Stash once, test the tag, unbox the payload on the present arm (D1828).
+
+  // Bounded to an INDEX read on purpose. A struct FIELD whose literal merged onto a declared
+  // row of another code has a rep the storage does not honour, and unboxing it there would
+  // trade D1411's loud refusal for invalid wasm.
+  const nbRep = repOfNode(e.binLeft)
+  if isIndexRead(e.binLeft) && nbRep.rdKind == "union" && nbRep.rdNul == 4 {
+    const nbKind = valueAtomKind(tyToEmitName(nodeTyIxOf(exprIx)))
+    const nbVt = nulBoxScalarValtype(nbKind)
+    const nbVb = vbHeapIdxOfKind(nbKind)
+    if nbVt >= 0 && nbVb >= 0 {
+      const nbSlot = sharedFieldRecvSlot()
+      if emitExpr(body, e.binLeft, fnIx) < 0 { return -1 }
+      fbLocalSet(nbSlot)
+      fbLocalGet(nbSlot)
+      fbStructGet(uBoxIdx, 0) // field 0: tag
+      fbI32Const(nullBoxTag())
+      fbI32Bin(71) // 0x47 i32.ne — present?
+      fbIf(nbVt)
+      ctrlEnter()
+      fbLocalGet(nbSlot)
+      fbStructGet(uBoxIdx, 1) // field 1: the payload anyref
+      fbRefCast(nbVb)
+      fbStructGet(nbVb, 0)
+      fbElse()
+      if emitCoalesceScalarDefault(body, e.binRight, nbKind, fnIx) < 0 {
+        return -1
+      }
       fbEnd()
       ctrlLeave()
       return 0
