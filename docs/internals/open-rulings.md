@@ -530,6 +530,13 @@ name. Measured stable across three working directories. **The owner can override
 spelling that appears in every backtrace is theirs to change, and only the renderer
 (`srcmapPathOf`) moves if they do.
 
+**The `vl-src` section shares that renderer** (ROADMAP row 22). Its file table is built by
+calling `srcmapPathOf` per module, so the per-instruction line the host prints and the
+declaration line the name section carries cannot spell one file two ways — the frame reads
+`vl!boom$m1@lib.vl:3` over `at lib.vl:6:3`, one path, two positions. Measured on a two-file
+program: the entry is its own bare file name and the import is `lib.vl`, with no directory
+prefix from either the cwd or the entry's own path.
+
 ### B6a-map-in-union-box — may a MAP be a union member, or does the box need a struct column? — raised 2026-09-07
 
 `const u: {[i32]: i32} | i32 = m` refuses with `an i32-keyed Map/Set is supported as … not

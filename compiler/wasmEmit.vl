@@ -197,6 +197,7 @@ import {
   atomStageSlot,
   ba8TypeIdx,
   ba8Used,
+  bankSpanRow,
   bl8TypeIdx,
   callRefSlot,
   capCacheOn,
@@ -19776,6 +19777,9 @@ export function emitFuncBody(body: i32[], blockIx: i32, fnIx: i32) {
     let i = 0
     while i < n {
       const isLast = i == n - 1 && !bodyIsVoid
+      // Banked after whichever arm lowers it: an implicit return leaves through
+      // `emitReturnExit`, so hooking the plain arm alone missed the tail statement.
+      const tlAt = body.length
       if isLast && stmtIsTailValue(stmts[i], fnIx) {
         // Implicit return: seed the return context + push the value (so a trailing
         // `null` / nullable value boxes or sentinels exactly like `return e`), then
@@ -19816,6 +19820,7 @@ export function emitFuncBody(body: i32[], blockIx: i32, fnIx: i32) {
           return -1
         }
       }
+      bankBodyStmtSpan(stmts[i], fnIx, tlAt, body.length)
       // A statically-TRUE `is` guard that always returns ends this instance's body.
       if monoStaticGuardEndsBlock(stmts[i], fnIx) {
         fbUnreachable() // 0x00 (dead padding — the cut path never runs)
@@ -19840,6 +19845,15 @@ export function emitFuncBody(body: i32[], blockIx: i32, fnIx: i32) {
   emitFail("emitProgram: function has no block body")
 }
 
+// Banks a statement's byte range, so a trap frame resolves to the line the instruction came
+// from rather than the declaration. Kind 5 inside a function, kind 1 at module scope — the row
+// `emitStartFnCode` already banks there. A statement that emitted no bytes gets no row.
+function bankBodyStmtSpan(stmtIx: i32, fnIx: i32, from: i32, to: i32) {
+  if to <= from { return 0 }
+  if fnIx < 0 { return bankSpanRow(stmtIx, -1, from, to, 1, "") }
+  bankSpanRow(stmtIx, fnStmtsPosOf(fnIx), from, to, 5, "")
+}
+
 // Lower every statement of the block at `blockIx` onto `body`, in order. Returns 0,
 // or -1 (via `emitFail`) on a non-block node or an unsupported statement within.
 function emitStmts(body: i32[], blockIx: i32, fnIx: i32) {
@@ -19854,10 +19868,15 @@ function emitStmts(body: i32[], blockIx: i32, fnIx: i32) {
     const savedGuardTop = narrowTop
     let i = 0
     while i < stmts.length {
+      // The statement's own byte range, so a trap frame names the line the instruction came
+      // from rather than the declaration (ROADMAP row 22). Offsets are relative to `body`;
+      // `emitFuncCode` rebases them onto the module with the rest of this frame's rows.
+      const stmtAt = body.length
       if emitStmt(body, stmts[i], fnIx) < 0 {
         scopePop()
         return -1
       }
+      bankBodyStmtSpan(stmts[i], fnIx, stmtAt, body.length)
       if monoStaticGuardEndsBlock(stmts[i], fnIx) {
         fbUnreachable() // 0x00 — see `monoStaticGuardEndsBlock`
         // D932 — slot accounting over the truncated tail; see `cursorSlotsUnder`.
