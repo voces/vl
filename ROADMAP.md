@@ -54,14 +54,14 @@ units: **hours** · **half-day** · **days**.
 | 18 | **B8 — the two `for` gaps that need a RULING, not a build** | objects → `a struct's fields are not a sequence …`; float bounds/step → `a `for` range counts in i32 …`. The other two members BUILT 2026-09-07: `for v, i in xs` / `for k, v in m` and an expression `step` | `open-rulings.md` §B8-for-struct, §B8-for-float-range — each has options, peers and a recommendation; neither is a build until it is ruled | ruling |
 | 20 | **A9 — no element-converting / field-dropping container copy** | `Cat[]` into an `Animal[]` param → `…type-valid (structural width subtyping) but not yet supported by codegen…` | `typecheck.vl` refusals + the converting-copy lowering; wire every delivery position BEFORE narrowing the gate | days |
 | 22 | **B-debug — a trap frame names `function@file:line`; the LINE is the DECLARATION's, not the trapping instruction's (2026-09-07)** | `print(a[7])` → `vl!__start__@1`; a two-file program → `vl!boom$m1@lib.vl:1` and `vl!__start__@main.vl:1`. The message still carries no index or length, and a frame still cannot say WHICH line inside the function trapped | the per-instruction map is what remains: a name-section string is per FUNCTION, so the trapping line needs a real source map (a custom section the host reads) — and the host would then change, with the three-hosts rule | days |
-| 23 | **D9.11 — `///` docs reach HOVER; COMPLETION's `doc` field is still filled by nobody** | hover renders them in the editor and the playground (2026-09-07); `Completion.doc` in `lsp/src/typeFeatures.ts` is documented as the declaration's `///` block and no wasm-path producer sets it, so the completion panel shows the type alone | `symScopeAt` already banks the decl token per result (`scopeResTok[i]`), so `symScopeDoc(i)` is one accessor pair over the `docRunAbove` the hover query built, plus the `scopeAt` bridge and the scope→completion mapping | hours |
 | 24 | **dogfood `match` over the compiler's own kind ladders** | the `Ty` set is DONE in the two biggest files: `emit_collect.vl` 38 → 32 (six) and `emit_classify.vl` 134 → 108 (twenty-six), all `_`-less with every member named, every output population byte-identical. The per-file table of what is left and why is `kind-ladder-lint.md` §Where the `Ty` set ran out | remaining: `typecheck.vl` (152) is unsurveyed; `VKind`'s 31, `RtKind`'s 15 and `EqCmpKind`'s 17 each need the sub-domain-litunion ruling before a 31-arm match is honest; `Node`'s 38 is excluded by the rule. `ladder-budget.py` reads 401 + 8 today | days |
-| 25 | **structural-tolerant emitter (rep architecture step 1)** | half migrated: `structIndexOfTypeName` 50 uses vs `structIndexByName` 56 | `emit_classify.vl` (53 of the nominal uses) | days, opportunistic |
+| 25 | **structural-tolerant emitter (rep architecture step 1)** — **20 of 37 caller sites CONVERTED; 17 remain and each has a measured reason** | the migration criterion is per site and is now measured, not guessed: a per-site oracle over 10,793 modules says 25 sites receive a structural name the nominal resolver declines, 12 never do. Of the 25, **20 convert byte-inert** and 5 are held back by witness — 4 lose builds, 1 moves a diagnostic | `emit_classify.vl`; the five held-back sites and their witnesses are `rep-descriptor-campaign.md` §11 | half-day for the five, each needs its own fix |
 | 27 | **E3 — user wasm runs on the playground's MAIN thread** | `playground/src/runtime.ts:21` instantiates there; `main.ts:36` says so | `playground/src/{runtime,playground,main}.ts` | days |
 | 28 | **F-tiers / J1 — collapse the redundant corpus runner** | 8 files execute emitted wasm under V8 via `tests/support/runWasm.ts` | `tests/support/casesWasmOracle.ts` + 4 shards + 4 standalone suites | days |
 | 29 | **F-day-one — five grammar axes still absent** | `day-one-sampler.md:90-92`: `match`, operator overloading, multi-param generics, recursive types, mixed-width arithmetic | `scripts/day-one/grammar.py` (91 records) | half-day per axis |
 | 30 | **Dogfood the orchestrator scripts onto the host ABI** | the ABI is COMPLETE (`std:process` `run`/`exit`, `std:env` `getEnv`, in all three hosts); 34,029 lines of Python and 2,536 of shell still do the work | `scripts/*.py` one port at a time; `scripts/seed-size.vl` is the first and is live, and the SECOND (`check-filed-witnesses.py`) is blocked on the three `dogfood:` rulings below | days |
 | 31 | **A-destructure — `let`/`const` and PARAMETER destructuring (owner ask, 2026-09-06 night; not scheduled)** | `const { x, y } = p`, `const [a, b] = xs`, `function f({ x, y }: Pt)` → `parse error … expected an identifier but found `{``; the `match` payload clause (pun, rename, nest — #2837) is the only destructuring today | `parser.vl` (a pattern in binding and parameter position, the payload clause's grammar reused), `typecheck.vl` (binding types from the pattern; for an UN-ANNOTATED parameter the pattern is a shape constraint `{a: ?, b: {c: ?}}` with hole leaves closed at the pin — the inference half is a second step), `format.vl` (byte-for-byte round trip), the desugar (one `const` per leaf, the `match` prelude's shape); list destructuring wants the multiple-returns question in `docs/guide/lambda-param-skip-design.md` answered first | days |
+| 32 | **the completion surfaces `///` docs do NOT reach: a user `type` NAME, a struct FIELD, a UFCS candidate** | measured 2026-09-07 with the docs wired for in-scope bindings: `type Pt` documented and in scope is offered as no completion item at all (`symScopeAt` records variable/parameter/function bindings only), and `p.` over a `Pt` whose `x` carries a `///` returns `x` with the bare fence | the type half is a NEW completion source, not a doc gap; the field half needs `memc*` to bank a declaration token the way `scopeResTok` does; the UFCS half is the cheapest — `ufcTok` already banks one, so it is `docRunAbove` over it | hours each |
 
 ### Open items that need an owner ruling first — listed, not decided
 
@@ -1400,9 +1400,12 @@ in-language GC knobs.
      only ADDS resolution for structural shapes — so the gate validates safety even where the fixpoint
      (i32-only) can't. **First target — inline-shape nested struct field — DONE (#665):**
      `collectNestedFieldShapes` pre-pass + `fieldTypeCode`/`fieldRefElemName` resolving via
-     `structIndexOfTypeName`. The remaining `structIndexByName` sites stay nominal-only for now — migrate
-     each opportunistically when a structural name actually reaches it (premature otherwise: today they
-     all receive nominal names, so a blanket swap is a no-op with risk).
+     `structIndexOfTypeName`. **MEASURED 2026-09-07, and "today they all receive nominal names" was false**: a
+     per-site oracle over 10,793 modules found 25 of 37 sites receiving a structural name the
+     nominal resolver declines. The criterion this line states is right and is now
+     instrumented — 20 sites converted byte-inert, 5 held back by witness (4 lose builds, 1
+     moves a diagnostic), 12 never see a structural name and stay nominal. A blanket swap is
+     NOT a no-op: it costs 14 builds. `rep-descriptor-campaign.md` §11.
   2. 🟡 **Rep-bug burn-down — THE #1 PRIORITY (drive to 0).** ✅ **Soundness milestone holds:** every
      unsound class (INVALID-WASM, TRAP, MISMATCH) is **0**; the check is EXACT/bidirectional
      (`scripts/rep-fuzz-check.sh`: soundness never baselineable, new rejects + stale entries both
@@ -1630,13 +1633,28 @@ in-language GC knobs.
         denominated in the four SITES that carry a carve-out. Seed: **+3,956 bytes across the
         two landings that were priced**; three of five were not, and phase 3 prices each.
         Scoreboard: `docs/internals/rep-descriptor-campaign.md` §8.
-     **PHASE 3'S PREREQUISITE, measured:** every domain-REMOVING conversion is blocked on the
-        descriptor's coverage gap — the LEFT-ONLY column, **147,945 queries over 15 kinds**,
-        headed by `reflist` (111,683 in 876 modules), `i32` (17,358), `map` (4,437), `union`
-        (3,358), `str` (3,233). A ladder is load-bearing exactly where the descriptor declines,
-        so nothing deletes until its kind is covered — §6.3 is the proof, a byte-identical
-        nine-rung deletion its own oracle refused at CONTRADICT 2,963 → 204,539. Phase 3 is
-        close the column largest-first, then delete; `reflist` alone is 76% of it.
+     🟡 **PHASE 3 — closing the LEFT-ONLY column, `reflist` first. FIRST LANDING IN.** Every
+        domain-REMOVING conversion is blocked on the descriptor's coverage gap: a ladder is
+        load-bearing exactly where the descriptor declines, so nothing deletes until its kind is
+        covered (§6.3 is the proof — a byte-identical nine-rung deletion its own oracle refused
+        at CONTRADICT 2,963 → 204,539). **Why `repOfArray` declined was measured before anything
+        was built**, by a classifier over all eleven `Ty` variants that accounts for every
+        `reflist` LEFT-ONLY event in both populations: **MAP element 96,659 events / 669
+        modules**, nested array 8,133 / 106, nullable 4,273 / 42, value-union box 3,167 / 82.
+        **The two populations disagree about the leader** — `tests/cases` puts the nested array
+        first at 38.8%, the corpus puts the map at 96.2% — so the reasons were re-counted by
+        MODULE, where the map leads on both denominators; an event count alone would have picked
+        the wrong reason to build first. A map is a reference like a struct or a closure, so a
+        list of maps is a ref list — the answer the ladder already gives — and the flat arm plus
+        both tree projections gain it, three lines, domain-KEEPING with no rung removed.
+        **`reflist` LEFT-ONLY falls 112,531 → 15,872, −96,659 (86%), every departing query
+        landing in AGREE and CONTRADICT holding at 0** — and the fall EQUALS the census exactly,
+        which is what separates "the number went down" from "it went down for the reason I
+        think". Byte-identical on both populations, which is the whole claim, since coverage is
+        §5.0's domain-WIDENING form. **CONTRADICT is 0, not the 178 this campaign quoted** —
+        that predates #2857. Remaining: nested array, nullable, value-union-box elements; no rung
+        is deletable until the column is empty for the kind.
+        `docs/internals/rep-descriptor-campaign.md` §9.
      Two owner rulings gate how far items 2 and 6 can go: `one-literal-union-rep` and
      `nullable-rep-rule-stated-once` (`docs/internals/open-rulings.md` §D).
      REMAINING legacy items: (a) widen `repOfTy` coverage (typed-value maps,

@@ -537,13 +537,13 @@ already-written policy rather than defect:
   modules — the **numeric literal-union base collapse**. `type N = 1 | 2` reps as its base
   scalar; `repOfTyFlat`'s `TyUnion` arm deliberately declines it ("the atom-vs-base split is
   alias-ness, checker metadata rather than structure"). The conversion keeps the collapse as
-  an explicit leg, and **§9's first ruling is exactly this line**.
+  an explicit leg, and **§10's first ruling is exactly this line**.
 * `descriptor-only`, 177,236 queries in 20 kinds — `struct`, `union`, `closure`, `map`,
   `reflist`, every nullable niche. The ladder never spoke for those shapes and its consumers
   compare `== <code>`; answering a code they have no arm for would be a new answer, not the
   same one. The conversion keeps the decline as the function's stated DOMAIN.
 
-Two of those declines are carve-outs written into the converted function and cited to §9,
+Two of those declines are carve-outs written into the converted function and cited to §10,
 because a ruling could retire either:
 
 * `void` — the one prim `repOfTy` reps (as the ladder fallthrough `i32`) and this vocabulary
@@ -1448,7 +1448,91 @@ ladder ever goes away.
 
 ---
 
-## 9. Two design simplifications the campaign should be ruled on
+## 9. Phase 3 — closing the descriptor's coverage gap, `reflist` first
+
+§8.5 named the LEFT-ONLY column as the one prerequisite. This is its first landing.
+
+### 9.1 Why the descriptor declined, measured before anything was built
+
+The oracle names WHERE the ladder answers and `repOfNode` declines; it does not say WHY. A
+classifier hung off the same site reports the reason, as a `_`-less match over all eleven `Ty`
+variants so no reason can fall through silently. It accounts for **every** `reflist` LEFT-ONLY
+event in both populations — 13,415 of 13,415 and 99,116 of 99,116, no residue.
+
+| why `repOfArray` declines | events | modules |
+| --- | --- | --- |
+| **MAP element** (`{[string]: V}[]`) | **96,659** | **669** |
+| NESTED ARRAY element (`S[][]`) | 8,133 | 106 |
+| NULLABLE element (`(S \| null)[]`) | 4,273 | 42 |
+| VALUE-UNION-BOX element | 3,167 | 82 |
+| no recorded type on the node | 166 | 1 |
+| other union element | 133 | 6 |
+
+**The two populations disagree about the leader, and only one of them is right.** In
+`tests/cases` the nested array leads (5,209 of 13,415, 38.8%) and the map is fourth (1,279); in
+the corpus the map is **96.2%** (95,380 of 99,116). The corpus is generated over fixed axes, so
+its event count reports axis repetition as much as programs — which is why the reasons were
+re-counted by MODULE. The map leads on both denominators (669 modules of 886 with any gap), and
+that is what settles it. **An event count alone would have picked the wrong reason to build
+first**, and the reason it would have picked is the one a reading of `repOfArray`'s
+"legacy owns" tail also suggests.
+
+### 9.2 The change, and why it is domain-KEEPING
+
+A map is a reference exactly as a struct and a closure are, so a list of maps is a ref list —
+the answer the annotation ladder already gives. `repOfArray` gains that arm, and both tree
+projections (`rtListVKind`, `repTreeListElemName`) gain theirs, so the flat and tree producers
+cannot disagree about a shape only one of them covers. Three lines. **No ladder rung is
+removed here**; the descriptor gains coverage and the ladder keeps every arm it had.
+
+### 9.3 The oracle, before and after
+
+| | `tests/cases` | | distilled corpus | |
+| --- | --- | --- | --- | --- |
+| | before | after | before | after |
+| AGREE | 389,621 | **390,900** | 109,142 | **204,522** |
+| LEFT-ONLY (all kinds) | 53,539 | **52,260** | 101,274 | **5,894** |
+| LEFT-ONLY (`reflist`) | 13,415 | **12,136** | 99,116 | **3,736** |
+| CONTRADICT | 0 | **0** | 0 | **0** |
+
+**`reflist` LEFT-ONLY falls 112,531 → 15,872 across both populations, −96,659 (86%).** Every
+query that left LEFT-ONLY arrived in AGREE; none became a contradiction.
+
+**The fall equals the census exactly.** 96,659 events were classified `MAP element` and 96,659
+left the column — so the coverage gained is precisely the reason closed and nothing else moved,
+which is the check that separates "the number went down" from "the number went down for the
+reason I think".
+
+**And `CONTRADICT` is 0, not the 178 this campaign has been quoting.** That figure is from
+§6.3, before #2857 closed `vtKindOfType`'s five missing nullable-scalar-list rungs; on today's
+tree both populations read zero. The bar is unchanged — a rise is a row — but the number to
+hold it against is 0.
+
+### 9.4 The price, which is the whole claim
+
+Coverage means the descriptor now ANSWERS where it declined, and `vtKindOfType` prefers the
+descriptor's answer. That is §5.0's second form — a domain WIDENING — so byte identity is not
+a formality here, it is the claim:
+
+```
+master vs candidate   tests/cases 3207/3207   distilled 7589/7589   DIFFERING FILES: 0
+```
+
+`rep-fuzz-check.sh` exact, `regress.py` no cell changed class, `mono-tyaram-grid` 161 OK /
+100 REJECT / **0 BAD**.
+
+### 9.5 What is left in the column
+
+**15,872 `reflist` queries over ~217 modules**, in the order a next landing should take them:
+the NESTED ARRAY element (8,133 / 106 modules), the NULLABLE element (4,273 / 42), the
+VALUE-UNION-BOX element (3,167 / 82). The nested-array arm is the natural next one — the rep
+tree already recurses into it (`rtGo`'s list arm builds a child), so the work is the flat arm
+and the two projections again rather than new machinery. **No rung is deletable yet**: deletion
+needs the column empty for the kind, and `reflist` still has three reasons in it.
+
+---
+
+## 10. Two design simplifications the campaign should be ruled on
 
 Both are filed in `docs/internals/open-rulings.md` §D with options, peers and a
 recommendation. Neither is decided here.
@@ -1467,7 +1551,7 @@ recommendation. Neither is decided here.
 
 ---
 
-## 10. Where the numbers come from
+## 11. Where the numbers come from
 
 | number | instrument |
 | --- | --- |
@@ -1479,3 +1563,103 @@ recommendation. Neither is decided here.
 
 Re-run the census before quoting it. A citation is a measurement with a date on it, and this
 document's own §1 will go stale the first time a family converts.
+
+## 11. The nominal→structural widening (ROADMAP row 25) — measured per SITE, and 5 of 25 refused
+
+§5.0 says *widen a domain never*. ROADMAP step 1 says migrate `structIndexByName` callers to
+`structIndexOfTypeName`, which is a widening by construction — the structural resolver calls
+the nominal one first and then falls back to a field-set match, so it is a strict superset.
+Both documents were right about something, and only a per-site measurement separates them.
+
+### 11.1 The criterion is per SITE, so the instrument is too
+
+Step 1 already states the rule: *migrate each opportunistically when a structural name
+actually reaches it*. That is a per-site question, so the oracle is per site — all 37 caller
+sites routed through a shadow-gated wrapper that, when the nominal resolver declines, asks
+whether the structural one would have answered (`RIGHT-ONLY`). Unarmed it is exactly
+`structIndexByName`; armed it writes to the report table `repLadderABSweep` drains.
+
+**The line's own parenthetical was false.** It reads *"today they all receive nominal names,
+so a blanket swap is a no-op with risk"*. Over 10,793 modules:
+
+| population | modules | sites firing | RIGHT-ONLY queries | sites with RIGHT-ONLY |
+| --- | ---: | ---: | ---: | ---: |
+| `tests/cases` | 3,204 | 32 | 6,669 | **25** |
+| distilled corpus | 7,589 | 29 | 6,798 | **16** (all a subset of the 25) |
+
+A six-line hand program reaches two of them. The swap is not a no-op; it is a live widening
+at 25 sites.
+
+### 11.2 And it is not free — the blanket swap costs 14 builds
+
+Converting all 25 at once:
+
+| | `tests/cases` | corpus |
+| --- | ---: | ---: |
+| BUILD LOST | **6** | **8** |
+| differ / output same | 2 | 0 |
+| build gained | 1 | 0 |
+
+Per site, graded alone against the 17 modules the blanket swap moved, four sites carry all of
+it — and they fail in four different ways, which is §5.0's point stated by witness:
+
+| site held back | lost | how it fails |
+| --- | ---: | --- |
+| `elemNameIsNominalAt` | 8 | **the compiler TRAPS** (exit 70) on eight `named/d361e0136*` cells |
+| `rlElemStructRow` | 6 | check-clean **invalid wasm** on six `structs/*twin*` modules |
+| `rlElemLitStructRow` | 5 | invalid wasm ×4, plus `emitProgram: nested struct fields are not supported` |
+| `structIndexOfExpr#2` | 4 | four LOUD emit refusals — `bare null needs a struct-typed context`, `index receiver is not an array or string`, `field access receiver is not a struct` ×2 |
+
+A nominal decline is an ANSWER routed to the spelling. Take it away and the caller's
+fall-through is gone; what arrives instead is a trap, an invalid module, or a refusal about
+something else entirely.
+
+### 11.3 The fifth refusal, and the blind spot that found it
+
+The 21 remaining sites graded **DIFFERING FILES: 1** on `tests/cases` (output identical) and
+**0** on the corpus — zero vetoes on the byte-and-output bar. The gate then went red on one
+fixture:
+
+```
+closures/error-nullable-elem-closure-field-array-lambda-sig-twin.vl
+  expected an emit error containing "list element has no rep"
+  got: ["12:9 emitProgram: callee is not a function name"]
+```
+
+**Byte identity is blind to a program that never produced bytes.** Both seeds fail to build
+that module, so it sat in the grader's `both-fail` bucket and was never compared — and for an
+`error-*` fixture the MESSAGE is the contract. A second grader over exactly that bucket found
+**1 changed diagnostic in 3,204 `tests/cases` modules and 0 in 7,589 corpus cells**, and a
+per-site run named `refArrShapeKindGo` as the only cause. Held back; the shipped set is 20.
+
+> **Add a fourth reading to §5.1: the DIAGNOSTIC, over the modules that do not build.** §8.2
+> already says byte identity and the oracle are not interchangeable. This is the same rule one
+> step further out — a population splits into modules that build and modules that do not, and
+> byte identity can only speak for the first. The second is where every `error-*` fixture
+> lives.
+
+### 11.4 What shipped, and what the 17 remaining sites are
+
+**20 sites converted.** Caller sites go `structIndexByName` 37 → 18 and `structIndexOfTypeName`
+24 → 44. (Both counts are CALL SITES; the row's old "50 vs 56" was a grep line count, and 16 of
+the 56 and 23 of the 50 were comments.)
+
+Final grade of the 20, both populations, all three readings:
+
+| reading | `tests/cases` | corpus |
+| --- | --- | --- |
+| byte + output | DIFFERING FILES **1**, `differ/output SAME`, VETO **0** | DIFFERING FILES **0**, VETO **0** |
+| diagnostics (the both-fail bucket) | CHANGED **0** | CHANGED **0** |
+
+The one differing module, `closures/closure-nullable-union-field-struct-elem-array-result.vl`,
+prints `7/NULL/hey/9/NULL0/5/2.5/NULL` under both and is **9 bytes smaller** after: the
+`wasm-dis` diff is a type-table renumbering where the nominal decline had minted a duplicate
+`(array (mut (ref null $3)))` row the structural resolver finds already interned. That is the
+widening doing exactly what it is for.
+
+**17 sites remain nominal, in two groups.** Twelve never received a structural name in either
+population — converting them is the no-op with risk the plan warned about, and they stay until
+one does. Five are refused by witness: the four in §11.2 and `refArrShapeKindGo` in §11.3. Each
+needs its own fix, not a wider gate; the trap in `elemNameIsNominalAt` is the one worth a row
+first, since a compiler trap is a defect wherever it comes from.
+
