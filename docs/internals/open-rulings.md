@@ -532,7 +532,9 @@ a name-derived key needs a definite-assignment argument the narrowing stack does
 `let i` must be excluded by a rule that does not exist. **Recommendation: yes, for `const`
 bindings only** (a `let` index keeps the refusal, with a message that says why).
 
-### D1736 — does an `is T` pin survive a `while` loop's re-execution barrier? — RULED 2026-09-06
+### D1736 — does an `is T` pin survive a `while` loop's re-execution barrier? — RULED 2026-09-06, REOPENED the same day
+
+**Reopened (2026-09-06, #2821):** built as ruled, the pin refuses the write that terminates a loop over a union — `while (x is i64) { … x = true }` (`tests/cases/unions/paren-is-narrow.vl`) became `cannot assign boolean to i64`, a `runs → not-runs` on a corpus program, and `tests/cases/loops/while-body-is-guard-not-narrowed.vl` is a standing contract that predicted it. The same rule holds in an `if` today (`if x is i64 { x = true }` is refused): a narrowed binding's type is also what it ACCEPTS. The question is about writes, not loops. **Options.** (a) narrowing applies to READS only; a write is checked against the declared type and re-narrows the binding to what was written — TypeScript's and Kotlin's rule; `if` and `while` then both narrow and the loop is legal; it changes what an `if` branch accepts today. (b) keep "the narrowed type is what it accepts"; `while` bodies stay un-narrowed by `is`; D1736 closes as DESIGN with the contract fixture as its witness. **Recommendation: (a).**
 
 **Ruling (owner, 2026-09-06):** (a) — yes; an `is` pin at a loop head is the null strip's twin, retired by a write to the receiver exactly as `!= null` is. D1736 is a capability row.
 
