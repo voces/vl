@@ -50,7 +50,6 @@ units: **hours** · **half-day** · **days**.
 | 1 | **B15 — a nested capturing function cannot be taken as a VALUE.** **NARROWED 2026-09-06: the DIRECT-call half is built** ([D1780](internals/inventory/D1780.md)/[D1781](internals/inventory/D1781.md)), the BINDING hop with it ([D1782](internals/inventory/D1782.md)), the ARRAY-element delivery at one pin ([D1794](internals/inventory/D1794.md)) and the ARGUMENT hop ([D1795](internals/inventory/D1795.md)); what stands is a closure that escapes its pin | `function o(n) { function k(x) { return x + n }; return k(1) }` runs at one pin and at two, and so do `const fs = [k]; fs[0](1)`, `function use(p) { return p(1) }; use(k)` and `const f = k; f(1)` at two pins; the array element at two pins still refuses ([D1816](internals/inventory/D1816.md)), and `return k` still refuses | `wasmEmit.vl emitClosureValue`; the binding hop is `calleeRetKindSid` and the `fnValTarget` family, which key on a name with no frame | half-day (D1782) |
 | 2 | **D1775 — a `type` alias over a negation type reps as a union BOX with a scalar value** | `type N = !string; const x: N = 5` → `vl check` rc 0, then `type mismatch: expected (ref $type), found i32`. `wasm-dis`: `(global $global$0 (mut (ref $1)) (i32.const 5))`. The INLINE spelling runs | `typecheck.vl` / `emit_classify.vl` rep classification of an alias body | hours–half-day |
 | 5 | **B7 R3 — `.backwards()` over a string** | `"abc".backwards()` → `no method '.backwards' on string` | `std/str.vl`; §Codepoints already specifies it | **hours** |
-| 10 | **Organize Imports drops an unused specifier but not a DUPLICATE one** | `server.ts:1491 .filter((d) => d.code === "unused-import")` | `lsp/src/server.ts:1489-1500` | **hours** |
 | 18 | **B8 — the two `for` gaps that need a RULING, not a build** | objects → `a struct's fields are not a sequence …`; float bounds/step → `a `for` range counts in i32 …`. The other two members BUILT 2026-09-07: `for v, i in xs` / `for k, v in m` and an expression `step` | `open-rulings.md` §B8-for-struct, §B8-for-float-range — each has options, peers and a recommendation; neither is a build until it is ruled | ruling |
 | 20 | **A9 — no element-converting / field-dropping container copy** | `Cat[]` into an `Animal[]` param → `…type-valid (structural width subtyping) but not yet supported by codegen…` | `typecheck.vl` refusals + the converting-copy lowering; wire every delivery position BEFORE narrowing the gate | days |
 | 22 | **B-debug — the trapping INSTRUCTION's line, in the PLAYGROUND (the native and Deno hosts are done, 2026-09-07)** | `vl run` and `deno task test` both print `at lib.vl:6:3  in \`boom$m1\`` under the trap, joined out of the emitter's `vl-src` custom section; the playground prints no such block | the section and the reader exist and `tests/support/vlSrcSection.ts` is host-agnostic, so the port is small — what is MISSING is a trap POSITION to join against: the browser gives `WebAssembly.RuntimeError` with a stack whose wasm frames V8 formats the same way, so the work is confirming that shape survives the playground's own bundling and wiring the block into its error surface. The message still carries no index or length | hours |
@@ -3109,13 +3108,13 @@ seed from current `compiler/*.vl` in ~40s.*
     discarded). Retain the *as-written* type syntax (or its span) so the AST is lossless for
     types — also benefits hover/inlay rendering (D1/D6/D8).
 - 🟡 **D — Project-wide unused-export hints.** Core shipped: debounced workspace pass on save (+ 3 s idle), use-map over ≤500 `.vl` files, `hint`/`unnecessary` diagnostics for zero-reference exports. REMAINING: **struct field–level unused-export analysis** — deferred because VL's structural typing makes field-level usage tracking fuzzy (a field could be "used" via a widened receiver type without any import); a future refinement could cross-check field names against known call sites once structural subtyping is tightened.
-- ⬜ **D — Organize Imports should drop a DUPLICATE specifier too.** The `duplicate-import`
-  lint (#2393) already names every repeated specifier and its quick-fix removes one — but
-  `server.ts`'s Organize Imports filters the lint stream to `unused-import` alone, so a
-  one-key "organize" leaves the duplicate behind. Adding the code to that filter is one
-  line; what needs checking first is `organizeImportEdits` over TWO IDENTICAL ranges in
-  different statements (the unused case never produces two edits that delete the same
-  text), which is why this is a follow-up and not part of #2393.
+- ✅ **D — Organize Imports drops a DUPLICATE specifier too.** The filter now takes both
+  redundant codes. The thing this row said to check first does not arise: each
+  `duplicate-import` is anchored at its OWN occurrence, so two statements yield two
+  DISTINCT ranges, and the rewrite rebuilds a statement from its survivors rather than
+  deleting per range. Identical ranges do occur — the unused and duplicate lints can name
+  one token — and the rewrite dedupes them, dropping one specifier per pass and reaching a
+  fixpoint on the next. `tests/lsp_organize_imports_duplicate_test.ts` grades all of it.
 - ⬜ **D8. Hover verbosity step-expansion.** Alias-name preservation is done (see `CHANGELOG.md`).
   REMAINING: the interactive shallow↔deep verbosity stepper — expand one alias layer at a time
   on demand via the proposed LSP 3.18 hover-verbosity API (`HoverParams.context.verbosityLevel`
