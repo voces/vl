@@ -121,6 +121,22 @@ down, or swap the bounds. A `step 0` is refused for the same reason, whether or
 not the bounds are constant. Both carry the `range-never-runs` diagnostic code
 with the folded `from`/`to`/`step` on the data channel.
 
+**The half-open `until` form obeys the SAME direction rule, with one boundary
+difference.** `for v in <from> until <to> [step <s>]` counts by `s` with the loop
+condition `v < to` (exclusive), where inclusive `to` uses `v <= to`. A *constant*
+`until` range is refused on exactly the same contradiction — a positive step from a
+start above its end (`5 until 2`), or a negative step from below it — and the message
+spells `until`, the keyword the author wrote. The one place the two forms grade
+differently is `from == to`: `for i in 0 to 0` runs once, `for i in 0 until 0` runs
+**zero times**, and that empty half-open range is **legal, not refused**. It is the
+clean empty-collection case — `for i in 0 until a.length` over an empty array is a
+no-op — so only a provably *backwards* range is the mistake the rule catches; an empty
+one is a contract. `until` exists because the dominant use of a range is index
+iteration, which wants `[0, n)` (`docs/internals/range-semantics-design.md`); the
+inclusive `for i in 0 to a.length` reads `a[a.length]` on its last turn and traps,
+and a `warning`-tier lint (`range-inclusive-length`) flags that exact shape and
+suggests `until`.
+
 **A NON-CONSTANT wrong-order range still runs zero times, and says nothing.**
 That is the loop's contract, not an oversight: `for i in lo to hi { … }` with
 `hi < lo` is how "iterate a possibly-empty span" is spelled, and refusing it —
@@ -136,9 +152,12 @@ the wrong-order range's answer one operand over. The constant `step 0` stays a
 compile-time refusal, because that one *is* knowable.
 
 - rejected: `loops/range-never-runs-reject.vl`, `loops/empty-range.vl`,
-  `lint/for-step-zero.vl`
+  `lint/for-step-zero.vl`, `loops/until-never-runs-reject.vl` (the `until` twin),
+  `lint/range-inclusive-length.vl` (the `to <x>.length` lint)
 - sound: `loops/range-direction-legal.vl` (ascending, `step -1`, equal bounds,
-  and both non-constant wrong-order forms), `loops/for-step.vl`
+  and both non-constant wrong-order forms), `loops/for-step.vl`,
+  `loops/until-range.vl`, `loops/until-empty.vl` (`0 until 0` and an empty
+  `a.length`), `loops/until-step.vl`, `loops/until-array-index.vl`
 
 ### Operators over inference holes
 

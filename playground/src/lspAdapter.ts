@@ -128,8 +128,30 @@ export const diagnostics = async (
 ): Promise<VLDiagnostic[]> => {
   if (checker === undefined) return [];
   const errors = await checker.check(text, entryKey, reader).catch(() => []);
-  return [...errors, ...checker.lint(text)];
+  const diags = [...errors, ...checker.lint(text)];
+  lastDiagnostics = { text, entryKey, diags };
+  return diags;
 };
+
+// The last whole-program diagnostics, cached so the code-action path does not
+// re-check what the editor's own diagnostics pass just computed — the browser
+// counterpart of `server.ts`'s `diagnosticsByUri` (which `onCodeAction` reads
+// instead of re-running `check`). The editor runs `diagnostics` on every edit,
+// so a code-action request on the current buffer reuses it; a stale text (a
+// race) recomputes rather than answering wrong.
+let lastDiagnostics:
+  | { text: string; entryKey: string; diags: VLDiagnostic[] }
+  | undefined;
+
+const diagnosticsForRequest = (
+  text: string,
+  entryKey: string,
+): Promise<VLDiagnostic[]> =>
+  lastDiagnostics !== undefined &&
+    lastDiagnostics.text === text &&
+    lastDiagnostics.entryKey === entryKey
+    ? Promise.resolve(lastDiagnostics.diags)
+    : diagnostics(text, entryKey);
 
 // ---- semantic tokens -------------------------------------------------------
 
@@ -403,7 +425,7 @@ export const codeActions = async (
   contextDiagnostics: VLDiagnostic[] = [],
   entryKey: string = DEFAULT_ENTRY,
 ): Promise<QuickFix[]> => {
-  const cached = await diagnostics(text, entryKey);
+  const cached = await diagnosticsForRequest(text, entryKey);
   const fixable = fixableDiagnosticsForRange(contextDiagnostics, cached, range);
   const fixes: QuickFix[] = [];
   for (const d of fixable) {
@@ -439,7 +461,7 @@ export const organizeImports = async (
   entryKey: string = DEFAULT_ENTRY,
 ): Promise<CompletionEdit[]> => {
   if (checker === undefined) return [];
-  const redundant = (await diagnostics(text, entryKey))
+  const redundant = (await diagnosticsForRequest(text, entryKey))
     .filter((d) => d.code === "unused-import" || d.code === "duplicate-import")
     .map((d) => d.range);
   return organizeImportEdits(text, redundant, (stmt) => checker?.formatSrc?.(stmt));

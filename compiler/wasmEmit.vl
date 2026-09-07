@@ -19268,10 +19268,10 @@ function emitWhileStmtStmt(body: i32[], s: WhileStmt, _stmtIx: i32, fnIx: i32) {
 }
 
 function emitForRangeStmt(body: i32[], s: ForRange, _stmtIx: i32, fnIx: i32) {
-  // `for v in A to B [step K] { body }` — an inclusive numeric range, lowered to the same
-  // block/loop shape as `while`. The loop var `v` and a synthetic bound temp own the next
-  // two cursor slots, and a non-constant step a third. A constant step's SIGN picks the exit
-  // comparison; a dynamic one picks it with a `select`. Bound and step evaluate once each.
+  // `for v in A to B [step K] { body }` — a numeric range, lowered to the same block/loop
+  // shape as `while`: the loop var and a bound temp take the next two cursor slots, a
+  // non-constant step a third (evaluated once). The step's sign picks the exit test (dynamic
+  // via `select`); `frExcl` (`until`) makes it strict — `v < B` not `v <= B`, so `0 until 0` is empty.
   const vSlot = emitLetCursor
   emitLetCursor = emitLetCursor + 1
   const bSlot = emitLetCursor
@@ -19358,32 +19358,35 @@ function emitForRangeStmt(body: i32[], s: ForRange, _stmtIx: i32, fnIx: i32) {
   ctrlEnter()
   loopContDepth.push(ctrlDepth)
   loopContLabel.push(s.frLabel)
-  // continue-condition: le_s (ascending) / ge_s (descending), inverted to exit. A DYNAMIC
+  // continue-condition: ascending / descending bound test, inverted to exit. `frExcl` (the
+  // half-open `until`) makes it strict — lt_s / gt_s where `to` uses le_s / ge_s. A DYNAMIC
   // step picks the direction with a `select` at run time, and a zero step makes the loop
   // empty — it advances nothing, the same answer a backwards constant range already gives.
+  let ascCmp = 76 // 0x4c i32.le_s
+  let descCmp = 78 // 0x4e i32.ge_s
+  if s.frExcl {
+    ascCmp = 72  // 0x48 i32.lt_s — half-open ascending
+    descCmp = 74 // 0x4a i32.gt_s — half-open descending
+  }
   if dynStep {
     fbLocalGet(vIdx)
     fbLocalGet(bIdx)
-    fbI32Bin(76)  // 0x4c i32.le_s — the ascending test
+    fbI32Bin(ascCmp)  // the ascending test
     fbLocalGet(vIdx)
     fbLocalGet(bIdx)
-    fbI32Bin(78)  // 0x4e i32.ge_s — the descending test
+    fbI32Bin(descCmp) // the descending test
     fbLocalGet(sIdx)
     fbI32Const(0)
-    fbI32Bin(74)  // 0x4a i32.gt_s
-    wU8(27)       // 0x1b select — the ascending test iff the step is positive
+    fbI32Bin(74)      // 0x4a i32.gt_s — is the step positive?
+    wU8(27)           // 0x1b select — the ascending test iff the step is positive
     fbLocalGet(sIdx)
     fbI32Eqz()
-    fbI32Eqz()    // step != 0
-    fbI32Bin(113) // 0x71 i32.and
+    fbI32Eqz()        // step != 0
+    fbI32Bin(113)     // 0x71 i32.and
   } else {
     fbLocalGet(vIdx)
     fbLocalGet(bIdx)
-    if stepK > 0 {
-      fbI32Bin(76) // 0x4c i32.le_s
-    } else {
-      fbI32Bin(78) // 0x4e i32.ge_s
-    }
+    if stepK > 0 { fbI32Bin(ascCmp) } else { fbI32Bin(descCmp) }
   }
   fbI32Eqz() // 0x45 invert: exit when out of range
   fbBrIf(1)  // 0x0d br_if -> break out of block
