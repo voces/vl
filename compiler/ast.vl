@@ -82,17 +82,18 @@ export type LetDecl = { // let/const x: T = e
   letInit: i32,  // initializer node, -1 if none
   pos: i32,
 }
-// A parameter `a: i32`, optionally carrying a default value. `parDefault` is the default
-// expression's arena index (-1 for none); `parOpt` is 1 for the surface `a?: i32`, sugar
-// for `a: i32 | null = null` and a faithful-surface marker the printer reads. Everything
-// downstream reads the desugared `parType` and `parDefault` and ignores `parOpt`.
+// A parameter `a: i32`, with `parDefault` the default expression's arena index (-1 for none).
+// `parOpt` is 1 for `a?: i32`, sugar for `a: i32 | null = null`; `parRest` is 1 for the rest
+// parameter `...xs: T[]`, whose `parType` is the list the trailing arguments pack into. Both
+// are surface markers the printer reads; downstream reads `parType` and `parDefault`.
 export type Param = {
   parName: string,
   parType: i32,
   parDefault: i32,
   parOpt: i32,
+  parRest: i32,
   pos: i32,
-} // a: i32,  a: i32 = 0,  a?: i32
+} // a: i32,  a: i32 = 0,  a?: i32,  ...xs: i32[]
 export type TypeRef = { tyName: string, pos: i32 } // i32 (annotation)
 export type FuncDecl = {                           // function f<T?>(..): T {..}
   fnName: string,
@@ -194,7 +195,12 @@ export type ObjLit = { objFields: i32[], pos: i32 }                // { x: 7, y:
 // access `a[i]` (a read, or a write when it is the left side of a `=`). Prefixes: `arr`
 // for the literal's element list, `idx` for the index's array and index pair. An array
 // type annotation reuses `TypeRef` with a synthetic `"i32[]"` name — see `parseType`.
-export type ArrayLit = { arrElems: i32[], pos: i32 }         // [1, 2, 3]
+export type ArrayLit = { arrElems: i32[], pos: i32 } // [1, 2, 3]
+// `...e` before a call argument or a list element — the operand's list is unpacked in
+// place. A node kind and not a parallel column on `Call`/`ArrayLit`, so a pass that has
+// not learned about it fails loudly instead of dropping the marker. The parser mints one
+// only in those two positions; `...` anywhere else is a parse error.
+export type Spread = { spdArg: i32, pos: i32 }               // ...ys
 export type Index = { idxArr: i32, idxIndex: i32, pos: i32 } // a[i]
 
 // A discriminated-union type alias `type Name = A | B | C` (`udVariants` are the member
@@ -257,7 +263,8 @@ export type Node = NumLit |
   ForRange |
   ForIn |
   MatchExpr |
-  ImportDecl
+  ImportDecl |
+  Spread
 
 // A parse diagnostic: a message plus the token index it is raised at. VL has no
 // exceptions, so errors accumulate rather than throw.
@@ -1240,6 +1247,25 @@ export function nodeIsTplHole(nodeIx: i32) {
   tplHole[nodeIx] == 1
 }
 
+// Parallel to `P.nodes` on `tplHole`'s contract. `1` marks a `Call` whose trailing arguments
+// have already been packed into the list its callee's rest parameter takes. The mark is what
+// makes `restCallPack` idempotent: a packed call's arity already equals its parameter count,
+// so nothing about the argument list itself distinguishes it from an unpacked one.
+export let callRestPacked: i32[] = []
+
+export function markCallRestPacked(nodeIx: i32) {
+  if nodeIx < 0 { return 0 }
+  while callRestPacked.length <= nodeIx { callRestPacked.push(0) }
+  callRestPacked[nodeIx] = 1
+  0
+}
+
+// True when `nodeIx` is a call whose trailing arguments are already packed.
+export function callIsRestPacked(nodeIx: i32) {
+  if nodeIx < 0 || nodeIx >= callRestPacked.length { return false }
+  callRestPacked[nodeIx] == 1
+}
+
 // A compound assignment `target op= value`, desugared to `target = (target op
 // value)` for typecheck/emit but tagged with the SURFACE operator (`binCompound`)
 // so the printer reprints `target op= value`. The target node is shared between
@@ -1596,6 +1622,41 @@ export function mkArrayLit(elems: i32[], pos: i32) {
   addNode(n)
 }
 
+export function mkSpread(arg: i32, pos: i32) {
+  const n: Node = { spdArg: arg, pos: pos }
+  addNode(n)
+}
+
+// Give node `dst` node `src`'s token anchor. A node minted after parsing takes the parser's
+// final cursor, which puts a diagnostic over it at the end of the file; the anchor is the
+// only thing `nodeStartTok` resolves, so adopting one is the whole of the fix.
+export function adoptNodeTok(dst: i32, src: i32) {
+  if dst < 0 || dst >= nodeToks.length { return 0 }
+  if src < 0 || src >= nodeToks.length { return 0 }
+  nodeToks[dst] = nodeToks[src]
+  0
+}
+
+// The operand of a spread element, or -1 when `ix` is not one — the reader every consumer
+// of an argument or element list uses to ask "is this item a spread, and of what".
+export function spreadArgOf(ix: i32) {
+  if ix < 0 || ix >= P.nodes.length { return -1 }
+  const n = P.nodes[ix]
+  if n is Spread { return n.spdArg }
+  -1
+}
+
+// True iff any item in an argument or element list is a spread — the cheap gate a consumer
+// checks before paying for the packing path, the shape `hasNamedArgs` already has.
+export function hasSpreadItem(items: i32[]) {
+  let i = 0
+  while i < items.length {
+    if spreadArgOf(items[i]) >= 0 { return true }
+    i = i + 1
+  }
+  false
+}
+
 export function mkOptMember(obj: i32, prop: string, dot: boolean, pos: i32) {
   const n: Node = { omObj: obj, omProp: prop, omDot: dot, pos: pos }
   addNode(n)
@@ -1622,15 +1683,40 @@ export function mkLet(kw: string, name: string, ty: i32, init: i32, pos: i32) {
   addNode(n)
 }
 
-export function mkParam(name: string, ty: i32, dflt: i32, opt: i32, pos: i32) {
+export function mkParam(
+  name: string,
+  ty: i32,
+  dflt: i32,
+  opt: i32,
+  rest: i32,
+  pos: i32,
+) {
   const n: Node = {
     parName: name,
     parType: ty,
     parDefault: dflt,
     parOpt: opt,
+    parRest: rest,
     pos: pos,
   }
   addNode(n)
+}
+
+// Whether the parameter node `pIx` is the rest parameter `...xs: T[]`. The one reader of
+// `parRest` outside the parser and the printer, so a caller never re-narrows the node.
+export function paramIsRest(pIx: i32) {
+  if pIx < 0 || pIx >= P.nodes.length { return false }
+  const p = P.nodes[pIx]
+  if p is Param { return p.parRest == 1 }
+  false
+}
+
+// The index of a parameter list's rest parameter, or -1 when it has none. A rest is last
+// by rule (`parseParamList` refuses any other position), so only the tail is asked.
+export function restParamIndex(params: i32[]) {
+  if params.length == 0 { return -1 }
+  if paramIsRest(params[params.length - 1]) { return params.length - 1 }
+  -1
 }
 
 // The default-value expression of the parameter node `pIx`, or -1 when it has
@@ -1985,6 +2071,10 @@ export function nodeChildren(ix: i32) {
     return out
   }
   if n is ArrayLit { return n.arrElems }
+  if n is Spread {
+    const out: i32[] = [n.spdArg]
+    return out
+  }
   if n is ObjLit { return n.objFields }
   if n is FieldInit {
     const out: i32[] = [n.fiValue]

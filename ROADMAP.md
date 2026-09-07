@@ -61,7 +61,6 @@ units: **hours** · **half-day** · **days**.
 | 18 | **B8 — four `for` gaps, one member per row** | objects → `for-in expects an array or map, got P`; `for v, i in xs` → parse error; expression step → `undeclared identifier 'i'`; float bounds → `for-range bounds must be i32` | `typecheck.vl:34100/34156`, `parser.vl` for-head | half-day each |
 | 19 | **B6a — an i32-keyed map in four container positions** | `const u: {[i32]: f64} \| i32 = 5` → `emitProgram: an i32-keyed Map/Set is supported as … not inside '{[i32]:f64}\|i32'`; same for `[][]`, closure array, map value | `emit_collect.vl:4707 i32MapSpellingLowerable` | days (position matrix, build-then-narrow per D965) |
 | 20 | **A9 — no element-converting / field-dropping container copy** | `Cat[]` into an `Animal[]` param → `…type-valid (structural width subtyping) but not yet supported by codegen…` | `typecheck.vl` refusals + the converting-copy lowering; wire every delivery position BEFORE narrowing the gate | days |
-| 21 | **H4.6 / B6 — variadics, then array spread (owner ruling 2026-09-06 night: (A), one rule)** | `xs.push(...ys)` → `parse error … expected an expression but found DOT`; no `...` token, no variadic function, `push` is arity-1 | `parser.vl` (rest parameter + `...` argument), `typecheck.vl` (packing at the call, refusal into fixed arity), emitter (list build at the call); `extend` in `std:array` ships the bulk-append value first | days |
 | 22 | **B-debug — a trap names a wasm function index, not a VL location** | `print(a[7])` → `vl!<wasm function 4>` and `out of bounds array access` with no index and no length | `scripts/vl-host/src/main.rs` trap formatting + the name section | days |
 | 23 | **D9.11 — `///` docs are not rendered in hover** | `server.ts:1002-1004` says so; no doc-text export exists in `compiler/` | `check_query.vl` + `entry.vl` export list, `lsp/src/server.ts` ~1002 | days |
 | 24 | **dogfood `match` over the compiler's own kind ladders** | the load-bearing dependency is MET: `match` over `{c:i32}\|{d:i32}` prints **5**, over `i32\|string` prints **1** | `emit_classify.vl` field-code ladders; measured by `ladder-budget.py` (430 + 8 today) | days |
@@ -184,6 +183,23 @@ Five items, in order. (0) is shipped; the rest are scheduled against it.
 
 
 ### Ruled and sequenced (owner decisions already made, waiting only on order)
+
+- **Variadics, then spread — RULED (A) 2026-09-06 night and BUILT.** One rule: a rest
+  parameter `function f(a: i32, ...xs: i32[])` packs the trailing arguments, a call-site
+  spread `f(1, ...ys)` unpacks a list into one, `[...a, ...b]` in a list literal is the same
+  operator, and `push` is variadic so `xs.push(...ys)` follows with no special case. The
+  packing is an in-place rewrite in the CHECKER (`f(a, b, c)` → `f(a, [b, c])`), so the
+  existing call, monomorphization and list-literal machinery serves it unchanged; the one new
+  emitter builder is the runtime-length literal, on `.slice`'s allocate-once-then-`array.copy`
+  shape. Position matrix 46 of 46 in both faces, 0 silent. **REMAINING**, each named and
+  none of it blocking: a `u8[]` SOURCE is refused at every spelling (D1850 — its packed
+  backing is not the rep an un-annotated destination binds; `bs.slice(0)` is the copy that
+  works); a covariant `Circle[]` into `...Shape[]` needs D791's element-converting loop
+  rather than `array.copy`; a rest parameter is deliberately NOT part of a function TYPE, so
+  a callback cannot be variadic (the alternative is stated in the design doc); an `extern`
+  cannot take one, since `parseExternParams` mints no `Param` node; and `f(1, "a")` into
+  `...xs: T[]` refuses at argument 2 rather than joining the element hole to `i32 | string`.
+  Design: `docs/internals/variadics-design.md`.
 
 - **`match` over an INTEGER scrutinee — RULED and BUILT 2026-09-03 as D1572**, the consumer
   ask VL-020 (glean's decoders switch on integer tags; a 105-way command-id dispatch was an
@@ -2103,8 +2119,7 @@ in-language GC knobs.
   Workboard D7.
 - 🟡 **B5. Objects.** REMAINING: methods via `self`+UFCS (B14); typed literals in object values
   (`{n: 4<i64>}`); Exact-by-default for values (A8).
-- 🟡 **B6. Collections — growable `T[]`.** REMAINING: in-place bulk append (deferred — will be
-  `xs.push(...ys)` once variadics land); representation inference (§VL.7 — lower never-grown
+- 🟡 **B6. Collections — growable `T[]`.** REMAINING: representation inference (§VL.7 — lower never-grown
   values to a header-less fixed array); `map`/`filter` build-side generics for `Map`/`Set` (A10);
   `.vl`-std migration once a module system exists. (design: `docs/guide/collections-design.md`)
 - 🟡 **B6a. `Map` + `Set`.** The **struct/variant FIELD position is DONE** — `{[i32]: V}` now ships
@@ -3035,8 +3050,9 @@ independent).*
     ("`u8` is a storage type, not a value type"). Bytes are
     represented as `i32` masked `& 0xff` in `wasmEmit.vl` and round-trip/instantiate fine; a real
     packed byte buffer (B7/B6 `(array i8)`) would drop the 4×-wide detour. (detail: `docs/internals/selfhost-gaps.md` §H4.1)
-  - ⬜ **H4.6. Array spread / concat in call position (worked around).** A small `appendAll()` loop
-    helper covers bulk-append today; `xs.push(...ys)` lands with variadics (B6). (detail: `docs/internals/selfhost-gaps.md` §H4.6)
+  - ✅ **H4.6. Array spread / concat in call position — BUILT** with variadics (B6): `...` is
+    one rule at three spellings, so `xs.push(...ys)`, `f(1, ...ys)` and `[...a, ...b]` all
+    run. `docs/internals/variadics-design.md` §5 names what is not built.
 - ⬜ **H-M2. Wasm-native distribution (end-state).** The `vl` binary becomes a wasm runtime
   (wasmtime — full WasmGC since v27) + a small host shim. No V8, no binaryen, no Deno.
   **Engine choice re-validated (2026 survey):** wasmtime remains the only standards-track
