@@ -298,7 +298,30 @@ load-bearing channels here are the three grids, the edge sweep, the corpus A/B a
 
 ---
 
-## 7. Out of scope, and why
+## 7. The f64 twin, added 2026-09-07 (D1890)
+
+**This doc treated the f64 target as the SWALLOW CONTROL** — "Grid 2 — 54 positions x {f32,
+f64}. The f64 twin is the swallow control." It was the right control for the f32 grant and it
+hid a gap of its own: f64 has no contextual-literal rule either, it rides the widening
+lattice's `i32 -> f64` edge, and that edge stops at 2^31. So every integer literal between
+2^31 and 2^53 — exactly representable in f64, and inexpressible without an `as` — refused at
+an f64 target while the **strictly less precise f32 accepted it**, because f32's predicate
+reads the LEXEME and spans the whole integer range.
+
+The twin is `isExactF64IntLitExpr` over `intLexemeIsExactF64`, and it needs no float half: a
+`.`-literal already types f64. Both halves of the pair now share one walk each —
+`intLitLexemeOf` for what counts as an integer literal, `intLexemeIsExactFloat(t, sigBits,
+maxWidth)` for exactness, `dstAdmitsPrim(dstTy, prim)` for the destination — so a future width
+cannot drift from these two the way these two drifted.
+
+Thirteen delivery positions x nine literal/target cells all run, and four must-refuse rows
+(2^53+1 at f64, 2^24+1 and 2147483647 at f32) refuse at all thirteen. The union/nullable cell
+needed an emitter change of its own, D1930, which also closed the PRE-EXISTING
+`const x: f32 | null = 2147483648` emit reject this doc's own grant had left behind.
+
+---
+
+## 8. Out of scope, and why
 
 - **f32 inference without an annotation** (`const x = 0.5` alone). The literal's default is
   f64 by design and nothing in the spec asks for that to change.
