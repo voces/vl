@@ -59,7 +59,7 @@ seven times per keystroke). The playground adapter has the same shape at the req
 | # | finding | where | cost | proof |
 | --- | --- | --- | --- | --- |
 | 9 | **The playground re-checks the whole program on every code-action request — TWICE.** `codeActions` calls `await diagnostics(text)` (a full `check` + `lint` walk); `main.ts:426` then calls `organizeImports`, which calls `diagnostics(text)` AGAIN — two whole-program walks per lightbulb. The **server does not**: it caches diagnostics in `diagnosticsByUri` on `onDidChangeContent` (`server.ts:231,421`) and the code-action handler reads the cache. | `lspAdapter.ts:401,437`; `main.ts:383,426` | 2× whole-program `check`+`lint` per code-action request, redundant with the diagnostics the editor already holds | thread the editor's cached diagnostics into `codeActions`/`organizeImports` (the server's own shape); `playground_import_actions_test.ts` identical, request count measured before/after with a checker call-counter |
-| 10 | **`semanticTokens` runs three seed queries per keystroke** — `tokensAt` + `memberTokensAt` + `lexicalTokensAt` (`lspAdapter.ts:145` area). These are three token LAYERS, so the outputs are not redundant; the open question is whether each re-lexes the same buffer or shares a prepared state in the seed. **Measure before ranking as work** — if the seed re-lexes three times per keystroke this is real editor latency, if it shares a prepare it is fine. | `lspAdapter.ts` `semanticTokens` | 3 seed calls per keystroke; unknown re-lex cost | add a lex counter to the seed's prepare, count per `semanticTokens` call on a 200-line buffer; a combined query if it re-lexes |
+| ~~10~~ | **STRUCK — measured NO-OP; the memo already shares the prepared state.** `semanticTokens` issues three token-LAYER queries (`tokensAt` + `memberTokensAt` + `lexicalTokensAt`), but it does NOT re-lex three times. Measured against the seed: one `semanticTokens` call costs exactly **1** graph-check. `tokensAt` and `memberTokensAt` both route through `ensurePrepared` → `ensureStaged`, which memoises the staging on `(exp, source, entryKey, read, generation)` — so the second is a memo HIT (0 re-parse, 0 re-check). `lexicalTokensAt` runs its own `exp.lexScan()`, but that is a deliberately-separate lightweight lexical-only scan: it writes only its four span tables and never touches `P.toks` or the node arena, kept apart precisely so the CHECK staging survives (`wasmChecker.ts:2032` comment). So per keystroke the cost is **1 heavyweight parse+check (shared) + 1 cheap lexScan**, not 3 re-lexes — a combined query would save nothing. | `lspAdapter.ts` `semanticTokens`; `wasmChecker.ts` `ensureStaged`/`ensurePrepared`/`lexicalTokensAt` | 0 — the memo shares the prepared state across the two heavyweight queries; the third is a purpose-built lightweight scan | none; no code change |
 
 ## What to do first
 
@@ -69,8 +69,10 @@ row 5** (the
 byte-identical text helpers) and **row 8** (the host-import factory), both pure extractions
 with an exact test-identity proof and no behaviour change. Row 6 (the std-export twin) and row
 7 (the `std:` predicate) are the same shape one size up. Row 9 (the double re-check) is the
-only one that changes a hot path, so it wants the call-counter measurement first; row 10 is a
-measurement before it is work.
+only one that changes a hot path, so it wanted the call-counter measurement first (shipped
+#2992). Row 10 was measured and is STRUCK as a NO-OP: the `ensureStaged` memo already shares
+the prepared state across `semanticTokens`' two heavyweight queries, and the third is a
+purpose-built lightweight lexical scan — one keystroke is one graph-check, not three re-lexes.
 
 **One meta-finding:** every tranche-2/3 row is a case of the playground adapter mirroring
 `server.ts` by hand because the shared home (`typeFeatures.ts`) took the pure LOGIC but not the
