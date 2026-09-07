@@ -513,6 +513,165 @@ Deno.test({
   },
 });
 
+// ── list-literal layout (#2814) ──────────────────────────────────────────────
+// A list literal that does not fit one line is FILLED — as many scalar literals per
+// continuation line as fit the 80-column budget — with ONE intent rule: rows the author
+// already wrote, two or more of them and every row the same width of at least two, are
+// kept exactly, because that is a 2-D table written as a 1-D list. Anything holding a
+// struct, closure, nested list or any non-literal element stays one per line, and so does
+// a literal carrying a comment, which pins the rows around it. There is no opt-out.
+
+Deno.test({
+  name: "vl-fmt: an over-wide list of scalar literals fills, and the filled text still runs",
+  ignore: !ENABLED,
+  fn: async () => {
+    const src =
+      "const xs = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25]\n" +
+      "print(xs.length)\n" +
+      "print(xs[24])\n";
+    const r = await run([], src);
+    if (r.code !== 0) throw new Error(`fmt failed: ${r.err}`);
+    if (!r.out.includes("const xs = [\n  1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,\n  23, 24, 25,\n]\n")) {
+      throw new Error(`scalar list did not fill:\n${r.out}`);
+    }
+    const r2 = await run([], r.out);
+    if (r2.out !== r.out) throw new Error(`fill not idempotent:\n${r2.out}`);
+    // Text equality cannot tell a filled list from a re-spelled one — run it.
+    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_fill_" });
+    try {
+      const f = `${dir}/a.vl`;
+      await Deno.writeTextFile(f, r.out);
+      const ran = await runOn("run", f);
+      if (ran.code !== 0) throw new Error(`filled list does not run: ${ran.err}`);
+      if (ran.out !== "25\n25\n") throw new Error(`filled list changed the answers: ${ran.out}`);
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
+
+Deno.test({
+  name: "vl-fmt: uniform author rows are kept exactly, even when the list would fit one line",
+  ignore: !ENABLED,
+  fn: async () => {
+    // A 4×4 identity matrix written as a 1-D list. It fits on one line, and collapsing it
+    // is exactly what the intent rule exists to prevent — the row width is read before the
+    // one-line form is tried.
+    const src =
+      "const eye = [\n" +
+      "  1, 0, 0, 0,\n" +
+      "  0, 1, 0, 0,\n" +
+      "  0, 0, 1, 0,\n" +
+      "  0, 0, 0, 1,\n" +
+      "]\n" +
+      "print(eye[5])\n";
+    const r = await run([], src);
+    if (r.code !== 0) throw new Error(`fmt failed: ${r.err}`);
+    if (!r.out.includes("const eye = [\n  1, 0, 0, 0,\n  0, 1, 0, 0,\n  0, 0, 1, 0,\n  0, 0, 0, 1,\n]\n")) {
+      throw new Error(`uniform rows were not kept:\n${r.out}`);
+    }
+    const r2 = await run([], r.out);
+    if (r2.out !== r.out) throw new Error(`kept rows not idempotent:\n${r2.out}`);
+  },
+});
+
+Deno.test({
+  name: "vl-fmt: rows of unequal width are not an intent signal — the list fills",
+  ignore: !ENABLED,
+  fn: async () => {
+    const src = "const r = [\n  1, 2, 3,\n  4, 5,\n  6, 7, 8, 9,\n]\nprint(r.length)\n";
+    const r = await run([], src);
+    if (r.code !== 0) throw new Error(`fmt failed: ${r.err}`);
+    if (!r.out.includes("const r = [1, 2, 3, 4, 5, 6, 7, 8, 9]\n")) {
+      throw new Error(`ragged rows were kept:\n${r.out}`);
+    }
+    const r2 = await run([], r.out);
+    if (r2.out !== r.out) throw new Error(`ragged fill not idempotent:\n${r2.out}`);
+  },
+});
+
+Deno.test({
+  name: "vl-fmt: a list holding a struct, a nested list or a name stays one per line",
+  ignore: !ENABLED,
+  fn: async () => {
+    const src =
+      "const objs = [{ a: 1, b: 2 }, { a: 3, b: 4 }, { a: 5, b: 6 }, { a: 7, b: 8 }, { a: 9, b: 10 }]\n" +
+      "const nest = [[1, 2, 3, 4, 5], [6, 7, 8, 9, 10], [11, 12, 13, 14, 15], [16, 17, 18]]\n" +
+      "const one = 1\n" +
+      "const refs = [one, one, one, one, one, one, one, one, one, one, one, one, one, one]\n" +
+      "print(objs.length + nest.length + refs.length)\n";
+    const r = await run([], src);
+    if (r.code !== 0) throw new Error(`fmt failed: ${r.err}`);
+    if (!r.out.includes("const objs = [\n  { a: 1, b: 2 },\n  { a: 3, b: 4 },\n")) {
+      throw new Error(`struct elements were filled:\n${r.out}`);
+    }
+    if (!r.out.includes("const nest = [\n  [1, 2, 3, 4, 5],\n  [6, 7, 8, 9, 10],\n")) {
+      throw new Error(`nested-list elements were filled:\n${r.out}`);
+    }
+    if (!r.out.includes("const refs = [\n  one,\n  one,\n")) {
+      throw new Error(`identifier elements were filled:\n${r.out}`);
+    }
+    const r2 = await run([], r.out);
+    if (r2.out !== r.out) throw new Error(`one-per-line not idempotent:\n${r2.out}`);
+  },
+});
+
+Deno.test({
+  name: "vl-fmt: a list that fits one line is left on one line",
+  ignore: !ENABLED,
+  fn: async () => {
+    const src = "const s = [1, 2, 3]\nconst t = [\"a\", \"b\"]\nprint(s.length + t.length)\n";
+    const r = await run([], src);
+    if (r.code !== 0) throw new Error(`fmt failed: ${r.err}`);
+    if (r.out !== src) throw new Error(`a fitting list was reflowed:\n${r.out}`);
+  },
+});
+
+Deno.test({
+  name: "vl-fmt: a comment inside a list literal pins its row (D1776)",
+  ignore: !ENABLED,
+  fn: async () => {
+    // No reflow can place an expression-interior comment, and the old one handed it back
+    // to the statement printer, which emitted it AFTER the whole declaration — the comment
+    // then documented the next statement. A literal carrying one is reproduced from source
+    // instead, so every row, the commented one included, stays exactly where it was.
+    const src =
+      "const c = [\n" +
+      "  111111111, 222222222,\n" +
+      "  // the second row\n" +
+      "  333333333, 444444444,\n" +
+      "  555555555, 666666666,\n" +
+      "  777777777, 888888888,\n" +
+      "]\n" +
+      "function f(): i32 {\n" +
+      "  const inner = [\n" +
+      "    10,\n" +
+      "    // a note\n" +
+      "    20,\n" +
+      "  ]\n" +
+      "  return inner[0] + inner[1]\n" +
+      "}\n" +
+      "const t = [1, 2] // after the list\n" +
+      "print(c.length + f() + t.length)\n";
+    const r = await run([], src);
+    if (r.code !== 0) throw new Error(`fmt failed: ${r.err}`);
+    if (r.out !== src) throw new Error(`a commented list moved:\n${r.out}`);
+    const r2 = await run([], r.out);
+    if (r2.out !== r.out) throw new Error(`commented list not idempotent:\n${r2.out}`);
+    // The pinned spelling still runs, and prints what the unformatted one did.
+    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_cmtlist_" });
+    try {
+      const f = `${dir}/c.vl`;
+      await Deno.writeTextFile(f, r.out);
+      const ran = await runOn("run", f);
+      if (ran.code !== 0) throw new Error(`pinned list does not run: ${ran.err}`);
+      if (ran.out !== "40\n") throw new Error(`pinned list changed the answers: ${ran.out}`);
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
+
 Deno.test({
   name: "vl-fmt: a lone wide comment's spacing does not force-align the narrower lines",
   ignore: !ENABLED,
