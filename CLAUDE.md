@@ -257,6 +257,15 @@ The same applies to `@hint redundant type annotation` — a hint saying the anno
 redundant is the checker agreeing about the TYPE, and says nothing about whether the two
 spellings agree about the REP.
 
+**AND THE POSITION MATRIX ITSELF CAN BE THE THING THAT ANNOTATES.** A matrix template fixes the
+value's TYPE, so a template whose type is concrete cannot see a defect whose ingredient is that
+type being INFERRED. #2854's rest-parameter matrix pinned `...xs: i32[]` and graded 46 of 46
+green in both faces while `f<T>(...xs: T[])` with `f(1, "x")` was **check-clean invalid wasm** —
+the hole was never bound to a union, because no cell in the grid bound the hole at all. The
+generic twin is a SECOND template, not a wider one: `spread-into-generic-rest.matrix.vl` beside
+`spread-into-rest-parameter.matrix.vl`. When a capability has a type PARAMETER, one of its
+templates has to leave that parameter open, or the instrument is annotating for you.
+
 ## A CAPABILITY GAP HAS A POSITION MATRIX — narrowing the checker first ships clause-1 bugs
 
 A refusal that names a capability (`no element-converting copy exists`) is usually enforced in

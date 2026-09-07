@@ -224,8 +224,10 @@ import {
   Unary,
   WhileStmt,
   annTsOf,
+  hasSpreadItem,
   mkTypeRef,
   nodeChildren,
+  spreadArgOf,
   tsHasKind,
   tsKind,
 } from "./ast"
@@ -562,6 +564,7 @@ import {
 import { emitFail, emitFailAt } from "./emit_bytes"
 import {
   MV_ARM_NOHINT,
+  RepDesc,
   declTyIxOfName,
   fieldElemTyIxOfName,
   hcShapeSetId,
@@ -584,6 +587,8 @@ import {
   recordSTyIx,
   recordUnMemTys,
   repCanonId,
+  repDescNone,
+  repDescRet,
   repElemId,
   repElemIdOfNameTy,
   repKindOfSigTok,
@@ -1558,9 +1563,7 @@ function globalIsNulMapSid(fnIx: i32, sid: i32) {
 
 // True if the function `name` returns a nullable struct (`"nulstruct"`).
 function fnRetNulRefSid(sid: i32, name: string, fnIx: i32) {
-  const i = fnIndexOfInScopeSid(sid, name, fnIx)
-  if i < 0 { return false }
-  fRetKind[i] == "nulstruct"
+  repOfNameResult(sid, name, fnIx).rdKind == "nulstruct"
 }
 
 // True if the `LetDecl` at `letIx` declares a nullable-struct local: its annotation
@@ -2278,9 +2281,7 @@ function globalIsNulStringSid(fnIx: i32, sid: i32) {
 }
 
 function fnRetNulStringSid(sid: i32, name: string, fnIx: i32) {
-  const i = fnIndexOfInScopeSid(sid, name, fnIx)
-  if i < 0 { return false }
-  fRetKind[i] == "nulstr"
+  repOfNameResult(sid, name, fnIx).rdKind == "nulstr"
 }
 
 export function letIsNulString(letIx: i32, fnIx: i32) {
@@ -3886,6 +3887,36 @@ export function fnIndexOfInScopeSid(sid: i32, name: string, fnIx: i32) {
     }
   }
   fnIndexOfSid(sid)
+}
+
+// The rep of the RESULT of calling `name`, resolved in the frame `fnIx` reads it — the ONE
+// home for the walk (#2815's calling frame, #2840's origin hop) and for the three return
+// columns that answer after it. `rdCovered` 0 means the name resolves to no lifted function;
+// `rdNul` is unanswered, since these columns carry no null discipline.
+export function repOfNameResult(sid: i32, name: string, fnIx: i32): RepDesc {
+  const i = fnIndexOfInScopeSid(sid, name, fnIx)
+  if repShadowOn { repABNoteNameResult(sid, i) }
+  if i < 0 { return repDescNone() }
+  // The three columns are pushed together in `buildFnMap`'s one loop over `fnStmts`, so an
+  // index valid for any of them is valid for all three; reading them together is what makes
+  // this a descriptor rather than three lookups that can drift.
+  repDescRet(fRetKind[i], fRetStructIdx[i], fRetRArrElem[i])
+}
+
+// The oracle at this surface compares the FLAT map's answer against the frame-aware walk's:
+// a disagreement is one site where a per-pin clone would have adopted its template's rep,
+// which is the whole D1788 family in one measurement.
+function repABNoteNameResult(sid: i32, scoped: i32) {
+  const flat = fnIndexOfSid(sid)
+  if flat == scoped { return 0 }
+  repABNote("nameResult", repABRetWord(flat), repABRetWord(scoped))
+}
+
+// A resolved slot's stored return kind as a report word, or `declined` for no slot.
+function repABRetWord(i: i32): string {
+  if i < 0 { return "declined" }
+  if i >= fRetKind.length { return "declined" }
+  fRetKind[i]
 }
 
 // ── capture analysis (closures) ───────────────────────────────────────────────
@@ -11050,6 +11081,52 @@ export function widenTmpSlot(which: i32) {
   scratchSlot(10, "i32", which, SCRATCH_BY_KEY)
 }
 
+// The rep a spread literal builds at, read off a spread's SOURCE: the checker has already made
+// every item's element type agree, so any one source names the whole literal's rep. `null` when
+// no source is a list the emitter knows, which is the caller's refusal.
+export function spreadDestKind(elems: i32[], fnIx: i32): MfKind | null {
+  let i = 0
+  while i < elems.length {
+    const src = spreadArgOf(elems[i])
+    if src >= 0 {
+      const k = mfRecvKindOf(src, fnIx)
+      if k != null { return k }
+    }
+    i = i + 1
+  }
+  null
+}
+
+// The ref-list row a spread literal builds at — 0 for every kind but `"ref"`, where the row is
+// the source's own, since a ref list's wrapper and backing heap types come from the row.
+export function spreadDestRow(elems: i32[], fnIx: i32) {
+  let i = 0
+  while i < elems.length {
+    const src = spreadArgOf(elems[i])
+    if src >= 0 {
+      const k = mfRecvKindOf(src, fnIx)
+      if k != null {
+        if k == "ref" { return refListSlotOfExpr(src, fnIx) }
+        return 0
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// A spread literal's frame slots: one list WRAPPER per item group (code 20) and one
+// destination BACKING (code 21), keyed by a per-site sequence so a nested spread literal
+// cannot write a live outer slot. Kind maps to heap type as codes 11 and 12 do, and the
+// ref-list row is `key % 4096`.
+export function spreadGroupWrapSlot(kind: MfKind, row: i32, seq: i32) {
+  scratchSlot(20, kind, row + 4096 * seq, SCRATCH_BY_BOTH)
+}
+
+export function spreadDstBackSlot(kind: MfKind, row: i32, seq: i32) {
+  scratchSlot(21, kind, row + 4096 * seq, SCRATCH_BY_BOTH)
+}
+
 // The tail-value expression of an if-expression's then arm (`ifArmValueExpr`: the arm
 // block's last statement), or -1. The arms share the checker's join type, so the then
 // arm's rep classifies the whole if-expression.
@@ -16159,12 +16236,17 @@ function nulCloFlagAnn(tyIx: i32) {
 }
 
 export function vtKindOfType(tyIx: i32): VKind {
-  // Arena-first (the strangler seam): where the checker's arena covers the annotation's
-  // shape, the rep descriptor decides the kind — one structural derivation instead of
-  // this ladder re-testing name arms. The ladder below is the fallback for the uncovered
-  // remainder and shrinks as coverage widens. `annRepKindOf` is this leg exactly.
   const rk = annRepKindOf(tyIx)
+  if repShadowOn {
+    let dw = "uncovered"
+    if rk != null { dw = rk }
+    repABNote("vtKindOfType", vtKindOfTypeLadder(tyIx), dw)
+  }
   if rk != null { return rk }
+  vtKindOfTypeLadder(tyIx)
+}
+
+function vtKindOfTypeLadder(tyIx: i32): VKind {
   // A literal-union annotation (`type K = "a" | "b"`) is an i32-backed interned atom (`"i32"`), NOT
   // a value-union box — checked first (it IS a `TyUnion`, so `retUnionFlag` would claim it).
   if tyIx >= 0 {
@@ -16212,6 +16294,11 @@ export function vtKindOfType(tyIx: i32): VKind {
   if retNulVariantFlag(tyIx) == 1 { return "nulvariant" }
   if retNulRefFlag(tyIx) == 1 { return "nulstruct" }
   if retNulStringFlag(tyIx) == 1 { return "nulstr" }
+  // The five nullable scalar-list niches (`string[] | null` and the f64/i64/f32/u8 lists),
+  // each its own wrapper heap type. Before the generic nullable-list arms, which claim the
+  // i32 backing: without this rung all five fell to the `"i32"` default.
+  const nsl = nulScalarListKindOfNode(tyIx)
+  if nsl != null { return nsl }
   if retNulListFlag(tyIx) == 1 { return "nullist" }
   // A nullable ref array (`<ref-array> | null`) — the `(ref null $wrapper)` niche (kind 18,
   // `"nulreflist"`). Before `retRefArrFlag` (whose non-null slot can't hold `null`) and the
@@ -18251,6 +18338,9 @@ export function arrLitIsStr(arrIx: i32, fnIx: i32) {
   const a = P.nodes[arrIx]
   if a is ArrayLit {
     if a.arrElems.length < 1 { return false }
+    if hasSpreadItem(a.arrElems) {
+      return spreadDestKind(a.arrElems, fnIx) == "str"
+    }
     // An atom-element literal (the checker adopted a `K[]` context) is the i32 atom-id
     // list, not a string list — its elements are string exprs syntactically but each lowers
     // as its interned atom id. Without this the literal claims the string-list build while
@@ -18292,6 +18382,12 @@ export function arrLitIsF64(arrIx: i32, fnIx: i32) {
   const a = P.nodes[arrIx]
   if a is ArrayLit {
     if a.arrElems.length < 1 { return false }
+    // A spread element is no f64 VALUE, so the element scan below would read `[...fs]` as
+    // the i32 default while `emitArrSpread` builds the source's rep — two heap types for
+    // one value. Both sides ask `spreadDestKind`, so they cannot disagree.
+    if hasSpreadItem(a.arrElems) {
+      return spreadDestKind(a.arrElems, fnIx) == "f64"
+    }
     // A box-list literal with an f64 member: the checker recorded a value union, so the
     // elements box and the f64-list build would store a string ref into an `(array (mut
     // f64))` backing. The scan below is order-blind (any f64 member claims the list), so
@@ -24164,9 +24260,7 @@ export function variantFieldIndex(vi: i32, field: string) {
 // per-pin clone shares its template's name, and the flat lookup always answers the template,
 // so an i32 instance read the struct pin's kind and returned a ref it never built (D1788).
 function fnRetStructSid(sid: i32, name: string, fnIx: i32) {
-  const i = fnIndexOfInScopeSid(sid, name, fnIx)
-  if i < 0 { return false }
-  fRetKind[i] == "struct"
+  repOfNameResult(sid, name, fnIx).rdKind == "struct"
 }
 
 // True if the parameter `name` of function `fnIx` is the struct type.
@@ -25126,20 +25220,21 @@ function declaredStructIndex(name: string) {
 // Frame-aware for the same reason its kind companion is: the two must resolve to the SAME
 // function, or the kind says struct while the row is another instance's (D1788).
 function fnRetStructIndexSid(sid: i32, name: string, fnIx: i32) {
-  const i = fnIndexOfInScopeSid(sid, name, fnIx)
-  if i < 0 { return -1 }
+  const d = repOfNameResult(sid, name, fnIx)
+  if d.rdCovered == 0 { return -1 }
   // Kind-gated, like every other reader of the polymorphic companion slot: `fRetStructIdx`
   // holds four namespaces selected by `fRetKind` (struct row, variant index, ref-list slot,
   // map shape), and every sibling reader gates on the kind first (D26) — the producer needs
   // the same gate a misreading consumer already carries.
-  const k = fRetKind[i]
+  const k = d.rdKind
   if k != "struct" && k != "nulstruct" { return -1 }
   // D871 — the same redirect the map's value slot and the local's cell take: the row the
   // return annotation names is the row the `??` family superseded, and the callee's returned
   // literal is minted at the merged row instead. Safe under the four-namespace slot since the
   // kind gate above already establishes this one is a struct-table row.
-  if !anonLeafRetMovedOf(fnStmts[i]) { return fRetStructIdx[i] }
-  anonLeafSupersedeOf(fRetStructIdx[i])
+  const i = fnIndexOfInScopeSid(sid, name, fnIx)
+  if !anonLeafRetMovedOf(fnStmts[i]) { return d.rdSlot }
+  anonLeafSupersedeOf(d.rdSlot)
 }
 
 // The struct table index of a module global `name` (from its annotation/initializer),
@@ -25638,9 +25733,7 @@ export function structIndexOfLet(letIx: i32, fnIx: i32) {
 
 // True if function `name` declares the union as its return type.
 function fnRetUnionSid(sid: i32, name: string, fnIx: i32) {
-  const i = fnIndexOfInScopeSid(sid, name, fnIx)
-  if i < 0 { return false }
-  fRetKind[i] == "union"
+  repOfNameResult(sid, name, fnIx).rdKind == "union"
 }
 
 // True if the parameter `name` of function `fnIx` is the union type.
@@ -28488,9 +28581,7 @@ export function exprReReadable(exprIx: i32): boolean {
 // return. Scope-aware because a monomorphized instance's per-pin clone shares the template's
 // name, and the flat map answers the template (D1781).
 function fnRetArraySid(sid: i32, name: string, fnIx: i32) {
-  const i = fnIndexOfInScopeSid(sid, name, fnIx)
-  if i < 0 { return false }
-  fRetKind[i] == "list"
+  repOfNameResult(sid, name, fnIx).rdKind == "list"
 }
 
 // True if the already-collected declared local `name` is an i32-array ref (code `2`).
@@ -28601,6 +28692,15 @@ function identShadowedByFrame(fnIx: i32, name: string) {
 
 export function exprArray(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return false }
+  // A spread literal answers from the rep `emitArrSpread` builds it at, ahead of the
+  // typed-IR path: that path claims every array kind, so `[...bs]` over a `u8[]` would bind
+  // the i32 cell while the value is the packed byte wrapper — two heap types for one value.
+  const sl = P.nodes[exprIx]
+  if sl is ArrayLit {
+    if hasSpreadItem(sl.arrElems) {
+      return spreadDestKind(sl.arrElems, fnIx) == "i32"
+    }
+  }
   if tyKindOf(nodeTyIxOf(exprIx)) == 2 {
     return true // typed-IR fast path (see exprIsF64)
   }
@@ -28737,9 +28837,7 @@ export function letIsArray(letIx: i32, fnIx: i32) {
 
 // True if function `name` declares a ref array (`S[]`/`N[]`) as its return type.
 function fnRetRefArraySid(sid: i32, name: string, fnIx: i32) {
-  const i = fnIndexOfInScopeSid(sid, name, fnIx)
-  if i < 0 { return false }
-  fRetKind[i] == "reflist"
+  repOfNameResult(sid, name, fnIx).rdKind == "reflist"
 }
 
 // True if the parameter `name` of function `fnIx` is a ref-array type.
@@ -28891,9 +28989,7 @@ function paramRefArrayName(fnIx: i32, name: string) {
 // The ref-list ELEMENT type-NAME a function `name` returns (from its `S[]`/`N[]` return
 // annotation, recorded in `fRetRArrElem`), or "".
 function fnRetRefArrayNameSid(sid: i32, name: string, fnIx: i32) {
-  const i = fnIndexOfInScopeSid(sid, name, fnIx)
-  if i < 0 { return "" }
-  fRetRArrElem[i]
+  repOfNameResult(sid, name, fnIx).rdListElem
 }
 
 // The INNER ref-list element type-NAME a function `name` returns when its return is a NULLABLE ref array
@@ -30328,9 +30424,7 @@ function declaredStringArray(name: string) { declaredKind(name) == "strlist" }
 // (`"strlist"`). Mirrors `fnRetArray`/`fnRetRefArray` — lets a `string[]`-returning call
 // classify so an untyped `let x = snap()` picks the string-list local kind (code `7`).
 function fnRetStringArraySid(sid: i32, name: string, fnIx: i32) {
-  const i = fnIndexOfInScopeSid(sid, name, fnIx)
-  if i < 0 { return false }
-  fRetKind[i] == "strlist"
+  repOfNameResult(sid, name, fnIx).rdKind == "strlist"
 }
 
 // True if function `name` declares (or, un-annotated, infers) an `f64[]` return — the f64
@@ -30338,18 +30432,14 @@ function fnRetStringArraySid(sid: i32, name: string, fnIx: i32) {
 // an f64 list (kind 12) instead of falling through to i32. Resolved from frame `fnIx` for
 // `fnRetArraySid`'s reason.
 function fnRetF64ArraySid(sid: i32, name: string, fnIx: i32) {
-  const i = fnIndexOfInScopeSid(sid, name, fnIx)
-  if i < 0 { return false }
-  fRetKind[i] == "f64list"
+  repOfNameResult(sid, name, fnIx).rdKind == "f64list"
 }
 
 // True if function `name` returns a string-keyed mono map (`{[string]: i32}`, annotated or
 // inferred — `"map"`). Lets `exprMap`/`mapShapeOfExpr` classify a call to it, so
 // `const r = mk()` (or `mk()[k]`) routes through the map lowering.
 function fnRetMapSid(sid: i32, name: string, fnIx: i32) {
-  const i = fnIndexOfInScopeSid(sid, name, fnIx)
-  if i < 0 { return false }
-  fRetKind[i] == "map"
+  repOfNameResult(sid, name, fnIx).rdKind == "map"
 }
 
 // True if evaluating the expression at `exprIx` yields a string list: a string-element
@@ -30877,18 +30967,16 @@ function globalIsF32ArraySid(fnIx: i32, sid: i32) {
   letIsF32Array(li, -1)
 }
 
-function fnRetF32ArraySid(sid: i32) {
-  const i = fnIndexOfSid(sid)
-  if i < 0 { return false }
-  fRetKind[i] == "f32list"
+function fnRetF32ArraySid(sid: i32, name: string, fnIx: i32) {
+  repOfNameResult(sid, name, fnIx).rdKind == "f32list"
 }
 
 // True if function `name` carries an annotated `f32[]` return — read straight off the
 // annotation node, since neither `fRetKind` (no f32-list arm) nor the typed-IR fast path
 // (`tyKindOf` carries no f32-array kind) can answer for f32. Gated on `fn.fnRet >= 0`: an
 // un-annotated `f32[]` return is a different, still-open defect.
-function fnRetAnnF32ArraySid(sid: i32) {
-  const i = fnIndexOfSid(sid)
+function fnRetAnnF32ArraySid(sid: i32, name: string, fnIx: i32) {
+  const i = fnIndexOfInScopeSid(sid, name, fnIx)
   if i < 0 || i >= fnStmts.length { return false }
   const fn = P.nodes[fnStmts[i]]
   if fn is FuncDecl {
@@ -30957,6 +31045,9 @@ export function arrLitIsF32(arrIx: i32, fnIx: i32) {
   const a = P.nodes[arrIx]
   if a is ArrayLit {
     if a.arrElems.length < 1 { return false }
+    if hasSpreadItem(a.arrElems) {
+      return spreadDestKind(a.arrElems, fnIx) == "f32"
+    }
     let i = 0
     while i < a.arrElems.length {
       if !exprIsF32(a.arrElems[i], fnIx) { return false }
@@ -31080,10 +31171,14 @@ export function exprF32Array(exprIx: i32, fnIx: i32) {
     }
     const callee = P.nodes[e.callFn]
     if callee is Ident {
-      if fnRetF32ArraySid(sidOfNode(e.callFn)) { return true }
+      if fnRetF32ArraySid(sidOfNode(e.callFn), callee.identName, fnIx) {
+        return true
+      }
       // A named function with an annotated `f32[]` return — the annotation read directly,
       // since f32 has neither channel its i64/f64 siblings use (`fnRetAnnF32ArraySid`).
-      if fnRetAnnF32ArraySid(sidOfNode(e.callFn)) { return true }
+      if fnRetAnnF32ArraySid(sidOfNode(e.callFn), callee.identName, fnIx) {
+        return true
+      }
       // A closure-VALUE call (`g()` with `g: () => f32[]`) whose resolved sig result is
       // the f32 list (`>F`) — the f32 dual of the i64/f64-list callee arms.
       return calleeRetKindSid(sidOfNode(e.callFn), fnIx) == "f32list"
@@ -31150,6 +31245,9 @@ export function arrLitIsI64(arrIx: i32, fnIx: i32) {
   const a = P.nodes[arrIx]
   if a is ArrayLit {
     if a.arrElems.length < 1 { return false }
+    if hasSpreadItem(a.arrElems) {
+      return spreadDestKind(a.arrElems, fnIx) == "i64"
+    }
     // A box-list literal with an i64 member is the f64 arm's twin (see `arrLitBoxElem`): the
     // scan is order-blind, so any i64 element (not just the first) makes this an i64 list.
     if arrLitBoxElem(arrIx) { return false }
@@ -32122,9 +32220,7 @@ function fnRetStringSid(sid: i32, name: string, fnIx: i32) {
   const spelled = sidText(sid)
   if spelled == "fromCodePoint" { return true }
   if spelled == "fromCodePoints" { return true }
-  const i = fnIndexOfInScopeSid(sid, name, fnIx)
-  if i < 0 { return false }
-  fRetKind[i] == "str"
+  repOfNameResult(sid, name, fnIx).rdKind == "str"
 }
 
 // True if the parameter `name` of function `fnIx` is `string`-typed.

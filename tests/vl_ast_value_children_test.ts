@@ -50,6 +50,7 @@ const VALUE_CHILDREN: Record<string, string[]> = {
   Paren: ["n.parInner"],
   Index: ["n.idxArr", "n.idxIndex"],
   ArrayLit: ["*n.arrElems"],
+  Spread: ["n.spdArg"],
   ObjLit: ["*n.objFields"],
   FieldInit: ["n.fiValue"],
   IsExpr: ["n.isObj"],

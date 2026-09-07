@@ -361,9 +361,11 @@ Ranked by blast radius ascending against disagreeing-producer count descending.
    `repSlotOfTy` for `TyObj` alone), and a slot is nominal where the rest of the descriptor is
    structural. Nothing earlier depends on it.
 
-**And separately, on the same clock: `repOfName(name, fnIx)`.** It is not a ladder conversion
-— it is the missing surface §3.3 names, and the five-row monomorphizer family is its
-evidence. It should land before step 3, because `repOfExpr`'s `Ident` arm is exactly it.
+**And separately, on the same clock: the name surface — BUILT, as `repOfNameResult`.** §6.2
+has its measurements and the one refinement it forced: of the five monomorphizer rows, only
+the return-kind readers wanted a REP. The other three wanted the SLOT and the `$fnsig` key,
+and the slot already has one home (`fnIndexOfInScope`). `repOfExpr`'s `Ident` arm still wants
+the binding-resolution half, which is a separate surface and is named in §6.2.
 
 ---
 
@@ -444,6 +446,123 @@ because a ruling could retire either:
   never has: a void expression has no arithmetic width to report.
 * a **string literal-union array element** — the interned i32 atom, which `repOfArray` reps as
   the i32 `list` and this vocabulary has never claimed.
+
+---
+
+### 6.2 The name surface — `repOfNameResult`, and what it did NOT need to be
+
+The five pin-context rows (D1781, D1782, D1788, D1795, D1817) each rebuilt a piece of one
+resolution by hand. Converting them onto a single surface answered a question this document
+could only guess at in §3.3: **only two of the five wanted a rep at all.**
+
+| row | what its rung actually wants | served by |
+| --- | --- | --- |
+| D1788, D1781 | the REP of the call's result | **`repOfNameResult`** — new |
+| D1782 | the `fnStmts` SLOT a binding's target resolves to | `fnIndexOfInScope`, already one home |
+| D1795 | the `$fnsig` KEY of a function value | `fnIndexOfInScope` + `fnSigKeyOf`, already one home |
+| D1817 | the walk itself | `fnIndexOfInScopeSid`'s `fnInstOrigin` hop, already one home |
+
+So the surface this campaign owed is narrower than "a rep for a name": it is **the rep of what
+calling a name in a frame yields**, and the walk under it was already unified. `repOfName` for
+a BINDING is a different and larger surface — `declaredSlotOf` takes a bare name, and
+`paramTypeNode` / `globalLetOfSidIn` take `fnIx` only as a frame-binds-this-name veto rather
+than as a scope-chain walk. That asymmetry (callee resolution frame-aware since D1781; binding
+resolution not) is what `repOfExpr`'s `Ident` arm will have to reconcile, and it is filed here
+rather than guessed at.
+
+**What it is.** `repOfNameResult(sid, name, fnIx) -> RepDesc` is the one home for the walk and
+for the three return columns that answer after it — `fRetKind` into `rdKind`, `fRetStructIdx`
+into `rdSlot`, `fRetRArrElem` into `rdListElem`. The columns are pushed together in
+`buildFnMap`'s single loop over `fnStmts`, so an index valid for one is valid for all three;
+reading them together is what makes this a descriptor rather than three lookups that can
+drift. `rdNul` is `REP_NUL_UNANSWERED` (-1), not 0: these columns carry no null discipline,
+and a 0 would read as one.
+
+**Fourteen readers became projections of it**, and the two `#2815` left behind gained the
+calling frame in the same move — which is the whole of D1834's fix.
+
+**The oracle at this surface compares the FLAT map against the frame-aware walk**, so a
+disagreement is one site where a per-pin clone would have adopted its template's rep:
+
+```
+tests/cases (3,150 modules)          distilled corpus (7,589 cells)
+  slot differs                3669     slot differs                   0
+  … and the KIND differs       814     … and the KIND differs         0
+```
+
+Every one of the 814 is in one of eight modules, and all eight are the pin-context fixtures
+themselves — `nested-capture-per-pin-container-kinds`, `-return-kinds`, `-clone`,
+`nested-lambda-in-generic-body-per-instance`, `pin-argument-recheck-ok`,
+`nested-named-fn-names-enclosing-typaram`, `nested-concrete-shadows-generic-homonym`, and one
+body-scope shadowing fixture. **No inventory row is owed by the oracle**: the contradictions
+are the walk doing its job, not a defect, and no site outside the known family contradicts.
+
+**Byte identity**, both arms from one seed: `3,154 of 3,155` `tests/cases` modules and
+`7,589 of 7,589` corpus cells identical. The one differing file is D1834's own fixture, `rc=1`
+on the merge-base and `rc=0` here — the conversion itself moves no byte, and the fix is
+observable only on the fixture it ships with, because no existing module had the shape.
+
+### 6.3 `vtKindOfType`'s ladder — five missing rungs closed, and a deletion REFUSED by its own oracle
+
+The doc's §5.2 item 2 said the work here is "widening `repOfTy` coverage until the fallback is
+unreachable, then deleting it". Measured, that sentence is half right, and the half that is
+wrong cost a candidate.
+
+**The measurement.** With the ladder computed beside the descriptor at every call, over
+`tests/cases` and the distilled corpus (10,734 modules, 1,082,293 queries):
+
+| | queries | kinds |
+| --- | --- | --- |
+| AGREE | 931,385 | — |
+| LEFT-ONLY (ladder answers, descriptor declines — the ladder is load-bearing) | 147,945 | 15 |
+| CONTRADICT (both answer, differently) | 2,963 | 6 |
+
+The LEFT-ONLY column is the descriptor's real coverage gap and is headed by `reflist`
+(111,683 queries in 876 modules), `i32` (17,358), `map` (4,437), `union` (3,358) and `str`
+(3,233). **Nine kinds appear in AGREE and never in LEFT-ONLY** — `struct` (117,609), `i64`
+(42,355), `closure` (15,574), `variant` (8,547), `f32` (5,619), `nulstr` (4,805), `u8list`
+(3,176), `nulclosure` (2,804), `f32list` (1,087), **201,576 queries** — which reads exactly
+like nine dead rungs.
+
+**The deletion was built, and its own oracle refused it.** Deleting all nine is
+byte-identical — `0 of 3,154` `tests/cases` modules and `0 of 7,589` corpus cells — and the
+two ordering pairs it touches (`nulclosure` before `closure`, `variant` before `struct`) are
+wholly inside the dead set, so no surviving rung changes what it sees. And then the oracle
+reads **CONTRADICT 2,963 → 204,539**: with the rungs gone, the ladder answers its `"i32"`
+default for all nine shapes, which is a valid-looking answer for a different rep at every one
+of them.
+
+**So "the descriptor always answers first" is not the deletion criterion.** The ladder's
+domain is *an annotation node the checker recorded no type on*, and for such a node the
+descriptor cannot answer by construction — `annRepKindOf` declines exactly there. The nine
+rungs are therefore not dead, they are **untested**: neither corpus contains an un-typed node
+of those nine shapes. Byte identity proves nothing breaks today and says nothing about the
+domain, which is why the deletion criterion has to be *unreachability* or *a named default*,
+not *no observed counterexample*. `tyKindOf` was safe to convert because it kept its DOMAIN
+and moved only the rep answer; this would have removed the domain.
+
+**What shipped instead is the fix the same measurement names.** Five of the six CONTRADICT
+classes are the five nullable scalar-list niches — `string[] | null`, `f64[] | null`,
+`i64[] | null`, `f32[] | null`, `u8[] | null` — for which the ladder had **no rung at all**,
+so each fell past every nullable arm to the `"i32"` default. `nulScalarListKindOfNode` is the
+predicate the local, param and global ladders already ask, and asking it here is what makes
+the two producers agree:
+
+```
+BEFORE  AGREE  931385  LEFT-ONLY  147945  CONTRADICT   2963  (6 classes)
+AFTER   AGREE  934170  LEFT-ONLY  147945  CONTRADICT    178  (1 classes)
+```
+
+Byte-identical in `3,154 of 3,154` and `7,589 of 7,589`. **It is hygiene, not a `runs` move**:
+no program was found that reaches the ladder at those shapes, and the arm's own control is the
+oracle, where it fires 2,785 times.
+
+**The one class left is the literal union, again.** `str -> i32` in two modules
+(`narrowed-litunion-param-atom-rep.vl`, `narrowed-litunion-fn-value-arg.vl`) — the ladder
+would say `str` because canon softens the member set to `string`, while the descriptor says
+the interned atom. It **cannot** be closed from the ladder's own domain: at an un-typed node
+the softened spelling is all there is, and the atom-ness is not recoverable from it. That is
+`one-literal-union-rep`'s cost measured a second time, at a second site.
 
 ---
 

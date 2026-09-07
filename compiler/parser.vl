@@ -98,6 +98,7 @@ import {
   mkPreIncr,
   mkProgram,
   mkReturn,
+  mkSpread,
   mkStr,
   mkTplConcat,
   mkTplHole,
@@ -214,6 +215,9 @@ function startsStmt(k: TokKind) {
 // far more often a missing closer than a missing comma, so a lossy recovery is kept.
 function startsExprTok(k: TokKind) {
   if k == "IF" { return true }
+  // `...` starts a call argument and a list element, never a statement, so it belongs
+  // here and not in `startsStmt` — the three callers are all missing-comma recovery.
+  if k == "ELLIPSIS" { return true }
   if isStmtKeyword(k) { return false }
   startsStmt(k)
 }
@@ -238,6 +242,7 @@ function kindDesc(k: TokKind): string {
   if k == "COLON" { return "`:`" }
   if k == "EQUAL" { return "`=`" }
   if k == "COMMA" { return "`,`" }
+  if k == "ELLIPSIS" { return "`...`" }
   if k == "IDENT" { return "an identifier" }
   if k == "NEWLINE" { return "end of line" }
   if k == "EOF" { return "end of input" }
@@ -1085,6 +1090,19 @@ function parsePrimary() {
     // a literal.)
     return parseArrayLit()
   }
+  if k == "ELLIPSIS" {
+    // The token is legal in two positions and `parseSpreadable` has already taken it in
+    // both, so reaching here means neither — say where it may appear rather than leaving
+    // the reader with "expected an expression but found ELLIPSIS".
+    P.diags.push(
+      {
+        msg: "`...` may only appear before a call argument or a list element",
+        at: P.pos,
+      },
+    )
+    advance()
+    return mkErr("expr", P.pos, p0)
+  }
   P.diags.push(
     { msg: "expected an expression but found " + kindTag(k), at: P.pos },
   )
@@ -1211,20 +1229,41 @@ function parseArgs() {
   args
 }
 
-// One argument: an optional `name:` prefix (IDENT directly followed by COLON —
-// the host's `at("ID") && peek(1).kind === "COLON"` test), then the value
-// expression. Pushes the value onto `args` and the name ("" if positional)
-// onto `names`.
+// One argument: an optional `name:` prefix (IDENT directly followed by COLON), then the
+// value expression, pushed onto `args` with its name ("" if positional) onto `names`. A
+// leading `...` wraps the value in a `Spread` — which fills the rest parameter by POSITION,
+// so a spread that is also named is refused right here.
 function parseOneArg(args: i32[], names: string[]) {
+  let named = false
   if peekKind() == "IDENT" && kindAt(P.pos + 1) == "COLON" {
     names.push(advance().text)
     advance() // COLON
     skipNewlines()
+    named = true
   } else {
     names.push("")
   }
-  args.push(parseExpr())
+  if named && peekKind() == "ELLIPSIS" {
+    P.diags.push(
+      {
+        msg: "a spread fills the rest parameter by position, so it cannot be named",
+        at: P.pos,
+      },
+    )
+  }
+  args.push(parseSpreadable())
   0
+}
+
+// An item that may be spread: `"..."? expr`, minting a `Spread` around the operand. The two
+// positions `...` is legal in — a call argument and a list element — share this, so their
+// grammars cannot drift; elsewhere the token reaches `parsePrimary`, which names both.
+function parseSpreadable() {
+  if peekKind() != "ELLIPSIS" { return parseExpr() }
+  const sp0 = peekTok().start
+  advance() // ELLIPSIS
+  skipNewlines()
+  mkSpread(parseExpr(), sp0)
 }
 
 // An object literal `{ name: value, … }`, the cursor on the leading `{`. A field is
@@ -1313,10 +1352,10 @@ function parseObjLit() {
   mkObjLit(fields, p0)
 }
 
-// An array literal `[e, e, ...]`, the cursor on the leading `[`. Elements are
-// comma-separated expressions (a trailing comma is tolerated), or empty `[]`.
-// Returns an `ArrayLit` whose `arrElems` are the element node indices in source
-// order — that order IS the fixed array's element order for `array.new_fixed`.
+// An array literal `[e, e, …]`, the cursor on the leading `[`. Elements are comma-separated
+// expressions, each optionally spread (`[...a, 1]`), with a trailing comma tolerated.
+// `arrElems` are the element nodes in source order — that order is the fixed array's element
+// order for `array.new_fixed`, so a literal carrying a `Spread` takes a runtime-length path.
 function parseArrayLit() {
   const p0 = peekTok().start // the opening `[`
   expect("LBRACK")
@@ -1328,7 +1367,7 @@ function parseArrayLit() {
   const elems: i32[] = []
   let going = peekKind() != "RBRACK"
   while going {
-    elems.push(parseExpr())
+    elems.push(parseSpreadable())
     skipNewlines()
     if takeSep(startsExprTok(peekKind())) {
       skipNewlines()
@@ -2139,12 +2178,13 @@ function parseOptionalParamType(name: string) {
   ix
 }
 
-// `IDENT "?"? (":" type)? ("=" expr)?` — two surface spellings, one mechanism. `a?: T` is
-// sugar for `a: T | null = null`, desugared right here, so `parType` already carries the
-// `| null` and only `parOpt` records which form the author wrote. A default is filled in at
-// each direct call site that omits the argument, so it is evaluated in the caller's frame.
+// `"..."? IDENT "?"? (":" type)? ("=" expr)?` — three surface spellings, one mechanism.
+// `a?: T` is sugar for `a: T | null = null`, desugared here, so only `parOpt` records the
+// form; a default is filled in at each call site that omits the argument. `...xs: T[]` is
+// the rest parameter, which takes neither `?` nor a default; `parseParamList` places it.
 function parseParam() {
-  const p0 = peekTok().start // the parameter's name token
+  const p0 = peekTok().start // the parameter's name token, or its `...`
+  const rest = accept("ELLIPSIS")
   let name = ""
   let nameTok = -1
   if peekKind() == "IDENT" {
@@ -2154,6 +2194,36 @@ function parseParam() {
     expect("IDENT")
   }
   const opt = accept("QUESTION")
+  if rest {
+    if opt {
+      P.diags.push(
+        {
+          msg: "a rest parameter is the empty list when no argument reaches it, so `" +
+            name +
+            "` cannot also be optional",
+          at: P.pos,
+        },
+      )
+    }
+    if peekKind() != "COLON" {
+      P.diags.push(
+        {
+          msg: "a rest parameter packs its arguments into a list — write `..." +
+            name +
+            ": T[]`",
+          at: P.pos,
+        },
+      )
+    }
+    if name == "self" {
+      P.diags.push(
+        {
+          msg: "`self` is the receiver and comes first, so it cannot be a rest parameter",
+          at: P.pos,
+        },
+      )
+    }
+  }
   let ty = -1
   let dflt = -1
   if accept("COLON") {
@@ -2183,21 +2253,32 @@ function parseParam() {
           at: P.pos,
         },
       )
+    } else if rest {
+      P.diags.push(
+        {
+          msg: "a rest parameter is the empty list when no argument reaches it, so `" +
+            name +
+            "` cannot carry a default",
+          at: P.pos,
+        },
+      )
     } else {
       dflt = d
     }
   }
   let optMark = 0
   if opt { optMark = 1 }
-  const ix = mkParam(name, ty, dflt, optMark, p0)
+  let restMark = 0
+  if rest { restMark = 1 }
+  const ix = mkParam(name, ty, dflt, optMark, restMark, p0)
   mkDeclNameTok(ix, nameTok)
   ix
 }
 
 // `"(" params? ")"` — the parameter list shared by every function form and the arrow lambda,
-// the cursor on the `(`. A signature may span several source lines: newlines are skipped
-// after `(`, around each `,` and before `)`, so the list tolerates line breaks anywhere a
-// separator may appear. A trailing comma before `)` is allowed.
+// the cursor on the `(`. Newlines are skipped after `(`, around each `,` and before `)`, and
+// a trailing comma is allowed. A rest parameter's POSITION is ruled on here, where the whole
+// list is in hand: `parseParam` reads the `...`, `restPositionCheck` places it.
 function parseParamList() {
   expect("LPAREN")
   skipNewlines()
@@ -2205,9 +2286,9 @@ function parseParamList() {
   if peekKind() != "RPAREN" {
     params.push(parseParam())
     skipNewlines()
-    // A parameter's element start is its name, so `function f(a: i32 b: i32)` is
-    // a missing separator; `takeSep` inserts it and consumes a real `,`.
-    let more = takeSep(peekKind() == "IDENT")
+    // A parameter's element start is its name or its `...`, so `function f(a: i32 b: i32)`
+    // is a missing separator; `takeSep` inserts it and consumes a real `,`.
+    let more = takeSep(peekKind() == "IDENT" || peekKind() == "ELLIPSIS")
     while more {
       skipNewlines()
       // Trailing comma: a `,` immediately before `)` closes the list.
@@ -2216,12 +2297,57 @@ function parseParamList() {
       } else {
         params.push(parseParam())
         skipNewlines()
-        more = takeSep(peekKind() == "IDENT")
+        more = takeSep(peekKind() == "IDENT" || peekKind() == "ELLIPSIS")
       }
     }
   }
   expectClose("RPAREN")
+  restPositionCheck(params)
   params
+}
+
+// A rest parameter is last and there is at most one — both refused here, where the whole
+// list is in hand, so the sentence names the parameter that follows it rather than a call.
+function restPositionCheck(params: i32[]) {
+  let seen = -1
+  let i = 0
+  while i < params.length {
+    const p = P.nodes[params[i]]
+    if p is Param {
+      if p.parRest == 1 {
+        if seen >= 0 {
+          const prev = P.nodes[params[seen]]
+          if prev is Param {
+            P.diags.push(
+              {
+                msg: "a function has at most one rest parameter, and `" +
+                  prev.parName +
+                  "` is already this one's",
+                at: P.pos,
+              },
+            )
+          }
+        }
+        seen = i
+      } else if seen >= 0 {
+        const first = P.nodes[params[seen]]
+        if first is Param {
+          P.diags.push(
+            {
+              msg: "a rest parameter must be last — `..." +
+                first.parName +
+                "` is followed by `" +
+                p.parName +
+                "`",
+              at: P.pos,
+            },
+          )
+        }
+      }
+    }
+    i = i + 1
+  }
+  0
 }
 
 // Parse a function body and build the `FuncDecl`, the cursor on the body's first token. The
