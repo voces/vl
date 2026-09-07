@@ -1597,12 +1597,13 @@ in-language GC knobs.
         narrowing VETOED. Of four producers only ONE clamp is live (`refListSlotOfExpr`, 197
         fires in 29 modules); narrowing it costs exactly **one module of 10,767**
         (`std/array-needle-nullable-niche`, `rc=0 → rc=70`) and **nothing traps**, so no
-        consumer indexes with `-1`. The blocker is the NAME, not the consumers: in that module
-        the walk looks up the EMPTY STRING 28 times, because a monomorphized `indexOf<T>`'s
-        element is a type variable and a type variable renders as `""` — D1794's mechanism at
-        this position — and the clamp's slot 0 is right by luck. Fix the render first, then
-        narrow; only then are the 31 declines testable and §7.6's 35 dead guards live.
-        `docs/internals/rep-descriptor-campaign.md` §7.6, §7.7. The rest of the survey: **183 PRODUCERS** over four
+        consumer indexes with `-1`. The blocker was the NAME, not the consumers — the walk
+        looks up the EMPTY STRING and the clamp's slot 0 is right by luck. **The cause first
+        named for that empty name was wrong**: a probe reads the monomorphized instance's
+        annotations already CONCRETE and the hole's pin POISONED, and the name comes from two
+        rungs where the arena and the spelling disagree about one nullable ref list (D1835).
+        With those resolved the narrowing is a **no-op** over both populations and §7.6's 35
+        guards are live. `docs/internals/rep-descriptor-campaign.md` §7.6-§7.8. The rest of the survey: **183 PRODUCERS** over four
         parallel-column banks (struct / ref-list / variant / map-value, each with 1-5 writers
         and 100-174 readers), of which 42% take an AST node and 12% an arena type: they decide
         a rep from raw input, none is a `match` because they PRODUCE the kind rather than
@@ -1620,6 +1621,28 @@ in-language GC knobs.
         (oracle 2,963 → 204,539), do not WIDEN one (8 modules `rc=0 → rc=1`), and do not move
         a GUARD out of reach of the lint that verifies it (`sentinel-index-unguarded` 0 → 21).
         Scoreboard: `docs/internals/rep-descriptor-campaign.md` §7.
+     **PHASE 2 CLOSED.** Two more families converted, one prerequisite REFUTED (the binding
+        surface — §5.3 read three signatures as frame-blind and four witnesses show binding
+        resolution is already frame-correct), the largest family AUDITED rather than picked over
+        (`expr*`: 48 classifiers, 931 call sites, **zero magic rep codes**, 79% already `VKind`),
+        the slot layer's clamp narrowed as a **no-op** once D1835's two rungs resolved the
+        element name, and the hole-pin table re-keyed per owning function — **21,186 false
+        poisonings to zero, byte-identical, and LATENT**, since no reader trusts one in a way
+        that changes output. The bar earned a fourth form (byte identity and the oracle are not
+        interchangeable) and two rules: a signature that does not take a frame is not thereby
+        frame-blind, and de-duplicate a guard only by moving the READ with it. Ruling
+        `nullable-rep-rule-stated-once` option (b) is **delivered** — all four valtype writers
+        are `_`-less matches, +120 bytes, byte-identical — and `one-literal-union-rep` is now
+        denominated in the four SITES that carry a carve-out. Seed: **+3,956 bytes across the
+        two landings that were priced**; three of five were not, and phase 3 prices each.
+        Scoreboard: `docs/internals/rep-descriptor-campaign.md` §8.
+     **PHASE 3'S PREREQUISITE, measured:** every domain-REMOVING conversion is blocked on the
+        descriptor's coverage gap — the LEFT-ONLY column, **147,945 queries over 15 kinds**,
+        headed by `reflist` (111,683 in 876 modules), `i32` (17,358), `map` (4,437), `union`
+        (3,358), `str` (3,233). A ladder is load-bearing exactly where the descriptor declines,
+        so nothing deletes until its kind is covered — §6.3 is the proof, a byte-identical
+        nine-rung deletion its own oracle refused at CONTRADICT 2,963 → 204,539. Phase 3 is
+        close the column largest-first, then delete; `reflist` alone is 76% of it.
      Two owner rulings gate how far items 2 and 6 can go: `one-literal-union-rep` and
      `nullable-rep-rule-stated-once` (`docs/internals/open-rulings.md` §D).
      REMAINING legacy items: (a) widen `repOfTy` coverage (typed-value maps,
