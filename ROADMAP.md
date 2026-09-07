@@ -2068,11 +2068,11 @@ in-language GC knobs.
   type` codegen error or a `containsInfer` TypeError crash. The main trigger — `const xs = []; xs.push(1)`
   — is fixed (A-infer-empty now infers it, and the "cannot infer — annotate" floor is deferred to
   scope-close so it fires only for a genuinely-unconstrained empty). The unresolved-generic half is
-  **BUILT (2026-09-06, #2825, [D1813](internals/inventory/D1813.md))**: a type parameter only the
-  declared RETURN type names is refused at the checker, from the direct and the UFCS call path alike,
-  with a sentence that names what to write. REMAINING: audit the other holes
-  (`Map()`/`Set()` empties, an INFERRED return that resolves to `T[]` — still check-clean invalid
-  wasm, no return annotation for that gate to read) for the same clean-diagnostic-not-crash guarantee.
+  **BUILT (2026-09-06, [D1813](internals/inventory/D1813.md)/[D1819](internals/inventory/D1819.md))**:
+  a type parameter only the RETURN type names is refused at the checker, from the direct and the UFCS
+  call path alike and at the declared and the INFERRED spelling alike, with a sentence that names what
+  to write. REMAINING: audit the other holes (`Map()`/`Set()` empties) for the same
+  clean-diagnostic-not-crash guarantee.
   The `Map()` half has a **named instance**: an inferred map with a non-mono value type reaches emit
   and fails there with a message that lists `string` as supported while rejecting a `string` value —
   see **A-infer-map-value**. That one is a rep gap, not only a diagnostic gap, but it is also the
