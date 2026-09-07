@@ -10,6 +10,7 @@ import {
   fsArgIsU8List,
   fsIntrinsicArity,
   fsIntrinsicSlot,
+  fsRetIsVoid,
   inferRetNameOf,
   inferRetTyIxOf,
   isNumIntrinsicName,
@@ -4640,12 +4641,23 @@ function globalCellArmIdx(gLet: i32, kind: VKind): i32 {
 
 function armDestHeapOf(kind: VKind, idx: i32): i32 {
   if idx < 0 { return -1 }
-  if kind == "variant" || kind == "nulvariant" {
-    if idx < uVarHeap.length { return uVarHeap[idx] }
-    return -1
-  }
-  if kind == "struct" || kind == "nulstruct" {
-    if idx < sHeapIdx.length { return sHeapIdx[idx] }
+  // EXHAUSTIVE over `VKind` and `_`-less, like the four byte writers: the 27 kinds with
+  // no arm DECLINE by name, so a 32nd member is a compile error here rather than a
+  // silent -1 that reads as "this arm has no heap type".
+  match kind {
+    "variant" | "nulvariant" => {
+      if idx < uVarHeap.length { return uVarHeap[idx] }
+      return -1
+    }
+    "struct" | "nulstruct" => {
+      if idx < sHeapIdx.length { return sHeapIdx[idx] }
+      return -1
+    }
+    "i32" | "list" | "str" | "union" | "reflist" | "map" | "strlist" | "i64" | "f64" | "f64list" | "f32" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" | "nulnone" | "u8list" => {
+      // No heap type of its own at an arm destination: a scalar, a list wrapper, a map
+      // or a closure reaches its rep through its own writer, never this table pair.
+      return -1
+    }
   }
   -1
 }
@@ -14336,10 +14348,10 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32) {
         fbCall(gMemLogIdx)
         return 0
       }
-      // ── the filesystem floor (`std:fs`) ────────────────────────────────────────
+      // ── the host floor (`std:fs`, `std:args`, `std:process`, `std:env`) ───────
       // The one intrinsic family that lowers to a host call rather than instructions. One
-      // arm for all ten, keyed by four small tables; the index is dynamic (reserved only
-      // when used), so a miss fails loudly.
+      // arm for every slot, keyed by four small tables; the index is dynamic (reserved
+      // only when used), so a miss fails loudly.
       const fsK = fsIntrinsicSlot(callee.identName)
       if fsK >= 0 {
         const fsWant = fsIntrinsicArity(fsK)
@@ -18825,6 +18837,10 @@ function emitCallStmt(body: i32[], s: Call, stmtIx: i32, fnIx: i32) {
     // is `unreachable` (no value reaches the drop).
     if callee.identName == "__array_copy__" { dropIt = false }
     if callee.identName == "__trap__" { dropIt = false }
+    // A void HOST import leaves nothing either. Asked through the slot table rather than
+    // by spelling, so a diverging slot added there cannot be missed here — every other
+    // entry in this ladder is a name, and a name is what a new slot would not carry.
+    if fsRetIsVoid(fsIntrinsicSlot(callee.identName)) { dropIt = false }
     if dropIt {
       // A name a closure binding covers denotes that binding, so the void question is the
       // closure's — the module function of the name lowered no instruction here (D1602).

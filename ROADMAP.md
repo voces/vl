@@ -69,7 +69,7 @@ units: **hours** · **half-day** · **days**.
 | 27 | **E3 — user wasm runs on the playground's MAIN thread** | `playground/src/runtime.ts:21` instantiates there; `main.ts:36` says so | `playground/src/{runtime,playground,main}.ts` | days |
 | 28 | **F-tiers / J1 — collapse the redundant corpus runner** | 8 files execute emitted wasm under V8 via `tests/support/runWasm.ts` | `tests/support/casesWasmOracle.ts` + 4 shards + 4 standalone suites | days |
 | 29 | **F-day-one — five grammar axes still absent** | `day-one-sampler.md:90-92`: `match`, operator overloading, multi-param generics, recursive types, mixed-width arithmetic | `scripts/day-one/grammar.py` (91 records) | half-day per axis |
-| 30 | **Host ABI (4) process spawn, (5) env + exit** | no `std` export for spawn/exec/env/exit; the orchestrator scripts still shell out | three hosts + the declaration in `wasmEmit.vl` | days |
+| 30 | **Dogfood the orchestrator scripts onto the host ABI** | the ABI is COMPLETE (`std:process` `run`/`exit`, `std:env` `getEnv`, in all three hosts); 34,029 lines of Python and 2,536 of shell still do the work | `scripts/*.py` one port at a time, `scripts/seed-size.py` first | days |
 | 31 | **A-destructure — `let`/`const` and PARAMETER destructuring (owner ask, 2026-09-06 night; not scheduled)** | `const { x, y } = p`, `const [a, b] = xs`, `function f({ x, y }: Pt)` → `parse error … expected an identifier but found `{``; the `match` payload clause (pun, rename, nest — #2837) is the only destructuring today | `parser.vl` (a pattern in binding and parameter position, the payload clause's grammar reused), `typecheck.vl` (binding types from the pattern; for an UN-ANNOTATED parameter the pattern is a shape constraint `{a: ?, b: {c: ?}}` with hole leaves closed at the pin — the inference half is a second step), `format.vl` (byte-for-byte round trip), the desugar (one `const` per leaf, the `match` prelude's shape); list destructuring wants the multiple-returns question in `docs/guide/lambda-param-skip-design.md` answered first | days |
 
 ### Open items that need an owner ruling first — listed, not decided
@@ -1312,24 +1312,24 @@ in-language GC knobs.
   cannot test itself and Track J has no on-ramp. The runner is also *"the first nontrivial VL program
   (not compiler module) in the tree"* — demand-driven dogfooding.
 
-- ⬜ **Host ABI for VL scripts (dogfooding).** *Not* a test-runner blocker (above) — this is about the
-  12 shell scripts. **STATUS 2026-09-06: slots (1), (2) and (3) below have SHIPPED** —
-  `std:fs` (#1813, 11 exports incl. `readTextFile`/`writeTextFile`/`listDir`) and `std:args`
-  (#1820, `programArgs()`); measured, `programArgs()` answers and `listDir("std")` returns 13.
-  What remains is (4) and (5). The dogfooding has NOT been taken up: `scripts/fuzz-vl.sh:81`
-  still sed-rewrites the VL source. The original text, now stale, read: VL programs can
-  **compute and print, nothing else**, the entire import
-  surface is seven print builtins, so `scripts/fuzzgen.vl` writes to stdout and the shell splits it,
-  and `fuzz-vl.sh` passes parameters by **sed-rewriting the VL source before compiling it**
-  (`s/^let RICHVALUES = .*/let RICHVALUES = $VALUES/` — rename that `let` and the flag silently stops
-  working). Value order: **(1) `argv`** (kills the sed-patching); **(2) file read/write**;
-  **(3) directory listing**; **(4) process spawn + exit code + captured stdout/stderr** — which is what
-  unlocks the orchestrators, since `refresh-compiler.sh` / `rep-fuzz-check.sh` / `native-fixpoint.sh`
-  exist to run the compiler and compare; **(5) `env` + `exit`**.
-  **Cost to name up front: every new import must land in THREE hosts** — `scripts/vl-host/src/main.rs`,
-  `tests/support/runWasm.ts`, `scripts/wasmtime-host.rs` — plus the declaration in `compiler/wasmEmit.vl`.
-  Miss one and a script runs under the CLI and fails under `deno task test`. Keep the ABI tiny, land it
-  as one batch. These are the same syscalls a `vl` CLI written in VL needs, so it is step 1 of Track H.
+- ✅ **Host ABI for VL scripts (dogfooding) — the ABI is COMPLETE; the dogfooding is not.**
+  All five value slots have shipped: **(1) `argv`** and **(2)/(3) file read/write + directory
+  listing** as `std:args` (#1820, `programArgs()`) and `std:fs` (#1813, 11 exports), then
+  **(4) process spawn + exit code + captured stdout/stderr** and **(5) `env` + `exit`** as
+  `std:process` (`runProgram(cmd, args): ProcessOutput | IoError`, `exit(code)`) and `std:env`
+  (`getEnv(name): string | IoError | null`). The floor beneath them is five host imports —
+  `__proc_run__` (command and arguments as one NUL-separated block), `__proc_out__`,
+  `__proc_err__`, `__proc_exit__`, `__env_get__` — declared in `compiler/typecheck.vl`'s slot
+  table and implemented in `scripts/vl-host/src/main.rs` and `scripts/wasmtime-host.rs`.
+  `tests/support/runWasm.ts` implements `__proc_exit__` (it unwinds as `VLExitError`, since a
+  test runner has no process to end) and refuses the four `u8[]`-carrying ones for the reason
+  the filesystem floor is refused there: **WasmGC values are opaque to JS and cannot be built
+  from it**, which is a wall in V8 and not an omission. Contract: `docs/internals/cli-design.md`
+  §"The process floor". **What has NOT been taken up is the dogfooding** — `scripts/fuzz-vl.sh:81`
+  still sed-rewrites the VL source (`s/^let RICHVALUES = .*/let RICHVALUES = $VALUES/` — rename
+  that `let` and the flag silently stops working), and 34,029 lines of Python plus 2,536 of shell
+  still do work a VL program can now do. That is row 30 above, one port at a time. These are the
+  same syscalls a `vl` CLI written in VL needs, so the ABI half is step 1 of Track H, done.
 
 - ✅ **`match` over ALL unions, not just literal unions — SHIPPED #1131.** **STATUS
   2026-09-06: the "verified at `cd69bd9`" note below was stale and contradicted this file's own
@@ -1575,9 +1575,24 @@ in-language GC knobs.
         `sentinel-index-unguarded` 0 → 21, because that lint's contract is within one function
         and the guard is the evidence it needs at each read. The campaign's bar in a third
         form: do not move a guard out of the reach of the checker that verifies it.
-     7. ⬜ **The slot layer, last** — `structIndexOfExpr`, `rlSlot*`, `mvSlot*`,
-        `exprVariantIndex`. `rdSlot` is nominal where the rest of the descriptor is
-        structural, and nothing earlier depends on it.
+     7. 🟡 **The slot layer** — SURVEYED, and it is two things. **183 PRODUCERS** over four
+        parallel-column banks (struct / ref-list / variant / map-value, each with 1-5 writers
+        and 100-174 readers), of which 42% take an AST node and 12% an arena type: they decide
+        a rep from raw input, none is a `match` because they PRODUCE the kind rather than
+        switch on it, and their `-1` tails are load-bearing. Converting them needs the
+        descriptor and therefore item 3's binding half — next phase, not this one. **A
+        13-function CONSUMER rim** takes a `VKind` and a slot together; four were `_`-less
+        matches after #2862 and the fifth, `armDestHeapOf`, is one now (byte-identical in
+        3,172 + 7,589, seed +14). Two hazards named for the next phase: four producers clamp a
+        miss to `0` rather than declining (D1040's shape), and the kind and the slot are
+        derived by two ladders that must agree (D244, D1737, D1040, D1106).
+     **PHASE 1 CLOSED.** Six landings, net seed **+4,073 bytes**, every one byte-identical on
+        both populations bar D1834's own fixture. Two contradictions found and closed (D1834;
+        `vtKindOfType`'s five missing nullable-scalar-list rungs, 2,963 → 178). The bar earned
+        three forms, each from a candidate an instrument refused: do not REMOVE a domain
+        (oracle 2,963 → 204,539), do not WIDEN one (8 modules `rc=0 → rc=1`), and do not move
+        a GUARD out of reach of the lint that verifies it (`sentinel-index-unguarded` 0 → 21).
+        Scoreboard: `docs/internals/rep-descriptor-campaign.md` §7.
      Two owner rulings gate how far items 2 and 6 can go: `one-literal-union-rep` and
      `nullable-rep-rule-stated-once` (`docs/internals/open-rulings.md` §D).
      REMAINING legacy items: (a) widen `repOfTy` coverage (typed-value maps,
