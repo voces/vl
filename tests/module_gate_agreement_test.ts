@@ -77,7 +77,8 @@ Deno.test("module-gate: the shared TS gate answers every row of the table", () =
     "the re-export row must arm through hasImports, not through the template scan",
   );
   assert(
-    hasTemplateHole("print(`v=\\{x}`)\n") && !hasImports("print(`v=\\{x}`)\n"),
+    hasTemplateHole('print("v=\\{x}")\n') &&
+      !hasImports('print("v=\\{x}")\n'),
     "the template row must arm through hasTemplateHole, not through the import scan",
   );
   // BOTH quoted forms interpolate, so both must arm — the plain-string half is

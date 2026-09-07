@@ -964,8 +964,8 @@ null | f64 | O` — `is O` RUNS.
 
     for i in 0 to 3 { print(i) }
 
-**Generics — `monomorphize: a return type parameter of `zero` is not bound by any
-parameter`; `zero<i32>()` is a parse error:**
+**Generics — `cannot infer type parameter `T`: `zero`'s return type names it and no
+parameter does`; `zero<i32>()` is a parse error:**
 
     function zero<T>(): T[] { return [] }
     const xs: i32[] = zero()

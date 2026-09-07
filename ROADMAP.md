@@ -47,11 +47,10 @@ units: **hours** · **half-day** · **days**.
 
 | # | item | witness, run today | region | effort |
 | --- | --- | --- | --- | --- |
-| 1 | **B15 — a nested capturing function cannot be taken as a VALUE.** **NARROWED 2026-09-06: the DIRECT-call half is built** ([D1780](internals/inventory/D1780.md)/[D1781](internals/inventory/D1781.md)); the ARRAY-element delivery at one pin joins it ([D1794](internals/inventory/D1794.md)); what stands is a closure that escapes its pin | `function o(n) { function k(x) { return x + n }; return k(1) }` runs at one pin and at two, and so does `const fs = [k]; fs[0](1)`; `const f = k; f(1)` at two pins is still invalid wasm ([D1782](internals/inventory/D1782.md)), the array element at two pins still refuses ([D1816](internals/inventory/D1816.md)), and `return k` still refuses | `wasmEmit.vl emitClosureValue`; the binding hop is `calleeRetKindSid` and the `fnValTarget` family, which key on a name with no frame | half-day (D1782) |
+| 1 | **B15 — a nested capturing function cannot be taken as a VALUE.** **NARROWED 2026-09-06: the DIRECT-call half is built** ([D1780](internals/inventory/D1780.md)/[D1781](internals/inventory/D1781.md)); the ARRAY-element delivery at one pin joins it ([D1794](internals/inventory/D1794.md)), and the ARGUMENT hop with it ([D1795](internals/inventory/D1795.md)); what stands is a closure that escapes its pin | `function o(n) { function k(x) { return x + n }; return k(1) }` runs at one pin and at two, and so does `const fs = [k]; fs[0](1)`, and so does `function use(p) { return p(1) }; use(k)`; `const f = k; f(1)` at two pins is still invalid wasm ([D1782](internals/inventory/D1782.md)), the array element at two pins still refuses ([D1816](internals/inventory/D1816.md)), and `return k` still refuses | `wasmEmit.vl emitClosureValue`; the binding hop is `calleeRetKindSid` and the `fnValTarget` family, which key on a name with no frame | half-day (D1782) |
 | 2 | **D1775 — a `type` alias over a negation type reps as a union BOX with a scalar value** | `type N = !string; const x: N = 5` → `vl check` rc 0, then `type mismatch: expected (ref $type), found i32`. `wasm-dis`: `(global $global$0 (mut (ref $1)) (i32.const 5))`. The INLINE spelling runs | `typecheck.vl` / `emit_classify.vl` rep classification of an alias body | hours–half-day |
 | 4 | **B21.1 — `match` payload renaming and nested destructuring** | `Move{x: a}` → `parse error … match payload binding must be a field name` | `parser.vl:2847`; `match-design.md` measures both as one-branch extensions | hours (renaming) / half-day (nesting) |
 | 5 | **B7 R3 — `.backwards()` over a string** | `"abc".backwards()` → `no method '.backwards' on string` | `std/str.vl`; §Codepoints already specifies it | **hours** |
-| 7 | **A-robust — an unbound generic return parameter refuses at EMIT, not at check** | `function mk<T>(): T[] { return [] }; mk()` → `emitProgram: monomorphize: a return type parameter of \`mk\` is not bound by any parameter` | move it to the check tier beside `solveUnannotParams`' "cannot infer — annotate" family | **hours** |
 | 8 | **the `parseIf` `then` arm is not marked lossless** | `if c then print(1)` + a type error → the parse error ONLY; `if c print(1)` + the same → BOTH | `parser.vl:2652` needs `dgMarkLossless(P.diags.length)`, as `parseBracedBody:2633` has | **hours** |
 | 9 | **`vl build` with no `-o` writes a file instead of stdout** | `vl build p.vl > out.bin` → `out.bin` holds `wrote p.wasm (147 bytes)` | `scripts/vl-host/src/main.rs` build arm; already "decided: yes" | **hours** |
 | 10 | **Organize Imports drops an unused specifier but not a DUPLICATE one** | `server.ts:1491 .filter((d) => d.code === "unused-import")` | `lsp/src/server.ts:1489-1500` | **hours** |
@@ -203,15 +202,14 @@ Five items, in order. (0) is shipped; the rest are scheduled against it.
   place** — DONE #2199 (ruled 2026-09-01, shipped the same day). Default scope, all six
   emit/classify/collect arms and `emitToString` are gone; `std:fmt` exports `toString`;
   every in-tree caller migrated; both retired spellings get a targeted import hint.
-- **String interpolation — SHIPPED #2188 (templates), EXTENDED and UNIFIED the same
-  week (plain strings + the `\{` migration).** ONE hole syntax, `\{expr}`, in BOTH
-  quoted forms: `"v=\{x}"` and `` `v=\{x}` `` are the same construct, desugared in the
+- **String interpolation — SHIPPED #2188, UNIFIED the same week, and the backtick form
+  REMOVED 2026-09-06.** ONE string form and ONE hole syntax: `"v=\{x}"`, desugared in the
   parser to concat over `std:fmt`'s renderer bound ABSOLUTELY via a compiler-injected
   bare import edge plus an unspellable rename row. The trigger sits in the ESCAPE
   namespace (Swift's `\(` placement, the owner's brace spelling), which is what makes it
   additive at zero permanent cost — `{` is data in every string forever, and `"a\{b"`
-  was a hard lex error before. `${` is ordinary text now and `\$` is retired; multiline
-  stays backtick-only. Two remainders, both measured and both UNCHANGED by the
+  was a hard lex error before. `${` is ordinary text now and `\$` is retired; a `"…"`
+  literal spans lines (Rust's rule), and a backtick is refused by name. Two remainders, both measured and both UNCHANGED by the
   extension: a STRING-only hole still pulls `std:fmt`+`std:str` because the host closes
   the module graph before any type exists — the fix is whole-program DCE, not a
   literal-form-specific drop; and an `f32` hole reaches the pre-existing
@@ -2073,8 +2071,12 @@ in-language GC knobs.
   **"cannot infer — annotate"** diagnostic; it must NEVER surface as a cryptic `Unhandled "Unknown"
   type` codegen error or a `containsInfer` TypeError crash. The main trigger — `const xs = []; xs.push(1)`
   — is fixed (A-infer-empty now infers it, and the "cannot infer — annotate" floor is deferred to
-  scope-close so it fires only for a genuinely-unconstrained empty). REMAINING: audit the other holes
-  (`Map()`/`Set()` empties, unresolved generic params) for the same clean-diagnostic-not-crash guarantee.
+  scope-close so it fires only for a genuinely-unconstrained empty). The unresolved-generic half is
+  **BUILT (2026-09-06, [D1813](internals/inventory/D1813.md)/[D1819](internals/inventory/D1819.md))**:
+  a type parameter only the RETURN type names is refused at the checker, from the direct and the UFCS
+  call path alike and at the declared and the INFERRED spelling alike, with a sentence that names what
+  to write. REMAINING: audit the other holes (`Map()`/`Set()` empties) for the same
+  clean-diagnostic-not-crash guarantee.
   The `Map()` half has a **named instance**: an inferred map with a non-mono value type reaches emit
   and fails there with a message that lists `string` as supported while rejecting a `string` value —
   see **A-infer-map-value**. That one is a rep gap, not only a diagnostic gap, but it is also the

@@ -21257,6 +21257,135 @@ function ufcsMissSpecsAt(memIx: i32) {
   ""
 }
 
+// A type parameter the callee's RETURN names and none of its PARAMETER annotations does: no
+// argument can bind it, and VL has no explicit type-argument spelling. A DECLARED return is
+// asked by its written spelling — a phantom `Bare<A>` parameter binds `A` its arena row drops
+// — and an INFERRED one by `retTy`, the settled result the call site already holds (D1819).
+function checkRetTyParamBound(declIx: i32, who: string, ix: i32, retTy: i32) {
+  if inferQuiet { return 0 }
+  if declIx < 0 { return 0 }
+  const dn = P.nodes[declIx]
+  if dn is FuncDecl {
+    if dn.fnTyParams.length == 0 { return 0 }
+    let rTs = -1
+    if dn.fnRet >= 0 {
+      rTs = annTsOf(dn.fnRet)
+      if rTs < 0 { return 0 }
+    }
+    let k = 0
+    while k < dn.fnTyParams.length {
+      const one: string[] = [dn.fnTyParams[k]]
+      let named = false
+      if dn.fnRet >= 0 {
+        named = tsMentionsAnyName(rTs, one)
+      } else {
+        named = tyMentionsTyVarNamed(retTy, dn.fnTyParams[k], 8)
+      }
+      if named {
+        if !anyParamMentionsTyParam(dn.fnParams, one) {
+          let w = "the callee"
+          if who != "" { w = "`" + who + "`" }
+          let what = "'s return type names it"
+          if dn.fnRet < 0 {
+            what = "'s return type is inferred as `" +
+              tyToStr(retTy) +
+              "`, which names it,"
+          }
+          tErr(
+            "cannot infer type parameter `" +
+              dn.fnTyParams[k] +
+              "`: " +
+              w +
+              what +
+              " and no parameter does, so a call has nothing to bind it from — give `" +
+              dn.fnTyParams[k] +
+              "` a parameter position, or make the return type concrete",
+            ix,
+          )
+          return 0
+        }
+      }
+      k = k + 1
+    }
+  }
+  0
+}
+
+// Does arena type `ty` name the type variable `name` anywhere in its tree? The arena twin of
+// `tsMentionsAnyName`, for a return type inference settled rather than one an author wrote.
+// An inference hole (`?fn.N`) never matches: its name is the checker's, not a declaration's.
+// Depth-bounded, and out of depth answers false — declining to refuse is the safe direction.
+function tyMentionsTyVarNamed(ty: i32, name: string, depth: i32): boolean {
+  if ty < 0 { return false }
+  if depth <= 0 { return false }
+  const t = T.tys[ty]
+  match t {
+    TyVar => {
+      return t.tvName == name
+    }
+    TyArray => {
+      return tyMentionsTyVarNamed(t.aElem, name, depth - 1)
+    }
+    TyNullable => {
+      return tyMentionsTyVarNamed(t.nInner, name, depth - 1)
+    }
+    TyNeg => {
+      return tyMentionsTyVarNamed(t.negTy, name, depth - 1)
+    }
+    TyMap => {
+      if tyMentionsTyVarNamed(t.mKey, name, depth - 1) { return true }
+      return tyMentionsTyVarNamed(t.mVal, name, depth - 1)
+    }
+    TyObj => {
+      let oi = 0
+      while oi < t.objFieldTypes.length {
+        if tyMentionsTyVarNamed(t.objFieldTypes[oi], name, depth - 1) {
+          return true
+        }
+        oi = oi + 1
+      }
+    }
+    TyUnion => {
+      let um = 0
+      while um < t.uMembers.length {
+        if tyMentionsTyVarNamed(t.uMembers[um], name, depth - 1) { return true }
+        um = um + 1
+      }
+    }
+    TyFunc => {
+      let fp = 0
+      while fp < t.fnParamTypes.length {
+        if tyMentionsTyVarNamed(t.fnParamTypes[fp], name, depth - 1) {
+          return true
+        }
+        fp = fp + 1
+      }
+      return tyMentionsTyVarNamed(t.fnRet, name, depth - 1)
+    }
+    TyPrim => {}
+    TyErr => {}
+    TyLit => {}
+  }
+  false
+}
+
+// Does any parameter's written annotation mention one of `names`? An un-annotated parameter
+// mentions nothing, which is the right answer: its type is a hole the call site pins, and a
+// hole never carries the declared name a return annotation would substitute through.
+function anyParamMentionsTyParam(params: i32[], names: string[]): boolean {
+  let i = 0
+  while i < params.length {
+    const p = P.nodes[params[i]]
+    if p is Param {
+      if p.parType >= 0 {
+        if tsMentionsAnyName(annTsOf(p.parType), names) { return true }
+      }
+    }
+    i = i + 1
+  }
+  false
+}
+
 function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
   // Maps the callee's plain source name to its merge-mangled function, after field precedence
   // has already been checked — resolved at this call's own site (D1120), since two merged
@@ -21375,6 +21504,9 @@ function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
       }
       i = i + 1
     }
+    // The uninferable-return gate reads the declaration, so `xs.f()` and `f(xs)` answer alike;
+    // the receiver is `self`, a parameter like any other for the purpose of binding.
+    checkRetTyParamBound(fnDeclIx[name] ?? CSTR_NODECL, plainName, ix, retTy)
     // The UFCS half of the deferred-constraint re-validation, which lived in the direct-call
     // path alone: `xs.indexOf(nd)` and `indexOf(xs, nd)` are the same call and must answer the
     // same way, so the UFCS spelling needs its own re-validation of the callee's recorded
@@ -22636,6 +22768,13 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
       argMismatchErr(i + 1, expected, at, args[i])
     }
     i = i + 1
+  }
+  // After the arguments, so a mismatched argument gets the more specific diagnostic first;
+  // the answer itself is the callee's declaration, not this site's bindings.
+  if cfn is Ident {
+    let rtpDecl = fnDeclIx[cfn.identName] ?? CSTR_NODECL
+    if rtpDecl == CSTR_NODECL { rtpDecl = lookupFnAliasNode(cfn.identName) }
+    checkRetTyParamBound(rtpDecl, cfn.identName, ix, ft.fnRet)
   }
   // Substitutes the binding into a generic return type — deep, so a structural return
   // (`{first: B, second: A}`, a generic alias body, a function-typed field) concretizes

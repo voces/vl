@@ -2,15 +2,15 @@ import { cpCount } from "./strutil"
 
 // A lexer for VL, written in VL — the self-hosted scanner the whole pipeline runs on. It
 // scans identifiers and keywords, integer and real literals (`12`, `3.14`, `1.5e-7`, and
-// `0x`/`0b`/`0o`), char and string literals over one shared escape grammar, backtick
-// templates, the one- to three-char operator set, `//` line and `///` doc comments
-// (retained as trivia in `gComments`, never emitted as tokens), and significant newlines.
+// `0x`/`0b`/`0o`), char and string literals over one shared escape grammar, the one- to
+// three-char operator set, `//` line and `///` doc comments (retained as trivia in
+// `gComments`, never emitted as tokens), and significant newlines.
 //
-// An interpolation hole is spelled `\{expr}` and is legal in both quoted forms: a literal
-// holding one scans as a split run (`TEMPLATE_HEAD`/`MID`/`TAIL`) with the hole
-// expressions lexed as ordinary tokens between, one holding none stays a single token.
-// A raw newline is content in a backtick literal and a terminator inside `"` — the only
-// rule the two grammars still disagree about. Positions follow the diagnostics
+// There is ONE string form. A `"…"` literal may span lines and keeps the raw newline; a
+// `\` immediately before a newline joins the next line and drops its indentation. An
+// interpolation hole is spelled `\{expr}`: a literal holding one scans as a split run
+// (`TEMPLATE_HEAD`/`MID`/`TAIL`) with the hole expressions lexed as ordinary tokens
+// between, one holding none stays a single token. Positions follow the diagnostics
 // convention: `line` 1-based, `col` 0-based, `start` the offset of the first char.
 
 // The closed token vocabulary as a literal union: `kind` is one i32 field, `kind ==
@@ -93,8 +93,8 @@ export type TokKind = ""
 
 // A lexer diagnostic: a message plus the 1-based line and 0-based column it is raised at.
 // `endCol` is the 0-based exclusive end column of the offending span on the same line as
-// `col` (the caret width the CLI draws); `endCol == col` means no span. One column pair
-// covers every span here because a quoted literal never spans lines.
+// `col` (the caret width the CLI draws); `endCol == col` means no span. A literal that
+// spans lines reports its FIRST line, which is the only span one column pair can express.
 type Diag = {
   msg: string,
   line: i32,
@@ -511,12 +511,10 @@ export function scanQuoted(quote: i32) {
   // there (not wherever scanning stopped) keeps a missing quote a local error.
   const openLine = gLine
   const openCol = gCol
-  // Template mode (`quote` is a backtick) differs from `"` in exactly two rules: a raw
-  // newline is content, and an escaped backtick joins the escape set. Hole mode covers `"`
-  // and the backtick but never `'`: a `\{` ends the part (recorded in `gTplStop`, since a
-  // VL function returns one value), and `'\{'` keeps its unknown-escape diagnostic.
-  const tpl = quote == '`'
-  const holes = tpl || quote == '"'
+  // Hole mode covers `"` but never `'`: a `\{` ends the part (recorded in `gTplStop`, since
+  // a VL function returns one value), and `'\{'` keeps its unknown-escape diagnostic. A `"`
+  // literal MAY span lines and keeps the raw newline; a char literal still may not.
+  const holes = quote == '"'
   if holes { gTplStop = 2 }
   advance() // opening quote
   let nCp = 0
@@ -524,11 +522,10 @@ export function scanQuoted(quote: i32) {
   let runStart = gPos
   while gPos < gSrc.length {
     const ch = peek()
-    // A raw newline terminates the literal: the closing quote is missing.
-    // The newline is left in the input (it becomes an ordinary NEWLINE token),
-    // so one missing quote yields a single local error at the opening quote
-    // instead of masking every later error up to EOF.
-    if !tpl && (ch == '\n' || ch == '\r') { break }
+    // A raw newline is CONTENT in a `"` literal and terminates a char literal, where a
+    // missing quote would otherwise mask every later error up to EOF. The newline is left
+    // in the input there, so it becomes an ordinary NEWLINE token.
+    if !holes && (ch == '\n' || ch == '\r') { break }
     // A hole opens. The trigger lives in the escape namespace — `\{`, not `${` — so `{`
     // stays an ordinary character in every string, while `\{` had no prior meaning to
     // break. Tested before the escape arm, so `\{` never reaches `decodeSimpleEscape`;
@@ -554,16 +551,6 @@ export function scanQuoted(quote: i32) {
         break
       }
       const e = peek()
-      // The one template-only escape: a template's own delimiter, handled before
-      // `decodeSimpleEscape` so the `"` grammar is unchanged. `\$` is not an escape in
-      // either form — `$` is an ordinary character in both — so it falls through to the
-      // unknown-escape arm below, which names it.
-      if tpl && e == '`' {
-        advance() // the escaped delimiter
-        nCp = nCp + 1
-        runStart = gPos
-        continue
-      }
       // \xXX — two hex digits.
       if e == 'x' {
         if isHex(peek2()) && isHex(peekN(2)) {
@@ -630,10 +617,16 @@ export function scanQuoted(quote: i32) {
         runStart = gPos
         continue
       }
-      // Line continuation: a backslash immediately before a newline drops both.
+      // Line continuation: a backslash immediately before a newline drops both, and the
+      // next line's INDENTATION with them. A joined line reads as one, so its leading
+      // whitespace is the layout of the source rather than content of the string — which is
+      // what lets a long literal be indented with the code that holds it.
       if e == '\n' || e == '\r' {
         advance() // the newline char
         if e == '\r' && peek() == '\n' { advance() }
+        while gPos < gSrc.length && (peek() == ' ' || peek() == '\t') {
+          advance()
+        }
         runStart = gPos
         continue
       }
@@ -687,8 +680,8 @@ export function scanQuoted(quote: i32) {
 
 // The `"`-quoted string lexeme meaning what template part `raw` means — the one bridge
 // between the two literal grammars, purely lexical, so no second escape decoder can drift.
-// An escape is copied whole, so a `\\` cannot re-open one; an escaped backtick loses its
-// backslash, `"` gains one, a newline becomes `\n`. Built from slices: `.length` is bytes.
+// An escape is copied whole, so a `\\` cannot re-open one; a `"` gains a backslash and a raw
+// newline becomes `\n`, which is what a multi-line part needs. Slices: `.length` is bytes.
 export function tplPartStrLex(raw: string): string {
   const n = raw.length
   const q = "\""
@@ -698,7 +691,7 @@ export function tplPartStrLex(raw: string): string {
   // already a lex error — and keeps everything, which is what leaves the
   // recovery lexeme well-formed.
   let stop = n
-  if raw[n - 1] == '`' || raw[n - 1] == '"' { stop = n - 1 }
+  if raw[n - 1] == '"' { stop = n - 1 }
   else if n >= 2 && raw[n - 2] == '\\' && raw[n - 1] == '{' { stop = n - 2 }
   const start = 1
   if stop <= start { return q + q }
@@ -716,14 +709,7 @@ export function tplPartStrLex(raw: string): string {
         i = i + 1
         runStart = i
       } else {
-        const e = raw[i + 1]
-        if e == '`' {
-          out = out + raw.slice(runStart, i) + raw.slice(i + 1, i + 2)
-          i = i + 2
-          runStart = i
-        } else {
-          i = i + 2
-        }
+        i = i + 2
       }
     } else if ch == '"' {
       out = out + raw.slice(runStart, i) + "\\\""
@@ -942,45 +928,42 @@ export function tokenize(source: string): LexResult {
     }
 
     // String literal `"..."` — and, since the hole trigger `\{` lives in the
-    // escape namespace, the same split-run opener a backtick is. A string with
-    // no hole is one `STRING` token and nothing downstream changes for it; one
-    // with a hole opens a `TEMPLATE_HEAD` and rides the identical machinery.
+    // escape namespace. A string with no hole is one `STRING` token and nothing
+    // downstream changes for it; one with a hole opens a `TEMPLATE_HEAD` and rides
+    // the split-run machinery.
     if c == '"' {
       scanQuoted('"')
       if gTplStop == 1 {
         tplOpenPush(startLine, startCol, startPos, '"')
         toks.push(mkTok("TEMPLATE_HEAD", startPos, startLine, startCol))
       } else {
-        // The span `scanQuoted` reports for a non-interpolable literal: the scan stopped
-        // at a raw newline (still on `startLine`) or at EOF, so `gCol` is the honest
-        // exclusive end either way.
+        // Reported at the OPENING quote, spanning its own line: a `"` literal may run to
+        // EOF now, and `diagSpan`'s columns are one pair on one line, so the first line is
+        // the only honest span — and the opening quote is the character to fix.
         if gTplStop == 2 {
-          diagSpan("Unterminated string literal", startLine, startCol, gCol)
+          diagSpan(
+            "Unterminated string literal",
+            startLine,
+            startCol,
+            tplLineEndCol(startPos, startCol),
+          )
         }
         toks.push(mkTok("STRING", startPos, startLine, startCol))
       }
       continue
     }
 
-    // Template literal — the opening backtick. A template with no hole is one
-    // `TEMPLATE` token; one with holes opens a `TEMPLATE_HEAD` and pushes a row
-    // onto the hole stack, which the `}` arm below closes.
+    // The backtick is not a literal delimiter: an ordinary `"…"` string spans lines and
+    // interpolates, so there is one string form. Refused by NAME rather than left to the
+    // operator tables, whose "unexpected character" says nothing about what to write.
     if c == '`' {
-      scanQuoted('`')
-      if gTplStop == 1 {
-        tplOpenPush(startLine, startCol, startPos, '`')
-        toks.push(mkTok("TEMPLATE_HEAD", startPos, startLine, startCol))
-      } else {
-        if gTplStop == 2 {
-          diagSpan(
-            "Unterminated template literal",
-            startLine,
-            startCol,
-            tplLineEndCol(startPos, startCol),
-          )
-        }
-        toks.push(mkTok("TEMPLATE", startPos, startLine, startCol))
-      }
+      advance()
+      diagSpan(
+        "A backtick is not a string delimiter — write a `\"` string, which may span lines and interpolate with `\\{…}`",
+        startLine,
+        startCol,
+        gCol,
+      )
       continue
     }
 
@@ -995,9 +978,8 @@ export function tokenize(source: string): LexResult {
     }
     if c == '}' {
       if atTplHoleDepth() {
-        // Resumed in the mode the run opened in — a `"` run still refuses a raw
-        // newline, a backtick run still takes one as content. This is the one
-        // read of `gTplQuote` that makes one machinery serve two literal forms.
+        // Resumed in the mode the run opened in — one form now, but the column stays the
+        // record of which delimiter opened this run rather than an assumption about it.
         scanQuoted(gTplQuote[gTplQuote.length - 1]) // the `}` is this part's opener
         if gTplStop == 1 {
           toks.push(mkTok("TEMPLATE_MID", startPos, startLine, startCol))
@@ -1096,10 +1078,8 @@ function tplOpenPush(line: i32, col: i32, pos: i32, quote: i32) {
 function tplOpenDiag() {
   const oi = gTplOpenLine.length - 1
   if oi >= 0 {
-    let what = "Unterminated string literal"
-    if gTplQuote[oi] == '`' { what = "Unterminated template literal" }
     diagSpan(
-      what,
+      "Unterminated string literal",
       gTplOpenLine[oi],
       gTplOpenCol[oi],
       tplLineEndCol(gTplOpenPos[oi], gTplOpenCol[oi]),

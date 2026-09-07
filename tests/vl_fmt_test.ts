@@ -673,6 +673,88 @@ Deno.test({
 });
 
 Deno.test({
+  name: "vl-fmt: a comment inside an object literal or a call's argument list pins its row (D1777)",
+  ignore: !ENABLED,
+  fn: async () => {
+    // The list literal's defect at the other two brackets: the comment was still pending
+    // when the construct finished, so the statement printer emitted it after the whole
+    // declaration. Three shapes — a comment on its own line inside an object literal,
+    // inside a call's argument list, and trailing an element of each.
+    const src =
+      "function g(x: i32, y: i32): i32 { x + y }\n" +
+      "const o = {\n" +
+      "  a: 1,\n" +
+      "  // the b field\n" +
+      "  b: 2,\n" +
+      "}\n" +
+      "const t = {\n" +
+      "  a: 3, // the a field\n" +
+      "  b: 4,\n" +
+      "}\n" +
+      "const s = g(\n" +
+      "  1,\n" +
+      "  // the second argument\n" +
+      "  2,\n" +
+      ")\n" +
+      "const u = g(\n" +
+      "  5, // the first argument\n" +
+      "  6,\n" +
+      ")\n" +
+      "print(o.a + o.b + t.a + t.b + s + u)\n";
+    const r = await run([], src);
+    if (r.code !== 0) throw new Error(`fmt failed: ${r.err}`);
+    if (r.out !== src) throw new Error(`a comment moved out of its construct:\n${r.out}`);
+    const r2 = await run([], r.out);
+    if (r2.out !== r.out) throw new Error(`pinned comments not idempotent:\n${r2.out}`);
+    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_cmtgap_" });
+    try {
+      const f = `${dir}/g.vl`;
+      await Deno.writeTextFile(f, r.out);
+      const ran = await runOn("run", f);
+      if (ran.code !== 0) throw new Error(`pinned construct does not run: ${ran.err}`);
+      if (ran.out !== "24\n") throw new Error(`pinned construct changed the answers: ${ran.out}`);
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
+
+Deno.test({
+  name: "vl-fmt: a comment INSIDE an element is that element's, and does not freeze the list (D1787)",
+  ignore: !ENABLED,
+  fn: async () => {
+    // The anchor reads the GAPS between items, not the whole span: a lambda body renders
+    // itself and already hosts its own comments, so a badly laid out one is still
+    // reformatted — in a list element, an object field and a call argument alike.
+    const src =
+      "function apply1(f: (i32) => i32) { f(1) }\n" +
+      "const zs = [\n" +
+      "  (v: i32) => {\n" +
+      "        // tripling\n" +
+      "        const   w=v*3\n" +
+      "        w\n" +
+      "  },\n" +
+      "]\n" +
+      "const ws = apply1((v: i32) => {\n" +
+      "      // doubling\n" +
+      "      const   u=v*2\n" +
+      "      u\n" +
+      "})\n" +
+      "print(zs[0](1) + ws)\n";
+    const r = await run([], src);
+    if (r.code !== 0) throw new Error(`fmt failed: ${r.err}`);
+    if (!r.out.includes("    // tripling\n    const w = v * 3\n")) {
+      throw new Error(`a list element's own body was frozen verbatim:\n${r.out}`);
+    }
+    if (!r.out.includes("  // doubling\n  const u = v * 2\n")) {
+      throw new Error(`a call argument's own body was frozen verbatim:\n${r.out}`);
+    }
+    const r2 = await run([], r.out);
+    if (r2.out !== r.out) throw new Error(`element-comment layout not idempotent:\n${r2.out}`);
+  },
+});
+
+Deno.test({
   name: "vl-fmt: a lone wide comment's spacing does not force-align the narrower lines",
   ignore: !ENABLED,
   fn: async () => {
@@ -1867,19 +1949,17 @@ Deno.test({
   fn: async () => {
     const src = [
       "const x = 5",
-      "const plain = `no holes`",
-      "const one = `v=\\{x} done`",
-      "const spaced = `\\{ x + 1 }`",
-      'const chained = "a" + `b\\{x}c` + "d"',
-      'const esc = `\\` and \\\\{ and " and \\\\`',
-      "const multi = `line1",
-      "  line2`",
+      'const plain = "no holes"',
       'const sHole = "v=\\{x} done"',
       'const sSpaced = "\\{ x + 1 }"',
       'const sChained = "a" + "b\\{x}c" + "d"',
       'const sBrace = "{plain} and ${x}"',
-      "print(plain + one + spaced + chained + esc + multi)",
-      "print(sHole + sSpaced + sChained + sBrace)",
+      'const multi = "line1',
+      '  line2"',
+      'const joined = "a \\',
+      '    b"',
+      "print(plain + sHole + sSpaced + sChained + sBrace)",
+      "print(multi + joined)",
       "",
     ].join("\n");
     const r = await run([], src);
@@ -1888,16 +1968,13 @@ Deno.test({
     }
     // Every literal's own bytes must survive, character for character.
     const literals = [
-      "`no holes`",
-      "`v=\\{x} done`",
-      "`\\{ x + 1 }`",
-      "`b\\{x}c`",
-      '`\\` and \\\\{ and " and \\\\`',
-      "`line1\n  line2`",
+      '"no holes"',
       '"v=\\{x} done"',
       '"\\{ x + 1 }"',
       '"b\\{x}c"',
       '"{plain} and ${x}"',
+      '"line1\n  line2"',
+      '"a \\\n    b"',
     ];
     for (const lit of literals) {
       if (!r.out.includes(lit)) {
@@ -1907,7 +1984,7 @@ Deno.test({
       }
     }
     // The desugar must not surface: neither the injected renderer's name nor a
-    // concatenation standing in for a template.
+    // concatenation standing in for an interpolated literal.
     if (r.out.includes("$tpl$")) {
       throw new Error(`fmt printed the desugared render call:\n${r.out}`);
     }

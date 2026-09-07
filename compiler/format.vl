@@ -351,6 +351,25 @@ function skipCovered() {
   0
 }
 
+// Whether a pending comment sits in the PUNCTUATION of a bracketed list — before the first
+// item, between two items, or after the last — rather than inside an item, which renders
+// itself and hosts its own comments. Only a gap has no printer to take the comment, so only
+// a gap forces the verbatim anchor; an item with no span answers no (D1777).
+function commentInListGaps(from: i32, stop: i32, items: i32[]) {
+  if from < 0 || stop < from { return false }
+  let lo = from
+  let i = 0
+  while i < items.length {
+    const a = nodePos(items[i])
+    const b = nodeEndOf(items[i])
+    if a < lo || b < a || b > stop { return false }
+    if commentInCharSpan(lo, a) { return true }
+    lo = b
+    i = i + 1
+  }
+  commentInCharSpan(lo, stop)
+}
+
 // Whether any pending comment starts inside the char span `[start, stop)`.
 function commentInCharSpan(start: i32, stop: i32) {
   if start < 0 || stop < 0 { return false }
@@ -2085,7 +2104,7 @@ function chainStep(text: string, kind: i32, ix: i32, indent: i32, column: i32) {
   } else if kind == 1 {
     if n is OptMember { return text + optMemberDot(n) + n.omProp }
   } else if kind == 2 {
-    if n is Call { return callTail(n, text, indent, column) }
+    if n is Call { return callTail(n, ix, text, indent, column) }
   } else {
     if n is Index { return text + "[" + expr(n.idxIndex, indent, column) + "]" }
   }
@@ -2230,14 +2249,22 @@ function callExpr(ix: i32, node: Call, indent: i32, column: i32) {
   if laid.length > 0 { return laid }
   const callee = expr(node.callFn, indent, column)
   const head = calleePrimary(node.callFn, callee)
-  callTail(node, head, indent, column)
+  callTail(node, ix, head, indent, column)
 }
 
 // `head` with the call's argument list appended, at `indent` starting from `column`, the
 // column `head` itself begins at. Split out of `callExpr` because the chain layout needs the
 // same tail under a different head, and a second spelling of the trailing-lambda hug plus
 // the width test is exactly the one width test this file already has.
-function callTail(node: Call, head: string, indent: i32, column: i32) {
+function callTail(node: Call, ix: i32, head: string, indent: i32, column: i32) {
+  // A comment between the arguments has the same nowhere to go, and the anchor is the
+  // argument list rather than the whole call: the callee is already rendered into `head`,
+  // and a receiver chain is a construct of its own that this must not reprint (D1777).
+  const open = callArgOpenAt(node, ix)
+  const stop = nodeEndOf(ix)
+  if open >= 0 && commentInListGaps(open, stop, node.callArgs) {
+    return head + sliceSpanFallback(open, stop)
+  }
   const n = node.callArgs.length
   // Every argument but the last, at the wrapped list's continuation depth. The last is
   // rendered exactly once, at the depth whichever form wins needs: rendering a lambda body
@@ -2256,6 +2283,20 @@ function callTail(node: Call, head: string, indent: i32, column: i32) {
     args.push(callArgText(node, n - 1, indent + 1, column))
   }
   head + wrapList("(", args, ")", indent, column + dispWidth(head))
+}
+
+// The offset of the `(` opening `node`'s argument list: the first one at or after the
+// callee's end, which is where the call's own punctuation starts. -1 when either side has
+// no span, and the caller then keeps the rendered form.
+function callArgOpenAt(node: Call, ix: i32) {
+  let p = nodeEndOf(node.callFn)
+  const stop = nodeEndOf(ix)
+  if p < 0 || stop < p || stop > fmtSrc.length { return -1 }
+  while p < stop {
+    if fmtSrc[p] == '(' { return p }
+    p = p + 1
+  }
+  -1
 }
 
 // Argument `i` as a list item: the value, with its optional name prefix.
@@ -2327,8 +2368,13 @@ function hugTrailingLambda(
   ""
 }
 
-function objectLiteral(_ix: i32, node: ObjLit, indent: i32, column: i32) {
+function objectLiteral(ix: i32, node: ObjLit, indent: i32, column: i32) {
   if node.objFields.length == 0 { return "{}" }
+  // A comment between the fields is the list literal's case at the other bracket: it falls
+  // through to the statement printer, one construct later than the row it annotates (D1777).
+  if commentInListGaps(nodePos(ix), nodeEndOf(ix), node.objFields) {
+    return sliceFallback(ix)
+  }
   const items: string[] = []
   let i = 0
   while i < node.objFields.length {
@@ -2431,11 +2477,13 @@ function arrUniformRow(elems: i32[]) {
 
 function arrayLiteral(ix: i32, node: ArrayLit, indent: i32, column: i32) {
   if node.arrElems.length == 0 { return "[]" }
-  // A comment inside the brackets pins the row it annotates, and none of the three layouts
-  // below has anywhere to put it: a reflowed comment falls through to the statement
-  // printer, which emits it after the whole declaration. So a literal carrying one is
-  // reproduced from source, the anchor `ifExpr` takes for the same reason (D1776).
-  if commentInCharSpan(nodePos(ix), nodeEndOf(ix)) { return sliceFallback(ix) }
+  // A comment in the brackets themselves pins the row it annotates, and none of the three
+  // layouts below has anywhere to put it: a reflowed comment falls through to the statement
+  // printer, which emits it after the whole declaration. So such a literal is reproduced
+  // from source, the anchor `ifExpr` takes for the same reason (D1776, D1787).
+  if commentInListGaps(nodePos(ix), nodeEndOf(ix), node.arrElems) {
+    return sliceFallback(ix)
+  }
   const items: string[] = []
   let i = 0
   while i < node.arrElems.length {
