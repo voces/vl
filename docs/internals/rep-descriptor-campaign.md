@@ -349,7 +349,14 @@ still worth doing in the domain-keeping shape — the second producer stops bein
 Every conversion owes all five, and the first is the one that decides:
 
 1. **The oracle: 0 CONTRADICT** over `tests/cases` and the distilled corpus, with the ladder
-   and the candidate projection compared side by side *before* anything is deleted.
+   and the candidate projection compared side by side *before* anything is deleted —
+   **reported over the population that EMITTED UNDER BOTH SEEDS, with that count printed.**
+   A module the candidate breaks runs no shadow sweep, so it contributes nothing to AGREE and
+   nothing to CONTRADICT: its counter-evidence leaves with it, and the oracle's silence about
+   it is an artefact of the breakage rather than a reading. §9.6 is the worked instance — a
+   candidate scored CONTRADICT 0 while breaking 35 modules, and the −627 in AGREE was those
+   modules leaving. If the emitting count is not equal under both seeds, the CONTRADICT figure
+   is not yet evidence; say which modules left and grade those first.
 2. **Byte identity** of the emitted module over both populations — both arms built from ONE
    seed, compared on sha256 and exit code, never on file size.
 3. `scripts/silent-sweep/distilled/regress.py`: **0 `runs → not-runs`, 0 `→ silent`**.
@@ -1551,7 +1558,7 @@ compensating directions. Byte-identical in **3,207 of 3,207** and **7,589 of 7,5
 `rep-fuzz` exact, `regress.py` no cell changed class, `mono-tyaram-grid` 161 OK / 100 REJECT /
 0 BAD.
 
-### 9.6 The NULLABLE element — a candidate REFUSED by its own byte-identity gate
+### 9.6 The NULLABLE element — the broad candidate REFUSED, the narrow one LANDS
 
 The third landing was built to the same recipe and **must not ship**. It is recorded here
 because the price it named is the finding.
@@ -1583,36 +1590,49 @@ rejects, in four messages:
 | `ref .push but ref list type not collected` | 1 |
 | compiler trap (`rc=70`) | 6 |
 
-**The mechanism, and the rule it buys: answering `reflist` is a PROMISE THAT A ROW EXISTS.**
-The descriptor is not read only by `vtKindOfType` — the ref-list slot, shape and collect
-consumers read it too, and a `reflist` answer sends them to look up an interned row. The
-collect pass interns one for a map element and for a nested-array element, which is why those
-two landings were byte-identical; **it interns none for a nullable element**. So the coverage
-is not a coverage gain at all, it is a claim the rest of the emitter cannot honour.
+**The mechanism — and the first diagnosis of it was WRONG, which is why this section reads as
+it does.** The refusal was initially written up as "the collect pass mints no ref-list row for a
+nullable element, so the answer is a promise nothing can honour". That is false.
+`refArrShapeKindGo` already interns rows for nullable elements across the board —
+`(P | null)[]` and `(Circle | null)[]` are kind 1, `({[string]: V} | null)[]` is kind 3, and
+`(i32[] | null)[]` is kinds 4/6/7/8/9/10/11 — and all five nullable-element shapes RUN on
+master today. **The rows were never missing.**
 
-**This is why byte identity is the claim and not a formality.** The oracle is a comparison of
-two ANSWERS; it cannot see a consumer that needs more than an answer. A landing graded on
-LEFT-ONLY and CONTRADICT alone would have shipped 35 `runs → not-runs` modules and six compiler
-traps with a clean-looking scoreboard — which is §5.0's second form, a domain WIDENING, doing
-exactly what the bar predicts.
+**The real error is the rule, not the row.** "A nullable cell is a reference, therefore its list
+is a ref list" does not hold, because what decides the list is the element's BACKING FAMILY:
 
-**Its price needs no new named set, and checking that is the point.** CLAUDE.md's rule is that
-a refused candidate which named a set puts that set in `named/`. All 16 corpus cells this one
-moved are ALREADY `named/` members, from five earlier sets in the same territory (`d341` x8,
-`d451` x5, `d775`, `d812`, `d1630`) and none from the derived `cells/` half — so the standing
-gate carries them, and `regress.py` against the candidate says so directly:
-`REGRESSION — 16 behavioural class(es) stopped running`. The 19 `tests/cases` members are
-fixtures already. The rule applied and the answer was that the instrument was ahead of it.
+* `(string | null)[]` rides the **string list** — the nullable lives inside the element, and the
+  wrapper is `$mkListIdx` either way (`refArrShapeKindGo` says so at its `string[][]` arm).
+* `(boolean | null)[]` and `(K | null)[]` ride the **i32 list**, at sentinels 2 and -1.
+* Only a nullable **struct**, **map** or **ref-list** element makes the list a ref list.
 
-**The contract this leaves the descriptor**, recorded on [D1837](inventory/D1837.md): `reflist`
-is answered ONLY where the collect pass has interned the row. A producer that answers it for a
-shape collect never minted is making a promise the slot, shape and collect consumers cannot
-keep — and the failure is loud or trapping, not a wrong rep.
+`nullable-elem-list-call-init.vl`'s own header names the family the candidate broke: *"the four
+element spellings that ride a scalar list's backing without being a primitive."* A one-level
+variant switch cannot express a backing-family rule, which is why the candidate could not have
+been made right by narrowing the exclusion list.
 
-**What the nullable element needs before it can be covered** is the collect pass interning a
-ref-list row for a nullable-element list, which is a build, not a projection. Until then the
-ladder is load-bearing here in the strong sense: it is the only producer whose answer the rest
-of the emitter is prepared for.
+**And the oracle's CONTRADICT 0 was partly VACUOUS, which is the transferable lesson.** A module
+that fails to emit never runs its shadow sweep: the broken modules produced no `vtKindOfType`
+rows at all, so they contributed nothing to AGREE and nothing to CONTRADICT. The programs that
+would have contradicted are exactly the ones the candidate broke, and they took their own
+counter-evidence with them. That is also the whole of the −627 in AGREE and the ~5,400 fewer
+invocations, first attributed to `vtKindOfParam` by per-site counters: not bookkeeping, not
+arena growth, but 35 modules leaving the population. §5.1 now carries this as a standing bar —
+every oracle reading is reported over the population that emitted under BOTH seeds, with that
+count printed.
+
+**What ships is the nullable-STRUCT arm alone.** `(S | null)[]` is the `(ref null $S)` niche
+riding the ref list — kind 1, the row `refArrShapeKindGo` already interns — and the flat arm and
+the tree arm land together with the two-producer audit as the gate between them: with the flat
+arm alone the audit reads `DISAGREE kind flat=reflist tree=list/`, and with both it reads
+**0 DISAGREE**. Byte-identical in **3,210 of 3,210** `tests/cases` modules and **7,589 of
+7,589** corpus cells, both populations emitting under both seeds, and all five nullable-element
+shapes still print what they printed.
+
+**The rest of the nullable reason stays in the column deliberately.** A nullable string, boolean
+or literal-union element is not a ref list at all, so it is not a coverage gap for `reflist` —
+it is a different kind's question, and answering it here would be the same over-claim in a
+narrower costume.
 
 ### 9.7 What is left in the column
 
