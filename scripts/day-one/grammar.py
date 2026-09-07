@@ -45,13 +45,55 @@ VALUES = [
     {
         "id": "i32", "weight": 4, "decls": [], "named": "i32", "inline": "i32",
         "expr": "7", "alt": "0", "alt_infers": True, "features": ["scalar"],
-        "reads": [{"id": "bare", "lines": ["print({v})"], "want": ["7"]}],
+        # MIXED-WIDTH arithmetic. `numWidensName` allows exactly three lossless edges —
+        # `i32 -> i64`, `i32 -> f64`, `f32 -> f64` — and the operand is a LITERAL, so these
+        # reads need no declaration and the record keeps declining `named_vs_inline`.
+        # `same_add` is the CONTROL beside them: a disagreement it shares is not a widening
+        # defect, which a table of mixed pairs alone could not tell.
+        "reads": [{"id": "bare", "lines": ["print({v})"], "want": ["7"]},
+                  {"id": "same_add", "mix": "same",
+                   "lines": ["print({v} + 1)"], "want": ["8"]},
+                  {"id": "mix_i64", "mix": "i32->i64",
+                   "lines": ["print({v} + 9000000000)"], "want": ["9000000007"]},
+                  {"id": "mix_f64", "mix": "i32->f64",
+                   "lines": ["print({v} + 2.5)"], "want": ["9.5"]},
+                  {"id": "mix_f64_mul", "mix": "i32->f64",
+                   "lines": ["print({v} * 2.5)"], "want": ["17.5"]},
+                  {"id": "mix_cmp_i64", "mix": "i32->i64",
+                   "lines": ["if {v} < 9000000000 { print(1) } else { print(0) }"],
+                   "want": ["1"]}],
     },
     {
         "id": "f64", "weight": 2, "decls": [], "named": "f64", "inline": "f64",
         "expr": "2.5", "alt": "0.0", "alt_infers": True, "features": ["scalar", "f64"],
+        # `arith` is the SAME-width control the record already had; `same_add` states it
+        # in the shape the mixed reads use, and `mix_lit_i32` is the `i32 -> f64` edge with
+        # the literal on the narrow side.
         "reads": [{"id": "bare", "lines": ["print({v})"], "want": ["2.5"]},
-                  {"id": "arith", "lines": ["print({v} * 2.0)"], "want": ["5"]}],
+                  {"id": "arith", "mix": "same",
+                   "lines": ["print({v} * 2.0)"], "want": ["5"]},
+                  {"id": "same_add", "mix": "same",
+                   "lines": ["print({v} + 2.5)"], "want": ["5"]},
+                  {"id": "mix_lit_i32", "mix": "i32->f64",
+                   "lines": ["print({v} + 1)"], "want": ["3.5"]}],
+    },
+    {
+        # The THIRD lossless edge, `f32 -> f64`, which no record could reach: there is no f32
+        # literal, so the value has to come from an annotated return. No decls, so this record
+        # declines `named_vs_inline` exactly as the other scalars do.
+        "id": "f32", "weight": 2, "decls": [], "named": "f32", "inline": "f32",
+        "expr": None, "mk": ["return 1.5"], "alt": "0.0",
+        "features": ["scalar", "f32"],
+        "reads": [{"id": "bare", "lines": ["print({v})"], "want": ["1.5"]},
+                  {"id": "same_add", "mix": "same",
+                   "lines": ["print({v} + 1.5)"], "want": ["3"]},
+                  {"id": "mix_f64", "mix": "f32->f64",
+                   "lines": ["const wf: f64 = 2.5", "print({v} + wf)"], "want": ["4"]},
+                  # The integer LITERAL adopts the context here, where the VALUE edge
+                  # `i32 -> f32` is refused as lossy — a different rule from the lattice,
+                  # so it gets its own read rather than riding the `i32 -> f64` tag.
+                  {"id": "lit_default", "mix": "lit->f32",
+                   "lines": ["print({v} + 1)"], "want": ["2.5"]}],
     },
     {
         "id": "string", "weight": 3, "decls": [], "named": "string", "inline": "string",
@@ -68,9 +110,18 @@ VALUES = [
                    "lines": ["if {v} { print(1) } else { print(0) }"], "want": ["1"]}],
     },
     {
-        "id": "i64", "weight": 1, "decls": [], "named": "i64", "inline": "i64",
+        "id": "i64", "weight": 2, "decls": [], "named": "i64", "inline": "i64",
         "expr": "9000000000", "alt": "0", "features": ["scalar", "i64"],
-        "reads": [{"id": "bare", "lines": ["print({v})"], "want": ["9000000000"]}],
+        # The widening runs the OTHER way here: the literal is the narrow side. `same_add`
+        # is the control, and `mix_div` is the same edge through a different operator —
+        # `/` has its own lowering, so an edge proven at `+` is not proven at `/`.
+        "reads": [{"id": "bare", "lines": ["print({v})"], "want": ["9000000000"]},
+                  {"id": "same_add", "mix": "same",
+                   "lines": ["print({v} + 9000000000)"], "want": ["18000000000"]},
+                  {"id": "mix_lit_i32", "mix": "i32->i64",
+                   "lines": ["print({v} + 1)"], "want": ["9000000001"]},
+                  {"id": "mix_div", "mix": "i32->i64",
+                   "lines": ["print({v} / 2)"], "want": ["4500000000"]}],
     },
     {
         "id": "rec", "weight": 4, "decls": [REC_DECL], "named": "Rec",

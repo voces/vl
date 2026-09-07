@@ -473,11 +473,17 @@ def make_pair(rng, axis_id=None):
         "a": {"src": srcA, "want": wantA, "face": fa[axis["id"]]},
         "b": {"src": srcB, "want": wantB, "face": fb[axis["id"]]},
         "compare": "grade+output" if wantA == wantB else "grade",
+        # The widening EDGE joins the features under its own `widen_` prefix, which the READ
+        # ids beginning `mix_` would collide with. Without it an agree on a mixed-width read
+        # could not be told from an edge the sample never exercised — the rule the axis
+        # table's `NOT EXERCISED` row states one level up.
         "features": sorted(set(plan["value"]["features"]) |
                            {plan["position"]["id"], plan["read"]["id"],
                             fa["scope"]} |
                            ({"pin2_" + plan["second_pin"]["id"]}
-                            if "generic2" in (fa["pinning"], fb["pinning"]) else set())),
+                            if "generic2" in (fa["pinning"], fb["pinning"]) else set()) |
+                           ({"widen_" + plan["read"]["mix"]}
+                            if "mix" in plan["read"] else set())),
         "delta": delta(axis, fa, fb, plan, srcA, srcB),
     }
 
