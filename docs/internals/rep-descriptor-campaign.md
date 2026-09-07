@@ -394,7 +394,15 @@ vocabulary, which is now the only rep numbering scheme with no single translatio
 
 ---
 
-### 5.3 The binding surface — item 7 stated as a step, with the change it needs
+### 5.3 The binding surface — the blocker as stated, and its REFUTATION
+
+> **REFUTED 2026-09-07, by witness.** This section was written from the SHAPE of three
+> signatures and it was wrong about all three. Binding resolution is already frame-correct;
+> there is no missing walk and no surface owed. §6.7 has the evidence — four witnesses, twenty
+> printed values, every one right on master. What is below is kept because the *reasoning* it
+> records is the trap, not because its conclusion stands: **a signature that does not take a
+> frame is not thereby frame-blind.** The pin is
+> `tests/cases/scope/binding-resolution-is-frame-correct.vl`.
 
 Item 6 (`expr*`, 48 classifiers, 927 call sites) is the campaign's largest family and its
 `Ident` arm is the reason it is blocked. This section states the blocker precisely so the
@@ -856,6 +864,69 @@ list literals, one construct over.
 
 ---
 
+### 6.7 The binding surface — REFUTED by witness, and what that leaves
+
+§5.3 specified a surface `expr*` was said to be blocked on: one `(name, frame)` scope-chain
+walk, because `declaredSlotOf` "takes a bare name with no frame" and `paramTypeNode` /
+`globalLetOfSidIn` "take `fnIx` only as a veto". **Phase 2 opened by testing that with
+programs instead of building on it, and all three claims are false.**
+
+**Four witnesses on master, twenty printed values, every one correct.**
+
+| witness | what it stresses | result |
+| --- | --- | --- |
+| three frames binding `v` at four reps, two of them monomorphized instances | `declaredSlotOf` | `9 · 2 · z · 1.5` |
+| a parameter read from a per-pin clone, which shares its template's leaf nodes | `paramTypeNode` | `9 · 2 · z · 1.5` |
+| a module `let` read, shadowed, captured, and mutated between reads | `globalLetOfSidIn` | `7 · local · 7 · 11 · 11 · local` |
+| two same-named locals at different reps in ONE frame (sibling blocks); a global shadowed only inside a nested BLOCK | `dupSlotBias`, `frameLetOfLive` | `3 · 4 · 100 · 7 · 12` |
+
+**The mechanism, per route:**
+
+* **`declaredSlotOf(name)` is frame-scoped by its AMBIENT table.** `localNames` is *"rebuilt
+  per function"* (`compiler/emit_state.vl:335`), so the table it scans belongs to exactly one
+  frame. The frame is the table, not a parameter.
+* **`paramTypeNode(fnIx, name)` is frame-EXPLICIT.** It reads `P.nodes[fnIx]`'s own parameter
+  list. Its `if scopeSlotOf(name) >= 0 { return -1 }` opener is not a missing walk — it is the
+  correct answer that a local shadows the parameter.
+* **`globalLetOfSidIn(fnIx, sid)` is frame-aware** through `identBoundInFrame(fnIx, name)`,
+  itself a three-rung walk: `localIndexOf`, then `capturedKindOf`, then `frameLetOfLive` off
+  the arena for the passes where `localNames` is empty.
+
+**Why the analogy to the callee case failed, which is the transferable part.** A CALLEE needs
+an outward walk because two lifted functions can share a name and `fnIndexBySid` is a flat,
+first-occurrence-wins map — the walk exists to beat that map. **A binding has no flat map.**
+`localNames` is per function, `globalLetOfSid` is module scope, and the enclosing-frame case
+is a CAPTURE, which `capturedKindOf` already owns. The two are not duals, and §5.3 reasoned
+from the shape of three signatures rather than from what they resolve against.
+
+**The rule this earns**: *a signature that does not take a frame is not thereby frame-blind* —
+the frame can be ambient in the table it reads. Checking costs one program per claim, and here
+it cost four programs to avoid building a surface nothing needed.
+
+**What is actually owed, and it is smaller.** Three readers each wrote out the same two-rung
+walk — `declaredSlotOf(name)` then `localDeclIx[slot]`, with their own bounds guards. That is
+duplication, not a defect, and it is now `bindingDeclInScope(name)`. **Its signature carries
+the finding: it takes no frame argument**, and its header says why. Byte-identical in
+**3,173 of 3,173** `tests/cases` modules and **7,589 of 7,589** corpus cells; seed
+**−41 bytes**.
+
+**And this de-duplication is safe where §6.5's was refused — the distinction is sharp enough
+to state as a rule.** `sentinel-index-unguarded` reads **373, unchanged**, because the table
+READ moved into the helper together with the guard that bounds it. §6.5's candidate moved the
+guard and left twenty-one reads behind. So form three of the bar refines to: **de-duplicate a
+guard only by moving the READ with it; moving the guard alone removes the lint's evidence and
+not the risk.**
+
+**What the surface does NOT unblock — the question §6.6 left open.** None of the four
+clamped-to-`0` slot producers is reached by it. `letAnnRefListSlot`, `tyAnnRefListSlot`,
+`refListSlotOfExpr` and `globalRefListSlot` clamp a **ref-list TABLE miss** (`rlSlotByName`
+finding no row), not a name-resolution miss — a different question with a different producer.
+Their fix is `rdCovered == 0` reaching the ref-list slot layer, which is the descriptor's job
+and still blocked on nothing but the work itself. That is a correction to §6.6's own
+"named next step", made here rather than left to mislead.
+
+---
+
 ## 7. What the campaign's first phase measured
 
 Six landings. This section is the phase's own scoreboard, and it is written so the next
@@ -872,8 +943,9 @@ and the population it ran over.
 | the field-code ladders | domain-KEEPING | **CONTRADICT 0** over 58,428 queries | 3,165 + 7,589, all identical | +120 |
 | the valtype writers | consumer family; `_`-less `match` | not applicable — no second producer | 3,167 + 7,589, all identical | **−113** |
 | the slot layer's consumer rim | consumer; `_`-less `match` | not applicable — the producers have no kind to switch on | 3,172 + 7,589, all identical | +14 |
+| the binding surface | REFUTED by witness; a de-duplication shipped instead | not applicable — four witnesses, twenty values, all correct on master | 3,173 + 7,589, all identical | **−41** |
 
-**Net seed cost of the phase: +4,073 bytes (+0.18%)**, of which +2,715 is the census and
+**Net seed cost of the phase: +4,032 bytes (+0.18%)**, of which +2,715 is the census and
 oracle scaffolding and the rest is four conversions. Every landing is byte-identical on both
 populations except D1834's own fixture, which master cannot build.
 
@@ -929,10 +1001,14 @@ Both are in `docs/internals/open-rulings.md` §D with options, peers and a recom
 ### 7.5 The next phase, and its stated prerequisite
 
 The largest family is untouched and deliberately so: **`expr*`, 48 classifiers over 927 call
-sites, 31% of every classifier call site in the emitter.** It is domain-REMOVING by §5.0's bar
-and blocked on the binding surface, whose blocker, required change and frame-vocabulary trap
-are specified in **§5.3** rather than left to be discovered inside the conversion. That is the
-phase's last deliverable: the next family cannot start by guessing.
+sites, 31% of every classifier call site in the emitter.** It is domain-REMOVING by §5.0's bar.
+
+**It is NOT blocked on a binding surface** — §5.3 said it was and §6.7 refutes that by witness:
+binding resolution is already frame-correct by three separate routes, and the surface §5.3
+specified is not owed. What `expr*` needs is the descriptor reaching an expression node, and
+what stands in the way is only the work itself: each of its four axes is a domain-keeping
+conversion of arms that decide a rep, beside syntactic arms that must stay because the arena
+has no type for their nodes. **The next family can start; it just cannot start by deleting.**
 
 ---
 

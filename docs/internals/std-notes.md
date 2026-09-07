@@ -369,7 +369,8 @@ Each now says so, in the shape the `concat`-vs-`+` bullet uses.
   30 does, and it also names the intended consumers — the orchestrator scripts — which is
   a stronger warrant than `std:args` had. But no `.vl` outside `std/` imports either module
   today, so the same sentence applies: the dogfooding is the FOLLOW-UP, not the warrant.
-  The first port is `scripts/seed-size.py`, and D1864 is why it has not landed yet.
+  The first port is `scripts/seed-size.vl`, which routes around D1864 and D1865 rather than
+  waiting for them.
 - **Why `runProgram` and not `run`.** VL has no namespace import, and a module that both
   imports and declares a name is a HARD PARSE ERROR — the rule that made `std:args` export
   `programArgs` rather than `args`. `run` is the most-claimed verb in exactly the population

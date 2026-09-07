@@ -278,4 +278,4 @@ time.
 
 Two module passes and one per function, all linear in bytes, sharing the kind-ladder line and
 function index. The seed grew **+1.6%** (2,043,139 → 2,076,521 bytes), under
-`scripts/seed-size.py`'s +3% bar; `scripts/native-fixpoint.sh` holds.
+`scripts/seed-size.vl`'s +3% bar; `scripts/native-fixpoint.sh` holds.

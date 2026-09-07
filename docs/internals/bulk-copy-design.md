@@ -291,7 +291,7 @@ available (`const n = src.length`, `while i < n`).
 prototype module is 29,332 bytes against 29,201 for the same program with no copy at all
 (+131 bytes for the function and its call site) and 29,297 for the inline loop it replaces
 (**+35 bytes**). The seed is unaffected: `compiler/*.vl` imports no `std:` module, so
-`build/vl-compiler.wasm` does not move by a byte and `scripts/seed-size.py` has nothing to say.
+`build/vl-compiler.wasm` does not move by a byte and `scripts/seed-size.vl` has nothing to say.
 
 **The host import is the real cost of E1**, and it is a cost in the same currency VL-011 is about.
 Every module importing `std:fs` already carries nine; a tenth changes no architecture. But it does
