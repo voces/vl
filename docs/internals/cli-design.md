@@ -623,12 +623,52 @@ host path until the protocol is proven on `check`.
 | flag | what it does |
 |---|---|
 | `-o <out.wasm>` | output path (default: the input with `.vl` → `.wasm`) |
+| `-o -` | write the module BYTES to stdout and nothing to disk |
 | `-O` | **shrink rung** — one open-world `wasm-opt -O` |
 | `-O3` | **release profile** — `wasm-opt --closed-world -O3 --gufa -O3` |
 | `--wat` | also dump a `.wat` beside the module (`wasm-dis`), AFTER optimization |
 | `--names` | embed the wasm `name` custom section (legible trap backtraces) |
 | `--no-validate` | skip the "will the engine instantiate this" check |
 | `--compiler <f>` | the compiler module to compile with |
+
+#### The output channel is RULED: a file by default, stdout only when asked
+
+`vl build main.vl` writes `main.wasm` beside the source and prints nothing to stdout.
+That default is the `cc` one and it is deliberate: a compiler that writes a binary to
+stdout unasked destroys a terminal on a typo, and every caller in this tree already
+passes `-o` — 76 invocation sites across `scripts/`, `.github/`, `tests/` and `bench/`,
+**zero** of which rely on the default.
+
+The pipeline case is served by the POSIX spelling instead. **`-o -` writes the module
+bytes to stdout and creates no file**, so `vl build p.vl -o - | …` is a stream. It
+composes with everything else: `-O`/`-O3` optimize through a temporary and the optimized
+bytes are what reach stdout, and validation still runs. Two refusals, both loud:
+`--wat` needs a path to write the `.wat` beside and cannot combine with `-o -`, and
+`-o -` onto a TERMINAL is refused rather than spewed (redirect or pipe it).
+
+**This is `vl seed`'s convention, not a new one.** That command already streams raw wasm
+to stdout and already refuses a tty in those words (*"writes N bytes of wasm to stdout,
+and stdout is a terminal"*), pinned by `tests/vl_help_test.ts`. `build` differs in one
+place on purpose: its tty refusal exits **2**, because `vl help build`'s own table reads
+*0 wrote a valid module; 1 compile/optimize/validate failure; 2 usage*, and asking for a
+binary on a terminal is usage, not a compile failure. `vl seed` bails at 1 and has no
+such table to answer to.
+
+**The status line is stderr, on every path.** `wrote main.wasm (150 bytes)` is chatter
+about the run, not the run's output, and it used to go to stdout — so
+`vl build p.vl > out.bin` left `out.bin` holding that sentence while the module sat in
+`p.wasm`, which is what ROADMAP row 9 filed. This is the same rule `check --json` states
+one section up (*"the human summary line is suppressed … so stdout stays pure"*),
+applied to the one command that had not adopted it: **stdout carries the artifact and
+nothing else.**
+
+*The alternative, and why not.* `ROADMAP.md`'s Track C bullet recorded
+"`vl build` to stdout when no `-o` (decided: yes, pipe-friendly)" — making stdout the
+DEFAULT. That buys the same pipeline this does, and costs a breaking change to a
+documented surface (this table, and `vl help build`'s `writes main.wasm`) for no
+measured consumer, plus the terminal-spew footgun on every bare `vl build`. `-o -` is
+the narrower spelling that reaches the same programs, so the default stands and the
+bullet is retired.
 
 Three rules hold across the two optimization rungs, and they are the contract:
 
