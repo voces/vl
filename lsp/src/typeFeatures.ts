@@ -1575,8 +1575,17 @@ export const importSpecifierForKey = (
   return `${"../".repeat(up === 0 ? 1 : up)}${to.slice(i).join("/")}`;
 };
 
-/** One UFCS candidate the completion pass turns into an item. */
-export type UfcsCandidate = { name: string; detail: string; moduleKey: string };
+/**
+ * One UFCS candidate the completion pass turns into an item. `doc` is the declaring
+ * function's `///` block (D9.11), absent when it carries none — the same text hover
+ * shows for that declaration.
+ */
+export type UfcsCandidate = {
+  name: string;
+  detail: string;
+  moduleKey: string;
+  doc?: string;
+};
 
 /**
  * Completion items for the UFCS methods `candidates` names, each carrying the
@@ -1620,6 +1629,7 @@ export const ufcsCompletions = (
       name: c.name,
       kind: "function",
       detail: c.detail.length > 0 ? c.detail : undefined,
+      doc: c.doc,
       description: local ? undefined : spec,
       ...(edit === undefined ? {} : { extraEdits: [edit] }),
     });

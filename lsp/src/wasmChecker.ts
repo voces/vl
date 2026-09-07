@@ -233,6 +233,12 @@ export type WasmUfcsCandidate = {
   name: string;
   detail: string;
   moduleKey: string;
+  /**
+   * The declaring function's `///` block (D9.11) — the same text `docAt` gives
+   * hover for that declaration. Undefined when it carries none, or when the seed
+   * predates the export, so an old seed degrades to the item it produced before.
+   */
+  doc?: string;
 };
 
 /**
@@ -1456,7 +1462,14 @@ export const createWasmChecker = (
       const detail = detailLen <= 0
         ? ""
         : readString(detailLen, (j) => exp.ufcsScanDetailCharAt(i, j));
-      out.push({ name, detail, moduleKey: keyOf[mod] ?? "" });
+      // The doc pair is younger than the rest of the UFCS ABI, so it is probed per
+      // call rather than folded into `hasUfcsScan`: a seed that speaks the scan but
+      // not docs must still answer with the candidates it does have.
+      const docLen = typeof exp.ufcsScanDocLen === "function" ? exp.ufcsScanDocLen(i) : 0;
+      const doc = docLen <= 0
+        ? undefined
+        : readString(docLen, (j) => exp.ufcsScanDocCharAt(i, j));
+      out.push({ name, detail, moduleKey: keyOf[mod] ?? "", doc });
     }
     return out;
   };
