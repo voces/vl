@@ -986,7 +986,7 @@ rather than §6.5's violated.
 name-shadowing fixtures** — the modules where the two lookups MUST differ; the corpus reports
 **0**. No new module contradicts, so **no row is owed**.
 
-Byte-identical in **3,175 of 3,175** `tests/cases` modules and **7,589 of 7,589** corpus cells;
+Byte-identical in **3,177 of 3,177** `tests/cases` modules and **7,589 of 7,589** corpus cells;
 seed **−327 bytes**.
 
 ---
