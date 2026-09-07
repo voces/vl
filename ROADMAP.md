@@ -93,6 +93,8 @@ units: **hours** · **half-day** · **days**.
 | B7 R4 `utf8Length` | A breaking std removal; also triggers the `std-api-reviewer` gate. |
 | C5 distribution · F5 the name · H5 versioning · H-M2 · J2 runner · J3 port target · D field-level hints · F9 baseline scope | Each already carries its question in its own row. |
 | registry-by-key step 5 | Blocked on D1492's write-seam question. |
+| `dogfood:` fixed-precision float rendering in `std:fmt` | Whether `toFixed(self: f64, digits: i32): string` is the export, a runtime format spec is, or precision belongs in the interpolation hole. `std:fmt` renders a float only at full precision (`toString(100.0 / 3.0)` → `33.333333333333336`), so the `+.1f` holes at `scripts/seed-size.py:85` and `:110` are the only part of that script a VL port cannot reproduce byte for byte — and every later port that prints a percentage, a duration or a ratio meets the same wall. Options, peers and a recommendation for `toFixed`: `open-rulings.md` §D `fmt-fixed-precision`. |
+| `dogfood:` a VL program cannot locate itself or its working directory | Whether `std:env` grows `cwd()` (a host import, so it lands in all three hosts), whether a `mainModule`-style entry path is exposed, or whether "a script runs from the checkout root" becomes the written contract. `programArgs()` documents index 0 as the first USER argument, so argv[0] is unreachable by design, and there is no `cwd` or `__file__` anywhere. `scripts/seed-size.py:40-42` derives every path from `ratchet.ROOT`, which is `os.path.dirname(os.path.dirname(os.path.abspath(__file__)))` at `scripts/ratchet.py:37` — the shape all five ratchets share, and one with no VL spelling. Options, peers and a recommendation for `cwd()`: `open-rulings.md` §D `script-self-location`. |
 
 ---
 
