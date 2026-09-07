@@ -131,8 +131,8 @@ monaco.languages.setMonarchTokensProvider(VL_LANGUAGE_ID, {
   keywords: [
     "as", "await", "break", "const", "continue", "else", "export", "extern",
     "false", "flat", "for", "from", "function", "if", "import", "in", "is",
-    "let", "match", "new", "null", "return", "step", "to", "true", "type",
-    "while",
+    "let", "match", "new", "null", "readonly", "return", "step", "to", "true",
+    "type", "while",
   ],
   tokenizer: {
     root: [
