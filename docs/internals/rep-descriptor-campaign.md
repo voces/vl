@@ -1279,6 +1279,84 @@ sentinel rather than by building a descriptor, which is the cheaper half of this
 
 ---
 
+### 7.9 The poisoned pin table — the owner goes on the ROW, and the defect is real but LATENT
+
+§7.8 found `holePinTys` keyed on the type-variable NAME across the whole program, so two
+generics that both call their variable `T` poison each other's row to `-2`. This is #2629's
+alias-set defect one layer down — a table keyed on a NAME where the question is
+`(name, owner)`.
+
+**Threading the owner was measured and refused.** Neither banking site has the callee:
+`substHoleTy` and `substHoleTyReal` take `(tyIx, bNames, bTys)`, and the checker's only ambient
+is `curFnEscName`, which at a call is the CALLER. Threading one in reaches **210 functions**,
+and the boundary is at 25:
+
+| level | n | what it is |
+| --- | --- | --- |
+| 0 | 2 | `substHoleTy`, `substHoleTyReal` |
+| 1 | 3 | `substTyDeep`, `holeMemberDeadAt`, `bankCoalHoles` |
+| 2 | 20 | the `validate*Cstrs` family, `argPinRecheck`, `ufcsCallTy` |
+| 3 | 7 | **`assignableGo`, `checkNodeReal`** and four call-check nodes |
+| 4+ | 178 | everything, because level 3 reaches `assignable` and `checkNode` |
+
+Eighteen of the 210 already carry one (`binCstrsHold` and `bankCoalHoles` take `calleeFn`, the
+`monoInfer*` family takes `declIx`), so a partial route exists along the CONSTRAINT path and
+stops dead on the `substTyDeep`/`assignable` path — the one the pin actually travels. A callee
+argument on `assignable` is not a change this campaign should make.
+
+**So the owner goes on the ROW**, where both sides already have what they need: `tyVarOwner`
+is filled at the four `mkTyVar` sites, and `pinnedHoleTyOf(tyIx)` reads it off the row it is
+already holding. The key is `holePinKey(owner, tvName)`, shaped exactly like `holeWriteKey`'s
+`"!w!" + fnName + "!" + tvName`, whose own comment states this defect verbatim for the
+array-write demand table — **the compiler solved this once already and the pin table never got
+the treatment.** So does `paramHoleName`: an un-annotated parameter's hole is named
+`"?" + fnName + "." + i`, owner-qualified by construction, which is why only the DECLARED type
+parameter was ever exposed.
+
+**Keying on `tyIx` alone is refuted, so nobody re-proposes it.** `addTy` does not intern, so
+each `mkTyVar("T")` mints a distinct row — which looks like a free fix. It is not:
+`tpEnvTys.push(mkTyVar(typarams[i]))` is pushed and popped per ANNOTATION RESOLUTION, so one
+function's `T` holds several rows and a `tyIx` key would fragment a true conflict into rows
+that never see each other, losing a real poisoning.
+
+**The census, instrumented and graded against two controls** (one function's `T` pinned twice
+must read TRUE; two functions' `T` must read FALSE) — the controls were run first, and the
+first instrument put every event in `unknown`, because `curFnEscName` is empty at the mint:
+
+| population | false BEFORE | false AFTER | files with a false poisoning |
+| --- | --- | --- | --- |
+| `tests/cases` | 9,192 events | **0** | 102 -> **0** |
+| distilled corpus | 11,994 events | **0** | 76 -> **0** |
+
+**21,186 false poisonings over 178 files, and after the re-key there are none.** The TRUE
+count is not comparable across the two runs and should not be read as a regression: the
+counter records an event per pin on an already-poisoned row, and per-owner rows change which
+rows poison at all, so the number rises while the behaviour does not.
+
+**And the defect is LATENT — that is the honest headline.** `compile(master, candidate)` is
+byte-identical in **3,186 of 3,186** `tests/cases` modules and **7,589 of 7,589** corpus cells.
+Removing 21,186 false poisonings changes not one emitted byte, so **no reader trusts a false
+poisoning in a way that changes output today**. That is the same test D1835 applied and passed:
+its probe read POISONED at all 14 clamps and its fix needed the pin at none of them. **A
+witness was attempted in each reader's own shape and neither moves** — a literal union reaching
+`pinnedHoleTyOf` through a hole parameter (D1412) and one reaching it through the ELEMENT pin of
+a container built in a generic body (D1725), each poisoned by a second generic also naming its
+variable `T`; both print the same thing on both compilers. The reason is structural: a false
+poisoning makes the pin answer "no answer", which every reader already handles by falling back,
+so it can cost a resolution but cannot produce a wrong one. The row is
+worth closing because it is a standing clause-1 risk in a table three emitter classifiers read,
+not because a program is wrong today.
+
+**One consequence to record: nothing gates this.** A change re-keying the table back onto the
+bare name would be byte-identical too, so `pin-owner-per-function.vl` pins that the spellings
+RUN and cannot detect the key regressing. The census script is the instrument, and it is not
+a gate row.
+
+**D1836 is untouched by this.** The un-annotated face of D1835 refuses in the monomorphizer's
+argument reader, before any pin is consulted, so the re-key does not reach it.
+
+---
+
 ## 8. Two design simplifications the campaign should be ruled on
 
 Both are filed in `docs/internals/open-rulings.md` §D with options, peers and a
