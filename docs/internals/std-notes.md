@@ -62,6 +62,36 @@ Each now says so, in the shape the `concat`-vs-`+` bullet uses.
 
 ## `std:array`
 
+- **`extend`'s `other` is `readonly T[]`, and NOT for the reason it looks like.** The
+  obvious reading — that the read-only view is what lets a narrower list be read as a wider
+  one — is wrong, and the control refutes it: the same function with `other: T[]` accepts
+  the covariant source too, and refuses a read-only ARGUMENT with the same words. Every
+  call-site row is identical between the two spellings. What `readonly` actually buys is
+  one row, the body: a write through a mutable `other` at a generic pin is `vl check`-clean
+  and the write is SILENTLY LOST (D1799), while the read-only spelling refuses it by name.
+  The word is load-bearing against D1799, not against invariance — do not drop it as
+  redundant when D1798 closes.
+
+- **`extend` cannot pass its own `readonly` parameter on, so `concat` still hand-rolls the
+  loop.** `concat`'s `other` was widened to `readonly T[]` with `extend`'s, so the twins
+  agree, and its body SHOULD read `out.extend(self); out.extend(other)` — the module being
+  its own first consumer, and two of the tree's bulk-append loops gone. It cannot:
+  `argument 1: expected T[], got readonly T[]`, because substituting `T` into `readonly T[]`
+  drops the flag (D1798). The DRY rewrite is a one-line follow-up the day that row closes.
+
+- **Why `extend` and not `pushAll` or `appendAll`.** `pushAll` promises the arity semantics
+  of the core `push`, which is arity-1 and has no variadic form; `appendAll` is what
+  ROADMAP §H4.6 called the hand-written workaround, so it names the thing being replaced.
+  `extend` is in-place in every language that has it, and JS — the source of the `reverse`
+  naming debt below — has no `extend` at all, so no reader arrives expecting a copy.
+  Where a `u8[]` bulk append would live is not settled here: `std:bytes` reads bytes and
+  does not write them, so its header would have to change first.
+
+- **`other` joins the per-position surface below.** A read-only source position now exists
+  and inherits that list exactly: it runs at `i32`, `i64`, `f64`, `boolean`, `string`, a
+  nested list, a struct union and a map element, and an anonymous un-named object shape is
+  the same loud emit reject `concat` already gives it, not a new carve-out.
+
 - **`sorted`'s body is `sort`'s, copied, and that is a compiler limitation.** It should
   read `const out = …copy…; sort(out, less); return out` and cannot: a GENERIC function
   cannot pass its own generic-typed function parameter to another generic function. The

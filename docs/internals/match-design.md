@@ -232,12 +232,16 @@ BINDING token and the field read at the FIELD token, so one token written means 
 shared. Without that, `{x: x}` and `{x}` are indistinguishable after parsing and the formatter
 would rewrite the first into the second — a token deletion, which is the `vl fmt` defect family.
 
-**Two refusals the richer forms add.** A NESTED TYPE PATTERN (`{inner: Circle{r}}`) is refused by
+**Two refusals the richer forms add — both DECLINED as surface, not deferred.** A NESTED TYPE PATTERN (`{inner: Circle{r}}`) is refused by
 name: a clause reads a field, and a type before the brace would TEST it, so the arm would stop
 covering its own variant and exhaustiveness — the point of the whole construct — would need a rule
 nothing has ruled. An EMPTY nested clause (`{p: {}}`) is refused too: `Move{}` is legal because it
 says "this variant, no bindings", but `p: {}` reads a field, binds nothing, and leaves the
 formatter no declaration to print it back from, so the next `vl fmt` would silently delete it.
+Neither is a deferral. Each was already refused before this landing, by the generic "must be a
+field name"; what was added is a sentence. Reopening the first needs an exhaustiveness rule for
+an arm that no longer covers its variant, and the second a column to print an empty group back
+from — a decision each, not a branch.
 
 Both forms land in the arm's PRELUDE, so both work in value position (below) with no extra slice —
 nested destructuring especially, since it is the form that puts the most `const`s in one arm.
