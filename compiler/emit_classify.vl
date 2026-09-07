@@ -83,6 +83,10 @@ import {
   isValueUnionName,
   isValueUnionTyOr,
   isVarTyIxOf,
+  joinHeadOf,
+  joinRowName,
+  joinRowNext,
+  joinRowTy,
   letNullHoleUnfilled,
   litUnionAliasNameOfTy,
   nameIsEmitterIntrinsic,
@@ -13479,6 +13483,15 @@ export function restoreNarrow(n: i32) {
 // `return` does and are how a loop-body guard is spelled, so both are checked here too.
 export function pushPostGuardNarrow(stmtIx: i32, fnIx: i32) {
   const s = P.nodes[stmtIx]
+  // The arm JOIN first: it describes the code below this `if` however the residual turns out,
+  // and the checker typed those reads with it, so the rep has to follow (D1846).
+  let jr = joinHeadOf(stmtIx)
+  while jr >= 0 {
+    const jn = joinRowName(jr)
+    retireNarrowFor(jn)
+    pushNarrowWriteReNarrow(jn, joinRowTy(jr), unionNameOfIdent(jn, fnIx))
+    jr = joinRowNext(jr)
+  }
   // An arm that wrote a different member into a name the residual describes falsifies it,
   // and the checker dropped it there — push nothing, or the reads after the chain lower at
   // an arm the value left (D1736).
@@ -27905,12 +27918,30 @@ export function msKeepTy(s: i32, ty: i32): i32 {
   let i = 0
   while i < n {
     if msBitSet(mask, i) {
-      if !tySame(unMemTys[st + i], ty) { mask = mask - (1 << i) }
+      if !msTyCovers(ty, unMemTys[st + i]) { mask = mask - (1 << i) }
     }
     i = i + 1
   }
   if mask == 0 { return -1 }
   msSetIntern(u, mask)
+}
+
+// Does `ty` cover member type `m`? A single type covers itself; a UNION covers each of its own
+// members, which is the shape an arm join hands back (`i32 | string` out of a three-arm
+// declaration). The set keeps the declared row and narrows only its mask, so box tags stay
+// positional whatever the join's own arena row looks like (D1846).
+function msTyCovers(ty: i32, m: i32): boolean {
+  if tySame(ty, m) { return true }
+  if ty < 0 || ty >= T.tys.length { return false }
+  const t = T.tys[ty]
+  if t is TyUnion {
+    let i = 0
+    while i < t.uMembers.length {
+      if tySame(t.uMembers[i], m) { return true }
+      i = i + 1
+    }
+  }
+  false
 }
 
 // SUBTRACTION of a named member: clear every member whose interned IDENTITY is the

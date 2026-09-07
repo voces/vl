@@ -978,6 +978,15 @@ let narFnEpoch = 0
 // different member falsifies exactly that claim — which under the reads-only rule no type
 // check on the write itself can catch (D1736).
 let narClobKeys: string[] = []
+// What each clobbering write left the name at, the type it held just before, and the scope depth
+// it ran at. `checkIfStmtNode` folds them per arm and joins: a write at the arm's OWN depth runs
+// whenever the arm does and decides alone, a deeper one is conditional (D1846).
+let narClobTys: i32[] = []
+let narClobPrev: i32[] = []
+let narClobDepths: i32[] = []
+// Whether the write RETIRED the narrowing, as against writing a member it already allowed. Only
+// a retiring write can falsify a post-guard residual; the arm join reads every row (D1846).
+let narClobRetired: i32[] = []
 let asgDeclKeys: string[] = []
 let asgDeclTys: i32[] = []
 let asgDeclDepths: i32[] = []
@@ -1022,7 +1031,129 @@ function asgDeclaredTy(name: string) { narDeclaredTy(name, NAR_KIND_ASG) }
 function narClobberedSince(mark: i32, name: string) {
   let i = mark
   while i < narClobKeys.length {
+    if narClobKeys[i] == name {
+      if narClobRetired[i] == 1 { return true }
+    }
+    i = i + 1
+  }
+  false
+}
+
+// The type `name` held on entry to the `if` whose rows start at `mark`: the FIRST write's own
+// before-type, which no earlier write in this subtree has touched. -1 when the subtree wrote it
+// only through a path key, which carries no such type (D1846).
+function narClobEntryTy(mark: i32, name: string) {
+  let i = mark
+  while i < narClobKeys.length {
+    if narClobKeys[i] == name { return narClobPrev[i] }
+    i = i + 1
+  }
+  -1
+}
+
+// The type `name` holds when the arm whose rows are [lo, hi) ends. A write at the arm's own
+// statement depth runs whenever the arm does and replaces what came before; a deeper one is
+// conditional, so the arm may leave either and the two join (D1846).
+function narArmEndTy(
+  lo: i32,
+  hi: i32,
+  name: string,
+  ownDepth: i32,
+  entryTy: i32,
+) {
+  let cur = entryTy
+  let i = lo
+  while i < hi {
+    if narClobKeys[i] == name {
+      if narClobDepths[i] == ownDepth {
+        cur = narClobTys[i]
+      } else {
+        cur = joinTys(cur, narClobTys[i])
+      }
+    }
+    i = i + 1
+  }
+  cur
+}
+
+// Is `name` already joined by a row in [lo, hi)? The join walks the ledger, which holds one row
+// per WRITE, so a name written twice would otherwise be joined twice.
+function narJoinSeen(lo: i32, hi: i32, name: string) {
+  let i = lo
+  while i < hi {
     if narClobKeys[i] == name { return true }
+    i = i + 1
+  }
+  false
+}
+
+// Join the narrowing column across an `if`'s arms and install it for the code below. For each
+// bare name an arm wrote, the surviving arms' end types join: a diverging arm contributes
+// nothing, an absent else contributes this `if`'s own entry type. Written in place at the
+// name's own depth, exactly as the retirement it refines (D1846).
+function applyArmJoins(
+  ix: i32,
+  clobMark: i32,
+  thenLo: i32,
+  thenHi: i32,
+  thenOwnDepth: i32,
+  elseLo: i32,
+  elseHi: i32,
+  elseOwnDepth: i32,
+  thenDiverges: boolean,
+  elseDiverges: boolean,
+  hasElse: boolean,
+  tnNames: string[],
+  enNames: string[],
+) {
+  // Both arms diverging leaves no code below to describe.
+  if thenDiverges && elseDiverges { return 0 }
+  let i = clobMark
+  while i < narClobKeys.length {
+    const nm = narClobKeys[i]
+    // One join per name, and never for a path — a path's fact is an overlay entry the arm's
+    // scope already popped, and joining it would need the overlay's own fork/join.
+    if !isPathKey(nm) && !narJoinSeen(clobMark, i, nm) {
+      // A name THIS `if`'s condition narrows enters its two arms at two different types, and
+      // the join of that partition is the type it already had — nothing to install.
+      if !nameInList(tnNames, nm) && !nameInList(enNames, nm) {
+        const entryTy = narClobEntryTy(clobMark, nm)
+        if entryTy >= 0 {
+          let jt = -1
+          if thenDiverges {
+            jt = narArmEndTy(elseLo, elseHi, nm, elseOwnDepth, entryTy)
+          } else if elseDiverges {
+            jt = narArmEndTy(thenLo, thenHi, nm, thenOwnDepth, entryTy)
+          } else {
+            const te = narArmEndTy(thenLo, thenHi, nm, thenOwnDepth, entryTy)
+            // No else arm is still a PATH through the `if`, and it wrote nothing.
+            let ee = entryTy
+            if hasElse {
+              ee = narArmEndTy(elseLo, elseHi, nm, elseOwnDepth, entryTy)
+            }
+            // The ELSE side first, so a one-armed join renders in the declaration's own order
+            // (`i64 | boolean`, not `boolean | i64`) — the diagnostic below reads it.
+            jt = joinTys(ee, te)
+          }
+          const cur = lookup(nm)
+          if jt >= 0 && cur >= 0 && jt != cur {
+            const d = lookupDepth(nm)
+            if d >= 0 { T.scopes[d][nm] = jt }
+            recordArmJoin(ix, nm, jt)
+          }
+        }
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// Does `names` hold `name`? The join asks it of the condition's own narrowing lists.
+function nameInList(names: string[], name: string) {
+  let i = 0
+  while i < names.length {
+    if names[i] == name { return true }
     i = i + 1
   }
   false
@@ -2620,6 +2751,13 @@ let asgNarTyIx: i32[] = []
 // D1736 — the post-guard residual's veto, keyed by the `if` node: 1 when an arm wrote a
 // different member into a name the residual would describe, so neither half installs it.
 let pgVoid: i32[] = []
+// D1846 — the arm JOIN, keyed by the `if` node: the type each bare name reads at below the `if`
+// when its arms wrote it. A node-sized head index into three small columns, so a node with no
+// join costs one `-1` and the emitter's lookup is a chain walk rather than a table scan.
+let joinHead: i32[] = []
+let joinName: string[] = []
+let joinTy: i32[] = []
+let joinNext: i32[] = []
 // Context-resolved type sidecar, parallel to `nodeTyIx`: at the arena-pure adoption sites it
 // records the destination type a literal node widened into, which is the rep the emitter builds.
 // `nodeTyIx` keeps the checker's self-inferred type for its existing consumers; the emitter's rep
@@ -3497,6 +3635,10 @@ export function initChecker() {
   isVarTyIx = []
   asgNarTyIx = []
   pgVoid = []
+  joinHead = []
+  joinName = []
+  joinTy = []
+  joinNext = []
   isParentTyIx = []
   isParentElseTyIx = []
   nodeRepTyIx = []
@@ -3610,6 +3752,10 @@ export function initChecker() {
   tyToStrDepth = 0
   asgDeclKeys = []
   narClobKeys = []
+  narClobTys = []
+  narClobPrev = []
+  narClobDepths = []
+  narClobRetired = []
   asgDeclTys = []
   asgDeclDepths = []
   asgDeclKinds = []
@@ -4826,14 +4972,23 @@ function retireNarrowingsForWrite(tgtIx: i32, rt: i32, atIx: i32) {
     npTys.push(pathReTy)
     npInvBy.push(-1)
     npEpochs.push(narFnEpoch)
+    // A path key rides the same ledger so a post-guard residual over it is dropped too; the
+    // arm JOIN reads bare names only, and `isPathKey` is what tells the two apart (D1846).
     narClobKeys.push(tgtKey)
+    narClobTys.push(pathReTy)
+    narClobPrev.push(-1)
+    narClobDepths.push(T.scopes.length)
+    narClobRetired.push(1)
   }
   const tn = P.nodes[tgtIx]
   if tn is Ident {
     const nm = tn.identName
     const dcl = narDeclaredTy(nm, -1)
     if dcl >= 0 {
-      if writeRetiresNarrowing(nm, rt, nm, lookup(nm)) {
+      const pre = lookup(nm)
+      const rn = writeReNarrowTy(dcl, rt)
+      const retires = writeRetiresNarrowing(nm, rt, nm, pre)
+      if retires {
         // The RETIREMENT goes back in place, so it outlives whatever inner block holds the
         // write: a narrowing the write falsified must not resurrect at that block's `}`.
         const d = lookupDepth(nm)
@@ -4842,14 +4997,22 @@ function retireNarrowingsForWrite(tgtIx: i32, rt: i32, atIx: i32) {
         // shadow in the CURRENT block instead, because that is exactly how long the emitter's
         // own push lives (its `restoreNarrow` unwinds at the same `}`). Banked at the
         // assignment node so both halves lower the reads after the write alike (D1736).
-        const rn = writeReNarrowTy(dcl, rt)
         if rn != dcl {
           noteNarShadow(nm, dcl, NAR_KIND_GUARD)
           declare(nm, rn)
         }
         recordAsgNarTyIx(atIx, rn)
-        narClobKeys.push(nm)
       }
+      // Every write joins, retiring or not: an arm that wrote a member the narrowing already
+      // allowed still ENDS at that member, and the first arm's in-place retirement is what
+      // makes the second arm's flip look admitted (D1846).
+      narClobKeys.push(nm)
+      narClobTys.push(rn)
+      narClobPrev.push(pre)
+      narClobDepths.push(T.scopes.length)
+      let rtd = 0
+      if retires { rtd = 1 }
+      narClobRetired.push(rtd)
     }
   }
   0
@@ -24913,6 +25076,10 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
   // apart (`writeStorageTy`).
   narFnEpoch = narFnEpoch + 1
   narClobKeys = []
+  narClobTys = []
+  narClobPrev = []
+  narClobDepths = []
+  narClobRetired = []
   // Check the body in a fresh scope sharing the parameters.
   pushScope(n.fnBody)
   // Paired with the `flushInferRetHoles` below, which must run while this scope is still
@@ -28034,6 +28201,10 @@ export function checkProgram(rootIx: i32) {
   isParentElseTyIx = []
   asgNarTyIx = []
   pgVoid = []
+  joinHead = []
+  joinName = []
+  joinTy = []
+  joinNext = []
   cFuncPinTyIx = -1
   cObjPinTyIx = -1
   nodePinKind = []
@@ -28705,6 +28876,44 @@ function recordPgResidualVoid(ix: i32) {
   if ix < 0 { return 0 }
   while pgVoid.length <= ix { pgVoid.push(0) }
   pgVoid[ix] = 1
+  0
+}
+// The first arm-join row of the `if` at node `ix`, or -1. The emitter walks the chain with
+// `joinRowNext` and pushes each name at `joinRowTy`, so the reads below the `if` lower at the
+// join the checker typed them with (D1846).
+export function joinHeadOf(ix: i32) {
+  if ix >= 0 {
+    if ix < joinHead.length { return joinHead[ix] }
+  }
+  -1
+}
+export function joinRowName(r: i32) {
+  if r >= 0 {
+    if r < joinName.length { return joinName[r] }
+  }
+  ""
+}
+export function joinRowTy(r: i32) {
+  if r >= 0 {
+    if r < joinTy.length { return joinTy[r] }
+  }
+  -1
+}
+export function joinRowNext(r: i32) {
+  if r >= 0 {
+    if r < joinNext.length { return joinNext[r] }
+  }
+  -1
+}
+// Bank one arm-join row, newest first — the order does not matter, since every row names a
+// different binding.
+function recordArmJoin(ix: i32, name: string, ty: i32) {
+  if ix < 0 || ty < 0 { return 0 }
+  while joinHead.length <= ix { joinHead.push(-1) }
+  joinName.push(name)
+  joinTy.push(ty)
+  joinNext.push(joinHead[ix])
+  joinHead[ix] = joinName.length - 1
   0
 }
 // The type the receiver of a member-path `is` test narrows to in the then branch — the
@@ -33519,7 +33728,12 @@ function checkIfStmtNode(n: IfStmt, ix: i32) {
   // alternative — mark the branch so `noteInferredRet` records it as a guarded member.
   const guardedRet = guardRows.length > 0
   if guardedRet { guardAltStack.push(guardRows[guardRows.length - 1]) }
+  // The arm's OWN statement depth: its block pushes one scope, so a write recorded at exactly
+  // this depth runs whenever the arm does and a deeper one is conditional (D1846).
+  const thenOwnDepth = T.scopes.length + 1
+  const thenLo = narClobKeys.length
   checkNode(n.ifThen)
+  const thenHi = narClobKeys.length
   if guardedRet { guardAltStack.pop() }
   retTailPos = false
   const thenTy = blockTailTy
@@ -33552,6 +33766,11 @@ function checkIfStmtNode(n: IfStmt, ix: i32) {
   const daElseAdds: i32[] = []
   const daElseRems: i32[] = []
   let elseTy = TY_VOID
+  // The else arm's own depth and row range, read by the arm join below. An absent else leaves
+  // them at their no-rows defaults, which is what says the fall-through wrote nothing.
+  let elseOwnDepth = -1
+  let elseLo = 0
+  let elseHi = 0
   const daHasElse = n.ifElse >= 0
   if daHasElse {
     daElseDiverges = daBranchDiverges(n.ifElse)
@@ -33566,7 +33785,10 @@ function checkIfStmtNode(n: IfStmt, ix: i32) {
     // `checkIfStmtNode` banks into `pgUpKeys` instead of a scope that is about to be popped.
     if enElse is IfStmt { pgUpArmIx = n.ifElse }
     retTailPos = ifTail
+    elseOwnDepth = T.scopes.length + 1
+    elseLo = narClobKeys.length
     const elseRes = checkNode(n.ifElse)
+    elseHi = narClobKeys.length
     pgUpArmIx = -1
     retTailPos = false
     elseTy = blockTailTy
@@ -33611,6 +33833,24 @@ function checkIfStmtNode(n: IfStmt, ix: i32) {
     daElseDiverges,
     daElseAdds,
     daElseRems,
+  )
+  // The narrowing column's own join, `daJoinArms`'s shape one table over: a name an arm wrote
+  // reads below the `if` at the join of what the surviving arms left it at, not at its
+  // declaration. Banked at this node so the emitter pushes the same member (D1846).
+  applyArmJoins(
+    ix,
+    clobMark,
+    thenLo,
+    thenHi,
+    thenOwnDepth,
+    elseLo,
+    elseHi,
+    elseOwnDepth,
+    daThenDiverges,
+    daElseDiverges,
+    daHasElse,
+    tnNames,
+    enNames,
   )
   // Guard clause: a then that always exits applies the false narrowings to the rest of the
   // block. Subtractions accumulate over a sequence of guards; restricted to bare names only.
