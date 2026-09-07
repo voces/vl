@@ -605,6 +605,64 @@ VALUES = [
                   {"id": "call", "op": "*", "opw": "same",
                    "lines": ["print(mulSw({v}, 2.5))"], "want": ["7.5"]}],
     },
+    {
+        # INIT_vs_ASSIGN x UNION-NARROWING. `i32 | Rec` has a SCALAR arm (a boxed i32) and a
+        # STRUCT arm (a boxed ref) — genuinely different reps. The value is the Rec; `alt` is
+        # the scalar `5`, so the axis's `assign` face is `let v: Mix = 5` then `v = mkval()` —
+        # a reassignment ACROSS the rep boundary. The narrow-and-read then surfaces a wrong
+        # stored rep as a wrong VALUE, not just a wrong type. `mix_same` below reassigns the
+        # SAME arm and is the control that separates a cross-rep defect from an assignment bug.
+        "id": "mix_cross", "weight": 2,
+        "decls": [("Rec", "{ n: i32 }"), ("Mix", "i32 | Rec")],
+        "named": "Mix", "inline": "i32 | { n: i32 }", "expr": None,
+        "mk": ["return { n: 3 }"], "alt": "5",
+        "features": ["union", "struct", "scalar", "xrep_cross"],
+        "reads": [
+            {"id": "is_rec", "narrow": "is", "named_only": True, "xrep": "cross",
+             "lines": ["if {v} is Rec { print({v}.n) } else { print(0) }"],
+             "want": ["3"]},
+            {"id": "match_rec", "narrow": "match", "named_only": True, "xrep": "cross",
+             "lines": ["match {v} {", "  Rec{n} => print(n)", "  i32 => print(0)", "}"],
+             "want": ["3"]},
+        ],
+    },
+    {
+        # The REVERSE crossing: the value is the SCALAR arm and `alt` is the struct, so the
+        # `assign` face seeds a ref (`let v: Mix = { n: 9 }`) and reassigns a scalar. A wrong
+        # stored rep here reads the ref's bits as an integer.
+        "id": "mix_cross_rev", "weight": 2,
+        "decls": [("Rec", "{ n: i32 }"), ("Mix", "i32 | Rec")],
+        "named": "Mix", "inline": "i32 | { n: i32 }", "expr": None,
+        "mk": ["return 5"], "alt": "{ n: 9 }",
+        "features": ["union", "struct", "scalar", "xrep_cross"],
+        "reads": [
+            {"id": "is_i32", "narrow": "is", "xrep": "cross",
+             "lines": ["if {v} is i32 { print({v}) } else { print(0) }"],
+             "want": ["5"]},
+            {"id": "match_i32", "narrow": "match", "named_only": True, "xrep": "cross",
+             "lines": ["match {v} {", "  i32 => print({v})", "  Rec => print(0)", "}"],
+             "want": ["5"]},
+        ],
+    },
+    {
+        # THE SAME-ARM CONTROL: identical `Mix` and reads, but `alt` is another Rec, so the
+        # `assign` face reassigns STRUCT over STRUCT — no rep boundary crossed. A disagreement
+        # this record shares is a plain assignment/narrowing bug, not a cross-rep one, which is
+        # what makes a hit on the two records above readable.
+        "id": "mix_same", "weight": 2,
+        "decls": [("Rec", "{ n: i32 }"), ("Mix", "i32 | Rec")],
+        "named": "Mix", "inline": "i32 | { n: i32 }", "expr": None,
+        "mk": ["return { n: 3 }"], "alt": "{ n: 9 }",
+        "features": ["union", "struct", "scalar", "xrep_same"],
+        "reads": [
+            {"id": "is_rec", "narrow": "is", "named_only": True, "xrep": "same",
+             "lines": ["if {v} is Rec { print({v}.n) } else { print(0) }"],
+             "want": ["3"]},
+            {"id": "match_rec", "narrow": "match", "named_only": True, "xrep": "same",
+             "lines": ["match {v} {", "  Rec{n} => print(n)", "  i32 => print(0)", "}"],
+             "want": ["3"]},
+        ],
+    },
 ]
 
 # ---------------------------------------------------------------------------
