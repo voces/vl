@@ -743,9 +743,10 @@ const lintRankUncondRecursion = 3
 const lintRankHasGuardReread = 4
 const lintRankUnionLetNoMelt = 5
 const lintRankUnusedPureExpr = 6
-const lintRankCount = 7
+const lintRankDivZero = 7
+const lintRankCount = 8
 
-// Offer `ix` to all seven structural rules, in rank order. Each visitor opens with its
+// Offer `ix` to all eight structural rules, in rank order. Each visitor opens with its
 // own `is` test, so this is a flat unconditional sequence: there is no rule id to
 // dispatch on and no chain a new rule could be inserted into in the wrong place.
 function lintVisitAll(ix: i32) {
@@ -756,6 +757,7 @@ function lintVisitAll(ix: i32) {
   hasGuardRereadVisit(ix)
   unionLetNoMeltVisit(ix)
   unusedPureExprVisit(ix)
+  divideByZeroVisit(ix)
   0
 }
 
@@ -774,9 +776,9 @@ function lintWalk(ix: i32) {
   0
 }
 
-// The tie-break rank of a walk-rule diagnostic, read off its code — each of the seven
+// The tie-break rank of a walk-rule diagnostic, read off its code — each of the eight
 // codes is emitted by exactly one visitor, so the code is the whole key. A code with no
-// rank sorts after all seven rather than being dropped; only the seven reach here,
+// rank sorts after all eight rather than being dropped; only the eight reach here,
 // since `lintRegroupWalkPhase` reads just the slice the walk appended.
 function lintRankOfCode(code: string) {
   if code == "unreachable-code" { return lintRankUnreachable }
@@ -786,6 +788,7 @@ function lintRankOfCode(code: string) {
   if code == "map-has-guard-reread" { return lintRankHasGuardReread }
   if code == "union-let-no-melt" { return lintRankUnionLetNoMelt }
   if code == "unused-pure-expression" { return lintRankUnusedPureExpr }
+  if code == "divide-by-zero" { return lintRankDivZero }
   lintRankCount
 }
 
@@ -923,6 +926,68 @@ function reportDegenerateStep(node: ForRange) {
     }
   }
   0
+}
+
+// ── 4b. integer division or remainder by a literal zero ─────────────────────
+
+// `x / 0` and `x % 0` are `vl check`-clean and TRAP at run time. The program is legal and
+// the trap is the language's own defined behaviour, so this is a `warning` — the tier
+// every rule here but one uses; `for-step-zero` is the single `error` because a `step 0`
+// loop is degenerate outright rather than a program that runs up to the division.
+function divideByZeroVisit(ix: i32) {
+  const e = P.nodes[ix]
+  if e is BinExpr {
+    if e.binOp == "/" || e.binOp == "%" { reportDivideByZero(e) }
+  }
+  0
+}
+
+// A FLOAT zero is deliberately not a finding: `x / 0.0` is `inf` by IEEE-754, a value a
+// program may want, and `0.0 / 0.0` is `nan` — neither traps. The divisor's LEXEME is the
+// whole test, so `1 - 1` and a `const z = 0` are not reached: this pass reads no expression
+// it did not lex, exactly as `reportDegenerateStep` does (D1588).
+function reportDivideByZero(node: BinExpr) {
+  const rhs = node.binRight
+  if rhs < 0 || rhs >= P.nodes.length { return 0 }
+  const rn = P.nodes[rhs]
+  if rn is NumLit {
+    if lintNumLexIsIntZero(rn.numText) {
+      lintEmit(
+        "divide-by-zero",
+        "`" +
+          node.binOp +
+          " 0` traps at run time — integer division by zero is a trap, not a value",
+        "warning",
+        rhs,
+      )
+    }
+  }
+  0
+}
+
+// Whether the numeric lexeme `t` is an INTEGER zero, at every spelling the lexer accepts:
+// `0`, `00`, `0x0`, `0b0`, `0o0` and any `_` separators. A `.`, an exponent or an `f`/`d`
+// suffix makes it a float, which does not trap and is not this rule's business.
+function lintNumLexIsIntZero(t: string) {
+  if t.length == 0 { return false }
+  let i = 0
+  // A radix prefix (`0x` / `0b` / `0o`, either case) is skipped whole; the digits decide.
+  if t.length > 2 {
+    if t[0] == '0' {
+      const c = t[1]
+      if c == 'x' || c == 'X' || c == 'b' || c == 'B' || c == 'o' || c == 'O' {
+        i = 2
+      }
+    }
+  }
+  let sawDigit = false
+  while i < t.length {
+    const ch = t[i]
+    if ch == '0' { sawDigit = true }
+    else if ch != '_' { return false }
+    i = i + 1
+  }
+  sawDigit
 }
 
 // ── 5. unreachable code ──────────────────────────────────────────────────────
