@@ -54,6 +54,8 @@ if x is i64 {
 With only ONE arm writing, the other path still holds what the guard proved, and the join says
 so: `if c { x = true }` alone leaves `x` at `i64 | boolean` below, and a read that demands one
 member is refused. A diverging arm contributes no path, so the surviving arm's own type stands.
+A PROPERTY PATH joins the same way — and a CALL in either arm that can reach the place leaves it
+unknown, so the join declines rather than handing the fact back.
 
 ## What narrows
 

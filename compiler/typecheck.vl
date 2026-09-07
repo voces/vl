@@ -1039,6 +1039,19 @@ function narClobberedSince(mark: i32, name: string) {
   false
 }
 
+// Did a CALL invalidate `name`'s narrowing in [lo, hi)? The arm join declines a path either arm
+// left unknown, since a merged entry would resurrect the fact the call took away (D1849).
+function narCallInvalidatedIn(lo: i32, hi: i32, name: string) {
+  let i = lo
+  while i < hi {
+    if narClobKeys[i] == name {
+      if narClobRetired[i] == 2 { return true }
+    }
+    i = i + 1
+  }
+  false
+}
+
 // The type `name` held on entry to the `if` whose rows start at `mark`: the FIRST write's own
 // before-type, which no earlier write in this subtree has touched. -1 when the subtree wrote it
 // only through a path key, which carries no such type (D1846).
@@ -1111,14 +1124,21 @@ function applyArmJoins(
   let i = clobMark
   while i < narClobKeys.length {
     const nm = narClobKeys[i]
-    // One join per name, and never for a path — a path's fact is an overlay entry the arm's
-    // scope already popped, and joining it would need the overlay's own fork/join.
-    if !isPathKey(nm) && !narJoinSeen(clobMark, i, nm) {
+    // One join per key, and a path only when neither arm left it UNKNOWN: a call that can write
+    // the place takes the fact away, and a merged entry would hand it back (D1849).
+    if !narJoinSeen(clobMark, i, nm) {
       // A name THIS `if`'s condition narrows enters its two arms at two different types, and
       // the join of that partition is the type it already had — nothing to install.
       if !nameInList(tnNames, nm) && !nameInList(enNames, nm) {
+        const path = isPathKey(nm)
+        let ok = true
+        if path {
+          if narCallInvalidatedIn(clobMark, narClobKeys.length, nm) {
+            ok = false
+          }
+        }
         const entryTy = narClobEntryTy(clobMark, nm)
-        if entryTy >= 0 {
+        if ok && entryTy >= 0 {
           let jt = -1
           if thenDiverges {
             jt = narArmEndTy(elseLo, elseHi, nm, elseOwnDepth, entryTy)
@@ -1135,11 +1155,24 @@ function applyArmJoins(
             // (`i64 | boolean`, not `boolean | i64`) — the diagnostic below reads it.
             jt = joinTys(ee, te)
           }
-          const cur = lookup(nm)
-          if jt >= 0 && cur >= 0 && jt != cur {
-            const d = lookupDepth(nm)
-            if d >= 0 { T.scopes[d][nm] = jt }
-            recordArmJoin(ix, nm, jt)
+          if path {
+            // A path installs into the OVERLAY: it has no shadowing `declare` to write through,
+            // and the entry pops with the block the code below the `if` lives in — the same
+            // lifetime the emitter's own push has.
+            if jt >= 0 && jt != entryTy {
+              npKeys.push(nm)
+              npTys.push(jt)
+              npInvBy.push(-1)
+              npEpochs.push(narFnEpoch)
+              recordArmJoin(ix, nm, jt)
+            }
+          } else {
+            const cur = lookup(nm)
+            if jt >= 0 && cur >= 0 && jt != cur {
+              const d = lookupDepth(nm)
+              if d >= 0 { T.scopes[d][nm] = jt }
+              recordArmJoin(ix, nm, jt)
+            }
           }
         }
       }
@@ -4943,10 +4976,23 @@ function retireNarrowingsForWrite(tgtIx: i32, rt: i32, atIx: i32) {
     }
     return 0
   }
+  // The path's own live fact before this write: the arm JOIN's entry type, and the tell that a
+  // narrowing covers the place at all (D1849).
+  const preSlot = narrowedPathIx(tgtKey)
+  let prePathTy = -1
+  if preSlot >= 0 {
+    // An entry a WRITE retired still seeds the ledger — that write belongs to the OTHER arm,
+    // and this arm's own end type is what it is about to store. Only a CALL's retirement stops
+    // the fold, because it is the one that leaves the place unknown (D1849).
+    if npInvBy[preSlot] < 0 || pathRetiredByAssign(npInvBy[preSlot]) {
+      prePathTy = npTys[preSlot]
+    }
+  }
   let i = 0
   // The member the write re-narrows `tgtKey` to, or -1 when it names none. Pushed after the
   // walk below rather than inside it: a fresh entry would be re-tested by the same loop.
   let pathReTy = -1
+  let pathRetired = false
   while i < npKeys.length {
     // The write's attribution wins over a call's, and the overwrite is what makes the read below
     // legible: `w.f = mk()` is one statement whose right-hand side is checked first, so an opaque
@@ -4959,6 +5005,7 @@ function retireNarrowingsForWrite(tgtIx: i32, rt: i32, atIx: i32) {
       // rule for every receiver, so the path re-narrows to the written member exactly as a bare
       // name does, and reads at its declaration when the write names none (D1736, D1847).
       if npKeys[i] == tgtKey {
+        pathRetired = true
         const pdcl = writeStorageTy(tgtIx)
         const prn = writeReNarrowTy(pdcl, rt)
         recordAsgNarTyIx(atIx, prn)
@@ -4972,13 +5019,27 @@ function retireNarrowingsForWrite(tgtIx: i32, rt: i32, atIx: i32) {
     npTys.push(pathReTy)
     npInvBy.push(-1)
     npEpochs.push(narFnEpoch)
-    // A path key rides the same ledger so a post-guard residual over it is dropped too; the
-    // arm JOIN reads bare names only, and `isPathKey` is what tells the two apart (D1846).
+  }
+  // Every write over a narrowed path joins, retiring or not — the first arm's retirement is
+  // what makes the second arm's flip look admitted, exactly as for a bare name. The row also
+  // carries the post-guard residual's veto, which reads the retiring ones (D1846, D1849).
+  if prePathTy >= 0 {
+    let endTy = pathReTy
+    if endTy < 0 {
+      if pathRetired {
+        endTy = writeStorageTy(tgtIx)
+      } else {
+        endTy = writeReNarrowTy(prePathTy, rt)
+      }
+    }
+    if endTy < 0 { endTy = prePathTy }
     narClobKeys.push(tgtKey)
-    narClobTys.push(pathReTy)
-    narClobPrev.push(-1)
+    narClobTys.push(endTy)
+    narClobPrev.push(prePathTy)
     narClobDepths.push(T.scopes.length)
-    narClobRetired.push(1)
+    let prtd = 0
+    if pathRetired { prtd = 1 }
+    narClobRetired.push(prtd)
   }
   const tn = P.nodes[tgtIx]
   if tn is Ident {
@@ -5051,8 +5112,16 @@ function noteCallInvalidations(callIx: i32) {
   if npKeys.length == 0 { return 0 }
   let i = 0
   while i < npKeys.length {
-    if npInvBy[i] < 0 {
-      if callInvalidatesNarrowedPath(callIx, npKeys[i]) { npInvBy[i] = callIx }
+    if callInvalidatesNarrowedPath(callIx, npKeys[i]) {
+      // The mark is first-cause-wins — a write's attribution outranks a call's, which is what
+      // the diagnostic reads. The LEDGER row is unconditional, because the arm JOIN reads the
+      // two arms separately and a write in one must not hide a call in the other (D1849).
+      if npInvBy[i] < 0 { npInvBy[i] = callIx }
+      narClobKeys.push(npKeys[i])
+      narClobTys.push(-1)
+      narClobPrev.push(-1)
+      narClobDepths.push(T.scopes.length)
+      narClobRetired.push(2)
     }
     i = i + 1
   }
