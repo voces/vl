@@ -1,0 +1,102 @@
+// `std:process` — running another program, and ending this one.
+//
+//     import { runProgram, exit, ProcessOutput, IoError } from "std:process"
+//
+// `runProgram` is SYNCHRONOUS: it waits for the program to finish and hands back both
+// captured streams whole. There is NO SHELL, so nothing expands a glob or splits on a
+// space, and the child gets no stdin. A non-zero exit is an ANSWER, not an error — only
+// a program that could not be started at all is. Output is bytes; text is a decoding on
+// top, as it is for a file. No pipelines, no background processes, no stdin, no working
+// directory or environment overrides, and nothing writes a variable.
+
+import { EINVAL, IoError, errnoName } from "std:fs"
+import { encodeUtf8 } from "std:utf8"
+import { toString } from "std:fmt"
+
+// Re-exported so a caller can spell `runProgram`'s error arm and branch on the codes this
+// module answers with, without a second import. They are `std:fs`'s own names rather than
+// copies, so one `IoError` vocabulary covers every module that answers with one.
+export { EACCES, EINVAL, ENOENT, EPERM, IoError, errnoName } from "std:fs"
+
+// What a finished program left behind. `code` is its own exit status — 0 by
+// convention means success, and `128 + N` reports the signal N that killed it — and
+// the two streams are everything it wrote, captured whole rather than streamed.
+export type ProcessOutput = { code: i32, stdout: u8[], stderr: u8[] }
+
+// The errno the last floor call recorded, as a positive number; 0 when it did not fail.
+function lastErrno(): i32 {
+  const e = __fs_errno__()
+  if e < 0 { return 0 - e }
+  e
+}
+
+// Whether `s` carries a 0 byte. That is the byte separating the fields of the block the
+// floor takes, so a value holding one would arrive as two.
+function hasNul(s: string): boolean {
+  for cp in s {
+    if cp == 0 { return true }
+  }
+  false
+}
+
+// Append every byte of `src` to `dst`, which is grown in place.
+function pushBytes(dst: u8[], src: u8[]) {
+  let i = 0
+  while i < src.length {
+    dst.push(src[i])
+    i = i + 1
+  }
+}
+
+// The command and its arguments as one block with a 0x00 between each. Every field is
+// checked for that byte first, so an empty argument survives the round trip and nothing
+// needs escaping.
+function argvBlock(cmd: string, args: readonly string[]): u8[] {
+  const out: u8[] = []
+  pushBytes(out, encodeUtf8(cmd))
+  let i = 0
+  while i < args.length {
+    out.push(0)
+    pushBytes(out, encodeUtf8(args[i]))
+    i = i + 1
+  }
+  out
+}
+
+// The one message for a value that cannot cross the argument block intact.
+function nulMsg(what: string): IoError {
+  { code: EINVAL, msg: "process.runProgram: " + what + " contains a NUL byte" }
+}
+
+// Run `cmd` with `args`, wait for it, and answer what it left behind. `cmd` is looked up
+// the way the operating system looks up a program name and `args` are passed one by one,
+// never through a shell; an empty `cmd`, or a NUL byte anywhere in either, is `EINVAL`.
+// An `IoError` means the program never ran; one that ran and failed answers its `code`.
+export function runProgram(
+  cmd: string,
+  args: readonly string[],
+): ProcessOutput | IoError {
+  if cmd.length == 0 {
+    return { code: EINVAL, msg: "process.runProgram: the command is empty" }
+  }
+  if hasNul(cmd) { return nulMsg("the command") }
+  let i = 0
+  while i < args.length {
+    if hasNul(args[i]) { return nulMsg("argument " + toString(i)) }
+    i = i + 1
+  }
+  const code = __proc_run__(argvBlock(cmd, args))
+  // The errno decides, not the sign of `code`: an exit status is the child's own
+  // number and a platform is free to make it negative.
+  const e = lastErrno()
+  if e != 0 {
+    return { code: e, msg: "process.runProgram " + cmd + ": " + errnoName(e) }
+  }
+  { code: code, stdout: __proc_out__(), stderr: __proc_err__() }
+}
+
+// End this program immediately with `code`, which is what started it will see; 0
+// conventionally means success. NEVER RETURNS — nothing after the call runs and no
+// cleanup of any kind happens, though anything already printed is flushed first. A
+// caller inside a function must still produce that function's own result.
+export function exit(code: i32) { __proc_exit__(code) }

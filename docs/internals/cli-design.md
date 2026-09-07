@@ -648,6 +648,58 @@ rather than an optimization level, and the level itself is measurably not the
 lever. What it buys, what each flag is worth, and the two scratch shapes that do
 NOT melt: `docs/internals/opt-profile-design.md`.
 
+## The process floor (`std:process`, `std:env`)
+
+Beneath `std:process` and `std:env` sit five host imports, appended to the same slot
+table `std:fs` and `std:args` use (`compiler/typecheck.vl`, `fsIntrinsicSlot` and its
+five sibling readers). They share that family's out-of-band error channel: a failing
+call answers empty or `-errno` and `__fs_errno__()` carries the positive WASI errno.
+
+| import | signature | answers |
+| --- | --- | --- |
+| `__proc_run__` | `(u8[]) -> i32` | the child's exit code, or `-errno` if it never started |
+| `__proc_out__` | `() -> u8[]` | the last run's captured stdout |
+| `__proc_err__` | `() -> u8[]` | the last run's captured stderr |
+| `__proc_exit__` | `(i32) -> ()` | nothing — it never returns |
+| `__env_get__` | `(u8[]) -> u8[]` | the variable's value, EMPTY with `errno` set otherwise |
+
+**`runProgram` is three imports because a wasm import answers ONE value** and a finished
+child has three: a code and two streams. `__proc_run__` performs the spawn and the two
+fetches read what it captured, out of a per-instance cell cleared at the start of every
+run — the same ambient shape `__fs_errno__` already is, and invisible above the floor
+because `std:process.runProgram` makes all three calls itself, in that order.
+
+**The argument block is the command and its arguments with one `0x00` between each.**
+NUL SEPARATES, it does not terminate: `cmd` alone is a command with no arguments and
+`cmd\0` is a command with one EMPTY argument. That is lossless for a POSIX argv, where a
+NUL cannot appear inside an element — but a VL `string` CAN carry one, so the precondition
+is enforced above the floor rather than assumed: `std:process` answers `EINVAL` for a NUL
+in `cmd` or in any argument, the one policy applied ahead of the host the way `std:fs`
+rejects an empty path. Without it a child receives one more argument than the caller
+wrote, silently. There is no shell, so nothing expands a glob or splits on a space, and
+the child gets no stdin.
+
+**A non-zero exit is an ANSWER, not a failure.** `errno` is 0 whenever the child ran, and
+the exit code is whatever it was — which is why `std:process.runProgram` tests the errno rather
+than the sign of the result: an exit status is the child's own number and a platform is
+free to make it negative. A child killed by a signal has no exit code at all and answers
+`128 + signal`, the shell's own convention.
+
+**`__proc_exit__` is the only import that returns nothing** (`fsRetIsVoid`, one slot). VL
+has no `never`, so `std:process.exit` is a void function documented as never returning,
+and a caller inside a function must still produce that function's own result. Two emitter
+ladders name the void intrinsics one by one and both needed the slot-table question rather
+than a name: the statement-position `drop` decision (`wasmEmit.vl`) and the tail-value
+classifier (`emit_classify.vl`). A miss in either is check-clean invalid wasm.
+
+**The three hosts do not implement the same set, and cannot.** `scripts/vl-host/src/main.rs`
+and `scripts/wasmtime-host.rs` implement all five. `tests/support/runWasm.ts` implements
+`__proc_exit__` alone — it unwinds as `VLExitError` carrying the code, because a test runner
+has no process to end — and refuses the other four with the message the filesystem floor
+already uses there: WasmGC values are opaque to JS and cannot be constructed from it. That
+is a measured wall in V8, not an omission, so a `tests/cases/` fixture touching them carries
+`// @skip` and the coverage lives in `tests/vl_std_process_test.ts` against the native host.
+
 ## Exit codes, and which module trapped
 
 The whole table, and it is the host's to answer — the VL side picks between 0, 1
