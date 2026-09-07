@@ -809,6 +809,35 @@ Today `Stop{}` is legal and means exactly `Stop` (a variant arm binding nothing)
 
 Raised by [D1848](inventory/D1848.md), whose build is measured and reverted rather than shipped. The assignment narrowing has no PATH arm: `o.v = 5` over a nullable field does not strip `null`, while `x = 5` over a nullable binding does. The path arm is a dozen lines and every probe row lands — but it costs **three shipped fixtures**, all one shape: write a non-null value into a nullable place, bind the read, then null-test the binding (`s.f = "bb"; const t4 = s.f; if t4 != null { … }` becomes `cannot compare string with null`). **The refusal is consistent, which is what makes it a ruling rather than a bug**: master already refuses the bare-name spelling of that exact shape, because `isAsgNarrowedName` exempts the narrowed NAME itself and not a binding read out of it. **Options.** (a) a null test on a value the checker proved non-null is a LINT, as a dead `??` default already is through `recordDeadCoalesce` — D1848 then closes free, the bare-name asymmetry closes with it, and the three fixtures keep running; (b) it stays an ERROR — D1848's close is those three fixtures' price, and the question becomes whether the design owes those programs; (c) D1848 closes as DESIGN and the path keeps no assignment narrowing at all, which leaves `o.v = 5; o.v + 1` refusing for a reason no sentence states. **Recommendation: (a)** — the value is proved, not asserted, so the test is dead code rather than a type error, and every other dead-code finding in the checker is a lint.
 
+### bare-block-as-expression — does `{ … }` yield its tail value, and in which positions? — ASKED 2026-09-07
+
+Raised by [D1902](inventory/D1902.md) and pinned by [D1903](inventory/D1903.md). **The tree
+answers this question three ways at once today, and the disagreement is measured, not argued.**
+`isStmtNode` says a bare block is a STATEMENT (D1901) and inference agrees — `function k() { { 5 } }`
+is `void`. `drwBareBlock` lowers `{ … }` to an else-less `if true { … }`, whose value
+`emitFuncBody`'s tail ladder drops. But `emitStmtTail` routes every tail `if` through
+`emitIfTail`, so the SAME block one position over is an expression: `if true { { 5 } } else { 6 }`
+prints `5`, at two nesting depths, in either arm, and it is the block's TAIL that arrives
+(`{ 5 \n 7 }` yields `7`). The un-annotated face of that program infers `void | i32`, which is
+the disagreement inside one program.
+
+Until D1902 the checker's totality rule sided with the expression reading while the emitter sided
+with the statement reading, so `function k(): i32 { { 5 } }` was check-clean invalid wasm — the
+emitter padding a live path with `unreachable` on a proof the checker had no business giving.
+D1902 makes the checker say `not all code paths return a value` there, matching the un-annotated
+face and the `if true { 5 }` twin, and leaves the five `if`-arm cells running.
+
+**Options.** (a) a bare block is a STATEMENT everywhere — D1902 stands, and the `if`-arm delivery
+is a defect to close, which costs those five running cells and needs the price named; (b) a bare
+block is an EXPRESSION in tail position — D1902's one arm reads `nodeIsTotalAt(last, true)` again
+and `emitFuncBody` grows the tail arm `emitStmtTail` already has, which turns five `SILENT` cells
+into `runs` and makes the un-annotated face infer `i32`; (c) it stays a statement and the `if`-arm
+behaviour is blessed as the `if`-expression's own rule, which is the status quo written down.
+**Recommendation: (b)** — it is the only option that loses no working program, the lowering
+already exists one function away, and it makes one rule out of three answers. It is a language
+decision rather than a defect close, which is why D1902 shipped the sound half and put the arm in
+one place instead of choosing.
+
 ### artifact-rulings-page — a hosted page for the rulings write-up — DEFERRED 2026-09-06 night
 
 Offered as a private web page mirroring this file's section D with the owner's answers; the owner deferred it. Nothing to build; this file is the record.
