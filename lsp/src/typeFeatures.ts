@@ -188,8 +188,8 @@ export type ExtLexicalToken = {
 };
 
 // The wasm lexical-token enum → its index in {@link SEMANTIC_TOKEN_TYPES}. Kept
-// in lockstep with the driver's `lexClassOf` (scripts/vl-compiler-driver.vl) and
-// the WASM_LEX_* constants in wasmChecker.ts.
+// in lockstep with the driver's `lexClassOf` (scripts/vl-compiler-driver.vl),
+// which is the source of truth for these class numbers.
 const LEX_CLASS_TOKEN_TYPE: Record<number, number> = {
   0: TT.keyword,
   1: TT.operator,
