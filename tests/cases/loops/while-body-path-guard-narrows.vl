@@ -1,0 +1,153 @@
+// @run
+// @log WITNESS-absent 0
+// @log WITNESS-present 7
+// @log IS-annot 4
+// @log IS-infer 4
+// @log NULL-annot 4
+// @log NULL-infer 4
+// @log INDEX 4
+// @log BARE-INDEX 4
+// @log WRITE 4
+// @log NESTED 4
+// @log DISCRIM 8
+// A PROPERTY-PATH GUARD NARROWS A LOOP BODY, exactly as it narrows an `if` arm. This file
+// was the CONTRACT saying the opposite; D1845 retired it, and it is now the loop's positive
+// path fixture. The bare-name half is `while-body-is-guard-narrows.vl`.
+//
+// THE OLD ARGUMENT WAS MEASURED AND NO LONGER REPRODUCES. It ran: a path fact is keyed by a
+// string over an object any number of names can reach, and "with a `clr(o) { o.v = null }` in
+// the arm, `if o.v != null { clr(o); o.v.length }` is `vl check`-clean and TRAPS". That
+// program is a loud check reject today — `noteCallInvalidations` retires a path narrowing
+// across a call that can write it — so the hole the loop was kept out of is closed, and what
+// the restriction cost was a capability the `if` spelling had all along.
+//
+// WHAT MAKES IT SOUND IN A LOOP is the same machinery, one construct over. The body's facts
+// are re-established by the head on every iteration; a WRITE inside the body retires them
+// through `retireNarrowingsForWrite`, and a CALL that can write the path retires them through
+// `noteCallInvalidations` — `error-while-path-call-retires.vl` is that refusal, and it is the
+// half a close of this file must not lose. Reads-only narrowing (D1736) does the rest: the
+// write is checked against the declaration, so the flip a loop terminates on stays legal.
+import { toString } from "std:fmt"
+
+type S = { v: i32 }
+type W = { v: S | null }
+
+// The file's original witness, both ways round: absent, and present so the narrowed read runs.
+function witness(o: W) {
+  while o.v != null { return o.v.v }
+  return 0
+}
+print("WITNESS-absent " + toString(witness({ v: null })))
+print("WITNESS-present " + toString(witness({ v: { v: 7 } })))
+
+type O = { v: i64 | boolean }
+type N = { v: i32 | null }
+type X = { xs: (i64 | boolean)[] }
+
+function mkO(): O { return { v: 3 } }
+function mkN(): N { return { v: 3 } }
+
+// The `is` pin, annotated receiver and inferred one.
+function isAnnot(o: O) {
+  let r: i64 = 0
+  while o.v is i64 {
+    r = o.v + 1
+    break
+  }
+  return r
+}
+print("IS-annot " + toString(isAnnot({ v: 3 })))
+
+function isInfer() {
+  const o = mkO()
+  let r: i64 = 0
+  while o.v is i64 {
+    r = o.v + 1
+    break
+  }
+  return r
+}
+print("IS-infer " + toString(isInfer()))
+
+// The null strip, both faces — the guard this file was written for.
+function nullAnnot(o: N) {
+  let r = 0
+  while o.v != null {
+    r = o.v + 1
+    break
+  }
+  return r
+}
+print("NULL-annot " + toString(nullAnnot({ v: 3 })))
+
+function nullInfer() {
+  const o = mkN()
+  let r = 0
+  while o.v != null {
+    r = o.v + 1
+    break
+  }
+  return r
+}
+print("NULL-infer " + toString(nullInfer()))
+
+// The INDEX spelling of a path, over a struct field and over a bare list.
+function indexPath(o: X) {
+  let r: i64 = 0
+  while o.xs[0] is i64 {
+    r = o.xs[0] + 1
+    break
+  }
+  return r
+}
+print("INDEX " + toString(indexPath({ xs: [3] })))
+
+function bareIndex(xs: (i64 | boolean)[]) {
+  let r: i64 = 0
+  while xs[0] is i64 {
+    r = xs[0] + 1
+    break
+  }
+  return r
+}
+print("BARE-INDEX " + toString(bareIndex([3])))
+
+// A WRITE to the path in the body: checked against the field's declared type, so the flip is
+// legal and it is what ends the loop. The read after it is at the declaration, as in an `if`.
+function write(o: O) {
+  let r: i64 = 0
+  while o.v is i64 {
+    r = o.v + 1
+    o.v = true
+  }
+  return r
+}
+print("WRITE " + toString(write({ v: 3 })))
+
+// A nested `if` inside the body reads under the same narrowing.
+function nested(o: O, c: boolean) {
+  let r: i64 = 0
+  while o.v is i64 {
+    if c { r = o.v + 1 }
+    o.v = true
+  }
+  return r
+}
+print("NESTED " + toString(nested({ v: 3 }, true)))
+
+// The DISCRIMINANT spelling narrows the receiver, not the path, so it ran before this change
+// and must keep running — the boundary between the two channels.
+type KC = "c"
+type KS = "s"
+type C = { kind: KC, r: i32 }
+type Sq = { kind: KS, w: i32 }
+type Sh = C | Sq
+function discrim(v: Sh) {
+  let r = 0
+  while v.kind is KC {
+    r = v.r
+    break
+  }
+  return r
+}
+print("DISCRIM " + toString(discrim({ kind: "c", r: 8 })))
