@@ -369,6 +369,15 @@ export type WasmChecker = {
     read: ModuleReader,
   ) => Promise<{ bytes: Uint8Array | undefined; diagnostics: VLDiagnostic[] }>;
   /**
+   * Toggle the emitter's name + `vl-src` sections for the NEXT `compile`
+   * (`setEmitNames` on the seed — the section rides `--names`, DECISIONS.md).
+   * Off by default so editor-keystroke compiles stay lean and every golden emit
+   * is byte-identical; a caller that means to run the module and resolve a trap
+   * to its source line turns it on around that one compile. A no-op on a seed
+   * that predates the export, so the frames simply do not resolve.
+   */
+  setEmitNames: (on: boolean) => void;
+  /**
    * Go-to-definition (Stage 2): the declaring span for the binding under
    * (`line`, `character`) (both 0-based, LSP), or undefined when the cursor is
    * off any tracked binding (or the seed predates the symbol exports).
@@ -1865,6 +1874,16 @@ export const createWasmChecker = (
   // `compileSrc`. The emitted module uses the standard VL host-import ABI
   // (`imports.__print_*__`/`__log*__`/`memory`), so the caller instantiates it
   // with that import object to run it.
+  // Turn the emitter's name + `vl-src` sections on/off for the next compile. The
+  // driver leaves them off, so this is the ONLY way the browser Run path gets the
+  // section a trap-frame resolver needs. Gated: a seed without `setEmitNames` just
+  // ignores the request and the frames stay unresolved.
+  const setEmitNames = (on: boolean): void => {
+    const exp = instantiate();
+    if (exp === undefined || typeof exp.setEmitNames !== "function") return;
+    exp.setEmitNames(on ? 1 : 0);
+  };
+
   const compile = async (
     source: string,
     entryKey: string,
@@ -2144,6 +2163,7 @@ export const createWasmChecker = (
   return {
     check,
     compile,
+    setEmitNames,
     definitionAt,
     referencesAt,
     referencesInEntry,
