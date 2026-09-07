@@ -234,6 +234,14 @@ REPORTS = [
     {"id": "rep_generic_pin", "weight": 3, "needs": ["fn_generic", "fn_mk"],
      "lines": ["if true {", "  const @N@ = passv(mk(7))", "  print(@N@.base)", "}"],
      "want": ["7"], "features": ["module_block", "generic"]},
+    # A cross-scope SHADOW: `shdw` is a module Cell (a ref) and a block string, so the two
+    # bindings have different reps under one name. Read as `shdw + "!"` (the block string) and
+    # `shdw.base` (the module Cell). Crossed with a std import moved to the module, this is the
+    # start-function ambient effect x a local rebind (D1934's shape without the operator).
+    {"id": "rep_shadow", "weight": 4, "needs": ["fn_mk"],
+     "lines": ["const shdw = mk(9)", "if true {", '  const shdw = "hi"',
+               '  print(shdw + "!")', "}", "print(shdw.base)"],
+     "want": ["hi!", "9"], "features": ["module_block", "shadow", "string_frame"]},
     # THE OPERATOR USES. Each `a + b` / `a * k` is checked in the ENTRY (a report is always
     # the entry's), so when `op_vadd` moves to the module the dispatch bank is written there
     # and read here. `+` is a same-type binary; `*` takes a wider... no, an i32 scalar operand.
@@ -449,6 +457,9 @@ def _features(spec):
         f.add("moved_statement")
     if set(spec["moved"]) & {"op_vadd", "op_vmul"}:
         f.add("operator_moved")
+    if spec["report"] == "rep_shadow" and (
+            set(spec["moved"]) & {"std_str", "std_array", "std_buffer"}):
+        f.add("shadow_x_std_moved")
     return sorted(f)
 
 
