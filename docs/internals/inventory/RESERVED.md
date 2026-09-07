@@ -47,4 +47,5 @@ D1800-D1819  vl-c3  2026-09-06  fix and discovery lanes, 2026-09-06 evening (blo
 D1820-D1839  vl-c3  2026-09-06  fix and discovery lanes, 2026-09-06 night (D1820 per-program mono ledger, D1821 annotated-helper two-pin trap, later residues)
 D1840-D1859  vl-c3  2026-09-07  fix lanes 2026-09-06/07 (D1845/D1846 narrowing limits, D1850-D1854 variadics residue, campaign D1834-D1839 already in the earlier block)
 D1860-D1879  vl-c3  2026-09-06  fix and discovery lanes, 2026-09-07 (D1833 residue, variadics residue, campaign rows, later)
-D1880-D1899  vl-c3  2026-09-07  fix lanes 2026-09-07 (fmt import/comment relocation, D1825 silent pop, later residue)
+D1880-D1894  vl-c3  2026-09-07  fix lanes 2026-09-07 (fmt import/comment relocation, D1825 silent pop, later residue)
+D1895-D1899  vl-c1  2026-09-07  carved out of vl-c3's D1880-D1899 by the coordinator for the narrowing lane's residues (ROADMAP row 16's successor)
