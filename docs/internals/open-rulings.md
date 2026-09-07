@@ -572,11 +572,41 @@ struct column, and Go pays it everywhere. Swift's existential box is (b) as well
 table. So every statically-typed peer that admits this either pays (b) globally or does not have
 a shared box at all.
 
-**Recommendation: (a) for now, (c) when a program needs it.** Nothing in the tree or the corpus
-spells a map union member, the refusal is loud and names two working spellings, and (b) is a
-change to the union rep's shared currency for one member kind. (c) is the honest middle and can
-be built the day a witness asks for it, without touching the box. What (a) must NOT do is stay
-UNDOCUMENTED: the position is the only one the message now excludes, so it is named there.
+**MEASURED 2026-09-07, and it moves the recommendation: the refusal is MISSING where the
+miscompile is.** This entry argued (a) partly on the reading that the string-keyed twin
+*"runs today"*. It does not — it is a SILENT miscompile as soon as the program holds two map
+structs, which is exactly the condition this entry names. [D1866](inventory/D1866.md) is the
+witness, six lines, no alias and no recursion:
+
+    const inner: { [string]: i32 } = Map()
+    inner["a"] = 1
+    const __m: { [string]: { [string]: i32 } | i32 } = Map()
+    __m["k"] = inner
+    if __m["k"] != null {
+      if __m["k"] is { [string]: i32 } { print(__m["k"].size) } else { print(-1) }
+    }
+    // vl check rc 0; invalid module, type mismatch: expected (ref null $type), found (ref $type)
+
+The same union read back from a plain BINDING runs, and from a LIST element runs; it is the
+outer MAP that puts the second map struct in the program. So the i32-keyed spelling is refused
+loudly while the string-keyed one — the same unsoundness — is admitted and miscompiles, and
+nine cells of `recursive-alias-map-into-union.matrix.vl` are that hole.
+
+**Recommendation: (a′) now, (b) or (c) on the owner's word.**
+
+(a′) **Extend the EXISTING refusal to the string-keyed spelling**, with the sentence already
+written for the i32-keyed one naming the struct-member workaround. This is hygiene, not a
+design decision — the design question below stays open, and the position stays refused either
+way. Cost: nine SILENT matrix cells and the witness above turn LOUD. **No `runs` cell is lost**,
+because every one of them is already broken; the corpus's check-reject columns are the check.
+
+(b) **The tag records the map STRUCT** — the build, and a change to the union rep's shared
+currency for one member kind. (c) **a map member gets its own niche** remains the honest middle
+for the unions it covers. Both stay the owner's.
+
+What (a) must NOT do is stay UNDOCUMENTED: the position is the only one the message now
+excludes, so it is named there — and until (a′) lands, the message excludes it at one spelling
+while the other spelling miscompiles quietly.
 
 ### B8-for-struct — may a `for` loop iterate a STRUCT's fields? — raised 2026-09-07
 
