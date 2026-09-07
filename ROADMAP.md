@@ -1550,9 +1550,16 @@ in-language GC knobs.
      5. ⬜ **The return-kind family** — `retResultVKind` + the fourteen `fnRet*Sid` readers;
         `fRetKind` becomes a projection rather than a parallel column. `fnRetF32ArraySid` and
         `fnRetAnnF32ArraySid` still read the flat `fnIndexOfSid` and move first.
-     6. ⬜ **The valtype and field-code ladders** — `fbValtype` (31 arms), `fbValtypeNullable`,
-        `fbRefNullForKind`, `fbHeapIdxForKind`; `fieldTypeCode`, `nameFieldCode`,
-        `anonFieldCode`. The remaining parallel numbering schemes.
+     6. 🟡 **The valtype and field-code ladders.** The FIELD-CODE half is DONE:
+        `fieldCodeOfTy`'s fourteen constants are one `fieldCodeOfVKind` table, its arms are
+        DOMAIN gates and its `-2` decline is unchanged — 0 CONTRADICT over 58,428 queries,
+        byte-identical in 3,165 + 7,589. **The domain-WIDENING variant was refused at a price
+        of 8 `tests/cases` modules `rc=0 → rc=1`**, six of them nullable fields and four
+        literal-union ones, which is the campaign's second half of the conversion bar: a
+        ladder's decline is an ANSWER, routed to a producer that knows more, so a domain is
+        neither removed nor widened. Remaining: the VALTYPE half — `fbValtype` (31 arms),
+        `fbValtypeNullable`, `fbRefNullForKind`, `fbHeapIdxForKind` — now the only rep
+        numbering scheme with no single translation table.
      7. ⬜ **The slot layer, last** — `structIndexOfExpr`, `rlSlot*`, `mvSlot*`,
         `exprVariantIndex`. `rdSlot` is nominal where the rest of the descriptor is
         structural, and nothing earlier depends on it.

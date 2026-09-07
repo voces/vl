@@ -307,65 +307,90 @@ buckets of §4.1.
 
 ## 5. Conversion order, and the proof obligation each family owes
 
-### 5.1 The obligation, stated once
+### 5.0 The conversion bar — restated, because a candidate was refused on it
+
+Two shapes a conversion can take, and only one of them is safe by construction.
+
+* **DOMAIN-KEEPING.** The function's own gate — the test that says *which shapes it speaks
+  for* — stays, and only the rep ANSWER moves to a descriptor projection. `tyKindOf` is this
+  shape: it kept `is TyPrim` / `is TyArray` and its literal-union carve-outs, and took the
+  kind from `repOfTy`. Nothing that used to reach the function reaches it differently.
+* **DOMAIN-REMOVING.** Rungs are deleted, so a shape the ladder used to name now falls to its
+  default. This is safe only under one of two conditions, and *neither is "no observed
+  counterexample"*:
+  * **(D1) the domain is provably unreachable** — no input can reach the deleted rung, by
+    construction; or
+  * **(D2) the default is NAMED** — an `emitFail`, a sentence, or a delegation to the ladder
+    that owns the rest, so a shape the ladder no longer names cannot receive a valid-looking
+    answer for a different rep.
+
+**Byte identity does not settle a domain-removing conversion**, and §6.3 is the measurement
+that proves it. Nine of `vtKindOfType`'s rungs are reached 201,576 times, always agree with
+the descriptor, and never appear in the LEFT-ONLY bucket over 10,734 modules. Deleting all
+nine is byte-identical in both populations — and takes the oracle from **CONTRADICT 2,963 to
+204,539**, because the ladder's domain is *an annotation node the checker recorded no type
+on*, where `annRepKindOf` declines by construction. Those rungs are not dead. They are
+untested: neither corpus contains an un-typed node of those shapes.
+
+**And the bar is two-sided: DOMAIN-WIDENING is unsafe too.** §6.4 is that instance. A
+ladder's decline is not an absence of an answer — it is an answer, routed to a producer that
+knows something this one does not. Letting the descriptor answer wherever it covers, which
+reads like a strict improvement, cost **eight `tests/cases` modules `rc=0 → rc=1`** at the
+field-code family. Byte identity caught it; the oracle could not, because the oracle grades
+the ANSWER where both producers speak and this was a disagreement about WHO speaks.
+
+So the bar is: **delete a ladder only under D1 or D2, widen its domain never, and otherwise
+keep the domain and move the answer.** A conversion that cannot meet the deletion bar is
+still worth doing in the domain-keeping shape — the second producer stops being able to
+*disagree*, which is the precondition for ever deleting it.
+
+### 5.1 The proof obligation, stated once
 
 Every conversion owes all five, and the first is the one that decides:
 
-1. **The oracle: 0 CONTRADICT** over `tests/cases` (3,145 modules) and the distilled corpus
-   (7,589 cells), with the ladder and the candidate projection compared side by side *before*
-   the ladder is deleted.
+1. **The oracle: 0 CONTRADICT** over `tests/cases` and the distilled corpus, with the ladder
+   and the candidate projection compared side by side *before* anything is deleted.
 2. **Byte identity** of the emitted module over both populations — both arms built from ONE
    seed, compared on sha256 and exit code, never on file size.
 3. `scripts/silent-sweep/distilled/regress.py`: **0 `runs → not-runs`, 0 `→ silent`**.
-4. `scripts/rep-fuzz-check.sh` exact — mandatory, the corpus and the fixpoint are both blind
+4. `scripts/rep-fuzz-check.sh` exact — mandatory; the corpus and the fixpoint are both blind
    to REJECT→MISMATCH.
 5. `scripts/mono-tyaram-grid.sh` no BAD — for anything that touches the pin context.
 
-A conversion that cannot be byte-identical is not thereby refused; it is a conversion whose
-price must be NAMED, measured on `regress.py`'s `runs` column, and carried in `named/`.
+A conversion that cannot be byte-identical is not thereby refused; its price must be NAMED,
+measured on `regress.py`'s `runs` column, and carried in `named/`.
 
-### 5.2 The order
+### 5.2 The order, re-ranked by the bar
 
-Ranked by blast radius ascending against disagreeing-producer count descending.
+Each row says which SHAPE a conversion there takes and what its domain's oracle coverage is
+today. "Coverage" is the LEFT-ONLY measurement: how often the ladder answers where the
+descriptor declines, which is exactly how much of the domain the descriptor cannot yet take.
 
-1. **`tyKindOf` — the i32 code vocabulary. DONE in this PR.** One private function, 18 call
-   sites, all in one file, and a THIRD rep numbering scheme (0/2/3/7/10/11/12/13/20) retired
-   in favour of `VKind`. Smallest possible blast radius, and it is the family whose *whole*
-   content is "a fourth producer of a fact the descriptor already has". §6 has its numbers.
-2. **`vtKindOfType`'s annotation ladder** — 25 predicate rungs, the canonical classifier. The
-   seam already exists (`annRepKindOf` is its first rung), so the work is not re-ordering, it
-   is **widening `repOfTy` coverage until the fallback is unreachable, then deleting it**. The
-   oracle's LEFT-ONLY bucket at this site is the burn-down list, and it is finite.
-3. **The `expr*` family — 48 classifiers, 926 call sites, the largest.** Needs `repOfExpr(exprIx,
-   fnIx)`, i.e. the node→type→descriptor path plus §3.3's pin context. Convert by AXIS, not
-   alphabetically, because each axis is a closed set whose siblings must move together:
-   (a) the seven scalar-list predicates (`exprArray`, `exprStringArray`, `exprF64Array`,
-   `exprI64Array`, `exprF32Array`, `exprU8Array`, `exprRefArray`);
-   (b) the six nullable niches (`exprNullableList`, `exprNullableRefArray`,
-   `exprNullableString`, `exprNullableStruct`, `exprNullableVariant`, `exprNulScalarListKind`);
-   (c) the three scalars (`exprIsI64`, `exprIsF64`, `exprIsF32`);
-   (d) the reference shapes (`exprStruct`, `exprUnion`, `exprMap`, `exprIsClosure`,
-   `exprIsLitAtom`).
-4. **The return-kind family** — `retResultVKind` plus the fourteen `fnRet*Sid` readers. Already
-   frame-aware after #2815/#2840, so the conversion is to make `fRetKind` a PROJECTION of the
-   descriptor rather than a parallel column refined by its own fixed point. Two members
-   (`fnRetF32ArraySid`, `fnRetAnnF32ArraySid`) still read the flat `fnIndexOfSid` and are the
-   residue #2815 left; they move first.
-5. **The valtype and field-code ladders** — `fbValtype` (31 arms), `fbValtypeNullable`,
-   `fbRefNullForKind`, `fbHeapIdxForKind` over one kind set; `fieldTypeCode`, `nameFieldCode`,
-   `anonFieldCode` over another. This is the ROADMAP's "3+ numbering schemes with translation
-   functions between them", and D1783 is its worked defect (the declared mint carried a
-   literal-union field split the ANONYMOUS mint did not).
-6. **The slot layer, last** — `structIndexOfExpr`, `rlSlot*`, `mvSlot*`, `exprVariantIndex`.
-   `rdSlot` is the field the descriptor least owns today (`repOfTy` fills it from
-   `repSlotOfTy` for `TyObj` alone), and a slot is nominal where the rest of the descriptor is
-   structural. Nothing earlier depends on it.
+| # | family | shape | its DOMAIN | coverage today |
+| --- | --- | --- | --- | --- |
+| 1 | `tyKindOf` — the i32 code vocabulary | domain-KEEPING | scalars and arrays, arena-gated | ✅ DONE, 0 CONTRADICT, byte-identical |
+| 2 | `repOfNameResult` — the name surface | new surface | a NAME plus the calling frame | ✅ DONE, closes D1834 |
+| 3 | `vtKindOfType`'s annotation ladder | domain-REMOVING | an annotation node the checker did NOT type | 🟡 15 kinds LEFT-ONLY, **147,945** queries. Deletion REFUSED (§6.3); five missing arms added, CONTRADICT 2,963 → 178 |
+| 4 | the field-code ladders — `fieldCodeOfTy` and its spelling siblings | domain-KEEPING | `fieldCodeOfTy` answers `-2` = *"the spelling ladder owns the rest"* — a NAMED decline, so the domain is explicit | ✅ **DONE** (§6.4): 0 CONTRADICT over 58,428 queries, byte-identical, a FOURTH numbering scheme collapsed into one `fieldCodeOfVKind` table. The domain-WIDENING variant was refused at a price of 8 modules |
+| 5 | the valtype ladders — `fbValtype` (31 arms), `fbValtypeNullable`, `fbRefNullForKind`, `fbHeapIdxForKind` | already a projection of `VKind` | a `VKind` member | low value alone; move it with item 4, since the two schemes translate into each other |
+| 6 | the `expr*` family — 48 classifiers, 927 call sites | domain-REMOVING | an EXPRESSION node, which the arena may not have typed (a monomorphized body carries the template's types) | blocked on item 7; convert by AXIS, never alphabetically |
+| 7 | `repOfName` for BINDINGS | new surface | a name plus the frame it is READ in → the declaration → its type | **BLOCKED, and the blocker is named**: `declaredSlotOf` takes a bare name with no frame; `paramTypeNode` and `globalLetOfSidIn` take `fnIx` only as a *frame-binds-this-name veto*, not as a scope-chain walk. Callee resolution has been frame-aware since D1781; binding resolution never was |
+| 8 | the slot layer — `structIndexOfExpr`, `rlSlot*`, `mvSlot*`, `exprVariantIndex` | domain-KEEPING, per resolver | a nominal table row | last: `rdSlot` is the field the descriptor least owns (`repOfTy` fills it from `repSlotOfTy` for `TyObj` alone) |
 
-**And separately, on the same clock: the name surface — BUILT, as `repOfNameResult`.** §6.2
-has its measurements and the one refinement it forced: of the five monomorphizer rows, only
-the return-kind readers wanted a REP. The other three wanted the SLOT and the `$fnsig` key,
-and the slot already has one home (`fnIndexOfInScope`). `repOfExpr`'s `Ident` arm still wants
-the binding-resolution half, which is a separate surface and is named in §6.2.
+**Item 6 is the largest and it is domain-removing, which is the whole reason item 7 comes
+first.** An `expr*` predicate's arms are syntactic — a literal, a call, an index read — and
+several of them exist precisely because the arena has no type for that node. Deleting them
+would hand every such node the ladder's own default. The domain-keeping half is available
+today and is what item 6 should do: keep each predicate's node ladder and replace the arms
+that re-derive a rep from a NAME or a TABLE with a descriptor projection, one axis at a time.
+
+**Item 4 was next because it is the only remaining family whose domain is already NAMED.**
+`fieldCodeOfTy` returns `-2` meaning "I decline; `nameFieldCode`'s spelling ladder owns the
+rest", and `nameFieldCodeTy` already calls it first — the strangler seam was built. Converting
+its answer therefore could not remove a domain; §6.4 records that it could still WIDEN one,
+which is the half of the bar this family added. **Item 5 is next**, and it moves with what
+item 4 left: `fbValtype` and its three siblings translate `VKind` into the valtype/heap
+vocabulary, which is now the only rep numbering scheme with no single translation table.
 
 ---
 
@@ -563,6 +588,67 @@ would say `str` because canon softens the member set to `string`, while the desc
 the interned atom. It **cannot** be closed from the ladder's own domain: at an un-typed node
 the softened spelling is all there is, and the atom-ness is not recoverable from it. That is
 `one-literal-union-rep`'s cost measured a second time, at a second site.
+
+---
+
+### 6.4 The field-code ladders — a domain-KEEPING conversion, and a domain-WIDENING one refused
+
+The fourth rep numbering scheme: `fieldCodeOfTy` answers in 0/3/4/5/6/14/16/17/22/23/24/25/
+26/27, spelled as fourteen constants at fourteen arms, with `-2` meaning *"the spelling ladder
+owns the rest"*. `nameFieldCodeTy` already calls it first, so the strangler seam was built and
+the domain was already NAMED — which is why §5.2 ranks it next.
+
+**The oracle first.** Ladder against the candidate projection, over both populations:
+
+```
+queries 58428
+  AGREE        52955
+  CONTRADICT       0
+  LADDER-ONLY   5114   (descriptor declines: `reflist`, 182 modules)
+  DESC-ONLY      359   (ladder declines: `union` 312 in 91 modules, `i32` 47 in 10)
+```
+
+**CONTRADICT 0** — wherever both answer, they answer the same code. So the ANSWER is safe to
+project; the two asymmetric columns are about the DOMAIN, and they are what decided the shape.
+
+**The first candidate put the projection FIRST and lost eight modules.** Letting the
+descriptor answer wherever it covers — which reads like a strict improvement, since the
+ladder's decline only means "ask the spelling" — turns those 359 DESC-ONLY queries into
+answers, and `compile(candidate, tests/cases)` goes from `rc=0` to `rc=1` at **eight
+modules** — a `runs → not-runs`, which is the corpus gate's own veto:
+
+```
+arrays/return-nullable-niche-field-struct-array.vl
+generics/union-projection-into-hole-param.vl
+literal-unions/quoted-separator-in-litunion-member.vl
+maps/map-value-nullable-litunion-field.vl
+structs/nested-struct-vs-niche-fieldset-twin-closure-result.vl
+structs/nullable-litunion-field.vl
+unions/union-variant-nullable-field.vl
+unions/variant-nullable-litunion-field.vl
+```
+
+**Six of the eight name a NULLABLE field and four name a LITERAL UNION**, which is the same
+question a third time: `repOfNullable` reps a nullable scalar as the value-union box, the
+spelling ladder codes a nullable literal-union field differently, and the ladder's decline is
+what routes the field to the producer that knows which. That is `one-literal-union-rep`'s
+price at a third site, and it is the sharpest form of it — here the ruling is worth eight
+running programs.
+
+**So the bar is two-sided, and this is its second worked instance.** §6.3 refused a
+domain-REMOVING conversion; this one refuses a domain-WIDENING one. A ladder's decline is not
+an absence of an answer — it is an answer, routed to a producer that knows something this one
+does not. **Keep the domain: neither remove it nor widen it.**
+
+**What shipped** keeps every arm as a DOMAIN gate and replaces only the constant it returns:
+`if t is TyPrim { return fieldCodeOfDesc(ty) }`, and the same for the nullable-closure, bare
+closure and scalar-element-array arms. The five `return 5` element arms stay constants — two
+of them (`TyArray` and `TyMap` elements) are exactly the descriptor's LADDER-ONLY column — and
+`void` keeps its decline, since the descriptor reps it as the ladder fallthrough `i32` and a
+void field has no storage. The fourteen constants become one `fieldCodeOfVKind` table.
+
+Byte-identical in **3,165 of 3,165** `tests/cases` modules and **7,589 of 7,589** corpus cells.
+Seed **+120 bytes (+0.005%)**.
 
 ---
 

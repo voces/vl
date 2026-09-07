@@ -19922,68 +19922,81 @@ export function anonFieldElemKeyI32(valIx: i32, code: i32) {
 }
 
 // ── the field-code classifier's arena rung ──
-// Answers primitive-keyword tests directly, since the arena went string-free. Confirm-only:
-// it answers only where the arena decides the code exactly, returning -2 to the name ladder
-// otherwise, since composites, closures, maps, and unions need emitter interning state the arena lacks.
+// The one translation from `VKind` into the field-code vocabulary, so the fourteen constants
+// live here rather than at fourteen arms. `-2` is the vocabulary's decline — a kind it does
+// not name, never a code.
+function fieldCodeOfVKind(k: VKind): i32 {
+  if k == "i32" { return 0 }
+  if k == "str" { return 3 }
+  if k == "list" { return 4 }
+  if k == "reflist" { return 5 }
+  if k == "strlist" { return 6 }
+  if k == "closure" { return 14 }
+  if k == "union" { return 16 }
+  if k == "f64" { return 17 }
+  if k == "nulclosure" { return 22 }
+  if k == "i64" { return 23 }
+  if k == "f32" { return 24 }
+  if k == "f64list" { return 25 }
+  if k == "i64list" { return 26 }
+  if k == "f32list" { return 27 }
+  -2
+}
+
+// The descriptor's field code for `ty`, or -2 where it declines or names a kind outside this
+// vocabulary. Asked only from inside a DOMAIN gate below, never as the opening rung: letting
+// it answer where the ladder declines widens the domain, which costs 8 modules (§6.4).
+function fieldCodeOfDesc(ty: i32): i32 {
+  const d = repOfTy(ty)
+  if d.rdCovered == 0 { return -2 }
+  fieldCodeOfVKind(d.rdKind)
+}
+
+// The field code for arena type `ty`, or `-2` meaning "the spelling ladder owns the rest".
+// Every arm below is a DOMAIN gate — which shapes this vocabulary speaks for — and the code
+// it hands back is the descriptor's, through the one translation above.
 function fieldCodeOfTy(ty: i32): i32 {
   if ty < 0 { return -2 }
   // The registration split the two ladders beside this one make: a registered literal-union
-  // alias reps as the interned atom, an unregistered inline set as a string ref.
+  // alias reps as the interned atom, an unregistered inline set as a string ref. Alias-ness
+  // is checker metadata rather than structure, so the descriptor declines all three.
   if tyIsLitUnionAlias(ty) { return 0 }
   if tyIsLitUnion(ty) { return 3 }
   if tyIsLitUnionArray(ty) { return 4 }
   const t = T.tys[ty]
   if t is TyPrim {
-    const p = t.primName
-    if p == "i32" { return 0 }
-    if p == "boolean" { return 0 }
-    if p == "f64" { return 17 }
-    if p == "i64" { return 23 }
-    if p == "f32" { return 24 }
-    if p == "string" { return 3 }
-    return -2
+    // `void` is the one prim the descriptor reps (as the ladder fallthrough `i32`) and this
+    // vocabulary never has: a void field has no storage.
+    if t.primName == "void" { return -2 }
+    return fieldCodeOfDesc(ty)
   }
-  // The two arms `nameFieldCode` reads off the spelling, asked of the type instead. Order
-  // matters, mirroring the text ladder: a nullable closure is the nullable fat-pointer 22,
-  // tested before the bare arrow (closure rep 14). A union carrying a closure member is a
+  // Order matters, mirroring the text ladder: a nullable closure is the nullable fat-pointer
+  // 22, tested before the bare arrow (closure rep 14). A union carrying a closure member is a
   // value union (the box), not a closure field, so `TyUnion` falls through here as it should.
   if t is TyNullable {
     const inner = T.tys[t.nInner]
-    if inner is TyFunc { return 22 }
+    if inner is TyFunc { return fieldCodeOfDesc(ty) }
   }
-  if t is TyFunc { return 14 }
+  if t is TyFunc { return fieldCodeOfDesc(ty) }
   // The array arm mirrors `fieldCodeOfSpelling`'s `scalarListKindOfName` ladder, deliberately
   // narrower: an unrecognised element stays uncoded (-2) and falls through to the render,
-  // rather than a blanket 5 (struct/union/closure only). No `TyObj` arm: the spelling
-  // ladder's declaration scan lets a forward reference tie into the shared rec group.
+  // rather than a blanket 5. No `TyObj` arm for the array ITSELF: the spelling ladder's
+  // declaration scan lets a forward reference tie into the shared rec group.
   if t is TyArray {
     const e = t.aElem
     if e >= 0 {
       const et = T.tys[e]
-      if et is TyPrim {
-        const ep = et.primName
-        if ep == "i32" { return 4 }
-        if ep == "boolean" { return 4 }
-        if ep == "string" { return 6 }
-        if ep == "f64" { return 25 }
-        if ep == "i64" { return 26 }
-        if ep == "f32" { return 27 }
-      }
-      // The spelling ladder's fall-through is `return 5` for any other `X[]`, but "other"
-      // there already excludes the nullable-element and litunion families by name. Reaching
-      // this point from the arena has not, so a blanket 5 would mis-code a nullable-element
-      // list and trap on an out-of-bounds index. Code 5 names struct/union/closure only.
+      if et is TyPrim { return fieldCodeOfDesc(ty) }
+      // Code 5 names struct/union/closure elements only. A nested list and a map-element list
+      // are ref lists too; a NULLABLE element stays out, since coding it 5 would mis-code the
+      // wrapper and trap on an out-of-bounds index (B171).
       if et is TyObj { return 5 }
       if et is TyUnion { return 5 }
       if et is TyFunc { return 5 }
-      // A nested list and a map-element list are ref lists too, claimed by no arm above the
-      // spelling ladder's fall-through — only the nullable element families are, which is why
-      // `TyNullable` stays out (B171).
       if et is TyArray { return 5 }
       if et is TyMap { return 5 }
     }
   }
-
   // A value union is the box, code 16 — the arm the name ladder states as
   // `isValueUnionName(t)`. Placed last so every arm the arena already claims still wins.
   // `isValueUnionTyOr` declines rather than guess, so a literal union (`TyLit` members,

@@ -689,6 +689,23 @@ descriptor declining by design and the campaign's carve-outs kept forever.
 numeric included. Simplest to state, and it changes what a program emits — an inline
 `("a"|"b")[]` becomes an atom list where it is a string list today.
 
+**THE PRICE IS NOW MEASURED AT THREE SITES, AND IT GREW AT EACH.** (1) `tyKindOf`: the
+ladder-vs-descriptor oracle reports **2,448 queries where the ladder answers and the descriptor
+declines, 1,503 of them (48 modules) the numeric literal-union base collapse**. (2)
+`vtKindOfType`: after its five missing nullable-scalar-list arms landed, **the only surviving
+contradiction in the whole ladder is this question** — `str -> i32`, 178 queries in
+`tests/cases/literal-unions/narrowed-litunion-param-atom-rep.vl` and
+`narrowed-litunion-fn-value-arg.vl`. It cannot be closed where that ladder lives: its domain is
+an annotation node the checker recorded no type on, and at such a node the softened spelling is
+all there is, so atom-ness is not recoverable. (3) **The field-code ladders, and this one is
+priced in running programs.** Letting the descriptor answer where `fieldCodeOfTy` declines
+costs **eight `tests/cases` modules `rc=0 → rc=1`**, and six of the eight name a NULLABLE field
+while four name a LITERAL UNION — `structs/nullable-litunion-field`,
+`unions/variant-nullable-litunion-field`, `maps/map-value-nullable-litunion-field`,
+`literal-unions/quoted-separator-in-litunion-member` among them. Every family the campaign
+converts after this one inherits the same carve-out, which is what makes (a) or (c) the
+difference between a bounded residue and a permanent one.
+
 **Recommendation: (a).** The descriptor's whole thesis is that a rep is a function of a type;
 (b) writes the exception down honestly but keeps a permanent second producer at every one of
 the six conversion families, and the campaign's own measurement is that this residue is the
