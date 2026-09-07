@@ -1094,6 +1094,34 @@ export const scopeCompletionsFromBindings = (
   return [...byName.values()];
 };
 
+/** One `type` NAME from the wasm checker's `typeNamesAt`. */
+export type ExtTypeName = { name: string; detail: string; doc?: string };
+
+/**
+ * Completion items for the `type` NAMES in scope, de-duped by name (first wins). A type
+ * shares the identifier namespace with values in the completion list, so `taken` drops any
+ * name a value binding already offered: at a use site the value is what the author reaches
+ * for, and two items under one label is the worse answer either way.
+ */
+export const typeCompletionsFromWasm = (
+  types: ExtTypeName[],
+  taken: (name: string) => boolean,
+): Completion[] => {
+  const byName = new Map<string, Completion>();
+  for (const t of types) {
+    if (taken(t.name) || byName.has(t.name)) continue;
+    byName.set(t.name, {
+      name: t.name,
+      kind: "type",
+      // An IMPORTED type has no rendered body here (see `WasmTypeName`), and an empty
+      // detail is dropped rather than shown as an empty code block.
+      detail: isDisplayableType(t.detail) ? t.detail : undefined,
+      doc: t.doc,
+    });
+  }
+  return [...byName.values()];
+};
+
 /** An external member-completion entry (the wasm checker's `memberCompletionsAt`). */
 export type ExtMemberCompletion = {
   name: string;

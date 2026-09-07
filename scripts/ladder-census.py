@@ -358,6 +358,41 @@ def pick_set(members, kind, sets, idx):
     return min(cands, key=lambda s: (len(sets[s][0]), s)) if cands else None
 
 
+# The subject's own PARAMETER annotation, which outranks the smallest-containing answer
+# above. `"f64"` is a member of five sets, so a chain testing it can be graded exhaustive
+# over `BtKind`'s three while its scrutinee is a `VKind` with thirty-one — the count then
+# says a ladder is complete when it names three of thirty-one. Mirrors `klParamSetOf`.
+PARAM_ANN = r"\b%s\s*:\s*([A-Za-z_][\w ]*?)\s*(?:\|\s*null\s*)?[,)]"
+
+
+def fn_header(lines, lo, hi):
+    """The function's signature text, joined across a wrapped parameter list — up to and
+    including the line whose code ends in `{`, capped at the function's own range."""
+    out = []
+    for i in range(lo, min(hi, lo + 40) + 1):
+        cut = strip_line(lines[i])
+        out.append(cut)
+        if cut.rstrip().endswith("{"):
+            break
+    return " ".join(out)
+
+
+def declared_set(lines, lo, hi, subj, members, kind, sets):
+    """The closed set `subj`'s parameter annotation names, or None. Declined unless the
+    set carries every tested member: a declaration the arms do not belong to is a
+    mis-parse, and the smallest-containing answer is the safer one."""
+    if not subj or "." in subj:
+        return None
+    m = re.search(PARAM_ANN % re.escape(subj), fn_header(lines, lo, hi))
+    if not m:
+        return None
+    name = m.group(1).strip()
+    if name not in sets or sets[name][1] != kind:
+        return None
+    ms = sets[name][0]
+    return name if all(x in ms for x in members) else None
+
+
 # ── how it ends ──────────────────────────────────────────────────────────────
 def tail_of(lines, last, hi):
     """The ladder's DEFAULT region: what runs when no arm matched. Scan forward from
@@ -551,7 +586,8 @@ def ladders_of(rel, src, sets, idx):
                     uniq.append(m)
             if len(uniq) < MIN_ARMS:
                 continue
-            setname = pick_set(uniq, kind, sets, idx)
+            setname = declared_set(lines, lo, hi, subj, uniq, kind, sets) \
+                or pick_set(uniq, kind, sets, idx)
             if setname is None:
                 continue
             first, last = min(i for i, _ in hits), max(i for i, _ in hits)
