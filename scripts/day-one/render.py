@@ -63,6 +63,8 @@ def applicable_axes(plan):
             continue
         if need == "narrow_group" and len(_narrow_group(val, read)) < 2:
             continue
+        if need == "op_group" and len(_op_group(val, read)) < 2:
+            continue
         if need == "fusible" and not _fusible(pos, read):
             continue
         if need == "pinnable" and pos["id"] == "assignment":
@@ -96,6 +98,16 @@ def _narrow_group(val, read):
     if "narrow" not in read:
         return []
     return [r for r in val["reads"] if "narrow" in r and r["want"] == read["want"]]
+
+
+def _op_group(val, read):
+    """Reads of `val` that go through the SAME operator — the operator spelling and the
+    direct call of a function with the same body. Grouped on the operator rather than on
+    `want`, because `[]` and `[]=` both print through the same record and a `want` key
+    would put four reads in one group and pair a getter against a setter."""
+    if "op" not in read:
+        return []
+    return [r for r in val["reads"] if r.get("op") == read["op"]]
 
 
 def pick_plan(rng, axis_id=None):
@@ -171,6 +183,10 @@ def flip(rng, plan, axis, faces):
         group = _narrow_group(plan["value"], plan["read"])
         a, b = rng.sample([r["id"] for r in group], 2)
         return a, b
+    if aid == "operator_vs_call":
+        group = _op_group(plan["value"], plan["read"])
+        a, b = rng.sample([r["id"] for r in group], 2)
+        return a, b
     if aid == "scope":
         opts = [s["id"] for s in G.SCOPES]
         return tuple(rng.sample(opts, 2))
@@ -196,6 +212,12 @@ def plan_pair(rng, axis_id=None):
     fb = dict(fa)
     fa[axis["id"]] = va
     fb[axis["id"]] = vb
+    if axis["id"] == "operator_vs_call":
+        # `render` selects the read through `faces["narrowing"]`, so this axis has to
+        # write there as well as under its own id — otherwise both faces render the plan's
+        # own read and the pair is two identical programs, which `make_pair` drops
+        # silently. The axis label stays its own so the report can attribute the yield.
+        fa["narrowing"], fb["narrowing"] = va, vb
     if axis["id"] == "named_vs_inline" and plan["read"].get("named_only"):
         # The inline face cannot spell `is Rect`; it reads the nearest legal read.
         fb["narrowing"] = _nearest_legal_read(plan["value"], plan["read"])
@@ -227,6 +249,10 @@ def render(plan, faces):
             plan["scenery"]["lines"])
     if named:
         decls.extend("type %s = %s" % (n, r) for n, r in val["decls"])
+    # Declarations the RECORD brings — the operator, its plain-function twin and the
+    # second operand. Module level, because a `function "+"` is only a dispatch entry
+    # there, and in BOTH faces, so the pair differs only in which one the read calls.
+    decls.extend(val.get("fns", []))
 
     expr = val["expr"]
     if expr is None:
