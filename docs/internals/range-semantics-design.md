@@ -1,5 +1,11 @@
 # Range iteration semantics — should `to` stay inclusive, and what carries `[0, n)`?
 
+> **RATIFIED (owner, 2026-09-07).** Option A with `until`, made primary, plus the lint (C):
+> `until` is the exclusive half-open range form, `to` stays inclusive. Built — lexer/parser
+> (soft keyword), emitter (`v < to`), the const-range rule (empty `0 until 0` legal, backwards
+> refused), and the `range-inclusive-length` lint. See `DECISIONS.md` and
+> `docs/guide/soundness.md`. §6's open question resolved in favour of `until` over `..<`.
+
 VL's counted loop is `for v in <from> to <to> [step <s>]`, and **`to` is inclusive** at the top
 (`docs/guide/soundness.md`, "A constant range must be able to run"): `for i in 0 to 4` runs five
 times, binding `0,1,2,3,4`.

@@ -51,6 +51,35 @@ Keys must be `string` or `i32` (anything else is a named refusal). An EMPTY coll
 still needs its element/value type pinned by an annotation or by a use — `const m = Map()`
 alone is `cannot infer a type for 'm'`, exactly as `const xs = []` is.
 
+**Iterating a collection — reach for the element, not the index.** The first spelling to
+try binds the elements directly; it needs no bound and cannot run off the end:
+
+```vl
+for x in xs { … }        // each element, in order
+for x, i in xs { … }     // element FIRST, then its index (0, 1, 2, …)
+for k in m { … }         // a map's keys, in insertion order
+for k, v in m { … }      // a map's key, then the value at it
+```
+
+The two-variable *list* form binds the **value first and the index second** — `for x, i in
+[10, 20, 30]` gives `x = 10, i = 0`, then `x = 20, i = 1`, … — because the value is what you
+almost always want, so it leads. A map's companion is its value (`for k, v in m`).
+
+When you genuinely need a numeric range rather than a collection's elements, there are two
+forms, and the keyword says which interval:
+
+```vl
+for i in 0 until n { … }   // half-open [0, n): binds 0 … n-1, exactly n trips — the INDEX range
+for i in a to b { … }      // inclusive [a, b]: binds a … b — a closed span you named on purpose
+```
+
+`until` stops **before** its bound; `to` **includes** it. So `for i in 0 until xs.length`
+walks every index of `xs` with no `- 1` and no out-of-range read, and `for day in 1 to 31`
+enumerates a closed range. The inclusive `for i in 0 to xs.length` reads `xs[xs.length]` on
+its last turn and **traps** — a `warning`-tier lint flags that exact shape and points you at
+`until`. Full semantics and the constant-range rules are in `docs/guide/soundness.md`; the
+design rationale is `docs/internals/range-semantics-design.md`.
+
 **`u8` is an ELEMENT type only, and a `u8[]` store TRUNCATES.** `u8[]` is one byte per
 element (a packed WasmGC `(array (mut i8))`); every value crossing its boundary is an
 ordinary `i32`, so `b[i]` reads back 0..255 (zero-extended) and `b[i] = v` / `b.push(v)`

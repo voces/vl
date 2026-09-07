@@ -1248,11 +1248,12 @@ export const VL_SOFT_KEYWORDS: readonly string[] = [
   "readonly",
   "step",
   "to",
+  "until",
 ];
 
 /**
  * Keyword completions for VL: all hard keywords (reserved by the lexer) plus
- * the contextual soft keywords (`as`, `from`, `in`, `step`, `to`).
+ * the contextual soft keywords (`as`, `from`, `in`, `step`, `to`, `until`).
  * Each item carries `kind: "keyword"` so `server.ts` maps it to
  * `CompletionItemKind.Keyword`. These are returned as plain text items (no
  * `insertText`); clients filter the list against the typed prefix, so the full
