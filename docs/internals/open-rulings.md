@@ -599,6 +599,8 @@ Today no `...` token exists, no function is variadic, and `push` takes exactly o
 
 ### match-empty-clause — is `Stop{}` a legal arm pattern? — RULED 2026-09-06 night
 
+**BUILT 2026-09-07 (PR "the empty payload clause `Stop{}` is refused").** The parser refuses an empty clause at the top level with the ruled sentence, anchored at the `{`, and `format.vl` cannot print one back; the nested refusal is unchanged.
+
 **Ruling (owner, 2026-09-06 night):** (a) — BANNED. `Stop{}` is refused with the nested clause's sentence ("`Stop{}` binds nothing — write `Stop`"); one spelling per meaning. The owner also wants parameter and `let`/`const` destructuring EVENTUALLY, with the payload clause's grammar (pun, rename, nest) — ROADMAP rows 31/32.
 
 Today `Stop{}` is legal and means exactly `Stop` (a variant arm binding nothing), while the same shape NESTED (`Wrap{p: {}}`) is refused as binding nothing. **Options.** (a) refuse `Stop{}` with the nested clause's sentence ("`Stop{}` binds nothing — write `Stop`"), one spelling per meaning and nothing for `vl fmt` to choose between; (b) allow both levels (Rust allows `Stop {}`), and lift the nested refusal for consistency. **Recommendation: (a).**
