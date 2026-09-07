@@ -40,6 +40,7 @@ import {
   isvalType,
   memcIsFn,
   memcName,
+  memcTok,
   memcType,
   rcoalCol,
   rcoalEnd,
@@ -488,9 +489,9 @@ export function docForDeclTok(tok: i32) {
 }
 
 // Doc hover: the `///` block above the declaration the name under (line, col) resolves to,
-// or "". Two rungs, mirroring the host's own hover ladder: a value binding through the
-// symbol table (so a USE shows its declaration's docs), then a user `type` name, which is
-// not a binding occurrence at all (`symTypeAliasAt` says why) and is found in the stream.
+// or "". Three rungs: a value binding through the symbol table (so a USE shows its
+// declaration's docs), a name in DECLARATION position (a `type`'s field), then a user
+// `type` name, which is not a binding occurrence at all and is found in the stream.
 export function symDocAt(line: i32, col: i32) {
   const occ = symDefAt(line, col)
   if occ >= 0 {
@@ -506,6 +507,11 @@ export function symDocAt(line: i32, col: i32) {
       col >= t.col &&
       col <= t.col + t.text.length
     ) {
+      // A name followed by `:` is in DECLARATION position — a `type`'s field — so its own
+      // run answers; anything else under the cursor is read as a user type NAME.
+      if i + 1 < P.toks.length && P.toks[i + 1].kind == "COLON" {
+        return docForDeclTok(i)
+      }
       return docTypeDeclRun(t.text)
     }
     i = i + 1
@@ -757,15 +763,84 @@ function memcSoften(ty: i32) {
   if t is TyNullable { return memcSoften(t.nInner) }
   ty
 }
-function memcPush(nm: string, ds: string, fn: i32) {
+function memcPush(nm: string, ds: string, fn: i32, tok: i32) {
   memcName.push(nm)
   memcType.push(ds)
   memcIsFn.push(fn)
+  memcTok.push(tok)
 }
+
+// The NAME token of the one `type` declaration whose arena type is `ty`, or -1. A `TyObj`
+// is structural — two identical `type`s share one arena entry — so a receiver's declaration
+// is recoverable only when exactly one name maps to its type; more than one and the field's
+// `///` is genuinely ambiguous, so none is offered.
+function memcTypeNameTok(ty: i32) {
+  let found = -1
+  let n = 0
+  let i = 1
+  while i < P.toks.length {
+    const t = P.toks[i]
+    if t.kind == "IDENT" && P.toks[i - 1].kind == "TYPE" {
+      // A multi-module merge renames the entry's own type decls, so the map's key is
+      // mangled while the token still reads the source name (`symTypeAliasAt` says why).
+      let uty = cUserTypes[t.text] ?? (-1)
+      if uty < 0 { uty = cUserTypes[t.text + "$m0"] ?? (-1) }
+      if uty == ty {
+        n = n + 1
+        found = i
+      }
+    }
+    i = i + 1
+  }
+  if n == 1 { return found }
+  -1
+}
+
+// The name token of field `field` in the declaration whose name token is `nameTok`, or -1.
+// A field name sits at brace depth 1 and is followed by `:`, so a field of the same name in
+// an inline object TYPE one level down is not mistaken for it.
+function memcFieldTok(nameTok: i32, field: string) {
+  if nameTok < 0 { return -1 }
+  let depth = 0
+  let i = nameTok + 1
+  while i < P.toks.length {
+    const t = P.toks[i]
+    // The nesting is matched on the LEXEME, not the kind: this is a brace matcher over one
+    // declaration, not a dispatch over `TokKind`, and reading the two braces by their text
+    // keeps it from being one.
+    if t.text == "{" { depth = depth + 1 }
+    if t.text == "}" {
+      depth = depth - 1
+      if depth <= 0 { return -1 }
+    }
+    if depth == 1 && t.kind == "IDENT" && t.text == field {
+      if i + 1 < P.toks.length && P.toks[i + 1].kind == "COLON" { return i }
+    }
+    i = i + 1
+  }
+  -1
+}
+
+// The `///` block of member `i`, memoised for the one index the host is reading: it asks
+// for the length and then each code point in turn, so recomputing the run per character
+// would be quadratic in the doc. Reset by `symMemberScanAt`.
+let memcDocIx = -1
+let memcDocBuf = ""
+function memcDocOf(i: i32) {
+  if memcDocIx == i { return memcDocBuf }
+  memcDocIx = i
+  memcDocBuf = ""
+  if i >= 0 && i < memcTok.length { memcDocBuf = docForDeclTok(memcTok[i]) }
+  memcDocBuf
+}
+export function symMemberScanDocLen(i: i32) { memcDocOf(i).length }
+export function symMemberScanDocCharAt(i: i32, j: i32) { memcDocOf(i)[j] }
 export function symMemberScanAt(line: i32, col: i32) {
+  memcDocIx = -1
   memcName = []
   memcType = []
   memcIsFn = []
+  memcTok = []
   const occ = symOccAt(line, col)
   if occ < 0 { return 0 }
   // The same choice hover makes (`symOccQueryTy`): a receiver under a flow narrowing
@@ -776,6 +851,9 @@ export function symMemberScanAt(line: i32, col: i32) {
   if ty < 0 { return 0 }
   const t = T.tys[ty]
   if t is TyObj {
+    // Once per scan, not once per field: the walk is over the whole token stream, and every
+    // field of one receiver is declared in the same `type`.
+    const declTok = memcTypeNameTok(ty)
     let k = 0
     while k < t.objFieldNames.length {
       const nm = t.objFieldNames[k]
@@ -783,7 +861,7 @@ export function symMemberScanAt(line: i32, col: i32) {
         const fty = t.objFieldTypes[k]
         let isfn = 0
         if symMemIsFn(fty) { isfn = 1 }
-        memcPush(nm, tyToStrUser(fty), isfn)
+        memcPush(nm, tyToStrUser(fty), isfn, memcFieldTok(declTok, nm))
       }
       k = k + 1
     }
@@ -791,16 +869,16 @@ export function symMemberScanAt(line: i32, col: i32) {
     if t.primName == "string" {
       // The string builtin methods the host surfaces, hand-written into the column
       // `tyToStr` fills above, so a signature reads the way VL source spells it (`=>`).
-      memcPush("slice", "(i32, i32) => string", 1)
-      memcPush("indexOf", "(string) => i32", 1)
-      memcPush("includes", "(string) => boolean", 1)
-      memcPush("charCodeAt", "(i32) => i32", 1)
+      memcPush("slice", "(i32, i32) => string", 1, -1)
+      memcPush("indexOf", "(string) => i32", 1, -1)
+      memcPush("includes", "(string) => boolean", 1, -1)
+      memcPush("charCodeAt", "(i32) => i32", 1, -1)
       // The Stage 2c codec trio, offered here as well as typed in `typecheck`: the
       // completion table is a sibling ladder that can lag the type rules (§2.7 L6).
-      memcPush("cpAt", "(i32) => i32", 1)
-      memcPush("cpLen", "() => i32", 0)
-      memcPush("isCharBoundary", "(i32) => boolean", 1)
-      memcPush("bytes", "() => u8[]", 0)
+      memcPush("cpAt", "(i32) => i32", 1, -1)
+      memcPush("cpLen", "() => i32", 0, -1)
+      memcPush("isCharBoundary", "(i32) => boolean", 1, -1)
+      memcPush("bytes", "() => u8[]", 0, -1)
     }
   }
   memcName.length

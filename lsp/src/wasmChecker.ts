@@ -213,6 +213,13 @@ export type WasmMemberCompletion = {
   name: string;
   detail: string;
   isMethod: boolean;
+  /**
+   * The field's `///` block (D9.11) — the same text `docAt` gives hover for that
+   * field's declaration. Undefined for a `string` builtin method (no source
+   * declaration), when the receiver's `type` cannot be named (a `TyObj` is
+   * structural, so two identical `type`s are ambiguous), and on an older seed.
+   */
+  doc?: string;
 };
 
 /**
@@ -1406,7 +1413,16 @@ export const createWasmChecker = (
       const detail = detailLen <= 0
         ? ""
         : readString(detailLen, (j) => exp.memberScanTypeCharAt(i, j));
-      out.push({ name, detail, isMethod: exp.memberScanIsFn(i) === 1 });
+      // The doc pair is younger than the rest of the member-scan ABI, so it is probed
+      // per call rather than folded into `hasMemberScan`: a seed that speaks the scan
+      // but not docs must still answer with the members it does have.
+      const docLen = typeof exp.memberScanDocLen === "function"
+        ? exp.memberScanDocLen(i)
+        : 0;
+      const doc = docLen <= 0
+        ? undefined
+        : readString(docLen, (j) => exp.memberScanDocCharAt(i, j));
+      out.push({ name, detail, isMethod: exp.memberScanIsFn(i) === 1, doc });
     }
     return out;
   };

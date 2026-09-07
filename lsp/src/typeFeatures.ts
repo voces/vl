@@ -1099,6 +1099,7 @@ export type ExtMemberCompletion = {
   name: string;
   detail: string;
   isMethod: boolean;
+  doc?: string; // the field's `///` block, absent when it carries none
 };
 
 /** An external builtin completion (the wasm checker's `builtinCompletions`). */
@@ -1142,6 +1143,10 @@ export const memberCompletionsFromWasm = (
       name: m.name,
       kind: m.isMethod ? "function" : "variable",
       detail: isDisplayableType(m.detail) ? m.detail : undefined,
+      // The field's `///` block (D9.11), rendered above the type block by `docMarkdown`
+      // — the same layout hover uses. NOT filtered by `isDisplayableType`, which grades
+      // a rendered TYPE; prose is prose.
+      doc: m.doc,
     });
   }
   return [...byName.values()];
