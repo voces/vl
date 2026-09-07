@@ -56,7 +56,6 @@ units: **hours** · **half-day** · **days**.
 | 12 | **B17 — no lint for division by a constant zero** | `print(toString(x / 0))` → `vl check` clean, then `wasm trap: integer divide by zero` | `lint.vl`, beside `for-step-zero` at :784 | **hours** |
 | 13 | **B-ci — `build.rs` bakes `VL_SEED_KEY`, so every seed push recompiles the crate** | `scripts/vl-host/build.rs:76` `println!("cargo:rustc-env=VL_SEED_KEY={h:016x}")` | `scripts/vl-host/build.rs` | **hours** |
 | 14 | **B-chore — three split-form list stores never re-fused** | `emit_rep.vl:3151 / :3347 / :3369` still carry the split form and its comment | `rtGo` / `rtOfNullable` / `rtOfMap` | **hours** (verify the store fix has published first) |
-| 15 | **A-exhaust — the provably-true final discriminant is still emitted** | `wasm-dis`: `(if (i32.eq (struct.get $3 0 …) (i32.const 1)) …)` then `(unreachable)` | `emitIs` (`wasmEmit.vl:2533`) fed by `ifChainExhausts` (`typecheck.vl:22741`) — the analysis exists, only the elision is missing | half-day |
 | 18 | **B8 — the two `for` gaps that need a RULING, not a build** | objects → `a struct's fields are not a sequence …`; float bounds/step → `a `for` range counts in i32 …`. The other two members BUILT 2026-09-07: `for v, i in xs` / `for k, v in m` and an expression `step` | `open-rulings.md` §B8-for-struct, §B8-for-float-range — each has options, peers and a recommendation; neither is a build until it is ruled | ruling |
 | 20 | **A9 — no element-converting / field-dropping container copy** | `Cat[]` into an `Animal[]` param → `…type-valid (structural width subtyping) but not yet supported by codegen…` | `typecheck.vl` refusals + the converting-copy lowering; wire every delivery position BEFORE narrowing the gate | days |
 | 22 | **B-debug — a trap frame names `function@file:line`; the LINE is the DECLARATION's, not the trapping instruction's (2026-09-07)** | `print(a[7])` → `vl!__start__@1`; a two-file program → `vl!boom$m1@lib.vl:1` and `vl!__start__@main.vl:1`. The message still carries no index or length, and a frame still cannot say WHICH line inside the function trapped | the per-instruction map is what remains: a name-section string is per FUNCTION, so the trapping line needs a real source map (a custom section the host reads) — and the host would then change, with the three-hosts rule | days |
@@ -2193,9 +2192,15 @@ in-language GC knobs.
   usage constraints (HM / the existing A13 row-poly inference path), consistent with "hide types where
   possible." Requiring annotations on all named-fn params is NOT VL's stated stance.
 - 🟡 **A-exhaust. Exhaustiveness analysis for `is`-chains.** Dead-arm flagging and omit-the-`else`
-  return-coverage shipped. REMAINING: **codegen** — elide the provably-true final discriminant test +
-  drop the dead arm (a type-driven optimization binaryen cannot do; runtime already correct via the
-  no-`else` `unreachable` fall-through; pure size/speed, deferred).
+  return-coverage shipped, and **the final discriminant's elision landed 2026-09-07**: the last arm
+  of a chain `ifChainExhausts` proves exhaustive lowers as the bare `else`, with no tag comparison
+  and no `if` frame — the shape `match` has had since its desugar picked an else arm, which is why
+  the `match` twin of the row's own witness already emitted one comparison to the chain's two. The
+  proof marks the arm where it is made (`chainProvenCond`) and the emitter reads it, so coverage is
+  not re-derived in the emitter. Measured on `tests/cases`: five modules shrank 12–35 bytes and
+  every one prints what it printed. REMAINING: **drop the dead arm** — an arm whose member an
+  earlier arm already covered is unreachable rather than provably true, and is still emitted (a
+  type-driven optimization binaryen cannot do; runtime already correct; pure size/speed).
 - 🟡 **A-robust. Robustness floor.** An unresolved `Infer`/`Unknown` type must produce a clear
   **"cannot infer — annotate"** diagnostic; it must NEVER surface as a cryptic `Unhandled "Unknown"
   type` codegen error or a `containsInfer` TypeError crash. The main trigger — `const xs = []; xs.push(1)`
