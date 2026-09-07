@@ -314,6 +314,23 @@ carries ten. Resolving a field needs the declaring type, which the lint — hand
 a time — cannot see, so it would need a drift-gated table like the closed-set copy. That is a
 separate landing with its own measurement: **+2 hits, both real.**
 
+## A `match` keeps a FREQUENT-FIRST ordering, so even a 74-member set converts byte-identically
+
+`binPrec` dispatches over all 74 `TokKind` members and its `0` is a real answer — "not a binary
+operator", also the operator-climber's loop sentinel. The worry was its opening: nine frequent
+non-operators tested FIRST as one `||` so the common `0` exits early, a deliberate ordering a
+`match` might reorder. It does not. The arm order is the author's: keep the frequent-nine as the
+FIRST arm returning `0`, the twenty-five operators next, and the remaining forty members
+(including `""`) as the last or-pattern arm returning `0`. `desugarMatchAt` lowers arms in
+source order and makes the last the `else`, so the emitted if-chain is exactly the hand-written
+one — **byte-identical, verified by `cmp`**. The value is real: a binary operator added to the
+lexer and forgotten here would parse with no binding power, and the `_`-less match makes that a
+compile error.
+
+So the two questions compose. First: does the scrutinee's declared type admit a `match`
+(§THE DECIDING INPUT). Second: is the fall-through a real answer (§The default test). A yes to
+both converts, whatever the member count — the arm order is yours to keep.
+
 ## Agreement, and why there are two implementations
 
 `compiler/lint.vl` grades one module from the source the driver hands it; the census grades the
