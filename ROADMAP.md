@@ -1652,8 +1652,20 @@ in-language GC knobs.
         which is what separates "the number went down" from "it went down for the reason I
         think". Byte-identical on both populations, which is the whole claim, since coverage is
         §5.0's domain-WIDENING form. **CONTRADICT is 0, not the 178 this campaign quoted** —
-        that predates #2857. Remaining: nested array, nullable, value-union-box elements; no rung
-        is deletable until the column is empty for the kind.
+        that predates #2857, and §6.3's block now carries the dated correction.
+        **SECOND LANDING: the NESTED ARRAY element.** A list is a reference too, so a list OF
+        lists is a ref list — the same three lines, and it can only fire for a non-nullable outer
+        since `repOfNullable` owns the rest. The census was re-run on the post-map tree rather
+        than reused, and confirms the first landing closed exactly what it claimed (the MAP
+        reason reads zero). **`reflist` LEFT-ONLY falls 15,872 → 7,739, −8,133, and the fall
+        equals the census in EACH population separately** (5,209 `tests/cases`, 2,924 corpus) —
+        the stronger form of the check, since a total can match while two populations move in
+        compensating directions. CONTRADICT 0, byte-identical on both, rep-fuzz exact,
+        `regress.py` unmoved, mono-grid 0 BAD. Across the two landings **104,792 of the 112,531
+        queries (93%) have left the column, every one into AGREE.** Remaining: the NULLABLE
+        element (4,273 / 42 modules — `repOfArray`'s tail as well, not `repOfNullable`'s: an
+        array with a nullable ELEMENT never reaches that function), the value-union box
+        (3,167 / 82), other union (133), one no-recorded-type module (166). No rung is deletable until the column is empty for the kind.
         `docs/internals/rep-descriptor-campaign.md` §9.
      Two owner rulings gate how far items 2 and 6 can go: `one-literal-union-rep` and
      `nullable-rep-rule-stated-once` (`docs/internals/open-rulings.md` §D).
