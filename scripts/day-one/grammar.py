@@ -97,6 +97,13 @@ VALUES = [
             {"id": "is_narrow", "narrow": "is", "named_only": True,
              "lines": ["if {v} is Rect { print({v}.w) } else { print(0) }"],
              "want": ["2"]},
+            # The `match` spelling of the same test, with the arm BINDING its payload —
+            # the shape the rename/nest landings touched. Named-only for `is_narrow`'s
+            # reason: an arm names a declared type, which the inline face has none of.
+            {"id": "match_bind", "narrow": "match", "named_only": True,
+             "lines": ["match {v} {", "  Rect{w} => print(w)", "  Circle => print(0)",
+                       "}"],
+             "want": ["2"]},
             {"id": "shared", "lines": ["print({v}.kind)"], "want": ["rect"]},
         ],
     },
@@ -115,6 +122,12 @@ VALUES = [
             {"id": "is_narrow", "narrow": "is", "named_only": True,
              "lines": ["if {v} is Box { print({v}.w) } else { print(0) }"],
              "want": ["4"]},
+            # This record's narrow group had ONE member, so the `narrowing` axis never
+            # applied to it at all: a second spelling is what makes the axis reachable
+            # for a union with no literal discriminant.
+            {"id": "match_bind", "narrow": "match", "named_only": True,
+             "lines": ["match {v} {", "  Box{w} => print(w)", "  Dot => print(0)", "}"],
+             "want": ["4"]},
         ],
     },
     {
@@ -124,6 +137,13 @@ VALUES = [
         "reads": [{"id": "bare", "lines": ["print({v})"], "want": ["red"]},
                   {"id": "eq_narrow", "narrow": "eq",
                    "lines": ['if {v} == "red" { print(1) } else { print(0) }'],
+                   "want": ["1"]},
+                  # SYMMETRIC, unlike every other `match` read here: a literal arm names
+                  # no declared type, so the inline face spells it too and
+                  # `named_vs_inline` gets a `match` pair rather than an asymmetric one.
+                  {"id": "match_lit", "narrow": "match",
+                   "lines": ["match {v} {", '  "red" => print(1)',
+                             '  "green" => print(0)', "}"],
                    "want": ["1"]}],
     },
     {
@@ -141,6 +161,11 @@ VALUES = [
              "want": ["3"]},
             {"id": "coalesce",
              "lines": ["print(({v} ?? " + REC_ALT + ").n)"], "want": ["3"]},
+            # The `null` ARM. Exhaustiveness demands it like any other member, so this is
+            # the spelling where a missing case is a check error, not a fall-through.
+            {"id": "match_null", "narrow": "match", "named_only": True,
+             "lines": ["match {v} {", "  Rec{n} => print(n)", "  null => print(0)", "}"],
+             "want": ["3"]},
         ],
     },
     {
@@ -154,6 +179,11 @@ VALUES = [
              "want": ["4"]},
             {"id": "isnull", "narrow": "is_null",
              "lines": ["if {v} is null { print(0) } else { print({v}) }"],
+             "want": ["4"]},
+            # Symmetric, unlike the struct twin: the arm names a PRIM, which needs no
+            # declaration, so the inline face spells it too.
+            {"id": "match_null", "narrow": "match",
+             "lines": ["match {v} {", "  i32 => print({v})", "  null => print(0)", "}"],
              "want": ["4"]},
         ],
     },
@@ -207,8 +237,29 @@ VALUES = [
         "reads": [{"id": "is_narrow", "narrow": "is",
                    "lines": ["if {v} is i32 { print({v}) } else { print(0) }"],
                    "want": ["3"]},
+                  {"id": "match_atom", "narrow": "match",
+                   "lines": ["match {v} {", "  i32 => print({v})",
+                             "  string => print(0)", "}"],
+                   "want": ["3"]},
                   {"id": "as_q", "lines": ["print({v} as? i32 ?? -1)"], "want": ["3"]},
                   {"id": "bare", "lines": ["print({v})"], "want": ["3"]}],
+    },
+    {
+        # THREE members, which is the smallest union an OR-PATTERN can be written over:
+        # `"b" | "c"` collapses two arms, and a two-member union has no such pair. Its
+        # `eq` twin needs `||`, so the group grades one arm-collapse against one
+        # short-circuit — the same test, two control-flow shapes.
+        "id": "litunion3", "weight": 2, "decls": [("Grade", '"a" | "b" | "c"')],
+        "named": "Grade", "inline": '"a" | "b" | "c"', "expr": None,
+        "mk": ['return "b"'], "alt": '"a"', "features": ["litunion"],
+        "reads": [{"id": "bare", "lines": ["print({v})"], "want": ["b"]},
+                  {"id": "eq_narrow", "narrow": "eq",
+                   "lines": ['if {v} == "b" || {v} == "c" { print(2) } else { print(9) }'],
+                   "want": ["2"]},
+                  {"id": "match_or", "narrow": "match",
+                   "lines": ["match {v} {", '  "a" => print(9)',
+                             '  "b" | "c" => print(2)', "}"],
+                   "want": ["2"]}],
     },
 ]
 
