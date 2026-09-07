@@ -2195,12 +2195,10 @@ function emitNulIsNullTest(
   if !nicheOnly {
     const ncN = P.nodes[unwrapParen(refIx)]
     if ncN is OptMember {
-      const ncPrev = optRecvStagedIx
-      const ncPrevSet = optRecvStagedSet
+      const ncSv = optRecvStageSave()
       optRecvStageMark(refIx)
       if emitOptChainIsNull(body, refIx, fnIx) < 0 { return -1 }
-      optRecvStagedIx = ncPrev
-      optRecvStagedSet = ncPrevSet
+      optRecvStageRestore(ncSv)
       if invert { fbI32Eqz() }
       return 1
     }
@@ -2761,8 +2759,7 @@ function emitIs(body: i32[], isIx: i32, fnIx: i32) {
           const oisFi = sFieldIndex(oisSi, vrecv.omProp)
           if oisFi >= 0 {
             if sFieldTypeAt(oisSi, oisFi) == 16 {
-              const oisPrev = optRecvStagedIx
-              const oisPrevSet = optRecvStagedSet
+              const oisSv = optRecvStageSave()
               optRecvStageMark(vrecv.omObj)
               if emitOptChainIsNull(body, vrecv.omObj, fnIx) < 0 { return -1 }
               fbIf(127)
@@ -2776,8 +2773,7 @@ function emitIs(body: i32[], isIx: i32, fnIx: i32) {
               fbI32Bin(70)
               fbEnd()
               ctrlLeave()
-              optRecvStagedIx = oisPrev
-              optRecvStagedSet = oisPrevSet
+              optRecvStageRestore(oisSv)
               return 0
             }
           }
@@ -3038,8 +3034,30 @@ function optRecvStageMark(exprIx: i32) {
   if !optChainStagesRecv(exprIx) { return 0 }
   const base = optChainBaseOf(exprIx)
   if base < 0 { return 0 }
+  // Re-marking a base already teed in KEEPS the tee: the value is in the slot, and clearing
+  // the flag would evaluate the receiver a second time (D1826).
+  if optRecvStagedIx == base && optRecvStagedSet { return 0 }
   optRecvStagedIx = base
   optRecvStagedSet = false
+  0
+}
+
+// The `?.` stash marker as one saved value, for a lowering that nests another chain inside
+// this one. Paired with `optRecvStageRestore`, which is where the tee survives.
+function optRecvStageSave(): i32[] {
+  const sv: i32[] = []
+  sv.push(optRecvStagedIx)
+  sv.push(if optRecvStagedSet { 1 } else { 0 })
+  sv
+}
+
+// Put back what `optRecvStageSave` took — except the tee, which SURVIVES when both scopes
+// stage the same base: the inner lowering already left that value in the slot, and every
+// later read of it is a `local.get` rather than a second evaluation of the receiver (D1826).
+function optRecvStageRestore(sv: i32[]) {
+  const wasSet = optRecvStagedSet && optRecvStagedIx == sv[0]
+  optRecvStagedIx = sv[0]
+  optRecvStagedSet = wasSet || sv[1] == 1
   0
 }
 
@@ -3268,12 +3286,10 @@ function emitListGetRecv(body: i32[], objIx: i32, fnIx: i32, heap: i32) {
 // `F | null`. The shape is the fused `?? d` two-arm select with the default replaced by the
 // null of the result's own rep, so the arms below dispatch on rep (`repOfNode`), not field.
 function emitOptMemberValue(body: i32[], exprIx: i32, fnIx: i32) {
-  const omPrev = optRecvStagedIx
-  const omPrevSet = optRecvStagedSet
+  const omSv = optRecvStageSave()
   optRecvStageMark(exprIx)
   const omR = emitOptMemberValueGo(body, exprIx, fnIx)
-  optRecvStagedIx = omPrev
-  optRecvStagedSet = omPrevSet
+  optRecvStageRestore(omSv)
   omR
 }
 
@@ -22191,14 +22207,12 @@ function coalWidenUnboxed(from: i32, to: i32) {
 // a re-readable place — the fused arms read the receiver two and three times, and the stash
 // is what lets them do that to a call. One save/restore, since a default may hold a chain.
 function emitCoalesce(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
-  const coPrev = optRecvStagedIx
-  const coPrevSet = optRecvStagedSet
-  const coSv = listGetStageSave()
+  const coRecvSv = optRecvStageSave()
+  const coGetSv = listGetStageSave()
   optRecvStageMark(e.binLeft)
   const coR = emitCoalesceGo(body, e, exprIx, fnIx)
-  optRecvStagedIx = coPrev
-  optRecvStagedSet = coPrevSet
-  listGetStageRestore(coSv)
+  optRecvStageRestore(coRecvSv)
+  listGetStageRestore(coGetSv)
   coR
 }
 
