@@ -375,7 +375,7 @@ descriptor declines, which is exactly how much of the domain the descriptor cann
 | 5 | the valtype writers — `fbValtype`, `fbValtypeNullable`, `fbRefNullOfKind`, `fbRefNullForKind` | consumers of a `VKind`, not classifiers | a `VKind` member plus its slot | ✅ **DONE** (§6.5), and it corrected this row: a QUARTET not a trio, `fbHeapIdxForKind` does not exist, and three of the four were already `_`-less `match` tables. The fourth is now one too |
 | 6 | the `expr*` family — 48 classifiers, 927 call sites | domain-REMOVING | an EXPRESSION node, which the arena may not have typed (a monomorphized body carries the template's types) | blocked on item 7; convert by AXIS, never alphabetically |
 | 7 | `repOfName` for BINDINGS | new surface | a name plus the frame it is READ in → the declaration → its type | **BLOCKED, and §5.3 states the blocker and the change it needs**: `declaredSlotOf` takes a bare name; `paramTypeNode` and `globalLetOfSidIn` take `fnIx` only as a *frame-binds-this-name veto*. Callee resolution has been frame-aware since D1781; binding resolution never was |
-| 8 | the slot layer — `structIndexOfExpr`, `rlSlot*`, `mvSlot*`, `exprVariantIndex` | domain-KEEPING, per resolver | a nominal table row | last: `rdSlot` is the field the descriptor least owns (`repOfTy` fills it from `repSlotOfTy` for `TyObj` alone) |
+| 8 | the slot layer — 183 producers over four banks, plus a 13-function consumer rim | **producers: domain-critical, needs the descriptor; rim: consumer** | a nominal table row, whose bank the KIND selects | 🟡 the rim is DONE (§6.6); the producers are the next phase's, blocked on item 7 like item 6 — 54% of them decide a rep from a type or a node, and none is a `match`, because they produce the kind rather than switch on it |
 
 **Item 6 is the largest and it is domain-removing, which is the whole reason item 7 comes
 first.** An `expr*` predicate's arms are syntactic — a literal, a call, an index read — and
@@ -529,13 +529,13 @@ already-written policy rather than defect:
   modules — the **numeric literal-union base collapse**. `type N = 1 | 2` reps as its base
   scalar; `repOfTyFlat`'s `TyUnion` arm deliberately declines it ("the atom-vs-base split is
   alias-ness, checker metadata rather than structure"). The conversion keeps the collapse as
-  an explicit leg, and **§7's first ruling is exactly this line**.
+  an explicit leg, and **§8's first ruling is exactly this line**.
 * `descriptor-only`, 177,236 queries in 20 kinds — `struct`, `union`, `closure`, `map`,
   `reflist`, every nullable niche. The ladder never spoke for those shapes and its consumers
   compare `== <code>`; answering a code they have no arm for would be a new answer, not the
   same one. The conversion keeps the decline as the function's stated DOMAIN.
 
-Two of those declines are carve-outs written into the converted function and cited to §7,
+Two of those declines are carve-outs written into the converted function and cited to §8,
 because a ruling could retire either:
 
 * `void` — the one prim `repOfTy` reps (as the ladder fallthrough `i32`) and this vocabulary
@@ -777,7 +777,166 @@ candidate is kept in the record rather than shipped, with its price in the three
 
 ---
 
-## 7. Two design simplifications the campaign should be ruled on
+### 6.6 The slot layer — what it IS, and why only its rim converts
+
+The last family on §5.2's list, surveyed before anything was touched. **It is not one family;
+it is a large PRODUCER family with a thin CONSUMER rim, and only the rim is this phase's work.**
+
+**Four banks, and a slot is meaningless without the kind that says which bank it indexes.**
+Every table is a set of parallel columns in `compiler/emit_state.vl`:
+
+| bank | key column | the heap-type column | cross-bank pointers into it |
+| --- | --- | --- | --- |
+| A — structs | `sNames` (`:643`) | `sHeapIdx` (`:670`) | `mvValStructIdx`, `uVarSTwin` |
+| B — ref lists | `rlElemName` (`:739`) | `rlWrapIdx` (`:763`) | `mvRlSlot` |
+| C — union variants | `uVariants` (`:1028`) | `uVarHeap` (`:1045`) | `mvValVariantIdx` |
+| D — map values | `mvValName` (`:804`) + `mvKeyI32` (`:808`) | `mvMapTypeIdx` (`:825`) | — |
+
+That cross-bank column is the whole reason a per-`VKind` "which table" dispatch exists at all,
+and it is why the kind and the slot are one fact rather than two.
+
+**The asymmetry that makes this a producer family.** Each bank has **one to five WRITERS** (all
+heap indices are assigned in a single pass, `mAssignTypeIndices`) and **100–174 read references**.
+And the resolvers are many: **183 producer declarations** — 57 struct, 36 variant, 39 ref-list,
+51 map-value — split by what they take:
+
+| input | count | share |
+| --- | --- | --- |
+| an AST node (`exprIx` / `letIx` / `objIx` / `tyIx`) | 77 | **42%** |
+| a rendered NAME | 36 | 20% |
+| an already-resolved slot | 34 | 19% |
+| an arena type (`ty: i32`) | 22 | 12% |
+
+**54% decide a rep from raw input** — which is what a descriptor could answer instead.
+
+**Why the `_`-less `match` is not the instrument here, and neither is deletion.** Not one
+producer is a `match` at all, and that is correct: **they have no kind to switch on — they
+PRODUCE the kind.** Their bodies are if-chains ending in `-1` and table scans, and that `-1`
+tail is load-bearing everywhere ("the caller keeps its name path", "the rendered rung runs
+instead"). By §5.0's bar every one of them is a domain-critical conversion of the kind item 6
+is: it needs the descriptor, not an exhaustiveness check, and the descriptor needs the binding
+surface §5.3 specifies. **Converting them is the next phase's work, not this one's.**
+
+Two hazards the survey names for that phase, both already flagged in the code's own comments:
+
+* **Four producers clamp a miss to `0` instead of declining** — `letAnnRefListSlot`,
+  `tyAnnRefListSlot`, and the clamps in `refListSlotOfExpr` and `globalRefListSlot`. The file
+  says why it matters: *"0 is a wrong answer, not a missing one — two such globals would
+  otherwise share slot 0's wrapper wrongly. D1040."* That is the in-band-sentinel shape, and
+  `rdCovered == 0` is what replaces it.
+* **The kind and the slot are derived by two separate ladders that must agree.**
+  `annValtypeSlotOf` is documented as *"the one home for which interned table slot this
+  annotation's `fbValtype` selects"* — and its kind-side counterpart is a different if-chain
+  (`tyAnnRefListKind` / `globalCellKind` / `declaredKind`). D244, D1737, D1040 and D1106 are
+  all that pairing failing. One descriptor returning `(kind, slot)` as one value removes the
+  class.
+
+**What converts here is the rim.** Thirteen consumers take a `VKind` and a slot together;
+three were already `_`-less `match`es and a fourth became one in §6.5. The fifth and last is
+`armDestHeapOf` (`compiler/wasmEmit.vl`, 13 call sites), an if-chain naming four of the
+thirty-one members with a bare `-1` for the other twenty-seven — and its callers hand it a
+`VKind` out of a table column (`fRetKind[fnPos]`, `localIsRef[slot]`) beside a slot out of
+another (`fRetStructIdx[fnPos]`, `localStructIdx[slot]`), which is the pairing hazard above at
+its own call sites. It is now a `_`-less `match` with the twenty-seven declining members named.
+
+**Its risk was materially lower than §6.5's and the doc should say so rather than claim a
+scalp.** `fbRefNullForKind`'s bare default wrote `aTypeIdx` — a well-formed heap type for a rep
+that is not an array. `armDestHeapOf`'s is `-1`, an out-of-band decline its callers already
+test. The conversion buys the compile-time gate, not a bug fix: a 32nd `VKind` member is now an
+error here instead of a silent decline.
+
+Byte-identical in **3,172 of 3,172** `tests/cases` modules and **7,589 of 7,589** corpus cells;
+seed **+14 bytes**.
+
+**One cost of the instrument, worth naming**: `vl fmt` has no wrap for a long or-pattern, so a
+`_`-less `match` naming twenty-seven declining members is one 250-column line. That is the
+formatter's canonical form (`fmt --check` is clean), and it is the price of using the language
+gate over a 31-member set — the same question `fmt-fill-style-scalar-lists` was ruled on for
+list literals, one construct over.
+
+---
+
+## 7. What the campaign's first phase measured
+
+Six landings. This section is the phase's own scoreboard, and it is written so the next
+reader can grade it rather than trust it — every number names the instrument that produced it
+and the population it ran over.
+
+### 7.1 Families converted
+
+| family | shape | oracle | byte identity | seed |
+| --- | --- | --- | --- | --- |
+| `tyKindOf` — the i32 code vocabulary | domain-KEEPING | **3,366,947 / 3,366,947 AGREE**, CONTRADICT 0 | 3,148 + 7,589, all identical | +2,715 |
+| `repOfNameResult` — the callee name surface | new surface | slot differs 3,669, KIND differs 814, all in the pin-context fixtures | 3,154 of 3,155 + 7,589 | +324 |
+| `vtKindOfType`'s annotation ladder | domain-REMOVING; five arms ADDED, deletion refused | **CONTRADICT 2,963 → 178** over 1,082,293 queries | 3,154 + 7,589, all identical | +1,013 |
+| the field-code ladders | domain-KEEPING | **CONTRADICT 0** over 58,428 queries | 3,165 + 7,589, all identical | +120 |
+| the valtype writers | consumer family; `_`-less `match` | not applicable — no second producer | 3,167 + 7,589, all identical | **−113** |
+| the slot layer's consumer rim | consumer; `_`-less `match` | not applicable — the producers have no kind to switch on | 3,172 + 7,589, all identical | +14 |
+
+**Net seed cost of the phase: +4,073 bytes (+0.18%)**, of which +2,715 is the census and
+oracle scaffolding and the rest is four conversions. Every landing is byte-identical on both
+populations except D1834's own fixture, which master cannot build.
+
+### 7.2 Contradictions found, and what each was
+
+The oracle's only actionable bucket is CONTRADICT — both producers answer, and differ. Over
+the phase it fired twice and both were closed:
+
+* **D1834**, the one real defect. `fnRetF32ArraySid` and `fnRetAnnF32ArraySid` were the two of
+  sixteen return-kind readers still on the flat name map, so a per-pin clone returning `f32[]`
+  adopted the struct pin's kind: `emitProgram: index access but array type not collected` on a
+  `vl check`-clean program, with the f64 twin as the oracle. Fixed by the conversion itself.
+* **The five nullable scalar-list rungs `vtKindOfType` never had.** `string[] | null`,
+  `f64[] | null`, `i64[] | null`, `f32[] | null` and `u8[] | null` fell past every nullable arm
+  to the `"i32"` default. 2,785 of the ladder's 2,963 contradictions, closed by one rung.
+  Hygiene, not a `runs` move: no program reaches the ladder there today, and the arm's control
+  is the oracle, where it fires 2,785 times.
+
+`tyKindOf` and the field codes each graded **CONTRADICT 0** before conversion — the two
+producers never both answered and differed, which is what made those conversions safe.
+
+### 7.3 The bar, in the three forms the phase found it
+
+Every one was found by building the candidate and being refused by an instrument, not by
+argument:
+
+| form | what was built | what refused it, and at what price |
+| --- | --- | --- |
+| **do not REMOVE a domain** | delete `vtKindOfType`'s nine rungs the descriptor always answers first (201,576 queries, never LEFT-ONLY) | the oracle: **CONTRADICT 2,963 → 204,539**. The ladder's domain is a node the checker did not type, where the descriptor declines by construction — the rungs are not dead, they are untested |
+| **do not WIDEN a domain** | let the descriptor answer wherever it covers, at `fieldCodeOfTy` | byte identity: **8 modules `rc=0 → rc=1`**. A ladder's decline is an answer, routed to a producer that knows more |
+| **do not move a GUARD out of reach of its lint** | fold the valtype quartet's four identical bounds guards into one predicate (byte-identical, −685 bytes) | three ratchets, headed by **`sentinel-index-unguarded` 0 → 21**. That lint's contract is *within one function*, and it exists because four compiler traps in one day were this shape |
+
+**And a fourth thing the phase learned about its own instruments.** Byte identity and the
+oracle are not interchangeable: the oracle grades the ANSWER where both producers speak, so it
+was blind to the domain-widening candidate; byte identity measures only what the two corpora
+reach, so it was blind to the domain-removing one. A conversion needs both, and where the
+input is already a `VKind` it needs neither — the language's `_`-less `match` is stronger than
+either, being checked over the whole member set at compile time.
+
+### 7.4 The two rulings, with their measured cost
+
+Both are in `docs/internals/open-rulings.md` §D with options, peers and a recommendation.
+
+* **`one-literal-union-rep`** — a literal union's rep is decided by ALIAS-NESS, not by its type.
+  Cost measured at **three sites and growing**: 1,503 queries in 48 modules at `tyKindOf`; the
+  **only surviving contradiction** in `vtKindOfType`'s whole ladder, unclosable in its domain;
+  and **eight running programs** at the field-code family. The third is the first denominated
+  in programs rather than queries. Every family converted after this one inherits the carve-out.
+* **`nullable-rep-rule-stated-once`** — `rdNul` has four disciplines and `VKind` eleven nullable
+  members, picked between arm by arm. Recommendation: gate it now with a `_`-less `match`,
+  state it once when the valtype layer is revisited.
+
+### 7.5 The next phase, and its stated prerequisite
+
+The largest family is untouched and deliberately so: **`expr*`, 48 classifiers over 927 call
+sites, 31% of every classifier call site in the emitter.** It is domain-REMOVING by §5.0's bar
+and blocked on the binding surface, whose blocker, required change and frame-vocabulary trap
+are specified in **§5.3** rather than left to be discovered inside the conversion. That is the
+phase's last deliverable: the next family cannot start by guessing.
+
+---
+
+## 8. Two design simplifications the campaign should be ruled on
 
 Both are filed in `docs/internals/open-rulings.md` §D with options, peers and a
 recommendation. Neither is decided here.
@@ -796,7 +955,7 @@ recommendation. Neither is decided here.
 
 ---
 
-## 8. Where the numbers come from
+## 9. Where the numbers come from
 
 | number | instrument |
 | --- | --- |
