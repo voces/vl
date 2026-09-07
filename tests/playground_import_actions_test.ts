@@ -16,7 +16,7 @@
 // `wrapReader`), because a UFCS import fix needs `import "std:test"` to resolve.
 
 import { codeActions, completion, diagnostics, initLsp, organizeImports } from "../playground/src/lspAdapter.ts";
-import { createWasmChecker, type Exports } from "../lsp/src/wasmChecker.ts";
+import { createWasmChecker, type Exports, type WasmChecker } from "../lsp/src/wasmChecker.ts";
 import { wrapStdReader } from "../lsp/src/editorText.ts";
 
 const SEED = new URL("../build/vl-compiler.wasm", import.meta.url).pathname;
@@ -34,12 +34,15 @@ const module = seedExists
   ? new WebAssembly.Module(Deno.readFileSync(SEED) as BufferSource)
   : undefined;
 
-const init = (): void => {
+// Returns the checker so a test can read its `graphCheckCount` call-counter.
+const init = (): WasmChecker => {
   if (!module) throw new Error(`no seed at ${SEED}`);
   const instance = new WebAssembly.Instance(module, {});
   // `wrapStdReader` is the browser's own reader wrapper — a `std:` key resolves
   // from the embedded map — so a UFCS import fix's `import "std:test"` resolves.
-  initLsp(createWasmChecker(() => instance.exports as unknown as Exports, wrapStdReader));
+  const checker = createWasmChecker(() => instance.exports as unknown as Exports, wrapStdReader);
+  initLsp(checker);
+  return checker;
 };
 
 const assert = (cond: boolean, msg: string): void => {
@@ -123,4 +126,35 @@ Deno.test({ name: "organize: an already-organized file yields no edits", ignore 
   init();
   const edits = await organizeImports('import { trim } from "std:str"\nprint(trim("  x  "))\n');
   assert(edits.length === 0, `no edits, got ${JSON.stringify(edits)}`);
+});
+
+// ---- the code-action path reuses the editor's diagnostics, not a re-check ----
+
+Deno.test({ name: "cache: a code-action request re-uses the diagnostics pass, not a second check", ignore }, async () => {
+  const checker = init();
+  const src = 'import { trim, join } from "std:str"\n\nexpect(1 + 2).toEqual(3)\n';
+  const range = { start: { line: 2, character: 14 }, end: { line: 2, character: 21 } };
+
+  // The editor's own diagnostics pass runs on every edit (this is what populates
+  // the cache). One graph check.
+  await diagnostics(src, "main.vl");
+  const afterDiag = checker.graphCheckCount();
+
+  // A code-action request on the SAME buffer — `codeActions` + `organizeImports`,
+  // exactly what `main.ts`'s provider fires — must add ZERO checks: before this
+  // change each re-ran the whole `check`, so the count rose by 2.
+  await codeActions(src, range, [], "main.vl");
+  await organizeImports(src, "main.vl");
+  assert(
+    checker.graphCheckCount() === afterDiag,
+    `cache hit expected 0 new checks, got ${checker.graphCheckCount() - afterDiag}`,
+  );
+
+  // A DIFFERENT buffer is a cache miss and does re-check — so the counter is
+  // live, not stuck at zero.
+  await codeActions(src + "\nprint(1)\n", range, [], "main.vl");
+  assert(
+    checker.graphCheckCount() > afterDiag,
+    "a code action on unseen text must re-check",
+  );
 });
