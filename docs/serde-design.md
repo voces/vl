@@ -368,10 +368,9 @@ Facts that constrain the design, each verified this session:
      `operator '+' is not defined for string and f64` **(RUN 2026-09-01)**, but **template
      literals exist** and their holes bind absolutely to the canonical stringifier:
      `"f64=\{x} i32=\{n} i64=\{i} bool=\{b}"` renders all four widths with no import and
-     no concat **(RUN 2026-09-01)**. A PLAIN string is enough — `\{…}` is one hole syntax
-     across both quoted forms since 2026-09-01, and backticks add multiline and nothing
-     else, so the JSON spellings below need no delimiter change and their bare braces stay
-     data. Anywhere below that reasons about hand-built strings
+     no concat **(RUN 2026-09-01)**. A PLAIN string is all there is — one string form,
+     which also spans lines (2026-09-06), so the JSON spellings below need no delimiter
+     change and their bare braces stay data. Anywhere below that reasons about hand-built strings
      being quadratic or awkward, interpolation is now the spelling — and the absolute binding
      (`DECISIONS.md`, "A template literal's stringifier is bound ABSOLUTELY") is the precedent
      OQ-1 leans on.
@@ -782,7 +781,7 @@ function decode(src: string): Config | null {   // built AT the destination shap
 }
 ```
 
-Two things the sketch shows that prose did not. **The template literal carries the whole
+Two things the sketch shows that prose did not. **The interpolated string carries the whole
 writer** — no `u8[]` builder, no quadratic concat, and holes render `f64`/`i64` directly —
 so the `fromCodePoints`-once idiom is an optimisation rather than a necessity. (The appendix's
 value-tree renderer uses `out = out + …` for legibility and is quadratic at document scale;
@@ -1711,7 +1710,7 @@ attribute syntax, and inventing one for this is a language feature bolted on for
 recognizes the import.** The function is spelled in a std module and reached by an ordinary
 import, so it reads exactly like `toString` or `encodeBase64`; the emitter recognizes the
 bound symbol and generates the per-shape walk in place of an ordinary call. *For:* **the
-precedent exists and shipped this week.** A template literal's hole binds ABSOLUTELY to
+precedent exists and shipped this week.** An interpolation hole binds ABSOLUTELY to
 std's renderer through one constant, `TPL_RENDER_EXPORT` in `driver.vl`, with the module
 merge rewriting an unspellable name onto the merged symbol (`DECISIONS.md`, "A template
 literal's stringifier is bound ABSOLUTELY"; `docs/constraints-design.md` §1). That is the

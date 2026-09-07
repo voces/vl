@@ -47,11 +47,10 @@ units: **hours** · **half-day** · **days**.
 
 | # | item | witness, run today | region | effort |
 | --- | --- | --- | --- | --- |
-| 1 | **B15 — a nested capturing function cannot be taken as a VALUE.** **NARROWED 2026-09-06: the DIRECT-call half is built** ([D1780](internals/inventory/D1780.md)/[D1781](internals/inventory/D1781.md)), the BINDING hop with it ([D1782](internals/inventory/D1782.md)) and the ARRAY-element delivery at one pin ([D1794](internals/inventory/D1794.md)); what stands is a closure that escapes its pin | `function o(n) { function k(x) { return x + n }; return k(1) }` runs at one pin and at two, and so do `const fs = [k]; fs[0](1)` and `const f = k; f(1)` at two pins; the array element at two pins still refuses ([D1816](internals/inventory/D1816.md)), and `return k` still refuses | `wasmEmit.vl emitClosureValue`; the binding hop is `calleeRetKindSid` and the `fnValTarget` family, which key on a name with no frame | half-day (D1782) |
+| 1 | **B15 — a nested capturing function cannot be taken as a VALUE.** **NARROWED 2026-09-06: the DIRECT-call half is built** ([D1780](internals/inventory/D1780.md)/[D1781](internals/inventory/D1781.md)), the BINDING hop with it ([D1782](internals/inventory/D1782.md)), the ARRAY-element delivery at one pin ([D1794](internals/inventory/D1794.md)) and the ARGUMENT hop ([D1795](internals/inventory/D1795.md)); what stands is a closure that escapes its pin | `function o(n) { function k(x) { return x + n }; return k(1) }` runs at one pin and at two, and so do `const fs = [k]; fs[0](1)`, `function use(p) { return p(1) }; use(k)` and `const f = k; f(1)` at two pins; the array element at two pins still refuses ([D1816](internals/inventory/D1816.md)), and `return k` still refuses | `wasmEmit.vl emitClosureValue`; the binding hop is `calleeRetKindSid` and the `fnValTarget` family, which key on a name with no frame | half-day (D1782) |
 | 2 | **D1775 — a `type` alias over a negation type reps as a union BOX with a scalar value** | `type N = !string; const x: N = 5` → `vl check` rc 0, then `type mismatch: expected (ref $type), found i32`. `wasm-dis`: `(global $global$0 (mut (ref $1)) (i32.const 5))`. The INLINE spelling runs | `typecheck.vl` / `emit_classify.vl` rep classification of an alias body | hours–half-day |
 | 4 | **B21.1 — `match` payload renaming and nested destructuring** | `Move{x: a}` → `parse error … match payload binding must be a field name` | `parser.vl:2847`; `match-design.md` measures both as one-branch extensions | hours (renaming) / half-day (nesting) |
 | 5 | **B7 R3 — `.backwards()` over a string** | `"abc".backwards()` → `no method '.backwards' on string` | `std/str.vl`; §Codepoints already specifies it | **hours** |
-| 7 | **A-robust — an unbound generic return parameter refuses at EMIT, not at check** | `function mk<T>(): T[] { return [] }; mk()` → `emitProgram: monomorphize: a return type parameter of \`mk\` is not bound by any parameter` | move it to the check tier beside `solveUnannotParams`' "cannot infer — annotate" family | **hours** |
 | 8 | **the `parseIf` `then` arm is not marked lossless** | `if c then print(1)` + a type error → the parse error ONLY; `if c print(1)` + the same → BOTH | `parser.vl:2652` needs `dgMarkLossless(P.diags.length)`, as `parseBracedBody:2633` has | **hours** |
 | 9 | **`vl build` with no `-o` writes a file instead of stdout** | `vl build p.vl > out.bin` → `out.bin` holds `wrote p.wasm (147 bytes)` | `scripts/vl-host/src/main.rs` build arm; already "decided: yes" | **hours** |
 | 10 | **Organize Imports drops an unused specifier but not a DUPLICATE one** | `server.ts:1491 .filter((d) => d.code === "unused-import")` | `lsp/src/server.ts:1489-1500` | **hours** |
@@ -60,7 +59,6 @@ units: **hours** · **half-day** · **days**.
 | 14 | **B-chore — three split-form list stores never re-fused** | `emit_rep.vl:3151 / :3347 / :3369` still carry the split form and its comment | `rtGo` / `rtOfNullable` / `rtOfMap` | **hours** (verify the store fix has published first) |
 | 15 | **A-exhaust — the provably-true final discriminant is still emitted** | `wasm-dis`: `(if (i32.eq (struct.get $3 0 …) (i32.const 1)) …)` then `(unreachable)` | `emitIs` (`wasmEmit.vl:2533`) fed by `ifChainExhausts` (`typecheck.vl:22741`) — the analysis exists, only the elision is missing | half-day |
 | 16 | **A6 residue — `is` over two ref arms is a tag compare, not `ref.test`** | `grep -rn "ref\.test" compiler/*.vl` → 0 hits | `emitIs`, `wasmEmit.vl:2533` | half-day (pure perf) |
-| 17 | **A5 — `x?.f()` and `x?.y.z`** | `p?.f() ?? 0` → `called value is not a function`; `o?.y.z` → `member access '.z' on non-object Inner \| null` (`x?.y?.z` runs) | `OptMember` in `emit_rewrite.vl:570/1039/1177`, `check_query.vl:14` | half-day each |
 | 18 | **B8 — four `for` gaps, one member per row** | objects → `for-in expects an array or map, got P`; `for v, i in xs` → parse error; expression step → `undeclared identifier 'i'`; float bounds → `for-range bounds must be i32` | `typecheck.vl:34100/34156`, `parser.vl` for-head | half-day each |
 | 19 | **B6a — an i32-keyed map in four container positions** | `const u: {[i32]: f64} \| i32 = 5` → `emitProgram: an i32-keyed Map/Set is supported as … not inside '{[i32]:f64}\|i32'`; same for `[][]`, closure array, map value | `emit_collect.vl:4707 i32MapSpellingLowerable` | days (position matrix, build-then-narrow per D965) |
 | 20 | **A9 — no element-converting / field-dropping container copy** | `Cat[]` into an `Animal[]` param → `…type-valid (structural width subtyping) but not yet supported by codegen…` | `typecheck.vl` refusals + the converting-copy lowering; wire every delivery position BEFORE narrowing the gate | days |
@@ -204,15 +202,14 @@ Five items, in order. (0) is shipped; the rest are scheduled against it.
   place** — DONE #2199 (ruled 2026-09-01, shipped the same day). Default scope, all six
   emit/classify/collect arms and `emitToString` are gone; `std:fmt` exports `toString`;
   every in-tree caller migrated; both retired spellings get a targeted import hint.
-- **String interpolation — SHIPPED #2188 (templates), EXTENDED and UNIFIED the same
-  week (plain strings + the `\{` migration).** ONE hole syntax, `\{expr}`, in BOTH
-  quoted forms: `"v=\{x}"` and `` `v=\{x}` `` are the same construct, desugared in the
+- **String interpolation — SHIPPED #2188, UNIFIED the same week, and the backtick form
+  REMOVED 2026-09-06.** ONE string form and ONE hole syntax: `"v=\{x}"`, desugared in the
   parser to concat over `std:fmt`'s renderer bound ABSOLUTELY via a compiler-injected
   bare import edge plus an unspellable rename row. The trigger sits in the ESCAPE
   namespace (Swift's `\(` placement, the owner's brace spelling), which is what makes it
   additive at zero permanent cost — `{` is data in every string forever, and `"a\{b"`
-  was a hard lex error before. `${` is ordinary text now and `\$` is retired; multiline
-  stays backtick-only. Two remainders, both measured and both UNCHANGED by the
+  was a hard lex error before. `${` is ordinary text now and `\$` is retired; a `"…"`
+  literal spans lines (Rust's rule), and a backtick is refused by name. Two remainders, both measured and both UNCHANGED by the
   extension: a STRING-only hole still pulls `std:fmt`+`std:str` because the host closes
   the module graph before any type exists — the fix is whole-program DCE, not a
   literal-form-specific drop; and an `f32` hole reaches the pre-existing
@@ -1675,10 +1672,16 @@ in-language GC knobs.
   difference is the mangled name, not the rule.
 
 - 🟡 **A4. Negation types** (`!A`). REMAINING: full open-world negation tracking (needs A12).
-- 🟡 **A5. Flow narrowing.** REMAINING: `case`/multi-guard (no grammar); stored-witness (A6b Stage B);
-  optional *call* `x?.f()` + chain short-circuit `x?.y.z` (use `x?.y?.z`); per-call
-  reachability-pruned return types (blocked on memoize-with-holes — see `docs/guide/narrowing.md`,
-  and see A5b: the pruning is ALSO gated on A4, which the guide does not say).
+- 🟡 **A5. Flow narrowing.** The optional *call* `x?.f()` and the chain short-circuit `x?.y.z`
+  SHIPPED 2026-09-06 ([D1814](internals/inventory/D1814.md)/[D1815](internals/inventory/D1815.md)):
+  one `?.` guards everything to its right, so the result carries the `| null` once and a link that
+  is nullable in its own right still needs its own `?.`. REMAINING: `case`/multi-guard (no
+  grammar); stored-witness (A6b Stage B); an INDEX after a `?.` (`o?.y[0]`), which the guard does
+  not yet cover; a `?.` call whose receiver is itself a call, refused at emit because the guard
+  names its receiver twice; a `?.` call over a MAP READ, declined for
+  [D1827](internals/inventory/D1827.md); per-call reachability-pruned return types (blocked on
+  memoize-with-holes — see `docs/guide/narrowing.md`, and see A5b: the pruning is ALSO gated on
+  A4, which the guide does not say).
 - ⬜ **A5b. The pruning asymmetry — one side is intersection, the other is negation.** MEASURED
   2026-08-16 on `function foo(thing) { if thing is string { return 6 } return "ok" }`:
   `foo(true)` infers **`string`** (pruned) while `foo("ok")` infers **`i32 | string`** (not pruned).
@@ -2068,8 +2071,12 @@ in-language GC knobs.
   **"cannot infer — annotate"** diagnostic; it must NEVER surface as a cryptic `Unhandled "Unknown"
   type` codegen error or a `containsInfer` TypeError crash. The main trigger — `const xs = []; xs.push(1)`
   — is fixed (A-infer-empty now infers it, and the "cannot infer — annotate" floor is deferred to
-  scope-close so it fires only for a genuinely-unconstrained empty). REMAINING: audit the other holes
-  (`Map()`/`Set()` empties, unresolved generic params) for the same clean-diagnostic-not-crash guarantee.
+  scope-close so it fires only for a genuinely-unconstrained empty). The unresolved-generic half is
+  **BUILT (2026-09-06, [D1813](internals/inventory/D1813.md)/[D1819](internals/inventory/D1819.md))**:
+  a type parameter only the RETURN type names is refused at the checker, from the direct and the UFCS
+  call path alike and at the declared and the INFERRED spelling alike, with a sentence that names what
+  to write. REMAINING: audit the other holes (`Map()`/`Set()` empties) for the same
+  clean-diagnostic-not-crash guarantee.
   The `Map()` half has a **named instance**: an inferred map with a non-mono value type reaches emit
   and fails there with a message that lists `string` as supported while rejecting a `string` value —
   see **A-infer-map-value**. That one is a rep gap, not only a diagnostic gap, but it is also the

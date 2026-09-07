@@ -42,6 +42,7 @@ import {
   numLitUnionBaseName,
   numLitUnionHasBase,
   opIdxFnAtNode,
+  optCallRestamp,
   recordNodeTyFrom,
   tyFieldTyOf,
   tyHasTyVar,
@@ -96,6 +97,7 @@ import {
   mkMember,
   mkNull,
   mkNum,
+  mkOptMember,
   mkParam,
   orderArgsByParamNames,
   paramDefaultIsCallsite,
@@ -341,8 +343,79 @@ function drwAnyInstanceTakesField(recvIx: i32, prop: string, ctx: i32) {
   false
 }
 
+// A fresh node denoting the same place as `ix`, so the guard's null test and the call never
+// share one arena index. Only the place forms `exprReReadable` admits are minted; anything
+// else is handed back unchanged, its caller having already declined (D1814).
+function drwRecvClone(ix: i32) {
+  const n = P.nodes[ix]
+  if n is Paren { return drwRecvClone(n.parInner) }
+  if n is Ident {
+    const cId = mkIdent(n.identName, n.pos)
+    nodeTyCarry(cId, ix)
+    return cId
+  }
+  if n is Member {
+    const cMem = mkMember(n.memObj, n.memProp, n.pos)
+    nodeTyCarry(cMem, ix)
+    return cMem
+  }
+  if n is Index {
+    const cIdx = mkIndex(n.idxArr, n.idxIndex, n.pos)
+    nodeTyCarry(cIdx, ix)
+    return cIdx
+  }
+  drwRecvNotAPlace(ix)
+}
+
+// Every `Node` kind `drwRecvClone` does not mint, as one answer: a value rather than a place,
+// so there is nothing to re-read and its caller declined the guard before asking.
+function drwRecvNotAPlace(ix: i32) { ix }
+
+// Wraps a rewritten optional call in the one guard its `?.` asks for — `if recv != null
+// { call } else { null }` — so the call itself lowers through the path it would have had
+// without the `?.`. `recvIx` is -1 for every other call, which passes through untouched
+// (D1814).
+function drwOptGuard(
+  res: i32,
+  ix: i32,
+  recvIx: i32,
+  pos: i32,
+  atStmt: boolean,
+) {
+  if recvIx < 0 { return res }
+  const gThen: i32[] = []
+  gThen.push(res)
+  // A `void` call has no value to fold a null through, and neither has one whose value the
+  // statement discards — a bare `null` there reaches `emitNullLitNode` with no destination.
+  let gElse = -1
+  if !atStmt && !nodeTyExcludesNull(ix) {
+    const gElseStmts: i32[] = []
+    gElseStmts.push(mkNull("null", pos))
+    gElse = mkBlock(gElseStmts, pos)
+  }
+  const gIf = mkIf(
+    mkBinary("!=", drwRecvClone(recvIx), mkNull("null", pos), pos),
+    mkBlock(gThen, pos),
+    gElse,
+    pos,
+  )
+  // D969 — the `| null` belongs to the `if` from here on, and the call node keeps the
+  // return the guarded arm actually leaves on the stack.
+  nodeTyCarry(gIf, ix)
+  optCallRestamp(ix)
+  gIf
+}
+
+// True while `drwWalk` is entering a node in STATEMENT position — one whose value is
+// discarded. Read and cleared at the walk's top, so the statement itself sees it and no
+// sub-expression inherits it. A block's LAST statement is deliberately not marked: it may be
+// the block's value.
+let drwAtStmt = false
+
 function drwWalk(ix: i32, ctx: i32) {
   if ix < 0 { return ix }
+  const atStmt = drwAtStmt
+  drwAtStmt = false
   const n = P.nodes[ix]
   if n is Call {
     const args = n.callArgs
@@ -351,9 +424,38 @@ function drwWalk(ix: i32, ctx: i32) {
       args[i] = drwWalk(args[i], ctx)
       i = i + 1
     }
+    // `p?.f(args)` — the callee becomes the plain member read, so UFCS, a callable field and
+    // every builtin method lower through the path they already have, and `drwOptGuard` moves
+    // the whole call into the non-null arm of one guard below.
+    let optWasOpt = false
+    const c0 = P.nodes[n.callFn]
+    if c0 is OptMember {
+      optWasOpt = true
+      n.callFn = mkMember(c0.omObj, c0.omProp, c0.pos)
+    }
+    let optRecv = -1
     const callee = P.nodes[n.callFn]
     if callee is Member {
       callee.memObj = drwWalk(callee.memObj, ctx)
+      if optWasOpt {
+        // A receiver that cannot be null needs no guard; one the lowering cannot read twice
+        // keeps the `?.` callee, which `emitCall` refuses by name. A map read is excluded for
+        // the reason the `??` desugar excludes it — a narrowed one in an if-expression bound
+        // to a local is check-clean invalid wasm of its own (D1827).
+        if !nodeTyExcludesNull(callee.memObj) {
+          if exprReReadable(callee.memObj) && !drwIsMapRead(callee.memObj) {
+            optRecv = callee.memObj
+          } else {
+            n.callFn = mkOptMember(
+              callee.memObj,
+              callee.memProp,
+              false,
+              callee.pos,
+            )
+            return ix
+          }
+        }
+      }
       // D1522 — a map `m.get(k)` is the read `m[k]`, so it becomes one, here rather than
       // as a separate emit arm: an emit arm alone leaves every consumer classifier reading
       // the call's checker type and claiming a box the read never left. The checked type
@@ -362,7 +464,7 @@ function drwWalk(ix: i32, ctx: i32) {
         if args.length == 1 && nodeTyIsMap(callee.memObj) {
           const mgIx = mkIndex(callee.memObj, args[0], n.pos)
           nodeTyCarry(mgIx, ix)
-          return mgIx
+          return drwOptGuard(mgIx, ix, optRecv, n.pos, atStmt)
         }
       }
       // UFCS: `o.f(args)`, where `f` is a free function whose first parameter is named
@@ -422,7 +524,7 @@ function drwWalk(ix: i32, ctx: i32) {
         n.callFn = mkIdent(uName, -1)
       }
       drwFillDefaults(ix, ctx)
-      return ix
+      return drwOptGuard(ix, ix, optRecv, n.pos, atStmt)
     }
     n.callFn = drwWalk(n.callFn, ctx)
     drwFillDefaults(ix, ctx)
@@ -439,6 +541,7 @@ function drwWalk(ix: i32, ctx: i32) {
       if bst is LetDecl {
         if letDeclIsClosureNoLocal(bs[i2]) { drwCloNames.push(bst.letName) }
       }
+      drwAtStmt = i2 + 1 < bs.length
       bs[i2] = drwBareBlock(drwWalk(bs[i2], ctx))
       i2 = i2 + 1
     }
@@ -586,6 +689,15 @@ function drwWalk(ix: i32, ctx: i32) {
   }
   if n is OptMember {
     n.omObj = drwWalk(n.omObj, ctx)
+    // A guard over a receiver that cannot be null is the plain read: the null arm is
+    // unreachable, and the standalone `?.` lowering has no rep to build for a result the
+    // guard never widened. Folded here for the reason `x ?? d` over a non-nullable left
+    // operand is (D1815).
+    if nodeTyExcludesNull(n.omObj) {
+      const omFold = mkMember(n.omObj, n.omProp, n.pos)
+      nodeTyCarry(omFold, ix)
+      return omFold
+    }
     return ix
   }
   if n is Index {
@@ -664,6 +776,7 @@ export function dispatchRewrite(stmts: i32[]) {
     } else if s is UnionDecl {
     } else {
       const oldIx = stmts[i]
+      drwAtStmt = true
       const newIx = drwBareBlock(drwWalk(oldIx, -1))
       if newIx != oldIx {
         // The statement node changed (e.g. `o[k] = v` → the write-trap call).

@@ -1116,24 +1116,24 @@ Deno.test({
   }
 });
 
-// The template arm's own failure shape: without it the loop never runs, `std:fmt`
+// The interpolation arm's own failure shape: without it the loop never runs, `std:fmt`
 // is never committed, and the injected reference resolves to nothing — an
 // "undeclared identifier" on a program the CLI compiles cleanly, the worst shape
 // of divergence, since it only appears in the editor.
-Deno.test({ name: "wasm-checker: a template with an i32 hole checks clean (std:fmt is fetched)", ignore }, async () => {
+Deno.test({ name: "wasm-checker: an interpolated literal with an i32 hole checks clean (std:fmt is fetched)", ignore }, async () => {
   const checker = loadWasmChecker(SEED, log)!;
   // The reader knows NOTHING about std — `withStd` serves `std:fmt` (and the
   // `std:str` it imports) from the embedded map.
   const diags = await checker.check(
-    "const x = 5\nprint(`v=\\{x}`)\n",
+    'const x = 5\nprint("v=\\{x}")\n',
     "/proj/main.vl",
     noSiblings,
   );
   if (diags.length !== 0) {
     throw new Error(`expected clean, got: ${diags.map((d) => d.message).join("; ")}`);
   }
-  // A hole-less template needs no renderer and stays on the single-source path.
-  const plain = await checker.check("print(`plain`)\n", "/proj/main.vl", noSiblings);
+  // A hole-LESS literal needs no renderer and stays on the single-source path.
+  const plain = await checker.check('print("plain")\n', "/proj/main.vl", noSiblings);
   if (plain.length !== 0) {
     throw new Error(`expected clean, got: ${plain.map((d) => d.message).join("; ")}`);
   }
@@ -1143,7 +1143,7 @@ Deno.test({ name: "wasm-checker: a template with an i32 hole checks clean (std:f
   // asserted, because this test used to use `f64` as its OUT-of-domain case and
   // the widening is what flipped it.
   const f64 = await checker.check(
-    "const f = 1.5\nprint(`v=\\{f}`)\n",
+    'const f = 1.5\nprint("v=\\{f}")\n',
     "/proj/main.vl",
     noSiblings,
   );
@@ -1155,7 +1155,7 @@ Deno.test({ name: "wasm-checker: a template with an i32 hole checks clean (std:f
   // width: it has no rendering at all, and will not get one from a number
   // renderer.
   const bad = await checker.check(
-    "const p = { x: 1 }\nprint(`v=\\{p}`)\n",
+    'const p = { x: 1 }\nprint("v=\\{p}")\n',
     "/proj/main.vl",
     noSiblings,
   );
