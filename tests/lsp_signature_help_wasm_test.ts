@@ -231,7 +231,7 @@ const SRC = [
   "  nil()", // 12
   "  const h: Handler = { cb: (v: i32) => v }", // 13
   "  h.cb(1)", // 14
-  '  print(`v=\\{greet("q", 3)}`)', // 15
+  '  print("v=\\{greet("q", 3)}")', // 15
   "}", // 16
 ].join("\n");
 

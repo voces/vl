@@ -373,8 +373,9 @@ Deno.test({ name: "wasm-lexical: `=>` fuses to one keyword token when source is 
 
 Deno.test({ name: "wasm-lexical: an interpolated literal's parts are string-classed, its hole is not", ignore }, () => {
   const checker = loadWasmChecker(SEED, () => {})!;
+  // One literal form since 2026-09-06, so one row: the backtick spelling this suite used to
+  // pair against is refused by the lexer now.
   for (const [what, src] of [
-    ["template", "const x = 1\nconst s = `v=\\{x} ok`\n"],
     ["plain string", 'const x = 1\nconst s = "v=\\{x} ok"\n'],
   ] as const) {
     const lexical = checker.lexicalTokensAt(src);
@@ -406,18 +407,10 @@ Deno.test({ name: "wasm-lexical: an interpolated literal's parts are string-clas
     }
   }
 
-  // A hole-less template is one token covering the whole literal.
-  const plain = checker.lexicalTokensAt("const p = `abc`\n");
-  const plainToks = decode(semanticTokensDataFromWasm([], plain, [], "const p = `abc`\n"));
-  const whole = plainToks.find((t) => t.line === 0 && t.char === 10);
-  if (whole === undefined || whole.type !== "string" || whole.length !== 5) {
-    throw new Error(`expected a 5-char string token at 0:10, got ${JSON.stringify(whole)}`);
-  }
-
-  // A hole-LESS `"` string still carries NO class — it is one `STRING` token and
-  // the TextMate grammar's, whose finer escape scopes would be lost to a flat
-  // semantic token. Only a holed one splits, and only a split one is coloured
-  // here; that asymmetry is deliberate and this is where it is pinned.
+  // A hole-LESS string carries NO class — it is one `STRING` token and the TextMate
+  // grammar's, whose finer escape scopes would be lost to a flat semantic token. Only a
+  // HOLED literal splits, and only a split one is coloured here; that asymmetry is
+  // deliberate and this is where it is pinned.
   const dq = checker.lexicalTokensAt('const q = "abc"\n');
   const dqToks = decode(semanticTokensDataFromWasm([], dq, [], 'const q = "abc"\n'));
   if (dqToks.some((t) => t.type === "string")) {

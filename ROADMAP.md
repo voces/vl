@@ -205,15 +205,14 @@ Five items, in order. (0) is shipped; the rest are scheduled against it.
   place** — DONE #2199 (ruled 2026-09-01, shipped the same day). Default scope, all six
   emit/classify/collect arms and `emitToString` are gone; `std:fmt` exports `toString`;
   every in-tree caller migrated; both retired spellings get a targeted import hint.
-- **String interpolation — SHIPPED #2188 (templates), EXTENDED and UNIFIED the same
-  week (plain strings + the `\{` migration).** ONE hole syntax, `\{expr}`, in BOTH
-  quoted forms: `"v=\{x}"` and `` `v=\{x}` `` are the same construct, desugared in the
+- **String interpolation — SHIPPED #2188, UNIFIED the same week, and the backtick form
+  REMOVED 2026-09-06.** ONE string form and ONE hole syntax: `"v=\{x}"`, desugared in the
   parser to concat over `std:fmt`'s renderer bound ABSOLUTELY via a compiler-injected
   bare import edge plus an unspellable rename row. The trigger sits in the ESCAPE
   namespace (Swift's `\(` placement, the owner's brace spelling), which is what makes it
   additive at zero permanent cost — `{` is data in every string forever, and `"a\{b"`
-  was a hard lex error before. `${` is ordinary text now and `\$` is retired; multiline
-  stays backtick-only. Two remainders, both measured and both UNCHANGED by the
+  was a hard lex error before. `${` is ordinary text now and `\$` is retired; a `"…"`
+  literal spans lines (Rust's rule), and a backtick is refused by name. Two remainders, both measured and both UNCHANGED by the
   extension: a STRING-only hole still pulls `std:fmt`+`std:str` because the host closes
   the module graph before any type exists — the fix is whole-program DCE, not a
   literal-form-specific drop; and an `f32` hole reaches the pre-existing
