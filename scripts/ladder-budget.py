@@ -105,6 +105,44 @@ def check_sets(lc):
             "`export type` declarations it mirrors:\n" + "\n".join(bad))
 
 
+def lint_fields(src):
+    """The field->set table as compiler/lint.vl carries it: `klFieldNames[i]` paired with
+    `klFieldSetNames[i]`, in order. Two arrays, not a map, because the lint has no map
+    literal — so they must be the same length."""
+    def arr(name):
+        m = re.search(r"^const " + name + r" = \[(.*?)\]$", src, re.M | re.S)
+        if not m:
+            raise SystemExit(f"ladder-budget: compiler/lint.vl has no `const {name} = [`")
+        return re.findall(r'"([^"]*)"', m.group(1))
+    fields, setnames = arr("klFieldNames"), arr("klFieldSetNames")
+    if len(fields) != len(setnames):
+        raise SystemExit("ladder-budget: compiler/lint.vl's klFieldNames and klFieldSetNames "
+                         f"differ in length ({len(fields)} vs {len(setnames)})")
+    return dict(zip(fields, setnames))
+
+
+def check_fields(lc):
+    """The lint's field->set table must still BE the tree's `type X = { f: T }` declarations
+    for every field whose type is exactly one closed set — the same source `field_set` reads,
+    so a `match t.primName` is graded against the field's real set on both sides."""
+    tree = lc.field_set_index(lc.closed_sets())
+    mine = lint_fields(lc.read_source(LINT))
+    bad = []
+    for f, name in sorted(mine.items()):
+        if f not in tree:
+            bad.append(f"  `{f}` is in compiler/lint.vl and no longer a single-closed-set field")
+        elif tree[f] != name:
+            bad.append(f"  `{f}` differs: tree `{tree[f]}`, lint `{name}`")
+    for f in sorted(tree):
+        if f not in mine:
+            bad.append(f"  `{f}` (-> `{tree[f]}`) is a single-closed-set field in the tree and "
+                       "missing from compiler/lint.vl's `klFieldNames`")
+    if bad:
+        raise SystemExit(
+            "ladder-budget: compiler/lint.vl's field->set copy has drifted from the "
+            "`type X = { f: T }` declarations it mirrors:\n" + "\n".join(bad))
+
+
 def current(lc):
     """{file: {code: count}} — the lint's own hits, per file."""
     sets = lc.closed_sets()
@@ -212,6 +250,7 @@ def main():
         return R.exempt_codes()
     lc = census()
     check_sets(lc)
+    check_fields(lc)
     if "--why" in args:
         return R.why(ratchet.flag_value(args, "--why"))
     if "--grade" in args:

@@ -377,6 +377,43 @@ def fn_header(lines, lo, hi):
     return " ".join(out)
 
 
+# A FIELD read (`t.primName`, `tok.kind`) has no parameter annotation, so its set is the
+# field's DECLARING type — read from `type X = { f: T }` across the tree. `primName` is a
+# `PrimName` (ten), so a chain naming three of them is graded exhaustive over `BtKind`'s three
+# without this. Only a field that resolves to exactly ONE closed set is usable; `klFieldSetOf`
+# in compiler/lint.vl carries the hardcoded copy this drift-gates.
+FIELD_DECL = re.compile(r"(?:export )?type \w+ = \{(.*?)\}", re.S)
+FIELD_PAIR = re.compile(r"(\w+)\s*:\s*([A-Za-z_]\w*)")
+
+
+FIDX = None
+
+
+def field_set_index(sets):
+    """{field name: set name}, only for fields whose declared type is exactly one closed set."""
+    seen = {}
+    setnames = set(sets)
+    for _rel, path in sources():
+        src = read_source(path)
+        for m in FIELD_DECL.finditer(src):
+            for f, t in FIELD_PAIR.findall(m.group(1)):
+                if t in setnames:
+                    seen.setdefault(f, set()).add(t)
+    return {f: next(iter(v)) for f, v in seen.items() if len(v) == 1}
+
+
+def field_set(subj, members, kind, sets, fidx):
+    """The closed set a field-read subject's declaring type names, or None — declined
+    unless the set carries every tested member (a mis-parse otherwise)."""
+    if "." not in subj:
+        return None
+    name = fidx.get(subj.split(".")[-1])
+    if name is None or sets[name][1] != kind:
+        return None
+    ms = sets[name][0]
+    return name if all(x in ms for x in members) else None
+
+
 def declared_set(lines, lo, hi, subj, members, kind, sets):
     """The closed set `subj`'s parameter annotation names, or None. Declined unless the
     set carries every tested member: a declaration the arms do not belong to is a
@@ -567,6 +604,9 @@ def match_ladders_in(rel, lines, fn, lo, hi, sets, idx, fn_names):
 
 
 def ladders_of(rel, src, sets, idx):
+    global FIDX
+    if "FIDX" not in globals() or FIDX is None:
+        FIDX = field_set_index(sets)
     lines = src.split("\n")
     fns = functions(lines)
     fn_names = {n for n, _, _ in fns}
@@ -586,8 +626,11 @@ def ladders_of(rel, src, sets, idx):
                     uniq.append(m)
             if len(uniq) < MIN_ARMS:
                 continue
-            setname = declared_set(lines, lo, hi, subj, uniq, kind, sets) \
+            setname = (
+                declared_set(lines, lo, hi, subj, uniq, kind, sets)
+                or field_set(subj, uniq, kind, sets, FIDX)
                 or pick_set(uniq, kind, sets, idx)
+            )
             if setname is None:
                 continue
             first, last = min(i for i, _ in hits), max(i for i, _ in hits)

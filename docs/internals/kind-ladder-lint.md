@@ -307,12 +307,28 @@ a mis-parse, and the older answer is the safer one.
 — and exactly one changes GRADE, `emitScalarValue` from `exhaustive` to `named`. Neither is
 reported, so `kind-ladder-incomplete` stays at 398 and `kind-ladder-split` at 8 on both sides.
 
-**A FIELD read (`t.primName`) is deliberately left out**, and it is where the remaining
-mis-attribution lives: six sites dispatch on a `PrimName`-typed field while graded over
-`BtKind` or `MfKind`, and two of those are graded exhaustive over three members when the field
-carries ten. Resolving a field needs the declaring type, which the lint — handed one module at
-a time — cannot see, so it would need a drift-gated table like the closed-set copy. That is a
-separate landing with its own measurement: **+2 hits, both real.**
+**A FIELD read (`t.primName`) now reads the declaring type too, through a drift-gated table.**
+A parameter's set is in the signature the lint is handed; a field's is in `type X = { f: T }`,
+which lives in another module the lint cannot see. So the census derives a `{field -> set}`
+index from every such declaration in the tree (`field_set_index`), keeping only a field whose
+type is exactly one closed set, and the lint carries the same table as two parallel arrays
+(`klFieldNames` / `klFieldSetNames`) consulted by `klFieldSetOf`. `check_fields` in
+`ladder-budget.py` compares the lint's copy to the tree the same way `check_sets` does the
+closed-set copy, so the hardcoded table cannot drift from the declarations. Eight fields
+resolve: `primName -> PrimName`, `kind -> TokKind`, `litKind -> LitKind`, `next`/`nodes ->
+Node`, `rdKind -> VKind`, `asMode -> AsMode`, `tys -> Ty`.
+
+**It revealed one hit, and the ratchet rising by one is the instrument seeing a ladder it was
+blind to, not new debt.** `repTyScalarMask` names three of `PrimName`'s ten and was graded
+exhaustive over a three-member set before the table; over `PrimName` it is incomplete. It is the
+one `PrimName`-field dispatch the litunion sweep left as an `if` chain, for a reason the table
+now records rather than hides: its three are independent `mask |= …` `if`s, not an else-if
+chain, so no `match` reproduces its bytes — it stays an `if` chain, a narrow resolver. Every
+other `PrimName`-field read the sweep converted; the one the table does not shrink is
+`emitImports` over `TokKind`'s 74 — already counted before the table, a noise-arm case that
+stays deferred, not a new hit. `field-prim-ladder.vl` in `tests/vl_kind_ladder_test.ts` pins the
+field path: without the table its three would read as an exhaustive three-member set and nothing
+would fire.
 
 ## A `match` keeps a FREQUENT-FIRST ordering, so even a 74-member set converts byte-identically
 
