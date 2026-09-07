@@ -371,6 +371,32 @@ value (a forgotten member) is marginal for a guard. `binPrec` earned its 74-memb
 dispatching over 25; these do not, so they wait for the attribution table that will grade them
 against their real set rather than a noise-arm conversion.
 
+## The row-24 residue, classified {#residue}
+
+The campaign converted the last cleanly-convertible single-subject litunion dispatches in one
+final byte-identical batch: `pushKindBit` (`PushKind`), `repTreeVKind` and `rtListVKind`
+(`RtKind`) — each an all-return `_`-less `match` naming every member, the unnamed ones taking
+the original's fall-through value (`128` for `pushKindBit`'s `u8`, `null` for the two `RtKind`
+sites' unlisted kinds). `ladder-budget.py` goes **379 → 376**; corpus and the compiler's own
+modules compiled by both seeds are `cmp`-equal.
+
+What is LEFT is the residue, and it is named rather than open — the 376 standing silent ladders
+split into five kinds, none a clean byte-identical conversion:
+
+| bucket | count | why it is not converted |
+| --- | --- | --- |
+| **arena walkers** | `Node` 213, `Ty` 110 | a partial `is`-dispatch that legitimately answers about a few of 38 / 11 arena kinds and ends in a real named default; a `_`-less match is a large noise arm, the same verdict the `Node` walkers carried from the start |
+| **deferred-large** | `VKind` 25, `TokKind` 5 | a handful of a 31 / 74-member litunion (`globalPromotable` names 4 of `VKind`'s 31); the `_`-less match is a 30-to-70-member arm, and `binPrec` earned its 74 by dispatching over 25 — these do not |
+| **not-a-dispatch — `string`** | the `PrimName` / `MfKind` string scrutinees (`nameIsPlainScalarAtom`, `anonLeafAtomWidth`, `anonLeafAtomOfText`, `monoScalarAnnName`, `primTyOfName`, …) | a `match` needs a union; a plain `string` parameter is not one. Each needs its PRODUCER given a litunion return first — a rep decision, not a rewrite |
+| **not-a-dispatch — `&&`-guarded** | `fnSigKeyOf`, `mfResultKindOf` | every arm tests two things (`r == "i32" && vk == "i32"`); not a single-subject dispatch |
+| **multi-subject** | `numWidensName`, `collectMapFilterUse`, `anonLeafFoldedAtom`, `unionRefArrayArmSlotForElem` | two interleaved scrutinees (`sn` then `dn`, `rk` then `rvk`); a match is over one |
+| **`unsup`-shares-default** | `repTreeListElemName`, `rtNulVKind` | an `unsup` rung that conditionally falls through to the SAME default the unnamed members take (`if ek == "unsup" { if reason { return … } }`), which a `_`-less match cannot replicate without duplicating the default into the arm |
+
+The first two buckets are the bulk (353 of 376) and were never conversion candidates; the last
+four are the litunion residue the sweep read to the end. The set column's per-site attribution
+is the discovery half — `scripts/ladder-census.py --list kind-ladder-incomplete` — and this table
+is what it grades against.
+
 ## Agreement, and why there are two implementations
 
 `compiler/lint.vl` grades one module from the source the driver hands it; the census grades the
