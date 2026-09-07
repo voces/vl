@@ -49,3 +49,4 @@ D1840-D1859  vl-c3  2026-09-07  fix lanes 2026-09-06/07 (D1845/D1846 narrowing l
 D1860-D1879  vl-c3  2026-09-06  fix and discovery lanes, 2026-09-07 (D1833 residue, variadics residue, campaign rows, later)
 D1880-D1894  vl-c3  2026-09-07  fix lanes 2026-09-07 (fmt import/comment relocation, D1825 silent pop, later residue)
 D1895-D1899  vl-c1  2026-09-07  carved out of vl-c3's D1880-D1899 by the coordinator for the narrowing lane's residues (ROADMAP row 16's successor)
+D1900-D1919  vl-c3  2026-09-07  fix lanes 2026-09-07 (D1866 residue: a module-block-only union registers no map member; later)
