@@ -22216,12 +22216,29 @@ function emitCoalesce(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
   coR
 }
 
-// Is `exprIx` a subscript read `a[i]`? The `??` box-unbox arm's bound: an element's rep comes
-// from its list's element slot, where a struct field's can come from a row the literal merged
-// onto (D1411).
-function isIndexRead(exprIx: i32): boolean {
+// Is `exprIx` a list ELEMENT read — a subscript `a[i]`, or the `.get(i)` spelling of one? The
+// `??` box-unbox arm's bound: an element's rep comes from its list's element slot, where a
+// struct field's can come from a row the literal merged onto (D1411). A map `.get` is claimed
+// by the fused map arm long before this and is excluded by name, not by arrival order.
+function isListElementRead(exprIx: i32, fnIx: i32): boolean {
   const e = P.nodes[unwrapParen(exprIx)]
   if e is Index { return true }
+  isListGetCall(exprIx, fnIx)
+}
+
+// The `.get(i)` half of `isListElementRead`, asked on its own because a `.get` is the CHECKED
+// read: an out-of-range index yields NO box, where a subscript traps. That is a second null
+// channel the present-test has to cover, and only for this spelling.
+function isListGetCall(exprIx: i32, fnIx: i32): boolean {
+  const e = P.nodes[unwrapParen(exprIx)]
+  if e is Call {
+    const geCallee = P.nodes[e.callFn]
+    if geCallee is Member {
+      if geCallee.memProp == "get" && e.callArgs.length == 1 {
+        return !exprMap(geCallee.memObj, fnIx)
+      }
+    }
+  }
   false
 }
 
@@ -22615,6 +22632,69 @@ function emitCoalesceGo(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
       }
     }
   }
+  // A nullable value-union BOX operand whose `??` result is the bare scalar rather than
+  // another box: a `(i32 | null)[]` ELEMENT is the box, so `x ?? d` yields the element's own
+  // rep. Asked of the REP, since the element's TYPE reads `i32 | null` while what the read
+  // leaves is the box. Stash once, test the tag, unbox the payload on the present arm (D1828).
+
+  // Ahead of the call-stash arm below, which claims a `.get(i)` by SYNTAX: the `.get`
+  // spelling of an element read belongs to this arm, not to a value-union-returning
+  // call (D1829).
+
+  // Bounded to a list ELEMENT read on purpose. A struct FIELD whose literal merged onto a
+  // declared row of another code has a rep the storage does not honour, and unboxing it there
+  // would trade D1411's loud refusal for invalid wasm.
+  const nbRep = repOfNode(e.binLeft)
+  if (
+    isListElementRead(e.binLeft, fnIx) &&
+    nbRep.rdKind == "union" &&
+    nbRep.rdNul == 4
+  ) {
+    const nbKind = valueAtomKind(tyToEmitName(nodeTyIxOf(exprIx)))
+    const nbVt = nulBoxScalarValtype(nbKind)
+    const nbVb = vbHeapIdxOfKind(nbKind)
+    if nbVt >= 0 && nbVb >= 0 {
+      const nbSlot = sharedFieldRecvSlot()
+      if emitExpr(body, e.binLeft, fnIx) < 0 { return -1 }
+      fbLocalSet(nbSlot)
+      // Present = a box is there AND its tag is not the null tag. A `.get` miss yields no box
+      // at all, so its test short-circuits on `ref.is_null` and the tag read never runs on a
+      // null; a subscript traps out of range and keeps the one-test shape it always had.
+      if isListGetCall(e.binLeft, fnIx) {
+        fbLocalGet(nbSlot)
+        wU8(209) // 0xd1 ref.is_null
+        fbIf(127)
+        ctrlEnter()
+        fbI32Const(0)
+        fbElse()
+        fbLocalGet(nbSlot)
+        fbStructGet(uBoxIdx, 0) // field 0: tag
+        fbI32Const(nullBoxTag())
+        fbI32Bin(71) // 0x47 i32.ne
+        fbEnd()
+        ctrlLeave()
+      } else {
+        fbLocalGet(nbSlot)
+        fbStructGet(uBoxIdx, 0) // field 0: tag
+        fbI32Const(nullBoxTag())
+        fbI32Bin(71) // 0x47 i32.ne — present?
+      }
+      fbIf(nbVt)
+      ctrlEnter()
+      fbLocalGet(nbSlot)
+      fbStructGet(uBoxIdx, 1) // field 1: the payload anyref
+      fbRefCast(nbVb)
+      fbStructGet(nbVb, 0)
+      fbElse()
+      if emitCoalesceScalarDefault(body, e.binRight, nbKind, fnIx) < 0 {
+        return -1
+      }
+      fbEnd()
+      ctrlLeave()
+      return 0
+    }
+  }
+
   // `f(x) ?? d` over a call returning a value union with `null`: a call cannot be re-evaluated
   // (effects and cost), so stash the box once in the coalesce-call slot, then test the tag and
   // unbox off that single evaluation. Scalar atoms only (the value-typed `if` blocktype); one
@@ -23146,42 +23226,6 @@ function emitCoalesceGo(body: i32[], e: BinExpr, exprIx: i32, fnIx: i32) {
       wU8(212) // 0xd4 ref.as_non_null — the stash cell is nullable, the block type is not
       fbElse()
       if emitUnionCoerce(body, coNm, e.binRight, fnIx) < 0 { return -1 }
-      fbEnd()
-      ctrlLeave()
-      return 0
-    }
-  }
-  // A nullable value-union BOX operand whose `??` result is the bare scalar rather than
-  // another box: a `(i32 | null)[]` ELEMENT is the box, so `x ?? d` yields the element's own
-  // rep. Asked of the REP, since the element's TYPE reads `i32 | null` while what the read
-  // leaves is the box. Stash once, test the tag, unbox the payload on the present arm (D1828).
-
-  // Bounded to an INDEX read on purpose. A struct FIELD whose literal merged onto a declared
-  // row of another code has a rep the storage does not honour, and unboxing it there would
-  // trade D1411's loud refusal for invalid wasm.
-  const nbRep = repOfNode(e.binLeft)
-  if isIndexRead(e.binLeft) && nbRep.rdKind == "union" && nbRep.rdNul == 4 {
-    const nbKind = valueAtomKind(tyToEmitName(nodeTyIxOf(exprIx)))
-    const nbVt = nulBoxScalarValtype(nbKind)
-    const nbVb = vbHeapIdxOfKind(nbKind)
-    if nbVt >= 0 && nbVb >= 0 {
-      const nbSlot = sharedFieldRecvSlot()
-      if emitExpr(body, e.binLeft, fnIx) < 0 { return -1 }
-      fbLocalSet(nbSlot)
-      fbLocalGet(nbSlot)
-      fbStructGet(uBoxIdx, 0) // field 0: tag
-      fbI32Const(nullBoxTag())
-      fbI32Bin(71) // 0x47 i32.ne — present?
-      fbIf(nbVt)
-      ctrlEnter()
-      fbLocalGet(nbSlot)
-      fbStructGet(uBoxIdx, 1) // field 1: the payload anyref
-      fbRefCast(nbVb)
-      fbStructGet(nbVb, 0)
-      fbElse()
-      if emitCoalesceScalarDefault(body, e.binRight, nbKind, fnIx) < 0 {
-        return -1
-      }
       fbEnd()
       ctrlLeave()
       return 0
