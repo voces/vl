@@ -108,6 +108,7 @@ import {
 } from "./typeFeatures.ts";
 import { invalidNewNameReason, planRenameAt, renameEdits } from "./rename.ts";
 import {
+  isStdKey,
   removeCharAt,
   type StdSurfaceCache,
   stdExportSurfaces,
@@ -821,7 +822,7 @@ connection.onSignatureHelp(async (params): Promise<SignatureHelp | null> => {
 // resolves std keys to real files there — renaming those from an editor would
 // corrupt the version-locked std surface just the same).
 const isStdKeyForRename = (key: string): boolean => {
-  if (key.startsWith("std:")) return true;
+  if (isStdKey(key)) return true;
   const stdDir = getStdDir();
   return stdDir !== undefined && key.startsWith(stdDir + "/");
 };

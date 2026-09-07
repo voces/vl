@@ -23,6 +23,7 @@
 
 import type { BindingKind, Position } from "../../compiler/coreTypes.ts";
 import type { WasmExtent } from "./wasmChecker.ts";
+import { isStdKey } from "./editorText.ts";
 
 // ---- semantic tokens (D5) ---------------------------------------------------
 
@@ -1388,7 +1389,7 @@ const escapeRegExp = (s: string): string =>
 export const resolveImportSpecifier = (spec: string, fromKey: string): string => {
   if (/^std:[a-z0-9_]+(\/[a-z0-9_]+)*$/.test(spec)) return spec;
   if (!spec.startsWith("./") && !spec.startsWith("../")) return "";
-  if (fromKey.startsWith("std:")) return "";
+  if (isStdKey(fromKey)) return "";
   const slash = fromKey.lastIndexOf("/");
   const base = slash >= 0 ? fromKey.slice(0, slash) : "";
   const joined = base !== "" ? `${base}/${spec}` : spec;
@@ -1585,7 +1586,7 @@ export const importSpecifierForKey = (
   moduleKey: string,
 ): string => {
   if (moduleKey === "" || moduleKey === entryKey) return "";
-  if (moduleKey.startsWith("std:")) return moduleKey;
+  if (isStdKey(moduleKey)) return moduleKey;
   const stmtRe = /import\s*(?:\{[^}]*\}\s*from\s*)?"([^"]*)"/g;
   for (let m = stmtRe.exec(source); m !== null; m = stmtRe.exec(source)) {
     if (resolveImportSpecifier(m[1], entryKey) === moduleKey) return m[1];
