@@ -16,6 +16,7 @@
 // frame's byte offset against. `vlSrcSection.ts` is host-agnostic and shared.
 
 import { sourceFrames, wasmFrames } from "./vlSrcSection.ts";
+import { vlHostImports } from "../../compiler/vlHostImports.ts";
 
 export type RunResult = {
   logs: string[];
@@ -164,11 +165,10 @@ const mapTrap = (err: unknown, wasm?: Uint8Array): unknown => {
  */
 export const runWasm = async (wasm: Uint8Array): Promise<RunResult> => {
   const logs: string[] = [];
-  // Accumulates the UTF-8 BYTES streamed by `__print_char__` until `__print_str_flush__`.
-  // STAGE 2c: the guest hands over its storage bytes verbatim — the import's name is
-  // historical, and the code-point spread this used to do rendered every multi-byte
-  // character as its bytes read as Latin-1.
-  const printChars: number[] = [];
+  // The shared print/log sinks (`compiler/vlHostImports.ts`) — `logs` is the line
+  // buffer a test compares. This Deno host MERGES its throwing fs/proc stubs into
+  // `imports` below; the browser playground provides no fs floor at all.
+  const { extern, imports: printImports } = vlHostImports(logs);
   let exports: WebAssembly.Exports = {};
   try {
     // The `as BufferSource` picks the BYTES overload of `instantiate`, the one that
@@ -185,33 +185,12 @@ export const runWasm = async (wasm: Uint8Array): Promise<RunResult> => {
     // NOT type-check this file. `ci-native`'s `deno test -A tests/cases_wasm_*_test.ts`
     // does, and it is what caught this.
     const { instance } = await WebAssembly.instantiate(wasm as BufferSource, {
-      // The USER externs (`extern function`), under their own module name. Externs carry
-      // scalars only, so — unlike the fs floor below — this harness can implement them, and
-      // it provides exactly the registry the native host does so a fixture behaves the same
-      // under both. An extern outside it is a LinkError naming the function, which is the
-      // enforcement docs/internals/extern-design.md §4 relies on.
-      extern: {
-        // `nowMillis(): i64` — a wasm i64 result must be handed back as a JS bigint.
-        nowMillis: () => BigInt(Date.now()),
-      },
+      extern,
       imports: {
-        // Direct value sinks for the `print(x)` builtin. A wasm i64 arrives as a
-        // JS bigint; the rest as numbers. Booleans render as `true`/`false`.
-        //
-        // NO COLOR HERE, DELIBERATELY (Stage C0's twin; see the native host's
-        // `Palette`). The native sink colors a rendered VALUE when stdout is a
-        // terminal; this harness has no stdout at all — `logs` is an array a test
-        // compares against expected strings — so there is nothing to gate on and
-        // nothing that could leak. Keeping it plain is also what makes the two
-        // hosts' output comparable, which several suites depend on.
-        __print_i32__: (v: number) => logs.push(String(v)),
-        __print_i64__: (v: bigint) => logs.push(v.toString()),
-        __print_f32__: (v: number) => logs.push(String(v)),
-        __print_f64__: (v: number) => logs.push(String(v)),
-        __print_bool__: (v: number) => logs.push(v ? "true" : "false"),
-        // A string prints by streaming its code points (no shared memory); flush
-        // assembles and emits the accumulated line.
-        __print_char__: (code: number) => printChars.push(code),
+        // The shared `print`/`log` sinks (`compiler/vlHostImports.ts`); the
+        // throwing fs/proc stubs below are this Deno harness's own — the browser
+        // host provides none of them.
+        ...printImports,
         // ── the filesystem floor: STUBS THAT THROW, and why they cannot be more ──
         //
         // MEASURED against this Deno's V8 (14.9.207.2), not assumed. Two independent
@@ -275,14 +254,6 @@ export const runWasm = async (wasm: Uint8Array): Promise<RunResult> => {
         // spread so it is the definition, not a stub.
         __proc_exit__: (code: number) => {
           throw new VLExitError(code);
-        },
-        __print_str_flush__: () => {
-          // `TextDecoder` takes the whole buffer, so the chunking this used to need is
-          // gone with its cause: `String.fromCodePoint(...spread)` blew the JS
-          // call-argument limit on very large prints. Lossy per §Validity — a string
-          // sliced off a character boundary is a legal VL value and must print.
-          logs.push(new TextDecoder().decode(new Uint8Array(printChars)));
-          printChars.length = 0;
         },
       },
     });
