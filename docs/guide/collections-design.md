@@ -118,6 +118,36 @@ compiler proves that by following every handle, which it cannot always do. A `re
 parameter makes the proof unnecessary: nothing may write through it, so the delivery is
 licensed by the type rather than by an analysis (D1686, D1687).
 
+### Spread and rest parameters — `[...a, b]`, `f(...xs)`, `xs.push(...ys)`
+
+`...` before a list unpacks it. It reads three ways, and they are one rule:
+
+| you write | what it means |
+| --- | --- |
+| `function f(a: i32, ...xs: i32[])` | `xs` is a **rest parameter** — the trailing arguments pack into it, and inside `f` it is an ordinary mutable `i32[]` |
+| `f(1, 2, ...ys, 3)` | a **call-site spread** — `ys`'s elements join the trailing arguments, in the order written |
+| `const c = [...a, 9, ...b]` | a **list-literal spread** — a NEW list of every element of `a`, then `9`, then every element of `b` |
+| `xs.push(4, 5)` / `xs.push(...ys)` | `push` is **variadic**, so it appends each argument, and a spread appends each of its source's elements |
+
+A rest parameter is **last** and there is **at most one**; it takes no default and no `?`,
+because "no argument reached it" already means the empty list. A call to a variadic function
+is positional — a named argument binds one parameter and the rest parameter is many.
+
+**A spread only ever fills a rest parameter.** `f(...ys)` into a fixed-arity `f` is refused,
+and the reason is worth knowing: VL has no tuple type, so a list's length is never known at
+the call, and nothing could check the arity. Declare the last parameter `...xs: T[]`, or pass
+the elements one by one.
+
+**Every spread COPIES.** The list a spread builds is fresh, so writing through it is not
+visible through the source — which is also why a `readonly T[]` may be spread even though it
+may not be written: spreading reads it, and what comes out is a new mutable list. The copy is
+SHALLOW, exactly as the read-only view is: the elements themselves are shared, so
+`c[0].x = 7` is visible through `a[0]`.
+
+Two things `...` is not. It does not spread a **string** — a string is a byte sequence with a
+code-point iteration, not a list of characters. And it does not spread a **`u8[]`** yet
+(D1850): use `bs.slice(0)`, which copies one at every rep.
+
 ## Summary / recommendation
 
 **VL has one user-facing collection, spelled `T[]`** — a growable, ordered,
@@ -187,8 +217,8 @@ Recommendation in one screen:
    `T[]` type** (`[0, 1, 2]` seeds a three-element collection — the scripting-feel
    default). Empty construction and pre-sized (capacity) construction are needed
    *capabilities*, but their **spelling is uncommitted** (the doc sketches them as
-   `List<T>()` / `List<T>(capacity: n)` using named params, since VL has no variadics
-   or overloading, §VL.4 — but those names are provisional, not decided).
+   `List<T>()` / `List<T>(capacity: n)` using named params — but those names are
+   provisional, not decided).
    `push`/`pop`/`map`/`filter` are
    `self`-methods (parens — they compute, B14). `l[i]` / `l[i] = v` route through the
    B13 `"[]"`/`"[]="` index traps (assumed to land in parallel) — though a
@@ -513,11 +543,10 @@ thing `[...]` ever means. (Reminder per the naming caveat: `List`/`Array` below 
   unambiguous** — `capacity:` is spelled at the call site and can never be read as a
   positional element. The capacity constructor is safe *on its own*.
 
-  We do **not** *also* offer an element-seeding `List(0, 1, 2)`: VL has **no
-  variadics** (every function is fixed-arity) and **no ad-hoc overloading** (one
-  binding per name per scope — DECISIONS B16), so an element-seeding `List(...)`
-  would need both variadic arity *and* a second `List` binding overloading the
-  capacity constructor — neither exists. Seeded construction is the **`[...]`
+  We do **not** *also* offer an element-seeding `List(0, 1, 2)`. VL now has variadics
+  (a rest parameter, see the shipped spellings above), but it still has **no ad-hoc
+  overloading** (one binding per name per scope — DECISIONS B16), so an element-seeding
+  `List(...)` would need a second `List` binding overloading the capacity constructor. Seeded construction is the **`[...]`
   literal** instead, which is exactly why the literal *is* the collection literal.
   The construction surface is therefore: **`[...]`** (seed), and the empty/capacity
   forms (uncommitted spelling, sketched as **`List<T>()`** / **`List<T>(capacity: n)`**).

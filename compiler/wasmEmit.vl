@@ -110,12 +110,15 @@ import {
 // table and assembles the module sections around the bodies lowered here.
 import {
   P,
+  adoptNodeTok,
   externArityAt,
   externLinkOf,
   externParamAt,
   hasNamedArgs,
+  hasSpreadItem,
   i32ToStr,
   isDefaultGlobalRef,
+  mkArrayLit,
   mkBinary,
   mkCallN,
   mkIdent,
@@ -124,6 +127,7 @@ import {
   nodeChildren,
   nodeToks,
   orderArgsByParamNames,
+  spreadArgOf,
   ufcsAliasAtSite,
 } from "./ast"
 import {
@@ -796,6 +800,10 @@ import {
   sigParamCoerceKind,
   sigParamKindAt,
   sigParamSlotAt,
+  spreadDestKind,
+  spreadDestRow,
+  spreadDstBackSlot,
+  spreadGroupWrapSlot,
   stmtIsTailValue,
   structEqStashSlot,
   structIdxOfElemName,
@@ -6377,6 +6385,179 @@ function emitStr(_body: i32[], strIx: i32, _fnIx: i32) {
   emitFail("emitProgram: expected a string literal")
 }
 
+// The (wrapper, backing) heap pair a list of element kind `k` builds — `.slice`'s own ladder,
+// asked by the spread literal so the two cannot disagree about a rep. `-1` in either half when
+// the module never collected that list type, or when a `"ref"` row is not a real one.
+function spreadWrapIdx(k: MfKind, row: i32) {
+  if k == "f64" {
+    if fa64Used { return fl64TypeIdx }
+    return -1
+  }
+  if k == "i64" {
+    if ia64Used { return il64TypeIdx }
+    return -1
+  }
+  if k == "f32" {
+    if fa32Used { return fl32TypeIdx }
+    return -1
+  }
+  if k == "u8" {
+    if ba8Used { return bl8TypeIdx }
+    return -1
+  }
+  if k == "str" { return mkListIdx }
+  if k == "ref" {
+    if row < 0 || row >= rlWrapIdx.length { return -1 }
+    return rlWrapIdx[row]
+  }
+  if lUsed && aUsed { return lTypeIdx }
+  -1
+}
+
+function spreadBackIdx(k: MfKind, row: i32) {
+  if k == "f64" {
+    if fa64Used { return fa64TypeIdx }
+    return -1
+  }
+  if k == "i64" {
+    if ia64Used { return ia64TypeIdx }
+    return -1
+  }
+  if k == "f32" {
+    if fa32Used { return fa32TypeIdx }
+    return -1
+  }
+  if k == "u8" {
+    if ba8Used { return ba8TypeIdx }
+    return -1
+  }
+  if k == "str" { return mkArrIdx }
+  if k == "ref" {
+    if row < 0 || row >= rlBackIdx.length { return -1 }
+    return rlBackIdx[row]
+  }
+  if lUsed && aUsed { return aTypeIdx }
+  -1
+}
+
+// `[...a, 1, ...b]` — the runtime-length list literal, on `.slice`'s shape, since
+// `array.new_fixed`'s length is a compile-time constant. Every item group — a spread's
+// source, or a run of plain elements as its own literal — is evaluated in source order into
+// its own frame slot; the destination is allocated once, and each group is one `array.copy`.
+function emitArrSpread(body: i32[], arrIx: i32, fnIx: i32) {
+  const a = P.nodes[arrIx]
+  if a is ArrayLit {
+    const elems = a.arrElems
+    const kk = spreadDestKind(elems, fnIx)
+    if kk == null {
+      return emitFail(
+        "emitProgram: a spread's source is not a list this rep knows",
+      )
+    }
+    const row = spreadDestRow(elems, fnIx)
+    const wrap = spreadWrapIdx(kk, row)
+    const back = spreadBackIdx(kk, row)
+    if wrap < 0 || back < 0 {
+      return emitFail("emitProgram: spread literal but list type not collected")
+    }
+    // The item groups in source order: a spread contributes its source, a run of plain
+    // elements its own synthesized literal, which `emitArr` builds at this same rep.
+    const groups: i32[] = []
+    let run: i32[] = []
+    let i = 0
+    while i < elems.length {
+      const src = spreadArgOf(elems[i])
+      if src >= 0 {
+        if run.length > 0 {
+          groups.push(spreadRunLit(run, arrIx, a.pos))
+          run = []
+        }
+        groups.push(src)
+      } else {
+        run.push(elems[i])
+      }
+      i = i + 1
+    }
+    if run.length > 0 { groups.push(spreadRunLit(run, arrIx, a.pos)) }
+    // Every group builds at the DESTINATION's rep, threaded from the kind this literal
+    // resolved at rather than from whatever annotation reached it: an un-annotated binding
+    // threads nothing, so a plain run would build at the i32 default while the destination
+    // is the source's own backing.
+    const pk = pendingKindOfMf(kk, row)
+    const seq = liKinds.length
+    const slots: i32[] = []
+    let g = 0
+    while g < groups.length {
+      pendingListKind = pk
+      pendingListSlot = row
+      if emitExpr(body, groups[g], fnIx) < 0 { return -1 }
+      const gs = spreadGroupWrapSlot(kk, row, seq + g)
+      slots.push(gs)
+      fbLocalSet(gs)
+      g = g + 1
+    }
+    pendingListKind = 0
+    pendingListSlot = 0
+    const totL = widenTmpSlot(2000 + 2 * seq)
+    const offL = widenTmpSlot(2001 + 2 * seq)
+    const dstL = spreadDstBackSlot(kk, row, seq)
+    fbI32Const(0)
+    fbLocalSet(totL)
+    let t = 0
+    while t < slots.length {
+      fbLocalGet(totL)
+      fbLocalGet(slots[t])
+      fbStructGet(wrap, 1) // the group's logical length
+      fbI32Bin(106)        // 0x6a i32.add
+      fbLocalSet(totL)
+      t = t + 1
+    }
+    fbLocalGet(totL)
+    fbArrayNewDefault(back)
+    fbLocalSet(dstL)
+    // The result wrapper is built FIRST and left on the stack, so the `array.copy` runs below
+    // consume their own operands and nothing has to re-read it — `emitArrSlice`'s discipline.
+    // The backing rides a NULLABLE frame slot and the wrapper's field is not, so it recovers.
+    fbLocalGet(dstL)
+    wU8(212) // 0xd4 ref.as_non_null
+    fbLocalGet(totL)
+    fbLocalGet(totL)
+    fbStructNew(wrap)
+    fbI32Const(0)
+    fbLocalSet(offL)
+    let c = 0
+    while c < slots.length {
+      fbLocalGet(dstL)     // dest backing
+      fbLocalGet(offL)     // dest offset
+      fbLocalGet(slots[c])
+      fbStructGet(wrap, 0) // src backing
+      fbI32Const(0)        // src offset
+      fbLocalGet(slots[c])
+      fbStructGet(wrap, 1) // count
+      fbArrayCopy(back, back)
+      if c + 1 < slots.length {
+        fbLocalGet(offL)
+        fbLocalGet(slots[c])
+        fbStructGet(wrap, 1)
+        fbI32Bin(106) // i32.add
+        fbLocalSet(offL)
+      }
+      c = c + 1
+    }
+    return 0
+  }
+  emitFail("emitProgram: expected an array literal")
+}
+
+// A run of plain elements as its own `ArrayLit`, reporting at the spread literal's position.
+// A synthesized node takes the parser's last cursor otherwise, which would put a diagnostic
+// over it at the end of the file.
+function spreadRunLit(run: i32[], arrIx: i32, pos: i32): i32 {
+  const ix = mkArrayLit(run, pos)
+  adoptNodeTok(ix, arrIx)
+  ix
+}
+
 // Lower an array literal `[e, e, ...]` onto `body` as a growable list value: push each element
 // value in source order, `array.new_fixed $aTypeIdx <count>` for the raw backing, then `count`
 // twice for len and cap and `struct.new $lTypeIdx` to wrap them into `{ backing, len, cap }`. An
@@ -6385,6 +6566,7 @@ function emitArr(body: i32[], arrIx: i32, fnIx: i32) {
   const a = P.nodes[arrIx]
   if a is ArrayLit {
     const elems = a.arrElems
+    if hasSpreadItem(elems) { return emitArrSpread(body, arrIx, fnIx) }
     // Which (backing, wrapper) pair the literal builds — `pendingListKind` 1/2 a ref backing, 3 a
     // string one, 4 f64, 6 i64, 7 f32, anything else the default `$lTypeIdx` i32 list. Two signals
     // answer it: the literal's own elements (`arrLitIs*`) and a threaded annotation from the
@@ -15563,6 +15745,129 @@ function pushRecvLocal(body: i32[], objIx: i32, fnIx: i32, base: i32) {
   listOpRecvLocal(body, objIx, fnIx, base, -1, ".push", true)
 }
 
+// The `pendingListKind` a list of element kind `k` is built at — the mapping `emitArr`'s own
+// arms read, so a synthesized literal lands on the same backing the receiver already has.
+function pendingKindOfMf(k: MfKind, row: i32) {
+  if k == "f64" { return 4 }
+  if k == "i64" { return 6 }
+  if k == "f32" { return 7 }
+  if k == "u8" { return 10 }
+  if k == "str" { return 3 }
+  if k == "ref" {
+    if rlElemKindTbl[row] == 2 { return 2 }
+    return 1
+  }
+  0
+}
+
+// `xs.push(a, b)` / `xs.push(...ys)` — the variadic appends. The arguments build as one list
+// at the receiver's own rep, so a spread argument is `emitArrSpread`'s business; the receiver
+// then grows once and the new elements arrive as a single `array.copy`. The one-argument
+// push keeps its own element-wise lowering, which is what makes this path free of it.
+function emitPushMany(body: i32[], callIx: i32, fnIx: i32, wantValue: boolean) {
+  const c = P.nodes[callIx]
+  if c is Call {
+    const callee = P.nodes[c.callFn]
+    if callee is Member {
+      // A nullable or literal-union element rides a SPINE whose list literal needs seeds
+      // this path does not thread, so those receivers keep the one-at-a-time spelling.
+      if (
+        arrElemLitUnionTy(callee.memObj, fnIx) >= 0 ||
+        nodeArrayElemIsNulBool(callee.memObj) ||
+        nodeArrayElemIsNulLitUnion(callee.memObj) ||
+        nodeArrayElemIsNulStr(callee.memObj)
+      ) {
+        return emitFail(
+          "emitProgram: a nullable or literal-union list takes one `.push` argument at a time",
+        )
+      }
+      const kk = mfRecvKindOf(callee.memObj, fnIx)
+      if kk == null {
+        return emitFail("emitProgram: .push receiver is not a list")
+      }
+      let row = 0
+      if kk == "ref" { row = refListSlotOfExpr(callee.memObj, fnIx) }
+      const wrap = spreadWrapIdx(kk, row)
+      const back = spreadBackIdx(kk, row)
+      if wrap < 0 || back < 0 {
+        return emitFail("emitProgram: .push but list type not collected")
+      }
+      const seq = liKinds.length
+      const recvS = spreadGroupWrapSlot(kk, row, seq)
+      const srcS = spreadGroupWrapSlot(kk, row, seq + 1)
+      const backS = spreadDstBackSlot(kk, row, seq)
+      const totL = widenTmpSlot(3000 + seq)
+      // The receiver, evaluated ONCE — an argument that is itself a list op would otherwise
+      // restage it, which is how a hoisted receiver gets clobbered.
+      if emitExpr(body, callee.memObj, fnIx) < 0 { return -1 }
+      if nulRecvNeedsRecover(callee.memObj, fnIx) {
+        wU8(212) // 0xd4 ref.as_non_null
+      }
+      fbLocalSet(recvS)
+      const lst = spreadRunLit(c.callArgs, callIx, c.pos)
+      pendingListKind = pendingKindOfMf(kk, row)
+      pendingListSlot = row
+      if emitExpr(body, lst, fnIx) < 0 { return -1 }
+      pendingListKind = 0
+      pendingListSlot = 0
+      fbLocalSet(srcS)
+      // tot = recv.len + new.len
+      fbLocalGet(recvS)
+      fbStructGet(wrap, 1)
+      fbLocalGet(srcS)
+      fbStructGet(wrap, 1)
+      fbI32Bin(106) // 0x6a i32.add
+      fbLocalSet(totL)
+      // if recv.cap < tot, grow the backing to EXACTLY tot — a bulk append knows the length
+      // it needs, so the doubling a one-at-a-time push amortizes over has nothing to buy.
+      fbLocalGet(recvS)
+      fbStructGet(wrap, 2)
+      fbLocalGet(totL)
+      fbI32Bin(72) // 0x48 i32.lt_s
+      fbIf(64)     // 0x04 if, 0x40 void blocktype
+      fbLocalGet(totL)
+      fbArrayNewDefault(back)
+      fbLocalSet(backS)
+      fbLocalGet(backS)
+      fbI32Const(0)
+      fbLocalGet(recvS)
+      fbStructGet(wrap, 0)
+      fbI32Const(0)
+      fbLocalGet(recvS)
+      fbStructGet(wrap, 1)
+      fbArrayCopy(back, back)
+      fbLocalGet(recvS)
+      fbLocalGet(backS)
+      wU8(212)     // 0xd4 ref.as_non_null
+      fbStructSet(wrap, 0)
+      fbLocalGet(recvS)
+      fbLocalGet(totL)
+      fbStructSet(wrap, 2)
+      fbEnd()      // 0x0b end (if)
+      // recv.backing[recv.len ..] = new
+      fbLocalGet(recvS)
+      fbStructGet(wrap, 0)
+      fbLocalGet(recvS)
+      fbStructGet(wrap, 1)
+      fbLocalGet(srcS)
+      fbStructGet(wrap, 0)
+      fbI32Const(0)
+      fbLocalGet(srcS)
+      fbStructGet(wrap, 1)
+      fbArrayCopy(back, back)
+      fbLocalGet(recvS)
+      fbLocalGet(totL)
+      fbStructSet(wrap, 1)
+      // D1592 — the value a `.push` yields is the new length, read back from the field this
+      // same sequence just wrote, so the two cannot disagree.
+      if wantValue { fbLocalGet(totL) }
+      return 0
+    }
+    return emitFail("emitProgram: .push receiver is not a member access")
+  }
+  emitFail("emitProgram: expected a push call")
+}
+
 // D1592 — `wantValue` is the value-position flag: the checker types `.push` `i32` (the new
 // length), so a bound/returned/argument push owes that value while a bare statement owes
 // an empty stack. One lowering serves both, reading the value back from the `len` field
@@ -15570,6 +15875,11 @@ function pushRecvLocal(body: i32[], objIx: i32, fnIx: i32, base: i32) {
 function emitPush(body: i32[], callIx: i32, fnIx: i32, wantValue: boolean) {
   const c = P.nodes[callIx]
   if c is Call {
+    // One plain argument is the element-wise lowering below; anything else — several
+    // arguments, or a spread — appends in bulk.
+    if c.callArgs.length != 1 || hasSpreadItem(c.callArgs) {
+      return emitPushMany(body, callIx, fnIx, wantValue)
+    }
     const callee = P.nodes[c.callFn]
     if callee is Member {
       // the receiver must produce a list — a bare list local/param or a struct-field array

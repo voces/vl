@@ -224,8 +224,10 @@ import {
   Unary,
   WhileStmt,
   annTsOf,
+  hasSpreadItem,
   mkTypeRef,
   nodeChildren,
+  spreadArgOf,
   tsHasKind,
   tsKind,
 } from "./ast"
@@ -11079,6 +11081,52 @@ export function widenTmpSlot(which: i32) {
   scratchSlot(10, "i32", which, SCRATCH_BY_KEY)
 }
 
+// The rep a spread literal builds at, read off a spread's SOURCE: the checker has already made
+// every item's element type agree, so any one source names the whole literal's rep. `null` when
+// no source is a list the emitter knows, which is the caller's refusal.
+export function spreadDestKind(elems: i32[], fnIx: i32): MfKind | null {
+  let i = 0
+  while i < elems.length {
+    const src = spreadArgOf(elems[i])
+    if src >= 0 {
+      const k = mfRecvKindOf(src, fnIx)
+      if k != null { return k }
+    }
+    i = i + 1
+  }
+  null
+}
+
+// The ref-list row a spread literal builds at — 0 for every kind but `"ref"`, where the row is
+// the source's own, since a ref list's wrapper and backing heap types come from the row.
+export function spreadDestRow(elems: i32[], fnIx: i32) {
+  let i = 0
+  while i < elems.length {
+    const src = spreadArgOf(elems[i])
+    if src >= 0 {
+      const k = mfRecvKindOf(src, fnIx)
+      if k != null {
+        if k == "ref" { return refListSlotOfExpr(src, fnIx) }
+        return 0
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// A spread literal's frame slots: one list WRAPPER per item group (code 20) and one
+// destination BACKING (code 21), keyed by a per-site sequence so a nested spread literal
+// cannot write a live outer slot. Kind maps to heap type as codes 11 and 12 do, and the
+// ref-list row is `key % 4096`.
+export function spreadGroupWrapSlot(kind: MfKind, row: i32, seq: i32) {
+  scratchSlot(20, kind, row + 4096 * seq, SCRATCH_BY_BOTH)
+}
+
+export function spreadDstBackSlot(kind: MfKind, row: i32, seq: i32) {
+  scratchSlot(21, kind, row + 4096 * seq, SCRATCH_BY_BOTH)
+}
+
 // The tail-value expression of an if-expression's then arm (`ifArmValueExpr`: the arm
 // block's last statement), or -1. The arms share the checker's join type, so the then
 // arm's rep classifies the whole if-expression.
@@ -18280,6 +18328,9 @@ export function arrLitIsStr(arrIx: i32, fnIx: i32) {
   const a = P.nodes[arrIx]
   if a is ArrayLit {
     if a.arrElems.length < 1 { return false }
+    if hasSpreadItem(a.arrElems) {
+      return spreadDestKind(a.arrElems, fnIx) == "str"
+    }
     // An atom-element literal (the checker adopted a `K[]` context) is the i32 atom-id
     // list, not a string list — its elements are string exprs syntactically but each lowers
     // as its interned atom id. Without this the literal claims the string-list build while
@@ -18321,6 +18372,12 @@ export function arrLitIsF64(arrIx: i32, fnIx: i32) {
   const a = P.nodes[arrIx]
   if a is ArrayLit {
     if a.arrElems.length < 1 { return false }
+    // A spread element is no f64 VALUE, so the element scan below would read `[...fs]` as
+    // the i32 default while `emitArrSpread` builds the source's rep — two heap types for
+    // one value. Both sides ask `spreadDestKind`, so they cannot disagree.
+    if hasSpreadItem(a.arrElems) {
+      return spreadDestKind(a.arrElems, fnIx) == "f64"
+    }
     // A box-list literal with an f64 member: the checker recorded a value union, so the
     // elements box and the f64-list build would store a string ref into an `(array (mut
     // f64))` backing. The scan below is order-blind (any f64 member claims the list), so
@@ -28625,6 +28682,15 @@ function identShadowedByFrame(fnIx: i32, name: string) {
 
 export function exprArray(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return false }
+  // A spread literal answers from the rep `emitArrSpread` builds it at, ahead of the
+  // typed-IR path: that path claims every array kind, so `[...bs]` over a `u8[]` would bind
+  // the i32 cell while the value is the packed byte wrapper — two heap types for one value.
+  const sl = P.nodes[exprIx]
+  if sl is ArrayLit {
+    if hasSpreadItem(sl.arrElems) {
+      return spreadDestKind(sl.arrElems, fnIx) == "i32"
+    }
+  }
   if tyKindOf(nodeTyIxOf(exprIx)) == 2 {
     return true // typed-IR fast path (see exprIsF64)
   }
@@ -30969,6 +31035,9 @@ export function arrLitIsF32(arrIx: i32, fnIx: i32) {
   const a = P.nodes[arrIx]
   if a is ArrayLit {
     if a.arrElems.length < 1 { return false }
+    if hasSpreadItem(a.arrElems) {
+      return spreadDestKind(a.arrElems, fnIx) == "f32"
+    }
     let i = 0
     while i < a.arrElems.length {
       if !exprIsF32(a.arrElems[i], fnIx) { return false }
@@ -31166,6 +31235,9 @@ export function arrLitIsI64(arrIx: i32, fnIx: i32) {
   const a = P.nodes[arrIx]
   if a is ArrayLit {
     if a.arrElems.length < 1 { return false }
+    if hasSpreadItem(a.arrElems) {
+      return spreadDestKind(a.arrElems, fnIx) == "i64"
+    }
     // A box-list literal with an i64 member is the f64 arm's twin (see `arrLitBoxElem`): the
     // scan is order-blind, so any i64 element (not just the first) makes this an i64 list.
     if arrLitBoxElem(arrIx) { return false }
