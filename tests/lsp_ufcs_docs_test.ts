@@ -169,6 +169,59 @@ Deno.test({ name: "ufcs docs: the rendered panel is prose above the fence, or th
   }
 });
 
+
+// ── the MULTI-MODULE face (D1863) ────────────────────────────────────────────
+// Every fixture above is a single file, which is what let the defect stand: the module
+// pipeline serves each module's tokens from a cache rather than re-lexing, so the doc table
+// was EMPTY for every module and one `import` silenced the panel. The assertion is that the
+// same program answers the same with and without an import.
+
+const MM_LIB = 'export function helper(): i32 { return 7 }\n';
+const mmRead = (key: string): string | undefined =>
+  key.endsWith("lib") || key.endsWith("lib.vl") ? MM_LIB : undefined;
+
+const MM_TAIL = [
+  "type Pt = { x: i32, y: i32 }",
+  "/// Doubles a point's x.",
+  "function twice(self: Pt): i32 { return self.x * 2 }",
+  "const p: Pt = { x: 1, y: 2 }",
+  "print(p.x)",
+  "",
+];
+const MM_SOLO = ["", ...MM_TAIL].join("\n");
+const MM_IMPORTING = [
+  'import { helper } from "./lib"',
+  ...MM_TAIL.slice(0, 2),
+  "function twice(self: Pt): i32 { return self.x * helper() }",
+  ...MM_TAIL.slice(3),
+].join("\n");
+// The receiver `p` in `p.x`, one line past the `twice` declaration in both.
+const MM_RECV = { line: 4, character: 6 };
+
+Deno.test({ name: "ufcs docs: an `import` does not silence the panel (D1863)", ignore }, async () => {
+  // A FRESH checker per arm: one asked both would let the single-module arm's rows answer
+  // the multi-module arm's query — the very staleness this defect is made of.
+  const docOf = async (src: string, r: (k: string) => string | undefined) => {
+    const cands = await loadWasmChecker(SEED, () => {})!.ufcsCandidatesAt(
+      src,
+      "/tmp/main.vl",
+      r,
+      MM_RECV.line,
+      MM_RECV.character,
+    );
+    return ufcsCompletions(src, "/tmp/main.vl", cands, () => false)
+      .find((c) => c.name === "twice")?.doc;
+  };
+  const solo = await docOf(MM_SOLO, noSiblings);
+  const multi = await docOf(MM_IMPORTING, mmRead);
+  if (solo === undefined) throw new Error("the single-module control has no doc");
+  if (multi !== solo) {
+    throw new Error(
+      `with an import ${JSON.stringify(multi)} != without ${JSON.stringify(solo)}`,
+    );
+  }
+});
+
 // ── the playground's parity gap, pinned ──────────────────────────────────────
 // The playground adapter's member path is `memberCompletionsFromWasm` alone — it never
 // calls `ufcsCandidatesAt`, so it offers no UFCS method at all and there is no panel here
