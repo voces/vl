@@ -538,12 +538,28 @@ bindings only** (a `let` index keeps the refusal, with a message that says why).
 
 **Ruling (owner, 2026-09-06):** (a) — yes; an `is` pin at a loop head is the null strip's twin, retired by a write to the receiver exactly as `!= null` is. D1736 is a capability row.
 
+**Re-ruling (owner, 2026-09-06 night):** (a) — narrowing applies to READS only. Inside a narrowed region a read sees the narrowed type; a WRITE is checked against the binding's DECLARED type and re-narrows the binding to what was written, so `if x is i64 { x = true }` and `while x is i64 { …; x = true }` are both legal and a read after the write sees `boolean`. TypeScript's and Kotlin's rule; the null strip already behaves this way and the `is` pin joins it. `tests/cases/loops/while-body-is-guard-not-narrowed.vl` is retired as a contract by this ruling and becomes the loop's positive fixture. D1736 stays a capability row until the build lands.
+
 `while v != null { … }` narrows the body; `while v is A { … }` refuses. The code's stated
 reason ("only a null strip re-narrows, never an `is T` pin; the body is re-tested every
 iteration") does not separate the two: both are re-tested at the top of each iteration, and
 the write-retire machinery covers a body that assigns. **Recommendation: yes** — an `is` pin
 is a null strip's twin at the loop head, with the same retirement on a write to the receiver.
 If the answer is no, the row closes as DESIGN with a message that names the loop, not the `is`.
+
+### variadics-then-spread — how does a list reach a call as many arguments? — RULED 2026-09-06 night
+
+**Ruling (owner, 2026-09-06 night):** (A) — variadics land as ONE rule, and spread falls out of it. A rest parameter `function f(...xs: T[])` packs its trailing arguments into a list; a call-site `f(...ys)` unpacks a list ONLY into a rest parameter; a spread into a fixed-arity function is refused with a sentence (VL has no tuple type, so a list's length is never statically known — TypeScript's own condition for allowing it). `push` becomes variadic so `xs.push(...ys)` follows with no special case, and `[...a, ...b]` in a list literal is the same operator. (B), a named bulk append `extend` in `std:array`, ships first as the immediate value (60 hand-written append loops measured in the tree); (C), `push(...ys)` as a one-off, was declined because it would fix `...`'s meaning before the general rule exists.
+
+Today no `...` token exists, no function is variadic, and `push` takes exactly one argument. ROADMAP row 21 (H4.6 / B6) sequenced spread behind variadics; the spread lane measured that premise on 2026-09-06 and confirmed it. **Options.** (A) variadics first, spread falls out; (B) a named bulk append, no new syntax; (C) `push(...ys)` alone. **Recommendation: (B) now, (A) when scheduled — never (C).**
+
+### match-empty-clause — is `Stop{}` a legal arm pattern? — ASKED 2026-09-06 night
+
+Today `Stop{}` is legal and means exactly `Stop` (a variant arm binding nothing), while the same shape NESTED (`Wrap{p: {}}`) is refused as binding nothing. **Options.** (a) refuse `Stop{}` with the nested clause's sentence ("`Stop{}` binds nothing — write `Stop`"), one spelling per meaning and nothing for `vl fmt` to choose between; (b) allow both levels (Rust allows `Stop {}`), and lift the nested refusal for consistency. **Recommendation: (a).**
+
+### artifact-rulings-page — a hosted page for the rulings write-up — DEFERRED 2026-09-06 night
+
+Offered as a private web page mirroring this file's section D with the owner's answers; the owner deferred it. Nothing to build; this file is the record.
 
 ### D1686 / D1687 — what does the design owe a covariant list the closure cannot follow? — RULED 2026-09-06
 
