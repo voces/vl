@@ -349,6 +349,7 @@ import {
   sHeapIdx,
   sTypeIdx,
   slUsed,
+  startStmts,
   strCatSlotIx,
   strPushScratchBase,
   strScratchBase,
@@ -10147,14 +10148,51 @@ let saDecls: i32[] = []
 let saApps: i32[] = []
 let saBads: i32[] = []
 let saFnIx = 0 - 2
+// A mark may only reach a name the scan already knows. At MODULE scope the walk covers
+// every function body, where minting a row per identifier would make the scan quadratic in
+// the program; the candidate declarations are all noted before the flag goes up.
+let saKnownOnly = false
 
-// Find (or start) the row for `name`.
-function saRow(name: string) {
+// The row for `name`, or -1.
+function saFind(name: string) {
   let i = 0
   while i < saNames.length {
     if saNames[i] == name { return i }
     i = i + 1
   }
+  -1
+}
+
+// Keep only the rows a later phase could still change: an already-disqualified name, or one
+// declared twice, can never qualify, and a dropped row reads as absent — which
+// `saNameQualifies` and `saMarkBad` both already treat as "not an accumulator". The prune is
+// what keeps the module-wide walk linear in the program rather than in its bindings.
+function saPruneSettled() {
+  const kn: string[] = []
+  const kd: i32[] = []
+  const ka: i32[] = []
+  const kb: i32[] = []
+  let i = 0
+  while i < saNames.length {
+    if saBads[i] == 0 && saDecls[i] == 1 {
+      kn.push(saNames[i])
+      kd.push(saDecls[i])
+      ka.push(saApps[i])
+      kb.push(saBads[i])
+    }
+    i = i + 1
+  }
+  saNames = kn
+  saDecls = kd
+  saApps = ka
+  saBads = kb
+  0
+}
+
+// Find (or start) the row for `name`.
+function saRow(name: string) {
+  const at = saFind(name)
+  if at >= 0 { return at }
   saNames.push(name)
   saDecls.push(0)
   saApps.push(0)
@@ -10163,6 +10201,12 @@ function saRow(name: string) {
 }
 
 function saMarkBad(name: string) {
+  const at = saFind(name)
+  if at >= 0 {
+    saBads[at] = 1
+    return 0
+  }
+  if saKnownOnly { return 0 }
   saBads[saRow(name)] = 1
   0
 }
@@ -10171,25 +10215,30 @@ function saMarkBad(name: string) {
 // construction: a mutable `let` whose initialiser is a string literal, annotated
 // `string` or not at all. Anything else disqualifies the name, because the binding
 // could then be handed a buffer some other accumulator still owns.
+function saDeclShapeOk(letIx: i32) {
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letKw != "let" { return false }
+    if d.letInit < 0 { return false }
+    const init = P.nodes[d.letInit]
+    if !(init is StrLit) { return false }
+    if d.letType >= 0 {
+      const ann = P.nodes[d.letType]
+      if ann is TypeRef { return ann.tyName == "string" }
+      return false
+    }
+    return true
+  }
+  false
+}
+
+// Count the declaration at `letIx` against its name's row, minting the row if needed.
 function saNoteDecl(letIx: i32) {
   const d = P.nodes[letIx]
   if d is LetDecl {
     const r = saRow(d.letName)
     saDecls[r] = saDecls[r] + 1
-    let ok = d.letKw == "let" && d.letInit >= 0
-    if ok {
-      const init = P.nodes[d.letInit]
-      if !(init is StrLit) { ok = false }
-    }
-    if ok && d.letType >= 0 {
-      const ann = P.nodes[d.letType]
-      if ann is TypeRef {
-        if ann.tyName != "string" { ok = false }
-      } else {
-        ok = false
-      }
-    }
-    if !ok { saBads[r] = 1 }
+    if !saDeclShapeOk(letIx) { saBads[r] = 1 }
   }
   0
 }
@@ -10246,7 +10295,11 @@ function strAccWalk(ix: i32, fnIx: i32, depth: i32, inLambda: boolean) {
     return 0
   }
   if n is LetDecl {
-    if inLambda { saMarkBad(n.letName) } else { saNoteDecl(ix) }
+    if inLambda || (saKnownOnly && !saDeclShapeOk(ix)) {
+      saMarkBad(n.letName)
+    } else {
+      saNoteDecl(ix)
+    }
     strAccWalk(n.letInit, fnIx, depth, inLambda)
     return 0
   }
@@ -10257,7 +10310,7 @@ function strAccWalk(ix: i32, fnIx: i32, depth: i32, inLambda: boolean) {
         if inLambda {
           saMarkBad(t.identName)
         } else if saSelfAppendOk(n.binRight, t.identName, fnIx) {
-          if depth > 0 {
+          if depth > 0 && !(saKnownOnly && saFind(t.identName) < 0) {
             saApps[saRow(t.identName)] = saApps[saRow(t.identName)] + 1
           }
         } else {
@@ -10301,8 +10354,69 @@ function strAccScan(blockIx: i32, fnIx: i32) {
   saApps = []
   saBads = []
   saFnIx = fnIx
+  saKnownOnly = false
   if !fnUsesStrOp { return 0 }
   strAccWalk(blockIx, fnIx, 0, false)
+  0
+}
+
+// The same proof for the START function, whose accumulator is a module CELL rather than a
+// slot. `collectFns` partitions the top level into exactly these three lists and lifts every
+// nested function into `fnStmts`, so walking all three is the whole program: a mention inside
+// any of them disqualifies the name, which is what makes the cell's one home safe to append into.
+export function strAccScanStart() {
+  saNames = []
+  saDecls = []
+  saApps = []
+  saBads = []
+  saFnIx = -1
+  saKnownOnly = false
+  if !fnUsesStrOp { return 0 }
+  // Declarations first: a function is HOISTED, so a body assigning to a global can be walked
+  // before the global's own `let`, and a mark that arrived before the row would be lost. Only
+  // a CANDIDATE mints a row — `saFind` is a linear scan, so one row per top-level binding
+  // would make this pass quadratic in the program on its own.
+  let i = 0
+  while i < globalStmts.length {
+    if saDeclShapeOk(globalStmts[i]) { saNoteDecl(globalStmts[i]) }
+    i = i + 1
+  }
+  saPruneSettled()
+  if saNames.length == 0 { return 0 }
+  saKnownOnly = true
+  // A second top-level declaration of a candidate name disqualifies it, whatever its shape.
+  i = 0
+  while i < globalStmts.length {
+    if !saDeclShapeOk(globalStmts[i]) {
+      const d = P.nodes[globalStmts[i]]
+      if d is LetDecl { saMarkBad(d.letName) }
+    }
+    i = i + 1
+  }
+  i = 0
+  while i < globalStmts.length {
+    const g = P.nodes[globalStmts[i]]
+    if g is LetDecl { strAccWalk(g.letInit, -1, 0, false) }
+    i = i + 1
+  }
+  i = 0
+  while i < startStmts.length {
+    strAccWalk(startStmts[i], -1, 0, false)
+    i = i + 1
+  }
+  // Every user function is foreign ground. Its CHILDREN are walked rather than the `FuncDecl`
+  // itself, so a parameter default mentioning the name disqualifies it like a body would.
+  i = 0
+  while i < fnStmts.length {
+    const kids = nodeChildren(fnStmts[i])
+    let k = 0
+    while k < kids.length {
+      strAccWalk(kids[k], -1, 0, true)
+      k = k + 1
+    }
+    i = i + 1
+  }
+  saKnownOnly = false
   0
 }
 
@@ -10320,6 +10434,33 @@ function saNameQualifies(name: string) {
   false
 }
 
+// Where a proven accumulator lives when it is not a slot: the `globalStmts` position of the
+// module cell `name`, or -1. Only at module scope, where `emitStartFnCode` is the emitter.
+function saAccGlobalIdx(name: string) {
+  if saFnIx != -1 { return -1 }
+  globalIndexOf(name)
+}
+
+// Read the accumulator. A function local by slot; otherwise the module binding through
+// `emitUserGlobalGet`, the storage-class chokepoint, which is also what makes a future
+// promotion of this cell follow without a second decision here.
+function saAccGet(slot: i32, gIx: i32) {
+  if slot >= 0 {
+    fbLocalGet(slot)
+    return 0
+  }
+  emitUserGlobalGet(gIx)
+}
+
+// The write half of the pair above.
+function saAccSet(slot: i32, gIx: i32) {
+  if slot >= 0 {
+    fbLocalSet(slot)
+    return 0
+  }
+  emitUserGlobalSet(gIx)
+}
+
 // Does the assignment at `binIx` append to a proven accumulator? Re-asked per site, with
 // the emit-time scope populated, so the scan's answer is a filter and never the whole
 // test. `saFnIx` pins the set to the body it is computed for.
@@ -10331,7 +10472,9 @@ function strAccAppendOk(binIx: i32, fnIx: i32) {
     const t = P.nodes[unwrapParen(a.binLeft)]
     if t is Ident {
       if !saNameQualifies(t.identName) { return false }
-      if localIndexOf(fnIx, t.identName) < 0 { return false }
+      if localIndexOf(fnIx, t.identName) < 0 {
+        if saAccGlobalIdx(t.identName) < 0 { return false }
+      }
       return saSelfAppendOk(a.binRight, t.identName, fnIx)
     }
   }
@@ -10348,6 +10491,7 @@ function emitStrAccAppend(body: i32[], binIx: i32, fnIx: i32) {
     const t = P.nodes[unwrapParen(a.binLeft)]
     if t is Ident {
       const slot = localIndexOf(fnIx, t.identName)
+      const gIx = saAccGlobalIdx(t.identName)
       const parts: i32[] = []
       strCatParts(a.binRight, fnIx, parts)
       const n = parts.length
@@ -10371,13 +10515,13 @@ function emitStrAccAppend(body: i32[], binIx: i32, fnIx: i32) {
         k = k + 1
       }
       fbLocalSet(strScratchBase + 3) // I0 = the added length
-      fbLocalGet(slot)
+      saAccGet(slot, gIx)
       fbStrLen()
       fbLocalSet(strScratchBase + 4) // I1 = the current length
-      fbLocalGet(slot)
+      saAccGet(slot, gIx)
       fbStrStart()
       fbLocalSet(strScratchBase + 6) // I3 = the current start
-      fbLocalGet(slot)
+      saAccGet(slot, gIx)
       fbStrBack()
       fbLocalSet(strScratchBase + 2) // OUT = the current backing
       fbLocalGet(strScratchBase + 6)
@@ -10439,7 +10583,7 @@ function emitStrAccAppend(body: i32[], binIx: i32, fnIx: i32) {
       fbLocalGet(strScratchBase + 3)
       fbI32Bin(106)
       fbStrNew()
-      fbLocalSet(slot)
+      saAccSet(slot, gIx)
       return 0
     }
   }
