@@ -33,6 +33,10 @@ LOGS="${TMPDIR:-/tmp}/vl-gate.$$"; mkdir -p "$LOGS"
 # them. $PYTHON pins an interpreter for every row without editing a script, and the
 # preflight row names the one that answered. Exported for the scripts a row shells.
 PY="${PYTHON:-python3}"; export PYTHON="$PY"
+# The native binary and the seed, for the rows written in VL. One row is today
+# (`seed size`, ported from Python); the paths are the ones every suite derives.
+VL="${VL:-$PWD/scripts/vl-host/target/release/vl}"
+SEED="${SEED:-$PWD/build/vl-compiler.wasm}"
 
 if [ "${1:-}" != "--no-build" ]; then
   echo "== building the seed (everything below reads it) =="
@@ -126,8 +130,12 @@ run "comment budget"           "$PY" scripts/comment-budget.py --check
 # jump names the landing that bought it rather than being found weeks later. It reads
 # the seed built above — ONE self-compile, which off a stale seed is the OLD codegen's
 # output; ci-native runs it straight after `--prove-fixpoint`, and that reading is the
-# deciding one. Milliseconds; a `stat` and a comparison.
-run "seed size"                "$PY" scripts/seed-size.py --check
+# deciding one.
+# WRITTEN IN VL, and it measures the seed it is compiled by, so this row now needs the
+# binary and a working seed where the Python needed neither. That is the point — the
+# first orchestrator script the language runs on itself — and it is why the row sits
+# after the build rather than beside the file scans.
+run "seed size"                "$VL" run scripts/seed-size.vl --compiler "$SEED" -- --check
 # The arena-scan RATCHET, same shape and the same reason: `arena-scan-outside-pass`
 # is a `warning` lint-self.sh holds out while the baseline is non-zero, so this is
 # what stops a whole-program scan being added outside a pass. #2419's class.
