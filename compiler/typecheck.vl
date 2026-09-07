@@ -15087,10 +15087,34 @@ function cwLambdaDeclOf(nm: string, fr: i32): i32 {
 // cannot place, which is the decline the callers turn into the `2` answer. D1683.
 function cwCalleeDeclOf(callFnIx: i32): i32 {
   const nm = covarRootName(callFnIx)
-  if nm == "" { return -1 }
+  if nm == "" { return cwUfcsDeclOf(callFnIx) }
   const d = cwFnDeclOf(nm)
   if d >= 0 { return d }
   cwLambdaDeclOf(nm, covarRootFrame(callFnIx))
+}
+
+// The declaration a UFCS callee (`xs.f(y)`) reaches: the member's PROPERTY names the free
+// `self`-function, which `covarRootName` cannot spell. Gated on the declaration actually
+// taking `self` first, so a closure-valued field read (`o.fn(x)`) does not resolve to an
+// unrelated top-level `fn`. D1799.
+function cwUfcsDeclOf(callFnIx: i32): i32 {
+  const cf = cwPeel(callFnIx)
+  if cf < 0 || cf >= P.nodes.length { return -1 }
+  const m = P.nodes[cf]
+  if m is Member {
+    if !declFirstParamIsSelf(m.memProp) { return -1 }
+    return cwFnDeclOf(m.memProp)
+  }
+  -1
+}
+
+// The parameter-slot offset an ARGUMENT index needs at this callee: 0 for a direct call, 1
+// for a UFCS spelling, whose receiver fills parameter 0. Every reader of the
+// argument->parameter edge applies this one answer, so none can outrun another (D1658).
+function cwCalleeArgOff(callFnIx: i32): i32 {
+  if covarRootName(callFnIx) != "" { return 0 }
+  if cwUfcsDeclOf(callFnIx) < 0 { return 0 }
+  1
 }
 
 // The parameter name at position `argIx` of the `FuncDecl` `dIx`, or "" past its parameter
@@ -15110,7 +15134,7 @@ function cwParamNameOfDecl(dIx: i32, argIx: i32): string {
 // The parameter a callee EXPRESSION delivers position `argIx` to — the spelling that reaches
 // a declared function and a function value alike.
 function cwParamNameAt(callFnIx: i32, argIx: i32): string {
-  cwParamNameOfDecl(cwCalleeDeclOf(callFnIx), argIx)
+  cwParamNameOfDecl(cwCalleeDeclOf(callFnIx), argIx + cwCalleeArgOff(callFnIx))
 }
 
 // The type-annotation node of the parameter at position `argIx` of `FuncDecl` `dIx`, or -1
@@ -15129,7 +15153,9 @@ function cwParamAnnOfDecl(dIx: i32, argIx: i32): i32 {
 
 // Does the callee EXPRESSION `callFnIx` declare position `argIx` as a read-only view?
 function cwParamIsView(callFnIx: i32, argIx: i32): boolean {
-  cwAnnIsView(cwParamAnnOfDecl(cwCalleeDeclOf(callFnIx), argIx))
+  cwAnnIsView(
+    cwParamAnnOfDecl(cwCalleeDeclOf(callFnIx), argIx + cwCalleeArgOff(callFnIx)),
+  )
 }
 
 // Is the annotation at `annIx` a read-only list view? Read off the ARENA type the checker
@@ -15945,11 +15971,14 @@ function cwGrowCall(
     if cwCallNamed(n.callArgNames) { return 2 }
     const cn = covarRootName(n.callFn)
     if cn == "" {
-      // `xs.push(b)` into a once-bound named receiver is a container store like `xs[i] = b`,
-      // filed above. Any other callee spelling no name — another method, a call result called
-      // straight through — has a body that is not a parameter list this can read.
-      if !cwPushIntoNamed(n.callFn) { return 2 }
-      return 0
+      // A UFCS spelling reaches a real parameter list one slot along, and the resolvers
+      // below apply that offset themselves. Where no declaration answers, this is the
+      // container store filed above (`xs.push(b)` into a once-bound name) or a callee with
+      // no parameter list to read. D1799.
+      if cwCalleeDeclOf(n.callFn) < 0 {
+        if !cwPushIntoNamed(n.callFn) { return 2 }
+        return 0
+      }
     }
     const cfr = cwParamFrameAt(n.callFn)
     let grew = 0
