@@ -229,6 +229,65 @@ the second one when scheduling the first.
 interleaves TWO subjects (`rk` then `rvk`), so it is not one dispatch. Of the pilot's two
 reasons for that site, only this one survives.
 
+**The second landing found FOUR sites, not one.** `forceAnnLeafReps` was the one the pilot
+named, but the nullable-`VKind` scrutinee is a shape, not a site: `repSigTokOfKind` — at 21 of
+31 the tree's LARGEST `VKind` ladder, whose `""` is the documented "no token (maps, nullable
+niches, scalar lists not yet in the ABI)" — plus `nulScalarListBuildKind` (`0`, not a nullable
+scalar list) and `nulScalarListFieldCode` (`-1`, no distinct wrapper). All four defaults are
+real answers, so all four convert; 398 → 394.
+
+**A rewrite that removes work is not byte-identical, and byte identity is the proof.**
+`forceAnnLeafReps` calls `nulScalarListKind(a)` twice — once in the guard, once for the local —
+and hoisting it would be better code. The conversion keeps both calls and rewrites only the
+ladder, so the emitted bytes cannot move; the redundant call is a separate change with its own
+evidence. Where a conversion cannot be byte-identical, say so rather than averaging it away.
+
+## THE DECIDING INPUT IS THE SCRUTINEE'S DECLARED TYPE, not which set its literals belong to
+
+The census's set column is derived from the LITERALS a chain compares, so it answers "which
+closed set do these strings live in" — a different question from "can this chain be a `match`",
+which only the scrutinee's declared type settles. Asked the second way, over the 49 non-`Ty`,
+non-`Node` sites in the tree:
+
+| the scrutinee is | sites | convertible |
+| --- | --- | --- |
+| a litunion PARAMETER (`k: MfKind`, `kind: TokKind`, `k: EqCmpKind`, `srcKind: VKind`) | 10 | yes |
+| a litunion FIELD read (`t.primName`, `tok.kind`) | 7 | yes — a member expression is a legal scrutinee |
+| a LOCAL from a litunion-returning call (`peekKind()`, `cloRetKindOf()`) | 11 | yes, nullable ones since D1898 |
+| a genuine `string` | **9** | **no** — `match` needs a union |
+| unresolved by the reader | 12 | to be read one at a time |
+
+**So "the ten string scrutinees" was wrong twice over.** The count is nine, and the other forty
+are matchable rather than blocked — the pilot's note generalised one site's `string` parameter
+into a property of every `lit` set. The nine that really are `string`-typed, named so nobody
+re-derives them:
+
+`nameIsPlainScalarAtom(a: string)` · `unionRefArrayArmSlotForElem(elemAtom: string)` ·
+`anonLeafAtomWidth(atom: string)` · `anonLeafAtomOfText(t: string)` ·
+`primTyOfName(name: string)` · `numCastCanFail(tgt: string)` ·
+`emitNumExactTest(dom: string)` · `emitNumExactConvert(src: string)` · and
+`numLitUnionBoxKind`, whose local comes from `numLitUnionBaseName(): string`.
+
+Each of those takes a spelling, not a kind. Giving one a `match` means giving the PRODUCER a
+litunion return type first, which is a rep decision and not a refactor — so they stay `if`
+chains until someone makes that decision deliberately.
+
+**The census also mis-attributes a set often enough to matter.** `fnSigKeyOf`'s subject is
+labelled `MfKind` and is a `VKind | null`; `scalarWidenConvOp`'s two are labelled
+`MfKind` and `BtKind` and are both `VKind`. A `_`-less rewrite must name the members of the
+DECLARED type, so reading the census's column as the arm list would produce a match that does
+not compile — which is the safe direction, but it is the reason to check.
+
+**And two sites are still not one dispatch**, for the reason that survives every set question:
+`scalarWidenConvOp` tests `srcKind` then `dstKind`, and `numWidensName` tests `sn` then `dn`.
+Two subjects interleaved is not a dispatch, and no amount of set-widening changes that.
+
+### The default test is the SECOND question
+
+Once the scrutinee's type admits a `match`, the honesty test from the section above applies:
+convert when the fall-through is a real answer, and fix the default first when it is a bare
+`0`/`""`/`false` nobody chose.
+
 ## Agreement, and why there are two implementations
 
 `compiler/lint.vl` grades one module from the source the driver hands it; the census grades the

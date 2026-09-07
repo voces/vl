@@ -27,6 +27,10 @@ CASES = os.path.join(TESTS, "cases")
 # suite ASSERTS, and why the corpus oracle cannot assert it. A file that appears in the
 # derived population and not here is an error — `tests/vl_wasm_runner_census_test.ts` fails
 # until it is classified, so a new runner cannot arrive unnoticed the way the fifth did.
+#
+# It has already earned that once: `vl_trap_source_frames_test.ts` became a runner in one PR
+# while this table was written in another, and the two were gated on trees without each other.
+# The census red on the merged master is the guard working, not a false one.
 CLASSIFIED = {
     "cases_wasm_0_test.ts": ("oracle shard", "seed (in-process)",
                              "@log output / @trap reason / @hint text"),
@@ -46,6 +50,8 @@ CLASSIFIED = {
                                 "EXPORT section aliases the public name"),
     "vl_std_process_test.ts": ("standalone", "native vl build",
                                "std:process / std:env across both hosts"),
+    "vl_trap_source_frames_test.ts": ("standalone", "native vl build",
+                                      "the trap's per-instruction source block, BOTH hosts"),
     "vl_seed_abi_test.ts": ("seed ABI", "none — instantiates the SEED",
                             "the seed's own export shape; not emitted user wasm"),
 }
