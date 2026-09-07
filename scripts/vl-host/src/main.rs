@@ -501,6 +501,7 @@ program verbatim — the only way to pass one that starts with `-`.
 
 {b}Flags:{r}
   {c}-o{r} <out.wasm>       Output path (default: the input with `.wasm`)
+  {c}-o -{r}                Write the module to stdout; no file is created
   {c}-O{r}                  Optimize with wasm-opt — the shrink rung (one -O pass)
   {c}-O3{r}                 The release profile (closed-world + -O3; melts union
                       boxes). Wins over -O when both are given. Both rungs
@@ -521,6 +522,7 @@ program verbatim — the only way to pass one that starts with `-`.
 {b}Examples:{r}
   vl build main.vl                  {d}writes main.wasm{r}
   vl build main.vl -O3 -o app.wasm --wat
+  vl build main.vl -o - | wc -c     {d}the module on stdout, nothing on disk{r}
 "
         ),
         // Parser of record: cliParseArgs in compiler/cli.vl (inside the seed).
@@ -5771,9 +5773,42 @@ fn build_cmd(args: &[String]) -> Result<()> {
     // only the user program's own execution gets a real (DRC) collector.
     let compile_engine = seed_engine(Collector::Null)?;
 
-    let out = flag("-o").unwrap_or_else(|| {
+    // `-o -` is the stdout spelling: the module BYTES go to stdout and no file is
+    // created. The default stays the `cc` one (`p.vl` → `p.wasm` beside the source) —
+    // docs/internals/cli-design.md §"The output channel is RULED" carries the decision
+    // and the alternative it declined.
+    let requested = flag("-o");
+    let to_stdout = requested.as_deref() == Some("-");
+    let out = requested.unwrap_or_else(|| {
         input.strip_suffix(".vl").unwrap_or(input).to_string() + ".wasm"
     });
+    if to_stdout {
+        use std::io::IsTerminal;
+        // Refused rather than spewed: a wasm module is not text, and the shell that
+        // would have received it is the one the user is reading.
+        if std::io::stdout().is_terminal() {
+            eprintln!("vl build: `-o -` writes a binary module to stdout, but stdout is a terminal");
+            eprintln!("    redirect it (`-o - > out.wasm`) or pipe it (`-o - | …`)");
+            std::process::exit(2);
+        }
+        // `--wat` writes `<out>.wat` BESIDE the module; with no path there is nowhere
+        // beside. A loud refusal, not a silently skipped dump.
+        if args.iter().any(|a| a == "--wat") {
+            eprintln!("vl build: `--wat` writes a .wat beside the module and needs a path");
+            eprintln!("    it cannot combine with `-o -` — give `-o <file.wasm>` instead");
+            std::process::exit(2);
+        }
+    }
+    // Everything below writes and optimizes a PATH, so stdout mode borrows a temporary
+    // and streams it at the end. `-O`/`-O3` therefore reach stdout optimized, which is
+    // what makes the stream worth having.
+    let sink = if to_stdout {
+        std::env::temp_dir().join(format!("vl-build-{}.wasm", std::process::id()))
+    } else {
+        std::path::PathBuf::from(&out)
+    };
+    let sink_str = sink.to_string_lossy().into_owned();
+    let out_label = if to_stdout { "<stdout>" } else { out.as_str() };
     // `--names` embeds a wasm "name" custom section (legible trap backtraces).
     let names = args.iter().any(|a| a == "--names");
     // `_located`, so a written module the engine refuses names the function it came
@@ -5794,16 +5829,16 @@ fn build_cmd(args: &[String]) -> Result<()> {
     if let Some(f) = fault_injection()? {
         inject_fault(f, &mut bytes)?;
     }
-    std::fs::write(&out, &bytes)?;
+    std::fs::write(&sink, &bytes)?;
     // Optimize the written module in place (wasm-opt, when present). Two
     // rungs, and `-O3` WINS when both are given — it is a superset of `-O`'s
     // effect on every measured shape, so running `-O` first would only cost a
     // process spawn. `-O3` is the release profile (`RELEASE_PASSES`), not a
-    // bare binaryen level. `wasm-opt` rewrites `out` itself (a subprocess, not
+    // bare binaryen level. `wasm-opt` rewrites the sink itself (a subprocess, not
     // this host), so `bytes` goes stale the moment either rung runs — `final_bytes`
     // is Some(..) exactly when that happened, and is the one place left that still
-    // reads `out` back off disk, because it is the only source of the post-optimize
-    // bytes (D1678).
+    // reads the sink back off disk, because it is the only source of the
+    // post-optimize bytes (D1678).
     let opt_rung = if args.iter().any(|a| a == "-O3") {
         Some(("-O3", RELEASE_PASSES))
     } else if args.iter().any(|a| a == "-O") {
@@ -5813,30 +5848,44 @@ fn build_cmd(args: &[String]) -> Result<()> {
     };
     let mut final_bytes: Option<Vec<u8>> = None;
     if let Some((flag, passes)) = opt_rung {
-        optimize_in_place(&out, flag, passes)?;
-        final_bytes = Some(std::fs::read(&out).map_err(|e| {
-            Error::from(e).context(format!("reading back the {flag}'d `{out}`"))
+        optimize_in_place(&sink_str, flag, passes)?;
+        final_bytes = Some(std::fs::read(&sink).map_err(|e| {
+            Error::from(e).context(format!("reading back the {flag}'d `{out_label}`"))
         })?);
     }
     let final_bytes: &[u8] = final_bytes.as_deref().unwrap_or(&bytes);
-    // The buffer's own length, not a filesystem stat of `out` — `-o /dev/null`
+    // STDERR, not stdout: this sentence is chatter about the run, and stdout carries the
+    // artifact and nothing else (cli-design.md). On stdout it made `vl build p.vl >
+    // out.bin` leave `out.bin` holding the sentence instead of the module (ROADMAP row 9).
+    // The buffer's own length, not a filesystem stat of the sink — `-o /dev/null`
     // (or any path that discards what it's given) reported "wrote ... (0 bytes)"
     // for a build that had in fact produced a full module (D1678).
-    println!("wrote {out} ({} bytes)", final_bytes.len());
+    eprintln!("wrote {out_label} ({} bytes)", final_bytes.len());
     // `--wat`: also write a `.wat` text dump beside the module (wasm-dis,
     // when present). Reflects the `-O`-optimized module if both are given.
+    // Refused above under `-o -`, which has no path to write beside.
     if args.iter().any(|a| a == "--wat") {
         let wat = format!("{}.wat", out.strip_suffix(".wasm").unwrap_or(&out));
         disassemble_to_wat(&out, &wat)?;
     }
+    // `-o -`: the module reaches stdout here and the borrowed temporary goes away.
+    // BEFORE validation, so the stream mirrors the file case exactly — a module the
+    // engine refuses is still delivered, and the refusal is still the exit code.
+    if to_stdout {
+        use std::io::Write;
+        let mut o = std::io::stdout().lock();
+        o.write_all(final_bytes)?;
+        o.flush()?;
+        let _ = std::fs::remove_file(&sink);
+    }
     // The written module must be a module the engine will ACCEPT — see
     // `validate_written_module`. Runs LAST so `--wat` still dumps a broken
     // module (that dump is how an emit bug gets diagnosed). Validates
-    // `final_bytes` — the buffer already in hand — rather than re-reading `out`,
+    // `final_bytes` — the buffer already in hand — rather than re-reading the sink,
     // so a write-only or unreadable `-o` target no longer fails a check-clean
     // build (D1678).
     if !args.iter().any(|a| a == "--no-validate") {
-        if let Err(e) = validate_written_module(&compile_engine, final_bytes, &out) {
+        if let Err(e) = validate_written_module(&compile_engine, final_bytes, out_label) {
             // An OPTIMIZED artifact is binaryen's bytes, not the emitter's, so the
             // emitter's byte ranges do not describe it — keep the engine's own text
             // rather than naming a function off an offset that means something else.
