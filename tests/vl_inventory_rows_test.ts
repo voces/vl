@@ -102,6 +102,17 @@ const ROWHEAD = /^#{2,4}\s+D\d/;
 // it still reporting as gradeable, because an indented block far below stood in for it.
 const ANYHEAD = /^#{1,6}\s/;
 
+/**
+ * What ENDS a wrapped status line's join: a blank line (a status line is one Markdown
+ * paragraph) or the next heading (which closes the section). The grader's
+ * `status_join_continues` is this function; the two must agree, or a row one accepts and the
+ * other does not lands green here and red there.
+ */
+function statusJoinContinues(line: string): boolean {
+  if (line.trim() === "") return false;
+  return !(SEC.test(line) || ANYHEAD.test(line));
+}
+
 /** The declared-status vocabulary, read from the grader so the two cannot drift. */
 function vocabulary(src: string): string[] {
   const block = src.split("DECLARED = [")[1];
@@ -182,20 +193,22 @@ function parseRows(text: string): Row[] {
     }
     if (!cur) continue;
     const ln = lines[i];
-    // A status line may WRAP onto a second line and still be a status line — the grader
-    // joins it, so this must too or the two disagree about which rows are gradeable.
+    // A status line may WRAP and still be a status line — the grader joins it, so this must
+    // too or the two disagree about which rows are gradeable. Bounded by the PARAGRAPH and
+    // by the next heading, not by a line count: a six-line cap refused an 8-line status as
+    // `status line names no known outcome` and named no cause.
     if (cur.status === undefined && ln.startsWith("**")) {
       if (ln.trimEnd().endsWith("**") && ln.trimEnd().length > 2) {
         cur.status = ln.replaceAll("*", "").trim();
       } else {
         const parts = [ln];
-        for (let k = i + 1; k < lines.length && k - i <= 5; k++) {
+        for (let k = i + 1; k < lines.length; k++) {
+          if (!statusJoinContinues(lines[k])) break;
           parts.push(lines[k]);
           if (lines[k].trimEnd().endsWith("**")) {
             cur.status = parts.join(" ").replaceAll("*", "").trim();
             break;
           }
-          if (lines[k].trim() === "") break;
         }
       }
     }
@@ -355,6 +368,62 @@ Deno.test("only a labelled indented block counts as a repro", () => {
   }
   if (bad.length > 0) {
     throw new Error(`the repro-shape rule misroutes:\n  ${bad.join("\n  ")}`);
+  }
+});
+
+// THE STATUS JOIN, SEEN TO FIRE — a wrapped status line is bounded by its PARAGRAPH, not by a
+// line count. A six-line cap read an 8-line status as having none, so the row graded
+// `status line names no known outcome` in both this test and the python, and neither said
+// that LENGTH was the cause. The specimens pin the lift and the two stops that replace it.
+const STATUS_SPECIMENS: Array<[string, boolean, string]> = [
+  ["a one-line status", true, "**closed 2026-09-07 — the witness prints `2`**"],
+  ["a two-line wrap", true, "**closed 2026-09-07 — the witness\nprints `2`**"],
+  // The row this PR exists for: eight lines, which the old cap refused at the sixth.
+  ["an eight-line wrap", true,
+    "**closed 2026-09-07 — the witness prints `2` · was a loud emit reject,\n" +
+    "`monomorphize: unsupported argument type` · clause 2 · 2 of the 64 cells\n" +
+    "of the `pop-union-box-element` matrix (`argument` and `early_return_guard`,\n" +
+    "un-annotated) · filed 2026-09-07 against master `8bdd886af` grading\n" +
+    "D1881's close; resolved against `1a67d7811` · fixtures\n" +
+    "`tests/cases/unions/pop-union-box-generic-pin.vl` and its `-annotated`\n" +
+    "twin, both of which run · byte identity over `tests/cases` 0 differing\n" +
+    "files, seed +130 bytes**"],
+  // The two stops that replace the cap. An opener that never closes must not swallow the
+  // prose below it, nor the row below THAT.
+  ["an opener closed by a blank line", false, "**closed 2026-09-07 — never closed\n\nprose"],
+  ["an opener closed by the next heading", false, "**closed — never closed\n#### Mechanism"],
+];
+
+Deno.test("a wrapped status line joins to its paragraph, whatever its length", () => {
+  const bad: string[] = [];
+  for (const [name, want, head] of STATUS_SPECIMENS) {
+    const text = `### D1 — specimen\n${head}\n\nRepro:\n\n    print(6 * 7)\n`;
+    const rows = parseRows(text);
+    if (rows.length < 1) {
+      bad.push(`${name}: want a parsed row, got ${rows.length}`);
+      continue;
+    }
+    const got = rows[0].status !== undefined &&
+      rows[0].status.toLowerCase().includes("closed");
+    if (got !== want) {
+      bad.push(
+        `${name}: want a graded status ${want}, got ${got} ` +
+          `(status: ${rows[0].status ?? "(none)"})`,
+      );
+    }
+  }
+  // The opener that runs into the next heading must leave that row alone as well — the stop
+  // exists to bound the join, and a join that ate the row below would still pass the check
+  // above while silently deleting a row from every count.
+  const two = parseRows(
+    "### D1 — first\n**closed — never closed\n### D2 — second\n**closed**\n\n" +
+      "Repro:\n\n    print(1)\n",
+  );
+  if (two.length !== 2) {
+    bad.push(`an opener running into the next row: want 2 parsed rows, got ${two.length}`);
+  }
+  if (bad.length > 0) {
+    throw new Error(`the status-line join misroutes:\n  ${bad.join("\n  ")}`);
   }
 });
 

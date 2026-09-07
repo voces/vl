@@ -58,9 +58,9 @@ def rows_of(target):
             if b.kind != "row":
                 continue
             body = R.strip_separator(b.text)
-            # A status block longer than the six lines `status_line` joins (D1025's is
-            # seven) returns None there; the outcome word opens the block, so the first
-            # bold line alone still classifies it — the grader reads it the same way.
+            # The first bold line alone still classifies a row whose status `status_line`
+            # cannot join at all (an opener that never closes): the outcome word opens the
+            # block. A fallback, not the path — the join is bounded by the paragraph.
             first_bold = next((ln.strip("*").strip() for ln in body.split("\n")
                                if ln.startswith("**")), "")
             out.append((b.rid, R.declared_outcome(S.status_line(body) or first_bold) or "?",
