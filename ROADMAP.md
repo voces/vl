@@ -58,7 +58,6 @@ units: **hours** · **half-day** · **days**.
 | 25 | **structural-tolerant emitter (rep architecture step 1)** — **CLOSED OUT: 20 of 37 caller sites converted, 5 RULED, 12 left as a standing measurement** | the criterion is per site and is measured: a per-site oracle over 10,801 modules. The 20 converted byte-inert with the diagnostics grader clean on both populations. **All five held-back sites are ruled and NOT ONE was a rep gap** — an inverted predicate (D1857), two precedence rungs (D1858, D1920), a circular source (D1859), an unexercised widening, and one widening the population DOES exercise that still gains zero builds and worsens a diagnostic (D1921). The other 12 have never received a structural name in either population | `rep-descriptor-campaign.md` §11–§12 | the 12 are a measurement, not a backlog: convert one the day its RIGHT-ONLY column moves off zero |
 | 27 | **E3 — user wasm runs on the playground's MAIN thread** | `playground/src/runtime.ts:21` instantiates there; `main.ts:36` says so | `playground/src/{runtime,playground,main}.ts` | days |
 | 28 | **F-tiers / J1 — the corpus runner is NOT redundant; what was missing was the census (2026-09-07)** | nine files execute emitted user wasm — four oracle shards and five standalone suites — and each standalone one grades what the oracle cannot (a host memory view, a GLOBAL count, an EXPORT alias, cross-instance byte-identity, the process floor); the 34 cells a suite also runs go through the NATIVE `vl build` while the oracle compiles in-process, so they are a cross-path agreement check | done: `scripts/wasm-runner-census.py` derives the population, `tests/vl_wasm_runner_census_test.ts` fails on an unclassified runner, and `docs/internals/wasm-runner-tiers-2026-09.md` states the tiers. Residue is documentation drift, not duplication | — |
-| 29 | **F-day-one — ONE grammar axis still absent** | `day-one-sampler.md`: operator overloading (`match` landed as a `narrowing` spelling, D1885/D1886; multi-param generics as a `pinning` face, D1887/D1888; recursive types as four records with a non-recursive control, D1889; mixed-width arithmetic as eleven READS, 381 pairs at zero, D1890) | `scripts/day-one/grammar.py` | half-day per axis |
 | 30 | **Dogfood the orchestrator scripts onto the host ABI** | the ABI is COMPLETE (`std:process` `run`/`exit`, `std:env` `getEnv`, in all three hosts); 34,029 lines of Python and 2,536 of shell still do the work | `scripts/*.py` one port at a time; `scripts/seed-size.vl` is the first and is live, and the SECOND (`check-filed-witnesses.py`) is blocked on the three `dogfood:` rulings below | days |
 | 31 | **A-destructure — `let`/`const` and PARAMETER destructuring (owner ask, 2026-09-06 night; not scheduled)** | `const { x, y } = p`, `const [a, b] = xs`, `function f({ x, y }: Pt)` → `parse error … expected an identifier but found `{``; the `match` payload clause (pun, rename, nest — #2837) is the only destructuring today | `parser.vl` (a pattern in binding and parameter position, the payload clause's grammar reused), `typecheck.vl` (binding types from the pattern; for an UN-ANNOTATED parameter the pattern is a shape constraint `{a: ?, b: {c: ?}}` with hole leaves closed at the pin — the inference half is a second step), `format.vl` (byte-for-byte round trip), the desugar (one `const` per leaf, the `match` prelude's shape); list destructuring wants the multiple-returns question in `docs/guide/lambda-param-skip-design.md` answered first | days |
 | 32 | **the completion surfaces `///` docs do NOT reach: a user `type` NAME, and the playground's missing UFCS path** | measured 2026-09-08: `type Pt` documented and in scope is offered as no completion item at all (`symScopeAt` records variable/parameter/function bindings only), and the playground adapter's member path never calls `ufcsCandidatesAt`, so it offers no UFCS method to document. The UFCS third landed 2026-09-08 and the struct FIELD third with it | the type half is a NEW completion source, not a doc gap — types in scope at the cursor, over the scope walk `symScopeAt` already does, and the doc then rides `docForDeclTok` like the other three; the playground half is `ufcsCandidatesAt` in `playground/src/lspAdapter.ts`, pinned in `tests/lsp_ufcs_docs_test.ts` | hours each |
@@ -3140,17 +3139,26 @@ seed from current `compiler/*.vl` in ~40s.*
 ## Track F — Infrastructure & hygiene
 *Independent; do continuously.*
 
-- ⬜ **F-day-one. Grow the day-one sampler's grammar, and aim the next run by hit rate.**
+- ✅ **F-day-one. Grow the day-one sampler's grammar, and aim the next run by hit rate.**
+  DONE 2026-09-07: all five named axes are in, each with a control that can refute it —
+  `match` as a `narrowing` SPELLING (D1885/D1886), multi-param generics as a `pinning` face
+  whose `same`-rep column is the control (D1887/D1888), recursive types as four records with
+  `rec_flat` beside them (D1889), mixed-width arithmetic as eleven READS with a same-width
+  control, 381 pairs at zero (D1890), and operator overloading as the `operator_vs_call`
+  axis whose UFCS control held 69 of 69 while four mechanisms fell out (D1891-D1894). What
+  remains below is the grammar's standing frame, not this item.
   `scripts/day-one/` generates ORDINARY programs in PAIRS and grades agree/disagree, which is
   the only instrument here that can find a shape nobody named — the others each sample a
   population somebody already wrote down. First run (2026-09-03, 640 programs) filed D1474,
   D1475 and D1476 and reproduced both of its controls. **What it cannot sample is the whole
-  backlog**: no operator overloading, no `std:json`/`buffer`/`fs`, nothing over ~25 lines,
-  and nothing whose expected output Python cannot compute. Each is one record in
-  `grammar.py`. Generics reach TWO parameters and no further (D1887/D1888); recursive types
-  are four records with a non-recursive control (D1889); `match` landed as a `narrowing`
-  SPELLING and mixed-width arithmetic as eleven READS rather than as axes of their own —
-  both compose with every axis that way, where an axis could only pair each against itself.
+  backlog**: no `std:json`/`buffer`/`fs`, nothing over ~25 lines, and nothing whose expected
+  output Python cannot compute. Each is one record in `grammar.py`. Generics reach TWO
+  parameters and no further (D1887/D1888); recursive types are four records with a
+  non-recursive control (D1889); operator overloading is the `operator_vs_call` axis, whose
+  UFCS control stayed green over 69 pairs while four mechanisms fell out (D1891-D1894);
+  `match` landed as a `narrowing` SPELLING and mixed-width arithmetic as eleven READS rather
+  than as axes of their own — both compose with every axis that way, where an axis could
+  only pair each against itself.
   Aim by the per-feature rate the run prints — `discriminant` 27.8%,
   `is_narrow` 26.1%, `closure_capture` 17.9% at the top; `scalar`, `string`, `forin`,
   `map_value`, `global_init` at zero. Details and the untriaged hit list:

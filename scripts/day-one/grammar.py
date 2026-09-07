@@ -41,6 +41,34 @@ REC_INLINE = "{ name: string, n: i32 }"
 REC_EXPR = '{ name: "ada", n: 3 }'
 REC_ALT = '{ name: "zed", n: 0 }'
 
+# OPERATOR OVERLOADING. `isStrFuncName` (`compiler/parser.vl`) admits `[]`, `[]=` and
+# `+ - * / % ^ > >= < <=` as quoted function names, dispatched by the `self` parameter's
+# TYPE — DECISIONS.md B14, "the one place ad-hoc overloading is allowed". `==` / `!=` are
+# the design's bounded exclusion, and the parser says so, so no record declares one: both
+# faces would refuse together and a both-fail is not a hit.
+#
+# Every record declares the operator AND a plain function with the same body, so the two
+# faces of `operator_vs_call` differ in ONE LINE — which spelling the read uses. Both
+# declarations stand in both faces, so a disagreement is about the CALL and not about
+# whether declaring an operator perturbs the module at all.
+#
+# The receiver is a `new` NOMINAL type because the receiver type IS the dispatch key, which
+# is also why these carry `no_inline`: expanding the name away is a different type and
+# takes the operator with it. `alt` is a CALL for the same reason — a bare object literal
+# in `??` or a re-assignment infers the structure, not the brand.
+
+
+def _op_alt(name, ty):
+    """The record's `alt`, as a function so the value keeps its nominal type wherever
+    the generator drops it un-annotated."""
+    return ["function %s(): %s {" % (name, ty),
+            "  const r: %s = { x: 9 }" % ty,
+            "  return r",
+            "}"]
+
+
+OP_MK = ["const r: {T} = { x: 3 }", "return r"]
+
 VALUES = [
     {
         "id": "i32", "weight": 4, "decls": [], "named": "i32", "inline": "i32",
@@ -394,6 +422,111 @@ VALUES = [
                              '  "b" | "c" => print(2)', "}"],
                    "want": ["2"]}],
     },
+    {
+        # `+`: same-type binary, result is the RECEIVER type.
+        "id": "op_add", "weight": 3, "decls": [("Vec", "new { x: i32 }")],
+        "named": "Vec", "inline": "Vec", "no_inline": True,
+        "fns": ['function "+"(self: Vec, other: Vec): Vec {',
+                "  const r: Vec = { x: self.x + other.x }",
+                "  return r",
+                "}",
+                "function plusVec(self: Vec, other: Vec): Vec {",
+                "  const r: Vec = { x: self.x + other.x }",
+                "  return r",
+                "}",
+                "const opW: Vec = { x: 4 }"] + _op_alt("altVec", "Vec"),
+        "expr": None, "mk": OP_MK, "alt": "altVec()", "alt_infers": True,
+        "features": ["struct", "operator", "op_add"],
+        "reads": [{"id": "op", "op": "+",
+                   "lines": ["print(({v} + opW).x)"], "want": ["7"]},
+                  {"id": "call", "op": "+",
+                   "lines": ["print(plusVec({v}, opW).x)"], "want": ["7"]}],
+    },
+    {
+        # `*` with a MIXED operand — the right side is a plain `i32`, so the operator's
+        # two parameters are not the same type and the dispatch key is only the left one.
+        "id": "op_mul", "weight": 2, "decls": [("Sca", "new { x: i32 }")],
+        "named": "Sca", "inline": "Sca", "no_inline": True,
+        "fns": ['function "*"(self: Sca, k: i32): Sca {',
+                "  const r: Sca = { x: self.x * k }",
+                "  return r",
+                "}",
+                "function mulSca(self: Sca, k: i32): Sca {",
+                "  const r: Sca = { x: self.x * k }",
+                "  return r",
+                "}"] + _op_alt("altSca", "Sca"),
+        "expr": None, "mk": OP_MK, "alt": "altSca()", "alt_infers": True,
+        "features": ["struct", "operator", "op_mul"],
+        "reads": [{"id": "op", "op": "*",
+                   "lines": ["print(({v} * 4).x)"], "want": ["12"]},
+                  {"id": "call", "op": "*",
+                   "lines": ["print(mulSca({v}, 4).x)"], "want": ["12"]}],
+    },
+    {
+        # `<`, whose result is a BOOLEAN and not the receiver type, delivered into a
+        # condition rather than a value position. An operator whose result re-enters the
+        # receiver's own rep and one whose result leaves it are different lowerings.
+        "id": "op_cmp", "weight": 2, "decls": [("Ord", "new { x: i32 }")],
+        "named": "Ord", "inline": "Ord", "no_inline": True,
+        "fns": ['function "<"(self: Ord, other: Ord): boolean {',
+                "  return self.x < other.x",
+                "}",
+                "function ltOrd(self: Ord, other: Ord): boolean {",
+                "  return self.x < other.x",
+                "}",
+                "const opO: Ord = { x: 4 }"] + _op_alt("altOrd", "Ord"),
+        "expr": None, "mk": OP_MK, "alt": "altOrd()", "alt_infers": True,
+        "features": ["struct", "operator", "op_cmp"],
+        "reads": [{"id": "op", "op": "<",
+                   "lines": ["if {v} < opO { print(1) } else { print(0) }"],
+                   "want": ["1"]},
+                  {"id": "call", "op": "<",
+                   "lines": ["if ltOrd({v}, opO) { print(1) } else { print(0) }"],
+                   "want": ["1"]}],
+    },
+    {
+        # `[]` and `[]=` are TWO op groups on one record: the bracket READ and the bracket
+        # WRITE are separate declarations and separate lowerings, so an edge proven at the
+        # getter is not proven at the setter. The setter is also the only read here that
+        # delivers the value into an ASSIGNMENT target rather than an expression.
+        "id": "op_index", "weight": 3, "decls": [("Box", "new { x: i32 }")],
+        "named": "Box", "inline": "Box", "no_inline": True,
+        "fns": ['function "[]"(self: Box, i: i32): i32 { return self.x + i }',
+                'function "[]="(self: Box, i: i32, k: i32) {',
+                "  print(self.x + i + k)",
+                "}",
+                "function idxBox(self: Box, i: i32): i32 { return self.x + i }",
+                "function setBox(self: Box, i: i32, k: i32) {",
+                "  print(self.x + i + k)",
+                "}"] + _op_alt("altBox", "Box"),
+        "expr": None, "mk": OP_MK, "alt": "altBox()", "alt_infers": True,
+        "features": ["struct", "operator", "op_index"],
+        "reads": [{"id": "get_op", "op": "[]",
+                   "lines": ["print({v}[4])"], "want": ["7"]},
+                  {"id": "get_call", "op": "[]",
+                   "lines": ["print(idxBox({v}, 4))"], "want": ["7"]},
+                  {"id": "set_op", "op": "[]=",
+                   "lines": ["{v}[4] = 5"], "want": ["12"]},
+                  {"id": "set_call", "op": "[]=",
+                   "lines": ["setBox({v}, 4, 5)"], "want": ["12"]}],
+    },
+    {
+        # THE CONTROL. No operator is declared anywhere; the pair is a plain call against
+        # its UFCS twin, which is the OTHER dispatch-by-receiver mechanism in the language.
+        # A disagreement this record shares is about dispatch in general and is not an
+        # operator defect — the job `rec_flat` does for recursion and `widen_same` for
+        # widening, and the only thing that makes a zero on the other four readable.
+        "id": "op_none", "weight": 2, "decls": [("Pln", "new { x: i32 }")],
+        "named": "Pln", "inline": "Pln", "no_inline": True,
+        "fns": ["function plusPln(self: Pln, k: i32): i32 { return self.x + k }"]
+        + _op_alt("altPln", "Pln"),
+        "expr": None, "mk": OP_MK, "alt": "altPln()", "alt_infers": True,
+        "features": ["struct", "operator", "op_none"],
+        "reads": [{"id": "call", "op": "none",
+                   "lines": ["print(plusPln({v}, 4))"], "want": ["7"]},
+                  {"id": "ufcs", "op": "none",
+                   "lines": ["print({v}.plusPln(4))"], "want": ["7"]}],
+    },
 ]
 
 # ---------------------------------------------------------------------------
@@ -504,6 +637,12 @@ AXES = [
     {"id": "scope", "weight": 3, "faces": ["module", "function", "fn_block",
                                            "module_block"], "needs": "free_scope"},
     {"id": "scenery", "weight": 3, "faces": ["bare", "neighbour"]},
+    # THE OPERATOR SPELLING against the DIRECT CALL of a function with the same body. Its
+    # faces are read ids, like `narrowing`'s, because what differs is the one line that
+    # consumes the value. Grouping is by the OPERATOR, not by the expected output, so `[]`
+    # and `[]=` stay two groups on one record even though several reads print the same
+    # number — the mistake `_narrow_group`'s `want` key would have made here.
+    {"id": "operator_vs_call", "weight": 4, "faces": ["*"], "needs": "op_group"},
     # INITIALISE vs DECLARE-THEN-ASSIGN. The `let` is seeded with a LITERAL, which pins
     # its rep, and the assignment is where a differently-repped source disagrees with
     # that pin — `let len = 0` then `len = xs[0]` crashes the compiler where
