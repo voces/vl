@@ -1662,10 +1662,21 @@ in-language GC knobs.
         the stronger form of the check, since a total can match while two populations move in
         compensating directions. CONTRADICT 0, byte-identical on both, rep-fuzz exact,
         `regress.py` unmoved, mono-grid 0 BAD. Across the two landings **104,792 of the 112,531
-        queries (93%) have left the column, every one into AGREE.** Remaining: the NULLABLE
-        element (4,273 / 42 modules — `repOfArray`'s tail as well, not `repOfNullable`'s: an
-        array with a nullable ELEMENT never reaches that function), the value-union box
-        (3,167 / 82), other union (133), one no-recorded-type module (166). No rung is deletable until the column is empty for the kind.
+        queries (93%) have left the column, every one into AGREE.** **THIRD LANDING REFUSED, and its price is the
+        finding.** The NULLABLE element (4,273 / 42 modules) was built to the same recipe and
+        its ORACLE endorsed it completely — `reflist` LEFT-ONLY falling by exactly its census in
+        each population (4,088 and 185), CONTRADICT 0. **Byte identity refuses it: 35 modules go
+        `runs -> not-runs`, six of them compiler TRAPS** (`ref index access but ref array type
+        not collected` x16, `ref valtype with no interned shape` x11, two collect-row refusals).
+        The rule it buys: **answering `reflist` is a PROMISE THAT A ROW EXISTS.** The descriptor
+        is read by the ref-list slot, shape and collect consumers too, and the collect pass mints
+        a row for a MAP and a NESTED-ARRAY element — which is why those two were byte-identical
+        — and none for a nullable one, so the answer is a claim the emitter cannot honour.
+        Covering it needs the collect pass to intern the row first, a build rather than a
+        projection ([D1837](internals/inventory/D1837.md), a refutation pin). A landing graded on
+        LEFT-ONLY and CONTRADICT alone would have shipped all 35. Remaining: the value-union box
+        (3,167 / 82), other union (133), one no-recorded-type module (166), and the nullable
+        element behind its build. No rung is deletable until the column is empty for the kind.
         `docs/internals/rep-descriptor-campaign.md` §9.
      Two owner rulings gate how far items 2 and 6 can go: `one-literal-union-rep` and
      `nullable-rep-rule-stated-once` (`docs/internals/open-rulings.md` §D).
