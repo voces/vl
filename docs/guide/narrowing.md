@@ -37,10 +37,9 @@ while y is i64 { print(y + 1)   // a loop head narrows its body, re-tested every
 ```
 
 A write of a NON-member is still refused, and the diagnostic names the declared type:
-`x = "s"` above is `cannot assign string to i64 | boolean`. Two places the rule stops short:
-a loop head narrows a bare name but not a property path (a path can be falsified through an
-alias, and the loop re-tests only its head), and a write inside a NESTED block retires the
-narrowing for everything after that block rather than re-narrowing across it.
+`x = "s"` above is `cannot assign string to i64 | boolean`. One place the rule stops short: a
+write inside a NESTED block retires the narrowing for everything after that block rather than
+re-narrowing across it.
 
 ## What narrows
 
@@ -57,10 +56,11 @@ narrowing for everything after that block rather than re-narrowing across it.
   (a property path's narrowing can be retired inside an arm, so it is not carried out). An arm on
   the fall-through path that WRITES a different member into the place drops the residual for that
   name: the write is legal, and what it costs is the fact the code below the chain would have had.
-- **Loop bodies:** a `while` head narrows its body exactly as an `if` then-arm does, for a null
-  strip and an `is T` pin alike. A guard from an ENCLOSING `if` is different: a write in the loop
-  body that falsifies it is refused, because the reads textually before the write run again after
-  it and no back edge re-tests that guard.
+- **Loop bodies:** a `while` head narrows its body exactly as an `if` then-arm does — a null
+  strip and an `is T` pin alike, a property path as much as a bare name. What could falsify a
+  fact mid-body retires it: a write, or a call that can reach the place. A guard from an
+  ENCLOSING `if` is different: a write in the loop body that falsifies it is refused, because
+  the reads textually before the write run again after it and no back edge re-tests that guard.
 - **`&&` / `||` chains:** a guard narrows a *list* of facts. `&&` narrows several places at once
   (`x != null && x.y is i32`), and its RHS is type-checked *and* codegen'd with the LHS's narrowing
   already applied (short-circuit). `||` is the De Morgan dual — `if x == null || y == null { return }`
