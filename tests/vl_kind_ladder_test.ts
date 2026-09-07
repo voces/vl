@@ -311,6 +311,29 @@ print(oneLiner("x") + holed("u8list"))
     incomplete: [4],
     split: [],
   },
+  {
+    // A FIELD read is graded against the field's DECLARING type, not the set its literals
+    // happen to spell. `c.primName` names three, but the field table (census + the lint's
+    // `klFieldSetOf`, drift-gated against `type X = { f: T }`) resolves it to `PrimName`'s
+    // ten, so the ladder is incomplete. Without the table its three would be an exhaustive
+    // three-member set and nothing would fire — this is the pin that the field path is live.
+    name: "field-prim-ladder.vl",
+    src: `type Cell = { primName: string }
+
+function fieldPrimLadder(c: Cell): i32 {
+  if c.primName == "i64" { return 1 }
+  if c.primName == "f64" { return 2 }
+  if c.primName == "f32" { return 3 }
+  0
+}
+
+const c: Cell = { primName: "i64" }
+print(fieldPrimLadder(c))
+`,
+    incomplete: [4],
+    split: [],
+    says: { code: INCOMPLETE, text: "PrimName" },
+  },
 ];
 
 type Hits = { lines: Record<string, number[]>; msgs: Record<string, string[]> };
