@@ -233,8 +233,10 @@ import {
   nameIsParenOpen,
   nameIsParenSpanEnds,
   nameIsQuotedLeaf,
+  nameIsReadOnlyList,
   nameMentionsIdent,
   parenEnclosesWhole,
+  roListInnerName,
   spanEqAt,
   splitUnionAtoms,
   tyTopIndexOf,
@@ -285,9 +287,11 @@ export type TyFunc = { fnParamTypes: i32[], fnRet: i32 }
 export type TyUnion = { uMembers: i32[] }
 // A nullable `T?` / `T | null`: the inner type-arena index.
 export type TyNullable = { nInner: i32 }
-// A growable array `T[]`: the element type-arena index (`-1` for an empty `[]`
-// whose element is not yet known — assignable to any array, like a hole).
-export type TyArray = { aElem: i32 }
+// A list `T[]`: the element type-arena index (`-1` for an empty `[]` whose element is not
+// yet known — assignable to any array, like a hole). `aRead` is 1 for the read-only view
+// `readonly T[]`, 0 for the growable list; the two rep identically, since `repCanonId`
+// reads the element alone, so a view is the same value and never a copy.
+export type TyArray = { aElem: i32, aRead: i32 }
 // A string-keyed map `{[K]: V}` or a set over it: key and value type-arena indices (`-1`
 // for the holes of a bare `Map()`/`Set()`, pinned by the binding annotation or the first
 // `.set`/`.add`). `mSet` is 1 for the set flavor, which is internally a boolean-valued map
@@ -2231,7 +2235,14 @@ function mkNullableTy(inner: i32) {
 }
 
 export function mkArrayTy(elem: i32) {
-  const t: Ty = { aElem: elem }
+  const t: Ty = { aElem: elem, aRead: 0 }
+  addTy(t)
+}
+
+// The read-only view over the same element (`readonly T[]`). A sibling constructor rather
+// than a flag on `mkArrayTy`, so every existing mint stays a mutable list by construction.
+export function mkArrayViewTy(elem: i32) {
+  const t: Ty = { aElem: elem, aRead: 1 }
   addTy(t)
 }
 
@@ -8640,15 +8651,7 @@ export function primTyOfName(name: string) {
 // is a second answer. A list and not a predicate, because the `did you mean` suggester has to
 // enumerate the names in scope rather than test one; a spelling missing here stops being reserved.
 const builtinTyNames = [
-  "i32",
-  "i64",
-  "f64",
-  "f32",
-  "boolean",
-  "string",
-  "void",
-  "null",
-  "u8",
+  "i32", "i64", "f64", "f32", "boolean", "string", "void", "null", "u8",
 ]
 
 // Read by the merge's type-position rename and by `tErrBuiltinTyDecl`'s two callers.
@@ -8684,6 +8687,42 @@ function methodInValuePosMsg(member: string) {
     "` may only appear in a BOUND — it demands that a call type-checks, which is not something a value carries. For a stored closure write the field form `name: (…) => R`; to constrain a type parameter write `<T: { " +
     member +
     " }>`"
+}
+
+// The one wording for a written negation type, raised by both annotation routes so a rule
+// enforced on one is not one a re-render walks around. A design refusal: a negation says what
+// a value is NOT, naming no rep a storing position can choose. `!is` is unaffected — there the
+// subtraction is from a known union and is never written as a type (D1773).
+function negInAnnotationMsg(spelling: string) {
+  "`" +
+    spelling +
+    "` is a NEGATION, which says what a value is not and so names no rep a value can be stored at. A negation may only appear in a `!is` guard: write the positive type here, and narrow with `if x !is T { … }`"
+}
+
+// An INTERSECTION operand, spelling-tree route: a negation here is subtracted from the
+// operand beside it and the annotation's own type is the positive remainder, which is the one
+// place the ruling keeps a written `!T`. Every other position reaches `tsToTy`'s refusing arm,
+// so `A & (B | !C)` — a negation stored inside a union — is refused like any other.
+function tsIsectOperandTy(kid: i32) {
+  if tsKind[kid] == TS_NEG {
+    const inner = tsToTy(tsKids[tsKidStart[kid]])
+    if inner < 0 { return -1 }
+    return mkNegTy(inner)
+  }
+  tsToTy(kid)
+}
+
+// The name route's twin, for the same reason and with the same scope: only a `!` that IS the
+// whole operand resolves, so a negation nested any deeper reaches the refusal.
+function nameIsectOperandTy(part: string) {
+  if part.length > 0 {
+    if part[0] == '!' {
+      const inner = nameToTy(part.slice(1, part.length))
+      if inner < 0 { return -1 }
+      return mkNegTy(inner)
+    }
+  }
+  nameToTy(part)
 }
 
 function declaredTyOfName(name: string) {
@@ -8850,36 +8889,12 @@ function builtinCtorTyLeafFail(name: string) {
 // suggestion table, not aliases: none of these becomes a type. Matched ASCII
 // case-folded. Positional pair: `tySpellTo[i]` answers `tySpellFrom[i]`.
 const tySpellFrom = [
-  "bool",
-  "boolean",
-  "int",
-  "integer",
-  "int32",
-  "i32_t",
-  "long",
-  "int64",
-  "float",
-  "double",
-  "number",
-  "str",
-  "string",
-  "byte",
+  "bool", "boolean", "int", "integer", "int32", "i32_t", "long", "int64",
+  "float", "double", "number", "str", "string", "byte",
 ]
 const tySpellTo = [
-  "boolean",
-  "boolean",
-  "i32",
-  "i32",
-  "i32",
-  "i32",
-  "i64",
-  "i64",
-  "f64",
-  "f64",
-  "f64",
-  "string",
-  "string",
-  "u8",
+  "boolean", "boolean", "i32", "i32", "i32", "i32", "i64", "i64", "f64", "f64",
+  "f64", "string", "string", "u8",
 ]
 
 // `a` equals `b` with ASCII case folded; `b` is assumed already lower-case, which is
@@ -9029,21 +9044,11 @@ function unknownTyTextIn(name: string, tail: string) {
 // differ from the call written (`charAt` takes an index, `slice` a range) is stored as the
 // whole call shape, never a bare name.
 const strMethodSpellFrom = [
-  "charat",
-  "substring",
-  "substr",
-  "touppercase",
-  "tolowercase",
-  "size",
+  "charat", "substring", "substr", "touppercase", "tolowercase", "size",
   "count",
 ]
 const strMethodSpellTo = [
-  "slice(i, i + 1)",
-  "slice",
-  "slice",
-  "toUpperAscii",
-  "toLowerAscii",
-  "length",
+  "slice(i, i + 1)", "slice", "slice", "toUpperAscii", "toLowerAscii", "length",
   "length",
 ]
 const listMethodSpellFrom = ["append", "add", "size", "count", "contains"]
@@ -9054,25 +9059,11 @@ const mapMethodSpellTo = ["set", "has", "length"]
 // The intrinsic call-able names `checkCallNode` tests for a string/array receiver, in
 // that order — a tie in the edit distance below keeps the earlier (intrinsic) candidate.
 const strMethodNames = [
-  "slice",
-  "indexOf",
-  "includes",
-  "charCodeAt",
-  "cpAt",
-  "cpLen",
-  "isCharBoundary",
-  "bytes",
-  "length",
+  "slice", "indexOf", "includes", "charCodeAt", "cpAt", "cpLen",
+  "isCharBoundary", "bytes", "length",
 ]
 const listMethodNames = [
-  "push",
-  "map",
-  "filter",
-  "pop",
-  "get",
-  "clear",
-  "slice",
-  "length",
+  "push", "map", "filter", "pop", "get", "clear", "slice", "length",
 ]
 
 // Map/set intrinsic names, gated exactly as `checkCallNode`'s own arms gate them: `set`/
@@ -9405,6 +9396,30 @@ function annRegisterVariantMembers(ms: i32[]) {
   0
 }
 
+// The type a `| null` wrapper denotes, or `ty` itself when it is not one; -1 for an absent
+// type or an arena hole. A join carrying `null` interns as `TyNullable` over its non-null
+// members, so a caller asking about those members has to look through the wrapper first.
+function nonNulTyOf(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  const t = T.tys[ty]
+  if t is TyNullable { return nonNulTyOf(t.nInner) }
+  ty
+}
+
+// The INFERRED route's half of the registration above: a mixed union the program only ever
+// JOINS is minted in `uVariants` by the emitter and spelled in no annotation, so its struct
+// members reached the arena rung as plain structs while the name ladder read them as arms
+// (D1746). Arity-aware, as the declaration route is: a one-member union is its member.
+function inferRegisterVariantMembers(ty: i32) {
+  const u = nonNulTyOf(ty)
+  if u < 0 { return 0 }
+  const t = T.tys[u]
+  if t is TyUnion {
+    if t.uMembers.length >= 2 { annRegisterVariantMembers(t.uMembers) }
+  }
+  0
+}
+
 // The annotation routes' member dedup, and the one place that records what a dropped
 // duplicate collapsed with: `type A = {v: i32}` and `type B = {v: i32}` mint distinct arena
 // nodes that `sameVariantTy` calls one variant, so `A | B` keeps one member but both names
@@ -9548,18 +9563,19 @@ function tsToTyReal(ix: i32) {
     let acc = -1
     let ii = 0
     while ii < cnt {
-      const operand = tsToTy(tsKids[start + ii])
+      const operand = tsIsectOperandTy(tsKids[start + ii])
       if operand < 0 { return -1 }
       if ii == 0 { acc = operand } else { acc = intersectTy(acc, operand) }
       ii = ii + 1
     }
     return acc
   }
-  // A prefix negation `!A`: "anything but A".
+  // A prefix negation `!A` written in an annotation — refused at both routes, since a rule
+  // enforced on one is one a re-render can walk around. `TyErr`, not -1: the diagnosis
+  // already stands and -1 would make the caller append a misleading `unknown type`.
   if k == TS_NEG {
-    const negd = tsToTy(tsKids[start])
-    if negd < 0 { return -1 }
-    return mkNegTy(negd)
+    tErr(negInAnnotationMsg("!" + tsToName(tsKids[start])), annotDiagAt)
+    return TY_ERR
   }
   // A parenthesized group `(A)`: strip the parens and re-enter, so a comma group
   // `(A, B)` re-enters on `"A,B"`, matches no arm, and resolves to -1 — a group is a
@@ -9607,15 +9623,20 @@ function tsToTyReal(ix: i32) {
   // would leak the empty-`[]` element hole as the type of every `xs[i]` read, and a member
   // access on that hole indexes the arena at -1 — a checker crash (`type-alias-nested.vl`).
   if k == TS_ARR {
+    // A `readonly` marker on this suffix mints the view over the same element — the tree
+    // route's twin of `nameToTyReal`'s marker arm.
+    const ro = tsText[ix] == "readonly"
     // `u8[]` — the one position `u8` is legal in. Matched on the element spelling rather
     // than by resolving it, since `u8` deliberately never resolves as a leaf (`TY_U8`) —
     // this keeps the storage type out of every value position with no context flag threaded through.
     const aeKid = tsKids[start]
     if tsKind[aeKid] == TS_NAME && tsText[aeKid] == "u8" {
+      if ro { return mkArrayViewTy(TY_U8) }
       return mkArrayTy(TY_U8)
     }
     const aeTy = tsToTy(aeKid)
     if aeTy < 0 { return -1 }
+    if ro { return mkArrayViewTy(aeTy) }
     return mkArrayTy(aeTy)
   }
   // A map `{[K]: V}` — the key is a bare identifier token, not a parsed type, so it rides
@@ -9704,7 +9725,7 @@ function nameToTyReal(name: string) {
     let acc = -1
     let ii = 0
     while ii < iparts.length {
-      const operand = nameToTy(iparts[ii])
+      const operand = nameIsectOperandTy(iparts[ii])
       if operand < 0 { return -1 }
       if ii == 0 { acc = operand } else { acc = intersectTy(acc, operand) }
       ii = ii + 1
@@ -9712,12 +9733,11 @@ function nameToTyReal(name: string) {
     return acc
   }
   if name.length > 0 {
-    // A prefix negation `!A`: "anything but A" — almost always consumed by the `&`
-    // fold, where `A & !B` subtracts B's variants from A.
+    // A prefix negation `!A` written in an annotation — the name route's half of the
+    // refusal the spelling tree raises, so both reach one wording.
     if name[0] == '!' {
-      const negd = nameToTy(name.slice(1, name.length))
-      if negd < 0 { return -1 }
-      return mkNegTy(negd)
+      tErr(negInAnnotationMsg(name), annotDiagAt)
+      return TY_ERR
     }
     // A parenthesized group `(A | B)`: peel only when `tyname.parenEnclosesWhole` says the
     // leading `(` closes at the final character — not `emit_base.tyGroupWrapsWhole`, which
@@ -9758,6 +9778,16 @@ function nameToTyReal(name: string) {
   if name == "u8" { return storageTyLeafFail() }
   const pv = primTyOfName(name)
   if pv >= 0 { return pv }
+  // `readonly T[]` — the view's marker prefixes the whole list spelling, so it is stripped
+  // here and the list under it resolves through the array arm below. A marker over anything
+  // but a list resolves to nothing: there is no read-only view of a scalar or a map.
+  if nameIsReadOnlyList(name) {
+    const listIx = nameToTy(roListInnerName(name))
+    if listIx < 0 { return -1 }
+    const lt = T.tys[listIx]
+    if lt is TyArray { return mkArrayViewTy(lt.aElem) }
+    return -1
+  }
   // An array type `T[]`: the parser appends a literal `[]` per array suffix to the type
   // name (`i32[]`, `Tok[]`, `i32[][]`). Strip one suffix and wrap the element.
   const nlen = name.length
@@ -10042,6 +10072,7 @@ function tyToStrGo(ix: i32, nominal: boolean) {
       // A list render is one atom in every form — a wide element is parenthesized so its
       // `|`s stop being top-level. Set explicitly, since the element render left its own width behind.
       tyStrAtoms = 1
+      if t.aRead == 1 { return "readonly " + arrElemRender(el, t.aElem, elw) }
       return arrElemRender(el, t.aElem, elw)
     }
     TyMap => {
@@ -10258,7 +10289,12 @@ function tyEqGo(a: i32, b: i32) {
       return false
     }
     TyArray => {
-      if tb is TyArray { return tyEq(ta.aElem, tb.aElem) }
+      if tb is TyArray {
+        // A view and its list render differently and accept different operations, so they
+        // are not the same type — `readonly Shape[]` never keys a `Shape[]` registry row.
+        if ta.aRead != tb.aRead { return false }
+        return tyEq(ta.aElem, tb.aElem)
+      }
       return false
     }
     TyMap => {
@@ -12066,11 +12102,6 @@ function singleAliasMemberTyIx(ti: i32, name: string) {
       // normalizes into the niche. Same defect as the union case: the alias's union row
       // would claim the slot while the read lowers the niche. Ungated in the inner, unlike the array and union arms.
       if nulAliasMemberFaithful(m0) { return m0 }
-      // A NEGATION member (`type N = !string`): a checker-only refinement with no rep of its
-      // own, so the alias denotes it transparently and the value keeps the rep its own type
-      // gives it. Without the arm the alias minted a one-variant union row and the cell became
-      // the box while the initializer stayed a bare scalar — invalid wasm (D1773).
-      if mt is TyNeg { return m0 }
     }
   }
   aliasMemberNotTransparent()
@@ -13296,6 +13327,12 @@ function canonEmitNameTs(name: string, ctx: i32, root: i32) {
     // claims every name that has one, bar a top-level function type), so it is one atom.
     canonAtoms = 1
     return name
+  }
+  // The read-only view's marker leaves the vocabulary here: a view and its list are one
+  // rep, so the emitter spells only the list and every rep-keyed table holds one row for
+  // the pair. The checker raises every refusal the marker buys before this runs.
+  if nameIsReadOnlyList(name) {
+    return canonEmitNameAt(roListInnerName(name), ctx)
   }
   // A trailing `[]`: canon the element (no top-level `|`/`&` here, so the suffix binds the
   // whole core); a union element keeps its grouping parens. Not for a top-level function
@@ -14941,6 +14978,37 @@ function cwParamNameAt(callFnIx: i32, argIx: i32): string {
   cwParamNameOfDecl(cwCalleeDeclOf(callFnIx), argIx)
 }
 
+// The type-annotation node of the parameter at position `argIx` of `FuncDecl` `dIx`, or -1
+// past the list, at an un-annotated parameter, or where the callee cannot be placed.
+function cwParamAnnOfDecl(dIx: i32, argIx: i32): i32 {
+  if dIx < 0 || dIx >= P.nodes.length { return -1 }
+  const d = P.nodes[dIx]
+  if d is FuncDecl {
+    if argIx < d.fnParams.length {
+      const p = P.nodes[d.fnParams[argIx]]
+      if p is Param { return p.parType }
+    }
+  }
+  -1
+}
+
+// Does the callee EXPRESSION `callFnIx` declare position `argIx` as a read-only view?
+function cwParamIsView(callFnIx: i32, argIx: i32): boolean {
+  cwAnnIsView(cwParamAnnOfDecl(cwCalleeDeclOf(callFnIx), argIx))
+}
+
+// Is the annotation at `annIx` a read-only list view? Read off the ARENA type the checker
+// recorded, not off the name: `canonEmitTypeNames` rewrites a view's name into the list the
+// emitter spells, and this closure is asked on both sides of that rewrite.
+function cwAnnIsView(annIx: i32): boolean {
+  if annIx < 0 { return false }
+  const ty = nodeTyIxOf(annIx)
+  if ty < 0 || ty >= T.tys.length { return false }
+  const t = T.tys[ty]
+  if t is TyArray { return t.aRead == 1 }
+  false
+}
+
 // The `FuncDecl` node of the top-level function `fnName`, or `CW_FR_UNKNOWN`. A parameter
 // declares into the frame its own function opens, so this is the frame the argument edge
 // binds the parameter in.
@@ -15761,6 +15829,12 @@ function cwGrowCall(
       }
       if cwIsEscapedHandle(n.callArgs[k], fowners, fownerFrs, flds) {
         carries = true
+      }
+      if carries {
+        // A parameter declared `readonly T[]` ends the walk instead of extending it: the
+        // checker refuses every write through a view and refuses a view where a mutable
+        // list is wanted, so no write can reach the value past this edge. D1686.
+        if cwParamIsView(n.callFn, k) { carries = false }
       }
       if carries {
         const pn = cwParamNameAt(n.callFn, k)
@@ -16899,6 +16973,11 @@ function assignableGo(src: i32, dst: i32) {
     }
     TyArray => {
       if d is TyArray {
+        // A view never satisfies a mutable list. The view exists to forbid the writes the
+        // list spelling licenses, so admitting it here would launder every one of them.
+        if sTail.aRead == 1 {
+          if d.aRead == 0 { return false }
+        }
         // An empty `[]` (element `-1`) is assignable to any array; otherwise the
         // element types must be assignable.
         return assignable(sTail.aElem, d.aElem)
@@ -17197,6 +17276,55 @@ function noteArrayDemand(name: string) {
   }
   holeArrayDemand.push(name)
   0
+}
+
+// A WRITE demand rides the same column under a key no hole name can spell, and it carries
+// the owning function: a declared type parameter's hole is named `T`, so three functions
+// each declaring `<T>` would share one row and a name-only key would fire on all three.
+// The owner is `curFnEscName` where the body records it and the callee at the pin.
+function holeWriteKey(fnName: string, tvName: string): string {
+  "!w!" + fnName + "!" + tvName
+}
+
+// The body wrote THROUGH this hole (`xs.push(v)`, `xs[0] = v`), not merely indexed it. A
+// read-only list view is refused at such a pin and accepted at every other.
+function noteArrayWriteDemand(tvName: string) {
+  noteArrayDemand(holeWriteKey(curFnEscName, tvName))
+}
+
+function holeIsArrayWriteDemanded(fnName: string, tvName: string) {
+  holeIsArrayDemanded(holeWriteKey(fnName, tvName))
+}
+
+// The pin's own refusal: an un-annotated type parameter whose body writes the list cannot
+// bind a view, and nothing downstream would say so — the body checked its write against a
+// synthesized mutable list, never against this argument.
+function holeArgViewErr(argN: i32, at: i32, ix: i32) {
+  tErr(
+    "argument " +
+      i32ToStr(argN) +
+      ": the body writes this list, and " +
+      tyToStrUser(at) +
+      " is a read-only view — pass the mutable list, or spell the parameter " +
+      "`readonly T[]` so the body may only read it",
+    ix,
+  )
+  0
+}
+
+// The declared name a callee EXPRESSION spells, or "" for a call through a value. The
+// owner half of a write demand's key at the pin; "" matches nothing a body filed.
+function calleeIdentName(cfn: Node): string {
+  if cfn is Ident { return cfn.identName }
+  ""
+}
+
+// Is `tyIx` a read-only list view? The one shape a write demand refuses.
+function tyIsListView(tyIx: i32): boolean {
+  if tyIx < 0 || tyIx >= T.tys.length { return false }
+  const t = T.tys[tyIx]
+  if t is TyArray { return t.aRead == 1 }
+  false
 }
 
 // The array builtin methods that constrain an un-annotated-param hole receiver to an array
@@ -17871,7 +17999,48 @@ function memberFloorErr(objTy: i32, prop: string, ix: i32) {
   if msg == "" {
     return tErr("member access '." + prop + "' on " + tyToStr(objTy), ix)
   }
-  tErr(msg, ix)
+  tErr(msg + unkeyedSubscriptNote(ix), ix)
+}
+
+// Why an `is` test the author already wrote did not narrow this read: its receiver is an
+// index whose subscript keys no place. A narrowing key is a SPELLING, so only a literal names
+// one cell — telling the author to narrow with `is` when they did is D1730's message half.
+// A `?.` receiver is out of scope: the suffix names a subscript, and `x?.r` has none to name.
+function unkeyedSubscriptNote(ix: i32) {
+  if ix < 0 || ix >= P.nodes.length { return "" }
+  const m = P.nodes[ix]
+  if m is Member { return unkeyedSubscriptNoteAt(peelParenIx(m.memObj)) }
+  ""
+}
+
+// The receiver half: the sentence when `recvIx` is an index whose subscript is a NAME, which
+// `subscriptKeyTextOf` declines and so keys no place. "" for a literal subscript, which keys
+// one and narrows, and for every receiver that is not an index.
+function unkeyedSubscriptNoteAt(recvIx: i32) {
+  if recvIx < 0 || recvIx >= P.nodes.length { return "" }
+  const r = P.nodes[recvIx]
+  if r is Index {
+    if subscriptKeyTextOf(r.idxIndex) != "" { return "" }
+    const sub = P.nodes[peelParenIx(r.idxIndex)]
+    if sub is Ident {
+      return " — the `is` test was accepted; what it could not narrow is the READ, because `" +
+        sub.identName +
+        "` is not a literal subscript and so names no one cell. Bind the element first: `const v = …[" +
+        sub.identName +
+        "]`, then test and read `v`"
+    }
+  }
+  ""
+}
+
+// The paren peel this file's place readers make by recursion, as an index: `placeKeyOf` and
+// `subscriptKeyTextOf` both recurse on `Paren`, and the note has to look at the same node
+// they keyed on.
+function peelParenIx(ix: i32): i32 {
+  if ix < 0 || ix >= P.nodes.length { return ix }
+  const n = P.nodes[ix]
+  if n is Paren { return peelParenIx(n.parInner) }
+  ix
 }
 
 // The exact line to paste, appended below when there is exactly ONE candidate module —
@@ -21189,6 +21358,9 @@ function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
         if holeIsArrayDemanded(pHole.tvName) {
           if tyRefusesArrayDemand(at) { holeArgArrayErr(i + 1, at, args[i]) }
         }
+        if holeIsArrayWriteDemanded(name, pHole.tvName) {
+          if tyIsListView(at) { holeArgViewErr(i + 1, at, args[i]) }
+        }
         // The `as` cast the body parked on this hole, re-asked under the argument. D1342.
         holeCastPinCheck(pHole.tvName, at, declParamNameAt(uDecl, i))
       }
@@ -21518,6 +21690,35 @@ function numIntrCallTy(name: string, n: Call, ix: i32) {
   width
 }
 
+// The list methods that change the list's own shape, and so the ones a `readonly T[]` view
+// refuses. Deliberately not `cwMutatesList`'s set, which also names the map/set spellings
+// (`set`/`add`/`delete`) a list receiver never reaches.
+function listMethodMutates(p: string): boolean {
+  if p == "push" { return true }
+  if p == "pop" { return true }
+  p == "clear"
+}
+
+// The result of a list method that BUILDS a new list from the receiver (`.filter`,
+// `.slice`): a view receiver hands back a MUTABLE list, since the result is a fresh value
+// nobody else holds. A mutable receiver keeps its own arena index, so nothing is reminted.
+function listBuiltResultTy(recvTy: i32, elem: i32, ro: i32): i32 {
+  if ro == 1 { return mkArrayTy(elem) }
+  recvTy
+}
+
+// The one sentence every write refused through a view carries: which write, the view it
+// went through, and the spelling that would allow it.
+function roWriteMsg(what: string, recvTy: i32): string {
+  what +
+    " writes the list, and " +
+    tyToStrUser(recvTy) +
+    " is a read-only view — it may be read and its elements' own fields written, never " +
+    "the list itself. Declare the handle " +
+    tyToStrUser(mkArrayTy(tyArrayElemIx(recvTy))) +
+    " if it must be written through."
+}
+
 // Method call on a member callee (`xs.push(e)`, `m.get(k)`, `s.slice(a)`): types the
 // builtin receiver kinds directly, never as a struct field read. Returns the call type,
 // or `-1` when no builtin arm claims it and the caller falls through to the field/UFCS
@@ -21535,6 +21736,10 @@ function checkMemberCallNode(n: Call, ix: i32, cfn: Member): i32 {
   if rt is TyVar {
     if holeArrMethod(cfn.memProp) {
       noteArrayDemand(rt.tvName)
+      // The synthesized receiver below is a MUTABLE list, and nothing re-checks the
+      // argument against it — so a write through the hole is filed here, and the pin
+      // refuses a view for it.
+      if listMethodMutates(cfn.memProp) { noteArrayWriteDemand(rt.tvName) }
       const elemHole = mkDerivedHole(HD_ELEM, "", -1, -1, recvTy)
       recvTy = mkArrayTy(elemHole)
     } else if holeMapMethod(cfn.memProp) {
@@ -21547,6 +21752,15 @@ function checkMemberCallNode(n: Call, ix: i32, cfn: Member): i32 {
   }
   rt = T.tys[recvTy]
   if rt is TyArray {
+    // The view's whole contract: a `readonly T[]` receiver refuses every method that
+    // changes the list's own shape. An element's fields are untouched by it — the marker
+    // is on the list, not on what the list holds. Reported and then fallen through, so the
+    // call still types as its own method and no cascade follows the one real diagnostic.
+    if rt.aRead == 1 {
+      if listMethodMutates(cfn.memProp) {
+        tErr(roWriteMsg("`." + cfn.memProp + "()`", recvTy), ix)
+      }
+    }
     const margs = n.callArgs
     if cfn.memProp == "push" {
       if margs.length != 1 {
@@ -21626,7 +21840,7 @@ function checkMemberCallNode(n: Call, ix: i32, cfn: Member): i32 {
               ix,
             )
           }
-          return recvTy
+          return listBuiltResultTy(recvTy, rt.aElem, rt.aRead)
         }
         return mkArrayTy(cb.fnRet)
       }
@@ -21678,7 +21892,7 @@ function checkMemberCallNode(n: Call, ix: i32, cfn: Member): i32 {
           si = si + 1
         }
       }
-      return recvTy
+      return listBuiltResultTy(recvTy, rt.aElem, rt.aRead)
     }
     // UFCS `self`-method on an array receiver (`parts.join(sep)`): an array
     // carries no user FIELD, so a matching free `self`-function resolves
@@ -22392,6 +22606,9 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
       // indexed, so reject it here (`head(5)`) instead of deferring to an emit failure.
       if holeIsArrayDemanded(pHole.tvName) {
         if tyRefusesArrayDemand(at) { holeArgArrayErr(i + 1, at, args[i]) }
+      }
+      if holeIsArrayWriteDemanded(calleeIdentName(cfn), pHole.tvName) {
+        if tyIsListView(at) { holeArgViewErr(i + 1, at, args[i]) }
       }
       // The `as` cast the body parked on this hole, re-asked under the argument. D1342.
       holeCastPinCheck(pHole.tvName, at, declParamNameAt(dParams, i))
@@ -31045,11 +31262,18 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
       // is the same arm the concrete receiver takes, not a second copy of it.
       const arrH0 = T.tys[arrTy0]
       if arrH0 is TyVar {
+        // An index WRITE through a hole, filed like `xs.push(v)`: the read that typed the
+        // receiver noted only that the body indexes it, which a view satisfies.
+        noteArrayWriteDemand(arrH0.tvName)
         const hmw = holeMapOf(arrH0.tvName)
         if hmw >= 0 { arrTy0 = hmw }
       }
       const arrT0 = T.tys[arrTy0]
       if arrT0 is TyArray {
+        // An index write is a write to the list's own shape, so a view refuses it. Ahead of
+        // the element pin below, which would otherwise infer a hole from a store that never
+        // happens; reported and fallen through, so no cascade follows the one diagnostic.
+        if arrT0.aRead == 1 { tErr(roWriteMsg("index assignment", arrTy0), ix) }
         if arrT0.aElem < 0 {
           arrT0.aElem = rt
           tyMutEpoch = tyMutEpoch + 1 // index-write pinned the element in place
@@ -31654,7 +31878,9 @@ function checkLetDeclNode(n: LetDecl, ix: i32) {
         inferLetTy.push(lvn)
       } else if tyIsMixedUnion(bound) {
         // A MIXED union renders "" above — a struct member is not a value ATOM — and still reps
-        // as the box, so its row is minted from the arena type instead of from a name.
+        // as the box, so its row is minted from the arena type instead of from a name. Its
+        // struct members register as ARMS here, the one place the join is named (D1746).
+        inferRegisterVariantMembers(bound)
         inferLetIx.push(ix)
         inferLetTy.push("")
       } else if isNulStringTy(bound) {
