@@ -49,6 +49,7 @@
 //     track).
 
 import type { ModuleReader } from "../../compiler/coreTypes.ts";
+import { isStdKey as isStdKeyDefault } from "./editorText.ts";
 import type { WasmChecker } from "./wasmChecker.ts";
 import {
   type LspRange,
@@ -278,7 +279,7 @@ export const planRenameAt = async (
   checker: WasmChecker,
   line: number,
   character: number,
-  isStdKey: (key: string) => boolean = (k) => k.startsWith("std:"),
+  isStdKey: (key: string) => boolean = isStdKeyDefault,
 ): Promise<RenamePlan | undefined> => {
   const at = wordRangeAt(source, line, character);
   if (at === undefined) return undefined;

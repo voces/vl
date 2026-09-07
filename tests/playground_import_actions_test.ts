@@ -17,8 +17,7 @@
 
 import { codeActions, completion, diagnostics, initLsp, organizeImports } from "../playground/src/lspAdapter.ts";
 import { createWasmChecker, type Exports } from "../lsp/src/wasmChecker.ts";
-import type { ModuleReader } from "../compiler/coreTypes.ts";
-import { STD_SOURCES } from "../std/embedded.ts";
+import { wrapStdReader } from "../lsp/src/editorText.ts";
 
 const SEED = new URL("../build/vl-compiler.wasm", import.meta.url).pathname;
 const seedExists = (() => {
@@ -35,15 +34,12 @@ const module = seedExists
   ? new WebAssembly.Module(Deno.readFileSync(SEED) as BufferSource)
   : undefined;
 
-// A `std:` key resolves from the embedded map, everything else passes through —
-// the browser's own reader wrapper (`wasmCheckerBrowser.ts`).
-const wrapReader = (read: ModuleReader): ModuleReader => (key) =>
-  key.startsWith("std:") ? STD_SOURCES[key] : read(key);
-
 const init = (): void => {
   if (!module) throw new Error(`no seed at ${SEED}`);
   const instance = new WebAssembly.Instance(module, {});
-  initLsp(createWasmChecker(() => instance.exports as unknown as Exports, wrapReader));
+  // `wrapStdReader` is the browser's own reader wrapper — a `std:` key resolves
+  // from the embedded map — so a UFCS import fix's `import "std:test"` resolves.
+  initLsp(createWasmChecker(() => instance.exports as unknown as Exports, wrapStdReader));
 };
 
 const assert = (cond: boolean, msg: string): void => {

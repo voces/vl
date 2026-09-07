@@ -9,6 +9,17 @@ import { STD_SOURCES } from "../../std/embedded.ts";
 import type { StdExportCandidate } from "./typeFeatures.ts";
 import type { WasmChecker } from "./wasmChecker.ts";
 
+// Whether `key` names a std module (the `std:` URI scheme). One author for the
+// rule the module graph, rename, the import-edit helpers and both hosts' readers
+// all ask — so a change to the scheme is a single edit, not nine.
+export const isStdKey = (key: string): boolean => key.startsWith("std:");
+
+// Wrap a module reader so a `std:` key resolves from the embedded map and every
+// other key passes through — the no-filesystem path the browser playground and
+// its tests use (`withStd` with no workspace `std/`).
+export const wrapStdReader = (read: ModuleReader): ModuleReader => (key) =>
+  isStdKey(key) ? STD_SOURCES[key] : read(key);
+
 // The identifier `[A-Za-z_][A-Za-z0-9_]*` immediately to the LEFT of `character`
 // on `line`, or null — the `<name>.` member-completion receiver. A numeric run is
 // rejected (an identifier cannot start with a digit).
