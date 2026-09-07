@@ -240,7 +240,7 @@ Recommendation in one screen:
    for the `T | null` form, not the trapping one. §VL.4–6.) The trap is already a
    bare `array.get`, so the *safe default is the fast default*; **bounds-narrowing**
    (§VL.6) is now only an optimization that elides the redundant bounds check inside
-   `for i in 0 to a.length` or after `if i < a.length`. Combined with the
+   `for i in 0 to a.length - 1` or after `if i < a.length`. Combined with the
    native-indexing flag *and* **backing-pointer hoisting** (§VL.6: load `backing`
    once per loop, not per access), an in-loop `l[i]` lowers to a bare `array.get` of
    `T`, codegen identical to a raw array, while `List` stays a `.vl` std type
@@ -421,7 +421,7 @@ makes Rust `Vec` / C++ `std::vector` indexing reach native speed (it hoists the
 data pointer). **Catch for VL:** binaryen's LICM over a GC `struct.get` across a
 loop is *not* guaranteed — it would have to prove nothing in the loop writes
 `backing` (no `push`/grow/reassign) — so VL likely needs to **explicitly hoist**
-the backing load for the canonical `for i in 0 to list.length { list[i] }` pattern
+the backing load for the canonical `for i in 0 to list.length - 1 { list[i] }` pattern
 rather than relying on binaryen to do it. With the hoist (the **backing-pointer
 hoisting** enabler, §VL.6), plus the **native-indexing flag** (§VL.6) +
 bounds-narrowing, the access folds back to a bare `array.get`; **without the hoist
@@ -707,7 +707,7 @@ is no fixed-array literal to fight.
   has to do this explicitly**: binaryen's LICM over a GC `struct.get` across a loop
   is *not* guaranteed (it must prove no `push`/grow/reassign in the loop touches
   `backing`), so VL should hoist the backing load for the canonical
-  `for i in 0 to list.length { list[i] }` pattern rather than rely on binaryen.
+  `for i in 0 to list.length - 1 { list[i] }` pattern rather than rely on binaryen.
   Without the hoist, bounds-narrowing + the native flag still leave the per-access
   `struct.get`; with all three, the list loop is the raw-array loop.
 
@@ -716,9 +716,14 @@ is no fixed-array literal to fight.
   there is no `T | null` to handle, no per-access null-unwrap, no tagged
   `i32 | null` for scalars. What remains is the **bounds check that precedes the
   trap**. Bounds-narrowing elides *that*: when the compiler can prove the index is
-  in range — inside `for i in 0 to a.length`, in the then-branch of
+  in range — inside `for i in 0 to a.length - 1`, in the then-branch of
   `if i < a.length`, or after an explicit guard — it drops the compare-and-trap,
-  leaving the bare `array.get`. This reuses the same narrowing engine that refines
+  leaving the bare `array.get`. Because `to` is **inclusive** (`for i in 0 to 4`
+  runs five times, `docs/guide/soundness.md`), the provably-in-range loop form is
+  `for i in 0 to a.length - 1`, *not* `for i in 0 to a.length` — the latter's final
+  iteration binds `i = a.length`, which is out of range and traps, so a
+  bounds-narrowing pass must key on `i < a.length` / `to a.length - 1`, never on
+  `to a.length`. This reuses the same narrowing engine that refines
   nullness and union members (A5, `docs/guide/narrowing.md`), pointed at the
   index/length relation. The crucial difference from the result-by-default world:
   **a missed narrowing now costs only a redundant compare-and-trap, not a

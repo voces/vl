@@ -91,6 +91,13 @@ print(3.0 as? i32)                 // 3
 print(5000000000 as? i32)          // null — out of i32's range
 ```
 
+A **fraction fails the same way an out-of-range value does** — a float-to-integer cast
+never rounds, so it needs an *exact* integer value. `2.5 as! i32` traps
+(`as! i32 at <line>:<col>: not exact`) and `2.5 as? i32` is `null`, while `2.0 as! i32` is
+`2` because 2.0 already **is** an integer. To convert a float you mean to truncate, make it
+integral first — the idiom is `trunc(x) as! i32` (`trunc(2.5) as! i32` is `2`); `floor` and
+`ceil` round the other ways.
+
 `x as u8` is the same narrowing with **0..255** as its domain, and the value it produces is
 an ordinary `i32` inside that range — `u8` names a byte-sized range, not a value type (there
 is no `u8` local, parameter, return or field). Every numeric source can fail it, `i32`
