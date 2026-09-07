@@ -21254,6 +21254,62 @@ function ufcsMissSpecsAt(memIx: i32) {
   ""
 }
 
+// A type parameter the callee's declared RETURN names and none of its PARAMETER annotations
+// does: no argument can bind it and VL has no explicit type-argument spelling, so the call
+// has nothing to infer it from. Asked of the written SPELLING, like the hoist's own
+// type-parameter test — a phantom `Bare<A>` parameter binds `A` that its arena row drops.
+function checkRetTyParamBound(declIx: i32, who: string, ix: i32) {
+  if inferQuiet { return 0 }
+  if declIx < 0 { return 0 }
+  const dn = P.nodes[declIx]
+  if dn is FuncDecl {
+    if dn.fnTyParams.length == 0 { return 0 }
+    if dn.fnRet < 0 { return 0 }
+    const rTs = annTsOf(dn.fnRet)
+    if rTs < 0 { return 0 }
+    let k = 0
+    while k < dn.fnTyParams.length {
+      const one: string[] = [dn.fnTyParams[k]]
+      if tsMentionsAnyName(rTs, one) {
+        if !anyParamMentionsTyParam(dn.fnParams, one) {
+          let w = "the callee"
+          if who != "" { w = "`" + who + "`" }
+          tErr(
+            "cannot infer type parameter `" +
+              dn.fnTyParams[k] +
+              "`: " +
+              w +
+              "'s return type names it and no parameter does, so a call has nothing to bind it from — give `" +
+              dn.fnTyParams[k] +
+              "` a parameter position, or make the return type concrete",
+            ix,
+          )
+          return 0
+        }
+      }
+      k = k + 1
+    }
+  }
+  0
+}
+
+// Does any parameter's written annotation mention one of `names`? An un-annotated parameter
+// mentions nothing, which is the right answer: its type is a hole the call site pins, and a
+// hole never carries the declared name a return annotation would substitute through.
+function anyParamMentionsTyParam(params: i32[], names: string[]): boolean {
+  let i = 0
+  while i < params.length {
+    const p = P.nodes[params[i]]
+    if p is Param {
+      if p.parType >= 0 {
+        if tsMentionsAnyName(annTsOf(p.parType), names) { return true }
+      }
+    }
+    i = i + 1
+  }
+  false
+}
+
 function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
   // Maps the callee's plain source name to its merge-mangled function, after field precedence
   // has already been checked — resolved at this call's own site (D1120), since two merged
@@ -21372,6 +21428,9 @@ function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
       }
       i = i + 1
     }
+    // The uninferable-return gate reads the declaration, so `xs.f()` and `f(xs)` answer alike;
+    // the receiver is `self`, a parameter like any other for the purpose of binding.
+    checkRetTyParamBound(fnDeclIx[name] ?? CSTR_NODECL, plainName, ix)
     // The UFCS half of the deferred-constraint re-validation, which lived in the direct-call
     // path alone: `xs.indexOf(nd)` and `indexOf(xs, nd)` are the same call and must answer the
     // same way, so the UFCS spelling needs its own re-validation of the callee's recorded
@@ -22627,6 +22686,13 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
       argMismatchErr(i + 1, expected, at, args[i])
     }
     i = i + 1
+  }
+  // After the arguments, so a mismatched argument gets the more specific diagnostic first;
+  // the answer itself is the callee's declaration, not this site's bindings.
+  if cfn is Ident {
+    let rtpDecl = fnDeclIx[cfn.identName] ?? CSTR_NODECL
+    if rtpDecl == CSTR_NODECL { rtpDecl = lookupFnAliasNode(cfn.identName) }
+    checkRetTyParamBound(rtpDecl, cfn.identName, ix)
   }
   // Substitutes the binding into a generic return type — deep, so a structural return
   // (`{first: B, second: A}`, a generic alias body, a function-typed field) concretizes
