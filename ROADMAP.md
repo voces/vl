@@ -1555,16 +1555,24 @@ in-language GC knobs.
      5. ⬜ **The return-kind family** — `retResultVKind` + the fourteen `fnRet*Sid` readers;
         `fRetKind` becomes a projection rather than a parallel column. `fnRetF32ArraySid` and
         `fnRetAnnF32ArraySid` still read the flat `fnIndexOfSid` and move first.
-     6. 🟡 **The valtype and field-code ladders.** The FIELD-CODE half is DONE:
+     6. ✅ **The valtype and field-code ladders.** The FIELD-CODE half is DONE:
         `fieldCodeOfTy`'s fourteen constants are one `fieldCodeOfVKind` table, its arms are
         DOMAIN gates and its `-2` decline is unchanged — 0 CONTRADICT over 58,428 queries,
         byte-identical in 3,165 + 7,589. **The domain-WIDENING variant was refused at a price
         of 8 `tests/cases` modules `rc=0 → rc=1`**, six of them nullable fields and four
         literal-union ones, which is the campaign's second half of the conversion bar: a
         ladder's decline is an ANSWER, routed to a producer that knows more, so a domain is
-        neither removed nor widened. Remaining: the VALTYPE half — `fbValtype` (31 arms),
-        `fbValtypeNullable`, `fbRefNullForKind`, `fbHeapIdxForKind` — now the only rep
-        numbering scheme with no single translation table.
+        neither removed nor widened. The VALTYPE half is DONE too, and it
+        corrected this list: `fbValtype` and `fbValtypeNullable` were already `_`-less `match`
+        tables, `fbHeapIdxForKind` does not exist, and the family is a QUARTET —
+        `fbRefNullOfKind` is the fourth, which the code's own "trio" comment miscounted. The
+        one member not gated by the language, `fbRefNullForKind`, is now a `_`-less `match`
+        with the five scalars named and a dead second `variant` arm removed: byte-identical in
+        3,165 + 7,589, seed −113 bytes, `kind-ladder-incomplete` down one. **Folding the four
+        writers' identical bounds guard into one predicate was refused by three ratchets** —
+        `sentinel-index-unguarded` 0 → 21, because that lint's contract is within one function
+        and the guard is the evidence it needs at each read. The campaign's bar in a third
+        form: do not move a guard out of the reach of the checker that verifies it.
      7. ⬜ **The slot layer, last** — `structIndexOfExpr`, `rlSlot*`, `mvSlot*`,
         `exprVariantIndex`. `rdSlot` is nominal where the rest of the descriptor is
         structural, and nothing earlier depends on it.
