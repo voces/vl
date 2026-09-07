@@ -32,6 +32,7 @@
 
 import type { ModuleReader } from "../../compiler/coreTypes.ts";
 import { STD_SOURCES } from "../../std/embedded.ts";
+import { isStdKey } from "./editorText.ts";
 import type { VLDiagnostic, VLRange } from "../../compiler/diagnostics.ts";
 import type { WasmChecker, WasmModuleSurface } from "./wasmChecker.ts";
 
@@ -96,7 +97,7 @@ export const withStd = (
   getStdDir?: () => string | undefined,
 ): ModuleReader =>
 async (key: string): Promise<string | undefined> => {
-  if (!key.startsWith("std:")) return read(key);
+  if (!isStdKey(key)) return read(key);
   const name = key.slice("std:".length);
   const stdDir = getStdDir?.();
   if (stdDir !== undefined) {
@@ -144,7 +145,7 @@ export const crossFileUriOf = (
   getStdDir?: () => string | undefined,
   exists: (path: string) => boolean = defaultExists,
 ): string => {
-  if (!key.startsWith("std:")) return pathToUri(key);
+  if (!isStdKey(key)) return pathToUri(key);
   const stdDir = getStdDir?.();
   if (stdDir !== undefined) {
     const workspacePath = `${stdDir}/${key.slice("std:".length)}.vl`;

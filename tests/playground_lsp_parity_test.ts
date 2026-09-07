@@ -435,6 +435,10 @@ type SubGap = {
   why: string;
 };
 
+// EMPTY IS CORRECT — the three that stood were composed and promoted to
+// `subBehaviours` (ROADMAP row 32). Add a row here when a REGISTERED provider's
+// adapter composes only PART of what its `server.ts` handler does: it reds until
+// the row is promoted, which is how the three that were here got caught.
 const SUB_GAPS: SubGap[] = [];
 
 Deno.test("every sub-behaviour gap names a live LSP helper", () => {

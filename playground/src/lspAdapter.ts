@@ -47,8 +47,12 @@ import {
   typeLabelDetail,
   ufcsCompletions,
 } from "../../lsp/src/typeFeatures.ts";
-import { STD_SOURCES } from "../../std/embedded.ts";
-import { removeCharAt, wordEndingBefore } from "../../lsp/src/editorText.ts";
+import {
+  removeCharAt,
+  type StdSurfaceCache,
+  stdExportSurfaces,
+  wordEndingBefore,
+} from "../../lsp/src/editorText.ts";
 import {
   foldingRanges as computeFoldingRanges,
   type VlFoldingRange,
@@ -124,8 +128,30 @@ export const diagnostics = async (
 ): Promise<VLDiagnostic[]> => {
   if (checker === undefined) return [];
   const errors = await checker.check(text, entryKey, reader).catch(() => []);
-  return [...errors, ...checker.lint(text)];
+  const diags = [...errors, ...checker.lint(text)];
+  lastDiagnostics = { text, entryKey, diags };
+  return diags;
 };
+
+// The last whole-program diagnostics, cached so the code-action path does not
+// re-check what the editor's own diagnostics pass just computed — the browser
+// counterpart of `server.ts`'s `diagnosticsByUri` (which `onCodeAction` reads
+// instead of re-running `check`). The editor runs `diagnostics` on every edit,
+// so a code-action request on the current buffer reuses it; a stale text (a
+// race) recomputes rather than answering wrong.
+let lastDiagnostics:
+  | { text: string; entryKey: string; diags: VLDiagnostic[] }
+  | undefined;
+
+const diagnosticsForRequest = (
+  text: string,
+  entryKey: string,
+): Promise<VLDiagnostic[]> =>
+  lastDiagnostics !== undefined &&
+    lastDiagnostics.text === text &&
+    lastDiagnostics.entryKey === entryKey
+    ? Promise.resolve(lastDiagnostics.diags)
+    : diagnostics(text, entryKey);
 
 // ---- semantic tokens -------------------------------------------------------
 
@@ -399,7 +425,7 @@ export const codeActions = async (
   contextDiagnostics: VLDiagnostic[] = [],
   entryKey: string = DEFAULT_ENTRY,
 ): Promise<QuickFix[]> => {
-  const cached = await diagnostics(text, entryKey);
+  const cached = await diagnosticsForRequest(text, entryKey);
   const fixable = fixableDiagnosticsForRange(contextDiagnostics, cached, range);
   const fixes: QuickFix[] = [];
   for (const d of fixable) {
@@ -435,7 +461,7 @@ export const organizeImports = async (
   entryKey: string = DEFAULT_ENTRY,
 ): Promise<CompletionEdit[]> => {
   if (checker === undefined) return [];
-  const redundant = (await diagnostics(text, entryKey))
+  const redundant = (await diagnosticsForRequest(text, entryKey))
     .filter((d) => d.code === "unused-import" || d.code === "duplicate-import")
     .map((d) => d.range);
   return organizeImportEdits(text, redundant, (stmt) => checker?.formatSrc?.(stmt));
@@ -486,42 +512,14 @@ const toCompletionItem = (c: Completion): CompletionItem => {
 };
 
 // Per-std-module export surfaces (name/kind/type) for `stdAutoImportCompletions`,
-// the browser twin of `server.ts`'s `stdExportsForCompletion`. The browser has no
-// workspace `std/`, so every source is the embedded map; types come from one
-// `scopeAt` over the module itself, matched to its export list, and a re-export
-// carries its origin instead. Cached by source text so the walk runs once.
-const stdExportCache = new Map<string, { src: string; exports: StdExportCandidate[] }>();
-const SCOPE_KINDS = ["variable", "parameter", "function"] as const;
-const stdExportsForPlayground = async (): Promise<Map<string, StdExportCandidate[]>> => {
-  const out = new Map<string, StdExportCandidate[]>();
-  if (checker === undefined) return out;
-  for (const key of Object.keys(STD_SOURCES)) {
-    const src = STD_SOURCES[key];
-    const cached = stdExportCache.get(key);
-    if (cached !== undefined && cached.src === src) {
-      out.set(key, cached.exports);
-      continue;
-    }
-    const surface = checker.moduleSurface(src, key);
-    const lastLine = src.split("\n").length - 1;
-    const scope = await checker.scopeAt(src, key, reader, lastLine, 0).catch(() => []);
-    const byName = new Map(scope.map((b) => [b.name, b]));
-    const exports: StdExportCandidate[] = surface.exports.map((e) => {
-      // A re-export has no binding in this module's own scope, so it carries its
-      // origin instead of a type detail (the ranking uses that origin).
-      const b = e.origin === "" ? byName.get(e.name) : undefined;
-      return {
-        name: e.name,
-        kind: b !== undefined ? SCOPE_KINDS[b.kind] ?? "function" : "function",
-        detail: b !== undefined && b.type !== "" ? b.type : undefined,
-        ...(e.origin === "" ? {} : { origin: e.origin }),
-      };
-    });
-    stdExportCache.set(key, { src, exports });
-    out.set(key, exports);
-  }
-  return out;
-};
+// via the shared `stdExportSurfaces` (`../../lsp/src/editorText.ts`). The browser
+// has no workspace `std/`, so its source read always yields `undefined` and the
+// shared core takes the embedded map. Cached by source text so the walk runs once.
+const stdExportCache: StdSurfaceCache = new Map();
+const stdExportsForPlayground = (): Promise<Map<string, StdExportCandidate[]>> =>
+  checker === undefined
+    ? Promise.resolve(new Map())
+    : stdExportSurfaces(checker, reader, () => undefined, stdExportCache);
 
 /**
  * Completion candidates at `pos`, mirroring `server.ts`'s wasm-mode
