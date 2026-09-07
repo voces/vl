@@ -1493,6 +1493,42 @@ in-language GC knobs.
      (b5) value-union composite members (R3b/R7 — the genuine ABI-policy cluster); then
      migrate `vtKindOfType`/the valtype ladders onto `repTreeVKind` and delete the flat
      `RepDesc` when its last consumer moves.
+     **STAGE C — "one rep per node", the CONSUMER census and conversion. OPEN, owner-approved
+     2026-09-06; plan, order and numbers: `docs/internals/rep-descriptor-campaign.md`.**
+     Stage B widened the PRODUCER; Stage C converts the population on the other side of the
+     seam, which nothing had counted. `scripts/rep-classifier-census.py` derives it from the
+     tree: **516 rep classifiers over 2,956 call sites**, 137 reading the ARENA, 116 a NAME,
+     28 a SPELLING, 131 a TABLE column and 220 a FRAME. Every conversion is graded by the
+     **ladder-vs-descriptor agreement oracle** (`repABNote`/`repLadderABSweep`, riding
+     `$VL_REP_SHADOW`; buckets AGREE / CONTRADICT / LEFT-ONLY / RIGHT-ONLY) at **0 CONTRADICT
+     over `tests/cases` + the distilled corpus** before its ladder is deleted, then by byte
+     identity over both populations, `regress.py` (0 `runs → not-runs`, 0 `→ silent`),
+     `rep-fuzz-check.sh` exact, and `mono-tyaram-grid.sh` for anything touching the pin
+     context. The families, in the order they convert:
+     1. ✅ **`tyKindOf`** — the i32 code vocabulary (0/2/3/7/10/11/12/13/20), 18 call sites.
+        DONE: 3,366,947/3,366,947 queries agree, byte-identical in 3,145 + 7,589 modules.
+     2. ⬜ **`vtKindOfType`'s annotation ladder** — 25 predicate rungs. The `annRepKindOf` seam
+        already exists, so the work is widening `repOfTy` coverage until the fallback is
+        unreachable; the oracle's LEFT-ONLY bucket at this site is the burn-down list.
+     3. ⬜ **`repOfName(name, fnIx)`** — the missing surface, not a ladder: name → frame
+        (`fnStmtsPosOf`) → `fnIndexOfInScopeSid` (walking `fnParent` then `fnInstOrigin`) →
+        declaration → type. The five-row monomorphizer family (D1781, D1782, D1788, D1795,
+        D1817) is every site that should have called it. Lands before item 4.
+     4. ⬜ **The `expr*` family** — 48 classifiers, 926 call sites, 31% of all classifier call
+        sites. Converted by AXIS, since each is a closed set whose siblings must move
+        together: (a) the seven scalar-list predicates, (b) the six nullable niches, (c) the
+        three scalars, (d) the reference shapes.
+     5. ⬜ **The return-kind family** — `retResultVKind` + the fourteen `fnRet*Sid` readers;
+        `fRetKind` becomes a projection rather than a parallel column. `fnRetF32ArraySid` and
+        `fnRetAnnF32ArraySid` still read the flat `fnIndexOfSid` and move first.
+     6. ⬜ **The valtype and field-code ladders** — `fbValtype` (31 arms), `fbValtypeNullable`,
+        `fbRefNullForKind`, `fbHeapIdxForKind`; `fieldTypeCode`, `nameFieldCode`,
+        `anonFieldCode`. The remaining parallel numbering schemes.
+     7. ⬜ **The slot layer, last** — `structIndexOfExpr`, `rlSlot*`, `mvSlot*`,
+        `exprVariantIndex`. `rdSlot` is nominal where the rest of the descriptor is
+        structural, and nothing earlier depends on it.
+     Two owner rulings gate how far items 2 and 6 can go: `one-literal-union-rep` and
+     `nullable-rep-rule-stated-once` (`docs/internals/open-rulings.md` §D).
      REMAINING legacy items: (a) widen `repOfTy` coverage (typed-value maps,
      litunion/union-element arrays — subsumed by Stage B above); (e) the variant⇄struct-table
      seam, **re-measured 2026-08-26 while closing `silent-class-inventory` D32, and this row was
