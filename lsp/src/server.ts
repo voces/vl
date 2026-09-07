@@ -95,6 +95,7 @@ import {
   type OutlineSymbolKind,
   refCountLensTitle,
   scopeCompletionsFromBindings,
+  typeCompletionsFromWasm,
   SEMANTIC_TOKEN_LEGEND,
   semanticTokensDataFromWasm,
   snippetCompletions,
@@ -1399,6 +1400,17 @@ connection.onCompletion(async (params): Promise<CompletionItem[]> => {
     byName.set(c.name, c);
   }
   for (const c of scopeCompletionsFromBindings(bindings)) byName.set(c.name, c);
+  // The TYPE namespace, added last and never over a name a value already took: at a use
+  // site the value is what the author reaches for, and one label cannot mean both.
+  const typeNames = await wasmChecker
+    .typeNamesAt?.(text, entryKeyOf(uri), workspaceReader)
+    .catch((err) => {
+      connection.console.log(`[wasm-checker] typeNamesAt failed: ${err}`);
+      return [];
+    }) ?? [];
+  for (const c of typeCompletionsFromWasm(typeNames, (n) => byName.has(n))) {
+    byName.set(c.name, c);
+  }
   const identifiers = [...byName.values()].map((c) => toCompletionItem(c));
   const keywords = keywordCompletions(false).map((c) => toCompletionItem(c));
   const snippets = snippetCompletions(false).map((c) => toCompletionItem(c));
