@@ -72,7 +72,6 @@ units: **hours** · **half-day** · **days**.
 | 29 | **F-day-one — five grammar axes still absent** | `day-one-sampler.md:90-92`: `match`, operator overloading, multi-param generics, recursive types, mixed-width arithmetic | `scripts/day-one/grammar.py` (91 records) | half-day per axis |
 | 30 | **Host ABI (4) process spawn, (5) env + exit** | no `std` export for spawn/exec/env/exit; the orchestrator scripts still shell out | three hosts + the declaration in `wasmEmit.vl` | days |
 | 31 | **A-destructure — `let`/`const` and PARAMETER destructuring (owner ask, 2026-09-06 night; not scheduled)** | `const { x, y } = p`, `const [a, b] = xs`, `function f({ x, y }: Pt)` → `parse error … expected an identifier but found `{``; the `match` payload clause (pun, rename, nest — #2837) is the only destructuring today | `parser.vl` (a pattern in binding and parameter position, the payload clause's grammar reused), `typecheck.vl` (binding types from the pattern; for an UN-ANNOTATED parameter the pattern is a shape constraint `{a: ?, b: {c: ?}}` with hole leaves closed at the pin — the inference half is a second step), `format.vl` (byte-for-byte round trip), the desugar (one `const` per leaf, the `match` prelude's shape); list destructuring wants the multiple-returns question in `docs/guide/lambda-param-skip-design.md` answered first | days |
-| 32 | **B21.2 — ban the empty top-level payload clause `Stop{}` (owner ruling 2026-09-06 night)** | `match c { Stop{} => 0 … }` runs today and means `Stop`; `Wrap{p: {}}` is already refused | `parser.vl` — refuse with the nested clause's sentence; retarget the `Move{}` fixture line in `payload-binding-*.vl` | hour |
 
 ### Open items that need an owner ruling first — listed, not decided
 
@@ -1521,10 +1520,13 @@ in-language GC knobs.
         LEFT-ONLY coverage gap (147,945 queries, headed by `reflist` at 111,683), and the one
         surviving CONTRADICT, which is `one-literal-union-rep`'s cost at a second site.
         `docs/internals/rep-descriptor-campaign.md` §6.3.
-     3. ⬜ **`repOfName(name, fnIx)`** — the missing surface, not a ladder: name → frame
-        (`fnStmtsPosOf`) → `fnIndexOfInScopeSid` (walking `fnParent` then `fnInstOrigin`) →
-        declaration → type. The five-row monomorphizer family (D1781, D1782, D1788, D1795,
-        D1817) is every site that should have called it. Lands before item 4.
+     3. ✅ **`repOfNameResult(sid, name, fnIx)`** — the name surface, and narrower than this
+        list first guessed: only the return-kind readers wanted a REP, and the other three
+        rows wanted the SLOT or the `$fnsig` key, which `fnIndexOfInScope` already owns.
+        DONE: fourteen readers became projections, the two `#2815` left behind gained the
+        frame (closing D1834), byte-identical in 3,154 of 3,155 + 7,589 of 7,589, and the flat-vs-scoped
+        oracle contradicts in eight modules, all of them the pin-context fixtures. The
+        BINDING half — `declaredSlotOf` takes a bare name — is still owed, by item 4.
      4. ⬜ **The `expr*` family** — 48 classifiers, 927 call sites, 31% of all classifier call
         sites. Converted by AXIS, since each is a closed set whose siblings must move
         together: (a) the seven scalar-list predicates, (b) the six nullable niches, (c) the
@@ -2783,7 +2785,10 @@ in-language GC knobs.
      nested form was predicted to be needed and was NOT, the arm's own narrowing already making
      the field read concrete. A nested TYPE pattern (`{inner: Circle{r}}`) is refused by name —
      it would TEST a field rather than read one, so the arm would stop covering its own variant
-     and exhaustiveness would need a rule nobody has ruled.
+     and exhaustiveness would need a rule nobody has ruled. **B21.2 (2026-09-07)** finished the
+     form: an EMPTY clause is now refused at both depths, `Stop{}` as well as `p: {}`, each
+     naming what to write instead — one spelling per meaning, and nothing for `vl fmt` to
+     choose between (`open-rulings.md` §match-empty-clause).
      ~~Also open and NOT phase-2b-specific: a binding arm cannot be a `const` INITIALIZER~~
      **DONE (C6)** — an if-expression arm's value is now its LAST statement and everything before
      it is the arm's PRELUDE, so `const r = match u { A{a} => a … }` and the hand-written `if`

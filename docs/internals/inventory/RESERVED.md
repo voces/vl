@@ -45,3 +45,4 @@ D1760-D1779  vl-c3  2026-09-06  fix and discovery lanes, 2026-09-06 afternoon
 D1780-D1799  vl-c3  2026-09-06  fix and discovery lanes, 2026-09-06 evening
 D1800-D1819  vl-c3  2026-09-06  fix and discovery lanes, 2026-09-06 evening (block 2)
 D1820-D1839  vl-c3  2026-09-06  fix and discovery lanes, 2026-09-06 night (D1820 per-program mono ledger, D1821 annotated-helper two-pin trap, later residues)
+D1860-D1879  vl-c3  2026-09-06  fix and discovery lanes, 2026-09-07 (D1833 residue, variadics residue, campaign rows, later)
