@@ -26,15 +26,20 @@ import type { VLDiagnostic } from "../../compiler/diagnostics.ts";
 import {
   builtinCompletionsFromWasm,
   type Completion,
+  type CompletionEdit,
   type CompletionKind,
   displayableType,
   docMarkdown,
+  importInsertionEdit,
   inlayHintsFromWasm,
   isDisplayableType,
   keywordCompletions,
   type LspRange,
   memberCompletionsFromWasm,
+  organizeImportEdits,
   scopeCompletionsFromBindings,
+  stdAutoImportCompletions,
+  type StdExportCandidate,
   typeCompletionsFromWasm,
   SEMANTIC_TOKEN_LEGEND,
   semanticTokensDataFromWasm,
@@ -42,6 +47,7 @@ import {
   typeLabelDetail,
   ufcsCompletions,
 } from "../../lsp/src/typeFeatures.ts";
+import { STD_SOURCES } from "../../std/embedded.ts";
 import {
   foldingRanges as computeFoldingRanges,
   type VlFoldingRange,
@@ -59,6 +65,9 @@ import {
   type LspTextEdit,
   type QuickFix,
   quickFixesForDiagnostic,
+  ufcsImportFixes,
+  ufcsImportModules,
+  ufcsMissingImportAt,
 } from "../../lsp/src/codeActions.ts";
 
 export type { LspTextEdit, QuickFix, VlFoldingRange, VLDiagnostic };
@@ -394,8 +403,41 @@ export const codeActions = async (
   const fixes: QuickFix[] = [];
   for (const d of fixable) {
     fixes.push(...quickFixesForDiagnostic(text, d.code, d.range));
+    // A missing UFCS import is the one fix whose candidate set the document
+    // cannot supply: which modules export the `self`-function this receiver
+    // dispatches to is the CHECKER's answer, riding the diagnostic's
+    // `data.modules` (recovered from `cached` when the editor did not round-trip
+    // it). No second query — the compiler decided it once, at the raise.
+    const ufcsName = ufcsMissingImportAt(text, d);
+    if (ufcsName !== undefined) {
+      fixes.push(...ufcsImportFixes(
+        text,
+        ufcsName,
+        ufcsImportModules(d, cached),
+        (src, spec, name) =>
+          importInsertionEdit(src, spec, name, (stmt) => checker?.formatSrc?.(stmt)),
+      ));
+    }
   }
   return fixes;
+};
+
+/**
+ * Organize imports: drop every REDUNDANT specifier — unused AND duplicate alike,
+ * both lint codes — and reprint each surviving statement through the seed's
+ * formatter, a specifier-less statement's line removed whole. The browser half of
+ * `server.ts`'s `source.organizeImports` action. No edits (already organized)
+ * means no action. Empty before the seed loads.
+ */
+export const organizeImports = async (
+  text: string,
+  entryKey: string = DEFAULT_ENTRY,
+): Promise<CompletionEdit[]> => {
+  if (checker === undefined) return [];
+  const redundant = (await diagnostics(text, entryKey))
+    .filter((d) => d.code === "unused-import" || d.code === "duplicate-import")
+    .map((d) => d.range);
+  return organizeImportEdits(text, redundant, (stmt) => checker?.formatSrc?.(stmt));
 };
 
 // ---- completion (D3) -------------------------------------------------------
@@ -413,6 +455,14 @@ export type CompletionItem = {
   labelDetail?: string;
   documentation?: string;
   insertText?: string;
+  /** Right-aligned secondary label — the providing module for an auto-import item. */
+  description?: string;
+  /**
+   * Edits applied ALONGSIDE the insertion (Monaco `additionalTextEdits`) — a std
+   * auto-import item carries the `import { … } from "std:…"` rewrite here, so
+   * accepting the name also adds its import.
+   */
+  additionalTextEdits?: CompletionEdit[];
 };
 
 /** The fence language id the playground hover/completion code blocks use. */
@@ -429,7 +479,47 @@ const toCompletionItem = (c: Completion): CompletionItem => {
     item.documentation = docMarkdown(c.detail ?? "", VL_LANGUAGE_ID, c.doc);
   }
   if (c.insertText !== undefined) item.insertText = c.insertText;
+  if (c.description !== undefined) item.description = c.description;
+  if (c.extraEdits !== undefined) item.additionalTextEdits = c.extraEdits;
   return item;
+};
+
+// Per-std-module export surfaces (name/kind/type) for `stdAutoImportCompletions`,
+// the browser twin of `server.ts`'s `stdExportsForCompletion`. The browser has no
+// workspace `std/`, so every source is the embedded map; types come from one
+// `scopeAt` over the module itself, matched to its export list, and a re-export
+// carries its origin instead. Cached by source text so the walk runs once.
+const stdExportCache = new Map<string, { src: string; exports: StdExportCandidate[] }>();
+const SCOPE_KINDS = ["variable", "parameter", "function"] as const;
+const stdExportsForPlayground = async (): Promise<Map<string, StdExportCandidate[]>> => {
+  const out = new Map<string, StdExportCandidate[]>();
+  if (checker === undefined) return out;
+  for (const key of Object.keys(STD_SOURCES)) {
+    const src = STD_SOURCES[key];
+    const cached = stdExportCache.get(key);
+    if (cached !== undefined && cached.src === src) {
+      out.set(key, cached.exports);
+      continue;
+    }
+    const surface = checker.moduleSurface(src, key);
+    const lastLine = src.split("\n").length - 1;
+    const scope = await checker.scopeAt(src, key, reader, lastLine, 0).catch(() => []);
+    const byName = new Map(scope.map((b) => [b.name, b]));
+    const exports: StdExportCandidate[] = surface.exports.map((e) => {
+      // A re-export has no binding in this module's own scope, so it carries its
+      // origin instead of a type detail (the ranking uses that origin).
+      const b = e.origin === "" ? byName.get(e.name) : undefined;
+      return {
+        name: e.name,
+        kind: b !== undefined ? SCOPE_KINDS[b.kind] ?? "function" : "function",
+        detail: b !== undefined && b.type !== "" ? b.type : undefined,
+        ...(e.origin === "" ? {} : { origin: e.origin }),
+      };
+    });
+    stdExportCache.set(key, { src, exports });
+    out.set(key, exports);
+  }
+  return out;
 };
 
 /**
@@ -498,7 +588,16 @@ export const completion = async (
   const identifiers = [...byName.values()].map(toCompletionItem);
   const keywords = keywordCompletions(false).map(toCompletionItem);
   const snippets = snippetCompletions(false).map(toCompletionItem);
-  return [...identifiers, ...keywords, ...snippets];
+  // std exports NOT in scope, offered with an import-statement rewrite on accept
+  // (`additionalTextEdits`) — the browser half of `server.ts`'s auto-import pass,
+  // spelled by the seed's own formatter so the added import is what `vl fmt` keeps.
+  const autoImports = stdAutoImportCompletions(
+    text,
+    await stdExportsForPlayground(),
+    (name) => byName.has(name),
+    (stmt) => checker?.formatSrc?.(stmt),
+  ).map(toCompletionItem);
+  return [...identifiers, ...autoImports, ...keywords, ...snippets];
 };
 
 // The identifier `[A-Za-z_][A-Za-z0-9_]*` immediately to the LEFT of `character`

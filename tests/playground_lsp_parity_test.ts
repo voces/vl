@@ -142,6 +142,12 @@ const FEATURES: Parity[] = [
     serverMarker: "connection.onCodeAction",
     adapterExport: "codeActions",
     mainMarker: "registerCodeActionProvider",
+    // Both were SUB_GAPS the playground did not compose; promoted 2026-09-08 when
+    // the adapter's code-action + organize paths gained them (ROADMAP row 32).
+    subBehaviours: [
+      { name: "missing-UFCS-import quick-fix", symbol: "ufcsImportFixes" },
+      { name: "organize imports", symbol: "organizeImportEdits" },
+    ],
   },
   {
     // Completion (D3): scope-aware identifiers + structural member completion
@@ -151,8 +157,12 @@ const FEATURES: Parity[] = [
     feature: "completion",
     // Measured 2026-09-08 by grepping both files for the composing symbol. `builtins`,
     // `scope bindings`, `keywords` and `snippets` are present on both sides and covered by
-    // the export marker; these are the ones a label alone would hide.
-    subBehaviours: [{ name: "UFCS method candidates", symbol: "ufcsCompletions" }],
+    // the export marker; these are the ones a label alone would hide. `stdAutoImportCompletions`
+    // was a SUB_GAPS row, promoted when the adapter's completion path gained it (row 32).
+    subBehaviours: [
+      { name: "UFCS method candidates", symbol: "ufcsCompletions" },
+      { name: "std auto-import items", symbol: "stdAutoImportCompletions" },
+    ],
     serverMarker: "connection.onCompletion",
     adapterExport: "completion",
     mainMarker: "registerCompletionItemProvider",
@@ -408,43 +418,24 @@ Deno.test("DOCUMENTED parity gaps (informational)", () => {
 // A `knownGap` row keys on `mainMarker`, so it can only describe a feature the
 // playground does not register AT ALL. It is blind to the other shape: the
 // Monaco provider IS registered and the adapter composes only PART of what the
-// LSP's own handler composes. Three of those stand, and all three sit under a
-// row this file already grades as in parity — "completion" and "code actions".
+// LSP's own handler composes.
 //
-// The rows below name the helper `server.ts` composes and the playground does
-// not, with the same polarity as `knownGap`: each asserts the gap STILL HOLDS,
-// so closing one reds this test and forces the row to be promoted rather than
-// left behind as a stale TODO. (`adapterSrc` is read once at the top of the
-// file, beside `serverSrc`/`mainSrc`.)
+// `SUB_GAPS` is that instrument's NEGATIVE half — a behaviour the adapter does
+// not compose yet, asserted to STILL HOLD so closing one reds this test and
+// forces a promotion. It is empty today: the three that stood (`stdAutoImport-
+// Completions`, `ufcsImportFixes`, `organizeImportEdits`) were composed by the
+// adapter (ROADMAP row 32) and PROMOTED into the `subBehaviours` of their
+// "completion" / "code actions" rows, where the positive both-hosts assertion
+// above now grades them. The type and the two tests stay as the standing home
+// for the next label-hidden gap. (`adapterSrc` is read once at the top of the
+// file.)
 type SubGap = {
   under: string; // the in-parity FEATURES row whose label hides this
   symbol: string; // the `lsp/src/*` helper server.ts composes
   why: string;
 };
 
-const SUB_GAPS: SubGap[] = [
-  {
-    under: "completion",
-    symbol: "stdAutoImportCompletions",
-    why:
-      "the LSP offers unimported std names as completion items that add the " +
-      "import on accept; the playground's completion path offers neither",
-  },
-  {
-    under: "code actions (quick-fix / Auto Fix)",
-    symbol: "ufcsImportFixes",
-    why:
-      "the LSP offers 'import the module this method comes from' as a " +
-      "quick-fix; the playground's code-action path composes no UFCS fixes",
-  },
-  {
-    under: "code actions (quick-fix / Auto Fix)",
-    symbol: "organizeImportEdits",
-    why:
-      "the LSP serves source.organizeImports (unused AND duplicate specifiers " +
-      "dropped, survivors fmt-sorted); the playground has no organize path",
-  },
-];
+const SUB_GAPS: SubGap[] = [];
 
 Deno.test("every sub-behaviour gap names a live LSP helper", () => {
   for (const g of SUB_GAPS) {
