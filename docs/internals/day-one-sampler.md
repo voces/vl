@@ -666,13 +666,57 @@ lowering, and the cross-rep name collision then mis-reps the string concat (D193
 sampler's `modules_split` axis assembled the ingredients; its `single` face is where they
 fire, so this is not a cross-module defect — it is a single-file one the cross reached.
 
-## Four two-feature crosses: three sound compositions, one seam that bit
+## The std-import x shadowed-name cross — 508 pairs, 0 wrong values, the ambient-effect analogue of D1934
 
-`narrow x generic-pin`, `operator x mixed-width` and `init_vs_assign x union-rep` all composed
-soundly — every disagreement was rep-independent and shared by a same-shape control. The
-residual defect surface is therefore NOT single-feature composition; it is cross-feature with a
-SEAM. `operator x modules_split` found the first real defect of the sweep (D1934), and even there the seam the brief predicted — cross-module bank survival —
-held; the miscompile was a name-collision the operator's lowering exposed.
+The fifth and last cross. D1934 was a GLOBAL effect (a `"+"` overload changes every `+`'s
+lowering) meeting a LOCAL rep decision (a name shadowed across scopes). A `std:` import is the
+other global effect the language has — a module-graph edge with a start function of its own —
+so this crosses it with the same local rebind: a `rep_shadow` report binds `shdw` as a module
+`Cell` (a ref) and shadows it with a block `const shdw = "hi"` (a string), reading both, while
+`modules_split` moves a `std:str` / `std:array` / `std:buffer` import into the module.
+
+Seeds 1201-1208 x 800 and a wider 1211-1216 x 1200, `--axis modules_split`:
+
+| | pairs | AGREE-RUNS | not AGREE |
+| --- | --- | --- | --- |
+| before (no shadow report) | 3,200 | 3,200 | 0 |
+| after, shadow report | 508 | 508 | 0 |
+| shadow with a std import MOVED to the module | 54 | 54 | 0 |
+
+**A clean negative.** The shadow's rep is resolved correctly whether or not a `std:` import is
+in the graph and whichever side of the module boundary it sits on — 0 wrong values, 0 silent
+wasm. The import's start function is an ambient effect on ORDER, not on name resolution or
+lowering, so it does not collide with a local rebind the way an operator overload did. D1934
+was operator-specific: the string `+` only routed through the wrong binding because a user
+`"+"` existed, and that is now fixed.
+
+## Five two-feature crosses: composition is sound; the defects live at name-resolution seams
+
+The two-feature sweep ran five crosses and stops here:
+
+| cross | result | defect |
+| --- | --- | --- |
+| narrow x generic-pin | clean (pin composes) | D1933 (incidental: a 4-way closure-capture emit reject) — FILED |
+| operator x mixed-width | clean negative | — (the one disagreement was D1893, control-shared) |
+| init_vs_assign x union-rep | clean negative (0 wrong values) | — |
+| operator x modules_split | cross-module resolution SOUND; a single-file seam exposed | D1934 — found and FIXED |
+| std-import x shadowed-name | clean negative | — |
+
+**Feature COMPOSITION is sound.** Every cross that measured a composition — pinning a narrowed
+rep, a mixed-width operator body, reassigning across a union's rep boundary, resolving an
+operator across a module boundary, a std import beside a shadow — came back a clean negative,
+its disagreements rep-independent and shared by a same-shape control. The cross-module dispatch
+bank the brief singled out survives being written in one module and read in another.
+
+**The two defects the sweep surfaced are name-resolution SEAMS, not composition bugs.** Both
+are a global/ambient effect meeting a local rep decision: D1934 is a `"+"` overload's global
+lowering meeting a name shadowed across scopes (`structIndexOfExpr` resolved the shadow by name
+to the wrong binding) — found by `operator x modules_split`, FIXED. D1933 is a closure capture
+of a field-sourced nullable inside a block, a four-ingredient cross — found by `narrow x pin`,
+FILED. Neither is reachable by a single-feature fixture; that a random program generator paired
+the ingredients is exactly the value the sampler was built to have. The productive remaining
+territory, if the sweep resumes, is more ambient x local seams — not the plain feature x
+feature grid, which these five show composes.
 
 ## Running it
 
