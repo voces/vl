@@ -1112,6 +1112,150 @@ any module. (b) buys a smaller table with ambient state, which is the trade this
 refused everywhere else. (d) is what the port does today by printing to stdout, and the reason
 this entry exists.
 
+### fs-directory-mutation — may a VL program make, empty or remove a directory? — raised 2026-09-07
+
+**It cannot do any of the three.** `std:fs` reads directories (`listDir`) and reads and writes
+files, and that is the whole surface: there is no `mkdir`, no `remove`, no `rename`, and no
+temp-directory primitive. Writing into a directory that does not exist is `ENOENT` — measured,
+`writeTextFile("/tmp/vl-probe-dir-xyz/a.vl", …)` answers
+`fs.writeFile …: ENOENT (no such file or directory)` — so a program cannot create the place it
+would write to.
+
+**The witness is the second script the dogfooding lane ports, and this one BLOCKS it.**
+`scripts/check-filed-witnesses.py` grades every inventory row by writing its `Repro:` block to
+a **fresh temp directory** and running `vl` there. **Eight rows across the two inventories carry
+a multi-file witness** — D1120, D1191, D1519, D1571, D1585, D1598, D1651 and D1654, the
+`// file: <name>.vl` form, added because a merge-time registry collision between two modules
+cannot be spelled in one file — and each needs its own private directory, because the imports
+inside the witness are relative (`import { x } from "./a"`) and the file therefore has to be
+named `a.vl` beside the entry. The names are the WITNESS's,
+not the grader's, so they cannot be prefixed to avoid collision without editing the program
+the script exists to run verbatim.
+
+The flat route-around is unsound under this repo's own rules. Writing every witness into one
+directory that already exists (`/tmp`) works for a single sequential run — measured, the write
+and the read-back both succeed — and breaks the moment two graders overlap, because both want
+`a.vl` at the same path. CLAUDE.md allows **six concurrent worktree agents**, each of which may
+run `gate.sh`, and `filed witnesses` is one of its rows.
+
+**Options.**
+(a) **`makeDir(path): IoResult` and `removeDir(path): IoResult`** (plus `removeFile`), a host
+import each, landing in all three hosts the way the process floor did. Smallest surface that
+unblocks the port. Leaves the caller to invent a unique name, which it cannot do — see (c).
+(b) **A temp-directory primitive** — `makeTempDir(prefix): string | IoError`, the host doing
+what `mkdtemp(3)` does, plus `removeDirAll`. One export answers the uniqueness question and the
+cleanup question together, and it is what every peer's stdlib offers for exactly this job.
+Against: it is a narrower promise than (a) and a program that wants a NAMED directory still
+cannot make one.
+(c) **Both**, with (b) written in terms of (a) plus a source of uniqueness. VL has none today:
+there is no pid, no clock in std (`nowMillis` is a user `extern`, not std), and no random. So
+(a) alone does not actually unblock the port — the caller cannot name a directory no other
+process will pick.
+(d) **Nothing: the grader keeps its eight multi-file rows in Python.** Then the port cannot be
+switched over, which is the state this ruling exists to end.
+
+**Peers.** Python `os.mkdir` / `tempfile.mkdtemp` / `shutil.rmtree`. Rust `fs::create_dir_all`
+/ `fs::remove_dir_all` (and `tempfile` as a crate, not std). Go `os.MkdirTemp` / `os.RemoveAll`.
+Deno `Deno.mkdir` / `Deno.makeTempDir` / `Deno.remove`. Every one has both halves, and three of
+the four put the temp-directory maker in the standard library rather than leaving it to be
+composed — because composing it needs a uniqueness source the language must also supply.
+
+**Recommendation: (b) first, then (a).** `makeTempDir` is the one the scheduled port needs, it
+answers uniqueness and cleanup in a single export, and its host implementation is one syscall
+that already exists on every platform. `makeDir`/`removeDir`/`removeFile` are the general
+answer and should follow, but they do not unblock anything on their own. Both are `std:fs`
+additions and host imports, so both take the `std-api-reviewer` pass and land in
+`scripts/vl-host/src/main.rs`, `scripts/wasmtime-host.rs` and a refusal in
+`tests/support/runWasm.ts` — a `string` result crosses as a `u8[]`, the same V8 wall the rest
+of the floor meets.
+
+### text-pattern-matching — does VL get a pattern language, or is character scanning the answer? — raised 2026-09-07
+
+**There is none.** No regex literal, no `std:regex`, and nothing in `std:str` above
+`startsWith` / `endsWith` / `indexOf` / `lastIndexOf` / `split` / `replace` / `trim` /
+`padStart` / `padEnd`. A VL program that recognises a shape in text writes the scan by hand.
+
+**The witness is the same script, and here the finding is that this is NOT a blocker.**
+`scripts/check-filed-witnesses.py` spells seven patterns with `re` — the row heading and its
+id suffix grammar (`D661A`, `D804b`, `D1009-N`), the row-shaped-heading population counter,
+the any-heading row terminator, the `// file:` marker, the inventory-split source marker, and
+the parse-error status phrase. **All of them are hand-writable, and the hard one was
+measured**: a VL row parser with no regex reads `docs/internals/inventory/D1865.md` and agrees
+with the Python on the id, the status line, the repro's line count and its first line. The
+heading scanner is fifteen lines of character walking where `re` is one line.
+
+So this ruling is about COST and about what the next twenty ports pay, not about whether the
+lane can proceed. The seven patterns are perhaps 120 lines of VL that `re` writes in seven,
+and every one of them is a place a future author can get the scan subtly wrong where a regex
+would have been reviewable at a glance.
+
+**Options.**
+(a) **Nothing — character scanning is the answer**, and `std:str` grows the specific helpers
+ports actually reach for (a `contains`, a `splitOnce`, a `stripPrefix`). Cheapest, honest, and
+it keeps the language small; the cost is paid once per pattern, forever.
+(b) **`std:regex` over a restricted syntax** — literals, classes, anchors, `*`/`+`/`?`,
+alternation, one capture group form. A real subsystem: a parser, a matcher, and a decision
+about backtracking. It is the answer every peer has, and it is also the largest single std
+module anyone has proposed here.
+(c) **A pattern LITERAL in the language**, checked at compile time, so a malformed pattern is a
+compile error rather than a runtime one — the direction VL's posture (a refusal should be loud
+and early) actually points. Much the most expensive: it puts a second grammar in the lexer.
+
+**Peers.** Python `re`, Rust `regex` (a crate, not std — deliberately), Go `regexp`, JS
+literals in the language. Rust is the interesting one: it kept regex OUT of std precisely
+because the engine is a subsystem with its own release cadence, and VL has no package
+ecosystem to put it in instead.
+
+**Recommendation: (a) for now, and say so out loud in `std:str`'s header** so a port author
+knows the scan is the intended shape rather than a gap they should wait out. Revisit (b) when
+a port needs a pattern that is not a fixed prefix, suffix or separator — none of the seven in
+this script is. (c) is not worth a lexer change for a capability (a) covers at the cost of
+lines rather than of expressiveness.
+
+### process-run-timeout — can a VL program bound how long a child runs? — raised 2026-09-07
+
+**It cannot.** `runProgram(cmd, args)` waits for the child to finish and there is no third
+argument, no `kill`, and no way to interrupt it. A child that loops runs forever and takes the
+VL program with it.
+
+**The witness is the same script, and this one is a robustness regression rather than a
+blocker.** `scripts/check-filed-witnesses.py` spawns `vl` two or three times per row —
+`check`, `run`, and `build` where the first two do not settle it — across 829 rows in inventory
+#1 alone, and **every one of those calls carries `timeout=120`**. That bound is not decoration:
+the rows this grader runs are, by construction, programs that provoke the compiler, and a
+compiler defect that loops is a defect class this tree has met (`docs/internals/…` records a
+non-converging self-build found under `timeout 300`). Ported as it stands, one such row hangs
+the `filed witnesses` gate row with no output and no exit — the exact failure CLAUDE.md
+describes as reading like slowness rather than like a finding.
+
+**Options.**
+(a) **A third argument** — `runProgram(cmd, args, timeoutMs: i32)`, `0` for no bound, and a
+timed-out child answers a distinguished `IoError` (`ETIMEDOUT`, WASI 73) rather than a code.
+One host import signature change, no new slot. Against: it makes the common call carry a
+number it does not care about, unless `runProgram` keeps its two-argument form and a
+`runProgramFor` takes the bound.
+(b) **A separate export** — `runProgramFor(cmd, args, timeoutMs)` beside `runProgram`, so the
+unbounded call stays two arguments. Two names for one operation, which the std rubric is
+critical of, but the bound is genuinely optional and VL has no default arguments in std's
+style.
+(c) **Nothing** — a caller that needs a bound spawns `timeout 120 <cmd>` instead. It works on
+every platform this repo targets, costs no ABI, and is what a shell script would do. Against:
+it is a POSIX tool dependency inside a std-level capability, and `timeout` KILLS THE SHELL,
+NOT THE CHILD — the trap CLAUDE.md already records, which a caller reaching for it would
+inherit.
+
+**Peers.** Python `subprocess.run(..., timeout=)`. Rust: none in std — `Command::output()`
+blocks, and a bound needs `wait_timeout` from a crate. Go `exec.CommandContext` with a
+context deadline. Deno `AbortSignal.timeout` on `Deno.Command`. So two of four put it on the
+call, one uses a cancellation object, and one leaves it out of std entirely.
+
+**Recommendation: (a), with `0` meaning unbounded.** The number is the honest shape — the
+operation really does take a bound — and a defaulted third argument is cheaper than a second
+export the rubric would have to justify. `ETIMEDOUT` as the error keeps the answer on the one
+channel `std:process` already uses, so a caller branches on `code` exactly as it does for a
+missing binary. (c) is what the port would have to do in the meantime and should be written
+into its header if it ships before this is ruled.
+
 ## Dismissed — filed as owner rulings, verified NOT open
 
 Kept so the same 22 are not re-swept. `ALREADY-RULED` = the answer exists elsewhere; `SHIPPED` = the code already does it; `STALE-PREMISE` = the question rests on something no longer true; `NOT-AN-OWNER-CALL` = ordinary work, or a measurement settles it.
