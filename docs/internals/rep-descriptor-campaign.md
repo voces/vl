@@ -1135,8 +1135,8 @@ call sites: 74 {'GUARDED': 35, 'BLIND': 31, 'DIRECT': 8}
   converts a silent wrong slot into a trap, which is §6.4's mistake in the other direction.
 * **8 DIRECT** — returned straight out; the caller's caller owns the question.
 
-**What step 2 therefore is, and what it is not.** It is 31 call sites, one at a time, each
-made to take a decline before the clamp narrows — not a rewrite of the four producers, three of
+**What step 2 looked like from here — and §7.7 is what happened when it was built.** It read
+as 31 call sites, one at a time, each made to take a decline before the clamp narrows — not a rewrite of the four producers, three of
 which are now known not to need one. **Step 3 (widening `repOfTy`'s `rdSlot` to bank B) is not
 needed for step 2 either**: the consumers here take an `i32` slot, so the decline they must
 learn is an explicit `-1` test, and only a consumer that is already a descriptor reader would
@@ -1145,6 +1145,68 @@ want `rdCovered == 0`. Saying which is which per site is step 2's own first move
 **The probe stays in the tree**, armed-only and costing one boolean test unarmed, because
 "which clamps fire" is a standing question and this measurement is the only thing that
 separates the one live clamp from the three that are not.
+
+
+---
+
+### 7.7 Step 2 is VETOED, and the veto names the blocker — it is the NAME, not the consumers
+
+§7.6 set the order: convert the 31 BLIND consumers so they can take a decline, then narrow
+`refListSlotOfExpr`'s clamp. Step 2 was built in a scratch tree to find out which consumers
+step 1 owes. **The answer inverts the plan.**
+
+**Narrowing the clamp costs exactly one module of 10,767.**
+
+```
+tests/cases   files A=3178 B=3178   DIFFERING FILES: 1
+distilled     files A=7589 B=7589   DIFFERING FILES: 0
+```
+
+The one is `tests/cases/std/array-needle-nullable-niche.vl`, **`rc=0 → rc=70`**:
+`the emitted module failed to validate inside `indexOf$m1$4`: type mismatch: expected i32,
+found (ref null $type)`. Six of the seven `tests/cases` control modules and all 22 corpus
+cells survive the narrowing unchanged, printing what they printed. **Nothing traps** anywhere
+in either population, so no consumer indexes a table with `-1` — which is the reassuring half
+of the result and says the 31 BLIND sites are not reached with a miss by any program we have.
+
+**And the failure is not a consumer that cannot take a decline.** A probe on the name the walk
+looks up says so directly: in that module `refListSlotOfExpr` clamps **28 times, and the name
+is the EMPTY STRING every time.** Inside a monomorphized instance of `indexOf<T>(self: T[], …)`
+the receiver's element is a type variable, and a type variable renders as `""` — the same
+empty render D1794 recorded at the array-element position. So `rlSlotByName("")` misses, and
+the miss is not *"no row exists"* but *"the name that would have found it was never
+rendered"*. The clamp then hands back slot **0**, which is the right row here — so the program
+compiles and prints correctly. **The clamp is load-bearing, and load-bearing by luck.**
+
+That is the D1040/D1106/D1500 shape seen from the other side: an in-band sentinel silently
+*saving* a program instead of silently breaking one, and equally invisible either way.
+
+**Why step 1 cannot rescue it.** With the clamp narrowed, an explicit `-1` test at the
+consumer turns this module from check-clean invalid wasm into a loud refusal — still
+`runs → not-runs`, still the veto. **The blocker is the NAME**, and its fix is D1794's:
+a generic body's element resolved through the pin the instance banked
+(`pinnedHoleTyOf` / `pinResolvedFnTy`), consulted only where the direct render declined.
+
+**And the other 30 BLIND sites cannot be converted honestly yet.** No program in either
+population reaches them with a miss, so a decline added there is dead code no test exercises —
+and the campaign's bar grades a conversion by measurement, not by intention. They convert when
+the narrowing can validate them, which is after the name is fixed.
+
+**So the order §7.6 set is right and its first step is different from what it named:**
+
+1. **Fix the empty element render in a monomorphized generic body** (D1794's mechanism at this
+   position). Until then the clamp cannot narrow.
+2. Then narrow, which is the only thing that makes the 31 declines testable and turns
+   §7.6's **35 dead guards** back into live ones.
+3. `repOfTy`'s `rdSlot` reaching bank B remains step 3 and is needed by neither.
+
+**One thing this section does NOT do, deliberately: file the row.** Three minimisations of the
+238-line fixture were written and run, and **none reproduces** — a nullable-struct element, a
+nullable i32-list element and a nullable-closure element each run identically on both
+compilers, so the shape needs more of the fixture's six-rep combination than has been
+isolated. A row whose `Repro` does not reproduce is worse than no row (D957 is that mistake),
+and the `filed witnesses` gate would run it and grade it wrong. **Minimising this witness is
+the first task of the next lane**, and the row follows the program, not the other way round.
 
 
 ---
