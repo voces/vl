@@ -1702,27 +1702,103 @@ function matchPatFmt(patIx: i32, bindIx: i32, indent: i32) {
   expr(patIx, indent, 0)
 }
 
-// A pattern's payload-binding clause `{x, y}`, or "" when there is none. Rendered
-// structurally from the bound names the parser banked as `const` declarations, not from a
-// source slice: the pattern node's span stops at its type atom, so printing from the span
-// would silently delete every binding. Structural rendering also canonicalizes the spacing.
+// A pattern's payload-binding clause `{x, y: b, p: {q}}`, or "" when there is none. Rendered
+// structurally from the `const` declarations the parser banked, not from a source slice: the
+// pattern node's span stops at its type atom, so printing from the span would silently delete
+// every binding. Structural rendering also canonicalizes the spacing.
 function matchBindFmt(bindIx: i32) {
   if bindIx < 0 { return "" }
   const bn = P.nodes[bindIx]
   if bn is Block {
-    let names = ""
-    let i = 0
-    while i < bn.blkStmts.length {
-      const st = P.nodes[bn.blkStmts[i]]
-      if st is LetDecl {
-        if names.length > 0 { names = names + ", " }
-        names = names + st.letName
-      }
-      i = i + 1
-    }
-    return "{" + names + "}"
+    return matchBindGroupFmt(bn.blkStmts, 0, bn.blkStmts.length, 0)
   }
   ""
+}
+
+// The field path a payload binding reads, outermost field first: `const y = s.p.q` over a
+// scrutinee `s` gives `["p", "q"]`. Walks the `Member` chain the parser minted and stops at
+// whatever is not a member, which is the shared scrutinee node.
+function matchBindPath(letIx: i32): string[] {
+  const path: string[] = []
+  const st = P.nodes[letIx]
+  if st is LetDecl {
+    let cur = st.letInit
+    while cur >= 0 {
+      const cn = P.nodes[cur]
+      if cn is Member {
+        path.push(cn.memProp)
+        cur = cn.memObj
+      } else {
+        cur = -1
+      }
+    }
+  }
+  const out: string[] = []
+  let i = path.length - 1
+  while i >= 0 {
+    out.push(path[i])
+    i = i - 1
+  }
+  out
+}
+
+// Renders `stmts[lo..hi)` as one `{ … }` level, where every entry's path shares the first
+// `depth` segments. A run of consecutive entries reaching one level deeper is a nested clause
+// and renders as `field: { … }`; the parser emits a nested group contiguously, so a run is
+// exactly the group the source wrote.
+function matchBindGroupFmt(stmts: i32[], lo: i32, hi: i32, depth: i32): string {
+  let out = ""
+  let i = lo
+  while i < hi {
+    const path = matchBindPath(stmts[i])
+    if path.length <= depth + 1 {
+      if out.length > 0 { out = out + ", " }
+      out = out + matchBindLeafFmt(stmts[i], path, depth)
+      i = i + 1
+    } else {
+      const head = path[depth]
+      let j = i + 1
+      while j < hi && matchBindRunsUnder(stmts[j], head, depth) { j = j + 1 }
+      if out.length > 0 { out = out + ", " }
+      out = out + head + ": " + matchBindGroupFmt(stmts, i, j, depth + 1)
+      i = j
+    }
+  }
+  "{" + out + "}"
+}
+
+// Does binding `letIx` belong to the nested group `head` opened at `depth` — one more segment
+// to go, and this segment equal to the group's? A shallower entry ends the run, which is what
+// keeps `{p: {x}, y}` from swallowing `y`.
+function matchBindRunsUnder(letIx: i32, head: string, depth: i32): boolean {
+  const path = matchBindPath(letIx)
+  if path.length <= depth + 1 { return false }
+  path[depth] == head
+}
+
+// One bound field at this level: `x` when the binding is punned, `x: a` when it renames. The
+// field is the path's last segment, the name is the `const`'s own. Punning is decided by the
+// two nodes sharing a POSITION, not by the names matching, so a same-named rename (`{x: x}`)
+// prints as the user wrote it instead of being collapsed to the punned spelling.
+function matchBindLeafFmt(letIx: i32, path: string[], depth: i32): string {
+  const st = P.nodes[letIx]
+  if st is LetDecl {
+    if path.length != depth + 1 { return st.letName }
+    const field = path[depth]
+    if matchBindIsPunned(st) { return field }
+    return field + ": " + st.letName
+  }
+  ""
+}
+
+// True for a PUNNED binding: the parser mints the `const` at the binding token and the field
+// read at the field token, so one token written means one shared position. A `LetDecl` with no
+// initializer is not a payload binding at all, and answers false.
+function matchBindIsPunned(st: LetDecl): boolean {
+  if st.letInit < 0 { return false }
+  const init = P.nodes[st.letInit]
+  if init is Member { return init.pos == st.pos }
+  false
 }
 
 // A `match` (value- or statement-position): the scrutinee on the header line, then one arm per
