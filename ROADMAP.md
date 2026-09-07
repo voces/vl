@@ -59,7 +59,6 @@ units: **hours** · **half-day** · **days**.
 | 15 | **A-exhaust — the provably-true final discriminant is still emitted** | `wasm-dis`: `(if (i32.eq (struct.get $3 0 …) (i32.const 1)) …)` then `(unreachable)` | `emitIs` (`wasmEmit.vl:2533`) fed by `ifChainExhausts` (`typecheck.vl:22741`) — the analysis exists, only the elision is missing | half-day |
 | 16 | **A6 residue — `is` over two ref arms is a tag compare, not `ref.test`** | `grep -rn "ref\.test" compiler/*.vl` → 0 hits | `emitIs`, `wasmEmit.vl:2533` | half-day (pure perf) |
 | 18 | **B8 — the two `for` gaps that need a RULING, not a build** | objects → `a struct's fields are not a sequence …`; float bounds/step → `a `for` range counts in i32 …`. The other two members BUILT 2026-09-07: `for v, i in xs` / `for k, v in m` and an expression `step` | `open-rulings.md` §B8-for-struct, §B8-for-float-range — each has options, peers and a recommendation; neither is a build until it is ruled | ruling |
-| 19 | **B6a — an i32-keyed map in four container positions** | `const u: {[i32]: f64} \| i32 = 5` → `emitProgram: an i32-keyed Map/Set is supported as … not inside '{[i32]:f64}\|i32'`; same for `[][]`, closure array, map value | `emit_collect.vl:4707 i32MapSpellingLowerable` | days (position matrix, build-then-narrow per D965) |
 | 20 | **A9 — no element-converting / field-dropping container copy** | `Cat[]` into an `Animal[]` param → `…type-valid (structural width subtyping) but not yet supported by codegen…` | `typecheck.vl` refusals + the converting-copy lowering; wire every delivery position BEFORE narrowing the gate | days |
 | 22 | **B-debug — a trap names a wasm function index, not a VL location** | `print(a[7])` → `vl!<wasm function 4>` and `out of bounds array access` with no index and no length | `scripts/vl-host/src/main.rs` trap formatting + the name section | days |
 | 23 | **D9.11 — `///` docs are not rendered in hover** | `server.ts:1002-1004` says so; no doc-text export exists in `compiler/` | `check_query.vl` + `entry.vl` export list, `lsp/src/server.ts` ~1002 | days |
@@ -1250,9 +1249,15 @@ which is why they closed in order rather than in parallel.
   Shipped shape + the three divergences from the charter: `docs/internals/vl-test-design.md`.
 
 **P2 — wanted, not gating:** ~~i32-keyed Map/Set + `for k in map` (B6a)~~ **DONE** for every value
-type the string-keyed rep lowers and every position but a union member (B6b extended the mv slot's
-identity from the VALUE to the (KEY, VALUE) pair, then gave the struct/variant FIELD row the same
-key column); ~~contextual f32 literals~~ **DONE**; ~~`match` phase 2 — variant payload
+type the string-keyed rep lowers and, since 2026-09-07, every CONTAINER position too (B6b extended
+the mv slot's identity from the VALUE to the (KEY, VALUE) pair, then gave the struct/variant FIELD
+row the same key column; the four positions ROADMAP row 19 named — a boxed union member, a nested
+array, an array of map-returning closures and a map value — turned out to need no plumbing at all,
+only the peel their string-keyed twins already had, which a gate-open probe measured before any
+code was written). What the position matrix found INSTEAD is
+[D1861](internals/inventory/D1861.md): a map declared in a module-level BLOCK and captured by a
+closure is check-clean invalid wasm at a string key and a loud reject at an i32 one — not a
+key-rep gap, and the first of the family that is SILENT; ~~contextual f32 literals~~ **DONE**; ~~`match` phase 2 — variant payload
 binding~~ **DONE** (`match cmd { Move{x, y} => … }`, punned fields; renaming + nested destructuring
 measured and deferred — B21 item 1); ~~`match` over an INTEGER scrutinee~~ **DONE** (D1572, the
 consumer ask VL-020 — integer-literal arms and a mandatory `_`; ranges and a `br_table` still
