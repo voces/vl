@@ -373,7 +373,7 @@ descriptor declines, which is exactly how much of the domain the descriptor cann
 | 3 | `vtKindOfType`'s annotation ladder | domain-REMOVING | an annotation node the checker did NOT type | 🟡 15 kinds LEFT-ONLY, **147,945** queries. Deletion REFUSED (§6.3); five missing arms added, CONTRADICT 2,963 → 178 |
 | 4 | the field-code ladders — `fieldCodeOfTy` and its spelling siblings | domain-KEEPING | `fieldCodeOfTy` answers `-2` = *"the spelling ladder owns the rest"* — a NAMED decline, so the domain is explicit | ✅ **DONE** (§6.4): 0 CONTRADICT over 58,428 queries, byte-identical, a FOURTH numbering scheme collapsed into one `fieldCodeOfVKind` table. The domain-WIDENING variant was refused at a price of 8 modules |
 | 5 | the valtype writers — `fbValtype`, `fbValtypeNullable`, `fbRefNullOfKind`, `fbRefNullForKind` | consumers of a `VKind`, not classifiers | a `VKind` member plus its slot | ✅ **DONE** (§6.5), and it corrected this row: a QUARTET not a trio, `fbHeapIdxForKind` does not exist, and three of the four were already `_`-less `match` tables. The fourth is now one too |
-| 6 | the `expr*` family — 48 classifiers, 927 call sites | domain-REMOVING | an EXPRESSION node, which the arena may not have typed (a monomorphized body carries the template's types) | blocked on item 7; convert by AXIS, never alphabetically |
+| 6 | the `expr*` family — 48 classifiers, 931 call sites | domain-REMOVING for its node arms; its ANSWERS mostly already projected | an EXPRESSION node, which the arena may not have typed | 🟡 AUDITED and its residue converted (§6.8): **0 magic rep codes, 89% already `VKind`**, and the 14 raw `fRetKind[fe]` reads now go through `repOfFnSlot`. The 2 left are `localLitUnion`, the literal-union carve-out |
 | 7 | `repOfName` for BINDINGS | new surface | a name plus the frame it is READ in → the declaration → its type | **BLOCKED, and §5.3 states the blocker and the change it needs**: `declaredSlotOf` takes a bare name; `paramTypeNode` and `globalLetOfSidIn` take `fnIx` only as a *frame-binds-this-name veto*. Callee resolution has been frame-aware since D1781; binding resolution never was |
 | 8 | the slot layer — 183 producers over four banks, plus a 13-function consumer rim | **producers: domain-critical, needs the descriptor; rim: consumer** | a nominal table row, whose bank the KIND selects | 🟡 the rim is DONE (§6.6); the producers are the next phase's, blocked on item 7 like item 6 — 54% of them decide a rep from a type or a node, and none is a `match`, because they produce the kind rather than switch on it |
 
@@ -927,6 +927,70 @@ and still blocked on nothing but the work itself. That is a correction to §6.6'
 
 ---
 
+### 6.8 The `expr*` family — the count and the suitability point in OPPOSITE directions
+
+§5.2 ranks this family first among what is left: **48 classifiers, 931 call sites, 31% of every
+classifier call site in the emitter.** Phase 2 started it, and the first thing to measure was
+which member to convert.
+
+**By the census's own criterion — most disagreeing producers — the answer is
+`exprIsLitAtom`: three producers (ARENA + FRAME + TABLE), eight arms, and 71 call sites, the
+most-called `expr*` classifier in the tree.** It is also, measured, the WORST target in the
+family. Every one of its rungs is *specifically about* the atom-versus-string rep, and its own
+comment states the reason: *"a literal union's type does not carry its rep"*. Its answer is the
+one the descriptor **cannot** give until `one-literal-union-rep` is ruled on. Converting it
+would be almost entirely carve-outs. **A ranking by producer count does not rank by
+convertibility, and this is the instance that shows it.**
+
+**So the family was audited instead of picked over.** Every rep-ish site in all 48 classifiers,
+classified by where its ANSWER comes from:
+
+| | before | after | |
+| --- | --- | --- | --- |
+| **PROJECTED** — a producer this campaign converted (`tyKindOf`, `repOfTy`, `repOfNameResult`) | 10 (8.0%) | 10 (9.0%) | |
+| **VKIND** — a comparison against a `VKind` member, already the one vocabulary | 99 (79.2%) | 99 (89.2%) | |
+| **TABLE** — a raw read of a rep column | **16 (12.8%)** | **2 (1.8%)** | ← this PR |
+| **MAGIC** — a bare integer rep code | **0** | **0** | |
+| total sites | 125 | 111 | |
+
+**The headline is the zero.** The `expr*` family carries **no magic-number rep codes at all**,
+and 79% of its rep-ish sites were already `VKind` comparisons *before* this PR — because the
+producers it reads from were converted in the first phase (`tyKindOf` in the census landing,
+`repOfNameResult` with D1834, the field and valtype vocabularies after). **The family is not 48
+unconverted ladders**; it is 48 node ladders whose answers mostly already come from converted
+producers. §5.2's "largest family" is a call-site count, not a conversion backlog, and reading
+it as the latter would have bought a large diff for nothing.
+
+**What was genuinely left was 16 raw table reads, and 14 of them are one shape:**
+`fRetKind[<fe>] == "<kind>"` — a lifted function's stored return kind, read straight out of the
+column at fourteen sites across eleven classifiers, beside the descriptor that already owns
+that column for a NAME. `repOfNameResult`'s tail is exactly that read, so it factors out:
+
+```
+repOfFnSlot(fe)                    the fe-keyed primitive — the three columns, one home
+repOfNameResult(sid, name, fnIx)   = repOfFnSlot(fnIndexOfInScopeSid(sid, name, fnIx))
+```
+
+Every arm stays a gate on the node kind; only the ANSWER moves. **The two remaining TABLE reads
+are `localLitUnion[slot]`**, the literal-union flag, and they stay for `exprIsLitAtom`'s reason
+above — named here rather than converted, because the descriptor cannot answer them.
+
+**Twelve of the fourteen sites read the column with no bounds test**; `repOfFnSlot` guards, so
+an out-of-range slot now returns an uncovered descriptor where it would have trapped. Byte
+identity says no program reaches that path, and `sentinel-index-unguarded` reads **373,
+unchanged** — the read moved into the helper *with* a guard, which is §6.7's rule satisfied
+rather than §6.5's violated.
+
+**Oracle**, both populations, `repOfNameResult`'s flat-versus-scoped bucket after the refactor:
+`tests/cases` CONTRADICT **918 queries in nine modules**, and **all nine are pin-context or
+name-shadowing fixtures** — the modules where the two lookups MUST differ; the corpus reports
+**0**. No new module contradicts, so **no row is owed**.
+
+Byte-identical in **3,177 of 3,177** `tests/cases` modules and **7,589 of 7,589** corpus cells;
+seed **−327 bytes**.
+
+---
+
 ## 7. What the campaign's first phase measured
 
 Six landings. This section is the phase's own scoreboard, and it is written so the next
@@ -1009,6 +1073,55 @@ specified is not owed. What `expr*` needs is the descriptor reaching an expressi
 what stands in the way is only the work itself: each of its four axes is a domain-keeping
 conversion of arms that decide a rep, beside syntactic arms that must stay because the arena
 has no type for their nodes. **The next family can start; it just cannot start by deleting.**
+
+---
+
+### 7.6 The four clamped-to-`0` slot producers — what `rdCovered == 0` needs, precisely
+
+§6.6 named these four and §6.7 corrected who unblocks them; this states the build so the next
+lane does not re-derive it.
+
+**The four, and what each clamps.** All four answer a REF-LIST slot — an index into bank B,
+whose key column is `rlElemName` and whose heap-type column is `rlWrapIdx`:
+
+| producer | its miss today |
+| --- | --- |
+| `letAnnRefListSlot(letIx)` | falls through to `tyAnnRefListSlot(d.letType)`, and returns a bare `0` for a non-`LetDecl` |
+| `tyAnnRefListSlot(tyIx)` | a bare `0` |
+| `refListSlotOfExpr(exprIx, fnIx)` | `rlSlotByName(refListElemNameOfExpr(…))`, then **clamped**: a `-1` becomes `0` |
+| `globalRefListSlot(letIx)` | `letRefListSlot(letIx, -1)`, then `if s < 0 { return 0 }` |
+
+**The reader they all bottom out in is `rlSlotByName`** (`compiler/emit_classify.vl`), which is
+`rlSlotByNameTyK(name, -1, -1)`: four sequential rungs over bank B — an exact `rlElemName`
+match, an `rlElemKey` structural scan, `rlSlotOfTyTwin`, then a rendered `structIndexOfTypeName`
+bridge — ending in a real `-1`. **The decline exists and is honest at the bottom; it is lost at
+the top**, where each of the four turns it into slot `0`.
+
+**Why `0` is not a missing answer.** Slot 0 is a real row with a real wrapper heap type. The
+code says so itself: *"0 is a wrong answer, not a missing one — two such globals would
+otherwise share slot 0's wrapper wrongly. D1040."* Two more rows name the same shape at their
+own positions (D1106; D1500, where a slot clamped to 0 indexed an EMPTY table and trapped).
+
+**What the build needs, in order:**
+
+1. **The callers already test a decline.** `refListSlotOfExprStrict` is the unclamped twin of
+   `refListSlotOfExpr` and returns `-1` today, so a `-1`-tolerant path exists and is exercised.
+   The work is to find, per call site of the four, whether the consumer tests `>= 0` or indexes
+   blind — the clamp exists because some consumer indexes blind, and that consumer is what must
+   move first.
+2. **The decline must be `rdCovered == 0`, not `-1`.** A bare `-1` is the in-band sentinel one
+   level down; the descriptor's `repDescNone()` already carries "no answer" out of band, and
+   `repOfTy`'s `rdSlot` is where a ref-list slot belongs once bank B is a descriptor field.
+3. **`repOfTy` fills `rdSlot` for `TyObj` alone today** (from `repSlotOfTy`). Bank B is not
+   wired to it at all, so this is a genuine widening of the descriptor, not a re-routing — and
+   by §5.0's bar it is domain-KEEPING only if every current `0` answer that a program reaches
+   keeps answering `0`. Byte identity over both populations is what decides that, and a
+   difference is a price to name, not automatically a defect.
+
+**What it is NOT blocked on.** Not the binding surface (§6.7 refutes that), and not a ruling.
+It is blocked only on the work, and on step 1 being done first — narrowing the clamp before the
+consumers can take a decline is the §6.4 mistake in its other direction.
+
 
 ---
 
