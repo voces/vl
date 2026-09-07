@@ -35,6 +35,7 @@ import {
   type LspRange,
   memberCompletionsFromWasm,
   scopeCompletionsFromBindings,
+  typeCompletionsFromWasm,
   SEMANTIC_TOKEN_LEGEND,
   semanticTokensDataFromWasm,
   snippetCompletions,
@@ -475,6 +476,14 @@ export const completion = async (
     byName.set(c.name, c);
   }
   for (const c of scopeCompletionsFromBindings(bindings)) byName.set(c.name, c);
+  // The TYPE namespace, on the same terms `server.ts` adds it: never over a name a value
+  // already took.
+  const typeNames = await checker
+    .typeNamesAt(text, entryKey, reader)
+    .catch(() => []);
+  for (const c of typeCompletionsFromWasm(typeNames, (n) => byName.has(n))) {
+    byName.set(c.name, c);
+  }
   const identifiers = [...byName.values()].map(toCompletionItem);
   const keywords = keywordCompletions(false).map(toCompletionItem);
   const snippets = snippetCompletions(false).map(toCompletionItem);
