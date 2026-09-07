@@ -537,13 +537,13 @@ already-written policy rather than defect:
   modules — the **numeric literal-union base collapse**. `type N = 1 | 2` reps as its base
   scalar; `repOfTyFlat`'s `TyUnion` arm deliberately declines it ("the atom-vs-base split is
   alias-ness, checker metadata rather than structure"). The conversion keeps the collapse as
-  an explicit leg, and **§8's first ruling is exactly this line**.
+  an explicit leg, and **§9's first ruling is exactly this line**.
 * `descriptor-only`, 177,236 queries in 20 kinds — `struct`, `union`, `closure`, `map`,
   `reflist`, every nullable niche. The ladder never spoke for those shapes and its consumers
   compare `== <code>`; answering a code they have no arm for would be a new answer, not the
   same one. The conversion keeps the decline as the function's stated DOMAIN.
 
-Two of those declines are carve-outs written into the converted function and cited to §8,
+Two of those declines are carve-outs written into the converted function and cited to §9,
 because a ruling could retire either:
 
 * `void` — the one prim `repOfTy` reps (as the ladder fallthrough `i32`) and this vocabulary
@@ -1357,7 +1357,98 @@ argument reader, before any pin is consulted, so the re-key does not reach it.
 
 ---
 
-## 8. Two design simplifications the campaign should be ruled on
+## 8. What the campaign's second phase measured
+
+Phase 1 (§7) converted five families and stated the bar. Phase 2 converted two more, REFUTED
+one prerequisite, audited the largest family without converting it, and closed the clamp §7.6
+opened — the last of those taking three PRs and two wrong diagnoses to get right.
+
+### 8.1 Families converted or measured
+
+| family | what happened | where |
+| --- | --- | --- |
+| the binding surface | **REFUTED.** §5.3 named it `expr*`'s blocker; four witnesses show binding resolution is already frame-correct by three separate routes, and the surface is not owed | §6.7 |
+| `expr*` | **AUDITED, not converted.** 48 classifiers over 931 call sites, **zero magic rep codes**, 79% of rep-ish sites already `VKind` comparisons; the 16 raw table reads go to 2 | §6.8 |
+| the valtype quartet | `fbRefNullForKind` converted; all four members are now `_`-less `match`es over the 31-member set | §6.5 |
+| the slot layer | **SURVEYED.** Only its RIM converts; `armDestHeapOf` became a `_`-less `match` with 27 declining members named | §6.6 |
+| the clamped ref-list slot | **NARROWED, as a no-op.** Four producers to one, then the clamp removed once the element name resolved | §7.6–§7.8 |
+| the hole-pin table | **RE-KEYED per owner.** 21,186 false poisonings to zero, byte-identical, LATENT | §7.9 |
+
+**The clamp is the phase's cautionary result.** §7.7 vetoed the narrowing and named the blocker
+as a type variable rendering as `""`; §7.8 probed the clamp instead of reading around it and
+found the annotations already concrete and the pin **POISONED**, with the empty name coming from
+two ordinary rungs where the arena and the spelling disagree about one type. The veto was right
+and its diagnosis was wrong, and only a probe separated them.
+
+### 8.2 The bar, in its four forms and two new rules
+
+§7.3 found the bar in three forms. Phase 2 added a fourth:
+
+1. Do not REMOVE a domain.
+2. Do not WIDEN a domain.
+3. Do not move a GUARD out of reach of the lint that verifies it.
+4. **Byte identity and the oracle are not interchangeable.** A conversion can be byte-identical
+   while changing what a classifier ANSWERS, and it can move bytes while answering the same
+   thing. Both readings are required and each names a different failure.
+
+And two rules the phase earned by getting them wrong first:
+
+* **A signature that does not take a frame is not thereby frame-blind.** §5.3 read
+  `declaredSlotOf(name)` and `paramTypeNode(fnIx, name)` as frame-blind from their parameter
+  lists and built a prerequisite on it; four witnesses refuted it, because the resolution runs
+  through the ambient scope stack rather than the argument. **Test a claim about reach with a
+  program, not with a signature.**
+* **De-duplicate a guard only by moving the READ with it.** §6.5's guard-fold left the read
+  behind, and `sentinel-index-unguarded` went 0 → 21 — correctly, because the guard and the
+  read had been separated. This is form 3 seen from the other side.
+
+### 8.3 The two rulings, re-denominated
+
+* **`one-literal-union-rep` is now denominated in the SITES that carry a carve-out**, because
+  every converted family inherits one and a query count in one place understates it. Four
+  stand: `tyKindOfDesc`'s numeric-literal-union base collapse (1,503 queries in 48 modules) and
+  its string-literal-union array element; `vtKindOfType`'s only surviving contradiction,
+  unclosable within its domain; and the field-code family's **eight running programs**. The cost
+  grows with the campaign, not with the corpus.
+* **`nullable-rep-rule-stated-once`: option (b) is delivered and measured.** All four valtype
+  writers — `fbValtype`, `fbValtypeNullable`, `fbRefNullOfKind`, `fbRefNullForKind` — are
+  `_`-less `match`es over the 31-member set, so a twelfth nullable shape breaks the self-compile
+  instead of falling through. Measured price: **+120 bytes, zero CPU, byte-identical output.**
+  That is the safety (b) promised, bought. Option (a) — deriving `rdNul` from the inner
+  descriptor — is untouched and remains the better end state.
+
+### 8.4 Seed, and the landings that were not priced
+
+Two phase-2 landings were priced at the fixpoint: D1835's close **+58 bytes** and the pin
+re-key **+3,898 bytes**, so **+3,956 bytes across the two that were measured**. Against the
+committed baseline the tree reads **2,333,335 B, +0.17%**, well under the +3% trip.
+
+**Three of the phase's five compiler landings were not separately priced, and that is recorded
+rather than hidden.** The seed ratchet exists because +8.8% across four landings was noticed
+only when a peer asked; a campaign that prices two of five has the same exposure at a smaller
+scale. Phase 1 summed six landings to **+4,073 bytes** and phase 2 cannot honestly match that
+sentence. **Phase 3 prices every landing at the fixpoint.**
+
+### 8.5 What phase 3 would be, and its one prerequisite
+
+The conversions with real leverage are the domain-REMOVING ones, and every one is blocked on the
+same thing: **the descriptor's coverage gap — the LEFT-ONLY column, 147,945 queries over 15
+kinds**, headed by `reflist` (111,683 queries in 876 modules), `i32` (17,358), `map` (4,437),
+`union` (3,358) and `str` (3,233).
+
+While a kind is in that column the ladder is load-bearing exactly where the descriptor declines,
+so the ladder cannot be deleted. §6.3 is the worked proof: deleting nine rungs that never appear
+in LEFT-ONLY is byte-identical on both populations, and the oracle still refused it, reading
+CONTRADICT 2,963 → 204,539.
+
+So phase 3 is **close the LEFT-ONLY column kind by kind, largest first, then delete** — `reflist`
+alone is 76% of the gap. Each kind covered makes one family deletable; none is deletable before
+its kind is covered. That ordering, not the classifier count, is what decides how much of the
+ladder ever goes away.
+
+---
+
+## 9. Two design simplifications the campaign should be ruled on
 
 Both are filed in `docs/internals/open-rulings.md` §D with options, peers and a
 recommendation. Neither is decided here.
@@ -1376,7 +1467,7 @@ recommendation. Neither is decided here.
 
 ---
 
-## 9. Where the numbers come from
+## 10. Where the numbers come from
 
 | number | instrument |
 | --- | --- |
