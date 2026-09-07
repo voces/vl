@@ -657,6 +657,10 @@ BEFORE  AGREE  931385  LEFT-ONLY  147945  CONTRADICT   2963  (6 classes)
 AFTER   AGREE  934170  LEFT-ONLY  147945  CONTRADICT    178  (1 classes)
 ```
 
+**That `178` is a reading from 2026-09-06 and is no longer current: both populations read
+CONTRADICT `0` on 2026-09-07** (§9.3), so the campaign's standing bar — a rise is a row — holds
+against zero. The block above is left as the instrument printed it.
+
 Byte-identical in `3,154 of 3,154` and `7,589 of 7,589`. **It is hygiene, not a `runs` move**:
 no program was found that reaches the ladder at those shapes, and the arm's own control is the
 oracle, where it fires 2,785 times.
@@ -1521,14 +1525,46 @@ master vs candidate   tests/cases 3207/3207   distilled 7589/7589   DIFFERING FI
 `rep-fuzz-check.sh` exact, `regress.py` no cell changed class, `mono-tyaram-grid` 161 OK /
 100 REJECT / **0 BAD**.
 
-### 9.5 What is left in the column
+### 9.5 The second landing — the NESTED ARRAY element
 
-**15,872 `reflist` queries over ~217 modules**, in the order a next landing should take them:
-the NESTED ARRAY element (8,133 / 106 modules), the NULLABLE element (4,273 / 42), the
-VALUE-UNION-BOX element (3,167 / 82). The nested-array arm is the natural next one — the rep
-tree already recurses into it (`rtGo`'s list arm builds a child), so the work is the flat arm
-and the two projections again rather than new machinery. **No rung is deletable yet**: deletion
-needs the column empty for the kind, and `reflist` still has three reasons in it.
+The census was re-run on the post-map tree rather than reusing §9.1's numbers, and it confirms
+the first landing closed exactly what it claimed: **the MAP reason reads zero**, and the column
+is 15,872 over 224 modules, split 8,133 / 106 nested array, 4,273 / 42 nullable, 3,167 / 82
+value-union box, 133 / 6 other union, 166 / 1 no-recorded-type.
+
+A list is a reference too, so a list OF lists is a ref list — again the ladder's own answer, and
+again three lines: the flat arm plus both tree projections. It can only fire for a non-nullable
+outer (`T[][]`), since a nullable array is a `TyNullable` that `repOfNullable` owns, so it
+cannot reach the `nulreflist` answers the same probe reports.
+
+| | `tests/cases` before → after | corpus before → after |
+| --- | --- | --- |
+| AGREE | 390,900 → **396,109** | 204,522 → **207,446** |
+| LEFT-ONLY (all kinds) | 52,260 → **47,051** | 5,894 → **2,970** |
+| LEFT-ONLY (`reflist`) | 12,136 → **6,927** | 3,736 → **812** |
+| CONTRADICT | 0 → **0** | 0 → **0** |
+
+**`reflist` LEFT-ONLY falls 15,872 → 7,739, −8,133**, and the fall equals the census in EACH
+population separately — 5,209 in `tests/cases`, 2,924 in the corpus — not merely in the total,
+which is the stronger form of the check: a total can match while two populations move in
+compensating directions. Byte-identical in **3,207 of 3,207** and **7,589 of 7,589**;
+`rep-fuzz` exact, `regress.py` no cell changed class, `mono-tyaram-grid` 161 OK / 100 REJECT /
+0 BAD.
+
+### 9.6 What is left in the column
+
+**7,739 `reflist` queries over ~130 modules**: the NULLABLE element (4,273 / 42), the
+VALUE-UNION-BOX element (3,167 / 82), other union (133 / 6) and one module with no recorded
+type (166). The nullable element is the next landing, and it is `repOfArray`'s tail as well — the first
+draft of this paragraph said `repOfNullable` owns it, which reading the code refutes: an
+array whose ELEMENT is nullable never reaches `repOfNullable`, it falls past the union arm to
+the same tail the map and the nested array fell past. Whether it is the same three lines
+depends on the element word and on whether `rtListVKind` needs a `nul` arm, and that is a
+measurement, not a prediction.
+
+**No rung is deletable yet**: deletion needs the column empty for the kind, and two reasons
+remain. The two landings so far have moved 104,792 of the 112,531 queries the column held for
+`reflist` (93%), and every one of them arrived in AGREE.
 
 ---
 
@@ -1659,7 +1695,47 @@ widening doing exactly what it is for.
 
 **17 sites remain nominal, in two groups.** Twelve never received a structural name in either
 population — converting them is the no-op with risk the plan warned about, and they stay until
-one does. Five are refused by witness: the four in §11.2 and `refArrShapeKindGo` in §11.3. Each
-needs its own fix, not a wider gate; the trap in `elemNameIsNominalAt` is the one worth a row
-first, since a compiler trap is a defect wherever it comes from.
+one does. Five are refused by witness: the four in §11.2 and `refArrShapeKindGo` in §11.3. They are
+taken one per PR; §11.5 settles the first, and it did NOT need a fix.
+
+### 11.5 `elemNameIsNominalAt` — settled as a DESIGN rule, and pinned (D1857)
+
+The trap was the loudest of the five, so it went first. It is not a mechanism to fix: the site
+must stay nominal by construction, and the row that says so is a refutation pin rather than a
+defect.
+
+**The predicate is ABOUT nominality.** Its contract, in its own words, is *"is the element name
+`en` one `repElemKey` keys nominally? Those are the names a structural row cannot stand in
+for."* `structIndexOfTypeName` answers by matching a structural shape TO a row — precisely the
+case whose answer must be `false`. Converting the site does not widen the predicate, it
+INVERTS it: a structurally-spelled element gets a nominally-keyed slot pointing at its
+structural twin, and `mAssignTypeIndices` then indexes a table with it. The rung's own comment
+had already priced this — *"a wrong hint is a silently wrong slot"* — and the trap is that slot
+one hop later.
+
+**Measured at the rung.** With the site left unconverted and a shadow-gated note beside it, the
+name it would flip on is `repAB/elemNominal would-flip -> {r:{c2:i32}|{s2:i32}} x2`, the
+structural rendering of `Circle`. Read off the code this would have been a guess; the reading
+is what makes it a ruling.
+
+**The ablation names one ingredient.** Of the eight `named/d361e0136*` cells, one minimises to
+13 lines, and only a **module-global binding whose type is the map ALIAS** is load-bearing.
+The union field, the nested struct, the binding hop, and whether the local is spelled inline or
+by the alias are all scenery — each still traps when removed.
+
+So the site is closed, not scheduled. `tests/cases/maps/map-alias-global-struct-elem-nominal-pin.vl`
+prints `7` and must keep doing so; it flips the day someone converts this rung.
+
+**And three instruments failed before one worked**, which is worth more than the row:
+
+| probe | why it said nothing |
+| --- | --- |
+| `repABNote` at the converted site | the compile TRAPS, and `repLadderABSweep` drains at the END of `emitProgram` — the process dies first |
+| `print` at the converted site | the compiler-as-seed has no print import; the seed would not load (`unknown import: __print_i32__`), so its silence was about the seed, not the rung |
+| `repABNote` at the UNCONVERTED site | works — a compile that finishes is the only one that drains |
+
+The rule underneath is CLAUDE.md's, seen from a third side: **never trust a probe until a
+control you know should trigger it does.** Two of these three reported zero on a program that
+provably reaches the rung, and only a control separated "the rung did not fire" from "the
+instrument cannot speak."
 

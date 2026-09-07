@@ -54,7 +54,6 @@ units: **hours** · **half-day** · **days**.
 | 18 | **B8 — the two `for` gaps that need a RULING, not a build** | objects → `a struct's fields are not a sequence …`; float bounds/step → `a `for` range counts in i32 …`. The other two members BUILT 2026-09-07: `for v, i in xs` / `for k, v in m` and an expression `step` | `open-rulings.md` §B8-for-struct, §B8-for-float-range — each has options, peers and a recommendation; neither is a build until it is ruled | ruling |
 | 20 | **A9 — no element-converting / field-dropping container copy** | `Cat[]` into an `Animal[]` param → `…type-valid (structural width subtyping) but not yet supported by codegen…` | `typecheck.vl` refusals + the converting-copy lowering; wire every delivery position BEFORE narrowing the gate | days |
 | 22 | **B-debug — a trap frame names `function@file:line`; the LINE is the DECLARATION's, not the trapping instruction's (2026-09-07)** | `print(a[7])` → `vl!__start__@1`; a two-file program → `vl!boom$m1@lib.vl:1` and `vl!__start__@main.vl:1`. The message still carries no index or length, and a frame still cannot say WHICH line inside the function trapped | the per-instruction map is what remains: a name-section string is per FUNCTION, so the trapping line needs a real source map (a custom section the host reads) — and the host would then change, with the three-hosts rule | days |
-| 23 | **D9.11 — `///` docs reach HOVER; COMPLETION's `doc` field is still filled by nobody** | hover renders them in the editor and the playground (2026-09-07); `Completion.doc` in `lsp/src/typeFeatures.ts` is documented as the declaration's `///` block and no wasm-path producer sets it, so the completion panel shows the type alone | `symScopeAt` already banks the decl token per result (`scopeResTok[i]`), so `symScopeDoc(i)` is one accessor pair over the `docRunAbove` the hover query built, plus the `scopeAt` bridge and the scope→completion mapping | hours |
 | 24 | **dogfood `match` over the compiler's own kind ladders** | the `Ty` set is DONE in the two biggest files: `emit_collect.vl` 38 → 32 (six) and `emit_classify.vl` 134 → 108 (twenty-six), all `_`-less with every member named, every output population byte-identical. The per-file table of what is left and why is `kind-ladder-lint.md` §Where the `Ty` set ran out | remaining: `typecheck.vl` (152) is unsurveyed; `VKind`'s 31, `RtKind`'s 15 and `EqCmpKind`'s 17 each need the sub-domain-litunion ruling before a 31-arm match is honest; `Node`'s 38 is excluded by the rule. `ladder-budget.py` reads 401 + 8 today | days |
 | 25 | **structural-tolerant emitter (rep architecture step 1)** — **20 of 37 caller sites CONVERTED; 17 remain and each has a measured reason** | the migration criterion is per site and is now measured, not guessed: a per-site oracle over 10,793 modules says 25 sites receive a structural name the nominal resolver declines, 12 never do. Of the 25, **20 convert byte-inert** and 5 are held back by witness — 4 lose builds, 1 moves a diagnostic | `emit_classify.vl`; the five held-back sites and their witnesses are `rep-descriptor-campaign.md` §11 | half-day for the five, each needs its own fix |
 | 27 | **E3 — user wasm runs on the playground's MAIN thread** | `playground/src/runtime.ts:21` instantiates there; `main.ts:36` says so | `playground/src/{runtime,playground,main}.ts` | days |
@@ -62,6 +61,7 @@ units: **hours** · **half-day** · **days**.
 | 29 | **F-day-one — four grammar axes still absent** | `day-one-sampler.md`: operator overloading, multi-param generics, recursive types, mixed-width arithmetic (`match` landed as a `narrowing` SPELLING, D1885/D1886) | `scripts/day-one/grammar.py` | half-day per axis |
 | 30 | **Dogfood the orchestrator scripts onto the host ABI** | the ABI is COMPLETE (`std:process` `run`/`exit`, `std:env` `getEnv`, in all three hosts); 34,029 lines of Python and 2,536 of shell still do the work | `scripts/*.py` one port at a time; `scripts/seed-size.vl` is the first and is live, and the SECOND (`check-filed-witnesses.py`) is blocked on the three `dogfood:` rulings below | days |
 | 31 | **A-destructure — `let`/`const` and PARAMETER destructuring (owner ask, 2026-09-06 night; not scheduled)** | `const { x, y } = p`, `const [a, b] = xs`, `function f({ x, y }: Pt)` → `parse error … expected an identifier but found `{``; the `match` payload clause (pun, rename, nest — #2837) is the only destructuring today | `parser.vl` (a pattern in binding and parameter position, the payload clause's grammar reused), `typecheck.vl` (binding types from the pattern; for an UN-ANNOTATED parameter the pattern is a shape constraint `{a: ?, b: {c: ?}}` with hole leaves closed at the pin — the inference half is a second step), `format.vl` (byte-for-byte round trip), the desugar (one `const` per leaf, the `match` prelude's shape); list destructuring wants the multiple-returns question in `docs/guide/lambda-param-skip-design.md` answered first | days |
+| 32 | **the completion surfaces `///` docs do NOT reach: a user `type` NAME, a struct FIELD, a UFCS candidate** | measured 2026-09-07 with the docs wired for in-scope bindings: `type Pt` documented and in scope is offered as no completion item at all (`symScopeAt` records variable/parameter/function bindings only), and `p.` over a `Pt` whose `x` carries a `///` returns `x` with the bare fence | the type half is a NEW completion source, not a doc gap; the field half needs `memc*` to bank a declaration token the way `scopeResTok` does; the UFCS half is the cheapest — `ufcTok` already banks one, so it is `docRunAbove` over it | hours each |
 
 ### Open items that need an owner ruling first — listed, not decided
 
@@ -1652,8 +1652,20 @@ in-language GC knobs.
         which is what separates "the number went down" from "it went down for the reason I
         think". Byte-identical on both populations, which is the whole claim, since coverage is
         §5.0's domain-WIDENING form. **CONTRADICT is 0, not the 178 this campaign quoted** —
-        that predates #2857. Remaining: nested array, nullable, value-union-box elements; no rung
-        is deletable until the column is empty for the kind.
+        that predates #2857, and §6.3's block now carries the dated correction.
+        **SECOND LANDING: the NESTED ARRAY element.** A list is a reference too, so a list OF
+        lists is a ref list — the same three lines, and it can only fire for a non-nullable outer
+        since `repOfNullable` owns the rest. The census was re-run on the post-map tree rather
+        than reused, and confirms the first landing closed exactly what it claimed (the MAP
+        reason reads zero). **`reflist` LEFT-ONLY falls 15,872 → 7,739, −8,133, and the fall
+        equals the census in EACH population separately** (5,209 `tests/cases`, 2,924 corpus) —
+        the stronger form of the check, since a total can match while two populations move in
+        compensating directions. CONTRADICT 0, byte-identical on both, rep-fuzz exact,
+        `regress.py` unmoved, mono-grid 0 BAD. Across the two landings **104,792 of the 112,531
+        queries (93%) have left the column, every one into AGREE.** Remaining: the NULLABLE
+        element (4,273 / 42 modules — `repOfArray`'s tail as well, not `repOfNullable`'s: an
+        array with a nullable ELEMENT never reaches that function), the value-union box
+        (3,167 / 82), other union (133), one no-recorded-type module (166). No rung is deletable until the column is empty for the kind.
         `docs/internals/rep-descriptor-campaign.md` §9.
      Two owner rulings gate how far items 2 and 6 can go: `one-literal-union-rep` and
      `nullable-rep-rule-stated-once` (`docs/internals/open-rulings.md` §D).
