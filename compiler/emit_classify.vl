@@ -1811,6 +1811,27 @@ export function letNulMapReadUnionBox(letIx: i32, fnIx: i32) {
   false
 }
 
+// Whether ref-list slot `slot` holds a value-union BOX element (kind 2). Its `T | null` has
+// no niche — the box carries `null` as a tag — so a checked read of one binds the box and
+// the miss arm builds the null-tagged box rather than a typed `ref.null` (D1825).
+export function popUnionBoxElem(slot: i32): boolean {
+  if slot < 0 { return false }
+  if slot >= rlElemKindTbl.length { return false }
+  rlElemKindTbl[slot] == 2
+}
+
+// A `let` whose initializer is a checked read (`.pop()` / `.get(i)`) over a ref list of
+// value-union boxes: the cell is the box, `null` riding as its tag, so the binding takes the
+// `union` kind rather than falling through to the i32 default (D1825).
+export function letPopUnionBoxElem(letIx: i32, fnIx: i32): boolean {
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 { return false }
+    return popUnionBoxElem(popRefRecvSlot(d.letInit, fnIx))
+  }
+  false
+}
+
 // The ref-list element kind a checked read over a nested list yields, or -1 (D1210).
 // `xs.pop()` over an `i32[][]` is `i32[] | null` to the checker and the popped value is the
 // inner list's wrapper, so each nullable-list classifier claims it at its own element kind.
@@ -13488,8 +13509,15 @@ export function pushPostGuardNarrow(stmtIx: i32, fnIx: i32) {
   let jr = joinHeadOf(stmtIx)
   while jr >= 0 {
     const jn = joinRowName(jr)
+    const jt = joinRowTy(jr)
     retireNarrowFor(jn)
-    pushNarrowWriteReNarrow(jn, joinRowTy(jr), unionNameOfIdent(jn, fnIx))
+    if !pushNarrowWriteReNarrow(jn, jt, unionNameOfIdent(jn, fnIx)) {
+      // A PATH key resolves no union NAME here — the join has only the key string, and the
+      // field's own spelling lives at the write. Push the arena type instead, which is what
+      // `narrowedValueAtomOf` reads first; a multi-member join names no atom and stays boxed,
+      // which is the answer the checker's own join gives it too (D1849).
+      pushNarrowJoinTy(jn, jt)
+    }
     jr = joinRowNext(jr)
   }
   // An arm that wrote a different member into a name the residual describes falsifies it,
@@ -26545,6 +26573,13 @@ export function unionNameOfExpr(exprIx: i32, fnIx: i32) {
   }
   if e is Call {
     const callee = P.nodes[e.callFn]
+    // `xs.pop()` / `xs.get(i)` over a value-union ref list: the read's `T | null` IS the
+    // box, `null` riding as its tag, so the element's union name is what makes a narrowed
+    // read unbox rather than hand its consumer the raw box ref (D1825).
+    if callee is Member {
+      const pus = popRefRecvSlot(exprIx, fnIx)
+      if popUnionBoxElem(pus) { return rlElemName[pus] }
+    }
     if callee is Ident {
       const t = fnIndexOfSid(sidOfNode(e.callFn))
       if t >= 0 {
@@ -28015,6 +28050,19 @@ function pushNarrowWriteReNarrow(name: string, ty: i32, un: string): boolean {
   if txt == "" { return false }
   pushNarrowRep(name, txt, -1, r)
   true
+}
+
+// Push an arm JOIN whose key names no union spelling — a property path. The narrowing carries
+// the arena TYPE alone, exactly as an `is` pin does, so `narrowedValueAtomOf` answers from the
+// type and a join with no single atom simply reads at the box (D1849).
+function pushNarrowJoinTy(name: string, ty: i32) {
+  if ty < 0 { return 0 }
+  const pn = tyPrimNameOf(ty)
+  let sp = ""
+  if pn != null { sp = pn }
+  if sp == "" { return 0 }
+  pushNarrowRep(name, sp, ty, -1)
+  0
 }
 
 // The interned set a binding is currently narrowed to — the set-ADT reading of
