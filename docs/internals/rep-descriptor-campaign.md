@@ -1942,3 +1942,73 @@ D1859); `structIndexOfExpr` precedence (§11.8, D1920); `structIndexOfExpr#2` un
 widening (§11.8, comment only). **Not one of the five was a rep gap.** `refArrShapeKindGo`
 — the diagnostic-mover of §11.3 — is the last unexamined one.
 
+## 12. Row 25 closed out — five sites, six shapes, and not one rep gap
+
+### 12.1 `refArrShapeKindGo` — the widening the population DOES exercise, refused anyway (D1921)
+
+The last of the five, and the only one whose conversion domain is entered at all. The site is
+the nullable-struct niche arm of the paren-union element resolver, and converting it resolves
+an inline-shape nullable element to the kind-1 niche a declared name already gets.
+
+**It clears §11.8's bar.** `WOULD-FLIP` **26** in `tests/cases` and **3** in the corpus, against
+`reached-nominal-hit` 177/12. Byte identity is not vacuous here.
+
+**And it gains nothing on its own.** Zero builds gained over 10,801 modules; `DIFFERING FILES` 1
+(`differ/output SAME`) and 0; one diagnostic moved, the wrong way:
+
+| | message |
+| --- | --- |
+| base | `a nullable-{f:()=>string} list element has no rep; use a non-null element type` |
+| converted | `callee is not a function name` |
+
+All three faces of the plain shape — inline, declared, inferred — already run, so nothing needed
+the conversion on its own. Converting lets the element resolve and the program refuses one layer
+deeper. **A refusal moved deeper is not a program that runs.**
+
+**The prerequisite was named wrong here and the correction is the point.** This section first
+called the closure-field CALL the blocker; twelve call positions all run, so that layer is
+built. The blocker is a two-renderings mismatch: the same arm answers **kind 2** for a LAMBDA
+binding's declared result and **kind 1** for the named-function and direct-binding spellings of
+the identical name `({f:()=>string}|null)[]`, because the lambda's declared result interns its
+element under a rendering `structIndexByName` does not look up. So this conversion is exactly
+the fix D1922 needs — the field-set scan finds the row the exact-spelling lookup misses — and
+the two land together. (unfiled: D1922 — filed with the composition PR.)
+
+### 12.2 The closing table
+
+| site | shape | ruling |
+| --- | --- | --- |
+| `elemNameIsNominalAt` | predicate ABOUT nominality | conversion INVERTS it (§11.5, D1857) |
+| `rlElemStructRow` | rung 2, bridge already at rung 4 | PRECEDENCE (§11.6, D1858) |
+| `rlElemLitStructRow` | seeds the override for a field-shape match | CIRCULAR (§11.7, D1859) |
+| `structIndexOfExpr` | rung 1, bridge already at rung 3 | PRECEDENCE (§11.8, D1920) |
+| `structIndexOfExpr#2` | reached 1,922×, flips 0× | UNEXERCISED widening (§11.8) |
+| `refArrShapeKindGo` | flips 29×, gains 0 builds ALONE | EXERCISED; the fix for D1922, and only in combination with it (§12.1, D1921) |
+
+Five sites, six shapes, and **not one of them a rep gap**. The campaign's premise for row 25 was
+that these were unmigrated lookups awaiting a bridge; every one turned out to be a rung doing a
+job, and the jobs differ.
+
+### 12.3 What the oracle's RIGHT-ONLY column now means
+
+It answers *"would the structural resolver answer where the nominal one declined?"* — and §11.6
+through §12.1 show that is **not** the migration question. Three readings have to be separated:
+
+1. **RIGHT-ONLY > 0** says a structural name reaches the site. It says nothing about whether the
+   nominal call is a gap or a rung. Where the enclosing function already names
+   `structIndexOfTypeName`, it is a rung with a precedence — one grep finds those.
+2. **WOULD-FLIP** is the conversion's own domain. `DIFFERING FILES: 0` with `WOULD-FLIP: 0` is
+   *untested*, not safe (§11.8).
+3. **Builds gained** is the only column that says the conversion is worth taking. §12.1 clears
+   (1) and (2) and fails (3).
+
+The oracle stays the discovery instrument; it was never the decision.
+
+### 12.4 The standing measurement
+
+Of the 37 caller sites the campaign started with, **20 converted** (tranche 1, byte-inert with
+the diagnostics grader clean on both populations), **5 are ruled above**, and **12 never
+received a structural name in either population**. Those twelve are the standing measurement,
+not a backlog: re-run the per-site oracle and convert one the day its RIGHT-ONLY column moves
+off zero — and then grade it on all three readings, not the first.
+

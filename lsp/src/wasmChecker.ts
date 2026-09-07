@@ -190,6 +190,18 @@ export const WASM_LEX_STRING = 5;
  * the rendered type string, empty when the binding has no retained type. The
  * native set covers only USER bindings — builtins/imports/types stay host-side.
  */
+/**
+ * One `type` NAME the cursor may complete to — this file's own top-level declarations plus
+ * the ones it imports. `detail` is the rendered body, EMPTY for an imported type (the merge
+ * renames the declaration, so the checker has no entry under the local spelling); `doc` is
+ * the declaration's `///` block (D9.11), which reaches an imported type all the same.
+ */
+export type WasmTypeName = {
+  name: string;
+  detail: string;
+  doc?: string;
+};
+
 export type WasmScopeBinding = {
   name: string;
   kind: number; // 0=variable 1=parameter 2=function
@@ -530,6 +542,15 @@ export type WasmChecker = {
     line: number,
     character: number,
   ) => Promise<WasmScopeBinding[]>;
+  /**
+   * The `type` NAMES offerable at the cursor. Empty when the seed predates the export, so
+   * the host offers what it offered before this existed: nothing of the type namespace.
+   */
+  typeNamesAt: (
+    source: string,
+    entryKey: string,
+    read: ModuleReader,
+  ) => Promise<WasmTypeName[]>;
   /**
    * Member-completion (kill-TS): the members of the receiver whose binding is
    * under (`line`, `character`) — both 0-based, LSP — a struct receiver's fields
@@ -1385,6 +1406,39 @@ export const createWasmChecker = (
     typeof exp.memberScanNameLen === "function" &&
     typeof exp.memberScanIsFn === "function";
 
+  // The type-name exports are newer than the scope ones, so a seed can speak scope and not
+  // this; the method then yields [] and the host offers no type items.
+  const hasTypeScan = (exp: Exports): boolean =>
+    typeof exp.typeScan === "function" &&
+    typeof exp.typeScanNameLen === "function";
+
+  // No position: every name this answers is in scope for the whole file (see `symTypeScan`).
+  const typeNamesAt = async (
+    source: string,
+    entryKey: string,
+    read: ModuleReader,
+  ): Promise<WasmTypeName[]> => {
+    const exp = instantiate();
+    if (
+      exp === undefined || !speaksAbi(exp) || !hasSymbols(exp) || !hasTypeScan(exp)
+    ) return [];
+    await ensurePrepared(exp, source, entryKey, read);
+    const count = exp.typeScan();
+    const out: WasmTypeName[] = [];
+    for (let i = 0; i < count; i++) {
+      const name = readString(exp.typeScanNameLen(i), (j) => exp.typeScanNameCharAt(i, j));
+      if (name.length === 0) continue; // defensive: a declaration always has a name
+      const dLen = exp.typeScanDetailLen(i);
+      const detail = dLen <= 0 ? "" : readString(dLen, (j) => exp.typeScanDetailCharAt(i, j));
+      const docLen = exp.typeScanDocLen(i);
+      const doc = docLen <= 0
+        ? undefined
+        : readString(docLen, (j) => exp.typeScanDocCharAt(i, j));
+      out.push({ name, detail, doc });
+    }
+    return out;
+  };
+
   const memberCompletionsAt = async (
     source: string,
     entryKey: string,
@@ -2105,6 +2159,7 @@ export const createWasmChecker = (
     builtinCompletions,
     inlayHintsAt,
     scopeAt,
+    typeNamesAt,
     memberCompletionsAt,
     ufcsCandidatesAt,
     importedNameSources,
