@@ -1509,9 +1509,18 @@ in-language GC knobs.
      context. The families, in the order they convert:
      1. ✅ **`tyKindOf`** — the i32 code vocabulary (0/2/3/7/10/11/12/13/20), 18 call sites.
         DONE: 3,366,947/3,366,947 queries agree, byte-identical in 3,148 + 7,589 modules.
-     2. ⬜ **`vtKindOfType`'s annotation ladder** — 25 predicate rungs. The `annRepKindOf` seam
-        already exists, so the work is widening `repOfTy` coverage until the fallback is
-        unreachable; the oracle's LEFT-ONLY bucket at this site is the burn-down list.
+     2. 🟡 **`vtKindOfType`'s annotation ladder** — 25 predicate rungs, GRADED and partly
+        closed. Five nullable scalar-list niches had no rung at all and fell to the `"i32"`
+        default; `nulScalarListKindOfNode` now answers them, taking the oracle from
+        **CONTRADICT 2,963 in six classes to 178 in one**, byte-identically. **Deleting the
+        nine rungs the descriptor always answers first was built and REFUSED by the oracle**:
+        it is byte-identical, and it takes CONTRADICT to **204,539**, because the ladder's
+        domain is an annotation node the checker did not type and the descriptor cannot
+        answer there by construction. The deletion criterion is unreachability or a named
+        default, never "no observed counterexample". Remaining: the descriptor's 15-kind
+        LEFT-ONLY coverage gap (147,945 queries, headed by `reflist` at 111,683), and the one
+        surviving CONTRADICT, which is `one-literal-union-rep`'s cost at a second site.
+        `docs/internals/rep-descriptor-campaign.md` §6.3.
      3. ⬜ **`repOfName(name, fnIx)`** — the missing surface, not a ladder: name → frame
         (`fnStmtsPosOf`) → `fnIndexOfInScopeSid` (walking `fnParent` then `fnInstOrigin`) →
         declaration → type. The five-row monomorphizer family (D1781, D1782, D1788, D1795,
