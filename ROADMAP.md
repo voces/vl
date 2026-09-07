@@ -1677,10 +1677,19 @@ in-language GC knobs.
         with that count printed. **THE NARROW ARM LANDS**: the nullable-STRUCT element alone,
         flat and tree together with the two-producer audit as the gate (flat-only reads
         `DISAGREE kind flat=reflist tree=list/`; both read 0), byte-identical in 3,210 of 3,210
-        and 7,589 of 7,589. Remaining: the value-union box (3,167 / 82), other union (133), one
-        no-recorded-type module (166); a nullable string/boolean/litunion element is not a ref
-        list at all and is a different kind's question. No rung is deletable until the column is
-        empty for the kind.
+        and 7,589 of 7,589. **VALUE-UNION-BOX element LANDS** (§9.7): a `(A | B)[]` box element is a
+        ref list, keyed on `unRowOfCanonId(elem)` — the interned canon-id row, never the
+        SPELLING, which names a declared alias where the arena renders structurally — gated on
+        `tyIsValueUnionBox` after byte identity caught the un-gated arm answering `reflist` for a
+        numeric litunion (a canon row exists but it reps as a scalar list; 15+12 modules
+        byte-different with identical output). `reflist` LEFT-ONLY falls −2,590 / −577, exactly
+        the census, CONTRADICT 0, byte-identical on both populations. The census took three
+        producers to state — arena render (wrong, disagrees per alias), spelling scan (the
+        ladder's question), arena canon row (the arm's) — the worked instance of asking the
+        arm's question of the arm's producer. Remaining in the column: other union (133), one
+        no-recorded-type module (166), and the nullable non-struct element — a `(string|null)[]`
+        rides the STRING list, a `(boolean|null)[]`/litunion the i32 list, so it is a different
+        kind's question, not a `reflist` gap. No rung is deletable until the column is empty.
         `docs/internals/rep-descriptor-campaign.md` §9.
      Two owner rulings gate how far items 2 and 6 can go: `one-literal-union-rep` and
      `nullable-rep-rule-stated-once` (`docs/internals/open-rulings.md` §D).
