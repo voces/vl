@@ -2811,6 +2811,8 @@ fn run_program_with(
     sink: impl Fn(&str) + Send + Sync + Clone + 'static,
     palette: Palette,
 ) -> Result<()> {
+    // The `vl-src` rows for THIS module, so a trap frame's offset resolves to a line.
+    note_src_map(bytes);
     let module = from_user(Module::new(engine, bytes))?;
     // The instance is dropped: `vl run` runs the start function (the program's top
     // level) and exits. `vl test` needs the instance back to call exports on it, so
@@ -5551,6 +5553,162 @@ fn cli_pump(args: &[String]) -> Result<()> {
 }
 
 
+// ── `vl-src`: the module byte offset a trap frame carries → the SOURCE LINE ──────
+//
+// A trap frame is `0x118 - vl!boom@3`: an offset into the module's own bytes
+// (`FrameInfo::module_offset`) plus a name-section string, and a name-section string can
+// only be per FUNCTION — so the `@3` is where `boom` was DECLARED, not where it trapped.
+// The emitter's `vl-src` custom section carries the rest: one row per body and per
+// statement, `[from, to)` over the same module bytes, with the line and column its source
+// anchor sits on. Joining the two gives the trapping statement (ROADMAP row 22).
+//
+// The rows are the table `locate_invalid_module` asks the compiler for (D1578/D1594), plus a
+// row per STATEMENT that the compiler's own offset lookup reads past — that diagnostic's
+// position is the declaration's by contract, and a trap frame wants the instruction's.
+#[derive(Default)]
+struct SrcMap {
+    files: Vec<String>,
+    /// `(from, to, line, col, file index)`, in emission order — not sorted, and rows NEST:
+    /// a statement's range lies inside its function's. `locate` takes the narrowest.
+    rows: Vec<(u32, u32, u32, u32, u32)>,
+}
+
+impl SrcMap {
+    /// The NARROWEST row containing `off` that carries a real line. Narrowest because the
+    /// statement row is the precise answer and the enclosing body row is the fallback; a
+    /// zero line means the row's body is synthetic and has no source position at all.
+    fn locate(&self, off: u32) -> Option<(&str, u32, u32)> {
+        let mut best: Option<&(u32, u32, u32, u32, u32)> = None;
+        for r in &self.rows {
+            if off < r.0 || off >= r.1 || r.2 == 0 {
+                continue;
+            }
+            if best.is_none_or(|b| r.1 - r.0 < b.1 - b.0) {
+                best = Some(r);
+            }
+        }
+        let r = best?;
+        let file = self.files.get(r.4 as usize).map(String::as_str).unwrap_or("");
+        Some((file, r.2, r.3))
+    }
+}
+
+/// One ULEB128 from `b` at `*i`, or `None` on a truncated or over-long encoding. Every
+/// read is bounds-checked: this parses a section the host did not necessarily emit.
+fn uleb(b: &[u8], i: &mut usize) -> Option<u32> {
+    let (mut v, mut shift) = (0u32, 0u32);
+    loop {
+        let byte = *b.get(*i)?;
+        *i += 1;
+        v |= ((byte & 0x7f) as u32).checked_shl(shift)?;
+        if byte < 0x80 {
+            return Some(v);
+        }
+        shift += 7;
+        if shift > 28 {
+            return None;
+        }
+    }
+}
+
+/// A length-prefixed name from `b` at `*i`.
+fn wasm_name(b: &[u8], i: &mut usize) -> Option<String> {
+    let n = uleb(b, i)? as usize;
+    let end = i.checked_add(n)?;
+    let s = std::str::from_utf8(b.get(*i..end)?).ok()?.to_string();
+    *i = end;
+    Some(s)
+}
+
+/// Find and decode the `vl-src` custom section. `None` for any module without one — a
+/// build with no `--names`, a module from an older seed, or one from another producer.
+/// A malformed section is `None` too: the frames then print exactly as they did before.
+fn parse_vl_src(bytes: &[u8]) -> Option<SrcMap> {
+    if bytes.len() < 8 || &bytes[0..4] != b"\0asm" {
+        return None;
+    }
+    let mut i = 8usize;
+    while i < bytes.len() {
+        let id = *bytes.get(i)?;
+        i += 1;
+        let size = uleb(bytes, &mut i)? as usize;
+        let end = i.checked_add(size)?;
+        if end > bytes.len() {
+            return None;
+        }
+        if id == 0 {
+            let mut p = i;
+            if wasm_name(bytes, &mut p).as_deref() == Some("vl-src") {
+                let nfiles = uleb(bytes, &mut p)?;
+                let mut files = Vec::with_capacity(nfiles as usize);
+                for _ in 0..nfiles {
+                    files.push(wasm_name(bytes, &mut p)?);
+                }
+                let nrows = uleb(bytes, &mut p)?;
+                let mut rows = Vec::with_capacity(nrows as usize);
+                for _ in 0..nrows {
+                    let from = uleb(bytes, &mut p)?;
+                    let to = uleb(bytes, &mut p)?;
+                    let line = uleb(bytes, &mut p)?;
+                    let col = uleb(bytes, &mut p)?;
+                    let file = uleb(bytes, &mut p)?;
+                    rows.push((from, to, line, col, file));
+                }
+                return Some(SrcMap { files, rows });
+            }
+        }
+        i = end;
+    }
+    None
+}
+
+/// The map for the module currently running, for `report` to join a trap frame against.
+/// Set where the module's bytes are in hand and cleared nowhere: a process runs one
+/// user program, and `vl test`'s many modules each overwrite it before their own call.
+static SRC_MAP: Mutex<Option<SrcMap>> = Mutex::new(None);
+
+fn note_src_map(bytes: &[u8]) {
+    if let Ok(mut slot) = SRC_MAP.lock() {
+        *slot = parse_vl_src(bytes);
+    }
+}
+
+/// The `at <file>:<line>:<col>` block under a trap, one line per wasm frame that resolves.
+/// Printed BESIDE wasmtime's own backtrace rather than replacing it: the offsets and the
+/// function names are what a bug report quotes, and this adds the position they lacked.
+fn source_frames(err: &Error) -> Option<String> {
+    // anyhow's own downcast, not the `chain()` one: wasmtime attaches the backtrace as a
+    // CONTEXT value and `WasmBacktrace` does not implement `std::error::Error`, so the
+    // `&dyn Error` chain never yields it.
+    let bt = err.downcast_ref::<WasmBacktrace>()?;
+    let guard = SRC_MAP.lock().ok()?;
+    let map = guard.as_ref()?;
+    let mut out = String::new();
+    for frame in bt.frames() {
+        let off = match frame.module_offset() {
+            Some(o) => o as u32,
+            None => continue,
+        };
+        if let Some((file, line, col)) = map.locate(off) {
+            let name = frame.func_name().unwrap_or("");
+            // The name section's own `@file:line` suffix is the DECLARATION's, and this
+            // line is the instruction's — printing both would read as a contradiction.
+            let name = name.split('@').next().unwrap_or(name);
+            let where_ = if file.is_empty() {
+                format!("{line}:{}", display_col(col as i32))
+            } else {
+                format!("{file}:{line}:{}", display_col(col as i32))
+            };
+            if name.is_empty() {
+                out.push_str(&format!("    at {where_}\n"));
+            } else {
+                out.push_str(&format!("    at {where_}  in `{name}`\n"));
+            }
+        }
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
 // ── which module trapped ─────────────────────────────────────────────────────
 //
 // A wasm trap renders identically whichever module raised it, so the COMPILER's
@@ -5648,6 +5806,10 @@ fn report(err: Error) -> ! {
         eprintln!();
     }
     eprintln!("Error: {err:?}");
+    if let Some(frames) = source_frames(&err) {
+        eprintln!("\nvl source frames (innermost first):");
+        eprint!("{frames}");
+    }
     if let Some(note) = trap.and_then(trap_explanation) {
         eprintln!("\nnote: {note}");
     }

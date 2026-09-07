@@ -70,7 +70,17 @@ AXIS for the same reason, and prints `NOT EXERCISED` rather than a zero.
    `narrowing` axis never applied to a union with no literal discriminant at all.
 4. **`fusion`** — `xs.pop() ?? d` against `const v = xs.pop()` then `v ?? d`.
 5. **`pinning`** — a concrete call against the same value routed through a generic
-   `pass<T>` or an un-annotated hole parameter.
+   `pass<T>`, an un-annotated hole parameter, or a TWO-parameter `pass2<A, B>(a: A, b: B): A`
+   whose second hole binds a rep of its own.
+
+   **The two-parameter face carries a `same` control, and the control is what fired.** Its
+   second-hole table draws seven differing reps (i32, string, f64, boolean, list, struct,
+   nullable) and one `same`, which binds both holes to the delivered value's own rep through
+   its `alt`. Over 519 `generic2` pairs the seven differing reps produced **0** disagreements
+   and `same` produced **18**, five of them check-clean invalid wasm (D1887). An
+   all-differing table could not have told "two holes disagree" from "two holes at all",
+   which is the same lesson #2854 taught one level down: a grid whose hole is never bound
+   cannot see a defect whose ingredient is the binding.
 6. **`scope`** — module, function body, `if true` block, and a one-iteration `while`, at
    module and function level.
 7. **`scenery`** — the same program with and without a plausible UNRELATED neighbour: an
@@ -103,7 +113,7 @@ Stated plainly, because a zero from an instrument is only as good as its frame.
   positions, six scopes, five neighbours; the module axis adds twenty-four units and nine
   reports, and the imports axis twelve std modules. No generics with more than one parameter,
   no recursive types, no operator overloading, no i32/f64 mixed arithmetic, no strings beyond
-  `+`/`.length`. `std:` reaches the single-file axes only as an unused import
+  `+`/`.length`. Generics reach TWO parameters (`pass2<A, B>`) and no further. `std:` reaches the single-file axes only as an unused import
   (the `unused_import` neighbour) and the imports axis only as one call per module, so no
   std VALUE — a `Json` tree, an `IoError`, a `Buf` — is ever delivered or read by the plans
   above. Each is a grammar record away, and none is there today.
