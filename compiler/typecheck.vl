@@ -3443,6 +3443,9 @@ export function initChecker() {
   inferLetNulBoolIx = []
   bodyChecked = Map()
   nodeTyIx = []
+  optCallRetIx = []
+  optCallRetTy = []
+  optCallRetName = []
   isVarTyIx = []
   isParentTyIx = []
   isParentElseTyIx = []
@@ -21855,31 +21858,40 @@ function roWriteMsg(what: string, recvTy: i32): string {
 // builtin receiver kinds directly, never as a struct field read. Returns the call type,
 // or `-1` when no builtin arm claims it and the caller falls through to the field/UFCS
 // path — the same "no answer" spelling `ufcsCallTy` and `arrayUnionCallTy` already use.
-function checkMemberCallNode(n: Call, ix: i32, cfn: Member): i32 {
+function checkMemberCallNode(
+  n: Call,
+  ix: i32,
+  recvIx: i32,
+  prop: string,
+  recvPre: i32,
+): i32 {
   // A member-access callee is always function-typed for semantic tokens; the builtin arms
   // below type it directly and never revisit the member-read arm, so its name is recorded here (a struct field holding a function falls through to `checkNode` and overwrites it for hover).
   symMemMethod(n.callFn)
-  let recvTy = checkNode(cfn.memObj)
+  // An optional call hands the receiver's type in already non-null: `p?.f(…)` resolves the
+  // callee against the value its guard admits, not against the `| null` the guard strips.
+  let recvTy = recvPre
+  if recvPre < 0 { recvTy = checkNode(recvIx) }
   let rt = T.tys[recvTy]
   // An un-annotated hole receiving an array method (`self.map`/`.push`/…) is constrained to
   // an array — synthesizing one over a derived element hole and falling into the array-method
   // arm below, which pins the concrete element per call shape. Without this the hole would
   // grow a `{map: any}` struct shape no array argument could satisfy.
   if rt is TyVar {
-    if holeArrMethod(cfn.memProp) {
+    if holeArrMethod(prop) {
       noteArrayDemand(rt.tvName)
       // The synthesized receiver below is a MUTABLE list, and nothing re-checks the
       // argument against it — so a write through the hole is filed here, and the pin
       // refuses a view for it.
-      if listMethodMutates(cfn.memProp) { noteArrayWriteDemand(rt.tvName) }
+      if listMethodMutates(prop) { noteArrayWriteDemand(rt.tvName) }
       const elemHole = mkDerivedHole(HD_ELEM, "", -1, -1, recvTy)
       recvTy = mkArrayTy(elemHole)
-    } else if holeMapMethod(cfn.memProp) {
+    } else if holeMapMethod(prop) {
       // The dual for a hole receiving a map/set method: becomes the hole's demanded map
       // (`{[?]: ?}`) and falls into the map-method arm below, which pins the open key/value
       // from the method's own arguments — `.add` mints the Set flavor. Without this the hole
       // would grow a `{set: any}` struct shape no map argument could satisfy.
-      recvTy = holeMapDemandTy(rt.tvName, cfn.memProp == "add")
+      recvTy = holeMapDemandTy(rt.tvName, prop == "add")
     }
   }
   rt = T.tys[recvTy]
@@ -21889,12 +21901,12 @@ function checkMemberCallNode(n: Call, ix: i32, cfn: Member): i32 {
     // is on the list, not on what the list holds. Reported and then fallen through, so the
     // call still types as its own method and no cascade follows the one real diagnostic.
     if rt.aRead == 1 {
-      if listMethodMutates(cfn.memProp) {
-        tErr(roWriteMsg("`." + cfn.memProp + "()`", recvTy), ix)
+      if listMethodMutates(prop) {
+        tErr(roWriteMsg("`." + prop + "()`", recvTy), ix)
       }
     }
     const margs = n.callArgs
-    if cfn.memProp == "push" {
+    if prop == "push" {
       if margs.length != 1 {
         tErr("push expects 1 argument, got " + i32ToStr(margs.length), ix)
       } else {
@@ -21926,13 +21938,10 @@ function checkMemberCallNode(n: Call, ix: i32, cfn: Member): i32 {
     // `.map(fn)` / `.filter(pred)`: the callback is a 1-arg function over the
     // element type; map yields an array of the callback's return, filter the
     // same array type (its predicate must yield bool).
-    if cfn.memProp == "map" || cfn.memProp == "filter" {
+    if prop == "map" || prop == "filter" {
       const cargs = n.callArgs
       if cargs.length != 1 {
-        tErr(
-          cfn.memProp + " expects 1 argument, got " + i32ToStr(cargs.length),
-          ix,
-        )
+        tErr(prop + " expects 1 argument, got " + i32ToStr(cargs.length), ix)
         return TY_ERR
       }
       // Seeds the callback's expected param type from the receiver's element type, so an
@@ -21950,14 +21959,14 @@ function checkMemberCallNode(n: Call, ix: i32, cfn: Member): i32 {
         const cbParams = cb.fnParamTypes
         if cbParams.length != 1 {
           tErr(
-            cfn.memProp +
+            prop +
               " callback expects 1 parameter, got " +
               i32ToStr(cbParams.length),
             ix,
           )
         } else if !assignable(rt.aElem, cbParams[0]) {
           tErr(
-            cfn.memProp +
+            prop +
               " callback: parameter expects " +
               tyToStr(cbParams[0]) +
               ", got " +
@@ -21965,7 +21974,7 @@ function checkMemberCallNode(n: Call, ix: i32, cfn: Member): i32 {
             ix,
           )
         }
-        if cfn.memProp == "filter" {
+        if prop == "filter" {
           if !assignable(cb.fnRet, TY_BOOL) {
             tErr(
               "filter predicate must yield boolean, got " + tyToStr(cb.fnRet),
@@ -21976,20 +21985,20 @@ function checkMemberCallNode(n: Call, ix: i32, cfn: Member): i32 {
         }
         return mkArrayTy(cb.fnRet)
       }
-      tErr(cfn.memProp + " expects a function, got " + tyToStr(cbTy), ix)
+      tErr(prop + " expects a function, got " + tyToStr(cbTy), ix)
       return TY_ERR
     }
     // `.pop()` / `.get(i)` yield `T | null` (an empty pop / out-of-range get is
     // normal absence); `.clear()` empties in place and yields nothing. The element is
     // its VALUE type (`arrElemValueTy`), so a `u8[]` answers `i32 | null` — the same
     // widening `xs[i]` takes, and the rep `emitPopNulBox` already builds (D1211).
-    if cfn.memProp == "pop" {
+    if prop == "pop" {
       if margs.length != 0 {
         tErr("pop expects 0 arguments, got " + i32ToStr(margs.length), ix)
       }
       return mkNullableTy(arrElemValueTy(rt.aElem))
     }
-    if cfn.memProp == "get" {
+    if prop == "get" {
       if margs.length != 1 {
         tErr("get expects 1 argument, got " + i32ToStr(margs.length), ix)
       } else {
@@ -22000,7 +22009,7 @@ function checkMemberCallNode(n: Call, ix: i32, cfn: Member): i32 {
       }
       return mkNullableTy(arrElemValueTy(rt.aElem))
     }
-    if cfn.memProp == "clear" {
+    if prop == "clear" {
       if margs.length != 0 {
         tErr("clear expects 0 arguments, got " + i32ToStr(margs.length), ix)
       }
@@ -22008,7 +22017,7 @@ function checkMemberCallNode(n: Call, ix: i32, cfn: Member): i32 {
     }
     // `.slice(start, end?)` yields a NEW array of the SAME element type — the bounds
     // are i32 (a missing `end` defaults to the length; negatives count from the end).
-    if cfn.memProp == "slice" {
+    if prop == "slice" {
       if margs.length != 1 && margs.length != 2 {
         tErr(
           "slice expects 1 or 2 arguments, got " + i32ToStr(margs.length),
@@ -22029,14 +22038,14 @@ function checkMemberCallNode(n: Call, ix: i32, cfn: Member): i32 {
     // UFCS `self`-method on an array receiver (`parts.join(sep)`): an array
     // carries no user FIELD, so a matching free `self`-function resolves
     // directly — the array dual of the string/struct/union UFCS paths.
-    const au = ufcsCallTy(cfn.memProp, recvTy, n, ix)
+    const au = ufcsCallTy(prop, recvTy, n, ix)
     if au >= 0 { return au }
     tErr(
       "no method '." +
-        cfn.memProp +
+        prop +
         "' on array " +
         tyToStr(recvTy) +
-        methodDidYouMean(recvTy, cfn.memProp),
+        methodDidYouMean(recvTy, prop),
       n.callFn,
     )
     return TY_ERR
@@ -22046,7 +22055,7 @@ function checkMemberCallNode(n: Call, ix: i32, cfn: Member): i32 {
   // `.add` alone gates on the value's TYPE rather than the flavor bit (see its own arm). The
   // first `.set`/`.add` on a bare `Map()`/`Set()` pins its key/value holes in place.
   if rt is TyMap {
-    const mp = cfn.memProp
+    const mp = prop
     const margs2 = n.callArgs
     if mp == "set" && rt.mSet == 0 {
       if margs2.length != 2 {
@@ -22149,7 +22158,7 @@ function checkMemberCallNode(n: Call, ix: i32, cfn: Member): i32 {
   // — a byte-offset decode, a continuation-byte scan, a lead-bit test — which the surface exposes no other way to reach.
   if rt is TyPrim {
     if rt.primName == "string" {
-      const sp = cfn.memProp
+      const sp = prop
       const sargs = n.callArgs
       if sp == "slice" {
         if sargs.length != 2 {
@@ -22297,16 +22306,16 @@ function checkMemberCallNode(n: Call, ix: i32, cfn: Member): i32 {
   // receiver has no such field (a callable field keeps precedence) and a matching free
   // function exists. The field-first test is `tyFieldTyOf`, the same predicate the emitter's
   // `drwWalk` calls on the receiver's recorded type, so the two cannot disagree (D1070).
-  const ufcsHasField = tyFieldTyOf(recvTy, cfn.memProp) >= 0
+  const ufcsHasField = tyFieldTyOf(recvTy, prop) >= 0
   const urt = T.tys[recvTy]
   // A bounded type parameter as the receiver (OQ-5, strict bodies): the bound answers, and
   // only the bound — arguments check against its declared members and the result is what it
   // promised. No dispatch happens here; the witness is chosen per instantiation site
   // (`checkBoundsAtCall`) and baked by the monomorphizer.
   if urt is TyVar {
-    const bcTy = boundMemberTy(urt.tvName, cfn.memProp, true)
+    const bcTy = boundMemberTy(urt.tvName, prop, true)
     if bcTy == BOUND_UNRESOLVED {
-      tErr(boundMemberUnknownMsg(urt.tvName, cfn.memProp), ix)
+      tErr(boundMemberUnknownMsg(urt.tvName, prop), ix)
       return TY_ERR
     }
     if bcTy >= 0 {
@@ -22316,7 +22325,7 @@ function checkMemberCallNode(n: Call, ix: i32, cfn: Member): i32 {
         if bcArgs.length != bcT.fnParamTypes.length {
           tErr(
             "`" +
-              cfn.memProp +
+              prop +
               "` on `" +
               urt.tvName +
               "` expects " +
@@ -22336,7 +22345,7 @@ function checkMemberCallNode(n: Call, ix: i32, cfn: Member): i32 {
           // call, rather than fed to `assignable` — which reads a negative side
           // as "accept anything" and would silently pass every argument.
           if bcWant < 0 {
-            tErr(boundMemberUnknownMsg(urt.tvName, cfn.memProp), ix)
+            tErr(boundMemberUnknownMsg(urt.tvName, prop), ix)
             return TY_ERR
           }
           if !assignableExpr(bcArgs[bca], bcat, bcWant) {
@@ -22345,33 +22354,33 @@ function checkMemberCallNode(n: Call, ix: i32, cfn: Member): i32 {
           bca = bca + 1
         }
         if bcT.fnRet < 0 {
-          tErr(boundMemberUnknownMsg(urt.tvName, cfn.memProp), ix)
+          tErr(boundMemberUnknownMsg(urt.tvName, prop), ix)
           return TY_ERR
         }
         return bcT.fnRet
       }
     }
-    const bcMsg = boundMemberFloorMsg(urt.tvName, cfn.memProp)
+    const bcMsg = boundMemberFloorMsg(urt.tvName, prop)
     if bcMsg != "" {
       tErr(bcMsg, ix)
       return TY_ERR
     }
   }
   if !ufcsHasField {
-    const uu = ufcsCallTy(cfn.memProp, recvTy, n, ix)
+    const uu = ufcsCallTy(prop, recvTy, n, ix)
     if uu >= 0 { return uu }
     // The name is a self-function, just not one in scope (D1230) — asked here since only
     // the call knows the argument count, banked on the callee member node where the sentence is raised (`memberFloorErr`).
     noteUfcsMiss(
       n.callFn,
-      ufcsMissingImportSpecs(cfn.memProp, recvTy, n.callArgs.length),
+      ufcsMissingImportSpecs(prop, recvTy, n.callArgs.length),
     )
     // When the name is already in scope, which gate declined (D1570) — banked beside
     // D1230's answer and read after it, since `argc` is known here and raised there.
     noteUfcsNotMethod(
       n.callFn,
-      cfn.memProp,
-      ufcsAliasAtSite(ix, cfn.memProp),
+      prop,
+      ufcsAliasAtSite(ix, prop),
       recvTy,
       n.callArgs.length,
     )
@@ -22854,6 +22863,60 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
   return cRetTy
 }
 
+// `p?.f(args)` — one guard over the receiver covers the whole call, so the callee and the
+// arguments resolve against the receiver's non-null type and the result is that call's own
+// return re-wrapped nullable. `-1` when no arm claimed the callee, leaving the caller's
+// "called value is not a function" to speak (D1814).
+function checkOptCallNode(n: Call, ix: i32, cfn: OptMember): i32 {
+  omGuardSet(-1, -1)
+  const recv = checkNode(cfn.omObj)
+  if recv < 0 { return TY_ERR }
+  const eff = omRecvTy(cfn.omObj, recv)
+  if eff < 0 { return TY_ERR }
+  // A `.` that inherited the chain's guard may not re-guard: same rule, same words, as the
+  // member link's.
+  if cfn.omDot {
+    const de = T.tys[eff]
+    if de is TyNullable {
+      memberFloorErr(eff, cfn.omProp, ix)
+      return TY_ERR
+    }
+  }
+  const rcv = T.tys[recv]
+  let wasNullable = false
+  if rcv is TyNullable { wasNullable = true }
+  const base = nonNullTy(eff)
+  if base < 0 { return TY_ERR }
+  let rt = checkMemberCallNode(n, ix, cfn.omObj, cfn.omProp, base)
+  if rt < 0 {
+    // No method arm claimed it: the callee is a VALUE on the receiver — a closure-typed
+    // field. Its guarded type is the field's own function type, which is what the call
+    // needs; the `?.` node's type is that same function behind a `| null`.
+    const fnTy = checkNode(n.callFn)
+    const g = omGuardTyAt(n.callFn)
+    let cft = fnTy
+    if g >= 0 { cft = g }
+    if cft < 0 { return TY_ERR }
+    const ft = T.tys[cft]
+    if ft is TyErr { return TY_ERR }
+    if !(ft is TyFunc) { return -1 }
+    rt = checkCallOnFuncTy(n, ix, cfn, ft)
+    if rt < 0 { return -1 }
+  }
+  omGuardSet(ix, rt)
+  if rt == TY_VOID {
+    noteOptCallRet(ix, rt, "")
+    return TY_VOID
+  }
+  if wasNullable {
+    const ort = mkNullableTy(rt)
+    noteOptCallRet(ix, rt, valueUnionRetName(ort))
+    return ort
+  }
+  noteOptCallRet(ix, rt, "")
+  rt
+}
+
 // A call expression, dispatched on the callee's shape: a member callee to
 // `checkMemberCallNode`, a bare identifier to `checkUnimplementedIntrinsicCall` and
 // `checkBuiltinIdentCall`, a function-typed value to `checkCallOnFuncTy`. The type-answering
@@ -22861,8 +22924,14 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
 function checkCallNode(n: Call, ix: i32) {
   const cfn = P.nodes[n.callFn]
   if cfn is Member {
-    const mt = checkMemberCallNode(n, ix, cfn)
+    const mt = checkMemberCallNode(n, ix, cfn.memObj, cfn.memProp, -1)
     if mt >= 0 { return mt }
+  }
+  // `p?.f(args)` — the receiver's guard covers the whole call. Answered before the callee is
+  // typed as a value, which is what read a nullable closure field as "not a function" (D1814).
+  if cfn is OptMember {
+    const ot = checkOptCallNode(n, ix, cfn)
+    if ot >= 0 { return ot }
   }
   if cfn is Ident { checkUnimplementedIntrinsicCall(cfn, ix) }
   if cfn is Ident {
@@ -28052,6 +28121,64 @@ export function nodeTyCarry(dst: i32, src: i32) {
   0
 }
 
+// The type `p?.f(…)` has once its receiver guard holds — the callee's own return, before the
+// `| null` the optional call wraps around it. Banked per call site: the node's recorded type
+// is the whole optional call's, and the guarded arm the emit-time desugar builds yields only
+// the call (D1814).
+let optCallRetIx: i32[] = []
+let optCallRetTy: i32[] = []
+let optCallRetName: string[] = []
+
+// Records one optional call's guarded return and the value-union spelling of its result.
+function noteOptCallRet(ix: i32, ty: i32, name: string) {
+  if ix < 0 || ty < 0 { return 0 }
+  let i = 0
+  while i < optCallRetIx.length {
+    if optCallRetIx[i] == ix {
+      optCallRetTy[i] = ty
+      optCallRetName[i] = name
+      return 0
+    }
+    i = i + 1
+  }
+  optCallRetIx.push(ix)
+  optCallRetTy.push(ty)
+  optCallRetName.push(name)
+  0
+}
+
+// How many optional calls the program has, and the arena node of each — the emit-side union
+// collection walks them, since an optional call's `| null` is spelled in no annotation.
+export function optCallRetCount() { optCallRetIx.length }
+
+export function optCallRetNodeAt(i: i32) {
+  if i < 0 || i >= optCallRetIx.length { return -1 }
+  optCallRetIx[i]
+}
+
+// The value-union spelling of the optional call's own `R | null`, or "" when that result is
+// not a boxed value union (a nullable struct, list or string carries its own niche).
+export function optCallRetNameAt(i: i32) {
+  if i < 0 || i >= optCallRetName.length { return "" }
+  optCallRetName[i]
+}
+
+// Restamps the optional call at `ix` with its guarded return, so the desugared then-arm is
+// classified by what the call actually leaves on the stack. A no-op for any other node.
+export function optCallRestamp(ix: i32) {
+  if ix < 0 { return 0 }
+  let i = 0
+  while i < optCallRetIx.length {
+    if optCallRetIx[i] == ix {
+      while nodeTyIx.length <= ix { nodeTyIx.push(-1) }
+      nodeTyIx[ix] = optCallRetTy[i]
+      return 0
+    }
+    i = i + 1
+  }
+  0
+}
+
 // The resolved type-arena index the checker recorded for AST node `ix`, or -1 if none (an
 // emitter-synthesized node, or a node never checked). The emitter reads the `Ty` at this
 // index to lower the node by its checked type rather than re-deriving it syntactically.
@@ -32009,6 +32136,12 @@ function checkLetDeclNode(n: LetDecl, ix: i32) {
       if ini1 is BinExpr {
         if ini1.binOp == "??" { isIfInit = true }
       }
+      // …and an optional CALL (`const t = p?.f()`), whose `| null` comes from the guard and
+      // so appears in neither the callee's type nor the call's own spelling (D1814).
+      if ini1 is Call {
+        const iniCallee = P.nodes[ini1.callFn]
+        if iniCallee is OptMember { isIfInit = true }
+      }
     }
     if isIfInit {
       const lvn = valueUnionRetName(bound)
@@ -34389,27 +34522,80 @@ function recordCollapsedIsAt(n: IsExpr, ix: i32, objTy: i32, chkTy: i32) {
 // Null-safe access: a nullable receiver reads the field off its inner type and re-wraps the
 // result nullable (`{x: i32} | null` ?. x -> `i32 | null`); a non-null receiver reads plainly.
 
+// The GUARDED type of the optional-chain link just checked — the field's own type, before
+// the `| null` the chain re-wraps around it. Read by the next link in the same chain, which
+// is the only reader: a `.` link inherits an earlier `?.`'s guard and so may not re-guard a
+// field that is nullable in its own right (D1815).
+let omGuardIx = -1
+let omGuardTy = -1
+
+function omGuardSet(ix: i32, ty: i32) {
+  omGuardIx = ix
+  omGuardTy = ty
+  0
+}
+
+// The guarded type recorded for node `ix`, or -1 when `ix` is not the link just checked —
+// a receiver that is a name, a call or a parenthesised chain answers -1 and ends the chain.
+export function omGuardTyAt(ix: i32) {
+  if ix >= 0 && omGuardIx == ix { return omGuardTy }
+  -1
+}
+
+// The receiver type an optional-chain link reads its field off: the link below's guarded
+// type when the receiver is itself a link of this chain, else the receiver's own type.
+function omRecvTy(objIx: i32, recv: i32) {
+  const g = omGuardTyAt(objIx)
+  if g >= 0 { return g }
+  recv
+}
+
 // Extracted from `checkNodeReal`'s `OptMember` arm (C3: thin the dispatcher).
 function checkOptMemberNode(n: OptMember, ix: i32) {
   // `x?.y` keys the same narrowed place as `x.y` (host `placeKey`).
   const omKey = placeKeyOf(ix)
   if omKey != "" {
     const omOv = narrowedPathTy(omKey)
-    if omOv >= 0 { return symMem(ix, omOv) }
+    if omOv >= 0 {
+      omGuardSet(ix, nonNullTy(omOv))
+      return symMem(ix, omOv)
+    }
     const omInv = narrowedPathInvBy(omKey)
     if omInv >= 0 && !pathRetiredByAssign(omInv) {
+      omGuardSet(-1, -1)
       return pathInvalidatedErr(omKey, omInv, ix)
     }
   }
+  omGuardSet(-1, -1)
   const recv = checkNode(n.omObj)
   // Guard the unpinned-hole receiver (`-1` — see the Member-arm note).
-  if recv < 0 { return TY_ERR }
+  if recv < 0 {
+    omGuardSet(-1, -1)
+    return TY_ERR
+  }
+  const eff = omRecvTy(n.omObj, recv)
+  if eff < 0 {
+    omGuardSet(-1, -1)
+    return TY_ERR
+  }
+  // A `.` that inherited the chain's guard reads through it, so a field that is nullable in
+  // its own right is a plain member access on a nullable value — the same refusal, and the
+  // same fix (`o?.y?.z`), the direct spelling gives.
+  if n.omDot {
+    const de = T.tys[eff]
+    if de is TyNullable {
+      omGuardSet(-1, -1)
+      memberFloorErr(eff, n.omProp, ix)
+      return TY_ERR
+    }
+  }
   const rcv = T.tys[recv]
   let wasNullable = false
-  let baseTy = recv
-  if rcv is TyNullable {
-    wasNullable = true
-    baseTy = rcv.nInner
+  let baseTy = eff
+  if rcv is TyNullable { wasNullable = true }
+  const et = T.tys[eff]
+  if et is TyNullable {
+    baseTy = et.nInner
     // Peels a second nullable layer too: the host's `flattenType` collapses `T??` to `T?`,
     // so a doubly-nullable receiver still reads its field with one `?.`.
     if baseTy >= 0 {
@@ -34417,31 +34603,42 @@ function checkOptMemberNode(n: OptMember, ix: i32) {
       if rcv2 is TyNullable { baseTy = rcv2.nInner }
     }
   }
-  if baseTy < 0 { return TY_ERR }
+  if baseTy < 0 {
+    omGuardSet(-1, -1)
+    return TY_ERR
+  }
   const bt = T.tys[baseTy]
   if bt is TyObj {
     const oft = objFieldType(bt, n.omProp)
     if oft < 0 {
+      omGuardSet(-1, -1)
       tErr("no field '" + n.omProp + "' on " + tyToStr(baseTy), ix)
       return TY_ERR
     }
+    omGuardSet(ix, oft)
     if wasNullable { return symMem(ix, mkNullableTy(oft)) }
     return symMem(ix, oft)
   }
-  if bt is TyErr { return TY_ERR }
+  if bt is TyErr {
+    omGuardSet(-1, -1)
+    return TY_ERR
+  }
   // Shared union field through `?.` — same rule as the plain member read.
   if bt is TyUnion {
     const osf = sharedUnionFieldTy(bt, n.omProp)
     if osf >= 0 {
+      omGuardSet(ix, osf)
       if wasNullable { return symMem(ix, mkNullableTy(osf)) }
       return symMem(ix, osf)
     }
   }
+  omGuardSet(-1, -1)
   // A nullable receiver here is not "a non-object" — it is an object-less base behind a
   // `| null`. `?.` reaches declared struct fields only; builtins (`.length`) are unreachable through it.
   if wasNullable {
     tErr(
-      "`?." +
+      "`" +
+        omDotStr(n) +
         n.omProp +
         "` is not available on " +
         tyToStr(recv) +
@@ -34454,8 +34651,22 @@ function checkOptMemberNode(n: OptMember, ix: i32) {
     )
     return TY_ERR
   }
-  tErr("member access '?." + n.omProp + "' on non-object " + tyToStr(recv), ix)
+  tErr(
+    "member access '" +
+      omDotStr(n) +
+      n.omProp +
+      "' on non-object " +
+      tyToStr(recv),
+    ix,
+  )
   return TY_ERR
+}
+
+// The separator a chain link carries in the source, so a diagnostic quotes the program the
+// author wrote and not the normalised node.
+function omDotStr(n: OptMember) {
+  if n.omDot { return "." }
+  "?."
 }
 
 // Extracted from `checkNodeReal`'s `WhileStmt` arm (C3: thin the dispatcher).
