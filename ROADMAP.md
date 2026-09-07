@@ -1595,7 +1595,16 @@ in-language GC knobs.
         `sentinel-index-unguarded` 0 → 21, because that lint's contract is within one function
         and the guard is the evidence it needs at each read. The campaign's bar in a third
         form: do not move a guard out of the reach of the checker that verifies it.
-     7. 🟡 **The slot layer** — SURVEYED, and it is two things. **183 PRODUCERS** over four
+     7. 🟡 **The slot layer** — SURVEYED, and its clamped-to-`0` half is MEASURED and its
+        narrowing VETOED. Of four producers only ONE clamp is live (`refListSlotOfExpr`, 197
+        fires in 29 modules); narrowing it costs exactly **one module of 10,767**
+        (`std/array-needle-nullable-niche`, `rc=0 → rc=70`) and **nothing traps**, so no
+        consumer indexes with `-1`. The blocker is the NAME, not the consumers: in that module
+        the walk looks up the EMPTY STRING 28 times, because a monomorphized `indexOf<T>`'s
+        element is a type variable and a type variable renders as `""` — D1794's mechanism at
+        this position — and the clamp's slot 0 is right by luck. Fix the render first, then
+        narrow; only then are the 31 declines testable and §7.6's 35 dead guards live.
+        `docs/internals/rep-descriptor-campaign.md` §7.6, §7.7. The rest of the survey: **183 PRODUCERS** over four
         parallel-column banks (struct / ref-list / variant / map-value, each with 1-5 writers
         and 100-174 readers), of which 42% take an AST node and 12% an arena type: they decide
         a rep from raw input, none is a `match` because they PRODUCE the kind rather than
