@@ -390,30 +390,52 @@ monaco.languages.registerCodeActionProvider(VL_LANGUAGE_ID, {
       entryKeyOf(model),
     );
 
+    type Edit = {
+      range: { start: lsp.LspPosition; end: lsp.LspPosition };
+      newText: string;
+    };
+    const toResourceEdits = (edits: Edit[]) => ({
+      edits: edits.map((e) => ({
+        resource: model.uri,
+        textEdit: {
+          range: new monaco.Range(
+            e.range.start.line + 1,
+            e.range.start.character + 1,
+            e.range.end.line + 1,
+            e.range.end.character + 1,
+          ),
+          text: e.newText,
+        },
+        versionId: model.getVersionId(),
+      })),
+    });
+
     const actions: monaco.languages.CodeAction[] = fixes.map((fix) => ({
       title: fix.title,
       kind: "quickfix",
       isPreferred: fix.isPreferred,
-      edit: {
-        edits: fix.edits.map((e) => ({
-          resource: model.uri,
-          textEdit: {
-            range: new monaco.Range(
-              e.range.start.line + 1,
-              e.range.start.character + 1,
-              e.range.end.line + 1,
-              e.range.end.character + 1,
-            ),
-            text: e.newText,
-          },
-          versionId: model.getVersionId(),
-        })),
-      },
+      edit: toResourceEdits(fix.edits),
     }));
+
+    // Organize imports — a SOURCE action (`editor.action.organizeImports`, or the
+    // command palette), not a lightbulb quick-fix. Offered only when it would
+    // change something, so an already-organized file gets no empty action.
+    const wantsSource = context.only === "source.organizeImports" ||
+      context.only === undefined;
+    if (wantsSource) {
+      const organizeEdits = await lsp.organizeImports(model.getValue(), entryKeyOf(model));
+      if (organizeEdits.length > 0) {
+        actions.push({
+          title: "Organize imports",
+          kind: "source.organizeImports",
+          edit: toResourceEdits(organizeEdits),
+        });
+      }
+    }
 
     return { actions, dispose: () => {} };
   },
-});
+}, { providedCodeActionKinds: ["quickfix", "source.organizeImports"] });
 
 // --- completion provider -----------------------------------------------------
 //
@@ -455,8 +477,14 @@ monaco.languages.registerCompletionItemProvider(VL_LANGUAGE_ID, {
     return {
       suggestions: items.map((c) => {
         const isSnippet = c.insertText !== undefined;
+        // A std auto-import item carries both a providing-module `description`
+        // (right-aligned on the row) and the `import { … }` rewrite as
+        // `additionalTextEdits` (applied alongside the name on accept).
+        const label = (c.labelDetail || c.description)
+          ? { label: c.label, detail: c.labelDetail, description: c.description }
+          : c.label;
         return {
-          label: c.labelDetail ? { label: c.label, detail: c.labelDetail } : c.label,
+          label,
           kind: COMPLETION_KIND[c.kind],
           insertText: c.insertText ?? c.label,
           insertTextRules: isSnippet
@@ -465,6 +493,15 @@ monaco.languages.registerCompletionItemProvider(VL_LANGUAGE_ID, {
           documentation: c.documentation
             ? { value: c.documentation }
             : undefined,
+          additionalTextEdits: c.additionalTextEdits?.map((e) => ({
+            range: new monaco.Range(
+              e.range.start.line + 1,
+              e.range.start.character + 1,
+              e.range.end.line + 1,
+              e.range.end.character + 1,
+            ),
+            text: e.newText,
+          })),
           range,
         };
       }),
