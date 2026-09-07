@@ -106,9 +106,13 @@ import {
   ufcsProbeSource,
   type UfcsProbeModule,
 } from "./typeFeatures.ts";
-import { STD_SOURCES } from "../../std/embedded.ts";
 import { invalidNewNameReason, planRenameAt, renameEdits } from "./rename.ts";
-import { removeCharAt, wordEndingBefore } from "./editorText.ts";
+import {
+  removeCharAt,
+  type StdSurfaceCache,
+  stdExportSurfaces,
+  wordEndingBefore,
+} from "./editorText.ts";
 import { foldingRanges, type VlFoldingKind } from "./folding.ts";
 import {
   callSiteAt,
@@ -1189,48 +1193,16 @@ const toCompletionItem = (
 
 // ---- std auto-import completion source ---------------------------------------
 //
-// Per-std-module export surfaces (name/kind/type) for `stdAutoImportCompletions`.
-// Sources are read through the SAME reader precedence the checker uses (the
-// workspace's own `std/` wins over the embedded map, so dogfooding offers what
-// the checker will actually accept), and cached by module source text so a
-// workspace std edit refreshes its entry. Types come from one `scopeAt` over the
-// module itself (its own decls, rendered unmangled), matched to the surface's
-// export list.
-const stdExportCache = new Map<string, { src: string; exports: StdExportCandidate[] }>();
-const SCOPE_KINDS = ["variable", "parameter", "function"] as const;
-const stdExportsForCompletion = async (): Promise<Map<string, StdExportCandidate[]>> => {
-  const out = new Map<string, StdExportCandidate[]>();
-  if (wasmChecker === undefined) return out;
-  for (const key of Object.keys(STD_SOURCES)) {
-    const src = (await workspaceReader(key)) ?? STD_SOURCES[key];
-    const cached = stdExportCache.get(key);
-    if (cached !== undefined && cached.src === src) {
-      out.set(key, cached.exports);
-      continue;
-    }
-    const surface = wasmChecker.moduleSurface(src, key);
-    const lastLine = src.split("\n").length - 1;
-    const scope = await wasmChecker
-      .scopeAt(src, key, workspaceReader, lastLine, 0)
-      .catch(() => []);
-    const byName = new Map(scope.map((b) => [b.name, b]));
-    const exports: StdExportCandidate[] = surface.exports.map((e) => {
-      // A RE-EXPORT has no binding in this module's own scope, so it carries the
-      // origin instead of a type detail — the ranking in
-      // `stdAutoImportCompletions` is what that origin is for.
-      const b = e.origin === "" ? byName.get(e.name) : undefined;
-      return {
-        name: e.name,
-        kind: b !== undefined ? SCOPE_KINDS[b.kind] ?? "function" : "function",
-        detail: b !== undefined && b.type !== "" ? b.type : undefined,
-        ...(e.origin === "" ? {} : { origin: e.origin }),
-      };
-    });
-    stdExportCache.set(key, { src, exports });
-    out.set(key, exports);
-  }
-  return out;
-};
+// Per-std-module export surfaces (name/kind/type) for `stdAutoImportCompletions`,
+// via the shared `stdExportSurfaces` (`./editorText.ts`). The server's source read
+// tries the workspace's own `std/` first — dogfooding, so it offers what the
+// checker will actually accept — falling back to the embedded map; the cache is
+// keyed on source text so a workspace std edit refreshes its entry.
+const stdExportCache: StdSurfaceCache = new Map();
+const stdExportsForCompletion = (): Promise<Map<string, StdExportCandidate[]>> =>
+  wasmChecker === undefined
+    ? Promise.resolve(new Map())
+    : stdExportSurfaces(wasmChecker, workspaceReader, workspaceReader, stdExportCache);
 
 // ---- UFCS candidate source ---------------------------------------------------
 //
