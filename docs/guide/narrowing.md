@@ -17,6 +17,31 @@ becomes a different type within a branch. The fact is produced once (in the chec
   (possibly nullable) wasm type — only the type-level view changes — so `local.get` / `struct.get`
   (which accept a nullable ref) stay valid; codegen unboxes a union per the narrowed view.
 
+## Narrowing applies to READS
+
+A narrowing changes what a place **reads as**, never what it **accepts**. A write is checked
+against the place's DECLARED type and then re-narrows it to the member it wrote, for the reads
+that follow until the region ends or the next write — TypeScript's and Kotlin's rule. So both of
+these are legal, and both print `4` and then `true`:
+
+```vl
+let x: i64 | boolean = 3
+if x is i64 { print(x + 1)      // reads as i64
+  x = true                      // checked against `i64 | boolean`
+  print(x) }                    // reads as boolean
+
+let y: i64 | boolean = 3
+while y is i64 { print(y + 1)   // a loop head narrows its body, re-tested every iteration
+  y = true                      // the flip is how a loop over a union terminates
+  print(y) }
+```
+
+A write of a NON-member is still refused, and the diagnostic names the declared type:
+`x = "s"` above is `cannot assign string to i64 | boolean`. Two places the rule stops short:
+a loop head narrows a bare name but not a property path (a path can be falsified through an
+alias, and the loop re-tests only its head), and a write inside a NESTED block retires the
+narrowing for everything after that block rather than re-narrowing across it.
+
 ## What narrows
 
 - **Nullness:** `if x != null` / `if x is T` → `x` non-null in the then-branch.
@@ -29,7 +54,13 @@ becomes a different type within a branch. The fact is produced once (in the chec
   chain, so `if u is A { return } else if u is B { return }` leaves the tail a bare `U − A − B`.
   The accumulation stops at the first arm that does *not* diverge — control can leave the chain
   through that arm's body with its condition true — and it applies to **bare names only**
-  (a property path's narrowing can be retired inside an arm, so it is not carried out).
+  (a property path's narrowing can be retired inside an arm, so it is not carried out). An arm on
+  the fall-through path that WRITES a different member into the place drops the residual for that
+  name: the write is legal, and what it costs is the fact the code below the chain would have had.
+- **Loop bodies:** a `while` head narrows its body exactly as an `if` then-arm does, for a null
+  strip and an `is T` pin alike. A guard from an ENCLOSING `if` is different: a write in the loop
+  body that falsifies it is refused, because the reads textually before the write run again after
+  it and no back edge re-tests that guard.
 - **`&&` / `||` chains:** a guard narrows a *list* of facts. `&&` narrows several places at once
   (`x != null && x.y is i32`), and its RHS is type-checked *and* codegen'd with the LHS's narrowing
   already applied (short-circuit). `||` is the De Morgan dual — `if x == null || y == null { return }`
