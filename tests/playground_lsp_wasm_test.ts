@@ -10,6 +10,7 @@
 import { createWasmChecker, type Exports, type WasmChecker } from "../lsp/src/wasmChecker.ts";
 import * as lsp from "../playground/src/lspAdapter.ts";
 import { runProgram } from "../playground/src/playground.ts";
+import { vlHostImports } from "../compiler/vlHostImports.ts";
 
 const assertEquals = <T>(actual: T, expected: T, msg?: string): void => {
   const a = JSON.stringify(actual);
@@ -112,6 +113,43 @@ Deno.test({ name: "playground-run: runProgram compiles + runs + captures print o
   }
   if (!result.compiled) throw new Error("expected a compiled module");
   assertEquals(result.logs, ["42", "10"], "captured print output");
+});
+
+// ---- the host tree-shakes the print sinks to what a module declares (veldt #4) ----
+
+Deno.test("host-imports: `declared` selects the print sinks the module actually imports", () => {
+  // No declared imports → an EMPTY sink object; the zero-glue host for a
+  // print-free program.
+  assertEquals(Object.keys(vlHostImports([], []).imports).length, 0, "empty selects nothing");
+  // A subset → exactly that subset.
+  assertEquals(
+    Object.keys(vlHostImports([], ["__print_i32__"]).imports),
+    ["__print_i32__"],
+    "one selected",
+  );
+  // Omitted → all seven (the backward-compatible default the Deno test host uses).
+  assertEquals(Object.keys(vlHostImports([]).imports).length, 7, "default is all seven");
+});
+
+Deno.test({ name: "host-imports: a print-free program declares no sinks and still runs", ignore }, async () => {
+  const checker = seedChecker();
+  // A print-free program imports NOTHING under the `imports` namespace — measured
+  // 2026-09-08: `const x = 1` declares [], `print(1)` declares 4 of the 7 sinks.
+  const { bytes } = await checker.compile("const x = 1\n", "main.vl", noSiblings);
+  if (bytes === undefined) throw new Error("expected bytes for a clean program");
+  const module = await WebAssembly.compile(bytes as BufferSource);
+  const declared = WebAssembly.Module.imports(module)
+    .filter((i) => i.module === "imports")
+    .map((i) => i.name);
+  assertEquals(declared, [], "a print-free program declares no print sinks");
+
+  // And the Run path instantiates it against that empty sink object — no error,
+  // no output.
+  const result = await runProgram("const x = 1\n", checker);
+  if (result.diagnostics.some((d) => d.severity === "error")) {
+    throw new Error(`unexpected errors: ${JSON.stringify(result.diagnostics)}`);
+  }
+  assertEquals(result.logs, [], "no output from a print-free program");
 });
 
 Deno.test({ name: "playground-lsp: cross-file hover resolves imported names + dependent locals", ignore }, async () => {
