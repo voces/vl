@@ -1560,10 +1560,17 @@ in-language GC knobs.
         ambient in the table it reads. What was actually owed is one de-duplication,
         `bindingDeclInScope(name)`, whose signature carries the finding by taking no frame.
         `docs/internals/rep-descriptor-campaign.md` §6.7.
-     4. ⬜ **The `expr*` family** — 48 classifiers, 927 call sites, 31% of all classifier call
-        sites. Converted by AXIS, since each is a closed set whose siblings must move
-        together: (a) the seven scalar-list predicates, (b) the six nullable niches, (c) the
-        three scalars, (d) the reference shapes.
+     4. 🟡 **The `expr*` family** — 48 classifiers, 931 call sites, 31% of all classifier call
+        sites, AUDITED and its residue converted. The headline is a zero: the family carries
+        **no magic-number rep codes**, and **89% of its rep-ish sites are already `VKind`
+        comparisons**, because the producers it reads from were converted in phase 1. It is a
+        call-site count, not a conversion backlog. What was genuinely left was 16 raw table
+        reads, 14 of them one shape (`fRetKind[fe] == "<kind>"` at eleven classifiers), now
+        `repOfFnSlot(fe)` — the fe-keyed primitive `repOfNameResult` factors onto. The 2 left
+        are `localLitUnion`, the literal-union carve-out. Byte-identical in 3,177 + 7,589, seed
+        −327. **And the census's own ranking misleads here**: `exprIsLitAtom` has the most
+        producers and the most call sites (71) and is the family's WORST target, being the
+        litunion carve-out itself. `docs/internals/rep-descriptor-campaign.md` §6.8.
      5. ⬜ **The return-kind family** — `retResultVKind` + the fourteen `fnRet*Sid` readers;
         `fRetKind` becomes a projection rather than a parallel column. `fnRetF32ArraySid` and
         `fnRetAnnF32ArraySid` still read the flat `fnIndexOfSid` and move first.
