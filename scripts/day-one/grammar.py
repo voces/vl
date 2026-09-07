@@ -553,6 +553,58 @@ VALUES = [
                   {"id": "ufcs", "op": "none",
                    "lines": ["print({v}.plusPln(4))"], "want": ["7"]}],
     },
+    {
+        # OPERATOR x MIXED-WIDTH: an overloaded operator whose BODY crosses widths — the
+        # `i32` field times an `f64` operand, so `self.x * k` widens `i32 -> f64` inside the
+        # dispatch. `op`/`call` join `operator_vs_call`; the `opw` tag marks the width the
+        # body mixes, and `op_samew` below is the same-shape control that makes a hit
+        # falsifiable. The result LEAVES the receiver's rep (returns `f64`), like `op_cmp`.
+        "id": "op_mixw_mul", "weight": 2, "decls": [("Mw", "new { x: i32 }")],
+        "named": "Mw", "inline": "Mw", "no_inline": True,
+        "fns": ['function "*"(self: Mw, k: f64): f64 { return self.x * k }',
+                "function mulMw(self: Mw, k: f64): f64 { return self.x * k }"]
+        + _op_alt("altMw", "Mw"),
+        "expr": None, "mk": OP_MK, "alt": "altMw()", "alt_infers": True,
+        "features": ["struct", "operator", "op_mixw", "opw_mix"],
+        "reads": [{"id": "op", "op": "*", "opw": "mix",
+                   "lines": ["print({v} * 2.5)"], "want": ["7.5"]},
+                  {"id": "call", "op": "*", "opw": "mix",
+                   "lines": ["print(mulMw({v}, 2.5))"], "want": ["7.5"]}],
+    },
+    {
+        # The `i32 -> i64` edge of the same cross: `self.x + k` widens `i32` to `i64` in the
+        # body, and a different operator (`+`) reaches a different lowering than `*`.
+        "id": "op_mixw_add", "weight": 2, "decls": [("Aw", "new { x: i32 }")],
+        "named": "Aw", "inline": "Aw", "no_inline": True,
+        "fns": ['function "+"(self: Aw, k: i64): i64 { return self.x + k }',
+                "function addAw(self: Aw, k: i64): i64 { return self.x + k }"]
+        + _op_alt("altAw", "Aw"),
+        "expr": None, "mk": OP_MK, "alt": "altAw()", "alt_infers": True,
+        "features": ["struct", "operator", "op_mixw", "opw_mix"],
+        "reads": [{"id": "op", "op": "+", "opw": "mix",
+                   "lines": ["print({v} + 9000000000)"], "want": ["9000000003"]},
+                  {"id": "call", "op": "+", "opw": "mix",
+                   "lines": ["print(addAw({v}, 9000000000))"], "want": ["9000000003"]}],
+    },
+    {
+        # THE SAME-WIDTH CONTROL: the identical operator shape and reads, but the field is
+        # `f64` so `self.y * k` is `f64 * f64` — no widening in the body. A disagreement this
+        # record shares is about operator dispatch, not about the mixed width, which is what
+        # makes a hit on the two records above falsifiable (`widen_same`'s job for `+`).
+        "id": "op_samew", "weight": 2, "decls": [("Sw", "new { y: f64 }")],
+        "named": "Sw", "inline": "Sw", "no_inline": True,
+        "fns": ['function "*"(self: Sw, k: f64): f64 { return self.y * k }',
+                "function mulSw(self: Sw, k: f64): f64 { return self.y * k }",
+                "function altSw(): Sw {", "  const r: Sw = { y: 9.0 }", "  return r",
+                "}"],
+        "expr": None, "mk": ["const r: {T} = { y: 3.0 }", "return r"],
+        "alt": "altSw()", "alt_infers": True,
+        "features": ["struct", "operator", "op_samew", "opw_same"],
+        "reads": [{"id": "op", "op": "*", "opw": "same",
+                   "lines": ["print({v} * 2.5)"], "want": ["7.5"]},
+                  {"id": "call", "op": "*", "opw": "same",
+                   "lines": ["print(mulSw({v}, 2.5))"], "want": ["7.5"]}],
+    },
 ]
 
 # ---------------------------------------------------------------------------
