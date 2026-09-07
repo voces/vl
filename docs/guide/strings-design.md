@@ -1079,14 +1079,15 @@ is re-slicing enough?*
 
 **OQ-2 — string building, interpolation, and formatting. INTERPOLATION IS SHIPPED
 (2026-09-01), `std:fmt` exists; the builder remains.** The perf half was already done
-(B7b fusion, §Mutability). The spelling ruled and built is `\{name}` — in a plain
-`"Hello \{name}"` as well as in a backtick `` `Hello \{name}` ``, one hole syntax for both
-quoted forms (owner, 2026-09-01, "OK do `\{`"; the trigger sits in the ESCAPE namespace so a
-bare `{` stays data in every string forever). Backticks add MULTILINE and nothing else. And
-`std:fmt` does back it — but not by scope lookup: a hole binds ABSOLUTELY to std's
-renderer through a compiler-injected import, so a template's meaning does not depend on
-the file's imports (DECISIONS.md, "A template literal's stringifier is bound
-ABSOLUTELY"). The hole domain is `string` plus whatever `std:fmt`'s renderer takes,
+(B7b fusion, §Mutability). The spelling ruled and built is `\{name}` in a plain
+`"Hello \{name}"` (owner, 2026-09-01, "OK do `\{`"; the trigger sits in the ESCAPE namespace
+so a bare `{` stays data in every string forever). MULTILINE is the same literal's: a raw
+newline inside `"…"` is content and a `\` before one joins the next line, stripping its
+indentation (owner, 2026-09-06 — Rust's rule; the backtick form that briefly carried
+multiline alone is removed). And `std:fmt` does back it — but not by scope lookup: a hole
+binds ABSOLUTELY to std's renderer through a compiler-injected import, so a string's
+meaning does not depend on the file's imports (DECISIONS.md, "A template literal's
+stringifier is bound ABSOLUTELY"). The hole domain is `string` plus whatever `std:fmt`'s renderer takes,
 read off its declared parameter rather than spelled in the compiler — so serde
 Stage 0's f64 arm widened it with no template-side edit. *Remaining: an explicit
 builder type for cases fusion cannot see.*

@@ -1907,6 +1907,17 @@ three callers instead would have been three more places to forget.
 
 ## Parser, distribution & bootstrapping
 
+- **ONE string form, and it spans lines (owner ruling 2026-09-06).** A `"…"` literal keeps a
+  raw newline as content, and a `\` immediately before a newline joins the next line and
+  strips its indentation — Rust's rule, chosen because it lets a long literal be laid out with
+  the code that holds it without the layout becoming part of the string. The backtick form is
+  REMOVED, not deprecated: it existed for six days and carried multiline alone, which was the
+  only rule the two grammars disagreed about, so unifying them deletes a grammar rather than
+  adding one (`compiler/lexer.vl` shrank). A backtick is refused BY NAME, naming the surviving
+  spelling — the refusal lives in the lexer, where the character is seen, because lexing and
+  parsing are one phase to `vl check` and a character with no meaning needs no token kind.
+  The one non-additive edge is the indentation strip: `"ab\<newline>  cd"` was `ab  cd` and is
+  now `abcd`, so a space that is wanted goes BEFORE the backslash, where it is content.
 - **Hand-written parser over a generator.** Dropped antlr4 (Java/Gradle build
   step; can't be part of a self-hosted compiler). Chose hand-written (Pratt)
   over peggy/parser-combinators for error quality and bootstrappability. (Track
