@@ -54,7 +54,6 @@ units: **hours** · **half-day** · **days**.
 | 9 | **`vl build` with no `-o` writes a file instead of stdout** | `vl build p.vl > out.bin` → `out.bin` holds `wrote p.wasm (147 bytes)` | `scripts/vl-host/src/main.rs` build arm; already "decided: yes" | **hours** |
 | 10 | **Organize Imports drops an unused specifier but not a DUPLICATE one** | `server.ts:1491 .filter((d) => d.code === "unused-import")` | `lsp/src/server.ts:1489-1500` | **hours** |
 | 13 | **B-ci — `build.rs` bakes `VL_SEED_KEY`, so every seed push recompiles the crate** | `scripts/vl-host/build.rs:76` `println!("cargo:rustc-env=VL_SEED_KEY={h:016x}")` | `scripts/vl-host/build.rs` | **hours** |
-| 14 | **B-chore — three split-form list stores never re-fused** | `emit_rep.vl:3151 / :3347 / :3369` still carry the split form and its comment | `rtGo` / `rtOfNullable` / `rtOfMap` | **hours** (verify the store fix has published first) |
 | 18 | **B8 — the two `for` gaps that need a RULING, not a build** | objects → `a struct's fields are not a sequence …`; float bounds/step → `a `for` range counts in i32 …`. The other two members BUILT 2026-09-07: `for v, i in xs` / `for k, v in m` and an expression `step` | `open-rulings.md` §B8-for-struct, §B8-for-float-range — each has options, peers and a recommendation; neither is a build until it is ruled | ruling |
 | 20 | **A9 — no element-converting / field-dropping container copy** | `Cat[]` into an `Animal[]` param → `…type-valid (structural width subtyping) but not yet supported by codegen…` | `typecheck.vl` refusals + the converting-copy lowering; wire every delivery position BEFORE narrowing the gate | days |
 | 22 | **B-debug — a trap frame names `function@file:line`; the LINE is the DECLARATION's, not the trapping instruction's (2026-09-07)** | `print(a[7])` → `vl!__start__@1`; a two-file program → `vl!boom$m1@lib.vl:1` and `vl!__start__@main.vl:1`. The message still carries no index or length, and a frame still cannot say WHICH line inside the function trapped | the per-instruction map is what remains: a name-section string is per FUNCTION, so the trapping line needs a real source map (a custom section the host reads) — and the host would then change, with the three-hosts rule | days |
@@ -2862,13 +2861,17 @@ in-language GC knobs.
   §1.5.1 records that correction as the method point it is).
 - ⬜ **B18. Tail-call optimization** (low priority). binaryen 130 has `return_call`; detect tail
   position and emit it.
-- ⬜ **B-chore-liststore-fuse. Re-fuse the three split-form list stores in `emit_rep.vl`**
-  (one-liner). The indexed-store eval-order fix (the #918 family's LIST twin — `a[i] = f()`
-  where `f` reallocates `a`'s backing) landed, but #921's split-form workarounds at the tree
-  builders (`rtGo`'s array arm, `rtOfNullable`, `rtOfMap` — comment-marked) must stay ONE seed
-  generation: the published seed's store lowering predates the fix (bootstrap ordering, the
-  #918 precedent). Once a seed containing the fix publishes, swap each split temp back to the
-  fused `rtChild[ix] = …` store.
+- ✅ **B-chore-liststore-fuse. The three split-form list stores in `emit_rep.vl` are re-fused.**
+  #921's workarounds at the tree builders (`rtGo`'s array arm, `rtOfNullable`, `rtOfMap`) had to
+  stay ONE seed generation, because the published seed's store lowering predated the indexed-store
+  eval-order fix (the #918 family's LIST twin — `a[i] = f()` where `f` reallocates `a`'s backing).
+  **The precondition was graded behaviourally rather than by reading**, since a grep cannot say
+  whether a seed's lowering is fixed: `tests/cases/eval-order/indexed-store-rhs-reallocates.vl`
+  prints `7` and `67` where a stale backing would print `0`, and it stays as the row's own gate.
+  Each store is the fused `rtChild[ix] = …` form its sibling at the nullable-litunion arm already
+  used; `rtOfMap`'s moves into both branches so it still follows its own call. Byte-identical over
+  both populations. **The row's cited coordinates had drifted** — the sites were at 3197 / 3393 /
+  3415, not 3151 / 3347 / 3369, which is why the grep is run before the row is believed.
 - 🐛 **B-bug. `while` as the tail statement of a void function crashes binaryen's Vacuum pass.**
   A `while` loop in *tail position* of a `void`-returning function body aborts inside binaryen
   optimization. Workaround: don't end a void function on a bare `while`. Fix: investigate the
