@@ -1567,8 +1567,8 @@ in-language GC knobs.
         call-site count, not a conversion backlog. What was genuinely left was 16 raw table
         reads, 14 of them one shape (`fRetKind[fe] == "<kind>"` at eleven classifiers), now
         `repOfFnSlot(fe)` — the fe-keyed primitive `repOfNameResult` factors onto. The 2 left
-        are `localLitUnion`, the literal-union carve-out. Byte-identical in 3,174 + 7,589, seed
-        −368. **And the census's own ranking misleads here**: `exprIsLitAtom` has the most
+        are `localLitUnion`, the literal-union carve-out. Byte-identical in 3,175 + 7,589, seed
+        −327. **And the census's own ranking misleads here**: `exprIsLitAtom` has the most
         producers and the most call sites (71) and is the family's WORST target, being the
         litunion carve-out itself. `docs/internals/rep-descriptor-campaign.md` §6.8.
      5. ⬜ **The return-kind family** — `retResultVKind` + the fourteen `fnRet*Sid` readers;
