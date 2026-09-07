@@ -94,23 +94,23 @@ export const GATE_CASES: readonly GateCase[] = [
     native: "skip",
   },
   // — interpolation holes `\{…}`: the second construct that arms the loop.
-  //   The trigger lives in the ESCAPE namespace, so it is legal in BOTH quoted
-  //   forms and the gate has to scan both. `${` is no longer a trigger anywhere.
+  //   The trigger lives in the ESCAPE namespace, and since 2026-09-06 there is one
+  //   quoted form to scan. `${` is not a trigger anywhere.
   {
-    name: "template with an i32 hole",
-    source: "const x = 5\nprint(`v=\\{x}`)\n",
-    arms: true,
-    native: "clean",
-  },
-  {
-    name: "PLAIN STRING with an i32 hole (the arm plain-string interpolation added)",
+    name: "a string with an i32 hole",
     source: 'const x = 5\nprint("v=\\{x}")\n',
     arms: true,
     native: "clean",
   },
   {
-    name: "hole-less template stays on the single-source path",
-    source: "print(`plain`)\n",
+    name: "a MULTI-LINE string with an i32 hole — the gate scans past the newline",
+    source: 'const x = 5\nprint("v=\\{x}\nand more")\n',
+    arms: true,
+    native: "clean",
+  },
+  {
+    name: "a hole-less string stays on the single-source path",
+    source: 'print("plain")\n',
     arms: false,
     native: "clean",
   },
@@ -127,13 +127,13 @@ export const GATE_CASES: readonly GateCase[] = [
     native: "clean",
   },
   {
-    name: "`${` in a template is ordinary text now, so it does not arm",
-    source: "print(`v=${x}`)\n",
+    name: "`${` in a string is ordinary text, so it does not arm",
+    source: 'print("v=${x}")\n',
     arms: false,
     native: "clean",
   },
   {
-    name: "a backtick in a `//` comment is not a template",
+    name: "a backtick in a `//` comment is prose, not a refused delimiter",
     source: "// a ` backtick in prose, and a ${ too\nprint(1)\n",
     arms: false,
     native: "clean",

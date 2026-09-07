@@ -508,12 +508,14 @@ const config: LanguageConfiguration = JSON.parse(
 Deno.test("language-config: the pairs the extension already shipped are intact", () => {
   eq(config.comments.lineComment, "//", "line comment");
   eq(config.brackets, [["{", "}"], ["[", "]"], ["(", ")"]], "brackets");
-  // Six: the three brackets, `"`, `'`, and the backtick a TEMPLATE literal opens.
-  eq(config.autoClosingPairs.length, 6, "auto-closing pairs");
-  eq(config.surroundingPairs.length, 6, "surrounding pairs");
+  // Five: the three brackets, `"` and `'`. The backtick pair is GONE with the literal form
+  // it opened — a backtick is refused by the lexer now, so autoclosing one would offer the
+  // editor's help writing a character the compiler rejects.
+  eq(config.autoClosingPairs.length, 5, "auto-closing pairs");
+  eq(config.surroundingPairs.length, 5, "surrounding pairs");
   for (const p of ["autoClosingPairs", "surroundingPairs"] as const) {
-    if (!config[p].some((x) => x.open === "`" && x.close === "`")) {
-      throw new Error(`${p} is missing the template-literal backtick pair`);
+    if (config[p].some((x) => x.open === "`")) {
+      throw new Error(`${p} still carries the retired backtick pair`);
     }
   }
 });

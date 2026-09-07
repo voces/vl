@@ -1949,19 +1949,17 @@ Deno.test({
   fn: async () => {
     const src = [
       "const x = 5",
-      "const plain = `no holes`",
-      "const one = `v=\\{x} done`",
-      "const spaced = `\\{ x + 1 }`",
-      'const chained = "a" + `b\\{x}c` + "d"',
-      'const esc = `\\` and \\\\{ and " and \\\\`',
-      "const multi = `line1",
-      "  line2`",
+      'const plain = "no holes"',
       'const sHole = "v=\\{x} done"',
       'const sSpaced = "\\{ x + 1 }"',
       'const sChained = "a" + "b\\{x}c" + "d"',
       'const sBrace = "{plain} and ${x}"',
-      "print(plain + one + spaced + chained + esc + multi)",
-      "print(sHole + sSpaced + sChained + sBrace)",
+      'const multi = "line1',
+      '  line2"',
+      'const joined = "a \\',
+      '    b"',
+      "print(plain + sHole + sSpaced + sChained + sBrace)",
+      "print(multi + joined)",
       "",
     ].join("\n");
     const r = await run([], src);
@@ -1970,16 +1968,13 @@ Deno.test({
     }
     // Every literal's own bytes must survive, character for character.
     const literals = [
-      "`no holes`",
-      "`v=\\{x} done`",
-      "`\\{ x + 1 }`",
-      "`b\\{x}c`",
-      '`\\` and \\\\{ and " and \\\\`',
-      "`line1\n  line2`",
+      '"no holes"',
       '"v=\\{x} done"',
       '"\\{ x + 1 }"',
       '"b\\{x}c"',
       '"{plain} and ${x}"',
+      '"line1\n  line2"',
+      '"a \\\n    b"',
     ];
     for (const lit of literals) {
       if (!r.out.includes(lit)) {
@@ -1989,7 +1984,7 @@ Deno.test({
       }
     }
     // The desugar must not surface: neither the injected renderer's name nor a
-    // concatenation standing in for a template.
+    // concatenation standing in for an interpolated literal.
     if (r.out.includes("$tpl$")) {
       throw new Error(`fmt printed the desugared render call:\n${r.out}`);
     }
