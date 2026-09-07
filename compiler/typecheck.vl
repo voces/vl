@@ -5355,6 +5355,11 @@ function softenLitTy(ty: i32) {
   ty
 }
 
+// Does `ty` concatenate as a string? The `+` gate's operand test, in one home because the
+// checker and its pin mirror must not drift about it (D1732). A literal union of strings is a
+// SET of strings, so it concatenates and the result is `string` — never the union (D1739).
+function concatsAsStr(ty: i32): boolean { isStringTy(softenLitTy(ty)) }
+
 // The literal type of a literal expression, or -1 when the expression is not a bare literal. Peels
 // parens. The string text is the raw lexeme between the quotes — the same characters a literal-type
 // annotation keeps — so membership compares consistently. The quote peel here is deliberately not
@@ -18336,11 +18341,11 @@ function binOpDefinedFor(op: string, lt0: i32, rt0: i32) {
   // puts it — self-function overloads only; the operator-field route is `objOpDispatchTy`'s.
   if objOpSelfDispatchTy(op, lt0) >= 0 { return true }
   if op == "+" {
-    // Unsoftened types on purpose: `checkBinary`'s `+` arm concatenates strings and lists
-    // before softening a literal union, and mirroring that order matters for what it accepts.
-    // Its gate is ONE operand being the `string` prim plus mutual assignability, not both being
-    // it — the narrower reading refused at the pin what the annotation accepts (D1732).
-    if isStringTy(lt0) || isStringTy(rt0) {
+    // The unsoftened pair on purpose: `checkBinary`'s `+` arm concatenates strings and lists
+    // before the arithmetic tail softens, and mirroring that order matters for what it accepts.
+    // Its gate is ONE operand concatenating AS a string plus mutual assignability, not both
+    // being the prim — the narrower reading refused at the pin what the direct spelling takes.
+    if concatsAsStr(lt0) || concatsAsStr(rt0) {
       if assignable(lt0, TY_STR) && assignable(rt0, TY_STR) {
         return true // string concat
       }
@@ -19657,6 +19662,12 @@ function substHoleTyReal(tyIx: i32, bNames: string[], bTys: i32[]) {
     if tyIsHole(innerB) { return rebaseDerivedHole(row, innerB) }
     const dTy = objOpSelfDispatchTy(hdField[row], innerB)
     if dTy >= 0 { return dTy }
+    // A pinned operand that concatenates as a string makes `+` a concat, whose result is
+    // `string` and not the operand — the same answer `checkBinary`'s own arm reaches once the
+    // hole is concrete, which is the agreement the pin exists to keep (D1739).
+    if hdField[row] == "+" {
+      if concatsAsStr(innerB) { return TY_STR }
+    }
     // No dispatch: the body's own answer, which may itself name this hole (`return lt` for
     // the arithmetic tail) or be concrete (`TY_BOOL` for an ordering comparison).
     return substTyDeep(hdInner[row], bNames, bTys)
@@ -24123,6 +24134,12 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
                     "expected " + tyToStr(ret) + ", got " + tyToStr(stTy),
                     stmts[s],
                   )
+                } else {
+                  // The check above is vacuous whenever a side is a hole, exactly as the
+                  // explicit `return`'s is — so the implicit return records the same pair for
+                  // the pin to re-ask under substitution. Without it a generic's TAIL
+                  // expression loses the refusal its `return` spelling makes (D1739).
+                  noteRetCstr(stTy, ret, stmts[s])
                 }
               }
             }
@@ -30862,11 +30879,18 @@ function mkBinOpRetTy(n: BinExpr, bTy: i32, lt: i32) {
   // whole — an overload has no second answer for a form the direct spelling doesn't lower either.
   if n.binCompound != "" { return bTy }
   const op = n.binOp
-  // Only an operator a user can declare can carry an overload, so nothing else has a second
-  // answer at a pin (`ast.vl:isBinOpFuncName`, the ten names a declaration admits).
-  if !isBinOpFuncName(op) { return bTy }
-  if (fnDeclIx[op] ?? -1) < 0 { return bTy }
   if !tyIsHole(lt) { return bTy }
+  // `+` over a hole has a second answer with no overload declared: a pinned literal union
+  // CONCATENATES, and the result is `string` rather than the operand the arithmetic tail
+  // handed back. Only that shape defers — a body answer that is not the operand already
+  // names its own type (D1739).
+  const plusDefers = op == "+" && bTy == lt
+  if !plusDefers {
+    // Only an operator a user can declare can carry an overload, so nothing else has a second
+    // answer at a pin (`ast.vl:isBinOpFuncName`, the ten names a declaration admits).
+    if !isBinOpFuncName(op) { return bTy }
+    if (fnDeclIx[op] ?? -1) < 0 { return bTy }
+  }
   // An annotated body is not excluded: D551 re-checks the annotation against the
   // resolved body type at each pin (`noteRetCstr`/`validateRetCstrs`), so a per-pin deferral is safe.
   const d = mkDerivedHole(HD_BINOP, op, bTy, -1, lt)
@@ -31385,9 +31409,10 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
   }
   // `+` also concatenates strings.
   if op == "+" {
-    // String concat needs an operand that actually IS a string — a hole is permissively
-    // assignable to string, so this defers a two-hole `a + b` to the call site (`substTyDeep`).
-    if isStringTy(lt) || isStringTy(rt) {
+    // String concat needs an operand that concatenates AS a string — a hole is permissively
+    // assignable to string, so this defers a two-hole `a + b` to the call site (`substTyDeep`),
+    // and a NUMERIC member set softens to its own base and falls to the arithmetic tail.
+    if concatsAsStr(lt) || concatsAsStr(rt) {
       if assignable(lt, TY_STR) && assignable(rt, TY_STR) { return TY_STR }
       // A `new string` newtype concatenates (with a same-brand value or a literal) and keeps
       // the brand — otherwise it would be the one newtype whose values could never be joined.
@@ -31418,7 +31443,11 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
     }
   }
   // Remaining arithmetic: numeric-only, both the same numeric type (no implicit i32<->f64).
-  // A literal/all-literal-union operand softens to its base scalar first.
+  // A literal/all-literal-union operand softens to its base scalar first. The refusal below
+  // renders the pair the user WROTE: softening is how the operand is checked, not what it is,
+  // and a message naming the base leaves a member set looking like a contradiction (D1739).
+  const ltWrote = lt
+  const rtWrote = rt
   lt = softenLitTy(lt)
   rt = softenLitTy(rt)
   // A hole operand reaching arithmetic is used numerically — record the demand so the call-arg
@@ -31430,9 +31459,9 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
       "operator '" +
         op +
         "' is not defined for " +
-        tyToStr(lt) +
+        tyToStr(ltWrote) +
         " and " +
-        tyToStr(rt),
+        tyToStr(rtWrote),
       ix,
     )
     return TY_ERR

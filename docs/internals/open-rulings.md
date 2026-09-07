@@ -532,7 +532,9 @@ a name-derived key needs a definite-assignment argument the narrowing stack does
 `let i` must be excluded by a rule that does not exist. **Recommendation: yes, for `const`
 bindings only** (a `let` index keeps the refusal, with a message that says why).
 
-### D1736 — does an `is T` pin survive a `while` loop's re-execution barrier? — RULED 2026-09-06
+### D1736 — does an `is T` pin survive a `while` loop's re-execution barrier? — RULED 2026-09-06, REOPENED the same day
+
+**Reopened (2026-09-06, #2821):** built as ruled, the pin refuses the write that terminates a loop over a union — `while (x is i64) { … x = true }` (`tests/cases/unions/paren-is-narrow.vl`) became `cannot assign boolean to i64`, a `runs → not-runs` on a corpus program, and `tests/cases/loops/while-body-is-guard-not-narrowed.vl` is a standing contract that predicted it. The same rule holds in an `if` today (`if x is i64 { x = true }` is refused): a narrowed binding's type is also what it ACCEPTS. The question is about writes, not loops. **Options.** (a) narrowing applies to READS only; a write is checked against the declared type and re-narrows the binding to what was written — TypeScript's and Kotlin's rule; `if` and `while` then both narrow and the loop is legal; it changes what an `if` branch accepts today. (b) keep "the narrowed type is what it accepts"; `while` bodies stay un-narrowed by `is`; D1736 closes as DESIGN with the contract fixture as its witness. **Recommendation: (a).**
 
 **Ruling (owner, 2026-09-06):** (a) — yes; an `is` pin at a loop head is the null strip's twin, retired by a write to the receiver exactly as `!= null` is. D1736 is a capability row.
 
@@ -571,7 +573,7 @@ nested list element keeps one-per-line, so the rule is decidable from the elemen
 
 ### D1773 — a negation type in a many-values-per-slot position: refused, by design or by gap? — RULED 2026-09-06
 
-**Ruling (owner, 2026-09-06):** a WRITTEN negation type (`!T` in any annotation — binding, alias, parameter, element, field, map value, return) is refused by the checker with one sentence; `x !is T` narrowing over a union stays, since there the "not T" is subtracted from a known set and is never written. Full negation tracking waits for A4/A12. D1773, D1775, D1784, D1785 and D1800 close as DESIGN — the last three were filed on PRs closed unmerged and are re-filed by the refusal lane; #2790's alias-transparency rungs are removed by the refusal lane; #2807 and #2813 were closed unmerged.
+**Ruling (owner, 2026-09-06):** a WRITTEN negation type (`!T` in any annotation — binding, alias, parameter, element, field, map value, return) is refused by the checker with one sentence; `x !is T` narrowing over a union stays, since there the "not T" is subtracted from a known set and is never written. A negation as an INTERSECTION operand (`(0 | 1 | 2) & !2`) is the type-level subtraction from a known set and stays legal — the `&` fold subtracts it and the annotation's own type is the positive remainder; a stored `!T` (`A & (B | !C)`) is refused with the rest (#2818 measured six shipping fixtures on this line). Full negation tracking waits for A4/A12. D1773, D1775, D1784, D1785 and D1800 close as DESIGN — the last three were filed on PRs closed unmerged and are re-filed by the refusal lane; #2790's alias-transparency rungs are removed by the refusal lane; #2807 and #2813 were closed unmerged.
 
 `type N = !string` is a checker-only refinement with no rep of its own, so a BINDING takes its
 initializer's rep and now runs (D1775, #2790; D1773's nine owed cells, #2807). The ten cells
