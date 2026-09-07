@@ -5468,10 +5468,21 @@ move is **1,834,521 → 1,996,118 (+8.8%)** across four landings on 2026-09-03 (
 endpoint is confirmed here — the fixpoint ladder at `ff4b5f04` prints 1,996,118 — and the
 starting figure is as reported, not re-derived.
 
-`scripts/seed-size.py` makes it a gated number, in the shape `scripts/comment-budget.py`
+`scripts/seed-size.vl` makes it a gated number, in the shape `scripts/comment-budget.py`
 already proved: a committed baseline, `--check` in `scripts/gate.sh` and in ci-native, and
 `--write-baseline` in the SAME PR as the change that earned the growth. A jump then names its
 own landing instead of being attributed weeks later.
+
+**It is WRITTEN IN VL**, ported from the Python that first carried it — the dogfooding lane's
+first orchestrator script, so the ratchet is compiled by the very seed it measures. Two
+consequences worth writing down rather than discovering. The row now needs the built binary and
+a working seed where a `stat` and a `json.load` needed neither, which is why it sits after the
+build in both callers and cannot report when the seed itself is broken. And the port is graded
+by having RUN BESIDE the Python, output for output, with the three places they could not agree
+named and asserted in `tests/vl_seed_size_port_test.ts` — the one-decimal percentage's rounding
+(there is no fixed-precision renderer in `std:fmt`), the tool its own regressed message names,
+and the stream a loud failure uses (VL has no stderr sink). The two gaps have rulings in
+`open-rulings.md` §D; the port routes around them with comments naming each.
 
 ### Why +3%, and why it does not block on shrinkage
 
