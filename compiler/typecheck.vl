@@ -804,6 +804,16 @@ let solvedParamTys: {[string]: i32} = Map()
 // registry renders `i32 | "err"` as `i32|string`. `-2` marks a hole two calls pinned
 // differently — one wasm function serves both, so the reader must decline to narrow.
 let holePinTys: {[string]: i32} = Map()
+// Argument demands parked on a hole: an argument whose type still rides an unsolved hole is
+// assignable to anything, so the comparison a concrete parameter deserves cannot be answered
+// where it is asked. Each row is re-asked as the hole takes a pin (D1821). `argPinDone` marks
+// a row that already reported, so two pins do not report twice.
+let argPinWant: i32[] = []
+let argPinGot: i32[] = []
+let argPinNode: i32[] = []
+let argPinNo: i32[] = []
+let argPinDone: i32[] = []
+let argPinChecking = false
 // Per hole-carrying function type: the same signature with each hole at its banked pin,
 // minted once however many classifiers ask for it (D1794).
 let pinFnTy: {[i32]: i32} = Map()
@@ -3413,6 +3423,12 @@ export function initChecker() {
   ufcsWhyData = []
   solvedParamTys = Map()
   holePinTys = Map()
+  argPinWant = []
+  argPinGot = []
+  argPinNode = []
+  argPinNo = []
+  argPinDone = []
+  argPinChecking = false
   pinFnTy = Map()
   paramSolveTried = Map()
   holeFlowSrc = []
@@ -19684,6 +19700,71 @@ function rebaseDerivedHole(row: i32, innerTy: i32) {
   -1
 }
 
+// A function-typed parameter, read off the arena. The demand this row parks is a FUNCTION
+// value's signature; a scalar or shape parameter whose argument rides a hole is the recorded
+// demand's business (`holeDemandOk`) and already reports, so parking one would say it twice.
+function tyIsFuncArena(tyIx: i32): boolean {
+  if tyIx < 0 || tyIx >= T.tys.length { return false }
+  const t = T.tys[tyIx]
+  t is TyFunc
+}
+
+// Is this argument a generic function taken as a VALUE — `applyTS(idT)`, where the boundary
+// itself binds `idT`'s own `<T>` and a second boundary binds it differently in the same
+// program? Such a hole belongs to the argument's declaration, not to an enclosing frame, so
+// it is pinned per boundary and no parked demand may be re-asked against another's pin.
+function argIsOwnGenericFnValue(argIx: i32): boolean {
+  if argIx < 0 || argIx >= P.nodes.length { return false }
+  const a = P.nodes[argIx]
+  if a is Ident {
+    const d = fnDeclIx[a.identName] ?? CSTR_NODECL
+    if d >= 0 && d < P.nodes.length {
+      const fd = P.nodes[d]
+      if fd is FuncDecl { return fd.fnTyParams.length > 0 }
+    }
+  }
+  false
+}
+
+// Park the comparison a concrete parameter deserves but cannot get yet: `got` still rides an
+// unsolved hole, so `assignable` says yes to everything. Re-asked per pin by `argPinRecheck`.
+function argPinPark(want: i32, got: i32, argIx: i32, argN: i32) {
+  argPinWant.push(want)
+  argPinGot.push(got)
+  argPinNode.push(argIx)
+  argPinNo.push(argN)
+  argPinDone.push(0)
+  0
+}
+
+// Re-ask every demand parked on `name` with the pin substituted. Re-entrancy-guarded, since
+// `substTyDeep` banks derived holes and would re-enter through `notePinnedHole`.
+function argPinRecheck(name: string, ty: i32) {
+  if argPinChecking { return 0 }
+  argPinChecking = true
+  const bN: string[] = []
+  const bT: i32[] = []
+  bN.push(name)
+  bT.push(ty)
+  let i = 0
+  while i < argPinWant.length {
+    if argPinDone[i] == 0 {
+      const sub = substTyDeep(argPinGot[i], bN, bT)
+      // Only a substitution that CHANGED the type says this pin reaches this demand, and only
+      // a fully concrete result can be compared.
+      if sub >= 0 && sub != argPinGot[i] && !tyHasTyVar(sub) {
+        if !assignable(sub, argPinWant[i]) {
+          argPinDone[i] = 1
+          argMismatchErr(argPinNo[i], argPinWant[i], sub, argPinNode[i])
+        }
+      }
+    }
+    i = i + 1
+  }
+  argPinChecking = false
+  0
+}
+
 // Banks the pin `ty` a hole named `name` took. First pin wins; a disagreeing second pin
 // poisons the row to `-2`, which `pinnedHoleTyOf` reads as "no answer" — the emitter lowers
 // one body for every call, so a rep read off one call's pin would miscompile at the other.
@@ -19691,6 +19772,7 @@ function rebaseDerivedHole(row: i32, innerTy: i32) {
 function notePinnedHole(name: string, ty: i32) {
   if inferQuiet { return 0 }
   if ty < 0 { return 0 }
+  argPinRecheck(name, ty)
   const cur = holePinTys[name] ?? -1
   if cur == -1 {
     holePinTys[name] = ty
@@ -22766,6 +22848,15 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
       // Anchored at the offending argument (or its offending return site),
       // never at the call node — see `argMismatchErr`.
       argMismatchErr(i + 1, expected, at, args[i])
+    } else if !tyIsHole(params[i]) {
+      // It passed, and for a hole-bearing argument that means nothing: a hole is assignable
+      // to anything, so a concrete parameter's comparison is answered before the deciding
+      // type exists. Parked here and re-asked as the hole takes a pin (D1821).
+      if tyHasTyVar(at) && tyIsFuncArena(expected) {
+        if !argIsOwnGenericFnValue(args[i]) {
+          argPinPark(expected, at, args[i], i + 1)
+        }
+      }
     }
     i = i + 1
   }
