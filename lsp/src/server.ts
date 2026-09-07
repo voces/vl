@@ -914,12 +914,14 @@ const wordAt = (line: string, character: number): string | null => {
   return /^[A-Za-z_]/.test(word) ? word : null;
 };
 
-// Render a hover body as a fenced `vital` code block so the client syntax-
-// highlights it via the TextMate grammar (rather than flat inline `code`). The
-// fence info string must match the registered language id (`VL_LANGUAGE_ID`).
-const hoverMarkdown = (code: string): Hover["contents"] => ({
+// Render a hover body through `docMarkdown`: the declaration's `///` block (D9.11)
+// as prose, then the type as a fenced `vital` code block the client syntax-highlights
+// via the TextMate grammar. One layout for hover and completion — the fence info string
+// must match the registered language id. An undocumented declaration is the bare fence,
+// byte for byte what this rendered before docs existed.
+const hoverMarkdown = (code: string, doc?: string): Hover["contents"] => ({
   kind: "markdown",
-  value: "```" + VL_LANGUAGE_ID + "\n" + code + "\n```",
+  value: docMarkdown(code, VL_LANGUAGE_ID, doc),
 });
 
 // D8 stepwise alias expansion (hover verbosity): the renderer (`stringifyType`'s
@@ -988,6 +990,25 @@ connection.onHover(async (params): Promise<Hover | null> => {
         return undefined;
       });
   };
+  // The `///` block above the DECLARATION the cursor's name resolves to (D9.11).
+  // Asked once for the whole ladder: the rungs disagree about which query answers the
+  // type, but they all name the same declaration, and `ensurePrepared` is memoised so
+  // the extra query does not re-check the document.
+  const wasmDoc = async (): Promise<string | undefined> => {
+    if (wasmChecker?.docAt === undefined) return undefined;
+    return await wasmChecker
+      .docAt(
+        document.getText(),
+        entryKeyOf(params.textDocument.uri),
+        workspaceReader,
+        params.position.line,
+        params.position.character,
+      )
+      .catch((err) => {
+        connection.console.log(`[wasm-symbols] docAt failed: ${err}`);
+        return undefined;
+      });
+  };
   const wordForHover = wordAt(
     document.getText({
       start: { line: params.position.line, character: 0 },
@@ -999,9 +1020,9 @@ connection.onHover(async (params): Promise<Hover | null> => {
   // ── Kill-TS: fully self-hosted hover in "wasm" mode ────────────────────────
   // Value binding (`hoverTypeAt`, incl. imported names) → member access
   // (`memberTypeAt`) → user `type` alias (`typeAliasAt`) → builtin (native
-  // builtin list). No checkOnly/parseSymbols/importedScope. Source `///` docs are
-  // not rendered — unchanged from the prior wasm-mode behaviour (the native path
-  // never carried them; a doc-aware hover needs a separate native export).
+  // builtin list). No checkOnly/parseSymbols/importedScope. Every user rung also
+  // carries the declaration's `///` block, from `docAt` (D9.11); a builtin has no
+  // declaration to document.
   //
   // Each rung is filtered through `displayableType`: the body is rendered as a
   // fenced `vital` code block, i.e. a claim that the text is VL, so a native
@@ -1010,13 +1031,15 @@ connection.onHover(async (params): Promise<Hover | null> => {
   // rung rather than printing a type name the language does not have.
   if (wasmChecker === undefined) return null;
   if (!wordForHover) return null;
+  const doc = await wasmDoc();
   const t = displayableType(await wasmHoverType());
-  if (t) return { contents: hoverMarkdown(`${wordForHover}: ${t}`) };
+  if (t) return { contents: hoverMarkdown(`${wordForHover}: ${t}`, doc) };
   const mt = displayableType(await wasmMemberType());
-  if (mt) return { contents: hoverMarkdown(`${wordForHover}: ${mt}`) };
+  if (mt) return { contents: hoverMarkdown(`${wordForHover}: ${mt}`, doc) };
   const at = displayableType(await wasmTypeAlias());
-  if (at) return { contents: hoverMarkdown(`${wordForHover}: ${at}`) };
-  // Builtin (`print`/`i32`/…): the word in the native builtin set.
+  if (at) return { contents: hoverMarkdown(`${wordForHover}: ${at}`, doc) };
+  // Builtin (`print`/`i32`/…): the word in the native builtin set. No user
+  // declaration, so no `///` block can be above it.
   const b = wasmChecker.builtinCompletions?.().find((x) => x.name === wordForHover);
   if (b && isDisplayableType(b.detail)) {
     return { contents: hoverMarkdown(`${wordForHover}: ${b.detail}`) };

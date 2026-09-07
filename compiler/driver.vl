@@ -74,6 +74,9 @@ import { capHas } from "./emit_base"
 import { extCollect } from "./extents"
 import { nodePos, tokEndCol, tokEndLine } from "./fmt_util"
 import {
+  docCmtLine,
+  docCmtMod,
+  docCmtText,
   scopeResKind,
   scopeResName,
   scopeResRaw,
@@ -180,6 +183,7 @@ import {
   redunMsgAt,
   redunTokAt,
   symDefAt,
+  symDocAt,
   symInlayColAt,
   symInlayCount,
   symInlayKindAt,
@@ -678,6 +682,14 @@ function modCacheBound(): i32 {
 
 function vcLoadToks(src: string): i32 {
   const r = tokenize(src)
+  // The doc table is derived from this same lex and is cleared with the stream it
+  // describes: an empty `P.toks` is the first load of a compile, and module mode then
+  // accumulates one module per call the way the token stream itself does.
+  if P.toks.length == 0 {
+    docCmtLine = []
+    docCmtText = []
+    docCmtMod = []
+  }
   let i = 0
   while i < r.tokens.length {
     const t = r.tokens[i]
@@ -711,6 +723,19 @@ function vcLoadToks(src: string): i32 {
     P.diags.push({ msg: r.diags[d].msg, at: -1 })
     d = d + 1
   }
+  // A `///` on a line of its own documents whatever follows it (`symDocAt`); a trailing
+  // one comments the code beside it and is dropped, so `const x = 1 /// n` documents
+  // nothing.
+  let cm = 0
+  while cm < r.comments.length {
+    const c = r.comments[cm]
+    if c.doc && !c.trailing {
+      docCmtLine.push(c.line)
+      docCmtText.push(c.text)
+      docCmtMod.push(vcLoadMod)
+    }
+    cm = cm + 1
+  }
   P.toks.length
 }
 // The entry source and the stream the lexer produced from it, held by reference: the bank
@@ -720,6 +745,12 @@ function vcLoadToks(src: string): i32 {
 let vcEtSrc = ""
 let vcEtToks: Tok[] = []
 let vcEtLen = 0
+// The doc table that lex produced, banked beside the stream: a replay restores `P.toks`
+// without re-lexing, and one that left `docCmt*` behind would answer hover with whatever
+// the previous file's lex had put there.
+let vcEtDocLine: i32[] = []
+let vcEtDocText: string[] = []
+let vcEtDocMod: i32[] = []
 // Releases the bank. Module mode never replays it — each module's stream comes from
 // `vcLoadToksMod` — so a graph check that kept the previous file's array would hold a
 // stream alive that nothing can read.
@@ -728,6 +759,9 @@ function vcEtDrop(): i32 {
   vcEtToks = fresh
   vcEtLen = 0
   vcEtSrc = ""
+  vcEtDocLine = []
+  vcEtDocText = []
+  vcEtDocMod = []
   0
 }
 // `vcLoadToks` for the entry source, through the bank above: `tokenize` is a pure function
@@ -739,6 +773,9 @@ function vcLoadToksEntry(src: string): i32 {
   if P.toks.length == 0 && vcEtLen > 0 && vcEtSrc == src {
     P.toks = vcEtToks
     while P.toks.length > vcEtLen { P.toks.pop() }
+    docCmtLine = vcEtDocLine
+    docCmtText = vcEtDocText
+    docCmtMod = vcEtDocMod
     return P.toks.length
   }
   const tokBefore = P.toks.length
@@ -749,6 +786,9 @@ function vcLoadToksEntry(src: string): i32 {
     vcEtSrc = src
     vcEtToks = P.toks
     vcEtLen = P.toks.length
+    vcEtDocLine = docCmtLine
+    vcEtDocText = docCmtText
+    vcEtDocMod = docCmtMod
   }
   P.toks.length
 }
@@ -1454,6 +1494,16 @@ export function typeStrAt(line: i32, col: i32): i32 {
 }
 export function typeStrLen(): i32 { symTyBuf.length }
 export function typeStrCharAt(j: i32): i32 { symTyBuf[j] }
+
+// Doc hover: the `///` block above the declaration the name at (line, col) resolves to,
+// exposed per-codepoint like `typeStrAt`. "" when the declaration carries none, which is
+// also what a `//` comment and a block separated by a blank line produce.
+let docBuf: string = ""
+export function docAt(line: i32, col: i32): i32 {
+  docBuf = symDocAt(line, col)
+  docBuf.length
+}
+export function docCharAt(j: i32): i32 { docBuf[j] }
 
 // Type-alias hover: the rendered type of the user `type` NAME (struct/union alias)
 // under (line, col) — its decl name or a use in an annotation — exposed

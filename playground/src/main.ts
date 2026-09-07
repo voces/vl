@@ -304,10 +304,9 @@ monaco.languages.registerHoverProvider(VL_LANGUAGE_ID, {
         result.range.end.character + 1,
       )
       : undefined;
-    return {
-      range,
-      contents: [{ value: "```" + VL_LANGUAGE_ID + "\n" + result.contents + "\n```" }],
-    };
+    // Already markdown — the adapter composed the `///` prose and the `vital` fence
+    // through `docMarkdown` (D9.11), the same layout `server.ts` and completion use.
+    return { range, contents: [{ value: result.contents }] };
   },
 });
 
