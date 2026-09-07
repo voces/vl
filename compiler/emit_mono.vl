@@ -15,6 +15,7 @@ import {
   annGenAppSpanEnds,
   arrElemIs,
   arrElemNameRaw,
+  arrElemSuffixed,
   listElemNameOf,
   nameIsArray,
   nameIsBraceSpanEnds,
@@ -26,6 +27,7 @@ import {
   T,
   TyArray,
   TyFunc,
+  TyNullable,
   TyObj,
   TyVar,
   bindGenWalk,
@@ -459,18 +461,6 @@ function monoModuleLetTyIs(letIx: i32, want: string) {
   false
 }
 
-// The `[]` suffix over a literal's element name, GROUPING an element with two or more top-level
-// atoms. The arena renderer's rule (`arrElemRender`) applied at the one site that builds the name
-// by concatenation: bare, the suffix binds into the element's last arm, so an inferred
-// `(i32[][] | null)[]` spells `i32[][]|null[]` and no reader can see the array (D1836).
-function arrLitElemSuffixed(el: string) {
-  if el == "" { return "" }
-  const atoms: string[] = []
-  splitUnionAtoms(el, atoms)
-  if atoms.length > 1 { return "(" + el + ")[]" }
-  el + "[]"
-}
-
 // The pin a module-block binding gives, or "" — its annotation, else its initializer's own
 // answer. "" rather than a third fall-through state, so a candidate that names nothing
 // cannot stop `monoArgTyName`'s ladder.
@@ -731,6 +721,26 @@ function monoUnionPinName(ix: i32): string {
   if r != "" { return r }
   const ur = unRowOfCanon(ty)
   if ur >= 0 && ur < unNames.length { return monoAnnPinName(unNames[ur]) }
+  monoNulUnionPinName(ty)
+}
+
+// The `T | null` half of the question above, and the one arm whose pin the membership list
+// cannot supply. A nullable value union renders FLAT (`i32|string|null`): the registry keys
+// the union and not its nullable, and `nullablePartOf` splits exactly two parts so no rung
+// peels the `null` off it — while the ARENA holds both halves (D1882).
+function monoNulUnionPinName(ty: i32): string {
+  const t = T.tys[ty]
+  if t is TyNullable {
+    if t.nInner < 0 { return "" }
+    // The arena's own union row under the null is what makes the pin safe: it is the same
+    // registered union an annotated parameter names, so the instance lowers the program a
+    // non-generic function carrying that annotation already lowers.
+    if unRowOfCanon(t.nInner) < 0 { return "" }
+    // And the pin is the FLAT render, not `<alias>|null`. The alias spelling gives the
+    // instance the right cell and no unbox: `unionNameOfIdentSid` answers on the flattened
+    // member set alone, which is what canon writes for an annotated `V | null`.
+    return tyToEmitName(ty)
+  }
   ""
 }
 
@@ -1074,7 +1084,7 @@ export function monoArgTyName(ix: i32, fnIx: i32) {
       // The arena: two `TyArray` hops answer directly what two grammar cuts over a render
       // asked. The render is still the pin returned below; only the question moved.
       if nodeTyNestedElemIsBoolPrim(ix) { return nlt }
-      return arrLitElemSuffixed(arrLitElemName(ix))
+      return arrElemSuffixed(arrLitElemName(ix))
     }
     // The arena, for every other shape: a call or projection reaches this floor with a type
     // the checker recorded and no literal to read an element off. The same question the
@@ -4318,8 +4328,9 @@ function monoInstantiate(origFe: i32, callIx: i32, ctx: i32) {
               let bind = an2
               if ann != tp {
                 // `T[]` param: the argument must be an array, and its element binds
-                // `T`. `arrElemNameRaw` is the cut paired with `nameIsArray`, raw
-                // because a composite element's grouping parens are part of the binding.
+                // `T`. The binding is the UNGROUPED element, because a bare `T` param pins it
+                // verbatim and `(S|null)` is a spelling nothing interns; every `[]` put back on
+                // it goes through `arrElemSuffixed` (D1896).
                 if !nameIsArray(an2) {
                   return emitFail(
                     "emitProgram: monomorphize: expected an array argument for `" +
@@ -4329,7 +4340,7 @@ function monoInstantiate(origFe: i32, callIx: i32, ctx: i32) {
                       "`",
                   )
                 }
-                bind = arrElemNameRaw(an2)
+                bind = listElemNameOf(an2)
               }
               const b = monoBindOf(tvN, tvV, tp)
               if b == "" {
@@ -4339,7 +4350,7 @@ function monoInstantiate(origFe: i32, callIx: i32, ctx: i32) {
                 bind = b
               }
               if ann != tp {
-                pinned.push(bind + "[]")
+                pinned.push(arrElemSuffixed(bind))
                 pinTys.push(monoArgPinTyIx(args[i], ctx))
               } else {
                 pinned.push(bind)
