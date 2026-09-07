@@ -4424,7 +4424,10 @@ function fnBoundNames(fnIx: i32, out: string[]) {
   }
   if n is LetDecl { out.push(n.letName) }
   if n is ForRange { out.push(n.frVar) }
-  if n is ForIn { out.push(n.fiVar) }
+  if n is ForIn {
+    out.push(n.fiVar)
+    if n.fiVar2 != "" { out.push(n.fiVar2) }
+  }
   const kids = nodeChildren(fnIx)
   let k = 0
   while k < kids.length {
@@ -14852,7 +14855,10 @@ function cwFrameWalk(ix: i32, fr: i32) {
   const n = P.nodes[ix]
   if n is LetDecl { cwDeclare(fr, n.letName) }
   if n is ForRange { cwDeclare(fr, n.frVar) }
-  if n is ForIn { cwDeclare(fr, n.fiVar) }
+  if n is ForIn {
+    cwDeclare(fr, n.fiVar)
+    if n.fiVar2 != "" { cwDeclare(fr, n.fiVar2) }
+  }
   if n is FuncDecl {
     // The declaration's own name binds OUTSIDE the frame it opens; its params and body are in.
     cwDeclare(fr, n.fnName)
@@ -35328,23 +35334,50 @@ function checkRangeNeverRuns(fromIx: i32, toIx: i32, stepIx: i32) {
   tErrCodedData(msg, toIx, CODE_RANGE_NEVER_RUNS, data)
 }
 
+// Whether a range bound or step is float-typed. Split out so the refusal can name the form
+// that works instead of the type it wanted — a float range is a language question, not a gap
+// (`open-rulings.md` §B8-for-float-range).
+function forRangeFloatish(ty: i32) {
+  primNameOf(ty) == "f64" || primNameOf(ty) == "f32"
+}
+
 // Extracted from `checkNodeReal`'s `ForRange` arm (C3: thin the dispatcher).
 function checkForRangeNode(n: ForRange, ix: i32) {
   const frFrom = checkNode(n.frFrom)
   const frTo = checkNode(n.frTo)
   if !assignable(frFrom, TY_I32) || !assignable(frTo, TY_I32) {
-    tErr(
-      "for-range bounds must be i32, got " +
-        tyToStr(frFrom) +
-        " and " +
-        tyToStr(frTo),
-      ix,
-    )
+    if forRangeFloatish(frFrom) || forRangeFloatish(frTo) {
+      tErr(
+        "a `for` range counts in i32, so " +
+          tyToStr(frFrom) +
+          " and " +
+          tyToStr(frTo) +
+          " bounds have no step — count with an integer and scale: `for i in 0 to 10 { const x = i / 10.0 }`",
+        ix,
+      )
+    } else {
+      tErr(
+        "for-range bounds must be i32, got " +
+          tyToStr(frFrom) +
+          " and " +
+          tyToStr(frTo),
+        ix,
+      )
+    }
   }
   if n.frStep >= 0 {
     const frStep = checkNode(n.frStep)
     if !assignable(frStep, TY_I32) {
-      tErr("for-range step must be i32, got " + tyToStr(frStep), ix)
+      if forRangeFloatish(frStep) {
+        tErr(
+          "a `for` range counts in i32, so a " +
+            tyToStr(frStep) +
+            " step has no iteration count — count with an integer and scale: `for i in 0 to 10 { const x = i / 10.0 }`",
+          ix,
+        )
+      } else {
+        tErr("for-range step must be i32, got " + tyToStr(frStep), ix)
+      }
     }
   }
   checkRangeNeverRuns(n.frFrom, n.frTo, n.frStep)
@@ -35373,35 +35406,61 @@ function checkForRangeNode(n: ForRange, ix: i32) {
 function checkForInNode(n: ForIn, ix: i32) {
   const iterTy = checkNode(n.fiIter)
   let elemTy = TY_ERR
+  // The SECOND binding's type. A sequence's companion is its INDEX; a map's is the VALUE at
+  // the key just bound. A set is a sequence here, not a map: its `mVal` is the internal
+  // membership boolean, which is not a value the author wrote (`collections-design.md` C2.4).
+  let elem2Ty = TY_ERR
   const it = T.tys[iterTy]
   if it is TyArray {
     elemTy = it.aElem
     // A `u8[]` loop var binds an `i32`, never a `u8` — one iteration is one element read,
     // and a `u8` in a value position is exactly what `u8` may not be (same rule as an index read).
     if primNameOf(it.aElem) == "u8" { elemTy = TY_I32 }
+    elem2Ty = TY_I32
   } else if it is TyMap {
     // `for k in m` over a map / set iterates its keys (the key type) — like
     // `for k in m.keys()`.
     elemTy = it.mKey
+    if it.mSet == 1 { elem2Ty = TY_I32 } else { elem2Ty = it.mVal }
   } else if isStringTy(iterTy) {
     // `for ch in s` iterates a string's code units, each an i32, exactly as `s[i]` reads
     // one — a string is a `{backing, start, len}` view over an i32 array (Stage 2b).
     elemTy = TY_I32
+    elem2Ty = TY_I32
   } else if it is TyErr {
     elemTy = TY_ERR
+    elem2Ty = TY_ERR
+  } else if it is TyObj {
+    // A struct is a NOMINAL record whose fields have different types, so a loop variable over
+    // one has no type to bind, and the field read the author wants needs a key no operation
+    // accepts. The map is the collection with keyed iteration (`open-rulings.md` §B8-for-struct).
+    tErr(
+      "a struct's fields are not a sequence, so `for … in " +
+        tyToStr(iterTy) +
+        "` has nothing to iterate — use a map (`{[string]: i32}`) for keyed iteration, or read the fields by name",
+      n.fiIter,
+    )
   } else {
-    tErr("for-in expects an array or map, got " + tyToStr(iterTy), n.fiIter)
+    tErr(
+      "for-in expects an array, a map or a string, got " + tyToStr(iterTy),
+      n.fiIter,
+    )
   }
   // See ForRange: a `for` body re-executes with nothing to re-establish a narrowing.
   pushReBarrier()
   pushScope(ix)
   declare(n.fiVar, elemTy)
   if symEnabled != 0 { symDecl(n.fiVar, ix, elemTy, 0) }
+  if n.fiVar2 != "" {
+    declare(n.fiVar2, elem2Ty)
+    if symEnabled != 0 { symDecl(n.fiVar2, ix, elem2Ty, 0) }
+  }
   // Loop body may run zero times — see `WhileStmt` (A-definite-assign).
   const daFiMark = daMark()
   // See ForRange: clear the loop var from the dead-zone for the body so it can't
   // collide with a shadowed, still-uninitialized module global of the same name.
   daMarkAssigned(n.fiVar)
+  if n.fiVar2 != "" { daMarkAssigned(n.fiVar2) }
   checkNode(n.fiBody)
   daRollbackTo(daFiMark)
   daRelease(daFiMark)

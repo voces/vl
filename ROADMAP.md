@@ -58,7 +58,7 @@ units: **hours** · **half-day** · **days**.
 | 14 | **B-chore — three split-form list stores never re-fused** | `emit_rep.vl:3151 / :3347 / :3369` still carry the split form and its comment | `rtGo` / `rtOfNullable` / `rtOfMap` | **hours** (verify the store fix has published first) |
 | 15 | **A-exhaust — the provably-true final discriminant is still emitted** | `wasm-dis`: `(if (i32.eq (struct.get $3 0 …) (i32.const 1)) …)` then `(unreachable)` | `emitIs` (`wasmEmit.vl:2533`) fed by `ifChainExhausts` (`typecheck.vl:22741`) — the analysis exists, only the elision is missing | half-day |
 | 16 | **A6 residue — `is` over two ref arms is a tag compare, not `ref.test`** | `grep -rn "ref\.test" compiler/*.vl` → 0 hits | `emitIs`, `wasmEmit.vl:2533` | half-day (pure perf) |
-| 18 | **B8 — four `for` gaps, one member per row** | objects → `for-in expects an array or map, got P`; `for v, i in xs` → parse error; expression step → `undeclared identifier 'i'`; float bounds → `for-range bounds must be i32` | `typecheck.vl:34100/34156`, `parser.vl` for-head | half-day each |
+| 18 | **B8 — the two `for` gaps that need a RULING, not a build** | objects → `a struct's fields are not a sequence …`; float bounds/step → `a `for` range counts in i32 …`. The other two members BUILT 2026-09-07: `for v, i in xs` / `for k, v in m` and an expression `step` | `open-rulings.md` §B8-for-struct, §B8-for-float-range — each has options, peers and a recommendation; neither is a build until it is ruled | ruling |
 | 19 | **B6a — an i32-keyed map in four container positions** | `const u: {[i32]: f64} \| i32 = 5` → `emitProgram: an i32-keyed Map/Set is supported as … not inside '{[i32]:f64}\|i32'`; same for `[][]`, closure array, map value | `emit_collect.vl:4707 i32MapSpellingLowerable` | days (position matrix, build-then-narrow per D965) |
 | 20 | **A9 — no element-converting / field-dropping container copy** | `Cat[]` into an `Animal[]` param → `…type-valid (structural width subtyping) but not yet supported by codegen…` | `typecheck.vl` refusals + the converting-copy lowering; wire every delivery position BEFORE narrowing the gate | days |
 | 22 | **B-debug — a trap names a wasm function index, not a VL location** | `print(a[7])` → `vl!<wasm function 4>` and `out of bounds array access` with no index and no length | `scripts/vl-host/src/main.rs` trap formatting + the name section | days |
@@ -1536,13 +1536,18 @@ in-language GC knobs.
         LEFT-ONLY coverage gap (147,945 queries, headed by `reflist` at 111,683), and the one
         surviving CONTRADICT, which is `one-literal-union-rep`'s cost at a second site.
         `docs/internals/rep-descriptor-campaign.md` §6.3.
-     3. ✅ **`repOfNameResult(sid, name, fnIx)`** — the name surface, and narrower than this
-        list first guessed: only the return-kind readers wanted a REP, and the other three
-        rows wanted the SLOT or the `$fnsig` key, which `fnIndexOfInScope` already owns.
-        DONE: fourteen readers became projections, the two `#2815` left behind gained the
-        frame (closing D1834), byte-identical in 3,154 of 3,155 + 7,589 of 7,589, and the flat-vs-scoped
-        oracle contradicts in eight modules, all of them the pin-context fixtures. The
-        BINDING half — `declaredSlotOf` takes a bare name — is still owed, by item 4.
+     3. 🟡 **The name surface.** The CALLEE half is DONE as `repOfNameResult(sid, name,
+        fnIx)`, and narrower than this list first guessed: only the return-kind readers wanted
+        a REP, and the other three rows wanted the SLOT or the `$fnsig` key, which
+        `fnIndexOfInScope` already owns. Fourteen readers became projections, the two `#2815`
+        left behind gained the frame (closing D1834), byte-identical in 3,154 of 3,155 + 7,589
+        of 7,589, and the flat-vs-scoped oracle contradicts in eight modules, all of them the
+        pin-context fixtures. **The BINDING half is the prerequisite item 4 has, and it is now
+        specified**: `declaredSlotOf` takes a bare name, `paramTypeNode`/`globalLetOfSidIn`
+        take `fnIx` only as a frame-binds-this-name veto, and what is needed is one scope-chain
+        walk keyed `(name, frame)` — #2629's `(frame, sid)` table is the precedent, with the
+        trap that its frame is a `FuncDecl` ARENA index while `fnIndexOfInScopeSid`'s is an
+        `fnStmts` POSITION, both spelled `i32`. `docs/internals/rep-descriptor-campaign.md` §5.3.
      4. ⬜ **The `expr*` family** — 48 classifiers, 927 call sites, 31% of all classifier call
         sites. Converted by AXIS, since each is a closed set whose siblings must move
         together: (a) the seven scalar-list predicates, (b) the six nullable niches, (c) the
@@ -1550,16 +1555,24 @@ in-language GC knobs.
      5. ⬜ **The return-kind family** — `retResultVKind` + the fourteen `fnRet*Sid` readers;
         `fRetKind` becomes a projection rather than a parallel column. `fnRetF32ArraySid` and
         `fnRetAnnF32ArraySid` still read the flat `fnIndexOfSid` and move first.
-     6. 🟡 **The valtype and field-code ladders.** The FIELD-CODE half is DONE:
+     6. ✅ **The valtype and field-code ladders.** The FIELD-CODE half is DONE:
         `fieldCodeOfTy`'s fourteen constants are one `fieldCodeOfVKind` table, its arms are
         DOMAIN gates and its `-2` decline is unchanged — 0 CONTRADICT over 58,428 queries,
         byte-identical in 3,165 + 7,589. **The domain-WIDENING variant was refused at a price
         of 8 `tests/cases` modules `rc=0 → rc=1`**, six of them nullable fields and four
         literal-union ones, which is the campaign's second half of the conversion bar: a
         ladder's decline is an ANSWER, routed to a producer that knows more, so a domain is
-        neither removed nor widened. Remaining: the VALTYPE half — `fbValtype` (31 arms),
-        `fbValtypeNullable`, `fbRefNullForKind`, `fbHeapIdxForKind` — now the only rep
-        numbering scheme with no single translation table.
+        neither removed nor widened. The VALTYPE half is DONE too, and it
+        corrected this list: `fbValtype` and `fbValtypeNullable` were already `_`-less `match`
+        tables, `fbHeapIdxForKind` does not exist, and the family is a QUARTET —
+        `fbRefNullOfKind` is the fourth, which the code's own "trio" comment miscounted. The
+        one member not gated by the language, `fbRefNullForKind`, is now a `_`-less `match`
+        with the five scalars named and a dead second `variant` arm removed: byte-identical in
+        3,165 + 7,589, seed −113 bytes, `kind-ladder-incomplete` down one. **Folding the four
+        writers' identical bounds guard into one predicate was refused by three ratchets** —
+        `sentinel-index-unguarded` 0 → 21, because that lint's contract is within one function
+        and the guard is the evidence it needs at each read. The campaign's bar in a third
+        form: do not move a guard out of the reach of the checker that verifies it.
      7. ⬜ **The slot layer, last** — `structIndexOfExpr`, `rlSlot*`, `mvSlot*`,
         `exprVariantIndex`. `rdSlot` is nominal where the rest of the descriptor is
         structural, and nothing earlier depends on it.
@@ -2393,13 +2406,21 @@ in-language GC knobs.
 - 🟡 **B8. Loops.** **STATUS 2026-09-06: this item's own programs spell the range head
   `for i = 1 to 5`; the language spells it `for i in 1 to 5`** (`tests/cases/loops/for-step.vl:8`),
   so running them verbatim gives a parse error unrelated to the gap. Re-graded with the real
-  spelling, `for…in` over a MAP works (#568); objects, `for v, i in`, an expression `step` and
-  float bounds all still refuse. REMAINING: `for…in` over objects/maps; `for val, i in arr` and `for , v in obj`
-  destructuring forms; **expression `step`** on a counter range (`for i = 1 to 5 step i * 2` — a
-  multiplicative/variable step, not just a const increment), distinct from the const-step
-  build-loop-fusion descriptor (DECISIONS) and the `step 0` lint (B17);
-  **float for-range bounds** (`for i = 1 to 1.5` — today bounds must be i32; open up to f64, maint.
-  note on #377); **user-defined iterators** (`for x in <anything>` via an iterator protocol, so
+  spelling, `for…in` over a MAP works (#568).
+  **BUILT 2026-09-07** — the two members that were grammar and lowering rather than language
+  questions: the **second binding name** (`for v, i in xs` over a list, a string or a struct
+  list binds the INDEX; `for k, v in m` binds the map's VALUE — the entries form
+  `collections-design.md` C2.4 specified), and an **expression `step`**
+  (`for i in 0 to 6 step n * 1`), evaluated once into its own slot with its sign picking the
+  exit comparison at run time. A range refuses a second name, since it counts one value.
+  **RULING, not build** — the other two members are language questions and are written up with
+  options, peers and a recommendation in `open-rulings.md`: `for…in` over an **object**
+  (§B8-for-struct — a struct's fields have different types, so the loop variable has no type,
+  and the field read the author wants needs a key no operation accepts) and **float range
+  bounds** (§B8-for-float-range — the inherited `+1` step runs `0.0 to 1.0` once, and an
+  explicit float step has no iteration count until accumulate-vs-index is chosen). Both refuse
+  today with a sentence naming the form that works.
+  REMAINING: **user-defined iterators** (`for x in <anything>` via an iterator protocol, so
   `for…in` is not array/map-only — maint. note on #377).
 - ⬜ **B12. Concurrency — and it is NOT `async`/`await`.** The model is RULED (owner,
   2026-08-22) and written up in `docs/internals/concurrency-design.md`; nothing is built.

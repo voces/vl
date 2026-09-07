@@ -4161,6 +4161,7 @@ export function capScan(ix: i32, bound: string[], caps: string[]) {
   if n is ForIn {
     capScan(n.fiIter, bound, caps)
     bound.push(n.fiVar)
+    if n.fiVar2 != "" { bound.push(n.fiVar2) }
     capScan(n.fiBody, bound, caps)
     return 0
   }
@@ -6291,6 +6292,7 @@ export function blockPushPopBits(blockIx: i32, fnIx: i32) {
         bits = bits |
           exprPopBits(s.frFrom, fnIx) |
           exprPopBits(s.frTo, fnIx) |
+          exprPopBits(s.frStep, fnIx) |
           blockPushPopBits(s.frBody, fnIx)
       }
       i = i + 1
@@ -7787,6 +7789,7 @@ function blockHasStrOpScan(blockIx: i32, fnIx: i32) {
       } else if s is ForRange {
         if exprHasStrOp(s.frFrom, fnIx) { return true }
         if exprHasStrOp(s.frTo, fnIx) { return true }
+        if exprHasStrOp(s.frStep, fnIx) { return true }
         if blockHasStrOp(s.frBody, fnIx) { return true }
       }
       // Post-guard complement narrowing, mirroring the emit loops, so a string read below a
@@ -13614,49 +13617,7 @@ export function forInElemKind(iterIx: i32, fnIx: i32): VKind | null {
           // i32 membership booleans. A map's yields its values: i32 for the mono map, the
           // value's kind for a ref-valued map.
           if mapIsSetExpr(callee.memObj, fnIx) { return "str" }
-          const vsl = mapShapeOfExpr(callee.memObj, fnIx)
-          if vsl >= 0 {
-            if mvValKind[vsl] == 3 {
-              // A nullable string value (`{[string]: string | null}`) rides the same kind-3
-              // vals list as its non-null twin (the element slot is nullable either way), so
-              // only the loop var differs: the `string | null` niche, exactly as `const v =
-              // m[k]` binds — the non-null `"str"` var would trap on a stored null.
-              if mvSlotNullable(vsl) { return "nulstr" }
-              return "str" // string value
-            }
-            if mvValKind[vsl] == 11 {
-              return "f64" // f64 value (scalar local)
-            }
-            if mvValKind[vsl] == 10 {
-              return "i64" // i64 value (scalar local)
-            }
-            if mvValKind[vsl] == 13 {
-              return "f32" // f32 value (scalar local)
-            }
-            if mvValKind[vsl] == 14 {
-              return "closure" // closure value (`{[string]: (i32) => i32}` — loop var calls each)
-            }
-            // A list value (`{[string]: i32[]}` / `S[]` …): the loop var binds the inner
-            // value list's own rep (`mvListValKind`), exactly as a nested-array `for row in
-            // g` does. A nullable list value rides the same vals list as its non-null twin,
-            // so only the loop var differs — the niche kind, mirroring `nulstr`/`nulstruct`.
-            if mvValKind[vsl] == 6 {
-              if mvSlotNullable(vsl) { return mvNulListValKind(vsl) }
-              return mvListValKind(vsl)
-            }
-            // A union-box value (`{[string]: i32 | null}`, `{[string]: C | S}`): the vals
-            // element IS `$uBox`, so the loop var binds as a kind-4 union-box local.
-            if mvValKind[vsl] == 2 { return "union" }
-            // A nullable-struct value (`{[string]: S | null}`) rides the same kind-1 vals
-            // list as its non-null twin; the loop var is the kind-9 niche instead.
-            if mvSlotNullable(vsl) { return "nulstruct" }
-            // A union-arm value (`{[string]: Circle}` where `Circle` is a declared union
-            // member): the loop var is the kind-8 variant local, not struct — the arm's
-            // layout lives in `uVarHeap`, since `collectS` skips a union member (D50).
-            if mvValVariantOf(vsl) >= 0 { return "variant" }
-            return "struct" // struct value
-          }
-          return "i32"
+          return mapValElemKind(callee.memObj, fnIx)
         }
       }
     }
@@ -13784,10 +13745,36 @@ export function forInU8Src(iterIx: i32, fnIx: i32) {
   exprU8Array(iterIx, fnIx)
 }
 
+// Whether a `for` range's step is a constant the emitter FOLDS — absent (the implicit `+1`),
+// an integer literal, or a negated one. Anything else is evaluated once into the loop's own
+// step slot, so the collect pass and the emitter read this one predicate rather than each
+// deciding which loops own that slot.
+export function forRangeStepIsConst(stepIx: i32) {
+  if stepIx < 0 { return true }
+  const st = P.nodes[stepIx]
+  if st is Unary {
+    // A negation folds exactly when its operand is the literal — `step -1` does, `step -n`
+    // does not — which is the same question one node down.
+    if st.unOp == "-" { return exprIsNumberLiteral(st.unArg) }
+    return false
+  }
+  exprIsNumberLiteral(stepIx)
+}
+
+// Whether `ix` is a NUMBER literal. Every other expression shape is EVALUATED rather than
+// folded, which is the whole of the classification above — there is no third answer.
+function exprIsNumberLiteral(ix: i32) {
+  if ix < 0 { return false }
+  const n = P.nodes[ix]
+  if n is NumLit { return true }
+  false
+}
+
 // True when a `for v in <iter>` walks a map's ordered vals list (field 1) rather than its
 // keys list (field 0) — a `.values()` call on a map that isn't a set (a set's `.values()`
 // yields its elements, in the keys list instead). Paired with `forInMapRecv`, so the field
 // a walk reads and the type its loop var binds can never disagree.
+
 export function forInMapWalksVals(iterIx: i32, fnIx: i32) {
   const e = P.nodes[iterIx]
   if e is Call {
@@ -13813,6 +13800,87 @@ export function forInMapValsSlot(iterIx: i32, fnIx: i32) {
   const sl = mapShapeOfExpr(forInMapRecv(iterIx, fnIx), fnIx)
   if sl < 0 { return -1 }
   sl
+}
+
+// The kind a map's VALUE binds at, for both spellings that walk one: `for v in m.values()`
+// and the second name of `for k, v in m`. ONE ladder, or the two spellings agree about the
+// value's type and disagree about its rep, which is invalid wasm rather than a diagnostic.
+export function mapValElemKind(mapObjIx: i32, fnIx: i32): VKind | null {
+  const vsl = mapShapeOfExpr(mapObjIx, fnIx)
+  if vsl >= 0 {
+    if mvValKind[vsl] == 3 {
+      // A nullable string value (`{[string]: string | null}`) rides the same kind-3
+      // vals list as its non-null twin (the element slot is nullable either way), so
+      // only the loop var differs: the `string | null` niche, exactly as `const v =
+      // m[k]` binds — the non-null `"str"` var would trap on a stored null.
+      if mvSlotNullable(vsl) { return "nulstr" }
+      return "str" // string value
+    }
+    if mvValKind[vsl] == 11 {
+      return "f64" // f64 value (scalar local)
+    }
+    if mvValKind[vsl] == 10 {
+      return "i64" // i64 value (scalar local)
+    }
+    if mvValKind[vsl] == 13 {
+      return "f32" // f32 value (scalar local)
+    }
+    if mvValKind[vsl] == 14 {
+      return "closure" // closure value (`{[string]: (i32) => i32}` — loop var calls each)
+    }
+    // A list value (`{[string]: i32[]}` / `S[]` …): the loop var binds the inner
+    // value list's own rep (`mvListValKind`), exactly as a nested-array `for row in
+    // g` does. A nullable list value rides the same vals list as its non-null twin,
+    // so only the loop var differs — the niche kind, mirroring `nulstr`/`nulstruct`.
+    if mvValKind[vsl] == 6 {
+      if mvSlotNullable(vsl) { return mvNulListValKind(vsl) }
+      return mvListValKind(vsl)
+    }
+    // A union-box value (`{[string]: i32 | null}`, `{[string]: C | S}`): the vals
+    // element IS `$uBox`, so the loop var binds as a kind-4 union-box local.
+    if mvValKind[vsl] == 2 { return "union" }
+    // A nullable-struct value (`{[string]: S | null}`) rides the same kind-1 vals
+    // list as its non-null twin; the loop var is the kind-9 niche instead.
+    if mvSlotNullable(vsl) { return "nulstruct" }
+    // A union-arm value (`{[string]: Circle}` where `Circle` is a declared union
+    // member): the loop var is the kind-8 variant local, not struct — the arm's
+    // layout lives in `uVarHeap`, since `collectS` skips a union member (D50).
+    if mvValVariantOf(vsl) >= 0 { return "variant" }
+    return "struct" // struct value
+  }
+  return "i32"
+}
+
+// The kind a `for`'s SECOND name binds at. A sequence's companion is its INDEX (an i32
+// counter of body executions), a map's is the VALUE at the key just bound. A set is a
+// sequence here, not a map: its `vals` holds membership booleans nobody wrote.
+export function forInPairElemKind(iterIx: i32, fnIx: i32): VKind | null {
+  if !forInPairIsMapVal(iterIx, fnIx) { return "i32" }
+  mapValElemKind(iterIx, fnIx)
+}
+
+// Whether a `for`'s SECOND name binds a map VALUE rather than a sequence index. One
+// predicate, read by the collect pass and the emitter alike.
+export function forInPairIsMapVal(iterIx: i32, fnIx: i32) {
+  if !exprMap(iterIx, fnIx) { return false }
+  !mapIsSetExpr(iterIx, fnIx)
+}
+
+// The interned vals slot a `for k, v in m` walks — the same one `.values()` walks, without
+// the call spelling. Negative for a mono-value map, whose vals list is the plain i32 list.
+export function forInPairValsSlot(iterIx: i32, fnIx: i32) {
+  if !forInPairIsMapVal(iterIx, fnIx) { return -1 }
+  mapShapeOfExpr(iterIx, fnIx)
+}
+
+// The struct / variant table row the second name binds, when the map's value is one — the
+// same resolution `forInRefArrayStructIdx` performs for the `.values()` walk.
+export function forInPairStructIdx(iterIx: i32, fnIx: i32): i32 {
+  const vsl = forInPairValsSlot(iterIx, fnIx)
+  if vsl < 0 { return -1 }
+  if mvValVariantOf(vsl) >= 0 { return -1 }
+  if mvValKind[vsl] == 1 { return mvValStructIdxOf(vsl) }
+  -1
 }
 
 // The element struct table index of a `for v in <S[]>` iterable (the struct that the
@@ -31765,6 +31833,7 @@ export function blockHasMapOp(blockIx: i32, fnIx: i32) {
       } else if s is ForRange {
         if exprHasMapOp(s.frFrom, fnIx) { return true }
         if exprHasMapOp(s.frTo, fnIx) { return true }
+        if exprHasMapOp(s.frStep, fnIx) { return true }
         if blockHasMapOp(s.frBody, fnIx) { return true }
       } else if s is Block {
         if blockHasMapOp(stmts[i], fnIx) { return true }

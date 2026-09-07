@@ -1071,13 +1071,22 @@ collections; `count`/`extent` stay reserved for a future *sparse* collection per
 
 **Decision.** Iteration ties to **B8** and is uniform across all collections — it is
 the entries/destructuring surface the reviewer asked about (`for index, value in
-foo`), planned via **B8 destructuring**, and it is **not** Map-specific:
+foo`), planned via **B8 destructuring**, and it is **not** Map-specific. **BUILT
+2026-09-07**, exactly as specified here:
 
 - `for v in seq` — a sequence's elements.
 - `for v, i in seq` — element **and** index (the sequence + index form, the same B8
-  destructuring §VL.6 sketches for lists/arrays).
-- `for k, v in map` — a map's entries (key + value).
-- `for x in set` — a set's elements.
+  destructuring §VL.6 sketches for lists/arrays). The index is a dense count of body
+  executions, which is what makes it right for a string (whose cursor is a UTF-8
+  offset) as well as a list.
+- `for k, v in map` — a map's entries (key + value), read off the same cursor and the
+  same evaluated-once receiver the key came from.
+- `for x in set` — a set's elements; `for x, i in set` adds the index, a set being a
+  sequence here rather than a map.
+
+The **first** name keeps exactly the meaning it has with no second name, which is the
+rule that makes one form serve both shapes. A RANGE (`for i in 0 to 10`) counts one
+value and so refuses a second name.
 
 This is one destructuring mechanism (B8) pointed at each collection's natural
 "entries" shape; it applies uniformly because all three concrete collections are

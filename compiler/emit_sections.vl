@@ -486,7 +486,6 @@ import {
   letNulMapReadUnionBox,
   letUnionNameOf,
   mapAnnShape,
-  markLoopVarSlot,
   moduleHasFcpSpill,
   moduleHasNumCast,
   moduleHasUnionAs,
@@ -513,7 +512,6 @@ import {
   retVariantFlag,
   rlSlotByName,
   sFieldTypeAt,
-  scopeBind,
   scopePop,
   scopePush,
   scopeUnbind,
@@ -553,6 +551,7 @@ import {
   computeRetInference,
   computeVoidFns,
   declareForInLocals,
+  declareForRangeLocals,
   leqScanBlock,
   leqScanExpr,
   leqScanStmt,
@@ -1470,12 +1469,13 @@ function startFnDetectScratch() {
       if blockHasCallRef(startStmts[si], -1) { fnUsesCallRef = true }
     }
     if st is ForRange {
-      // The bounds are part of the start function's body — nothing scans them by default, so a
-      // `for i in 0 to (g(2) ?? 0) { }` at module scope would emit `fbLocalSet(coalesceCallSlot)`
-      // against a local the vector never declared. The in-function twins are covered
-      // (`blockHasCoalesceCall`/`blockHasArrNew`/`blockHasMapOp`/`blockPushPopBits` all walk `frFrom`/`frTo`), which is why this needed its own scan.
+      // The whole HEAD — bounds and step alike — is part of the start function's body, and
+      // nothing scans it by default: `for i in 0 to (g(2) ?? 0) { }` at module scope would
+      // emit `fbLocalSet(coalesceCallSlot)` against a local the vector never declared. The
+      // in-function twins walk it already, which is why this needed its own scan.
       startScanHeaderExpr(st.frFrom)
       startScanHeaderExpr(st.frTo)
+      startScanHeaderExpr(st.frStep)
       startScanBlock(st.frBody)
     } else if st is ForIn {
       startScanBlock(st.fiBody)
@@ -1568,10 +1568,10 @@ function collectStartLocals() {
   while i < startStmts.length {
     const s = P.nodes[startStmts[i]]
     if s is ForRange {
-      const fvSlot = addLocalName(s.frVar, "i32", -1)
-      markLoopVarSlot(fvSlot)
-      scopeBind(s.frVar, fvSlot)
-      addLocalName(s.frVar + "#b", "i32", -1)
+      // SHARED with the function-scope walk, for the reason the `ForIn` arm below states:
+      // a top-level `for` and an in-function `for` need identical slots. Duplicating it is
+      // how a non-constant `step` at module scope emitted against a local nothing declared.
+      declareForRangeLocals(s)
       if collectLocals(s.frBody, -1) < 0 {
         scopePop()
         return -1
