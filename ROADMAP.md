@@ -51,7 +51,6 @@ units: **hours** · **half-day** · **days**.
 | 2 | **D1775 — a `type` alias over a negation type reps as a union BOX with a scalar value** | `type N = !string; const x: N = 5` → `vl check` rc 0, then `type mismatch: expected (ref $type), found i32`. `wasm-dis`: `(global $global$0 (mut (ref $1)) (i32.const 5))`. The INLINE spelling runs | `typecheck.vl` / `emit_classify.vl` rep classification of an alias body | hours–half-day |
 | 4 | **B21.1 — `match` payload renaming and nested destructuring** | `Move{x: a}` → `parse error … match payload binding must be a field name` | `parser.vl:2847`; `match-design.md` measures both as one-branch extensions | hours (renaming) / half-day (nesting) |
 | 5 | **B7 R3 — `.backwards()` over a string** | `"abc".backwards()` → `no method '.backwards' on string` | `std/str.vl`; §Codepoints already specifies it | **hours** |
-| 7 | **A-robust — an unbound generic return parameter refuses at EMIT, not at check** | `function mk<T>(): T[] { return [] }; mk()` → `emitProgram: monomorphize: a return type parameter of \`mk\` is not bound by any parameter` | move it to the check tier beside `solveUnannotParams`' "cannot infer — annotate" family | **hours** |
 | 8 | **the `parseIf` `then` arm is not marked lossless** | `if c then print(1)` + a type error → the parse error ONLY; `if c print(1)` + the same → BOTH | `parser.vl:2652` needs `dgMarkLossless(P.diags.length)`, as `parseBracedBody:2633` has | **hours** |
 | 9 | **`vl build` with no `-o` writes a file instead of stdout** | `vl build p.vl > out.bin` → `out.bin` holds `wrote p.wasm (147 bytes)` | `scripts/vl-host/src/main.rs` build arm; already "decided: yes" | **hours** |
 | 10 | **Organize Imports drops an unused specifier but not a DUPLICATE one** | `server.ts:1491 .filter((d) => d.code === "unused-import")` | `lsp/src/server.ts:1489-1500` | **hours** |
@@ -2067,8 +2066,12 @@ in-language GC knobs.
   **"cannot infer — annotate"** diagnostic; it must NEVER surface as a cryptic `Unhandled "Unknown"
   type` codegen error or a `containsInfer` TypeError crash. The main trigger — `const xs = []; xs.push(1)`
   — is fixed (A-infer-empty now infers it, and the "cannot infer — annotate" floor is deferred to
-  scope-close so it fires only for a genuinely-unconstrained empty). REMAINING: audit the other holes
-  (`Map()`/`Set()` empties, unresolved generic params) for the same clean-diagnostic-not-crash guarantee.
+  scope-close so it fires only for a genuinely-unconstrained empty). The unresolved-generic half is
+  **BUILT (2026-09-06, [D1813](internals/inventory/D1813.md)/[D1819](internals/inventory/D1819.md))**:
+  a type parameter only the RETURN type names is refused at the checker, from the direct and the UFCS
+  call path alike and at the declared and the INFERRED spelling alike, with a sentence that names what
+  to write. REMAINING: audit the other holes (`Map()`/`Set()` empties) for the same
+  clean-diagnostic-not-crash guarantee.
   The `Map()` half has a **named instance**: an inferred map with a non-mono value type reaches emit
   and fails there with a message that lists `string` as supported while rejecting a `string` value —
   see **A-infer-map-value**. That one is a rep gap, not only a diagnostic gap, but it is also the
