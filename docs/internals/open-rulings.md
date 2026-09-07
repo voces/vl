@@ -545,6 +545,10 @@ the write-retire machinery covers a body that assigns. **Recommendation: yes** �
 is a null strip's twin at the loop head, with the same retirement on a write to the receiver.
 If the answer is no, the row closes as DESIGN with a message that names the loop, not the `is`.
 
+### match-empty-clause — is `Stop{}` a legal arm pattern? — RULED 2026-09-06 night
+
+**Ruling (owner, 2026-09-06 night):** (a) — BANNED. `Stop{}` today means exactly `Stop` while the nested `Wrap{p: {}}` is refused as binding nothing; the top-level form is refused with the same sentence ("`Stop{}` binds nothing — write `Stop`"), one spelling per meaning. The owner also wants parameter and `let`/`const` destructuring EVENTUALLY, with the payload clause's grammar (pun, rename, nest) — a ROADMAP item, not scheduled.
+
 ### D1686 / D1687 — what does the design owe a covariant list the closure cannot follow? — RULED 2026-09-06
 
 **BUILT 2026-09-06 (PR "a read-only list view: `readonly T[]` is covariant, mutable lists stay invariant").** `readonly T[]` is a spelling wherever a type is written; `TyArray` grew an `aRead` flag and `repCanonId` ignores it, so a view is the list's own value at the list's own rep (2,545 of 2,545 buildable `tests/cases` modules byte-identical). `push`/`pop`/`clear`/index assignment refuse on a view receiver; `readonly T[]` never converts to `T[]`; element-field writes through a view are allowed (shallow). The covariant-write closure ends at a read-only parameter, which is what closes D1686/D1687 — both rows keep their filed refusal at the MUTABLE spelling and close as DESIGN, with the refusal naming `readonly` as the spelling that runs.
