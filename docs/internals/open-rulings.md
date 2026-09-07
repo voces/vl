@@ -553,7 +553,9 @@ If the answer is no, the row closes as DESIGN with a message that names the loop
 
 Today no `...` token exists, no function is variadic, and `push` takes exactly one argument. ROADMAP row 21 (H4.6 / B6) sequenced spread behind variadics; the spread lane measured that premise on 2026-09-06 and confirmed it. **Options.** (A) variadics first, spread falls out; (B) a named bulk append, no new syntax; (C) `push(...ys)` alone. **Recommendation: (B) now, (A) when scheduled — never (C).**
 
-### match-empty-clause — is `Stop{}` a legal arm pattern? — ASKED 2026-09-06 night
+### match-empty-clause — is `Stop{}` a legal arm pattern? — RULED 2026-09-06 night
+
+**Ruling (owner, 2026-09-06 night):** (a) — BANNED. `Stop{}` is refused with the nested clause's sentence ("`Stop{}` binds nothing — write `Stop`"); one spelling per meaning. The owner also wants parameter and `let`/`const` destructuring EVENTUALLY, with the payload clause's grammar (pun, rename, nest) — ROADMAP rows 31/32.
 
 Today `Stop{}` is legal and means exactly `Stop` (a variant arm binding nothing), while the same shape NESTED (`Wrap{p: {}}`) is refused as binding nothing. **Options.** (a) refuse `Stop{}` with the nested clause's sentence ("`Stop{}` binds nothing — write `Stop`"), one spelling per meaning and nothing for `vl fmt` to choose between; (b) allow both levels (Rust allows `Stop {}`), and lift the nested refusal for consistency. **Recommendation: (a).**
 
