@@ -24,7 +24,7 @@ cheapest wins and the ones most likely to grow.
 | # | finding | where | cost | proof |
 | --- | --- | --- | --- | --- |
 | 1 | **6 `WASM_LEX_*` constants are exported and referenced by NO code** — only a comment in `typeFeatures.ts:192` names them; the lexical classes are encoded by literal elsewhere. **Hand-verified: 0 code references repo-wide.** | `wasmChecker.ts:178-183` | 6 dead exports; a fourth ratchet target if a TS `unused-export` check is ever built | delete them; `deno check --config lsp/deno.json lsp/src/*.ts` + `deno task build` (lsp) stay green |
-| 2 | **`clearLastSession` is exported and never imported** — `main.ts:44` imports only `loadLastSession`/`saveLastSession`. **Hand-verified: 0 references.** | `playground/src/projects.ts:71` | 1 dead export (~5 lines) | delete; `deno check` + bundle green |
+| 2 | ~~`clearLastSession` is exported and never imported~~ **RETRACTED — it is LIVE.** The pre-landing tree-wide grep (`grep -rn clearLastSession`, not scoped to `src/`+`tests/` as this survey's first pass was) found `playground/verify.ts:530,571` call it. `verify.ts` is the end-to-end bundled-path verifier, outside the `src/` tree the first grep walked. The lesson: a dead-export claim must grep the WHOLE tree, `verify.ts` and scripts included, not just `src/` and `tests/`. | `playground/src/projects.ts:71` | none — not dead | n/a |
 | 3 | **`runtime.ts`'s host-import object carries THREE dead sinks** — `__log__`, `__log_string__`, and an `imports.memory` — that `runWasm.ts` already MEASURED out: its own comment records "0 of 1,149 building modules import a memory, 0 import `__log__` or `__log_string__`." The browser copy never got that trim. | `playground/src/runtime.ts:15` (`runWasmBytes`) | ~15 dead lines that also shape finding 6's shared factory | delete the three sinks; `playground_lsp_wasm_test.ts` (run path) + `playground_trap_frames_test.ts` identical |
 | 4 | **`SUB_GAPS` is now an empty array** — its three rows were promoted to `subBehaviours` (row 32). The type + two tests remain as the documented standing home for the next label-hidden gap. Keep OR delete is a judgment call; flagged so it is a decision, not drift. | `playground_lsp_parity_test.ts` (§4) | 0 today; a live instrument the day the next gap appears | n/a — documentation decision, not a code change |
 
@@ -63,8 +63,9 @@ seven times per keystroke). The playground adapter has the same shape at the req
 
 ## What to do first
 
-**Tranche 1 (rows 1-3) is an afternoon and reds nothing** — delete the dead exports and the
-dead sinks, and the layer stops carrying code no test protects. **Then row 5** (the
+**Tranche 1 (rows 1 and 3 — row 2 retracted) is an afternoon and reds nothing** — delete the
+dead constants and the dead sinks, and the layer stops carrying code no test protects. **Then
+row 5** (the
 byte-identical text helpers) and **row 8** (the host-import factory), both pure extractions
 with an exact test-identity proof and no behaviour change. Row 6 (the std-export twin) and row
 7 (the `std:` predicate) are the same shape one size up. Row 9 (the double re-check) is the
