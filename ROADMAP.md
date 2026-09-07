@@ -1630,13 +1630,28 @@ in-language GC knobs.
         denominated in the four SITES that carry a carve-out. Seed: **+3,956 bytes across the
         two landings that were priced**; three of five were not, and phase 3 prices each.
         Scoreboard: `docs/internals/rep-descriptor-campaign.md` §8.
-     **PHASE 3'S PREREQUISITE, measured:** every domain-REMOVING conversion is blocked on the
-        descriptor's coverage gap — the LEFT-ONLY column, **147,945 queries over 15 kinds**,
-        headed by `reflist` (111,683 in 876 modules), `i32` (17,358), `map` (4,437), `union`
-        (3,358), `str` (3,233). A ladder is load-bearing exactly where the descriptor declines,
-        so nothing deletes until its kind is covered — §6.3 is the proof, a byte-identical
-        nine-rung deletion its own oracle refused at CONTRADICT 2,963 → 204,539. Phase 3 is
-        close the column largest-first, then delete; `reflist` alone is 76% of it.
+     🟡 **PHASE 3 — closing the LEFT-ONLY column, `reflist` first. FIRST LANDING IN.** Every
+        domain-REMOVING conversion is blocked on the descriptor's coverage gap: a ladder is
+        load-bearing exactly where the descriptor declines, so nothing deletes until its kind is
+        covered (§6.3 is the proof — a byte-identical nine-rung deletion its own oracle refused
+        at CONTRADICT 2,963 → 204,539). **Why `repOfArray` declined was measured before anything
+        was built**, by a classifier over all eleven `Ty` variants that accounts for every
+        `reflist` LEFT-ONLY event in both populations: **MAP element 96,659 events / 669
+        modules**, nested array 8,133 / 106, nullable 4,273 / 42, value-union box 3,167 / 82.
+        **The two populations disagree about the leader** — `tests/cases` puts the nested array
+        first at 38.8%, the corpus puts the map at 96.2% — so the reasons were re-counted by
+        MODULE, where the map leads on both denominators; an event count alone would have picked
+        the wrong reason to build first. A map is a reference like a struct or a closure, so a
+        list of maps is a ref list — the answer the ladder already gives — and the flat arm plus
+        both tree projections gain it, three lines, domain-KEEPING with no rung removed.
+        **`reflist` LEFT-ONLY falls 112,531 → 15,872, −96,659 (86%), every departing query
+        landing in AGREE and CONTRADICT holding at 0** — and the fall EQUALS the census exactly,
+        which is what separates "the number went down" from "it went down for the reason I
+        think". Byte-identical on both populations, which is the whole claim, since coverage is
+        §5.0's domain-WIDENING form. **CONTRADICT is 0, not the 178 this campaign quoted** —
+        that predates #2857. Remaining: nested array, nullable, value-union-box elements; no rung
+        is deletable until the column is empty for the kind.
+        `docs/internals/rep-descriptor-campaign.md` §9.
      Two owner rulings gate how far items 2 and 6 can go: `one-literal-union-rep` and
      `nullable-rep-rule-stated-once` (`docs/internals/open-rulings.md` §D).
      REMAINING legacy items: (a) widen `repOfTy` coverage (typed-value maps,
