@@ -804,6 +804,9 @@ let solvedParamTys: {[string]: i32} = Map()
 // registry renders `i32 | "err"` as `i32|string`. `-2` marks a hole two calls pinned
 // differently — one wasm function serves both, so the reader must decline to narrow.
 let holePinTys: {[string]: i32} = Map()
+// Per hole-carrying function type: the same signature with each hole at its banked pin,
+// minted once however many classifiers ask for it (D1794).
+let pinFnTy: {[i32]: i32} = Map()
 // Declarations whose solve has been attempted, keyed by decl node index — a body is probed at
 // most once, whether or not the probe found anything to solve.
 let paramSolveTried: {[string]: boolean} = Map()
@@ -3410,6 +3413,7 @@ export function initChecker() {
   ufcsWhyData = []
   solvedParamTys = Map()
   holePinTys = Map()
+  pinFnTy = Map()
   paramSolveTried = Map()
   holeFlowSrc = []
   holeFlowDst = []
@@ -19707,6 +19711,43 @@ export function pinnedHoleTyOf(tyIx: i32): i32 {
   holePinTys[t.tvName] ?? -1
 }
 
+// A function type with each hole in its signature at that hole's pin, minted once per row. The
+// argument itself when it carries no hole; -1 for a non-function type, and for one whose holes
+// this program pinned to no single answer — the case a node two instances share cannot have.
+export function pinResolvedFnTy(tyIx: i32): i32 {
+  if tyIx < 0 { return -1 }
+  if !tyHasTyVar(tyIx) { return tyIx }
+  const memo = pinFnTy[tyIx] ?? -1
+  if memo >= 0 { return memo }
+  const t = T.tys[tyIx]
+  if t is TyFunc {
+    const ps: i32[] = []
+    let i = 0
+    while i < t.fnParamTypes.length {
+      const p = pinResolvedAtomTy(t.fnParamTypes[i])
+      if p < 0 { return -1 }
+      ps.push(p)
+      i = i + 1
+    }
+    const r = pinResolvedAtomTy(t.fnRet)
+    if r < 0 { return -1 }
+    const m = mkFuncTy(ps, r)
+    pinFnTy[tyIx] = m
+    return m
+  }
+  -1
+}
+
+// One atom of that signature: a hole answers with its pin, a type still carrying one after
+// that declines, and a concrete type is already the answer.
+function pinResolvedAtomTy(tyIx: i32): i32 {
+  if tyIx < 0 { return -1 }
+  const t = T.tys[tyIx]
+  if t is TyVar { return pinnedHoleTyOf(tyIx) }
+  if tyHasTyVar(tyIx) { return -1 }
+  tyIx
+}
+
 // The type of the expression at node `ix` at this pin: its recorded type, resolved through the
 // hole's banked pin when the recorded type is a hole exactly one call pinned, else the recorded
 // type unchanged. A LIST-level classifier may read this; a SCALAR one may not, because a
@@ -29314,7 +29355,14 @@ export function nodeArrayElemName(ix: i32) {
       // A function element renders the closure-element table key (wrapped in parens), matching
       // `refArrElemName`'s form so an un-annotated literal of function values recovers the same slot.
       if el is TyFunc {
-        const fn = tyToEmitName(t.aElem)
+        let fn = tyToEmitName(t.aElem)
+        // A closure element riding the enclosing frame's hole renders as nothing at all, since
+        // the recorded type is the one the checker saw; the element at this instance is that
+        // signature at the hole's pin (D1794).
+        if fn == "" {
+          const pinEl = pinResolvedFnTy(t.aElem)
+          if pinEl >= 0 { fn = tyToEmitName(pinEl) }
+        }
         if fn == "" { return "" }
         return "(" + fn + ")"
       }
