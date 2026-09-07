@@ -2933,3 +2933,103 @@ Deno.test({
     }
   },
 });
+
+
+// D1880 — A MID-FILE `import` IS HOISTED ALONE, NOT WITH THE FILE'S COMMENTS.
+//
+// `emitImports` runs before the statement walk and emits every `import` at the top whatever
+// line it was written on. It flushed EVERY pending comment before that line, so a mid-file
+// import carried the whole file's comments into the import region and left the declarations
+// they described bare. A hoist may take only the import's OWN lead: the contiguous run of
+// own-line comments directly above it, with no blank line inside. Adjacency is what tells the
+// two apart — a blank line makes the comment the previous declaration's.
+Deno.test({
+  name: "vl-fmt: a mid-file import is hoisted without the comments above it (D1880)",
+  ignore: !ENABLED,
+  fn: async () => {
+    const src = [
+      "const a = 1",
+      "",
+      "// this comment belongs to `b`",
+      "const b = 2",
+      "",
+      "// the string renderer",
+      "// on two lines",
+      'import { toString } from "std:fmt"',
+      "",
+      "print(toString(a + b))",
+      "",
+    ].join("\n");
+    const want = [
+      "// the string renderer",
+      "// on two lines",
+      'import { toString } from "std:fmt"',
+      "",
+      "const a = 1",
+      "",
+      "// this comment belongs to `b`",
+      "const b = 2",
+      "",
+      "print(toString(a + b))",
+      "",
+    ].join("\n");
+    const r = await run([], src);
+    if (r.code !== 0) {
+      throw new Error(`vl fmt rejected valid source (rc ${r.code}):\n${r.err}`);
+    }
+    if (r.out !== want) {
+      throw new Error(`want:\n${want}\n---\ngot:\n${r.out}`);
+    }
+    const again = await run([], r.out);
+    if (again.code !== 0 || again.out !== r.out) {
+      throw new Error(`not idempotent (rc ${again.code}):\n${again.out}`);
+    }
+    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_import_cmt_" });
+    try {
+      const file = `${dir}/main.vl`;
+      await Deno.writeTextFile(file, r.out);
+      const ran = await runOn("run", file);
+      if (ran.code !== 0 || ran.out !== "3\n") {
+        throw new Error(
+          `formatted output did not run (rc ${ran.code}): ${JSON.stringify(ran.out)}\n${ran.err}`,
+        );
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
+
+// D1880, SECOND ITEM — A FILE-HEADER COMMENT ABOVE TOP-OF-FILE IMPORTS STILL LEADS THEM.
+//
+// The narrowed rule applies only to an import HOISTED past code. One in the file's leading
+// region moves nowhere, so it keeps taking the pending comments before it — which is what
+// keeps a header separated from the imports by a blank line above them rather than below.
+Deno.test({
+  name: "vl-fmt: a file-header comment stays above top-of-file imports (D1880)",
+  ignore: !ENABLED,
+  fn: async () => {
+    const src = [
+      "// A file header comment, separated from the imports by a blank line.",
+      "",
+      'import { toString } from "std:fmt"',
+      "",
+      "// a lead on the first declaration",
+      "const a = 1",
+      "",
+      "print(toString(a))",
+      "",
+    ].join("\n");
+    const r = await run([], src);
+    if (r.code !== 0) {
+      throw new Error(`vl fmt rejected valid source (rc ${r.code}):\n${r.err}`);
+    }
+    if (r.out !== src) {
+      throw new Error(`the header or the lead moved:\n${r.out}`);
+    }
+    const again = await run([], r.out);
+    if (again.code !== 0 || again.out !== r.out) {
+      throw new Error(`not idempotent (rc ${again.code}):\n${again.out}`);
+    }
+  },
+});
