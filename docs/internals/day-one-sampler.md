@@ -68,6 +68,8 @@ AXIS for the same reason, and prints `NOT EXERCISED` rather than a zero.
    the literal, atom and prim ones are symmetric, so `named_vs_inline` gets a real `match` pair
    rather than only asymmetric ones. `sunion`'s narrow group had ONE member before, so the
    `narrowing` axis never applied to a union with no literal discriminant at all.
+
+   **Narrowing crosses the generic PIN too** — `is_pin`/`ne_pin` route the whole narrowed value, `match_pin`/`match_null_pin` the bound field, through `thru<T>` so the pin sees the refined rep. Each shares its narrow group with its un-pinned read, so the axis is its own control. The whole-value pins are all AGREE-RUNS; the cross surfaced D1933 (a closure-captured field-sourced nullable), not a pin defect.
 4. **`fusion`** — `xs.pop() ?? d` against `const v = xs.pop()` then `v ?? d`.
 5. **`pinning`** — a concrete call against the same value routed through a generic
    `pass<T>`, an un-annotated hole parameter, or a TWO-parameter `pass2<A, B>(a: A, b: B): A`
@@ -536,6 +538,42 @@ depending on unrelated module content. D1893 is scenery: **any** `std:` import (
 json, str all tested) makes an operator on a hole refuse where the identical import-free
 program prints `12`. D1894 is the solve synthesising a structural `{x: _}` from a field read
 and then refusing the `new`-branded argument, with no operator and no import in the witness.
+
+## The narrow x generic-pin cross — 149 pairs, 0 pin-borne disagreements, and a 4-way both-fail it surfaced
+
+The first of the two-feature cross-products: a value narrowed by `match` or `is`/`!= null`,
+THEN routed through a generic hole (`thru<T>`), so the pin sees the REFINED member's rep and
+not the union box's. Four reads on the two union records — `is_pin` and `ne_pin` pin the whole
+narrowed VALUE, `match_pin` and `match_null_pin` the bound field — each sharing its narrow
+group with the un-pinned read beside it, so the `narrowing` axis pairs pinned against
+un-pinned as its own same-shape control. A single record that only paired its two features
+with themselves would measure nothing; these compose with every axis.
+
+Seeds 801-808 x 800 (before/after) and a wider 811-816 x 1000:
+
+| | pairs | AGREE-RUNS | DISAGREE | BOTH-FAIL |
+| --- | --- | --- | --- | --- |
+| before (no cross reads), whole sample | 3,200 | 3,084 | 45 | 71 |
+| after, whole sample | 3,200 | 3,073 | 52 | 75 |
+| after, on a cross read | 77 | 67 | 3 | 7 |
+| wide, on a cross read | 72 | 67 | 2 | 3 |
+
+**The whole-value pins compose cleanly.** `is_pin` and `ne_pin` — the reads that pin a
+refined union member or a narrowed non-null, where a rep defect would live — are 100%
+AGREE-RUNS across both samples. Pinning a narrowed rep through a generic hole is sound.
+
+**Every cross DISAGREE is the un-pinned control's too.** The `match_pin` disagreements all
+carry `match scrutinee must be a union or an integer, got _` — the match-over-a-hole-parameter
+refusal (D1885/D1886), present identically in the before sample (28 vs 27 occurrences) and in
+the un-pinned twin: removing `thru` leaves `match p { … }` on the same `_` and it fails the
+same way. The pin is scenery there, not a defect.
+
+**The cross surfaced a defect of a DIFFERENT cross.** A both-fail carried
+`emitProgram: ref valtype with no interned shape`, present in the before sample too (the pin
+is scenery). Delta-debugged to a four-ingredient witness — a closure capturing a FIELD-sourced
+nullable, inside a block, then narrowed — each ingredient load-bearing, filed as **D1933**. It
+is exactly the cross-product blindness the sampler exists for: no single-feature fixture
+reaches it, and the non-null twin is its own control.
 
 ## Running it
 

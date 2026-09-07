@@ -469,6 +469,19 @@ def _generator_axes():
     return [a for a in G.AXES if a.get("generator") and a["id"] not in EXCLUDE]
 
 
+def _xnp_tags(plan, fa, fb):
+    """`xnp_<narrow>` when EITHER face routes a narrowed value through the generic pin.
+    Read off both faces, not the plan's base read, so a `narrowing` pair whose only pinned
+    side is `b` is still counted."""
+    tags = set()
+    for f in (fa, fb):
+        r = next((x for x in plan["value"]["reads"]
+                  if x["id"] == f.get("narrowing")), None)
+        if r and r.get("xnp"):
+            tags.add("xnp_" + r["xnp"])
+    return tags
+
+
 def make_pair(rng, axis_id=None):
     """One sample: two spellings of one program, plus what was varied.
 
@@ -509,7 +522,8 @@ def make_pair(rng, axis_id=None):
                            ({"pin2_" + plan["second_pin"]["id"]}
                             if "generic2" in (fa["pinning"], fb["pinning"]) else set()) |
                            ({"widen_" + plan["read"]["mix"]}
-                            if "mix" in plan["read"] else set())),
+                            if "mix" in plan["read"] else set()) |
+                           _xnp_tags(plan, fa, fb)),
         "delta": delta(axis, fa, fb, plan, srcA, srcB),
     }
 

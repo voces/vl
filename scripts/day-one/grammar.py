@@ -196,6 +196,9 @@ VALUES = [
         "expr": None, "mk": ["return { kind: 2, w: 4.0 }"],
         "alt": "{ kind: 1, r: 1.0 }",
         "features": ["union", "struct"],
+        # `thru` is the generic PIN the narrow-and-pin reads route through. It shares no name
+        # with the `pinning` axis's `pass`, so the two never collide when both fire.
+        "fns": ["function thru<T>(x: T): T { return x }"],
         "reads": [
             {"id": "shared", "lines": ["print({v}.kind)"], "want": ["2"]},
             {"id": "is_narrow", "narrow": "is", "named_only": True,
@@ -206,6 +209,17 @@ VALUES = [
             # for a union with no literal discriminant.
             {"id": "match_bind", "narrow": "match", "named_only": True,
              "lines": ["match {v} {", "  Box{w} => print(w)", "  Dot => print(0)", "}"],
+             "want": ["4"]},
+            # NARROW x GENERIC-PIN. The value narrowed to `Box`, then routed through a generic
+            # hole so the pin sees the REFINED member's rep, not the union box's. Each shares
+            # its narrow group with the un-pinned read above, so the `narrowing` axis pairs
+            # pinned against un-pinned — the same-shape control that makes a hit falsifiable.
+            {"id": "is_pin", "narrow": "is", "named_only": True, "xnp": "is",
+             "lines": ["if {v} is Box { print(thru({v}).w) } else { print(0) }"],
+             "want": ["4"]},
+            {"id": "match_pin", "narrow": "match", "named_only": True, "xnp": "match",
+             "lines": ["match {v} {", "  Box{w} => print(thru(w))", "  Dot => print(0)",
+                       "}"],
              "want": ["4"]},
         ],
     },
@@ -231,9 +245,21 @@ VALUES = [
         "named": "MaybeRec", "inline": REC_INLINE + " | null",
         "expr": None, "mk": ["return " + REC_EXPR], "alt": "null",
         "features": ["nullable", "struct"],
+        "fns": ["function thru<T>(x: T): T { return x }"],
         "reads": [
             {"id": "nullcheck", "narrow": "ne_null",
              "lines": ["if {v} != null { print({v}.n) } else { print(0) }"],
+             "want": ["3"]},
+            # NARROW x GENERIC-PIN, the nullable face: the value narrowed non-null then routed
+            # through a generic hole, so the pin sees a `Rec` where the un-narrowed rep is the
+            # `Rec | null` niche. `ne_pin` pairs with `nullcheck`, `match_null_pin` with
+            # `match_null` — each its own un-pinned control in the same narrow group.
+            {"id": "ne_pin", "narrow": "ne_null", "xnp": "ne_null",
+             "lines": ["if {v} != null { print(thru({v}).n) } else { print(0) }"],
+             "want": ["3"]},
+            {"id": "match_null_pin", "narrow": "match", "named_only": True, "xnp": "match",
+             "lines": ["match {v} {", "  Rec{n} => print(thru(n))", "  null => print(0)",
+                       "}"],
              "want": ["3"]},
             {"id": "isnull", "narrow": "is_null",
              "lines": ["if {v} is null { print(0) } else { print({v}.n) }"],
