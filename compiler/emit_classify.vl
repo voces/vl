@@ -1545,8 +1545,8 @@ function globalIsNulMapSid(fnIx: i32, sid: i32) {
 }
 
 // True if the function `name` returns a nullable struct (`"nulstruct"`).
-function fnRetNulRefSid(sid: i32) {
-  const i = fnIndexOfSid(sid)
+function fnRetNulRefSid(sid: i32, name: string, fnIx: i32) {
+  const i = fnIndexOfInScopeSid(sid, name, fnIx)
   if i < 0 { return false }
   fRetKind[i] == "nulstruct"
 }
@@ -1977,7 +1977,12 @@ export function exprNullableRefArray(exprIx: i32, fnIx: i32) {
     if popRefElemKind(exprIx, fnIx) == 9 { return true }
     const callee = P.nodes[e.callFn]
     if callee is Ident {
-      if fnRetNulRefArrayNameSid(sidOfNode(e.callFn)) != "" { return true }
+      if (
+        fnRetNulRefArrayNameSid(sidOfNode(e.callFn), callee.identName, fnIx) !=
+        ""
+      ) {
+        return true
+      }
     }
   }
   // `p ?? d` over the same niche stays `<ref-array> | null` exactly when the default can
@@ -2055,7 +2060,11 @@ function nulRefArrayInnerSlot(exprIx: i32, fnIx: i32) {
     if pes >= 0 && pes < rlElemName.length { return rlElemInnerSlot(pes) }
     const callee = P.nodes[e.callFn]
     if callee is Ident {
-      const rn = fnRetNulRefArrayNameSid(sidOfNode(e.callFn))
+      const rn = fnRetNulRefArrayNameSid(
+        sidOfNode(e.callFn),
+        callee.identName,
+        fnIx,
+      )
       if rn != "" { return rlSlotByName(rn) }
     }
   }
@@ -2256,8 +2265,8 @@ function globalIsNulStringSid(fnIx: i32, sid: i32) {
   letIsNulString(li, -1)
 }
 
-function fnRetNulStringSid(sid: i32) {
-  const i = fnIndexOfSid(sid)
+function fnRetNulStringSid(sid: i32, name: string, fnIx: i32) {
+  const i = fnIndexOfInScopeSid(sid, name, fnIx)
   if i < 0 { return false }
   fRetKind[i] == "nulstr"
 }
@@ -2299,7 +2308,9 @@ export function exprNullableString(exprIx: i32, fnIx: i32) {
   if e is Call {
     const callee = P.nodes[e.callFn]
     if callee is Ident {
-      if fnRetNulStringSid(sidOfNode(e.callFn)) { return true }
+      if fnRetNulStringSid(sidOfNode(e.callFn), callee.identName, fnIx) {
+        return true
+      }
       // A `string | null`-returning function value (a binding, or a `(…) => string | null`
       // param callee) — its result is the nullable raw array, `>N`.
       return calleeRetKindSid(sidOfNode(e.callFn), fnIx) == "nulstr"
@@ -2414,7 +2425,9 @@ export function exprNullableStruct(exprIx: i32, fnIx: i32) {
   if e is Call {
     const callee = P.nodes[e.callFn]
     if callee is Ident {
-      if fnRetNulRefSid(sidOfNode(e.callFn)) { return true }
+      if fnRetNulRefSid(sidOfNode(e.callFn), callee.identName, fnIx) {
+        return true
+      }
       // An `S | null`-returning function value (a binding, or a `(…) => S | null` param
       // callee) — its result is the nullable struct ref, `>nN;`.
       if calleeRetKindSid(sidOfNode(e.callFn), fnIx) == "nulstruct" {
@@ -3928,7 +3941,10 @@ function capRecord(name: string, bound: string[], caps: string[]) {
       // The module scope is the one enclosing scope the frame walk cannot reach, and it has
       // a binding form that is not a global: a top-level `for` variable. Without it a closure
       // in a top-level loop body addresses the module function instead of the loop variable.
-      if !moduleBindsLoopVar(emitRootIx, name) { return 0 }
+      if !moduleBindsLoopVar(emitRootIx, name) {
+        capSiblingFrees(name, bound, caps)
+        return 0
+      }
     }
   }
   // The builtin-name exemption is positional and lives in `capScan`'s `Call` arm, not here:
@@ -3936,6 +3952,57 @@ function capRecord(name: string, bound: string[], caps: string[]) {
   // at every identifier would suppress a genuine capture of a local sharing the name.
   if capHas(caps, name) { return 0 }
   caps.push(name)
+  0
+}
+
+// The nested functions whose frees are being folded in, so two that call each other do not
+// recur forever. A stack rather than a set: the same sibling reached down two different paths
+// is folded in each time, which is what a capture set of names needs.
+const capSibStack: i32[] = []
+
+// A SIBLING nested function's free names are the caller's captures too: `j` calling `k` builds
+// `k`'s env inside `j`, so every name `k` needs from an outer frame must ride `j`'s env. Depth
+// already works through `capScan`'s `FuncDecl` arm, which folds a nested body's frees upward;
+// this is the sibling direction, which `capRecord` dropped with the function name (D1761).
+function capSiblingFrees(name: string, bound: string[], caps: string[]) {
+  if capFrame < 0 || capFrame >= fnStmts.length { return 0 }
+  // The same outward walk `fnIndexOfInScopeSid` takes, and for the same reason: only a
+  // NESTED function is found, so a module-level callee resolves to -1 and folds in nothing.
+  let pp = capFrame
+  let fe = 0 - 1
+  let steps = 0
+  while pp >= 0 && steps <= fnStmts.length {
+    const hit = nestedFnDeclaredInFrame(name, pp)
+    if hit >= 0 {
+      fe = hit
+      pp = 0 - 1
+    } else {
+      if pp < fnParent.length { pp = fnParent[pp] } else { pp = 0 - 1 }
+    }
+    steps = steps + 1
+  }
+  if fe < 0 { return 0 }
+  if fe == capFrame { return 0 }
+  let si = 0
+  while si < capSibStack.length {
+    if capSibStack[si] == fe { return 0 }
+    si = si + 1
+  }
+  capSibStack.push(fe)
+  // The sibling's own scan must not re-record narrowings: `capNarrowRecord` is keyed on the
+  // declaration node, and this walk reaches the same node from every caller of it.
+  const savedFrame = capFrame
+  const savedRec = cnRecording
+  cnRecording = false
+  const sub = capComputeNamesOf(fe)
+  cnRecording = savedRec
+  capFrame = savedFrame
+  capSibStack.pop()
+  let ci = 0
+  while ci < sub.length {
+    capRecord(sub[ci], bound, caps)
+    ci = ci + 1
+  }
   0
 }
 
@@ -19132,6 +19199,11 @@ export function anonFieldCode(valIx: i32) {
   // box rung below, since a literal union also registers as a union NAME and would otherwise
   // be minted as a `(ref)` box every reader of the row then lowers as an atom (D1757).
   if tyIsLitUnionAlias(nodeTyIxOf(valIx)) { return 0 }
+  // The INLINE spelling of that field is the string slot, code 3 — the other half of the split
+  // `fieldCodeOfSpelling` makes for the declared twin. Without it a member set with no alias
+  // reached the spellability gate, which declines a `TyUnion`, and cost the whole literal its
+  // row (D1783).
+  if tyIsLitUnion(nodeTyIxOf(valIx)) { return 3 }
   // A value-union field value is the shared box, code 16 — the same code the declared twin
   // gets from `isValueUnionName`. Checked ahead of the spellability gate on purpose:
   // `nodeTyName` spells no union, so that gate would refuse the whole literal a row (D1242).
@@ -19591,6 +19663,14 @@ export function anonFieldElemName(valIx: i32, code: i32) {
   // union records its NAME so the atom's membership survives the mint. Self-gating, since the
   // reader answers "" for the plain `i32` and `boolean` values that share code 0 (D1757).
   if code == 0 { return litUnionAliasNameOfTy(nodeTyIxOf(valIx)) }
+  // The inline twin's companion (code 3): the member set, recorded for the reason its declared
+  // twin records it — code 3 is layout-shared with a plain string field, so the membership is
+  // unrecoverable without it. Self-gating, since a plain string renders no member set (D1783).
+  if code == 3 {
+    const inl3 = tyToEmitName(nodeTyIxOf(valIx))
+    if nameIsInlineLitUnion(inl3) { return inl3 }
+    return ""
+  }
   if code != 15 { return "" }
   const si = structIndexOfObj(valIx)
   if si >= 0 { return sNames[si] }
@@ -23963,10 +24043,12 @@ export function variantFieldIndex(vi: i32, field: string) {
   -1
 }
 
-// True if the function `name` declares the struct as its return type (flat lookup
-// over the stored kind `buildFnMap` recorded — no arena rescan).
-function fnRetStructSid(sid: i32) {
-  const i = fnIndexOfSid(sid)
+// True if the function `name` declares the struct as its return type (over the stored kind
+// `buildFnMap` recorded — no arena rescan). Frame-aware, like the scalar and list readers: a
+// per-pin clone shares its template's name, and the flat lookup always answers the template,
+// so an i32 instance read the struct pin's kind and returned a ref it never built (D1788).
+function fnRetStructSid(sid: i32, name: string, fnIx: i32) {
+  const i = fnIndexOfInScopeSid(sid, name, fnIx)
   if i < 0 { return false }
   fRetKind[i] == "struct"
 }
@@ -24015,7 +24097,9 @@ export function exprStruct(exprIx: i32, fnIx: i32) {
   if e is Call {
     const callee = P.nodes[e.callFn]
     if callee is Ident {
-      if fnRetStructSid(sidOfNode(e.callFn)) { return true }
+      if fnRetStructSid(sidOfNode(e.callFn), callee.identName, fnIx) {
+        return true
+      }
       // A struct-returning function VALUE (a binding / `(i32) => S` param callee): its
       // resolved `>sN;` sig (mirrors `structIndexOfExpr`'s closure case). Falls through to the
       // per-node-type fallback below when the sig path misses (a factory-inferred value).
@@ -24768,10 +24852,13 @@ export function exprVariantIndex(exprIx: i32, fnIx: i32) {
     const callee = P.nodes[e.callFn]
     if callee is Ident {
       const cvsid = sidOfNode(e.callFn)
+      const cvname = callee.identName
       // A DECLARED function keeps its own richer resolution (the `: Cat` annotation, then
       // the inferred `fRetKind`/`fRetStructIdx` pair) — unchanged, and asked first so no
       // named-callee answer moves.
-      if fnIndexOfSid(cvsid) >= 0 { return fnRetVariantIndexSid(cvsid) }
+      if fnIndexOfInScopeSid(cvsid, cvname, fnIx) >= 0 {
+        return fnRetVariantIndexSid(cvsid, cvname, fnIx)
+      }
       // A closure-value callee (`const f = (x: Circle) => x; f(c)`, `const f = idc; f(c)`,
       // a closure param `f(c)`), which `fnIndexOfSid` misses by construction. The resolved
       // `$fnsig` key is the same key `emitCallRef` casts the call through, so the slot this
@@ -24873,8 +24960,8 @@ function globalVariantIndexSid(fnIx: i32, sid: i32): i32 {
 
 // The union-VARIANT table index a function `name` returns (its `: Cat` return
 // annotation), or -1.
-function fnRetVariantIndexSid(sid: i32) {
-  const fe = fnIndexOfSid(sid)
+function fnRetVariantIndexSid(sid: i32, name: string, fnIx: i32) {
+  const fe = fnIndexOfInScopeSid(sid, name, fnIx)
   if fe >= 0 {
     const fn = P.nodes[fnStmts[fe]]
     if fn is FuncDecl {
@@ -24920,8 +25007,10 @@ function declaredStructIndex(name: string) {
 }
 
 // The struct table index a function `name` returns (recorded in `fRetStructIdx`), or -1.
-function fnRetStructIndexSid(sid: i32) {
-  const i = fnIndexOfSid(sid)
+// Frame-aware for the same reason its kind companion is: the two must resolve to the SAME
+// function, or the kind says struct while the row is another instance's (D1788).
+function fnRetStructIndexSid(sid: i32, name: string, fnIx: i32) {
+  const i = fnIndexOfInScopeSid(sid, name, fnIx)
   if i < 0 { return -1 }
   // Kind-gated, like every other reader of the polymorphic companion slot: `fRetStructIdx`
   // holds four namespaces selected by `fRetKind` (struct row, variant index, ref-list slot,
@@ -25131,7 +25220,11 @@ export function structIndexOfExpr(exprIx: i32, fnIx: i32) {
   if e is Call {
     const callee = P.nodes[e.callFn]
     if callee is Ident {
-      const ri = fnRetStructIndexSid(sidOfNode(e.callFn))
+      const ri = fnRetStructIndexSid(
+        sidOfNode(e.callFn),
+        callee.identName,
+        fnIx,
+      )
       if ri >= 0 { return ri }
       // A struct-returning function VALUE (a binding / `(i32) => S` param callee, invisible
       // to `fnRetStructIndex`): the struct index from its resolved `>sN;` sig. Falls through to the
@@ -25428,8 +25521,8 @@ export function structIndexOfLet(letIx: i32, fnIx: i32) {
 // not the union — boxing happens at a flow boundary, so a bare object literal is not this.
 
 // True if function `name` declares the union as its return type.
-function fnRetUnionSid(sid: i32) {
-  const i = fnIndexOfSid(sid)
+function fnRetUnionSid(sid: i32, name: string, fnIx: i32) {
+  const i = fnIndexOfInScopeSid(sid, name, fnIx)
   if i < 0 { return false }
   fRetKind[i] == "union"
 }
@@ -25494,7 +25587,9 @@ export function exprUnion(exprIx: i32, fnIx: i32) {
   if e is Call {
     const callee = P.nodes[e.callFn]
     if callee is Ident {
-      if fnRetUnionSid(sidOfNode(e.callFn)) { return true }
+      if fnRetUnionSid(sidOfNode(e.callFn), callee.identName, fnIx) {
+        return true
+      }
       // A union-returning function VALUE (a binding / `(…) => A | B` param callee) — its
       // result is the union box, `>u`.
       if calleeRetKindSid(sidOfNode(e.callFn), fnIx) == "union" { return true }
@@ -28478,8 +28573,8 @@ export function letIsArray(letIx: i32, fnIx: i32) {
 // but for `S[]`/`N[]` annotations. `localIsRef` code `5` flags a ref-list local.
 
 // True if function `name` declares a ref array (`S[]`/`N[]`) as its return type.
-function fnRetRefArraySid(sid: i32) {
-  const i = fnIndexOfSid(sid)
+function fnRetRefArraySid(sid: i32, name: string, fnIx: i32) {
+  const i = fnIndexOfInScopeSid(sid, name, fnIx)
   if i < 0 { return false }
   fRetKind[i] == "reflist"
 }
@@ -28520,7 +28615,9 @@ export function exprRefArray(exprIx: i32, fnIx: i32) {
     if arrNewIntrKind(exprIx, fnIx) == 3 { return true }
     const callee = P.nodes[e.callFn]
     if callee is Ident {
-      if fnRetRefArraySid(sidOfNode(e.callFn)) { return true }
+      if fnRetRefArraySid(sidOfNode(e.callFn), callee.identName, fnIx) {
+        return true
+      }
       // A closure-VALUE callee returning a ref list (`mk: () => S[]`) — its resolved `$fnsig`
       // result is the ref-list wrapper (`>r<slot>;`), so `mk()[i]` indexes it directly.
       return calleeRetKindSid(sidOfNode(e.callFn), fnIx) == "reflist"
@@ -28630,8 +28727,8 @@ function paramRefArrayName(fnIx: i32, name: string) {
 
 // The ref-list ELEMENT type-NAME a function `name` returns (from its `S[]`/`N[]` return
 // annotation, recorded in `fRetRArrElem`), or "".
-function fnRetRefArrayNameSid(sid: i32) {
-  const i = fnIndexOfSid(sid)
+function fnRetRefArrayNameSid(sid: i32, name: string, fnIx: i32) {
+  const i = fnIndexOfInScopeSid(sid, name, fnIx)
   if i < 0 { return "" }
   fRetRArrElem[i]
 }
@@ -28640,8 +28737,8 @@ function fnRetRefArrayNameSid(sid: i32) {
 // (`i32[][] | null` → the inner `i32[]`), else "". Reads the return-type node directly (`fRetRArrElem`
 // records only the NON-null ref-array element), so a consumer `const t = mk()` infers the kind-18 niche
 // and its `!= null` narrow + narrowed indexing resolve the inner ref-list slot.
-function fnRetNulRefArrayNameSid(sid: i32) {
-  const i = fnIndexOfSid(sid)
+function fnRetNulRefArrayNameSid(sid: i32, name: string, fnIx: i32) {
+  const i = fnIndexOfInScopeSid(sid, name, fnIx)
   if i < 0 { return "" }
   const fn = P.nodes[fnStmts[i]]
   if fn is FuncDecl {
@@ -28738,10 +28835,18 @@ export function refListElemNameOfExpr(exprIx: i32, fnIx: i32) {
     }
     const callee = P.nodes[e.callFn]
     if callee is Ident {
-      const fn = fnRetRefArrayNameSid(sidOfNode(e.callFn))
+      const fn = fnRetRefArrayNameSid(
+        sidOfNode(e.callFn),
+        callee.identName,
+        fnIx,
+      )
       if fn != "" { return fn }
       // A nulreflist-returning function (`mk: () => i32[][] | null`): the INNER ref-list element name.
-      const nfn = fnRetNulRefArrayNameSid(sidOfNode(e.callFn))
+      const nfn = fnRetNulRefArrayNameSid(
+        sidOfNode(e.callFn),
+        callee.identName,
+        fnIx,
+      )
       if nfn != "" { return nfn }
       // A closure-value callee returning a ref list: its element name is the `rlElemName` of
       // the result slot parsed off the callee's resolved `$fnsig`.
@@ -28942,7 +29047,11 @@ export function exprEmittedRefListSlot(exprIx: i32, fnIx: i32): i32 {
   if e is Call {
     const callee = P.nodes[unwrapParen(e.callFn)]
     if callee is Ident {
-      const cn = fnRetRefArrayNameSid(sidOfNode(e.callFn))
+      const cn = fnRetRefArrayNameSid(
+        sidOfNode(e.callFn),
+        callee.identName,
+        fnIx,
+      )
       if cn != "" { return rlSlotByName(cn) }
     }
   }
@@ -30055,8 +30164,8 @@ function declaredStringArray(name: string) { declaredKind(name) == "strlist" }
 // True if function `name` declares (or, un-annotated, infers) a `string[]` return type
 // (`"strlist"`). Mirrors `fnRetArray`/`fnRetRefArray` — lets a `string[]`-returning call
 // classify so an untyped `let x = snap()` picks the string-list local kind (code `7`).
-function fnRetStringArraySid(sid: i32) {
-  const i = fnIndexOfSid(sid)
+function fnRetStringArraySid(sid: i32, name: string, fnIx: i32) {
+  const i = fnIndexOfInScopeSid(sid, name, fnIx)
   if i < 0 { return false }
   fRetKind[i] == "strlist"
 }
@@ -30074,8 +30183,8 @@ function fnRetF64ArraySid(sid: i32, name: string, fnIx: i32) {
 // True if function `name` returns a string-keyed mono map (`{[string]: i32}`, annotated or
 // inferred — `"map"`). Lets `exprMap`/`mapShapeOfExpr` classify a call to it, so
 // `const r = mk()` (or `mk()[k]`) routes through the map lowering.
-function fnRetMapSid(sid: i32) {
-  const i = fnIndexOfSid(sid)
+function fnRetMapSid(sid: i32, name: string, fnIx: i32) {
+  const i = fnIndexOfInScopeSid(sid, name, fnIx)
   if i < 0 { return false }
   fRetKind[i] == "map"
 }
@@ -30122,7 +30231,9 @@ export function exprStringArray(exprIx: i32, fnIx: i32) {
     if mapValuesResultKind(exprIx, fnIx) == 7 { return true }
     const callee = P.nodes[e.callFn]
     if callee is Ident {
-      if fnRetStringArraySid(sidOfNode(e.callFn)) { return true }
+      if fnRetStringArraySid(sidOfNode(e.callFn), callee.identName, fnIx) {
+        return true
+      }
       // A closure-VALUE call (`g(x)` with `g: (i32) => string[]`) whose resolved sig
       // result is the string list (`>A`).
       return calleeRetKindSid(sidOfNode(e.callFn), fnIx) == "strlist"
@@ -30997,7 +31108,9 @@ export function exprMap(exprIx: i32, fnIx: i32) {
     // throughout; a named function returning a map (`fnRetMap`) yields one too.
     if callee is Ident {
       if callee.identName == "Map" || callee.identName == "Set" { return true }
-      if fnRetMapSid(sidOfNode(e.callFn)) { return true }
+      if fnRetMapSid(sidOfNode(e.callFn), callee.identName, fnIx) {
+        return true
+      }
     }
     // `scopes.pop()` over a map ref list (`{[string]:i32}[]`) yields a Map ref.
     if callee is Member {
@@ -31743,13 +31856,13 @@ function mvSlotOfMapValNameOrMonoKTy(
 // builtin (H2) constructs a single-character VL string, so it is `string`-returning too —
 // classifying it here routes `value + fromCodePoint(cp)` to string concat and
 // `let s = fromCodePoint(n)` to a string local, exactly as a user function would.
-function fnRetStringSid(sid: i32) {
+function fnRetStringSid(sid: i32, name: string, fnIx: i32) {
   // The three builtin string producers are recognized by spelling, not the function table
   // — `sidText` reads the spelling back out of the intern table, faithful since callers mint.
-  const name = sidText(sid)
-  if name == "fromCodePoint" { return true }
-  if name == "fromCodePoints" { return true }
-  const i = fnIndexOfSid(sid)
+  const spelled = sidText(sid)
+  if spelled == "fromCodePoint" { return true }
+  if spelled == "fromCodePoints" { return true }
+  const i = fnIndexOfInScopeSid(sid, name, fnIx)
   if i < 0 { return false }
   fRetKind[i] == "str"
 }
@@ -31852,7 +31965,9 @@ export function exprString(exprIx: i32, fnIx: i32) {
     if cloArrCallRetKind(exprIx, fnIx) == "str" { return true }
     const callee = P.nodes[e.callFn]
     if callee is Ident {
-      if fnRetStringSid(sidOfNode(e.callFn)) { return true }
+      if fnRetStringSid(sidOfNode(e.callFn), callee.identName, fnIx) {
+        return true
+      }
       // A string-returning function value's resolved `>S` sig, except an aliased litunion
       // call whose checker type softens to `string` while `call_ref` reps the i32 atom.
       if calleeReturnsStringSid(sidOfNode(e.callFn), fnIx) {
