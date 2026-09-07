@@ -1019,10 +1019,18 @@ const run = async () => {
 
     const errors = result.diagnostics.filter((d) => d.severity === "error");
     if (errors.length > 0) {
+      // A runtime trap resolves to the trapping instruction's source line(s) —
+      // the same block `vl run` prints. Show it in the Run pane beside the verdict
+      // (the message itself stays in the Diagnostics tab), innermost frame first.
+      const framesHtml = result.sourceFrames?.length
+        ? `<div class="trap-frames">${
+          result.sourceFrames.map((f) => `<code>${escapeHtml(f)}</code>`).join("")
+        }</div>`
+        : "";
       logPane.innerHTML =
         `<div class="out-empty"><span class="big" style="color:var(--err)">Cannot run — ${errors.length} error${
           errors.length === 1 ? "" : "s"
-        }</span><span>See the Diagnostics tab.</span></div>`;
+        }</span><span>See the Diagnostics tab.</span>${framesHtml}</div>`;
       setStatus(
         `Failed — ${errors.length} error${errors.length === 1 ? "" : "s"}`,
         "error",
