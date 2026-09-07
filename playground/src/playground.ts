@@ -13,6 +13,7 @@
 
 import type { VLDiagnostic } from "../../compiler/diagnostics.ts";
 import type { WasmChecker } from "../../lsp/src/wasmChecker.ts";
+import { sourceFrames } from "../../compiler/vlSrcSection.ts";
 import { runWasmBytes } from "./runtime.ts";
 import { watFromBytes } from "./wat.ts";
 
@@ -32,6 +33,14 @@ export type PlaygroundResult = {
   compiled: boolean;
   /** Size in bytes of the emitted wasm module, when one was produced. */
   wasmBytes?: number;
+  /**
+   * The `at <line>:<col>  in \`fn\`` lines a runtime trap resolves to, innermost
+   * first — the SAME block `vl run` and the Deno host print, joined from the
+   * emitted module's `vl-src` section against the trap's wasm frame offsets. Only
+   * present (and only non-empty) when a run trapped and the module carried the
+   * section (the Run path enables it via `setEmitNames`).
+   */
+  sourceFrames?: string[];
 };
 
 /**
@@ -46,8 +55,17 @@ export const runProgram = async (
   checker: WasmChecker,
   opts: { wat?: boolean } = {},
 ): Promise<PlaygroundResult> => {
-  const { diagnostics, bytes } = await checker.compile(source, "main.vl", NO_SIBLINGS);
-  return finishRun(diagnostics, bytes, opts);
+  // Names ON only around the RUN-path compile, so a trap resolves to its source
+  // line; restored immediately so an editor-keystroke `check`/`compile` on the
+  // same seed stays lean and byte-standard.
+  checker.setEmitNames(true);
+  let compiled;
+  try {
+    compiled = await checker.compile(source, "main.vl", NO_SIBLINGS);
+  } finally {
+    checker.setEmitNames(false);
+  }
+  return finishRun(compiled.diagnostics, compiled.bytes, opts);
 };
 
 /**
@@ -65,12 +83,15 @@ export const runProject = async (
   checker: WasmChecker,
   opts: { wat?: boolean } = {},
 ): Promise<PlaygroundResult> => {
-  const { diagnostics, bytes } = await checker.compile(
-    files[entry] ?? "",
-    entry,
-    (key) => files[key],
-  );
-  return finishRun(diagnostics, bytes, opts);
+  // Names ON only around the RUN-path compile (see `runProgram`).
+  checker.setEmitNames(true);
+  let compiled;
+  try {
+    compiled = await checker.compile(files[entry] ?? "", entry, (key) => files[key]);
+  } finally {
+    checker.setEmitNames(false);
+  }
+  return finishRun(compiled.diagnostics, compiled.bytes, opts);
 };
 
 // Shared tail: optionally emit WAT, then instantiate + capture `log` output.
@@ -116,6 +137,20 @@ const finishRun = async (
         end: { line: 0, character: 0 },
       },
     });
-    return { diagnostics, logs: [], wat, compiled: true, wasmBytes };
+    // The trapping INSTRUCTION's line, joined from the module's `vl-src` section
+    // against V8's wasm frame offsets — the same block `vl run` and the Deno host
+    // print. `err.stack` is V8's (the playground runs on the browser's V8, Deno's
+    // in tests); an empty array when the module carried no section or nothing
+    // resolved, so the error surface is unchanged in that case.
+    const stack = err instanceof Error ? err.stack : undefined;
+    const frames = wasm ? sourceFrames(wasm, stack) : [];
+    return {
+      diagnostics,
+      logs: [],
+      wat,
+      compiled: true,
+      wasmBytes,
+      sourceFrames: frames.length > 0 ? frames : undefined,
+    };
   }
 };
