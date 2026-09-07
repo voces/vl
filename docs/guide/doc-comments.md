@@ -2,8 +2,9 @@
 
 `///` is a doc comment. `//` is an ordinary comment. The difference is who reads it: a `///`
 block written directly above a declaration is that declaration's documentation, and the editor
-shows it on hover wherever the name is used. A `//` comment is for whoever is reading the
-source, and no tool renders it anywhere else.
+shows it on hover wherever the name is used — and in the completion list, above the type, while
+you are still choosing the name. A `//` comment is for whoever is reading the source, and no
+tool renders it anywhere else.
 
 ```vl
 /// Greets a person by name.

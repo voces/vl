@@ -1695,7 +1695,47 @@ widening doing exactly what it is for.
 
 **17 sites remain nominal, in two groups.** Twelve never received a structural name in either
 population — converting them is the no-op with risk the plan warned about, and they stay until
-one does. Five are refused by witness: the four in §11.2 and `refArrShapeKindGo` in §11.3. Each
-needs its own fix, not a wider gate; the trap in `elemNameIsNominalAt` is the one worth a row
-first, since a compiler trap is a defect wherever it comes from.
+one does. Five are refused by witness: the four in §11.2 and `refArrShapeKindGo` in §11.3. They are
+taken one per PR; §11.5 settles the first, and it did NOT need a fix.
+
+### 11.5 `elemNameIsNominalAt` — settled as a DESIGN rule, and pinned (D1857)
+
+The trap was the loudest of the five, so it went first. It is not a mechanism to fix: the site
+must stay nominal by construction, and the row that says so is a refutation pin rather than a
+defect.
+
+**The predicate is ABOUT nominality.** Its contract, in its own words, is *"is the element name
+`en` one `repElemKey` keys nominally? Those are the names a structural row cannot stand in
+for."* `structIndexOfTypeName` answers by matching a structural shape TO a row — precisely the
+case whose answer must be `false`. Converting the site does not widen the predicate, it
+INVERTS it: a structurally-spelled element gets a nominally-keyed slot pointing at its
+structural twin, and `mAssignTypeIndices` then indexes a table with it. The rung's own comment
+had already priced this — *"a wrong hint is a silently wrong slot"* — and the trap is that slot
+one hop later.
+
+**Measured at the rung.** With the site left unconverted and a shadow-gated note beside it, the
+name it would flip on is `repAB/elemNominal would-flip -> {r:{c2:i32}|{s2:i32}} x2`, the
+structural rendering of `Circle`. Read off the code this would have been a guess; the reading
+is what makes it a ruling.
+
+**The ablation names one ingredient.** Of the eight `named/d361e0136*` cells, one minimises to
+13 lines, and only a **module-global binding whose type is the map ALIAS** is load-bearing.
+The union field, the nested struct, the binding hop, and whether the local is spelled inline or
+by the alias are all scenery — each still traps when removed.
+
+So the site is closed, not scheduled. `tests/cases/maps/map-alias-global-struct-elem-nominal-pin.vl`
+prints `7` and must keep doing so; it flips the day someone converts this rung.
+
+**And three instruments failed before one worked**, which is worth more than the row:
+
+| probe | why it said nothing |
+| --- | --- |
+| `repABNote` at the converted site | the compile TRAPS, and `repLadderABSweep` drains at the END of `emitProgram` — the process dies first |
+| `print` at the converted site | the compiler-as-seed has no print import; the seed would not load (`unknown import: __print_i32__`), so its silence was about the seed, not the rung |
+| `repABNote` at the UNCONVERTED site | works — a compile that finishes is the only one that drains |
+
+The rule underneath is CLAUDE.md's, seen from a third side: **never trust a probe until a
+control you know should trigger it does.** Two of these three reported zero on a program that
+provably reaches the rung, and only a control separated "the rung did not fire" from "the
+instrument cannot speak."
 
