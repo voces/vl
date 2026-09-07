@@ -14481,12 +14481,31 @@ export function nodeEqCmpKind(ix: i32): EqCmpKind {
 // is -1. Moved here from `emit_classify` so the checker and the emitter read one map instead
 // of two guesses about "which core".
 export function eqCoreKindOfTyToken(k: EqCmpKind) {
-  if k == "list" || k == "nullist" { return 0 }
-  if k == "strlist" || k == "nulstrlist" { return 3 }
-  if k == "reflist" || k == "nulreflist" { return 4 }
-  if k == "glist" || k == "nulglist" { return 7 }
-  if k == "str" || k == "nulstr" { return 5 }
-  if k == "closure" || k == "nulclosure" { return 6 }
+  // Exhaustive over `EqCmpKind` and `_`-less: `-1` is a real answer — "no core of its own" —
+  // so a new kind must say whether it shares a core rather than inherit that by omission.
+  match k {
+    "list" | "nullist" => {
+      return 0
+    }
+    "strlist" | "nulstrlist" => {
+      return 3
+    }
+    "reflist" | "nulreflist" => {
+      return 4
+    }
+    "glist" | "nulglist" => {
+      return 7
+    }
+    "str" | "nulstr" => {
+      return 5
+    }
+    "closure" | "nulclosure" => {
+      return 6
+    }
+    "" | "scalar" | "struct" | "none" | "nulstruct" => {
+      // No compare core of its own; the caller reads `-1`.
+    }
+  }
   -1
 }
 
@@ -17662,6 +17681,14 @@ function holeDemandOk(name: string, srcExpr: i32, at: i32) {
   const shape = holeShapeOf(name)
   if shape < 0 { return true }
   if holeAssignOk(srcExpr, at, shape) { return true }
+  // A `new`-branded argument satisfies a shape SYNTHESISED from its own field reads: the demand
+  // is structural (member reads only build it), and a brand is erased at run time, so the
+  // underlying structure is what the body actually reads. Retry against the erased base so the
+  // nominal barrier does not refuse the very type that induced the demand (D1894).
+  const atBase = nomErasedTyIx(at)
+  if atBase != at {
+    if holeAssignOk(srcExpr, atBase, shape) { return true }
+  }
   let k = 0
   while k < holeAltNames.length {
     if holeAltNames[k] == name {
@@ -20910,6 +20937,33 @@ function opDeclKeyOf(op: string) {
   const merged = mergedDeclKeyOf(op)
   if merged == "" { return op }
   merged
+}
+
+// The `self` parameter's type for `op`'s declaration, or -1 when the operator names no
+// two-parameter `self`-function. The receiver half of `opSelfFnTy`'s own resolution, split out
+// so a hole on the LEFT can be seeded from the same declaration. A non-bracket operator may be
+// declared once per program (`redeclared <`), so the answer is unambiguous.
+function opSelfParamTy(op: string) {
+  const opKey = opDeclKeyOf(op)
+  const fnTy = lookup(opKey)
+  if fnTy < 0 { return -1 }
+  const dIx = fnDeclIx[opKey] ?? -1
+  if dIx < 0 { return -1 }
+  const d = P.nodes[dIx]
+  if d is FuncDecl {
+    if d.fnParams.length == 2 {
+      const p0 = P.nodes[d.fnParams[0]]
+      if p0 is Param {
+        if p0.parName == "self" {
+          const ft = T.tys[fnTy]
+          if ft is TyFunc {
+            if ft.fnParamTypes.length == 2 { return ft.fnParamTypes[0] }
+          }
+        }
+      }
+    }
+  }
+  -1
 }
 
 // Operator dispatch `a op b` over a struct left operand through the free `self`-function
@@ -32900,6 +32954,11 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
         }
       }
     } else {
+      // A hole on the LEFT never reached the operator table at all: the lookup above is gated
+      // on the left operand ALREADY being an object, and it is `opSelfFnTy`'s own trailing
+      // `assignableExpr` that seeds a hole on the RIGHT. Record the mirror flow so the
+      // parameter solve binds it too — inert outside the solve, as `noteHoleFlow` is (D1891).
+      if tyIsHole(lt) { noteHoleFlow(lt, opSelfParamTy(op)) }
       // The site's own decision, recorded (D491): a non-object left operand takes the
       // language's own lowering with no declaration consulted — recorded for the declaration side.
       opBinSiteTook(op, false)
