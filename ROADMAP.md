@@ -1731,6 +1731,16 @@ in-language GC knobs.
   annotation is wanted later and is additive: with inference alone, variance is a property of a
   function BODY, so adding a `.push` silently breaks callers with the error at the call site — an
   API-stability argument that only bites once there are cross-module consumers.
+  **BACKLOGGED behind the read-only LIST view, which shipped 2026-09-06 (D1686/D1687).** The
+  annotation the paragraph above says is "wanted later and additive" now exists for ONE type
+  constructor: `readonly T[]` is a covariant, shallow, read-only view of a list, refusing
+  `push`/`pop`/`clear`/index assignment on its receiver and never converting back to `T[]`.
+  What A9 would GENERALISE, once it is scheduled: the same readable/writable split over the
+  OTHER constructors (`readonly {[K]: V}`, a read-only struct or field, a read-only export at
+  the module boundary — `modules-design.md` §exports depends on exactly that); INFERENCE of
+  the marker during parameter inference, so a body that never writes its argument is read-only
+  without being told; and a Writable half spelled rather than derived. The view is deliberately
+  a per-constructor spelling so A9 can subsume it — nothing in it commits the general rule.
 - 🟡 **A10. Parametric types / generics.** REMAINING: same `map`/`filter` generics for `Map`/`Set`
   (B6a); **const generics** (numeric/value type parameters, e.g. `Decimal<10, 8>` /
   `Buffer<N>`) — today generics take *type* params only; enabler for the parameterized

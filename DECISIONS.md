@@ -1169,6 +1169,43 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
     rule belongs in the checker. What it could not price was a rule that says so without
     also rejecting the read-only pass.
 
+  **THE SURFACE IS NO LONGER NONE, FOR ONE CONSTRUCTOR: `readonly T[]` (owner ruling
+  2026-09-06, D1686/D1687).** A read-only list view — covariant in its element, invariant
+  when mutable, and SHALLOW: it forbids writes to the list's own shape (`push`, `pop`,
+  `clear`, index assignment) and says nothing about an element's fields, as Kotlin's `List`
+  and C#'s `IReadOnlyList` do. Four things decide the design and are worth keeping:
+
+  * **A FLAG ON `TyArray`, NOT A `Ty` VARIANT.** `TyArray = { aElem, aRead }`. A variant
+    would owe an arm in eighteen `TyArray` ladders and in every `_`-less `match` over `Ty`,
+    and `ladder-budget.py` re-derives the closed set from the `export type` and would demand
+    each one. A flag is invisible to every ladder that does not ask.
+
+  * **`repCanonId` IGNORES IT, SO A VIEW IS THE SAME VALUE.** No copy, no new heap type, and
+    byte-identity for every module that does not spell the marker — measured at 2,545 of
+    2,545 buildable `tests/cases` modules. `canonEmitTypeNames` strips the marker, so the
+    emitter's vocabulary is the list's alone and no rep-keyed table grows a second row.
+
+  * **THE ONE ASYMMETRY IS WHAT MAKES IT A VIEW.** `T[]` -> `readonly T[]` passes;
+    `readonly T[]` -> `T[]` is refused at every position. Without that, one binding launders
+    every write the marker forbids, and the marker means nothing.
+
+  * **AND THE REFUSAL HAS A POSITION THAT IS NOT THE RECEIVER'S.** An un-annotated type
+    parameter (`function grow<T>(xs: T) { xs.push(1) }`) is re-typed as a freshly synthesized
+    MUTABLE list, and nothing re-checks the argument against that synthesis — so `assignable`
+    never sees the view and the write lands. The write is filed on the hole and the PIN
+    refuses a view, keyed by the OWNING FUNCTION: a declared type parameter's hole is named
+    `T`, so three `<T>`s share one row and a name-only key is a false reject. The mutable
+    controls and every read-only use of the same hole are unmoved.
+
+  * **IT ROUTES THE READ-ONLY PROOF THROUGH THE TYPE.** The `Readable` half's licence is a
+    whole-program alias closure, and D1686/D1687 are the two shapes where it cannot find a
+    handle — a nameless call result, a callee whose parameter list the program does not
+    spell. A `readonly` parameter needs no handle: nothing may write through it, so the
+    closure ends at that edge rather than guessing. Both rows close as DESIGN with their
+    filed refusal intact at the mutable spelling, and the refusal names the spelling that
+    works. A9 stays the general rule (inference, and the other constructors); this is one
+    constructor's spelling, built so A9 can subsume it.
+
 
 - **BOUNDS ARE ANNOTATIONS, AND THE CHECKER'S OWN COLUMN WAS REFUSED ON A MEASUREMENT**
   (2026-09-01, constraints phase 1). A `<T: Showable>` bound is stored as a `TypeRef` NODE
