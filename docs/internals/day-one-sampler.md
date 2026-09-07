@@ -575,6 +575,65 @@ nullable, inside a block, then narrowed — each ingredient load-bearing, filed 
 is exactly the cross-product blindness the sampler exists for: no single-feature fixture
 reaches it, and the non-null twin is its own control.
 
+## The operator x mixed-width cross — 372 pairs, 0 width-borne disagreements
+
+The second two-feature cross: an overloaded operator whose BODY crosses widths. `op_mixw_mul`
+is `"*"(self: Mw{x: i32}, k: f64): f64` — `self.x * k` widens `i32 -> f64` inside the
+dispatch; `op_mixw_add` is `"+"(self: Aw{x: i32}, k: i64): i64` for the `i32 -> i64` edge. Both
+join `operator_vs_call` (their `op`/`call` reads carry an `op` key) and tag `opw_mix`.
+`op_samew` is the same-shape control — the identical operator over an `f64` field, so
+`self.y * k` is `f64 * f64` with no widening — tagged `opw_same`. A record that only paired a
+mixed operator with itself would measure nothing; the same-width record is what makes a hit
+falsifiable.
+
+Seeds 901-908 x 800 (before/after) and a wider 911-916 x 1000:
+
+| | pairs | AGREE-RUNS | DISAGREE |
+| --- | --- | --- | --- |
+| after, on a mixed-width operator (`opw_mix`) | 132 | 129 | 3 |
+| after, same-width control (`opw_same`) | 58 | 58 | 0 |
+| wide, `opw_mix` | 124 | 124 | 1 |
+| wide, `opw_same` | 56 | 56 | 1 |
+
+**A clean negative.** The mixed-width operator bodies compose correctly at every delivery
+position and both spellings. Every disagreement — and there is one on the SAME-WIDTH control
+too — carries `` `take` prints its type parameter here ``: the operator reached through an
+un-annotated parameter with a `std:` import in the graph, which is [D1893](inventory/D1893.md)
+(fixed in flight), width-independent by construction. The plainest witness confirms it: the
+mixed `Mw` and the same-width `Sw` refuse identically with the import and run identically
+without it. Overloaded-operator dispatch does not care that the body widens.
+
+## The init_vs_assign x union-narrowing cross — 322 pairs, 0 wrong values, a rep-interaction clean negative
+
+The third two-feature cross, and the first aimed at a REP interaction rather than a dispatch
+one. `Mix = i32 | Rec` has a SCALAR arm (a boxed `i32`) and a STRUCT arm (a boxed ref) —
+genuinely different reps. `mix_cross`'s value is the `Rec` and its `alt` is the scalar `5`, so
+the `init_vs_assign` axis's `assign` face is `let v: Mix = 5` then `v = mkval()` — a
+reassignment ACROSS the rep boundary. `mix_cross_rev` crosses the other way (scalar value,
+struct `alt`). The narrow-and-read then surfaces a wrong STORED rep as a wrong VALUE, not just
+a wrong type. `mix_same` reassigns another `Rec` over the `Rec` — the same-arm control that
+separates a cross-rep defect from a plain assignment bug.
+
+Seeds 1001-1008 x 800 (before/after) and a wider 1011-1016 x 1000:
+
+| | pairs | AGREE-RUNS | DISAGREE | RUNS-WRONG |
+| --- | --- | --- | --- | --- |
+| on a cross record (`xrep_cross`) | 225 | 201 | 17 | 0 |
+| same-arm control (`xrep_same`) | 97 | 88 | 7 | 0 |
+| the `init_vs_assign` axis itself, on a cross record | 27 | 27 | 0 | 0 |
+
+**A clean negative, and the sharpest of the three.** No cross-rep pair ever produced a wrong
+VALUE — a wrong stored rep would, and none did. The `init_vs_assign` axis, which is the one
+that actually varies the reassignment (direct-init vs seed-then-reassign-across-the-boundary),
+is 100% agreement: reassigning a struct over a scalar-seeded union slot, or the reverse, reads
+back exactly what a direct init does.
+
+Every disagreement is rep-independent and shared by the same-arm control: `match scrutinee
+must be a union or an integer, got _` (the match-over-a-hole-parameter refusal, D1885/D1886)
+and `field 'n' is not on every member of Mix` (narrowing a CALL result, which does not carry
+to a second call of it — a fact about places, not reps). Both appear in `xrep_same` at the
+same rate. The scalar/struct rep boundary is crossed soundly.
+
 ## Running it
 
 `--count` counts PROGRAMS, so it is twice the number of pairs.

@@ -553,6 +553,116 @@ VALUES = [
                   {"id": "ufcs", "op": "none",
                    "lines": ["print({v}.plusPln(4))"], "want": ["7"]}],
     },
+    {
+        # OPERATOR x MIXED-WIDTH: an overloaded operator whose BODY crosses widths — the
+        # `i32` field times an `f64` operand, so `self.x * k` widens `i32 -> f64` inside the
+        # dispatch. `op`/`call` join `operator_vs_call`; the `opw` tag marks the width the
+        # body mixes, and `op_samew` below is the same-shape control that makes a hit
+        # falsifiable. The result LEAVES the receiver's rep (returns `f64`), like `op_cmp`.
+        "id": "op_mixw_mul", "weight": 2, "decls": [("Mw", "new { x: i32 }")],
+        "named": "Mw", "inline": "Mw", "no_inline": True,
+        "fns": ['function "*"(self: Mw, k: f64): f64 { return self.x * k }',
+                "function mulMw(self: Mw, k: f64): f64 { return self.x * k }"]
+        + _op_alt("altMw", "Mw"),
+        "expr": None, "mk": OP_MK, "alt": "altMw()", "alt_infers": True,
+        "features": ["struct", "operator", "op_mixw", "opw_mix"],
+        "reads": [{"id": "op", "op": "*", "opw": "mix",
+                   "lines": ["print({v} * 2.5)"], "want": ["7.5"]},
+                  {"id": "call", "op": "*", "opw": "mix",
+                   "lines": ["print(mulMw({v}, 2.5))"], "want": ["7.5"]}],
+    },
+    {
+        # The `i32 -> i64` edge of the same cross: `self.x + k` widens `i32` to `i64` in the
+        # body, and a different operator (`+`) reaches a different lowering than `*`.
+        "id": "op_mixw_add", "weight": 2, "decls": [("Aw", "new { x: i32 }")],
+        "named": "Aw", "inline": "Aw", "no_inline": True,
+        "fns": ['function "+"(self: Aw, k: i64): i64 { return self.x + k }',
+                "function addAw(self: Aw, k: i64): i64 { return self.x + k }"]
+        + _op_alt("altAw", "Aw"),
+        "expr": None, "mk": OP_MK, "alt": "altAw()", "alt_infers": True,
+        "features": ["struct", "operator", "op_mixw", "opw_mix"],
+        "reads": [{"id": "op", "op": "+", "opw": "mix",
+                   "lines": ["print({v} + 9000000000)"], "want": ["9000000003"]},
+                  {"id": "call", "op": "+", "opw": "mix",
+                   "lines": ["print(addAw({v}, 9000000000))"], "want": ["9000000003"]}],
+    },
+    {
+        # THE SAME-WIDTH CONTROL: the identical operator shape and reads, but the field is
+        # `f64` so `self.y * k` is `f64 * f64` — no widening in the body. A disagreement this
+        # record shares is about operator dispatch, not about the mixed width, which is what
+        # makes a hit on the two records above falsifiable (`widen_same`'s job for `+`).
+        "id": "op_samew", "weight": 2, "decls": [("Sw", "new { y: f64 }")],
+        "named": "Sw", "inline": "Sw", "no_inline": True,
+        "fns": ['function "*"(self: Sw, k: f64): f64 { return self.y * k }',
+                "function mulSw(self: Sw, k: f64): f64 { return self.y * k }",
+                "function altSw(): Sw {", "  const r: Sw = { y: 9.0 }", "  return r",
+                "}"],
+        "expr": None, "mk": ["const r: {T} = { y: 3.0 }", "return r"],
+        "alt": "altSw()", "alt_infers": True,
+        "features": ["struct", "operator", "op_samew", "opw_same"],
+        "reads": [{"id": "op", "op": "*", "opw": "same",
+                   "lines": ["print({v} * 2.5)"], "want": ["7.5"]},
+                  {"id": "call", "op": "*", "opw": "same",
+                   "lines": ["print(mulSw({v}, 2.5))"], "want": ["7.5"]}],
+    },
+    {
+        # INIT_vs_ASSIGN x UNION-NARROWING. `i32 | Rec` has a SCALAR arm (a boxed i32) and a
+        # STRUCT arm (a boxed ref) — genuinely different reps. The value is the Rec; `alt` is
+        # the scalar `5`, so the axis's `assign` face is `let v: Mix = 5` then `v = mkval()` —
+        # a reassignment ACROSS the rep boundary. The narrow-and-read then surfaces a wrong
+        # stored rep as a wrong VALUE, not just a wrong type. `mix_same` below reassigns the
+        # SAME arm and is the control that separates a cross-rep defect from an assignment bug.
+        "id": "mix_cross", "weight": 2,
+        "decls": [("Rec", "{ n: i32 }"), ("Mix", "i32 | Rec")],
+        "named": "Mix", "inline": "i32 | { n: i32 }", "expr": None,
+        "mk": ["return { n: 3 }"], "alt": "5",
+        "features": ["union", "struct", "scalar", "xrep_cross"],
+        "reads": [
+            {"id": "is_rec", "narrow": "is", "named_only": True, "xrep": "cross",
+             "lines": ["if {v} is Rec { print({v}.n) } else { print(0) }"],
+             "want": ["3"]},
+            {"id": "match_rec", "narrow": "match", "named_only": True, "xrep": "cross",
+             "lines": ["match {v} {", "  Rec{n} => print(n)", "  i32 => print(0)", "}"],
+             "want": ["3"]},
+        ],
+    },
+    {
+        # The REVERSE crossing: the value is the SCALAR arm and `alt` is the struct, so the
+        # `assign` face seeds a ref (`let v: Mix = { n: 9 }`) and reassigns a scalar. A wrong
+        # stored rep here reads the ref's bits as an integer.
+        "id": "mix_cross_rev", "weight": 2,
+        "decls": [("Rec", "{ n: i32 }"), ("Mix", "i32 | Rec")],
+        "named": "Mix", "inline": "i32 | { n: i32 }", "expr": None,
+        "mk": ["return 5"], "alt": "{ n: 9 }",
+        "features": ["union", "struct", "scalar", "xrep_cross"],
+        "reads": [
+            {"id": "is_i32", "narrow": "is", "xrep": "cross",
+             "lines": ["if {v} is i32 { print({v}) } else { print(0) }"],
+             "want": ["5"]},
+            {"id": "match_i32", "narrow": "match", "named_only": True, "xrep": "cross",
+             "lines": ["match {v} {", "  i32 => print({v})", "  Rec => print(0)", "}"],
+             "want": ["5"]},
+        ],
+    },
+    {
+        # THE SAME-ARM CONTROL: identical `Mix` and reads, but `alt` is another Rec, so the
+        # `assign` face reassigns STRUCT over STRUCT — no rep boundary crossed. A disagreement
+        # this record shares is a plain assignment/narrowing bug, not a cross-rep one, which is
+        # what makes a hit on the two records above readable.
+        "id": "mix_same", "weight": 2,
+        "decls": [("Rec", "{ n: i32 }"), ("Mix", "i32 | Rec")],
+        "named": "Mix", "inline": "i32 | { n: i32 }", "expr": None,
+        "mk": ["return { n: 3 }"], "alt": "{ n: 9 }",
+        "features": ["union", "struct", "scalar", "xrep_same"],
+        "reads": [
+            {"id": "is_rec", "narrow": "is", "named_only": True, "xrep": "same",
+             "lines": ["if {v} is Rec { print({v}.n) } else { print(0) }"],
+             "want": ["3"]},
+            {"id": "match_rec", "narrow": "match", "named_only": True, "xrep": "same",
+             "lines": ["match {v} {", "  Rec{n} => print(n)", "  i32 => print(0)", "}"],
+             "want": ["3"]},
+        ],
+    },
 ]
 
 # ---------------------------------------------------------------------------

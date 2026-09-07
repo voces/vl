@@ -523,7 +523,11 @@ def make_pair(rng, axis_id=None):
                             if "generic2" in (fa["pinning"], fb["pinning"]) else set()) |
                            ({"widen_" + plan["read"]["mix"]}
                             if "mix" in plan["read"] else set()) |
-                           _xnp_tags(plan, fa, fb)),
+                           _xnp_tags(plan, fa, fb) |
+                           ({"opw_" + plan["read"]["opw"]}
+                            if "opw" in plan["read"] else set()) |
+                           ({"xrep_" + plan["read"]["xrep"]}
+                            if "xrep" in plan["read"] else set())),
         "delta": delta(axis, fa, fb, plan, srcA, srcB),
     }
 
