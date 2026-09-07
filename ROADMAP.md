@@ -68,7 +68,7 @@ units: **hours** · **half-day** · **days**.
 | 27 | **E3 — user wasm runs on the playground's MAIN thread** | `playground/src/runtime.ts:21` instantiates there; `main.ts:36` says so | `playground/src/{runtime,playground,main}.ts` | days |
 | 28 | **F-tiers / J1 — collapse the redundant corpus runner** | 8 files execute emitted wasm under V8 via `tests/support/runWasm.ts` | `tests/support/casesWasmOracle.ts` + 4 shards + 4 standalone suites | days |
 | 29 | **F-day-one — five grammar axes still absent** | `day-one-sampler.md:90-92`: `match`, operator overloading, multi-param generics, recursive types, mixed-width arithmetic | `scripts/day-one/grammar.py` (91 records) | half-day per axis |
-| 30 | **Dogfood the orchestrator scripts onto the host ABI** | the ABI is COMPLETE (`std:process` `run`/`exit`, `std:env` `getEnv`, in all three hosts); 34,029 lines of Python and 2,536 of shell still do the work | `scripts/*.py` one port at a time, `scripts/seed-size.py` first | days |
+| 30 | **Dogfood the orchestrator scripts onto the host ABI** | the ABI is COMPLETE (`std:process` `run`/`exit`, `std:env` `getEnv`, in all three hosts); 34,029 lines of Python and 2,536 of shell still do the work | `scripts/*.py` one port at a time; `scripts/seed-size.vl` is the first and is live | days |
 | 31 | **A-destructure — `let`/`const` and PARAMETER destructuring (owner ask, 2026-09-06 night; not scheduled)** | `const { x, y } = p`, `const [a, b] = xs`, `function f({ x, y }: Pt)` → `parse error … expected an identifier but found `{``; the `match` payload clause (pun, rename, nest — #2837) is the only destructuring today | `parser.vl` (a pattern in binding and parameter position, the payload clause's grammar reused), `typecheck.vl` (binding types from the pattern; for an UN-ANNOTATED parameter the pattern is a shape constraint `{a: ?, b: {c: ?}}` with hole leaves closed at the pin — the inference half is a second step), `format.vl` (byte-for-byte round trip), the desugar (one `const` per leaf, the `match` prelude's shape); list destructuring wants the multiple-returns question in `docs/guide/lambda-param-skip-design.md` answered first | days |
 
 ### Open items that need an owner ruling first — listed, not decided
@@ -92,8 +92,9 @@ units: **hours** · **half-day** · **days**.
 | B7 R4 `utf8Length` | A breaking std removal; also triggers the `std-api-reviewer` gate. |
 | C5 distribution · F5 the name · H5 versioning · H-M2 · J2 runner · J3 port target · D field-level hints · F9 baseline scope | Each already carries its question in its own row. |
 | registry-by-key step 5 | Blocked on D1492's write-seam question. |
-| `dogfood:` fixed-precision float rendering in `std:fmt` | Whether `toFixed(self: f64, digits: i32): string` is the export, a runtime format spec is, or precision belongs in the interpolation hole. `std:fmt` renders a float only at full precision (`toString(100.0 / 3.0)` → `33.333333333333336`), so the `+.1f` holes at `scripts/seed-size.py:85` and `:110` are the only part of that script a VL port cannot reproduce byte for byte — and every later port that prints a percentage, a duration or a ratio meets the same wall. Options, peers and a recommendation for `toFixed`: `open-rulings.md` §D `fmt-fixed-precision`. |
-| `dogfood:` a VL program cannot locate itself or its working directory | Whether `std:env` grows `cwd()` (a host import, so it lands in all three hosts), whether a `mainModule`-style entry path is exposed, or whether "a script runs from the checkout root" becomes the written contract. `programArgs()` documents index 0 as the first USER argument, so argv[0] is unreachable by design, and there is no `cwd` or `__file__` anywhere. `scripts/seed-size.py:40-42` derives every path from `ratchet.ROOT`, which is `os.path.dirname(os.path.dirname(os.path.abspath(__file__)))` at `scripts/ratchet.py:37` — the shape all five ratchets share, and one with no VL spelling. Options, peers and a recommendation for `cwd()`: `open-rulings.md` §D `script-self-location`. |
+| `dogfood:` fixed-precision float rendering in `std:fmt` | Whether `toFixed(self: f64, digits: i32): string` is the export, a runtime format spec is, or precision belongs in the interpolation hole. `std:fmt` renders a float only at full precision (`toString(100.0 / 3.0)` → `33.333333333333336`), so `scripts/seed-size.vl` carries eleven hand-written lines (`pctStr`) where the Python it replaced wrote `+.1f` twice, and the two round differently on an exact tie — and every later port that prints a percentage, a duration or a ratio meets the same wall. Options, peers and a recommendation for `toFixed`: `open-rulings.md` §D `fmt-fixed-precision`. |
+| `dogfood:` a VL program cannot write to stderr | Whether `eprint` joins `print` as a builtin, whether one import carries a stream tag, or whether the second stream waits for a `std:io` writer. `print` is the whole output surface and the seven `__print_*__` sinks all route to stdout in all three hosts, so a script cannot separate a diagnostic from its answer: `scripts/seed-size.vl` prints what `scripts/seed-size.py` raised through `SystemExit` to STDOUT, which `tests/vl_seed_size_test.ts` asserts, and a port whose stdout is consumed by a pipe or a `--json` mode could not report a failure at all. Options, peers and a recommendation for `eprint`: `open-rulings.md` §D `script-stderr`. |
+| `dogfood:` a VL program cannot locate itself or its working directory | Whether `std:env` grows `cwd()` (a host import, so it lands in all three hosts), whether a `mainModule`-style entry path is exposed, or whether "a script runs from the checkout root" becomes the written contract. `programArgs()` documents index 0 as the first USER argument, so argv[0] is unreachable by design, and there is no `cwd` or `__file__` anywhere. `scripts/seed-size.vl` resolves its two paths against the working directory because it cannot do otherwise; the Python it replaced derived them from `ratchet.ROOT`, `os.path.dirname(os.path.dirname(os.path.abspath(__file__)))` at `scripts/ratchet.py:37` — the shape the four remaining ratchets still share, and one with no VL spelling. Options, peers and a recommendation for `cwd()`: `open-rulings.md` §D `script-self-location`. |
 
 ---
 
@@ -1549,12 +1550,16 @@ in-language GC knobs.
         `fnIndexOfInScope` already owns. Fourteen readers became projections, the two `#2815`
         left behind gained the frame (closing D1834), byte-identical in 3,154 of 3,155 + 7,589
         of 7,589, and the flat-vs-scoped oracle contradicts in eight modules, all of them the
-        pin-context fixtures. **The BINDING half is the prerequisite item 4 has, and it is now
-        specified**: `declaredSlotOf` takes a bare name, `paramTypeNode`/`globalLetOfSidIn`
-        take `fnIx` only as a frame-binds-this-name veto, and what is needed is one scope-chain
-        walk keyed `(name, frame)` — #2629's `(frame, sid)` table is the precedent, with the
-        trap that its frame is a `FuncDecl` ARENA index while `fnIndexOfInScopeSid`'s is an
-        `fnStmts` POSITION, both spelled `i32`. `docs/internals/rep-descriptor-campaign.md` §5.3.
+        pin-context fixtures. **The BINDING half was specified as a prerequisite and is
+        REFUTED by witness**: binding resolution is already frame-correct by three separate
+        routes — `localNames` is rebuilt per function so the frame is the TABLE, `paramTypeNode`
+        reads its own `fnIx`, and `globalLetOfSidIn` vetoes through `identBoundInFrame`'s
+        three-rung walk. Four witnesses, twenty printed values, all correct on master; pinned by
+        `tests/cases/scope/binding-resolution-is-frame-correct.vl`. The rule it earns: **a
+        signature that does not take a frame is not thereby frame-blind** — the frame can be
+        ambient in the table it reads. What was actually owed is one de-duplication,
+        `bindingDeclInScope(name)`, whose signature carries the finding by taking no frame.
+        `docs/internals/rep-descriptor-campaign.md` §6.7.
      4. ⬜ **The `expr*` family** — 48 classifiers, 927 call sites, 31% of all classifier call
         sites. Converted by AXIS, since each is a closed set whose siblings must move
         together: (a) the seven scalar-list predicates, (b) the six nullable niches, (c) the

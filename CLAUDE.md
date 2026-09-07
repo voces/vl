@@ -149,7 +149,8 @@ loud→silent while its loud-emit column moved −126, so the regression was ari
 invisible. And a named set re-grades against any new seed in ~10 invocations, so use one rather
 than rebuilding its grid.
 
-**THE SEED'S SIZE IS A GATED NUMBER — `scripts/seed-size.py --check`.**
+**THE SEED'S SIZE IS A GATED NUMBER —
+`vl run scripts/seed-size.vl --compiler build/vl-compiler.wasm -- --check`.**
 `build/vl-compiler.wasm` is the compiler's own codegen of itself, so every emitter change is
 priced in its bytes — and that price was read only when somebody went looking: **+8.8% across
 four landings on 2026-09-03**, noticed because a peer asked. Same ratchet shape as the comment
@@ -160,6 +161,18 @@ ci-native, `--write-baseline` in the SAME PR as the growth it records. It reds o
 self-compile off a stale seed is the PREVIOUS compiler's output, so ci-native takes it straight
 after `--prove-fixpoint`. Rationale and both measurements: DECISIONS.md §"The seed's size is a
 per-landing number".
+
+**IT IS THE FIRST ORCHESTRATOR SCRIPT WRITTEN IN VL**, so it is compiled by the seed it
+measures and this row now needs the binary and a working seed where the Python needed neither.
+The port is graded by having run BESIDE the Python it replaced, output for output, and the
+three places they could not agree are named and asserted in
+`tests/vl_seed_size_port_test.ts` rather than tolerated: the rounding of the one-decimal
+percentage (`std:fmt` has no fixed-precision renderer — `open-rulings.md` §D
+`fmt-fixed-precision`), the tool its own regressed message names, and the STREAM a loud
+failure uses (VL has no stderr sink, so what the Python raised through `SystemExit` is printed
+to stdout). Paths resolve against the WORKING DIRECTORY, not the script — a VL program can
+read neither its own path nor the cwd (§D `script-self-location`) — so run it from the
+checkout root, which `gate.sh` and `ci.yml` both do.
 
 ## "Zero silent rows" is a claim about the INVENTORY, not about VL
 

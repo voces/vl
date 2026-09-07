@@ -134,4 +134,4 @@ python3 scripts/ladder-budget.py --write-baseline     # after a real fix, in the
 
 One extra per-function pass, linear in bytes, sharing the line and function index the `if` half
 already builds. The seed grew **+0.19%** (2,187,156 → 2,191,334 bytes), under
-`scripts/seed-size.py`'s +3% bar; `scripts/native-fixpoint.sh` holds.
+`scripts/seed-size.vl`'s +3% bar; `scripts/native-fixpoint.sh` holds.
