@@ -8,6 +8,11 @@ change owes. Four findings were re-verified by hand before ranking (the checker'
 named-argument resolver, the dead token fields, the gate table's time column, the
 diagnostic column base); the rest stand on the surveys' own measurements.
 
+A fourth survey covers the EDITOR layer — the VS Code language server and the browser
+playground — and is ranked on its own page: [lsp and playground](lsp-and-playground.md)
+(surveyed at `aadacc574`). It is not folded into the ranking below because its rows are
+editor-latency and host-parity findings, not compiler ones; it carries its own tranches.
+
 ## Tranche 1 — instruments and dead code (hours each, no behaviour change)
 
 | # | finding | where | value | proof |
