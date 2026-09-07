@@ -52,8 +52,22 @@ AXIS for the same reason, and prints `NOT EXERCISED` rather than a zero.
    ingredient is *inference doing the pinning instead* is invisible to a fixture that
    annotates (CLAUDE.md, D969).
 3. **`narrowing`** — one test, several spellings: `is T`, `== "lit"`, `!= null`, `is null`
-   complement. ASYMMETRIC where a spelling has no twin (`is` cannot be written for an inline
-   arm); that pair is graded on RUNS-ness alone, each side keeping its own expected output.
+   complement, and `match`. ASYMMETRIC where a spelling has no twin (`is` cannot be written for
+   an inline arm); that pair is graded on RUNS-ness alone, each side keeping its own expected
+   output.
+
+   **`match` is a SPELLING here, not an axis of its own**, and that is what makes it compose:
+   a read is orthogonal to every other axis, so one `match` record is immediately crossed with
+   named/inline, annotated/inferred, fused/bound, the generic pin, six scopes, five neighbours,
+   six sources and nine delivery positions. An axis of its own would only ever pair `match`
+   against `match`, which measures nothing the grammar did not already reach. Seven reads
+   across six value records: payload BINDING (`Rect{w} =>`) on the two struct unions, a literal
+   arm on the literal unions, an OR-PATTERN (`"b" | "c" =>`) on a three-member one, atom arms on
+   the value union, and a `null` ARM on both nullables. The struct-payload ones are `named_only`
+   for `is Rect`'s reason — an arm names a declared type and the inline face declares none — and
+   the literal, atom and prim ones are symmetric, so `named_vs_inline` gets a real `match` pair
+   rather than only asymmetric ones. `sunion`'s narrow group had ONE member before, so the
+   `narrowing` axis never applied to a union with no literal discriminant at all.
 4. **`fusion`** — `xs.pop() ?? d` against `const v = xs.pop()` then `v ?? d`.
 5. **`pinning`** — a concrete call against the same value routed through a generic
    `pass<T>` or an un-annotated hole parameter.
@@ -88,8 +102,8 @@ Stated plainly, because a zero from an instrument is only as good as its frame.
 * **Anything outside the grammar.** Seventeen value shapes, six sources, nine delivery
   positions, six scopes, five neighbours; the module axis adds twenty-four units and nine
   reports, and the imports axis twelve std modules. No generics with more than one parameter,
-  no recursive types, no `match`, no operator overloading, no i32/f64 mixed arithmetic, no
-  strings beyond `+`/`.length`. `std:` reaches the single-file axes only as an unused import
+  no recursive types, no operator overloading, no i32/f64 mixed arithmetic, no strings beyond
+  `+`/`.length`. `std:` reaches the single-file axes only as an unused import
   (the `unused_import` neighbour) and the imports axis only as one call per module, so no
   std VALUE — a `Json` tree, an `IoError`, a `Buf` — is ever delivered or read by the plans
   above. Each is a grammar record away, and none is there today.
