@@ -118,6 +118,25 @@ UNITS = [
     _unit("fn_generic", 3, ["function passv<T>(x: T): T { return x }"],
           exports=["passv"], features=["generic"]),
 
+    # OPERATOR x MODULES. An overloaded operator is a free `self`-function resolved by the
+    # receiver type and BANKED per call node for the emitter's dispatch rewrite. That bank is
+    # written where `a + b` is checked and read where it is emitted — so an operator declared
+    # in the moved module and used in the entry is the one thing a single-file sample cannot
+    # reach. The `single` face (operator in the entry) is the same-module control by
+    # construction; a split-vs-single disagreement IS the cross-module resolution defect.
+    _unit("ty_vec", 4, ["type Vec = new { x: i32 }"], exports=["Vec"],
+          features=["struct", "exported_type", "operator_recv"]),
+    _unit("fn_mkvec", 4, ["function mkvec(a: i32): Vec { return { x: a } }"],
+          exports=["mkvec"], deps=["ty_vec"], features=["struct"]),
+    _unit("op_vadd", 4,
+          ['function "+"(self: Vec, other: Vec): Vec {',
+           "  const r: Vec = { x: self.x + other.x }", "  return r", "}"],
+          deps=["ty_vec"], features=["operator", "op_add"]),
+    _unit("op_vmul", 3,
+          ['function "*"(self: Vec, k: i32): Vec {',
+           "  const r: Vec = { x: self.x * k }", "  return r", "}"],
+          deps=["ty_vec"], features=["operator", "op_mul"]),
+
     _unit("g_table", 4, ["const Tbl = __array_new__(4, 0)"], exports=["Tbl"],
           probe=("print(Tbl[3])", _table_want), features=["table"]),
     _unit("g_tally", 4, ["let tally = 0"], exports=["tally"],
@@ -215,6 +234,22 @@ REPORTS = [
     {"id": "rep_generic_pin", "weight": 3, "needs": ["fn_generic", "fn_mk"],
      "lines": ["if true {", "  const @N@ = passv(mk(7))", "  print(@N@.base)", "}"],
      "want": ["7"], "features": ["module_block", "generic"]},
+    # THE OPERATOR USES. Each `a + b` / `a * k` is checked in the ENTRY (a report is always
+    # the entry's), so when `op_vadd` moves to the module the dispatch bank is written there
+    # and read here. `+` is a same-type binary; `*` takes a wider... no, an i32 scalar operand.
+    {"id": "rep_op_add", "weight": 5, "needs": ["op_vadd", "fn_mkvec", "ty_vec"],
+     "lines": ["const @N@ = mkvec(3)", "const vrhs = mkvec(4)",
+               "print((@N@ + vrhs).x)"],
+     "want": ["7"], "features": ["operator", "op_add"]},
+    {"id": "rep_op_mul", "weight": 4, "needs": ["op_vmul", "fn_mkvec", "ty_vec"],
+     "lines": ["const @N@ = mkvec(3)", "print((@N@ * 4).x)"],
+     "want": ["12"], "features": ["operator", "op_mul"]},
+    # The operator through an un-annotated HOLE parameter, delivered across the boundary —
+    # the D1891/D1892 bank meeting a module seam at once.
+    {"id": "rep_op_hole", "weight": 4, "needs": ["op_vadd", "fn_mkvec", "ty_vec"],
+     "lines": ["function useAdd(p) { return (p + mkvec(4)).x }",
+               "const @N@ = mkvec(3)", "print(useAdd(@N@))"],
+     "want": ["7"], "features": ["operator", "op_add", "hole_param"]},
 ]
 
 
@@ -412,6 +447,8 @@ def _features(spec):
         f.add("name_collision")
     if set(spec["moved"]) & {u["id"] for u in UNITS if u["names"]}:
         f.add("moved_statement")
+    if set(spec["moved"]) & {"op_vadd", "op_vmul"}:
+        f.add("operator_moved")
     return sorted(f)
 
 

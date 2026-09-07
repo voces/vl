@@ -634,6 +634,46 @@ and `field 'n' is not on every member of Mix` (narrowing a CALL result, which do
 to a second call of it — a fact about places, not reps). Both appear in `xrep_same` at the
 same rate. The scalar/struct rep boundary is crossed soundly.
 
+## The operator x modules_split cross — cross-module resolution is SOUND, and a single-file miscompile fell out (D1934)
+
+The fourth cross, and the first to BITE. An overloaded operator is a free `self`-function
+resolved by receiver type and BANKED per call node for the emitter's dispatch rewrite — the
+thing D1891/D1892 turned on. That bank is written where `a + b` is checked and read where it
+is emitted, so an operator declared in the moved module and used in the entry is the one seam
+a single-file sample cannot reach. Three new `modules.py` units — `ty_vec`, `op_vadd`,
+`op_vmul` — and three reports that use them (`rep_op_add`, `rep_op_mul`, `rep_op_hole`) put
+the `a + b` in the entry; `operator_moved` marks the pairs where the operator crossed.
+
+Seeds 1101-1108 x 800 (before/after) and a wider 1111-1116 x 1200, `--axis modules_split`:
+
+| | pairs | AGREE-RUNS | DISAGREE |
+| --- | --- | --- | --- |
+| before (no operator units) | 3,200 | 3,200 | 0 |
+| after | 3,200 | 3,168 | 32 |
+| operator crossed the boundary (`operator_moved`) | 848 | 826 | 22 |
+| of those, where the SPLIT face failed | — | — | **0** |
+
+**Cross-module operator resolution is sound.** Over 848 pairs where the operator was declared
+in the module and used in the entry, the SPLIT face never failed: the per-node dispatch bank
+survives being written in one module and read in another. That is the clean-negative half.
+
+**But the cross surfaced a single-file miscompile.** All 65 operator disagreements are the
+SINGLE face going check-clean invalid wasm — the compiler itself prints "this is a bug in vl".
+Delta-debugged to four ingredients: a `"+"` operator overload declared anywhere, a name bound
+as a ref (`Vec`) at module scope and shadowed by a `string` in a block, and a string `+` on
+that shadowed name. Declaring an operator routes every `+` through the operator-dispatch
+lowering, and the cross-rep name collision then mis-reps the string concat (D1934). The
+sampler's `modules_split` axis assembled the ingredients; its `single` face is where they
+fire, so this is not a cross-module defect — it is a single-file one the cross reached.
+
+## Four two-feature crosses: three sound compositions, one seam that bit
+
+`narrow x generic-pin`, `operator x mixed-width` and `init_vs_assign x union-rep` all composed
+soundly — every disagreement was rep-independent and shared by a same-shape control. The
+residual defect surface is therefore NOT single-feature composition; it is cross-feature with a
+SEAM. `operator x modules_split` found the first real defect of the sweep (D1934), and even there the seam the brief predicted — cross-module bank survival —
+held; the miscompile was a name-collision the operator's lowering exposed.
+
 ## Running it
 
 `--count` counts PROGRAMS, so it is twice the number of pairs.
