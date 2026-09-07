@@ -144,9 +144,12 @@ may not be written: spreading reads it, and what comes out is a new mutable list
 SHALLOW, exactly as the read-only view is: the elements themselves are shared, so
 `c[0].x = 7` is visible through `a[0]`.
 
-Two things `...` is not. It does not spread a **string** — a string is a byte sequence with a
-code-point iteration, not a list of characters. And it does not spread a **`u8[]`** yet
-(D1850): use `bs.slice(0)`, which copies one at every rep.
+One thing `...` is not: it does not spread a **string** — a string is a byte sequence with a
+code-point iteration, not a list of characters.
+
+A `u8[]` spreads like any other list. The one form it does not take yet is a spread MIXED with
+a bare integer (`[...bs, 9]`), which infers `(u8 | i32)[]` and is refused — annotate the
+destination `u8[]` and it runs.
 
 ## Summary / recommendation
 
