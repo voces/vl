@@ -165,6 +165,7 @@ import {
   recordClonedNodeTyFb,
   recordClonedNodeTyKnown,
   recordNodePin,
+  tyArrayElemIx,
   tyArrayElemPrimName,
   tyFieldTyOf,
   tyHasTyVar,
@@ -18569,6 +18570,39 @@ function arrLitMapElemName(arrIx: i32): string {
 // — the nested-array twin of `arrLitUnionElemName`/`arrLitMapElemName`, same contract: the
 // name is the checker's recorded element type. Needed for an empty `[]` a later `.push`
 // pinned to an array, since the nested/element classifiers key off the first element's node.
+
+// The NOMINAL `(S|null)[]` spelling of an inner list whose own element is a nullable ref, or
+// "". `tyToEmitName` renders that element structurally (`{n:i32}|null`), and every reader
+// resolves its struct row through `structIndexByName`, which answers only for a declared
+// name — so the structural key leaves a nested literal's element row unfindable (D1884).
+function nestedNulRefElemNominal(innerArrTy: i32): string {
+  nestedNulRefElemNominalAt(innerArrTy, 0)
+}
+
+// The walk itself. Recurses through further nesting levels so `[[[{n: 42}, null]]]` names its
+// element too; the bound is a guard against a cyclic arena row, not a policy — past it the
+// walk declines and the structural render below stands.
+function nestedNulRefElemNominalAt(innerArrTy: i32, depth: i32): string {
+  if depth > 8 { return "" }
+  // This level: grouped, which is the spelling the annotation interns and the one
+  // `refElemArrName` peels back.
+  const here = nulRefElemNameOfArrTy(innerArrTy)
+  if here != "" { return arrLitNulRefGrouped("(" + here + ")[]") }
+  // ...else one level further down, so `[[[{n: 42}, null]]]` names its element too. A leaf
+  // that is not a nullable and not another list has no nominal half to recover, and
+  // `nodeArrayElemName`'s structural render stands.
+  const deeper = nestedNulRefElemNominalAt(tyArrayElemIx(innerArrTy), depth + 1)
+  if deeper == "" { return "" }
+  arrLitNulRefGrouped(deeper + "[]")
+}
+
+// `name` echoed back when the ref-list layer can name it, else "" — the gate every arm of
+// the nested walk applies before handing a spelling to the table.
+function arrLitNulRefGrouped(name: string): string {
+  if !nameIsRefArray(refElemArrName(name)) { return "" }
+  name
+}
+
 export function arrLitNestedElemName(arrIx: i32): string {
   const ty = nodeTyIxOf(arrIx)
   if ty < 0 { return "" }
@@ -18580,6 +18614,10 @@ export function arrLitNestedElemName(arrIx: i32): string {
         // The gate is the same one `nodeArrayElemName`'s arm asks (D702): does this element
         // render? A spelling with no render is one no row can be keyed under.
         if !tyNestedArrLeafRenders(t.aElem) { return "" }
+        // The nominal spelling first, where the inner element is a nullable ref: the reader
+        // side resolves it by declared name, which the structural render is not.
+        const nnr = nestedNulRefElemNominal(t.aElem)
+        if nnr != "" { return nnr }
         const nen = nodeArrayElemName(arrIx)
         if nen == "" { return "" }
         // The ref-list layer must also be able to name it: `refArrElemKind` answers a kind
@@ -18649,20 +18687,22 @@ function nulRefElemEmitName(nulTy: i32, innerTy: i32): string {
 }
 
 export function arrLitNulRefElemName(arrIx: i32): string {
-  const ty = nodeTyIxOf(arrIx)
-  if ty < 0 { return "" }
-  const t = T.tys[ty]
-  if t is TyArray {
-    if t.aElem >= 0 {
-      const el = T.tys[t.aElem]
-      if el is TyNullable {
-        const nen = nulRefElemEmitName(t.aElem, el.nInner)
-        if nen == "" { return "" }
-        const an = refElemArrName(nen)
-        if !nameIsRefArray(an) { return "" }
-        return nen
-      }
-    }
+  nulRefElemNameOfArrTy(nodeTyIxOf(arrIx))
+}
+
+// The same question over a TYPE rather than a literal node — the twin the nested walk asks,
+// so one nullable-element rule serves both depths. "" for every type whose element is not a
+// nullable the ref-list layer can name.
+function nulRefElemNameOfArrTy(ty: i32): string {
+  const ae = tyArrayElemIx(ty)
+  if ae < 0 { return "" }
+  const el = T.tys[ae]
+  if el is TyNullable {
+    const nen = nulRefElemEmitName(ae, el.nInner)
+    if nen == "" { return "" }
+    const an = refElemArrName(nen)
+    if !nameIsRefArray(an) { return "" }
+    return nen
   }
   ""
 }

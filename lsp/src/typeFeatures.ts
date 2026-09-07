@@ -1054,6 +1054,7 @@ export type ScopeBinding = {
   name: string;
   kind: number; // 0=variable 1=parameter 2=function
   type: string; // rendered type, "" when none
+  doc?: string; // the declaration's `///` block, absent when it carries none
 };
 
 /** Map a 0/1/2 scope kind to its {@link CompletionKind} (variable/parameter/function). */
@@ -1084,6 +1085,10 @@ export const scopeCompletionsFromBindings = (
       // in the docs panel, so it takes the same displayable-type filter as the
       // inlay label — an undisplayable rendering is dropped, not shown.
       detail: isDisplayableType(b.type) ? b.type : undefined,
+      // The declaration's `///` block (D9.11), rendered above the type block by
+      // `docMarkdown` — the same layout hover uses. NOT filtered by
+      // `isDisplayableType`, which grades a rendered TYPE; prose is prose.
+      doc: b.doc,
     });
   }
   return [...byName.values()];
