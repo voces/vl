@@ -43,3 +43,4 @@ D1710-D1719  vl-c3  2026-09-06  coordinator lanes 2026-09-06 (D1707/D1708 predic
 D1720-D1729  vl-c3  2026-09-06  coordinator lanes 2026-09-06 morning (optchain D1677/D1681 residues, D1686/D1687 covariant residues, D1712/D1680 rulings, later residues)
 D1760-D1779  vl-c3  2026-09-06  fix and discovery lanes, 2026-09-06 afternoon
 D1780-D1799  vl-c3  2026-09-06  fix and discovery lanes, 2026-09-06 evening
+D1800-D1819  vl-c3  2026-09-06  fix and discovery lanes, 2026-09-06 evening (block 2)
