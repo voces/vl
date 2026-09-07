@@ -1,7 +1,8 @@
 // Corpus-oracle shard 0 of 4. The adjudication lives in
 // `tests/support/casesWasmOracle.ts`; this file exists only so that
 // `deno test --parallel`, which gives one WORKER PER FILE, can spread the
-// 2,786-case corpus over more than one core. Shard membership is
+// corpus over more than one core (`scripts/wasm-runner-census.py --cells` counts it;
+// a number here would go stale in silence, and this one had). Shard membership is
 // a CONTIGUOUS equal-count block of the sorted case list, so every case is graded
 // exactly once across the 4 files, in the order the unsharded file used.
 //
