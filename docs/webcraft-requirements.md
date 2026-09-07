@@ -57,7 +57,7 @@ requirements list from webcraft's side — what "done" needs to mean.
 const buf = Buffer(byteLength)      // zero-filled; grows the one linear memory
 buf.length: i32
 // the full width matrix, both directions (today: 4 store widths, 1 load width):
-buf.loadU8(off): i32    buf.storeU8(off, v)
+buf.loadU8(off): i32    buf.store8(off, v)
 buf.loadI8(off): i32    // sign-extending
 buf.loadU16(off) / loadI16(off) / store16(off, v)
 buf.loadI32(off): i32   buf.storeI32(off, v)
