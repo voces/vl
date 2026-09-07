@@ -5779,6 +5779,36 @@ rather than never *running*; that was accepted over splitting one rule across tw
 `step 0` diagnostic is anchored at the STEP and the direction one at the `to` keyword — each
 caret sits on what the sentence tells the reader to change.
 
+## `until` is the exclusive range twin; `to` stays inclusive (owner ruling, 2026-09-07 — veldt ask)
+
+**The decision.** `for v in <from> until <to> [step <s>]` is the half-open range: it exits on
+`v < to`, so `for i in 0 until 4` binds `0,1,2,3` and `for i in 0 until a.length` walks every
+index of `a` with no `- 1` and no out-of-range read. `to` is unchanged and still inclusive.
+`until` is a soft keyword — contextual like `to`/`step`, so `const until = 5` still binds an
+ordinary name. Ratifies `docs/internals/range-semantics-design.md` (option A with `until`).
+
+**Why not flip `to`.** `to` reads INCLUSIVE in English — Pascal/BASIC/Ruby's `1 to 10` includes
+10 — so making it exclusive would be syntax lying about its own word. But the dominant use of a
+numeric range is index iteration, which wants the half-open `[0, n)` (length `n`, clean empty
+range; Dijkstra EWD831). Every inclusive-keyword language that later took iteration seriously
+(Kotlin `until`/`..<`, Swift `..<`, Nim, Ruby) ADDED an exclusive form rather than flipping the
+keyword; VL copies Kotlin's exact spelling. The root-cause reflex is still element iteration
+(`for x in a`) or value+index — a numeric range over `.length` is the last resort, and `until`
+is for genuine computed half-open spans (veldt's `0 to N - 1` voxel loops become `0 until N`).
+
+**The constant-range rule chosen.** The empty half-open range is LEGAL: `for i in 0 until 0`
+compiles and runs zero times — the natural empty-collection case, so it is never refused. The
+D1588 direction rule applies otherwise UNCHANGED: a constant `until` whose step contradicts its
+direction (a positive step with `from > to`, e.g. `5 until 2`) is refused, spelled with the
+keyword the author wrote. The predicate is literally identical to `to`'s — inclusive `to`
+already accepts `from == to` (it runs once) and exclusive `until` accepts it (it runs zero
+times), so only the message wording changed, not the boundary.
+
+**The residual footgun gets a lint.** A `warning`-tier `range-inclusive-length` flags
+`for i in <lo> to <expr>.length` / `.count` — an inclusive `to` bounded by a length member,
+which reads one past the last index — and suggests `until`. It fires only on a DIRECT member
+bound: `to xs.length - 1` (the hand correction) and any `until` range are left alone.
+
 ## `match` over an integer scrutinee (2026-09-03) — D1572, BUILT
 
 **A `match` whose scrutinee is `i32` or `i64` dispatches on integer LITERALS, and its `_` arm
