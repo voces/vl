@@ -1549,12 +1549,16 @@ in-language GC knobs.
         `fnIndexOfInScope` already owns. Fourteen readers became projections, the two `#2815`
         left behind gained the frame (closing D1834), byte-identical in 3,154 of 3,155 + 7,589
         of 7,589, and the flat-vs-scoped oracle contradicts in eight modules, all of them the
-        pin-context fixtures. **The BINDING half is the prerequisite item 4 has, and it is now
-        specified**: `declaredSlotOf` takes a bare name, `paramTypeNode`/`globalLetOfSidIn`
-        take `fnIx` only as a frame-binds-this-name veto, and what is needed is one scope-chain
-        walk keyed `(name, frame)` — #2629's `(frame, sid)` table is the precedent, with the
-        trap that its frame is a `FuncDecl` ARENA index while `fnIndexOfInScopeSid`'s is an
-        `fnStmts` POSITION, both spelled `i32`. `docs/internals/rep-descriptor-campaign.md` §5.3.
+        pin-context fixtures. **The BINDING half was specified as a prerequisite and is
+        REFUTED by witness**: binding resolution is already frame-correct by three separate
+        routes — `localNames` is rebuilt per function so the frame is the TABLE, `paramTypeNode`
+        reads its own `fnIx`, and `globalLetOfSidIn` vetoes through `identBoundInFrame`'s
+        three-rung walk. Four witnesses, twenty printed values, all correct on master; pinned by
+        `tests/cases/scope/binding-resolution-is-frame-correct.vl`. The rule it earns: **a
+        signature that does not take a frame is not thereby frame-blind** — the frame can be
+        ambient in the table it reads. What was actually owed is one de-duplication,
+        `bindingDeclInScope(name)`, whose signature carries the finding by taking no frame.
+        `docs/internals/rep-descriptor-campaign.md` §6.7.
      4. ⬜ **The `expr*` family** — 48 classifiers, 927 call sites, 31% of all classifier call
         sites. Converted by AXIS, since each is a closed set whose siblings must move
         together: (a) the seven scalar-list predicates, (b) the six nullable niches, (c) the
