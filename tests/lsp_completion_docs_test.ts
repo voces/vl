@@ -169,6 +169,61 @@ Deno.test({ name: "completion docs: the rendered panel is prose above the fence,
   }
 });
 
+
+// ── the MULTI-MODULE face (D1863) ────────────────────────────────────────────
+// Every fixture above is a single file, which is what let the defect stand: the module
+// pipeline serves each module's tokens from a cache rather than re-lexing, so the doc table
+// was EMPTY for every module and one `import` silenced the panel. The assertion is that the
+// same program answers the same with and without an import.
+
+const MM_LIB = 'export function helper(): i32 { return 7 }\n';
+const mmRead = (key: string): string | undefined =>
+  key.endsWith("lib") || key.endsWith("lib.vl") ? MM_LIB : undefined;
+
+const MM_TAIL = [
+  "/// A documented function.",
+  "function mine(): i32 { return 7 }",
+  "/// The answer.",
+  "const answer = 42",
+  "print(mine() + answer)",
+  "",
+];
+const MM_SOLO = ["", ...MM_TAIL].join("\n");
+const MM_IMPORTING = [
+  'import { helper } from "./lib"',
+  MM_TAIL[0],
+  "function mine(): i32 { return helper() }",
+  ...MM_TAIL.slice(2),
+].join("\n");
+// The cursor: the last line, where both top-level bindings are in scope.
+const MM_CURSOR = { line: 4, character: 0 };
+
+Deno.test({ name: "completion docs: an `import` does not silence the panel (D1863)", ignore }, async () => {
+  // A FRESH checker per arm — see the hover suite's twin: one checker asked both would let
+  // the single-module arm's rows answer the multi-module arm's query.
+  const docsOf = async (src: string, r: (k: string) => string | undefined) => {
+    const bs = await loadWasmChecker(SEED, () => {})!.scopeAt(
+      src,
+      "/tmp/main.vl",
+      r,
+      MM_CURSOR.line,
+      MM_CURSOR.character,
+    );
+    const cs = scopeCompletionsFromBindings(bs);
+    return ["mine", "answer"].map((n) => cs.find((c) => c.name === n)?.doc);
+  };
+  const solo = await docsOf(MM_SOLO, noSiblings);
+  const multi = await docsOf(MM_IMPORTING, mmRead);
+  if (solo.some((d) => d === undefined)) {
+    throw new Error(`the single-module control has no docs: ${JSON.stringify(solo)}`);
+  }
+  if (JSON.stringify(multi) !== JSON.stringify(solo)) {
+    throw new Error(
+      `with an import ${JSON.stringify(multi)} != without ${JSON.stringify(solo)}`,
+    );
+  }
+});
+
 // ── the playground, end to end ───────────────────────────────────────────────
 // The adapter renders `documentation` itself, so this grades the string a Monaco user
 // sees rather than the `Completion` behind it.

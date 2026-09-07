@@ -498,6 +498,11 @@ let modCacheExpEnd: i32[] = []
 // cached, so a hit never has diags to re-fold.
 let modCacheTokOff: i32[] = []
 let modCacheTokEnd: i32[] = []
+// The module's `///` rows, banked with its tokens because both come from the same lex: the
+// cache exists so a module is not re-lexed, so a doc table filled only by `vcLoadToks` is
+// empty for every module the cache serves (D1863).
+let modCacheDocOff: i32[] = []
+let modCacheDocEnd: i32[] = []
 // What a non-trailing drop leaves behind: its token rows, and the slot itself. The
 // whole cache clears once either outgrows its live half, bounding the storage without
 // a compaction pass. A module banking no tokens (a lex diag) moves only the slot count.
@@ -510,6 +515,8 @@ let modCacheClears = 0
 // without threading a return type through the scan.
 let modScanTokOff = -1
 let modScanTokEnd = -1
+let modScanDocOff = -1
+let modScanDocEnd = -1
 // Flat storage backing the slices above.
 let modCacheImpSpec: string[] = []
 let modCacheImpKey: string[] = []
@@ -534,6 +541,8 @@ let modCacheExpDeclCol: i32[] = []
 let modCacheExpKwLine: i32[] = []
 let modCacheExpKwCol: i32[] = []
 let modCacheTokKind: TokKind[] = []
+let modCacheDocLine: i32[] = []
+let modCacheDocText: string[] = []
 let modCacheTokText: string[] = []
 let modCacheTokStart: i32[] = []
 let modCacheTokLine: i32[] = []
@@ -569,6 +578,8 @@ function modCacheClear(): i32 {
   modCacheExpEnd = []
   modCacheTokOff = []
   modCacheTokEnd = []
+  modCacheDocOff = []
+  modCacheDocEnd = []
   modCacheImpSpec = []
   modCacheImpKey = []
   modCacheImpName = []
@@ -592,6 +603,8 @@ function modCacheClear(): i32 {
   modCacheExpKwLine = []
   modCacheExpKwCol = []
   modCacheTokKind = []
+  modCacheDocLine = []
+  modCacheDocText = []
   modCacheTokText = []
   modCacheTokStart = []
   modCacheTokLine = []
@@ -624,6 +637,14 @@ function modCacheDrop(ci: i32): i32 {
     while modCacheTokKind.length > toff { modCacheTokKind.pop() }
   } else if toff >= 0 {
     modCacheDeadTok = modCacheDeadTok + (tend - toff)
+  }
+  // The doc rows are a second flat store with its own trailing test: a slot's tokens and
+  // its docs are banked together but land at independent offsets, so one may be trailing
+  // while the other is not.
+  const doff = modCacheDocOff[ci]
+  if doff >= 0 && modCacheDocEnd[ci] == modCacheDocLine.length {
+    modCachePopToI(modCacheDocLine, doff)
+    modCachePopTo(modCacheDocText, doff)
   }
   if modCacheImpEnd[ci] == modCacheImpSpec.length {
     const ioff = modCacheImpOff[ci]
@@ -669,6 +690,8 @@ function modCacheDrop(ci: i32): i32 {
     modCachePopToI(modCacheExpEnd, ci)
     modCachePopToI(modCacheTokOff, ci)
     modCachePopToI(modCacheTokEnd, ci)
+    modCachePopToI(modCacheDocOff, ci)
+    modCachePopToI(modCacheDocEnd, ci)
   } else {
     modCacheDeadSlots = modCacheDeadSlots + 1
   }
@@ -2628,6 +2651,8 @@ function modScanCached(m: i32, key: string, src: string): i32 {
   modCacheExpEnd.push(modCacheExpName.length)
   modCacheTokOff.push(modScanTokOff)
   modCacheTokEnd.push(modScanTokEnd)
+  modCacheDocOff.push(modScanDocOff)
+  modCacheDocEnd.push(modScanDocEnd)
   modCacheBound()
   0
 }
@@ -2653,10 +2678,20 @@ function vcLoadToksMod(m: i32): i32 {
       )
       ti = ti + 1
     }
+    // The docs ride the same slot: a replay that restored the tokens alone would answer
+    // every doc query about this module with nothing at all.
+    let di = modCacheDocOff[ci]
+    while di >= 0 && di < modCacheDocEnd[ci] {
+      docCmtLine.push(modCacheDocLine[di])
+      docCmtText.push(modCacheDocText[di])
+      docCmtMod.push(vcLoadMod)
+      di = di + 1
+    }
     return P.toks.length
   }
   const tokBefore = P.toks.length
   const diagBefore = P.diags.length
+  const docBefore = docCmtLine.length
   vcLoadToks(modSrcs[m])
   if ci >= 0 && P.diags.length == diagBefore {
     modCacheTokOff[ci] = modCacheTokKind.length
@@ -2671,6 +2706,14 @@ function vcLoadToksMod(m: i32): i32 {
       ti2 = ti2 + 1
     }
     modCacheTokEnd[ci] = modCacheTokKind.length
+    modCacheDocOff[ci] = modCacheDocLine.length
+    let dj = docBefore
+    while dj < docCmtLine.length {
+      modCacheDocLine.push(docCmtLine[dj])
+      modCacheDocText.push(docCmtText[dj])
+      dj = dj + 1
+    }
+    modCacheDocEnd[ci] = modCacheDocLine.length
   }
   P.toks.length
 }
@@ -2900,6 +2943,8 @@ function modScan(m: i32, src: string): i32 {
   const toks = r.tokens
   modScanTokOff = -1
   modScanTokEnd = -1
+  modScanDocOff = -1
+  modScanDocEnd = -1
   if r.diags.length == 0 {
     modScanTokOff = modCacheTokKind.length
     let b = 0
@@ -2912,6 +2957,19 @@ function modScan(m: i32, src: string): i32 {
       b = b + 1
     }
     modScanTokEnd = modCacheTokKind.length
+    // This lex is the only one most modules get, so the `///` rows are banked here on the
+    // same gate the tokens are — see `modCacheDocOff`.
+    modScanDocOff = modCacheDocLine.length
+    let dc = 0
+    while dc < r.comments.length {
+      const cm = r.comments[dc]
+      if cm.doc && !cm.trailing {
+        modCacheDocLine.push(cm.line)
+        modCacheDocText.push(cm.text)
+      }
+      dc = dc + 1
+    }
+    modScanDocEnd = modCacheDocLine.length
   }
   let depth = 0
   let sawTplHole = false
@@ -3542,6 +3600,13 @@ function modCompile(emit: i32): i32 {
   // diagnostics rather than aborting at the first failure, so one run reports
   // every file's syntax errors. `vcLoadMod` attributes a lex diag to the module
   // being loaded; parse diags resolve their owner through `modOfTok`.
+
+  // The doc table is cleared here, not in `vcLoadToks`: that clear keys on an empty
+  // `P.toks`, and a module served from the cache never calls it, so the previous program's
+  // rows would answer this one's queries (D1863).
+  docCmtLine = []
+  docCmtText = []
+  docCmtMod = []
   let o = 0
   while o < modOrder.length {
     const m = modOrder[o]

@@ -168,6 +168,64 @@ Deno.test({ name: "hover docs: one space is stripped, further indent is kept", i
   }
 });
 
+
+// ── the MULTI-MODULE face (D1863) ────────────────────────────────────────────
+// Every fixture above is a single file, and that is exactly what let a defect stand in the
+// merged feature: the module pipeline serves each module's tokens from a cache rather than
+// re-lexing, so a table filled only by the lex was EMPTY for every module — one `import`
+// and hover went silent. The assertion is not "a doc comes back"; it is that the SAME
+// program answers the same, with and without an import, so the two faces cannot drift.
+
+const MM_LIB = 'export function helper(): i32 { return 7 }\n';
+const mmRead = (key: string): string | undefined =>
+  key.endsWith("lib") || key.endsWith("lib.vl") ? MM_LIB : undefined;
+
+// The same declarations twice: once importing, once not. Line numbers are shared by
+// construction — the import replaces a blank first line — so one coordinate grades both.
+const MM_BODY = [
+  "/// A documented function.",
+  "function mine(): i32 { return 7 }",
+  "/// A two-dimensional point.",
+  "type Pt = { x: i32, y: i32 }",
+  "/// The answer.",
+  "const answer = 42",
+  "const p: Pt = { x: 1, y: 2 }",
+  "print(mine() + answer + p.x)",
+  "",
+];
+const MM_SOLO = ["", ...MM_BODY].join("\n");
+const MM_IMPORTING = [
+  'import { helper } from "./lib"',
+  ...MM_BODY.slice(0, 1),
+  "function mine(): i32 { return helper() }",
+  ...MM_BODY.slice(2),
+].join("\n");
+
+Deno.test({ name: "hover docs: an `import` does not silence the docs (D1863)", ignore }, async () => {
+  // A FRESH checker per arm. One checker asked both would let the single-module arm's rows
+  // stay in the table and answer the multi-module arm's query — the very staleness this
+  // defect is made of, and it made an earlier draft of this case pass on the broken seed.
+  const ask = async (src: string, r: (k: string) => string | undefined, l: number, c: number) =>
+    await loadWasmChecker(SEED, () => {})!.docAt(src, "/tmp/main.vl", r, l, c);
+  // (label, line, col) — the declaration of each documented binding, and one USE.
+  const spots: [string, number, number][] = [
+    ["mine decl", 2, 10],
+    ["Pt decl", 4, 6],
+    ["answer decl", 6, 7],
+    ["Pt use in an annotation", 7, 10],
+  ];
+  for (const [what, line, col] of spots) {
+    const solo = await ask(MM_SOLO, noSiblings, line, col);
+    const multi = await ask(MM_IMPORTING, mmRead, line, col);
+    if (solo === undefined) throw new Error(`${what}: the single-module control has no doc`);
+    if (multi !== solo) {
+      throw new Error(
+        `${what}: with an import ${JSON.stringify(multi)} != without ${JSON.stringify(solo)}`,
+      );
+    }
+  }
+});
+
 // ── the markdown the editor receives ─────────────────────────────────────────
 // `server.ts`'s `hoverMarkdown` is `docMarkdown` plus the `MarkupContent` wrapper, so the
 // layout is graded here on `docMarkdown` itself — the same function the playground
