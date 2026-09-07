@@ -1,0 +1,274 @@
+// The seed-size ratchet — the first orchestrator script written in the language it
+// measures, and the one place a VL program prices the compiler's own codegen.
+//
+//     vl run scripts/seed-size.vl [--check | --write-baseline] [--seed P] [--baseline P]
+//
+// The seed is the compiler's own codegen of itself, so every emitter change is priced in
+// its bytes. `--check` exits 1 above a +3.0% bar; `--write-baseline` records the current
+// size and the HEAD commit.
+//
+// PATHS ARE RELATIVE TO THE WORKING DIRECTORY, not to this file. The Python derives the
+// checkout from its own `__file__`; a VL program can read neither its own path nor the
+// working directory, so this must be run from the checkout root — which `gate.sh` and
+// `ci.yml` both do. The ruling that would fix it is `open-rulings.md` §D
+// `script-self-location`, recommending `cwd()` in `std:env`.
+
+import {
+  IoError,
+  fileSize,
+  pathExists,
+  readTextFile,
+  writeTextFile,
+} from "std:fs"
+import { Json, JsonError, parseJson } from "std:json"
+import { programArgs } from "std:args"
+import { exit, runProgram } from "std:process"
+import { Utf8Error, decodeUtf8 } from "std:utf8"
+import { toString } from "std:fmt"
+import { trim } from "std:str"
+
+// The object arm of `Json`, spelled once so the narrowing below can name it.
+type JsonMap = { [string]: Json }
+
+const SEED = "build/vl-compiler.wasm"
+const BASELINE = "scripts/seed-size-baseline.json"
+
+// The bar, in TENTHS of a percent: one landing may grow the seed 3.0% before it has to
+// say so. Tenths rather than a float because that is the unit the report prints in.
+const MAX_GROWTH_TENTHS: i64 = 30
+
+// Stop with `code` after saying why. The Python's loud failures reach stderr through
+// `SystemExit`; VL has no stderr sink, so these land on stdout.
+function die(msg: string, code: i32) {
+  print(msg)
+  exit(code)
+}
+
+// The percentage growth in TENTHS, rounded half away from zero on the exact ratio.
+// Integer arithmetic throughout: the Python rounds a double half to EVEN, and the two
+// can disagree only on an exact tie, which `tests/vl_seed_size_port_test.ts` states.
+function pctTenths(size: i64, base: i64): i64 {
+  const num = (size - base) * 1000
+  if num >= 0 { return (num * 2 + base) / (base * 2) }
+  0 - ((0 - num) * 2 + base) / (base * 2)
+}
+
+// A signed one-decimal percentage, `+2.6` / `-0.4` / `+0.0`. Hand-rolled because
+// `std:fmt` renders a float only at full precision; the ruling that would replace this
+// with `toFixed(pct, 1)` is `open-rulings.md` §D `fmt-fixed-precision`.
+function pctStr(tenths: i64): string {
+  let sign = "+"
+  let t = tenths
+  if t < 0 {
+    sign = "-"
+    t = 0 - t
+  }
+  sign + toString(t / 10) + "." + toString(t % 10)
+}
+
+// The one report line, the shape every caller prints.
+function report(size: i64, base: i64): string {
+  "seed size " +
+    toString(size) +
+    " bytes, baseline " +
+    toString(base) +
+    " (" +
+    pctStr(pctTenths(size, base)) +
+    "%)"
+}
+
+// The bar as a BYTE COUNT, so the comparison is integer and a failure can name the exact
+// number it wanted. A percentage printed to one place reads the same on either side.
+function limitBytes(base: i64): i64 { base + base * MAX_GROWTH_TENTHS / 1000 }
+
+// The one message for a baseline whose `bytes` member is missing or is not a whole
+// number, so both readings below say the same thing.
+function badBytesMsg(path: string): string {
+  "seed-size: " + path + " has no integer `bytes` field"
+}
+
+// The committed byte count. A missing or shapeless baseline is a LOUD failure with the
+// fix named — a traceback out of a merge gate reads as the gate breaking rather than as
+// the file it grades being wrong.
+function loadBaseline(path: string): i64 {
+  const text = readTextFile(path)
+  if text is IoError {
+    die(
+      "seed-size: cannot read the baseline " +
+        path +
+        " (" +
+        text.msg +
+        "). Write one with\n  vl run scripts/seed-size.vl --write-baseline",
+      1,
+    )
+    return 0
+  }
+  const row = parseJson(text)
+  // Narrowed to the object arm FIRST, before any other `is` on this value: a union
+  // narrowed to its MAP arm after a prior narrowing loses its map rep (D1864), so the
+  // `is JsonError` arm has to live below rather than ahead of it.
+  if row is JsonMap {
+    const b = row["bytes"]
+    if b == null {
+      die(badBytesMsg(path), 1)
+      return 0
+    }
+    if b is f64 {
+      // `as? i64` rather than `as!`: a fractional or out-of-range number is not a byte
+      // count, and the Python's own guard is `isinstance(row.get("bytes"), int)`.
+      const n = b as? i64
+      if n == null {
+        die(badBytesMsg(path), 1)
+        return 0
+      }
+      return n
+    }
+    die(badBytesMsg(path), 1)
+    return 0
+  }
+  if row is JsonError {
+    die("seed-size: " + path + " is not JSON: " + row.msg, 1)
+    return 0
+  }
+  die(badBytesMsg(path), 1)
+  0
+}
+
+// The short sha of the tree the baseline is written from — provenance for a human reading
+// a jump, never an input to `--check`. `unknown` outside a checkout, or when git cannot
+// answer, exactly as the Python's `head_commit` default does.
+function headCommit(): string {
+  const r = runProgram("git", ["rev-parse", "--short", "HEAD"])
+  if r is IoError { return "unknown" }
+  if r.code != 0 { return "unknown" }
+  const t = decodeUtf8(r.stdout)
+  if t is Utf8Error { return "unknown" }
+  trim(t)
+}
+
+// The baseline row, rendered by hand rather than through `toJson`: building a `Json`
+// object refuses (`a map value is not a supported union member`, D1865), and the file is
+// one line by design, so its key order is part of what a reviewer reads.
+function writeBaseline(seed: string, baseline: string) {
+  const size = fileSize(seed)
+  if size is IoError {
+    die("seed-size: cannot size " + seed + " (" + size.msg + ")", 1)
+    return 0
+  }
+  const commit = headCommit()
+  const row = "{\"bytes\": " +
+    toString(size) +
+    ", \"commit\": \"" +
+    commit +
+    "\"}\n"
+  const w = writeTextFile(baseline, row)
+  if w != null {
+    die("seed-size: cannot write " + baseline + " (" + w.msg + ")", 1)
+    return 0
+  }
+  print("wrote " + baseline + ": " + toString(size) + " bytes at " + commit)
+  0
+}
+
+// Whether `path` names anything, treating an unanswerable question as absence — the
+// Python's `os.path.exists` swallows the same errors.
+function exists(path: string): boolean {
+  const e = pathExists(path)
+  if e is IoError { return false }
+  e
+}
+
+// `--check`: print the line, and exit 1 only when the seed is over the bar. An ABSENT
+// seed is not a failure — the `ci` job never builds one, and every seed-backed test there
+// self-ignores on the same reasoning.
+function cmdCheck(seed: string, baseline: string) {
+  if !exists(seed) {
+    print(
+      "no seed at " +
+        seed +
+        " — nothing to size (the `ci` job builds none); skipping",
+    )
+    return 0
+  }
+  const size = fileSize(seed)
+  if size is IoError {
+    die("seed-size: cannot size " + seed + " (" + size.msg + ")", 1)
+    return 0
+  }
+  const base = loadBaseline(baseline)
+  const line = report(size, base)
+  const limit = limitBytes(base)
+  if size > limit {
+    print(
+      "seed size REGRESSED — " +
+        line +
+        ": over the " +
+        toString(limit) +
+        "-byte bar (" +
+        pctStr(MAX_GROWTH_TENTHS) +
+        "%) by " +
+        toString(size - limit),
+    )
+    print(
+      "\nEither the growth is the change (say what bought it in the PR body and\nrewrite the baseline in the SAME PR with\n  vl run scripts/seed-size.vl --write-baseline)\nor it is a cost nobody chose — which is the case this gate exists for.",
+    )
+    exit(1)
+    return 0
+  }
+  print(line)
+  0
+}
+
+// Whether `flag` appears anywhere in `args`.
+function hasFlag(args: readonly string[], flag: string): boolean {
+  let i = 0
+  while i < args.length {
+    if args[i] == flag { return true }
+    i = i + 1
+  }
+  false
+}
+
+// The argument after `flag`, or `fallback` when the flag is absent or last.
+function flagValue(
+  args: readonly string[],
+  flag: string,
+  fallback: string,
+): string {
+  let i = 0
+  while i < args.length {
+    if args[i] == flag {
+      if i + 1 < args.length { return args[i + 1] }
+      return fallback
+    }
+    i = i + 1
+  }
+  fallback
+}
+
+// The whole command, so the argument list crosses one boundary and the top level below
+// stays the three lines that read it.
+function main(args: readonly string[]) {
+  const seed = flagValue(args, "--seed", SEED)
+  const baseline = flagValue(args, "--baseline", BASELINE)
+  if hasFlag(args, "--write-baseline") { return writeBaseline(seed, baseline) }
+  if hasFlag(args, "--check") { return cmdCheck(seed, baseline) }
+  if !exists(seed) {
+    print("no seed at " + seed)
+    return 0
+  }
+  const size = fileSize(seed)
+  if size is IoError {
+    die("seed-size: cannot size " + seed + " (" + size.msg + ")", 1)
+    return 0
+  }
+  print(report(size, loadBaseline(baseline)))
+  0
+}
+
+const argv = programArgs()
+if argv is Utf8Error {
+  die("seed-size: an argument is not UTF-8: " + argv.msg, 2)
+} else {
+  main(argv)
+}

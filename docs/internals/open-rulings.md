@@ -952,14 +952,19 @@ that renders a number, and `toString` is full precision: `toString(100.0 / 3.0)`
 flag. `padLeft(self: string, width: i32, fill: string)` pads an already-rendered string, which
 is a column, not a precision.
 
-**The witness is the first script the dogfooding lane ports.** `scripts/seed-size.py:85` is
-`return f"seed size {size} bytes, baseline {base} ({pct_growth(size, base):+.1f}%)"` and
-`:110` is `f"({MAX_GROWTH_PCT:+.1f}%) by {size - limit}"`. Those two `+.1f` holes are the ONLY
-part of that script a VL port cannot reproduce byte for byte; everything else in it —
-`os.path.getsize`, `json.load`/`json.dumps`, `git rev-parse`, the exit codes — has a std answer
-today. A ratchet whose output text is compared against the Python it replaces therefore cannot
-be switched over, and every later port that prints a percentage, a duration or a ratio meets
-the same wall.
+**The witness is the first script the dogfooding lane ported, and it is now a standing one.**
+The Python's two `+.1f` holes — `f"seed size {size} bytes, baseline {base} ({pct:+.1f}%)"` and
+`f"({MAX_GROWTH_PCT:+.1f}%) by {size - limit}"` — were the ONLY part of that script a VL port
+could not reproduce with a std call; everything else in it (`os.path.getsize`,
+`json.load`/`json.dumps`, `git rev-parse`, the exit codes) had a std answer already. The port
+therefore carries `pctStr` in `scripts/seed-size.vl`, eleven hand-written lines that render a
+signed one-decimal percentage out of integer tenths, with a comment naming this ruling. It is
+not merely verbose: it rounds half away from zero on the exact ratio where the Python rounds
+the nearest DOUBLE half to even, and `tests/vl_seed_size_port_test.ts` pins the one input where
+they disagree (2003 bytes against a 2000-byte baseline is exactly 0.15%, whose nearest double
+is 0.1499999999999999944, so the Python printed `+0.1%` and the port prints `+0.2%`). Every
+later port that prints a percentage, a duration or a ratio meets the same wall and will write
+the same eleven lines.
 
 **Options.**
 (a) **`toFixed(self: f64, digits: i32): string`** — JS's name and JS's contract, `self`-first so
@@ -1003,19 +1008,18 @@ can open `"build/vl-compiler.wasm"`, and the host resolves that against the proc
 directory — but the program cannot ASK what that directory is, cannot find out where its own
 source lives, and therefore cannot resolve a path relative to the repository it belongs to.
 
-**The witness is the same script.** `scripts/seed-size.py:40-42` is
-
-    ROOT = ratchet.ROOT
-    SEED = os.path.join(ROOT, "build", "vl-compiler.wasm")
-    BASELINE = os.path.join(ROOT, "scripts", "seed-size-baseline.json")
-
-and `ratchet.ROOT` at `scripts/ratchet.py:37` is
-`os.path.dirname(os.path.dirname(os.path.abspath(__file__)))` — the checkout derived from the
-script's OWN path. That derivation has no VL spelling. Every one of the five ratchets shares it,
-so this is not one script's problem: it is the shape the whole `scripts/` tree is written in. A
-port must instead assume the process was started from the checkout root, which `gate.sh` and
-`ci.yml` do today and a developer running `vl run scripts/seed-size.vl` from a subdirectory does
-not — a silently wrong answer (a missing baseline read as a missing file) rather than a refusal.
+**The witness is the same script, and it is now a shipped contract rather than a hypothetical.**
+The Python it replaced derived every path from `ratchet.ROOT`, which is
+`os.path.dirname(os.path.dirname(os.path.abspath(__file__)))` at `scripts/ratchet.py:37` — the
+checkout, from the script's OWN path. That derivation has no VL spelling, and the four remaining
+ratchets still share the line, so this is not one script's problem: it is the shape the whole
+`scripts/` tree is written in. `scripts/seed-size.vl` therefore takes `"build/vl-compiler.wasm"`
+and `"scripts/seed-size-baseline.json"` as literals resolved against the WORKING DIRECTORY, with
+its header saying so and naming this ruling. `gate.sh` and `ci.yml` both run it from the
+checkout root, so the gate is correct — but a developer running
+`vl run scripts/seed-size.vl -- --check` from a subdirectory gets a silently wrong answer (the
+absent baseline reads as a missing file) rather than a refusal, and nothing in the language lets
+the script tell the difference.
 
 **Options.**
 (a) **argv[0] as `programArgs()[0]`** — the C layout. Cheap (the host already has it) and
@@ -1046,7 +1050,7 @@ directory and a self-location — and they answer different questions: the first
 user is, the second is where the code is.
 
 **Recommendation: (c) now, (b) when a second consumer asks; never (a).** `cwd()` is the smaller
-of the two, it is the one the port actually needs (every path in `seed-size.py` is
+of the two, it is the one the port actually needs (every path in `seed-size.vl` is
 checkout-relative, and the checkout root is the CWD under every invocation the gate makes), and
 it belongs to a module that already exists and already reads exactly this kind of ambient state.
 (b) is the more precise answer to "where am I", but it owes a story for the playground and for
@@ -1055,6 +1059,54 @@ excluded on its own merits: it would break `programArgs`'s documented contract t
 question it does not actually answer. (d) is the honest interim and should be WRITTEN DOWN in
 the ported script's header either way — a ruling for (c) does not make (d) wrong, it makes it
 temporary.
+
+### script-stderr — how does a VL program say something that is not its output? — raised 2026-09-07
+
+**It cannot.** `print` is the whole output surface and it goes to stdout: the seven
+`__print_*__` imports are the only sinks the emitter declares, and all three hosts route them
+to one stream. There is no `eprint`, no `std:io`, and nothing in `std:fs` that names a standard
+stream. A program whose diagnostics have to be separable from its data has one channel for
+both.
+
+**The witness is the third divergence in the first port.** `scripts/seed-size.py` raised
+`SystemExit`, which reaches STDERR; `scripts/seed-size.vl` prints the same sentence — a
+baseline that is not JSON, one with no `bytes` member, one that is absent — to STDOUT and exits
+1. `tests/vl_seed_size_test.ts` asserts that, so the difference is recorded rather than
+tolerated, and the private helper the port routes it through is called `die`. The verdict is
+unaffected because a runner reads the exit code, but the shape is wrong in the general case: a
+script whose stdout is consumed (`$(...)`, a pipe, a `--json` mode) cannot report a failure
+without corrupting its own answer. Two of the ports this lane has scheduled do exactly that.
+
+**Options.**
+(a) **`eprint(x)`, the twin of `print`** — one builtin, one host import per value type, and the
+existing print family duplicated. Cheap to spell, expensive in ABI: the seven `__print_*__`
+imports become fourteen, in three hosts, and every module that prints anything grows an import
+it does not use.
+(b) **ONE import with a stream tag** — a `__print_stream__(fd)` that steers the sink until the
+next flush, so the value imports stay at seven. Smaller ABI, but it makes the print family
+STATEFUL, which is the shape `__fs_errno__` already is and the one the std review is most
+critical of; a mis-ordered pair silently writes to the wrong stream.
+(c) **`std:io` with an explicit writer** — `stderr().write(bytes)` beside a future
+`stdout()`, files and buffers, the WASI-shaped answer. The right END state and the one
+`std-design.md` D2 already names as a WASI-era module; it wants a writer type this tree does
+not have, so it is not this batch.
+(d) **Nothing: a script that must separate them writes to a file.** `std:fs` can already do it,
+and a runner that cares can read the file. Cheapest, and it is what a port would have to do
+today — but "write a temp file to say a sentence" is not an answer anyone will keep.
+
+**Peers.** Every one of them has both streams as a first-class pair, and none exposes only
+stdout: Python `print(..., file=sys.stderr)`, Rust `eprintln!`, Go `fmt.Fprintln(os.Stderr, …)`,
+Deno `console.error`. The split is only in HOW: Python and Go take a writer (option c), Rust
+and JS give the second stream its own name (option a).
+
+**Recommendation: (a) now, (c) when `std:io` is scheduled.** `eprint` is the smallest thing that
+makes a failing script behave like every other program on the system, it needs no new type, and
+it is what the JS and Rust peers chose. The ABI cost is the honest objection and it is bounded:
+the value imports are declared PER PROGRAM by the use scan, so a program that never calls
+`eprint` declares none of them and pays nothing — the fourteen is a ceiling on the table, not on
+any module. (b) buys a smaller table with ambient state, which is the trade this repo has
+refused everywhere else. (d) is what the port does today by printing to stdout, and the reason
+this entry exists.
 
 ## Dismissed — filed as owner rulings, verified NOT open
 
