@@ -468,12 +468,14 @@ Explicitly left open by the owner pass and unimplemented. docs/error-handling-de
 
 ---
 
-## D. Pending owner rulings raised 2026-09-05/06 (vl-c3) — each has a witness row and a recommendation
+## D. Pending owner rulings raised 2026-09-05/07 (vl-c3, dogfooding) — each has a witness and a recommendation
 
 Every item here is a question an agent measured up to and then stopped at, because the answer
 changes which program is legal rather than how a legal one compiles. None blocks a merge. The
 recommendation is the coordinator's; the witness is the row's own `Repro:`, re-run by the
-`filed witnesses` gate, so a ruling can be graded the day it lands.
+`filed witnesses` gate, so a ruling can be graded the day it lands. The last two entries are
+the exception that proves the shape: they are std API asks rather than defects, so their
+witness is a script in this tree that cannot be ported, cited by line.
 
 ### B6a-map-in-union-box — may a MAP be a union member, or does the box need a struct column? — raised 2026-09-07
 
@@ -902,6 +904,118 @@ binary (`b6eb19b9`) and `vl --version` naming the std hash (#2655); row 20 ("VL 
 parameter values") is contradicted by `function ld(self: {v: i32}, k: i32 = 5)` in
 `tests/cases/objects/ufcs-shadowed-callee-no-default-fill.vl`. Both should be re-measured
 against the tree and closed or re-worded before they are put to the owner.
+
+### fmt-fixed-precision — how does a VL program render a float to N decimal places? — raised 2026-09-07
+
+**It cannot.** `std:fmt` exports `toString(self: i32 | i64 | boolean | f64)` and nothing else
+that renders a number, and `toString` is full precision: `toString(100.0 / 3.0)` prints
+`33.333333333333336`, `toString(2.6)` prints `2.6`. There is no width, no precision, no sign
+flag. `padLeft(self: string, width: i32, fill: string)` pads an already-rendered string, which
+is a column, not a precision.
+
+**The witness is the first script the dogfooding lane ports.** `scripts/seed-size.py:85` is
+`return f"seed size {size} bytes, baseline {base} ({pct_growth(size, base):+.1f}%)"` and
+`:110` is `f"({MAX_GROWTH_PCT:+.1f}%) by {size - limit}"`. Those two `+.1f` holes are the ONLY
+part of that script a VL port cannot reproduce byte for byte; everything else in it —
+`os.path.getsize`, `json.load`/`json.dumps`, `git rev-parse`, the exit codes — has a std answer
+today. A ratchet whose output text is compared against the Python it replaces therefore cannot
+be switched over, and every later port that prints a percentage, a duration or a ratio meets
+the same wall.
+
+**Options.**
+(a) **`toFixed(self: f64, digits: i32): string`** — JS's name and JS's contract, `self`-first so
+`x.toFixed(1)` reads as a method under UFCS. Rounds half away from zero, `digits` clamped to
+`[0, 100]` or refused. One export, one edge case (a negative or absurd `digits`), no parser
+work. It does NOT give a `+` sign, so `seed-size.vl` still writes `if pct >= 0 { "+" }` by hand
+— which is what the Python's `+` flag is doing, so this is a two-line difference at the call
+site, not a missing capability.
+(b) **A format-spec sibling of `toString`** — `format(self: f64, spec: string)` taking a
+mini-language (`"+.1f"`), the way Python and Rust do. One export covers precision, sign, width
+and fill forever, and the spec string is the same one every reader already knows. Against: the
+spec is parsed at RUNTIME from a string VL cannot check, so a typo is a wrong number rather
+than a compile error — in a language whose whole posture is that a refusal is loud, that is the
+wrong trade for a formatting call.
+(c) **Interpolation-level precision** — `"\{x:.1f}"`, checked at compile time. The strongest
+answer and the most expensive: it puts a second grammar inside the interpolation hole, which
+the parser, the formatter and the LSP all have to carry, and it is unreachable from a value
+already in a variable unless (a) exists underneath it anyway.
+
+**Peers.** Python `f"{x:+.1f}"` and `format(x, '+.1f')` (spec mini-language, runtime-parsed).
+Rust `format!("{:+.1}", x)` (spec, but COMPILE-time checked by the macro). JS
+`x.toFixed(1)` (method, no sign or width) plus `Intl.NumberFormat` for the rest. Go
+`fmt.Sprintf("%+.1f", x)` (runtime spec). So the split is: the two languages with a macro or a
+checker put the spec in the literal; the one without a macro exposes a method.
+
+**Recommendation: (a), `toFixed`.** VL has no macro, so (b) buys the spec's expressiveness at
+the price of moving a formatting mistake from compile time to runtime, which no other decision
+in std has been willing to do. (c) is the right END state and (a) is a strict subset of it —
+`"\{x:.1f}"` would desugar to `toFixed(x, 1)` — so building (a) now costs nothing that (c)
+would have to undo, and it unblocks the port lane immediately. The one thing (a) must decide
+before it is permanent is what `toFixed(x, 1)` does for a non-finite `x`: `"NaN"` / `"Infinity"`
+matching `toString`, not an error, because a formatter that can fail gives every call site a
+second error channel.
+
+### script-self-location — how does a VL program know where it is, or where it was run from? — raised 2026-09-07
+
+**It cannot do either.** `std:args`'s `programArgs()` is documented as "Index 0 is the FIRST
+user argument — the program name is not in the list", so argv[0] is unreachable by design.
+There is no `cwd()` anywhere in std, and no `__file__` equivalent in the language. A VL program
+can open `"build/vl-compiler.wasm"`, and the host resolves that against the process's working
+directory — but the program cannot ASK what that directory is, cannot find out where its own
+source lives, and therefore cannot resolve a path relative to the repository it belongs to.
+
+**The witness is the same script.** `scripts/seed-size.py:40-42` is
+
+    ROOT = ratchet.ROOT
+    SEED = os.path.join(ROOT, "build", "vl-compiler.wasm")
+    BASELINE = os.path.join(ROOT, "scripts", "seed-size-baseline.json")
+
+and `ratchet.ROOT` at `scripts/ratchet.py:37` is
+`os.path.dirname(os.path.dirname(os.path.abspath(__file__)))` — the checkout derived from the
+script's OWN path. That derivation has no VL spelling. Every one of the five ratchets shares it,
+so this is not one script's problem: it is the shape the whole `scripts/` tree is written in. A
+port must instead assume the process was started from the checkout root, which `gate.sh` and
+`ci.yml` do today and a developer running `vl run scripts/seed-size.vl` from a subdirectory does
+not — a silently wrong answer (a missing baseline read as a missing file) rather than a refusal.
+
+**Options.**
+(a) **argv[0] as `programArgs()[0]`** — the C layout. Cheap (the host already has it) and
+familiar, but it BREAKS the documented contract of the one export `std:args` has, silently
+renumbering every existing caller's indices; and argv[0] is what the *invoker* passed, so it is
+`vl` for `vl run script.vl`, not the script. It answers the wrong question.
+(b) **A `mainModule`-style export** — `std:args` or a new `std:script` answering the entry
+file's path, Deno's `Deno.mainModule`. It answers the question actually asked and needs no
+new host import for the CLI, which already knows the entry path — but the entry path is
+meaningless for a module the playground compiled from a buffer, and it has to say what it
+answers there.
+(c) **`cwd(): string | IoError` in `std:env`** — the process's working directory. It is where
+this module belongs (`std:env` is already the ambient-process reader), it composes with `std:fs`
+immediately, and every peer has it. It is a HOST IMPORT, so it lands in all three: a
+`__env_cwd__` slot beside `__env_get__` in `compiler/typecheck.vl`'s table,
+`scripts/vl-host/src/main.rs`, `scripts/wasmtime-host.rs`, and a refusal in
+`tests/support/runWasm.ts` (it answers a `u8[]`, so V8 cannot build it — the same wall the rest
+of the floor meets there).
+(d) **Neither: state that a script runs from the checkout root** and make that the documented
+contract, the way `gate.sh` already invokes every ratchet. Zero cost, and it is what the port
+will do in the meantime — but it turns a class of user mistake into a wrong answer instead of a
+message, which is the thing this repo's standing bar is against.
+
+**Peers.** Python `os.getcwd()` + `__file__`. Rust `env::current_dir()` +
+`env!("CARGO_MANIFEST_DIR")` / `file!()`. Deno `Deno.cwd()` + `Deno.mainModule` +
+`import.meta.url`. Go `os.Getwd()` + `runtime.Caller`. Every one of them has BOTH — the working
+directory and a self-location — and they answer different questions: the first is where the
+user is, the second is where the code is.
+
+**Recommendation: (c) now, (b) when a second consumer asks; never (a).** `cwd()` is the smaller
+of the two, it is the one the port actually needs (every path in `seed-size.py` is
+checkout-relative, and the checkout root is the CWD under every invocation the gate makes), and
+it belongs to a module that already exists and already reads exactly this kind of ambient state.
+(b) is the more precise answer to "where am I", but it owes a story for the playground and for
+`vl test`, where "the entry file" is not one file, and no scheduled port needs it. (a) is
+excluded on its own merits: it would break `programArgs`'s documented contract to answer a
+question it does not actually answer. (d) is the honest interim and should be WRITTEN DOWN in
+the ported script's header either way — a ruling for (c) does not make (d) wrong, it makes it
+temporary.
 
 ## Dismissed — filed as owner rulings, verified NOT open
 

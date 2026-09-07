@@ -92,6 +92,8 @@ units: **hours** · **half-day** · **days**.
 | B7 R4 `utf8Length` | A breaking std removal; also triggers the `std-api-reviewer` gate. |
 | C5 distribution · F5 the name · H5 versioning · H-M2 · J2 runner · J3 port target · D field-level hints · F9 baseline scope | Each already carries its question in its own row. |
 | registry-by-key step 5 | Blocked on D1492's write-seam question. |
+| `dogfood:` fixed-precision float rendering in `std:fmt` | Whether `toFixed(self: f64, digits: i32): string` is the export, a runtime format spec is, or precision belongs in the interpolation hole. `std:fmt` renders a float only at full precision (`toString(100.0 / 3.0)` → `33.333333333333336`), so the `+.1f` holes at `scripts/seed-size.py:85` and `:110` are the only part of that script a VL port cannot reproduce byte for byte — and every later port that prints a percentage, a duration or a ratio meets the same wall. Options, peers and a recommendation for `toFixed`: `open-rulings.md` §D `fmt-fixed-precision`. |
+| `dogfood:` a VL program cannot locate itself or its working directory | Whether `std:env` grows `cwd()` (a host import, so it lands in all three hosts), whether a `mainModule`-style entry path is exposed, or whether "a script runs from the checkout root" becomes the written contract. `programArgs()` documents index 0 as the first USER argument, so argv[0] is unreachable by design, and there is no `cwd` or `__file__` anywhere. `scripts/seed-size.py:40-42` derives every path from `ratchet.ROOT`, which is `os.path.dirname(os.path.dirname(os.path.abspath(__file__)))` at `scripts/ratchet.py:37` — the shape all five ratchets share, and one with no VL spelling. Options, peers and a recommendation for `cwd()`: `open-rulings.md` §D `script-self-location`. |
 
 ---
 
@@ -1578,9 +1580,24 @@ in-language GC knobs.
         `sentinel-index-unguarded` 0 → 21, because that lint's contract is within one function
         and the guard is the evidence it needs at each read. The campaign's bar in a third
         form: do not move a guard out of the reach of the checker that verifies it.
-     7. ⬜ **The slot layer, last** — `structIndexOfExpr`, `rlSlot*`, `mvSlot*`,
-        `exprVariantIndex`. `rdSlot` is nominal where the rest of the descriptor is
-        structural, and nothing earlier depends on it.
+     7. 🟡 **The slot layer** — SURVEYED, and it is two things. **183 PRODUCERS** over four
+        parallel-column banks (struct / ref-list / variant / map-value, each with 1-5 writers
+        and 100-174 readers), of which 42% take an AST node and 12% an arena type: they decide
+        a rep from raw input, none is a `match` because they PRODUCE the kind rather than
+        switch on it, and their `-1` tails are load-bearing. Converting them needs the
+        descriptor and therefore item 3's binding half — next phase, not this one. **A
+        13-function CONSUMER rim** takes a `VKind` and a slot together; four were `_`-less
+        matches after #2862 and the fifth, `armDestHeapOf`, is one now (byte-identical in
+        3,172 + 7,589, seed +14). Two hazards named for the next phase: four producers clamp a
+        miss to `0` rather than declining (D1040's shape), and the kind and the slot are
+        derived by two ladders that must agree (D244, D1737, D1040, D1106).
+     **PHASE 1 CLOSED.** Six landings, net seed **+4,073 bytes**, every one byte-identical on
+        both populations bar D1834's own fixture. Two contradictions found and closed (D1834;
+        `vtKindOfType`'s five missing nullable-scalar-list rungs, 2,963 → 178). The bar earned
+        three forms, each from a candidate an instrument refused: do not REMOVE a domain
+        (oracle 2,963 → 204,539), do not WIDEN one (8 modules `rc=0 → rc=1`), and do not move
+        a GUARD out of reach of the lint that verifies it (`sentinel-index-unguarded` 0 → 21).
+        Scoreboard: `docs/internals/rep-descriptor-campaign.md` §7.
      Two owner rulings gate how far items 2 and 6 can go: `one-literal-union-rep` and
      `nullable-rep-rule-stated-once` (`docs/internals/open-rulings.md` §D).
      REMAINING legacy items: (a) widen `repOfTy` coverage (typed-value maps,
