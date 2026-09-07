@@ -17,7 +17,6 @@ export const runWasmBytes = async (wasm: Uint8Array): Promise<string[]> => {
   // Accumulates the UTF-8 BYTES streamed by `__print_char__` until `__print_str_flush__`
   // (Stage 2c: a string's element is a byte, and the guest streams its storage verbatim).
   const printChars: number[] = [];
-  const memory = new WebAssembly.Memory({ initial: 1, maximum: 65536 });
   await WebAssembly.instantiate(wasm, {
     // The USER externs (`extern function`). A browser loader supplies this object; the
     // playground provides the same registry the native host does, so a program that runs
@@ -27,35 +26,11 @@ export const runWasmBytes = async (wasm: Uint8Array): Promise<string[]> => {
       // `nowMillis(): i64` — a wasm i64 result must be returned as a JS bigint.
       nowMillis: () => BigInt(Date.now()),
     },
+    // The ONLY imports any emitted module declares are the seven `__print_*__` sinks:
+    // a program that uses linear memory DEFINES and exports its own, and no module
+    // imports the legacy `__log__`/`__log_string__` decoders or a host memory
+    // (censused 0 of 1,149 building modules — `tests/support/runWasm.ts`).
     imports: {
-      memory,
-      // Read `length` raw bytes at `offset` as a UTF-8 string (the byte form a
-      // `__store_string__` writes from a GC string).
-      __log_string__: (offset: number, length: number) => {
-        logs.push(
-          new TextDecoder().decode(new Uint8Array(memory.buffer, offset, length)),
-        );
-      },
-      __log__: (offset: number, length: number) => {
-        const view = new Int32Array(memory.buffer, offset, length / 4);
-        const args: (number | bigint)[] = [];
-        for (let i = 0; i < length / 4; i++) {
-          if (view[i] === 1) {
-            const low = BigInt(view[++i]) & BigInt(0xFFFFFFFF);
-            const high = BigInt(view[++i]) << BigInt(32);
-            args.push(high | low);
-          } else if (view[i] === 2) {
-            i++;
-            args.push(new Float32Array(memory.buffer, offset + i * 4, 1)[0]);
-          } else if (view[i] === 3) {
-            const swap = new Int32Array(2);
-            swap[0] = view[++i];
-            swap[1] = view[++i];
-            args.push(new Float64Array(swap.buffer, 0, 1)[0]);
-          } else args.push(view[++i]);
-        }
-        logs.push(args.map((a) => a.toString()).join(" "));
-      },
       // Direct value sinks for `print(x)`. A wasm i64 arrives as a JS bigint; the
       // rest as numbers. Booleans render as `true`/`false`.
       //
