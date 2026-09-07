@@ -40,6 +40,7 @@ import {
   semanticTokensDataFromWasm,
   snippetCompletions,
   typeLabelDetail,
+  ufcsCompletions,
 } from "../../lsp/src/typeFeatures.ts";
 import {
   foldingRanges as computeFoldingRanges,
@@ -463,7 +464,17 @@ export const completion = async (
     const members = await checker
       .memberCompletionsAt(repaired, entryKey, reader, pos.line, dotCol - receiver.length)
       .catch(() => []);
-    return memberCompletionsFromWasm(members).map(toCompletionItem);
+    const fields = memberCompletionsFromWasm(members);
+    // The UFCS half, which this path offered nothing of: `x.f(…)` over a free
+    // `function f(self: T, …)` is a call the checker resolves only against names IN SCOPE,
+    // and the editor is what surfaces the rest. A FIELD of the same name wins at a real
+    // call, so `taken` drops the free function under that label.
+    const taken = new Set(fields.map((f) => f.name));
+    const cands = await checker
+      .ufcsCandidatesAt(repaired, entryKey, reader, pos.line, dotCol - receiver.length)
+      .catch(() => []);
+    const ufcs = ufcsCompletions(text, entryKey, cands, (n) => taken.has(n));
+    return [...fields, ...ufcs].map(toCompletionItem);
   }
 
   // Identifier completion: in-scope user bindings + builtins, plus keyword/snippet

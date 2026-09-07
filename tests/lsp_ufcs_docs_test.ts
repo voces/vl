@@ -222,33 +222,40 @@ Deno.test({ name: "ufcs docs: an `import` does not silence the panel (D1863)", i
   }
 });
 
-// ── the playground's parity gap, pinned ──────────────────────────────────────
-// The playground adapter's member path is `memberCompletionsFromWasm` alone — it never
-// calls `ufcsCandidatesAt`, so it offers no UFCS method at all and there is no panel here
-// to carry a doc. `playground_lsp_parity_test.ts` cannot see this: it grades one marker per
-// FEATURE, and UFCS is a behaviour inside "completion".
-//
-// This case pins the gap so it cannot widen quietly, and so the day someone wires UFCS into
-// the adapter this test tells them the doc rides `UfcsCandidate.doc` and needs no new query.
+// ── the playground, end to end ───────────────────────────────────────────────
+// This was a PIN until the adapter's member path called `ufcsCandidatesAt` at all: it ran
+// `memberCompletionsFromWasm` alone, so the playground offered no UFCS method and had no
+// panel to carry a doc. `playground_lsp_parity_test.ts` could not see that — it grades one
+// marker per FEATURE and UFCS is a behaviour inside "completion" — so the parity table now
+// carries a second marker for it too.
+
 const module = seedExists
   ? new WebAssembly.Module(Deno.readFileSync(SEED) as BufferSource)
   : undefined;
 
-Deno.test({ name: "ufcs docs: the playground offers no UFCS method yet — pin, not a claim it should not", ignore }, async () => {
+Deno.test({ name: "ufcs docs: the playground offers the method, with its prose", ignore }, async () => {
   if (!module) throw new Error(`no seed at ${SEED}`);
   const instance = new WebAssembly.Instance(module, {});
   initLsp(createWasmChecker(() => instance.exports as unknown as Exports));
   // `p.` — the member-completion cursor, one past the dot.
   const src = SRC.replace("print(p.x)", "print(p.)");
   const cs = await completion(src, { line: 18, character: 8 }, ".");
-  const labels = cs.map((c) => c.label).sort();
-  if (labels.join(",") !== "x,y") {
-    throw new Error(
-      `the playground member panel changed: got ${JSON.stringify(labels)}. If UFCS was ` +
-        `wired into playground/src/lspAdapter.ts, pass the candidates through ` +
-        `ufcsCompletions and this pin becomes the doc assertion — UfcsCandidate.doc ` +
-        `already carries it, no new query needed.`,
-    );
+  const byLabel = (l: string) => cs.find((c) => c.label === l);
+  // The FIELDS are still there — the UFCS half is added beside them, not instead.
+  for (const f of ["x", "y"]) {
+    if (byLabel(f) === undefined) throw new Error(`the field \`${f}\` was lost`);
+  }
+  const twice = byLabel("twice");
+  if (twice === undefined) throw new Error(`no \`twice\` item: ${JSON.stringify(cs.map((c) => c.label))}`);
+  if (twice.kind !== "function") throw new Error(`twice kind: ${twice.kind}`);
+  if (twice.documentation === undefined || !twice.documentation.startsWith("Doubles a point's x.\n")) {
+    throw new Error(`twice documentation: ${JSON.stringify(twice.documentation)}`);
+  }
+  // An UNDOCUMENTED candidate is offered too, with the bare fence.
+  const plain = byLabel("plain");
+  if (plain === undefined) throw new Error("no `plain` item");
+  if (plain.documentation === undefined || plain.documentation.includes("\n\n")) {
+    throw new Error(`plain should be the bare fence: ${JSON.stringify(plain.documentation)}`);
   }
 });
 
