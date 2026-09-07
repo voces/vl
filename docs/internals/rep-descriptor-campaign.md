@@ -497,8 +497,9 @@ themselves — `nested-capture-per-pin-container-kinds`, `-return-kinds`, `-clon
 body-scope shadowing fixture. **No inventory row is owed by the oracle**: the contradictions
 are the walk doing its job, not a defect, and no site outside the known family contradicts.
 
-**Byte identity**, both arms from one seed: `3,150 of 3,150` `tests/cases` modules and
-`7,589 of 7,589` corpus cells identical — the conversion moves no byte, and D1834's fix is
+**Byte identity**, both arms from one seed: `3,154 of 3,155` `tests/cases` modules and
+`7,589 of 7,589` corpus cells identical. The one differing file is D1834's own fixture, `rc=1`
+on the merge-base and `rc=0` here — the conversion itself moves no byte, and the fix is
 observable only on the fixture it ships with, because no existing module had the shape.
 
 ---

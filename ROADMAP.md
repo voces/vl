@@ -1516,7 +1516,7 @@ in-language GC knobs.
         list first guessed: only the return-kind readers wanted a REP, and the other three
         rows wanted the SLOT or the `$fnsig` key, which `fnIndexOfInScope` already owns.
         DONE: fourteen readers became projections, the two `#2815` left behind gained the
-        frame (closing D1834), byte-identical in 3,150 + 7,589 modules, and the flat-vs-scoped
+        frame (closing D1834), byte-identical in 3,154 of 3,155 + 7,589 of 7,589, and the flat-vs-scoped
         oracle contradicts in eight modules, all of them the pin-context fixtures. The
         BINDING half — `declaredSlotOf` takes a bare name — is still owed, by item 4.
      4. ⬜ **The `expr*` family** — 48 classifiers, 927 call sites, 31% of all classifier call
