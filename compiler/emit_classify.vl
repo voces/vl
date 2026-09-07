@@ -589,6 +589,7 @@ import {
   repKindOfSigTok,
   repNameCanonId,
   repOfNode,
+  repOfTy,
   repRowOfName,
   repRowOfTyStruct,
   repShadowAddReason,
@@ -30641,50 +30642,140 @@ export function binRemFloatNeed(ix: i32): i32 {
   -1
 }
 
+// The ladder↔descriptor agreement oracle: per (family, ladder answer, descriptor answer)
+// tallies, so a family is graded "0 disagreements" over the corpus before its ladder is
+// deleted. Keyed by the PAIR, so a new family needs no slot arithmetic and the report names
+// the exact disagreement. Accumulated during emit, reported after `repShadowSweep`'s reset.
+let repABKeys: string[] = []
+let repABCnt: i32[] = []
+let repABIx: {[string]: i32} = Map()
+
+// `repOfTy`'s answer as a report word: the covered `VKind`, or `uncovered` where the
+// descriptor declines. The oracle's right-hand column, and the only place the two answers
+// meet — a consumer still reads whichever producer its own site names.
+function repABDescWord(tyIx: i32): string {
+  const d = repOfTy(tyIx)
+  if d.rdCovered == 1 { return d.rdKind }
+  "uncovered"
+}
+
+// One (ladder, descriptor) pair recorded. Called only when armed, so the map growth and the
+// read-modify-write are off the unarmed path entirely.
+function repABNote(family: string, ladder: string, desc: string) {
+  const k = family + " " + ladder + " -> " + desc
+  const i = repABIx[k] ?? -1
+  if i >= 0 {
+    repABCnt[i] = repABCnt[i] + 1
+    return 0
+  }
+  repABIx[k] = repABKeys.length
+  repABKeys.push(k)
+  repABCnt.push(1)
+  0
+}
+
+// Reported once per program beside `unionRegistryABSweep`, after `repShadowSweep` has reset
+// the bucket table — a bump during emit would not survive that reset.
+export function repLadderABSweep() {
+  if !repShadowOn { return 0 }
+  let i = 0
+  while i < repABKeys.length {
+    repShadowAddReason("repAB/" + repABKeys[i], repABCnt[i])
+    i = i + 1
+  }
+  repABKeys = []
+  repABCnt = []
+  repABIx = Map()
+  0
+}
+
+// `tyKindOf`'s own i32 code as a report word — the third rep numbering scheme this campaign
+// retires, named here so the oracle's report reads in one vocabulary.
+function tyKindCodeWord(k: i32): string {
+  if k == 0 { return "i32" }
+  if k == 2 { return "list" }
+  if k == 3 { return "str" }
+  if k == 7 { return "strlist" }
+  if k == 10 { return "i64" }
+  if k == 11 { return "f64" }
+  if k == 12 { return "f64list" }
+  if k == 13 { return "f32" }
+  if k == 20 { return "i64list" }
+  "declined"
+}
+
+// The nine codes this vocabulary speaks, as a projection of the ONE descriptor. Every kind
+// outside them keeps the decline (-1) every consumer's `== <code>` test expects — answering
+// a code the consumer has no arm for is a new answer, not the same one.
+function tyKindCodeOfVKind(k: VKind): i32 {
+  if k == "i32" { return 0 }
+  if k == "list" { return 2 }
+  if k == "str" { return 3 }
+  if k == "strlist" { return 7 }
+  if k == "i64" { return 10 }
+  if k == "f64" { return 11 }
+  if k == "f64list" { return 12 }
+  if k == "f32" { return 13 }
+  if k == "i64list" { return 20 }
+  -1
+}
+
+// The list code whose ELEMENT reps as `k` — the numeric-literal-union element collapse's only
+// consumer, since the descriptor declines the collapsed array itself.
+function tyKindListCodeOfElem(k: i32): i32 {
+  if k == 0 { return 2 }
+  if k == 3 { return 7 }
+  if k == 10 { return 20 }
+  if k == 11 { return 12 }
+  -1
+}
+
+// The descriptor's answer in this vocabulary, or -1 where the descriptor declines.
+function tyKindCodeOfTy(tyIx: i32): i32 {
+  const d = repOfTy(tyIx)
+  if d.rdCovered == 0 { return -1 }
+  tyKindCodeOfVKind(d.rdKind)
+}
+
 function tyKindOf(tyIx: i32) {
+  const k = tyKindOfDesc(tyIx)
+  if repShadowOn {
+    repABNote("tyKindOf", tyKindCodeWord(k), repABDescWord(tyIx))
+  }
+  k
+}
+
+// The arena's rep for `tyIx` in the legacy i32 code vocabulary, as a PROJECTION of the one
+// descriptor. Two facts stay here because they are this function's contract, not the rep: its
+// DOMAIN (scalars and arrays — every other shape keeps its decline), and the numeric
+// literal-union base collapse the descriptor deliberately does not model.
+function tyKindOfDesc(tyIx: i32): i32 {
   if tyIx < 0 { return -1 }
   const t = T.tys[tyIx]
   if t is TyPrim {
-    const n = t.primName
-    if n == "i32" { return 0 }
-    if n == "f64" { return 11 }
-    if n == "i64" { return 10 }
-    if n == "f32" { return 13 }
-    if n == "string" { return 3 }
-    if n == "boolean" { return 0 }
-    return -1
+    // `void` is the one prim the descriptor reps (as the ladder fallthrough `i32`) and this
+    // vocabulary never has: a void expression has no arithmetic width to report.
+    if t.primName == "void" { return -1 }
+    return tyKindCodeOfTy(tyIx)
   }
   if t is TyArray {
     if t.aElem < 0 { return -1 }
-    // A numeric litunion element reps as its base scalar's list (`numLitUnionBaseTy`); a
-    // string litunion element stays -1, since its rep is the interned atom, not a `(ref $array)`.
-    let elIx = t.aElem
-    const el0 = T.tys[elIx]
-    if el0 is TyLit {
-      const eb0 = numLitUnionBaseTy(elIx)
-      if eb0 >= 0 { elIx = eb0 }
-    }
-    if el0 is TyUnion {
-      const eb1 = numLitUnionBaseTy(elIx)
-      if eb1 >= 0 { elIx = eb1 }
-    }
-    const el = T.tys[elIx]
-    if el is TyPrim {
-      const en = el.primName
-      if en == "i32" { return 2 }
-      if en == "f64" { return 12 }
-      if en == "i64" { return 20 }
-      if en == "string" { return 7 }
-      if en == "boolean" { return 2 }
-    }
-    return -1 // struct / ref / nested-list element — needs the ref-list slot
+    // A NUMERIC literal-union element reps as its base scalar's list; the descriptor declines
+    // the collapse (the atom-vs-base split is checker metadata, not structure), so it is taken
+    // here off the element's own code.
+    const eb = numLitUnionBaseTy(t.aElem)
+    if eb >= 0 { return tyKindListCodeOfElem(tyKindOfDesc(eb)) }
+    // A STRING literal-union element is the interned i32 atom, which the descriptor reps as
+    // the i32 `list` and this vocabulary has never claimed — see open-rulings
+    // "one-literal-union-rep", whose answer decides whether this decline survives.
+    if tyIsLitUnion(t.aElem) { return -1 }
+    return tyKindCodeOfTy(tyIx)
   }
-  // A numeric literal type or union has no rep of its own — it reps as its base scalar,
-  // resolved through `numLitUnionBaseTy` and this function's `TyPrim` arm, not written twice.
+  // A numeric literal type or union has no rep of its own — it reps as its base scalar.
   let litBaseRow = -1
   if t is TyLit { litBaseRow = numLitUnionBaseTy(tyIx) }
   if t is TyUnion { litBaseRow = numLitUnionBaseTy(tyIx) }
-  if litBaseRow >= 0 { return tyKindOf(litBaseRow) }
+  if litBaseRow >= 0 { return tyKindOfDesc(litBaseRow) }
   -1
 }
 

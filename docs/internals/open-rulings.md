@@ -611,6 +611,99 @@ one step wider and costs a heap type per negation. **Recommendation: (a)** — a
 constraint on a type, not a type with a runtime shape, and (b) buys a boxed `i32` for a feature
 almost nothing uses. If (a), the checker owes the sentence and D1773 closes as DESIGN.
 
+### one-literal-union-rep — should a literal union's TYPE carry its REP?
+
+Raised 2026-09-06 by the "one rep per node" campaign
+(`docs/internals/rep-descriptor-campaign.md`), whose first converted classifier measured the
+cost. **Nothing is broken while this waits** — every spelling below compiles today; what it
+decides is whether the rep descriptor can ever be total over literal unions, and therefore
+whether every classifier family after the second one pays this same carve-out again.
+
+**Measured 2026-09-06.** A literal union's rep is decided by ALIAS-NESS, not by its type:
+`repOfTyFlat`'s `TyUnion` arm covers a declared `type K = "a" | "b"` (the interned i32 atom)
+and DECLINES an inline `("a" | "b")`, because canon softens the inline spelling to `string`;
+and it declines a NUMERIC literal union (`type N = 1 | 2`) in both spellings, because that one
+reps as its base scalar and the collapse is checker metadata rather than structure. Over
+`tests/cases` the ladder-vs-descriptor oracle at the very first converted site
+(`tyKindOf`) reports **2,448 queries where the ladder answers and the descriptor declines,
+1,503 of them (48 modules) this exact collapse** — the single largest residue at the seam.
+The standing memory note is `vl-litunion-rep-cliff`: a literal union's TYPE does not carry
+its REP.
+
+**Options.**
+(a) **The type carries the rep.** A literal union's arena row records which of the three reps
+it takes (interned i32 atom / softened `string` / collapsed base scalar) at MINT time, so the
+descriptor answers structurally and no consumer re-derives it from alias-ness. Cost: canon
+must stop softening an inline member set to `string` at the positions where the atom rep is
+what is emitted, or record the softening as provenance rather than as a rewrite (the
+`tyLitUnionAliasIx` provenance stamp is half of this already).
+(b) **Alias-ness stays the deciding input, and it is written down as a rule** rather than
+inferred per site: an aliased literal union is the atom, an inline one is the softened base,
+a numeric one is its base scalar — one predicate, asked by every consumer, with the
+descriptor declining by design and the campaign's carve-outs kept forever.
+(c) **One rep for all three**: every literal union is the interned i32 atom, inline and
+numeric included. Simplest to state, and it changes what a program emits — an inline
+`("a"|"b")[]` becomes an atom list where it is a string list today.
+
+**Recommendation: (a).** The descriptor's whole thesis is that a rep is a function of a type;
+(b) writes the exception down honestly but keeps a permanent second producer at every one of
+the six conversion families, and the campaign's own measurement is that this residue is the
+largest one. (c) is the cleanest rule and the only one that moves emitted bytes, so it wants
+its own corpus grading before it is chosen, not a ruling on the strength of tidiness.
+
+Peers: TypeScript's string-literal types are erased entirely, so it has no rep question;
+Rust's `&'static str` constants and its enums are two different things and it never merges
+them; Kotlin's `enum class` is the atom rep with no inline spelling at all. VL is unusual in
+offering both spellings of one type, which is where the two reps came from.
+
+Grading: `tests/cases/literal-unions/*` (121 modules), plus the oracle's LEFT-ONLY bucket at
+`tyKindOf` and at `vtKindOfType`, which must fall to 0 under (a) or (c) and is permanent
+under (b).
+
+### nullable-rep-rule-stated-once — can niche-vs-box be one rule instead of eleven arms?
+
+Raised 2026-09-06 by the same campaign. **Nothing is broken while this waits**; the eleven
+arms are individually correct, and the per-rep audit's own finding is that a ladder naming
+three of them has named a quarter of the family.
+
+`VKind` carries **eleven** nullable members — `nulstruct`, `nulstr`, `nullist`, `nulbool`,
+`nulmap`, `nulreflist`, `nulclosure`, `nulvariant`, `nulu8list`, and the four distinct-backing
+scalar lists (`nulstrlist`, `nulf64list`, `nuli64list`, `nulf32list`) — and `RepDesc.rdNul`
+records four distinct null DISCIPLINES (ref niche, boolean/litunion i32 sentinel, boxed atom
+tag, none). `repOfNullable` decides between them by testing the inner variant arm by arm.
+Every arm is right; the question is whether the rule they collectively implement can be
+stated once, as a function of the inner rep's reference-ness and (for a union) its member
+count — so that a twelfth nullable shape gets its arm by construction rather than by
+somebody remembering.
+
+**Options.**
+(a) **State it once**: `rdNul` is derived from the inner descriptor — a reference rep takes the
+`(ref null …)` niche, an i32-repped one takes its spare-value sentinel, a value union takes
+the box tag — and `repOfNullable`'s arms become the derivation's inputs rather than its
+answer. A new nullable shape then needs no arm.
+(b) **Keep the arms and gate them**: add the missing-arm compile error instead of the rule, by
+making `repOfNullable` a `_`-less `match` over the inner variant (the language's own
+exhaustiveness check), so a twelfth shape breaks the self-compile rather than falling
+through. Cheaper, and it buys the same *safety* without the same *simplicity*.
+(c) Leave it. The eleven arms are correct and the audit that found them is the standing
+instrument.
+
+**Recommendation: (b) now, (a) as the campaign reaches step 5 of its order.** The measured
+hazard is a MISSING arm, not a wrong one — `nulvariant` had no rung (#2400) and
+`captureValKind` had two arms for a three-member set (D1370) — and (b) closes exactly that
+with the surface the repo already dogfoods. (a) is the better end state and is worth taking
+when the valtype ladders convert, because `fbValtypeNullable`/`fbRefNullForKind` are the same
+rule written a third and fourth time and should move with it, not before it.
+
+Peers: Kotlin's `T?` is one rule (a nullable reference) because every `T` is a reference;
+Rust's niche optimisation IS rule (a), computed structurally per type with no per-shape arm;
+C#'s split between `Nullable<T>` for values and plain null for references is rule (b) with two
+arms and a hard boundary. VL has four disciplines because it has four rep families, so (a) is
+Rust's answer and is reachable.
+
+Grading: the nullable half of `tests/cases/types/` and `tests/cases/unions/`, the 11
+`tests/cases/arrays/nullable-*` modules, and the rep-fuzz baseline, which is where a missing nullable arm has historically surfaced.
+
 ### code-quality survey rows 19 and 20 — re-grade before ruling
 
 Row 19 (the seed anchors on the CWD, std on the EXE's tree) predates std shipping INSIDE the
