@@ -93,19 +93,41 @@ if selfcompile; then ok=1; fi
 if [ "$ok" = 0 ] && [ "$FALLBACK" = 1 ] && [ "$fetched" = 0 ]; then
   echo "  seed cannot compile current source — may be a stale CACHED seed;" >&2
   echo "  re-fetching the rolling seed-latest and retrying once..." >&2
-  # `fetch-seed.sh` no-ops when a seed file is already present, so remove the
-  # stale one first to force a real download of the current `seed-latest`.
-  rm -f "$SEED"
-  SEED="$SEED" scripts/fetch-seed.sh
+  # THE LIVE SEED IS NEVER REMOVED (D1804). `fetch-seed.sh` no-ops when its destination
+  # exists, so the download goes to a temp destination instead of clearing `$SEED` first —
+  # a self-compile fails for reasons other than staleness (a compile error in
+  # `compiler/*.vl` is the common one), and clearing first destroyed a good seed whenever
+  # the fetch could not reach GitHub. Every write below lands by renaming a SIBLING temp
+  # over the path, so a concurrent reader — another agent's gate row on the same `build/` —
+  # always sees one complete file and never an absent one.
+  entry_seed=""
+  if [ -s "$SEED" ]; then
+    entry_seed="$WORK/entry-seed.wasm"
+    cp "$SEED" "$entry_seed"
+  fi
+  publish_seed() { # <src>: replace $SEED atomically, same filesystem
+    cp "$1" "$SEED.refresh-tmp" && mv "$SEED.refresh-tmp" "$SEED"
+  }
+  fresh="$WORK/seed-latest.wasm"
+  SEED="$fresh" scripts/fetch-seed.sh || true
   fetched=1
+  if [ -s "$fresh" ]; then publish_seed "$fresh"; fi
   if selfcompile; then ok=1; fi
+  # Neither seed compiles the source: leave the tree exactly as it was found, so a failed
+  # run changes nothing a later one depends on.
+  if [ "$ok" = 0 ] && [ -n "$entry_seed" ]; then publish_seed "$entry_seed"; fi
 fi
 if [ "$ok" = 0 ]; then
-  echo "ERROR: seed cannot compile current source (stale seed)." >&2
-  echo "  The seed predates a construct the compiler now uses, AND the rolling" >&2
-  echo "  seed-latest could not compile it either. Land the enabling change in" >&2
-  echo "  smaller steps so each seed self-compiles the next (there is no TS re-mint" >&2
-  echo "  — the project keeps no second compiler)." >&2
+  echo "ERROR: the seed could not compile compiler/*.vl." >&2
+  echo "  Two causes look identical from here. Either the SOURCE does not compile —" >&2
+  echo "  read the diagnostics above, this is the common one — or the seed predates a" >&2
+  echo "  construct the source now uses and the rolling seed-latest could not compile" >&2
+  echo "  it either. For the latter, land the enabling change in smaller steps so each" >&2
+  echo "  seed self-compiles the next (there is no TS re-mint — the project keeps no" >&2
+  echo "  second compiler)." >&2
+  if [ -s "$SEED" ]; then
+    echo "  $SEED is unchanged; nothing was destroyed." >&2
+  fi
   exit 1
 fi
 
