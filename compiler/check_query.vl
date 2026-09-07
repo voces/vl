@@ -23,6 +23,9 @@ import {
 } from "./ast"
 import {
   SYM_MEM_METHOD,
+  docCmtLine,
+  docCmtMod,
+  docCmtText,
   inlayCol,
   inlayKind,
   inlayLine,
@@ -91,6 +94,7 @@ import {
 // completion detail), so it renders through the user pathway — `tyToStrUser` /
 // `tyToStructStrUser`, demangle then render — never the raw `tyToStr`, whose spelling
 // doubles as a canon and interner key and keeps its `$mN` mangles.
+import { srcmapModOfTok } from "./srcmap"
 import {
   T,
   TyFunc,
@@ -407,6 +411,113 @@ export function isvalMsgAt(i: i32) {
     "` — `is " +
     isvalLit[i] +
     "` is a value test (`==`) and cannot tell a failure from data; give the failure a distinguishable arm (`| null` or a struct)"
+}
+
+// The text a `///` line contributes: the lexeme past the three slashes, with ONE
+// following space dropped so `/// Greets` reads as `Greets` and an indented continuation
+// keeps its own indent. A bare `///` contributes an empty line.
+function docStripSlashes(text: string) {
+  let at = 3
+  if at < text.length && text[at] == ' ' { at = at + 1 }
+  text.slice(at, text.length)
+}
+
+// The 1-based line the declaration whose NAME token is `tok` starts on. The head keywords
+// may sit above the name (`export function f`, and each on its own line is legal), and the
+// doc run has to end directly above the FIRST of them, not above the name.
+function docHeadLine(tok: i32) {
+  if tok < 0 || tok >= P.toks.length { return -1 }
+  let at = tok
+  let walking = true
+  while walking {
+    walking = false
+    if at > 0 {
+      const k = P.toks[at - 1].kind
+      if (
+        k == "EXPORT" ||
+        k == "FUNCTION" ||
+        k == "TYPE" ||
+        k == "CONST" ||
+        k == "LET"
+      ) {
+        at = at - 1
+        walking = true
+      }
+    }
+  }
+  P.toks[at].line
+}
+
+// The contiguous `///` run ending directly above `line` in module `mod`, in source order
+// and joined with newlines. The run is defined by CONSECUTIVE lines, so a blank line and a
+// `//` comment both break it by simply not being in the table — the same adjacency rule the
+// formatter attaches a comment by. "" when the line above carries no doc comment.
+function docRunAbove(line: i32, mod: i32) {
+  if line <= 1 { return "" }
+  const back: string[] = []
+  let want = line - 1
+  let more = true
+  while more {
+    more = false
+    let i = 0
+    while i < docCmtLine.length {
+      if docCmtMod[i] == mod && docCmtLine[i] == want {
+        back.push(docStripSlashes(docCmtText[i]))
+        want = want - 1
+        more = true
+      }
+      i = i + 1
+    }
+  }
+  let out = ""
+  let j = back.length - 1
+  while j >= 0 {
+    out = out + back[j]
+    if j > 0 { out = out + "\n" }
+    j = j - 1
+  }
+  out
+}
+
+// Doc hover: the `///` block above the declaration the name under (line, col) resolves to,
+// or "". Two rungs, mirroring the host's own hover ladder: a value binding through the
+// symbol table (so a USE shows its declaration's docs), then a user `type` name, which is
+// not a binding occurrence at all (`symTypeAliasAt` says why) and is found in the stream.
+export function symDocAt(line: i32, col: i32) {
+  const occ = symDefAt(line, col)
+  if occ >= 0 {
+    const dtok = symOccTokOf(occ)
+    if dtok >= 0 { return docRunAbove(docHeadLine(dtok), srcmapModOfTok(dtok)) }
+  }
+  let i = 0
+  while i < P.toks.length {
+    const t = P.toks[i]
+    if (
+      t.kind == "IDENT" &&
+      t.line == line &&
+      col >= t.col &&
+      col <= t.col + t.text.length
+    ) {
+      return docTypeDeclRun(t.text)
+    }
+    i = i + 1
+  }
+  ""
+}
+
+// The doc run above the `type NAME` declaration spelled `name`, or "". Split from
+// `symDocAt` so the cursor scan and the declaration scan are one loop each rather than
+// one nested in the other.
+function docTypeDeclRun(name: string) {
+  let i = 1
+  while i < P.toks.length {
+    const t = P.toks[i]
+    if t.kind == "IDENT" && t.text == name && P.toks[i - 1].kind == "TYPE" {
+      return docRunAbove(docHeadLine(i), srcmapModOfTok(i))
+    }
+    i = i + 1
+  }
+  ""
 }
 
 // Type-alias hover: the rendered type of the user type name (a `type`-declared struct
