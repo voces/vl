@@ -105,6 +105,17 @@ still behind a flag). For a solver, FMA is the single biggest win *and* the sing
 hazard — a determinism gap is exactly what a physics engine's replay/netcode cannot have silently. So
 relaxed SIMD is a **separately-gated, opt-in tier**, never the default (§D7, §F O6).
 
+**This is a different hazard than standard-op NaN nondeterminism, not a bigger dose of it.**
+The WASM spec also permits an implementation-defined bit pattern for a *freshly-produced* NaN
+from an ordinary (non-relaxed) float op — that is real and separate from relaxed SIMD, and this
+section should not be read as claiming standard ops are deterministic *by spec*. What makes
+relaxed SIMD the one gated tier is that its nondeterminism changes actual **finite** results
+based on the executing hardware (FMA's single- vs. double-rounding), with no observed
+convergence across engines the way NaN bit patterns have — see
+`docs/internals/numeric-determinism-rulings.md` §4 for the measurement (`serde-design.md` OQ-3)
+showing VL's two target engines agree on NaN bit patterns today, and for why that is treated as
+a verified engineering commitment rather than a spec guarantee.
+
 ### A5. Availability — fixed 128-bit SIMD is baseline, so v1 can require it
 
 Fixed-width SIMD reached phase 5 in 2021 and ships unflagged in every engine veldt targets — all
