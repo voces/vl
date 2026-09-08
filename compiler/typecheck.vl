@@ -99,7 +99,13 @@ import {
   ufcsSpecAlreadyImported,
 } from "./ast"
 // The free index-operator declaration-name encoding (B14).
-import { OP_INDEX_GET, OP_INDEX_SET, opDeclLabel, opDeclOpOf } from "./ast"
+import {
+  OP_INDEX_GET,
+  OP_INDEX_SET,
+  opDeclLabel,
+  opDeclLabelBin,
+  opDeclOpOf,
+} from "./ast"
 // A node's source span: its first token, its last token on that first line, and a token's
 // end column — what a diagnostic underlines, since a message names the whole construct and
 // `nodeToks` alone anchors at its closing brace.
@@ -110,7 +116,7 @@ import {
   tokFirstLineEndCol,
 } from "./fmt_util"
 import { sidArrGet, sidArrPut, sidLookup, sidOf } from "./symbols"
-import { arenaReplaceNode, isBinOpFuncName } from "./ast"
+import { arenaReplaceNode, isBinOpDecl, isBinOpFuncName } from "./ast"
 // The extern manifest: parsed in any module, declared here, imported by the emitter.
 import {
   extDeclLink,
@@ -2612,6 +2618,11 @@ let opIdxFns: string[] = []
 // declares no index operator banks nothing.
 let opIdxSiteNode: i32[] = []
 let opIdxSiteFn: string[] = []
+// The receiver-keyed operator function the checker resolved at a binary-operator site, banked
+// for the emitter's dispatch rewrite to read back — the `a op b` twin of `opIdxSiteFn`, so the
+// emitter names the exact declaration the checker chose rather than re-running the receiver scan.
+let opBinSiteNode: i32[] = []
+let opBinSiteFn: string[] = []
 // ── the type-parameter `self` operator, banked from both ends ────────────────
 
 // D491 — `binOpDeadSelf` refuses a binary-operator declaration whose `self` can never be an
@@ -3688,6 +3699,8 @@ export function initChecker() {
   opIdxFns = []
   opIdxSiteNode = []
   opIdxSiteFn = []
+  opBinSiteNode = []
+  opBinSiteFn = []
   opBinHoleDeclName = []
   opBinHoleDeclNode = []
   opBinHoleDeclAnn = []
@@ -4198,11 +4211,11 @@ function checkNotEmitterIntrinsic(name: string, at: i32) {
 // silently meaning something else at the site. `opSelfFnTy` resolves through `lookup(op)` and a
 // nested `function "+"` binds in a node table, so this is a position rule, not a type rule.
 function checkNotNestedBinOpDecl(name: string, at: i32) {
-  if !isBinOpFuncName(name) { return 0 }
+  if !isBinOpDecl(name) { return 0 }
   if isTopLevelStmt(at) { return 0 }
   tErr(
     "operator `" +
-      name +
+      opDeclLabelBin(name) +
       "` can never dispatch: a binary operator must be declared at MODULE SCOPE, and " +
       "this one is nested inside a function body or block — move it to the top level",
     at,
@@ -7065,7 +7078,7 @@ function recordRedundantRet(n: FuncDecl, fnIx: i32, ret: i32) {
   redunSCol.push(P.toks[colonTok].col)
   redunELine.push(P.toks[braceTok].line)
   redunECol.push(P.toks[braceTok].col)
-  redunName.push(opDeclLabel(demangleName(n.fnName)))
+  redunName.push(opDeclLabelBin(demangleName(n.fnName)))
   // User-facing (the finding's message quotes it) — the user render, not the raw one.
   redunType.push(tyToStrUser(ret))
   redunTok.push(nameTok)
@@ -19011,12 +19024,16 @@ function objOpSelfDispatchTy(op: string, lt: i32) {
 // route since a false true there is free; this one must not, because `monoPinBinOps` only
 // rewrites through `drwSelfFnOf(op, 2)` and has no struct-table row for a field closure.
 function objOpSelfFnRetTy(op: string, lt: i32) {
-  const fnTy = lookup(op)
+  // Receiver-directed, the same scan `opSelfFnTy` uses: the declaration whose `self` accepts
+  // `lt`, keyed on `(symbol, receiver)` so each receiver type's operator resolves on its own.
+  const opKey = opSelfFnKeyFor(op, lt)
+  if opKey == "" { return -1 }
+  const fnTy = lookup(opKey)
   if fnTy < 0 { return -1 }
   const ft = T.tys[fnTy]
   if ft is TyFunc {
     if ft.fnParamTypes.length != 2 { return -1 }
-    const dIx = fnDeclIx[op] ?? -1
+    const dIx = fnDeclIx[opKey] ?? -1
     if dIx < 0 { return -1 }
     const d = P.nodes[dIx]
     if d is FuncDecl {
@@ -20952,6 +20969,36 @@ export function opIdxFnAtNode(ix: i32) {
   ""
 }
 
+// BANK the resolved binary-operator function on its site node, for the emitter's dispatch
+// rewrite. Real pass only, for the reason `opIdxBank` is (a quiet probe may resolve a hole).
+function opBinBank(siteIx: i32, fn: string) {
+  if inferQuiet { return 0 }
+  if siteIx < 0 { return 0 }
+  let i = 0
+  while i < opBinSiteNode.length {
+    if opBinSiteNode[i] == siteIx {
+      opBinSiteFn[i] = fn
+      return 0
+    }
+    i = i + 1
+  }
+  opBinSiteNode.push(siteIx)
+  opBinSiteFn.push(fn)
+  0
+}
+
+// The receiver-keyed operator function the checker resolved at binary-operator site `ix`, or ""
+// — the emitter's read of the bank above, the `a op b` twin of `opIdxFnAtNode`.
+export function opBinFnAtNode(ix: i32) {
+  if ix < 0 { return "" }
+  let i = 0
+  while i < opBinSiteNode.length {
+    if opBinSiteNode[i] == ix { return opBinSiteFn[i] }
+    i = i + 1
+  }
+  ""
+}
+
 // The declared type of parameter `pi` of the operator function `fn`, or -1.
 function opIdxParamTy(fn: string, pi: i32) {
   const fnTy = lookup(fn)
@@ -21000,23 +21047,108 @@ function opIdxBindGen(
   }
 }
 
-// The `fnDeclIx` key an operator declaration is stored under: the plain spelling in a
-// single-file program, the merge's renamed one everywhere else. "" never reaches the table —
-// the plain name is returned unchanged when nothing merged claims it, so the miss is the
-// caller's own `lookup` miss and not a second refusal (A-OPMOD).
-function opDeclKeyOf(op: string) {
-  if lookup(op) >= 0 { return op }
-  const merged = mergedDeclKeyOf(op)
-  if merged == "" { return op }
-  merged
+// The receiver-keyed declaration name for binary operator `op` whose `self` parameter accepts
+// left-operand type `lt`, or "" — the receiver-directed scan of the operator registry
+// (`opIdxFns`), the twin of `opIdxFnFor` for a binary operator. Several receiver types may each
+// declare `op`; this picks the one the left operand is assignable to (B14 generalized).
+function opSelfFnKeyFor(op: string, lt: i32): string {
+  if lt < 0 { return "" }
+  let i = 0
+  while i < opIdxFns.length {
+    if opIdxOps[i] == op {
+      const nm = opIdxFns[i]
+      const fnTy = lookup(nm)
+      if fnTy >= 0 {
+        // Force an un-annotated return past its pending sentinel, as `opIdxFnFor` and the
+        // bare `a op b` resolution do, so a call ahead of the declaration reads a real type.
+        const preFt = T.tys[fnTy]
+        if preFt is TyFunc {
+          if preFt.fnRet == -2 {
+            if !onInferStack(nm) {
+              const dIx = fnDeclIx[nm] ?? -1
+              if dIx >= 0 { checkNode(dIx) }
+            }
+          }
+        }
+        const ft = T.tys[fnTy]
+        if ft is TyFunc {
+          const ps = ft.fnParamTypes
+          if ps.length > 0 {
+            if assignable(lt, ps[0]) { return nm }
+          }
+        }
+      }
+    }
+    i = i + 1
+  }
+  ""
+}
+
+// Whether any receiver's declaration of binary operator symbol `op` is registered — the
+// pin-deferral gate's question, keyed on the symbol across all receivers, since an operator
+// declaration takes no `fnDeclIx` slot.
+function binOpSymDeclared(op: string): boolean {
+  let i = 0
+  while i < opIdxOps.length {
+    if opIdxOps[i] == op {
+      if lookup(opIdxFns[i]) >= 0 { return true }
+    }
+    i = i + 1
+  }
+  false
+}
+
+// The receiver-keyed operator name for `(op, recvTy)`, for the monomorphizer — a lean
+// post-check scan (no pending-return force; returns are settled at pin time), the
+// receiver-directed twin of the bare `drwSelfFnOf`.
+export function opSelfFnNameForRecv(op: string, recvTy: i32): string {
+  if recvTy < 0 { return "" }
+  let i = 0
+  while i < opIdxFns.length {
+    if opIdxOps[i] == op {
+      const nm = opIdxFns[i]
+      const fnTy = lookup(nm)
+      if fnTy >= 0 {
+        const ft = T.tys[fnTy]
+        if ft is TyFunc {
+          const ps = ft.fnParamTypes
+          if ps.length > 0 {
+            if assignable(recvTy, ps[0]) { return nm }
+          }
+        }
+      }
+    }
+    i = i + 1
+  }
+  ""
+}
+
+// The one registered declaration name for `op` when the receiver is not yet known (a hole on
+// the LEFT), or "" when none or more than one exists. A single declaration per symbol is the
+// only case where seeding a hole from it is unambiguous, which is every program that compiles.
+function opSelfFnKeyOnly(op: string): string {
+  let found = ""
+  let n = 0
+  let i = 0
+  while i < opIdxFns.length {
+    if opIdxOps[i] == op {
+      if lookup(opIdxFns[i]) >= 0 {
+        found = opIdxFns[i]
+        n = n + 1
+      }
+    }
+    i = i + 1
+  }
+  if n == 1 { return found }
+  ""
 }
 
 // The `self` parameter's type for `op`'s declaration, or -1 when the operator names no
 // two-parameter `self`-function. The receiver half of `opSelfFnTy`'s own resolution, split out
-// so a hole on the LEFT can be seeded from the same declaration. A non-bracket operator may be
-// declared once per program (`redeclared <`), so the answer is unambiguous.
+// so a hole on the LEFT can be seeded from the same declaration.
 function opSelfParamTy(op: string) {
-  const opKey = opDeclKeyOf(op)
+  const opKey = opSelfFnKeyOnly(op)
+  if opKey == "" { return -1 }
   const fnTy = lookup(opKey)
   if fnTy < 0 { return -1 }
   const dIx = fnDeclIx[opKey] ?? -1
@@ -21043,12 +21175,17 @@ function opSelfParamTy(op: string) {
 // first parameter named `self`. Binds the operands into the function's holes like any call
 // and substitutes the return; -1 means no such function fits, and the caller falls through to the operator-field lookup or the native numeric paths.
 function opSelfFnTy(op: string, lt: i32, rt: i32, rightIx: i32, ix: i32) {
-  // The operator's own site is `a + b`, which carries no name a merge could rewrite, so the
-  // declaration's key is the merged one and this ask is the plain one. Resolved through the
-  // shared key resolver, the same one the UFCS gate uses (A-OPMOD).
-  const opKey = opDeclKeyOf(op)
+  // Receiver-directed: the declaration whose `self` accepts the LEFT operand's type, from the
+  // operator registry keyed on `(symbol, receiver)` (B14 generalized from `[]`/`[]=`). Several
+  // receiver types may each declare `op`; the left operand picks which. One declaration
+  // resolves to the same target a bare `lookup(op)` would, so single-receiver bytes are unchanged.
+  const opKey = opSelfFnKeyFor(op, lt)
+  if opKey == "" { return -1 }
   const fnTy = lookup(opKey)
   if fnTy < 0 { return -1 }
+  // Bank the receiver-keyed name for the emitter, so `a + b` lowers to the exact declaration
+  // resolved here rather than a bare-name re-scan that a merge could rewrite differently.
+  opBinBank(ix, opKey)
   const preFt = T.tys[fnTy]
   if preFt is TyFunc {
     if preFt.fnRet == -2 {
@@ -26407,7 +26544,7 @@ function checkProgramNode(n: Program) {
       // it here means a malformed declaration is reported once, at itself, rather
       // than at every use site that fails to resolve.
       const opk = opDeclOpOf(s.fnName)
-      if opk != "" {
+      if opk == OP_INDEX_GET || opk == OP_INDEX_SET {
         let want = 2
         if opk == OP_INDEX_SET { want = 3 }
         if hp.length != want {
@@ -26439,12 +26576,21 @@ function checkProgramNode(n: Program) {
           opIdxOps.push(opk)
           opIdxFns.push(s.fnName)
         }
+      } else if isBinOpDecl(s.fnName) {
+        // A BINARY operator: register it under its SYMBOL in the operator table `opSelfFnTy`'s
+        // receiver scan reads, so several receiver types can each define the symbol and
+        // dispatch resolves by the left operand's type (B14 generalized). Both a receiver-keyed
+        // `+@Vec3` and a bare `+` (unannotated/hole `self`) register under `+` (D1934).
+        let binSym = s.fnName
+        if opk != "" { binSym = opk }
+        opIdxOps.push(binSym)
+        opIdxFns.push(s.fnName)
       }
       // The swallow at the binary operators, said out loud (D425) — the twin of the index
       // gate above: `checkBinary` reaches `opSelfFnTy` only when the left operand is an
       // object, so a declaration whose `self` is not one is not a dispatch that fails, it is
       // one the language already decided will never happen. Disjoint from D471's first-parameter-name gate (checked in the parser), so a declaration failing both gets the name diagnostic only.
-      if isBinOpFuncName(s.fnName) {
+      if isBinOpDecl(s.fnName) {
         if hp.length == 2 {
           let selfNamed = false
           // Whether `self` carries an ANNOTATION at all (D491) — read inside the `is
@@ -26459,7 +26605,7 @@ function checkProgramNode(n: Program) {
             if binOpDeadSelf(hpt[0]) {
               tErr(
                 "operator `" +
-                  s.fnName +
+                  opDeclLabelBin(s.fnName) +
                   "` can never dispatch: `self` is the LEFT OPERAND and dispatch needs an object, but " +
                   tyToStr(hpt[0]) +
                   " is not one",
@@ -26472,7 +26618,14 @@ function checkProgramNode(n: Program) {
               // parameter as a fresh type variable, so `tyHasHole` is true of it exactly as of `self: T` (D521).
               if hpt[0] >= 0 {
                 if tyHasHole(hpt[0]) {
-                  opBinHoleDeclName.push(s.fnName)
+                  // Banked under the bare SYMBOL, not the receiver-keyed decl name: D491 is a
+                  // whole-program question ("does this operator ever dispatch"), and the site
+                  // side (`opBinSiteTook`) records the symbol, so both halves must key alike. A
+                  // `self: T` op mints `+@T` but the question it answers is about `+`.
+                  const holeSym = opDeclOpOf(s.fnName)
+                  let holeKey = s.fnName
+                  if holeSym != "" { holeKey = holeSym }
+                  opBinHoleDeclName.push(holeKey)
                   opBinHoleDeclNode.push(stmts[hi])
                   opBinHoleDeclAnn.push(selfAnn)
                 }
@@ -32565,7 +32718,7 @@ function mkBinOpRetTy(n: BinExpr, bTy: i32, lt: i32) {
     // Only an operator a user can declare can carry an overload, so nothing else has a second
     // answer at a pin (`ast.vl:isBinOpFuncName`, the ten names a declaration admits).
     if !isBinOpFuncName(op) { return bTy }
-    if (fnDeclIx[op] ?? -1) < 0 { return bTy }
+    if !binOpSymDeclared(op) { return bTy }
   }
   // An annotated body is not excluded: D551 re-checks the annotation against the
   // resolved body type at each pin (`noteRetCstr`/`validateRetCstrs`), so a per-pin deferral is safe.

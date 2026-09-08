@@ -26,7 +26,6 @@ import {
   inferRetTyIxOf,
   lambdaVoidAdoptedAt,
   litUnionAliasNameOfTy,
-  mergedDeclKeyOf,
   mkArrayTy,
   nameIsLitUnionType,
   nodeTyCarry,
@@ -34,13 +33,13 @@ import {
   nodeTyIsLitUnionAlias,
   nodeTyIsMap,
   nodeTyIsNullable,
-  nodeTyIsObj,
   nodeTyIsUnion,
   nodeTyIxOf,
   nodeTyName,
   numLitUnionAliasName,
   numLitUnionBaseName,
   numLitUnionHasBase,
+  opBinFnAtNode,
   opIdxFnAtNode,
   optCallRestamp,
   recordNodeTyFrom,
@@ -146,18 +145,6 @@ import { paramIsClosure, paramNulClosure } from "./emit_query"
 // The host resolves these in its type-aware parser; the native parser is
 // type-free, so the emitter rewrites the arena before monomorphization: UFCS
 // (`o.f(args)` → `f(o, args)`), an operator closure field, and a `[]`/`[]=` trap field.
-
-// The name `fnIndexOf` holds an operator declaration under: the plain spelling in a
-// single-file program, the merge's renamed one everywhere else. Asked of the checker's own
-// key resolver rather than re-derived here, so the two phases cannot disagree about which
-// declaration an operator site means. `name` unchanged when nothing merged claims it (A-OPMOD).
-export function drwMergedFnName(name: string) {
-  if fnIndexOf(name) >= 0 { return name }
-  const merged = mergedDeclKeyOf(name)
-  if merged == "" { return name }
-  if fnIndexOf(merged) < 0 { return name }
-  merged
-}
 
 // The `fnStmts` index of a free `self`-function `name` reachable at `argc` total
 // params (first param named `self`), or -1 — the host's UFCS reachability rule.
@@ -648,21 +635,16 @@ function drwWalk(ix: i32, ctx: i32) {
     }
     if drwDispatchOp(n.binOp) {
       const osi = structIndexOfExpr(n.binLeft, ctx)
-      // A free `self`-function named for the operator wins (host parser order); else an
-      // operator closure field dispatches member-call style (that branch keeps `osi`). Gated
-      // on the operand's own OBJECT type, not the name-resolved `osi`: a user `"+"` receiver
-      // is always an object, and a shadowed string operand must take the built-in `+` (D1934).
-      if nodeTyIsObj(n.binLeft) {
-        // One resolver for both halves: the reachability test and the callee it builds have
-        // to name the same declaration, or a merged program rewrites to a callee that
-        // resolves to nothing (A-OPMOD).
-        const opFn = drwMergedFnName(n.binOp)
-        if drwSelfFnOf(opFn, 2) >= 0 {
-          const oargs: i32[] = []
-          oargs.push(n.binLeft)
-          oargs.push(n.binRight)
-          return mkCall(mkIdent(opFn, -1), oargs, -1)
-        }
+      // The checker banked the receiver-keyed operator it resolved (`+@Vec3`); name that
+      // declaration directly — the `a op b` twin of the `"[]"` arm's `opIdxFnAtNode` read.
+      // Empty unless the left operand is a dispatched object, in which case an operator
+      // closure field dispatches member-call style below (D1934).
+      const opFn = opBinFnAtNode(ix)
+      if opFn != "" {
+        const oargs: i32[] = []
+        oargs.push(n.binLeft)
+        oargs.push(n.binRight)
+        return mkCall(mkIdent(opFn, -1), oargs, -1)
       }
       if osi >= 0 {
         if drwFieldClosure(osi, n.binOp) {
