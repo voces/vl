@@ -24477,6 +24477,58 @@ function ifChainExhausts(ifIx: i32) {
   true
 }
 
+// Refuse a trailing else-less `is`-chain that does not cover every variant when the function
+// returns a value: the uncovered path falls off the end and the emitter writes `unreachable`
+// there. `retTy` is the annotated return or the inferred one, so inference is checked the same as
+// an annotation; skipped for a void, error, or nullable return that legitimately falls (D1902).
+function checkTrailingChainTotal(stmtIx: i32, retTy: i32) {
+  if retTy < 0 { return }
+  const lastN = P.nodes[stmtIx]
+  if lastN is IfStmt {
+    const firstCond = P.nodes[condUnderParens(lastN.ifCond)]
+    let isChain = false
+    if firstCond is IsExpr {
+      isChain = true
+    } else if firstCond is BinExpr {
+      if firstCond.binOp == "==" {
+        let eqPlace = -1
+        if litTyOfExpr(firstCond.binRight) >= 0 {
+          eqPlace = firstCond.binLeft
+        } else if litTyOfExpr(firstCond.binLeft) >= 0 {
+          eqPlace = firstCond.binRight
+        }
+        if eqPlace >= 0 {
+          const eqObj = P.nodes[eqPlace]
+          if eqObj is Ident {
+            if isLitBearing(lookup(eqObj.identName)) { isChain = true }
+          }
+        }
+      }
+    }
+    const retT = T.tys[retTy]
+    let retNullable = false
+    if retT is TyNullable { retNullable = true }
+    if isChain && !isVoidTy(retTy) && retTy != TY_ERR && !retNullable {
+      if !ifChainExhausts(stmtIx) {
+        let chainFix = "add the missing variant(s) or an `else` (expected " +
+          tyToStr(retTy) +
+          ")"
+        if chainMissing != "" {
+          chainFix = "missing " +
+            chainMissing +
+            " (add the arm(s) or an `else`; expected " +
+            tyToStr(retTy) +
+            ")"
+        }
+        tErr(
+          "non-exhaustive `is`-chain falls through with no `else` — " + chainFix,
+          stmtIx,
+        )
+      }
+    }
+  }
+}
+
 // Does the block hold a bare `return`, recursing into if/while/for bodies but never into a
 // nested function, whose returns are its own? A bare `return` is legal only where nothing is
 // owed, so one anywhere in a body is the author writing `: void`; the checker pins the return
@@ -25637,6 +25689,11 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
           // states: under inference the destination is the join, not this witness (D1591).
           noteInferRetWitness(stmts[s], stTy)
           noteInferredRet(inferRetTyOf(stmts[s], stTy))
+          // The soundness check for an inferred return: `inferObserved` is the join of the
+          // returns just walked (the value type the chain infers), while the tail if-statement's
+          // own type is void for an all-returning chain — so the accumulated join is what the
+          // fall-through is checked against, refused the same as an annotation would (D1902).
+          checkTrailingChainTotal(stmts[s], inferObserved)
         } else {
           // Redundant-return rule: witness the trailing expression's NATURAL type
           // (before constrainEmpty pins a hole); an annotation-influenced trailing
@@ -25644,63 +25701,10 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
           if retInfluencedByAnnot(stmts[s]) { retNaturalErr = true }
           noteNaturalRet(stTy)
           constrainEmptyExpr(stmts[s], stTy, ret)
-          // Soundness — missing-return / non-exhaustive fall-through: when the body's last
-          // statement is an else-less `is`-chain that does not cover every variant, a value
-          // falls off the end (typed `| null`), which is a soundness hole for a non-void
-          // declared return. Skipped when the return type is itself nullable or the error type.
-          const lastN = P.nodes[stmts[s]]
-          if lastN is IfStmt {
-            // Only a discriminating chain is subject to this rule — a trailing `if` over `is`
-            // arms, or a literal-equality chain over a literal-union place (the uncovered
-            // member leaves a `| null` fall-through). A plain `if cond {…}` over a non-literal
-            // place keeps the existing per-branch checks.
-            const firstCond = P.nodes[condUnderParens(lastN.ifCond)]
-            let isChain = false
-            if firstCond is IsExpr {
-              isChain = true
-            } else if firstCond is BinExpr {
-              if firstCond.binOp == "==" {
-                let eqPlace = -1
-                if litTyOfExpr(firstCond.binRight) >= 0 {
-                  eqPlace = firstCond.binLeft
-                } else if litTyOfExpr(firstCond.binLeft) >= 0 {
-                  eqPlace = firstCond.binRight
-                }
-                if eqPlace >= 0 {
-                  const eqObj = P.nodes[eqPlace]
-                  if eqObj is Ident {
-                    if isLitBearing(lookup(eqObj.identName)) { isChain = true }
-                  }
-                }
-              }
-            }
-            const retT = T.tys[ret]
-            let retNullable = false
-            if retT is TyNullable { retNullable = true }
-            if isChain && !isVoidTy(ret) && ret != TY_ERR && !retNullable {
-              if !ifChainExhausts(stmts[s]) {
-                // Name the uncovered variants when member coverage computed
-                // them (the `match` sibling's courtesy); a chain that is
-                // non-exhaustive for a SHAPE reason (a non-coverable arm, an
-                // uncovered `null` path) has no member list, so stay generic.
-                let chainFix = "add the missing variant(s) or an `else` (expected " +
-                  tyToStr(ret) +
-                  ")"
-                if chainMissing != "" {
-                  chainFix = "missing " +
-                    chainMissing +
-                    " (add the arm(s) or an `else`; expected " +
-                    tyToStr(ret) +
-                    ")"
-                }
-                tErr(
-                  "non-exhaustive `is`-chain falls through with no `else` — " +
-                    chainFix,
-                  stmts[s],
-                )
-              }
-            }
-          }
+          // Soundness — missing-return / non-exhaustive fall-through: an else-less `is`-chain
+          // that does not cover every variant lets a value fall off the end, refused for a
+          // non-void declared return (D1902).
+          checkTrailingChainTotal(stmts[s], ret)
         }
       }
       s = s + 1
