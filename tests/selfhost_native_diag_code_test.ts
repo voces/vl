@@ -328,7 +328,25 @@ const checkGraph = (
 const LIB_SRC = [
   "export type Box = { v: i32 }",
   "export function box(v: i32): Box { return { v: v } }",
+  "",
+].join("\n");
+
+// `area` lives OUTSIDE Box's home module — an orphan extension. A type-bound call does
+// not reach it (Box's own module, "./lib", does not export it), so D1230's "import it"
+// suggestion is still the actionable answer; `extMark`/`other` only pull the module into
+// the graph. A method Box's home module exported would instead RESOLVE with no import
+// (the type-bound-UFCS feature), which the cases fixtures cover on the positive side.
+const EXT_SRC = [
+  'import { Box } from "./lib"',
   "export function area(self: Box): i32 { return self.v * self.v }",
+  "export function extMark(): i32 { return 0 }",
+  "",
+].join("\n");
+
+const MORE_SRC = [
+  'import { Box } from "./lib"',
+  "export function area(self: Box): i32 { return self.v + self.v }",
+  "export function other(): i32 { return 1 }",
   "",
 ].join("\n");
 
@@ -340,8 +358,8 @@ Deno.test({
   const { rc, diags } = checkGraph(
     exp,
     "/w/entry.vl",
-    'import { box } from "./lib"\nprint(box(5).area())\n',
-    { "/w/lib.vl": LIB_SRC },
+    'import { box } from "./lib"\nimport { extMark } from "./ext"\nprint(extMark())\nprint(box(5).area())\n',
+    { "/w/lib.vl": LIB_SRC, "/w/ext.vl": EXT_SRC },
   );
   if (rc !== 2) throw new Error(`expected rc 2 (type stage), got ${rc}`);
   if (diags.length !== 1) {
@@ -357,11 +375,11 @@ Deno.test({
   }
   sameData(
     diags[0].data,
-    { member: ["area"], modules: ["./lib"], recv: ["Box"] },
+    { member: ["area"], modules: ["./ext"], recv: ["Box"] },
     "one candidate module",
   );
   // The wire bytes, exactly — a netstring per field, key then value.
-  const wantRaw = "6:member,4:area,7:modules,5:./lib,4:recv,3:Box,";
+  const wantRaw = "6:member,4:area,7:modules,5:./ext,4:recv,3:Box,";
   if (diags[0].raw !== wantRaw) {
     throw new Error(
       `expected payload bytes ${JSON.stringify(wantRaw)}, got ${
@@ -370,9 +388,9 @@ Deno.test({
     );
   }
   // The MODULE SPECIFIER is the file's own import text, not the resolved key.
-  // `/w/lib.vl` would be a path the author never typed and an import they cannot
-  // write; `./lib` is the string already in the file.
-  if (diags[0].raw.includes("/w/lib.vl")) {
+  // `/w/ext.vl` would be a path the author never typed and an import they cannot
+  // write; `./ext` is the string already in the file.
+  if (diags[0].raw.includes("/w/ext.vl")) {
     throw new Error(
       `the payload must carry the SPECIFIER, not the resolved key: ${
         JSON.stringify(diags[0])
@@ -386,28 +404,27 @@ Deno.test({
   ignore,
 }, () => {
   const exp = instantiate();
-  // Both modules export an `area(self: Box)`; the entry imports neither name.
-  // A quick-fix offers one code action per listed module, so the candidates are
-  // a FIELD of one diagnostic — two diagnostics would stack two squiggles on the
-  // single `area` token.
+  // Two ORPHAN modules export an `area(self: Box)` — neither is Box's home ("./lib"),
+  // which exports no `area`, so type-bound resolution does not fire and both are live
+  // import candidates. A quick-fix offers one code action per listed module, so the
+  // candidates are a FIELD of one diagnostic — two diagnostics would stack two squiggles
+  // on the single `area` token.
   const { rc, diags } = checkGraph(
     exp,
     "/w/entry.vl",
     [
       'import { box } from "./lib"',
+      'import { extMark } from "./ext"',
       'import { other } from "./more"',
-      "print(box(5).area())",
+      "print(extMark())",
       "print(other())",
+      "print(box(5).area())",
       "",
     ].join("\n"),
     {
       "/w/lib.vl": LIB_SRC,
-      "/w/more.vl": [
-        'import { Box } from "./lib"',
-        "export function area(self: Box): i32 { return self.v + self.v }",
-        "export function other(): i32 { return 1 }",
-        "",
-      ].join("\n"),
+      "/w/ext.vl": EXT_SRC,
+      "/w/more.vl": MORE_SRC,
     },
   );
   if (rc !== 2) throw new Error(`expected rc 2 (type stage), got ${rc}`);
@@ -428,7 +445,7 @@ Deno.test({
   // cannot merge two modules into one or split one into two.
   sameData(
     diags[0].data,
-    { member: ["area"], modules: ["./lib", "./more"], recv: ["Box"] },
+    { member: ["area"], modules: ["./ext", "./more"], recv: ["Box"] },
     "two candidate modules",
   );
 });
@@ -742,8 +759,8 @@ Deno.test({
   const { rc, diags } = checkGraph(
     exp,
     "/w/entry.vl",
-    'import { box } from "./lib"\nprint(box(5).area())\n',
-    { "/w/lib.vl": LIB_SRC },
+    'import { box } from "./lib"\nimport { extMark } from "./ext"\nprint(extMark())\nprint(box(5).area())\n',
+    { "/w/lib.vl": LIB_SRC, "/w/ext.vl": EXT_SRC },
   );
   if (rc !== 2) throw new Error(`expected rc 2 (type stage), got ${rc}`);
   if (diags.length !== 1) {

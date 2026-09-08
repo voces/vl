@@ -66,20 +66,21 @@ Deno.test({
   fn: async () => {
     const dir = await Deno.makeTempDir({ prefix: "vl_ufcs_suffix_" });
     try {
-      // `Buf` is already imported for the annotation, so the fix EXTENDS that
-      // import rather than proposing a second, colliding one.
+      // A STRING receiver has no declaring module, so type-bound resolution never fires
+      // and `trim` still needs importing (D1230's domain). `std:str` is already imported
+      // for `join`, so the fix EXTENDS that import rather than opening a second one.
       eq(
         await errorsOf(
           dir,
-          'import { Buf } from "std:buffer"\n\nfunction f(b: Buf): i32 { b.loadU8(0) }\n',
+          'import { join } from "std:str"\n\nprint("hi".trim())\n',
         ),
         [
-          "'loadU8' is not imported — a free `loadU8(self: …)` accepting Buf is " +
-          'exported by "std:buffer"; a UFCS call resolves only names in scope, so ' +
-          "import `loadU8` from there — add `loadU8` to the existing " +
-          '`import { … } from "std:buffer"`',
+          "'trim' is not imported — a free `trim(self: …)` accepting string is " +
+          'exported by "std:str"; a UFCS call resolves only names in scope, so ' +
+          "import `trim` from there — add `trim` to the existing " +
+          '`import { … } from "std:str"`',
         ],
-        "std:buffer, Buf already imported",
+        "std:str, join already imported",
       );
     } finally {
       await Deno.remove(dir, { recursive: true });
@@ -93,12 +94,18 @@ Deno.test({
   fn: async () => {
     const dir = await Deno.makeTempDir({ prefix: "vl_ufcs_suffix_" });
     try {
+      // `area` is an ORPHAN: `Box`'s home ("./base") does not export it, so type-bound
+      // resolution does not fire. It lives in "./lib", which the entry already imports
+      // (for `helper`), so the fix EXTENDS that relative import.
       eq(
         await errorsOfFiles(dir, {
-          "lib.vl": "export type Box = { v: i32 }\n\n" +
-            "export function box(v: i32): Box { return { v: v } }\n\n" +
-            "export function area(self: Box): i32 { return self.v * self.v }\n",
-          "entry.vl": 'import { box } from "./lib"\n\nprint(box(2).area())\n',
+          "base.vl": "export type Box = { v: i32 }\n\n" +
+            "export function box(v: i32): Box { return { v: v } }\n",
+          "lib.vl": 'import { Box } from "./base"\n\n' +
+            "export function area(self: Box): i32 { return self.v * self.v }\n\n" +
+            "export function helper(): i32 { return 0 }\n",
+          "entry.vl": 'import { box } from "./base"\nimport { helper } from "./lib"\n\n' +
+            "print(box(2).area())\n\nprint(helper())\n",
         }),
         [
           "'area' is not imported — a free `area(self: …)` accepting Box is " +
@@ -106,7 +113,7 @@ Deno.test({
           "import `area` from there — add `area` to the existing " +
           '`import { … } from "./lib"`',
         ],
-        "./lib, box already imported",
+        "./lib orphan, helper already imported",
       );
     } finally {
       await Deno.remove(dir, { recursive: true });
@@ -149,19 +156,24 @@ Deno.test({
   fn: async () => {
     const dir = await Deno.makeTempDir({ prefix: "vl_ufcs_suffix_" });
     try {
-      // The fix is a CHOICE between "./left" and "./right", so no single pasteable
-      // line is right and the sentence stops at "from there", exactly as before.
+      // Two ORPHAN modules export `label(self: Tag)`; `Tag`'s home ("./base") exports
+      // none, so type-bound resolution does not fire and both are live candidates. The
+      // fix is a CHOICE between "./left" and "./right", so no single pasteable line is
+      // right and the sentence stops at "from there".
       eq(
         await errorsOfFiles(dir, {
-          "left.vl": "export type Tag = { n: i32 }\n\n" +
-            "export function tag(n: i32): Tag { return { n: n } }\n\n" +
-            'export function label(self: Tag): string { return "L" }\n',
-          "right.vl": 'import { Tag } from "./left"\n\n' +
+          "base.vl": "export type Tag = { n: i32 }\n\n" +
+            "export function tag(n: i32): Tag { return { n: n } }\n",
+          "left.vl": 'import { Tag } from "./base"\n\n' +
+            'export function label(self: Tag): string { return "L" }\n\n' +
+            "export function leftMark(): i32 { return 0 }\n",
+          "right.vl": 'import { Tag } from "./base"\n\n' +
             'export function label(self: Tag): string { return "R" }\n\n' +
             "export function marker(): i32 { return 1 }\n",
-          "entry.vl": 'import { tag } from "./left"\n' +
+          "entry.vl": 'import { tag } from "./base"\n' +
+            'import { leftMark } from "./left"\n' +
             'import { marker } from "./right"\n\n' +
-            "print(tag(1).label())\n\nprint(marker())\n",
+            "print(tag(1).label())\n\nprint(leftMark())\n\nprint(marker())\n",
         }),
         [
           "'label' is not imported — a free `label(self: …)` accepting Tag is " +
