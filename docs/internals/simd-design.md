@@ -9,7 +9,11 @@ voxels/metre, `16³` bricks, a **2-byte voxel record** `{ sdf: i8, mat: u8 }`; i
 already `vec4`-shaped because it targets WebGPU/WGSL. This document surveys how a wide gamut of
 languages treat SIMD as first-class, works the design axes against VL's actual model (`Buffer`,
 unions, tight nominal types, `flat`, `std:*` conventions, a WASM target), and **recommends one
-direction** with the open questions the owner must rule on before a line is built.
+direction**. The owner has since ruled on all ten open questions — §F is rewritten from
+questions into decisions, and §D is updated to match. Two rulings moved past the
+recommendation: **O4** sanctions operator overloading broadly, for any nominal type under the
+orphan rule, not just the SIMD family; **O7** unifies the SIMD and graphics-vector surfaces into
+one type family rather than layering a separate `std:vec` on top.
 
 `ROADMAP.md` already reserves the slot — *"SIMD over Buffer (unlocked by P0, not requested yet)"* and,
 in the strings design, *"SIMD / word-at-a-time work belongs to `Buffer` (B-mem) — wasm SIMD is
@@ -21,6 +25,13 @@ This is a **design pass. No compiler source is touched by the change that carrie
 apply and were not run; the doc-only PR runs the ordinary docs path. Sibling docs whose style this
 matches: `buffer-design.md` (the linear-memory tier this builds on), `flat-records-design.md`,
 `numeric-intrinsics.md`.
+
+**Status: the design is finalized; this is not a build ticket.** All ten open questions in §F are
+now ruled. The build itself stays gated on two prerequisites: the `std:math` deterministic numeric
+substrate (`docs/internals/std-math-design.md`, DESIGNED but not yet built — ROADMAP row 34) that
+SIMD's scalar ops sit on, and the type-bound UFCS method resolution that lets `v.dot(w)` resolve as
+a method in `F32x4`'s own module with no import — that half is now SHIPPED (#3003 receiver-keyed
+operators, #3005 type-bound method fallback), so `std:math` is what remains before S0 can start.
 
 ---
 
@@ -305,20 +316,23 @@ The seven axes the recommendation must settle, each with where the survey lands.
 7. **Fit with VL's aesthetic.** Tight nominal types (distinct `F32x4` vs `I32x4`, distinct `Mask`, so
    lanes cannot be reinterpreted by accident — the exact argument that made `F32View` and `I32View`
    separate types); `std:*` library conventions; operators where VL already overloads them (`"[]"`,
-   and the `"+"` question in A13/B16). → **Nominal fixed types in `std:simd`, operators where
-   sanctioned.**
+   and now `"+"`/`"-"`/`"*"`/`"/"` per receiver type since #3003 — A13's separate question, whether
+   a `"+"`-named struct FIELD is spellable, is unrelated and still open). → **Nominal fixed types
+   in `std:simd`, with vector arithmetic and geometry operators defined directly on those types
+   under the general receiver-keyed mechanism (O4).**
 
 ---
 
 ## D. The recommended surface
 
-**One-line recommendation: a fixed-width, nominally-typed SIMD *library* (`std:simd`) — a closed
+**One-line ruling (O1, O9, O10): a fixed-width, nominally-typed SIMD *library* (`std:simd`) — a closed
 family of `new`-newtype vector types matching WASM's `v128` lane shapes, built on a thin new
 `__…_v128__` intrinsic family in the emitter, mirroring exactly how `std:buffer` wraps the memory
 intrinsics.** Not a language-level generic `SIMD[T, N]` / `@Vector(N, T)` — WASM's single fixed width
 makes a generic low-value, and it is blocked on const-generics (A10) regardless.
 
-This is the direction to react to; the alternatives are laid out in §F O1 so the owner can overrule.
+This is the ruled direction — §F O1 records the reasoning and the two places (O4, O7) the
+owner's ruling moved past this section's own recommendation.
 
 ### D1. The type family
 
@@ -342,8 +356,10 @@ export type Mask8x16 = new v128  // a lane mask over a 16-lane vector
 
 `v128` is a **new primitive scalar type** the compiler knows (declared beside `i32`/`f32` in
 `typecheck.vl`, one WasmGC-invisible scalar the way `i64` is), never spelled by users directly — it is
-the substrate the newtypes brand. Users only ever hold `F32x4` and friends. (§F O2 asks whether the
-public spelling should instead be lowercase `f32x4`, or the WGSL-flavoured `float4`/`vec4f`.)
+the substrate the newtypes brand. Users only ever hold `F32x4` and friends. **Ruled (O2):**
+`F32x4` is the spelling; a `vec4f` alias may be added later purely for WGSL familiarity, but
+`F32x4` stays canonical — every other API in this doc, including O7's geometry methods, is defined
+against it.
 
 ### D2. Construction
 
@@ -385,14 +401,20 @@ safe wrapper, and is the same descriptor shape `buffer-design.md` §L already sh
 
 ### D4. The op set (minimum viable, fixed here)
 
-Grouped as §A3. Operators overload where VL sanctions it (§F O4); every op also has a named function
-so the surface works even if operator overloading is declined.
+Grouped as §A3. Operators overload under the general receiver-keyed, orphan-rule-gated
+mechanism (§F O4, shipped as #3003) — not a SIMD-specific carve-out; every op also has a named
+function so the surface reads the same whether a kernel prefers `a*b + c` or
+`addF32x4(mulF32x4(a,b), c)`.
 
 - **Arithmetic** — `"+"` `"-"` `"*"` `"/"` (or `addF32x4`/… ), `minF32x4` `maxF32x4` `absF32x4`
   `sqrtF32x4` `negF32x4`; integer shapes add `min_s/u`, `max_s/u`, shifts, `avgrU8x16`.
 - **Lane access** — `laneF32x4(v, i)` (extract) / `withLaneF32x4(v, i, x)` (replace). **`i` must be a
-  compile-time constant** (the wasm lane immediate); a non-constant index is a checker error naming
-  the constraint (§F O3). This is the one place the WASM encoding leaks into the surface.
+  compile-time constant** (the wasm lane immediate — `extract_lane`/`replace_lane` take a byte
+  immediate, not a stack operand); a non-constant index is a checker error naming the constraint
+  (§F O3, ruled). **Ruled addition:** named `.x`/`.y`/`.z`/`.w` accessors on the 4-lane shapes cover
+  the common case with no index at all, so a numeric `laneF32x4` call is rarely needed in practice.
+  A runtime-index fallback (spill to memory, index the spill) stays DEFERRED, not designed away — it
+  answers a genuinely-dynamic-index kernel once one shows up, without holding up v1.
 - **Compare → mask** — `ltF32x4(a, b): Mask32x4`, `eq`/`ne`/`le`/`gt`/`ge`; then
   `selectF32x4(m: Mask32x4, a: F32x4, b: F32x4): F32x4` (`v128.bitselect`), `anyTrue(m): bool`,
   `allTrue(m): bool`, `bitmaskF32x4(m): i32` (one bit per lane, for a scalar branch).
@@ -402,11 +424,13 @@ so the surface works even if operator overloading is declined.
 - **Shuffle / swizzle** — `swizzleU8x16(v, idx: U8x16): U8x16` (dynamic, `i8x16.swizzle`) plus a small
   set of **named** static shuffles (`reverseF32x4`, `rotateF32x4`, `interleaveLowF32x4`/`High`),
   because a *general* static `shuffle<i0,i1,i2,i3>` needs a compile-time immediate VL cannot yet
-  spell without const-generics (§F O3). Arbitrary static shuffle is deferred, not designed away.
+  spell without const-generics (§F O3/O10). Arbitrary static shuffle stays deferred — **ruled
+  permanently optional, not a placeholder for const-generics** (O10): the fixed named family is the
+  permanent surface, not a stand-in for a future generic one.
 - **Convert / widen / narrow** — `convertI32x4ToF32x4`, `truncF32x4ToI32x4`, `widenLowU8x16` →
   `I16x8`, `narrowI16x8` → `U8x16`, `promoteF32x4Low` → `F64x2`, `demoteF64x2` → `F32x4`.
 
-### D5. `flat` interop — a struct-of-4-f32 array read as a vector
+### D5. `flat` interop, and why there is no separate `std:vec` (O7, ruled)
 
 A `flat` record laid out as four contiguous `f32` is a 16-byte `vec4` row in a `Buffer`, so a `flat`
 array (`buf.rows<T>` from `flat-records-design.md`) of such rows reads as `F32x4` with no copy:
@@ -421,6 +445,19 @@ This is the reason `flat` and SIMD are co-designed, and it is exactly veldt's So
 its `vec4` math. The narrow shapes tie to veldt ask #3 (byte/sub-byte `flat` fields): a `flat` array
 of the 2-byte voxel record, read 8 rows at a time as an `I16x8`/two `U8x16`, is the voxel pass that is
 "~4x off" today.
+
+**Ruled (O7): unify, don't layer.** The owner declined this document's own "separate `std:vec`"
+recommendation (§F O7) — graphics and compute are the SAME type family. `F32x4` *is* the graphics
+`vec4`: `dot`, `cross`, `normalize` and swizzle (via the named `.x/.y/.z/.w` accessors, O3) are
+METHODS on the vector types themselves, not a separate `Vec3`/`Vec4`/`Mat4` layer built on top.
+`vec3` values are represented as an `F32x4` with the fourth lane padded and ignored — the GPU
+convention (the same layout WGSL rounds a `vec3<f32>` up to inside a uniform buffer), so there is
+one 16-byte value shape for 3- and 4-component vectors, not two. This matches both consumers'
+mental model directly: veldt and sunsuz already think in `vec4`-shaped WGSL, and a CPU-side
+`F32x4` and a GPU-side `vec4<f32>` now share one bit layout, so a `flat` row built for
+`queue.writeBuffer` needs no repacking on the way out. (The `flat type Vec4` above is a
+*storage-layout* record for a `Buf`'s rows — unrelated to this question; the in-register value a
+program computes with is `F32x4` itself, not a second `Vec4` value type.)
 
 ### D6. Lowering to `v128`
 
@@ -479,82 +516,103 @@ Stated so a reversal's cost is on the record (the `buffer-design.md` §E discipl
 - **Distinct `Mask` types (D1)** — forecloses using a comparison result directly as data. Intended,
   and the Rust blocker-list is the evidence it is the right call. A program that wants the raw bits
   uses `bitmask`.
-- **Nominal newtypes, not `.xyzw` swizzles in the core (D1)** — forecloses Swift/WGSL-style
-  `v.x`/`v.xyz` at the SIMD layer. Intended: swizzles are a *graphics* vocabulary and belong in a
-  `std:vec` layer on top (§F O7), where `.xyz` is a named shuffle. Keeping the SIMD core lane-indexed
-  keeps it honest about the `shuffle` immediate.
+- **Unifying graphics and compute in one type family, not a `std:vec` layer (D5, O7)** —
+  forecloses giving the graphics vocabulary its own abstraction boundary: a future graphics-only
+  representation choice (an unpadded 12-byte `vec3`, say) is no longer available, because `vec3` IS
+  an `F32x4` with a padded fourth lane, warts included. What it buys back: named `.x/.y/.z/.w`
+  accessors (O3) and geometry methods (`dot`/`cross`/`normalize`) are ordinary methods on the SIMD
+  types, so there is one type to learn, one value to hand `queue.writeBuffer`, and no repacking
+  between the compute core and the graphics vocabulary.
+- **Broad operator overloading via one general mechanism, not a SIMD-only carve-out (O4)** —
+  forecloses treating `F32x4`'s `+ - * /` as a special case; the receiver-keyed, orphan-rule-gated
+  mechanism (#3003) is available to any nominal type in its own declaring module, and SIMD's
+  operators are an ordinary use of it, not a bespoke exception `DECISIONS.md` has to carry twice.
 - **Requiring base SIMD (D7)** — forecloses running on a hypothetical no-SIMD host without a
   `-mno-simd` rebuild. Costs veldt nothing (all its targets have SIMD); the fallback is designed so
   the door is not welded.
 - **Compile-time lane index (D4, O3)** — forecloses a runtime `laneF32x4(v, i)` with a variable `i`
-  until either const-generics land or the library offers a spill-and-index helper. This is a WASM
-  encoding fact, not a VL choice, and naming it in the checker is more honest than silently emitting a
-  spill.
+  until the library offers a spill-and-index helper (deferred, not designed away — O3, ruled). This
+  is a WASM encoding fact, not a VL choice, and naming it in the checker is more honest than silently
+  emitting a spill. The common case doesn't need that door open: named `.x/.y/.z/.w` accessors
+  (also ruled under O3) cover 4-lane access with a literal, compile-time-checked name instead.
 
 ---
 
-## F. Open questions for the owner
+## F. Resolved: the owner's rulings
 
-Numbered so they can be ruled one at a time. Each carries a recommendation.
+Numbered as filed, so each can still be traced back to its recommendation. All ten are now ruled;
+two (O4, O7) landed broader than this document's own recommendation, and both are called out
+inline. The reasoning below is kept where the ruling agrees with the recommendation, and replaced
+where it does not.
 
-**O1 — Library (`std:simd`) or language builtin (`@Vector` / `SIMD[T,N]`)?**
-→ **Recommend library**, on the `buffer` O1 precedent (types in std, thin intrinsics in the compiler).
-A language builtin buys a generic surface WASM's single width makes low-value, and it is blocked on
-const-generics (A10) anyway. Reopen only if a measured kernel shows the std wrappers cost something the
-`-O3 --closed-world` inliner does not remove — the same bar `buffer` O1 set.
+**O1 — Library, not a language builtin.** RULED: `std:simd`, on the `buffer` O1 precedent (types in
+std, thin intrinsics in the compiler). A language builtin would buy a generic surface WASM's single
+width makes low-value, and it is blocked on const-generics (A10) regardless — see O10, which rules
+that dependency out entirely rather than deferring it. Reopen only if a measured kernel shows the
+std wrappers cost something the `-O3 --closed-world` inliner does not remove — the same bar
+`buffer` O1 set.
 
-**O2 — Type spelling.** `F32x4`/`I8x16` (Swift/Rust `SIMD4<Float>` flavour, and VL's `PascalCase`
-type convention) vs lowercase `f32x4` (matches the primitive `f32`) vs WGSL `vec4f`/`float4` (matches
-veldt's GPU code). → **Recommend `F32x4`** — it is a nominal std type, so it follows VL's type-name
-convention (`Buf`, `F32View`), and reserves `vec4`/`float4` for the graphics layer (O7).
+**O2 — `F32x4`.** RULED: the nominal, `PascalCase` spelling — it is a nominal std type, so it
+follows VL's type-name convention (`Buf`, `F32View`), leaving `vec4`/`float4` free rather than
+colliding with them. A `vec4f` alias MAY be added later purely for WGSL familiarity; it would be a
+spelling, not a second type — `F32x4` stays canonical.
 
-**O3 — The compile-time lane index and static shuffle.** WASM requires an immediate for
-`extract_lane`/`replace_lane`/`shuffle`. Options: (a) require a literal and make a non-literal a
-checker error (v1 recommendation); (b) offer a runtime `lane(v, i)` that spills to memory and indexes
-(slower, always works); (c) wait for const-generics (A10) to spell `shuffle<0,2,1,3>` and a
-statically-checked lane index. → **Recommend (a) now, (c) later** — a literal covers every kernel
-veldt has, and a spelled error beats a silent spill. This is the one place the surface should *ask*
-before it is built.
+**O3 — Compile-time literal lane index, plus named accessors.** RULED: the lane index for
+`lane`/`withLane` MUST be a compile-time literal — WASM encodes `extract_lane`/`replace_lane` as an
+instruction immediate, not a stack operand, so a runtime index is not expressible as one
+instruction, and a non-literal is a checker error naming the constraint. Named `.x`/`.y`/`.z`/`.w`
+accessors are ADDED for the common 4-lane case, so a numeric index is rarely needed at all. A
+runtime-index fallback (spill to memory, index the spill — slower, always works) is DEFERRED, not
+designed away: it answers a genuinely-dynamic-index kernel once one shows up, without holding up v1.
 
-**O4 — Operator overloading on vectors.** `a + b` for `F32x4` needs arithmetic-operator overloading on
-a std type. VL overloads `"[]"` today; `DECISIONS.md:1569` records a default "no" to ad-hoc overloading
-(B16), and A13 has an open `"+"`-as-a-struct-field question. → **Recommend sanctioning `+ - * /` for
-the closed `std:simd` type family specifically** (not opening general operator overloading), with named
-`addF32x4` functions as the fallback surface if declined. Kernels read far better as `a*b + c` than
-`addF32x4(mulF32x4(a,b), c)`.
+**O4 — Operator overloading: BROAD, under the orphan rule.** RULED, and broader than the
+recommendation: any nominal type may overload operators in its OWN declaring module, gated by the
+orphan rule (only the declaring module defines a type's operators, so two declarations for the same
+`(symbol, receiver)` pair collide and different receivers never conflict). This is not a SIMD-only
+carve-out — the owner overrode the "closed `std:simd` family specifically" recommendation — and it
+is already BUILT: the receiver-keyed operator mechanism merged as **#3003**, generalizing B14's
+existing `[]`/`[]=` receiver-keyed exception to binary arithmetic and relational operators (`+ - *
+/ % ^ > >= < <=`). Equality (`==`/`!=`) is a separate, deliberately non-overloadable case (D46,
+refused at the parser) and #3003 does not touch it — consistent with §D4's compare ops being named
+functions (`ltF32x4`, …), never `==`. So `F32x4`'s `+ - * /` ride the general mechanism, not a
+special case, and `DECISIONS.md` B14/B16 are updated to match. A13's separate question — whether a
+`"+"`-named struct FIELD is spellable — is unrelated and still open.
 
-**O5 — Load alignment default.** Unaligned (`align 0`, works at any `Buf` offset) vs aligned (`align
-4`, requires 16-aligned data, marginally faster on some engines). → **Recommend unaligned default**
-(veldt's records are not 16-aligned; wasm alignment is a hint), with an `*Aligned` variant as a later
-performance option and a possible `ALIGN`-bump in `std:buffer` for callers who want it.
+**O5 — Unaligned by default.** RULED: `align 0`, works at any `Buf` offset (veldt's records are not
+16-aligned; wasm alignment is a hint, not a constraint). A `…Aligned` variant (`align 4`) is a PURE
+performance option for later, not a correctness axis.
 
-**O6 — Relaxed SIMD.** Ship FMA/relaxed-dot behind `-mrelaxed-simd` with a strict deterministic
-fallback (recommendation), or exclude relaxed SIMD from v1 entirely? → **Recommend the gated tier** —
-FMA is the solver's biggest single win, and the gate + strict fallback means a program is correct
-either way and only opts into non-determinism deliberately. The determinism hazard is real (replay/
-netcode), so it must never be on by default.
+**O6 — Relaxed SIMD: a gated, non-default opt-in tier.** RULED: FMA/relaxed-dot ship behind
+`-mrelaxed-simd` with a strict deterministic fallback, OFF by default. Benefit: FMA (faster and more
+accurate — one rounding instead of two) and faster swizzle/dot on some ISAs; cost: results that
+differ across hardware, which is why this is deliberately the one opt-in non-deterministic surface
+in VL — see `docs/internals/numeric-determinism-rulings.md`, which already carves out exactly this
+exception against standard (non-relaxed) ops being a verified engineering commitment rather than a
+spec guarantee. Determinism-critical consumers (veldt's replay, sunsuz's WGSL cross-host parity)
+leave the flag off; a program is correct either way and only opts into non-determinism deliberately.
 
-**O7 — Is the graphics `vec3`/`vec4` math layer the same types, or a `std:vec` on top?** Swift unifies
-SIMD and vector-math; veldt wants both `dot`/`cross`/`normalize`/`.xyz` *and* the raw lane ops. →
-**Recommend a separate `std:vec`** layer (`Vec3`, `Vec4`, `Mat4`) built *on* `std:simd` (a `Vec4` is an
-`F32x4`; `.xyz` is a named shuffle; `dot` is `reduceAdd(a*b)`), so the SIMD core stays a numeric
-substrate and the graphics vocabulary is optional. This keeps the SIMD review small and the graphics
-API free to evolve.
+**O7 — Unify graphics and compute; no separate `std:vec`.** RULED, and the owner leaned AWAY from
+this document's own "separate `std:vec` layer" recommendation: the SIMD `F32x4` type family IS the
+graphics vector family. `dot`, `cross`, `normalize` and swizzle (via O3's named accessors) are
+METHODS on the vector types directly; `vec3` is represented padded to 16 bytes (the GPU convention —
+the wasted lane is standard, and it is the layout WGSL rounds a `vec3<f32>` up to). No separate
+`std:vec` layer sits on top. This matches both consumers' WGSL mental model exactly, and it is the
+place this document most needed revising — see §D5 and §E.
 
-**O8 — Where do load/store live: grow `std:buffer` with a `v128` width, or put them in `std:simd`
-(importing `Buf`)?** → **Recommend `std:simd`**, so `std:buffer` stays width-agnostic and a program
-that never touches SIMD imports none of it — mirroring how `std:simd` would import `Buf` the way a
-consumer does.
+**O8 — Load/store live in `std:simd`.** RULED: importing `Buf` from `std:buffer`, so `std:buffer`
+stays width-agnostic and a program that never touches SIMD imports none of it.
 
-**O9 — Does `v128` become a user-spellable primitive, or stay an internal substrate the newtypes
-brand?** → **Recommend internal** — users hold `F32x4`, never a bare `v128`; the untyped `v128` is the
-one thing the survey's worst corners (raw `__m128` reinterpreted freely) warn against.
+**O9 — `v128` stays an internal substrate.** RULED: users hold `F32x4`, never a bare `v128`; the
+newtypes brand it, and the untyped `v128` is exactly the thing the survey's worst corners (raw
+`__m128` reinterpreted freely) warn against.
 
-**O10 — Const-generics (A10) reservation.** A future `SIMD[T, N]` / general static `shuffle<…>` both
-depend on A10. Does the owner want to reserve that surface now (and treat `std:simd`'s fixed types as
-the concrete instantiations a later generic would unify), or rule the fixed family permanent? →
-**Recommend "fixed family is the surface; A10 is not a dependency of v1"** — the fixed types are
-useful and complete on their own, and Swift has shipped exactly this for a decade without a generic.
+**O10 — No reservation for const-generics; the fixed family is permanent.** RULED, firmly: the
+fixed named family is the PERMANENT surface, not a placeholder awaiting `SIMD[T, N]`. WASM's single
+128-bit width makes a generic `Vector<T, N>` low-value — a conclusion a compiler-architecture review
+independently confirmed — and Swift has shipped exactly this fixed-family shape for a decade with no
+generic behind it. A10/const-generics is not a v1 dependency and the fixed types are not awaiting
+it; if WASM ever gets a wider vector width, new named shapes (`F32x8`) are added beside these, not a
+rework (§E).
 
 ---
 
@@ -571,13 +629,17 @@ The smallest slices, in dependency order (the `buffer-design.md` §F discipline)
 - **S2 — load/store + splat + one arithmetic op** (`__load_v128__`, `__store_v128__`,
   `__splat_f32x4__`, `__add_f32x4__`). The `0xFD` LEB byte-writer and the first opcode-table rows.
 - **S3 — `std:simd`, the `F32x4` slice.** The newtype, `loadF32x4`/`storeF32x4`/`splatF32`/`f32x4()`,
-  `+ - * /`, `min`/`max`/`abs`/`sqrt`, lane access, compare→`Mask32x4`+`select`, `reduceAdd`. This is
-  the whole rigid-body solver's need — the first thing that lets veldt measure the 4×.
+  `+ - * /`, `min`/`max`/`abs`/`sqrt`, lane access plus the named `.x/.y/.z/.w` accessors (O3),
+  compare→`Mask32x4`+`select`, `reduceAdd`, and the geometry methods `dot`/`cross`/`normalize` as
+  ordinary methods on `F32x4` (O7 — no separate later layer). This is the whole rigid-body solver's
+  need — the first thing that lets veldt measure the 4×.
 - **S4 — the integer + narrow shapes** (`I32x4`, `I16x8`, `U8x16`, widening loads, `dot`, `swizzle`).
   This is the voxel-pass need and the `flat`-record interop (§D5).
 - **S5 — relaxed SIMD (gated).** `-mrelaxed-simd`, FMA + relaxed dot, strict fallback (O6).
-- **Later, separable:** `std:vec` (O7), a checked `v128view`, aligned loads (O5), general static
-  `shuffle` once A10 lands (O3/O10), a `@simd`-loop hint (axis 2).
+- **Later, separable:** a checked `v128view`, aligned loads (O5), a `@simd`-loop hint (axis 2). A
+  general static `shuffle<…>` stays unplanned rather than merely deferred — O10 rules the fixed
+  family permanent, so this is only revisited if WASM itself grows a wider vector width. (No
+  separate `std:vec` slice — O7 folded its methods into S3/S4 directly.)
 
 **The first slice that gives veldt something real: S0–S3** — `F32x4` load/store/arith/compare over a
 `Buf`. It is the rigid-body solver's entire surface, and it lets veldt retire the "~4x off" number
@@ -602,8 +664,12 @@ against a real kernel while S4's voxel shapes are built.
   it needs `F32x4` over the solver's real data, benchmarked against the scalar path, and it must be
   taken on the `-O3 --closed-world` profile veldt ships (the same caveat `buffer-design.md` §G raises,
   since that profile inlines the std wrappers whose per-call cost is otherwise real).
-- **Whether operator overloading (O4) is cheap in the checker.** The recommendation assumes overloading
-  a closed nominal set is a small, contained change; that is unverified against `typecheck.vl`'s
-  resolution and is a question for the implementer, not this doc.
+- ~~Whether operator overloading (O4) is cheap in the checker.~~ **Resolved, and answered
+  sharper than asked:** `docs/internals/type-bound-ufcs-design.md` (#3001) found that operators
+  already resolved through a single whole-program name slot, so two receiver types collided
+  outright (`redeclared +`) independent of ergonomics — and **#3003** shipped the fix, generalizing
+  B14's receiver-keyed exception. Cheap in the end: byte-identical on every existing program
+  (tests/cases, the distilled corpus, and the compiler's own 31 modules), additive only.
 - **The exact intrinsic count.** ~60 is an estimate over the shapes in §D; the precise list falls out
-  of the op set the owner rules in (O4/O6/O7 each move it).
+  of the op set the owner has now ruled on — O4's broadened scope and O7's added geometry
+  methods both move it up from the ~60 estimate.

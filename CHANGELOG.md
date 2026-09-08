@@ -8,6 +8,29 @@ see **`DECISIONS.md`**.
 
 ## Type system (Track A)
 
+- **SIMD design finalized — the owner ruled all ten open questions in `simd-design.md` §F, now
+  rewritten from questions into decisions.** `std:simd`: a closed family of nominal `new`-newtype
+  vector types (`F32x4`, …) over an internal `v128` substrate — a library, not a language builtin,
+  and not a placeholder for future const-generics (O1, O9, O10; a compiler-architecture review
+  independently confirmed a generic `Vector<T,N>` is low-value on WASM's single 128-bit width, and
+  Swift ships the fixed-family shape permanently). `F32x4` is the spelling, with an optional
+  `vec4f` alias possible later for WGSL familiarity (O2). The lane index for `lane`/`withLane` must
+  be a compile-time literal (WASM encodes it as an instruction immediate); named `.x/.y/.z/.w`
+  accessors are ADDED for the common 4-lane case, and a runtime-index fallback is deferred, not
+  designed away (O3). Operator overloading is sanctioned BROADLY under the orphan rule — any
+  nominal type may define operators in its own declaring module, not narrowed to the SIMD family
+  as this doc had recommended — riding the receiver-keyed mechanism already shipped in #3003, so
+  `F32x4`'s `+ - * /` are an ordinary use of a general capability (O4; `DECISIONS.md` B14/B16
+  updated to match). Loads/stores are unaligned by default (O5) and live in `std:simd` importing
+  `Buf` from `std:buffer` (O8). Relaxed SIMD ships as a gated, non-default opt-in tier with a
+  strict deterministic fallback, cross-referenced against `numeric-determinism-rulings.md`'s
+  existing carve-out (O6). And graphics and compute UNIFY, overriding this doc's "separate
+  `std:vec`" recommendation: `F32x4` IS the graphics `vec4`, `dot`/`cross`/`normalize`/swizzle are
+  methods on the vector types directly, `vec3` is padded to 16 bytes GPU-style, and there is no
+  separate vector-math layer (O7 — §D5 and §E revised to match). The design is finalized; the
+  build stays gated behind `std:math` (designed, not yet built) and the type-bound UFCS method
+  resolution SIMD's methods need (shipped: #3003, #3005). Docs only — no compiler, std or test
+  change.
 - **Numeric determinism formalized (three rulings) and the `std:math` design that sits on them
   (veldt/sunsuz/glean).** `docs/internals/numeric-determinism-rulings.md` verifies against
   `dist/vl` and rules: float→int out-of-range casts keep the exact-or-fail trio, and saturation
