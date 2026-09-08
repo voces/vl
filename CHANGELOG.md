@@ -22,6 +22,22 @@ see **`DECISIONS.md`**.
   slice 1 = `hypot`/`atan2`/`PI` gradable against sunsuz's existing cross-host parity harness
   (`~/sunsuz/tools/headless/coast.mjs`). Docs only — no compiler, std or test change; the build
   goes through `std-api-reviewer` per `CLAUDE.md`'s standing rule.
+- **Eight-lens adversarial design review, synthesized and filed.** Eight independent
+  persona-driven reviews (Rust/memory-safety, Swift/ergonomics, C#/evolvability,
+  Lua/minimalism, game-programmer/determinism, compiler-architect, numerics/ML,
+  functional/type-theory) were run against VL's memory model, SIMD proposal, numeric model
+  and type system. `docs/internals/design-review-2026-09.md` is the cross-panel synthesis —
+  a convergence ranking (findings multiple lenses hit independently), a split between real
+  defects and tradeoffs VL already chose on purpose, and two strategic items (whole-program
+  monomorphization's scaling bet; the rep-descriptor campaign as a symptom of the
+  structural/nominal rep tension) flagged for a future design session rather than a ticket.
+  The eight full critiques are kept under `docs/internals/design-review-2026-09/`. One
+  finding (an inferred-return function's totality check skipping the checker's own
+  non-exhaustive-`is`-chain rule) was a fresh, live-reproduced soundness bug, fixed the same
+  day (`docs/internals/inventory/D1950.md`, #3000). Four still-open findings filed as ROADMAP rows 35–38: `Buf`'s missing
+  newtype brand, a request to reconsider O5's no-epoch-export ruling, a stale worked example
+  plus wording gap in `docs/guide/soundness.md`, and a "did you mean" gap for undeclared
+  identifiers/import specifiers.
 - **Three doc bugs surfaced by the veldt voxel-engine consumer, one a latent bounds-narrowing soundness landmine.** `for … to` is INCLUSIVE at both ends, so `for i in 0 to a.length { a[i] }` reads `a[a.length]` on its last iteration and TRAPS. `collections-design.md` taught exactly that as the canonical loop AND, worse, its §VL.6 listed `for i in 0 to a.length` among the cases a future bounds-narrowing pass could prove in-range and drop the check — which under inclusive `to` is false, so an optimizer keyed on that pattern would have MISCOMPILED to a silent out-of-bounds read (bounds-narrowing is not yet built; the fix moves the canonical pattern to `to a.length - 1` and adds explicit inclusive-`to` reasoning so the future implementer keys on `< length` / `to length - 1`). Also: `webcraft-requirements.md`'s shipped-API block showed `buf.storeU8`, which does not exist — `std:buffer` stores have no signedness (`store8`, buffer-design.md O2), fixed to `buf.store8`; and `operators.md` now states that a float-to-integer `as!` needs an EXACT integer and traps on a fraction (`2.5 as! i32` traps `not exact`, `2.0 as! i32` is `2`), with the `trunc(x) as! i32` idiom. Docs only — no compiler, std or test change.
 
 - **The `match`-over-kind-ladders campaign closes: a final byte-identical batch converts the last cleanly-convertible single-subject litunion dispatches, and the residue is named (ROADMAP row 24).** `pushKindBit` (`PushKind`), `repTreeVKind` and `rtListVKind` (`RtKind`) become all-return `_`-less matches naming every member, the unlisted kinds taking the original fall-through value; `kind-ladder-incomplete` **380 → 377**, corpus (2,642 modules, 0 DIFFER / 0 LOST) and the compiler's own modules `cmp`-equal under both seeds. The 376 standing ladders are classified in `docs/internals/kind-ladder-lint.md` §residue — arena walkers (`Node` 213 + `Ty` 110), deferred-large (`VKind` 25 + `TokKind` 5), `string`-typed scrutinees (which need a litunion-returning producer first), `&&`-guarded and multi-subject chains, and the `RtKind` `unsup`-shares-default pair — none a clean byte-identical conversion.
