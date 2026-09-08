@@ -809,11 +809,11 @@ let ufcsWhyData: string[] = []
 // nothing in the body and leaves the parameter's rep to whatever the call's argument supplied.
 // Solving the hole to what its usage demands makes it match the annotated spelling exactly.
 let solvedParamTys: {[string]: i32} = Map()
-// D1412 — the pin a hole took at the call that resolved it, keyed by the hole's own name: the
-// un-softened arena type the emitter's literal complement cannot re-derive, since the union
-// registry renders `i32 | "err"` as `i32|string`. `-2` marks a hole two calls pinned
-// differently — one wasm function serves both, so the reader must decline to narrow.
-let holePinTys: {[string]: i32} = Map()
+// D1412 — the distinct pins a hole took (first-seen order), keyed by the hole's own name: the
+// un-softened arena types the emitter's literal complement cannot re-derive. A SET so a
+// per-instance mint can read each pin; `holePinCollapsedOf` derives the one-answer view every
+// reader had before — `-2` when two calls pinned it differently, one body serving both.
+let holePinSet: {[string]: i32[]} = Map()
 // The declaring function of each `TyVar` row. A pin is keyed on it, so two generics that both
 // call their variable `T` cannot poison each other's row.
 let tyVarOwner: {[i32]: string} = Map()
@@ -3670,7 +3670,7 @@ export function initChecker() {
   ufcsWhyMsg = []
   ufcsWhyData = []
   solvedParamTys = Map()
-  holePinTys = Map()
+  holePinSet = Map()
   tyVarOwner = Map()
   argPinWant = []
   argPinGot = []
@@ -20362,26 +20362,34 @@ function argPinRecheck(name: string, ty: i32) {
   0
 }
 
-// Banks the pin `ty` that `owner`'s hole named `name` took. First pin wins; a disagreeing
-// second pin poisons the row to `-2`, which `pinnedHoleTyOf` reads as "no answer" — one body
-// serves every call, so a rep read off one call's pin would miscompile at the other.
-// Never banked from a quiet probe: `solveUnannotParams` truncates its tables afterward.
+// Banks the pin `ty` that `owner`'s hole named `name` took, appending it to the hole's set
+// unless a `tySame` pin is already there. Never banked from a quiet probe: `solveUnannotParams`
+// truncates its tables afterward. The collapse (`-2` for two disagreeing) is derived on read.
 function notePinnedHole(name: string, ty: i32, owner: string) {
   if inferQuiet { return 0 }
   if ty < 0 { return 0 }
   argPinRecheck(name, ty)
   const key = holePinKey(owner, name)
-  const cur = holePinTys[key] ?? -1
-  if cur == -1 {
-    holePinTys[key] = ty
-    return 0
+  const s = holePinSet[key] ?? []
+  let i = 0
+  while i < s.length {
+    if s[i] == ty { return 0 }
+    if tySame(s[i], ty) { return 0 }
+    i = i + 1
   }
-  if cur == ty { return 0 }
-  if cur >= 0 {
-    if tySame(cur, ty) { return 0 }
-  }
-  holePinTys[key] = -2
+  s.push(ty)
+  holePinSet[key] = s
   0
+}
+
+// The one-pin view of a hole's set: -1 when unpinned, the sole pin when every note agreed
+// (`tySame` to the first), -2 when two disagreed — the scalar answer readers had before the
+// set. `notePinnedHole` keeps the set distinct by `tySame`, so a length of two is a real clash.
+function holePinCollapsedOf(key: string): i32 {
+  const s = holePinSet[key] ?? []
+  if s.length == 0 { return -1 }
+  if s.length == 1 { return s[0] }
+  0 - 2
 }
 
 // The pin behind arena type `tyIx` when it is a HOLE, or -1 for anything else — a
@@ -20391,7 +20399,7 @@ export function pinnedHoleTyOf(tyIx: i32): i32 {
   if tyIx < 0 { return -1 }
   const t = T.tys[tyIx]
   if !(t is TyVar) { return -1 }
-  holePinTys[holePinKey(tyVarOwnerOf(tyIx), t.tvName)] ?? -1
+  holePinCollapsedOf(holePinKey(tyVarOwnerOf(tyIx), t.tvName))
 }
 
 // A function type with each hole in its signature at that hole's pin, minted once per row. The
