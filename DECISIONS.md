@@ -1603,20 +1603,29 @@ it worked.
   single-signature closure value (monomorphic, pinned by use). (B15)
 - **Only `!`, not `not`.** Logical operators are symbolic (`&&`/`||`/`!=`); the
   lone word operator was dropped. (B10)
-- **One binding per name per scope** (no ad-hoc overloading for now); nested
-  shadowing is allowed. (B16)
+- **One binding per name per scope** (no ad-hoc overloading for ordinary named
+  functions); nested shadowing is allowed. Operators are the standing exception,
+  and it widened — see (B14). (B16)
 - **Operator / call / index dispatch via well-known methods**, resolved
   statically (no runtime `Proxy`): `"+"`, `"()"`, `"[]"`/`"[]="` are typed
   methods in a shape's contract. (B13)
-- **Index operators are FREE functions dispatched by receiver type, and are the
-  one place ad-hoc overloading is allowed.** `function "[]"(self: T, i: I)` beats
-  a closure FIELD because it is a direct call rather than an indirect one through
-  a per-value allocation. Several may share an operator — one per receiver — which
-  the general no-overloading rule above forbids for named functions; the exception
-  is bounded by there being no name to overload (a bracket names nothing, so the
-  receiver type is the only possible key) and it is what lets two nominal newtypes
-  over one structure carry different operators. The `self` annotation is required:
-  it IS the dispatch key. (B14)
+- **Operators are FREE functions dispatched by receiver TYPE, and are the one
+  place ad-hoc overloading is allowed — originally just `[]`/`[]=`, now every
+  arithmetic/relational operator too.** `function "[]"(self: T, i: I)` /
+  `function "+"(self: T, other: T)` beat a closure FIELD because each is a
+  direct call rather than an indirect one through a per-value allocation.
+  Several declarations may share an operator symbol — one per receiver type —
+  which the general no-overloading rule above forbids for named functions; the
+  exception is bounded by there being no single name to overload globally (the
+  receiver type is the dispatch key) and it is what lets two nominal newtypes
+  over one structure carry different operators. The `self` annotation is
+  required: it IS the dispatch key. **#3003** generalized this from the index
+  operators alone to binary arithmetic and relational operators (`+ - * / % ^
+  > >= < <=`), keyed `(symbol, receiver)`: a type may define its own `+` in its
+  OWN declaring module, and the orphan rule (only the declaring module defines
+  a type's operators) is what keeps two declarations for different receivers
+  from colliding. Equality (`==`/`!=`) is unaffected — it stays non-overloadable,
+  refused at the parser (D46). (B14)
 - **Size members follow the uniform-access principle.** `length` is a contract
   member via property syntax, dispatched to a native lowering (not a structural
   field — that broke index-sig subtyping). Property syntax (no parens) is
