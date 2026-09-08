@@ -25,12 +25,45 @@ export type VlHostImports = {
  * playground renders it into the DOM). `__print_char__` streams a string's UTF-8
  * bytes into a per-call buffer that `__print_str_flush__` decodes as one line.
  *
+ * `declared` TREE-SHAKES the `imports` namespace: pass the `imports`-module names a
+ * module actually declares (`WebAssembly.Module.imports(m)`) and only those sinks
+ * are built, so a print-free program instantiates against an EMPTY `imports`
+ * object rather than seven stubs it never calls — the zero-glue browser host
+ * veldt asked for (surprise #4). Omit it to build all seven (the default; extra
+ * imports a module does not declare are harmless).
+ *
  * NO COLOR HERE, DELIBERATELY (Stage C0's twin; see the native host's `Palette`).
  * Neither JS host has a terminal to ask about, and plain output is what makes the
  * two hosts' `logs` comparable — several suites depend on that.
  */
-export const vlHostImports = (logs: string[]): VlHostImports => {
+export const vlHostImports = (
+  logs: string[],
+  declared?: Iterable<string>,
+): VlHostImports => {
   const printChars: number[] = [];
+  // Every `print` sink this host knows how to provide. `declared` selects a subset.
+  const allPrintSinks: WebAssembly.ModuleImports = {
+    // Direct value sinks for `print(x)`. A wasm i64 arrives as a JS bigint; the
+    // rest as numbers. Booleans render as `true`/`false`.
+    __print_i32__: (v: number) => logs.push(String(v)),
+    __print_i64__: (v: bigint) => logs.push(v.toString()),
+    __print_f32__: (v: number) => logs.push(String(v)),
+    __print_f64__: (v: number) => logs.push(String(v)),
+    __print_bool__: (v: number) => logs.push(v ? "true" : "false"),
+    // A string prints by streaming its UTF-8 bytes; flush decodes the line.
+    __print_char__: (code: number) => printChars.push(code),
+    __print_str_flush__: () => {
+      logs.push(new TextDecoder().decode(new Uint8Array(printChars)));
+      printChars.length = 0;
+    },
+  };
+  const imports = declared === undefined
+    ? allPrintSinks
+    : Object.fromEntries(
+      [...declared]
+        .filter((name) => name in allPrintSinks)
+        .map((name) => [name, allPrintSinks[name]]),
+    );
   return {
     // The USER externs (`extern function`), under their own module name — scalars
     // only, the same registry the native host provides so a program that runs
@@ -40,20 +73,6 @@ export const vlHostImports = (logs: string[]): VlHostImports => {
       // `nowMillis(): i64` — a wasm i64 result must be handed back as a JS bigint.
       nowMillis: () => BigInt(Date.now()),
     },
-    imports: {
-      // Direct value sinks for `print(x)`. A wasm i64 arrives as a JS bigint; the
-      // rest as numbers. Booleans render as `true`/`false`.
-      __print_i32__: (v: number) => logs.push(String(v)),
-      __print_i64__: (v: bigint) => logs.push(v.toString()),
-      __print_f32__: (v: number) => logs.push(String(v)),
-      __print_f64__: (v: number) => logs.push(String(v)),
-      __print_bool__: (v: number) => logs.push(v ? "true" : "false"),
-      // A string prints by streaming its UTF-8 bytes; flush decodes the line.
-      __print_char__: (code: number) => printChars.push(code),
-      __print_str_flush__: () => {
-        logs.push(new TextDecoder().decode(new Uint8Array(printChars)));
-        printChars.length = 0;
-      },
-    },
+    imports,
   };
 };

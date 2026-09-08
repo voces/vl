@@ -57,6 +57,7 @@ import {
   unMemTyStart,
   unMemTys,
   unNames,
+  unTyIx,
   vbF32Idx,
   vbF32Used,
   vbF64Idx,
@@ -2778,6 +2779,22 @@ function repOfNullable(inner: i32): RepDesc {
   repUncovered()
 }
 
+// The union registry row whose arena type shares `ty`'s interned canon id, or -1. The
+// id is what both producers can compute: the collect pass registers under the DECLARED
+// spelling, and an arena-side reader has no spelling to offer.
+function unRowOfCanonId(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  const c = repCanonId(ty)
+  let u = 0
+  while u < unTyIx.length {
+    if unTyIx[u] >= 0 {
+      if repCanonId(unTyIx[u]) == c { return u }
+    }
+    u = u + 1
+  }
+  -1
+}
+
 // An array's rep is decided by its ELEMENT variant — one wrapper level, never
 // the element's own descriptor (which is what keeps this arm cycle-free).
 function repOfArray(elem: i32): RepDesc {
@@ -2828,6 +2845,13 @@ function repOfArray(elem: i32): RepDesc {
     // a bare inline union to `string`, but at the element position the two spellings are
     // one type, exactly as `repOfNullable`'s list arm already treats it — ungated here too.
     if tyIsLitUnion(elem) { return repMk("list", 0, "i32") }
+    // A value-union BOX element the registry holds a row for — a reference, so a ref list.
+    // `tyIsValueUnionBox` is the shape gate (a numeric litunion has a canon row too but reps
+    // as its scalar list); the row is keyed on the interned canon id, never the spelling,
+    // which names a declared alias where the arena renders structurally.
+    if tyIsValueUnionBox(elem) {
+      if unRowOfCanonId(elem) >= 0 { return repMk("reflist", 0, "union") }
+    }
     return repUncovered()
   }
   // A nullable element and a non-literal union element — legacy owns those two.
@@ -3606,7 +3630,11 @@ function rtListVKind(elem: i32): VKind | null {
       }
       return null
     }
+    // A value-union BOX element the registry holds a row for — the box is a reference, so
+    // the list is a ref list. Gated on the node's arena provenance, the same canon-id
+    // question the flat arm asks, so a box with no row declines on both sides.
     "box" => {
+      if unRowOfCanonId(rtTy[elem]) >= 0 { return "reflist" }
       return null
     }
   }
@@ -3680,6 +3708,7 @@ function repTreeListElemName(ix: i32): string {
   if ek == "map" { return "map" }
   if ek == "list" { return "list" }
   if ek == "nul" { return "struct" }
+  if ek == "box" { return "union" }
   // The nullable-list flat arm treats a policy-pending litunion element as
   // atom-backed (see `rtNulVKind`) — its element vocabulary is "i32".
   if ek == "unsup" {

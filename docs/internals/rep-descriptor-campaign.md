@@ -1634,19 +1634,53 @@ or literal-union element is not a ref list at all, so it is not a coverage gap f
 it is a different kind's question, and answering it here would be the same over-claim in a
 narrower costume.
 
-### 9.7 What is left in the column
+### 9.7 The VALUE-UNION-BOX element — an arena-keyed arm, and the census that took three producers to state
 
-**7,739 `reflist` queries over ~130 modules**: the NULLABLE element (4,273 / 42), the
-VALUE-UNION-BOX element (3,167 / 82), other union (133 / 6) and one module with no recorded
-type (166). The nullable element was the next landing and is **refused** — §9.6 records the candidate and
-its price. `rtListVKind` DID need a `nul` arm, measured rather than predicted: with the flat arm
-alone the audit reads `DISAGREE kind flat=reflist tree=list/`, and `repOfTy` returns the right
-answer only because it falls back to flat when the tree declines, so the two producers drift
-while every scoreboard stays clean.
+A `(A | B)[]` whose element is a value-union box is a ref list — the box is a reference. The
+ladder already answers it (`refArrElemKind`'s kind-2 arm), so this is a coverage arm, and it
+is byte-identical: **`reflist` LEFT-ONLY falls 5,940 → 3,350 in `tests/cases` and 812 → 235 in
+the corpus — −2,590 and −577, each exactly its census — CONTRADICT 0**, over emitting
+populations of 2,633 / 3,225 and 4,655 / 7,589.
 
-**No rung is deletable yet**: deletion needs the column empty for the kind, and two reasons
-remain. The two landings so far have moved 104,792 of the 112,531 queries the column held for
-`reflist` (93%), and every one of them arrived in AGREE.
+**The census had to be corrected twice, and that is the worked instance of "ask the arm's
+question of the arm's producer".** The value-union-box reason is 3,167 events. Measured three
+ways:
+
+| what the census asked | "registered" | verdict |
+| --- | --- | --- |
+| arena render `tyToEmitName` → `unNames` | 1,568 | wrong producer — disagrees with `unNames` for every alias (`type V = i32\|string` renders `i32\|string`, the registry holds `V`) |
+| spelling cut `arrElemNameRaw` → `unNames` | 1,698 | the LADDER's own question, but not the descriptor's |
+| **arena canon row `unRowOfCanon`** | **3,167** | the question an arena-side arm can actually ask |
+
+The arena canon-id lookup is a strict superset — zero `spelling-only`, zero `neither`, in both
+populations — because the collect pass registers a union under the DECLARED spelling while an
+arena-side reader has no spelling to offer, and only the interned canon id is common to both.
+So the arm keys on `unRowOfCanonId(elem) >= 0`, the id-keyed row lookup, never the name.
+
+**The gate needs the SHAPE check too, and byte identity is what caught its absence.** Keyed on
+the row alone, the arm answered `reflist` for a numeric literal union (`type Z = 0 | 1`), which
+also has a canon row but reps as its base scalar list — 15 `tests/cases` and 12 corpus modules
+went byte-different with IDENTICAL output, a latent miscompile no `regress.py` would veto. The
+row existing is necessary, not sufficient — the same lesson §9.6 filed one landing earlier —
+so the arm gates on `tyIsValueUnionBox(elem)` first, the census's own predicate. With that gate
+the DISAGREE audit reads 0 on both a numeric-litunion module and a value-union-box one, and
+both populations are byte-identical.
+
+The tree arm needs no shape gate: only a real box is a `"box"` rep-tree node, so the flat and
+tree producers ask the same canon-id question of the same shape and cannot drift.
+
+### 9.8 What is left in the column
+
+The `reflist` column now holds only what genuinely is not a ref list: the NULLABLE
+non-struct element (a `(string|null)[]` rides the string list, a `(boolean|null)[]`/litunion
+the i32 list — §9.6), other union (133 / 6) and one no-recorded-type module (166). The
+value-union-box element closed in §9.7; the nullable-STRUCT slice closed in §9.6; the nullable
+non-struct slice is a DIFFERENT kind's question, not a `reflist` gap.
+
+**No rung is deletable yet**: deletion needs the column empty for the kind, and the
+non-ref-list residue keeps it non-empty. Every landing that has moved a query moved it into
+AGREE, and each was byte-identical over its emitting population — the map, nested-array,
+nullable-struct and value-union-box arms.
 
 ---
 
