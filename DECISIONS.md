@@ -5958,3 +5958,47 @@ What would be a win is `br_on_cast_fail`, which tests and binds in one instructi
 second check — **74 bytes** on the same function, and available only where the arms are all
 distinct. That is filed as D1895, with the arms-alias analysis named as the work a close owes
 before it owes a lowering.
+
+## Float→int out-of-range casts keep the trio; saturation is a std helper, not a fifth operator (owner, 2026-09-07)
+
+Confirmed unchanged against `dist/vl`: `2.5 as! i32` traps (`as! i32 at 1:15: not exact`),
+`2.5 as? i32` is `null` — the exact-or-fail trio (`Numeric `as` to an INTEGER target is
+exact-or-fail under the trio`, above) already covers this correctly. **Ruling: saturation
+(clamp-to-range) does not get a fifth `as` spelling.** The operator surface stays at four
+(`as`, `as?`, `as!`, `as%`), each one meaning; a "clamp" policy is ordinary code, not a failure
+mode the cast grammar needs to spell, and will live in `std:math` alongside the transcendentals
+(`docs/internals/std-math-design.md`) rather than in `std:num`, which does not exist. `as%`
+stays integer-width-only, confirmed live: a float operand is refused naming the exact family.
+Full verification and rationale: `docs/internals/numeric-determinism-rulings.md` §2.
+
+## Integer overflow wraps by default; `MIN / -1` still traps (owner, 2026-09-07)
+
+`+`/`-`/`*` on `i32`/`i64` wrap on overflow — confirmed live (`INT32_MAX + 1` is `INT32_MIN`,
+`INT64_MAX + 1` is `INT64_MIN`, `INT32_MAX * 2` is `-2`) — matching the wasm instructions VL
+emits directly (no trapping form exists) and systems-language convention (Rust release mode, C
+unsigned overflow). **The behavior does not change; it was undocumented while the cast
+operators right beside it are documented as loud, and that is fixed in `docs/guide/operators.md`
+this same PR.** `/` and `%` are not part of this rule: they already trap on a zero divisor, and
+— verified, and previously undocumented — on `i32.MIN / -1` / `i64.MIN / -1`, the one input pair
+whose quotient does not fit back in the source width (`i32.div_s`/`i64.div_s` have no wrapping
+form). Checked/saturating arithmetic helpers for callers who need to detect or clamp an overflow
+are a `std:math` build item, not a change to the default. Full verification:
+`docs/internals/numeric-determinism-rulings.md` §3.
+
+## Standard-op NaN determinism is a MEASURED engineering commitment, not a spec guarantee — relaxed SIMD is the one opt-in exception (owner, 2026-09-07)
+
+**Determinism — the same `.wasm` produces the same bits on every host — is a first-class VL
+guarantee for all standard numeric operations.** `docs/internals/simd-design.md` §A4 and
+`docs/serde-design.md` OQ-3 previously read as disagreeing about whether that extends to a
+computed NaN's bit pattern: §A4's framing treated only relaxed SIMD as non-deterministic; OQ-3
+correctly notes the wasm SPEC also permits an implementation-defined NaN payload for a freshly-
+produced NaN from a standard (non-relaxed) op, then measures — on wasmtime and V8, VL's two
+target engines — that they agree today (re-confirmed on `dist/vl`, 2026-09-07:
+`f64bits(0.0/0.0)` and `f64bits(0.0 - (0.0/0.0))` both print `-2251799813685248`). **Ruled: VL's
+guarantee for standard ops is this measurement, re-verified as the host matrix grows — not a
+claim that the wasm spec mandates it.** Relaxed SIMD is not a bigger dose of the same hazard: it
+changes actual finite results by hardware (FMA rounding), with no observed convergence the way
+NaN bit patterns have, which is why it alone stays a separately-gated, opt-in tier
+(`simd-design.md` §A4/§D/§O6) rather than something treated as deterministic-in-practice.
+`simd-design.md` §A4 and `serde-design.md` OQ-3 both carry a reconciling note pointing here; full
+rationale and the measurement table: `docs/internals/numeric-determinism-rulings.md` §4.

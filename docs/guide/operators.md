@@ -17,9 +17,9 @@ right-associative. `as` / `as?` / `as!` / `as%` bind tighter than every binary o
 
 | operator | operands | result | notes |
 | --- | --- | --- | --- |
-| `+` | two numbers | the wider of the two | also `string + string` (concat) and `T[] + T[]` (a fresh list) |
-| `-` `*` | two numbers | the wider of the two | |
-| `/` | two integers | that integer type | TRUNCATES toward zero: `-7 / 2` is `-3`, not `-4` |
+| `+` | two numbers | the wider of the two | also `string + string` (concat) and `T[] + T[]` (a fresh list); **integer overflow WRAPS silently, see below** |
+| `-` `*` | two numbers | the wider of the two | **integer overflow WRAPS silently, see below** |
+| `/` | two integers | that integer type | TRUNCATES toward zero: `-7 / 2` is `-3`, not `-4`; traps on a zero divisor **or on `i32.MIN / -1` / `i64.MIN / -1`, see below** |
 | `/` | with a float operand | the float type | ordinary IEEE division; `1.0 / 0.0` is `Infinity` |
 | `%` | two numbers | the wider of the two | the TRUNCATED remainder — see below |
 | unary `-` | a number | the same type | |
@@ -27,6 +27,44 @@ right-associative. `as` / `as?` / `as!` / `as%` bind tighter than every binary o
 A mixed pair widens the narrower operand: `i32 op i64` is `i64`, anything with an `f64` is
 `f64`, `f32 op f64` is `f64`. There is no implicit narrowing anywhere; `x as! i32` is how you
 go the other way, and it is exact-or-fail (see `as`, below).
+
+### Integer overflow wraps silently — this is the WASM default, not a VL choice
+
+`+`, `-` and `*` on `i32` or `i64` **wrap on overflow**: the result is the low 32 (or 64) bits
+of the true two's-complement sum, exactly what `i32.add`/`i32.sub`/`i32.mul` (and the `i64`
+twins) compute — there is no trapping form of these instructions to opt into. This matches
+Rust's release-mode arithmetic and C's unsigned-overflow behavior, and it is the default in
+every numeric-adjacent language VL has looked to. Verified:
+
+```vl
+function addI32(a: i32, b: i32): i32 { return a + b }
+print(addI32(2147483647, 1))    // -2147483648  — INT32_MAX + 1 wraps to INT32_MIN
+print(addI32(-2147483648, -1))  // 2147483647   — wraps the other way
+
+const a: i64 = 9223372036854775807
+print(a + 1)                    // -9223372036854775808 — i64 wraps the same way
+```
+
+Nothing here checks for it: `2147483647 + 1` does not trap, does not become `i64`, and does
+not warn — the literal typing rule that infers `i64` for an out-of-range decimal literal
+(DECISIONS.md §"Numeric `as` to an INTEGER target is exact-or-fail under the trio") only
+applies to a bare literal, not to two `i32`-typed values computed at runtime. **If a program
+needs to detect or clamp an overflow, write that check explicitly** — a checked or saturating
+add is not a different operator, it is ordinary code (or, for the common cases, a future
+`std:math` helper — `docs/internals/numeric-determinism-rulings.md` §3).
+
+**`/` and `%` are not part of this rule — they trap instead of wrapping**, on a zero divisor
+(as already documented above) and on the one input pair whose mathematical quotient does not
+fit back in the source width, `i32.MIN / -1` and `i64.MIN / -1`:
+
+```vl
+function divI32(a: i32, b: i32): i32 { return a / b }
+divI32(-2147483648, -1)   // wasm trap: integer overflow — 2147483648 does not fit in i32
+```
+
+This is `i32.div_s`/`i64.div_s`'s own trap; wasm has no wrapping division instruction, so a
+divide that would overflow fails loudly the same way a divide by zero does, rather than
+silently producing the wrong (wrapped) quotient.
 
 ### `%` is the truncated remainder — the same one Rust, JavaScript and C compute
 
