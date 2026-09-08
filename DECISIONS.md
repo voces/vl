@@ -5362,6 +5362,21 @@ Three decisions inside that are worth keeping:
 (`compiler/cli.vl`, unchanged): the payload is an editor's answer, and the fix is an edit no
 batch reporter performs. Adding it would store a field nothing reads.
 
+**PARTLY SUPERSEDED 2026-09-07 — type-bound UFCS (design #3001, `docs/internals/type-bound-ufcs-design.md`).**
+The type-directed fallback declined above was RECONSIDERED and adopted, but only where it is
+unambiguous by construction: `x.f(…)` on a value whose type is NAMED resolves `f` in that
+type's OWN declaring module before refusing, so `buf.storeI32(…)` on a `Buf` from `std:buffer`
+now works with no import. Coherence is the orphan rule — only the type's declaring module is
+consulted (never a third module that merely imported the type to write `f(self: T)`), so there
+is exactly one place to look and no second answer to disagree with; the objection above
+(a name from an un-imported module becoming callable) does not arise, because the module is the
+one the value's type already came from. The reach is EXPORTS only — a foreign call sees a
+module's public surface, never an un-exported method (the D1191 boundary, held cross-module).
+So the "import it" suggestion (D1230) is superseded for the home-module case and stands for its
+remainder: an orphan method, a non-nominal receiver (string), and an absent name. The explicit
+rule is unchanged for writing an ANNOTATION or CONSTRUCTING a value — this is only about calling
+a method on a value already in hand.
+
 ## String building is a LOWERING, not a spelling the user has to know (owner direction, 2026-09-03)
 
 The owner's direction is "optimize string building at the compiler level, without the user

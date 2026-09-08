@@ -93,9 +93,11 @@ import {
   tsMentionsAnyName,
   ufcsAliasAtSite,
   ufcsAliasInScope,
+  ufcsExportedScopeIn,
   ufcsImpMangled,
   ufcsImpName,
   ufcsImpSpec,
+  ufcsSiteAdd,
   ufcsSpecAlreadyImported,
 } from "./ast"
 // The free index-operator declaration-name encoding (B14).
@@ -22398,12 +22400,69 @@ function anyParamMentionsTyParam(params: i32[], names: string[]): boolean {
   false
 }
 
+// The module index in a `name$m<N>` merge-rename suffix, or -1 when `nm` carries none — an
+// unmerged single-file program's names are unmangled. Reads the FIRST `$m<digits>` run: the
+// head type's own module, ahead of any generic-application argument suffixes.
+function modIxOfMangled(nm: string): i32 {
+  let i = 0
+  while i + 2 < nm.length {
+    if (
+      nm[i] == '$' &&
+      nm[i + 1] == 'm' &&
+      nm[i + 2] >= '0' &&
+      nm[i + 2] <= '9'
+    ) {
+      let v = 0
+      let j = i + 2
+      while j < nm.length && nm[j] >= '0' && nm[j] <= '9' {
+        v = v * 10 + (nm[j] - '0')
+        j = j + 1
+      }
+      return v
+    }
+    i = i + 1
+  }
+  -1
+}
+
+// The module that declared the named type at arena index `recvTy`, from the `$m<N>` suffix
+// its recovered name carries (§C, docs/internals/type-bound-ufcs-design.md). -1 when the type
+// carries no declared name or the program never merged — both mean "no foreign scope to ask",
+// so the type-bound rung is skipped and the ordinary refusal stands.
+function homeModuleOf(recvTy: i32): i32 {
+  if recvTy < 0 { return -1 }
+  let nm = nomNameOfTy(recvTy)
+  if nm == "" { nm = structNameOfTy(recvTy) }
+  if nm == "" { nm = unionAliasDeclNameOfTy(recvTy) }
+  if nm == "" { nm = genAppNameOfTy(recvTy) }
+  if nm == "" { return -1 }
+  modIxOfMangled(nm)
+}
+
 function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
   // Maps the callee's plain source name to its merge-mangled function, after field precedence
   // has already been checked — resolved at this call's own site (D1120), since two merged
   // modules may each export the same-named `self`-function.
-  const name = ufcsAliasAtSite(ix, plainName)
-  const fnTy = lookup(name)
+  let name = ufcsAliasAtSite(ix, plainName)
+  let fnTy = lookup(name)
+  if fnTy < 0 {
+    // Type-bound fallback (§C): the caller's own scope bound nothing, so ask the RECEIVER
+    // type's declaring module for the method before refusing. Fallback-only — it runs only on
+    // this miss, so no call that resolves today can rebind (§F); banked on the site so the
+    // emitter's `ufcsAliasAtSite` names the same function the checker chose.
+    const hm = homeModuleOf(recvTy)
+    if hm >= 0 {
+      const tbName = ufcsExportedScopeIn(hm, plainName)
+      if tbName != "" {
+        const tbFn = lookup(tbName)
+        if tbFn >= 0 {
+          name = tbName
+          fnTy = tbFn
+          ufcsSiteAdd(ix, tbName)
+        }
+      }
+    }
+  }
   if fnTy < 0 { return -1 }
   const preFt = T.tys[fnTy]
   if preFt is TyFunc {

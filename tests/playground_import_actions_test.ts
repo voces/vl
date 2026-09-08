@@ -15,7 +15,7 @@
 // std-resolving reader wrapper the browser uses (`wasmCheckerBrowser.ts`'s
 // `wrapReader`), because a UFCS import fix needs `import "std:test"` to resolve.
 
-import { codeActions, completion, diagnostics, initLsp, organizeImports } from "../playground/src/lspAdapter.ts";
+import { codeActions, completion, diagnostics, initLsp, organizeImports, setWorkspace } from "../playground/src/lspAdapter.ts";
 import { createWasmChecker, type Exports, type WasmChecker } from "../lsp/src/wasmChecker.ts";
 import { wrapStdReader } from "../lsp/src/editorText.ts";
 
@@ -81,23 +81,34 @@ Deno.test({ name: "auto-import: a name already in scope is NOT re-offered as an 
 
 Deno.test({ name: "ufcs-fix: a missing UFCS import offers the module the checker named", ignore }, async () => {
   init();
-  // `toEqual` is a free `self`-function in std:test; `expect` is imported, `toEqual` is not.
-  const src = 'import { expect } from "std:test"\n\nexpect(1 + 2).toEqual(3)\n';
-  const diags = await diagnostics(src, "main.vl");
-  const ufcs = diags.find((d) => d.code === "ufcs-not-imported");
-  assert(ufcs !== undefined, `the ufcs-not-imported diagnostic, got ${JSON.stringify(diags.map((d) => d.code))}`);
-  const fixes = await codeActions(
-    src,
-    { start: { line: 2, character: 14 }, end: { line: 2, character: 21 } },
-    [],
-    "main.vl",
-  );
-  const fix = fixes.find((f) => f.title === 'Import `toEqual` from "std:test"');
-  assert(fix !== undefined, `the import fix, got ${JSON.stringify(fixes.map((f) => f.title))}`);
-  assert(
-    fix!.edits[0].newText === 'import { expect, toEqual } from "std:test"',
-    `extends the existing import, got ${JSON.stringify(fix!.edits[0].newText)}`,
-  );
+  // `area` is an ORPHAN self-function: `Box`'s home ("./shapes") does not export it, so a
+  // type-bound `.area()` does not resolve and the import is still needed (D1230's domain).
+  // An object receiver gives the diagnostic a member-exact range for the range-based fix.
+  setWorkspace(() => ({
+    "shapes.vl": "export type Box = { v: i32 }\nexport function box(v: i32): Box { return { v: v } }\n",
+    "ext.vl":
+      'import { Box } from "./shapes"\nexport function area(self: Box): i32 { return self.v * self.v }\nexport function extMark(): i32 { return 0 }\n',
+  }));
+  try {
+    const src = 'import { box } from "./shapes"\nimport { extMark } from "./ext"\n\nprint(extMark())\nprint(box(5).area())\n';
+    const diags = await diagnostics(src, "main.vl");
+    const ufcs = diags.find((d) => d.code === "ufcs-not-imported");
+    assert(ufcs !== undefined, `the ufcs-not-imported diagnostic, got ${JSON.stringify(diags.map((d) => d.code))}`);
+    const fixes = await codeActions(
+      src,
+      { start: { line: 4, character: 13 }, end: { line: 4, character: 17 } },
+      [],
+      "main.vl",
+    );
+    const fix = fixes.find((f) => f.title === 'Import `area` from "./ext"');
+    assert(fix !== undefined, `the import fix, got ${JSON.stringify(fixes.map((f) => f.title))}`);
+    assert(
+      fix!.edits[0].newText === 'import { area, extMark } from "./ext"',
+      `extends the existing import, got ${JSON.stringify(fix!.edits[0].newText)}`,
+    );
+  } finally {
+    setWorkspace(() => ({}));
+  }
 });
 
 // ---- organize imports --------------------------------------------------------

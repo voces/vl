@@ -428,7 +428,9 @@ Deno.test({
   ignore,
 }, async () => {
   const { checker, read } = checkerAndReader();
-  const src = 'import { expect, it } from "std:test"\n\nit("x", () => {\n  expect(1 + 2).toEqual(3)\n})\n';
+  // A STRING receiver has no declaring module, so type-bound resolution never fires and
+  // an un-imported `trim` (std:str) still needs the import — D1230's remaining domain.
+  const src = 'import { join } from "std:str"\n\nprint("  x  ".trim())\n';
   const before = await checker.check(src, "/proj/main.vl", read);
   assert(
     before.some((d) => (d.code ?? "").startsWith("ufcs-not-imported")),
@@ -436,8 +438,8 @@ Deno.test({
   );
   const edit = importInsertionEdit(
     src,
-    "std:test",
-    "toEqual",
+    "std:str",
+    "trim",
     (stmt) => checker.formatSrc?.(stmt),
   );
   if (edit === undefined) throw new Error("expected an import edit");
@@ -522,8 +524,16 @@ Deno.test({
   name: "seed: the quick-fix appears on the D1230 diagnostic and applying it fixes the file",
   ignore,
 }, async () => {
-  const { checker, read } = checkerAndReader();
-  const src = 'import { expect, it } from "std:test"\n\nit("x", () => {\n  expect(1 + 2).toEqual(3)\n})\n';
+  // `area` is an ORPHAN self-function — `Box`'s home ("./shapes") does not export it, so
+  // type-bound resolution does not fire and the import is still needed (D1230's domain).
+  // An object receiver gives the diagnostic a member-exact range, which the range-based
+  // quick-fix reads.
+  const shapes = "export type Box = { v: i32 }\nexport function box(v: i32): Box { return { v: v } }\n";
+  const ext = 'import { Box } from "./shapes"\nexport function area(self: Box): i32 { return self.v * self.v }\nexport function extMark(): i32 { return 0 }\n';
+  const { checker, read } = checkerAndReader((key) =>
+    key.endsWith("shapes.vl") ? shapes : key.endsWith("ext.vl") ? ext : undefined
+  );
+  const src = 'import { box } from "./shapes"\nimport { extMark } from "./ext"\n\nprint(extMark())\nprint(box(5).area())\n';
   const diags = await checker.check(src, "/proj/main.vl", read);
   const d1230 = diags.find((d) => d.code === "ufcs-not-imported");
   if (d1230 === undefined) {
@@ -531,11 +541,11 @@ Deno.test({
   }
   assert(
     JSON.stringify(d1230.data) ===
-      JSON.stringify({ member: ["toEqual"], modules: ["std:test"], recv: ["Expectation<i32>"] }),
+      JSON.stringify({ member: ["area"], modules: ["./ext"], recv: ["Box"] }),
     `the payload decodes to all three fields; got ${JSON.stringify(d1230.data)}`,
   );
   const name = ufcsMissingImportAt(src, d1230);
-  assert(name === "toEqual", `the fix knows the member; got ${name}`);
+  assert(name === "area", `the fix knows the member; got ${name}`);
   const fixes = ufcsImportFixes(
     src,
     name!,
@@ -544,7 +554,7 @@ Deno.test({
   );
   assert(fixes.length === 1, `one action; got ${JSON.stringify(fixes.map((f) => f.title))}`);
   assert(
-    fixes[0].title === 'Import `toEqual` from "std:test"',
+    fixes[0].title === 'Import `area` from "./ext"',
     `title; got ${JSON.stringify(fixes[0].title)}`,
   );
   const edit = fixes[0].edits[0];
@@ -566,14 +576,18 @@ Deno.test({
   name: "seed: two candidate modules yield two actions, both from the payload",
   ignore,
 }, async () => {
+  // `Box`'s home ("./a") exports NO `area`, so type-bound resolution does not fire;
+  // two ORPHAN modules ("./b", "./c") each export one, so both are live candidates.
   const mods: Record<string, string> = {
     "/proj/a.vl":
-      "export type Box = { v: i32 }\nexport function box(v: i32): Box { return { v: v } }\nexport function area(self: Box): i32 { return self.v * self.v }\n",
+      "export type Box = { v: i32 }\nexport function box(v: i32): Box { return { v: v } }\n",
     "/proj/b.vl":
       'import { Box } from "./a"\nexport function area(self: Box): i32 { return self.v + self.v }\nexport function other(): i32 { return 1 }\n',
+    "/proj/c.vl":
+      'import { Box } from "./a"\nexport function area(self: Box): i32 { return self.v * self.v }\nexport function third(): i32 { return 2 }\n',
   };
   const { checker, read } = checkerAndReader((key) => mods[key]);
-  const src = 'import { box } from "./a"\nimport { other } from "./b"\n\nprint(box(5).area())\nprint(other())\n';
+  const src = 'import { box } from "./a"\nimport { other } from "./b"\nimport { third } from "./c"\n\nprint(box(5).area())\nprint(other())\nprint(third())\n';
   const diags = await checker.check(src, "/proj/main.vl", read);
   const d1230 = diags.find((d) => d.code === "ufcs-not-imported");
   if (d1230 === undefined) {
@@ -581,7 +595,7 @@ Deno.test({
   }
   const specs = ufcsImportModules(d1230);
   assert(
-    JSON.stringify(specs) === JSON.stringify(["./a", "./b"]),
+    JSON.stringify(specs) === JSON.stringify(["./b", "./c"]),
     `both specifiers, in the graph's order; got ${JSON.stringify(specs)}`,
   );
   const fixes = ufcsImportFixes(
