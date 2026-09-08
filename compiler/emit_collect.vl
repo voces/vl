@@ -9736,6 +9736,49 @@ function pushFieldRow(
   0
 }
 
+// The flat declaration named `name` among `stmts`, or -1. Nested layout-only detection needs
+// the decl of a nested flat field, keyed by its spelling.
+function flatDeclByName(stmts: i32[], name: string): i32 {
+  let i = 0
+  while i < stmts.length {
+    const s = P.nodes[stmts[i]]
+    if s is TypeDecl {
+      if s.tdFlat == 1 && s.tdName == name { return stmts[i] }
+    }
+    i = i + 1
+  }
+  -1
+}
+
+// True if a `flat` declaration is layout-only: it has a sub-word storage field (`u8`/`i8`/`u16`/
+// `i16`), or nests a flat that does — a byte field has a width but no struct-field rep, so the
+// record is not also a GC struct and is read by address and offset. Transitive (a nested
+// layout-only flat propagates), depth-bounded since a flat cycle is already a size error.
+function flatHasSubWordField(sx: i32, stmts: i32[], depth: i32): boolean {
+  if depth <= 0 { return false }
+  const s = P.nodes[sx]
+  if s is TypeDecl {
+    if s.tdFlat == 0 { return false }
+    const fields = s.tdFields
+    let i = 0
+    while i < fields.length {
+      const fd = P.nodes[fields[i]]
+      if fd is FieldDef {
+        const nm = tyNameOf(fd.fdType)
+        if nm == "u8" || nm == "i8" || nm == "u16" || nm == "i16" {
+          return true
+        }
+        const nx = flatDeclByName(stmts, nm)
+        if nx >= 0 {
+          if flatHasSubWordField(nx, stmts, depth - 1) { return true }
+        }
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+
 // ── struct-type collection ───────────────────────────────────────────────────
 // Scans top-level statements for every struct `type` declaration into the flat multi-struct
 // table; each interns its own WasmGC struct heap type, and a field whose type has no code
@@ -9795,7 +9838,15 @@ export function collectS(stmts: i32[]) {
     // A union variant `TypeDecl` belongs to the variant table, not here; a generic alias
     // declaration has no concrete shape, its applications intern via `collectGenAliasShapes`.
     if s is TypeDecl {
-      if variantIndexOf(s.tdName) < 0 && gaeLtAt(s.tdName) < 0 {
+      // A `flat` record is ordinarily also a GC struct (`flat` subtracts nothing). The one
+      // exception is a sub-word storage field (`u8`/`i8`/`u16`/`i16`): it has no struct-field
+      // rep, only a byte width, so such a record is layout-only — read by address and offset —
+      // and builds no struct-field table.
+      if (
+        variantIndexOf(s.tdName) < 0 &&
+        gaeLtAt(s.tdName) < 0 &&
+        !flatHasSubWordField(stmts[i], stmts, 16)
+      ) {
         sDeclared = true
         sNames.push(s.tdName)
         recordSRowDeclOfName(s.tdName)

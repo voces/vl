@@ -11836,6 +11836,16 @@ function flatScalarWidth(tyIx: i32) {
   -1
 }
 
+// The byte width a sub-word storage spelling names as a `flat` FIELD, or 0. `u8`/`i8` are one
+// byte, `u16`/`i16` two — a flat-field-only storage width (like a `u8[]` element), read back as
+// `i32` through `loadU8`/`loadI16`/... . `u32`/`u64` are excluded: they do not widen losslessly
+// into a value type, so the ruling stops byte-multiples at 16 bits.
+function flatStorageSpellWidth(name: string) {
+  if name == "u8" || name == "i8" { return 1 }
+  if name == "u16" || name == "i16" { return 2 }
+  0
+}
+
 // The declared type spelling of a `FieldDef`'s annotation, or "" when it has none. The
 // nested-record test must ask the spelling, not the arena: a resolved `TyObj` carries no
 // name, so it cannot say whether the record it describes is declared `flat`.
@@ -12111,9 +12121,18 @@ function flatStageDecl(d: i32, sd: TypeDecl) {
         )
         bad = true
       }
+      const spellW = flatStorageSpellWidth(flatFieldTyName(dfields[fi]))
       const fty = flatFieldTyOf(declTyIx, fi)
       const w = flatScalarWidth(fty)
-      if w > 0 {
+      if spellW > 0 {
+        // A sub-word storage width read off the FIELD spelling — `u8`/`i8` one byte, `u16`/`i16`
+        // two. `fillTypeDeclAt` resolved all four to the `u8` placeholder, so the width cannot
+        // come from the arena type; the spelling is what distinguishes 1 from 2.
+        flFNames.push(fname)
+        flFWidth.push(spellW)
+        flFNest.push(-1)
+        flFOff.push(0)
+      } else if w > 0 {
         flFNames.push(fname)
         flFWidth.push(w)
         flFNest.push(-1)
@@ -12137,8 +12156,8 @@ function flatStageDecl(d: i32, sd: TypeDecl) {
                 fname +
                 "' cannot be in a `flat` type: " +
                 flatWhyNot(fty, flatFieldTyName(dfields[fi])) +
-                " — a flat field must be i32/i64/f32/f64, a newtype over one of " +
-                "those, or another `flat` type",
+                " — a flat field must be i32/i64/f32/f64, a sub-word storage width " +
+                "(u8/i8/u16/i16), a newtype over one of those, or another `flat` type",
               dfields[fi],
             )
           }
@@ -25851,7 +25870,20 @@ function fillTypeDeclAt(sx: i32) {
             let fty = TY_ERR
             if fd.fdType >= 0 {
               const ftn = P.nodes[fd.fdType]
-              if ftn is TypeRef {
+              // A sub-word storage width (`u8`/`i8`/`u16`/`i16`) is legal only as a `flat` field
+              // — the packed-storage carve-out beside `u8[]`'s, so the leaf gate does not refuse
+              // it. Resolves to the `u8` storage type as a placeholder; the width comes from the
+              // spelling in `flatStageDecl`, and elsewhere it stays illegal.
+              if (
+                ftn is TypeRef &&
+                sd.tdFlat == 1 &&
+                flatStorageSpellWidth(ftn.tyName) > 0
+              ) {
+                fty = TY_U8
+                if !inferQuiet && fd.fdType < nodeTyIx.length {
+                  nodeTyIx[fd.fdType] = TY_U8
+                }
+              } else if ftn is TypeRef {
                 // The diagnostic anchors on the FIELD (`dfields[fi]`); the
                 // spelling tree is banked on its `TypeRef` child.
                 const r = nameToTyAnn(ftn.tyName, dfields[fi], fd.fdType)

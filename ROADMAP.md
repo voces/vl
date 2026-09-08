@@ -1071,12 +1071,21 @@ which is why they closed in order rather than in parallel.
   outside the fixture (`{x:i32,y:i32}` → 8, `{p:i64,q:i32,r:i32}` → 16, that type's `q` → 8).
   **Of the two filed blockers, one was never a blocker**: generic `flat` DECLARATIONS are unrelated,
   because the records `rows<T>` indexes are concrete. Generic `flat` decls remain rejected by design.
-  **SUB-BYTE AND BYTE-MULTIPLE FIELD WIDTHS — RULED (owner, 2026-08-22), not yet built.**
-  `flat` accepts only `i32`/`i64`/`f32`/`f64`, newtypes over those, and nested `flat`, **so a byte
-  field costs four bytes and `flat` cannot express a C struct containing a `uint8_t`** — which is
-  the job it exists for. It gains STORAGE widths: byte-multiple (`u8`/`i8`/`u16`/`i16`, the same
-  packed-storage feature `u8[]` needs — see B7 and the `u8[]` work) and **sub-byte
-  (`u1`…`u7`)**, so a wire format spells itself: `flat type Header = { ver: u1, ext: u1, kind: u6 }`
+  **BYTE-MULTIPLE FIELD WIDTHS — SHIPPED (veldt #3); sub-byte + newtypes-over-widths remain.**
+  `u8`/`i8`/`u16`/`i16` are legal as a `flat` FIELD — a flat-field-scoped storage width (like a
+  `u8[]` element): the width (1 or 2 bytes) folds into the running-sum layout in `typecheck.vl`,
+  and the field is read/written through the existing `loadU8`/`store8`/… intrinsics at the folded
+  offset, coming back as `i32`. They stay illegal in every value position (`u8` a storage-type
+  error, `i8`/`u16`/`i16` unknown), and `u32`/`u64` stay rejected (no lossless widening). **One
+  refinement of "flat subtracts nothing" the rep forces**: a flat with a sub-word field is NOT
+  also a GC struct (a byte field has no struct-field rep), so it is layout-only — read by address
+  and offset, skipped from the struct table in `collectS`, transitively (a flat nesting a sub-word
+  flat is layout-only too); a scalar-field flat is unchanged. REMAINING, Phase 2: **sub-byte
+  (`u1`…`u7`)** + `boolean`-at-1-bit (bit folding, the straddle rule, MSB-first packing, and a
+  `getBits`/`setBits` std helper → std-api-review), and newtypes over the widths (`type Mat = new
+  u8` needs a newtype-body carve-out AND a type-based value gate, since the storage gate is
+  name-based at the leaf — a leak otherwise). So a wire format spells itself:
+  `flat type Header = { ver: u1, ext: u1, kind: u6 }`
   is ONE byte and self-documenting where today it is a `u8` plus a comment.
   **`boolean` becomes legal at 1 bit** — it rejects today only because it has no defined width,
   and `{ ver: boolean, ext: boolean, kind: u6 }` reads better than `u1` for a flag.
