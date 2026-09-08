@@ -8,6 +8,20 @@ see **`DECISIONS.md`**.
 
 ## Type system (Track A)
 
+- **Numeric determinism formalized (three rulings) and the `std:math` design that sits on them
+  (veldt/sunsuz/glean).** `docs/internals/numeric-determinism-rulings.md` verifies against
+  `dist/vl` and rules: float→int out-of-range casts keep the exact-or-fail trio, and saturation
+  gets a `std:math` helper rather than a fifth `as` spelling; integer `+`/`-`/`*` wrap silently
+  by default (now documented in `operators.md`, along with the previously-undocumented
+  `i32.MIN / -1` / `i64.MIN / -1` division trap); and standard-op NaN bit-pattern determinism is
+  a measured engineering commitment across VL's two target engines, not a WASM spec guarantee —
+  reconciling a contradiction between `simd-design.md` §A4 and `serde-design.md` OQ-3 (both
+  edited with a pointer to the reconciled rule). `docs/internals/std-math-design.md` is the
+  follow-on design: deterministic polynomial approximations only (never a host `Math`/libm
+  call), f32 and f64 both first-class, a published absolute-or-relative error bound per op,
+  slice 1 = `hypot`/`atan2`/`PI` gradable against sunsuz's existing cross-host parity harness
+  (`~/sunsuz/tools/headless/coast.mjs`). Docs only — no compiler, std or test change; the build
+  goes through `std-api-reviewer` per `CLAUDE.md`'s standing rule.
 - **Three doc bugs surfaced by the veldt voxel-engine consumer, one a latent bounds-narrowing soundness landmine.** `for … to` is INCLUSIVE at both ends, so `for i in 0 to a.length { a[i] }` reads `a[a.length]` on its last iteration and TRAPS. `collections-design.md` taught exactly that as the canonical loop AND, worse, its §VL.6 listed `for i in 0 to a.length` among the cases a future bounds-narrowing pass could prove in-range and drop the check — which under inclusive `to` is false, so an optimizer keyed on that pattern would have MISCOMPILED to a silent out-of-bounds read (bounds-narrowing is not yet built; the fix moves the canonical pattern to `to a.length - 1` and adds explicit inclusive-`to` reasoning so the future implementer keys on `< length` / `to length - 1`). Also: `webcraft-requirements.md`'s shipped-API block showed `buf.storeU8`, which does not exist — `std:buffer` stores have no signedness (`store8`, buffer-design.md O2), fixed to `buf.store8`; and `operators.md` now states that a float-to-integer `as!` needs an EXACT integer and traps on a fraction (`2.5 as! i32` traps `not exact`, `2.0 as! i32` is `2`), with the `trunc(x) as! i32` idiom. Docs only — no compiler, std or test change.
 
 - **The `match`-over-kind-ladders campaign closes: a final byte-identical batch converts the last cleanly-convertible single-subject litunion dispatches, and the residue is named (ROADMAP row 24).** `pushKindBit` (`PushKind`), `repTreeVKind` and `rtListVKind` (`RtKind`) become all-return `_`-less matches naming every member, the unlisted kinds taking the original fall-through value; `kind-ladder-incomplete` **380 → 377**, corpus (2,642 modules, 0 DIFFER / 0 LOST) and the compiler's own modules `cmp`-equal under both seeds. The 376 standing ladders are classified in `docs/internals/kind-ladder-lint.md` §residue — arena walkers (`Node` 213 + `Ty` 110), deferred-large (`VKind` 25 + `TokKind` 5), `string`-typed scrutinees (which need a litunion-returning producer first), `&&`-guarded and multi-subject chains, and the `RtKind` `unsup`-shares-default pair — none a clean byte-identical conversion.

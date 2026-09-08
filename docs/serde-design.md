@@ -1859,6 +1859,12 @@ value back that went in, and the engine-divergence worry that would have justifi
 canonicalizing is not observed on the engines VL runs on. Refusing (borsh's posture) is
 wrong for VL specifically: `NaN` is a reachable, printable value here (fact 6), so refusing
 it would make a legal program fail at encode — a clause-2 shape this repo rejects elsewhere.
+**This does not contradict `webcraft-requirements.md`'s NaN-canonicalization requirement** —
+that document names canonicalization as a *hashing* answer (content-addressing/dedup over
+computed values), which is exactly OQ-4's `canonicalize<T>` transform below, not a reason to
+change VLB's *encoding* default; a reader who finds only one of these two documents should not
+conclude they disagree about the same bits (`docs/internals/serde-critique-crosslang.md` §(c),
+`docs/internals/numeric-determinism-rulings.md` §4).
 **If a content-addressing consumer ever appears**, it wants canonicalization of MORE than
 NaN (sorted maps, OQ-4) and it should get one transform that does all of it, not a flag on
 encode — see OQ-4. And the JSON rendering answers this separately and does not inherit it:
