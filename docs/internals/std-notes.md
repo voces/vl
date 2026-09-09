@@ -765,3 +765,51 @@ Each now says so, in the shape the `concat`-vs-`+` bullet uses.
 Kept only to prove the `std:` resolution plumbing end to end — both resolvers, the Rust
 host's std-dir mapping, the CLI's `fsRead` wrap, the LSP's embedded map. It can be retired
 once any real module stands in for all of those.
+
+## `std:math`
+
+Slice 1 of `docs/internals/std-math-design.md` — `hypot`, `atan2` and `PI` at both widths,
+the module's first landing. The design's §C determinism contract is the spine: every op is
+pure VL over the opcode intrinsics (`sqrt`, `abs`) and `+ - * /`, no host `Math` call, so the
+only cross-host variance is IEEE-754 itself.
+
+- **`atan2`'s algorithm.** Fold to the first octant — `a = atanUnit(min(ax,ay)/max(ax,ay))`
+  when `ax >= ay`, else `PI/2 - atanUnit(ax/ay)` — giving the angle magnitude in `[0, PI/2]`,
+  then reconstruct the quadrant with `if x < 0 { a = PI - a }` and `if y < 0 { a = -a }`. The
+  `(0,0)` guard runs first so the division never sees `0/0`. `atanUnit(r)` approximates
+  `atan(r)` on `[0,1]` as `r * P(r*r)`.
+
+- **The coefficients.** `P` is a degree-8 minimax polynomial in `u = r*r` (highest term
+  `r^17`), derived by a Remez exchange on `g(u) = atan(sqrt u)/sqrt u` over `[0,1]`
+  (`scripts` were run out of tree; the derivation is a pure-Python Remez with a 200k-node
+  error scan). Ratio-error minimax rather than atan-weighted, which is conservative near
+  `r=0` and tight near `r=1` where the worst case sits — good enough with margin to spare,
+  so no weighting was added. The same nine decimal literals serve both widths: in the f32
+  body they adapt to f32 contextually (`p` is declared `f32`), which is what makes the f32
+  function native f32 throughout rather than an f64 computation cast down (design §D).
+
+- **Measured worst-case absolute error** (grade it by regenerating the sweep: 44,647 pairs —
+  a `[-60,60]^2` integer grid, a dense `r`-in-`[0,1]` fold sweep across all sign combos, and
+  several magnitude scales — each compared via `f64bits`/`f32bits` against Python's
+  `math.atan2` of the same inputs):
+  - `atan2F64`: **1.36e-8**, bound 1e-7 — ~7× margin. Worst case at the `ax==ay` fold
+    boundary (`r=1`), i.e. the polynomial's own minimax peak.
+  - `atan2F32`: **2.58e-7**, bound 1e-6 — ~4× margin. Worst case in Q2 at a small ratio,
+    dominated by the `PI - a` reconstruction rounding at f32 and f32 Horner accumulation, not
+    by the approximation error (which is 1.36e-8, negligible at f32).
+
+- **Signed zero is not special-cased.** The quadrant tests use `x < 0.0` / `y < 0.0`, which
+  are false for `-0.0`, so the sign is lost when `y = ±0`: `atan2F*(0.0, -0.0)` returns
+  `0` where a fully IEEE `atan2` returns `PI`, and `atan2F*(-0.0, -1.0)` returns `+PI` where
+  IEEE returns `-PI`. None of the three filed consumers feed signed zeros; a `copysign`-based sign
+  extraction would close it additively without touching the bound. Filed here rather than in
+  the export comment because it is an implementation limit, not part of the promised contract.
+
+- **`hypot` is the naive `sqrt(x*x + y*y)`**, design §E's documented v1 form. The overflow
+  thresholds the export comments name (~1.3e154 for f64, ~1.8e19 for f32) are where `x*x`
+  first reaches the width's max finite value; the scaled overflow-safe form is deferred (§F).
+
+- **What grades it.** `tests/cases/math/hypot.vl`, `atan2-quadrants.vl` and `pi.vl` — run
+  through the standing corpus oracle. The atan2 fixture asserts each result within the
+  promised bound (printing `true`) rather than pinning exact bits, so a later coefficient
+  change that still meets the bound does not churn the fixture.
