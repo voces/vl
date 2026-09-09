@@ -4045,11 +4045,20 @@ fn binaryen_missing_note(flag: &str, tool: &str, env_override: &str, consequence
 /// (the proposal is on by default there). Because the enables are orthogonal to
 /// the optimization level, this belongs in the SHARED list — a rung that missed it
 /// would fail on exactly the programs the other rung optimizes fine.
+///
+/// `--enable-simd` is the same shape once more — the fixed-width 128-bit SIMD flag.
+/// Binaryen 130 rejects any `0xFD` opcode (`v128.*`, `f32x4.*`, …) without it, the
+/// same `rc=1`, no-output-file failure the two above have; it is enabled here AHEAD
+/// of the emitter writing a SIMD opcode so `-O` and `wasm-dis` accept it the day it
+/// does. Fixed SIMD is wasm baseline and wasmtime 47 runs it with no host change.
+/// Relaxed SIMD is a SEPARATE `--enable-relaxed-simd` flag, deliberately NOT enabled
+/// — its ops are non-deterministic (`simd-design.md` §A4/O6). See §G (S0).
 const BINARYEN_FEATURES: &[&str] = &[
     "--enable-reference-types",
     "--enable-gc",
     "--enable-bulk-memory",
     "--enable-tail-call",
+    "--enable-simd",
 ];
 
 /// `vl build -O` — the SHRINK rung. One `-O` pass, open world. It melts a scratch
