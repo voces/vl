@@ -97,7 +97,7 @@ function guard(k: string): boolean {
 `,
     incomplete: [2],
     split: [],
-    says: { code: INCOMPLETE, text: "tests 3 of 31 VKind kinds and ends without naming the rest" },
+    says: { code: INCOMPLETE, text: "tests 3 of 32 VKind kinds and ends without naming the rest" },
   },
   {
     // D981's shape. `walkStmt`'s default hands the rest to `walkExpr`; `walkExpr`
@@ -237,7 +237,7 @@ function exhaustive(k: K): i32 {
     split: [],
     says: {
       code: INCOMPLETE,
-      text: "matches 2 of 31 VKind kinds and its `_` arm names none of the rest",
+      text: "matches 2 of 32 VKind kinds and its `_` arm names none of the rest",
     },
   },
   {

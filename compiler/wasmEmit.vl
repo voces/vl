@@ -22,6 +22,7 @@ import {
   nameIsMemBulkIntrinsic,
   nameIsMemLoadIntrinsic,
   nameIsMemStoreIntrinsic,
+  nameIsSimdIntrinsic,
   nodeArrayElemIsLitUnion,
   nodeArrayElemIsNulBool,
   nodeArrayElemIsNulLitUnion,
@@ -64,6 +65,7 @@ import {
   tyRenderSoftensLits,
   tySame,
   tyToEmitName,
+  u8LexValue,
   valueAtomKind,
 } from "./typecheck"
 import {
@@ -4666,7 +4668,7 @@ function armDestHeapOf(kind: VKind, idx: i32): i32 {
       if idx < sHeapIdx.length { return sHeapIdx[idx] }
       return -1
     }
-    "i32" | "list" | "str" | "union" | "reflist" | "map" | "strlist" | "i64" | "f64" | "f64list" | "f32" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" | "nulnone" | "u8list" => {
+    "i32" | "list" | "str" | "union" | "reflist" | "map" | "strlist" | "i64" | "f64" | "f64list" | "f32" | "v128" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" | "nulnone" | "u8list" => {
       // No heap type of its own at an arm destination: a scalar, a list wrapper, a map
       // or a closure reaches its rep through its own writer, never this table pair.
       return -1
@@ -13973,6 +13975,43 @@ function fbMemoryGrow() {
   0
 }
 
+// ── SIMD (0xFD prefix): the third prefixed family (simd-design.md §D6/A3) ────
+// Unlike the 0xfc misc prefix, a SIMD sub-opcode is a REAL u32 LEB — `f32x4.add` is 228 and
+// encodes as two bytes — so `wULEB` is required, never `wU8`. Verify each sub-opcode with a
+// `wasm-dis --enable-simd` round-trip of the emitted bytes.
+const OP_SIMD_PREFIX = 0xfd
+const SIMD_V128_LOAD = 0x00
+const SIMD_V128_STORE = 0x0b
+const SIMD_F32X4_SPLAT = 0x13
+const SIMD_F32X4_EXTRACT_LANE = 0x1f
+const SIMD_F32X4_ADD = 228
+
+// One SIMD instruction with no trailing immediate (`f32x4.splat`, `f32x4.add`): the prefix,
+// then the uLEB sub-opcode. The stack effect the caller has already arranged.
+function fbSimdOp(sub: i32) {
+  wU8(OP_SIMD_PREFIX)
+  wULEB(sub)
+  0
+}
+// A memarg-carrying SIMD load/store (`v128.load`/`v128.store`): `0xFD <sub> <align-exp>
+// <offset>`. Align 0 — unaligned (O5), so a vector reads/writes at ANY `Buf` offset; offset 0,
+// since VL spells the address as an ordinary expression.
+function fbSimdMem(sub: i32) {
+  wU8(OP_SIMD_PREFIX)
+  wULEB(sub)
+  wU8(0) // align exponent 0 (unaligned — a hint the spec never enforces)
+  wU8(0) // static offset 0 (the address is the stack operand)
+  0
+}
+// A lane-immediate SIMD instruction (`f32x4.extract_lane`): `0xFD <sub> <lane byte>`. The lane
+// is a single immediate byte; the checker refused anything but a 0..3 literal (O3).
+function fbSimdLane(sub: i32, lane: i32) {
+  wU8(OP_SIMD_PREFIX)
+  wULEB(sub)
+  wU8(lane)
+  0
+}
+
 // ── numeric-opcode intrinsics ────────────────────────────────────────────────
 // The IEEE bitcasts. A bitcast moves no bits: the same 32/64-bit pattern is simply
 // read at the other type. Each is exactly one wasm instruction, so there is no
@@ -14203,6 +14242,85 @@ function emitMemIntrinArg(body: i32[], ix: i32, fnIx: i32) {
 function identNameIsUserBound(name: string, fnIx: i32): boolean {
   if localIndexOf(fnIx, name) >= 0 { return true }
   capturedKindOf(fnIx, name) != null
+}
+
+// The compile-time lane index of an `__extract_lane_f32x4__` argument, or -1 when it is not a
+// 0..3 literal. The checker (`checkSimdLaneArg`) already refused a non-literal, so this only
+// re-reads the value the immediate byte needs; -1 keeps a drift between the two loud, not silent.
+function simdLaneImm(argIx: i32): i32 {
+  const ix = unwrapParen(argIx)
+  if ix < 0 || ix >= P.nodes.length { return -1 }
+  const e = P.nodes[ix]
+  if e is NumLit {
+    if numLexIsFloat(e.numText) { return -1 }
+    const v = u8LexValue(e.numText)
+    if v <= 3 { return v }
+  }
+  -1
+}
+
+// The SIMD substrate lowering (`simd-design.md` §D6): each intrinsic pushes its operands, then
+// writes one 0xFD-prefix instruction. Load/store take a byte address (context-cleared) and
+// force the module's memory; splat takes an f32; add/extract take v128 operands emitted at
+// their natural rep. The extract lane index is the 0..3 literal the checker pinned.
+function emitSimdIntrinsic(body: i32[], c: Call, name: string, fnIx: i32) {
+  if name == "__load_v128__" {
+    if c.callArgs.length != 1 {
+      return emitFail(
+        "emitProgram: __load_v128__ takes exactly one argument (the byte address)",
+      )
+    }
+    if emitMemIntrinArg(body, c.callArgs[0], fnIx) < 0 { return -1 }
+    fbSimdMem(SIMD_V128_LOAD)
+    return 0
+  }
+  if name == "__store_v128__" {
+    if c.callArgs.length != 2 {
+      return emitFail(
+        "emitProgram: __store_v128__ takes exactly two arguments (the byte address and the vector)",
+      )
+    }
+    if emitMemIntrinArg(body, c.callArgs[0], fnIx) < 0 { return -1 }
+    if emitExpr(body, c.callArgs[1], fnIx) < 0 { return -1 }
+    fbSimdMem(SIMD_V128_STORE)
+    return 0
+  }
+  if name == "__splat_f32x4__" {
+    if c.callArgs.length != 1 {
+      return emitFail(
+        "emitProgram: __splat_f32x4__ takes exactly one argument (the f32 lane value)",
+      )
+    }
+    if emitExprAsF32(body, c.callArgs[0], fnIx) < 0 { return -1 }
+    fbSimdOp(SIMD_F32X4_SPLAT)
+    return 0
+  }
+  if name == "__add_f32x4__" {
+    if c.callArgs.length != 2 {
+      return emitFail("emitProgram: __add_f32x4__ takes exactly two arguments")
+    }
+    if emitExpr(body, c.callArgs[0], fnIx) < 0 { return -1 }
+    if emitExpr(body, c.callArgs[1], fnIx) < 0 { return -1 }
+    fbSimdOp(SIMD_F32X4_ADD)
+    return 0
+  }
+  if name == "__extract_lane_f32x4__" {
+    if c.callArgs.length != 2 {
+      return emitFail(
+        "emitProgram: __extract_lane_f32x4__ takes exactly two arguments (the vector and a 0..3 lane literal)",
+      )
+    }
+    if emitExpr(body, c.callArgs[0], fnIx) < 0 { return -1 }
+    const lane = simdLaneImm(c.callArgs[1])
+    if lane < 0 {
+      return emitFail(
+        "emitProgram: __extract_lane_f32x4__ lane index is not a compile-time literal in 0..3",
+      )
+    }
+    fbSimdLane(SIMD_F32X4_EXTRACT_LANE, lane)
+    return 0
+  }
+  emitFail("emitProgram: '" + name + "' is not a known SIMD intrinsic")
 }
 
 // Node shapes read: Call { callFn: i32, callArgs: i32[] }, callee Ident { identName }.
@@ -14499,6 +14617,12 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32) {
         }
         fbMemAccess(mlOp, mlAlign)
         return 0
+      }
+      // The SIMD substrate (`simd-design.md` §D6): five intrinsics, each lowered inline to a
+      // 0xFD-prefix instruction — the third prefixed family, beside the 0xfb GC and 0xfc misc
+      // ones. Dispatched by name like the memory intrinsics above it.
+      if !userBindsName && nameIsSimdIntrinsic(callee.identName) {
+        return emitSimdIntrinsic(body, c, callee.identName, fnIx)
       }
       // `memory.size` / `memory.grow` — the two ops that lift the 64 KiB ceiling
       // (`buffer-design.md` §B2/§S4). Both take the memory index as an immediate (0x00,
@@ -19053,6 +19177,8 @@ function emitCallStmt(body: i32[], s: Call, stmtIx: i32, fnIx: i32) {
     if callee.identName == "__store_i32__" { dropIt = false }
     if nameIsMemStoreIntrinsic(callee.identName) { dropIt = false }
     if nameIsMemBulkIntrinsic(callee.identName) { dropIt = false }
+    // `__store_v128__` is void (the other SIMD intrinsics leave a value the drop below wants).
+    if callee.identName == "__store_v128__" { dropIt = false }
     if callee.identName == "__log__" { dropIt = false }
     // The void array intrinsics: `__array_copy__` leaves nothing; `__trap__`
     // is `unreachable` (no value reaches the drop).

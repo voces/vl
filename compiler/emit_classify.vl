@@ -312,6 +312,7 @@ import {
   retNulStringFlag,
   retStrArrFlag,
   retStrFlag,
+  retV128Flag,
   shapeInnerFieldSplit,
   strContains,
   tyGroupWrapsWhole,
@@ -889,6 +890,11 @@ function retKindPri(k: VKind) {
     "f32" => {
       return 13
     }
+    "v128" => {
+      // The SIMD scalar shares the scalar tier: a return is a v128 or something else, never
+      // both, exactly as the i64/f64/f32 arms above.
+      return 13
+    }
     "nulnone" => {
       // D1567 — the `null` type shares the top tier: a return whose every value is a bare
       // `null` is the `null` type or something else, never both. The strict `>` is what stops
@@ -952,6 +958,7 @@ export function retAnnKindChain(tyIx: i32): VKind {
   if retI64Flag(tyIx) == 1 { k = "i64" }
   if retF64Flag(tyIx) == 1 { k = "f64" }
   if retF32Flag(tyIx) == 1 { k = "f32" }
+  if retV128Flag(tyIx) == 1 { k = "v128" }
   k
 }
 
@@ -8223,6 +8230,9 @@ function arrNewKindOfListVKind(k: VKind | null): i32 {
   if k == "nuli64list" { return -1 }
   if k == "nulf32list" { return -1 }
   if k == "nulu8list" { return -1 }
+  if k == "v128" {
+    return -1 // a v128 is a value, not a list backing
+  }
   -1
 }
 
@@ -8242,6 +8252,9 @@ function arrNewDefaultKind(callIx: i32) {
   if p == "void" { return 0 }
   if p == "null" { return 0 }
   if p == "never" { return 0 }
+  if p == "v128" {
+    return 0 // no v128 array element; the i32 default code stands
+  }
   0
 }
 
@@ -9270,8 +9283,9 @@ function tyValueAtomKindOf(ty: i32): i32 {
         "null" => {
           return 6
         }
-        "void" | "never" | "u8" => {
-          // No value-atom code of its own; the outer `-1` stands.
+        "void" | "never" | "u8" | "v128" => {
+          // No value-atom code of its own; the outer `-1` stands. (A v128 is never a
+          // value-union member in S1-S2.)
         }
       }
     }
@@ -9295,7 +9309,7 @@ function tyValueAtomKindOf(ty: i32): i32 {
           "f32" => {
             return 12
           }
-          "i32" | "boolean" | "string" | "void" | "null" | "never" | "u8" => {
+          "i32" | "boolean" | "string" | "void" | "null" | "never" | "u8" | "v128" => {
             // Not a per-width numeric leaf; the outer `-1` stands.
           }
         }
@@ -11851,6 +11865,34 @@ export function letInfersF32(letIx: i32, fnIx: i32) {
     if d.letType >= 0 { return false }
     if d.letInit < 0 { return false }
     return exprIsF32(d.letInit, fnIx)
+  }
+  false
+}
+
+// True if the expression at `exprIx` is a v128 SIMD vector — read off the checker's recorded
+// type (a SIMD intrinsic call, or an ident/local so typed). v128 is never spelled, so there is
+// no annotation route; the arena type is the whole answer (`simd-design.md` §D6).
+function exprIsV128(exprIx: i32, fnIx: i32) {
+  if exprIx < 0 { return false }
+  const ty = nodeTyIxOf(exprIx)
+  if ty >= 0 {
+    const t = T.tys[ty]
+    if t is TyPrim { return t.primName == "v128" }
+  }
+  const e = P.nodes[exprIx]
+  if e is Paren { return exprIsV128(e.parInner, fnIx) }
+  false
+}
+
+// True if the un-annotated `LetDecl` at `letIx` binds a v128 — its init is a SIMD intrinsic
+// that yields a vector. Annotation is impossible (v128 is not spellable), so this is the only
+// route a `v128` local is classified through.
+export function letInfersV128(letIx: i32, fnIx: i32) {
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 { return false }
+    if d.letInit < 0 { return false }
+    return exprIsV128(d.letInit, fnIx)
   }
   false
 }
@@ -16581,7 +16623,7 @@ export function nulScalarListBuildKind(kind: VKind | null): i32 {
     "nulu8list" => {
       return 13
     }
-    "i32" | "struct" | "list" | "str" | "union" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "i64" | "f64" | "f64list" | "f32" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "nulmap" | "nulnone" | "u8list" | null => {
+    "i32" | "struct" | "list" | "str" | "union" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "i64" | "f64" | "f64list" | "f32" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "nulmap" | "nulnone" | "u8list" | "v128" | null => {
       // Not a nullable scalar list, so it builds through no leaf-list code of its own.
       return 0
     }
@@ -16622,7 +16664,7 @@ function nulScalarListFieldCode(name: string) {
     "nulu8list" => {
       return 35
     }
-    "i32" | "struct" | "list" | "str" | "union" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "i64" | "f64" | "f64list" | "f32" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "nulmap" | "nulnone" | "u8list" | null => {
+    "i32" | "struct" | "list" | "str" | "union" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "i64" | "f64" | "f64list" | "f32" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "nulmap" | "nulnone" | "u8list" | "v128" | null => {
       // No distinct wrapper of its own: the i32-backed leaves fold onto code 18, and
       // `null` is the spelling not naming a nullable scalar list at all.
       return -1
@@ -16823,6 +16865,7 @@ function vtKindOfTypeLadder(tyIx: i32): VKind {
   if retI64Flag(tyIx) == 1 { return "i64" }
   if retF64Flag(tyIx) == 1 { return "f64" }
   if retF32Flag(tyIx) == 1 { return "f32" }
+  if retV128Flag(tyIx) == 1 { return "v128" }
   "i32"
 }
 
@@ -18039,6 +18082,9 @@ export function forceScalarListRep(rep: string) {
   } else if rep == "null" {
     0
   } else if rep == "never" {
+    0
+  } else if rep == "v128" {
+    // Not a list element rep in S1-S2 (no v128[]); mints nothing.
     0
   }
   0
@@ -20194,6 +20240,9 @@ function anonNulListFieldCodeOfElem(elem: i32): i32 {
         "u8" => {
           // The packed byte list rides code 35, claimed by its own spelling test.
         }
+        "v128" => {
+          // Not a nullable-list element type: v128 has no list in S1-S2.
+        }
         "void" => {
           // Not an element type.
         }
@@ -20591,7 +20640,7 @@ function fieldCodeOfVKind(k: VKind): i32 {
     "f32list" => {
       return 27
     }
-    "struct" | "map" | "variant" | "nulvariant" | "nulstruct" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" | "nulnone" | "u8list" => {
+    "struct" | "map" | "variant" | "nulvariant" | "nulstruct" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" | "nulnone" | "u8list" | "v128" => {
       // Outside this vocabulary: `-2` hands the question to the spelling ladder, which is
       // what the caller's domain gate expects.
       return -2
@@ -25246,7 +25295,7 @@ export function vkNulNicheOf(k: VKind): VKind | null {
     "closure" => {
       return "nulclosure"
     }
-    "i32" | "union" | "nulvariant" | "nulstruct" | "i64" | "f64" | "f32" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" | "nulnone" => {
+    "i32" | "union" | "nulvariant" | "nulstruct" | "i64" | "f64" | "f32" | "v128" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" | "nulnone" => {
       // No nullable niche is owed: the scalars ride a sentinel, and the `nul*` kinds are
       // already the niche.
       return null
@@ -28886,6 +28935,10 @@ export function unMemIsRefElemArray(m: i32): boolean {
         "u8" => {
           return false
         }
+        "v128" => {
+          // A v128 element is a scalar, not a ref element (no v128[] in S1-S2).
+          return false
+        }
         "i32" | "boolean" | "string" | "void" | "null" | "never" => {
           // A ref-element leaf; the `true` below stands.
         }
@@ -28932,7 +28985,7 @@ export function unMemAtomKind(m: i32): i32 {
             // past the value-atom arm to the struct-variant ladder and rejected.
             return 13
           }
-          "i32" | "boolean" | "string" | "void" | "null" | "never" => {
+          "i32" | "boolean" | "string" | "void" | "null" | "never" | "v128" => {
             // Not a per-width numeric or byte leaf; falls to the string/`-1` arms below.
           }
         }
@@ -30401,7 +30454,7 @@ function tyPrimLeafListKind(ty: i32): VKind | null {
     "u8" => {
       return "u8list"
     }
-    "void" | "null" | "never" | null => {
+    "void" | "null" | "never" | "v128" | null => {
       // No list backing for these element types, nor for a non-array/non-prim element.
     }
   }
