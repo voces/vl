@@ -287,6 +287,11 @@ export type PrimName = "i32"
   // as the type of a local, param, return, binding, map value, union member or generic
   // argument. See `TY_U8`.
   | "u8"
+  // The 128-bit SIMD vector, a WasmGC-invisible scalar (wasm `v128`, valtype 0x7b) that
+  // flows through locals/params/returns like `i64`. Not spelled in source: it is the
+  // substrate the `std:simd` newtypes will brand, reached only via the `__…_v128__`
+  // intrinsics. See `TY_V128` and `docs/internals/simd-design.md` §D6.
+  | "v128"
 
 // A primitive.
 export type TyPrim = { primName: PrimName }
@@ -1815,6 +1820,9 @@ function elemHasZero(el: i32) {
   if p == "void" { return false }
   if p == "null" { return false }
   if p == "never" { return false }
+  if p == "v128" {
+    return false // not an element type in S1-S2 (no v128[])
+  }
   false
 }
 
@@ -2414,6 +2422,10 @@ let TY_NEVER = -1
 // is backed by one byte, so the store truncates and every read yields 0..255. Legal only as an
 // array element, so `primTyOfName` declines it and `tyVarMayBind` refuses it as a `T` binding.
 let TY_U8 = -1
+// `v128` — the 128-bit SIMD vector scalar. WasmGC-invisible like `i64`; the emitter lowers
+// it to the wasm `v128` valtype (0x7b) in every position a scalar flows through. Never
+// spelled in source — the `__…_v128__` intrinsics produce and consume it (`simd-design.md` §G).
+let TY_V128 = -1
 
 // ── type-arena constructors ──────────────────────────────────────────────────
 // Each appends a variant to `T.tys` and returns its index — the same shape as the AST's `mk*`
@@ -3808,6 +3820,7 @@ export function initChecker() {
   TY_NULL = mkPrim("null")
   TY_NEVER = mkPrim("never")
   TY_U8 = mkPrim("u8")
+  TY_V128 = mkPrim("v128")
   T.scopes.push(Map())
   constScopes = []
   constScopes.push(Map())
@@ -3934,6 +3947,15 @@ export function initChecker() {
   declare("__load_i64__", mkFuncTy([TY_I32], TY_I64))
   declare("__load_f32__", mkFuncTy([TY_I32], TY_F32))
   declare("__load_f64__", mkFuncTy([TY_I32], TY_F64))
+  // The SIMD substrate (`simd-design.md` §D6, slices S1-S2): load/store a 128-bit vector to
+  // linear memory (they force the module's memory like `__load_i32__`), splat an f32 across
+  // four lanes, add two f32x4 vectors, extract a lane as an f32. The lane index of
+  // `__extract_lane_f32x4__` must be a compile-time literal in 0..3 (checked below).
+  declare("__load_v128__", mkFuncTy([TY_I32], TY_V128))
+  declare("__store_v128__", mkFuncTy([TY_I32, TY_V128], TY_VOID))
+  declare("__splat_f32x4__", mkFuncTy([TY_F32], TY_V128))
+  declare("__add_f32x4__", mkFuncTy([TY_V128, TY_V128], TY_V128))
+  declare("__extract_lane_f32x4__", mkFuncTy([TY_V128, TY_I32], TY_F32))
   // The filesystem floor (`std:fs`, `std:args`), which unlike everything above it does not
   // lower to instructions — a syscall is the one thing wasm cannot express. Bytes, not
   // strings, in both directions, so a payload crosses as one packed `u8[]` GC object. Errors are
@@ -3983,6 +4005,9 @@ export function nameIsEmitterIntrinsic(name: string) {
   if name == "__memory_grow__" { return true }
   // The bulk pair, reserved the day they acquired their arm.
   if nameIsMemBulkIntrinsic(name) { return true }
+  // The SIMD substrate, reserved the day it acquired its emit arm — same rule: the emitter
+  // rewrites the call site by name, so a user definition would be silently discarded.
+  if nameIsSimdIntrinsic(name) { return true }
   // The filesystem floor. These lower to a `call` of a host import rather than to instructions,
   // but the reservation reason is identical and is about the call site, not the lowering:
   // `emitCall` matches these names before it looks up a declaration, so a user
@@ -3998,6 +4023,19 @@ export function nameIsEmitterIntrinsic(name: string) {
 export function nameIsMemBulkIntrinsic(name: string) {
   if name == "__memory_copy__" { return true }
   if name == "__memory_fill__" { return true }
+  false
+}
+
+// The SIMD substrate intrinsics (`simd-design.md` §D6), each lowered inline to a `0xFD`-prefix
+// instruction by `emitCall`. One list, consulted by the checker's definition reservation, the
+// emitter's dispatch and the import scan, so the three cannot drift. `__load_v128__` /
+// `__store_v128__` additionally force the module's memory (see `emit_sections`/`emit_state`).
+export function nameIsSimdIntrinsic(name: string) {
+  if name == "__load_v128__" { return true }
+  if name == "__store_v128__" { return true }
+  if name == "__splat_f32x4__" { return true }
+  if name == "__add_f32x4__" { return true }
+  if name == "__extract_lane_f32x4__" { return true }
   false
 }
 
@@ -8723,7 +8761,7 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
 // the lexeme is. Saturating rather than folding keeps this free of the bignum path
 // `intLexemeFitsI32` needs: the walk stops the moment the accumulator passes 255. Radix prefixes
 // and `_` separators are honoured; a lexeme with a digit its radix does not admit saturates too.
-function u8LexValue(t: string) {
+export function u8LexValue(t: string) {
   let base = 10
   let i = 0
   if t.length >= 2 && t[0] == '0' {
@@ -11843,8 +11881,9 @@ function flatScalarWidth(tyIx: i32) {
       "f64" => {
         return 8
       }
-      "boolean" | "string" | "void" | "null" | "never" | "u8" => {
-        // No flat width; the outer `-1` stands.
+      "boolean" | "string" | "void" | "null" | "never" | "u8" | "v128" => {
+        // No flat width; the outer `-1` stands. A v128 flat field is not wired in S1-S2, so it
+        // declines here rather than claim a width no `flat` load/store path can honour.
       }
     }
   }
@@ -13029,7 +13068,7 @@ export function tyNulNumScalarValKind(ty: i32): i32 {
         "f32" => {
           return 5
         }
-        "boolean" | "string" | "void" | "null" | "never" | "u8" => {
+        "boolean" | "string" | "void" | "null" | "never" | "u8" | "v128" => {
           // Not a boxed nullable numeric scalar; the outer `-1` stands.
         }
       }
@@ -23516,6 +23555,30 @@ function checkUnimplementedIntrinsicCall(cfn: Ident, ix: i32) {
   }
 }
 
+// `__extract_lane_f32x4__(v, lane)`: the lane index is a wasm instruction IMMEDIATE, not a
+// stack operand, so it MUST be a compile-time literal in 0..3 — a non-literal (a `-` prefix
+// parses as `Unary`, not `NumLit`) or out-of-range lane is a loud check error (O3, §F).
+function checkSimdLaneArg(n: Call, cfn: Ident) {
+  if cfn.identName != "__extract_lane_f32x4__" { return 0 }
+  if n.callArgs.length != 2 { return 0 }
+  const laneIx = parenPeelIx(n.callArgs[1])
+  if laneIx < 0 || laneIx >= P.nodes.length { return 0 }
+  const le = P.nodes[laneIx]
+  let ok = false
+  if le is NumLit {
+    if !numLexIsFloat(le.numText) {
+      if u8LexValue(le.numText) <= 3 { ok = true }
+    }
+  }
+  if !ok {
+    tErr(
+      "__extract_lane_f32x4__ requires a compile-time lane index literal in 0..3 — the wasm lane immediate is not a runtime operand",
+      n.callArgs[1],
+    )
+  }
+  0
+}
+
 // Calls to a compiler builtin named by the callee identifier — `print`, `Map`/`Set`, the
 // codepoint constructors and the `__array_*` / bitcast / numeric intrinsics. None has a
 // declaration to check against, so arity and argument types are checked here. Returns the
@@ -24080,6 +24143,7 @@ function checkCallNode(n: Call, ix: i32) {
     if ot >= 0 { return ot }
   }
   if cfn is Ident { checkUnimplementedIntrinsicCall(cfn, ix) }
+  if cfn is Ident { checkSimdLaneArg(n, cfn) }
   if cfn is Ident {
     const bt = checkBuiltinIdentCall(n, ix, cfn)
     if bt >= 0 { return bt }
@@ -31619,7 +31683,7 @@ export function nodeTyMapValIsNulBool(ix: i32) {
           "boolean" => {
             sawBool = true
           }
-          "i32" | "i64" | "f32" | "f64" | "string" | "void" | "never" | "u8" => {
+          "i32" | "i64" | "f32" | "f64" | "string" | "void" | "never" | "u8" | "v128" => {
             // Neither half of `boolean | null`.
           }
         }
