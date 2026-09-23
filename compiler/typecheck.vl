@@ -28866,6 +28866,102 @@ function blockLastStmt(ix: i32): i32 {
   b.blkStmts[n - 1]
 }
 
+// The value expressions a tail at `ix` yields: each arm of an `if`/`else` or `match`, followed
+// down nested ones and an arm's block tail, else `ix` itself. A worklist, so a long `else if`
+// chain costs no stack. A block whose tail follows an exit yields nothing (D2234).
+function tailValueLeaves(ix: i32, out: i32[]) {
+  const todo: i32[] = [ix]
+  while todo.length > 0 {
+    const at = cwPeel(todo.pop() ?? -1)
+    if at >= 0 && at < P.nodes.length {
+      if (
+        !tailPushIfArms(at, todo) &&
+        !tailPushMatchArms(at, todo) &&
+        !tailPushBlockTail(at, todo)
+      ) {
+        out.push(at)
+      }
+    }
+  }
+  0
+}
+
+// When `p` is an `if`, queues its then arm and its else arm or `else if` link.
+function tailPushIfArms(p: i32, todo: i32[]): boolean {
+  const n = P.nodes[p]
+  if n is IfStmt {
+    todo.push(n.ifThen)
+    if n.ifElse >= 0 { todo.push(n.ifElse) }
+    return true
+  }
+  false
+}
+
+// When `p` is a `match` not yet desugared, queues each arm's body.
+function tailPushMatchArms(p: i32, todo: i32[]): boolean {
+  const n = P.nodes[p]
+  if n is MatchExpr {
+    let i = 0
+    while i < n.matchBodies.length {
+      todo.push(n.matchBodies[i])
+      i = i + 1
+    }
+    return true
+  }
+  false
+}
+
+// When `p` is a block, queues its last statement unless the one before it exits.
+function tailPushBlockTail(p: i32, todo: i32[]): boolean {
+  const n = P.nodes[p]
+  if n is Block {
+    const k = n.blkStmts.length
+    if k == 1 { todo.push(n.blkStmts[0]) }
+    if k > 1 {
+      if !stmtAlwaysExits(n.blkStmts[k - 2]) { todo.push(n.blkStmts[k - 1]) }
+    }
+    return true
+  }
+  false
+}
+
+// Checks each value a tail `if`/`else` (or the chain a `match` desugared to) yields against
+// the declared return `ret`, at the arm that yields it — the check the bare tail expression
+// gets. An arm that exits, yields no value or already failed is left to its own rule (D2234).
+function checkTailArmsAgainst(ix: i32, ret: i32) {
+  const leaves: i32[] = []
+  tailValueLeaves(ix, leaves)
+  let i = 0
+  while i < leaves.length {
+    const lf = leaves[i]
+    i = i + 1
+    const lt = nodeTyOf(lf)
+    if lt >= 0 && lt != TY_ERR && lt != TY_NEVER && !isVoidTy(lt) {
+      if !isStmtNode(lf) && !stmtAlwaysExits(lf) {
+        if !assignableExpr(lf, lt, ret) {
+          tErr("expected " + tyToStr(ret) + ", got " + tyToStr(lt), lf)
+        } else {
+          noteRetCstr(lt, ret, lf)
+        }
+      }
+    }
+  }
+  0
+}
+
+// Seeds each value a tail `if`/`else` or `match` yields with the declared return, as the bare
+// tail expression is seeded, so an arm's lambda or literal reads the return type (D2234).
+function seedTailArms(ix: i32, ret: i32) {
+  const leaves: i32[] = []
+  tailValueLeaves(ix, leaves)
+  let i = 0
+  while i < leaves.length {
+    if !isStmtNode(leaves[i]) { seedExpected(leaves[i], ret) }
+    i = i + 1
+  }
+  0
+}
+
 // Whether the if-arm block `armIx` ends in a bare `{ … }` block, whose value is the open
 // bare-block-as-expression ruling.
 function armTailUndecided(armIx: i32): boolean {
@@ -30521,8 +30617,10 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
       if tailIsReturn && s > 0 {
         if stmtAlwaysExits(stmts[s - 1]) { tailIsReturn = false }
       }
-      if tailIsReturn && !inferring && ret >= 0 && !isStmtNode(stmts[s]) {
-        seedExpected(stmts[s], ret)
+      if tailIsReturn && !inferring && ret >= 0 {
+        if !isStmtNode(stmts[s]) || P.nodes[stmts[s]] is IfStmt {
+          seedTailArms(stmts[s], ret)
+        }
       }
       const stTy = checkNode(stmts[s])
       retTailPos = savedRTPbody
@@ -30555,6 +30653,12 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
                   // expression loses the refusal its `return` spelling makes (D1739).
                   noteRetCstr(stTy, ret, stmts[s])
                 }
+              }
+            } else if P.nodes[stmts[s]] is IfStmt {
+              // A tail `if`/`else` — or the chain a tail `match` desugared to — is a statement
+              // node, but under a non-void return each arm's value is the return (D2234).
+              if !isVoidTy(ret) && ret != TY_NEVER {
+                checkTailArmsAgainst(stmts[s], ret)
               }
             }
           }
