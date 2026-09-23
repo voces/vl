@@ -78,9 +78,8 @@ print("done")
     want: 0,
     out: "1\n-1\n",
   },
-  // A scrutinee that is not a plain variable stays a chain TODAY because of D1991 (the chain
-  // re-evaluates it once per tested arm, a wrong-value defect), not by design. The fix binds
-  // it to a temp once, which also makes this match table-eligible: then this count becomes 1.
+  // A scrutinee that is not a plain variable is bound to a temp once (D1991), so the match
+  // over the temp is table-eligible like any other.
   computed_scrutinee: {
     src: `function g(x: i32) {
   match x % 7 {
@@ -93,8 +92,26 @@ print("done")
 print(g(8))
 print(g(6))
 `,
-    want: 0,
+    want: 1,
     out: "11\n19\n",
+  },
+  // D1991's witness as a table: the call runs once, so the arm is the one its first value picks.
+  side_effecting_scrutinee: {
+    src: `let n = 5
+function next() {
+  n = n + 1
+  n
+}
+const r = match next() {
+  5 => "five"
+  6 => "six"
+  7 => "seven"
+  _ => "other"
+}
+print("\\{r} \\{n}")
+`,
+    want: 1,
+    out: "six 6\n",
   },
   // Only a chain a `match` built is marked; a hand-written dense `else if` chain over the same
   // literals keeps its compares.
