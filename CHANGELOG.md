@@ -833,6 +833,15 @@ new: the compare-frame pre-pass never recurses into a code-15 field, so a NESTED
 
 ## Codegen, memory & runtime (Track B)
 
+- **A large function's call sites no longer each walk the function (D2180, plumb PL-019).**
+  #3050's loop-variable rung asked every named callee's frame for its capture set before
+  asking whether any enclosing frame binds the name as a loop variable, and the dispatch
+  rewrite's bare-block mints kept dropping the capture memo. So every call site walked its
+  whole function. The cheap test now runs first. plumb `chunk_142` 43 s → 3.6 s, `chunk_73`
+  11 s → 1.8 s, `chunk_400` 4.6 s → 1.3 s, output byte-identical. Beside it, D2181:
+  `scopeSlotOf` reads a name index over the scope stack instead of scanning every live
+  binding, so 2,500 function-scope locals build in 0.13 s rather than 2.2 s. Guarded by the
+  `call sites per function` and `live locals in one scope` scaling axes.
 - **A module `const` with a constant initializer is an immutable wasm global (plumb PL-014
   lane L10).** Every module binding used to be a `(mut …)` global, so an engine re-loaded a
   `const` on every read. A `const` whose initializer is a constant expression (a literal, a
