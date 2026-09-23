@@ -813,3 +813,29 @@ only cross-host variance is IEEE-754 itself.
   through the standing corpus oracle. The atan2 fixture asserts each result within the
   promised bound (printing `true`) rather than pinning exact bits, so a later coefficient
   change that still meets the bound does not churn the fixture.
+
+## `std:simd`
+
+Slice S3 of `docs/internals/simd-design.md` — the `F32x4` surface over the `__…_f32x4__` /
+`__…_v128__` intrinsics, the `std:buffer` shape.
+
+- **`v128` is spellable.** A brand needs a base the checker can resolve, so `v128` joined
+  `primTyOfName`/`builtinTyNames`. §E allows a program its own `new v128` brands; O9 is
+  honoured at the API — no `std:simd` export takes or returns a bare `v128`. An `as`
+  between two v128s (brand or not) is an identity re-brand, as between two `new i32` brands.
+- **Operators on a non-object.** #3003 dispatched binary operators only on an object left
+  operand; a `new v128` brand has no arithmetic of its own, so `tyIsV128Brand` admits it at
+  both the declaration gate (`binOpDeadSelf`) and the site (`checkBinary`). A `new i32`
+  brand is deliberately not admitted: its `+` is the language's own.
+- **`reduceAddF32x4` order.** Two shuffles: `s = v + v.zwxy`, `t = s + s.yxwz`, lane 0 of `t`
+  is `(x + z) + (y + w)`. Documented in the export because a scalar oracle has to copy it.
+- **`cross`** is `a.yzxw * b.zxyw - a.zxyw * b.yzxw` with lane 3 then replaced by `0.0`; the
+  raw lane 3 would be `aw*bw - aw*bw`, which is NaN for an infinite or NaN `w`.
+- **`dot`/`normalize` read all four lanes** (vec4 semantics). A vec3 is "padded" with `w = 0`,
+  which makes the four-lane and three-lane answers equal; O7's "ignored" is only literally
+  true of `cross`. Flagged to the owner with D1980.
+- **Not shipped: lane read-back** (D1980). `std:simd` cannot wrap a literal-lane intrinsic,
+  and `.x` needs property syntax. The header points callers at `storeF32x4` + `loadF32`.
+- **What grades it.** `tests/cases/simd/f32x4-std-surface.vl` (every op, lane order, NaN and
+  -0.0), `f32x4-geometry.vl`, `f32x4-kernel-vs-scalar.vl` (bit-identical to scalar),
+  `f32x4-positions.vl`, and the `error-*` refusals.

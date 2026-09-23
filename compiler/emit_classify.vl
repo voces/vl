@@ -3185,6 +3185,7 @@ function letInitCellKind(letIx: i32, fnIx: i32): VKind {
   if letIsNulString(letIx, fnIx) { return "nulstr" }
   if letIsString(letIx, fnIx) { return "str" }
   if letIsI64(letIx, fnIx) { return "i64" }
+  if letInfersV128(letIx, fnIx) { return "v128" }
   if letIsF32(letIx) || letInfersF32(letIx, fnIx) { return "f32" }
   if letIsF64(letIx, fnIx) { return "f64" }
   if letIsClosure(letIx, fnIx) { return "closure" }
@@ -3772,7 +3773,8 @@ export function criClassify(rx0: i32, i: i32) {
     if rxn.binOp == "??" { scalarOk = false }
   }
   if scalarOk {
-    if exprIsF64(rx, fnStmts[i]) { criSetRetKind(i, "f64") }
+    if exprIsV128(rx, fnStmts[i]) { criSetRetKind(i, "v128") }
+    else if exprIsF64(rx, fnStmts[i]) { criSetRetKind(i, "f64") }
     else if exprIsF32(rx, fnStmts[i]) { criSetRetKind(i, "f32") }
     else if exprIsI64(rx, fnStmts[i]) { criSetRetKind(i, "i64") }
   }
@@ -11740,6 +11742,9 @@ export function ifArmIsValue(stmtIx: i32, fnIx: i32) {
 // The single-byte blocktype valtype for a value-position if-expression: the widest
 // numeric rep across its arms (checked f64 → f32 → i64, else the i32 default).
 export function ifExprValtype(ifIx: i32, fnIx: i32) {
+  if exprIsV128(ifIx, fnIx) {
+    return 123 // 0x7b v128
+  }
   if exprIsF64(ifIx, fnIx) {
     return 124 // 0x7c f64
   }
@@ -11927,28 +11932,64 @@ export function letInfersF32(letIx: i32, fnIx: i32) {
   false
 }
 
-// True if the expression at `exprIx` is a v128 SIMD vector — read off the checker's recorded
-// type (a SIMD intrinsic call, or an ident/local so typed). v128 is never spelled, so there is
-// no annotation route; the arena type is the whole answer (`simd-design.md` §D6).
-function exprIsV128(exprIx: i32, fnIx: i32) {
+// True if evaluating `exprIx` yields a v128 SIMD vector (a `new v128` brand such as `F32x4` is
+// one): the checker's recorded type first, then the leaves a rewrite minted without one — a
+// brand cast, a param/local/capture/global so typed, a call (a dispatched `a + b` is one) to a
+// v128-returning function, and an if-expression with a vector arm. Mirrors `exprIsF32`.
+export function exprIsV128(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return false }
-  const ty = nodeTyIxOf(exprIx)
-  if ty >= 0 {
-    const t = T.tys[ty]
-    if t is TyPrim { return t.primName == "v128" }
-  }
+  if nodeTyIxOf(exprIx) >= 0 { return nodeTyIsV128(exprIx) }
   const e = P.nodes[exprIx]
+  if e is AsExpr { return e.asTy == "v128" }
   if e is Paren { return exprIsV128(e.parInner, fnIx) }
+  if e is Ident {
+    if retV128Flag(paramTypeNode(fnIx, e.identName)) == 1 { return true }
+    if declaredKind(e.identName) == "v128" { return true }
+    if capturedKindOf(fnIx, e.identName) == "v128" { return true }
+    const gli = globalLetOfSidIn(fnIx, sidOfNode(exprIx))
+    if gli >= 0 { return letInfersV128(gli, -1) }
+    return false
+  }
+  if e is Call {
+    if e.callFn < 0 { return false }
+    const callee = P.nodes[e.callFn]
+    if callee is Ident {
+      const target = fnIndexOfInScopeSid(
+        sidOfNode(e.callFn),
+        callee.identName,
+        fnIx,
+      )
+      if target >= 0 { return repOfFnSlot(target).rdKind == "v128" }
+    }
+    return false
+  }
+  if e is IfStmt {
+    if e.ifElse < 0 { return false }
+    if exprIsV128(ifArmValueExpr(e.ifThen), fnIx) { return true }
+    const els = P.nodes[e.ifElse]
+    if els is IfStmt { return exprIsV128(e.ifElse, fnIx) }
+    return exprIsV128(ifArmValueExpr(e.ifElse), fnIx)
+  }
+  // Every other kind carries no vector of its own: only a recorded type could name one.
+  nodeTyIsV128(exprIx)
+}
+
+// Whether the checker recorded a `v128` (or a brand over it, a copy of the prim) at `exprIx`.
+function nodeTyIsV128(exprIx: i32): boolean {
+  const ty = nodeTyIxOf(exprIx)
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if t is TyPrim { return t.primName == "v128" }
   false
 }
 
-// True if the un-annotated `LetDecl` at `letIx` binds a v128 — its init is a SIMD intrinsic
-// that yields a vector. Annotation is impossible (v128 is not spellable), so this is the only
-// route a `v128` local is classified through.
+// True if the `LetDecl` at `letIx` binds a v128 — annotated with `v128` or a brand over it, or
+// un-annotated with an init that yields a vector. The one route a `v128` local is classified through.
 export function letInfersV128(letIx: i32, fnIx: i32) {
   const d = P.nodes[letIx]
   if d is LetDecl {
-    if d.letType >= 0 { return false }
+    // An annotated binding (`const v: F32x4 = …`): the brand is erased to its `v128` base.
+    if d.letType >= 0 { return retV128Flag(d.letType) == 1 }
     if d.letInit < 0 { return false }
     return exprIsV128(d.letInit, fnIx)
   }
@@ -14770,6 +14811,7 @@ export function stmtIsTailValue(stmtIx: i32, fnIx: i32) {
       if callee.identName == "__store_i32__" { return false }
       if nameIsMemStoreIntrinsic(callee.identName) { return false }
       if nameIsMemBulkIntrinsic(callee.identName) { return false }
+      if callee.identName == "__store_v128__" { return false }
       if callee.identName == "__log__" { return false }
       if callee.identName == "__array_copy__" { return false }
       if callee.identName == "__trap__" { return false }
@@ -17272,6 +17314,7 @@ function globalKind(initIx: i32): VKind {
   // module-scope analogue of `letIsF32`. Checked before the f64 arm, mirroring
   // `exprIsF32`'s own dispatch order: `exprIsF64` over-claims a mixed f32/float-literal
   // init (`fv * 1.0` satisfies both), so f32 must go first or the start-fn's `f32.mul` disagrees.
+  if exprIsV128(initIx, -1) { return "v128" }
   if exprIsF32(initIx, -1) { return "f32" }
   // A scalar f64/i64 non-literal init (arithmetic, or an f64-returning call) — kind 11/10,
   // the module-scope analogue of `letIsF64`/`letIsI64`. May recurse into another global,
@@ -17387,6 +17430,9 @@ function globalCellKindGo(letIx: i32): VKind {
     // `nullref`. Checked first, outside the annotation split: the binding has no
     // annotation by construction, so the un-annotated arm would read the init as i32.
     if letIsNulNone(letIx, -1) { return "nulnone" }
+    // A v128 vector cell (`F32x4`), annotated or inferred from its init — no other rung
+    // claims a vector, and several would misread its init as a ref.
+    if letInfersV128(letIx, -1) { return "v128" }
     if globalHasTypeAnn(letIx) {
       // A NULLABLE-function global (`let g: ((i32) => i32) | null = inc`) is a nullable
       // closure cell (kind 19) — checked BEFORE the bare-function kind 14, mirroring
