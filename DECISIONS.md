@@ -2218,6 +2218,36 @@ braced blocks reach too (`if c { 1 } else { 2 }` in value position is the same c
 formats parse-clean files, so it simply stops seeing the unbraced input; nothing became
 unreachable.
 
+## A bare `{}` is refused — VL has neither an empty object nor an empty nested block (owner, 2026-09-23)
+
+**The ruling (D2223).** `{}` used as a VALUE (a binding initializer, an argument, a return, a
+field, an element, an arm value) is refused by `vl check` with "an empty object has no fields
+to hold; write its fields, or use `null` for no value". `{}` standing as a STATEMENT inside a
+block is refused with "an empty block does nothing; remove it". The empty BODY of a construct
+is untouched: `if c {}`, `else {}`, `while c {}`, `for x in xs {}`, `function f() {}`,
+`() => {}` and a match arm's `=> {}` are all still the ordinary empty body.
+
+**Why refuse rather than build either reading.** Before the ruling `{}` parsed as an object
+literal in both positions, the checker typed it as the empty record and accepted it, and the
+emitter had no zero-field shape, so every spelling was a check-clean emit failure (clause 2).
+The two ways to close it were a parser ruling (`{}` in statement position is an empty block)
+plus a lowering for `const o = {}`, or a zero-field struct rep for every position. Neither
+earns its place: an empty nested block does nothing, and an empty object carries no
+information that `null` does not. A refusal the design owes is not a capability gap.
+
+**Measured before landing.** The distilled corpus moved **0 of 7,589 cells**; `std/`,
+`compiler/` and consumer plumb write no bare `{}`. Eight sites in six files did: four fixtures
+(`unions/empty-inline-shape-union-arm.vl` constructed its empty arm, `structs/nullable-map-field.vl`
+omitted the only field, `maps/error-object-literal-not-map.vl` and `arrays/error-u8-storage-only.vl`
+used `{}` as a stand-in for a map value) and two capability probes for `{} | null`, which
+probed a value the language no longer has and were deleted.
+
+**Where it lives.** Both messages are parser diagnostics marked lossless, since the tree keeps
+the literal the author wrote; the checker types a zero-field literal as the error type and
+return inference counts it as an already-reported cause, so no follow-on error is printed.
+The TYPE `{}` still parses (as a union arm it still declares and discriminates); it simply has
+no literal.
+
 ## ONE hole syntax, `\{expr}`, in BOTH quoted forms — the trigger lives in the escape namespace (owner, 2026-09-01, "OK do `\{`")
 
 **`"v=\{x} done"` interpolates, and so does `` `v=\{x} done` ``.** Plain double-quoted strings

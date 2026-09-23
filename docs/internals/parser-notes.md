@@ -761,6 +761,14 @@ Mirrors `parser.ts`'s `looksLikeObject`: skip NEWLINEs after `{`, then
 sources, so it's omitted here.)
 ```
 
+Since D2223 (owner ruling, 2026-09-23) `parseStmt` asks `bracesAreEmpty` before this
+lookahead: an empty `{}` at statement position is still parsed as a zero-field object
+literal, so the tree keeps what the author wrote, but it carries the lossless diagnostic
+"an empty block does nothing; remove it". In expression position `parseObjLit` attaches
+"an empty object has no fields to hold…" instead. The empty BODY of a construct (`if c {}`,
+`function f() {}`, `() => {}`, a match arm's `=> {}`) never reaches either: those callers
+take `parseBlock` for empty braces.
+
 ## importSpecCharMsg — one sentence, two scanners
 
 Moved from `compiler/parser.vl` (the 14-line block at line 3530, as it stood at 2026-09-02).
