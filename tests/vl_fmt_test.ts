@@ -3041,7 +3041,8 @@ Deno.test({
 // An `if` expression whose arms are not one simple expression each used to go through the
 // whitespace-collapsing slice (joining an arm's statements onto one line, which re-parsed
 // `const t = 4` / `[t][0]` as an index), and an `else if` arm rendered only its FIRST
-// statement. Both now render every arm as a block, and the output must still run the same.
+// statement. Both now render every arm as a block, and the output must still run the same —
+// in a binding, an arrow body and a lambda passed as a call argument.
 Deno.test({
   name: "vl-fmt: a labelled loop first in a block, and multi-line if-expression arms (D1998)",
   ignore: !ENABLED,
@@ -3121,6 +3122,98 @@ Deno.test({
           "  r",
           "}",
           "print(k(true))",
+          "",
+        ].join("\n"),
+        prints: "4\n",
+      },
+      // an arrow body
+      {
+        src: [
+          "function k(a: boolean): i32 {",
+          "  const f = () => if a {",
+          "    const t = 4",
+          "    [t][0]",
+          "  } else { 3 }",
+          "  f()",
+          "}",
+          "print(k(true))",
+          "",
+        ].join("\n"),
+        want: [
+          "function k(a: boolean): i32 {",
+          "  const f = () => if a {",
+          "    const t = 4",
+          "    [t][0]",
+          "  } else {",
+          "    3",
+          "  }",
+          "  f()",
+          "}",
+          "print(k(true))",
+          "",
+        ].join("\n"),
+        prints: "4\n",
+      },
+      // an arrow body with an `else if` arm
+      {
+        src: [
+          "function k(a: boolean): i32 {",
+          "  let q = 0",
+          "  const f = (x: i32) => if a {",
+          "    q = x",
+          "    q",
+          "  } else if !a {",
+          "    q = 5",
+          "    -q",
+          "  } else { 3 }",
+          "  f(2)",
+          "}",
+          "print(k(false))",
+          "",
+        ].join("\n"),
+        want: [
+          "function k(a: boolean): i32 {",
+          "  let q = 0",
+          "  const f = (x: i32) => if a {",
+          "    q = x",
+          "    q",
+          "  } else if !a {",
+          "    q = 5",
+          "    -q",
+          "  } else {",
+          "    3",
+          "  }",
+          "  f(2)",
+          "}",
+          "print(k(false))",
+          "",
+        ].join("\n"),
+        prints: "-5\n",
+      },
+      // a lambda passed as a call argument
+      {
+        src: [
+          "function k(xs: i32[]): i32[] {",
+          "  xs.map((x: i32) => if x > 1 {",
+          "    const t = x * 2",
+          "    [t][0]",
+          "  } else { x })",
+          "}",
+          "print(k([1, 2])[1])",
+          "",
+        ].join("\n"),
+        want: [
+          "function k(xs: i32[]): i32[] {",
+          "  xs.map(",
+          "    (x: i32) => if x > 1 {",
+          "      const t = x * 2",
+          "      [t][0]",
+          "    } else {",
+          "      x",
+          "    },",
+          "  )",
+          "}",
+          "print(k([1, 2])[1])",
           "",
         ].join("\n"),
         prints: "4\n",
