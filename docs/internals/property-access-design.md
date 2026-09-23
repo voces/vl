@@ -14,7 +14,7 @@ Are they good for VL?"*
 `i`. VL has no property syntax. `buf.length` works only because `Buf` is a struct with a real
 `length` field. A std wrapper also cannot pass a literal lane index on to
 `__extract_lane_f32x4__`, because once `i` is a parameter it is no longer a literal. The row is
-D1980 (unfiled: D1980, filed by #3015 on its branch; delete this marker when #3015 merges).
+[D1980](inventory/D1980.md).
 
 **The short answer, argued in §C–§E:**
 
@@ -378,8 +378,7 @@ consumers.
   `x()`, because **std has no deprecation story**: adding `get x` later would give a type both
   `v.x()` and `v.x`, or require retracting a std name.
 - **Naming.** `x`, `y`, `z` and `w` become permanent exported *function* names in a flat
-  namespace. With type-bound UFCS they need no import. But D1984 (unfiled: D1984, filed by
-  #3015; delete this marker when it merges) shows that any caller module with its own `x`
+  namespace. With type-bound UFCS they need no import. But [D1984](inventory/D1984.md) shows that any caller module with its own `x`
   function blocks the fallback. `x` is about the most likely name a graphics program declares
   for itself, for example `function x(self: Vec2)`. Until D1984 is fixed, `v.x()` fails in
   exactly the programs most likely to call it.
