@@ -82,9 +82,11 @@ import {
   UnionDecl,
   WhileStmt,
   callSiteLocOf,
+  elseIfLink,
   fillArgDefaults,
   fnRequiredArity,
   hasNamedArgs,
+  i32ToStr,
   mkArrayLit,
   mkBareBlockIf,
   mkBinary,
@@ -99,6 +101,7 @@ import {
   mkNum,
   mkOptMember,
   mkParam,
+  nodeValueSpineChildren,
   orderArgsByParamNames,
   paramDefaultIsCallsite,
   paramDefaultOf,
@@ -141,6 +144,7 @@ import {
   tyStructHasMapField,
 } from "./emit_classify"
 import { paramIsClosure, paramNulClosure } from "./emit_query"
+import { sidNoteNodeName } from "./symbols"
 
 // ── self-method / operator / index-trap dispatch rewrite ─────────────────────
 // The host resolves these in its type-aware parser; the native parser is
@@ -1088,103 +1092,150 @@ export function synthParamAnnots() {
 // scan of every earlier `let` (D2090). Reset per function by `captureBoxRewrite`.
 let cboxDletSeen: {[string]: i32} = Map()
 
-// One scan of a maker body: `dlets` = the maker's own `let` names (depth 0); `alam` = names
-// assigned inside a nested lambda (depth > 0); `ndecls` = every binding declared inside a
-// nested lambda (params, lets, loop vars) — the shadow set.
-function cboxScan(
-  ix: i32,
-  depth: i32,
-  dlets: string[],
-  alam: string[],
-  ndecls: string[],
-) {
-  if ix < 0 { return 0 }
-  const n = P.nodes[ix]
-  if n is FuncDecl {
-    const ps = n.fnParams
+// The names a binding inside a nested function shadows at the point being walked: a count
+// per name, and a trail trimmed on scope exit. A nested function's own `c` is neither an
+// assignment to the maker's `c` nor a read to box (D2068).
+const cboxShadow: {[string]: i32} = Map()
+const cboxShTrail: string[] = []
+
+function cboxShadowPush(name: string) {
+  cboxShadow[name] = (cboxShadow[name] ?? 0) + 1
+  cboxShTrail.push(name)
+  0
+}
+
+// Closes the nested bindings opened since `mark` (a `cboxShTrail.length`).
+function cboxShadowTrim(mark: i32) {
+  while cboxShTrail.length > mark {
+    const nm = cboxShTrail[cboxShTrail.length - 1]
+    cboxShadow[nm] = (cboxShadow[nm] ?? 1) - 1
+    cboxShTrail.pop()
+  }
+  0
+}
+
+// Opens the parameters of nested function `fn` as shadows.
+function cboxShadowParams(fn: i32) {
+  const f = P.nodes[fn]
+  if f is FuncDecl {
+    const ps = f.fnParams
     let pi = 0
     while pi < ps.length {
       const p = P.nodes[ps[pi]]
-      if p is Param {
-        if !capHas(ndecls, p.parName) { ndecls.push(p.parName) }
-      }
+      if p is Param { cboxShadowPush(p.parName) }
       pi = pi + 1
     }
-    return cboxScan(n.fnBody, depth + 1, dlets, alam, ndecls)
+  }
+  0
+}
+
+// One scan of a maker body: `dlets` = the maker's own `let` names (depth 0); `alam` = names
+// assigned inside a nested lambda (depth > 0) where no binding of that lambda shadows them.
+function cboxScan(ix: i32, depth: i32, dlets: string[], alam: string[]) {
+  if ix < 0 { return 0 }
+  const n = P.nodes[ix]
+  if n is FuncDecl {
+    const fmark = cboxShTrail.length
+    cboxShadowParams(ix)
+    cboxScan(n.fnBody, depth + 1, dlets, alam)
+    return cboxShadowTrim(fmark)
   }
   if n is LetDecl {
+    cboxScan(n.letInit, depth, dlets, alam)
     if depth == 0 {
       if (cboxDletSeen[n.letName] ?? 0) == 0 {
         cboxDletSeen[n.letName] = 1
         dlets.push(n.letName)
       }
     } else {
-      if !capHas(ndecls, n.letName) { ndecls.push(n.letName) }
+      cboxShadowPush(n.letName)
     }
-    return cboxScan(n.letInit, depth, dlets, alam, ndecls)
+    return 0
   }
   if n is Block {
+    const bmark = cboxShTrail.length
     const bs = n.blkStmts
     let i = 0
     while i < bs.length {
-      cboxScan(bs[i], depth, dlets, alam, ndecls)
+      cboxScan(bs[i], depth, dlets, alam)
       i = i + 1
     }
-    return 0
+    return cboxShadowTrim(bmark)
   }
   if n is BinExpr {
     if n.binOp == "=" {
       if depth > 0 {
         const t = P.nodes[n.binLeft]
         if t is Ident {
-          if !capHas(alam, t.identName) { alam.push(t.identName) }
+          if (cboxShadow[t.identName] ?? 0) == 0 {
+            if !capHas(alam, t.identName) { alam.push(t.identName) }
+          }
         }
       }
     }
-    cboxScan(n.binLeft, depth, dlets, alam, ndecls)
-    return cboxScan(n.binRight, depth, dlets, alam, ndecls)
+    cboxScan(n.binLeft, depth, dlets, alam)
+    return cboxScan(n.binRight, depth, dlets, alam)
   }
   if n is IfStmt {
-    cboxScan(n.ifCond, depth, dlets, alam, ndecls)
-    cboxScan(n.ifThen, depth, dlets, alam, ndecls)
-    return cboxScan(n.ifElse, depth, dlets, alam, ndecls)
+    // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
+    let cur = ix
+    while cur >= 0 {
+      const c = P.nodes[cur]
+      cur = -1
+      if c is IfStmt {
+        cboxScan(c.ifCond, depth, dlets, alam)
+        cboxScan(c.ifThen, depth, dlets, alam)
+        if c.ifElse >= 0 {
+          if P.nodes[c.ifElse] is IfStmt {
+            cur = c.ifElse
+          } else {
+            cboxScan(c.ifElse, depth, dlets, alam)
+          }
+        }
+      }
+    }
+    return 0
   }
   if n is WhileStmt {
-    cboxScan(n.whileCond, depth, dlets, alam, ndecls)
-    return cboxScan(n.whileBody, depth, dlets, alam, ndecls)
+    cboxScan(n.whileCond, depth, dlets, alam)
+    return cboxScan(n.whileBody, depth, dlets, alam)
   }
   if n is ForRange {
-    if !capHas(ndecls, n.frVar) { ndecls.push(n.frVar) }
-    cboxScan(n.frFrom, depth, dlets, alam, ndecls)
-    cboxScan(n.frTo, depth, dlets, alam, ndecls)
-    cboxScan(n.frStep, depth, dlets, alam, ndecls)
-    return cboxScan(n.frBody, depth, dlets, alam, ndecls)
+    cboxScan(n.frFrom, depth, dlets, alam)
+    cboxScan(n.frTo, depth, dlets, alam)
+    cboxScan(n.frStep, depth, dlets, alam)
+    const rmark = cboxShTrail.length
+    if depth > 0 { cboxShadowPush(n.frVar) }
+    cboxScan(n.frBody, depth, dlets, alam)
+    return cboxShadowTrim(rmark)
   }
   if n is ForIn {
-    if !capHas(ndecls, n.fiVar) { ndecls.push(n.fiVar) }
-    if n.fiVar2 != "" {
-      if !capHas(ndecls, n.fiVar2) { ndecls.push(n.fiVar2) }
+    cboxScan(n.fiIter, depth, dlets, alam)
+    const imark = cboxShTrail.length
+    if depth > 0 {
+      cboxShadowPush(n.fiVar)
+      if n.fiVar2 != "" { cboxShadowPush(n.fiVar2) }
     }
-    cboxScan(n.fiIter, depth, dlets, alam, ndecls)
-    return cboxScan(n.fiBody, depth, dlets, alam, ndecls)
+    cboxScan(n.fiBody, depth, dlets, alam)
+    return cboxShadowTrim(imark)
   }
-  if n is RetStmt { return cboxScan(n.retArg, depth, dlets, alam, ndecls) }
-  if n is Unary { return cboxScan(n.unArg, depth, dlets, alam, ndecls) }
-  if n is Paren { return cboxScan(n.parInner, depth, dlets, alam, ndecls) }
-  if n is Member { return cboxScan(n.memObj, depth, dlets, alam, ndecls) }
-  if n is OptMember { return cboxScan(n.omObj, depth, dlets, alam, ndecls) }
+  if n is RetStmt { return cboxScan(n.retArg, depth, dlets, alam) }
+  if n is Unary { return cboxScan(n.unArg, depth, dlets, alam) }
+  if n is Paren { return cboxScan(n.parInner, depth, dlets, alam) }
+  if n is Member { return cboxScan(n.memObj, depth, dlets, alam) }
+  if n is OptMember { return cboxScan(n.omObj, depth, dlets, alam) }
   if n is Index {
-    cboxScan(n.idxArr, depth, dlets, alam, ndecls)
-    return cboxScan(n.idxIndex, depth, dlets, alam, ndecls)
+    cboxScan(n.idxArr, depth, dlets, alam)
+    return cboxScan(n.idxIndex, depth, dlets, alam)
   }
-  if n is IsExpr { return cboxScan(n.isObj, depth, dlets, alam, ndecls) }
-  if n is AsExpr { return cboxScan(n.asObj, depth, dlets, alam, ndecls) }
+  if n is IsExpr { return cboxScan(n.isObj, depth, dlets, alam) }
+  if n is AsExpr { return cboxScan(n.asObj, depth, dlets, alam) }
   if n is Call {
-    cboxScan(n.callFn, depth, dlets, alam, ndecls)
+    cboxScan(n.callFn, depth, dlets, alam)
     const args = n.callArgs
     let ci = 0
     while ci < args.length {
-      cboxScan(args[ci], depth, dlets, alam, ndecls)
+      cboxScan(args[ci], depth, dlets, alam)
       ci = ci + 1
     }
     return 0
@@ -1193,7 +1244,7 @@ function cboxScan(
     const es = n.arrElems
     let ei = 0
     while ei < es.length {
-      cboxScan(es[ei], depth, dlets, alam, ndecls)
+      cboxScan(es[ei], depth, dlets, alam)
       ei = ei + 1
     }
     return 0
@@ -1203,7 +1254,7 @@ function cboxScan(
     let fi = 0
     while fi < fs.length {
       const f = P.nodes[fs[fi]]
-      if f is FieldInit { cboxScan(f.fiValue, depth, dlets, alam, ndecls) }
+      if f is FieldInit { cboxScan(f.fiValue, depth, dlets, alam) }
       fi = fi + 1
     }
     return 0
@@ -1211,33 +1262,49 @@ function cboxScan(
   0
 }
 
+// How many nested function bodies `cboxWalk` is inside; a binding opened at depth 0 is the
+// maker's own and is boxed, one opened deeper shadows the maker's name.
+let cboxDepth = 0
+
 // Rewrites the maker body (and its nested lambda bodies): a use of a boxed name → `c[0]`,
-// and a boxed `let c = init` → `let c = [init]`. Returns the (possibly replaced) node index
-// so parents reassign — mirrors `drwWalk`, plus descending into `FuncDecl` bodies.
+// and a boxed `let c = init` → `let c = [init]`, except where a nested function's own
+// binding shadows the name. Returns the (possibly replaced) node index so parents
+// reassign — mirrors `drwWalk`, plus descending into `FuncDecl` bodies.
 function cboxWalk(ix: i32, boxed: string[]) {
   if ix < 0 { return ix }
   const n = P.nodes[ix]
   if n is Ident {
-    if capHas(boxed, n.identName) {
+    if capHas(boxed, n.identName) && (cboxShadow[n.identName] ?? 0) == 0 {
       return mkIndex(mkIdent(n.identName, -1), mkNum("0", -1), -1)
     }
     return ix
   }
   if n is FuncDecl {
+    const fmark = cboxShTrail.length
+    cboxShadowParams(ix)
+    cboxDepth = cboxDepth + 1
     n.fnBody = cboxWalk(n.fnBody, boxed)
+    cboxDepth = cboxDepth - 1
+    cboxShadowTrim(fmark)
     return ix
   }
   if n is Block {
+    const bmark = cboxShTrail.length
     const bs = n.blkStmts
     let i = 0
     while i < bs.length {
       bs[i] = cboxWalk(bs[i], boxed)
       i = i + 1
     }
+    cboxShadowTrim(bmark)
     return ix
   }
   if n is LetDecl {
     n.letInit = cboxWalk(n.letInit, boxed)
+    if cboxDepth > 0 {
+      cboxShadowPush(n.letName)
+      return ix
+    }
     if capHas(boxed, n.letName) {
       // Converts a scalar annotation to its array form so the boxed length-1 list classifies
       // as the matching list type (`let c: f64` → `let c: f64[]`, so the `[0.0]` literal
@@ -1300,12 +1367,21 @@ function cboxWalk(ix: i32, boxed: string[]) {
     n.frFrom = cboxWalk(n.frFrom, boxed)
     n.frTo = cboxWalk(n.frTo, boxed)
     n.frStep = cboxWalk(n.frStep, boxed)
+    const rmark = cboxShTrail.length
+    if cboxDepth > 0 { cboxShadowPush(n.frVar) }
     n.frBody = cboxWalk(n.frBody, boxed)
+    cboxShadowTrim(rmark)
     return ix
   }
   if n is ForIn {
     n.fiIter = cboxWalk(n.fiIter, boxed)
+    const imark = cboxShTrail.length
+    if cboxDepth > 0 {
+      cboxShadowPush(n.fiVar)
+      if n.fiVar2 != "" { cboxShadowPush(n.fiVar2) }
+    }
     n.fiBody = cboxWalk(n.fiBody, boxed)
+    cboxShadowTrim(imark)
     return ix
   }
   if n is RetStmt {
@@ -1415,9 +1491,9 @@ function cboxInitScalar(initIx: i32) {
   false
 }
 
-// Per top-level function: boxes each direct `let` that is assigned inside a nested lambda,
-// not shadowed, and has a scalar-literal init. Usage-gated — a program with no such local
-// rewrites nothing (identical bytes).
+// Per top-level function: boxes each direct `let` that is assigned inside a nested lambda
+// where no binding of the lambda shadows it, and has a scalar-literal init. Usage-gated — a
+// program with no such local rewrites nothing (identical bytes).
 export function captureBoxRewrite(_stmts: i32[]) {
   let fe = 0
   while fe < fnStmts.length {
@@ -1426,22 +1502,363 @@ export function captureBoxRewrite(_stmts: i32[]) {
       const dlets: string[] = []
       cboxDletSeen = Map()
       const alam: string[] = []
-      const ndecls: string[] = []
-      cboxScan(fn.fnBody, 0, dlets, alam, ndecls)
+      cboxScan(fn.fnBody, 0, dlets, alam)
       const boxed: string[] = []
       let di = 0
       while di < dlets.length {
         const nm = dlets[di]
         if capHas(alam, nm) {
-          if !capHas(ndecls, nm) {
-            if cboxInitScalar(cboxInitOf(fn.fnBody, nm)) { boxed.push(nm) }
-          }
+          if cboxInitScalar(cboxInitOf(fn.fnBody, nm)) { boxed.push(nm) }
         }
         di = di + 1
       }
       if boxed.length > 0 { fn.fnBody = cboxWalk(fn.fnBody, boxed) }
     }
     fe = fe + 1
+  }
+  cboxModuleFrame()
+}
+
+// The module frame's share of the rule: a `let` in a module-scope block is a start-function
+// local, captured by value like any maker's, so it boxes the same way. A top-level binding
+// is a global, which a closure assigns in place, and is not among these statements.
+function cboxModuleFrame() {
+  const dlets: string[] = []
+  cboxDletSeen = Map()
+  const alam: string[] = []
+  let si = 0
+  while si < startStmts.length {
+    cboxScan(startStmts[si], 0, dlets, alam)
+    si = si + 1
+  }
+  const boxed: string[] = []
+  let di = 0
+  while di < dlets.length {
+    const nm = dlets[di]
+    if capHas(alam, nm) {
+      let init = -1
+      let ii = 0
+      while ii < startStmts.length && init < 0 {
+        init = cboxInitOf(startStmts[ii], nm)
+        ii = ii + 1
+      }
+      if cboxInitScalar(init) { boxed.push(nm) }
+    }
+    di = di + 1
+  }
+  if boxed.length == 0 { return 0 }
+  let wi = 0
+  while wi < startStmts.length {
+    startStmts[wi] = cboxWalk(startStmts[wi], boxed)
+    wi = wi + 1
+  }
+  0
+}
+
+// ── shadow respelling (D2068) ─────────────────────────────────────────────────────────────
+// Capture questions are asked by name within a frame, while a binding is scoped by its block.
+// So a binding that makes such a question ambiguous is respelled here, with every read it
+// denotes; `shrDeclare` states which bindings those are.
+
+// The names read inside a function nested in the frame being walked.
+let shrLamNames: {[string]: i32} = Map()
+let shrLamAny = false
+// The module's top-level bindings and function names, visible from every frame.
+let shrGlobals: {[string]: i32} = Map()
+// Names a call in the unit being respelled spells as a method (`x.name()`): the checker may
+// resolve one to a local binding, and a member name is not an identifier this pass can follow,
+// so a binding of one in that unit is never respelled.
+let shrMethodNames: {[string]: i32} = Map()
+// Per source name, the spelling of its innermost open binding ("" when none is open) and the
+// frame depth that binding belongs to.
+let shrCur: {[string]: string} = Map()
+let shrCurDepth: {[string]: i32} = Map()
+// The names the frame being walked has bound so far, in any of its blocks.
+let shrFrameSeen: {[string]: i32} = Map()
+// The one spelling the frame being walked gives its bindings that shadow an enclosing frame's.
+let shrFrameShared: {[string]: string} = Map()
+let shrDepth = 0
+// The open bindings as (source name, shadowed spelling, shadowed depth), trimmed on scope exit.
+const shrTrailName: string[] = []
+const shrTrailPrev: string[] = []
+const shrTrailPrevDepth: i32[] = []
+let shrSerial = 0
+
+// Records in `shrLamNames` every identifier under `ix` that sits inside a nested function;
+// `inFn` says whether `ix` already does. An `else if` chain is walked along its spine.
+function shrCollect(ix: i32, inFn: boolean) {
+  let cur = ix
+  while cur >= 0 && cur < P.nodes.length {
+    const n = P.nodes[cur]
+    if n is Ident {
+      if inFn {
+        shrLamNames[n.identName] = 1
+        shrLamAny = true
+      }
+      return 0
+    }
+    let inner = inFn
+    if n is FuncDecl { inner = true }
+    const kids = nodeValueSpineChildren(cur)
+    let i = 0
+    while i < kids.length {
+      shrCollect(kids[i], inner)
+      i = i + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  0
+}
+
+// Records in `shrMethodNames` every name a call under `ix` spells as a method. An `else if`
+// chain is walked along its spine.
+function shrCollectMethods(ix: i32) {
+  let cur = ix
+  while cur >= 0 && cur < P.nodes.length {
+    const n = P.nodes[cur]
+    if n is Call {
+      const cf = P.nodes[unwrapParen(n.callFn)]
+      if cf is Member { shrMethodNames[cf.memProp] = 1 }
+      if cf is OptMember { shrMethodNames[cf.omProp] = 1 }
+    }
+    const kids = nodeValueSpineChildren(cur)
+    let i = 0
+    while i < kids.length {
+      shrCollectMethods(kids[i])
+      i = i + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  0
+}
+
+// A fresh spelling of `name`.
+function shrMint(name: string): string {
+  shrSerial = shrSerial + 1
+  name + "$s" + i32ToStr(shrSerial)
+}
+
+// Opens a binding of `name` and returns the spelling it carries. With `respell`, a binding a
+// nested function reads gets a unique spelling when another binding of the name is visible or
+// earlier in the frame, since captures resolve by name within a frame; one that shadows an
+// enclosing frame's binding or a module name, or the frame's shared spelling, gets that spelling.
+function shrDeclare(name: string, respell: boolean): string {
+  let sp = name
+  if respell && name != "" && (shrMethodNames[name] ?? 0) == 0 {
+    const open = (shrCur[name] ?? "") != ""
+    if (
+      (shrLamNames[name] ?? 0) == 1 &&
+      (open || (shrFrameSeen[name] ?? 0) == 1 || (shrGlobals[name] ?? 0) == 1)
+    ) {
+      sp = shrMint(name)
+    } else if (
+      (open && (shrCurDepth[name] ?? 0) < shrDepth) ||
+      (open && shrCur[name] == (shrFrameShared[name] ?? "")) ||
+      (!open && (shrGlobals[name] ?? 0) == 1)
+    ) {
+      const shared = shrFrameShared[name] ?? ""
+      if shared != "" {
+        sp = shared
+      } else {
+        sp = shrMint(name)
+        shrFrameShared[name] = sp
+      }
+    }
+  }
+  shrTrailName.push(name)
+  shrTrailPrev.push(shrCur[name] ?? "")
+  shrTrailPrevDepth.push(shrCurDepth[name] ?? 0)
+  shrCur[name] = sp
+  shrCurDepth[name] = shrDepth
+  shrFrameSeen[name] = 1
+  sp
+}
+
+// Closes the bindings opened since `mark` (a `shrTrailName.length`), so each name again
+// denotes what it denoted before them.
+function shrTrim(mark: i32) {
+  while shrTrailName.length > mark {
+    const top = shrTrailName.length - 1
+    shrCur[shrTrailName[top]] = shrTrailPrev[top]
+    shrCurDepth[shrTrailName[top]] = shrTrailPrevDepth[top]
+    shrTrailName.pop()
+    shrTrailPrev.pop()
+    shrTrailPrevDepth.pop()
+  }
+  0
+}
+
+// Opens function `fnIx`'s own frame — a fresh one, whose parameters keep their spellings and
+// whose nested functions' reads are collected anew — walks its body, and closes it again.
+function shrWalkFrame(fnIx: i32) {
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    const savedSeen = shrFrameSeen
+    const savedShared = shrFrameShared
+    const savedLam = shrLamNames
+    const savedAny = shrLamAny
+    shrFrameSeen = Map()
+    shrFrameShared = Map()
+    shrLamNames = Map()
+    shrLamAny = false
+    shrCollect(fn.fnBody, false)
+    shrDepth = shrDepth + 1
+    const mark = shrTrailName.length
+    const ps = fn.fnParams
+    let pi = 0
+    while pi < ps.length {
+      const p = P.nodes[ps[pi]]
+      if p is Param { shrDeclare(p.parName, false) }
+      pi = pi + 1
+    }
+    shrWalk(fn.fnBody)
+    shrTrim(mark)
+    shrDepth = shrDepth - 1
+    shrFrameSeen = savedSeen
+    shrFrameShared = savedShared
+    shrLamNames = savedLam
+    shrLamAny = savedAny
+  }
+  0
+}
+
+// Respells the bindings under `ix` that `shrDeclare` decides to, and every read of one. A
+// block closes its bindings and a loop its variables; an `else if` chain is walked along its
+// spine, so its depth costs no stack.
+function shrWalk(ix: i32) {
+  let cur = ix
+  while cur >= 0 && cur < P.nodes.length {
+    const n = P.nodes[cur]
+    if n is Ident {
+      const sp = shrCur[n.identName] ?? ""
+      if sp != "" && sp != n.identName {
+        n.identName = sp
+        sidNoteNodeName(cur)
+      }
+      return 0
+    }
+    if n is LetDecl {
+      shrWalk(n.letInit)
+      const lsp = shrDeclare(n.letName, true)
+      if lsp != n.letName {
+        n.letName = lsp
+        sidNoteNodeName(cur)
+      }
+      return 0
+    }
+    if n is Block {
+      const bmark = shrTrailName.length
+      const bs = n.blkStmts
+      let bi = 0
+      while bi < bs.length {
+        shrWalk(bs[bi])
+        bi = bi + 1
+      }
+      shrTrim(bmark)
+      return 0
+    }
+    if n is ForRange {
+      shrWalk(n.frFrom)
+      shrWalk(n.frTo)
+      shrWalk(n.frStep)
+      const rmark = shrTrailName.length
+      const rsp = shrDeclare(n.frVar, true)
+      if rsp != n.frVar {
+        n.frVar = rsp
+        sidNoteNodeName(cur)
+      }
+      shrWalk(n.frBody)
+      shrTrim(rmark)
+      return 0
+    }
+    if n is ForIn {
+      shrWalk(n.fiIter)
+      const imark = shrTrailName.length
+      const isp = shrDeclare(n.fiVar, true)
+      if isp != n.fiVar {
+        n.fiVar = isp
+        sidNoteNodeName(cur)
+      }
+      if n.fiVar2 != "" { n.fiVar2 = shrDeclare(n.fiVar2, true) }
+      shrWalk(n.fiBody)
+      shrTrim(imark)
+      return 0
+    }
+    if n is FuncDecl {
+      if n.fnName != "" { shrDeclare(n.fnName, false) }
+      return shrWalkFrame(cur)
+    }
+    const kids = nodeValueSpineChildren(cur)
+    let i = 0
+    while i < kids.length {
+      shrWalk(kids[i])
+      i = i + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  0
+}
+
+// The pass: the module frame's statements, then each top-level function, each walked only
+// when a closure inside it reads some name. Runs before any pass that asks about captures.
+export function shadowRespell(stmts: i32[]) {
+  shrGlobals = Map()
+  let gi = 0
+  while gi < stmts.length {
+    const g = P.nodes[stmts[gi]]
+    if g is LetDecl { shrGlobals[g.letName] = 1 }
+    if g is FuncDecl {
+      if g.fnName != "" { shrGlobals[g.fnName] = 1 }
+    }
+    gi = gi + 1
+  }
+  shrDepth = 0
+  shrMethodNames = Map()
+  shrLamNames = Map()
+  shrLamAny = false
+  let mi = 0
+  while mi < stmts.length {
+    if P.nodes[stmts[mi]] !is FuncDecl {
+      shrCollect(stmts[mi], false)
+      shrCollectMethods(stmts[mi])
+    }
+    mi = mi + 1
+  }
+  if shrLamAny {
+    shrCur = Map()
+    shrCurDepth = Map()
+    shrFrameSeen = Map()
+    shrFrameShared = Map()
+    let si = 0
+    while si < stmts.length {
+      const st = P.nodes[stmts[si]]
+      if st is LetDecl {
+        // A top-level binding is a module global rather than a frame local, so only its
+        // initialiser, which may hold a closure, is walked.
+        shrWalk(st.letInit)
+      } else if st !is FuncDecl {
+        shrWalk(stmts[si])
+      }
+      si = si + 1
+    }
+    shrTrim(0)
+  }
+  let fi = 0
+  while fi < stmts.length {
+    const fn = P.nodes[stmts[fi]]
+    if fn is FuncDecl {
+      shrLamNames = Map()
+      shrLamAny = false
+      shrCollect(fn.fnBody, false)
+      if shrLamAny {
+        shrMethodNames = Map()
+        shrCollectMethods(fn.fnBody)
+        shrCur = Map()
+        shrCurDepth = Map()
+        shrWalkFrame(stmts[fi])
+      }
+    }
+    fi = fi + 1
   }
   0
 }

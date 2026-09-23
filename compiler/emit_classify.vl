@@ -225,6 +225,7 @@ import {
   Paren,
   Program,
   RetStmt,
+  Spread,
   StrLit,
   TS_FUNC,
   TS_OBJ,
@@ -4328,10 +4329,33 @@ function capSiblingFrees(name: string, bound: {[string]: i32}, caps: string[]) {
   0
 }
 
-// Walk a statement or expression subtree collecting free-variable captures. `bound` grows as
-// `let` declarations are seen: wasm locals are function-scoped, so once declared a name
-// shadows an enclosing binding for the rest of the body. A nested `FuncDecl` is not
-// descended, being lifted to its own function with its own capture analysis.
+// The names `capScan` has bound, in the scopes still open, that the enclosing scope leaves
+// unbound, so leaving a block or loop unbinds exactly those (D2068). A name the enclosing scope
+// binds needs no entry: it stays bound on the way out.
+const capTrailName: string[] = []
+
+// Binds `name` in `bound` for the rest of the innermost open scope.
+function capBind(bound: {[string]: i32}, name: string) {
+  if (bound[name] ?? 0) == 1 { return 0 }
+  capTrailName.push(name)
+  bound[name] = 1
+  0
+}
+
+// Closes the scopes opened since `mark` (a `capTrailName.length`), unbinding what they bound so
+// the enclosing name is visible, and capturable, again.
+function capTrim(bound: {[string]: i32}, mark: i32) {
+  while capTrailName.length > mark {
+    bound[capTrailName[capTrailName.length - 1]] = 0
+    capTrailName.pop()
+  }
+  0
+}
+
+// Walk a statement or expression subtree collecting free-variable captures. `bound` holds
+// the names the scopes open at this point bind: a `let` binds to the end of its block and a
+// loop variable to the end of its loop, as the checker scopes them. A nested `FuncDecl` is
+// scanned against its own bound set and folds only its free names into this one.
 export function capScan(ix: i32, bound: {[string]: i32}, caps: string[]) {
   if ix < 0 { return 0 }
   const n = P.nodes[ix]
@@ -4340,7 +4364,7 @@ export function capScan(ix: i32, bound: {[string]: i32}, caps: string[]) {
     return 0
   }
   if n is FuncDecl {
-    if n.fnName != "" { bound[n.fnName] = 1 }
+    if n.fnName != "" { capBind(bound, n.fnName) }
     // A nested function's free variables that this scope does not bind are transitive
     // captures: the nested closure's env is built inside this lifted function, so a name the
     // nested body needs from an outer frame must ride this env too. Scan the nested body
@@ -4375,6 +4399,7 @@ export function capScan(ix: i32, bound: {[string]: i32}, caps: string[]) {
     const stmts = n.blkStmts
     let i = 0
     const savedBlkTop = narrowTop
+    const mark = capTrailName.length
     while i < stmts.length {
       capScan(stmts[i], bound, caps)
       // A guard `if` with no else whose then-branch always leaves narrows the rest of the
@@ -4383,12 +4408,13 @@ export function capScan(ix: i32, bound: {[string]: i32}, caps: string[]) {
       if cnRecording { cnPostGuard(stmts[i]) }
       i = i + 1
     }
+    if capTrailName.length > mark { capTrim(bound, mark) }
     if cnRecording { restoreNarrow(savedBlkTop) }
     return 0
   }
   if n is LetDecl {
     if n.letInit >= 0 { capScan(n.letInit, bound, caps) }
-    bound[n.letName] = 1
+    capBind(bound, n.letName)
     return 0
   }
   if n is RetStmt {
@@ -4437,15 +4463,19 @@ export function capScan(ix: i32, bound: {[string]: i32}, caps: string[]) {
     capScan(n.frFrom, bound, caps)
     capScan(n.frTo, bound, caps)
     if n.frStep >= 0 { capScan(n.frStep, bound, caps) }
-    bound[n.frVar] = 1
+    const rmark = capTrailName.length
+    capBind(bound, n.frVar)
     capScan(n.frBody, bound, caps)
+    capTrim(bound, rmark)
     return 0
   }
   if n is ForIn {
     capScan(n.fiIter, bound, caps)
-    bound[n.fiVar] = 1
-    if n.fiVar2 != "" { bound[n.fiVar2] = 1 }
+    const imark = capTrailName.length
+    capBind(bound, n.fiVar)
+    if n.fiVar2 != "" { capBind(bound, n.fiVar2) }
     capScan(n.fiBody, bound, caps)
+    capTrim(bound, imark)
     return 0
   }
   if n is Call {
@@ -4539,6 +4569,10 @@ export function capScan(ix: i32, bound: {[string]: i32}, caps: string[]) {
       capScan(elems[i], bound, caps)
       i = i + 1
     }
+    return 0
+  }
+  if n is Spread {
+    capScan(n.spdArg, bound, caps)
     return 0
   }
   0
@@ -4941,11 +4975,13 @@ export function capNarrowBuild() {
   cnScanFnIx = -1
   const sbound: {[string]: i32} = Map()
   const scaps: string[] = []
+  const smark = capTrailName.length
   let si = 0
   while si < startStmts.length {
     capScan(startStmts[si], sbound, scaps)
     si = si + 1
   }
+  capTrim(sbound, smark)
   cnRecording = false
   cnScanFnIx = -1
   restoreNarrow(savedTop)
