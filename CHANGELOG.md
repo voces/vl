@@ -853,6 +853,20 @@ new: the compare-frame pre-pass never recurses into a code-15 field, so a NESTED
   0.487 → 0.406 s; an f64 `acc * SCALE + OFF` loop and both loops on V8 (deno 2.9) do not move.
   `-O3` now drops `str-eq`'s `ALPHA` header allocation (allocs 16 → 15). Fixpoint holds,
   distilled corpus 0 cells moved. Test `tests/vl_immutable_const_global_test.ts`; row D2176 closed.
+- **A field write in a value-yielding tail arm yields its value, and a captured literal-union
+  `let` stores the atom (D2170, D2168).** A recursive BST `insert` with no declared result and
+  `if n.left == null { n.left = { … } } else { insert(n.left, v) }` trapped `unreachable`: the
+  emitter delivers an assignment's value by re-reading its target, which it admitted only for a
+  field whose type is the value's, so the arm had nothing to yield. In a function the emitter
+  gives a result, a tail field or element write now spills its right-hand side (`const v = r;
+  t = v; v`), and a result the return walk left at `i32` takes the struct row of the checker's
+  function type, so an `if` joining two struct locals no longer declares `(result i32)`.
+  Separately, the cell `captureBoxRewrite` makes of a captured `let k: K` now carries its list
+  type, so `k = "ww"` inside a closure stores the atom, and an assignment's value is an atom
+  exactly when its target is. The compiler's own codegen is unchanged (master's source compiles
+  byte-identically); the seed grows 5.9 KB of new compiler code. Residue D2171–D2174 filed.
+  Fixtures `conditionals/tail-if-field-assign-arm.vl`, `closures/captured-litunion-assign.vl`.
+
 - **A long closure body compiles in linear time (D2017, plumb's generated closures).** Every
   read of a name the closure does not bind asked for its capture set, and before emission
   each ask re-walked the whole lifted body, so a 2,500-arm `match` closure took 127 s against

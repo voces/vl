@@ -23201,7 +23201,10 @@ function callResultAtomTexts(ix: i32, fnIx: i32): string[] {
     const ft = cloCallCalleeFnTy(c, fnIx)
     if ft >= 0 {
       const t = T.tys[ft]
-      if t is TyFunc { return tyLitMemberTexts(t.fnRet) }
+      if t is TyFunc {
+        const ftx = tyLitMemberTexts(t.fnRet)
+        if ftx.length > 0 { return ftx }
+      }
     }
     if cn.callFn < 0 { return none }
     if P.nodes[cn.callFn] is Ident {
@@ -23210,6 +23213,15 @@ function callResultAtomTexts(ix: i32, fnIx: i32): string[] {
         const cf = P.nodes[fnStmts[target]]
         if cf is FuncDecl {
           if cf.fnRet >= 0 { return tyLitMemberTexts(nodeTyIxOf(cf.fnRet)) }
+          // An inferred atom result whose checked type is wider than the atom — the value of
+          // an assignment to a literal-union cell types as the right-hand side's `string` —
+          // takes its members from the returned expression, the same one `fRetLitAtom` read.
+          if target < fRetLitAtom.length && fRetLitAtom[target] == 1 {
+            const rx = fnRetExprOf(fnStmts[target])
+            if rx >= 0 {
+              return tyLitMemberTexts(litAtomMemberTy(rx, fnStmts[target]))
+            }
+          }
         }
       }
     }
@@ -23238,10 +23250,15 @@ function memberAtomFieldTexts(ix: i32, fnIx: i32): string[] {
 function litAtomMemberTyAt(exprIx: i32, fnIx: i32, depth: i32): i32 {
   if exprIx < 0 { return 0 - 1 }
   const ix = unwrapParen(exprIx)
+  const e = P.nodes[ix]
+  // An assignment's atom is its target's re-read, so the target's type names the members,
+  // not the right-hand side's narrower one.
+  if e is BinExpr {
+    if e.binOp == "=" { return litAtomMemberTyAt(e.binLeft, fnIx, depth) }
+  }
   const direct = nodeTyIxOf(ix)
   if tyIsLitUnion(direct) { return direct }
   if depth >= declFallbackDepthCap() { return 0 - 1 }
-  const e = P.nodes[ix]
   if e is Index { return arrElemLitUnionTyAt(e.idxArr, fnIx, depth + 1) }
   if e is Ident {
     const slot = declaredSlotOf(e.identName)
@@ -23323,6 +23340,14 @@ export function exprIsLitAtom(exprIx: i32, fnIx: i32) {
   // a bare i32 and every atom consumer saw a number instead of the member.
   if coalesceLitUnionFits(exprIx, fnIx) { return true }
   const e = P.nodes[unwrapParen(exprIx)]
+  // An assignment's value is lowered as a re-read of its target, so it is an atom exactly
+  // when that target is (D2168).
+  if e is BinExpr {
+    if e.binOp == "=" {
+      if !assignTargetReReads(unwrapParen(exprIx), fnIx) { return false }
+      return exprIsLitAtom(e.binLeft, fnIx)
+    }
+  }
   if e is Ident {
     // A captured variable, resolved against the enclosing frame's binding — the same node
     // `captureValKind` sizes the env field from, checked first because a capture shadows
@@ -25910,6 +25935,9 @@ export function exprStruct(exprIx: i32, fnIx: i32) {
   // `S | null` instead, since a stored null is preserved through `??` — `exprNullableStruct`
   // claims that arm, not this one.
   if e is BinExpr {
+    // A name's assignment yields a re-read of its cell, so it is the name's struct (D2170).
+    const asgCell = asgCellOf(exprIx)
+    if asgCell >= 0 { return exprStruct(asgCell, fnIx) }
     const cms = coalesceMvSlot(exprIx, fnIx)
     if cms >= 0 {
       // A nullable-value slot with a NON-null default coalesces to the non-null struct too
@@ -25963,7 +25991,16 @@ export function exprStruct(exprIx: i32, fnIx: i32) {
     // never grew. Without it, a lambda whose body is a bare captured struct minted its
     // `$fnsig` result i32 over a body returning `(ref $S)` — two functypes, invalid wasm.
     if capturedKindOf(fnIx, e.identName) == "struct" { return true }
-    return globalIsStructSid(fnIx, sidOfNode(exprIx))
+    if globalIsStructSid(fnIx, sidOfNode(exprIx)) { return true }
+    // The frame's own `let`, asked outside the frame's emission, where `declaredStruct` has no
+    // collected slot to read: the kind `structIndexOfExpr`'s frame leg already names a row for.
+    const fli = frameLetOf(fnIx, e.identName)
+    if fli >= 0 && !letIsVariant(fli, fnIx) {
+      if structIndexOfLet(fli, fnIx) >= 0 {
+        return !exprNullableStruct(exprIx, fnIx)
+      }
+    }
+    return false
   }
   // `xs[i]` over a STRUCT-element ref list yields the struct (G7-ref). Per-slot: the
   // element kind comes from the receiver's distinct ref-list slot (1 = struct).
@@ -25979,6 +26016,20 @@ export function exprStruct(exprIx: i32, fnIx: i32) {
   // A NULLABLE struct value (`S | null`) participates in the struct machinery
   // (member layout resolution); the field-read path inserts the non-null recover.
   exprNullableStruct(exprIx, fnIx)
+}
+
+// The target of the assignment at `ix` when that target is a name, whose re-read is how the
+// assignment's value is lowered; -1 for any other node or target.
+function asgCellOf(ix: i32): i32 {
+  const e = P.nodes[ix]
+  if e is BinExpr {
+    if e.binOp == "=" {
+      const t = unwrapParen(e.binLeft)
+      if t < 0 { return -1 }
+      if P.nodes[t] is Ident { return t }
+    }
+  }
+  -1
 }
 
 // True if the already-collected declared local `name` is a nullable struct (code 9).
@@ -27067,6 +27118,8 @@ export function structIndexOfExpr(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return -1 }
   const e = P.nodes[exprIx]
   if e is ObjLit { return structIndexOfObjCtx(exprIx, fnIx) }
+  const asgCell = asgCellOf(exprIx)
+  if asgCell >= 0 { return structIndexOfExpr(asgCell, fnIx) }
   if e is Paren { return structIndexOfExpr(e.parInner, fnIx) }
   // An if-EXPRESSION whose join is a struct (`const b = if c { mk(1) } else { mk(2) }`): the
   // THEN arm's struct index classifies the whole `if` (the checker proved the arms agree), so an

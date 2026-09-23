@@ -9,6 +9,7 @@
 import { arrElemNameRaw, nameIsArray, nameIsSpaceFree } from "./tyname"
 import {
   annUnionAtomsOf,
+  ifYieldsNoValue,
   inferRetFnKey,
   inferRetIsNulList,
   inferRetNameByNode,
@@ -37,6 +38,7 @@ import {
   nodeTyIsUnion,
   nodeTyIxOf,
   nodeTyName,
+  nodeTyRecord,
   numLitUnionAliasName,
   numLitUnionBaseName,
   numLitUnionHasBase,
@@ -96,11 +98,13 @@ import {
   mkIdent,
   mkIf,
   mkIndex,
+  mkLet,
   mkMember,
   mkNull,
   mkNum,
   mkOptMember,
   mkParam,
+  nodeChildren,
   nodeValueSpineChildren,
   orderArgsByParamNames,
   paramDefaultIsCallsite,
@@ -806,10 +810,188 @@ export function dispatchRewrite(stmts: i32[]) {
     if fn is FuncDecl {
       drwCloNames.clear()
       fn.fnBody = drwWalk(fn.fnBody, fnStmts[fe])
+      if fe < fRetVoid.length && fRetVoid[fe] == 0 {
+        spillTail(fn.fnBody, fnStmts[fe])
+      }
     }
     fe = fe + 1
   }
   0
+}
+
+// ── value-position assignments the target cannot re-read (D2170) ────────────────────────────
+// An assignment yields its right-hand side, which a re-read of the target delivers at the
+// value's rep only for a name. So in a function that yields a value, a tail write to a field
+// or element `t = r` becomes `const v = r; t = v; v`.
+
+// Spills the value-position tail of the block at `blockIx`: its last statement, or every arm
+// of a last `if` the checker says yields a value.
+function spillTail(blockIx: i32, fnIx: i32) {
+  if blockIx < 0 { return 0 }
+  const b = P.nodes[blockIx]
+  if b is Block {
+    const n = b.blkStmts.length
+    if n == 0 { return 0 }
+    const last = b.blkStmts[n - 1]
+    if P.nodes[last] is IfStmt {
+      if ifYieldsNoValue(last) { return 0 }
+      let cur = last
+      while cur >= 0 {
+        const c = P.nodes[cur]
+        cur = elseIfLink(cur)
+        if c is IfStmt {
+          spillTail(c.ifThen, fnIx)
+          if cur < 0 { spillTail(c.ifElse, fnIx) }
+        }
+      }
+      return 0
+    }
+    if spillWanted(last, fnIx) {
+      const a = P.nodes[last]
+      if a is BinExpr {
+        const name = "asg#" + i32ToStr(last)
+        const decl = mkLet("const", name, -1, a.binRight, a.pos)
+        nodeTyCarry(decl, a.binRight)
+        const use = mkIdent(name, a.pos)
+        nodeTyCarry(use, a.binRight)
+        const val = mkIdent(name, a.pos)
+        nodeTyCarry(val, a.binRight)
+        a.binRight = use
+        b.blkStmts[n - 1] = decl
+        b.blkStmts.push(last)
+        b.blkStmts.push(val)
+        capMemoNoteEdit()
+      }
+    }
+  }
+  0
+}
+
+// Whether the statement at `ix` is a field or element write whose spill cannot be observed.
+// The spill evaluates the target after the right-hand side, so the target must be a pure path
+// the right-hand side cannot rebind: not by a write inside it, nor by a call when a name is
+// not the frame's own.
+function spillWanted(ix: i32, fnIx: i32): boolean {
+  const a = P.nodes[ix]
+  if a is BinExpr {
+    if a.binOp != "=" { return false }
+    if P.nodes[unwrapParen(a.binLeft)] is Ident { return false }
+    if !exprReReadable(a.binLeft) { return false }
+    const names: string[] = []
+    spillPathNames(a.binLeft, names)
+    let i = 0
+    while i < names.length {
+      if spillWrites(a.binRight, names[i]) { return false }
+      if spillHasCall(a.binRight) && !spillFrameOwned(fnIx, names[i]) {
+        return false
+      }
+      i = i + 1
+    }
+    return true
+  }
+  false
+}
+
+// Pushes every identifier the pure path at `ix` reads onto `out`.
+function spillPathNames(ix: i32, out: string[]) {
+  if ix < 0 { return 0 }
+  const n = P.nodes[ix]
+  if n is Ident { out.push(n.identName) }
+  const ks = nodeChildren(ix)
+  let i = 0
+  while i < ks.length {
+    spillPathNames(ks[i], out)
+    i = i + 1
+  }
+  0
+}
+
+// Whether the subtree at `ix` assigns or increments the name `nm`.
+function spillWrites(ix: i32, nm: string): boolean {
+  if ix < 0 { return false }
+  const n = P.nodes[ix]
+  let tgt = -1
+  if n is BinExpr {
+    if n.binOp == "=" { tgt = unwrapParen(n.binLeft) }
+  }
+  if tgt >= 0 {
+    const t = P.nodes[tgt]
+    if t is Ident {
+      if t.identName == nm { return true }
+    }
+  }
+  const ks = nodeChildren(ix)
+  let i = 0
+  while i < ks.length {
+    if spillWrites(ks[i], nm) { return true }
+    i = i + 1
+  }
+  false
+}
+
+// Whether the subtree at `ix` calls anything.
+function spillHasCall(ix: i32): boolean {
+  if ix < 0 { return false }
+  if P.nodes[ix] is Call { return true }
+  const ks = nodeChildren(ix)
+  let i = 0
+  while i < ks.length {
+    if spillHasCall(ks[i]) { return true }
+    i = i + 1
+  }
+  false
+}
+
+// Whether `nm` is a parameter or local of the function at `fnIx` that no function nested in
+// it assigns, so no call can rebind it. A global or a capture answers false.
+function spillFrameOwned(fnIx: i32, nm: string): boolean {
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    let own = false
+    let i = 0
+    while i < fn.fnParams.length {
+      const p = P.nodes[fn.fnParams[i]]
+      if p is Param {
+        if p.parName == nm { own = true }
+      }
+      i = i + 1
+    }
+    if !own { own = spillDeclares(fn.fnBody, nm) }
+    if !own { return false }
+    return !spillNestedWrites(fn.fnBody, nm)
+  }
+  false
+}
+
+// Whether the subtree at `ix` declares `nm` outside any function nested in it.
+function spillDeclares(ix: i32, nm: string): boolean {
+  if ix < 0 { return false }
+  const n = P.nodes[ix]
+  if n is FuncDecl { return false }
+  if n is LetDecl {
+    if n.letName == nm { return true }
+  }
+  const ks = nodeChildren(ix)
+  let i = 0
+  while i < ks.length {
+    if spillDeclares(ks[i], nm) { return true }
+    i = i + 1
+  }
+  false
+}
+
+// Whether a function nested in the subtree at `ix` assigns `nm`.
+function spillNestedWrites(ix: i32, nm: string): boolean {
+  if ix < 0 { return false }
+  const n = P.nodes[ix]
+  if n is FuncDecl { return spillWrites(n.fnBody, nm) }
+  const ks = nodeChildren(ix)
+  let i = 0
+  while i < ks.length {
+    if spillNestedWrites(ks[i], nm) { return true }
+    i = i + 1
+  }
+  false
 }
 
 // Pins every un-annotated lambda that returns a union to that union, consuming the
@@ -1105,6 +1287,11 @@ let cboxDletSeen: {[string]: i32} = Map()
 const cboxShadow: {[string]: i32} = Map()
 const cboxShTrail: string[] = []
 
+// The arena type of each boxed name's cell list, keyed by name, or absent when the binding
+// carries no annotation. The `c` a use is rewritten to reads it, so a store through `c[0]`
+// sees the element type the checker gave the binding (D2168).
+let cboxCellTy: {[string]: i32} = Map()
+
 function cboxShadowPush(name: string) {
   cboxShadow[name] = (cboxShadow[name] ?? 0) + 1
   cboxShTrail.push(name)
@@ -1282,7 +1469,13 @@ function cboxWalk(ix: i32, boxed: string[]) {
   const n = P.nodes[ix]
   if n is Ident {
     if capHas(boxed, n.identName) && (cboxShadow[n.identName] ?? 0) == 0 {
-      return mkIndex(mkIdent(n.identName, -1), mkNum("0", -1), -1)
+      // The cell `c` carries the type of its list, so an element question about `c[0]` has
+      // the binding's declared type to answer from. The read `c[0]` itself stays untyped:
+      // `assignTargetReReads` takes that as the mark of a captured cell.
+      const cell = mkIdent(n.identName, -1)
+      const cellTy = cboxCellTy[n.identName] ?? -1
+      if cellTy >= 0 { nodeTyRecord(cell, cellTy) }
+      return mkIndex(cell, mkNum("0", -1), -1)
     }
     return ix
   }
@@ -1325,12 +1518,16 @@ function cboxWalk(ix: i32, boxed: string[]) {
           // a single top-level atom: `nm + "[]"` is an array spelling only then — `"i32 |
           // string" + "[]"` denotes `i32 | (string[])`, so a composite keeps the name path.
           let boxedTy = -1
+          const elemTy = nodeTyIxOf(n.letType)
           if annUnionAtomsOf(n.letType) == 1 {
             if annArrowAt(lt.tyName) < 0 {
-              const elemTy = nodeTyIxOf(n.letType)
               if elemTy >= 0 { boxedTy = mkArrayTy(elemTy) }
             }
           }
+          // The cell's own type is the list of the declared type at every spelling; only the
+          // synthesized annotation's NAME is limited to the one-atom case above.
+          if boxedTy >= 0 { cboxCellTy[n.letName] = boxedTy }
+          else if elemTy >= 0 { cboxCellTy[n.letName] = mkArrayTy(elemTy) }
           n.letType = synthTypeRefTy(lt.tyName + "[]", -1, boxedTy)
         }
       }
@@ -1508,6 +1705,7 @@ export function captureBoxRewrite(_stmts: i32[]) {
     if fn is FuncDecl {
       const dlets: string[] = []
       cboxDletSeen = Map()
+      cboxCellTy = Map()
       const alam: string[] = []
       cboxScan(fn.fnBody, 0, dlets, alam)
       const boxed: string[] = []
@@ -1532,6 +1730,7 @@ export function captureBoxRewrite(_stmts: i32[]) {
 function cboxModuleFrame() {
   const dlets: string[] = []
   cboxDletSeen = Map()
+  cboxCellTy = Map()
   const alam: string[] = []
   let si = 0
   while si < startStmts.length {
