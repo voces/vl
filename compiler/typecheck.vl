@@ -924,6 +924,10 @@ let collRetFnNodes: i32[] = []
 // function's binding. Depth-tagged sparse rows, read through `lookupDepth` exactly like `collBind`.
 let objLitBindDepth: i32[] = []
 let objLitBindName: string[] = []
+// The same rows for an un-annotated binding of a list literal or a `Map()`/`Set()`, whose
+// container is built at the type it flows into; the readonly-only list rule leaves it to that.
+let ctnLitBindDepth: i32[] = []
+let ctnLitBindName: string[] = []
 
 // The un-inferred empty-collection floor: an un-annotated empty `[]` / `Map()` / `Set()` whose
 // element/key/value hole is never pinned — by an annotation or a downstream `.push`/`.set`/
@@ -7061,6 +7065,8 @@ function isvalReset() {
   collBindName = []
   objLitBindDepth = []
   objLitBindName = []
+  ctnLitBindDepth = []
+  ctnLitBindName = []
   collRetFnNodes = []
   collapsedAliases = Map()
   annotCollapsed = Map()
@@ -7142,6 +7148,38 @@ function bindingIsObjLit(name: string) {
   bindMarkHas(objLitBindDepth, objLitBindName, name)
 }
 
+// Mark, and test, an un-annotated binding whose initializer is a list literal.
+function markCtnLitBinding(name: string, depth: i32) {
+  bindMarkPush(ctnLitBindDepth, ctnLitBindName, name, depth)
+}
+
+function bindingIsCtnLit(name: string) {
+  bindMarkHas(ctnLitBindDepth, ctnLitBindName, name)
+}
+
+// Is `ix` a `let`/`const` with no annotation and a list-literal or `Map()`/`Set()` initializer?
+function letDeclIsUnannotCtnLit(ix: i32): boolean {
+  const n = P.nodes[ix]
+  if n is LetDecl {
+    if n.letType >= 0 { return false }
+    if n.letInit < 0 { return false }
+    const iv = P.nodes[n.letInit]
+    if iv is ArrayLit { return true }
+    return exprIsCollCtorCall(n.letInit)
+  }
+  false
+}
+
+// Is `ix` a bare `Map()` / `Set()` constructor call?
+function exprIsCollCtorCall(ix: i32): boolean {
+  const iv = P.nodes[ix]
+  if iv is Call {
+    const cn = P.nodes[iv.callFn]
+    if cn is Ident { return cn.identName == "Map" || cn.identName == "Set" }
+  }
+  false
+}
+
 // Is `ix` a `let`/`const` with no annotation and an object-literal initializer? The one shape
 // `markObjLitBinding` records, asked at both the hoist and the pass-2 declaration.
 function letDeclIsUnannotObjLit(ix: i32): boolean {
@@ -7159,6 +7197,7 @@ function letDeclIsUnannotObjLit(ix: i32): boolean {
 function collBindPopTo(depth: i32) {
   bindMarkPopTo(collBindDepth, collBindName, depth)
   bindMarkPopTo(objLitBindDepth, objLitBindName, depth)
+  bindMarkPopTo(ctnLitBindDepth, ctnLitBindName, depth)
 }
 
 // Mark or test a function declaration whose return annotation collapsed. Deduped: pass 1 hoists
@@ -8788,7 +8827,7 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
       // D2060 — the record twin: a field widened by this delivery is shared with the source,
       // so it is legal only where nothing the delivery reaches writes it.
       rcwPend(srcExpr, srcTy, dstTy)
-      if objShapeAdapterless(srcExpr, srcTy, dstTy, 12, true) {
+      if objShapeAdapterlessAt(srcExpr, srcTy, dstTy) {
         objShapeAdapterlessErr(srcExpr, srcTy, dstTy)
       }
     }
@@ -9164,6 +9203,14 @@ function arrElemRender(el: string, elTy: i32, elAtoms: i32): string {
   if tyIxIsFunc(elTy) { return "(" + el + ")[]" }
   if elAtoms > 1 { return "(" + el + ")[]" }
   el + "[]"
+}
+
+// Is arena index `ix` a `readonly T[]` view? Total in `ix`, like `tyIxIsFunc`.
+function tyIxIsView(ix: i32): boolean {
+  if ix < 0 || ix >= T.tys.length { return false }
+  const t = T.tys[ix]
+  if t is TyArray { return t.aRead == 1 }
+  false
 }
 
 // Is arena index `ix` a function type? Total in `ix`, and that is the whole reason it exists: `-1`
@@ -10926,8 +10973,11 @@ function tyToStrGo(ix: i32, nominal: boolean) {
       // A list render is one atom in every form — a wide element is parenthesized so its
       // `|`s stop being top-level. Set explicitly, since the element render left its own width behind.
       tyStrAtoms = 1
-      if t.aRead == 1 { return "readonly " + arrElemRender(el, t.aElem, elw) }
-      return arrElemRender(el, t.aElem, elw)
+      // A view element is grouped: `readonly T[][]` spells a view of `T[][]` (D2195).
+      let row = arrElemRender(el, t.aElem, elw)
+      if tyIxIsView(t.aElem) { row = "(" + el + ")[]" }
+      if t.aRead == 1 { return "readonly " + row }
+      return row
     }
     TyMap => {
       const mk = tyToStrAt(t.mKey, nominal)
@@ -15278,6 +15328,16 @@ function containerElemClassDiffers(se: i32, de: i32): boolean {
   sc != dc
 }
 
+// Is a list element `de` strictly wider than `se`, so a store through the wider handle could
+// put in a value `se` forbids? An inference hole or `never` source decides nothing yet.
+function listElemWidens(se: i32, de: i32): boolean {
+  if se < 0 || de < 0 { return false }
+  if se == de { return false }
+  if tyReachesHole(se, 8) || tyReachesHole(de, 8) { return false }
+  if primNameOf(se) == "never" { return false }
+  !assignable(de, se)
+}
+
 // —— which binding does a name mean: the frame table the write scan keys on (D1610/D1611) ——
 // A name is not a value: two functions may each bind `b` and mean two lists. Every predicate
 // below keys on the pair (name, frame), so a same-named handle another frame cannot reach
@@ -17564,8 +17624,9 @@ function covarWriteThroughErrAt(srcExpr: i32, srcTy: i32, dstTy: i32, at: i32) {
       "assignment is read-only. The two element storages differ, so the destination would " +
       "have to hold a converted copy, and a store through either handle would not be seen " +
       "through the other. Declare the source as " +
-      tyToStr(dstTy) +
-      " so both handles share one element storage, or drop the write",
+      tyToStr(listMutableTwin(dstTy)) +
+      " so both handles share one element storage, or copy it with " +
+      containerWidenCopyHintBare(srcTy, dstTy),
     at,
   )
 }
@@ -17582,7 +17643,7 @@ function ufcsRecvPinSeam(callIx: i32, recvTy: i32, selfTy: i32, at: i32) {
       covarWriteThroughErrAt(rx, recvTy, selfTy, at)
       return 0
     }
-    if objShapeAdapterless(rx, recvTy, selfTy, 12, true) {
+    if objShapeAdapterlessAt(rx, recvTy, selfTy) {
       objShapeAdapterlessErr(at, recvTy, selfTy)
     }
   }
@@ -19961,11 +20022,93 @@ function objFieldWidthPair(src: i32, dst: i32): boolean {
   false
 }
 
+// True while the walk is inside a value whose type inference chose rather than an annotation
+// (`srcIsInferredCtn`): its lists are built at the type they flow into, so the readonly-only
+// list rule leaves it alone, at any depth below.
+let shapeAdaptLitRoot = false
+
+// The entry to `objShapeAdapterless` for a whole delivery of `srcExpr`.
+function objShapeAdapterlessAt(srcExpr: i32, src: i32, dst: i32): boolean {
+  shapeAdaptLitRoot = false
+  objShapeAdapterless(srcExpr, src, dst, 12, true)
+}
+
+// Does any argument of `c` hand in an existing list? A list literal is new, so it does not.
+function callPassesList(c: Call): boolean {
+  let i = 0
+  while i < c.callArgs.length {
+    const aix = parenPeelIx(c.callArgs[i])
+    if aix < 0 || aix >= P.nodes.length { return false }
+    const ax = P.nodes[aix]
+    if ax is ArrayLit {
+      i = i + 1
+      continue
+    }
+    const at = nodeTyIxOf(c.callArgs[i])
+    if at >= 0 && at < T.tys.length {
+      const t = T.tys[at]
+      if t is TyArray { return true }
+    }
+    i = i + 1
+  }
+  false
+}
+
+// Is `srcExpr` a value no annotation typed: a name bound without one to an object, list or map
+// literal, or a call of a function whose result type no annotation fixes (no declared return, or
+// a generic one, which the call instantiates)?
+function srcIsInferredCtn(srcExpr: i32): boolean {
+  if srcExpr < 0 { return false }
+  const px = parenPeelIx(srcExpr)
+  if px < 0 || px >= P.nodes.length { return false }
+  const e = P.nodes[px]
+  if e is Ident {
+    return bindingIsObjLit(e.identName) || bindingIsCtnLit(e.identName)
+  }
+  callResultIsInferred(px)
+}
+
+// Is `ix` a call whose result type no annotation fixes (see `srcIsInferredCtn`)?
+function callResultIsInferred(ix: i32): boolean {
+  const e = P.nodes[ix]
+  if e is Call {
+    const cn = P.nodes[e.callFn]
+    if cn is Ident {
+      // The fill intrinsic builds a new list at the type it flows into.
+      if cn.identName == "__array_new__" { return true }
+      const fd = lookupFnDeclNode(cn.identName)
+      if fd >= 0 {
+        const f = P.nodes[fd]
+        if f is FuncDecl {
+          if f.fnRet < 0 { return true }
+          // A generic call builds its result only when no list goes in: `id(xs)` hands `xs` back.
+          if f.fnTyParams.length > 0 { return !callPassesList(e) }
+        }
+      }
+    }
+  }
+  false
+}
+
 // `direct` — is the destination a slot a `(ref $src)` can be written into as it stands?
 // True at a value flow, where a declared WasmGC supertype makes the reference fit. False
 // wherever the pair sits under something whose own wasm type has to relate by identity — an
 // array or map element, a function signature — since a struct-level `sub` edge does not reach those.
 function objShapeAdapterless(
+  srcExpr: i32,
+  src: i32,
+  dst: i32,
+  depth: i32,
+  direct: boolean,
+): boolean {
+  const saved = shapeAdaptLitRoot
+  if !saved && srcIsInferredCtn(srcExpr) { shapeAdaptLitRoot = true }
+  const r = objShapeAdapterlessGo(srcExpr, src, dst, depth, direct)
+  shapeAdaptLitRoot = saved
+  r
+}
+
+function objShapeAdapterlessGo(
   srcExpr: i32,
   src: i32,
   dst: i32,
@@ -20129,14 +20272,28 @@ function objShapeAdapterless(
         return true
       }
       if containerElemClassDiffers(s.aElem, d.aElem) {
-        // The converting copy (D965) admits three of these pairs, under the licence the ref
-        // copy already runs on: the copy is a snapshot, sound only where nothing writes the
-        // value. An unknown write state (2) keeps the refusal.
-        if scalarElemWidenServed(s.aElem, d.aElem) {
+        // Only a `readonly` destination takes the converting copy (D965), and only where
+        // nothing writes the source: the copy is a snapshot. An unknown write state (2) refuses.
+        if d.aRead == 1 && scalarElemWidenServed(s.aElem, d.aElem) {
           if covarValueWriteState(covarRootName(cx), covarRootFrame(cx)) == 0 {
             return false
           }
         }
+        shapeAdaptSrcTy = src
+        shapeAdaptDstTy = dst
+        shapeAdaptSrcExpr = cx
+        shapeAdaptElemPair = true
+        shapeAdaptWidthField = false
+        return true
+      }
+      // Only a `readonly` list is covariant (DECISIONS.md §"No implicit container widening"):
+      // a mutable wider handle, shared or copied, lets a store the source's element type
+      // forbids reach it or silently stop reaching it (D2161).
+      if (
+        d.aRead != 1 &&
+        !shapeAdaptLitRoot &&
+        listElemWidens(s.aElem, d.aElem)
+      ) {
         shapeAdaptSrcTy = src
         shapeAdaptDstTy = dst
         shapeAdaptSrcExpr = cx
@@ -20238,6 +20395,26 @@ function containerWidenCopyHint(src: i32, dst: i32): string {
   ", filling it from the source"
 }
 
+// The growable list over the same element as `ty` (a `readonly T[]` gives `T[]`), so a hint
+// naming a source's declaration never proposes a view the source is then written through.
+function listMutableTwin(ty: i32): i32 {
+  const t = T.tys[ty]
+  if t is TyArray {
+    if t.aRead == 1 { return mkArrayTy(t.aElem) }
+  }
+  ty
+}
+
+// The `.map` copy alone, without `containerWidenCopyHint`'s leading clause.
+function containerWidenCopyHintBare(src: i32, dst: i32): string {
+  const s = T.tys[src]
+  const d = T.tys[dst]
+  if s is TyArray {
+    if d is TyArray { return "`.map((x): " + tyToStr(d.aElem) + " => x)`" }
+  }
+  "a copy built at " + tyToStr(dst)
+}
+
 // Is `src` -> `dst` a list pair the read-only converting copy serves (D965)? Only those
 // are refused for being written rather than refused outright.
 function containerWidenServed(src: i32, dst: i32): boolean {
@@ -20247,6 +20424,35 @@ function containerWidenServed(src: i32, dst: i32): boolean {
     if d is TyArray { return scalarElemWidenServed(s.aElem, d.aElem) }
   }
   false
+}
+
+// Is `src` -> `dst` a list pair refused only because `dst` is mutable, so `readonly dst`
+// would accept it? A converting-copy pair (D965) or one whose element keeps its storage.
+function containerWidenReadonlyServes(src: i32, dst: i32): boolean {
+  const s = T.tys[src]
+  const d = T.tys[dst]
+  if s is TyArray {
+    if d is TyArray {
+      if d.aRead == 1 { return false }
+      if scalarElemWidenServed(s.aElem, d.aElem) { return true }
+      return !containerElemClassDiffers(s.aElem, d.aElem)
+    }
+  }
+  false
+}
+
+// The reason sentence for `containerWidenReadonlyServes`'s pairs: a copy that would stop
+// sharing writes, or a wider handle whose store the source's element type forbids.
+function containerWidenWhy(src: i32, dst: i32): string {
+  if containerWidenServed(src, dst) {
+    return "Its elements would be stored differently, so it would be a copy, and a write " +
+      "through either list would not reach the other."
+  }
+  "A store through " +
+    tyToStr(dst) +
+    " could put in an element that " +
+    tyToStr(src) +
+    " does not allow."
 }
 
 // Is `ty` stored as one of the four numeric element classes?
@@ -20298,14 +20504,39 @@ function objShapeAdapterlessErr(srcExpr: i32, src: i32, dst: i32) {
     return 0
   }
   // A design rule, not a missing lowering (DECISIONS.md §"No implicit container widening").
-  // A numeric pair delivered directly is refused only because the list may be written, so
-  // that message names the write; every other pair refuses read-only too.
+  // A mutable list pair `readonly` would accept names both fixes; a readonly copy pair is
+  // refused only because the source is written, so that message names the write.
   if shapeAdaptElemPair {
     let rule = ": a container never widens implicitly. Its elements would have to be stored " +
       "differently, which takes a copy, and a write through the copy would no longer reach " +
       "the original. Build it as "
     let hint = containerWidenCopyHint(sT, dT)
     let buildAs = dT
+    if containerWidenReadonlyServes(sT, dT) {
+      let which = "it"
+      // An inner list written in the source (a literal's element or field) can still be
+      // copied with `.map`; one reached only through a type is built at the outer one.
+      if through != "" {
+        which = "that list"
+        if sX < 0 { hint = ", or build it as " + tyToStr(dst) }
+      }
+      tErr(
+        tyToStr(sT) +
+          " is not " +
+          tyToStr(dT) +
+          through +
+          ": a container never widens implicitly, and only a readonly list is covariant. " +
+          containerWidenWhy(sT, dT) +
+          " Declare " +
+          which +
+          " `readonly " +
+          tyToStr(dT) +
+          "` for a read-only view" +
+          hint,
+        srcExpr,
+      )
+      return 0
+    }
     if through != "" {
       hint = ""
       buildAs = dst
@@ -23815,7 +24046,10 @@ export function substTyDeep(tyIx: i32, bNames: string[], bTys: i32[]) {
   let res = tyIx
   if t is TyArray {
     const e2 = substTyDeep(t.aElem, bNames, bTys)
-    if e2 != t.aElem { res = mkArrayTy(e2) }
+    // A `readonly T[]` stays a view once `T` is bound, or its covariance is lost.
+    if e2 != t.aElem {
+      if t.aRead == 1 { res = mkArrayViewTy(e2) } else { res = mkArrayTy(e2) }
+    }
   } else if t is TyNullable {
     const n2 = substTyDeep(t.nInner, bNames, bTys)
     if n2 != t.nInner { res = mkNullableTy(n2) }
@@ -30360,6 +30594,9 @@ function checkProgramNode(n: Program) {
         declare(sm.letName, mty)
         if letDeclIsUnannotObjLit(stmts[mi]) {
           markObjLitBinding(sm.letName, 0)
+        }
+        if letDeclIsUnannotCtnLit(stmts[mi]) {
+          markCtnLitBinding(sm.letName, 0)
         }
         moduleGlobals[sm.letName] = true
         // TDZ: in the dead-zone until pass 2 reaches the initializer.
@@ -38434,6 +38671,9 @@ function checkLetDeclNode(n: LetDecl, ix: i32) {
   // same thing at the same depth (D1609).
   if !preHoisted && letDeclIsUnannotObjLit(ix) {
     markObjLitBinding(n.letName, T.scopes.length - 1)
+  }
+  if !preHoisted && letDeclIsUnannotCtnLit(ix) {
+    markCtnLitBinding(n.letName, T.scopes.length - 1)
   }
   // D1048's second hint: marks a binding whose type came from a spelling that collapsed a
   // subsumed literal arm. A bare call initializer is the whole rung, deliberately narrow.

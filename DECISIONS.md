@@ -3763,15 +3763,37 @@ language refuses, and the message says so: `i32[] is not (i32 | null)[]: a conta
 widens implicitly … Build it as (i32 | null)[], or copy it with .map((x): i32 | null => x)`.
 The author writes the copy, or builds the container at the wide type from the start.
 
-**The read-only converting copy is the exception still standing** — the numeric element pairs
-`i32`→`f64`, `i32`→`i64`, `f32`→`f64`, and the ref pair `Circle[]` → `Shape[]`: a READ-ONLY
-direct delivery still compiles to a copy, which the owner has not yet ruled on. Until then their refusal names the
-write that forced it rather than the general rule — `i32[] is not f64[] here: this list is
-written (line 4), and a written container never widens implicitly …`, or `the list is WRITTEN
-THROUGH (line 4)` for the ref pair — so the message never contradicts a spelling that runs.
-Every copy the messages suggest compiles alone; D2166 is the one combination found that does
-not. A pair reached through an outer container names the outer type to build and no `.map`,
-since a nested `.map` into a list element is itself refused (D1482's literal).
+**Only a `readonly` list is covariant** (second ruling, same day). A MUTABLE wider list is
+refused whether its element changes storage (`i32[]` into `f64[]`, which would be a hidden copy)
+or keeps it (`C[]` into `(C | null)[]`, which would share the list and let a `null` reach the
+`C[]`, D2161), and the refusal says so and names both fixes: declare the destination
+`readonly (C | null)[]` for a read-only view, or copy with `.map((x): C | null => x)`. A pair reached through an
+outer container names the inner list to declare `readonly`, and `.map` where the inner value is
+spelled in the source. Every fix a message names builds, with one exception filed as D2193
+(`.map` into a nullable union-arm or nullable-list element).
+
+**A `readonly` destination keeps the converting copy for now.** `i32[]` into `readonly f64[]`
+and `Circle[]` into `readonly Shape[]` still lower as the D965/D791 element-converting copy,
+licensed where nothing writes the source, and every store position lowers it (push, indexed
+store, map store and global assignment, D2163). A view that shares storage is the follow-up; it
+would also close D2162, a `readonly` return the copy lets diverge from a later write.
+
+**Inference is not widening.** A value whose type no annotation fixed is left to inference: an
+un-annotated list literal is BUILT at the type it flows into, so there is no narrower handle.
+The rule stands aside for a name bound without an annotation to a list, object or map literal, a
+generic call no existing list goes into (`filled(2, { r: 1 })`), and a call of a function with
+no return annotation — the last too wide, since `function relay() { circles }` hands back an
+annotated list (D2194). An UN-ANNOTATED PARAMETER is not a destination at all: each call
+specialises the function at the argument's own type, so `function total(xs) { … }` runs over an
+`i32[]` and an `f64[]` with no copy (`unannotated-list-param-no-widening-runs.vl`).
+
+**What it cost, measured before landing.** The distilled corpus lost `runs` in exactly 8 cells
+(`d773_readonly_*`, `d791_*`, `d822_*`, `d852_escape_*`), every one an annotated `Circle[]`
+read as a mutable `Shape[]` through the retired copy. In `tests/cases` 31 fixtures moved: 26
+respelled with `readonly` destinations (the copy machinery they pin now serves `readonly` only),
+3 refusals reworded, and 2 that run unchanged once generic calls were exempted and D1798 closed.
+No `std` module is affected. A first cut that refused inferred sources too cost 620 corpus
+classes (12,170 census cells), all un-annotated literals, which is why inference stands aside.
 
 A method call's receiver is `self`'s argument and gets the same verdict in every spelling —
 `xs.f()`, `xs?.f()`, a generic `self`, and a receiver inside an un-annotated body, asked at
@@ -3785,31 +3807,15 @@ stored into an `i32` list). A copy the author wrote is visible at the call site;
 compiler inserted is not. `readonly T[]` (D1686/D1687) remains the one covariant spelling,
 because a read-only view needs neither a copy nor a write check.
 
-**What the ruling changed, and what it did not.** The refusal the checker already gave (every
-pair except the three numeric ones, and those three when written through) was worded as a
+**What the first ruling changed, and what it did not.** The refusal the checker already gave
+(every pair except the three numeric ones, and those three when written through) was worded as a
 capability gap — "type-valid … but not yet supported by codegen … no element-converting copy
 exists" — and counted by `goal-scoreboard.py` as a clause-2 concession. It is now a design
 refusal and leaves that count. That is not the relabelling the next section warns against: the
-rule comes from a ruling with a reason (aliasing), not from what the emitter happened to lower. **No program that ran stopped running:** the 2026-09-23 grid
-(29 element pairs × 9 positions × read-only / write-through-the-wide-handle /
-write-through-the-original, 765 cells) moved zero verdicts. Two groups of widenings the ruling
-does not want still RUN, and are the owner's to decide, because `runs → not-runs` is a veto:
-
-* **The read-only converting copy** (D791 for ref elements, D965 for `i32`→`f64`, `i32`→`i64`,
-  `f32`→`f64`): accepted where nothing writes either handle, at binding, argument, return,
-  assignment, struct field, literal element, global init and global assignment. Unobservable
-  when the licence is right; D2162 is a position where it is wrong (a write after a `return`
-  delivery, silently diverging) and D2163 the store positions where it is taken but never
-  lowered.
-* **The class-keeping widening, which SHARES the list**: `C[]` → `(C | null)[]`,
-  `string[]` → `(string | null)[]`, `i32[][]` → `(i32[] | null)[]`, `boolean[]` →
-  `(boolean | null)[]`, `K[]` → `(K | null)[]`. Sound for reads and for writes of the narrow
-  type; a `null` written through the wide handle reaches the narrow one (D2161, a trap or a wrong
-  value).
-
-The recommendation for both is the same: make `readonly` the only covariant spelling, which
-retires the copy and closes D2161 in one rule, priced by `elem-storage-class-widening-runs.vl`
-and the corpus before it lands.
+rule comes from a ruling with a reason (aliasing), not from what the emitter happened to lower.
+The 2026-09-23 grid (29 element pairs × 9 positions × read-only / write-through-the-wide-handle /
+write-through-the-original, 765 cells) moved zero verdicts under the first ruling; the second
+ruling, above, is the one that retired running programs, and it was priced first.
 
 ## Array covariance over ALIASING lists: what VL actually owes, priced (D411, D501, D661B, D741, D742)
 
@@ -3868,7 +3874,8 @@ which a two-destination binding in a non-generic function never reaches.
 reach). This is the answer that keeps both facts and costs no running program, because every
 cell that runs today stores through at most one handle. It is a real language feature: a second
 array type, a variance rule that reads it, and a decision about what `.push` does to it.
-Nothing has been built or priced.
+Nothing has been built or priced. **Since built** as `readonly T[]` (D1686/D1687), and since 2026-09-23 the ONLY
+covariant list spelling ("No implicit container widening", above).
 
 **(d) Value semantics for list assignment** (copy on assign). Changes aliasing for programs
 that run today, which is fact (1) above; D411's third enumerated option is the same observation
@@ -3933,8 +3940,9 @@ legal exactly where nothing it reaches WRITES a widened slot.
   `string`, a record into a boxed union, or an element still a type variable) is copied or
   refused by the container rule, so no handle is shared and this rule stands aside. One that
   keeps its storage is shared — a list of records whose fields widen, and D2161's `C[]` into
-  `(C | null)[]` — and this rule refuses a store the source's slot cannot hold. Whether such a
-  widening should be refused even where nothing writes is D2161's open question.
+  `(C | null)[]` — and this rule refuses a store the source's slot cannot hold. Since D2161's
+  close the list rule refuses such a widening at the delivery unless the destination is
+  `readonly`, so a shared list reaches this rule only as a view, whose own writes are refused.
 * **What a delivered union is, and when a read ends the path.** A union (or nullable) source
   delivered into a record is one of its members, so each member the record accepts contributes
   its own widened slots. A read of a scalar out of the value holds no slot a store can reach, so
