@@ -477,6 +477,11 @@ import {
   captureValStructIdx,
   cloRetValKind,
   cloRetValSlot,
+  dupMoreAt,
+  dupPassBegin,
+  dupPassClasses,
+  dupPassSeen,
+  dupScanIndex,
   envSlotShift,
   exprEmittedRefListSlot,
   exprHasMapOp,
@@ -1451,9 +1456,41 @@ function dupScanRun(fnIx: i32) {
   dupScanActive = frameHasDupLocalName()
   dupSlotBias = 0
   dupSlotMore = false
+  if dupScanActive { dupScanIndex(fnIx) }
+  // Per swept bias: its classes (`width` entries each) and the heads it looked up.
+  let width = 0
+  const swept: i32[] = []
+  const seenOff: i32[] = []
+  const seenHeads: i32[] = []
   let again = true
   while again {
-    if fnIx < 0 { startFnDetectScratch() } else { fnDetectScratch(fnIx) }
+    let twin = -1
+    let cls: i32[] = []
+    if dupScanActive {
+      cls = dupPassClasses(dupSlotBias)
+      width = cls.length
+      twin = sweptTwinOf(swept, width, cls)
+    }
+    // A bias resolving every name to the classes an earlier sweep saw is not re-swept: flags
+    // only set and lists dedupe, so it would add nothing (D2090).
+    if twin < 0 {
+      if dupScanActive { dupPassBegin() }
+      if fnIx < 0 { startFnDetectScratch() } else { fnDetectScratch(fnIx) }
+      if dupScanActive {
+        appendI32s(swept, cls)
+        seenOff.push(seenHeads.length)
+        appendI32s(seenHeads, dupPassSeen())
+      }
+    } else {
+      // The twin looked these names up; at this bias they raise what a sweep would.
+      let k = seenOff[twin]
+      let end = seenHeads.length
+      if twin + 1 < seenOff.length { end = seenOff[twin + 1] }
+      while k < end {
+        if dupMoreAt(seenHeads[k], dupSlotBias) { dupSlotMore = true }
+        k = k + 1
+      }
+    }
     again = false
     // The bias can only run past the match count, so `dupSlotMore` falls on its own;
     // `localNames.length` is the belt-and-braces bound (one pass per slot at most).
@@ -1476,6 +1513,30 @@ function dupScanRun(fnIx: i32) {
     blockLetHidden = false
   }
   0
+}
+
+// Append every entry of `src` onto `dst`, in place.
+function appendI32s(dst: i32[], src: i32[]) {
+  let i = 0
+  while i < src.length {
+    dst.push(src[i])
+    i = i + 1
+  }
+  0
+}
+
+// The index of the swept bias whose classes equal `cls`, or -1. `swept` holds `width` entries
+// per swept bias, in sweep order.
+function sweptTwinOf(swept: i32[], width: i32, cls: i32[]) {
+  if width < 1 { return -1 }
+  let b = 0
+  while (b + 1) * width <= swept.length {
+    let k = 0
+    while k < width && swept[b * width + k] == cls[k] { k = k + 1 }
+    if k == width { return b }
+    b = b + 1
+  }
+  -1
 }
 
 // Clears every start-function scratch flag, then detects the frames its body needs over the
