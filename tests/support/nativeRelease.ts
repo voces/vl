@@ -373,7 +373,9 @@ export const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3:
   {
     bench: "algorithms/lambda-hot",
     axis: "closure call in a hot loop, four spellings",
-    O: { bytes: 351, fns: 3, allocs: 1, indirect: 0 },
+    // D1999: functypes left the heap-type rec group, so `-O` merges identical signatures
+    // into one type; `-O` 351 -> 329 bytes is the type section alone, code and counts unchanged.
+    O: { bytes: 329, fns: 3, allocs: 1, indirect: 0 },
     O3: { bytes: 269, fns: 1, allocs: 0, indirect: 0 },
   },
   // HIGHER-ORDER BUILTINS. `xs.map(f).filter(g)` plus a `reduce`: the one shape where
@@ -391,7 +393,9 @@ export const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3:
   {
     bench: "algorithms/map-filter-reduce",
     axis: "map/filter/reduce callback pipeline",
-    O: { bytes: 869, fns: 4, allocs: 8, indirect: 0 },
+    // D1999: functypes left the heap-type rec group, so `-O` merges identical signatures
+    // into one type; `-O` 869 -> 809 bytes is the type section alone, code and counts unchanged.
+    O: { bytes: 809, fns: 4, allocs: 8, indirect: 0 },
     O3: { bytes: 688, fns: 1, allocs: 8, indirect: 0 },
   },
   // THE CONTROL FOR THE TWO ABOVE. A four-way dispatch table is genuinely dynamic, so
@@ -412,7 +416,9 @@ export const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3:
     // address-taken functions: one function was reachable only as a table entry. `indirect`
     // stayed 2 at both rungs while lambda-hot and map-filter-reduce went to 0, which is this
     // row discriminating a dynamic target from a devirtualisable one, exactly as intended.
-    O: { bytes: 672, fns: 5, allocs: 22, indirect: 2 },
+    // D1999: functypes left the heap-type rec group, so `-O` merges identical signatures
+    // into one type; `-O` 672 -> 644 bytes is the type section alone, code and counts unchanged.
+    O: { bytes: 644, fns: 5, allocs: 22, indirect: 2 },
     O3: { bytes: 453, fns: 5, allocs: 14, indirect: 2 },
   },
   // TAIL CALLS. `meta.json` still carries the `vlDefect` entry from when VL emitted a plain
@@ -500,7 +506,9 @@ export const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3:
     // instead of calling `__str_concat__`, so STATIC alloc sites rise where DYNAMIC
     // allocations fall (n - 1 -> 1 per chain execution): this row counts sites, and the
     // direction it moves is the opposite of the direction the work moves.
-    O: { bytes: 8005, fns: 16, allocs: 95, indirect: 0, refEq: 1 },
+    // D1999: functypes left the heap-type rec group, so `-O` merges identical signatures
+    // into one type; `-O` 8005 -> 7643 bytes is the type section alone, code and counts unchanged.
+    O: { bytes: 7643, fns: 16, allocs: 95, indirect: 0, refEq: 1 },
     O3: { bytes: 2147, fns: 5, allocs: 46, indirect: 0, refEq: 1 },
   },
   // MAP PROBE WITHOUT THE STRING COST. i32 keys, so this isolates the bucket walk and the
@@ -538,7 +546,9 @@ export const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3:
     // site carries a range test and a source-located trap message (the message is per-site
     // `__print_char__` code in the cold branch; see `emitNumCastTrapMsg`). `-O` 3383 -> 3617,
     // `-O3` 2890 -> 3099, structure unchanged at both rungs. One cast site, ~230 bytes.
-    O: { bytes: 3617, fns: 6, allocs: 51, indirect: 0, refEq: 1 },
+    // D1999: functypes left the heap-type rec group, so `-O` merges identical signatures
+    // into one type; `-O` 3617 -> 3215 bytes is the type section alone, code and counts unchanged.
+    O: { bytes: 3215, fns: 6, allocs: 51, indirect: 0, refEq: 1 },
     O3: { bytes: 3099, fns: 5, allocs: 50, indirect: 0, refEq: 1 },
   },
   // ARRAY ELEMENT WRITE + READ, 400M of each, with the allocation hoisted out of the steady
