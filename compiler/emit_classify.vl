@@ -4138,6 +4138,86 @@ export function captureCountOf(fe: i32) {
   caps.length
 }
 
+// The module-scope `for` binding `name` whose body holds the lifted frame `fe`, or -1. A
+// module loop variable is a start-function local, in scope only inside its own loop's body, so
+// a closure written anywhere else that spells the name means the global meaning (D2010).
+function moduleLoopEnclosing(fe: i32, name: string): i32 {
+  if !moduleBindsLoopVar(emitRootIx, name) { return -1 }
+  if fe < 0 || fe >= fnStmts.length { return -1 }
+  let at = fnStmts[fe]
+  if (
+    fe < fnInstOrigin.length &&
+    fnInstOrigin[fe] >= 0 &&
+    fnInstOrigin[fe] < fnStmts.length
+  ) {
+    at = fnStmts[fnInstOrigin[fe]]
+  }
+  const r = P.nodes[emitRootIx]
+  if r is Program {
+    const stmts = r.progStmts
+    let i = 0
+    while i < stmts.length {
+      const hit = modLoopHolding(stmts[i], name, at)
+      if hit >= 0 { return hit }
+      i = i + 1
+    }
+  }
+  -1
+}
+
+// `moduleLoopEnclosing`'s walk over one module-scope statement: the innermost loop binding
+// `name` whose body contains node `at`, or -1. Stops at a `FuncDecl`, which is its own frame.
+function modLoopHolding(ix: i32, name: string, at: i32): i32 {
+  if ix < 0 || ix >= P.nodes.length { return -1 }
+  const st = P.nodes[ix]
+  if st is ForIn {
+    const inner = modLoopHolding(st.fiBody, name, at)
+    if inner >= 0 { return inner }
+    if (
+      (st.fiVar == name || st.fiVar2 == name) &&
+      nodeSubtreeHas(st.fiBody, at)
+    ) {
+      return ix
+    }
+    return -1
+  }
+  if st is ForRange {
+    const inner = modLoopHolding(st.frBody, name, at)
+    if inner >= 0 { return inner }
+    if st.frVar == name && nodeSubtreeHas(st.frBody, at) { return ix }
+    return -1
+  }
+  if st is WhileStmt { return modLoopHolding(st.whileBody, name, at) }
+  if st is IfStmt {
+    const th = modLoopHolding(st.ifThen, name, at)
+    if th >= 0 { return th }
+    return modLoopHolding(st.ifElse, name, at)
+  }
+  if st is Block {
+    const kids = st.blkStmts
+    let i = 0
+    while i < kids.length {
+      const hit = modLoopHolding(kids[i], name, at)
+      if hit >= 0 { return hit }
+      i = i + 1
+    }
+  }
+  -1
+}
+
+// True when node `at` is `ix` or one of its descendants.
+function nodeSubtreeHas(ix: i32, at: i32): boolean {
+  if ix < 0 { return false }
+  if ix == at { return true }
+  const kids = nodeChildren(ix)
+  let i = 0
+  while i < kids.length {
+    if nodeSubtreeHas(kids[i], at) { return true }
+    i = i + 1
+  }
+  false
+}
+
 // A module global and a lifted function name are addressable directly from inside a lifted
 // function, so neither is a capture — unless an enclosing frame binds the same name, when
 // the identifier denotes that binding and dropping it leaves the body reading `global.get`.
@@ -4149,7 +4229,7 @@ function capRecord(name: string, bound: string[], caps: string[]) {
       // The module scope is the one enclosing scope the frame walk cannot reach, and it has
       // a binding form that is not a global: a top-level `for` variable. Without it a closure
       // in a top-level loop body addresses the module function instead of the loop variable.
-      if !moduleBindsLoopVar(emitRootIx, name) {
+      if moduleLoopEnclosing(capFrame, name) < 0 {
         capSiblingFrees(name, bound, caps)
         return 0
       }
@@ -4346,7 +4426,7 @@ export function capScan(ix: i32, bound: string[], caps: string[]) {
         if globalIndexOf(cal.identName) >= 0 { shadowed = true }
         if parentBindingFrameOf(capFrame, cal.identName) >= 0 {
           shadowed = true
-        } else if moduleBindsLoopVar(emitRootIx, cal.identName) {
+        } else if moduleLoopEnclosing(capFrame, cal.identName) >= 0 {
           // The frame walk stops short of the module scope, whose `for` variable is a
           // start-function local: `capRecord` reads the same table for the same reason.
           shadowed = true
@@ -4544,8 +4624,7 @@ function captureLoopVarIterOf(fe: i32, name: string): i32 {
   if par < 0 {
     // A module-scope `for` variable: a start-function local, typed with the frame -1 its
     // own `declareForInLocals` call passes, which is what the callers' frame reads answer.
-    if !moduleBindsLoopVar(emitRootIx, name) { return -1 }
-    const mlv = parentLoopVarOf(emitRootIx, name)
+    const mlv = moduleLoopEnclosing(fe, name)
     if mlv < 0 { return -1 }
     const mln = P.nodes[mlv]
     if mln is ForIn { return mln.fiIter }
