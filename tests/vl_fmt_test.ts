@@ -132,19 +132,24 @@ Deno.test({
   fn: async () => {
     // The printer reads the surface operator off the desugared node, so each of the eleven
     // `op=` forms must come back as itself. A generic close written flush against its `=`
-    // lexes as one `>=` / `>>=` / `>>>=` token; the output re-spacing it proves it parsed,
-    // since unparseable input is returned verbatim.
+    // lexes as one `>=` / `>>=` / `>>>=` token, and one flush against `==` as that token
+    // plus `=`; the output re-spacing each proves it parsed, since unparseable input is
+    // returned verbatim.
     const ops = ["+", "-", "*", "/", "%", "&", "|", "^", "<<", ">>", ">>>"];
     const src = "type Box<T> = { v: T }\n" +
       "const a: Box<i32>= { v: 1 }\n" +
       "const b: Box<Box<i32>>= { v: { v: 2 } }\n" +
       "const c: Box<Box<Box<i32>>>= { v: { v: { v: 3 } } }\n" +
+      "const d = a is Box<i32>== true\n" +
+      "const e = b is Box<Box<i32>>== true\n" +
       "let x = 1\n" +
       ops.map((op) => `x${op}=a.v+1\n`).join("");
     const want = "type Box<T> = { v: T }\n" +
       "const a: Box<i32> = { v: 1 }\n" +
       "const b: Box<Box<i32>> = { v: { v: 2 } }\n" +
       "const c: Box<Box<Box<i32>>> = { v: { v: { v: 3 } } }\n" +
+      "const d = a is Box<i32> == true\n" +
+      "const e = b is Box<Box<i32>> == true\n" +
       "let x = 1\n" +
       ops.map((op) => `x ${op}= a.v + 1\n`).join("");
     const r = await run([], src);

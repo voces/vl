@@ -123,7 +123,8 @@ same result type and is refused for the same reasons as the spelled-out form: `f
 The place is evaluated ONCE. In `xs[next()] ^= mask` or `current().bits |= flag`, the receiver
 and then the index are evaluated a single time, before the right-hand side, and the read and the
 write go to the same slot — a side-effecting index runs once, not twice. The same holds for
-`+=` and prefix `++`, and through a user-defined `"[]"`/`"[]="` pair.
+`+=` and prefix `++`, and through a user-defined `"[]"`/`"[]="` pair, whether it is the place
+itself or a read inside the receiver (`g[1][0] += 5` calls `g`'s `"[]"` once).
 
 ```vl
 let flags = 0

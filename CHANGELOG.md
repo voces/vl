@@ -1567,9 +1567,11 @@ new: the compare-frame pre-pass never recurses into a code-15 field, so a NESTED
   form (D2191)**: the target node was shared between the read and the write, so `xs[k()] += 4`
   called `k` twice. `dispatchRewrite` spills a receiver or index that is not re-readable to a
   `const` ahead of the statement, receiver first, keeping the target node so a user
-  `"[]"`/`"[]="` pair still resolves. **A generic close flush against `=` parses (D2192)**:
+  `"[]"`/`"[]="` pair still resolves; a user `"[]"` inside the receiver counts as a call. **A generic close flush against `=` parses (D2192)**:
   `Box<i32>= v` lexed as `>=` and was a parse error, and the new `>>=`/`>>>=` tokens would have
-  broken `Box<Box<i32>>= v`, which parsed before; `expectTypeGt` splits all three. Measured
+  broken `Box<Box<i32>>= v` and `u is Box<Box<i32>>== true`, which parsed before;
+  `expectTypeGt` splits all three, taking an abutting `=` into `==`, and rebuilds the token
+  stream rather than editing the array the entry token bank holds. Measured
   against a control seed built from master by the same compiler: 2,735 `tests/cases` modules
   byte-identical, 1 differing (`generics/nested-generic-call-spine-assign-targets.vl`, whose
   indices are calls), 0 lost, 2 gained (the new fixtures). Fixtures

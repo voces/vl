@@ -537,7 +537,7 @@ function drwWalk(ix: i32, ctx: i32) {
     while i2 < bs.length {
       // The spills land ahead of the write and are walked next, as ordinary statements.
       const cpOut: i32[] = []
-      if spillCompoundPlace(bs[i2], cpOut) {
+      if spillCompoundPlace(bs[i2], cpOut, ctx) {
         const cn = cpOut.length
         let cj = bs.length - 1
         while bs.length < cj + 1 + cn { bs.push(-1) }
@@ -808,7 +808,7 @@ export function dispatchRewrite(stmts: i32[]) {
       // locals of the start function rather than becoming module globals.
       let topIx = oldIx
       const topOut: i32[] = []
-      if spillCompoundPlace(oldIx, topOut) {
+      if spillCompoundPlace(oldIx, topOut, -1) {
         topOut.push(oldIx)
         topIx = mkBlock(topOut, P.nodes[oldIx].pos)
         capMemoNoteEdit()
@@ -931,7 +931,7 @@ function spillWrite(asgIx: i32, out: i32[]): i32 {
 // A compound write `p op= v` (or `++p`) reads its place through the same target node it
 // writes, so a receiver or index that is not re-readable would run twice. Spills each such
 // operand once, receiver first, onto `out` and points the target at the spill; true if any.
-function spillCompoundPlace(asgIx: i32, out: i32[]): boolean {
+function spillCompoundPlace(asgIx: i32, out: i32[], ctx: i32): boolean {
   const a = P.nodes[asgIx]
   if a is BinExpr {
     if a.binCompound == "" || a.binOp != "=" { return false }
@@ -939,8 +939,8 @@ function spillCompoundPlace(asgIx: i32, out: i32[]): boolean {
     if t < 0 { return false }
     const tn = P.nodes[t]
     if tn is Index {
-      if exprReReadable(tn.idxIndex) {
-        if exprReReadable(tn.idxArr) { return false }
+      if cpReReadable(tn.idxIndex, ctx) {
+        if cpReReadable(tn.idxArr, ctx) { return false }
         tn.idxArr = spillLocal(tn.idxArr, asgIx, "co", out, a.pos)
         return true
       }
@@ -949,21 +949,50 @@ function spillCompoundPlace(asgIx: i32, out: i32[]): boolean {
       tn.idxIndex = spillLocal(tn.idxIndex, asgIx, "ci", out, a.pos)
       return true
     }
-    return spillCompoundRecv(t, asgIx, out, a.pos)
+    return spillCompoundRecv(t, asgIx, out, a.pos, ctx)
   }
   false
 }
 
 // `spillCompoundPlace` for every target that is not an element: a field's receiver is spilled
 // when it is not re-readable, and a name has nothing to spill.
-function spillCompoundRecv(t: i32, asgIx: i32, out: i32[], pos: i32): boolean {
+function spillCompoundRecv(
+  t: i32,
+  asgIx: i32,
+  out: i32[],
+  pos: i32,
+  ctx: i32,
+): boolean {
   const tn = P.nodes[t]
   if tn is Member {
-    if exprReReadable(tn.memObj) { return false }
+    if cpReReadable(tn.memObj, ctx) { return false }
     tn.memObj = spillLocal(tn.memObj, asgIx, "co", out, pos)
     return true
   }
   false
+}
+
+// `exprReReadable` for a compound write's place, except that an element read a user `"[]"`
+// answers is a call, whose effects a second read would repeat.
+function cpReReadable(ix: i32, ctx: i32): boolean {
+  const u = unwrapParen(ix)
+  if u < 0 { return false }
+  const e = P.nodes[u]
+  if e is Index {
+    if opIdxFnAtNode(u) != "" { return false }
+    if drwFieldClosure(structIndexOfExpr(e.idxArr, ctx), "[]") { return false }
+    return cpReReadable(e.idxArr, ctx) && cpReReadable(e.idxIndex, ctx)
+  }
+  cpRecvReReadable(u, ctx)
+}
+
+// `cpReReadable` for a node that is not an element read: a field read asks of its receiver,
+// and anything else is `exprReReadable`'s.
+function cpRecvReReadable(u: i32, ctx: i32): boolean {
+  if u < 0 { return false }
+  const e = P.nodes[u]
+  if e is Member { return cpReReadable(e.memObj, ctx) }
+  exprReReadable(u)
 }
 
 // Pushes `const asg#<asgIx>#<tag> = <ix>` onto `out` and answers a read of it, both typed as `ix`.
