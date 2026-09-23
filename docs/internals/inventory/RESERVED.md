@@ -51,3 +51,4 @@ D1900-D1919  vl-c3  2026-09-07  fix lanes 2026-09-07 (D1866 residue: a module-bl
 D1920-D1929  vl-c3  2026-09-07  row-25 refusal sites (a4674d1; D1920 filed)
 D1930-D1939  vl-c3  2026-09-07  day-one sampler follow-ups (aab99b3)
 D1940-D1949  vl-c3  2026-09-07  kind-ladder lane
+D1995-D1999  vl-11  2026-09-22  review follow-ups
