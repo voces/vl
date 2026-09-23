@@ -194,7 +194,7 @@ else
 fi
 
 # WARM EVERY ENGINE TAG, not just the one this script happened to make. The host
-# compiles the seed under TWO engine configurations (`gc_engine`, main.rs): a null
+# compiles the seed under several engine configurations (`seed_engine`, main.rs): a null
 # collector for `build`/`run`, a collecting one for the `check`/`fmt`/`test` pump —
 # and each keeps its own sidecar. Only `run`'s was ever carried forward, so the
 # `check` tag was cold at the start of every ci-native step and every worker that
@@ -207,7 +207,14 @@ warm() {
   "$VL" "$1" "$WORK/hello.vl" --compiler "$OUT" > /dev/null 2>&1 ||
     echo "  note: could not warm the \`$1\` sidecar — its first use re-JITs the seed" >&2
 }
-warm run & warm check & wait
+# The third tag is the copying-collector compile a large source gets (`compile_engine`,
+# main.rs); `$VL_COMPILE_GC=copying` reaches it with a small program.
+warm_copying() {
+  VL_COMPILE_GC=copying "$VL" build "$WORK/hello.vl" -o "$WORK/warm-copying.wasm" \
+    --compiler "$OUT" > /dev/null 2>&1 ||
+    echo "  note: could not warm the copying-compile sidecar — its first use re-JITs the seed" >&2
+}
+warm run & warm check & warm_copying & wait
 sidecars=0
 for side in "$OUT".*.cwasm; do
   if [ -f "$side" ]; then sidecars=$((sidecars + 1)); fi
