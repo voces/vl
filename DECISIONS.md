@@ -6792,6 +6792,109 @@ Every hot loop is now out of run-once code, so that gap is somewhere else — pl
 itself, which absorbs its helpers into one 4,400-line function. SpiderMonkey and JavaScriptCore
 were not measured: neither is installed here (bun 1.0's JSC predates WasmGC).
 
+## `-O` inlines the helpers a per-call struct is passed to, and the default build does not (2026-09-23) — lane L4
+
+**The defect.** plumb's decoder allocates its state `D` once per instruction and hands it to six
+small helpers (`byte(d)`, `readImm(d, n)`, `sizeOf(sel, d, w)`, `memOperand(d, ins)`, ...).
+binaryen's `--heap2local` turns a `struct.new` into locals only when the allocation never leaves
+its function, and a call is a way out, so `D` stayed on the heap at every rung: master's `-O` and
+`-O3` both leave its `struct.new` in place, because binaryen's size heuristics inline `byte` but
+not `memOperand` or `finish`, and one un-inlined helper is enough to pin it.
+
+**The rule.** Before either rung, the host (`escape_inline_marks` in
+`scripts/vl-host/src/main.rs`) reads the module with `wasmparser` and chooses the callees that:
+
+1. take a parameter of a struct type that no struct field, array element, global or table can
+   hold, and that takes no part in subtyping — a value no heap location can hold can leave its
+   function only through a call or a return, which is what makes it per-call state;
+2. are called from a function that allocates that type, or from a chosen callee that takes it
+   (a fixpoint, so `memOperand` → `byte` is followed);
+3. are at most 320 body bytes (`ESCAPE_INLINE_MAX_BYTES`), in no call cycle (a strongly
+   connected component of the direct call graph with more than one member, or a self-call),
+   and neither run-once code nor called from it, so the step never undoes lane L8;
+4. hand the struct type they take to no function that is not chosen — the struct would escape
+   there anyway, so inlining them buys nothing.
+
+Two bounds keep the step's growth in proportion: a chosen callee with its own chosen callees
+inlined may be at most 4,096 bytes (`ESCAPE_INLINE_EXPANDED_BYTES`), and a module whose chosen
+callees would grow the code by more than 64 KiB plus half its size gets no step.
+
+**A call cycle is never chosen.** The first version excluded only a function that calls itself.
+Mutually recursive helpers that take the struct were all chosen, and binaryen, told to inline
+them at any size, unrolled the cycle to its iteration limit while the struct stayed live across
+the recursion: a 12-helper cycle (1.7 KB of source) grew from 1,520 to 1,448,761 bytes and took
+55 s at `-O`, and `tests/fixtures/opt-escape/cycle-helpers.vl`'s 4-helper cycle grew from 457
+to 376,477 bytes. The escape test now bounds that fixture's module at twice the plain build.
+
+**One `--no-inline` pass, not one per function.** Binaryen runs each `--no-inline=<pattern>` as
+its own pass over every function, so marking all but the chosen few cost `marks × functions`:
+7,999 marks on 8,000 functions took 1.95 s native and 5.2 s with the npm build (measured in
+review). The host
+instead renames the step's input — `L4c.<index>` for a chosen callee, `L4n.<index>` for every
+other function — and passes the one pattern `--no-inline=L4n.*` with `-g`, then gives every
+function back its own name (or none) before the rung runs. Without `-g` binaryen drops the name
+section, so the step refuses a result whose functions lost their markers rather than hand the
+rung a module with no way back to its names; `tests/selfhost_native_release_escape_test.ts` reads
+the step's output (`$VL_OPT_ESCAPE_DUMP`) and checks a `--names` build keeps them. On a generated 8,000-function program `-O` costs
+3.24 s native against master's 3.42 s and the first version's 4.38 s (npm: 4.10, 3.56, 6.46).
+
+The rung then runs as before on the result, with the run-once marks re-read off that result
+(inlining renumbers functions). Which allocations actually leave the heap is still binaryen's
+escape analysis; the host decides only what is worth inlining for it. A module with no chosen
+callee skips the step and builds byte-identically: the compiler at both rungs and all 86
+programs under `bench/`.
+
+**Measured** on plumb's `decode-bench` (war3.exe, 6,964,856 instructions per pass), CPU seconds per
+pass, median of 9 interleaved rounds of 3 passes, load 2–5, binaryen 133. V8 is node 24 through a
+runner that exports the start function as `main`; wasmtime is `vl run` on the prebuilt module.
+Build is the optimiser's CPU on top of the plain build's 0.08 s.
+
+| build | wasmtime | V8 | build (s CPU) | size (bytes) |
+| --- | --- | --- | --- | --- |
+| unoptimized | 0.646 | 0.433 | 0.08 | 106,870 |
+| `-O`, master → this | 0.594 → **0.514** (−14%) | 0.459 → **0.429** (−6%) | +0.46 → +0.54 | 70,874 → 71,694 |
+| `-O3`, master → this | 0.573 → **0.516** (−10%) | 0.461 → **0.439** (−5%) | +0.74 → +0.81 | 63,290 → 63,700 |
+
+`D`'s `struct.new` is gone at both rungs. On V8 this also closes the gap L8 left: `-O`/`-O3` now
+run the decoder as fast as the unoptimized module does (0.97–0.99×) instead of 4–5% slower.
+`tests/selfhost_native_release_escape_test.ts` pins the shape against a no-step control, and
+pins output on identity, aliasing and escaping fixtures.
+
+**Why not the default build.** Every way to get this effect without `-O` was measured on the
+same benchmark (ratios to the unoptimized module, same rounds):
+
+| candidate | wasmtime | V8 | build cost | verdict |
+| --- | --- | --- | --- | --- |
+| (a) a binaryen pipeline in every build: the targeted inlining + `--heap2local` | 0.85–0.88 | 0.93 | +0.13 s CPU native (+160% of this unit's build), +1.0 s with the npm binaryen | binaryen is optional (`vl build` runs without it), the result changes by machine, and it invalidates the `vl-src` rows a trap uses to name its source line |
+| (a′) the same inlining without `--heap2local` | 0.92–0.93 | 0.99–1.01 | +0.12 s | same objections |
+| (b) emit-time inlining of those helpers, estimated by (a′) | ≈ 0.93 | ≈ 1.00 | none measurable | the only default-path route; a feature in the emitter (a callee's frame, locals and returns inside a caller's), and without scalar replacement it stops at (a′) |
+| (c) wasmtime's own inliner (`Inlining::Yes`) | 0.96–1.02 | — | +22% Cranelift CPU on a cold cache (cached after) | drops inlined frames from a trap's backtrace, so `vl run` loses the "vl source frames" lines; −3.3% geomean over `bench/` (i32/i64 accumulators −40%) but ≈0 here, even with the size threshold raised to 200,000 |
+
+So a default-path L4 is emit-time work: (b), plus scalar replacement of the struct itself. B1
+("lean on binaryen's Heap2Local rather than hand-rolling SROA") and H4 ("loses Heap2Local
+scalarization until `wasm-opt` runs") already name the tension: the native default path never
+runs `wasm-opt`. Revisiting B1 for that path is a larger lane than this one, and its measured
+ceiling on this benchmark is (a)'s row.
+
+**Open, and older than this step: `vl build --names -O` writes a module with no function
+names.** Neither rung passes `-g` to `wasm-opt`, so binaryen drops the name section the build
+asked for (master: `tests/fixtures/opt-runonce/main-wrapper.vl` at `--names -O` disassembles to
+`$0`, `$1`). Whether an optimized `--names` build should keep them — `-g` on the rung when
+`--names` is given, at the cost of the section's bytes — is a decision for a follow-up; the
+escape step keeps names through itself, so it neither causes nor hides the loss.
+
+**What was rejected.**
+* *Raising binaryen's inline sizes globally* (`-aimfs 60`/`400`). `-aimfs 400` scalarises `D`
+  but doubles the module (106,870 → 224,725 bytes) and is 3–6% SLOWER on V8; `-aimfs 60` leaves
+  `D` on the heap.
+* *`--inlining-optimizing`* instead of `--inlining`: slower to build (1.9 s CPU with the npm
+  binaryen) and V8 1.03–1.21×.
+* *A pipeline ending in `--vacuum`.* binaryen 130 writes `--heap2local --vacuum` in one run as a
+  module wasmtime and V8 both reject ("uninitialized non-defaultable local"); the same two passes
+  in two runs are valid. The step avoids it by running the rung's own pipeline, and the host
+  still validates every module it writes.
+* *An inline hint* (`@metadata.code.inline`): binaryen 133 still ignores it, as L8 found for 130.
+
 ## A string-literal type reps as the atom wherever it lives, and a `const` bound to a literal has its type (owner, 2026-09-23) — D2150, D2156, D2157
 
 *The owner's two rulings: "comparing two string literals should be allowed, even if in objects,

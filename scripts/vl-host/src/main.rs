@@ -4834,6 +4834,367 @@ const RELEASE_PASSES: &[&str] = &["--closed-world", "-O3", "--gufa", "-O3"];
 /// matter, and inlining is what lets a small producer's allocation melt at its use.
 const RUN_ONCE_INLINE_LEAF_BYTES: usize = 160;
 
+/// What the `-O`/`-O3` inlining marks are computed from: one pass over the emitted module.
+struct ModuleScan {
+    n_imports: u32,
+    start: Option<u32>,
+    /// Functions reachable other than by a direct call: exported, or held as a reference.
+    escapes: std::collections::HashSet<u32>,
+    bodies: Vec<ScanBody>,
+    names: std::collections::HashMap<u32, String>,
+    /// The type index of each DEFINED function, in body order.
+    func_types: Vec<u32>,
+    /// Per type index: the concrete struct types a function type's parameters name, or
+    /// `None` for a type that is not a function type.
+    param_structs: Vec<Option<Vec<u32>>>,
+    /// Struct types that are declared as a subtype, or named by one.
+    subtyped: std::collections::HashSet<u32>,
+    /// Types some struct field, array element, global or table can hold.
+    heap_held: std::collections::HashSet<u32>,
+}
+
+struct ScanBody {
+    size: usize,
+    has_loop: bool,
+    calls_defined: bool,
+    /// `(callee, inside a loop)` per direct call site.
+    calls: Vec<(u32, bool)>,
+    /// Struct types this body allocates with `struct.new`.
+    allocs: std::collections::HashSet<u32>,
+}
+
+impl ModuleScan {
+    fn parse(bytes: &[u8]) -> Option<ModuleScan> {
+        use wasmparser::{
+            CompositeInnerType, ElementItems, ExternalKind, HeapType, Name, Operator, Parser,
+            Payload, StorageType, TypeRef, ValType,
+        };
+        let concrete = |v: &ValType| match v {
+            ValType::Ref(r) => match r.heap_type() {
+                HeapType::Concrete(i) | HeapType::Exact(i) => i.as_module_index(),
+                _ => None,
+            },
+            _ => None,
+        };
+        let mut s = ModuleScan {
+            n_imports: 0,
+            start: None,
+            escapes: Default::default(),
+            bodies: Vec::new(),
+            names: Default::default(),
+            func_types: Vec::new(),
+            param_structs: Vec::new(),
+            subtyped: Default::default(),
+            heap_held: Default::default(),
+        };
+        // Per type index: is it a struct type.
+        let mut is_struct: Vec<bool> = Vec::new();
+        let mut func_params: Vec<Option<Vec<u32>>> = Vec::new();
+        for payload in Parser::new(0).parse_all(bytes) {
+            match payload.ok()? {
+                Payload::TypeSection(r) => {
+                    for group in r {
+                        for sub in group.ok()?.into_types() {
+                            let ix = is_struct.len() as u32;
+                            if let Some(sup) = sub.supertype_idx.and_then(|p| p.as_module_index()) {
+                                s.subtyped.insert(ix);
+                                s.subtyped.insert(sup);
+                            }
+                            match &sub.composite_type.inner {
+                                CompositeInnerType::Struct(st) => {
+                                    is_struct.push(true);
+                                    func_params.push(None);
+                                    for f in st.fields.iter() {
+                                        if let StorageType::Val(v) = f.element_type {
+                                            s.heap_held.extend(concrete(&v));
+                                        }
+                                    }
+                                }
+                                CompositeInnerType::Array(at) => {
+                                    is_struct.push(false);
+                                    func_params.push(None);
+                                    if let StorageType::Val(v) = at.0.element_type {
+                                        s.heap_held.extend(concrete(&v));
+                                    }
+                                }
+                                CompositeInnerType::Func(ft) => {
+                                    is_struct.push(false);
+                                    func_params.push(Some(
+                                        ft.params().iter().filter_map(concrete).collect(),
+                                    ));
+                                }
+                                CompositeInnerType::Cont(_) => {
+                                    is_struct.push(false);
+                                    func_params.push(None);
+                                }
+                            }
+                        }
+                    }
+                }
+                Payload::ImportSection(r) => {
+                    for imp in r.into_imports() {
+                        match imp.ok()?.ty {
+                            TypeRef::Func(_) | TypeRef::FuncExact(_) => s.n_imports += 1,
+                            TypeRef::Global(g) => s.heap_held.extend(concrete(&g.content_type)),
+                            TypeRef::Table(t) => {
+                                s.heap_held.extend(concrete(&ValType::Ref(t.element_type)))
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Payload::FunctionSection(r) => {
+                    for t in r {
+                        s.func_types.push(t.ok()?);
+                    }
+                }
+                Payload::TableSection(r) => {
+                    for t in r {
+                        s.heap_held
+                            .extend(concrete(&ValType::Ref(t.ok()?.ty.element_type)));
+                    }
+                }
+                Payload::GlobalSection(r) => {
+                    for g in r {
+                        s.heap_held.extend(concrete(&g.ok()?.ty.content_type));
+                    }
+                }
+                Payload::StartSection { func, .. } => s.start = Some(func),
+                Payload::ExportSection(r) => {
+                    for e in r {
+                        let e = e.ok()?;
+                        if e.kind == ExternalKind::Func {
+                            s.escapes.insert(e.index);
+                        }
+                    }
+                }
+                Payload::ElementSection(r) => {
+                    for el in r {
+                        match el.ok()?.items {
+                            ElementItems::Functions(fs) => {
+                                for f in fs {
+                                    s.escapes.insert(f.ok()?);
+                                }
+                            }
+                            ElementItems::Expressions(_, es) => {
+                                for e in es {
+                                    for op in e.ok()?.get_operators_reader() {
+                                        if let Operator::RefFunc { function_index } = op.ok()? {
+                                            s.escapes.insert(function_index);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Payload::CodeSectionEntry(body) => {
+                    let mut b = ScanBody {
+                        size: body.range().len(),
+                        has_loop: false,
+                        calls_defined: false,
+                        calls: Vec::new(),
+                        allocs: Default::default(),
+                    };
+                    // One entry per open block: whether it is a `loop`.
+                    let mut ctrl: Vec<bool> = Vec::new();
+                    let mut loops = 0usize;
+                    for op in body.get_operators_reader().ok()? {
+                        match op.ok()? {
+                            Operator::Loop { .. } => {
+                                ctrl.push(true);
+                                loops += 1;
+                                b.has_loop = true;
+                            }
+                            Operator::Block { .. }
+                            | Operator::If { .. }
+                            | Operator::Try { .. }
+                            | Operator::TryTable { .. } => ctrl.push(false),
+                            Operator::End => {
+                                if ctrl.pop() == Some(true) {
+                                    loops -= 1;
+                                }
+                            }
+                            Operator::Call { function_index }
+                            | Operator::ReturnCall { function_index } => {
+                                if function_index >= s.n_imports {
+                                    b.calls_defined = true;
+                                    b.calls.push((function_index, loops > 0));
+                                }
+                            }
+                            Operator::RefFunc { function_index } => {
+                                s.escapes.insert(function_index);
+                            }
+                            Operator::StructNew { struct_type_index }
+                            | Operator::StructNewDefault { struct_type_index } => {
+                                b.allocs.insert(struct_type_index);
+                            }
+                            _ => {}
+                        }
+                    }
+                    s.bodies.push(b);
+                }
+                Payload::CustomSection(c) => {
+                    if let wasmparser::KnownCustom::Name(r) = c.as_known() {
+                        for sub in r {
+                            if let Ok(Name::Function(map)) = sub {
+                                for n in map.into_iter().flatten() {
+                                    s.names.insert(n.index, n.name.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Only struct types are candidates for a parameter's allocation; keep those.
+        s.param_structs = func_params
+            .into_iter()
+            .map(|p| {
+                p.map(|v| {
+                    v.into_iter()
+                        .filter(|&t| is_struct.get(t as usize) == Some(&true))
+                        .collect()
+                })
+            })
+            .collect();
+        Some(s)
+    }
+
+    fn defined(&self, f: u32) -> bool {
+        f >= self.n_imports && ((f - self.n_imports) as usize) < self.bodies.len()
+    }
+
+    fn body(&self, f: u32) -> &ScanBody {
+        &self.bodies[(f - self.n_imports) as usize]
+    }
+
+    /// Binaryen names a function by its name-section entry, else by its index among the
+    /// DEFINED functions — the names `--no-inline=<pattern>` matches against.
+    fn binaryen_name(&self, f: u32) -> String {
+        self.names
+            .get(&f)
+            .cloned()
+            .unwrap_or_else(|| (f - self.n_imports).to_string())
+    }
+
+    /// Every direct call site, by callee: `(caller, inside a loop)`.
+    fn callers(&self) -> std::collections::HashMap<u32, Vec<(u32, bool)>> {
+        let mut callers: std::collections::HashMap<u32, Vec<(u32, bool)>> = Default::default();
+        for (i, b) in self.bodies.iter().enumerate() {
+            for &(callee, in_loop) in &b.calls {
+                callers
+                    .entry(callee)
+                    .or_default()
+                    .push((self.n_imports + i as u32, in_loop));
+            }
+        }
+        callers
+    }
+
+    /// Run-once code: the start function, then every function reached only by direct calls
+    /// outside any loop of run-once code. Empty when the module has no defined start.
+    fn run_once(
+        &self,
+        callers: &std::collections::HashMap<u32, Vec<(u32, bool)>>,
+    ) -> std::collections::HashSet<u32> {
+        let Some(start) = self.start.filter(|&f| self.defined(f)) else {
+            return Default::default();
+        };
+        let mut once = std::collections::HashSet::from([start]);
+        // A fixpoint, since membership only grows.
+        loop {
+            let before = once.len();
+            for (&f, sites) in callers {
+                if !once.contains(&f)
+                    && !self.escapes.contains(&f)
+                    && self.defined(f)
+                    && sites
+                        .iter()
+                        .all(|&(c, in_loop)| once.contains(&c) && !in_loop)
+                {
+                    once.insert(f);
+                }
+            }
+            if once.len() == before {
+                break;
+            }
+        }
+        once
+    }
+
+    /// Every defined function in a call cycle: a strongly connected component of the direct
+    /// call graph with more than one member, or a function that calls itself. Iterative
+    /// Tarjan, so a deep call graph cannot overflow the host's stack.
+    fn cyclic(&self) -> std::collections::HashSet<u32> {
+        let n = self.bodies.len();
+        let succ = |v: usize| -> Vec<usize> {
+            self.bodies[v]
+                .calls
+                .iter()
+                .filter(|&&(c, _)| self.defined(c))
+                .map(|&(c, _)| (c - self.n_imports) as usize)
+                .collect()
+        };
+        let mut index = vec![usize::MAX; n];
+        let mut low = vec![0usize; n];
+        let mut on_stack = vec![false; n];
+        let mut stack: Vec<usize> = Vec::new();
+        let mut next = 0usize;
+        let mut out: std::collections::HashSet<u32> = Default::default();
+        for root in 0..n {
+            if index[root] != usize::MAX {
+                continue;
+            }
+            // (node, its successors, the next successor to visit)
+            let mut work: Vec<(usize, Vec<usize>, usize)> = vec![(root, succ(root), 0)];
+            index[root] = next;
+            low[root] = next;
+            next += 1;
+            stack.push(root);
+            on_stack[root] = true;
+            while let Some((v, ws, i)) = work.last_mut() {
+                let v = *v;
+                if *i < ws.len() {
+                    let w = ws[*i];
+                    *i += 1;
+                    if index[w] == usize::MAX {
+                        index[w] = next;
+                        low[w] = next;
+                        next += 1;
+                        stack.push(w);
+                        on_stack[w] = true;
+                        work.push((w, succ(w), 0));
+                    } else if on_stack[w] {
+                        low[v] = low[v].min(index[w]);
+                    }
+                    continue;
+                }
+                work.pop();
+                if let Some((u, _, _)) = work.last() {
+                    low[*u] = low[*u].min(low[v]);
+                }
+                if low[v] == index[v] {
+                    let mut comp = Vec::new();
+                    while let Some(w) = stack.pop() {
+                        on_stack[w] = false;
+                        comp.push(w);
+                        if w == v {
+                            break;
+                        }
+                    }
+                    let self_loop = comp.len() == 1 && succ(v).contains(&v);
+                    if comp.len() > 1 || self_loop {
+                        out.extend(comp.into_iter().map(|w| self.n_imports + w as u32));
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
 /// The binaryen names of the functions `-O`/`-O3` must NOT inline, because the only code
 /// that calls them runs once and calls them from inside a loop.
 ///
@@ -4853,175 +5214,389 @@ const RUN_ONCE_INLINE_LEAF_BYTES: usize = 160;
 /// inlinable (`RUN_ONCE_INLINE_LEAF_BYTES`). Any module this cannot parse gets no marks,
 /// which is exactly the old behaviour.
 fn run_once_hot_callees(bytes: &[u8]) -> Vec<String> {
-    run_once_hot_callees_inner(bytes).unwrap_or_default()
+    ModuleScan::parse(bytes)
+        .map(|s| run_once_hot_in(&s))
+        .unwrap_or_default()
 }
 
-fn run_once_hot_callees_inner(bytes: &[u8]) -> Option<Vec<String>> {
-    use std::collections::{HashMap, HashSet};
-    use wasmparser::{ElementItems, ExternalKind, Name, Operator, Parser, Payload, TypeRef};
-
-    struct Body {
-        size: usize,
-        has_loop: bool,
-        calls_defined: bool,
-        /// `(callee, inside a loop)` per direct call site.
-        calls: Vec<(u32, bool)>,
-    }
-    let mut n_imports = 0u32;
-    let mut start: Option<u32> = None;
-    // Functions reachable other than by a direct call: exported, or held as a reference.
-    let mut escapes: HashSet<u32> = HashSet::new();
-    let mut bodies: Vec<Body> = Vec::new();
-    let mut names: HashMap<u32, String> = HashMap::new();
-    for payload in Parser::new(0).parse_all(bytes) {
-        match payload.ok()? {
-            Payload::ImportSection(r) => {
-                for imp in r.into_imports() {
-                    if matches!(imp.ok()?.ty, TypeRef::Func(_) | TypeRef::FuncExact(_)) {
-                        n_imports += 1;
-                    }
-                }
-            }
-            Payload::StartSection { func, .. } => start = Some(func),
-            Payload::ExportSection(r) => {
-                for e in r {
-                    let e = e.ok()?;
-                    if e.kind == ExternalKind::Func {
-                        escapes.insert(e.index);
-                    }
-                }
-            }
-            Payload::ElementSection(r) => {
-                for el in r {
-                    match el.ok()?.items {
-                        ElementItems::Functions(fs) => {
-                            for f in fs {
-                                escapes.insert(f.ok()?);
-                            }
-                        }
-                        ElementItems::Expressions(_, es) => {
-                            for e in es {
-                                for op in e.ok()?.get_operators_reader() {
-                                    if let Operator::RefFunc { function_index } = op.ok()? {
-                                        escapes.insert(function_index);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            Payload::CodeSectionEntry(body) => {
-                let mut b = Body {
-                    size: body.range().len(),
-                    has_loop: false,
-                    calls_defined: false,
-                    calls: Vec::new(),
-                };
-                // One entry per open block: whether it is a `loop`.
-                let mut ctrl: Vec<bool> = Vec::new();
-                let mut loops = 0usize;
-                for op in body.get_operators_reader().ok()? {
-                    match op.ok()? {
-                        Operator::Loop { .. } => {
-                            ctrl.push(true);
-                            loops += 1;
-                            b.has_loop = true;
-                        }
-                        Operator::Block { .. }
-                        | Operator::If { .. }
-                        | Operator::Try { .. }
-                        | Operator::TryTable { .. } => ctrl.push(false),
-                        Operator::End => {
-                            if ctrl.pop() == Some(true) {
-                                loops -= 1;
-                            }
-                        }
-                        Operator::Call { function_index }
-                        | Operator::ReturnCall { function_index } => {
-                            if function_index >= n_imports {
-                                b.calls_defined = true;
-                                b.calls.push((function_index, loops > 0));
-                            }
-                        }
-                        Operator::RefFunc { function_index } => {
-                            escapes.insert(function_index);
-                        }
-                        _ => {}
-                    }
-                }
-                bodies.push(b);
-            }
-            Payload::CustomSection(c) => {
-                if let wasmparser::KnownCustom::Name(r) = c.as_known() {
-                    for sub in r {
-                        if let Ok(Name::Function(map)) = sub {
-                            for n in map.into_iter().flatten() {
-                                names.insert(n.index, n.name.to_string());
-                            }
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    let start = start?;
-    let defined = |f: u32| f >= n_imports && ((f - n_imports) as usize) < bodies.len();
-    if !defined(start) {
-        return Some(Vec::new());
-    }
-    let body = |f: u32| &bodies[(f - n_imports) as usize];
-    // Every direct call site, by callee: `(caller, inside a loop)`.
-    let mut callers: HashMap<u32, Vec<(u32, bool)>> = HashMap::new();
-    for (i, b) in bodies.iter().enumerate() {
-        for &(callee, in_loop) in &b.calls {
-            callers.entry(callee).or_default().push((n_imports + i as u32, in_loop));
-        }
-    }
-    // Run-once code: the start function, then every function reached only by direct calls
-    // outside any loop of run-once code. A fixpoint, since membership only grows.
-    let mut once: HashSet<u32> = HashSet::from([start]);
-    loop {
-        let before = once.len();
-        for (&f, sites) in &callers {
-            if !once.contains(&f)
-                && !escapes.contains(&f)
-                && defined(f)
-                && sites.iter().all(|&(c, in_loop)| once.contains(&c) && !in_loop)
-            {
-                once.insert(f);
-            }
-        }
-        if once.len() == before {
-            break;
-        }
+fn run_once_hot_in(s: &ModuleScan) -> Vec<String> {
+    let callers = s.callers();
+    let once = s.run_once(&callers);
+    if once.is_empty() {
+        return Vec::new();
     }
     let mut hot: Vec<u32> = callers
         .iter()
         .filter(|&(&f, sites)| {
-            defined(f)
+            s.defined(f)
                 && sites.iter().any(|&(_, in_loop)| in_loop)
                 && sites.iter().all(|&(c, _)| once.contains(&c))
                 && {
-                    let b = body(f);
+                    let b = s.body(f);
                     b.has_loop || b.calls_defined || b.size > RUN_ONCE_INLINE_LEAF_BYTES
                 }
         })
         .map(|(&f, _)| f)
         .collect();
     hot.sort_unstable();
-    // Binaryen names a function by its name-section entry, else by its index among the
-    // DEFINED functions — the names `--no-inline=<pattern>` matches against.
-    Some(
-        hot.into_iter()
-            .map(|f| names.get(&f).cloned().unwrap_or_else(|| (f - n_imports).to_string()))
-            .collect(),
-    )
+    hot.into_iter().map(|f| s.binaryen_name(f)).collect()
+}
+
+/// A callee at most this many body bytes may be inlined to let a caller's struct stay off
+/// the heap (`escape_inline_choice`). It bounds the code a call site can grow by.
+const ESCAPE_INLINE_MAX_BYTES: usize = 320;
+
+/// A chosen callee's body with every chosen callee of its own inlined may be at most this
+/// many bytes, so a chain of helpers cannot multiply out.
+const ESCAPE_INLINE_EXPANDED_BYTES: usize = 4096;
+
+/// The step may grow the code section by at most this many bytes plus half its size; a
+/// module whose chosen callees would grow it more gets no step at all.
+const ESCAPE_INLINE_GROWTH_FLOOR: usize = 64 << 10;
+
+/// The name prefixes the step's input carries: `L4c.<index>` for a chosen callee and
+/// `L4n.<index>` for every other defined function, so ONE `--no-inline=L4n.*` pass marks
+/// all of the latter — binaryen runs one pass per `--no-inline`, each over every function.
+const ESCAPE_CHOSEN_PREFIX: &str = "L4c.";
+const ESCAPE_OTHER_PREFIX: &str = "L4n.";
+
+/// The step both rungs run first when `escape_inline_choice` chooses any callee: inline
+/// exactly the functions not named `L4n.*`, whatever binaryen's size heuristics would say.
+/// `-g` keeps the name section, which carries each function's original index back out.
+const ESCAPE_INLINE_PASSES: &[&str] = &[
+    "-g",
+    "--no-inline=L4n.*",
+    "--always-inline-max-function-size",
+    "100000",
+    "--inlining",
+];
+
+/// The callees `-O`/`-O3` inline first so a caller's struct allocation can stay off the GC
+/// heap, as function indices, or `None` when there is no such callee (and so no step).
+///
+/// Binaryen's `--heap2local` turns a `struct.new` into locals only when the allocation never
+/// leaves its function, so a per-call state struct handed to small helpers (`byte(d)`,
+/// `readImm(d, 4)`) stays on the heap unless every helper is inlined first — and binaryen's
+/// size heuristics decline most of them. A callee is chosen when it takes a struct type that
+/// no field, element, global or table can hold and that takes no part in subtyping (a value
+/// no heap location can hold leaves its function only through a call or a return), a caller
+/// allocates that type or is itself chosen and takes it, and it is small
+/// (`ESCAPE_INLINE_MAX_BYTES`), in no call cycle (inlining a cycle unrolls it and the struct
+/// stays live anyway), neither run-once code nor called from it (lane L8), and hands the
+/// struct type to no function that is not chosen (the struct would escape there anyway).
+/// Chains are bounded by `ESCAPE_INLINE_EXPANDED_BYTES` and the whole step by
+/// `ESCAPE_INLINE_GROWTH_FLOOR`. Which allocations actually stay off the heap is binaryen's
+/// escape analysis to decide; this only decides what is worth inlining for it.
+/// DECISIONS.md, "`-O` inlines the helpers a per-call struct is passed to".
+fn escape_inline_choice(s: &ModuleScan) -> Option<std::collections::HashSet<u32>> {
+    let callers = s.callers();
+    let once = s.run_once(&callers);
+    let cyclic = s.cyclic();
+    let ix = |f: u32| (f - s.n_imports) as usize;
+    // Per defined function: the per-call-state struct types its parameters take.
+    let takes: Vec<Vec<u32>> = (0..s.bodies.len())
+        .map(|i| {
+            let ty = s.func_types.get(i).copied().unwrap_or(u32::MAX);
+            s.param_structs
+                .get(ty as usize)
+                .cloned()
+                .flatten()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|t| !s.heap_held.contains(t) && !s.subtyped.contains(t))
+                .collect()
+        })
+        .collect();
+    let shares = |a: u32, b: u32| takes[ix(a)].iter().any(|t| takes[ix(b)].contains(t));
+    let eligible = |f: u32| {
+        s.defined(f)
+            && !takes[ix(f)].is_empty()
+            && s.body(f).size <= ESCAPE_INLINE_MAX_BYTES
+            && !cyclic.contains(&f)
+            && !once.contains(&f)
+            && callers
+                .get(&f)
+                .is_some_and(|sites| sites.iter().all(|(c, _)| !once.contains(c)))
+    };
+    let mut chosen: std::collections::HashSet<u32> = Default::default();
+    // A fixpoint, since a chosen callee can make its own callees worth choosing.
+    loop {
+        let before = chosen.len();
+        for (&f, sites) in &callers {
+            if chosen.contains(&f) || !eligible(f) {
+                continue;
+            }
+            let wanted = sites.iter().any(|&(c, _)| {
+                takes[ix(f)].iter().any(|t| s.body(c).allocs.contains(t))
+                    || (chosen.contains(&c) && shares(f, c))
+            });
+            if wanted {
+                chosen.insert(f);
+            }
+        }
+        if chosen.len() == before {
+            break;
+        }
+    }
+    // Drop, to a fixpoint, a callee that hands a type it takes to a function not chosen, and
+    // one whose chain of chosen callees inlines to more than the expanded bound.
+    loop {
+        let before = chosen.len();
+        let leaks: Vec<u32> = chosen
+            .iter()
+            .copied()
+            .filter(|&f| {
+                s.body(f)
+                    .calls
+                    .iter()
+                    .any(|&(g, _)| g != f && s.defined(g) && !chosen.contains(&g) && shares(f, g))
+            })
+            .collect();
+        for f in leaks {
+            chosen.remove(&f);
+        }
+        let mut expanded = Default::default();
+        let too_big: Vec<u32> = chosen
+            .iter()
+            .copied()
+            .filter(|&f| {
+                escape_expanded(f, s, &chosen, &mut expanded) > ESCAPE_INLINE_EXPANDED_BYTES
+            })
+            .collect();
+        for f in too_big {
+            chosen.remove(&f);
+        }
+        if chosen.len() == before {
+            break;
+        }
+    }
+    if chosen.is_empty() {
+        return None;
+    }
+    // What the step adds: every call from an unchosen function into a chosen one becomes a
+    // copy of that callee's expanded body.
+    let mut expanded = Default::default();
+    let (mut growth, mut code) = (0usize, 0usize);
+    for (i, b) in s.bodies.iter().enumerate() {
+        code += b.size;
+        if chosen.contains(&(s.n_imports + i as u32)) {
+            continue;
+        }
+        for &(g, _) in &b.calls {
+            if chosen.contains(&g) {
+                growth = growth.saturating_add(escape_expanded(g, s, &chosen, &mut expanded));
+            }
+        }
+    }
+    if growth > ESCAPE_INLINE_GROWTH_FLOOR + code / 2 {
+        return None;
+    }
+    Some(chosen)
+}
+
+/// `f`'s body size with every chosen callee of its own inlined, memoised. The chosen graph is
+/// acyclic (no call cycle is ever chosen), so the walk ends.
+fn escape_expanded(
+    f: u32,
+    s: &ModuleScan,
+    chosen: &std::collections::HashSet<u32>,
+    memo: &mut std::collections::HashMap<u32, usize>,
+) -> usize {
+    if let Some(&n) = memo.get(&f) {
+        return n;
+    }
+    memo.insert(f, usize::MAX);
+    let mut n = s.body(f).size;
+    for &(g, _) in &s.body(f).calls {
+        if chosen.contains(&g) {
+            n = n.saturating_add(escape_expanded(g, s, chosen, memo));
+        }
+    }
+    memo.insert(f, n);
+    n
+}
+
+fn put_leb_u32(out: &mut Vec<u8>, mut v: u32) {
+    loop {
+        let byte = (v & 0x7f) as u8;
+        v >>= 7;
+        if v == 0 {
+            out.push(byte);
+            return;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+fn put_name(out: &mut Vec<u8>, s: &str) {
+    put_leb_u32(out, s.len() as u32);
+    out.extend_from_slice(s.as_bytes());
+}
+
+/// `bytes` with its function names replaced: `rename(index, current name)` answers each
+/// function's new name, or `None` for none. Every other section, and every other part of the
+/// `name` section, is kept byte for byte; a module with no `name` section gains one at the
+/// end. `None` when the module's section framing does not parse.
+fn rename_functions(
+    bytes: &[u8],
+    n_funcs: u32,
+    rename: impl Fn(u32, Option<&str>) -> Option<String>,
+) -> Option<Vec<u8>> {
+    let header = bytes.get(..8)?;
+    let mut current: std::collections::HashMap<u32, String> = Default::default();
+    let mut out = header.to_vec();
+    let mut other_subsections: Vec<u8> = Vec::new();
+    let mut p = 8;
+    while p < bytes.len() {
+        let id = bytes[p];
+        p += 1;
+        let len = leb_u32(bytes, &mut p)? as usize;
+        let body = bytes.get(p..p.checked_add(len)?)?;
+        let start = p;
+        p += len;
+        if id == 0 {
+            let mut q = 0;
+            let nlen = leb_u32(body, &mut q)? as usize;
+            if body.get(q..q + nlen)? == b"name" {
+                q += nlen;
+                while q < body.len() {
+                    let sub = body[q];
+                    let at = q;
+                    q += 1;
+                    let slen = leb_u32(body, &mut q)? as usize;
+                    let payload = body.get(q..q + slen)?;
+                    q += slen;
+                    if sub == 1 {
+                        let mut r = 0;
+                        for _ in 0..leb_u32(payload, &mut r)? {
+                            let f = leb_u32(payload, &mut r)?;
+                            let l = leb_u32(payload, &mut r)? as usize;
+                            let n = std::str::from_utf8(payload.get(r..r + l)?).ok()?;
+                            r += l;
+                            current.insert(f, n.to_string());
+                        }
+                    } else {
+                        other_subsections.extend_from_slice(&body[at..q]);
+                    }
+                }
+                continue;
+            }
+        }
+        out.push(id);
+        put_leb_u32(&mut out, len as u32);
+        out.extend_from_slice(&bytes[start..start + len]);
+    }
+    let mut entries: Vec<u8> = Vec::new();
+    let mut count = 0u32;
+    for f in 0..n_funcs {
+        if let Some(n) = rename(f, current.get(&f).map(String::as_str)) {
+            put_leb_u32(&mut entries, f);
+            put_name(&mut entries, &n);
+            count += 1;
+        }
+    }
+    let mut section: Vec<u8> = Vec::new();
+    put_name(&mut section, "name");
+    // Subsection order is module (0), functions (1), then the rest; a module-name
+    // subsection, when there is one, leads `other_subsections` and must stay first.
+    let (module_sub, rest) = if other_subsections.first() == Some(&0) {
+        let mut q = 1;
+        let l = leb_u32(&other_subsections, &mut q)? as usize;
+        other_subsections.split_at(q + l)
+    } else {
+        other_subsections.split_at(0)
+    };
+    section.extend_from_slice(module_sub);
+    if count > 0 {
+        let mut sub = Vec::new();
+        put_leb_u32(&mut sub, count);
+        sub.extend_from_slice(&entries);
+        section.push(1);
+        put_leb_u32(&mut section, sub.len() as u32);
+        section.extend_from_slice(&sub);
+    }
+    section.extend_from_slice(rest);
+    if section.len() > 5 {
+        out.push(0);
+        put_leb_u32(&mut out, section.len() as u32);
+        out.extend_from_slice(&section);
+    }
+    Some(out)
+}
+
+/// The escape step on the module at `path` (holding `bytes`): name the chosen callees apart
+/// from everything else, inline them in one `wasm-opt` run, then give every function back the
+/// name it had, or none. Answers the rewritten bytes (also left at `path`), or `None` when no
+/// callee is chosen and the module is untouched.
+fn escape_inline_step(path: &str, flag: &str, bytes: &[u8]) -> Result<Option<Vec<u8>>> {
+    let Some(scan) = ModuleScan::parse(bytes) else {
+        return Ok(None);
+    };
+    let Some(chosen) = escape_inline_choice(&scan) else {
+        return Ok(None);
+    };
+    let n_funcs = scan.n_imports + scan.bodies.len() as u32;
+    let named = rename_functions(bytes, n_funcs, |f, cur| {
+        if f < scan.n_imports {
+            cur.map(str::to_string)
+        } else if chosen.contains(&f) {
+            Some(format!("{ESCAPE_CHOSEN_PREFIX}{f}"))
+        } else {
+            Some(format!("{ESCAPE_OTHER_PREFIX}{f}"))
+        }
+    });
+    let Some(named) = named else {
+        return Ok(None);
+    };
+    std::fs::write(path, &named)?;
+    optimize_in_place(path, flag, ESCAPE_INLINE_PASSES, &[])?;
+    let stepped = std::fs::read(path)
+        .map_err(|e| Error::from(e).context(format!("reading back the {flag}'d `{path}`")))?;
+    // Inlining removes functions, so the step's output numbers them anew; the prefixed names
+    // carry each one's ORIGINAL index, which is what finds its original name.
+    let after = ModuleScan::parse(&stepped).ok_or_else(|| {
+        Error::msg(format!(
+            "{flag}: the escape step wrote a module it cannot read"
+        ))
+    })?;
+    let n_after = after.n_imports + after.bodies.len() as u32;
+    // Every defined function must come back carrying the name the step gave it; one that
+    // does not means the name section was lost, and the original names with it.
+    let original = |f: u32, cur: Option<&str>| {
+        cur.and_then(|n| {
+            n.strip_prefix(ESCAPE_CHOSEN_PREFIX)
+                .or_else(|| n.strip_prefix(ESCAPE_OTHER_PREFIX))
+        })
+        .and_then(|o| o.parse::<u32>().ok())
+        .filter(|_| f >= after.n_imports)
+    };
+    if (after.n_imports..n_after)
+        .any(|f| original(f, after.names.get(&f).map(String::as_str)).is_none())
+    {
+        bail!("{flag}: the escape step's module lost the function names it was given");
+    }
+    let restored = rename_functions(&stepped, n_after, |f, cur| {
+        if f < after.n_imports {
+            return cur.map(str::to_string);
+        }
+        original(f, cur).and_then(|o| scan.names.get(&o).cloned())
+    })
+    .ok_or_else(|| {
+        Error::msg(format!(
+            "{flag}: the escape step wrote a module it cannot read"
+        ))
+    })?;
+    std::fs::write(path, &restored)?;
+    // `$VL_OPT_ESCAPE_DUMP=<file>`: a copy of the step's output, for tests and diagnosis — the
+    // rung overwrites `path` next. Undocumented in `vl help build`: a measurement facility.
+    if let Some(dump) = std::env::var_os("VL_OPT_ESCAPE_DUMP").filter(|v| !v.is_empty()) {
+        std::fs::write(dump, &restored)?;
+    }
+    Ok(Some(restored))
 }
 
 /// Shell out to `wasm-opt` to rewrite the emitted module IN PLACE with one of the
-/// two rungs above.
+/// two rungs above, or with the escape step (`ESCAPE_INLINE_PASSES`) that runs before them.
 ///
 /// A missing `wasm-opt` is a HARD ERROR, not a soft no-op. `-O` / `-O3` are never
 /// implied — a build only reaches here because the caller typed the flag — and
@@ -7049,7 +7624,12 @@ fn build_cmd(args: &[String]) -> Result<()> {
     };
     let mut final_bytes: Option<Vec<u8>> = None;
     if let Some((flag, passes)) = opt_rung {
-        optimize_in_place(&sink_str, flag, passes, &run_once_hot_callees(&bytes))?;
+        // The escape step goes first, so the rung's own passes (`--heap2local` among them)
+        // see each per-call struct and its uses in one function. It renumbers functions, so
+        // the run-once marks are read off its output, not off `bytes`.
+        let stepped = escape_inline_step(&sink_str, flag, &bytes)?;
+        let rung_input: &[u8] = stepped.as_deref().unwrap_or(&bytes);
+        optimize_in_place(&sink_str, flag, passes, &run_once_hot_callees(rung_input))?;
         final_bytes = Some(std::fs::read(&sink).map_err(|e| {
             Error::from(e).context(format!("reading back the {flag}'d `{out_label}`"))
         })?);
