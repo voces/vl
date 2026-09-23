@@ -11,6 +11,9 @@
 //      enforcement half of the design; a fixture that ran it would just fail.
 //   5. `vl check` NEEDS NO PROVIDER. The same program checks clean, because checking a
 //      program never instantiates it.
+//   6. A `: void` EXTERN IS A RESULT-LESS IMPORT (D1997). Its fixture builds, runs every
+//      call position in order against a host that provides it, and links to another
+//      unit's `export function f(a: i32): void` — the engine compares the two functypes.
 //
 // The `vl_` prefix is load-bearing: it is one of the globs `ci-native` auto-discovers
 // (tests/ci_seed_coverage_test.ts). GATING is the usual one — `SELFHOST_NATIVE_ALIGN=1`
@@ -19,6 +22,7 @@
 // @test-timing native
 
 import { COMPILER, ROOT, VL, exists } from "./support/tree.ts";
+import { vlHostImports } from "../compiler/vlHostImports.ts";
 
 const STD = `${ROOT}/std`;
 const CASES = `${ROOT}/tests/cases/extern`;
@@ -260,6 +264,74 @@ Deno.test({
       }
     } finally {
       await Deno.remove(p.replace(/\/[^/]+$/, ""), { recursive: true });
+    }
+  },
+});
+
+/** Build `entry` to a module, throwing the compiler's stderr on a non-zero exit. */
+const buildModule = async (entry: string): Promise<WebAssembly.Module> => {
+  const dir = await Deno.makeTempDir({ prefix: "vl_extern_void_" });
+  const out = `${dir}/out.wasm`;
+  try {
+    const built = await vl(["build", entry, "-o", out]);
+    if (built.code !== 0) {
+      throw new Error(`\`vl build ${entry}\` exited ${built.code}\n${built.err}`);
+    }
+    return new WebAssembly.Module(await Deno.readFile(out));
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+};
+
+Deno.test({
+  name: "extern: a `: void` extern is called in every statement position, in order",
+  ignore: !ENABLED,
+  fn: async () => {
+    const mod = await buildModule(`${CASES}/void-result.vl`);
+    const calls: number[] = [];
+    const { imports } = vlHostImports([]);
+    // The top level runs as the start function, so instantiating IS running it.
+    new WebAssembly.Instance(mod, {
+      imports,
+      extern: {
+        sink: (a: number) => {
+          calls.push(a);
+        },
+      },
+    });
+    const want = [1, 2, 3, 4, 5, 6, 7, 8, 90, 11, -1];
+    if (calls.join(",") !== want.join(",")) {
+      throw new Error(`want sink calls ${want.join(",")}, got ${calls.join(",")}`);
+    }
+  },
+});
+
+Deno.test({
+  name: "extern: a `: void` extern links to another unit's `: void` export",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = await Deno.makeTempDir({ prefix: "vl_extern_link_" });
+    try {
+      // Unit A holds ONE function, so its functype is a singleton rec group — the same
+      // type the import declares, which is what lets the engine match the two.
+      await Deno.writeTextFile(
+        `${dir}/a.vl`,
+        "export function f(a: i32): void {\n  print(a * 2)\n}\n",
+      );
+      await Deno.writeTextFile(`${dir}/b.vl`, "extern function f(a: i32): void\nf(21)\nf(5)\n");
+      const logs: string[] = [];
+      const { imports } = vlHostImports(logs);
+      const a = new WebAssembly.Instance(await buildModule(`${dir}/a.vl`), { imports });
+      // A result list that disagreed with the export's would be a LinkError here.
+      new WebAssembly.Instance(await buildModule(`${dir}/b.vl`), {
+        imports,
+        extern: { f: a.exports.f },
+      });
+      if (logs.join(",") !== "42,10") {
+        throw new Error(`want logs 42,10, got ${logs.join(",")}`);
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
     }
   },
 });

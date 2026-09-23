@@ -232,6 +232,8 @@ import {
   Unary,
   WhileStmt,
   annTsOf,
+  externLinkOf,
+  externRetIsVoid,
   hasSpreadItem,
   mkTypeRef,
   nodeChildren,
@@ -4330,13 +4332,14 @@ export function capScan(ix: i32, bound: string[], caps: string[]) {
     const cal = P.nodes[unwrapParen(n.callFn)]
     if cal is Ident {
       if isBuiltinFnName(cal.identName) { skipCallee = true }
-      // The dunder family takes the same shadowing guard as the numeric one (D1087):
-      // `emitCall`'s intrinsic arms are gated on `identNameIsUserBound`, so a call whose name
-      // the frame binds routes to the value, and the closure's env must carry it for the gate
-      // to find. The condition is the one under which the emitter writes the opcode.
+      // The dunder family, the numeric one and the `extern` imports take one shadowing guard
+      // (D1087): `emitCall`'s arms for them are gated on `identNameIsUserBound`, so a call whose
+      // name the frame binds routes to the value, and the closure's env must carry it for the
+      // gate to find. The condition is the one under which the emitter writes the call.
       if (
         nameIsEmitterIntrinsic(cal.identName) ||
-        isNumIntrinsicName(cal.identName)
+        isNumIntrinsicName(cal.identName) ||
+        externLinkOf(cal.identName) >= 0
       ) {
         let shadowed = capIsBound(bound, cal.identName)
         if fnIndexOf(cal.identName) >= 0 { shadowed = true }
@@ -8471,6 +8474,23 @@ function declaredIndexOf(fnIx: i32, name: string) {
 export function envSlotShift(fnIx: i32) {
   if fnValUsed && fnIx >= 0 { return 1 }
   0
+}
+
+// Is `name` bound by the user in this frame — a parameter, a local, or a capture of one?
+// Scoped to callee position only (a parameter named `__load_i32__` is legal VL); a
+// parameter is the only binding form that can hold such a name, since the checker refuses
+// a `function`/`const`/`let` of an intrinsic spelling. Guards a capture-of-parameter miss (D1087).
+export function identNameIsUserBound(name: string, fnIx: i32): boolean {
+  if localIndexOf(fnIx, name) >= 0 { return true }
+  capturedKindOf(fnIx, name) != null
+}
+
+// True when `name` in callee position lowers to a result-less `extern function` import — the
+// scope does not bind the name (a parameter of that spelling wins, as in `emitCall`) and its
+// link row returns void. Such a call leaves nothing on the stack: a statement, never a value.
+export function calleeIsVoidExtern(name: string, fnIx: i32): boolean {
+  if identNameIsUserBound(name, fnIx) { return false }
+  externRetIsVoid(externLinkOf(name))
 }
 
 // Resolve an identifier `name` to its wasm local index for function `fnIx`: a live lexical
@@ -14819,6 +14839,7 @@ export function stmtIsTailValue(stmtIx: i32, fnIx: i32) {
       // table rather than by spelling, so a diverging slot added there cannot be missed
       // here — every other entry above is a name, which a new slot would not carry.
       if fsRetIsVoid(fsIntrinsicSlot(callee.identName)) { return false }
+      if calleeIsVoidExtern(callee.identName, fnIx) { return false }
       const target = fnIndexOf(callee.identName)
       // A live closure binding of the name is what the tail denotes, so the voidness is
       // that closure's and the module function of the name settles nothing (D1602).
