@@ -937,9 +937,23 @@ fn embedded_std_hash() -> String {
     std_hash(std_embedded::STD_MODULES.iter().map(|(n, s)| (*n, s.as_bytes())))
 }
 
+/// The engine for a USER PROGRAM's store (`vl run`, `vl run --batch`, `vl test`).
+///
+/// Starts the GC heap at `RUN_GC_HEAP_INITIAL` rather than 0. wasmtime's copying
+/// collector only grows its heap when a collection frees almost nothing, so a program
+/// whose live set sits near half the heap collects on every few MiB of allocation and
+/// never grows out of it — plumb's decoder ran 1,248 collections at a 16 MiB heap.
+/// The reservation is virtual and committed on first touch, so a small program's
+/// footprint does not move. Measurements: docs/internals/perf-decoder-gap-2026-09.md.
 fn gc_engine(collector: Collector) -> Result<Engine> {
-    Engine::new(&gc_config(collector))
+    let mut cfg = gc_config(collector);
+    cfg.gc_heap_initial_size(RUN_GC_HEAP_INITIAL);
+    Engine::new(&cfg)
 }
+
+/// See `gc_engine`. 64 MiB is where the decoder's curve flattens (16 MiB: 1,248
+/// collections, 64 MiB: 123, 256 MiB: 26 — within 6% of the 64 MiB time).
+const RUN_GC_HEAP_INITIAL: u64 = 64 << 20;
 
 /// The engine for a store that drives the COMPILER SEED (`build`'s one-shot compile,
 /// the CLI pump's command loop, `run`'s and `--batch`'s compile phase). Identical to
