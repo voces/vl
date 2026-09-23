@@ -890,6 +890,11 @@ let paramSolveProbe = false
 // unchanged.
 let constScopes: {[string]: boolean}[] = []
 
+// The scope chain inverted: for each name, the depths of the frames binding it, outermost first,
+// so the innermost binding is the last entry. `declare` and `popScope` keep it in step with
+// `T.scopes`, and a lookup reads one entry instead of walking every frame (D2190).
+let scopeDepthsOf: {[string]: i32[]} = Map()
+
 // The function-declaration chain, parallel to `T.scopes`: each frame records the arena node of
 // every `FuncDecl` declared in it. `fnDeclIx` answers that for top-level functions only; this
 // answers it for a nested one too, under the scope chain's shadowing rule, which is what a call
@@ -1046,12 +1051,9 @@ let asgDeclFrames: i32[] = []
 // the same walk reading the type out; this one reads the frame it came from, which is what the
 // narrowing bank validates its entries against.
 function lookupDepth(name: string) {
-  let i = T.scopes.length - 1
-  while i >= 0 {
-    if T.scopes[i].has(name) { return i }
-    i = i - 1
-  }
-  -1
+  const ds = scopeDepthsOf[name]
+  if ds == null || ds.length == 0 { return -1 }
+  ds[ds.length - 1]
 }
 
 // The declared type banked for narrowed `name`, or -1 when no live entry of a matching kind
@@ -2428,14 +2430,8 @@ function nodeIsTotal(ix: i32) {
 
 // True if `name` resolves (innermost-first) to a `const` binding.
 function isConstName(name: string) {
-  let i = T.scopes.length - 1
-  while i >= 0 {
-    if T.scopes[i].has(name) {
-      if i < constScopes.length { return constScopes[i].has(name) }
-      return false
-    }
-    i = i - 1
-  }
+  const i = lookupDepth(name)
+  if i >= 0 && i < constScopes.length { return constScopes[i].has(name) }
   false
 }
 
@@ -3654,6 +3650,7 @@ export function initChecker() {
   voidCoerceValNames = []
   T.tys = []
   T.scopes = []
+  scopeDepthsOf = Map()
   T.diags = []
   T.curRet = -1
   cUserTypes = Map()
@@ -6714,6 +6711,12 @@ function pushScope(owner: i32) {
 // Leave the innermost scope, unwinding what it pushed.
 function popScope() {
   flushUninferred(T.scopes.length - 1)
+  if T.scopes.length > 0 {
+    for k in T.scopes[T.scopes.length - 1] {
+      const ds = scopeDepthsOf[k]
+      if ds != null { ds.pop() }
+    }
+  }
   T.scopes.pop()
   constScopes.pop()
   fnDeclScopes.pop()
@@ -7467,6 +7470,10 @@ function inlineLitUnionUnhide(s: string): string {
 // Bind `name` to type-arena index `ty` in the innermost scope.
 export function declare(name: string, ty: i32) {
   const top = T.scopes.length - 1
+  if !T.scopes[top].has(name) {
+    const ds = scopeDepthsOf[name]
+    if ds == null { scopeDepthsOf[name] = [top] } else { ds.push(top) }
+  }
   T.scopes[top][name] = ty
   0
 }
@@ -7482,14 +7489,8 @@ function declareFnDeclNode(name: string, nodeIx: i32) {
 // own shadowing rule, exactly like `isConstName` and `lookupFnDeclNode`. Its one consumer is
 // deferred-constraint ownership; see the table's header for why it is separate.
 function lookupFnAliasNode(name: string) {
-  let i = T.scopes.length - 1
-  while i >= 0 {
-    if T.scopes[i].has(name) {
-      if i < fnAliasScopes.length { return fnAliasScopes[i][name] ?? -1 }
-      return -1
-    }
-    i = i - 1
-  }
+  const i = lookupDepth(name)
+  if i >= 0 && i < fnAliasScopes.length { return fnAliasScopes[i][name] ?? -1 }
   -1
 }
 
@@ -7498,26 +7499,17 @@ function lookupFnAliasNode(name: string) {
 // that frame — the scope chain's own shadowing rule — so a local binding that shadows a function
 // name answers -1, and the call keeps the exact-arity gate a function value must have.
 function lookupFnDeclNode(name: string) {
-  let i = T.scopes.length - 1
-  while i >= 0 {
-    if T.scopes[i].has(name) {
-      if i < fnDeclScopes.length { return fnDeclScopes[i][name] ?? -1 }
-      return -1
-    }
-    i = i - 1
-  }
+  const i = lookupDepth(name)
+  if i >= 0 && i < fnDeclScopes.length { return fnDeclScopes[i][name] ?? -1 }
   -1
 }
 
 // Look `name` up through the scope chain, innermost first. Returns its type-arena
 // index, or `-1` if undeclared (innermost-wins, so shadowing works).
 export function lookup(name: string) {
-  let i = T.scopes.length - 1
-  while i >= 0 {
-    if T.scopes[i].has(name) { return T.scopes[i][name] ?? -1 }
-    i = i - 1
-  }
-  -1
+  const i = lookupDepth(name)
+  if i < 0 { return -1 }
+  T.scopes[i][name] ?? -1
 }
 
 // Raise a diagnostic at AST node `at`, resolving its source position — the node's anchor token

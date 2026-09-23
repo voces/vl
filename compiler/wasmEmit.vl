@@ -9431,17 +9431,40 @@ function hoistSafeStmt(ix: i32, fnIx: i32): boolean {
   hoistSafeExpr(ix, fnIx)
 }
 
+// Every loop asks both walks of its whole body, so a loop nest would cost the square of its
+// depth; the answers are kept per block for one function (D2190). `hmSafe` holds
+// `hoistSafeBlock`'s, and `hmNoIdx` the blocks in which `hoistScanExpr` found no index at all.
+let hmFn = -2
+let hmSafe: {[i32]: boolean} = Map()
+let hmNoIdx: {[i32]: boolean} = Map()
+let hmIdxSeen = 0
+
+// Start the memos over when the function changes; `emitFuncBody` forces it with `-2`.
+function hoistMemoFor(fnIx: i32) {
+  if hmFn != fnIx {
+    hmFn = fnIx
+    hmSafe = Map()
+    hmNoIdx = Map()
+  }
+  0
+}
+
 function hoistSafeBlock(ix: i32, fnIx: i32): boolean {
   if ix < 0 { return false }
   const b = P.nodes[ix]
   if b is Block {
+    hoistMemoFor(fnIx)
+    const known = hmSafe[ix]
+    if known != null { return known }
     const stmts = b.blkStmts
+    let safe = true
     let i = 0
-    while i < stmts.length {
-      if !hoistSafeStmt(stmts[i], fnIx) { return false }
+    while safe && i < stmts.length {
+      if !hoistSafeStmt(stmts[i], fnIx) { safe = false }
       i = i + 1
     }
-    return true
+    hmSafe[ix] = safe
+    return safe
   }
   false
 }
@@ -9556,6 +9579,7 @@ function hoistScanExpr(ix: i32) {
   if ix < 0 { return 0 }
   const e = P.nodes[ix]
   if e is Index {
+    hmIdxSeen = hmIdxSeen + 1
     const recv = P.nodes[e.idxArr]
     if recv is Ident { hoistScanAdd(recv.identName, ix) }
     hoistScanExpr(e.idxArr)
@@ -9615,12 +9639,15 @@ function hoistScanBlock(ix: i32) {
   if ix < 0 { return 0 }
   const b = P.nodes[ix]
   if b is Block {
+    if hmNoIdx.has(ix) { return 0 }
+    const seen = hmIdxSeen
     const stmts = b.blkStmts
     let i = 0
     while i < stmts.length {
       hoistScanStmt(stmts[i])
       i = i + 1
     }
+    if hmIdxSeen == seen { hmNoIdx[ix] = true }
   }
   0
 }
@@ -20607,6 +20634,7 @@ export function emitFuncBody(body: u8[], blockIx: i32, fnIx: i32) {
     // than in `emitFuncCode` because nothing before the body needs the answer, and the
     // set is stamped with `fnIx` so a body that never scanned cannot read a stale one.
     strAccScan(blockIx, fnIx)
+    hmFn = -2
     // Enter the function's top-level lexical scope (mirrors `collectLocals` on the body
     // block). The emit-time scope stack drives same-named-local resolution.
     scopePush()

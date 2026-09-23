@@ -845,6 +845,16 @@ new: the compare-frame pre-pass never recurses into a code-15 field, so a NESTED
 
 ## Codegen, memory & runtime (Track B)
 
+- **Nesting depth is bounded by memory, not the compiler's stack (D2182).** Every pass recurses
+  once per nested block, and wasmtime's default 512 KiB stack held ~950 levels (`vl run`), ~750
+  for an `if` nest. The host now gives each compiler-seed engine a 512 MiB wasm stack on a
+  thread sized for it, committed only as deep as a compile goes: 10,000 levels of blocks,
+  labelled loops, `if`s and a mix each check and run in about half a second, 100,000 run. With
+  it, D2190: four passes re-walked each level's subtree (a guard's `stmtAlwaysExits`, the
+  checker's scope-chain lookups, a loop's hoist scans, the `vl-src` anchor walk), so 10,000
+  levels took 10 to 18 s; each now reads a memo or an index, output byte-identical. The editor's
+  V8 stack still caps nesting near 800 levels (D2189). Guarded by `tests/vl_deep_nesting_test.ts`
+  and the `nesting depth` scaling axis.
 - **A large function's call sites no longer each walk the function (D2180, plumb PL-019).**
   #3050's loop-variable rung asked every named callee's frame for its capture set before
   asking whether any enclosing frame binds the name as a loop variable, and the dispatch
