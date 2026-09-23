@@ -32,8 +32,10 @@ Are they good for VL?"*
 - So the recommendation is **a narrow, declared, nominal-only, read-only getter** (`get x(self:
   F32x4): f32`), which exists mainly to honour O3's `.x` and to let a packed scalar newtype
   expose named parts.
-- **The getter's body is checked, not trusted.** It must be loop-free, recursion-free,
-  allocation-free and effect-free, and it may call only intrinsics and other getters (§D3a).
+- **The getter's body is checked, not trusted.** It must be effect-free, allocation-free and
+  bounded, and it may call only intrinsics and other getters (§D3a). Reads are allowed, except
+  of a module `let`. *(Amended 2026-09-22: "bounded" admits constant-range loops within a
+  budget of 64; v1 as built is loop-free. See §D3a-contract.)*
   That keeps a getter read to a load or a short straight-line sequence. The contract is
   deliberately conservative and will only ever be relaxed.
 - **Nothing new in the language is needed to unblock lane reads today.** A literal-union
@@ -483,19 +485,41 @@ consumers.
 
 ##### D3a-contract. The v1 getter body is checked, not trusted
 
+> **Amended (owner, 2026-09-22, after getters v1 shipped in #3031).** The contract is
+> **effect-free + allocation-free + bounded. Reads are allowed. Module-`let` reads are excluded
+> because a getter describes its receiver**: it reads what is reachable from `self`, plus
+> constants. That is the rationale, not purity, and getter-eligible is not the same predicate
+> as `pure` (`function-effects-design.md` §C1b, the general summary this contract is one
+> reading of). **Constant-bounded loops are permitted**: a `for i in <a> (to | until) <b>
+> [step <s>]` whose ends are integer literals or module `const` integers and whose step is a
+> literal, with the loop variable never assigned; `break` and `continue` allowed; nested loops
+> multiply; and the total, **transitive through getter calls**, is at most one named budget,
+> **64** iterations. The invariant: the worst-case cost is computable at compile time from the
+> source plus bounded callees, and is never data-dependent. A `for`-in over data, a
+> data-bounded range, `while` and recursion stay refused, permanently. Only the budget number
+> may change, through `DECISIONS.md` and a std review (`function-effects-design.md` §C1a).
+> **What is built is still v1**: the shipped checker refuses every loop, and
+> `docs/guide/getters.md` and `DECISIONS.md` describe that. The loop relaxation is ruled, not
+> built, and those two files change with its build. The bullets below are the v1 text, with
+> the first one amended.
+
 A getter body is refused unless it is:
 
-- **Loop-free and recursion-free.** It contains no `for` or `while`, and it has no cycle through
-  other getters.
+- **Bounded (amended; v1 said "loop-free").** v1: it contains no `for` or `while`. As amended:
+  every loop is a constant range as above, and the body's total iteration count, including
+  that of every getter it calls, is at most 64. In both, it has no cycle through other getters,
+  because recursion has no compile-time bound.
 - **Allocation-free.** It makes no heap allocation, in the GC heap or in linear memory. A
   `let`/`const` local is fine, because it is a wasm local. The walk refuses construction of a
   struct, list, map, string or closure, string `+` and interpolation, and `Buffer(n)`.
   `Buffer(n)` is also an effect, because it moves the allocator's bump pointer. Allocation that
   VL's rep choice adds without any source syntax is covered below.
-- **Effect-free.** It writes only to its own locals (block-scoped: a local ends with its
-  block). It makes no extern or host calls. It reads no module `let` BINDING: `self`'s fields
-  and module `const`s are fine. This is a rule about bindings, not about the heap: the heap
-  reachable from `self` or from a module `const` is readable, like linear memory. **Linear-memory reads through the
+- **Effect-free, and reads only what describes the receiver.** It writes only to its own
+  locals (block-scoped: a local ends with its block). It makes no extern or host calls. It
+  reads no module `let` BINDING: `self`'s fields and module `const`s are fine. The `let` rule
+  is not a purity rule. A getter describes its receiver, and a module `let` is state the
+  receiver does not own. This is a rule about bindings, not about the heap: the heap
+  reachable from `self` or from a module `const` is readable, and so is linear memory. **Linear-memory reads through the
   `__load_*` intrinsics are permitted deliberately**: the flat-row getter (`flat-records-design.md`
   §9) is exactly a load at a derived address, and a load has no effect. A trap is permitted (an
   `as!`, or an integer division); by the same reasoning as `exprEffectFree`, the program dies
@@ -524,10 +548,11 @@ The contract aims at the first two of four cost tiers:
 
 1. **a load**: `.x` reads one field or one lane;
 2. **straight-line bounded**: a few loads, ALU ops, compares and branches, such as a packed
-   `Color`'s `(self as i32 >> 8) & 255`;
+   `Color`'s `(self as i32 >> 8) & 255`. As amended, this tier also takes constant-range loops
+   within the budget of 64, such as a four-lane reduction written as `for i in 0 until 4`;
 3. **O(1) but allocating**: excluded. It fails the "surprised in a loop" test, because a reader
    of `p.name` in a hot loop does not expect a heap allocation per read;
-4. **unbounded**: excluded.
+4. **unbounded**, or over the budget: excluded.
 
 Every getter O3 and E2 name fits. `get x(self: F32x4): f32 { __extract_lane_f32x4__(self as!
 v128, 0) }` is tier 1, and a packed-scalar part is tier 2.
@@ -582,10 +607,43 @@ refuses the forwarding row, which does not allocate. That is the conservative di
 the function-effects design can relax it.
 
 **This is deliberately conservative, and it will be relaxed, never tightened.** A separate
-design, `docs/internals/function-effects-design.md` (in a parallel PR), infers or marks
-functions as pure and bounded. Once it lands, a getter may call such functions as well as
-intrinsics. Loosening the contract turns refusals into programs that compile. Tightening it
+design, `docs/internals/function-effects-design.md` (PR #3023), infers a per-instance summary
+of every function: its effects, its reads by location, its allocation, and its bound. The
+getter contract is that summary's `getter-eligible` predicate (§C1b there). Once it lands, a
+getter may call any function that is getter-eligible, as well as intrinsics. Loosening the contract turns refusals into programs that compile. Tightening it
 later would break getters that already compile, and std has no deprecation story for that.
+
+###### What other languages allow in a getter body
+
+Added 2026-09-22. This survey is from knowledge of each language's specification and published
+guidelines. Nothing here was run.
+
+| language | what a getter body may do | checked restriction |
+| --- | --- | --- |
+| **C#** | anything a method may do | **none on the form.** The Framework Design Guidelines say to prefer a method when the operation is much slower than a field access, has an observable side effect, or returns a different result on each call. This is guidance only. **`readonly` struct members** (C# 8) are the one checked restriction I know of: a `readonly` getter cannot assign to `this`'s fields. It may still loop, allocate, do I/O and write global state, and a call from it to a non-`readonly` member makes a defensive copy of `this` instead of failing |
+| **Kotlin** | anything (`get() { … }`) | none. The coding conventions prefer a property over a function when the algorithm does not throw, is cheap (or cached after the first call), and returns the same result while the object is unchanged. This is guidance only |
+| **JavaScript** | anything (`get x() { … }`) | none |
+| **Python** | anything (`@property`) | none. PEP 8: "Avoid using properties for computationally expensive operations; the attribute notation makes the caller believe that access is (relatively) cheap." This is guidance only |
+| **D** | anything (`@property`, whose semantics were never settled) | none on the form. D lets an author **opt in** to checked attributes on any member function, a getter included: `const` (no mutation through `this`), `pure`, `nothrow`, `@nogc` (no GC allocation). None of them bounds loops, and none is required of a getter |
+| **Scala** | anything (a parameterless `def`) | none. Uniform access means a `def` and a `val` look the same to callers, and nothing checks that the `def` is cheap |
+| **Swift** | anything (computed `var … { get }`) | none. **Swift 5.5 (SE-0310) went the other way**: effectful read-only properties, `get async throws`, let a getter suspend and throw |
+| **Rust, Go, Zig** | — | no getters. A field access never runs user code (Rust's `Deref` aside), and a getter is an ordinary method, `x()` |
+
+**Finding: VL's checked contract appears to have no precedent among mainstream languages.**
+Every language above that has getters allows an arbitrary body. Where cheapness is wanted, it
+is stated as guidance (C#, Kotlin, Python), and nothing enforces it. The only checked
+restrictions are opt-in attributes that any method may carry (D) or a no-mutation-of-`this`
+rule (C# `readonly` members). Neither says anything about loops or cost. Swift, the most
+recent change among them, relaxed its getters in the opposite direction. I know of no
+mainstream language where the getter *form* requires an effect-free, allocation-free, bounded
+body. The claim is "appears to" because the survey is from knowledge, not an exhaustive search.
+
+**What that implies.** There is no proven design to borrow, and no other language's users have
+tested where such a contract chafes. Every rule in the contract will be learned from VL's own
+getters. So **the relax-only direction matters more here than it would for a borrowed
+design**: start strict, relax a rule when a real getter needs it, and never tighten. The
+2026-09-22 loop amendment is the first instance: the budget is the one number that can move,
+and the invariant (never data-dependent) is what stays fixed.
 
 #### D3b. Implicit parenless calls (Nim / D style)
 
@@ -762,6 +820,8 @@ Revisit only if a reference type needs a validating setter and `readonly` fields
 do not cover it.
 
 **F8. Adopt the checked v1 getter-body contract (§D3a-contract)?**
+*(Ruled (a), and amended on 2026-09-22: "loop-free" became "bounded", admitting constant-range
+loops within a budget of 64; see the note at the head of §D3a-contract.)*
 (a) yes, as stated: loop-free, recursion-free, allocation-free and effect-free, with branches
 allowed, and calls only to intrinsics and other getters. It is relaxed later by
 `docs/internals/function-effects-design.md`. (b) Pure by convention, stated as a guideline and
