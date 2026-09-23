@@ -541,18 +541,18 @@ construction. **Quote the phase timer for this item, not the profile share.**
 
 ### 6.2 What shipped
 
-Four exports, one loop shape, no new language surface:
+Four exports over one shared loop (`strutil.cpAccLoad`), no new language surface:
 
 | export | accumulator | who feeds it |
 | --- | --- | --- |
-| `srcLoad(count)` | `vcCodes` | `vl build`/`run` on an import-free file |
+| `srcLoad(count)` | `vcAcc` | `vl build`/`run` on an import-free file |
 | `modKeyLoad(count)` | `modKeyAcc` | the H3 module fetch loop (keys) |
 | `modSrcLoad(count)` | `modSrcAcc` | the H3 module fetch loop (**the self-compile**) |
 | `cliResultLoad(count)` | `cliResultAcc` | the CLI pump's `CMD_READ_FILE` (**`vl check`/`fmt`/`test`**) |
 
 Each appends the `count` UTF-32LE code points the host wrote at **byte 0 of the
-module's linear memory**. The memory itself is not new API: a `__load_i32__` in
-those loops sets the emitter's `memUsed`, which emits section 5 (one page, 64 KiB)
+module's linear memory**. The memory itself is not new API: the `__load_i32__` in
+`cpAccLoad` sets the emitter's `memUsed`, which emits section 5 (one page, 64 KiB)
 and — since P0.2 / ruling O4(i) — exports it automatically as `memory`.
 
 **The one claim in §2.2 that was wrong: "no host change."** §2.2 said to "export it
@@ -592,6 +592,7 @@ The residue is real and expected: WasmGC has no runtime memory→array copy
 (`memory-gc-design.md` §2 #10), so the element move survives; only the CALL is
 bought. A local-alias/byte-cursor rewrite of the loop was built and A/B'd — 135 vs
 139 ms, under the floor — and rejected in favour of four identically-shaped loops.
+Those four loops are one since D1975: `strutil.cpAccLoad`, which every channel calls.
 
 **Host-side, wasmtime, interleaved min-of-11, `.cwasm` warm, 24-core box at load
 2.8–3.2** (the same A/B at load 4.7–7.0 read 192/135 — the DELTA is stable, the

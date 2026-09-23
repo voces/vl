@@ -70,6 +70,9 @@ RUNNING the block tells you. A row whose FILED outcome really is a parse-stage r
 A witness that needs MORE THAN ONE MODULE splits the block with `// file: <name>.vl` marker
 lines; each marker starts a file and the LAST one is the entry that is checked, run and
 built. Relative imports between the sections resolve. See `split_files`.
+
+A witness whose defect is its SIZE writes `@@repeat(<N>, "<text>")@@` for N copies of
+<text>, expanded before the program is written. See `expand_repeats`.
 """
 import json, re, subprocess, sys, tempfile, os
 from pathlib import Path
@@ -201,8 +204,26 @@ def names_parse_error(status_line):
 FILE_MARK = re.compile(r"^// file: (\S+\.vl)\s*$")
 
 
+# A SIZE WITNESS. A defect whose one ingredient is the source's or the module's length (a
+# 2^23-element intake or output buffer, D1975/D1976) needs megabytes of program, which no
+# row can hold inline. `@@repeat(N, "text")@@` is N copies of `text`; the text may not hold
+# a `"`, and N is capped so a typo cannot fill the disk.
+REPEAT = re.compile(r'@@repeat\((\d+), "([^"]*)"\)@@')
+REPEAT_MAX = 50_000_000
+
+
+def expand_repeats(src):
+    def one(m):
+        n = int(m.group(1))
+        if n > REPEAT_MAX:
+            raise ValueError(f"@@repeat count {n} is over the {REPEAT_MAX} cap")
+        return m.group(2) * n
+    return REPEAT.sub(one, src)
+
+
 def split_files(src):
     """(name, source) per `// file:` section; a single unnamed section is `w.vl`."""
+    src = expand_repeats(src)
     files, name, body = [], None, []
     for ln in src.splitlines():
         m = FILE_MARK.match(ln)
@@ -272,6 +293,9 @@ SELF_TEST = [
     # `export` in a module that then imports from a sibling that does not exist.
     ("runs", "// file: a.vl\nexport function six(): i32 { return 6 }\n"
              "// file: main.vl\nimport { six } from \"./a\"\nprint(six() * 7)\n"),
+    # A SIZE WITNESS: runs only if `@@repeat` expanded to 80 characters. Unexpanded, the
+    # literal is 22 long and the index is negative, which loads and then traps.
+    ("runs", 'const xs: i32[] = [1]\nconst s = "@@repeat(40, "ab")@@"\nprint(xs[s.length - 80])\n'),
     # PROSE, which is what a row files when its real repro is shadowed by an indented
     # English paragraph. It must NOT grade `check_reject`: that is the outcome most rows
     # declare, so folding the two together is a row passing `--strict` on a program that
