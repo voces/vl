@@ -1,9 +1,9 @@
 // A LITERAL LANE INDEX IS ONE LANE INSTRUCTION — property-access-design.md §A7 and §E3.
 //
-// `std:simd`'s `lane(i)` / `withLane(i, x)` take `i: Lane` (`0 | 1 | 2 | 3`) and branch over it,
+// `std:simd`'s `lane(i)` / `withLane(i, x)` take `i: Lane4` (`0 | 1 | 2 | 3`) and branch over it,
 // each arm passing a LITERAL to the lane intrinsic. At `-O` and `-O3` a literal argument must
 // fold that ladder to exactly one `f32x4.extract_lane N` / `f32x4.replace_lane N` with the right
-// immediate, and the `.x`–`.w` getters to one `extract_lane` each. A `Lane` known only at run
+// immediate, and the `.x`–`.w` getters to one `extract_lane` each. A `Lane4` known only at run
 // time keeps all four arms. The vector is loaded from a `Buf` so nothing constant-folds away.
 //
 // GATING: needs the built binary, the seed and binaryen (`node_modules`). A missing
@@ -20,14 +20,14 @@ if (!ENABLED) console.warn("[simd-lane-codegen] skipped — missing vl, the seed
 
 const PRE = [
   'import { Buffer } from "std:buffer"',
-  'import { Lane, loadF32x4, storeF32x4 } from "std:simd"',
+  'import { Lane4, loadF32x4, storeF32x4 } from "std:simd"',
   "const b = Buffer(64)",
   "b.storeF32(8, 7.5)",
   "const v = b.loadF32x4(0)",
 ];
 
 const PICK = [
-  "function pick(n: i32): Lane {",
+  "function pick(n: i32): Lane4 {",
   "  if n == 0 { return 0 }",
   "  if n == 1 { return 1 }",
   "  if n == 2 { return 2 }",

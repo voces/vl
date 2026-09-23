@@ -29,8 +29,8 @@ matches: `buffer-design.md` (the linear-memory tier this builds on), `flat-recor
 **Build status (2026-09-22): S0–S3 shipped, with O3's lane access.** `std:simd` carries the
 `F32x4` slice (§G S3). O3 is built as `property-access-design.md` ruled it (F3(a), F4(b)):
 `.x/.y/.z/.w` are getters, and the indexed pair is spelled `v.lane(i)` / `v.withLane(i, x)`,
-unsuffixed and type-bound, where `i: Lane` (`0 | 1 | 2 | 3`). A literal index is one lane
-instruction at `-O`; a value already typed `Lane` is accepted and costs a four-way branch,
+unsuffixed and type-bound, where `i: Lane4` (`0 | 1 | 2 | 3`). A literal index is one lane
+instruction at `-O`; a value already typed `Lane4` is accepted and costs a four-way branch,
 which delivers the deferred runtime-index fallback without a spill; a plain `i32` is refused.
 D1980 is closed. Vectors inside containers (D1981) and function values (D1982) are refused
 loudly. Implementation notes: `docs/internals/std-notes.md` §`std:simd`.
@@ -420,7 +420,7 @@ function so the surface reads the same whether a kernel prefers `a*b + c` or
 - **Arithmetic** — `"+"` `"-"` `"*"` `"/"` (or `addF32x4`/… ), `minF32x4` `maxF32x4` `absF32x4`
   `sqrtF32x4` `negF32x4`; integer shapes add `min_s/u`, `max_s/u`, shifts, `avgrU8x16`.
 - **Lane access** — `laneF32x4(v, i)` (extract) / `withLaneF32x4(v, i, x)` (replace); shipped as the
-  unsuffixed type-bound `v.lane(i)` / `v.withLane(i, x)` with `i: Lane` (build status above). **`i` must be a
+  unsuffixed type-bound `v.lane(i)` / `v.withLane(i, x)` with `i: Lane4` (build status above). **`i` must be a
   compile-time constant** (the wasm lane immediate — `extract_lane`/`replace_lane` take a byte
   immediate, not a stack operand); a non-constant index is a checker error naming the constraint
   (§F O3, ruled). **Ruled addition:** named `.x`/`.y`/`.z`/`.w` accessors on the 4-lane shapes cover
@@ -576,8 +576,8 @@ instruction, and a non-literal is a checker error naming the constraint. Named `
 accessors are ADDED for the common 4-lane case, so a numeric index is rarely needed at all. A
 runtime-index fallback (spill to memory, index the spill — slower, always works) is DEFERRED, not
 designed away: it answers a genuinely-dynamic-index kernel once one shows up, without holding up v1.
-*Built (2026-09-22)* per `property-access-design.md` F3(a): the index is a literal-union `Lane`
-parameter, so "literal" means "typed `Lane`"; a runtime `Lane` is a four-way branch, not a spill.
+*Built (2026-09-22)* per `property-access-design.md` F3(a): the index is a literal-union `Lane4`
+parameter, so "literal" means "typed `Lane4`"; a runtime `Lane4` is a four-way branch, not a spill.
 
 **O4 — Operator overloading: BROAD, under the orphan rule.** RULED, and broader than the
 recommendation: any nominal type may overload operators in its OWN declaring module, gated by the
