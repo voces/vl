@@ -55,3 +55,4 @@ D1960-D1979  vl-11  2026-09-22  plumb consumer lanes (PL-001..PL-007)
 D1980-D1989  vl-11  2026-09-22  SIMD S3
 D1990-D1994  vl-11  2026-09-22  plumb PL-001/PL-008 lanes
 D1995-D1999  vl-11  2026-09-22  review follow-ups
+D2010-D2019  vl-11  2026-09-22  review follow-ups 2
