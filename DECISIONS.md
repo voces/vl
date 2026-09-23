@@ -3935,6 +3935,17 @@ legal exactly where nothing it reaches WRITES a widened slot.
   keeps its storage is shared — a list of records whose fields widen, and D2161's `C[]` into
   `(C | null)[]` — and this rule refuses a store the source's slot cannot hold. Whether such a
   widening should be refused even where nothing writes is D2161's open question.
+* **What a delivered union is, and when a read ends the path.** A union (or nullable) source
+  delivered into a record is one of its members, so each member the record accepts contributes
+  its own widened slots. A read of a scalar out of the value holds no slot a store can reach, so
+  the path ends there — `it.qty * 10` is not an escape. A `match` arm is its value like an `if`
+  arm, a spread's elements stay at the same element slots, a rest parameter holds the packed
+  list, and a value the checker typed as an error gives no verdict.
+* **A value read back out of the source keeps the source's type.** Every store of anything else
+  into a widened slot is refused, so the slot only ever holds its source type, and `p.a = p.b`
+  (or `const t = p.a` then `p.b = t`) stores a value of that type. This is the one
+  flow-sensitive fact the rule uses; a value from ANOTHER argument's widened field would need
+  that argument's own type, which the rule does not track.
 * **A write is judged by its value's static type.** Each widened slot carries the SOURCE's own
   type there; a store whose value type is assignable to it (`p.x = 5` into an `i32` source's
   widened `x`) cannot break the source's rep and runs. A store of a value typed wider than the

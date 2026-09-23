@@ -17,7 +17,9 @@ see **`DECISIONS.md`**.
   relays, closures, stores, loop variables, `map`/`filter` and function-parameter callbacks
   (std `sort`/`reduce` included), returns, `??`, `if` arms, memoised per parameter. Joins are
   deliveries too (a list literal's, an `if` value's, a `??`'s or an inferred return's narrower
-  operand), and every delivery is decided once all bodies are checked. A write to a widened slot
+  operand), and every delivery is decided once all bodies are checked. A union join delivered into a
+  record is split into its members, a scalar read ends a path, `match` arms, spreads and rest
+  parameters are followed, and a value read back out of the source keeps its source type. A write to a widened slot
   of a value the source's own slot type does not accept refuses the delivery, naming the write;
   `p.x = 5` into an `i32` source still runs. An 840-cell grid (7 widenings × 12 positions × 5
   callee behaviours × two faces): 278 traps, 280 invalid modules and 19 emit floors → check
