@@ -355,8 +355,8 @@ first-match-wins. Both are hard errors at the pattern.
 literals compiles to one `br_table` jump when the literal set is dense, and to the compare chain
 otherwise. The semantics are the same either way — first matching arm, `_` mandatory, the
 scrutinee read at the point of dispatch — so the choice is invisible except in speed: on a
-256-arm state-machine loop the table ran ~12× faster in user CPU than the chain (11.55 s →
-0.96 s over 500M dispatches; binaryen `-O3` recovered none of the gap, 8.20 s → 0.72 s).
+256-arm state-machine loop the table ran ~13× faster in user CPU than the chain (10.51 s →
+0.81 s over 500M dispatches; binaryen `-O3` recovered none of the gap, 7.15 s → 0.70 s).
 
 **The density rule.** Let `n` be the number of DISTINCT literal values across all arms (an
 or-group contributes each of its values; a repeated value keeps its first arm, exactly as the
