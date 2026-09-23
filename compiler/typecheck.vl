@@ -2330,6 +2330,12 @@ function nodeIsTotalAt(ix: i32, tail: boolean) {
   if n is Block {
     const st = n.blkStmts
     if st.length == 0 { return false }
+    // A statement that always exits ends the block, whatever dead code follows it.
+    let si = 0
+    while si < st.length - 1 {
+      if stmtAlwaysExits(st[si]) { return true }
+      si = si + 1
+    }
     return nodeIsTotalAt(st[st.length - 1], tail)
   }
   if n is RetStmt { return true }
@@ -2343,6 +2349,8 @@ function nodeIsTotalAt(ix: i32, tail: boolean) {
       if ifCondIsDiscriminating(n.ifCond) { return true }
       return false
     }
+    // An arm that completes with no value falls off the end, whatever the other arm does.
+    if ifYieldsNoValue(ix) { return false }
     return nodeIsTotalAt(n.ifThen, tail) && nodeIsTotalAt(n.ifElse, tail)
   }
   if n is WhileStmt {
@@ -2353,7 +2361,11 @@ function nodeIsTotalAt(ix: i32, tail: boolean) {
   }
   // A bare trailing value expression is the implicit return — in a value position only.
   if !tail { return false }
-  !isStmtNode(ix)
+  if isStmtNode(ix) { return false }
+  if ifYieldsNoValue(ix) { return false }
+  // A `void` call in tail position is a statement: it yields nothing to return.
+  const tt = nodeTyIxOf(ix)
+  !(tt >= 0 && isVoidTy(tt))
 }
 
 // Totality of a function BODY, which `emitFuncBody` trusts to pad a fall-through with
@@ -2633,6 +2645,20 @@ let opBinDeclined: string[] = []
 let inferStack: string[] = []
 let inferObserved = -1
 let inferSawErr = false
+// Every witness `noteInferredRet` joined for the functions being inferred, in order, and
+// whether it is a tail `if` arm's seed. A tail `if` that yields no value replays the non-seed
+// rows from its mark, so its arms' values leave the inferred return (`dropTailIfSeeds`).
+let inferRetLogTy: i32[] = []
+let inferRetLogSeed: boolean[] = []
+let inferRetSeeding = false
+// True while an explicit `return`'s argument is checked: an `if` there is a value slot, so its
+// verdict never rewinds the inferred return (the slot's own void check refuses it instead).
+let inRetArg = false
+// Per node: true at an `if` some completing arm of which yields no value (a `void` tail, an empty
+// arm, a statement, or such an `if` nested as its tail). That `if` is a statement, never a value.
+let ifNoValueAt: boolean[] = []
+// Per node: an `if`/`else`'s completing-arm value join (`ifTailValTyOf`), -1 where unrecorded.
+let ifValTyAt: i32[] = []
 // The value type of the most recently checked `Block` — its trailing expression's type, or
 // `TY_VOID` when the block ends in a statement. `checkNode(Block)` itself returns `TY_VOID`, so
 // this carries the tail value out of band for an `if … { v } else { w }` expression to join its
@@ -3763,6 +3789,11 @@ export function initChecker() {
   inferStack = []
   inferObserved = -1
   inferSawErr = false
+  inferRetLogTy = []
+  inferRetLogSeed = []
+  inferRetSeeding = false
+  ifNoValueAt = []
+  ifValTyAt = []
   // Pass 0 and pass 1's collect tables, reset here with everything else: every
   // `checkProgram` reaches its walk through a caller that ran `initChecker` first
   // (`compileSrc`, `checkSrc`, `checkSrcSym`, `jwSecondPass`), so this is the one
@@ -24443,12 +24474,134 @@ function noteInferredRet(t: i32) {
   // sees the true type — first-wins alone silently dropped later branches. A return reached
   // only through an `is`-guard over a hole param contributes a guarded member instead (`mkGuardedRetTy`).
   const g = mkGuardedRetTy(t)
+  inferRetLogTy.push(g)
+  inferRetLogSeed.push(inferRetSeeding)
   if inferObserved < 0 {
     inferObserved = g
   } else {
     inferObserved = joinRetTys(inferObserved, g)
   }
   0
+}
+
+// A tail `if` arm's value, noted as a seed so `dropTailIfSeeds` can take it back.
+function noteInferredSeed(t: i32) {
+  inferRetSeeding = true
+  noteInferredRet(t)
+  inferRetSeeding = false
+  0
+}
+
+// Rewinds the inferred return to `obsMark`, the value it had at log row `logMark`, and re-joins
+// only the non-seed rows since: the `return`s stay, every tail-arm value below the mark leaves.
+function dropTailIfSeeds(logMark: i32, obsMark: i32) {
+  if logMark > inferRetLogTy.length { return 0 }
+  const keepTy: i32[] = []
+  let i = logMark
+  while i < inferRetLogTy.length {
+    if !inferRetLogSeed[i] { keepTy.push(inferRetLogTy[i]) }
+    i = i + 1
+  }
+  while inferRetLogTy.length > logMark {
+    inferRetLogTy.pop()
+    inferRetLogSeed.pop()
+  }
+  inferObserved = obsMark
+  let k = 0
+  while k < keepTy.length {
+    inferRetLogTy.push(keepTy[k])
+    inferRetLogSeed.push(false)
+    if inferObserved < 0 {
+      inferObserved = keepTy[k]
+    } else {
+      inferObserved = joinRetTys(inferObserved, keepTy[k])
+    }
+    k = k + 1
+  }
+  0
+}
+
+// True when the `if` at `ix` yields no value on some completing arm — a statement, whatever
+// its arms' join reads. -1 and every non-`if` node answer false.
+export function ifYieldsNoValue(ix: i32): boolean {
+  if ix < 0 || ix >= ifNoValueAt.length { return false }
+  ifNoValueAt[ix]
+}
+
+// Does the if-arm `armIx`, which completes, finish without a value? `armTy` is its tail type
+// as the arm join sees it: `void` for an empty arm, a statement or a void call; an `if` tail
+// with a value-less arm of its own joins to a type mentioning `void`, so it is asked directly.
+function ifArmGivesNoValue(armIx: i32, armTy: i32): boolean {
+  if armTy == TY_VOID { return true }
+  if armIx < 0 { return false }
+  const a = P.nodes[armIx]
+  if a is Block {
+    const n = a.blkStmts.length
+    if n == 0 { return true }
+    return ifYieldsNoValue(a.blkStmts[n - 1])
+  }
+  // Any other arm node (a `match` arm's bare expression) carries its own verdict.
+  ifYieldsNoValue(armIx)
+}
+
+// A `match` at `ix` keeps the `if`/`else` rule on its arms: `matchTallyBegin` clears its verdict,
+// `matchArmTally` folds one arm (an exiting arm adds nothing, a value-less one marks it), and
+// `matchTallyEnd` banks the completing arms' join. The running join is -1 until an arm adds.
+function matchTallyBegin(ix: i32): i32 {
+  if ix < 0 { return -1 }
+  while ifNoValueAt.length <= ix { ifNoValueAt.push(false) }
+  ifNoValueAt[ix] = false
+  -1
+}
+
+function matchArmTally(ix: i32, body: i32, armTy: i32, acc: i32): i32 {
+  if ix < 0 || stmtAlwaysExits(body) { return acc }
+  if ifArmGivesNoValue(body, armTy) {
+    while ifNoValueAt.length <= ix { ifNoValueAt.push(false) }
+    ifNoValueAt[ix] = true
+    return acc
+  }
+  const v = ifArmValTy(body, armTy)
+  if acc < 0 { return v }
+  joinTys(acc, v)
+}
+
+function matchTallyEnd(ix: i32, acc: i32) {
+  if ix < 0 { return 0 }
+  while ifValTyAt.length <= ix { ifValTyAt.push(-1) }
+  if acc < 0 { ifValTyAt[ix] = TY_VOID } else { ifValTyAt[ix] = acc }
+  0
+}
+
+// Whether the if-arm block `armIx` ends in a bare `{ … }` block statement.
+function armEndsInBareBlock(armIx: i32): boolean {
+  if armIx < 0 { return false }
+  const a = P.nodes[armIx]
+  if !(a is Block) { return false }
+  const n = a.blkStmts.length
+  n > 0 && P.nodes[a.blkStmts[n - 1]] is Block
+}
+
+// The value an `if`/`else` at `ix` yields as a tail: the join of the arms that complete, an
+// exiting arm contributing nothing (`void` when none completes). `fallback` for any other node.
+function ifTailValTyOf(ix: i32, fallback: i32): i32 {
+  if ix < 0 || ix >= ifValTyAt.length { return fallback }
+  if ifValTyAt[ix] < 0 { return fallback }
+  ifValTyAt[ix]
+}
+
+// An if-arm's tail value as `ifTailValTyOf` sees it: a nested `if`/`else` tail answers its own
+// completing-arm join instead of the arm join `armTy`, which counts an exiting arm as `void`.
+function ifArmValTy(armIx: i32, armTy: i32): i32 {
+  if armIx < 0 { return armTy }
+  const a = P.nodes[armIx]
+  if a is Block {
+    const n = a.blkStmts.length
+    if n > 0 { return ifTailValTyOf(a.blkStmts[n - 1], armTy) }
+    return armTy
+  }
+  // Any other arm node (an `else if` link, a `match` arm's bare expression) answers its own.
+  ifTailValTyOf(armIx, armTy)
 }
 
 // The natural-return accumulator for the redundant-return rule (annotated funcs):
@@ -25952,6 +26105,7 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
   // function's body check) and the enclosing return type.
   const savedObserved = inferObserved
   const savedSawErr = inferSawErr
+  const savedRetLogLen = inferRetLogTy.length
   const cbBefore = cycleBreakCount
   const savedValueRet = fnSawValueRet
   const savedRetNatural = retNatural
@@ -26013,6 +26167,8 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
   const daSavedUnassigned = daEnterFrame()
   const savedRet = T.curRet
   T.curRet = ret
+  const savedInRetArg = inRetArg
+  inRetArg = false
   // D1045: the name the nominal-escape refusal puts in its sentence. An anonymous
   // lambda keeps the ENCLOSING function's name, which is the scope the declaration
   // is actually inside.
@@ -26110,8 +26266,13 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
           if !isStmtNode(stmts[s]) { refuseLocalNomEscape(stTy, stmts[s]) }
           // The IMPLICIT return of the deferred pin, for the reason the explicit one
           // states: under inference the destination is the join, not this witness (D1591).
-          noteInferRetWitness(stmts[s], stTy)
-          noteInferredRet(inferRetTyOf(stmts[s], stTy))
+          // A tail `if` with a value-less arm is a statement, so the body has no tail value.
+          if !ifYieldsNoValue(stmts[s]) {
+            noteInferRetWitness(stmts[s], stTy)
+            noteInferredRet(
+              ifTailValTyOf(stmts[s], inferRetTyOf(stmts[s], stTy)),
+            )
+          }
           // The soundness check for an inferred return: `inferObserved` is the join of the
           // returns just walked (the value type the chain infers), while the tail if-statement's
           // own type is void for an all-returning chain — so the accumulated join is what the
@@ -26156,6 +26317,7 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
   // `popScope` below would drop. The flag is consumed after `ret` is finalized.
   const bodyTotalForRet = nodeIsTotal(n.fnBody)
   T.curRet = savedRet
+  inRetArg = savedInRetArg
   curFnEscName = savedEscName
   curFnBareRetVoid = savedBareRetVoid
   daLeaveFrame(daSavedUnassigned)
@@ -26191,6 +26353,11 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
       savedValueRet,
       bodyTotalForRet,
     )
+  }
+  // This body's witnesses belong to its own inference, not to an enclosing `if`'s replay.
+  while inferRetLogTy.length > savedRetLogLen {
+    inferRetLogTy.pop()
+    inferRetLogSeed.pop()
   }
   // Soundness — missing return: a function whose body can fall off the end without yielding a
   // value on some path implicitly produces `null`, sound only when `null` is part of the
@@ -34250,6 +34417,7 @@ function checkMatchIntArms(n: MatchExpr, ix: i32, st: i32) {
   // -1 is the "unset" join seed (`joinTys` returns the other operand); the positive TY_ERR
   // sentinel would poison the join, so never seed with it.
   let matchTy = -1
+  let matchValAcc = matchTallyBegin(ix)
   const nArms = n.matchArmStart.length
   let ai = 0
   while ai < nArms {
@@ -34295,9 +34463,11 @@ function checkMatchIntArms(n: MatchExpr, ix: i32, st: i32) {
       if armTy < 0 { armTy = TY_VOID }
     }
     matchTy = joinTys(matchTy, armTy)
+    matchValAcc = matchArmTally(ix, body, armTy, matchValAcc)
     ai = ai + 1
   }
   if matchTy < 0 { matchTy = TY_VOID }
+  matchTallyEnd(ix, matchValAcc)
   // Exhaustiveness is the wildcard, and it is required — an integer has no closed member set,
   // so there is no arm list that could stand in for one.
   if !hasWild && !sawBadPat {
@@ -34555,6 +34725,7 @@ function checkMatchTypeArms(n: MatchExpr, ix: i32, st: i32, uMems: i32[]) {
   // Pass 3 (source order): check each arm body under its branch's narrowing, joining arm value
   // types. -1 is the "unset" join seed; the positive TY_ERR sentinel would poison the join.
   let matchTy = -1
+  let matchValAcc = matchTallyBegin(ix)
   let bi = 0
   while bi < nArms {
     const nmz: string[] = []
@@ -34593,9 +34764,11 @@ function checkMatchTypeArms(n: MatchExpr, ix: i32, st: i32, uMems: i32[]) {
     }
     if scoped { popScope() }
     matchTy = joinTys(matchTy, armTy)
+    matchValAcc = matchArmTally(ix, body, armTy, matchValAcc)
     bi = bi + 1
   }
   if matchTy < 0 { matchTy = TY_VOID }
+  matchTallyEnd(ix, matchValAcc)
   // Exhaustiveness: `_` is allowed but never required — a match naming every member is
   // complete without one. Missing members render from the arena types, not a re-split spelling.
   if !hasWild && !sawBadPat {
@@ -34682,6 +34855,7 @@ function checkMatchExprNode(n: MatchExpr, ix: i32) {
   // -1 is the "unset" join seed (`joinTys` returns the other operand); the positive TY_ERR
   // sentinel would poison the join (every arm joins back to error), so never seed with it.
   let matchTy = -1
+  let matchValAcc = matchTallyBegin(ix)
   let ai = 0
   while ai < n.matchArmStart.length {
     // Patterns of arm `ai`.
@@ -34764,11 +34938,13 @@ function checkMatchExprNode(n: MatchExpr, ix: i32) {
       if armTy < 0 { armTy = TY_VOID }
     }
     matchTy = joinTys(matchTy, armTy)
+    matchValAcc = matchArmTally(ix, body, armTy, matchValAcc)
     ai = ai + 1
   }
   // A void-armed match leaves the join unset (-1) or void; normalize to void so the function-
   // body-tail seeding (`noteInferredRet`) does not mistake it for the error sentinel.
   if matchTy < 0 { matchTy = TY_VOID }
+  matchTallyEnd(ix, matchValAcc)
   // Exhaustiveness: every member covered, or a wildcard. Skipped after an invalid pattern —
   // that arm covers nothing, so a missing-member report would mis-blame what the pattern already explained.
   if !hasWild && !sawBadPat {
@@ -34817,7 +34993,11 @@ function checkIfStmtNode(n: IfStmt, ix: i32) {
   // An `if`/`else` in value position is an expression whose value is the join of its branch
   // tail values — capture whether THIS `if` sits in the function's return-tail position.
   const ifTail = retTailPos
+  const ifInRetArg = inRetArg
   retTailPos = false
+  // Where the inferred return stood before this `if`'s arms seeded it (`dropTailIfSeeds`).
+  const seedLogMark = inferRetLogTy.length
+  const seedObsMark = inferObserved
   const condTy = checkNode(n.ifCond)
   if !assignable(condTy, TY_BOOL) {
     tErr("if-condition must be boolean, got " + tyToStr(condTy), n.ifCond)
@@ -34893,7 +35073,7 @@ function checkIfStmtNode(n: IfStmt, ix: i32) {
       // The arm, not the arms' join: a tail `if`/`else` whose one arm is an open `[]` needs
       // the sibling arm's shape, and the join is a third arena row (D1591).
       noteInferRetWitness(thenIx, thenTy)
-      noteInferredRet(thenTy)
+      noteInferredSeed(ifArmValTy(n.ifThen, thenTy))
       if guardedRet { guardAltStack.pop() }
     }
   }
@@ -34910,6 +35090,7 @@ function checkIfStmtNode(n: IfStmt, ix: i32) {
   const daElseAdds: i32[] = []
   const daElseRems: i32[] = []
   let elseTy = TY_VOID
+  let elseIsLink = false
   // The else arm's own depth and row range, read by the arm join below. An absent else leaves
   // them at their no-rows defaults, which is what says the fall-through wrote nothing.
   let elseOwnDepth = -1
@@ -34942,12 +35123,13 @@ function checkIfStmtNode(n: IfStmt, ix: i32) {
     if enElse is IfStmt {
       elseTy = elseRes
       elseIx = -1
+      elseIsLink = true
     }
     if enNames.length > 0 { popScope() }
     if ifTail {
       if elseTy != TY_VOID && elseTy != TY_ERR {
         noteInferRetWitness(elseIx, elseTy)
-        noteInferredRet(elseTy)
+        noteInferredSeed(ifArmValTy(n.ifElse, elseTy))
       }
     }
     const daElseSid: i32[] = []
@@ -35063,6 +35245,41 @@ function checkIfStmtNode(n: IfStmt, ix: i32) {
     }
   }
   retTailPos = ifTail
+  // An `if` with a completing arm that yields no value is a statement: it is `void` as the
+  // function's tail, so the arm values it seeded leave the inferred return.
+  // An arm ending in a bare `{ … }` leaves the `if` undecided: whether that block yields its
+  // tail is the open bare-block-as-expression ruling, and D1903 pins what runs today.
+  let bareArm = armEndsInBareBlock(n.ifThen)
+  if daHasElse && !elseIsLink && armEndsInBareBlock(n.ifElse) { bareArm = true }
+  let noValue = !bareArm && !thenExits && ifArmGivesNoValue(n.ifThen, thenTy)
+  if !bareArm && daHasElse && !daElseDiverges {
+    // An `else if` link answers its own verdict: an else-less link's fall-through is its `null`.
+    if elseIsLink {
+      if ifYieldsNoValue(n.ifElse) { noValue = true }
+    } else if ifArmGivesNoValue(n.ifElse, elseTy) {
+      noValue = true
+    }
+  }
+  // Written both ways: a later pass re-decides with the callees' final types.
+  if ix >= 0 && (noValue || ix < ifNoValueAt.length) {
+    while ifNoValueAt.length <= ix { ifNoValueAt.push(false) }
+    ifNoValueAt[ix] = noValue
+  }
+  if noValue && ifTail && !ifInRetArg && daHasElse {
+    dropTailIfSeeds(seedLogMark, seedObsMark)
+  }
+  if daHasElse && ix >= 0 {
+    let valTy = TY_VOID
+    if !thenExits { valTy = ifArmValTy(n.ifThen, thenTy) }
+    if !daElseDiverges {
+      // A `void` here is an else-less link's value-less fall-through, which adds nothing.
+      const ev = ifArmValTy(n.ifElse, elseTy)
+      if thenExits || valTy == TY_VOID { valTy = ev }
+      else if ev != TY_VOID { valTy = joinTys(valTy, ev) }
+    }
+    while ifValTyAt.length <= ix { ifValTyAt.push(-1) }
+    if bareArm { ifValTyAt[ix] = -1 } else { ifValTyAt[ix] = valTy }
+  }
   // The `if`-expression's value type: with an `else`, the join of the two branch tail
   // values.
   if daHasElse { return joinTys(thenTy, elseTy) }
@@ -36935,7 +37152,10 @@ function checkRetStmtNode(n: RetStmt, ix: i32) {
     fnSawValueRet = true
     // A returned call whose deferred join this site could not decide contributes the
     // whole join, not the lossy collapse the emitter gets (`inferRetTyOf`).
+    const savedInRetArg = inRetArg
+    inRetArg = true
     const rArgTy = checkNode(n.retArg)
+    inRetArg = savedInRetArg
     // `return <void call>` names a value to return and has none — reported here rather than
     // left to the mismatch check below, which never sees this path (the return type is still inferred).
     if voidValueSlotErr(rArgTy, n.retArg, "return", ix) { return TY_VOID }

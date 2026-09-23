@@ -68,6 +68,7 @@ import {
   fsIntrinsicSlot,
   fsRetIsVoid,
   fusedMapReadRecvIx,
+  ifYieldsNoValue,
   inferRetBearsNull,
   inferRetFnKey,
   inferRetNameByNode,
@@ -14891,6 +14892,31 @@ export function memberCallYieldsValue(stmtIx: i32) {
   false
 }
 
+// Whether the assignment at `asgIx` lowers as a value by storing and re-reading its target: a
+// name, a captured name's cell (`c[0]`, minted by the capture rewrite with no checked type), or
+// a literal-index / field write on a named non-map place whose checked type is the assignment's.
+export function assignTargetReReads(asgIx: i32, fnIx: i32): boolean {
+  const a = P.nodes[asgIx]
+  if !(a is BinExpr) { return false }
+  if a.binOp != "=" { return false }
+  const tgt = P.nodes[a.binLeft]
+  if tgt is Ident { return true }
+  let recv = -1
+  if tgt is Index {
+    if !(P.nodes[tgt.idxIndex] is NumLit) { return false }
+    recv = tgt.idxArr
+  } else if tgt is Member {
+    recv = tgt.memObj
+  } else {
+    return false
+  }
+  if !(P.nodes[recv] is Ident) { return false }
+  if exprMap(recv, fnIx) { return false }
+  const tt = nodeTyIxOf(a.binLeft)
+  if tt < 0 { return tgt is Index && P.nodes[tgt.idxArr] is Ident }
+  tt == nodeTyIxOf(asgIx)
+}
+
 // True if the statement at `stmtIx` is a bare value expression usable as an implicit
 // return — no `return` keyword needed. Recognized: literals, an identifier, a unary, a
 // non-assignment `BinExpr`, a paren, a member/index access, an `is` guard, an
@@ -14919,11 +14945,9 @@ export function stmtIsTailValue(stmtIx: i32, fnIx: i32) {
   if s is ArrayLit { return true }
   if s is BinExpr {
     if s.binOp == "=" {
-      // A trailing assignment over an ident target is a tail value — assignment yields
-      // its right side (DECISIONS: assignment-as-expression). An index/member target stays a statement.
-      const tgt = P.nodes[s.binLeft]
-      if tgt is Ident { return true }
-      return false
+      // A trailing assignment is a tail value — assignment yields its right side (DECISIONS:
+      // assignment-as-expression) — wherever `assignTargetReReads` can deliver it.
+      return assignTargetReReads(stmtIx, fnIx)
     }
     return true
   }
@@ -15049,6 +15073,8 @@ function ifTailIsValue(stmtIx: i32, fnIx: i32) {
     // `if n>0 { rec(n-1) }` as a value. The nullable-return case is handled separately by
     // `elseLessNullableTail` at emit time.
     if s.ifElse < 0 { return false }
+    // The checker's verdict: an arm that completes with no value makes the `if` a statement.
+    if ifYieldsNoValue(stmtIx) { return false }
     // D1034 — an empty arm disqualifies the whole `if`: this asks "does any arm end in a
     // bare value", so `if c { } else { buf.push(1) }` (one value arm, one empty) would
     // otherwise be wrongly classified non-void. Not "every arm must be a value" — an
