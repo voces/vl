@@ -65,6 +65,15 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   `{[string]: i32} | null` is still a check reject. The emitter side is one guard over the
   non-null twin's core (`nulFieldInnerCode`), shared by the struct and variant field ladders.
 
+- **AN ELSE-LESS `if` THAT ENDS AN ARM IS A VALUE, `T | null`** (owner, 2026-09-22). The
+  top-level rule already made a tail `if c { 5 }` yield `i32 | null`; the same `if` one level
+  down, as the tail of an arm of a tail `if`/`else` or `match`, is the same value, at any
+  depth. `function f(c, d) { if c { if d { 5 } } else { 6 } }` returns `5`, `null` or `6` and
+  infers `i32 | null`, and an exiting then-arm (`if d { return 5 }`) leaves the `null` path as
+  the arm's value. The alternative — reading the arm as value-less, so the whole tail becomes a
+  statement — silently answered `null` where the source says `6`. It interacts with the
+  void-context rule below only as that rule already says: in a void context the tail is a
+  statement whatever its arms yield (D1995).
 - **VOID CONTEXTS DISCARD IMPLICIT TAIL VALUES; AN EXPLICIT `return expr` STAYS AN ERROR,
   ANCHORED AT THE RETURN** (2026-08-31). VL is expression-oriented and effectively
   semicolon-less at line ends — `fmt` normalizes semicolons away — so there is no Rust-style
