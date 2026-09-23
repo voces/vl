@@ -65,6 +65,12 @@ The two-variable *list* form binds the **value first and the index second** — 
 [10, 20, 30]` gives `x = 10, i = 0`, then `x = 20, i = 1`, … — because the value is what you
 almost always want, so it leads. A map's companion is its value (`for k, v in m`).
 
+**A list walk is live.** The iterable is evaluated once, so rebinding the variable inside the
+body does not change what is walked — but the list's length is checked on every step, so an
+element pushed during the walk (through any alias) is visited and a `pop` ends it early. A
+body that makes no call cannot change the length, and the compiler then reads the list's
+header once before the loop; the answer is the same either way.
+
 When you genuinely need a numeric range rather than a collection's elements, there are two
 forms, and the keyword says which interval:
 

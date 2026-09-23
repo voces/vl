@@ -478,6 +478,8 @@ import {
   mvValsBackOf,
   nulScalarListFieldWrapHeap,
   nulScalarListWrapHeap,
+  rpRow,
+  rpVar,
   wDropBack,
   wLen,
   wPeekBack,
@@ -9102,16 +9104,20 @@ function emitListIdxGuard(wrapSlot: i32, lTy: i32) {
 // The hoisted twin of `emitListIdxGuard`, for an access whose receiver is a binding
 // with a live cached header: the backing ref and `len` are already in locals, so the
 // receiver is never (re-)emitted and the stack holds only the index. Leaves the same
-// [backing, safeIndex] pair; the bounds check is not weakened — same `len`, read once.
-function emitListIdxGuardHoisted(row: i32) {
+// [backing, safeIndex] pair; an index `idxIx` that `rangeProvenIndex` proves in bounds skips the select.
+function emitListIdxGuardHoisted(row: i32, idxIx: i32) {
   fbLocalSet(listIdxScratchBase) // 0x21 local.set — stash the index
   fbLocalGet(lhBack[row])        // the cached backing (was `struct.get` field 0)
+  if rangeProvenIndex(row, idxIx) {
+    fbLocalGet(listIdxScratchBase)
+    return 0
+  }
   fbLocalGet(listIdxScratchBase)
-  fbI32Const(-1)                 // the out-of-range replacement index
+  fbI32Const(-1)         // the out-of-range replacement index
   fbLocalGet(listIdxScratchBase)
-  fbLocalGet(lhLen[row])         // the cached len (was `struct.get` field 1)
-  fbI32Bin(73)                   // 0x49 i32.lt_u
-  wU8(27)                        // 0x1b select → i if in-bounds else -1
+  fbLocalGet(lhLen[row]) // the cached len (was `struct.get` field 1)
+  fbI32Bin(73)           // 0x49 i32.lt_u
+  wU8(27)                // 0x1b select → i if in-bounds else -1
   0
 }
 
@@ -9673,6 +9679,7 @@ function loopHoistOpen(
   bodyIx: i32,
   fnIx: i32,
   ownVar: string,
+  ownVar2: string,
 ) {
   if !hoistSafeExpr(condIx, fnIx) { return 0 }
   if !hoistSafeBlock(bodyIx, fnIx) { return 0 }
@@ -9684,7 +9691,7 @@ function loopHoistOpen(
   let i = 0
   while i < lhScanName.length {
     const nm = lhScanName[i]
-    let ok = nm != ownVar
+    let ok = nm != ownVar && nm != ownVar2
     if ok && exprReboundsName(condIx, nm) { ok = false }
     if ok && blockReboundsName(bodyIx, nm) { ok = false }
     if ok {
@@ -9727,6 +9734,98 @@ function loopHoistOpen(
     i = i + 1
   }
   opened
+}
+
+// The live list (not raw-string) hoist row cached for binding `name`, or -1.
+function liveListRowNamed(name: string) {
+  let k = 0
+  while k < lhName.length {
+    if lhLive[k] > 0 && lhName[k] == name && !hoistRowIsStr(k) { return k }
+    k = k + 1
+  }
+  0 - 1
+}
+
+// Whether `ix` is a non-negative i32 integer literal.
+function exprIsNonNegIntLit(ix: i32) {
+  if ix < 0 { return false }
+  const e = P.nodes[ix]
+  if e is NumLit {
+    return !numLexIsFloat(e.numText) &&
+      numLexFitsI32(e.numText) &&
+      parseI32(e.numText) >= 0
+  }
+  false
+}
+
+// The binding whose length bounds a range loop's top, or "": `xs.length` under `until`,
+// `xs.length - 1` under `to`. Either way every value the loop variable takes is `< len`.
+function rangeTopLenOf(s: ForRange) {
+  let top = s.frTo
+  if !s.frExcl {
+    if top < 0 { return "" }
+    const b = P.nodes[top]
+    if b is BinExpr {
+      if b.binOp != "-" { return "" }
+      const one = P.nodes[b.binRight]
+      if one is NumLit {
+        if one.numText != "1" { return "" }
+      } else {
+        return ""
+      }
+      top = b.binLeft
+    } else {
+      return ""
+    }
+  }
+  if top < 0 { return "" }
+  const m = P.nodes[top]
+  if m is Member {
+    if m.memProp != "length" { return "" }
+    const o = P.nodes[m.memObj]
+    if o is Ident { return o.identName }
+  }
+  ""
+}
+
+// Open a range proof for `for v in A until xs.length` (or `to xs.length - 1`) with a constant
+// positive step, `A` a non-negative literal, `v` never rebound in the body, and `xs` served by
+// a live hoist row — whose `len` cannot move while the row is live. Returns the count pushed.
+function rangeProofOpen(s: ForRange, stepK: i32, dynStep: boolean) {
+  if dynStep || stepK <= 0 { return 0 }
+  if !exprIsNonNegIntLit(s.frFrom) { return 0 }
+  const nm = rangeTopLenOf(s)
+  if nm == "" || nm == s.frVar { return 0 }
+  const row = liveListRowNamed(nm)
+  if row < 0 { return 0 }
+  if blockReboundsName(s.frBody, s.frVar) { return 0 }
+  rpVar.push(s.frVar)
+  rpRow.push(row)
+  1
+}
+
+function rangeProofClose(n: i32) {
+  let i = 0
+  while i < n {
+    rpVar.pop()
+    rpRow.pop()
+    i = i + 1
+  }
+  0
+}
+
+// Whether index expression `idxIx` over hoist row `row` is a range-proven loop variable.
+function rangeProvenIndex(row: i32, idxIx: i32) {
+  if idxIx < 0 { return false }
+  const e = P.nodes[idxIx]
+  if e is Ident {
+    let k = rpVar.length - 1
+    while k >= 0 {
+      if rpVar[k] == e.identName { return rpRow[k] == row }
+      k = k - 1
+    }
+  }
+  false
 }
 
 // Close the `n` rows this loop opened, innermost first.
@@ -9814,7 +9913,7 @@ function emitIndex(body: i32[], idxIx: i32, fnIx: i32) {
       pendingF32 = savedRlIxF32
       // Guard `i u< len`, unwrap to the backing (`struct.get` field 0), read.
       if rlHz >= 0 {
-        emitListIdxGuardHoisted(rlHz)
+        emitListIdxGuardHoisted(rlHz, nd.idxIndex)
       } else {
         emitListIdxGuard(listIdxWrapSlot("ref", rslot), rlWrapIdx[rslot])
       }
@@ -9865,7 +9964,7 @@ function emitIndex(body: i32[], idxIx: i32, fnIx: i32) {
       }
       if emitExpr(body, nd.idxIndex, fnIx) < 0 { return -1 }
       if nsHz >= 0 {
-        emitListIdxGuardHoisted(nsHz)
+        emitListIdxGuardHoisted(nsHz, nd.idxIndex)
       } else {
         emitListIdxGuard(listIdxWrapSlot("str", 0), mkListIdx)
       }
@@ -9894,7 +9993,7 @@ function emitIndex(body: i32[], idxIx: i32, fnIx: i32) {
       if emitExpr(body, nd.idxIndex, fnIx) < 0 { return -1 }
       // Guard `i u< len`, unwrap to the backing (`struct.get` field 0), read.
       if slHz >= 0 {
-        emitListIdxGuardHoisted(slHz)
+        emitListIdxGuardHoisted(slHz, nd.idxIndex)
       } else {
         emitListIdxGuard(listIdxWrapSlot("str", 0), mkListIdx)
       }
@@ -9921,7 +10020,7 @@ function emitIndex(body: i32[], idxIx: i32, fnIx: i32) {
       pendingF32 = savedIxF32
       // Guard `i u< len`, unwrap to the backing (`struct.get` field 0), read.
       if skHz >= 0 {
-        emitListIdxGuardHoisted(skHz)
+        emitListIdxGuardHoisted(skHz, nd.idxIndex)
       } else {
         emitListIdxGuard(
           listIdxWrapSlot(listIdxKindOf(ek), 0),
@@ -15747,7 +15846,7 @@ function emitAssign(body: i32[], binIx: i32, fnIx: i32) {
       // Guard `i u< len`, unwrap to the backing (`struct.get` field 0) — leaves
       // [backing, safeIndex] resolved AFTER the value ran.
       if stHz >= 0 {
-        emitListIdxGuardHoisted(stHz)
+        emitListIdxGuardHoisted(stHz, target.idxIndex)
       } else {
         emitListIdxGuard(listIdxWrapSlot(idxKind, idxSlot), lTy)
       }
@@ -19750,7 +19849,7 @@ function emitWhileStmtStmt(body: i32[], s: WhileStmt, _stmtIx: i32, fnIx: i32) {
   // checked at the top; if false, exit the block; otherwise run the body then continue
   // the loop. Track the two control frames so break/continue compute their relative br
   // depth. The list-header hoists open before the block, since a loop that never iterates leaves them unread.
-  const whHoist = loopHoistOpen(body, s.whileCond, s.whileBody, fnIx, "")
+  const whHoist = loopHoistOpen(body, s.whileCond, s.whileBody, fnIx, "", "")
   if whHoist < 0 { return -1 }
   fbBlock(64) // 0x02 block, 0x40 void blocktype
   ctrlEnter()
@@ -19868,8 +19967,9 @@ function emitForRangeStmt(body: i32[], s: ForRange, _stmtIx: i32, fnIx: i32) {
   // anything) and BEFORE the loop variable is bound, so its receiver reads
   // resolve in the enclosing scope. `frVar` itself is never a candidate — the
   // body sees it as a fresh i32 binding.
-  const frHoist = loopHoistOpen(body, -1, s.frBody, fnIx, s.frVar)
+  const frHoist = loopHoistOpen(body, -1, s.frBody, fnIx, s.frVar, "")
   if frHoist < 0 { return -1 }
+  const frProof = rangeProofOpen(s, stepK, dynStep)
   // Bind the loop var for the body (mirrors the collect pass's scopeBind).
   scopeBind(s.frVar, vSlot)
   fbBlock(64) // 0x02 block, void
@@ -19945,6 +20045,7 @@ function emitForRangeStmt(body: i32[], s: ForRange, _stmtIx: i32, fnIx: i32) {
   loopBrkDepth.pop()
   loopBrkLabel.pop()
   loopHoistClose(frHoist)
+  rangeProofClose(frProof)
   // The loop variable's scope is the loop (see `scopeUnbind`).
   scopeUnbind()
   return 0
@@ -20021,6 +20122,11 @@ function emitForInStmt(body: i32[], s: ForIn, _stmtIx: i32, fnIx: i32) {
     pairEk == "reflist")
   let wrapTy = lTypeIdx
   let backTy = aTypeIdx
+  // The lazy-frame kind and ref slot of this list's backing, for the header hoist below;
+  // `hOk` false where the walked list is a map's, not a list wrapper of its own.
+  let hKind: MfKind = "i32"
+  let hSlot = 0
+  let hOk = true
   if ek == "str" || ek == "nulstr" {
     // `string[]` and `(string | null)[]` share one backing (`$mkList` / `$mkArr`, whose
     // element slot is nullable either way) and differ ONLY in the loop var: `str` recovers
@@ -20028,6 +20134,7 @@ function emitForInStmt(body: i32[], s: ForIn, _stmtIx: i32, fnIx: i32) {
     // element is a value the body can test rather than a trap.
     wrapTy = mkListIdx
     backTy = mkArrIdx
+    hKind = "str"
   } else if (
     ek == "struct" ||
     ek == "variant" ||
@@ -20057,21 +20164,26 @@ function emitForInStmt(body: i32[], s: ForIn, _stmtIx: i32, fnIx: i32) {
     if fimv >= 0 {
       wrapTy = mvValsWrapOf(fimv)
       backTy = mvValsBackOf(fimv)
+      hOk = false
     } else {
       const rslot = refListSlotOfExpr(s.fiIter, fnIx)
       wrapTy = rlWrapIdx[rslot]
       backTy = rlBackIdx[rslot]
+      hKind = "ref"
+      hSlot = rslot
     }
   } else if ek == "f64" || ek == "i64" || ek == "f32" {
     // A scalar f64/i64/f32 element list: the wrapper/backing come from the descriptor, and
     // `array.get <back>` yields the scalar directly (no `ref.as_non_null`).
     wrapTy = scalarListWrap(ek)
     backTy = scalarListBack(ek)
+    hKind = listIdxKindOf(ek)
   } else if u8Src {
     // The packed byte list — the same descriptor pair, keyed on the `#l` temp's kind rather
     // than the loop var's (which is `"i32"`, shared with the i32 list and the string walk).
     wrapTy = scalarListWrap("u8list")
     backTy = scalarListBack("u8list")
+    hKind = "u8"
   }
   // for a map iteration, evaluate the receiver once and stash the map ref: the stash is
   // the receiver's only evaluation, so the walked list, the loop bound and the skip's
@@ -20095,6 +20207,27 @@ function emitForInStmt(body: i32[], s: ForIn, _stmtIx: i32, fnIx: i32) {
     wU8(212) // 0xd4 ref.as_non_null
   }
   fbLocalSet(lIdx)
+  // A body that cannot reallocate a list (`hoistSafeBlock`: no call, so no push/pop through
+  // any alias) sees one backing and one `len` throughout, so both are read once here. Any
+  // other body re-reads the header per step, so an element pushed mid-walk is visited.
+  let fiHBack = -1
+  let fiHLen = -1
+  if (
+    hOk &&
+    !strSrc &&
+    mapRecv < 0 &&
+    pairValsSlot < 0 &&
+    hoistSafeBlock(s.fiBody, fnIx)
+  ) {
+    fiHBack = listBackStashSlot(hKind, hSlot)
+    fiHLen = strI32Slot()
+    fbLocalGet(lIdx)
+    fbStructGet(wrapTy, 0)
+    fbLocalSet(fiHBack)
+    fbLocalGet(lIdx)
+    fbStructGet(wrapTy, 1)
+    fbLocalSet(fiHLen)
+  }
   // a string source runs its cursor in backing coordinates: the `#l` temp holds the
   // header, so hoist the backing into its own slot and pre-compute the exit bound — one
   // `array.get` per code point and no `struct.get` in the loop, since binaryen is not
@@ -20130,6 +20263,9 @@ function emitForInStmt(body: i32[], s: ForIn, _stmtIx: i32, fnIx: i32) {
     fbI32Const(0)
     fbLocalSet(pIdx)
   }
+  // The body's own index receivers, as `while` and a range loop hoist theirs.
+  const fiHoist = loopHoistOpen(body, -1, s.fiBody, fnIx, s.fiVar, pairName)
+  if fiHoist < 0 { return -1 }
   scopeBind(s.fiVar, vSlot)
   if hasPair { scopeBind(pairName, pSlot) }
   fbBlock(64) // 0x02 block, void
@@ -20145,6 +20281,8 @@ function emitForInStmt(body: i32[], s: ForIn, _stmtIx: i32, fnIx: i32) {
   fbLocalGet(iIdx)
   if strSrc {
     fbLocalGet(fiSEnd)
+  } else if fiHLen >= 0 {
+    fbLocalGet(fiHLen)
   } else {
     fbLocalGet(lIdx)
     fbStructGet(wrapTy, 1)
@@ -20182,6 +20320,10 @@ function emitForInStmt(body: i32[], s: ForIn, _stmtIx: i32, fnIx: i32) {
     fbLocalTee(fiSPk)
     fbI32Const(16777215) // 0x00ffffff — strip the width, keep the code point
     fbI32Bin(113)        // 0x71 i32.and
+  } else if fiHBack >= 0 {
+    fbLocalGet(fiHBack)
+    fbLocalGet(iIdx)
+    fbArrayGet(backTy)
   } else {
     fbLocalGet(lIdx)
     fbStructGet(wrapTy, 0)
@@ -20267,6 +20409,7 @@ function emitForInStmt(body: i32[], s: ForIn, _stmtIx: i32, fnIx: i32) {
   ctrlLeave()
   loopBrkDepth.pop()
   loopBrkLabel.pop()
+  loopHoistClose(fiHoist)
   // The loop variables' scope is the loop (see `scopeUnbind`) — one release per name.
   if hasPair { scopeUnbind() }
   scopeUnbind()
