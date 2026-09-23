@@ -95,6 +95,8 @@ const SRC = [
   /* 63 */ "}",
   /* 64 */ 'print(useAdd("x"))',
   /* 65 */ "print(useRem(3.0) + (readsTable(0) + readsCount() + viaLiteral({ a: 1 }) + useOp({ q: 1 }).q) as f64)",
+  /* 66 */ "function addPrintLast<T>(a: T, b: T): T { const v = a + b; print(1); v }",
+  /* 67 */ "function addPrintFirst<T>(a: T, b: T): T { print(1); const v = a + b; v }",
   "",
 ].join("\n");
 
@@ -133,6 +135,8 @@ const WANT = [
   `readsTable: ${NONE} · cost: 0 steps · I/O: none`,
   "readsCount: writes: none · reads: the module `let` `count` · allocates: no · cost: 0 steps · I/O: none",
   "viaLiteral: writes: `w.inner.a` · reads: none · allocates: yes (a struct literal at line 61) · cost: 0 steps · I/O: none",
+  "addPrintLast: writes: unknown (`+` over an unbound type parameter at line 67) · reads: unknown (`+` over an unbound type parameter at line 67) · allocates: unknown (`+` over an unbound type parameter at line 67) · cost: unbounded (it applies `+` over an unbound type parameter at line 67) · I/O: `print`",
+  "addPrintFirst: writes: unknown (`+` over an unbound type parameter at line 68) · reads: unknown (`+` over an unbound type parameter at line 68) · allocates: unknown (`+` over an unbound type parameter at line 68) · cost: unbounded (it calls the host function `print`) · I/O: `print`",
 ];
 
 Deno.test({ name: "effects summary: the dump pins every fact", ignore }, async () => {
