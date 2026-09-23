@@ -273,8 +273,9 @@ Deno.test({
     withDir(async (dir) => {
       await Deno.writeTextFile(`${dir}/g.vl`, "extern let rax: i64\nprint(rax)\n");
       const r = await exec(VL, ["run", `${dir}/g.vl`, "--compiler", COMPILER]);
-      if (r.code === 0 || !r.err.includes("`rax`")) {
-        throw new Error(`want a non-zero exit naming \`rax\`, got ${r.code}: ${r.err}`);
+      const want = "extern global `rax` is declared but `vl run` provides no globals";
+      if (r.code === 0 || !r.err.includes(want)) {
+        throw new Error(`want a non-zero exit saying \`${want}\`, got ${r.code}: ${r.err}`);
       }
     }),
 });
