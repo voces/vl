@@ -198,11 +198,11 @@ Deno.test({
   ignore: !ENABLED,
   fn: async () => {
     await withDir(async (dir) => {
-      // D1976's witness: a small entry file, so the null collector, and one function body
-      // past the 64 MiB object cap. About 0.4 s and 320 MB.
+      // D1977's witness: a small entry file, so the null collector, and one literal past 2^23
+      // code points, whose string-pool decode outgrows the 64 MiB object cap. About 0.3 s.
       await Deno.writeTextFile(
         `${dir}/m.vl`,
-        `export function f0(): string { "${"a".repeat(2_850_000)}" }\n`,
+        `export function f0(): string { "${"a".repeat(8_400_000)}" }\n`,
       );
       await Deno.writeTextFile(
         `${dir}/main.vl`,
