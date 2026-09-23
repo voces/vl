@@ -78,8 +78,9 @@ print("done")
     want: 0,
     out: "1\n-1\n",
   },
-  // A scrutinee that is not a plain place keeps the chain: it is re-read per arm there, and a
-  // table that read it once would change how often its side effects run.
+  // A scrutinee that is not a plain variable stays a chain TODAY because of D1991 (the chain
+  // re-evaluates it once per tested arm, a wrong-value defect), not by design. The fix binds
+  // it to a temp once, which also makes this match table-eligible: then this count becomes 1.
   computed_scrutinee: {
     src: `function g(x: i32) {
   match x % 7 {
@@ -94,6 +95,28 @@ print(g(6))
 `,
     want: 0,
     out: "11\n19\n",
+  },
+  // Only a chain a `match` built is marked; a hand-written dense `else if` chain over the same
+  // literals keeps its compares.
+  hand_written_chain: {
+    src: `function h(x: i32) {
+  if x == 0 {
+    return 10
+  } else if x == 1 {
+    return 11
+  } else if x == 2 {
+    return 12
+  } else if x == 3 {
+    return 13
+  } else {
+    return 19
+  }
+}
+print(h(2))
+print(h(7))
+`,
+    want: 0,
+    out: "12\n19\n",
   },
 };
 

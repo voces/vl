@@ -396,10 +396,10 @@ list) all take the table.
 
 **What stays a chain, and why.**
 
-* **A scrutinee that is not a plain `Ident`** (`match x % 7`, `match f()`). The chain re-reads the
-  scrutinee per tested arm ("Scrutinee evaluated once" above names that as a defect); a table
-  that read it once would change how often a side-effecting scrutinee runs, and only for dense
-  sets. Binding the scrutinee to a temp first is the fix for both, and is not this change.
+* **A scrutinee that is not a plain `Ident`** (`match x % 7`, `match f()`), because of D1991:
+  the chain re-evaluates the scrutinee once per tested arm ("Scrutinee evaluated once" above),
+  which gives a side-effecting scrutinee the wrong arm. That is a defect, not a design choice.
+  Binding the scrutinee to a temp once fixes it and makes such a match table-eligible too.
 * **An un-annotated scrutinee** (the hole route) and a monomorphized clone: the emitter has no
   recorded `i32`/`i64` type for the node, and a hole may be pinned to a float.
 * **A value join that is nullable** (an arm yielding `null`): the chain's niche seeding owns it.
