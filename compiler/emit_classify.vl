@@ -1975,8 +1975,13 @@ export function exprNullableList(exprIx: i32, fnIx: i32) {
     if exprNullableList(nlIfL, fnIx) { return true }
   }
   // An if-expression with a null arm over an i32-list arm — see `nulArmIfThenValueIx`.
+  // An empty `[]` arm is that list only when its pinned element is `i32` (D2209).
   const elIfL = nulArmIfThenValueIx(exprIx)
-  if elIfL >= 0 { return exprArray(elIfL, fnIx) }
+  if elIfL >= 0 {
+    const elHk = emptyArrHoleKind(elIfL)
+    if elHk != null && elHk != "list" { return false }
+    return exprArray(elIfL, fnIx)
+  }
   if e is Ident {
     if paramNulList(fnIx, e.identName) { return true }
     if declaredNulList(e.identName) { return true }
@@ -12172,13 +12177,24 @@ function exprIsNullLit(exprIx: i32) {
 // its companion slot must be read off one arm, or `fbValtype` names a heap type the value
 // does not actually hold (D1560).
 function ifRepArmValueIx(ifIx: i32) {
-  const tv = ifThenValueIx(ifIx)
+  const tv = ifListArmValueIx(ifIx)
   if tv >= 0 {
     if !exprIsNullLit(tv) { return tv }
   }
   const nlv = nulIfArmNullableValueIx(ifIx)
   if nlv >= 0 { return nlv }
   tv
+}
+
+// The then arm's value, unless it is an empty `[]` beside a non-empty, non-`null` else arm:
+// an empty literal has no element to classify by, so its sibling decides the join (D2209). A
+// `null` sibling decides nothing; the nullable-join rungs read the `[]` arm instead.
+function ifListArmValueIx(ifIx: i32) {
+  const tv = ifThenValueIx(ifIx)
+  if emptyArrLitIxOf(tv) < 0 { return tv }
+  const ev = ifElseValueIx(ifIx)
+  if ev < 0 || emptyArrLitIxOf(ev) >= 0 || exprIsNullLit(ev) { return tv }
+  ev
 }
 
 // The else arm's tail value of the if-expression at `ifIx`, or -1 when the else is absent or
@@ -12212,11 +12228,23 @@ function ifJoinAtomMeetsString(ifIx: i32, fnIx: i32) {
 // numeric join and for a value-union/concrete-variant join (handled upstream). The array
 // predicates run before the i32-list `exprArray`, which would also claim a wider list via its typed-IR fast path.
 export function ifExprRefKind(ifIx: i32, fnIx: i32): VKind | null {
-  const tv = ifThenValueIx(ifIx)
+  const tv = ifListArmValueIx(ifIx)
   if tv < 0 { return null }
   // A closure join (kind 14, `(ref $cloStruct)`) checked first: a bare lambda arm is a
   // function value, not a string/array/struct.
   if exprIsClosure(tv, fnIx) { return "closure" }
+  // An empty `[]` arm with no non-empty sibling to decide (an `else if` chain follows it): the
+  // join pinned its element, so its recorded type is the join's rep (D2209).
+  const hk = emptyArrHoleKind(tv)
+  if (
+    hk == "strlist" ||
+    hk == "f32list" ||
+    hk == "f64list" ||
+    hk == "i64list" ||
+    hk == "reflist"
+  ) {
+    return hk
+  }
   // The join's checked type is the arm-order-independent string signal: a `string`-typed
   // join (an atom + a string/member-literal arm, either order) is the string ref kind even
   // when the then arm alone doesn't classify stringy; the atom arm widens later.
@@ -12303,6 +12331,8 @@ export function ifExprRefSlot(ifIx: i32, fnIx: i32, kind: VKind) {
   }
   if kind == "reflist" {
     if pendingListKind == 5 { return pendingListSlot }
+    const hs = emptyArrHoleElemSlot(tv)
+    if hs >= 0 { return hs }
     return refListSlotOfExpr(tv, fnIx)
   }
   // A map join's slot is the map shape (mv slot / -1 mono / -2 set), the value every other
@@ -19966,6 +19996,24 @@ export function arrLitNominalElemName(arrIx: i32): string {
   ""
 }
 
+// The inner literal of a list-of-lists literal whose leaf keys the element: the first element,
+// unless that is an empty `[]` and a later element is a non-empty literal. The empty one has
+// no leaf to read, and the element join pinned it to its sibling's (D2209).
+function arrLitLeadInner(a: ArrayLit): i32 {
+  const e0 = a.arrElems[0]
+  if emptyArrLitIxOf(e0) < 0 { return e0 }
+  let k = 1
+  while k < a.arrElems.length {
+    const ek = a.arrElems[k]
+    if emptyArrLitIxOf(ek) < 0 {
+      if P.nodes[ek] is ArrayLit { return ek }
+      return e0
+    }
+    k = k + 1
+  }
+  e0
+}
+
 // The ref-element kind of the array literal at `arrIx` (assumes `arrLitIsRef`): 2 when the
 // first element is a union variant (boxes into the union), else 1 (a direct struct
 // element). Per-element-type: a `Tok[]` literal is kind 1 even in a program that also
@@ -19986,14 +20034,15 @@ export function arrLitElemKind(arrIx: i32) {
         // probes below all decline an object/nested-list inner, and the arm would fall to 4,
         // keying the i32-list wrapper over a backing holding a `(ref $rlWrap)` (D702). Must
         // agree arm for arm with `arrLitElemName`'s rung of the same shape.
-        if arrLitIsRef(a.arrElems[0]) {
+        const e0x = arrLitLeadInner(a)
+        if arrLitIsRef(e0x) || emptyArrLitIxOf(e0x) >= 0 {
           if arrLitNestedElemName(arrIx) != "" {
             return arrLitNestedElemKind(arrIx)
           }
         }
-        if arrLitIsStr(a.arrElems[0], -1) { return 6 }
-        if arrLitIsF64(a.arrElems[0], -1) { return 7 }
-        if arrLitIsI64(a.arrElems[0], -1) { return 8 }
+        if arrLitIsStr(e0x, -1) { return 6 }
+        if arrLitIsF64(e0x, -1) { return 7 }
+        if arrLitIsI64(e0x, -1) { return 8 }
         return 4
       }
       if e0 is ObjLit {
@@ -20222,17 +20271,22 @@ export function arrLitElemName(arrIx: i32) {
         if emptyArrLitIxOf(a.arrElems[0]) >= 0 {
           if cen != "" { return cen }
         }
+        const e0x = arrLitLeadInner(a)
+        if emptyArrLitIxOf(e0x) >= 0 {
+          const hen = arrLitNestedElemName(arrIx)
+          if hen != "" { return hen }
+        }
         // A ref inner literal's element is the inner ref list, whose name the leaf probes
         // below cannot render — they answer one level short, keying a different row than
         // the element actually builds (D702). The arena renders it instead, the same string
         // the annotated spelling interns. Must agree arm for arm with `arrLitElemKind`'s kind-9 rung.
-        if arrLitIsRef(a.arrElems[0]) {
+        if arrLitIsRef(e0x) {
           const rin = arrLitNestedElemName(arrIx)
           if rin != "" { return rin }
         }
-        if arrLitIsStr(a.arrElems[0], -1) { return "string[]" }
-        if arrLitIsF64(a.arrElems[0], -1) { return "f64[]" }
-        if arrLitIsI64(a.arrElems[0], -1) { return "i64[]" }
+        if arrLitIsStr(e0x, -1) { return "string[]" }
+        if arrLitIsF64(e0x, -1) { return "f64[]" }
+        if arrLitIsI64(e0x, -1) { return "i64[]" }
         return "i32[]"
       }
       if e0 is ObjLit {
@@ -30809,6 +30863,8 @@ export function exprRefArray(exprIx: i32, fnIx: i32) {
   const e = P.nodes[exprIx]
   if e is ArrayLit { return arrLitIsRef(exprIx) }
   if e is Paren { return exprRefArray(e.parInner, fnIx) }
+  // An if-expression is the list its join blocktype is (D2210).
+  if e is IfStmt { return ifExprRefKind(exprIx, fnIx) == "reflist" }
   // `m[k]` / `m[k] ?? d` over a struct-LIST-valued map yields a struct ref list.
   if mapReadListKind(exprIx, fnIx) == "reflist" { return true }
   if e is Call {
@@ -31005,6 +31061,13 @@ export function refListElemNameOfExpr(exprIx: i32, fnIx: i32) {
   const e = P.nodes[exprIx]
   if e is ArrayLit { return arrLitElemName(exprIx) }
   if e is Paren { return refListElemNameOfExpr(e.parInner, fnIx) }
+  // An if-expression's element is its join's row, the one its blocktype names (D2210).
+  if e is IfStmt {
+    if ifExprRefKind(exprIx, fnIx) != "reflist" { return "" }
+    const ifs = ifExprRefSlot(exprIx, fnIx, "reflist")
+    if ifs < 0 || ifs >= rlElemName.length { return "" }
+    return rlElemName[ifs]
+  }
   // `m[k]` / `m[k] ?? d` over a struct-LIST-valued map — the element is the value's struct.
   const slsMv = mapReadStructListMvSlot(exprIx, fnIx)
   if slsMv >= 0 { return refArrElemName(mvValName[slsMv]) }
@@ -31491,7 +31554,7 @@ function tyPrimLeafElem(ty: i32) { tyPrimLeafElemName(ty) != null }
 // same 0/1/2/3/4/5/6/7/10 alphabet `tyAnnRefListKind` produces from an ANNOTATION node and
 // `seedFieldListBuild` from a FIELD code. `0` (the i32-list default) for every kind that is
 // not a distinct-backing list, which is also the correct seed for the i32-backed ones.
-function listBuildKindOfVKind(kind: VKind | null, slot: i32) {
+export function listBuildKindOfVKind(kind: VKind | null, slot: i32) {
   if kind == "strlist" { return 3 }
   if kind == "f64list" { return 4 }
   if kind == "i64list" { return 6 }
@@ -31510,6 +31573,32 @@ function listBuildKindOfVKind(kind: VKind | null, slot: i32) {
 // The `pendingListKind` / `pendingListSlot` pair an empty `[]` hole demands of `emitArr`.
 export function emptyArrHoleBuildKind(exprIx: i32) {
   listBuildKindOfVKind(emptyArrHoleKind(exprIx), emptyArrHoleElemSlot(exprIx))
+}
+
+// An empty `[]` delivered to a union is recorded as the union's first list member
+// (`recordRepTyAdopt`), which is the arm it is built and tagged as: that arm's ref-list row, or
+// -1 for a non-ref element or a literal that is not an empty `[]` (D2202).
+export function emptyArrUnionArmSlot(exprIx: i32) {
+  const ax = emptyArrLitIxOf(exprIx)
+  if ax < 0 { return -1 }
+  const s = rlSlotOfTy(tyRefArrElemOf(nodeRepTyIxOf(ax)))
+  if s < 0 || s >= rlElemKindTbl.length { return -1 }
+  s
+}
+
+// The list `VKind` of that adopted arm, or `null` when the literal adopted none.
+export function emptyArrUnionArmKind(exprIx: i32): VKind | null {
+  const ax = emptyArrLitIxOf(exprIx)
+  if ax < 0 { return null }
+  tyListRepKind(nodeRepTyIxOf(ax), emptyArrUnionArmSlot(exprIx))
+}
+
+// The `pendingListKind` that builds the adopted arm's backing.
+export function emptyArrUnionArmBuildKind(exprIx: i32) {
+  listBuildKindOfVKind(
+    emptyArrUnionArmKind(exprIx),
+    emptyArrUnionArmSlot(exprIx),
+  )
 }
 
 export function emptyArrHoleBuildSlot(exprIx: i32) {
@@ -32471,8 +32560,12 @@ export function exprStringArray(exprIx: i32, fnIx: i32) {
   // `m[k]` / `m[k] ?? d` over a string[]-VALUED map yields a string list.
   if mapReadListKind(exprIx, fnIx) == "strlist" { return true }
   const e = P.nodes[exprIx]
-  if e is ArrayLit { return arrLitIsStr(exprIx, fnIx) }
+  if e is ArrayLit {
+    if emptyArrHoleKind(exprIx) == "strlist" { return true }
+    return arrLitIsStr(exprIx, fnIx)
+  }
   if e is Paren { return exprStringArray(e.parInner, fnIx) }
+  if e is IfStmt { return ifExprRefKind(exprIx, fnIx) == "strlist" }
   if e is Call {
     // `__array_new__(n, "s")` builds a string list (intrinsic kind 2).
     if arrNewIntrKind(exprIx, fnIx) == 2 { return true }
@@ -32514,6 +32607,14 @@ export function exprStringArray(exprIx: i32, fnIx: i32) {
     // A VALUE-union ident narrowed to a string-backed LIST arm (`is string[]`, `is
     // (string | null)[]` — value-atom kind 9) reads UNBOXED as the string list.
     if unionIdentReadKind(exprIx, fnIx) == 9 { return true }
+    // A `(string | null)[]` binding the checker pinned as a list, whose own declaration no
+    // storage rung below names: an un-annotated alias of a narrowed read (D2211).
+    const snPin = nodeTyPinIxOf(exprIx)
+    if snPin >= 0 {
+      if T.tys[snPin] is TyArray {
+        if nodeArrayElemIsNulStr(exprIx) { return true }
+      }
+    }
     if paramStringArray(fnIx, e.identName) { return true }
     if declaredStringArray(e.identName) { return true }
     if globalIsStringArraySid(fnIx, sidOfNode(exprIx)) {
@@ -32899,7 +33000,10 @@ export function exprF64Array(exprIx: i32, fnIx: i32) {
   // `m[k]` / `m[k] ?? d` over an f64[]-VALUED map yields an f64 list.
   if mapReadListKind(exprIx, fnIx) == "f64list" { return true }
   const e = P.nodes[exprIx]
-  if e is ArrayLit { return arrLitIsF64(exprIx, fnIx) }
+  if e is ArrayLit {
+    if emptyArrHoleKind(exprIx) == "f64list" { return true }
+    return arrLitIsF64(exprIx, fnIx)
+  }
   if e is Paren { return exprF64Array(e.parInner, fnIx) }
   if e is Ident {
     // A VALUE-union ident narrowed to the `f64[]` LIST arm (value-atom kind 8) reads
@@ -33146,7 +33250,10 @@ export function exprF32Array(exprIx: i32, fnIx: i32) {
   const e = P.nodes[exprIx]
   // An f32-element literal, the arm the f64/i64 siblings carry and this lacked — without it,
   // an inferred `[fv]` built an i32 backing over f32 elements (invalid wasm).
-  if e is ArrayLit { return arrLitIsF32(exprIx, fnIx) }
+  if e is ArrayLit {
+    if emptyArrHoleKind(exprIx) == "f32list" { return true }
+    return arrLitIsF32(exprIx, fnIx)
+  }
   if e is Paren { return exprF32Array(e.parInner, fnIx) }
   if e is Ident {
     // A value-union ident narrowed to the `f32[]` list arm reads unboxed — the checker's
@@ -33288,7 +33395,10 @@ export function exprI64Array(exprIx: i32, fnIx: i32) {
   // `m[k]` / `m[k] ?? d` over an i64[]-VALUED map yields an i64 list.
   if mapReadListKind(exprIx, fnIx) == "i64list" { return true }
   const e = P.nodes[exprIx]
-  if e is ArrayLit { return arrLitIsI64(exprIx, fnIx) }
+  if e is ArrayLit {
+    if emptyArrHoleKind(exprIx) == "i64list" { return true }
+    return arrLitIsI64(exprIx, fnIx)
+  }
   if e is Paren { return exprI64Array(e.parInner, fnIx) }
   if e is Ident {
     if paramI64Array(fnIx, e.identName) { return true }
