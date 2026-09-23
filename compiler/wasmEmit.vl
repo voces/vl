@@ -152,7 +152,6 @@ import {
 import {
   numLexFitsI32,
   numLexIs2Pow31,
-  numLexIsDecimal,
   numLexIsFloat,
   parseI32,
   parseI64Pair,
@@ -199,6 +198,7 @@ import {
 import {
   blockHasContinueFor,
   exprIsIfStmt,
+  globalCellIsImmutable,
   ifArmValueExpr,
   letIsF32,
   paramNulString,
@@ -493,6 +493,7 @@ import {
   rpVar,
   wDropBack,
   wLen,
+  wNegateConstFrom,
   wPeekBack,
   wSLEB,
   wTarget,
@@ -13367,15 +13368,30 @@ function emitExprWideCleared(body: u8[], ix: i32, fnIx: i32) {
   r
 }
 
+// Whether the node at `ix` is an integer literal, or `-` applied to one (parens peeled).
+function numLitOrNegated(ix: i32): boolean {
+  const n = P.nodes[ix]
+  if n is Unary {
+    if n.unOp != "-" { return false }
+    return numLitOrNegatedLeaf(unwrapParen(n.unArg))
+  }
+  numLitOrNegatedLeaf(ix)
+}
+function numLitOrNegatedLeaf(ix: i32): boolean {
+  const n = P.nodes[ix]
+  if n is NumLit { return !numLexIsFloat(n.numText) }
+  false
+}
+
 // Emit the expression at `exprIx` as an i64 value: a bare integer literal lowers directly
 // as `i64.const` (`pendingI64` set), an expression that already yields i64 emits as-is, and
 // any other i32 source is emitted then sign-extended (`i64.extend_i32_s`). The literal peel
 // runs first so the other two arms can own their own width via `emitExprWideCleared`.
 export function emitExprAsI64(body: u8[], exprIx: i32, fnIx: i32) {
-  // Peel parens to find a bare literal we can emit directly as i64.const.
+  // Peel parens to find a bare literal, or a negated one, we can emit directly as i64.const:
+  // a hex literal past I32_MAX is an i32 bit pattern, so widening it after would change it.
   const inner = unwrapParen(exprIx)
-  const innerNode = P.nodes[inner]
-  if innerNode is NumLit {
+  if numLitOrNegated(inner) {
     const saved = pendingI64
     pendingI64 = true
     const r = emitExpr(body, inner, fnIx)
@@ -13407,28 +13423,17 @@ export function emitExprAsF64(body: u8[], exprIx: i32, fnIx: i32) {
     return 0
   }
   if exprIsF64(f64Cls, fnIx) { return emitExpr(body, exprIx, fnIx) }
-  // A bare int literal (optionally negated) re-encodes directly as `f64.const` — exact,
-  // and it keeps a const-global init a valid constexpr (a convert op is not constant).
-  // Checked before the i64 branch so a big literal stays one `f64.const` too, mirroring
-  // the `pendingF64` NumLit lowering and `emitExprAsF32`'s literal path.
+  // A bare int literal of any radix (optionally negated) re-encodes directly as `f64.const`
+  // under `pendingF64`, the rule a const-global init uses — exact, where converting the i32
+  // bit pattern of `0xFFFFFFFF` would give -1. Checked before the i64 branch so a big
+  // literal stays one `f64.const` too.
   const f64Inner = unwrapParen(exprIx)
-  const f64Node = P.nodes[f64Inner]
-  if f64Node is NumLit {
-    if numLexIsDecimal(f64Node.numText) {
-      fbF64Const(f64Node.numText)
-      return 0
-    }
-  }
-  if f64Node is Unary {
-    if f64Node.unOp == "-" {
-      const negInner = P.nodes[unwrapParen(f64Node.unArg)]
-      if negInner is NumLit {
-        if numLexIsDecimal(negInner.numText) {
-          fbF64Const("-" + negInner.numText)
-          return 0
-        }
-      }
-    }
+  if numLitOrNegated(f64Inner) {
+    const savedF64 = pendingF64
+    pendingF64 = true
+    const r = emitExpr(body, f64Inner, fnIx)
+    pendingF64 = savedF64
+    return r
   }
   // An i64 source converts (signed) to f64.
   if exprIsI64(f64Cls, fnIx) {
@@ -20943,6 +20948,10 @@ export function emitUserGlobalSet(gi: i32) {
     fbLocalSet(gPromoSlot[gi])
     return 0
   }
+  // An immutable cell is written only by its constexpr; a store here would be invalid wasm.
+  if globalCellIsImmutable(gi) {
+    return emitFail("emitProgram: a store to an immutable module const")
+  }
   fbGlobalSet(userGlobalIdx(gi))
   0
 }
@@ -21930,39 +21939,62 @@ function emitUnaryNode(body: u8[], e: Unary, _exprIx: i32, fnIx: i32) {
   if e.unOp != "-" {
     return emitFail("emitProgram: unsupported unary operator")
   }
+  // A negated numeric literal folds to one constant (`wNegateConstFrom`), which keeps a
+  // module const initialized with it a constant expression. The operator below is
+  // the fallback, and it computes the same value.
+  const negInner = unwrapParen(e.unArg)
+  const negNode = P.nodes[negInner]
+  const negLit = negNode is NumLit
+  const negMark = wLen()
   // f32 negation uses the dedicated `f32.neg` (0x8c) — flips the sign bit. Checked
   // before f64 (an f32 expr is never `exprIsF64`, but this keeps the float cases
   // grouped and explicit). (Slice 5.)
   if exprIsF32(e.unArg, fnIx) {
     if emitExpr(body, e.unArg, fnIx) < 0 { return -1 }
+    if negLit && wNegateConstFrom(negMark) { return 0 }
     wU8(140) // 0x8c f32.neg
     return 0
   }
   // f64 negation uses the dedicated `f64.neg` (0x9a) — flips the sign bit (Slice 3).
   if exprIsF64(e.unArg, fnIx) {
     if emitExpr(body, e.unArg, fnIx) < 0 { return -1 }
+    if negLit && wNegateConstFrom(negMark) { return 0 }
     wU8(154) // 0x9a f64.neg
     return 0
   }
   // a negated magnitude-2^31 integer literal (`-2147483648`) is i32, but the bare
   // operand lexeme is one past I32_MAX, so the `exprIsI64` branch below would
-  // otherwise lower it as an i64 negation. `parseI32` folds it to I32_MIN directly instead.
-  const negInner = unwrapParen(e.unArg)
-  const negNode = P.nodes[negInner]
-  if negNode is NumLit {
+  // otherwise lower it as an i64 negation. `parseI32` reads it as I32_MIN, its own negation.
+  // A wider const cell's init seeds its own literal rep, so the fold below serves it.
+  const negWide = pendingI64 || pendingF64 || pendingF32
+  if negNode is NumLit && !negWide {
     if !numLexIsFloat(negNode.numText) {
       if numLexIs2Pow31(negNode.numText) {
-        fbI32Const(0)
         fbI32Const(parseI32(negNode.numText))
-        fbI32Bin(107) // 0x6b i32.sub
         return 0
       }
     }
   }
+  // A literal operand multiplies by -1 when it does not fold, since the zero `0 - x` needs
+  // would already have to be on the stack; the two agree under wrapping.
   if exprIsI64(e.unArg, fnIx) {
+    if negLit {
+      if emitExpr(body, e.unArg, fnIx) < 0 { return -1 }
+      if wNegateConstFrom(negMark) { return 0 }
+      fbI64Const(-1, -1)
+      fbI32Bin(126) // 0x7e i64.mul
+      return 0
+    }
     fbI64Const(0, 0) // i64 0
     if emitExpr(body, e.unArg, fnIx) < 0 { return -1 }
     fbI32Bin(125)    // 0x7d i64.sub
+    return 0
+  }
+  if negLit {
+    if emitExpr(body, e.unArg, fnIx) < 0 { return -1 }
+    if wNegateConstFrom(negMark) { return 0 }
+    fbI32Const(-1)
+    fbI32Bin(108) // 0x6c i32.mul
     return 0
   }
   fbI32Const(0)

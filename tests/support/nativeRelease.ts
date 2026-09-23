@@ -475,8 +475,13 @@ export const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3:
     // grow-check + `array.copy` + one header. bytes 1600 -> 1650 at `-O` and 1513 -> 1546
     // at `-O3`, with `fns`/`allocs`/`refEq` unchanged — per-instruction weight, and the
     // trade is that the key-building loop stops being O(n^2).
-    O: { bytes: 1650, fns: 3, allocs: 16, indirect: 0, refEq: 1 },
-    O3: { bytes: 1546, fns: 3, allocs: 16, indirect: 0, refEq: 1 },
+    //
+    // 2026-09-23, immutable module consts: `const ALPHA` is now an immutable global, so `-O3`
+    // reads its header's fields as constants and drops the header allocation, keeping only
+    // the backing array: allocs 16 -> 15, bytes 1546 -> 1532. `-O` keeps the header
+    // (bytes 1650 -> 1657).
+    O: { bytes: 1657, fns: 3, allocs: 16, indirect: 0, refEq: 1 },
+    O3: { bytes: 1532, fns: 3, allocs: 15, indirect: 0, refEq: 1 },
   },
   // STRING HASHING + MAP PROBE. 30M lookups over string keys built as distinct objects, so the
   // probe path is a real hash plus a real content compare rather than a pointer check. This is
