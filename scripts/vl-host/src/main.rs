@@ -515,7 +515,8 @@ program verbatim — the only way to pass one that starts with `-`.
   {c}-O3{r}                 The release profile (closed-world + -O3; melts union
                       boxes). Wins over -O when both are given. Both rungs
                       require binaryen's wasm-opt and fail loudly without it
-  {c}--names{r}             Embed the wasm \"name\" section (legible trap backtraces)
+  {c}--names{r}             Embed the wasm \"name\" section (legible trap backtraces);
+                      kept through -O/-O3, at the cost of the section's bytes
   {c}--import-memory{r}     Import the linear memory as `env.memory` instead of
                       defining and exporting it, so separately built units can
                       share one. No effect on a module that touches no linear
@@ -5271,6 +5272,18 @@ const ESCAPE_INLINE_PASSES: &[&str] = &[
     "--inlining",
 ];
 
+/// A rung's `wasm-opt` passes, led by `-g` when the build asked for `--names`: binaryen drops
+/// the name section unless told to keep it, and keeps each surviving function's name through
+/// inlining when it is. Without `--names` the passes are the rung's own, so the output is too.
+fn rung_passes<'a>(passes: &[&'a str], names: bool) -> Vec<&'a str> {
+    let mut out = Vec::with_capacity(passes.len() + 1);
+    if names {
+        out.push("-g");
+    }
+    out.extend_from_slice(passes);
+    out
+}
+
 /// The callees `-O`/`-O3` inline first so a caller's struct allocation can stay off the GC
 /// heap, as function indices, or `None` when there is no such callee (and so no step).
 ///
@@ -5426,6 +5439,32 @@ fn put_leb_u32(out: &mut Vec<u8>, mut v: u32) {
         }
         out.push(byte | 0x80);
     }
+}
+
+/// `bytes` without its custom section `name`, or `None` when it has none (or its section
+/// framing does not parse), so a caller rewrites a module only when something was removed.
+fn without_custom_section(bytes: &[u8], name: &str) -> Option<Vec<u8>> {
+    if bytes.len() < 8 || &bytes[0..4] != b"\0asm" {
+        return None;
+    }
+    let mut out = bytes[..8].to_vec();
+    let mut removed = false;
+    let mut i = 8usize;
+    while i < bytes.len() {
+        let start = i;
+        let id = bytes[i];
+        i += 1;
+        let size = uleb(bytes, &mut i)? as usize;
+        let end = i.checked_add(size).filter(|&e| e <= bytes.len())?;
+        let mut p = i;
+        if id == 0 && wasm_name(bytes, &mut p).as_deref() == Some(name) {
+            removed = true;
+        } else {
+            out.extend_from_slice(&bytes[start..end]);
+        }
+        i = end;
+    }
+    removed.then_some(out)
 }
 
 fn put_name(out: &mut Vec<u8>, s: &str) {
@@ -7624,12 +7663,20 @@ fn build_cmd(args: &[String]) -> Result<()> {
     };
     let mut final_bytes: Option<Vec<u8>> = None;
     if let Some((flag, passes)) = opt_rung {
+        // A `--names` build's `vl-src` rows are offsets into the EMITTER's bytes, and binaryen
+        // rewrites every body; kept through `-g` they would name the wrong source line for a
+        // trap, so they go before any `wasm-opt` run. A module without them is untouched.
+        if let Some(stripped) = without_custom_section(&bytes, "vl-src") {
+            bytes = stripped;
+            std::fs::write(&sink, &bytes)?;
+        }
         // The escape step goes first, so the rung's own passes (`--heap2local` among them)
         // see each per-call struct and its uses in one function. It renumbers functions, so
         // the run-once marks are read off its output, not off `bytes`.
         let stepped = escape_inline_step(&sink_str, flag, &bytes)?;
         let rung_input: &[u8] = stepped.as_deref().unwrap_or(&bytes);
-        optimize_in_place(&sink_str, flag, passes, &run_once_hot_callees(rung_input))?;
+        let passes = rung_passes(passes, names);
+        optimize_in_place(&sink_str, flag, &passes, &run_once_hot_callees(rung_input))?;
         final_bytes = Some(std::fs::read(&sink).map_err(|e| {
             Error::from(e).context(format!("reading back the {flag}'d `{out_label}`"))
         })?);
