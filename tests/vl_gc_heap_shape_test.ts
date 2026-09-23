@@ -24,6 +24,11 @@
 // probe until a control you KNOW should trigger it does") and 7x under the
 // regressed count, so ordinary run-to-run variance cannot cross it either way.
 //
+// `VL_GC: "auto"` is pinned in the spawn env (nativeEnv's idiom, alongside VL_STD /
+// VL_COMPILER_WASM) rather than left to the ambient environment: `none` or `refcount`
+// never run the copying collector at all, which reads as "0 collections" — the same
+// shape as the counter being dead — and would misdirect a real regression's own message.
+//
 // GATING: requires the vl binary + seed wasm; absent either, the test registers
 // ignored with a one-line how-to-build note.
 //
@@ -83,7 +88,7 @@ Deno.test({
         args: ["run", srcPath, "--compiler", COMPILER],
         stdout: "piped",
         stderr: "piped",
-        env: nativeEnv({ VL_GC_STATS: "1" }),
+        env: nativeEnv({ VL_GC: "auto", VL_GC_STATS: "1" }),
       }).output();
       const out = new TextDecoder().decode(stdout);
       const err = new TextDecoder().decode(stderr);
