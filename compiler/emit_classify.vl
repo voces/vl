@@ -14584,11 +14584,14 @@ export function forInElemKind(iterIx: i32, fnIx: i32): VKind | null {
       if rlElemIsNulNiche(rslot) { return "nulu8list" }
       return "u8list" // u8-inner list -> a packed-byte-list local
     }
-    // A closure-element ref list (`((i32) => i32)[]`, element kind 5): the loop var binds
-    // as a kind-14 closure local — `for f in fs { … f(x) … }` calls each via `call_ref`.
-    // The element read recovers the closure ref non-null (like a struct); the `#l` temp is
-    // the ref-list wrapper (code 5).
-    if rlElemKindTbl[rslot] == 5 { return "closure" }
+    // A closure-element ref list (`((i32) => i32)[]`, element kind 5): the loop var binds a
+    // kind-14 closure recovered non-null, the `#l` temp the ref-list wrapper (code 5). A
+    // `(F | null)[]` element binds the nullable niche instead, since recovering it would trap
+    // on the null the body means to test.
+    if rlElemKindTbl[rslot] == 5 {
+      if rlElemIsNulNiche(rslot) { return "nulclosure" }
+      return "closure"
+    }
     // A nested ref array (`S[][]`/`(C|D)[][]`/`S[][][]`, element kind 9): the loop var
     // binds the inner ref list — a kind-5 ref-list local carrying the inner slot,
     // recursing (the inner slot may itself be kind 9). A `(S[] | null)[]` element is the
@@ -34866,6 +34869,10 @@ function calleeCloSigKeyAt(sid: i32, fnIx: i32, atIx: i32) {
     const nk = annSigKey(nc)
     if nk != "" { return nk }
   }
+  // A `for f in fs` loop variable has no declaration node, so no rung below can name it;
+  // it IS the iterable's element and calls through the element's key (D2110).
+  const lk = loopVarCloSigKey(name, fnIx)
+  if lk != "" { return lk }
   const pk = paramCloSigKey(fnIx, name)
   if pk != "" { return pk }
   // The binding's twin of that answer (D1090), ahead of the annotation arms: a `??` merge
@@ -34935,7 +34942,17 @@ function calleeCloSigKeyAt(sid: i32, fnIx: i32, atIx: i32) {
   // captured void closure resolves its `>v` sig and its call stays a statement (D1634).
   const cowner = capturedBindingFrameOf(fnIx, name)
   if cowner >= 0 && cowner != fnIx {
-    return calleeCloSigKeyAt(sid, cowner, atIx)
+    const ok = calleeCloSigKeyAt(sid, cowner, atIx)
+    if ok != "" { return ok }
+  }
+  // Positioned, the callee node's own checker type answers last: it is the key
+  // `cloCallSigKey`'s general fallback lowers the call with, so the void answer and the
+  // emitted `call_ref` cannot disagree about whether a value is left (D2110).
+  if atIx >= 0 {
+    const aty = nodeTyIxOf(atIx)
+    if aty >= 0 {
+      if T.tys[aty] is TyFunc { return sigKeyOfTy(aty) }
+    }
   }
   ""
 }
@@ -34954,6 +34971,45 @@ function calleeReturnsF64Sid(sid: i32, fnIx: i32) {
 // ambiguous name and the empty key reads as "returns a value" (D1862).
 export function calleeReturnsVoidAt(sid: i32, fnIx: i32, atIx: i32) {
   sigKeyRetIsVoid(calleeCloSigKeyAt(sid, fnIx, atIx))
+}
+
+// Whether the lifted frame `fnIx` captures `name`: a free variable of its body, not one of
+// its own params, locals or globals.
+function frameCapturesName(fnIx: i32, name: string): boolean {
+  const fe = fnStmtsPosOf(fnIx)
+  if fe < 0 { return false }
+  const caps = captureNamesOf(fe)
+  let i = 0
+  while i < caps.length {
+    if caps[i] == name { return true }
+    i = i + 1
+  }
+  false
+}
+
+// The `$fnsig` key a for-in loop variable `name` calls through, or "" when `name` is no
+// closure-element loop variable of frame `fnIx`, keyed as `fs[i]` is so the two agree. The
+// scoped slot answers a loop the frame owns, so a closed loop's name means the outer binding
+// again; a captured loop variable has no slot and asks the frame that owns it.
+function loopVarCloSigKey(name: string, fnIx: i32) {
+  let iter = -1
+  const slot = scopeSlotOf(name)
+  if slot >= 0 {
+    if slot >= localLoopIter.length { return "" }
+    iter = localLoopIter[slot]
+  } else if frameCapturesName(fnIx, name) {
+    iter = captureLoopVarIterOf(fnStmtsPosOf(fnIx), name)
+  }
+  if iter < 0 { return "" }
+  const mvs = forInMapValsSlot(iter, fnIx)
+  if mvs >= 0 {
+    if mvs >= mvRlSlot.length { return "" }
+    return cloArrSlotSigKey(mvRlSlot[mvs])
+  }
+  if !exprRefArray(iter, fnIx) { return "" }
+  const ek = anonLeafArrElemSigKey(iter, fnIx)
+  if ek != "" { return ek }
+  cloArrSlotSigKey(refListSlotOfExpr(iter, fnIx))
 }
 
 function calleeReturnsVoidSid(sid: i32, fnIx: i32) {
