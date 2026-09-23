@@ -6900,7 +6900,7 @@ distinct from floats (option b).*
 
 **THE RULE.** A float literal in a type position (`2.0`, `1.5`, `1e3`) is refused by `vl check`
 in every position that takes a type: a parameter, a return, a union member, an alias, a generic
-argument, an array element, a map value, a field, an `is` test. The message states the rule and
+argument, an array element, a map value, a field, an `is` test, an `as`/`as?` target. The message states the rule and
 the fix:
 
     a float literal cannot be a type: float equality is not set membership (`-0.0 == 0.0`, NaN
@@ -6935,4 +6935,4 @@ half-resolved union. `LitKind` lost its `"flt"` member.
 refused: 100 corpus cells (all minted by the census's `f64lit` rep, `type F = 1.5 | 2.5`) and 29
 `tests/cases` fixtures; none in `compiler/`, `std/` or other scripts. Of the corpus cells, 35
 graded `runs`: 21 only DECLARED `F` in a shared prelude and keep running with the line removed,
-and 14 used it and are design refusals now. The census generators no longer mint the rep.
+and 14 used it and are design refusals now. `gencensus.py` keeps its `f64lit` level, because cell ids are sequential over the axes and dropping a level renumbers every block and orphans the committed named sets; those cells are now design refusals. `mkmatrix.py`, whose preludes only declared the alias, drops it.

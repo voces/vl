@@ -47,9 +47,6 @@ import sys
 
 # ─────────────────────────────────────────────────────────────── rep vocabulary
 # rep -> (field type, canonical field value, default field value, predicate template)
-# No `f64lit` rep: a float literal is not a type (owner ruling 2026-09-23, D2221 — float
-# equality is not set membership), so `type F = 1.5 | 2.5` is refused by design and a rep
-# built on it would only mint refusals.
 REPS = {
     "i32":     ("i32", "7", "0", "{X}.r == 7"),
     "i64":     ("i64", "7", "0", "{X}.r == 7"),
@@ -59,6 +56,10 @@ REPS = {
     "str":     ("string", '"seven"', '""', '{X}.r == "seven"'),
     "strlit":  ("K", '"p"', '"q"', '{X}.r == "p"'),
     "numlit":  ("N", "1", "2", "{X}.r == 1"),
+    # A float literal is not a type (owner ruling, D2221), so every `f64lit` cell is a design
+    # refusal. The level stays: cell ids are sequential over the axes, and dropping it would
+    # renumber every block and orphan the committed named sets.
+    "f64lit":  ("F", "1.5", "2.5", "{X}.r == 1.5"),
     "list":    ("i32[]", "[1, 2]", "[]", "{X}.r.length == 2"),
     "map":     ("{[string]: i32}", "mkI()", "Map()", "{X}.r.size == 1"),
     "obj":     ("Inner", "{ q: 7 }", "{ q: 0 }", "{X}.r.q == 7"),
@@ -77,6 +78,7 @@ SCALAR_REPS = ("scalar", "string")
 PRELUDE_FOR = {
     "strlit": ['type K = "p" | "q"'],
     "numlit": ["type N = 1 | 2"],
+    "f64lit": ["type F = 1.5 | 2.5"],
     "obj":    ["type Inner = { q: i32 }"],
     "arm":    ["type Cir2 = { c2: i32 }", "type Sq2 = { s2: i32 }",
                "type Shape2 = Cir2 | Sq2"],
