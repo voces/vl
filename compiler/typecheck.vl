@@ -64,8 +64,10 @@ import {
   WhileStmt,
   adoptNodeTok,
   arenaEpochBump,
+  callIsNever,
   callIsRestPacked,
   hasSpreadItem,
+  markCallNever,
   markCallRestPacked,
   mkArrayLit,
   mkBinary,
@@ -2350,6 +2352,9 @@ function nodeIsTotalAt(ix: i32, tail: boolean) {
   if n is RetStmt { return true }
   if n is BreakStmt { return true }
   if n is ContinueStmt { return true }
+  if n is Call {
+    if callIsNever(ix) { return true }
+  }
   if n is IfStmt {
     if n.ifElse < 0 {
       // An else-less `if`: a discriminating `is` / literal-equality chain may be exhaustive, so
@@ -5456,6 +5461,18 @@ function voidSlotExemptExpr(exprIx: i32) {
   const vn = P.nodes[vi]
   if vn is MatchExpr { return true }
   false
+}
+
+// A `never` value cannot be stored: the expression never returns, so a slot typed by it would
+// take a type no value has. Reports and answers true when `ty` is `never` (D1972).
+function neverValueSlotErr(ty: i32, slot: string, at: i32) {
+  if ty < 0 || ty != TY_NEVER { return false }
+  tErr(
+    slot +
+      " would hold a `never` value, and none exists: the expression never returns",
+    at,
+  )
+  true
 }
 
 // A `void` expression has no value, so a slot that demands one is a type error. This is the one
@@ -9275,7 +9292,8 @@ export function primTyOfName(name: string) {
 // is a second answer. A list and not a predicate, because the `did you mean` suggester has to
 // enumerate the names in scope rather than test one; a spelling missing here stops being reserved.
 const builtinTyNames = [
-  "i32", "i64", "f64", "f32", "boolean", "string", "void", "null", "u8", "v128",
+  "i32", "i64", "f64", "f32", "boolean", "string", "void", "null", "never",
+  "u8", "v128",
 ]
 
 // Read by the merge's type-position rename and by `tErrBuiltinTyDecl`'s two callers.
@@ -9645,6 +9663,11 @@ function unknownTyText(name: string) { unknownTyTextIn(name, "") }
 // 'U'`) placed before the suggestion, so `did you mean` always ends the sentence.
 function unknownTyTextIn(name: string, tail: string) {
   if unkTyClash.length > 0 { return unkTyClash + tail }
+  if name == "never" || unkTyPart == "never" {
+    return "`never`" +
+      tail +
+      " has no values, so it is legal only as a function's declared return type"
+  }
   const part = unkTyPart
   if part.length == 0 {
     return "unknown type '" + name + "'" + tail + tyDidYouMean(name)
@@ -11566,6 +11589,9 @@ function tyToNameGo(ix: i32, ctx: i32, nominal: boolean): string {
       // rather than the softened `string`, so an inferred closure value keys the litunion's
       // i32-atom token, byte-matching the constructed lambda's `$fnsig`.
       let rs = ""
+      // A `never` result lowers as `void`: the callee leaves nothing, and each call site
+      // follows it with `unreachable` (D1972).
+      if t.fnRet == TY_NEVER && t.fnRet >= 0 { rs = "void" }
       const rtn = T.tys[t.fnRet]
       if rtn is TyNullable {
         const nal = litUnionAliasNameOfTy(rtn.nInner)
@@ -23925,7 +23951,7 @@ function checkBuiltinIdentCall(n: Call, ix: i32, cfn: Ident): i32 {
         )
       }
     }
-    return TY_VOID
+    return TY_NEVER
   }
   // The numeric-opcode intrinsics: each lowers to exactly one wasm instruction, so
   // the checker only has to type them. A user binding of the same name shadows the
@@ -24433,6 +24459,18 @@ function resolveAnnotTs(
   r
 }
 
+// A function's declared return type. `never` resolves only here: it says the function cannot
+// return, which no other position can mean, so everywhere else it stays an unknown type (D1972).
+function resolveRetAnnotAt(
+  name: string,
+  typarams: string[],
+  at: i32,
+  owner: string,
+) {
+  if name == "never" { return TY_NEVER }
+  resolveAnnotAt(name, typarams, at, owner)
+}
+
 // `resolveAnnot` with resolution diagnostics anchored at node `at` (the
 // annotation's TypeRef) — see `annotDiagAt`.
 function resolveAnnotAt(
@@ -24482,6 +24520,9 @@ function noteInferredRet(t: i32) {
   }
   if tt is TyPrim {
     if tt.primName == "void" { return 0 }
+    // A call that never returns is not a return witness: an un-annotated function that only
+    // traps infers `void`, and `never` is a type a function must declare (D1972).
+    if tt.primName == "never" { return 0 }
   }
   // Joins every non-void return, not just the first: a function whose returns disagree
   // (`return 5` … `return null`) infers the flattened union/nullable of them, so the caller
@@ -26124,7 +26165,7 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
     if n.fnRet >= 0 {
       const rtn = P.nodes[n.fnRet]
       if rtn is TypeRef {
-        ret = resolveAnnotAt(rtn.tyName, n.fnTyParams, n.fnRet, n.fnName)
+        ret = resolveRetAnnotAt(rtn.tyName, n.fnTyParams, n.fnRet, n.fnName)
         // D1048's second hint: a declared return whose spelling collapsed marks the
         // DECLARATION, so an un-annotated `const r = f(…)` can inherit the provenance.
         // The pass-1 hoist below records the same fact for a top-level function; this
@@ -26293,7 +26334,8 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
           }
           if ret >= 0 {
             if !isStmtNode(stmts[s]) {
-              if !isVoidTy(ret) {
+              // A `never` body is graded whole below, not by its tail's value.
+              if !isVoidTy(ret) && ret != TY_NEVER {
                 if !assignableExpr(stmts[s], stTy, ret) {
                   tErr(
                     "expected " + tyToStr(ret) + ", got " + tyToStr(stTy),
@@ -26430,9 +26472,21 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
   // just its top node — a union that reaches `null` through a member needs this too. Suppressed in the pre-pass and on a void/error return.
   let retNullableNow = false
   if ret >= 0 { retNullableNow = tyBearsNull(ret) }
+  // A `never` function has no value to return: every path must end in a call that never
+  // returns, which is the shared exit rule over the whole body (D1972).
+  if !inferQuiet && ret == TY_NEVER && ret >= 0 && !stmtAlwaysExits(n.fnBody) {
+    let who = "this function"
+    if n.fnName != "" { who = "`" + n.fnName + "`" }
+    tErr(
+      who +
+        " is declared `never` but can return — end every path in a call that never returns, such as `__trap__()`",
+      n.fnBody,
+    )
+  }
   if (
     !inferQuiet &&
     !isVoidTy(ret) &&
+    ret != TY_NEVER &&
     ret != TY_ERR &&
     !bodyTotalForRet &&
     !retNullableNow
@@ -27046,7 +27100,12 @@ function checkProgramNode(n: Program) {
       if s.fnRet >= 0 {
         const hrtn = P.nodes[s.fnRet]
         if hrtn is TypeRef {
-          const r = resolveAnnotAt(hrtn.tyName, s.fnTyParams, s.fnRet, s.fnName)
+          const r = resolveRetAnnotAt(
+            hrtn.tyName,
+            s.fnTyParams,
+            s.fnRet,
+            s.fnName,
+          )
           // D1048's second hint, recorded order-independently: this hoist is the only pass
           // that resolves every top-level return before any body runs, so a `const r = f(…)`
           // written above `function f(): R` still inherits the provenance.
@@ -27424,6 +27483,10 @@ function checkNode(ix: i32) {
   }
   const t = checkNodeReal(ix)
   retTailPos = savedTail
+  // A call typed `never` ends its path; marked on every pass, since narrowing asks during inference too.
+  if t == TY_NEVER && t >= 0 {
+    if P.nodes[ix] is Call { markCallNever(ix) }
+  }
   if !inferQuiet {
     if ix >= 0 {
       if ix < nodeTyIx.length { nodeTyIx[ix] = t }
@@ -34214,6 +34277,17 @@ function checkLetDeclNode(n: LetDecl, ix: i32) {
       initTy = TY_ERR
     }
   }
+  // A `never` initializer leaves nothing to bind, and an un-annotated binding would take a type
+  // no value has; a declared type gives the dead binding a real one (D1972).
+  if n.letInit >= 0 && annot < 0 && initTy == TY_NEVER && initTy >= 0 {
+    tErr(
+      "`" +
+        n.letName +
+        "` would hold a `never` value, and none exists: its initializer never returns — call it as a statement, or declare the binding's type",
+      ix,
+    )
+    initTy = TY_ERR
+  }
   // Redundant explicit annotation: skipped when checking the initializer consumed a contextual
   // seed the annotation supplied (an un-annotated lambda param) — comparing then would be circular (D1442).
   if annot >= 0 && initTy >= 0 && n.letInit >= 0 && cbSeedUsed == seedMark {
@@ -35189,13 +35263,9 @@ function checkIfStmtNode(n: IfStmt, ix: i32) {
   const enNames: string[] = []
   const enTys: i32[] = []
   collectElseNarrows(n.ifCond, enNames, enTys)
-  // The guard-clause divergence test, hoisted: the post-guard leg and the `else if` hand-up
-  // decision both ask it, and the emitter's `pushPostGuardNarrow` asks the same predicate.
-  const thenExits = stmtAlwaysExits(n.ifThen)
   // Definite-assignment fork/join: each branch forks off the if-entry state and they join
   // after — assigned only if assigned on every surviving path; a diverging branch contributes nothing.
   const daFork = daMark()
-  const daThenDiverges = thenExits
   // `is`-guard alternatives over a hole: a then-narrow refining a hole is an alternative the
   // body handles on its own branch, not an extra field demand — registered before the scope pushes.
   const altRows: i32[] = []
@@ -35237,6 +35307,11 @@ function checkIfStmtNode(n: IfStmt, ix: i32) {
   const thenLo = narClobKeys.length
   checkNode(n.ifThen)
   const thenHi = narClobKeys.length
+  // The guard-clause divergence test, asked once the arm is checked so a `never` call in it is
+  // marked (D1972): the post-guard leg, the `else if` hand-up and the emitter's
+  // `pushPostGuardNarrow` all ask the same predicate.
+  const thenExits = stmtAlwaysExits(n.ifThen)
+  const daThenDiverges = thenExits
   if guardedRet { guardAltStack.pop() }
   retTailPos = false
   const thenTy = blockTailTy
@@ -35277,7 +35352,6 @@ function checkIfStmtNode(n: IfStmt, ix: i32) {
   let elseHi = 0
   const daHasElse = n.ifElse >= 0
   if daHasElse {
-    daElseDiverges = stmtAlwaysExits(n.ifElse)
     if enNames.length > 0 {
       pushScope(-1)
       applyNarrows(enNames, enTys)
@@ -35293,6 +35367,7 @@ function checkIfStmtNode(n: IfStmt, ix: i32) {
     elseLo = narClobKeys.length
     const elseRes = checkNode(n.ifElse)
     elseHi = narClobKeys.length
+    daElseDiverges = stmtAlwaysExits(n.ifElse)
     pgUpArmIx = -1
     retTailPos = false
     elseTy = blockTailTy
@@ -36123,6 +36198,7 @@ function checkArrayLitNode(n: ArrayLit, _ix: i32) {
     elemTy = joinTys(elemTy, et)
     ei = ei + 1
   }
+  if neverValueSlotErr(elemTy, "a list element", elems[0]) { elemTy = TY_ERR }
   return mkArrayTy(elemTy)
 }
 
@@ -36311,6 +36387,7 @@ function checkObjLitNode(n: ObjLit, _ix: i32) {
       if voidValueSlotErr(fty, fnode.fiValue, fslot, fnode.fiValue) {
         fty = TY_ERR
       }
+      if neverValueSlotErr(fty, fslot, fnode.fiValue) { fty = TY_ERR }
       ftys.push(fty)
     }
     i = i + 1
@@ -37309,6 +37386,16 @@ function bareRetVoidNote(want: i32): string {
 // Extracted from `checkNodeReal`'s `RetStmt` arm (C3: thin the dispatcher).
 function checkRetStmtNode(n: RetStmt, ix: i32) {
   const want = T.curRet
+  // Only a call that itself never returns may stand in a `never` function's `return` (D1972).
+  if want == TY_NEVER && want >= 0 {
+    if n.retArg < 0 || checkNode(n.retArg) != TY_NEVER {
+      tErr(
+        "a function declared `never` cannot return — end the path in a call that never returns, such as `__trap__()`",
+        ix,
+      )
+    }
+    return TY_VOID
+  }
   if n.retArg < 0 {
     // `tyIsHole` because `assignable` waves a `TyVar` past any destination, so a declared
     // `: T` accepted the bare return here and the emitter refused the instance (D1600).

@@ -64,7 +64,8 @@ unknown, so the join declines rather than handing the fact back.
   N-case union peels one variant per `if`; nested narrowings compose on the *current* view, not the
   declared type.
 - **Post-guard (guard clauses):** `if x == null { return }` → `x` non-null for the rest of the block
-  (any divergent then-branch — return/break/continue, via `divergesStatement`). Post-guard
+  (any divergent then-branch — `return`/`break`/`continue` or a call that never returns, via
+  `stmtAlwaysExits`; see [Calls that never return](#calls-that-never-return)). Post-guard
   subtractions **accumulate**, both across a sequence of separate `if`s and down an `else if`
   chain, so `if u is A { return } else if u is B { return }` leaves the tail a bare `U − A − B`.
   The accumulation stops at the first arm that does *not* diverge — control can leave the chain
@@ -95,6 +96,41 @@ unknown, so the join declines rather than handing the fact back.
 - **Exhaustiveness:** an `if/else if` chain that subtracts the discriminated place to `Never` has no
   reachable fall-through — no spurious `| null`, and codegen emits `unreachable` for the impossible
   path (`conditionsExhaust`).
+
+## Calls that never return
+
+A call whose type is `never` ends its path, exactly as `return` does. `__trap__()` and
+`__trap__("reason")` have that type, and so does any function that DECLARES it:
+
+```vl
+function fail(msg: string): never {
+  print(msg)
+  __trap__()
+}
+
+function f(x: i64 | IoError): i64 {
+  if x is IoError { fail("io") }
+  x * 2                                      // x is i64 here
+}
+
+const n = if ok { 10 } else { fail("no") }   // n: i32 — the `never` arm joins away
+```
+
+The one rule (`stmtAlwaysExits`) serves the post-guard narrowing, definite assignment
+(`let y: i32; if c { y = 1 } else { fail("no") }; y + 1`), the unreachable-code lint and the
+emitter, which follows each such call with `unreachable` so it can stand in any value position.
+
+- `never` is spelled **only** as a function's declared return type. It has no values, so a
+  parameter, field or binding annotation of `never` is refused.
+- A `: never` body must end every path in another never-returning call; falling off the end, or a
+  `return` of anything else, is a check error (`fail` is declared `never` but can return). A `while true` body
+  does not count yet (D1973).
+- **Inference never produces `never`.** A function that only traps but carries no annotation
+  infers `void`, and a call to it does not end a path — the annotation is the contract. A
+  never-returning tail contributes nothing to an inferred return, so
+  `function t(c: boolean) { if c { return 1 } fail("x") }` infers `i32`.
+- A `never` call cannot be STORED: an un-annotated binding, an object field or a list element
+  initialised by one is refused. An annotated binding, an argument and a `return` accept one.
 
 ## The algebra (A3 / A4)
 

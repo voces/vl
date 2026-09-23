@@ -8,6 +8,15 @@ see **`DECISIONS.md`**.
 
 ## Type system (Track A)
 
+- **A call that never returns ends a path (D1972, plumb PL-007 follow-up).** `__trap__(…)` has
+  type `never`, and `never` is spellable as a function's declared return type:
+  `function fail(msg: string): never { print(msg) __trap__() }`. A call of that type narrows the
+  code after a guard, satisfies definite assignment, triggers the unreachable-code lint and
+  stands in a value position (`if ok { n } else { fail("no") }` is `i32`); the emitter follows it
+  with `unreachable`. A `: never` body that can fall off the end or `return` is refused; `never`
+  as a parameter, field or binding annotation is refused, as is storing a `never` value in an
+  un-annotated binding, object field or list element. Inference never produces `never` — an
+  un-annotated trapping function stays `void` (DECISIONS.md, "A call that never returns").
 - **`std:simd` — the `F32x4` slice (SIMD S3, `simd-design.md` §G).** `F32x4` and `Mask32x4` are
   `new v128` brands; the module ships `splatF32`, `f32x4(x, y, z, w)`, unaligned
   `loadF32x4`/`storeF32x4` over a `Buf`, `+ - * /` (receiver-keyed operators, #3003) with named

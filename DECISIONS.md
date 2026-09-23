@@ -6204,3 +6204,39 @@ import a mutable global another unit (or the embedder) owns, and a unit to expor
 Pinned by `tests/vl_extern_global_test.ts` (sections, a host `WebAssembly.Global` written from both
 sides, V8 and `wasm-merge` + `-O3` links, the mutability `LinkError`, the `vl run` refusal) and the
 `tests/cases/extern/global-*` / `error-global-*` fixtures.
+
+## A call that never returns ends a path, through a `never` type — and only a declared one (owner, 2026-09-22) — D1972, plumb PL-007 follow-up
+
+**Ruled: `__trap__()` / `__trap__("reason")`, and a call to any function whose declared return
+type is `never`, END A PATH** — for post-guard narrowing, definite assignment, the
+unreachable-code lint and the emitter alike, because all four read the one rule
+`stmtAlwaysExits` (D1970), which gains one arm: an expression statement whose call's type is
+`never`. The checker marks such a call from its type (`callNever`, beside `callRestPacked`), so an
+imported or aliased `never` function counts; the parse-only lint pass, which runs no checker,
+marks calls by name to `__trap__` and to this file's `: never` declarations, dropping any name
+the file also binds as a parameter, local or other function (a shadowing callback returns).
+
+- **`never` is the bottom type it already was** (assignable to everything, nothing but itself
+  assignable to it), now SPELLABLE — but only as a function's declared return type. As a
+  parameter, field or binding annotation it names no values, and is refused as such.
+- **A `: never` body must end every path in a never-returning call**; falling off the end is
+  "`fail` is declared `never` but can return", and a `return` of anything but another never
+  call is refused. `while true` does not count yet (D1973's rule is the one to extend).
+- **Value position:** the join drops `never`, so `if c { 1 } else { fail("x") }` is `i32`; the
+  emitter follows every never-typed call with `unreachable`, whose polymorphic stack satisfies
+  any blocktype. A `: never` function lowers with no result, like `void` — and so does a never
+  RESULT inside a function TYPE, wherever the emitter spells one (closure signatures, list
+  elements, a generic pinned by a never function), since the reps have no `never`.
+- **A `never` value is not stored:** an un-annotated binding, an object field and a list element
+  initialised by one are refused (the slot would take a type no value has, and was invalid wasm
+  when bound). An annotated binding, an argument and a `return` accept one — nothing arrives.
+
+**Inference: `never` is never inferred; the annotation is required.** An un-annotated function
+that only traps keeps inferring `void`, exactly as before, and a call to it is an ordinary
+statement. A never-returning tail contributes nothing to an inferred return (`if c { return 1 }
+fail("x")` infers `i32`). Reasons: inferring `never` would silently change the TYPE of existing
+functions — `std:test`'s private `vltAbort` is one — and an exported function's return type is
+API surface that should not flip because its body happens to trap today; TypeScript draws the
+same line for function declarations. The distilled corpus could not measure the alternative (it
+holds no `__trap__` cell), so the conservative reading was taken rather than a measured one.
+`__trap__` itself needed no annotation: its type is the intrinsic's.

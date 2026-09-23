@@ -1360,6 +1360,115 @@ export function callIsRestPacked(nodeIx: i32) {
   callRestPacked[nodeIx] == 1
 }
 
+// Parallel to `P.nodes` on `tplHole`'s contract. `1` marks a `Call` whose type is `never` — it
+// cannot return, so `stmtAlwaysExits` ends a path at it (D1972). The checker marks from the call's
+// type; a lint run on a bare parse marks by declaration instead (`markNeverCallsByDecl`).
+export let callNever: i32[] = []
+
+export function markCallNever(nodeIx: i32) {
+  if nodeIx < 0 { return 0 }
+  while callNever.length <= nodeIx { callNever.push(0) }
+  callNever[nodeIx] = 1
+  0
+}
+
+// True when `nodeIx` is a call that never returns.
+export function callIsNever(nodeIx: i32) {
+  if nodeIx < 0 || nodeIx >= callNever.length { return false }
+  callNever[nodeIx] == 1
+}
+
+// The parse-only producer of `callNever`, for a lint pass with no checker behind it: a call to
+// `__trap__`, or by bare name to a function this parse declares `: never` and binds nowhere
+// else — a parameter, local or other function of that name anywhere in the file drops it, so
+// a shadowing callback never reads as a terminator. Marks a subset of the checker's answer.
+export function markNeverCallsByDecl() {
+  const names: string[] = ["__trap__"]
+  const others: string[] = []
+  let i = 0
+  while i < P.nodes.length {
+    const nv = neverFnNameAt(i)
+    if nv != "" {
+      names.push(nv)
+    } else {
+      const b = binderNameAt(i)
+      if b != "" { others.push(b) }
+    }
+    i = i + 1
+  }
+  let j = 0
+  while j < P.nodes.length {
+    const callee = identCalleeAt(j)
+    if callee != "" && strListHas(names, callee) {
+      if callee == "__trap__" || !strListHas(others, callee) {
+        markCallNever(j)
+      }
+    }
+    j = j + 1
+  }
+  0
+}
+
+// The name of the function declared `: never` at `ix`, or "".
+function neverFnNameAt(ix: i32) {
+  const d = P.nodes[ix]
+  if d is FuncDecl {
+    if d.fnName != "" && d.fnRet >= 0 {
+      const r = P.nodes[d.fnRet]
+      if r is TypeRef {
+        if r.tyName == "never" { return d.fnName }
+      }
+    }
+  }
+  ""
+}
+
+// The name bound at `ix` by a parameter, a `let`/`const` or a function, or "".
+function binderNameAt(ix: i32) {
+  const pn = paramNameAt(ix)
+  if pn != "" { return pn }
+  const ln = letNameAt(ix)
+  if ln != "" { return ln }
+  fnDeclNameAt(ix)
+}
+
+function paramNameAt(ix: i32) {
+  const d = P.nodes[ix]
+  if d is Param { return d.parName }
+  ""
+}
+
+function letNameAt(ix: i32) {
+  const d = P.nodes[ix]
+  if d is LetDecl { return d.letName }
+  ""
+}
+
+function fnDeclNameAt(ix: i32) {
+  const d = P.nodes[ix]
+  if d is FuncDecl { return d.fnName }
+  ""
+}
+
+// The callee name of a call by bare identifier at `ix`, or "".
+function identCalleeAt(ix: i32) {
+  const c = P.nodes[ix]
+  if c is Call {
+    const callee = P.nodes[c.callFn]
+    if callee is Ident { return callee.identName }
+  }
+  ""
+}
+
+function strListHas(xs: string[], s: string) {
+  let k = 0
+  while k < xs.length {
+    if xs[k] == s { return true }
+    k = k + 1
+  }
+  false
+}
+
 // A compound assignment `target op= value`, desugared to `target = (target op
 // value)` for typecheck/emit but tagged with the SURFACE operator (`binCompound`)
 // so the printer reprints `target op= value`. The target node is shared between
@@ -2165,12 +2274,14 @@ export function i32ToStr(n: i32) {
 // True if control never falls out of statement `ix` to its next sibling: the one rule the
 // checker's narrowing and definite assignment, the emitter and the lint share (D1970). A block
 // exits once any statement does; an `if` needs an `else` and both arms exiting; a `match`, every
-// arm. A loop never does, since a `break` in it leaves only the loop.
+// arm; a call, when its type is `never` (D1972). A loop never does: a `break` leaves only the loop.
 export function stmtAlwaysExits(ix: i32): boolean {
   if ix < 0 || ix >= P.nodes.length { return false }
   const s = P.nodes[ix]
   if s is RetStmt {
     return true
+  } else if s is Call {
+    return callIsNever(ix)
   } else if s is BreakStmt {
     return true
   } else if s is ContinueStmt {
