@@ -238,6 +238,7 @@ import {
   externLinkOf,
   externRetIsVoid,
   hasSpreadItem,
+  i32ToStr,
   mkTypeRef,
   nodeChildren,
   nodeSpineChildren,
@@ -4115,12 +4116,12 @@ export function capComputeNamesOf(fe: i32) {
   capFrame = fe
   const fn = P.nodes[fnStmts[fe]]
   if fn is FuncDecl {
-    const bound: string[] = []
+    const bound: {[string]: i32} = Map()
     const params = fn.fnParams
     let pi = 0
     while pi < params.length {
       const p = P.nodes[params[pi]]
-      if p is Param { bound.push(p.parName) }
+      if p is Param { bound[p.parName] = 1 }
       pi = pi + 1
     }
     // `capScan` resolves a narrowing condition against the frame whose body it is in;
@@ -4256,7 +4257,7 @@ function nodeSubtreeHas(ix: i32, at: i32): boolean {
 // function, so neither is a capture — unless an enclosing frame binds the same name, when
 // the identifier denotes that binding and dropping it leaves the body reading `global.get`.
 // It deliberately binds the local: a closure written before a shadowing `let` captures it.
-function capRecord(name: string, bound: string[], caps: string[]) {
+function capRecord(name: string, bound: {[string]: i32}, caps: string[]) {
   if capIsBound(bound, name) { return 0 }
   if globalIndexOf(name) >= 0 || fnIndexOf(name) >= 0 {
     if parentBindingFrameOf(capFrame, name) < 0 {
@@ -4286,7 +4287,7 @@ const capSibStack: i32[] = []
 // `k`'s env inside `j`, so every name `k` needs from an outer frame must ride `j`'s env. Depth
 // already works through `capScan`'s `FuncDecl` arm, which folds a nested body's frees upward;
 // this is the sibling direction, which `capRecord` dropped with the function name (D1761).
-function capSiblingFrees(name: string, bound: string[], caps: string[]) {
+function capSiblingFrees(name: string, bound: {[string]: i32}, caps: string[]) {
   if capFrame < 0 || capFrame >= fnStmts.length { return 0 }
   // The same outward walk `fnIndexOfInScopeSid` takes, and for the same reason: only a
   // NESTED function is found, so a module-level callee resolves to -1 and folds in nothing.
@@ -4332,7 +4333,7 @@ function capSiblingFrees(name: string, bound: string[], caps: string[]) {
 // `let` declarations are seen: wasm locals are function-scoped, so once declared a name
 // shadows an enclosing binding for the rest of the body. A nested `FuncDecl` is not
 // descended, being lifted to its own function with its own capture analysis.
-export function capScan(ix: i32, bound: string[], caps: string[]) {
+export function capScan(ix: i32, bound: {[string]: i32}, caps: string[]) {
   if ix < 0 { return 0 }
   const n = P.nodes[ix]
   if n is Ident {
@@ -4340,20 +4341,20 @@ export function capScan(ix: i32, bound: string[], caps: string[]) {
     return 0
   }
   if n is FuncDecl {
-    if n.fnName != "" { bound.push(n.fnName) }
+    if n.fnName != "" { bound[n.fnName] = 1 }
     // A nested function's free variables that this scope does not bind are transitive
     // captures: the nested closure's env is built inside this lifted function, so a name the
     // nested body needs from an outer frame must ride this env too. Scan the nested body
     // against its own bound set, then filter the frees through `capRecord`.
-    const ibound: string[] = []
+    const ibound: {[string]: i32} = Map()
     const iparams = n.fnParams
     let ipi = 0
     while ipi < iparams.length {
       const ip = P.nodes[iparams[ipi]]
-      if ip is Param { ibound.push(ip.parName) }
+      if ip is Param { ibound[ip.parName] = 1 }
       ipi = ipi + 1
     }
-    if n.fnName != "" { ibound.push(n.fnName) }
+    if n.fnName != "" { ibound[n.fnName] = 1 }
     const ifree: string[] = []
     // `ifree` is the nested body's free-name set before the global and function-name filter,
     // which is exactly the population `capNarrowRecord` may record: it excludes every name
@@ -4388,7 +4389,7 @@ export function capScan(ix: i32, bound: string[], caps: string[]) {
   }
   if n is LetDecl {
     if n.letInit >= 0 { capScan(n.letInit, bound, caps) }
-    bound.push(n.letName)
+    bound[n.letName] = 1
     return 0
   }
   if n is RetStmt {
@@ -4437,14 +4438,14 @@ export function capScan(ix: i32, bound: string[], caps: string[]) {
     capScan(n.frFrom, bound, caps)
     capScan(n.frTo, bound, caps)
     if n.frStep >= 0 { capScan(n.frStep, bound, caps) }
-    bound.push(n.frVar)
+    bound[n.frVar] = 1
     capScan(n.frBody, bound, caps)
     return 0
   }
   if n is ForIn {
     capScan(n.fiIter, bound, caps)
-    bound.push(n.fiVar)
-    if n.fiVar2 != "" { bound.push(n.fiVar2) }
+    bound[n.fiVar] = 1
+    if n.fiVar2 != "" { bound[n.fiVar2] = 1 }
     capScan(n.fiBody, bound, caps)
     return 0
   }
@@ -4939,7 +4940,7 @@ export function capNarrowBuild() {
   // enclosing frame to capture from, but a top-level `if` still narrows a module global,
   // and the frames declared under it are frames like any other.
   cnScanFnIx = -1
-  const sbound: string[] = []
+  const sbound: {[string]: i32} = Map()
   const scaps: string[] = []
   let si = 0
   while si < startStmts.length {
@@ -6331,13 +6332,58 @@ export function isVariantSpelling(variant: string, tyIx: i32): string {
   variant
 }
 
+// The name index over `localNames`: the first slot of each name, and per slot the next slot
+// of the same name, so a name's slots are a chain in ascending order and a lookup costs the
+// chain rather than the frame. `lixLen` is how many slots it covers; any other length means
+// `localNames` got reset behind it, and the next use rebuilds (D2090).
+let lixFirst: {[string]: i32} = Map()
+let lixLast: {[string]: i32} = Map()
+let lixNext: i32[] = []
+let lixLen = 0
+let lixDup = false
+
+function lixRebuild() {
+  lixFirst = Map()
+  lixLast = Map()
+  lixNext = []
+  lixLen = 0
+  lixDup = false
+  while lixLen < localNames.length { lixAppend(lixLen) }
+  0
+}
+
+function lixAppend(pos: i32) {
+  const name = localNames[pos]
+  const last = lixLast[name] ?? -1
+  lixNext.push(-1)
+  if last >= 0 {
+    lixNext[last] = pos
+    lixDup = true
+  } else {
+    lixFirst[name] = pos
+  }
+  lixLast[name] = pos
+  lixLen = pos + 1
+  0
+}
+
+// The first declared-local slot named `name`, or -1; walk on with `lixNextOf`.
+function lixFirstOf(name: string) {
+  if lixLen != localNames.length { lixRebuild() }
+  lixFirst[name] ?? -1
+}
+
+function lixNextOf(pos: i32) { lixNext[pos] }
+
 // Append the declared-local name `name` to `localNames` as a fresh slot — one wasm local per
 // lexical binding, with no dedupe by name, so two same-named `let`s in disjoint branches get
 // distinct slots and distinct valtypes. `structIdx` is the local's struct table index when it
 // is a ref, else -1. Returns the new slot's position (its wasm index is `paramCount + pos`).
 export function addLocalName(name: string, isRef: VKind, structIdx: i32) {
   const pos = localNames.length
+  if lixLen != pos { lixRebuild() }
   localNames.push(name)
+  lixAppend(pos)
   localIsRef.push(isRef)
   localStructIdx.push(structIdx)
   localLoopVar.push(0)
@@ -6779,15 +6825,13 @@ function identShadowMayBeLitAtom(exprIx: i32, _fnIx: i32) {
     // frames for every ordinary string local in the program.
     let seen = 0
     let hit = false
-    let i = 0
-    while i < localNames.length {
-      if localNames[i] == e.identName {
-        seen = seen + 1
-        if i < localLitUnion.length {
-          if localLitUnion[i] == 1 { hit = true }
-        }
+    let i = lixFirstOf(e.identName)
+    while i >= 0 {
+      seen = seen + 1
+      if i < localLitUnion.length {
+        if localLitUnion[i] == 1 { hit = true }
       }
-      i = i + 1
+      i = lixNextOf(i)
     }
     if seen > 1 { return hit }
   }
@@ -8491,47 +8535,116 @@ function declaredSlotLive(name: string) {
   if scoped >= 0 { return scoped }
   // `flatScanSkips` states for a block binding what `localLoopVar` states for a loop
   // variable: a flat hit the scope stack could have answered for is out of scope.
-  let pos = 0
-  while pos < localNames.length {
-    if (
-      localNames[pos] == name &&
-      localLoopVar[pos] == 0 &&
-      !flatScanSkips(pos)
-    ) {
-      return pos
-    }
-    pos = pos + 1
+  let pos = lixFirstOf(name)
+  while pos >= 0 {
+    if localLoopVar[pos] == 0 && !flatScanSkips(pos) { return pos }
+    pos = lixNextOf(pos)
   }
   -1
 }
 
 // Could two same-named slots in one frame give a type-directed detector different answers?
-// True when they differ on any axis a classifier reads off the slot: the rep, the struct row,
-// the literal-atom flag, the declaration node or the loop iterable. Same on every one means
-// the flat scan's choice cannot matter, so the detection owes no second pass (D1595).
-function localRepDiffers(a: i32, b: i32) {
-  if a < 0 || b < 0 { return true }
-  if localIsRef[a] != localIsRef[b] { return true }
-  if localStructIdx[a] != localStructIdx[b] { return true }
-  if localLitUnion[a] != localLitUnion[b] { return true }
-  if localDeclIx[a] != localDeclIx[b] { return true }
-  localLoopIter[a] != localLoopIter[b]
+// Only if their keys differ: the rep, the struct row, the literal-atom flag, the declaration's
+// class and the loop iterable — every axis a classifier reads off the slot. Equal keys mean the
+// flat scan's choice cannot matter, so the detection owes no second pass (D1595).
+function localRepKey(slot: i32): string {
+  localIsRef[slot] +
+    "|" +
+    i32ToStr(localStructIdx[slot]) +
+    "|" +
+    i32ToStr(localLitUnion[slot]) +
+    "|" +
+    i32ToStr(localDeclClass(slot)) +
+    "|" +
+    i32ToStr(localLoopIter[slot])
+}
+
+// The declaration axis of `localRepKey`: -1 for a slot with no `LetDecl`, -2 for one whose
+// declaration every declaration reader answers nothing for, else the `LetDecl` itself. Those
+// readers (`bindingDeclInScope`'s three callers) ask only for a literal-union type or a
+// string-list literal, so two declarations that yield neither are interchangeable (D2090).
+function localDeclClass(slot: i32) {
+  const d = localDeclIx[slot]
+  if d < 0 { return -1 }
+  if declYieldsNothing(d, 0) { return -2 }
+  d
+}
+
+// Does every declaration reader answer nothing for `LetDecl` `d`, whichever same-named slot a
+// scope-less pass resolves a name in its initializer to? Conservative: an index, an array
+// literal or a chain deeper than the cap counts as yielding something.
+function declYieldsNothing(d: i32, depth: i32): boolean {
+  const n = P.nodes[d]
+  if n is LetDecl {
+    if n.letType >= 0 {
+      if tyIsLitUnion(nodeArrayElemTyIx(n.letType)) { return false }
+      return !tyIsLitUnion(nodeTyIxOf(n.letType))
+    }
+    if n.letInit < 0 { return true }
+    return initYieldsNothing(n.letInit, depth + 1)
+  }
+  true
+}
+
+// `declYieldsNothing` of an initializer: the rungs `litAtomMemberTyAt` and
+// `arrElemLitUnionTyAt` read off the node itself, then the one arm (`Ident`) that recurses.
+function initYieldsNothing(e: i32, depth: i32): boolean {
+  if depth > 8 { return false }
+  const ix = unwrapParen(e)
+  if tyIsLitUnion(nodeTyIxOf(ix)) { return false }
+  if tyIsLitUnion(nodeArrayElemTyIx(e)) { return false }
+  if tyIsLitUnion(tyStepElem(nodeTyPinIxOf(ix))) { return false }
+  if tyIsLitUnion(pinnedHoleTyOf(nodeArrayElemTyIx(e))) { return false }
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = P.nodes[ix]
+  if n is ArrayLit { return false }
+  if n is Index { return false }
+  if n is Ident { return identYieldsNothing(n.identName, depth) }
+  // Every other kind is a leaf to the declaration readers.
+  initIsReaderLeaf()
+}
+
+// The readers recurse through `Ident` and `Index` alone and read a list literal only as a
+// string list, so an initializer of any other kind is answered by its own rungs.
+function initIsReaderLeaf(): boolean { true }
+
+// Every slot a scope-less pass can resolve `name` to answers nothing: no loop iterable, and
+// either a declaration that yields nothing or, with none, a parameter type that is not a
+// literal union. Memoised per frame in `dupYieldMemo` (0 no, 1 yes, 2 being asked).
+function identYieldsNothing(name: string, depth: i32): boolean {
+  const m = dupYieldMemo[name] ?? -1
+  if m >= 0 { return m == 1 }
+  dupYieldMemo[name] = 2
+  let ok = true
+  let p = lixFirstOf(name)
+  if p < 0 { ok = paramYieldsNothing(name) }
+  while ok && p >= 0 {
+    if localLoopIter[p] >= 0 {
+      ok = false
+    } else if localDeclIx[p] >= 0 {
+      ok = declYieldsNothing(localDeclIx[p], depth)
+    } else {
+      ok = paramYieldsNothing(name)
+    }
+    p = lixNextOf(p)
+  }
+  if ok { dupYieldMemo[name] = 1 } else { dupYieldMemo[name] = 0 }
+  ok
+}
+
+function paramYieldsNothing(name: string): boolean {
+  const pt = paramTypeNode(dupFnIx, name)
+  if pt < 0 { return true }
+  if tyIsLitUnion(nodeTyIxOf(pt)) { return false }
+  !tyIsLitUnion(nodeArrayElemTyIx(pt))
 }
 
 // Does this frame bind any name to more than one slot? The one condition under which
 // `declaredSlotOf`'s scope-less answer is a guess. The detection drivers ask once per frame,
 // so a frame with no shadowing keeps the flat scan's first-match early return (D1595).
 export function frameHasDupLocalName() {
-  let i = 1
-  while i < localNames.length {
-    let j = 0
-    while j < i {
-      if localNames[j] == localNames[i] { return true }
-      j = j + 1
-    }
-    i = i + 1
-  }
-  false
+  if lixLen != localNames.length { lixRebuild() }
+  lixDup
 }
 
 // Does the flat scan have to pass slot `pos` over? True for a block-scoped binding asked
@@ -8567,14 +8680,136 @@ export function bindingDeclInScope(name: string): i32 {
   localDeclIx[slot]
 }
 
+// The disambiguation loop's view of the name index, built once per frame by `dupScanIndex`:
+// each name's slots laid out in order from its first slot's `dupOff`, `dupCnt` of them; per
+// slot its class (the first same-named slot with an equal `localRepKey`) and whether a later
+// same-named slot is of another class. A biased lookup is then two reads, not a frame scan.
+let dupFlat: i32[] = []
+let dupOff: i32[] = []
+let dupCnt: i32[] = []
+let dupMore: i32[] = []
+let dupClass: i32[] = []
+let dupLen = -1
+let dupFnIx = -1
+let dupYieldMemo: {[string]: i32} = Map()
+// The names bound more than once (their first slots), and which of them the current sweep has
+// looked up: `dupSeenMark[head]` is 1 for one, and `dupSeen` lists them.
+let dupHeads: i32[] = []
+let dupSeenMark: i32[] = []
+let dupSeen: i32[] = []
+
+// Build the disambiguation index for the frame of `fnIx`. The columns it reads are final once
+// the collect walk has run, and a lookup rebuilds it if the frame has grown since.
+export function dupScanIndex(fnIx: i32) {
+  if lixLen != localNames.length { lixRebuild() }
+  dupFnIx = fnIx
+  dupYieldMemo = Map()
+  const n = localNames.length
+  dupFlat = []
+  dupOff = []
+  dupCnt = []
+  dupMore = []
+  dupClass = []
+  dupHeads = []
+  dupSeenMark = []
+  dupSeen = []
+  let i = 0
+  while i < n {
+    dupOff.push(0)
+    dupCnt.push(0)
+    dupMore.push(0)
+    dupClass.push(i)
+    dupSeenMark.push(0)
+    i = i + 1
+  }
+  i = 0
+  while i < n {
+    if (lixFirst[localNames[i]] ?? -1) == i && lixNextOf(i) >= 0 {
+      dupIndexGroup(i)
+      dupHeads.push(i)
+    } else if (lixFirst[localNames[i]] ?? -1) == i {
+      dupOff[i] = dupFlat.length
+      dupCnt[i] = 1
+      dupFlat.push(i)
+    }
+    i = i + 1
+  }
+  dupLen = n
+  0
+}
+
+// Lay out the same-named slots headed by `head`, class them by `localRepKey`, and mark each
+// slot a later slot of another class follows.
+function dupIndexGroup(head: i32) {
+  const off = dupFlat.length
+  const repOf: {[string]: i32} = Map()
+  let p = head
+  while p >= 0 {
+    dupFlat.push(p)
+    const key = localRepKey(p)
+    const rep = repOf[key] ?? -1
+    if rep >= 0 { dupClass[p] = rep } else { repOf[key] = p }
+    p = lixNextOf(p)
+  }
+  dupOff[head] = off
+  dupCnt[head] = dupFlat.length - off
+  let j = dupFlat.length - 2
+  while j >= off {
+    const a = dupFlat[j]
+    const b = dupFlat[j + 1]
+    if dupClass[a] != dupClass[b] || dupMore[b] == 1 { dupMore[a] = 1 }
+    j = j - 1
+  }
+  0
+}
+
+// Start a sweep: forget which names the previous one looked up.
+export function dupPassBegin() {
+  let k = 0
+  while k < dupSeen.length {
+    dupSeenMark[dupSeen[k]] = 0
+    k = k + 1
+  }
+  dupSeen = []
+  0
+}
+
+// The heads the current sweep has looked up, in first-lookup order.
+export function dupPassSeen(): i32[] { dupSeen }
+
+// The class every multiply-bound name resolves to at `bias`, one entry per head. Two sweeps with
+// equal answers here hand every lookup a slot of the same class, so they classify alike.
+export function dupPassClasses(bias: i32): i32[] {
+  const out: i32[] = []
+  let h = 0
+  while h < dupHeads.length {
+    const head = dupHeads[h]
+    if bias < dupCnt[head] {
+      out.push(dupClass[dupFlat[dupOff[head] + bias]])
+    } else {
+      out.push(dupClass[head])
+    }
+    h = h + 1
+  }
+  out
+}
+
+// Would a lookup of the name headed by `head` at `bias` flag an unvisited slot of another
+// class? The `dupSlotMore` a sweep would raise, answered without running it.
+export function dupMoreAt(head: i32, bias: i32): boolean {
+  if head < 0 || head >= dupCnt.length { return false }
+  if bias >= dupCnt[head] { return false }
+  dupMore[dupFlat[dupOff[head] + bias]] == 1
+}
+
 function declaredSlotOf(name: string) {
   const scoped = scopeSlotOf(name)
   if scoped >= 0 { return scoped }
   if !dupScanActive {
-    let pos = 0
-    while pos < localNames.length {
-      if localNames[pos] == name && !flatScanSkips(pos) { return pos }
-      pos = pos + 1
+    let pos = lixFirstOf(name)
+    while pos >= 0 {
+      if !flatScanSkips(pos) { return pos }
+      pos = lixNextOf(pos)
     }
     return -1
   }
@@ -8582,24 +8817,17 @@ function declaredSlotOf(name: string) {
   // same-named slot (the first when the name is bound once, or when the bias has run past
   // the match count), and tell the driver when a later match of a different rep is still
   // unvisited — that is the pass it has yet to run.
-  let p = 0
-  let first = -1
-  let pick = -1
-  let seen = 0
-  while p < localNames.length {
-    if localNames[p] == name {
-      if first < 0 { first = p }
-      if seen == dupSlotBias {
-        pick = p
-      } else if seen > dupSlotBias && pick >= 0 {
-        if localRepDiffers(pick, p) { dupSlotMore = true }
-      }
-      seen = seen + 1
-    }
-    p = p + 1
+  const first = lixFirstOf(name)
+  if first < 0 { return -1 }
+  if dupLen != localNames.length { dupScanIndex(dupFnIx) }
+  if dupCnt[first] > 1 && dupSeenMark[first] == 0 {
+    dupSeenMark[first] = 1
+    dupSeen.push(first)
   }
-  if pick >= 0 { return pick }
-  first
+  if dupSlotBias >= dupCnt[first] { return first }
+  const pick = dupFlat[dupOff[first] + dupSlotBias]
+  if dupMore[pick] == 1 { dupSlotMore = true }
+  pick
 }
 
 // The `VKind` of declared local `name`, or `null` when there is no such declared local — the
@@ -15395,12 +15623,10 @@ export function fnUnionRetSinkOk(fnIx: i32) {
 // already run, so a shadowed name that answers for the wrong slot only mis-predicts,
 // costing two unused locals, never a wrong sink (the lowering reads `localIsRef[slot]` directly).
 function localNameIsUnionSlot(name: string) {
-  let i = 0
-  while i < localNames.length {
-    if localNames[i] == name {
-      if localIsRef[i] == "union" { return true }
-    }
-    i = i + 1
+  let i = lixFirstOf(name)
+  while i >= 0 {
+    if localIsRef[i] == "union" { return true }
+    i = lixNextOf(i)
   }
   false
 }

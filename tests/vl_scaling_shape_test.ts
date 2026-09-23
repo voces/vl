@@ -459,6 +459,50 @@ axis(
   (d) => twoFiles(d, genCovar(1400, 1400), genCovar(1400, 70)),
 );
 
+// One function of `n` sibling blocks, each binding five temps and folding them into `acc` —
+// the shape a machine-code translator emits, one block per instruction. `temps` picks how
+// the temps are bound: `same` redeclares the same names in every block, `unique` gives each
+// block its own, and `hoisted` declares them once at function scope and assigns them. The
+// fifth temp alternates `f64` and `i32`, so same-named slots of two reps interleave.
+const genSiblingBlocks = (n: number, temps: "same" | "unique" | "hoisted"): string => {
+  const o = ["let g = 3", "function f(a: i32): i32 {", "  let acc = 0"];
+  if (temps === "hoisted") {
+    o.push("  let m = 0", "  let x = 0", "  let y = 0", "  let r = 0", "  let vf = 0.0", "  let vi = 0");
+  }
+  for (let i = 0; i < n; i++) {
+    const s = temps === "unique" ? `_${i}` : "";
+    const d = temps === "hoisted" ? "" : "const ";
+    const v = temps === "hoisted" ? (i % 2 ? "vf" : "vi") : `v${s}`;
+    o.push(
+      `  { ${d}m${s} = a + g + ${i}; ${d}x${s} = m${s} * 3; ${d}y${s} = x${s} - acc; ` +
+        `${d}r${s} = y${s} ^ m${s}; acc = acc + r${s}; ${d}${v} = ${i % 2 ? "1.5" : i}; print(${v}) }`,
+    );
+  }
+  o.push("  acc", "}", "print(f(7))");
+  return o.join("\n") + "\n";
+};
+
+// 0.69 / 0.59 / 1.17 at 2,500 blocks. Master is cubic here: on the four-temp shape it read
+// 44 s at 250 blocks and ran past 300 s at 500, where the hoisted arm read 0.06 s (D2090).
+// Every same-named slot made the scope-less detection sweep run once more, and each lookup
+// scanned the frame; without the sweep dedupe the interleaved f64/i32 temp is quadratic alone.
+axis(
+  "sibling blocks redeclaring locals",
+  2.5,
+  "`dupScanRun` is sweeping once per same-named slot, or `declaredSlotOf` is scanning the frame (D2090).",
+  (d) => twoFiles(d, genSiblingBlocks(2500, "same"), genSiblingBlocks(2500, "hoisted")),
+);
+
+// 0.63 / 0.65 / 0.97 at 2,500 blocks, against master's 168 s / 0.59 s at 4,000: a frame of
+// distinct locals, each read resolved by a linear scan of the frame and of `capScan`'s bound
+// list (D2090).
+axis(
+  "locals per function",
+  2.5,
+  "A per-read lookup is scanning every local of the frame — `declaredSlotOf`, `capIsBound` (D2090).",
+  (d) => twoFiles(d, genSiblingBlocks(2500, "unique"), genSiblingBlocks(2500, "hoisted")),
+);
+
 // ── the one RUNTIME axis ─────────────────────────────────────────────────────
 // Every pair above grades COMPILE time, because every cost above is the compiler's. String
 // building is the exception: the cost lands in the EMITTED program, so this pair builds
