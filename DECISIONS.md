@@ -5673,6 +5673,47 @@ whitelist over literals, identifier reads, places and arithmetic; every kind it 
 a call, a lambda, a `MatchExpr`, every statement kind — answers "possibly effectful" and puts
 its literal on the scratch path. A kind nobody has classified is never silently reordered.
 
+## The host's dependencies build at opt-level 3; the host crate stays at 1 (2026-09-22)
+
+`scripts/vl-host` shipped with `[profile.release] opt-level = 1` from its first commit (#275),
+with no recorded reason, and that setting reached every dependency — wasmtime, Cranelift and
+the GC collector. Those are not the thin OS shim the crate is: they run every guest and compile
+every module, so the collector's copy loop and Cranelift itself ran at O1. The decoder-gap
+investigation (#3022, lane L2) measured it; this change is
+`[profile.release.package."*"] opt-level = 3`, deps only.
+
+Measured on this box, one A/B pair interleaved per iteration (so contention lands on both arms),
+median CPU seconds (user+sys), readings taken at load ≤ 15 unless marked:
+
+| workload | O1 deps | O3 deps | Δ |
+| --- | --- | --- | --- |
+| plumb `decode-bench` `1` (decode, default GC heap) | 3.96 | 2.87 | −27.5% |
+| plumb `decode-bench` `0` (per-run fixed cost: Cranelift of the guest) | 0.78 | 0.64 | −18.0% |
+| seed Cranelift compile, no `.cwasm` sidecar (first run per content key) | 17.8 | 14.0 | −21.5% (load ~80) |
+| self-compile `vl build compiler/entry.vl`, warm sidecar | 5.45 | 5.27 | −3.4% (a second reading −8.4% at load ~80) |
+| `vl run hello.vl`, warm sidecar | 0.029 | 0.025 | −16% (11 samples; wall 14 → 12 ms) |
+| release binary size | 25,878,456 B | 22,285,344 B | −13.9% |
+
+The self-compile barely moves, and that is expected rather than disappointing: a warm run executes
+the seed's CRANELIFT OUTPUT, which the host's opt level does not touch — only the collector and
+libcalls get faster. What moves is everything Rust: the GC (decode) and Cranelift (every
+uncached compile, including each user program `vl run` builds).
+
+**The host crate stays at 1 on purpose.** It is the only unit a dev loop or CI rebuilds without
+a manifest change — `ci-embed-seed` recompiles it on every run because `build.rs` tracks the
+seed — so its compile time is paid often, and nothing hot lives in it.
+
+**The price is build CPU, and it was smaller than predicted.** #3022 recorded +35% for a cold
+build (1m03 → 1m25, one reading on a loaded box). Four cold readings here did not reproduce a
+wall-clock cost: at `-j8`, 106.7 s / 120.0 s at O1 against 108.9 s / 107.0 s at O3 (user CPU
+604 / 597 → 669 / 654, +10%); at `-j4`, closer to a CI runner, 184.7 s against 133.7 s with
+user CPU 501 against 495 — the O1 run met a load spike, so read that pair as "no measurable
+difference", not as a speed-up. A cold build is dominated by a few large crates on the critical
+path either way. CI pays it only on a cache miss: every `vl-bin-*` and `cargo-*` key already
+hashes `Cargo.toml`, so this change is one clean miss, then warm. The distributed binary
+(`scripts/build-binary.sh`, `release.yml`) builds the same `--release` profile and gets the
+change too.
+
 ## std ships inside the binary; a pin is one file; development overrides are explicit and announced (owner question 2026-09-03) — D1573/D1574, BUILT
 
 The owner asked whether `vl` should distribute with std baked in. It should, and the reason is

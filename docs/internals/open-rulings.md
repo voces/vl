@@ -1314,6 +1314,26 @@ channel `std:process` already uses, so a caller branches on `code` exactly as it
 missing binary. (c) is what the port would have to do in the meantime and should be written
 into its header if it ships before this is ruled.
 
+### property-access — should VL have getters, and how does SIMD read a lane? — raised 2026-09-22
+
+SIMD S3 (#3015) shipped neither O3 lane-read spelling. `f32x4(…).x` gives `member access '.x' on
+non-object F32x4`, and a std `laneF32x4(v, i)` cannot pass a literal `i` on to the intrinsic.
+The full write-up is `docs/internals/property-access-design.md`, with nine questions (F1–F9).
+The two that decide the rest:
+
+- **F1, getters at all.** *Recommend* declared, nominal-only, read-only getters
+  (`get x(self: F32x4): f32`), resolved only through the receiver type's own module. The body
+  is CHECKED: loop-free, allocation-free and effect-free, calling only intrinsics and other
+  getters, and using only types whose rep never boxes (F8, F9; relaxed later by
+  `docs/internals/function-effects-design.md`). Reject implicit parenless calls, because they would settle the `c.area` bound-value question
+  (`ROADMAP.md`, B14) as a side effect.
+- **F2, structural participation.** *Recommend* never. In VL `{ x: f32 }` is a WasmGC layout,
+  it permits writes and it is a narrowing place, and a getter is none of the three.
+
+**Nothing waits on the ruling.** A `lane(self, i: 0 | 1 | 2 | 3)` literal-union ladder in std
+needs no compiler change. It is range-checked at compile time and folds to one
+`f32x4.extract_lane` at `-O`/`-O3` (doc §A7).
+
 ## Dismissed — filed as owner rulings, verified NOT open
 
 Kept so the same 22 are not re-swept. `ALREADY-RULED` = the answer exists elsewhere; `SHIPPED` = the code already does it; `STALE-PREMISE` = the question rests on something no longer true; `NOT-AN-OWNER-CALL` = ordinary work, or a measurement settles it.
