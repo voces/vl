@@ -20060,6 +20060,7 @@ function objShapeAdapterlessAt(srcExpr: i32, src: i32, dst: i32): boolean {
   shapeAdaptNulCopy = false
   shapeAdaptNestedCopy = false
   shapeAdaptMapShared = false
+  shapeAdaptRecField = false
   if objShapeAdapterless(srcExpr, src, dst, 12, true) { return true }
   let wd = dst
   if dst == lwStoreDst && lwStoreVal >= 0 { wd = lwStoreVal }
@@ -20094,6 +20095,7 @@ function mapStoreValPin(tgt: i32, readTy: i32) {
 let shapeAdaptNulCopy = false
 let shapeAdaptNestedCopy = false
 let shapeAdaptMapShared = false
+let shapeAdaptRecField = false
 
 // Claim `src` -> `dst` as the refused list pair, the way `objShapeAdapterless` claims one.
 function listWidenClaim(x: i32, src: i32, dst: i32): boolean {
@@ -20256,7 +20258,8 @@ function listWidenLitElems(els: i32[], de: i32, depth: i32): boolean {
 }
 
 // A record into a record: each field the destination declares, with its initializer when the
-// source is an object literal.
+// source is an object literal. A record VALUE is shared, not rebuilt, so a list field whose
+// element differs has no lowering even as a view (D2100): that pair is claimed outright.
 function listWidenObj(x: i32, s: TyObj, dst: i32, depth: i32): boolean {
   const d = T.tys[dst]
   if d is TyObj {
@@ -20273,11 +20276,47 @@ function listWidenObj(x: i32, s: TyObj, dst: i32, depth: i32): boolean {
         if listWidenWalk(fx, sf, d.objFieldTypes[i], depth - 1, false) {
           return true
         }
+        if lit < 0 && listSlotWidens(sf, d.objFieldTypes[i], 8) {
+          shapeAdaptRecField = true
+          return listWidenClaimInner(sf, d.objFieldTypes[i], x)
+        }
       }
       i = i + 1
     }
   }
   false
+}
+
+// Claim the first list pair inside `st` -> `dt` whose element differs, for the message.
+function listWidenClaimInner(st: i32, dt: i32, x: i32): boolean {
+  let s = st
+  let d = dt
+  let guard = 0
+  while guard < 16 {
+    const dn = T.tys[d]
+    const sn = T.tys[s]
+    if dn is TyNullable {
+      d = dn.nInner
+      if sn is TyNullable { s = sn.nInner }
+    } else if dn is TyArray {
+      if sn is TyArray {
+        if listElemDiffers(sn.aElem, dn.aElem) {
+          return listWidenClaim(x, s, d)
+        }
+        s = sn.aElem
+        d = dn.aElem
+      } else {
+        return listWidenClaim(x, st, dt)
+      }
+    } else {
+      return listWidenClaim(x, st, dt)
+    }
+    if s < 0 || d < 0 || s >= T.tys.length || d >= T.tys.length {
+      return listWidenClaim(x, st, dt)
+    }
+    guard = guard + 1
+  }
+  listWidenClaim(x, st, dt)
 }
 
 // The value expression the object literal at `lit` gives field `name`, or -1.
@@ -20297,8 +20336,10 @@ function objLitFieldExpr(lit: i32, name: string): i32 {
   -1
 }
 
-// A map into a map. A map has no read-only view, so a key or value holding a list may not
-// widen at all, readonly or not: every handle shares its entries.
+// A map into a map. A map has no read-only view, so a key or value holding a list whose
+// element widens is refused even into a `readonly` list: a store through the wider map puts a
+// wider list where the narrower map's readers expect their own (D2161's r13). A list shared at
+// its own element type (`string[]` into `readonly string[]`) passes.
 function listWidenMap(
   x: i32,
   s: TyMap,
@@ -20310,8 +20351,8 @@ function listWidenMap(
   if d is TyMap {
     if listWidenWalk(-1, s.mKey, d.mKey, depth - 1, false) { return true }
     if listWidenWalk(-1, s.mVal, d.mVal, depth - 1, false) { return true }
-    const vw = tyContainsList(d.mVal, 8) && listElemWidens(s.mVal, d.mVal)
-    const kw = tyContainsList(d.mKey, 8) && listElemWidens(s.mKey, d.mKey)
+    const vw = listSlotWidens(s.mVal, d.mVal, 8)
+    const kw = listSlotWidens(s.mKey, d.mKey, 8)
     if vw || kw {
       shapeAdaptMapShared = true
       return listWidenClaim(x, src, dst)
@@ -20344,6 +20385,96 @@ function listWidenFunc(s: TyFunc, dst: i32, depth: i32): boolean {
     }
   }
   false
+}
+
+// Does `st` -> `dt` pair a list with one whose element differs, anywhere inside, `readonly`
+// or not? The shape a map value or record field cannot share.
+function listSlotWidens(st: i32, dt: i32, depth: i32): boolean {
+  if (
+    st < 0 ||
+    dt < 0 ||
+    st >= T.tys.length ||
+    dt >= T.tys.length ||
+    depth <= 0
+  ) {
+    return false
+  }
+  if st == dt { return false }
+  const d = T.tys[dt]
+  match d {
+    TyArray => {
+      const se = tyArrayElemIx(st)
+      if se < 0 { return false }
+      if listElemDiffers(se, d.aElem) { return true }
+      // A mutable list read as a view of a union or nullable element: a view stored back
+      // through the wider slot may itself view a NARROWER list (D2161's r13).
+      if d.aRead == 1 && !tyIxIsView(st) && elemAdmitsNarrowerShare(d.aElem) {
+        return true
+      }
+      return listSlotWidens(se, d.aElem, depth - 1)
+    }
+    TyNullable => {
+      return listSlotWidens(nonNulTyOf(st), d.nInner, depth - 1)
+    }
+    TyObj => {
+      return listSlotWidensFields(st, d, depth)
+    }
+    TyMap => {
+      return listSlotWidensEntries(st, d, depth)
+    }
+    // A leaf, a union or a function holds no list slot this rule shares.
+    TyPrim | TyErr | TyFunc | TyUnion | TyVar | TyLit | TyNeg => {
+      return false
+    }
+  }
+}
+
+// `listSlotWidens` over each field `d` declares, when `st` is a record too.
+function listSlotWidensFields(st: i32, d: TyObj, depth: i32): boolean {
+  const s = T.tys[st]
+  if s is TyObj {
+    let i = 0
+    while i < d.objFieldNames.length {
+      const sf = objFieldType(s, d.objFieldNames[i])
+      if sf >= 0 && listSlotWidens(sf, d.objFieldTypes[i], depth - 1) {
+        return true
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// `listSlotWidens` over a map's key and value, when `st` is a map too.
+function listSlotWidensEntries(st: i32, d: TyMap, depth: i32): boolean {
+  const s = T.tys[st]
+  if s is TyMap {
+    return listSlotWidens(s.mKey, d.mKey, depth - 1) ||
+      listSlotWidens(s.mVal, d.mVal, depth - 1)
+  }
+  false
+}
+
+// Can a list of a NARROWER element be shared as a view of `de`: a union or nullable element,
+// which a list of one of its members reaches without a copy?
+function elemAdmitsNarrowerShare(de: i32): boolean {
+  if de < 0 || de >= T.tys.length { return false }
+  const t = T.tys[de]
+  match t {
+    TyNullable | TyUnion => {
+      return true
+    }
+    // No other element has a narrower type a list of it shares storage with.
+    TyPrim | TyErr | TyObj | TyFunc | TyArray | TyMap | TyVar | TyLit | TyNeg => {
+      return false
+    }
+  }
+}
+
+// Do two list elements differ in a way a shared list cannot carry: a widened element, or a
+// different storage class?
+function listElemDiffers(se: i32, de: i32): boolean {
+  listElemWidens(se, de) || containerElemClassDiffers(se, de)
 }
 
 // Does `ty` hold a list anywhere a store could reach one?
@@ -20414,6 +20545,8 @@ function listOriginExpr(expr: i32): i32 {
     if e is Ident {
       const init = ctnLitInitOf(e.identName)
       if init < 0 { return x }
+      // A const whose contents receive an existing list holds more than its literal built.
+      if constStoresForeignList(e.identName, covarRootFrame(x)) { return x }
       if exprIsCollCtorCall(init) { return LW_INFERRED }
       x = parenPeelIx(init)
       hops = hops + 1
@@ -20423,6 +20556,134 @@ function listOriginExpr(expr: i32): i32 {
     return x
   }
   x
+}
+
+// Does a store INTO the value the name (`nm`, `fr`) is bound to — an element or field store
+// (`ls[0] = v`, `o.xs = v`, `m[k] = v`) or a mutating method (`ls.push(v)`, `m.set(k, v)`), at
+// any projection depth — put there a list that is not itself fresh (`lwValueIsFresh`)?
+function constStoresForeignList(nm: string, fr: i32): boolean {
+  if nm == "" { return true }
+  if lwFreshDepth > 8 { return true }
+  lwFreshDepth = lwFreshDepth + 1
+  cwIxBuild()
+  let found = false
+  let r = cwIxChain(nm)
+  while r >= 0 && !found {
+    if cwIxKind[r] == CW_OCC_USE {
+      if cwSameFrame(cwIxFr[r], fr) {
+        const st = cwUseStoreNode(cwIxNode[r])
+        if st >= 0 && lwStoreCarriesForeignList(st) { found = true }
+      }
+    }
+    r = cwIxNext[r]
+  }
+  lwFreshDepth = lwFreshDepth - 1
+  found
+}
+
+// The recursion bound shared by `constStoresForeignList` and `lwValueIsFresh`, which reach each
+// other through a const that stores into itself.
+let lwFreshDepth = 0
+
+// The store or mutating call the use `u` of a name sits under, or -1: the assignment node for
+// `x[i] = v` / `x.f = v`, the call node for `x.push(v)`.
+function cwUseStoreNode(u: i32): i32 {
+  let at = u
+  let steps = 0
+  while at >= 0 && at < cwIxUpKind.length && cwIxUpKind[at] == CW_UP_OBJ {
+    const p = cwIxUp[at]
+    if p < 0 || p >= P.nodes.length || p >= cwIxUpKind.length { return -1 }
+    const pk = cwIxUpKind[p]
+    if pk == CW_UP_ASG_LHS { return cwIxUp[p] }
+    const pn = P.nodes[p]
+    if pn is Member {
+      if pk == CW_UP_CALLEE {
+        if cwMutatesList(pn.memProp) { return cwIxUp[p] }
+        return -1
+      }
+    }
+    at = p
+    steps = steps + 1
+    if steps > 64 { return -1 }
+  }
+  -1
+}
+
+// Does the store at `st` (an assignment or a mutating call) carry a list that is not fresh?
+function lwStoreCarriesForeignList(st: i32): boolean {
+  if st < 0 || st >= P.nodes.length { return true }
+  const n = P.nodes[st]
+  if n is BinExpr { return !lwValueIsFresh(n.binRight) }
+  lwCallCarriesForeignList(st)
+}
+
+// `lwStoreCarriesForeignList` for a mutating call: any argument not fresh. A store node of any
+// other shape is not one this reads, so it counts as foreign.
+function lwCallCarriesForeignList(st: i32): boolean {
+  const n = P.nodes[st]
+  if n is Call {
+    let i = 0
+    while i < n.callArgs.length {
+      if !lwValueIsFresh(n.callArgs[i]) { return true }
+      i = i + 1
+    }
+    return false
+  }
+  true
+}
+
+// Is the value at `v` either free of lists or built fresh: a literal whose own lists are fresh,
+// a literal const nothing foreign is stored into, or a result `callResultIsInferred` trusts?
+function lwValueIsFresh(v: i32): boolean {
+  if v < 0 || v >= P.nodes.length { return false }
+  // A value the check has not typed yet (a store after the delivery) is judged by its origin.
+  const vt = nodeTyIxOf(v)
+  if vt >= 0 && !tyContainsList(vt, 8) { return true }
+  if lwFreshDepth > 8 { return false }
+  lwFreshDepth = lwFreshDepth + 1
+  const o = listOriginExpr(v)
+  let fresh = false
+  if o == LW_INFERRED { fresh = true }
+  else if o >= 0 && o < P.nodes.length { fresh = lwLitIsFresh(o) }
+  lwFreshDepth = lwFreshDepth - 1
+  fresh
+}
+
+// Is the node `o` a list or object literal all of whose parts are fresh (`lwValueIsFresh`)? A
+// spread of a list-holding source is not.
+function lwLitIsFresh(o: i32): boolean {
+  const n = P.nodes[o]
+  if n is ArrayLit {
+    let i = 0
+    while i < n.arrElems.length {
+      const el = P.nodes[n.arrElems[i]]
+      if el is Spread {
+        if tyContainsList(nodeTyIxOf(el.spdArg), 8) { return false }
+      } else if !lwValueIsFresh(n.arrElems[i]) {
+        return false
+      }
+      i = i + 1
+    }
+    return true
+  }
+  lwObjLitIsFresh(o)
+}
+
+// `lwLitIsFresh` for an object literal: every field value fresh.
+function lwObjLitIsFresh(o: i32): boolean {
+  const n = P.nodes[o]
+  if n is ObjLit {
+    let i = 0
+    while i < n.objFields.length {
+      const fi = P.nodes[n.objFields[i]]
+      if fi is FieldInit {
+        if !lwValueIsFresh(fi.fiValue) { return false }
+      }
+      i = i + 1
+    }
+    return true
+  }
+  false
 }
 
 // Does the argument at `ix` hand an EXISTING list to the call? A literal is new, so only the
@@ -20793,6 +21054,16 @@ function listMutableTwin(ty: i32): i32 {
   ty
 }
 
+// The type to declare a delivered source at so it needs no widening: the destination with its
+// outer `| null` and `readonly` taken off, since the source is a non-null value built to be
+// written (`readonly f64[] | null` gives `f64[]`).
+function sourceBuildTy(dst: i32): i32 {
+  if dst < 0 || dst >= T.tys.length { return dst }
+  const d = T.tys[dst]
+  if d is TyNullable { return listMutableTwin(d.nInner) }
+  listMutableTwin(dst)
+}
+
 // The `.map` copy alone, without `containerWidenCopyHint`'s leading clause.
 function containerWidenCopyHintBare(src: i32, dst: i32): string {
   const s = T.tys[src]
@@ -20893,8 +21164,10 @@ function readonlyFixOf(
   const nC = shapeAdaptNulCopy
   const nN = shapeAdaptNestedCopy
   const nM = shapeAdaptMapShared
+  const nR = shapeAdaptRecField
   const bad = covarWriteThrough(srcExpr, src, ro) != 0 ||
     objShapeAdapterlessAt(srcExpr, src, ro)
+  shapeAdaptRecField = nR
   shapeAdaptSrcTy = sS
   shapeAdaptDstTy = sD
   shapeAdaptSrcExpr = sX
@@ -20967,7 +21240,10 @@ function elemClassIsNumeric(ty: i32): boolean {
 // and the fields that make it one, not the container that carried it (reported separately),
 // then the two ways out: a constructor is built at the shape it flows into, or the source
 // can be spelled at the target's shape.
-function objShapeAdapterlessErr(srcExpr: i32, src: i32, dst: i32) {
+function objShapeAdapterlessErr(srcExpr: i32, src: i32, dstIn: i32) {
+  // A map index store is checked against its read type `V | null`; the slot is `V`.
+  let dst = dstIn
+  if dstIn == lwStoreDst && lwStoreVal >= 0 { dst = lwStoreVal }
   let sT = shapeAdaptSrcTy
   let dT = shapeAdaptDstTy
   let sX = shapeAdaptSrcExpr
@@ -21011,28 +21287,40 @@ function objShapeAdapterlessErr(srcExpr: i32, src: i32, dst: i32) {
   if shapeAdaptElemPair {
     let rule = ": a container never widens implicitly. Its elements would have to be stored " +
       "differently, which takes a copy, and a write through the copy would no longer reach " +
-      "the original. Build it as "
+      "the original."
     let hint = containerWidenCopyHint(sT, dT)
-    let buildAs = dT
+    // The whole delivered value built at the type it flows into, as its own declaration
+    // spells it — every fix names a type the author can write at the source.
+    const buildFix = " Build the source as `" +
+      tyToStr(sourceBuildTy(dst)) +
+      "`"
     // An inner list spelled in the source (a literal's element or field) can still be copied
     // with `.map`; one reached only through a type is built at the outer type instead.
-    if through != "" && sX < 0 { hint = ", or build it as " + tyToStr(dst) }
+    const innerNamed = !(through != "" && sX < 0)
+    if !innerNamed { hint = "" }
     const pairNote = tyToStr(sT) + " is not " + tyToStr(dT) + through
+    let copyFix = buildFix
+    if hint != "" { copyFix = " Copy it" + hint.slice(12, hint.length) }
     if shapeAdaptNulCopy || shapeAdaptNestedCopy {
-      let gapFix = " Build it as " + tyToStr(dst)
-      if hint != "" && !(through != "" && sX < 0) {
-        gapFix = " Copy it" + hint.slice(12, hint.length)
-      }
-      tErr(pairNote + containerCopyGapWhy(shapeAdaptNulCopy) + gapFix, srcExpr)
+      tErr(pairNote + containerCopyGapWhy(shapeAdaptNulCopy) + copyFix, srcExpr)
       return 0
     }
     if shapeAdaptMapShared {
       tErr(
         pairNote +
-          ": a map never widens implicitly, and it has no read-only view, so every handle " +
-          "would share entries of two types. Build it as " +
-          tyToStr(dT) +
-          ", filling it from the source",
+          ": a map never widens a list it holds, and it has no read-only view, so every handle " +
+          "would share entries of two types." +
+          buildFix,
+        srcExpr,
+      )
+      return 0
+    }
+    if shapeAdaptRecField {
+      tErr(
+        pairNote +
+          ": a record is shared, not rebuilt, so its list field would have to change type in " +
+          "place, which no delivery does, readonly or not (D2100)." +
+          buildFix,
         srcExpr,
       )
       return 0
@@ -21046,12 +21334,8 @@ function objShapeAdapterlessErr(srcExpr: i32, src: i32, dst: i32) {
           tyToStr(ro) +
           "` for a read-only view"
         if hint != "" { fix = fix + hint }
-      } else if through != "" && sX < 0 {
-        fix = " Build it as " + tyToStr(dst)
-      } else if hint != "" {
-        fix = " Copy it" + hint.slice(12, hint.length)
       } else {
-        fix = " Build it as " + tyToStr(dst)
+        fix = copyFix
       }
       tErr(
         pairNote +
@@ -21062,10 +21346,7 @@ function objShapeAdapterlessErr(srcExpr: i32, src: i32, dst: i32) {
       )
       return 0
     }
-    if through != "" {
-      hint = ""
-      buildAs = dst
-    } else if containerWidenServed(sT, dT) {
+    if through == "" && containerWidenServed(sT, dT) {
       const wAt = covarValueWriteAt(covarRootName(sX), covarRootFrame(sX))
       let written = "nothing shows this list is never written, and a container that may be " +
         "written"
@@ -21077,16 +21358,14 @@ function objShapeAdapterlessErr(srcExpr: i32, src: i32, dst: i32) {
       rule = " here: " +
         written +
         " never widens implicitly. Its elements would have to be stored differently, which " +
-        "takes a copy, and a write would not reach both. Build it as "
+        "takes a copy, and a write would not reach both."
     }
+    // A pair reached through a literal spelled in the source is fixed at that inner value.
+    let fixes = buildFix
+    if through != "" && hint != "" { fixes = copyFix }
+    else if hint != "" { fixes = fixes + hint }
     tErr(
-      tyToStr(sT) +
-        " is not " +
-        tyToStr(dT) +
-        through +
-        rule +
-        tyToStr(buildAs) +
-        hint,
+      tyToStr(sT) + " is not " + tyToStr(dT) + through + rule + fixes,
       srcExpr,
     )
     return 0

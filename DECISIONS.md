@@ -3760,7 +3760,7 @@ check takes the BASE seed.
 where an `(i32 | null)[]`, an `(i32 | string)[]` or a nested `f64[][]` is declared, a `K[]` of a
 literal union where a `string[]` is, and a map whose key or value would widen are programs the
 language refuses, and the message says so: `i32[] is not (i32 | null)[]: a container never
-widens implicitly … Build it as (i32 | null)[], or copy it with .map((x): i32 | null => x)`.
+widens implicitly … Build the source as `(i32 | null)[]`, or copy it with `.map((x): i32 | null => x)``.
 The author writes the copy, or builds the container at the wide type from the start.
 
 **Only a `readonly` list is covariant** (second ruling, same day). A MUTABLE wider list is
@@ -3793,15 +3793,23 @@ function at the argument's own type, so `function total(xs) { … }` runs over a
 **Every fix a message prints builds, and a test applies each one.** The `readonly` fix names the
 whole destination (`readonly (readonly (C | null)[])[]` for a nested list) and is offered only
 when this checker accepts that spelling for this delivery; where no view builds — a copy under
-`| null` or nested in another list (D2196), a written source — the message offers `.map` or
-"build it as". `tests/vl_widen_hint_test.ts` reads each printed fix, applies it, and runs it.
+`| null` or nested in another list (D2196), a written source — the message offers `.map`, or
+"Build the source as `X`", X being the destination without its outer `readonly` and `| null`,
+the type the source's own declaration can take. `tests/vl_widen_hint_test.ts` reads each
+printed fix, applies it, runs it, and checks the element it delivers.
 
 **Scope.** The walk goes through nullables, unions, nested lists, record fields and function
-types, and a map is never covariant in a list-bearing key or value (it has no read-only view).
-Out of scope, each with its own owner: a record field widening with no list inside (`{x: i32}`
-into `{x: i32 | string}`, D2100/D2160 and the record rule below), and a map value widening with
-no list inside (`{[string]: C}` into `{[string]: C | null}`), which shares its entries and runs
-read-only while a write through the wider map is refused by the record rule's map arm.
+types. A map has no read-only view, so it refuses a list value or key whose element differs, and
+a view of a union or nullable element reached from a mutable list, since a view stored back
+through the wider map may itself view a narrower list; a list shared at its own element type
+(`{[string]: string[]}` into `{[string]: readonly string[]}`) passes. A record value is shared,
+not rebuilt, so a list field whose element differs is refused even into a `readonly` field
+(D2100 is the rebuild that would lower it). A literal `const` whose contents are stored into
+(`ls[0] = v`, `ls.push(v)`, `o.xs = v`) vouches for nothing and is judged at its own type. Out of
+scope, each with its own owner: a record field widening with no list inside (`{x: i32}` into
+`{x: i32 | string}`, D2100/D2160 and the record rule below), and a map value widening with no list
+inside (`{[string]: C}` into `{[string]: C | null}`), which shares its entries and runs read-only
+while a write through the wider map is refused by the record rule's map arm.
 
 **What it cost, measured before landing.** The distilled corpus lost `runs` in exactly 8 cells
 (`d773_readonly_*`, `d791_*`, `d822_*`, `d852_escape_*`), every one an annotated `Circle[]`
@@ -3811,7 +3819,13 @@ respelled with `readonly` destinations (the copy machinery they pin now serves `
 No `std` module is affected. A first cut that refused inferred sources too cost 620 corpus
 classes (12,170 census cells), all un-annotated literals, which is why inference stands aside.
 Keying the exemption on each list's origin, and extending the walk to maps and record fields,
-moved no further corpus cell.
+moved no further corpus cell. Over the 221 hand-written review probes of #3065 (two rounds),
+19 programs that ran on master are refused, every one a MUTABLE wider list — shared (`C[]` into
+`(C | null)[]`, 10) or copied (`i32[]` into `f64[]`/`i64[]`, `Circle[]` into `Shape[]`, 9) — at a
+binding, argument, record field, nested list or mutated `const`; each message names a fix that
+builds. In each, the list that widens is mutable at its own level (x2, `(readonly (C | null)[])[]`
+from `C[][]`, is the one with a view inside: its OUTER list is mutable, and a view stored into it
+reaches the `C[][]`).
 
 A method call's receiver is `self`'s argument and gets the same verdict in every spelling —
 `xs.f()`, `xs?.f()`, a generic `self`, and a receiver inside an un-annotated body, asked at
