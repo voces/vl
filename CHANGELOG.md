@@ -17,6 +17,22 @@ see **`DECISIONS.md`**.
   as a parameter, field or binding annotation is refused, as is storing a `never` value in an
   un-annotated binding, object field or list element. Inference never produces `never` — an
   un-annotated trapping function stays `void` (DECISIONS.md, "A call that never returns").
+- **Getters v1 — `get x(self: T): R`, a read-only property of a nominal type
+  (`property-access-design.md` §D3a, owner rulings F1(b)/F2(a)/F7/F8(a)/F9(a)).** `v.x` reads it
+  with no parentheses. Found only through the receiver's `new` type, in the module that declares
+  it (`export get` to reach it from another), never by name, so no import or local `x` can shadow
+  it; a field or built-in member wins, and a getter it would shadow is a declaration error. Never
+  structural (a getter satisfies no `{ x: T }` bound or record), never writable (`v.x = …` names
+  the getter), never a narrowing place, not readable through `?.`. The body is CHECKED:
+  loop-free, recursion-free (getter cycles included), allocation-free (no literal, string `+` or
+  interpolation), effect-free (writes only its own locals, reads no module `let`, no host call),
+  calling only pure intrinsics and other getters, with a non-boxing result and locals (value
+  unions and nullable scalars refused, the type named). The read is rewritten into a call before
+  emit: byte-identical to `x(v)` at every `-O` rung, one `extract_lane` for a lane getter, one
+  `struct.get` for a field getter. The flat-row pattern now reads `stack[i].tt` as written
+  (`flat-records-design.md` §9.1). Editor: `property` token with the `readonly` modifier,
+  `Property` completion, go-to-definition on the `get` declaration. Guide:
+  `docs/guide/getters.md`. `std:simd`'s `.x/.y/.z/.w` are a separate lane (after D1984).
 - **`std:simd` — the `F32x4` slice (SIMD S3, `simd-design.md` §G).** `F32x4` and `Mask32x4` are
   `new v128` brands; the module ships `splatF32`, `f32x4(x, y, z, w)`, unaligned
   `loadF32x4`/`storeF32x4` over a `Buf`, `+ - * /` (receiver-keyed operators, #3003) with named

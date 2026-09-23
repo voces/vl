@@ -53,6 +53,7 @@ export const SEMANTIC_TOKEN_TYPES = [
 
 export const SEMANTIC_TOKEN_MODIFIERS = [
   "declaration", // the defining occurrence (`isDecl`), vs a use
+  "readonly", // a getter read (`get x(self: T)`): a computed property that cannot be assigned
 ] as const;
 
 export const SEMANTIC_TOKEN_LEGEND = {
@@ -70,6 +71,7 @@ const TT = Object.fromEntries(
 ) as Record<(typeof SEMANTIC_TOKEN_TYPES)[number], number>;
 
 const DECLARATION_BIT = 1 << 0; // index 0 in SEMANTIC_TOKEN_MODIFIERS
+const READONLY_BIT = 1 << 1; // index 1 in SEMANTIC_TOKEN_MODIFIERS
 
 /**
  * One classified token span, in 0-based LSP coordinates. Spans are single-line
@@ -155,6 +157,8 @@ export type ExtMemberToken = {
   char: number;
   length: number;
   isMethod: boolean;
+  /** A getter read: still a `property`, carrying the `readonly` modifier. */
+  isGetter?: boolean;
 };
 
 /** External member tokens as {@link ClassifiedToken}s (the legend's method/property). */
@@ -169,7 +173,7 @@ const memberTokensFromExternal = (
       char: m.char,
       length: m.length,
       tokenType: m.isMethod ? TT.method : TT.property,
-      tokenModifiers: 0,
+      tokenModifiers: m.isGetter ? READONLY_BIT : 0,
     });
   }
   return out;
@@ -861,7 +865,7 @@ export const seedStatusView = (origin: SeedOriginInfo | null): SeedStatusView =>
  * `"keyword"` covers reserved words and soft keywords. `"snippet"` covers
  * multi-token skeleton expansions.
  */
-export type CompletionKind = BindingKind | "keyword" | "snippet";
+export type CompletionKind = BindingKind | "keyword" | "snippet" | "property";
 
 /** One completion candidate, runtime-agnostic; `server.ts` wraps it for LSP. */
 export type Completion = {
@@ -1128,6 +1132,7 @@ export type ExtMemberCompletion = {
   name: string;
   detail: string;
   isMethod: boolean;
+  isGetter?: boolean; // a getter, offered with the `property` completion kind
   doc?: string; // the field's `///` block, absent when it carries none
 };
 
@@ -1170,7 +1175,7 @@ export const memberCompletionsFromWasm = (
     if (byName.has(m.name)) continue;
     byName.set(m.name, {
       name: m.name,
-      kind: m.isMethod ? "function" : "variable",
+      kind: m.isMethod ? "function" : m.isGetter ? "property" : "variable",
       detail: isDisplayableType(m.detail) ? m.detail : undefined,
       // The field's `///` block (D9.11), rendered above the type block by `docMarkdown`
       // — the same layout hover uses. NOT filtered by `isDisplayableType`, which grades

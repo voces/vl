@@ -25,6 +25,10 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 VL="${VL:-scripts/vl-host/target/release/vl}"
+# The self-compile's collector is a CHOICE, not the size heuristic's accident: pinned so the
+# committed CPU baseline always prices the same collector (DECISIONS.md, "The compiler's
+# collector is picked by the size of the entry file").
+export VL_COMPILE_GC=null
 SEED="${SEED:-build/vl-compiler.wasm}"
 BASELINE="${BASELINE:-scripts/self-compile-baseline.json}"
 # Read from the baseline file, so the committed number and the committed band travel

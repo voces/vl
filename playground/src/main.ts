@@ -454,6 +454,7 @@ const COMPLETION_KIND: Record<lsp.CompletionItem["kind"], monaco.languages.Compl
   type: monaco.languages.CompletionItemKind.Struct,
   keyword: monaco.languages.CompletionItemKind.Keyword,
   snippet: monaco.languages.CompletionItemKind.Snippet,
+  property: monaco.languages.CompletionItemKind.Property,
 };
 
 monaco.languages.registerCompletionItemProvider(VL_LANGUAGE_ID, {
