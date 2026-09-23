@@ -6891,3 +6891,48 @@ environment. A value that does not parse, or is not UTF-8, is a hard error.
 
 **Revisit** when wasmtime grows a copying heap by survivor share: the default can then come back to
 64 MiB or below and take the RSS price with it.
+
+
+## A float literal is not a type; an integer literal type stays distinct from a float (owner, 2026-09-23) — D2221
+
+*The owner's ruling: remove float literal types (option c), and keep integer literal types
+distinct from floats (option b).*
+
+**THE RULE.** A float literal in a type position (`2.0`, `1.5`, `1e3`) is refused by `vl check`
+in every position that takes a type: a parameter, a return, a union member, an alias, a generic
+argument, an array element, a map value, a field, an `is` test, an `as`/`as?` target. The message states the rule and
+the fix:
+
+    a float literal cannot be a type: float equality is not set membership (`-0.0 == 0.0`, NaN
+    never equals itself, and rounding makes different spellings one value), so no `is` or `==`
+    could test the set it names. Write `f64` (or `f32`), or the integer literal `2` if an
+    integer was meant, in place of the float literal `2.0`
+
+A whole-number spelling names its integer; any other names "an integer literal". Float VALUES
+are untouched: a float literal expression has no literal type at all, so `const X = 2.5` is an
+`f64` (the const-literal inference of D2157/D2198 is string-only and stays so), and neither the
+impossible-compare refusal nor the `is`-overlap narrowing (D2205) has a float case left to meet.
+
+**THE PRECEDENT.** Python's PEP 586 (`Literal[...]`) admits ints, strings, bytes, bools, enums
+and `None`, and deliberately excludes floats, for the reason above: a literal type is a set whose
+membership is decided by equality, and float equality is not an equivalence on spellings. `0.0`
+and `-0.0` are equal and distinct; `NaN` is a member of no set, itself included; `0.1 + 0.2` is
+not `0.3`, and `1e0` and `1.0` are one value under two lexemes. A test against such a set cannot
+be both total and honest — D2221 was the concrete failure (`n: 1 | 2.0 | 3; n is 2.0 | 3` answered
+`false` for every value).
+
+**INTEGER LITERALS STAY DISTINCT FROM FLOATS.** `1 | 2 | f64` holds the integer `2` and the float
+`2.0` as different members; `is 2` dispatches on the member's rep before comparing values, so it
+holds for `2` and not for `2.0`. Nothing in the fix needed changing for that once the float
+literal member was gone: D2221's wrong answers were all the float member's membership compare.
+
+**THE MECHANISM, AND ONE REFUSAL SITE PER ROUTE.** The refusal banks its sentence on the
+unknown-type reason wire (`unkTyClash`, as `u8` does) at both annotation routes — the spelling
+tree and the name — so the positioned caller reports it once and nothing downstream sees a
+half-resolved union. `LitKind` lost its `"flt"` member.
+
+**THE PRICE, MEASURED.** 129 of the 2,094 tracked `.vl` files carrying a float lexeme are
+refused: 100 corpus cells (all minted by the census's `f64lit` rep, `type F = 1.5 | 2.5`) and 29
+`tests/cases` fixtures; none in `compiler/`, `std/` or other scripts. Of the corpus cells, 35
+graded `runs`: 21 only DECLARED `F` in a shared prelude and keep running with the line removed,
+and 14 used it and are design refusals now. `gencensus.py` keeps its `f64lit` level, because cell ids are sequential over the axes and dropping a level renumbers every block and orphans the committed named sets; those cells are now design refusals. `mkmatrix.py`, whose preludes only declared the alias, drops it.

@@ -56,6 +56,9 @@ REPS = {
     "str":     ("string", '"seven"', '""', '{X}.r == "seven"'),
     "strlit":  ("K", '"p"', '"q"', '{X}.r == "p"'),
     "numlit":  ("N", "1", "2", "{X}.r == 1"),
+    # A float literal is not a type (owner ruling, D2221), so every `f64lit` cell is a design
+    # refusal. The level stays: cell ids are sequential over the axes, and dropping it would
+    # renumber every block and orphan the committed named sets.
     "f64lit":  ("F", "1.5", "2.5", "{X}.r == 1.5"),
     "list":    ("i32[]", "[1, 2]", "[]", "{X}.r.length == 2"),
     "map":     ("{[string]: i32}", "mkI()", "Map()", "{X}.r.size == 1"),
