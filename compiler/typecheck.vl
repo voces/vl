@@ -27808,15 +27808,33 @@ function hoistMatchScrutinees(rootIx: i32) {
 // Post-order over the value children, so an inner match is recorded before the one holding it.
 function hmsWalk(ix: i32, anc: i32[]) {
   if ix < 0 || ix >= P.nodes.length { return 0 }
-  anc.push(ix)
-  const kids = nodeValueChildren(ix)
-  let i = 0
-  while i < kids.length {
-    hmsWalk(kids[i], anc)
-    i = i + 1
+  // An `else if` chain is walked along its spine, each link staying on the path (D1990).
+  let cur = ix
+  let links = 0
+  while cur >= 0 {
+    anc.push(cur)
+    links = links + 1
+    let kids = nodeValueChildren(cur)
+    if elseIfLink(cur) >= 0 { kids = nodeSpineChildren(cur) }
+    let i = 0
+    while i < kids.length {
+      hmsWalk(kids[i], anc)
+      i = i + 1
+    }
+    cur = elseIfLink(cur)
   }
-  anc.pop()
-  hmsNoteRebindable(ix)
+  while links > 0 {
+    const node = anc[anc.length - 1]
+    anc.pop()
+    links = links - 1
+    hmsNoteRebindable(node)
+    hmsRecordMatch(node, anc)
+  }
+  0
+}
+
+// Records match `ix` with a copy of its ancestor path when its scrutinee is computed.
+function hmsRecordMatch(ix: i32, anc: i32[]) {
   const n = P.nodes[ix]
   if n is MatchExpr {
     if !matchScrutInPlace(n.matchScrut) {
@@ -28030,13 +28048,32 @@ function hmsHolderWalked(anc: i32[], j: i32): boolean {
 // Whether the emitter walks the arms of the `if` or `match` at `anc[j]`: a statement of a walked
 // block, the initializer of a local, a `return` operand, or an `else` / arm of one that is.
 function hmsValueWalked(anc: i32[], j: i32): boolean {
-  if j < 1 { return false }
-  const e = anc[j]
-  const pn = P.nodes[anc[j - 1]]
-  if pn is Paren { return hmsValueWalked(anc, j - 1) }
-  if pn is IfStmt { return pn.ifElse == e && hmsValueWalked(anc, j - 1) }
-  if pn is MatchExpr { return pn.matchScrut != e && hmsValueWalked(anc, j - 1) }
-  hmsCarrierWalked(anc, j - 1)
+  // Climbs an `else if` chain by a loop, not by recursion (D1990).
+  let k = j
+  while k >= 1 {
+    const step = hmsValueStep(anc, k)
+    if step != 1 { return step == 2 }
+    k = k - 1
+  }
+  false
+}
+
+// One step of `hmsValueWalked` at `anc[k]`: 1 when it is its parent's value (a parenthesis,
+// an `else` link, a match arm) so the parent decides, 2 when the parent walks it, -1 when not.
+function hmsValueStep(anc: i32[], k: i32): i32 {
+  const e = anc[k]
+  const pn = P.nodes[anc[k - 1]]
+  if pn is Paren { return 1 }
+  if pn is IfStmt {
+    if pn.ifElse == e { return 1 }
+    return -1
+  }
+  if pn is MatchExpr {
+    if pn.matchScrut != e { return 1 }
+    return -1
+  }
+  if hmsCarrierWalked(anc, k - 1) { return 2 }
+  -1
 }
 
 // Whether `anc[i]` holds its child as a walked statement, or is a local's initializer or a
