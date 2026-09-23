@@ -8834,6 +8834,14 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
   if primNameOf(dstTy) == "i32" {
     if primNameOf(srcTy) == "boolean" && !isBoolLitExpr(srcExpr) { return true }
   }
+  // A `const` literal, or a join of them, read as `string`: a literal-typed destination takes it at
+  // the literal type it is, in a list or object literal exactly as at an argument (D2157).
+  if srcExpr >= 0 && srcExpr < wideLitByNode.length {
+    const uw = wideLitByNode[srcExpr]
+    if uw >= 0 && uw != srcTy {
+      if assignable(uw, dstTy) { return true }
+    }
+  }
   // A literal-typed destination: a bare literal flows wherever its literal type is a member (`"a"`
   // into `"a" | "b"`), even though its softened base (`string`) does not.
   if srcExpr >= 0 {
@@ -26232,6 +26240,9 @@ function finishInferredReturn(
     }
     if inferred != preAdopt { cbSeedUsed = cbSeedUsed + 1 }
   }
+  // A `const` literal returned is the `string` it is stored as, so a join with `null`, a number
+  // or a record meets the return floors below exactly as that string does (D2157).
+  inferred = widenLitTy(inferred)
   // Permissive fall-through (totality): an un-annotated function that can fall off the end
   // implicitly yields `null` there, so its inferred return widens to `T | null`. A box-able
   // value type lowers un-annotated via the `uBoxIdx` box; a niche (`boolean`/`string`) widens
@@ -34822,8 +34833,9 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
       if peekL >= 0 { lt = peekL }
     }
     // An operator reads a `const`'s literal as the `string` it is; the literal itself is
-    // `nodeWideStrLitText`'s to answer, so no operator rule changes for it (D2157).
-    lt = widenLitTy(lt)
+    // `nodeWideStrLitText`'s to answer, so no operator rule changes for it (D2157). A compare
+    // decides once both sides are known (`eqKeepsWideLit`).
+    if op != "==" && op != "!=" { lt = widenLitTy(lt) }
   }
   ltOut.push(lt)
   // Contextual typing for an assignment RHS: seed the LHS type so an un-annotated lambda
@@ -34846,7 +34858,17 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
       const peekR = arrDefOperandElemPeek(n.binRight)
       if peekR >= 0 { rt = peekR }
     }
-    rt = widenLitTy(rt)
+    if op == "==" || op == "!=" {
+      const keepL = eqKeepsWideLit(lt, rt)
+      const keepR = eqKeepsWideLit(rt, lt)
+      if !keepL {
+        lt = widenLitTy(lt)
+        ltOut[0] = lt
+      }
+      if !keepR { rt = widenLitTy(rt) }
+    } else {
+      rt = widenLitTy(rt)
+    }
     // A store's value reading the place it writes: the value is what the program said the
     // element is, and the read has no answer of its own until this pins one.
     if lt < 0 {
@@ -35437,9 +35459,9 @@ function constStrLitBound(n: LetDecl, initTy: i32): i32 {
   if n.letKw == "const" {
     const iN = P.nodes[n.letInit]
     if iN is StrLit { return mkWideStrLitTy(iN.strText, initTy) }
-    // `const Y = Z` is the same one literal; a join of several (`if c { Z } else { W }`) is
-    // recorded as the `string` its expression is, and binds as that.
-    if isWideLitTy(initTy) { return initTy }
+    // `const Y = Z` is the same one literal, and a join of several (`if c { Z } else { W }`)
+    // keeps its literal set, as the join does where it is written; both read as `string`.
+    if isWideLitJoin(initTy) { return initTy }
   }
   widenLitTy(initTy)
 }
@@ -35458,6 +35480,36 @@ function mkWideStrLitTy(lex: string, fallback: i32): i32 {
   while wideLitTyIxs.length <= lt { wideLitTyIxs.push(false) }
   wideLitTyIxs[lt] = true
   lt
+}
+
+// Whether a compare keeps operand type `x` at its `const` literal: only beside a literal-typed
+// other side (or its nullable) that the literal is a member of. Anywhere else it compares as the
+// `string` it is, so `MODE == "release"` over `const MODE = "debug"` stays a false test.
+function eqKeepsWideLit(x: i32, other: i32): boolean {
+  if !isWideLitJoin(x) { return false }
+  if other < 0 || isWideLitJoin(other) { return false }
+  if !isLitBearing(other) { return false }
+  if assignable(x, other) { return true }
+  const o = T.tys[other]
+  if o is TyNullable { return assignable(x, o.nInner) }
+  false
+}
+
+// Whether `ty` is a widening literal, or a union made only of them.
+function isWideLitJoin(ty: i32): boolean {
+  if isWideLitTy(ty) { return true }
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if t is TyUnion {
+    if t.uMembers.length == 0 { return false }
+    let i = 0
+    while i < t.uMembers.length {
+      if !isWideLitTy(t.uMembers[i]) { return false }
+      i = i + 1
+    }
+    return true
+  }
+  false
 }
 
 // Whether `ty` is a widening literal: a `const` inferred it and nobody declared it.

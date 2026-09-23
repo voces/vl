@@ -6684,7 +6684,10 @@ escape and the character it spells agree.
 widening literal: the type is minted fresh per binding and flagged, kept wherever the value is
 read, and widened to `string` where it is stored somewhere reassignable — a `let`, a list or
 object literal, a type argument, an operator operand, the element an empty container pins from
-it — and the widening is structural, through joins, function results, lists and maps. Without the widening,
+it — and the widening is structural, through joins, function results, lists and maps. A
+function's inferred return widens as well. Where the value flows into a literal-typed destination
+(an argument, a binding, an annotated list or object literal element) it is taken at the literal
+type it has, and a `const` bound to a join of constants keeps the join's literal set. Without the widening,
 `let s = Z; s = "other"`, `[Z].push("w")` and `wrap(Z).push("other")` all stop checking. The
 recorded node type is the widened `string`, so no emitter classifier sees a literal it never
 saw before; `nodeWideStrLitText` is the one question the literal answers. Scope, as ruled: a

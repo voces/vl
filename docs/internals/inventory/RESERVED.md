@@ -65,4 +65,3 @@ D2093-D2099  vl-11  2026-09-22  getter diagnostics follow-ups (G3 field-bound me
 D2110-D2119  vl-11  2026-09-23  function-list calls (PR #3050)
 D2120-D2129  vl-11  2026-09-23  getter step budget lane (D2061-D2063 residue; D2120 filed)
 D2135-D2144  vl-11  2026-09-23  effects summary s1 (getters call qualifying functions)
-D2167-D2168  vl-11  2026-09-23  #3056 review residue (D2167 filed; D2168 spare)
