@@ -1,7 +1,7 @@
 # Streaming and positional file output in `std:fs` — design, ruled
 
-**Status: RULED (owner, 2026-09-23), not yet built.** The six questions in §6 are answered,
-and §5 is the surface they settle, with its build items. §1–§4 are the proposal as the owner
+**Status: RULED (owner, 2026-09-23) and BUILT** (#3064, and `appendTextFile` after it). The
+six questions in §6 are answered, and §5 is the surface they settle, with its build items. §1–§4 are the proposal as the owner
 read it and are kept as the record. The ruled surface is not the one §4 recommended: no
 `…From` names, an `appendFile`, and contiguous writes only.
 Consumer: plumb (`~/plumb/docs/vl-issues.md` PL-020, and the queued PL-009 "streaming I/O").
@@ -211,7 +211,8 @@ export function writeFileRangeFrom(
 
 ## 5. The ruled surface
 
-**Three write names, each taking `u8[] | Buf`, plus one view helper in `std:buffer`.**
+**Three write names, each taking `u8[] | Buf`, plus one view helper in `std:buffer`**, and
+one text sibling, `appendTextFile`, ruled after the build (§6 Q7).
 
 | | whole file | at a file offset (contiguous) | at the end |
 | --- | --- | --- | --- |
@@ -238,6 +239,11 @@ export function writeFileRange(path: string, offset: i64, data: u8[] | Buf): IoR
 // again appends again, so begin with `writeFile(path, [])` when the file should hold only
 // this run's output.
 export function appendFile(path: string, data: u8[] | Buf): IoResult
+
+// Add `text` encoded as UTF-8 to the end of the file, as `appendFile` does. Running the
+// same program again appends again, so begin with `writeTextFile(path, "")` when the file
+// should hold only this run's output. Encoding cannot fail, so this adds no failure mode.
+export function appendTextFile(path: string, text: string): IoResult
 
 // std:buffer
 // The `len` bytes of `self` from byte `off`, as a `Buf` over the same memory, not a copy.
@@ -376,6 +382,16 @@ if the change is documented.
 **Q5 — A truncate primitive.** **RULED (owner, 2026-09-23): (a) none.** Why:
 `writeFile(path, [])` starts a file fresh, and a file that must end shorter is written fresh.
 
+**Q7 — `appendTextFile`.** **RULED (owner, 2026-09-23): add it**, as
+`appendTextFile(path: string, text: string): IoResult`, mirroring `writeTextFile`: UTF-8,
+the `IoResult` channel, the empty-path `EINVAL` answered under its own name, and every other
+failure reported by the byte function it delegates to (`fs.appendFile …`), as
+`writeTextFile`'s are by `fs.writeFile`. Why: Q2's justification is logs, and logs are text;
+an append of whole strings never splits a character. Its comment carries `appendFile`'s
+non-idempotence warning, with `writeTextFile(path, "")` as the fresh start. A byte range
+still has no text sibling, since one can split a character, and the header's text line now
+says so: "text is UTF-8, whole or appended, never a byte range".
+
 ---
 
 ## 7. std API self-review of the ruled surface (`std-api-review.md`)
@@ -485,12 +501,12 @@ missing `From` mirror of `Into`.
 all five deviations above adequately justified. The missing `From` mirror of `Into` is
 invisible to a caller, so it belongs in `std-notes.md` only.
 
-1. **`appendTextFile` — OPEN, for the owner.** Q2's justification is logs, and logs are
+1. **`appendTextFile` — RULED (owner, 2026-09-23): add** (§6 Q7). Q2's justification is logs, and logs are
    text. `writeTextFile` sets the pattern of a text sibling for a whole-file write, and an
    append of whole strings never splits a character. The reviewer asks for either
    `appendTextFile(path: string, text: string): IoResult` or a header line refusing it:
-   saying nothing will not pass. This doc does not decide it, because the rulings named
-   exactly three write names. The build does not start until it is decided.
+   saying nothing will not pass. The owner ruled for the sibling after #3064 landed the three
+   byte writes.
 2. **`std:buffer` header line 7 goes stale.** Fixed in build item 5.
 3. **Name: `window`.**
    - `u8view` promises `[]` indexing it does not have, and breaks the view family's
