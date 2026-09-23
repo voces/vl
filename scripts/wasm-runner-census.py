@@ -48,6 +48,8 @@ CLASSIFIED = {
                                  "host-owned env.memory: shape, heap window, two linked units"),
     "vl_instance_state_leak_test.ts": ("standalone", "seed (in-process, shared instance)",
                                        "emission byte-identity vs a fresh-instance oracle"),
+    "vl_large_output_test.ts": ("standalone", "native vl build",
+                                "a 9.6 MB module read out whole: V8 runs it and prints the sum"),
     "vl_reexport_abi_test.ts": ("standalone", "native vl build",
                                 "EXPORT section aliases the public name"),
     "vl_std_process_test.ts": ("standalone", "native vl build",
