@@ -6,6 +6,7 @@
 
 import { f32Bytes, f64Bytes, gIeeeOverflow } from "./emit_bignum"
 import {
+  ByteRope,
   MfKind,
   VKind,
   W,
@@ -252,7 +253,7 @@ const VT_ANYREF = 0x6e
 // Redirect the writer at `buf`; return the PREVIOUS current buffer so the caller
 // can restore it (closure-free save/restore — replaces threading `body`/`payload`
 // through every helper).
-export function wTarget(buf: i32[]) {
+export function wTarget(buf: u8[]) {
   const prev = curBuf
   curBuf = buf
   prev
@@ -302,10 +303,20 @@ export function wDropBack(n: i32) {
   0
 }
 // Append every byte of `bs` in order to the current buffer.
-export function wBytes(bs: i32[]) {
+export function wBytes(bs: u8[]) {
   let i = 0
   while i < bs.length {
     wU8(bs[i])
+    i = i + 1
+  }
+  0
+}
+// Append the low 8 bits of each value of `vs`, for the encoders that return their bytes as
+// an `i32[]` (`f64Bytes`/`f32Bytes`, which the checker shares).
+function wI32Bytes(vs: i32[]) {
+  let i = 0
+  while i < vs.length {
+    wU8(vs[i])
     i = i + 1
   }
   0
@@ -366,13 +377,72 @@ export function wName(s: string) {
 }
 // ── section framing ─────────────────────────────────────────────────────────
 // A section is: id byte, then ULEB(byte-length of payload), then payload. The payload
-// is built eagerly into a temporary `i32[]`, then framed onto the current buffer — no
-// backpatching, no closures or builder objects.
-export function wSection(id: i32, payload: i32[]) {
-  wU8(id)
-  wULEB(payload.length)
-  wBytes(payload)
+// is built eagerly into a buffer of its own; framing appends the header and the payload
+// to the module rope `W` as two chunks, without copying the payload.
+export function wSection(id: i32, payload: u8[]) {
+  ropePush(W, sectionHead(id, payload.length))
+  ropePush(W, payload)
   0
+}
+// The same framing over a payload that is itself a rope (the code section), whose chunks
+// join the module's in order.
+export function wSectionRope(id: i32, payload: ByteRope) {
+  ropePush(W, sectionHead(id, payload.len))
+  let c = 0
+  while c < payload.chunks.length {
+    ropePush(W, payload.chunks[c].b)
+    c = c + 1
+  }
+  0
+}
+// A section's id byte and ULEB payload length, as a buffer of their own.
+function sectionHead(id: i32, n: i32): u8[] {
+  const head: u8[] = []
+  const prev = wTarget(head)
+  wU8(id)
+  wULEB(n)
+  wTarget(prev)
+  head
+}
+// ── byte ropes ──────────────────────────────────────────────────────────────
+// Append `bs` to `r` as a chunk of its own, uncopied; the caller must not write to `bs`
+// afterwards. An empty buffer adds nothing, and nothing is added once the emit has failed,
+// so a partial module never reaches the host.
+export function ropePush(r: ByteRope, bs: u8[]) {
+  if emitFailed { return 0 }
+  if bs.length == 0 { return 0 }
+  r.chunks.push({ b: bs })
+  r.len = r.len + bs.length
+  0
+}
+// Empty `r`, and forget the read cursor `ropeSeek` keeps in it.
+export function ropeReset(r: ByteRope) {
+  r.chunks = []
+  r.len = 0
+  r.seekChunk = 0
+  r.seekBase = 0
+  0
+}
+// The index of the chunk holding byte `i` of `r`, leaving `r.seekBase` at that chunk's
+// first byte; `-1` when `i` is outside `0..r.len-1`. A forward sequential read costs O(1)
+// per call, since the search starts from the previous answer.
+export function ropeSeek(r: ByteRope, i: i32): i32 {
+  if i < 0 || i >= r.len { return -1 }
+  if r.seekChunk >= r.chunks.length || i < r.seekBase {
+    r.seekChunk = 0
+    r.seekBase = 0
+  }
+  while i >= r.seekBase + r.chunks[r.seekChunk].b.length {
+    r.seekBase = r.seekBase + r.chunks[r.seekChunk].b.length
+    r.seekChunk = r.seekChunk + 1
+  }
+  r.seekChunk
+}
+// Byte `i` of `r`, or `-1` when `i` is out of range.
+export function ropeAt(r: ByteRope, i: i32): i32 {
+  const c = ropeSeek(r, i)
+  if c < 0 { return -1 }
+  r.chunks[c].b[i - r.seekBase]
 }
 // ── control flow / locals / consts (the universal base — Phase B) ─────────────
 // local.get / local.set / local.tee: 0x20/0x21/0x22 <localidx-uleb>.
@@ -474,7 +544,7 @@ export function fbI64ExtendI32S() {
 // backstop on any unchecked path, using the same flag and encoder so the two agree.
 export function fbF64Const(text: string) {
   wU8(OP_F64_CONST) // 0x44 f64.const
-  wBytes(f64Bytes(text))
+  wI32Bytes(f64Bytes(text))
   if gIeeeOverflow {
     return emitFail("emitProgram: float literal overflows f64: " + text)
   }
@@ -490,7 +560,7 @@ export function fbF64ConvertI32S() {
 // Same overflow backstop as `fbF64Const`, at the f32 range.
 export function fbF32Const(text: string) {
   wU8(OP_F32_CONST) // 0x43 f32.const
-  wBytes(f32Bytes(text))
+  wI32Bytes(f32Bytes(text))
   if gIeeeOverflow {
     return emitFail("emitProgram: float literal overflows f32: " + text)
   }
@@ -965,7 +1035,7 @@ export function emitFailAt(msg: string, at: i32) {
     emitErr = msg
     emitErrAt = at
   }
-  W.bytes = []
+  ropeReset(W)
   -1
 }
 // Per-slot type accessors, each answering for the mono map on slot < 0 so callers
@@ -1425,7 +1495,7 @@ export function fbLocalsCount(nLocals: i32) {
 // per declared local, then the scratch frames in `fbBeginFunc`'s layout order. Every
 // frame that walk hands a named base out for is checked here against the runs written so
 // far (`fbFrameAt`), so the third walk cannot drift from the two it must agree with.
-export function fbEmitLocalsVec(body: i32[], nLocals: i32) {
+export function fbEmitLocalsVec(body: u8[], nLocals: i32) {
   const prev = wTarget(body)
   fbRunsWritten = 0
   wULEB(fbLocalsCount(nLocals))
