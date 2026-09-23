@@ -28,6 +28,19 @@ see **`DECISIONS.md`**.
   `effectsDump` export pins the summaries in `tests/vl_effects_summary_test.ts`. The body-shape
   test follows calls, so a helper a getter reaches is held to no loop and no allocation too.
   Programs without getters compile byte-identically.
+- **A container never widens implicitly (owner ruling 2026-09-23).** The refusal of
+  `i32[]` → `f64[]` when written, and of every storage-changing element or map pair
+  (`i32[]` → `(i32 | null)[]`, `K[]` → `string[]`, `{[string]: i32}` → `{[string]: f64}`), read
+  "type-valid … not yet supported by codegen"; it is now a design refusal that names the rule
+  and the copy to write (`i32[] is not f64[]: a container never widens implicitly … copy it with
+  .map((x) => x as f64)`), and leaves `goal-scoreboard.py`'s concession count (23 → 22). A
+  765-cell grid (29 element pairs × 9 positions × read / write-wide / write-original) moved zero
+  verdicts. It filed five rows: D2160 (an annotated record into a wider union field, invalid
+  wasm), D2161 (a class-keeping widening shares the list, so a `null` written through the wide
+  handle traps the narrow one), D2162 (the read-only copy licensed at a `return` although the
+  argument is written after), D2163 (push / index / map stores take the licence and lower no
+  copy), D2164 (`[...a]` into a wider element, invalid wasm). DECISIONS.md §"No implicit
+  container widening" lists the widenings that still run and are the owner's to decide.
 - **A getter body is held to a step budget, a string-literal compare is priced, and a float `%`
   is refused (D2061, D2062, D2063).** The contract counted loops, so nine loop-free getters each
   reading the previous one four times passed and did 65,536 calls behind one `.a8`. The checker

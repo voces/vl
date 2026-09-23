@@ -15074,9 +15074,9 @@ function objFieldNameSetsEq(src: i32, dst: i32): boolean {
 }
 
 // The wasm element storage class a container's element (or map key/value) type lowers to.
-// Two element types in different classes make two unrelated container wasm types, so there
-// is no element-converting copy to insert; widening is free whenever the class holds (a ref
-// or niche-nullable element costs nothing), but a class change has no lowering. `ESC_UNKNOWN` always declines.
+// Two element types in different classes make two unrelated container wasm types, so only a
+// copy could relate them, and a container does not widen by copying (DECISIONS.md §"No
+// implicit container widening"). A kept class costs nothing. `ESC_UNKNOWN` always declines.
 const ESC_UNKNOWN = 0
 const ESC_I32 = 1
 const ESC_I64 = 2
@@ -17607,6 +17607,30 @@ function objDroppedFieldList(src: i32, dst: i32) {
   out
 }
 
+// The explicit copy the element-storage refusal suggests. A list converts each element with
+// `.map`, a numeric one through `as` and any other through an annotated callback return; a
+// map has no `.map`, so it gets the closing clause alone.
+function containerWidenCopyHint(src: i32, dst: i32): string {
+  const s = T.tys[src]
+  const d = T.tys[dst]
+  if s is TyArray {
+    if d is TyArray {
+      const de = tyToStr(d.aElem)
+      if elemClassIsNumeric(s.aElem) && elemClassIsNumeric(d.aElem) {
+        return ", or copy it with `.map((x) => x as " + de + ")`"
+      }
+      return ", or copy it with `.map((x): " + de + " => x)`"
+    }
+  }
+  ", filling it from the source"
+}
+
+// Is `ty` stored as one of the four numeric element classes?
+function elemClassIsNumeric(ty: i32): boolean {
+  const c = elemStoreClassOf(ty, 8)
+  c == ESC_I32 || c == ESC_I64 || c == ESC_F32 || c == ESC_F64
+}
+
 // The message for an `objShapeAdapterless` pair. Names the object pair that has no lowering
 // and the fields that make it one, not the container that carried it (reported separately),
 // then the two ways out: a constructor is built at the shape it flows into, or the source
@@ -17649,20 +17673,19 @@ function objShapeAdapterlessErr(srcExpr: i32, src: i32, dst: i32) {
     )
     return 0
   }
+  // A design rule, not a missing lowering: a container never widens implicitly (DECISIONS.md
+  // §"No implicit container widening"), so the message names the rule and the copy to write.
   if shapeAdaptElemPair {
-    tErrUnsupported(
-      "a value of type " +
-        tyToStr(sT) +
-        " flowing into " +
+    tErr(
+      tyToStr(sT) +
+        " is not " +
         tyToStr(dT) +
         through +
-        " changes how the ELEMENT is stored: type-valid (the element type widens) but " +
-        "not yet supported by codegen — a container's wasm type is fixed by its element's " +
-        "storage, so these are unrelated types and no element-converting copy exists. " +
-        "Build the container at " +
+        ": a container never widens implicitly. Its elements would have to be stored " +
+        "differently, which takes a copy, and a write through the copy would no longer " +
+        "reach the original. Build it as " +
         tyToStr(dT) +
-        " (a literal is built at the type it flows into), or declare the source as " +
-        tyToStr(dT),
+        containerWidenCopyHint(sT, dT),
       srcExpr,
     )
     return 0
