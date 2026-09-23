@@ -545,7 +545,7 @@ Four exports, one loop shape, no new language surface:
 
 | export | accumulator | who feeds it |
 | --- | --- | --- |
-| `srcLoad(count)` | `vcCodes` | `vl build`/`run` on an import-free file |
+| `srcLoad(count)` | `vcAcc` | `vl build`/`run` on an import-free file |
 | `modKeyLoad(count)` | `modKeyAcc` | the H3 module fetch loop (keys) |
 | `modSrcLoad(count)` | `modSrcAcc` | the H3 module fetch loop (**the self-compile**) |
 | `cliResultLoad(count)` | `cliResultAcc` | the CLI pump's `CMD_READ_FILE` (**`vl check`/`fmt`/`test`**) |

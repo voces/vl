@@ -27,3 +27,71 @@ export function cpCount(s: string) {
   for cp in s { n = n + 1 }
   n
 }
+
+// A host-fed code-point stream, held as strings of at most `CP_CHUNK` code points
+// plus an unflushed tail. One `i32[]` over a whole source outgrows the engine's
+// largest single allocation (64 MiB, 16M code points) long before the source string
+// itself does (D1975).
+export type CpAcc = { tail: i32[], chunks: string[] }
+const CP_CHUNK = 1048576
+
+export function cpAccNew(): CpAcc { { tail: [], chunks: [] } }
+
+export function cpAccPush(a: CpAcc, cp: i32) {
+  a.tail.push(cp)
+  if a.tail.length >= CP_CHUNK { cpAccFlush(a) }
+}
+
+// Appends the `count` UTF-32LE code points the host staged at linear memory 0 — the
+// `<name>Load` half of the host's `StrIn` ABI (`driver.srcLoad`).
+export function cpAccLoad(a: CpAcc, count: i32) {
+  let i = 0
+  while i < count {
+    cpAccPush(a, __load_i32__(i * 4))
+    i = i + 1
+  }
+}
+
+function cpAccFlush(a: CpAcc) {
+  const cps = a.tail
+  if cps.length == 0 { return }
+  a.chunks.push(fromCodePoints(cps))
+  a.tail = []
+}
+
+export function cpAccEmpty(a: CpAcc): boolean {
+  a.tail.length == 0 && a.chunks.length == 0
+}
+
+// The whole stream as one string. Idempotent: the joined string replaces the chunks,
+// so a second call copies nothing. Joined pairwise, so each byte is copied once per
+// level (log2 of the chunk count) rather than once per chunk.
+export function cpAccString(a: CpAcc): string {
+  cpAccFlush(a)
+  if a.chunks.length == 0 { return "" }
+  let cur = a.chunks
+  while cur.length > 1 {
+    const next: string[] = []
+    let i = 0
+    while i + 1 < cur.length {
+      next.push(cur[i] + cur[i + 1])
+      i = i + 2
+    }
+    if i < cur.length { next.push(cur[i]) }
+    cur = next
+  }
+  a.chunks = cur
+  cur[0]
+}
+
+// `cpAccString`, leaving the accumulator empty for the next stream.
+export function cpAccTake(a: CpAcc): string {
+  const s = cpAccString(a)
+  cpAccReset(a)
+  s
+}
+
+export function cpAccReset(a: CpAcc) {
+  a.tail = []
+  a.chunks = []
+}
