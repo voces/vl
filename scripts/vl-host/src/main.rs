@@ -477,6 +477,10 @@ program verbatim — the only way to pass one that starts with `-`.
 {b}Environment:{r}
   {c}VL_GC{r}               Collector for the program: auto (default) | tracing |
                       refcount | none
+  {c}VL_GC_HEAP{r}          The program's first GC heap size, in bytes or with a K,
+                      M or G suffix (default 256M; 64M under --batch; 8M per
+                      `vl test` worker). Larger collects less often and
+                      commits more memory
   {c}VL_COMPILE_GC{r}       Collector for the compiler: auto (default: null when the
                       ENTRY FILE is under 1.5 MiB, copying at or above; imports do
                       not count) | null | copying
@@ -965,13 +969,51 @@ fn gc_engine(collector: Collector, initial: u64) -> Result<Engine> {
     Engine::new(&cfg)
 }
 
-/// `vl run` and `vl run --batch`: one store per process, so it can afford the size at
-/// which the decoder's collection count flattens.
-const RUN_GC_HEAP_INITIAL: u64 = 64 << 20;
+/// `vl run`: one store per process. wasmtime grows a copying heap only when the live set
+/// nearly fills a semispace, so every collection re-copies the whole live set; 256 MiB
+/// is where plumb's decoder (a 5.6 MB live set) stops getting faster. The price: a
+/// program that allocates 256 MiB in total commits about that much.
+/// docs/internals/perf/gc-heap-policy-2026-09.md.
+const RUN_GC_HEAP_INITIAL: u64 = 256 << 20;
+
+/// `vl run --batch`: a fresh store per case, so every case that allocates past the heap
+/// faults in a heap of its own; at 256 MiB that cost a batch 45% of its wall time.
+const BATCH_GC_HEAP_INITIAL: u64 = 64 << 20;
 
 /// `vl test`: one store per worker and one worker per core, so the per-store price is
 /// multiplied; 8 MiB keeps most of the CPU win at a fraction of the memory.
 const TEST_GC_HEAP_INITIAL: u64 = 8 << 20;
+
+/// The user-program store's first GC heap size: `$VL_GC_HEAP` when set (bytes, or a
+/// number with a `K`, `M` or `G` binary suffix, e.g. `64M`), else `default`. An
+/// unparsable value is a hard error, as `$VL_GC`'s is, so a typo cannot quietly run
+/// at the default.
+fn gc_heap_initial(default: u64) -> Result<u64> {
+    match std::env::var("VL_GC_HEAP").ok().as_deref() {
+        None | Some("") => Ok(default),
+        Some(v) => parse_byte_size(v).ok_or_else(|| {
+            Error::msg(format!(
+                "unknown $VL_GC_HEAP `{v}` (bytes, or a number with a K, M or G suffix, at most 4G)"
+            ))
+        }),
+    }
+}
+
+/// `1234`, `64K`, `256M`, `1G` (binary multiples, either case); `None` for anything
+/// else, and for a size past the GC heap's 4 GiB index space.
+fn parse_byte_size(v: &str) -> Option<u64> {
+    let (digits, shift) = match v.as_bytes().last()?.to_ascii_uppercase() {
+        b'K' => (&v[..v.len() - 1], 10),
+        b'M' => (&v[..v.len() - 1], 20),
+        b'G' => (&v[..v.len() - 1], 30),
+        _ => (v, 0),
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let bytes = digits.parse::<u64>().ok()?.checked_mul(1u64 << shift)?;
+    (bytes <= 1 << 32).then_some(bytes)
+}
 
 /// Copying-collector cycles in the current process, counted only while
 /// `$VL_GC_STATS=1` (`maybe_install_gc_stats`). A debug facility for the C1
@@ -4599,7 +4641,7 @@ fn run_batch(args: &[String]) -> Result<()> {
     let compiler = resolve_compiler(compiler);
 
     let compile_engine = seed_engine(Collector::Null)?;
-    let run_engine = gc_engine(run_collector()?, RUN_GC_HEAP_INITIAL)?;
+    let run_engine = gc_engine(run_collector()?, gc_heap_initial(BATCH_GC_HEAP_INITIAL)?)?;
     let module = load_compiler_module(&compile_engine, &compiler)?;
     // Pre-link once; `instantiate_pre` re-checks nothing per case.
     let pre = from_compiler(Linker::new(&compile_engine).instantiate_pre(&module))?;
@@ -5273,7 +5315,7 @@ fn run_cmd(args: &[String]) -> Result<()> {
         "vl run <file.vl> -- -v\n",
         "       `vl help run` shows the full flag list",
     );
-    let run_engine = gc_engine(run_collector()?, RUN_GC_HEAP_INITIAL)?;
+    let run_engine = gc_engine(run_collector()?, gc_heap_initial(RUN_GC_HEAP_INITIAL)?)?;
     let gc_stats = maybe_install_gc_stats();
     // The program's print output goes to THIS process's stdout, so stdout is the
     // stream the auto rule asks about — a `vl run p.vl > log` is escape-free even
@@ -5655,7 +5697,7 @@ fn test_engine(slot: &mut Option<Engine>) -> Result<Engine> {
     if let Some(engine) = slot {
         return Ok(engine.clone());
     }
-    let engine = gc_engine(run_collector()?, TEST_GC_HEAP_INITIAL)?;
+    let engine = gc_engine(run_collector()?, gc_heap_initial(TEST_GC_HEAP_INITIAL)?)?;
     *slot = Some(engine.clone());
     Ok(engine)
 }
