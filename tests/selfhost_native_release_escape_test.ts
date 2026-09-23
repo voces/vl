@@ -11,7 +11,9 @@
 // The CONTROL runs each rung's passes without the step and must find a `struct.new` left:
 // otherwise a fixture binaryen would have scalarised anyway passes whether or not the step
 // exists. `escapes.vl` is output-only — its structs are returned, captured and stored, so
-// their allocations must survive.
+// their allocations must survive. `cycle-helpers.vl` is BOUNDED: its helpers call one another
+// in a cycle, which the step must leave alone, so each optimized module stays within
+// `MAX_GROWTH` times the plain build (inlining the cycle unrolled it to hundreds of KB).
 //
 // @test-timing opt
 import {
@@ -30,7 +32,10 @@ const FIXTURES: [string, boolean][] = [
   ["state-helpers", true],
   ["identity-alias", true],
   ["escapes", false],
+  ["cycle-helpers", false],
 ];
+const BOUNDED = new Set(["cycle-helpers"]);
+const MAX_GROWTH = 2;
 const RUNGS: [string, string][] = [["-O", "OPT_PASSES"], ["-O3", "RELEASE_PASSES"]];
 
 const allocations = (wat: string): number => (wat.match(/\(struct\.new/g) ?? []).length;
@@ -79,6 +84,17 @@ for (const [fx, melts] of FIXTURES) {
               `${fx} ${rung}: the optimized module prints something else\n` +
                 `  want: ${JSON.stringify(want)}\n  got:  ${JSON.stringify(got)} rc=${r.code}`,
             );
+          }
+          if (BOUNDED.has(fx)) {
+            const plainSize = Deno.statSync(plain).size;
+            const size = Deno.statSync(out).size;
+            if (size > MAX_GROWTH * plainSize) {
+              throw new Error(
+                `${fx} ${rung}: the optimized module is ${size} bytes against ${plainSize} plain\n` +
+                  `  want: at most ${MAX_GROWTH}x — no helper in a call cycle may be inlined\n` +
+                  "  got:  a cycle was inlined and unrolled",
+              );
+            }
           }
           if (!melts) continue;
           const left = allocations(Deno.readTextFileSync(`${tmp}/m${rung}.wat`));

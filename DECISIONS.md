@@ -6809,14 +6809,37 @@ not `memOperand` or `finish`, and one un-inlined helper is enough to pin it.
    function only through a call or a return, which is what makes it per-call state;
 2. are called from a function that allocates that type, or from a chosen callee that takes it
    (a fixpoint, so `memOperand` → `byte` is followed);
-3. are at most 320 body bytes (`ESCAPE_INLINE_MAX_BYTES`), not directly recursive, and neither
-   run-once code nor called from it, so the step never undoes lane L8.
+3. are at most 320 body bytes (`ESCAPE_INLINE_MAX_BYTES`), in no call cycle (a strongly
+   connected component of the direct call graph with more than one member, or a self-call),
+   and neither run-once code nor called from it, so the step never undoes lane L8;
+4. hand the struct type they take to no function that is not chosen — the struct would escape
+   there anyway, so inlining them buys nothing.
 
-It then runs `wasm-opt --no-inline=<every other function> -aimfs 100000 --inlining` and the rung
-as before on the result, with the run-once marks re-read off that result (inlining renumbers
-functions). Which allocations actually leave the heap is still binaryen's escape analysis; the
-host decides only what is worth inlining for it. A module with no chosen callee skips the step
-and builds byte-identically: the compiler at both rungs and all 86 programs under `bench/`.
+Two bounds keep the step's growth in proportion: a chosen callee with its own chosen callees
+inlined may be at most 4,096 bytes (`ESCAPE_INLINE_EXPANDED_BYTES`), and a module whose chosen
+callees would grow the code by more than 64 KiB plus half its size gets no step.
+
+**A call cycle is never chosen.** The first version excluded only a function that calls itself.
+Mutually recursive helpers that take the struct were all chosen, and binaryen, told to inline
+them at any size, unrolled the cycle to its iteration limit while the struct stayed live across
+the recursion: a 12-helper cycle (1.7 KB of source) grew from 1,520 to 1,448,761 bytes and took
+55 s at `-O`, and `tests/fixtures/opt-escape/cycle-helpers.vl`'s 4-helper cycle grew from 457
+to 376,477 bytes. The escape test now bounds that fixture's module at twice the plain build.
+
+**One `--no-inline` pass, not one per function.** Binaryen runs each `--no-inline=<pattern>` as
+its own pass over every function, so marking all but the chosen few cost `marks × functions`:
+7,999 marks on 8,000 functions took 1.95 s native and 5.2 s with the npm build (measured in
+review). The host
+instead renames the step's input — `L4c.<index>` for a chosen callee, `L4n.<index>` for every
+other function — and passes the one pattern `--no-inline=L4n.*`, then gives every function back
+its own name (or none) before the rung runs. On a generated 8,000-function program `-O` costs
+3.24 s native against master's 3.42 s and the first version's 4.38 s (npm: 4.10, 3.56, 6.46).
+
+The rung then runs as before on the result, with the run-once marks re-read off that result
+(inlining renumbers functions). Which allocations actually leave the heap is still binaryen's
+escape analysis; the host decides only what is worth inlining for it. A module with no chosen
+callee skips the step and builds byte-identically: the compiler at both rungs and all 86
+programs under `bench/`.
 
 **Measured** on plumb's `decode-bench` (war3.exe, 6,964,856 instructions per pass), CPU seconds per
 pass, median of 9 interleaved rounds of 3 passes, load 2–5, binaryen 133. V8 is node 24 through a
