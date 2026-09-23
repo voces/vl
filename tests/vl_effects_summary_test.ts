@@ -95,6 +95,8 @@ const SRC = [
   /* 63 */ "}",
   /* 64 */ 'print(useAdd("x"))',
   /* 65 */ "print(useRem(3.0) + (readsTable(0) + readsCount() + viaLiteral({ a: 1 }) + useOp({ q: 1 }).q) as f64)",
+  /* 66 */ "function addPrintLast<T>(a: T, b: T): T { const v = a + b; print(1); v }",
+  /* 67 */ "function addPrintFirst<T>(a: T, b: T): T { print(1); const v = a + b; v }",
   "",
 ].join("\n");
 
@@ -102,7 +104,7 @@ const NONE = "writes: none · reads: none · allocates: no";
 const WANT = [
   `clamp01: ${NONE} · cost: 0 steps · I/O: none`,
   `inferred: ${NONE} · cost: 0 steps · I/O: none`,
-  "same: writes: unknown (`==` over an unbound type parameter at line 8) · reads: unknown (`==` over an unbound type parameter at line 8) · allocates: yes (`==` over an unbound type parameter at line 8) · cost: unbounded (it applies `==` over an unbound type parameter at line 8) · I/O: unknown (`==` over an unbound type parameter at line 8)",
+  "same: writes: unknown · reads: unknown · allocates: unknown · cost: unbounded · I/O: unknown, because it applies `==` over an unbound type parameter at line 8",
   `same<T = i32>: ${NONE} · cost: 0 steps · I/O: none`,
   `same<T = string>: ${NONE} · cost: unbounded (it compares \`string\` values with \`==\` at line 8) · I/O: none`,
   `useSame: ${NONE} · cost: unbounded (it compares \`string\` values with \`==\` at line 8, via \`same()\`) · I/O: none`,
@@ -121,18 +123,20 @@ const WANT = [
   "greet: writes: none · reads: none · allocates: yes (a string concatenation at line 42) · cost: unbounded (it concatenates strings at line 42) · I/O: none",
   `get lenish: ${NONE} · cost: 0 steps · I/O: none`,
   `readsGetter: ${NONE} · cost: 1 step · I/O: none`,
-  "addT: writes: unknown (`+` over an unbound type parameter at line 50) · reads: unknown (`+` over an unbound type parameter at line 50) · allocates: yes (`+` over an unbound type parameter at line 50) · cost: unbounded (it applies `+` over an unbound type parameter at line 50) · I/O: unknown (`+` over an unbound type parameter at line 50)",
+  "addT: writes: unknown · reads: unknown · allocates: unknown · cost: unbounded · I/O: unknown, because it applies `+` over an unbound type parameter at line 50",
   "addT<T = string>: writes: none · reads: none · allocates: yes (a string concatenation at line 50) · cost: unbounded (it concatenates strings at line 50) · I/O: none",
-  "addT<T = Q>: writes: the module `let` `count`, via `+@Q()` · reads: the module `let` `count`, via `+@Q()` · allocates: no · cost: 1 step · I/O: none",
-  "remT: writes: unknown (`%` over an unbound type parameter at line 51) · reads: unknown (`%` over an unbound type parameter at line 51) · allocates: yes (`%` over an unbound type parameter at line 51) · cost: unbounded (it applies `%` over an unbound type parameter at line 51) · I/O: unknown (`%` over an unbound type parameter at line 51)",
+  'addT<T = Q>: writes: the module `let` `count`, via operator "+" for Q · reads: the module `let` `count`, via operator "+" for Q · allocates: no · cost: 1 step · I/O: none',
+  "remT: writes: unknown · reads: unknown · allocates: unknown · cost: unbounded · I/O: unknown, because it applies `%` over an unbound type parameter at line 51",
   `remT<T = f64>: ${NONE} · cost: unbounded (it takes a float remainder at line 51) · I/O: none`,
-  "+@Q: writes: the module `let` `count` · reads: the module `let` `count` · allocates: no · cost: 0 steps · I/O: none",
+  'operator "+" for Q: writes: the module `let` `count` · reads: the module `let` `count` · allocates: no · cost: 0 steps · I/O: none',
   "useAdd: writes: none · reads: none · allocates: yes (a string concatenation at line 50, via `addT()`) · cost: unbounded (it concatenates strings at line 50, via `addT()`) · I/O: none",
   `useRem: ${NONE} · cost: unbounded (it takes a float remainder at line 51, via \`remT()\`) · I/O: none`,
   "useOp: writes: the module `let` `count`, via `addT()` · reads: the module `let` `count`, via `addT()` · allocates: no · cost: 2 steps · I/O: none",
   `readsTable: ${NONE} · cost: 0 steps · I/O: none`,
   "readsCount: writes: none · reads: the module `let` `count` · allocates: no · cost: 0 steps · I/O: none",
   "viaLiteral: writes: `w.inner.a` · reads: none · allocates: yes (a struct literal at line 61) · cost: 0 steps · I/O: none",
+  "addPrintLast: writes: unknown (`+` over an unbound type parameter at line 67) · reads: unknown (`+` over an unbound type parameter at line 67) · allocates: unknown (`+` over an unbound type parameter at line 67) · cost: unbounded (it applies `+` over an unbound type parameter at line 67) · I/O: `print`",
+  "addPrintFirst: writes: unknown (`+` over an unbound type parameter at line 68) · reads: unknown (`+` over an unbound type parameter at line 68) · allocates: unknown (`+` over an unbound type parameter at line 68) · cost: unbounded (it calls the host function `print`) · I/O: `print`",
 ];
 
 Deno.test({ name: "effects summary: the dump pins every fact", ignore }, async () => {

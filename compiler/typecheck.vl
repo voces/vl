@@ -38369,7 +38369,7 @@ function esCloseCycle(r: i32) {
       if i != j { esTakeFacts(members[i], members[j]) }
       j = j + 1
     }
-    esUnbound(members[i], "it recurses through `" + esLabel(r) + "`", -1)
+    esUnbound(members[i], "it recurses through " + esQuoted(r), -1)
     i = i + 1
   }
   0
@@ -38743,13 +38743,13 @@ function gcCharge(r: i32, to: i32): i32 {
     if esLow[r] > esLow[to] { esLow[r] = esLow[to] }
     gcTrail.push(to)
     esTakeFacts(r, to)
-    return esUnbound(r, "it recurses through `" + esLabel(to) + "`", -1)
+    return esUnbound(r, "it recurses through " + esQuoted(to), -1)
   }
   esTakeFacts(r, to)
   gcTrail.push(to)
   if esCost[to] >= ES_UNBOUNDED {
     if keyHasPrefix(esWhy[to], "it recurses") {
-      return esUnbound(r, "it calls `" + esLabel(to) + "`, which recurses", -1)
+      return esUnbound(r, "it calls " + esQuoted(to) + ", which recurses", -1)
     }
     return esUnbound(r, esWhy[to], to)
   }
@@ -39394,14 +39394,26 @@ function gcCostSoFar(r: i32): i32 {
   esCost[r]
 }
 
-// How a path names row `r`: a getter by its property, a function by its name and `()`.
+// How a path names row `r`: a getter by its property, a user operator as `operator "+" for P`,
+// a function by its name and `()`.
 function esLabel(r: i32): string {
   const d = P.nodes[esDecl[r]]
   if d is FuncDecl {
     if getDeclPropOf(d.fnName) != "" { return gcName(esDecl[r]) }
+    if opDeclOpOf(d.fnName) != "" { return "operator " + opDeclLabel(d.fnName) }
     return d.fnName + "()"
   }
   "?"
+}
+
+// Row `r` named inside a sentence: `esLabel` in backticks, except an operator, whose label
+// already quotes its symbol.
+function esQuoted(r: i32): string {
+  const d = P.nodes[esDecl[r]]
+  if d is FuncDecl {
+    if opDeclOpOf(d.fnName) != "" { return esLabel(r) }
+  }
+  "`" + esLabel(r) + "`"
 }
 
 // ── the getter step budget (§D3a-contract, D2061) ────────────────────────────
@@ -39584,7 +39596,12 @@ function esFactPath(c: i32, via: i32[]): string {
 
 // Row `r` as one line a person reads: what it writes, the module state it reads, whether it
 // allocates, its cost in steps and its host calls, each naming the first instance and its path.
+// When an operator over an unbound type parameter is every field's cause, it is stated once.
 export function esText(r: i32): string {
+  const opAlloc = esAllocIsOperator(r)
+  const shared = esSharedWhy(r)
+  let uf = "unknown (" + esUnknown[r] + esVia(r, esUnknownVia) + ")"
+  if shared != "" { uf = "unknown" }
   let w = "none"
   if esWrite[r] != "" { w = esWrite[r] + esVia(r, esWriteVia) }
   let a = "no"
@@ -39594,11 +39611,10 @@ export function esText(r: i32): string {
   let rd = "none"
   if esReadLet[r] != "" { rd = esReadLet[r] + esVia(r, esReadLetVia) }
   if esUnknown[r] != "" {
-    const u = "unknown (" + esUnknown[r] + esVia(r, esUnknownVia) + ")"
-    if esWrite[r] == "" { w = u }
-    if esAlloc[r] == "" { a = u }
-    if esHost[r] == "" { io = u }
-    if esReadLet[r] == "" { rd = u }
+    if esWrite[r] == "" { w = uf }
+    if esAlloc[r] == "" || opAlloc { a = uf }
+    if esHost[r] == "" { io = uf }
+    if esReadLet[r] == "" { rd = uf }
   }
   let cost = "1 step"
   if esCost[r] != 1 { cost = i32ToStr(esCost[r]) + " steps" }
@@ -39607,7 +39623,10 @@ export function esText(r: i32): string {
   }
   if esCost[r] >= ES_UNBOUNDED {
     cost = "unbounded (" + esWhy[r] + esVia(r, esWhyVia) + ")"
+    if shared != "" { cost = "unbounded" }
   }
+  let tail = ""
+  if shared != "" { tail = ", because " + shared }
   "writes: " +
     w +
     " · reads: " +
@@ -39617,13 +39636,37 @@ export function esText(r: i32): string {
     " · cost: " +
     cost +
     " · I/O: " +
-    io
+    io +
+    tail
 }
 
-// ", via `f()`" naming the callee a fact of row `r` came through, or "".
+// Whether row `r`'s allocation is the one an operator over an unbound type parameter may make:
+// that site records the same text, through the same callee, as the row's unknown call.
+function esAllocIsOperator(r: i32): boolean {
+  esUnknown[r] != "" &&
+    esAlloc[r] == esUnknown[r] &&
+    esAllocVia[r] == esUnknownVia[r]
+}
+
+// The one cause behind every field of row `r` ("it applies `+` over …"), when an operator over
+// an unbound type parameter is it and no field has a cause of its own; "" otherwise.
+function esSharedWhy(r: i32): string {
+  if !esAllocIsOperator(r) { return "" }
+  if esWrite[r] != "" || esReadLet[r] != "" || esHost[r] != "" { return "" }
+  if (
+    esWhy[r] != "it applies " + esUnknown[r] ||
+    esWhyVia[r] != esUnknownVia[r]
+  ) {
+    return ""
+  }
+  esWhy[r] + esVia(r, esWhyVia)
+}
+
+// ", via `f()`" (or ", via operator "+" for P") naming the callee a fact of row `r` came
+// through, or "".
 function esVia(r: i32, via: i32[]): string {
   if via[r] < 0 { return "" }
-  ", via `" + esLabel(via[r]) + "`"
+  ", via " + esQuoted(via[r])
 }
 
 // The type bindings of row `r` as `<T = i32, U = string>`, or "" for an unpinned row.
@@ -39680,12 +39723,14 @@ export function esDumpText(): string {
   demangleMsg(out)
 }
 
-// A dump line's name: `get p` for a getter, the function's name otherwise.
+// A dump line's name: `get p` for a getter, `operator "+" for P` for a user operator, the
+// function's name otherwise.
 function esDumpLabel(r: i32): string {
   const d = P.nodes[esDecl[r]]
   if d is FuncDecl {
     const prop = getDeclPropOf(d.fnName)
     if prop != "" { return "get " + prop }
+    if opDeclOpOf(d.fnName) != "" { return "operator " + opDeclLabel(d.fnName) }
     return d.fnName
   }
   "?"
