@@ -510,13 +510,13 @@ import {
   binMixHardF64,
   callIsArrSlice,
   callSpillsFcpArg,
+  calleeIsVoidExtern,
   calleeReturnsVoidAt,
   capComputeNamesOf,
   captureCountOf,
   captureNamesOf,
   captureValKind,
   capturedIsUnionBox,
-  capturedKindOf,
   capturedNulListCellRead,
   catListKindOfBin,
   catListKindOfExpr,
@@ -653,6 +653,7 @@ import {
   identChainTyMapArmUnion,
   identIsBoundClosure,
   identIsEnvCapture,
+  identNameIsUserBound,
   identNullableBoolPop,
   identSlotIsUnionBox,
   ifArmIsValue,
@@ -14279,15 +14280,6 @@ function emitMemIntrinArg(body: i32[], ix: i32, fnIx: i32) {
   emitExprWideCleared(body, ix, fnIx)
 }
 
-// Is `name` bound by the user in this frame — a parameter, a local, or a capture of one?
-// Scoped to callee position only (a parameter named `__load_i32__` is legal VL); a
-// parameter is the only binding form that can hold such a name, since the checker refuses
-// a `function`/`const`/`let` of an intrinsic spelling. Guards a capture-of-parameter miss (D1087).
-function identNameIsUserBound(name: string, fnIx: i32): boolean {
-  if localIndexOf(fnIx, name) >= 0 { return true }
-  capturedKindOf(fnIx, name) != null
-}
-
 // The compile-time lane index of an `__extract_lane_f32x4__` argument, or -1 when it is not a
 // 0..3 literal. The checker (`checkSimdLaneArg`) already refused a non-literal, so this only
 // re-reads the value the immediate byte needs; -1 keeps a drift between the two loud, not silent.
@@ -14921,16 +14913,18 @@ function emitCall(body: i32[], callIx: i32, fnIx: i32) {
         if exprIsClosure(c.callFn, fnIx) {
           return emitCallRef(body, callIx, fnIx)
         }
-        // The numeric-opcode intrinsics: one wasm instruction over the arguments, no
-        // import and no runtime. Reached only where the name resolved to no function and
-        // no closure value, which IS the shadowing rule the checker types against — a
-        // program that defines its own `min` calls its own.
-        const bcRc = emitBitcastIntr(body, callIx, fnIx, callee.identName)
-        if bcRc != NUM_INTR_NONE { return bcRc }
-        const fiRc = emitFloatIntr(body, callIx, fnIx, callee.identName)
-        if fiRc != NUM_INTR_NONE { return fiRc }
-        const iiRc = emitIntIntr(body, callIx, fnIx, callee.identName)
-        if iiRc != NUM_INTR_NONE { return iiRc }
+        // The numeric-opcode intrinsics: one wasm instruction over the arguments. Reached
+        // only where the name resolved to no function, no closure value and no frame binding
+        // (a captured loop variable), which IS the shadowing rule the checker types against —
+        // a program that defines its own `min` calls its own (D2010).
+        if !userBindsName {
+          const bcRc = emitBitcastIntr(body, callIx, fnIx, callee.identName)
+          if bcRc != NUM_INTR_NONE { return bcRc }
+          const fiRc = emitFloatIntr(body, callIx, fnIx, callee.identName)
+          if fiRc != NUM_INTR_NONE { return fiRc }
+          const iiRc = emitIntIntr(body, callIx, fnIx, callee.identName)
+          if iiRc != NUM_INTR_NONE { return iiRc }
+        }
         return emitFail("emitProgram: call to unknown function")
       }
       // a direct call to a capturing lifted function (`add(10)` where `add` captures `n`
@@ -19306,6 +19300,7 @@ function emitCallStmt(body: i32[], s: Call, stmtIx: i32, fnIx: i32) {
     // by spelling, so a diverging slot added there cannot be missed here — every other
     // entry in this ladder is a name, and a name is what a new slot would not carry.
     if fsRetIsVoid(fsIntrinsicSlot(callee.identName)) { dropIt = false }
+    if calleeIsVoidExtern(callee.identName, fnIx) { dropIt = false }
     if dropIt {
       // A name a closure binding covers denotes that binding, so the void question is the
       // closure's — the module function of the name lowered no instruction here (D1602).

@@ -1335,6 +1335,19 @@ it worked.
   Full argument, the JS loader shape, and why std's own floor is NOT migrated:
   `docs/internals/extern-design.md`.
 
+- **AN EXTERN STATES ITS RESULT, `: void` INCLUDED** (2026-09-22, owner ruling on plumb's PL-013,
+  D1997). `extern function g(a: i32): void` is a wasm import with an empty result list, and a
+  call to it is a statement: using its value where one is required is the check error a void
+  `function` gets. An extern with NO return type is a check error naming the fix — a `function`
+  infers its result from its body, and an extern has none, so a missing annotation cannot be
+  read as a choice. (The first design read it as a void import; the call lowering never agreed,
+  and the program built invalid wasm.) `void` is legal in the return position only, never as a
+  parameter. **The old refusal of `: void` was not a decision**: the return annotation went
+  through the parameter whitelist (`externScalarTy`), whose message is about bytes and `Buf`, so
+  `void` was rejected incidentally rather than because a result-less import was unwanted. Two
+  declarations of one link name that disagree (`: void` beside `: i32`) stay refused by the
+  existing link-signature rule.
+
 - **A `string` is UTF-8 BYTES behind a slice header, and the surface is
   BYTE-INDEXED.** `s[i]` is a byte (0–255, O(1)), `.length` is the byte count
   (O(1)), `slice(a, b)` takes byte offsets and returns an O(1) view; code points
