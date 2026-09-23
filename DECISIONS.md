@@ -6757,10 +6757,10 @@ type it has, and a `const` bound to a join of constants keeps the join's literal
 `let s = Z; s = "other"`, `[Z].push("w")` and `wrap(Z).push("other")` all stop checking. The
 recorded node type is the widened `string`, so no emitter classifier sees a literal it never
 saw before; `nodeWideStrLitText` is the one question the literal answers. Scope, as ruled: a
-`const` of a string literal. A `let` keeps `string`; a numeric `const` is unchanged. Unlike a
-declared literal type, a widening one does not refuse a compare against a literal outside it:
-`const MODE = "debug"; if MODE == "release"` is a false test, not an error, because refusing it
-would break every configuration constant written that way.
+`const` of a string literal. A `let` keeps `string`; a numeric `const` is unchanged. This
+section first left `const MODE = "debug"; if MODE == "release"` a false test rather than an
+error; the owner reversed that the same day — see "A `const` literal is never compared with a
+literal it cannot equal" below.
 
 **One predicate for type and rep.** The getter contract prices a compare of two tag operands at 0
 through `nodeCmpsByTag`: a string literal, a value typed as one literal (`tyIsOneStrLit`, the
@@ -6773,3 +6773,39 @@ member string, and its compare still calls `__str_eq__`; changing that is the ta
 litunion-compact-rep-design.md §7 leaves open. A string member read on a multi-member set
 (`k.length` over `"a" | "bb"`) is still refused: it would need the atom widened first.
 
+
+## A `const` literal is never compared with a literal it cannot equal (owner, 2026-09-23) — D2198
+
+*The owner's ruling: take the TypeScript approach. `const MODE = "debug"; if MODE == "release"`
+is refused, like the declared case, with a message that suggests declaring the domain.*
+
+**THE RULE.** A compare (`==`, `!=`) or an `is "lit"` test is refused when one side is a `const`
+bound to a string literal — or to a join of such constants — and the other side is a string
+literal, a declared string-literal type, or another such `const`, and the two share no member:
+
+    MODE is always "debug" here, so this comparison is always false. If MODE can take other
+    values, declare them: const MODE: "debug" | "release" = "debug"
+
+The suggested declaration is the constant's own value plus every member of the other side, so the
+other side is a subset of it and the compare the author wrote then checks. `!=` says "always
+true". `const MODE: string = "debug"` is the escape to full flexibility, which is why a `string`
+annotation on such a constant is no longer reported as a redundant annotation — deleting it, as
+that hint and its quick fix said to, now changes what the program means.
+
+**THE PRECEDENT.** TypeScript refuses `const MODE = "debug"; if (MODE === "release")` with
+"This comparison appears to be unintentional because the types '"debug"' and '"release"' have no
+overlap" (TS2367), for the same reason: a `const`'s literal type is exact, and a compare that
+cannot hold is almost always a typo (`MODE == "relaese"`) or a stale branch. VL already refused
+it for a DECLARED literal type (`k: "a" | "b"; k == "c"` is "not a member of the union"); leaving
+the inferred case silent made the annotation the only thing standing between a typo and a dead
+branch. The cost is a small departure from "VL does not require annotations": a configuration
+constant compared against its alternatives must declare them. Accepted for this corner case.
+
+**WHERE IT STOPS, AND WHY.** Only where both sides are string-literal sets known at check time.
+A side typed `string` (a parameter, a runtime value, `const S: string`), a `let` (which widens to
+`string`), a nullable literal type (already refused by the compare's own rule), and a mixed union
+(`"a" | i32`) are untouched. A literal spelled with an escape (`"a\nb"`) is never called disjoint,
+because membership compares lexemes and an escape and the character it stands for are one value.
+`match` has no arm to refuse: its scrutinee may not be a string, so a `const` string literal
+cannot reach an arm pattern. `is string` over the constant reads it as the `string` it is, as
+every operator does, rather than refusing it as a type that "can never match".

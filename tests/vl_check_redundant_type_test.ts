@@ -67,7 +67,7 @@ Deno.test({
   ignore: !ENABLED,
   fn: async () => {
     const r = await check(
-      "let a: i32 = 5\nconst b: string = \"hi\"\nprint(a + b.length)\n",
+      "let a: i32 = 5\nlet b: string = \"hi\"\nb = \"ho\"\na = 6\nprint(a + b.length)\n",
     );
     const hits = redundantLines(r.err);
     if (hits.length !== 2) {
@@ -87,10 +87,12 @@ Deno.test({
   ignore: !ENABLED,
   fn: async () => {
     // i64/f64 widen the i32-default literal; `[]`/`null` need the annotation to
-    // infer their element/nullable type — none is redundant.
+    // infer their element/nullable type; a `const` bound to a string literal would
+    // otherwise hold the literal's type (D2198) — none is redundant.
     const r = await check(
       "let w: i64 = 5\nlet f: f64 = 5\nlet xs: i32[] = []\nlet n: i32 | null = null\n" +
-        "xs.push(1)\nprint(w + f + xs.length)\n",
+        "const m: string = \"debug\"\n" +
+        "xs.push(1)\nprint(w + f + xs.length + m.length)\n",
     );
     const hits = redundantLines(r.err);
     if (hits.length !== 0) {
