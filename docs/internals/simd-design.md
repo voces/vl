@@ -26,6 +26,12 @@ apply and were not run; the doc-only PR runs the ordinary docs path. Sibling doc
 matches: `buffer-design.md` (the linear-memory tier this builds on), `flat-records-design.md`,
 `numeric-intrinsics.md`.
 
+**Build status (2026-09-22): S0–S3 shipped.** `std:simd` carries the `F32x4` slice (§G S3);
+two O3 items are NOT built and await a ruling — the `.x/.y/.z/.w` accessors (property syntax
+or `v.x()` methods?) and `laneF32x4(v, i)` (a literal lane cannot pass through a std wrapper):
+inventory D1980. Vectors inside containers (D1981) and function values (D1982) are refused
+loudly. Implementation notes: `docs/internals/std-notes.md` §`std:simd`.
+
 **Status: the design is finalized; this is not a build ticket.** All ten open questions in §F are
 now ruled. The build itself stays gated on two prerequisites: the `std:math` deterministic numeric
 substrate (`docs/internals/std-math-design.md`, DESIGNED but not yet built — ROADMAP row 34) that
@@ -355,8 +361,10 @@ export type Mask8x16 = new v128  // a lane mask over a 16-lane vector
 ```
 
 `v128` is a **new primitive scalar type** the compiler knows (declared beside `i32`/`f32` in
-`typecheck.vl`, one WasmGC-invisible scalar the way `i64` is), never spelled by users directly — it is
-the substrate the newtypes brand. Users only ever hold `F32x4` and friends. **Ruled (O2):**
+`typecheck.vl`, one WasmGC-invisible scalar the way `i64` is) — the substrate the newtypes brand.
+`std:simd` hands users only `F32x4` and friends: no export takes or returns a bare `v128` (O9).
+The name itself is spellable (S3 needed it for `new v128`), so a program MAY declare its own
+brand over it, as §E allows; that is a program's choice, not something std offers. **Ruled (O2):**
 `F32x4` is the spelling; a `vec4f` alias may be added later purely for WGSL familiarity, but
 `F32x4` stays canonical — every other API in this doc, including O7's geometry methods, is defined
 against it.

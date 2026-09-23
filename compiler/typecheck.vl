@@ -688,6 +688,11 @@ let argCstrWho: string[] = []
 let printCstrTy: i32[] = []
 let printCstrIx: i32[] = []
 let printCstrFn: i32[] = []
+// The vector-container twin of the `print` rows (`noteNestCstr`), deduped by type and owner.
+let nestCstrTy: i32[] = []
+let nestCstrIx: i32[] = []
+let nestCstrFn: i32[] = []
+let nestCstrSeen: {[string]: boolean} = Map()
 
 // D1470 — every `__array_new_default__(n)` call, its node and the array-hole row it returned.
 // `array.new_default` writes each slot's zero, so the element type is decided by what pins the
@@ -3640,6 +3645,10 @@ export function initChecker() {
   printCstrTy = []
   printCstrIx = []
   printCstrFn = []
+  nestCstrTy = []
+  nestCstrIx = []
+  nestCstrFn = []
+  nestCstrSeen = Map()
   arrDefCallIx = []
   arrDefCallTy = []
   holeLinkA = []
@@ -3808,6 +3817,9 @@ export function initChecker() {
   TY_NEVER = mkPrim("never")
   TY_U8 = mkPrim("u8")
   TY_V128 = mkPrim("v128")
+  // Per-compile state: the checker instance outlives one program (LSP, the corpus oracle).
+  v128Seen = false
+  v128NestReported = []
   T.scopes.push(Map())
   constScopes = []
   constScopes.push(Map())
@@ -3943,6 +3955,31 @@ export function initChecker() {
   declare("__splat_f32x4__", mkFuncTy([TY_F32], TY_V128))
   declare("__add_f32x4__", mkFuncTy([TY_V128, TY_V128], TY_V128))
   declare("__extract_lane_f32x4__", mkFuncTy([TY_V128, TY_I32], TY_F32))
+  // Slice S3 (`std:simd`'s F32x4): the rest of the f32x4 lane arithmetic, the six compares
+  // (each answering an all-ones/all-zeros lane mask), `v128.bitselect` and a 4-lane shuffle. A
+  // lane argument of `__replace_lane_f32x4__` / `__shuffle_f32x4__` is a literal (checked below).
+  declare("__sub_f32x4__", mkFuncTy([TY_V128, TY_V128], TY_V128))
+  declare("__mul_f32x4__", mkFuncTy([TY_V128, TY_V128], TY_V128))
+  declare("__div_f32x4__", mkFuncTy([TY_V128, TY_V128], TY_V128))
+  declare("__min_f32x4__", mkFuncTy([TY_V128, TY_V128], TY_V128))
+  declare("__max_f32x4__", mkFuncTy([TY_V128, TY_V128], TY_V128))
+  declare("__abs_f32x4__", mkFuncTy([TY_V128], TY_V128))
+  declare("__sqrt_f32x4__", mkFuncTy([TY_V128], TY_V128))
+  declare("__eq_f32x4__", mkFuncTy([TY_V128, TY_V128], TY_V128))
+  declare("__ne_f32x4__", mkFuncTy([TY_V128, TY_V128], TY_V128))
+  declare("__lt_f32x4__", mkFuncTy([TY_V128, TY_V128], TY_V128))
+  declare("__gt_f32x4__", mkFuncTy([TY_V128, TY_V128], TY_V128))
+  declare("__le_f32x4__", mkFuncTy([TY_V128, TY_V128], TY_V128))
+  declare("__ge_f32x4__", mkFuncTy([TY_V128, TY_V128], TY_V128))
+  declare("__bitselect_v128__", mkFuncTy([TY_V128, TY_V128, TY_V128], TY_V128))
+  declare(
+    "__replace_lane_f32x4__",
+    mkFuncTy([TY_V128, TY_I32, TY_F32], TY_V128),
+  )
+  declare(
+    "__shuffle_f32x4__",
+    mkFuncTy([TY_V128, TY_V128, TY_I32, TY_I32, TY_I32, TY_I32], TY_V128),
+  )
   // The filesystem floor (`std:fs`, `std:args`), which unlike everything above it does not
   // lower to instructions — a syscall is the one thing wasm cannot express. Bytes, not
   // strings, in both directions, so a payload crosses as one packed `u8[]` GC object. Errors are
@@ -4021,9 +4058,40 @@ export function nameIsSimdIntrinsic(name: string) {
   if name == "__load_v128__" { return true }
   if name == "__store_v128__" { return true }
   if name == "__splat_f32x4__" { return true }
-  if name == "__add_f32x4__" { return true }
   if name == "__extract_lane_f32x4__" { return true }
+  if name == "__replace_lane_f32x4__" { return true }
+  if name == "__shuffle_f32x4__" { return true }
+  if name == "__bitselect_v128__" { return true }
+  if simdF32x4LaneOpCode(name) >= 0 { return true }
   false
+}
+
+// The `0xFD` sub-opcode of an f32x4 lane-wise intrinsic that takes one or two vectors and
+// pushes one (arithmetic, compare), or -1. One table for the checker's reservation and the
+// emitter's dispatch; `simdF32x4LaneOpArity` says how many vector operands it pops.
+export function simdF32x4LaneOpCode(name: string): i32 {
+  if name == "__eq_f32x4__" { return 0x41 }
+  if name == "__ne_f32x4__" { return 0x42 }
+  if name == "__lt_f32x4__" { return 0x43 }
+  if name == "__gt_f32x4__" { return 0x44 }
+  if name == "__le_f32x4__" { return 0x45 }
+  if name == "__ge_f32x4__" { return 0x46 }
+  if name == "__abs_f32x4__" { return 0xe0 }
+  if name == "__sqrt_f32x4__" { return 0xe3 }
+  if name == "__add_f32x4__" { return 0xe4 }
+  if name == "__sub_f32x4__" { return 0xe5 }
+  if name == "__mul_f32x4__" { return 0xe6 }
+  if name == "__div_f32x4__" { return 0xe7 }
+  if name == "__min_f32x4__" { return 0xe8 }
+  if name == "__max_f32x4__" { return 0xe9 }
+  -1
+}
+
+// The vector operand count of a `simdF32x4LaneOpCode` intrinsic: 1 for abs/sqrt, else 2.
+export function simdF32x4LaneOpArity(name: string): i32 {
+  if name == "__abs_f32x4__" { return 1 }
+  if name == "__sqrt_f32x4__" { return 1 }
+  2
 }
 
 // The seven new load widths. `__load_i32__` predates them and keeps its own arm at every call
@@ -9144,6 +9212,11 @@ export function primTyOfName(name: string) {
   // The `null` type itself — the check type of `x is null` (host: an Alias
   // named "null"); union members spell it through the `|`-split / `TS_NULL`.
   if name == "null" { return TY_NULL }
+  // The SIMD substrate, spelled so `std:simd` can brand it (`type F32x4 = new v128`).
+  if name == "v128" {
+    v128Seen = true
+    return TY_V128
+  }
   -1
 }
 
@@ -9152,7 +9225,7 @@ export function primTyOfName(name: string) {
 // is a second answer. A list and not a predicate, because the `did you mean` suggester has to
 // enumerate the names in scope rather than test one; a spelling missing here stops being reserved.
 const builtinTyNames = [
-  "i32", "i64", "f64", "f32", "boolean", "string", "void", "null", "u8",
+  "i32", "i64", "f64", "f32", "boolean", "string", "void", "null", "u8", "v128",
 ]
 
 // Read by the merge's type-position rename and by `tErrBuiltinTyDecl`'s two callers.
@@ -14640,6 +14713,24 @@ export function eqRefusals(
   // whether a map operand has already been spoken for. Two sentences about one design rule
   // read as two separate problems.
   const msgsBefore = msgs.length
+  // A vector has four lanes and no single truth value, so `==` is not defined on it; the
+  // lane-wise compare is a function of the vector's own module.
+  let vecTy = -1
+  if primNameOf(lt) == "v128" { vecTy = lt }
+  if primNameOf(rt) == "v128" { vecTy = rt }
+  // A null test compares no lanes; whatever makes a vector nullable is refused on its own.
+  if isNullTy(lt) || isNullTy(rt) { vecTy = -1 }
+  if vecTy >= 0 {
+    msgs.push(
+      "`" +
+        op +
+        "` does not compare 128-bit vectors: " +
+        tyToStr(vecTy) +
+        " has four lanes and no single answer — compare lane by lane (`eqF32x4` in std:simd) and select on the mask",
+    )
+    unsup.push(0)
+    return 0
+  }
   if structural && lt >= 0 {
     const lT = T.tys[lt]
     let isStruct = false
@@ -20918,7 +21009,16 @@ function binOpDeadSelf(ty: i32) {
   if tyHasHole(ty) { return false }
   const t = T.tys[ty]
   if t is TyErr { return false }
+  if tyIsV128Brand(ty) { return false }
   !tyDenotesObj(ty)
+}
+
+// A nominal brand over the SIMD substrate (`type F32x4 = new v128`): the one non-object `self`
+// a binary operator dispatches on, because the language gives a v128 no operator of its own.
+function tyIsV128Brand(ty: i32): boolean {
+  if ty < 0 { return false }
+  if nomNameOfTy(ty) == "" { return false }
+  primNameOf(ty) == "v128"
 }
 
 // The index-operator function `op` dispatches to for a receiver of type `recvTy` — the first
@@ -22643,6 +22743,13 @@ function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
           fnDeclIx[name] ?? CSTR_NODECL,
           plainName,
         )
+        validateNestCstrs(
+          bNames,
+          bTys,
+          ix,
+          fnDeclIx[name] ?? CSTR_NODECL,
+          plainName,
+        )
         // The declared return, at the UFCS half for the same symmetry: `p.g()` and `g(p)`
         // must answer the same way, or the method spelling of D551's family stays silent beside a loud direct one.
         validateRetCstrs(
@@ -23534,27 +23641,50 @@ function checkUnimplementedIntrinsicCall(cfn: Ident, ix: i32) {
   }
 }
 
-// `__extract_lane_f32x4__(v, lane)`: the lane index is a wasm instruction IMMEDIATE, not a
-// stack operand, so it MUST be a compile-time literal in 0..3 — a non-literal (a `-` prefix
-// parses as `Unary`, not `NumLit`) or out-of-range lane is a loud check error (O3, §F).
+// A SIMD lane argument is a wasm instruction IMMEDIATE, not a stack operand, so it MUST be a
+// compile-time integer literal in `0..max` — a non-literal (a `-` prefix parses as `Unary`, not
+// `NumLit`) or out-of-range lane is a loud check error (O3, `simd-design.md` §F). Extract and
+// replace take one lane in 0..3; the shuffle takes four, each in 0..7 across its two vectors.
 function checkSimdLaneArg(n: Call, cfn: Ident) {
-  if cfn.identName != "__extract_lane_f32x4__" { return 0 }
-  if n.callArgs.length != 2 { return 0 }
-  const laneIx = parenPeelIx(n.callArgs[1])
+  const nm = cfn.identName
+  if nm == "__extract_lane_f32x4__" {
+    if n.callArgs.length == 2 { simdLaneLitCheck(nm, n.callArgs[1], 3) }
+    return 0
+  }
+  if nm == "__replace_lane_f32x4__" {
+    if n.callArgs.length == 3 { simdLaneLitCheck(nm, n.callArgs[1], 3) }
+    return 0
+  }
+  if nm == "__shuffle_f32x4__" {
+    if n.callArgs.length == 6 {
+      let k = 2
+      while k < 6 {
+        simdLaneLitCheck(nm, n.callArgs[k], 7)
+        k = k + 1
+      }
+    }
+    return 0
+  }
+  0
+}
+
+// Reports unless `argIx` is an integer literal in `0..max`; the message names the intrinsic.
+function simdLaneLitCheck(nm: string, argIx: i32, max: i32) {
+  const laneIx = parenPeelIx(argIx)
   if laneIx < 0 || laneIx >= P.nodes.length { return 0 }
   const le = P.nodes[laneIx]
-  let ok = false
   if le is NumLit {
     if !numLexIsFloat(le.numText) {
-      if u8LexValue(le.numText) <= 3 { ok = true }
+      if u8LexValue(le.numText) <= max { return 0 }
     }
   }
-  if !ok {
-    tErr(
-      "__extract_lane_f32x4__ requires a compile-time lane index literal in 0..3 — the wasm lane immediate is not a runtime operand",
-      n.callArgs[1],
-    )
-  }
+  tErr(
+    nm +
+      " requires a compile-time lane index literal in 0.." +
+      i32ToStr(max) +
+      " — the wasm lane immediate is not a runtime operand",
+    argIx,
+  )
   0
 }
 
@@ -24001,6 +24131,7 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
       dhArgNode,
     )
     validatePrintCstrs(bNames, bTys, ix, cstrCallee, cstrWho)
+    validateNestCstrs(bNames, bTys, ix, cstrCallee, cstrWho)
     validateArgCstrs(bNames, bTys, ix)
     // The declared return rides the same pin: the body's mismatch check is vacuous under
     // a hole, and this is the first position that knows the instance (D551).
@@ -24122,7 +24253,10 @@ function checkCallNode(n: Call, ix: i32) {
     if ot >= 0 { return ot }
   }
   if cfn is Ident { checkUnimplementedIntrinsicCall(cfn, ix) }
-  if cfn is Ident { checkSimdLaneArg(n, cfn) }
+  if cfn is Ident {
+    if nameIsSimdIntrinsic(cfn.identName) { v128Seen = true }
+    checkSimdLaneArg(n, cfn)
+  }
   if cfn is Ident {
     const bt = checkBuiltinIdentCall(n, ix, cfn)
     if bt >= 0 { return bt }
@@ -24256,6 +24390,12 @@ function resolveAnnotAt(
   // phase. `tErrOncePerMsg` dedups the case where a declared union reaches it from both routes.
   const dm = unionDiscrimMsg(r)
   if dm != "" { tErrOncePerMsg(dm, at) }
+  // A container of vectors named by an annotation alone (a param, a field of a struct only
+  // ever passed around, `v?: F32x4`) reaches no expression node, so it is refused here.
+  if !inferQuiet {
+    v128NestCheck(at, r)
+    noteNestCstr(r, at)
+  }
   r
 }
 
@@ -27040,8 +27180,142 @@ function checkNode(ix: i32) {
     if ix >= 0 {
       if ix < nodeTyIx.length { nodeTyIx[ix] = t }
     }
+    if v128Seen { v128NestCheck(ix, t) }
+    noteNestCstr(t, ix)
   }
   t
+}
+
+// Set once a program names `v128` or calls a SIMD intrinsic, so `v128NestCheck` costs a program
+// that never touches a vector nothing.
+let v128Seen = false
+// The container types `v128NestCheck` already reported, so one type is refused once.
+let v128NestReported: i32[] = []
+
+// A v128 vector lives in locals, parameters, returns and globals; a container holding one — an
+// array element, a struct field, a map key or value, a nullable or a union member — has no
+// lowering yet, so the first node typed with such a container is refused here, before emission.
+function v128NestCheck(ix: i32, t: i32) {
+  if ix < 0 || t < 0 { return 0 }
+  if !tyNestsV128(t, 8) { return 0 }
+  let i = 0
+  while i < v128NestReported.length {
+    if v128NestReported[i] == t { return 0 }
+    i = i + 1
+  }
+  v128NestReported.push(t)
+  tErrUnsupported(v128NestMsg(t), ix)
+  0
+}
+
+// The container-of-vector refusal, one wording for the direct site and the generic pin.
+function v128NestMsg(t: i32): string {
+  tyToStr(t) +
+    " holds a 128-bit vector inside an array, struct field, map, nullable or union, which has no lowering yet — keep the vector in a local, parameter, return or global, or store its lanes to a `Buf`"
+}
+
+// A generic body's container over a type parameter (`[x, x]` at `x: T`) has no vector in it
+// until a call binds `T`, so the type and node are recorded, owned by the enclosing
+// declaration, and `validateNestCstrs` asks again at each pin (the `print` constraint's shape).
+function noteNestCstr(t: i32, ix: i32) {
+  if t < 0 || cstrOwnerStack.length == 0 { return 0 }
+  const tt = T.tys[t]
+  let composite = false
+  if tt is TyArray { composite = true }
+  if tt is TyObj { composite = true }
+  if tt is TyNullable { composite = true }
+  if tt is TyUnion { composite = true }
+  if tt is TyMap { composite = true }
+  if !composite { return 0 }
+  if !tyHasHole(t) { return 0 }
+  const owner = cstrOwnerTop()
+  const key = i32ToStr(t) + ":" + i32ToStr(owner)
+  if nestCstrSeen.has(key) { return 0 }
+  nestCstrSeen.set(key, true)
+  nestCstrTy.push(t)
+  nestCstrIx.push(ix)
+  nestCstrFn.push(owner)
+  0
+}
+
+// Re-asks every recorded container this call instantiates under its bindings. Skipped unless
+// a binding is (or holds) a vector, so a pin that binds no vector does no work.
+function validateNestCstrs(
+  bNames: string[],
+  bTys: i32[],
+  ix: i32,
+  calleeFn: i32,
+  who: string,
+) {
+  let anyVec = false
+  let bi = 0
+  while bi < bTys.length {
+    if tyIsOrNestsV128(bTys[bi], 8) { anyVec = true }
+    bi = bi + 1
+  }
+  if !anyVec { return 0 }
+  const nOrig = nestCstrTy.length
+  let ci = 0
+  while ci < nOrig {
+    if cstrOwnedBy(nestCstrFn[ci], calleeFn) {
+      const ct = substTyDeep(nestCstrTy[ci], bNames, bTys)
+      if tyHasHole(ct) {
+        if calleeFn >= 0 && ct != nestCstrTy[ci] {
+          noteNestCstr(ct, nestCstrIx[ci])
+        }
+      } else if tyNestsV128(ct, 8) {
+        let pWho = "a type parameter is stored in a container here: "
+        if who != "" {
+          pWho = "`" + who + "` stores its type parameter in a container here: "
+        }
+        tErrUnsupported(pWho + v128NestMsg(ct), ix)
+        return 0
+      }
+    }
+    ci = ci + 1
+  }
+  0
+}
+
+// Whether a member of the composite type `t` (not `t` itself) is a v128, within `d` levels.
+function tyNestsV128(t: i32, d: i32): boolean {
+  if t < 0 || d <= 0 { return false }
+  const tt = T.tys[t]
+  if tt is TyArray { return tyIsOrNestsV128(tt.aElem, d - 1) }
+  if tt is TyNullable { return tyIsOrNestsV128(tt.nInner, d - 1) }
+  if tt is TyMap {
+    if tyIsOrNestsV128(tt.mKey, d - 1) { return true }
+    return tyIsOrNestsV128(tt.mVal, d - 1)
+  }
+  if tt is TyObj {
+    let i = 0
+    while i < tt.objFieldTypes.length {
+      if tyIsOrNestsV128(tt.objFieldTypes[i], d - 1) { return true }
+      i = i + 1
+    }
+    return false
+  }
+  if tt is TyUnion {
+    let j = 0
+    while j < tt.uMembers.length {
+      if tyIsOrNestsV128(tt.uMembers[j], d - 1) { return true }
+      j = j + 1
+    }
+    return false
+  }
+  // A function value is D1982's (the emitter refuses it); the rest hold no member at all.
+  if tt is TyFunc { return false }
+  if tt is TyPrim { return false }
+  if tt is TyVar { return false }
+  if tt is TyLit { return false }
+  if tt is TyNeg { return false }
+  if tt is TyErr { return false }
+  false
+}
+
+function tyIsOrNestsV128(t: i32, d: i32): boolean {
+  if primNameOf(t) == "v128" { return true }
+  tyNestsV128(t, d)
 }
 
 // Dispatches every node kind — expressions and statements — and returns the node's
@@ -27576,11 +27850,12 @@ function printRefRefusal(pt: i32): string {
 // Whether `x` is outside `print`'s domain by being a WasmGC reference: an array, a struct, a
 // map/set, a function value, a union carrying one of those, and any of them behind `| null`.
 // A domain rule, not a lowering gap (D711): the language has never defined how a container
-// renders, not merely failed to implement it yet. A `TyVar` answers false since it has no rep yet; `validatePrintCstrs` asks again at the pin (D401).
+// renders, not merely failed to implement it yet, and a 128-bit vector has no rendering either. A `TyVar` answers false since it has no rep yet; `validatePrintCstrs` asks again at the pin (D401).
 function tyPrintsAsRef(pt: i32, depth: i32) {
   if pt < 0 { return false }
   if depth <= 0 { return false }
   const t = T.tys[pt]
+  if t is TyPrim { return t.primName == "v128" }
   if t is TyArray { return true }
   if t is TyObj { return true }
   if t is TyMap { return true }
@@ -33304,6 +33579,15 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
   // is checked first, then an operator closure field — equality/logicals/`=`/`??` already returned.
   if op != "&&" && op != "||" {
     const odsp = T.tys[lt]
+    // A `new v128` brand has no arithmetic of the language's own, so it dispatches like an
+    // object: its declaring module's operator is the only meaning `a + b` can have.
+    if tyIsV128Brand(lt) {
+      const vsf = opSelfFnTy(op, lt, rt, n.binRight, ix)
+      if vsf >= 0 {
+        opBinSiteTook(op, true)
+        return vsf
+      }
+    }
     if odsp is TyObj {
       const osf = opSelfFnTy(op, lt, rt, n.binRight, ix)
       if osf >= 0 {
@@ -35142,6 +35426,11 @@ function checkCastNode(n: AsExpr, ix: i32) {
       if !castPropagationFits(rest, n.asTy, ix, T.curRet) { return TY_ERR }
       return target
     }
+  }
+  // A v128 to a v128 (a `new v128` brand on either side, or both) re-brands the same 128 bits:
+  // no conversion, cannot fail, so every mode but `as%` answers the target itself.
+  if primNameOf(target) == "v128" && arg >= 0 && primNameOf(arg) == "v128" {
+    if n.asMode != "wrap" { return target }
   }
   const tn = primNameOf(target)
   const targetIsScalar = tn == "i32" ||

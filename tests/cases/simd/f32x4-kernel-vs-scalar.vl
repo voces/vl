@@ -1,0 +1,128 @@
+// @run
+// @log -759.361083984375
+// @log -759.361083984375
+// @log true
+// @log 0
+// @log 0
+// @log -4.416870594024658
+// @log -4.416870594024658
+// Two kernels over a Buf of floats, each written once with std:simd and once with scalar f32,
+// compared bit for bit. A vector op is exactly its four scalar ops (no fused multiply-add), so
+// the only thing a scalar twin has to copy is the order of additions: four running sums, one
+// per lane, combined as (lane 0 + lane 2) + (lane 1 + lane 3) — reduceAddF32x4's order.
+import { Buf, Buffer, loadF32, loadI32, storeF32 } from "std:buffer"
+import { loadF32x4, reduceAddF32x4, splatF32, storeF32x4 } from "std:simd"
+
+const N = 64
+
+// Deterministic, non-trivial floats: no two products share a rounding.
+function fill(b: Buf, seed: i32) {
+  let i = 0
+  while i < N {
+    const k = (i * 37 + seed) % 101
+    b.storeF32(i * 4, (k as f32) * 0.173 - 7.9)
+    i = i + 1
+  }
+}
+
+function dotSimd(a: Buf, b: Buf) {
+  let acc = splatF32(0.0)
+  let off = 0
+  while off < N * 4 {
+    acc = acc + a.loadF32x4(off) * b.loadF32x4(off)
+    off = off + 16
+  }
+  return acc.reduceAddF32x4()
+}
+
+function dotScalar(a: Buf, b: Buf) {
+  let s0: f32 = 0.0
+  let s1: f32 = 0.0
+  let s2: f32 = 0.0
+  let s3: f32 = 0.0
+  let off = 0
+  while off < N * 4 {
+    s0 = s0 + a.loadF32(off) * b.loadF32(off)
+    s1 = s1 + a.loadF32(off + 4) * b.loadF32(off + 4)
+    s2 = s2 + a.loadF32(off + 8) * b.loadF32(off + 8)
+    s3 = s3 + a.loadF32(off + 12) * b.loadF32(off + 12)
+    off = off + 16
+  }
+  return (s0 + s2) + (s1 + s3)
+}
+
+// One damped-spring integration step over SoA columns: v += (-k * p - c * v) * dt; p += v * dt.
+function stepSimd(p: Buf, v: Buf) {
+  const k = splatF32(3.5)
+  const c = splatF32(0.25)
+  const dt = splatF32(0.01)
+  const zero = splatF32(0.0)
+  let off = 0
+  while off < N * 4 {
+    const pp = p.loadF32x4(off)
+    let vv = v.loadF32x4(off)
+    vv = vv + ((zero - k * pp) - c * vv) * dt
+    p.storeF32x4(off, pp + vv * dt)
+    v.storeF32x4(off, vv)
+    off = off + 16
+  }
+}
+
+function stepScalar(p: Buf, v: Buf) {
+  const k: f32 = 3.5
+  const c: f32 = 0.25
+  const dt: f32 = 0.01
+  const zero: f32 = 0.0
+  let off = 0
+  while off < N * 4 {
+    const pp = p.loadF32(off)
+    let vv = v.loadF32(off)
+    vv = vv + ((zero - k * pp) - c * vv) * dt
+    p.storeF32(off, pp + vv * dt)
+    v.storeF32(off, vv)
+    off = off + 4
+  }
+}
+
+// How many of the N floats differ, compared as bit patterns.
+function differing(x: Buf, y: Buf) {
+  let n = 0
+  let off = 0
+  while off < N * 4 {
+    if x.loadI32(off) != y.loadI32(off) { n = n + 1 }
+    off = off + 4
+  }
+  return n
+}
+
+function main() {
+  const a = Buffer(N * 4)
+  const b = Buffer(N * 4)
+  fill(a, 3)
+  fill(b, 58)
+  const ds = dotSimd(a, b)
+  const dc = dotScalar(a, b)
+  print(ds)
+  print(dc)
+  print(ds == dc)
+
+  const p1 = Buffer(N * 4)
+  const v1 = Buffer(N * 4)
+  const p2 = Buffer(N * 4)
+  const v2 = Buffer(N * 4)
+  fill(p1, 11)
+  fill(v1, 29)
+  fill(p2, 11)
+  fill(v2, 29)
+  let s = 0
+  while s < 100 {
+    stepSimd(p1, v1)
+    stepScalar(p2, v2)
+    s = s + 1
+  }
+  print(differing(p1, p2))
+  print(differing(v1, v2))
+  print(p1.loadF32(20))
+  print(p2.loadF32(20))
+}
+main()
