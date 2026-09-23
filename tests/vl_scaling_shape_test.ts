@@ -204,7 +204,7 @@ const genCovar = (n: number, cov: number): string => {
     "type Circle = { r: i32 }",
     "type Sq = { s: i32 }",
     "type Shape = Circle | Sq",
-    "type Box = { xs: Shape[] }",
+    "type Box = { xs: readonly Shape[] }",
     "type CBox = { xs: Circle[] }",
     // the unrelated write that makes the analysis run at all (`cwProgramHasWrite`)
     "function other() {",
@@ -218,7 +218,7 @@ const genCovar = (n: number, cov: number): string => {
     o.push(
       `function d${i}() {`,
       `  const a${i}: Circle[] = [{ r: 7 }]`,
-      `  const b${i}: ${wide ? "Shape" : "Circle"}[] = a${i}`,
+      `  const b${i}: ${wide ? "readonly Shape" : "Circle"}[] = a${i}`,
       `  const s${i}: ${wide ? "Box" : "CBox"} = { xs: b${i} }`,
       `  print(s${i}.xs.length)`,
       "}",

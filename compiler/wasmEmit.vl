@@ -1322,31 +1322,41 @@ function emitStructFieldValue(
   if nulNicheRecoverOwed(fieldCodeVKind(scode), valIx, fnIx) {
     fbRefAsNonNull()
   }
-  if scode == 5 {
-    // read-only covariance at the field boundary (D791): `pendingListSlot` still holds
-    // this field's own row, resolved by the code-5 arm above.
-    emitRefListWidenSite(
-      body,
-      valIx,
-      exprEmittedRefListSlot(valIx, fnIx),
-      pendingListSlot,
-    )
-  }
-
-  // the scalar dual of the ref-list widen above (D965): the field's own wasm-type code,
-  // not a separately derived name, picks the destination kind, so it cannot disagree.
-  if (scode == 4 || scode == 25 || scode == 26 || scode == 27 || scode == 35) {
-    let sfk: VKind = "list"
-    if scode == 35 { sfk = "u8list" }
-    if scode == 25 { sfk = "f64list" }
-    if scode == 26 { sfk = "i64list" }
-    if scode == 27 { sfk = "f32list" }
-    emitScalarListWidenSite(body, valIx, fnIx, sfk)
-  }
+  // read-only covariance at the field boundary (D791): `pendingListSlot` still holds this
+  // field's own row, resolved by the code-5 arm above.
+  emitFieldListWidenSite(body, valIx, fnIx, scode, pendingListSlot)
   if scode == 15 { pendingStructIdx = savedPSI }
   if scode == 19 { pendingMapSlot = -1 }
   pendingListKind = 0
   0
+}
+
+// The read-only covariant copy a list value owes on its way into a struct field of wasm-type
+// code `scode` whose ref-list row is `refSlot`: the ref copy for code 5 (D791), the scalar copy
+// for the list codes (D965). Shared by the construct and the field store (D2163).
+function emitFieldListWidenSite(
+  body: u8[],
+  valIx: i32,
+  fnIx: i32,
+  scode: i32,
+  refSlot: i32,
+): boolean {
+  if scode == 5 {
+    return emitRefListWidenSite(
+      body,
+      valIx,
+      exprEmittedRefListSlot(valIx, fnIx),
+      refSlot,
+    )
+  }
+  let sfk: VKind | null = null
+  if scode == 4 { sfk = "list" }
+  if scode == 35 { sfk = "u8list" }
+  if scode == 25 { sfk = "f64list" }
+  if scode == 26 { sfk = "i64list" }
+  if scode == 27 { sfk = "f32list" }
+  if sfk == null { return false }
+  emitScalarListWidenSite(body, valIx, fnIx, sfk)
 }
 
 // Lower an object literal `{ f: v, … }` onto `body`: resolve which struct the field-name
@@ -7102,26 +7112,9 @@ function emitArr(body: u8[], arrIx: i32, fnIx: i32) {
           // `if s is Circle`. The slot's own element heap is the destination, the same one
           // `rlBackIdx` types the backing array with.
           if elArmOwed { emitNarrowedArmUnboxTo(rlElemArmHeapOf(rslot)) }
-          // Read-only covariance at a nested-list element (D791) — `[lv1]` of a `Shape[][]`,
-          // where the element's own row is the inner ref list.
-          if elemNest == 9 && nestInnerSlot >= 0 {
-            emitRefListWidenSite(
-              body,
-              elems[i],
-              exprEmittedRefListSlot(elems[i], fnIx),
-              nestInnerSlot,
-            )
-          }
-          // The scalar dual (D965) — `[e]` of an `f64[][]` over an `i32[]` element. The element's
-          // own nest code is the destination kind: 4 `i32[]`, 7 `f64[]`, 8 `i64[]`, 10 `f32[]` —
-          // the same ladder the `elCtx.listKind` seeding above reads, one column over.
-          if elemNest == 4 || elemNest == 7 || elemNest == 8 || elemNest == 10 {
-            let nse: VKind = "i32"
-            if elemNest == 7 { nse = "f64" }
-            if elemNest == 8 { nse = "i64" }
-            if elemNest == 10 { nse = "f32" }
-            emitScalarListWidenSiteElem(body, elems[i], fnIx, nse)
-          }
+          // Read-only covariance at a nested-list element (D791, D965) — `[lv1]` of a
+          // `(readonly Shape[])[]`.
+          emitNestedListWidenSite(body, elems[i], fnIx, rslot)
         }
         pendingVariantIdx = -1
         i = i + 1
@@ -8694,6 +8687,13 @@ function emitMapSetValExpr(
         exprEmittedRefListSlot(valIx, fnIx),
         mvWiden,
       )
+    }
+    // the scalar copy at the same boundary (D965, D2163) — `m["k"] = ints` over a
+    // `{[string]: readonly f64[]}`, keyed by the value list's own element kind.
+    const mvLK = mvListValKind(mslot)
+    if mvLK != null {
+      const mvSE = scalarListElemOfListKind(mvLK)
+      if mvSE != null { emitScalarListWidenSiteElem(body, valIx, fnIx, mvSE) }
     }
   }
   0
@@ -15661,6 +15661,13 @@ function emitAssign(body: u8[], binIx: i32, fnIx: i32) {
           // module globals) — distinct from the global-init copy in `emit_sections`, since
           // a re-assignment is ordinary code and a const initializer a wasm constexpr.
           emitScalarListWidenSite(body, a.binRight, fnIx, gaKind)
+          // and the ref copy (D791) at the same boundary, the local assignment's twin (D2163).
+          emitRefListWidenSite(
+            body,
+            a.binRight,
+            exprEmittedRefListSlot(a.binRight, fnIx),
+            exprEmittedRefListSlot(lhsIx, fnIx),
+          )
           // the narrowed-arm unbox at the same boundary (D1031) — `gv = s` under `if s is
           // Circle`, between two module globals; `armDestHeapOf` reads the destination pair.
           if narrowedArmNeedsUnbox(a.binRight, fnIx) {
@@ -16022,6 +16029,10 @@ function emitAssign(body: u8[], binIx: i32, fnIx: i32) {
       } else {
         if emitExpr(body, a.binRight, fnIx) < 0 { return -1 }
       }
+      // the read-only covariant copy at the indexed-store boundary (D2163)
+      if idxKind == "ref" {
+        emitNestedListWidenSite(body, a.binRight, fnIx, idxSlot)
+      }
       // the narrowed-arm unbox at the ELEMENT-assignment boundary, the binding boundary's
       // twin one container over: the element's own variant or struct row is where the arm
       // lands, and those two seeds are what the value emits under (D1685).
@@ -16250,6 +16261,14 @@ function emitAssign(body: u8[], binIx: i32, fnIx: i32) {
       if nulNicheRecoverOwed(fieldCodeVKind(fscode), a.binRight, fnIx) {
         fbRefAsNonNull()
       }
+      // the read-only covariant copy at the field-store boundary, the construct's twin (D2163)
+      emitFieldListWidenSite(
+        body,
+        a.binRight,
+        fnIx,
+        fscode,
+        sFieldRefSlot(si, fieldIdx),
+      )
       pendingListKind = 0
       pendingMapSlot = -1
       pendingStructIdx = savedWPSI
@@ -16691,6 +16710,7 @@ function emitPush(body: u8[], callIx: i32, fnIx: i32, wantValue: boolean) {
       // the value slot's rep kind, for the D1197 non-null recover below. A `(string |
       // null)[]` keeps its nullable slot and stays `null` here.
       let pushDestKind: VKind | null = null
+      let pushRSlot = -1
       if isRef {
         if !rlUsed {
           return emitFail(
@@ -16698,6 +16718,7 @@ function emitPush(body: u8[], callIx: i32, fnIx: i32, wantValue: boolean) {
           )
         }
         const rslot = refListSlotOfExpr(callee.memObj, fnIx)
+        pushRSlot = rslot
         lTy = rlWrapIdx[rslot]
         aTy = rlBackIdx[rslot]
         base = refPushScratchBaseFor(rslot)
@@ -16856,6 +16877,10 @@ function emitPush(body: u8[], callIx: i32, fnIx: i32, wantValue: boolean) {
         // `Circle[]` under `if s is Circle`. The element-literal twin is in `emitArr`; both
         // read the same slot heap, so the two spellings of one store cannot disagree.
         if pushArmOwed { emitNarrowedArmUnboxTo(pushArmHeap) }
+        // the read-only covariant copy at the `.push` boundary (D2163)
+        if pushRSlot >= 0 {
+          emitNestedListWidenSite(body, c.callArgs[0], fnIx, pushRSlot)
+        }
         // D1197 — the non-null recover `.push` OWED. Eight sibling deliveries of the same
         // narrowed value ask `nulNicheRecoverOwed`; this one asked nothing, so `out.push(e)`
         // under `if e != null` handed a `(ref null $H)` to the non-null value slot —
@@ -18003,6 +18028,36 @@ export function emitScalarListWidenSite(
   const de = scalarListElemOfListKind(dstListKind)
   if de == null { return false }
   emitScalarListWidenSiteElem(body, srcIx, fnIx, de)
+}
+
+// The copy a list value owes on its way into an element of the ref list at `rslot` — a
+// nested-list literal element, a `.push` or an indexed store (D2163). The element's nest
+// code names the destination: 9 an inner ref list, 4/7/8/10 an `i32`/`f64`/`i64`/`f32` list.
+function emitNestedListWidenSite(
+  body: u8[],
+  valIx: i32,
+  fnIx: i32,
+  rslot: i32,
+): boolean {
+  if rslot < 0 || rslot >= rlElemKindTbl.length { return false }
+  const nest = rlElemKindTbl[rslot]
+  if nest == 9 {
+    const inner = rlElemInnerSlot(rslot)
+    if inner < 0 { return false }
+    return emitRefListWidenSite(
+      body,
+      valIx,
+      exprEmittedRefListSlot(valIx, fnIx),
+      inner,
+    )
+  }
+  let nse: VKind | null = null
+  if nest == 4 { nse = "i32" }
+  if nest == 7 { nse = "f64" }
+  if nest == 8 { nse = "i64" }
+  if nest == 10 { nse = "f32" }
+  if nse == null { return false }
+  emitScalarListWidenSiteElem(body, valIx, fnIx, nse)
 }
 
 // The same site keyed by the destination's ELEMENT kind rather than its list kind, for

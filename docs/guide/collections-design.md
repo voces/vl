@@ -162,16 +162,36 @@ const maybe: (i32 | null)[] = counts.map((x): i32 | null => x)  // the same, for
 const wide: f64[] = [1, 2]                                      // or build it wide
 ```
 
-Two kinds of widening still run today and are under review against this rule: a read-only
-`i32[]` into `f64[]` (compiled as a copy, and refused as soon as either list is written), and a
-widening that keeps the element's storage, such as `C[]` into `(C | null)[]`, which shares the
-list. For the second, write `readonly (C | null)[]` if the receiver only reads.
+**Only a `readonly` list is covariant** (owner ruling 2026-09-23). A mutable wider list is
+refused even where the elements keep their storage: `C[]` into `(C | null)[]` would share the
+list, and a `null` stored through the wider handle would land in the `C[]`. The refusal names
+both fixes — declare the destination `readonly` when it only reads, or copy with `.map`:
+
+```vl
+type C = { n: i32 }
+function count(xs: readonly (C | null)[]): i32 { xs.length }  // only reads: a view
+const cs: C[] = [{ n: 1 }]
+print(count(cs))
+const grown: (C | null)[] = cs.map((x): C | null => x)        // will be written: a copy
+grown.push(null)
+```
+
+A list of lists is a view at every level — `C[][]` passes as `readonly (readonly (C | null)[])[]`
+— and a map never widens the lists it holds, since it has no read-only spelling: build it at the wider
+type and fill it.
+
+Two things are not covariant destinations, so they need neither fix. An un-annotated parameter
+is compiled once per argument type, so `function total(xs) { … }` takes an `i32[]` and an
+`f64[]` alike, with no copy. And a list the compiler inferred, `const cs = [{ n: 1 }]`, is built
+at the type it flows into, so there is no narrower list to protect.
 
 Covariance is where the view earns its place. A `Circle[]` delivered into a `Shape[]` needs
 an element-converting copy, which is only sound where nothing writes either list — and the
 compiler proves that by following every handle, which it cannot always do. A `readonly`
 parameter makes the proof unnecessary: nothing may write through it, so the delivery is
-licensed by the type rather than by an analysis (D1686, D1687).
+licensed by the type rather than by an analysis (D1686, D1687). Until the view shares storage
+for such a pair, the copy is still a snapshot, so a `readonly Shape[]` built from a `Circle[]`
+is refused when that `Circle[]` is written afterwards.
 
 ### Spread and rest parameters — `[...a, b]`, `f(...xs)`, `xs.push(...ys)`
 
