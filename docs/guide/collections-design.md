@@ -147,9 +147,10 @@ checked its write against a list the compiler synthesized for the hole and nothi
 compare that to the argument. Read-only uses through the same parameter (`xs[0]`, `xs.length`)
 are unaffected, and spelling the parameter `readonly T[]` says the body only reads.
 
-**A list does not widen implicitly** (owner ruling 2026-09-23). An `i32[]` is not an `f64[]`,
-an `(i32 | null)[]` or an `(i32 | string)[]`, a `K[]` of a literal union is not a `string[]`,
-and the same holds for a map's key and value types. Changing how the elements are stored takes
+**A list does not widen implicitly** (owner ruling 2026-09-23). An `i32[]` is not an
+`(i32 | null)[]` or an `(i32 | string)[]`, a `K[]` of a literal union is not a `string[]`, a
+list that is written is not a list of a wider number type, and the same holds for a map's key
+and value types. Changing how the elements are stored takes
 a copy, and a copy made behind your back would stop sharing writes with the original — a
 callee's `xs[0] = 9.5` would never reach your list. So you write the copy, or build the list at
 the wide type from the start:

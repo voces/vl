@@ -32,8 +32,12 @@ see **`DECISIONS.md`**.
   `i32[]` → `f64[]` when written, and of every storage-changing element or map pair
   (`i32[]` → `(i32 | null)[]`, `K[]` → `string[]`, `{[string]: i32}` → `{[string]: f64}`), read
   "type-valid … not yet supported by codegen"; it is now a design refusal that names the rule
-  and the copy to write (`i32[] is not f64[]: a container never widens implicitly … copy it with
-  .map((x) => x as f64)`), and leaves `goal-scoreboard.py`'s concession count (23 → 22). A
+  and the copy to write (`i32[] is not (i32 | null)[]: a container never widens implicitly …
+  copy it with .map((x): i32 | null => x)`), and leaves `goal-scoreboard.py`'s concession count
+  (23 → 22). A numeric pair, whose read-only delivery still compiles to a copy, is refused
+  naming the write that forced it (`this list is written (line 4), and a written container
+  never widens implicitly`), as is the `Circle[]` → `Shape[]` refusal (`WRITTEN THROUGH (line
+  4)`); a nested pair names the outer type to build. A
   765-cell grid (29 element pairs × 9 positions × read / write-wide / write-original) moved zero
   verdicts. It filed five rows: D2160 (an annotated record into a wider union field, invalid
   wasm), D2161 (a class-keeping widening shares the list, so a `null` written through the wide
@@ -43,8 +47,11 @@ see **`DECISIONS.md`**.
   container widening" lists the widenings that still run and are the owner's to decide.
   A method-call receiver now takes the argument's verdict (D2165): `ks.join(",")` over a `K[]`
   and a `self: f64[]` method written through on an `i32[]` were check-clean invalid wasm while
-  `join(ks, ",")` refused. `ufcsCallTy` asks the argument seam after dispatch, and the
-  write-state closure follows a receiver into `self`.
+  `join(ks, ",")` refused. `ufcsCallTy` asks the argument seam after dispatch, including an
+  optional-chain receiver (`xs?.f()`) and a generic `self` under the receiver's binding; a
+  receiver in an un-annotated body is asked at the pinning call. The write-state closure
+  follows a receiver into `self`, and a `Circle[] | null` handle now fixes its list's storage.
+  D2166 files `.map` into a value-union element failing beside a literal-union list.
 - **A getter body is held to a step budget, a string-literal compare is priced, and a float `%`
   is refused (D2061, D2062, D2063).** The contract counted loops, so nine loop-free getters each
   reading the previous one four times passed and did 65,536 calls behind one `.a8`. The checker

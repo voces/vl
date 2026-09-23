@@ -3753,16 +3753,29 @@ they read it.
 Related: a `--price` run against the POST-landing seed reports VETO rather than a false pass,
 because term (a) legitimately fails once the cells are loud. That is the safe direction; the
 check takes the BASE seed.
+
 ## No implicit container widening (owner ruling, 2026-09-23)
 
-**A container of T never implicitly becomes a container of a wider U.** `const a: i32[] = [1];
-const b: f64[] = a` is not a missing lowering but a program the language refuses, and the
-message says so: `i32[] is not f64[]: a container never widens implicitly … Build it as f64[],
-or copy it with .map((x) => x as f64)`. The same rule covers a union-widened element
-(`i32[]` → `(i32 | null)[]`), a literal union into `string` (`K[]` → `string[]`), and a map's
-key or value. The author writes the copy, or builds the container at the wide type from the
-start. A method call's receiver is `self`'s argument and gets the same verdict: `ks.join(",")`
-refuses exactly where `join(ks, ",")` does (D2165).
+**A container of T never implicitly becomes a container of a wider U.** An `i32[]` delivered
+where an `(i32 | null)[]`, an `(i32 | string)[]` or a nested `f64[][]` is declared, a `K[]` of a
+literal union where a `string[]` is, and a map whose key or value would widen are programs the
+language refuses, and the message says so: `i32[] is not (i32 | null)[]: a container never
+widens implicitly … Build it as (i32 | null)[], or copy it with .map((x): i32 | null => x)`.
+The author writes the copy, or builds the container at the wide type from the start.
+
+**The read-only converting copy is the exception still standing** — the numeric element pairs
+`i32`→`f64`, `i32`→`i64`, `f32`→`f64`, and the ref pair `Circle[]` → `Shape[]`: a READ-ONLY
+direct delivery still compiles to a copy, which the owner has not yet ruled on. Until then their refusal names the
+write that forced it rather than the general rule — `i32[] is not f64[] here: this list is
+written (line 4), and a written container never widens implicitly …`, or `the list is WRITTEN
+THROUGH (line 4)` for the ref pair — so the message never contradicts a spelling that runs.
+Every copy the messages suggest compiles alone; D2166 is the one combination found that does
+not. A pair reached through an outer container names the outer type to build and no `.map`,
+since a nested `.map` into a list element is itself refused (D1482's literal).
+
+A method call's receiver is `self`'s argument and gets the same verdict in every spelling —
+`xs.f()`, `xs?.f()`, a generic `self`, and a receiver inside an un-annotated body, asked at
+the call that pins it: `ks.join(",")` refuses exactly where `join(ks, ",")` does (D2165).
 
 **Why a copy is not the answer.** VL lists alias: `const b: i32[] = a; b[0] = 9` is seen
 through `a`, and so is a callee's store through its parameter. An implicit converting copy
