@@ -5,11 +5,14 @@
 // two drifted three times in the first review (D2061, D2062, D2063: an `is "z"` that called a
 // looping helper, a float `%` that looped). This suite builds every run-fixture under
 // `tests/cases/getters/` and a program reading std:simd's four lane getters, disassembles each
-// module, and holds each getter's own function body to the promise: no `loop`, no
-// `struct.new`/`array.new*`, no indirect call, and a direct call only to another getter or to a
-// leaf the contract admits (`__str_eq__`, which the checker charges a literal's length). A
-// control program's method is held to the same scan and must be flagged, so a scan that stopped
-// seeing an opcode cannot pass quietly.
+// module, and holds each getter's function body, and every body it reaches through direct
+// calls, to the promise: no `loop`, no `struct.new`/`array.new*`, no `array.copy`/`array.fill` or
+// `memory.copy`/`memory.fill` (their work scales with the length), no indirect call, no call of a
+// host import, and no call back into a function already on the path. A getter may call ordinary
+// functions whose summary qualifies (D2136), so the helpers are held to the same scan; a leaf the
+// contract admits (`__str_eq__`, which the checker charges a literal's length) is not entered. A
+// control program's method is held to the same scan and must be flagged, directly and through the
+// helper it calls, so a scan that stopped seeing an opcode or a call edge cannot pass quietly.
 //
 // What it cannot see: HOW LONG a `__str_eq__` call walks. That helper is on the leaf list, so a
 // compare the checker charged 0 (a literal it wrongly took for a tag compare) passes here; the
@@ -45,11 +48,16 @@ const SIMD_PROGRAM = [
   "print(v.x + v.y + v.z + v.w)",
 ].join("\n") + "\n";
 
-// A method that loops, allocates and calls a user function: the scan must flag all three.
+// A method that loops, allocates and calls a user function that loops: the scan must flag the
+// method's loop and allocation, and the helper's loop through the call edge.
 const CONTROL_PROGRAM = [
   "type P = { a: i32 }",
   "type C = new i32",
-  "function helper(n: i32): i32 { return n + 1 }",
+  "function helper(n: i32): i32 {",
+  "  let k = n",
+  "  while k > 9 { k = k - 1 }",
+  "  return k",
+  "}",
   "function spin(self: C): i32 {",
   "  let s = 0",
   "  while s < (self as! i32) { s = s + 1 }",
@@ -123,23 +131,50 @@ const stripTrapArms = (body: string): string => {
   }
 };
 
-const violations = (
-  body: string,
-  isGetter: (fn: string) => boolean,
-): string[] => {
+const violations = (body: string): string[] => {
   const bad: string[] = [];
   if (/\(loop\b/.test(body)) bad.push("a loop");
   const alloc = body.match(/\((struct\.new\w*|array\.new\w*)/);
   if (alloc) bad.push(`an allocation (${alloc[1]})`);
+  // One instruction each, but their work scales with the length operand.
+  const bulk = body.match(/\((array\.copy|array\.fill|memory\.copy|memory\.fill)\b/);
+  if (bulk) bad.push(`a length-scaled ${bulk[1]}`);
   const indirect = body.match(/\(((?:return_)?call_(?:ref|indirect))/);
   if (indirect) bad.push(`an indirect call (${indirect[1]})`);
-  // A tail call (`return_call`) is still a direct call to a named function.
-  for (const m of body.matchAll(/\((?:return_)?call \$(\S+)/g)) {
-    const callee = m[1];
-    if (!LEAVES.has(callee) && !isGetter(callee)) {
-      bad.push(`a call to $${callee}`);
+  return bad;
+};
+
+// The functions a body calls directly; a tail call (`return_call`) is still a direct call.
+const directCalls = (body: string): string[] =>
+  [...body.matchAll(/\((?:return_)?call \$(\S+)/g)].map((m) => m[1]);
+
+// Every violation in function `start` and in each function it reaches through direct calls,
+// prefixed by the path that reached it. A callee that is not a function of the module is a host
+// import; a callee already on the path is recursion.
+const reachViolations = (start: string, fns: Map<string, string>): string[] => {
+  const bad: string[] = [];
+  const done = new Set<string>();
+  const visit = (fn: string, path: string[]) => {
+    const where = [...path, `$${fn}`].join(" → ");
+    const body = fns.get(fn);
+    if (body === undefined) {
+      bad.push(`${where}: a call of a host import`);
+      return;
     }
-  }
+    if (done.has(fn)) return;
+    done.add(fn);
+    const stripped = stripTrapArms(body);
+    for (const v of violations(stripped)) bad.push(`${where}: ${v}`);
+    for (const callee of directCalls(stripped)) {
+      if (LEAVES.has(callee)) continue;
+      if (callee === fn || path.includes(`$${callee}`)) {
+        bad.push(`${where}: a call back to $${callee}`);
+        continue;
+      }
+      visit(callee, [...path, `$${fn}`]);
+    }
+  };
+  visit(start, []);
   return bad;
 };
 
@@ -174,15 +209,12 @@ const scan = async (
   const dir = Deno.makeTempDirSync({ prefix: "vl-getter-shape-" });
   try {
     const fns = functionsOf(await build(dir, src, name));
-    const isGetter = (fn: string) => isGetterFn(fn, getters);
     let seen = 0;
     const bad: string[] = [];
-    for (const [fn, body] of fns) {
-      if (!isGetter(fn)) continue;
+    for (const fn of fns.keys()) {
+      if (!isGetterFn(fn, getters)) continue;
       seen++;
-      for (const v of violations(stripTrapArms(body), isGetter)) {
-        bad.push(`$${fn}: ${v}`);
-      }
+      bad.push(...reachViolations(fn, fns));
     }
     return { seen, bad };
   } finally {
@@ -267,19 +299,21 @@ Deno.test({
           `control: no $spin function in ${[...fns.keys()].join(", ")}`,
         );
       }
-      const got = violations(spin[1], () => false).map((v) =>
+      const got = reachViolations(spin[0], fns).map((v) =>
         v.replace(/ \(.*\)$/, "")
       );
       for (const want of ["a loop", "an allocation"]) {
-        if (!got.includes(want)) {
+        if (!got.includes(`$${spin[0]}: ${want}`)) {
           throw new Error(
-            `control: want "${want}" flagged, got ${JSON.stringify(got)}`,
+            `control: want "${want}" flagged in $spin, got ${
+              JSON.stringify(got)
+            }`,
           );
         }
       }
-      if (!got.some((v) => v.startsWith("a call to $helper"))) {
+      if (!got.some((v) => /→ \$helper\S*: a loop$/.test(v))) {
         throw new Error(
-          `control: want the call to helper flagged, got ${
+          `control: want helper's loop flagged through the call, got ${
             JSON.stringify(got)
           }`,
         );

@@ -8,6 +8,26 @@ see **`DECISIONS.md`**.
 
 ## Type system (Track A)
 
+- **Every function has an effects summary, and a getter may call a function whose summary
+  qualifies (D2135, D2136).** The checker computes, per declaration and per generic instance
+  (bottom-up over the call graph, Tarjan for recursion, memoised), what a function writes (a
+  module `let`, a place reached from a parameter, linear memory), which module `let` or
+  `extern let` it reads, whether it allocates in its
+  source (a struct, list or closure literal, string `+` and interpolation), its cost in the
+  getter's steps (a call is 1 plus the callee, a branch its dearest arm, a string-literal
+  compare its length; a loop, recursion, a call through a function value or to the host is
+  unbounded), and its host calls. The getter step walk is now this summary's walk, not a second
+  one. A getter body may call a user or std function, directly, by UFCS or as a user operator,
+  when the callee writes nothing, reads no module `let`, allocates and prints nothing and fits
+  the budget:
+  `get level(self: Knob): f64 { clamp01(self.raw) }` compiles. A generic is judged at the pinned
+  types (`T == T` is fine at `i32`, refused at `string`; an operator over an unbound `T`, or one
+  dispatching to a user operator at the pin, is charged as that call), and a refusal names the fact and the
+  path (`calls viaBump, which writes the module let count (viaBump() → bump())`). Readers: LSP
+  hover on a function shows `writes: none · reads: none · allocates: no · cost: 0 steps · I/O: none`, and the
+  `effectsDump` export pins the summaries in `tests/vl_effects_summary_test.ts`. The body-shape
+  test follows calls, so a helper a getter reaches is held to no loop and no allocation too.
+  Programs without getters compile byte-identically.
 - **A getter body is held to a step budget, a string-literal compare is priced, and a float `%`
   is refused (D2061, D2062, D2063).** The contract counted loops, so nine loop-free getters each
   reading the previous one four times passed and did 65,536 calls behind one `.a8`. The checker

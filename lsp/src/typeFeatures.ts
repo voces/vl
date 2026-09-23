@@ -1048,6 +1048,18 @@ export const docMarkdown = (
 };
 
 /**
+ * A hover body with a function's effects summary under it (function-effects-design §D):
+ * the `docMarkdown` layout, then the one-line summary as prose — "writes: none · reads: none ·
+ * allocates: no · cost: 3 steps · I/O: none". No summary leaves the body unchanged, so a
+ * value binding hovers exactly as before.
+ */
+export const withEffects = (markdown: string, effects?: string): string => {
+  const line = effects?.trim();
+  if (!line) return markdown;
+  return markdown ? `${markdown}\n\n${line}` : line;
+};
+
+/**
  * One in-scope binding from an EXTERNAL source (the wasm checker's `scopeAt`),
  * the native counterpart of a {@link SymbolTable} binding. `kind` is
  * 0=variable / 1=parameter / 2=function (the same convention as

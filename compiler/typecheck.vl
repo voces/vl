@@ -150,6 +150,7 @@ import {
   externArityAt,
   externCount,
   externDeclCount,
+  externGlobalLinkOfName,
   externGlobalLinkOfNode,
   externLinkOf,
   externNameAt,
@@ -3796,6 +3797,7 @@ export function initChecker() {
   getWriteTarget = -1
   getLetNodes = []
   getLetTys = []
+  esReset()
   opIdxSiteNode = []
   opIdxSiteFn = []
   opBinSiteNode = []
@@ -37244,7 +37246,7 @@ const GW_LOOP = "a getter must not loop"
 const GW_RECUR = "a getter must not recurse"
 const GW_EFFECT = "a getter must not have side effects"
 const GW_STATE = "a getter must not read mutable state"
-const GW_CALL = "a getter may call only other getters and the single-instruction numeric, load and SIMD intrinsics"
+const GW_CALL = "a getter may call only other getters, the single-instruction numeric, load and SIMD intrinsics, and functions that write, allocate and print nothing within the step budget"
 const GW_OTHER = "a getter body may only compute a value from its receiver"
 
 // The most abstract steps one getter read may cost (§D3a-contract, D2061): a getter read is 1
@@ -37546,8 +37548,10 @@ function gwWalk(ix: i32) {
     return gwTypeOk(ix)
   }
   if n is Index {
-    if opIdxFnAtNode(ix) != "" {
-      getterContractErr("calls a user `\"[]\"` operator", GW_CALL, ix)
+    const idxOp = opIdxFnAtNode(ix)
+    if idxOp != "" {
+      const args: i32[] = [n.idxArr, n.idxIndex]
+      gwOperatorCall(idxOp, args, "calls a user `\"[]\"` operator", ix)
     } else if gwErasedIs(nodeTyIxOf(n.idxArr)) == "map" {
       getterContractErr(
         "indexes the map `" +
@@ -37703,11 +37707,8 @@ function gwBinExpr(n: BinExpr, ix: i32) {
   }
   const opFn = opBinFnAtNode(ix)
   if opFn != "" {
-    getterContractErr(
-      "calls the user operator `" + n.binOp + "`, an ordinary function",
-      GW_CALL,
-      ix,
-    )
+    const args: i32[] = [n.binLeft, n.binRight]
+    gwOperatorCall(opFn, args, "calls the user operator `" + n.binOp + "`", ix)
   }
   gwWalk(n.binLeft)
   gwWalk(n.binRight)
@@ -37847,7 +37848,7 @@ function gwErasedIs(ty: i32): string {
   }
   if t is TyErr { return "other" }
   if t is TyFunc { return "other" }
-  if t is TyVar { return "other" }
+  if t is TyVar { return esTyVarErased(e) }
   if t is TyNeg { return "other" }
   "other"
 }
@@ -37878,18 +37879,27 @@ function gwTagOperand(ix: i32): boolean {
   n is NumLit
 }
 
-// A call: only an intrinsic the contract admits. A getter read is a `Member`, not a call, and
-// every other callee — a user or std function, a method, an extern, a function value — is refused.
+// A call: an intrinsic the contract admits, or a declared function — directly or by UFCS —
+// whose summary at this call's types writes, allocates and prints nothing and has a step bound
+// (D2136). A getter read is a `Member`, not a call; a method, an extern and a function value
+// are refused.
 function gwCall(n: Call, ix: i32) {
   const callee = P.nodes[n.callFn]
-  if callee is Ident {
+  let local = false
+  if callee is Ident { local = gwIsLocal(callee.identName) }
+  let kind = -1
+  if local { kind = 1 }
+  const d = esCalleeDecl(getDecls[gwRow], n, ix, kind)
+  if d >= 0 {
+    const row = esCalleeRow(esDeclRow(getDecls[gwRow]), d, esCallArgs(n))
+    gwCalleeCheck(row, "calls `" + calleeNameOf(ix) + "`", ix)
+    if callee is Member { gwWalk(callee.memObj) }
+  } else if callee is Ident {
     const nm = callee.identName
     if externLinkOf(nm) >= 0 {
       getterCallErr("calls the host function `" + nm + "`", GW_EFFECT, ix)
-    } else if gwIsLocal(nm) || (moduleGlobals[nm] ?? false) {
+    } else if local || (moduleGlobals[nm] ?? false) {
       getterCallErr("calls the function value `" + nm + "`", GW_CALL, ix)
-    } else if fnDeclIx.has(nm) {
-      getterCallErr("calls the function `" + nm + "`", GW_CALL, ix)
     } else if !getterIntrinsicOk(nm) {
       getterCallErr("calls `" + nm + "`", GW_CALL, ix)
     }
@@ -37905,6 +37915,17 @@ function gwCall(n: Call, ix: i32) {
     i = i + 1
   }
   gwTypeOk(ix)
+}
+
+// A user operator or `"[]"` at node `ix`, the function `fn` it dispatches to, called with
+// `args`: admitted on the same summary as any other call.
+function gwOperatorCall(fn: string, args: i32[], what: string, ix: i32) {
+  const d = fnDeclIx[fn] ?? -1
+  if d < 0 {
+    return getterContractErr(what + ", an ordinary function", GW_CALL, ix)
+  }
+  const row = esCalleeRow(esDeclRow(getDecls[gwRow]), d, args)
+  gwCalleeCheck(row, what, ix)
 }
 
 // A `match`: its scrutinee, its payload bindings and its arm bodies; patterns are literals or
@@ -37931,162 +37952,480 @@ function gwMatch(n: MatchExpr, ix: i32) {
   gwTypeOk(ix)
 }
 
-// ── the getter step budget (§D3a-contract, D2061) ────────────────────────────
+// ── the per-function summary (function-effects-design.md §C1, D2135) ─────────
 
-// Each registry row's cost in steps: -1 not yet costed, -2 being costed (a cycle, refused on
-// its own), else the steps. Memoised, so a getter read many times is costed once.
-let gcCost: i32[] = []
-// Per row, the heaviest contributor on its costed path, for the refusal's path: the getter row
-// read most expensively (or -1) and how often, and the string-literal compares' steps and count.
+// A cost past every budget, standing for "no step bound": a loop, recursion, a call through a
+// function value or to the host, or an operator whose lowering loops over its operands.
+const ES_UNBOUNDED = 1000000001
+
+// One row per summarised instance: a declaration plus the type bindings a call pinned it at
+// (§C4), keyed by `esKeyOf`. Every column below is parallel to `esDecl`.
+let esKeyIx: {[string]: i32} = Map()
+let esDecl: i32[] = []
+let esBindStart: i32[] = []
+let esBindCount: i32[] = []
+let esBindNames: string[] = []
+let esBindTys: i32[] = []
+// The row's cost in steps (-1 not yet costed, else a count or `ES_UNBOUNDED`), and why it has
+// no bound ("" while it has one).
+let esCost: i32[] = []
+let esWhy: string[] = []
+// The first write, allocation, host call and call of unknown effect the row reaches, "" for
+// none, and for each the callee row it came through (-1 when the row's own body does it).
+let esWrite: string[] = []
+let esAlloc: string[] = []
+let esHost: string[] = []
+let esUnknown: string[] = []
+// The first module `let` or `extern let` binding the row reads, "" for none (the getter rule:
+// a getter describes its receiver, and a helper may not read what the getter may not).
+let esReadLet: string[] = []
+let esReadLetVia: i32[] = []
+// Whether the row's write names a place only its own body can see (a parameter's or a local's
+// field): a caller re-spells such a write as memory reachable from the callee's arguments.
+let esWriteLocal: boolean[] = []
+let esWhyVia: i32[] = []
+let esWriteVia: i32[] = []
+let esAllocVia: i32[] = []
+let esHostVia: i32[] = []
+let esUnknownVia: i32[] = []
+// The names in scope at the node being walked, innermost last, from `esScopeBase` up for the
+// row being walked: kind 0 a parameter, 1 a local, 2 a `const` bound directly to a literal the
+// body built, whose writes nobody else can see (§C2).
+let esScopeNames: string[] = []
+let esScopeKind: i32[] = []
+let esScopeBase = 0
+// Tarjan's bookkeeping over the instance call graph (§C4): visit order, low link, the stack.
+let esOrder: i32[] = []
+let esLow: i32[] = []
+let esOnStack: boolean[] = []
+let esStack: i32[] = []
+let esCounter = 0
+// The row whose body is being walked, so `gwErasedIs` can read a type parameter through the
+// row's bindings; -1 outside a summary walk, where a type parameter erases as before.
+let esFrame = -1
+// Per row, the heaviest contributor on its costed path, for a refusal's path: the callee row
+// called most expensively (or -1) and how often, and the string-literal compares' steps and count.
 let gcTopRow: i32[] = []
 let gcTopCount: i32[] = []
 let gcTopSteps: i32[] = []
 let gcCmpSteps: i32[] = []
 let gcCmpCount: i32[] = []
-// What the path being costed charged, in order: a row read (>= 0) or a literal compare of
+// What the path being costed charged, in order: a callee row (>= 0) or a literal compare of
 // length `-e` (< 0). A branch keeps only its dearest arm's entries.
 let gcTrail: i32[] = []
+// Each getter registry row's cost, read off its summary row by `getterBudgetCheck`.
+let gcCost: i32[] = []
 
+export function esReset() {
+  esKeyIx = Map()
+  esDecl = []
+  esBindStart = []
+  esBindCount = []
+  esBindNames = []
+  esBindTys = []
+  esCost = []
+  esWhy = []
+  esWrite = []
+  esAlloc = []
+  esHost = []
+  esUnknown = []
+  esReadLet = []
+  esReadLetVia = []
+  esWriteLocal = []
+  esWhyVia = []
+  esWriteVia = []
+  esAllocVia = []
+  esHostVia = []
+  esUnknownVia = []
+  esScopeNames = []
+  esScopeKind = []
+  esScopeBase = 0
+  esOrder = []
+  esLow = []
+  esOnStack = []
+  esStack = []
+  esCounter = 0
+  esFrame = -1
+  gcTopRow = []
+  gcTopCount = []
+  gcTopSteps = []
+  gcCmpSteps = []
+  gcCmpCount = []
+  gcTrail = []
+  0
+}
+
+// `a + b` in steps: saturating at `GETTER_STEP_CAP`, and `ES_UNBOUNDED` when either is.
 function gcAdd(a: i32, b: i32): i32 {
+  if a >= ES_UNBOUNDED || b >= ES_UNBOUNDED { return ES_UNBOUNDED }
   if a >= GETTER_STEP_CAP - b { return GETTER_STEP_CAP }
   a + b
 }
 
-// The steps one read of getter row `gi` costs beyond the read itself.
-function getterCost(gi: i32): i32 {
-  if gcCost[gi] >= 0 { return gcCost[gi] }
-  if gcCost[gi] == -2 { return 0 }
-  gcCost[gi] = -2
-  const mark = gcTrail.length
-  let c = 0
-  const d = P.nodes[getDecls[gi]]
-  if d is FuncDecl { c = gcNode(d.fnBody) }
-  gcSummarise(gi, mark)
-  while gcTrail.length > mark { gcTrail.pop() }
-  gcCost[gi] = c
-  c
-}
-
-// Records row `gi`'s heaviest contributor from its trail, the entries past `mark`.
-function gcSummarise(gi: i32, mark: i32) {
-  let best = -1
-  let bestCount = 0
-  let bestSteps = -1
-  let cmpSteps = 0
-  let cmpCount = 0
-  let i = mark
-  while i < gcTrail.length {
-    const e = gcTrail[i]
-    if e < 0 {
-      cmpSteps = gcAdd(cmpSteps, 0 - e)
-      cmpCount = cmpCount + 1
-    } else {
-      let seen = false
-      let k = mark
-      while k < i {
-        if gcTrail[k] == e { seen = true }
-        k = k + 1
-      }
-      if !seen {
-        let count = 0
-        let j = i
-        while j < gcTrail.length {
-          if gcTrail[j] == e { count = count + 1 }
-          j = j + 1
-        }
-        let steps = 0
-        let m = 0
-        while m < count {
-          steps = gcAdd(steps, gcAdd(1, gcCostSoFar(e)))
-          m = m + 1
-        }
-        if steps > bestSteps {
-          best = e
-          bestCount = count
-          bestSteps = steps
-        }
-      }
-    }
+// The summary row of declaration `decl` pinned at bindings `names`/`tys`, created on first ask
+// and computed before it is returned. Bindings are keyed by their rendering, so two calls that
+// pin the same types share one row.
+export function esRowFor(decl: i32, names: string[], tys: i32[]): i32 {
+  let key = i32ToStr(decl)
+  let i = 0
+  while i < names.length {
+    key = key + "|" + names[i] + "=" + tyToStr(tys[i])
     i = i + 1
   }
-  gcTopRow[gi] = best
-  gcTopCount[gi] = bestCount
-  gcTopSteps[gi] = bestSteps
-  gcCmpSteps[gi] = cmpSteps
-  gcCmpCount[gi] = cmpCount
+  const hit = esKeyIx[key] ?? -1
+  if hit >= 0 {
+    if esOrder[hit] < 0 { esVisit(hit) }
+    return hit
+  }
+  const r = esDecl.length
+  esKeyIx[key] = r
+  esDecl.push(decl)
+  esBindStart.push(esBindNames.length)
+  esBindCount.push(names.length)
+  let j = 0
+  while j < names.length {
+    esBindNames.push(names[j])
+    esBindTys.push(tys[j])
+    j = j + 1
+  }
+  esCost.push(-1)
+  esWhy.push("")
+  esWrite.push("")
+  esAlloc.push("")
+  esHost.push("")
+  esUnknown.push("")
+  esReadLet.push("")
+  esReadLetVia.push(-1)
+  esWriteLocal.push(false)
+  esWhyVia.push(-1)
+  esWriteVia.push(-1)
+  esAllocVia.push(-1)
+  esHostVia.push(-1)
+  esUnknownVia.push(-1)
+  esOrder.push(-1)
+  esLow.push(-1)
+  esOnStack.push(false)
+  gcTopRow.push(-1)
+  gcTopCount.push(0)
+  gcTopSteps.push(0)
+  gcCmpSteps.push(0)
+  gcCmpCount.push(0)
+  esVisit(r)
+  r
+}
+
+// The unpinned summary row of declaration `decl`: a type parameter no call bound erases as
+// "may loop", so a generic's own row is the worst of its instances.
+export function esDeclRow(decl: i32): i32 {
+  const none: string[] = []
+  const noTys: i32[] = []
+  esRowFor(decl, none, noTys)
+}
+
+// Computes row `r` once, callees first (Tarjan over the instance call graph, §C4). A row on a
+// cycle has no step bound, and every row of one cycle shares the cycle's facts.
+function esVisit(r: i32) {
+  esOrder[r] = esCounter
+  esLow[r] = esCounter
+  esCounter = esCounter + 1
+  esStack.push(r)
+  esOnStack[r] = true
+  const saveFrame = esFrame
+  const saveBase = esScopeBase
+  esFrame = r
+  esScopeBase = esScopeNames.length
+  const mark = gcTrail.length
+  let c = 0
+  const d = P.nodes[esDecl[r]]
+  if d is FuncDecl {
+    let i = 0
+    while i < d.fnParams.length {
+      const p = P.nodes[d.fnParams[i]]
+      if p is Param { esScopePush(p.parName, 0) }
+      i = i + 1
+    }
+    c = gcNode(r, d.fnBody)
+  }
+  gcSummarise(r, mark)
+  while gcTrail.length > mark { gcTrail.pop() }
+  esScopeTruncate(esScopeBase)
+  esScopeBase = saveBase
+  esFrame = saveFrame
+  if esCost[r] < c { esCost[r] = c }
+  if esLow[r] == esOrder[r] { esCloseCycle(r) }
   0
 }
 
-// Row `gi`'s cost, reading an in-progress row (a cycle) as 0.
-function gcCostSoFar(gi: i32): i32 {
-  if gcCost[gi] < 0 { return 0 }
-  gcCost[gi]
+// Pops the strongly connected component rooted at `r`; when it is a cycle, every member takes
+// every member's facts and loses its bound.
+function esCloseCycle(r: i32) {
+  const members: i32[] = []
+  let done = false
+  while !done && esStack.length > 0 {
+    const m = esStack[esStack.length - 1]
+    esStack.pop()
+    esOnStack[m] = false
+    members.push(m)
+    if m == r { done = true }
+  }
+  if members.length < 2 { return 0 }
+  let i = 0
+  while i < members.length {
+    let j = 0
+    while j < members.length {
+      if i != j { esTakeFacts(members[i], members[j]) }
+      j = j + 1
+    }
+    esUnbound(members[i], "it recurses through `" + esLabel(r) + "`", -1)
+    i = i + 1
+  }
+  0
 }
 
-// The steps node `ix` of a getter body costs. Every AST kind is named; the kinds the body walk
-// refuses cost 0 here, since the walk's refusal is the error that program gets.
-function gcNode(ix: i32): i32 {
-  if ix < 0 || ix >= P.nodes.length { return 0 }
-  const n = P.nodes[ix]
-  if n is Paren { return gcNode(n.parInner) }
-  if n is Unary { return gcNode(n.unArg) }
-  if n is AsExpr { return gcNode(n.asObj) }
-  if n is IsExpr { return gcAdd(gcNode(n.isObj), gcIsLitSteps(n, ix)) }
-  if n is OptMember { return gcNode(n.omObj) }
-  if n is Index { return gcAdd(gcNode(n.idxArr), gcNode(n.idxIndex)) }
-  if n is LetDecl { return gcNode(n.letInit) }
-  if n is RetStmt { return gcNode(n.retArg) }
-  if n is Member {
-    let c = gcNode(n.memObj)
-    const gFn = getSiteFnOf(ix)
-    if gFn != "" {
-      const to = getRowOf(gFn)
-      if to >= 0 {
-        c = gcAdd(c, gcAdd(1, getterCost(to)))
-        gcTrail.push(to)
-      }
-    }
-    return c
+// Row `s` takes each fact row `c` has and `s` lacks, recording `c` as where it came from.
+function esTakeFacts(s: i32, c: i32) {
+  if esWrite[s] == "" && esWrite[c] != "" {
+    esWrite[s] = esWrite[c]
+    if esWriteLocal[c] { esWrite[s] = "memory reachable from its arguments" }
+    esWriteVia[s] = c
   }
-  if n is BinExpr {
-    let c = gcAdd(gcNode(n.binLeft), gcNode(n.binRight))
-    const lit = gwStrLitEqLen(n)
-    if lit > 0 {
-      c = gcAdd(c, lit)
-      gcTrail.push(0 - lit)
-    }
-    return c
+  if esReadLet[s] == "" && esReadLet[c] != "" {
+    esReadLet[s] = esReadLet[c]
+    esReadLetVia[s] = c
   }
-  if n is Call {
-    let c = 0
-    const callee = P.nodes[n.callFn]
-    if callee is Member { c = gcNode(callee.memObj) }
+  if esAlloc[s] == "" && esAlloc[c] != "" {
+    esAlloc[s] = esAlloc[c]
+    esAllocVia[s] = c
+  }
+  if esHost[s] == "" && esHost[c] != "" {
+    esHost[s] = esHost[c]
+    esHostVia[s] = c
+  }
+  if esUnknown[s] == "" && esUnknown[c] != "" {
+    esUnknown[s] = esUnknown[c]
+    esUnknownVia[s] = c
+  }
+  0
+}
+
+// Marks row `s` unbounded for reason `why` (reached through callee row `via`, or -1), keeping
+// the first reason; answers `ES_UNBOUNDED` so a node can return it.
+function esUnbound(s: i32, why: string, via: i32): i32 {
+  if esWhy[s] == "" {
+    esWhy[s] = why
+    esWhyVia[s] = via
+  }
+  esCost[s] = ES_UNBOUNDED
+  ES_UNBOUNDED
+}
+
+function esSetWrite(s: i32, what: string) {
+  if esWrite[s] == "" { esWrite[s] = what }
+  0
+}
+
+// Records a write into a place only the row's own body can name.
+function esSetLocalWrite(s: i32, what: string) {
+  if esWrite[s] == "" {
+    esWrite[s] = what
+    esWriteLocal[s] = true
+  }
+  0
+}
+
+function esSetAlloc(s: i32, what: string, at: i32) {
+  if esAlloc[s] == "" { esAlloc[s] = what + esAtLine(at) }
+  0
+}
+
+function esSetHost(s: i32, what: string) {
+  if esHost[s] == "" { esHost[s] = what }
+  0
+}
+
+function esSetUnknown(s: i32, what: string, at: i32) {
+  if esUnknown[s] == "" { esUnknown[s] = what + esAtLine(at) }
+  0
+}
+
+// " at line N" for node `at` in the entry module; "" elsewhere, where a line number would read
+// as the entry's own.
+function esAtLine(at: i32): string {
+  if ufcsModOfNode(at) > 0 { return "" }
+  const ln = nodeLineOf(at)
+  if ln <= 0 { return "" }
+  " at line " + i32ToStr(ln)
+}
+
+function esScopePush(name: string, kind: i32) {
+  esScopeNames.push(name)
+  esScopeKind.push(kind)
+  0
+}
+
+function esScopeTruncate(mark: i32) {
+  while esScopeNames.length > mark {
+    esScopeNames.pop()
+    esScopeKind.pop()
+  }
+  0
+}
+
+// Whether node `ix` is a struct or list literal every part of which is private to it: a scalar
+// or string value, or another such literal. A part holding a reference it did not build (a
+// parameter's object) makes a write through the literal a write to that object.
+function esIsBuiltLiteral(ix: i32): boolean {
+  const u = cwPeel(ix)
+  if u < 0 || u >= P.nodes.length { return false }
+  const n = P.nodes[u]
+  if n is ObjLit {
     let i = 0
-    while i < n.callArgs.length {
-      c = gcAdd(c, gcNode(n.callArgs[i]))
+    while i < n.objFields.length {
+      const f = P.nodes[n.objFields[i]]
+      if f is FieldInit {
+        if !esIsPrivatePart(f.fiValue) { return false }
+      } else {
+        return false
+      }
       i = i + 1
     }
+    return true
+  }
+  esIsBuiltList(u)
+}
+
+function esIsBuiltList(u: i32): boolean {
+  const n = P.nodes[u]
+  if n is ArrayLit {
+    let i = 0
+    while i < n.arrElems.length {
+      if !esIsPrivatePart(n.arrElems[i]) { return false }
+      i = i + 1
+    }
+    return true
+  }
+  false
+}
+
+// Whether value node `ix` shares no mutable object with anything: a scalar or string, or a
+// literal `esIsBuiltLiteral` accepts.
+function esIsPrivatePart(ix: i32): boolean {
+  if esIsBuiltLiteral(ix) { return true }
+  const ty = nodeTyIxOf(ix)
+  if ty < 0 { return false }
+  const t = T.tys[nomErasedTyIx(ty)]
+  if t is TyPrim { return true }
+  t is TyLit
+}
+
+// The kind of the innermost binding of `name` in the row being walked (see `esScopeNames`), or
+// -1 when the row binds no such name where the walk is.
+function esLocalKind(name: string): i32 {
+  let k = esScopeNames.length - 1
+  while k >= esScopeBase {
+    if esScopeNames[k] == name { return esScopeKind[k] }
+    k = k - 1
+  }
+  -1
+}
+
+// The type row `r` binds type parameter `ty` to, or -1 when it binds none.
+function esBoundTy(r: i32, ty: i32): i32 {
+  if r < 0 || ty < 0 { return -1 }
+  const t = T.tys[ty]
+  if t is TyVar {
+    let k = esBindStart[r]
+    while k < esBindStart[r] + esBindCount[r] {
+      if esBindNames[k] == t.tvName { return esBindTys[k] }
+      k = k + 1
+    }
+  }
+  -1
+}
+
+// Type `ty` as row `r` sees it: a type parameter the row binds is its binding.
+function esShownTy(r: i32, ty: i32): i32 {
+  const b = esBoundTy(r, ty)
+  if b >= 0 { return b }
+  ty
+}
+
+// What type parameter `ty` erases to inside the summary walk: its binding's erasure, "tyvar"
+// when the walked row binds it to nothing concrete, and "other" outside a walk.
+function esTyVarErased(ty: i32): string {
+  if esFrame < 0 { return "other" }
+  const b = esBoundTy(esFrame, ty)
+  if b < 0 { return "tyvar" }
+  const bt = T.tys[b]
+  if bt is TyVar { return "tyvar" }
+  gwErasedIs(b)
+}
+
+// ── the summary walk ─────────────────────────────────────────────────────────
+
+// The steps node `ix` of row `r`'s body costs, recording the row's facts as it goes. Every AST
+// kind is named; a getter body's refused constructs are costed as what they do, and the body
+// walk's refusal stays the error that program gets.
+function gcNode(r: i32, ix: i32): i32 {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const n = P.nodes[ix]
+  if n is Paren { return gcNode(r, n.parInner) }
+  if n is Unary { return gcNode(r, n.unArg) }
+  if n is AsExpr { return gcNode(r, n.asObj) }
+  if n is IsExpr { return gcAdd(gcNode(r, n.isObj), gcIsLitSteps(n, ix)) }
+  if n is OptMember { return gcNode(r, n.omObj) }
+  if n is Index { return gcIndex(r, n, ix) }
+  if n is LetDecl {
+    const c = gcNode(r, n.letInit)
+    let kind = 1
+    if n.letKw == "const" && esIsBuiltLiteral(n.letInit) { kind = 2 }
+    esScopePush(n.letName, kind)
     return c
   }
+  if n is RetStmt { return gcNode(r, n.retArg) }
+  if n is Member { return gcMember(r, n, ix) }
+  if n is BinExpr { return gcBinExpr(r, n, ix) }
+  if n is Call { return gcCall(r, n, ix) }
   if n is Block {
+    const mark = esScopeNames.length
     let c = 0
     let i = 0
     while i < n.blkStmts.length {
-      c = gcAdd(c, gcNode(n.blkStmts[i]))
+      c = gcAdd(c, gcNode(r, n.blkStmts[i]))
       i = i + 1
     }
+    esScopeTruncate(mark)
     return c
   }
   if n is IfStmt {
     const arms: i32[] = [n.ifThen, n.ifElse]
-    return gcAdd(gcNode(n.ifCond), gcDearest(arms))
+    return gcAdd(gcNode(r, n.ifCond), gcDearest(r, arms))
   }
-  if n is MatchExpr { return gcMatch(n) }
-  // A bounded loop, once admitted, costs its body times its trip count; today the walk refuses
-  // every loop.
-  if n is WhileStmt { return 0 }
-  if n is ForRange { return 0 }
-  if n is ForIn { return 0 }
+  if n is MatchExpr { return gcMatch(r, n) }
+  if n is WhileStmt {
+    gcNode(r, n.whileCond)
+    gcNode(r, n.whileBody)
+    return esUnbound(r, "it loops (`while`" + esAtLine(ix) + ")", -1)
+  }
+  if n is ForRange {
+    gcNode(r, n.frFrom)
+    gcNode(r, n.frTo)
+    gcNode(r, n.frStep)
+    const mark = esScopeNames.length
+    esScopePush(n.frVar, 1)
+    gcNode(r, n.frBody)
+    esScopeTruncate(mark)
+    return esUnbound(r, "it loops (`for`" + esAtLine(ix) + ")", -1)
+  }
+  if n is ForIn {
+    gcNode(r, n.fiIter)
+    const mark = esScopeNames.length
+    esScopePush(n.fiVar, 1)
+    if n.fiVar2 != "" { esScopePush(n.fiVar2, 1) }
+    gcNode(r, n.fiBody)
+    esScopeTruncate(mark)
+    return esUnbound(r, "it loops (`for … in`" + esAtLine(ix) + ")", -1)
+  }
   if n is BreakStmt { return 0 }
   if n is ContinueStmt { return 0 }
   // A leaf costs nothing.
@@ -38095,14 +38434,41 @@ function gcNode(ix: i32): i32 {
   if n is CharLit { return 0 }
   if n is BoolLit { return 0 }
   if n is NullLit { return 0 }
-  if n is Ident { return 0 }
+  if n is Ident { return gcIdent(r, n, ix) }
   if n is ErrExpr { return 0 }
-  // What the walk refuses outright costs nothing here; its refusal is the program's error.
-  if n is FuncDecl { return 0 }
-  if n is ObjLit { return 0 }
-  if n is FieldInit { return 0 }
-  if n is ArrayLit { return 0 }
-  if n is Spread { return 0 }
+  // A nested function or a lambda builds a closure; its body runs only when it is called.
+  if n is FuncDecl {
+    esSetAlloc(r, "a closure", ix)
+    esScopePush(n.fnName, 3)
+    return 0
+  }
+  if n is ObjLit {
+    esSetAlloc(r, "a struct literal", ix)
+    let c = 0
+    let i = 0
+    while i < n.objFields.length {
+      c = gcAdd(c, gcNode(r, n.objFields[i]))
+      i = i + 1
+    }
+    return c
+  }
+  if n is FieldInit { return gcNode(r, n.fiValue) }
+  if n is ArrayLit {
+    esSetAlloc(r, "a list literal", ix)
+    let c = 0
+    let i = 0
+    while i < n.arrElems.length {
+      c = gcAdd(c, gcNode(r, n.arrElems[i]))
+      i = i + 1
+    }
+    return c
+  }
+  if n is Spread {
+    esSetAlloc(r, "a spread", ix)
+    gcNode(r, n.spdArg)
+    return esUnbound(r, "it copies a list with `...`" + esAtLine(ix), -1)
+  }
+  // Declarations and annotations run nothing.
   if n is TypeDecl { return 0 }
   if n is UnionDecl { return 0 }
   if n is FieldDef { return 0 }
@@ -38113,14 +38479,610 @@ function gcNode(ix: i32): i32 {
   0
 }
 
+// A name read costs nothing, but naming a declared function as a value builds a closure, and a
+// read of a module `let` or an `extern let` is the read fact. The walk never visits a callee
+// name, so every name it reaches is in value position.
+function gcIdent(r: i32, n: Ident, ix: i32): i32 {
+  const nm = n.identName
+  if esLocalKind(nm) >= 0 { return 0 }
+  if fnDeclIx.has(nm) {
+    esSetAlloc(r, "a function value", ix)
+    return 0
+  }
+  if esReadLet[r] != "" { return 0 }
+  if esIsExternLet(nm) {
+    esReadLet[r] = "the extern `" + nm + "`"
+  } else if (moduleGlobals[nm] ?? false) && !isConstName(nm) {
+    esReadLet[r] = "the module `let` `" + nm + "`"
+  }
+  0
+}
+
+// Whether `nm` names an `extern let` binding: a mutable global the host provides.
+function esIsExternLet(nm: string): boolean {
+  const link = externGlobalLinkOfName(nm)
+  if link < 0 || link >= extGMut.length { return false }
+  extGMut[link] == 1
+}
+
+// An index read: a user `"[]"` operator is a call to it, a map read probes in a loop.
+function gcIndex(r: i32, n: Index, ix: i32): i32 {
+  const c = gcAdd(gcNode(r, n.idxArr), gcNode(r, n.idxIndex))
+  let op = opIdxFnAtNode(ix)
+  const rawTy = nodeTyIxOf(n.idxArr)
+  const recvTy = esShownTy(r, rawTy)
+  if op == "" && esIsTyVar(rawTy) {
+    if esIsTyVar(recvTy) { return gcAdd(c, esOpenOperator(r, "[]", ix)) }
+    op = opIdxFnFor("[]", recvTy)
+  }
+  if op != "" {
+    const args: i32[] = [n.idxArr, n.idxIndex]
+    return gcAdd(c, gcCallDecl(r, fnDeclIx[op] ?? -1, args, ix))
+  }
+  if gwErasedIs(recvTy) == "map" {
+    return esUnbound(
+      r,
+      "it indexes a map, which probes in a loop" + esAtLine(ix),
+      -1,
+    )
+  }
+  c
+}
+
+// A member read: a getter read is a call of that getter.
+function gcMember(r: i32, n: Member, ix: i32): i32 {
+  let c = gcNode(r, n.memObj)
+  const gFn = getSiteFnOf(ix)
+  if gFn != "" {
+    const d = fnDeclIx[gFn] ?? -1
+    if d >= 0 {
+      const to = esDeclRow(d)
+      c = gcAdd(c, gcCharge(r, to))
+    }
+  }
+  c
+}
+
+// Charges row `r` one call of row `to`: 1 plus `to`'s cost, and `to`'s facts. A callee still
+// open on the walk is recursion.
+function gcCharge(r: i32, to: i32): i32 {
+  if esOnStack[to] {
+    if esLow[r] > esLow[to] { esLow[r] = esLow[to] }
+    gcTrail.push(to)
+    esTakeFacts(r, to)
+    return esUnbound(r, "it recurses through `" + esLabel(to) + "`", -1)
+  }
+  esTakeFacts(r, to)
+  gcTrail.push(to)
+  if esCost[to] >= ES_UNBOUNDED {
+    if keyHasPrefix(esWhy[to], "it recurses") {
+      return esUnbound(r, "it calls `" + esLabel(to) + "`, which recurses", -1)
+    }
+    return esUnbound(r, esWhy[to], to)
+  }
+  gcAdd(1, esCost[to])
+}
+
+// A binary expression: an assignment's write, the operators whose lowering allocates or
+// loops, a string-literal compare at the literal's length, and a user operator as a call.
+function gcBinExpr(r: i32, n: BinExpr, ix: i32): i32 {
+  if n.binOp == "=" {
+    // A bare name assigned to is written, not read; a place's object and index are read.
+    let lc = 0
+    if !esIsBareName(n.binLeft) { lc = gcNode(r, n.binLeft) }
+    esAssignWrite(r, n.binLeft)
+    return gcAdd(lc, gcNode(r, n.binRight))
+  }
+  const c = gcAdd(gcNode(r, n.binLeft), gcNode(r, n.binRight))
+  if n.binTpl == 1 {
+    esSetAlloc(r, "string interpolation", ix)
+    return esUnbound(r, "it interpolates a string" + esAtLine(ix), -1)
+  }
+  if n.binOp == "&&" || n.binOp == "||" || n.binOp == "??" { return c }
+  // Inside a generic the operand types are the instance's: the shared node banks no operator
+  // dispatch, so a user operator is resolved here for the bound type, and an unbound type
+  // parameter may be anything.
+  const lt = esShownTy(r, nodeTyIxOf(n.binLeft))
+  const rt = esShownTy(r, nodeTyIxOf(n.binRight))
+  const resTy = esShownTy(r, nodeTyIxOf(ix))
+  let opFn = opBinFnAtNode(ix)
+  if opFn == "" && esBinOverTyVar(n) {
+    if esIsTyVar(lt) || esIsTyVar(rt) {
+      return gcAdd(c, esOpenOperator(r, n.binOp, ix))
+    }
+    opFn = opSelfFnKeyFor(n.binOp, lt)
+  }
+  if opFn != "" {
+    const args: i32[] = [n.binLeft, n.binRight]
+    return gcAdd(c, gcCallDecl(r, fnDeclIx[opFn] ?? -1, args, ix))
+  }
+  if (
+    n.binOp == "+" &&
+    (tyIsPrimNamed(resTy, "string") || tyIsPrimNamed(lt, "string"))
+  ) {
+    esSetAlloc(r, "a string concatenation", ix)
+    return esUnbound(r, "it concatenates strings" + esAtLine(ix), -1)
+  }
+  if (
+    n.binOp == "+" &&
+    (gwErasedIs(resTy) == "list" || gwErasedIs(lt) == "list")
+  ) {
+    esSetAlloc(r, "a list concatenation", ix)
+    return esUnbound(r, "it concatenates lists" + esAtLine(ix), -1)
+  }
+  if n.binOp == "%" && (gwIsFloat(resTy) || gwIsFloat(lt)) {
+    return esUnbound(r, "it takes a float remainder" + esAtLine(ix), -1)
+  }
+  if gwIsCompare(n.binOp) {
+    const lit = gwStrLitEqLen(n)
+    if lit > 0 {
+      gcTrail.push(0 - lit)
+      return gcAdd(c, lit)
+    }
+    if lit < 0 {
+      const bad = gwLoopCmpOperand(n.binLeft, n.binRight)
+      if bad >= 0 {
+        return esUnbound(
+          r,
+          "it compares `" +
+            tyToStr(esShownTy(r, nodeTyIxOf(bad))) +
+            "` values with `" +
+            n.binOp +
+            "`" +
+            esAtLine(ix),
+          -1,
+        )
+      }
+    }
+  }
+  c
+}
+
+// Whether either operand of `n` is typed by a bare type parameter, so its operator is decided
+// per instance.
+function esBinOverTyVar(n: BinExpr): boolean {
+  esIsTyVar(nodeTyIxOf(n.binLeft)) || esIsTyVar(nodeTyIxOf(n.binRight))
+}
+
+function esIsBareName(ix: i32): boolean {
+  const u = cwPeel(ix)
+  if u < 0 || u >= P.nodes.length { return false }
+  const n = P.nodes[u]
+  n is Ident
+}
+
+function esIsTyVar(ty: i32): boolean {
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  t is TyVar
+}
+
+// Operator `op` over a type parameter the row binds to nothing: any lowering, a user operator
+// included, may run, so it is unbounded, may allocate and is of unknown effect.
+function esOpenOperator(r: i32, op: string, ix: i32): i32 {
+  const what = "`" + op + "` over an unbound type parameter"
+  esSetAlloc(r, what, ix)
+  esSetUnknown(r, what, ix)
+  esUnbound(r, "it applies " + what + esAtLine(ix), -1)
+}
+
+// Records the write an assignment to place `lhs` makes: none to a local name or into a fresh
+// local's literal, else the module binding, the captured name or the heap place it reaches.
+function esAssignWrite(r: i32, lhs: i32) {
+  const u = cwPeel(lhs)
+  if u < 0 || u >= P.nodes.length { return 0 }
+  const t = P.nodes[u]
+  if t is Ident {
+    if esLocalKind(t.identName) >= 0 { return 0 }
+    if esIsExternLet(t.identName) {
+      return esSetWrite(r, "the extern `" + t.identName + "`")
+    }
+    if moduleGlobals[t.identName] ?? false {
+      return esSetWrite(r, "the module `let` `" + t.identName + "`")
+    }
+    return esSetWrite(r, "the captured `" + t.identName + "`")
+  }
+  esPlaceWrite(r, u, "")
+}
+
+// Records a write into the heap place at `ix`, `how` naming the method that writes it or "",
+// unless the place is rooted at a fresh local (§C2). The place is spelled with the narrowing
+// key vocabulary `fnWriteEffects` uses; a place with no key is a heap place.
+function esPlaceWrite(r: i32, ix: i32, how: string) {
+  let key = placeKeyOf(ix)
+  if key == "" {
+    key = indexRootKeyOf(ix)
+    if key != "" { key = key + "[…]" }
+  }
+  const rootKind = esLocalKind(esKeyRoot(key))
+  if key != "" && rootKind == 2 { return 0 }
+  let what = "a heap place"
+  if key != "" { what = "`" + key + "`" }
+  if how != "" { what = what + " (`." + how + "()`)" }
+  if key != "" && rootKind >= 0 { return esSetLocalWrite(r, what) }
+  esSetWrite(r, what)
+}
+
+// The name narrowing key `key` is rooted at: `p` for `p.x.y` or `p[0]`.
+function esKeyRoot(key: string): string {
+  let i = 0
+  while i < key.length {
+    if key[i] == '.' || key[i] == '[' { return key.slice(0, i) }
+    i = i + 1
+  }
+  key
+}
+
+// A call: its receiver and arguments, then the callee — a declared function (directly, by
+// UFCS or through a nested declaration) as a call of its summary, a built-in by what it does,
+// and anything else as a call of unknown effect.
+function gcCall(r: i32, n: Call, ix: i32): i32 {
+  let c = 0
+  const callee = P.nodes[n.callFn]
+  if callee is Member { c = gcNode(r, callee.memObj) }
+  let i = 0
+  while i < n.callArgs.length {
+    c = gcAdd(c, gcNode(r, n.callArgs[i]))
+    i = i + 1
+  }
+  let kind = -1
+  if callee is Ident { kind = esLocalKind(callee.identName) }
+  const local = kind >= 0
+  const d = esCalleeDecl(esDecl[r], n, ix, kind)
+  if d >= 0 { return gcAdd(c, gcCallDecl(r, d, esCallArgs(n), ix)) }
+  if callee is Ident {
+    const nm = callee.identName
+    if !local && !(moduleGlobals[nm] ?? false) {
+      return gcAdd(c, gcBuiltinCall(r, nm, ix))
+    }
+  }
+  if callee is Member {
+    if !esCalleeIsField(callee) {
+      return gcAdd(c, gcBuiltinMethod(r, callee, ix))
+    }
+  }
+  esSetUnknown(r, "a call of a function value", ix)
+  gcAdd(c, esUnbound(r, "it calls a function value" + esAtLine(ix), -1))
+}
+
+// The `FuncDecl` call `n` at node `ix` inside declaration `owner` reaches statically, or -1.
+// `kind` is how the callee name is bound where the call is (`esLocalKind`): 3, a function the
+// owner's body declared; any other local binding, a function value; -1, the top-level function
+// of that name. A UFCS member call resolves to its `self`-function; an extern is not one.
+export function esCalleeDecl(owner: i32, n: Call, ix: i32, kind: i32): i32 {
+  if owner < 0 || owner >= P.nodes.length { return -1 }
+  const cf = P.nodes[n.callFn]
+  if cf is Ident {
+    const nm = cf.identName
+    if externLinkOf(nm) >= 0 { return -1 }
+    if kind == 3 {
+      const d = P.nodes[owner]
+      if d is FuncDecl {
+        const nested = findFnDeclIn(d.fnBody, nm)
+        if nested >= 0 && nested != owner { return nested }
+      }
+      return -1
+    }
+    if kind >= 0 { return -1 }
+    return fnDeclIx[nm] ?? -1
+  }
+  esUfcsCallee(n.callFn, ix)
+}
+
+// The `self`-function the member callee at node `calleeIx` of UFCS call `ix` resolves to, or
+// -1 when the callee is not a member, is a field holding a function, or names a built-in method.
+function esUfcsCallee(calleeIx: i32, ix: i32): i32 {
+  const cf = P.nodes[calleeIx]
+  if cf is Member {
+    if esCalleeIsField(cf) { return -1 }
+    const name = ufcsAliasAtSite(ix, cf.memProp)
+    const u = fnDeclIx[name] ?? -1
+    if u >= 0 && declFirstParamIsSelf(name) { return u }
+  }
+  -1
+}
+
+// Whether member callee `cf` reads a struct field holding a function value.
+function esCalleeIsField(cf: Member): boolean {
+  const rt = nodeTyIxOf(cf.memObj)
+  if rt < 0 { return false }
+  const t = T.tys[nomErasedTyIx(rt)]
+  if t is TyObj { return objFieldType(t, cf.memProp) >= 0 }
+  false
+}
+
+// Call `n`'s arguments in parameter order: a UFCS receiver first, as `m(o, a)` declares it.
+// A call naming any argument answers none, so its type parameters stay open rather than bind
+// to the wrong argument.
+function esCallArgs(n: Call): i32[] {
+  const out: i32[] = []
+  let k = 0
+  while k < n.callArgNames.length {
+    if n.callArgNames[k] != "" { return out }
+    k = k + 1
+  }
+  const cf = P.nodes[n.callFn]
+  if cf is Member { out.push(cf.memObj) }
+  let i = 0
+  while i < n.callArgs.length {
+    out.push(n.callArgs[i])
+    i = i + 1
+  }
+  out
+}
+
+// One call from row `r` of declaration `d` with argument nodes `args`: the callee's row at the
+// types this call binds its type parameters to, charged as a call.
+function gcCallDecl(r: i32, d: i32, args: i32[], ix: i32): i32 {
+  if d < 0 {
+    esSetUnknown(r, "a call whose callee is not known", ix)
+    return esUnbound(
+      r,
+      "it calls a function that is not known" + esAtLine(ix),
+      -1,
+    )
+  }
+  gcCharge(r, esCalleeRow(r, d, args))
+}
+
+// The row call arguments `args` from row `r` pin declaration `d` at: each type parameter bound
+// to its argument's type, read through `r`'s own bindings (§C4). An unbound one stays open.
+export function esCalleeRow(r: i32, d: i32, args: i32[]): i32 {
+  const names: string[] = []
+  const tys: i32[] = []
+  const fd = P.nodes[d]
+  if fd is FuncDecl {
+    const fnTy = lookup(fd.fnName)
+    if fnTy >= 0 && tyHasTyVar(fnTy) {
+      const ft = T.tys[fnTy]
+      if ft is TyFunc {
+        let i = 0
+        while i < ft.fnParamTypes.length && i < args.length {
+          esBindWalk(r, ft.fnParamTypes[i], nodeTyIxOf(args[i]), names, tys, 0)
+          i = i + 1
+        }
+      }
+    }
+  }
+  esRowFor(d, names, tys)
+}
+
+// Binds every type parameter in parameter type `p` to the matching part of argument type `a`,
+// resolving `a`'s own type parameters through row `r`; first binding wins.
+function esBindWalk(
+  r: i32,
+  p: i32,
+  a: i32,
+  names: string[],
+  tys: i32[],
+  depth: i32,
+) {
+  if p < 0 || a < 0 || depth > 8 { return 0 }
+  let at = a
+  const b = esBoundTy(r, a)
+  if b >= 0 { at = b }
+  const pt = T.tys[p]
+  if pt is TyVar {
+    let k = 0
+    while k < names.length {
+      if names[k] == pt.tvName { return 0 }
+      k = k + 1
+    }
+    names.push(pt.tvName)
+    tys.push(at)
+    return 0
+  }
+  if pt is TyArray {
+    esBindArray(r, pt.aElem, at, names, tys, depth + 1)
+  } else if pt is TyNullable {
+    esBindNullable(r, pt.nInner, at, names, tys, depth + 1)
+  } else if pt is TyMap {
+    esBindMap(r, pt, at, names, tys, depth + 1)
+  } else if pt is TyObj {
+    esBindObj(r, pt, at, names, tys, depth + 1)
+  } else if pt is TyFunc {
+    esBindFunc(r, pt, at, names, tys, depth + 1)
+  } else if (
+    pt is TyUnion ||
+    pt is TyPrim ||
+    pt is TyLit ||
+    pt is TyErr ||
+    pt is TyNeg
+  ) {
+    // A union's members bind by position nowhere else either, and the rest hold no parameter.
+    return 0
+  }
+  0
+}
+
+// `esBindWalk`'s arms, one argument kind each: the argument must be the parameter's kind for
+// its parts to bind, except that a nullable parameter binds a non-nullable argument whole.
+function esBindArray(
+  r: i32,
+  pElem: i32,
+  at: i32,
+  names: string[],
+  tys: i32[],
+  depth: i32,
+) {
+  const x = T.tys[at]
+  if x is TyArray { esBindWalk(r, pElem, x.aElem, names, tys, depth) }
+  0
+}
+
+function esBindNullable(
+  r: i32,
+  pInner: i32,
+  at: i32,
+  names: string[],
+  tys: i32[],
+  depth: i32,
+) {
+  const x = T.tys[at]
+  if x is TyNullable {
+    return esBindWalk(r, pInner, x.nInner, names, tys, depth)
+  }
+  esBindWalk(r, pInner, at, names, tys, depth)
+}
+
+function esBindMap(
+  r: i32,
+  pt: TyMap,
+  at: i32,
+  names: string[],
+  tys: i32[],
+  depth: i32,
+) {
+  const x = T.tys[at]
+  if x is TyMap {
+    esBindWalk(r, pt.mKey, x.mKey, names, tys, depth)
+    esBindWalk(r, pt.mVal, x.mVal, names, tys, depth)
+  }
+  0
+}
+
+function esBindObj(
+  r: i32,
+  pt: TyObj,
+  at: i32,
+  names: string[],
+  tys: i32[],
+  depth: i32,
+) {
+  const x = T.tys[at]
+  if x is TyObj {
+    let i = 0
+    while i < pt.objFieldNames.length {
+      const f = objFieldType(x, pt.objFieldNames[i])
+      esBindWalk(r, pt.objFieldTypes[i], f, names, tys, depth)
+      i = i + 1
+    }
+  }
+  0
+}
+
+function esBindFunc(
+  r: i32,
+  pt: TyFunc,
+  at: i32,
+  names: string[],
+  tys: i32[],
+  depth: i32,
+) {
+  const x = T.tys[at]
+  if x is TyFunc {
+    let i = 0
+    while i < pt.fnParamTypes.length && i < x.fnParamTypes.length {
+      esBindWalk(r, pt.fnParamTypes[i], x.fnParamTypes[i], names, tys, depth)
+      i = i + 1
+    }
+    esBindWalk(r, pt.fnRet, x.fnRet, names, tys, depth)
+  }
+  0
+}
+
+// A call of a built-in named `nm`: a host call is I/O, a store writes linear memory, and each
+// allocating or looping builtin says so; an unclassified name is of unknown effect.
+function gcBuiltinCall(r: i32, nm: string, ix: i32): i32 {
+  if (
+    nm == "print" ||
+    nm == "__log__" ||
+    nameIsFsIntrinsic(nm) ||
+    externLinkOf(nm) >= 0
+  ) {
+    esSetHost(r, "`" + nm + "`")
+    return esUnbound(r, "it calls the host function `" + nm + "`", -1)
+  }
+  if getterIntrinsicName(nm) { return 0 }
+  if (
+    nm == "__store_i32__" ||
+    nm == "__store_v128__" ||
+    nameIsMemStoreIntrinsic(nm)
+  ) {
+    esSetWrite(r, "linear memory")
+    return 0
+  }
+  if nm == "__memory_grow__" {
+    esSetWrite(r, "linear memory")
+    return 0
+  }
+  if nm == "__memory_size__" { return 0 }
+  if nameIsMemBulkIntrinsic(nm) {
+    esSetWrite(r, "linear memory")
+    return esUnbound(r, "it copies or fills a byte range with `" + nm + "`", -1)
+  }
+  if nm == "Map" || nm == "Set" {
+    esSetAlloc(r, "a `" + nm + "()`", ix)
+    return 0
+  }
+  if nm == "fromCodePoint" {
+    esSetAlloc(r, "a string from `fromCodePoint`", ix)
+    return 0
+  }
+  if (
+    nm == "fromCodePoints" ||
+    nm == "__array_new__" ||
+    nm == "__array_new_default__"
+  ) {
+    esSetAlloc(r, "`" + nm + "`", ix)
+    return esUnbound(r, "it fills a new array with `" + nm + "`", -1)
+  }
+  if nm == "__array_copy__" {
+    esSetWrite(r, "a list, with `__array_copy__`")
+    return esUnbound(r, "it copies a list range with `__array_copy__`", -1)
+  }
+  esSetUnknown(r, "the built-in `" + nm + "`", ix)
+  esUnbound(r, "it calls the built-in `" + nm + "`", -1)
+}
+
+// A call of a built-in method on a string, list or map: every one walks its operand, the
+// mutating ones write the receiver, and the building ones allocate.
+function gcBuiltinMethod(r: i32, cf: Member, ix: i32): i32 {
+  const m = cf.memProp
+  if esMethodMutates(m) { esPlaceWrite(r, cf.memObj, m) }
+  if esMethodBuilds(m) { esSetAlloc(r, "`." + m + "()`", ix) }
+  esUnbound(r, "it calls the built-in `." + m + "()`" + esAtLine(ix), -1)
+}
+
+function esMethodMutates(m: string): boolean {
+  m == "push" ||
+    m == "pop" ||
+    m == "clear" ||
+    m == "set" ||
+    m == "delete" ||
+    m == "add" ||
+    m == "sort" ||
+    m == "reverse" ||
+    m == "insert" ||
+    m == "remove"
+}
+
+function esMethodBuilds(m: string): boolean {
+  m == "push" ||
+    m == "set" ||
+    m == "add" ||
+    m == "map" ||
+    m == "filter" ||
+    m == "slice" ||
+    m == "bytes" ||
+    m == "keys" ||
+    m == "values" ||
+    m == "toString" ||
+    m == "toUpperAscii" ||
+    m == "toLowerAscii" ||
+    m == "concat" ||
+    m == "join" ||
+    m == "split"
+}
+
 // The dearest of alternative nodes `arms`, keeping only that arm's trail entries.
-function gcDearest(arms: i32[]): i32 {
+function gcDearest(r: i32, arms: i32[]): i32 {
   const mark = gcTrail.length
   let best = 0
   let keep: i32[] = []
   let a = 0
   while a < arms.length {
-    const c = gcNode(arms[a])
+    const c = gcNode(r, arms[a])
     if a == 0 || c > best {
       best = c
       keep = gcTrail.slice(mark, gcTrail.length)
@@ -38139,8 +39101,8 @@ function gcDearest(arms: i32[]): i32 {
 // A `match`: its scrutinee, then each string-literal pattern tested in turn when the scrutinee
 // is stored as a string (an undeclared literal union), then its dearest arm. Over a declared
 // literal union the patterns compare by tag and cost nothing.
-function gcMatch(n: MatchExpr): i32 {
-  let c = gcNode(n.matchScrut)
+function gcMatch(r: i32, n: MatchExpr): i32 {
+  let c = gcNode(r, n.matchScrut)
   if gwErasedIs(nodeTyIxOf(n.matchScrut)) == "string" {
     let i = 0
     while i < n.matchPats.length {
@@ -38152,7 +39114,7 @@ function gcMatch(n: MatchExpr): i32 {
       i = i + 1
     }
   }
-  gcAdd(c, gcDearest(n.matchBodies))
+  gcAdd(c, gcDearest(r, n.matchBodies))
 }
 
 // The steps `x is "a" | "b"` costs: each string literal is compared in turn, so the sum of
@@ -38185,11 +39147,77 @@ function gcIsLitSteps(n: IsExpr, ix: i32): i32 {
   c
 }
 
-// The path a refusal names for row `gi`: each getter's heaviest read and how many times it is
-// read, ending at the string-literal compares that cost the most, if any.
-function gcPath(gi: i32): string {
-  let s = gcName(gi)
-  let cur = gi
+// Records row `r`'s heaviest contributor from its trail, the entries past `mark`: the callee
+// whose calls cost the most in total, and the string-literal compares.
+function gcSummarise(r: i32, mark: i32) {
+  const counts: {[i32]: i32} = Map()
+  const order: i32[] = []
+  let cmpSteps = 0
+  let cmpCount = 0
+  let i = mark
+  while i < gcTrail.length {
+    const e = gcTrail[i]
+    if e < 0 {
+      cmpSteps = gcAdd(cmpSteps, 0 - e)
+      cmpCount = cmpCount + 1
+    } else {
+      const seen = counts[e] ?? 0
+      if seen == 0 { order.push(e) }
+      counts[e] = seen + 1
+    }
+    i = i + 1
+  }
+  let best = -1
+  let bestCount = 0
+  let bestSteps = -1
+  let k = 0
+  while k < order.length {
+    const e = order[k]
+    const count = counts[e] ?? 0
+    let steps = 0
+    let m = 0
+    while m < count && steps < GETTER_STEP_CAP {
+      steps = gcAdd(steps, gcAdd(1, gcCostSoFar(e)))
+      m = m + 1
+    }
+    if steps > bestSteps {
+      best = e
+      bestCount = count
+      bestSteps = steps
+    }
+    k = k + 1
+  }
+  gcTopRow[r] = best
+  gcTopCount[r] = bestCount
+  gcTopSteps[r] = bestSteps
+  gcCmpSteps[r] = cmpSteps
+  gcCmpCount[r] = cmpCount
+  0
+}
+
+// Row `r`'s cost, reading a row not yet costed, or no row, as 0.
+function gcCostSoFar(r: i32): i32 {
+  if r < 0 || r >= esCost.length || esCost[r] < 0 { return 0 }
+  esCost[r]
+}
+
+// How a path names row `r`: a getter by its property, a function by its name and `()`.
+function esLabel(r: i32): string {
+  const d = P.nodes[esDecl[r]]
+  if d is FuncDecl {
+    if getDeclPropOf(d.fnName) != "" { return gcName(esDecl[r]) }
+    return d.fnName + "()"
+  }
+  "?"
+}
+
+// ── the getter step budget (§D3a-contract, D2061) ────────────────────────────
+
+// The path a refusal names for row `r`: each row's heaviest callee and how many times it is
+// called, ending at the string-literal compares that cost the most, if any.
+function gcPath(r: i32): string {
+  let s = esLabel(r)
+  let cur = r
   let hops = 0
   while cur >= 0 && hops < 12 {
     const top = gcTopRow[cur]
@@ -38197,10 +39225,10 @@ function gcPath(gi: i32): string {
       return s + " → " + gcCmpPhrase(cur)
     }
     if top < 0 { return s }
-    s = s + " → " + gcName(top)
+    s = s + " → " + esLabel(top)
     if gcTopCount[cur] > 1 { s = s + " (" + i32ToStr(gcTopCount[cur]) + "×)" }
     // A cycle is refused on its own; stop at its first repeat.
-    if top == gi { return s }
+    if top == r { return s }
     cur = top
     hops = hops + 1
   }
@@ -38208,9 +39236,12 @@ function gcPath(gi: i32): string {
   s
 }
 
-// Getter row `gi` as a path names it: its property, qualified by its receiver (`B.v`) when
-// another getter shares the property name.
-function gcName(gi: i32): string {
+// A getter declared at node `decl` as a path names it: its property, qualified by its receiver
+// (`B.v`) when another getter shares the property name.
+function gcName(decl: i32): string {
+  let gi = 0
+  while gi < getDecls.length && getDecls[gi] != decl { gi = gi + 1 }
+  if gi >= getDecls.length { return "?" }
   let i = 0
   while i < getProps.length {
     if i != gi && getProps[i] == getProps[gi] {
@@ -38221,50 +39252,40 @@ function gcName(gi: i32): string {
   getProps[gi]
 }
 
-function gcCmpPhrase(gi: i32): string {
-  const steps = i32ToStr(gcCmpSteps[gi])
-  if gcCmpCount[gi] == 1 {
+function gcCmpPhrase(r: i32): string {
+  const steps = i32ToStr(gcCmpSteps[r])
+  if gcCmpCount[r] == 1 {
     return "a compare with a " + steps + "-character string literal"
   }
-  i32ToStr(gcCmpCount[gi]) +
+  i32ToStr(gcCmpCount[r]) +
     " string-literal compares totalling " +
     steps +
     " characters"
 }
 
 // Refuses every getter over the step budget that no other getter over the budget reads, so a
-// chain is one error at its top, naming the path that made the total.
+// chain is one error at its top, naming the path that made the total. A getter with no bound
+// at all is refused where the unbounded construct is, by the body walk or its call check.
 function getterBudgetCheck() {
   gcCost = []
-  gcTopRow = []
-  gcTopCount = []
-  gcTopSteps = []
-  gcCmpSteps = []
-  gcCmpCount = []
-  gcTrail = []
+  const rows: i32[] = []
   let i = 0
   while i < getFns.length {
-    gcCost.push(-1)
-    gcTopRow.push(-1)
-    gcTopCount.push(0)
-    gcTopSteps.push(0)
-    gcCmpSteps.push(0)
-    gcCmpCount.push(0)
+    const row = esDeclRow(getDecls[i])
+    rows.push(row)
+    gcCost.push(gcCostSoFar(row))
     i = i + 1
-  }
-  let gi = 0
-  while gi < getFns.length {
-    getterCost(gi)
-    gi = gi + 1
   }
   let r = 0
   while r < getFns.length {
-    if gcCost[r] > GETTER_STEP_BUDGET && !gcReadByOver(r) {
+    if gcIsOver(gcCost[r]) && !gcReadByOver(r) {
       let total = i32ToStr(gcCost[r])
-      if gcCost[r] >= GETTER_STEP_CAP { total = "over " + total }
+      if gcCost[r] >= GETTER_STEP_CAP {
+        total = "over " + i32ToStr(GETTER_STEP_CAP)
+      }
       gwRow = r
       getterContractErr(
-        "costs " + total + " steps (" + gcPath(r) + ")",
+        "costs " + total + " steps (" + gcPath(rows[r]) + ")",
         "a getter must cost at most " + i32ToStr(GETTER_STEP_BUDGET) + " steps",
         getDecls[r],
       )
@@ -38274,17 +39295,207 @@ function getterBudgetCheck() {
   0
 }
 
+// Whether a getter cost is over the budget and still a number.
+function gcIsOver(c: i32): boolean {
+  c > GETTER_STEP_BUDGET && c < ES_UNBOUNDED
+}
+
 // Whether a getter over the step budget reads row `r`.
 function gcReadByOver(r: i32): boolean {
   let k = 0
   while k < getEdgeFrom.length {
     const from = getEdgeFrom[k]
-    if getEdgeTo[k] == r && from != r && gcCost[from] > GETTER_STEP_BUDGET {
-      return true
-    }
+    if getEdgeTo[k] == r && from != r && gcIsOver(gcCost[from]) { return true }
     k = k + 1
   }
   false
+}
+
+// Refuses the getter's call, spelled `what` at node `at`, of summary row `c` unless the row
+// writes nothing, allocates nothing, calls neither the host nor something unknown, and has a
+// step bound; the refusal names the fact and the path to where it holds (D2136).
+function gwCalleeCheck(c: i32, what: string, at: i32) {
+  if esWrite[c] != "" {
+    return getterCallErr(
+      what + ", which writes " + esWrite[c] + esFactPath(c, esWriteVia),
+      GW_EFFECT,
+      at,
+    )
+  }
+  if esReadLet[c] != "" {
+    return getterCallErr(
+      what + ", which reads " + esReadLet[c] + esFactPath(c, esReadLetVia),
+      GW_STATE,
+      at,
+    )
+  }
+  if esHost[c] != "" {
+    return getterCallErr(
+      what +
+        ", which calls the host function " +
+        esHost[c] +
+        esFactPath(c, esHostVia),
+      GW_EFFECT,
+      at,
+    )
+  }
+  if esUnknown[c] != "" {
+    return getterCallErr(
+      what +
+        ", which makes " +
+        esUnknown[c] +
+        esFactPath(c, esUnknownVia) +
+        ", whose effects are not known",
+      GW_CALL,
+      at,
+    )
+  }
+  if esAlloc[c] != "" {
+    return getterCallErr(
+      what + ", which allocates " + esAlloc[c] + esFactPath(c, esAllocVia),
+      GW_ALLOC,
+      at,
+    )
+  }
+  if esCost[c] >= ES_UNBOUNDED {
+    let rule = GW_LOOP
+    if keyHasPrefix(esWhy[c], "it recurses") { rule = GW_RECUR }
+    return getterCallErr(
+      what +
+        ", which has no step bound: " +
+        esWhy[c] +
+        esFactPath(c, esWhyVia),
+      rule,
+      at,
+    )
+  }
+  0
+}
+
+// The chain of rows a fact of row `c` came through, `via` being that fact's column, as
+// " (c → d → e)", or "" when `c`'s own body has it.
+function esFactPath(c: i32, via: i32[]): string {
+  if via[c] < 0 { return "" }
+  let s = esLabel(c)
+  let cur = via[c]
+  let hops = 0
+  while cur >= 0 && hops < 12 {
+    s = s + " → " + esLabel(cur)
+    cur = via[cur]
+    hops = hops + 1
+  }
+  " (" + s + ")"
+}
+
+// ── the summary in words (hover, the dump) ───────────────────────────────────
+
+// Row `r` as one line a person reads: what it writes, the module state it reads, whether it
+// allocates, its cost in steps and its host calls, each naming the first instance and its path.
+export function esText(r: i32): string {
+  let w = "none"
+  if esWrite[r] != "" { w = esWrite[r] + esVia(r, esWriteVia) }
+  let a = "no"
+  if esAlloc[r] != "" { a = "yes (" + esAlloc[r] + esVia(r, esAllocVia) + ")" }
+  let io = "none"
+  if esHost[r] != "" { io = esHost[r] + esVia(r, esHostVia) }
+  let rd = "none"
+  if esReadLet[r] != "" { rd = esReadLet[r] + esVia(r, esReadLetVia) }
+  if esUnknown[r] != "" {
+    const u = "unknown (" + esUnknown[r] + esVia(r, esUnknownVia) + ")"
+    if esWrite[r] == "" { w = u }
+    if esAlloc[r] == "" { a = u }
+    if esHost[r] == "" { io = u }
+    if esReadLet[r] == "" { rd = u }
+  }
+  let cost = "1 step"
+  if esCost[r] != 1 { cost = i32ToStr(esCost[r]) + " steps" }
+  if esCost[r] >= GETTER_STEP_CAP {
+    cost = "over " + i32ToStr(GETTER_STEP_CAP) + " steps"
+  }
+  if esCost[r] >= ES_UNBOUNDED {
+    cost = "unbounded (" + esWhy[r] + esVia(r, esWhyVia) + ")"
+  }
+  "writes: " +
+    w +
+    " · reads: " +
+    rd +
+    " · allocates: " +
+    a +
+    " · cost: " +
+    cost +
+    " · I/O: " +
+    io
+}
+
+// ", via `f()`" naming the callee a fact of row `r` came through, or "".
+function esVia(r: i32, via: i32[]): string {
+  if via[r] < 0 { return "" }
+  ", via `" + esLabel(via[r]) + "`"
+}
+
+// The type bindings of row `r` as `<T = i32, U = string>`, or "" for an unpinned row.
+export function esBindText(r: i32): string {
+  if esBindCount[r] == 0 { return "" }
+  let s = "<"
+  let k = esBindStart[r]
+  while k < esBindStart[r] + esBindCount[r] {
+    if k > esBindStart[r] { s = s + ", " }
+    s = s + esBindNames[k] + " = " + tyToStr(esBindTys[k])
+    k = k + 1
+  }
+  s + ">"
+}
+
+// The summary of the function declared at node `decl`, as `esText` spells it, or "" when the
+// node is not a function declaration.
+export function esTextOfDecl(decl: i32): string {
+  if decl < 0 || decl >= P.nodes.length { return "" }
+  const d = P.nodes[decl]
+  if d is FuncDecl { return demangleMsg(esText(esDeclRow(decl))) }
+  ""
+}
+
+// One line per top-level function and getter the entry module declares, in source order, each
+// followed by the instances its calls pinned: `name<T = i32>: <esText>`.
+export function esDumpText(): string {
+  const decls: i32[] = []
+  let i = 0
+  while i < P.nodes.length {
+    const n = P.nodes[i]
+    if n is FuncDecl {
+      if (fnDeclIx[n.fnName] ?? -1) == i && ufcsModOfNode(i) <= 0 {
+        decls.push(i)
+        esDeclRow(i)
+      }
+    }
+    i = i + 1
+  }
+  let out = ""
+  let k = 0
+  while k < decls.length {
+    const r0 = esDeclRow(decls[k])
+    out = out + esDumpLabel(r0) + ": " + esText(r0) + "\n"
+    let r = 0
+    while r < esDecl.length {
+      if esDecl[r] == decls[k] && esBindCount[r] > 0 {
+        out = out + esDumpLabel(r) + esBindText(r) + ": " + esText(r) + "\n"
+      }
+      r = r + 1
+    }
+    k = k + 1
+  }
+  demangleMsg(out)
+}
+
+// A dump line's name: `get p` for a getter, the function's name otherwise.
+function esDumpLabel(r: i32): string {
+  const d = P.nodes[esDecl[r]]
+  if d is FuncDecl {
+    const prop = getDeclPropOf(d.fnName)
+    if prop != "" { return "get " + prop }
+    return d.fnName
+  }
+  "?"
 }
 
 // The declaration half of the contract for registry row `gi`: a nominal receiver declared in the

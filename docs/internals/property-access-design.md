@@ -36,8 +36,8 @@ Are they good for VL?"*
   bounded, and it may call only intrinsics and other getters (§D3a). Reads are allowed, except
   of a module `let`. *(Amended and RULED 2026-09-22: "bounded" admits constant-range loops
   within a budget of 16 abstract steps, and a getter may call an ordinary function that
-  writes nothing, allocates nothing, does no I/O and fits the budget; v1 as built is
-  loop-free. See §D3a-contract.)*
+  writes nothing, allocates nothing, does no I/O and fits the budget. The callee rule is built
+  (D2135); loops are still refused. See §D3a-contract.)*
   That keeps a getter read to a load or a short straight-line sequence. The contract is
   deliberately conservative: it may later relax (for instance into a lint), never the reverse.
 - **Nothing new in the language is needed to unblock lane reads today.** A literal-union
@@ -510,12 +510,10 @@ consumers.
 >   says no writes, no allocation, no host I/O and a cost within the budget.
 > - **In std** (D-Q7): a getter is only for a named part of an opaque scalar or vector brand (a
 >   lane, a packed field, a flat-row column); anything else is a method (`std-api-review.md`).
-> - **What is built is still v1**: the shipped checker refuses every loop and every non-getter
->   callee, and `docs/guide/getters.md` and `DECISIONS.md` describe that. The rulings build
->   after the persona review's contract rows close (§4 there: steps over calls, string-literal
->   compares, f64 `%`) and D2064 (intrinsics, closed #3048), and those two files change with
->   the build. The bullets below
->   are the v1 text, amended where marked.
+> - **What is built**: the step budget, string-literal compares and the f64 `%` refusal
+>   (D2061–D2063), the intrinsic set (D2064), and the callee rule (D2135): a getter may call an
+>   ordinary function whose per-function summary qualifies (below). Every loop is still
+>   refused. The bullets below are the v1 text, amended where marked.
 
 A getter body is refused unless it is:
 
@@ -538,17 +536,29 @@ A getter body is refused unless it is:
   §9) is exactly a load at a derived address, and a load has no effect. A trap is permitted (an
   `as!`, or an integer division); by the same reasoning as `exprEffectFree`, the program dies
   either way.
-- **Calls intrinsics and other getters only** (v1; as ruled, also an ordinary function that
-  meets the callee rule above). In v1 no user or std function is callable, no function
-  value, and no user operator overload, because `"+"` on a nominal type is an ordinary function
-  call. The admitted intrinsics are those the emitter lowers inline to instructions whose only
+- **Calls intrinsics, other getters, and ordinary functions whose summary qualifies** (built,
+  D2135). A user or std function, called directly or by UFCS (`self.f()`), a user operator
+  overload (`"+"` on a nominal type is an ordinary function call) and a user `"[]"` are admitted
+  when the callee's **per-function summary** (`function-effects-design.md` §C1, computed in the
+  checker per instance, bottom-up, once) says it writes nothing, reads no module `let` or
+  `extern let` (the getter rule, which a helper may not launder; a module `const` and its heap
+  stay readable), allocates nothing, calls no host function and nothing of unknown effect, and
+  has a step bound; the call then costs 1 plus the
+  callee's steps against the getter's budget. A generic callee is summarised at the types the
+  call pins, so `same(self.n, 3)` over `T == T` is admitted at `i32` and refused at `string`,
+  where `==` loops. An operator over a type parameter is decided at the pin, a user operator
+  included (charged as the call it is); over a parameter the call binds to nothing it is of
+  unknown effect. The refusal names the fact that failed and the path to it: "calls
+  `viaBump`, which writes the module `let` `count` (viaBump() → bump())". A call through a
+  function value stays refused (its effects are unknown), as does a built-in method. The
+  admitted intrinsics are those the emitter lowers inline to instructions whose only
   possible effect is a trap: the scalar numeric opcodes (`sqrt abs floor ceil trunc nearest min
   max copysign`, `clz ctz popcnt rotl rotr divU remU`, the unsigned compares, the four bitcasts),
   the loads, the SIMD value operations, the heap-window reads and `__trap__`. The set is read off
   the emitter's own classifiers (`isNumIntrinsicName`, `nameIsMemLoadIntrinsic`,
   `nameIsSimdIntrinsic` less any result-less member), not kept as a second list (D2064). A user
-  function spelled like one is refused as a call to that function, a user binding as a function
-  value.
+  function spelled like one is that function, judged by its summary; a user binding is a
+  function value and refused.
 - **Operators whose lowering loops or allocates are refused** (built, from the #3031 review's
   disassembly): `==`/`!=`/`<`/`<=`/`>`/`>=` over string, list, map or struct operands (a
   `__str_eq__` call or an inline element loop), an index into a map (a hash and a probe loop),
@@ -561,16 +571,17 @@ A getter body is refused unless it is:
   `s != "lit"` and `s is "a" | "b"` call `__str_eq__`, which answers unequal lengths before it
   loops and otherwise walks at most the literal's length, so the compare is bounded by a
   constant the checker can read. It costs that length in steps (below). Two runtime strings
-  stay refused. `startsWith`/`endsWith` are std functions, which a getter cannot call yet, so
-  that clause of the ruling admits nothing today. **f32/f64 `%` is refused** (RULED; built,
+  stay refused. `startsWith`/`endsWith` are std functions, callable when their summary
+  qualifies; each walks its argument, so neither has a step bound and both stay refused. **f32/f64 `%` is refused** (RULED; built,
   D2063): `__f64_rem__` scales the divisor by
   doubling and halving, so its trip count is the operands' exponent gap, up to about 4,000
   iterations, and is data-dependent. Integer `%` is one instruction and stays allowed.
 - **Within the step budget** (D2061). Loop-freedom alone does not bound a body that reads other
   getters: nine getters each reading the previous one four times are loop-free and acyclic, and
   one read of the last does 4^8 getter calls. The checker counts **abstract steps**:
-  - a getter read costs 1 plus the read getter's cost (memoised per getter, so the check is
-    linear in the getter graph however exponential the program's work);
+  - a getter read costs 1 plus the read getter's cost, and a call of an ordinary function 1 plus
+    its summary's cost (memoised per instance, so the check is linear in the call graph however
+    exponential the program's work);
   - a compare with a string literal costs the literal's length; `is "a" | "b"` costs the SUM,
     because the lowering tests each literal in turn and each test that passes the length check
     walks its literal;
@@ -587,9 +598,9 @@ A getter body is refused unless it is:
 
 The checker reads the SOURCE and promises something about the LOWERING, so
 `tests/vl_getter_body_shape_test.ts` holds the two together: it builds every getter run-fixture
-and std:simd's lane getters, disassembles them, and refuses a getter body with a `loop`, a
-`struct.new`/`array.new*`, an indirect call, or a direct call to anything but a getter or
-`__str_eq__`. Its first run found `is "ab"` allocating the literal (fixed in `collectStrPool`,
+and std:simd's lane getters, disassembles them, and refuses a getter body, or any body it reaches
+through direct calls, with a `loop`, a `struct.new`/`array.new*`, an indirect call, a host
+import, or a call back into the path (`__str_eq__` is a leaf and not entered). Its first run found `is "ab"` allocating the literal (fixed in `collectStrPool`,
 D2062).
 
 **Branches are allowed.** `if` and `match` expressions are fine: cost is the max over the arms,
