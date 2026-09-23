@@ -688,6 +688,11 @@ let argCstrWho: string[] = []
 let printCstrTy: i32[] = []
 let printCstrIx: i32[] = []
 let printCstrFn: i32[] = []
+// The vector-container twin of the `print` rows (`noteNestCstr`), deduped by type and owner.
+let nestCstrTy: i32[] = []
+let nestCstrIx: i32[] = []
+let nestCstrFn: i32[] = []
+let nestCstrSeen: {[string]: boolean} = Map()
 
 // D1470 — every `__array_new_default__(n)` call, its node and the array-hole row it returned.
 // `array.new_default` writes each slot's zero, so the element type is decided by what pins the
@@ -3640,6 +3645,10 @@ export function initChecker() {
   printCstrTy = []
   printCstrIx = []
   printCstrFn = []
+  nestCstrTy = []
+  nestCstrIx = []
+  nestCstrFn = []
+  nestCstrSeen = Map()
   arrDefCallIx = []
   arrDefCallTy = []
   holeLinkA = []
@@ -14709,6 +14718,8 @@ export function eqRefusals(
   let vecTy = -1
   if primNameOf(lt) == "v128" { vecTy = lt }
   if primNameOf(rt) == "v128" { vecTy = rt }
+  // A null test compares no lanes; whatever makes a vector nullable is refused on its own.
+  if isNullTy(lt) || isNullTy(rt) { vecTy = -1 }
   if vecTy >= 0 {
     msgs.push(
       "`" +
@@ -22732,6 +22743,13 @@ function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
           fnDeclIx[name] ?? CSTR_NODECL,
           plainName,
         )
+        validateNestCstrs(
+          bNames,
+          bTys,
+          ix,
+          fnDeclIx[name] ?? CSTR_NODECL,
+          plainName,
+        )
         // The declared return, at the UFCS half for the same symmetry: `p.g()` and `g(p)`
         // must answer the same way, or the method spelling of D551's family stays silent beside a loud direct one.
         validateRetCstrs(
@@ -24113,6 +24131,7 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
       dhArgNode,
     )
     validatePrintCstrs(bNames, bTys, ix, cstrCallee, cstrWho)
+    validateNestCstrs(bNames, bTys, ix, cstrCallee, cstrWho)
     validateArgCstrs(bNames, bTys, ix)
     // The declared return rides the same pin: the body's mismatch check is vacuous under
     // a hole, and this is the first position that knows the instance (D551).
@@ -24371,6 +24390,12 @@ function resolveAnnotAt(
   // phase. `tErrOncePerMsg` dedups the case where a declared union reaches it from both routes.
   const dm = unionDiscrimMsg(r)
   if dm != "" { tErrOncePerMsg(dm, at) }
+  // A container of vectors named by an annotation alone (a param, a field of a struct only
+  // ever passed around, `v?: F32x4`) reaches no expression node, so it is refused here.
+  if !inferQuiet {
+    v128NestCheck(at, r)
+    noteNestCstr(r, at)
+  }
   r
 }
 
@@ -27156,6 +27181,7 @@ function checkNode(ix: i32) {
       if ix < nodeTyIx.length { nodeTyIx[ix] = t }
     }
     if v128Seen { v128NestCheck(ix, t) }
+    noteNestCstr(t, ix)
   }
   t
 }
@@ -27171,18 +27197,83 @@ let v128NestReported: i32[] = []
 // lowering yet, so the first node typed with such a container is refused here, before emission.
 function v128NestCheck(ix: i32, t: i32) {
   if ix < 0 || t < 0 { return 0 }
-  if !tyNestsV128(t, 4) { return 0 }
+  if !tyNestsV128(t, 8) { return 0 }
   let i = 0
   while i < v128NestReported.length {
     if v128NestReported[i] == t { return 0 }
     i = i + 1
   }
   v128NestReported.push(t)
-  tErrUnsupported(
-    tyToStr(t) +
-      " holds a 128-bit vector inside an array, struct field, map, nullable or union, which has no lowering yet — keep the vector in a local, parameter, return or global, or store its lanes to a `Buf`",
-    ix,
-  )
+  tErrUnsupported(v128NestMsg(t), ix)
+  0
+}
+
+// The container-of-vector refusal, one wording for the direct site and the generic pin.
+function v128NestMsg(t: i32): string {
+  tyToStr(t) +
+    " holds a 128-bit vector inside an array, struct field, map, nullable or union, which has no lowering yet — keep the vector in a local, parameter, return or global, or store its lanes to a `Buf`"
+}
+
+// A generic body's container over a type parameter (`[x, x]` at `x: T`) has no vector in it
+// until a call binds `T`, so the type and node are recorded, owned by the enclosing
+// declaration, and `validateNestCstrs` asks again at each pin (the `print` constraint's shape).
+function noteNestCstr(t: i32, ix: i32) {
+  if t < 0 || cstrOwnerStack.length == 0 { return 0 }
+  const tt = T.tys[t]
+  let composite = false
+  if tt is TyArray { composite = true }
+  if tt is TyObj { composite = true }
+  if tt is TyNullable { composite = true }
+  if tt is TyUnion { composite = true }
+  if tt is TyMap { composite = true }
+  if !composite { return 0 }
+  if !tyHasHole(t) { return 0 }
+  const owner = cstrOwnerTop()
+  const key = i32ToStr(t) + ":" + i32ToStr(owner)
+  if nestCstrSeen.has(key) { return 0 }
+  nestCstrSeen.set(key, true)
+  nestCstrTy.push(t)
+  nestCstrIx.push(ix)
+  nestCstrFn.push(owner)
+  0
+}
+
+// Re-asks every recorded container this call instantiates under its bindings. Skipped unless
+// a binding is (or holds) a vector, so a pin that binds no vector does no work.
+function validateNestCstrs(
+  bNames: string[],
+  bTys: i32[],
+  ix: i32,
+  calleeFn: i32,
+  who: string,
+) {
+  let anyVec = false
+  let bi = 0
+  while bi < bTys.length {
+    if tyIsOrNestsV128(bTys[bi], 8) { anyVec = true }
+    bi = bi + 1
+  }
+  if !anyVec { return 0 }
+  const nOrig = nestCstrTy.length
+  let ci = 0
+  while ci < nOrig {
+    if cstrOwnedBy(nestCstrFn[ci], calleeFn) {
+      const ct = substTyDeep(nestCstrTy[ci], bNames, bTys)
+      if tyHasHole(ct) {
+        if calleeFn >= 0 && ct != nestCstrTy[ci] {
+          noteNestCstr(ct, nestCstrIx[ci])
+        }
+      } else if tyNestsV128(ct, 8) {
+        let pWho = "a type parameter is stored in a container here: "
+        if who != "" {
+          pWho = "`" + who + "` stores its type parameter in a container here: "
+        }
+        tErrUnsupported(pWho + v128NestMsg(ct), ix)
+        return 0
+      }
+    }
+    ci = ci + 1
+  }
   0
 }
 

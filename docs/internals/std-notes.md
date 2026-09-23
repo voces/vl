@@ -837,6 +837,8 @@ Slice S3 of `docs/internals/simd-design.md` — the `F32x4` surface over the `__
 - **Unsuffixed methods own their names.** `dot`/`cross`/`normalize` (O7) are ordinary
   functions, so a later `F64x2` must use `dotF64x2`. A caller module with its own `dot` loses
   the no-import spelling (D1984); the header documents the aliased-import workaround.
+- **Containers are refused in the checker, including at a generic pin** (D1981): the direct
+  site, an annotation, and a generic body's `[x, x]` re-asked at the call that binds `T`.
 - **Not shipped: lane read-back** (D1980). `std:simd` cannot wrap a literal-lane intrinsic,
   and `.x` needs property syntax. The header points callers at `storeF32x4` + `loadF32`.
 - **What grades it.** `tests/cases/simd/f32x4-std-surface.vl` (every op, lane order, NaN and
