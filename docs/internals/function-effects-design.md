@@ -1,6 +1,10 @@
 # Function effects: what a function may do, and who is told
 
-> Status: design, for an owner ruling. No compiler or std source is touched by the change that
+> Status: design. The owner's rulings of 2026-09-22/23 are recorded in §I, each marked
+> **RULED** with its date; the questions still open are marked **OPEN**. Where a ruling and the
+> body text disagree, the ruling holds and the body has been brought in line.
+>
+> Evidence: No compiler or std source is touched by the change that
 > carries this doc. Every "today" claim is a program run with `dist/vl` at master `9341d7e1c`
 > (2026-09-22), or a line of the tree cited by path. The tier percentages in §C5 come from a
 > syntactic estimator (a Python script, not the compiler) and are labelled as estimates. Where
@@ -27,7 +31,7 @@ not re-argue them):**
    which fails the loop test because of GC pressure; (4) unbounded (loops or recursion). The
    getter target is tiers 1–2: no back-edges, no recursion, no allocation, no effects.
    *(Amended by the owner later on 2026-09-22: constant-bounded loops are tier 2, within a
-   budget of 64 iterations. "No back-edges" became "a bound computable at compile time". See
+   budget of 16 abstract steps. "No back-edges" became "a cost computable at compile time". See
    §C1a.)*
 2. **Inferred per-function summaries**, computed bottom-up over the call graph with SCCs for
    recursion and **per instance**. Unknown callees are pessimistic.
@@ -52,17 +56,19 @@ not re-argue them):**
 - A summary is **a set of bits plus one number**, not one bit (§C1). "Effect-free" and
   "cheap" are independent axes. `popcnt` is pure and loops. A counter bump is O(1) and writes.
   The consumers split along the same line (§G), so the vocabulary has to split too. Reads are
-  split by location (`let` binding, GC heap by root, linear memory), and cost is a **bound**:
-  `Bounded(n)` or `Unbounded`, transitive through calls, never data-dependent (§C1a).
+  split by location (`let` binding, GC heap by root, linear memory), and cost is a **bound in
+  abstract steps**: `Bounded(n)` or `Unbounded`, transitive through calls, never
+  data-dependent (§C1a).
 - **Getter-eligible is not `pure`.** A getter may read its receiver's mutable fields and
   linear memory. It may not write, call the host, call something unknown, allocate, read a
-  module `let`, or exceed a bound of 64 (§C1b). `pure` is about effects and reads; a getter is
+  module `let`, or exceed a budget of 16 steps (§C1b). `pure` is about effects and reads; a getter is
   about effects, allocation and cost.
 - **The marker's word is `pure`, and it means effects only**: no writes to state the call did
   not create, no host calls, no unknown calls, no reads of module `let`s, linear memory or a
   module `const`'s heap (reads through a parameter are allowed). It promises
-  nothing about cost. Koka's `pure`, Fortran's `PURE` and D's `pure` all mean the same thing,
-  and "pure" meaning loop-free would be a new meaning no reader expects (§E2).
+  nothing about cost. That is Fortran's `PURE` and D's weak `pure`, which also admit reads
+  through arguments, and "pure" meaning loop-free would be a new meaning no reader expects
+  (§E2).
 - **Cost gets no keyword in v1.** A getter's body is checked by inference. std's cost promise
   is a **checked baseline file**, the same ratchet shape as `seed-size-baseline.json`. VL has
   exactly one module boundary that outlives a build (std, version-locked), and a baseline
@@ -327,7 +333,7 @@ Every fact is a bit except `B`, which is a number.
 | `H` | call the host | an `extern function`, `print`, `std:fs`/`std:process`/`std:args` intrinsics. **Sub-bit `S`: may suspend** (concurrency-design §4's question) |
 | `X` | call something unknown | `call_indirect` whose target set is not resolved (§F); an extern with no trusted marker |
 | `A` | allocate on the GC heap | an object or array literal; a lambda literal (a `{env, id}` struct, `emit_state.vl:158`); string `+` and template interpolation; spread; `slice`/`map`/`filter`/`concat`; `Map()`; constructors |
-| `B` | take at most this many loop iterations: **`Bounded(n)`**, or **`Unbounded`** | §C1a. `Unbounded` comes from a `while`, a `for`-in over data, a range whose ends are not constant, recursion (a cyclic SCC or a self-edge), an unresolved indirect call, or **an operator whose lowering loops over its operands** (string and list `==`, string hashing, a map probe, `utf8` coding: §A3) |
+| `B` | cost at most this many abstract steps: **`Bounded(n)`**, or **`Unbounded`** | §C1a. `Unbounded` comes from a `while`, a `for`-in over data, a range whose ends are not constant, recursion (a cyclic SCC or a self-edge), an unresolved indirect call, or **an operator whose lowering loops over its operands** (string and list `==` other than a compare against a string literal, which §C1a charges by the literal's length; f64 `%`; string hashing, a map probe, `utf8` coding: §A3) |
 | `T` | trap | index, division, `as!`, `__trap__`, overflowing casts. **Optimizer-only; never user-visible** (D1510 ruled that a trap is not an effect). A split into explicit and implicit traps is §I16 |
 | `U` | unwind (leave by an exception) | **reserved, always 0 today.** VL has no exceptions. Wasm exception handling is the future source, and plumb reserves a status result "for exception unwinding" in its cross-unit calls (`~/plumb/docs/vl-issues.md`, PL-013). Every surveyed optimizer keeps this fact apart from traps and effects (§B2 finding 3), so it gets its slot now |
 
@@ -335,39 +341,40 @@ Every fact is a bit except `B`, which is a number.
 (§D) still records *why* a function is `Unbounded`, loop or recursion or operator, so nothing a
 message needs is lost.
 
-#### C1a. The bound (owner ruling, 2026-09-22)
+#### C1a. The bound (RULED, owner, 2026-09-22; metric and budget per §I11)
 
-**Invariant: an instance's worst-case iteration count is computable at compile time from the
-source plus the bounds of its callees, and never depends on data.** Every rule below follows
+**Invariant: an instance's worst-case cost is computable at compile time from the source plus
+the bounds of its callees, and never depends on data.** Every rule below follows
 from it, and only the budget's number may change.
 
 - **Allowed:** a numeric range `for i in <a> (to | until) <b> [step <s>]` where `a` and `b` are
-  integer literals or module `const` integers (§I13 says exactly which consts), `s` is an
-  integer literal, and the loop variable is never assigned in the body. `break` and `continue`
+  integer literals or a `const` initialised by an integer literal or by another such `const`
+  (§I13), `s` is an integer literal, and the loop variable is never assigned in the body. `break` and `continue`
   are allowed; the bound assumes the loop runs to its end. The trip count is the number of
   values the range visits (`to` is inclusive, `until` half-open), so `for i in 0 to 3` is 4
   and `for i in 10 to 0 step -2` is 6 (both run with `dist/vl`). `step 0` is already refused by
   the checker ("a range with `step 0` never advances").
 - **Never:** a `for`-in over data, a range with a data-dependent end, `while`, and recursion.
   They are `Unbounded`, with no escape.
-- **Composition.** Nested loops multiply, and the bound is **transitive through calls**:
-
-  ```
-  bound(f) = Σ over loops ℓ in f:  trips(ℓ) × Π trips(loops enclosing ℓ)
-           + Σ over calls c in f:  bound(callee(c)) × Π trips(loops enclosing c)
-  ```
-
-  So a loop of 4 inside a loop of 4 costs 4 + 16 = 20, and a call to a `Bounded(8)` callee
-  inside a loop of 4 adds 32. `Unbounded` absorbs everything. Straight-line code is
-  `Bounded(0)`. A compiler helper whose loop is bounded by a format constant rather than by its
-  operands (f64 `%`'s `__f64_rem__`, which property-access §D3a-contract already rules tier 2)
-  counts as 0 (§I15).
-- **The budget.** A getter's total must be at most **one named budget, 64**. That number is
-  the only part of this rule that may change, and changing it takes a `DECISIONS.md` entry and
-  a std review, because std exports' eligibility depends on it. The summary carries the exact
-  number (saturating, so a pathological product cannot overflow) and applies no budget of its
-  own. Each consumer applies its own threshold: getters take `≤ 64`, and D1510 and hoisting
-  take any `Bounded(n)`.
+- **Composition, in abstract steps.** A call costs 1 plus its callee's cost, a loop multiplies
+  its body's cost by its trip count, and a branch (`if`, `match`) takes the max over its arms.
+  The cost is **transitive through calls**, so a loop-free chain of getters that fans out is
+  charged for every call it makes. `Unbounded` absorbs everything. A compiler-lowered operation
+  is charged its real worst case: a compare against a string literal (`==`, `!=`, `is "a" |
+  "b"`, `startsWith` / `endsWith` with a literal) costs the literal's length, provided its
+  lowering pre-checks lengths and never loops past the shorter operand; a compare of two
+  run-time strings, and f64 `%` (whose `__f64_rem__` loops by the operands' exponent gap), are
+  `Unbounded` (§I15).
+- **The budget.** A getter's total must be at most **one named budget, 16 steps**, tuned by
+  usage. That number is the only part of this rule that may change, and changing it takes a
+  `DECISIONS.md` entry and a std review, because std exports' eligibility depends on it. The
+  summary carries the exact number (saturating, so a pathological product cannot overflow) and
+  applies no budget of its own. Each consumer applies its own threshold: getters take `≤ 16`,
+  and D1510 and hoisting take any `Bounded(n)`. An over-budget error names the call path.
+- **The loop variable.** A constant-range loop variable gets an internal interval type
+  `[lo, hi)`, with no user syntax. It is assignable wherever every value in it fits (a lane
+  index, for instance), without expanding to a literal union. A user-spellable range type is a
+  separate future decision.
 
 #### C1b. The derived predicates
 
@@ -378,7 +385,7 @@ These are what people and passes actually ask:
 | **effect-free** | ¬W ∧ ¬H ∧ ¬X (∧ ¬U once `U` exists) | all | D1510 reorder (with terminating), concurrency §5 "pure CPU" |
 | **terminating** | `B` = `Bounded(n)`, any `n` | all | D1510 reorder, hoisting. Sufficient, not necessary: a `while` that always stops is still `Unbounded` |
 | **`pure`** (the marker, §E) | effect-free ∧ ¬`R.let` ∧ ¬`R.mem` ∧ ¬`R.heap[const]` | `R.heap[param]` only | the checked marker; parallelism; compile-time evaluation |
-| **getter-eligible** | effect-free ∧ ¬A ∧ ¬`R.let` ∧ `B` = `Bounded(n ≤ 64)` | `R.heap` (both roots) and `R.mem` | the getter body check |
+| **getter-eligible** | effect-free ∧ ¬A ∧ ¬`R.let` ∧ `B` = `Bounded(n ≤ 16)` | `R.heap` (both roots) and `R.mem` | the getter body check |
 | **hoistable** (optimizer only) | effect-free ∧ terminating ∧ no `T`, or a trip-count guard ∧ nothing it reads is written in the loop | per §G2 | LICM, CSE |
 
 **Getter-eligible is NOT `pure`, and neither implies the other.** A getter reads its receiver's
@@ -427,7 +434,7 @@ rule "the loop writes no heap at all". Without the parameter-heap fact, hoisting
 of a loop that assigns `p.x` would be unsound. This is why `R.heap` is recorded even though
 getters admit it.
 
-**Tiers fall out of `A` and `B`, independent of reads.** Tier 1–2 is ¬A ∧ `Bounded(n ≤ 64)`:
+**Tiers fall out of `A` and `B`, independent of reads.** Tier 1–2 is ¬A ∧ `Bounded(n ≤ 16)`:
 constant-bounded loops within the budget are tier 2 now, not tier 4. Tier 3 is A ∧
 `Bounded`, and tier 4 is `Unbounded` or over budget. Tier 1 versus tier 2 is not a fact. Once
 inlined they are the same wasm (property-access §A2), and nothing needs to tell them apart.
@@ -526,15 +533,15 @@ surfaces in three places.
 
    ```
    getter `len` has no compile-time bound: it calls `norm` (vec.vl:12), whose `while` is at vec.vl:14
-   getter `sum` costs 80 iterations, over the budget of 64: 4 × 20 through `row` (vec.vl:21)
+   getter `sum` costs 84 steps, over the budget of 16: 4 × (1 + 20) through `row` (vec.vl:21)
    getter `label` must not allocate: string `+` at shape.vl:9 builds a new string
    `pure function scale` reads module state: `gScale` (a `let`) at cfg.vl:3
    ```
 
    The chain is the **shortest** path to the first offending line, found by walking back the
    SCC order. (Judgement: a message that names only the getter sends the reader on a hunt.)
-2. **LSP hover** on a function name or a call shows one line: `pure · bound 0 · no
-   allocation` or `writes: gCount (line 8) · unbounded (while, line 9)`. For a generic it shows the summary at *this*
+2. **LSP hover** on a function name or a call shows one line: `no writes · no allocation · no
+   I/O · 3 steps` or `writes: gCount (line 8) · unbounded (while, line 9)`. For a generic it shows the summary at *this*
    call's instance. This is the "visibility comes from tooling" answer that
    `concurrency-design.md` §5 already chose.
 3. **Hints, never errors, for facts that do not decide acceptance.** Examples are the §C3
@@ -565,7 +572,7 @@ Point 6(ii): the word must also work as the future type qualifier. Candidates:
 
 | word | as a declaration | as a type qualifier | meaning elsewhere | verdict |
 | --- | --- | --- | --- | --- |
-| **`pure`** | `pure function f` | `pure (i32) => i32` | Koka, D, Fortran, GCC, Solidity, Haskell culture: **effect-free, cost unspecified** | **recommended**, as effects only |
+| **`pure`** | `pure function f` | `pure (i32) => i32` | Fortran `PURE`, D's weak `pure`, GCC, Solidity, Haskell culture: **effect-free, cost unspecified** | **recommended**, as effects only |
 | `const` | `const function f` | `const (i32) => i32` | Rust and C++: *compile-time evaluable*, which permits loops; VL: an immutable binding | reject. It collides with VL's binding keyword, and the borrowed meaning is a different property (it needs ¬`R.let` and permits unbounded loops) |
 | `@pure` | `@pure function f` | `@pure (i32) => i32` reads badly | D-style attributes | reject. It opens an attribute syntax class that invites D's "attribute soup", and it composes worse in type position |
 | `func` | Nim: `func` = no side effects | — | — | reject. `func` versus `function` is a one-letter semantic difference |
@@ -605,7 +612,7 @@ is in the signature, so the comment does not repeat it.
 
 A user getter that calls `normalize` is accepted because the checker sees `normalize`'s body
 and grades it getter-eligible. If a later std version adds an unbounded loop, or raises the
-bound so that the user's getter's total passes 64, the user's getter fails
+bound so that the user's getter's total passes 16 steps, the user's getter fails
 **loudly**, on upgrade. So nothing is unsound. What is missing is that **std's own CI would
 not notice** that it withdrew a property users depend on.
 
@@ -768,7 +775,7 @@ through a parameter exactly what the message carried.
 | decision | forecloses | reversible? |
 | --- | --- | --- |
 | Summaries are inferred and never written (points 2–3) | nothing: a written form can be added later | yes |
-| Getter body must be getter-eligible (point 1, §C1b) | getters that allocate, recurse, loop over data, exceed a bound of 64, or read a `let` | **relaxing is easy** (raise the budget, admit `R.let`). Tightening later would break getters. Reads of the receiver's heap and of linear memory are already admitted |
+| Getter body must be getter-eligible (point 1, §C1b) | getters that allocate, recurse, loop over data, exceed a budget of 16 steps, or read a `let` | **relaxing is easy** (raise the budget, admit `R.let`). Tightening later would break getters. Reads of the receiver's heap and of linear memory are already admitted |
 | The bound's invariant: computable at compile time, never data-dependent (§C1a) | a getter that loops over a receiver's list, however short in practice | **ruled as permanent** (owner, 2026-09-22). Only the budget number may change, through `DECISIONS.md` and a std review |
 | `pure` = effects only (§E2) | using `pure` to mean cost; a cost promise via `pure` | **one-way**: the word's meaning is permanent once std exports carry it |
 | `pure` excludes `R.let`, `R.mem`, `R.heap[const]` (§C1b) | `pure` functions that read `let` globals, linear memory, or a `const` table's heap | relaxing (admitting a read class) is safe; tightening later is breaking |
@@ -782,9 +789,15 @@ through a parameter exactly what the message carried.
 
 ---
 
-## I. Open questions for the owner
+## I. Questions for the owner
 
-**I1. One analysis for getters and concurrency?**
+Ruled: I11, I12 (restaged), I13, I14, I15 (superseded), I16 (deferred), I5 in part, and I2
+and I10 for getters.
+Settled by what is built: I9. Open: I1, I2 (for `pure`), I3, I4, I6, I7, I8, I10 (for
+`pure`). The rulings come from the owner's 2026-09-22/23 decisions on the persona review
+(`design-review-getters-effects-2026-09.md` §5, D-Q1 to D-Q7).
+
+**I1. One analysis for getters and concurrency? OPEN.**
 (a) The summary of §C is concurrency §4's effect analysis, built once, and both docs cite it;
 (b) two analyses.
 *Recommend (a).* §G4: concurrency §5's eligibility table is the same predicates under other
@@ -794,7 +807,7 @@ names. Two analyses would disagree about what "pure CPU" means.
 **RULED for getters (owner, 2026-09-22):** a getter reads its receiver's mutable fields and
 linear memory by design, and excludes module `let` reads because a getter describes its
 receiver (§C1b). Getter-eligible is not `pure`.
-**Open for `pure`:** (a) exclude `R.let`, `R.mem` and `R.heap[const]`, admit
+**OPEN for `pure`:** (a) exclude `R.let`, `R.mem` and `R.heap[const]`, admit
 `R.heap[param]` (§C1b); (b) exclude every read, as GCC's `const` does; (c) exclude only
 `R.let`.
 *Recommend (a).* Its exclusions are exactly what compile-time evaluation and parallel workers
@@ -803,25 +816,29 @@ cannot tolerate, and a read through a parameter is safe for both. (b) would refu
 fresh linear memory and give a silent wrong answer. Strict is the direction that relaxes later
 (§H).
 
-**I3. The word.**
+**I3. The word. OPEN.** (Ruled alongside it, D-Q5: getter and `pure` stay separate, and no
+getter text uses the word.)
 (a) `pure`, effects only; (b) `pure` meaning effects and cost; (c) another word from §E2.
 *Recommend (a).* Every surveyed use of "pure" is effects only (§B, finding 1). The type
 qualifier's consumers do not want cost (§E2). Cost has no one-way decision to protect.
 
-**I4. std's cost promise.**
+**I4. std's cost promise. OPEN**, deferred by D-Q6 to its own ruling.
 (a) A checked baseline, `scripts/std-effects-baseline.json`, and a rubric row (§E4); (b) a
 second keyword now (`bounded`, `cheap`); (c) none: inference only, so a std regression breaks
 users loudly on upgrade.
 *Recommend (a).* It is checked, has no syntax, and covers VL's one boundary. Choose (b)'s word
 when separate compilation creates a boundary with no visible bodies.
 
-**I5. What "allocates" means.**
+**I5. What "allocates" means. RULED in part (owner, 2026-09-23, D-Q6): (a), source-visible
+allocation** is the fact S1 computes. Why: acceptance must not turn on representation choices.
+Whether representation boxes also get a hint stays OPEN.
 (a) Source-visible allocation, with a hint for representation boxes (§C3); (b) emitted
 allocation, as an error.
 *Recommend (a).* (b) makes acceptance depend on representation rules that the program does not
 state and the compiler keeps changing (§A6).
 
-**I6. The operator cost table.**
+**I6. The operator cost table. OPEN**, except two entries ruled with I11: a compare against a
+string literal costs the literal's length, and f64 `%` is `Unbounded` for getters (I15).
 Which compiler-lowered operations count as loops? The proposal: string and list `==`/`!=`,
 string hashing, map `[]` (a probe loop), `utf8` coding, `slice`/`concat`/spread make the bound
 `Unbounded` (and set `A` where they build). `.length` does not. A helper whose loop is bounded by
@@ -831,48 +848,61 @@ bounded (expected O(1)).
 *Recommend (a).* The loop test is "would we feel bad", and a string key's hash is O(length). A
 relaxation can be ruled per operation later. That direction is safe.
 
-**I7. Function values.**
+**I7. Function values. OPEN**, deferred by D-Q6 to its first consumer.
 *Recommend F-D:* (A) now; (A+) with concurrency step 6; (B) optimizer-only; (C) reserved as
 syntax, not built. Confirm point 6(i): `(A) => B` means unknown effects forever.
 
-**I8. Does this amend `concurrency-design.md`'s "never written, never in a type"?**
+**I8. Does this amend `concurrency-design.md`'s "never written, never in a type"? OPEN.**
 A checked `pure` on a declaration *is* written. F-C would be *in a type*.
 (a) Amend §4 narrowly: the analysis stays inferred; a checked, optional declaration marker
 exists for boundaries; the type qualifier stays unbuilt (§7 is unchanged); (b) no marker at
 all, and the baseline carries `pure` too.
 *Recommend (a).* The marker is the owner's point 4, and it changes no code generation.
 
-**I9. Traps inside getters.**
+**I9. Traps inside getters. Settled (a) by what is built:** the getters guide
+(`docs/guide/getters.md`) allows a trap from `as!`, an integer division or `divU` by zero, and
+the example below runs. Whether the summary splits traps is I16.
 `get first(self: Stack): i32 { self.xs[0] }` can trap.
 (a) Allowed, which keeps D1510's ruling that a trap is not an effect; (b) forbidden.
 *Recommend (a).* A getter that indexes is ordinary, and forbidding traps would forbid almost
 every body that reads an array.
 
-**I10. `print` inside a getter or a `pure` function.**
+**I10. `print` inside a getter or a `pure` function. Getters: RULED (owner, 2026-09-23,
+D-Q6)**, no host I/O in a getter or in anything it calls. **`pure`: OPEN.**
 (a) Forbidden (`H`), with no escape; (b) a D-style `debug` escape.
 *Recommend (a) in v1.* An escape is additive later. A getter that prints is the surprise the
 contract exists to prevent.
 
-**I11. Constant-trip loops. RULED (owner, 2026-09-22).**
-Constant-bounded loops are allowed: `for i in <int literal | module const int> (to | until)
-<same> [step <literal>]`, the loop variable never assigned, `break` and `continue` allowed,
-nested loops multiplying, and the total, transitive through calls, at most one named budget of
-**64**. **Invariant: the worst-case cost is computable at compile time from the source plus
-bounded callees, and never data-dependent.** Never allowed: a `for`-in over data, a
-data-bounded range, `while`, recursion. Only the budget number may change, through a
-`DECISIONS.md` entry and a std review. §C1a is the rule; the bound is a number in the summary
-and in the std baseline (§E4).
+**I11. Constant-trip loops. RULED (owner, 2026-09-22), with the metric and budget corrected
+the same day (D-Q2).**
+Constant-bounded loops are allowed: `for i in <int literal | const int> (to | until) <same>
+[step <literal>]`, the loop variable never assigned, `break` and `continue` allowed.
+**Invariant: the worst-case cost is computable at compile time from the source plus bounded
+callees, and never data-dependent.** Never allowed: a `for`-in over data, a data-bounded range,
+`while`, recursion. Cost is counted in **abstract steps**: a call costs 1 plus its callee's
+cost, a loop multiplies, a branch takes the max. The total, transitive through calls, is at
+most one named budget of **16 steps**, tuned by usage, which supersedes the earlier 64
+iterations; the error names the call path. A constant-range loop variable gets an internal
+interval type `[lo, hi)`, with no user syntax. Only the budget number may change, through a
+`DECISIONS.md` entry and a std review. Build after the persona review's contract rows close
+(steps over calls, string-literal compares, f64 `%`) and D2064 (intrinsics, closed #3048).
+Why: steps charge calls, which trip counts left free. §C1a is the rule.
 
-**I12. Staging.**
-(S1) The summary, hover, and D1510/`unionEqOperandOk` admission, with no syntax; (S2) the
-getter body check, landing with property-access D3a; (S3) `pure` as a contextual keyword on
-declarations, the std baseline, and the rubric row; (S4, deferred) F-A+, the trusted extern
-marker, and optimizer hoisting. F-C is not scheduled.
-*Recommend this order.* S1 is useful with no user-facing decision made, and every later step
-reads it.
+**I12. Staging. RULED (owner, 2026-09-23, D-Q6 (b+)).**
+(S1) Compute now every fact whose meaning is settled: writes state (`W`), allocates
+(source-visible `A`), cost in steps (`B`), and host I/O (`H`, `print` included). Each has a
+reader on day one: hover shows the summary, and a dump fixture pins it so a wrong fact fails a
+test. Getter admission of ordinary callees reads them: a getter may call a function with no
+writes, no allocation, no I/O and a cost within the budget (previously S2). (Later, each with
+its own ruling or first consumer) the read-location split (`R.let` / `R.heap` / `R.mem`), the
+trap split (I16), `pure` as a contextual keyword with its rubric row, the std cost baseline
+(I4), function-value effects (I7, F-A+), D1510's reorder admission, the trusted extern marker,
+and optimizer hoisting. F-C is not scheduled.
+Why: a fact with no reader goes wrong unnoticed, and these four have one.
 
-
-**I13. Which module `const`s count as a constant range end?** (New, raised by I11.)
+**I13. Which module `const`s count as a constant range end? RULED (owner, 2026-09-22): (a).**
+Only a `const` whose initializer is an integer literal, or another such `const`, bounds a loop.
+Folding (b) is a later widening. Why: it meets the invariant with no folding machinery.
 A module `const` may be bound to a run-time value (`const n = count()`), so "module const int"
 needs a definition.
 (a) A `const` whose initializer is an integer literal, or another such `const`; (b) any
@@ -880,7 +910,9 @@ integer `const` the compiler can fold (`const N = 4 * 2`); (c) any `const` of in
 *Recommend (a).* It meets the invariant with no folding machinery, and (b) is a pure
 relaxation for later. (c) breaks the invariant.
 
-**I14. Heap reached from a module `const` (a lookup table).**
+**I14. Heap reached from a module `const` (a lookup table). RULED (owner, 2026-09-22): (a).**
+A getter may read a module `const`'s heap; `pure` may not. Why: a table lookup is a natural
+getter, and a worker's copy of the table is freshly initialised.
 `const LUT = [0, 1, 4, 9]; get sq(self: Small): i32 { LUT[self as i32] }` reads a `const`'s
 heap. Property-access §D3a-contract already permits it for getters ("the heap reachable from
 `self` or from a module `const` is readable").
@@ -890,7 +922,9 @@ and would miss a run-time mutation; (b) allowed for both; (c) excluded for both.
 reads most naturally as including them. For `pure` the exclusion can be relaxed later if VL
 gains immutable list literals, whose heap no one can write.
 
-**I15. Loops bounded by a format constant.**
+**I15. Loops bounded by a format constant. SUPERSEDED (owner, 2026-09-22, D-Q1).**
+The premise was wrong: `__f64_rem__`'s trip count depends on the operands' exponent gap, so it
+is data-dependent, and f64 `%` is refused in getters. The question as first put:
 f64 `%` lowers to `__f64_rem__`, whose loops are bounded by the float format, not by the
 operands. Property-access §D3a-contract already treats it as tier 2.
 (a) Such helpers count 0 toward the budget; (b) they count their real worst case.
@@ -898,7 +932,8 @@ operands. Property-access §D3a-contract already treats it as tier 2.
 a number to the rule that nobody can see in the source, and it would change whenever the
 helper is rewritten.
 
-**I16. Split `T` into explicit and implicit traps?**
+**I16. Split `T` into explicit and implicit traps? RULED (owner, 2026-09-22): deferred.** Split
+it when a VL-side hoist or speculation pass lands.
 binaryen, Cranelift and LLVM all distinguish a certain trap from a possible one (§B2 finding 4).
 *Recommend: not now.* `T` is optimizer-only and has no consumer that needs the split yet. Split
 it when a VL-side hoist or speculation pass lands.
