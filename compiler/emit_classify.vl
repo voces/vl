@@ -69,6 +69,7 @@ import {
   fsRetIsVoid,
   fusedMapReadRecvIx,
   inferRetBearsNull,
+  inferRetFnKey,
   inferRetNameByNode,
   inferRetNameOf,
   inferRetTyIxByNode,
@@ -3950,12 +3951,44 @@ function criWalkStmt(stmtIx: i32, i: i32) {
 
 // Look up the wasm function index for `name`, or -1 if no such top-level function
 // exists (an undefined callee — the caller fails loudly).
-export function fnIndexOf(name: string) {
-  sidArrGet(fnIndexBySid, sidLookup(name))
+export function fnIndexOf(name: string) { fnIndexOfSid(sidLookup(name)) }
+
+// The sid-taking primitive. While a body is lowered, a name some nested function carries
+// resolves through that body's scope chain, since the flat map is first-wins. A sibling
+// frame's nested function under the name of one of this body's params or locals is not that
+// binding: answers -1 (D1966).
+export function fnIndexOfSid(sid: i32) {
+  if emitCurFnIx >= 0 && sidArrGet(nestedNameBySid, sid) == 1 {
+    const name = sidText(sid)
+    const fe = fnIndexOfInScopeSid(sid, name, emitCurFnIx)
+    if fe >= 0 && fe < fnParent.length && fnParent[fe] >= 0 {
+      if (
+        !fnPosOnScopeChain(fnParent[fe], emitCurFnPos) &&
+        localIndexOf(emitCurFnIx, name) >= 0
+      ) {
+        return -1
+      }
+    }
+    return fe
+  }
+  sidArrGet(fnIndexBySid, sid)
 }
 
-// The sid-taking primitive — an array read. See `globalIndexOfSid`.
-export function fnIndexOfSid(sid: i32) { sidArrGet(fnIndexBySid, sid) }
+// Whether the `fnStmts` frame `frame` is `pos` or one of its enclosing frames, following an
+// instance into its origin as `fnIndexOfInScopeSid` does.
+function fnPosOnScopeChain(frame: i32, pos: i32): boolean {
+  let pp = pos
+  let steps = 0
+  while pp >= 0 && steps <= fnStmts.length {
+    if pp == frame { return true }
+    let up = -1
+    if pp < fnParent.length { up = fnParent[pp] }
+    if up < 0 && pp < fnInstOrigin.length { up = fnInstOrigin[pp] }
+    pp = up
+    steps = steps + 1
+  }
+  false
+}
 
 // The `fnStmts` position of a lifted function named `name` whose parent frame is the
 // `fnStmts` position `pp`, or -1 — one rung of the scope-chain walk in
@@ -4005,7 +4038,7 @@ export function fnIndexOfInScopeSid(sid: i32, name: string, fnIx: i32) {
       steps = steps + 1
     }
   }
-  fnIndexOfSid(sid)
+  sidArrGet(fnIndexBySid, sid)
 }
 
 // The rep of the RESULT of calling the lifted function at `fnStmts` slot `fe`, or an
@@ -14662,15 +14695,16 @@ export function fnRetNullBearing(fnIx: i32) {
   // `retUnionFlag` admits (a `TyUnion` with a `null` member and a `TyNullable` scalar).
   if retUnionFlag(r) == 1 { return nodeTyBearsNull(r) }
   if r < 0 {
-    const im = inferRetNameOf(fn.fnName)
+    const irk = inferRetFnKey(fnIx, fn.fnName)
+    const im = inferRetNameOf(irk)
     if isValueUnionName(im) {
       // The arena, reached through the inferred-return table's own type column
       // (`inferRetTyIxOf`), rather than splitting a rendered member set on `|`. The
       // fallback below is unreachable and kept only as a total-function guard:
       // `isValueUnionName(im)` being true already proves `inferRetTyIxOf` resolves.
-      return inferRetBearsNull(fn.fnName)
+      return inferRetBearsNull(irk)
     }
-    if inferNicheNullByName(fn.fnName) != "" { return true }
+    if inferNicheNullByName(irk) != "" { return true }
   }
   false
 }
@@ -14977,8 +15011,9 @@ export function fnUnionRetSinkOk(fnIx: i32) {
       }
     }
     if fn.fnRet < 0 {
-      const im = inferRetNameOf(fn.fnName)
-      if isValueUnionName(im) || isUNameAB(15, im, inferRetTyIxOf(fn.fnName)) {
+      const irk = inferRetFnKey(fnIx, fn.fnName)
+      const im = inferRetNameOf(irk)
+      if isValueUnionName(im) || isUNameAB(15, im, inferRetTyIxOf(irk)) {
         isBox = true
       }
     }
@@ -15922,7 +15957,10 @@ export function exprNulBool(exprIx: i32, fnIx: i32) {
           // spelling (D-CLASSGRAM census note): `inferNicheNullByName` publishes a
           // three-valued tag (`""` / `"boolean|null"` / `"string|null"`), compared by provenance, not shape.
           if cfn.fnRet < 0 {
-            if inferNicheNullByName(callee.identName) == "boolean|null" {
+            if (
+              inferNicheNullByName(inferRetFnKey(fnStmts[t], callee.identName)) ==
+              "boolean|null"
+            ) {
               return true
             }
           }
@@ -27216,13 +27254,12 @@ export function unionNameOfExpr(exprIx: i32, fnIx: i32) {
           // An un-annotated function whose returns join to a value union: without its inferred
           // name, a binding stays the raw box and a narrowed read mis-types (arrayref vs scalar).
           if fn.fnRet < 0 {
-            const im = inferRetNameOf(callee.identName)
+            const irk = inferRetFnKey(fnStmts[t], callee.identName)
+            const im = inferRetNameOf(irk)
             // A value union or a registered struct union (`isUName`, from this same inferred
             // name in `collectU`) — either drives narrowing/unboxing as an annotation would.
             if isValueUnionName(im) { return im }
-            if im != "" && isUNameAB(18, im, inferRetTyIxOf(callee.identName)) {
-              return im
-            }
+            if im != "" && isUNameAB(18, im, inferRetTyIxOf(irk)) { return im }
           }
         }
       }
@@ -27238,9 +27275,10 @@ export function unionNameOfExpr(exprIx: i32, fnIx: i32) {
           // `isUName` covers struct unions only, so this narrowed result would not unbox otherwise. B290.
           if isValueUnionTyOr(annRowOfNode(cfn.fnRet)) == 1 { return crn }
           if cfn.fnRet < 0 {
-            const cim = inferRetNameOf(cfn.fnName)
+            const cirk = inferRetFnKey(fnStmts[cfe], cfn.fnName)
+            const cim = inferRetNameOf(cirk)
             if isValueUnionName(cim) { return cim }
-            if cim != "" && isUNameAB(19, cim, inferRetTyIxOf(cfn.fnName)) {
+            if cim != "" && isUNameAB(19, cim, inferRetTyIxOf(cirk)) {
               return cim
             }
           }
@@ -27272,9 +27310,10 @@ export function unionNameOfExpr(exprIx: i32, fnIx: i32) {
           const mrn = tyNameOf(mfn.fnRet)
           if unRowOfCanon(annRowOfNode(mfn.fnRet)) >= 0 { return mrn }
           if mfn.fnRet < 0 {
-            const mim = inferRetNameOf(mfn.fnName)
+            const mirk = inferRetFnKey(fnStmts[mfe], mfn.fnName)
+            const mim = inferRetNameOf(mirk)
             if isValueUnionName(mim) { return mim }
-            if mim != "" && isUNameAB(20, mim, inferRetTyIxOf(mfn.fnName)) {
+            if mim != "" && isUNameAB(20, mim, inferRetTyIxOf(mirk)) {
               return mim
             }
           }
