@@ -6144,3 +6144,63 @@ the default window silently puts a unit's heap at 1024, which may be inside the 
 A `vl link` command wrapping the recipe is a separate follow-up. Pinned by
 `tests/vl_import_memory_test.ts`, including the two-unit collision, its fix, and the recipe's one
 memory.
+
+## Globals cross the wasm boundary: `extern let` imports one, the entry's `export let` exports one (owner, 2026-09-22) — plumb PL-003(b)
+
+**The ask:** plumb links ~150 separately compiled units that all touch the x86 register file.
+Kept in linear memory, every register access is a load or store at a fixed address; kept in wasm
+GLOBALS, it is a `global.get`/`global.set` the engine can keep in a register. That needs a unit to
+import a mutable global another unit (or the embedder) owns, and a unit to export one.
+
+**Ruled, and the points settled while building it:**
+
+- **`extern let rax: i64` imports a mutable global, `extern const k: i32` an immutable one**, from
+  the `extern` module — the namespace `extern function` already uses, so one host object serves
+  both, and one name cannot be both a function and a global (refused: a host object holds one
+  value per key). The brief's "env" was read as "the same module name as `extern function`",
+  which is `extern`; `env` stays the memory's.
+- **It is a `LetDecl`, not a new binding kind.** An `extern function` mints no node; an `extern
+  let` mints an ordinary module `let`/`const` with no initializer, recorded in a manifest beside
+  the function one. So name lookup, the module merge's per-module rename, `export extern let`,
+  assignment, `const` (a write to an `extern const` is the ordinary `const` refusal), closures and
+  every reader of a module global serve it unchanged; the only new lowering is the index. Imported
+  globals precede every defined one in wasm's index space, so they take 0..n-1, one per NAME
+  across the module graph, and the string pool and the defined cells move up by n.
+- **Every access is on the import itself.** No snapshot is taken anywhere: a closure reads the
+  global (module globals are never captured), a function reads it after any call, and the
+  top-level promotion that turns a module `let` into a start-function local never applies to one
+  (it has no initializer). Nothing narrows across a call because nothing narrows a scalar.
+- **Scalars only — `externScalarTy`'s set (`i32`, `i64`, `f32`, `f64`, `boolean` as `i32`).** A GC
+  ref cannot cross to a browser host, the same argument as for an extern's parameters.
+- **A type is required and an initializer is refused**, both at parse time: there is nothing to
+  infer from, and the value belongs to whoever exports the global. Definite assignment treats an
+  extern global as assigned.
+- **Two declarations of one name must agree on type AND mutability**, reported at the declaration
+  that disagrees — the extern link rule, one level over. The engine agrees: an `extern let` linked
+  to an immutable export is a `LinkError` (pinned).
+- **`export let` becomes a wasm global export only in the ENTRY module**, the rule `export
+  function` already follows — the driver stages the entry's `export`-marked declarations (and its
+  re-exports) as the ABI, and a dependency's `export let` stays what it always was, a VL-level
+  export between modules. Only a binding whose CHECKED type is one of the scalars is published; a
+  string or struct binding keeps its VL meaning and publishes nothing, rather than being refused,
+  because refusing would break every entry module that exports a non-scalar constant today. An
+  `export const` with a constant initializer is exported immutable (so `extern const` links to
+  it); one whose initializer runs in the start function is necessarily a mutable cell and is
+  exported mutable. A published binding is never promoted to a start-function local.
+- **Multi-unit linking goes through a generated facade, not a per-extern import module (owner,
+  2026-09-22).** Every extern name is imported from `extern`, so with three or more units no
+  single unit can take that name under `wasm-merge`. An `extern … from "module"` clause was
+  considered and DEFERRED: it would be permanent syntax serving one generated-code consumer, and
+  it can be added later without breaking anything written today. Instead a generated facade
+  named `extern` imports each name from its defining unit and re-exports it, merged with
+  `--rename-export-conflicts` (`cli-design.md`, "the facade recipe"). Measured for globals too: an
+  imported MUTABLE global re-exported through the facade resolves to the defining unit's own
+  global, with no `extern` import left and every access a direct `global.get`/`global.set`.
+- **`vl run` provides no globals and refuses at load**, naming the global and the fix (build and
+  link it). Supplying zero-initialized globals was the alternative and was declined: the program
+  would read a value nobody set, which is exactly what the contract exists to prevent. The same
+  choice `vl run --import-memory` made.
+
+Pinned by `tests/vl_extern_global_test.ts` (sections, a host `WebAssembly.Global` written from both
+sides, V8 and `wasm-merge` + `-O3` links, the mutability `LinkError`, the `vl run` refusal) and the
+`tests/cases/extern/global-*` / `error-global-*` fixtures.

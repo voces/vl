@@ -126,12 +126,21 @@ import {
   extDeclPos,
   extDeclSig,
   extDeclVl,
+  extGDeclLink,
+  extGDeclMut,
+  extGDeclNode,
+  extGDeclPos,
+  extGDeclTy,
+  extGMut,
+  extGNames,
+  extGTys,
   extNames,
   extPoss,
   extSigs,
   externArityAt,
   externCount,
   externDeclCount,
+  externGlobalLinkOfNode,
   externLinkOf,
   externNameAt,
   externParamAt,
@@ -4314,8 +4323,9 @@ function checkNotEmitterIntrinsic(name: string, at: i32) {
     return 0
   }
   // An extern name is a host import name: `emitCall` routes the call to the import, so a
-  // definition of that name would never run — the same reason the fs floor is reserved.
-  if externLinkOf(name) >= 0 {
+  // definition of that name would never run — the same reason the fs floor is reserved. An
+  // `extern let` of the name is refused once, by `checkExternGlobals`.
+  if externLinkOf(name) >= 0 && externGlobalLinkOfNode(at) < 0 {
     tErr(
       "'" +
         name +
@@ -29449,7 +29459,79 @@ function checkExternDecls() {
     }
     d = d + 1
   }
+  checkExternGlobals()
   0
+}
+
+// The `extern let` / `extern const` rows: a scalar type, one name per import across both
+// kinds, and every declaration of one name agreeing on type and mutability. The binding
+// itself is an ordinary `LetDecl`, declared by `checkNode` like any module global.
+function checkExternGlobals() {
+  let g = 0
+  while g < extGNames.length {
+    const nm = extGNames[g]
+    let fk = 0
+    while fk < extNames.length {
+      if extNames[fk] == nm {
+        externErr(
+          "extern `" +
+            nm +
+            "` is declared both as a function and as a global — one name is one host import",
+          extPoss[fk],
+        )
+      }
+      fk = fk + 1
+    }
+    g = g + 1
+  }
+  let d = 0
+  while d < extGDeclNode.length {
+    const link = extGDeclLink[d]
+    const tok = extGDeclPos[d]
+    if link >= 0 && link < extGNames.length {
+      const nm = extGNames[link]
+      const ty = extGDeclTy[d]
+      // The closed set is `externScalarTy`'s; a global has no `Buf` workaround to name.
+      if (
+        ty != "" &&
+        ty != "i32" &&
+        ty != "i64" &&
+        ty != "f32" &&
+        ty != "f64" &&
+        ty != "boolean"
+      ) {
+        externErr(
+          "extern `" +
+            nm +
+            "` is typed `" +
+            ty +
+            "`, which cannot cross a host boundary — " +
+            "an imported global holds i32, i64, f32, f64 or boolean only",
+          tok,
+        )
+      }
+      if extGTys[link] != ty || extGMut[link] != extGDeclMut[d] {
+        externErr(
+          "extern `" +
+            nm +
+            "` is declared `" +
+            externGlobalSig(extGDeclMut[d], ty) +
+            "` here and `" +
+            externGlobalSig(extGMut[link], extGTys[link]) +
+            "` elsewhere — one name is one host import, so every declaration of it must agree",
+          tok,
+        )
+      }
+    }
+    d = d + 1
+  }
+  0
+}
+
+// The declaration an extern-global disagreement quotes: `let: i64` or `const: i32`.
+function externGlobalSig(mut: i32, ty: string): string {
+  if mut == 1 { return "let: " + ty }
+  "const: " + ty
 }
 
 // The checker's entry point; `initChecker()` must have run first. Every module table this
@@ -29525,7 +29607,48 @@ export function checkProgram(rootIx: i32) {
     ni = ni + 1
   }
   checkProgramEndOpDecls()
+  recordTopScalars()
   T.diags.length
+}
+
+// The module bindings whose checked type is one of the scalars a wasm global can export
+// (`i32`, `i64`, `f32`, `f64`, `boolean`), by merged name — what the emitter asks before it
+// publishes an entry module's `export let`/`export const` as a wasm global.
+let topScalarNames: string[] = []
+let topScalarTys: string[] = []
+
+function recordTopScalars() {
+  topScalarNames = []
+  topScalarTys = []
+  let i = 0
+  while i < gRootStmts.length {
+    const s = P.nodes[gRootStmts[i]]
+    if s is LetDecl {
+      const t = lookup(s.letName)
+      let sp = ""
+      if t == TY_I32 { sp = "i32" }
+      else if t == TY_I64 { sp = "i64" }
+      else if t == TY_F32 { sp = "f32" }
+      else if t == TY_F64 { sp = "f64" }
+      else if t == TY_BOOL { sp = "boolean" }
+      if sp != "" {
+        topScalarNames.push(s.letName)
+        topScalarTys.push(sp)
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// The scalar spelling of module binding `name`, or "" when its type is anything else.
+export function topLetScalarOf(name: string): string {
+  let i = 0
+  while i < topScalarNames.length {
+    if topScalarNames[i] == name { return topScalarTys[i] }
+    i = i + 1
+  }
+  ""
 }
 
 // A20 for one un-annotated function: records its inferred return under `key` for the
@@ -34246,7 +34369,8 @@ function checkLetDeclNode(n: LetDecl, ix: i32) {
   // Definite-assignment: an uninitialized `let x` starts unassigned; a later read before a
   // write is an error. An initialized `let`/`const` is assigned from the start and never tracked.
   daMarkAssigned(n.letName)
-  if n.letInit < 0 { daAdd(n.letName) }
+  // An `extern let` is assigned by whoever provides the import, before any code here runs.
+  if n.letInit < 0 && externGlobalLinkOfNode(ix) < 0 { daAdd(n.letName) }
   return TY_VOID
 }
 // ── match ──────────────────────────────────────────────────────────────────

@@ -69,4 +69,83 @@ A VL module's `export function f(a: i32): void` is a wasm function with no resul
 built separately can take it as the provider of its `extern function f(a: i32): void` —
 through `wasm-merge`, or by handing one instance's exports to the other's `extern` imports.
 
-The design and its rationale: `docs/internals/extern-design.md`.
+## `extern let` and `extern const` — globals the host owns
+
+A module can also import a wasm **global**: `extern let` for a mutable one, `extern const` for an
+immutable one. It has a type and no initializer — whoever provides it sets its value.
+
+```vl
+extern let rax: i64      // read and written by this module and by its owner
+extern const width: i32  // read only
+
+function step(): void {
+  rax = rax + (width as i64)
+}
+step()
+print(rax)
+```
+
+Every read is a `global.get` and every write a `global.set` on the import itself, so a value the
+host or another unit writes between two reads is what the second read sees — in a function, at
+top level, or inside a closure. The types are the ones that cross for an `extern function`:
+`i32`, `i64`, `f32`, `f64` and `boolean`. Globals live in the same `extern` namespace as extern
+functions, so one name cannot be both. Declaring one global in two modules is one import, and the
+two declarations must agree on the type and on `let` versus `const`.
+
+From JavaScript, pass a `WebAssembly.Global` (an `i64` one holds a `BigInt`):
+
+```js
+const rax = new WebAssembly.Global({ value: "i64", mutable: true }, 0n);
+const width = new WebAssembly.Global({ value: "i32", mutable: false }, 8);
+await WebAssembly.instantiate(bytes, { imports: { /* print sinks */ }, extern: { rax, width } });
+console.log(rax.value); // what the program last wrote
+```
+
+`vl run` supplies no globals, so it refuses a module that imports one; build it with `vl build`
+and run it from a host, or link it to the unit that exports the global.
+
+## `export let` — a global another unit imports
+
+In the module you build (the entry module), `export let` and `export const` of one of those
+scalar types become wasm global exports, the way `export function` becomes a function export:
+
+```vl
+export let rax: i64 = 0     // a mutable global
+export const width = 8      // an immutable global
+
+export function incr(): void {
+  rax = rax + 1
+}
+```
+
+A separately built unit declaring `extern let rax: i64`, `extern const width: i32` and
+`extern function incr(): void` links to these — by handing one instance's exports to the other's
+`extern` imports, or through `wasm-merge` — and both units then read and write one global.
+
+With `wasm-merge`, whatever satisfies an `extern` import must be the input named `extern`. For
+two units, name the exporting one `extern`. For more, generate a small facade module that
+imports each name from the unit that defines it and re-exports it, and merge it as `extern`:
+
+```sh
+wasm-merge facade.wasm extern ua.wasm ua ub.wasm ub -o linked.wasm --rename-export-conflicts \
+  --enable-gc --enable-reference-types --enable-bulk-memory --enable-tail-call
+```
+
+After the merge every call is direct and every global access reads or writes the defining unit's
+global; no `extern` import is left. The facade's exact shape is in
+`docs/internals/cli-design.md`, "the facade recipe".
+
+An `export const` with a constant initializer (`export const width = 8`) is published immutable,
+so the importer must declare it `extern const`; an `extern let` of it fails to link. An `export
+const` whose initializer is not constant (`export const seed = hash(1)`) is published MUTABLE:
+its value is written by the module's start function, and wasm cannot initialise an immutable
+global that way. Import that one with `extern let` — an `extern const` of it fails with a
+`LinkError`. A binding named `memory` is not published in a module that uses linear memory,
+because the memory export takes that name.
+
+An `export let` in a
+module you import rather than build stays an ordinary VL export, and one of any other type (a
+string, a list, a struct) is not published to the host at all.
+
+The design and its rationale: `docs/internals/extern-design.md`, and `DECISIONS.md` §"Globals
+cross the wasm boundary".
