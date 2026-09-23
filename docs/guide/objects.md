@@ -31,7 +31,11 @@ const c: Cfg = {}                 // both fields null
 run({})
 function defaults(): Cfg { return {} }
 const cfg = loaded ?? {}          // `loaded: Cfg | null`
+withDefaults(() => ({}))          // a callback declared `() => Cfg`
 ```
+
+Into a union, `{}` is the first member, in declaration order, whose fields all admit `null`:
+with `type Plain = { b: i32 }`, `const u: Plain | Cfg = {}` is a `Cfg`.
 
 It is refused when the record has a field that may not be left out, and the message names it:
 
@@ -60,8 +64,9 @@ if ready {
 }
 ```
 
-That includes the last line of a block whose value is used: write `({})` there to mean the
-literal, as in `function pick(k: i32): Cfg | null { if k == 0 { ({}) } else { null } }`.
+That includes the last line of a block whose value is used, where the message says so
+(`a {} here is an empty block; to produce an empty record write ({})`): write `({})` there to
+mean the literal, as in `function pick(k: i32): Cfg | null { if k == 0 { ({}) } else { null } }`.
 
 The empty **body** of a construct is fine, and is how you write "do nothing":
 

@@ -85,6 +85,7 @@ import {
   spreadArgOf,
   stmtAlwaysExits,
   stmtBraceNodes,
+  stmtBraceTails,
 } from "./ast"
 import {
   CALLSITE_NAME,
@@ -3101,6 +3102,9 @@ let bareBraceCount = 0
 // type to complete (1). `bareBraceUndelivered` refuses the rest once every body is checked.
 let bareBraceLits: i32[] = []
 let bareBraceMark: i32[] = []
+// Nesting depth of a speculative `assignableExpr` (one union member tried of several): a `{}`
+// is judged once, by the outer delivery that sees every member.
+let bareBraceSpec = 0
 let inferTentative: string[] = []
 let unresolvedFns: string[] = []
 let fnSawValueRet = false
@@ -3883,6 +3887,7 @@ export function initChecker() {
   bareBraceCount = 0
   bareBraceLits = []
   bareBraceMark = []
+  bareBraceSpec = 0
   inferTentative = []
   unresolvedFns = []
   fnSawValueRet = false
@@ -7343,6 +7348,13 @@ function recordRedundantAnnot(
   if !tyEq(initTy, annot) { return 0 }
   // Without its annotation a `const` bound to a string literal holds that literal's type, so a
   // `string` annotation there is what lets it compare with other strings (D2198).
+  // A `{}` has no type of its own to infer; the annotation is what it completes (D2223).
+  if n.letInit >= 0 {
+    const bin = P.nodes[n.letInit]
+    if bin is ObjLit {
+      if bin.objFields.length == 0 { return 0 }
+    }
+  }
   if n.letKw == "const" && n.letInit >= 0 {
     const lin = P.nodes[n.letInit]
     if lin is StrLit { return 0 }
@@ -9054,7 +9066,10 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
           while mi < members.length {
             const mt = T.tys[members[mi]]
             if mt is TyObj && unionArmBoxSafe(members[mi]) {
-              if assignableExpr(srcExpr, srcTy, members[mi]) {
+              bareBraceSpec = bareBraceSpec + 1
+              const armOk = assignableExpr(srcExpr, srcTy, members[mi])
+              bareBraceSpec = bareBraceSpec - 1
+              if armOk {
                 if !inferQuiet {
                   while nodeTyIx.length <= srcExpr { nodeTyIx.push(-1) }
                   nodeTyIx[srcExpr] = members[mi]
@@ -9132,7 +9147,10 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
             // An `f32[]` arm adopts like any other list arm: the f32-list value atom
             // (kind 12) gives the box a real rep, and the emitter's coerce re-encodes
             // the literal's f64-classified elements at f32 (`coerceListKind` 7).
-            if assignableExpr(srcExpr, srcTy, members[mi]) {
+            bareBraceSpec = bareBraceSpec + 1
+            const armOk = assignableExpr(srcExpr, srcTy, members[mi])
+            bareBraceSpec = bareBraceSpec - 1
+            if armOk {
               if !inferQuiet {
                 while nodeTyIx.length <= srcExpr { nodeTyIx.push(-1) }
                 nodeTyIx[srcExpr] = members[mi]
@@ -29605,6 +29623,13 @@ function finishInferredReturn(
         inferred = expRet
         objRetAdopted = true
       }
+      // A bare `{}` body completes the expected record, as it would at any delivery (D2223).
+      if inferred != expRet && bareBraceNode(lambdaBodyTail(n.fnBody)) {
+        if bareBraceRecordOf(expRet) >= 0 {
+          bareBraceDeliver(lambdaBodyTail(n.fnBody), expRet, 8)
+          inferred = expRet
+        }
+      }
       // The litunion dual: a bare string-literal body that is a member of the expected
       // literal-union adopts it. Its inferred type is the softened `string`; the direct
       // `const k: K = "b"` binding grants the member flow via `assignableExpr`, but the
@@ -31736,6 +31761,18 @@ function bareBraceRequiredMsg(dstTy: i32): string {
   ""
 }
 
+// Whether `ix` is a bare `{}` value (parentheses peeled), not a `{}` statement.
+function bareBraceNode(ix: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const at = peelParenIx(ix)
+  if at < 0 || at >= P.nodes.length { return false }
+  const e = P.nodes[at]
+  if e is ObjLit {
+    return e.objFields.length == 0 && !listHasI32(stmtBraceNodes, at)
+  }
+  false
+}
+
 // Whether `dstTy` is absent or is (or wraps) an unsolved type variable: a generic parameter
 // offers no record for a `{}` to complete.
 function bareBraceHoleDst(dstTy: i32): boolean {
@@ -31780,8 +31817,20 @@ function bareBraceDeliver(srcExpr: i32, dstTy: i32, depth: i32): boolean {
   }
   if e is ArrayLit { return bareBraceDeliverElems(e.arrElems, dstTy, depth) }
   if !(e is ObjLit) { return false }
-  if e.objFields.length != 0 || listHasI32(stmtBraceNodes, srcExpr) {
-    return false
+  if e.objFields.length != 0 { return false }
+  if listHasI32(stmtBraceNodes, srcExpr) {
+    // A block's last `{}` whose value is delivered is refused naming the `({})` spelling.
+    if !listHasI32(stmtBraceTails, srcExpr) || bareBraceSpec > 0 {
+      return false
+    }
+    while bareBraceMark.length <= srcExpr { bareBraceMark.push(0) }
+    bareBraceMark[srcExpr] = 1
+    if inferQuiet { return false }
+    tErr(
+      "a `{}` here is an empty block; to produce an empty record write `({})`",
+      srcExpr,
+    )
+    return true
   }
   if bareBraceHoleDst(dstTy) { return false }
   while bareBraceMark.length <= srcExpr { bareBraceMark.push(0) }
@@ -31794,8 +31843,13 @@ function bareBraceDeliver(srcExpr: i32, dstTy: i32, depth: i32): boolean {
     recordRepTyAdopt(srcExpr, rec, 6)
     while nodeTyIx.length <= srcExpr { nodeTyIx.push(-1) }
     nodeTyIx[srcExpr] = rec
-    return false
+    // Into a union the chosen member is the answer: the first whose fields all admit `null`,
+    // the order the literal-to-union adoption below tries members in. A speculative trial of
+    // one member only records; the outer delivery decides.
+    if bareBraceSpec > 0 { return false }
+    return rec != dstTy && bareBraceMembers(dstTy).length > 1
   }
+  if bareBraceSpec > 0 { return false }
   const msg = bareBraceRequiredMsg(dstTy)
   if msg == "" { return false }
   bareBraceCount = bareBraceCount + 1
@@ -31834,11 +31888,15 @@ function bareBraceUndelivered() {
       d = d + 1
     }
     if !marked {
-      tErr(
-        "`{}` has no record type here to complete — give its destination a record type " +
-          "whose fields admit `null`, or write its fields",
-        ix,
-      )
+      if listHasI32(stmtBraceTails, ix) {
+        tErr("an empty block does nothing; remove it", ix)
+      } else {
+        tErr(
+          "`{}` has no record type here to complete — give its destination a record type " +
+            "whose fields admit `null`, or write its fields",
+          ix,
+        )
+      }
     }
     i = i + 1
   }
@@ -44741,9 +44799,11 @@ function checkIndexNode(n: Index, ix: i32) {
 function checkObjLitNode(n: ObjLit, ix: i32) {
   const fields = n.objFields
   if fields.length == 0 {
-    // A `{}` statement is the parser's empty-block refusal; the error type keeps it at one.
+    // A `{}` statement is an empty block, refused by the parser, or for a block's last
+    // statement by `bareBraceDeliver` / `bareBraceUndelivered`; the error type keeps it at one.
     if listHasI32(stmtBraceNodes, ix) {
       bareBraceCount = bareBraceCount + 1
+      if listHasI32(stmtBraceTails, ix) { bareBraceLits.push(ix) }
       return TY_ERR
     }
     bareBraceLits.push(ix)
