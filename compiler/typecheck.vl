@@ -4111,6 +4111,13 @@ export function initChecker() {
   declare("__args_count__", mkFuncTy(noParams, TY_I32))
   declare("__args_get__", mkFuncTy([TY_I32], u8Arr))
   declare("__fs_errno__", mkFuncTy(noParams, TY_I32))
+  // The positional and appending writes: `mode` is 0 replace, 1 at `offset` without
+  // truncating, 2 append. The second takes its bytes from linear memory at `addr`.
+  declare("__fs_write_at__", mkFuncTy([u8Arr, TY_I64, u8Arr, TY_I32], TY_I32))
+  declare(
+    "__fs_write_from__",
+    mkFuncTy([u8Arr, TY_I64, TY_I32, TY_I32, TY_I32], TY_I32),
+  )
   // The process floor (`std:process`, `std:env`): five more host imports on the same
   // out-of-band error channel. `__proc_run__` takes the command and its arguments as ONE
   // NUL-separated block — the one byte an argv element cannot hold — and answers the
@@ -4262,13 +4269,15 @@ export function fsIntrinsicSlot(name: string): i32 {
   if name == "__proc_err__" { return 12 }
   if name == "__proc_exit__" { return 13 }
   if name == "__env_get__" { return 14 }
+  if name == "__fs_write_at__" { return 15 }
+  if name == "__fs_write_from__" { return 16 }
   -1
 }
 
 // How many fs slots exist. Every parallel table the emitter keeps (`gFsUse`, `gFsIdx`) is exactly
 // this long, and every read of one is bound-checked against it — `emitFail` does not halt
 // emission, so an out-of-bounds read here would trap a compiler that had already decided to fail.
-export function fsIntrinsicCount(): i32 { 15 }
+export function fsIntrinsicCount(): i32 { 17 }
 
 // The name at slot `k` — the inverse of `fsIntrinsicSlot`, used by the import and name
 // sections, which iterate slots rather than spelling names. `""` for a slot out of
@@ -4289,10 +4298,12 @@ export function fsIntrinsicNameAt(k: i32): string {
   if k == 12 { return "__proc_err__" }
   if k == 13 { return "__proc_exit__" }
   if k == 14 { return "__env_get__" }
+  if k == 15 { return "__fs_write_at__" }
+  if k == 16 { return "__fs_write_from__" }
   ""
 }
 
-// True when `name` is one of the ten. A projection of `fsIntrinsicSlot`, deliberately not a
+// True when `name` is a floor slot. A projection of `fsIntrinsicSlot`, deliberately not a
 // second `if`-chain: the two could not then disagree.
 export function nameIsFsIntrinsic(name: string) { fsIntrinsicSlot(name) >= 0 }
 
@@ -4310,6 +4321,8 @@ export function fsArgIsU8List(k: i32, a: i32) {
   if k == 9 { return a == 0 }
   if k == 10 { return a == 0 }
   if k == 14 { return a == 0 }
+  if k == 15 { return a == 0 || a == 2 }
+  if k == 16 { return a == 0 }
   false
 }
 
@@ -4328,6 +4341,8 @@ export function fsIntrinsicArity(k: i32): i32 {
   if k == 12 { return 0 }
   if k == 13 { return 1 }
   if k == 14 { return 1 }
+  if k == 15 { return 4 }
+  if k == 16 { return 5 }
   if k >= 0 && k <= 3 { return 1 }
   -1
 }
@@ -4338,12 +4353,14 @@ export function fsRetIsU8List(k: i32) {
   k == 0 || k == 2 || k == 5 || k == 7 || k == 11 || k == 12 || k == 14
 }
 
-// True when slot `k` takes an i64 in argument position `a` — a range read's byte offset into the
-// FILE, which an i32 cannot address past 2 GiB. Read beside `fsArgIsU8List` by the functype
+// True when slot `k` takes an i64 in argument position `a` — a byte offset into the FILE,
+// which an i32 cannot address past 2 GiB. Read beside `fsArgIsU8List` by the functype
 // writer and the call lowering, so every position is a packed list, an i64, or an i32.
 export function fsArgIsI64(k: i32, a: i32) {
   if k == 7 { return a == 1 }
   if k == 9 { return a == 1 }
+  if k == 15 { return a == 1 }
+  if k == 16 { return a == 1 }
   false
 }
 
@@ -4357,11 +4374,11 @@ export function fsRetIsI64(k: i32) { k == 8 }
 // oblige every host to leave a value on the stack it can never reach the code to push.
 export function fsRetIsVoid(k: i32) { k == 13 }
 
-// True when slot `k` writes into linear memory, so the module needs the memory emitted and
-// exported even when it contacts it nowhere else. Without this a program whose only memory
-// use is `__fs_read_into__` names a memory that does not exist, and the host has nowhere to
-// write. Read by the use scan beside the memory intrinsics, which force it the same way.
-export function fsSlotWritesMemory(k: i32) { k == 9 }
+// True when slot `k` reads or writes linear memory by address, so the module needs the memory
+// emitted and exported even when it contacts it nowhere else. Without this a program whose only
+// memory use is `__fs_read_into__` names a memory that does not exist, and the host has nowhere
+// to write. Read by the use scan beside the memory intrinsics, which force it the same way.
+export function fsSlotTouchesMemory(k: i32) { k == 9 || k == 16 }
 
 // The declared-but-unlowered memory intrinsics: names that pass `vl check` and then die at emit
 // with `emitProgram: call to unknown function`, which reads like a mistyped identifier when the

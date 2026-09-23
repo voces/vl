@@ -257,6 +257,13 @@ Each now says so, in the shape the `concat`-vs-`+` bullet uses.
   `-O` and `-O3` inline it away; §M2 has the number. `wasm-opt -O` does NOT inline the
   plain accessor wrappers; `-O3 --closed-world` does (§O1).
 
+- **`window` is a view, not a copy, and CHECKS its range** — the one `Buf`-returning
+  function besides `Buffer`. It traps rather than answering an error, which is this
+  module's convention for every range check (`storeBytes`, `loadBytes`, the views), and is
+  why `std:fs` can take a window without a second error channel. Named by the std review
+  (`fs-streaming-design.md` §5): `u8view` would promise the `[]` indexing the typed views
+  have, `view` drops the width, `slice` copies on arrays. Not re-exported from `std:fs`.
+
 ## `std:fs`
 
 - **`IoError` cannot extend the design doc's floor shape at this head.** It is meant to
@@ -338,7 +345,7 @@ Each now says so, in the shape the `concat`-vs-`+` bullet uses.
   `readFileInto` passes offset 0. Splitting it would have been a second host import with
   the same body, and the emitter's per-slot tables would carry two rows saying one thing.
 - **It is the first fs slot that WRITES, so the use scan forces the memory.**
-  `fsSlotWritesMemory` sets `memUsed` exactly as `__memory_size__` does: the host looks the
+  `fsSlotTouchesMemory` (then `fsSlotWritesMemory`) sets `memUsed` exactly as `__memory_size__` does: the host looks the
   destination up by the module's `memory` EXPORT, so a program whose only contact with
   linear memory is this call still needs section 5 emitted and section 7 to name it.
   `tests/cases/intrinsics/fs-read-into.vl` is the pin — it carries zero load, store or
@@ -366,8 +373,52 @@ Each now says so, in the shape the `concat`-vs-`+` bullet uses.
 - **The measurement that justified the out-parameter** is `bulk-copy-design.md` §B and §D —
   the copy loop is 0.1791 s of the 0.2374 s a 64 MiB read costs, and §2 of the API rubric
   requires it before a caller-owned buffer is admitted.
-- **Not here, and why:** no path manipulation (a future `std:fs/path`); no open handles,
-  seeking or streaming (`readFileRange` is positional, so a scan needs none); no ranged
+- **The write side: `writeFile` widened, `writeFileRange` and `appendFile` added** — the
+  surface ruled in `fs-streaming-design.md` §5/§6, for plumb PL-020 (145 files of up to
+  256 MB, each assembled in a `Buf`) and PL-009 (a 300 MB generated source). Four choices:
+  - **One union source, `data: u8[] | Buf`**, rather than `…From` twins: three write names,
+    not a 2×2 matrix. The read side's `Into` has no `From` mirror because a write returns
+    `IoResult` whatever the source, while a read's return changes with its destination.
+    VL has no overloading of named functions (`DECISIONS.md` B16). The widening changes no
+    function-value binding: `writeFile` could not be taken as a value before (its
+    `IoResult` result has no function-value ABI) and still cannot. A partial write from a
+    `Buf` is `std:buffer`'s `window`; there is no copy-free partial write from a `u8[]`.
+  - **Contiguous only, for now (Q4).** An offset past the file's length is `EINVAL`, never a
+    zero-filled gap, so relaxing it later is additive. The host checks the offset against
+    the size of the descriptor it OPENED (`fstat`), not a separate stat. On `EINVAL`, std
+    reads `__fs_size__` for the message's length — the length when the error is reported,
+    which is the one a caller can act on; a missing file reads `length 0`, and any other
+    failed size read falls back to `failed()`'s errno rendering. At a non-zero offset a
+    missing file is refused rather than created, so a refusal never leaves a file behind.
+  - **`appendFile` exists by owner ruling (Q2)**, for logs. Its offset is the file's current
+    length, state the call both reads and changes, and it is not idempotent across runs; its
+    comment names `writeFile(path, [])` as the fresh start. It is not
+    `writeFileRange(p, fileSize(p), d)`: `O_APPEND` reads and uses the offset atomically.
+  - **`writeFile` now PROMISES to create a missing file**; the old comment left that to the
+    host. Every host already did (`std::fs::write`), so no caller's behaviour changed.
+- **`appendTextFile` is NOT here, pending an owner ruling.** The design-level API review
+  asked for either the text sibling or a header line refusing it; the rulings named exactly
+  three write names, so neither was added. Until it is ruled, text is encoded once with
+  `encodeUtf8` at the call. When it is: a "no" rewords the header's text line to "only
+  whole-file reads and writes have a text sibling", since `appendFile` is not a byte range.
+- **Two floor slots, 15 and 16.** `__fs_write_at__(path, offset, data: u8[], mode)` and
+  `__fs_write_from__(path, offset, addr, len, mode)`; `mode` is 0 replace (`O_TRUNC`),
+  1 at the offset (no truncate), 2 append (`O_APPEND`) — a host argument no caller spells,
+  since the three exports carry the distinction by name. `writeFile`'s `u8[]` arm stays on
+  slot 1. Slot 16 reads the `Buf` IN PLACE from the exported memory (`-EFAULT` outside
+  it), the mirror of slot 9, so `fsSlotTouchesMemory` covers both. Both handlers loop until
+  every byte is written (`write_all`), so a short count is never success, and a zero-length
+  source still opens the file, so a replace truncates. Measured by
+  `tests/vl_std_fs_write_test.ts` on 64 MiB: every `Buf` write peaks within 1 MiB of the
+  fill alone, while the whole-array `writeFile` peaks ~128 MiB higher (the `u8[]` copy plus
+  the host's `Vec`).
+- **An empty `[]` into `u8[] | Buf` needed a compiler fix (D2201)**: the union box built the
+  i32 list for it and the narrowed read trapped, so `writeFile(path, [])` — the documented
+  fresh start — trapped on the first draft. The `string[]` and struct-array twins are
+  D2202 and D2203, still open.
+- **Not here, and why:** no path manipulation (a future `std:fs/path`); no open handles or
+  seeking (`readFileRange` and `writeFileRange` are positional, so a stream needs none,
+  and a handle waits on scope-exit cleanup, Q1); no truncating to a length (Q5); no ranged
   TEXT read, since a byte range can split a UTF-8 sequence; no metadata beyond
   file-or-directory and size; no mkdir, remove, rename or symlink inspection — each is a
   floor intrinsic that does not exist, and a std wrapper for a syscall VL cannot make is

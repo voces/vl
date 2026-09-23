@@ -92,7 +92,7 @@ fn main() -> Result<()> {
     })?;
 
     // ── the host floor (`std:fs`, `std:args`, `std:process`, `std:env`) ──────
-    // The fifteen host imports, registered only when the module declares them. This spike
+    // The seventeen host imports, registered only when the module declares them. This spike
     // is not in CI and is built by nothing (see the header) — it carries them because
     // ROADMAP's host-ABI item requires every new import to land in all three hosts, and
     // because a parity harness that cannot instantiate a file-touching module cannot
@@ -275,6 +275,98 @@ fn main() -> Result<()> {
                     -code
                 }
             });
+            Ok(())
+        })?;
+    }
+    // The write behind `__fs_write_at__` / `__fs_write_from__`: 0 or a POSITIVE errno. `mode`
+    // 0 replaces, 1 writes at `off` without truncating (an offset past the end of the
+    // OPENED file is EINVAL, and a missing file is created only at offset 0), 2 appends.
+    fn write_mode(p: &std::path::Path, off: i64, data: &[u8], mode: i32) -> i32 {
+        use std::io::{Seek, SeekFrom, Write};
+        if off < 0 {
+            return 28;
+        }
+        let mut o = std::fs::OpenOptions::new();
+        match mode {
+            0 => o.write(true).create(true).truncate(true),
+            1 => o.write(true).create(off == 0),
+            2 => o.append(true).create(true),
+            _ => return 28,
+        };
+        let mut f = match o.open(p) {
+            Ok(f) => f,
+            Err(err) if mode == 1 && off > 0 && err.kind() == std::io::ErrorKind::NotFound => {
+                return 28;
+            }
+            Err(err) => return errno_of(&err),
+        };
+        if mode == 1 {
+            match f.metadata() {
+                Ok(m) if (off as u64) > m.len() => return 28,
+                Ok(_) => {}
+                Err(err) => return errno_of(&err),
+            }
+            if let Err(err) = f.seek(SeekFrom::Start(off as u64)) {
+                return errno_of(&err);
+            }
+        }
+        match f.write_all(data) {
+            Ok(()) => 0,
+            Err(err) => errno_of(&err),
+        }
+    }
+    // `__fs_write_at__(path, offset, data, mode)` — 0 = ok, negative = -errno.
+    if let Some(ft) = fs_ty("__fs_write_at__") {
+        let e = fs_errno.clone();
+        linker.func_new("imports", "__fs_write_at__", ft, move |mut c, a, r| {
+            let p = to_path(&bytes_of(&mut c, &a[0])?);
+            let Val::I64(off) = a[1] else {
+                bail!("__fs_write_at__: expected an i64 offset")
+            };
+            let d = bytes_of(&mut c, &a[2])?;
+            let Val::I32(mode) = a[3] else {
+                bail!("__fs_write_at__: expected an i32 mode")
+            };
+            let code = write_mode(&p, off, &d, mode);
+            *e.lock().unwrap() = code;
+            r[0] = Val::I32(-code);
+            Ok(())
+        })?;
+    }
+    // `__fs_write_from__(path, offset, addr, len, mode)` — the same write, its bytes read in
+    // place from the module's exported memory at `[addr, addr + len)`; outside it is -EFAULT.
+    if let Some(ft) = fs_ty("__fs_write_from__") {
+        let e = fs_errno.clone();
+        linker.func_new("imports", "__fs_write_from__", ft, move |mut c, a, r| {
+            let p = to_path(&bytes_of(&mut c, &a[0])?);
+            let Val::I64(off) = a[1] else {
+                bail!("__fs_write_from__: expected an i64 offset")
+            };
+            let Val::I32(addr) = a[2] else {
+                bail!("__fs_write_from__: expected an i32 address")
+            };
+            let Val::I32(len) = a[3] else {
+                bail!("__fs_write_from__: expected an i32 length")
+            };
+            let Val::I32(mode) = a[4] else {
+                bail!("__fs_write_from__: expected an i32 mode")
+            };
+            let code = if addr < 0 || len < 0 {
+                28
+            } else if len == 0 {
+                write_mode(&p, off, &[], mode)
+            } else {
+                let Some(Extern::Memory(mem)) = c.get_export("memory") else {
+                    bail!("__fs_write_from__: the module exports no `memory`")
+                };
+                let (lo, n) = (addr as usize, len as usize);
+                match mem.data(&c).get(lo..).and_then(|t| t.get(..n)) {
+                    None => 21,
+                    Some(src) => write_mode(&p, off, src, mode),
+                }
+            };
+            *e.lock().unwrap() = code;
+            r[0] = Val::I32(-code);
             Ok(())
         })?;
     }
