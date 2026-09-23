@@ -2847,6 +2847,41 @@ Deno.test({
   },
 });
 
+// AN `extern let` / `extern const` IS PRINTED ONCE, WHERE IT WAS WRITTEN. Unlike an `extern
+// function` it DOES mint a node (a `LetDecl`, so the checker and emitter treat it as a module
+// global), so it reaches the printer twice — through the token recovery and through the arena
+// walk — and the walk would print it as a plain `let`, dropping `extern`. The walk skips it.
+Deno.test({
+  name: "vl-fmt: an `extern let` / `extern const` survives once, in place and canonical",
+  ignore: !ENABLED,
+  fn: async () => {
+    const src = [
+      "export   extern let  rax :  i64 // the accumulator",
+      "print(rax)",
+      "// Declared after a statement.",
+      "extern const width: i32",
+      "print(width)",
+      "",
+    ].join("\n");
+    const r = await run([], src);
+    const want = [
+      "export extern let rax: i64 // the accumulator",
+      "print(rax)",
+      "// Declared after a statement.",
+      "extern const width: i32",
+      "print(width)",
+      "",
+    ].join("\n");
+    if (r.code !== 0 || r.out !== want) {
+      throw new Error(`want (rc 0):\n${want}\ngot (rc ${r.code}):\n${r.out}${r.err}`);
+    }
+    const again = await run([], r.out);
+    if (again.code !== 0 || again.out !== r.out) {
+      throw new Error(`not idempotent (rc ${again.code}):\n${again.out}`);
+    }
+  },
+});
+
 // The object-literal METHOD SHORTHAND is a surface form `vl fmt` canonicalises to the arrow
 // field it desugars to. Both spellings are legal and the corpus is formatted, so the shorthand
 // survives only in a test that reads its text — this one. `tests/cases/objects/method-*` hold

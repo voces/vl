@@ -221,5 +221,9 @@ So the honest statement is narrower than "one mechanism, std uses it too":
   microsecond resolution) is a one-arm change to `register_extern_imports` plus a line in each
   JS loader. Keep the three lists in step — the two JS loaders and the Rust registry — the way
   `concurrency-design.md` §8 says every import must.
-- **No `extern const`, no `extern` globals, no `extern` memory or table imports.** Only
-  functions, which is what the import section's other kinds would each need a design for.
+- **Globals now cross (PL-003(b), 2026-09-22):** `extern let` / `extern const` import a mutable /
+  immutable scalar global from this same `extern` namespace, and the entry module's scalar
+  `export let` / `export const` export one. The rules and why are `DECISIONS.md` §"Globals cross
+  the wasm boundary"; the parser mints an ordinary `LetDecl` and `ast.vl`'s `extG*` manifest is
+  what turns its cell into an import. **The memory is imported by `--import-memory` (`env.memory`,
+  PL-003(a)); no table import exists.**

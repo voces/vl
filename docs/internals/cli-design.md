@@ -658,6 +658,33 @@ The result imports exactly one memory, `host.memory`, and needs no multi-memory 
 provider cannot itself import `env.memory`, and `linked.wasm` re-exports it as `memory`.
 Without the provider, `wasm-merge` keeps one memory import per unit (multi-memory).
 
+#### Linking units' `extern` names through a facade (the facade recipe)
+
+Every `extern function` / `extern let` / `extern const` is imported from the module named
+`extern`, whichever unit defines it. With more than two units no single unit can be the one
+named `extern`, so a generated FACADE takes that name: it imports each name from the unit that
+exports it and re-exports it under the same name.
+
+```sh
+# facade.wat — one import/export pair per extern name, pointing at its defining unit:
+# (module
+#   (import "ua" "rax" (global $rax (mut i64)))  (export "rax" (global $rax))
+#   (import "ua" "incr" (func $incr))            (export "incr" (func $incr)))
+wasm-as facade.wat -o facade.wasm
+wasm-merge facade.wasm extern ua.wasm ua ub.wasm ub -o linked.wasm \
+  --rename-export-conflicts \
+  --enable-gc --enable-reference-types --enable-bulk-memory --enable-tail-call
+```
+
+Each unit's `extern.<name>` import resolves through the facade to the defining unit. After the
+merge a function call is a direct call and a global access is a `global.get`/`global.set` on the
+defining unit's own global, and no `extern` import is left. `--rename-export-conflicts` is needed
+because the facade's re-export and the defining unit's own export share a name (the renamed
+copies are the only trace). An imported MUTABLE global re-exported through the facade is still
+one cell (pinned in `tests/vl_extern_global_test.ts`). The facade is the recipe for now, not an
+`extern … from "module"` clause (`DECISIONS.md` §"Globals cross the wasm boundary"). Add the
+memory provider from the recipe above as one more input when the units use `--import-memory`.
+
 #### The output channel is RULED: a file by default, stdout only when asked
 
 `vl build main.vl` writes `main.wasm` beside the source and prints nothing to stdout.
