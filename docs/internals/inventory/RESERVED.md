@@ -62,3 +62,4 @@ D2040-D2049  vl-11  2026-09-22  review follow-ups 3
 D2050-D2059  vl-11  2026-09-22  review follow-ups 4
 D2093-D2099  vl-11  2026-09-22  getter diagnostics follow-ups (G3 field-bound message)
 D2110-D2119  vl-11  2026-09-23  function-list calls (PR #3050)
+D2060-D2069  vl-11  2026-09-22  persona review defects
