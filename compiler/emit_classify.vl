@@ -390,6 +390,7 @@ import {
   buildFnChildIndex,
   capCacheOn,
   capCountTbl,
+  capMemoArmed,
   capNamesFlat,
   capStartTbl,
   cloSigBase,
@@ -4157,9 +4158,9 @@ export function capComputeNamesOf(fe: i32) {
 }
 
 // The captured-variable names of the lifted function at `fnStmts[fe]` — from the capture
-// cache when it is valid (the emission phases), else by direct walk (the rewrite and
-// monomorphize phases, which still mutate bodies). A fresh small array either way, since a
-// `string[][]` cache row is not self-host-emittable.
+// cache when it is valid (the emission phases), else from the pass memo, else by direct walk
+// (the rewrite and monomorphize phases, which still mutate bodies). A fresh small array
+// either way, since a `string[][]` cache row is not self-host-emittable.
 export function captureNamesOf(fe: i32) {
   if capCacheOn && fe >= 0 && fe < capStartTbl.length {
     const caps: string[] = []
@@ -4172,15 +4173,87 @@ export function captureNamesOf(fe: i32) {
     }
     return caps
   }
+  if capMemoUsable(fe) { return capMemoNamesOf(fe) }
   capComputeNamesOf(fe)
 }
 
 // The number of captured variables of the lifted function at `fnStmts[fe]` —
-// O(1) from the cache when valid, else the direct walk's length.
+// O(1) from the cache when valid, else the memo's or the direct walk's length.
 export function captureCountOf(fe: i32) {
   if capCacheOn && fe >= 0 && fe < capCountTbl.length { return capCountTbl[fe] }
-  const caps = capComputeNamesOf(fe)
+  const caps = captureNamesOf(fe)
   caps.length
+}
+
+// The pass memo: `captureNamesOf`'s walk kept within one armed pass, laid out as the capture
+// cache is. The memo is dropped when the pass ends, when a node is minted, or when the pass
+// reports an edit that mints nothing, so no answer outlives the tree it describes (D2017).
+let capMemoGen: i32 = 0 - 1
+let capMemoNodes: i32 = 0 - 1
+let capMemoEditsAt: i32 = 0 - 1
+let capMemoEdits: i32 = 0
+let capMemoStamp: i32[] = []
+let capMemoStart: i32[] = []
+let capMemoCount: i32[] = []
+let capMemoFlat: string[] = []
+
+// An armed pass that rewrites a body without minting a node (re-pointing a child at an
+// existing one, appending a shared default argument) calls this after the edit.
+export function capMemoNoteEdit() {
+  capMemoEdits = capMemoEdits + 1
+  0
+}
+
+// True when a query may be served from, or stored in, the pass memo. A recording walk has
+// side effects a hit would skip, and a sibling walk under way answers relative to its stack.
+function capMemoUsable(fe: i32): boolean {
+  if !capMemoArmed { return false }
+  if cnRecording { return false }
+  if capSibStack.length > 0 { return false }
+  fe >= 0 && fe < fnStmts.length
+}
+
+// `capComputeNamesOf(fe)` through the pass memo; the caller has checked `capMemoUsable`.
+function capMemoNamesOf(fe: i32): string[] {
+  if (
+    capMemoGen != emitPassGen ||
+    capMemoNodes != P.nodes.length ||
+    capMemoEditsAt != capMemoEdits
+  ) {
+    capMemoGen = emitPassGen
+    capMemoNodes = P.nodes.length
+    capMemoEditsAt = capMemoEdits
+    capMemoStamp = []
+    capMemoStart = []
+    capMemoCount = []
+    capMemoFlat = []
+  }
+  if fe < 0 { return capComputeNamesOf(fe) }
+  while capMemoStamp.length <= fe {
+    capMemoStamp.push(0 - 1)
+    capMemoStart.push(0)
+    capMemoCount.push(0)
+  }
+  if capMemoStamp[fe] == capMemoGen {
+    const hit: string[] = []
+    const start = capMemoStart[fe]
+    let ci = 0
+    while ci < capMemoCount[fe] {
+      hit.push(capMemoFlat[start + ci])
+      ci = ci + 1
+    }
+    return hit
+  }
+  const caps = capComputeNamesOf(fe)
+  capMemoStamp[fe] = capMemoGen
+  capMemoStart[fe] = capMemoFlat.length
+  capMemoCount[fe] = caps.length
+  let ci = 0
+  while ci < caps.length {
+    capMemoFlat.push(caps[ci])
+    ci = ci + 1
+  }
+  caps
 }
 
 // The module-scope `for` binding `name` whose body holds the lifted frame `fe`, or -1. A

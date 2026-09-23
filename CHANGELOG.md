@@ -833,6 +833,16 @@ new: the compare-frame pre-pass never recurses into a code-15 field, so a NESTED
 
 ## Codegen, memory & runtime (Track B)
 
+- **A long closure body compiles in linear time (D2017, plumb's generated closures).** Every
+  read of a name the closure does not bind asked for its capture set, and before emission
+  each ask re-walked the whole lifted body, so a 2,500-arm `match` closure took 127 s against
+  0.08 s for the same `match` in a top-level function. `captureNamesOf` now keeps each walk in
+  a pass memo, armed only for passes that cannot change a capture set without saying so
+  (return inference, and the dispatch rewrite, whose non-minting edits call `capMemoNoteEdit`);
+  an answer is dropped when its pass ends, a node is minted or an edit is reported. 2,500
+  arms: 0.16 s. Output is byte-identical (self-compile, 3,351 `tests/cases` programs, closure
+  fixtures). Guarded by the `closure body length` scaling axis; residue D2130 (a global
+  initialised by a closure call re-derives its signature key per read) filed.
 - **A regression guard for the GC-heap-sizing pathology #3022 fixed (plumb PL-014 lane
   L7).** `docs/internals/perf-decoder-gap-2026-09.md` found that none of the existing
   benchmark suite could have caught C1 (wasmtime's copying collector never growing past
