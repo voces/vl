@@ -3753,6 +3753,64 @@ they read it.
 Related: a `--price` run against the POST-landing seed reports VETO rather than a false pass,
 because term (a) legitimately fails once the cells are loud. That is the safe direction; the
 check takes the BASE seed.
+
+## No implicit container widening (owner ruling, 2026-09-23)
+
+**A container of T never implicitly becomes a container of a wider U.** An `i32[]` delivered
+where an `(i32 | null)[]`, an `(i32 | string)[]` or a nested `f64[][]` is declared, a `K[]` of a
+literal union where a `string[]` is, and a map whose key or value would widen are programs the
+language refuses, and the message says so: `i32[] is not (i32 | null)[]: a container never
+widens implicitly … Build it as (i32 | null)[], or copy it with .map((x): i32 | null => x)`.
+The author writes the copy, or builds the container at the wide type from the start.
+
+**The read-only converting copy is the exception still standing** — the numeric element pairs
+`i32`→`f64`, `i32`→`i64`, `f32`→`f64`, and the ref pair `Circle[]` → `Shape[]`: a READ-ONLY
+direct delivery still compiles to a copy, which the owner has not yet ruled on. Until then their refusal names the
+write that forced it rather than the general rule — `i32[] is not f64[] here: this list is
+written (line 4), and a written container never widens implicitly …`, or `the list is WRITTEN
+THROUGH (line 4)` for the ref pair — so the message never contradicts a spelling that runs.
+Every copy the messages suggest compiles alone; D2166 is the one combination found that does
+not. A pair reached through an outer container names the outer type to build and no `.map`,
+since a nested `.map` into a list element is itself refused (D1482's literal).
+
+A method call's receiver is `self`'s argument and gets the same verdict in every spelling —
+`xs.f()`, `xs?.f()`, a generic `self`, and a receiver inside an un-annotated body, asked at
+the call that pins it: `ks.join(",")` refuses exactly where `join(ks, ",")` does (D2165).
+
+**Why a copy is not the answer.** VL lists alias: `const b: i32[] = a; b[0] = 9` is seen
+through `a`, and so is a callee's store through its parameter. An implicit converting copy
+breaks that silently — a callee's `xs[0] = 9.5` never reaches the caller's list, and nothing at
+the call site says a copy was made. An implicit VIEW instead is unsound for writes (a `9.5`
+stored into an `i32` list). A copy the author wrote is visible at the call site; one the
+compiler inserted is not. `readonly T[]` (D1686/D1687) remains the one covariant spelling,
+because a read-only view needs neither a copy nor a write check.
+
+**What the ruling changed, and what it did not.** The refusal the checker already gave (every
+pair except the three numeric ones, and those three when written through) was worded as a
+capability gap — "type-valid … but not yet supported by codegen … no element-converting copy
+exists" — and counted by `goal-scoreboard.py` as a clause-2 concession. It is now a design
+refusal and leaves that count. That is not the relabelling the next section warns against: the
+rule comes from a ruling with a reason (aliasing), not from what the emitter happened to lower. **No program that ran stopped running:** the 2026-09-23 grid
+(29 element pairs × 9 positions × read-only / write-through-the-wide-handle /
+write-through-the-original, 765 cells) moved zero verdicts. Two groups of widenings the ruling
+does not want still RUN, and are the owner's to decide, because `runs → not-runs` is a veto:
+
+* **The read-only converting copy** (D791 for ref elements, D965 for `i32`→`f64`, `i32`→`i64`,
+  `f32`→`f64`): accepted where nothing writes either handle, at binding, argument, return,
+  assignment, struct field, literal element, global init and global assignment. Unobservable
+  when the licence is right; D2162 is a position where it is wrong (a write after a `return`
+  delivery, silently diverging) and D2163 the store positions where it is taken but never
+  lowered.
+* **The class-keeping widening, which SHARES the list**: `C[]` → `(C | null)[]`,
+  `string[]` → `(string | null)[]`, `i32[][]` → `(i32[] | null)[]`, `boolean[]` →
+  `(boolean | null)[]`, `K[]` → `(K | null)[]`. Sound for reads and for writes of the narrow
+  type; a `null` written through the wide handle reaches the narrow one (D2161, a trap or a wrong
+  value).
+
+The recommendation for both is the same: make `readonly` the only covariant spelling, which
+retires the copy and closes D2161 in one rule, priced by `elem-storage-class-widening-runs.vl`
+and the corpus before it lands.
+
 ## Array covariance over ALIASING lists: what VL actually owes, priced (D411, D501, D661B, D741, D742)
 
 **This is a language-design decision the compiler cannot make for itself, and it is the root of

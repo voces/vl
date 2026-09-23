@@ -147,6 +147,26 @@ checked its write against a list the compiler synthesized for the hole and nothi
 compare that to the argument. Read-only uses through the same parameter (`xs[0]`, `xs.length`)
 are unaffected, and spelling the parameter `readonly T[]` says the body only reads.
 
+**A list does not widen implicitly** (owner ruling 2026-09-23). An `i32[]` is not an
+`(i32 | null)[]` or an `(i32 | string)[]`, a `K[]` of a literal union is not a `string[]`, a
+list that is written is not a list of a wider number type, and the same holds for a map's key
+and value types. Changing how the elements are stored takes
+a copy, and a copy made behind your back would stop sharing writes with the original — a
+callee's `xs[0] = 9.5` would never reach your list. So you write the copy, or build the list at
+the wide type from the start:
+
+```vl
+const counts: i32[] = [1, 2]
+const scaled: f64[] = counts.map((x) => x as f64)               // an explicit copy
+const maybe: (i32 | null)[] = counts.map((x): i32 | null => x)  // the same, for a union
+const wide: f64[] = [1, 2]                                      // or build it wide
+```
+
+Two kinds of widening still run today and are under review against this rule: a read-only
+`i32[]` into `f64[]` (compiled as a copy, and refused as soon as either list is written), and a
+widening that keeps the element's storage, such as `C[]` into `(C | null)[]`, which shares the
+list. For the second, write `readonly (C | null)[]` if the receiver only reads.
+
 Covariance is where the view earns its place. A `Circle[]` delivered into a `Shape[]` needs
 an element-converting copy, which is only sound where nothing writes either list — and the
 compiler proves that by following every handle, which it cannot always do. A `readonly`

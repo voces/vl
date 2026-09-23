@@ -15074,9 +15074,9 @@ function objFieldNameSetsEq(src: i32, dst: i32): boolean {
 }
 
 // The wasm element storage class a container's element (or map key/value) type lowers to.
-// Two element types in different classes make two unrelated container wasm types, so there
-// is no element-converting copy to insert; widening is free whenever the class holds (a ref
-// or niche-nullable element costs nothing), but a class change has no lowering. `ESC_UNKNOWN` always declines.
+// Two element types in different classes make two unrelated container wasm types, so only a
+// copy could relate them, and a container does not widen by copying (DECISIONS.md §"No
+// implicit container widening"). A kept class costs nothing. `ESC_UNKNOWN` always declines.
 const ESC_UNKNOWN = 0
 const ESC_I32 = 1
 const ESC_I64 = 2
@@ -15669,6 +15669,11 @@ let cwAnswers: i32[] = []
 // Parallel to `cwAnswers`: 1 where the alias set demands two element storages
 // (`cwSplitStorage`), 0 otherwise. Meaningful only where the closure actually ran.
 let cwSplits: i32[] = []
+// Parallel to `cwAnswers`: the node of the write that decided a `1`, else -1, so a refusal
+// can name the line that forced it.
+let cwWriteAts: i32[] = []
+// The write node the last `cwWrites` pass decided on, or -1.
+let cwLastWriteAt = -1
 let cwArenaLen = -1
 
 export function covarWriteReset() {
@@ -15676,6 +15681,7 @@ export function covarWriteReset() {
   cwRootFrames = []
   cwAnswers = []
   cwSplits = []
+  cwWriteAts = []
   cwArenaLen = -1
   cwFrameReset()
 }
@@ -16653,6 +16659,33 @@ function cwGrowAt(
   if k == CW_UP_ARG {
     return cwGrowCall(up, set, setFr, fowners, fownerFrs, flds)
   }
+  if k == CW_UP_OBJ { return cwGrowRecv(up, set, setFr) }
+  0
+}
+
+// The `self`-function a receiver member `x.f` or `x?.f` calls, or -1 — `cwUfcsDeclOf` with
+// the optional-chain spelling, whose receiver binds `self` the same way.
+function cwRecvDeclOf(mIx: i32): i32 {
+  const m = P.nodes[cwPeel(mIx)]
+  if m is OptMember {
+    if !declFirstParamIsSelf(m.omProp) { return -1 }
+    return cwFnDeclOf(m.omProp)
+  }
+  cwUfcsDeclOf(mIx)
+}
+
+// The receiver -> `self` edge of a UFCS call `x.f(…)`, where `mIx` is the member `x.f`: the
+// receiver binds `f`'s first parameter exactly as an argument binds its own, so a write through
+// `self` is a write through `x` (D2165). A member that is not a resolved UFCS callee adds nothing.
+function cwGrowRecv(mIx: i32, set: string[], setFr: i32[]): i32 {
+  if mIx < 0 || mIx >= cwIxUpKind.length { return 0 }
+  if cwIxUpKind[mIx] != CW_UP_CALLEE { return 0 }
+  const dIx = cwRecvDeclOf(mIx)
+  if dIx < 0 { return 0 }
+  if cwAnnIsView(cwParamAnnOfDecl(dIx, 0)) { return 0 }
+  const pn = cwParamNameOfDecl(dIx, 0)
+  if pn == "" { return 2 }
+  if cwAdd(set, setFr, pn, dIx) { return 1 }
   0
 }
 
@@ -16945,6 +16978,8 @@ function cwWrites(
     }
     j = j + 1
   }
+  cwLastWriteAt = -1
+  if ans == 1 { cwLastWriteAt = at }
   ans
 }
 
@@ -16967,12 +17002,20 @@ function cwWriteNodeOf(u: i32): i32 {
   -1
 }
 
+// The list an annotation type declares: the type itself, or a nullable's inner list.
+function cwListOfAnnTy(ty: i32): i32 {
+  if ty < 0 || ty >= T.tys.length { return ty }
+  const t = T.tys[ty]
+  if t is TyNullable { return t.nInner }
+  ty
+}
+
 // The element storage a declared list annotation fixes: 1 = a value union's `{tag,
 // payload}` box, 2 = a plain struct row, 0 = neither, or an annotation whose type the
-// checker has not recorded yet.
+// checker has not recorded yet. A nullable list (`Circle[] | null`) fixes its list's storage.
 function cwElemKindOfAnn(annIx: i32): i32 {
   if annIx < 0 { return 0 }
-  const ty = nodeTyIxOf(annIx)
+  const ty = cwListOfAnnTy(nodeTyIxOf(annIx))
   if ty < 0 || ty >= T.tys.length { return 0 }
   const t = T.tys[ty]
   if t is TyArray {
@@ -17021,7 +17064,7 @@ function cwElemRead(set: string[], setFr: i32[]): boolean {
 // union the emitter boxes, else -1 — the identity half of `cwElemKindOfAnn`.
 function cwUnionElemTyOfAnn(annIx: i32): i32 {
   if annIx < 0 { return -1 }
-  const ty = nodeTyIxOf(annIx)
+  const ty = cwListOfAnnTy(nodeTyIxOf(annIx))
   if ty < 0 || ty >= T.tys.length { return -1 }
   const t = T.tys[ty]
   if t is TyArray {
@@ -17128,6 +17171,7 @@ export function covarValueWriteState(root: string, rootFr: i32): i32 {
     cwRootFrames = []
     cwAnswers = []
     cwSplits = []
+    cwWriteAts = []
     cwFrameReset()
     cwArenaLen = P.nodes.length
   }
@@ -17140,6 +17184,7 @@ export function covarValueWriteState(root: string, rootFr: i32): i32 {
   }
   let ans = 0
   let split = 0
+  let wAt = -1
   if cwProgramHasWrite() {
     const set: string[] = []
     const setFr: i32[] = []
@@ -17154,7 +17199,10 @@ export function covarValueWriteState(root: string, rootFr: i32): i32 {
     const wownerFrs: i32[] = []
     const wflds: string[] = []
     cwEscapedFields(set, setFr, wowners, wownerFrs, wflds)
-    if ans == 0 { ans = cwWrites(set, setFr, wowners, wownerFrs, wflds) }
+    if ans == 0 {
+      ans = cwWrites(set, setFr, wowners, wownerFrs, wflds)
+      wAt = cwLastWriteAt
+    }
     if ans == 0 {
       if !cwClaimed(set, setFr) { ans = 2 }
     }
@@ -17166,7 +17214,22 @@ export function covarValueWriteState(root: string, rootFr: i32): i32 {
   cwRootFrames.push(rootFr)
   cwAnswers.push(ans)
   cwSplits.push(split)
+  cwWriteAts.push(wAt)
   ans
+}
+
+// The node of the write that made `covarValueWriteState` answer 1 for this value, or -1
+// when it answered anything else. Asks the predicate first, so the memo row exists.
+export function covarValueWriteAt(root: string, rootFr: i32): i32 {
+  if covarValueWriteState(root, rootFr) != 1 { return -1 }
+  let m = 0
+  while m < cwRootNames.length {
+    if cwRootNames[m] == root {
+      if cwRootFrames[m] == rootFr { return cwWriteAts[m] }
+    }
+    m = m + 1
+  }
+  -1
 }
 
 // —— the checker's `Writable` rule (DECISIONS.md A9, D793) ——
@@ -17223,19 +17286,49 @@ function covarNonNullArms(ms: i32[]): i32 {
 // author can change. Not a capability concession: the copy exists (D791), this program is
 // the one shape it is not allowed to run in.
 function covarWriteThroughErr(srcExpr: i32, srcTy: i32, dstTy: i32) {
+  covarWriteThroughErrAt(srcExpr, srcTy, dstTy, srcExpr)
+}
+
+// The same refusal reported at `at`, for a delivery checked away from its own node (a generic
+// body's receiver, re-asked at the call that pins it).
+function covarWriteThroughErrAt(srcExpr: i32, srcTy: i32, dstTy: i32, at: i32) {
+  let where = "somewhere in this program"
+  const wAt = covarValueWriteAt(covarRootName(srcExpr), covarRootFrame(srcExpr))
+  if wAt >= 0 { where = "(line " + i32ToStr(nodeLineOf(wAt)) + ")" }
   tErr(
     "a " +
       tyToStr(srcTy) +
       " cannot be assigned to " +
       tyToStr(dstTy) +
-      " here: the list is WRITTEN THROUGH somewhere in this program, and a covariant list " +
+      " here: the list is WRITTEN THROUGH " +
+      where +
+      ", and a covariant list " +
       "assignment is read-only. The two element storages differ, so the destination would " +
       "have to hold a converted copy, and a store through either handle would not be seen " +
       "through the other. Declare the source as " +
       tyToStr(dstTy) +
       " so both handles share one element storage, or drop the write",
-    srcExpr,
+    at,
   )
+}
+
+// The argument seam's container refusals for a generic body's receiver, re-asked once the
+// pin at `at` has bound it to `recvTy`. `callIx` is the member call inside the body (D2165).
+function ufcsRecvPinSeam(callIx: i32, recvTy: i32, selfTy: i32, at: i32) {
+  if callIx < 0 || callIx >= P.nodes.length { return 0 }
+  const c = P.nodes[callIx]
+  if c is Call {
+    const rx = ufcsRecvExpr(c)
+    if rx < 0 { return 0 }
+    if covarWriteThrough(rx, recvTy, selfTy) == 1 {
+      covarWriteThroughErrAt(rx, recvTy, selfTy, at)
+      return 0
+    }
+    if objShapeAdapterless(rx, recvTy, selfTy, 12, true) {
+      objShapeAdapterlessErr(at, recvTy, selfTy)
+    }
+  }
+  0
 }
 
 // The second sentence (D853), reported at the assignment like its sibling but deliberately
@@ -17607,6 +17700,41 @@ function objDroppedFieldList(src: i32, dst: i32) {
   out
 }
 
+// The explicit copy the element-storage refusal suggests. A list converts each element with
+// `.map`, a numeric one through `as` and any other through an annotated callback return; a
+// map has no `.map`, so it gets the closing clause alone.
+function containerWidenCopyHint(src: i32, dst: i32): string {
+  const s = T.tys[src]
+  const d = T.tys[dst]
+  if s is TyArray {
+    if d is TyArray {
+      const de = tyToStr(d.aElem)
+      if elemClassIsNumeric(s.aElem) && elemClassIsNumeric(d.aElem) {
+        return ", or copy it with `.map((x) => x as " + de + ")`"
+      }
+      return ", or copy it with `.map((x): " + de + " => x)`"
+    }
+  }
+  ", filling it from the source"
+}
+
+// Is `src` -> `dst` a list pair the read-only converting copy serves (D965)? Only those
+// are refused for being written rather than refused outright.
+function containerWidenServed(src: i32, dst: i32): boolean {
+  const s = T.tys[src]
+  const d = T.tys[dst]
+  if s is TyArray {
+    if d is TyArray { return scalarElemWidenServed(s.aElem, d.aElem) }
+  }
+  false
+}
+
+// Is `ty` stored as one of the four numeric element classes?
+function elemClassIsNumeric(ty: i32): boolean {
+  const c = elemStoreClassOf(ty, 8)
+  c == ESC_I32 || c == ESC_I64 || c == ESC_F32 || c == ESC_F64
+}
+
 // The message for an `objShapeAdapterless` pair. Names the object pair that has no lowering
 // and the fields that make it one, not the container that carried it (reported separately),
 // then the two ways out: a constructor is built at the shape it flows into, or the source
@@ -17649,20 +17777,40 @@ function objShapeAdapterlessErr(srcExpr: i32, src: i32, dst: i32) {
     )
     return 0
   }
+  // A design rule, not a missing lowering (DECISIONS.md §"No implicit container widening").
+  // A numeric pair delivered directly is refused only because the list may be written, so
+  // that message names the write; every other pair refuses read-only too.
   if shapeAdaptElemPair {
-    tErrUnsupported(
-      "a value of type " +
-        tyToStr(sT) +
-        " flowing into " +
+    let rule = ": a container never widens implicitly. Its elements would have to be stored " +
+      "differently, which takes a copy, and a write through the copy would no longer reach " +
+      "the original. Build it as "
+    let hint = containerWidenCopyHint(sT, dT)
+    let buildAs = dT
+    if through != "" {
+      hint = ""
+      buildAs = dst
+    } else if containerWidenServed(sT, dT) {
+      const wAt = covarValueWriteAt(covarRootName(sX), covarRootFrame(sX))
+      let written = "nothing shows this list is never written, and a container that may be " +
+        "written"
+      if wAt >= 0 {
+        written = "this list is written (line " +
+          i32ToStr(nodeLineOf(wAt)) +
+          "), and a written container"
+      }
+      rule = " here: " +
+        written +
+        " never widens implicitly. Its elements would have to be stored differently, which " +
+        "takes a copy, and a write would not reach both. Build it as "
+    }
+    tErr(
+      tyToStr(sT) +
+        " is not " +
         tyToStr(dT) +
         through +
-        " changes how the ELEMENT is stored: type-valid (the element type widens) but " +
-        "not yet supported by codegen — a container's wasm type is fixed by its element's " +
-        "storage, so these are unrelated types and no element-converting copy exists. " +
-        "Build the container at " +
-        tyToStr(dT) +
-        " (a literal is built at the type it flows into), or declare the source as " +
-        tyToStr(dT),
+        rule +
+        tyToStr(buildAs) +
+        hint,
       srcExpr,
     )
     return 0
@@ -20191,6 +20339,8 @@ function validateUfcsCstrs(
                 uSuggest,
               ix,
             )
+          } else if !tyHasHole(ufcsCstrP0[ci]) {
+            ufcsRecvPinSeam(ufcsCstrIx[ci], ur, ufcsCstrP0[ci], ix)
           }
         }
       }
@@ -22957,6 +23107,35 @@ function ufcsScopeStepsAside(name: string, fnTy: i32, recvTy: i32): boolean {
   false
 }
 
+// The type of `self` under the call's bindings. `substTyDeep` rebuilds a list as a mutable
+// one, so a `readonly T[]` parameter is re-wrapped as a view, or it would refuse its receiver.
+function substSelfTy(p0: i32, bNames: string[], bTys: i32[]): i32 {
+  const sub = substTyDeep(p0, bNames, bTys)
+  if sub == p0 || p0 < 0 || sub < 0 { return sub }
+  const pt = T.tys[p0]
+  const st = T.tys[sub]
+  if pt is TyArray {
+    if st is TyArray {
+      if pt.aRead == 1 && st.aRead == 0 { return mkArrayViewTy(st.aElem) }
+    }
+  }
+  sub
+}
+
+// The receiver expression of a member call `r.f(…)` or `r?.f(…)`, or -1 for any other callee.
+function ufcsRecvExpr(n: Call): i32 {
+  const c = P.nodes[n.callFn]
+  if c is Member { return c.memObj }
+  optChainRecvOf(n.callFn)
+}
+
+// The receiver of an optional-chain callee `r?.f`, or -1 for a callee that is not one.
+function optChainRecvOf(callFn: i32): i32 {
+  const c = P.nodes[callFn]
+  if c is OptMember { return c.omObj }
+  -1
+}
+
 function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
   // Maps the callee's plain source name to its merge-mangled function, after field precedence
   // has already been checked — resolved at this call's own site (D1120), since two merged
@@ -23072,6 +23251,20 @@ function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
           )
           return TY_ERR
         }
+      }
+    }
+    // The receiver is `self`'s argument, so it takes the argument seam's verdict too: the
+    // dispatch gate above asks bare `assignable`, which misses the refusals the seam holds,
+    // such as a container widened into a differently stored element (D2165). `self` is asked
+    // under the receiver's own binding; a receiver that is still a hole is re-asked at the pin.
+    const recvX = ufcsRecvExpr(n)
+    const selfTy = substSelfTy(params[0], bNames, bTys)
+    if recvX >= 0 && !tyHasHole(recvTy) && !tyHasHole(selfTy) {
+      if !assignableExpr(recvX, recvTy, selfTy) {
+        tErr(
+          "receiver: expected " + tyToStr(selfTy) + ", got " + tyToStr(recvTy),
+          recvX,
+        )
       }
     }
     let i = 0
