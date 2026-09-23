@@ -535,6 +535,23 @@ function drwWalk(ix: i32, ctx: i32) {
     // stack grows as the statements are walked and truncates on the way out.
     const cloMark = drwCloNames.length
     while i2 < bs.length {
+      // The spills land ahead of the write and are walked next, as ordinary statements.
+      const cpOut: i32[] = []
+      if spillCompoundPlace(bs[i2], cpOut) {
+        const cn = cpOut.length
+        let cj = bs.length - 1
+        while bs.length < cj + 1 + cn { bs.push(-1) }
+        while cj >= i2 {
+          bs[cj + cn] = bs[cj]
+          cj = cj - 1
+        }
+        cj = 0
+        while cj < cn {
+          bs[i2 + cj] = cpOut[cj]
+          cj = cj + 1
+        }
+        capMemoNoteEdit()
+      }
       const bst = P.nodes[bs[i2]]
       if bst is LetDecl {
         if letDeclIsClosureNoLocal(bs[i2]) { drwCloNames.push(bst.letName) }
@@ -787,8 +804,17 @@ export function dispatchRewrite(stmts: i32[]) {
     } else if s is UnionDecl {
     } else {
       const oldIx = stmts[i]
+      // A top-level compound write spills into a block of its own, so the spills stay
+      // locals of the start function rather than becoming module globals.
+      let topIx = oldIx
+      const topOut: i32[] = []
+      if spillCompoundPlace(oldIx, topOut) {
+        topOut.push(oldIx)
+        topIx = mkBlock(topOut, P.nodes[oldIx].pos)
+        capMemoNoteEdit()
+      }
       drwAtStmt = true
-      const newIx = drwBareBlock(drwWalk(oldIx, -1))
+      const newIx = drwBareBlock(drwWalk(topIx, -1))
       if newIx != oldIx {
         // The statement node changed (e.g. `o[k] = v` → the write-trap call).
         // `startStmts` captured the old arena index during `collectFns`; repoint it
@@ -900,6 +926,44 @@ function spillWrite(asgIx: i32, out: i32[]): i32 {
     return val
   }
   -1
+}
+
+// A compound write `p op= v` (or `++p`) reads its place through the same target node it
+// writes, so a receiver or index that is not re-readable would run twice. Spills each such
+// operand once, receiver first, onto `out` and points the target at the spill; true if any.
+function spillCompoundPlace(asgIx: i32, out: i32[]): boolean {
+  const a = P.nodes[asgIx]
+  if a is BinExpr {
+    if a.binCompound == "" || a.binOp != "=" { return false }
+    const t = unwrapParen(a.binLeft)
+    if t < 0 { return false }
+    const tn = P.nodes[t]
+    if tn is Index {
+      if exprReReadable(tn.idxIndex) {
+        if exprReReadable(tn.idxArr) { return false }
+        tn.idxArr = spillLocal(tn.idxArr, asgIx, "co", out, a.pos)
+        return true
+      }
+      // An index with an effect runs after the receiver, so the receiver is taken first.
+      tn.idxArr = spillLocal(tn.idxArr, asgIx, "co", out, a.pos)
+      tn.idxIndex = spillLocal(tn.idxIndex, asgIx, "ci", out, a.pos)
+      return true
+    }
+    return spillCompoundRecv(t, asgIx, out, a.pos)
+  }
+  false
+}
+
+// `spillCompoundPlace` for every target that is not an element: a field's receiver is spilled
+// when it is not re-readable, and a name has nothing to spill.
+function spillCompoundRecv(t: i32, asgIx: i32, out: i32[], pos: i32): boolean {
+  const tn = P.nodes[t]
+  if tn is Member {
+    if exprReReadable(tn.memObj) { return false }
+    tn.memObj = spillLocal(tn.memObj, asgIx, "co", out, pos)
+    return true
+  }
+  false
 }
 
 // Pushes `const asg#<asgIx>#<tag> = <ix>` onto `out` and answers a read of it, both typed as `ix`.

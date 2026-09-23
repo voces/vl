@@ -127,6 +127,36 @@ Deno.test({
 });
 
 Deno.test({
+  name: "vl-fmt: every compound assignment reprints its own operator, and a fused generic close re-spaces",
+  ignore: !ENABLED,
+  fn: async () => {
+    // The printer reads the surface operator off the desugared node, so each of the eleven
+    // `op=` forms must come back as itself. A generic close written flush against its `=`
+    // lexes as one `>=` / `>>=` / `>>>=` token; the output re-spacing it proves it parsed,
+    // since unparseable input is returned verbatim.
+    const ops = ["+", "-", "*", "/", "%", "&", "|", "^", "<<", ">>", ">>>"];
+    const src = "type Box<T> = { v: T }\n" +
+      "const a: Box<i32>= { v: 1 }\n" +
+      "const b: Box<Box<i32>>= { v: { v: 2 } }\n" +
+      "const c: Box<Box<Box<i32>>>= { v: { v: { v: 3 } } }\n" +
+      "let x = 1\n" +
+      ops.map((op) => `x${op}=a.v+1\n`).join("");
+    const want = "type Box<T> = { v: T }\n" +
+      "const a: Box<i32> = { v: 1 }\n" +
+      "const b: Box<Box<i32>> = { v: { v: 2 } }\n" +
+      "const c: Box<Box<Box<i32>>> = { v: { v: { v: 3 } } }\n" +
+      "let x = 1\n" +
+      ops.map((op) => `x ${op}= a.v + 1\n`).join("");
+    const r = await run([], src);
+    if (r.code !== 0 || r.out !== want) {
+      throw new Error(`want:\n${want}\ngot (code ${r.code}):\n${r.out}${r.err}`);
+    }
+    const r2 = await run([], r.out);
+    if (r2.out !== r.out) throw new Error(`compound formatting not idempotent:\n${r2.out}`);
+  },
+});
+
+Deno.test({
   name: "vl-fmt: a `;`-joined one-liner is preserved when it fits, expanded when it overflows",
   ignore: !ENABLED,
   fn: async () => {

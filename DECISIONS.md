@@ -5221,7 +5221,7 @@ const big = n
 **The continuing set is DERIVED from `binPrec`, so it cannot drift.** Every entry in the
 parser's binary-operator table joins a line except `-`: `|| && ?? == != < <= > >= + * / %`, the
 bitwise and shift operators `| & ^ << >> >>>`, and — by the same derivation, since none of them
-can begin an expression either — `=` and the compound forms `+= -= *= /=`. Member access (`.`,
+can begin an expression either — `=` and every compound form (`+= -= *= /= %= &= |= ^= <<= >>= >>>=`). Member access (`.`,
 `?.`) already joined at every depth; `is` and the four `as` casts join here for the first time.
 A `|>` pipe, if one is ever added, would join for the same reason.
 

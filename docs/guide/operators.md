@@ -9,8 +9,8 @@ than left to be re-derived. The precedence ladder is the parser's own
 ??  ||   <   &&   <   |   <   ^   <   &   <   ==  !=   <   <  <=  >  >=   <   <<  >>  >>>   <   +  -   <   *  /  %
 ```
 
-Assignment (`=`, and the compound forms `+= -= *= /=`) binds loosest of all and is
-right-associative. `as` / `as?` / `as!` / `as%` bind tighter than every binary operator, so
+Assignment (`=`, and the compound forms `+= -= *= /= %= &= |= ^= <<= >>= >>>=`) binds
+loosest of all and is right-associative. `as` / `as?` / `as!` / `as%` bind tighter than every binary operator, so
 `a + b as! i32` is `a + (b as! i32)`. Unary `-` `!` `~` bind tighter still.
 
 ## Arithmetic
@@ -109,6 +109,33 @@ the quotient passes 2^53 — so `1e308 % 3.0` is `2`, not an approximation of it
 These are about BIT PATTERNS, so a float operand is refused: `1.0 & 2` is
 `operator '&' is integer-only, got f64 and i32`. `%` is deliberately **not** in this family —
 a float remainder is a meaningful number, and VL computes it.
+
+## Compound assignment
+
+Every binary arithmetic, bitwise and shift operator has a compound form: `+= -= *= /= %=`,
+`&= |= ^=` and `<<= >>= >>>=`. `x op= y` means `x = x op (y)` — the whole right-hand side is
+the operand, so `x <<= a | b` shifts by `a | b`. It takes the same operand types, produces the
+same result type and is refused for the same reasons as the spelled-out form: `f ^= 1` on an
+`f64` is `operator '^' is integer-only, got f64 and i32`, and an `i32` place cannot take an
+`i64` result, so `x <<= w` with `w: i64` is `cannot assign i64 to i32`. An `i64` place takes an
+`i32` or an `i64` shift count.
+
+The place is evaluated ONCE. In `xs[next()] ^= mask` or `current().bits |= flag`, the receiver
+and then the index are evaluated a single time, before the right-hand side, and the read and the
+write go to the same slot — a side-effecting index runs once, not twice. The same holds for
+`+=` and prefix `++`, and through a user-defined `"[]"`/`"[]="` pair.
+
+```vl
+let flags = 0
+flags |= 4          // 4
+flags ^= 5          // 1
+let h: i64 = 1
+h <<= 40            // 1099511627776 — an i32 count shifting an i64
+const xs = [8, 16]
+xs[flags] >>>= 1    // xs[1] is 8
+```
+
+There is no `&&=`, `||=` or `??=`.
 
 ## `as` / `as?` / `as!` / `as%` — the conversion family
 
