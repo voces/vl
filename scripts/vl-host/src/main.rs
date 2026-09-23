@@ -477,6 +477,9 @@ program verbatim — the only way to pass one that starts with `-`.
 {b}Environment:{r}
   {c}VL_GC{r}               Collector for the program: auto (default) | tracing |
                       refcount | none
+  {c}VL_COMPILE_GC{r}       Collector for the compiler: auto (default: null when the
+                      ENTRY FILE is under 1.5 MiB, copying at or above; imports do
+                      not count) | null | copying
   {c}VL_COMPILER_WASM{r}    Compiler seed path (when --compiler is not given)
   {c}VL_STD{r}              VL's std/ directory (the only candidate when set)
   {c}NO_COLOR{r}            Disable ANSI in printed values (also off when stdout is
@@ -527,6 +530,7 @@ program verbatim — the only way to pass one that starts with `-`.
 {b}Environment:{r}
   {c}VL_WASM_OPT{r} / {c}VL_WASM_DIS{r}   Explicit binaryen tool paths (else PATH)
   {c}VL_COMPILER_WASM{r}, {c}VL_STD{r}    As in `vl help run`
+  {c}VL_COMPILE_GC{r}                 As in `vl help run`
 
 {b}Exit:{r} 0 wrote a valid module; 1 compile/optimize/validate failure; 2 usage;
       70 the compiler itself crashed (a vl bug — please report it).
@@ -980,20 +984,73 @@ const TEST_GC_HEAP_INITIAL: u64 = 8 << 20;
 /// dies in the module's start function. The user-program engine therefore stays
 /// plain, and the profile covers the compiler rather than the program it emitted.
 fn seed_engine(collector: Collector) -> Result<Engine> {
+    seed_engine_sized(collector, None)
+}
+
+/// `seed_engine` with an optional first GC heap size (`gc_heap_initial_size`).
+fn seed_engine_sized(collector: Collector, initial: Option<u64>) -> Result<Engine> {
     let mut cfg = gc_config(collector);
+    if let Some(bytes) = initial {
+        cfg.gc_heap_initial_size(bytes);
+    }
     if guest_profile_path().is_some() {
         cfg.epoch_interruption(true);
     }
     Engine::new(&cfg)
 }
 
+/// The engine for a ONE-SHOT compile (`vl build`, `vl run`) whose ENTRY FILE is
+/// `source_len` bytes; imports are loaded later and do not count. `$VL_COMPILE_GC` picks the collector: `null`, `copying`, or
+/// `auto` (the default), which is null below `COPYING_COMPILE_THRESHOLD` and copying
+/// at or above it. An unknown value is a hard error, as `$VL_GC`'s is.
+///
+/// The null collector never frees, so a compile's peak memory is everything it ever
+/// allocated, and the GC heap's 32-bit index caps that at 4 GiB (a ~15.6 MB source).
+/// Small sources are cheapest under null; above the threshold copying uses less
+/// memory at about the same CPU. DECISIONS.md, "The compiler's collector is picked by
+/// the size of the entry file".
+fn compile_engine(source_len: usize) -> Result<Engine> {
+    let collector = compile_collector(source_len)?;
+    // `$VL_COMPILE_GC_TRACE=1` names the choice on stderr, so a test can see it.
+    if std::env::var("VL_COMPILE_GC_TRACE").is_ok_and(|v| v == "1") {
+        let name = if matches!(collector, Collector::Copying) { "copying" } else { "null" };
+        eprintln!("vl: compile collector: {name} (entry file {source_len} bytes)");
+    }
+    COMPILE_UNDER_NULL.store(!matches!(collector, Collector::Copying), Ordering::Relaxed);
+    match collector {
+        Collector::Copying => seed_engine_sized(collector, Some(COPYING_COMPILE_HEAP_INITIAL)),
+        _ => seed_engine(collector),
+    }
+}
+
+/// `auto` moves to the copying collector at this entry-file size, where the null
+/// collector's footprint overtakes the copying collector's first heap.
+const COPYING_COMPILE_THRESHOLD: usize = 3 << 19; // 1.5 MiB
+
+/// The copying compile's first GC heap, 192 MiB per semispace; the heap doubles from
+/// here. Starting from 0 costs CPU: the small early heaps collect over and over.
+const COPYING_COMPILE_HEAP_INITIAL: u64 = 384 << 20;
+
+fn compile_collector(source_len: usize) -> Result<Collector> {
+    match std::env::var("VL_COMPILE_GC").ok().as_deref() {
+        None | Some("") | Some("auto") => Ok(if source_len >= COPYING_COMPILE_THRESHOLD {
+            Collector::Copying
+        } else {
+            Collector::Null
+        }),
+        Some("null") => Ok(Collector::Null),
+        Some("copying") => Ok(Collector::Copying),
+        Some(other) => bail!("unknown $VL_COMPILE_GC `{other}` (auto | null | copying)"),
+    }
+}
+
 fn gc_config(collector: Collector) -> Config {
     let mut cfg = Config::new();
     cfg.wasm_gc(true);
     cfg.wasm_function_references(true);
-    // A ONE-SHOT compile (`vl build` / `vl run` / a single-file `vl check`) is batch
-    // work: the null collector (never frees) skips every DRC barrier/refcount, trading
-    // memory for speed — give it a large reservation to grow into. Anything that keeps
+    // A ONE-SHOT compile (`vl build` / `vl run`) of a small source is batch work: the
+    // null collector (never frees) trades memory for speed — give it a large
+    // reservation to grow into (`compile_engine` owns the choice). Anything that keeps
     // running gets a real collector: user programs (`vl run`) may be long-lived, and
     // the CLI pump (`cli_pump`) compiles EVERY file of a directory walk in ONE store,
     // so its garbage is unbounded in the file count, not the file size.
@@ -1458,21 +1515,66 @@ fn seed_cache_path(tag: &str) -> Option<std::path::PathBuf> {
 
 #[cfg(feature = "embed-seed")]
 fn seed_cache_path_impl(tag: &str) -> Option<std::path::PathBuf> {
-    let dir = if let Some(d) = std::env::var_os("VL_CACHE_DIR") {
-        std::path::PathBuf::from(d)
-    } else if let Some(d) = std::env::var_os("XDG_CACHE_HOME") {
-        std::path::PathBuf::from(d).join("vl")
-    } else if let Some(h) = std::env::var_os("HOME") {
-        std::path::PathBuf::from(h).join(".cache/vl")
-    } else if let Some(d) = std::env::var_os("LOCALAPPDATA") {
-        std::path::PathBuf::from(d).join("vl")
-    } else {
+    let dir = user_cache_root()?;
+    if let Err(why) = private_cache_dir(&dir) {
+        // Loud, unlike the module cache: without this entry every invocation recompiles
+        // the whole seed, a slowdown of seconds nobody would otherwise explain.
+        eprintln!("vl: not caching the compiler in `{}`: {why}", dir.display());
         return None;
-    };
-    std::fs::create_dir_all(&dir).ok()?;
+    }
     let ours = dir.join(format!("seed-{}-{tag}.cwasm", env!("VL_SEED_KEY")));
     prune_seed_cache(&dir, &ours);
     Some(ours)
+}
+
+/// The user cache directory, first hit wins: `$VL_CACHE_DIR` · `$XDG_CACHE_HOME/vl` ·
+/// `$HOME/.cache/vl` · `%LOCALAPPDATA%\vl`. Shared by the embedded seed's cache and the
+/// user-module cache (`modules/` under it). Not created here.
+fn user_cache_root() -> Option<std::path::PathBuf> {
+    let var = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty());
+    Some(if let Some(d) = var("VL_CACHE_DIR") {
+        std::path::PathBuf::from(d)
+    } else if let Some(d) = var("XDG_CACHE_HOME") {
+        std::path::PathBuf::from(d).join("vl")
+    } else if let Some(h) = var("HOME") {
+        std::path::PathBuf::from(h).join(".cache/vl")
+    } else if let Some(d) = var("LOCALAPPDATA") {
+        std::path::PathBuf::from(d).join("vl")
+    } else {
+        return None;
+    })
+}
+
+/// Create `dir` if missing (mode 0700 on Unix) and say whether files in it may be
+/// trusted by `deserialize`: `Ok` only when it is a directory owned by this process's
+/// effective user and not writable by group or others. A cache dir someone else made
+/// first (a shared `$VL_CACHE_DIR` under /tmp) could hold forged entries, and a forged
+/// entry is code execution. On Windows the default `%LOCALAPPDATA%` is per-user and no
+/// check is made.
+fn private_cache_dir(dir: &std::path::Path) -> std::result::Result<(), &'static str> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+        if !dir.is_dir() {
+            let _ = std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir);
+        }
+        let meta = std::fs::metadata(dir).map_err(|_| "cannot create it")?;
+        if !meta.is_dir() {
+            return Err("not a directory");
+        }
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        if meta.uid() != unsafe { libc::geteuid() } {
+            return Err("owned by another user");
+        }
+        if meta.mode() & 0o022 != 0 {
+            return Err("writable by group or others (`chmod go-w` it, or remove it)");
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(dir).map_err(|_| "cannot create it")
+    }
 }
 
 /// The SEED a cache file belongs to, read out of a `seed-<seed key>-<engine tag>.cwasm`
@@ -1893,6 +1995,235 @@ fn cached_module(
         },
         _ => compile_and_cache()?,
     })
+}
+
+// ── the user-module compilation cache ───────────────────────────────────────
+// `vl run x.wasm`, `vl run x.vl`, `--batch` and `vl test` all hand the engine a
+// module to Cranelift-compile, and on a 100 KB–MB module that compile is the whole
+// fixed cost of a short run (0.3–0.5 s). The seed has had a cache for that since the
+// start; this is the same idea for the modules the seed EMITS, with two differences
+// forced by where the files live and how many there are:
+//
+// * the directory is shared by every module the user ever runs, so it is BOUNDED
+//   (`module_cache_max_bytes`, least-recently-used first); and
+// * an entry is wrapped in an ENVELOPE that names the wasm it came from (SHA-256),
+//   the engine configuration it was compiled under, and the SHA-256 of the artifact
+//   itself, all verified before `Module::deserialize` sees a byte. The seed's sidecar
+//   relies on the path alone; a cache dir holding thousands of entries written by
+//   interrupted, concurrent and differently-versioned processes earns the check.
+//   DECISIONS.md, "A user module's Cranelift compile is cached".
+
+/// The size `<cache>/modules/` is pruned back to: `$VL_CACHE_MAX_MB` MiB, default 512.
+/// A SOFT bound — pruning runs at most once per `MODULE_CACHE_PRUNE_EVERY` (see
+/// `prune_module_cache`), so a burst of misses can overshoot it until the next pass.
+fn module_cache_max_bytes() -> u64 {
+    std::env::var("VL_CACHE_MAX_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(512)
+        .saturating_mul(1 << 20)
+}
+
+/// The minimum interval between two prune passes over `modules/`. A pass stats every
+/// entry, and a corpus run misses thousands of times a minute; once a minute keeps the
+/// scan off the per-miss path while still bounding the directory.
+const MODULE_CACHE_PRUNE_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The envelope's first bytes. Bump the digit when the layout changes; an old entry
+/// then fails the magic check and is recompiled over.
+const MODULE_CACHE_MAGIC: &[u8; 8] = b"VLMODC01";
+
+/// Envelope layout: magic · SHA-256(wasm) · engine tag (16 ASCII hex) ·
+/// SHA-256(artifact) · artifact length (u64 LE) · artifact.
+const MODULE_CACHE_HEADER: usize = 8 + 32 + 16 + 32 + 8;
+
+/// `$VL_NO_CACHE` (any non-empty value but `0`) turns the user-module cache off:
+/// nothing is read from or written to `modules/`. The compiler seed's own cache is
+/// not affected — without it every `vl` invocation would recompile the compiler.
+fn module_cache_disabled() -> bool {
+    std::env::var("VL_NO_CACHE").is_ok_and(|v| !v.is_empty() && v != "0")
+}
+
+/// `$VL_CACHE_TRACE=1`: one stderr line per user-module lookup — `hit`, `miss`,
+/// `rejected (<why>)` or `off` — for tests and for diagnosing a cache that is not
+/// paying off. Silent otherwise.
+fn module_cache_trace(what: &str, path: Option<&std::path::Path>) {
+    if std::env::var_os("VL_CACHE_TRACE").is_some_and(|v| !v.is_empty() && v != "0") {
+        match path {
+            Some(p) => eprintln!("vl: module cache {what}: {}", p.display()),
+            None => eprintln!("vl: module cache {what}"),
+        }
+    }
+}
+
+fn sha256(bytes: &[u8]) -> [u8; 32] {
+    use sha2::Digest;
+    sha2::Sha256::digest(bytes).into()
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Compile a USER module (`Module::new`), through the on-disk cache when one is
+/// available. A module the engine refuses returns `Module::new`'s own error, exactly
+/// as uncached; every cache failure is silent and falls back to compiling.
+fn user_module(engine: &Engine, bytes: &[u8]) -> Result<Module> {
+    if module_cache_disabled() {
+        module_cache_trace("off", None);
+        return Module::new(engine, bytes);
+    }
+    let Some(root) = user_cache_root() else {
+        return Module::new(engine, bytes);
+    };
+    // Both levels: files live in `modules/`, and whoever controls `root` can swap it.
+    let dir = root.join("modules");
+    if private_cache_dir(&root).is_err() || private_cache_dir(&dir).is_err() {
+        module_cache_trace("rejected (unsafe dir)", Some(&dir));
+        return Module::new(engine, bytes);
+    }
+    let wasm_hash = sha256(bytes);
+    let tag = engine_cache_tag(engine);
+    let path = dir.join(format!("{}-{tag}.cwasm", hex(&wasm_hash)));
+    match read_module_cache(engine, &path, &wasm_hash, &tag) {
+        Ok(module) => {
+            module_cache_trace("hit", Some(&path));
+            return Ok(module);
+        }
+        Err(Some(why)) => module_cache_trace(&format!("rejected ({why})"), Some(&path)),
+        Err(None) => module_cache_trace("miss", Some(&path)),
+    }
+    let module = Module::new(engine, bytes)?;
+    if let Ok(artifact) = module.serialize() {
+        write_module_cache(&path, &wasm_hash, &tag, &artifact);
+        prune_module_cache(&dir, &path);
+    }
+    Ok(module)
+}
+
+/// Load a cache entry, or say why not: `Err(None)` is an ordinary miss (no file),
+/// `Err(Some(why))` an entry that exists and failed a check — it is then recompiled
+/// and overwritten.
+///
+/// SAFETY of the `deserialize` below: wasmtime documents that deserializing bytes it
+/// did not produce is undefined behaviour, and that its own header check (version,
+/// target, engine configuration) is NOT a defence against corruption. Every byte
+/// handed to it here has passed an exact SHA-256 comparison against the digest this
+/// host stored when it serialized that artifact under this engine tag for this wasm,
+/// so what reaches wasmtime is byte-for-byte what `Module::serialize` produced. The
+/// digest is not a MAC: a writer that recomputes it can forge an entry. Precondition,
+/// checked by the caller (`private_cache_dir`): only this user can write the directory,
+/// so such a writer already had the power to replace the `vl` binary.
+fn read_module_cache(
+    engine: &Engine,
+    path: &std::path::Path,
+    wasm_hash: &[u8; 32],
+    tag: &str,
+) -> std::result::Result<Module, Option<&'static str>> {
+    let file = std::fs::read(path).map_err(|_| None)?;
+    if file.len() < MODULE_CACHE_HEADER || &file[..8] != MODULE_CACHE_MAGIC {
+        return Err(Some("bad header"));
+    }
+    if &file[8..40] != wasm_hash || &file[40..56] != tag.as_bytes() {
+        return Err(Some("key mismatch"));
+    }
+    let len = u64::from_le_bytes(file[88..96].try_into().unwrap());
+    let artifact = &file[MODULE_CACHE_HEADER..];
+    if len != artifact.len() as u64 {
+        return Err(Some("truncated"));
+    }
+    if file[56..88] != sha256(artifact) {
+        return Err(Some("digest mismatch"));
+    }
+    let module =
+        unsafe { Module::deserialize(engine, artifact) }.map_err(|_| Some("incompatible"))?;
+    // LRU: a hit makes the entry young again. Throttled to once a minute so a hot
+    // entry costs no write per run; best-effort (a read-only dir just ages).
+    let stale = std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age.as_secs() >= 60);
+    if stale {
+        if let Ok(f) = std::fs::OpenOptions::new().write(true).open(path) {
+            let _ = f.set_modified(std::time::SystemTime::now());
+        }
+    }
+    Ok(module)
+}
+
+/// Publish an entry atomically: write a temp file unique to this process AND thread
+/// (`vl test` compiles on several), then rename it into place, so a concurrent reader
+/// sees the whole old file or the whole new one. Best-effort.
+fn write_module_cache(path: &std::path::Path, wasm_hash: &[u8; 32], tag: &str, artifact: &[u8]) {
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
+    let mut file = Vec::with_capacity(MODULE_CACHE_HEADER + artifact.len());
+    file.extend_from_slice(MODULE_CACHE_MAGIC);
+    file.extend_from_slice(wasm_hash);
+    file.extend_from_slice(tag.as_bytes());
+    file.extend_from_slice(&sha256(artifact));
+    file.extend_from_slice(&(artifact.len() as u64).to_le_bytes());
+    file.extend_from_slice(artifact);
+    if file.len() != MODULE_CACHE_HEADER + artifact.len() {
+        return; // a tag that is not 16 bytes would misplace every field after it
+    }
+    let tmp = path.with_extension(format!(
+        "{}.{}.tmp",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    if std::fs::write(&tmp, &file).is_err() || std::fs::rename(&tmp, path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// Bring `modules/` back under `module_cache_max_bytes` by deleting the
+/// least-recently-used entries (oldest mtime first; `ours`, just written, is never a
+/// candidate), plus temp files a killed process left behind more than an hour ago.
+/// Called only after a miss wrote an entry, so the warm path never lists the
+/// directory, and it passes unless the `.last-prune` stamp is missing or older than
+/// `MODULE_CACHE_PRUNE_EVERY`. Two processes pruning at once is harmless.
+fn prune_module_cache(dir: &std::path::Path, ours: &std::path::Path) {
+    let stamp = dir.join(".last-prune");
+    let recent = std::fs::metadata(&stamp)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age < MODULE_CACHE_PRUNE_EVERY);
+    if recent || std::fs::write(&stamp, b"").is_err() {
+        return;
+    }
+    let max = module_cache_max_bytes();
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let mut live: Vec<(std::time::SystemTime, u64, std::path::PathBuf)> = Vec::new();
+    for e in entries.flatten() {
+        let path = e.path();
+        let Ok(meta) = e.metadata() else { continue };
+        let Ok(mtime) = meta.modified() else { continue };
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        if name.ends_with(".tmp") {
+            if mtime.elapsed().is_ok_and(|a| a.as_secs() > 3600) {
+                let _ = std::fs::remove_file(&path);
+            }
+        } else if name.ends_with(".cwasm") && path != ours {
+            live.push((mtime, meta.len(), path));
+        }
+    }
+    let ours_len = std::fs::metadata(ours).map_or(0, |m| m.len());
+    let mut total: u64 = ours_len + live.iter().map(|e| e.1).sum::<u64>();
+    if total <= max {
+        return;
+    }
+    live.sort_by(|a, b| a.0.cmp(&b.0)); // oldest first
+    for (_, len, path) in live {
+        if total <= max {
+            break;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            total -= len;
+        }
+    }
 }
 
 /// Read a file as UTF-8, distinguishing "missing/unreadable" from "present but
@@ -2973,7 +3304,7 @@ fn run_program_with(
 ) -> Result<()> {
     // The `vl-src` rows for THIS module, so a trap frame's offset resolves to a line.
     note_src_map(bytes);
-    let module = from_user(Module::new(engine, bytes))?;
+    let module = from_user(user_module(engine, bytes))?;
     // The instance is dropped: `vl run` runs the start function (the program's top
     // level) and exits. `vl test` needs the instance back to call exports on it, so
     // it goes through `instantiate_program` directly.
@@ -4392,7 +4723,7 @@ fn compile_and_run(
     run_engine: &Engine,
     palette: Palette,
 ) -> Result<()> {
-    let compile_engine = seed_engine(Collector::Null)?;
+    let compile_engine = compile_engine(source.len())?;
     // `_located`, so a module the engine refuses can still be traced back to the
     // function that emitted it (D1578). The compile itself is unchanged.
     let (bytes, session) =
@@ -4719,7 +5050,7 @@ fn collect_test_file(engine: &Engine, file: &TestFile) -> TestRegistry {
         skips: Vec::new(),
         error,
     };
-    let module = match Module::new(engine, &file.bytes) {
+    let module = match user_module(engine, &file.bytes) {
         Ok(m) => m,
         // The emitter produced bytes the engine will not load — a compiler bug, not
         // a test failure, so name the file the host was given.
@@ -5933,6 +6264,10 @@ fn source_frames(err: &Error) -> Option<String> {
 /// later error to inherit.
 static FAULT_IN_COMPILER: AtomicBool = AtomicBool::new(false);
 
+/// Set by `compile_engine` when the one-shot compile runs under the null collector, so
+/// a compiler trap on `allocation size too large` can name the collecting escape.
+static COMPILE_UNDER_NULL: AtomicBool = AtomicBool::new(false);
+
 /// A module the emitter produced that the ENGINE refuses. `vl check` returned 0 to reach
 /// the emitter at all, so an invalid module is the compiler's fault by construction: it
 /// exits 70 like a compiler trap (#2483), so a caller can tell a vl BUG from a bad
@@ -6021,6 +6356,17 @@ fn report(err: Error) -> ! {
     }
     if let Some(note) = trap.and_then(trap_explanation) {
         eprintln!("\nnote: {note}");
+    }
+    // No automatic retry under copying: DECISIONS.md, "The compiler's collector is picked
+    // by the size of the entry file", says why. The escape is named instead.
+    if compiler_bug
+        && matches!(trap, Some(Trap::AllocationTooLarge))
+        && COMPILE_UNDER_NULL.load(Ordering::Relaxed)
+    {
+        eprintln!(
+            "note: this compile ran under the null collector, which never frees and caps one \
+             object at 64 MiB; `VL_COMPILE_GC=copying` compiles under a collecting one"
+        );
     }
     std::process::exit(if compiler_bug || invalid_module {
         EXIT_COMPILER_BUG
@@ -6136,13 +6482,11 @@ fn build_cmd(args: &[String]) -> Result<()> {
     };
     let compiler = resolve_compiler(flag("--compiler"));
 
-    let read_source = || {
-        std::fs::read_to_string(input)
-            .map_err(|e| Error::from(e).context(format!("reading `{input}`")))
-    };
-    // The compile step always runs under the null collector (one-shot batch work);
-    // only the user program's own execution gets a real (DRC) collector.
-    let compile_engine = seed_engine(Collector::Null)?;
+    // The collector follows the source's size (`compile_engine`), so the source is
+    // read before the engine is built.
+    let source = std::fs::read_to_string(input)
+        .map_err(|e| Error::from(e).context(format!("reading `{input}`")))?;
+    let compile_engine = compile_engine(source.len())?;
 
     // `-o -` is the stdout spelling: the module BYTES go to stdout and no file is
     // created. The default stays the `cc` one (`p.vl` → `p.wasm` beside the source) —
@@ -6190,7 +6534,7 @@ fn build_cmd(args: &[String]) -> Result<()> {
     let (mut bytes, mut session) = compile_vl_located(
         &compile_engine,
         &compiler,
-        &read_source()?,
+        &source,
         input,
         "compileSrc",
         names,

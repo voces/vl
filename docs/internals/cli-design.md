@@ -615,6 +615,30 @@ runs under a host that has it.
 policy is thin and already mostly host-mechanism), so they can stay on today's
 host path until the protocol is proven on `check`.
 
+### The user-module cache (host)
+
+Every path that instantiates a user module — `run` (a `.wasm` or the module a `.vl`
+compiled to), `run --batch`, `test` — gets its `Module` from `user_module` in the host,
+which keeps Cranelift's output under `<cache dir>/modules/<sha256(wasm)>-<engine tag>.cwasm`.
+The cache dir is the embedded seed's: `$VL_CACHE_DIR` · `$XDG_CACHE_HOME/vl` ·
+`$HOME/.cache/vl` · `%LOCALAPPDATA%\vl`.
+
+| variable | effect |
+| --- | --- |
+| `VL_NO_CACHE=1` | no read, no write (the seed's cache is unaffected) |
+| `VL_CACHE_MAX_MB=<n>` | prune target, default 512; a soft bound, pruned at most once a minute |
+| `VL_CACHE_TRACE=1` | one stderr line per lookup: `hit`, `miss`, `rejected (<why>)`, `off` |
+
+On Unix the cache root and `modules/` are used only when owned by the effective uid with no
+group/other write bit (`private_cache_dir`, created 0700); otherwise the module compiles
+uncached (`rejected (unsafe dir)`) and the embedded seed's cache is skipped with a note.
+An entry is an envelope — magic, SHA-256 of the wasm, the engine tag, SHA-256 of the
+artifact, its length, the artifact — and every field is checked before
+`Module::deserialize` runs. A failing entry is recompiled and rewritten; writes are
+temp-file + rename. `tests/vl_module_cache_test.ts` pins hit, each rejection, opt-out,
+pruning order and throttle; the safety argument is DECISIONS.md §"A user module's
+Cranelift compile is cached".
+
 ### `build` flags (today's host surface)
 
 `build` is the one command whose flags are still parsed entirely in Rust

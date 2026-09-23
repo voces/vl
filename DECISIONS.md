@@ -5690,6 +5690,96 @@ whitelist over literals, identifier reads, places and arithmetic; every kind it 
 a call, a lambda, a `MatchExpr`, every statement kind — answers "possibly effectful" and puts
 its literal on the scratch path. A kind nobody has classified is never silently reordered.
 
+## A user module's Cranelift compile is cached, behind a digest the host checks (2026-09-22) — lane L5
+
+Every `vl run` Cranelift-compiled the module it ran, every time: 0.33–0.5 s on plumb's
+~100 KB modules, the whole fixed cost of the many short tool invocations plumb makes
+(`docs/internals/perf-decoder-gap-2026-09.md` §6, L5). The seed's own compile has been cached
+since the start; the modules it emits now are too, in `modules/` under the same user cache
+directory, keyed `<sha256(wasm)>-<engine tag>.cwasm`. The tag is the one the seed's cache
+uses — wasmtime's `precompile_compatibility_hash`, which covers the wasmtime version, the target
+and every compile-relevant `Config` setting. Because the GC heap size is part of it, `vl run`
+(64 MiB) and `vl test` (8 MiB) get separate entries; no other setting needed its own handling.
+
+Measured on this box (load 15–20), median of 7, cold is `VL_NO_CACHE=1`:
+
+| run | cold wall / CPU ms | warm wall / CPU ms |
+| --- | --- | --- |
+| plumb `decode-bench` prebuilt `db.wasm`, `0` passes | 425 / 724 | **24 / 24** |
+| the same, `1` pass | 1,340 / 1,617 | 940 / 940 |
+| `vl run tools/decode-bench.vl … 0` (compile from source) | 506 / 799 | 128 / 127 |
+| `vl run hello.wasm` | 6.8 / 19.8 | 1.1 / 0.9 |
+| `vl run hello.vl` | 12.0 / 25.5 | 5.5 / 5.2 |
+| distilled corpus (`regress.py`, JOBS=6, load 60–160) | 50.7 s wall, 248 CPU-s | 23.7 s wall, 133 CPU-s |
+
+A miss costs nothing measurable over no cache at all for the two programs timed that way
+(hello 6.8 → 7.1 ms, `db.wasm` 449 → 427 ms, both inside the noise): serializing, hashing and
+writing are small beside Cranelift. For the corpus the question is a whole run from an EMPTY
+cache against one with the cache off, interleaved twice: **227 and 235 CPU-s empty against 262
+and 269 off** (wall 33.3 / 42.1 s against 46.6 / 72.5 s, load 27–98). An empty-cache run is
+cheaper, not dearer, because the corpus repeats modules — its cold run writes 3,648 entries
+(104 MB) for more cells than that, and the repeats hit inside the run. An entry is about 13×
+its wasm (1.33 MB for `db.wasm`, 20 KB for hello).
+
+**Why `deserialize` is sound here.** wasmtime documents `Module::deserialize` as unsafe: its
+input is "only lightly validated", arbitrary bytes "can trivially be used to execute arbitrary
+code", and calling it is safe only on "the exact output of [`Module::serialize`] (unmodified)".
+Its version and configuration check makes a *foreign-version* file fail safely; it does not
+detect a *damaged* one. The seed's cache relies on the file's path alone, which is fine for a
+handful of files beside the seed; a directory holding thousands of entries, written by
+concurrent, interrupted and differently-versioned `vl` processes, earns more. So each entry is
+an envelope — magic, SHA-256 of the wasm, the engine tag, SHA-256 of the artifact, the
+artifact's length, then the artifact — and the host reads the whole file into memory and checks
+every field before calling `deserialize` on the bytes it just hashed. What reaches wasmtime is
+therefore byte-for-byte what `Module::serialize` produced for *this* wasm under *this* engine
+configuration. That rules out truncation, bit rot, a torn write and a file renamed from another
+key. `deserialize` (bytes) is used rather than `deserialize_file` (mmap) on purpose: the checked
+bytes and the loaded bytes are the same buffer, so nothing can change them between the check and
+the load. A collision needs SHA-256 to break.
+
+**The digest is not a MAC, so the argument has a precondition: nobody but the user can write
+the directory.** A writer who can put a file there can recompute the digests and forge an entry,
+and a forged entry reaching `deserialize` is code execution. For the user themself that is no
+new power (they could replace the `vl` binary). For anyone else it would be. So the host trusts
+a cache directory only when it is owned by the process's effective uid and has no group or
+world write bit (`private_cache_dir`), checked at BOTH levels the module cache uses — the cache
+root, whose owner could swap `modules/` out, and `modules/` itself — and creates what it
+creates with mode 0700. A directory that fails is not used at all: the module compiles as if
+uncached (`VL_CACHE_TRACE` says `rejected (unsafe dir)`), and the embedded seed's cache, which
+lives in the same root and is loaded by `deserialize_file` on its path alone, is skipped with a
+stderr note naming the directory and the fix. This matters because the root is configurable: a
+`$VL_CACHE_DIR` or `$XDG_CACHE_HOME` under `/tmp` that another local user created first would
+otherwise be accepted by `create_dir_all` without a word. The check does not reach ancestors
+above the root (a root inside another user's writable directory can still be renamed away
+between check and use); `~/.cache` and a sticky `/tmp` are not such ancestors. A dir that an
+older `vl` created under `umask 002` is group-writable and is refused until `chmod go-w`. On
+Windows no check is made: the default `%LOCALAPPDATA%` is per-user, and a `%VL_CACHE_DIR%`
+pointed somewhere shared is the user's own choice. The on-disk seed's sidecar beside
+`build/vl-compiler.wasm` is not covered and need not be: whoever can write beside the seed can
+rewrite the seed, which is the compiler.
+
+**Bounded, least-recently-used, soft.** After a miss writes an entry, the host prunes
+`modules/` back to `$VL_CACHE_MAX_MB` (default 512) by deleting the entries with the oldest
+mtimes, never the one it just wrote, and removes temp files older than an hour. A hit refreshes
+its entry's mtime, at most once a minute. The pass stats every entry, so it runs at most once a
+minute (a `.last-prune` stamp): a corpus run misses thousands of times a minute, and a per-miss
+scan would put a directory walk on every one of them. The bound is therefore soft — a burst can
+overshoot it until the next pass — which is the right trade for a cache. Writes are temp file +
+`rename`, so concurrent runs see a whole old file or a whole new one; sixteen concurrent cold
+runs of one module all ran correctly and left one entry.
+
+**Opt-out is an environment variable, not a flag**, because every `vl` flag is parsed in the
+guest (`compiler/cli.vl`) and the host's engine setup happens before any guest runs; `$VL_GC`
+is the same shape. `VL_NO_CACHE=1` covers only user modules: turning the seed's cache off
+would make every invocation recompile the compiler, which nobody switching off a module cache
+is asking for. `VL_CACHE_TRACE=1` exists so a test can prove a hit without timing anything
+(`tests/vl_module_cache_test.ts`).
+
+**Not wasmtime's built-in cache** (`Config::cache`, compiled in by default). It keys on
+SHA-256 and compresses, but a hit is checked only for decompressing (zstd) before it reaches
+`deserialize`, it prunes on a background worker whose timing is not ours, and it would be a
+second cache directory, with its own config file, beside the one `vl` already documents.
+
 ## The host's dependencies build at opt-level 3; the host crate stays at 1 (2026-09-22)
 
 `scripts/vl-host` shipped with `[profile.release] opt-level = 1` from its first commit (#275),
@@ -6309,3 +6399,96 @@ every local must have a non-boxing representation, decided from types before emi
 - **The minted name is `Recv.prop`**, which is also what a trap backtrace prints. The rewrite
   bumps the arena epoch, because it changes the tree in place and the parse bank's replay would
   otherwise hand lint a tree whose callee rows were popped.
+
+## The compiler's collector is picked by the size of the entry file (2026-09-22) — plumb PL-002 follow-up
+
+`vl build` and `vl run` used to compile under wasmtime's NULL collector always. It never frees,
+so a compile's peak memory is every byte the compiler ever allocated, and the GC heap's 32-bit
+index caps that at 4 GiB, a ~15.6 MB source. plumb compiles 1.16 GB of generated VL in 551 units
+(p50 2.0 MB, max 8.7 MB) in parallel, and memory per unit is its bottleneck.
+
+**The rule** (`compile_engine`, `scripts/vl-host/src/main.rs`): when the ENTRY FILE is under
+**1.5 MiB**, null; at or above it, the **copying** collector with a **384 MiB** first heap.
+Imports do not count.
+`$VL_COMPILE_GC=auto|null|copying` overrides it; an unknown value is refused.
+`$VL_COMPILE_GC_TRACE=1` names the choice on stderr, which `tests/vl_compile_gc_test.ts` pins
+at the threshold byte.
+
+Measured with deps at opt-level 3 (#3025), null and copying interleaved per pair so contention
+lands on both, median CPU (user+sys), peak RSS (`/usr/bin/time`), box load 20–150:
+
+| input | source | null CPU / RSS | copying CPU / RSS | CPU | RSS |
+| --- | --- | --- | --- | --- | --- |
+| plumb `chunk_95` (`--import-memory`) | 2.05 MB | 4.84 s / 629 MB | 5.53 s / 416 MB | +14% | −34% |
+| plumb `chunk_5` | 2.07 MB | 8.24 s / 702 MB | 9.75 s / 417 MB | +18% | −41% |
+| synth `s200` | 2.3 MB | 2.84 s / 607 MB | 3.37 s / 415 MB | +19% | −32% |
+| synth `s130` | 1.5 MB | 1.41 s / 423 MB | 1.56 s / 414 MB | +11% | −2% |
+| synth `s870` | 10.1 MB | 12.2 s / 2,534 MB | 14.0 s / 1,577 MB | +14% | −38% |
+| synth `s1300` | 15.1 MB | 15.3 s / 3,988 MB | 18.2 s / 3,119 MB | +19% | −22% |
+| synth `s1500` | 17.4 MB | **traps**, `allocation size too large` (exit 70) | 34.8 s / 3,122 MB | — | — |
+| self-compile `compiler/entry.vl` | 5.9 KB entry, 6.5 MB graph | 5.43 s / 1,146 MB | 8.65 s / 800 MB | +59% | −30% |
+| `s20` / hello | 0.23 MB / 15 B | 0.25 s / 90 MB, 0.01 s / 29 MB | same CPU, 111 MB / 29 MB | 0 | +23% / 0 |
+
+The synth inputs are plumb's own generator (`vl-probes/synth/gen.vl <F> 20 10`).
+
+**Why a threshold and not copying always.** Copying costs +11–19% CPU at every size where it
+saves memory, and saves none below ~1.5 MB: its first heap is a floor of ~415 MB once a compile
+allocates more than one 192 MiB semispace, which is where null's footprint crosses it (`s130`).
+The self-compile is +59% under copying and the gate runs it many times; its entry file is small,
+so `auto` picks null, and every self-compile script (`native-fixpoint.sh`,
+`self-compile-time.sh`, `refresh-compiler.sh`, `survey-profile.sh`) also exports
+`VL_COMPILE_GC=null`, so a change to the threshold cannot move the fixpoint's collector. The threshold reads the ENTRY file only, because the host loads imports on
+demand and cannot sum them first. A small entry importing large modules therefore stays null;
+`VL_COMPILE_GC=copying` is the escape.
+
+**Why a 384 MiB first heap.** From 0, wasmtime's copying heap grows by doubling and collects
+first whenever the predicted use is under HALF the capacity. That is a semispace heap's whole
+usable half, so near each size it collects again and again while reclaiming almost nothing
+(logged: 9 back-to-back collections at 256 MiB with 127 MiB live). The first heap skips the small
+sizes: `s20` went from 0.43 s to 0.24 s, the same as null. 384 = 3 × 128 puts the sizes at 384,
+768, 1,536 and 3,072 MiB. A plumb 2 MB unit's live set is 135–155 MiB, so it fits the first
+size and never grows. The value is part of the engine configuration, so each distinct value is
+a separate `.cwasm` sidecar and a fresh Cranelift compile of the seed. There is therefore ONE
+value, and `refresh-compiler.sh` warms its sidecar with the other two.
+
+**Why not the alternatives.**
+* *DRC (refcount)*: `s200`, 2.8 s under null, had run 47,169 collections in 10 minutes when
+  it was stopped.
+* *Null, retrying once under copying on `allocation size too large`* (the backstop for a small
+  entry file over a large import graph). Declined, for three reasons. The failed attempt has
+  already paid its peak before the retry starts, up to 4 GiB and ~15 s at the heap cap, and that
+  peak is what plumb schedules its parallelism against. The same trap is also the only symptom
+  of a real single-object cap in the compiler (D1975, [D1976](docs/internals/inventory/D1976.md)),
+  and wasmtime reports both as `AllocationTooLarge`, so the host cannot tell them apart. A retry
+  would hide those defects behind a slower build: D1976's witness would stop trapping and hit
+  [D2092](docs/internals/inventory/D2092.md) instead. Instead, a compiler trap on this error
+  under null ends with a note naming `VL_COMPILE_GC=copying`, which `tests/vl_compile_gc_test.ts`
+  pins on D1976's own witness.
+* *A bigger or 64-bit GC heap*: wasmtime 47 has neither. `VMGcRef` is a `u32`, the heap's memory
+  type is `IndexType::I32`, and `grow_gc_heap` saturates at `1 << 32`. `gc_heap_reservation` is
+  virtual address space only; it does not raise the cap. Under copying the cap is a 2 GiB
+  semispace, so the largest source that builds is ~29 MB (#3013) instead of ~15.6 MB.
+* *Capping the heap with a `ResourceLimiter`*: a denied growth fails the allocation. wasmtime
+  does not fall back to a smaller growth step.
+
+**A side effect: D1976's first witness moved.** It was one 3.2 MB file and trapped on the null
+collector's 64 MiB cap for one object (an `i32[]` output buffer past 2^23 slots). As an entry
+file of 1.5 MiB or more it now compiles under copying, which has no such cap, and running it
+costs Cranelift 127 s and 25 GB for the 9.6 MB module (earlyoom killed it in the first gate run).
+The row now grades a two-file witness whose entry file is small, so it keeps the null collector
+and still traps, in 0.4 s. A one-file literal of the same length under copying reaches wasmtime's
+7,654,321-byte function-body limit instead, which is its own row,
+[D2092](docs/internals/inventory/D2092.md).
+
+**plumb's "under 1 GB for a 10–20 MB unit" is not reachable with a collector choice.** The live
+set is the floor, and it is ~59 bytes per source byte: 592 MiB at 10 MB. `vl check`, which stops
+after the type checker, already holds ~500 MiB of it, so the front end's tables account for
+~85% of the peak and emit adds the rest. A semispace heap needs twice the live set, so a 10 MB
+unit needs ~1.2 GiB of heap at the least. Reaching 1 GB at 10–20 MB needs the live set cut
+~3×, to ~20 B/byte. In order of expected yield, which is a prediction until a heap census
+splits the live set by structure: (1) release what the front end no longer needs
+before emit starts (the token stream, the source's code points, per-statement parse
+scratch), since ~85% of the peak is already live when checking ends; (2) store the AST and the
+type tables as parallel `i32[]` columns, not one GC struct per node, because every object pays
+a header; (3) have emit write bytes straight to the output buffer, not into intermediate lists.
+Today's policy puts plumb's REAL units (2 MB) at ~417 MB, which fits.

@@ -33,6 +33,14 @@ see **`DECISIONS.md`**.
   (`flat-records-design.md` §9.1). Editor: `property` token with the `readonly` modifier,
   `Property` completion, go-to-definition on the `get` declaration. Guide:
   `docs/guide/getters.md`. `std:simd`'s `.x/.y/.z/.w` are a separate lane (after D1984).
+- **`std:simd` lane read-back (D1980, `property-access-design.md` §E3, F3(a)/F4(b)).**
+  `v.x`/`v.y`/`v.z`/`v.w` are `export get` getters, one `f32x4.extract_lane` each;
+  `v.lane(i)` and `v.withLane(i, x)` (a new vector; the receiver is unchanged) take
+  `i: Lane4`, the new `type Lane4 = 0 | 1 | 2 | 3`. A literal index is exactly one
+  `extract_lane N`/`replace_lane N` at `-O`/`-O3`, a runtime `Lane4` is a four-way branch, and a
+  plain `i32` is refused at compile time (`expected Lane4, got i32`). No compiler change: the
+  body is a ladder over the literal union. `std:buffer`'s header now says a checked view's
+  `base` and `length` are writable fields that defeat the range check when overwritten (F6(c)).
 - **`std:simd` — the `F32x4` slice (SIMD S3, `simd-design.md` §G).** `F32x4` and `Mask32x4` are
   `new v128` brands; the module ships `splatF32`, `f32x4(x, y, z, w)`, unaligned
   `loadF32x4`/`storeF32x4` over a `Buf`, `+ - * /` (receiver-keyed operators, #3003) with named
@@ -1210,6 +1218,8 @@ new: the compare-frame pre-pass never recurses into a code-15 field, so a NESTED
 - **playground: code-split binaryen off the initial load** — with codegen on the seed, binaryen (~13 MB) is reached ONLY via the lazy `import("binaryen")`/`import("./toWasm.ts")` behind `wasmToWat` (the WAT renderer). `build.ts` now enables esbuild `splitting` (`outdir` + object-form `entryPoints` → `playground.js`), so binaryen lands in its own `chunk-*.js` fetched on demand when the WAT pane is first shown — not on page load. The entry `playground.js` drops from ~22 MB to ~2 MB (the rest is lazy chunks: Monaco's on-demand features + the binaryen WAT chunk). `pages.yml` ships the chunks (`dist/*.js`); `index.html` still loads only `playground.js` + `playground.css`. WAT stays a feature (binaryen disassembling the seed's bytes), just off the critical path.
 
 ## Infrastructure (Track F)
+
+- **`vl run` and `vl test` cache the native compile of the module they run (lane L5 of the decoder-gap investigation).** Each module's Cranelift output is kept under `<cache dir>/modules/<sha256(wasm)>-<engine tag>.cwasm`, in the same user cache directory as the embedded seed's cache, so an unchanged program skips the compile the next time: plumb's `decode-bench` `db.wasm` (fixed cost only) **425 → 24 ms** wall, 724 → 24 CPU-ms; `vl run hello.wasm` 6.8 → 1.1 ms; the distilled corpus on a second run 50.7 → 23.7 s. Each entry carries SHA-256 digests of its wasm and its artifact, checked before `Module::deserialize` sees a byte; a failing entry is recompiled and rewritten. On Unix a cache dir is used only when the user owns it and neither group nor others can write it (the embedded seed's cache included); anything else runs uncached. Pruned least-recently-used back to `$VL_CACHE_MAX_MB` (default 512), at most once a minute. `VL_NO_CACHE=1` turns it off, `VL_CACHE_TRACE=1` prints hit/miss/rejected. Safety argument: DECISIONS.md §"A user module's Cranelift compile is cached".
 
 - **The native host's dependencies build at opt-level 3 (lane L2 of the decoder-gap investigation, #3022).** `scripts/vl-host` had built wasmtime, Cranelift and the GC collector at the crate's `opt-level = 1` since #275; `[profile.release.package."*"] opt-level = 3` raises the dependencies alone and keeps the thin host crate at 1, since it is the unit CI and dev loops rebuild. Median CPU, interleaved A/B: plumb's decoder **3.96 → 2.87 s (−27.5%)**, the per-run guest compile 0.78 → 0.64 s (−18%), an uncached seed compile 17.8 → 14.0 s (−21.5%), `vl run hello` 29 → 25 ms, the warm self-compile −3 to −8% (it runs Cranelift output, which this does not touch), and the binary **25.9 → 22.3 MB**. Four cold `cargo build --release` readings showed no measurable wall-clock cost (+10% user CPU at `-j8`, even at `-j4`); the predicted +35% did not reproduce. Numbers and why the host crate stays at 1: DECISIONS.md §"The host's dependencies build at opt-level 3".
 
