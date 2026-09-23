@@ -76,6 +76,7 @@ import {
   nodeIsTplHole,
   restParamIndex,
   spreadArgOf,
+  stmtAlwaysExits,
 } from "./ast"
 import {
   CALLSITE_NAME,
@@ -2281,30 +2282,6 @@ function daCheckRead(name: string, at: i32) {
   0
 }
 
-// True if the statement at node `ix` always exits its enclosing path, so its end is unreachable
-// and it contributes nothing to a definite-assignment join. A `return`/`break`/`continue`
-// diverges; a `Block` diverges if its last statement does; an `if … else …` diverges only if
-// both arms do, a chain recursing through its `ifElse`.
-function daBranchDiverges(ix: i32) {
-  if ix < 0 { return false }
-  const s = P.nodes[ix]
-  if s is RetStmt {
-    return true
-  } else if s is BreakStmt {
-    return true
-  } else if s is ContinueStmt {
-    return true
-  } else if s is Block {
-    const st = s.blkStmts
-    if st.length > 0 { return daBranchDiverges(st[st.length - 1]) }
-    return false
-  } else if s is IfStmt {
-    if s.ifElse < 0 { return false }
-    return daBranchDiverges(s.ifThen) && daBranchDiverges(s.ifElse)
-  }
-  false
-}
-
 // ── missing-return totality (soundness) ──────────────────────────────────────
 // The condition node under any `Paren` wrappers (`((x is T))` → `x is T`). The condition-shape
 // matchers (chain discrimination, exhaustiveness) peel through this so a parenthesized guard
@@ -2341,7 +2318,7 @@ function ifCondIsDiscriminating(ifCondIx: i32) {
 // True if executing `ix` always yields a return value or diverges. `tail` says a bare trailing
 // value expression IS the implicit return; inside a bare `{ … }` statement it is not. A `Block`
 // is total iff its last statement is, an `if`/`else` iff both arms are, a `while true { … }` is.
-// Unlike `daBranchDiverges`, this counts the implicit return.
+// Unlike `stmtAlwaysExits`, this counts the implicit return.
 function nodeIsTotalAt(ix: i32, tail: boolean) {
   if ix < 0 { return false }
   const n = P.nodes[ix]
@@ -10622,10 +10599,6 @@ function tyToStrGo(ix: i32, nominal: boolean) {
       return "!" + ns
     }
   }
-  // Unreachable by construction: every arena variant has an arm above and every arm
-  // returns. Stays as the trailing value — the token a 12th variant would print if the
-  // `match` ever got a `_`.
-  "<?>"
 }
 
 // Is arena type `ix` a nullable value-union box — a `TyUnion` with a `null` member and two
@@ -10859,10 +10832,6 @@ function tyEqGo(a: i32, b: i32) {
       return false
     }
   }
-  // Unreachable by construction: every arena variant has an arm above and every arm
-  // returns. The per-arm `tb` tests are same-variant guards, not a second dispatch —
-  // `return false` is the right answer for every other variant, so they stay `if`s.
-  false
 }
 
 // The type-arena index of object `o`'s field `name`, or `-1` if absent — takes a concrete
@@ -25906,7 +25875,7 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
       // return, so neither seeding nor checking may treat it as the returned expression.
       let tailIsReturn = s == stmts.length - 1
       if tailIsReturn && s > 0 {
-        if daBranchDiverges(stmts[s - 1]) { tailIsReturn = false }
+        if stmtAlwaysExits(stmts[s - 1]) { tailIsReturn = false }
       }
       if tailIsReturn && !inferring && ret >= 0 && !isStmtNode(stmts[s]) {
         seedExpected(stmts[s], ret)
@@ -34493,23 +34462,13 @@ function checkIfStmtNode(n: IfStmt, ix: i32) {
   const enNames: string[] = []
   const enTys: i32[] = []
   collectElseNarrows(n.ifCond, enNames, enTys)
-  // The guard-clause divergence test, hoisted: the post-guard leg and the `else if`
-  // hand-up decision both ask it — deliberately the last-statement test, not the broader one.
-  let thenExits = false
-  const tnDiv = P.nodes[n.ifThen]
-  if tnDiv is Block {
-    const tdst = tnDiv.blkStmts
-    if tdst.length > 0 {
-      const tdlast = P.nodes[tdst[tdst.length - 1]]
-      if tdlast is RetStmt { thenExits = true }
-      else if tdlast is BreakStmt { thenExits = true }
-      else if tdlast is ContinueStmt { thenExits = true }
-    }
-  }
+  // The guard-clause divergence test, hoisted: the post-guard leg and the `else if` hand-up
+  // decision both ask it, and the emitter's `pushPostGuardNarrow` asks the same predicate.
+  const thenExits = stmtAlwaysExits(n.ifThen)
   // Definite-assignment fork/join: each branch forks off the if-entry state and they join
   // after — assigned only if assigned on every surviving path; a diverging branch contributes nothing.
   const daFork = daMark()
-  const daThenDiverges = daBranchDiverges(n.ifThen)
+  const daThenDiverges = thenExits
   // `is`-guard alternatives over a hole: a then-narrow refining a hole is an alternative the
   // body handles on its own branch, not an extra field demand — registered before the scope pushes.
   const altRows: i32[] = []
@@ -34590,7 +34549,7 @@ function checkIfStmtNode(n: IfStmt, ix: i32) {
   let elseHi = 0
   const daHasElse = n.ifElse >= 0
   if daHasElse {
-    daElseDiverges = daBranchDiverges(n.ifElse)
+    daElseDiverges = stmtAlwaysExits(n.ifElse)
     if enNames.length > 0 {
       pushScope(-1)
       applyNarrows(enNames, enTys)
