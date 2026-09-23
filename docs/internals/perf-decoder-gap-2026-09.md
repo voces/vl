@@ -55,7 +55,7 @@ The gap being attributed is `dist/vl` decode 3.79 s − Rust faithful 0.44 s = *
 
 | # | cause | evidence | share of the 3.35 s | fix | kind | effort |
 | --- | --- | --- | --- | --- | --- | --- |
-| C1 | **GC heap never grows** — wasmtime's copying collector grows only when a collection frees almost nothing, and the host sets no initial size, so the heap sticks at 16 MiB under a live set of a few MiB | 1,248 collections at the default heap; 123 at 64 MiB; 26 at 256 MiB (§3). decode 3.79 → 1.17 with only `gc_heap_initial_size(64 MiB)`. A 20-line synthetic reproduces it at every live-set size tried, 1.4–8.8× | **2.62 s · 78%** | host: `gc_heap_initial_size(64 MiB)` on the user-program engine (**in this PR**); upstream: the growth test compares against the whole heap, not the active semispace | host config | S (done) |
+| C1 | **GC heap never grows** — wasmtime's copying collector grows only when a collection frees almost nothing, and the host sets no initial size, so the heap sticks at 16 MiB under a live set of a few MiB | 1,248 collections at the default heap; 123 at 64 MiB; 26 at 256 MiB (§3). decode 3.79 → 1.17 with only `gc_heap_initial_size(64 MiB)`. A 20-line synthetic reproduces it at every live-set size tried, 1.4–8.8× | **2.62 s · 78%** | host: `gc_heap_initial_size` on the user-program engine, 64 MiB for `vl run`, 8 MiB for `vl test` (**in this PR**); upstream: the growth test compares against the whole heap, not the active semispace | host config | S (done) |
 | C2 | **Host built at `opt-level = 1`** — the collector's copy loop and Cranelift itself are Rust code in the host | decode 3.79 → 2.66 at the default heap (the collector is most of that); 1.17 → 1.05 once C1 is fixed; `p0` 0.80 → 0.64 (faster Cranelift) | **0.12 s · 4%** after C1 (1.13 s before it) | `[profile.release.package."*"] opt-level = 3` — dependencies only, the host crate stays at 1 | host build | S |
 | C3 | **Cranelift vs TurboFan on WasmGC** — same module, V8 decodes in 0.56 s | §4: every struct access re-derives the GC heap base through two dependent loads, non-null `(ref $D)` params are still null-checked, every call pays a frame (and a stack-limit check when the callee itself calls), and wasmtime will not inline into a caller over its 2,000-byte sum threshold (`decode` is far over it) | **0.49 s · 15%** | VL-side: inline small leaf functions and scalar-replace non-escaping structs at emit time (what `-O3` does partially: −0.12 s); upstream wasmtime issues | engine codegen | M–L |
 | C4 | **VL code shape vs Rust**, measured on the strong engine | V8 0.56 vs Rust faithful 0.44; vs gcshape 0.55 it is parity. The decoder state `D` is a heap struct updated through `struct.set` per byte (Rust keeps it in registers); string equality is an out-of-line call | **0.12 s · 4%** | literal-length guard on `==` against a literal (−3% ops, §5); inlining + SROA as C3 | compiler emit | S–M |
@@ -122,11 +122,44 @@ allocation rates low, which is exactly the regime where the heap's size does not
 realistic program — a table held for the whole run, an allocation per unit of work — is the
 regime where it does. The suite needs one such benchmark (lane L7).
 
-**The cost of the fix.** The reservation is virtual and committed on first touch: a small
-program's max RSS is unchanged (30 MB either way on a 1,000-allocation program; 163 vs 162 MB on
-the byte-sum microbench), and an allocation-heavy one grows by at most the heap it actually uses
-(+43 MB on the decoder). No semantics move: the collector is the same, it just starts larger.
-Behaviour past 64 MiB is wasmtime's normal doubling.
+**The cost of the fix — memory tracks total allocation, not the live set.** The copying
+collector bump-allocates through each semispace and never hands pages back, so once a store has
+allocated more than its initial heap, all of that heap is committed however small the live set
+is. A store therefore pays **up to its initial size in extra resident memory**, reached by any
+program that allocates that much in total. A program that allocates little pays nothing (the
+1,000-allocation `hello` stays at 30 MB at every size). `vl test` pays it **once per worker**,
+because each file runs in its own store and the default is one worker per core. No semantics
+move: the collector is the same, it just starts larger. Past the initial size, wasmtime's normal
+doubling takes over.
+
+Max RSS, old (heap starts at 0) → 64 MiB, one run each; the reviewer's numbers, confirmed here:
+
+| program | max RSS today | at 64 MiB |
+| --- | --- | --- |
+| churn, `LIVE` = 1,000 (tiny live set, 20 M allocations) | 30–32 MB | 96 MB |
+| decode-bench | 196 MB | 247–252 MB |
+| `vl test` over 12 files that each allocate 5 M temps (24 workers) | 99–115 MB | 768–875 MB |
+| `hello` (1,000 allocations) | 30 MB | 30 MB |
+
+**So `vl test` gets a smaller initial heap than `vl run`.** Measured on the 12-file suite with the
+default worker count (one per core, 24 on this box), three runs each, box load 12–170:
+
+| test-engine initial heap | CPU (user+sys) | max RSS | CPU win kept |
+| --- | --- | --- | --- |
+| 0 (before this PR) | 3.54–4.20 s | 98–100 MB | — |
+| **8 MiB (chosen)** | **1.64–1.73 s** | **195–198 MB** | **~87%** |
+| 16 MiB | 1.64–1.85 s | 294–295 MB | ~87% |
+| 24 MiB | 1.68–1.71 s | 393–395 MB | ~88% |
+| 32 MiB | 1.65–1.79 s | 488–491 MB | ~88% |
+| 64 MiB | 1.66–1.76 s | 768–875 MB | 100% (reference) |
+
+The win comes almost entirely from not starting at 128 KiB and doubling up through many small
+heaps. With a tiny live set, a 4 MiB semispace already makes collections rare. Above 8 MiB, each
+step costs ~100 MB of RSS at 24 workers and buys nothing measurable. A test whose live set is
+large (a decoder-sized table) needs ≥ 24 MiB to escape the pathology, and at 8 MiB it pays what it
+paid before this PR, never more. **`vl run` and `vl run --batch` stay at 64 MiB**: one store per
+process, and the decoder's collection count only flattens there (§3's table: 32 MiB still takes
+2.5× as many collections as 64 MiB, and decode CPU 2.57 vs 1.89).
 
 ## 4 · C3/C4 in detail — what Cranelift makes of the hot code
 
@@ -205,7 +238,7 @@ replacement for Wasm) — V8 decode 0.56 → 0.95 s. Re-running the same binarye
 
 | rank | lane | closes | effort | notes |
 | --- | --- | --- | --- | --- |
-| **L1** | **Start the user-program GC heap at 64 MiB** (`gc_engine`, `vl run` / `--batch` / `vl test`) | **78%** of this gap; 1.4–8.8× on the synthetic | S — **landed in this PR** | the CLI pump (`vl check`/`fmt`/`test`'s compiler store) runs the same collector: `vl check compiler/typecheck.vl` is 0.86 s with it and 0.64 s with `VL_PUMP_GC=null` (load 50), so the same fix likely applies there — measure before landing |
+| **L1** | **Start the user-program GC heap larger**: 64 MiB for `vl run` / `--batch`, 8 MiB per `vl test` worker | **78%** of this gap; 1.4–8.8× on the synthetic | S — **landed in this PR** | the CLI pump (`vl check`/`fmt`/`test`'s compiler store) runs the same collector: `vl check compiler/typecheck.vl` is 0.86 s with it and 0.64 s with `VL_PUMP_GC=null` (load 50), so the same fix likely applies there — measure before landing |
 | **L2** | **Build the host's dependencies at opt-level 3** | 4% after L1 (34% before it); `p0` −20%; every Cranelift compile, including the seed's first compile per content key | S | +35% cold host build (1m03 → 1m25 at `-j8`, loaded box); CI caches the binary, so it lands on cache misses only |
 | **L3** | **File the wasmtime issues** — (a) the copying collector's grow tests use the whole heap instead of the active semispace, so the heap grows only once the live set nearly fills a semispace and until then every few MiB of allocation is a full collection; (b) non-null `(ref $t)` params are still null-checked; (c) the GC heap base is reloaded through two dependent loads per access; (d) the inliner's 2,000-byte caller+callee sum threshold rules out every large caller | the ~15% C3 share, on the engine's schedule | S to file | (a) is the root of C1; L1 is the workaround |
 | **L4** | **Emit-time inlining of small leaf functions** (the `std:buffer` accessors, a user's `byte`/`oprSize`), and scalar replacement of a struct that does not escape after it | part of C3+C4; `loadU8` 2.3 → 0.66 ns/byte is the measured ceiling (what `-O3` gets) | M | the default build has no binaryen; this is the emitter doing the one binaryen pass that matters for Cranelift |

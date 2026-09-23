@@ -937,23 +937,25 @@ fn embedded_std_hash() -> String {
     std_hash(std_embedded::STD_MODULES.iter().map(|(n, s)| (*n, s.as_bytes())))
 }
 
-/// The engine for a USER PROGRAM's store (`vl run`, `vl run --batch`, `vl test`).
+/// The engine for a USER PROGRAM's store, its GC heap starting at `initial` bytes.
 ///
-/// Starts the GC heap at `RUN_GC_HEAP_INITIAL` rather than 0. wasmtime's copying
-/// collector only grows its heap when a collection frees almost nothing, so a program
-/// whose live set sits near half the heap collects on every few MiB of allocation and
-/// never grows out of it — plumb's decoder ran 1,248 collections at a 16 MiB heap.
-/// The reservation is virtual and committed on first touch, so a small program's
-/// footprint does not move. Measurements: docs/internals/perf-decoder-gap-2026-09.md.
-fn gc_engine(collector: Collector) -> Result<Engine> {
+/// wasmtime's copying collector grows its heap only once the live set nearly fills a
+/// semispace, so from 0 a program collects every few MiB of allocation (plumb's decoder:
+/// 1,248 collections). The price: committed memory tracks TOTAL allocation up to
+/// `initial`, per store. Sizes and measurements: docs/internals/perf-decoder-gap-2026-09.md.
+fn gc_engine(collector: Collector, initial: u64) -> Result<Engine> {
     let mut cfg = gc_config(collector);
-    cfg.gc_heap_initial_size(RUN_GC_HEAP_INITIAL);
+    cfg.gc_heap_initial_size(initial);
     Engine::new(&cfg)
 }
 
-/// See `gc_engine`. 64 MiB is where the decoder's curve flattens (16 MiB: 1,248
-/// collections, 64 MiB: 123, 256 MiB: 26 — within 6% of the 64 MiB time).
+/// `vl run` and `vl run --batch`: one store per process, so it can afford the size at
+/// which the decoder's collection count flattens.
 const RUN_GC_HEAP_INITIAL: u64 = 64 << 20;
+
+/// `vl test`: one store per worker and one worker per core, so the per-store price is
+/// multiplied; 8 MiB keeps most of the CPU win at a fraction of the memory.
+const TEST_GC_HEAP_INITIAL: u64 = 8 << 20;
 
 /// The engine for a store that drives the COMPILER SEED (`build`'s one-shot compile,
 /// the CLI pump's command loop, `run`'s and `--batch`'s compile phase). Identical to
@@ -3930,7 +3932,7 @@ fn run_batch(args: &[String]) -> Result<()> {
     let compiler = resolve_compiler(compiler);
 
     let compile_engine = seed_engine(Collector::Null)?;
-    let run_engine = gc_engine(run_collector()?)?;
+    let run_engine = gc_engine(run_collector()?, RUN_GC_HEAP_INITIAL)?;
     let module = load_compiler_module(&compile_engine, &compiler)?;
     // Pre-link once; `instantiate_pre` re-checks nothing per case.
     let pre = from_compiler(Linker::new(&compile_engine).instantiate_pre(&module))?;
@@ -4378,7 +4380,7 @@ fn run_cmd(args: &[String]) -> Result<()> {
         "vl run <file.vl> -- -v\n",
         "       `vl help run` shows the full flag list",
     );
-    let run_engine = gc_engine(run_collector()?)?;
+    let run_engine = gc_engine(run_collector()?, RUN_GC_HEAP_INITIAL)?;
     // The program's print output goes to THIS process's stdout, so stdout is the
     // stream the auto rule asks about — a `vl run p.vl > log` is escape-free even
     // when stderr is still a terminal.
@@ -4753,7 +4755,7 @@ fn test_engine(slot: &mut Option<Engine>) -> Result<Engine> {
     if let Some(engine) = slot {
         return Ok(engine.clone());
     }
-    let engine = gc_engine(run_collector()?)?;
+    let engine = gc_engine(run_collector()?, TEST_GC_HEAP_INITIAL)?;
     *slot = Some(engine.clone());
     Ok(engine)
 }
