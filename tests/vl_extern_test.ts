@@ -312,11 +312,12 @@ Deno.test({
   fn: async () => {
     const dir = await Deno.makeTempDir({ prefix: "vl_extern_link_" });
     try {
-      // Unit A holds ONE function, so its functype is a singleton rec group — the same
-      // type the import declares, which is what lets the engine match the two.
+      // Unit A holds TWO functions, so the link also covers D1999: each functype is its own
+      // rectype, the same type the import declares, which is what lets the engine match them.
       await Deno.writeTextFile(
         `${dir}/a.vl`,
-        "export function f(a: i32): void {\n  print(a * 2)\n}\n",
+        "export function f(a: i32): void {\n  print(a * 2)\n}\n" +
+          "export function other(a: i32): i32 { return a + 1 }\n",
       );
       await Deno.writeTextFile(`${dir}/b.vl`, "extern function f(a: i32): void\nf(21)\nf(5)\n");
       const logs: string[] = [];

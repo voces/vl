@@ -66,9 +66,7 @@ const { instance } = await WebAssembly.instantiate(bytes, {
 ```
 
 A VL module's `export function f(a: i32): void` is a wasm function with no result, so a unit
-built separately can take it as the provider of its `extern function f(a: i32): void`.
-Today that link only matches when the exporting unit contains one function: with two or more,
-their types sit in one recursive type group, which the engine does not treat as the standalone
-type the import declares.
+built separately can take it as the provider of its `extern function f(a: i32): void` —
+through `wasm-merge`, or by handing one instance's exports to the other's `extern` imports.
 
 The design and its rationale: `docs/internals/extern-design.md`.
