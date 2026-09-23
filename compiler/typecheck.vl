@@ -22455,6 +22455,26 @@ function checkBoundsAtCall(
                   getterBoundNote(gBound, bm[m]),
                 ix,
               )
+            } else if wit == "" && !bm[m] {
+              tErr(
+                tyKey +
+                  " does not satisfy `" +
+                  boundText(bAnn) +
+                  "`: no field `" +
+                  bn[m] +
+                  ": " +
+                  tyToStr(bt[m]) +
+                  "` — a field bound is satisfied only by a stored field; to accept a `" +
+                  bn[m] +
+                  "(self: " +
+                  tyKey +
+                  ")` function, bound on `{ " +
+                  bn[m] +
+                  "(): " +
+                  tyToStr(bt[m]) +
+                  " }`",
+                ix,
+              )
             } else if wit == "" {
               let what = bn[m]
               if bm[m] { what = bn[m] + "(): " + tyToStr(retOfFuncTy(bt[m])) }
@@ -37184,9 +37204,12 @@ let gwLocals: string[] = []
 // The boxed types already refused in the getter being walked, by spelling, so one boxed type
 // is one error however many nodes carry it.
 let gwBoxedSeen: string[] = []
-// The refusals already raised for the getter being walked, so one mistake is one error: a
-// `+` chain nests one string `+` inside another, and a callee called twice is one fact.
+// The callees already refused in the getter being walked: every call to one callee has the
+// same fix, so a callee called three times is one error.
 let gwSaid: string[] = []
+// The `+` nodes nested inside a concatenation already refused, so `a + b + c` is one error at
+// its outermost `+` while a separate concatenation elsewhere in the body is its own.
+let gwConcatInner: i32[] = []
 // The nodes of the walked getter whose value is discarded — a non-final block statement, and
 // the arms of a statement-position `if` or `match`. Their type is never materialised, so the
 // non-boxing rule does not apply to it.
@@ -37279,9 +37302,8 @@ function getterBoundNote(fn: string, method: boolean): string {
     after
 }
 
-// One contract refusal, anchored at the offending construct: what the getter does, the rule it
-// breaks, and the method it could be instead. Raised once per getter for each distinct fact.
-function getterContractErr(what: string, rule: string, at: i32) {
+// A refusal of a call to a named callee, raised once per getter for each callee.
+function getterCallErr(what: string, rule: string, at: i32) {
   const key = what + "|" + rule
   let i = 0
   while i < gwSaid.length {
@@ -37289,6 +37311,12 @@ function getterContractErr(what: string, rule: string, at: i32) {
     i = i + 1
   }
   gwSaid.push(key)
+  getterContractErr(what, rule, at)
+}
+
+// One contract refusal, anchored at the offending construct: what the getter does, the rule it
+// breaks, and the method it could be instead.
+function getterContractErr(what: string, rule: string, at: i32) {
   tErr(
     "the " +
       getDeclLabel(getFns[gwRow]) +
@@ -37642,10 +37670,10 @@ function gwBinExpr(n: BinExpr, ix: i32) {
     return getterContractErr("uses string interpolation", GW_ALLOC, ix)
   }
   if n.binOp == "+" && tyIsPrimNamed(nodeTyIxOf(ix), "string") {
-    getterContractErr("concatenates strings", GW_ALLOC, ix)
+    gwConcatErr("concatenates strings", n, ix)
   }
   if n.binOp == "+" && gwErasedIs(nodeTyIxOf(ix)) == "list" {
-    getterContractErr("concatenates lists with `+`", GW_ALLOC, ix)
+    gwConcatErr("concatenates lists with `+`", n, ix)
   }
   if gwIsCompare(n.binOp) {
     const bad = gwLoopCmpOperand(n.binLeft, n.binRight)
@@ -37672,6 +37700,31 @@ function gwBinExpr(n: BinExpr, ix: i32) {
   gwWalk(n.binLeft)
   gwWalk(n.binRight)
   gwTypeOk(ix)
+}
+
+// Refuses the concatenation at `+` node `ix` unless it is nested in one already refused, and
+// marks its `+` operands as nested, so a chain is one error at its outermost `+`.
+function gwConcatErr(what: string, n: BinExpr, ix: i32) {
+  let inner = false
+  let i = 0
+  while i < gwConcatInner.length {
+    if gwConcatInner[i] == ix { inner = true }
+    i = i + 1
+  }
+  if !inner { getterContractErr(what, GW_ALLOC, ix) }
+  gwConcatMarkInner(n.binLeft)
+  gwConcatMarkInner(n.binRight)
+  0
+}
+
+function gwConcatMarkInner(ix: i32) {
+  const u = cwPeel(ix)
+  if u < 0 || u >= P.nodes.length { return 0 }
+  const m = P.nodes[u]
+  if m is BinExpr {
+    if m.binOp == "+" { gwConcatInner.push(u) }
+  }
+  0
 }
 
 function gwIsCompare(op: string): boolean {
@@ -37743,18 +37796,14 @@ function gwCall(n: Call, ix: i32) {
   if callee is Ident {
     const nm = callee.identName
     if externLinkOf(nm) >= 0 {
-      getterContractErr("calls the host function `" + nm + "`", GW_EFFECT, ix)
+      getterCallErr("calls the host function `" + nm + "`", GW_EFFECT, ix)
     } else if gwIsLocal(nm) || (moduleGlobals[nm] ?? false) {
-      getterContractErr("calls the function value `" + nm + "`", GW_CALL, ix)
+      getterCallErr("calls the function value `" + nm + "`", GW_CALL, ix)
     } else if !getterIntrinsicOk(nm) {
-      getterContractErr("calls `" + nm + "`", GW_CALL, ix)
+      getterCallErr("calls `" + nm + "`", GW_CALL, ix)
     }
   } else if callee is Member {
-    getterContractErr(
-      "calls the method `." + callee.memProp + "()`",
-      GW_CALL,
-      ix,
-    )
+    getterCallErr("calls the method `." + callee.memProp + "()`", GW_CALL, ix)
     gwWalk(callee.memObj)
   } else {
     getterContractErr("calls a function value", GW_CALL, ix)
@@ -38011,6 +38060,7 @@ function checkProgramEndGetters() {
   while gi < getFns.length {
     gwBoxedSeen = []
     gwSaid = []
+    gwConcatInner = []
     getterDeclCheck(gi)
     const d = P.nodes[getDecls[gi]]
     if d is FuncDecl {
@@ -38026,7 +38076,6 @@ function checkProgramEndGetters() {
   while ci < getFns.length {
     if getterReaches(ci, ci) {
       gwRow = ci
-      gwSaid = []
       getterContractErr(
         "reads itself through a chain of getters",
         GW_RECUR,
