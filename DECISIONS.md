@@ -6074,6 +6074,19 @@ A's, and overwrites it).
 
 **What the contract does not cover yet**: a unit that pokes raw addresses through the bare
 intrinsics (`__store_i32__`) is trusted, as before — that is how a transliterated unit works on
-guest memory. And `wasm-merge` keeps each unit's `env.memory` import as a separate memory index
-(multi-memory) bound to the same object at instantiation; that is the linker's shape, not VL's.
-Pinned by `tests/vl_import_memory_test.ts`, including the two-unit collision and its fix.
+guest memory.
+
+**Linking to ONE memory is a recipe, not a VL mechanism.** Merged naively, `wasm-merge` keeps each
+unit's `env.memory` import as its own memory index — N memories bound to one object, which
+needs multi-memory. `wasm-merge` resolves an import against the input module whose NAME matches,
+so the recipe adds a provider named `env` that re-exports a single import:
+`(module (import "host" "memory" (memory 1)) (export "memory" (memory 0)))`, linked as
+`wasm-merge env.wasm env u0.wasm u0 u1.wasm u1 …`. Every unit's `env.memory` collapses onto that
+one memory, imported by the result as `host.memory`, and it validates without multi-memory. Two
+caveats: the provider cannot itself import `env.memory` (it would resolve against itself), and
+the merged module re-exports `memory` from the provider. The layout flags are parsed strictly —
+a misspelled, space-separated, valued or repeated layout flag exits 2 — because falling back to
+the default window silently puts a unit's heap at 1024, which may be inside the host's image.
+A `vl link` command wrapping the recipe is a separate follow-up. Pinned by
+`tests/vl_import_memory_test.ts`, including the two-unit collision, its fix, and the recipe's one
+memory.

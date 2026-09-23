@@ -2317,27 +2317,62 @@ fn stale_seed_for(flag: &str, export: &str) -> Error {
 const HEAP_BASE_DEFAULT: i64 = 1024;
 const HEAP_LIMIT_DEFAULT: i64 = (i32::MAX as i64) & !7;
 
-/// `--heap-base=<n>` / `--heap-limit=<n>` (decimal or `0x` hex) into a validated window,
-/// or `None` when neither is given. Exits 2 on a malformed or inconsistent pair: both ends
-/// are multiples of 8 (the allocator's alignment, so a window's size is exactly usable), the
-/// base is nonzero (0 is its "not yet started" sentinel), and the limit is at least the base.
-fn parse_heap_window(args: &[String]) -> Option<(i32, i32)> {
-    let value = |name: &str| -> Option<i64> {
-        let prefix = format!("{name}=");
-        let raw = args.iter().find_map(|a| a.strip_prefix(prefix.as_str()))?;
+/// The link flags, parsed STRICTLY: a layout flag that is misspelled, spelled with a space,
+/// given a value it does not take, or repeated exits 2 rather than falling back to the
+/// default layout — whose base 1024 may lie inside memory the host owns. `--heap-base=` /
+/// `--heap-limit=` take decimal or `0x` hex; both ends are multiples of 8 (the allocator's
+/// alignment), the base is nonzero (a `Buf` at 0 must stay impossible), limit >= base.
+fn parse_link_opts(args: &[String]) -> LinkOpts {
+    let mut import_memory = false;
+    let mut base: Option<i64> = None;
+    let mut limit: Option<i64> = None;
+    let parse = |name: &str, raw: &str| -> i64 {
         let parsed = match raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) {
             Some(hex) => i64::from_str_radix(&hex.replace('_', ""), 16),
             None => raw.replace('_', "").parse::<i64>(),
         };
-        match parsed {
-            Ok(v) => Some(v),
-            Err(_) => usage_exit(&format!(
+        parsed.unwrap_or_else(|_| {
+            usage_exit(&format!(
                 "`{name}={raw}` — expected a byte address, decimal or 0x hex"
-            )),
+            ))
+        })
+    };
+    let once = |slot: &Option<i64>, name: &str| {
+        if slot.is_some() {
+            usage_exit(&format!("`{name}=` is given twice — give it once"));
         }
     };
-    let base = value("--heap-base");
-    let limit = value("--heap-limit");
+    for a in args.iter().skip(2) {
+        if a == "--import-memory" {
+            if import_memory {
+                usage_exit("`--import-memory` is given twice — give it once");
+            }
+            import_memory = true;
+        } else if let Some(v) = a.strip_prefix("--import-memory=") {
+            usage_exit(&format!(
+                "`--import-memory={v}` — the flag takes no value; the import is always \
+                 `env.memory`"
+            ));
+        } else if let Some(v) = a.strip_prefix("--heap-base=") {
+            once(&base, "--heap-base");
+            base = Some(parse("--heap-base", v));
+        } else if let Some(v) = a.strip_prefix("--heap-limit=") {
+            once(&limit, "--heap-limit");
+            limit = Some(parse("--heap-limit", v));
+        } else if a == "--heap-base" || a == "--heap-limit" {
+            usage_exit(&format!("`{a}` takes its value after `=`: `{a}=<addr>`"));
+        } else if a.starts_with("--heap") || a.starts_with("--import") {
+            usage_exit(&format!(
+                "unknown layout flag `{a}` — the layout flags are `--import-memory`, \
+                 `--heap-base=<addr>` and `--heap-limit=<addr>`"
+            ));
+        }
+    }
+    LinkOpts { import_memory, heap: heap_window(base, limit) }
+}
+
+/// Validates a window from the two optional ends, or `None` when neither is given.
+fn heap_window(base: Option<i64>, limit: Option<i64>) -> Option<(i32, i32)> {
     if base.is_none() && limit.is_none() {
         return None;
     }
@@ -6125,13 +6160,10 @@ fn build_cmd(args: &[String]) -> Result<()> {
     let names = args.iter().any(|a| a == "--names");
     // `--import-memory`: the module imports `env.memory` instead of defining and exporting
     // it (DECISIONS.md §"Linear memory is a layout contract").
-    let link = LinkOpts {
-        import_memory: args.iter().any(|a| a == "--import-memory"),
-        heap: parse_heap_window(args),
-    };
+    let link = parse_link_opts(args);
     // `_located`, so a written module the engine refuses names the function it came
     // from (D1578). The instance is read only on that failure path.
-    let (mut bytes, session) = compile_vl_located(
+    let (mut bytes, mut session) = compile_vl_located(
         &compile_engine,
         &compiler,
         &read_source()?,
@@ -6140,6 +6172,21 @@ fn build_cmd(args: &[String]) -> Result<()> {
         names,
         link,
     )?;
+    // A unit sharing a host's memory that allocates with no window of its own starts at
+    // the default base, as every other such unit does. Legal, so a warning, not a refusal.
+    if link.import_memory && link.heap.is_none() {
+        if let Some((store, inst)) = session.as_mut() {
+            if let Ok(read) = inst.get_typed_func::<(), i32>(&mut *store, "heapWindowRead") {
+                if read.call(&mut *store, ())? != 0 {
+                    eprintln!(
+                        "vl build: warning: `{input}` allocates from std:buffer under \
+                         --import-memory with no --heap-base; its heap starts at 1024, the \
+                         same address as every other such unit"
+                    );
+                }
+            }
+        }
+    }
     // THE SECOND SEAM (D1594). `None` on every real run — see the `$VL_FAULT_INJECT`
     // block. `vl check --codegen` renders the engine's refusal through cli.vl and this
     // path through `locate_invalid_module`, so a control that exercises only the other

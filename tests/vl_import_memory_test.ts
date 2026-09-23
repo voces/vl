@@ -72,6 +72,7 @@ const noop = () => {};
 /** The imports a VL module may ask for, over the memory the host owns. */
 const hostImports = (memory: WebAssembly.Memory) => ({
   env: { memory },
+  host: { memory }, // the provider recipe's one import, after linking
   imports: {
     __print_i32__: noop,
     __print_bool__: noop,
@@ -302,6 +303,11 @@ Deno.test({
           ["--heap-base=0x2000", "--heap-limit=0x1000"],
           ["--heap-base=0x1000", "--heap-limit=0x1004"],
           ["--heap-base=lots"],
+          ["--heap-limt=0x100"],
+          ["--heap-base", "0x10000"],
+          ["--import-memory=foo"],
+          ["--import-memory", "--import-memory"],
+          ["--heap-base=0x1000", "--heap-base=0x2000"],
         ]
       ) {
         const r = await vl([
@@ -321,26 +327,163 @@ Deno.test({
   },
 });
 
+Deno.test({
+  name:
+    "heap window: an allocating unit under --import-memory with no --heap-base is warned about",
+  ignore: !ENABLED,
+  fn: async () => {
+    const tmp = await Deno.makeTempDir();
+    try {
+      const warned = async (src: string, flags: string[]) => {
+        await Deno.writeTextFile(`${tmp}/t.vl`, src);
+        const r = await vl([
+          "build",
+          `${tmp}/t.vl`,
+          "-o",
+          `${tmp}/t.wasm`,
+          "--compiler",
+          COMPILER,
+          ...flags,
+        ]);
+        eq(r.code, 0, `vl build ${flags.join(" ")} exit code`);
+        return r.err.includes("warning");
+      };
+      eq(
+        await warned(WRITER, ["--import-memory"]),
+        true,
+        "allocating, no window",
+      );
+      eq(
+        await warned(WRITER, ["--import-memory", "--heap-base=0x10000"]),
+        false,
+        "allocating, with a window",
+      );
+      eq(await warned(CODE_ONLY, ["--import-memory"]), false, "code-only unit");
+      eq(await warned(WRITER, []), false, "no --import-memory");
+    } finally {
+      await Deno.remove(tmp, { recursive: true });
+    }
+  },
+});
+
+Deno.test({
+  name: "heap window: bufferRelease traps on an unaligned mark",
+  ignore: !ENABLED,
+  fn: async () => {
+    const ex = await instantiate(
+      await build(
+        `import { Buffer, bufferRelease } from "std:buffer"
+export function go(off: i32): i32 {
+  const b = Buffer(16)
+  bufferRelease(b.base + off)
+  b.base
+}
+`,
+        ["--import-memory", "--heap-base=0x10000", "--heap-limit=0x10100"],
+      ),
+      new WebAssembly.Memory({ initial: 2 }),
+    );
+    eq(ex.go(8), 0x10000, "an aligned mark is accepted");
+    let trapped = false;
+    try {
+      ex.go(4);
+    } catch (e) {
+      trapped = e instanceof WebAssembly.RuntimeError;
+    }
+    if (!trapped) {
+      throw new Error(
+        "an unaligned mark was accepted — the next Buf could pass the limit",
+      );
+    }
+  },
+});
+
 // ── 3. two units, one memory ─────────────────────────────────────────────────
 
-/** Link `units` with wasm-merge, each under its own module name. */
+/** The provider module the recipe links first, under the name `env`:
+ * `(module (import "host" "memory" (memory 1)) (export "memory" (memory 0)))`. wasm-merge
+ * binds each unit's `env.memory` import to THIS export, so the units share its one memory. */
+const PROVIDER = new Uint8Array([
+  0x00,
+  0x61,
+  0x73,
+  0x6d,
+  0x01,
+  0x00,
+  0x00,
+  0x00, // magic, version
+  0x02,
+  0x10,
+  0x01,
+  0x04,
+  0x68,
+  0x6f,
+  0x73,
+  0x74, // import section: 1, "host"
+  0x06,
+  0x6d,
+  0x65,
+  0x6d,
+  0x6f,
+  0x72,
+  0x79,
+  0x02, //   "memory", kind memory
+  0x00,
+  0x01, //   limits: min 1
+  0x07,
+  0x0a,
+  0x01,
+  0x06,
+  0x6d,
+  0x65,
+  0x6d,
+  0x6f, // export section: 1, "memory"
+  0x72,
+  0x79,
+  0x02,
+  0x00, //   kind memory, index 0
+]);
+
+/** Features a VL module needs, and NOT multi-memory: the recipe must not depend on it. */
+const MERGE_FEATURES = [
+  "--enable-gc",
+  "--enable-reference-types",
+  "--enable-bulk-memory",
+  "--enable-tail-call",
+];
+
+/** Link `units` with wasm-merge through the provider recipe, then check the result has
+ * exactly ONE memory: imported as `host.memory`, with no memory section beside it, so no
+ * instruction can name a memory index other than 0. */
 const merge = async (units: Uint8Array[]): Promise<Uint8Array> => {
   const tmp = await Deno.makeTempDir();
   try {
-    const args: string[] = [];
+    await Deno.writeFile(`${tmp}/env.wasm`, PROVIDER);
+    const args: string[] = [`${tmp}/env.wasm`, "env"];
     for (let i = 0; i < units.length; i++) {
       await Deno.writeFile(`${tmp}/u${i}.wasm`, units[i]);
       args.push(`${tmp}/u${i}.wasm`, `unit${i}`);
     }
     const { code, stderr } = await new Deno.Command(WASM_MERGE, {
-      args: [...args, "--all-features", "-o", `${tmp}/merged.wasm`],
+      args: [...args, ...MERGE_FEATURES, "-o", `${tmp}/merged.wasm`],
       stdout: "piped",
       stderr: "piped",
     }).output();
     if (code !== 0) {
       throw new Error(`wasm-merge failed: ${dec.decode(stderr).trim()}`);
     }
-    return await Deno.readFile(`${tmp}/merged.wasm`);
+    const merged = await Deno.readFile(`${tmp}/merged.wasm`);
+    eq(
+      memoryShape(merged).imports,
+      ["host.memory"],
+      "the linked module's memory imports",
+    );
+    if (sectionIds(merged).includes(5)) {
+      throw new Error(
+        "the linked module defines a memory beside the imported one",
+      );
+    }
+    return merged;
   } finally {
     await Deno.remove(tmp, { recursive: true });
   }
