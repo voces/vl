@@ -15,7 +15,13 @@
 // `P`, and the arena `mk*` constructors. The parser's own `advance`/`peekTok`
 // cursor primitives stay private to this module.
 import { TokKind, tplPartStrLex } from "./lexer"
-import { arenaEpochBump, externAdd, isBinOpFuncName, mkMatch } from "./ast"
+import {
+  arenaEpochBump,
+  externAdd,
+  externGlobalAdd,
+  isBinOpFuncName,
+  mkMatch,
+} from "./ast"
 import { BinExpr, Ident, P, Tok, dgMarkLossless, mkDeclNameTok } from "./ast"
 // The free index-operator declaration-name encoding — the parser is where
 // `function "[]"(self: T, …)` gets the receiver-carrying name it declares under.
@@ -2765,20 +2771,26 @@ function annNameOf(ix: i32): string {
 // no body. The name is the wasm import name, so the declaration is banked in the program-wide
 // manifest (`ast.externAdd`) and contributes NO statement: an extern has no body to run and
 // no local index to occupy.
+// Answers the `LetDecl` an `extern let`/`extern const` mints, or -1 for a function.
 function parseExtern() {
   // `export extern function …` — ordinary visibility, exactly as on a `function`: the
   // declaring module keeps a non-exported extern to itself, and an exported one is importable
   // by name. The link name it points at is shared either way.
+  const p0 = peekTok().start
   if peekKind() == "EXPORT" { advance() }
   advance() // "extern"
+  if peekKind() == "LET" || peekKind() == "CONST" {
+    return parseExternGlobal(p0)
+  }
   if peekKind() != "FUNCTION" {
     P.diags.push(
       {
-        msg: "`extern` declares a host function — write `extern function name(…): T`",
+        msg: "`extern` declares a host import — write `extern function name(…): T`, " +
+          "`extern let name: T` or `extern const name: T`",
         at: P.pos,
       },
     )
-    return 0
+    return -1
   }
   advance() // "function"
   let name = ""
@@ -2790,6 +2802,64 @@ function parseExtern() {
   if accept("COLON") { ret = annNameOf(parseType()) }
   externAdd(name, ptys, ret, nameTok)
   externRejectBody()
+  -1
+}
+
+// `extern (let | const) IDENT ":" type` — an imported wasm global, mutable for `let`. Unlike an
+// `extern function` it IS a statement: a `LetDecl` with no initializer, so every reader of a
+// module global (lookup, the merge's rename, closures, assignment) serves it unchanged, and
+// the manifest row is what makes the emitter import the cell instead of defining it.
+function parseExternGlobal(p0: i32) {
+  const kw = advance().text // "let" or "const"
+  let name = ""
+  let nameTok = -1
+  if peekKind() == "IDENT" {
+    nameTok = P.pos
+    name = advance().text
+  } else {
+    expect("IDENT")
+  }
+  let ty = -1
+  if accept("COLON") {
+    ty = parseType()
+  } else {
+    P.diags.push(
+      {
+        msg: "`extern " +
+          kw +
+          " " +
+          name +
+          "` needs a type — an imported global's type is " +
+          "the whole contract, so write it: `extern " +
+          kw +
+          " " +
+          name +
+          ": i64`",
+        at: P.pos,
+      },
+    )
+  }
+  if peekKind() == "EQUAL" {
+    P.diags.push(
+      {
+        msg: "`extern " +
+          kw +
+          " " +
+          name +
+          "` has no initializer — the host or the linked " +
+          "unit that exports it provides its value",
+        at: P.pos,
+      },
+    )
+    advance()
+    parseExpr()
+  }
+  let mut = 0
+  if kw == "let" { mut = 1 }
+  const ix = mkLet(kw, name, ty, -1, p0)
+  mkDeclNameTok(ix, nameTok)
+  externGlobalAdd(name, annNameOf(ty), mut, nameTok, ix)
+  ix
 }
 
 // `"(" (IDENT ":" type ("," …)*)? ")"` — an extern's parameter list, appending each
@@ -3723,13 +3793,23 @@ export function parseProgram() {
   let going = true
   while going {
     const k = peekKind()
-    if k == "EOF" { going = false }
-    else if k == "NEWLINE" || k == "SEMI" { advance() }
-    else if k == "IMPORT" { stmts.push(parseImport()) }
-    else if k == "EXPORT" && kindAt(P.pos + 1) == "LBRACE" { skipReexport() }
-    else if k == "EXTERN" { parseExtern() }
-    else if k == "EXPORT" && kindAt(P.pos + 1) == "EXTERN" { parseExtern() }
-    else { stmts.push(parseStmt()) }
+    if k == "EOF" {
+      going = false
+    } else if k == "NEWLINE" || k == "SEMI" {
+      advance()
+    } else if k == "IMPORT" {
+      stmts.push(parseImport())
+    } else if k == "EXPORT" && kindAt(P.pos + 1) == "LBRACE" {
+      skipReexport()
+    } else if (
+      k == "EXTERN" ||
+      (k == "EXPORT" && kindAt(P.pos + 1) == "EXTERN")
+    ) {
+      const xg = parseExtern()
+      if xg >= 0 { stmts.push(xg) }
+    } else {
+      stmts.push(parseStmt())
+    }
   }
   // D1045 — the hoist. A body-scoped declaration is also a top-level statement of the
   // program, which is what makes the checker's passes register it and the emitter mint its

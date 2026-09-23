@@ -52,7 +52,7 @@ import {
   WhileStmt,
 } from "./ast"
 import { TokKind } from "./lexer"
-import { P, isBodyTyDecl, nodeEndOf } from "./ast"
+import { P, externGlobalLinkOfNode, isBodyTyDecl, nodeEndOf } from "./ast"
 // The free index-operator declaration-name encoding — the formatter prints the operator
 // back in its source spelling, not the name it declares under.
 import { opDeclOpOf } from "./ast"
@@ -529,13 +529,17 @@ export function formatProgram(progRoot: i32) {
     // filtered out of the statement walk; emitting them there too would duplicate every
     // import. D1045 — a body-scoped `type` is filtered one scope in for the same reason:
     // the parser hoists it into `progStmts` and it stays at its lexical position as well.
+    // An `extern let` is recovered from the tokens with every other extern, so its node is too.
     topPrevLine = emitImports()
     const stmts: i32[] = []
     let fi = 0
     while fi < root.progStmts.length {
       const fn = P.nodes[root.progStmts[fi]]
       if !(fn is ImportDecl) {
-        if !isBodyTyDecl(root.progStmts[fi]) { stmts.push(root.progStmts[fi]) }
+        const fx = root.progStmts[fi]
+        if !isBodyTyDecl(fx) && externGlobalLinkOfNode(fx) < 0 {
+          stmts.push(fx)
+        }
       }
       fi = fi + 1
     }
@@ -816,9 +820,9 @@ function fmtExtern(k: i32) {
   const stop = e.start + e.text.length
   const lp = extRecLp[k]
   const rp = extRecRp[k]
-  if lp < 0 || rp < 0 || commentInCharSpan(t.start, stop) {
-    return sliceSpanFallback(t.start, stop)
-  }
+  if commentInCharSpan(t.start, stop) { return sliceSpanFallback(t.start, stop) }
+  // No parameter list: an `extern let`/`extern const`, or a malformed head.
+  if lp < 0 || rp < 0 { return fmtExternNoParens(k) }
   const lparen = P.toks[lp]
   const rparen = P.toks[rp]
   const head = collapseWs(fmtSrc.slice(t.start, lparen.start))
@@ -835,6 +839,24 @@ function fmtExtern(k: i32) {
     p = p + 1
   }
   head + wrapList("(", items, ")", 0, dispWidth(head) + dispWidth(tail)) + tail
+}
+
+// Recovered extern `k` token by token: one space wherever the source had any, none before a
+// `:` and one after it — so `extern let rax : i64` prints as `extern let rax: i64`.
+function fmtExternNoParens(k: i32) {
+  let out = ""
+  let i = extRecStart[k]
+  const stop = extRecStop[k]
+  while i <= stop && i < P.toks.length {
+    const tk = P.toks[i]
+    if i > extRecStart[k] && tk.kind != "COLON" {
+      const prev = P.toks[i - 1]
+      if prev.kind == "COLON" || prev.start + prev.text.length < tk.start { out = out + " " }
+    }
+    out = out + tk.text
+    i = i + 1
+  }
+  out
 }
 
 // Whether a recovered extern is still unplaced and starts before source `line`.

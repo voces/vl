@@ -28,6 +28,7 @@ import {
   nodeTyIsUnionish,
   nodeTyIxOf,
   numLitUnionHasBase,
+  topLetScalarOf,
   tyPrimNameOf,
   tyToEmitName,
 } from "./typecheck"
@@ -77,8 +78,13 @@ import {
   WhileStmt,
   annTsOf,
   declNameTokOf,
+  extGMut,
+  extGNames,
+  extGTys,
   externArityAt,
   externCount,
+  externGlobalCount,
+  externGlobalLinkOfNode,
   externNameAt,
   externParamAt,
   externRetAt,
@@ -264,6 +270,7 @@ import {
   genTyParamNames,
   genTyParamSeen,
   globalIndexBySid,
+  globalNames,
   globalStmts,
   ia64TypeIdx,
   ia64Used,
@@ -608,6 +615,7 @@ import {
   mvValsWrapOf,
   sFieldStorageSlot,
   strAccScanStart,
+  userGlobalIdx,
 } from "./wasmEmit"
 
 // Host opt-in for the name section (see `gEmitNames`). The driver does NOT call
@@ -1223,6 +1231,8 @@ function globalPromotable(gi: i32) {
   const d = P.nodes[globalStmts[gi]]
   if d is LetDecl {
     if d.letInit < 0 { return false }
+    // A binding the export section publishes is a wasm global by contract.
+    if globalIsExportTarget(gi) { return false }
     const ck = globalCellKind(globalStmts[gi])
     if ck == "i32" { return true }
     if ck == "i64" { return true }
@@ -1249,11 +1259,11 @@ export function computeGlobalPromotion() {
   while ri < globalStmts.length {
     gPromoOk.push(0)
     gPromoSlot.push(-1)
-    gCellIdx.push(ri)
+    gCellIdx.push(-1)
     ri = ri + 1
   }
   if startStmts.length == 0 {
-    return 0 // P1
+    return densifyGlobalCells() // P1
   }
   let anyCand = false
   let ci = 0
@@ -1264,7 +1274,7 @@ export function computeGlobalPromotion() {
     }
     ci = ci + 1
   }
-  if !anyCand { return 0 }
+  if !anyCand { return densifyGlobalCells() }
   // P4, in two halves. The reachability walk marks the top-level region; the flat arena
   // scan then finds every `Ident` the walk did NOT reach and vetoes the binding it
   // names. The scan is over the WHOLE arena, which is what makes "everywhere else"
@@ -1303,13 +1313,17 @@ export function computeGlobalPromotion() {
     }
     ai = ai + 1
   }
-  // The surviving cells re-densify: a promoted binding emits none, so every cell below
-  // a promoted one keeps its index and every cell above it drops by one. `userGlobalIdx`
-  // is the single translation and reads this array.
+  densifyGlobalCells()
+}
+
+// The surviving cells re-densify: a promoted binding and an imported (`extern let`) one emit
+// none, so every cell below keeps its index and every cell above drops by one.
+// `userGlobalIdx` is the single translation and reads this array.
+function densifyGlobalCells() {
   let cell = 0
   let di = 0
   while di < globalStmts.length {
-    if gPromoOk[di] == 1 {
+    if gPromoOk[di] == 1 || externGlobalLinkOfNode(globalStmts[di]) >= 0 {
       gCellIdx[di] = -1
     } else {
       gCellIdx[di] = cell
@@ -1318,6 +1332,30 @@ export function computeGlobalPromotion() {
     di = di + 1
   }
   0
+}
+
+// Is the binding at `globalStmts` position `gi` one the export section publishes as a wasm
+// global — named by an alias row, defined here rather than imported, and scalar-typed?
+function globalIsExportTarget(gi: i32): boolean {
+  if gi < 0 || gi >= globalNames.length { return false }
+  let i = 0
+  while i < reExpTarget.length {
+    if reExpTarget[i] == globalNames[gi] {
+      return exportGlobalOfTarget(reExpTarget[i]) == gi
+    }
+    i = i + 1
+  }
+  false
+}
+
+// The `globalStmts` position an export target names, or -1: a defined (not imported) module
+// binding whose checked type is a scalar. Any other binding stays a VL-level export only.
+function exportGlobalOfTarget(name: string): i32 {
+  const gi = globalIndexOf(name)
+  if gi < 0 || gi >= globalStmts.length { return -1 }
+  if externGlobalLinkOfNode(globalStmts[gi]) >= 0 { return -1 }
+  if topLetScalarOf(name) == "" { return -1 }
+  gi
 }
 
 // Does the binding at `globalStmts` position `gi` have its initializer run by the start
@@ -5426,11 +5464,14 @@ function emitImportSection(n: i32, typeOffset: i32, hasStart: i32) {
   // An imported memory alone still needs the section; its entry trails every function import,
   // and memory imports occupy their own index space, so no function index moves.
   if gImports == 0 {
-    if memImported() {
+    if memImported() || externGlobalCount() > 0 {
       const memOnlyPayload: i32[] = []
       const moPrev = wTarget(memOnlyPayload)
-      wULEB(1)
-      emitMemoryImportEntry()
+      let nNonFn = externGlobalCount()
+      if memImported() { nNonFn = nNonFn + 1 }
+      wULEB(nNonFn)
+      emitGlobalImportEntries()
+      if memImported() { emitMemoryImportEntry() }
       wTarget(moPrev)
       wSection(2, memOnlyPayload)
     }
@@ -5463,7 +5504,7 @@ function emitImportSection(n: i32, typeOffset: i32, hasStart: i32) {
     // …and one per USED fs slot, counted from the same table the entries below iterate.
     nImports = nImports + fsImportCount()
     // …and one per declared extern, trailing the fs block.
-    nImports = nImports + externCount()
+    nImports = nImports + externCount() + externGlobalCount()
     if memImported() { nImports = nImports + 1 }
     wULEB(nImports)
     wName("imports")
@@ -5548,9 +5589,26 @@ function emitImportSection(n: i32, typeOffset: i32, hasStart: i32) {
       ftFs = ftFs + 1
       exim = exim + 1
     }
+    emitGlobalImportEntries()
     if memImported() { emitMemoryImportEntry() }
     wTarget(imPrev)
     wSection(2, importPayload)
+  }
+  0
+}
+
+// One `(import "extern" "<name>" (global (mut? <valtype>)))` per `extern let`/`extern const`
+// link row, in manifest order — which is global index 0.. since imports precede every
+// defined global. Same module name as `extern function`, so one host object serves both.
+function emitGlobalImportEntries() {
+  let gi = 0
+  while gi < externGlobalCount() {
+    wName("extern")
+    wName(extGNames[gi])
+    wU8(3) // import kind: global
+    wU8(externValType(extGTys[gi]))
+    if extGMut[gi] == 1 { wU8(1) } else { wU8(0) }
+    gi = gi + 1
   }
   0
 }
@@ -5633,15 +5691,16 @@ function emitGlobalSection() {
   let nCells = 0
   let nci = 0
   while nci < ng {
-    if gPromoOk[nci] != 1 { nCells = nCells + 1 }
+    if gCellIdx[nci] >= 0 { nCells = nCells + 1 }
     nci = nci + 1
   }
   const np = gStrPoolTexts.length
-  // The heap-window pair trails the pool and every user cell, so no existing global moves.
+  // The heap-window pair trails the imports, the pool and every user cell, so no existing
+  // global moves.
   let nHeap = 0
   if gHeapUsed {
     nHeap = 2
-    gHeapGlobalIdx = np + nCells
+    gHeapGlobalIdx = externGlobalCount() + np + nCells
   }
   if nCells + np + nHeap > 0 {
     const globalPayload: i32[] = []
@@ -5675,8 +5734,9 @@ function emitGlobalSection() {
     let gi = 0
     while gi < ng {
       // A PROMOTED binding (G2c) emits no cell at all: its value lives in a
-      // start-function local and its initializer becomes a `local.set` there.
-      if gPromoOk[gi] == 1 {
+      // start-function local and its initializer becomes a `local.set` there. An imported
+      // one (`extern let`) has its cell in the import section instead.
+      if gCellIdx[gi] < 0 {
         gi = gi + 1
         continue
       }
@@ -5783,7 +5843,13 @@ function emitGlobalSection() {
             pendingNulRefHeap = mapTypeIdxOf(gcs)
           }
           fbValtype(gck, gcs) // valtype
-          wU8(1)              // 0x01 mutable
+          // An exported `const` is published immutable, so an `extern const` import links to
+          // it; nothing else writes a constexpr cell. Every other cell is mutable.
+          if g.letKw == "const" && globalIsExportTarget(gi) {
+            wU8(0)
+          } else {
+            wU8(1)
+          }
           // An `: i64` global lowers its literal init as `i64.const` (kind 10 / 0x7e);
           // an `: f32`/`: f64` global as `f32.const`/`f64.const` (kind 13 / 0x7d, 11 /
           // 0x7c) — re-encoding an integer literal directly so the init stays a valid
@@ -5951,6 +6017,23 @@ function emitExportSection(_n: i32, wrapBase: i32) {
   // An IMPORTED memory is not re-exported: its host already holds it, and N units each
   // exporting `memory` is a fatal name conflict when a linker merges them.
   const memExported = memUsed && !memImported()
+  // The scalar module bindings the alias rows name, published as wasm globals after every
+  // function entry. A public name a function already took keeps the function.
+  const gExpNm: string[] = []
+  const gExpIx: i32[] = []
+  let gxi = 0
+  while gxi < reExpName.length {
+    const gxg = exportGlobalOfTarget(reExpTarget[gxi])
+    if (
+      gxg >= 0 &&
+      !capHas(reExpNm, reExpName[gxi]) &&
+      !capHas(gExpNm, reExpName[gxi])
+    ) {
+      gExpNm.push(reExpName[gxi])
+      gExpIx.push(gxg)
+    }
+    gxi = gxi + 1
+  }
   if memExported {
     let mci = 0
     while mci < reExpNm.length {
@@ -5961,11 +6044,16 @@ function emitExportSection(_n: i32, wrapBase: i32) {
       }
       mci = mci + 1
     }
+    if capHas(gExpNm, "memory") {
+      return emitFail(
+        "emitProgram: this program exports a binding named 'memory', but a program that uses linear memory exports the memory itself under that name — rename the binding",
+      )
+    }
   }
   // An export-free program still omits the section unless the memory is exported, in which
   // case section 7 exists to carry that one entry — otherwise a memory-only module would lose its export.
-  if reExpNm.length == 0 && !memExported { return 0 }
-  let nExports = reExpNm.length
+  if reExpNm.length == 0 && gExpNm.length == 0 && !memExported { return 0 }
+  let nExports = reExpNm.length + gExpNm.length
   if memExported { nExports = nExports + 1 }
   const exportPayload: i32[] = []
   const exPrev = wTarget(exportPayload)
@@ -5983,6 +6071,13 @@ function emitExportSection(_n: i32, wrapBase: i32) {
       wULEB(gImports + reExpEi[rei])
     }
     rei = rei + 1
+  }
+  let gxe = 0
+  while gxe < gExpNm.length {
+    wName(gExpNm[gxe])
+    wU8(3) // export kind: global
+    wULEB(userGlobalIdx(gExpIx[gxe]))
+    gxe = gxe + 1
   }
   // The memory entry LAST, so every function export keeps the index it had — the
   // export section is order-insensitive to a host, but keeping the prefix identical

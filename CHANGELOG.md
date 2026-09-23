@@ -721,6 +721,27 @@ new: the compare-frame pre-pass never recurses into a code-15 field, so a NESTED
   recipe"), so the result needs no multi-memory. The layout flags are parsed strictly, and a
   window-less allocating unit is warned about. `vl run` refuses all three flags. `DECISIONS.md` §"Linear memory is a layout contract";
   `tests/vl_import_memory_test.ts`.
+- **Mutable globals cross the wasm boundary: `extern let` / `extern const` import one, and an
+  entry module's scalar `export let` / `export const` exports one (plumb PL-003(b), owner ruling
+  2026-09-22).** `extern let rax: i64` imports a mutable global from the `extern` namespace (the
+  one `extern function` uses) and `extern const k: i32` an immutable one; every read and write is
+  a `global.get`/`global.set` directly on the import — at top level, in a function and in a
+  closure, none of which snapshots it — so ~150 separately built units can share a register file
+  as globals rather than a load/store per access. The binding is an ordinary module `LetDecl`
+  (name lookup, the module merge's rename, `export extern let`, closures and `const` all serve it
+  unchanged); imported globals take indices 0.. ahead of the string pool and every defined cell.
+  Scalars only (`i32`, `i64`, `f32`, `f64`, `boolean` as `i32`); a type, an initializer, a
+  disagreeing second declaration (type or mutability) and a name that is also an `extern
+  function` are refused, each naming the fix. The entry module's `export let`/`export const`
+  whose checked type is one of those scalars becomes a wasm global export — mutable, or immutable
+  for a `const` with a constant initializer — the same "entry module's `export` is the ABI" rule
+  `export function` follows, so a dependency's `export let` stays a VL-level export and a
+  non-scalar one is not published. `vl run` provides no globals and refuses at load, naming the
+  global. `tests/vl_extern_global_test.ts` pins the sections, a host `WebAssembly.Global` seen
+  through writes in both directions, two units linked by V8 and by `wasm-merge` (+ `-O3`), and
+  mutability as part of the link. Found on the way: [D2020](docs/internals/inventory/D2020.md), a
+  module `let x: T` with no initializer checks clean and then has no emitter cell. `DECISIONS.md`
+  §"Globals cross the wasm boundary"; guide `docs/guide/extern.md`.
 - **The rep descriptor covers a VALUE-UNION-BOX ref list, keyed on the interned canon id rather than the spelling.** A `(A | B)[]` whose element is a value-union box is a ref list — the box is a reference, and the ladder already answers it (`refArrElemKind`'s kind-2 arm), so this is a coverage arm and is byte-identical. `reflist` LEFT-ONLY falls **5,940 → 3,350** in `tests/cases` and **812 → 235** in the corpus — **−2,590 and −577, each exactly its census** — CONTRADICT 0, over emitting populations of 2,633 / 3,225 and 4,655 / 7,589. **The key is the arena canon-id row, never the spelling.** The collect pass registers a union under its DECLARED spelling (`unNames` holds `V` for `type V = i32 | string`), while an arena-side reader renders structurally (`i32|string`) and has no spelling to offer — the campaign's two-producer thesis in miniature. So the arm asks `unRowOfCanonId(elem) >= 0`, the interned-id row lookup shared by both producers, which the census measured as a strict superset of the spelling scan (zero `spelling-only`, zero `neither`, both populations). **The census took three producers to state, and the first two were wrong**: an arena render (`tyToEmitName`) said 1,568 registered but disagrees with `unNames` for every alias; the spelling cut (`arrElemNameRaw`) said 1,698 but that is the LADDER's question, not the descriptor's; only the arena canon row reaches all 3,167 — the worked instance of "ask the arm's question of the arm's producer". **And the shape gate is load-bearing, caught by byte identity.** Keyed on the row alone the arm answered `reflist` for a numeric literal union (`type Z = 0 | 1`), which also has a canon row but reps as its base scalar list: 15 `tests/cases` and 12 corpus modules went byte-different with IDENTICAL output — a latent miscompile `regress.py` would not veto — so the arm gates on `tyIsValueUnionBox(elem)` first, the census's own predicate. The row existing is necessary, not sufficient, the same lesson the refused nullable candidate filed one landing earlier (D1837). The tree arm needs no shape gate — only a real box is a `"box"` rep-tree node — so the flat and tree producers ask the same canon-id question of the same shape and the two-producer audit reads 0. `rep-fuzz-check.sh` exact, `regress.py` no cell changed class, `mono-tyaram-grid` 0 BAD.
 
 - **SIMD design doc — `docs/internals/simd-design.md` surveys a wide gamut of SIMD-first languages (WASM SIMD, Zig, Mojo, Rust, C/C++/Highway, C#, Swift, ISPC, WGSL/HLSL/GLSL, Julia, Go 1.26/1.27, Futhark, SVE/RVV) and recommends a direction for veldt ask #1 ("~4x off without it").** The recommendation: a fixed-width, nominally-typed `std:simd` library (`F32x4`/`I32x4`/`U8x16`/…, distinct `Mask`) over a thin new `__…_v128__` intrinsic + `0xFD` opcode family — the `std:buffer` shape exactly — not a language-level generic `SIMD[T,N]` (WASM's single fixed width makes it low-value, and it is blocked on const-generics regardless). Design-only: no compiler source touched. ROADMAP row 32; ten owner rulings listed (§F).

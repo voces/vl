@@ -3895,6 +3895,14 @@ fn register_extern_imports(linker: &mut Linker<()>, module: &Module) -> Result<(
             continue;
         }
         let name = imp.name().to_string();
+        // An `extern let`/`extern const` is state another unit or the embedder owns; this host
+        // is neither, so it refuses at load rather than inventing a zero the program never set.
+        if let ExternType::Global(_) = imp.ty() {
+            bail!(
+                "extern global `{name}` is declared but `vl run` provides no globals — build it \
+                 with `vl build` and link it against the unit or host that exports `{name}`"
+            );
+        }
         let ExternType::Func(ft) = imp.ty() else {
             bail!("extern `{name}` is not imported as a function");
         };
