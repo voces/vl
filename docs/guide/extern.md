@@ -133,8 +133,17 @@ wasm-merge facade.wasm extern ua.wasm ua ub.wasm ub -o linked.wasm --rename-expo
 
 After the merge every call is direct and every global access reads or writes the defining unit's
 global; no `extern` import is left. The facade's exact shape is in
-`docs/internals/cli-design.md`, "the facade recipe". `export const` is published immutable, so the
-importer must declare it `extern const`; an `extern let` of it fails to link. An `export let` in a
+`docs/internals/cli-design.md`, "the facade recipe".
+
+An `export const` with a constant initializer (`export const width = 8`) is published immutable,
+so the importer must declare it `extern const`; an `extern let` of it fails to link. An `export
+const` whose initializer is not constant (`export const seed = hash(1)`) is published MUTABLE:
+its value is written by the module's start function, and wasm cannot initialise an immutable
+global that way. Import that one with `extern let` — an `extern const` of it fails with a
+`LinkError`. A binding named `memory` is not published in a module that uses linear memory,
+because the memory export takes that name.
+
+An `export let` in a
 module you import rather than build stays an ordinary VL export, and one of any other type (a
 string, a list, a struct) is not published to the host at all.
 

@@ -203,6 +203,25 @@ Deno.test({
       if (!/LinkError/.test(err) || !/width/.test(err)) {
         throw new Error(`want a LinkError naming width, got ${err || "a clean link"}`);
       }
+      // The converse: an `export const` set by the start function is a MUTABLE export, so an
+      // `extern const` of it does not link and an `extern let` does.
+      await Deno.writeTextFile(
+        `${dir}/s.vl`,
+        "function hash(x: i32): i32 { return x * 31 }\nexport const seed = hash(1)\n",
+      );
+      const s = await build(dir, `${dir}/s.vl`, "s");
+      await Deno.writeTextFile(`${dir}/sc.vl`, "extern const seed: i32\nprint(seed)\n");
+      await Deno.writeTextFile(`${dir}/sl.vl`, "extern let seed: i32\nprint(seed)\n");
+      let serr = "";
+      try {
+        await linkV8([s, await build(dir, `${dir}/sc.vl`, "sc")]);
+      } catch (e) {
+        serr = String(e);
+      }
+      if (!/LinkError/.test(serr)) {
+        throw new Error(`want a LinkError for extern const of a start-set export, got ${serr}`);
+      }
+      expectEq("extern let of it", await linkV8([s, await build(dir, `${dir}/sl.vl`, "sl")]), "31");
     }),
 });
 
