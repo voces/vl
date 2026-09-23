@@ -9,7 +9,7 @@
 //      Always runs under the usual gate (`SELFHOST_NATIVE_ALIGN=1` + binary + seed).
 //   2. binaryen `wasm-merge`, folding the units into ONE module, then the release `-O3` flag
 //      set over the result. Needs `node_modules/.bin`, which `ci-native` does not install, so it
-//      self-ignores there and runs on a developer box and in `scripts/gate.sh`.
+//      self-ignores there; the `ci-release-shape` job names this file and runs it with npm deps.
 //
 // @test-timing native
 
