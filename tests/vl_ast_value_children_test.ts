@@ -236,9 +236,18 @@ Deno.test("json_walk: both recursive walks take their children from `nodeValueCh
     !jw.includes("jwKids"),
     "compiler/json_walk.vl mentions `jwKids` — the second child walker is back",
   );
-  const uses = jw.split("const ks = nodeValueChildren(ix)").length - 1;
+  // Each walk loops along an `else if` chain's spine (D1990), so it reads the spine form, which
+  // is `nodeValueChildren` with the chain's next link left out.
+  const uses = jw.split("const ks = nodeValueSpineChildren(cur)").length - 1;
   assert(
     uses === 2,
-    `json_walk.vl reads nodeValueChildren at ${uses} sites; jwSubst and jwArmDisturbs are 2`,
+    `json_walk.vl reads nodeValueSpineChildren at ${uses} sites; jwSubst and jwArmDisturbs are 2`,
+  );
+  const ast = read("compiler/ast.vl");
+  const at = ast.indexOf("export function nodeValueSpineChildren(");
+  const body = ast.slice(at, ast.indexOf("\n}\n", at));
+  assert(
+    at >= 0 && body.includes("nodeValueChildren(ix)"),
+    "compiler/ast.vl's nodeValueSpineChildren no longer answers from nodeValueChildren",
   );
 });

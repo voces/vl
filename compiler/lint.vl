@@ -51,8 +51,9 @@ import {
   P,
   declHasExportKw,
   declNameTokOf,
+  elseIfLink,
   externGlobalLinkOfNode,
-  nodeChildren,
+  nodeSpineChildren,
   nodeToks,
   stmtAlwaysExits,
 } from "./ast"
@@ -337,11 +338,16 @@ function nameReassignedIn(ix: i32, name: string) {
       if plainIdentName(n.binLeft) == name { return true }
     }
   }
-  let i = 0
-  const kids = nodeChildren(ix)
-  while i < kids.length {
-    if nameReassignedIn(kids[i], name) { return true }
-    i = i + 1
+  // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
+  let cur = ix
+  while cur >= 0 {
+    let i = 0
+    const kids = nodeSpineChildren(cur)
+    while i < kids.length {
+      if nameReassignedIn(kids[i], name) { return true }
+      i = i + 1
+    }
+    cur = elseIfLink(cur)
   }
   false
 }
@@ -524,11 +530,16 @@ function blockMutates(ix: i32, recvName: string, key: i32) {
       }
     }
   }
-  let i = 0
-  const kids = nodeChildren(ix)
-  while i < kids.length {
-    if blockMutates(kids[i], recvName, key) { return true }
-    i = i + 1
+  // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
+  let cur = ix
+  while cur >= 0 {
+    let i = 0
+    const kids = nodeSpineChildren(cur)
+    while i < kids.length {
+      if blockMutates(kids[i], recvName, key) { return true }
+      i = i + 1
+    }
+    cur = elseIfLink(cur)
   }
   false
 }
@@ -556,11 +567,16 @@ function subtreeHasCall(ix: i32) {
   if ix < 0 || ix >= P.nodes.length { return false }
   const n = P.nodes[ix]
   if n is Call { return true }
-  let i = 0
-  const kids = nodeChildren(ix)
-  while i < kids.length {
-    if subtreeHasCall(kids[i]) { return true }
-    i = i + 1
+  // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
+  let cur = ix
+  while cur >= 0 {
+    let i = 0
+    const kids = nodeSpineChildren(cur)
+    while i < kids.length {
+      if subtreeHasCall(kids[i]) { return true }
+      i = i + 1
+    }
+    cur = elseIfLink(cur)
   }
   false
 }
@@ -580,12 +596,17 @@ function blockRereadsAsBang(ix: i32, recvName: string, key: i32) {
       }
     }
   }
-  let i = 0
-  const kids = nodeChildren(ix)
-  while i < kids.length {
-    const hit = blockRereadsAsBang(kids[i], recvName, key)
-    if hit >= 0 { return hit }
-    i = i + 1
+  // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
+  let cur = ix
+  while cur >= 0 {
+    let i = 0
+    const kids = nodeSpineChildren(cur)
+    while i < kids.length {
+      const hit = blockRereadsAsBang(kids[i], recvName, key)
+      if hit >= 0 { return hit }
+      i = i + 1
+    }
+    cur = elseIfLink(cur)
   }
   -1
 }
@@ -608,12 +629,17 @@ function blockRereads(ix: i32, recvName: string, key: i32) {
       if sameKey(n.idxIndex, key) { return ix }
     }
   }
-  let i = 0
-  const kids = nodeChildren(ix)
-  while i < kids.length {
-    const hit = blockRereads(kids[i], recvName, key)
-    if hit >= 0 { return hit }
-    i = i + 1
+  // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
+  let cur = ix
+  while cur >= 0 {
+    let i = 0
+    const kids = nodeSpineChildren(cur)
+    while i < kids.length {
+      const hit = blockRereads(kids[i], recvName, key)
+      if hit >= 0 { return hit }
+      i = i + 1
+    }
+    cur = elseIfLink(cur)
   }
   -1
 }
@@ -772,11 +798,17 @@ function lintVisitAll(ix: i32) {
 function lintWalk(ix: i32) {
   if ix < 0 || ix >= P.nodes.length { return 0 }
   lintVisitAll(ix)
-  const kids = nodeChildren(ix)
-  let i = 0
-  while i < kids.length {
-    lintWalk(kids[i])
-    i = i + 1
+  // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
+  let cur = ix
+  while cur >= 0 {
+    if cur != ix { lintVisitAll(cur) }
+    const kids = nodeSpineChildren(cur)
+    let i = 0
+    while i < kids.length {
+      lintWalk(kids[i])
+      i = i + 1
+    }
+    cur = elseIfLink(cur)
   }
   0
 }
@@ -1195,12 +1227,26 @@ function urcStmtFlags(ix: i32) {
   } else if s is Block {
     return urcBlockFlags(s.blkStmts)
   } else if s is IfStmt {
-    if !urcExprClean(s.ifCond) { return 0 }
-    const f = urcStmtFlags(s.ifThen)
-    // A missing `else` IS a clean fall-through: the condition being false skips
-    // the arm entirely. This is what spares the `if n == 0 { return 0 }` guard.
-    if s.ifElse >= 0 { return f | urcStmtFlags(s.ifElse) }
-    return f | URC_FALL
+    // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
+    let acc = 0
+    let cur = ix
+    while cur >= 0 {
+      const c = P.nodes[cur]
+      cur = -1
+      if c is IfStmt {
+        if !urcExprClean(c.ifCond) { return acc }
+        acc = acc | urcStmtFlags(c.ifThen)
+        // A missing `else` IS a clean fall-through: the condition being false skips
+        // the arm entirely. This is what spares the `if n == 0 { return 0 }` guard.
+        if c.ifElse < 0 { return acc | URC_FALL }
+        if P.nodes[c.ifElse] is IfStmt {
+          cur = c.ifElse
+        } else {
+          return acc | urcStmtFlags(c.ifElse)
+        }
+      }
+    }
+    return acc
   } else if s is WhileStmt {
     if !urcExprClean(s.whileCond) { return 0 }
     // A loop body may run zero times, so the loop always falls through cleanly;
@@ -1602,11 +1648,17 @@ function bindScan(ix: i32) {
     bindTrim(mark)
   } else {
     nameVisit(ix)
-    const kids = nodeChildren(ix)
-    let i = 0
-    while i < kids.length {
-      bindScan(kids[i])
-      i = i + 1
+    // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
+    let cur = ix
+    while cur >= 0 {
+      if cur != ix { nameVisit(cur) }
+      const kids = nodeSpineChildren(cur)
+      let i = 0
+      while i < kids.length {
+        bindScan(kids[i])
+        i = i + 1
+      }
+      cur = elseIfLink(cur)
     }
   }
   0
