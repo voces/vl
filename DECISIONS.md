@@ -6213,7 +6213,8 @@ unreachable-code lint and the emitter alike, because all four read the one rule
 `stmtAlwaysExits` (D1970), which gains one arm: an expression statement whose call's type is
 `never`. The checker marks such a call from its type (`callNever`, beside `callRestPacked`), so an
 imported or aliased `never` function counts; the parse-only lint pass, which runs no checker,
-marks calls by name to `__trap__` and to this file's `: never` declarations.
+marks calls by name to `__trap__` and to this file's `: never` declarations, dropping any name
+the file also binds as a parameter, local or other function (a shadowing callback returns).
 
 - **`never` is the bottom type it already was** (assignable to everything, nothing but itself
   assignable to it), now SPELLABLE — but only as a function's declared return type. As a
@@ -6223,7 +6224,9 @@ marks calls by name to `__trap__` and to this file's `: never` declarations.
   call is refused. `while true` does not count yet (D1973's rule is the one to extend).
 - **Value position:** the join drops `never`, so `if c { 1 } else { fail("x") }` is `i32`; the
   emitter follows every never-typed call with `unreachable`, whose polymorphic stack satisfies
-  any blocktype. A `: never` function lowers with no result, like `void`.
+  any blocktype. A `: never` function lowers with no result, like `void` — and so does a never
+  RESULT inside a function TYPE, wherever the emitter spells one (closure signatures, list
+  elements, a generic pinned by a never function), since the reps have no `never`.
 - **A `never` value is not stored:** an un-annotated binding, an object field and a list element
   initialised by one are refused (the slot would take a type no value has, and was invalid wasm
   when bound). An annotated binding, an argument and a `return` accept one — nothing arrives.
