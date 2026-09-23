@@ -1334,6 +1334,39 @@ The two that decide the rest:
 needs no compiler change. It is range-checked at compile time and folds to one
 `f32x4.extract_lane` at `-O`/`-O3` (doc §A7).
 
+### scope-exit-cleanup — how does a VL block run code on every exit? — raised 2026-09-23
+
+**A language build item, filed by owner ruling.** `docs/internals/fs-streaming-design.md` §6
+Q1 was RULED (owner, 2026-09-23): `std:fs` gets **no file handle until VL has scope-exit
+cleanup**. VL has no destructor, no `defer`, no `using`, and WasmGC has no finalizer, so a
+value cannot run code when it becomes unreachable and a block cannot run code when it exits.
+An explicit `closeFile` would therefore leak on every early `return` the caller forgot to pair
+with it (`std-api-review.md` §3's "must be paired with a cleanup call"). The same wall stands
+in front of any future std resource: a lock, a child process kept open, a socket, or a
+`bufferMark`/`bufferRelease` pair.
+
+**Witness.** No program can express it today; that is the gap. The dependent surface is the
+handle sketch in `fs-streaming-design.md` §4(b), and its measured benefit is that doc's
+reopen table: about 1 µs per call, a few percent at MiB-sized writes.
+
+**Options.**
+(a) **`defer <stmt>`** (Go, Zig): runs at block exit in reverse order. It is small and fully
+explicit, but the caller still has to remember to write it.
+(b) **`using const f = …`** (TS/Deno, C#): the binding's type declares a cleanup function,
+which runs at scope exit. It pairs the cleanup with the TYPE, so a std resource cannot be
+opened without it. It needs a way to declare the cleanup (a well-known `"dispose"`
+function, like the `"[]"` dispatch).
+(c) **`Drop`-like, type-driven and implicit** (Rust): the cleanup runs whenever a value's
+owner goes out of scope. That needs ownership or move semantics VL does not have, because a
+copied `new i32` handle has no single owner.
+(d) **None**: std resources stay handle-free, with positional one-shot calls only (today's
+state).
+
+**Recommendation: none yet.** This entry makes the dependency visible. A design doc owes
+the interaction with early `return`, `break` out of a loop, a trap (which ends the instance,
+so no cleanup can run), and closures that capture the resource. (a) and (b) are both
+additive syntax.
+
 ## Dismissed — filed as owner rulings, verified NOT open
 
 Kept so the same 22 are not re-swept. `ALREADY-RULED` = the answer exists elsewhere; `SHIPPED` = the code already does it; `STALE-PREMISE` = the question rests on something no longer true; `NOT-AN-OWNER-CALL` = ordinary work, or a measurement settles it.

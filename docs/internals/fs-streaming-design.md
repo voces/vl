@@ -1,9 +1,17 @@
-# Streaming and positional file output in `std:fs` — design proposal
+# Streaming and positional file output in `std:fs` — design, ruled
 
-**Status: PROPOSAL, 2026-09-23, awaiting the owner rulings in §6.** Nothing here is built.
+**Status: RULED (owner, 2026-09-23), not yet built.** The six questions in §6 are answered,
+and §5 is the surface they settle, with its build items. §1–§4 are the proposal as the owner
+read it and are kept as the record. The ruled surface is not the one §4 recommended: no
+`…From` names, an `appendFile`, and contiguous writes only.
 Consumer: plumb (`~/plumb/docs/vl-issues.md` PL-020, and the queued PL-009 "streaming I/O").
-Every `std:fs` export this adds goes through the `std-api-reviewer` pass before it merges;
-§7 is this proposal's own pass against `std-api-review.md`, so the reviewer starts from it.
+Every `std:*` export this adds goes through the `std-api-reviewer` pass. §7 is the review of
+the ruled surface.
+
+**These are std APIs, but they are not frozen yet.** Owner, 2026-09-23: during this phase a
+std API may change if the change is documented. Two rulings below are stated as "for now"
+(Q4's contiguity rule and Q1's no-handle rule), and either may relax later without a
+deprecation.
 
 ---
 
@@ -74,7 +82,7 @@ anything — only to be cheap, which §4(b) measures.
 
 ---
 
-## 4. The options
+## 4. The options (the proposal as ruled on; §5 is what was chosen)
 
 ### (a) Whole-file helpers only — `appendFile`
 
@@ -200,136 +208,265 @@ export function writeFileRangeFrom(
 
 ---
 
-## 5. Recommendation
 
-**Complete the matrix with (c) and (d): three exports, no handle, no append.**
+## 5. The ruled surface
 
-| | whole file | a window at a file offset |
-| --- | --- | --- |
-| write from a `u8[]` | `writeFile` (exists) | **`writeFileRange(path, offset, data)`** |
-| write from a `Buf` | **`writeFileFrom(path, src, srcOff, len)`** | **`writeFileRangeFrom(path, offset, src, srcOff, len)`** |
+**Three write names, each taking `u8[] | Buf`, plus one view helper in `std:buffer`.**
 
-Why this and not the others:
+| | whole file | at a file offset (contiguous) | at the end |
+| --- | --- | --- | --- |
+| `data: u8[] \| Buf` | `writeFile(path, data)` (widened) | **`writeFileRange(path, offset, data)`** | **`appendFile(path, data)`** |
+| a sub-range of a `Buf` | `buf.window(off, len)` passed as `data` (name open, below) | same | same |
 
-- It solves both asks. PL-020's 256 MB file goes out with ONE `writeFileFrom` and zero heap
-  copies; a file larger than memory goes out as `writeFileRangeFrom` windows of a reused `Buf`.
-  PL-009's generator buffers text into a `Buf` and flushes each full window with
-  `writeFileRangeFrom` — the buffering §4(b) shows is needed anyway.
-- It keeps `std:fs`'s header promise — *errors are values, nothing is ambient, no open
-  handles* — true. The one order dependence (start fresh with `writeFile(out, [])`) is a
-  single documented line, and forgetting it produces a file with a stale tail, not a leak.
-- It is the shape the read side already chose for the same reasons, so a caller who knows
-  `readFileRangeInto` can guess `writeFileRangeFrom` including its argument order.
-- It is cheap to build: two new floor slots, no new ABI shape (a `u8[]` in, i32/i64 scalars,
-  an i32 out), no host state.
-
-plumb's PL-020 loop under it:
+Draft signatures and consumer comments, each within `std-api-review.md` §4's 1–4 lines:
 
 ```vl
-import { Buffer } from "std:buffer"
-import { writeFileFrom, IoError } from "std:fs"
+// std:fs
+// Replace the file's contents with `data`, creating it when absent. A `Buf` is written
+// in place rather than copied, and `buf.window(0, used)` writes only its filled part.
+// `writeFile(path, [])` empties the file: the fresh start before `appendFile` or
+// `writeFileRange`. Whether the replacement is atomic is the host's policy.
+export function writeFile(path: string, data: u8[] | Buf): IoResult
+
+// Write `data` over the file from byte `offset`, keeping every byte outside that range.
+// `offset` may be at most the file's current length, so a write can extend the file but
+// never leave a gap. A larger or a negative offset is `EINVAL`, and the message names the
+// offset and the length. Offset 0 creates a missing file.
+export function writeFileRange(path: string, offset: i64, data: u8[] | Buf): IoResult
+
+// Add `data` to the end of the file, creating it when absent. Running the same program
+// again appends again, so begin with `writeFile(path, [])` when the file should hold only
+// this run's output.
+export function appendFile(path: string, data: u8[] | Buf): IoResult
+
+// std:buffer
+// The `len` bytes of `self` from byte `off`, as a `Buf` over the same memory. Nothing is
+// copied, so a store through either one is seen through both. Traps naming the range
+// unless `[off, off + len)` lies inside `self`.
+export function window(self: Buf, off: i32, len: i32): Buf
+```
+
+**The union dispatch runs today.** A `u8[] | Buf` parameter narrowed by `if data is Buf`
+gives the right arm for an array literal, an annotated `u8[]` local, a `Buffer(16)` and a
+hand-written window. A function of the widened type also still binds to a
+`(string, u8[]) => i32` value, so widening `writeFile` breaks no existing caller that passes
+it as a value. (`/home/verit/vl/dist/vl`, `VL_STD` pinned to this tree, 2026-09-23. The
+programs are in §7.)
+
+**The view helper's name is open for the std review.** The owner asked that it read like the
+existing `f32view`/`i32view` and not like `slice`, which copies on arrays. Candidates:
+
+| name | for | against |
+| --- | --- | --- |
+| `window` (drafted above) | Says "part of the same bytes" and implies no element type. `buf.window(0, used)` reads naturally at a write call. | Not spelled like `f32view`. A generic word in a flat namespace, though an explicit import is what brings it into scope. |
+| `u8view` | Spelled like `f32view`/`i32view`, with the same `(self, off, count)` argument shape, and for bytes count equals length. | Those two return distinct view TYPES with `[]` indexing. This one returns a plain `Buf`, which has no `[]`, so the name over-promises. |
+| `view` | Short, and the family word. | Suggests the typed-view family without a width. The most collision-prone name of the four. |
+| `bufWindow` | Repeats the module, as `bufferMark`/`bufferRelease` do, so it is self-sufficient in a flat namespace. | Reads oddly as a method (`buf.bufWindow(…)`). |
+| `slice` | — | Refused by the owner: on arrays it means a copy. |
+
+**Known gap, accepted:** there is no copy-free partial write from a `u8[]`. `xs.slice(a, b)`
+copies. An explicit-offset form (`data, dataOff, len`) is additive and lands only if a
+consumer needs it.
+
+**Overloads were considered and not pursued.** Separate `u8[]` and `Buf` functions under ONE
+name would need ad-hoc overloading of named functions, and VL has none (`DECISIONS.md` B16:
+one binding per name per scope, with operators the only exception). Admitting it would also
+first need an answer to what the bare name means as a function VALUE. A union parameter gets
+one name per operation without either problem.
+
+plumb's PL-020 loop under the ruled surface:
+
+```vl
+import { Buffer, window } from "std:buffer"
+import { writeFile, IoError } from "std:fs"
 
 function writeStore(n: i32): IoError | null {
   const buf = Buffer(256 * 1024 * 1024)
   for i in 0 to n - 1 {
     const used = assembleDataFile(i, buf)            // fills buf, answers bytes used
-    const e = writeFileFrom(dataPath(i), buf, 0, used)
+    const e = writeFile(dataPath(i), buf.window(0, used))
     if e != null { return e }
   }
   null
 }
 ```
 
-**Not recommended now: appendFile (§6 Q2) and handles (§6 Q1).** Handles should wait for a
-scope-exit construct; when one exists the positional exports above stay correct and a handle
-adds only the few percent §4(b) measured.
+A file larger than memory, or PL-009's generator, reuses one `Buf` and flushes each full
+window with `appendFile(out, buf.window(0, used))` after one `writeFile(out, [])`. To patch a
+header after the body is written, use `writeFileRange(out, 0, header)`.
 
 **Build items** (one PR, native-only like the rest of the floor):
 
-1. `compiler/typecheck.vl` — slots 15 `__fs_write_range__` and 16 `__fs_write_from__` in
-   `fsIntrinsicSlot` / `fsIntrinsicNameAt` / `fsIntrinsicCount`, their `declare`s and per-arg
-   `u8[]` kinds; `fsSlotWritesMemory` → covers slot 16. `compiler/driver.vl` — two `blPush` rows.
-2. `scripts/vl-host/src/main.rs` and `scripts/wasmtime-host.rs` — both handlers; the write
-   LOOPS until done (`write_all_at`), so a short count is never success.
-3. `tests/support/runWasm.ts` — two names in the throwing-stub list.
-4. `std/fs.vl` — the three exports and a header line; `deno task gen-std`; a
-   `docs/internals/std-notes.md` §`std:fs` entry for each choice below.
-5. Fixtures: an intrinsic pin (`tests/cases/intrinsics/`, `// @skip` for the V8 harness), a
-   native test writing a file larger than a `Buf` window, and a round-trip
-   `writeFileRangeFrom` → `readFileRangeInto` at an offset past 2^32.
-6. `std-api-reviewer` on the `std/fs.vl` diff.
+1. **Floor**, `compiler/typecheck.vl`: two slots at the END of `fsIntrinsicSlot` /
+   `fsIntrinsicNameAt` / `fsIntrinsicCount`, with their `declare`s and per-arg `u8[]` kinds,
+   and two `blPush` rows in `compiler/driver.vl`:
+   - 15 `__fs_write_at__(path: u8[], offset: i64, data: u8[], mode: i32) -> i32`
+   - 16 `__fs_write_from__(path: u8[], offset: i64, addr: i32, len: i32, mode: i32) -> i32`
+
+   `mode` is 0 replace (`O_TRUNC`, offset ignored), 1 at offset (no truncate), or 2 append
+   (`O_APPEND`, offset ignored). It is a floor argument that no caller spells, so the three
+   exports carry the distinction by name. `fsSlotWritesMemory` becomes "touches memory" and
+   covers slot 16. The existing `__fs_write__` (slot 1) keeps serving `writeFile`'s `u8[]` arm.
+2. **Contiguity**, in the hosts: mode 1 opens the file, `fstat`s THAT descriptor, and answers
+   `-EINVAL` when `offset > size`. Checking the open descriptor narrows the check-then-write
+   window to one open file. std rejects a negative offset before the call. On `EINVAL` from a
+   non-negative offset, std asks `__fs_size__` for the length its message names. That number
+   is the length when the error is reported, which is the one a caller can act on.
+3. **Hosts**: `scripts/vl-host/src/main.rs` and `scripts/wasmtime-host.rs`. Both handlers LOOP
+   until every byte is written (`write_all` / `write_all_at`), so a short count is never
+   success. Slot 16 reads `data()[addr..addr+len]` in place and answers `-EFAULT` outside the
+   memory, mirroring `__fs_read_into__`.
+4. **`tests/support/runWasm.ts`**: two names in the throwing-stub list.
+5. **`std/fs.vl`**: widen `writeFile`, add `writeFileRange` and `appendFile`, and rewrite the
+   header's does-not-do line within its 10 lines ("no open handles, no truncation to a
+   length, no gaps"). **`std/buffer.vl`**: the view helper under its reviewed name. Then run
+   `deno task gen-std` and add a `docs/internals/std-notes.md` `std:fs` entry for the union
+   source, contiguity and append choices.
+6. **Fixtures**: an intrinsic pin for each slot (`tests/cases/intrinsics/`, `// @skip` for the
+   V8 harness), plus native tests for:
+   - a `Buf` window round-trip through `writeFile` → `readFileInto`;
+   - `appendFile` twice doubling a file, and `writeFile(p, [])` resetting it;
+   - `writeFileRange` at `size` extending the file, at `size + 1` refused with both numbers
+     in the message, and at an offset past 2^32 on a file already that long;
+   - `window` trapping outside its `Buf`.
+7. **`std-api-reviewer`** on the `std/fs.vl` + `std/buffer.vl` diff. The design-level pass is
+   §7; the build still owes the diff-level pass.
 
 ---
 
-## 6. Questions for the owner
+## 6. Owner rulings
 
-**Q1 — Handles: not in v1, or explicit-close now?**
-(a) no handles until VL has a scope-exit construct; positional exports only — **recommended**;
-(b) a `FileHandle` with explicit `closeFile` now, accepting the leak and `EBADF` risks in §4(b);
-(c) handles as a build item gated on a `using`/`defer` language design, filed now so the
-dependency is visible. (a) and (c) are compatible: recommend (a) now plus filing (c).
+**Q1 — Handles.** **RULED (owner, 2026-09-23): (a) no file handle** until VL has scope-exit
+cleanup. Why: a handle with no `defer`/`using`/`Drop` backstop leaks on every forgotten early
+return, and positional writes already cover the need. Scope-exit cleanup is filed as a
+language design item: `open-rulings.md` §D `scope-exit-cleanup`, and the matching row in
+`ROADMAP.md`'s owner-ruling table. A handle is reconsidered once that lands. The positional
+exports stay correct beside it.
 
-**Q2 — `appendFile`?**
-(a) not now — `writeFileRange` with a caller-held offset covers every single-writer case and is
-idempotent — **recommended**; (b) add `appendFile(path, data: u8[])` alongside, as the name
-callers from Node/Python will look for; (c) add it only when a consumer needs `O_APPEND`'s
-cross-process atomicity (a shared log), which positional writes cannot provide.
+**Q2 — `appendFile`.** **RULED (owner, 2026-09-23): (b) add `appendFile` now**, against the
+proposal's recommendation (a). Why: familiarity for logs. It is the name Node and Python
+callers look for, and a log is the common append-only file. Its comment carries the
+non-idempotence warning: running the program again appends again, and a fresh start is
+`writeFile(path, [])`.
 
-**Q3 — How is the `Buf` source window spelled?**
-(a) explicit `(srcOff, len)` checked against `src.length` — **recommended**, mirrors
-`readFileInto`'s `dstOff` and adds nothing to `std:buffer`; (b) a checked `std:buffer` export
-`bufWindow(self: Buf, off, len): Buf` and a bare `src: Buf` parameter — fewer arguments here,
-one more std name, and it would also serve other APIs taking a `Buf`; (c) whole `Buf` only —
-refused: a buffer's capacity is not its fill.
+**Q3 + Q6 — How a `Buf` source is spelled, and whether `u8[]` positional writes earn a
+place.** **RULED (owner, 2026-09-23): one union source, `data: u8[] | Buf`**, on `writeFile`
+(an additive widening), `writeFileRange` and `appendFile`. That makes three write names, with
+no `…From` variants. A partial write from a `Buf` goes through a new bounds-checked, copy-free
+window helper in `std:buffer` that returns a `Buf` (Q3's option (b), named to match
+`f32view`/`i32view` rather than `slice`; §5 lists the candidates). Why: one name per operation instead of a 2×2 matrix. The window
+helper also serves every other API that takes a `Buf`. Accepted gap: no copy-free partial
+write from a `u8[]` (§5). Overloads were not pursued (B16, §5).
 
-**Q4 — Offset past the end of the file.**
-(a) zero-fill the gap, as `pwrite` does everywhere — **recommended**; (b) `EINVAL` when
-`offset > fileSize`, which costs a `stat` and a TOCTOU window and forbids patch-last formats.
+**Q4 — Offset past the end of the file.** **RULED (owner, 2026-09-23): (b), writes are
+contiguous for now.** An offset greater than the file's current length is refused with an
+error naming both numbers, and `setFileLength` is deferred (it can be added later). Why: a
+gap is refused because nothing needs one yet, and refusing now keeps a later relaxation
+additive. This is the ruling most likely to relax, for example for patch-last archive formats
+that write out of order, under the owner's standing note that std may change in this phase
+if the change is documented.
 
-**Q5 — Is a truncate primitive owed?**
-(a) no — `writeFile(out, [])` starts a file fresh, and a file that must END shorter than its
-previous contents is written fresh — **recommended**; (b) `setFileSize(path, size: i64)`
-(`ftruncate`) now, for rewriting in place without a fresh start.
-
-**Q6 — Does the `u8[]` positional write earn its place, or `Buf`-sourced only?**
-(a) both — text generators hold `encodeUtf8` output as `u8[]`, and the 2×2 matrix is what
-makes the names guessable — **recommended**; (b) `Buf`-sourced only, one export fewer, at the
-cost of every `u8[]` caller staging into a `Buf` first (the copy this design removes).
+**Q5 — A truncate primitive.** **RULED (owner, 2026-09-23): (a) none.** Why:
+`writeFile(path, [])` starts a file fresh, and a file that must end shorter is written fresh.
 
 ---
 
-## 7. `std-api-review.md` self-assessment of the recommended surface
+## 7. std API self-review of the ruled surface (`std-api-review.md`)
 
-- **§0 embedded map.** Build item 4 regenerates `std/embedded.ts`; `tests/std_embedded_test.ts` checks it.
-- **§1 conventions.** lowerCamelCase ✓. Union return annotated (`IoResult`) ✓. Path-first, not
-  `self`-first — the module's existing, header-stated deviation, applied uniformly ✓. Names
-  self-sufficient in a flat namespace and repeat the module (`writeFile…`) ✓. The family is
-  uniform: `Range` = at a file offset, `Into`/`From` = through a `Buf`, the same suffixes in
-  the same positions as the read side; `writeFileAt` is avoided for the reason `readFileAt` was
-  (it reads as "the file at a path") ✓. Header gains "no append" in its does-not-do line.
-- **§2 ambient/stateful.** None added: no cursor, no descriptor table; each write answers its
-  own `-errno` directly, as `writeFile` does, and the errno cell is not read. ✓
-- **§2 order dependence.** One, stated: streaming a file assumes it was started fresh. It
-  cannot be typed; it goes in `writeFileRange`'s comment as its edge case. NOTED DEVIATION.
-- **§2 boolean parameters.** None exported. The floor's `truncate: i32` is a host-import
-  argument no caller spells; two exports carry the distinction by NAME, which is what §2 asks.
-- **§2 caller-owned buffers.** `Buf` sources are admitted on the measurement §2 demands:
-  `bulk-copy-design.md` §B (the copy is 368 MB/s and 75% of the staged read) plus the memory
-  argument in §1 — a second 256 MB copy, and a file larger than the heap unwritable. NOTED.
-- **§2 silently lossy.** The kept tail and the zero-filled gap are named in the comment, not
-  silent. `writeFileFrom` replaces the file, as `writeFile` does, and says so.
-- **§2 names that over-promise.** `writeFileRange` does not truncate and its name does not say
-  "file replaced" — `writeFile` and `writeFileFrom` are the two that replace. ✓
-- **§2 second error channel / duplication.** None; `IoResult` throughout. `writeFileFrom` ≠
-  `writeFileRangeFrom(…, 0, …)` — the first truncates. The `u8[]`/`Buf` pairs mirror the read side. ✓
+The build still owes the `std-api-reviewer` pass on its diff (build item 7). This section is
+the design-level pass. The reviewer agent's verdict on it follows at the end.
+
+- **§0 embedded map.** Build item 5 regenerates `std/embedded.ts`, and
+  `tests/std_embedded_test.ts` checks it.
+- **§1 conventions.**
+  - lowerCamelCase ✓.
+  - Union returns annotated (`IoResult`) ✓.
+  - Path-first rather than `self`-first ✓. This is `std:fs`'s existing deviation, stated in
+    its header and applied uniformly. `window` is `self`-first, as every `std:buffer` export is.
+  - Names repeat the module and stand alone in a flat namespace: `writeFile…`, `appendFile` ✓.
+  - `Range` means "at a file offset", the same suffix in the same position as `readFileRange`.
+    `writeFileAt` was avoided for the same reason `readFileAt` was: it reads as "the file at
+    a path" ✓.
+  - The read side's `Into` suffix now has no `From` mirror. The READ side needs `Into`
+    because the destination type changes the return type (`u8[]` against a count), while a
+    write returns `IoResult` whatever the source. NOTED ASYMMETRY.
+- **§2 ambient or stateful.**
+  - No cursor and no descriptor table. Each write answers its own `-errno` directly, as
+    `writeFile` does, and does not read the errno cell ✓.
+  - `appendFile`'s offset is the file's current length, a state that the call both reads and
+    changes. NOTED DEVIATION, chosen by the owner (Q2) and stated in its comment.
+- **§2 order dependence.**
+  - Streaming a file assumes it was started fresh, and `appendFile` repeats on a rerun. The
+    types cannot state either, so both comments name `writeFile(path, [])` as the start.
+    NOTED DEVIATION.
+  - The contiguity rule makes `writeFileRange` calls partly order-dependent: chunk N+1 is
+    refused until chunk N has extended the file far enough. That is a loud `EINVAL`, not a
+    silent result.
+- **§2 boolean parameters.** None exported. The floor's `mode: i32` is a host-import argument
+  that no caller spells ✓.
+- **§2 caller-owned buffers.** A `Buf` source is admitted on the measurement §2 demands:
+  `bulk-copy-design.md` §B (the copy runs at 368 MB/s) plus the memory argument in §1 (a
+  second 256 MB copy, and a file larger than the heap cannot be written). NOTED. The window
+  aliases its parent by design, and its comment says so.
+- **§2 silently lossy.**
+  - `writeFileRange` keeps the old tail past the written range, and its comment says so.
+  - A gap is refused, not zero-filled, so nothing is invented ✓.
+  - `writeFile` replaces the file and says so.
+  - A forged `Buf` (`ROADMAP.md` row 35) writes whatever linear memory holds at its address.
+    That is the same trust the read side documents, and it is closed by row 35's newtype, not
+    here.
+- **§2 names that over-promise.** `writeFileRange` does not truncate, and nothing in its name
+  suggests it does. `appendFile` does what its name says. For the view helper, `u8view` is the
+  candidate that over-promises (see §5).
+- **§2 second error channel.** None: `IoResult` throughout. `window` TRAPS on a bad range,
+  which is `std:buffer`'s own convention (`storeBytes`, `loadBytes` and the views all trap),
+  not a second channel inside `std:fs` ✓.
+- **§2 duplicated functionality.**
+  - `appendFile(p, d)` is `writeFileRange(p, fileSize(p), d)` done in one call: the offset is
+    read and used atomically, and it survives a concurrent appender. It is kept by ruling.
+  - `writeFile(p, d)` is not the same as `writeFileRange(p, 0, d)`, because only the first
+    truncates.
+  - `window` does not duplicate `loadBytes`: that one copies into a NEW `u8[]`.
+- **§2 text siblings.** `writeTextFile` exists; no `appendTextFile` is proposed. Text is
+  encoded once with `encodeUtf8` at the call, as the header's "bytes first" line says. This is
+  a question for the review, not a ruling.
 - **§2 speculative.** Admitted under `std-design.md` D2's WASI-era clause (`std:fs` is named
-  there) with an external consumer, as `readFileInto` was for glean. The consumer is NOT in
-  the tree; say so in the PR, and prefer a dogfood script that writes a large output as the
-  in-tree fixture.
-- **§3 composability.** `if e != null` / `e is IoError` ✓; the error type and `Buf` are
-  already re-exported, so no second import ✓; no cleanup pairing ✓; the new slots are
-  `std:fs`'s own, no cross-module cell ✓.
-- **§4 documentation.** Draft comments above are 1–3 lines each, consumer-facing, no ids.
+  there), with an external consumer, as `readFileInto` was for glean. The consumer is NOT in
+  this tree, so build item 6 supplies in-tree fixtures.
+- **§3 composability.**
+  - `if e != null` and `e is IoError` work as they do on every other write ✓.
+  - `Buf` is already re-exported by `std:fs`, but `window` is not. A caller imports it from
+    `std:buffer`, as they already import `Buffer`.
+  - No cleanup pairing ✓.
+  - The new slots belong to `std:fs`, and there is no cross-module cell ✓.
+- **§4 documentation.** The draft comments in §5 are 3 or 4 lines each, written for a
+  consumer, with no ids. The `std:fs` header's does-not-do line must be rewritten within its
+  10 lines (build item 5).
 
-**Expected verdict: CONSISTENT WITH NOTED DEVIATIONS** — the start-fresh order dependence and
-the caller-owned source buffer, both justified above and both to be stated in `std/fs.vl`.
+The union-dispatch witnesses cited in §5, run with `VL_STD` pinned to this tree:
+
+```vl
+import { Buf, Buffer, store8 } from "std:buffer"
+function win(self: Buf, off: i32, len: i32): Buf {
+  if off < 0 || len < 0 || off > self.length - len { __trap__() }
+  return { base: self.base + off, length: len }
+}
+function sink(data: u8[] | Buf): i32 {
+  if data is Buf { return 1000 + data.length }
+  return data.length
+}
+const b = Buffer(16)
+store8(b, 0, 7)
+print(sink([1, 2, 3]))      // 3
+print(sink(b))              // 1016
+print(sink(win(b, 4, 5)))   // 1005
+const xs: u8[] = [9, 9]
+print(sink(xs))             // 2
+```
+
+and, for the widening, `const f: (string, u8[]) => i32 = sink2` where `sink2` takes
+`(path: string, data: u8[] | Buf)`, which prints `2` for a two-byte `u8[]`.
+
+**Self-assessed verdict: CONSISTENT WITH NOTED DEVIATIONS.** These are the start-fresh order
+dependence, `appendFile`'s ambient offset (ruled), the caller-owned source buffer, and the
+missing `From` mirror of `Into`. The view helper's name is left to the reviewer.
