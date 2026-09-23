@@ -91,17 +91,33 @@ not:
 | allocation-free | a struct, list or closure literal; string `+`; string interpolation |
 | effect-free | an assignment to anything but its own `let` locals; a read of a module `let` binding (the heap reachable from `self` or a module `const` stays readable, like linear memory) |
 | calls intrinsics and getters only | a user or std function, a method (`s.slice(…)`), a host `extern`, a function value (including one named like an intrinsic), a user operator (`"+"` or `"[]"` for a nominal type) |
-| no hidden loops | `==` `!=` `<` `<=` `>` `>=` over strings, lists, maps or structs; an index into a map; list `+` |
+| no hidden loops | `==` `!=` `<` `<=` `>` `>=` over two strings, or over lists, maps or structs; an index into a map; list `+`; float `%` |
+| bounded | a body costing more than 16 steps (below) |
 
 Allowed: `let` / `const` locals (a local ends with its block), `if` and `match` expressions,
 reads of `self`'s fields and of module `const`s, other getters, `as` conversions, comparisons
-of scalars and of literal unions (a tag compare), a test against `null`, a string's `.length`
-and byte index, float `%` (bounded by the float format), and every intrinsic that compiles to
-instructions with no effect but a trap: the scalar numeric ones (`sqrt`, `abs`, `floor`,
-`ceil`, `trunc`, `nearest`, `min`, `max`, `copysign`, `clz`, `ctz`, `popcnt`, `rotl`, `rotr`,
+of scalars and of declared literal unions (`type K = "a" | "b"`, a tag compare at no cost), a
+test against `null`, a string's `.length` and byte index, `==`, `!=` and `is` against a string
+literal (a compare that stops at the literal's length; a field typed `"a" | "b"` inline is
+stored as a string and counts as one), and every intrinsic that compiles to instructions with
+no effect but a trap: the scalar numeric ones (`sqrt`, `abs`, `floor`, `ceil`, `trunc`, `nearest`, `min`, `max`, `copysign`, `clz`, `ctz`, `popcnt`, `rotl`, `rotr`,
 `divU`, `remU`, the unsigned compares and the bitcasts), linear-memory `__load_*` reads, lane
 operations and `__trap__`. A trap, from `as!`, an integer division or `divU` by zero, is
 allowed: the program stops either way.
+
+**The step budget.** A getter may read other getters, so a body that looks small can do a lot
+of work: four reads of a getter that reads four more is sixteen reads behind one `.x`. The
+checker counts abstract steps and refuses a getter over **16**. Reading a getter costs 1 plus
+that getter's own cost; comparing with a string literal costs the literal's length (`is "ab" |
+"cd"` costs both, 4); an `if` or `match` costs its dearest arm, not the sum; arithmetic, field
+reads, conversions and intrinsics cost nothing. The refusal names the path that made the total:
+
+```
+the getter `a4` on C costs 340 steps (a4 → a3 (4×) → a2 (4×) → a1 (4×) → a0 (4×)), and a getter
+must cost at most 16 steps — make it a method: `function a4(self: C): i32`, called as `.a4()`
+```
+
+A chain over the budget is one error, at the getter no other over-budget getter reads.
 
 **The type rule.** A value's representation can allocate with no allocating syntax at all, so
 the result and every local must have a representation that never boxes: a scalar (or a brand of
@@ -122,7 +138,8 @@ method: `function full(self: Name): string`, called as `.full()`
 One mistake is one error: a `+` chain is refused once, a boxed result once (at the result
 type), and a function called three times once.
 
-The contract is deliberately conservative. It will be relaxed, never tightened.
+The contract is deliberately conservative: it may relax later (for instance into a lint), never
+the reverse. The budget's number, 16, is tuned as getters are used.
 
 ## What it costs
 
