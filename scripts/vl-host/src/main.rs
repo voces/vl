@@ -4647,6 +4647,197 @@ const OPT_PASSES: &[&str] = &["-O"];
 /// allocations and ZERO casts removed, on every fixture and on that module.
 const RELEASE_PASSES: &[&str] = &["--closed-world", "-O3", "--gufa", "-O3"];
 
+/// A callee at most this many body bytes, with no loop and no call to a defined function,
+/// may still be inlined into run-once code: its per-call work is too small for the tier to
+/// matter, and inlining is what lets a small producer's allocation melt at its use.
+const RUN_ONCE_INLINE_LEAF_BYTES: usize = 160;
+
+/// The binaryen names of the functions `-O`/`-O3` must NOT inline, because the only code
+/// that calls them runs once and calls them from inside a loop.
+///
+/// V8 (and so every Chromium browser) compiles each wasm function with its baseline
+/// compiler first and swaps in the optimizing one only at the function's NEXT call — there
+/// is no on-stack replacement for wasm. So code that runs once stays baseline code for the
+/// whole run. The start function runs once, and so does a function whose every call site
+/// sits outside any loop of run-once code (`function main() {...}; main()`). Unoptimized,
+/// a hot callee in such a loop is its own function, called many times, and V8 tiers it up;
+/// binaryen inlines a single-caller function wherever it is, which moves the hot work into
+/// the run-once body and leaves it on the baseline tier for good. Cranelift has one tier,
+/// so wasmtime is indifferent (DECISIONS.md, "`-O3` keeps hot callees out of run-once code").
+///
+/// The rule is per call site and binaryen's `--no-inline` is per callee, so a callee is
+/// marked only when EVERY direct call of it comes from run-once code — marking one that
+/// hot code also calls would cost that caller its inlining. A tiny loop-free leaf is left
+/// inlinable (`RUN_ONCE_INLINE_LEAF_BYTES`). Any module this cannot parse gets no marks,
+/// which is exactly the old behaviour.
+fn run_once_hot_callees(bytes: &[u8]) -> Vec<String> {
+    run_once_hot_callees_inner(bytes).unwrap_or_default()
+}
+
+fn run_once_hot_callees_inner(bytes: &[u8]) -> Option<Vec<String>> {
+    use std::collections::{HashMap, HashSet};
+    use wasmparser::{ElementItems, ExternalKind, Name, Operator, Parser, Payload, TypeRef};
+
+    struct Body {
+        size: usize,
+        has_loop: bool,
+        calls_defined: bool,
+        /// `(callee, inside a loop)` per direct call site.
+        calls: Vec<(u32, bool)>,
+    }
+    let mut n_imports = 0u32;
+    let mut start: Option<u32> = None;
+    // Functions reachable other than by a direct call: exported, or held as a reference.
+    let mut escapes: HashSet<u32> = HashSet::new();
+    let mut bodies: Vec<Body> = Vec::new();
+    let mut names: HashMap<u32, String> = HashMap::new();
+    for payload in Parser::new(0).parse_all(bytes) {
+        match payload.ok()? {
+            Payload::ImportSection(r) => {
+                for imp in r.into_imports() {
+                    if matches!(imp.ok()?.ty, TypeRef::Func(_) | TypeRef::FuncExact(_)) {
+                        n_imports += 1;
+                    }
+                }
+            }
+            Payload::StartSection { func, .. } => start = Some(func),
+            Payload::ExportSection(r) => {
+                for e in r {
+                    let e = e.ok()?;
+                    if e.kind == ExternalKind::Func {
+                        escapes.insert(e.index);
+                    }
+                }
+            }
+            Payload::ElementSection(r) => {
+                for el in r {
+                    match el.ok()?.items {
+                        ElementItems::Functions(fs) => {
+                            for f in fs {
+                                escapes.insert(f.ok()?);
+                            }
+                        }
+                        ElementItems::Expressions(_, es) => {
+                            for e in es {
+                                for op in e.ok()?.get_operators_reader() {
+                                    if let Operator::RefFunc { function_index } = op.ok()? {
+                                        escapes.insert(function_index);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Payload::CodeSectionEntry(body) => {
+                let mut b = Body {
+                    size: body.range().len(),
+                    has_loop: false,
+                    calls_defined: false,
+                    calls: Vec::new(),
+                };
+                // One entry per open block: whether it is a `loop`.
+                let mut ctrl: Vec<bool> = Vec::new();
+                let mut loops = 0usize;
+                for op in body.get_operators_reader().ok()? {
+                    match op.ok()? {
+                        Operator::Loop { .. } => {
+                            ctrl.push(true);
+                            loops += 1;
+                            b.has_loop = true;
+                        }
+                        Operator::Block { .. }
+                        | Operator::If { .. }
+                        | Operator::Try { .. }
+                        | Operator::TryTable { .. } => ctrl.push(false),
+                        Operator::End => {
+                            if ctrl.pop() == Some(true) {
+                                loops -= 1;
+                            }
+                        }
+                        Operator::Call { function_index }
+                        | Operator::ReturnCall { function_index } => {
+                            if function_index >= n_imports {
+                                b.calls_defined = true;
+                                b.calls.push((function_index, loops > 0));
+                            }
+                        }
+                        Operator::RefFunc { function_index } => {
+                            escapes.insert(function_index);
+                        }
+                        _ => {}
+                    }
+                }
+                bodies.push(b);
+            }
+            Payload::CustomSection(c) => {
+                if let wasmparser::KnownCustom::Name(r) = c.as_known() {
+                    for sub in r {
+                        if let Ok(Name::Function(map)) = sub {
+                            for n in map.into_iter().flatten() {
+                                names.insert(n.index, n.name.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let start = start?;
+    let defined = |f: u32| f >= n_imports && ((f - n_imports) as usize) < bodies.len();
+    if !defined(start) {
+        return Some(Vec::new());
+    }
+    let body = |f: u32| &bodies[(f - n_imports) as usize];
+    // Every direct call site, by callee: `(caller, inside a loop)`.
+    let mut callers: HashMap<u32, Vec<(u32, bool)>> = HashMap::new();
+    for (i, b) in bodies.iter().enumerate() {
+        for &(callee, in_loop) in &b.calls {
+            callers.entry(callee).or_default().push((n_imports + i as u32, in_loop));
+        }
+    }
+    // Run-once code: the start function, then every function reached only by direct calls
+    // outside any loop of run-once code. A fixpoint, since membership only grows.
+    let mut once: HashSet<u32> = HashSet::from([start]);
+    loop {
+        let before = once.len();
+        for (&f, sites) in &callers {
+            if !once.contains(&f)
+                && !escapes.contains(&f)
+                && defined(f)
+                && sites.iter().all(|&(c, in_loop)| once.contains(&c) && !in_loop)
+            {
+                once.insert(f);
+            }
+        }
+        if once.len() == before {
+            break;
+        }
+    }
+    let mut hot: Vec<u32> = callers
+        .iter()
+        .filter(|&(&f, sites)| {
+            defined(f)
+                && sites.iter().any(|&(_, in_loop)| in_loop)
+                && sites.iter().all(|&(c, _)| once.contains(&c))
+                && {
+                    let b = body(f);
+                    b.has_loop || b.calls_defined || b.size > RUN_ONCE_INLINE_LEAF_BYTES
+                }
+        })
+        .map(|(&f, _)| f)
+        .collect();
+    hot.sort_unstable();
+    // Binaryen names a function by its name-section entry, else by its index among the
+    // DEFINED functions — the names `--no-inline=<pattern>` matches against.
+    Some(
+        hot.into_iter()
+            .map(|f| names.get(&f).cloned().unwrap_or_else(|| (f - n_imports).to_string()))
+            .collect(),
+    )
+}
+
 /// Shell out to `wasm-opt` to rewrite the emitted module IN PLACE with one of the
 /// two rungs above.
 ///
@@ -4659,7 +4850,7 @@ const RELEASE_PASSES: &[&str] = &["--closed-world", "-O3", "--gufa", "-O3"];
 /// tests carry hand-written guards that exist only to detect this. A plain
 /// `vl build` never calls this function, so a toolchain without binaryen keeps
 /// working for every build that did not ask to be optimized.
-fn optimize_in_place(path: &str, flag: &str, passes: &[&str]) -> Result<()> {
+fn optimize_in_place(path: &str, flag: &str, passes: &[&str], no_inline: &[String]) -> Result<()> {
     let Some(opt) = binaryen_tool("wasm-opt", "VL_WASM_OPT") else {
         // The unoptimized module is already on disk at this point. Leaving it there
         // would re-open the hole from the other side: a caller that ignores the exit
@@ -4676,7 +4867,10 @@ fn optimize_in_place(path: &str, flag: &str, passes: &[&str]) -> Result<()> {
              or set $VL_WASM_OPT. (Build without {flag} to emit the unoptimized module.)"
         );
     };
+    // The marks go first: `--no-inline=` is itself a pass, and must run before the inliner.
+    let marks: Vec<String> = no_inline.iter().map(|n| format!("--no-inline={n}")).collect();
     let mut argv: Vec<&str> = vec![path];
+    argv.extend(marks.iter().map(String::as_str));
     argv.extend_from_slice(passes);
     argv.extend_from_slice(BINARYEN_FEATURES);
     argv.extend_from_slice(&["-o", path]);
@@ -6639,7 +6833,7 @@ fn build_cmd(args: &[String]) -> Result<()> {
     };
     let mut final_bytes: Option<Vec<u8>> = None;
     if let Some((flag, passes)) = opt_rung {
-        optimize_in_place(&sink_str, flag, passes)?;
+        optimize_in_place(&sink_str, flag, passes, &run_once_hot_callees(&bytes))?;
         final_bytes = Some(std::fs::read(&sink).map_err(|e| {
             Error::from(e).context(format!("reading back the {flag}'d `{out_label}`"))
         })?);

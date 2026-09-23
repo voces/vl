@@ -36,8 +36,10 @@ Deno.test({
             `the fence.`,
         );
       }
-      // (3) The stated fast pattern really is bare: no call and no check.
-      if (hoist.trap !== 0 || hoist.call !== 0) {
+      // (3) The stated fast pattern really is bare: no check, and no call but the ONE the
+      // run-once driver makes per trip — `-O3` keeps the kernel out of a driver that runs
+      // once (DECISIONS.md, "`-O3` keeps hot callees out of run-once code").
+      if (hoist.trap !== 0 || hoist.call > 1) {
         throw new Error(
           `${shape}-hoist is not bare at -O3: [trap,call] = [${hoist.trap},${hoist.call}]. ` +
             `The fast pattern documented in §M5 must lower to the intrinsic with ` +

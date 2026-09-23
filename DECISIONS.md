@@ -6501,3 +6501,81 @@ scratch), since ~85% of the peak is already live when checking ends; (2) store t
 type tables as parallel `i32[]` columns, not one GC struct per node, because every object pays
 a header; (3) have emit write bytes straight to the output buffer, not into intermediate lists.
 Today's policy puts plumb's REAL units (2 MB) at ~417 MB, which fits.
+
+## `-O3` keeps hot callees out of run-once code (2026-09-22) — lane L8
+
+**The defect.** V8 compiles every wasm function with its baseline compiler (Liftoff) first and
+swaps in TurboFan only at the function's NEXT call: there is no on-stack replacement for wasm.
+Code that runs once therefore runs as baseline code for the whole program. The start function
+runs once, and so does a `main()` that top-level code calls once. Unoptimized, a hot callee in
+such code's loop — plumb's `decode`, called 7M times from the top-level loop of
+`tools/decode-bench.vl` — is its own function, called many times, and tiers up. Binaryen inlines
+every single-caller function into its caller, so `-O`/`-O3` moved `decode`'s body into the start
+function and pinned it to Liftoff (`docs/internals/perf-decoder-gap-2026-09.md` §4, lane L8).
+Cranelift has one tier, so wasmtime never showed it; plumb ships to browsers, where it is the
+common case.
+
+**The rule.** Before calling `wasm-opt`, the host (`run_once_hot_callees` in
+`scripts/vl-host/src/main.rs`) reads the emitted module's call graph with `wasmparser` and
+passes `--no-inline=<name>` for every function that:
+
+1. is called directly from inside a `loop` of RUN-ONCE code — the start function, plus, to a
+   fixpoint, every function that is not exported or referenced and whose every direct call site
+   is in run-once code outside any loop;
+2. has no direct caller outside run-once code, since `--no-inline` is per callee and marking a
+   function that hot code also calls would cost that caller its inlining; and
+3. is not a tiny loop-free leaf (at most 160 body bytes, no loop, no call to a defined function):
+   inlining one of those costs next to nothing on the baseline tier and is what lets a small
+   producer's allocation melt at its use (`tests/fixtures/opt-melt/*` keep every count).
+
+Both rungs, since `-O` inlines single-caller functions too. A module the reader cannot parse
+gets no marks, which is the old behaviour. Nothing changes in the emitter or the module ABI.
+
+**Measured** on plumb's `decode-bench` (war3.exe, 6,964,856 instructions), CPU seconds, median of
+5 interleaved runs, load ~20. V8 is node 24 and deno 2.9 through a runner that exports the start
+function as `main` (JS cannot serve the fs imports during instantiation); wasmtime is `vl run`.
+
+| build | node (V8) | deno (V8) | wasmtime |
+| --- | --- | --- | --- |
+| unoptimized | 0.58 | 0.53 | 0.88 |
+| `-O`, before → after | 0.84 → **0.64** | 0.81 → **0.61** | 0.84 → 0.86 |
+| `-O3`, before → after | 0.83 → **0.65** | 0.82 → **0.62** | 0.86 → 0.80 |
+| `-O3`, the loop inside `main()`, before → after | 0.85 → **0.63** | 0.82 → **0.63** | 0.77 → 0.80 |
+
+The bench suite: 7 of 46 programs change shape, the rest are byte-identical at both rungs. Timed
+interleaved at `-O3`: V8 `algorithms/nbody` 4.31 → 2.36 s, `arrays/binsearch` 1.70 → 1.42 s,
+`strings/int-format` 5.02 → 3.68 s, the other four flat. wasmtime is flat within noise on six
+and pays on one: `strings/int-format` min 4.78 → 5.14 s (+7%), because `toString`, called 30M
+times from `main`'s loop, is now a call rather than inlined. That is the price, and it is taken
+on purpose: the same change is 1.36× the other way on V8, and the browser is the target `-O3`
+exists for.
+
+**The larger price is the view kernels** (`bench/buffer-view-bounds/`, buffer-design.md §M9).
+Each is a kernel called per trip from a run-once `main()`. The old `-O3` collapsed the kernel into
+the driver, which is what let four one-view kernels melt their descriptor — and made all eighteen
+1.4–4x SLOWER under V8 than the unoptimized module. Now V8 is back within 1.4x of the unoptimized
+module on every kernel (level with it on most), and under wasmtime those four lose the melt (1.4–1.7x slower: `scale-view`
+0.24 → 0.38 s) while three that never melted gain 1.8–2x (`axpy-view` 0.98 → 0.54 s). The melt
+is not lost for good: emit-time scalar replacement of a descriptor (lane L4) or a kernel spelled
+over hoisted accessors (§M8) does not depend on the driver absorbing its kernel. If the owner
+would rather keep wasmtime's melt, the narrower rule is to skip any callee that takes a GC
+reference parameter: that keeps `decode` and `toString` fixed and leaves every view kernel and
+`binsearch` as slow on V8 as before.
+
+**What was rejected.**
+* *Emit top-level code as a `$main` the start function calls, and mark `$main` no-inline* (the
+  lane's first idea). `$main` is called once too; the callee is inlined into `$main` instead, and
+  V8 measured 1.34–1.42 s against 1.57–1.59 s (one run, load 58) — most of the loss kept. The
+  problem is inlining INTO run-once code, not the start function as such.
+* *Export `_start` instead of using the start section.* Same reason, plus an ABI change for every
+  host.
+* *A code-annotation hint.* Binaryen 130 parses and preserves `@metadata.code.inline`, but its
+  inliner ignores it: a single-caller call marked `"\00"` (never) was inlined anyway, and a
+  two-caller function marked `"\7f"` (always) was not.
+* *`--one-caller-inline-max-function-size`.* It fixes the decoder (V8 0.69–0.71 s) but applies to
+  every caller, including hot ones, so it trades a targeted fix for a global loss of inlining.
+
+**What remains.** On V8, the unoptimized decoder (0.53–0.58 s) still beats `-O3` (0.62–0.65 s).
+Every hot loop is now out of run-once code, so that gap is somewhere else — plausibly `decode`
+itself, which absorbs its helpers into one 4,400-line function. SpiderMonkey and JavaScriptCore
+were not measured: neither is installed here (bun 1.0's JSC predates WasmGC).
