@@ -503,6 +503,46 @@ axis(
   (d) => twoFiles(d, genCovar(1400, 1400), genCovar(1400, 70)),
 );
 
+// `n` calls handing one record to a function that reads a parameter field `n` times. `wide`
+// declares the parameter with a field wider than the record's, so every call is a covariant
+// delivery whose write analysis walks the parameter's uses; the other arm delivers the record at
+// its own type. Without a memo per (parameter, widened slots) the wide arm is calls x uses (D2060).
+const genRecordCovar = (n: number, wide: boolean, recursive = false, filler = 4): string => {
+  const o = [
+    `type P = { x: ${wide ? "i32 | string" : "i32"}, n: i32 }`,
+    `function g(p: P${recursive ? ", k: i32" : ""}): i32 {`,
+    "  let s = 0",
+  ];
+  for (let i = 0; i < n; i++) o.push("  s = s + p.n");
+  if (recursive) o.push("  if k > 0 { s = s + g(p, k - 1) }");
+  o.push("  s", "}", "let acc = 0", "function main() {", "  const q = { x: 1, n: 1 }", "  let t = 0");
+  for (let i = 0; i < n; i++) {
+    o.push(recursive ? "  t = t + g(q, 1)" : "  t = t + g(q)");
+    fill(o, i, filler);
+  }
+  o.push("  print(t)", "}", "main()", "print(acc)");
+  return o.join("\n") + "\n";
+};
+
+// Both arms hand the same record to the same body the same number of times; only whether the
+// field widens differs, so the delivery analysis is the only thing that moves.
+axis(
+  "covariant record deliveries",
+  2.5,
+  "The D2060 record write analysis is re-walking the parameter's uses per delivery instead of reading `rcwMemo`.",
+  (d) => twoFiles(d, genRecordCovar(3500, true), genRecordCovar(3500, false)),
+);
+
+// The same pair through a callee that calls itself: the recursion cuts a cycle under every
+// delivery's first question, and an answer computed under a cut must still be banked at the
+// outermost question, or each delivery re-walks the uses (D2060).
+axis(
+  "covariant record deliveries to a recursive callee",
+  2.5,
+  "The D2060 memo is declining to bank a cut answer at the outermost open question (`rcwMemoPut`).",
+  (d) => twoFiles(d, genRecordCovar(5000, true, true, 0), genRecordCovar(5000, false, true, 0)),
+);
+
 // One function of `n` sibling blocks, each binding five temps and folding them into `acc` —
 // the shape a machine-code translator emits, one block per instruction. `temps` picks how
 // the temps are bound: `same` redeclares the same names in every block, `unique` gives each

@@ -3895,6 +3895,72 @@ compiler accepts". A refusal relabelled as a design rule is exactly the drift.
 running. Any future candidate for (a)–(d) re-grades against them in one command and has to say
 which of the 46 it costs.
 
+## Record depth covariance: the reads-only rule, field by field (D2060, 2026-09-22)
+
+`assignable` admits `{x: i32}` where `{x: i32 | string}` is declared — depth subtyping — and
+VL records alias exactly as lists do: the emitter hands the callee the caller's struct. So the
+covariant-array hole above has a record twin, and a store of `"s"` through the wider handle
+trapped `cast failure` at the caller's next `q.x + 1`. **No new semantics were chosen here.**
+The rule is the owner's A9 reads-only rule, already governing lists: a covariant delivery is
+legal exactly where nothing it reaches WRITES a widened slot.
+
+* **What counts as a widened slot.** Every field path whose type differs between the delivered
+  value and the destination (`.x`, `.inner.x`, `.xs[]`, a map's `[]`), including the slots of a
+  union member the value can be narrowed to. A slot owned by a fresh literal is exempt — no
+  other handle sees it — so `f({ x: 1 })` still runs when `f` writes `p.x`.
+* **How a write is found.** From the delivery, through the checker's occurrence index
+  (`cwIxBuild`, the list rule's own): a binding's every use, a parameter's body, a relay into a
+  further call, a closure capture, a store into another place, a `for` element, a `map`/`filter`
+  callback, a function-typed parameter (every argument its callers pass), a return (every call
+  of the function, method spellings included), `??`, an `if` arm. A value an expression
+  statement discards goes nowhere. A JOIN is a delivery: an operand narrower than the type a
+  list literal, an `if` value, a `??` or an inferred return joins it into is checked as
+  delivered there, and every delivery is decided after all bodies are checked. Writes a widened slot at any hop → refused at the delivery,
+  naming the write (and its file, across modules). Flow- and context-insensitive, frame-keyed,
+  like the list closure, and memoised per (binding, widened slots) so N deliveries to one
+  parameter cost one walk of its uses.
+* **Where it differs from the list rule, and why.** The list rule's third answer — "escapes
+  through a form the closure does not model" — keeps the emitter's decline, because a list has
+  a converting copy to fall back on. A record has none: the emitter aliases it, so the only
+  non-silent answer to an unfollowable handle (a function-typed parameter, a consumer the index
+  does not model) is the refusal. That is the price, and it is the D1686/D1687 shape: the list
+  twin was settled by a `readonly T[]` spelling, and the owner has since ruled the record one —
+  `{ readonly x }` bounds plus inferred read-only parameters (D-Q4 (c)). Filed as D2101, which
+  that build closes. The unfollowable handles are now function values held outside a parameter
+  (a list element, a record field) and chains past a depth limit of about a thousand calls.
+* **Where it meets the container rule** ("No implicit container widening", above). A delivered
+  list or map whose ELEMENT changes storage (`i32[]` into `f64[]`, a literal union into
+  `string`, a record into a boxed union, or an element still a type variable) is copied or
+  refused by the container rule, so no handle is shared and this rule stands aside. One that
+  keeps its storage is shared — a list of records whose fields widen, and D2161's `C[]` into
+  `(C | null)[]` — and this rule refuses a store the source's slot cannot hold. Whether such a
+  widening should be refused even where nothing writes is D2161's open question.
+* **What a delivered union is, and when a read ends the path.** A union (or nullable) source
+  delivered into a record is one of its members, so each member the record accepts contributes
+  its own widened slots. A read of a scalar out of the value holds no slot a store can reach, so
+  the path ends there — `it.qty * 10` is not an escape. A `match` arm is its value like an `if`
+  arm, a spread's elements stay at the same element slots, a rest parameter holds the packed
+  list, and a value the checker typed as an error gives no verdict.
+* **A value read back out of the source keeps the source's type.** Every store of anything else
+  into a widened slot is refused, so the slot only ever holds its source type, and `p.a = p.b`
+  (or `const t = p.a` then `p.b = t`) stores a value of that type. This is the one
+  flow-sensitive fact the rule uses; a value from ANOTHER argument's widened field would need
+  that argument's own type, which the rule does not track.
+* **A write is judged by its value's static type.** Each widened slot carries the SOURCE's own
+  type there; a store whose value type is assignable to it (`p.x = 5` into an `i32` source's
+  widened `x`) cannot break the source's rep and runs. A store of a value typed wider than the
+  source's slot — `"s"`, or a parameter typed `i32 | string` that happens to hold an `i32` — is
+  refused. The analysis is flow-insensitive, so a write in an `if` arm the run never takes is
+  refused too, and context-insensitive, so a function returning its parameter carries the
+  widened slots to every caller's result; those are the static price, recorded rather than
+  fixed. A value whose type is a type variable or an error type is unknown and refuses, and a
+  type parameter on the SOURCE side counts as widened — except by parametricity: when the
+  value entered a generic function at its only `T`-supplying parameter (`self: T[]`, and `T`
+  elsewhere only as a function parameter's argument type), every `T` in the body is one of that
+  slot's own values, so storing one back is a permutation (`sort`'s swaps) and runs. Every slot
+  `T` stands in must carry one source type, and a slot that also holds other values (another
+  list element, an earlier store) voids the argument.
+
 ## Default arguments v1: the expression is the DECLARATION's, the evaluation position is the CALL's (owner, 2026-09-01)
 
 **"let's do A — schedule in defaults, then we can do tracking."** Default arguments ship as a

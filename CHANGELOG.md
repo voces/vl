@@ -8,6 +8,26 @@ see **`DECISIONS.md`**.
 
 ## Type system (Track A)
 
+- **A record delivered covariantly is read-only in its widened fields (D2060).** `{ x: 1 }`
+  passed where `{ x: i32 | string }` is declared shares the struct, so a callee's `p.x = "s"`
+  trapped `cast failure` at the caller's next `q.x + 1`. The owner's reads-only rule for
+  covariant lists (A9) now applies field by field: every argument, `self`, bound, binding,
+  assignment, field, element and return delivery computes its widened slots, drops the ones a
+  fresh literal owns, and follows the destination through the list rule's occurrence index —
+  relays, closures, stores, loop variables, `map`/`filter` and function-parameter callbacks
+  (std `sort`/`reduce` included), returns, `??`, `if` arms, memoised per parameter. Joins are
+  deliveries too (a list literal's, an `if` value's, a `??`'s or an inferred return's narrower
+  operand), and every delivery is decided once all bodies are checked. A union join delivered into a
+  record is split into its members, a scalar read ends a path, `match` arms, spreads and rest
+  parameters are followed, and a value read back out of the source keeps its source type. A write to a widened slot
+  of a value the source's own slot type does not accept refuses the delivery, naming the write;
+  `p.x = 5` into an `i32` source still runs. An 840-cell grid (7 widenings × 12 positions × 5
+  callee behaviours × two faces): 278 traps, 280 invalid modules and 19 emit floors → check
+  rejects, 81 `runs` → 81. The price is D2101: a handle reaching a callee the checker cannot see
+  into (a list element, a record field) is refused, until `{ readonly x }` bounds and inferred
+  read-only parameters (D-Q4 (c)). D2100 files the read-only invalid-module face.
+  Fixtures `soundness/error-covariant-record-field-written.vl`,
+  `soundness/covariant-record-field-read-only-runs.vl`.
 - **A string-literal type reps as the atom wherever it lives, and a `const` bound to a literal
   has the literal's type (D2150, D2156, D2157; owner, 2026-09-23).** An inline `"a" | "b"` at a
   field, parameter, return, local, global, capture or type argument compared with `__str_eq__`;
