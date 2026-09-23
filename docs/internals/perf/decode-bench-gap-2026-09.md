@@ -127,7 +127,7 @@ so A1 and A2 compound.
 | --- | --- | --- | --- | --- | --- |
 | 1 | **Size the GC heap from the live set, not just the allocation rate.** Upstream: wasmtime's copying collector should grow when a collection's survivors are a large fraction of the semispace (L3(a) of the previous round, now with a second witness: the live set, not the heap floor). Host stopgap: `vl run`'s initial heap from 64 MiB to 256 MiB | **−16%** (0.97 → 0.80–0.81); up to −20% for a program shaped like `flat` | host: S. Upstream: S to file, the fix is theirs | host: +192 MiB committed for any program that allocates that much in total (the RSS table in the previous round's §3 applies unchanged). `vl test` keeps 8 MiB | `perf-decoder-gap-2026-09.md` L1/L3(a) |
 | 2 | **L4: emit-time inlining of small leaf functions plus scalar replacement of non-escaping structs.** `D` is the textbook case: built in `decode`, passed only to helpers that are candidates for inlining, never stored | **−10 to −14%**, and fewer collections as a side effect | M–L: needs an escape rule and the inliner to run first. A struct passed to a non-inlined call escapes | medium: an escape check has to be exact about closures, `self` arguments and returns. Needs a byte-identical-output check on the corpus plus the rep-fuzz gate | L4 (queued) |
-| 3 | **L9: an inline length test (and `ref.eq`) in front of `__str_eq__` for `==` against a literal** | **−3%** | S | low: a pure pre-check, the call stays the fallback | L9 (queued) |
+| 3 | **L9: an inline length test (and `ref.eq`) in front of `__str_eq__` for `==` against a literal** | **−3%** | S | low: a pure pre-check, the call stays the fallback | L9 (landed: −3.3% to −3.6% on wasmtime, every string `==`, not only a literal one) |
 | 4 | **Host: turn on wasmtime's inliner** (`Config::compiler_inlining(Inlining::Yes)`) on the user-program engine | −2 to −4% (the previous round measured 0% on an older module) | S (one line) | low for correctness. It costs compile time on a cold cache (cached since L5); measure `p0` before landing | new, host-side |
 | 5 | **Cheaper `[]`**: point a list literal with no elements at one shared immutable zero-length backing array per element type, allocating only at the first push | −1% | S | low, since push already grows at `len == cap`. Check every path that writes through a list's backing array without the grow test (`list[i] = v` at `i < len` cannot reach it, because len is 0) | new, small |
 | 6 | **Advice to plumb, no compiler change**: walk `.pdata` from the image, or keep `begin`/`end` in two `i32[]`, rather than holding 131 k small structs for the whole run | **−20%** today, on wasmtime only | S, their side | none | PL-014 follow-up |
@@ -138,7 +138,7 @@ L4 and L1 compound. After lanes 1–3 the benchmark would sit near 0.65 s per pa
 0.56–0.60 s, about 1.1–1.2×. What is left is Cranelift's per-access cost on WasmGC, which is the
 engine's to fix (the previous round's L3(b)–(d)).
 
-**Found on the way, not filed.** The following program is `vl check`-clean (rc 0) and then fails
+**Found on the way, filed as D2223.** The following program is `vl check`-clean (rc 0) and then fails
 in the emitter with `emitProgram: object literal field count does not match struct` (a clause-2
 violation by construction). A statement-position `{}` inside an `if` arm is typed as an empty
 statement block by the checker and lowered as an object literal by the emitter:
