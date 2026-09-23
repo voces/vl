@@ -6044,3 +6044,62 @@ NaN bit patterns have, which is why it alone stays a separately-gated, opt-in ti
 (`simd-design.md` §A4/§D/§O6) rather than something treated as deterministic-in-practice.
 `simd-design.md` §A4 and `serde-design.md` OQ-3 both carry a reconciling note pointing here; full
 rationale and the measurement table: `docs/internals/numeric-determinism-rulings.md` §4.
+
+## Linear memory is a layout contract: a unit owns only its heap window (owner, 2026-09-22) — plumb PL-003(a)
+
+**The old model was implicit: one module owns its linear memory from address 0.** Every VL
+program DEFINED and EXPORTED its memory, and `std:buffer`'s allocator started its bump pointer
+at a hard-coded 1024 and grew the memory on demand. Nothing else in a VL module touches linear
+memory — there is no data section, strings and lists are GC objects, and the compiler keeps no
+shadow stack — so the allocator was the whole of VL's claim on the address space, and it
+claimed all of it. **Separate compilation broke that.** plumb links ~150 separately compiled
+units with `wasm-merge` over ONE host-owned memory holding a 221 MB guest image at a fixed base;
+a unit that defines its own memory cannot share one, and two units that each allocate `Buf`s
+both start at 1024 and hand out the SAME address (measured: unit B's first `Buffer(16)` is unit
+A's, and overwrites it).
+
+**Ruled: a unit owns only its heap window `[base, limit)`, and nothing outside it.**
+
+- **`vl build --import-memory`** takes the memory as `(import "env" "memory" (memory 1))` —
+  wasm-ld's `--import-memory` spelling and name, min 1 page, no max, unshared — instead of
+  defining it. **It is NOT re-exported**: the host already holds the memory it supplied, and
+  N units each exporting `memory` is a FATAL `wasm-merge` name conflict (measured). Fixed name,
+  no `=<module>.<field>` override — nothing has asked for another, and it can be added without
+  breaking this spelling. A module that touches no linear memory has none to import; the flag
+  changes none of its bytes. `vl run` refuses the flag (exit 2): it has no memory to supply.
+- **The window is two immutable i32 globals**, the shape of wasm-ld's `__heap_base`, read by the
+  intrinsics `__heap_base__()` / `__heap_limit__()`. `std:buffer` starts its bump pointer at the
+  base, and a `Buffer` whose end would pass the limit TRAPS rather than growing into memory the
+  host owns; growth stays on demand inside the window. Defaults reproduce the old behaviour
+  exactly — base 1024, limit 2^31-8 (the largest 8-aligned i32 — the allocator's pre-existing 2 GiB overflow cap) — so a
+  single-module build is unchanged in behaviour.
+- **The flags set them: `--heap-base=<n>` / `--heap-limit=<n>`** (decimal or `0x`; the base a
+  nonzero multiple of 8, the limit a multiple of 8 at least the base). **Chosen over IMPORTED globals**, because
+  a window is per UNIT and an import is per NAME: under `wasm-merge`, N units importing
+  `env.__heap_base` would all receive the same value, so disjoint windows would need a unique
+  import name per unit and a host that knows them all. Baked into each unit's own global, the
+  window travels with the unit and the linker needs to know nothing. An imported spelling can be
+  added later beside this one if a host wants to place windows at load time.
+- **A code-only unit carries NO layout at all**: the globals exist only in a module that reads
+  one (in practice, one that imports `std:buffer`, directly or through `std:fs`), there is no
+  data section anywhere, and a unit of raw loads and stores over guest addresses is pure code
+  over the imported memory (pinned: no memory, global or data section).
+
+**What the contract does not cover yet**: a unit that pokes raw addresses through the bare
+intrinsics (`__store_i32__`) is trusted, as before — that is how a transliterated unit works on
+guest memory.
+
+**Linking to ONE memory is a recipe, not a VL mechanism.** Merged naively, `wasm-merge` keeps each
+unit's `env.memory` import as its own memory index — N memories bound to one object, which
+needs multi-memory. `wasm-merge` resolves an import against the input module whose NAME matches,
+so the recipe adds a provider named `env` that re-exports a single import:
+`(module (import "host" "memory" (memory 1)) (export "memory" (memory 0)))`, linked as
+`wasm-merge env.wasm env u0.wasm u0 u1.wasm u1 …`. Every unit's `env.memory` collapses onto that
+one memory, imported by the result as `host.memory`, and it validates without multi-memory. Two
+caveats: the provider cannot itself import `env.memory` (it would resolve against itself), and
+the merged module re-exports `memory` from the provider. The layout flags are parsed strictly —
+a misspelled, space-separated, valued or repeated layout flag exits 2 — because falling back to
+the default window silently puts a unit's heap at 1024, which may be inside the host's image.
+A `vl link` command wrapping the recipe is a separate follow-up. Pinned by
+`tests/vl_import_memory_test.ts`, including the two-unit collision, its fix, and the recipe's one
+memory.

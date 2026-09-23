@@ -211,6 +211,17 @@ Each now says so, in the shape the `concat`-vs-`+` bullet uses.
   the SPEC limit is unreachable from here and only host resource exhaustion produces the
   -1. Both hosts grow a 2 GiB request without complaint (wasmtime 47 and V8 alike,
   measured), which is why no corpus fixture pins that line.
+- **The heap window is the build's, not the module's.** `__heap_base__()` and
+  `__heap_limit__()` each lower to a `global.get` of an immutable global the emitter appends
+  only when a program reads one, set by `vl build --heap-base=/--heap-limit=` (defaults 1024
+  and 2^31-8). The allocator counts `bumpOff` from the base, so its global keeps a constant
+  initialiser and the module needs no start function.
+- **`Buffer`'s window check is one comparison, and that is load-bearing.** `byteLength >
+  limit - base` cannot overflow (the window lies in `[0, 2^31)`) and, because both ends are
+  multiples of 8, a length that passes still fits once rounded up — so it REPLACES the old
+  `next < base` overflow check instead of joining it. Adding it as a second check pushed
+  `Buffer` past the always-inline size `vl_view_descriptor_melt_test.ts` prices (§M4), and
+  the `Buf` stopped melting; a lazy "0 means unstarted" bump pointer did the same.
 - **`ALIGN` is a performance choice, not a correctness one.** Wasm's alignment immediate
   is a hint and every load/store here is legal at any address; the unaligned cases in
   `tests/cases/memory/` pin it.

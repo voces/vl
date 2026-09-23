@@ -234,6 +234,10 @@ import {
   gF64PrintIdx,
   gFsIdx,
   gFsUse,
+  gHeapBase,
+  gHeapGlobalIdx,
+  gHeapLimit,
+  gHeapUsed,
   gHelpF64Rem,
   gHelpMapProbe,
   gHelpMapProbeI32,
@@ -245,6 +249,7 @@ import {
   gHelpUtf8CpLen,
   gHelpUtf8Dec,
   gHelpUtf8Enc,
+  gImportMemory,
   gImports,
   gMemLogIdx,
   gNeedsF32Print,
@@ -612,6 +617,35 @@ export function setEmitNames(on: i32) {
   if on != 0 { gEmitNames = 1 } else { gEmitNames = 0 }
   0
 }
+
+// Host opt-in for importing the linear memory (see `gImportMemory`). Like `setEmitNames`
+// the driver never calls it, so the default emit is unchanged. Any nonzero `on` enables.
+export function setImportMemory(on: i32) {
+  if on != 0 { gImportMemory = 1 } else { gImportMemory = 0 }
+  0
+}
+
+// Host opt-in for a `std:buffer` heap window (see `gHeapBase`); the driver never calls it.
+// Refuses (-1, window unchanged) unless both ends are positive multiples of 8 and the limit is
+// at least the base: a base of 0 would make `base == 0` a real `Buf`.
+export function setHeapWindow(base: i32, limit: i32) {
+  if base <= 0 || (base & 7) != 0 { return -1 }
+  if limit < base || (limit & 7) != 0 { return -1 }
+  gHeapBase = base
+  gHeapLimit = limit
+  0
+}
+
+// Whether the last module emitted reads the heap window, for the host's warning about a
+// unit that shares a memory with no window of its own. 1 or 0.
+export function heapWindowRead(): i32 {
+  if gHeapUsed { return 1 }
+  0
+}
+
+// Whether this module takes its memory as the `env.memory` import rather than defining it.
+// A module that touches no linear memory has none to import, so the opt-in changes nothing.
+function memImported(): boolean { memUsed && gImportMemory != 0 }
 
 function emitReset() {
   // NOTE: `gImports` and `startStmts` are NOT reset here — they are assigned by
@@ -3581,6 +3615,8 @@ function emitModule(_stmts: i32[]) {
   // Intern the string-literal pool (its globals PRECEDE the user cells — every
   // user-global index below rides `userGlobalIdx`).
   collectStrPool()
+  // Placed by `emitGlobalSection`, which runs before any function body is emitted.
+  gHeapGlobalIdx = -1
 
   // Heap-type indices, in type-section order: standalone structs, then (for the union path)
   // the variant structs + box, the i32 array/list pair, each ref-list pair, the string-list
@@ -3636,9 +3672,9 @@ function emitModule(_stmts: i32[]) {
   }
 
   // Memory section (id 5, between function (3) and global (6)): one module-defined memory, min
-  // 1 page, no max. The host imports `imports.memory` instead; the native runner provides no
-  // memory import, so the module defines its own (same observable behavior). Emitted only when a memory intrinsic is used.
-  if memUsed {
+  // 1 page, no max. Emitted only when a memory intrinsic is used, and not at all when the
+  // host opted into importing it (`memImported`) — the import section then carries it.
+  if memUsed && !memImported() {
     const memPayload: i32[] = []
     const memPrev = wTarget(memPayload)
     wULEB(1) // 1 memory
@@ -3792,6 +3828,7 @@ function scanPrintUse() {
   gF32PrintIdx = 0
   memUsed = false
   memLogUsed = false
+  gHeapUsed = false
   // The fs tables are rebuilt from scratch, never patched: `scanPrintUse` is the single
   // writer and it runs once per module, so a stale row from a previous compile in the
   // same process would silently declare an import the program never calls.
@@ -3914,6 +3951,13 @@ function scanPrintUse() {
           pcallee.identName == "__memory_grow__"
         ) {
           memUsed = true
+        }
+        // The heap window is two globals a program pays for only when it reads one.
+        if (
+          pcallee.identName == "__heap_base__" ||
+          pcallee.identName == "__heap_limit__"
+        ) {
+          gHeapUsed = true
         }
         if pcallee.identName == "__log__" {
           memUsed = true
@@ -5378,6 +5422,20 @@ function emitImportSection(n: i32, typeOffset: i32, hasStart: i32) {
   // the host's `"imports"` module, occupying function indices 0..3 in this exact
   // order (the call lowering hardcodes them): __print_i32__, __print_bool__,
   // __print_char__ (all `(i32)->()`), __print_str_flush__ (`()->()`).
+
+  // An imported memory alone still needs the section; its entry trails every function import,
+  // and memory imports occupy their own index space, so no function index moves.
+  if gImports == 0 {
+    if memImported() {
+      const memOnlyPayload: i32[] = []
+      const moPrev = wTarget(memOnlyPayload)
+      wULEB(1)
+      emitMemoryImportEntry()
+      wTarget(moPrev)
+      wSection(2, memOnlyPayload)
+    }
+    return 0
+  }
   if gImports > 0 {
     const ftI32 = typeOffset + n + hasStart
     const ftVoid = ftI32 + 1
@@ -5406,6 +5464,7 @@ function emitImportSection(n: i32, typeOffset: i32, hasStart: i32) {
     nImports = nImports + fsImportCount()
     // …and one per declared extern, trailing the fs block.
     nImports = nImports + externCount()
+    if memImported() { nImports = nImports + 1 }
     wULEB(nImports)
     wName("imports")
     wName("__print_i32__")
@@ -5489,9 +5548,21 @@ function emitImportSection(n: i32, typeOffset: i32, hasStart: i32) {
       ftFs = ftFs + 1
       exim = exim + 1
     }
+    if memImported() { emitMemoryImportEntry() }
     wTarget(imPrev)
     wSection(2, importPayload)
   }
+  0
+}
+
+// One import entry: `(import "env" "memory" (memory 1))` — the limits the defined memory would
+// carry (min 1 page, no max, unshared), so the two shapes differ only in who supplies it.
+function emitMemoryImportEntry() {
+  wName("env")
+  wName("memory")
+  wU8(2) // import kind: memory
+  wU8(0) // limits flag 0x00: min only
+  wULEB(1) // min: 1 page
   0
 }
 
@@ -5566,13 +5637,19 @@ function emitGlobalSection() {
     nci = nci + 1
   }
   const np = gStrPoolTexts.length
-  if nCells + np > 0 {
+  // The heap-window pair trails the pool and every user cell, so no existing global moves.
+  let nHeap = 0
+  if gHeapUsed {
+    nHeap = 2
+    gHeapGlobalIdx = np + nCells
+  }
+  if nCells + np + nHeap > 0 {
     const globalPayload: i32[] = []
     // Bind the writer at `globalPayload` for the WHOLE global-section payload build, so
     // the count, each entry's valtype (`fbValtype`), mutability flag, and init constexpr
     // (`fb*` opcodes) all stream to `curBuf == globalPayload`. Restored before framing.
     const gPrev = wTarget(globalPayload)
-    wULEB(nCells + np)
+    wULEB(nCells + np + nHeap)
     // The string-literal pool first (indices 0..np-1, before the user cells): each entry an
     // immutable non-null string ref whose init constexpr builds the literal once
     // (`array.new_fixed` for the packed backing, then `struct.new` for the header) — every
@@ -5758,6 +5835,17 @@ function emitGlobalSection() {
       }
       gi = gi + 1
     }
+    // The heap window last: base then limit, immutable, at `gHeapGlobalIdx` and the next index.
+    if nHeap == 2 {
+      wU8(127) // 0x7f i32
+      wU8(0)   // immutable
+      fbI32Const(gHeapBase)
+      fbEnd()
+      wU8(127)
+      wU8(0)
+      fbI32Const(gHeapLimit)
+      fbEnd()
+    }
     wTarget(gPrev)
     wSection(6, globalPayload)
   }
@@ -5859,7 +5947,11 @@ function emitExportSection(_n: i32, wrapBase: i32) {
   // name `memory`, gated on the memory existing at all (`memUsed`, the same flag that decides
   // section 5) — so a program that never touches linear memory is byte-identical to before.
   // Automatic rather than a flag, since an unused memory has nothing to opt out of; a user `export function memory()` name collision is rejected loudly, the trade O4(i) makes.
-  if memUsed {
+
+  // An IMPORTED memory is not re-exported: its host already holds it, and N units each
+  // exporting `memory` is a fatal name conflict when a linker merges them.
+  const memExported = memUsed && !memImported()
+  if memExported {
     let mci = 0
     while mci < reExpNm.length {
       if reExpNm[mci] == "memory" {
@@ -5872,9 +5964,9 @@ function emitExportSection(_n: i32, wrapBase: i32) {
   }
   // An export-free program still omits the section unless the memory is exported, in which
   // case section 7 exists to carry that one entry — otherwise a memory-only module would lose its export.
-  if reExpNm.length == 0 && !memUsed { return 0 }
+  if reExpNm.length == 0 && !memExported { return 0 }
   let nExports = reExpNm.length
-  if memUsed { nExports = nExports + 1 }
+  if memExported { nExports = nExports + 1 }
   const exportPayload: i32[] = []
   const exPrev = wTarget(exportPayload)
   wULEB(nExports)
@@ -5895,7 +5987,7 @@ function emitExportSection(_n: i32, wrapBase: i32) {
   // The memory entry LAST, so every function export keeps the index it had — the
   // export section is order-insensitive to a host, but keeping the prefix identical
   // makes the A/B byte diff read as a pure append.
-  if memUsed {
+  if memExported {
     wName("memory")
     wU8(2)   // export kind: memory
     wULEB(0) // memory index 0 (the one module-defined memory)

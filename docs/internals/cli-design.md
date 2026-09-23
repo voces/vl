@@ -629,7 +629,34 @@ host path until the protocol is proven on `check`.
 | `--wat` | also dump a `.wat` beside the module (`wasm-dis`), AFTER optimization |
 | `--names` | embed the wasm `name` custom section (legible trap backtraces) |
 | `--no-validate` | skip the "will the engine instantiate this" check |
+| `--import-memory` | import the memory as `env.memory` instead of defining and exporting it |
+| `--heap-base=<n>` | first byte `std:buffer` may hand out (default 1024; nonzero multiple of 8) |
+| `--heap-limit=<n>` | one past the last; a `Buffer` past it traps (default 2^31-8; a multiple of 8) |
 | `--compiler <f>` | the compiler module to compile with |
+
+The three layout flags are parsed strictly: a misspelled `--heap-*`/`--import*` flag, the
+space-separated `--heap-base 0x10000`, `--import-memory=<anything>`, or a repeated layout flag
+exits 2 instead of quietly building the default layout. A unit that allocates from
+`std:buffer` under `--import-memory` with no `--heap-base` builds, with a warning: its heap
+starts at 1024, like every other such unit.
+
+#### Linking units to ONE memory (the provider recipe)
+
+`--import-memory` units each import `env.memory`. `wasm-merge` resolves an import against the
+input module whose NAME matches, so link a one-line provider named `env` first:
+
+```sh
+# env.wat: (module (import "host" "memory" (memory 1)) (export "memory" (memory 0)))
+wasm-as env.wat -o env.wasm
+vl build a.vl -o a.wasm --import-memory --heap-base=0x100000 --heap-limit=0x200000
+vl build b.vl -o b.wasm --import-memory --heap-base=0x200000 --heap-limit=0x300000
+wasm-merge env.wasm env a.wasm a b.wasm b -o linked.wasm \
+  --enable-gc --enable-reference-types --enable-bulk-memory --enable-tail-call
+```
+
+The result imports exactly one memory, `host.memory`, and needs no multi-memory support. The
+provider cannot itself import `env.memory`, and `linked.wasm` re-exports it as `memory`.
+Without the provider, `wasm-merge` keeps one memory import per unit (multi-memory).
 
 #### The output channel is RULED: a file by default, stdout only when asked
 
