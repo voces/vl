@@ -1828,7 +1828,7 @@ export function nulVariantIdxOfExpr(exprIx: i32, fnIx: i32) {
     // that OWNS the binding, so a nested initialiser resolves where it is written.
     const fli = frameLetOf(fnIx, e.identName)
     if fli >= 0 { return nulVariantIdxOfLetIn(fli, fnIx) }
-    const mli = moduleLocalLetOfUnique(emitRootIx, e.identName)
+    const mli = moduleLocalLetSeenFrom(fnIx, e.identName)
     if mli >= 0 { return nulVariantIdxOfLetIn(mli, -1) }
   }
   -1
@@ -2328,6 +2328,7 @@ export function exprNulScalarListKind(exprIx: i32, fnIx: i32): VKind | null {
   const elIfK = nulArmIfThenValueIx(exprIx)
   if elIfK >= 0 {
     if exprStringArray(elIfK, fnIx) { return "nulstrlist" }
+    if exprU8Array(elIfK, fnIx) { return "nulu8list" }
     if exprF32Array(elIfK, fnIx) { return "nulf32list" }
     if exprF64Array(elIfK, fnIx) { return "nulf64list" }
     if exprI64Array(elIfK, fnIx) { return "nuli64list" }
@@ -12286,6 +12287,7 @@ export function ifExprRefKind(ifIx: i32, fnIx: i32): VKind | null {
     hk == "f32list" ||
     hk == "f64list" ||
     hk == "i64list" ||
+    hk == "u8list" ||
     hk == "reflist"
   ) {
     return hk
@@ -12300,6 +12302,8 @@ export function ifExprRefKind(ifIx: i32, fnIx: i32): VKind | null {
   if ifJoinAtomMeetsString(ifIx, fnIx) { return "str" }
   if exprString(tv, fnIx) { return "str" }
   if exprStringArray(tv, fnIx) { return "strlist" }
+  // The packed byte list before every other list rung, which would claim its i32 elements (D2246).
+  if exprU8Array(tv, fnIx) { return "u8list" }
   // Scalar lists in `scalarListElemKind`'s own order — f32 before f64, since
   // `exprF64Array`'s typed-IR fast path would otherwise claim an `f32[]` join too.
   if exprF32Array(tv, fnIx) { return "f32list" }
@@ -12330,6 +12334,7 @@ export function ifExprRefKind(ifIx: i32, fnIx: i32): VKind | null {
     if exprNullableString(nlv, fnIx) { return "str" }
     const nsk = exprNulScalarListKind(nlv, fnIx)
     if nsk == "nulstrlist" { return "strlist" }
+    if nsk == "nulu8list" { return "u8list" }
     if nsk == "nulf32list" { return "f32list" }
     if nsk == "nulf64list" { return "f64list" }
     if nsk == "nuli64list" { return "i64list" }
@@ -15277,13 +15282,12 @@ function coalesceMvSlot(exprIx: i32, fnIx: i32) {
   -1
 }
 
-// True when a `m[k] ?? d` read over a nullable-value map (slot `cns`) stays nullable — i.e.
-// the default `d` is itself nullable (a bare `null`, or a nullable-typed default). `??`
-// coalesces on the read value being null, so a non-null default collapses the read to the
-// value's non-null kind; only a nullable default leaves it `V | null`.
+// True when a `m[k] ?? d` read over the map value slot `cns` stays nullable — i.e. the
+// default `d` is itself nullable (a bare `null`, or a nullable-typed default). A miss is the
+// read's null whether or not the value type admits one, so the slot's own nullability does
+// not enter: `m[k] ?? null` over `{[K]: V}` is `V | null` (D2247).
 export function coalesceStaysNullable(exprIx: i32, cns: i32, _fnIx: i32) {
   if cns < 0 { return false }
-  if !mvSlotNullable(cns) { return false }
   const e = P.nodes[unwrapParen(exprIx)]
   if e is BinExpr {
     if e.binOp == "??" {
@@ -26274,7 +26278,7 @@ export function exprNullableVariant(exprIx: i32, fnIx: i32) {
     // would answer speaks only while that frame's body is emitted (D1635).
     const fli = frameLetOf(fnIx, e.identName)
     if fli >= 0 { return nulVariantOfLetIn(fli, fnIx) }
-    const mli = moduleLocalLetOfUnique(emitRootIx, e.identName)
+    const mli = moduleLocalLetSeenFrom(fnIx, e.identName)
     if mli >= 0 { return nulVariantOfLetIn(mli, -1) }
     return false
   }
@@ -27453,7 +27457,7 @@ export function structIndexOfExpr(exprIx: i32, fnIx: i32) {
     // binding is no frame's `fnBody` and no global. Annotated only — an initializer resolves
     // against the frame it is written in, so reading one from outside can name a row other
     // than the local's, while an annotation reads the same anywhere (D1636).
-    const mli = moduleLocalLetOfUnique(emitRootIx, e.identName)
+    const mli = moduleLocalLetSeenFrom(fnIx, e.identName)
     if mli >= 0 && letHasAnnotation(mli) && !letIsVariant(mli, -1) {
       return structIndexOfLet(mli, -1)
     }
@@ -33643,6 +33647,22 @@ export function frameLetOf(fnIx: i32, name: string) {
   const fn = P.nodes[fnIx]
   if fn is FuncDecl { return parentLetOf(fn.fnBody, name) }
   -1
+}
+
+// The module-scope block binding a read of `name` in frame `fnIx` can denote, or -1 when that
+// frame binds the name itself — a parameter, a `let` or a loop variable shadows every module
+// block's binding of it, so a function's own `r` never takes the kind of a top-level block's `r`.
+// D2245.
+function moduleLocalLetSeenFrom(fnIx: i32, name: string) {
+  if fnIx >= 0 {
+    if paramIndexOf(fnIx, name) >= 0 { return -1 }
+    const fn = P.nodes[fnIx]
+    if fn is FuncDecl {
+      if parentLetOf(fn.fnBody, name) >= 0 { return -1 }
+      if parentLoopVarOf(fn.fnBody, name) >= 0 { return -1 }
+    }
+  }
+  moduleLocalLetOfUnique(emitRootIx, name)
 }
 
 // True if evaluating the expression at `exprIx` yields a string-keyed map: the

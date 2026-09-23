@@ -37,6 +37,7 @@ import {
   nodeTyIsNullable,
   nodeTyIsUnion,
   nodeTyIxOf,
+  nodeTyMapValExcludesNull,
   nodeTyName,
   nodeTyRecord,
   numLitUnionAliasName,
@@ -71,6 +72,7 @@ import {
   IsExpr,
   LetDecl,
   Member,
+  NullLit,
   NumLit,
   ObjLit,
   OptMember,
@@ -654,6 +656,37 @@ function drwWalk(ix: i32, ctx: i32) {
       if nodeTyExcludesNull(coalLhs) {
         capMemoNoteEdit()
         return n.binLeft
+      }
+      // `x ?? null` is `x` for every `x`: a null left selects a null default. Folded so the
+      // read lowers at its own nullable rep instead of through a coalesce whose arms assume
+      // the default is the non-null half (D2247).
+      if P.nodes[unwrapParen(n.binRight)] is NullLit {
+        capMemoNoteEdit()
+        return n.binLeft
+      }
+      // A read of a `{[K]: V}` map with a nullable default is `V | null`, a rep the fused
+      // get-with-default builds only for some values, so a re-readable one desugars to the
+      // null test, whose join every value rep lowers (D2248).
+      if coalLhs >= 0 && drwIsMapRead(n.binLeft) && exprReReadable(coalLhs) {
+        const mdRead = P.nodes[coalLhs]
+        if (
+          mdRead is Index &&
+          nodeTyMapValExcludesNull(mdRead.idxArr) &&
+          nodeTyIsNullable(unwrapParen(n.binRight))
+        ) {
+          const mdThen: i32[] = []
+          mdThen.push(n.binLeft)
+          const mdElse: i32[] = []
+          mdElse.push(n.binRight)
+          const mdIf = mkIf(
+            mkBinary("!=", n.binLeft, mkNull("null", n.pos), n.pos),
+            mkBlock(mdThen, n.pos),
+            mkBlock(mdElse, n.pos),
+            n.pos,
+          )
+          nodeTyCarry(mdIf, ix)
+          return mdIf
+        }
       }
       // D962 — `x ?? d` over a nullable value-union box desugars here rather than in an
       // emit arm, since the lowering names the operand twice and only a re-readable left
