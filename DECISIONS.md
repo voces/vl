@@ -5900,6 +5900,11 @@ three-way niche print), so building one is a codegen project with its own grid, 
 a surface decision. It stays where the design doc already had it, as
 `docs/internals/match-design.md`'s phasing item 5.
 
+**Superseded for the dense case (2026-09-22, plumb PL-001):** the chain stays the DESUGAR, and
+the emitter now lowers the chain an integer `match` built to one `br_table` when its literal
+set is dense. The surface, exhaustiveness and first-match semantics are unchanged; the rule and
+what stays a chain are `match-design.md` §"A dense integer match is a `br_table`".
+
 **Out of scope, and why.** RANGE patterns (`0..9 => …`) are a separate surface decision: a
 range needs its own grammar, an ordering rule at the type tier, and an overlap check that is
 not the equality check duplicates use — three decisions that should be taken together and with

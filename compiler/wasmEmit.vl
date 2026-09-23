@@ -14,6 +14,7 @@ import {
   fsRetIsVoid,
   inferRetNameOf,
   inferRetTyIxOf,
+  intMatchHeadAt,
   isNumIntrinsicName,
   isValueUnionName,
   isVarTyIxOf,
@@ -31,6 +32,7 @@ import {
   nodeLitMembersWithin,
   nodeNulLitUnionMemberTexts,
   nodeNumScalarBaseName,
+  nodeTyIntWidth,
   nodeTyIsLitUnion,
   nodeTyIsLitUnionAlias,
   nodeTyIsMap,
@@ -12599,6 +12601,14 @@ function emitIfExprRef(
   kind: VKind,
   slot: i32,
 ) {
+  if ifIx < 0 || ifIx >= P.nodes.length {
+    return emitFail("emitProgram: expected an if expression")
+  }
+  if !nodeTyIsNullable(ifIx) {
+    const sw = emitIntSwitch(body, ifIx, fnIx, 3, 0, kind, slot)
+    if sw < 0 { return -1 }
+    if sw > 0 { return 0 }
+  }
   const s = P.nodes[ifIx]
   if s is IfStmt {
     // An else-less `if` used as a value is `T | null` (DECISIONS.md "An else-less `if`
@@ -12771,6 +12781,11 @@ function emitRefIfArm(
 // Lower the if-expression at `ifIx` with a known blocktype byte `kind`, threading it
 // through the `else if` recursion so the whole chain shares one result rep.
 function emitIfExprAs(body: i32[], ifIx: i32, fnIx: i32, kind: i32) {
+  if !nodeTyIsNullable(ifIx) {
+    const sw = emitIntSwitch(body, ifIx, fnIx, 2, kind, "i32", -1)
+    if sw < 0 { return -1 }
+    if sw > 0 { return 0 }
+  }
   const s = P.nodes[ifIx]
   if s is IfStmt {
     // An else-less `if` used as a value is `T | null` (DECISIONS.md "An else-less `if`
@@ -19306,7 +19321,272 @@ function monoStaticGuardEndsBlock(stmtIx: i32, fnIx: i32) {
   false
 }
 
-function emitIfStmtStmt(body: i32[], s: IfStmt, _stmtIx: i32, fnIx: i32) {
+// ── a dense integer `match` as a `br_table` (PL-001) ─────────────────────────
+// The chain an integer `match` desugared to (`intMatchHeadAt`) lowers to one `br_table` over
+// nested blocks when its literal set is dense: at least 3 distinct values spanning fewer than
+// `2 * values + 8`; the rule is match-design.md §"A dense integer match is a `br_table`".
+
+// The value of integer pattern `patIx` (a `NumLit`, or `-` over one) as a 64-bit pair pushed
+// onto `out` as hi then lo; false for any other node.
+function switchLitPair(patIx: i32, out: i32[]) {
+  let numIx = patIx
+  let neg = false
+  const p = P.nodes[patIx]
+  if p is Unary {
+    if p.unOp != "-" { return false }
+    numIx = p.unArg
+    neg = true
+  }
+  const n = P.nodes[numIx]
+  if n is NumLit {
+    if numLexIsFloat(n.numText) { return false }
+    const pr = parseI64Pair(n.numText)
+    let hi = pr[0]
+    let lo = pr[1]
+    if neg {
+      let carry = 0
+      if lo == 0 { carry = 1 }
+      lo = 0 - lo
+      hi = (hi ^ -1) + carry
+    }
+    out.push(hi)
+    out.push(lo)
+    return true
+  }
+  false
+}
+
+// Collects arm `arm`'s case values from its condition — `scrut == lit`, or an `||` tree of
+// them over the SAME scrutinee node — into `vals`/`arms`; false on any other shape. A value
+// that is not a sign-extended `i32` declines, so every table key fits in an `i32`.
+function switchCondCollect(
+  condIx: i32,
+  scrutIx: i32,
+  arm: i32,
+  vals: i32[],
+  arms: i32[],
+) {
+  const c = P.nodes[condIx]
+  if c is BinExpr {
+    if c.binOp == "||" {
+      if !switchCondCollect(c.binLeft, scrutIx, arm, vals, arms) {
+        return false
+      }
+      return switchCondCollect(c.binRight, scrutIx, arm, vals, arms)
+    }
+    if c.binOp == "==" && c.binLeft == scrutIx {
+      const pr: i32[] = []
+      if !switchLitPair(c.binRight, pr) { return false }
+      if pr[0] != (pr[1] >> 31) { return false }
+      vals.push(pr[1])
+      arms.push(arm)
+      return true
+    }
+  }
+  false
+}
+
+// The scrutinee node of the chain condition `condIx` — the left operand of its leftmost
+// `==` — or -1 when the condition is not an `==`/`||` tree.
+function switchScrutOf(condIx: i32) {
+  let at = condIx
+  while at >= 0 {
+    const c = P.nodes[at]
+    if c is BinExpr {
+      if c.binOp == "==" { return c.binLeft }
+      if c.binOp != "||" { return -1 }
+      at = c.binLeft
+    } else {
+      return -1
+    }
+  }
+  -1
+}
+
+// The scrutinee's width for a `br_table`: 1 for a plain `i32` place, 2 for a plain `i64` one,
+// 0 when the chain stays — not an `Ident`, a union box, an atom, a float, or no recorded type.
+function switchScrutWidth(scrutIx: i32, fnIx: i32) {
+  if scrutIx < 0 { return 0 }
+  if !(P.nodes[scrutIx] is Ident) { return 0 }
+  const w = nodeTyIntWidth(scrutIx)
+  if w == 0 { return 0 }
+  if exprUnion(scrutIx, fnIx) || exprIsLitAtom(scrutIx, fnIx) { return 0 }
+  if exprIsF64(scrutIx, fnIx) || exprIsF32(scrutIx, fnIx) { return 0 }
+  if (w == 2) != exprIsI64(scrutIx, fnIx) { return 0 }
+  w
+}
+
+// One arm body of a switch in `mode`: 0 statement, 1 function tail, 2 scalar value of
+// blocktype `kind`, 3 ref value of `rk`/`slot`.
+function emitSwitchArm(
+  body: i32[],
+  blk: i32,
+  fnIx: i32,
+  mode: i32,
+  kind: i32,
+  rk: VKind,
+  slot: i32,
+) {
+  if mode == 2 { return emitBlockValueAs(body, blk, fnIx, kind) }
+  if mode == 3 { return emitRefIfArm(body, blk, fnIx, rk, slot, false) }
+  if blk < 0 || blk >= P.nodes.length {
+    return emitFail("emitProgram: a match arm has no body")
+  }
+  const b = P.nodes[blk]
+  if b is Block {
+    if mode == 1 { return emitStmtsTail(body, blk, fnIx) }
+    return emitStmts(body, blk, fnIx)
+  }
+  if mode == 1 { return emitStmtTail(body, blk, fnIx) }
+  emitStmt(body, blk, fnIx)
+}
+
+// Lowers the integer-`match` chain headed at `headIx` as a `br_table` in `mode` (see
+// `emitSwitchArm`): 1 when lowered, 0 when it declined having written nothing, -1 on an emit
+// failure. Arms are emitted in chain order — the collect pass's — so the let cursor stays in step.
+function emitIntSwitch(
+  body: i32[],
+  headIx: i32,
+  fnIx: i32,
+  mode: i32,
+  kind: i32,
+  rk: VKind,
+  slot: i32,
+) {
+  if !intMatchHeadAt(headIx) { return 0 }
+  const vals: i32[] = []
+  const arms: i32[] = []
+  const thens: i32[] = []
+  let scrutIx = -1
+  let cur = headIx
+  let elseBlk = -1
+  let walking = true
+  while walking {
+    const s = P.nodes[cur]
+    if s is IfStmt {
+      if scrutIx < 0 { scrutIx = switchScrutOf(s.ifCond) }
+      if scrutIx < 0 { return 0 }
+      if !switchCondCollect(s.ifCond, scrutIx, thens.length, vals, arms) {
+        return 0
+      }
+      thens.push(s.ifThen)
+      const next = s.ifElse
+      let more = false
+      if next >= 0 {
+        if P.nodes[next] is IfStmt { more = !intMatchHeadAt(next) }
+      }
+      if more {
+        cur = next
+      } else {
+        elseBlk = next
+        walking = false
+      }
+    } else {
+      return 0
+    }
+  }
+  const w = switchScrutWidth(scrutIx, fnIx)
+  if w == 0 { return 0 }
+  if elseBlk < 0 && mode >= 2 { return 0 }
+  const m = thens.length
+  let lo = vals[0]
+  let hi = vals[0]
+  let i = 1
+  while i < vals.length {
+    if vals[i] < lo { lo = vals[i] }
+    if vals[i] > hi { hi = vals[i] }
+    i = i + 1
+  }
+  // `hi - lo` wraps negative exactly when the true span passes 2^31, which is never dense.
+  const span = hi - lo
+  if span < 0 || span >= 2 * vals.length + 8 { return 0 }
+  // A repeated value keeps its FIRST arm, as the chain's first passing test does.
+  const table: i32[] = []
+  let t = 0
+  while t <= span {
+    table.push(m)
+    t = t + 1
+  }
+  let distinct = 0
+  i = 0
+  while i < vals.length {
+    const at = vals[i] - lo
+    if table[at] == m {
+      table[at] = arms[i]
+      distinct = distinct + 1
+    }
+    i = i + 1
+  }
+  if distinct < 3 || span >= 2 * distinct + 8 { return 0 }
+  // The outer frame carries the value in the value modes; every inner frame is void.
+  wU8(2) // 0x02 block
+  if mode == 3 { fbValtype(rk, slot) }
+  else if mode == 2 { wU8(kind) }
+  else { wU8(64) }
+  ctrlEnter()
+  const endDepth = ctrlDepth
+  fbBlock(64) // the else arm's frame, the `br_table` default
+  ctrlEnter()
+  let k = 0
+  while k < m {
+    fbBlock(64)
+    ctrlEnter()
+    k = k + 1
+  }
+  if emitExpr(body, scrutIx, fnIx) < 0 { return -1 }
+  if w == 2 {
+    // An i64 index `d = s - lo` is in range iff `d <u span + 1`; out of range selects the
+    // default slot `span + 1`, so no 64-bit value can wrap onto a case.
+    fbI64Const(lo >> 31, lo)
+    fbI32Bin(125) // 0x7d i64.sub
+    fbI32WrapI64()
+    fbI32Const(span + 1)
+    if emitExpr(body, scrutIx, fnIx) < 0 { return -1 }
+    fbI64Const(lo >> 31, lo)
+    fbI32Bin(125) // 0x7d i64.sub
+    fbI64Const(0, span + 1)
+    fbI32Bin(84) // 0x54 i64.lt_u
+    fbSelect()
+  } else if lo != 0 {
+    // i32 subtraction wraps mod 2^32 and `br_table` reads its index unsigned, so `s - lo`
+    // lands in `[0, span]` exactly when `s` is in `[lo, hi]`.
+    fbI32Const(lo)
+    fbI32Bin(107) // 0x6b i32.sub
+  }
+  wU8(14) // 0x0e br_table
+  wULEB(span + 1)
+  t = 0
+  while t <= span {
+    wULEB(table[t])
+    t = t + 1
+  }
+  wULEB(m) // default: the else arm's frame
+  k = 0
+  while k < m {
+    fbEnd()
+    ctrlLeave()
+    if emitSwitchArm(body, thens[k], fnIx, mode, kind, rk, slot) < 0 {
+      return -1
+    }
+    fbBr(ctrlDepth - endDepth)
+    k = k + 1
+  }
+  fbEnd()
+  ctrlLeave()
+  if elseBlk >= 0 {
+    if emitSwitchArm(body, elseBlk, fnIx, mode, kind, rk, slot) < 0 {
+      return -1
+    }
+  }
+  fbEnd()
+  ctrlLeave()
+  1
+}
+
+function emitIfStmtStmt(body: i32[], s: IfStmt, stmtIx: i32, fnIx: i32) {
+  const sw = emitIntSwitch(body, stmtIx, fnIx, 0, 64, "i32", -1)
+  if sw < 0 { return -1 }
+  if sw > 0 { return 0 }
   // A-exhaust: the LAST arm of a chain the checker PROVED exhaustive is reached only when its
   // test holds, so it lowers as the bare `else` — no comparison, no `if` frame. The narrowing
   // still runs, since the arm reads its own member's fields (`condProvenTrue`).
@@ -19365,6 +19645,13 @@ function emitIfStmtStmt(body: i32[], s: IfStmt, _stmtIx: i32, fnIx: i32) {
   return 0
 }
 
+// Whether `condIx` is the literal `true` (through parentheses).
+function condIsLitTrue(condIx: i32) {
+  const c = P.nodes[unwrapParen(condIx)]
+  if c is BoolLit { return c.boolVal == 1 }
+  false
+}
+
 function emitWhileStmtStmt(body: i32[], s: WhileStmt, _stmtIx: i32, fnIx: i32) {
   // structured while loop: block (void) wrapping a loop (void). The condition is
   // checked at the top; if false, exit the block; otherwise run the body then continue
@@ -19380,10 +19667,13 @@ function emitWhileStmtStmt(body: i32[], s: WhileStmt, _stmtIx: i32, fnIx: i32) {
   ctrlEnter()
   loopContDepth.push(ctrlDepth)
   loopContLabel.push(s.whileLabel)
-  // condition + eqz: if condition is false (zero), exit block
-  if emitExpr(body, s.whileCond, fnIx) < 0 { return -1 }
-  fbI32Eqz() // 0x45 i32.eqz (invert: exit if condition was false)
-  fbBrIf(1)  // 0x0d br_if, depth 1 = break out of block
+  // condition + eqz: if condition is false (zero), exit block. A literal `true` never exits,
+  // so it writes no test at all.
+  if !condIsLitTrue(s.whileCond) {
+    if emitExpr(body, s.whileCond, fnIx) < 0 { return -1 }
+    fbI32Eqz() // 0x45 i32.eqz (invert: exit if condition was false)
+    fbBrIf(1)  // 0x0d br_if, depth 1 = break out of block
+  }
   // the body is a narrowing scope (the checker's `checkWhileStmtNode` narrows it): the
   // condition is re-tested every iteration, so a `while e != null { … }` body reads `e`
   // unboxed. Pushed after `loopHoistOpen`, so the once-run hoist prologue sees the
@@ -20157,6 +20447,12 @@ function emitStmtTail(body: i32[], stmtIx: i32, fnIx: i32) {
 // position): each arm is lowered with its last statement tail-aware (`emitStmtsTail`).
 // Mirrors `emitStmt`'s void-if shape, but routes the arm bodies through the tail path.
 function emitIfTail(body: i32[], stmtIx: i32, fnIx: i32) {
+  if stmtIx < 0 || stmtIx >= P.nodes.length {
+    return emitFail("emitProgram: emitIfTail: not an if statement")
+  }
+  const sw = emitIntSwitch(body, stmtIx, fnIx, 1, 64, "i32", -1)
+  if sw < 0 { return -1 }
+  if sw > 0 { return 0 }
   const s = P.nodes[stmtIx]
   if s is IfStmt {
     // D932 — the tail-position twin of `emitIfStmtStmt`'s dead-arm skip, same byte-read
