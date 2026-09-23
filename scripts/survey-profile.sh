@@ -12,6 +12,9 @@ set -u
 cd "$(dirname "$0")/.."
 PY="${PYTHON:-python3}"
 VL="${VL:-scripts/vl-host/target/release/vl}"
+# The profiled self-compile runs under the null collector by choice, as every self-compile
+# script pins it (DECISIONS.md, "The compiler's collector is picked by the size of the entry file").
+export VL_COMPILE_GC=null
 SEED="${SEED:-build/vl-compiler.wasm}"
 DOC=docs/internals/code-quality-survey-2026-09/README.md
 export VL_STD="$PWD/std"

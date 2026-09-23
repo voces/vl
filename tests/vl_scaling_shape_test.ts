@@ -466,7 +466,8 @@ axis(
 // appending in a loop, one through std's hand-rolled code-point builder (`str.join`), which
 // has always been linear. The builder arm is the baseline the append arm has to match.
 //
-// `vl run` compiles too, and that fixed ~0.05 s lands on BOTH arms, so it dilutes the ratio
+// `vl run` compiles too — the VL compile always, the engine's compile unless the module
+// cache hits — and that fixed cost lands on BOTH arms alike, so it dilutes the ratio
 // rather than inflating it — the bar is an upper bound and dilution can only make this
 // weaker, never a false red. The floor is the pair's own (0.05 s, not `FLOOR`): both arms
 // finish well under 0.4 s now, and `FLOOR` would divide the append arm by 0.4 and pass a

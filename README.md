@@ -92,6 +92,19 @@ The cache is content-keyed, self-healing and size-bounded (a few seeds' worth; o
 entries are retired as new ones land) — delete it and the next run rebuilds it, and if
 the directory is unwritable `vl` still works, just without the speedup.
 
+**The modules your programs compile to are cached the same way.** `vl run x.wasm`,
+`vl run x.vl`, `vl run --batch` and `vl test` keep the engine's native compile of each module
+under `modules/` in that same directory, keyed on the module's bytes (SHA-256) and the engine
+configuration, so running an unchanged program again skips the compile — 0.3–0.5 s on a
+100 KB module, most of a short run. Each entry carries a digest the host checks before
+loading it; one that fails is recompiled and rewritten. The directory is pruned back to
+`$VL_CACHE_MAX_MB` (default 512) least-recently-used first, at most once a minute.
+`VL_NO_CACHE=1` turns this cache off (the compiler's own cache above is unaffected), and
+`VL_CACHE_TRACE=1` prints `hit` / `miss` / `rejected (…)` per module on stderr. On Unix, `vl`
+uses a cache directory only if you own it and neither group nor others can write it (it
+creates its own with mode 0700); anything else runs uncached, since a file planted there would
+be loaded as native code. On Windows the default `%LOCALAPPDATA%` is already per-user.
+
 `$VL_GC` picks the garbage collector `vl run` gives your program — a pure runtime
 tuning dial, with no effect on what the program computes:
 `auto` (default; tracing, collects cycles) · `tracing` · `refcount` (shorter pauses,

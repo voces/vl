@@ -1,7 +1,8 @@
 // A SOURCE LARGER THAN 8M CODE POINTS COMPILES, WHOLE AND IN ORDER (D1975, reported by
 // plumb as PL-002).
 //
-// The compile store runs under the null collector, whose largest single allocation is
+// The compile store here runs under the null collector (pinned in `vl` below; a source
+// this size would otherwise get the copying one), whose largest single allocation is
 // 64 MiB. The host stages a source into the seed as UTF-32 code points, and the seed used
 // to collect them into ONE `i32[]` — which `.push`'s 2x growth takes to 2^24 slots (64
 // MiB) as soon as the source passes 2^23 code points. `strutil.CpAcc` now holds the stream
@@ -90,7 +91,9 @@ const vl = async (args: string[]): Promise<Res> => {
     args: [...args, "--compiler", COMPILER],
     stdout: "piped",
     stderr: "piped",
-    env: nativeEnv({ NO_COLOR: "1" }),
+    // These sources are past the size where `vl build`/`vl run` would pick the copying
+    // collector, and the trap this suite guards is the null collector's. Pin it.
+    env: nativeEnv({ NO_COLOR: "1", VL_COMPILE_GC: "null" }),
   }).output();
   return {
     code,
