@@ -350,14 +350,16 @@ Each now says so, in the shape the `concat`-vs-`+` bullet uses.
   linear memory is this call still needs section 5 emitted and section 7 to name it.
   `tests/cases/intrinsics/fs-read-into.vl` is the pin — it carries zero load, store or
   bulk-memory instructions and its module still exports a memory.
-- **`EFAULT` (21) is by number, deliberately**, on the same terms as `EFBIG`. The host
-  answers it when the destination window does not lie inside the memory, which a `Buf` from
-  `Buffer(n)` cannot produce — that call grows the memory to cover the extent — so naming
+- **`EFAULT` (21) is not an exported constant, deliberately**, on the same terms as `EFBIG`.
+  The host answers it when a `Buf` window does not lie inside the memory, which a `Buf` from
+  `Buffer(n)` cannot produce — that call grows the memory to cover the extent — so exporting
   the constant would add a permanent std name for a branch an allocating caller cannot take.
+  `errnoName` does render it (`EFAULT (a Buf outside linear memory)`), since #3064: the
+  message is what a caller with a forged `Buf` reads, and `errno 21` told them nothing.
   **The re-export widens who CAN take it**, which the API review found by writing the
   program: `Buf` is a structural type, so `const forged: Buf = { base: 0, length: 100000000 }`
   now type-checks with `std:fs` as the only import, and `readFileInto` through it answers
-  `errno 21` — a value, not a trap, and the header's no-trap promise holds for a base past
+  `EFAULT` (21) — a value, not a trap, and the header's no-trap promise holds for a base past
   the end (21) and a negative base (28) alike. That is the price of `Buf` being trusted
   rather than checked, and the declarations say so.
 - **The host LOOPS the read**, rather than taking one `read(2)`. That is what makes a short
