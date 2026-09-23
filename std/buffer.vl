@@ -7,6 +7,7 @@
 // typed views and `storeBytes`/`loadBytes` check a range and trap; every other read
 // past the end of a `Buf` stays inside the memory and is not caught. Reclamation
 // is LIFO — `bufferRelease(mark)` invalidates every `Buf` allocated after `mark`.
+// `Buffer` hands out only the build's heap window, [1024, 2 GiB) unless `vl build` moves it.
 
 // A linear-memory extent: the byte address of its first byte, and the number of
 // bytes the caller asked for. `.length` is a plain field read.
@@ -16,16 +17,13 @@ export type Buf = { base: i32, length: i32 }
 const PAGE_SHIFT = 16
 const PAGE_MASK = 65535
 
-// Byte addresses below this are never handed out, so `base == 0` is never a
-// real `Buf` and a program poking raw addresses has a window std will not touch.
-const HEAP_BASE = 1024
-
 // Every allocation's size rounds up to this, so each `Buf` starts aligned and
 // every width's natural alignment is satisfied at offset 0.
 const ALIGN = 8
 
-// The bump pointer: the address one past the last byte handed out.
-let bumpPtr = HEAP_BASE
+// How many bytes have been handed out, counted from the heap base; the bump pointer
+// is the base plus this. The base is never 0, so `base == 0` is never a `Buf`.
+let bumpOff = 0
 
 // `n` rounded up to the next multiple of `ALIGN`.
 function alignUp(n: i32): i32 {
@@ -47,31 +45,35 @@ function ensureCapacity(end: i32) {
   }
 }
 
-// Reserve `n` zero-filled bytes and describe them. Bytes never handed out
-// before are zero for free; a region reclaimed by `bufferRelease` holds
-// whatever was written there. Traps on a negative length or a total past 2 GiB.
+// Reserve `n` zero-filled bytes and describe them. Bytes never handed out before
+// are zero for free; one reclaimed by `bufferRelease` holds what was written there.
+// Traps on a negative length, or when it would end past the heap limit (2 GiB by default).
 // Growing the memory DETACHES a host's views of it — re-take them afterwards.
 export function Buffer(byteLength: i32): Buf {
   if byteLength < 0 { __trap__() }
-  const base = bumpPtr
+  const heap = __heap_base__()
+  const base = heap + bumpOff
+  // The window's ends are multiples of 8, so a length that fits still fits once
+  // rounded up — and the comparison cannot overflow, unlike `base + length`.
+  if byteLength > __heap_limit__() - base { __trap__() }
   const next = base + alignUp(byteLength)
-  if next < base { __trap__() }
   ensureCapacity(next)
-  bumpPtr = next
+  bumpOff = next - heap
   return { base: base, length: byteLength }
 }
 
 // The current bump pointer, to hand back to `bufferRelease`.
-export function bufferMark(): i32 { return bumpPtr }
+export function bufferMark(): i32 { return __heap_base__() + bumpOff }
 
 // Reclaim everything allocated since `mark`, in one move. Every `Buf` allocated
 // after `mark` DANGLES: reads answer another buffer's bytes and writes corrupt
 // them silently, because nothing is out of bounds. Traps on a `mark` outside
 // `[heap base, bump pointer]` — which a mark held across an earlier release is.
 export function bufferRelease(mark: i32) {
-  if mark < HEAP_BASE { __trap__() }
-  if mark > bumpPtr { __trap__() }
-  bumpPtr = mark
+  const heap = __heap_base__()
+  if mark < heap { __trap__() }
+  if mark > heap + bumpOff { __trap__() }
+  bumpOff = mark - heap
 }
 
 // ── loads ────────────────────────────────────────────────────────────────────

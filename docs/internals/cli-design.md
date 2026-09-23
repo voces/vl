@@ -629,6 +629,9 @@ host path until the protocol is proven on `check`.
 | `--wat` | also dump a `.wat` beside the module (`wasm-dis`), AFTER optimization |
 | `--names` | embed the wasm `name` custom section (legible trap backtraces) |
 | `--no-validate` | skip the "will the engine instantiate this" check |
+| `--import-memory` | import the memory as `env.memory` instead of defining and exporting it |
+| `--heap-base=<n>` | first byte `std:buffer` may hand out (default 1024; nonzero multiple of 8) |
+| `--heap-limit=<n>` | one past the last; a `Buffer` past it traps (default 2^31-8; a multiple of 8) |
 | `--compiler <f>` | the compiler module to compile with |
 
 #### The output channel is RULED: a file by default, stdout only when asked

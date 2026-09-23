@@ -507,6 +507,18 @@ program verbatim — the only way to pass one that starts with `-`.
                       boxes). Wins over -O when both are given. Both rungs
                       require binaryen's wasm-opt and fail loudly without it
   {c}--names{r}             Embed the wasm \"name\" section (legible trap backtraces)
+  {c}--import-memory{r}     Import the linear memory as `env.memory` instead of
+                      defining and exporting it, so separately built units can
+                      share one. No effect on a module that touches no linear
+                      memory. HAZARD: each unit's std:buffer
+                      allocator starts at the same address unless each is
+                      given its own window (below)
+  {c}--heap-base={r}<addr>  First byte std:buffer may hand out (default 1024;
+                      decimal or 0x hex, a nonzero multiple of 8)
+  {c}--heap-limit={r}<addr> One past the last (a multiple of 8); a Buffer() past it
+                      TRAPS rather than growing into memory the host owns
+                      (default 2 GiB). Bytes
+                      outside [base, limit) are never touched by VL itself
   {c}--wat{r}               Also write a .wat disassembly beside the module
                       (binaryen's wasm-dis; skipped with a note when absent)
   {c}--no-validate{r}       Skip validating the written module
@@ -2283,6 +2295,74 @@ macro_rules! phase {
     }};
 }
 
+/// How a `vl build` module links into its host: `--import-memory` and the `std:buffer`
+/// heap window. The default is the shape every other path emits — a defined memory and
+/// the historical window — so only `build_cmd` ever passes anything else.
+#[derive(Clone, Copy, Default)]
+struct LinkOpts {
+    import_memory: bool,
+    /// `(base, limit)`, already validated by `parse_heap_window`.
+    heap: Option<(i32, i32)>,
+}
+
+/// The refusal for a link flag the seed has no setter for.
+fn stale_seed_for(flag: &str, export: &str) -> Error {
+    Error::msg(format!(
+        "this compiler seed predates `{flag}` (no `{export}` export) — refresh it \
+         (`scripts/refresh-compiler.sh`) or drop the flag"
+    ))
+}
+
+/// The default `std:buffer` window, as the compiler holds it (`gHeapBase`/`gHeapLimit`).
+const HEAP_BASE_DEFAULT: i64 = 1024;
+const HEAP_LIMIT_DEFAULT: i64 = (i32::MAX as i64) & !7;
+
+/// `--heap-base=<n>` / `--heap-limit=<n>` (decimal or `0x` hex) into a validated window,
+/// or `None` when neither is given. Exits 2 on a malformed or inconsistent pair: both ends
+/// are multiples of 8 (the allocator's alignment, so a window's size is exactly usable), the
+/// base is nonzero (0 is its "not yet started" sentinel), and the limit is at least the base.
+fn parse_heap_window(args: &[String]) -> Option<(i32, i32)> {
+    let value = |name: &str| -> Option<i64> {
+        let prefix = format!("{name}=");
+        let raw = args.iter().find_map(|a| a.strip_prefix(prefix.as_str()))?;
+        let parsed = match raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) {
+            Some(hex) => i64::from_str_radix(&hex.replace('_', ""), 16),
+            None => raw.replace('_', "").parse::<i64>(),
+        };
+        match parsed {
+            Ok(v) => Some(v),
+            Err(_) => usage_exit(&format!(
+                "`{name}={raw}` — expected a byte address, decimal or 0x hex"
+            )),
+        }
+    };
+    let base = value("--heap-base");
+    let limit = value("--heap-limit");
+    if base.is_none() && limit.is_none() {
+        return None;
+    }
+    let base = base.unwrap_or(HEAP_BASE_DEFAULT);
+    let limit = limit.unwrap_or(HEAP_LIMIT_DEFAULT);
+    if base <= 0 || base % 8 != 0 || base > HEAP_LIMIT_DEFAULT {
+        usage_exit(&format!(
+            "--heap-base={base:#x} — the base must be a nonzero multiple of 8 below 2 GiB"
+        ));
+    }
+    if limit < base || limit % 8 != 0 || limit > HEAP_LIMIT_DEFAULT {
+        usage_exit(&format!(
+            "--heap-limit={limit:#x} — the limit must be a multiple of 8, at least the base \
+             ({base:#x}), and below 2 GiB"
+        ));
+    }
+    Some((base as i32, limit as i32))
+}
+
+fn usage_exit(msg: &str) -> ! {
+    eprintln!("vl build: {msg}");
+    eprintln!("    see `vl help build`");
+    std::process::exit(2);
+}
+
 /// Load the seed, stage `source`, call `entry`, and hand the emitted bytes back
 /// ALONGSIDE the live compiler instance, so a failure that happens after the compile
 /// - the engine refusing the emitted module - can still ask it where the offending
@@ -2300,9 +2380,18 @@ fn compile_vl_located(
     source_path: &str,
     entry: &str,
     emit_names: bool,
+    link: LinkOpts,
 ) -> Result<(Vec<u8>, Option<(Store<()>, Instance)>)> {
     let (mut store, inst) = phase!("load_compiler", load_compiler(engine, compiler))?;
-    let bytes = compile_vl_instance(&mut store, &inst, source, source_path, entry, emit_names)?;
+    let bytes = compile_vl_instance(
+        &mut store,
+        &inst,
+        source,
+        source_path,
+        entry,
+        emit_names,
+        link,
+    )?;
     Ok((bytes, Some((store, inst))))
 }
 
@@ -2517,6 +2606,7 @@ fn compile_vl_instance(
     source_path: &str,
     entry: &str,
     emit_names: bool,
+    link: LinkOpts,
 ) -> Result<Vec<u8>> {
     let mut store = store;
     note_compiling(source_path);
@@ -2531,6 +2621,25 @@ fn compile_vl_instance(
     if emit_names {
         if let Ok(set_names) = inst.get_typed_func::<i32, i32>(&mut store, "setEmitNames") {
             set_names.call(&mut store, 1)?;
+        }
+    }
+    // `vl build --import-memory`. Unlike the name section this changes what the module
+    // LINKS against, so a seed without the export is refused rather than ignored: a
+    // module that silently defined its own memory would link and then not share it.
+    if link.import_memory {
+        let set = inst
+            .get_typed_func::<i32, i32>(&mut store, "setImportMemory")
+            .map_err(|_| stale_seed_for("--import-memory", "setImportMemory"))?;
+        set.call(&mut store, 1)?;
+    }
+    // `--heap-base=` / `--heap-limit=`: refused on an old seed for the same reason — a
+    // module that ignored its window would allocate over whatever the host put there.
+    if let Some((base, limit)) = link.heap {
+        let set = inst
+            .get_typed_func::<(i32, i32), i32>(&mut store, "setHeapWindow")
+            .map_err(|_| stale_seed_for("--heap-base / --heap-limit", "setHeapWindow"))?;
+        if set.call(&mut store, (base, limit))? != 0 {
+            bail!("the compiler refused the heap window [{base:#x}, {limit:#x})");
         }
     }
 
@@ -3962,7 +4071,15 @@ fn run_batch(args: &[String]) -> Result<()> {
                 let mut store = Store::new(&compile_engine, ());
                 arm_guest_profile(&mut store);
                 let inst = from_compiler(pre.instantiate(&mut store))?;
-                compile_vl_instance(&mut store, &inst, &source, f, "compileSrc", true)?
+                compile_vl_instance(
+                    &mut store,
+                    &inst,
+                    &source,
+                    f,
+                    "compileSrc",
+                    true,
+                    LinkOpts::default(),
+                )?
             };
             // `Palette::OFF`, and NOT the resolved one: a `.out` file is a machine
             // artifact the corpus compares byte-for-byte, so `--batch` output stays
@@ -4220,7 +4337,15 @@ fn compile_and_run(
     // `_located`, so a module the engine refuses can still be traced back to the
     // function that emitted it (D1578). The compile itself is unchanged.
     let (bytes, session) =
-        compile_vl_located(&compile_engine, compiler, source, source_path, "compileSrc", true)?;
+        compile_vl_located(
+            &compile_engine,
+            compiler,
+            source,
+            source_path,
+            "compileSrc",
+            true,
+            LinkOpts::default(),
+        )?;
     match run_program(run_engine, &bytes, palette) {
         Err(e) => Err(locate_invalid_module(e, session, source_path)),
         ok => ok,
@@ -4314,6 +4439,22 @@ fn run_cmd(args: &[String]) -> Result<()> {
             // that is what they have always been on this path — turning a spelling
             // that runs today into an error is the thing this change is avoiding.
             "-O" | "-O3" | "--names" | "--wat" | "--no-validate" => {}
+            // Refused, not inert like the four above: it changes what the module LINKS
+            // against, and `vl run` has no `env.memory` to supply — the run would fail at
+            // instantiation with a sentence about imports rather than about the flag.
+            "--import-memory" => arg_error(
+                "`--import-memory` builds a module whose memory the HOST supplies, and \
+                 `vl run` supplies none — build it with `vl build --import-memory` and \
+                 instantiate it from a host that provides `env.memory`",
+                None,
+            ),
+            a if a.starts_with("--heap-base=") || a.starts_with("--heap-limit=") => arg_error(
+                &format!(
+                    "`{a}` lays out a module for a host that shares its memory — it is a \
+                     `vl build` flag, and `vl run` owns the whole memory it creates"
+                ),
+                None,
+            ),
             // `--color=<when>`, the `=` spelling only — the same one `vl check`
             // takes, and the one that cannot swallow the source file the way a
             // space-separated value would (`vl run --color p.vl`). A bare
@@ -5982,6 +6123,12 @@ fn build_cmd(args: &[String]) -> Result<()> {
     let out_label = if to_stdout { "<stdout>" } else { out.as_str() };
     // `--names` embeds a wasm "name" custom section (legible trap backtraces).
     let names = args.iter().any(|a| a == "--names");
+    // `--import-memory`: the module imports `env.memory` instead of defining and exporting
+    // it (DECISIONS.md §"Linear memory is a layout contract").
+    let link = LinkOpts {
+        import_memory: args.iter().any(|a| a == "--import-memory"),
+        heap: parse_heap_window(args),
+    };
     // `_located`, so a written module the engine refuses names the function it came
     // from (D1578). The instance is read only on that failure path.
     let (mut bytes, session) = compile_vl_located(
@@ -5991,6 +6138,7 @@ fn build_cmd(args: &[String]) -> Result<()> {
         input,
         "compileSrc",
         names,
+        link,
     )?;
     // THE SECOND SEAM (D1594). `None` on every real run — see the `$VL_FAULT_INJECT`
     // block. `vl check --codegen` renders the engine's refusal through cli.vl and this
