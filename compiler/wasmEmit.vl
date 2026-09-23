@@ -562,6 +562,9 @@ import {
   elseLessNullableTail,
   emptyArrHoleBuildKind,
   emptyArrHoleBuildSlot,
+  emptyArrUnionArmBuildKind,
+  emptyArrUnionArmKind,
+  emptyArrUnionArmSlot,
   envSlotShift,
   eqCmpKindOfOperand,
   eqCoreKindOfBin,
@@ -705,6 +708,7 @@ import {
   letNulBool,
   letNulMapReadUnionBox,
   letUnionNameOf,
+  listBuildKindOfVKind,
   listElemIsBool,
   listGetIdxReReadable,
   listIdxKindOf,
@@ -3727,6 +3731,48 @@ function emitMapUnionUnboxRead(body: u8[], name: string, fnIx: i32) {
   0
 }
 
+// An empty `[]` into a union with no `i32[]` arm, built and tagged as the list arm the checker
+// adopted it as. The value-atom ladder classifies every empty literal `i32[]` and re-maps only
+// onto the scalar-list arms, so a string or ref-list arm got the i32 backing (D2202).
+// Returns 1 = handled, 0 = not applicable, -1 = error.
+function emitEmptyArrUnionArm(
+  body: u8[],
+  unionName: string,
+  exprIx: i32,
+  fnIx: i32,
+) {
+  if unionName == "" { return 0 }
+  const bare = P.nodes[unwrapParen(exprIx)]
+  if bare is ArrayLit {
+    if bare.arrElems.length != 0 { return 0 }
+  } else {
+    return 0
+  }
+  if unionHasAtomTy(unionName, "i32", true) { return 0 }
+  const k = emptyArrUnionArmKind(exprIx)
+  let tag = -1
+  if k == "strlist" {
+    tag = scalarTagOfKind(9) // "string[]", the tag a `(string | null)[]` arm shares
+  } else if k == "reflist" {
+    const slot = emptyArrUnionArmSlot(exprIx)
+    if !unionHasRefArrayArmSlot(unionName, slot) { return 0 }
+    tag = refArrSlotTag(slot)
+  }
+  if tag < 0 { return 0 }
+  fbI32Const(tag)
+  const savedK = pendingListKind
+  const savedS = pendingListSlot
+  pendingListKind = emptyArrUnionArmBuildKind(exprIx)
+  pendingListSlot = emptyArrUnionArmSlot(exprIx)
+  if pendingListSlot < 0 { pendingListSlot = 0 }
+  const rc = emitExpr(body, exprIx, fnIx)
+  pendingListKind = savedK
+  pendingListSlot = savedS
+  if rc < 0 { return -1 }
+  fbStructNew(uBoxIdx) // { tag, list-wrapper ref }
+  1
+}
+
 // Route a list literal flowing into a union whose matching arm is a union-box-element
 // ref-array (`(i32 | string)[] | {w: i32}`) through that arm's build: thread
 // `pendingListKind = 2` and the arm's reflist slot so `emitArr` boxes each element into the
@@ -4032,6 +4078,9 @@ export function emitUnionCoerce(
   const d29 = emitUnionMapArmBox(body, unionName, exprIx, fnIx)
   if d29 < 0 { return -1 }
   if d29 == 1 { return 0 }
+  const eau = emitEmptyArrUnionArm(body, unionName, exprIx, fnIx)
+  if eau < 0 { return -1 }
+  if eau == 1 { return 0 }
   // A ref-element array carrier (`S[]`, `(() => f64)[]`, `(C | D)[]`) flowing into a union with
   // a matching ref-array arm: the reflist wrapper ref rides the box anyref directly, tagged by
   // its interned slot (`refArrSlotTag`). Checked before the value-atom gate below — such a union
@@ -6652,6 +6701,19 @@ function emitArr(body: u8[], arrIx: i32, fnIx: i32) {
   if a is ArrayLit {
     const elems = a.arrElems
     if hasSpreadItem(elems) { return emitArrSpread(body, arrIx, fnIx) }
+    // An empty `[]` no destination threaded a kind to builds at the element type the checker
+    // pinned on the literal itself — a join arm's sibling, a return's witness (D2209).
+    if elems.length == 0 && pendingListKind == 0 {
+      const hbk = emptyArrHoleBuildKind(arrIx)
+      if hbk != 0 {
+        pendingListKind = hbk
+        pendingListSlot = emptyArrHoleBuildSlot(arrIx)
+        const hrc = emitArr(body, arrIx, fnIx)
+        pendingListKind = 0
+        pendingListSlot = 0
+        return hrc
+      }
+    }
     // Which (backing, wrapper) pair the literal builds — `pendingListKind` 1/2 a ref backing, 3 a
     // string one, 4 f64, 6 i64, 7 f32, anything else the default `$lTypeIdx` i32 list. Two signals
     // answer it: the literal's own elements (`arrLitIs*`) and a threaded annotation from the
@@ -12931,6 +12993,27 @@ function ifArmNoValueFail(what: string, blockIx: i32) {
   )
 }
 
+// Seed an empty `[]` returned from the un-annotated function at `fnPos` with that function's
+// inferred list kind. Inside a generic instance the literal's recorded type is the template's
+// `T[]`, which names no rep, while the instance's return kind does (D2209).
+function emptyArrRetSeedFromKind(retArg: i32, fnPos: i32) {
+  const ra = P.nodes[unwrapParen(retArg)]
+  if ra is ArrayLit {
+    if ra.arrElems.length != 0 { return 0 }
+  } else {
+    return 0
+  }
+  if fnPos < 0 || fnPos >= fRetKind.length || fnPos >= fRetStructIdx.length {
+    return 0
+  }
+  const rs = fRetStructIdx[fnPos]
+  const jk = listBuildKindOfVKind(fRetKind[fnPos], rs)
+  if jk == 0 { return 0 }
+  pendingListKind = jk
+  if fRetKind[fnPos] == "reflist" && rs >= 0 { pendingListSlot = rs }
+  0
+}
+
 // One arm of a ref-typed if-expression: its prelude, then its tail-value statement emitted
 // in the join rep. Re-seeds `pendingStructIdx` (struct arms) / `pendingListKind` +
 // `pendingListSlot` (ref-list arms) after the prelude, since the previous arm's emit or a
@@ -12960,6 +13043,15 @@ function emitRefIfArm(
         if kind == "reflist" {
           pendingListKind = 5
           pendingListSlot = slot
+        }
+        // An empty `[]` arm is built at the join's list rep, which its own recorded type can
+        // miss inside a generic instance (D2209).
+        const ea = P.nodes[unwrapParen(tv)]
+        if ea is ArrayLit {
+          if ea.arrElems.length == 0 && kind != "reflist" {
+            const jk = listBuildKindOfVKind(kind, slot)
+            if jk != 0 { pendingListKind = jk }
+          }
         }
         // An ATOM arm in a `string` join widens to its member string (the atom is a
         // bare i32 id; the join blocktype is the string ref) — the if-expression seam
@@ -18510,6 +18602,8 @@ function emitReturnValue(body: u8[], retArg: i32, fnIx: i32) {
       if hbk != 0 {
         pendingListKind = hbk
         pendingListSlot = emptyArrHoleBuildSlot(retArg)
+      } else {
+        emptyArrRetSeedFromKind(retArg, fnPos)
       }
     }
   }
