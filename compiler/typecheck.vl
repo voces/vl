@@ -8865,7 +8865,7 @@ function radixLitAdoptPeer64(exprIx: i32, peerTy: i32) {
 export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
   // A bare `{}` completes against a record destination; a required field it omits is refused
   // here, in words, instead of as the site's generic mismatch (D2223).
-  if bareBraceDeliver(srcExpr, dstTy, 8) { return true }
+  if bareBraceDeliver(srcExpr, dstTy, 8, true) { return true }
   // A generic function value meeting a concrete function type is decided by instantiation inside
   // `assignable`'s `TyFunc` case (`genericFnAssignable`), so it governs nested positions like an
   // array element too, not just this expression-level entry.
@@ -29624,11 +29624,12 @@ function finishInferredReturn(
         objRetAdopted = true
       }
       // A bare `{}` body completes the expected record, as it would at any delivery (D2223).
+      // Only marked when it cannot: the argument's own mismatch is then the one report.
       if inferred != expRet && bareBraceNode(lambdaBodyTail(n.fnBody)) {
-        if bareBraceRecordOf(expRet) >= 0 {
-          bareBraceDeliver(lambdaBodyTail(n.fnBody), expRet, 8)
-          inferred = expRet
-        }
+        bareBraceSpec = bareBraceSpec + 1
+        bareBraceDeliver(lambdaBodyTail(n.fnBody), expRet, 8, true)
+        bareBraceSpec = bareBraceSpec - 1
+        if bareBraceRecordOf(expRet) >= 0 { inferred = expRet }
       }
       // The litunion dual: a bare string-literal body that is a member of the expected
       // literal-union adopts it. Its inferred type is the softened `string`; the direct
@@ -30679,7 +30680,9 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
           }
           if ret >= 0 {
             // A tail `if` is a statement node, so its arms' `{}` reach no `assignableExpr`.
-            if isStmtNode(stmts[s]) { bareBraceDeliver(stmts[s], ret, 8) }
+            if isStmtNode(stmts[s]) {
+              bareBraceDeliver(stmts[s], ret, 8, false)
+            }
             if !isStmtNode(stmts[s]) {
               // A `never` body is graded whole below, not by its tail's value.
               if !isVoidTy(ret) && ret != TY_NEVER {
@@ -31787,37 +31790,53 @@ function bareBraceHoleDst(dstTy: i32): boolean {
 }
 
 // Mark every bare `{}` that `srcExpr` delivers into `dstTy`, following parentheses, the
-// fallback of `??`, list elements and the value tails of `if` / `match`. True when it refused
-// one for a required field, so the delivery itself reports nothing more.
-function bareBraceDeliver(srcExpr: i32, dstTy: i32, depth: i32): boolean {
+// fallback of `??`, list elements, record fields and the value tails of `if` / `match`. True
+// only when it reported a refusal, or when `srcExpr` itself (`direct`, parentheses aside) is
+// a `{}` it completed as a union member; every enclosing value is left to the ordinary check.
+function bareBraceDeliver(
+  srcExpr: i32,
+  dstTy: i32,
+  depth: i32,
+  direct: boolean,
+): boolean {
   if srcExpr < 0 || srcExpr >= P.nodes.length || depth <= 0 { return false }
   const e = P.nodes[srcExpr]
-  if e is Paren { return bareBraceDeliver(e.parInner, dstTy, depth - 1) }
+  if e is Paren {
+    return bareBraceDeliver(e.parInner, dstTy, depth - 1, direct)
+  }
   if e is BinExpr {
-    if e.binOp == "??" { return bareBraceDeliver(e.binRight, dstTy, depth - 1) }
+    if e.binOp == "??" {
+      return bareBraceDeliver(e.binRight, dstTy, depth - 1, false)
+    }
     return false
   }
   if e is Block {
     if e.blkStmts.length == 0 { return false }
-    return bareBraceDeliver(e.blkStmts[e.blkStmts.length - 1], dstTy, depth - 1)
+    const last = e.blkStmts[e.blkStmts.length - 1]
+    return bareBraceDeliver(last, dstTy, depth - 1, false)
   }
   if e is IfStmt {
-    const a = bareBraceDeliver(e.ifThen, dstTy, depth - 1)
-    const b = bareBraceDeliver(e.ifElse, dstTy, depth - 1)
+    const a = bareBraceDeliver(e.ifThen, dstTy, depth - 1, false)
+    const b = bareBraceDeliver(e.ifElse, dstTy, depth - 1, false)
     return a || b
   }
   if e is MatchExpr {
     let any = false
     let m = 0
     while m < e.matchBodies.length {
-      if bareBraceDeliver(e.matchBodies[m], dstTy, depth - 1) { any = true }
+      if bareBraceDeliver(e.matchBodies[m], dstTy, depth - 1, false) {
+        any = true
+      }
       m = m + 1
     }
     return any
   }
   if e is ArrayLit { return bareBraceDeliverElems(e.arrElems, dstTy, depth) }
   if !(e is ObjLit) { return false }
-  if e.objFields.length != 0 { return false }
+  if e.objFields.length != 0 {
+    bareBraceDeliverFields(e.objFields, dstTy, depth)
+    return false
+  }
   if listHasI32(stmtBraceNodes, srcExpr) {
     // A block's last `{}` whose value is delivered is refused naming the `({})` spelling.
     if !listHasI32(stmtBraceTails, srcExpr) || bareBraceSpec > 0 {
@@ -31846,7 +31865,7 @@ function bareBraceDeliver(srcExpr: i32, dstTy: i32, depth: i32): boolean {
     // Into a union the chosen member is the answer: the first whose fields all admit `null`,
     // the order the literal-to-union adoption below tries members in. A speculative trial of
     // one member only records; the outer delivery decides.
-    if bareBraceSpec > 0 { return false }
+    if bareBraceSpec > 0 || !direct { return false }
     return rec != dstTy && bareBraceMembers(dstTy).length > 1
   }
   if bareBraceSpec > 0 { return false }
@@ -31869,10 +31888,43 @@ function bareBraceDeliverElems(elems: i32[], dstTy: i32, depth: i32): boolean {
   let any = false
   let k = 0
   while k < elems.length {
-    if bareBraceDeliver(elems[k], aa.aElem, depth - 1) { any = true }
+    if bareBraceDeliver(elems[k], aa.aElem, depth - 1, false) { any = true }
     k = k + 1
   }
   any
+}
+
+// Marks the `{}` values among a record literal's fields against the field types the record
+// members of `dstTy` declare, reporting nothing: the literal's own check judges the fields,
+// and a mark only records that a record type is expected there.
+function bareBraceDeliverFields(fields: i32[], dstTy: i32, depth: i32) {
+  const ms = bareBraceMembers(dstTy)
+  bareBraceSpec = bareBraceSpec + 1
+  let k = 0
+  while k < fields.length {
+    const f = P.nodes[fields[k]]
+    if f is FieldInit {
+      let i = 0
+      let done = false
+      while i < ms.length && !done {
+        const mo = T.tys[ms[i]]
+        if mo is TyObj {
+          let j = 0
+          while j < mo.objFieldNames.length && !done {
+            if mo.objFieldNames[j] == f.fiName {
+              bareBraceDeliver(f.fiValue, mo.objFieldTypes[j], depth - 1, false)
+              done = true
+            }
+            j = j + 1
+          }
+        }
+        i = i + 1
+      }
+    }
+    k = k + 1
+  }
+  bareBraceSpec = bareBraceSpec - 1
+  0
 }
 
 // Refuse every value-position `{}` no delivery gave a record type to complete, unless another

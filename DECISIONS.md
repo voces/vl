@@ -2256,7 +2256,9 @@ element and store delivery passes, marks a `{}` it delivers into a record (follo
 `??`'s fallback, list elements and `if`/`match` value tails), and a tail `if` under a declared
 return is marked where the body's tail is checked. The union adoptions try `assignableExpr`
 once per member; those trials are speculative and only record, so the one verdict is the outer
-delivery's, over every member. A `{}` no delivery reached is refused after the last body. A delivered `{}` records its record as both its type and its rep, since no struct
+delivery's, over every member. Only a `{}` that IS the delivered value is accepted as a union
+member there; one inside a join (`s ?? {}`, `[{}, 42]`, an `if` arm) is marked and recorded,
+and the join itself goes through the ordinary check, so its other parts cannot ride along. A `{}` no delivery reached is refused after the last body. A delivered `{}` records its record as both its type and its rep, since no struct
 row has zero fields; the emitter's row resolver takes that record for a zero-field literal.
 
 **Measured.** The distilled corpus moved **0 of 7,589 cells**; `std/`, `compiler/` and consumer
