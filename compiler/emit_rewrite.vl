@@ -104,7 +104,6 @@ import {
   mkNum,
   mkOptMember,
   mkParam,
-  nodeChildren,
   nodeValueSpineChildren,
   orderArgsByParamNames,
   paramDefaultIsCallsite,
@@ -819,10 +818,10 @@ export function dispatchRewrite(stmts: i32[]) {
   0
 }
 
-// ── value-position assignments the target cannot re-read (D2170) ────────────────────────────
+// ── value-position writes to a field or element (D2170) ──────────────────────────────────────
 // An assignment yields its right-hand side, which a re-read of the target delivers at the
-// value's rep only for a name. So in a function that yields a value, a tail write to a field
-// or element `t = r` becomes `const v = r; t = v; v`.
+// value's rep only for a name. So in a function that yields a value, a tail `o[i] = r` becomes
+// `const o2 = o; const i2 = i; const v = r; o2[i2] = v; v`, in source order (D1510).
 
 // Spills the value-position tail of the block at `blockIx`: its last statement, or every arm
 // of a last `if` the checker says yields a value.
@@ -846,152 +845,102 @@ function spillTail(blockIx: i32, fnIx: i32) {
       }
       return 0
     }
-    if spillWanted(last, fnIx) {
-      const a = P.nodes[last]
-      if a is BinExpr {
-        const name = "asg#" + i32ToStr(last)
-        const decl = mkLet("const", name, -1, a.binRight, a.pos)
-        nodeTyCarry(decl, a.binRight)
-        const use = mkIdent(name, a.pos)
-        nodeTyCarry(use, a.binRight)
-        const val = mkIdent(name, a.pos)
-        nodeTyCarry(val, a.binRight)
-        a.binRight = use
-        b.blkStmts[n - 1] = decl
-        b.blkStmts.push(last)
-        b.blkStmts.push(val)
-        capMemoNoteEdit()
-      }
+    const out: i32[] = []
+    const val = spillWrite(last, out)
+    if val < 0 { return 0 }
+    b.blkStmts.pop()
+    let k = 0
+    while k < out.length {
+      b.blkStmts.push(out[k])
+      k = k + 1
     }
+    b.blkStmts.push(last)
+    b.blkStmts.push(spillRead(val))
+    capMemoNoteEdit()
   }
   0
 }
 
-// Whether the statement at `ix` is a field or element write whose spill cannot be observed.
-// The spill evaluates the target after the right-hand side, so the target must be a pure path
-// the right-hand side cannot rebind: not by a write inside it, nor by a call when a name is
-// not the frame's own.
-function spillWanted(ix: i32, fnIx: i32): boolean {
-  const a = P.nodes[ix]
+// Rewrites the field or element write at `asgIx` to store a spilled value into a spilled place,
+// pushing the spills onto `out` in source order; the value's read, or -1 for any other node.
+function spillWrite(asgIx: i32, out: i32[]): i32 {
+  const a = P.nodes[asgIx]
   if a is BinExpr {
-    if a.binOp != "=" { return false }
-    if P.nodes[unwrapParen(a.binLeft)] is Ident { return false }
-    if !exprReReadable(a.binLeft) { return false }
-    const names: string[] = []
-    spillPathNames(a.binLeft, names)
-    let i = 0
-    while i < names.length {
-      if spillWrites(a.binRight, names[i]) { return false }
-      if spillHasCall(a.binRight) && !spillFrameOwned(fnIx, names[i]) {
-        return false
+    if a.binOp != "=" { return -1 }
+    const t = unwrapParen(a.binLeft)
+    if t < 0 { return -1 }
+    let place = -1
+    const tn = P.nodes[t]
+    if tn is Member {
+      place = mkMember(
+        spillLocal(tn.memObj, asgIx, "o", out, a.pos),
+        tn.memProp,
+        tn.pos,
+      )
+    } else if tn is Index {
+      const recv = spillLocal(tn.idxArr, asgIx, "o", out, a.pos)
+      let idx = tn.idxIndex
+      // A number re-evaluates to itself; any other index is spilled with the receiver.
+      if !(P.nodes[idx] is NumLit) {
+        idx = spillLocal(idx, asgIx, "i", out, a.pos)
       }
-      i = i + 1
+      place = mkIndex(recv, idx, tn.pos)
     }
-    return true
+    if place < 0 { return -1 }
+    nodeTyCarry(place, t)
+    // A compound write reads its target inside the right-hand side, through the same node.
+    const inner = P.nodes[a.binRight]
+    if inner is BinExpr {
+      if unwrapParen(inner.binLeft) == t { inner.binLeft = place }
+    }
+    const val = spillLocal(a.binRight, asgIx, "v", out, a.pos)
+    spillTypeByTarget(out[out.length - 1], val, t)
+    a.binLeft = place
+    a.binRight = val
+    return val
   }
-  false
+  -1
 }
 
-// Pushes every identifier the pure path at `ix` reads onto `out`.
-function spillPathNames(ix: i32, out: string[]) {
-  if ix < 0 { return 0 }
-  const n = P.nodes[ix]
-  if n is Ident { out.push(n.identName) }
-  const ks = nodeChildren(ix)
-  let i = 0
-  while i < ks.length {
-    spillPathNames(ks[i], out)
-    i = i + 1
+// Pushes `const asg#<asgIx>#<tag> = <ix>` onto `out` and answers a read of it, both typed as `ix`.
+function spillLocal(
+  ix: i32,
+  asgIx: i32,
+  tag: string,
+  out: i32[],
+  pos: i32,
+): i32 {
+  const name = "asg#" + i32ToStr(asgIx) + "#" + tag
+  const decl = mkLet("const", name, -1, ix, pos)
+  nodeTyCarry(decl, ix)
+  out.push(decl)
+  const rd = mkIdent(name, pos)
+  nodeTyCarry(rd, ix)
+  rd
+}
+
+// A second read of the spilled name `rd` reads, with its type.
+function spillRead(rd: i32): i32 {
+  const n = P.nodes[rd]
+  if n is Ident {
+    const r2 = mkIdent(n.identName, n.pos)
+    nodeTyCarry(r2, rd)
+    return r2
   }
+  -1
+}
+
+// A literal-union target stores the atom, so the spilled value `decl` takes the target's alias
+// and holds the atom too; any other target keeps the right-hand side's own type.
+function spillTypeByTarget(decl: i32, rd: i32, t: i32) {
+  const ty = nodeTyIxOf(t)
+  const al = litUnionAliasNameOfTy(ty)
+  if al == "" { return 0 }
+  const d = P.nodes[decl]
+  if d is LetDecl { d.letType = synthTypeRefTy(al, -1, ty) }
+  nodeTyRecord(decl, ty)
+  nodeTyRecord(rd, ty)
   0
-}
-
-// Whether the subtree at `ix` assigns or increments the name `nm`.
-function spillWrites(ix: i32, nm: string): boolean {
-  if ix < 0 { return false }
-  const n = P.nodes[ix]
-  let tgt = -1
-  if n is BinExpr {
-    if n.binOp == "=" { tgt = unwrapParen(n.binLeft) }
-  }
-  if tgt >= 0 {
-    const t = P.nodes[tgt]
-    if t is Ident {
-      if t.identName == nm { return true }
-    }
-  }
-  const ks = nodeChildren(ix)
-  let i = 0
-  while i < ks.length {
-    if spillWrites(ks[i], nm) { return true }
-    i = i + 1
-  }
-  false
-}
-
-// Whether the subtree at `ix` calls anything.
-function spillHasCall(ix: i32): boolean {
-  if ix < 0 { return false }
-  if P.nodes[ix] is Call { return true }
-  const ks = nodeChildren(ix)
-  let i = 0
-  while i < ks.length {
-    if spillHasCall(ks[i]) { return true }
-    i = i + 1
-  }
-  false
-}
-
-// Whether `nm` is a parameter or local of the function at `fnIx` that no function nested in
-// it assigns, so no call can rebind it. A global or a capture answers false.
-function spillFrameOwned(fnIx: i32, nm: string): boolean {
-  const fn = P.nodes[fnIx]
-  if fn is FuncDecl {
-    let own = false
-    let i = 0
-    while i < fn.fnParams.length {
-      const p = P.nodes[fn.fnParams[i]]
-      if p is Param {
-        if p.parName == nm { own = true }
-      }
-      i = i + 1
-    }
-    if !own { own = spillDeclares(fn.fnBody, nm) }
-    if !own { return false }
-    return !spillNestedWrites(fn.fnBody, nm)
-  }
-  false
-}
-
-// Whether the subtree at `ix` declares `nm` outside any function nested in it.
-function spillDeclares(ix: i32, nm: string): boolean {
-  if ix < 0 { return false }
-  const n = P.nodes[ix]
-  if n is FuncDecl { return false }
-  if n is LetDecl {
-    if n.letName == nm { return true }
-  }
-  const ks = nodeChildren(ix)
-  let i = 0
-  while i < ks.length {
-    if spillDeclares(ks[i], nm) { return true }
-    i = i + 1
-  }
-  false
-}
-
-// Whether a function nested in the subtree at `ix` assigns `nm`.
-function spillNestedWrites(ix: i32, nm: string): boolean {
-  if ix < 0 { return false }
-  const n = P.nodes[ix]
-  if n is FuncDecl { return spillWrites(n.fnBody, nm) }
-  const ks = nodeChildren(ix)
-  let i = 0
-  while i < ks.length {
-    if spillNestedWrites(ks[i], nm) { return true }
-    i = i + 1
-  }
-  false
 }
 
 // Pins every un-annotated lambda that returns a union to that union, consuming the

@@ -858,14 +858,15 @@ new: the compare-frame pre-pass never recurses into a code-15 field, so a NESTED
   `if n.left == null { n.left = { … } } else { insert(n.left, v) }` trapped `unreachable`: the
   emitter delivers an assignment's value by re-reading its target, which it admitted only for a
   field whose type is the value's, so the arm had nothing to yield. In a function the emitter
-  gives a result, a tail field or element write now spills its right-hand side (`const v = r;
-  t = v; v`), and a result the return walk left at `i32` takes the struct row of the checker's
+  gives a result, a tail field or element write now spills its receiver, index and right-hand
+  side in source order (`const o2 = o; const i2 = i; const v = r; o2[i2] = v; v`, D1510), and a result the return walk left at `i32` takes the struct row of the checker's
   function type, so an `if` joining two struct locals no longer declares `(result i32)`.
   Separately, the cell `captureBoxRewrite` makes of a captured `let k: K` now carries its list
   type, so `k = "ww"` inside a closure stores the atom, and an assignment's value is an atom
-  exactly when its target is. The compiler's own codegen is unchanged (master's source compiles
-  byte-identically); the seed grows 5.9 KB of new compiler code. Residue D2171–D2174 filed.
-  Fixtures `conditionals/tail-if-field-assign-arm.vl`, `closures/captured-litunion-assign.vl`.
+  exactly when its target is; a spilled value written to a literal-union target takes the target's
+  alias, so it holds the atom. Residue D2171–D2175 and D2185–D2187 filed. Fixtures
+  `conditionals/tail-if-field-assign-arm.vl`, `closures/captured-litunion-assign.vl`,
+  `eval-order/tail-write-value.vl`.
 
 - **A long closure body compiles in linear time (D2017, plumb's generated closures).** Every
   read of a name the closure does not bind asked for its capture set, and before emission
