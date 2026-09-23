@@ -2651,6 +2651,9 @@ let inferSawErr = false
 let inferRetLogTy: i32[] = []
 let inferRetLogSeed: boolean[] = []
 let inferRetSeeding = false
+// The seeds `dropTailIfSeeds` removed, per inference frame: re-joined when the function turns
+// out to return a value anyway, since then the tail's value arms return (`clearTailVerdict`).
+let inferDroppedTy: i32[] = []
 // True while an explicit `return`'s argument is checked: an `if` there is a value slot, so its
 // verdict never rewinds the inferred return (the slot's own void check refuses it instead).
 let inRetArg = false
@@ -3794,6 +3797,7 @@ export function initChecker() {
   inferRetSeeding = false
   ifNoValueAt = []
   ifValTyAt = []
+  inferDroppedTy = []
   // Pass 0 and pass 1's collect tables, reset here with everything else: every
   // `checkProgram` reaches its walk through a caller that ran `initChecker` first
   // (`compileSrc`, `checkSrc`, `checkSrcSym`, `jwSecondPass`), so this is the one
@@ -24499,7 +24503,11 @@ function dropTailIfSeeds(logMark: i32, obsMark: i32) {
   const keepTy: i32[] = []
   let i = logMark
   while i < inferRetLogTy.length {
-    if !inferRetLogSeed[i] { keepTy.push(inferRetLogTy[i]) }
+    if inferRetLogSeed[i] {
+      inferDroppedTy.push(inferRetLogTy[i])
+    } else {
+      keepTy.push(inferRetLogTy[i])
+    }
     i = i + 1
   }
   while inferRetLogTy.length > logMark {
@@ -24573,13 +24581,44 @@ function matchTallyEnd(ix: i32, acc: i32) {
   0
 }
 
-// Whether the if-arm block `armIx` ends in a bare `{ … }` block statement.
-function armEndsInBareBlock(armIx: i32): boolean {
+// Clears the no-value verdict down the tail spine at `ix` (an `if`, its arms' tails, its
+// `else if` links). Called for a function whose return is not void: only a void context
+// discards a tail value (DECISIONS.md), so there each value arm returns and a value-less
+// arm falls through like any other path, to `null` or to the missing-return refusal.
+function clearTailVerdict(ix: i32) {
+  if ix < 0 { return 0 }
+  if ix < ifNoValueAt.length { ifNoValueAt[ix] = false }
+  const n = P.nodes[ix]
+  if n is IfStmt {
+    clearTailVerdict(blockLastStmt(n.ifThen))
+    clearTailVerdict(blockLastStmt(n.ifElse))
+    clearTailVerdict(n.ifElse)
+  }
+  0
+}
+
+// The last statement of the block at `ix`, or -1 for an empty block or a non-block node.
+function blockLastStmt(ix: i32): i32 {
+  if ix < 0 { return -1 }
+  const b = P.nodes[ix]
+  if !(b is Block) { return -1 }
+  const n = b.blkStmts.length
+  if n == 0 { return -1 }
+  b.blkStmts[n - 1]
+}
+
+// Whether the if-arm block `armIx` ends in a shape whose value is an open ruling: a bare
+// `{ … }` block (bare-block-as-expression), or an else-less `if`, whose fall-through reads
+// as `null` at a tail and as no value in an arm (D1995's open question).
+function armTailUndecided(armIx: i32): boolean {
   if armIx < 0 { return false }
   const a = P.nodes[armIx]
   if !(a is Block) { return false }
   const n = a.blkStmts.length
-  n > 0 && P.nodes[a.blkStmts[n - 1]] is Block
+  if n == 0 { return false }
+  const last = P.nodes[a.blkStmts[n - 1]]
+  if last is Block { return true }
+  last is IfStmt && last.ifElse < 0
 }
 
 // The value an `if`/`else` at `ix` yields as a tail: the join of the arms that complete, an
@@ -26106,6 +26145,7 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
   const savedObserved = inferObserved
   const savedSawErr = inferSawErr
   const savedRetLogLen = inferRetLogTy.length
+  const savedDroppedLen = inferDroppedTy.length
   const cbBefore = cycleBreakCount
   const savedValueRet = fnSawValueRet
   const savedRetNatural = retNatural
@@ -26238,6 +26278,9 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
         // i32) apply here too, matching an explicit `return <expr>` — the bare trailing
         // expression, which is the implicit return, needs the identical check.
         if !inferring && tailIsReturn {
+          if ret >= 0 && !isVoidTy(ret) && ret != TY_ERR {
+            clearTailVerdict(stmts[s])
+          }
           if ret >= 0 {
             if !isStmtNode(stmts[s]) {
               if !isVoidTy(ret) {
@@ -26341,6 +26384,14 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
       bodyChecked[n.fnName] = true
     }
   }
+  if inferring && inferObserved >= 0 {
+    let dk = savedDroppedLen
+    while dk < inferDroppedTy.length {
+      inferObserved = joinRetTys(inferObserved, inferDroppedTy[dk])
+      dk = dk + 1
+    }
+  }
+  while inferDroppedTy.length > savedDroppedLen { inferDroppedTy.pop() }
   if inferring {
     ret = finishInferredReturn(
       n,
@@ -26353,6 +26404,10 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
       savedValueRet,
       bodyTotalForRet,
     )
+    // Inferred non-void after all: the tail's value arms return (`clearTailVerdict`).
+    if ret >= 0 && !isVoidTy(ret) && ret != TY_ERR {
+      clearTailVerdict(blockLastStmt(n.fnBody))
+    }
   }
   // This body's witnesses belong to its own inference, not to an enclosing `if`'s replay.
   while inferRetLogTy.length > savedRetLogLen {
@@ -35249,8 +35304,8 @@ function checkIfStmtNode(n: IfStmt, ix: i32) {
   // function's tail, so the arm values it seeded leave the inferred return.
   // An arm ending in a bare `{ … }` leaves the `if` undecided: whether that block yields its
   // tail is the open bare-block-as-expression ruling, and D1903 pins what runs today.
-  let bareArm = armEndsInBareBlock(n.ifThen)
-  if daHasElse && !elseIsLink && armEndsInBareBlock(n.ifElse) { bareArm = true }
+  let bareArm = armTailUndecided(n.ifThen)
+  if daHasElse && !elseIsLink && armTailUndecided(n.ifElse) { bareArm = true }
   let noValue = !bareArm && !thenExits && ifArmGivesNoValue(n.ifThen, thenTy)
   if !bareArm && daHasElse && !daElseDiverges {
     // An `else if` link answers its own verdict: an else-less link's fall-through is its `null`.
