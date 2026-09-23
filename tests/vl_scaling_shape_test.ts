@@ -587,6 +587,33 @@ axis(
   (d) => twoFiles(d, genSiblingBlocks(2500, "unique"), genSiblingBlocks(2500, "hoisted")),
 );
 
+// One `match` of `n` arms, each reading the module global `k`, written as a closure's body or
+// as a top-level function's. Every arm's read asks whether `k` is a capture of the frame, which
+// a top-level function answers without a walk. Both arms share `fill` statements so the cheap
+// arm clears `FLOOR` and the reading stays a ratio.
+const genLongBody = (n: number, closure: boolean): string => {
+  const o = ["const k = 1000"];
+  o.push(closure ? "const g = (y: i32) => match y {" : "function g(y: i32): i32 {\n  match y {");
+  for (let i = 0; i < n; i++) o.push(`  ${i} => k + ${i % 97}`);
+  o.push("  _ => -1", "}");
+  if (!closure) o.push("}");
+  o.push("let acc = 0");
+  for (let i = 0; i < 2400; i++) fill(o, i, 6);
+  o.push("print(acc + g(3))");
+  return o.join("\n") + "\n";
+};
+
+// 0.59 / 0.54 / 1.09 at 1,500 arms, against master's 38.73 / 0.46 / 84.20: every read of `k`
+// re-walked the whole closure body to learn its capture set until `captureNamesOf` kept the
+// walk for the pass (D2017). The fill is shared and reads no global set from `g`, which would
+// price a different per-read walk (D2130).
+axis(
+  "closure body length",
+  2.5,
+  "A closure's capture set is being re-walked per read inside its own body (D2017).",
+  (d) => twoFiles(d, genLongBody(1500, true), genLongBody(1500, false)),
+);
+
 // ── the one RUNTIME axis ─────────────────────────────────────────────────────
 // Every pair above grades COMPILE time, because every cost above is the compiler's. String
 // building is the exception: the cost lands in the EMITTED program, so this pair builds

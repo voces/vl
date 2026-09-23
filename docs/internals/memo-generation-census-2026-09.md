@@ -58,6 +58,7 @@ tree ungraded.
 | `anonLeafIndex` (`anonIxSeen`) | `P.nodes.length` | its own link columns | probe |
 | `fnChildIndex` | `fnChildHead.length` vs `fnStmts.length` | `fnParent`, written in place by `monomorphize` | probe |
 | `elemRowsCaptureWalk` (`ercGenP`/`ercStamp`) | **`emitPassGen`**, and a per-walk stamp so a new walk clears nothing | none: the table is rebuilt when the pass generation moves, and a slot is dead the moment its walk id is stale | pass-stamped |
+| `closureCaptureNames` (`capMemoGen`/`capMemoStamp`, D2017) | **`emitPassGen`**, `P.nodes.length`, a reported-edit count | none reachable: armed only inside `computeRetInference`, `computeRetInference#2` and `dispatchRewrite`; the first two write no table `capScan` reads, and every rewrite either mints a node or calls `capMemoNoteEdit` | pass-stamped |
 | `covarValueWriteState` (`cwArenaLen`) | `P.nodes.length` | its own `cwIx*` index, dropped with it; and `nodeRepTyIx`, a checker sidecar written in place | probe |
 
 ## The `probe` verdict is a measurement — one row at a time
@@ -98,6 +99,7 @@ Readings on 2026-09-05, master `55f25c3e7`:
 | `anonLeafIndex` | byte-identical | no cell changed class |
 | `fnChildIndex` | byte-identical | no cell changed class |
 | `covarValueWriteState` | byte-identical | no cell changed class |
+| `closureCaptureNames` (graded 2026-09-23, master `9847488c1` + D2017) | byte-identical | no cell changed class |
 
 **Seventeen of nineteen disable edits leave the compiler's own codegen of itself byte-identical
 to master's fixpoint**, and the eleven graded against the corpus — the ten `probe` rows that

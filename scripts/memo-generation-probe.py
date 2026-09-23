@@ -125,6 +125,11 @@ ROWS = [
     ("elemRowsCaptureWalk", ["ercGenP", "ercStamp"], "pass-stamped",
      ("    if ercVal[slot] == 0 - 2 { return true }",
       "    if true { return true }")),
+    # D2017: the key reads `emitPassGen` beside `P.nodes.length` and the reported-edit count,
+    # and the memo is armed only inside the passes `passKeepsCaptures` names.
+    ("closureCaptureNames", ["capMemoGen", "capMemoStamp"], "pass-stamped",
+     ("  if capMemoStamp[fe] == capMemoGen {",
+      "  if false && capMemoStamp[fe] == capMemoGen {")),
     ("covarValueWriteState", ["cwArenaLen", "cwRootNames", "cwRootFrames"], "probe",
      ("  if root == \"\" { return 2 }\n  if P.nodes.length != cwArenaLen {",
       "  if root == \"\" { return 2 }\n  if true {")),
