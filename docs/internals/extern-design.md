@@ -29,7 +29,7 @@ loader; VL's loader is the wasm engine and its contract is the import section.
 
 ```vl
 export extern function nowMillis(): i64
-extern function drawRect(x: i32, y: i32, w: i32, h: i32)
+extern function drawRect(x: i32, y: i32, w: i32, h: i32): void
 ```
 
 Module level, any module, no body, no generics. The declaration mints **no statement and no
@@ -71,9 +71,12 @@ declaration, so the body would be emitted and never reached.
 
 ## 2. Types that may cross
 
-**`i32`, `i64`, `f32`, `f64`, `boolean`** as parameters and as the return; **no return
-annotation is a void import**, not a missing one. Everything else is a check error naming the
-workaround:
+**`i32`, `i64`, `f32`, `f64`, `boolean`** as parameters and as the return, and **`void` as the
+return only** — a wasm import with an empty result list, whose call is a statement. **No return
+annotation is a check error** naming the fix (``write `: void` for an extern that returns
+nothing``): an extern has no body to infer a result from, so the author states it (owner ruling
+2026-09-22, D1997 — this section first read a missing annotation as void, and the call lowering
+did not agree). Everything else is a check error naming the workaround:
 
 ```
 extern `logLine` takes `string`, which cannot cross a host boundary — an extern carries
