@@ -232,6 +232,8 @@ import {
   Unary,
   WhileStmt,
   annTsOf,
+  externLinkOf,
+  externRetIsVoid,
   hasSpreadItem,
   mkTypeRef,
   nodeChildren,
@@ -4136,6 +4138,92 @@ export function captureCountOf(fe: i32) {
   caps.length
 }
 
+// The module-scope `for` binding `name` whose body holds the lifted frame `fe`, or -1. A
+// module loop variable is a start-function local, in scope only inside its own loop's body, so
+// a closure written anywhere else that spells the name means the global meaning (D2010).
+function moduleLoopEnclosing(fe: i32, name: string): i32 {
+  if !moduleBindsLoopVar(emitRootIx, name) { return -1 }
+  if fe < 0 || fe >= fnStmts.length { return -1 }
+  let at = fnStmts[fe]
+  if (
+    fe < fnInstOrigin.length &&
+    fnInstOrigin[fe] >= 0 &&
+    fnInstOrigin[fe] < fnStmts.length
+  ) {
+    at = fnStmts[fnInstOrigin[fe]]
+  }
+  const r = P.nodes[emitRootIx]
+  if r is Program {
+    const stmts = r.progStmts
+    let i = 0
+    while i < stmts.length {
+      const hit = modLoopHolding(stmts[i], name, at)
+      if hit >= 0 { return hit }
+      i = i + 1
+    }
+  }
+  -1
+}
+
+// `moduleLoopEnclosing`'s walk over one module-scope statement: the innermost loop binding
+// `name` whose body contains node `at`, or -1. Stops at a `FuncDecl`, which is its own frame.
+function modLoopHolding(ix: i32, name: string, at: i32): i32 {
+  if ix < 0 || ix >= P.nodes.length { return -1 }
+  const st = P.nodes[ix]
+  if st is ForIn {
+    const inner = modLoopHolding(st.fiBody, name, at)
+    if inner >= 0 { return inner }
+    if (
+      (st.fiVar == name || st.fiVar2 == name) &&
+      nodeSubtreeHas(st.fiBody, at)
+    ) {
+      return ix
+    }
+    return -1
+  }
+  if st is ForRange {
+    const inner = modLoopHolding(st.frBody, name, at)
+    if inner >= 0 { return inner }
+    if st.frVar == name && nodeSubtreeHas(st.frBody, at) { return ix }
+    return -1
+  }
+  if st is WhileStmt { return modLoopHolding(st.whileBody, name, at) }
+  if st is IfStmt {
+    const th = modLoopHolding(st.ifThen, name, at)
+    if th >= 0 { return th }
+    return modLoopHolding(st.ifElse, name, at)
+  }
+  if st is Block {
+    const kids = st.blkStmts
+    let i = 0
+    while i < kids.length {
+      const hit = modLoopHolding(kids[i], name, at)
+      if hit >= 0 { return hit }
+      i = i + 1
+    }
+    return -1
+  }
+  modLoopNoneHere()
+}
+
+// Every statement kind `modLoopHolding` does not test, as one answer: no loop of the module
+// frame. A `FuncDecl` is its own frame, whose loops bind its own locals, and every other kind
+// holds no statement that could be a module-scope `for`.
+function modLoopNoneHere(): i32 { -1 }
+
+// True when node `at` is `ix` or one of its descendants.
+function nodeSubtreeHas(ix: i32, at: i32): boolean {
+  if ix < 0 { return false }
+  if ix == at { return true }
+  const kids = nodeChildren(ix)
+  let i = 0
+  while i < kids.length {
+    if nodeSubtreeHas(kids[i], at) { return true }
+    i = i + 1
+  }
+  false
+}
+
 // A module global and a lifted function name are addressable directly from inside a lifted
 // function, so neither is a capture — unless an enclosing frame binds the same name, when
 // the identifier denotes that binding and dropping it leaves the body reading `global.get`.
@@ -4147,7 +4235,7 @@ function capRecord(name: string, bound: string[], caps: string[]) {
       // The module scope is the one enclosing scope the frame walk cannot reach, and it has
       // a binding form that is not a global: a top-level `for` variable. Without it a closure
       // in a top-level loop body addresses the module function instead of the loop variable.
-      if !moduleBindsLoopVar(emitRootIx, name) {
+      if moduleLoopEnclosing(capFrame, name) < 0 {
         capSiblingFrees(name, bound, caps)
         return 0
       }
@@ -4330,18 +4418,23 @@ export function capScan(ix: i32, bound: string[], caps: string[]) {
     const cal = P.nodes[unwrapParen(n.callFn)]
     if cal is Ident {
       if isBuiltinFnName(cal.identName) { skipCallee = true }
-      // The dunder family takes the same shadowing guard as the numeric one (D1087):
-      // `emitCall`'s intrinsic arms are gated on `identNameIsUserBound`, so a call whose name
-      // the frame binds routes to the value, and the closure's env must carry it for the gate
-      // to find. The condition is the one under which the emitter writes the opcode.
+      // The dunder family, the numeric one and the `extern` imports take one shadowing guard
+      // (D1087): `emitCall`'s arms for them are gated on `identNameIsUserBound`, so a call whose
+      // name the frame binds routes to the value, and the closure's env must carry it for the
+      // gate to find. The condition is the one under which the emitter writes the call.
       if (
         nameIsEmitterIntrinsic(cal.identName) ||
-        isNumIntrinsicName(cal.identName)
+        isNumIntrinsicName(cal.identName) ||
+        externLinkOf(cal.identName) >= 0
       ) {
         let shadowed = capIsBound(bound, cal.identName)
         if fnIndexOf(cal.identName) >= 0 { shadowed = true }
         if globalIndexOf(cal.identName) >= 0 { shadowed = true }
         if parentBindingFrameOf(capFrame, cal.identName) >= 0 {
+          shadowed = true
+        } else if moduleLoopEnclosing(capFrame, cal.identName) >= 0 {
+          // The frame walk stops short of the module scope, whose `for` variable is a
+          // start-function local: `capRecord` reads the same table for the same reason.
           shadowed = true
         }
         if !shadowed { skipCallee = true }
@@ -4534,7 +4627,16 @@ function capturedBindingFrameOf(fnIx: i32, name: string) {
 // only where `parentBindingOf` declines, which is the right precedence by construction.
 function captureLoopVarIterOf(fe: i32, name: string): i32 {
   const par = parentBindingFrameOf(fe, name)
-  if par < 0 || par >= fnStmts.length { return -1 }
+  if par < 0 {
+    // A module-scope `for` variable: a start-function local, typed with the frame -1 its
+    // own `declareForInLocals` call passes, which is what the callers' frame reads answer.
+    const mlv = moduleLoopEnclosing(fe, name)
+    if mlv < 0 { return -1 }
+    const mln = P.nodes[mlv]
+    if mln is ForIn { return mln.fiIter }
+    return -1
+  }
+  if par >= fnStmts.length { return -1 }
   const pfn = P.nodes[fnStmts[par]]
   if pfn is FuncDecl {
     const lv = parentLoopVarOf(pfn.fnBody, name)
@@ -8471,6 +8573,23 @@ function declaredIndexOf(fnIx: i32, name: string) {
 export function envSlotShift(fnIx: i32) {
   if fnValUsed && fnIx >= 0 { return 1 }
   0
+}
+
+// Is `name` bound by the user in this frame — a parameter, a local, or a capture of one?
+// Scoped to callee position only (a parameter named `__load_i32__` is legal VL); a
+// parameter is the only binding form that can hold such a name, since the checker refuses
+// a `function`/`const`/`let` of an intrinsic spelling. Guards a capture-of-parameter miss (D1087).
+export function identNameIsUserBound(name: string, fnIx: i32): boolean {
+  if localIndexOf(fnIx, name) >= 0 { return true }
+  capturedKindOf(fnIx, name) != null
+}
+
+// True when `name` in callee position lowers to a result-less `extern function` import — the
+// scope does not bind the name (a parameter of that spelling wins, as in `emitCall`) and its
+// link row returns void. Such a call leaves nothing on the stack: a statement, never a value.
+export function calleeIsVoidExtern(name: string, fnIx: i32): boolean {
+  if identNameIsUserBound(name, fnIx) { return false }
+  externRetIsVoid(externLinkOf(name))
 }
 
 // Resolve an identifier `name` to its wasm local index for function `fnIx`: a live lexical
@@ -14819,6 +14938,7 @@ export function stmtIsTailValue(stmtIx: i32, fnIx: i32) {
       // table rather than by spelling, so a diverging slot added there cannot be missed
       // here — every other entry above is a name, which a new slot would not carry.
       if fsRetIsVoid(fsIntrinsicSlot(callee.identName)) { return false }
+      if calleeIsVoidExtern(callee.identName, fnIx) { return false }
       const target = fnIndexOf(callee.identName)
       // A live closure binding of the name is what the tail denotes, so the voidness is
       // that closure's and the module function of the name settles nothing (D1602).

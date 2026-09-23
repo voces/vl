@@ -1335,6 +1335,19 @@ it worked.
   Full argument, the JS loader shape, and why std's own floor is NOT migrated:
   `docs/internals/extern-design.md`.
 
+- **AN EXTERN STATES ITS RESULT, `: void` INCLUDED** (2026-09-22, owner ruling on plumb's PL-013,
+  D1997). `extern function g(a: i32): void` is a wasm import with an empty result list, and a
+  call to it is a statement: using its value where one is required is the check error a void
+  `function` gets. An extern with NO return type is a check error naming the fix — a `function`
+  infers its result from its body, and an extern has none, so a missing annotation cannot be
+  read as a choice. (The first design read it as a void import; the call lowering never agreed,
+  and the program built invalid wasm.) `void` is legal in the return position only, never as a
+  parameter. **The old refusal of `: void` was not a decision**: the return annotation went
+  through the parameter whitelist (`externScalarTy`), whose message is about bytes and `Buf`, so
+  `void` was rejected incidentally rather than because a result-less import was unwanted. Two
+  declarations of one link name that disagree (`: void` beside `: i32`) stay refused by the
+  existing link-signature rule.
+
 - **A `string` is UTF-8 BYTES behind a slice header, and the surface is
   BYTE-INDEXED.** `s[i]` is a byte (0–255, O(1)), `.length` is the byte count
   (O(1)), `slice(a, b)` takes byte offsets and returns an O(1) view; code points
@@ -5660,6 +5673,47 @@ whitelist over literals, identifier reads, places and arithmetic; every kind it 
 a call, a lambda, a `MatchExpr`, every statement kind — answers "possibly effectful" and puts
 its literal on the scratch path. A kind nobody has classified is never silently reordered.
 
+## The host's dependencies build at opt-level 3; the host crate stays at 1 (2026-09-22)
+
+`scripts/vl-host` shipped with `[profile.release] opt-level = 1` from its first commit (#275),
+with no recorded reason, and that setting reached every dependency — wasmtime, Cranelift and
+the GC collector. Those are not the thin OS shim the crate is: they run every guest and compile
+every module, so the collector's copy loop and Cranelift itself ran at O1. The decoder-gap
+investigation (#3022, lane L2) measured it; this change is
+`[profile.release.package."*"] opt-level = 3`, deps only.
+
+Measured on this box, one A/B pair interleaved per iteration (so contention lands on both arms),
+median CPU seconds (user+sys), readings taken at load ≤ 15 unless marked:
+
+| workload | O1 deps | O3 deps | Δ |
+| --- | --- | --- | --- |
+| plumb `decode-bench` `1` (decode, default GC heap) | 3.96 | 2.87 | −27.5% |
+| plumb `decode-bench` `0` (per-run fixed cost: Cranelift of the guest) | 0.78 | 0.64 | −18.0% |
+| seed Cranelift compile, no `.cwasm` sidecar (first run per content key) | 17.8 | 14.0 | −21.5% (load ~80) |
+| self-compile `vl build compiler/entry.vl`, warm sidecar | 5.45 | 5.27 | −3.4% (a second reading −8.4% at load ~80) |
+| `vl run hello.vl`, warm sidecar | 0.029 | 0.025 | −16% (11 samples; wall 14 → 12 ms) |
+| release binary size | 25,878,456 B | 22,285,344 B | −13.9% |
+
+The self-compile barely moves, and that is expected rather than disappointing: a warm run executes
+the seed's CRANELIFT OUTPUT, which the host's opt level does not touch — only the collector and
+libcalls get faster. What moves is everything Rust: the GC (decode) and Cranelift (every
+uncached compile, including each user program `vl run` builds).
+
+**The host crate stays at 1 on purpose.** It is the only unit a dev loop or CI rebuilds without
+a manifest change — `ci-embed-seed` recompiles it on every run because `build.rs` tracks the
+seed — so its compile time is paid often, and nothing hot lives in it.
+
+**The price is build CPU, and it was smaller than predicted.** #3022 recorded +35% for a cold
+build (1m03 → 1m25, one reading on a loaded box). Four cold readings here did not reproduce a
+wall-clock cost: at `-j8`, 106.7 s / 120.0 s at O1 against 108.9 s / 107.0 s at O3 (user CPU
+604 / 597 → 669 / 654, +10%); at `-j4`, closer to a CI runner, 184.7 s against 133.7 s with
+user CPU 501 against 495 — the O1 run met a load spike, so read that pair as "no measurable
+difference", not as a speed-up. A cold build is dominated by a few large crates on the critical
+path either way. CI pays it only on a cache miss: every `vl-bin-*` and `cargo-*` key already
+hashes `Cargo.toml`, so this change is one clean miss, then warm. The distributed binary
+(`scripts/build-binary.sh`, `release.yml`) builds the same `--release` profile and gets the
+change too.
+
 ## std ships inside the binary; a pin is one file; development overrides are explicit and announced (owner question 2026-09-03) — D1573/D1574, BUILT
 
 The owner asked whether `vl` should distribute with std baked in. It should, and the reason is
@@ -6031,3 +6085,62 @@ NaN bit patterns have, which is why it alone stays a separately-gated, opt-in ti
 (`simd-design.md` §A4/§D/§O6) rather than something treated as deterministic-in-practice.
 `simd-design.md` §A4 and `serde-design.md` OQ-3 both carry a reconciling note pointing here; full
 rationale and the measurement table: `docs/internals/numeric-determinism-rulings.md` §4.
+
+## Linear memory is a layout contract: a unit owns only its heap window (owner, 2026-09-22) — plumb PL-003(a)
+
+**The old model was implicit: one module owns its linear memory from address 0.** Every VL
+program DEFINED and EXPORTED its memory, and `std:buffer`'s allocator started its bump pointer
+at a hard-coded 1024 and grew the memory on demand. Nothing else in a VL module touches linear
+memory — there is no data section, strings and lists are GC objects, and the compiler keeps no
+shadow stack — so the allocator was the whole of VL's claim on the address space, and it
+claimed all of it. **Separate compilation broke that.** plumb links ~150 separately compiled
+units with `wasm-merge` over ONE host-owned memory holding a 221 MB guest image at a fixed base;
+a unit that defines its own memory cannot share one, and two units that each allocate `Buf`s
+both start at 1024 and hand out the SAME address (measured: unit B's first `Buffer(16)` is unit
+A's, and overwrites it).
+
+**Ruled: a unit owns only its heap window `[base, limit)`, and nothing outside it.**
+
+- **`vl build --import-memory`** takes the memory as `(import "env" "memory" (memory 1))` —
+  wasm-ld's `--import-memory` spelling and name, min 1 page, no max, unshared — instead of
+  defining it. **It is NOT re-exported**: the host already holds the memory it supplied, and
+  N units each exporting `memory` is a FATAL `wasm-merge` name conflict (measured). Fixed name,
+  no `=<module>.<field>` override — nothing has asked for another, and it can be added without
+  breaking this spelling. A module that touches no linear memory has none to import; the flag
+  changes none of its bytes. `vl run` refuses the flag (exit 2): it has no memory to supply.
+- **The window is two immutable i32 globals**, the shape of wasm-ld's `__heap_base`, read by the
+  intrinsics `__heap_base__()` / `__heap_limit__()`. `std:buffer` starts its bump pointer at the
+  base, and a `Buffer` whose end would pass the limit TRAPS rather than growing into memory the
+  host owns; growth stays on demand inside the window. Defaults reproduce the old behaviour
+  exactly — base 1024, limit 2^31-8 (the largest 8-aligned i32 — the allocator's pre-existing 2 GiB overflow cap) — so a
+  single-module build is unchanged in behaviour.
+- **The flags set them: `--heap-base=<n>` / `--heap-limit=<n>`** (decimal or `0x`; the base a
+  nonzero multiple of 8, the limit a multiple of 8 at least the base). **Chosen over IMPORTED globals**, because
+  a window is per UNIT and an import is per NAME: under `wasm-merge`, N units importing
+  `env.__heap_base` would all receive the same value, so disjoint windows would need a unique
+  import name per unit and a host that knows them all. Baked into each unit's own global, the
+  window travels with the unit and the linker needs to know nothing. An imported spelling can be
+  added later beside this one if a host wants to place windows at load time.
+- **A code-only unit carries NO layout at all**: the globals exist only in a module that reads
+  one (in practice, one that imports `std:buffer`, directly or through `std:fs`), there is no
+  data section anywhere, and a unit of raw loads and stores over guest addresses is pure code
+  over the imported memory (pinned: no memory, global or data section).
+
+**What the contract does not cover yet**: a unit that pokes raw addresses through the bare
+intrinsics (`__store_i32__`) is trusted, as before — that is how a transliterated unit works on
+guest memory.
+
+**Linking to ONE memory is a recipe, not a VL mechanism.** Merged naively, `wasm-merge` keeps each
+unit's `env.memory` import as its own memory index — N memories bound to one object, which
+needs multi-memory. `wasm-merge` resolves an import against the input module whose NAME matches,
+so the recipe adds a provider named `env` that re-exports a single import:
+`(module (import "host" "memory" (memory 1)) (export "memory" (memory 0)))`, linked as
+`wasm-merge env.wasm env u0.wasm u0 u1.wasm u1 …`. Every unit's `env.memory` collapses onto that
+one memory, imported by the result as `host.memory`, and it validates without multi-memory. Two
+caveats: the provider cannot itself import `env.memory` (it would resolve against itself), and
+the merged module re-exports `memory` from the provider. The layout flags are parsed strictly —
+a misspelled, space-separated, valued or repeated layout flag exits 2 — because falling back to
+the default window silently puts a unit's heap at 1024, which may be inside the host's image.
+A `vl link` command wrapping the recipe is a separate follow-up. Pinned by
+`tests/vl_import_memory_test.ts`, including the two-unit collision, its fix, and the recipe's one
+memory.

@@ -1709,7 +1709,9 @@ function statementInline(ix: i32, indent: i32) {
   if n is ForRange { return sliceFallback(ix) }
   if n is ForIn { return sliceFallback(ix) }
   if n is Block { return sliceFallback(ix) }
-  if n is IfStmt { return sliceFallback(ix) }
+  // An `if` here is an expression body (`() => if …`): it takes the expression printer, whose
+  // multi-line form keeps every arm's statements apart (D1998).
+  if n is IfStmt { return ifExpr(ix, n, indent) }
   expr(ix, indent, 0)
 }
 
@@ -2714,9 +2716,7 @@ function ifExpr(ix: i32, node: IfStmt, indent: i32) {
   // comment cannot ride the inline form, so it stays anchored by falling through to the
   // verbatim slice.
   const hasCmt = commentInCharSpan(nodePos(ix), nodeEndOf(ix))
-  let elseOk = node.ifElse < 0
-  if !elseOk { elseOk = branchIsSimple(node.ifElse) || elseIsIf(node.ifElse) }
-  if !hasCmt && branchIsSimple(node.ifThen) && elseOk {
+  if !hasCmt && ifChainIsSimple(ix) {
     const cond = expr(node.ifCond, indent, 0)
     const thenE = bareBodyInline(node.ifThen, indent)
     let parts = "if " + cond + " { " + thenE + " }"
@@ -2730,6 +2730,48 @@ function ifExpr(ix: i32, node: IfStmt, indent: i32) {
     }
     return parts
   }
+  // A multi-line arm cannot ride the whitespace-collapsing slice: it would join its
+  // statements onto one line. Render every arm as a block instead (D1998).
+  if !hasCmt && startLineOf(ix) != stopLineOf(ix) {
+    return ifExprBlocks(node, indent)
+  }
+  sliceFallback(ix)
+}
+
+// Whether every arm of the `if` chain at `ix` is one simple expression, so the chain can
+// render inline; an `else if` arm is judged like the first.
+function ifChainIsSimple(ix: i32): boolean {
+  const n = P.nodes[ix]
+  if n is IfStmt {
+    if !branchIsSimple(n.ifThen) { return false }
+    if n.ifElse < 0 { return true }
+    if elseIsIf(n.ifElse) { return ifChainIsSimple(n.ifElse) }
+    return branchIsSimple(n.ifElse)
+  }
+  false
+}
+
+// An `if` expression with each arm rendered as a multi-line block, `else if` included.
+function ifExprBlocks(node: IfStmt, indent: i32): string {
+  let parts = "if " +
+    expr(node.ifCond, indent, 0) +
+    " " +
+    armBlock(node.ifThen, indent)
+  if node.ifElse >= 0 {
+    const e = P.nodes[node.ifElse]
+    if e is IfStmt {
+      parts = parts + " else " + ifExprBlocks(e, indent)
+    } else {
+      parts = parts + " else " + armBlock(node.ifElse, indent)
+    }
+  }
+  parts
+}
+
+// One `if`-expression arm as a block; a non-block arm (none is parsed) keeps its slice.
+function armBlock(ix: i32, indent: i32) {
+  const n = P.nodes[ix]
+  if n is Block { return blockExpr(ix, n, indent) }
   sliceFallback(ix)
 }
 
