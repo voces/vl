@@ -477,8 +477,9 @@ program verbatim — the only way to pass one that starts with `-`.
 {b}Environment:{r}
   {c}VL_GC{r}               Collector for the program: auto (default) | tracing |
                       refcount | none
-  {c}VL_COMPILE_GC{r}       Collector for the compiler: auto (default: null below a
-                      1.5 MiB source, copying at or above) | null | copying
+  {c}VL_COMPILE_GC{r}       Collector for the compiler: auto (default: null when the
+                      ENTRY FILE is under 1.5 MiB, copying at or above; imports do
+                      not count) | null | copying
   {c}VL_COMPILER_WASM{r}    Compiler seed path (when --compiler is not given)
   {c}VL_STD{r}              VL's std/ directory (the only candidate when set)
   {c}NO_COLOR{r}            Disable ANSI in printed values (also off when stdout is
@@ -998,8 +999,8 @@ fn seed_engine_sized(collector: Collector, initial: Option<u64>) -> Result<Engin
     Engine::new(&cfg)
 }
 
-/// The engine for a ONE-SHOT compile (`vl build`, `vl run`) of an entry source of
-/// `source_len` bytes. `$VL_COMPILE_GC` picks the collector: `null`, `copying`, or
+/// The engine for a ONE-SHOT compile (`vl build`, `vl run`) whose ENTRY FILE is
+/// `source_len` bytes; imports are loaded later and do not count. `$VL_COMPILE_GC` picks the collector: `null`, `copying`, or
 /// `auto` (the default), which is null below `COPYING_COMPILE_THRESHOLD` and copying
 /// at or above it. An unknown value is a hard error, as `$VL_GC`'s is.
 ///
@@ -1007,21 +1008,22 @@ fn seed_engine_sized(collector: Collector, initial: Option<u64>) -> Result<Engin
 /// allocated, and the GC heap's 32-bit index caps that at 4 GiB (a ~15.6 MB source).
 /// Small sources are cheapest under null; above the threshold copying uses less
 /// memory at about the same CPU. DECISIONS.md, "The compiler's collector is picked by
-/// the size of the source".
+/// the size of the entry file".
 fn compile_engine(source_len: usize) -> Result<Engine> {
     let collector = compile_collector(source_len)?;
     // `$VL_COMPILE_GC_TRACE=1` names the choice on stderr, so a test can see it.
     if std::env::var("VL_COMPILE_GC_TRACE").is_ok_and(|v| v == "1") {
         let name = if matches!(collector, Collector::Copying) { "copying" } else { "null" };
-        eprintln!("vl: compile collector: {name} (entry source {source_len} bytes)");
+        eprintln!("vl: compile collector: {name} (entry file {source_len} bytes)");
     }
+    COMPILE_UNDER_NULL.store(!matches!(collector, Collector::Copying), Ordering::Relaxed);
     match collector {
         Collector::Copying => seed_engine_sized(collector, Some(COPYING_COMPILE_HEAP_INITIAL)),
         _ => seed_engine(collector),
     }
 }
 
-/// `auto` moves to the copying collector at this entry-source size, where the null
+/// `auto` moves to the copying collector at this entry-file size, where the null
 /// collector's footprint overtakes the copying collector's first heap.
 const COPYING_COMPILE_THRESHOLD: usize = 3 << 19; // 1.5 MiB
 
@@ -5988,6 +5990,10 @@ fn source_frames(err: &Error) -> Option<String> {
 /// later error to inherit.
 static FAULT_IN_COMPILER: AtomicBool = AtomicBool::new(false);
 
+/// Set by `compile_engine` when the one-shot compile runs under the null collector, so
+/// a compiler trap on `allocation size too large` can name the collecting escape.
+static COMPILE_UNDER_NULL: AtomicBool = AtomicBool::new(false);
+
 /// A module the emitter produced that the ENGINE refuses. `vl check` returned 0 to reach
 /// the emitter at all, so an invalid module is the compiler's fault by construction: it
 /// exits 70 like a compiler trap (#2483), so a caller can tell a vl BUG from a bad
@@ -6076,6 +6082,17 @@ fn report(err: Error) -> ! {
     }
     if let Some(note) = trap.and_then(trap_explanation) {
         eprintln!("\nnote: {note}");
+    }
+    // No automatic retry under copying: DECISIONS.md, "The compiler's collector is picked
+    // by the size of the entry file", says why. The escape is named instead.
+    if compiler_bug
+        && matches!(trap, Some(Trap::AllocationTooLarge))
+        && COMPILE_UNDER_NULL.load(Ordering::Relaxed)
+    {
+        eprintln!(
+            "note: this compile ran under the null collector, which never frees and caps one \
+             object at 64 MiB; `VL_COMPILE_GC=copying` compiles under a collecting one"
+        );
     }
     std::process::exit(if compiler_bug || invalid_module {
         EXIT_COMPILER_BUG

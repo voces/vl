@@ -18,6 +18,11 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 VL="${VL:-scripts/vl-host/target/release/vl}"
+# The self-compile's collector is a CHOICE, not the size heuristic's accident: the compiler
+# is a multi-file graph with a small entry file, so `auto` already picks null, and pinning it
+# keeps a heuristic change from silently moving the fixpoint's CPU (DECISIONS.md, "The
+# compiler's collector is picked by the size of the entry file").
+export VL_COMPILE_GC=null
 SEED="${SEED:-build/vl-compiler.wasm}"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT

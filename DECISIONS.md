@@ -6310,15 +6310,16 @@ every local must have a non-boxing representation, decided from types before emi
   bumps the arena epoch, because it changes the tree in place and the parse bank's replay would
   otherwise hand lint a tree whose callee rows were popped.
 
-## The compiler's collector is picked by the size of the source (2026-09-22) — plumb PL-002 follow-up
+## The compiler's collector is picked by the size of the entry file (2026-09-22) — plumb PL-002 follow-up
 
 `vl build` and `vl run` used to compile under wasmtime's NULL collector always. It never frees,
 so a compile's peak memory is every byte the compiler ever allocated, and the GC heap's 32-bit
 index caps that at 4 GiB, a ~15.6 MB source. plumb compiles 1.16 GB of generated VL in 551 units
 (p50 2.0 MB, max 8.7 MB) in parallel, and memory per unit is its bottleneck.
 
-**The rule** (`compile_engine`, `scripts/vl-host/src/main.rs`): below **1.5 MiB** of entry
-source, null; at or above it, the **copying** collector with a **384 MiB** first heap.
+**The rule** (`compile_engine`, `scripts/vl-host/src/main.rs`): when the ENTRY FILE is under
+**1.5 MiB**, null; at or above it, the **copying** collector with a **384 MiB** first heap.
+Imports do not count.
 `$VL_COMPILE_GC=auto|null|copying` overrides it; an unknown value is refused.
 `$VL_COMPILE_GC_TRACE=1` names the choice on stderr, which `tests/vl_compile_gc_test.ts` pins
 at the threshold byte.
@@ -6344,7 +6345,9 @@ The synth inputs are plumb's own generator (`vl-probes/synth/gen.vl <F> 20 10`).
 saves memory, and saves none below ~1.5 MB: its first heap is a floor of ~415 MB once a compile
 allocates more than one 192 MiB semispace, which is where null's footprint crosses it (`s130`).
 The self-compile is +59% under copying and the gate runs it many times; its entry file is small,
-so it stays null. The threshold reads the ENTRY file only, because the host loads imports on
+so `auto` picks null, and every self-compile script (`native-fixpoint.sh`,
+`self-compile-time.sh`, `refresh-compiler.sh`, `survey-profile.sh`) also exports
+`VL_COMPILE_GC=null`, so a change to the threshold cannot move the fixpoint's collector. The threshold reads the ENTRY file only, because the host loads imports on
 demand and cannot sum them first. A small entry importing large modules therefore stays null;
 `VL_COMPILE_GC=copying` is the escape.
 
@@ -6361,8 +6364,16 @@ value, and `refresh-compiler.sh` warms its sidecar with the other two.
 **Why not the alternatives.**
 * *DRC (refcount)*: `s200`, 2.8 s under null, had run 47,169 collections in 10 minutes when
   it was stopped.
-* *Null, retrying copying on `allocation size too large`*: pays the whole failed compile first,
-  and it never engages below ~15 MB, where plumb's units are.
+* *Null, retrying once under copying on `allocation size too large`* (the backstop for a small
+  entry file over a large import graph). Declined, for three reasons. The failed attempt has
+  already paid its peak before the retry starts, up to 4 GiB and ~15 s at the heap cap, and that
+  peak is what plumb schedules its parallelism against. The same trap is also the only symptom
+  of a real single-object cap in the compiler (D1975, [D1976](docs/internals/inventory/D1976.md)),
+  and wasmtime reports both as `AllocationTooLarge`, so the host cannot tell them apart. A retry
+  would hide those defects behind a slower build: D1976's witness would stop trapping and hit
+  [D2092](docs/internals/inventory/D2092.md) instead. Instead, a compiler trap on this error
+  under null ends with a note naming `VL_COMPILE_GC=copying`, which `tests/vl_compile_gc_test.ts`
+  pins on D1976's own witness.
 * *A bigger or 64-bit GC heap*: wasmtime 47 has neither. `VMGcRef` is a `u32`, the heap's memory
   type is `IndexType::I32`, and `grow_gc_heap` saturates at `1 << 32`. `gc_heap_reservation` is
   virtual address space only; it does not raise the cap. Under copying the cap is a 2 GiB
@@ -6370,12 +6381,14 @@ value, and `refresh-compiler.sh` warms its sidecar with the other two.
 * *Capping the heap with a `ResourceLimiter`*: a denied growth fails the allocation. wasmtime
   does not fall back to a smaller growth step.
 
-**A side effect: D1976 moved.** Its 3.2 MB witness trapped on the null collector's 64 MiB cap
-for one object (an `i32[]` output buffer past 2^23 slots). The copying collector has no such
-cap, so the witness now builds, and running it then costs Cranelift 127 s and 25 GB to compile
-the 9.6 MB module. The first gate run on this change graded that witness, and earlyoom killed
-it. The row now grades a one-function spelling, which reaches the engine's function-body limit
-in 0.6 s. Under `VL_COMPILE_GC=null` both still trap.
+**A side effect: D1976's first witness moved.** It was one 3.2 MB file and trapped on the null
+collector's 64 MiB cap for one object (an `i32[]` output buffer past 2^23 slots). As an entry
+file of 1.5 MiB or more it now compiles under copying, which has no such cap, and running it
+costs Cranelift 127 s and 25 GB for the 9.6 MB module (earlyoom killed it in the first gate run).
+The row now grades a two-file witness whose entry file is small, so it keeps the null collector
+and still traps, in 0.4 s. A one-file literal of the same length under copying reaches wasmtime's
+7,654,321-byte function-body limit instead, which is its own row,
+[D2092](docs/internals/inventory/D2092.md).
 
 **plumb's "under 1 GB for a 10–20 MB unit" is not reachable with a collector choice.** The live
 set is the floor, and it is ~59 bytes per source byte: 592 MiB at 10 MB. `vl check`, which stops
