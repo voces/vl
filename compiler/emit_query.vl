@@ -43,6 +43,7 @@ import {
   TypeRef,
   Unary,
   WhileStmt,
+  nodeChildren,
 } from "./ast"
 import { numLexFitsI32, numLexIsFloat } from "./emit_bignum"
 import {
@@ -554,54 +555,45 @@ export function blockHasContinueFor(
   label: string,
   nested: boolean,
 ) {
-  const b = P.nodes[blockIx]
-  if b is Block {
-    const stmts = b.blkStmts
-    let i = 0
-    while i < stmts.length {
-      const st = P.nodes[stmts[i]]
-      if st is ContinueStmt {
-        if st.contLabel == "" {
-          if !nested { return true }
-        } else {
-          if label != "" && st.contLabel == label { return true }
-        }
-      } else if st is IfStmt {
-        if ifHasContinueFor(stmts[i], label, nested) { return true }
-      } else if st is WhileStmt {
-        if label != "" {
-          if blockHasContinueFor(st.whileBody, label, true) { return true }
-        }
-      } else if st is ForRange {
-        if label != "" {
-          if blockHasContinueFor(st.frBody, label, true) { return true }
-        }
-      } else if st is ForIn {
-        if label != "" {
-          if blockHasContinueFor(st.fiBody, label, true) { return true }
-        }
-      }
-      i = i + 1
+  subtreeHasContinueFor(blockIx, label, nested)
+}
+// The walk behind `blockHasContinueFor`, over every child, so a `continue` inside an
+// expression (a value `if` or `match` arm, D2050) is found as well as one in a statement.
+// A nested loop's body is `nested`; a function body is a boundary no `continue` crosses.
+// An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
+function subtreeHasContinueFor(ix: i32, label: string, nested: boolean) {
+  let cur = ix
+  while cur >= 0 && cur < P.nodes.length {
+    const n = P.nodes[cur]
+    if n is IfStmt {
+      if subtreeHasContinueFor(n.ifCond, label, nested) { return true }
+      if subtreeHasContinueFor(n.ifThen, label, nested) { return true }
+      cur = n.ifElse
+    } else {
+      return nodeHasContinueFor(cur, label, nested)
     }
   }
   false
 }
-// The `if`-statement descent of `blockHasContinueFor`: both arms, including a
-// chained `else if`.
-function ifHasContinueFor(ifIx: i32, label: string, nested: boolean) {
-  // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
-  let cur = ifIx
-  while cur >= 0 {
-    const st = P.nodes[cur]
-    cur = -1
-    if st is IfStmt {
-      if blockHasContinueFor(st.ifThen, label, nested) { return true }
-      if st.ifElse >= 0 {
-        const els = P.nodes[st.ifElse]
-        if els is Block { return blockHasContinueFor(st.ifElse, label, nested) }
-        if els is IfStmt { cur = st.ifElse }
-      }
-    }
+// One node of `subtreeHasContinueFor`'s walk other than an `if`: a `continue`, a boundary,
+// or a descent into every child.
+function nodeHasContinueFor(ix: i32, label: string, nested: boolean) {
+  const n = P.nodes[ix]
+  if n is ContinueStmt {
+    if n.contLabel == "" { return !nested }
+    return label != "" && n.contLabel == label
+  }
+  if n is FuncDecl { return false }
+  let inner = nested
+  if n is WhileStmt || n is ForRange || n is ForIn {
+    if label == "" { return false }
+    inner = true
+  }
+  const kids = nodeChildren(ix)
+  let i = 0
+  while i < kids.length {
+    if subtreeHasContinueFor(kids[i], label, inner) { return true }
+    i = i + 1
   }
   false
 }
