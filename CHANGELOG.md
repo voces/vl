@@ -738,7 +738,8 @@ new: the compare-frame pre-pass never recurses into a code-15 field, so a NESTED
   `export function` follows, so a dependency's `export let` stays a VL-level export and a
   non-scalar one is not published. `vl run` provides no globals and refuses at load, naming the
   global. `tests/vl_extern_global_test.ts` pins the sections, a host `WebAssembly.Global` seen
-  through writes in both directions, two units linked by V8 and by `wasm-merge` (+ `-O3`), and
+  through writes in both directions, two units linked by V8, by `wasm-merge` (+ `-O3`) and by a
+  merge through a generated `extern` facade (the multi-unit recipe, `cli-design.md`), and
   mutability as part of the link. Found on the way: [D2020](docs/internals/inventory/D2020.md), a
   module `let x: T` with no initializer checks clean and then has no emitter cell. `DECISIONS.md`
   §"Globals cross the wasm boundary"; guide `docs/guide/extern.md`.

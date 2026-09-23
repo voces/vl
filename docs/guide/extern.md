@@ -119,9 +119,21 @@ export function incr(): void {
 ```
 
 A separately built unit declaring `extern let rax: i64`, `extern const width: i32` and
-`extern function incr(): void` links to these — through `wasm-merge` (name the exporting unit
-`extern`, as for functions) or by handing one instance's exports to the other's `extern` imports —
-and both units then read and write one global. `export const` is published immutable, so the
+`extern function incr(): void` links to these — by handing one instance's exports to the other's
+`extern` imports, or through `wasm-merge` — and both units then read and write one global.
+
+With `wasm-merge`, whatever satisfies an `extern` import must be the input named `extern`. For
+two units, name the exporting one `extern`. For more, generate a small facade module that
+imports each name from the unit that defines it and re-exports it, and merge it as `extern`:
+
+```sh
+wasm-merge facade.wasm extern ua.wasm ua ub.wasm ub -o linked.wasm --rename-export-conflicts \
+  --enable-gc --enable-reference-types --enable-bulk-memory --enable-tail-call
+```
+
+After the merge every call is direct and every global access reads or writes the defining unit's
+global; no `extern` import is left. The facade's exact shape is in
+`docs/internals/cli-design.md`, "the facade recipe". `export const` is published immutable, so the
 importer must declare it `extern const`; an `extern let` of it fails to link. An `export let` in a
 module you import rather than build stays an ordinary VL export, and one of any other type (a
 string, a list, a struct) is not published to the host at all.

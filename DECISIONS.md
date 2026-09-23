@@ -6187,6 +6187,15 @@ import a mutable global another unit (or the embedder) owns, and a unit to expor
   `export const` with a constant initializer is exported immutable (so `extern const` links to
   it); one whose initializer runs in the start function is necessarily a mutable cell and is
   exported mutable. A published binding is never promoted to a start-function local.
+- **Multi-unit linking goes through a generated facade, not a per-extern import module (owner,
+  2026-09-22).** Every extern name is imported from `extern`, so with three or more units no
+  single unit can take that name under `wasm-merge`. An `extern … from "module"` clause was
+  considered and DEFERRED: it would be permanent syntax serving one generated-code consumer, and
+  it can be added later without breaking anything written today. Instead a generated facade
+  named `extern` imports each name from its defining unit and re-exports it, merged with
+  `--rename-export-conflicts` (`cli-design.md`, "the facade recipe"). Measured for globals too: an
+  imported MUTABLE global re-exported through the facade resolves to the defining unit's own
+  global, with no `extern` import left and every access a direct `global.get`/`global.set`.
 - **`vl run` provides no globals and refuses at load**, naming the global and the fix (build and
   link it). Supplying zero-initialized globals was the alternative and was declined: the program
   would read a value nobody set, which is exactly what the contract exists to prevent. The same

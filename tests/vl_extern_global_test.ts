@@ -8,7 +8,8 @@
 //      write the host makes between two reads (from top level, a function and a closure), and
 //      the host sees every write the program makes.
 //   3. SEPARATELY BUILT UNITS SHARE ONE GLOBAL — through V8 (one instance's exports as the
-//      next one's `extern` imports) and through `wasm-merge` plus `-O3`. Mutability is part of
+//      next one's `extern` imports), through `wasm-merge` plus `-O3`, and through a merge whose
+//      `extern` is a generated facade re-exporting each name from its unit. Mutability is part of
 //      the link: an `extern let` against an `export const` is a link error.
 //   4. `vl run` PROVIDES NO GLOBALS and refuses at load, naming the global.
 //
@@ -34,8 +35,8 @@ const FEATURES = [
 
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
 const ENABLED = GATED && exists(VL) && exists(COMPILER);
-const TOOLS = ENABLED && exists(`${BIN}/wasm-merge`) && exists(`${BIN}/wasm-opt`) &&
-  exists(`${BIN}/wasm-dis`);
+const TOOLS = ENABLED &&
+  ["wasm-merge", "wasm-opt", "wasm-as", "wasm-dis"].every((t) => exists(`${BIN}/${t}`));
 if (GATED && !ENABLED) {
   console.warn("[vl-extern-global] skipped — missing vl binary or seed wasm.");
 }
@@ -231,6 +232,37 @@ Deno.test({
       const opt = `${dir}/merged.O3.wasm`;
       await mustExec(`${BIN}/wasm-opt`, [merged, ...FEATURES, "-O3", "-o", opt]);
       expectEq("merged -O3", await run(opt), LINKED_LOGS);
+
+      // The facade recipe (`cli-design.md`): a generated module NAMED `extern` imports each
+      // name from its defining unit and re-exports it, so no unit has to be named `extern`.
+      // An imported mutable global re-exported through it still resolves to the one cell.
+      await Deno.writeTextFile(
+        `${dir}/facade.wat`,
+        `(module
+  (import "a" "rax" (global $rax (mut i64)))
+  (import "a" "width" (global $width i32))
+  (import "a" "incr" (func $incr))
+  (export "rax" (global $rax))
+  (export "width" (global $width))
+  (export "incr" (func $incr)))
+`,
+      );
+      const facade = `${dir}/facade.wasm`;
+      await mustExec(`${BIN}/wasm-as`, [`${dir}/facade.wat`, ...FEATURES, "-o", facade]);
+      const viaFacade = `${dir}/facade-merged.wasm`;
+      await mustExec(`${BIN}/wasm-merge`, [
+        facade,
+        "extern",
+        a,
+        "a",
+        b,
+        "b",
+        "--rename-export-conflicts",
+        ...FEATURES,
+        "-o",
+        viaFacade,
+      ]);
+      expectEq("merged through the facade", await run(viaFacade), LINKED_LOGS);
     }),
 });
 
