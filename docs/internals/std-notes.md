@@ -834,6 +834,9 @@ Slice S3 of `docs/internals/simd-design.md` — the `F32x4` surface over the `__
 - **`dot`/`normalize` read all four lanes** (vec4 semantics). A vec3 is "padded" with `w = 0`,
   which makes the four-lane and three-lane answers equal; O7's "ignored" is only literally
   true of `cross`. Flagged to the owner with D1980.
+- **Unsuffixed methods own their names.** `dot`/`cross`/`normalize` (O7) are ordinary
+  functions, so a later `F64x2` must use `dotF64x2`. A caller module with its own `dot` loses
+  the no-import spelling (D1984); the header documents the aliased-import workaround.
 - **Not shipped: lane read-back** (D1980). `std:simd` cannot wrap a literal-lane intrinsic,
   and `.x` needs property syntax. The header points callers at `storeF32x4` + `loadF32`.
 - **What grades it.** `tests/cases/simd/f32x4-std-surface.vl` (every op, lane order, NaN and

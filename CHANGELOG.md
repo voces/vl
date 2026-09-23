@@ -24,7 +24,7 @@ see **`DECISIONS.md`**.
   vector are refused as design; a vector inside an array/struct/map/nullable/union is refused
   loudly (D1981, was invalid wasm for the inferred array). NOT shipped, pending an owner ruling:
   lane read-back — `.x/.y/.z/.w` need property syntax and `laneF32x4(v, i)` cannot carry a
-  literal through a std wrapper (D1980). Function values over vectors stay emit-refused (D1982).
+  literal through a std wrapper (D1980). Function values over vectors stay emit-refused (D1982); a caller's own `dot` hides the vector's (D1984).
 - **SIMD design finalized — the owner ruled all ten open questions in `simd-design.md` §F, now
   rewritten from questions into decisions.** `std:simd`: a closed family of nominal `new`-newtype
   vector types (`F32x4`, …) over an internal `v128` substrate — a library, not a language builtin,
