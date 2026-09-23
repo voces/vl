@@ -27734,6 +27734,8 @@ function desugarMatchAt(ix: i32) {
 // The matches found by the walk, innermost first, each beside a copy of its ancestor path.
 let hmsMatches: i32[] = []
 let hmsPaths: i32[][] = []
+// Every name the program can rebind — a `let`, a parameter, a loop variable — by spelling.
+let hmsRebindable: {[string]: boolean} = Map()
 
 // By declaration node: the top-level statement a `$scrut…` global is bound ahead of, or -1.
 // Never reset: `topStmtOrderKey` trusts an entry only while its node is such a binding, and no
@@ -27788,6 +27790,7 @@ function matchLeafIsLitOrLambda(ix: i32): boolean {
 function hoistMatchScrutinees(rootIx: i32) {
   hmsMatches = []
   hmsPaths = []
+  hmsRebindable = Map()
   const anc: i32[] = []
   hmsWalk(rootIx, anc)
   let done = 0
@@ -27798,6 +27801,7 @@ function hoistMatchScrutinees(rootIx: i32) {
   }
   hmsMatches = []
   hmsPaths = []
+  hmsRebindable = Map()
   done
 }
 
@@ -27812,6 +27816,7 @@ function hmsWalk(ix: i32, anc: i32[]) {
     i = i + 1
   }
   anc.pop()
+  hmsNoteRebindable(ix)
   const n = P.nodes[ix]
   if n is MatchExpr {
     if !matchScrutInPlace(n.matchScrut) {
@@ -27826,6 +27831,71 @@ function hmsWalk(ix: i32, anc: i32[]) {
     }
   }
   0
+}
+
+// Records the names node `ix` binds that a later write could rebind: a `let`, a parameter,
+// a loop variable. One kind per helper, since each reads a different field.
+function hmsNoteRebindable(ix: i32) {
+  hmsNoteLet(ix)
+  hmsNoteParams(ix)
+  hmsNoteRangeVar(ix)
+  hmsNoteForInVars(ix)
+}
+
+function hmsNoteLet(ix: i32) {
+  const n = P.nodes[ix]
+  if n is LetDecl {
+    if n.letKw != "const" { hmsRebindable[n.letName] = true }
+  }
+  0
+}
+
+function hmsNoteParams(ix: i32) {
+  const n = P.nodes[ix]
+  if n is FuncDecl {
+    let i = 0
+    while i < n.fnParams.length {
+      const pix = n.fnParams[i]
+      if pix >= 0 && pix < P.nodes.length {
+        const pn = P.nodes[pix]
+        if pn is Param { hmsRebindable[pn.parName] = true }
+      }
+      i = i + 1
+    }
+  }
+  0
+}
+
+function hmsNoteRangeVar(ix: i32) {
+  const n = P.nodes[ix]
+  if n is ForRange { hmsRebindable[n.frVar] = true }
+  0
+}
+
+function hmsNoteForInVars(ix: i32) {
+  const n = P.nodes[ix]
+  if n is ForIn {
+    hmsRebindable[n.fiVar] = true
+    hmsRebindable[n.fiVar2] = true
+  }
+  0
+}
+
+// Whether reading `ix` before the scrutinee is the same as reading it after: a bare name no
+// `let`, parameter or loop binds, so a declared function, a `const` or a builtin (D2038).
+function hmsStableName(ix: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = P.nodes[ix]
+  if n is Ident { return !hmsRebindable.has(n.identName) }
+  false
+}
+
+// A callee the scrutinee cannot change: a stable name, or a method on a stable name.
+function hmsStableCallee(ix: i32): boolean {
+  if hmsStableName(ix) { return true }
+  const n = P.nodes[ix]
+  if n is Member { return hmsStableName(n.memObj) }
+  false
 }
 
 // Climbs from match `m` through ancestors that evaluate it first and unconditionally, then
@@ -27857,7 +27927,7 @@ function hoistMatchScrutAt(m: i32, anc: i32[]): boolean {
 }
 
 // Whether parent `p` evaluates child `cur` unconditionally, and after nothing but literals,
-// lambdas, and a callee or receiver place, so evaluating `cur` earlier changes nothing.
+// lambdas, and a callee, receiver or index base no write can rebind.
 function hmsStepOk(p: i32, cur: i32): boolean {
   const pn = P.nodes[p]
   if pn is LetDecl { return pn.letInit == cur }
@@ -27867,11 +27937,12 @@ function hmsStepOk(p: i32, cur: i32): boolean {
   if pn is BinExpr {
     const op = pn.binOp
     if op == "&&" || op == "||" || op == "??" { return false }
+    // An assignment's target is not moved ahead of its value.
+    if op == "=" { return pn.binRight == cur && P.nodes[pn.binLeft] is Ident }
     if pn.binLeft == cur { return true }
-    if op == "=" { return P.nodes[pn.binLeft] is Ident }
     return matchLitOrLambda(pn.binLeft)
   }
-  if pn is Index { return pn.idxArr == cur || placeKeyOf(pn.idxArr) != "" }
+  if pn is Index { return pn.idxArr == cur || hmsStableName(pn.idxArr) }
   if pn is ArrayLit { return hmsPriorLits(pn.arrElems, cur) }
   if pn is ObjLit { return hmsPriorFieldLits(pn.objFields, cur) }
   hmsSingleChildParent(p)
@@ -27892,7 +27963,7 @@ function hmsSingleChildParent(p: i32): boolean {
 }
 
 // A call evaluates its callee, then its arguments in order; named arguments are reordered by
-// the checker, so a call carrying one is declined.
+// the checker, so a call carrying one is declined, as is a callee the scrutinee could rebind.
 function hmsCallArgOk(c: Call, cur: i32): boolean {
   if c.callFn == cur { return true }
   let i = 0
@@ -27900,7 +27971,7 @@ function hmsCallArgOk(c: Call, cur: i32): boolean {
     if c.callArgNames[i] != "" { return false }
     i = i + 1
   }
-  if placeKeyOf(c.callFn) == "" { return false }
+  if !hmsStableCallee(c.callFn) { return false }
   hmsPriorLits(c.callArgs, cur)
 }
 
