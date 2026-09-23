@@ -833,6 +833,19 @@ new: the compare-frame pre-pass never recurses into a code-15 field, so a NESTED
 
 ## Codegen, memory & runtime (Track B)
 
+- **A module `const` with a constant initializer is an immutable wasm global (plumb PL-014
+  lane L10).** Every module binding used to be a `(mut …)` global, so an engine re-loaded a
+  `const` on every read. A `const` whose initializer is a constant expression (a literal, a
+  constant list or record, a pooled string, and now a negated numeric literal into a bare
+  `i32`/`i64`/`f32`/`f64` cell, which folds to one `*.const`) drops `mut`; a `let`, and a
+  `const` initialized by the start function, stay mutable, and an exported `const` keeps the
+  immutable ABI it already had. A negated literal folds everywhere (`-5` is one `i32.const`),
+  and a store to an immutable cell is a loud emit failure. The compiler's own module: 2,206 →
+  1,744 mutable globals, seed 2,656,215 → 2,643,378 bytes (-0.48%). A const-read hot loop
+  (`(acc * MUL + ((i >> SHIFT) & MASK) + NEG) & 0xffffff`, 4e8 steps) on wasmtime:
+  0.487 → 0.406 s; an f64 `acc * SCALE + OFF` loop and both loops on V8 (deno 2.9) do not move.
+  `-O3` now drops `str-eq`'s `ALPHA` header allocation (allocs 16 → 15). Fixpoint holds,
+  distilled corpus 0 cells moved. Test `tests/vl_immutable_const_global_test.ts`.
 - **A long closure body compiles in linear time (D2017, plumb's generated closures).** Every
   read of a name the closure does not bind asked for its capture set, and before emission
   each ask re-walked the whole lifted body, so a 2,500-arm `match` closure took 127 s against
