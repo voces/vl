@@ -439,42 +439,6 @@ consumers.
      syntax is reserved for O(1) members. VL checks that rule where C# and Python only state it
      in a guideline.
 
-##### D3a-contract. The v1 getter body is checked, not trusted
-
-A getter body is refused unless it is:
-
-- **Loop-free and recursion-free.** It contains no `for` or `while`, and it has no cycle through
-  other getters.
-- **Allocation-free.** It builds no struct, list, map or string. String `+` and interpolation
-  count as allocation.
-- **Effect-free.** It writes only to its own locals. It makes no extern or host calls. It reads
-  no mutable module state: `self`'s fields and module `const`s are fine, and a module `let` is
-  not. A trap is permitted (an `as!`, or an integer division); by the same reasoning as
-  `exprEffectFree`, the program dies either way.
-- **Calls intrinsics and other getters only.** No user or std function is callable, no function
-  value, and no user operator overload, because `"+"` on a nominal type is an ordinary function
-  call.
-
-**Branches are allowed.** `if` and `match` expressions are fine: cost is bounded by the longest
-path, and a simple fork often lowers to `select`.
-
-The contract aims at the first two of four cost tiers:
-
-1. **a load**: `.x` reads one field or one lane;
-2. **straight-line bounded**: a few loads, ALU ops, compares and branches, such as a packed
-   `Color`'s `(self as i32 >> 8) & 255`;
-3. **O(1) but allocating**: excluded. It fails the "surprised in a loop" test, because a reader
-   of `p.name` in a hot loop does not expect a heap allocation per read;
-4. **unbounded**: excluded.
-
-Every getter O3 and E2 name fits. `get x(self: F32x4): f32 { __extract_lane_f32x4__(self as!
-v128, 0) }` is tier 1, and a packed-scalar part is tier 2.
-
-**This is deliberately conservative, and it will be relaxed, never tightened.** A separate
-design, `docs/internals/function-effects-design.md` (in a parallel PR), infers or marks
-functions as pure and bounded. Once it lands, a getter may call such functions as well as
-intrinsics. Loosening the contract turns refusals into programs that compile. Tightening it
-later would break getters that already compile, and std has no deprecation story for that.
 - **Where it goes.**
   - Parser: `get` as a contextual keyword at declaration start, followed by an identifier and
     `(`. `get` stays usable as an identifier everywhere else; `xs.get(i)` is untouched.
@@ -484,7 +448,8 @@ later would break getters that already compile, and std has no deprecation story
     the getter-to-getter call graph (which contains only getters, so it is small). The walk is
     a `_`-less match over node kinds, so a node kind nobody has classified is refused until
     someone classifies it. The contract errs toward refusing, in the same direction it will
-    later relax.
+    later relax. The same walk checks each node's checker type against the non-boxing rep
+    list (F9 (a)), so the type rule costs no second pass.
   - Lowering: **rewrite the `Member` node into a `Call` before emit**, so the emitter's "a member
     read is a load" assumption (`exprEffectFree`, §A1) stays true without teaching the emitter
     anything. The rewrite has to preserve source evaluation order; a probe in the same shape as
@@ -510,6 +475,95 @@ later would break getters that already compile, and std has no deprecation story
   1–2 at every level. The readability cost is real: a reader of `v.x` has to know that `F32x4`
   is a getter type. Mitigations are the semantic token and
   the fact that getters exist only on named types, never on `{ … }`.
+
+##### D3a-contract. The v1 getter body is checked, not trusted
+
+A getter body is refused unless it is:
+
+- **Loop-free and recursion-free.** It contains no `for` or `while`, and it has no cycle through
+  other getters.
+- **Allocation-free.** It makes no heap allocation, in the GC heap or in linear memory. A
+  `let`/`const` local is fine, because it is a wasm local. The walk refuses construction of a
+  struct, list, map, string or closure, string `+` and interpolation, and `Buffer(n)`.
+  `Buffer(n)` is also an effect, because it moves the allocator's bump pointer. Allocation that
+  VL's rep choice adds without any source syntax is covered below.
+- **Effect-free.** It writes only to its own locals. It makes no extern or host calls. It reads
+  no mutable module state: `self`'s fields and module `const`s are fine, and a module `let` is
+  not. A trap is permitted (an `as!`, or an integer division); by the same reasoning as
+  `exprEffectFree`, the program dies either way.
+- **Calls intrinsics and other getters only.** No user or std function is callable, no function
+  value, and no user operator overload, because `"+"` on a nominal type is an ordinary function
+  call.
+
+**Branches are allowed.** `if` and `match` expressions are fine: cost is bounded by the longest
+path, and a simple fork often lowers to `select`.
+
+The contract aims at the first two of four cost tiers:
+
+1. **a load**: `.x` reads one field or one lane;
+2. **straight-line bounded**: a few loads, ALU ops, compares and branches, such as a packed
+   `Color`'s `(self as i32 >> 8) & 255`;
+3. **O(1) but allocating**: excluded. It fails the "surprised in a loop" test, because a reader
+   of `p.name` in a hot loop does not expect a heap allocation per read;
+4. **unbounded**: excluded.
+
+Every getter O3 and E2 name fits. `get x(self: F32x4): f32 { __extract_lane_f32x4__(self as!
+v128, 0) }` is tier 1, and a packed-scalar part is tier 2.
+
+###### Implicit allocation from rep choice
+
+A syntax-only walk misses one kind of allocation. **VL boxes some values without any source
+syntax**, depending on the rep it chooses for a type. I measured this with `dist/vl` on master:
+each function below reads fields of `self` and returns without writing a constructor, and I
+counted allocating instructions in its `-O0` body with `wasm-dis`:
+
+| result (or intermediate) type | wasm result | allocating instructions |
+| --- | --- | --- |
+| `i32 \| string` | `(ref $box)` | 2 `struct.new` (payload box, then tag box) |
+| `i32 \| i64` | `(ref $box)` | 3 `struct.new` |
+| `i32 \| null` | `(ref $box)` | 2 `struct.new` |
+| `f32 \| null` | `(ref $box)` | 2 `struct.new` |
+| `A \| B` (two structs, returning a field as-is) | `(ref $box)` | 1 `struct.new` (the `{i32 tag, anyref}` box) |
+| a scalar result with an `i32 \| string` *local* | `i32` | 3 `struct.new` at `-O0`; 0 at `-O3`, once binaryen scalarises it |
+| `Q \| null` (nullable struct) | `(ref null $Q)` | none (the null niche) |
+| `string \| null` | `(ref null $str)` | none |
+| `boolean \| null` | `i32` | none (an i32 niche) |
+| `"lo" \| "hi"` (string literal union) | `(ref $str)` | none (each literal is a module global) |
+| `i32 \| string`, forwarding a field of that type unchanged | `(ref $box)` | none (the existing box is returned) |
+
+So whether a getter allocates depends on its **types**, including the types of its locals, and
+not only on its syntax. The last row shows the dependence cuts both ways: the same union type
+allocates when a value is widened into it, and costs nothing when an existing box is passed on.
+
+Two ways to close this:
+
+- **(a) Restrict the types.** A getter's result, and every local and intermediate value in its
+  body, must have a rep that never boxes. From the table, that means:
+  - a scalar (`i32`, `i64`, `f32`, `f64`, `boolean`, `u8`, `v128`) or a `new` brand of one;
+  - a literal union (int literals lower to `i32`, string literals to globals);
+  - a reference to an existing struct, string, list or map;
+  - the null niches: a nullable struct, `string | null`, `boolean | null`.
+
+  Excluded: value unions (`i32 | string`, `i32 | i64`, a union of structs) and nullable
+  scalars (`i32 | null`, `f32 | null`). The checker decides this from types alone, before any
+  rep is chosen, and a refusal names the offending type.
+- **(b) Check after rep selection.** Let the emitter reject a getter whose emitted body
+  contains `struct.new`, `array.new` or an allocating helper call. This is exact, and it
+  admits the forwarding row. But the refusal would come from the emitter, as a clause-2-shaped
+  error. It would depend on the rep choice of the day, which this repo's rep campaigns change
+  often. And it would reach the author as an instruction they never wrote.
+
+**Recommend (a) for v1** (F9). It is predictable, it can be explained in one sentence ("a
+getter traffics in scalars and existing references"), and every getter known today returns a
+scalar: SIMD lanes, packed-scalar parts and `length`-style counts. The cost is that it also
+refuses the forwarding row, which does not allocate. That is the conservative direction, and
+the function-effects design can relax it.
+
+**This is deliberately conservative, and it will be relaxed, never tightened.** A separate
+design, `docs/internals/function-effects-design.md` (in a parallel PR), infers or marks
+functions as pure and bounded. Once it lands, a getter may call such functions as well as
+intrinsics. Loosening the contract turns refusals into programs that compile. Tightening it
+later would break getters that already compile, and std has no deprecation story for that.
 
 #### D3b. Implicit parenless calls (Nim / D style)
 
@@ -693,6 +747,16 @@ user getter would break it silently. (c) gives no cost bound that (a) lacks, sin
 stay in tiers 1–2, and it makes multi-step lane or bit extraction harder to read. The rule that matters is
 the direction: (a) can only be relaxed. Starting from (b) and tightening later would break
 getters that already compile, and std has no deprecation story for that.
+
+**F9. How does the contract see allocation that VL's rep choice adds (§D3a-contract, "Implicit
+allocation from rep choice")?**
+(a) Restrict the result type and every local to non-boxing reps: scalars and their brands,
+literal unions, existing references, and the null niches (nullable struct, `string | null`,
+`boolean | null`). Value unions and nullable scalars are refused. (b) Check the emitted body
+after rep selection for `struct.new`, `array.new` or an allocating helper.
+*Recommend (a).* The check is by type, before emission, and a refusal names the type. Every
+getter known today returns a scalar. (b) is exact, but its refusals would come from the emitter
+and would shift whenever the rep layer changes.
 
 ---
 

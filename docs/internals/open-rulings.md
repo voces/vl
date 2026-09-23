@@ -1318,14 +1318,14 @@ into its header if it ships before this is ruled.
 
 SIMD S3 (#3015) shipped neither O3 lane-read spelling. `f32x4(…).x` gives `member access '.x' on
 non-object F32x4`, and a std `laneF32x4(v, i)` cannot pass a literal `i` on to the intrinsic.
-The full write-up is `docs/internals/property-access-design.md`, with eight questions (F1–F8).
+The full write-up is `docs/internals/property-access-design.md`, with nine questions (F1–F9).
 The two that decide the rest:
 
 - **F1, getters at all.** *Recommend* declared, nominal-only, read-only getters
   (`get x(self: F32x4): f32`), resolved only through the receiver type's own module. The body
   is CHECKED: loop-free, allocation-free and effect-free, calling only intrinsics and other
-  getters (F8; relaxed later by `docs/internals/function-effects-design.md`). Reject
-  implicit parenless calls, because they would settle the `c.area` bound-value question
+  getters, and using only types whose rep never boxes (F8, F9; relaxed later by
+  `docs/internals/function-effects-design.md`). Reject implicit parenless calls, because they would settle the `c.area` bound-value question
   (`ROADMAP.md`, B14) as a side effect.
 - **F2, structural participation.** *Recommend* never. In VL `{ x: f32 }` is a WasmGC layout,
   it permits writes and it is a narrowing place, and a getter is none of the three.
