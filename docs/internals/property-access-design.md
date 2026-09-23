@@ -502,8 +502,14 @@ A getter body is refused unless it is:
   either way.
 - **Calls intrinsics and other getters only.** No user or std function is callable, no function
   value, and no user operator overload, because `"+"` on a nominal type is an ordinary function
-  call. The intrinsics are an exact list of names (loads, pure lane and vector operations, the
-  heap-window reads, `__trap__`); a user binding spelled like one is refused as a function value.
+  call. The admitted intrinsics are those the emitter lowers inline to instructions whose only
+  possible effect is a trap: the scalar numeric opcodes (`sqrt abs floor ceil trunc nearest min
+  max copysign`, `clz ctz popcnt rotl rotr divU remU`, the unsigned compares, the four bitcasts),
+  the loads, the SIMD value operations, the heap-window reads and `__trap__`. The set is read off
+  the emitter's own classifiers (`isNumIntrinsicName`, `nameIsMemLoadIntrinsic`,
+  `nameIsSimdIntrinsic` less any result-less member), not kept as a second list (D2064). A user
+  function spelled like one is refused as a call to that function, a user binding as a function
+  value.
 - **Operators whose lowering loops or allocates are refused** (built, from the #3031 review's
   disassembly): `==`/`!=`/`<`/`<=`/`>`/`>=` over string, list, map or struct operands (a
   `__str_eq__` call or an inline element loop), an index into a map (a hash and a probe loop),
