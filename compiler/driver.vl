@@ -1,4 +1,13 @@
-import { pushCps } from "./strutil"
+import {
+  cpAccEmpty,
+  cpAccLoad,
+  cpAccNew,
+  cpAccPush,
+  cpAccReset,
+  cpAccString,
+  cpAccTake,
+  pushCps,
+} from "./strutil"
 // The source-in / bytes-out driver — the interface `scripts/vl-host` embeds against.
 // A real `import`/`export` module that imports the pipeline (lexer → ast → parser →
 // typecheck → wasmEmit → lint → format) and exposes the host ABI
@@ -280,19 +289,19 @@ import {
   formatProgram,
 } from "./format"
 
-let vcCodes: i32[] = []
+const vcAcc = cpAccNew()
 // The in-module source channel, set when a VL caller already holds the source string
 // — as opposed to the host channel below, which arrives one element at a time. Exactly
-// one of the two is used per compile, so `vcSource` chooses between them on
-// `vcCodes.length` alone rather than carrying a second flag to keep in step.
+// one of the two is used per compile, so `vcSource` chooses between them on whether
+// `vcAcc` holds anything rather than carrying a second flag to keep in step.
 let vcSrcStr = ""
 export function srcReset(): i32 {
-  vcCodes = []
+  cpAccReset(vcAcc)
   vcSrcStr = ""
   0
 }
 export function srcPush(c: i32): i32 {
-  vcCodes.push(c)
+  cpAccPush(vcAcc, c)
   0
 }
 // Stages a source string directly, with no per-element round trip. A byte producer
@@ -300,7 +309,7 @@ export function srcPush(c: i32): i32 {
 // every non-ASCII character before the lexer sees it — `'é'` would lex as two
 // characters. A string handed over as a string has no unit to get wrong.
 export function srcSetStr(s: string): i32 {
-  vcCodes = []
+  cpAccReset(vcAcc)
   vcSrcStr = s
   0
 }
@@ -312,20 +321,15 @@ export function hostAbi(): i32 { 2 }
 
 // ── bulk source intake over linear memory ─────────────────────────────────────
 // `srcPush` above is one host call per code point; this batched form replaces N calls
-// with N/16384, the host writing a chunk into linear memory before this loop copies
+// with N/16384, the host writing a chunk into linear memory before `cpAccLoad` copies
 // it out — WasmGC has no memory→GC-array copy, so only the call boundary is bought.
 export function srcLoad(count: i32): i32 {
-  let i = 0
-  while i < count {
-    const cp = __load_i32__(i * 4)
-    vcCodes.push(cp)
-    i = i + 1
-  }
+  cpAccLoad(vcAcc, count)
   0
 }
 function vcSource(): string {
-  if vcCodes.length == 0 { return vcSrcStr }
-  fromCodePoints(vcCodes)
+  if cpAccEmpty(vcAcc) { return vcSrcStr }
+  cpAccString(vcAcc)
 }
 // Source positions (and owning module) for `P.diags` entries with no token anchor:
 // lex diagnostics and module-resolution diagnostics (emitted before any tokens load).
@@ -392,11 +396,11 @@ function vcDgPush(idx: i32, line: i32, col: i32, endCol: i32, mod: i32) {
 // ── H3 module-table state (globals precede their first textual use; the module
 // SUBSYSTEM itself — exports, scan, pipeline, rewrite — lives at the bottom of
 // this file) ──────────────────────────────────────────────────────────────────
-let modKeys: string[] = [] // resolved module keys, [0] = the entry
-let modSrcs: string[] = [] // module sources ("" when missing)
-let modFound: i32[] = []   // 1 = read ok, 0 = host could not read the key
-let modKeyAcc: i32[] = []  // accumulators for the NEXT commit
-let modSrcAcc: i32[] = []
+let modKeys: string[] = []   // resolved module keys, [0] = the entry
+let modSrcs: string[] = []   // module sources ("" when missing)
+let modFound: i32[] = []     // 1 = read ok, 0 = host could not read the key
+const modKeyAcc = cpAccNew() // accumulators for the NEXT commit
+const modSrcAcc = cpAccNew()
 // Flat per-import-entry tables (filled by the token scan at each commit):
 let impMod: i32[] = []      // importing module's table index
 let impSpec: string[] = []  // the raw specifier text (diagnostics)
@@ -2471,8 +2475,8 @@ export function modReset(): i32 {
   modKeys = []
   modSrcs = []
   modFound = []
-  modKeyAcc = []
-  modSrcAcc = []
+  cpAccReset(modKeyAcc)
+  cpAccReset(modSrcAcc)
   impMod = []
   impSpec = []
   impKey = []
@@ -2510,11 +2514,11 @@ export function modReset(): i32 {
   0
 }
 export function modKeyPush(c: i32): i32 {
-  modKeyAcc.push(c)
+  cpAccPush(modKeyAcc, c)
   0
 }
 export function modSrcPush(c: i32): i32 {
-  modSrcAcc.push(c)
+  cpAccPush(modSrcAcc, c)
   0
 }
 // The `modKey`/`modSrc` twins of `srcLoad` — same protocol and staging window.
@@ -2522,33 +2526,19 @@ export function modSrcPush(c: i32): i32 {
 // during a self-compile); `modKeyLoad` carries only module keys. Both channels
 // need the batched form, or the un-converted one keeps paying per code point silently.
 export function modKeyLoad(count: i32): i32 {
-  let i = 0
-  while i < count {
-    const cp = __load_i32__(i * 4)
-    modKeyAcc.push(cp)
-    i = i + 1
-  }
+  cpAccLoad(modKeyAcc, count)
   0
 }
-// The four loops are deliberately the same shape: a hand-optimized variant showed
-// no measurable win, so uniformity wins on a tie.
 export function modSrcLoad(count: i32): i32 {
-  let i = 0
-  while i < count {
-    const cp = __load_i32__(i * 4)
-    modSrcAcc.push(cp)
-    i = i + 1
-  }
+  cpAccLoad(modSrcAcc, count)
   0
 }
 // Register the accumulated (key, source) pair. `found = 0` marks "the host could
 // not read this key" so the unresolvable diagnostic fires instead of an infinite
 // re-request. A found module is token-scanned immediately (imports + exports).
 export function modCommit(found: i32): i32 {
-  const key = fromCodePoints(modKeyAcc)
-  const src = fromCodePoints(modSrcAcc)
-  modKeyAcc = []
-  modSrcAcc = []
+  const key = cpAccTake(modKeyAcc)
+  const src = cpAccTake(modSrcAcc)
   modCommitStr(key, src, found)
 }
 // The direct entry point, for a caller that already holds the strings —
@@ -2568,12 +2558,12 @@ export function modCommitStr(key: string, src: string, found: i32): i32 {
 // and a disagreement is a miss. Returns 1 when the cache served it; 0 leaves the key
 // staged, so a miss is finished by `modSrcPush` + `modCommit`.
 export function modCommitCached(srcBytes: i32): i32 {
-  const key = fromCodePoints(modKeyAcc)
+  const key = cpAccString(modKeyAcc)
   const ci = modCacheSlotOfKey(key)
   if ci < 0 { return 0 }
   if modCacheSrcs[ci].length != srcBytes { return 0 }
-  modKeyAcc = []
-  modSrcAcc = []
+  cpAccReset(modKeyAcc)
+  cpAccReset(modSrcAcc)
   modCommitStr(key, modCacheSrcs[ci], 1)
   1
 }

@@ -110,10 +110,8 @@ Deferred (follow-ups, captured here so we don't reinvent them):
    **An INTEGER scrutinee: SHIPPED** (D1572, the consumer ask VL-020). See below.
 4. **Guards** (`pat if cond =>`).
 5. (Maybe) ranges / `i32` density → `br_table` codegen. D1572 built the integer scrutinee and
-   left BOTH halves of this item standing: it lowers to the compare chain, because the emitter
-   has no general jump-table helper (its one `br_table` is a hand-written three-way niche
-   print), and a jump table is a codegen project with its own grid rather than a rider on a
-   surface decision.
+   lowered it to the compare chain. **The `br_table` half: SHIPPED** (plumb PL-001) — see
+   "A dense integer match is a `br_table`" below. Ranges still stand.
 
 ## Phase 2a as built
 
@@ -350,6 +348,71 @@ union means naming every member; an `i32` has 2^32 values, so here exhaustivenes
 wildcard. And `matchElseArmOf` makes the wildcard arm the chain's bare `else`, so an arm after
 it would be tested FIRST — allowing it would silently REORDER the program against
 first-match-wins. Both are hard errors at the pattern.
+
+## A dense integer match is a `br_table` (plumb PL-001)
+
+**For a VL author.** Nothing to write: a `match` over an `i32` or `i64` whose arms are integer
+literals compiles to one `br_table` jump when the literal set is dense, and to the compare chain
+otherwise. The semantics are the same either way — first matching arm, `_` mandatory, the
+scrutinee read at the point of dispatch — so the choice is invisible except in speed: on a
+256-arm state-machine loop the table ran ~13× faster in user CPU than the chain (10.51 s →
+0.81 s over 500M dispatches; binaryen `-O3` recovered none of the gap, 7.15 s → 0.70 s).
+
+**The density rule.** Let `n` be the number of DISTINCT literal values across all arms (an
+or-group contributes each of its values; a repeated value keeps its first arm, exactly as the
+chain's first passing test would) and `span = max − min`. The table is built when
+
+    n >= 3   and   span < 2n + 8
+
+The table has `span + 1` entries, offset by `min`, so a range like `100..110` or `-5..0` costs
+the same as `0..10`; a hole in the range and every value outside it go to the `_` arm. The bound
+keeps the table no larger than the chain it replaces: each chain arm costs at least five bytes
+(`local.get`, `i32.const`, `i32.eq`, `if`, blocktype), a table entry one or two. Three values is
+the floor because below it the chain is already one or two compares; the plumb witness —
+three states and a `_` — is at the floor and gets its table.
+
+**The index can never wrap onto a case.** For `i32` the index is `s − min` in wrapping `i32`
+arithmetic and `br_table` reads it UNSIGNED, so it lands in `[0, span]` exactly when
+`s ∈ [min, max]` — `i32` extremes as scrutinee go to `_`. For `i64` the subtraction is done in
+`i64`, compared `<u span + 1`, and a miss selects the default slot, so a value like `2^32 + 1`
+is never truncated onto arm 1.
+
+**The shape.** Nested void blocks, one per arm plus one for `_`, around the dispatch:
+
+    block $end (result T)?        ;; carries the value in expression position
+      block $default
+        block $armN-1 … block $arm0
+          local.get $s  (i32.const min  i32.sub)?  br_table $arm0 … $default
+        end  arm0's body  br $end
+        …
+      end  _'s body
+    end
+
+Arms are emitted in chain order, which is the order the collect pass allocated their locals in,
+so a `let` inside an arm lands in the same slot either way; every frame is counted by
+`ctrlEnter`, so a `break`, `continue` or sinking `return` inside an arm branches the right depth.
+Statement form, function-tail form, a scalar value join and a ref value join (`string`, struct,
+list) all take the table.
+
+**What stays a chain, and why.**
+
+* **A scrutinee that is not a plain `Ident`** (`match x % 7`, `match f()`), because of D1991:
+  the chain re-evaluates the scrutinee once per tested arm ("Scrutinee evaluated once" above),
+  which gives a side-effecting scrutinee the wrong arm. That is a defect, not a design choice.
+  Binding the scrutinee to a temp once fixes it and makes such a match table-eligible too.
+* **An un-annotated scrutinee** (the hole route) and a monomorphized clone: the emitter has no
+  recorded `i32`/`i64` type for the node, and a hole may be pinned to a float.
+* **A value join that is nullable** (an arm yielding `null`): the chain's niche seeding owns it.
+* **A value join lowered as a union box or variant** (`emitUnionIfValue`/`emitVariantIfValue`).
+* **An `i64` literal outside the `i32` range**, and any sparse set.
+* **A hand-written if/else chain.** Only the chain a `match` built is marked (`intMatchHeadAt`);
+  recognising hand-written chains is possible but was not asked for.
+* `u8` and literal-union-of-integer scrutinees do not exist to lower (D1572: `u8` is a storage
+  type no local holds, and a numeric literal union is refused at the scrutinee).
+
+**What it does not fix: depth.** The desugared chain is still an `IfStmt` nested once per arm,
+and every recursive walker in the compiler descends it — a 2,500-arm `match` exhausts the
+compiler's call stack before the emitter is reached, table or no table (D1990).
 
 ## Pipeline touch-points (per the language-features playbook)
 

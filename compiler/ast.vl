@@ -1841,6 +1841,25 @@ export function mkIf(cond: i32, thenB: i32, els: i32, pos: i32) {
   addNode(n)
 }
 
+// The emitter's lowering of the bare `{ … }` statement at `blockIx` (starting at `pos`):
+// `if true { … }`, whose `true` shares the `if`'s position — which no parsed `if true` can,
+// since its keyword comes first. `isBareBlockIf` reads that tell back.
+export function mkBareBlockIf(blockIx: i32, pos: i32) {
+  mkIf(mkBool(1, pos), blockIx, -1, pos)
+}
+
+// True if the node at `ix` is an `if` minted by `mkBareBlockIf`.
+export function isBareBlockIf(ix: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const s = P.nodes[ix]
+  if s is IfStmt {
+    if s.ifElse >= 0 || s.ifCond < 0 { return false }
+    const c = P.nodes[s.ifCond]
+    if c is BoolLit { return c.boolVal == 1 && c.pos == s.pos }
+  }
+  false
+}
+
 // Loop constructors take the optional loop label last ("" = unlabelled).
 export function mkWhile(cond: i32, body: i32, label: string, pos: i32) {
   const n: Node = {
@@ -2050,6 +2069,48 @@ export function i32ToStr(n: i32) {
   }
   if neg { out = "-" + out }
   out
+}
+
+// True if control never falls out of statement `ix` to its next sibling: the one rule the
+// checker's narrowing and definite assignment, the emitter and the lint share (D1970). A block
+// exits once any statement does; an `if` needs an `else` and both arms exiting; a `match`, every
+// arm. A loop never does, since a `break` in it leaves only the loop.
+export function stmtAlwaysExits(ix: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const s = P.nodes[ix]
+  if s is RetStmt {
+    return true
+  } else if s is BreakStmt {
+    return true
+  } else if s is ContinueStmt {
+    return true
+  } else if s is Block {
+    const st = s.blkStmts
+    let i = 0
+    while i < st.length {
+      if stmtAlwaysExits(st[i]) { return true }
+      i = i + 1
+    }
+    return false
+  } else if s is IfStmt {
+    // The emitter's lowered bare block runs its arm unconditionally, so it answers as its
+    // block does, or the passes on either side of that rewrite would disagree.
+    if isBareBlockIf(ix) { return stmtAlwaysExits(s.ifThen) }
+    if s.ifElse < 0 { return false }
+    return stmtAlwaysExits(s.ifThen) && stmtAlwaysExits(s.ifElse)
+  } else if s is MatchExpr {
+    // A checked `match` is exhaustive, and its desugar is an if/else chain ending in a bare
+    // `else`, so this answer and the one read off the lowered chain agree.
+    const bodies = s.matchBodies
+    if bodies.length == 0 { return false }
+    let k = 0
+    while k < bodies.length {
+      if !stmtAlwaysExits(bodies[k]) { return false }
+      k = k + 1
+    }
+    return true
+  }
+  false
 }
 
 // The empty child list, shared rather than minted per call. Safe for the same reason a

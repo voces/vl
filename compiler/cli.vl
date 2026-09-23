@@ -1,4 +1,11 @@
-import { pushCps } from "./strutil"
+import {
+  cpAccLoad,
+  cpAccNew,
+  cpAccPush,
+  cpAccReset,
+  cpAccTake,
+  pushCps,
+} from "./strutil"
 import { i32ToStr } from "./ast"
 import {
   isvalColAt,
@@ -145,15 +152,15 @@ const ST_TEST_RUN = 15       // the host reported every planned test's result
 const ST_CHECK_VALIDATE = 16 // the host validated this file's emitted module
 
 // ── protocol state ────────────────────────────────────────────────────────────
-let cliArgs: string[] = []   // committed argv (cliArgs[0] = the subcommand)
-let cliArgAcc: i32[] = []    // the in-flight argument's code points
-let cliState = 0             // see the ST_* constants above
-let cliCmdPath = ""          // path payload of the current command
-let cliCmdData = ""          // data payload of the current command (a print line)
-let cliResultAcc: i32[] = [] // the host pushes a file's contents here
-let cliFileSrc = ""          // last committed file contents
-let cliFileFound = 0         // 1 = the host read the file, 0 = missing
-let cliExit = 0              // the process exit code, read after CMD_DONE
+let cliArgs: string[] = []      // committed argv (cliArgs[0] = the subcommand)
+let cliArgAcc: i32[] = []       // the in-flight argument's code points
+let cliState = 0                // see the ST_* constants above
+let cliCmdPath = ""             // path payload of the current command
+let cliCmdData = ""             // data payload of the current command (a print line)
+const cliResultAcc = cpAccNew() // the host pushes a file's contents here
+let cliFileSrc = ""             // last committed file contents
+let cliFileFound = 0            // 1 = the host read the file, 0 = missing
+let cliExit = 0                 // the process exit code, read after CMD_DONE
 // A `--codegen` file whose emitted module the engine refused. `vl check` said rc 0 to
 // reach the emitter, so an invalid module is the compiler's fault by construction and
 // exits 70 (EX_SOFTWARE, the code `report` uses for a compiler trap) rather than 1: a
@@ -392,7 +399,7 @@ export function cliArgReset() {
   cliState = ST_INIT
   cliCmdPath = ""
   cliCmdData = ""
-  cliResultAcc = []
+  cpAccReset(cliResultAcc)
   cliFileSrc = ""
   cliFileFound = 0
   cliExit = 0
@@ -550,7 +557,7 @@ export function cliCmdDataStore(off: i32, count: i32): i32 {
 
 // ── result intake (host commits the serviced command's result) ─────────────────
 export function cliResultPush(c: i32) {
-  cliResultAcc.push(c)
+  cpAccPush(cliResultAcc, c)
   0
 }
 // The bulk twin of `cliResultPush` — the `<name>Load(count)` half of the host's
@@ -558,30 +565,20 @@ export function cliResultPush(c: i32) {
 // header). Every `vl check` / `vl fmt` / `vl test` file read arrives on this channel,
 // so it is the LSP's own intake.
 export function cliResultLoad(count: i32) {
-  let i = 0
-  while i < count {
-    const cp = __load_i32__(i * 4)
-    cliResultAcc.push(cp)
-    i = i + 1
-  }
+  cpAccLoad(cliResultAcc, count)
   0
 }
 export function cliFileCommit(found: i32) {
   cliFileFound = found
-  cliFileSrc = fromCodePoints(cliResultAcc)
-  cliResultAcc = []
+  cliFileSrc = cpAccTake(cliResultAcc)
   0
 }
 // The host's CMD_VALIDATE verdict for the file just emitted: `ok = 1` and the
 // module is one the engine accepts; `ok = 0` and `cliResultAcc` carries the
 // engine's rejection, which becomes this file's positionless error diagnostic.
 export function cliValidateCommit(ok: i32) {
-  if ok != 0 {
-    cliValidateMsg = ""
-  } else {
-    cliValidateMsg = fromCodePoints(cliResultAcc)
-  }
-  cliResultAcc = []
+  const msg = cpAccTake(cliResultAcc)
+  if ok != 0 { cliValidateMsg = "" } else { cliValidateMsg = msg }
   0
 }
 export function cliExitCode() { return cliExit }
@@ -1817,9 +1814,8 @@ export function cliTestNameCommit(skip: i32) {
 // is what the names above attribute to.
 export function cliTestFileCommit(status: i32) {
   cliTestFileStatus.push(status)
-  cliTestFileMsg.push(fromCodePoints(cliResultAcc))
+  cliTestFileMsg.push(cpAccTake(cliResultAcc))
   cliTestLocalNext = 0
-  cliResultAcc = []
   0
 }
 // Captured output of the test result being committed.
@@ -1838,9 +1834,8 @@ export function cliTestResultCommit(k: i32, status: i32) {
     cliResOut.push("")
   }
   cliResStatus.push(status)
-  cliResMsg.push(fromCodePoints(cliResultAcc))
+  cliResMsg.push(cpAccTake(cliResultAcc))
   cliResOut.push(fromCodePoints(cliTestOutAcc))
-  cliResultAcc = []
   cliTestOutAcc = []
   0
 }
