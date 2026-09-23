@@ -25,12 +25,23 @@ const PROGRAM = [
   "const F = [1, 2, 3]",
   "const G = A + 1",
   "let H = -4",
+  "const Z = -0.0",
+  "const M32 = -2147483648",
+  "const M64: i64 = -9223372036854775808",
   "function use() {",
   "  H = H - 1",
   "  print(A + B + F[1] + G + H)",
   "  print(C)",
   "  print(D)",
   "  print(E)",
+  "  print(1.0 / Z)",
+  "  print(M32)",
+  "  print(M64)",
+  // D2176: a function-body delivery of a hex literal to a wide slot keeps its value.
+  "  const h: i64 = -0xFFFFFFFF",
+  "  let qp: f64 = 0xFFFFFFFF",
+  "  print(h)",
+  "  print(qp)",
   "}",
   "use()",
 ].join("\n");
@@ -45,6 +56,9 @@ const WANT_GLOBALS = [
   "(ref $", // F: an immutable ref built by a constant expression
   "(mut i32) (i32.const 0)", // G: its initializer runs in the start function
   "(mut i32) (i32.const -4)", // H: a `let` is mutable
+  "f64 (f64.const -0)", // Z: the sign survives the fold; the run checks 1 / Z
+  "i32 (i32.const -2147483648)",
+  "i64 (i64.const -9223372036854775808)",
 ];
 
 Deno.test({
@@ -84,7 +98,8 @@ Deno.test({
         stderr: "piped",
       }).output();
       const stdout = new TextDecoder().decode(r.stdout);
-      const want = "11\n-2147483648\n-2\n-1.5\n";
+      const want = "11\n-2147483648\n-2\n-1.5\n-Infinity\n-2147483648\n" +
+        "-9223372036854775808\n-4294967295\n4294967295\n";
       if (!r.success || stdout !== want) {
         throw new Error(`vl run: want ${JSON.stringify(want)}, got ${JSON.stringify(stdout)}`);
       }

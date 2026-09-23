@@ -840,12 +840,19 @@ new: the compare-frame pre-pass never recurses into a code-15 field, so a NESTED
   `i32`/`i64`/`f32`/`f64` cell, which folds to one `*.const`) drops `mut`; a `let`, and a
   `const` initialized by the start function, stay mutable, and an exported `const` keeps the
   immutable ABI it already had. A negated literal folds everywhere (`-5` is one `i32.const`),
-  and a store to an immutable cell is a loud emit failure. The compiler's own module: 2,206 →
+  and a store to an immutable cell is a loud emit failure. Two behaviour changes, both
+  intended: a negated hex literal into an `i64`/`f64` module cell (`const H: i64 =
+  -0xFFFFFFFF`) now holds its value, -4294967295, where the start-function path negated the
+  i32 bit pattern and gave `1`; and a negated-literal const is initialized before the start
+  function runs, so an earlier non-constant initializer that reads it sees its value (`-3`,
+  not `0`), as it already did for a positive literal. The same literal delivered to a local
+  or argument `i64`/`f64` slot was wrong the same way (D2176, `let q: f64 = 0xFFFFFFFF`
+  printed -1) and now lowers in the wide rep too. The compiler's own module: 2,206 →
   1,744 mutable globals, seed 2,656,215 → 2,643,378 bytes (-0.48%). A const-read hot loop
   (`(acc * MUL + ((i >> SHIFT) & MASK) + NEG) & 0xffffff`, 4e8 steps) on wasmtime:
   0.487 → 0.406 s; an f64 `acc * SCALE + OFF` loop and both loops on V8 (deno 2.9) do not move.
   `-O3` now drops `str-eq`'s `ALPHA` header allocation (allocs 16 → 15). Fixpoint holds,
-  distilled corpus 0 cells moved. Test `tests/vl_immutable_const_global_test.ts`.
+  distilled corpus 0 cells moved. Test `tests/vl_immutable_const_global_test.ts`; row D2176 closed.
 - **A long closure body compiles in linear time (D2017, plumb's generated closures).** Every
   read of a name the closure does not bind asked for its capture set, and before emission
   each ask re-walked the whole lifted body, so a 2,500-arm `match` closure took 127 s against
