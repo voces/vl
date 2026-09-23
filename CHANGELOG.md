@@ -40,6 +40,19 @@ see **`DECISIONS.md`**.
   besides the one #3056 fixture that pinned the old behaviour; 22 fixtures drop 31 `@hint`s on
   a `const`'s `string` annotation. D2199 files an emit refusal found alongside. Fixtures
   `literal-unions/const-literal-impossible-compare.vl`, `const-literal-compare-allowed.vl`.
+- **Three programs #3056 stopped running run again (D2199, D2204, D2206; and D2208).** An `if` whose arms
+  carry different literal sets (`if c { A } else { B }` with `A: "x" | "y"`, `B: "y"`) delivered
+  to a literal-union destination was an emit refusal, and bound un-annotated at module scope was
+  invalid wasm; the join now lowers each arm as the atom. `const MODE = "debug"; MODE is "debug"
+  | "x"` was refused as a test that can never match; a const literal now tests against any set
+  its value is in, as `==` does. The declared-type spelling (`const MODE: "debug"`) still refuses
+  a wider set and is filed as a ruling (D2205). An `if` condition and a switch scrutinee are
+  lowered outside the atom context, so `if s() == "green"` keeps its string, and a module-scope
+  join whose fresh set equals a declared alias's is that alias's atom (D2208, invalid wasm on
+  every seed before). Fixtures
+  `literal-unions/if-join-arms-disagree-into-atom-destination.vl`,
+  `if-join-arms-disagree-unannotated-binding.vl`, `is-const-literal-overlapping-set.vl`, and the
+  refusal's two suggestions applied together in `const-literal-compare-allowed.vl`.
 - **A string-literal type reps as the atom wherever it lives, and a `const` bound to a literal
   has the literal's type (D2150, D2156, D2157; owner, 2026-09-23).** An inline `"a" | "b"` at a
   field, parameter, return, local, global, capture or type argument compared with `__str_eq__`;
