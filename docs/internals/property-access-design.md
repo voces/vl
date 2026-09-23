@@ -34,8 +34,10 @@ Are they good for VL?"*
   expose named parts.
 - **The getter's body is checked, not trusted.** It must be effect-free, allocation-free and
   bounded, and it may call only intrinsics and other getters (§D3a). Reads are allowed, except
-  of a module `let`. *(Amended 2026-09-22: "bounded" admits constant-range loops within a
-  budget of 64; v1 as built is loop-free. See §D3a-contract.)*
+  of a module `let`. *(Amended and RULED 2026-09-22: "bounded" admits constant-range loops
+  within a budget of 16 abstract steps, and a getter may call an ordinary function that
+  writes nothing, allocates nothing, does no I/O and fits the budget; v1 as built is
+  loop-free. See §D3a-contract.)*
   That keeps a getter read to a load or a short straight-line sequence. The contract is
   deliberately conservative and will only ever be relaxed.
 - **Nothing new in the language is needed to unblock lane reads today.** A literal-union
@@ -485,30 +487,42 @@ consumers.
 
 ##### D3a-contract. The v1 getter body is checked, not trusted
 
-> **Amended (owner, 2026-09-22, after getters v1 shipped in #3031).** The contract is
-> **effect-free + allocation-free + bounded. Reads are allowed. Module-`let` reads are excluded
-> because a getter describes its receiver**: it reads what is reachable from `self`, plus
-> constants. That is the rationale, not purity, and getter-eligible is not the same predicate
-> as `pure` (`function-effects-design.md` §C1b, the general summary this contract is one
-> reading of). **Constant-bounded loops are permitted**: a `for i in <a> (to | until) <b>
-> [step <s>]` whose ends are integer literals or module `const` integers and whose step is a
-> literal, with the loop variable never assigned; `break` and `continue` allowed; nested loops
-> multiply; and the total, **transitive through getter calls**, is at most one named budget,
-> **64** iterations. The invariant: the worst-case cost is computable at compile time from the
-> source plus bounded callees, and is never data-dependent. A `for`-in over data, a
-> data-bounded range, `while` and recursion stay refused, permanently. Only the budget number
-> may change, through `DECISIONS.md` and a std review (`function-effects-design.md` §C1a).
-> **What is built is still v1**: the shipped checker refuses every loop, and
-> `docs/guide/getters.md` and `DECISIONS.md` describe that. The loop relaxation is ruled, not
-> built, and those two files change with its build. The bullets below are the v1 text, with
-> the first one amended.
+> **Amended and RULED (owner, 2026-09-22/23, after getters v1 shipped in #3031;
+> `design-review-getters-effects-2026-09.md` §5 D-Q1, D-Q2, D-Q5, D-Q6).**
+>
+> - **Severity: a hard error for everyone**, with no std/user split and no suppression. It may
+>   relax to a lint later, never the reverse. The escape to a method is one keyword and `()`.
+> - **The contract: effect-free + allocation-free + bounded. Reads are allowed. Module-`let`
+>   reads are excluded** because a getter describes its receiver: it reads what is reachable
+>   from `self`, plus constants and the heap of a module `const` (a lookup table).
+> - **Cost is counted in abstract steps**: a call costs 1 plus its callee's cost, a loop
+>   multiplies, a branch takes the max. The total, transitive through calls, is at most one
+>   named budget, **16 steps**, tuned by usage. An over-budget error names the call path.
+> - **The invariant:** the worst-case cost is computable at compile time from the source plus
+>   bounded callees, and is never data-dependent. Allowed: `for i in <a> (to | until) <b>
+>   [step <s>]` whose ends are integer literals or a `const` initialised by one (or by another
+>   such `const`), whose step is a literal, and whose loop variable is never assigned; `break`
+>   and `continue`. Never: `for … in` over data, a data-bounded range, `while`, recursion.
+> - **A constant-range loop variable has an internal interval type `[lo, hi)`**, with no user
+>   syntax. It is assignable wherever every value in it fits, so `for i in 0 until 4` can pass
+>   `i` as a `Lane4`.
+> - **Callees:** besides intrinsics and getters, an ordinary function whose inferred summary
+>   says no writes, no allocation, no host I/O and a cost within the budget.
+> - **In std** (D-Q7): a getter is only for a named part of an opaque scalar or vector brand (a
+>   lane, a packed field, a flat-row column); anything else is a method (`std-api-review.md`).
+> - **What is built is still v1**: the shipped checker refuses every loop and every non-getter
+>   callee, and `docs/guide/getters.md` and `DECISIONS.md` describe that. The rulings build
+>   after the persona review's contract rows close (§4 there: steps over calls, string-literal
+>   compares, f64 `%`) and D2064 (intrinsics, closed #3048), and those two files change with
+>   the build. The bullets below
+>   are the v1 text, amended where marked.
 
 A getter body is refused unless it is:
 
-- **Bounded (amended; v1 said "loop-free").** v1: it contains no `for` or `while`. As amended:
-  every loop is a constant range as above, and the body's total iteration count, including
-  that of every getter it calls, is at most 64. In both, it has no cycle through other getters,
-  because recursion has no compile-time bound.
+- **Bounded (amended; v1 said "loop-free").** v1: it contains no `for` or `while`. As ruled:
+  every loop is a constant range as above, and the body's cost in steps, including that of
+  every function it calls, is at most 16. In both, it has no cycle through calls, because
+  recursion has no compile-time bound.
 - **Allocation-free.** It makes no heap allocation, in the GC heap or in linear memory. A
   `let`/`const` local is fine, because it is a wasm local. The walk refuses construction of a
   struct, list, map, string or closure, string `+` and interpolation, and `Buffer(n)`.
@@ -524,7 +538,8 @@ A getter body is refused unless it is:
   §9) is exactly a load at a derived address, and a load has no effect. A trap is permitted (an
   `as!`, or an integer division); by the same reasoning as `exprEffectFree`, the program dies
   either way.
-- **Calls intrinsics and other getters only.** No user or std function is callable, no function
+- **Calls intrinsics and other getters only** (v1; as ruled, also an ordinary function that
+  meets the callee rule above). In v1 no user or std function is callable, no function
   value, and no user operator overload, because `"+"` on a nominal type is an ordinary function
   call. The admitted intrinsics are those the emitter lowers inline to instructions whose only
   possible effect is a trap: the scalar numeric opcodes (`sqrt abs floor ceil trunc nearest min
@@ -538,18 +553,23 @@ A getter body is refused unless it is:
   disassembly): `==`/`!=`/`<`/`<=`/`>`/`>=` over string, list, map or struct operands (a
   `__str_eq__` call or an inline element loop), an index into a map (a hash and a probe loop),
   and list `+`. A literal-union comparison compares tags (`i32.eq`) and is allowed, as is a
-  test against `null`. **f64 `%` is allowed**: it lowers to `__f64_rem__`, whose loops are
-  bounded by the float format (a fixed constant), not by the operands, so it is tier 2.
+  test against `null`. **f64 `%` is refused (RULED, owner, 2026-09-22)**: its
+  `__f64_rem__` lowering loops a number of times set by the operands' exponent gap, which is
+  data-dependent. **A compare against a string literal is bounded (RULED, owner, 2026-09-22)**:
+  `s == "lit"`, `!=`, `is "a" | "b"`, and `startsWith` / `endsWith` with a literal cost the
+  literal's length, provided the lowering pre-checks lengths and never loops past the shorter
+  operand. A compare of two run-time strings stays refused.
 
-**Branches are allowed.** `if` and `match` expressions are fine: cost is bounded by the longest
-path, and a simple fork often lowers to `select`.
+**Branches are allowed.** `if` and `match` expressions are fine: cost is the max over the arms,
+and a simple fork often lowers to `select`.
 
 The contract aims at the first two of four cost tiers:
 
 1. **a load**: `.x` reads one field or one lane;
 2. **straight-line bounded**: a few loads, ALU ops, compares and branches, such as a packed
-   `Color`'s `(self as i32 >> 8) & 255`. As amended, this tier also takes constant-range loops
-   within the budget of 64, such as a four-lane reduction written as `for i in 0 until 4`;
+   `Color`'s `(self as i32 >> 8) & 255`. As ruled, this tier also takes constant-range loops
+   within the budget of 16 steps, such as a four-lane reduction written as `for i in 0 until 4`
+   (its interval-typed `i` passes as a `Lane4`);
 3. **O(1) but allocating**: excluded. It fails the "surprised in a loop" test, because a reader
    of `p.name` in a hot loop does not expect a heap allocation per read;
 4. **unbounded**, or over the budget: excluded.
@@ -607,10 +627,10 @@ refuses the forwarding row, which does not allocate. That is the conservative di
 the function-effects design can relax it.
 
 **This is deliberately conservative, and it will be relaxed, never tightened.** A separate
-design, `docs/internals/function-effects-design.md` (PR #3023), infers a per-instance summary
-of every function: its effects, its reads by location, its allocation, and its bound. The
-getter contract is that summary's `getter-eligible` predicate (§C1b there). Once it lands, a
-getter may call any function that is getter-eligible, as well as intrinsics. Loosening the contract turns refusals into programs that compile. Tightening it
+design, `docs/internals/function-effects-design.md` (PR #3023), infers a summary of every
+function: whether it writes state, allocates, does host I/O, and its cost in steps. Once it
+lands, a getter may call any function whose summary meets the callee rule, as well as
+intrinsics. Loosening the contract turns refusals into programs that compile. Tightening it
 later would break getters that already compile, and std has no deprecation story for that.
 
 ###### What other languages allow in a getter body
@@ -799,6 +819,14 @@ own `lane` function breaks `v.lane(…)`. This question is about std's naming co
 SIMD, and S3's review may already have settled it.
 
 **F5. A read-only member bound, `{ readonly x: f32 }`?**
+**RULED (owner, 2026-09-22, review D-Q4 (c)):** build `{ readonly x: T }` as a generic bound,
+satisfied by fields and getters and specialised per type, with no adaptors. A writable `{ x }`
+converts to `{ readonly x }`, never the reverse. A position that is not specialised (a mixed
+list, a function-typed parameter, a struct field) gets a clear error. An un-annotated
+parameter's read-only requirements are inferred from `fnWriteEffects`, so
+`function red(t) { t.r }` accepts a getter type. Order: after mutable record fields become invariant in depth (the persona review's
+clause-1 row). Why: it ends the dead end
+D2066 recorded without an invisible adaptor. This narrows F2(a) to specialised bounds only.
 Satisfied by a field or a getter; the body may read `t.x` and never write it. It is Swift's
 `{ get }` and mypy's `@property` protocol member.
 *Recommend: rule the meaning now and build it later*, alongside `readonly` fields (A9). Nothing
@@ -814,17 +842,23 @@ renamed to something a caller would not write (the rejected `.raw` pattern, `new
 cannot do the job.
 
 **F7. Setters.**
+**RULED (owner, 2026-09-22, review D-Q3 (c)):** no setters, as the rule. One recorded
+exception, designed only on a flat-row consumer's demand: a store-through-handle setter
+(`set hp(self: UnitRow, v)`) that stores through an address and never modifies the handle. It
+needs a receiver-once `-=`, takes no part in assignment narrowing, and carries a cost contract.
+Why: it is the one setter shape with no write-back problem.
 *Recommend: none in v1, and none planned.* A value-type setter (`v.x = 1` on an `F32x4`) needs
 write-back semantics (C#'s CS1612, Swift's modify accessors). `withLane` says what happens.
 Revisit only if a reference type needs a validating setter and `readonly` fields plus a method
 do not cover it.
 
 **F8. Adopt the checked v1 getter-body contract (§D3a-contract)?**
-*(Ruled (a), and amended on 2026-09-22: "loop-free" became "bounded", admitting constant-range
-loops within a budget of 64; see the note at the head of §D3a-contract.)*
+*(Ruled (a), then amended and RULED on 2026-09-22 (review D-Q1, D-Q2): a hard error for
+everyone; "loop-free" became "bounded", admitting constant-range loops within a budget of 16
+abstract steps; see the note at the head of §D3a-contract.)*
 (a) yes, as stated: loop-free, recursion-free, allocation-free and effect-free, with branches
 allowed, and calls only to intrinsics and other getters. It is relaxed later by
-`docs/internals/function-effects-design.md`. (b) Pure by convention, stated as a guideline and
+`docs/internals/function-effects-design.md`. (b) Cheap and effect-free by convention, stated as a guideline and
 not checked (C#, Python). (c) Stricter: a single expression with no local bindings.
 *Recommend (a).* (b) leaves the perf consumers' guarantee unenforced, and the first allocating
 user getter would break it silently. (c) gives no cost bound that (a) lacks, since both
