@@ -89,6 +89,27 @@ argument-passing, assignment, **and** comparison. `"c"` is never a `"a" | "b"`.
 - rejected: `literal-union-reject-arg.vl`, `literal-union-reject-assign.vl`,
   `literal-union-reject-compare.vl`
 
+### A literal type is a string or an integer, never a float
+A literal type is a set whose members are decided by equality, and float equality does not
+behave like set membership: `-0.0 == 0.0`, `NaN` never equals itself, and rounding makes
+different spellings one value (`1e0` and `1.0`; `0.1 + 0.2` is not `0.3`). So a float literal
+in a type — `x: 1.5`, `1 | 2.0`, `type R = 0.5 | 1.5`, `Box<2.5>`, `(1.5 | 2)[]`, `v is 1.5` —
+is refused, the same choice Python's PEP 586 makes. Write `f64` (or `f32`) there, or an integer
+literal if an integer was meant; `2.0` suggests `2` by name:
+
+```
+function f(x: 1 | 2.0) { … }
+// error: a float literal cannot be a type: … Write `f64` (or `f32`), or the integer literal
+// `2` if an integer was meant, in place of the float literal `2.0`
+```
+
+Float VALUES are unaffected: `const X = 2.5` is an `f64`. An integer literal type stays distinct
+from a float of the same value — over `1 | 2 | f64`, `is 2` holds for the integer `2` and not
+for the float `2.0`.
+
+- rejected: `float-literal-type-refused.vl`
+- sound: `float-literal-type-suggested-fix-runs.vl`, `is-int-literal-set-dispatch.vl`
+
 ### A `const` bound to a string literal has that literal's type
 `const MODE = "debug"` has the type `"debug"`, not `string`. It reads as a plain `string`
 wherever it is stored somewhere reassignable (`let m = MODE` is a `string`) or used by an
