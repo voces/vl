@@ -403,7 +403,7 @@ function binPrec(kind: TokKind): i32 {
     "STAREQ" => {
       return 1
     }
-    "SLASHEQ" => {
+    "SLASHEQ" | "PERCENTEQ" | "AMPEQ" | "PIPEEQ" | "CARETEQ" | "SHLEQ" | "SHREQ" | "USHREQ" => {
       return 1
     }
     "PIPE" => {
@@ -492,12 +492,21 @@ function asAfterNewlines(): i32 {
 
 // The right-associative operators (assignment): their RHS parses at the same
 // precedence, not `prec + 1`, so `a = b = c` nests as `a = (b = c)`.
-function rightAssoc(kind: TokKind) {
-  kind == "EQUAL" ||
-    kind == "PLUSEQ" ||
+function rightAssoc(kind: TokKind) { kind == "EQUAL" || isCompoundAssign(kind) }
+
+// The compound assignments `op=`, each desugared by the climber to `a = a op (b)`.
+function isCompoundAssign(kind: TokKind) {
+  kind == "PLUSEQ" ||
     kind == "MINUSEQ" ||
     kind == "STAREQ" ||
-    kind == "SLASHEQ"
+    kind == "SLASHEQ" ||
+    kind == "PERCENTEQ" ||
+    kind == "AMPEQ" ||
+    kind == "PIPEEQ" ||
+    kind == "CARETEQ" ||
+    kind == "SHLEQ" ||
+    kind == "SHREQ" ||
+    kind == "USHREQ"
 }
 
 // ── type annotations ─────────────────────────────────────────────────────────
@@ -527,7 +536,75 @@ function expectTypeGt() {
     pendingGt = 2
     return 0
   }
+  // A close fused with an `=` (`Box<i32>= v`, `Box<Box<i32>>= v`): the `>`s are taken and
+  // the `=` it ends with is left as its own token.
+  if k == "GE" { return splitGtEq(0) }
+  if k == "SHREQ" { return splitGtEq(1) }
+  if k == "USHREQ" { return splitGtEq(2) }
   expectClose("GT")
+  0
+}
+
+// Splits the fused token at the cursor into its `>` run and an `=` (or `==`, taking an `=`
+// that abuts it) and consumes the run: one `>` now, `banked` more owed. The stream is rebuilt,
+// never edited in place, because the entry token bank holds the old array by reference.
+function splitGtEq(banked: i32) {
+  const t = peekTok()
+  const n = banked + 1
+  let gk: TokKind = "GT"
+  if n == 2 { gk = "SHR" }
+  if n == 3 { gk = "USHR" }
+  let tk: TokKind = "EQUAL"
+  let tText = "="
+  let skip = -1
+  const nx = P.toks[P.pos + 1]
+  if nx.kind == "EQUAL" && nx.start == t.start + t.text.length {
+    tk = "EQ"
+    tText = "=="
+    skip = P.pos + 1
+  }
+  const out: Tok[] = []
+  let j = 0
+  while j < P.toks.length {
+    const s = P.toks[j]
+    if j == P.pos {
+      out.push(
+        {
+          kind: gk,
+          text: t.text.slice(0, n),
+          pos: out.length,
+          start: t.start,
+          line: t.line,
+          col: t.col,
+        },
+      )
+      out.push(
+        {
+          kind: tk,
+          text: tText,
+          pos: out.length,
+          start: t.start + n,
+          line: t.line,
+          col: t.col + n,
+        },
+      )
+    } else if j != skip {
+      out.push(
+        {
+          kind: s.kind,
+          text: s.text,
+          pos: out.length,
+          start: s.start,
+          line: s.line,
+          col: s.col,
+        },
+      )
+    }
+    j = j + 1
+  }
+  P.toks = out
+  advance()
+  pendingGt = banked
   0
 }
 
@@ -1708,10 +1785,15 @@ function parseBinary(left: i32, minPrec: i32, leftPos: i32) {
       if rightAssoc(k) { nextMin = prec }
       const rightPos = peekTok().start // the right operand's leading token
       const right = parseBinary(parseUnary(), nextMin, rightPos)
-      if k == "PLUSEQ" || k == "MINUSEQ" || k == "STAREQ" || k == "SLASHEQ" {
-        // `a += b` desugars to `a = a + (b)` (the host's ARITH_ASSIGN_OPS), tagged
-        // with the surface op so the printer reprints `a += b` (see `mkCompoundAssign`).
-        acc = mkCompoundAssign(opText.slice(0, 1), acc, right, leftPos)
+      if isCompoundAssign(k) {
+        // `a op= b` desugars to `a = a op (b)`, tagged with the surface op so the
+        // printer reprints `a op= b` (see `mkCompoundAssign`).
+        acc = mkCompoundAssign(
+          opText.slice(0, opText.length - 1),
+          acc,
+          right,
+          leftPos,
+        )
       } else {
         // `??` never shares an unparenthesized operand chain with `||` or `&&`: they sit on
         // one precedence tier here, so `a ?? b || c` would group left to right, a coin flip

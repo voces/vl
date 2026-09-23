@@ -92,6 +92,12 @@ const CASES: [string, string][] = [
     `  loc.file + ":" + i32ToStr(loc.line)\n}\nprint(where())\n`,
   ],
   [
+    "fused generic close (the parser splits a token)",
+    `type Box<T> = { v: T }\nconst b: Box<i32>= { v: 41 }\n` +
+    `const c: Box<Box<i32>>= { v: b }\nlet unusedOne = 2\n` +
+    `print(c.v.v + 1)\nprint(c is Box<Box<i32>>== true)\n`,
+  ],
+  [
     "unused everything (a finding-heavy program)",
     `import { fmtI32 } from "std:fmt"\nfunction dead(a: i32): i32 { a }\n` +
     `let never = 1\nlet used = 2\nprint(used)\n`,
