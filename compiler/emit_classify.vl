@@ -14881,7 +14881,12 @@ export function memberCallYieldsValue(stmtIx: i32) {
   const s = P.nodes[stmtIx]
   if s is Call {
     const callee = P.nodes[s.callFn]
-    if callee is Member { return tyPrimNameOf(nodeTyIxOf(stmtIx)) != "void" }
+    if callee is Member {
+      // An unrecorded type (-1) is "cannot answer", never a value.
+      const t = nodeTyIxOf(stmtIx)
+      if t < 0 { return false }
+      return tyPrimNameOf(t) != "void"
+    }
   }
   false
 }
@@ -14988,9 +14993,7 @@ export function blockTailIsValue(blockIx: i32, fnIx: i32) {
     const last = stmts[n - 1]
     const s = P.nodes[last]
     if s is IfStmt { return ifTailIsValue(last, fnIx) }
-    // A member call the checker typed non-void is a value here too, which `emitStmtTail`
-    // already lowers (D1992: an if whose every arm ends in `s.slice(…)`).
-    return stmtIsTailValue(last, fnIx) || memberCallYieldsValue(last)
+    return stmtIsTailValue(last, fnIx)
   }
   false
 }
@@ -15054,8 +15057,41 @@ function ifTailIsValue(stmtIx: i32, fnIx: i32) {
     if ifTailArmIsEmpty(s.ifElse) { return false }
     if blockTailIsValue(s.ifThen, fnIx) { return true }
     const els = P.nodes[s.ifElse]
-    if els is Block { return blockTailIsValue(s.ifElse, fnIx) }
-    return ifTailIsValue(s.ifElse, fnIx)
+    if els is Block {
+      if blockTailIsValue(s.ifElse, fnIx) { return true }
+    } else if ifTailIsValue(s.ifElse, fnIx) {
+      return true
+    }
+    // A member-call arm counts only when EVERY arm is a value (D1992): one `xs.push(x)` arm
+    // beside a `print(0)` arm is a statement tail, and the function stays void.
+    return ifArmsAllMemberValues(stmtIx, fnIx)
+  }
+  false
+}
+
+// Every arm of the else-ful `if` chain at `stmtIx` ends in a tail value or a member call the
+// checker typed non-void; a nested `if` arm must itself qualify. False on an empty arm.
+function ifArmsAllMemberValues(stmtIx: i32, fnIx: i32): boolean {
+  const s = P.nodes[stmtIx]
+  if s is IfStmt {
+    if s.ifElse < 0 { return false }
+    if !armBlockAllMemberValues(s.ifThen, fnIx) { return false }
+    const els = P.nodes[s.ifElse]
+    if els is Block { return armBlockAllMemberValues(s.ifElse, fnIx) }
+    return ifArmsAllMemberValues(s.ifElse, fnIx)
+  }
+  false
+}
+
+// The last statement of the block at `blockIx` qualifies for `ifArmsAllMemberValues`.
+function armBlockAllMemberValues(blockIx: i32, fnIx: i32): boolean {
+  const b = P.nodes[blockIx]
+  if b is Block {
+    const n = b.blkStmts.length
+    if n == 0 { return false }
+    const last = b.blkStmts[n - 1]
+    if P.nodes[last] is IfStmt { return ifArmsAllMemberValues(last, fnIx) }
+    return stmtIsTailValue(last, fnIx) || memberCallYieldsValue(last)
   }
   false
 }
