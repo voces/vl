@@ -100,6 +100,7 @@ import {
   ufcsImpMangled,
   ufcsImpName,
   ufcsImpSpec,
+  ufcsModOfNode,
   ufcsSiteAdd,
   ufcsSpecAlreadyImported,
 } from "./ast"
@@ -18758,7 +18759,12 @@ function memberFloorErr(objTy: i32, prop: string, ix: i32) {
   const specs = ufcsMissSpecsAt(ix)
   if specs != "" {
     return tErrCodedData(
-      ufcsNotImportedMsg(prop, specs, objTy),
+      ufcsNotImportedMsg(
+        prop,
+        specs,
+        objTy,
+        ufcsImportAliasAt(ix, prop, objTy),
+      ),
       ix,
       CODE_UFCS_NOT_IMPORTED,
       ufcsNotImportedData(prop, specs, objTy),
@@ -18831,28 +18837,96 @@ function peelParenIx(ix: i32): i32 {
 // with two or more the fix is a CHOICE and no one line is right, so the sentence ends
 // at "from there" unchanged. Extends the entry's own import (`ufcsSpecAlreadyImported`)
 // rather than proposing a second, colliding one.
-function ufcsImportEditSuffix(prop: string, specs: string): string {
+function ufcsImportEditSuffix(
+  prop: string,
+  specs: string,
+  alias: string,
+): string {
   if specs == "" { return "" }
   let i = 0
   while i < specs.length {
     if specs[i] == ',' { return "" }
     i = i + 1
   }
+  let item = prop
+  let call = ""
+  if alias != "" {
+    item = prop + " as " + alias
+    call = " and call `." + alias + "(…)`"
+  }
   if ufcsSpecAlreadyImported(specs) {
     return " — add `" +
-      prop +
+      item +
       "` to the existing `import { … } from \"" +
       specs +
-      "\"`"
+      "\"`" +
+      call
   }
-  " — add `import { " + prop + " } from \"" + specs + "\"`"
+  " — add `import { " + item + " } from \"" + specs + "\"`" + call
+}
+
+// The import alias D1230's sentence proposes when the caller's module already binds a
+// `self`-function `prop` (D1984): `prop` plus the receiver's type name, which an import of the
+// plain name would collide with. "" when the module binds no such name.
+function ufcsImportAliasAt(ix: i32, prop: string, objTy: i32): string {
+  if ufcsAliasInScope(ix, prop) == prop { return "" }
+  const tn = demangleMsg(tyToStr(objTy))
+  let out = prop
+  let i = 0
+  while i < tn.length {
+    const c = tn[i]
+    if c == '<' { return out }
+    if (
+      (c >= 'a' && c <= 'z') ||
+      (c >= 'A' && c <= 'Z') ||
+      (c >= '0' && c <= '9') ||
+      c == '_'
+    ) {
+      out = out + tn.slice(i, i + 1)
+    }
+    i = i + 1
+  }
+  ufcsFreeAliasAt(ix, out)
+}
+
+// `base`, or `base` with the smallest numeric suffix from 2 up, whichever the module at `ix`
+// neither declares nor imports as a `self`-function, so the proposed import cannot collide.
+function ufcsFreeAliasAt(ix: i32, base: string): string {
+  const m = ufcsModOfNode(ix)
+  let own = ""
+  if m >= 0 { own = "$m" + i32ToStr(m) }
+  let out = base
+  let n = 2
+  while n < 100 {
+    if (
+      ufcsAliasInScope(ix, out) == out &&
+      lookup(out + own) < 0 &&
+      lookup(out) < 0
+    ) {
+      return out
+    }
+    out = base + i32ToStr(n)
+    n = n + 1
+  }
+  out
 }
 
 // D1230's sentence. The fault is the missing import, so the sentence leads with it — "no
 // field 'toEqual' on Expectation<i32>" is true and tells a reader nothing they can act on,
 // while the compiler knew `toEqual` is a free `self`-function in a module the file already
 // names. The closing clause is the rule, not a hedge: UFCS in this language is explicit by ruling.
-function ufcsNotImportedMsg(prop: string, specs: string, objTy: i32) {
+function ufcsNotImportedMsg(
+  prop: string,
+  specs: string,
+  objTy: i32,
+  alias: string,
+) {
+  let how = "so import `" + prop + "` from there"
+  if alias != "" {
+    how = "and this module already binds `" +
+      prop +
+      "`, so import it from there under another name"
+  }
   "'" +
     prop +
     "' is not imported — a free `" +
@@ -18861,10 +18935,9 @@ function ufcsNotImportedMsg(prop: string, specs: string, objTy: i32) {
     tyToStr(objTy) +
     " is exported by " +
     specListQuoted(specs) +
-    "; a UFCS call resolves only names in scope, so import `" +
-    prop +
-    "` from there" +
-    ufcsImportEditSuffix(prop, specs)
+    "; a UFCS call resolves only names in scope, " +
+    how +
+    ufcsImportEditSuffix(prop, specs, alias)
 }
 
 // D1230's payload, the machine half, on the data channel `CODE_UFCS_NOT_IMPORTED` documents.
@@ -22633,31 +22706,10 @@ function homeModuleOf(recvTy: i32): i32 {
   modIxOfMangled(nm)
 }
 
-function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
-  // Maps the callee's plain source name to its merge-mangled function, after field precedence
-  // has already been checked — resolved at this call's own site (D1120), since two merged
-  // modules may each export the same-named `self`-function.
-  let name = ufcsAliasAtSite(ix, plainName)
-  let fnTy = lookup(name)
-  if fnTy < 0 {
-    // Type-bound fallback (§C): the caller's own scope bound nothing, so ask the RECEIVER
-    // type's declaring module for the method before refusing. Fallback-only — it runs only on
-    // this miss, so no call that resolves today can rebind (§F); banked on the site so the
-    // emitter's `ufcsAliasAtSite` names the same function the checker chose.
-    const hm = homeModuleOf(recvTy)
-    if hm >= 0 {
-      const tbName = ufcsExportedScopeIn(hm, plainName)
-      if tbName != "" {
-        const tbFn = lookup(tbName)
-        if tbFn >= 0 {
-          name = tbName
-          fnTy = tbFn
-          ufcsSiteAdd(ix, tbName)
-        }
-      }
-    }
-  }
-  if fnTy < 0 { return -1 }
+// Runs the pending return inference of the function `name` binds, so its type is complete
+// before a UFCS call reads it. False when `fnTy` is not a function at all.
+function ufcsInferCallee(name: string, fnTy: i32): boolean {
+  if fnTy < 0 { return false }
   const preFt = T.tys[fnTy]
   if preFt is TyFunc {
     if preFt.fnRet == -2 {
@@ -22666,9 +22718,99 @@ function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
         if dIx >= 0 { checkNode(dIx) }
       }
     }
-  } else {
-    return -1
+    return true
   }
+  false
+}
+
+// Whether `name` is a `self`-function whose declared `self` type accepts `recvTy`, raising no
+// diagnostic — asked only of the type-bound candidate, once the scope's own has stepped aside.
+function ufcsSelfAccepts(name: string, fnTy: i32, recvTy: i32): boolean {
+  if fnTy < 0 { return false }
+  const ft = T.tys[fnTy]
+  if ft is TyFunc {
+    if ft.fnParamTypes.length < 1 { return false }
+    if !declFirstParamIsSelf(name) { return false }
+    const p0 = ft.fnParamTypes[0]
+    if p0 < 0 { return false }
+    return assignable(recvTy, p0)
+  }
+  false
+}
+
+// Whether the declared type `ty` names the newtype `nom` itself or as a union or nullable
+// member — the shapes a `self` of that newtype can take. Names only: no structural comparison.
+function tyNamesNominal(ty: i32, nom: string, depth: i32): boolean {
+  if ty < 0 || depth <= 0 { return false }
+  if nomNameOfTy(ty) == nom { return true }
+  const inner = nonNullTy(ty)
+  if inner != ty { return tyNamesNominal(inner, nom, depth - 1) }
+  const t = T.tys[ty]
+  if t is TyUnion {
+    let i = 0
+    while i < t.uMembers.length {
+      if tyNamesNominal(t.uMembers[i], nom, depth - 1) { return true }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// Whether the scope's `self`-function `name` steps aside for the receiver's home module: only
+// when the receiver is a newtype and `self` is ANNOTATED with a concrete type that does not
+// name it. Declared names alone decide, so no field or body edit elsewhere re-routes a call
+// (DECISIONS.md §"UFCS is never implicit", D1984); every other scope binding keeps the call.
+function ufcsScopeStepsAside(name: string, fnTy: i32, recvTy: i32): boolean {
+  if fnTy < 0 { return false }
+  const nom = nomNameOfTy(recvTy)
+  if nom == "" { return false }
+  if !declFirstParamIsSelf(name) { return false }
+  const ps = fnDeclParamsOf(name)
+  if ps.length == 0 { return false }
+  const p0n = P.nodes[ps[0]]
+  if p0n is Param {
+    if p0n.parType < 0 { return false }
+  } else {
+    return false
+  }
+  const ft = T.tys[fnTy]
+  if ft is TyFunc {
+    if ft.fnParamTypes.length < 1 { return false }
+    const p0 = ft.fnParamTypes[0]
+    if p0 < 0 || tyHasHole(p0) { return false }
+    return !tyNamesNominal(p0, nom, 8)
+  }
+  false
+}
+
+function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
+  // Maps the callee's plain source name to its merge-mangled function, after field precedence
+  // has already been checked — resolved at this call's own site (D1120), since two merged
+  // modules may each export the same-named `self`-function.
+  let name = ufcsAliasAtSite(ix, plainName)
+  let fnTy = lookup(name)
+  if fnTy < 0 || ufcsScopeStepsAside(name, fnTy, recvTy) {
+    // Type-bound fallback (§C, docs/internals/type-bound-ufcs-design.md): the caller's scope
+    // binds no such `self`-function, or binds one declared for another type while the receiver
+    // is a newtype (§F, D1984), so ask the receiver type's declaring module. Banked on the site
+    // for the emitter.
+    const hm = homeModuleOf(recvTy)
+    if hm >= 0 {
+      const tbName = ufcsExportedScopeIn(hm, plainName)
+      if tbName != "" && tbName != name {
+        const tbFn = lookup(tbName)
+        if tbFn >= 0 {
+          if fnTy < 0 || ufcsSelfAccepts(tbName, tbFn, recvTy) {
+            name = tbName
+            fnTy = tbFn
+            ufcsSiteAdd(ix, tbName)
+          }
+        }
+      }
+    }
+  }
+  if fnTy < 0 { return -1 }
+  if !ufcsInferCallee(name, fnTy) { return -1 }
   const ft = T.tys[fnTy]
   if ft is TyFunc {
     let retTy = ft.fnRet
@@ -23584,7 +23726,12 @@ function checkMemberCallNode(
       const suSpecs = ufcsMissingImportSpecs(sp, recvTy, n.callArgs.length)
       if suSpecs != "" {
         tErrCodedData(
-          ufcsNotImportedMsg(sp, suSpecs, recvTy),
+          ufcsNotImportedMsg(
+            sp,
+            suSpecs,
+            recvTy,
+            ufcsImportAliasAt(ix, sp, recvTy),
+          ),
           ix,
           CODE_UFCS_NOT_IMPORTED,
           ufcsNotImportedData(sp, suSpecs, recvTy),

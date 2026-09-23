@@ -275,6 +275,25 @@ is consulted only as a fallback, after that search finds nothing.** Not "explici
 a tie" — there is never a tie to break, because the fallback rung does not run at all when the
 ordinary one succeeds.
 
+**A scope binding steps aside only on a newtype receiver, by declared names (D1984; owner
+ruling 2026-09-22, option (a)).** As first built, any same-named scope function blocked the rung,
+so a module with its own `dot(self: V2)` could not write `v.dot(w)` on an `F32x4`. The rung now
+also runs when the receiver is a NEWTYPE (`new`-branded, e.g. `F32x4`) and the scope function's
+`self` is ANNOTATED with a concrete type that does not name that newtype (directly, or as a
+union / nullable / array member). In every other case the scope binding keeps the call as
+before: a structural receiver never steps past it, an un-annotated `self` never does, and a
+generic `self: T` keeps it; so does a scope function that names the receiver and then fails on
+arity or arguments. The decision reads declared type names only — never structural
+assignability, never what a body demands. A first cut that asked "does this `self` ACCEPT the
+receiver" was refused in review: on a structural receiver, a library adding a field to `V`, or
+an edit to an un-annotated `self` body, silently moved an already-compiling call between the
+caller's function and the library's. That is the hijacking D's overload rules forbid (a
+declaration elsewhere must never silently change which function a call binds to), and it is why
+Rust and Lean key dot-resolution on the receiver's nominal type. A newtype is not assignable to
+any other declared type, so a scope function annotated for another type could never have taken
+it: stepping aside turns only errors into resolutions, and no declaration elsewhere can change
+which way the test goes.
+
 **Why this is the only rule that cannot change an existing program's meaning.** A program that
 compiles today has, by definition, an ordinary-resolution answer for every call it makes — that
 *is* what "compiles" means under the current rule. Under this design, that same lookup runs
