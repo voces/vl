@@ -4,7 +4,11 @@
 > carries this doc. Every "today" claim is a program run with `dist/vl` at master `9341d7e1c`
 > (2026-09-22), or a line of the tree cited by path. The tier percentages in §C5 come from a
 > syntactic estimator (a Python script, not the compiler) and are labelled as estimates. Where
-> a claim is judgement rather than measurement, the text says so.
+> a claim is judgement rather than measurement, the text says so. §B2 (compiler-internal
+> effect systems) is written from knowledge of those compilers' documentation and source,
+> except where it says a binaryen fact was read from the pinned package. Revised later on
+> 2026-09-22 for the owner's rulings: a numeric bound replaces the loop and recursion bits,
+> reads are split by location, and getter-eligible is separated from `pure` (§C1).
 
 **The question (owner, 2026-09-22).** The getter design on PR #3019
 (`property-access-design.md` §D3a) says a getter is "zero-argument, pure by convention", and
@@ -22,6 +26,9 @@ not re-argue them):**
    and compares, **branches allowed**, costed by the longest path; (3) O(1) but allocating,
    which fails the loop test because of GC pressure; (4) unbounded (loops or recursion). The
    getter target is tiers 1–2: no back-edges, no recursion, no allocation, no effects.
+   *(Amended by the owner later on 2026-09-22: constant-bounded loops are tier 2, within a
+   budget of 64 iterations. "No back-edges" became "a bound computable at compile time". See
+   §C1a.)*
 2. **Inferred per-function summaries**, computed bottom-up over the call graph with SCCs for
    recursion and **per instance**. Unknown callees are pessimistic.
 3. **Not in function types by default.** A summary belongs to a declaration. Users see it
@@ -42,11 +49,18 @@ not re-argue them):**
   the same shape (a bottom-up fixpoint, never in a type) for its own purposes. The getter
   contract, D1510's reorder gate, the concurrency lint and the optimizer all read this one
   analysis. Two analyses would disagree.
-- A summary is **eight bits and a sub-bit**, not one (§C1). "Effect-free" and "cheap" are independent axes.
-  `popcnt` is pure and loops. A counter bump is O(1) and writes. The consumers split along the
-  same line (§G), so the vocabulary has to split too.
+- A summary is **a set of bits plus one number**, not one bit (§C1). "Effect-free" and
+  "cheap" are independent axes. `popcnt` is pure and loops. A counter bump is O(1) and writes.
+  The consumers split along the same line (§G), so the vocabulary has to split too. Reads are
+  split by location (`let` binding, GC heap by root, linear memory), and cost is a **bound**:
+  `Bounded(n)` or `Unbounded`, transitive through calls, never data-dependent (§C1a).
+- **Getter-eligible is not `pure`.** A getter may read its receiver's mutable fields and
+  linear memory. It may not write, call the host, call something unknown, allocate, read a
+  module `let`, or exceed a bound of 64 (§C1b). `pure` is about effects and reads; a getter is
+  about effects, allocation and cost.
 - **The marker's word is `pure`, and it means effects only**: no writes to state the call did
-  not create, no host calls, no unknown calls, no reads of mutable module state. It promises
+  not create, no host calls, no unknown calls, no reads of module `let`s, linear memory or a
+  module `const`'s heap (reads through a parameter are allowed). It promises
   nothing about cost. Koka's `pure`, Fortran's `PURE` and D's `pure` all mean the same thing,
   and "pure" meaning loop-free would be a new meaning no reader expects (§E2).
 - **Cost gets no keyword in v1.** A getter's body is checked by inference. std's cost promise
@@ -172,6 +186,11 @@ litunion compact rep are two of those changes). §C3 turns on this.
 
 ## B. Survey
 
+§B1 surveys what languages let a user write. §B2 surveys what optimizing compilers track
+internally, where nobody writes anything.
+
+### B1. Language markers
+
 The columns that decide VL's answer: **is it checked**, **is it in function types**, and
 **how does a higher-order function get the property from its argument**.
 
@@ -223,47 +242,199 @@ Findings, stated as findings:
    conversion goes one way (`pure → default`) and a callback parameter just takes the weakest
    type. That is option (C)'s subtyping.
 
+### B2. Compiler-internal effect systems
+
+§B1 is about markers a user writes. This section is about what optimizing compilers **infer
+and keep for themselves**. No user writes these facts, and a wrong one is a compiler bug, not
+a user error. They are the best available evidence for which facts are worth tracking, because
+each exists only because some pass needed it.
+
+**Sources, stated honestly.** One row is partly measured: binaryen 130 is pinned in
+`package.json`, and `node_modules/binaryen/index.d.ts` (the C API binding) lists its
+`SideEffects` bitmask. The binaryen C++ `EffectAnalyzer` (`src/ir/effects.h`) is **not**
+available locally, so its fields below come from knowledge of the source, not from reading
+the pinned version. Every other row is from knowledge of the documentation and source, with
+no local measurement. Where I am unsure of a name or a version, the row says so.
+
+| system | where | what it tracks | how it is inferred | consumers |
+| --- | --- | --- | --- | --- |
+| **LLVM** | function and parameter attributes | **`memory(...)`** (LLVM 16+) gives an access kind (`none`/`read`/`write`/`readwrite`) **per location**: `argmem` (memory reached through pointer arguments), `inaccessiblemem` (memory the module cannot name, such as allocator state), and `other`. Later releases add more locations (an errno location, I believe; not verified). It replaced the older attributes, which survive as spellings: `readnone` = `memory(none)`, `readonly` = `memory(read)`, `writeonly` = `memory(write)`, `argmemonly` = `memory(argmem: readwrite)`. Separate attributes: **`willreturn`** (returns or unwinds, never diverges), **`mustprogress`** (C++ forward progress: a loop without side effects may be assumed to terminate), **`nounwind`** (no exception leaves), **`norecurse`**, **`nofree`** (frees no memory, so a dereferenceable pointer stays dereferenceable), **`nosync`** (no synchronisation with other threads), `speculatable` (no UB and no effects, so it can be executed where it was not before), `noreturn`. Per parameter: `readonly`/`writeonly`/`readnone`, and `nocapture` (spelled `captures(none)` in recent releases, I believe) | `FunctionAttrs` walks SCCs of the call graph bottom-up; `norecurse` is derived in a second top-down walk; the Attributor is a heavier fixpoint framework for the same facts | alias analysis, LICM, DCE of unused calls, GVN/CSE across calls, speculation |
+| **GCC** | IPA passes | **`ipa-pure-const`** discovers `const` (reads no memory except constants) and `pure` (may read global memory), each with a separate **`looping`** flag: a *looping* pure function may not terminate, so a call whose result is unused cannot be deleted. It also discovers `nothrow`, `noreturn` and `malloc`. **`ipa-modref`** (GCC 11+) records per-function **load and store summaries** as trees keyed by base (a parameter index or global memory), then alias set, then offset and size ranges; plus per-parameter escape flags (the `EAF_*` family). To my knowledge GCC 12 added `side_effects` and `nondeterministic` flags to modref summaries | reduced postorder over the call graph with SCCs; modref propagates summaries through calls, including through a parameter passed on to a callee | DSE and alias queries across calls; `-Wsuggest-attribute=pure/const/noreturn` |
+| **binaryen** (VL's own optimizer) | `EffectAnalyzer` per expression; `--generate-global-effects` per function | **Measured (C API, `index.d.ts`):** `Branches`, `Calls`, `ReadsLocal`/`WritesLocal`, `ReadsGlobal`/`WritesGlobal`, `ReadsMemory`/`WritesMemory`, `ReadsTable`/`WritesTable`, `ImplicitTrap`, `IsAtomic`, `Throws`, `DanglingPop`, `TrapsNeverHappen`. **From knowledge of the C++ class** (not the pinned source): the local and global reads and writes are **sets of names**, and only *mutable* globals count as read; GC reads are split into **`readsMutableStruct`** (an immutable field read is no effect) and `readsArray`, and writes into `writesStruct` and `writesArray`; **`trap`** (an explicit or certain trap, such as `unreachable`) is separate from **`implicitTrap`** (a load, a division or a cast that *may* trap); **`mayNotReturn`** marks a loop or a call that may not come back; `branchesOut` and the try and catch depth track control. The C API bitmask exposes no struct, array or `mayNotReturn` entry, so those fields are the least certain claims in this table | a local walk per expression; `--generate-global-effects` computes each function's effects over the call graph and lets later passes use them at call sites instead of assuming the worst. `--ignore-implicit-traps` and `--traps-never-happen` let a pass drop the trap facts | LICM, code folding, simplify-locals (moving a `local.set`'s value), vacuum (dead code), GUFA. §A5: VL's release profile runs neither `--licm` nor `--generate-global-effects` |
+| **V8 TurboFan** | `Operator::Properties` on each IR operator | `kNoRead`, `kNoWrite`, `kNoThrow`, `kNoDeopt`, `kIdempotent`, `kCommutative`, `kAssociative`. **`kPure` = `kNoRead` + `kNoWrite` + `kNoThrow` + `kNoDeopt` + `kIdempotent`**. Deoptimization (bailing out to the interpreter) is its own axis, because the speculative JIT can leave the optimized code at any check. Turboshaft (the newer backend) replaced this with `OpEffects`, which separates loads and stores of **heap** memory from **off-heap** memory, control flow, allocation and "required when unused". I am confident of the TurboFan flags and less sure of Turboshaft's exact names | per operator, fixed by the operator's definition; calls take the callee's known properties or the worst | effect-chain scheduling, load elimination, dead-node removal |
+| **HotSpot C2** | the memory graph | memory state is **sliced by alias class**: each field and each array element type has its own memory slice, and a node reads and writes only its slice, so a store to `A.f` does not order against a load of `B.g`. Calls kill every slice unless the call is a known leaf. From knowledge, lower confidence than the rows above | type-based alias classes; escape analysis for allocations | GVN, load elimination, scalar replacement |
+| **Cranelift** | instruction definitions and `MemFlags` | each opcode is defined with flags such as `can_load`, `can_store`, `can_trap` and `other_side_effects`. Memory operations carry `MemFlags`: `notrap`, `aligned`, `readonly`, an **alias region** (`heap`, `table` or `vmctx`), and `can_move` (the load may be hoisted). The e-graph optimizer lets **pure** instructions float and keeps side-effecting ones in a fixed "skeleton" order. From knowledge | per instruction; the frontend (Wasmtime) sets the flags it can prove | e-graph rewriting, alias analysis by region, load hoisting |
+| **MLIR** | `MemoryEffectOpInterface` | effects are `Allocate`, `Free`, `Read` and `Write`, each on a named **resource**. The `Pure` trait is **no memory effects plus `AlwaysSpeculatable`**, so it combines effects with "may be executed speculatively". `RecursiveMemoryEffects` derives an op's effects from its nested regions | per op, and recursively for ops with regions | CSE, LICM, dead-op removal |
+
+Findings, stated as findings:
+
+1. **Every optimizing IR splits reads and writes by location.** LLVM has `argmem` against
+   `inaccessiblemem` against `other`. GCC's modref keys by parameter index. binaryen separates
+   locals, globals by name, linear memory, tables, struct fields and arrays. TurboFan's
+   successor splits heap from off-heap, and C2 and Cranelift split by alias class or region.
+   None of them has one "reads" bit. **VL should split `R` by location** (§C1). It also should
+   note what binaryen, LLVM and GCC agree on: a read of *immutable* state is no effect at all.
+2. **Termination is its own fact everywhere, never part of "pure".** LLVM has
+   `willreturn`/`mustprogress`, GCC has the `looping` flag on `pure` and `const`, binaryen has
+   `mayNotReturn`, and MLIR folds speculatability into its `Pure` trait explicitly rather than
+   implying it. GCC's `looping pure` is the compiler-internal twin of §B1's finding 1: a
+   function can be effect-free and still diverge, and a pass that deletes or moves the call
+   has to know. **VL adopts this as a bound (§C1), and goes one step further than any of them:
+   the bound is a number, not a bit**, because the getter test is about cost, and a yes/no
+   "terminates" says nothing about how long.
+3. **Unwinding is its own fact.** LLVM `nounwind`, GCC `nothrow`, binaryen `Throws` and
+   TurboFan `kNoThrow` all separate "may leave by an exception" from "may trap" and from "has
+   effects". VL has no exceptions today, so **`U` is reserved** (§C1).
+4. **Explicit and implicit traps are different facts for an optimizer.** binaryen separates
+   `trap` from `implicitTrap`, Cranelift has `can_trap` and a `notrap` flag, and LLVM's
+   `speculatable` exists because a trap that *may* happen blocks speculation. A certain trap
+   (`__trap__`, a failed `as!`) ends a path. A possible trap (an index, a division) only
+   stops code from moving above its guard. **VL's optimizer-only `T` could split the same way
+   when an optimizer consumer needs it** (§I16). It stays invisible to users either way.
+5. **Parameter-scoped facts are the common case.** LLVM's per-parameter `readonly`, GCC's
+   modref bases and escape flags, and `argmem` all say "this function touches only what its
+   arguments reach". VL's `R.heap` with its root class (§C1) is the smallest version of that.
+   A per-parameter split is a later refinement, and only an optimizer would need it.
+6. **Not worth adopting: `nofree` and `nosync`.** `nofree` protects a pointer from being
+   invalidated by a deallocation, and nothing in VL's GC heap can be freed by user code. The
+   one manual deallocation, `bufferRelease` of linear memory, is already a write (`W`).
+   `nosync` describes synchronisation with other threads through shared memory, and VL has no
+   shared-memory threads (`concurrency-design.md` §6 rules them out for now). Both are moot
+   under VL's memory model, not merely deferred. `speculatable` is also not a source-level
+   concept; an optimizer can derive it from the bits VL already has (effect-free, bounded, no
+   `T`).
+7. **Every one of these is an optimizer fact, and none of them decides acceptance.** That is
+   the owner's point 5 again. VL is unusual in using the same summary for an acceptance rule
+   (the getter check), which is why the acceptance half must be local and stable, and the
+   optimizer half may use global flow.
+
 ---
 
 ## C. The summary
 
 ### C1. What a summary records
 
-Each bit is a monotone "may" fact about **one instance** (a declaration plus its pin key, §C4),
-closed over its callees. Lower is better, and the analysis may only over-approximate.
+Each fact is a monotone "may" fact about **one instance** (a declaration plus its pin key,
+§C4), closed over its callees. Lower is better, and the analysis may only over-approximate.
+Every fact is a bit except `B`, which is a number.
 
-| bit | the instance may… | own-body sources |
+| fact | the instance may… | own-body sources |
 | --- | --- | --- |
 | `W` | write state it did not create during this call | assignment to a module `let`; a field, element or map write whose root is not fresh (§C2); `push`/`pop`/`set`/`sort`…; linear-memory `store*`, `memory.fill/copy`; `bufferRelease` |
-| `R` | read mutable module state | a read of a module `let`; a linear-memory load (memory is ambient) |
+| `R.let` | read a module `let` **binding** | a read of a module `let`. A read of a module `const` binding is **not** a read: the binding cannot change |
+| `R.heap` | read mutable GC-heap state that this call did not create. It carries a **root class**: `param` (reached from a parameter, `self` included) or `const` (reached from a module `const`, such as a lookup table) | a field, element or map read whose root is not fresh (§C2). A read of a field the language makes immutable would not count, as binaryen and LLVM already treat it (§B2 finding 1) |
+| `R.mem` | read linear memory | a `__load_*` intrinsic, and the std functions built on them (`std:buffer`, `std:bytes`) |
 | `H` | call the host | an `extern function`, `print`, `std:fs`/`std:process`/`std:args` intrinsics. **Sub-bit `S`: may suspend** (concurrency-design §4's question) |
 | `X` | call something unknown | `call_indirect` whose target set is not resolved (§F); an extern with no trusted marker |
 | `A` | allocate on the GC heap | an object or array literal; a lambda literal (a `{env, id}` struct, `emit_state.vl:158`); string `+` and template interpolation; spread; `slice`/`map`/`filter`/`concat`; `Map()`; constructors |
-| `L` | execute a back-edge | `while`, `for`; **an operator whose lowering loops** (string and list `==`, string hashing, a map probe, `utf8` coding: §A3) |
-| `C` | recurse | membership in a cyclic SCC, or a self-edge |
-| `T` | trap | index, division, `as!`, `__trap__`, overflowing casts. **Optimizer-only; never user-visible** (D1510 ruled that a trap is not an effect) |
+| `B` | take at most this many loop iterations: **`Bounded(n)`**, or **`Unbounded`** | §C1a. `Unbounded` comes from a `while`, a `for`-in over data, a range whose ends are not constant, recursion (a cyclic SCC or a self-edge), an unresolved indirect call, or **an operator whose lowering loops over its operands** (string and list `==`, string hashing, a map probe, `utf8` coding: §A3) |
+| `T` | trap | index, division, `as!`, `__trap__`, overflowing casts. **Optimizer-only; never user-visible** (D1510 ruled that a trap is not an effect). A split into explicit and implicit traps is §I16 |
+| `U` | unwind (leave by an exception) | **reserved, always 0 today.** VL has no exceptions. Wasm exception handling is the future source, and plumb reserves a status result "for exception unwinding" in its cross-unit calls (`~/plumb/docs/vl-issues.md`, PL-013). Every surveyed optimizer keeps this fact apart from traps and effects (§B2 finding 3), so it gets its slot now |
 
-The derived predicates, which are what people and passes actually ask:
+`B` replaces the earlier `L` (any back-edge) and `C` (recursion) bits. The diagnostic chain
+(§D) still records *why* a function is `Unbounded`, loop or recursion or operator, so nothing a
+message needs is lost.
 
-| name | definition | who asks |
-| --- | --- | --- |
-| **effect-free** | ¬W ∧ ¬H ∧ ¬X | D1510 reorder (with terminating), concurrency §5 "pure CPU" |
-| **`pure`** (the marker, §E) | effect-free ∧ ¬R | the checked marker; parallelism; compile-time evaluation |
-| **terminating** | ¬L ∧ ¬C | D1510 reorder, hoisting. This is sufficient, not necessary (§I11) |
-| **getter-eligible** | `pure` ∧ ¬A ∧ ¬L ∧ ¬C | the getter body check: tiers 1–2 |
+#### C1a. The bound (owner ruling, 2026-09-22)
 
-That makes the owner's four getter conditions exactly `getter-eligible`. The tiers fall out:
-tier 3 is `pure ∧ A ∧ ¬L ∧ ¬C`, and tier 4 is `pure ∧ (L ∨ C)`. Tier 1 versus tier 2 is not a
-bit. Once inlined they are the same wasm (property-access §A2), and nothing needs to tell them
-apart.
+**Invariant: an instance's worst-case iteration count is computable at compile time from the
+source plus the bounds of its callees, and never depends on data.** Every rule below follows
+from it, and only the budget's number may change.
 
-**Why `R` is separate from `W` (judgement, backed by one measurement).** Reads are harmless for
-D1510 and for the loop test. But two consumers need them excluded. A parallel worker gets
-**fresh** module globals (`concurrency-design.md` §6: "a silent wrong answer"), and
-compile-time evaluation cannot read a `let` whose value is decided at run time. Measured by the
-estimator: of the 87 std functions it grades tier ≤ 2, **3 read a module `let`**. In the
-compiler the figure is **601 of 939**, because the compiler keeps its arenas in module globals.
-Excluding `R` costs std almost nothing, and the compiler is not getter code.
+- **Allowed:** a numeric range `for i in <a> (to | until) <b> [step <s>]` where `a` and `b` are
+  integer literals or module `const` integers (§I13 says exactly which consts), `s` is an
+  integer literal, and the loop variable is never assigned in the body. `break` and `continue`
+  are allowed; the bound assumes the loop runs to its end. The trip count is the number of
+  values the range visits (`to` is inclusive, `until` half-open), so `for i in 0 to 3` is 4
+  and `for i in 10 to 0 step -2` is 6 (both run with `dist/vl`). `step 0` is already refused by
+  the checker ("a range with `step 0` never advances").
+- **Never:** a `for`-in over data, a range with a data-dependent end, `while`, and recursion.
+  They are `Unbounded`, with no escape.
+- **Composition.** Nested loops multiply, and the bound is **transitive through calls**:
+
+  ```
+  bound(f) = Σ over loops ℓ in f:  trips(ℓ) × Π trips(loops enclosing ℓ)
+           + Σ over calls c in f:  bound(callee(c)) × Π trips(loops enclosing c)
+  ```
+
+  So a loop of 4 inside a loop of 4 costs 4 + 16 = 20, and a call to a `Bounded(8)` callee
+  inside a loop of 4 adds 32. `Unbounded` absorbs everything. Straight-line code is
+  `Bounded(0)`. A compiler helper whose loop is bounded by a format constant rather than by its
+  operands (f64 `%`'s `__f64_rem__`, which property-access §D3a-contract already rules tier 2)
+  counts as 0 (§I15).
+- **The budget.** A getter's total must be at most **one named budget, 64**. That number is
+  the only part of this rule that may change, and changing it takes a `DECISIONS.md` entry and
+  a std review, because std exports' eligibility depends on it. The summary carries the exact
+  number (saturating, so a pathological product cannot overflow) and applies no budget of its
+  own. Each consumer applies its own threshold: getters take `≤ 64`, and D1510 and hoisting
+  take any `Bounded(n)`.
+
+#### C1b. The derived predicates
+
+These are what people and passes actually ask:
+
+| name | definition | reads it admits | who asks |
+| --- | --- | --- | --- |
+| **effect-free** | ¬W ∧ ¬H ∧ ¬X (∧ ¬U once `U` exists) | all | D1510 reorder (with terminating), concurrency §5 "pure CPU" |
+| **terminating** | `B` = `Bounded(n)`, any `n` | all | D1510 reorder, hoisting. Sufficient, not necessary: a `while` that always stops is still `Unbounded` |
+| **`pure`** (the marker, §E) | effect-free ∧ ¬`R.let` ∧ ¬`R.mem` ∧ ¬`R.heap[const]` | `R.heap[param]` only | the checked marker; parallelism; compile-time evaluation |
+| **getter-eligible** | effect-free ∧ ¬A ∧ ¬`R.let` ∧ `B` = `Bounded(n ≤ 64)` | `R.heap` (both roots) and `R.mem` | the getter body check |
+| **hoistable** (optimizer only) | effect-free ∧ terminating ∧ no `T`, or a trip-count guard ∧ nothing it reads is written in the loop | per §G2 | LICM, CSE |
+
+**Getter-eligible is NOT `pure`, and neither implies the other.** A getter reads its receiver's
+mutable fields by design, and the approved getter contract (property-access §D3a-contract)
+deliberately allows `__load_*` linear-memory reads, because the flat-row getter is exactly a
+load at a derived address. So a getter admits `R.heap` and `R.mem`, which `pure` does not. In
+the other direction, a `pure` function may loop without bound and may allocate, which a getter
+may not.
+
+**Why a getter excludes `R.let` (the rationale is description, not purity).** A getter
+*describes its receiver*: it reads what is reachable from `self`, plus constants. A module
+`let` is neither. It is state the receiver does not own, and a getter that reads it gives two
+different answers for the same receiver. Linear memory is admitted pragmatically: a `Buf`
+receiver's bytes are reachable from `self` in intent, but proving that a load's address is
+derived from `self` needs address analysis VL does not have. So the rule admits every
+linear-memory read rather than refusing the flat-row getter.
+
+**Why `pure` excludes `R.let`, `R.mem` and `R.heap[const]`, and admits `R.heap[param]`
+(judgement, backed by one measurement).** The two consumers that need `pure` to exclude reads
+are compile-time evaluation and parallel workers.
+
+- Compile-time evaluation cannot read a `let` whose value is decided at run time, or linear
+  memory that is filled at run time. It evaluates a call only when the arguments are
+  compile-time values, so the heap reached through a *parameter* is compile-time data too.
+  A module `const`'s heap is not: a `const` binding's list can be mutated at run time.
+- A parallel worker is a separate instance, and it gets **fresh** module globals and a fresh
+  linear memory (`concurrency-design.md` §6: "a silent wrong answer"). A `let` read, a memory
+  read, and a read of a `const`'s mutated heap would all see the worker's fresh copy. A read
+  through a parameter sees what the caller passed, which is the one thing a worker message
+  carries.
+
+This makes `pure` about as strong as D's weak `pure` for reads (§B1), which may read through
+its arguments, and weaker than GCC's `const`, which reads nothing but constants. Unlike D's
+weak `pure`, VL's `pure` still forbids writes through arguments (`W`).
+
+Measured by the estimator (§C5), before this split: of the 87 std functions it grades tier ≤ 2,
+**3 read a module `let`**. In the compiler the figure is **601 of 939**, because the compiler
+keeps its arenas in module globals. Excluding `R.let` costs std almost nothing, and the
+compiler is not getter code. The estimator does not split heap reads by root, so it gives no
+count for `R.heap[const]`.
+
+**Hoisting needs the read facts too (§G2).** A call can move out of a loop only if nothing the
+call reads is written inside the loop. For `R.let` and `R.mem` that is a cheap check against
+the loop's own `W` sources. For `R.heap[param]` it needs either alias analysis or the coarse
+rule "the loop writes no heap at all". Without the parameter-heap fact, hoisting `norm(p)` out
+of a loop that assigns `p.x` would be unsound. This is why `R.heap` is recorded even though
+getters admit it.
+
+**Tiers fall out of `A` and `B`, independent of reads.** Tier 1–2 is ¬A ∧ `Bounded(n ≤ 64)`:
+constant-bounded loops within the budget are tier 2 now, not tier 4. Tier 3 is A ∧
+`Bounded`, and tier 4 is `Unbounded` or over budget. Tier 1 versus tier 2 is not a fact. Once
+inlined they are the same wasm (property-access §A2), and nothing needs to tell them apart.
+
+**The std baseline records the bound as a number** (§E4). CI flags any export whose bound
+**increases**, including `Bounded(n)` → `Unbounded`, as well as any export that loses a
+predicate.
 
 ### C2. Freshness: writing to what you just allocated is not an effect
 
@@ -284,7 +455,7 @@ Two constraints decide the placement:
   clause-2 violation by construction, since `check` returned 0 to reach the emitter". The
   getter check and the `pure` check are acceptance rules, so they are checker diagnostics.
 - **§A3's operators need types.** The typed AST has them. The checker knows `n.name` is a
-  `string`, so `==` on it sets `L`.
+  `string`, so `==` on it makes the bound `Unbounded`.
 
 So the summary is computed **in the checker, over the typed AST, per pinned instance**. It
 consults an **operator cost table** keyed by operator and operand type (§I6).
@@ -304,12 +475,14 @@ error, and hover shows it (§D).
 
 - **Key.** A summary is keyed by `(declaration, pin key)`, the same identity the emitter's
   instance table uses (`monomorphization-design.md`). A non-generic function has one key. A
-  generic's `a == b` over `T` is ALU at `i32` and a loop at `string`, so its `L` bit differs
+  generic's `a == b` over `T` is ALU at `i32` and a loop at `string`, so its bound differs
   per key. That is the reason for point 2 ("computed PER INSTANCE").
 - **Order.** Tarjan's SCCs over the instance call graph, visited callees first. Each SCC's
-  summary is the OR of its members' own-body bits and its external callees' summaries, plus `C`
-  if the SCC is cyclic. That is one pass, linear in instances plus call edges, with no
-  iteration to a fixpoint, because every bit is a monotone OR.
+  summary is the OR of its members' own-body bits and its external callees' summaries. A
+  cyclic SCC is `Unbounded`. An acyclic instance's bound is the §C1a sum, over callees whose
+  bounds are already final. That is one pass, linear in instances plus call edges, with no
+  iteration to a fixpoint: every bit is a monotone OR, and the bound of an acyclic node is
+  computed once from finished callees.
 - **The cost trap.** CLAUDE.md's D1090 section shows a per-binding whole-arena scan making the
   L2 self-compile non-terminating. The summary must be **one pass that is memoised per key**,
   never a query that re-walks callees on demand. It needs a `tests/vl_scaling_shape_test.ts`
@@ -337,7 +510,9 @@ cyclic SCCs and 222 self-recursive functions, so recursion is common and the SCC
 not optional. **std's tier ≤ 2 exports are exactly what a getter would call**: all of
 `std:simd`'s lane arithmetic, `dot`, `cross`, `normalize`, both `hypot`s and both `atan2`s,
 `std:bytes`' decoders, and `std:buffer`'s `load*`/`get*`. Those read linear memory, so they
-carry `R` (§I2).
+carry `R.mem`: getters may call them, and `pure` functions may not (§C1b). The estimator treats
+every loop as unbounded, so after the §C1a ruling its tier ≤ 2 counts are a lower bound: a
+function whose only loops are constant ranges within the budget now lands in tier 2.
 
 ---
 
@@ -350,15 +525,16 @@ surfaces in three places.
    path, and the line that set the bit:
 
    ```
-   getter `len` must not loop: it calls `norm` (vec.vl:12), which loops at vec.vl:14
+   getter `len` has no compile-time bound: it calls `norm` (vec.vl:12), whose `while` is at vec.vl:14
+   getter `sum` costs 80 iterations, over the budget of 64: 4 × 20 through `row` (vec.vl:21)
    getter `label` must not allocate: string `+` at shape.vl:9 builds a new string
    `pure function scale` reads module state: `gScale` (a `let`) at cfg.vl:3
    ```
 
    The chain is the **shortest** path to the first offending line, found by walking back the
    SCC order. (Judgement: a message that names only the getter sends the reader on a hunt.)
-2. **LSP hover** on a function name or a call shows one line: `pure · no loops · no
-   allocation` or `writes: gCount (line 8) · loops`. For a generic it shows the summary at *this*
+2. **LSP hover** on a function name or a call shows one line: `pure · bound 0 · no
+   allocation` or `writes: gCount (line 8) · unbounded (while, line 9)`. For a generic it shows the summary at *this*
    call's instance. This is the "visibility comes from tooling" answer that
    `concurrency-design.md` §5 already chose.
 3. **Hints, never errors, for facts that do not decide acceptance.** Examples are the §C3
@@ -390,7 +566,7 @@ Point 6(ii): the word must also work as the future type qualifier. Candidates:
 | word | as a declaration | as a type qualifier | meaning elsewhere | verdict |
 | --- | --- | --- | --- | --- |
 | **`pure`** | `pure function f` | `pure (i32) => i32` | Koka, D, Fortran, GCC, Solidity, Haskell culture: **effect-free, cost unspecified** | **recommended**, as effects only |
-| `const` | `const function f` | `const (i32) => i32` | Rust and C++: *compile-time evaluable*, which permits loops; VL: an immutable binding | reject. It collides with VL's binding keyword, and the borrowed meaning is a different property (it needs ¬R and permits `L`) |
+| `const` | `const function f` | `const (i32) => i32` | Rust and C++: *compile-time evaluable*, which permits loops; VL: an immutable binding | reject. It collides with VL's binding keyword, and the borrowed meaning is a different property (it needs ¬`R.let` and permits unbounded loops) |
 | `@pure` | `@pure function f` | `@pure (i32) => i32` reads badly | D-style attributes | reject. It opens an attribute syntax class that invites D's "attribute soup", and it composes worse in type position |
 | `func` | Nim: `func` = no side effects | — | — | reject. `func` versus `function` is a one-letter semantic difference |
 | `view` | Solidity: reads allowed, no writes | — | — | reject. It names the permissive half, and nobody outside Solidity knows it |
@@ -428,16 +604,21 @@ is in the signature, so the comment does not repeat it.
 ### E4. The cost half at the std boundary: a checked baseline, not a keyword
 
 A user getter that calls `normalize` is accepted because the checker sees `normalize`'s body
-and grades it getter-eligible. If a later std version adds a loop, the user's getter fails
+and grades it getter-eligible. If a later std version adds an unbounded loop, or raises the
+bound so that the user's getter's total passes 64, the user's getter fails
 **loudly**, on upgrade. So nothing is unsound. What is missing is that **std's own CI would
 not notice** that it withdrew a property users depend on.
 
 **Recommended: `scripts/std-effects-baseline.json`**, one line per std export, recording its
-derived predicates (`pure`, `terminating`, `getter-eligible`). `--check` in `gate.sh` fails
-when any export **loses** a predicate. `--write-baseline` goes in the same PR as the loss, and
+derived predicates (`pure`, `terminating`, `getter-eligible`) and its **bound as a number**
+(`Bounded(n)` or `Unbounded`, §C1a). `--check` in `gate.sh` fails when any export **loses** a
+predicate or its **bound increases**. The bound has to be a number, not only the
+getter-eligible bit: a user getter's total is the sum over what it calls, so a std export
+going from 8 to 40 can push a user getter over the budget while the export itself stays
+eligible. `--write-baseline` goes in the same PR as the loss or the increase, and
 that PR must go through `std-api-reviewer`. This is the `seed-size` and `comment-budget` shape
 the repo already runs. It is checked, it needs no syntax, and it covers the only boundary VL
-has. A new predicate appearing (a body getting cheaper) prints and passes.
+has. A new predicate appearing or a bound falling (a body getting cheaper) prints and passes.
 
 **When a keyword becomes necessary:** when a second boundary exists whose bodies the compiler
 cannot see. Separately compiled units (`incremental-build-design.md`, and plumb's
@@ -543,8 +724,14 @@ admission lets `unionEqOperandOk` re-read a getter-eligible call, and the three 
 
 §A5's `popcnt(k)` runs 1,000 times at `-O3`. Hoisting a call out of a loop needs effect-free
 (nothing observes the move), terminating (a loop that runs zero times must not start to hang),
-and either no `T` or a guard on the trip count. ¬R, or no writes to the read state inside the
-loop, is needed too. Hoisting is an optimizer consumer, so global flow facts are allowed here.
+and either no `T` or a guard on the trip count. It also needs **nothing the call reads to be
+written inside the loop**, and that is where the location split of §C1 pays. An `R.let` read
+conflicts only with the loop's writes to that `let`, and an `R.mem` read only with its memory
+stores: both are cheap checks. An `R.heap[param]` read conflicts with any heap write in the loop
+that might reach the same object, so without the parameter-heap fact the hoist is unsound
+(`norm(p)` moved out of a loop that assigns `p.x`), and with it the hoist needs alias analysis
+or the coarse rule "the loop writes no heap". Hoisting is an optimizer consumer, so global flow
+facts are allowed here.
 One option is to emit binaryen's `--generate-global-effects` plus `--licm` in the release
 profile, which needs a measurement first. The other is a VL-side hoist. Neither changes
 acceptance.
@@ -553,16 +740,18 @@ acceptance.
 
 A `const` initialiser, a future const parameter (property-access D4, and the lane immediate in
 D1980), or a table built at compile time can be evaluated by the compiler when the callee is
-`pure` (¬R is essential). Termination is **not** required if the evaluator has a fuel quota
+`pure` (the read exclusions of §C1b are essential). Termination is **not** required if the evaluator has a fuel quota
 (Zig's `@setEvalBranchQuota`), which is why `pure` must not imply cost. Otherwise every
 compile-time-evaluable function would also have to be loop-free.
 
 ### G4. Parallelism and concurrency
 
-`concurrency-design.md` §4's three jobs read `H`/`S` (suspends) and `W`/`R` (ambient state). §5's
-eligibility table is this summary's predicates under other names: I/O = `S`, "pure CPU" =
-`pure`, "touches ambient mutable state" = `W ∨ R`. **One analysis serves both docs.** It is
-also why §C1 keeps `R`: a worker reads fresh globals.
+`concurrency-design.md` §4's three jobs read `H`/`S` (suspends) and `W` plus the reads
+(ambient state). §5's eligibility table is this summary's predicates under other names: I/O =
+`S`, "pure CPU" = `pure`, "touches ambient mutable state" = `W ∨ R.let ∨ R.mem ∨
+R.heap[const]`. **One analysis serves both docs.** It is also why §C1 splits the reads: a
+worker gets fresh globals, a fresh memory and freshly initialised `const`s, but it reads
+through a parameter exactly what the message carried.
 
 ### G5. Diagnostics that come free
 
@@ -579,9 +768,11 @@ also why §C1 keeps `R`: a worker reads fresh globals.
 | decision | forecloses | reversible? |
 | --- | --- | --- |
 | Summaries are inferred and never written (points 2–3) | nothing: a written form can be added later | yes |
-| Getter body must be getter-eligible (point 1) | getters that loop, allocate, recurse, or read a `let` | **relaxing is easy** (admit constant-trip loops, admit `R`). Tightening later would break getters |
+| Getter body must be getter-eligible (point 1, §C1b) | getters that allocate, recurse, loop over data, exceed a bound of 64, or read a `let` | **relaxing is easy** (raise the budget, admit `R.let`). Tightening later would break getters. Reads of the receiver's heap and of linear memory are already admitted |
+| The bound's invariant: computable at compile time, never data-dependent (§C1a) | a getter that loops over a receiver's list, however short in practice | **ruled as permanent** (owner, 2026-09-22). Only the budget number may change, through `DECISIONS.md` and a std review |
 | `pure` = effects only (§E2) | using `pure` to mean cost; a cost promise via `pure` | **one-way**: the word's meaning is permanent once std exports carry it |
-| `pure` excludes `R` (§C1) | `pure` functions that read `let` globals | relaxing (admitting `R`) is safe; tightening later is breaking |
+| `pure` excludes `R.let`, `R.mem`, `R.heap[const]` (§C1b) | `pure` functions that read `let` globals, linear memory, or a `const` table's heap | relaxing (admitting a read class) is safe; tightening later is breaking |
+| `U` reserved (§C1) | nothing today | free: it is 0 until VL has exceptions |
 | Allocation judged on the source (§C3) | an error for representation boxes (a hint only) | yes: an error could be added later, but that would make acceptance representation-dependent |
 | Cost promise via the baseline (§E4) | a user-visible cost promise in source | yes: a keyword can be added when a second boundary appears |
 | (A) for function values | getters and `pure` functions that call callbacks | yes: (A+) and (C) both only relax |
@@ -599,14 +790,18 @@ also why §C1 keeps `R`: a worker reads fresh globals.
 *Recommend (a).* §G4: concurrency §5's eligibility table is the same predicates under other
 names. Two analyses would disagree about what "pure CPU" means.
 
-**I2. Does the getter contract (and `pure`) exclude reads of mutable module state (`R`)?**
-(a) Yes: `let` globals and linear-memory loads are both excluded; (b) exclude `let` reads, and
-admit linear-memory loads as "reading through the argument" (a `Buf` receiver); (c) admit all
-reads.
-*Recommend (b) for getters and (a) for `pure`, if the owner wants the distinction. Otherwise
-(b) for both.* Strict is the direction that relaxes later (§H). `std:buffer`'s `getF32` is a
-natural getter body that loads through its receiver, and forbidding it would fail the purpose.
-Measured: 3 of std's 87 tier ≤ 2 functions read a `let`.
+**I2. Which reads do the getter contract and `pure` exclude?**
+**RULED for getters (owner, 2026-09-22):** a getter reads its receiver's mutable fields and
+linear memory by design, and excludes module `let` reads because a getter describes its
+receiver (§C1b). Getter-eligible is not `pure`.
+**Open for `pure`:** (a) exclude `R.let`, `R.mem` and `R.heap[const]`, admit
+`R.heap[param]` (§C1b); (b) exclude every read, as GCC's `const` does; (c) exclude only
+`R.let`.
+*Recommend (a).* Its exclusions are exactly what compile-time evaluation and parallel workers
+cannot tolerate, and a read through a parameter is safe for both. (b) would refuse
+`pure function len(v: Vec): f64`, which reads its argument's fields. (c) lets a worker read a
+fresh linear memory and give a silent wrong answer. Strict is the direction that relaxes later
+(§H).
 
 **I3. The word.**
 (a) `pure`, effects only; (b) `pure` meaning effects and cost; (c) another word from §E2.
@@ -628,9 +823,10 @@ state and the compiler keeps changing (§A6).
 
 **I6. The operator cost table.**
 Which compiler-lowered operations count as loops? The proposal: string and list `==`/`!=`,
-string hashing, map `[]` (a probe loop), `utf8` coding, `slice`/`concat`/spread count as `L`
-(and `A` where they build). `.length` does not.
-(a) Conservative: any lowering with a `loop` is `L`; (b) treat map `[]` with a scalar key as
+string hashing, map `[]` (a probe loop), `utf8` coding, `slice`/`concat`/spread make the bound
+`Unbounded` (and set `A` where they build). `.length` does not. A helper whose loop is bounded by
+a format constant is §I15.
+(a) Conservative: any lowering whose loop depends on its operands is `Unbounded`; (b) treat map `[]` with a scalar key as
 bounded (expected O(1)).
 *Recommend (a).* The loop test is "would we feel bad", and a string key's hash is O(length). A
 relaxation can be ruled per operation later. That direction is safe.
@@ -657,12 +853,15 @@ every body that reads an array.
 *Recommend (a) in v1.* An escape is additive later. A getter that prints is the surprise the
 contract exists to prevent.
 
-**I11. Constant-trip loops.**
-Is `for i in 0 to 4 { … }` tier 2?
-*Recommend: not in v1.* The owner's rule is "no back-edges", and admitting literal-bounded
-ranges later is a pure relaxation. It becomes worth doing when a real getter needs it (a
-4-lane reduction written as a loop), and `reduceAddF32x4` shows std writes those without a
-loop today.
+**I11. Constant-trip loops. RULED (owner, 2026-09-22).**
+Constant-bounded loops are allowed: `for i in <int literal | module const int> (to | until)
+<same> [step <literal>]`, the loop variable never assigned, `break` and `continue` allowed,
+nested loops multiplying, and the total, transitive through calls, at most one named budget of
+**64**. **Invariant: the worst-case cost is computable at compile time from the source plus
+bounded callees, and never data-dependent.** Never allowed: a `for`-in over data, a
+data-bounded range, `while`, recursion. Only the budget number may change, through a
+`DECISIONS.md` entry and a std review. §C1a is the rule; the bound is a number in the summary
+and in the std baseline (§E4).
 
 **I12. Staging.**
 (S1) The summary, hover, and D1510/`unionEqOperandOk` admission, with no syntax; (S2) the
@@ -671,6 +870,38 @@ declarations, the std baseline, and the rubric row; (S4, deferred) F-A+, the tru
 marker, and optimizer hoisting. F-C is not scheduled.
 *Recommend this order.* S1 is useful with no user-facing decision made, and every later step
 reads it.
+
+
+**I13. Which module `const`s count as a constant range end?** (New, raised by I11.)
+A module `const` may be bound to a run-time value (`const n = count()`), so "module const int"
+needs a definition.
+(a) A `const` whose initializer is an integer literal, or another such `const`; (b) any
+integer `const` the compiler can fold (`const N = 4 * 2`); (c) any `const` of integer type.
+*Recommend (a).* It meets the invariant with no folding machinery, and (b) is a pure
+relaxation for later. (c) breaks the invariant.
+
+**I14. Heap reached from a module `const` (a lookup table).**
+`const LUT = [0, 1, 4, 9]; get sq(self: Small): i32 { LUT[self as i32] }` reads a `const`'s
+heap. Property-access §D3a-contract already permits it for getters ("the heap reachable from
+`self` or from a module `const` is readable").
+(a) Getters: allowed; `pure`: excluded (§C1b), because a worker's `LUT` is freshly initialised
+and would miss a run-time mutation; (b) allowed for both; (c) excluded for both.
+*Recommend (a).* A table lookup is a natural getter, and "constants" in the getter rationale
+reads most naturally as including them. For `pure` the exclusion can be relaxed later if VL
+gains immutable list literals, whose heap no one can write.
+
+**I15. Loops bounded by a format constant.**
+f64 `%` lowers to `__f64_rem__`, whose loops are bounded by the float format, not by the
+operands. Property-access §D3a-contract already treats it as tier 2.
+(a) Such helpers count 0 toward the budget; (b) they count their real worst case.
+*Recommend (a).* The budget is about the loop a reader writes. A per-helper constant would add
+a number to the rule that nobody can see in the source, and it would change whenever the
+helper is rewritten.
+
+**I16. Split `T` into explicit and implicit traps?**
+binaryen, Cranelift and LLVM all distinguish a certain trap from a possible one (§B2 finding 4).
+*Recommend: not now.* `T` is optimizer-only and has no consumer that needs the split yet. Split
+it when a VL-side hoist or speculation pass lands.
 
 ---
 
