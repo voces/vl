@@ -338,10 +338,10 @@ a seed built from this tree.
 | [D2061](inventory/D2061.md) | the contract counts loops, not calls; `a8` = 4^8 getter calls, accepted | runs; the acceptance is the defect | the contract's own promise |
 | [D2062](inventory/D2062.md) | string `is "lit"` in a getter is accepted and calls `__str_eq__`, while `==` is refused | runs; the acceptance is the defect | the contract's own promise |
 | [D2063](inventory/D2063.md) | f64 `%` in a getter is accepted as cost 0 and loops by exponent gap | runs; the acceptance is the defect | the contract's own promise |
-| [D2064](inventory/D2064.md) | `sqrt`, `abs`, `min`, `popcnt`, … refused in a getter as "not pure intrinsics" | loud check reject | 2, capability |
+| [D2064](inventory/D2064.md) | `sqrt`, `abs`, `min`, `popcnt`, … refused in a getter as "not pure intrinsics" | loud check reject; closed #3048 | 2, capability |
 | [D2065](inventory/D2065.md) | a constant-range loop variable is `i32`, so the amendment's lane example fails | loud check reject | design gap in #3039 |
-| [D2066](inventory/D2066.md) | a getter satisfies no bound; the refusal offers the §G3 false fix; the guide's workaround is false | loud check reject | message and guide |
-| [D2067](inventory/D2067.md) | one string `+` reports twice; a nullable result reports twice; no message names the method escape | loud check reject | diagnostics |
+| [D2066](inventory/D2066.md) | a getter satisfies no bound; the refusal offers the §G3 false fix; the guide's workaround is false | loud check reject; message and guide closed #3046 | message and guide |
+| [D2067](inventory/D2067.md) | one string `+` reports twice; a nullable result reports twice; no message names the method escape | loud check reject; closed #3046 | diagnostics |
 
 The three "runs" rows use `runs today and must keep running` in the sense that the grader
 reports them as MOVED the day the contract closes. There is no outcome word for "accepted but
@@ -378,7 +378,8 @@ rather than changed.
 
 ## 5. Owner decisions
 
-Each lists options, who holds which, and the synthesis recommendation.
+Each lists options, who holds which, and the synthesis recommendation. All seven are **RULED**;
+the ruling follows each question and supersedes the recommendation where they differ.
 
 **D-Q1. Severity of the getter body contract.**
 (a) keep one hard error for everyone, no suppression (Swift, C#, Rust, game-perf, beginner,
@@ -390,6 +391,12 @@ error everywhere, and none puts the opt-out at the read site.
 **Recommend (a)**, conditional on closing D2061–D2064 first. Rule out (c) explicitly. Rule
 separately, if ever, whether VL gets per-site suppression at all (minimalist).
 
+**RULED (owner, 2026-09-22): (a).** The getter contract is a hard error for everyone, with no
+std/user split and no suppression, conditional on first closing D2061 (step counting over calls),
+D2062 (a string-literal compare costs the literal's length), D2063 (f64 `%` refused in a getter)
+and D2064 (math intrinsics, closed #3048). It may relax to a lint later, never the reverse. Why:
+the escape to a method is free, and a cost the author can silence tells the reader of `.` nothing.
+
 **D-Q2. The loop amendment, its metric and its number.**
 (i) Keep constant-bounded loops ruled? Recommend **keep the ruling, do not build it** until it
 ships with a literal-union loop variable (D2065), so a consumer runs. The alternative is the
@@ -399,6 +406,29 @@ helpers are charged their worst case. This applies to v1 as well and closes D206
 (iii) Budget? Recommend choosing it in steps once (ii) lands, sized to a named consumer and
 recorded in DECISIONS.md. Game-perf's 16-trip figure is the reference point.
 (iv) Refinement-bounded loops (`0 until i`, `i: Lane4`)? Recommend **never**, by name.
+
+**RULED (owner, 2026-09-22).**
+
+- **Metric: abstract steps.** A call costs 1 plus its callee's cost, a loop multiplies, a branch
+  takes the max.
+- **Loop variable: an internal interval type.** A constant-range loop variable gets the type
+  `[lo, hi)`, with no user syntax. It is assignable wherever every value in the interval fits
+  (a lane index, for instance), and it does not expand to a literal union. A user-spellable range
+  type is a separate future decision.
+- **Budget: 16 steps**, a named constant tuned by usage. This supersedes the 64 in
+  function-effects-design.md §I11 and in the property-access amendment.
+- **Order:** build after D2061–D2064.
+- **The invariant (I11):** the worst-case cost is computable at compile time from the source plus
+  bounded callees, and is never data-dependent. Allowed: `for i in <lit | const int> until/to
+  <same> [step <lit>]` with the loop variable never assigned, plus `break` and `continue`. Never:
+  `for … in` over data, a data-bounded range (including (iv)'s `0 until i`), `while`, recursion.
+  The budget is transitive through calls, and the error names the call path.
+- **String-literal compares:** `s == "lit"`, `!=`, `is "a" | "b"`, and `startsWith` /
+  `endsWith` with a literal count as bounded, at a cost of the literal's length, provided the
+  lowering pre-checks lengths and never loops past the shorter operand. A compare of two
+  run-time strings stays excluded.
+
+Why: steps close D2061 and D2063 with one computable rule, and 16 covers the widest lane shape.
 
 **D-Q3. Setters (8–1, game-perf dissenting).**
 (a) keep "none" (eight lenses, most with a condition: Swift's `withX` write-back, TS and C#'s
@@ -412,6 +442,12 @@ it. Its design must answer the receiver-once `-=` spelling (`units[i].hp -= dmg`
 getter's so the store cannot hide other effects. Record Swift's `withX` write-back as the other
 admissible shape.
 
+**RULED (owner, 2026-09-22): (c) as a recorded exception, with no setters as the rule.** The one
+exception, designed only when a flat-row consumer asks for it, is a store-through-handle setter
+(`set hp(self: UnitRow, v)`) that stores through an address and never modifies the handle. It
+needs a receiver-once `-=`, takes no part in assignment narrowing, and carries a cost contract.
+Why: it is the only setter shape with no write-back problem and a real consumer.
+
 **D-Q4. `{ readonly x }` and getters.**
 Build it bound-only at specialised positions? Recommend **yes**, sequenced after D2060 and after
 S2's per-declaration write summary. Urgency: fix D2066's guide sentence and message **now**, and
@@ -421,10 +457,22 @@ consumer, and type-theory's snapshot coercion for immutable-receiver getters is 
 exception worth keeping in view. TypeScript's parameter-sugar and inferred-read-only-row extensions are compatible
 follow-ups.
 
+**RULED (owner, 2026-09-22): (c).** Build `{ readonly x: T }` as a generic bound, satisfied by
+fields and getters alike and specialised per type, with no adaptors. A writable `{ x }` converts to
+`{ readonly x }`, never the reverse. A position that is not specialised (a mixed list, a
+function-typed parameter, a struct field) gets a clear error. An un-annotated parameter's read-only
+requirements are inferred from the existing write analysis (`fnWriteEffects`), so
+`function red(t) { t.r }` accepts a getter type. Order: after D2060. Why: it removes D2066's dead
+end without an invisible `dyn`.
+
 **D-Q5. `pure` and getter-eligible.** Recommend **keep them separate** (nine of nine), strip "pure"
 from getter diagnostics (D2067/D2064), fix the Koka citation, and state the no-`let`-read
 rationale honestly. On building `pure` at all, the minimalist and the effects doc's own staging
 agree: reserve it, and build it with its first reader.
+
+**RULED (owner, 2026-09-22): (a), keep them separate.** No getter-related text says "pure". The
+effects doc's citation becomes Fortran `PURE` / D's weak `pure`, and user-facing text uses plain
+words. Why: the two rules admit different reads, so one word for both would mislead.
 
 **D-Q6. The effects summary.**
 (i) Per instance or per declaration? Recommend **per declaration, with residual obligations**
@@ -439,11 +487,29 @@ nullable-scalar getters. Recommend judging on the **source** for acceptance (the
 C#, Swift), plus game-perf's test-time `--deny-alloc` assertion over emitted instances for the
 rep-level truth.
 
+**RULED (owner, 2026-09-23): (b+).**
+
+- Compute now every fact whose meaning is settled: writes state, allocates (source-visible), cost
+  in steps, and host I/O (`print`).
+- Each fact has a reader on day one: hover shows the summary and a dump fixture pins it, so a
+  wrong fact fails a test.
+- Getter admission of ordinary callees uses them: a getter may call a function with no writes, no
+  allocation, no I/O and a cost within the budget.
+- Later, each with its own ruling or first consumer: the read-location split, the trap split,
+  `pure`, the std cost baseline, and function-value effects.
+
+Why: a fact nobody reads goes wrong unnoticed, and these four already have a reader.
+
 **D-Q7 (raised by the review). A std rule for when a member is a getter.** Recommend adopting the
 minimalist's sentence into `std-api-review.md`: *a getter is only for a named part of an opaque
 scalar or vector brand (a lane, a packed field, a flat-row column); anything else is a method.*
 
+**RULED (owner, 2026-09-22): (a).** The sentence is in `std-api-review.md`. Why: it makes the
+getter-or-method choice in std one rule instead of a judgment per member.
+
 ## 6. Recommended build order
+
+Where this order and a §5 ruling differ, the ruling holds.
 
 1. **Docs, today, no compiler change.** Correct the guide's `{ x(): f32 }` sentence and say that a
    getter type is for concrete code until F5 (D2066). Add the beginner's "when to use which"
@@ -462,13 +528,14 @@ scalar or vector brand (a lane, a packed field, a flat-row column); anything els
    Add the compiler-engineer's self-check: every emitted getter instance contains no `loop`, no
    allocation, and no helper call outside a leaf list. It catches the next drift the first time a
    fixture hits it.
-6. **S2: getters may call getter-eligible functions**, by a per-declaration summary built on
+6. **Getters may call ordinary functions** (effects stage S1 under D-Q6's ruling), by a per-declaration summary built on
    `fnWriteEffects`. Game-perf and C# rank this ahead of loops. It removes the copy-paste
    pressure and finding 24's raw-`__load_*` steering.
 7. **F5, `{ readonly x: T }`, bound-only**, with never-narrowing reads in generic bodies.
 8. **Getter lowering**: inline getters, or lower them in the emitter's `Member` arm, so `.x` is a
    load at `-O0` and `exprEffectFree` can use the contract (Rust, game-perf, compiler-engineer).
-9. **Constant-bounded loops**, only with a literal-union loop variable and a running consumer.
+9. **Constant-bounded loops**, with the interval-typed loop variable and the 16-step budget
+   (D-Q2's ruling), after D2061–D2064.
 10. **The rest of the effects summary**, with its first unbuilt consumer (concurrency step 6),
     after measuring binaryen's global-effects flags.
 
