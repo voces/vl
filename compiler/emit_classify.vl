@@ -181,6 +181,7 @@ import {
   tyIsLitUnionArray,
   tyIsLitUnionOrLit,
   tyIsNewtypeBrand,
+  tyIsNonNullHoleRead,
   tyIsNullableLitUnion,
   tyIsU8ArrayTy,
   tyIxIsVariantMember,
@@ -2290,6 +2291,18 @@ export function letNulScalarListKind(letIx: i32, fnIx: i32): VKind | null {
     if d.letType >= 0 { return nulScalarListKindOfNode(d.letType) }
     return exprNulScalarListKind(d.letInit, fnIx)
   }
+  null
+}
+
+// The nullable-scalar-list `VKind` of an identifier read under a `!= null` narrowing of a hole,
+// or null. The read's node is shared by every instance of the generic body, so its recorded
+// type is the deferred `hole minus null`; the instance's own binding names the wrapper (D2238).
+export function narrowedHoleNulScalarListKind(
+  exprIx: i32,
+  fnIx: i32,
+): VKind | null {
+  if !tyIsNonNullHoleRead(nodeTyIxOf(exprIx)) { return null }
+  if P.nodes[exprIx] is Ident { return exprNulScalarListKind(exprIx, fnIx) }
   null
 }
 
@@ -32636,6 +32649,9 @@ export function exprStringArray(exprIx: i32, fnIx: i32) {
       }
     }
     if paramStringArray(fnIx, e.identName) { return true }
+    if narrowedHoleNulScalarListKind(exprIx, fnIx) == "nulstrlist" {
+      return true
+    }
     if declaredStringArray(e.identName) { return true }
     if globalIsStringArraySid(fnIx, sidOfNode(exprIx)) {
       if !identShadowedByFrame(fnIx, e.identName) { return true }
@@ -33030,6 +33046,9 @@ export function exprF64Array(exprIx: i32, fnIx: i32) {
     // UNBOXED as the f64 list — the string/i32-list classifiers carry the same arm.
     if unionIdentReadKind(exprIx, fnIx) == 8 { return true }
     if paramF64Array(fnIx, e.identName) { return true }
+    if narrowedHoleNulScalarListKind(exprIx, fnIx) == "nulf64list" {
+      return true
+    }
     if declaredF64Array(e.identName) { return true }
     if globalIsF64ArraySid(fnIx, sidOfNode(exprIx)) {
       if !identShadowedByFrame(fnIx, e.identName) { return true }
@@ -33215,7 +33234,7 @@ function annIsU8Array(tyIx: i32) {
 // recorded type says `u8[]` exactly when an annotation put it there, at every position.
 export function exprU8Array(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return false }
-  if tyIsU8ArrayTy(nodeTyIxOf(exprIx)) { return true }
+  if tyIsU8ArrayTy(nodeTyPinIxOf(exprIx)) { return true }
   const e = P.nodes[exprIx]
   if e is Paren { return exprU8Array(e.parInner, fnIx) }
   if e is Call {
@@ -33238,6 +33257,9 @@ export function exprU8Array(exprIx: i32, fnIx: i32) {
     // The three name positions it doesn't reach — a param inside its own body, a declared
     // local, a module global — each ask the declaration that fixed the cell's kind instead.
     if annIsU8Array(paramTypeNode(fnIx, e.identName)) { return true }
+    if narrowedHoleNulScalarListKind(exprIx, fnIx) == "nulu8list" {
+      return true
+    }
     if declaredKind(e.identName) == "u8list" { return true }
     const gli = globalLetOfSidIn(fnIx, sidOfNode(exprIx))
     if gli >= 0 {
@@ -33280,6 +33302,9 @@ export function exprF32Array(exprIx: i32, fnIx: i32) {
     // typed-IR carries no f32-array claim (a float literal types f64), so this is the only signal.
     if unionIdentReadKind(exprIx, fnIx) == 12 { return true }
     if paramF32Array(fnIx, e.identName) { return true }
+    if narrowedHoleNulScalarListKind(exprIx, fnIx) == "nulf32list" {
+      return true
+    }
     if declaredF32Array(e.identName) { return true }
     if globalIsF32ArraySid(fnIx, sidOfNode(exprIx)) {
       if !identShadowedByFrame(fnIx, e.identName) { return true }
@@ -33288,7 +33313,7 @@ export function exprF32Array(exprIx: i32, fnIx: i32) {
     if capturedKindOf(fnIx, e.identName) == "f32list" { return true }
     // The arena leg: every rung above answers off a bare `f32[]` declared kind, none of which
     // covers the `f32[] | null` niche — the checker's narrowed-read type is the plain `f32[]`.
-    return tyIsF32ArrayShape(nodeTyIxOf(exprIx))
+    return tyIsF32ArrayShape(nodeTyPinIxOf(exprIx))
   }
   // A struct-field read of an `f32[]` field (code 27) — the f64/i64 duals get this from their
   // typed-IR fast path, so f32 fields need the field code directly.
@@ -33296,7 +33321,7 @@ export function exprF32Array(exprIx: i32, fnIx: i32) {
     if memberFieldCode(exprIx, fnIx) == 27 { return true }
     // The nullable-field niche, narrowed in place: the field's own code is the nullable one
     // (declining the code-27 rung above), so the arena leg answers from the narrowed read.
-    return tyIsF32ArrayShape(nodeTyIxOf(exprIx))
+    return tyIsF32ArrayShape(nodeTyPinIxOf(exprIx))
   }
   if e is Call {
     // `__array_new__(n, <f32 fill>)` yields an f32 list — the arm `exprI64Array` (D1669),
@@ -33411,7 +33436,7 @@ export function arrLitIsI64(arrIx: i32, fnIx: i32) {
 
 export function exprI64Array(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return false }
-  if tyIsI64Array(nodeTyIxOf(exprIx)) { return true }
+  if tyIsI64Array(nodeTyPinIxOf(exprIx)) { return true }
   // `m[k]` / `m[k] ?? d` over an i64[]-VALUED map yields an i64 list.
   if mapReadListKind(exprIx, fnIx) == "i64list" { return true }
   const e = P.nodes[exprIx]
@@ -33422,6 +33447,9 @@ export function exprI64Array(exprIx: i32, fnIx: i32) {
   if e is Paren { return exprI64Array(e.parInner, fnIx) }
   if e is Ident {
     if paramI64Array(fnIx, e.identName) { return true }
+    if narrowedHoleNulScalarListKind(exprIx, fnIx) == "nuli64list" {
+      return true
+    }
     if declaredI64Array(e.identName) { return true }
     if globalIsI64ArraySid(fnIx, sidOfNode(exprIx)) {
       if !identShadowedByFrame(fnIx, e.identName) { return true }
