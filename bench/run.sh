@@ -424,6 +424,7 @@ PYSCALE = {
     "arrays/sort-heap":              (4.0,    "ROUNDS 4 vs 1"),
     "arrays/struct-aos":             (8.333,  "ROUNDS 500 vs 60"),
     "arrays/struct-soa":             (8.333,  "ROUNDS 500 vs 60"),
+    "collections/live-set-churn":    (25.0,   "CHURN 75e6 vs 3e6, linear; LIVE build cost negligible"),
     "collections/map-i32":           (4.0,    "n 200e3 vs 50e3, linear"),
     "collections/map-string":        (4.0,    "n 100e3 vs 25e3, linear"),
     "collections/set-ops":           (4.0,    "n 100e3 vs 25e3, linear"),

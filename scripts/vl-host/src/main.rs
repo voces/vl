@@ -42,7 +42,7 @@
 // explicit override still wins, and a distribution binary announces it on stderr,
 // because the failure this replaces was silent — a released `vl` pairing a current
 // seed with a stale checkout's `std/`, and picking up whatever `./build/` held.
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use wasmtime::*;
 
@@ -972,6 +972,56 @@ const RUN_GC_HEAP_INITIAL: u64 = 64 << 20;
 /// `vl test`: one store per worker and one worker per core, so the per-store price is
 /// multiplied; 8 MiB keeps most of the CPU win at a fraction of the memory.
 const TEST_GC_HEAP_INITIAL: u64 = 8 << 20;
+
+/// Copying-collector cycles in the current process, counted only while
+/// `$VL_GC_STATS=1` (`maybe_install_gc_stats`). A debug facility for the C1
+/// regression guard (`tests/vl_gc_heap_shape_test.ts`,
+/// `bench/collections/live-set-churn`): this wasmtime version exposes no public
+/// per-collection counter, so the count comes from its own trace log, which
+/// prints "Begin copying collection" once per cycle at `log::Level::Trace`.
+static GC_COLLECTIONS: AtomicU64 = AtomicU64::new(0);
+
+struct GcStatsLog;
+
+impl log::Log for GcStatsLog {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.level() == log::Level::Trace && metadata.target().starts_with("wasmtime")
+    }
+    fn log(&self, record: &log::Record) {
+        if self.enabled(record.metadata())
+            && record.args().to_string().starts_with("Begin copying collection")
+        {
+            GC_COLLECTIONS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    fn flush(&self) {}
+}
+
+static GC_STATS_LOG: GcStatsLog = GcStatsLog;
+
+/// Installs `GC_STATS_LOG` and returns whether it did, so the caller knows to
+/// print the count when the run finishes. `$VL_GC_STATS` is undocumented in `vl
+/// help run` on purpose — like `$VL_COMPILE_GC_TRACE`, it is a measurement
+/// facility, not a tuning knob. `log::set_logger` is one-shot per process, which
+/// `run_cmd` (the only caller) never exceeds.
+fn maybe_install_gc_stats() -> bool {
+    if std::env::var("VL_GC_STATS").ok().as_deref() != Some("1") {
+        return false;
+    }
+    log::set_max_level(log::LevelFilter::Trace);
+    let _ = log::set_logger(&GC_STATS_LOG);
+    true
+}
+
+/// Prints the collection count on stderr when `gc_stats` asked for it — after the
+/// run, so the count covers everything the program allocated — then passes
+/// `result` through unchanged.
+fn finish_gc_stats(gc_stats: bool, result: Result<()>) -> Result<()> {
+    if gc_stats {
+        eprintln!("vl: gc collections: {}", GC_COLLECTIONS.load(Ordering::Relaxed));
+    }
+    result
+}
 
 /// The engine for a store that drives the COMPILER SEED (`build`'s one-shot compile,
 /// the CLI pump's command loop, `run`'s and `--batch`'s compile phase). Identical to
@@ -4896,6 +4946,7 @@ fn run_cmd(args: &[String]) -> Result<()> {
         "       `vl help run` shows the full flag list",
     );
     let run_engine = gc_engine(run_collector()?, RUN_GC_HEAP_INITIAL)?;
+    let gc_stats = maybe_install_gc_stats();
     // The program's print output goes to THIS process's stdout, so stdout is the
     // stream the auto rule asks about — a `vl run p.vl > log` is escape-free even
     // when stderr is still a terminal.
@@ -4907,13 +4958,16 @@ fn run_cmd(args: &[String]) -> Result<()> {
             let raw = std::fs::read(f)
                 .map_err(|e| Error::from(e).context(format!("reading `{f}`")))?;
             if raw.starts_with(b"\0asm") {
-                return run_program(&run_engine, &raw, palette);
+                return finish_gc_stats(gc_stats, run_program(&run_engine, &raw, palette));
             }
             let source = String::from_utf8(raw).map_err(|e| {
                 Error::from(e)
                     .context(format!("`{f}` is neither UTF-8 VL source nor a wasm module"))
             })?;
-            return compile_and_run(&compiler, &source, f, &run_engine, palette);
+            return finish_gc_stats(
+                gc_stats,
+                compile_and_run(&compiler, &source, f, &run_engine, palette),
+            );
         }
     }
 
@@ -4934,7 +4988,10 @@ fn run_cmd(args: &[String]) -> Result<()> {
         eprintln!("{USAGE}");
         std::process::exit(2);
     }
-    compile_and_run(&compiler, &source, "source.vl", &run_engine, palette)
+    finish_gc_stats(
+        gc_stats,
+        compile_and_run(&compiler, &source, "source.vl", &run_engine, palette),
+    )
 }
 
 // ── `vl test` — the runner's MECHANISM half (docs/internals/vl-test-design.md) ──
