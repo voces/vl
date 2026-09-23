@@ -9,6 +9,7 @@
 import { arrElemNameRaw, nameIsArray, nameIsSpaceFree } from "./tyname"
 import {
   annUnionAtomsOf,
+  ifYieldsNoValue,
   inferRetFnKey,
   inferRetIsNulList,
   inferRetNameByNode,
@@ -37,6 +38,7 @@ import {
   nodeTyIsUnion,
   nodeTyIxOf,
   nodeTyName,
+  nodeTyRecord,
   numLitUnionAliasName,
   numLitUnionBaseName,
   numLitUnionHasBase,
@@ -96,6 +98,7 @@ import {
   mkIdent,
   mkIf,
   mkIndex,
+  mkLet,
   mkMember,
   mkNull,
   mkNum,
@@ -806,9 +809,137 @@ export function dispatchRewrite(stmts: i32[]) {
     if fn is FuncDecl {
       drwCloNames.clear()
       fn.fnBody = drwWalk(fn.fnBody, fnStmts[fe])
+      if fe < fRetVoid.length && fRetVoid[fe] == 0 {
+        spillTail(fn.fnBody, fnStmts[fe])
+      }
     }
     fe = fe + 1
   }
+  0
+}
+
+// ── value-position writes to a field or element (D2170) ──────────────────────────────────────
+// An assignment yields its right-hand side, which a re-read of the target delivers at the
+// value's rep only for a name. So in a function that yields a value, a tail `o[i] = r` becomes
+// `const o2 = o; const i2 = i; const v = r; o2[i2] = v; v`, in source order (D1510).
+
+// Spills the value-position tail of the block at `blockIx`: its last statement, or every arm
+// of a last `if` the checker says yields a value.
+function spillTail(blockIx: i32, fnIx: i32) {
+  if blockIx < 0 { return 0 }
+  const b = P.nodes[blockIx]
+  if b is Block {
+    const n = b.blkStmts.length
+    if n == 0 { return 0 }
+    const last = b.blkStmts[n - 1]
+    if P.nodes[last] is IfStmt {
+      if ifYieldsNoValue(last) { return 0 }
+      let cur = last
+      while cur >= 0 {
+        const c = P.nodes[cur]
+        cur = elseIfLink(cur)
+        if c is IfStmt {
+          spillTail(c.ifThen, fnIx)
+          if cur < 0 { spillTail(c.ifElse, fnIx) }
+        }
+      }
+      return 0
+    }
+    const out: i32[] = []
+    const val = spillWrite(last, out)
+    if val < 0 { return 0 }
+    b.blkStmts.pop()
+    let k = 0
+    while k < out.length {
+      b.blkStmts.push(out[k])
+      k = k + 1
+    }
+    b.blkStmts.push(last)
+    b.blkStmts.push(spillRead(val))
+    capMemoNoteEdit()
+  }
+  0
+}
+
+// Rewrites the field or element write at `asgIx` to store a spilled value into a spilled place,
+// pushing the spills onto `out` in source order; the value's read, or -1 for any other node.
+function spillWrite(asgIx: i32, out: i32[]): i32 {
+  const a = P.nodes[asgIx]
+  if a is BinExpr {
+    if a.binOp != "=" { return -1 }
+    const t = unwrapParen(a.binLeft)
+    if t < 0 { return -1 }
+    let place = -1
+    const tn = P.nodes[t]
+    if tn is Member {
+      place = mkMember(
+        spillLocal(tn.memObj, asgIx, "o", out, a.pos),
+        tn.memProp,
+        tn.pos,
+      )
+    } else if tn is Index {
+      const recv = spillLocal(tn.idxArr, asgIx, "o", out, a.pos)
+      let idx = tn.idxIndex
+      // A number re-evaluates to itself; any other index is spilled with the receiver.
+      if !(P.nodes[idx] is NumLit) {
+        idx = spillLocal(idx, asgIx, "i", out, a.pos)
+      }
+      place = mkIndex(recv, idx, tn.pos)
+    }
+    if place < 0 { return -1 }
+    nodeTyCarry(place, t)
+    // A compound write reads its target inside the right-hand side, through the same node.
+    const inner = P.nodes[a.binRight]
+    if inner is BinExpr {
+      if unwrapParen(inner.binLeft) == t { inner.binLeft = place }
+    }
+    const val = spillLocal(a.binRight, asgIx, "v", out, a.pos)
+    spillTypeByTarget(out[out.length - 1], val, t)
+    a.binLeft = place
+    a.binRight = val
+    return val
+  }
+  -1
+}
+
+// Pushes `const asg#<asgIx>#<tag> = <ix>` onto `out` and answers a read of it, both typed as `ix`.
+function spillLocal(
+  ix: i32,
+  asgIx: i32,
+  tag: string,
+  out: i32[],
+  pos: i32,
+): i32 {
+  const name = "asg#" + i32ToStr(asgIx) + "#" + tag
+  const decl = mkLet("const", name, -1, ix, pos)
+  nodeTyCarry(decl, ix)
+  out.push(decl)
+  const rd = mkIdent(name, pos)
+  nodeTyCarry(rd, ix)
+  rd
+}
+
+// A second read of the spilled name `rd` reads, with its type.
+function spillRead(rd: i32): i32 {
+  const n = P.nodes[rd]
+  if n is Ident {
+    const r2 = mkIdent(n.identName, n.pos)
+    nodeTyCarry(r2, rd)
+    return r2
+  }
+  -1
+}
+
+// A literal-union target stores the atom, so the spilled value `decl` takes the target's alias
+// and holds the atom too; any other target keeps the right-hand side's own type.
+function spillTypeByTarget(decl: i32, rd: i32, t: i32) {
+  const ty = nodeTyIxOf(t)
+  const al = litUnionAliasNameOfTy(ty)
+  if al == "" { return 0 }
+  const d = P.nodes[decl]
+  if d is LetDecl { d.letType = synthTypeRefTy(al, -1, ty) }
+  nodeTyRecord(decl, ty)
+  nodeTyRecord(rd, ty)
   0
 }
 
@@ -1105,6 +1236,11 @@ let cboxDletSeen: {[string]: i32} = Map()
 const cboxShadow: {[string]: i32} = Map()
 const cboxShTrail: string[] = []
 
+// The arena type of each boxed name's cell list, keyed by name, or absent when the binding
+// carries no annotation. The `c` a use is rewritten to reads it, so a store through `c[0]`
+// sees the element type the checker gave the binding (D2168).
+let cboxCellTy: {[string]: i32} = Map()
+
 function cboxShadowPush(name: string) {
   cboxShadow[name] = (cboxShadow[name] ?? 0) + 1
   cboxShTrail.push(name)
@@ -1282,7 +1418,13 @@ function cboxWalk(ix: i32, boxed: string[]) {
   const n = P.nodes[ix]
   if n is Ident {
     if capHas(boxed, n.identName) && (cboxShadow[n.identName] ?? 0) == 0 {
-      return mkIndex(mkIdent(n.identName, -1), mkNum("0", -1), -1)
+      // The cell `c` carries the type of its list, so an element question about `c[0]` has
+      // the binding's declared type to answer from. The read `c[0]` itself stays untyped:
+      // `assignTargetReReads` takes that as the mark of a captured cell.
+      const cell = mkIdent(n.identName, -1)
+      const cellTy = cboxCellTy[n.identName] ?? -1
+      if cellTy >= 0 { nodeTyRecord(cell, cellTy) }
+      return mkIndex(cell, mkNum("0", -1), -1)
     }
     return ix
   }
@@ -1325,12 +1467,16 @@ function cboxWalk(ix: i32, boxed: string[]) {
           // a single top-level atom: `nm + "[]"` is an array spelling only then — `"i32 |
           // string" + "[]"` denotes `i32 | (string[])`, so a composite keeps the name path.
           let boxedTy = -1
+          const elemTy = nodeTyIxOf(n.letType)
           if annUnionAtomsOf(n.letType) == 1 {
             if annArrowAt(lt.tyName) < 0 {
-              const elemTy = nodeTyIxOf(n.letType)
               if elemTy >= 0 { boxedTy = mkArrayTy(elemTy) }
             }
           }
+          // The cell's own type is the list of the declared type at every spelling; only the
+          // synthesized annotation's NAME is limited to the one-atom case above.
+          if boxedTy >= 0 { cboxCellTy[n.letName] = boxedTy }
+          else if elemTy >= 0 { cboxCellTy[n.letName] = mkArrayTy(elemTy) }
           n.letType = synthTypeRefTy(lt.tyName + "[]", -1, boxedTy)
         }
       }
@@ -1508,6 +1654,7 @@ export function captureBoxRewrite(_stmts: i32[]) {
     if fn is FuncDecl {
       const dlets: string[] = []
       cboxDletSeen = Map()
+      cboxCellTy = Map()
       const alam: string[] = []
       cboxScan(fn.fnBody, 0, dlets, alam)
       const boxed: string[] = []
@@ -1532,6 +1679,7 @@ export function captureBoxRewrite(_stmts: i32[]) {
 function cboxModuleFrame() {
   const dlets: string[] = []
   cboxDletSeen = Map()
+  cboxCellTy = Map()
   const alam: string[] = []
   let si = 0
   while si < startStmts.length {
