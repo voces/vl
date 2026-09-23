@@ -2364,7 +2364,8 @@ Pinned by `soa-view` / `soa-at` / `axpy-at` in `tests/vl_buffer_view_bounds_shap
   two-function `--licm` probe (binaryen hoists the top-level spelling, 3 of 3, and the nested one 0
   of 3, at every rung — the `--licm`-alone row is the live control that proves the probe is not
   inert); `scale-view` vs `scale-seedtwice` (0 in-loop reads and 1 `struct.new` against 5 and 2,
-  from a source difference that is one repeated call to an idempotent helper); and the priced route
+  from a source difference that is one repeated call to an idempotent helper — both 5 and 2 since
+  M9, which pins them agreeing); and the priced route
   around (`--always-inline-max-function-size=60` takes `axpy-view` from 7 reads / 2 allocations to
   0 / 0). Sabotage-verified all three ways: top-levelling the probe's nested reads, deleting
   `scale-seedtwice`'s second seed call, and lowering the threshold to 20 each redden exactly their
@@ -2375,3 +2376,37 @@ Pinned by `soa-view` / `soa-at` / `axpy-at` in `tests/vl_buffer_view_bounds_shap
 - The shape test does NOT see the bracket's forwarding hop: `scale-view` and `scale-accessor` have
   identical loop-level counts, because the extra frame is one level down. That difference lives in
   M3(4) and on the clock only.
+
+### M9. Run-once drivers: the collapse above was a V8 pessimization (2026-09-22)
+
+Every kernel here is called per trip from a `main()` that runs once, and the collapse M4 relies on
+— the whole program inlined into that driver — puts the kernel's loop in code V8 never tiers up:
+V8 swaps in its optimizing compiler at a function's next call, and a run-once function has none.
+Measured under V8 (node 24), the old `-O3` module was 1.4–4x SLOWER than the unoptimized one on
+all eighteen kernels. `-O`/`-O3` now keep a hot callee of run-once code out of line (DECISIONS.md,
+"`-O3` keeps hot callees out of run-once code"), so the optimized rows carry the driver's per-trip
+`call` again and the descriptor no longer melts into the driver; `scale-view` now reads like
+`scale-seedtwice`. The goldens in M7's two tests were re-recorded to that shape.
+
+CPU seconds, median of 3 interleaved, load ~20 (`none` = unoptimized, old/new = `-O3`):
+
+| kernel | V8 none | V8 old | V8 new | wasmtime none | wasmtime old | wasmtime new |
+| --- | --- | --- | --- | --- | --- | --- |
+| `scale-view` | 0.26 | 0.82 | **0.26** | 1.51 | 0.24 | 0.38 |
+| `scale-accessor` | 0.26 | 0.69 | **0.25** | 1.06 | 0.25 | 0.39 |
+| `scale-seedtwice` | 0.27 | 1.03 | **0.27** | 1.51 | 0.74 | **0.39** |
+| `reduce-view` | 0.24 | 0.53 | **0.24** | 0.84 | 0.19 | 0.26 |
+| `rows-view` | 0.29 | 0.70 | **0.30** | 1.39 | 0.31 | 0.51 |
+| `axpy-view` | 0.33 | 1.36 | **0.41** | 2.49 | 0.98 | **0.54** |
+| `axpy-at` | 0.73 | 1.62 | **0.74** | 1.97 | 0.77 | 0.84 |
+| `soa-view` | 0.07 | 0.12 | 0.10 | 0.12 | 0.05 | **0.02** |
+| the ten `buf` / `hoist` / `fencedhoist` / `soa-at` rows | 0.07–0.46 | 0.10–1.04 | 0.07–0.42 | | −36% to +18% of old | |
+
+So the trade is explicit: V8 recovers its unoptimized speed on every kernel but `soa-view`, and
+wasmtime gives back the melt on the four one-view kernels that collapsed (`scale-view`, `scale-accessor`,
+`reduce-view`, `rows-view`: 1.4–1.7x) while gaining on the ones that never melted
+(`scale-seedtwice`, `axpy-view`, `soa-view`: 1.8–2x). The four that lost the melt still run
+2.7–4x faster under wasmtime than their own unoptimized build. The M4 lever
+(`--always-inline-max-function-size=60`) and M8's hoisted accessors are unaffected; what M4 attributes to a second call site is now what every kernel
+behind a run-once driver pays under wasmtime, which is where L4 (emit-time scalar replacement of
+a descriptor) would pay off.

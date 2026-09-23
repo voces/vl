@@ -278,7 +278,12 @@ export const LOOP_TABLE: Array<{
   // both rungs DCE the whole tail away. The gate has now fired three times on a helper the
   // probe cannot reach and zero times on the defect it exists to catch, which is the
   // strongest argument yet for scoping it to the probe's own functions.
-  { fixture: "binsearch-probe", none: [11, 4, 6], O: [3, 3, 6], O3: [3, 3, 6] },
+  //
+  // `-O`/`-O3` carried 6 -> 3 when run-once code stopped absorbing its hot callees
+  // (DECISIONS.md, "`-O3` keeps hot callees out of run-once code"): `run` is called once from
+  // top-level code, so `bsearch`, called from `run`'s loop, is its own function again and no
+  // loop carries the caller's values and the callee's together. Fewer carried is this gate's fast direction.
+  { fixture: "binsearch-probe", none: [11, 4, 6], O: [3, 3, 3], O3: [3, 3, 3] },
 ];
 
 // ── THE BENCHMARK SHAPE PINS ────────────────────────────────────────────────
@@ -508,8 +513,11 @@ export const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3:
     // direction it moves is the opposite of the direction the work moves.
     // D1999: functypes left the heap-type rec group, so `-O` merges identical signatures
     // into one type; `-O` 8005 -> 7643 bytes is the type section alone, code and counts unchanged.
-    O: { bytes: 7643, fns: 16, allocs: 95, indirect: 0, refEq: 1 },
-    O3: { bytes: 2147, fns: 5, allocs: 46, indirect: 0, refEq: 1 },
+    // Both rungs `fns` +1: `main` runs once, so the helper its loop calls stays a function
+    // instead of being inlined into it (DECISIONS.md, "`-O3` keeps hot callees out of run-once
+    // code"). Allocation sites unchanged; wasmtime and V8 timings unchanged.
+    O: { bytes: 7670, fns: 17, allocs: 95, indirect: 0, refEq: 1 },
+    O3: { bytes: 2174, fns: 6, allocs: 46, indirect: 0, refEq: 1 },
   },
   // MAP PROBE WITHOUT THE STRING COST. i32 keys, so this isolates the bucket walk and the
   // `?? -1` sentinel path from hashing and content compare — the two rows differ by exactly
@@ -518,8 +526,11 @@ export const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3:
   {
     bench: "collections/map-i32",
     axis: "i32-keyed map: insert, hit/miss probe, iterate",
-    O: { bytes: 1171, fns: 2, allocs: 13, indirect: 0 },
-    O3: { bytes: 1104, fns: 2, allocs: 13, indirect: 0 },
+    // Both rungs `fns` 2 -> 3: the probe helper `main`'s loop calls stays a function, because
+    // `main` runs once (DECISIONS.md, "`-O3` keeps hot callees out of run-once code").
+    // Allocation sites unchanged; wasmtime and V8 timings unchanged.
+    O: { bytes: 1215, fns: 3, allocs: 13, indirect: 0 },
+    O3: { bytes: 1131, fns: 3, allocs: 13, indirect: 0 },
   },
   // MIXED MAP + STRING, the realistic one: tokenize by code-point scan and slice, then a
   // read-modify-write upsert. `meta.json` decomposes VL's cost as ~64% map upsert and ~21%
@@ -548,8 +559,13 @@ export const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3:
     // `-O3` 2890 -> 3099, structure unchanged at both rungs. One cast site, ~230 bytes.
     // D1999: functypes left the heap-type rec group, so `-O` merges identical signatures
     // into one type; `-O` 3617 -> 3215 bytes is the type section alone, code and counts unchanged.
-    O: { bytes: 3215, fns: 6, allocs: 51, indirect: 0, refEq: 1 },
-    O3: { bytes: 3099, fns: 5, allocs: 50, indirect: 0, refEq: 1 },
+    // Run-once `main` keeps the hot callees of its loops as functions (DECISIONS.md, "`-O3`
+    // keeps hot callees out of run-once code"). `-O3` fns 5 -> 6, allocs 50 -> 52. `-O` moves
+    // further, 3215 -> 8568 bytes, fns 6 -> 17, allocs 51 -> 101: `toString` is no longer
+    // inlined into `main`, so open-world `-O` keeps the `std:fmt` code that came with it.
+    // Timed with the old and new modules interleaved, wasmtime and V8 are unchanged (±5%).
+    O: { bytes: 8568, fns: 17, allocs: 101, indirect: 0, refEq: 1 },
+    O3: { bytes: 3140, fns: 6, allocs: 52, indirect: 0, refEq: 1 },
   },
   // ARRAY ELEMENT WRITE + READ, 400M of each, with the allocation hoisted out of the steady
   // state by construction. `fns: 1` is the load-bearing pin: every element accessor has been
@@ -576,8 +592,12 @@ export const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3:
     // This is the row where that cost is most visible — the kernel is 381 bytes, so ONE cast
     // site is +59% — and it is visible because the module is tiny, not because the loop got
     // slower: the added code is a cold branch outside the search loop.
-    O: { bytes: 607, fns: 1, allocs: 2, indirect: 0 },
-    O3: { bytes: 558, fns: 1, allocs: 2, indirect: 0 },
+    //
+    // Both rungs fns 1 -> 2, allocs 2 -> 3: the search function, called from `main`'s loop, is
+    // no longer inlined into `main`, which runs once (DECISIONS.md, "`-O3` keeps hot callees
+    // out of run-once code"). Timed at `-O3`: V8 1.70 -> 1.42 s, wasmtime 2.27 -> 2.05 s.
+    O: { bytes: 694, fns: 2, allocs: 3, indirect: 0 },
+    O3: { bytes: 648, fns: 2, allocs: 3, indirect: 0 },
   },
   // STRUCT FIELD THROUGH AN ARRAY (array-of-structs). Adds a `struct.get` per element to the
   // fill-sum shape, and `allocs: 3` says the per-element structs are allocated once during
