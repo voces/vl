@@ -637,6 +637,9 @@ const HD_GNOT = 5
 // fits it, else the join of the two — the concrete arm's own tail, deferred because neither
 // half can be computed until the pin. `hdInner` carries the default's type. D1693.
 const HD_COAL = 6
+// The VALUE of an indexed hole (`a[i]` read): `HD_ELEM`'s element at its value type, so a
+// `u8[]` pin reads `i32`. `HD_ELEM` itself stays the storage type, which a write checks (D2238).
+const HD_ELEMV = 7
 let hdKind: i32[] = []
 let hdField: string[] = []
 let hdInner: i32[] = []
@@ -6338,6 +6341,23 @@ function nonNullNarrowTy(cur: i32) {
   if inner != cur { return inner }
   if tyIsHole(cur) { return mkDerivedHole(HD_GNOT, "", -1, TY_NULL, cur) }
   inner
+}
+
+// The hole an indexed-hole VALUE (`HD_ELEMV`) reads from, or -1 for any other type.
+function elemValueHoleBase(tyIx: i32): i32 {
+  const row = hdRowOf(tyIx)
+  if row < 0 { return -1 }
+  if hdKind[row] != HD_ELEMV { return -1 }
+  hdBase[row]
+}
+
+// True when `tyIx` is the deferred `hole minus null` that `nonNullNarrowTy` records for a hole
+// read under a null test. Every instance of the generic body shares that node, and in each one
+// it denotes the non-null face of whatever that instance pinned the hole to.
+export function tyIsNonNullHoleRead(tyIx: i32): boolean {
+  const row = hdRowOf(tyIx)
+  if row < 0 { return false }
+  hdKind[row] == HD_GNOT && hdAlt[row] == TY_NULL
 }
 
 // For a guard on an optional chain (`x?.y is T`), the truthy branch also implies every `?.`
@@ -24444,6 +24464,7 @@ function hdRenderName(
   if kind == HD_FLD { return "?fld." + field + "." + baseName }
   if kind == HD_RET { return "?ret." + baseName }
   if kind == HD_ELEM { return "?elem." + baseName }
+  if kind == HD_ELEMV { return "?elemv." + baseName }
   // The fallback type rides the name, like the guarded form's two arena indices: two sites
   // over the same hole reaching different no-dispatch answers are different holes.
   if kind == HD_BINOP {
@@ -24759,13 +24780,16 @@ function substHoleTyReal(tyIx: i32, bNames: string[], bTys: i32[]) {
     return substTyDeep(hdInner[row], bNames, bTys)
   }
   // The element of an indexed hole (`self[i]`): resolve the hole to its pinned
-  // argument; an array yields its element, a string an i32 code point. Mirrors the
-  // FIELD read for indexing.
-  if kind == HD_ELEM {
+  // argument; an array yields its element (its value type for `HD_ELEMV`, so a `u8` byte
+  // reads as `i32`), a string an i32 code point. Mirrors the FIELD read for indexing.
+  if kind == HD_ELEM || kind == HD_ELEMV {
     const innerE = substHoleTy(hdBase[row], bNames, bTys)
     if innerE >= 0 {
       const itE = T.tys[innerE]
-      if itE is TyArray { return itE.aElem }
+      if itE is TyArray {
+        if kind == HD_ELEMV { return arrElemValueTy(itE.aElem) }
+        return itE.aElem
+      }
       if itE is TyPrim {
         if itE.primName == "string" { return TY_I32 }
       }
@@ -38607,6 +38631,10 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
     const asgDcl = writeStorageTy(n.binLeft)
     if asgDcl >= 0 {
       asgLt = asgDcl
+    } else if elemValueHoleBase(lt) >= 0 {
+      // An index write through a hole checks the element's STORAGE, so a `u8[]` pin still
+      // refuses an out-of-range literal; the read type is the widened value (D2238).
+      asgLt = mkDerivedHole(HD_ELEM, "", -1, -1, elemValueHoleBase(lt))
     } else {
       asgBarred = writeBarredByLoop(n.binLeft)
     }
@@ -44319,7 +44347,7 @@ function checkIndexNode(n: Index, ix: i32) {
     // Admitted here and re-asked at the pin (D691): `noteArrayDemand` only reaches a bound
     // receiver and refuses scalars/maps — a record/nullable/function/union pinned reaches the emitter unruled.
     noteMemCstr(arrTy, OP_INDEX_GET, ix, false)
-    return mkDerivedHole(HD_ELEM, "", -1, -1, arrTy)
+    return mkDerivedHole(HD_ELEMV, "", -1, -1, arrTy)
   }
   // Free index operator (B14): `x[i]` on a non-indexable receiver resolves to a declared
   // `"[]"` function by type. Checked before the closure-field trap, mirroring the `a op b` order.
