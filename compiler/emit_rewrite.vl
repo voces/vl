@@ -1565,8 +1565,9 @@ let shrLamNames: {[string]: i32} = Map()
 let shrLamAny = false
 // The module's top-level bindings and function names, visible from every frame.
 let shrGlobals: {[string]: i32} = Map()
-// Names some call spells as a method (`x.name()`): the checker may resolve one to a local
-// binding, and a member name is not an identifier this pass can follow, so it is never respelled.
+// Names a call in the unit being respelled spells as a method (`x.name()`): the checker may
+// resolve one to a local binding, and a member name is not an identifier this pass can follow,
+// so a binding of one in that unit is never respelled.
 let shrMethodNames: {[string]: i32} = Map()
 // Per source name, the spelling of its innermost open binding ("" when none is open) and the
 // frame depth that binding belongs to.
@@ -1609,6 +1610,28 @@ function shrCollect(ix: i32, inFn: boolean) {
   0
 }
 
+// Records in `shrMethodNames` every name a call under `ix` spells as a method. An `else if`
+// chain is walked along its spine.
+function shrCollectMethods(ix: i32) {
+  let cur = ix
+  while cur >= 0 && cur < P.nodes.length {
+    const n = P.nodes[cur]
+    if n is Call {
+      const cf = P.nodes[unwrapParen(n.callFn)]
+      if cf is Member { shrMethodNames[cf.memProp] = 1 }
+      if cf is OptMember { shrMethodNames[cf.omProp] = 1 }
+    }
+    const kids = nodeValueSpineChildren(cur)
+    let i = 0
+    while i < kids.length {
+      shrCollectMethods(kids[i])
+      i = i + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  0
+}
+
 // A fresh spelling of `name`.
 function shrMint(name: string): string {
   shrSerial = shrSerial + 1
@@ -1618,7 +1641,7 @@ function shrMint(name: string): string {
 // Opens a binding of `name` and returns the spelling it carries. With `respell`, a binding a
 // nested function reads gets a unique spelling when another binding of the name is visible or
 // earlier in the frame, since captures resolve by name within a frame; one that shadows an
-// enclosing frame's binding or a module name gets the frame's shared spelling.
+// enclosing frame's binding or a module name, or the frame's shared spelling, gets that spelling.
 function shrDeclare(name: string, respell: boolean): string {
   let sp = name
   if respell && name != "" && (shrMethodNames[name] ?? 0) == 0 {
@@ -1630,6 +1653,7 @@ function shrDeclare(name: string, respell: boolean): string {
       sp = shrMint(name)
     } else if (
       (open && (shrCurDepth[name] ?? 0) < shrDepth) ||
+      (open && shrCur[name] == (shrFrameShared[name] ?? "")) ||
       (!open && (shrGlobals[name] ?? 0) == 1)
     ) {
       const shared = shrFrameShared[name] ?? ""
@@ -1788,23 +1812,16 @@ export function shadowRespell(stmts: i32[]) {
     }
     gi = gi + 1
   }
-  shrMethodNames = Map()
-  let ni = 0
-  while ni < P.nodes.length {
-    const c = P.nodes[ni]
-    if c is Call {
-      const cf = P.nodes[unwrapParen(c.callFn)]
-      if cf is Member { shrMethodNames[cf.memProp] = 1 }
-      if cf is OptMember { shrMethodNames[cf.omProp] = 1 }
-    }
-    ni = ni + 1
-  }
   shrDepth = 0
+  shrMethodNames = Map()
   shrLamNames = Map()
   shrLamAny = false
   let mi = 0
   while mi < stmts.length {
-    if P.nodes[stmts[mi]] !is FuncDecl { shrCollect(stmts[mi], false) }
+    if P.nodes[stmts[mi]] !is FuncDecl {
+      shrCollect(stmts[mi], false)
+      shrCollectMethods(stmts[mi])
+    }
     mi = mi + 1
   }
   if shrLamAny {
@@ -1834,6 +1851,8 @@ export function shadowRespell(stmts: i32[]) {
       shrLamAny = false
       shrCollect(fn.fnBody, false)
       if shrLamAny {
+        shrMethodNames = Map()
+        shrCollectMethods(fn.fnBody)
         shrCur = Map()
         shrCurDepth = Map()
         shrWalkFrame(stmts[fi])
