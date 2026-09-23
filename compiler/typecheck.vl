@@ -290,6 +290,8 @@ import {
 // traversal the lint rules do, and a second copy is a second thing to keep in step with
 // the node roster.
 import { elseIfLink, nodeSpineChildren } from "./ast"
+// The file a node came from, named in a record-covariance refusal that crosses modules.
+import { srcmapModOfTok, srcmapPathOf } from "./srcmap"
 
 // ── type-arena variants ──────────────────────────────────────────────────────
 // One struct per type kind, prefixed field names so `is` discriminates the union (the
@@ -8769,6 +8771,9 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
         covarTwoUnionsErr(srcExpr, srcTy, dstTy)
         return true
       }
+      // D2060 — the record twin: a field widened by this delivery is shared with the source,
+      // so it is legal only where nothing the delivery reaches writes it.
+      rcwPend(srcExpr, srcTy, dstTy)
       if objShapeAdapterless(srcExpr, srcTy, dstTy, 12, true) {
         objShapeAdapterlessErr(srcExpr, srcTy, dstTy)
       }
@@ -15311,6 +15316,10 @@ const CW_OCC_USE = 0
 const CW_OCC_BIND = 1
 const CW_OCC_ASG = 2
 const CW_OCC_CALL = 3
+// A method-spelled call `recv.m(…)`, filed under `m`'s plain name, carrying no frame.
+const CW_OCC_MCALL = 4
+// A named `FuncDecl`, filed under its plain name so a method spelling finds merged declarations.
+const CW_OCC_FDECL = 5
 // Per interned name (`sidOf`), the head of its occurrence chain, or -1.
 let cwIxHead: i32[] = []
 // The chain's rows: the next row, the arena node, the frame it resolves in, and which of the
@@ -15341,7 +15350,20 @@ const CW_UP_ELEM = 9
 const CW_UP_RET = 10
 const CW_UP_TAIL = 11
 const CW_UP_ITER = 12
+// An operand of `??`, whose value is the expression's own. No list reader claims it.
+const CW_UP_COAL = 13
+// The operand of `x is T`, which yields a boolean and narrows the same binding in place.
+const CW_UP_IS = 14
+// The tail statement of an `if` arm, or an `else if` link, whose value is the `if`'s own.
+const CW_UP_ARM = 15
 let cwIxUp: i32[] = []
+// Per arena node, the node whose children include it (an `else if` link's is the `if` before
+// it), or -1. Read by the record rule to tell a discarded statement from a consumed value.
+let cwIxParent: i32[] = []
+// The join sites (list literals, `if` statements, `??`, functions) and the `return`s, in
+// arena order, for the record rule's end-of-check pass.
+let cwIxJoins: i32[] = []
+let cwIxRets: i32[] = []
 let cwIxUpKind: i32[] = []
 let cwIxUpAux: i32[] = []
 // The note pass's own cursor: one row per node it has read, so the walk is a grow loop over
@@ -15370,6 +15392,9 @@ function cwIxReset() {
   cwIxIsObj = []
   cwIxHeld = []
   cwIxUp = []
+  cwIxParent = []
+  cwIxJoins = []
+  cwIxRets = []
   cwIxUpKind = []
   cwIxUpAux = []
   cwIxNoted = []
@@ -15473,7 +15498,10 @@ function cwIxNoteCallWrite(at: i32, cf: i32) {
 // row and no flag, which is what the readers below read as "this analysis knows nothing
 // about it" — the same answer a bare name got before the index existed.
 function cwIxNote(at: i32) {
+  cwIxNoteParent(at)
   const n = P.nodes[at]
+  if n is ArrayLit || n is IfStmt || n is FuncDecl { cwIxJoins.push(at) }
+  if n is RetStmt { cwIxRets.push(at) }
   if n is Ident {
     cwIxOcc(sidOf(n.identName), at, cwFrameOfUse(at, n.identName), CW_OCC_USE)
   }
@@ -15484,11 +15512,26 @@ function cwIxNote(at: i32) {
   if n is OptMember { cwIxPlace(at, n.omObj) }
   if n is Index { cwIxPlace(at, n.idxArr) }
   if n is ForIn { cwIxUpSet(n.fiIter, at, CW_UP_ITER, 0) }
+  if n is IsExpr { cwIxUpSet(n.isObj, at, CW_UP_IS, 0) }
+  if n is IfStmt {
+    cwIxUpSet(rcwBlockTail(n.ifThen), at, CW_UP_ARM, 0)
+    if n.ifElse >= 0 && n.ifElse < P.nodes.length {
+      const el = P.nodes[n.ifElse]
+      if el is IfStmt {
+        cwIxUpSet(n.ifElse, at, CW_UP_ARM, 0)
+      } else {
+        cwIxUpSet(rcwBlockTail(n.ifElse), at, CW_UP_ARM, 0)
+      }
+    }
+  }
   if n is RetStmt {
     if n.retArg >= 0 { cwIxUpSet(n.retArg, at, CW_UP_RET, 0) }
   }
   if n is FuncDecl {
-    if n.fnName != "" { cwIxFn(sidOf(n.fnName), at) }
+    if n.fnName != "" {
+      cwIxFn(sidOf(n.fnName), at)
+      cwIxOcc(sidOf(demangleName(n.fnName)), at, CW_FR_UNKNOWN, CW_OCC_FDECL)
+    }
     const tail = cwFnTailStmt(at)
     if tail >= 0 { cwIxUpSet(tail, at, CW_UP_TAIL, 0) }
   }
@@ -15526,6 +15569,10 @@ function cwIxNote(at: i32) {
     cwIxNoteCallWrite(at, cwPeel(n.callFn))
     const cn = covarRootName(n.callFn)
     if cn != "" { cwIxOcc(sidOf(cn), at, CW_FR_UNKNOWN, CW_OCC_CALL) }
+    const mcf = P.nodes[cwPeel(n.callFn)]
+    if mcf is Member {
+      cwIxOcc(sidOf(demangleName(mcf.memProp)), at, CW_FR_UNKNOWN, CW_OCC_MCALL)
+    }
   }
   if n is BinExpr {
     if n.binOp == "=" {
@@ -15542,7 +15589,26 @@ function cwIxNote(at: i32) {
       cwIxUpSet(n.binLeft, at, CW_UP_CMP, 0)
       cwIxUpSet(n.binRight, at, CW_UP_CMP, 0)
     }
+    if n.binOp == "??" {
+      cwIxJoins.push(at)
+      cwIxUpSet(n.binLeft, at, CW_UP_COAL, 0)
+      cwIxUpSet(n.binRight, at, CW_UP_COAL, 0)
+    }
   }
+  0
+}
+
+// File `at` as the parent of each of its children, and of the `else if` link after it.
+function cwIxNoteParent(at: i32) {
+  const kids = nodeSpineChildren(at)
+  let i = 0
+  while i < kids.length {
+    const k = kids[i]
+    if k >= 0 && k < cwIxParent.length { cwIxParent[k] = at }
+    i = i + 1
+  }
+  const link = elseIfLink(at)
+  if link >= 0 && link < cwIxParent.length { cwIxParent[link] = at }
   0
 }
 
@@ -15557,6 +15623,7 @@ function cwIxBuild() {
     cwIxIsObj.push(0)
     cwIxHeld.push(0)
     cwIxUp.push(-1)
+    cwIxParent.push(-1)
     cwIxUpKind.push(CW_UP_NONE)
     cwIxUpAux.push(0)
   }
@@ -15781,6 +15848,17 @@ let cwLastWriteAt = -1
 let cwArenaLen = -1
 
 export function covarWriteReset() {
+  rcwReported = []
+  rcwMemo = Map()
+  rcwPendSrc = []
+  rcwPendSrcTy = []
+  rcwPendDstTy = []
+  rcwPendSeen = Map()
+  rcwBdDecl = []
+  rcwBdTp = []
+  rcwBdConc = []
+  rcwBdCovs = []
+  rcwBdCall = []
   cwRootNames = []
   cwRootFrames = []
   cwAnswers = []
@@ -15847,13 +15925,35 @@ function cwFrameOfDecl(ix: i32): i32 {
 // and Set operations; naming them costs a decline on a map sharing a member name and keeps
 // the list honest if a list ever grows one.
 function cwMutatesList(p: string): boolean {
-  if p == "push" { return true }
-  if p == "pop" { return true }
-  if p == "clear" { return true }
-  if p == "set" { return true }
-  if p == "add" { return true }
-  if p == "delete" { return true }
-  false
+  const k = collMethodKind(p)
+  k == CM_STORES || k == CM_REMOVES_ONE || k == CM_REMOVES
+}
+
+// What a built-in collection method does to its receiver's element slots — the one table the
+// list rule (`cwMutatesList`) and the record rule (`rcwStoresElem`, …) both read. STORES puts
+// an argument in a slot; REMOVES_ONE takes one out and hands it back; REMOVES takes some out
+// and hands nothing back; RETURNS hands a slot's value back; READS hands no slot back.
+const CM_OTHER = 0
+const CM_STORES = 1
+const CM_REMOVES_ONE = 2
+const CM_REMOVES = 3
+const CM_RETURNS = 4
+const CM_READS = 5
+function collMethodKind(p: string): i32 {
+  if p == "push" || p == "set" || p == "add" { return CM_STORES }
+  if p == "pop" { return CM_REMOVES_ONE }
+  if p == "clear" || p == "delete" { return CM_REMOVES }
+  if p == "get" { return CM_RETURNS }
+  if (
+    p == "includes" ||
+    p == "indexOf" ||
+    p == "has" ||
+    p == "join" ||
+    p == "keys"
+  ) {
+    return CM_READS
+  }
+  CM_OTHER
 }
 
 // The `FuncDecl` the name `fnName` declares, or -1. Never mints an id: a name the arena
@@ -17452,6 +17552,2046 @@ function covarTwoUnionsErr(srcExpr: i32, srcTy: i32, dstTy: i32) {
       "list the same element type, or drop the write",
     srcExpr,
   )
+}
+
+// —— a record delivered covariantly is read-only in its widened fields (D2060) ——
+// `{x: i32}` passed as `{x: i32 | string}` is shared, not copied, so a `string` stored through
+// the wider handle lands in a field the source types `i32`. The reads-only rule for covariant
+// lists (DECISIONS.md A9) applies field by field: legal where nothing writes a widened slot.
+
+// A covariant slot path is a run of segments, `.f` for a field and `[]` for any element or map
+// value, relative to the delivered value. A trailing `*` marks a slot nothing below is followed
+// into, so everything reachable under it counts as widened. Answers whether `s` and `d` differ.
+function rcwCovs(
+  s: i32,
+  d: i32,
+  path: string,
+  out: string[],
+  depth: i32,
+): boolean {
+  if s < 0 || d < 0 || s >= T.tys.length || d >= T.tys.length { return false }
+  if s == d || tyEq(s, d) { return false }
+  if depth > 12 {
+    out.push(path + "*")
+    return true
+  }
+  const st = T.tys[s]
+  const dt = T.tys[d]
+  // A hole or type variable on the destination side adopts the source; a named type parameter
+  // on the source side may be any type, so the slot counts as widened and its type as unknown.
+  if dt is TyVar || st is TyErr || dt is TyErr { return false }
+  if st is TyVar {
+    if st.tvName.length == 0 || st.tvName[0] == '?' { return false }
+    if path != "" { out.push(rcwTyped(path, s)) }
+    return true
+  }
+  let differs = false
+  let walked = false
+  if st is TyObj {
+    if dt is TyObj {
+      walked = true
+      let i = 0
+      while i < dt.objFieldNames.length {
+        const sf = objFieldType(st, dt.objFieldNames[i])
+        if sf >= 0 {
+          const fp = path + "." + dt.objFieldNames[i]
+          if rcwCovs(sf, dt.objFieldTypes[i], fp, out, depth + 1) {
+            differs = true
+          }
+        }
+        i = i + 1
+      }
+    }
+  }
+  if st is TyArray {
+    if dt is TyArray {
+      // A delivered list of records into a list of a boxed union is the list rule's own
+      // domain, where a read-only delivery is a converted copy (`covarWriteThrough`).
+      if path == "" && rcwListRuleDomain(st.aElem, dt.aElem) { return false }
+      walked = true
+      differs = rcwCovs(st.aElem, dt.aElem, path + "[]", out, depth + 1)
+    }
+  }
+  if st is TyMap {
+    if dt is TyMap {
+      walked = true
+      differs = rcwCovs(st.mVal, dt.mVal, path + "[]", out, depth + 1)
+    }
+  }
+  if walked {
+    if differs && path != "" { out.push(rcwTyped(path, s)) }
+    return differs
+  }
+  if dt is TyUnion || dt is TyNullable { rcwIntoUnion(s, d, path, out, depth) }
+  else if rcwIsRefTy(s) { out.push(path + "*") }
+  if path != "" { out.push(rcwTyped(path, s)) }
+  true
+}
+
+// A widened slot entry carries the SOURCE's own type at that slot, `<path>=<ty>`, so a write of a
+// value the source's field already accepts is told apart from one it does not.
+function rcwTyped(path: string, ty: i32): string { path + "=" + i32ToStr(ty) }
+
+// The path part of a slot entry, its `=<ty>` suffix dropped.
+function rcwPathOf(c: string): string {
+  let i = 0
+  while i < c.length {
+    if c[i] == '=' { return c.slice(0, i) }
+    i = i + 1
+  }
+  c
+}
+
+// The source type a slot entry carries, or -1 for an entry with none (a `*` entry).
+function rcwTyOf(c: string): i32 {
+  let i = 0
+  let at = -1
+  while i < c.length {
+    if c[i] == '=' { at = i + 1 }
+    i = i + 1
+  }
+  if at < 0 || at >= c.length { return -1 }
+  let v = 0
+  i = at
+  while i < c.length {
+    const d = c[i] - '0'
+    if c[i] == '!' { return v }
+    if d < 0 || d > 9 { return -1 }
+    v = v * 10 + d
+    i = i + 1
+  }
+  v
+}
+
+// A value landing in a wider union keeps its own type, and a handle reaches its slots only by
+// narrowing to a member the value is assignable to, so each such member's widened slots are
+// the value's. A union value lands member by member.
+function rcwIntoUnion(s: i32, d: i32, path: string, out: string[], depth: i32) {
+  if s < 0 || d < 0 || s >= T.tys.length || d >= T.tys.length || depth > 12 {
+    return 0
+  }
+  const parts = rcwMembersOf(s)
+  if parts.length != 1 || parts[0] != s {
+    let pi = 0
+    while pi < parts.length {
+      rcwIntoUnion(parts[pi], d, path, out, depth + 1)
+      pi = pi + 1
+    }
+    return 0
+  }
+  if isNullTy(s) { return 0 }
+  const ms = rcwMembersOf(d)
+  let i = 0
+  while i < ms.length {
+    // An exact member keeps the value's type; an unfilled hole (-1) adopts it.
+    if ms[i] < 0 || tyEq(s, ms[i]) { return 0 }
+    i = i + 1
+  }
+  let any = false
+  i = 0
+  while i < ms.length {
+    if !isNullTy(ms[i]) && assignable(s, ms[i]) {
+      any = true
+      const sub: string[] = []
+      rcwCovs(s, ms[i], path, sub, depth + 1)
+      let k = 0
+      while k < sub.length {
+        if rcwPathOf(sub[k]) != path { out.push(sub[k]) }
+        k = k + 1
+      }
+    }
+    i = i + 1
+  }
+  if !any && rcwIsRefTy(s) { out.push(path + "*") }
+  0
+}
+
+// The types a value of type `t` may be one of: a union's members, a nullable's inner type
+// (its `null` has no slots), and the type itself for everything else. Exhaustive over `Ty`.
+function rcwMembersOf(t: i32): i32[] {
+  const out: i32[] = []
+  if t < 0 || t >= T.tys.length {
+    out.push(t)
+    return out
+  }
+  const tt = T.tys[t]
+  match tt {
+    TyUnion => {
+      let i = 0
+      while i < tt.uMembers.length {
+        out.push(tt.uMembers[i])
+        i = i + 1
+      }
+    }
+    TyNullable => {
+      out.push(tt.nInner)
+    }
+    TyPrim => {
+      out.push(t)
+    }
+    TyErr => {
+      out.push(t)
+    }
+    TyObj => {
+      out.push(t)
+    }
+    TyFunc => {
+      out.push(t)
+    }
+    TyArray => {
+      out.push(t)
+    }
+    TyMap => {
+      out.push(t)
+    }
+    TyVar => {
+      out.push(t)
+    }
+    TyLit => {
+      out.push(t)
+    }
+    TyNeg => {
+      out.push(t)
+    }
+  }
+  out
+}
+// `covarWriteThrough`'s pair: a record element delivered into a boxed union element.
+function rcwListRuleDomain(se: i32, de: i32): boolean {
+  if se < 0 || de < 0 || se >= T.tys.length || de >= T.tys.length {
+    return false
+  }
+  const st = T.tys[se]
+  const dt = T.tys[de]
+  if st is TyObj {
+    if dt is TyUnion { return covarNonNullArms(dt.uMembers) >= 2 }
+  }
+  false
+}
+
+// A type whose values are shared handles: a record, a list, a map, or a union holding one.
+function rcwIsRefTy(s: i32): boolean {
+  if s < 0 || s >= T.tys.length { return false }
+  const st = T.tys[s]
+  match st {
+    TyObj => {
+      return true
+    }
+    TyArray => {
+      return true
+    }
+    TyMap => {
+      return true
+    }
+    TyNullable => {
+      return rcwIsRefTy(st.nInner)
+    }
+    TyUnion => {
+      let i = 0
+      while i < st.uMembers.length {
+        if rcwIsRefTy(st.uMembers[i]) { return true }
+        i = i + 1
+      }
+    }
+    // Scalars, functions (immutable), holes and literal or negated scalar types.
+    TyPrim => {}
+    TyErr => {}
+    TyFunc => {}
+    TyVar => {}
+    TyLit => {}
+    TyNeg => {}
+  }
+  false
+}
+// Where the next segment of `path` starts at or after `i`, or `path.length`.
+function rcwSegEnd(path: string, i: i32): i32 {
+  let j = i + 1
+  while j < path.length {
+    if path[j] == '.' || path[j] == '[' || path[j] == '*' { return j }
+    j = j + 1
+  }
+  path.length
+}
+
+// Whether `s` begins with `pfx` at a segment boundary and is longer than it.
+function rcwStrictlyUnder(s: string, pfx: string): boolean {
+  if s.length <= pfx.length { return false }
+  if !keyHasPrefix(s, pfx) { return false }
+  const c = s[pfx.length]
+  c == '.' || c == '['
+}
+
+// Does a write of the value `val` at slot `w` store what the source's own slot cannot hold? A
+// value the source's narrower slot type accepts leaves its rep intact, so only a value that
+// type does not accept (or whose type is unknown) is the hazard. Under a `*` entry every write is.
+function rcwWriteHits(covs: string[], w: string, val: i32, at: i32): boolean {
+  if w == "" { return false }
+  let i = 0
+  while i < covs.length {
+    const c = covs[i]
+    if c.length > 0 && c[c.length - 1] == '*' {
+      const base = c.slice(0, c.length - 1)
+      if w == base || base == "" || rcwStrictlyUnder(w, base) { return true }
+    } else if rcwPathOf(c) == w {
+      const narrow = rcwTyOf(c)
+      const vt = nodeTyOf(val)
+      if narrow < 0 || vt < 0 || val < 0 { return true }
+      if !rcwParametricOk(vt, narrow, at) {
+        // A type variable or an error type on either side is unknown here, so it refuses.
+        if rcwTyUnknown(vt) || rcwTyUnknown(narrow) { return true }
+        if !assignable(vt, narrow) { return true }
+      }
+    }
+    i = i + 1
+  }
+  false
+}
+
+// Whether `t` mentions a type variable or is an error type: a static type that does not say
+// which values it holds.
+function rcwTyUnknown(t: i32): boolean {
+  if t < 0 || t >= T.tys.length { return true }
+  if T.tys[t] is TyErr { return true }
+  tyHasTyVar(t)
+}
+
+// The value a storing collection call writes: its last argument, or -1 when it has none.
+function rcwStoredArg(call: i32): i32 {
+  const cn = P.nodes[call]
+  if cn is Call {
+    if cn.callArgs.length > 0 { return cn.callArgs[cn.callArgs.length - 1] }
+  }
+  -1
+}
+
+// The widened slots strictly below `at`, re-rooted at it: what a handle to the value at `at`
+// could still write. A plain widened slot AT `at` contributes nothing — its value is a legal
+// member of the wider type, and only a store into the slot itself is the hazard.
+function rcwUnder(covs: string[], at: string): string[] {
+  const out: string[] = []
+  let i = 0
+  while i < covs.length {
+    const c = covs[i]
+    const deep = c.length > 0 && c[c.length - 1] == '*'
+    let base = c
+    if deep { base = c.slice(0, c.length - 1) }
+    if at == "" {
+      out.push(c)
+    } else if rcwStrictlyUnder(base, at) {
+      out.push(c.slice(at.length, c.length))
+    } else if deep && (base == at || base == "" || rcwStrictlyUnder(at, base)) {
+      out.push("*")
+    }
+    i = i + 1
+  }
+  out
+}
+
+// Every path of `covs` under the segment run `pfx`.
+// `uniform` false marks each typed entry `!`: the prefixed slot also holds values that did not
+// come from the source (another list element, an earlier store), which parametricity must not
+// read as the source's own.
+function rcwPrefix(pfx: string, covs: string[], uniform: boolean): string[] {
+  const out: string[] = []
+  let i = 0
+  while i < covs.length {
+    const c = covs[i]
+    if (
+      uniform ||
+      c.length == 0 ||
+      c[c.length - 1] == '*' ||
+      c[c.length - 1] == '!'
+    ) {
+      out.push(pfx + c)
+    } else {
+      out.push(pfx + c + "!")
+    }
+    i = i + 1
+  }
+  out
+}
+
+// Whether a typed slot entry also holds values from outside the source (see `rcwPrefix`).
+function rcwMixed(c: string): boolean { c.length > 0 && c[c.length - 1] == '!' }
+
+// The expressions whose value an expression IS: itself, or each operand of a `??`, or each
+// arm's tail of an `if` used as a value. A worklist, so a long `else if` chain costs no stack.
+function rcwBranches(ix: i32, out: i32[]) {
+  const todo: i32[] = [ix]
+  while todo.length > 0 {
+    const p = cwPeel(todo.pop() ?? -1)
+    if p >= 0 && p < P.nodes.length {
+      if !rcwPushIfArms(p, todo) && !rcwPushCoalOperands(p, todo) {
+        out.push(p)
+      }
+    }
+  }
+  0
+}
+
+// When `p` is an `if` used as a value, queue its arms' tails (an `else if` link as itself).
+function rcwPushIfArms(p: i32, todo: i32[]): boolean {
+  const n = P.nodes[p]
+  if n is IfStmt {
+    todo.push(rcwBlockTail(n.ifThen))
+    const el = n.ifElse
+    if el >= 0 && el < P.nodes.length {
+      if P.nodes[el] is IfStmt {
+        todo.push(el)
+      } else {
+        todo.push(rcwBlockTail(el))
+      }
+    }
+    return true
+  }
+  false
+}
+
+// When `p` is `a ?? b`, queue both operands: the value is one of them.
+function rcwPushCoalOperands(p: i32, todo: i32[]): boolean {
+  const n = P.nodes[p]
+  if n is BinExpr {
+    if n.binOp == "??" {
+      todo.push(n.binLeft)
+      todo.push(n.binRight)
+      return true
+    }
+  }
+  false
+}
+// The value statement a block ends with, or -1 when it ends in none (an empty block).
+function rcwBlockTail(bIx: i32): i32 {
+  if bIx < 0 || bIx >= P.nodes.length { return -1 }
+  const b = P.nodes[bIx]
+  if b is Block {
+    if b.blkStmts.length == 0 { return -1 }
+    return b.blkStmts[b.blkStmts.length - 1]
+  }
+  bIx
+}
+
+// A leaf that holds no slot any other handle can see: a scalar literal, a statement that is
+// not a value, or an empty `Map()` / `Set()` just made.
+function rcwLeafVacuous(p: i32): boolean {
+  const n = P.nodes[p]
+  if (
+    n is NumLit ||
+    n is StrLit ||
+    n is CharLit ||
+    n is BoolLit ||
+    n is NullLit
+  ) {
+    return true
+  }
+  if (
+    n is LetDecl ||
+    n is RetStmt ||
+    n is WhileStmt ||
+    n is ForIn ||
+    n is ForRange
+  ) {
+    return true
+  }
+  // A function value is immutable: it holds no slot a store could go through.
+  if n is FuncDecl { return true }
+  rcwIsFreshCtor(p)
+}
+
+// An empty `Map()` / `Set()` made on the spot, by the builtin rather than a same-named binding.
+function rcwIsFreshCtor(p: i32): boolean {
+  const n = P.nodes[p]
+  if n is Call {
+    const cf = P.nodes[cwPeel(n.callFn)]
+    if cf is Ident {
+      if (
+        n.callArgs.length == 0 &&
+        (cf.identName == "Map" || cf.identName == "Set")
+      ) {
+        return cwFrameOfUse(cwPeel(n.callFn), cf.identName) == CW_FR_UNKNOWN
+      }
+    }
+  }
+  false
+}
+// A value with no identity of its own: every branch a vacuous leaf, or an object or list
+// literal whose every part is one. Nothing else can hold a handle on it.
+function rcwAllFresh(ix: i32, depth: i32): boolean {
+  if depth > 64 { return false }
+  const leaves: i32[] = []
+  rcwBranches(ix, leaves)
+  let li = 0
+  while li < leaves.length {
+    const p = leaves[li]
+    const n = P.nodes[p]
+    if n is ObjLit {
+      let k = 0
+      while k < n.objFields.length {
+        const f = P.nodes[n.objFields[k]]
+        if f is FieldInit {
+          if !rcwAllFresh(f.fiValue, depth + 1) { return false }
+        } else {
+          return false
+        }
+        k = k + 1
+      }
+    } else if n is ArrayLit {
+      let e = 0
+      while e < n.arrElems.length {
+        if !rcwAllFresh(n.arrElems[e], depth + 1) { return false }
+        e = e + 1
+      }
+    } else if !rcwLeafVacuous(p) {
+      return false
+    }
+    li = li + 1
+  }
+  true
+}
+
+// Is the widened slot `c` owned by a fresh value at `src`? Then no other handle sees it and
+// storing a wider value there is the literal's own business. Walks every segment but the last
+// through literal parts, every branch and every element of each.
+function rcwSlotFresh(src: i32, c: string, i: i32, depth: i32): boolean {
+  if depth > 64 { return false }
+  if c.length > 0 && c[c.length - 1] == '*' { return rcwAllFresh(src, 0) }
+  const e = rcwSegEnd(c, i)
+  const leaves: i32[] = []
+  rcwBranches(src, leaves)
+  let li = 0
+  while li < leaves.length {
+    if !rcwLeafSlotFresh(leaves[li], c, i, e, depth) { return false }
+    li = li + 1
+  }
+  true
+}
+
+// One branch of `rcwSlotFresh`: the segment `c[i..e]` taken from the leaf `p`.
+function rcwLeafSlotFresh(
+  p: i32,
+  c: string,
+  i: i32,
+  e: i32,
+  depth: i32,
+): boolean {
+  if rcwLeafVacuous(p) { return true }
+  // `c[i..]` is the last segment: its owner is the node here, fresh when it is a literal.
+  if e >= c.length { return rcwIsLiteralRecord(p) }
+  if c[i] == '.' { return rcwFieldSlotFresh(p, c, i, e, depth) }
+  rcwElemSlotFresh(p, c, e, depth)
+}
+
+// An object or list literal: a value made here, whose slots no other handle has seen.
+function rcwIsLiteralRecord(p: i32): boolean {
+  const n = P.nodes[p]
+  n is ObjLit || n is ArrayLit
+}
+
+// The field segment `c[i..e]` of the literal `p`, followed into that field's value.
+function rcwFieldSlotFresh(
+  p: i32,
+  c: string,
+  i: i32,
+  e: i32,
+  depth: i32,
+): boolean {
+  const n = P.nodes[p]
+  if n is ObjLit {
+    const name = c.slice(i + 1, e)
+    let k = 0
+    while k < n.objFields.length {
+      const f = P.nodes[n.objFields[k]]
+      if f is FieldInit {
+        if f.fiName == name { return rcwSlotFresh(f.fiValue, c, e, depth + 1) }
+      }
+      k = k + 1
+    }
+  }
+  false
+}
+
+// The element segment of the literal `p`, followed into every element.
+function rcwElemSlotFresh(p: i32, c: string, e: i32, depth: i32): boolean {
+  const n = P.nodes[p]
+  if n is ArrayLit {
+    let k = 0
+    while k < n.arrElems.length {
+      if !rcwSlotFresh(n.arrElems[k], c, e, depth + 1) { return false }
+      k = k + 1
+    }
+    return true
+  }
+  false
+}
+// The query's state: the node that decides a refusal, and the (handle, slots) pairs already
+// asked, so an alias cycle answers "no write" — the least fixpoint of a may-write question.
+let rcwWhy = -1
+// The imprecise hop a write is reached through — the result of a function whose calls share
+// what it returns, or a function parameter whose callers' arguments are pooled — or "".
+let rcwVia = ""
+// What `rcwWhy` is: `RCW_OPAQUE` a consumer the index does not model, `RCW_WRITE` a definite
+// write, `RCW_CALLEE` a function value whose body this cannot name, `RCW_DEPTH` the depth limit.
+let rcwWhyKind = 0
+const RCW_OPAQUE = 0
+const RCW_WRITE = 1
+const RCW_CALLEE = 2
+const RCW_DEPTH = 3
+// How deep one query follows handles before it refuses, in recursion steps (about four a call).
+const RCW_DEPTH_LIMIT = 4000
+let rcwSeen: {[string]: boolean} = Map()
+// Answers that outlive one query, keyed like `rcwSeen`: -1 for "nothing writes", else the
+// deciding node times four plus its kind. A "nothing writes" answer is banked only when no cycle
+// is cut beneath it, since a cut answer is provisional while its ancestor is still open.
+let rcwMemo: {[string]: i32} = Map()
+let rcwCut = 0
+// How many memoised questions are open on the current path. A "nothing writes" answer with a
+// cycle cut beneath it is final at the outermost one, since every cut there is inside it.
+let rcwOpen = 0
+
+// The collection methods by what they do to their receiver's element slots. A storing method
+// writes a slot; an element-returning one hands a slot's value back; the read-only ones hand
+// back nothing a store could go through. A method in none of the three is not followed.
+function rcwStoresElem(m: string): boolean { collMethodKind(m) == CM_STORES }
+function rcwReturnsElem(m: string): boolean {
+  const k = collMethodKind(m)
+  k == CM_RETURNS || k == CM_REMOVES_ONE
+}
+function rcwReadsOnly(m: string): boolean {
+  const k = collMethodKind(m)
+  k == CM_READS || k == CM_REMOVES
+}
+// Record the node that decided a refusal, keeping the first.
+function rcwFound(at: i32): boolean { rcwWhyAs(at, RCW_OPAQUE) }
+
+// Record the deciding node with its kind, keeping the first.
+function rcwWhyAs(at: i32, kind: i32): boolean {
+  if rcwWhy < 0 {
+    rcwWhy = at
+    rcwWhyKind = kind
+  }
+  true
+}
+
+// Refuse at a call whose callee is a function value this check cannot name a body for.
+function rcwFoundCallee(at: i32): boolean {
+  if rcwIsErrNode(at) { return false }
+  rcwWhyAs(at, RCW_CALLEE)
+}
+
+// Whether the checker typed `at` as an error: it already reported there, and the program does
+// not build, so a second refusal would only repeat the first.
+function rcwIsErrNode(at: i32): boolean {
+  const t = nodeTyOf(at)
+  if t < 0 || t >= T.tys.length { return false }
+  T.tys[t] is TyErr
+}
+
+// The memo's answer for `key`, replayed into the query state: 0 not banked, 1 nothing writes,
+// 2 something does.
+function rcwMemoGet(key: string): i32 {
+  const hit = rcwMemo[key]
+  if hit is i32 {
+    if hit < 0 { return 1 }
+    rcwWhyAs(hit / 4, hit % 4)
+    return 2
+  }
+  0
+}
+
+// Bank the answer `res` for `key`, computed while `cut0` cycles had been cut.
+function rcwMemoPut(key: string, res: boolean, cut0: i32) {
+  if res {
+    if rcwWhy >= 0 { rcwMemo[key] = rcwWhy * 4 + rcwWhyKind }
+  } else if rcwCut == cut0 || rcwOpen <= 1 {
+    rcwMemo[key] = -1
+  }
+  rcwOpen = rcwOpen - 1
+  0
+}
+
+// Whether `key` is already being asked in this query: a cycle, cut at "nothing writes".
+function rcwSeenCut(key: string): boolean {
+  if rcwSeen.has(key) {
+    rcwCut = rcwCut + 1
+    return true
+  }
+  rcwSeen[key] = true
+  rcwOpen = rcwOpen + 1
+  false
+}
+
+// Record the node that decided a refusal as a definite write rather than an opaque edge.
+function rcwWrote(at: i32): boolean { rcwWhyAs(at, RCW_WRITE) }
+
+// Can the value at expression `v`, carrying the widened slots `covs`, be written at one of
+// them? Climbs the projection chain `v.a[i].b` to the node that consumes it, then asks that
+// consumer — a write target, a binding, a call, a literal, a return. A consumer the occurrence
+// index does not model answers yes, so a gap in the index is a refusal, never a hole.
+function rcwValueWrites(v: i32, covs0: string[], depth: i32): boolean {
+  if covs0.length == 0 { return false }
+  if depth > RCW_DEPTH_LIMIT { return rcwWhyAs(v, RCW_DEPTH) }
+  let node = cwPeel(v)
+  let path = ""
+  let climbing = true
+  while climbing {
+    if node < 0 || node >= cwIxUpKind.length { return rcwFound(v) }
+    climbing = false
+    // An `if` arm's tail is the `if`'s own value: climb without a segment, as a loop so a
+    // long `else if` chain costs no stack.
+    if cwIxUpKind[node] == CW_UP_ARM {
+      node = cwIxUp[node]
+      climbing = true
+    } else if cwIxUpKind[node] == CW_UP_OBJ {
+      const pu = cwIxUp[node]
+      if pu < 0 || pu >= P.nodes.length { return rcwFound(v) }
+      const pn = P.nodes[pu]
+      if pn is Member {
+        if nameIn(getProps, pn.memProp) {
+          if rcwUnder(covs0, path).length > 0 { return rcwFound(pu) }
+          return false
+        }
+        if pu < cwIxUpKind.length && cwIxUpKind[pu] == CW_UP_CALLEE {
+          return rcwMethodWrites(
+            pu,
+            pn,
+            cwIxUp[pu],
+            rcwUnder(covs0, path),
+            covs0,
+            path,
+            depth,
+          )
+        }
+        path = path + "." + pn.memProp
+        node = pu
+        climbing = true
+      } else if pn is OptMember {
+        if pu < cwIxUpKind.length && cwIxUpKind[pu] == CW_UP_CALLEE {
+          if rcwUnder(covs0, path).length > 0 { return rcwFound(pu) }
+          return false
+        }
+        path = path + "." + pn.omProp
+        node = pu
+        climbing = true
+      } else if pn is Index {
+        path = path + "[]"
+        node = pu
+        climbing = true
+      } else {
+        if rcwUnder(covs0, path).length > 0 { return rcwFound(pu) }
+        return false
+      }
+    }
+  }
+  const kind = cwIxUpKind[node]
+  const up = cwIxUp[node]
+  if kind == CW_UP_ASG_LHS {
+    const asg = P.nodes[up]
+    let val = -1
+    if asg is BinExpr { val = asg.binRight }
+    if rcwWriteHits(covs0, path, val, up) { return rcwWrote(up) }
+    return false
+  }
+  const covs = rcwUnder(covs0, path)
+  if covs.length == 0 { return false }
+  if kind == CW_UP_CMP { return false }
+  if kind == CW_UP_CALLEE { return false }
+  if kind == CW_UP_COAL { return rcwValueWrites(cwIxUp[node], covs, depth + 1) }
+  if kind == CW_UP_IS { return false }
+  if kind == CW_UP_NONE { return rcwStmtValueWrites(node, covs, depth) }
+  if up < 0 || up >= P.nodes.length { return rcwFound(node) }
+  const un = P.nodes[up]
+  if kind == CW_UP_LETINIT {
+    if un is LetDecl {
+      return rcwNameWrites(un.letName, cwFrameOfDecl(up), covs, depth + 1)
+    }
+    return rcwFound(up)
+  }
+  if kind == CW_UP_ASG_RHS {
+    if un is BinExpr { return rcwPlaceWrites(un.binLeft, "", covs, depth + 1) }
+    return rcwFound(up)
+  }
+  if kind == CW_UP_ARG {
+    if un is Call {
+      return rcwArgWrites(up, un, cwIxUpAux[node], covs, depth + 1)
+    }
+    return rcwFound(up)
+  }
+  if kind == CW_UP_FIELD {
+    const fi = P.nodes[cwIxUpAux[node]]
+    if fi is FieldInit {
+      return rcwValueWrites(
+        up,
+        rcwPrefix("." + fi.fiName, covs, true),
+        depth + 1,
+      )
+    }
+    return rcwFound(up)
+  }
+  if kind == CW_UP_ELEM {
+    return rcwValueWrites(up, rcwPrefix("[]", covs, false), depth + 1)
+  }
+  if kind == CW_UP_RET {
+    if up < cwFrameOf.length {
+      return rcwReturnWrites(cwFrameOf[up], up, covs, depth + 1)
+    }
+    return rcwFound(up)
+  }
+  if kind == CW_UP_TAIL { return rcwReturnWrites(up, node, covs, depth + 1) }
+  if kind == CW_UP_ITER {
+    // A list's loop variable is its element and a map's second one its value; both are the
+    // `[]` slot. Asked of both names, since the loop's collection kind is not known yet here.
+    if un is ForIn {
+      const ec = rcwUnder(covs, "[]")
+      const fr = cwFrameOfDecl(up)
+      if rcwNameWrites(un.fiVar, fr, ec, depth + 1) { return true }
+      if un.fiVar2 != "" { return rcwNameWrites(un.fiVar2, fr, ec, depth + 1) }
+      return false
+    }
+    return rcwFound(up)
+  }
+  rcwStmtValueWrites(node, covs, depth)
+}
+
+// A value no index row consumes, climbed through the statements that hold it: a statement that
+// is not its block's last discards its value, a block's last hands it to the block, an `if` arm
+// to the `if`, and a loop body or a top-level statement drops it. Anything else is unmodelled.
+function rcwStmtValueWrites(node: i32, covs: string[], depth: i32): boolean {
+  let n = node
+  while n >= 0 && n < cwIxParent.length {
+    const p = cwIxParent[n]
+    if p < 0 || p >= P.nodes.length { return rcwFound(node) }
+    const step = rcwStmtStep(p, n, node)
+    if step == 1 { return false }
+    if step == 2 { return true }
+    if cwIxUpKind[p] != CW_UP_NONE { return rcwValueWrites(p, covs, depth + 1) }
+    n = p
+  }
+  rcwFound(node)
+}
+
+// What the statement or block `p` does with its child `n`'s value: 0 makes it `p`'s own (the
+// last statement of a block, an arm of an `if`), 1 drops it (any other statement of a block or
+// the program, a loop or function body), 2 is a use this does not model, refused at `node`.
+function rcwStmtStep(p: i32, n: i32, node: i32): i32 {
+  const pn = P.nodes[p]
+  if pn is Block {
+    if pn.blkStmts.length > 0 && pn.blkStmts[pn.blkStmts.length - 1] == n {
+      return 0
+    }
+    return 1
+  }
+  if pn is IfStmt {
+    if pn.ifThen == n || pn.ifElse == n { return 0 }
+  }
+  if pn is Program { return 1 }
+  if pn is WhileStmt {
+    if pn.whileBody == n { return 1 }
+  }
+  if pn is ForIn {
+    if pn.fiBody == n { return 1 }
+  }
+  if pn is ForRange {
+    if pn.frBody == n { return 1 }
+  }
+  if pn is FuncDecl {
+    if pn.fnBody == n { return 1 }
+  }
+  rcwStmtUnmodelled(node)
+}
+
+// Refuse at `node`, a value held by a statement form the climb above does not model.
+function rcwStmtUnmodelled(node: i32): i32 {
+  rcwFound(node)
+  2
+}
+
+// A method called on the widened value at `path`: `recv.m(…)`, where `callee` is the `Member`
+// node and `call` the `Call`. A `self`-function is the receiver's parameter 0; a collection
+// method is judged by what it does to the receiver's element slots.
+function rcwMethodWrites(
+  callee: i32,
+  m: Member,
+  call: i32,
+  covs: string[],
+  covs0: string[],
+  path: string,
+  depth: i32,
+): boolean {
+  // A method spelling may reach any `self`-function of that name, merged modules included,
+  // or the collection method of the same name; each reading is asked.
+  const ds = rcwSelfDeclsOf(m.memProp, callee)
+  let di = 0
+  while di < ds.length {
+    if covs.length > 0 && rcwParamWrites(ds[di], 0, covs, depth + 1) {
+      return true
+    }
+    di = di + 1
+  }
+  if rcwStoresElem(m.memProp) {
+    if rcwWriteHits(covs0, path + "[]", rcwStoredArg(call), call) {
+      return rcwWrote(call)
+    }
+    return false
+  }
+  if covs.length == 0 { return false }
+  if rcwReadsOnly(m.memProp) { return false }
+  if rcwReturnsElem(m.memProp) {
+    return rcwValueWrites(call, rcwUnder(covs, "[]"), depth + 1)
+  }
+  // `map` / `filter` hand each element to a callback; `filter`, `slice` and `values` answer a
+  // list of the receiver's own elements, so the result carries the receiver's slots.
+  if m.memProp == "map" || rcwSameElems(m.memProp) {
+    if rcwCallbacksWrite(call, rcwUnder(covs, "[]"), depth) { return true }
+    if m.memProp == "map" { return false }
+    return rcwValueWrites(call, covs, depth + 1)
+  }
+  if ds.length > 0 { return false }
+  rcwFoundCallee(call)
+}
+
+// The collection methods whose result is a list of the receiver's own elements.
+function rcwSameElems(m: string): boolean {
+  m == "filter" || m == "slice" || m == "values"
+}
+
+// Each callback argument of the collection call `call`, receiving one element at a time: a
+// lambda written in place or a declared function is followed into its first parameter.
+function rcwCallbacksWrite(call: i32, elemCovs: string[], depth: i32): boolean {
+  if elemCovs.length == 0 { return false }
+  const cn = P.nodes[call]
+  if cn is Call {
+    let i = 0
+    while i < cn.callArgs.length {
+      const a = cwPeel(cn.callArgs[i])
+      if a >= 0 && a < P.nodes.length {
+        if !rcwLeafVacuous(a) || P.nodes[a] is FuncDecl {
+          if rcwCallableWrites(a, call, 0, elemCovs, depth + 1) { return true }
+        }
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// The `self`-functions a method spelling `.prop(…)` at `callee` may reach: the one the scope
+// resolves, and every declaration whose name, merge suffix stripped, is `prop` and whose first
+// parameter is `self`.
+function rcwSelfDeclsOf(prop: string, callee: i32): i32[] {
+  const out: i32[] = []
+  const d0 = cwUfcsDeclOf(callee)
+  if d0 >= 0 { out.push(d0) }
+  let r = cwIxChain(demangleName(prop))
+  while r >= 0 {
+    if cwIxKind[r] == CW_OCC_FDECL {
+      const d = cwIxNode[r]
+      if d != d0 && rcwFirstParamIsSelf(d) { out.push(d) }
+    }
+    r = cwIxNext[r]
+  }
+  out
+}
+
+// Whether the `FuncDecl` at `d` takes `self` first.
+function rcwFirstParamIsSelf(d: i32): boolean {
+  const fd = P.nodes[d]
+  if fd is FuncDecl {
+    if fd.fnParams.length == 0 { return false }
+    const p0 = P.nodes[fd.fnParams[0]]
+    if p0 is Param { return p0.parName == "self" }
+  }
+  false
+}
+
+// The value carrying `covs` stored into the place `lhs` (plus the segments `below` it): the
+// place's root binding then holds the widened slots under the place's own path.
+function rcwPlaceWrites(
+  lhs: i32,
+  below: string,
+  covs: string[],
+  depth: i32,
+): boolean {
+  const p = cwPeel(lhs)
+  if p < 0 || p >= P.nodes.length { return rcwFound(lhs) }
+  const n = P.nodes[p]
+  if n is Ident {
+    return rcwNameWrites(
+      n.identName,
+      covarRootFrame(p),
+      rcwPrefix(below, covs, false),
+      depth + 1,
+    )
+  }
+  if n is Member {
+    return rcwPlaceWrites(n.memObj, "." + n.memProp + below, covs, depth + 1)
+  }
+  if n is Index {
+    return rcwPlaceWrites(n.idxArr, "[]" + below, covs, depth + 1)
+  }
+  rcwFound(lhs)
+}
+
+// The widened value passed as argument `argNo` of `call`. A declared function or a lambda
+// bound once is followed into its parameter; a bare intrinsic stores nothing; a storing
+// collection method puts the value in its receiver's element slots; anything else is opaque.
+function rcwArgWrites(
+  callIx: i32,
+  cn: Call,
+  argNo: i32,
+  covs: string[],
+  depth: i32,
+): boolean {
+  if cwCallNamed(cn.callArgNames) { return rcwFound(callIx) }
+  const cf = cwPeel(cn.callFn)
+  if cf < 0 || cf >= P.nodes.length { return rcwFound(callIx) }
+  const f = P.nodes[cf]
+  if f is Ident {
+    const d = cwCalleeDeclOf(cn.callFn)
+    if d >= 0 { return rcwParamWrites(d, argNo, covs, depth + 1) }
+    // `print` renders its argument and keeps nothing.
+    if (
+      f.identName == "print" &&
+      cwFrameOfUse(cf, f.identName) == CW_FR_UNKNOWN
+    ) {
+      return false
+    }
+    // A callee that is a parameter of the enclosing function is whatever its callers pass.
+    return rcwCallableWrites(cf, callIx, argNo, covs, depth + 1)
+  }
+  if f is Member {
+    const ds = rcwSelfDeclsOf(f.memProp, cn.callFn)
+    let di = 0
+    while di < ds.length {
+      if rcwParamWrites(ds[di], argNo + 1, covs, depth + 1) { return true }
+      di = di + 1
+    }
+    if nameIn(getProps, f.memProp) { return rcwFound(callIx) }
+    if rcwStoresElem(f.memProp) {
+      return rcwPlaceWrites(f.memObj, "[]", covs, depth + 1)
+    }
+    if rcwReadsOnly(f.memProp) { return false }
+    if ds.length > 0 { return false }
+  }
+  rcwFoundCallee(callIx)
+}
+
+// The function values the expression `fx` may hold, each asked what it does with its parameter
+// `argNo` given the widened slots: a lambda or a declared function directly, and a parameter of
+// the enclosing function through every call site of that function. `at` names the refusal.
+function rcwCallableWrites(
+  fx: i32,
+  at: i32,
+  argNo: i32,
+  covs: string[],
+  depth: i32,
+): boolean {
+  if depth > RCW_DEPTH_LIMIT { return rcwWhyAs(at, RCW_DEPTH) }
+  const a = cwPeel(fx)
+  if a < 0 || a >= P.nodes.length { return rcwFoundCallee(at) }
+  const n = P.nodes[a]
+  if n is FuncDecl { return rcwParamWrites(a, argNo, covs, depth + 1) }
+  const d = cwCalleeDeclOf(a)
+  if d >= 0 { return rcwParamWrites(d, argNo, covs, depth + 1) }
+  if n is Ident {
+    const fr = cwFrameOfUse(a, n.identName)
+    if fr >= 0 && fr < P.nodes.length {
+      const k = rcwParamIndexOf(fr, n.identName)
+      if k >= 0 {
+        return rcwParamCallbackWrites(fr, k, at, argNo, covs, depth + 1)
+      }
+    }
+  }
+  rcwFoundCallee(at)
+}
+
+// The name of parameter `k` of `fnIx`, or "?".
+function rcwParamNameOf(fnIx: i32, k: i32): string {
+  const fd = P.nodes[fnIx]
+  if fd is FuncDecl {
+    if k >= 0 && k < fd.fnParams.length {
+      const pn = P.nodes[fd.fnParams[k]]
+      if pn is Param { return pn.parName }
+    }
+  }
+  "?"
+}
+
+// The position of the parameter named `nm` in the function `fnIx`, or -1.
+function rcwParamIndexOf(fnIx: i32, nm: string): i32 {
+  const fd = P.nodes[fnIx]
+  if fd is FuncDecl {
+    let i = 0
+    while i < fd.fnParams.length {
+      const pn = P.nodes[fd.fnParams[i]]
+      if pn is Param {
+        if pn.parName == nm { return i }
+      }
+      i = i + 1
+    }
+  }
+  -1
+}
+
+// Parameter `k` of `fnIx` called with the widened value as its argument `argNo`: every call site
+// of `fnIx` names what it passes there.
+function rcwParamCallbackWrites(
+  fnIx: i32,
+  k: i32,
+  at: i32,
+  argNo: i32,
+  covs: string[],
+  depth: i32,
+): boolean {
+  const key = "cb#" +
+    i32ToStr(fnIx) +
+    "#" +
+    i32ToStr(k) +
+    "#" +
+    i32ToStr(argNo) +
+    "#" +
+    rcwKey(covs)
+  const m = rcwMemoGet(key)
+  if m != 0 { return m == 2 }
+  if rcwSeenCut(key) { return false }
+  const cut0 = rcwCut
+  const sites: i32[] = []
+  const bad = rcwCallSites(fnIx, sites)
+  let res = false
+  if bad >= 0 {
+    res = rcwFoundCallee(at)
+  } else {
+    let i = 0
+    while i < sites.length && !res {
+      const c = sites[i] / 2
+      const off = sites[i] % 2
+      const cn = P.nodes[c]
+      if cn is Call {
+        if cwCallNamed(cn.callArgNames) {
+          res = rcwFoundCallee(c)
+        } else if off == 1 && k == 0 {
+          res = rcwFoundCallee(c)
+        } else if k - off < cn.callArgs.length {
+          res = rcwCallableWrites(
+            cn.callArgs[k - off],
+            at,
+            argNo,
+            covs,
+            depth + 1,
+          )
+        }
+      }
+      i = i + 1
+    }
+    if res && sites.length > 1 && rcwVia == "" && rcwWhyKind == RCW_WRITE {
+      rcwVia = "the function parameter `" +
+        rcwParamNameOf(fnIx, k) +
+        "` of `" +
+        rcwFnLabel(fnIx) +
+        "`, whose callers' arguments all meet there"
+    }
+  }
+  rcwMemoPut(key, res, cut0)
+  res
+}
+
+// Parameter `paramIx` of the function `d` receiving the widened value.
+function rcwParamWrites(
+  d: i32,
+  paramIx: i32,
+  covs: string[],
+  depth: i32,
+): boolean {
+  const fd = P.nodes[d]
+  if fd is FuncDecl {
+    if paramIx < 0 || paramIx >= fd.fnParams.length { return rcwFound(d) }
+    const pn = P.nodes[fd.fnParams[paramIx]]
+    if pn is Param {
+      if pn.parRest != 0 { return rcwFound(fd.fnParams[paramIx]) }
+      rcwCtxPush(d, paramIx, covs)
+      const r = rcwNameWrites(pn.parName, d, covs, depth + 1)
+      rcwCtxFn.pop()
+      rcwCtxTv.pop()
+      rcwCtxNarrow.pop()
+      return r
+    }
+  }
+  rcwFound(d)
+}
+
+// Parametricity: a widened value entering `d` at the one parameter that can supply `d`'s type
+// parameter `T` (`T[]`, `{f: T}`; elsewhere `T` only as a function parameter's argument type)
+// makes every `T` in the body one of that slot's own values, so storing one back is a
+// permutation (`sort`'s swaps). Per entered function: `T` and the source's slot type, or "", -1.
+let rcwCtxFn: i32[] = []
+let rcwCtxTv: string[] = []
+let rcwCtxNarrow: i32[] = []
+
+// Push the context for the widened value entering `d` at parameter `k` carrying `covs`.
+function rcwCtxPush(d: i32, k: i32, covs: string[]) {
+  let tv = ""
+  let narrow = -1
+  const fd = P.nodes[d]
+  if fd is FuncDecl {
+    const pt = rcwParamTy(d, k)
+    if pt >= 0 {
+      let ti = 0
+      while ti < fd.fnTyParams.length && tv == "" {
+        if rcwTvCount(pt, fd.fnTyParams[ti], 0) > 0 { tv = fd.fnTyParams[ti] }
+        ti = ti + 1
+      }
+    }
+    if tv != "" {
+      const paths: string[] = []
+      if (
+        !rcwTvPaths(pt, tv, "", paths, 0) ||
+        paths.length != rcwTvCount(pt, tv, 0) ||
+        !rcwTvOnlyAsInput(d, k, tv)
+      ) {
+        tv = ""
+      } else {
+        narrow = rcwCommonNarrow(paths, covs)
+      }
+    }
+    if narrow < 0 { tv = "" }
+  }
+  rcwCtxFn.push(d)
+  rcwCtxTv.push(tv)
+  rcwCtxNarrow.push(narrow)
+  0
+}
+
+// The slot paths where the type variable `tv` stands in `t`, through lists and record fields
+// only. False when `tv` also occurs somewhere a slot cannot name (a union, a map, a function).
+function rcwTvPaths(
+  t: i32,
+  tv: string,
+  path: string,
+  out: string[],
+  depth: i32,
+): boolean {
+  if t < 0 || t >= T.tys.length || depth > 12 { return false }
+  const tt = T.tys[t]
+  if tt is TyVar {
+    if tt.tvName == tv { out.push(path) }
+    return true
+  }
+  if tt is TyArray {
+    return rcwTvPaths(tt.aElem, tv, path + "[]", out, depth + 1)
+  }
+  if tt is TyObj {
+    let i = 0
+    while i < tt.objFieldTypes.length {
+      const f = tt.objFieldTypes[i]
+      if !rcwTvPaths(f, tv, path + "." + tt.objFieldNames[i], out, depth + 1) {
+        return false
+      }
+      i = i + 1
+    }
+    return true
+  }
+  rcwTvCount(t, tv, depth) == 0
+}
+
+// The source type every slot in `paths` has in `covs`, or -1 when one is missing or they differ.
+function rcwCommonNarrow(paths: string[], covs: string[]): i32 {
+  let narrow = -1
+  let i = 0
+  while i < paths.length {
+    let found = -1
+    let c = 0
+    while c < covs.length {
+      if rcwPathOf(covs[c]) == paths[i] {
+        if rcwMixed(covs[c]) { return -1 }
+        found = rcwTyOf(covs[c])
+      }
+      c = c + 1
+    }
+    if found < 0 { return -1 }
+    if narrow >= 0 && !tyEq(narrow, found) { return -1 }
+    narrow = found
+    i = i + 1
+  }
+  narrow
+}
+// The resolved type of parameter `k` of `d`, or -1 when it has no annotation.
+function rcwParamTy(d: i32, k: i32): i32 {
+  const fd = P.nodes[d]
+  if fd is FuncDecl {
+    if k < 0 || k >= fd.fnParams.length { return -1 }
+    const pn = P.nodes[fd.fnParams[k]]
+    if pn is Param {
+      if pn.parType < 0 || pn.parType >= P.nodes.length { return -1 }
+      const a = P.nodes[pn.parType]
+      if a is TypeRef { return resolveAnnot(a.tyName, fd.fnTyParams) }
+    }
+  }
+  -1
+}
+
+// The name of `t` when it is one of the type parameters `tps`, else "".
+function rcwTvName(t: i32, tps: string[]): string {
+  if t < 0 || t >= T.tys.length { return "" }
+  const tt = T.tys[t]
+  if tt is TyVar {
+    if nameIn(tps, tt.tvName) { return tt.tvName }
+  }
+  ""
+}
+
+// How many times the type variable `tv` occurs in `t`.
+function rcwTvCount(t: i32, tv: string, depth: i32): i32 {
+  if t < 0 || t >= T.tys.length { return 0 }
+  // Past the depth limit the answer is "mentioned, many times": fail closed.
+  if depth > 12 { return 99 }
+  const tt = T.tys[t]
+  let n = 0
+  match tt {
+    TyVar => {
+      if tt.tvName == tv { n = 1 }
+    }
+    TyArray => {
+      n = rcwTvCount(tt.aElem, tv, depth + 1)
+    }
+    TyMap => {
+      n = rcwTvCount(tt.mKey, tv, depth + 1) +
+        rcwTvCount(tt.mVal, tv, depth + 1)
+    }
+    TyNullable => {
+      n = rcwTvCount(tt.nInner, tv, depth + 1)
+    }
+    TyNeg => {
+      n = rcwTvCount(tt.negTy, tv, depth + 1)
+    }
+    TyObj => {
+      let i = 0
+      while i < tt.objFieldTypes.length {
+        n = n + rcwTvCount(tt.objFieldTypes[i], tv, depth + 1)
+        i = i + 1
+      }
+    }
+    TyUnion => {
+      let i = 0
+      while i < tt.uMembers.length {
+        n = n + rcwTvCount(tt.uMembers[i], tv, depth + 1)
+        i = i + 1
+      }
+    }
+    TyFunc => {
+      n = rcwTvCount(tt.fnRet, tv, depth + 1)
+      let i = 0
+      while i < tt.fnParamTypes.length {
+        n = n + rcwTvCount(tt.fnParamTypes[i], tv, depth + 1)
+        i = i + 1
+      }
+    }
+    TyPrim => {}
+    TyErr => {}
+    TyLit => {}
+  }
+  n
+}
+
+// Whether no parameter of `d` but `k` can supply a `tv` value: each mentions it only as a
+// direct argument type of a function-typed parameter, which the body can pass to but never get
+// back from.
+function rcwTvOnlyAsInput(d: i32, k: i32, tv: string): boolean {
+  const fd = P.nodes[d]
+  if fd is FuncDecl {
+    let i = 0
+    while i < fd.fnParams.length {
+      if i != k {
+        const pt = rcwParamTy(d, i)
+        if pt < 0 { return false }
+        if rcwTvCount(pt, tv, 0) > 0 && !rcwTvInputOnly(pt, tv) { return false }
+      }
+      i = i + 1
+    }
+    return true
+  }
+  false
+}
+
+// `t` is a function type whose result and whose parameters' insides never mention `tv`.
+function rcwTvInputOnly(t: i32, tv: string): boolean {
+  const tt = T.tys[t]
+  if tt is TyFunc {
+    if rcwTvCount(tt.fnRet, tv, 0) > 0 { return false }
+    let i = 0
+    while i < tt.fnParamTypes.length {
+      const pp = tt.fnParamTypes[i]
+      if rcwTvName(pp, [tv]) == "" && rcwTvCount(pp, tv, 0) > 0 { return false }
+      i = i + 1
+    }
+    return true
+  }
+  false
+}
+
+// Whether a write at `at` of a value typed `vt` into a slot whose source type is `narrow` is a
+// permutation under the innermost parametricity context.
+function rcwParametricOk(vt: i32, narrow: i32, at: i32): boolean {
+  const top = rcwCtxFn.length - 1
+  if top < 0 || rcwCtxTv[top] == "" { return false }
+  if at < 0 || at >= cwFrameOf.length || cwFrameOf[at] != rcwCtxFn[top] {
+    return false
+  }
+  if rcwTvName(vt, [rcwCtxTv[top]]) == "" { return false }
+  tyEq(narrow, rcwCtxNarrow[top])
+}
+
+// The context part of a memo key for a binding of frame `fr`: a binding of the innermost
+// entered function answers under that entry's parametricity context.
+function rcwCtxKey(fr: i32): string {
+  const top = rcwCtxFn.length - 1
+  if top < 0 || rcwCtxFn[top] != fr { return "" }
+  "|" + rcwCtxTv[top] + ":" + i32ToStr(rcwCtxNarrow[top])
+}
+
+// The widened value returned by the function `fnIx` (from the node `at`): every call of the
+// function then carries it.
+function rcwReturnWrites(
+  fnIx: i32,
+  _at: i32,
+  covs: string[],
+  depth: i32,
+): boolean {
+  const key = "ret#" + i32ToStr(fnIx) + "#" + rcwKey(covs) + rcwCtxKey(fnIx)
+  const m = rcwMemoGet(key)
+  if m != 0 { return m == 2 }
+  if rcwSeenCut(key) { return false }
+  const cut0 = rcwCut
+  const sites: i32[] = []
+  const bad = rcwCallSites(fnIx, sites)
+  let res = false
+  if bad >= 0 {
+    res = rcwFound(bad)
+  } else {
+    let i = 0
+    while i < sites.length && !res {
+      res = rcwValueWrites(sites[i] / 2, covs, depth + 1)
+      i = i + 1
+    }
+    if res && sites.length > 1 && rcwVia == "" {
+      rcwVia = "the result of `" +
+        rcwFnLabel(fnIx) +
+        "`, whose calls all share what it returns"
+    }
+  }
+  rcwMemoPut(key, res, cut0)
+  res
+}
+
+// A function's name for a message: its declared name, the `const` a lambda is bound to, or
+// "a function literal".
+function rcwFnLabel(fnIx: i32): string {
+  const fd = P.nodes[fnIx]
+  if fd is FuncDecl {
+    if fd.fnName != "" { return demangleName(fd.fnName) }
+    if fnIx < cwIxUpKind.length && cwIxUpKind[fnIx] == CW_UP_LETINIT {
+      const ld = P.nodes[cwIxUp[fnIx]]
+      if ld is LetDecl { return ld.letName }
+    }
+  }
+  "a function literal"
+}
+
+// Every call that may reach the function `fnIx`, pushed as the call node times two plus 1 for a
+// method spelling (`recv.f(…)`, receiver at parameter 0). Answers -1, or the node of a use the
+// calls cannot be enumerated past: a lambda bound to nothing, or the function read as a value.
+function rcwCallSites(fnIx: i32, out: i32[]): i32 {
+  if fnIx < 0 || fnIx >= P.nodes.length { return fnIx }
+  const fd = P.nodes[fnIx]
+  if fd is FuncDecl {
+    let nm = fd.fnName
+    let fr = CW_FR_UNKNOWN
+    if nm == "" {
+      if fnIx >= cwIxUpKind.length || cwIxUpKind[fnIx] != CW_UP_LETINIT {
+        return fnIx
+      }
+      const ld = P.nodes[cwIxUp[fnIx]]
+      if ld is LetDecl {
+        nm = ld.letName
+        fr = cwFrameOfDecl(cwIxUp[fnIx])
+      } else {
+        return fnIx
+      }
+    }
+    const b1 = rcwNamedCallSites(nm, fnIx, fr, out)
+    if b1 >= 0 { return b1 }
+    const plain = demangleName(nm)
+    if plain != nm {
+      const b2 = rcwNamedCallSites(plain, fnIx, fr, out)
+      if b2 >= 0 { return b2 }
+    }
+    if fd.fnName != "" && rcwFirstParamIsSelf(fnIx) {
+      let r = cwIxChain(plain)
+      while r >= 0 {
+        if cwIxKind[r] == CW_OCC_MCALL {
+          const occ = cwIxNode[r]
+          const cn = P.nodes[occ]
+          if cn is Call {
+            const d = cwUfcsDeclOf(cn.callFn)
+            if d < 0 || d == fnIx { out.push(occ * 2 + 1) }
+          }
+        }
+        r = cwIxNext[r]
+      }
+    }
+    return -1
+  }
+  fnIx
+}
+
+// The calls spelled `nm(…)` that may reach `fnIx` (one resolving elsewhere is skipped, one
+// resolving nowhere kept), or the first read of the name that is not a call.
+function rcwNamedCallSites(nm: string, fnIx: i32, fr: i32, out: i32[]): i32 {
+  let r = cwIxChain(nm)
+  while r >= 0 {
+    const occ = cwIxNode[r]
+    if cwIxKind[r] == CW_OCC_CALL {
+      const cn = P.nodes[occ]
+      if cn is Call {
+        const d = cwCalleeDeclOf(cn.callFn)
+        if d < 0 || d == fnIx { out.push(occ * 2) }
+      }
+    } else if cwIxKind[r] == CW_OCC_USE && cwSameFrame(cwIxFr[r], fr) {
+      if occ >= cwIxUpKind.length || cwIxUpKind[occ] != CW_UP_CALLEE {
+        return occ
+      }
+    }
+    r = cwIxNext[r]
+  }
+  -1
+}
+
+// The slots of one question, as a memo key.
+function rcwKey(covs: string[]): string {
+  let s = ""
+  let i = 0
+  while i < covs.length {
+    s = s + covs[i] + ","
+    i = i + 1
+  }
+  s
+}
+
+// Can the binding `name` in frame `fr`, holding a value with the widened slots `covs`, be
+// written at one of them? Every read of the binding, a captured one included, is a handle.
+function rcwNameWrites(
+  name: string,
+  fr: i32,
+  covs: string[],
+  depth: i32,
+): boolean {
+  if covs.length == 0 { return false }
+  const key = name + "@" + i32ToStr(fr) + "#" + rcwKey(covs) + rcwCtxKey(fr)
+  const m = rcwMemoGet(key)
+  if m != 0 { return m == 2 }
+  if rcwSeenCut(key) { return false }
+  const cut0 = rcwCut
+  // A plain `const b = a` hands `b` exactly these slots; such aliases join a worklist rather
+  // than a recursion, so a long chain of them costs no stack.
+  const names: string[] = [name]
+  const frs: i32[] = [fr]
+  let res = false
+  let i = 0
+  while i < names.length && !res {
+    if i > 0 {
+      const ak = names[i] +
+        "@" +
+        i32ToStr(frs[i]) +
+        "#" +
+        rcwKey(covs) +
+        rcwCtxKey(frs[i])
+      const am = rcwMemoGet(ak)
+      if am == 2 { res = true }
+      if am != 0 || rcwSeen.has(ak) {
+        i = i + 1
+        continue
+      }
+      rcwSeen[ak] = true
+    }
+    let r = cwIxChain(names[i])
+    while r >= 0 && !res {
+      if cwIxKind[r] == CW_OCC_USE {
+        if cwSameFrame(cwIxFr[r], frs[i]) {
+          const u = cwIxNode[r]
+          const al = rcwPlainAlias(u)
+          if al >= 0 {
+            const ld = P.nodes[al]
+            if ld is LetDecl {
+              names.push(ld.letName)
+              frs.push(cwFrameOfDecl(al))
+            }
+          } else {
+            res = rcwValueWrites(u, covs, depth + 1)
+          }
+        }
+      }
+      r = cwIxNext[r]
+    }
+    i = i + 1
+  }
+  rcwMemoPut(key, res, cut0)
+  res
+}
+
+// The `LetDecl` the name use `u` initialises as its whole value (`const b = a`), or -1.
+function rcwPlainAlias(u: i32): i32 {
+  if u < 0 || u >= cwIxUpKind.length || cwIxUpKind[u] != CW_UP_LETINIT {
+    return -1
+  }
+  const up = cwIxUp[u]
+  if up < 0 || up >= P.nodes.length { return -1 }
+  if P.nodes[up] is LetDecl { return up }
+  -1
+}
+
+// The widened slots a delivery of `srcExpr` (typed `srcTy`) into `dstTy` shares with an
+// existing value: the slots a fresh literal owns are dropped.
+function rcwSharedCovs(srcExpr: i32, srcTy: i32, dstTy: i32): string[] {
+  const all: string[] = []
+  rcwCovs(srcTy, dstTy, "", all, 0)
+  const out: string[] = []
+  let i = 0
+  while i < all.length {
+    if !rcwSlotFresh(srcExpr, rcwPathOf(all[i]), 0, 0) { out.push(all[i]) }
+    i = i + 1
+  }
+  out
+}
+
+// Make the occurrence index current for this arena, as `covarValueWriteState` does.
+function rcwIndexReady() {
+  if P.nodes.length != cwArenaLen {
+    cwRootNames = []
+    cwRootFrames = []
+    cwAnswers = []
+    cwSplits = []
+    cwFrameReset()
+    cwArenaLen = P.nodes.length
+    rcwMemo = Map()
+  }
+  cwIxBuild()
+  0
+}
+
+// The delivery nodes already refused, so a delivery the checker visits twice is reported once.
+let rcwReported: i32[] = []
+
+// Deliveries recorded while checking and decided once every body is checked, so a write's
+// value type is known whichever of caller and callee the file declares first. Keyed on
+// (source node, destination type) so a re-checked delivery is asked once.
+let rcwPendSrc: i32[] = []
+let rcwPendSrcTy: i32[] = []
+let rcwPendDstTy: i32[] = []
+let rcwPendSeen: {[string]: boolean} = Map()
+// Bounded-call deliveries, likewise deferred: the callee, its type parameter, the argument's
+// concrete type, the widened slots (`rcwKey` form) and the call.
+let rcwBdDecl: i32[] = []
+let rcwBdTp: string[] = []
+let rcwBdConc: i32[] = []
+let rcwBdCovs: string[] = []
+let rcwBdCall: i32[] = []
+
+// Record a delivery of `srcExpr` (typed `srcTy`) into `dstTy` when it widens a shared slot.
+function rcwPend(srcExpr: i32, srcTy: i32, dstTy: i32) {
+  if srcExpr < 0 || srcTy < 0 || dstTy < 0 || srcTy == dstTy { return 0 }
+  const key = i32ToStr(srcExpr) + "#" + i32ToStr(dstTy)
+  if rcwPendSeen.has(key) { return 0 }
+  rcwPendSeen[key] = true
+  if rcwSharedCovs(srcExpr, srcTy, dstTy).length == 0 { return 0 }
+  rcwPendSrc.push(srcExpr)
+  rcwPendSrcTy.push(srcTy)
+  rcwPendDstTy.push(dstTy)
+  0
+}
+
+// Decide every recorded delivery, after adding the ones no assignment check sees: a narrower
+// operand of a join — a list literal's element, an `if` value's arm, a `??` operand, a return
+// of a function whose result type is inferred — is delivered into the joined type.
+function rcwRunPending() {
+  rcwIndexReady()
+  rcwPendJoins()
+  let i = 0
+  while i < rcwPendSrc.length {
+    if rcwDeliveryWrites(rcwPendSrc[i], rcwPendSrcTy[i], rcwPendDstTy[i]) {
+      rcwErr(rcwPendSrc[i], rcwPendSrcTy[i], rcwPendDstTy[i])
+    }
+    i = i + 1
+  }
+  let b = 0
+  while b < rcwBdDecl.length {
+    rcwBoundDeliveries(
+      rcwBdDecl[b],
+      rcwBdTp[b],
+      rcwBdConc[b],
+      weSplit(rcwBdCovs[b]),
+      rcwBdCall[b],
+    )
+    b = b + 1
+  }
+  0
+}
+
+// Record a join operand `op` delivered into the joined type `j`, when it is assignable there.
+function rcwPendJoinOperand(op: i32, j: i32) {
+  const p = cwPeel(op)
+  if p < 0 || j < 0 || j >= T.tys.length { return 0 }
+  const t = nodeTyOf(p)
+  if t < 0 || t == j || tyEq(t, j) { return 0 }
+  if !assignable(t, j) { return 0 }
+  rcwPend(p, t, j)
+}
+
+// Walk the join sites the occurrence index collected.
+function rcwPendJoins() {
+  let i = 0
+  while i < cwIxJoins.length {
+    const at = cwIxJoins[i]
+    const n = P.nodes[at]
+    const jt = nodeTyOf(at)
+    if n is ArrayLit {
+      if jt >= 0 && jt < T.tys.length {
+        const at2 = T.tys[jt]
+        if at2 is TyArray {
+          let e = 0
+          while e < n.arrElems.length {
+            if !(P.nodes[n.arrElems[e]] is Spread) {
+              rcwPendJoinOperand(n.arrElems[e], at2.aElem)
+            }
+            e = e + 1
+          }
+        }
+      }
+    } else if n is IfStmt {
+      if jt >= 0 {
+        rcwPendJoinOperand(rcwBlockTail(n.ifThen), jt)
+        if n.ifElse >= 0 && n.ifElse < P.nodes.length {
+          if P.nodes[n.ifElse] is IfStmt {
+            rcwPendJoinOperand(n.ifElse, jt)
+          } else {
+            rcwPendJoinOperand(rcwBlockTail(n.ifElse), jt)
+          }
+        }
+      }
+    } else if n is BinExpr {
+      if jt >= 0 {
+        rcwPendJoinOperand(n.binLeft, jt)
+        rcwPendJoinOperand(n.binRight, jt)
+      }
+    } else if n is FuncDecl {
+      if n.fnRet < 0 {
+        const tail = cwFnTailStmt(at)
+        if (
+          tail >= 0 &&
+          tail < cwIxUpKind.length &&
+          cwIxUpKind[tail] == CW_UP_TAIL
+        ) {
+          rcwPendJoinOperand(tail, rcwInferredRetTy(at))
+        }
+      }
+    }
+    i = i + 1
+  }
+  let r = 0
+  while r < cwIxRets.length {
+    const ri = cwIxRets[r]
+    const rn = P.nodes[ri]
+    if rn is RetStmt {
+      if rn.retArg >= 0 && ri < cwFrameOf.length {
+        const f = cwFrameOf[ri]
+        if f >= 0 && f < P.nodes.length {
+          const fd = P.nodes[f]
+          if fd is FuncDecl {
+            if fd.fnRet < 0 {
+              rcwPendJoinOperand(rn.retArg, rcwInferredRetTy(f))
+            }
+          }
+        }
+      }
+    }
+    r = r + 1
+  }
+  0
+}
+
+// The inferred result type of the function `fnIx`: its recorded type, or its name's binding.
+function rcwInferredRetTy(fnIx: i32): i32 {
+  const fd = P.nodes[fnIx]
+  let ft = nodeTyOf(fnIx)
+  if ft < 0 || ft >= T.tys.length || !(T.tys[ft] is TyFunc) {
+    ft = -1
+    if fd is FuncDecl {
+      if fd.fnName != "" { ft = lookup(fd.fnName) }
+    }
+  }
+  if ft < 0 || ft >= T.tys.length { return -1 }
+  const t = T.tys[ft]
+  if t is TyFunc { return t.fnRet }
+  -1
+}
+
+// The delivery seam: `srcExpr` reaching a `dstTy` wider in some field. True when a handle the
+// delivery creates may write a widened slot the source shares; `rcwWhy` then names the node.
+function rcwDeliveryWrites(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
+  if srcExpr < 0 || srcTy < 0 || dstTy < 0 || srcTy == dstTy { return false }
+  const covs = rcwSharedCovs(srcExpr, srcTy, dstTy)
+  if covs.length == 0 { return false }
+  rcwIndexReady()
+  rcwWhy = -1
+  rcwWhyKind = RCW_OPAQUE
+  rcwSeen = Map()
+  rcwOpen = 0
+  rcwVia = ""
+  rcwCtxFn = []
+  rcwCtxTv = []
+  rcwCtxNarrow = []
+  rcwValueWrites(srcExpr, covs, 0)
+}
+
+// The same question for a handle that is a parameter rather than an expression: the
+// parameter `paramIx` of `d` receiving `srcExpr` under a bound whose field is wider.
+function rcwParamDeliveryWrites(
+  srcExpr: i32,
+  covs0: string[],
+  d: i32,
+  paramIx: i32,
+): boolean {
+  const covs: string[] = []
+  let i = 0
+  while i < covs0.length {
+    if !rcwSlotFresh(srcExpr, rcwPathOf(covs0[i]), 0, 0) { covs.push(covs0[i]) }
+    i = i + 1
+  }
+  if covs.length == 0 { return false }
+  rcwIndexReady()
+  rcwWhy = -1
+  rcwWhyKind = RCW_OPAQUE
+  rcwSeen = Map()
+  rcwOpen = 0
+  rcwVia = ""
+  rcwCtxFn = []
+  rcwCtxTv = []
+  rcwCtxNarrow = []
+  rcwParamWrites(d, paramIx, covs, 0)
+}
+
+// The refusal, at the delivery, naming the write — or the place the analysis could not follow.
+function rcwErr(srcExpr: i32, srcTy: i32, dstTy: i32) {
+  if nameInI32(rcwReported, srcExpr) { return 0 }
+  rcwReported.push(srcExpr)
+  tErr(
+    "a " +
+      tyToStr(srcTy) +
+      " cannot be delivered as " +
+      tyToStr(dstTy) +
+      " here: " +
+      rcwWhat(srcExpr, "a widened field") +
+      ". A record is shared, not copied, so a wider value stored through the " +
+      tyToStr(dstTy) +
+      " would sit in the " +
+      tyToStr(srcTy) +
+      " it came from. " +
+      rcwFixHint(dstTy),
+    srcExpr,
+  )
+  0
+}
+
+// What to do instead: declare the source at the destination's type, when that type can be
+// written (it names no type variable), else pass a copy or drop the write.
+function rcwFixHint(dstTy: i32): string {
+  if tyHasTyVar(dstTy) { return "Pass a fresh copy, or drop the write" }
+  "Declare the source as " +
+    tyToStr(dstTy) +
+    ", pass a fresh copy, or drop the write"
+}
+
+// The clause naming why the delivery at `src` is refused, from `rcwWhy` and its kind; `slot`
+// is how a write's target is spoken of.
+function rcwWhat(src: i32, slot: string): string {
+  const w = rcwWhy
+  if w < 0 || w >= P.nodes.length {
+    return "a handle to it reaches a place this check cannot follow"
+  }
+  const where = rcwWhere(w, src)
+  const wn = P.nodes[w]
+  if rcwWhyKind == RCW_WRITE {
+    let via = ""
+    if rcwVia != "" { via = ", reached through " + rcwVia }
+    if wn is Call {
+      return "the call to " +
+        rcwCalleeText(w) +
+        " on " +
+        where +
+        " writes " +
+        slot +
+        via
+    }
+    return "the assignment on " + where + " writes " + slot + via
+  }
+  if rcwWhyKind == RCW_CALLEE {
+    return "it reaches the call to " +
+      rcwCalleeText(w) +
+      " on " +
+      where +
+      ", a function value this check cannot see the body of"
+  }
+  if rcwWhyKind == RCW_DEPTH {
+    return "it is handed on through more steps than this check follows (a depth limit), at " +
+      where
+  }
+  "a handle to it reaches " +
+    rcwExprText(w, 0) +
+    " on " +
+    where +
+    ", which this check cannot follow"
+}
+
+// `line N`, with the file named when the node is in a different module from `src`.
+function rcwWhere(at: i32, src: i32): string {
+  const ln = "line " + i32ToStr(nodeLineOf(at))
+  const m = rcwModOf(at)
+  if m >= 0 && m != rcwModOf(src) {
+    const f = srcmapPathOf(m)
+    if f != "" { return ln + " of " + f }
+  }
+  ln
+}
+
+// The module a node's anchor token belongs to, or -1.
+function rcwModOf(at: i32): i32 {
+  if at < 0 || at >= nodeToks.length { return -1 }
+  const tk = nodeToks[at]
+  if tk < 0 { return -1 }
+  srcmapModOfTok(tk)
+}
+
+// A call's callee as the source spells it, in backticks.
+function rcwCalleeText(callIx: i32): string {
+  const cn = P.nodes[callIx]
+  if cn is Call { return "`" + rcwExprText(cn.callFn, 0) + "`" }
+  "a call"
+}
+
+// A short rendering of an expression for a message: names, member reads, calls and indexes.
+function rcwExprText(ix: i32, depth: i32): string {
+  const p = cwPeel(ix)
+  if p < 0 || p >= P.nodes.length || depth > 6 { return "an expression" }
+  const n = P.nodes[p]
+  if n is Ident { return demangleName(n.identName) }
+  if n is Member {
+    return rcwExprText(n.memObj, depth + 1) + "." + demangleName(n.memProp)
+  }
+  if n is Index { return rcwExprText(n.idxArr, depth + 1) + "[…]" }
+  if n is Call { return rcwExprText(n.callFn, depth + 1) + "(…)" }
+  if n is FuncDecl { return "a function literal" }
+  "an expression"
+}
+
+// A bounded call `f<G: {x: i32 | string}>(t: G)` given a `{x: i32}`: every parameter typed
+// `G` (or `G[]`) is a handle on the argument at the bound's wider field types. A parameter
+// spelling `G` any other way is not followed, and refuses.
+function rcwBoundDeliveries(
+  declIx: i32,
+  tpName: string,
+  conc: i32,
+  covs: string[],
+  callIx: i32,
+) {
+  const fd = P.nodes[declIx]
+  const cn = P.nodes[callIx]
+  if fd is FuncDecl {
+    if cn is Call {
+      let i = 0
+      while i < fd.fnParams.length {
+        const pn = P.nodes[fd.fnParams[i]]
+        if pn is Param {
+          const spelled = rcwParamSpellsTp(pn.parType, tpName)
+          if spelled != 0 {
+            let arg = callIx
+            if i < cn.callArgs.length && !cwCallNamed(cn.callArgNames) {
+              arg = cn.callArgs[i]
+            }
+            let pc = covs
+            if spelled == 2 { pc = rcwPrefix("[]", covs, true) }
+            let writes = true
+            rcwWhy = -1
+            rcwWhyKind = RCW_OPAQUE
+            if spelled != 3 && arg != callIx {
+              writes = rcwParamDeliveryWrites(arg, pc, declIx, i)
+            }
+            if writes { rcwBoundErr(arg, conc) }
+          }
+        }
+        i = i + 1
+      }
+    }
+  }
+  0
+}
+
+// How the parameter annotation `ann` spells the type parameter `tp`: 0 not at all, 1 as `tp`,
+// 2 as `tp[]`, 3 inside some other type this does not follow.
+function rcwParamSpellsTp(ann: i32, tp: string): i32 {
+  if ann < 0 || ann >= P.nodes.length { return 0 }
+  const a = P.nodes[ann]
+  if a is TypeRef {
+    if a.tyName == tp { return 1 }
+    if a.tyName == tp + "[]" { return 2 }
+    if rcwNameMentions(a.tyName, tp) { return 3 }
+  }
+  0
+}
+
+// Whether the type spelling `s` names `tp` as a whole word.
+function rcwNameMentions(s: string, tp: string): boolean {
+  let i = 0
+  while i + tp.length <= s.length {
+    if s.slice(i, i + tp.length) == tp {
+      const before = i == 0 || !isIdentCharCode(s[i - 1])
+      const after = i + tp.length == s.length ||
+        !isIdentCharCode(s[i + tp.length])
+      if before && after { return true }
+    }
+    i = i + 1
+  }
+  false
+}
+
+function isIdentCharCode(c: i32): boolean {
+  (c >= 'a' && c <= 'z') ||
+    (c >= 'A' && c <= 'Z') ||
+    (c >= '0' && c <= '9') ||
+    c == '_'
+}
+
+// The bound spelling of the refusal.
+function rcwBoundErr(arg: i32, conc: i32) {
+  if nameInI32(rcwReported, arg) { return 0 }
+  rcwReported.push(arg)
+  tErr(
+    "a " +
+      tyToStr(conc) +
+      " cannot be bound here to a type parameter whose bound declares a wider field: " +
+      rcwWhat(arg, "a field the bound widens") +
+      ". A record is shared, not copied, so a wider value stored through the bound's type " +
+      "would sit in the " +
+      tyToStr(conc) +
+      " it came from. Declare the argument with the bound's field types, pass a fresh copy, " +
+      "or drop the write",
+    arg,
+  )
+  0
+}
+
+function nameInI32(xs: i32[], x: i32): boolean {
+  let i = 0
+  while i < xs.length {
+    if xs[i] == x { return true }
+    i = i + 1
+  }
+  false
 }
 
 // Does reaching `dst` from `src` need an object-shape adapter that codegen does not have?
@@ -22680,6 +24820,7 @@ function checkBoundsAtCall(
           tpEnvNames.pop()
           tpEnvTys.pop()
           const tyKey = tyToStr(conc)
+          const bCovs: string[] = []
           let m = 0
           while m < bn.length {
             let wit = ""
@@ -22698,7 +24839,10 @@ function checkBoundsAtCall(
               if ct is TyObj {
                 const ft = objFieldType(ct, bn[m])
                 if ft >= 0 {
-                  if assignable(ft, bt[m]) { wit = "field" }
+                  if assignable(ft, bt[m]) {
+                    wit = "field"
+                    rcwCovs(ft, bt[m], "." + bn[m], bCovs, 0)
+                  }
                 }
               }
             }
@@ -22752,6 +24896,15 @@ function checkBoundsAtCall(
               cohRecord(who, tyKey, bn[m], wit, ix)
             }
             m = m + 1
+          }
+          // D2060 — a colon member wider than the argument's field is the covariant delivery
+          // of a record, and the body writes through the bound's type.
+          if bCovs.length > 0 && !inferQuiet {
+            rcwBdDecl.push(declIx)
+            rcwBdTp.push(tpName)
+            rcwBdConc.push(conc)
+            rcwBdCovs.push(rcwKey(bCovs))
+            rcwBdCall.push(ix)
           }
         }
       }
@@ -23303,6 +25456,12 @@ function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
     }
     if args.length < uRequired || args.length + 1 > params.length { return -1 }
     if !assignable(recvTy, params[0]) { return -1 }
+    // D2060 — the receiver is delivered to `self` like an argument, so a wider `self` field
+    // the body writes is refused here as it is at the argument seam.
+    const rcwRecv = P.nodes[n.callFn]
+    if rcwRecv is Member {
+      if !inferQuiet { rcwPend(rcwRecv.memObj, recvTy, params[0]) }
+    }
     // The vacuous half of that gate, deferred: `assignable` answers true for a `TyVar` on
     // either side, so this row makes a hole receiver's pass mean something once resolved (see `ufcsCstrTy`'s header).
     noteUfcsCstr(recvTy, plainName, ix, params[0])
@@ -30842,6 +33001,7 @@ export function checkProgram(rootIx: i32) {
   }
   checkProgramEndOpDecls()
   recordTopScalars()
+  rcwRunPending()
   checkProgramEndGetters()
   T.diags.length
 }
