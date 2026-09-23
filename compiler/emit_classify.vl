@@ -6706,6 +6706,48 @@ export function callIsMemberPopKind(callIx: i32, fnIx: i32, kind: PushKind) {
   (callPopBits(callIx, fnIx) & pushKindBit(kind)) != 0
 }
 
+// True when the value `if` at `ix` meets an atom destination arm by arm: each arm's value is
+// narrowed where it is produced, so no arm is widened to a string and narrowed back, and the
+// join itself is never staged. An else-less `if` is a nullable value and is not a member.
+export function ifJoinNarrowsPerArm(ix: i32): boolean {
+  if ix < 0 { return false }
+  const n = P.nodes[ix]
+  if n is IfStmt { return n.ifElse >= 0 }
+  false
+}
+
+// True when the value `if` at `ix` records a registered literal-union type, so it is an atom
+// whatever its arms' own reps are: every arm is lowered in the atom context, and a binding of
+// it takes the atom slot its type names (D2206). Asked by member set, as a binding's rep is: a
+// join mints a fresh index even when its set is a declared alias's (D2208).
+export function ifJoinTypedAtom(ix: i32): boolean {
+  if !ifJoinNarrowsPerArm(ix) { return false }
+  litUnionAliasNameOfTy(nodeTyIxOf(ix)) != ""
+}
+
+// The pop and staging bits of every arm VALUE of the `if` chain at `ifIx`. The block walk asks
+// only of statement kinds that can hold a `.push`, and an arm's tail value can be any expression
+// that meets the join's destination (D2199).
+function ifChainArmValueBits(ifIx: i32, fnIx: i32) {
+  let bits = 0
+  let cur = ifIx
+  while cur >= 0 {
+    const s = P.nodes[cur]
+    cur = -1
+    if s is IfStmt {
+      bits = bits | exprPopBits(ifArmValueExpr(s.ifThen), fnIx)
+      if s.ifElse >= 0 {
+        if P.nodes[s.ifElse] is IfStmt {
+          cur = s.ifElse
+        } else {
+          bits = bits | exprPopBits(ifArmValueExpr(s.ifElse), fnIx)
+        }
+      }
+    }
+  }
+  bits
+}
+
 // Bit 256 at a value position: does the expression at `ix` itself need the atom-narrow staging
 // slot? The sibling of `pushStagesAtomNarrow`, one destination set wider — that one asks of a
 // `.push` argument, where the members come from the destination, this of any value reaching
@@ -6716,6 +6758,8 @@ function exprStagesAtomNarrow(exprIx: i32, _fnIx: i32): boolean {
   const a = P.nodes[ax]
   // A member string literal lowers as its interned id with no tower at all.
   if a is StrLit { return false }
+  // A join hands the atom destination to each arm, which the descent below asks about.
+  if ifJoinNarrowsPerArm(ax) { return false }
   // A re-readable place takes the re-reading tower, which needs no slot.
   if unionEqOperandOk(exprIx) { return false }
   // A value whose recorded type is a registered litunion alias is already the atom — no
@@ -6772,7 +6816,9 @@ function exprPopBitsGo(exprIx: i32, fnIx: i32) {
   if e is Paren { return exprPopBits(e.parInner, fnIx) }
   // An if-EXPRESSION's arms are value positions too: `if c { xs.push(1) } else { 0 }` runs
   // the grow sequence inside the arm and needs the frame reserved (D1992).
-  if e is IfStmt { return ifChainPushPopBits(exprIx, fnIx) }
+  if e is IfStmt {
+    return ifChainPushPopBits(exprIx, fnIx) | ifChainArmValueBits(exprIx, fnIx)
+  }
   // The four remaining value positions, taught from this file's own sibling walker
   // `exprHasMapOp`. `emitExpr` lowers all four into `emitPop` and `emitPopOr`, which test no
   // `fnUses*Push` flag, so a `.pop()` in an array-literal element, an object-literal field
@@ -18193,6 +18239,9 @@ function globalCellKindGo(letIx: i32): VKind {
     }
     // No annotation: a const literal init types itself; a non-const un-annotated init is
     // out of scope (no annotation to derive from) and `globalKind` returns its best guess.
+    // An atom init is the i32 atom cell, the answer `bindingIsLitAtom` gives every read of
+    // it; `globalKind` reads the init's rendered type and can call a join a string (D2206).
+    if letInitIsLitAtom(letIx, -1) { return "i32" }
     // An empty `[]` whose PUSHES infer a string element is the string list (kind 7).
     if letInfStrListByUse(letIx) { return "strlist" }
     // The two nullable cells the un-annotated arm lacked: `const g = mk()` with a
@@ -23414,9 +23463,11 @@ export function exprIsLitAtom(exprIx: i32, fnIx: i32) {
   }
   if e is IfStmt {
     // A value if-expression joining two atoms yields an atom, since the join rep is the
-    // bare i32 id. Both arms must be atoms; a mixed atom/string join types `string` instead,
-    // widening at the string-join seam, so it deliberately does not classify here.
+    // bare i32 id. A mixed atom/string join is an atom too when the checker recorded a
+    // registered literal union for it, which is the atom rep (`ifJoinTypedAtom`); otherwise it
+    // types `string` and widens at the string-join seam, so it does not classify here.
     if e.ifElse < 0 { return false }
+    if ifJoinTypedAtom(unwrapParen(exprIx)) { return true }
     const tv = ifArmValueExpr(e.ifThen)
     if tv >= 0 {
       if exprIsLitAtom(tv, fnIx) {

@@ -674,6 +674,8 @@ import {
   ifExprRefKind,
   ifExprRefSlot,
   ifExprValtype,
+  ifJoinNarrowsPerArm,
+  ifJoinTypedAtom,
   indexElemUnionName,
   indexPlaceNonNull,
   inferredRetMapSlot,
@@ -4545,7 +4547,7 @@ function emitUnionIfValueLink(
     // null is the null-tagged box — the same value `emitNulNullToLocal` writes for the binding
     // sink's rep 0, built here on the stack instead of into a slot.
     const noElse = s.ifElse < 0
-    if emitExpr(body, s.ifCond, fnIx) < 0 { return -1 }
+    if emitCondExpr(body, s.ifCond, fnIx) < 0 { return -1 }
     fbOpenIf()             // 0x04 if
     fbValtype("union", -1) // result blocktype: the union box `(ref $uBox)`
     const savedTop = narrowTop
@@ -4764,7 +4766,7 @@ function emitVariantIfValueLink(
     // is `ref.null $uVarHeap[vi]`, so the blocktype goes nullable with it (`fbRefNullOfKind` is
     // `fbValtypeNullable`'s value twin).
     const noElse = s.ifElse < 0
-    if emitExpr(body, s.ifCond, fnIx) < 0 { return -1 }
+    if emitCondExpr(body, s.ifCond, fnIx) < 0 { return -1 }
     fbOpenIf() // 0x04 if
     if noElse {
       fbValtypeNullable("variant", vi) // `(ref null $(uVarHeap[vi]))`
@@ -12646,7 +12648,12 @@ export function emitExpr(body: u8[], exprIx: i32, fnIx: i32) {
       return emitStaticLitAtom(body, exprIx, wideLex, fnIx)
     }
     if strReppedLitUnionAt(exprIx, fnIx) {
-      return emitStrToAtom(body, unwrapParen(exprIx), fnIx)
+      // A join whose arms disagree about their rep takes the destination into each arm,
+      // under the same context, rather than joining as a string to narrow back (D2199).
+      if ifJoinNarrowsPerArm(wideIx) {
+        return emitIfExprAs(body, wideIx, fnIx, 127)
+      }
+      return emitStrToAtom(body, wideIx, fnIx)
     }
   }
   const e = P.nodes[exprIx]
@@ -12719,11 +12726,29 @@ export function emitExpr(body: u8[], exprIx: i32, fnIx: i32) {
   emitFailAt("emitProgram: unsupported expression", exprIx)
 }
 
+// A condition or a switch scrutinee: never a destination, so it is lowered outside any atom
+// context its `if` value is emitted under, where a string literal in it would become an id.
+function emitCondExpr(body: u8[], ix: i32, fnIx: i32) {
+  const savedLU = pendingLitUnion
+  pendingLitUnion = 0
+  const rc = emitExpr(body, ix, fnIx)
+  pendingLitUnion = savedLU
+  rc
+}
+
 // Lower an if-expression (`if c then a else b` in value position) onto `body`: cond,
 // `if (result <kind>)`, the then-arm value, else the else-arm value (an `else if` chain
 // recurses). Both arms are coerced to the branch-join's scalar rep (a mixed `then 1 else
 // 2.5` widens to f64); a ref-typed join (string/struct/array) routes to `emitIfExprRef` instead, for the multi-byte `(ref $ht)` blocktype a single numeric byte cannot spell.
 function emitIfExpr(body: u8[], ifIx: i32, fnIx: i32) {
+  // An atom join lowers every arm in the atom context, whatever rep the arm has alone (D2206).
+  if ifJoinTypedAtom(ifIx) {
+    const savedLU = pendingLitUnion
+    pendingLitUnion = 1
+    const rcA = emitIfExprAs(body, ifIx, fnIx, 127)
+    pendingLitUnion = savedLU
+    return rcA
+  }
   const rk = ifExprRefKind(ifIx, fnIx)
   if rk != null {
     return emitIfExprRef(body, ifIx, fnIx, rk, ifExprRefSlot(ifIx, fnIx, rk))
@@ -12781,7 +12806,7 @@ function emitIfExprRefLink(
     // used as a value"): the false path yields `null`, so the join is nullable and the
     // missing arm is the rep's own null. The blocktype below and the else arm at the bottom are that one fact, twice.
     const noElse = s.ifElse < 0
-    if emitExpr(body, s.ifCond, fnIx) < 0 { return -1 }
+    if emitCondExpr(body, s.ifCond, fnIx) < 0 { return -1 }
     fbOpenIf() // 0x04 if
     // A join the checker typed `T | null` (one arm `null`, or absent) needs a nullable
     // blocktype, else that arm's `(ref null $ht)` mismatches the non-null result.
@@ -12845,11 +12870,19 @@ function emitIfArmOpen(body: u8[], blockIx: i32, fnIx: i32) {
         )
       }
     }
+    // The prelude delivers nothing to the arm's destination, so it runs outside the atom
+    // context the arm's value may be emitted under (D2199).
+    const savedLU = pendingLitUnion
+    pendingLitUnion = 0
     let i = 0
     while i + 1 < stmts.length {
-      if emitStmt(body, stmts[i], fnIx) < 0 { return -1 }
+      if emitStmt(body, stmts[i], fnIx) < 0 {
+        pendingLitUnion = savedLU
+        return -1
+      }
       i = i + 1
     }
+    pendingLitUnion = savedLU
   }
   0
 }
@@ -12994,7 +13027,7 @@ function emitIfExprAsLink(
         return emitFail("emitProgram: if-expression requires an else arm")
       }
     }
-    if emitExpr(body, s.ifCond, fnIx) < 0 { return -1 }
+    if emitCondExpr(body, s.ifCond, fnIx) < 0 { return -1 }
     fbIf(kind) // 0x04 if, <kind> result blocktype
     const savedTop = narrowTop
     const narrowed = setNarrowFromCond(s.ifCond, fnIx)
@@ -13042,6 +13075,15 @@ function emitIfExprAsLink(
 // as an expression COERCED to the if-expression's result rep `kind` (so an i32-literal
 // arm widens into an f64/f32/i64 join). The i32 default emits the value as-is.
 function emitBlockValueAs(body: u8[], blockIx: i32, fnIx: i32, kind: i32) {
+  // An arm's value may clear the atom context (a `??` does), and the next arm must still
+  // see it, so each arm hands the context back as it found it (D2199).
+  const savedLU = pendingLitUnion
+  const rc = emitBlockValueAsGo(body, blockIx, fnIx, kind)
+  pendingLitUnion = savedLU
+  rc
+}
+
+function emitBlockValueAsGo(body: u8[], blockIx: i32, fnIx: i32, kind: i32) {
   const b = P.nodes[blockIx]
   if b is Block {
     const tv = ifArmValueExpr(blockIx)
@@ -13181,7 +13223,7 @@ function emitNullableIfBindingLink(
 ) {
   const s = P.nodes[unwrapParen(ifIx)]
   if s is IfStmt {
-    if emitExpr(body, s.ifCond, fnIx) < 0 { return -1 }
+    if emitCondExpr(body, s.ifCond, fnIx) < 0 { return -1 }
     fbIf(64) // 0x04 if, 0x40 void blocktype
     const savedTop = narrowTop
     const narrowed = setNarrowFromCond(s.ifCond, fnIx)
@@ -13334,7 +13376,7 @@ function emitUnionIfBindingSinkLink(
 ) {
   const s = P.nodes[unwrapParen(ifIx)]
   if s is IfStmt {
-    if emitExpr(body, s.ifCond, fnIx) < 0 { return -1 }
+    if emitCondExpr(body, s.ifCond, fnIx) < 0 { return -1 }
     fbIf(64) // 0x04 if, 0x40 void blocktype
     const savedTop = narrowTop
     const narrowed = setNarrowFromCond(s.ifCond, fnIx)
@@ -18846,7 +18888,7 @@ function emitUnionRetIfSinkLink(body: u8[], ifIx: i32, fnIx: i32, open: i32[]) {
     if s.ifElse < 0 {
       return emitFail("emitProgram: union if-expression requires an else arm")
     }
-    if emitExpr(body, s.ifCond, fnIx) < 0 { return -1 }
+    if emitCondExpr(body, s.ifCond, fnIx) < 0 { return -1 }
     fbIf(64) // 0x04 if, 0x40 void blocktype
     const savedTop = narrowTop
     const narrowed = setNarrowFromCond(s.ifCond, fnIx)
@@ -19866,7 +19908,7 @@ function emitIntSwitch(
     fbBlock(64)
     k = k + 1
   }
-  if emitExpr(body, scrutIx, fnIx) < 0 { return -1 }
+  if emitCondExpr(body, scrutIx, fnIx) < 0 { return -1 }
   if w == 2 {
     // An i64 index `d = s - lo` is in range iff `d <u span + 1`; out of range selects the
     // default slot `span + 1`, so no 64-bit value can wrap onto a case.
@@ -19874,7 +19916,7 @@ function emitIntSwitch(
     fbI32Bin(125) // 0x7d i64.sub
     fbI32WrapI64()
     fbI32Const(span + 1)
-    if emitExpr(body, scrutIx, fnIx) < 0 { return -1 }
+    if emitCondExpr(body, scrutIx, fnIx) < 0 { return -1 }
     fbI64Const(lo >> 31, lo)
     fbI32Bin(125) // 0x7d i64.sub
     fbI64Const(0, span + 1)
@@ -19975,7 +20017,7 @@ function emitIfLinkStmt(body: u8[], s: IfStmt, fnIx: i32, open: i32[]) {
   // provably unreachable in this instance and is emitted empty instead (D932) — read
   // off the emitted condition itself (`emittedCondConst`), not a parallel predicate.
   const condStart = wLen()
-  if emitExpr(body, s.ifCond, fnIx) < 0 { return -1 }
+  if emitCondExpr(body, s.ifCond, fnIx) < 0 { return -1 }
   let staticGuard = -1
   const condN = P.nodes[unwrapParen(s.ifCond)]
   if condN is IsExpr { staticGuard = emittedCondConst(condStart) }
@@ -20882,7 +20924,7 @@ function emitIfLinkTail(body: u8[], s: IfStmt, fnIx: i32, open: i32[]) {
   // is the same defect one position over: `function f(v) { if v is string { "\"" + v }
   // else { "o" } }` emitted the statically-false arm's narrowed use in the i32 instance.
   const condStart = wLen()
-  if emitExpr(body, s.ifCond, fnIx) < 0 { return -1 }
+  if emitCondExpr(body, s.ifCond, fnIx) < 0 { return -1 }
   let staticGuard = -1
   const condN = P.nodes[unwrapParen(s.ifCond)]
   if condN is IsExpr { staticGuard = emittedCondConst(condStart) }
