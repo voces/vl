@@ -674,6 +674,8 @@ import {
   ifExprRefKind,
   ifExprRefSlot,
   ifExprValtype,
+  ifJoinNarrowsPerArm,
+  ifJoinTypedAtom,
   indexElemUnionName,
   indexPlaceNonNull,
   inferredRetMapSlot,
@@ -12646,7 +12648,12 @@ export function emitExpr(body: u8[], exprIx: i32, fnIx: i32) {
       return emitStaticLitAtom(body, exprIx, wideLex, fnIx)
     }
     if strReppedLitUnionAt(exprIx, fnIx) {
-      return emitStrToAtom(body, unwrapParen(exprIx), fnIx)
+      // A join whose arms disagree about their rep takes the destination into each arm,
+      // under the same context, rather than joining as a string to narrow back (D2199).
+      if ifJoinNarrowsPerArm(wideIx) {
+        return emitIfExprAs(body, wideIx, fnIx, 127)
+      }
+      return emitStrToAtom(body, wideIx, fnIx)
     }
   }
   const e = P.nodes[exprIx]
@@ -12724,6 +12731,14 @@ export function emitExpr(body: u8[], exprIx: i32, fnIx: i32) {
 // recurses). Both arms are coerced to the branch-join's scalar rep (a mixed `then 1 else
 // 2.5` widens to f64); a ref-typed join (string/struct/array) routes to `emitIfExprRef` instead, for the multi-byte `(ref $ht)` blocktype a single numeric byte cannot spell.
 function emitIfExpr(body: u8[], ifIx: i32, fnIx: i32) {
+  // An atom join lowers every arm in the atom context, whatever rep the arm has alone (D2206).
+  if ifJoinTypedAtom(ifIx) {
+    const savedLU = pendingLitUnion
+    pendingLitUnion = 1
+    const rcA = emitIfExprAs(body, ifIx, fnIx, 127)
+    pendingLitUnion = savedLU
+    return rcA
+  }
   const rk = ifExprRefKind(ifIx, fnIx)
   if rk != null {
     return emitIfExprRef(body, ifIx, fnIx, rk, ifExprRefSlot(ifIx, fnIx, rk))
@@ -12845,11 +12860,19 @@ function emitIfArmOpen(body: u8[], blockIx: i32, fnIx: i32) {
         )
       }
     }
+    // The prelude delivers nothing to the arm's destination, so it runs outside the atom
+    // context the arm's value may be emitted under (D2199).
+    const savedLU = pendingLitUnion
+    pendingLitUnion = 0
     let i = 0
     while i + 1 < stmts.length {
-      if emitStmt(body, stmts[i], fnIx) < 0 { return -1 }
+      if emitStmt(body, stmts[i], fnIx) < 0 {
+        pendingLitUnion = savedLU
+        return -1
+      }
       i = i + 1
     }
+    pendingLitUnion = savedLU
   }
   0
 }
