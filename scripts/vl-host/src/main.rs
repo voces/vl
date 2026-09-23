@@ -3373,7 +3373,7 @@ fn run_program_with(
 }
 
 // ── the host floor (`std:fs`, `std:args`, `std:process`, `std:env`) ──────────
-// Fifteen host imports. Unlike the print family they are OPTIONAL: the emitter declares
+// Seventeen host imports. Unlike the print family they are OPTIONAL: the emitter declares
 // only the ones the program calls, so this side registers only what the module asks
 // for and a file-free program's instantiation is byte-for-byte the work it was before.
 //
@@ -3650,6 +3650,50 @@ fn child_code(status: std::process::ExitStatus) -> i32 {
     128
 }
 
+/// The write behind `__fs_write_at__` and `__fs_write_from__`: 0, or a POSITIVE WASI errno.
+///
+/// `mode` 0 replaces the file (`O_TRUNC`, `off` ignored), 1 writes at `off` without
+/// truncating, 2 appends (`O_APPEND`, `off` ignored). Every mode creates a missing file
+/// except mode 1 at a non-zero offset, which is past the end of an empty file: `EINVAL`,
+/// and nothing is created. Mode 1 checks `off` against the size of the descriptor it
+/// OPENED, not a separate stat, so the check and the write see the same file; an offset
+/// past the end is `EINVAL`, because writes are contiguous and a gap is never zero-filled.
+/// `write_all` loops, so a short count is never reported as success.
+fn fs_write_mode(p: &std::path::Path, off: i64, data: &[u8], mode: i32) -> i32 {
+    use std::io::{Seek, SeekFrom, Write};
+    if off < 0 {
+        return 28; // EINVAL
+    }
+    let mut o = std::fs::OpenOptions::new();
+    match mode {
+        0 => o.write(true).create(true).truncate(true),
+        1 => o.write(true).create(off == 0),
+        2 => o.append(true).create(true),
+        _ => return 28, // EINVAL
+    };
+    let mut f = match o.open(p) {
+        Ok(f) => f,
+        Err(err) if mode == 1 && off > 0 && err.kind() == std::io::ErrorKind::NotFound => {
+            return 28; // EINVAL — past the end of a file that has no bytes
+        }
+        Err(err) => return wasi_errno(&err),
+    };
+    if mode == 1 {
+        match f.metadata() {
+            Ok(m) if (off as u64) > m.len() => return 28, // EINVAL
+            Ok(_) => {}
+            Err(err) => return wasi_errno(&err),
+        }
+        if let Err(err) = f.seek(SeekFrom::Start(off as u64)) {
+            return wasi_errno(&err);
+        }
+    }
+    match f.write_all(data) {
+        Ok(()) => 0,
+        Err(err) => wasi_errno(&err),
+    }
+}
+
 /// Register the fs imports the module actually declares.
 ///
 /// GATED ON THE MODULE, twice over: a name the module does not import is never
@@ -3801,6 +3845,86 @@ fn register_fs_imports(
             }
             Ok(())
         })?;
+    }
+
+    // `__fs_write_at__(path, offset, data, mode)` — `data` written by `fs_write_mode`'s
+    // `mode`: 0 = ok, negative = -errno. The `u8[]` source of `writeFileRange` and
+    // `appendFile`; `writeFile`'s stays on `__fs_write__`.
+    if let Some((_, ft)) = has("__fs_write_at__") {
+        let e = errno.clone();
+        linker.func_new("imports", "__fs_write_at__", ft, move |mut c, args, results| {
+            let path = read_u8_list(&mut c, &args[0])?;
+            let Val::I64(off) = args[1] else {
+                bail!("fs intrinsic: __fs_write_at__ expected an i64 offset");
+            };
+            let data = read_u8_list(&mut c, &args[2])?;
+            let Val::I32(mode) = args[3] else {
+                bail!("fs intrinsic: __fs_write_at__ expected an i32 mode");
+            };
+            let code = match os_path(&path) {
+                Err(bad) => bad,
+                Ok(p) => fs_write_mode(&p, off, &data, mode),
+            };
+            *e.lock().unwrap() = code;
+            results[0] = Val::I32(-code);
+            Ok(())
+        })?;
+    }
+
+    // `__fs_write_from__(path, offset, addr, len, mode)` — the same write, its bytes read
+    // IN PLACE from the module's exported linear memory at `[addr, addr + len)`, so a `Buf`
+    // reaches `write(2)` with no copy. A source outside the memory is `-EFAULT`, the
+    // mirror of `__fs_read_into__`'s destination. A zero-length source still opens the
+    // file, so a replace truncates and a missing file is created.
+    if let Some((_, ft)) = has("__fs_write_from__") {
+        let e = errno.clone();
+        linker.func_new(
+            "imports",
+            "__fs_write_from__",
+            ft,
+            move |mut c, args, results| {
+                let path = read_u8_list(&mut c, &args[0])?;
+                let Val::I64(off) = args[1] else {
+                    bail!("fs intrinsic: __fs_write_from__ expected an i64 offset");
+                };
+                let Val::I32(addr) = args[2] else {
+                    bail!("fs intrinsic: __fs_write_from__ expected an i32 address");
+                };
+                let Val::I32(len) = args[3] else {
+                    bail!("fs intrinsic: __fs_write_from__ expected an i32 length");
+                };
+                let Val::I32(mode) = args[4] else {
+                    bail!("fs intrinsic: __fs_write_from__ expected an i32 mode");
+                };
+                let code = if addr < 0 || len < 0 {
+                    28 // EINVAL
+                } else {
+                    match os_path(&path) {
+                        Err(bad) => bad,
+                        Ok(p) if len == 0 => fs_write_mode(&p, off, &[], mode),
+                        Ok(p) => {
+                            // The emitter forces the memory to exist and to be exported
+                            // whenever this slot is used, so a miss is a drift between
+                            // the two halves, not something a program can spell.
+                            let Some(Extern::Memory(mem)) = c.get_export("memory") else {
+                                bail!(
+                                    "fs intrinsic: __fs_write_from__ needs the module's \
+                                     exported `memory`, which this module does not have"
+                                );
+                            };
+                            let (a, n) = (addr as usize, len as usize);
+                            match mem.data(&c).get(a..).and_then(|t| t.get(..n)) {
+                                None => 21, // EFAULT
+                                Some(src) => fs_write_mode(&p, off, src, mode),
+                            }
+                        }
+                    }
+                };
+                *e.lock().unwrap() = code;
+                results[0] = Val::I32(-code);
+                Ok(())
+            },
+        )?;
     }
 
     // `__proc_exit__(code)` — end the process NOW with `code`, answering nothing. The one
