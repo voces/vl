@@ -46,6 +46,10 @@ bare `read` collides with every other reader. That is why `encodeUtf8` repeats i
 and why `readTextFile` is not `readText`. Redundancy that would be noise under a namespace
 import is load-bearing here — do not "simplify" it away.
 
+**A getter is only for a named part of an opaque scalar or vector brand (a lane, a packed
+field, a flat-row column); anything else is a method.** Owner ruling, 2026-09-22
+(`design-review-getters-effects-2026-09.md` §5 D-Q7).
+
 ---
 
 ## 2. Patterns to be critical of
