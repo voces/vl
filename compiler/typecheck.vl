@@ -5022,10 +5022,8 @@ function callInvalidatesNarrowedPath(callIx: i32, key: string) {
 // `set`/`add` insert, none of which can take `xs[0]` or `m["a"]` away, and retiring on those would
 // end a narrowing the guard still proves.
 function cellRemovingMethod(p: string): boolean {
-  if p == "delete" { return true }
-  if p == "clear" { return true }
-  if p == "pop" { return true }
-  false
+  const k = collMethodKind(p)
+  k == CM_REMOVES_ONE || k == CM_REMOVES
 }
 
 // The cell a `delete(<literal>)` names, as its key text, or "" when the call names no single cell
@@ -15929,10 +15927,21 @@ function cwMutatesList(p: string): boolean {
   k == CM_STORES || k == CM_REMOVES_ONE || k == CM_REMOVES
 }
 
-// What a built-in collection method does to its receiver's element slots — the one table the
-// list rule (`cwMutatesList`) and the record rule (`rcwStoresElem`, …) both read. STORES puts
-// an argument in a slot; REMOVES_ONE takes one out and hands it back; REMOVES takes some out
-// and hands nothing back; RETURNS hands a slot's value back; READS hands no slot back.
+// Whether `p` is a list method's spelling, rather than one only a map or set has
+// (`set`/`add`/`delete`/`has`/`keys`).
+function collIsListSpelling(p: string): boolean {
+  p == "push" ||
+    p == "pop" ||
+    p == "clear" ||
+    p == "get" ||
+    p == "includes" ||
+    p == "indexOf" ||
+    p == "join"
+}
+
+// What a built-in collection method does to its receiver's element slots — the one table every
+// method question reads. STORES puts an argument in a slot; REMOVES_ONE takes one out and
+// hands it back; REMOVES hands nothing back; RETURNS hands a slot's value back; READS none.
 const CM_OTHER = 0
 const CM_STORES = 1
 const CM_REMOVES_ONE = 2
@@ -17605,15 +17614,19 @@ function rcwCovs(
   }
   if st is TyArray {
     if dt is TyArray {
-      // A delivered list of records into a list of a boxed union is the list rule's own
-      // domain, where a read-only delivery is a converted copy (`covarWriteThrough`).
-      if path == "" && rcwListRuleDomain(st.aElem, dt.aElem) { return false }
+      // A delivered container whose element changes storage is copied or refused by the
+      // container rule (DECISIONS.md "No implicit container widening"), so no handle is
+      // shared; one that keeps its storage is shared, and this rule decides its writes.
+      if path == "" && rcwContainerRuleDomain(st.aElem, dt.aElem) {
+        return false
+      }
       walked = true
       differs = rcwCovs(st.aElem, dt.aElem, path + "[]", out, depth + 1)
     }
   }
   if st is TyMap {
     if dt is TyMap {
+      if path == "" && rcwContainerRuleDomain(st.mVal, dt.mVal) { return false }
       walked = true
       differs = rcwCovs(st.mVal, dt.mVal, path + "[]", out, depth + 1)
     }
@@ -17756,14 +17769,18 @@ function rcwMembersOf(t: i32): i32[] {
   }
   out
 }
-// `covarWriteThrough`'s pair: a record element delivered into a boxed union element.
-function rcwListRuleDomain(se: i32, de: i32): boolean {
+// Whether a container's element pair changes storage — the pairs the container rule copies
+// or refuses (`i32` into `f64`, a literal union into `string`, a record into a boxed union).
+function rcwContainerRuleDomain(se: i32, de: i32): boolean {
   if se < 0 || de < 0 || se >= T.tys.length || de >= T.tys.length {
     return false
   }
-  const st = T.tys[se]
+  // An element whose storage is not known yet (a type variable) is the container rule's,
+  // which asks again at the call that pins it.
+  if tyHasTyVar(de) || tyHasTyVar(se) { return true }
+  if containerElemClassDiffers(se, de) { return true }
   const dt = T.tys[de]
-  if st is TyObj {
+  if T.tys[se] is TyObj {
     if dt is TyUnion { return covarNonNullArms(dt.uMembers) >= 2 }
   }
   false
@@ -19386,8 +19403,10 @@ function rcwErr(srcExpr: i32, srcTy: i32, dstTy: i32) {
       " cannot be delivered as " +
       tyToStr(dstTy) +
       " here: " +
-      rcwWhat(srcExpr, "a widened field") +
-      ". A record is shared, not copied, so a wider value stored through the " +
+      rcwWhat(srcExpr, "a widened " + rcwSlotNoun(srcTy)) +
+      ". A " +
+      rcwValueNoun(srcTy) +
+      " is shared, not copied, so a wider value stored through the " +
       tyToStr(dstTy) +
       " would sit in the " +
       tyToStr(srcTy) +
@@ -19396,6 +19415,39 @@ function rcwErr(srcExpr: i32, srcTy: i32, dstTy: i32) {
     srcExpr,
   )
   0
+}
+
+// What a delivered value is called in the refusal: a list, a map, or a record.
+function rcwValueNoun(t: i32): string {
+  if t < 0 || t >= T.tys.length { return "record" }
+  const tt = T.tys[t]
+  let noun = "record"
+  match tt {
+    TyArray => {
+      noun = "list"
+    }
+    TyMap => {
+      noun = "map"
+    }
+    // Every other delivered value this rule sees is a record, or a union or nullable of one.
+    TyObj => {}
+    TyUnion => {}
+    TyNullable => {}
+    TyPrim => {}
+    TyErr => {}
+    TyFunc => {}
+    TyVar => {}
+    TyLit => {}
+    TyNeg => {}
+  }
+  noun
+}
+
+// What a widened slot of that value is called: a list's or map's element, a record's field.
+function rcwSlotNoun(t: i32): string {
+  const n = rcwValueNoun(t)
+  if n == "record" { return "field" }
+  "element or field"
 }
 
 // What to do instead: declare the source at the destination's type, when that type can be
@@ -25890,9 +25942,7 @@ function numIntrCallTy(name: string, n: Call, ix: i32) {
 // refuses. Deliberately not `cwMutatesList`'s set, which also names the map/set spellings
 // (`set`/`add`/`delete`) a list receiver never reaches.
 function listMethodMutates(p: string): boolean {
-  if p == "push" { return true }
-  if p == "pop" { return true }
-  p == "clear"
+  cwMutatesList(p) && collIsListSpelling(p)
 }
 
 // The result of a list method that BUILDS a new list from the receiver (`.filter`,

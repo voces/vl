@@ -3928,6 +3928,13 @@ legal exactly where nothing it reaches WRITES a widened slot.
   `{ readonly x }` bounds plus inferred read-only parameters (D-Q4 (c)). Filed as D2101, which
   that build closes. The unfollowable handles are now function values held outside a parameter
   (a list element, a record field) and chains past a depth limit of about a thousand calls.
+* **Where it meets the container rule** ("No implicit container widening", above). A delivered
+  list or map whose ELEMENT changes storage (`i32[]` into `f64[]`, a literal union into
+  `string`, a record into a boxed union, or an element still a type variable) is copied or
+  refused by the container rule, so no handle is shared and this rule stands aside. One that
+  keeps its storage is shared — a list of records whose fields widen, and D2161's `C[]` into
+  `(C | null)[]` — and this rule refuses a store the source's slot cannot hold. Whether such a
+  widening should be refused even where nothing writes is D2161's open question.
 * **A write is judged by its value's static type.** Each widened slot carries the SOURCE's own
   type there; a store whose value type is assignable to it (`p.x = 5` into an `i32` source's
   widened `x`) cannot break the source's rep and runs. A store of a value typed wider than the
