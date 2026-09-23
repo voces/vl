@@ -65,6 +65,5 @@ D2093-D2099  vl-11  2026-09-22  getter diagnostics follow-ups (G3 field-bound me
 D2100-D2104  vl-11  2026-09-22  D2060 residue (record covariance)
 D2110-D2119  vl-11  2026-09-23  function-list calls (PR #3050)
 D2120-D2129  vl-11  2026-09-23  getter step budget lane (D2061-D2063 residue; D2120 filed)
-D2135-D2144  vl-11  2026-09-23  effects summary s1 (getters call qualifying functions)
 D2130-D2134  d2017-lane  2026-09-23  D2017 capture-memo residue (D2130 filed)
-D2180-D2184  pl019  2026-09-23  PL-019 compile-time regression (D2180-D2182 filed)
+D2176-D2179  vl-11  2026-09-23  PL-014 lane L10 (immutable module const globals)

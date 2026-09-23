@@ -842,6 +842,41 @@ new: the compare-frame pre-pass never recurses into a code-15 field, so a NESTED
   `scopeSlotOf` reads a name index over the scope stack instead of scanning every live
   binding, so 2,500 function-scope locals build in 0.13 s rather than 2.2 s. Guarded by the
   `call sites per function` and `live locals in one scope` scaling axes.
+- **A module `const` with a constant initializer is an immutable wasm global (plumb PL-014
+  lane L10).** Every module binding used to be a `(mut …)` global, so an engine re-loaded a
+  `const` on every read. A `const` whose initializer is a constant expression (a literal, a
+  constant list or record, a pooled string, and now a negated numeric literal into a bare
+  `i32`/`i64`/`f32`/`f64` cell, which folds to one `*.const`) drops `mut`; a `let`, and a
+  `const` initialized by the start function, stay mutable, and an exported `const` keeps the
+  immutable ABI it already had. A negated literal folds everywhere (`-5` is one `i32.const`),
+  and a store to an immutable cell is a loud emit failure. Two behaviour changes, both
+  intended: a negated hex literal into an `i64`/`f64` module cell (`const H: i64 =
+  -0xFFFFFFFF`) now holds its value, -4294967295, where the start-function path negated the
+  i32 bit pattern and gave `1`; and a negated-literal const is initialized before the start
+  function runs, so an earlier non-constant initializer that reads it sees its value (`-3`,
+  not `0`), as it already did for a positive literal. The same literal delivered to a local
+  or argument `i64`/`f64` slot was wrong the same way (D2176, `let q: f64 = 0xFFFFFFFF`
+  printed -1) and now lowers in the wide rep too. The compiler's own module: 2,206 →
+  1,744 mutable globals, seed 2,656,215 → 2,643,378 bytes (-0.48%). A const-read hot loop
+  (`(acc * MUL + ((i >> SHIFT) & MASK) + NEG) & 0xffffff`, 4e8 steps) on wasmtime:
+  0.487 → 0.406 s; an f64 `acc * SCALE + OFF` loop and both loops on V8 (deno 2.9) do not move.
+  `-O3` now drops `str-eq`'s `ALPHA` header allocation (allocs 16 → 15). Fixpoint holds,
+  distilled corpus 0 cells moved. Test `tests/vl_immutable_const_global_test.ts`; row D2176 closed.
+- **A field write in a value-yielding tail arm yields its value, and a captured literal-union
+  `let` stores the atom (D2170, D2168).** A recursive BST `insert` with no declared result and
+  `if n.left == null { n.left = { … } } else { insert(n.left, v) }` trapped `unreachable`: the
+  emitter delivers an assignment's value by re-reading its target, which it admitted only for a
+  field whose type is the value's, so the arm had nothing to yield. In a function the emitter
+  gives a result, a tail field or element write now spills its receiver, index and right-hand
+  side in source order (`const o2 = o; const i2 = i; const v = r; o2[i2] = v; v`, D1510), and a result the return walk left at `i32` takes the struct row of the checker's
+  function type, so an `if` joining two struct locals no longer declares `(result i32)`.
+  Separately, the cell `captureBoxRewrite` makes of a captured `let k: K` now carries its list
+  type, so `k = "ww"` inside a closure stores the atom, and an assignment's value is an atom
+  exactly when its target is; a spilled value written to a literal-union target takes the target's
+  alias, so it holds the atom. Residue D2171–D2175 and D2185–D2187 filed. Fixtures
+  `conditionals/tail-if-field-assign-arm.vl`, `closures/captured-litunion-assign.vl`,
+  `eval-order/tail-write-value.vl`.
+
 - **A long closure body compiles in linear time (D2017, plumb's generated closures).** Every
   read of a name the closure does not bind asked for its capture set, and before emission
   each ask re-walked the whole lifted body, so a 2,500-arm `match` closure took 127 s against

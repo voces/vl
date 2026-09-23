@@ -567,6 +567,57 @@ export function fbF32Const(text: string) {
   }
   0
 }
+// Rewrite the bytes from `mark` to the end of the current buffer as their negation when they
+// are exactly one numeric `*.const`: an integer becomes `0 - v` (wrapping), a float has its
+// sign bit flipped, which is what `f32.neg`/`f64.neg` compute. Answers whether it rewrote; a
+// negated literal folded this way stays a constant expression.
+export function wNegateConstFrom(mark: i32): boolean {
+  const n = curBuf.length - mark
+  if mark < 0 || n < 2 { return false }
+  const op = curBuf[mark]
+  if op == OP_F64_CONST || op == OP_F32_CONST {
+    let w = 5
+    if op == OP_F64_CONST { w = 9 }
+    if n != w { return false }
+    curBuf[mark + w - 1] = curBuf[mark + w - 1] ^ 0x80
+    return true
+  }
+  if op != OP_I32_CONST && op != OP_I64_CONST { return false }
+  // Decode the signed LEB into (hi, lo) lanes, one 7-bit group at a time.
+  let lo = 0
+  let hi = 0
+  let sh = 0
+  let k = mark + 1
+  let last = -1
+  while k < curBuf.length && last < 0 {
+    const b = curBuf[k]
+    const p = b & 0x7f
+    if sh < 32 {
+      lo = lo | (p << sh)
+      if sh > 25 { hi = hi | (p >>> (32 - sh)) }
+    } else if sh < 64 {
+      hi = hi | (p << (sh - 32))
+    }
+    sh = sh + 7
+    if (b & 0x80) == 0 { last = b }
+    k = k + 1
+  }
+  if last < 0 || k != curBuf.length { return false }
+  if (last & 0x40) != 0 {
+    if sh < 32 {
+      lo = lo | (-1 << sh)
+      hi = -1
+    } else if sh < 64 {
+      hi = hi | (-1 << (sh - 32))
+    }
+  }
+  wDropBack(n)
+  if op == OP_I32_CONST { return fbI32Const(0 - lo) == 0 }
+  const nlo = ~lo + 1
+  let nhi = ~hi
+  if nlo == 0 { nhi = nhi + 1 }
+  fbI64Const(nhi, nlo) == 0
+}
 // `v128.const` of sixteen zero bytes (`0xFD 0x0C` + the immediate) — the zero of a v128 cell,
 // a valid constant expression for a global's init.
 export function fbV128ConstZero() {
