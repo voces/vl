@@ -1,0 +1,163 @@
+// @run
+// @skip the fs floor needs a host that can build a WasmGC value — V8 cannot; asserted natively by tests/selfhost_native_align_test.ts
+// @log 1,2,3
+// @log 12,13,14
+// @log 12,13,14,7
+// @log 12,13,14,7,10,11
+// @log 12,9,9,7,10,11
+// @log 12,9,9,7,10,11,17
+// @log 10,11,12,13,14,15,16,17
+// @log 28
+// @log fs.writeFileRange /tmp/vl-std-fs-write.bin: offset 9 is past the end (length 8)
+// @log 10,11,12,13,14,15,16,17
+// @log fs.writeFileRange /tmp/vl-std-fs-write.bin: offset -1 is negative
+// @log 0
+// @log 5,5
+// @log 0
+// @log 0
+// @log fs.writeFileRange /tmp/vl-std-fs-write-absent/x.bin: offset 3 is past the end (length 0)
+// @log false
+// @log 44
+// @log 44
+// @log 28
+// @log 28
+// @log 28
+// @log 31
+// @log 31
+// @log fs.writeFile /tmp/vl-std-fs-write.bin: EFAULT (a Buf outside linear memory)
+// `writeFile`, `writeFileRange` and `appendFile`, each from a `u8[]` AND from a `Buf`.
+//
+// A `Buf` source is written straight from linear memory, and `window` is how a caller
+// writes part of one. Every step reads the file back whole, so a write that landed at
+// the wrong offset, truncated when it should not have, or kept a byte it should have
+// replaced changes a printed line rather than a count.
+//
+// `@skip`ped under the V8 harness and asserted natively for the reason
+// `tests/cases/std/fs-range.vl` sets out: the floor takes a `u8[]` path, which JS can
+// neither read nor build. HERMETIC as far as `std:fs` allows: the file is at a FIXED
+// path under `/tmp` and every step starts from `writeFile`, so a rerun prints the same
+// lines; the missing-file cases name a directory that is never created.
+import { Buf, Buffer, store8, window } from "std:buffer"
+import { toString } from "std:fmt"
+import {
+  IoError,
+  appendFile,
+  fileSize,
+  pathExists,
+  readFile,
+  writeFile,
+  writeFileRange,
+} from "std:fs"
+
+const p = "/tmp/vl-std-fs-write.bin"
+const absent = "/tmp/vl-std-fs-write-absent/x.bin"
+
+function bytes(path: string): string {
+  const r = readFile(path)
+  if r is IoError { return "read failed: " + r.msg }
+  let s = ""
+  let i = 0
+  while i < r.length {
+    if i > 0 { s = s + "," }
+    s = s + r[i].toString()
+    i = i + 1
+  }
+  s
+}
+
+function must(e: IoError | null) {
+  if e != null { print("unexpected: " + e.msg) }
+}
+
+// Byte `i` of the buffer holds `10 + i`, so every byte written from it names its offset.
+const b = Buffer(8)
+let i = 0
+while i < 8 {
+  store8(b, i, 10 + i)
+  i = i + 1
+}
+
+// writeFile, from an array and then from a window of the buffer: each replaces the file.
+must(writeFile(p, [1, 2, 3]))
+print(bytes(p))
+must(writeFile(p, window(b, 2, 3)))
+print(bytes(p))
+
+// appendFile, from an array and from a window: each adds to the end.
+must(appendFile(p, [7]))
+print(bytes(p))
+must(appendFile(p, window(b, 0, 2)))
+print(bytes(p))
+
+// writeFileRange inside the file replaces only its own bytes and keeps the tail; at the
+// end it extends; from 0 with more bytes than the file it overwrites and extends.
+must(writeFileRange(p, 1, [9, 9]))
+print(bytes(p))
+must(writeFileRange(p, 6, window(b, 7, 1)))
+print(bytes(p))
+must(writeFileRange(p, 0, b))
+print(bytes(p))
+
+// One byte past the end would leave a gap, and is refused with both numbers; nothing is
+// written. A negative offset is refused before the host is asked.
+const gap = writeFileRange(p, 9, [1])
+if gap is IoError {
+  print(gap.code)
+  print(gap.msg)
+} else {
+  print("gap should have failed")
+}
+print(bytes(p))
+const neg = writeFileRange(p, 0 - 1, window(b, 0, 1))
+if neg is IoError { print(neg.msg) } else { print("neg should have failed") }
+
+// `writeFile(path, [])` empties the file: the fresh start an appending run begins with.
+must(writeFile(p, []))
+const sz = fileSize(p)
+if sz is IoError { print(sz.msg) } else { print(sz) }
+must(appendFile(p, [5]))
+must(appendFile(p, [5]))
+print(bytes(p))
+
+// A zero-length window at the end of the buffer is in range, and writing it empties too.
+print(window(b, 8, 0).length)
+must(writeFile(p, window(b, 8, 0)))
+const sz0 = fileSize(p)
+if sz0 is IoError { print(sz0.msg) } else { print(sz0) }
+
+// A missing file has length 0, so any offset past 0 is refused — and nothing is created.
+const miss = writeFileRange(absent, 3, [1])
+if miss is IoError { print(miss.msg) } else { print("miss should have failed") }
+const ex = pathExists(absent)
+if ex is IoError { print(ex.msg) } else { print(ex) }
+
+// Offset 0 and appendFile create a missing FILE, but not its directory: `ENOENT` (44).
+const miss0 = writeFileRange(absent, 0, window(b, 0, 1))
+if miss0 is IoError {
+  print(miss0.code)
+} else {
+  print("miss0 should have failed")
+}
+const missA = appendFile(absent, [1])
+if missA is IoError {
+  print(missA.code)
+} else {
+  print("missA should have failed")
+}
+
+// An empty path is `EINVAL` (28) for all three, and a directory is `EISDIR` (31).
+const e1 = writeFile("", b)
+if e1 is IoError { print(e1.code) } else { print("e1 should have failed") }
+const e2 = writeFileRange("", 0, b)
+if e2 is IoError { print(e2.code) } else { print("e2 should have failed") }
+const e3 = appendFile("", b)
+if e3 is IoError { print(e3.code) } else { print("e3 should have failed") }
+const d1 = writeFile("/tmp", b)
+if d1 is IoError { print(d1.code) } else { print("d1 should have failed") }
+const d2 = appendFile("/tmp", [1])
+if d2 is IoError { print(d2.code) } else { print("d2 should have failed") }
+
+// A hand-built `Buf` past the end of linear memory is a value, `EFAULT`, named in the message.
+const forged: Buf = { base: 2147483000, length: 16 }
+const f1 = writeFile(p, forged)
+if f1 is IoError { print(f1.msg) } else { print("f1 should have failed") }

@@ -44,8 +44,8 @@
 // std export with a loop in it moves all eighteen `none` cells by the same
 // amount and neither `O` nor `O3` at all, which is the signature to check for
 // before reading a move as a codegen finding. `storeBytes`/`loadBytes` carry +3
-// call for their `__trap__("…")` message, whose per-character print loop is what
-// drags the string machinery into a kernel that has no strings. Their two
+// call for their `__trap__("…")` message, and `window` +1 for its own, whose
+// per-character print loop is what drags the string machinery into a kernel that has no strings. Their two
 // `struct.get`s each are NOT in the `sget` column: a loop whose only call is a
 // linear-memory intrinsic keeps the list-header hoist, so the wrapper is read
 // above the loop (`bulk-copy-design.md` §E4). At `-O3` the module is
@@ -160,11 +160,11 @@ const c = (trap: number, call: number, sget: number): Counts => ({ trap, call, s
 // kernel, above its loop, so those rows read 0. The comments below describe the collapsed
 // shape these rows had before; §M of `buffer-design.md` carries the re-measured costs.
 export const TABLE: Record<string, Row> = {
-  "scale-view": { none: c(0, 6, 1), O: c(2, 2, 3), O3: c(4, 1, 5) },
+  "scale-view": { none: c(0, 7, 1), O: c(2, 2, 3), O3: c(4, 1, 5) },
   // Identical to `scale-view` in every cell, which is the POINT: the bracket's
   // extra frame is one level DOWN (`"[]"` calls `getF32`), so a loop-level count
   // cannot see it. It shows up only in the call TARGET and on the clock (§M3(4)).
-  "scale-accessor": { none: c(0, 6, 1), O: c(2, 2, 3), O3: c(4, 1, 5) },
+  "scale-accessor": { none: c(0, 7, 1), O: c(2, 2, 3), O3: c(4, 1, 5) },
   // `scale-view` with its IDEMPOTENT seed helper called twice, and no other
   // difference: one buffer, one view, one column, the same kernel source. The
   // second call site keeps `seed` alive, the module stops collapsing into its
@@ -172,29 +172,29 @@ export const TABLE: Record<string, Row> = {
   // melts away survives — so the `-O3` cell that reads 0 there reads non-zero
   // here, and the kernel runs 3.0x slower (0.445 -> 1.36 ns/element). This row
   // is the evidence that the reload is NOT a "two views of one width" property.
-  "scale-seedtwice": { none: c(0, 6, 1), O: c(2, 2, 3), O3: c(4, 1, 5) },
-  "scale-buf": { none: c(0, 6, 0), O: c(0, 2, 1), O3: c(0, 1, 1) },
-  "scale-hoist": { none: c(0, 4, 0), O: c(0, 1, 0), O3: c(0, 1, 0) },
-  "reduce-view": { none: c(0, 5, 1), O: c(2, 1, 3), O3: c(2, 1, 3) },
-  "reduce-buf": { none: c(0, 5, 0), O: c(0, 1, 1), O3: c(0, 1, 1) },
-  "reduce-hoist": { none: c(0, 4, 0), O: c(0, 1, 0), O3: c(0, 1, 0) },
-  "axpy-view": { none: c(0, 7, 1), O: c(2, 3, 3), O3: c(6, 1, 7) },
+  "scale-seedtwice": { none: c(0, 7, 1), O: c(2, 2, 3), O3: c(4, 1, 5) },
+  "scale-buf": { none: c(0, 7, 0), O: c(0, 2, 1), O3: c(0, 1, 1) },
+  "scale-hoist": { none: c(0, 5, 0), O: c(0, 1, 0), O3: c(0, 1, 0) },
+  "reduce-view": { none: c(0, 6, 1), O: c(2, 1, 3), O3: c(2, 1, 3) },
+  "reduce-buf": { none: c(0, 6, 0), O: c(0, 1, 1), O3: c(0, 1, 1) },
+  "reduce-hoist": { none: c(0, 5, 0), O: c(0, 1, 0), O3: c(0, 1, 0) },
+  "axpy-view": { none: c(0, 8, 1), O: c(2, 3, 3), O3: c(6, 1, 7) },
   // The ATTRIBUTION control (§M4): the same six per-access compares as
   // `axpy-view`, written by hand over a base and an extent hoisted into locals.
   // Six traps and ZERO field reloads per element at `none`; the seventh trap and
   // the four `struct.get`s that appear once optimized are the view CONSTRUCTION
   // check and its field reads, inlined into the driver's TRIP loop — per trip,
   // not per element, which is the limit of a loop-membership counter.
-  "axpy-fencedhoist": { none: c(6, 4, 0), O: c(7, 1, 0), O3: c(7, 1, 0) },
+  "axpy-fencedhoist": { none: c(6, 5, 0), O: c(7, 1, 0), O3: c(7, 1, 0) },
   // The control above, as a LIBRARY call rather than six hand-written compares:
   // `getF32At`/`setF32At` shipped in `std:buffer` (webcraft A1). At `none` the
   // traps sit in the callees, so this reads like `axpy-view`; what matters is the
   // `-O3` cell, where the per-element reload is gone (7 -> 4, and those 4 are the
   // view construction in the TRIP loop, exactly as on the `fencedhoist` row) while
   // all six per-access compares survive.
-  "axpy-at": { none: c(0, 7, 0), O: c(2, 3, 0), O3: c(6, 1, 0) },
-  "axpy-buf": { none: c(0, 7, 0), O: c(0, 3, 1), O3: c(0, 1, 1) },
-  "axpy-hoist": { none: c(0, 4, 0), O: c(0, 1, 0), O3: c(0, 1, 0) },
+  "axpy-at": { none: c(0, 8, 0), O: c(2, 3, 0), O3: c(6, 1, 0) },
+  "axpy-buf": { none: c(0, 8, 0), O: c(0, 3, 1), O3: c(0, 1, 1) },
+  "axpy-hoist": { none: c(0, 5, 0), O: c(0, 1, 0), O3: c(0, 1, 0) },
   // ── shape `soa`: webcraft's own six-column integrator (A1) ──────────────────
   // The two-view `axpy` rows UNDERSTATE the reload, because there the per-trip
   // view-construction reads dominate the per-element ones. This pair is the
@@ -208,11 +208,11 @@ export const TABLE: Record<string, Row> = {
   // contains — the same loop-membership limit called out on `axpy-fencedhoist`.
   // Both rows keep all 24 traps at `-O3`, which is the point: the fence is not
   // what costs.
-  "soa-view": { none: c(0, 16, 0), O: c(0, 13, 0), O3: c(24, 1, 24) },
-  "soa-at": { none: c(0, 16, 0), O: c(0, 13, 0), O3: c(24, 1, 0) },
-  "rows-view": { none: c(0, 6, 0), O: c(2, 2, 2), O3: c(4, 1, 4) },
-  "rows-buf": { none: c(0, 6, 0), O: c(0, 3, 0), O3: c(0, 1, 1) },
-  "rows-hoist": { none: c(0, 4, 0), O: c(0, 1, 0), O3: c(0, 1, 0) },
+  "soa-view": { none: c(0, 17, 0), O: c(0, 13, 0), O3: c(24, 1, 24) },
+  "soa-at": { none: c(0, 17, 0), O: c(0, 13, 0), O3: c(24, 1, 0) },
+  "rows-view": { none: c(0, 7, 0), O: c(2, 2, 2), O3: c(4, 1, 4) },
+  "rows-buf": { none: c(0, 7, 0), O: c(0, 3, 0), O3: c(0, 1, 1) },
+  "rows-hoist": { none: c(0, 5, 0), O: c(0, 1, 0), O3: c(0, 1, 0) },
 };
 
 export const RUNGS: Array<{ name: keyof Row; flag: string | null }> = [

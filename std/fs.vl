@@ -1,18 +1,18 @@
-// `std:fs` — reading and writing files, whole or by byte range, and listing directories.
+// `std:fs` — reading, writing and appending files, whole or by byte range, and listing directories.
 //
 //     import { readTextFile, writeTextFile, listDir, IoError } from "std:fs"
 //
 // Errors are VALUES: every fallible export answers `T | IoError` and nothing traps.
 // `IoError`, the errno constants and `errnoName` are also what `std:process` and
 // `std:env` answer in. FREE functions, not methods — the thing operated on is the FILE,
-// so `path` leads. Contents are bytes; text is a decoding on top, so a byte range has no
-// text sibling, and the `*Into` reads fill a `Buf` from `std:buffer`, re-exported here.
-// No path manipulation, no open handles.
+// so `path` leads. Contents are bytes, to and from a `u8[]` or a `Buf` (re-exported from
+// `std:buffer`); text is a decoding on top, so a byte range has no text sibling.
+// No path manipulation, no open handles, no truncating to a length, no write that leaves a gap.
 
 import { Utf8Error, decodeUtf8, decodeUtf8At, encodeUtf8 } from "std:utf8"
 import { toString } from "std:fmt"
 
-// Re-exported so a caller can spell `readFileInto`'s destination without a second
+// Re-exported so a caller can spell a `Buf` destination or source without a second
 // import. It is the same type `std:buffer` exports, not a copy — but only that
 // module's `Buffer(n)` makes one with memory actually behind it.
 export { Buf } from "std:buffer"
@@ -42,11 +42,15 @@ export const ENOSPC = 51
 export const ENOTDIR = 54
 export const EPERM = 63
 
+// Named by `errnoName` but not exported: a `Buf` from `Buffer(n)` never produces it.
+const EFAULT = 21
+
 // The errno as a short name and a plain-English reason, or `"errno N"` for one this
 // module does not name. Every module that answers an `IoError` renders its `code`
 // through this, so a reason reads the same wherever it came from.
 export function errnoName(code: i32) {
   if code == EACCES { return "EACCES (permission denied)" }
+  if code == EFAULT { return "EFAULT (a Buf outside linear memory)" }
   if code == EILSEQ { return "EILSEQ (invalid byte sequence)" }
   if code == EINVAL { return "EINVAL (invalid argument)" }
   if code == EIO { return "EIO (i/o error)" }
@@ -227,22 +231,101 @@ export function readFileRangeInto(
   { code: code, msg: failed("readFileRangeInto", path, code) }
 }
 
-// Replace the file's contents with `data`. Answers `null` on success, since a
-// whole-file write has nothing to report. Whether the file is created,
-// truncated or replaced atomically is the host's policy, not this module's.
-export function writeFile(path: string, data: u8[]): IoResult {
+// Replace the file's contents with `data`, creating it when absent. A `Buf` is written
+// straight from memory, not copied, and `buf.window(0, used)` writes only its filled part.
+// `writeFile(path, [])` empties the file: the fresh start before `appendFile` or
+// `writeFileRange`. Whether the replacement is atomic is the host's policy.
+export function writeFile(path: string, data: u8[] | Buf): IoResult {
   if path.length == 0 {
     return { code: EINVAL, msg: emptyPathMsg("writeFile") }
   }
-  const rc = __fs_write__(encodeUtf8(path), data)
+  let rc = 0
+  if data is Buf {
+    rc = __fs_write_from__(encodeUtf8(path), 0, data.base, data.length, 0)
+  } else {
+    rc = __fs_write__(encodeUtf8(path), data)
+  }
+  writeResult("writeFile", path, rc)
+}
+
+// The floor's answer to a write as an `IoResult`: 0 is success, a negative is `-errno`.
+function writeResult(op: string, path: string, rc: i32): IoResult {
   if rc == 0 { return null }
   let code = EIO
   if rc < 0 { code = 0 - rc }
-  { code: code, msg: failed("writeFile", path, code) }
+  { code: code, msg: failed(op, path, code) }
 }
 
-// The same, encoding `text` as UTF-8 first. Encoding cannot fail, so this adds
-// no failure mode.
+// Write `data` over the file from byte `offset`, keeping every byte outside that range.
+// `offset` may be at most the file's current length, so a write can extend the file but
+// never leave a gap; a larger or negative offset is `EINVAL`, and the message names it.
+// A missing file has length 0, so only offset 0 creates one.
+export function writeFileRange(
+  path: string,
+  offset: i64,
+  data: u8[] | Buf,
+): IoResult {
+  if path.length == 0 {
+    return { code: EINVAL, msg: emptyPathMsg("writeFileRange") }
+  }
+  if offset < 0 {
+    return {
+      code: EINVAL,
+      msg: "fs.writeFileRange " +
+        path +
+        ": offset " +
+        toString(offset) +
+        " is negative",
+    }
+  }
+  const p = encodeUtf8(path)
+  let rc = 0
+  if data is Buf {
+    rc = __fs_write_from__(p, offset, data.base, data.length, 1)
+  } else {
+    rc = __fs_write_at__(p, offset, data, 1)
+  }
+  if rc == 0 - EINVAL { return pastEnd(p, path, offset) }
+  writeResult("writeFileRange", path, rc)
+}
+
+// The refusal of a write that would leave a gap, naming the file's length (0 when missing).
+function pastEnd(p: u8[], path: string, offset: i64): IoError {
+  let size = __fs_size__(p)
+  if size < 0 && lastErrno() == ENOENT && offset > 0 { size = 0 }
+  if size < 0 || offset <= size {
+    return { code: EINVAL, msg: failed("writeFileRange", path, EINVAL) }
+  }
+  {
+    code: EINVAL,
+    msg: "fs.writeFileRange " +
+      path +
+      ": offset " +
+      toString(offset) +
+      " is past the end (length " +
+      toString(size) +
+      ")",
+  }
+}
+
+// Add `data` to the end of the file, creating it when absent. Running the same program
+// again appends again, so begin with `writeFile(path, [])` when the file should hold only
+// this run's output.
+export function appendFile(path: string, data: u8[] | Buf): IoResult {
+  if path.length == 0 {
+    return { code: EINVAL, msg: emptyPathMsg("appendFile") }
+  }
+  let rc = 0
+  if data is Buf {
+    rc = __fs_write_from__(encodeUtf8(path), 0, data.base, data.length, 2)
+  } else {
+    rc = __fs_write_at__(encodeUtf8(path), 0, data, 2)
+  }
+  writeResult("appendFile", path, rc)
+}
+
+// Replace the file's contents with `text` encoded as UTF-8, as `writeFile` does.
+// Encoding cannot fail, so this adds no failure mode.
 export function writeTextFile(path: string, text: string): IoResult {
   if path.length == 0 {
     return { code: EINVAL, msg: emptyPathMsg("writeTextFile") }

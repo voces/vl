@@ -1,4 +1,4 @@
-// The SENTENCE `std:buffer`'s bulk `u8[]` pair prints before it aborts.
+// The SENTENCE `std:buffer`'s bulk `u8[]` pair, and `window`, print before they abort.
 //
 // `storeBytes`/`loadBytes` compare their range once and `__trap__("…")` when it
 // does not fit, which streams the message to the host boundary and then executes
@@ -52,6 +52,15 @@ const CASES: [string, string][] = [
   [
     "buffer-load-bytes-overflow-traps.vl",
     "std:buffer.loadBytes: [off, off + len) is not inside the buffer",
+  ],
+  // `window` checks the same way and says so in the same shape.
+  [
+    "buffer-window-past-end-traps.vl",
+    "std:buffer.window: [off, off + len) is not inside the buffer",
+  ],
+  [
+    "buffer-window-negative-traps.vl",
+    "std:buffer.window: [off, off + len) is not inside the buffer",
   ],
 ];
 

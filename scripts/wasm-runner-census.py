@@ -54,6 +54,8 @@ CLASSIFIED = {
                                 "EXPORT section aliases the public name"),
     "vl_std_process_test.ts": ("standalone", "native vl build",
                                "std:process / std:env across both hosts"),
+    "vl_std_fs_write_test.ts": ("standalone", "native vl build",
+                                "the V8 harness refuses both fs write slots by name"),
     "vl_trap_source_frames_test.ts": ("standalone", "native vl build",
                                       "the trap's per-instruction source block, BOTH hosts"),
     "vl_seed_abi_test.ts": ("seed ABI", "none — instantiates the SEED",
