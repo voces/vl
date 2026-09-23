@@ -125,6 +125,26 @@ const genCallbacks = (n: number, k: number): string => {
   return o.join("\n") + "\n";
 };
 
+// GETTER CALLEES: N getters each calling a helper that calls a second helper, against the
+// same N getters calling N/K such chains. Both arms declare the same 2N helpers and read every
+// getter once; only how many distinct callee chains the getter check summarises differs, which
+// is the entity the per-function summary (D2135) is computed for, once each.
+const genGetterCallees = (n: number, k: number): string => {
+  const m = Math.max(1, Math.floor(n / k));
+  const o: string[] = ["type V = new { n: i32 }"];
+  for (let i = 0; i < n; i++) {
+    o.push(`function k${i}(x: i32): i32 { x * ${(i % 5) + 2} }`);
+    o.push(`function h${i}(x: i32): i32 { if x > ${i % 11} { k${i}(x) } else { x + 1 } }`);
+  }
+  for (let i = 0; i < n; i++) o.push(`get g${i}(self: V): i32 { h${i % m}(self.n) }`);
+  o.push("const v: V = { n: 3 }", "let acc = 0");
+  for (let i = 0; i < n; i++) o.push(`acc = acc + v.g${i}`);
+  // Keeps every helper reached, so neither arm drops declarations the other emits.
+  for (let i = 0; i < n; i++) o.push(`acc = acc + h${i}(${i % 5})`);
+  o.push("print(acc)");
+  return o.join("\n") + "\n";
+};
+
 const genClosures = (n: number, k: number): string => {
   const m = Math.max(1, Math.floor(n / k));
   const o: string[] = [];
@@ -621,6 +641,16 @@ Deno.test({
     }
   },
 });
+
+// 1.27 / 1.13 / 1.12 (wall, idle-ish box). GETTER CALLEES (D2135): the per-function summary is
+// one walk per callee instance, memoised, so N distinct callee chains cost what N/K chains read
+// K times each do. A summary that scans the program per callee separates the two arms.
+axis(
+  "getter callees",
+  2.5,
+  "The effects summary is doing whole-program work per callee instance rather than one memoised walk (`esRowFor`).",
+  (d) => twoFiles(d, genGetterCallees(1600, 1), genGetterCallees(1600, 20)),
+);
 
 // ── the instrument's own control ─────────────────────────────────────────────
 // EVERY PAIR ABOVE PASSES, so nothing above can say whether the grader still reds. The

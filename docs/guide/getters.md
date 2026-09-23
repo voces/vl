@@ -90,7 +90,7 @@ not:
 | recursion-free | a getter that reads itself, directly or through other getters (`x` reads `y`, `y` reads `x`) |
 | allocation-free | a struct, list or closure literal; string `+`; string interpolation |
 | effect-free | an assignment to anything but its own `let` locals; a read of a module `let` binding (the heap reachable from `self` or a module `const` stays readable, like linear memory) |
-| calls intrinsics and getters only | a user or std function, a method (`s.slice(…)`), a host `extern`, a function value (including one named like an intrinsic), a user operator (`"+"` or `"[]"` for a nominal type) |
+| calls only what qualifies | a function (user or std, called directly, by UFCS, or as a user operator `"+"` / `"[]"`) that writes, allocates, prints or has no step bound (below); a built-in method (`s.slice(…)`); a host `extern`; a function value (including one named like an intrinsic) |
 | no hidden loops | `==` `!=` `<` `<=` `>` `>=` over two strings, or over lists, maps or structs; an index into a map; list `+`; float `%` |
 | bounded | a body costing more than 16 steps (below) |
 
@@ -105,12 +105,38 @@ no effect but a trap: the scalar numeric ones (`sqrt`, `abs`, `floor`, `ceil`, `
 operations and `__trap__`. A trap, from `as!`, an integer division or `divU` by zero, is
 allowed: the program stops either way.
 
+**Calling a function.** A getter may call an ordinary function, yours or std's, directly, by
+UFCS or as a user operator, when that function writes nothing (no module `let`, nothing
+reachable from its arguments, no linear memory), reads no module `let` or `extern let` (a
+getter may not, so neither may what it calls; a module `const` is fine), allocates nothing,
+calls no host function (`print` included) and nothing it cannot see (a function value), and has
+a step bound: no loop and no recursion, through every function it calls in turn. The compiler works this out for
+each function; you write nothing.
+
+```vl
+function clamp01(x: f64): f64 { if x < 0.0 { 0.0 } else if x > 1.0 { 1.0 } else { x } }
+get level(self: Knob): f64 { clamp01(self.raw) }
+```
+
+A generic function is judged at the types the call uses: `same(self.n, 3)` over
+`function same<T>(a: T, b: T): boolean { a == b }` is fine at `i32` and refused at `string`,
+where `==` walks the characters. A refusal names the fact and the path to it:
+
+```
+the getter `g2` on V calls `viaBump`, which writes the module `let` `count` (viaBump() →
+bump()), and a getter must not have side effects — make it a method: …
+```
+
+Hovering a function name in the editor shows the same facts in one line:
+`writes: none · reads: none · allocates: no · cost: 0 steps · I/O: none`.
+
 **The step budget.** A getter may read other getters, so a body that looks small can do a lot
 of work: four reads of a getter that reads four more is sixteen reads behind one `.x`. The
 checker counts abstract steps and refuses a getter over **16**. Reading a getter costs 1 plus
 that getter's own cost; comparing with a string literal costs the literal's length (`is "ab" |
 "cd"` costs both, 4); an `if` or `match` costs its dearest arm, not the sum; arithmetic, field
-reads, conversions and intrinsics cost nothing. The refusal names the path that made the total:
+reads, conversions and intrinsics cost nothing; calling a function costs 1 plus that function's
+own cost. The refusal names the path that made the total:
 
 ```
 the getter `a4` on C costs 340 steps (a4 → a3 (4×) → a2 (4×) → a1 (4×) → a0 (4×)), and a getter

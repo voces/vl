@@ -105,6 +105,7 @@ import {
   ufcsCompletions,
   ufcsProbeSource,
   type UfcsProbeModule,
+  withEffects,
 } from "./typeFeatures.ts";
 import { invalidNewNameReason, planRenameAt, renameEdits } from "./rename.ts";
 import {
@@ -926,9 +927,13 @@ const wordAt = (line: string, character: number): string | null => {
 // via the TextMate grammar. One layout for hover and completion — the fence info string
 // must match the registered language id. An undocumented declaration is the bare fence,
 // byte for byte what this rendered before docs existed.
-const hoverMarkdown = (code: string, doc?: string): Hover["contents"] => ({
+const hoverMarkdown = (
+  code: string,
+  doc?: string,
+  effects?: string,
+): Hover["contents"] => ({
   kind: "markdown",
-  value: docMarkdown(code, VL_LANGUAGE_ID, doc),
+  value: withEffects(docMarkdown(code, VL_LANGUAGE_ID, doc), effects),
 });
 
 // D8 stepwise alias expansion (hover verbosity): the renderer (`stringifyType`'s
@@ -1016,6 +1021,23 @@ connection.onHover(async (params): Promise<Hover | null> => {
         return undefined;
       });
   };
+  // The effects summary of the function the cursor's name resolves to (what it writes,
+  // whether it allocates, its cost in steps, its host calls); undefined off a function.
+  const wasmEffects = async (): Promise<string | undefined> => {
+    if (wasmChecker?.effectsAt === undefined) return undefined;
+    return await wasmChecker
+      .effectsAt(
+        document.getText(),
+        entryKeyOf(params.textDocument.uri),
+        workspaceReader,
+        params.position.line,
+        params.position.character,
+      )
+      .catch((err) => {
+        connection.console.log(`[wasm-symbols] effectsAt failed: ${err}`);
+        return undefined;
+      });
+  };
   const wordForHover = wordAt(
     document.getText({
       start: { line: params.position.line, character: 0 },
@@ -1040,9 +1062,17 @@ connection.onHover(async (params): Promise<Hover | null> => {
   if (!wordForHover) return null;
   const doc = await wasmDoc();
   const t = displayableType(await wasmHoverType());
-  if (t) return { contents: hoverMarkdown(`${wordForHover}: ${t}`, doc) };
+  if (t) {
+    return {
+      contents: hoverMarkdown(`${wordForHover}: ${t}`, doc, await wasmEffects()),
+    };
+  }
   const mt = displayableType(await wasmMemberType());
-  if (mt) return { contents: hoverMarkdown(`${wordForHover}: ${mt}`, doc) };
+  if (mt) {
+    return {
+      contents: hoverMarkdown(`${wordForHover}: ${mt}`, doc, await wasmEffects()),
+    };
+  }
   const at = displayableType(await wasmTypeAlias());
   if (at) return { contents: hoverMarkdown(`${wordForHover}: ${at}`, doc) };
   // Builtin (`print`/`i32`/…): the word in the native builtin set. No user

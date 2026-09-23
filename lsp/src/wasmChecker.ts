@@ -471,6 +471,28 @@ export type WasmChecker = {
     character: number,
   ) => Promise<string | undefined>;
   /**
+   * Hover EFFECTS (function-effects-design §D): the summary of the function the name
+   * under the cursor resolves to, one line — "writes: none · reads: none · allocates: no ·
+   * cost: 3 steps · I/O: none". undefined off a function, and when the seed predates the export.
+   */
+  effectsAt?: (
+    source: string,
+    entryKey: string,
+    read: ModuleReader,
+    line: number,
+    character: number,
+  ) => Promise<string | undefined>;
+  /**
+   * The effects dump: one `name<bindings>: summary` line per top-level function and
+   * getter of the entry module, each followed by the instances its calls pinned. The
+   * fixture reader for `tests/vl_effects_summary_test.ts`. "" when the seed predates it.
+   */
+  effectsDump?: (
+    source: string,
+    entryKey: string,
+    read: ModuleReader,
+  ) => Promise<string>;
+  /**
    * Semantic tokens (Stage 2): every classified IDENTIFIER occurrence in the
    * document (binding kind + declaration flag + span). Empty when the seed
    * predates the token exports — the host then falls back to its TS pass.
@@ -1280,6 +1302,40 @@ export const createWasmChecker = (
     const len = exp.docAt(line + 1, character);
     if (len <= 0) return undefined;
     return readString(len, (j) => exp.docCharAt(j));
+  };
+
+  const effectsAt = async (
+    source: string,
+    entryKey: string,
+    read: ModuleReader,
+    line: number,
+    character: number,
+  ): Promise<string | undefined> => {
+    const exp = instantiate();
+    if (exp === undefined || !speaksAbi(exp) || !hasSymbols(exp) ||
+      typeof exp.effectsAt !== "function") {
+      return undefined;
+    }
+    await ensurePrepared(exp, source, entryKey, read);
+    const len = exp.effectsAt(line + 1, character);
+    if (len <= 0) return undefined;
+    return readString(len, (j) => exp.effectsCharAt(j));
+  };
+
+  const effectsDump = async (
+    source: string,
+    entryKey: string,
+    read: ModuleReader,
+  ): Promise<string> => {
+    const exp = instantiate();
+    if (exp === undefined || !speaksAbi(exp) || !hasSymbols(exp) ||
+      typeof exp.effectsDump !== "function") {
+      return "";
+    }
+    await ensurePrepared(exp, source, entryKey, read);
+    const len = exp.effectsDump();
+    if (len <= 0) return "";
+    return readString(len, (j) => exp.effectsDumpCharAt(j));
   };
 
   // The token exports ride the same Stage-2 seed as the symbol exports; an older
@@ -2172,6 +2228,8 @@ export const createWasmChecker = (
     signatureAt,
     typeAliasAt,
     docAt,
+    effectsAt,
+    effectsDump,
     tokensAt,
     memberTokensAt,
     lexicalTokensAt,
