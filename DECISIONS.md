@@ -6849,3 +6849,45 @@ because membership compares lexemes and an escape and the character it stands fo
 `match` has no arm to refuse: its scrutinee may not be a string, so a `const` string literal
 cannot reach an arm pattern. `is string` over the constant reads it as the `string` it is, as
 every operator does, rather than refusing it as a type that "can never match".
+
+## `vl run` starts the GC heap at 256 MiB, and no host-side policy can be adaptive (2026-09-23) — plumb PL-014 lane 1
+
+#3022 started `vl run`'s GC heap at 64 MiB. plumb's decoder still spent ~45% of its time on
+wasmtime re-copying a 5.6 MB live set 89 times per pass (`docs/internals/perf/decode-bench-gap-2026-09.md`
+§3 A1). `vl run` now starts at 256 MiB, `vl run --batch` stays at 64 MiB, `vl test` at 8 MiB per
+worker, and `$VL_GC_HEAP` overrides all three. Measurements: `docs/internals/perf/gc-heap-policy-2026-09.md`.
+
+**Why a fixed size and not a survivor-aware one.** The right policy grows the heap when a
+collection's survivors are a large share of the semispace, so memory follows the live set rather
+than total allocation. wasmtime 47 gives a host nothing to build that from: no collection callback,
+no public live-set size, no way to request growth (`GcHeapOutOfMemory::new` is crate-private), and a
+limiter that can only veto. The one route that works is an epoch callback allocating a host-side
+balloon, and epoch interruption alone cost 11–16% CPU on the decoder, more than the growth bought
+back. So the fix that belongs upstream is filed upstream (draft:
+`docs/internals/perf/wasmtime-copying-heap-growth-issue.md`), and the host picks the one number it
+controls.
+
+**Why 256 MiB.** Decode CPU stops falling there: 1 pass 0.86 → 0.68 s (−21%), 3 passes 2.60 →
+1.92 s (−26%). 384 and 512 MiB measure the same as 256. The price is memory the program touches,
+never its live set: a program that allocates less than the heap in total pays nothing (hello and a
+2 M-allocation program are unchanged). One that allocates more commits up to 256 MiB and pays ~40 ms
+of page faults for it (a short heavy allocator: 73 → 270 MB, 0.08 → 0.12 s wall).
+
+**The container cost.** Committed memory is what a cgroup counts. Under `MemoryMax=200M` or
+`256M`, a program with a tiny live set and 20 M allocations is OOM-killed (rc 137) at the 256 MiB
+default and runs at `VL_GC_HEAP=64M`, which `vl help run` says. A follow-up could cap the default
+at a fraction of the cgroup limit (`/sys/fs/cgroup/memory.max`).
+
+**Why `--batch` and `vl test` stay small.** Both make a fresh store per case or worker, so the
+fault cost is paid per store: a 48-case batch went 0.87 → 1.26 s wall at 256 MiB, and a 12-file
+`vl test` at 64 MiB per worker commits 823 MB against 134 MB at 8 MiB.
+
+**Why an environment variable.** `run_cmd` parses `vl run`'s flags in Rust, so a flag was possible.
+An environment variable was chosen because it matches `$VL_GC`, the other collector dial, and
+because it reaches every path that builds a user-program engine: `vl test`'s workers, `--batch`, and
+a `vl` started by a script or a child process, none of which a `vl run` flag would reach. It is also a
+tuning knob that never changes what a program means, which is what this host keeps in the
+environment. A value that does not parse, or is not UTF-8, is a hard error.
+
+**Revisit** when wasmtime grows a copying heap by survivor share: the default can then come back to
+64 MiB or below and take the RSS price with it.

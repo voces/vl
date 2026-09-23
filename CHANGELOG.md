@@ -940,6 +940,25 @@ new: the compare-frame pre-pass never recurses into a code-15 field, so a NESTED
   program — the guard's bound (20) sits with wide margin on both sides of that 149x
   spread, and a collection count of at least one is itself a fired CONTROL proving the
   counter is alive.
+- **`vl run` starts the program's GC heap at 256 MiB, and `$VL_GC_HEAP` sets it (plumb
+  PL-014, lane 1 of `docs/internals/perf/decode-bench-gap-2026-09.md`).** wasmtime's copying
+  collector grows only when the live set nearly fills a semispace, so plumb's decoder
+  re-copied its 5.6 MB table 89 times per pass at 64 MiB. At 256 MiB: 19 collections, decode
+  CPU 0.86 → 0.68 s per pass (−21%), 3 passes 2.60 → 1.92 s. The price is memory the program
+  touches: up to 256 MiB for a program that allocates that much in total, and nothing for one
+  that does not (`hello`, a 2 M-allocation program: unchanged). Under a cgroup memory cap of
+  200–256 MiB, a high-churn program with a tiny live set is now OOM-killed where it ran before;
+  `VL_GC_HEAP=64M` restores it (`vl help run` says so). `vl run --batch` stays at
+  64 MiB and `vl test` at 8 MiB per worker, since both pay per store. `$VL_GC_HEAP=64M` (bytes
+  or a K/M/G suffix, at most 4G; a bad value is a hard error) overrides any of them. wasmtime
+  47 has no hook for a survivor-aware policy: an epoch-callback prototype worked, but epoch
+  interruption alone cost 11–16%. The upstream issue is drafted in
+  `docs/internals/perf/wasmtime-copying-heap-growth-issue.md` and reproduces on the stock
+  wasmtime 49 CLI. `tests/vl_gc_heap_shape_test.ts` now holds a 400,000-struct live set:
+  222 / 20 / 3 collections at 0 / 64 MiB / 256 MiB. The default must collect 1–10 times,
+  `VL_GC_HEAP=64M` at least 3× as often, and a bad value must fail. The 64 MiB host fails it
+  with 20. Survey, trade-off tables and the rejected options:
+  `docs/internals/perf/gc-heap-policy-2026-09.md`.
 
 - **A function with thousands of sibling blocks re-declaring the same temps compiles in linear time (D2090, plumb's full build).** The emitter found a local's slot by scanning every local of the frame, `capScan` tested each identifier against a list holding every `let` so far, and — the multiplier — `dupScanRun` re-ran the whole scratch-detection sweep once per same-named slot, because it counted each `LetDecl` as a distinct rep. Now a per-frame name index answers a lookup from the name's own slots, `capScan`'s bound set is a map, a declaration no declaration reader can answer for is one class rather than its own, and a bias whose names resolve to classes an earlier sweep already saw is not re-swept. Output is byte-identical (self-compile, 6,386 corpus and fixture programs, four plumb units); plumb's `chunk_142` goes 1,877 s → 3.9 s, and `chunk_143` and `chunk_73`, which ran 2,390 s and 4,993 s into a 4 GiB heap trap, build in 2.7 s and 4.1 s. Guarded by two `vl_scaling_shape_test.ts` axes.
 - **`extern function g(a: i32): void` declares a result-less host import, and an extern with no return type is a check error (D1997, reported by plumb as PL-013; owner ruling 2026-09-22).** A call to a `: void` extern is a statement — graded at top level, in a `: void` or inferred-return function's tail, in all three lambda forms, in a branch and before a bare `return` — and using its value is refused where a void `function`'s is (binding, `print`, `return`), plus two value positions that let a void `function` through as well and now refuse both: a `==`/`!=` operand and a generic argument (`id(g(1))`). `extern function g(a: i32)` with NO return type used to build a module that failed to validate (a `drop` after a call that left nothing); it is now a check error that names the fix (“write `: void` for an extern that returns nothing”), since an extern has no body to infer from. `void` stays refused as a parameter, now with a message about `void` rather than the `Buf` workaround. An extern called inside a lambda, or inside any function of a module that uses a function value, was `emitProgram: call to unknown function` at every return type (the name was captured like a variable); it now takes the capture exemption the intrinsics have. A second declaration with no return type after a `: void` one gets the same “write `: void`” message. Along the way (D2010): a closure capturing a module-scope `for` variable typed its env field `i32` whatever the element was (invalid wasm for a string or f64, a loud reject for a function), and a loop variable named like a numeric intrinsic was called as the opcode — `for sqrt in fns { … sqrt(16.0) }` printed 4; all run now. `tests/vl_extern_test.ts` runs every position against a host that provides the import and links a `: void` export from one unit into a `: void` extern of another.
