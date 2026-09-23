@@ -398,11 +398,13 @@ Each now says so, in the shape the `concat`-vs-`+` bullet uses.
     `writeFileRange(p, fileSize(p), d)`: `O_APPEND` reads and uses the offset atomically.
   - **`writeFile` now PROMISES to create a missing file**; the old comment left that to the
     host. Every host already did (`std::fs::write`), so no caller's behaviour changed.
-- **`appendTextFile` is NOT here, pending an owner ruling.** The design-level API review
-  asked for either the text sibling or a header line refusing it; the rulings named exactly
-  three write names, so neither was added. Until it is ruled, text is encoded once with
-  `encodeUtf8` at the call. When it is: a "no" rewords the header's text line to "only
-  whole-file reads and writes have a text sibling", since `appendFile` is not a byte range.
+- **`appendTextFile` exists by owner ruling (2026-09-23, `fs-streaming-design.md` §6 Q7)**,
+  added after the three byte writes: logs are text, and an append of whole strings never
+  splits a character. It mirrors `writeTextFile` exactly — the empty path is refused under
+  its own name, and every other failure is reported by `appendFile`'s message, as
+  `writeTextFile`'s are by `writeFile`'s. The header's text line became "text is UTF-8,
+  whole or appended, never a byte range, which can split a character": `appendFile` is not a
+  byte range, and `writeFileRange` and the range reads still have no text sibling.
 - **Two floor slots, 15 and 16.** `__fs_write_at__(path, offset, data: u8[], mode)` and
   `__fs_write_from__(path, offset, addr, len, mode)`; `mode` is 0 replace (`O_TRUNC`),
   1 at the offset (no truncate), 2 append (`O_APPEND`) — a host argument no caller spells,
