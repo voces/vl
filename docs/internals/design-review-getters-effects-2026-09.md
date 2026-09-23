@@ -29,15 +29,21 @@ synthesis re-ran it on `dist/vl`.
   counts loop trips, so calls are free. Four lenses want a step count (calls cost 1 plus the
   callee, branches take the max). Three found that the amendment's own example does not
   type-check (D2065). The minimalist wants the amendment reverted until a consumer runs.
-- **Q3: no setters.** All nine agree. Game-perf names the one consumer (a flat-row handle whose
-  setter stores through `self`), and Swift names the only shape worth building later (value
-  write-back derived from `withX`).
+- **Q3: no setters, 8–1.** Game-perf dissents: narrow "none" to "none that write to `self`",
+  because a setter that stores *through* a handle (a flat-row `RowAddr = new i32` storing into
+  linear memory) has no write-back problem, and `units[i].hp -= dmg` is the data-oriented use.
+  The majority attached conditions: Swift wants any future setter to be value write-back via
+  `withX`; TypeScript and C# want private backing fields first; type-theory bars setters from
+  assignment narrowing; Rust objects to hidden calls on `+=`.
 - **Q4: a getter type is sealed off from every generic and un-annotated caller today, and the
   guide's workaround is false (D2066).** Eight lenses want `{ readonly x }` at specialised
-  positions. None wants witness tables or adaptors. Type-theory found that records are unsound
+  positions. Five reject witness tables and adaptors outright, TypeScript and compiler-engineer
+  would refuse them until a consumer asks, and type-theory admits a snapshot coercion only for a
+  getter that reads nothing mutable; none wants them now. Type-theory found that records are unsound
   underneath it: a mutable field is accepted covariantly and a check-clean program traps
   (D2060, independent of getters).
-- **Q5: getter-eligible is not `pure`.** Nine of nine agree. The vocabulary is already tangled:
+- **Q5: getter-eligible is not `pure`.** Nine of nine agree on the distinction; the beginner
+  disagrees on the vocabulary and the minimalist questions building `pure` yet. The vocabulary is already tangled:
   the shipped message says "pure intrinsic", and the effects doc cites Koka's `pure` wrongly.
 - **Q6: the summary's shape is right**: inferred, kept out of types, with one checked marker.
   Three corrections recur: the checker already has an interprocedural write analysis
@@ -63,11 +69,11 @@ headed its own section.
 | type-theory | split | semantic half makes a getter an *observation* (reorder, CSE, narrowing); cost half is a warning |
 | minimalist | keep | "hard error, or nothing"; the middle option is the worst of the three |
 
-**Where they converge.** Nobody wants the proposal as written. The use-site
-`// vl-allow getter-cost` comment is rejected by all nine. Swift, Rust, game-perf and beginner
-reject it outright. TypeScript, compiler-engineer and type-theory would allow an opt-out only on
-the *declaration*, and TypeScript wants `@ts-expect-error` semantics (an unused suppression is
-itself a diagnostic). The minimalist's objection is procedural: VL's first per-site suppression
+**Where they converge.** Nobody wants the proposal as written. No lens wants the
+`// vl-allow getter-cost` comment at the read site. Swift, Rust, game-perf, beginner and
+minimalist reject it outright. TypeScript, compiler-engineer and type-theory would allow an
+opt-out, but only on the *declaration*, and TypeScript wants `@ts-expect-error` semantics (an
+unused suppression is itself a diagnostic). The minimalist's objection is procedural: VL's first per-site suppression
 is a language-wide decision and should not ride in on one lint. Five lenses (Swift, Rust,
 game-perf, beginner, minimalist) name the std/user split as two dialects. A getter copied out of
 std would compile under different rules.
@@ -111,8 +117,10 @@ not split by directory.
 | type-theory | agree, formula has a hole | add a call term; rule on `0 until i` with `i: Lane4`; `step -1`; I13 |
 | minimalist | disagree | revert to loop-free; the rule has no consumer that runs, and "relax only" is the `constexpr` ratchet |
 
-**Converge.** Eight of nine accept "never data-dependent" as the right *category* line: it is
-syntactic, and the next step (a data-bounded loop) breaks it rather than moving a number. The
+**Converge.** All nine accept "never data-dependent" as the right *category* line, including
+the minimalist, who calls it "a sound stopping rule for which category of loop gets in" and
+disagrees only because the budget is a knob. C#/Kotlin, Rust, compiler-engineer and type-theory
+deny that it is *sufficient*, because of the unit (below). The category line is syntactic, and the next step (a data-bounded loop) breaks it rather than moving a number. The
 precedents cited independently are WGSL (no recursion), HLSL `[unroll]`, the eBPF verifier and
 Zig's branch quota.
 
@@ -165,12 +173,34 @@ because binaryen does not unroll (game-perf).
 | type-theory | agree; a validating setter breaks PutGet, which `writeReNarrowTy` relies on |
 | minimalist | agree none; the proposed narrowing makes legality depend on representation |
 
-**Recommended resolution: keep F7 ("none") and do not narrow it to reference types.** No lens
-wanted reference-type setters. Two are worth recording in DECISIONS.md as the only candidate
-future shapes, so nobody builds the other one first. Game-perf's handle setter
-(`units[i].hp -= dmg` over a flat row, with the receiver bound once) is the measured consumer.
-Swift's value write-back derived from `withX` is the form with precedent. Type-theory's PutGet
-point is the constraint either would have to meet: a setter place must not re-narrow on write.
+**Tally: 8–1 for "none".** Game-perf is the dissent, and it is a real one, not a wording
+change. The rule that avoids CS1612 is "the setter's body never assigns `self`", not "value
+type versus reference type". A handle brand such as `RowAddr = new i32` writes *through* its
+receiver into linear memory, so there is nothing to write back. Its hot path,
+`units[i].hp -= dmg`, reads today as `units[i].setHp(units[i].hp - dmg)`, which computes the
+address twice at `-O0`. Game-perf also raises the spelling question any such setter must
+answer: `-=` has to evaluate the receiver place once.
+
+**The majority's "none" is conditional, and the conditions differ:**
+
+- Swift: if setters ever come, they are value-type write-back derived from a `withX` function
+  (`v.x = 1` means `v = v.withLane(0, 1)` on an assignable place), never reference-type method
+  sugar.
+- TypeScript and C#/Kotlin: validation and reactivity setters need private backing fields (or
+  `readonly` fields) first, or they guard a door beside an open window.
+- Type-theory: a setter place must never take part in assignment narrowing, because a
+  validating setter breaks PutGet and `writeReNarrowTy` relies on it.
+- Rust (and compiler-engineer): `a.x += 1` becomes two hidden calls, get then set, which is
+  hidden control flow on the left of `=` and D1510's ordering class again.
+
+**Recommended resolution: keep F7 ("none") for now, and do not narrow it to "none on value
+types".** Nobody but game-perf wants setters now, and the proposed narrowing is the one shape
+no lens asked for. Record in DECISIONS.md that game-perf's **store-through-handle setter** is
+the one credible narrow exception, to be designed if a flat-row consumer needs it. It would
+satisfy every majority condition except Rust's. Its body never assigns `self` (the CS1612
+point), there is no backing field to protect, and it can stay out of narrowing (PutGet).
+Rust's hidden-call objection is what it would have to answer, with a receiver-once `-=` and a
+cost contract like the getter's. Swift's `withX` write-back stays the other recorded shape.
 
 ### Q4. Should getters satisfy read-only structural contracts?
 
@@ -186,9 +216,14 @@ point is the constraint either would have to meet: a setter place must not re-na
 | type-theory | modify, bound first | `{x} <: {readonly x}` one way; mutable fields invariant; **fix D2060 first** |
 | minimalist | not now | build only if `readonly` *fields* earn it; never witness tables |
 
-**Converge.** Nine of nine: no witness tables or silent adaptors. Every lens that discussed it
-cites the same precedent, a visible `dyn` or `any` against an invisible one. Eight of nine: yes
-at specialised positions. Plain `{ x: f32 }` must never accept a getter (TypeScript #13347,
+**Converge.** No lens wants witness tables or silent adaptors now, but that is not nine flat
+no's. Five reject them outright: Swift, C#/Kotlin, Rust, game-perf and minimalist, all citing a
+visible `dyn` or `any` against an invisible one. TypeScript and compiler-engineer would refuse
+those positions loudly until a consumer asks (compiler-engineer sketches the eventual witness,
+`{anyref obj, funcref getx}`). Type-theory makes the annotated position a checker refusal in
+v1, but admits a *snapshot* coercion for a getter that reads nothing mutable (every `F32x4`
+lane) and a live witness later. The beginner does not address it. Eight of nine: yes at
+specialised positions (the minimalist says not now). Plain `{ x: f32 }` must never accept a getter (TypeScript #13347,
 cited by five).
 
 **Urgency comes from D2066.** Today a getter type satisfies no field bound, no method bound, and
@@ -207,7 +242,8 @@ per-parameter write summary `fnWriteEffects` already computes, so Q4 and Q6 shou
 
 ### Q5. Is getter-eligible rightly not `pure`?
 
-Nine of nine agree. The refinements:
+Nine of nine agree on the distinction. Two qualify it: the beginner disagrees on the vocabulary,
+and the minimalist questions building `pure` at all yet. The refinements:
 
 - **Vocabulary.** The shipped message says "neither a pure intrinsic nor a getter" (beginner,
   **re-verified**). The guide says "effect-free". The effects doc says a getter is not `pure`.
@@ -236,7 +272,8 @@ Nine of nine agree. The refinements:
 | minimalist | mostly speculative | measure binaryen's `--generate-global-effects --licm` first; defer to concurrency step 6; start from three facts; reserve no empty slots |
 
 **Converge.** Inferred, never in types, pessimistic at unknown calls, with Nim's rule later:
-nine of nine. The four corrections that more than one lens reached independently are listed in
+no lens objects to any of these, and the minimalist, who would defer building most of the
+summary, calls Nim's rule the best idea in the doc. The four corrections that more than one lens reached independently are listed in
 §3. The genuine split is scope. The minimalist wants three facts and a deferral. Game-perf wants
 *more* precision (`W` split, alias classes). The compiler-engineer wants a different computation
 unit.
@@ -347,7 +384,9 @@ Each lists options, who holds which, and the synthesis recommendation.
 (a) keep one hard error for everyone, no suppression (Swift, C#, Rust, game-perf, beginner,
 minimalist); (b) split by seam: effects an error, cost a warning for users and an error for std,
 with a declaration-site opt-out that reports when unused (TypeScript, compiler-engineer,
-type-theory); (c) the proposal as written: warning, std-only error, use-site comment (no lens).
+type-theory); (c) the proposal as written: the whole contract a warning for users, an error
+for std, and a per-site comment. No lens holds (c): the three splitters keep the effect half an
+error everywhere, and none puts the opt-out at the read site.
 **Recommend (a)**, conditional on closing D2061–D2064 first. Rule out (c) explicitly. Rule
 separately, if ever, whether VL gets per-site suppression at all (minimalist).
 
@@ -361,15 +400,25 @@ helpers are charged their worst case. This applies to v1 as well and closes D206
 recorded in DECISIONS.md. Game-perf's 16-trip figure is the reference point.
 (iv) Refinement-bounded loops (`0 until i`, `i: Lane4`)? Recommend **never**, by name.
 
-**D-Q3. Setters.** Recommend **keep "none"; do not narrow it to reference types.** Record the two
-candidate future shapes, game-perf's handle setter and Swift's value write-back, together with
-type-theory's PutGet constraint.
+**D-Q3. Setters (8–1, game-perf dissenting).**
+(a) keep "none" (eight lenses, most with a condition: Swift's `withX` write-back, TS and C#'s
+private fields first, type-theory's no-narrowing, Rust's no hidden calls on `+=`); (b) narrow to
+"none on value types", which permits reference-type setters (no lens); (c) narrow to "none that
+write to `self`" (game-perf).
+Recommend **(a) now, and rule out (b)**. Record game-perf's **store-through-handle setter** in
+DECISIONS.md as the one credible narrow exception, to be designed if a flat-row consumer needs
+it. Its design must answer the receiver-once `-=` spelling (`units[i].hp -= dmg` evaluates
+`units[i]` once), stay out of assignment narrowing (PutGet), and carry a cost contract like the
+getter's so the store cannot hide other effects. Record Swift's `withX` write-back as the other
+admissible shape.
 
 **D-Q4. `{ readonly x }` and getters.**
 Build it bound-only at specialised positions? Recommend **yes**, sequenced after D2060 and after
 S2's per-declaration write summary. Urgency: fix D2066's guide sentence and message **now**, and
-build the bound in the next getters slice, not "later". Never adaptors or witness tables (nine
-of nine). TypeScript's parameter-sugar and inferred-read-only-row extensions are compatible
+build the bound in the next getters slice, not "later". No adaptors or witness tables now:
+five lenses reject them outright, TypeScript and compiler-engineer want them only with a
+consumer, and type-theory's snapshot coercion for immutable-receiver getters is the one
+exception worth keeping in view. TypeScript's parameter-sugar and inferred-read-only-row extensions are compatible
 follow-ups.
 
 **D-Q5. `pure` and getter-eligible.** Recommend **keep them separate** (nine of nine), strip "pure"
