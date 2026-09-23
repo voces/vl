@@ -66,3 +66,4 @@ D2060-D2069  vl-11  2026-09-22  persona review defects
 D2120-D2129  vl-11  2026-09-23  getter step budget lane (D2061-D2063 residue; D2120 filed)
 D2135-D2144  vl-11  2026-09-23  effects summary s1 (getters call qualifying functions)
 D2150-D2159  vl-11  2026-09-23  literal-union atom rep everywhere (feat/litunion-atom-everywhere)
+D2167-D2168  vl-11  2026-09-23  #3056 review residue (D2167 filed; D2168 spare)

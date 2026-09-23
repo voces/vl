@@ -6654,8 +6654,14 @@ as a hidden alias `#luN` when it first resolves one (`annUnionInnerTy`), and wri
 `UnionDecl` for each into the program before canon, so the emitter's passes that walk
 declarations see it exactly as they see a written one. `#` is not an identifier character, so
 the name cannot collide, and `demangleMsg` renders it as its member set, so no user reads it.
-`mkUnionTy` hands back a registered set's own index when a join or a narrowing lands on exactly its
-members, so no twin index can read as the string rep beside it.
+The registry is indexed by member set, so a lookup costs a key, not a scan.
+
+**THE CHECKER DOES NOT COLLAPSE A MINTED SET ONTO THE ALIAS.** A join, a narrowing or a generic's
+`T | "b"` substituted at a pin keeps its own arena index. The pin case decides it: the instance
+returns the `string` its pinned `T` is, so the call's recorded type must be a set the emitter
+reads as a string and narrows at a literal-typed destination. Where one question needs the member
+set (a function whose inferred return is a join equal to an alias's set), the emitter asks the
+member-set predicate `litUnionAliasNameOfTy` rather than the index.
 
 *Alternatives.* Teaching each of the ~40 name- and index-keyed rep sites the inline set (the
 litunion-compact-rep-design.md route) is the same change spread over every consumer, with the
@@ -6677,7 +6683,8 @@ escape and the character it spells agree.
 **`const Z = "zz"` HAS TYPE `"zz"`, AND IT WIDENS WHERE IT IS STORED.** After TypeScript's
 widening literal: the type is minted fresh per binding and flagged, kept wherever the value is
 read, and widened to `string` where it is stored somewhere reassignable — a `let`, a list or
-object literal, a type argument, the element an empty container pins from it. Without the widening,
+object literal, a type argument, an operator operand, the element an empty container pins from
+it — and the widening is structural, through joins, function results, lists and maps. Without the widening,
 `let s = Z; s = "other"`, `[Z].push("w")` and `wrap(Z).push("other")` all stop checking. The
 recorded node type is the widened `string`, so no emitter classifier sees a literal it never
 saw before; `nodeWideStrLitText` is the one question the literal answers. Scope, as ruled: a

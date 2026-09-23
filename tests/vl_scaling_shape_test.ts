@@ -90,6 +90,25 @@ const genUnions = (n: number, k: number): string => {
   return o.join("\n") + "\n";
 };
 
+// The literal-union registry's axis (D2150): N functions typed with an inline string-literal
+// set, spread over N distinct sets in the many arm and N/K in the one arm. Each distinct set
+// registers a hidden alias, so a lookup that scans the registry is quadratic in the sets.
+const genLitSets = (n: number, k: number): string => {
+  const m = Math.max(1, Math.floor(n / k));
+  const o: string[] = [];
+  for (let i = 0; i < n; i++) {
+    const t = i % m;
+    o.push(
+      `function f${i}(k: "a${t}" | "b${t}" | "c"): i32 { if k == "c" { return 1 } if k == "a${t}" { return 2 } 3 }`,
+      `function g${i}(b: boolean): "a${t}" | "b${t}" | "c" { if b { return "c" } "b${t}" }`,
+    );
+  }
+  o.push("let acc = 0");
+  for (let i = 0; i < n; i++) o.push(`acc = acc + f${i}(g${i}(${i % 2 === 0}))`);
+  o.push("print(acc)");
+  return o.join("\n") + "\n";
+};
+
 // N call sites either way; the many arm spreads them over N callees, the one arm over
 // N/K. Both DECLARE N functions, so only the callee distribution differs.
 const genCallSites = (n: number, k: number): string => {
@@ -386,6 +405,11 @@ axis(
   "Memoise it on an arena prefix the way `moduleHasUnionAs` does (compiler/emit_classify.vl), clearing the memo in `emitProgram`.",
   (d) => twoFiles(d, genFunctions(1600, 20), genFunctions(80, 400)),
 );
+
+// D2150's pair: a registry lookup that scans every registered set made the many arm
+// quadratic in the sets; the member-set index keeps it linear.
+axis("literal-union sets", 2.5, "A literal-union lookup is scanning the union registry.", (d) =>
+  twoFiles(d, genLitSets(3000, 1), genLitSets(3000, 20)));
 
 // 1.37 / 1.15 / 1.19.
 axis("types", 2.5, "A per-declaration cost is scaling with the type table.", (d) =>

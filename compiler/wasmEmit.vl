@@ -30,6 +30,7 @@ import {
   nodeArrayElemIsNulLitUnion,
   nodeArrayElemIsNulStr,
   nodeEqCmpKind,
+  nodeHasWideStrLit,
   nodeLitMembersWithin,
   nodeNulLitUnionMemberTexts,
   nodeNumScalarBaseName,
@@ -52,6 +53,7 @@ import {
   nodeTyMapValIsNulLitUnion,
   nodeTyMapValLitUnionTexts,
   nodeTyPinIxOf,
+  nodeUnwidenedTyOf,
   nodeWideStrLitText,
   nominalStructNameOfTy,
   numLitUnionBaseName,
@@ -2612,8 +2614,14 @@ function emitIs(body: u8[], isIx: i32, fnIx: i32) {
   if nd0 is IsExpr {
     if exprIsLitAtom(nd0.isObj, fnIx) {
       // Every member of a literal union is a string, so `is string` holds of the atom
-      // outright; the member ladder below has no member texts for the base to test (D2154).
+      // outright, and of the `K | null` niche exactly when it is not the `-1` null (D2154).
       if tyPrimNameOf(isVarTyIxOf(isIx)) == "string" {
+        if exprNulLitUnion(nd0.isObj, fnIx) {
+          if emitExpr(body, nd0.isObj, fnIx) < 0 { return -1 }
+          fbI32Const(-1)
+          fbI32Bin(71) // 0x47 i32.ne
+          return 0
+        }
         fbI32Const(1)
         return 0
       }
@@ -12600,9 +12608,10 @@ export function emitExpr(body: u8[], exprIx: i32, fnIx: i32) {
   // `local.set` of a `(ref $array)` into an `i32` slot: invalid wasm at every such destination.
   if pendingLitUnion == 1 {
     // A read of a `const` bound to a literal is that literal, whose id needs no conversion.
-    const wideLit = nodeWideStrLitText(unwrapParen(exprIx))
-    if wideLit != "" {
-      return emitStaticLitAtom(body, exprIx, quoteLex(wideLit), fnIx)
+    const wideIx = unwrapParen(exprIx)
+    if nodeHasWideStrLit(wideIx) {
+      const wideLex = quoteLex(nodeWideStrLitText(wideIx))
+      return emitStaticLitAtom(body, exprIx, wideLex, fnIx)
     }
     if strReppedLitUnionAt(exprIx, fnIx) {
       return emitStrToAtom(body, unwrapParen(exprIx), fnIx)
@@ -21397,7 +21406,7 @@ function emitStrToAtom(body: u8[], ix: i32, fnIx: i32) {
   // `tyLitMemberTexts` over the node's recorded type, NOT `nodeLitUnionMemberTexts`: that
   // node query declines a bare `TyLit` on purpose (its callers read an empty list as "not a
   // widenable atom"), and a bare `TyLit` is exactly the one-member set this narrowing serves.
-  const texts = tyLitMemberTexts(nodeTyIxOf(ix))
+  const texts = tyLitMemberTexts(nodeUnwidenedTyOf(ix))
   if texts.length == 0 {
     return emitFail("emitProgram: literal-union atom narrowing with no members")
   }
@@ -21551,7 +21560,7 @@ function strReppedLitUnionAt(ix: i32, fnIx: i32) {
   const av = unwrapParen(ix)
   const e = P.nodes[av]
   if e is StrLit { return false }
-  tyIsLitUnionOrLit(nodeTyIxOf(av))
+  tyIsLitUnionOrLit(nodeUnwidenedTyOf(av))
 }
 
 // The lexeme (quotes kept) operand `ix` is statically known to be: a string literal, or an
@@ -21562,8 +21571,7 @@ function staticStrLitLex(ix: i32): string {
   if u < 0 { return "" }
   const n = P.nodes[u]
   if n is StrLit { return n.strText }
-  const wide = nodeWideStrLitText(u)
-  if wide != "" { return quoteLex(wide) }
+  if nodeHasWideStrLit(u) { return quoteLex(nodeWideStrLitText(u)) }
   const t = nodeTyIxOf(u)
   if !tyIsOneStrLit(t) { return "" }
   quoteLex(tyLitMemberTexts(t)[0])
