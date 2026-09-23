@@ -7211,6 +7211,13 @@ function recordRedundantAnnot(
   if isNeverTy(initTy) { return 0 }
   if annot == TY_ERR { return 0 }
   if !tyEq(initTy, annot) { return 0 }
+  // Without its annotation a `const` bound to a string literal holds that literal's type, so a
+  // `string` annotation there is what lets it compare with other strings (D2198).
+  if n.letKw == "const" && n.letInit >= 0 {
+    const lin = P.nodes[n.letInit]
+    if lin is StrLit { return 0 }
+    if isWideLitJoin(nodeUnwidenedTyOf(n.letInit)) { return 0 }
+  }
   const nameTok = declNameTokOf(declIx)
   if nameTok < 0 { return 0 }
   if jwTokIsGenerated(nameTok) { return 0 }
@@ -37282,6 +37289,9 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
       if peekR >= 0 { rt = peekR }
     }
     if op == "==" || op == "!=" {
+      if constLitNeverMeets(n.binLeft, lt, n.binRight, rt, op, ix) {
+        return TY_BOOL
+      }
       const keepL = eqKeepsWideLit(lt, rt)
       const keepR = eqKeepsWideLit(rt, lt)
       if !keepL {
@@ -37907,7 +37917,7 @@ function mkWideStrLitTy(lex: string, fallback: i32): i32 {
 
 // Whether a compare keeps operand type `x` at its `const` literal: only beside a literal-typed
 // other side (or its nullable) that the literal is a member of. Anywhere else it compares as the
-// `string` it is, so `MODE == "release"` over `const MODE = "debug"` stays a false test.
+// `string` it is; `constLitNeverMeets` refuses a literal side it can never equal.
 function eqKeepsWideLit(x: i32, other: i32): boolean {
   if !isWideLitJoin(x) { return false }
   if other < 0 || isWideLitJoin(other) { return false }
@@ -37916,6 +37926,173 @@ function eqKeepsWideLit(x: i32, other: i32): boolean {
   const o = T.tys[other]
   if o is TyNullable { return assignable(x, o.nInner) }
   false
+}
+
+// Refuses a compare that can never hold: one side a `const` string literal (or a join of them),
+// the other a literal of a type with no member in common (owner ruling, D2198). Reports and
+// returns true when it refused; a side that may hold any string never refuses.
+function constLitNeverMeets(
+  lx: i32,
+  lty: i32,
+  rx: i32,
+  rty: i32,
+  op: string,
+  ix: i32,
+): boolean {
+  let wx = lx
+  let wty = lty
+  let oty = strLitViewOf(rx, rty)
+  if !isWideLitJoin(lty) {
+    if !isWideLitJoin(rty) { return false }
+    wx = rx
+    wty = rty
+    oty = strLitViewOf(lx, lty)
+  }
+  if oty < 0 { return false }
+  if !strLitSetsDisjoint(wty, oty) { return false }
+  const always = if op == "!=" { "true" } else { "false" }
+  tErr(constLitNeverMsg(wx, wty, oty, "comparison is always " + always), ix)
+  true
+}
+
+// The message for a test that a `const` literal never passes. `wx` is the const's operand, `wty`
+// its literal set, `oty` the set it is tested against, and `what` names the always-answer; the
+// suggested declaration adds `oty`'s members to the const's own.
+function constLitNeverMsg(wx: i32, wty: i32, oty: i32, what: string): string {
+  const dom: i32[] = []
+  flattenStrLits(wty, dom)
+  const one = dom.length == 1
+  const own = strLitsSpelled(dom)
+  const extra: i32[] = []
+  flattenStrLits(oty, extra)
+  let d = 0
+  while d < extra.length {
+    let seen = false
+    let j = 0
+    while j < dom.length {
+      if tyEq(dom[j], extra[d]) { seen = true }
+      j = j + 1
+    }
+    if !seen { dom.push(extra[d]) }
+    d = d + 1
+  }
+  const domStr = strLitsSpelled(dom)
+  const nm = constOperandName(wx)
+  const subj = if nm == "" { "this value" } else { nm }
+  const isWord = if one { " is always " } else { " is only ever " }
+  let msg = subj + isWord + own + " here, so this " + what + "."
+  if nm == "" {
+    return msg +
+      " If it can take other values, declare them in the type of the const it reads: " +
+      domStr
+  }
+  msg = msg + " If " + nm + " can take other values, declare them: "
+  if one { return msg + "const " + nm + ": " + domStr + " = " + own }
+  msg + "const " + nm + ": " + domStr + " = ..."
+}
+
+// Whether string-literal sets `a` and `b` provably share no value. Membership compares lexemes,
+// so a set holding an escape (`"\n"` beside a raw newline) is never called disjoint.
+function strLitSetsDisjoint(a: i32, b: i32): boolean {
+  const both: i32[] = []
+  flattenStrLits(a, both)
+  flattenStrLits(b, both)
+  let i = 0
+  while i < both.length {
+    const t = T.tys[both[i]]
+    if t is TyLit {
+      if t.litText.indexOf("\\") >= 0 { return false }
+    }
+    i = i + 1
+  }
+  const bs: i32[] = []
+  flattenStrLits(a, bs)
+  let k = 0
+  while k < bs.length {
+    if assignable(bs[k], b) { return false }
+    k = k + 1
+  }
+  true
+}
+
+// String-literal types `lits` spelled as the union a user would write, `"a" | "b"`.
+function strLitsSpelled(lits: i32[]): string {
+  let s = ""
+  let i = 0
+  while i < lits.length {
+    if i > 0 { s = s + " | " }
+    s = s + tyToStr(lits[i])
+    i = i + 1
+  }
+  s
+}
+
+// The name a compare operand reads (`MODE`, through parens), or "" for any other expression.
+function constOperandName(x: i32): string {
+  const px = peelParenIx(x)
+  if px < 0 || px >= P.nodes.length { return "" }
+  const e = P.nodes[px]
+  if e is Ident { return demangleName(e.identName) }
+  ""
+}
+
+// The string-literal set operand `x` (typed `ty`) is confined to — a bare literal, a `const`
+// literal, or a declared literal type — or -1 when it may hold any string, null, or a member
+// that is not a string literal (a nullable side is refused by the compare's own rule).
+function strLitViewOf(x: i32, ty: i32): i32 {
+  const lit = litTyOfExpr(x)
+  if lit >= 0 {
+    const lt = T.tys[lit]
+    if lt is TyLit {
+      if lt.litKind == "str" { return lit }
+    }
+    return -1
+  }
+  if !allStrLitMembers(ty) { return -1 }
+  ty
+}
+
+// Whether `ty` is a string literal or a union made only of them.
+function allStrLitMembers(ty: i32): boolean {
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  match t {
+    TyLit => {
+      return t.litKind == "str"
+    }
+    TyUnion => {
+      if t.uMembers.length == 0 { return false }
+      let i = 0
+      while i < t.uMembers.length {
+        if !allStrLitMembers(t.uMembers[i]) { return false }
+        i = i + 1
+      }
+      return true
+    }
+    TyNullable | TyPrim | TyObj | TyFunc | TyArray | TyMap | TyErr | TyVar | TyNeg => {
+      return false
+    }
+  }
+}
+
+// Appends the string-literal members of `ty` (through unions) to `out`.
+function flattenStrLits(ty: i32, out: i32[]) {
+  if ty < 0 { return 0 }
+  const t = T.tys[ty]
+  match t {
+    TyLit => {
+      if t.litKind == "str" { out.push(ty) }
+    }
+    TyUnion => {
+      let i = 0
+      while i < t.uMembers.length {
+        flattenStrLits(t.uMembers[i], out)
+        i = i + 1
+      }
+    }
+    TyNullable | TyPrim | TyObj | TyFunc | TyArray | TyMap | TyErr | TyVar | TyNeg => {}
+  }
+  0
 }
 
 // Whether `ty` is a widening literal, or a union made only of them.
@@ -43562,8 +43739,23 @@ function jsonSpellHas(s: string, m: string): boolean {
 }
 
 function checkIsExprNode(n: IsExpr, ix: i32) {
-  const objTy = checkNode(n.isObj)
+  let objTy = checkNode(n.isObj)
   const chkTy = isTypeTy(n.isVariant, ix)
+  // A `const` literal tests as the compare does: against a literal it never equals the
+  // test is refused, and against anything else it is the `string` it is (D2198).
+  if chkTy >= 0 && isWideLitJoin(objTy) {
+    if allStrLitMembers(chkTy) {
+      if strLitSetsDisjoint(objTy, chkTy) {
+        tErr(
+          constLitNeverMsg(n.isObj, objTy, chkTy, "test is always false"),
+          ix,
+        )
+        return TY_BOOL
+      }
+    } else {
+      objTy = widenLitTy(objTy)
+    }
+  }
   // Bank the resolved check type on the `is` node so the emitter's narrowing stack carries
   // it as an arena index, instead of re-classifying the spelling at every read of the binding.
   if chkTy >= 0 {

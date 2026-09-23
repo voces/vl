@@ -89,6 +89,31 @@ argument-passing, assignment, **and** comparison. `"c"` is never a `"a" | "b"`.
 - rejected: `literal-union-reject-arg.vl`, `literal-union-reject-assign.vl`,
   `literal-union-reject-compare.vl`
 
+### A `const` bound to a string literal has that literal's type
+`const MODE = "debug"` has the type `"debug"`, not `string`. It reads as a plain `string`
+wherever it is stored somewhere reassignable (`let m = MODE` is a `string`) or used by an
+operator, and it keeps the literal type where it is compared. So a compare with a literal it
+can never equal is refused rather than compiled as a constant, as TypeScript does — the typo
+`MODE == "relaese"` is the bug this catches:
+
+```
+const MODE = "debug"
+if MODE == "release" { … }
+// error: MODE is always "debug" here, so this comparison is always false. If MODE can take
+// other values, declare them: const MODE: "debug" | "release" = "debug"
+```
+
+The rule covers both operand orders, `!=` (always true), two such constants (`A == B`), a
+declared literal type on the other side, and `MODE is "release"`. It never touches a value typed
+`string`, a `let`, or a runtime string. Two ways out, depending on what the constant is for:
+
+- **declare its domain** — `const MODE: "debug" | "release" = "debug"` — and the compare is an
+  ordinary test, still checked against that set;
+- **declare it `string`** — `const MODE: string = "debug"` — and it compares with anything.
+
+- rejected: `const-literal-impossible-compare.vl`
+- sound: `const-literal-compare-allowed.vl`, `const-literal-widening.vl`
+
 ### Equality is typed
 `==`/`!=` require comparable operand types — there is no JS-style cross-type
 equality that silently returns `false`. `==`/`!=` against `null` is always

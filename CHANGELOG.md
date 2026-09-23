@@ -28,6 +28,18 @@ see **`DECISIONS.md`**.
   read-only parameters (D-Q4 (c)). D2100 files the read-only invalid-module face.
   Fixtures `soundness/error-covariant-record-field-written.vl`,
   `soundness/covariant-record-field-read-only-runs.vl`.
+- **A `const` string literal compared with a literal it can never equal is refused (D2198;
+  owner, 2026-09-23, after TypeScript's TS2367).** `const MODE = "debug"; if MODE == "relaese"`
+  compiled to a constant false; it now reports `MODE is always "debug" here, so this comparison
+  is always false. If MODE can take other values, declare them: const MODE: "debug" | "relaese"
+  = "debug"`. Both operand orders, `!=` (always true), two constants, a declared literal type on
+  the other side, a join of constants and `is "lit"`; never a `string`, a `let` or a runtime
+  value. `const MODE: string = "debug"` is the escape, so it is no longer hinted as a redundant
+  annotation, and `is string` over such a constant is allowed. Nothing else in the repo tripped
+  it (11,485 `.vl` files across the compiler, std, tests and corpus; 0 corpus cells moved)
+  besides the one #3056 fixture that pinned the old behaviour; 22 fixtures drop 31 `@hint`s on
+  a `const`'s `string` annotation. D2199 files an emit refusal found alongside. Fixtures
+  `literal-unions/const-literal-impossible-compare.vl`, `const-literal-compare-allowed.vl`.
 - **A string-literal type reps as the atom wherever it lives, and a `const` bound to a literal
   has the literal's type (D2150, D2156, D2157; owner, 2026-09-23).** An inline `"a" | "b"` at a
   field, parameter, return, local, global, capture or type argument compared with `__str_eq__`;
