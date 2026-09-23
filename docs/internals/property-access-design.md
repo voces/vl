@@ -553,12 +553,41 @@ A getter body is refused unless it is:
   disassembly): `==`/`!=`/`<`/`<=`/`>`/`>=` over string, list, map or struct operands (a
   `__str_eq__` call or an inline element loop), an index into a map (a hash and a probe loop),
   and list `+`. A literal-union comparison compares tags (`i32.eq`) and is allowed, as is a
-  test against `null`. **f64 `%` is refused (RULED, owner, 2026-09-22)**: its
-  `__f64_rem__` lowering loops a number of times set by the operands' exponent gap, which is
-  data-dependent. **A compare against a string literal is bounded (RULED, owner, 2026-09-22)**:
-  `s == "lit"`, `!=`, `is "a" | "b"`, and `startsWith` / `endsWith` with a literal cost the
-  literal's length, provided the lowering pre-checks lengths and never loops past the shorter
-  operand. A compare of two run-time strings stays refused.
+  test against `null`. **A compare with a string literal is allowed** (RULED, owner, 2026-09-22;
+  built, D2062): `s == "lit"`,
+  `s != "lit"` and `s is "a" | "b"` call `__str_eq__`, which answers unequal lengths before it
+  loops and otherwise walks at most the literal's length, so the compare is bounded by a
+  constant the checker can read. It costs that length in steps (below). Two runtime strings
+  stay refused. `startsWith`/`endsWith` are std functions, which a getter cannot call yet, so
+  that clause of the ruling admits nothing today. **f32/f64 `%` is refused** (RULED; built,
+  D2063): `__f64_rem__` scales the divisor by
+  doubling and halving, so its trip count is the operands' exponent gap, up to about 4,000
+  iterations, and is data-dependent. Integer `%` is one instruction and stays allowed.
+- **Within the step budget** (D2061). Loop-freedom alone does not bound a body that reads other
+  getters: nine getters each reading the previous one four times are loop-free and acyclic, and
+  one read of the last does 4^8 getter calls. The checker counts **abstract steps**:
+  - a getter read costs 1 plus the read getter's cost (memoised per getter, so the check is
+    linear in the getter graph however exponential the program's work);
+  - a compare with a string literal costs the literal's length; `is "a" | "b"` costs the SUM,
+    because the lowering tests each literal in turn and each test that passes the length check
+    walks its literal;
+  - an `if` or `match` costs its condition plus its dearest arm, not the sum;
+  - arithmetic, field reads, conversions and the admitted intrinsics cost 0;
+  - a loop, once bounded loops are admitted, will cost its body times its trip count
+    (`gcNode`'s loop arm is the hook; every loop is refused today).
+
+  The budget is `GETTER_STEP_BUDGET` (16) in `compiler/typecheck.vl`, one named constant to be
+  tuned by usage. A getter over it is refused, once per chain: at each over-budget getter that
+  no other over-budget getter reads. The refusal names the path that made the total, following
+  each getter's heaviest contributor, for example `a8 → a7 (4×) → a6 (4×) → … → a0 (4×)`, and
+  offers the method. A cycle costs its back edge 0 and is refused by the recursion rule.
+
+The checker reads the SOURCE and promises something about the LOWERING, so
+`tests/vl_getter_body_shape_test.ts` holds the two together: it builds every getter run-fixture
+and std:simd's lane getters, disassembles them, and refuses a getter body with a `loop`, a
+`struct.new`/`array.new*`, an indirect call, or a direct call to anything but a getter or
+`__str_eq__`. Its first run found `is "ab"` allocating the literal (fixed in `collectStrPool`,
+D2062).
 
 **Branches are allowed.** `if` and `match` expressions are fine: cost is the max over the arms,
 and a simple fork often lowers to `select`.
@@ -626,7 +655,9 @@ scalar: SIMD lanes, packed-scalar parts and `length`-style counts. The cost is t
 refuses the forwarding row, which does not allocate. That is the conservative direction, and
 the function-effects design can relax it.
 
-**This is deliberately conservative, and it will be relaxed, never tightened.** A separate
+**This is deliberately conservative: it may relax later (for instance into a lint), never the
+reverse.** The one number in it, the step budget, is tuned by usage. (The step budget and the
+float `%` refusal, D2061/D2063, tightened v1 before any consumer relied on it.) A separate
 design, `docs/internals/function-effects-design.md` (PR #3023), infers a summary of every
 function: whether it writes state, allocates, does host I/O, and its cost in steps. Once it
 lands, a getter may call any function whose summary meets the callee rule, as well as

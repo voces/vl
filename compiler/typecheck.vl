@@ -37247,6 +37247,13 @@ const GW_STATE = "a getter must not read mutable state"
 const GW_CALL = "a getter may call only other getters and the single-instruction numeric, load and SIMD intrinsics"
 const GW_OTHER = "a getter body may only compute a value from its receiver"
 
+// The most abstract steps one getter read may cost (§D3a-contract, D2061): a getter read is 1
+// plus the read getter's cost, a string-literal compare its literal's length, a branch its
+// dearest arm, and arithmetic, field reads and single-instruction intrinsics 0.
+const GETTER_STEP_BUDGET = 16
+// Where a cost stops counting, so a runaway chain saturates instead of overflowing `i32`.
+const GETTER_STEP_CAP = 1000000000
+
 // Getter row `gi`'s declared result type as a message spells it, or "" when it has none.
 function getterRetStr(gi: i32): string {
   const fnTy = lookup(getFns[gi])
@@ -37673,7 +37680,14 @@ function gwBinExpr(n: BinExpr, ix: i32) {
   if n.binOp == "+" && gwErasedIs(nodeTyIxOf(ix)) == "list" {
     gwConcatErr("concatenates lists with `+`", n, ix)
   }
-  if gwIsCompare(n.binOp) {
+  if n.binOp == "%" && gwIsFloat(nodeTyIxOf(ix)) {
+    getterContractErr(
+      "takes a float remainder with `%`, which loops as many times as the operands' exponents differ",
+      GW_LOOP,
+      ix,
+    )
+  }
+  if gwIsCompare(n.binOp) && gwStrLitEqLen(n) < 0 {
     const bad = gwLoopCmpOperand(n.binLeft, n.binRight)
     if bad >= 0 {
       getterContractErr(
@@ -37727,6 +37741,66 @@ function gwConcatMarkInner(ix: i32) {
 
 function gwIsCompare(op: string): boolean {
   op == "==" || op == "!=" || op == "<" || op == "<=" || op == ">" || op == ">="
+}
+
+// Whether `ty` erases to `f32` or `f64`, whose `%` lowers to the looping `__f64_rem__`.
+function gwIsFloat(ty: i32): boolean {
+  if ty < 0 { return false }
+  const t = T.tys[nomErasedTyIx(ty)]
+  if t is TyPrim { return t.primName == "f64" || t.primName == "f32" }
+  false
+}
+
+// The length of the literal a `==`/`!=` compares a plain string against, or -1 when `n` is not
+// that compare. `__str_eq__` answers unequal lengths at once and otherwise walks at most the
+// literal's length, so this compare is bounded by it and costs that many steps (D2062).
+function gwStrLitEqLen(n: BinExpr): i32 {
+  if n.binOp != "==" && n.binOp != "!=" { return -1 }
+  if gwErasedIs(nodeTyIxOf(n.binLeft)) == "string" {
+    const r = gwStrLitLenOf(n.binRight)
+    if r >= 0 { return r }
+  }
+  if gwErasedIs(nodeTyIxOf(n.binRight)) == "string" {
+    return gwStrLitLenOf(n.binLeft)
+  }
+  -1
+}
+
+// The length of the string literal expression `ix` spells, or -1: a quoted literal, or a value
+// whose type is one string literal.
+function gwStrLitLenOf(ix: i32): i32 {
+  const u = cwPeel(ix)
+  if u < 0 || u >= P.nodes.length { return -1 }
+  const n = P.nodes[u]
+  if n is StrLit {
+    const raw = n.strText
+    if raw.length < 2 { return -1 }
+    return gwLitLen(raw.slice(1, raw.length - 1))
+  }
+  gwStrLitTyLen(nodeTyIxOf(u))
+}
+
+// The length of string literal type `ty`, or -1 when it is not one.
+function gwStrLitTyLen(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  const t = T.tys[ty]
+  if t is TyLit {
+    if t.litKind == "str" { return gwLitLen(t.litText) }
+  }
+  -1
+}
+
+// At least the number of code points string literal text `raw` (quotes stripped, escapes
+// unresolved) denotes: a backslash and the character after it count one, every other character
+// one. A hex escape's digits each count, which can only overstate a cost, never understate it.
+function gwLitLen(raw: string): i32 {
+  let n = 0
+  let i = 0
+  while i < raw.length {
+    if raw[i] == '\\' && i + 1 < raw.length { i = i + 2 } else { i = i + 1 }
+    n = n + 1
+  }
+  n
 }
 
 // What type `ty` erases to, for the operator rules: "string", "list", "map", "struct", "lit"
@@ -37838,6 +37912,336 @@ function gwMatch(n: MatchExpr, ix: i32) {
     j = j + 1
   }
   gwTypeOk(ix)
+}
+
+// ── the getter step budget (§D3a-contract, D2061) ────────────────────────────
+
+// Each registry row's cost in steps: -1 not yet costed, -2 being costed (a cycle, refused on
+// its own), else the steps. Memoised, so a getter read many times is costed once.
+let gcCost: i32[] = []
+// Per row, the heaviest contributor on its costed path, for the refusal's path: the getter row
+// read most expensively (or -1) and how often, and the string-literal compares' steps and count.
+let gcTopRow: i32[] = []
+let gcTopCount: i32[] = []
+let gcTopSteps: i32[] = []
+let gcCmpSteps: i32[] = []
+let gcCmpCount: i32[] = []
+// What the path being costed charged, in order: a row read (>= 0) or a literal compare of
+// length `-e` (< 0). A branch keeps only its dearest arm's entries.
+let gcTrail: i32[] = []
+
+function gcAdd(a: i32, b: i32): i32 {
+  if a >= GETTER_STEP_CAP - b { return GETTER_STEP_CAP }
+  a + b
+}
+
+// The steps one read of getter row `gi` costs beyond the read itself.
+function getterCost(gi: i32): i32 {
+  if gcCost[gi] >= 0 { return gcCost[gi] }
+  if gcCost[gi] == -2 { return 0 }
+  gcCost[gi] = -2
+  const mark = gcTrail.length
+  let c = 0
+  const d = P.nodes[getDecls[gi]]
+  if d is FuncDecl { c = gcNode(d.fnBody) }
+  gcSummarise(gi, mark)
+  while gcTrail.length > mark { gcTrail.pop() }
+  gcCost[gi] = c
+  c
+}
+
+// Records row `gi`'s heaviest contributor from its trail, the entries past `mark`.
+function gcSummarise(gi: i32, mark: i32) {
+  let best = -1
+  let bestCount = 0
+  let bestSteps = -1
+  let cmpSteps = 0
+  let cmpCount = 0
+  let i = mark
+  while i < gcTrail.length {
+    const e = gcTrail[i]
+    if e < 0 {
+      cmpSteps = gcAdd(cmpSteps, 0 - e)
+      cmpCount = cmpCount + 1
+    } else {
+      let seen = false
+      let k = mark
+      while k < i {
+        if gcTrail[k] == e { seen = true }
+        k = k + 1
+      }
+      if !seen {
+        let count = 0
+        let j = i
+        while j < gcTrail.length {
+          if gcTrail[j] == e { count = count + 1 }
+          j = j + 1
+        }
+        let steps = 0
+        let m = 0
+        while m < count {
+          steps = gcAdd(steps, gcAdd(1, gcCostSoFar(e)))
+          m = m + 1
+        }
+        if steps > bestSteps {
+          best = e
+          bestCount = count
+          bestSteps = steps
+        }
+      }
+    }
+    i = i + 1
+  }
+  gcTopRow[gi] = best
+  gcTopCount[gi] = bestCount
+  gcTopSteps[gi] = bestSteps
+  gcCmpSteps[gi] = cmpSteps
+  gcCmpCount[gi] = cmpCount
+  0
+}
+
+// Row `gi`'s cost, reading an in-progress row (a cycle) as 0.
+function gcCostSoFar(gi: i32): i32 {
+  if gcCost[gi] < 0 { return 0 }
+  gcCost[gi]
+}
+
+// The steps node `ix` of a getter body costs. Every AST kind is named; the kinds the body walk
+// refuses cost 0 here, since the walk's refusal is the error that program gets.
+function gcNode(ix: i32): i32 {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const n = P.nodes[ix]
+  if n is Paren { return gcNode(n.parInner) }
+  if n is Unary { return gcNode(n.unArg) }
+  if n is AsExpr { return gcNode(n.asObj) }
+  if n is IsExpr { return gcAdd(gcNode(n.isObj), gcIsLitSteps(n, ix)) }
+  if n is OptMember { return gcNode(n.omObj) }
+  if n is Index { return gcAdd(gcNode(n.idxArr), gcNode(n.idxIndex)) }
+  if n is LetDecl { return gcNode(n.letInit) }
+  if n is RetStmt { return gcNode(n.retArg) }
+  if n is Member {
+    let c = gcNode(n.memObj)
+    const gFn = getSiteFnOf(ix)
+    if gFn != "" {
+      const to = getRowOf(gFn)
+      if to >= 0 {
+        c = gcAdd(c, gcAdd(1, getterCost(to)))
+        gcTrail.push(to)
+      }
+    }
+    return c
+  }
+  if n is BinExpr {
+    let c = gcAdd(gcNode(n.binLeft), gcNode(n.binRight))
+    const lit = gwStrLitEqLen(n)
+    if lit > 0 {
+      c = gcAdd(c, lit)
+      gcTrail.push(0 - lit)
+    }
+    return c
+  }
+  if n is Call {
+    let c = 0
+    const callee = P.nodes[n.callFn]
+    if callee is Member { c = gcNode(callee.memObj) }
+    let i = 0
+    while i < n.callArgs.length {
+      c = gcAdd(c, gcNode(n.callArgs[i]))
+      i = i + 1
+    }
+    return c
+  }
+  if n is Block {
+    let c = 0
+    let i = 0
+    while i < n.blkStmts.length {
+      c = gcAdd(c, gcNode(n.blkStmts[i]))
+      i = i + 1
+    }
+    return c
+  }
+  if n is IfStmt {
+    const arms: i32[] = [n.ifThen, n.ifElse]
+    return gcAdd(gcNode(n.ifCond), gcDearest(arms))
+  }
+  if n is MatchExpr { return gcMatch(n) }
+  // A bounded loop, once admitted, costs its body times its trip count; today the walk refuses
+  // every loop.
+  if n is WhileStmt { return 0 }
+  if n is ForRange { return 0 }
+  if n is ForIn { return 0 }
+  if n is BreakStmt { return 0 }
+  if n is ContinueStmt { return 0 }
+  // A leaf costs nothing.
+  if n is NumLit { return 0 }
+  if n is StrLit { return 0 }
+  if n is CharLit { return 0 }
+  if n is BoolLit { return 0 }
+  if n is NullLit { return 0 }
+  if n is Ident { return 0 }
+  if n is ErrExpr { return 0 }
+  // What the walk refuses outright costs nothing here; its refusal is the program's error.
+  if n is FuncDecl { return 0 }
+  if n is ObjLit { return 0 }
+  if n is FieldInit { return 0 }
+  if n is ArrayLit { return 0 }
+  if n is Spread { return 0 }
+  if n is TypeDecl { return 0 }
+  if n is UnionDecl { return 0 }
+  if n is FieldDef { return 0 }
+  if n is Param { return 0 }
+  if n is TypeRef { return 0 }
+  if n is Program { return 0 }
+  if n is ImportDecl { return 0 }
+  0
+}
+
+// The dearest of alternative nodes `arms`, keeping only that arm's trail entries.
+function gcDearest(arms: i32[]): i32 {
+  const mark = gcTrail.length
+  let best = 0
+  let keep: i32[] = []
+  let a = 0
+  while a < arms.length {
+    const c = gcNode(arms[a])
+    if a == 0 || c > best {
+      best = c
+      keep = gcTrail.slice(mark, gcTrail.length)
+    }
+    while gcTrail.length > mark { gcTrail.pop() }
+    a = a + 1
+  }
+  let k = 0
+  while k < keep.length {
+    gcTrail.push(keep[k])
+    k = k + 1
+  }
+  best
+}
+
+// A `match`: its scrutinee, then its dearest arm. A match scrutinee is never a plain string, so
+// its patterns compare by tag and cost nothing.
+function gcMatch(n: MatchExpr): i32 {
+  gcAdd(gcNode(n.matchScrut), gcDearest(n.matchBodies))
+}
+
+// The steps `x is "a" | "b"` costs: each string literal is compared in turn, so the sum of
+// their lengths. Over a literal union the test is a tag compare and costs 0.
+function gcIsLitSteps(n: IsExpr, ix: i32): i32 {
+  if gwErasedIs(nodeTyIxOf(n.isObj)) == "lit" { return 0 }
+  const ty = isVarTyIxOf(ix)
+  if ty < 0 { return 0 }
+  const lens: i32[] = []
+  const one = gwStrLitTyLen(ty)
+  if one >= 0 { lens.push(one) }
+  const t = T.tys[ty]
+  if t is TyUnion {
+    let i = 0
+    while i < t.uMembers.length {
+      const m = gwStrLitTyLen(t.uMembers[i])
+      if m >= 0 { lens.push(m) }
+      i = i + 1
+    }
+  }
+  let c = 0
+  let k = 0
+  while k < lens.length {
+    if lens[k] > 0 {
+      c = gcAdd(c, lens[k])
+      gcTrail.push(0 - lens[k])
+    }
+    k = k + 1
+  }
+  c
+}
+
+// The path a refusal names for row `gi`: each getter's heaviest read and how many times it is
+// read, ending at the string-literal compares that cost the most, if any.
+function gcPath(gi: i32): string {
+  let s = getProps[gi]
+  let cur = gi
+  let hops = 0
+  while cur >= 0 && hops < 12 {
+    const top = gcTopRow[cur]
+    if gcCmpCount[cur] > 0 && (top < 0 || gcCmpSteps[cur] >= gcTopSteps[cur]) {
+      return s + " → " + gcCmpPhrase(cur)
+    }
+    if top < 0 { return s }
+    s = s + " → " + getProps[top]
+    if gcTopCount[cur] > 1 { s = s + " (" + i32ToStr(gcTopCount[cur]) + "×)" }
+    // A cycle is refused on its own; stop at its first repeat.
+    if top == gi { return s }
+    cur = top
+    hops = hops + 1
+  }
+  if cur >= 0 { s = s + " → …" }
+  s
+}
+
+function gcCmpPhrase(gi: i32): string {
+  const steps = i32ToStr(gcCmpSteps[gi])
+  if gcCmpCount[gi] == 1 {
+    return "a compare with a " + steps + "-character string literal"
+  }
+  i32ToStr(gcCmpCount[gi]) +
+    " string-literal compares totalling " +
+    steps +
+    " characters"
+}
+
+// Refuses every getter over the step budget that no other getter over the budget reads, so a
+// chain is one error at its top, naming the path that made the total.
+function getterBudgetCheck() {
+  gcCost = []
+  gcTopRow = []
+  gcTopCount = []
+  gcTopSteps = []
+  gcCmpSteps = []
+  gcCmpCount = []
+  gcTrail = []
+  let i = 0
+  while i < getFns.length {
+    gcCost.push(-1)
+    gcTopRow.push(-1)
+    gcTopCount.push(0)
+    gcTopSteps.push(0)
+    gcCmpSteps.push(0)
+    gcCmpCount.push(0)
+    i = i + 1
+  }
+  let gi = 0
+  while gi < getFns.length {
+    getterCost(gi)
+    gi = gi + 1
+  }
+  let r = 0
+  while r < getFns.length {
+    if gcCost[r] > GETTER_STEP_BUDGET && !gcReadByOver(r) {
+      let total = i32ToStr(gcCost[r])
+      if gcCost[r] >= GETTER_STEP_CAP { total = "over " + total }
+      gwRow = r
+      getterContractErr(
+        "costs " + total + " steps (" + gcPath(r) + ")",
+        "a getter must cost at most " + i32ToStr(GETTER_STEP_BUDGET) + " steps",
+        getDecls[r],
+      )
+    }
+    r = r + 1
+  }
+  0
+}
+
+// Whether a getter over the step budget reads row `r`.
+function gcReadByOver(r: i32): boolean {
+  let k = 0
+  while k < getEdgeFrom.length {
+    const from = getEdgeFrom[k]
+    if getEdgeTo[k] == r && from != r && gcCost[from] > GETTER_STEP_BUDGET {
+      return true
+    }
+    k = k + 1
+  }
+  false
 }
 
 // The declaration half of the contract for registry row `gi`: a nominal receiver declared in the
@@ -38051,7 +38455,7 @@ function getterRewriteSites() {
 }
 
 // The end-of-program getter pass: each declaration's checks, each body's contract walk, the
-// cycle check over getter reads, and the rewrite of every getter read into a call.
+// cycle check over getter reads, the step budget, and the rewrite of every read into a call.
 function checkProgramEndGetters() {
   if getFns.length == 0 { return 0 }
   getEdgeFrom = []
@@ -38084,6 +38488,7 @@ function checkProgramEndGetters() {
     }
     ci = ci + 1
   }
+  getterBudgetCheck()
   gwRow = -1
   getterRewriteSites()
   0

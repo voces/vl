@@ -8,6 +8,21 @@ see **`DECISIONS.md`**.
 
 ## Type system (Track A)
 
+- **A getter body is held to a step budget, a string-literal compare is priced, and a float `%`
+  is refused (D2061, D2062, D2063).** The contract counted loops, so nine loop-free getters each
+  reading the previous one four times passed and did 65,536 calls behind one `.a8`. The checker
+  now counts abstract steps against `GETTER_STEP_BUDGET` (16): a getter read is 1 plus that
+  getter's memoised cost, a compare with a string literal its length, a branch its dearest arm,
+  arithmetic and intrinsics 0. A chain over the budget is one error at its top, naming the path
+  (`a8 → a7 (4×) → … → a0 (4×)`). `s == "lit"`, `!=` and `s is "a" | "b"` are admitted at their
+  literal lengths (`__str_eq__` checks lengths before it loops), so `==` and `is` now agree; two
+  runtime strings stay refused. f32/f64 `%` (`__f64_rem__` loops over the exponent gap) is
+  refused in a getter; integer `%` stays. `collectStrPool` also pools the literals an `is` tests
+  a string against, so `s is "ab"` no longer allocates the literal per test (three corpus modules
+  shrank, the rest byte-identical). `tests/vl_getter_body_shape_test.ts` disassembles every
+  getter fixture and std:simd's lane getters and refuses a body with a loop, an allocation or a
+  call outside the contract. Residue: an un-annotated `const K = "zz"` still compares as a
+  runtime string (D2120).
 - **A `match` evaluates its scrutinee once (D1991).** The desugared chain tested the scrutinee
   NODE at every arm, so `match next() { 5 => …, 6 => …, 7 => …, _ => … }` called `next()` up to
   three times and picked the wrong arm (`other 8` for `six 6`). A scrutinee that is not a literal
