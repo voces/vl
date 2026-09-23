@@ -64,6 +64,7 @@ import {
   WhileStmt,
   adoptNodeTok,
   arenaEpochBump,
+  arenaSetNode,
   callIsNever,
   callIsRestPacked,
   hasSpreadItem,
@@ -74,9 +75,11 @@ import {
   mkBinary,
   mkBlock,
   mkIf,
+  mkLet,
   mkNum,
   mkParen,
   nodeIsTplHole,
+  nodeValueChildren,
   restParamIndex,
   spreadArgOf,
   stmtAlwaysExits,
@@ -120,6 +123,7 @@ import {
 // `nodeToks` alone anchors at its closing brace.
 import {
   nodeLastTok,
+  nodePos,
   nodeSpanEndTok,
   nodeStartTok,
   tokFirstLineEndCol,
@@ -6797,6 +6801,7 @@ function symStampVis(name: string, declNode: i32, kind: i32, spanIx: i32) {
 // node anchor when unset.
 function symDecl(name: string, declNode: i32, ty: i32, kind: i32) {
   if symEnabled == 0 { return 0 }
+  if symNameIsMinted(name) { return 0 }
   if symDeclScope.length > 0 {
     const top = symDeclScope.length - 1
     symDeclScope[top][name] = declNode
@@ -6893,12 +6898,17 @@ function symResolve(name: string) {
   -1
 }
 
+// A name the compiler minted (`$` is not an identifier character, D1991's `$scrut…`): no
+// editor feature may show, colour or complete it.
+function symNameIsMinted(name: string) { name.length > 0 && name[0] == '$' }
+
 // Record a use occurrence of the identifier node `useNode`, whose anchor token is the identifier.
 // It resolves through the decl-scope chain, and a name with no tracked binding records nothing.
 // `curTy` is retained per occurrence (`symOccTy`) so a position query can render the narrowed type
 // — only under a live narrowing shadow, so an un-narrowed use stores -1 and hovers as its final type.
 function symUse(useNode: i32, name: string, curTy: i32) {
   if symEnabled == 0 { return 0 }
+  if symNameIsMinted(name) { return 0 }
   const decl = symResolve(name)
   if decl < 0 { return 0 }
   let tok = -1
@@ -27716,6 +27726,403 @@ function desugarMatchAt(ix: i32) {
   0
 }
 
+// ── a computed `match` scrutinee is evaluated once (D1991) ──────────────────────
+// The chain tests the scrutinee NODE at every arm, so a scrutinee that is neither a literal
+// nor a place is bound to `const $scrut<match>` ahead of the statement holding the match,
+// unless that would reorder or skip an evaluation there (D2038).
+
+// The matches found by the walk, innermost first, each beside a copy of its ancestor path.
+let hmsMatches: i32[] = []
+let hmsPaths: i32[][] = []
+
+// By declaration node: the top-level statement a `$scrut…` global is bound ahead of, or -1.
+// Never reset: `topStmtOrderKey` trusts an entry only while its node is such a binding, and no
+// source can spell a `$` name, so a stale entry cannot describe a user node.
+const hmsTopBefore: i32[] = []
+
+// The start function's order key for top-level node `ix`: its arena index doubled, or one less
+// than the key of the statement a hoisted scrutinee binding precedes, so it runs just before it.
+export function topStmtOrderKey(ix: i32): i32 {
+  if ix >= 0 && ix < hmsTopBefore.length {
+    const s = hmsTopBefore[ix]
+    if s >= 0 {
+      const d = P.nodes[ix]
+      if d is LetDecl {
+        if d.letName.length > 6 && d.letName.slice(0, 6) == "$scrut" {
+          return s * 2 - 1
+        }
+      }
+    }
+  }
+  ix * 2
+}
+
+// Whether scrutinee `ix` may be read once per arm: a literal, or a place `placeKeyOf` keys.
+function matchScrutInPlace(ix: i32) {
+  if matchLitOrLambda(ix) { return true }
+  placeKeyOf(ix) != ""
+}
+
+// A literal (possibly negated or parenthesised) or a lambda: a value whose evaluation can
+// move past the scrutinee's without either observing the other.
+function matchLitOrLambda(ix: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = P.nodes[ix]
+  if n is Paren { return matchLitOrLambda(n.parInner) }
+  if n is Unary { return n.unOp == "-" && matchLitOrLambda(n.unArg) }
+  matchLeafIsLitOrLambda(ix)
+}
+
+// The leaves `matchLitOrLambda` accepts once parentheses and a minus are peeled.
+function matchLeafIsLitOrLambda(ix: i32): boolean {
+  const n = P.nodes[ix]
+  n is NumLit ||
+    n is StrLit ||
+    n is CharLit ||
+    n is BoolLit ||
+    n is NullLit ||
+    n is FuncDecl
+}
+
+// Binds every computed scrutinee under `rootIx` (see the section head). Returns the count.
+function hoistMatchScrutinees(rootIx: i32) {
+  hmsMatches = []
+  hmsPaths = []
+  const anc: i32[] = []
+  hmsWalk(rootIx, anc)
+  let done = 0
+  let k = 0
+  while k < hmsMatches.length {
+    if hoistMatchScrutAt(hmsMatches[k], hmsPaths[k]) { done = done + 1 }
+    k = k + 1
+  }
+  hmsMatches = []
+  hmsPaths = []
+  done
+}
+
+// Post-order over the value children, so an inner match is recorded before the one holding it.
+function hmsWalk(ix: i32, anc: i32[]) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  anc.push(ix)
+  const kids = nodeValueChildren(ix)
+  let i = 0
+  while i < kids.length {
+    hmsWalk(kids[i], anc)
+    i = i + 1
+  }
+  anc.pop()
+  const n = P.nodes[ix]
+  if n is MatchExpr {
+    if !matchScrutInPlace(n.matchScrut) {
+      const path: i32[] = []
+      let j = 0
+      while j < anc.length {
+        path.push(anc[j])
+        j = j + 1
+      }
+      hmsMatches.push(ix)
+      hmsPaths.push(path)
+    }
+  }
+  0
+}
+
+// Climbs from match `m` through ancestors that evaluate it first and unconditionally, then
+// binds its scrutinee before the statement reached, or inside the enclosing match arm. False,
+// leaving the match as parsed, when a step would reorder or skip an evaluation.
+function hoistMatchScrutAt(m: i32, anc: i32[]): boolean {
+  let cur = m
+  let k = anc.length - 1
+  while k >= 0 {
+    const p = anc[k]
+    const pn = P.nodes[p]
+    if pn is Program { return hmsInsertBefore(p, cur, m) }
+    if pn is Block {
+      if pn.blkStmts.length < 2 && !hmsBlockWalked(anc, k) { return false }
+      return hmsInsertBefore(p, cur, m)
+    }
+    if pn is MatchExpr {
+      if pn.matchScrut != cur {
+        if !hmsValueWalked(anc, k) { return false }
+        return hmsWrapArm(p, cur, m)
+      }
+    } else {
+      if !hmsStepOk(p, cur) { return false }
+    }
+    cur = p
+    k = k - 1
+  }
+  false
+}
+
+// Whether parent `p` evaluates child `cur` unconditionally, and after nothing but literals,
+// lambdas, and a callee or receiver place, so evaluating `cur` earlier changes nothing.
+function hmsStepOk(p: i32, cur: i32): boolean {
+  const pn = P.nodes[p]
+  if pn is LetDecl { return pn.letInit == cur }
+  if pn is IfStmt { return pn.ifCond == cur }
+  if pn is ForIn { return pn.fiIter == cur }
+  if pn is Call { return hmsCallArgOk(pn, cur) }
+  if pn is BinExpr {
+    const op = pn.binOp
+    if op == "&&" || op == "||" || op == "??" { return false }
+    if pn.binLeft == cur { return true }
+    if op == "=" { return P.nodes[pn.binLeft] is Ident }
+    return matchLitOrLambda(pn.binLeft)
+  }
+  if pn is Index { return pn.idxArr == cur || placeKeyOf(pn.idxArr) != "" }
+  if pn is ArrayLit { return hmsPriorLits(pn.arrElems, cur) }
+  if pn is ObjLit { return hmsPriorFieldLits(pn.objFields, cur) }
+  hmsSingleChildParent(p)
+}
+
+// A parent with one value child, evaluated first: nothing else of it can run before the child.
+function hmsSingleChildParent(p: i32): boolean {
+  const pn = P.nodes[p]
+  pn is Paren ||
+    pn is Unary ||
+    pn is AsExpr ||
+    pn is IsExpr ||
+    pn is Member ||
+    pn is OptMember ||
+    pn is Spread ||
+    pn is FieldInit ||
+    pn is RetStmt
+}
+
+// A call evaluates its callee, then its arguments in order; named arguments are reordered by
+// the checker, so a call carrying one is declined.
+function hmsCallArgOk(c: Call, cur: i32): boolean {
+  if c.callFn == cur { return true }
+  let i = 0
+  while i < c.callArgNames.length {
+    if c.callArgNames[i] != "" { return false }
+    i = i + 1
+  }
+  if placeKeyOf(c.callFn) == "" { return false }
+  hmsPriorLits(c.callArgs, cur)
+}
+
+// Whether every item of `items` before `cur` is a literal or a lambda (false if `cur` is absent).
+function hmsPriorLits(items: i32[], cur: i32): boolean {
+  let i = 0
+  while i < items.length {
+    if items[i] == cur { return true }
+    if !matchLitOrLambda(items[i]) { return false }
+    i = i + 1
+  }
+  false
+}
+
+// `hmsPriorLits` over an object literal's `FieldInit`s, reading each field's value.
+function hmsPriorFieldLits(fields: i32[], cur: i32): boolean {
+  let i = 0
+  while i < fields.length {
+    if fields[i] == cur { return true }
+    const vals = nodeValueChildren(fields[i])
+    let j = 0
+    while j < vals.length {
+      if !matchLitOrLambda(vals[j]) { return false }
+      j = j + 1
+    }
+    i = i + 1
+  }
+  false
+}
+
+// Whether the emitter allocates the locals of Block `anc[k]` (`collectLocals` reaches it), so a
+// binding added to a one-statement block does not become an arm prelude it refuses.
+function hmsBlockWalked(anc: i32[], k: i32): boolean {
+  if k < 1 { return false }
+  const pn = P.nodes[anc[k - 1]]
+  if pn is FuncDecl { return true }
+  if pn is IfStmt { return hmsValueWalked(anc, k - 1) }
+  if pn is MatchExpr { return hmsValueWalked(anc, k - 1) }
+  hmsLoopBodyWalked(anc, k)
+}
+
+// Whether Block `anc[k]` is the body of a loop that is itself a walked statement.
+function hmsLoopBodyWalked(anc: i32[], k: i32): boolean {
+  if k < 2 { return false }
+  const pn = P.nodes[anc[k - 1]]
+  const loop = pn is WhileStmt || pn is ForRange || pn is ForIn
+  loop && hmsHolderWalked(anc, k - 2)
+}
+
+// Whether `anc[j]` is the program or a walked block: a statement it holds is walked.
+function hmsHolderWalked(anc: i32[], j: i32): boolean {
+  const h = P.nodes[anc[j]]
+  h is Program || (h is Block && hmsBlockWalked(anc, j))
+}
+
+// Whether the emitter walks the arms of the `if` or `match` at `anc[j]`: a statement of a walked
+// block, the initializer of a local, a `return` operand, or an `else` / arm of one that is.
+function hmsValueWalked(anc: i32[], j: i32): boolean {
+  if j < 1 { return false }
+  const e = anc[j]
+  const pn = P.nodes[anc[j - 1]]
+  if pn is Paren { return hmsValueWalked(anc, j - 1) }
+  if pn is IfStmt { return pn.ifElse == e && hmsValueWalked(anc, j - 1) }
+  if pn is MatchExpr { return pn.matchScrut != e && hmsValueWalked(anc, j - 1) }
+  hmsCarrierWalked(anc, j - 1)
+}
+
+// Whether `anc[i]` holds its child as a walked statement, or is a local's initializer or a
+// `return` operand in a walked block — a module global's initializer is not walked.
+function hmsCarrierWalked(anc: i32[], i: i32): boolean {
+  if hmsHolderWalked(anc, i) { return true }
+  const c = P.nodes[anc[i]]
+  if !(c is LetDecl || c is RetStmt) || i < 1 { return false }
+  P.nodes[anc[i - 1]] is Block && hmsBlockWalked(anc, i - 1)
+}
+
+// Inserts match `m`'s scrutinee binding into Block or Program `bIx`, just before `stmtIx`.
+function hmsInsertBefore(bIx: i32, stmtIx: i32, m: i32): boolean {
+  const stmts = nodeValueChildren(bIx)
+  let at = -1
+  let i = 0
+  while i < stmts.length {
+    if stmts[i] == stmtIx { at = i }
+    i = i + 1
+  }
+  if at < 0 { return false }
+  const decl = hmsBind(m)
+  if decl < 0 { return false }
+  const out: i32[] = []
+  let j = 0
+  while j < stmts.length {
+    if j == at { out.push(decl) }
+    out.push(stmts[j])
+    j = j + 1
+  }
+  const b = P.nodes[bIx]
+  if b is Program {
+    const np: Node = { progStmts: out, pos: b.pos }
+    arenaSetNode(bIx, np)
+    while hmsTopBefore.length <= decl { hmsTopBefore.push(-1) }
+    hmsTopBefore[decl] = stmtIx
+    return true
+  }
+  const nb: Node = { blkStmts: out, pos: nodePos(bIx) }
+  arenaSetNode(bIx, nb)
+  true
+}
+
+// Replaces arm body `bodyIx` of match `outer` with `{ const $scrut… = …; <body> }`.
+function hmsWrapArm(outer: i32, bodyIx: i32, m: i32): boolean {
+  const o = P.nodes[outer]
+  if o is MatchExpr {
+    let at = -1
+    let i = 0
+    while i < o.matchBodies.length {
+      if o.matchBodies[i] == bodyIx { at = i }
+      i = i + 1
+    }
+    if at < 0 { return false }
+    const decl = hmsBind(m)
+    if decl < 0 { return false }
+    const stmts: i32[] = [decl, bodyIx]
+    const blk = mkBlock(stmts, -1)
+    adoptNodeTok(blk, bodyIx)
+    const bodies: i32[] = []
+    let j = 0
+    while j < o.matchBodies.length {
+      if j == at { bodies.push(blk) } else { bodies.push(o.matchBodies[j]) }
+      j = j + 1
+    }
+    const no: Node = {
+      matchScrut: o.matchScrut,
+      matchPats: o.matchPats,
+      matchBinds: o.matchBinds,
+      matchArmStart: o.matchArmStart,
+      matchArmCount: o.matchArmCount,
+      matchBodies: bodies,
+      pos: o.pos,
+    }
+    arenaSetNode(outer, no)
+    return true
+  }
+  false
+}
+
+// Mints `const $scrut<m> = <scrutinee>` and points match `m` — its scrutinee, its type
+// patterns and its payload reads — at the binding instead. Returns the declaration, or -1.
+function hmsBind(m: i32) {
+  const n = P.nodes[m]
+  if n is MatchExpr {
+    const scrut = n.matchScrut
+    const name = "$scrut" + i32ToStr(m)
+    const sp = nodePos(scrut)
+    const decl = mkLet("const", name, -1, scrut, sp)
+    adoptNodeTok(decl, scrut)
+    const ref = mkIdent(name, sp)
+    adoptNodeTok(ref, scrut)
+    let pi = 0
+    while pi < n.matchPats.length {
+      const pat = n.matchPats[pi]
+      const pn = P.nodes[pat]
+      if pn is IsExpr {
+        if pn.isObj == scrut {
+          const np: Node = {
+            isObj: ref,
+            isVariant: pn.isVariant,
+            pos: pn.pos,
+            isNeg: pn.isNeg,
+          }
+          arenaSetNode(pat, np)
+        }
+      }
+      pi = pi + 1
+    }
+    let bi = 0
+    while bi < n.matchBinds.length {
+      const bx = n.matchBinds[bi]
+      if bx >= 0 { hmsRedirectBinds(bx, scrut, ref) }
+      bi = bi + 1
+    }
+    const nm: Node = {
+      matchScrut: ref,
+      matchPats: n.matchPats,
+      matchBinds: n.matchBinds,
+      matchArmStart: n.matchArmStart,
+      matchArmCount: n.matchArmCount,
+      matchBodies: n.matchBodies,
+      pos: n.pos,
+    }
+    arenaSetNode(m, nm)
+    return decl
+  }
+  -1
+}
+
+// Points each payload `const x = <scrut>.p.x` of clause block `bx` at `to` instead of `from`.
+function hmsRedirectBinds(bx: i32, from: i32, to: i32) {
+  const lets = nodeValueChildren(bx)
+  let i = 0
+  while i < lets.length {
+    const d = P.nodes[lets[i]]
+    if d is LetDecl { hmsRedirectRoot(d.letInit, from, to) }
+    i = i + 1
+  }
+  0
+}
+
+// Re-roots the member chain at `ix` from node `from` onto node `to`.
+function hmsRedirectRoot(ix: i32, from: i32, to: i32) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const n = P.nodes[ix]
+  if n is Member {
+    if n.memObj == from {
+      const nm: Node = { memObj: to, memProp: n.memProp, pos: n.pos }
+      arenaSetNode(ix, nm)
+      return 0
+    }
+    return hmsRedirectRoot(n.memObj, from, to)
+  }
+  0
+}
+
 // D1580 — the return tail is a spine, not a subtree: `retTailPos` may follow only the chain
 // of nodes whose own value is the function's return (a block's last statement, an
 // if-expression's arms, a `return`'s argument, a paren). Every other parent — an object
@@ -29867,6 +30274,8 @@ export function checkProgram(rootIx: i32) {
     )
   }
   checkerArmed = false
+  // Before the tables below are sized, so every node it mints is checked (D1991).
+  hoistMatchScrutinees(rootIx)
   const rootN0 = P.nodes[rootIx]
   if rootN0 is Program { gRootStmts = rootN0.progStmts }
   // Size the typed-IR table to the (now fully parsed) node arena, all holes (-1).
@@ -34530,7 +34939,8 @@ function checkLetDeclNode(n: LetDecl, ix: i32) {
   if n.letInit >= 0 { initTy = checkNode(n.letInit) }
   // A `void` initializer has no value to bind — reject with a source-located message,
   // poisoning `initTy`. Exempted: an if-expression init, whose false path is implicit `null`.
-  if n.letInit >= 0 && isVoidTy(initTy) {
+  // A minted scrutinee binding (D1991) keeps the `void`, so the `match` reports it in its own words.
+  if n.letInit >= 0 && isVoidTy(initTy) && !symNameIsMinted(n.letName) {
     if !voidSlotExemptExpr(n.letInit) {
       tErr(
         "cannot bind the void result of '" +
