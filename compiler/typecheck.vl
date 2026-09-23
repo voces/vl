@@ -351,8 +351,9 @@ export type TyMap = { mKey: i32, mVal: i32, mSet: i32 }
 // its argument's type and the return substitutes through.
 export type TyVar = { tvName: string }
 // The literal-member vocabulary — a closed set, so every producer is a literal
-// `mkLitTy("str"/"int"/"flt", …)` and a member outside it is a hard type error.
-export type LitKind = "str" | "int" | "flt"
+// `mkLitTy("str"/"int", …)` and a member outside it is a hard type error. There is no float
+// literal type: `floatLitTypeMsg` refuses one where it is written.
+export type LitKind = "str" | "int"
 
 // The comparability vocabulary — which lowering a `==`/`!=` operand's rep takes. `""` and
 // `"none"` are different answers and both are load-bearing: the checker rejects `"none"`
@@ -375,10 +376,10 @@ export type EqCmpKind = ""
   | "nulstrlist"
   | "nulreflist"
 
-// A literal type: a single-inhabitant type (`"a"`, `0`, `1.5`), the member unit of a
-// literal union. `litText` is the raw characters between the quotes for "str" (escapes
-// unresolved — annotation and literal expression carry the same raw lexeme, so membership
-// compares consistently), the numeric lexeme for "int"/"flt".
+// A literal type: a single-inhabitant type (`"a"`, `0`), the member unit of a literal union.
+// `litText` is the raw characters between the quotes for "str" (escapes unresolved —
+// annotation and literal expression carry the same raw lexeme, so membership compares
+// consistently), the canonical integer lexeme for "int".
 export type TyLit = { litKind: LitKind, litText: string }
 // A negation `!T` — "anything but `T`". Almost always consumed by `intersectTy`
 // (`A & !B` subtracts); a residual standalone negation accepts any source not assignable
@@ -2640,8 +2641,8 @@ function mkLitTy(kind: LitKind, text: string) {
   addTy(t)
 }
 
-// The arena type of one literal-member lexeme — `"a"` → the `str` literal type, `1.5` → `flt`,
-// `0x10` → `int` — or -1 when `name` does not begin a literal member at all. The one home for
+// The arena type of one literal-member lexeme — `"a"` → the `str` literal type, `0x10` → `int`
+// — or -1 when `name` is not a literal member (a float lexeme is none: `floatLitTypeMsg`). The one home for
 // that lexeme grammar, so `nameToTy`'s annotation resolver and `canonEmitName`'s literal arm both
 // ask for the type and let the renderer name it rather than each carrying the rule.
 function litMemberTy(name: string) {
@@ -2651,10 +2652,9 @@ function litMemberTy(name: string) {
   // characters. The quote test (`tyname.nameIsQuotedLeaf`) stays here because the group-interior
   // cut at its home is delimiter-blind by design; its bound is the length test two lines up.
   if nameIsQuotedLeaf(name) { return mkLitTy("str", groupInnerOf(name)) }
-  // A numeric-literal type (`0`, `1.5`, `1e3`): int or float by the lexeme's own shape — a `.` or
-  // a scientific exponent, `numLexIsFloat` being the one home.
+  // An integer-literal type (`0`, `0x10`). A float lexeme (`1.5`, `1e3`) names no type.
   if name[0] >= '0' && name[0] <= '9' {
-    if numLexIsFloat(name) { return mkLitTy("flt", name) }
+    if numLexIsFloat(name) { return -1 }
     return mkLitTy("int", name)
   }
   -1
@@ -6020,13 +6020,12 @@ function operandKind(ix: i32) {
   "a type"
 }
 
-// The base scalar a literal type softens to: a string literal to `string`, a real to `f64`, an
-// integer to its magnitude-defaulted integer type. An integer literal past the i32 range softens
+// The base scalar a literal type softens to: a string literal to `string`, an integer to its
+// magnitude-defaulted integer type. An integer literal past the i32 range softens
 // to i64, so the literal-aware assignability path never sneaks an out-of-range literal into an
 // i32 slot.
 export function litBaseTy(t: TyLit) {
   if t.litKind == "str" { return TY_STR }
-  if t.litKind == "flt" { return TY_F64 }
   if intLexemeFitsI32(t.litText) { return TY_I32 }
   TY_I64
 }
@@ -6109,8 +6108,9 @@ function litTyOfExpr(ix: i32) {
     const raw = e.strText
     return mkLitTy("str", raw.slice(1, raw.length - 1))
   }
+  // A float literal has no literal type; it is an `f64` value (`floatLitTypeMsg`).
   if e is NumLit {
-    if numLexIsFloat(e.numText) { return mkLitTy("flt", e.numText) }
+    if numLexIsFloat(e.numText) { return -1 }
     return mkLitTy("int", e.numText)
   }
   -1
@@ -9587,6 +9587,47 @@ function negInAnnotationMsg(spelling: string) {
     "` is a NEGATION, which says what a value is not and so names no rep a value can be stored at. A negation may only appear in a `!is` guard: write the positive type here, and narrow with `if x !is T { … }`"
 }
 
+// A float literal written as a type, on either annotation route: banks the reason on the
+// `unkTyClash` wire, as `storageTyLeafFail` does, so the positioned caller reports it once.
+function floatLitTypeFail(lex: string) {
+  unkTyClash = floatLitTypeMsg(lex)
+  -1
+}
+
+// The one wording for that refusal. A design rule (owner ruling, D2221): float equality is not
+// set membership, so a float literal names no set `is` or `==` could test. An integral lexeme
+// (`2.0`) suggests its integer.
+function floatLitTypeMsg(lex: string): string {
+  let intPart = ""
+  let dot = false
+  let whole = true
+  let i = 0
+  while i < lex.length {
+    const c = lex[i]
+    if c == 'e' || c == 'E' {
+      whole = false
+    } else if c == '.' {
+      dot = true
+    } else if dot {
+      if c != '0' && c != '_' { whole = false }
+    } else {
+      intPart = intPart + lex.slice(i, i + 1)
+    }
+    i = i + 1
+  }
+  if intPart.length == 0 { whole = false }
+  const intHint = if whole {
+    ", or the integer literal `" + intPart + "` if an integer was meant"
+  } else {
+    ", or an integer literal if an integer was meant"
+  }
+  "a float literal cannot be a type: float equality is not set membership (`-0.0 == 0.0`, NaN never equals itself, and rounding makes different spellings one value), so no `is` or `==` could test the set it names. Write `f64` (or `f32`)" +
+    intHint +
+    ", in place of the float literal `" +
+    lex +
+    "`"
+}
+
 // An INTERSECTION operand, spelling-tree route: a negation here is subtracted from the
 // operand beside it and the annotation's own type is the positive remainder, which is the one
 // place the ruling keeps a written `!T`. Every other position reaches `tsToTy`'s refusing arm,
@@ -10558,9 +10599,9 @@ function tsToTyReal(ix: i32) {
     const lex = tsText[ix]
     return mkLitTy("str", groupInnerOf(lex))
   }
-  // A numeric-literal type (`0`, `1.5`): int vs float by the `.` in the lexeme.
+  // An integer-literal type (`0`). A float literal in a type is refused (`floatLitTypeFail`).
   if k == TS_LITNUM {
-    if numLexIsFloat(tsText[ix]) { return mkLitTy("flt", tsText[ix]) }
+    if numLexIsFloat(tsText[ix]) { return floatLitTypeFail(tsText[ix]) }
     return mkLitTy("int", tsText[ix])
   }
   if k == TS_NULL { return TY_NULL }
@@ -10683,6 +10724,10 @@ function nameToTyReal(name: string) {
     if name[0] == '!' {
       tErr(negInAnnotationMsg(name), annotDiagAt)
       return TY_ERR
+    }
+    // A float literal written as a type — the name route's half of the spelling tree's refusal.
+    if name[0] >= '0' && name[0] <= '9' {
+      if numLexIsFloat(name) { return floatLitTypeFail(name) }
     }
     // A parenthesized group `(A | B)`: peel only when `tyname.parenEnclosesWhole` says the
     // leading `(` closes at the final character — not `emit_base.tyGroupWrapsWhole`, which
@@ -41623,7 +41668,6 @@ function getterLitUnionOk(ms: i32[]): boolean {
     if ms[i] < 0 { return false }
     const m = T.tys[ms[i]]
     if m is TyLit {
-      if m.litKind == "flt" { return false }
       if kind == "" { kind = m.litKind }
       if kind != m.litKind { return false }
     } else {
@@ -44967,6 +45011,7 @@ function litSetNeverMsg(x: i32, obj: i32, chk: i32): string {
 function checkIsExprNode(n: IsExpr, ix: i32) {
   let objTy = checkNode(n.isObj)
   const chkTy = isTypeTy(n.isVariant, ix)
+  const chkClash = if chkTy < 0 { unkTyClash } else { "" }
   // A literal set that only overlaps the operand's tests as the overlap (D2205).
   const meet = litSetMeetTy(objTy, chkTy)
   // A `const` literal tests as the compare does: against a literal it never equals the
@@ -44997,7 +45042,12 @@ function checkIsExprNode(n: IsExpr, ix: i32) {
     }
   }
   if chkTy < 0 {
-    tErr("unknown type '" + n.isVariant + "' in 'is'", ix)
+    // A reason the resolver banked (a float literal, `u8`) is the whole diagnostic.
+    if chkClash.length > 0 {
+      tErr(chkClash, ix)
+    } else {
+      tErr("unknown type '" + n.isVariant + "' in 'is'", ix)
+    }
     // `objTy < 0` is the operand's own "no answer", not a type — indexing `T.tys` with it
     // would trap the compiler (D1462); an unresolved operand is freely testable, same as `TyErr`.
   } else if n.isVariant != "null" && objTy >= 0 {
