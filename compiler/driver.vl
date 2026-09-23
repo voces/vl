@@ -58,7 +58,16 @@ import {
   srcmapReset,
   srcmapSetKeys,
 } from "./srcmap"
-import { wBytes, wName, wSection, wTarget, wULEB } from "./emit_bytes"
+import {
+  ropeAt,
+  ropeReset,
+  ropeSeek,
+  wBytes,
+  wName,
+  wSection,
+  wTarget,
+  wULEB,
+} from "./emit_bytes"
 import {
   W,
   emitErr,
@@ -957,7 +966,7 @@ export function compileSrc(): i32 {
   callRestPacked = []
   callNever = []
   vcDgReset()
-  W.bytes = []
+  ropeReset(W)
   emitErr = ""
   fnNames = []
   fnIndices = []
@@ -1008,36 +1017,40 @@ export function compileSrc(): i32 {
   emitSrcSection()
   0
 }
-export function rbyteLen(): i32 { W.bytes.length }
-export function rbyteAt(i: i32): i32 { W.bytes[i] }
+export function rbyteLen(): i32 { W.len }
+export function rbyteAt(i: i32): i32 { ropeAt(W, i) }
 // ── bulk result read-back over linear memory — the out mirror of `srcLoad` ───────
 // `rbyteAt` above is one host call per emitted byte; this batched form has the guest
 // write the staging window and the host copy out, packed four bytes per i32 word so
 // the copy is a `memcpy`. A return of 0 or more than `count` is a protocol violation.
 export function rbyteStore(off: i32, count: i32): i32 {
-  const bs = W.bytes
-  const avail = bs.length - off
+  const avail = W.len - off
   let n = count
   if n > avail { n = avail }
-  if n < 0 { n = 0 }
+  if n <= 0 { return 0 }
+  // The module is a rope, so the window may straddle chunks; each word packs the next four
+  // bytes little-endian whichever chunk they come from.
+  let c = ropeSeek(W, off)
+  if c < 0 { return 0 }
+  let bs = W.chunks[c].b
+  let at = off - W.seekBase
+  let w = 0
   let i = 0
-  while i + 4 <= n {
-    const b0 = bs[off + i]
-    const b1 = bs[off + i + 1]
-    const b2 = bs[off + i + 2]
-    const b3 = bs[off + i + 3]
-    __store_i32__(i, b0 | (b1 << 8) | (b2 << 16) | (b3 << 24))
-    i = i + 4
-  }
-  if i < n {
-    let w = 0
-    let k = n - 1
-    while k >= i {
-      w = (w << 8) | bs[off + k]
-      k = k - 1
+  while i < n {
+    if at >= bs.length {
+      c = c + 1
+      bs = W.chunks[c].b
+      at = 0
     }
-    __store_i32__(i, w)
+    w = w | (bs[at] << ((i & 3) * 8))
+    at = at + 1
+    i = i + 1
+    if (i & 3) == 0 {
+      __store_i32__(i - 4, w)
+      w = 0
+    }
   }
+  if (i & 3) != 0 { __store_i32__(i - (i & 3), w) }
   n
 }
 // `vl check`: parse and typecheck only, no emit. 0 = ok, 1 = lex/parse, 2 = type.
@@ -1068,10 +1081,10 @@ export function checkSrc(): i32 {
   globalStmts = []
   globalNames = []
   // `check` never emits, so clear the emit-stage ABI a prior `compileSrc` on
-  // this instance populated: stale `W.bytes` would read back through
+  // this instance populated: a stale `W` would read back through
   // `rbyteLen`/`rbyteAt`, and a stale `emitErr` would append a phantom emit
   // diagnostic to THIS check's `diagCount`/`vcDiags` stream.
-  W.bytes = []
+  ropeReset(W)
   emitErr = ""
   initChecker()
   // Module mode (H3) — see compileSrc; `check` runs the same pipeline minus emit.
@@ -1396,7 +1409,7 @@ export function checkSrcSym(): i32 {
   globalStmts = []
   globalNames = []
   // Clear the emit-stage ABI — see checkSrc (a symbol-aware check never emits).
-  W.bytes = []
+  ropeReset(W)
   emitErr = ""
   initChecker()
   if modKeys.length > 0 {
@@ -2290,7 +2303,7 @@ function emitSrcSection(): i32 {
     if files[m] == "" { files[m] = srcmapPathOf(m) }
     r = r + 1
   }
-  const payload: i32[] = []
+  const payload: u8[] = []
   const prev = wTarget(payload)
   wULEB(files.length)
   let f = 0
@@ -2321,16 +2334,14 @@ function emitSrcSection(): i32 {
     i = i + 1
   }
   wTarget(prev)
-  const sec: i32[] = []
+  const sec: u8[] = []
   const secPrev = wTarget(sec)
   wName("vl-src")
   wBytes(payload)
   wTarget(secPrev)
   // Appended to the finished module: legal for a custom section, and it leaves every other
   // section's bytes at the offsets the rows name.
-  const outPrev = wTarget(W.bytes)
   wSection(0, sec)
-  wTarget(outPrev)
   0
 }
 

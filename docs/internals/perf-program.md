@@ -821,7 +821,7 @@ Two exports, two shapes, no new language surface:
 
 | export | accumulator | element | chunk | who reads it |
 | --- | --- | --- | ---: | --- |
-| `rbyteStore(off, count)` | `W.bytes` | a BYTE, packed 4 per i32 word | 65,536 | `vl build` / `run` / `test` (CMD_TEST_STASH) |
+| `rbyteStore(off, count)` | the module rope `W` (D1976) | a BYTE, packed 4 per i32 word | 65,536 | `vl build` / `run` / `test` (CMD_TEST_STASH) |
 | `cliCmdDataStore(off, count)` | `cliCmdData` | a code point, UTF-32LE | 16,384 | the CLI pump: `vl fmt` stdout + write, every `vl check` line, `--json` |
 
 Each writes `min(count, len - off)` elements at **byte 0 of the module's linear

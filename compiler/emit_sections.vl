@@ -124,6 +124,7 @@ import {
   letIsNulBoolAnn,
 } from "./emit_query"
 import {
+  ByteRope,
   VKind,
   W,
   aTypeIdx,
@@ -389,6 +390,7 @@ import {
   vbF64Used,
   vbI32Used,
   vbI64Used,
+  wStray,
 } from "./emit_state"
 import {
   emitFail,
@@ -436,12 +438,15 @@ import {
   fbValtypeNullable,
   mapTypeIdxOf,
   pushFieldStorage,
+  ropePush,
+  ropeReset,
   wBytes,
   wLen,
   wName,
   wRangeEq,
   wSLEB,
   wSection,
+  wSectionRope,
   wTarget,
   wU8,
   wULEB,
@@ -660,14 +665,17 @@ function emitReset() {
   // their own passes (the print-detection scan in `emitProgram`, `collectFns`)
   // which run BEFORE `emitModule` calls this; resetting them here would clobber
   // those passes' results.
-  W.bytes = []
-  curBuf = W.bytes
+  ropeReset(W)
+  wStray = []
+  curBuf = wStray
   0
 }
 
 // ── module header ────────────────────────────────────────────────────────────
 function emitHeader() {
-  // "\0asm" magic + version 1
+  // "\0asm" magic + version 1, the module's first chunk.
+  const head: u8[] = []
+  const prev = wTarget(head)
   wU8(0)
   wU8(97)  // 'a'
   wU8(115) // 's'
@@ -676,6 +684,8 @@ function emitHeader() {
   wU8(0)
   wU8(0)
   wU8(0)
+  wTarget(prev)
+  ropePush(W, head)
   0
 }
 
@@ -844,7 +854,7 @@ function checkParams(fnIx: i32) {
 // (declared locals, all i32), the body's statement instructions, then `end`. Framed bytes are
 // appended onto `out`. Returns 0, or -1 (via `emitFail`) on any unsupported shape. Every
 // declared local is i32, so the vector is one run `(L, 0x7f)`; params are not counted here — they are encoded in the functype, not the locals vector.
-function emitFuncCode(out: i32[], fnIx: i32, fnPos: i32) {
+function emitFuncCode(out: u8[], fnIx: i32, fnPos: i32) {
   const fn = P.nodes[fnIx]
   if fn is FuncDecl {
     // Anchors any emit failure raised while lowering this body at its declaration (`emitFail`
@@ -940,7 +950,7 @@ function emitFuncCode(out: i32[], fnIx: i32, fnPos: i32) {
     // land after the params and the hidden env param (local 0) when a function value exists module-wide, so the cursor starts past `envSlotShift`.
     fbBeginFunc(fn.fnParams.length + envSlotShift(fnIx), nLocals)
 
-    const bodyExpr: i32[] = []
+    const bodyExpr: u8[] = []
     // Binds the writer at `bodyExpr` so the `fb*` opcode methods (which append to `curBuf`) write
     // the function-body instructions; the recursive lowering threads the same `bodyExpr` as its
     // `body` arg, so `curBuf == body` throughout and not-yet-converted raw `body.push(...)` sites
@@ -966,7 +976,7 @@ function emitFuncCode(out: i32[], fnIx: i32, fnPos: i32) {
     if emitFuncBody(bodyExpr, fn.fnBody, fnIx) < 0 { return -1 }
     wTarget(exprPrev)
 
-    const body: i32[] = []
+    const body: u8[] = []
     // Locals vector: one (count=1, valtype) run per DECLARED local, then the scratch
     // frames in `fbBeginFunc`'s layout order. Derived from the local set + scratch
     // flags by the FuncBuilder (Phase H) — the run count and every valtype come from
@@ -1017,9 +1027,9 @@ function emitFuncCode(out: i32[], fnIx: i32, fnPos: i32) {
     }
     fbEnd() // 0x0b end
     wTarget(endPrev)
-    // Stream the size-prefixed code entry onto `out` (the code-section payload). Bind
-    // the writer at `out` explicitly: the caller restores `curBuf` off the payload
-    // before this loop, so `curBuf` is NOT `out` on entry here.
+    // Stream the size-prefixed code entry onto `out` (this entry's own buffer, which
+    // `placeCodeEntry` joins to the code payload). Bind the writer at `out` explicitly:
+    // `curBuf` is NOT `out` on entry here.
     const outPrev = wTarget(out)
     wULEB(body.length)
     // The size prefix is written, so `out.length` is where the body itself begins; `exprInBody`
@@ -1737,7 +1747,7 @@ function collectStartLocals() {
 // every non-const global initializer in declaration order, then `global.set gi`, so each cell
 // holds its real value before any other code runs. Frames exactly as `emitFuncCode` does:
 // collect locals, detect scratch frames, lay them out, emit the locals vector, then the body and `end`, size-prefixed.
-function emitStartFnCode(out: i32[]) {
+function emitStartFnCode(out: u8[]) {
   // Locals first, detection second: the scratch detectors classify expressions through the
   // declared-locals registry, so it must be populated first — `declaredSlotOf` falls back to the
   // flat `localNames` scan when no scope frame is active. The start function is synthetic and has
@@ -1763,7 +1773,7 @@ function emitStartFnCode(out: i32[]) {
   uSinkFired = 0
   fbBeginFunc(0, nStartLocals)
 
-  const bodyExpr: i32[] = []
+  const bodyExpr: u8[] = []
   const exprPrev = wTarget(bodyExpr)
   // Reset the emit-time scope/loop bookkeeping (the start fn has its own empty frame),
   // mirroring `emitFuncCode` — no leak from the last user function.
@@ -2053,7 +2063,7 @@ function emitStartFnCode(out: i32[]) {
   restoreNarrow(savedStartNarrowTop)
   wTarget(exprPrev)
 
-  const body: i32[] = []
+  const body: u8[] = []
   // Locals vector: the start fn's declared locals (for-loop vars), then the scratch frames.
   if fbEmitLocalsVec(body, nStartLocals) < 0 { return -1 }
   // Where `bodyExpr` lands INSIDE the body — everything before it is the locals vector.
@@ -2065,10 +2075,9 @@ function emitStartFnCode(out: i32[]) {
 
   const outPrev = wTarget(out)
   wULEB(body.length)
-  // REBASE this body's statement rows off `bodyExpr` and onto the code payload (D1594):
-  // the size prefix is written, so `out.length` is where the body itself begins. The
-  // caller rebases the payload onto the module once `wSection` places it, exactly as it
-  // does for a user function's row.
+  // REBASE this body's statement rows off `bodyExpr` and onto the entry (D1594): the size
+  // prefix is written, so `out.length` is where the body itself begins. The caller moves
+  // them onto the payload and then the module, exactly as it does for a user function's row.
   const bodyInOut = out.length
   let ssp = spanBase
   while ssp < emitFnSpanStart.length {
@@ -2085,8 +2094,8 @@ function emitStartFnCode(out: i32[]) {
 // memory (two words per pair) and prints each value, mirroring the host runner's `__log__`
 // import. Tag 0 is a plain i32; a non-zero tag traps (`unreachable`) since no corpus program
 // logs one natively and a silent wrong decode is worse. The host joins a multi-pair log into one line, this prints one per pair — harmless, since every corpus call logs exactly one.
-function emitMemLogFnCode(out: i32[]) {
-  const body: i32[] = []
+function emitMemLogFnCode(out: u8[]) {
+  const body: u8[] = []
   const prev = wTarget(body)
   // Locals vector: params occupy 0 (offset) and 1 (length); local 2 is the cursor.
   wULEB(1)      // 1 locals run
@@ -2134,7 +2143,7 @@ function emitMemLogFnCode(out: i32[]) {
 // opcodes against wasm param/local indices (no scratch-frame indirection — params are the frame).
 
 // Frame a finished helper body (locals vec + code already in `body`) onto `out`.
-function helpFrameBody(out: i32[], body: i32[]) {
+function helpFrameBody(out: u8[], body: u8[]) {
   const outPrev = wTarget(out)
   wULEB(body.length)
   wBytes(body)
@@ -2166,8 +2175,8 @@ function fbStrHashStep(k: i32) {
 // Locals: h(1), i(2), n(3), lim(4), back(5). Memoised in the header's mutable `$hash` field
 // (field 3) — sound because the hash is a pure function of the three immutable header
 // fields, so one mutable field in an immutable string is a memo, not state; `0` means "not computed yet", so a string whose hash is genuinely 0 re-walks.
-function emitStrHashFnCode(out: i32[]) {
-  const body: i32[] = []
+function emitStrHashFnCode(out: u8[]) {
+  const body: u8[] = []
   const prev = wTarget(body)
   wULEB(2)     // 2 locals runs
   wULEB(4)     // count 4
@@ -2281,8 +2290,8 @@ function fbStrEqReadB(k: i32) {
   0
 }
 
-function emitStrEqFnCode(out: i32[]) {
-  const body: i32[] = []
+function emitStrEqFnCode(out: u8[]) {
+  const body: u8[] = []
   const prev = wTarget(body)
   wULEB(3)     // 3 locals runs
   wULEB(3)     // count 3
@@ -2416,8 +2425,8 @@ function emitStrEqFnCode(out: i32[]) {
 // both operands' live ranges in, and wraps a whole-backing header around it. Params: a(0),
 // b(1). Locals: lenA(2), lenB(3) i32; out(4) a non-null `(ref $sBackIdx)`. Concat is the one
 // string op a view cannot make cheaper, but each `array.copy` reads from its operand's `start`, not from 0, so a view operand does not concatenate its parent's leading characters.
-function emitStrConcatFnCode(out: i32[]) {
-  const body: i32[] = []
+function emitStrConcatFnCode(out: u8[]) {
+  const body: u8[] = []
   const prev = wTarget(body)
   wULEB(2) // 2 locals runs
   wULEB(2) // count 2
@@ -2512,8 +2521,8 @@ function fbUtf8DecBad() {
 // `i`, never reading at or past `end`. Returns `(width << 24) | codepoint`, so one call answers
 // both questions a decoding cursor has; `width` is always >= 1. A malformed sequence — a stray
 // continuation byte, an invalid lead, a truncated tail, an overlong form, a surrogate, or a value past U+10FFFF — decodes to U+FFFD rather than trapping (Go-lean).
-function emitUtf8DecFnCode(out: i32[]) {
-  const body: i32[] = []
+function emitUtf8DecFnCode(out: u8[]) {
+  const body: u8[] = []
   const prev = wTarget(body)
   wULEB(1) // 1 locals run
   wULEB(6) // b, n, cp, k, c, lo
@@ -2744,8 +2753,8 @@ function fbUtf8Bump(wL: i32, k: i32) {
 // from `back[start ..]` into a fresh, exact-fit string. Params: back(0) `(ref $aTypeIdx)`,
 // start(1), len(2). Locals: n(3), i(4), cp(5), out(6) `(ref $sBackIdx)`, w(7). Two passes,
 // because a WasmGC array is fixed-length: pass 1 sums the widths to size the backing, pass 2 writes; both read through `fbUtf8EncRead`, so they cannot disagree about what a code point is.
-function emitUtf8EncFnCode(out: i32[]) {
-  const body: i32[] = []
+function emitUtf8EncFnCode(out: u8[]) {
+  const body: u8[] = []
   const prev = wTarget(body)
   wULEB(3) // 3 locals runs — the ref sits BETWEEN two i32 runs, so the vector splits
   wULEB(3) // n(3), i(4), cp(5)
@@ -2874,8 +2883,8 @@ function emitUtf8EncFnCode(out: i32[]) {
 // Locals: back(1) `(ref null $sBackIdx)`, i(2), end(3), n(4). Drives `__utf8_dec__` rather
 // than counting non-continuation bytes: the difference shows only on malformed input, where
 // a cheap count and the decode-driven count disagree (a stray continuation byte or truncated sequence each yield their own U+FFFD) — this stays the decode's own answer, not a second one.
-function emitUtf8CpLenFnCode(out: i32[]) {
-  const body: i32[] = []
+function emitUtf8CpLenFnCode(out: u8[]) {
+  const body: u8[] = []
   const prev = wTarget(body)
   wULEB(2)
   wULEB(1)
@@ -2929,8 +2938,8 @@ function emitUtf8CpLenFnCode(out: i32[]) {
 // storage. One `array.copy` of the view's byte range into an exact-fit packed backing,
 // wrapped in the ordinary list struct. Params: s(0). Locals: out(1), a non-null
 // `(ref $ba8TypeIdx)` set before reads. It copies though the design doc says it should not: a `u8[]` wrapper has no `start` field, so a zero-copy `bytes()` would be silently wrong on `s.slice(1)` (filed, not done).
-function emitStrBytesFnCode(out: i32[]) {
-  const body: i32[] = []
+function emitStrBytesFnCode(out: u8[]) {
+  const body: u8[] = []
   const prev = wTarget(body)
   wULEB(1)
   wULEB(1)
@@ -2968,8 +2977,8 @@ function emitStrBytesFnCode(out: i32[]) {
 // to wrap with `i32.and` instead of `i32.rem_u`. The `index` array's length is a power of two
 // at every point in a map's life, from its only three producers (`emitMapNew` at 16,
 // `__map_resize__` at `2 * len(index)`, `emitMapCompact`) — a fourth producer must keep `mask = cap - 1`. `__map_probe__`: wrapping linear probe to the matching-or-free slot, the shared core of every map op.
-function emitMapProbeFnCode(out: i32[]) {
-  const body: i32[] = []
+function emitMapProbeFnCode(out: u8[]) {
+  const body: u8[] = []
   const prev = wTarget(body)
   wULEB(1) // 1 locals run
   wULEB(3) // count 3
@@ -3046,8 +3055,8 @@ function emitMapProbeFnCode(out: i32[]) {
 // `__map_probe__`, line for line, with three substitutions — the key hashes by the integer
 // mix (`fbI32HashMix`) instead of `__str_hash__`, the stored-hash gate falls through to an
 // `i32.eq` on the key, and the mix stays inline here (the string hash is hoisted to the call site instead) — everything else is identical, which lets both key kinds share `__map_resize__`, the rehash and the compaction.
-function emitMapProbeI32FnCode(out: i32[]) {
-  const body: i32[] = []
+function emitMapProbeI32FnCode(out: u8[]) {
+  const body: u8[] = []
   const prev = wTarget(body)
   wULEB(1) // 1 locals run
   wULEB(4) // count 4
@@ -3126,8 +3135,8 @@ function emitMapProbeI32FnCode(out: i32[]) {
 // crosses 1/2 (`size*2 >= len(index)`), allocates a doubled index and re-places every live entry
 // from its stored hash (no key re-hashing), returning the fresh backing; otherwise returns
 // `index` unchanged. The caller unconditionally stores the result back into `M.index`.
-function emitMapResizeFnCode(out: i32[]) {
-  const body: i32[] = []
+function emitMapResizeFnCode(out: u8[]) {
+  const body: u8[] = []
   const prev = wTarget(body)
   wULEB(2) // 2 locals runs
   wULEB(3) // count 3
@@ -3222,8 +3231,8 @@ function emitMapResizeFnCode(out: i32[]) {
 // the sign of the dividend (Rust's `f64::rem`, JS's `%`, C's `fmod`; wasm has no instruction
 // for it, D1586). Not that identity evaluated directly — it is off by an ulp once the
 // quotient passes 2^53 — but a scaled repeated-subtraction form: double `b` to the largest `b * 2^k <= a`, then halve back down subtracting where it fits, each step exact in Sterbenz's range.
-function emitF64RemFnCode(out: i32[]) {
-  const body: i32[] = []
+function emitF64RemFnCode(out: u8[]) {
+  const body: u8[] = []
   const prev = wTarget(body)
   wULEB(1) // one locals run
   wULEB(4) // four of them
@@ -3372,7 +3381,7 @@ function emitNameSection(n: i32) {
   // Build the namemap (count + entries) into a temp buffer, then frame it as the
   // subsection payload. The print imports (if present) are named first at their
   // hardcoded indices 0..3, then each user function at `gImports + i`.
-  const fnameMap: i32[] = []
+  const fnameMap: u8[] = []
   const mapPrev = wTarget(fnameMap)
   let count = gImports + n
   if startStmts.length > 0 { count = count + 1 }
@@ -3509,12 +3518,12 @@ function emitNameSection(n: i32) {
   wTarget(mapPrev)
 
   // ── assemble the section payload: wName("name") + the two subsections ─────────
-  const namePayload: i32[] = []
+  const namePayload: u8[] = []
   const npPrev = wTarget(namePayload)
   wName("name")
   // module-name subsection (id 0): a single name. Its payload is a length-prefixed
   // name, built into a temp so the subsection-size ULEB frames the right length.
-  const modName: i32[] = []
+  const modName: u8[] = []
   const mnPrev = wTarget(modName)
   wName("vl")
   wTarget(mnPrev)
@@ -3705,7 +3714,7 @@ function emitModule(_stmts: i32[]) {
   // + i`), so the id a closure already stores is the table slot. Sized for all of them, not for
   // the filled ones: the size is written four sections before the bodies decide which those are.
   if fnValUsed {
-    const tabPayload: i32[] = []
+    const tabPayload: u8[] = []
     const tabPrev = wTarget(tabPayload)
     wULEB(1)            // 1 table
     wU8(112)            // 0x70 funcref element type
@@ -3719,7 +3728,7 @@ function emitModule(_stmts: i32[]) {
   // 1 page, no max. Emitted only when a memory intrinsic is used, and not at all when the
   // host opted into importing it (`memImported`) — the import section then carries it.
   if memUsed && !memImported() {
-    const memPayload: i32[] = []
+    const memPayload: u8[] = []
     const memPrev = wTarget(memPayload)
     wULEB(1) // 1 memory
     wU8(0)   // limits flag 0x00: min only
@@ -3739,7 +3748,7 @@ function emitModule(_stmts: i32[]) {
   // any export is callable — here the synthetic start fn that runs the non-const global
   // initializers. Sits after the export section (7) and before the code section (10); omitted entirely when no non-const global exists.
   if hasStart == 1 {
-    const startPayload: i32[] = []
+    const startPayload: u8[] = []
     const stPrev = wTarget(startPayload)
     wULEB(startFnIdx)
     wTarget(stPrev)
@@ -3749,8 +3758,13 @@ function emitModule(_stmts: i32[]) {
   // The code payload is BUILT here and framed below, after the element section it feeds:
   // lowering a function value is what marks `fnAddrTaken`, so building first is what lets the
   // segment list the addresses the bodies actually took. Sound because no body reads the
-  // module buffer — every write goes to a payload of its own — so only the framing is ordered.
-  const codePayload: i32[] = []
+  // module rope — every write goes to a payload of its own — so only the framing is ordered.
+  const codePayload: ByteRope = {
+    chunks: [],
+    len: 0,
+    seekChunk: 0,
+    seekBase: 0,
+  }
   if buildCodePayload(codePayload, n, hasStart, memFn, nHelpers) < 0 {
     return -1
   }
@@ -3762,7 +3776,7 @@ function emitModule(_stmts: i32[]) {
   if fnValUsed {
     const elemRuns = fnAddrTakenRuns(n)
     if elemRuns > 0 {
-      const elemPayload: i32[] = []
+      const elemPayload: u8[] = []
       const elPrev = wTarget(elemPayload)
       wULEB(elemRuns)
       let di = elemNextTaken(0, n)
@@ -3790,6 +3804,11 @@ function emitModule(_stmts: i32[]) {
   // lives). A no-op unless `gEmitNames` is set, so the default emit path is
   // unchanged for every golden.
   emitNameSection(n)
+  if wStray.length > 0 {
+    return emitFail(
+      "emitProgram: a module byte was written outside any section",
+    )
+  }
   0
 }
 
@@ -4839,7 +4858,7 @@ function emitTypeSection(
   nPrintTypes: i32,
   nHelpers: i32,
 ) {
-  const typePayload: i32[] = []
+  const typePayload: u8[] = []
   // Bind the writer at `typePayload` for the WHOLE type-section payload build, so the
   // raw framing bytes, `pushFieldStorage`, and `fbValtype` all stream to `curBuf ==
   // typePayload` identically. Restored just before `wSection` frames it (below).
@@ -5471,7 +5490,7 @@ function emitImportSection(n: i32, typeOffset: i32, hasStart: i32) {
   // and memory imports occupy their own index space, so no function index moves.
   if gImports == 0 {
     if memImported() || externGlobalCount() > 0 {
-      const memOnlyPayload: i32[] = []
+      const memOnlyPayload: u8[] = []
       const moPrev = wTarget(memOnlyPayload)
       let nNonFn = externGlobalCount()
       if memImported() { nNonFn = nNonFn + 1 }
@@ -5500,7 +5519,7 @@ function emitImportSection(n: i32, typeOffset: i32, hasStart: i32) {
     // continues the same chain rather than re-deriving it.
     let ftFs = ftF32
     if gNeedsF32Print { ftFs = ftF32 + 1 }
-    const importPayload: i32[] = []
+    const importPayload: u8[] = []
     const imPrev = wTarget(importPayload)
     // 4 imports normally; +1 each for `__print_i64__` / `__print_f64__` / `__print_f32__`.
     let nImports = 4
@@ -5641,7 +5660,7 @@ function emitFunctionSection(
   // Function section (id 3): N functions; func i uses functype `typeOffset + i`. The
   // synthetic start function (if any) is the LAST entry — function index `n` — using
   // the `()->()` functype at index `typeOffset + n`.
-  const funcPayload: i32[] = []
+  const funcPayload: u8[] = []
   const fnPrev = wTarget(funcPayload)
   const wrapF = exportWrapSlots()
   wULEB(n + hasStart + memFn + nHelpers + wrapF.length)
@@ -5709,7 +5728,7 @@ function emitGlobalSection() {
     gHeapGlobalIdx = externGlobalCount() + np + nCells
   }
   if nCells + np + nHeap > 0 {
-    const globalPayload: i32[] = []
+    const globalPayload: u8[] = []
     // Bind the writer at `globalPayload` for the WHOLE global-section payload build, so
     // the count, each entry's valtype (`fbValtype`), mutability flag, and init constexpr
     // (`fb*` opcodes) all stream to `curBuf == globalPayload`. Restored before framing.
@@ -5989,8 +6008,8 @@ function exportWrapSlots(): i32[] {
 // tail into the real function. A top-level export cannot capture anything, so `ref.null
 // struct` is the correct env, exactly as the direct-call path passes for a non-capturing
 // callee. No locals: the wrapper's own params are locals 0..p-1, un-shifted — the one function in the module with no env param.
-function emitExportWrapperCode(out: i32[], slot: i32) {
-  const body: i32[] = []
+function emitExportWrapperCode(out: u8[], slot: i32) {
+  const body: u8[] = []
   const prev = wTarget(body)
   wULEB(0) // no local runs
   fbRefNullStruct()
@@ -6058,7 +6077,7 @@ function emitExportSection(_n: i32, wrapBase: i32) {
   if reExpNm.length == 0 && gExpNm.length == 0 && !memExported { return 0 }
   let nExports = reExpNm.length + gExpNm.length
   if memExported { nExports = nExports + 1 }
-  const exportPayload: i32[] = []
+  const exportPayload: u8[] = []
   const exPrev = wTarget(exportPayload)
   wULEB(nExports)
   // Each entry: the bare public name pointing at the target's func index — or, when the module
@@ -6159,105 +6178,155 @@ function fnAddrTakenRuns(n: i32): i32 {
 // (in helper-index order). Separate from the framing below because the element section is
 // written between the two. Returns -1 if any body fails to emit, else 0.
 function buildCodePayload(
-  codePayload: i32[],
+  codePayload: ByteRope,
   n: i32,
   hasStart: i32,
   memFn: i32,
   nHelpers: i32,
 ) {
-  const codePrev = wTarget(codePayload)
   const wrapC = exportWrapSlots()
+  const countHead: u8[] = []
+  const codePrev = wTarget(countHead)
   wULEB(n + hasStart + memFn + nHelpers + wrapC.length)
   wTarget(codePrev)
+  ropePush(codePayload, countHead)
+  // Each entry renders into a buffer of its own and joins the payload as one chunk, so no
+  // buffer holds more than one function (D1976). `rows` marks the span rows the entry is
+  // about to bank, entry-relative until `placeCodeEntry` moves them onto the payload.
   let ci = 0
   while ci < n {
     // Bank the body's byte range for the VALIDATE diagnostic (D1578). Recorded HERE, at
     // the one loop that already pairs a `fnStmts` position with the body it writes, so a
     // span cannot name a different function than the code it brackets. Payload-relative
-    // until `wSection` below places the payload in the module.
-    const bodyAt = codePayload.length
-    if emitFuncCode(codePayload, fnStmts[ci], ci) < 0 { return -1 }
-    bankFnSpan(fnStmts[ci], ci, bodyAt, codePayload.length, 0, "")
+    // until `writeCodeSection` places the payload in the module.
+    const rows = emitFnSpanStart.length
+    const entry: u8[] = []
+    if emitFuncCode(entry, fnStmts[ci], ci) < 0 { return -1 }
+    placeCodeEntry(codePayload, entry, rows, fnStmts[ci], ci, 0, "")
     ci = ci + 1
   }
   if hasStart == 1 {
     // The start function banks a row per top-level statement from inside `emitStartFnCode`
     // (D1594), then this whole-body row as the fallback for the frame bytes no statement covers.
     // Pushed after them, since `emitFnSpanAt` returns the first row whose range holds the offset and the narrower answer is the useful one.
-    const startAt = codePayload.length
-    if emitStartFnCode(codePayload) < 0 { return -1 }
-    bankFnSpan(-1, -1, startAt, codePayload.length, 4, "")
+    const rows = emitFnSpanStart.length
+    const entry: u8[] = []
+    if emitStartFnCode(entry) < 0 { return -1 }
+    placeCodeEntry(codePayload, entry, rows, -1, -1, 4, "")
   }
   if memLogUsed {
-    const logAt = codePayload.length
-    if emitMemLogFnCode(codePayload) < 0 { return -1 }
-    bankFnSpan(-1, -1, logAt, codePayload.length, 3, "__log__")
+    const rows = emitFnSpanStart.length
+    const entry: u8[] = []
+    if emitMemLogFnCode(entry) < 0 { return -1 }
+    placeCodeEntry(codePayload, entry, rows, -1, -1, 3, "__log__")
   }
   // The shared runtime helpers, each banked under the name the name section gives it — one body, one row, so a trace and a validate diagnostic cannot disagree about what to call the same function.
   if gHelpStrHash >= 0 {
-    let hAt = codePayload.length
-    if emitStrHashFnCode(codePayload) < 0 { return -1 }
-    bankFnSpan(-1, -1, hAt, codePayload.length, 3, "__str_hash__")
-    hAt = codePayload.length
-    if emitStrEqFnCode(codePayload) < 0 { return -1 }
-    bankFnSpan(-1, -1, hAt, codePayload.length, 3, "__str_eq__")
-    hAt = codePayload.length
-    if emitStrConcatFnCode(codePayload) < 0 { return -1 }
-    bankFnSpan(-1, -1, hAt, codePayload.length, 3, "__str_concat__")
-    hAt = codePayload.length
-    if emitUtf8DecFnCode(codePayload) < 0 { return -1 }
-    bankFnSpan(-1, -1, hAt, codePayload.length, 3, "__utf8_dec__")
-    hAt = codePayload.length
-    if emitUtf8EncFnCode(codePayload) < 0 { return -1 }
-    bankFnSpan(-1, -1, hAt, codePayload.length, 3, "__utf8_enc__")
-    hAt = codePayload.length
-    if emitUtf8CpLenFnCode(codePayload) < 0 { return -1 }
-    bankFnSpan(-1, -1, hAt, codePayload.length, 3, "__utf8_cplen__")
+    const hash: u8[] = []
+    let rows = emitFnSpanStart.length
+    if emitStrHashFnCode(hash) < 0 { return -1 }
+    placeCodeEntry(codePayload, hash, rows, -1, -1, 3, "__str_hash__")
+    const eq: u8[] = []
+    rows = emitFnSpanStart.length
+    if emitStrEqFnCode(eq) < 0 { return -1 }
+    placeCodeEntry(codePayload, eq, rows, -1, -1, 3, "__str_eq__")
+    const concat: u8[] = []
+    rows = emitFnSpanStart.length
+    if emitStrConcatFnCode(concat) < 0 { return -1 }
+    placeCodeEntry(codePayload, concat, rows, -1, -1, 3, "__str_concat__")
+    const dec: u8[] = []
+    rows = emitFnSpanStart.length
+    if emitUtf8DecFnCode(dec) < 0 { return -1 }
+    placeCodeEntry(codePayload, dec, rows, -1, -1, 3, "__utf8_dec__")
+    const enc: u8[] = []
+    rows = emitFnSpanStart.length
+    if emitUtf8EncFnCode(enc) < 0 { return -1 }
+    placeCodeEntry(codePayload, enc, rows, -1, -1, 3, "__utf8_enc__")
+    const cpLen: u8[] = []
+    rows = emitFnSpanStart.length
+    if emitUtf8CpLenFnCode(cpLen) < 0 { return -1 }
+    placeCodeEntry(codePayload, cpLen, rows, -1, -1, 3, "__utf8_cplen__")
     if gHelpStrBytes >= 0 {
-      hAt = codePayload.length
-      if emitStrBytesFnCode(codePayload) < 0 { return -1 }
-      bankFnSpan(-1, -1, hAt, codePayload.length, 3, "__str_bytes__")
+      const bytes: u8[] = []
+      rows = emitFnSpanStart.length
+      if emitStrBytesFnCode(bytes) < 0 { return -1 }
+      placeCodeEntry(codePayload, bytes, rows, -1, -1, 3, "__str_bytes__")
     }
   }
   if gHelpMapProbe >= 0 {
-    let mAt = codePayload.length
-    if emitMapProbeFnCode(codePayload) < 0 { return -1 }
-    bankFnSpan(-1, -1, mAt, codePayload.length, 3, "__map_probe__")
-    mAt = codePayload.length
-    if emitMapResizeFnCode(codePayload) < 0 { return -1 }
-    bankFnSpan(-1, -1, mAt, codePayload.length, 3, "__map_resize__")
+    const probe: u8[] = []
+    let rows = emitFnSpanStart.length
+    if emitMapProbeFnCode(probe) < 0 { return -1 }
+    placeCodeEntry(codePayload, probe, rows, -1, -1, 3, "__map_probe__")
+    const resize: u8[] = []
+    rows = emitFnSpanStart.length
+    if emitMapResizeFnCode(resize) < 0 { return -1 }
+    placeCodeEntry(codePayload, resize, rows, -1, -1, 3, "__map_resize__")
   }
   if gHelpMapProbeI32 >= 0 {
-    const miAt = codePayload.length
-    if emitMapProbeI32FnCode(codePayload) < 0 { return -1 }
-    bankFnSpan(-1, -1, miAt, codePayload.length, 3, "__map_probe_i32__")
+    const rows = emitFnSpanStart.length
+    const entry: u8[] = []
+    if emitMapProbeI32FnCode(entry) < 0 { return -1 }
+    placeCodeEntry(codePayload, entry, rows, -1, -1, 3, "__map_probe_i32__")
   }
   if gHelpF64Rem >= 0 {
-    const frAt = codePayload.length
-    if emitF64RemFnCode(codePayload) < 0 { return -1 }
-    bankFnSpan(-1, -1, frAt, codePayload.length, 3, "__f64_rem__")
+    const rows = emitFnSpanStart.length
+    const entry: u8[] = []
+    if emitF64RemFnCode(entry) < 0 { return -1 }
+    placeCodeEntry(codePayload, entry, rows, -1, -1, 3, "__f64_rem__")
   }
   // The export-wrapper bodies LAST, in the same order the function section declared them.
   // A wrapper's row carries the WRAPPED function's slot and node, so its name and the
   // `file:line:col` of its declaration fall out of the same readers a user body uses.
   let wci = 0
   while wci < wrapC.length {
-    const wAt = codePayload.length
-    emitExportWrapperCode(codePayload, wrapC[wci])
-    bankFnSpan(fnStmts[wrapC[wci]], wrapC[wci], wAt, codePayload.length, 2, "")
+    const rows = emitFnSpanStart.length
+    const entry: u8[] = []
+    emitExportWrapperCode(entry, wrapC[wci])
+    placeCodeEntry(
+      codePayload,
+      entry,
+      rows,
+      fnStmts[wrapC[wci]],
+      wrapC[wci],
+      2,
+      "",
+    )
     wci = wci + 1
   }
   0
 }
 
+// Append one rendered code entry to `code` and bank its whole-body span row. The rows
+// banked since `rows` are relative to `entry`, so they move by the entry's payload offset.
+function placeCodeEntry(
+  code: ByteRope,
+  entry: u8[],
+  rows: i32,
+  node: i32,
+  pos: i32,
+  kind: i32,
+  tag: string,
+) {
+  const at = code.len
+  let r = rows
+  while r < emitFnSpanStart.length {
+    emitFnSpanStart[r] = emitFnSpanStart[r] + at
+    emitFnSpanEnd[r] = emitFnSpanEnd[r] + at
+    r = r + 1
+  }
+  ropePush(code, entry)
+  bankFnSpan(node, pos, at, at + entry.length, kind, tag)
+}
+
 // Code section (id 10): frame the payload `buildCodePayload` produced onto the module, then
 // rebase the body spans onto it.
-function writeCodeSection(codePayload: i32[]) {
-  wSection(10, codePayload)
-  // Rebases the payload-relative spans onto the module (D1578). `wSection` has just appended
-  // the payload to the module buffer, so `wLen() - codePayload.length` is where it starts — a
+function writeCodeSection(codePayload: ByteRope) {
+  wSectionRope(10, codePayload)
+  // Rebases the payload-relative spans onto the module (D1578). `wSectionRope` has just appended
+  // the payload to the module rope, so `W.len - codePayload.len` is where it starts — a
   // module offset being exactly the coordinate the engine's validator reports. Derived from the length, not the section header's own width, so the ULEB size prefix cannot be counted wrong.
-  const codeBase = wLen() - codePayload.length
+  const codeBase = W.len - codePayload.len
   let sp = 0
   while sp < emitFnSpanStart.length {
     emitFnSpanStart[sp] = emitFnSpanStart[sp] + codeBase
