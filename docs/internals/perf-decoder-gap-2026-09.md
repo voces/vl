@@ -218,7 +218,7 @@ the right-hand columns):
 That last point matters for `-O3` on the web: **`-O3` inlines `decode` into the start function**
 (it has one caller), which is called once and therefore never leaves V8's baseline tier (V8 has no on-stack
 replacement for Wasm) — V8 decode 0.56 → 0.95 s. Re-running the same binaryen pipeline with
-`--no-inline=decode*` takes V8's whole run from 1.00 to 0.77 CPU-s, and wasmtime does not care.
+`--no-inline=decode*` takes V8's whole run from 1.00 to 0.77 CPU-s, and wasmtime does not care. (L8, now built: the host marks such callees itself.)
 
 ## 5 · Validated A/Bs
 
@@ -245,7 +245,7 @@ replacement for Wasm) — V8 decode 0.56 → 0.95 s. Re-running the same binarye
 | **L5** | **Cache the Cranelift compile of a user module** (`vl run x.wasm` and `vl run x.vl`), keyed like the seed's `.cwasm` sidecar | 0.33–0.44 s wall per run; all of plumb's "setup" | M | outside the decode gap but it is the whole fixed cost of every short run. **BUILT**: `db.wasm` 0 passes 425 → 24 ms warm — DECISIONS.md §"A user module's Cranelift compile is cached" |
 | **L6** | **`u8[]` element access** — one bounds check, not two, and the backing array and length hoisted out of a `for`-in | `u8[]` is 3–4× the raw load at every build | M | the logical-length clamp is VL's; the rest is L3's engine overhead |
 | **L7** | **Add a live-set benchmark to `bench/`** — a held table plus per-unit allocation, the churn program above | would have caught C1 | S — **BUILT** | the existing suite's kernels have tiny live sets (§3). `bench/collections/live-set-churn` (LIVE=50,000, CHURN=75,000,000, ~1s). The regression GUARD is `tests/vl_gc_heap_shape_test.ts`, graded by collection count rather than wall clock: `$VL_GC_STATS=1` (scripts/vl-host/src/main.rs) counts wasmtime's copying-collection cycles via its trace log and prints them on exit. On the same fixture, scaled to run in milliseconds (LIVE=50,000, CHURN=1,000,000): 1 collection at the shipped 64 MiB initial heap, 149 at an initial size of 0 (built to an isolated target-dir, never the shared binary) — a 149x spread, so the bound (20) has wide margin on both sides |
-| L8 | `-O3` must not inline into the start function | V8 only: whole run 1.00 → 0.77 CPU-s here | S | the web target; wasmtime indifferent |
+| L8 | `-O3` must not inline into the start function | V8 only: whole run 1.00 → 0.77 CPU-s here | S | the web target; wasmtime indifferent. **BUILT**: the host marks every callee that only run-once code calls from a loop `--no-inline`; V8 `-O3` 0.83 → 0.65 CPU-s, wasmtime unchanged here, a trade on the view kernels (buffer-design.md §M9) — DECISIONS.md §"`-O3` keeps hot callees out of run-once code" |
 | L9 | `==` against a string literal: compare lengths inline before calling `__str_eq__` | 3% of ops here | S | cheap, general |
 | L10 | Scalar module `const`s as immutable globals (or immediates) | ~0% speed | S | module size and readability of the wasm only |
 

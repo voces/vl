@@ -262,7 +262,11 @@ const buildAt = async (fixture: string, flag: string | null, out: string): Promi
 };
 
 Deno.test({
-  name: "descriptor melt: one view melts, the same one view with a second call site does not",
+  // Until `-O3` kept hot callees out of run-once code (DECISIONS.md, "`-O3` keeps hot callees
+  // out of run-once code"), `scale-view` collapsed into its once-run driver and melted to 0/1
+  // while `scale-seedtwice` kept 5/2. The driver no longer absorbs the kernel, so both now
+  // read 5/2; the collapse is still reachable by forcing inlining (test 3 below).
+  name: "descriptor melt: a kernel called from a run-once driver keeps its descriptor",
   ignore: !ENABLED,
   fn: async () => {
     const dir = await Deno.makeTempDir({ prefix: "vl-descmelt-" });
@@ -278,11 +282,11 @@ Deno.test({
       const melted = await shapeOf("scale-view");
       const kept = await shapeOf("scale-seedtwice");
       const bad: string[] = [];
-      // `scale-view` collapses into its driver: the only `struct.new` left is the
-      // Buffer's, the view descriptor never exists, nothing is read per element.
-      if (melted.sget !== 0 || melted.snew !== 1) {
+      // `scale-view`'s kernel stays a function its run-once driver calls per trip, so the
+      // descriptor is built and passed like `scale-seedtwice`'s and read per element.
+      if (melted.sget !== 5 || melted.snew !== 2) {
         bad.push(
-          `scale-view: in-loop struct.get=${melted.sget} (want 0), struct.new=${melted.snew} (want 1)`,
+          `scale-view: in-loop struct.get=${melted.sget} (want 5), struct.new=${melted.snew} (want 2)`,
         );
       }
       // `scale-seedtwice` does not: the descriptor is built in a surviving callee
@@ -296,8 +300,9 @@ Deno.test({
         throw new Error(
           `the descriptor melt boundary moved — ${bad.join("; ")}\n` +
             `  These two sources differ ONLY in how many times an idempotent seed helper\n` +
-            `  is called. If they now agree, the 3.0x in buffer-design.md §M4 has a new\n` +
-            `  explanation and §M4 must be re-derived in the same commit.`,
+            `  is called. If they differ again, the run-once driver is absorbing its kernel\n` +
+            `  (V8 then runs it on the baseline tier) and buffer-design.md §M4 must be\n` +
+            `  re-derived in the same commit.`,
         );
       }
     } finally {
