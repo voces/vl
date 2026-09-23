@@ -1104,7 +1104,10 @@ These are the decisions O1(c) says are "ordinary code". Each is pinned by value 
   `std:buffer` promises never to touch; and the host's already-written `ioMem` staging probe wants a
   fixed low window it can own later without moving the heap. **1 KiB and not one page** — reserving
   a whole page would force a `memory.grow`, and therefore a host view detachment, during the init of
-  a program that otherwise fits in the default page.
+  a program that otherwise fits in the default page. **1024 is now the DEFAULT of a per-build heap
+  window** (`vl build --heap-base=/--heap-limit=`, read through two immutable globals), so that
+  separately compiled units sharing one memory can be given disjoint windows — `DECISIONS.md`
+  §"Linear memory is a layout contract". The default reproduces every behaviour pinned here.
 - **`ALIGN = 8` — sizes round up, bases are 8-aligned.** 8 is the widest scalar VL can store
   (i64/f64), so every width's natural alignment is satisfied at offset 0 and every 8-multiple offset.
   This is a PERFORMANCE choice, not a correctness one — the wasm alignment immediate is a hint and
@@ -1120,7 +1123,8 @@ These are the decisions O1(c) says are "ordinary code". Each is pinned by value 
 - **Three traps, all at allocation time, none per access.** A negative length (the bump pointer
   would walk backwards and hand out overlapping extents); an i32 overflow (past 2 GiB a byte address
   stops being orderable, so `next > base` silently stops working); and a `bufferRelease` mark outside
-  `[HEAP_BASE, bumpPtr]`. §A4's bounds policy is untouched: there is no per-access check, because the
+  `[HEAP_BASE, bumpPtr]`. A fourth joined with the heap window: a `Buffer` whose end passes the
+  build's heap limit, which by default is the same 2 GiB cap. §A4's bounds policy is untouched: there is no per-access check, because the
   engine's own trap is the memory-safety proof.
 
 ### J4. What was re-measured, and the three claims that were STALE
