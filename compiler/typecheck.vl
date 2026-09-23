@@ -16653,6 +16653,22 @@ function cwGrowAt(
   if k == CW_UP_ARG {
     return cwGrowCall(up, set, setFr, fowners, fownerFrs, flds)
   }
+  if k == CW_UP_OBJ { return cwGrowRecv(up, set, setFr) }
+  0
+}
+
+// The receiver -> `self` edge of a UFCS call `x.f(…)`, where `mIx` is the member `x.f`: the
+// receiver binds `f`'s first parameter exactly as an argument binds its own, so a write through
+// `self` is a write through `x` (D2165). A member that is not a resolved UFCS callee adds nothing.
+function cwGrowRecv(mIx: i32, set: string[], setFr: i32[]): i32 {
+  if mIx < 0 || mIx >= cwIxUpKind.length { return 0 }
+  if cwIxUpKind[mIx] != CW_UP_CALLEE { return 0 }
+  const dIx = cwUfcsDeclOf(mIx)
+  if dIx < 0 { return 0 }
+  if cwAnnIsView(cwParamAnnOfDecl(dIx, 0)) { return 0 }
+  const pn = cwParamNameOfDecl(dIx, 0)
+  if pn == "" { return 2 }
+  if cwAdd(set, setFr, pn, dIx) { return 1 }
   0
 }
 
@@ -22980,6 +22996,14 @@ function ufcsScopeStepsAside(name: string, fnTy: i32, recvTy: i32): boolean {
   false
 }
 
+// The receiver expression of a member call `r.f(…)`, or -1 when the callee is not a plain
+// member access (an optional chain's receiver is checked on its own path).
+function ufcsRecvExpr(n: Call): i32 {
+  const c = P.nodes[n.callFn]
+  if c is Member { return c.memObj }
+  -1
+}
+
 function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
   // Maps the callee's plain source name to its merge-mangled function, after field precedence
   // has already been checked — resolved at this call's own site (D1120), since two merged
@@ -23095,6 +23119,19 @@ function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
           )
           return TY_ERR
         }
+      }
+    }
+    // The receiver is `self`'s argument, so it takes the argument seam's verdict too: the
+    // dispatch gate above asks bare `assignable`, which misses the refusals the seam holds,
+    // such as a container widened into a differently stored element (D2165). A hole on
+    // either side is left to the pin, which re-asks the dispatch with the hole bound.
+    const recvX = ufcsRecvExpr(n)
+    if recvX >= 0 && !tyHasHole(recvTy) && !tyHasHole(params[0]) {
+      if !assignableExpr(recvX, recvTy, params[0]) {
+        tErr(
+          "receiver: expected " + tyToStr(params[0]) + ", got " + tyToStr(recvTy),
+          recvX,
+        )
       }
     }
     let i = 0

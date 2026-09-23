@@ -3761,7 +3761,8 @@ message says so: `i32[] is not f64[]: a container never widens implicitly … Bu
 or copy it with .map((x) => x as f64)`. The same rule covers a union-widened element
 (`i32[]` → `(i32 | null)[]`), a literal union into `string` (`K[]` → `string[]`), and a map's
 key or value. The author writes the copy, or builds the container at the wide type from the
-start.
+start. A method call's receiver is `self`'s argument and gets the same verdict: `ks.join(",")`
+refuses exactly where `join(ks, ",")` does (D2165).
 
 **Why a copy is not the answer.** VL lists alias: `const b: i32[] = a; b[0] = 9` is seen
 through `a`, and so is a callee's store through its parameter. An implicit converting copy

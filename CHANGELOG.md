@@ -41,6 +41,10 @@ see **`DECISIONS.md`**.
   argument is written after), D2163 (push / index / map stores take the licence and lower no
   copy), D2164 (`[...a]` into a wider element, invalid wasm). DECISIONS.md §"No implicit
   container widening" lists the widenings that still run and are the owner's to decide.
+  A method-call receiver now takes the argument's verdict (D2165): `ks.join(",")` over a `K[]`
+  and a `self: f64[]` method written through on an `i32[]` were check-clean invalid wasm while
+  `join(ks, ",")` refused. `ufcsCallTy` asks the argument seam after dispatch, and the
+  write-state closure follows a receiver into `self`.
 - **A getter body is held to a step budget, a string-literal compare is priced, and a float `%`
   is refused (D2061, D2062, D2063).** The contract counted loops, so nine loop-free getters each
   reading the previous one four times passed and did 65,536 calls behind one `.a8`. The checker
