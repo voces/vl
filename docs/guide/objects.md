@@ -19,29 +19,49 @@ type Opt = { id: i32, label: string | null }
 const o: Opt = { id: 1 }          // o.label is null
 ```
 
-## There is no empty object
+## `{}` is the literal with every field left out
 
-`{}` is refused wherever a value is expected: a binding, an argument, a return value, a
-field, a list element or a match arm's value.
+So `{}` is a value of any record whose fields all admit `null`, wherever that record is the
+expected type — a binding, an argument, a return, a field, a list element, the fallback of
+`??`:
 
 ```vl
-const o = {}      // error: an empty object has no fields to hold; write its fields,
-                  //        or use `null` for no value
+type Cfg = { verbose: boolean | null, out: string | null }
+const c: Cfg = {}                 // both fields null
+run({})
+function defaults(): Cfg { return {} }
+const cfg = loaded ?? {}          // `loaded: Cfg | null`
 ```
 
-An object with no fields carries no information, so write the fields it should have, or
-use `null` (with a `T | null` type) for "no value". A map starts empty with `Map()`, a set
-with `Set()`.
+It is refused when the record has a field that may not be left out, and the message names it:
+
+```vl
+type P = { a: i32, b: string | null }
+const x: P = {}   // error: `{}` leaves out `a`, a required field of P; only a field whose
+                  //        type admits `null` may be omitted
+```
+
+and when nothing says which record it is:
+
+```vl
+const o = {}      // error: `{}` has no record type here to complete — give its destination
+                  //        a record type whose fields admit `null`, or write its fields
+```
+
+A map starts empty with `Map()`, a set with `Set()`; `{}` is never a map.
 
 ## There is no empty nested block
 
-A `{}` standing on its own as a statement is refused too:
+A `{}` standing on its own as a statement is refused:
 
 ```vl
 if ready {
   {}              // error: an empty block does nothing; remove it
 }
 ```
+
+That includes the last line of a block whose value is used: write `({})` there to mean the
+literal, as in `function pick(k: i32): Cfg | null { if k == 0 { ({}) } else { null } }`.
 
 The empty **body** of a construct is fine, and is how you write "do nothing":
 

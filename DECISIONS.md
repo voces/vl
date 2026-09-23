@@ -2218,35 +2218,42 @@ braced blocks reach too (`if c { 1 } else { 2 }` in value position is the same c
 formats parse-clean files, so it simply stops seeing the unbraced input; nothing became
 unreachable.
 
-## A bare `{}` is refused — VL has neither an empty object nor an empty nested block (owner, 2026-09-23)
+## `{}` completes an all-nullable record; a `{}` statement is an empty block and refused (owner, 2026-09-23)
 
-**The ruling (D2223).** `{}` used as a VALUE (a binding initializer, an argument, a return, a
-field, an element, an arm value) is refused by `vl check` with "an empty object has no fields
-to hold; write its fields, or use `null` for no value". `{}` standing as a STATEMENT inside a
-block is refused with "an empty block does nothing; remove it". The empty BODY of a construct
-is untouched: `if c {}`, `else {}`, `while c {}`, `for x in xs {}`, `function f() {}`,
-`() => {}` and a match arm's `=> {}` are all still the ordinary empty body.
+**The ruling (D2223), as revised the same day to option (b).** A record literal may omit a
+field whose type admits `null` (it completes to `null`), so `{}` is the literal that omits
+every field. It is legal wherever the EXPECTED type is a record whose fields all admit `null`:
+`type Cfg = { verbose: boolean | null, out: string | null }; const c: Cfg = {}` runs with both
+fields null, and so do an argument, a return, a field, an element, a nullable or union
+destination with such a member, and `x ?? {}`. The TYPE `{}` stays meaningful — a record
+with no fields — and `type E = {}; const e: E = {}` runs. `{}` as a value is refused in two
+cases, each in its own words: against a record with a required field ("`{}` leaves out `a`,
+a required field of P; only a field whose type admits `null` may be omitted"), and where no
+record type is expected at all (`const o = {}`, `{ inner: {} }`, `[{}]`, an inferred return:
+"`{}` has no record type here to complete…"). A `{}` standing as a STATEMENT inside a block
+(`if c { {} }`, a line of a function body) is refused as "an empty block does nothing; remove
+it" — including as the value tail of a block, where `({})` is the spelling. The empty BODY of
+a construct (`if c {}`, `else {}`, `while`, `for`, `function f() {}`, `() => {}`, `=> {}`) is
+unchanged.
 
-**Why refuse rather than build either reading.** Before the ruling `{}` parsed as an object
-literal in both positions, the checker typed it as the empty record and accepted it, and the
-emitter had no zero-field shape, so every spelling was a check-clean emit failure (clause 2).
-The two ways to close it were a parser ruling (`{}` in statement position is an empty block)
-plus a lowering for `const o = {}`, or a zero-field struct rep for every position. Neither
-earns its place: an empty nested block does nothing, and an empty object carries no
-information that `null` does not. A refusal the design owes is not a capability gap.
+**Why not refuse `{}` outright**, the first reading of the ruling: it would single out the
+one record literal that omits everything, while the literal omitting all but one field is
+legal. The rule is the omission rule, and `{}` is its limit case. An empty nested block, by
+contrast, does nothing at all, so the statement reading earns no place.
 
-**Measured before landing.** The distilled corpus moved **0 of 7,589 cells**; `std/`,
-`compiler/` and consumer plumb write no bare `{}`. Eight sites in six files did: four fixtures
-(`unions/empty-inline-shape-union-arm.vl` constructed its empty arm, `structs/nullable-map-field.vl`
-omitted the only field, `maps/error-object-literal-not-map.vl` and `arrays/error-u8-storage-only.vl`
-used `{}` as a stand-in for a map value) and two capability probes for `{} | null`, which
-probed a value the language no longer has and were deleted.
+**Where it lives.** The statement refusal is a lossless parser diagnostic; the parser lists
+the node so the checker types it as the error type without a second message. The value
+readings are the checker's: `assignableExpr`, the seam every binding, argument, return, field,
+element and store delivery passes, marks a `{}` it delivers into a record (following parens,
+`??`'s fallback, list elements and `if`/`match` value tails), and a tail `if` under a declared
+return is marked where the body's tail is checked. A `{}` no delivery reached is refused after
+the last body. A delivered `{}` records its record as both its type and its rep, since no struct
+row has zero fields; the emitter's row resolver takes that record for a zero-field literal.
 
-**Where it lives.** Both messages are parser diagnostics marked lossless, since the tree keeps
-the literal the author wrote; the checker types a zero-field literal as the error type and
-return inference counts it as an already-reported cause, so no follow-on error is printed.
-The TYPE `{}` still parses (as a union arm it still declares and discriminates); it simply has
-no literal.
+**Measured.** The distilled corpus moved **0 of 7,589 cells**; `std/`, `compiler/` and consumer
+plumb write no bare `{}`, and every fixture and probe in the tree that wrote one — an empty
+union arm, an omitted map field, a map-typed destination, the `{} | null` probes — keeps its
+spelling and its outcome.
 
 ## ONE hole syntax, `\{expr}`, in BOTH quoted forms — the trigger lives in the escape namespace (owner, 2026-09-01, "OK do `\{`")
 

@@ -84,6 +84,7 @@ import {
   restParamIndex,
   spreadArgOf,
   stmtAlwaysExits,
+  stmtBraceNodes,
 } from "./ast"
 import {
   CALLSITE_NAME,
@@ -3093,9 +3094,13 @@ let nodePinKind: i32[] = []
 let nodePinPay: string[] = []
 let inferQuiet = false
 let cycleBreakCount = 0
-// Bare `{}` literals checked so far (D2223): a body holding one has already been refused, so
+// Bare `{}` literals refused so far (D2223): a body holding one has already been reported, so
 // its return inference owes no second message.
 let bareBraceCount = 0
+// D2223: every value-position `{}` checked, and per node whether a delivery gave it a record
+// type to complete (1). `bareBraceUndelivered` refuses the rest once every body is checked.
+let bareBraceLits: i32[] = []
+let bareBraceMark: i32[] = []
 let inferTentative: string[] = []
 let unresolvedFns: string[] = []
 let fnSawValueRet = false
@@ -3876,6 +3881,8 @@ export function initChecker() {
   inferQuiet = false
   cycleBreakCount = 0
   bareBraceCount = 0
+  bareBraceLits = []
+  bareBraceMark = []
   inferTentative = []
   unresolvedFns = []
   fnSawValueRet = false
@@ -8844,6 +8851,9 @@ function radixLitAdoptPeer64(exprIx: i32, peerTy: i32) {
 }
 
 export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
+  // A bare `{}` completes against a record destination; a required field it omits is refused
+  // here, in words, instead of as the site's generic mismatch (D2223).
+  if bareBraceDeliver(srcExpr, dstTy, 8) { return true }
   // A generic function value meeting a concrete function type is decided by instantiation inside
   // `assignable`'s `TyFunc` case (`genericFnAssignable`), so it governs nested positions like an
   // array element too, not just this expression-level entry.
@@ -30643,6 +30653,8 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
             clearTailVerdict(stmts[s])
           }
           if ret >= 0 {
+            // A tail `if` is a statement node, so its arms' `{}` reach no `assignableExpr`.
+            if isStmtNode(stmts[s]) { bareBraceDeliver(stmts[s], ret, 8) }
             if !isStmtNode(stmts[s]) {
               // A `never` body is graded whole below, not by its tail's value.
               if !isVoidTy(ret) && ret != TY_NEVER {
@@ -31646,9 +31658,191 @@ function checkProgramNode(n: Program) {
     }
     uf = uf + 1
   }
+  bareBraceUndelivered()
   // LAST, because both of its filters read state this pass fills — see its header.
   annCommitVariantMembers()
   TY_VOID
+}
+
+// ── bare `{}` (D2223) ───────────────────────────────────────────────────────
+// `{}` is the record literal with every field omitted, so it needs an expected record type
+// whose fields all admit `null`. Deliveries mark it (`bareBraceDeliver`); what no delivery
+// reached is refused after the last body is checked.
+
+// The members of `dstTy` a `{}` could complete: `dstTy` itself, or its union members, with a
+// nullable wrapper peeled; empty when there is no type.
+function bareBraceMembers(dstTy: i32): i32[] {
+  const out: i32[] = []
+  if dstTy < 0 { return out }
+  let d = dstTy
+  const dn = T.tys[d]
+  if dn is TyNullable { d = dn.nInner }
+  if d < 0 { return out }
+  const du = T.tys[d]
+  if du is TyUnion {
+    let m = 0
+    while m < du.uMembers.length {
+      if du.uMembers[m] >= 0 { out.push(du.uMembers[m]) }
+      m = m + 1
+    }
+  } else {
+    out.push(d)
+  }
+  out
+}
+
+// The first field of record `mt` a `{}` cannot omit (its type does not admit `null`), "" when
+// every field may be omitted, or "-" when `mt` is not a record.
+function bareBraceRequiredField(mt: i32): string {
+  const mo = T.tys[mt]
+  if mo is TyObj {
+    let k = 0
+    while k < mo.objFieldNames.length {
+      if !tyAdmitsNull(mo.objFieldTypes[k]) { return mo.objFieldNames[k] }
+      k = k + 1
+    }
+    return ""
+  }
+  "-"
+}
+
+// The record member of `dstTy` a `{}` completes, or -1 when none admits it.
+function bareBraceRecordOf(dstTy: i32): i32 {
+  const ms = bareBraceMembers(dstTy)
+  let i = 0
+  while i < ms.length {
+    if bareBraceRequiredField(ms[i]) == "" { return ms[i] }
+    i = i + 1
+  }
+  -1
+}
+
+// The refusal for a `{}` delivered into `dstTy` that no record member admits, naming the first
+// required field of the first record member; "" when `dstTy` offers no record at all.
+function bareBraceRequiredMsg(dstTy: i32): string {
+  const ms = bareBraceMembers(dstTy)
+  let i = 0
+  while i < ms.length {
+    const f = bareBraceRequiredField(ms[i])
+    if f != "-" {
+      return "`{}` leaves out `" +
+        f +
+        "`, a required field of " +
+        tyToStr(ms[i]) +
+        "; only a field whose type admits `null` may be omitted"
+    }
+    i = i + 1
+  }
+  ""
+}
+
+// Whether `dstTy` is absent or is (or wraps) an unsolved type variable: a generic parameter
+// offers no record for a `{}` to complete.
+function bareBraceHoleDst(dstTy: i32): boolean {
+  if dstTy < 0 { return true }
+  const ms = bareBraceMembers(dstTy)
+  let i = 0
+  while i < ms.length {
+    if tyIsHole(ms[i]) { return true }
+    i = i + 1
+  }
+  false
+}
+
+// Mark every bare `{}` that `srcExpr` delivers into `dstTy`, following parentheses, the
+// fallback of `??`, list elements and the value tails of `if` / `match`. True when it refused
+// one for a required field, so the delivery itself reports nothing more.
+function bareBraceDeliver(srcExpr: i32, dstTy: i32, depth: i32): boolean {
+  if srcExpr < 0 || srcExpr >= P.nodes.length || depth <= 0 { return false }
+  const e = P.nodes[srcExpr]
+  if e is Paren { return bareBraceDeliver(e.parInner, dstTy, depth - 1) }
+  if e is BinExpr {
+    if e.binOp == "??" { return bareBraceDeliver(e.binRight, dstTy, depth - 1) }
+    return false
+  }
+  if e is Block {
+    if e.blkStmts.length == 0 { return false }
+    return bareBraceDeliver(e.blkStmts[e.blkStmts.length - 1], dstTy, depth - 1)
+  }
+  if e is IfStmt {
+    const a = bareBraceDeliver(e.ifThen, dstTy, depth - 1)
+    const b = bareBraceDeliver(e.ifElse, dstTy, depth - 1)
+    return a || b
+  }
+  if e is MatchExpr {
+    let any = false
+    let m = 0
+    while m < e.matchBodies.length {
+      if bareBraceDeliver(e.matchBodies[m], dstTy, depth - 1) { any = true }
+      m = m + 1
+    }
+    return any
+  }
+  if e is ArrayLit { return bareBraceDeliverElems(e.arrElems, dstTy, depth) }
+  if !(e is ObjLit) { return false }
+  if e.objFields.length != 0 || listHasI32(stmtBraceNodes, srcExpr) {
+    return false
+  }
+  if bareBraceHoleDst(dstTy) { return false }
+  while bareBraceMark.length <= srcExpr { bareBraceMark.push(0) }
+  bareBraceMark[srcExpr] = 1
+  if inferQuiet { return false }
+  const rec = bareBraceRecordOf(dstTy)
+  if rec >= 0 {
+    // The emitter builds the literal as this record, since no row has zero fields: its
+    // recorded type, not only its rep, names the record every reader then resolves.
+    recordRepTyAdopt(srcExpr, rec, 6)
+    while nodeTyIx.length <= srcExpr { nodeTyIx.push(-1) }
+    nodeTyIx[srcExpr] = rec
+    return false
+  }
+  const msg = bareBraceRequiredMsg(dstTy)
+  if msg == "" { return false }
+  bareBraceCount = bareBraceCount + 1
+  tErr(msg, srcExpr)
+  true
+}
+
+// `bareBraceDeliver` over a list literal's elements, against the element type of `dstTy`.
+function bareBraceDeliverElems(elems: i32[], dstTy: i32, depth: i32): boolean {
+  if dstTy < 0 { return false }
+  let at = dstTy
+  const an = T.tys[at]
+  if an is TyNullable { at = an.nInner }
+  if at < 0 { return false }
+  const aa = T.tys[at]
+  if !(aa is TyArray) { return false }
+  let any = false
+  let k = 0
+  while k < elems.length {
+    if bareBraceDeliver(elems[k], aa.aElem, depth - 1) { any = true }
+    k = k + 1
+  }
+  any
+}
+
+// Refuse every value-position `{}` no delivery gave a record type to complete, unless another
+// diagnostic already stands on that literal.
+function bareBraceUndelivered() {
+  let i = 0
+  while i < bareBraceLits.length {
+    const ix = bareBraceLits[i]
+    let marked = ix < bareBraceMark.length && bareBraceMark[ix] == 1
+    let d = 0
+    while d < T.diags.length && !marked {
+      if T.diags[d].tat == ix { marked = true }
+      d = d + 1
+    }
+    if !marked {
+      tErr(
+        "`{}` has no record type here to complete — give its destination a record type " +
+          "whose fields admit `null`, or write its fields",
+        ix,
+      )
+    }
+    i = i + 1
+  }
+  0
 }
 
 // Wraps a match arm body as a `Block` (a bare-expression body becomes a one-statement block).
@@ -44544,13 +44738,15 @@ function checkIndexNode(n: Index, ix: i32) {
 // structure, so field order need not match the declaration.
 
 // Extracted from `checkNodeReal`'s `ObjLit` arm (C3: thin the dispatcher).
-function checkObjLitNode(n: ObjLit, _ix: i32) {
+function checkObjLitNode(n: ObjLit, ix: i32) {
   const fields = n.objFields
-  // A zero-field literal is a bare `{}`, which the parser has already refused in words (D2223);
-  // the error type keeps every consumer of its value from reporting it again.
   if fields.length == 0 {
-    bareBraceCount = bareBraceCount + 1
-    return TY_ERR
+    // A `{}` statement is the parser's empty-block refusal; the error type keeps it at one.
+    if listHasI32(stmtBraceNodes, ix) {
+      bareBraceCount = bareBraceCount + 1
+      return TY_ERR
+    }
+    bareBraceLits.push(ix)
   }
   const fnames: string[] = []
   const ftys: i32[] = []

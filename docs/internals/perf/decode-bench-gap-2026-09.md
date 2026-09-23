@@ -142,9 +142,9 @@ engine's to fix (the previous round's L3(b)–(d)).
 in the emitter with `emitProgram: object literal field count does not match struct` (a clause-2
 violation by construction). A statement-position `{}` inside an `if` arm parses as an object
 literal, the checker types it as the empty record `{}`, and the emitter has no zero-field shape
-to build it with. The owner's ruling closed it: VL has neither an empty object nor an empty
-nested block, so `vl check` now refuses a bare `{}` in both readings (DECISIONS.md, "A bare
-`{}` is refused"):
+to build it with. The owner's ruling closed it: a `{}` standing as a statement is refused as an
+empty block, and a `{}` value completes a record whose fields all admit `null`, refused only
+where no such record is expected (DECISIONS.md, "`{}` completes an all-nullable record"):
 
 ```vl
 type Insn = { len: i32 }

@@ -23,7 +23,15 @@ import {
   mkMatch,
 } from "./ast"
 import { getDeclAdd, getDeclName } from "./ast"
-import { BinExpr, Ident, P, Tok, dgMarkLossless, mkDeclNameTok } from "./ast"
+import {
+  BinExpr,
+  Ident,
+  P,
+  Tok,
+  dgMarkLossless,
+  mkDeclNameTok,
+  stmtBraceNodes,
+} from "./ast"
 // The free index-operator declaration-name encoding — the parser is where
 // `function "[]"(self: T, …)` gets the receiver-carrying name it declares under.
 import {
@@ -1197,7 +1205,7 @@ function parsePrimary() {
     // (A block statement is dispatched by `parseStmt`'s `LBRACE` case before
     // any expression is parsed, so a `{` ever reaching `parsePrimary` — an
     // expression context — is unambiguously an object literal, never a block.)
-    return parseObjLit(EMPTY_OBJ_MSG)
+    return parseObjLit()
   }
   if k == "LBRACK" {
     // A `[` in expression position is an array literal `[e, e, ...]`. (Index
@@ -1382,10 +1390,9 @@ function parseSpreadable() {
   mkSpread(parseExpr(), sp0)
 }
 
-// D2223: VL has no empty object and no empty nested block, so a bare `{}` is refused in both
-// readings. The diagnostic is a lossless recovery (the literal stays in the tree), and the
-// checker types a zero-field literal as the error type, so nothing downstream repeats it.
-const EMPTY_OBJ_MSG = "an empty object has no fields to hold; write its fields, or use `null` for no value"
+// D2223: VL has no empty nested block, so a bare `{}` standing as a statement is refused. The
+// diagnostic is a lossless recovery (the literal stays in the tree, and the checker, which
+// owns the value reading of `{}`, is told by `stmtBraceNodes` not to report it again).
 const EMPTY_BLOCK_MSG = "an empty block does nothing; remove it"
 
 // Whether the `{` at token index `bracePos` closes with nothing but newlines inside it.
@@ -1398,13 +1405,9 @@ function bracesAreEmpty(bracePos: i32) {
 // An object literal `{ name: value, … }`, the cursor on the leading `{`. A field is
 // `IDENT ":" expr`, a string key `"+": expr` (operator and index-trap fields, decoded with
 // quotes stripped), a method shorthand `add(a, b) { … }`, or a bare-IDENT shorthand `{ x }`.
-// `objFields` are the `FieldInit` indices in source order; `emptyMsg` refuses a bare `{}`.
-function parseObjLit(emptyMsg: string) {
+// `objFields` are the `FieldInit` indices in the source order the emitter binds by.
+function parseObjLit() {
   const p0 = peekTok().start // the opening `{`
-  if bracesAreEmpty(P.pos) {
-    dgMarkLossless(P.diags.length) // the index this push is about to occupy
-    P.diags.push({ msg: emptyMsg, at: P.pos })
-  }
   expect("LBRACE")
   const brSavedO = brDepth
   brDepth = brDepth + 1
@@ -3793,7 +3796,13 @@ export function parseStmt() {
     // A `{` at statement position is a block unless it shapes up as an object literal
     // (`{ k: v, … }` — an expression statement or implicit return). `looksLikeObject`
     // disambiguates, and the object form parses as an expression through `parsePrimary`.
-    if bracesAreEmpty(P.pos) { return parseObjLit(EMPTY_BLOCK_MSG) }
+    if bracesAreEmpty(P.pos) {
+      dgMarkLossless(P.diags.length) // the index this push is about to occupy
+      P.diags.push({ msg: EMPTY_BLOCK_MSG, at: P.pos })
+      const eb = parseObjLit()
+      stmtBraceNodes.push(eb)
+      return eb
+    }
     if looksLikeObject(P.pos) { return parseExpr() }
     return parseBlock()
   }

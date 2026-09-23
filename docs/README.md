@@ -12,7 +12,7 @@ The language and CLI as a user mental model.
 - [`guide/operators.md`](guide/operators.md) — what every operator means and on what operand types (`%` is the truncated remainder; the `as` / `as?` / `as!` / `as%` family).
 - [`guide/narrowing.md`](guide/narrowing.md) — flow narrowing (`is` / `?.` / null).
 - [`guide/doc-comments.md`](guide/doc-comments.md) — `///` vs `//`, what a doc block attaches to, and what the editor shows on hover.
-- [`guide/objects.md`](guide/objects.md) — object literals and braces: when `{` is an object and when a block, and why a bare `{}` is refused in both readings.
+- [`guide/objects.md`](guide/objects.md) — object literals and braces: when `{` is an object and when a block, what `{}` completes, and why a `{}` statement is refused.
 - [`guide/unions.md`](guide/unions.md) — union types and variant discrimination.
 - [`guide/getters.md`](guide/getters.md) — `get x(self: T): R`: read-only properties of a nominal type, where they are found, and the body contract that keeps a read as cheap as a field.
 - [`guide/collections-design.md`](guide/collections-design.md) — `T[]` / `Map` / `Set` syntax and semantics; §"What you write TODAY" is the shipped spelling table (a map TYPE is `{[K]: V}`, `Map()` is the constructor).
