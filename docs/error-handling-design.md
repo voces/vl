@@ -113,6 +113,14 @@ _should_ look like the raw floor of the language, not an ergonomic API. If a
 friendlier spelling is ever wanted, it can be a plain std wrapper decided
 separately — nothing here forecloses it.
 
+**A trap ends a path (2026-09-22, D1972).** `__trap__(…)` has type `never`, and
+so does a call to any function declared `: never` — the way to write that
+friendlier wrapper yourself: `function fail(msg: string): never { print(msg)
+__trap__() }`. Such a call narrows the code after a guard and satisfies definite
+assignment exactly as `return` does, and stands in a value position
+(`if ok { v } else { fail("no") }`). The annotation is required: inference
+never produces `never`. See `guide/narrowing.md` §"Calls that never return".
+
 ## Examples
 
 Every example below is real VL and would parse today (syntax verified against

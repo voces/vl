@@ -1360,6 +1360,60 @@ export function callIsRestPacked(nodeIx: i32) {
   callRestPacked[nodeIx] == 1
 }
 
+// Parallel to `P.nodes` on `tplHole`'s contract. `1` marks a `Call` whose type is `never` — it
+// cannot return, so `stmtAlwaysExits` ends a path at it (D1972). The checker marks from the call's
+// type; a lint run on a bare parse marks by declaration instead (`markNeverCallsByDecl`).
+export let callNever: i32[] = []
+
+export function markCallNever(nodeIx: i32) {
+  if nodeIx < 0 { return 0 }
+  while callNever.length <= nodeIx { callNever.push(0) }
+  callNever[nodeIx] = 1
+  0
+}
+
+// True when `nodeIx` is a call that never returns.
+export function callIsNever(nodeIx: i32) {
+  if nodeIx < 0 || nodeIx >= callNever.length { return false }
+  callNever[nodeIx] == 1
+}
+
+// The parse-only producer of `callNever`, for a lint pass with no checker behind it: a call to
+// `__trap__`, or by bare name to a function this parse declares `: never`. An imported or
+// shadowed name is not resolved, so this marks a subset of what the checker's types would.
+export function markNeverCallsByDecl() {
+  const names: string[] = ["__trap__"]
+  let i = 0
+  while i < P.nodes.length {
+    const d = P.nodes[i]
+    if d is FuncDecl {
+      if d.fnName != "" && d.fnRet >= 0 {
+        const r = P.nodes[d.fnRet]
+        if r is TypeRef {
+          if r.tyName == "never" { names.push(d.fnName) }
+        }
+      }
+    }
+    i = i + 1
+  }
+  let j = 0
+  while j < P.nodes.length {
+    const c = P.nodes[j]
+    if c is Call {
+      const callee = P.nodes[c.callFn]
+      if callee is Ident {
+        let k = 0
+        while k < names.length {
+          if names[k] == callee.identName { markCallNever(j) }
+          k = k + 1
+        }
+      }
+    }
+    j = j + 1
+  }
+  0
+}
+
 // A compound assignment `target op= value`, desugared to `target = (target op
 // value)` for typecheck/emit but tagged with the SURFACE operator (`binCompound`)
 // so the printer reprints `target op= value`. The target node is shared between
@@ -2165,12 +2219,14 @@ export function i32ToStr(n: i32) {
 // True if control never falls out of statement `ix` to its next sibling: the one rule the
 // checker's narrowing and definite assignment, the emitter and the lint share (D1970). A block
 // exits once any statement does; an `if` needs an `else` and both arms exiting; a `match`, every
-// arm. A loop never does, since a `break` in it leaves only the loop.
+// arm; a call, when its type is `never` (D1972). A loop never does: a `break` leaves only the loop.
 export function stmtAlwaysExits(ix: i32): boolean {
   if ix < 0 || ix >= P.nodes.length { return false }
   const s = P.nodes[ix]
   if s is RetStmt {
     return true
+  } else if s is Call {
+    return callIsNever(ix)
   } else if s is BreakStmt {
     return true
   } else if s is ContinueStmt {
