@@ -946,14 +946,16 @@ new: the compare-frame pre-pass never recurses into a code-15 field, so a NESTED
   re-copied its 5.6 MB table 89 times per pass at 64 MiB. At 256 MiB: 19 collections, decode
   CPU 0.86 → 0.68 s per pass (−21%), 3 passes 2.60 → 1.92 s. The price is memory the program
   touches: up to 256 MiB for a program that allocates that much in total, and nothing for one
-  that does not (`hello`, a 2 M-allocation program: unchanged). `vl run --batch` stays at
+  that does not (`hello`, a 2 M-allocation program: unchanged). Under a cgroup memory cap of
+  200–256 MiB, a high-churn program with a tiny live set is now OOM-killed where it ran before;
+  `VL_GC_HEAP=64M` restores it (`vl help run` says so). `vl run --batch` stays at
   64 MiB and `vl test` at 8 MiB per worker, since both pay per store. `$VL_GC_HEAP=64M` (bytes
   or a K/M/G suffix, at most 4G; a bad value is a hard error) overrides any of them. wasmtime
   47 has no hook for a survivor-aware policy: an epoch-callback prototype worked, but epoch
   interruption alone cost 11–16%. The upstream issue is drafted in
   `docs/internals/perf/wasmtime-copying-heap-growth-issue.md` and reproduces on the stock
   wasmtime 49 CLI. `tests/vl_gc_heap_shape_test.ts` now holds a 400,000-struct live set:
-  222 / 20 / 3 collections at 0 / 64 MiB / 256 MiB. The default must collect 1–5 times,
+  222 / 20 / 3 collections at 0 / 64 MiB / 256 MiB. The default must collect 1–10 times,
   `VL_GC_HEAP=64M` at least 3× as often, and a bad value must fail. The 64 MiB host fails it
   with 20. Survey, trade-off tables and the rejected options:
   `docs/internals/perf/gc-heap-policy-2026-09.md`.

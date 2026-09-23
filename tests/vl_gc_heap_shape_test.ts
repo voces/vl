@@ -14,7 +14,7 @@
 // (#3022's default), 7 at 128 MiB, 3 at 256 MiB.
 //
 // Three runs grade it. The DEFAULT must collect at least once (a fired control, so a
-// dead counter cannot pass) and at most `MAX_DEFAULT`. `VL_GC_HEAP=64M` must collect at
+// dead counter cannot pass) and at most a loose `MAX_DEFAULT`. `VL_GC_HEAP=64M` must collect at
 // least `MIN_SPREAD` times as often as the default: that is the relative check that
 // survives an emitter change resizing the structs, and it proves the override is live.
 // And an unparsable `VL_GC_HEAP` must be a hard error, not a quiet default.
@@ -63,9 +63,10 @@ print("sum " + s.toString())
 
 const EXPECT = "sum -1664468608\n";
 
-// 3 at the shipped 256 MiB; 7 at 128 MiB, 20 at 64 MiB, 222 at 0 (see the header).
-const MAX_DEFAULT = 5;
-// 20 / 3 at the time of writing; a heap of 128 MiB or less as the default fails it.
+// 3 at the shipped 256 MiB, 222 at 0. Loose on purpose so a change in object size cannot
+// red it; MIN_SPREAD is the check that tells 256 MiB from a smaller default.
+const MAX_DEFAULT = 10;
+// 20 / 3 at the time of writing; 128 MiB as the default gives 20 / 7 and fails it.
 const MIN_SPREAD = 3;
 
 async function run(tmp: string, env: Record<string, string>) {

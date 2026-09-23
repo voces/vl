@@ -480,7 +480,9 @@ program verbatim — the only way to pass one that starts with `-`.
   {c}VL_GC_HEAP{r}          The program's first GC heap size, in bytes or with a K,
                       M or G suffix (default 256M; 64M under --batch; 8M per
                       `vl test` worker). Larger collects less often and
-                      commits more memory
+                      commits more memory: a program that allocates past it
+                      holds all of it, so under a memory cap of ~256M or less
+                      set VL_GC_HEAP=64M
   {c}VL_COMPILE_GC{r}       Collector for the compiler: auto (default: null when the
                       ENTRY FILE is under 1.5 MiB, copying at or above; imports do
                       not count) | null | copying
@@ -989,13 +991,17 @@ const TEST_GC_HEAP_INITIAL: u64 = 8 << 20;
 /// unparsable value is a hard error, as `$VL_GC`'s is, so a typo cannot quietly run
 /// at the default.
 fn gc_heap_initial(default: u64) -> Result<u64> {
-    match std::env::var("VL_GC_HEAP").ok().as_deref() {
-        None | Some("") => Ok(default),
+    let Some(raw) = std::env::var_os("VL_GC_HEAP") else {
+        return Ok(default);
+    };
+    match raw.to_str() {
+        Some("") => Ok(default),
         Some(v) => parse_byte_size(v).ok_or_else(|| {
             Error::msg(format!(
                 "unknown $VL_GC_HEAP `{v}` (bytes, or a number with a K, M or G suffix, at most 4G)"
             ))
         }),
+        None => bail!("$VL_GC_HEAP is not valid UTF-8 (bytes, or a number with a K, M or G suffix)"),
     }
 }
 

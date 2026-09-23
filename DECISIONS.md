@@ -6873,12 +6873,21 @@ never its live set: a program that allocates less than the heap in total pays no
 2 M-allocation program are unchanged). One that allocates more commits up to 256 MiB and pays ~40 ms
 of page faults for it (a short heavy allocator: 73 → 270 MB, 0.08 → 0.12 s wall).
 
+**The container cost.** Committed memory is what a cgroup counts. Under `MemoryMax=200M` or
+`256M`, a program with a tiny live set and 20 M allocations is OOM-killed (rc 137) at the 256 MiB
+default and runs at `VL_GC_HEAP=64M`, which `vl help run` says. A follow-up could cap the default
+at a fraction of the cgroup limit (`/sys/fs/cgroup/memory.max`).
+
 **Why `--batch` and `vl test` stay small.** Both make a fresh store per case or worker, so the
 fault cost is paid per store: a 48-case batch went 0.87 → 1.26 s wall at 256 MiB, and a 12-file
 `vl test` at 64 MiB per worker commits 823 MB against 134 MB at 8 MiB.
 
-**Why an environment variable.** Like `$VL_GC`, the heap size is set on the engine before any guest
-code runs, and `vl`'s flag parsing lives in the guest. A value that does not parse is a hard error.
+**Why an environment variable.** `run_cmd` parses `vl run`'s flags in Rust, so a flag was possible.
+An environment variable was chosen because it matches `$VL_GC`, the other collector dial, and
+because it reaches every path that builds a user-program engine: `vl test`'s workers, `--batch`, and
+a `vl` started by a script or a child process, none of which a `vl run` flag would reach. It is also a
+tuning knob that never changes what a program means, which is what this host keeps in the
+environment. A value that does not parse, or is not UTF-8, is a hard error.
 
 **Revisit** when wasmtime grows a copying heap by survivor share: the default can then come back to
 64 MiB or below and take the RSS price with it.

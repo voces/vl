@@ -21,18 +21,19 @@ Read from the pinned crate's source (`wasmtime-47.0.2`, `src/config.rs`, `src/ru
 | `Config::gc_heap_reservation`, `_guard_size`, `_reservation_for_growth`, `_may_move` | virtual-memory layout: how far the heap can grow in place | no, they say nothing about when it grows |
 | `Store::gc(None)` | collect now | no, it only collects |
 | `Store::gc(Some(&GcHeapOutOfMemory))` | collect, then grow if the named allocation still does not fit | not usable: `GcHeapOutOfMemory::new` is `pub(crate)`, so a host can only pass one it received from a failed allocation |
-| `Store::gc_heap_capacity()` | current heap size in bytes | on `Store` only, not on `StoreContextMut`, so not inside a callback |
+| `Store::gc_heap_capacity()`, `Caller::gc_heap_capacity()` | current heap size in bytes | not on `StoreContext`/`StoreContextMut`, so not reachable from an epoch callback (a `Caller` exists only inside a host import) |
 | `ResourceLimiter::memory_growing` | consulted when the GC heap's memory grows | veto only; it cannot start or enlarge a growth |
 | `Config::total_gc_heaps` | pooling-allocator slot count | no |
 | collection statistics | **none public**. The post-collection live size (`GcStore::last_post_gc_allocated_bytes`) is crate-private and appears only in `log::trace!` output | the stats counter (`$VL_GC_STATS`) already scrapes that log |
 | a growth policy, a GC callback, or a "grow when survivors exceed X%" knob | **none** | — |
 
-**The growth rule itself** (`should_collect_first` and `collect_and_maybe_grow_gc_heap`): when an
-allocation fails, wasmtime collects first unless `last_live + bytes_needed >= capacity / 2`, and after
-a collection it grows only if the request still does not fit. `capacity` is the WHOLE heap
-(`heap_slice().len()`), while the copying collector allocates in one half of it. So for the copying
-collector the grow-first branch is reached only when the live set nearly fills a semispace, and a live
-set at any fraction below that is re-copied at every collection for the rest of the run. That is the
+**The growth rule itself** (`retry_after_gc_async` and `should_collect_first`): when an allocation
+fails, wasmtime collects first unless `last_live + bytes_needed >= capacity / 2`. That collection
+never grows the heap. Growth comes only if the retried allocation still fails. `capacity` is the WHOLE
+heap (`heap_slice().len()`), while the copying collector allocates in one half of it, so the
+grow-first branch is reached only when the live set nearly fills a semispace. In practice the heap
+grows only when a collection frees less than the pending allocation. A live set at any fraction below
+that is re-copied at every collection for the rest of the run. That is the
 upstream bug, and the reason no host-side sizing can be adaptive without a hook wasmtime does not have.
 
 ## 2 · Options, measured
@@ -75,6 +76,12 @@ allocates less than the heap in total pays nothing (`mid`, `hello`). One that al
 the whole heap and pays the page faults on it: about 40 ms of system time for 256 MiB, which is +50% wall
 on `tiny` and +45% on the batch, where every heavy case faults a fresh store's heap.
 
+**Under a memory cap.** A cgroup counts committed memory, so the same program is killed where it
+used to run. `tiny` under `systemd-run --scope -p MemoryMax=200M -p MemorySwapMax=0`, and again at
+`256M`: rc 137 (OOM-killed) at `VL_GC_HEAP=256M`, `sum 2052959872` at `64M`. The remedy is
+`VL_GC_HEAP=64M`, which `vl help run` names. Follow-up, not built: cap the default at a fraction of
+the cgroup limit (`/sys/fs/cgroup/memory.max`) when one is set.
+
 **`vl test`** (12 files that each allocate 5 M structs, one worker per core): 134–135 MB before and
 after, because the test engine's 8 MiB is unchanged. `VL_GC_HEAP=64M` on the same run gives 823 MB,
 which is why the per-worker size stays small.
@@ -98,7 +105,7 @@ was rejected.
 | `vl run <file>` (source or prebuilt `.wasm`) | **256 MiB** | one store per process; the knee of the decode curve, and a program that allocates less pays nothing |
 | `vl run --batch` | 64 MiB (unchanged) | a fresh store per case, so each heavy case faults its own heap: +45% wall at 256 MiB |
 | `vl test` | 8 MiB per worker (unchanged) | one store per worker times one worker per core |
-| any of them, under `$VL_GC_HEAP` | the value given | `64M` for a memory-tight run, `1G` for a bigger live set; bytes or a `K`/`M`/`G` suffix, at most 4G, and a bad value is a hard error |
+| any of them, under `$VL_GC_HEAP` | the value given | `64M` for a memory-capped container or a memory-tight run, `1G` for a bigger live set; bytes or a `K`/`M`/`G` suffix, at most 4G, and a bad or non-UTF-8 value is a hard error |
 
 The heap size is part of the engine's compatibility hash, so `vl run` and `vl test` keep separate
 compiled-module cache entries (as they did at 64 MiB/8 MiB). A `$VL_GC_HEAP` override gets its own
@@ -106,7 +113,7 @@ entry too, compiled once.
 
 **Guarded by** `tests/vl_gc_heap_shape_test.ts`. A 400,000-struct live set with 12 M allocations
 collects 222 / 20 / 7 / 3 times at 0 / 64 / 128 / 256 MiB (deterministic). The default must collect 1
-to 5 times, `VL_GC_HEAP=64M` must collect at least 3× as often as the default, and an unparsable value
+to 10 times (loose, so an object-size change cannot red it), `VL_GC_HEAP=64M` must collect at least 3× as often as the default, and an unparsable value
 must fail. Checked both ways: the master binary (64 MiB, no override) fails the first assertion with 20.
 
 **When to revisit.** When wasmtime grows a copying heap by the live set's share of a semispace

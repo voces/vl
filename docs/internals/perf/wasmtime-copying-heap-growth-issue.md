@@ -82,29 +82,34 @@ The trace calls this 38% utilization. But the copying collector can only use 8 M
 time, and the live set fills 76% of it.
 
 A real program hits the same case: an x86 decoder holding a 5.6 MB table for its run collects 943
-times per pass from a 0 initial size and 89 times from 64 MiB. That is ~45% of its runtime on
-wasmtime, while V8 (generational) runs the same module at parity with a Rust port.
+times per pass from a 0 initial size and 89 times from 64 MiB. Removing the held table (walking
+the data instead) cut its runtime by ~20%, and raising the initial heap to 256 MiB cut it by 21%.
 
 ### Cause
 
-In `crates/wasmtime/src/runtime/store/gc.rs` (47.0.2), `retry_after_gc_async` asks
-`should_collect_first(bytes_needed, gc_heap_capacity, last_gc_heap_usage)`, which collects first
-while `last_live + bytes_needed < gc_heap_capacity / 2`. After the collection,
-`collect_and_maybe_grow_gc_heap` grows only if the request still does not fit
-(`n > capacity - last_live`).
+In `crates/wasmtime/src/runtime/store/gc.rs` (47.0.2), a failed allocation goes through
+`retry_after_gc_async`, which asks `should_collect_first(bytes_needed, gc_heap_capacity,
+last_gc_heap_usage)`. That answers "collect first" while `last_live + bytes_needed <
+gc_heap_capacity / 2`. The collect-first branch calls `store.gc(limiter, None, None, ..)`, which
+passes no `bytes_needed` and so never grows. It then retries the allocation, and grows
+(`grow_gc_heap`) only if the retry fails. (The `n > capacity - last_live` test in
+`collect_and_maybe_grow_gc_heap` belongs to the embedder-facing `Store::gc(Some(oom))`, not this
+path.)
 
 `gc_heap_capacity` is `GcStore::gc_heap_capacity()`, the whole heap (`heap_slice().len()`). The
 copying collector allocates in one semispace, `capacity / 2`, and its `allocated_bytes()` counts
-only the active one. So `last_live < capacity / 2` holds for every live set that fits at all, and the
-"grow once the heap is more than half full" intent reduces to "grow once a collection frees nothing".
-For DRC and null the whole heap is usable and the rule means what it says. For copying it is off by
-the factor of two, and it has no notion of how much of each collection's work is copying survivors.
+only the active one. So `last_live + bytes_needed < capacity / 2` holds for every live set that
+leaves room for the request, and the heap grows only when a collection frees less than the pending
+allocation. The "grow once the heap is more than half full" intent is lost. For DRC and null the
+whole heap is usable and the rule means what it says. For copying it is off by the factor of two,
+and it has no notion of how much of each collection's work is copying survivors.
 
 ### Suggested fix
 
 1. **Compare against usable capacity.** Give `GcHeap` a method for the bytes available for
    allocation between collections (the semispace for copying, the whole heap otherwise), and use it
-   in `should_collect_first` and in the post-collection growth test. That alone makes the copying
+   at both sites: `should_collect_first` (the allocation-failure path in `retry_after_gc_async`)
+   and the growth test in `collect_and_maybe_grow_gc_heap` (`Store::gc(Some(oom))`). That alone makes the copying
    heap grow when survivors pass 50% of a semispace.
 2. **Grow on survivor ratio after a collection.** For a copying collector the cost per allocated byte
    is `live / (semispace - live)`. At 50% survivors every byte allocated costs a byte copied. A
@@ -115,7 +120,7 @@ the factor of two, and it has no notion of how much of each collection's work is
 3. **Let embedders see and steer it** (any of these would have let us fix this host-side):
    - the post-collection live size and the heap capacity, readable from a `StoreContextMut`
      (today `last_post_gc_allocated_bytes` is crate-private, and `gc_heap_capacity` is on `Store`
-     only);
+     and `Caller` but not on `StoreContext`/`StoreContextMut`, so an epoch callback cannot read it);
    - or a callback after each collection;
    - or a public way to request growth (`GcHeapOutOfMemory::new` is `pub(crate)`, so
      `Store::gc(Some(..))` can only be driven by an allocation that already failed).
