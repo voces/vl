@@ -543,7 +543,8 @@ import {
   scopeFrames,
   scopeNames,
   scopeSlotOf,
-  scopeSlots,
+  scopeStackPop,
+  scopeStackPush,
   slUsed,
   startStmts,
   uDeclared,
@@ -5123,10 +5124,7 @@ export function scopePop() {
   if scopeFrames.length == 0 { return 0 }
   const mark = scopeFrames[scopeFrames.length - 1]
   scopeFrames.pop()
-  while scopeNames.length > mark {
-    scopeNames.pop()
-    scopeSlots.pop()
-  }
+  while scopeNames.length > mark { scopeStackPop() }
   0
 }
 
@@ -5134,20 +5132,14 @@ export function scopePop() {
 // `let` is reached, so a binding is in scope only after its declaration, which also yields
 // correct shadowing of an outer same-named binding. Returns 0.
 export function scopeBind(name: string, slot: i32) {
-  scopeNames.push(name)
-  scopeSlots.push(slot)
-  0
+  scopeStackPush(name, slot)
 }
 
 // Drop the most recent binding — the loop-variable unbind. A `for` binds its variable in the
 // enclosing frame, but the variable's scope is the loop, so both passes unbind it as the loop
 // closes. Without it the loop var keeps shadowing a same-named binding that resolves through
 // a later channel, and `for i in …` followed by `let i = 0` reads the dead loop counter.
-export function scopeUnbind() {
-  scopeNames.pop()
-  scopeSlots.pop()
-  0
-}
+export function scopeUnbind() { scopeStackPop() }
 
 // The wasm local base of the ref-push scratch frame for ref-list table slot `slot`.
 export function refPushScratchBaseFor(slot: i32) {
@@ -35184,6 +35176,18 @@ function frameCapturesName(fnIx: i32, name: string): boolean {
   false
 }
 
+// Whether the frame binding a capture `name` of lifted frame `fe` binds it as a loop variable:
+// the table lookups `captureLoopVarIterOf` starts with, without its element-kind reads. False
+// means that function answers -1.
+function enclosingLoopVarBinds(fe: i32, name: string): boolean {
+  const par = parentBindingFrameOf(fe, name)
+  if par < 0 { return moduleLoopEnclosing(fe, name) >= 0 }
+  if par >= fnStmts.length { return false }
+  const pfn = P.nodes[fnStmts[par]]
+  if pfn is FuncDecl { return parentLoopVarOf(pfn.fnBody, name) >= 0 }
+  false
+}
+
 // The `$fnsig` key a for-in loop variable `name` calls through, or "" when `name` is no
 // closure-element loop variable of frame `fnIx`, keyed as `fs[i]` is so the two agree. The
 // scoped slot answers a loop the frame owns, so a closed loop's name means the outer binding
@@ -35194,8 +35198,18 @@ function loopVarCloSigKey(name: string, fnIx: i32) {
   if slot >= 0 {
     if slot >= localLoopIter.length { return "" }
     iter = localLoopIter[slot]
-  } else if frameCapturesName(fnIx, name) {
-    iter = captureLoopVarIterOf(fnStmtsPosOf(fnIx), name)
+  } else {
+    // The capture set walks the frame's whole body, so it is asked only once an enclosing
+    // frame is known to bind `name` as a loop variable; asked first, it made every call
+    // site of a large function a walk of that function (D2180).
+    const fe = fnStmtsPosOf(fnIx)
+    if (
+      fe >= 0 &&
+      enclosingLoopVarBinds(fe, name) &&
+      frameCapturesName(fnIx, name)
+    ) {
+      iter = captureLoopVarIterOf(fe, name)
+    }
   }
   if iter < 0 { return "" }
   const mvs = forInMapValsSlot(iter, fnIx)

@@ -614,6 +614,60 @@ axis(
   (d) => twoFiles(d, genLongBody(1500, true), genLongBody(1500, false)),
 );
 
+// `n` sibling blocks, each calling a top-level function inside a binary, written as one
+// function or spread over `fns`. Each bare block is rewritten to an `if` (a mint, which drops
+// the capture memo), and each call asks whether its callee is a captured loop variable.
+const genCallBlocks = (n: number, fns: number): string => {
+  const per = Math.floor(n / fns);
+  const o = ["let g = 3", "function h(x: i32): i32 { x * 2 + g }"];
+  for (let f = 0; f < fns; f++) {
+    o.push(`function f${f}(a: i32): i32 {`, "  let acc = 0");
+    for (let i = 0; i < per; i++) o.push(`  { const m = h(a + ${i}) + g; acc = acc + m }`);
+    o.push("  acc", "}");
+  }
+  o.push("let acc = 0");
+  for (let i = 0; i < 2400; i++) fill(o, i, 6);
+  for (let f = 0; f < fns; f++) o.push(`acc = acc + f${f}(${f % 7})`);
+  o.push("print(acc)");
+  return o.join("\n") + "\n";
+};
+
+// Every call site in the one-function arm walked that whole function for its capture set,
+// because the loop-variable rung asked the capture set before asking whether any enclosing
+// frame binds the name as a loop variable (D2180, plumb PL-019).
+axis(
+  "call sites per function",
+  2.5,
+  "A per-call-site question is walking the whole enclosing function — `loopVarCloSigKey`'s capture test (D2180).",
+  (d) => twoFiles(d, genCallBlocks(2500, 1), genCallBlocks(2500, 50)),
+);
+
+// `n` distinct locals bound at function scope, so all of them are live on the scope stack at
+// once, written as one function or spread over `fns`.
+const genFrameLocals = (n: number, fns: number): string => {
+  const per = Math.floor(n / fns);
+  const o = ["let g = 3"];
+  for (let f = 0; f < fns; f++) {
+    o.push(`function f${f}(a: i32): i32 {`, "  let acc = 0");
+    for (let i = 0; i < per; i++) o.push(`  const m${i} = a + ${i}`, `  acc = acc + m${i} * g`);
+    o.push("  acc", "}");
+  }
+  o.push("let acc = 0");
+  for (let i = 0; i < 2400; i++) fill(o, i, 6);
+  for (let f = 0; f < fns; f++) o.push(`acc = acc + f${f}(${f % 7})`);
+  o.push("print(acc)");
+  return o.join("\n") + "\n";
+};
+
+// Every read resolved its slot by scanning the live scope stack, which holds every local of
+// the frame once they are all bound at function scope (D2181).
+axis(
+  "live locals in one scope",
+  2.5,
+  "`scopeSlotOf` is scanning the live scope stack instead of reading its name index (D2181).",
+  (d) => twoFiles(d, genFrameLocals(2500, 1), genFrameLocals(2500, 50)),
+);
+
 // ── the one RUNTIME axis ─────────────────────────────────────────────────────
 // Every pair above grades COMPILE time, because every cost above is the compiler's. String
 // building is the exception: the cost lands in the EMITTED program, so this pair builds
