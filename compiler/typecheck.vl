@@ -2677,6 +2677,10 @@ let moduleGlobals: {[string]: boolean} = Map()
 // cycle-break commits a provisional `void`. A suppressed pre-pass resolves every un-annotated
 // return first, iterating to a fixpoint; `bodyChecked` lets the real pass still check each once.
 let topUnannotFns: i32[] = []
+// The nested named un-annotated functions (`FuncDecl` node) and their final inferred `TyFunc`,
+// banked at `finishInferredReturn` because their binding does not outlive the enclosing scope.
+let nestedUnannotFns: i32[] = []
+let nestedUnannotTys: i32[] = []
 // The top-level statement list, captured at `checkProgram` entry so the return-inference floor
 // can reverse-map an inferred struct-union's object members to named types
 // (`structUnionRetName`). The floor must accept exactly the unions the emitter can lower, all
@@ -3722,6 +3726,8 @@ export function initChecker() {
   opBinDeclined = []
   moduleGlobals = Map()
   topUnannotFns = []
+  nestedUnannotFns = []
+  nestedUnannotTys = []
   gRootStmts = []
   inferRetFn = []
   inferRetTy = []
@@ -25314,7 +25320,13 @@ function finishInferredReturn(
   // type as the expression value. The parameter-solve probe observes this body and must not
   // decide the return, so patching here would deny pass 1.7 a fresh re-derivation.
   if n.fnName != "" && !paramSolveProbe {
-    const bound = lookup(n.fnName)
+    // A nested function has no hoisted binding: only one already declared in the enclosing
+    // scope is its own, and `lookup` further out would find an outer namesake (D1966).
+    const isTopDecl = (fnDeclIx[n.fnName] ?? -1) == fnIx
+    let bound = -1
+    if isTopDecl || lookupDepth(n.fnName) == T.scopes.length - 1 {
+      bound = lookup(n.fnName)
+    }
     let patched = false
     if bound >= 0 {
       const bt = T.tys[bound]
@@ -25325,6 +25337,7 @@ function finishInferredReturn(
       }
     }
     if !patched { declare(n.fnName, mkFuncTy(paramTys, inferred)) }
+    if !isTopDecl && !inferQuiet { noteNestedUnannotFn(fnIx, lookup(n.fnName)) }
     // Re-retains the symbol-table type with the inferred return: the entry stamped while
     // checking the signature carried the `-2` infer-later sentinel, and the in-place patch
     // above only touches the scope-bound copy. Without this, hover / inlay on an
@@ -25594,6 +25607,23 @@ function finishInferredReturn(
   ret
 }
 
+// Banks a nested named function's inferred signature for the A20 export; a re-check of the
+// same declaration replaces its row rather than adding a second.
+function noteNestedUnannotFn(fnIx: i32, fty: i32) {
+  if fty < 0 { return 0 }
+  let i = 0
+  while i < nestedUnannotFns.length {
+    if nestedUnannotFns[i] == fnIx {
+      nestedUnannotTys[i] = fty
+      return 0
+    }
+    i = i + 1
+  }
+  nestedUnannotFns.push(fnIx)
+  nestedUnannotTys.push(fty)
+  0
+}
+
 // A function declaration: resolves param/return annotations, binds the signature, and checks
 // the body in a fresh scope. An un-annotated return is inferred from the body's returns and
 // trailing expression (`noteInferredRet`, under a `-2` pending `curRet`), then patched into
@@ -25784,6 +25814,10 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
     // it here covers nested function decls and is an idempotent rebind otherwise.
     // (An anonymous function EXPRESSION has no name to bind.)
     if n.fnName != "" { declare(n.fnName, mkFuncTy(paramTys, ret)) }
+  } else if n.fnName != "" && (fnDeclIx[n.fnName] ?? -1) != fnIx {
+    // A nested named function binds its pending signature before its body, as the top-level
+    // hoist does, so a self-call resolves and `finishInferredReturn` patches this binding.
+    declare(n.fnName, mkFuncTy(paramTys, -2))
   }
   // Save the inference accumulators (a demand-inference can nest inside another
   // function's body check) and the enclosing return type.
@@ -28954,201 +28988,183 @@ export function checkProgram(rootIx: i32) {
       const eft = lookup(efn.fnName)
       if eft >= 0 {
         const eftt = T.tys[eft]
-        if eftt is TyFunc {
-          const er = eftt.fnRet
-          // Generic functions skip (a `self` marker, an un-annotated param, or a deferred-join
-          // return) — their type is per-call-site and would export a misleading or wrong name.
-          let generic = false
-          // D1643 — `fnRet` still holds the PENDING sentinel (-2) whenever inference never
-          // patches it, which is every anonymous lambda written as a module-level statement.
-          // Both arena reads take a real index, the gate the recording rung below already has.
-          if er >= 0 {
-            const ert0 = T.tys[er]
-            if ert0 is TyVar { generic = true }
-          }
-          if tyIsDeferredJoin(er) { generic = true }
-          // D970 — an un-annotated param alone does not make a concrete union return generic;
-          // the skip is for a per-call-site return, which a deferred join still is.
-          let retIsConcreteUnion = false
-          if !generic && er >= 0 {
-            const ertU = T.tys[er]
-            if ertU is TyUnion {
-              // Only when the body genuinely returns two different concrete types — a join
-              // over the function's own TyVars must still skip (admitting it produces invalid wasm).
-              if a20RetSetDisagrees(efn.fnBody) { retIsConcreteUnion = true }
-            }
-          }
-          let gp = 0
-          while gp < eftt.fnParamTypes.length {
-            const pt = T.tys[eftt.fnParamTypes[gp]]
-            if pt is TyVar {
-              if !retIsConcreteUnion { generic = true }
-            }
-            if tyIsDeferredJoin(eftt.fnParamTypes[gp]) { generic = true }
-            gp = gp + 1
-          }
-          if !generic && er >= 0 && er != TY_VOID && er != TY_ERR {
-            // Only scalar/string returns are recorded — a structural name (`{x:i32}`, `A|B`,
-            // `Tok[]`) can mis-classify, and the emitter's expression-based fallback covers those.
-            const enm = tyToStructStr(er)
-            // A branded newtype (`type NS = new string`) is minted as a copy of its base `Ty`,
-            // so it renders as its own brand name and is not classifiable without erasure below.
-            let recNm = enm
-            let recTy = er
-            if !isClassifiableRetName(recNm) {
-              const erased = nomErasedTyIx(er)
-              if erased != er {
-                const ernm = tyToStructStr(erased)
-                if isClassifiableRetName(ernm) {
-                  recNm = ernm
-                  recTy = erased
-                }
-              }
-            }
-            // A numeric literal union (`NK = 0 | 1 | 2`) erases to its base scalar the same
-            // way a brand does — its rep is the base's. `NK[]` is untouched (declined as an array).
-            if !isClassifiableRetName(recNm) {
-              const nlb = numLitUnionBaseTy(er)
-              if nlb >= 0 {
-                const nlnm = tyToStructStr(nlb)
-                if isClassifiableRetName(nlnm) {
-                  recNm = nlnm
-                  recTy = nlb
-                }
-              }
-            }
-            // D1576 — a never-filled infer-null hole returned is the `null` type too: `let x =
-            // null; return x` hands on `TyNullable(-1)`, which the rung below must also catch.
-            let enmNull = enm == "null"
-            const erNH = T.tys[er]
-            if erNH is TyNullable {
-              if erNH.nInner < 0 { enmNull = true }
-            }
-            if enmNull {
-              // D1567 — a return whose only value is bare `null` is the `null` type (reps as
-              // `nullref`), checked ahead of the erasure rungs since `null` has no classifiable name.
+        if eftt is TyFunc { a20RecordFn(efn.fnName, efn, eftt) }
+      }
+    }
+    ei = ei + 1
+  }
+  // D1966 — a nested named function is lifted like a lambda, so its row is keyed by its node.
+  let ni = 0
+  while ni < nestedUnannotFns.length {
+    const nfn = P.nodes[nestedUnannotFns[ni]]
+    const nft = T.tys[nestedUnannotTys[ni]]
+    if nfn is FuncDecl {
+      if nft is TyFunc {
+        a20RecordFn("#" + i32ToStr(nestedUnannotFns[ni]), nfn, nft)
+      }
+    }
+    ni = ni + 1
+  }
+  checkProgramEndOpDecls()
+  T.diags.length
+}
 
-              // The recorded arena type is `TY_NULL`, not `er`: the hole spelling's `er` is
-              // `TyNullable(-1)` itself, and a downstream `T.tys[-1]` read would be out of bounds.
-              recordInferRet(efn.fnName, "null", TY_NULL, 1, IR_REC_NULL_ONLY)
-            } else if isClassifiableRetName(recNm) {
-              // `isClassifiableRetName`'s admitted set is six scalar spellings plus
-              // `i32[]`/`string[]` — every one of them a single atom (#1115).
-              recordInferRet(efn.fnName, recNm, recTy, 1, IR_REC_CLASSIFIABLE)
+// A20 for one un-annotated function: records its inferred return under `key` for the
+// emitter — its name at top level, `#<nodeIx>` for a nested named function, whose name is
+// not unique and whose binding is gone once its enclosing scope pops (D1966).
+function a20RecordFn(key: string, efn: FuncDecl, eftt: TyFunc) {
+  const er = eftt.fnRet
+  // Generic functions skip (a `self` marker, an un-annotated param, or a deferred-join
+  // return) — their type is per-call-site and would export a misleading or wrong name.
+  let generic = false
+  // D1643 — `fnRet` still holds the PENDING sentinel (-2) whenever inference never
+  // patches it, which is every anonymous lambda written as a module-level statement.
+  // Both arena reads take a real index, the gate the recording rung below already has.
+  if er >= 0 {
+    const ert0 = T.tys[er]
+    if ert0 is TyVar { generic = true }
+  }
+  if tyIsDeferredJoin(er) { generic = true }
+  // D970 — an un-annotated param alone does not make a concrete union return generic;
+  // the skip is for a per-call-site return, which a deferred join still is.
+  let retIsConcreteUnion = false
+  if !generic && er >= 0 {
+    const ertU = T.tys[er]
+    if ertU is TyUnion {
+      // Only when the body genuinely returns two different concrete types — a join
+      // over the function's own TyVars must still skip (admitting it produces invalid wasm).
+      if a20RetSetDisagrees(efn.fnBody) { retIsConcreteUnion = true }
+    }
+  }
+  let gp = 0
+  while gp < eftt.fnParamTypes.length {
+    const pt = T.tys[eftt.fnParamTypes[gp]]
+    if pt is TyVar {
+      if !retIsConcreteUnion { generic = true }
+    }
+    if tyIsDeferredJoin(eftt.fnParamTypes[gp]) { generic = true }
+    gp = gp + 1
+  }
+  if !generic && er >= 0 && er != TY_VOID && er != TY_ERR {
+    // Only scalar/string returns are recorded — a structural name (`{x:i32}`, `A|B`,
+    // `Tok[]`) can mis-classify, and the emitter's expression-based fallback covers those.
+    const enm = tyToStructStr(er)
+    // A branded newtype (`type NS = new string`) is minted as a copy of its base `Ty`,
+    // so it renders as its own brand name and is not classifiable without erasure below.
+    let recNm = enm
+    let recTy = er
+    if !isClassifiableRetName(recNm) {
+      const erased = nomErasedTyIx(er)
+      if erased != er {
+        const ernm = tyToStructStr(erased)
+        if isClassifiableRetName(ernm) {
+          recNm = ernm
+          recTy = erased
+        }
+      }
+    }
+    // A numeric literal union (`NK = 0 | 1 | 2`) erases to its base scalar the same
+    // way a brand does — its rep is the base's. `NK[]` is untouched (declined as an array).
+    if !isClassifiableRetName(recNm) {
+      const nlb = numLitUnionBaseTy(er)
+      if nlb >= 0 {
+        const nlnm = tyToStructStr(nlb)
+        if isClassifiableRetName(nlnm) {
+          recNm = nlnm
+          recTy = nlb
+        }
+      }
+    }
+    // D1576 — a never-filled infer-null hole returned is the `null` type too: `let x =
+    // null; return x` hands on `TyNullable(-1)`, which the rung below must also catch.
+    let enmNull = enm == "null"
+    const erNH = T.tys[er]
+    if erNH is TyNullable {
+      if erNH.nInner < 0 { enmNull = true }
+    }
+    if enmNull {
+      // D1567 — a return whose only value is bare `null` is the `null` type (reps as
+      // `nullref`), checked ahead of the erasure rungs since `null` has no classifiable name.
+
+      // The recorded arena type is `TY_NULL`, not `er`: the hole spelling's `er` is
+      // `TyNullable(-1)` itself, and a downstream `T.tys[-1]` read would be out of bounds.
+      recordInferRet(key, "null", TY_NULL, 1, IR_REC_NULL_ONLY)
+    } else if isClassifiableRetName(recNm) {
+      // `isClassifiableRetName`'s admitted set is six scalar spellings plus
+      // `i32[]`/`string[]` — every one of them a single atom (#1115).
+      recordInferRet(key, recNm, recTy, 1, IR_REC_CLASSIFIABLE)
+    } else {
+      // A value union/nullable inferred return lowers through the same `uBoxIdx`
+      // machinery as an annotation — export its name so the return site picks it up.
+      const un = valueUnionRetName(er)
+      if un != "" {
+        recordInferRet(key, un, er, inferRetNameAtoms, IR_RUNG_VALUE_UNION)
+      } else if structUnionRetName(er, gRootStmts) != "" {
+        // A struct union lowers via the same variant-boxed rep as an annotated union;
+        // the width is read from a local AFTER the render (#1115), not argument order.
+        const sun = structUnionRetName(er, gRootStmts)
+        recordInferRet(key, sun, er, inferRetNameAtoms, IR_RUNG_STRUCT_UNION)
+      } else if litUnionAliasNameOfTy(er) != "" {
+        // A pure literal-union inferred return reps as the interned i32 atom, like the
+        // annotated spelling — export the alias name so classification reaches that atom.
+        recordInferRet(
+          key,
+          litUnionAliasNameOfTy(er),
+          er,
+          1,
+          IR_RUNG_LITUNION_ALIAS,
+        )
+      } else if variantBoxUnionRetName(er) != "" {
+        // A variant-box union (`{w:i32} | i32`) lowers un-annotated via the same `>u`
+        // box an annotated spelling interns — export the render so `collectU` registers it.
+        const vbn = variantBoxUnionRetName(er)
+        recordInferRet(key, vbn, er, inferRetNameAtoms, IR_RUNG_VARIANT_BOX)
+      } else {
+        // A niche nullable (`boolean | null`, `string | null`) lowers via its sentinel
+        // rep, not the box, so `valueUnionRetName` declines it — export the niche name instead.
+        const ert = T.tys[er]
+        if ert is TyNullable {
+          // Two atoms, written out literally right here (#1115).
+          if tyIsPrimNamed(ert.nInner, "boolean") {
+            recordInferRet(key, "boolean|null", er, 2, IR_RUNG_NULLABLE)
+          } else if tyIsPrimNamed(ert.nInner, "string") {
+            recordInferRet(key, "string|null", er, 2, IR_RUNG_NULLABLE)
+          } else if litUnionAliasNameOfTy(ert.nInner) != "" {
+            // The literal-union niche (`K | null`): an i32 atom with `-1` for null, the
+            // same rep an annotated `: K | null` spelling reaches.
+            recordInferRet(
+              key,
+              litUnionAliasNameOfTy(ert.nInner) + "|null",
+              er,
+              2,
+              IR_RUNG_NUL_LITUNION,
+            )
+          } else {
+            // D887 — the nullable struct ref (`{r:i32} | null`, `P | null`) already has a
+            // rep (`ref.null $S`); `nullableRetName` is the same renderer the lambda ladder uses.
+            const nsn = nullableRetName(er, gRootStmts)
+            if nsn != "" {
+              recordInferRet(key, nsn, er, inferRetNameAtoms, IR_RUNG_NULLABLE)
             } else {
-              // A value union/nullable inferred return lowers through the same `uBoxIdx`
-              // machinery as an annotation — export its name so the return site picks it up.
-              const un = valueUnionRetName(er)
-              if un != "" {
+              // D1062 — a nullable list at an element type the arm above does not name.
+              // Recorded so `synthNulListRetAnns` can pin the function's own annotation.
+              const nln = nulListRetName(er)
+              if nln != "" {
                 recordInferRet(
-                  efn.fnName,
-                  un,
+                  key,
+                  nln,
                   er,
                   inferRetNameAtoms,
-                  IR_RUNG_VALUE_UNION,
+                  IR_RUNG_NUL_LIST_RET,
                 )
-              } else if structUnionRetName(er, gRootStmts) != "" {
-                // A struct union lowers via the same variant-boxed rep as an annotated union;
-                // the width is read from a local AFTER the render (#1115), not argument order.
-                const sun = structUnionRetName(er, gRootStmts)
-                recordInferRet(
-                  efn.fnName,
-                  sun,
-                  er,
-                  inferRetNameAtoms,
-                  IR_RUNG_STRUCT_UNION,
-                )
-              } else if litUnionAliasNameOfTy(er) != "" {
-                // A pure literal-union inferred return reps as the interned i32 atom, like the
-                // annotated spelling — export the alias name so classification reaches that atom.
-                recordInferRet(
-                  efn.fnName,
-                  litUnionAliasNameOfTy(er),
-                  er,
-                  1,
-                  IR_RUNG_LITUNION_ALIAS,
-                )
-              } else if variantBoxUnionRetName(er) != "" {
-                // A variant-box union (`{w:i32} | i32`) lowers un-annotated via the same `>u`
-                // box an annotated spelling interns — export the render so `collectU` registers it.
-                const vbn = variantBoxUnionRetName(er)
-                recordInferRet(
-                  efn.fnName,
-                  vbn,
-                  er,
-                  inferRetNameAtoms,
-                  IR_RUNG_VARIANT_BOX,
-                )
-              } else {
-                // A niche nullable (`boolean | null`, `string | null`) lowers via its sentinel
-                // rep, not the box, so `valueUnionRetName` declines it — export the niche name instead.
-                const ert = T.tys[er]
-                if ert is TyNullable {
-                  // Two atoms, written out literally right here (#1115).
-                  if tyIsPrimNamed(ert.nInner, "boolean") {
-                    recordInferRet(
-                      efn.fnName,
-                      "boolean|null",
-                      er,
-                      2,
-                      IR_RUNG_NULLABLE,
-                    )
-                  } else if tyIsPrimNamed(ert.nInner, "string") {
-                    recordInferRet(
-                      efn.fnName,
-                      "string|null",
-                      er,
-                      2,
-                      IR_RUNG_NULLABLE,
-                    )
-                  } else if litUnionAliasNameOfTy(ert.nInner) != "" {
-                    // The literal-union niche (`K | null`): an i32 atom with `-1` for null, the
-                    // same rep an annotated `: K | null` spelling reaches.
-                    recordInferRet(
-                      efn.fnName,
-                      litUnionAliasNameOfTy(ert.nInner) + "|null",
-                      er,
-                      2,
-                      IR_RUNG_NUL_LITUNION,
-                    )
-                  } else {
-                    // D887 — the nullable struct ref (`{r:i32} | null`, `P | null`) already has a
-                    // rep (`ref.null $S`); `nullableRetName` is the same renderer the lambda ladder uses.
-                    const nsn = nullableRetName(er, gRootStmts)
-                    if nsn != "" {
-                      recordInferRet(
-                        efn.fnName,
-                        nsn,
-                        er,
-                        inferRetNameAtoms,
-                        IR_RUNG_NULLABLE,
-                      )
-                    } else {
-                      // D1062 — a nullable list at an element type the arm above does not name.
-                      // Recorded so `synthNulListRetAnns` can pin the function's own annotation.
-                      const nln = nulListRetName(er)
-                      if nln != "" {
-                        recordInferRet(
-                          efn.fnName,
-                          nln,
-                          er,
-                          inferRetNameAtoms,
-                          IR_RUNG_NUL_LIST_RET,
-                        )
-                      }
-                    }
-                  }
-                }
               }
             }
           }
         }
       }
     }
-    ei = ei + 1
   }
-  checkProgramEndOpDecls()
-  T.diags.length
+  0
 }
 
 // A20: the emitter reads this to classify an un-annotated function's return from its
@@ -29209,6 +29225,18 @@ export function inferRetIsNulList(name: string): boolean {
     if it is TyArray { return true }
   }
   false
+}
+
+// The inferred-return key of the function declared at `declIx` named `name`: `#<declIx>` for
+// a nested named un-annotated function (a name there is neither unique nor the checker's
+// key), else `name`. Every emitter read of a declaration's row goes through this (D1966).
+export function inferRetFnKey(declIx: i32, name: string): string {
+  let i = 0
+  while i < nestedUnannotFns.length {
+    if nestedUnannotFns[i] == declIx { return "#" + i32ToStr(declIx) }
+    i = i + 1
+  }
+  name
 }
 
 export function inferRetNameOf(name: string) {
