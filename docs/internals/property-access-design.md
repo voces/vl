@@ -1,5 +1,10 @@
 # Property access: should VL have getters?
 
+> **Ruled and built (2026-09-22).** The owner took every recommendation in §F; F5 and F6 are
+> ruled and not built. Getters v1 (§D3a) is shipped: `docs/guide/getters.md` is the user's
+> page, `DECISIONS.md` §"Getters: declared, nominal-only, read-only, with a checked body" records
+> what the build decided. The text below is the design as it was put to the owner.
+>
 > Status: design, for an owner ruling. No compiler or std source is touched by the change that
 > carries this doc. Every "today" claim below is a program run with `dist/vl` on master
 > `914d64d65` (2026-09-22). Claims about the SIMD surface were run with a compiler built from
@@ -487,13 +492,24 @@ A getter body is refused unless it is:
   struct, list, map, string or closure, string `+` and interpolation, and `Buffer(n)`.
   `Buffer(n)` is also an effect, because it moves the allocator's bump pointer. Allocation that
   VL's rep choice adds without any source syntax is covered below.
-- **Effect-free.** It writes only to its own locals. It makes no extern or host calls. It reads
-  no mutable module state: `self`'s fields and module `const`s are fine, and a module `let` is
-  not. A trap is permitted (an `as!`, or an integer division); by the same reasoning as
-  `exprEffectFree`, the program dies either way.
+- **Effect-free.** It writes only to its own locals (block-scoped: a local ends with its
+  block). It makes no extern or host calls. It reads no module `let` BINDING: `self`'s fields
+  and module `const`s are fine. This is a rule about bindings, not about the heap: the heap
+  reachable from `self` or from a module `const` is readable, like linear memory. **Linear-memory reads through the
+  `__load_*` intrinsics are permitted deliberately**: the flat-row getter (`flat-records-design.md`
+  §9) is exactly a load at a derived address, and a load has no effect. A trap is permitted (an
+  `as!`, or an integer division); by the same reasoning as `exprEffectFree`, the program dies
+  either way.
 - **Calls intrinsics and other getters only.** No user or std function is callable, no function
   value, and no user operator overload, because `"+"` on a nominal type is an ordinary function
-  call.
+  call. The intrinsics are an exact list of names (loads, pure lane and vector operations, the
+  heap-window reads, `__trap__`); a user binding spelled like one is refused as a function value.
+- **Operators whose lowering loops or allocates are refused** (built, from the #3031 review's
+  disassembly): `==`/`!=`/`<`/`<=`/`>`/`>=` over string, list, map or struct operands (a
+  `__str_eq__` call or an inline element loop), an index into a map (a hash and a probe loop),
+  and list `+`. A literal-union comparison compares tags (`i32.eq`) and is allowed, as is a
+  test against `null`. **f64 `%` is allowed**: it lowers to `__f64_rem__`, whose loops are
+  bounded by the float format (a fixed constant), not by the operands, so it is tier 2.
 
 **Branches are allowed.** `if` and `match` expressions are fine: cost is bounded by the longest
 path, and a simple fork often lowers to `select`.

@@ -108,6 +108,8 @@ export type WasmMemberToken = {
   char: number; // 0-based
   length: number;
   isMethod: boolean;
+  /** A getter read (`get x(self: T)`): a computed, read-only property. False on an older seed. */
+  isGetter?: boolean;
 };
 
 /**
@@ -217,6 +219,8 @@ export type WasmMemberCompletion = {
   name: string;
   detail: string;
   isMethod: boolean;
+  /** A getter (`get x(self: T)`), offered as a property. False on an older seed. */
+  isGetter?: boolean;
   /**
    * The field's `///` block (D9.11) — the same text `docAt` gives hover for that
    * field's declaration. Undefined for a `string` builtin method (no source
@@ -1350,6 +1354,8 @@ export const createWasmChecker = (
         char: exp.memberColAt(i),
         length,
         isMethod: exp.memberIsMethodAt(i) === 1,
+        // Younger than the rest of the member ABI, so probed per call.
+        isGetter: typeof exp.memberIsGetterAt === "function" && exp.memberIsGetterAt(i) === 1,
       });
     }
     return out;
@@ -1477,7 +1483,9 @@ export const createWasmChecker = (
       const doc = docLen <= 0
         ? undefined
         : readString(docLen, (j) => exp.memberScanDocCharAt(i, j));
-      out.push({ name, detail, isMethod: exp.memberScanIsFn(i) === 1, doc });
+      const isGetter = typeof exp.memberScanIsGetter === "function" &&
+        exp.memberScanIsGetter(i) === 1;
+      out.push({ name, detail, isMethod: exp.memberScanIsFn(i) === 1, isGetter, doc });
     }
     return out;
   };

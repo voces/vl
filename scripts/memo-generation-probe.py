@@ -90,6 +90,7 @@ ROWS = [
     ("rootStmtList", ["gRootStmts"], "not-a-memo", None),
     ("repWalkMark", ["repSeenGen"], "not-a-memo", None),
     ("repTreeWalkMark", ["rtWalkGen"], "not-a-memo", None),
+    ("getterBoxedSeen", ["gwBoxedSeen"], "not-a-memo", None),
     ("repKeyMemo", ["repKeyMemoEpoch"], "probe",
      ("  if repKeyMemoEpoch != tyMutEpoch {", "  if true {")),
     ("repElemMemo", ["repElemMemoEpoch", "repElemMemoUserVer", "repElemMemoLen"], "probe",

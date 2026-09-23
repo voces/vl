@@ -6257,3 +6257,55 @@ API surface that should not flip because its body happens to trap today; TypeScr
 same line for function declarations. The distilled corpus could not measure the alternative (it
 holds no `__trap__` cell), so the conservative reading was taken rather than a measured one.
 `__trap__` itself needed no annotation: its type is the intrinsic's.
+
+## Getters: declared, nominal-only, read-only, with a checked body (owner, 2026-09-22) — BUILT
+
+**The rulings are `docs/internals/property-access-design.md` §F, each taken as recommended.**
+F1(b): a getter is a declaration, `get x(self: T): R`, not a parenless call of any zero-argument
+method (D3b would have decided B14's `c.area` question by accident). F2(a): a getter never
+participates in a structural type — a record type in VL is a WasmGC layout, a write permission
+and a narrowing place, and a getter is none of the three (§C; TypeScript's #13347 is the hole
+the other answer opens). F7: no setters. F8(a): the body contract is CHECKED — loop-free,
+recursion-free (cycles through other getters included), allocation-free, effect-free, calling
+only intrinsics and other getters — and it will only ever be relaxed. F9(a): the result and
+every local must have a non-boxing representation, decided from types before emission. F5
+(`{ readonly x: T }` bounds) and F6 (`readonly` fields) are ruled and not built.
+
+**What the build decided, and why:**
+
+- **A getter is found through its receiver's TYPE, never by name.** It is minted under
+  `<Recv>.<prop>`, which no source spelling can reach, and registered by its resolved `self`
+  type. So an import cannot bring one in and a local `x` cannot shadow `.x` — the D1984 collision
+  type-bound methods still have is impossible by construction.
+- **Only a `new` brand has getters, and only its declaring module declares them** (the orphan rule
+  of #3003/#3005, read from the `$mN` merge suffix both names carry). **A field or a built-in
+  member wins**, so a getter it would shadow is a declaration error rather than dead code.
+- **Cross-module reads need `export get`**, the D1191 boundary methods keep. The parser records
+  the keyword per declaration, since it drops `export` everywhere else.
+- **The result type is required.** It is what the F9 type rule checks, and requiring it keeps a
+  getter that reads another getter from needing return inference.
+- **The read is rewritten into a call at the end of checking**, not in the emitter, so every emit
+  pass sees an ordinary call and `exprEffectFree`'s "a member read is a load" stays true. During
+  checking the read stays a `Member`, banked as a getter site; the site is never a narrowing place.
+  Measured: the rewrite is byte-identical to the direct call and the UFCS call at `-O0`, `-O` and
+  `-O3`, and a field-read getter is byte-identical to the field read at `-O`/`-O3`
+  (`tests/vl_getter_codegen_test.ts`); source evaluation order holds
+  (`tests/cases/getters/getter-eval-order.vl`).
+- **`?.` does not read a getter.** `?.` reads a declared struct field and already refuses a
+  built-in `.length`; a getter is refused the same way, by name, with the narrowing that works.
+- **The contract walk is one `_`-less ladder over every AST kind** at the end of checking, plus a
+  reachability check over the getter-to-getter edges it records. The intrinsics a getter may call
+  are an exact list of names (loads, lane and vector arithmetic, the heap-window reads,
+  `__trap__`), refused when any program binding carries the name; stores, memory growth, prints
+  and host calls are refused. Locals are block-scoped in the walk, so a block's `let counter`
+  never exempts the module `let counter` after the block.
+- **Operators that hide a loop are refused** (review of #3031): comparisons over string, list,
+  map or struct operands, a map index, list `+`. Literal-union comparisons (a tag `i32.eq`) and
+  null tests stay; f64 `%` stays, its `__f64_rem__` loops bounded by the float format.
+  Linear-memory `__load_*` reads are allowed on purpose: the flat-row getter is one.
+- **A getter may not share its name with a method of its receiver** — a built-in method of the
+  representation or a same-module `self`-function over the same type — so `v.x` and `v.x()`
+  never mean two things, which keeps B14's bound-method `c.area` open.
+- **The minted name is `Recv.prop`**, which is also what a trap backtrace prints. The rewrite
+  bumps the arena epoch, because it changes the tree in place and the parse bank's replay would
+  otherwise hand lint a tree whose callee rows were popped.

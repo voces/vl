@@ -553,7 +553,18 @@ The whole trick is the third row. Once `"[]"` returns something branded over `i3
 bracket yields an address, `.tt()` is UFCS on an integer, and **there is no row value
 anywhere in the program** — so there is nothing for a fusion optimization to remove.
 
-### 9.1 Divergence from the spec: `.tt()`, not `.tt`
+### 9.1 Divergence from the spec: `.tt()`, not `.tt` — CLOSED by getters v1
+
+**Closed.** Getters v1 (`property-access-design.md` §D3a) lets the accessor be declared
+`get tt(self: RowAddr): i32 { __load_i32__((self as! i32) + TValue.tt) }`, and then
+`stack[i].tt` reads exactly as the requirements doc spells it. The brand over `i32` is still
+what the argument below needs: `.tt` is a getter over an ADDRESS, never a field of a
+materialized row, and the module is byte-identical to the `.tt()` spelling at every
+optimisation level (`tests/vl_getter_codegen_test.ts`). Pinned end to end by
+`tests/cases/memory/flat-fused-row-getter.vl`. A plain `self`-function still spells `.tt()`, so
+`flat-fused-row-field-spelling-rejected.vl` keeps pinning the reject for the method form. The
+text below is the record of why the divergence existed.
+
 
 The requirements doc writes `stack[i].tt` — a FIELD. VL's UFCS is call-style, so what is
 writable is `stack[i].tt()`. **This is the only divergence, and it is a loud checker
@@ -747,6 +758,7 @@ them coincide reads as a rule.*
 | `memory/flat-fused-row-import/` | the merge axis, both mechanisms at once |
 | `memory/flat-fused-row-brands-dont-cross.vl` | two row brands over one representation; a `NodeAddr` into a `TValue` accessor, and a bare `i32` variable into a row accessor |
 | `memory/flat-fused-row-field-spelling-rejected.vl` | the `.tt` divergence, as the reject it is |
+| `memory/flat-fused-row-getter.vl` | `stack[i].tt` as written, through a getter over the row address (§9.1, closed) |
 | `memory/flat-fused-row-past-page-end-traps.vl` | the bounds policy |
 
 The read/write cross-check in the first fixture is the §7.2 discipline reapplied: every

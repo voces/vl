@@ -30,7 +30,7 @@ tree ungraded.
 | `pass-stamped` | 3 | the key reads `emitPassGen`, or a phase flag that is one |
 | `no-refined-input` | 3 | every table its value reads is push-only or reset wholesale |
 | `resume-reseeds` | 2 | a resume bank that writes the refined columns back before reusing them |
-| `not-a-memo` | 8 | a visit mark or a per-row flag — no cached ANSWER to go stale |
+| `not-a-memo` | 9 | a visit mark or a per-row flag — no cached ANSWER to go stale |
 | `probe` | 12 | safety is measured, not argued |
 
 ### The rows
@@ -45,7 +45,7 @@ tree ungraded.
 | `declStructNodeOf` | top-level `stmts.length` | none: it indexes `TypeDecl` nodes, which no pass rewrites | no-refined-input |
 | `buildFnMapResumable` | 8 collect lengths | `fRetKind` and siblings — and `buildFnMapReseedPrefix` writes the banked seed back over the prefix, which is what makes the resume exact rather than merely cheap | resume-reseeds |
 | `collectAResumable` | `P.nodes.length` + 7 collect lengths | the annotation sidecars; the bank is armed only for a run no arena-editing pass crosses | resume-reseeds |
-| `monoGen`, `daGen`, `klGSeen`, `npEpochs`/`asgDeclEpochs`, `emitNameSeen`/`nomNameSeen`/`stSeenStack`, `gRootStmts`, `repSeenGen`, `rtWalkGen` | — | — | not-a-memo |
+| `monoGen`, `daGen`, `klGSeen`, `npEpochs`/`asgDeclEpochs`, `emitNameSeen`/`nomNameSeen`/`stSeenStack`, `gRootStmts`, `repSeenGen`, `rtWalkGen`, `gwBoxedSeen` (the getter walk's once-per-type report mark) | — | — | not-a-memo |
 | `repKeyMemo` / `hcCanonMemo` | `tyMutEpoch` | its own canon-key columns | probe |
 | `repElemMemo` / `hcElemMemo` / `hcMvMemo` | `tyMutEpoch`, `cUserTypesVer`, `sNames.length` | its own columns | probe |
 | `repSlotCache` | `tyMutEpoch`, `cUserTypesVer`, `sNames.length` | `sFieldTypes`, which `unifyMixedLitRepArms` re-lays in place at the end of `collectS` | probe |
