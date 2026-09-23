@@ -27,6 +27,10 @@ Are they good for VL?"*
 - So the recommendation is **a narrow, declared, nominal-only, read-only getter** (`get x(self:
   F32x4): f32`), which exists mainly to honour O3's `.x` and to let a packed scalar newtype
   expose named parts.
+- **The getter's body is checked, not trusted.** It must be loop-free, recursion-free,
+  allocation-free and effect-free, and it may call only intrinsics and other getters (§D3a).
+  That keeps a getter read to a load or a short straight-line sequence. The contract is
+  deliberately conservative and will only ever be relaxed.
 - **Nothing new in the language is needed to unblock lane reads today.** A literal-union
   parameter (`i: 0 | 1 | 2 | 3`) compiles in std with no compiler change. It is range-checked at
   compile time, and it folds to one `f32x4.extract_lane` at `-O` and `-O3` (§A7).
@@ -431,15 +435,56 @@ consumers.
      need explicitly.
   4. **Never structural** (§C5), and **never a narrowing place**. A getter path behaves like a
      call result for narrowing (Kotlin's rule).
-  5. **Zero-argument, pure by convention.** B6's "property syntax is reserved for O(1)
-     members" becomes the documented contract for a getter, and a std review criterion for std
-     getters (`std-api-review.md` §2, "a name that promises more than it delivers"). Nothing
-     enforces it for user getters, as in C# and Python.
+  5. **Zero-argument, with a CHECKED body contract (§D3a-contract below).** B6 says property
+     syntax is reserved for O(1) members. VL checks that rule where C# and Python only state it
+     in a guideline.
+
+##### D3a-contract. The v1 getter body is checked, not trusted
+
+A getter body is refused unless it is:
+
+- **Loop-free and recursion-free.** It contains no `for` or `while`, and it has no cycle through
+  other getters.
+- **Allocation-free.** It builds no struct, list, map or string. String `+` and interpolation
+  count as allocation.
+- **Effect-free.** It writes only to its own locals. It makes no extern or host calls. It reads
+  no mutable module state: `self`'s fields and module `const`s are fine, and a module `let` is
+  not. A trap is permitted (an `as!`, or an integer division); by the same reasoning as
+  `exprEffectFree`, the program dies either way.
+- **Calls intrinsics and other getters only.** No user or std function is callable, no function
+  value, and no user operator overload, because `"+"` on a nominal type is an ordinary function
+  call.
+
+**Branches are allowed.** `if` and `match` expressions are fine: cost is bounded by the longest
+path, and a simple fork often lowers to `select`.
+
+The contract aims at the first two of four cost tiers:
+
+1. **a load**: `.x` reads one field or one lane;
+2. **straight-line bounded**: a few loads, ALU ops, compares and branches, such as a packed
+   `Color`'s `(self as i32 >> 8) & 255`;
+3. **O(1) but allocating**: excluded. It fails the "surprised in a loop" test, because a reader
+   of `p.name` in a hot loop does not expect a heap allocation per read;
+4. **unbounded**: excluded.
+
+Every getter O3 and E2 name fits. `get x(self: F32x4): f32 { __extract_lane_f32x4__(self as!
+v128, 0) }` is tier 1, and a packed-scalar part is tier 2.
+
+**This is deliberately conservative, and it will be relaxed, never tightened.** A separate
+design, `docs/internals/function-effects-design.md` (in a parallel PR), infers or marks
+functions as pure and bounded. Once it lands, a getter may call such functions as well as
+intrinsics. Loosening the contract turns refusals into programs that compile. Tightening it
+later would break getters that already compile, and std has no deprecation story for that.
 - **Where it goes.**
   - Parser: `get` as a contextual keyword at declaration start, followed by an identifier and
     `(`. `get` stays usable as an identifier everywhere else; `xs.get(i)` is untouched.
   - Checker: one new rung in `checkMemberNode` / `memberFloorErr` (`typecheck.vl:35201`,
     `:18580`), and a refusal in the assignment-target arm.
+  - Body contract: **one walk over the getter body** at its declaration, plus a cycle check over
+    the getter-to-getter call graph (which contains only getters, so it is small). The walk is
+    a `_`-less match over node kinds, so a node kind nobody has classified is refused until
+    someone classifies it. The contract errs toward refusing, in the same direction it will
+    later relax.
   - Lowering: **rewrite the `Member` node into a `Call` before emit**, so the emitter's "a member
     read is a load" assumption (`exprEffectFree`, §A1) stays true without teaching the emitter
     anything. The rewrite has to preserve source evaluation order; a probe in the same shape as
@@ -461,8 +506,9 @@ consumers.
   It extends B6 from compiler-owned to user-declarable members, under B6's own O(1) contract. It
   is consistent with #3003's orphan rule and type-bound resolution.
 - **Perf view.** `.` stops being a guaranteed load on a *nominal* type whose module declares
-  getters. At `-O`/`-O3` the measured cost is zero (§A2). The readability cost is real: a reader
-  of `v.x` has to know that `F32x4` is a getter type. Mitigations are the semantic token and
+  getters. At `-O`/`-O3` the measured cost is zero (§A2), and the body contract caps it at tiers
+  1–2 at every level. The readability cost is real: a reader of `v.x` has to know that `F32x4`
+  is a getter type. Mitigations are the semantic token and
   the fact that getters exist only on named types, never on `{ … }`.
 
 #### D3b. Implicit parenless calls (Nim / D style)
@@ -549,9 +595,15 @@ or where they arrive by making calls parenless (D's `@property`, Scala 2's auto-
      today (`Buf.length`) can never make it computed. A declared getter gives std one way to
      evolve that does not need a retraction.
   3. **O3 already rules `.x`.**
+- **The perf consumers' objection has a checked answer.** Their objection is "a `.` is no longer
+  a load". Under the v1 body contract (§D3a-contract), a getter read costs a load or a short,
+  bounded, allocation-free, effect-free sequence, and the compiler checks this. Convention would
+  not be enough for plumb, veldt and sunsuz, and a guideline nothing checks would not survive
+  the first user getter that allocates.
 
 So: **adopt D3a (declared `get`, nominal-only, read-only, type-bound, never structural, never a
-narrowing place, lowered as a call), and reject D2, D3b and D3c.** Separately, **route
+narrowing place, lowered as a call, with a body checked against the v1 contract), and reject D2,
+D3b and D3c.** Separately, **route
 read-only-ness to A9 `readonly` fields**. That fixes §A5 and §G1 and gives the future bound
 `{ readonly x: f32 }` (F5) its meaning.
 
@@ -630,6 +682,17 @@ cannot do the job.
 write-back semantics (C#'s CS1612, Swift's modify accessors). `withLane` says what happens.
 Revisit only if a reference type needs a validating setter and `readonly` fields plus a method
 do not cover it.
+
+**F8. Adopt the checked v1 getter-body contract (§D3a-contract)?**
+(a) yes, as stated: loop-free, recursion-free, allocation-free and effect-free, with branches
+allowed, and calls only to intrinsics and other getters. It is relaxed later by
+`docs/internals/function-effects-design.md`. (b) Pure by convention, stated as a guideline and
+not checked (C#, Python). (c) Stricter: a single expression with no local bindings.
+*Recommend (a).* (b) leaves the perf consumers' guarantee unenforced, and the first allocating
+user getter would break it silently. (c) gives no cost bound that (a) lacks, since both
+stay in tiers 1–2, and it makes multi-step lane or bit extraction harder to read. The rule that matters is
+the direction: (a) can only be relaxed. Starting from (b) and tightening later would break
+getters that already compile, and std has no deprecation story for that.
 
 ---
 
