@@ -5399,6 +5399,23 @@ remainder: an orphan method, a non-nominal receiver (string), and an absent name
 rule is unchanged for writing an ANNOTATION or CONSTRUCTING a value — this is only about calling
 a method on a value already in hand.
 
+**Refined 2026-09-22 (D1984; owner ruling, option (a)) — a scope binding steps aside only on a
+NEWTYPE receiver, by declared names.** A same-named `self`-function in the caller's scope still
+wins, except when the receiver is `new`-branded (`F32x4`) and that function's `self` is
+ANNOTATED with a concrete type not naming the receiver's newtype (a local `dot(self: V2)` beside
+`v.dot(w)`); then the receiver's home module is asked. Structural receivers never step past the
+scope binding, an un-annotated `self` never does, and a generic `self: T` keeps the call. The
+test reads only declared type names, never structural assignability or body demands: a first cut
+that asked whether `self` ACCEPTED the receiver let a field added to a library type, or an edit
+to an un-annotated body, silently move a compiling call between the caller's function and the
+library's. Rationale: D's anti-hijacking principle — a declaration elsewhere must never silently
+change which function a call binds to — and the nominal keying Rust and Lean give dot-resolution.
+Since a newtype is assignable to no other declared type, the steps-aside case was always a check
+error, so only errors become resolutions. This is what makes an unsuffixed std method name
+(`v.lane(i)`) safe beside a caller's own `lane(self: string)`. Where the caller binds the name
+and still cannot reach the module's method, D1230's sentence proposes an ALIASED import
+(`area as areaBox`, or the next free suffix), since the plain one would collide.
+
 ## String building is a LOWERING, not a spelling the user has to know (owner direction, 2026-09-03)
 
 The owner's direction is "optimize string building at the compiler level, without the user

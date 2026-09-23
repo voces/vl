@@ -187,3 +187,74 @@ Deno.test({
     }
   },
 });
+
+Deno.test({
+  name: "ufcs-import suffix: the entry binds its own same-named method — an ALIASED import (D1984)",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = await Deno.makeTempDir({ prefix: "vl_ufcs_suffix_" });
+    try {
+      // `area` is an ORPHAN in "./lib", and the entry declares its own `area(self: string)`,
+      // so importing the plain name would collide with it. The line to paste aliases the
+      // import after the receiver's type and names the call it enables.
+      eq(
+        await errorsOfFiles(dir, {
+          "base.vl": "export type Box = { v: i32 }\n\n" +
+            "export function box(v: i32): Box { return { v: v } }\n",
+          "lib.vl": 'import { Box } from "./base"\n\n' +
+            "export function area(self: Box): i32 { return self.v * self.v }\n\n" +
+            "export function helper(): i32 { return 0 }\n",
+          "entry.vl": 'import { box } from "./base"\nimport { helper } from "./lib"\n\n' +
+            "function area(self: string): i32 { return self.length }\n\n" +
+            'print(box(2).area())\n\nprint(helper())\n\nprint("ab".area())\n',
+        }),
+        [
+          "'area' is not imported — a free `area(self: …)` accepting Box is " +
+          'exported by "./lib"; a UFCS call resolves only names in scope, and this ' +
+          "module already binds `area`, so import it from there under another " +
+          "name — add `area as areaBox` to the existing " +
+          '`import { … } from "./lib"` and call `.areaBox(…)`',
+        ],
+        "./lib orphan beside a local area",
+      );
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
+
+Deno.test({
+  name: "ufcs-import suffix: the proposed alias is itself bound — the next free one is proposed",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = await Deno.makeTempDir({ prefix: "vl_ufcs_suffix_" });
+    try {
+      // The entry binds both `area` and `areaBox`, so `area as areaBox` would collide in its
+      // turn; the sentence proposes `areaBox2` instead.
+      eq(
+        await errorsOfFiles(dir, {
+          "base.vl": "export type Box = { v: i32 }\n\n" +
+            "export function box(v: i32): Box { return { v: v } }\n",
+          "lib.vl": 'import { Box } from "./base"\n\n' +
+            "export function area(self: Box): i32 { return self.v * self.v }\n\n" +
+            "export function helper(): i32 { return 0 }\n",
+          "entry.vl": 'import { box } from "./base"\nimport { helper } from "./lib"\n\n' +
+            "function area(self: string): i32 { return self.length }\n\n" +
+            "function areaBox(n: i32): i32 { return n }\n\n" +
+            'print(box(2).area())\n\nprint(helper())\n\nprint("ab".area())\n\n' +
+            "print(areaBox(1))\n",
+        }),
+        [
+          "'area' is not imported — a free `area(self: …)` accepting Box is " +
+          'exported by "./lib"; a UFCS call resolves only names in scope, and this ' +
+          "module already binds `area`, so import it from there under another " +
+          "name — add `area as areaBox2` to the existing " +
+          '`import { … } from "./lib"` and call `.areaBox2(…)`',
+        ],
+        "./lib orphan beside a local area and areaBox",
+      );
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
