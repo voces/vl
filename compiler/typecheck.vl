@@ -924,10 +924,11 @@ let collRetFnNodes: i32[] = []
 // function's binding. Depth-tagged sparse rows, read through `lookupDepth` exactly like `collBind`.
 let objLitBindDepth: i32[] = []
 let objLitBindName: string[] = []
-// The same rows for an un-annotated binding of a list literal or a `Map()`/`Set()`, whose
-// container is built at the type it flows into; the readonly-only list rule leaves it to that.
+// The same rows for an un-annotated `const` bound to a list, object or map literal, with its
+// initializer: the readonly-only list rule follows such a name to the literal it names.
 let ctnLitBindDepth: i32[] = []
 let ctnLitBindName: string[] = []
+let ctnLitBindInit: i32[] = []
 
 // The un-inferred empty-collection floor: an un-annotated empty `[]` / `Map()` / `Set()` whose
 // element/key/value hole is never pinned — by an annotation or a downstream `.push`/`.set`/
@@ -7067,6 +7068,7 @@ function isvalReset() {
   objLitBindName = []
   ctnLitBindDepth = []
   ctnLitBindName = []
+  ctnLitBindInit = []
   collRetFnNodes = []
   collapsedAliases = Map()
   annotCollapsed = Map()
@@ -7148,23 +7150,40 @@ function bindingIsObjLit(name: string) {
   bindMarkHas(objLitBindDepth, objLitBindName, name)
 }
 
-// Mark, and test, an un-annotated binding whose initializer is a list literal.
-function markCtnLitBinding(name: string, depth: i32) {
+// Mark an un-annotated literal `const` (see `letDeclIsUnannotCtnLit`) with its initializer.
+function markCtnLitBinding(name: string, depth: i32, init: i32) {
   bindMarkPush(ctnLitBindDepth, ctnLitBindName, name, depth)
+  ctnLitBindInit.push(init)
 }
 
-function bindingIsCtnLit(name: string) {
-  bindMarkHas(ctnLitBindDepth, ctnLitBindName, name)
+// The initializer of the literal `const` `name` resolves to, or -1 when it resolves to anything
+// else. Paired by depth exactly as `bindMarkHas` is, so shadowing holds.
+function ctnLitInitOf(name: string): i32 {
+  if ctnLitBindName.length == 0 { return -1 }
+  const d = lookupDepth(name)
+  if d < 0 { return -1 }
+  let i = ctnLitBindName.length - 1
+  while i >= 0 {
+    if ctnLitBindName[i] == name && ctnLitBindDepth[i] == d {
+      if i < ctnLitBindInit.length { return ctnLitBindInit[i] }
+      return -1
+    }
+    i = i - 1
+  }
+  -1
 }
 
-// Is `ix` a `let`/`const` with no annotation and a list-literal or `Map()`/`Set()` initializer?
+// Is `ix` a `const` with no annotation and a list, object or `Map()`/`Set()` initializer? A
+// `let` may be re-pointed at any list, so its initializer says nothing about its value.
 function letDeclIsUnannotCtnLit(ix: i32): boolean {
   const n = P.nodes[ix]
   if n is LetDecl {
+    if n.letKw != "const" { return false }
     if n.letType >= 0 { return false }
     if n.letInit < 0 { return false }
     const iv = P.nodes[n.letInit]
     if iv is ArrayLit { return true }
+    if iv is ObjLit { return true }
     return exprIsCollCtorCall(n.letInit)
   }
   false
@@ -7198,6 +7217,7 @@ function collBindPopTo(depth: i32) {
   bindMarkPopTo(collBindDepth, collBindName, depth)
   bindMarkPopTo(objLitBindDepth, objLitBindName, depth)
   bindMarkPopTo(ctnLitBindDepth, ctnLitBindName, depth)
+  while ctnLitBindInit.length > ctnLitBindName.length { ctnLitBindInit.pop() }
 }
 
 // Mark or test a function declaration whose return annotation collapsed. Deduped: pass 1 hoists
@@ -16320,16 +16340,28 @@ function cwEscapeFld(dst: i32, elem: boolean): string {
   cwProjPath(dst)
 }
 
-// Is `callFnIx` the callee of `xs.push(…)` on a container this analysis can name? `push` is
-// the only mutator that takes the value: `pop` and `clear` deliver nothing, and a map's store
-// is an index assignment.
+// Is `callFnIx` the callee of `xs.push(…)`, or of a map's `m.set(k, …)`, on a container this
+// analysis can name? The two mutators that take the value: `pop` and `clear` deliver nothing,
+// and `m.set(k, v)` is the method spelling of the index store `m[k] = v`.
 function cwPushIntoNamed(callFnIx: i32): boolean {
   const cf = cwPeel(callFnIx)
   if cf < 0 || cf >= P.nodes.length { return false }
   const n = P.nodes[cf]
   if n is Member {
     if n.memProp == "push" { return cwEscapeOwner(cf) != "" }
+    if n.memProp == "set" && cwRecvIsMap(n.memObj) {
+      return cwEscapeOwner(cf) != ""
+    }
   }
+  false
+}
+
+// Is the receiver at `ix` typed as a map?
+function cwRecvIsMap(ix: i32): boolean {
+  const t = nodeTyIxOf(ix)
+  if t < 0 || t >= T.tys.length { return false }
+  const mt = T.tys[t]
+  if mt is TyMap { return true }
   false
 }
 
@@ -20022,71 +20054,450 @@ function objFieldWidthPair(src: i32, dst: i32): boolean {
   false
 }
 
-// True while the walk is inside a value whose type inference chose rather than an annotation
-// (`srcIsInferredCtn`): its lists are built at the type they flow into, so the readonly-only
-// list rule leaves it alone, at any depth below.
-let shapeAdaptLitRoot = false
-
-// The entry to `objShapeAdapterless` for a whole delivery of `srcExpr`.
+// The entry for a whole delivery of `srcExpr`: the storage and object-shape floor first, then
+// the readonly-only list rule.
 function objShapeAdapterlessAt(srcExpr: i32, src: i32, dst: i32): boolean {
-  shapeAdaptLitRoot = false
-  objShapeAdapterless(srcExpr, src, dst, 12, true)
+  shapeAdaptNulCopy = false
+  shapeAdaptNestedCopy = false
+  shapeAdaptMapShared = false
+  if objShapeAdapterless(srcExpr, src, dst, 12, true) { return true }
+  let wd = dst
+  if dst == lwStoreDst && lwStoreVal >= 0 { wd = lwStoreVal }
+  listWidenWalk(srcExpr, src, wd, 12, false)
 }
 
-// Does any argument of `c` hand in an existing list? A list literal is new, so it does not.
-function callPassesList(c: Call): boolean {
-  let i = 0
-  while i < c.callArgs.length {
-    const aix = parenPeelIx(c.callArgs[i])
-    if aix < 0 || aix >= P.nodes.length { return false }
-    const ax = P.nodes[aix]
-    if ax is ArrayLit {
-      i = i + 1
-      continue
+// A map index store `m[k] = v` is checked against the READ type `V | null`, while the value
+// lands in a `V` slot: the list rule walks `V` (`lwStoreVal`) for that one delivery.
+let lwStoreDst = -1
+let lwStoreVal = -1
+
+// Pin `lwStoreDst`/`lwStoreVal` when the place at `tgt` is an index into a map read as `readTy`.
+function mapStoreValPin(tgt: i32, readTy: i32) {
+  lwStoreDst = -1
+  lwStoreVal = -1
+  if tgt < 0 || tgt >= P.nodes.length { return 0 }
+  const t = P.nodes[tgt]
+  if t is Index {
+    const ct = nodeTyIxOf(t.idxArr)
+    if ct < 0 || ct >= T.tys.length { return 0 }
+    const m = T.tys[ct]
+    if m is TyMap {
+      lwStoreDst = readTy
+      lwStoreVal = m.mVal
     }
-    const at = nodeTyIxOf(c.callArgs[i])
-    if at >= 0 && at < T.tys.length {
-      const t = T.tys[at]
-      if t is TyArray { return true }
+  }
+  0
+}
+
+// Set beside the claimed pair: a readonly list reached through `| null` that needs a
+// converting copy, one nested in another list, or a map whose list values widen (D2196).
+let shapeAdaptNulCopy = false
+let shapeAdaptNestedCopy = false
+let shapeAdaptMapShared = false
+
+// Claim `src` -> `dst` as the refused list pair, the way `objShapeAdapterless` claims one.
+function listWidenClaim(x: i32, src: i32, dst: i32): boolean {
+  shapeAdaptSrcTy = src
+  shapeAdaptDstTy = dst
+  shapeAdaptSrcExpr = x
+  shapeAdaptElemPair = true
+  shapeAdaptWidthField = false
+  true
+}
+
+// The readonly-only list rule (DECISIONS.md "No implicit container widening", D2161): a list
+// whose element widens is refused unless the destination is `readonly`. Keyed on each list's
+// ORIGIN: a list literal is built at the type it flows into, so it is exempt while the lists
+// inside it are judged by their own expressions. `underNul`: the pair sits under a `| null`.
+function listWidenWalk(
+  expr: i32,
+  src: i32,
+  dst: i32,
+  depth: i32,
+  underNul: boolean,
+): boolean {
+  if src < 0 || dst < 0 || depth <= 0 { return false }
+  if src >= T.tys.length || dst >= T.tys.length { return false }
+  if src == dst { return false }
+  const x = listOriginExpr(expr)
+  if x == LW_INFERRED { return false }
+  const d = T.tys[dst]
+  if d is TyNullable {
+    const sn = T.tys[src]
+    if sn is TyNullable {
+      return listWidenWalk(-1, sn.nInner, d.nInner, depth - 1, true)
+    }
+    return listWidenWalk(x, src, d.nInner, depth - 1, true)
+  }
+  if d is TyUnion {
+    return listWidenIntoUnion(x, src, d.uMembers, depth, underNul)
+  }
+  listWidenFromSrc(x, src, dst, depth, underNul)
+}
+
+// A union destination accepts the source at some member; the walk refuses only when every
+// member that accepts it refuses.
+function listWidenIntoUnion(
+  x: i32,
+  src: i32,
+  dms: i32[],
+  depth: i32,
+  underNul: boolean,
+): boolean {
+  let anyClean = false
+  let anyBad = false
+  let i = 0
+  while i < dms.length {
+    if assignable(src, dms[i]) {
+      if listWidenWalk(x, src, dms[i], depth - 1, underNul) {
+        anyBad = true
+      } else {
+        anyClean = true
+      }
+    }
+    i = i + 1
+  }
+  if anyClean { return false }
+  anyBad
+}
+
+// The walk's dispatch on the source's own kind; a leaf holds no list.
+function listWidenFromSrc(
+  x: i32,
+  src: i32,
+  dst: i32,
+  depth: i32,
+  underNul: boolean,
+): boolean {
+  const s = T.tys[src]
+  match s {
+    TyNullable => {
+      return listWidenWalk(-1, s.nInner, dst, depth - 1, underNul)
+    }
+    TyUnion => {
+      let i = 0
+      while i < s.uMembers.length {
+        if listWidenWalk(-1, s.uMembers[i], dst, depth - 1, underNul) {
+          return true
+        }
+        i = i + 1
+      }
+      return false
+    }
+    TyArray => {
+      return listWidenArray(x, s, src, dst, depth, underNul)
+    }
+    TyObj => {
+      return listWidenObj(x, s, dst, depth)
+    }
+    TyMap => {
+      return listWidenMap(x, s, src, dst, depth)
+    }
+    TyFunc => {
+      return listWidenFunc(s, dst, depth)
+    }
+    TyPrim | TyErr | TyVar | TyLit | TyNeg => {
+      return false
+    }
+  }
+}
+
+// A list into a list: the element pair first, so the innermost widened list is the one named.
+function listWidenArray(
+  x: i32,
+  s: TyArray,
+  src: i32,
+  dst: i32,
+  depth: i32,
+  underNul: boolean,
+): boolean {
+  const d = T.tys[dst]
+  if d is TyArray {
+    if x >= 0 {
+      const lit = P.nodes[x]
+      if lit is ArrayLit {
+        return listWidenLitElems(lit.arrElems, d.aElem, depth)
+      }
+    }
+    if listWidenWalk(-1, s.aElem, d.aElem, depth - 1, false) { return true }
+    if d.aRead != 1 {
+      if listElemWidens(s.aElem, d.aElem) { return listWidenClaim(x, src, dst) }
+      return false
+    }
+    // A readonly destination that needs a converting copy under `| null` has no lowering yet.
+    if underNul && listPairNeedsCopy(s.aElem, d.aElem) {
+      shapeAdaptNulCopy = true
+      return listWidenClaim(x, src, dst)
+    }
+  }
+  false
+}
+
+// The elements of a list literal, each judged by its own expression; a spread hands over the
+// elements of an existing list, which carry no origin of their own.
+function listWidenLitElems(els: i32[], de: i32, depth: i32): boolean {
+  let i = 0
+  while i < els.length {
+    const el = P.nodes[els[i]]
+    if el is Spread {
+      const st = nodeTyIxOf(el.spdArg)
+      if st >= 0 && st < T.tys.length {
+        const sa = T.tys[st]
+        if sa is TyArray {
+          if listWidenWalk(-1, sa.aElem, de, depth - 1, false) { return true }
+        }
+      }
+    } else if listWidenWalk(els[i], nodeTyIxOf(els[i]), de, depth - 1, false) {
+      return true
     }
     i = i + 1
   }
   false
 }
 
-// Is `srcExpr` a value no annotation typed: a name bound without one to an object, list or map
-// literal, or a call of a function whose result type no annotation fixes (no declared return, or
-// a generic one, which the call instantiates)?
-function srcIsInferredCtn(srcExpr: i32): boolean {
-  if srcExpr < 0 { return false }
-  const px = parenPeelIx(srcExpr)
-  if px < 0 || px >= P.nodes.length { return false }
-  const e = P.nodes[px]
-  if e is Ident {
-    return bindingIsObjLit(e.identName) || bindingIsCtnLit(e.identName)
+// A record into a record: each field the destination declares, with its initializer when the
+// source is an object literal.
+function listWidenObj(x: i32, s: TyObj, dst: i32, depth: i32): boolean {
+  const d = T.tys[dst]
+  if d is TyObj {
+    let lit = -1
+    if x >= 0 {
+      const ol = P.nodes[x]
+      if ol is ObjLit { lit = x }
+    }
+    let i = 0
+    while i < d.objFieldNames.length {
+      const sf = objFieldType(s, d.objFieldNames[i])
+      if sf >= 0 {
+        const fx = objLitFieldExpr(lit, d.objFieldNames[i])
+        if listWidenWalk(fx, sf, d.objFieldTypes[i], depth - 1, false) {
+          return true
+        }
+      }
+      i = i + 1
+    }
   }
-  callResultIsInferred(px)
+  false
 }
 
-// Is `ix` a call whose result type no annotation fixes (see `srcIsInferredCtn`)?
+// The value expression the object literal at `lit` gives field `name`, or -1.
+function objLitFieldExpr(lit: i32, name: string): i32 {
+  if lit < 0 { return -1 }
+  const ol = P.nodes[lit]
+  if ol is ObjLit {
+    let i = 0
+    while i < ol.objFields.length {
+      const fi = P.nodes[ol.objFields[i]]
+      if fi is FieldInit {
+        if fi.fiName == name { return fi.fiValue }
+      }
+      i = i + 1
+    }
+  }
+  -1
+}
+
+// A map into a map. A map has no read-only view, so a key or value holding a list may not
+// widen at all, readonly or not: every handle shares its entries.
+function listWidenMap(
+  x: i32,
+  s: TyMap,
+  src: i32,
+  dst: i32,
+  depth: i32,
+): boolean {
+  const d = T.tys[dst]
+  if d is TyMap {
+    if listWidenWalk(-1, s.mKey, d.mKey, depth - 1, false) { return true }
+    if listWidenWalk(-1, s.mVal, d.mVal, depth - 1, false) { return true }
+    const vw = tyContainsList(d.mVal, 8) && listElemWidens(s.mVal, d.mVal)
+    const kw = tyContainsList(d.mKey, 8) && listElemWidens(s.mKey, d.mKey)
+    if vw || kw {
+      shapeAdaptMapShared = true
+      return listWidenClaim(x, src, dst)
+    }
+  }
+  false
+}
+
+// A function value: its result is covariant and its parameters contravariant, in the order
+// `assignable`'s `TyFunc` arm compares them.
+function listWidenFunc(s: TyFunc, dst: i32, depth: i32): boolean {
+  const d = T.tys[dst]
+  if d is TyFunc {
+    if s.fnParamTypes.length != d.fnParamTypes.length { return false }
+    if listWidenWalk(-1, s.fnRet, d.fnRet, depth - 1, false) { return true }
+    let i = 0
+    while i < s.fnParamTypes.length {
+      if (
+        listWidenWalk(
+          -1,
+          d.fnParamTypes[i],
+          s.fnParamTypes[i],
+          depth - 1,
+          false,
+        )
+      ) {
+        return true
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// Does `ty` hold a list anywhere a store could reach one?
+function tyContainsList(ty: i32, depth: i32): boolean {
+  if ty < 0 || ty >= T.tys.length || depth <= 0 { return false }
+  const t = T.tys[ty]
+  match t {
+    TyArray => {
+      return true
+    }
+    TyNullable => {
+      return tyContainsList(t.nInner, depth - 1)
+    }
+    TyUnion => {
+      let i = 0
+      while i < t.uMembers.length {
+        if tyContainsList(t.uMembers[i], depth - 1) { return true }
+        i = i + 1
+      }
+      return false
+    }
+    TyObj => {
+      let i = 0
+      while i < t.objFieldTypes.length {
+        if tyContainsList(t.objFieldTypes[i], depth - 1) { return true }
+        i = i + 1
+      }
+      return false
+    }
+    TyMap => {
+      return tyContainsList(t.mKey, depth - 1) ||
+        tyContainsList(t.mVal, depth - 1)
+    }
+    TyPrim | TyErr | TyFunc | TyVar | TyLit | TyNeg => {
+      return false
+    }
+  }
+}
+
+// Does a list of `se` delivered as a list of `de` take an element-converting copy rather than
+// share? The numeric pairs (D965) and a plain record into a boxed union (D791).
+function listPairNeedsCopy(se: i32, de: i32): boolean {
+  if scalarElemWidenServed(se, de) { return true }
+  if se < 0 || de < 0 || se >= T.tys.length || de >= T.tys.length {
+    return false
+  }
+  const st = T.tys[se]
+  if st is TyObj {
+    const dt = T.tys[de]
+    if dt is TyUnion { return covarNonNullArms(dt.uMembers) >= 2 }
+  }
+  false
+}
+
+// `listOriginExpr`'s answer for a value whose type inference chose.
+const LW_INFERRED = -2
+
+// Where the list `expr` delivers comes from: a literal `const` resolves to the literal it
+// names, a `Map()`/`Set()` const or a call whose result no annotation fixes is LW_INFERRED,
+// and anything else is itself. -1 stays -1.
+function listOriginExpr(expr: i32): i32 {
+  if expr < 0 { return -1 }
+  let x = parenPeelIx(expr)
+  let hops = 0
+  while hops < 16 {
+    if x < 0 || x >= P.nodes.length { return -1 }
+    const e = P.nodes[x]
+    if e is Ident {
+      const init = ctnLitInitOf(e.identName)
+      if init < 0 { return x }
+      if exprIsCollCtorCall(init) { return LW_INFERRED }
+      x = parenPeelIx(init)
+      hops = hops + 1
+      continue
+    }
+    if callResultIsInferred(x) { return LW_INFERRED }
+    return x
+  }
+  x
+}
+
+// Does the argument at `ix` hand an EXISTING list to the call? A literal is new, so only the
+// lists inside it that come from elsewhere count.
+function argCarriesList(ix: i32): boolean {
+  const px = parenPeelIx(ix)
+  if px < 0 || px >= P.nodes.length { return false }
+  const e = P.nodes[px]
+  if e is ArrayLit {
+    let i = 0
+    while i < e.arrElems.length {
+      const el = P.nodes[e.arrElems[i]]
+      if el is Spread {
+        if tyContainsList(nodeTyIxOf(el.spdArg), 8) { return true }
+      } else if argCarriesList(e.arrElems[i]) {
+        return true
+      }
+      i = i + 1
+    }
+    return false
+  }
+  if e is ObjLit {
+    let i = 0
+    while i < e.objFields.length {
+      const fi = P.nodes[e.objFields[i]]
+      if fi is FieldInit {
+        if argCarriesList(fi.fiValue) { return true }
+      }
+      i = i + 1
+    }
+    return false
+  }
+  tyContainsList(nodeTyIxOf(px), 8)
+}
+
+// Does any argument of `c` hand in an existing list?
+function callPassesList(c: Call): boolean {
+  let i = 0
+  while i < c.callArgs.length {
+    if argCarriesList(c.callArgs[i]) { return true }
+    i = i + 1
+  }
+  false
+}
+
+// Is `ix` a call whose result is built at the type it flows into: the fill intrinsic, a
+// function with no declared return, or a generic whose declared result names a type parameter
+// and which no existing list goes into (`filled(2, { r: 1 })`, not `id(xs)`)?
 function callResultIsInferred(ix: i32): boolean {
   const e = P.nodes[ix]
   if e is Call {
     const cn = P.nodes[e.callFn]
     if cn is Ident {
-      // The fill intrinsic builds a new list at the type it flows into.
       if cn.identName == "__array_new__" { return true }
       const fd = lookupFnDeclNode(cn.identName)
       if fd >= 0 {
         const f = P.nodes[fd]
         if f is FuncDecl {
           if f.fnRet < 0 { return true }
-          // A generic call builds its result only when no list goes in: `id(xs)` hands `xs` back.
-          if f.fnTyParams.length > 0 { return !callPassesList(e) }
+          if f.fnTyParams.length > 0 && fnDeclRetHasTyVar(fd) {
+            return !callPassesList(e)
+          }
         }
       }
     }
   }
+  false
+}
+
+// Does the declared result of the function declared at `fd` name one of its type parameters?
+function fnDeclRetHasTyVar(fd: i32): boolean {
+  const ft = nodeTyOf(fd)
+  if ft < 0 || ft >= T.tys.length { return false }
+  const f = T.tys[ft]
+  if f is TyFunc { return tyHasTyVar(f.fnRet) }
   false
 }
 
@@ -20095,20 +20506,6 @@ function callResultIsInferred(ix: i32): boolean {
 // wherever the pair sits under something whose own wasm type has to relate by identity — an
 // array or map element, a function signature — since a struct-level `sub` edge does not reach those.
 function objShapeAdapterless(
-  srcExpr: i32,
-  src: i32,
-  dst: i32,
-  depth: i32,
-  direct: boolean,
-): boolean {
-  const saved = shapeAdaptLitRoot
-  if !saved && srcIsInferredCtn(srcExpr) { shapeAdaptLitRoot = true }
-  const r = objShapeAdapterlessGo(srcExpr, src, dst, depth, direct)
-  shapeAdaptLitRoot = saved
-  r
-}
-
-function objShapeAdapterlessGo(
   srcExpr: i32,
   src: i32,
   dst: i32,
@@ -20275,25 +20672,15 @@ function objShapeAdapterlessGo(
         // Only a `readonly` destination takes the converting copy (D965), and only where
         // nothing writes the source: the copy is a snapshot. An unknown write state (2) refuses.
         if d.aRead == 1 && scalarElemWidenServed(s.aElem, d.aElem) {
-          if covarValueWriteState(covarRootName(cx), covarRootFrame(cx)) == 0 {
+          if cx < 0 {
+            shapeAdaptNestedCopy = true
+          } else if (
+            covarValueWriteState(covarRootName(cx), covarRootFrame(cx)) ==
+            0
+          ) {
             return false
           }
         }
-        shapeAdaptSrcTy = src
-        shapeAdaptDstTy = dst
-        shapeAdaptSrcExpr = cx
-        shapeAdaptElemPair = true
-        shapeAdaptWidthField = false
-        return true
-      }
-      // Only a `readonly` list is covariant (DECISIONS.md §"No implicit container widening"):
-      // a mutable wider handle, shared or copied, lets a store the source's element type
-      // forbids reach it or silently stop reaching it (D2161).
-      if (
-        d.aRead != 1 &&
-        !shapeAdaptLitRoot &&
-        listElemWidens(s.aElem, d.aElem)
-      ) {
         shapeAdaptSrcTy = src
         shapeAdaptDstTy = dst
         shapeAdaptSrcExpr = cx
@@ -20386,6 +20773,7 @@ function containerWidenCopyHint(src: i32, dst: i32): string {
   if s is TyArray {
     if d is TyArray {
       const de = tyToStr(d.aElem)
+      if !mapCopyBuilds(d.aElem) { return "" }
       if elemClassIsNumeric(s.aElem) && elemClassIsNumeric(d.aElem) {
         return ", or copy it with `.map((x) => x as " + de + ")`"
       }
@@ -20415,6 +20803,21 @@ function containerWidenCopyHintBare(src: i32, dst: i32): string {
   "a copy built at " + tyToStr(dst)
 }
 
+// Can `.map` build a result list of element `de`? Not yet for a nullable list or a nullable
+// union arm (D2193), so no message offers that copy.
+function mapCopyBuilds(de: i32): boolean {
+  if de < 0 || de >= T.tys.length { return false }
+  const t = T.tys[de]
+  if t is TyNullable {
+    const ni = t.nInner
+    if ni < 0 || ni >= T.tys.length { return false }
+    const it = T.tys[ni]
+    if it is TyArray { return false }
+    if cTyIxSetHas(cVariantMemberTyIxSet, ni) { return false }
+  }
+  true
+}
+
 // Is `src` -> `dst` a list pair the read-only converting copy serves (D965)? Only those
 // are refused for being written rather than refused outright.
 function containerWidenServed(src: i32, dst: i32): boolean {
@@ -20439,6 +20842,105 @@ function containerWidenReadonlyServes(src: i32, dst: i32): boolean {
     }
   }
   false
+}
+
+// Why a readonly list that needs a converting copy is refused where it sits: under `| null` or
+// nested in another list, the copy has no lowering yet (D2196).
+function containerCopyGapWhy(underNul: boolean): string {
+  let where = "a list nested in another list"
+  if underNul { where = "a list that may be null" }
+  ": its elements would be stored differently, so it would take a converting copy, and a " +
+    "copy into " +
+    where +
+    " is not built yet (D2196)."
+}
+
+// The `readonly` spelling of `dst` that `src` could be delivered to — every list on the way to
+// the widened one made a view — or -1 when this checker would refuse that too, so a message
+// never offers a fix that does not build. `srcExpr` keeps the delivery's own write licence.
+function readonlyFixOf(
+  srcExpr: i32,
+  src: i32,
+  dst: i32,
+  pairS: i32,
+  pairD: i32,
+): i32 {
+  const ro = viewifyLists(src, dst, 8)
+  if ro < 0 || ro == dst { return -1 }
+  // A readonly copy is licensed where nothing writes the source (D791); the emitter decides a
+  // record-into-union copy, so the offer asks the same licence rather than promise it.
+  if pairS < 0 || pairD < 0 || pairS >= T.tys.length || pairD >= T.tys.length {
+    return -1
+  }
+  const ps = T.tys[pairS]
+  const pd = T.tys[pairD]
+  if ps is TyArray {
+    if pd is TyArray {
+      if listPairNeedsCopy(ps.aElem, pd.aElem) {
+        const rx = parenPeelIx(srcExpr)
+        if covarValueWriteState(covarRootName(rx), covarRootFrame(rx)) != 0 {
+          return -1
+        }
+      }
+    }
+  }
+  if !assignable(src, ro) { return -1 }
+  const sS = shapeAdaptSrcTy
+  const sD = shapeAdaptDstTy
+  const sX = shapeAdaptSrcExpr
+  const sE = shapeAdaptElemPair
+  const sW = shapeAdaptWidthField
+  const nC = shapeAdaptNulCopy
+  const nN = shapeAdaptNestedCopy
+  const nM = shapeAdaptMapShared
+  const bad = covarWriteThrough(srcExpr, src, ro) != 0 ||
+    objShapeAdapterlessAt(srcExpr, src, ro)
+  shapeAdaptSrcTy = sS
+  shapeAdaptDstTy = sD
+  shapeAdaptSrcExpr = sX
+  shapeAdaptElemPair = sE
+  shapeAdaptWidthField = sW
+  shapeAdaptNulCopy = nC
+  shapeAdaptNestedCopy = nN
+  shapeAdaptMapShared = nM
+  if bad { return -1 }
+  ro
+}
+
+// `dst` with every list that pairs with a list of `src` made a view, through `| null`; any
+// other type is kept as it stands. -1 only for a hole.
+function viewifyLists(src: i32, dst: i32, depth: i32): i32 {
+  if src < 0 || dst < 0 || src >= T.tys.length || dst >= T.tys.length {
+    return -1
+  }
+  if depth <= 0 { return dst }
+  const d = T.tys[dst]
+  const s = T.tys[src]
+  let sIn = src
+  if s is TyNullable {
+    sIn = s.nInner
+    if sIn < 0 || sIn >= T.tys.length { return -1 }
+  }
+  match d {
+    TyNullable => {
+      const inner = viewifyLists(sIn, d.nInner, depth - 1)
+      if inner < 0 { return -1 }
+      return mkNullableTy(inner)
+    }
+    TyArray => {
+      const sa = T.tys[sIn]
+      if sa is TyArray {
+        const el = viewifyLists(sa.aElem, d.aElem, depth - 1)
+        if el < 0 { return -1 }
+        return mkArrayViewTy(el)
+      }
+      return dst
+    }
+    // No other destination has a view spelling; it is kept as it stands.
+    TyPrim | TyErr | TyObj | TyFunc | TyUnion | TyMap | TyVar | TyLit | TyNeg => {
+      return dst
+    }
+  }
 }
 
 // The reason sentence for `containerWidenReadonlyServes`'s pairs: a copy that would stop
@@ -20512,27 +21014,50 @@ function objShapeAdapterlessErr(srcExpr: i32, src: i32, dst: i32) {
       "the original. Build it as "
     let hint = containerWidenCopyHint(sT, dT)
     let buildAs = dT
+    // An inner list spelled in the source (a literal's element or field) can still be copied
+    // with `.map`; one reached only through a type is built at the outer type instead.
+    if through != "" && sX < 0 { hint = ", or build it as " + tyToStr(dst) }
+    const pairNote = tyToStr(sT) + " is not " + tyToStr(dT) + through
+    if shapeAdaptNulCopy || shapeAdaptNestedCopy {
+      let gapFix = " Build it as " + tyToStr(dst)
+      if hint != "" && !(through != "" && sX < 0) {
+        gapFix = " Copy it" + hint.slice(12, hint.length)
+      }
+      tErr(pairNote + containerCopyGapWhy(shapeAdaptNulCopy) + gapFix, srcExpr)
+      return 0
+    }
+    if shapeAdaptMapShared {
+      tErr(
+        pairNote +
+          ": a map never widens implicitly, and it has no read-only view, so every handle " +
+          "would share entries of two types. Build it as " +
+          tyToStr(dT) +
+          ", filling it from the source",
+        srcExpr,
+      )
+      return 0
+    }
     if containerWidenReadonlyServes(sT, dT) {
-      let which = "it"
-      // An inner list written in the source (a literal's element or field) can still be
-      // copied with `.map`; one reached only through a type is built at the outer one.
-      if through != "" {
-        which = "that list"
-        if sX < 0 { hint = ", or build it as " + tyToStr(dst) }
+      // The `readonly` fix is offered only when this checker accepts it for this delivery.
+      const ro = readonlyFixOf(srcExpr, src, dst, sT, dT)
+      let fix = ""
+      if ro >= 0 {
+        fix = " Declare the destination `" +
+          tyToStr(ro) +
+          "` for a read-only view"
+        if hint != "" { fix = fix + hint }
+      } else if through != "" && sX < 0 {
+        fix = " Build it as " + tyToStr(dst)
+      } else if hint != "" {
+        fix = " Copy it" + hint.slice(12, hint.length)
+      } else {
+        fix = " Build it as " + tyToStr(dst)
       }
       tErr(
-        tyToStr(sT) +
-          " is not " +
-          tyToStr(dT) +
-          through +
+        pairNote +
           ": a container never widens implicitly, and only a readonly list is covariant. " +
           containerWidenWhy(sT, dT) +
-          " Declare " +
-          which +
-          " `readonly " +
-          tyToStr(dT) +
-          "` for a read-only view" +
-          hint,
+          fix,
         srcExpr,
       )
       return 0
@@ -30596,7 +31121,7 @@ function checkProgramNode(n: Program) {
           markObjLitBinding(sm.letName, 0)
         }
         if letDeclIsUnannotCtnLit(stmts[mi]) {
-          markCtnLitBinding(sm.letName, 0)
+          markCtnLitBinding(sm.letName, 0, sm.letInit)
         }
         moduleGlobals[sm.letName] = true
         // TDZ: in the dead-zone until pass 2 reaches the initializer.
@@ -37739,7 +38264,9 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
     // A plain assignment pins the source's open holes, exactly as an annotated let-init, call
     // argument, or typed return already does — runs before `assignableExpr` so the pin applies first.
     constrainEmptyExpr(n.binRight, rt, asgLt)
+    mapStoreValPin(n.binLeft, asgLt)
     const asgOk = assignableExpr(n.binRight, rt, asgLt)
+    lwStoreDst = -1
     if !asgOk {
       if asgBarred {
         writeBarredErr(placeKeyOf(n.binLeft), ix)
@@ -38673,7 +39200,7 @@ function checkLetDeclNode(n: LetDecl, ix: i32) {
     markObjLitBinding(n.letName, T.scopes.length - 1)
   }
   if !preHoisted && letDeclIsUnannotCtnLit(ix) {
-    markCtnLitBinding(n.letName, T.scopes.length - 1)
+    markCtnLitBinding(n.letName, T.scopes.length - 1, n.letInit)
   }
   // D1048's second hint: marks a binding whose type came from a spelling that collapsed a
   // subsumed literal arm. A bare call initializer is the whole rung, deliberately narrow.

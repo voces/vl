@@ -176,6 +176,10 @@ const grown: (C | null)[] = cs.map((x): C | null => x)        // will be written
 grown.push(null)
 ```
 
+A list of lists is a view at every level — `C[][]` passes as `readonly (readonly (C | null)[])[]`
+— and a map never widens the lists it holds, since it has no read-only spelling: build it at the wider
+type and fill it.
+
 Two things are not covariant destinations, so they need neither fix. An un-annotated parameter
 is compiled once per argument type, so `function total(xs) { … }` takes an `i32[]` and an
 `f64[]` alike, with no copy. And a list the compiler inferred, `const cs = [{ n: 1 }]`, is built

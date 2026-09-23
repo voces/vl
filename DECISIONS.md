@@ -3767,25 +3767,41 @@ The author writes the copy, or builds the container at the wide type from the st
 refused whether its element changes storage (`i32[]` into `f64[]`, which would be a hidden copy)
 or keeps it (`C[]` into `(C | null)[]`, which would share the list and let a `null` reach the
 `C[]`, D2161), and the refusal says so and names both fixes: declare the destination
-`readonly (C | null)[]` for a read-only view, or copy with `.map((x): C | null => x)`. A pair reached through an
-outer container names the inner list to declare `readonly`, and `.map` where the inner value is
-spelled in the source. Every fix a message names builds, with one exception filed as D2193
-(`.map` into a nullable union-arm or nullable-list element).
+`readonly (C | null)[]` for a read-only view, or copy with `.map((x): C | null => x)`. The
+`.map` copy is not offered for a nullable union-arm or nullable-list element, which `.map` cannot
+build yet (D2193).
 
 **A `readonly` destination keeps the converting copy for now.** `i32[]` into `readonly f64[]`
 and `Circle[]` into `readonly Shape[]` still lower as the D965/D791 element-converting copy,
 licensed where nothing writes the source, and every store position lowers it (push, indexed
-store, map store and global assignment, D2163). A view that shares storage is the follow-up; it
+store, map store, field store and global assignment, D2163), except under `| null` or nested in
+another list, which the checker refuses until the copy is built there (D2196). A view that shares storage is the follow-up; it
 would also close D2162, a `readonly` return the copy lets diverge from a later write.
 
-**Inference is not widening.** A value whose type no annotation fixed is left to inference: an
-un-annotated list literal is BUILT at the type it flows into, so there is no narrower handle.
-The rule stands aside for a name bound without an annotation to a list, object or map literal, a
-generic call no existing list goes into (`filled(2, { r: 1 })`), and a call of a function with
-no return annotation — the last too wide, since `function relay() { circles }` hands back an
-annotated list (D2194). An UN-ANNOTATED PARAMETER is not a destination at all: each call
-specialises the function at the argument's own type, so `function total(xs) { … }` runs over an
-`i32[]` and an `f64[]` with no copy (`unannotated-list-param-no-widening-runs.vl`).
+**Inference is not widening, and the rule keys on each list's ORIGIN.** An un-annotated list
+literal is BUILT at the type it flows into, so there is no narrower handle: a literal, or a
+`const` bound to one, is exempt, while the lists INSIDE it are judged by their own expressions
+(`const ls = [circles]` into `(C | null)[][]` is refused, since `circles` is annotated). A `let`
+may be re-pointed at any list, so its initializer vouches for nothing. A generic call builds its
+result only when its declared result names a type parameter and no existing list goes in,
+directly or inside a map or record argument (`filled(2, { r: 1 })`, not `id(xs)`). One origin
+is still taken on trust, a call of a function with no return annotation, which is too wide
+(D2194). An UN-ANNOTATED PARAMETER is not a destination at all: each call specialises the
+function at the argument's own type, so `function total(xs) { … }` runs over an `i32[]` and an
+`f64[]` with no copy (`unannotated-list-param-no-widening-runs.vl`).
+
+**Every fix a message prints builds, and a test applies each one.** The `readonly` fix names the
+whole destination (`readonly (readonly (C | null)[])[]` for a nested list) and is offered only
+when this checker accepts that spelling for this delivery; where no view builds — a copy under
+`| null` or nested in another list (D2196), a written source — the message offers `.map` or
+"build it as". `tests/vl_widen_hint_test.ts` reads each printed fix, applies it, and runs it.
+
+**Scope.** The walk goes through nullables, unions, nested lists, record fields and function
+types, and a map is never covariant in a list-bearing key or value (it has no read-only view).
+Out of scope, each with its own owner: a record field widening with no list inside (`{x: i32}`
+into `{x: i32 | string}`, D2100/D2160 and the record rule below), and a map value widening with
+no list inside (`{[string]: C}` into `{[string]: C | null}`), which shares its entries and runs
+read-only while a write through the wider map is refused by the record rule's map arm.
 
 **What it cost, measured before landing.** The distilled corpus lost `runs` in exactly 8 cells
 (`d773_readonly_*`, `d791_*`, `d822_*`, `d852_escape_*`), every one an annotated `Circle[]`
@@ -3794,6 +3810,8 @@ respelled with `readonly` destinations (the copy machinery they pin now serves `
 3 refusals reworded, and 2 that run unchanged once generic calls were exempted and D1798 closed.
 No `std` module is affected. A first cut that refused inferred sources too cost 620 corpus
 classes (12,170 census cells), all un-annotated literals, which is why inference stands aside.
+Keying the exemption on each list's origin, and extending the walk to maps and record fields,
+moved no further corpus cell.
 
 A method call's receiver is `self`'s argument and gets the same verdict in every spelling —
 `xs.f()`, `xs?.f()`, a generic `self`, and a receiver inside an un-annotated body, asked at
