@@ -18272,10 +18272,37 @@ function holeArgDemandErr(name: string, argN: i32, at: i32, ix: i32) {
       ": expected " +
       holeDemandStr(name) +
       ", got " +
-      tyToStr(at),
+      tyToStr(at) +
+      getterDemandNote(holeDemandTy(name), at),
     ix,
   )
   0
+}
+
+// When a field an un-annotated parameter's body reads is a getter on argument type `at`, the
+// sentence that says so: the inferred record demands a field, and a getter is not one.
+function getterDemandNote(demand: i32, at: i32): string {
+  if demand < 0 || at < 0 { return "" }
+  const d = T.tys[demand]
+  if d is TyObj {
+    let i = 0
+    while i < d.objFieldNames.length {
+      const g = getterFnFor(at, d.objFieldNames[i])
+      if g != "" {
+        return " — `" +
+          d.objFieldNames[i] +
+          "` on " +
+          tyToStr(at) +
+          " is a getter, and the parameter's inferred type is a record with a field `" +
+          d.objFieldNames[i] +
+          "`, which a getter does not satisfy; annotate the parameter as `" +
+          tyToStr(at) +
+          "`"
+      }
+      i = i + 1
+    }
+  }
+  ""
 }
 
 // Reports an argument an indexed hole cannot take — one home for the wording, shared by the
@@ -18875,7 +18902,36 @@ function memberFloorErr(objTy: i32, prop: string, ix: i32) {
   if msg == "" {
     return tErr("member access '." + prop + "' on " + tyToStr(objTy), ix)
   }
-  tErr(msg + unkeyedSubscriptNote(ix), ix)
+  tErr(msg + unkeyedSubscriptNote(ix) + getterNarrowNote(objTy, ix), ix)
+}
+
+// When member node `ix` reads through a nullable getter result, the sentence that says why a
+// null test did not help: a getter read is a call, never a narrowed place.
+function getterNarrowNote(objTy: i32, ix: i32): string {
+  if objTy < 0 || ix < 0 || ix >= P.nodes.length { return "" }
+  if !(T.tys[objTy] is TyNullable) { return "" }
+  const n = P.nodes[ix]
+  if n is Member {
+    const g = getSiteFnOf(n.memObj)
+    if g == "" { return "" }
+    const p = getDeclPropOf(g)
+    let read = "v." + p
+    const gm = P.nodes[n.memObj]
+    if gm is Member {
+      const base = placeKeyOf(gm.memObj)
+      if base != "" { read = base + "." + p }
+    }
+    return " — `." +
+      p +
+      "` is a getter, and a null test does not narrow a getter read; bind it to a local first: `const " +
+      p +
+      " = " +
+      read +
+      "`, then test `" +
+      p +
+      " != null`"
+  }
+  ""
 }
 
 // Why an `is` test the author already wrote did not narrow this read: its receiver is an
@@ -22389,7 +22445,37 @@ function checkBoundsAtCall(
                 }
               }
             }
-            if wit == "" {
+            const gBound = getterFnFor(conc, bn[m])
+            if wit == "" && gBound != "" {
+              tErr(
+                tyKey +
+                  " does not satisfy `" +
+                  boundText(bAnn) +
+                  "`: " +
+                  getterBoundNote(gBound, bm[m]),
+                ix,
+              )
+            } else if wit == "" && !bm[m] {
+              tErr(
+                tyKey +
+                  " does not satisfy `" +
+                  boundText(bAnn) +
+                  "`: no field `" +
+                  bn[m] +
+                  ": " +
+                  tyToStr(bt[m]) +
+                  "` — a field bound is satisfied only by a stored field; to accept a `" +
+                  bn[m] +
+                  "(self: " +
+                  tyKey +
+                  ")` function, bound on `{ " +
+                  bn[m] +
+                  "(): " +
+                  tyToStr(bt[m]) +
+                  " }`",
+                ix,
+              )
+            } else if wit == "" {
               let what = bn[m]
               if bm[m] { what = bn[m] + "(): " + tyToStr(retOfFuncTy(bt[m])) }
               tErr(
@@ -37115,8 +37201,15 @@ function getterReadTy(fn: string, n: Member, ix: i32) {
 // The locals of the getter body being walked, and the getter-to-getter reads each body makes
 // (`getEdgeFrom[k]` reads `getEdgeTo[k]`, both registry rows) for the cycle check.
 let gwLocals: string[] = []
-// The boxed types already refused in the getter being walked, so one boxed local is one error.
-let gwBoxedSeen: i32[] = []
+// The boxed types already refused in the getter being walked, by spelling, so one boxed type
+// is one error however many nodes carry it.
+let gwBoxedSeen: string[] = []
+// The callees already refused in the getter being walked: every call to one callee has the
+// same fix, so a callee called three times is one error.
+let gwSaid: string[] = []
+// The `+` nodes nested inside a concatenation already refused, so `a + b + c` is one error at
+// its outermost `+` while a separate concatenation elsewhere in the body is its own.
+let gwConcatInner: i32[] = []
 // The nodes of the walked getter whose value is discarded — a non-final block statement, and
 // the arms of a statement-position `if` or `match`. Their type is never materialised, so the
 // non-boxing rule does not apply to it.
@@ -37145,14 +37238,94 @@ function getLetTyOf(ix: i32): i32 {
   -1
 }
 
-// One contract refusal, anchored at the offending node and naming the getter and the rule.
-function getterContractErr(what: string, at: i32) {
+// The rules a getter body keeps, one sentence each, for `getterContractErr`'s `rule`.
+const GW_ALLOC = "a getter must not allocate"
+const GW_LOOP = "a getter must not loop"
+const GW_RECUR = "a getter must not recurse"
+const GW_EFFECT = "a getter must not have side effects"
+const GW_STATE = "a getter must not read mutable state"
+const GW_CALL = "a getter may call only other getters and the load and SIMD intrinsics"
+const GW_OTHER = "a getter body may only compute a value from its receiver"
+
+// Getter row `gi`'s declared result type as a message spells it, or "" when it has none.
+function getterRetStr(gi: i32): string {
+  const fnTy = lookup(getFns[gi])
+  if fnTy < 0 { return "" }
+  const ft = T.tys[fnTy]
+  if ft is TyFunc {
+    if ft.fnRet >= 0 && ft.fnRet != TY_VOID { return tyToStr(ft.fnRet) }
+  }
+  ""
+}
+
+// Getter row `gi` spelled as the method it could be instead: `function p(self: T): R`.
+function getterAsMethod(gi: i32): string {
+  let ret = getterRetStr(gi)
+  if ret != "" { ret = ": " + ret }
+  "`function " +
+    getProps[gi] +
+    "(self: " +
+    tyToStr(getSelfTys[gi]) +
+    ")" +
+    ret +
+    "`"
+}
+
+// The fix every getter refusal offers: the same declaration as a method, read with `()`.
+function getterMethodFix(gi: i32): string {
+  "make it a method: " +
+    getterAsMethod(gi) +
+    ", called as `." +
+    getProps[gi] +
+    "()`"
+}
+
+// Why getter `fn` does not answer a bound member of its name, and the two ways out; `method` is
+// whether the bound asks for `p(): R` rather than a field `p: R`.
+function getterBoundNote(fn: string, method: boolean): string {
+  const gi = getRowOf(fn)
+  if gi < 0 { return "`" + getDeclPropOf(fn) + "` is a getter" }
+  const p = getProps[gi]
+  const recv = tyToStr(getSelfTys[gi])
+  let after = ", and bound on `{ " + p + "(): " + getterRetStr(gi) + " }`"
+  if method { after = ", which satisfies it" }
+  "`" +
+    p +
+    "` on " +
+    recv +
+    " is a getter, and a getter does not satisfy a bound yet — take a `" +
+    recv +
+    "` parameter instead, or declare `" +
+    p +
+    "` as a method, " +
+    getterAsMethod(gi) +
+    after
+}
+
+// A refusal of a call to a named callee, raised once per getter for each callee.
+function getterCallErr(what: string, rule: string, at: i32) {
+  const key = what + "|" + rule
+  let i = 0
+  while i < gwSaid.length {
+    if gwSaid[i] == key { return 0 }
+    i = i + 1
+  }
+  gwSaid.push(key)
+  getterContractErr(what, rule, at)
+}
+
+// One contract refusal, anchored at the offending construct: what the getter does, the rule it
+// breaks, and the method it could be instead.
+function getterContractErr(what: string, rule: string, at: i32) {
   tErr(
     "the " +
       getDeclLabel(getFns[gwRow]) +
       " " +
       what +
-      " — a getter body is loop-free, recursion-free, allocation-free and effect-free, and calls only intrinsics and other getters",
+      ", and " +
+      rule +
+      " — " +
+      getterMethodFix(gwRow),
     at,
   )
   0
@@ -37267,9 +37440,8 @@ function gwTypeOk(ix: i32) {
   const ty = nodeTyIxOf(ix)
   if ty >= 0 && ty != TY_VOID && !getterRepOk(ty) && gwBoxedFirst(ty) {
     getterContractErr(
-      "computes a value of type `" +
-        tyToStr(ty) +
-        "`, whose representation is boxed (it allocates)",
+      "computes a value of type `" + tyToStr(ty) + "`, which is allocated",
+      GW_ALLOC,
       ix,
     )
   }
@@ -37287,12 +37459,13 @@ function gwDiscarded(ix: i32): boolean {
 
 // True the first time boxed type `ty` is refused in the walked getter, marking it refused.
 function gwBoxedFirst(ty: i32): boolean {
+  const key = tyToStr(ty)
   let i = 0
   while i < gwBoxedSeen.length {
-    if gwBoxedSeen[i] == ty { return false }
+    if gwBoxedSeen[i] == key { return false }
     i = i + 1
   }
-  gwBoxedSeen.push(ty)
+  gwBoxedSeen.push(key)
   true
 }
 
@@ -37301,12 +37474,16 @@ function gwBoxedFirst(ty: i32): boolean {
 function gwIdentRead(nm: string, ix: i32) {
   if gwIsLocal(nm) { return 0 }
   if fnDeclIx.has(nm) {
-    getterContractErr("uses the function `" + nm + "` as a value", ix)
+    getterContractErr("uses the function `" + nm + "` as a value", GW_OTHER, ix)
     return 0
   }
   if moduleGlobals[nm] ?? false {
     if !isConstName(nm) {
-      getterContractErr("reads the mutable module `let` `" + nm + "`", ix)
+      getterContractErr(
+        "reads the mutable module `let` `" + nm + "`",
+        GW_STATE,
+        ix,
+      )
     }
   }
   0
@@ -37365,12 +37542,13 @@ function gwWalk(ix: i32) {
   }
   if n is Index {
     if opIdxFnAtNode(ix) != "" {
-      getterContractErr("calls a user `\"[]\"` operator", ix)
+      getterContractErr("calls a user `\"[]\"` operator", GW_CALL, ix)
     } else if gwErasedIs(nodeTyIxOf(n.idxArr)) == "map" {
       getterContractErr(
         "indexes the map `" +
           tyToStr(nodeTyIxOf(n.idxArr)) +
-          "`, a hash and a probe loop",
+          "`, which hashes and probes in a loop",
+        GW_LOOP,
         ix,
       )
       // The read's `V | null` result would be refused too; the map index is the one fact.
@@ -37398,7 +37576,8 @@ function gwWalk(ix: i32) {
           n.letName +
           "` of type `" +
           tyToStr(lty) +
-          "`, whose representation is boxed (it allocates)",
+          "`, which is allocated",
+        GW_ALLOC,
         ix,
       )
     }
@@ -37434,35 +37613,37 @@ function gwWalk(ix: i32) {
   if n is MatchExpr { return gwMatch(n, ix) }
   if n is RetStmt { return gwWalk(n.retArg) }
   if n is WhileStmt || n is ForRange || n is ForIn {
-    return getterContractErr("contains a loop", ix)
+    return getterContractErr("contains a loop", GW_LOOP, ix)
   }
   if n is BreakStmt || n is ContinueStmt {
-    return getterContractErr("contains a loop", ix)
+    return getterContractErr("contains a loop", GW_LOOP, ix)
   }
   if n is FuncDecl {
-    return getterContractErr(
-      "declares a function, which allocates a closure",
-      ix,
-    )
+    return getterContractErr("declares a function, a closure", GW_ALLOC, ix)
   }
   if n is ObjLit || n is FieldInit {
-    return getterContractErr("constructs a struct, which allocates", ix)
+    return getterContractErr("constructs a struct", GW_ALLOC, ix)
   }
   if n is ArrayLit || n is Spread {
-    return getterContractErr("constructs a list, which allocates", ix)
+    return getterContractErr("constructs a list", GW_ALLOC, ix)
   }
   if n is TypeDecl || n is UnionDecl || n is FieldDef {
-    return getterContractErr("declares a type", ix)
+    return getterContractErr("declares a type", GW_OTHER, ix)
   }
   // A parameter and an annotation are not walked (the parameter list is fixed as `self`), and
   // a program root or an import cannot appear in a body.
   if n is Param || n is TypeRef || n is Program || n is ImportDecl {
     return getterContractErr(
       "contains a construct the contract does not classify",
+      GW_OTHER,
       ix,
     )
   }
-  getterContractErr("contains a construct the contract does not classify", ix)
+  getterContractErr(
+    "contains a construct the contract does not classify",
+    GW_OTHER,
+    ix,
+  )
 }
 
 // A binary expression: an assignment may write only the getter's own `let` locals, a string
@@ -37475,6 +37656,7 @@ function gwBinExpr(n: BinExpr, ix: i32) {
     if !ok {
       getterContractErr(
         "writes a place that is not one of its own locals",
+        GW_EFFECT,
         n.binLeft,
       )
     }
@@ -37485,13 +37667,13 @@ function gwBinExpr(n: BinExpr, ix: i32) {
   // A template is refused once, at its root: its holes render through `toString` and its
   // parts concatenate, and naming each of those would bury the one fact that matters.
   if n.binTpl == 1 {
-    return getterContractErr("uses string interpolation, which allocates", ix)
+    return getterContractErr("uses string interpolation", GW_ALLOC, ix)
   }
   if n.binOp == "+" && tyIsPrimNamed(nodeTyIxOf(ix), "string") {
-    getterContractErr("concatenates strings, which allocates", ix)
+    gwConcatErr("concatenates strings", n, ix)
   }
   if n.binOp == "+" && gwErasedIs(nodeTyIxOf(ix)) == "list" {
-    getterContractErr("concatenates lists with `+`, which allocates", ix)
+    gwConcatErr("concatenates lists with `+`", n, ix)
   }
   if gwIsCompare(n.binOp) {
     const bad = gwLoopCmpOperand(n.binLeft, n.binRight)
@@ -37501,7 +37683,8 @@ function gwBinExpr(n: BinExpr, ix: i32) {
           tyToStr(nodeTyIxOf(bad)) +
           "` values with `" +
           n.binOp +
-          "`, a comparison that loops",
+          "`, which loops over their contents",
+        GW_LOOP,
         ix,
       )
     }
@@ -37510,12 +37693,38 @@ function gwBinExpr(n: BinExpr, ix: i32) {
   if opFn != "" {
     getterContractErr(
       "calls the user operator `" + n.binOp + "`, an ordinary function",
+      GW_CALL,
       ix,
     )
   }
   gwWalk(n.binLeft)
   gwWalk(n.binRight)
   gwTypeOk(ix)
+}
+
+// Refuses the concatenation at `+` node `ix` unless it is nested in one already refused, and
+// marks its `+` operands as nested, so a chain is one error at its outermost `+`.
+function gwConcatErr(what: string, n: BinExpr, ix: i32) {
+  let inner = false
+  let i = 0
+  while i < gwConcatInner.length {
+    if gwConcatInner[i] == ix { inner = true }
+    i = i + 1
+  }
+  if !inner { getterContractErr(what, GW_ALLOC, ix) }
+  gwConcatMarkInner(n.binLeft)
+  gwConcatMarkInner(n.binRight)
+  0
+}
+
+function gwConcatMarkInner(ix: i32) {
+  const u = cwPeel(ix)
+  if u < 0 || u >= P.nodes.length { return 0 }
+  const m = P.nodes[u]
+  if m is BinExpr {
+    if m.binOp == "+" { gwConcatInner.push(u) }
+  }
+  0
 }
 
 function gwIsCompare(op: string): boolean {
@@ -37587,20 +37796,17 @@ function gwCall(n: Call, ix: i32) {
   if callee is Ident {
     const nm = callee.identName
     if externLinkOf(nm) >= 0 {
-      getterContractErr("calls the host function `" + nm + "`", ix)
+      getterCallErr("calls the host function `" + nm + "`", GW_EFFECT, ix)
     } else if gwIsLocal(nm) || (moduleGlobals[nm] ?? false) {
-      getterContractErr("calls the function value `" + nm + "`", ix)
+      getterCallErr("calls the function value `" + nm + "`", GW_CALL, ix)
     } else if !getterIntrinsicOk(nm) {
-      getterContractErr(
-        "calls `" + nm + "`, which is neither a pure intrinsic nor a getter",
-        ix,
-      )
+      getterCallErr("calls `" + nm + "`", GW_CALL, ix)
     }
   } else if callee is Member {
-    getterContractErr("calls the method `." + callee.memProp + "()`", ix)
+    getterCallErr("calls the method `." + callee.memProp + "()`", GW_CALL, ix)
     gwWalk(callee.memObj)
   } else {
-    getterContractErr("calls a function value", ix)
+    getterContractErr("calls a function value", GW_CALL, ix)
   }
   let i = 0
   while i < n.callArgs.length {
@@ -37712,12 +37918,23 @@ function getterDeclCheck(gi: i32) {
         if ft.fnRet == TY_VOID {
           tErr("the " + label + " must return a value", getDecls[gi])
         } else if ft.fnRet >= 0 && !getterRepOk(ft.fnRet) {
+          // The body computes this same type, and one mistake is one error.
+          gwBoxedFirst(ft.fnRet)
+          let alt = "return a type that needs no allocation"
+          if T.tys[nomErasedTyIx(ft.fnRet)] is TyNullable {
+            alt = "return a type without `| null`"
+          }
           tErr(
             "the " +
               label +
               " returns `" +
               tyToStr(ft.fnRet) +
-              "`, whose representation is boxed (it allocates) — a getter returns a scalar, a literal union, an existing reference or a null niche",
+              "`, which is allocated, and " +
+              GW_ALLOC +
+              " — " +
+              alt +
+              ", or " +
+              getterMethodFix(gi),
             d.fnRet,
           )
         }
@@ -37841,13 +38058,15 @@ function checkProgramEndGetters() {
   getEdgeTo = []
   let gi = 0
   while gi < getFns.length {
+    gwBoxedSeen = []
+    gwSaid = []
+    gwConcatInner = []
     getterDeclCheck(gi)
     const d = P.nodes[getDecls[gi]]
     if d is FuncDecl {
       gwRow = gi
       gwLocals = []
       gwLocals.push("self")
-      gwBoxedSeen = []
       gwDiscard = []
       gwWalk(d.fnBody)
     }
@@ -37858,7 +38077,8 @@ function checkProgramEndGetters() {
     if getterReaches(ci, ci) {
       gwRow = ci
       getterContractErr(
-        "is recursive: it reads itself through a chain of getters",
+        "reads itself through a chain of getters",
+        GW_RECUR,
         getDecls[ci],
       )
     }

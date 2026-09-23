@@ -172,7 +172,7 @@ field" as the next constructor). §E keeps the two questions apart.
   read".
 - The refusal message for a field bound ends "the bound needs a field of that type **or a
   `x(self: V, …)` function in scope** at this call". The second half is false: the witness above
-  has exactly that function in scope and is still refused. Unfiled (§G3).
+  has exactly that function in scope and is still refused. Filed and closed as D2093 (§G3).
 
 ### A7. The literal lane index, and the substitute VL already has
 
@@ -796,4 +796,4 @@ inventory ids. Each should be filed from `TEMPLATE.md` under the coordinator's n
   `function x(self: V): f32` in scope says "the bound needs a field of that type or a
   `x(self: V, …)` function in scope". The function is in scope and the call is still refused,
   which is correct per `DECISIONS.md:1218`. The message should offer only the field, or point
-  at the method-bound spelling `{ x(): f32 }`.
+  at the method-bound spelling `{ x(): f32 }`. Closed as D2093: it now does the latter.

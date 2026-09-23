@@ -53,12 +53,27 @@ A getter belongs to its **receiver type**, and it is found only through that typ
 
 - **Not writable.** `v.x = 1` and `v.x += 1` are refused, naming the getter. There are no
   setters.
-- **Not a field.** A value whose `x` is a getter does not satisfy a `{ x: f32 }` bound, and it
-  cannot be passed where a `{ x: f32 }` record is expected. A record type in VL is a layout and a
-  write permission, and a getter is neither. Generic code that wants "anything with a readable
-  `x`" asks for the method `{ x(): f32 }` instead.
+- **Not usable through a bound, yet.** A getter satisfies no bound. A value whose `x` is a
+  getter does not satisfy a `{ x: f32 }` bound, and it cannot be passed where a `{ x: f32 }`
+  record is expected, including an un-annotated parameter whose body reads `.x` (its inferred
+  type is that record). A record type in VL is a layout and a write permission, and a getter is
+  neither. It does not satisfy the method bound `{ x(): f32 }` either, because a getter is not
+  read with `()`. So a getter is for concrete code: a parameter typed as the receiver reads it.
+  When generic code needs the value, declare it as a method instead, which does satisfy
+  `{ x(): f32 }`:
+
+  ```vl
+  type Rgb = new i32
+  function r(self: Rgb): i32 { return ((self as! i32) >> 16) & 255 }
+  function red<T: { r(): i32 }>(t: T): i32 { return t.r() }
+  print(red(0x123456 as! Rgb))   // 18
+  ```
+
+  A type cannot have both a getter and a method named `x` (see above), so this is a choice made
+  once per property. Read-only structural bounds (`{ readonly x: f32 }`) are future work.
 - **Not a narrowing place.** `v.p` behaves like a call result: `if v.p != null { v.p.z }` does
-  not narrow the second read. Bind it first: `const p = v.p; if p != null { p.z }`.
+  not narrow the second read, and the refusal says so. Bind it to a local first:
+  `const p = v.p; if p != null { p.z }`.
 - **Not a method.** `v.x()` is refused, and the message names the getter `.x` read and says to drop the `()`.
 - **Not read through `?.`.** `?.` reads only a declared struct field, as it already refuses a
   built-in `.length`, so `v?.x` on a nullable receiver is refused by name. Narrow the receiver
@@ -81,15 +96,29 @@ not:
 Allowed: `let` / `const` locals (a local ends with its block), `if` and `match` expressions,
 reads of `self`'s fields and of module `const`s, other getters, `as` conversions, comparisons
 of scalars and of literal unions (a tag compare), a test against `null`, a string's `.length`
-and byte index, float `%` (bounded by the float format), and the pure intrinsics: loads,
-including linear-memory `__load_*` reads, lane operations and `__trap__`. A trap, from `as!` or
-an integer division, is allowed: the program stops either way.
+and byte index, float `%` (bounded by the float format), and the load and SIMD intrinsics:
+linear-memory `__load_*` reads, lane operations and `__trap__`. Scalar math builtins such as
+`sqrt`, `abs`, `min` and `max` are not on that list. A trap, from `as!` or an integer division,
+is allowed: the program stops either way.
 
 **The type rule.** A value's representation can allocate with no allocating syntax at all, so
 the result and every local must have a representation that never boxes: a scalar (or a brand of
 one), a literal union, a reference to an existing struct, list, map or string, or a null niche
 (a nullable struct, `string | null`, `boolean | null`). A value union such as `i32 | string`, or a
-nullable scalar such as `i32 | null`, is refused, and the refusal names the type.
+nullable scalar such as `i32 | null`, is refused, and the refusal names the type. In short: a
+getter cannot return a nullable number, but nullable strings, structs and booleans are fine.
+
+**When a body is refused, make it a method.** Every refusal names the construct, the rule it
+breaks and the fix, which is always available: the same declaration with `function` in place
+of `get`, read with `()`. A method has no body contract.
+
+```
+the getter `full` on Name concatenates strings, and a getter must not allocate — make it a
+method: `function full(self: Name): string`, called as `.full()`
+```
+
+One mistake is one error: a `+` chain is refused once, a boxed result once (at the result
+type), and a function called three times once.
 
 The contract is deliberately conservative. It will be relaxed, never tightened.
 
