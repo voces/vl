@@ -96,10 +96,12 @@ not:
 Allowed: `let` / `const` locals (a local ends with its block), `if` and `match` expressions,
 reads of `self`'s fields and of module `const`s, other getters, `as` conversions, comparisons
 of scalars and of literal unions (a tag compare), a test against `null`, a string's `.length`
-and byte index, float `%` (bounded by the float format), and the load and SIMD intrinsics:
-linear-memory `__load_*` reads, lane operations and `__trap__`. Scalar math builtins such as
-`sqrt`, `abs`, `min` and `max` are not on that list. A trap, from `as!` or an integer division,
-is allowed: the program stops either way.
+and byte index, float `%` (bounded by the float format), and every intrinsic that compiles to
+instructions with no effect but a trap: the scalar numeric ones (`sqrt`, `abs`, `floor`,
+`ceil`, `trunc`, `nearest`, `min`, `max`, `copysign`, `clz`, `ctz`, `popcnt`, `rotl`, `rotr`,
+`divU`, `remU`, the unsigned compares and the bitcasts), linear-memory `__load_*` reads, lane
+operations and `__trap__`. A trap, from `as!`, an integer division or `divU` by zero, is
+allowed: the program stops either way.
 
 **The type rule.** A value's representation can allocate with no allocating syntax at all, so
 the result and every local must have a representation that never boxes: a scalar (or a brand of

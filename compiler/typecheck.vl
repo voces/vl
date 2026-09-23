@@ -37244,7 +37244,7 @@ const GW_LOOP = "a getter must not loop"
 const GW_RECUR = "a getter must not recurse"
 const GW_EFFECT = "a getter must not have side effects"
 const GW_STATE = "a getter must not read mutable state"
-const GW_CALL = "a getter may call only other getters and the load and SIMD intrinsics"
+const GW_CALL = "a getter may call only other getters and the single-instruction numeric, load and SIMD intrinsics"
 const GW_OTHER = "a getter body may only compute a value from its receiver"
 
 // Getter row `gi`'s declared result type as a message spells it, or "" when it has none.
@@ -37395,19 +37395,22 @@ function getterLitUnionOk(ms: i32[]): boolean {
   true
 }
 
-// The intrinsics a getter may call: loads, the pure lane and vector operations, the two heap
-// window reads and a trap. Stores, memory growth and copies, prints and host calls have an
-// effect or allocate. Exact names: a user binding that merely looks like one is not one.
-const getterIntrinsics = [
-  "__load_i32__", "__load_i64__", "__load_f32__", "__load_f64__", "__load_u8__",
-  "__load_u16__", "__load_i8__", "__load_i16__", "__load_v128__",
-  "__extract_lane_f32x4__", "__replace_lane_f32x4__", "__splat_f32x4__",
-  "__shuffle_f32x4__", "__bitselect_v128__", "__add_f32x4__", "__sub_f32x4__",
-  "__mul_f32x4__", "__div_f32x4__", "__min_f32x4__", "__max_f32x4__",
-  "__sqrt_f32x4__", "__abs_f32x4__", "__eq_f32x4__", "__ne_f32x4__",
-  "__lt_f32x4__", "__le_f32x4__", "__gt_f32x4__", "__ge_f32x4__", "__trap__",
-  "__heap_base__", "__heap_limit__",
-]
+// Whether `nm` names an intrinsic a getter may call: one the emitter lowers inline to
+// instructions whose only possible effect is a trap — a numeric opcode, a linear-memory load, a
+// SIMD value operation, the heap window, `__trap__`. Read off the emitter's own classifiers, so
+// a new member joins here; a result-less intrinsic (every store) is refused for having no value.
+function getterIntrinsicName(nm: string): boolean {
+  if isNumIntrinsicName(nm) { return true }
+  if nm == "__load_i32__" || nameIsMemLoadIntrinsic(nm) { return true }
+  if nameIsSimdIntrinsic(nm) {
+    const ft = lookup(nm)
+    if ft < 0 { return false }
+    const f = T.tys[ft]
+    if f is TyFunc { return f.fnRet != TY_VOID }
+    return false
+  }
+  nm == "__trap__" || nm == "__heap_base__" || nm == "__heap_limit__"
+}
 
 // Whether callee name `nm` is one of those intrinsics and nothing else: no local, module
 // binding, function or extern of the program carries the name.
@@ -37416,12 +37419,7 @@ function getterIntrinsicOk(nm: string): boolean {
   if moduleGlobals[nm] ?? false { return false }
   if fnDeclIx.has(nm) { return false }
   if externLinkOf(nm) >= 0 { return false }
-  let i = 0
-  while i < getterIntrinsics.length {
-    if getterIntrinsics[i] == nm { return true }
-    i = i + 1
-  }
-  false
+  getterIntrinsicName(nm)
 }
 
 // Whether `name` is one of the walked getter's own locals (`self` or a `let`/`const` it declared).
@@ -37799,6 +37797,8 @@ function gwCall(n: Call, ix: i32) {
       getterCallErr("calls the host function `" + nm + "`", GW_EFFECT, ix)
     } else if gwIsLocal(nm) || (moduleGlobals[nm] ?? false) {
       getterCallErr("calls the function value `" + nm + "`", GW_CALL, ix)
+    } else if fnDeclIx.has(nm) {
+      getterCallErr("calls the function `" + nm + "`", GW_CALL, ix)
     } else if !getterIntrinsicOk(nm) {
       getterCallErr("calls `" + nm + "`", GW_CALL, ix)
     }
