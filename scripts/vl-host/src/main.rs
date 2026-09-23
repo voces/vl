@@ -1040,6 +1040,16 @@ fn seed_engine(collector: Collector) -> Result<Engine> {
 /// `seed_engine` with an optional first GC heap size (`gc_heap_initial_size`).
 fn seed_engine_sized(collector: Collector, initial: Option<u64>) -> Result<Engine> {
     let mut cfg = gc_config(collector);
+    // The compiler recurses once per nesting level of the program it reads, about half a
+    // KiB a level, so wasmtime's default 512 KiB stack capped a function at ~950 nested
+    // blocks (D2182). `main` backs the larger cap with a native stack of its own, and
+    // pages are committed only as deep as a compile goes. Without that thread the default
+    // stays: a wasm cap past the native stack aborts the process instead of trapping. wasmtime
+    // refuses a wasm stack larger than its async stack, though this host never runs async.
+    if ON_SEED_STACK_THREAD.load(Ordering::Relaxed) {
+        cfg.async_stack_size(SEED_WASM_STACK + (1 << 20));
+        cfg.max_wasm_stack(SEED_WASM_STACK);
+    }
     if let Some(bytes) = initial {
         cfg.gc_heap_initial_size(bytes);
     }
@@ -6750,8 +6760,42 @@ fn report(err: Error) -> ! {
     });
 }
 
+/// The wasm stack every compiler-seed engine may use: room for about a million nested
+/// blocks, so a program's nesting depth is bounded by the compile's memory and time
+/// rather than by the stack (D2182). Only `main`'s thread runs the seed.
+const SEED_WASM_STACK: usize = 512 << 20;
+
+/// The native stack `main` runs on: the seed's wasm stack plus headroom for the host's
+/// own frames and wasmtime's trap handling beneath it.
+const MAIN_THREAD_STACK: usize = SEED_WASM_STACK + (64 << 20);
+
+/// Set by the `MAIN_THREAD_STACK` thread as it starts, and only there: `seed_engine_sized`
+/// raises the wasm stack only when the native stack beneath it can hold it.
+static ON_SEED_STACK_THREAD: AtomicBool = AtomicBool::new(false);
+
 fn main() {
-    let r = real_main();
+    // A process's first thread has the stack its OS gave it (8 MiB on Linux, 1 MiB on
+    // Windows), smaller than `SEED_WASM_STACK`, so the host runs on a thread sized for
+    // it. A platform that refuses the reservation runs on the first thread with wasmtime's
+    // default stack, as before D2182. `$VL_SEED_STACK=default` takes that path on purpose,
+    // so the fallback can be tested.
+    let fallback = std::env::var("VL_SEED_STACK").is_ok_and(|v| v == "default");
+    let spawned = if fallback {
+        None
+    } else {
+        std::thread::Builder::new()
+            .name("vl".to_string())
+            .stack_size(MAIN_THREAD_STACK)
+            .spawn(|| {
+                ON_SEED_STACK_THREAD.store(true, Ordering::Relaxed);
+                real_main()
+            })
+            .ok()
+    };
+    let r = match spawned {
+        Some(h) => h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)),
+        None => real_main(),
+    };
     // Before `report`, which exits: a failed compile is often the one worth
     // profiling, and a profile that is never written says nothing at all.
     finish_guest_profile();

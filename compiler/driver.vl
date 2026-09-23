@@ -2222,10 +2222,63 @@ function declAnchorTokIx(nodeIx: i32): i32 {
   -1
 }
 
-// The token a module-scope statement's diagnostic anchors at: its declaring name
-// where it has one, else its first token. D1594 — `nodeToks` anchors at the last
-// token consumed, so a thirty-line `if` chain anchored at its closing brace instead,
-// nowhere near the code. Walks back rather than binary-searching `P.toks`.
+// A min-tree over the tokens' start offsets, built by `emitSrcSection` for its own rows and
+// dropped after. Node 1 is the root, node `k` has children `2k` and `2k + 1`, and leaf
+// `satSize + t` holds `P.toks[t].start`; the padding leaves hold the largest i32.
+let satMin: i32[] = []
+let satSize = 0
+let satLive = false
+
+function satBuild() {
+  const n = P.toks.length
+  let sz = 1
+  while sz < n { sz = sz * 2 }
+  satMin = []
+  let k = 0
+  while k < 2 * sz {
+    satMin.push(2147483647)
+    k = k + 1
+  }
+  k = 0
+  while k < n {
+    satMin[sz + k] = P.toks[k].start
+    k = k + 1
+  }
+  k = sz - 1
+  while k >= 1 {
+    const l = satMin[2 * k]
+    const r = satMin[2 * k + 1]
+    if l < r { satMin[k] = l } else { satMin[k] = r }
+    k = k - 1
+  }
+  satSize = sz
+  satLive = true
+  0
+}
+
+function satDrop() {
+  satMin = []
+  satSize = 0
+  satLive = false
+  0
+}
+
+// The largest token index `t <= last` in node `node`'s span `[nl, nr]` whose start is at or
+// before `at`, or -1 when none is.
+function satFind(node: i32, nl: i32, nr: i32, last: i32, at: i32): i32 {
+  if node < 1 || node >= satMin.length { return -1 }
+  if nl > last || satMin[node] > at { return -1 }
+  if nl == nr { return nl }
+  const mid = nl + (nr - nl) / 2
+  const right = satFind(2 * node + 1, mid + 1, nr, last, at)
+  if right >= 0 { return right }
+  satFind(2 * node, nl, mid, last, at)
+}
+
+// The token a module-scope statement's diagnostic anchors at: its declaring name, else its
+// first token rather than `nodeToks`' closing one — the first, walking back from the last, that
+// starts at or before the node. `emitSrcSection` asks this of every statement, so there
+// `satFind` answers it instead of a walk as long as the statement (D2190).
 function stmtAnchorTokIx(nodeIx: i32): i32 {
   const nm = declNameTokOf(nodeIx)
   if nm >= 0 && nm < P.toks.length { return nm }
@@ -2234,6 +2287,11 @@ function stmtAnchorTokIx(nodeIx: i32): i32 {
   if last < 0 || last >= P.toks.length { return -1 }
   const at = nodePos(nodeIx)
   if at < 0 { return last }
+  if satLive && satSize >= P.toks.length {
+    const found = satFind(1, 0, satSize - 1, last, at)
+    if found >= 0 && P.toks[found].start == at { return found }
+    return last
+  }
   let t = last
   while t >= 0 {
     const s = P.toks[t].start
@@ -2327,6 +2385,7 @@ function emitSrcSection(): i32 {
   if emitFnSpanStart.length == 0 { return 0 }
   // The file table, in module order, through the one speller the name section's own suffix
   // uses — so the two cannot spell a file two ways (open-rulings §trap-frame-path-spelling).
+  satBuild()
   const files: string[] = []
   let r = 0
   while r < emitFnSpanStart.length {
@@ -2366,6 +2425,7 @@ function emitSrcSection(): i32 {
     i = i + 1
   }
   wTarget(prev)
+  satDrop()
   const sec: u8[] = []
   const secPrev = wTarget(sec)
   wName("vl-src")

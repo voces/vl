@@ -668,6 +668,39 @@ axis(
   (d) => twoFiles(d, genFrameLocals(2500, 1), genFrameLocals(2500, 50)),
 );
 
+// N levels of blocks, labelled loops and `if`s, nested in one arm and side by side in the
+// other: the same statements, only the depth differs.
+const genNesting = (n: number, nested: boolean): string => {
+  const open: string[] = [];
+  const close: string[] = [];
+  for (let k = 0; k < n; k++) {
+    const kind = k % 3;
+    open.push(
+      kind === 0
+        ? "{ const m = acc + 1; acc = m; "
+        : kind === 1
+        ? `L${k}: while true { acc = acc + 1; `
+        : "if a > 0 { acc = acc + 1; ",
+    );
+    close.push(kind === 1 ? `acc = acc + 1; break L${k} } ` : "} ");
+  }
+  const body = nested
+    ? open.join("") + [...close].reverse().join("")
+    : open.map((o, k) => o + close[k]).join("");
+  return `function f(a: i32): i32 {\n  let acc = 0\n  ${body}\n  acc\n}\nprint(f(1))\n`;
+};
+
+// A pass that re-walked a level's whole subtree once per level was quadratic in the depth:
+// a guard's `stmtAlwaysExits`, a scope-chain lookup, a loop's hoist scan (D2190). Measured
+// 2026-09-23: 0.62 / 0.56 / 1.11, and 6.60 / 0.39 / 16.50 on the seed before D2190. The many
+// arm needs a host whose compiler stack holds 6,000 levels (D2182).
+axis(
+  "nesting depth",
+  2.5,
+  "A pass is re-walking each nested statement's whole subtree once per level (D2190).",
+  (d) => twoFiles(d, genNesting(6000, true), genNesting(6000, false)),
+);
+
 // ── the one RUNTIME axis ─────────────────────────────────────────────────────
 // Every pair above grades COMPILE time, because every cost above is the compiler's. String
 // building is the exception: the cost lands in the EMITTED program, so this pair builds
