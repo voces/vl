@@ -335,3 +335,18 @@ Deno.test({
     }
   },
 });
+
+Deno.test({
+  name: "extern: a module-scope loop variable spelled like an extern is the variable, not the import",
+  ignore: !ENABLED,
+  fn: async () => {
+    const mod = await buildModule(`${CASES}/loop-var-shadows-extern.vl`);
+    const logs: string[] = [];
+    const { imports } = vlHostImports(logs);
+    new WebAssembly.Instance(mod, { imports, extern: { g: () => 999 } });
+    const want = "11,21,12,22,999";
+    if (logs.join(",") !== want) {
+      throw new Error(`want logs ${want}, got ${logs.join(",")}`);
+    }
+  },
+});

@@ -24015,6 +24015,17 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
     if nodeIsTplHole(args[i]) {
       if tplHoleHandled(ix, n.pos, args[i], at, params[i]) { return TY_STR }
     }
+    // A void argument would bind a type parameter to `void`, which no instance can carry; a
+    // concrete parameter already refuses it through `assignable`, with its own message.
+    if tyHasTyVar(params[i]) || tyIsHole(params[i]) {
+      if isVoidTy(at) && !voidSlotExemptExpr(args[i]) {
+        tErr(
+          "argument " + i32ToStr(i + 1) + " expects a value, got void",
+          args[i],
+        )
+        return TY_ERR
+      }
+    }
     // Bind every TyVar reachable in the expected param position from the
     // argument's shape (first use wins), then check the argument against the
     // SUBSTITUTED expected type — a later disagreeing use errors here.
@@ -29132,6 +29143,19 @@ function externBadTy(name: string, what: string, spelling: string, tok: i32) {
   0
 }
 
+// The refusal for an extern with no return type, naming the fix: an extern has no body to
+// infer a result from, so the author states it, `: void` included.
+function externNoRetErr(name: string, tok: i32) {
+  externErr(
+    "extern `" +
+      name +
+      "` has no return type — an extern has no body to infer one from; write `: void` " +
+      "for an extern that returns nothing",
+    tok,
+  )
+  0
+}
+
 // Declare every `extern function` the module graph carries, and refuse the two shapes that
 // cannot become one import: a type that does not cross, and two declarations of one link name
 // whose signatures disagree. Runs before `checkNode` so a call in any module resolves.
@@ -29160,17 +29184,8 @@ function checkExternDecls() {
     // `: void` is a result-less import. No annotation at all is refused rather than read as
     // void: an extern has no body to infer a result from, so the author has to say which.
     let rt = TY_VOID
-    if rs == "" {
-      externErr(
-        "extern `" +
-          nm +
-          "` has no return type — an extern has no body to infer one from; write `: void` " +
-          "for an extern that returns nothing",
-        tok,
-      )
-    } else if rs != "void" {
-      rt = externScalarTy(nm, "returns", rs, tok)
-    }
+    if rs == "" { externNoRetErr(nm, tok) }
+    else if rs != "void" { rt = externScalarTy(nm, "returns", rs, tok) }
     linkTys.push(mkFuncTy(ptys, rt))
     k = k + 1
   }
@@ -29182,7 +29197,16 @@ function checkExternDecls() {
   while d < externDeclCount() {
     const link = extDeclLink[d]
     if link >= 0 && link < linkTys.length {
-      if extSigs[link] != extDeclSig[d] {
+      const dsig = extDeclSig[d]
+      if (
+        extSigs[link] != dsig &&
+        dsig.length >= 2 &&
+        dsig.slice(dsig.length - 2, dsig.length) == "->"
+      ) {
+        // This declaration names no return type while an earlier one does: the fix is the
+        // annotation, not agreement with the other declaration.
+        externNoRetErr(extNames[link], extDeclPos[d])
+      } else if extSigs[link] != dsig {
         externErr(
           "extern `" +
             extNames[link] +
@@ -33529,6 +33553,13 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
   }
   // Equality: result bool; requires mutual compatibility.
   if op == "==" || op == "!=" {
+    // A void operand leaves nothing to compare (a call to a `: void` function or extern).
+    if voidValueSlotErr(lt, n.binLeft, "`" + op + "`", n.binLeft) {
+      return TY_BOOL
+    }
+    if voidValueSlotErr(rt, n.binRight, "`" + op + "`", n.binRight) {
+      return TY_BOOL
+    }
     // A null test asks about the storage, not the flow-narrowed type — a narrowing does not
     // change storage, so `isAsgNarrowedName` exempts exactly the bindings an assignment narrowed.
     if isNullTy(lt) || isNullTy(rt) {

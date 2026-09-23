@@ -50,7 +50,7 @@ for an extern that returns nothing
 
 A `: void` extern's call is a statement. Using it where a value is needed is refused the same
 way a `void` function's result is — `const x = log(1)`, `print(log(1))`, `return log(1)` from a
-function declared to return `i32`. `void` is a return type only; a parameter cannot be `void`.
+function declared to return `i32`, `log(1) == log(2)`, or passing it to a generic `id(log(1))`. `void` is a return type only; a parameter cannot be `void`.
 
 ## Providing the imports from JavaScript
 
