@@ -150,13 +150,17 @@ if e != null { print(e.msg) } else { print("ok") }
       const got: Record<string, { secs: number; rssKiB: number }> = {};
       for (const [name, src] of Object.entries(progs)) {
         const wasm = await build(dir, name, src);
-        let best = { secs: Infinity, rssKiB: -1 };
+        const best = { secs: Infinity, rssKiB: -1 };
         // Best of three: the box is shared, and the minimum is the least contended reading.
+        // Each measure takes its own minimum — the fastest run need not be the leanest one.
         for (let rep = 0; rep < 3; rep++) {
           await Deno.remove(path).catch(() => {});
           const r = await runBuilt(wasm);
           check(r.out, "ok", `${name} did not finish cleanly`);
-          if (r.secs < best.secs) best = { secs: r.secs, rssKiB: r.rssKiB };
+          if (r.secs < best.secs) best.secs = r.secs;
+          if (r.rssKiB >= 0 && (best.rssKiB < 0 || r.rssKiB < best.rssKiB)) {
+            best.rssKiB = r.rssKiB;
+          }
         }
         got[name] = best;
         if (name === "fill_only") continue;
