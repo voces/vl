@@ -60,8 +60,8 @@ D2020-D2029  vl-11  2026-09-22  PL-003(b) and follow-ups
 D2030-D2039  vl-11  2026-09-22  getters v1 lanes
 D2040-D2049  vl-11  2026-09-22  review follow-ups 3
 D2050-D2059  vl-11  2026-09-22  review follow-ups 4
+D2060-D2069  vl-11  2026-09-22  persona review defects
 D2093-D2099  vl-11  2026-09-22  getter diagnostics follow-ups (G3 field-bound message)
 D2110-D2119  vl-11  2026-09-23  function-list calls (PR #3050)
-D2060-D2069  vl-11  2026-09-22  persona review defects
 D2120-D2129  vl-11  2026-09-23  getter step budget lane (D2061-D2063 residue; D2120 filed)
 D2135-D2144  vl-11  2026-09-23  effects summary s1 (getters call qualifying functions)

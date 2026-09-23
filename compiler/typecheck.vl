@@ -78,6 +78,7 @@ import {
   mkLet,
   mkNum,
   mkParen,
+  mkUnionDecl,
   nodeIsTplHole,
   nodeValueChildren,
   restParamIndex,
@@ -1733,7 +1734,7 @@ function asgReadElemPin(exprIx: i32, vt: i32) {
     const t = T.tys[asgOpenElemRow]
     if t is TyArray {
       if t.aElem >= 0 { return -1 }
-      t.aElem = vt
+      t.aElem = widenLitTy(vt)
       tyMutEpoch = tyMutEpoch + 1 // the store's own value pinned the element in place
       const el = arrElemValueTy(vt)
       // The read's recorded type too, for `arrDefOperandElemPeek`'s reason: `checkNode` banked
@@ -3877,6 +3878,14 @@ export function initChecker() {
   cUnionTyIxs = []
   cUnionTyIxSet = []
   cUnionNames = []
+  luPosByKey = Map()
+  luPosByTy = []
+  luIxCursor = 0
+  luPending = []
+  wideLitTyIxs = []
+  wideLitByNode = []
+  luHiddenTyIxs = []
+  luSynthDone = false
   gaAppTyIxs = []
   gaAppTyIxSet = []
   gaAppHeads = []
@@ -7410,7 +7419,43 @@ export function demangleName(nm: string) {
 // diagnostic message: the merge renames a module's declarations and the parser renames a
 // body-scoped `type` (D1045), both internal names that must not surface. The two suffixes compose,
 // and the scan handles that by restarting after the digits. One home, in `tyname.demangleSpelling`.
-export function demangleMsg(s: string) { demangleSpelling(s) }
+export function demangleMsg(s: string) {
+  inlineLitUnionUnhide(demangleSpelling(s))
+}
+
+// Replaces each hidden inline-literal-union alias (`#lu3`) in a message with its member set,
+// parenthesized before an array suffix, so a canon-rendered spelling reads as the source does.
+function inlineLitUnionUnhide(s: string): string {
+  let h = 0
+  while h < s.length && s[h] != '#' { h = h + 1 }
+  if h == s.length { return s }
+  let out = ""
+  let i = 0
+  while i < s.length {
+    if (
+      s[i] == '#' &&
+      i + 3 < s.length &&
+      s.slice(i, i + 3) == inlineLitUnionPrefix
+    ) {
+      let j = i + 3
+      while j < s.length && s[j] >= '0' && s[j] <= '9' { j = j + 1 }
+      const hit = cUserTypes[s.slice(i, j)]
+      if j > i + 3 && hit is i32 {
+        let r = tyToStructStr(hit)
+        if j < s.length && s[j] == '[' { r = "(" + r + ")" }
+        out = out + r
+        i = j
+      } else {
+        out = out + s.slice(i, i + 1)
+        i = i + 1
+      }
+    } else {
+      out = out + s.slice(i, i + 1)
+      i = i + 1
+    }
+  }
+  out
+}
 
 // Bind `name` to type-arena index `ty` in the innermost scope.
 export function declare(name: string, ty: i32) {
@@ -8788,6 +8833,14 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
   // `f32[]` is the `ArrayLit` recursion in the literal-aware block below, not this arm.
   if primNameOf(dstTy) == "i32" {
     if primNameOf(srcTy) == "boolean" && !isBoolLitExpr(srcExpr) { return true }
+  }
+  // A `const` literal, or a join of them, read as `string`: a literal-typed destination takes it at
+  // the literal type it is, in a list or object literal exactly as at an argument (D2157).
+  if srcExpr >= 0 && srcExpr < wideLitByNode.length {
+    const uw = wideLitByNode[srcExpr]
+    if uw >= 0 && uw != srcTy {
+      if assignable(uw, dstTy) { return true }
+    }
   }
   // A literal-typed destination: a bare literal flows wherever its literal type is a member (`"a"`
   // into `"a" | "b"`), even though its softened base (`string`) does not.
@@ -10240,7 +10293,59 @@ function annUnionInnerTy(members: i32[], hasNull: boolean): i32 {
   // K = "aa"|"bb"` must resolve to the same index canon spells `K`, or the two producers disagree.
   const lal = litUnionAliasTyOfMembers(flat)
   if lal >= 0 { return lal }
-  mkUnionTy(flat)
+  const fresh = mkUnionTy(flat)
+  if tyIsLitUnion(fresh) { registerInlineLitUnion(fresh) }
+  fresh
+}
+
+// Registers an inline string-literal union as a hidden alias, so it takes the interned-atom
+// rep at every position exactly as `type K = "a" | "b"` does (D2150). The name starts with `#`,
+// which no identifier can, and `tyToStr` renders it back as its member set.
+function registerInlineLitUnion(ix: i32) {
+  if luSynthDone { return 0 }
+  luHiddenTyIxs.push(ix)
+  const nm = inlineLitUnionPrefix + i32ToStr(cUnionNames.length)
+  cTyIxSetAdd(cUnionTyIxs, cUnionTyIxSet, ix)
+  cUnionNames.push(nm)
+  cUserTypes[nm] = ix
+  cUserTypesVer = cUserTypesVer + 1
+  0
+}
+
+const inlineLitUnionPrefix = "#lu"
+
+// The hidden aliases this program registered, and whether their declarations are written yet:
+// one minted after that (an emit-phase annotation) keeps the string rep, since no declaration
+// would carry it to the emitter's union tables.
+let luHiddenTyIxs: i32[] = []
+let luSynthDone = false
+
+// Appends one `UnionDecl` per hidden alias to the program's statements, ahead of canon, so
+// every emitter pass that walks declarations sees `#luN` exactly as it sees a written alias.
+function synthInlineLitUnionDecls(rootIx: i32) {
+  luSynthDone = true
+  const root = P.nodes[rootIx]
+  if root is Program {
+    let i = 0
+    while i < luHiddenTyIxs.length {
+      const ix = luHiddenTyIxs[i]
+      const texts = tyLitMemberTexts(ix)
+      const vs: string[] = []
+      let k = 0
+      while k < texts.length {
+        vs.push("\"" + texts[k] + "\"")
+        k = k + 1
+      }
+      const nm = unionAliasDeclNameOfTy(ix)
+      if nm != "" {
+        const d = mkUnionDecl(nm, vs, 0, 0)
+        root.progStmts.push(d)
+        cFillStmtIx[nm] = d
+      }
+      i = i + 1
+    }
+  }
+  0
 }
 
 // The whole union type an `A | B | null` spelling denotes: `annUnionInnerTy` over the
@@ -11734,12 +11839,11 @@ export function structNameOfTy(ty: i32): string {
 // generalized to value unions.
 export function unionAliasDeclNameOfTy(ty: i32): string {
   if ty < 0 { return "" }
-  let i = 0
-  while i < cUnionTyIxs.length {
-    if cUnionTyIxs[i] == ty { return cUnionNames[i] }
-    i = i + 1
-  }
-  ""
+  luIndexSync()
+  if ty >= luPosByTy.length { return "" }
+  const a = luPosByTy[ty]
+  if a < 0 { return "" }
+  cUnionNames[a]
 }
 
 // Does arena type `ix` reach itself — is its expansion cyclic? The guard the nominal
@@ -18521,7 +18625,8 @@ function tplHoleHandled(
   at: i32,
   expected: i32,
 ) {
-  if isStringTy(at) {
+  // A string-literal type or a union of them is a set of strings, delivered as one (D1485).
+  if isStringTy(softenLitTy(at)) {
     arenaReplaceNode(callIx, mkParen(holeIx, callPos))
     return true
   }
@@ -21180,7 +21285,7 @@ export function bindGenWalk(
     if primNameOf(atIx) == "u8" { return 0 }
     if bindOf(bNames, bTys, e.tvName) < 0 {
       bNames.push(e.tvName)
-      bTys.push(atIx)
+      bTys.push(widenLitTy(atIx))
     }
     return 0
   }
@@ -23669,6 +23774,7 @@ function checkMemberCallNode(
   // callee against the value its guard admits, not against the `| null` the guard strips.
   let recvTy = recvPre
   if recvPre < 0 { recvTy = checkNode(recvIx) }
+  if recvTy >= 0 { recvTy = strLitRecvTy(recvTy) }
   let rt = T.tys[recvTy]
   // An un-annotated hole receiving an array method (`self.map`/`.push`/…) is constrained to
   // an array — synthesizing one over a derived element hole and falling into the array-method
@@ -23735,7 +23841,7 @@ function checkMemberCallNode(
             // The first `.push(v)` on a bare empty `[]` pins its element type to `typeof v` in
             // place — the usage-driven inference that resolves an un-annotated `const xs = []`; a later conflicting push is then a clean type error.
             if rt.aElem < 0 {
-              rt.aElem = pat
+              rt.aElem = widenLitTy(pat)
               tyMutEpoch = tyMutEpoch + 1 // `.push` pinned the element in place
             } else {
               // The pushed value's own open holes pin from the element slot — the same rule
@@ -23887,14 +23993,14 @@ function checkMemberCallNode(
         if rt.mVal >= 0 { seedExpected(margs2[1], rt.mVal) }
         const v0 = checkNode(margs2[1])
         if rt.mKey < 0 {
-          rt.mKey = k0
+          rt.mKey = widenLitTy(k0)
           tyMutEpoch = tyMutEpoch + 1 // `.set` pinned the key in place
-          checkInferredMapKey(k0, rt.mSet, ix)
+          checkInferredMapKey(rt.mKey, rt.mSet, ix)
         } else if !bmArgOk(BM_SETKEY, "set", k0, rt.mKey, -1, margs2[0]) {
           tErr(bmArgMsg(BM_SETKEY, "set", k0, rt.mKey, -1), ix)
         }
         if rt.mVal < 0 {
-          rt.mVal = v0
+          rt.mVal = widenLitTy(v0)
           tyMutEpoch = tyMutEpoch + 1 // `.set` pinned the value in place
         } else {
           // The value argument's own open holes pin from the slot, the third step
@@ -23931,9 +24037,9 @@ function checkMemberCallNode(
       } else {
         const ka = checkNode(margs2[0])
         if rt.mKey < 0 {
-          rt.mKey = ka
+          rt.mKey = widenLitTy(ka)
           tyMutEpoch = tyMutEpoch + 1 // `.add` pinned the Set key in place
-          checkInferredMapKey(ka, rt.mSet, ix)
+          checkInferredMapKey(rt.mKey, rt.mSet, ix)
         } else if !bmArgOk(BM_ADDKEY, "add", ka, rt.mKey, -1, margs2[0]) {
           tErr(bmArgMsg(BM_ADDKEY, "add", ka, rt.mKey, -1), ix)
         }
@@ -26134,6 +26240,9 @@ function finishInferredReturn(
     }
     if inferred != preAdopt { cbSeedUsed = cbSeedUsed + 1 }
   }
+  // A `const` literal returned is the `string` it is stored as, so a join with `null`, a number
+  // or a record meets the return floors below exactly as that string does (D2157).
+  inferred = widenLitTy(inferred)
   // Permissive fall-through (totality): an un-annotated function that can fall off the end
   // implicitly yields `null` there, so its inferred return widens to `T | null`. A box-able
   // value type lowers un-annotated via the `uBoxIdx` box; a niche (`boolean`/`string`) widens
@@ -27806,6 +27915,9 @@ function checkProgramNode(n: Program) {
             else { mty = TY_I64 }
           } else if initN is StrLit {
             mty = TY_STR
+            if sm.letKw == "const" {
+              mty = mkWideStrLitTy(initN.strText, TY_STR)
+            }
           } else if initN is CharLit {
             mty = TY_I32
           } else if initN is BoolLit {
@@ -28541,7 +28653,11 @@ function checkNodeDone(ix: i32, t: i32, savedTail: boolean) {
   }
   if !inferQuiet {
     if ix >= 0 {
-      if ix < nodeTyIx.length { nodeTyIx[ix] = t }
+      // A widening literal is recorded as its base: the emitter lowers the value as the
+      // `string` it is stored as, and asks `nodeWideStrLitText` where the literal matters.
+      const wt = widenLitTy(t)
+      if ix < nodeTyIx.length { nodeTyIx[ix] = wt }
+      if wt != t { noteWideLitNode(ix, t) }
     }
     if v128Seen { v128NestCheck(ix, t) }
     noteNestCstr(t, ix)
@@ -30694,6 +30810,7 @@ export function checkProgram(rootIx: i32) {
   flushUninferred(0)
   // …and with every pin now in, grade what `__array_new_default__` needed to default.
   checkArrayNewDefaultElems()
+  synthInlineLitUnionDecls(rootIx)
   // Rewrite literal/intersection annotation names into the emitter's runtime vocabulary —
   // membership is already enforced above; names without those constructs are untouched.
   canonEmitTypeNames()
@@ -30773,7 +30890,8 @@ export function topLetScalarOf(name: string): string {
 // emitter — its name at top level, `#<nodeIx>` for a nested named function, whose name is
 // not unique and whose binding is gone once its enclosing scope pops (D1966).
 function a20RecordFn(key: string, efn: FuncDecl, eftt: TyFunc) {
-  const er = eftt.fnRet
+  // A join of `const` literals is recorded as the `string` its reads are (D2157).
+  const er = widenLitTy(eftt.fnRet)
   // Generic functions skip (a `self` marker, an un-annotated param, or a deferred-join
   // return) — their type is per-call-site and would export a misleading or wrong name.
   let generic = false
@@ -32340,11 +32458,8 @@ export function nodeTyIsNulLitUnion(ix: i32) {
 export function litUnionAliasNameOfTy(ty: i32) {
   if ty < 0 { return "" }
   if !tyIsLitUnion(ty) { return "" }
-  let i = 0
-  while i < cUnionTyIxs.length {
-    if cUnionTyIxs[i] == ty { return cUnionNames[i] }
-    i = i + 1
-  }
+  const own = unionAliasDeclNameOfTy(ty)
+  if own != "" { return own }
   // Structural fallback: an annotation position may rebuild the alias's member union at a
   // fresh arena index, so matching by member-literal set (not index) is exact, not a guess.
   const tu = T.tys[ty]
@@ -32365,35 +32480,9 @@ export function litUnionAliasNameOfTy(ty: i32) {
 // "42"]` -> "K0"), or "" — shared by the structural fallback above and the
 // flattened-member regroup in `variantBoxUnionRetName`.
 export function litUnionAliasOfLitTexts(texts: string[]): string {
-  if texts.length == 0 { return "" }
-  let a = 0
-  while a < cUnionTyIxs.length {
-    if tyIsLitUnion(cUnionTyIxs[a]) {
-      const rt = T.tys[cUnionTyIxs[a]]
-      if rt is TyUnion {
-        if rt.uMembers.length == texts.length {
-          let all = true
-          let m = 0
-          while m < texts.length {
-            let found = false
-            let r = 0
-            while r < rt.uMembers.length {
-              const rm = T.tys[rt.uMembers[r]]
-              if rm is TyLit {
-                if rm.litText == texts[m] { found = true }
-              }
-              r = r + 1
-            }
-            if !found { all = false }
-            m = m + 1
-          }
-          if all { return cUnionNames[a] }
-        }
-      }
-    }
-    a = a + 1
-  }
-  ""
+  const a = luPosOfTexts(texts)
+  if a < 0 { return "" }
+  cUnionNames[a]
 }
 // The registered litunion alias's own arena index whose member set is exactly the str-literal
 // types `members`, or -1 — the arena twin of `litUnionAliasOfLitTexts`, needed because an
@@ -32413,37 +32502,96 @@ export function litUnionAliasTyOfMembers(members: i32[]): i32 {
     }
     i = i + 1
   }
-  let a = 0
-  while a < cUnionTyIxs.length {
-    const ti = cUnionTyIxs[a]
-    if tyIsLitUnion(ti) {
-      const rt = T.tys[ti]
-      if rt is TyUnion {
-        // An exact set, both directions: `>=` here would be a silent type widening — a
-        // 2-member annotation could adopt a 4-member alias's index and narrow wrongly.
-        if rt.uMembers.length == texts.length {
-          let all = true
-          let mi = 0
-          while mi < texts.length {
-            let found = false
-            let r = 0
-            while r < rt.uMembers.length {
-              const rm = T.tys[rt.uMembers[r]]
-              if rm is TyLit {
-                if rm.litText == texts[mi] { found = true }
-              }
-              r = r + 1
-            }
-            if !found { all = false }
-            mi = mi + 1
-          }
-          if all { return ti }
-        }
+  const a = luPosOfTexts(texts)
+  if a < 0 { return -1 }
+  cUnionTyIxs[a]
+}
+
+// —— the member-set index over registered unions ——
+// `cUnionTyIxs` position of the first registered literal union per member-set key, the first
+// position per arena index, and the registrations not yet indexed. A declaration registers an
+// empty placeholder that pass 0b fills later, so an entry with no members yet stays pending.
+let luPosByKey: {[string]: i32} = Map()
+let luPosByTy: i32[] = []
+let luIxCursor = 0
+let luPending: i32[] = []
+
+// The order-free key of a literal member set: its distinct texts sorted, each length-prefixed so
+// no text can spell a separator.
+function luSetKey(texts: string[]): string {
+  const sorted: string[] = []
+  let i = 0
+  while i < texts.length {
+    const t = texts[i]
+    let dup = false
+    let k = 0
+    while k < sorted.length {
+      if sorted[k] == t { dup = true }
+      k = k + 1
+    }
+    if !dup {
+      sorted.push(t)
+      let j = sorted.length - 1
+      while j > 0 && sorted[j - 1] > sorted[j] {
+        const tmp = sorted[j - 1]
+        sorted[j - 1] = sorted[j]
+        sorted[j] = tmp
+        j = j - 1
       }
     }
-    a = a + 1
+    i = i + 1
   }
-  -1
+  let key = ""
+  let q = 0
+  while q < sorted.length {
+    key = key + i32ToStr(sorted[q].length) + ":" + sorted[q]
+    q = q + 1
+  }
+  key
+}
+
+// The first registered literal union whose member set is exactly `texts`, as a `cUnionTyIxs`
+// position, or -1.
+function luPosOfTexts(texts: string[]): i32 {
+  if texts.length == 0 { return -1 }
+  luIndexSync()
+  luPosByKey[luSetKey(texts)] ?? -1
+}
+
+// Indexes position `a` under its member set when it is a filled literal union; true when it is
+// still an empty placeholder. An earlier position displaces a later one, so a declaration that
+// fills after a hidden alias of its set still comes first.
+function luIndexPos(a: i32): boolean {
+  const ty = cUnionTyIxs[a]
+  const t = T.tys[ty]
+  if t is TyUnion {
+    if t.uMembers.length == 0 { return true }
+  }
+  if !tyIsLitUnion(ty) { return false }
+  const key = luSetKey(tyLitMemberTexts(ty))
+  const cur = luPosByKey[key] ?? -1
+  if cur < 0 || a < cur { luPosByKey[key] = a }
+  false
+}
+
+function luIndexSync() {
+  if luIxCursor == cUnionTyIxs.length && luPending.length == 0 { return 0 }
+  const still: i32[] = []
+  let p = 0
+  while p < luPending.length {
+    if luIndexPos(luPending[p]) { still.push(luPending[p]) }
+    p = p + 1
+  }
+  while luIxCursor < cUnionTyIxs.length {
+    const a = luIxCursor
+    const ty = cUnionTyIxs[a]
+    while luPosByTy.length <= ty { luPosByTy.push(-1) }
+    if luPosByTy[ty] < 0 { luPosByTy[ty] = a }
+    if luIndexPos(a) { still.push(a) }
+    luIxCursor = luIxCursor + 1
+  }
+  luPending = still
+  0
 }
 
 // The atom width of the last `litUnionInlineNameOfTy` answer, and whether that union
@@ -34684,6 +34832,10 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
       const peekL = arrDefOperandElemPeek(n.binLeft)
       if peekL >= 0 { lt = peekL }
     }
+    // An operator reads a `const`'s literal as the `string` it is; the literal itself is
+    // `nodeWideStrLitText`'s to answer, so no operator rule changes for it (D2157). A compare
+    // decides once both sides are known (`eqKeepsWideLit`).
+    if op != "==" && op != "!=" { lt = widenLitTy(lt) }
   }
   ltOut.push(lt)
   // Contextual typing for an assignment RHS: seed the LHS type so an un-annotated lambda
@@ -34705,6 +34857,17 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
     if rt < 0 {
       const peekR = arrDefOperandElemPeek(n.binRight)
       if peekR >= 0 { rt = peekR }
+    }
+    if op == "==" || op == "!=" {
+      const keepL = eqKeepsWideLit(lt, rt)
+      const keepR = eqKeepsWideLit(rt, lt)
+      if !keepL {
+        lt = widenLitTy(lt)
+        ltOut[0] = lt
+      }
+      if !keepR { rt = widenLitTy(rt) }
+    } else {
+      rt = widenLitTy(rt)
     }
     // A store's value reading the place it writes: the value is what the program said the
     // element is, and the read has no answer of its own until this pins one.
@@ -34789,7 +34952,7 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
         // happens; reported and fallen through, so no cascade follows the one diagnostic.
         if arrT0.aRead == 1 { tErr(roWriteMsg("index assignment", arrTy0), ix) }
         if arrT0.aElem < 0 {
-          arrT0.aElem = rt
+          arrT0.aElem = widenLitTy(rt)
           tyMutEpoch = tyMutEpoch + 1 // index-write pinned the element in place
         }
         // A `u8[]` store checks against the element type directly: `checkIndexNode` types a
@@ -34805,13 +34968,13 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
           let kt0 = nodeTyIxOf(tgt.idxIndex)
           if kt0 < 0 { kt0 = checkNode(tgt.idxIndex) }
           if kt0 >= 0 {
-            arrT0.mKey = kt0
+            arrT0.mKey = widenLitTy(kt0)
             tyMutEpoch = tyMutEpoch + 1 // index-write pinned the key in place
-            checkInferredMapKey(kt0, arrT0.mSet, ix)
+            checkInferredMapKey(arrT0.mKey, arrT0.mSet, ix)
           }
         }
         if arrT0.mVal < 0 {
-          arrT0.mVal = rt
+          arrT0.mVal = widenLitTy(rt)
           tyMutEpoch = tyMutEpoch + 1 // index-write pinned the value in place
         }
       }
@@ -34934,7 +35097,7 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
         if asgCt is TyNullable {
           if rhsNonNull {
             if asgCt.nInner < 0 {
-              asgCt.nInner = rt
+              asgCt.nInner = widenLitTy(rt)
               tyMutEpoch = tyMutEpoch + 1 // nullable inner pinned in place
               // D1589 — a read typed before the fill banked the hole itself: re-derive
               // every such `??` here, the moment its non-null part exists.
@@ -35277,6 +35440,201 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
 // ── let declaration ────────────────────────────────────────────────────────
 
 // Extracted from `checkNodeReal`'s `LetDecl` arm (C3: thin the dispatcher).
+// A receiver typed as one string literal is a `string` to every member, method and index: the
+// literal is one value of that type, and its rep is the string (D2159).
+export function strLitRecvTy(ty: i32): i32 {
+  if ty < 0 { return ty }
+  const t = T.tys[ty]
+  if t is TyLit {
+    if t.litKind == "str" { return TY_STR }
+  }
+  ty
+}
+
+// The type an un-annotated binding takes from its initializer's `initTy`. A `const` bound to a
+// string literal is that literal's type, so it compares in O(1) (owner ruling, D2157); the type
+// is a widening one, so a `let` that copies it holds a `string` it may reassign.
+function constStrLitBound(n: LetDecl, initTy: i32): i32 {
+  if n.letInit < 0 { return initTy }
+  if n.letKw == "const" {
+    const iN = P.nodes[n.letInit]
+    if iN is StrLit { return mkWideStrLitTy(iN.strText, initTy) }
+    // `const Y = Z` is the same one literal, and a join of several (`if c { Z } else { W }`)
+    // keeps its literal set, as the join does where it is written; both read as `string`.
+    if isWideLitJoin(initTy) { return initTy }
+  }
+  widenLitTy(initTy)
+}
+
+// Arena indices of the literal types a `const` inferred from its initializer. Each is minted
+// fresh, so the flag belongs to that binding's type alone: kept at every read, and widened to
+// its base where the value is stored somewhere reassignable — a `let`, a list or object literal,
+// a type argument.
+let wideLitTyIxs: boolean[] = []
+
+// The widening literal type of string lexeme `lex` (quotes kept), or `fallback` when `lex` is
+// not a quoted literal.
+function mkWideStrLitTy(lex: string, fallback: i32): i32 {
+  const lt = litMemberTy(lex)
+  if lt < 0 { return fallback }
+  while wideLitTyIxs.length <= lt { wideLitTyIxs.push(false) }
+  wideLitTyIxs[lt] = true
+  lt
+}
+
+// Whether a compare keeps operand type `x` at its `const` literal: only beside a literal-typed
+// other side (or its nullable) that the literal is a member of. Anywhere else it compares as the
+// `string` it is, so `MODE == "release"` over `const MODE = "debug"` stays a false test.
+function eqKeepsWideLit(x: i32, other: i32): boolean {
+  if !isWideLitJoin(x) { return false }
+  if other < 0 || isWideLitJoin(other) { return false }
+  if !isLitBearing(other) { return false }
+  if assignable(x, other) { return true }
+  const o = T.tys[other]
+  if o is TyNullable { return assignable(x, o.nInner) }
+  false
+}
+
+// Whether `ty` is a widening literal, or a union made only of them.
+function isWideLitJoin(ty: i32): boolean {
+  if isWideLitTy(ty) { return true }
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if t is TyUnion {
+    if t.uMembers.length == 0 { return false }
+    let i = 0
+    while i < t.uMembers.length {
+      if !isWideLitTy(t.uMembers[i]) { return false }
+      i = i + 1
+    }
+    return true
+  }
+  false
+}
+
+// Whether `ty` is a widening literal: a `const` inferred it and nobody declared it.
+function isWideLitTy(ty: i32): boolean {
+  if ty < 0 || ty >= wideLitTyIxs.length { return false }
+  wideLitTyIxs[ty]
+}
+
+// The type a node had before `widenLitTy`, by node index; -1 where widening changed nothing.
+let wideLitByNode: i32[] = []
+
+function noteWideLitNode(ix: i32, ty: i32) {
+  while wideLitByNode.length <= ix { wideLitByNode.push(-1) }
+  wideLitByNode[ix] = ty
+  0
+}
+
+// Whether node `ix` read a `const` bound to a string literal. The recorded type of such a node
+// is `string`; this and `nodeWideStrLitText` are the one place the literal is asked for (D2157).
+export function nodeHasWideStrLit(ix: i32): boolean {
+  if ix < 0 || ix >= wideLitByNode.length { return false }
+  const ty = wideLitByNode[ix]
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if t is TyLit { return t.litKind == "str" }
+  false
+}
+
+// Node `ix`'s type before a `const` literal inside it widened to `string` — a join of such
+// literals is a literal union a literal-typed destination narrows from — else its recorded type.
+export function nodeUnwidenedTyOf(ix: i32): i32 {
+  if ix >= 0 && ix < wideLitByNode.length {
+    if wideLitByNode[ix] >= 0 { return wideLitByNode[ix] }
+  }
+  nodeTyIxOf(ix)
+}
+
+// The raw text (no quotes) of the literal `nodeHasWideStrLit` found at `ix`; ask that first,
+// since `const E = ""` holds a literal whose text is empty.
+export function nodeWideStrLitText(ix: i32): string {
+  if ix < 0 || ix >= wideLitByNode.length { return "" }
+  const ty = wideLitByNode[ix]
+  if ty < 0 { return "" }
+  const t = T.tys[ty]
+  if t is TyLit { return t.litText }
+  ""
+}
+
+// `ty` with every widening literal inside it replaced by its base scalar: a union of them
+// (`if c { Z } else { W }`), a function's result (`() => Z`), a list's element and a map's key
+// or value, rebuilt only where something widened. Every other type comes back unchanged.
+function widenLitTy(ty: i32): i32 {
+  if wideLitTyIxs.length == 0 { return ty }
+  widenLitTyGo(ty, 6)
+}
+
+function widenLitTyGo(ty: i32, depth: i32): i32 {
+  if ty < 0 || depth <= 0 { return ty }
+  const t = T.tys[ty]
+  match t {
+    TyLit => {
+      if ty < wideLitTyIxs.length && wideLitTyIxs[ty] { return litBaseTy(t) }
+      return ty
+    }
+    TyUnion => {
+      let changed = false
+      const ws: i32[] = []
+      let i = 0
+      while i < t.uMembers.length {
+        const w = widenLitTyGo(t.uMembers[i], depth - 1)
+        if w != t.uMembers[i] { changed = true }
+        ws.push(w)
+        i = i + 1
+      }
+      if !changed || ws.length == 0 { return ty }
+      let acc = ws[0]
+      let k = 1
+      while k < ws.length {
+        acc = joinTys(acc, ws[k])
+        k = k + 1
+      }
+      return acc
+    }
+    TyNullable => {
+      const wi = widenLitTyGo(t.nInner, depth - 1)
+      if wi == t.nInner { return ty }
+      return mkNullableTy(wi)
+    }
+    TyFunc => {
+      const wr = widenLitTyGo(t.fnRet, depth - 1)
+      if wr == t.fnRet { return ty }
+      return mkFuncTy(t.fnParamTypes, wr)
+    }
+    TyArray => {
+      if t.aRead == 1 { return ty }
+      const we = widenLitTyGo(t.aElem, depth - 1)
+      if we == t.aElem { return ty }
+      return mkArrayTy(we)
+    }
+    TyMap => {
+      const wk = widenLitTyGo(t.mKey, depth - 1)
+      const wv = widenLitTyGo(t.mVal, depth - 1)
+      if wk == t.mKey && wv == t.mVal { return ty }
+      return mkMapTy(wk, wv, t.mSet)
+    }
+    TyPrim => {
+      return ty
+    }
+    TyObj => {
+      // An object literal widens its fields as it is built (`checkObjLitNode`), and a declared
+      // record is annotated, so neither carries a widening literal to find here.
+      return ty
+    }
+    TyErr => {
+      return ty
+    }
+    TyVar => {
+      return ty
+    }
+    TyNeg => {
+      return ty
+    }
+  }
+}
+
 function checkLetDeclNode(n: LetDecl, ix: i32) {
   // Resolve the annotation (if any) by reading the TypeRef child inline.
   let annot = -1
@@ -35387,7 +35745,7 @@ function checkLetDeclNode(n: LetDecl, ix: i32) {
       }
     }
   } else if initTy >= 0 {
-    bound = initTy
+    bound = constStrLitBound(n, initTy)
     // A-infer-null: an un-annotated `let x = null` binds a nullable with an open inner hole;
     // the first non-null assignment fills it in place (the `=` arm), so `x` becomes `T | null`.
     if isNullTy(initTy) {
@@ -37933,6 +38291,28 @@ function gwConcatMarkInner(ix: i32) {
   0
 }
 
+// Whether `==` operand `ix` is a value the emitter compares as an interned atom: a string
+// literal, a value whose type is one string literal (`tyIsOneStrLit`, known at compile time),
+// or one whose type reps as the atom (`tyLitUnionAliasIx`). The getter contract prices a
+// compare of two of these at 0 because the emitter lowers it to one `i32.eq` or a constant.
+export function nodeCmpsByTag(ix: i32): boolean {
+  const u = cwPeel(ix)
+  if u < 0 || u >= P.nodes.length { return false }
+  if P.nodes[u] is StrLit { return true }
+  if nodeHasWideStrLit(u) { return true }
+  const ty = nodeTyIxOf(u)
+  if ty < 0 { return false }
+  const e = nomErasedTyIx(ty)
+  tyIsOneStrLit(e) || tyLitUnionAliasIx(e) >= 0
+}
+
+// Whether `ty` is exactly one string literal: a bare `"z"`, or a literal union of one member.
+// A value of it is known at compile time, so a compare against it needs no read.
+export function tyIsOneStrLit(ty: i32): boolean {
+  if !tyIsLitUnionOrLit(ty) { return false }
+  tyLitMemberTexts(ty).length == 1
+}
+
 function gwIsCompare(op: string): boolean {
   op == "==" || op == "!=" || op == "<" || op == "<=" || op == ">" || op == ">="
 }
@@ -37956,6 +38336,7 @@ function gwIsFloat(ty: i32): boolean {
 // literal's length, so this compare is bounded by it and costs that many steps (D2062).
 function gwStrLitEqLen(n: BinExpr): i32 {
   if n.binOp != "==" && n.binOp != "!=" { return -1 }
+  if nodeCmpsByTag(n.binLeft) && nodeCmpsByTag(n.binRight) { return 0 }
   if gwErasedIs(nodeTyIxOf(n.binLeft)) == "string" {
     const r = gwStrLitLenOf(n.binRight)
     if r >= 0 { return r }
@@ -37977,6 +38358,7 @@ function gwStrLitLenOf(ix: i32): i32 {
     if raw.length < 2 { return -1 }
     return gwLitLen(raw.slice(1, raw.length - 1))
   }
+  if nodeHasWideStrLit(u) { return gwLitLen(nodeWideStrLitText(u)) }
   gwStrLitTyLen(nodeTyIxOf(u))
 }
 
@@ -38029,7 +38411,7 @@ function gwErasedIs(ty: i32): string {
   }
   if t is TyUnion {
     if !getterLitUnionOk(t.uMembers) { return "union" }
-    if tyIsLitUnionAlias(e) || gwErasedIs(t.uMembers[0]) == "lit" {
+    if tyLitUnionAliasIx(e) >= 0 || gwErasedIs(t.uMembers[0]) == "lit" {
       return "lit"
     }
     return "string"
@@ -40009,7 +40391,7 @@ function checkMemberNode(n: Member, ix: i32) {
       return pathInvalidatedErr(mKey, mInv, ix)
     }
   }
-  const objTy = checkNode(n.memObj)
+  const objTy = strLitRecvTy(checkNode(n.memObj))
   // A negative receiver type is an unpinned inference hole, not an arena index — indexing
   // `T.tys` with it would crash. Already reported elsewhere, so don't cascade.
   if objTy < 0 { return TY_ERR }
@@ -40107,13 +40489,13 @@ function checkArrayLitNode(n: ArrayLit, _ix: i32) {
   if hasSpreadItem(elems) { return checkSpreadArrayLit(elems) }
   // A `void` element has no value to store — poisoned to `TY_ERR` rather than joined, so an
   // annotated literal keeps one "cannot assign" message instead of a second one.
-  let elemTy = checkNode(elems[0])
+  let elemTy = widenLitTy(checkNode(elems[0]))
   if voidValueSlotErr(elemTy, elems[0], "list element", elems[0]) {
     elemTy = TY_ERR
   }
   let ei = 1
   while ei < elems.length {
-    let et = checkNode(elems[ei])
+    let et = widenLitTy(checkNode(elems[ei]))
     if voidValueSlotErr(et, elems[ei], "list element", elems[ei]) {
       et = TY_ERR
     }
@@ -40138,7 +40520,7 @@ function checkSpreadArrayLit(elems: i32[]) {
     if spreadArgOf(elems[ei]) >= 0 {
       et = spreadElemTy(elems[ei])
     } else {
-      et = checkNode(elems[ei])
+      et = widenLitTy(checkNode(elems[ei]))
       if voidValueSlotErr(et, elems[ei], "list element", elems[ei]) {
         et = TY_ERR
       }
@@ -40154,7 +40536,7 @@ function checkSpreadArrayLit(elems: i32[]) {
 
 // Extracted from `checkNodeReal`'s `Index` arm (C3: thin the dispatcher).
 function checkIndexNode(n: Index, ix: i32) {
-  const arrTy = checkNode(n.idxArr)
+  const arrTy = strLitRecvTy(checkNode(n.idxArr))
   const idxTy = checkNode(n.idxIndex)
   // Guard the unpinned-hole receiver (`-1` — see the Member-arm note).
   if arrTy < 0 { return TY_ERR }
@@ -40306,7 +40688,7 @@ function checkObjLitNode(n: ObjLit, _ix: i32) {
       fnames.push(fnode.fiName)
       // A `void` field initializer has no value to store — poisoned to `TY_ERR` so an
       // annotated literal keeps one message, instead of an uninterned-shape reject naming nothing.
-      let fty = checkNode(fnode.fiValue)
+      let fty = widenLitTy(checkNode(fnode.fiValue))
       const fslot = "field '" + fnode.fiName + "'"
       if voidValueSlotErr(fty, fnode.fiValue, fslot, fnode.fiValue) {
         fty = TY_ERR
@@ -41250,7 +41632,8 @@ function checkForRangeNode(n: ForRange, ix: i32) {
 
 // Extracted from `checkNodeReal`'s `ForIn` arm (C3: thin the dispatcher).
 function checkForInNode(n: ForIn, ix: i32) {
-  const iterTy = checkNode(n.fiIter)
+  let iterTy = checkNode(n.fiIter)
+  if iterTy >= 0 { iterTy = strLitRecvTy(iterTy) }
   let elemTy = TY_ERR
   // The SECOND binding's type. A sequence's companion is its INDEX; a map's is the VALUE at
   // the key just bound. A set is a sequence here, not a map: its `mVal` is the internal

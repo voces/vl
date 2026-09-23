@@ -8,6 +8,17 @@ see **`DECISIONS.md`**.
 
 ## Type system (Track A)
 
+- **A string-literal type reps as the atom wherever it lives, and a `const` bound to a literal
+  has the literal's type (D2150, D2156, D2157; owner, 2026-09-23).** An inline `"a" | "b"` at a
+  field, parameter, return, local, global, capture or type argument compared with `__str_eq__`;
+  it is now the interned atom its alias spelling always was, so `==`, `!=`, `is "lit"` and
+  `match` over it are one `i32.eq`. A compare between values typed as one literal folds to a
+  constant. `const Z = "zz"` is `"zz"` (widened to `string` in a `let`, a list, an object
+  literal or a type argument), so `self.kind == Z` is one `i32.eq` and `self.name == Z` costs the
+  literal's length. The getter contract prices tag compares at 0, so two inline-literal fields
+  compare in a getter (D2120 closed). Along the way: an interpolation hole takes a literal type
+  (D1485), a one-literal receiver takes string members, and five alias-spelling defects the
+  change exposed are closed (D2151–D2155).
 - **Every function has an effects summary, and a getter may call a function whose summary
   qualifies (D2135, D2136).** The checker computes, per declaration and per generic instance
   (bottom-up over the call graph, Tarjan for recursion, memoised), what a function writes (a

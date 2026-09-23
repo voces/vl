@@ -30,6 +30,7 @@ import {
   nodeArrayElemIsNulLitUnion,
   nodeArrayElemIsNulStr,
   nodeEqCmpKind,
+  nodeHasWideStrLit,
   nodeLitMembersWithin,
   nodeNulLitUnionMemberTexts,
   nodeNumScalarBaseName,
@@ -52,6 +53,8 @@ import {
   nodeTyMapValIsNulLitUnion,
   nodeTyMapValLitUnionTexts,
   nodeTyPinIxOf,
+  nodeUnwidenedTyOf,
+  nodeWideStrLitText,
   nominalStructNameOfTy,
   numLitUnionBaseName,
   numLitUnionHasBase,
@@ -61,6 +64,7 @@ import {
   tyIsLitUnionArray,
   tyIsLitUnionOrLit,
   tyIsNulValueUnionBox,
+  tyIsOneStrLit,
   tyLitMemberTexts,
   tyLitUnionAliasIx,
   tyNulLitUnionInner,
@@ -2609,6 +2613,18 @@ function emitIs(body: u8[], isIx: i32, fnIx: i32) {
 
   if nd0 is IsExpr {
     if exprIsLitAtom(nd0.isObj, fnIx) {
+      // Every member of a literal union is a string, so `is string` holds of the atom
+      // outright, and of the `K | null` niche exactly when it is not the `-1` null (D2154).
+      if tyPrimNameOf(isVarTyIxOf(isIx)) == "string" {
+        if exprNulLitUnion(nd0.isObj, fnIx) {
+          if emitExpr(body, nd0.isObj, fnIx) < 0 { return -1 }
+          fbI32Const(-1)
+          fbI32Bin(71) // 0x47 i32.ne
+          return 0
+        }
+        fbI32Const(1)
+        return 0
+      }
       const laTexts = tyLitMemberTexts(isVarTyIxOf(isIx))
       if laTexts.length > 0 {
         if nodeLitMembersWithin(nd0.isObj, laTexts) {
@@ -12591,6 +12607,12 @@ export function emitExpr(body: u8[], exprIx: i32, fnIx: i32) {
   // is already the context every atom-typed slot seeds. Without it the store is a
   // `local.set` of a `(ref $array)` into an `i32` slot: invalid wasm at every such destination.
   if pendingLitUnion == 1 {
+    // A read of a `const` bound to a literal is that literal, whose id needs no conversion.
+    const wideIx = unwrapParen(exprIx)
+    if nodeHasWideStrLit(wideIx) {
+      const wideLex = quoteLex(nodeWideStrLitText(wideIx))
+      return emitStaticLitAtom(body, exprIx, wideLex, fnIx)
+    }
     if strReppedLitUnionAt(exprIx, fnIx) {
       return emitStrToAtom(body, unwrapParen(exprIx), fnIx)
     }
@@ -21384,7 +21406,7 @@ function emitStrToAtom(body: u8[], ix: i32, fnIx: i32) {
   // `tyLitMemberTexts` over the node's recorded type, NOT `nodeLitUnionMemberTexts`: that
   // node query declines a bare `TyLit` on purpose (its callers read an empty list as "not a
   // widenable atom"), and a bare `TyLit` is exactly the one-member set this narrowing serves.
-  const texts = tyLitMemberTexts(nodeTyIxOf(ix))
+  const texts = tyLitMemberTexts(nodeUnwidenedTyOf(ix))
   if texts.length == 0 {
     return emitFail("emitProgram: literal-union atom narrowing with no members")
   }
@@ -21538,7 +21560,63 @@ function strReppedLitUnionAt(ix: i32, fnIx: i32) {
   const av = unwrapParen(ix)
   const e = P.nodes[av]
   if e is StrLit { return false }
-  tyIsLitUnionOrLit(nodeTyIxOf(av))
+  tyIsLitUnionOrLit(nodeUnwidenedTyOf(av))
+}
+
+// The lexeme (quotes kept) operand `ix` is statically known to be: a string literal, or an
+// expression whose type is exactly one string literal (a bare `"z"`, or a one-member literal
+// union); "" otherwise. A type is the value set, so a one-literal type is one value.
+function staticStrLitLex(ix: i32): string {
+  const u = unwrapParen(ix)
+  if u < 0 { return "" }
+  const n = P.nodes[u]
+  if n is StrLit { return n.strText }
+  if nodeHasWideStrLit(u) { return quoteLex(nodeWideStrLitText(u)) }
+  const t = nodeTyIxOf(u)
+  if !tyIsOneStrLit(t) { return "" }
+  quoteLex(tyLitMemberTexts(t)[0])
+}
+
+// Whether two string lexemes (quotes kept) spell the same value — decoded, so an escape and the
+// character it stands for agree.
+function strLexSameValue(a: string, b: string): boolean {
+  if a == b { return true }
+  const da = decodeStr(strToCps(a))
+  const db = decodeStr(strToCps(b))
+  if da.length != db.length { return false }
+  let i = 0
+  while i < da.length {
+    if da[i] != db[i] { return false }
+    i = i + 1
+  }
+  true
+}
+
+// The lexeme (quotes kept) of the member in `texts` whose value `lex` spells, else `lex` itself —
+// whose interned id then matches no member's.
+function memberLexOfValue(texts: string[], lex: string): string {
+  let i = 0
+  while i < texts.length {
+    const m = quoteLex(texts[i])
+    if strLexSameValue(m, lex) { return m }
+    i = i + 1
+  }
+  lex
+}
+
+// Pushes the interned atom id of statically-known operand `ix` (lexeme `lex`): a literal is its
+// id outright, anything else is evaluated for its effects and dropped first.
+function emitStaticLitAtom(body: u8[], ix: i32, lex: string, fnIx: i32) {
+  if !(P.nodes[unwrapParen(ix)] is StrLit) {
+    const savedLU = pendingLitUnion
+    pendingLitUnion = 0
+    const rc = emitExpr(body, ix, fnIx)
+    pendingLitUnion = savedLU
+    if rc < 0 { return -1 }
+    fbDrop()
+  }
+  fbI32Const(internAtom(lex))
+  0
 }
 
 // True when `ix` can be lowered in atom context — the interned i32 id the litunion atom
@@ -22318,6 +22396,50 @@ function emitBinExprNode(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
           fnIx,
         )
       }
+    }
+  }
+  // Two string-literal types compare in O(1): an operand typed as one string literal is that
+  // literal whatever it reads, so beside another such operand the compare folds, and beside an
+  // atom it is its interned id. Both operands still evaluate, for their effects (D2156).
+  if e.binOp == "==" || e.binOp == "!=" {
+    const slL = staticStrLitLex(e.binLeft)
+    const slR = staticStrLitLex(e.binRight)
+    if slL != "" && slR != "" {
+      if emitStaticLitAtom(body, e.binLeft, slL, fnIx) < 0 { return -1 }
+      fbDrop()
+      if emitStaticLitAtom(body, e.binRight, slR, fnIx) < 0 { return -1 }
+      fbDrop()
+      if strLexSameValue(slL, slR) == (e.binOp == "==") {
+        fbI32Const(1)
+      } else {
+        fbI32Const(0)
+      }
+      return 0
+    }
+    const slAtomL = slL != "" && exprIsLitAtom(e.binRight, fnIx)
+    const slAtomR = slR != "" && exprIsLitAtom(e.binLeft, fnIx)
+    if slAtomL || slAtomR {
+      // The static side is spelled as the member it equals, since an atom is interned by its
+      // member's lexeme; a value no member equals leaves an id no atom carries, so `==` is false.
+      let slLex = slR
+      let slAtomIx = e.binLeft
+      if slAtomL {
+        slLex = slL
+        slAtomIx = e.binRight
+      }
+      const slMem = memberLexOfValue(litAtomWidenTexts(slAtomIx, fnIx), slLex)
+      const slCtx = expCtxHere()
+      slCtx.litUnion = 1
+      if slAtomL {
+        if emitStaticLitAtom(body, e.binLeft, slMem, fnIx) < 0 { return -1 }
+        if emitExprExpect(body, e.binRight, fnIx, slCtx) < 0 { return -1 }
+      } else {
+        if emitExprExpect(body, e.binLeft, fnIx, slCtx) < 0 { return -1 }
+        if emitStaticLitAtom(body, e.binRight, slMem, fnIx) < 0 { return -1 }
+      }
+      fbI32Bin(70) // 0x46 i32.eq
+      if e.binOp == "!=" { fbI32Eqz() }
+      return 0
     }
   }
   // A literal-union atom compare (`k == "a"`, `k1 == k2`) emits both operands as i32 ids (a
