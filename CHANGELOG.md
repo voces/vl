@@ -33,6 +33,14 @@ see **`DECISIONS.md`**.
   (`flat-records-design.md` §9.1). Editor: `property` token with the `readonly` modifier,
   `Property` completion, go-to-definition on the `get` declaration. Guide:
   `docs/guide/getters.md`. `std:simd`'s `.x/.y/.z/.w` are a separate lane (after D1984).
+- **`std:simd` lane read-back (D1980, `property-access-design.md` §E3, F3(a)/F4(b)).**
+  `v.x`/`v.y`/`v.z`/`v.w` are `export get` getters, one `f32x4.extract_lane` each;
+  `v.lane(i)` and `v.withLane(i, x)` (a new vector; the receiver is unchanged) take
+  `i: Lane`, the new `type Lane = 0 | 1 | 2 | 3`. A literal index is exactly one
+  `extract_lane N`/`replace_lane N` at `-O`/`-O3`, a runtime `Lane` is a four-way branch, and a
+  plain `i32` is refused at compile time (`expected Lane, got i32`). No compiler change: the
+  body is a ladder over the literal union. `std:buffer`'s header now says a checked view's
+  `length` is a writable field that defeats the range check when overwritten (F6(c)).
 - **`std:simd` — the `F32x4` slice (SIMD S3, `simd-design.md` §G).** `F32x4` and `Mask32x4` are
   `new v128` brands; the module ships `splatF32`, `f32x4(x, y, z, w)`, unaligned
   `loadF32x4`/`storeF32x4` over a `Buf`, `+ - * /` (receiver-keyed operators, #3003) with named
