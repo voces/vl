@@ -6411,7 +6411,10 @@ function collectThenNarrows(condIx: i32, names: string[], tys: i32[]) {
     if cond.isVariant == "null" {
       pushNarrowFact(cond.isObj, TY_NULL, names, tys)
     } else {
-      const tIdx = isTypeTyRead(cond.isVariant, condIx)
+      let tIdx = isTypeTyRead(cond.isVariant, condIx)
+      // An overlapping literal set narrows to the overlap, as `checkIsExprNode` tests it.
+      const meet = litSetMeetTy(placeCurTy(cond.isObj, names, tys), tIdx)
+      if meet >= 0 { tIdx = meet }
       if tIdx >= 0 {
         pushNarrowFact(cond.isObj, tIdx, names, tys)
         pushDiscrimParentFact(
@@ -44793,9 +44796,144 @@ function jsonSpellHas(s: string, m: string): boolean {
   false
 }
 
+// `litSetMeetTy`'s answer when the two sets share no value.
+const LIT_MEET_NONE = -2
+
+// The members of literal set `chk` that a value of `obj` can hold, when `chk` is not already
+// inside `obj`: the type `x is chk` tests and narrows to. -1 when `chk` is not a literal set,
+// `obj` holds no literal, or `chk` fits `obj` as written; `LIT_MEET_NONE` when none of `chk`
+// fits. A `null` in `obj` is not a member of the meet.
+function litSetMeetTy(obj: i32, chk: i32): i32 {
+  if obj < 0 || chk < 0 { return -1 }
+  if !allLitMembers(chk) { return -1 }
+  let base = obj
+  const ot = T.tys[obj]
+  if ot is TyNullable { base = ot.nInner }
+  if base < 0 { return -1 }
+  const own: i32[] = []
+  flattenLits(base, own)
+  if own.length == 0 { return -1 }
+  if assignable(chk, base) { return -1 }
+  const cands: i32[] = []
+  flattenLits(chk, cands)
+  const keep: i32[] = []
+  let i = 0
+  while i < cands.length {
+    if assignable(cands[i], base) { keep.push(cands[i]) }
+    i = i + 1
+  }
+  if keep.length == 0 {
+    // A string lexeme holding an escape may equal a raw spelling, so it is never called disjoint.
+    if !allStrLitMembers(chk) || strLitSetsDisjoint(base, chk) {
+      return LIT_MEET_NONE
+    }
+    return -1
+  }
+  if keep.length == 1 { return keep[0] }
+  const res = mkUnionTy(keep)
+  noteLitUnionCopy(res, base)
+  res
+}
+
+// Whether `ty` is a literal or a union made only of them.
+function allLitMembers(ty: i32): boolean {
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  match t {
+    TyLit => {
+      return true
+    }
+    TyUnion => {
+      if t.uMembers.length == 0 { return false }
+      let i = 0
+      while i < t.uMembers.length {
+        if !allLitMembers(t.uMembers[i]) { return false }
+        i = i + 1
+      }
+      return true
+    }
+    TyNullable | TyPrim | TyObj | TyFunc | TyArray | TyMap | TyErr | TyVar | TyNeg => {
+      return false
+    }
+  }
+}
+
+// Appends the literal members of `ty` (through unions) to `out`.
+function flattenLits(ty: i32, out: i32[]) {
+  if ty < 0 { return 0 }
+  const t = T.tys[ty]
+  match t {
+    TyLit => {
+      out.push(ty)
+    }
+    TyUnion => {
+      let i = 0
+      while i < t.uMembers.length {
+        flattenLits(t.uMembers[i], out)
+        i = i + 1
+      }
+    }
+    TyNullable | TyPrim | TyObj | TyFunc | TyArray | TyMap | TyErr | TyVar | TyNeg => {}
+  }
+  0
+}
+
+// The refusal of an `is` whose literal set shares no value with the operand's: the same shape
+// as a `const` literal's always-false test, naming the type to declare instead.
+function litSetNeverMsg(x: i32, obj: i32, chk: i32): string {
+  let base = obj
+  const ot = T.tys[obj]
+  if ot is TyNullable { base = ot.nInner }
+  const own: i32[] = []
+  flattenLits(base, own)
+  const extra: i32[] = []
+  flattenLits(chk, extra)
+  // Spelled member by member: `tyToStr` of the whole type may name an alias of the same set.
+  let dom = ""
+  const bt = T.tys[base]
+  if bt is TyUnion {
+    let m = 0
+    while m < bt.uMembers.length {
+      if m > 0 { dom = dom + " | " }
+      dom = dom + tyToStr(bt.uMembers[m])
+      m = m + 1
+    }
+  } else {
+    dom = tyToStr(base)
+  }
+  if base != obj { dom = dom + " | null" }
+  let d = 0
+  while d < extra.length {
+    let seen = false
+    let j = 0
+    while j < own.length {
+      if tyEq(own[j], extra[d]) { seen = true }
+      j = j + 1
+    }
+    if !seen { dom = dom + " | " + tyToStr(extra[d]) }
+    d = d + 1
+  }
+  const nm = constOperandName(x)
+  const subj = if nm == "" { "this value" } else { nm }
+  let what = " holds no literal but "
+  if allLitMembers(base) {
+    what = if own.length == 1 { " is always " } else { " is only ever " }
+    if base != obj { what = " is null or " }
+  }
+  subj +
+    what +
+    strLitsSpelled(own) +
+    " here, so this test is always false. If " +
+    (if nm == "" { "it" } else { nm }) +
+    " can take other values, declare them in its type: " +
+    dom
+}
+
 function checkIsExprNode(n: IsExpr, ix: i32) {
   let objTy = checkNode(n.isObj)
   const chkTy = isTypeTy(n.isVariant, ix)
+  // A literal set that only overlaps the operand's tests as the overlap (D2205).
+  const meet = litSetMeetTy(objTy, chkTy)
   // A `const` literal tests as the compare does: against a literal it never equals the
   // test is refused, and against anything else it is the `string` it is (D2198).
   if chkTy >= 0 && isWideLitJoin(objTy) {
@@ -44807,8 +44945,8 @@ function checkIsExprNode(n: IsExpr, ix: i32) {
         )
         return TY_BOOL
       }
-      // Sets that meet test as the `string` too: `"debug"` may be tested against
-      // `"debug" | "x"`, and a subset keeps its literal type (D2204).
+      // Sets that meet test as their overlap (`meet`, D2205): `"debug"` may be tested
+      // against `"debug" | "x"`, and a subset keeps its literal type (D2204).
       if !assignable(chkTy, objTy) { objTy = widenLitTy(objTy) }
     } else {
       objTy = widenLitTy(objTy)
@@ -44818,7 +44956,9 @@ function checkIsExprNode(n: IsExpr, ix: i32) {
   // it as an arena index, instead of re-classifying the spelling at every read of the binding.
   if chkTy >= 0 {
     if ix >= 0 {
-      if ix < isVarTyIx.length { isVarTyIx[ix] = chkTy }
+      if ix < isVarTyIx.length {
+        isVarTyIx[ix] = if meet >= 0 { meet } else { chkTy }
+      }
     }
   }
   if chkTy < 0 {
@@ -44844,7 +44984,11 @@ function checkIsExprNode(n: IsExpr, ix: i32) {
     // passes assignability below (widens into `Json[]`) and would answer false for every value.
     const jwDeep = jsonDeepIsSite(ix, chkTy, n.isObj, objTy)
     if jwDeep == 1 { return TY_BOOL }
-    if !assignable(chkTy, baseTy) || isWidenNotVariant(chkTy, baseTy) {
+    if meet == LIT_MEET_NONE {
+      tErr(litSetNeverMsg(n.isObj, objTy, chkTy), ix)
+    } else if meet >= 0 {
+      0
+    } else if !assignable(chkTy, baseTy) || isWidenNotVariant(chkTy, baseTy) {
       if jwBadMsg != "" {
         tErr(
           "`is` check type '" +
