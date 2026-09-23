@@ -37743,6 +37743,12 @@ function gwIsCompare(op: string): boolean {
   op == "==" || op == "!=" || op == "<" || op == "<=" || op == ">" || op == ">="
 }
 
+// Whether node `ix` holds a value an `is "lit"` test compares with `__str_eq__`: a `string`, a
+// string literal type, an undeclared string-literal union, or `string | null`.
+export function nodeTyComparesAsString(ix: i32): boolean {
+  gwErasedIs(nodeTyIxOf(ix)) == "string" || nodeTyIsNulString(ix)
+}
+
 // Whether `ty` erases to `f32` or `f64`, whose `%` lowers to the looping `__f64_rem__`.
 function gwIsFloat(ty: i32): boolean {
   if ty < 0 { return false }
@@ -37780,14 +37786,18 @@ function gwStrLitLenOf(ix: i32): i32 {
   gwStrLitTyLen(nodeTyIxOf(u))
 }
 
-// The length of string literal type `ty`, or -1 when it is not one.
+// The length of string literal type `ty`, or -1 when it is not one: a literal, or an alias whose
+// only member is one.
 function gwStrLitTyLen(ty: i32): i32 {
   if ty < 0 { return -1 }
-  const t = T.tys[ty]
-  if t is TyLit {
-    if t.litKind == "str" { return gwLitLen(t.litText) }
+  const e = nomErasedTyIx(ty)
+  const texts = tyLitMemberTexts(e)
+  if texts.length != 1 { return -1 }
+  const t = T.tys[e]
+  if t is TyUnion {
+    if t.uMembers.length != 1 { return -1 }
   }
-  -1
+  gwLitLen(texts[0])
 }
 
 // At least the number of code points string literal text `raw` (quotes stripped, escapes
@@ -37803,9 +37813,10 @@ function gwLitLen(raw: string): i32 {
   n
 }
 
-// What type `ty` erases to, for the operator rules: "string", "list", "map", "struct", "lit"
-// (a literal or a literal union, compared by tag), "null", "other" (a scalar, a function or an
-// unresolved type) or "union" (a value union or a nullable of one of the loop-compared kinds).
+// What type `ty` erases to, for the operator rules: "string" (also a string literal type, or an
+// undeclared string-literal union, both stored as a string), "list", "map", "struct", "lit" (an
+// integer literal, or a declared literal union, whose atom compares by tag), "null", "other" (a
+// scalar, a function or an unresolved type) or "union" (a value union or a nullable of one).
 function gwErasedIs(ty: i32): string {
   if ty < 0 { return "other" }
   const e = nomErasedTyIx(ty)
@@ -37818,10 +37829,16 @@ function gwErasedIs(ty: i32): string {
   if t is TyArray { return "list" }
   if t is TyMap { return "map" }
   if t is TyObj { return "struct" }
-  if t is TyLit { return "lit" }
+  if t is TyLit {
+    if t.litKind == "str" { return "string" }
+    return "lit"
+  }
   if t is TyUnion {
-    if getterLitUnionOk(t.uMembers) { return "lit" }
-    return "union"
+    if !getterLitUnionOk(t.uMembers) { return "union" }
+    if tyIsLitUnionAlias(e) || gwErasedIs(t.uMembers[0]) == "lit" {
+      return "lit"
+    }
+    return "string"
   }
   if t is TyNullable {
     const inner = gwErasedIs(t.nInner)
@@ -38119,10 +38136,23 @@ function gcDearest(arms: i32[]): i32 {
   best
 }
 
-// A `match`: its scrutinee, then its dearest arm. A match scrutinee is never a plain string, so
-// its patterns compare by tag and cost nothing.
+// A `match`: its scrutinee, then each string-literal pattern tested in turn when the scrutinee
+// is stored as a string (an undeclared literal union), then its dearest arm. Over a declared
+// literal union the patterns compare by tag and cost nothing.
 function gcMatch(n: MatchExpr): i32 {
-  gcAdd(gcNode(n.matchScrut), gcDearest(n.matchBodies))
+  let c = gcNode(n.matchScrut)
+  if gwErasedIs(nodeTyIxOf(n.matchScrut)) == "string" {
+    let i = 0
+    while i < n.matchPats.length {
+      const lit = gwStrLitLenOf(n.matchPats[i])
+      if lit > 0 {
+        c = gcAdd(c, lit)
+        gcTrail.push(0 - lit)
+      }
+      i = i + 1
+    }
+  }
+  gcAdd(c, gcDearest(n.matchBodies))
 }
 
 // The steps `x is "a" | "b"` costs: each string literal is compared in turn, so the sum of
@@ -38135,7 +38165,7 @@ function gcIsLitSteps(n: IsExpr, ix: i32): i32 {
   const one = gwStrLitTyLen(ty)
   if one >= 0 { lens.push(one) }
   const t = T.tys[ty]
-  if t is TyUnion {
+  if one < 0 && t is TyUnion {
     let i = 0
     while i < t.uMembers.length {
       const m = gwStrLitTyLen(t.uMembers[i])
@@ -38158,7 +38188,7 @@ function gcIsLitSteps(n: IsExpr, ix: i32): i32 {
 // The path a refusal names for row `gi`: each getter's heaviest read and how many times it is
 // read, ending at the string-literal compares that cost the most, if any.
 function gcPath(gi: i32): string {
-  let s = getProps[gi]
+  let s = gcName(gi)
   let cur = gi
   let hops = 0
   while cur >= 0 && hops < 12 {
@@ -38167,7 +38197,7 @@ function gcPath(gi: i32): string {
       return s + " → " + gcCmpPhrase(cur)
     }
     if top < 0 { return s }
-    s = s + " → " + getProps[top]
+    s = s + " → " + gcName(top)
     if gcTopCount[cur] > 1 { s = s + " (" + i32ToStr(gcTopCount[cur]) + "×)" }
     // A cycle is refused on its own; stop at its first repeat.
     if top == gi { return s }
@@ -38176,6 +38206,19 @@ function gcPath(gi: i32): string {
   }
   if cur >= 0 { s = s + " → …" }
   s
+}
+
+// Getter row `gi` as a path names it: its property, qualified by its receiver (`B.v`) when
+// another getter shares the property name.
+function gcName(gi: i32): string {
+  let i = 0
+  while i < getProps.length {
+    if i != gi && getProps[i] == getProps[gi] {
+      return tyToStr(getSelfTys[gi]) + "." + getProps[gi]
+    }
+    i = i + 1
+  }
+  getProps[gi]
 }
 
 function gcCmpPhrase(gi: i32): string {

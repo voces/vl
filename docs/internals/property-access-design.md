@@ -39,7 +39,7 @@ Are they good for VL?"*
   writes nothing, allocates nothing, does no I/O and fits the budget; v1 as built is
   loop-free. See §D3a-contract.)*
   That keeps a getter read to a load or a short straight-line sequence. The contract is
-  deliberately conservative and will only ever be relaxed.
+  deliberately conservative: it may later relax (for instance into a lint), never the reverse.
 - **Nothing new in the language is needed to unblock lane reads today.** A literal-union
   parameter (`i: 0 | 1 | 2 | 3`) compiles in std with no compiler change. It is range-checked at
   compile time, and it folds to one `f32x4.extract_lane` at `-O` and `-O3` (§A7).
@@ -552,9 +552,12 @@ A getter body is refused unless it is:
 - **Operators whose lowering loops or allocates are refused** (built, from the #3031 review's
   disassembly): `==`/`!=`/`<`/`<=`/`>`/`>=` over string, list, map or struct operands (a
   `__str_eq__` call or an inline element loop), an index into a map (a hash and a probe loop),
-  and list `+`. A literal-union comparison compares tags (`i32.eq`) and is allowed, as is a
-  test against `null`. **A compare with a string literal is allowed** (RULED, owner, 2026-09-22;
-  built, D2062): `s == "lit"`,
+  and list `+`. A DECLARED literal union (`type K = "a" | "b"`) is an interned `i32` atom, so
+  its comparison compares tags (`i32.eq`) and is allowed at no cost, as is a test against
+  `null`. An UNDECLARED one (a field typed `"a" | "b"` inline) and a single string literal type
+  are stored as strings and compare through `__str_eq__`, so they follow the string rules below.
+  **A compare with a string literal is allowed** (RULED, owner, 2026-09-22; built, D2062):
+  `s == "lit"`,
   `s != "lit"` and `s is "a" | "b"` call `__str_eq__`, which answers unequal lengths before it
   loops and otherwise walks at most the literal's length, so the compare is bounded by a
   constant the checker can read. It costs that length in steps (below). Two runtime strings

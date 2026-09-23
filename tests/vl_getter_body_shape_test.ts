@@ -11,6 +11,12 @@
 // control program's method is held to the same scan and must be flagged, so a scan that stopped
 // seeing an opcode cannot pass quietly.
 //
+// What it cannot see: HOW LONG a `__str_eq__` call walks. That helper is on the leaf list, so a
+// compare the checker charged 0 (a literal it wrongly took for a tag compare) passes here; the
+// step cost of a string compare is graded only by the checker fixtures. A trap arm — a `then`
+// that prints the trap message through `__print_*` helpers and ends in `unreachable` — is
+// stripped before the scan: a getter may trap, and the message is part of trapping.
+//
 // GATING: needs the built binary, the seed and `wasm-dis` (`node_modules/.bin`, not on PATH).
 // `ci-native` installs no npm deps, so it self-ignores there; the `ci-release-shape` job names
 // this file and runs it with npm deps.
@@ -89,6 +95,34 @@ const isGetterFn = (fn: string, getters: [string, string][]): boolean =>
   );
 
 // What a body does that the contract forbids, one entry per fact.
+// `body` with every trap arm removed: a `(then …)` whose last form is `(unreachable)` and whose
+// only calls are to the `__print_*` trap-message helpers.
+const stripTrapArms = (body: string): string => {
+  let out = body;
+  let from = 0;
+  for (;;) {
+    const at = out.indexOf("(then", from);
+    if (at < 0) return out;
+    let depth = 0;
+    let end = at;
+    for (; end < out.length; end++) {
+      if (out[end] === "(") depth++;
+      else if (out[end] === ")" && --depth === 0) break;
+    }
+    const arm = out.slice(at, end + 1);
+    const inner = arm.slice(0, -1).trimEnd();
+    const calls = [...arm.matchAll(/\(call \$(\S+)/g)].map((m) => m[1]);
+    if (
+      inner.endsWith("(unreachable)") &&
+      calls.every((c) => c.startsWith("__print_"))
+    ) {
+      out = out.slice(0, at) + out.slice(end + 1);
+    } else {
+      from = at + 1;
+    }
+  }
+};
+
 const violations = (
   body: string,
   isGetter: (fn: string) => boolean,
@@ -146,7 +180,9 @@ const scan = async (
     for (const [fn, body] of fns) {
       if (!isGetter(fn)) continue;
       seen++;
-      for (const v of violations(body, isGetter)) bad.push(`$${fn}: ${v}`);
+      for (const v of violations(stripTrapArms(body), isGetter)) {
+        bad.push(`$${fn}: ${v}`);
+      }
     }
     return { seen, bad };
   } finally {

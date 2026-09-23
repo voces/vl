@@ -16,7 +16,8 @@ see **`DECISIONS.md`**.
   arithmetic and intrinsics 0. A chain over the budget is one error at its top, naming the path
   (`a8 → a7 (4×) → … → a0 (4×)`). `s == "lit"`, `!=` and `s is "a" | "b"` are admitted at their
   literal lengths (`__str_eq__` checks lengths before it loops), so `==` and `is` now agree; two
-  runtime strings stay refused. f32/f64 `%` (`__f64_rem__` loops over the exponent gap) is
+  runtime strings stay refused. Only a DECLARED literal union compares by tag at no cost; a field
+  typed `"a" | "b"` inline is stored as a string and priced like one, `match` patterns included. f32/f64 `%` (`__f64_rem__` loops over the exponent gap) is
   refused in a getter; integer `%` stays. `collectStrPool` also pools the literals an `is` tests
   a string against, so `s is "ab"` no longer allocates the literal per test (three corpus modules
   shrank, the rest byte-identical). `tests/vl_getter_body_shape_test.ts` disassembles every

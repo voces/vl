@@ -96,11 +96,11 @@ not:
 
 Allowed: `let` / `const` locals (a local ends with its block), `if` and `match` expressions,
 reads of `self`'s fields and of module `const`s, other getters, `as` conversions, comparisons
-of scalars and of literal unions (a tag compare), a test against `null`, a string's `.length`
-and byte index, `==`, `!=` and `is` against a string literal (a compare that stops at the
-literal's length), and every intrinsic that compiles to
-instructions with no effect but a trap: the scalar numeric ones (`sqrt`, `abs`, `floor`,
-`ceil`, `trunc`, `nearest`, `min`, `max`, `copysign`, `clz`, `ctz`, `popcnt`, `rotl`, `rotr`,
+of scalars and of declared literal unions (`type K = "a" | "b"`, a tag compare at no cost), a
+test against `null`, a string's `.length` and byte index, `==`, `!=` and `is` against a string
+literal (a compare that stops at the literal's length; a field typed `"a" | "b"` inline is
+stored as a string and counts as one), and every intrinsic that compiles to instructions with
+no effect but a trap: the scalar numeric ones (`sqrt`, `abs`, `floor`, `ceil`, `trunc`, `nearest`, `min`, `max`, `copysign`, `clz`, `ctz`, `popcnt`, `rotl`, `rotr`,
 `divU`, `remU`, the unsigned compares and the bitcasts), linear-memory `__load_*` reads, lane
 operations and `__trap__`. A trap, from `as!`, an integer division or `divU` by zero, is
 allowed: the program stops either way.
@@ -138,7 +138,8 @@ method: `function full(self: Name): string`, called as `.full()`
 One mistake is one error: a `+` chain is refused once, a boxed result once (at the result
 type), and a function called three times once.
 
-The contract is deliberately conservative, and the budget will be tuned as getters are used.
+The contract is deliberately conservative: it may relax later (for instance into a lint), never
+the reverse. The budget's number, 16, is tuned as getters are used.
 
 ## What it costs
 
