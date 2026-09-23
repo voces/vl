@@ -223,7 +223,7 @@ Draft signatures and consumer comments, each within `std-api-review.md` §4's 1�
 ```vl
 // std:fs
 // Replace the file's contents with `data`, creating it when absent. A `Buf` is written
-// in place rather than copied, and `buf.window(0, used)` writes only its filled part.
+// straight from memory, not copied, and `buf.window(0, used)` writes only its filled part.
 // `writeFile(path, [])` empties the file: the fresh start before `appendFile` or
 // `writeFileRange`. Whether the replacement is atomic is the host's policy.
 export function writeFile(path: string, data: u8[] | Buf): IoResult
@@ -240,9 +240,9 @@ export function writeFileRange(path: string, offset: i64, data: u8[] | Buf): IoR
 export function appendFile(path: string, data: u8[] | Buf): IoResult
 
 // std:buffer
-// The `len` bytes of `self` from byte `off`, as a `Buf` over the same memory. Nothing is
-// copied, so a store through either one is seen through both. Traps naming the range
-// unless `[off, off + len)` lies inside `self`.
+// The `len` bytes of `self` from byte `off`, as a `Buf` over the same memory, not a copy.
+// Traps naming the range unless `[off, off + len)` lies inside `self`. A `len` of 0 at
+// `off == self.length` is in range.
 export function window(self: Buf, off: i32, len: i32): Buf
 ```
 
@@ -253,12 +253,12 @@ hand-written window. A function of the widened type also still binds to a
 it as a value. (`/home/verit/vl/dist/vl`, `VL_STD` pinned to this tree, 2026-09-23. The
 programs are in §7.)
 
-**The view helper's name is open for the std review.** The owner asked that it read like the
+**The view helper is `window`, chosen by the std review (§7).** The owner asked that it read like the
 existing `f32view`/`i32view` and not like `slice`, which copies on arrays. Candidates:
 
 | name | for | against |
 | --- | --- | --- |
-| `window` (drafted above) | Says "part of the same bytes" and implies no element type. `buf.window(0, used)` reads naturally at a write call. | Not spelled like `f32view`. A generic word in a flat namespace, though an explicit import is what brings it into scope. |
+| **`window` — chosen by the std review** | Says "part of the same bytes" and implies no element type. `buf.window(0, used)` reads naturally at a write call. | Not spelled like `f32view`. A generic word in a flat namespace, though an explicit import is what brings it into scope. |
 | `u8view` | Spelled like `f32view`/`i32view`, with the same `(self, off, count)` argument shape, and for bytes count equals length. | Those two return distinct view TYPES with `[]` indexing. This one returns a plain `Buf`, which has no `[]`, so the name over-promises. |
 | `view` | Short, and the family word. | Suggests the typed-view family without a width. The most collision-prone name of the four. |
 | `bufWindow` | Repeats the module, as `bufferMark`/`bufferRelease` do, so it is self-sufficient in a flat namespace. | Reads oddly as a method (`buf.bufWindow(…)`). |
@@ -311,17 +311,24 @@ header after the body is written, use `writeFileRange(out, 0, header)`.
    `-EINVAL` when `offset > size`. Checking the open descriptor narrows the check-then-write
    window to one open file. std rejects a negative offset before the call. On `EINVAL` from a
    non-negative offset, std asks `__fs_size__` for the length its message names. That number
-   is the length when the error is reported, which is the one a caller can act on.
+   is the length when the error is reported, which is the one a caller can act on. The
+   message keeps `failed()`'s shape:
+   `fs.writeFileRange <path>: offset 12 is past the end (length 10)`. If the follow-up size
+   read itself fails, the message falls back to `failed()`'s errno rendering; on a missing
+   file, which has no size, it reads `length 0`.
 3. **Hosts**: `scripts/vl-host/src/main.rs` and `scripts/wasmtime-host.rs`. Both handlers LOOP
    until every byte is written (`write_all` / `write_all_at`), so a short count is never
    success. Slot 16 reads `data()[addr..addr+len]` in place and answers `-EFAULT` outside the
    memory, mirroring `__fs_read_into__`.
 4. **`tests/support/runWasm.ts`**: two names in the throwing-stub list.
 5. **`std/fs.vl`**: widen `writeFile`, add `writeFileRange` and `appendFile`, and rewrite the
-   header's does-not-do line within its 10 lines ("no open handles, no truncation to a
-   length, no gaps"). **`std/buffer.vl`**: the view helper under its reviewed name. Then run
-   `deno task gen-std` and add a `docs/internals/std-notes.md` `std:fs` entry for the union
-   source, contiguity and append choices.
+   header within its 10 lines, replacing lines rather than adding any (the reviewer's draft
+   is in §7). **`std/buffer.vl`**: add `window`, and change header line 7 to "Only the typed
+   views, `window` and `storeBytes`/`loadBytes` check a range and trap". The helper is NOT
+   re-exported from `std:fs`. Then run
+   `deno task gen-std` and add a `docs/internals/std-notes.md` `std:fs` entry covering four
+   choices: the union source, contiguity, append, and `writeFile` now PROMISING to create a
+   missing file (its old comment left that to the host).
 6. **Fixtures**: an intrinsic pin for each slot (`tests/cases/intrinsics/`, `// @skip` for the
    V8 harness), plus native tests for:
    - a `Buf` window round-trip through `writeFile` → `readFileInto`;
@@ -469,4 +476,57 @@ and, for the widening, `const f: (string, u8[]) => i32 = sink2` where `sink2` ta
 
 **Self-assessed verdict: CONSISTENT WITH NOTED DEVIATIONS.** These are the start-fresh order
 dependence, `appendFile`'s ambient offset (ruled), the caller-owned source buffer, and the
-missing `From` mirror of `Into`. The view helper's name is left to the reviewer.
+missing `From` mirror of `Into`.
+
+### The `std-api-reviewer` pass (2026-09-23, design level)
+
+**Verdict: CONSISTENT WITH NOTED DEVIATIONS.** It holds on three conditions: name the helper
+`window`, fix `std:buffer`'s header line 7, and decide `appendTextFile`. The reviewer judged
+all five deviations above adequately justified. The missing `From` mirror of `Into` is
+invisible to a caller, so it belongs in `std-notes.md` only.
+
+1. **`appendTextFile` — OPEN, for the owner.** Q2's justification is logs, and logs are
+   text. `writeTextFile` sets the pattern of a text sibling for a whole-file write, and an
+   append of whole strings never splits a character. The reviewer asks for either
+   `appendTextFile(path: string, text: string): IoResult` or a header line refusing it:
+   saying nothing will not pass. This doc does not decide it, because the rulings named
+   exactly three write names. The build does not start until it is decided.
+2. **`std:buffer` header line 7 goes stale.** Fixed in build item 5.
+3. **Name: `window`.**
+   - `u8view` promises `[]` indexing it does not have, and breaks the view family's
+     return-type pattern.
+   - `view` is the family word with the width missing.
+   - `bufWindow` stutters as a method call.
+   - The reviewer probed the flat-namespace risk: an import of `window` beside a
+     module-level `const window` fails LOUDLY (`Duplicate binding "window"`, suggesting
+     `as`), and a local `const window` shadows it and runs.
+
+   Adopted in §5.
+4. **Zero-length case missing from `window`'s comment.** Adopted: the comment now says a
+   `len` of 0 at `off == self.length` is in range, and drops the aliasing sentence, which
+   `std:buffer`'s header already covers.
+5. **"Written in place" was ambiguous.** It read as though the FILE is written in place.
+   Reworded, and the new create-when-absent promise is noted for `std-notes.md`.
+6. **Pin the contiguity message's shape**, including when the size read fails. Added to
+   build item 2.
+7. **Trap vs `IoError` is consistent.** A forged `Buf`'s `-EFAULT` renders as `errno 21`,
+   as `readFileInto` already does. Naming `EFAULT` is optional.
+8. **Do not re-export `window` from `std:fs`.** Adopted in build item 5.
+
+The reviewer's `std:fs` header draft fits in 10 lines, replacing lines rather than adding any:
+
+```
+// `std:fs` — reading, writing and appending files, whole or by byte range, and listing directories.
+//
+//     import { readTextFile, writeTextFile, listDir, IoError } from "std:fs"
+//
+// Errors are VALUES: every fallible export answers `T | IoError` and nothing traps.
+// `IoError`, the errno constants and `errnoName` are also what `std:process` and
+// `std:env` answer in. FREE functions, not methods — the thing operated on is the FILE,
+// so `path` leads. Contents are bytes, from a `u8[]` or a `Buf` (re-exported from `std:buffer`);
+// text is a decoding on top, so a byte range has no text sibling.
+// No path manipulation, no open handles, no truncating to a length, no writes past the end.
+```
+
+The diff-level pass, including `tests/std_embedded_test.ts`, is still owed at build time
+(build item 7).
