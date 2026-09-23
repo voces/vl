@@ -23,7 +23,16 @@ import {
   mkMatch,
 } from "./ast"
 import { getDeclAdd, getDeclName } from "./ast"
-import { BinExpr, Ident, P, Tok, dgMarkLossless, mkDeclNameTok } from "./ast"
+import {
+  BinExpr,
+  Ident,
+  P,
+  Tok,
+  dgMarkLossless,
+  mkDeclNameTok,
+  stmtBraceNodes,
+  stmtBraceTails,
+} from "./ast"
 // The free index-operator declaration-name encoding — the parser is where
 // `function "[]"(self: T, …)` gets the receiver-carrying name it declares under.
 import {
@@ -1380,6 +1389,18 @@ function parseSpreadable() {
   advance() // ELLIPSIS
   skipNewlines()
   mkSpread(parseExpr(), sp0)
+}
+
+// D2223: VL has no empty nested block, so a bare `{}` standing as a statement is refused. The
+// diagnostic is a lossless recovery (the literal stays in the tree, and the checker, which
+// owns the value reading of `{}`, is told by `stmtBraceNodes` not to report it again).
+const EMPTY_BLOCK_MSG = "an empty block does nothing; remove it"
+
+// Whether the `{` at token index `bracePos` closes with nothing but newlines inside it.
+function bracesAreEmpty(bracePos: i32) {
+  let i = bracePos + 1
+  while kindAt(i) == "NEWLINE" { i = i + 1 }
+  kindAt(i) == "RBRACE"
 }
 
 // An object literal `{ name: value, … }`, the cursor on the leading `{`. A field is
@@ -3776,6 +3797,21 @@ export function parseStmt() {
     // A `{` at statement position is a block unless it shapes up as an object literal
     // (`{ k: v, … }` — an expression statement or implicit return). `looksLikeObject`
     // disambiguates, and the object form parses as an expression through `parsePrimary`.
+    if bracesAreEmpty(P.pos) {
+      const at = P.pos
+      const eb = parseObjLit()
+      stmtBraceNodes.push(eb)
+      // The last statement of a block may be its value; the checker words that one.
+      let nx = P.pos
+      while kindAt(nx) == "NEWLINE" || kindAt(nx) == "SEMI" { nx = nx + 1 }
+      if kindAt(nx) == "RBRACE" {
+        stmtBraceTails.push(eb)
+        return eb
+      }
+      dgMarkLossless(P.diags.length) // the index this push is about to occupy
+      P.diags.push({ msg: EMPTY_BLOCK_MSG, at: at })
+      return eb
+    }
     if looksLikeObject(P.pos) { return parseExpr() }
     return parseBlock()
   }

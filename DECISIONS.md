@@ -2218,6 +2218,54 @@ braced blocks reach too (`if c { 1 } else { 2 }` in value position is the same c
 formats parse-clean files, so it simply stops seeing the unbraced input; nothing became
 unreachable.
 
+## `{}` completes an all-nullable record; a `{}` statement is an empty block and refused (owner, 2026-09-23)
+
+**The ruling (D2223), as revised the same day to option (b).** A record literal may omit a
+field whose type admits `null` (it completes to `null`), so `{}` is the literal that omits
+every field. It is legal wherever the EXPECTED type is a record whose fields all admit `null`:
+`type Cfg = { verbose: boolean | null, out: string | null }; const c: Cfg = {}` runs with both
+fields null, and so do an argument, a return, a field, an element, a nullable or union
+destination with such a member, a lambda whose expected return is such a record, and
+`x ?? {}`. Into a union, `{}` is the FIRST member, in declaration order, whose fields all admit
+`null` — the order the literal-to-union adoption already tries members in, so `const u: A | B
+= {}` over two all-nullable records is an `A`; members with a required field are skipped, and
+only when no member admits it is it refused, naming the first record member's required field.
+The TYPE `{}` stays meaningful — a record
+with no fields — and `type E = {}; const e: E = {}` runs. `{}` as a value is refused in two
+cases, each in its own words: against a record with a required field ("`{}` leaves out `a`,
+a required field of P; only a field whose type admits `null` may be omitted"), and where no
+record type is expected at all (`const o = {}`, `{ inner: {} }`, `[{}]`, an inferred return:
+"`{}` has no record type here to complete…"). A `{}` standing as a STATEMENT inside a block
+(`if c { {} }`, a line of a function body) is refused as "an empty block does nothing; remove
+it". As a block's LAST statement where a record value is expected (a function tail under a
+declared return, an `if`/`match` arm value, a lambda body) it is still an empty block, but
+removing it would change the value, so the message says so: "a `{}` here is an empty block;
+to produce an empty record write `({})`". The empty BODY of
+a construct (`if c {}`, `else {}`, `while`, `for`, `function f() {}`, `() => {}`, `=> {}`) is
+unchanged.
+
+**Why not refuse `{}` outright**, the first reading of the ruling: it would single out the
+one record literal that omits everything, while the literal omitting all but one field is
+legal. The rule is the omission rule, and `{}` is its limit case. An empty nested block, by
+contrast, does nothing at all, so the statement reading earns no place.
+
+**Where it lives.** The statement refusal is a lossless parser diagnostic; the parser lists
+the node so the checker types it as the error type without a second message. The value
+readings are the checker's: `assignableExpr`, the seam every binding, argument, return, field,
+element and store delivery passes, marks a `{}` it delivers into a record (following parens,
+`??`'s fallback, list elements and `if`/`match` value tails), and a tail `if` under a declared
+return is marked where the body's tail is checked. The union adoptions try `assignableExpr`
+once per member; those trials are speculative and only record, so the one verdict is the outer
+delivery's, over every member. Only a `{}` that IS the delivered value is accepted as a union
+member there; one inside a join (`s ?? {}`, `[{}, 42]`, an `if` arm) is marked and recorded,
+and the join itself goes through the ordinary check, so its other parts cannot ride along. A `{}` no delivery reached is refused after the last body. A delivered `{}` records its record as both its type and its rep, since no struct
+row has zero fields; the emitter's row resolver takes that record for a zero-field literal.
+
+**Measured.** The distilled corpus moved **0 of 7,589 cells**; `std/`, `compiler/` and consumer
+plumb write no bare `{}`, and every fixture and probe in the tree that wrote one — an empty
+union arm, an omitted map field, a map-typed destination, the `{} | null` probes — keeps its
+spelling and its outcome.
+
 ## ONE hole syntax, `\{expr}`, in BOTH quoted forms — the trigger lives in the escape namespace (owner, 2026-09-01, "OK do `\{`")
 
 **`"v=\{x} done"` interpolates, and so does `` `v=\{x} done` ``.** Plain double-quoted strings

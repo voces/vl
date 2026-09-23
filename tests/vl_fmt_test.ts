@@ -162,6 +162,26 @@ Deno.test({
 });
 
 Deno.test({
+  name: "vl-fmt: an empty lambda body stays `() => {}`, bound and passed as a callback",
+  ignore: !ENABLED,
+  fn: async () => {
+    // It used to print as `() => {` / a blank line / `}`, which read as a body with a
+    // statement missing. A body holding only a comment still expands, keeping the comment.
+    const src = "const g = () => {}\n" +
+      "function each(xs: i32[], cb: (i32) => void) { for x in xs { cb(x) } }\n" +
+      "each([1], (_x) => {})\n" +
+      "each([2], (_x) => {\n  // nothing\n})\n";
+    const r = await run([], src);
+    if (r.code !== 0) throw new Error(`fmt failed: ${r.err}`);
+    for (const want of ["const g = () => {}\n", "each([1], (_x) => {})\n", "  // nothing\n"]) {
+      if (!r.out.includes(want)) throw new Error(`want ${JSON.stringify(want)} in:\n${r.out}`);
+    }
+    const r2 = await run([], r.out);
+    if (r2.out !== r.out) throw new Error(`empty-lambda formatting not idempotent:\n${r2.out}`);
+  },
+});
+
+Deno.test({
   name: "vl-fmt: a `;`-joined one-liner is preserved when it fits, expanded when it overflows",
   ignore: !ENABLED,
   fn: async () => {
