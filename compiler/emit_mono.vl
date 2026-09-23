@@ -98,6 +98,7 @@ import {
   UnionDecl,
   WhileStmt,
   annTsOf,
+  elseIfLink,
   hasNamedArgs,
   i32ToStr,
   mkArrayLit,
@@ -127,7 +128,7 @@ import {
   mkReturn,
   mkUnary,
   mkWhile,
-  nodeChildren,
+  nodeSpineChildren,
   tsMentionsAnyName,
   ufcsAliasAtSite,
 } from "./ast"
@@ -1349,6 +1350,56 @@ function monoCloPinShapeAnn(initIx: i32): i32 {
   -1
 }
 
+// The links of the `else if` chain headed by the `if` at `ix`, outermost first. A rewriter
+// maps each link's condition and then arm in this order, then the last link's else
+// (`monoIfChainElse`), and `monoIfChainRebuild` reassembles them — the node order of the
+// recursive form, at no stack depth (D1990).
+function monoIfChainLinks(ix: i32): i32[] {
+  const links: i32[] = []
+  let cur = ix
+  while cur >= 0 {
+    const c = P.nodes[cur]
+    const at = cur
+    cur = -1
+    if c is IfStmt {
+      links.push(at)
+      if c.ifElse >= 0 && P.nodes[c.ifElse] is IfStmt { cur = c.ifElse }
+    }
+  }
+  links
+}
+
+// The else of the chain's last link: a block, or -1 when it has none.
+function monoIfChainElse(links: i32[]): i32 {
+  const c = P.nodes[links[links.length - 1]]
+  if c is IfStmt { return c.ifElse }
+  -1
+}
+
+// Rebuilds the chain innermost-first from each link's rewritten condition and then arm and the
+// rewritten tail else `ce`, keeping a link whose parts are all unchanged.
+function monoIfChainRebuild(
+  links: i32[],
+  ccs: i32[],
+  cts: i32[],
+  ce0: i32,
+): i32 {
+  let ce = ce0
+  let li = links.length - 1
+  while li >= 0 {
+    const c = P.nodes[links[li]]
+    if c is IfStmt {
+      if ccs[li] == c.ifCond && cts[li] == c.ifThen && ce == c.ifElse {
+        ce = links[li]
+      } else {
+        ce = mkIf(ccs[li], cts[li], ce, c.pos)
+      }
+    }
+    li = li - 1
+  }
+  ce
+}
+
 // Clone a monomorphized instance's body, substituting every `LetDecl` type-param
 // annotation through the binding. Only the statement spine is rebuilt; every leaf
 // expression, a nested lambda included, is shared, so no new function node is created.
@@ -1427,30 +1478,47 @@ function monoCloneBody(
     return mkWhile(n.whileCond, cb, n.whileLabel, n.pos)
   }
   if n is IfStmt {
-    const ct = monoCloneBody(
-      n.ifThen,
-      typarams,
-      tvN,
-      tvV,
-      outName,
-      outType,
-      outTyIx,
-      bN,
-      bT,
+    // An `else if` chain is rewritten along its spine, so its depth costs no stack (D1990).
+    const links = monoIfChainLinks(ix)
+    const ccs: i32[] = []
+    const cts: i32[] = []
+    let k = 0
+    while k < links.length {
+      const c = P.nodes[links[k]]
+      if c is IfStmt {
+        ccs.push(c.ifCond)
+        cts.push(
+          monoCloneBody(
+            c.ifThen,
+            typarams,
+            tvN,
+            tvV,
+            outName,
+            outType,
+            outTyIx,
+            bN,
+            bT,
+          ),
+        )
+      }
+      k = k + 1
+    }
+    return monoIfChainRebuild(
+      links,
+      ccs,
+      cts,
+      monoCloneBody(
+        monoIfChainElse(links),
+        typarams,
+        tvN,
+        tvV,
+        outName,
+        outType,
+        outTyIx,
+        bN,
+        bT,
+      ),
     )
-    const ce = monoCloneBody(
-      n.ifElse,
-      typarams,
-      tvN,
-      tvV,
-      outName,
-      outType,
-      outTyIx,
-      bN,
-      bT,
-    )
-    if ct == n.ifThen && ce == n.ifElse { return ix }
-    return mkIf(n.ifCond, ct, ce, n.pos)
   }
   if n is ForRange {
     const cb = monoCloneBody(
@@ -1980,10 +2048,32 @@ function monoPinBodyLambdas(
     return mkWhile(n.whileCond, cb, n.whileLabel, n.pos)
   }
   if n is IfStmt {
-    const ct = monoPinBodyLambdas(n.ifThen, typarams, tvN, tvV, bN, bT)
-    const ce = monoPinBodyLambdas(n.ifElse, typarams, tvN, tvV, bN, bT)
-    if ct == n.ifThen && ce == n.ifElse { return ix }
-    return mkIf(n.ifCond, ct, ce, n.pos)
+    // An `else if` chain is rewritten along its spine, so its depth costs no stack (D1990).
+    const links = monoIfChainLinks(ix)
+    const ccs: i32[] = []
+    const cts: i32[] = []
+    let k = 0
+    while k < links.length {
+      const c = P.nodes[links[k]]
+      if c is IfStmt {
+        ccs.push(c.ifCond)
+        cts.push(monoPinBodyLambdas(c.ifThen, typarams, tvN, tvV, bN, bT))
+      }
+      k = k + 1
+    }
+    return monoIfChainRebuild(
+      links,
+      ccs,
+      cts,
+      monoPinBodyLambdas(
+        monoIfChainElse(links),
+        typarams,
+        tvN,
+        tvV,
+        bN,
+        bT,
+      ),
+    )
   }
   if n is ForRange {
     const cb = monoPinBodyLambdas(n.frBody, typarams, tvN, tvV, bN, bT)
@@ -2057,11 +2147,16 @@ function monoNodeNamesTyParam(ix: i32, typarams: string[]) {
       if monoTyParamOf(mo.identName, typarams) != "" { return true }
     }
   }
-  const kids = nodeChildren(ix)
-  let i = 0
-  while i < kids.length {
-    if monoNodeNamesTyParam(kids[i], typarams) { return true }
-    i = i + 1
+  // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
+  let cur = ix
+  while cur >= 0 {
+    const kids = nodeSpineChildren(cur)
+    let i = 0
+    while i < kids.length {
+      if monoNodeNamesTyParam(kids[i], typarams) { return true }
+      i = i + 1
+    }
+    cur = elseIfLink(cur)
   }
   false
 }
@@ -2184,10 +2279,25 @@ function monoPinMapLambdas(
     return mkWhile(n.whileCond, cb, n.whileLabel, n.pos)
   }
   if n is IfStmt {
-    const ct = monoPinMapLambdas(n.ifThen, pNames, pElems, pElemTys)
-    const ce = monoPinMapLambdas(n.ifElse, pNames, pElems, pElemTys)
-    if ct == n.ifThen && ce == n.ifElse { return ix }
-    return mkIf(n.ifCond, ct, ce, n.pos)
+    // An `else if` chain is rewritten along its spine, so its depth costs no stack (D1990).
+    const links = monoIfChainLinks(ix)
+    const ccs: i32[] = []
+    const cts: i32[] = []
+    let k = 0
+    while k < links.length {
+      const c = P.nodes[links[k]]
+      if c is IfStmt {
+        ccs.push(c.ifCond)
+        cts.push(monoPinMapLambdas(c.ifThen, pNames, pElems, pElemTys))
+      }
+      k = k + 1
+    }
+    return monoIfChainRebuild(
+      links,
+      ccs,
+      cts,
+      monoPinMapLambdas(monoIfChainElse(links), pNames, pElems, pElemTys),
+    )
   }
   if n is ForRange {
     const cb = monoPinMapLambdas(n.frBody, pNames, pElems, pElemTys)
@@ -2373,10 +2483,25 @@ function monoBakeCallback(
     return mkWhile(n.whileCond, cb, n.whileLabel, n.pos)
   }
   if n is IfStmt {
-    const ct = monoBakeCallback(n.ifThen, cbParamNames, cbFnNames)
-    const ce = monoBakeCallback(n.ifElse, cbParamNames, cbFnNames)
-    if ct == n.ifThen && ce == n.ifElse { return ix }
-    return mkIf(n.ifCond, ct, ce, n.pos)
+    // An `else if` chain is rewritten along its spine, so its depth costs no stack (D1990).
+    const links = monoIfChainLinks(ix)
+    const ccs: i32[] = []
+    const cts: i32[] = []
+    let k = 0
+    while k < links.length {
+      const c = P.nodes[links[k]]
+      if c is IfStmt {
+        ccs.push(c.ifCond)
+        cts.push(monoBakeCallback(c.ifThen, cbParamNames, cbFnNames))
+      }
+      k = k + 1
+    }
+    return monoIfChainRebuild(
+      links,
+      ccs,
+      cts,
+      monoBakeCallback(monoIfChainElse(links), cbParamNames, cbFnNames),
+    )
   }
   if n is ForRange {
     const cb = monoBakeCallback(n.frBody, cbParamNames, cbFnNames)
@@ -2542,11 +2667,25 @@ function monoCloneGenericCalls(ix: i32) {
     return mkReturn(ca2, n.pos)
   }
   if n is IfStmt {
-    const cc = monoCloneGenericCalls(n.ifCond)
-    const ct = monoCloneGenericCalls(n.ifThen)
-    const ce = monoCloneGenericCalls(n.ifElse)
-    if cc == n.ifCond && ct == n.ifThen && ce == n.ifElse { return ix }
-    return mkIf(cc, ct, ce, n.pos)
+    // An `else if` chain is rewritten along its spine, so its depth costs no stack (D1990).
+    const links = monoIfChainLinks(ix)
+    const ccs: i32[] = []
+    const cts: i32[] = []
+    let k = 0
+    while k < links.length {
+      const c = P.nodes[links[k]]
+      if c is IfStmt {
+        ccs.push(monoCloneGenericCalls(c.ifCond))
+        cts.push(monoCloneGenericCalls(c.ifThen))
+      }
+      k = k + 1
+    }
+    return monoIfChainRebuild(
+      links,
+      ccs,
+      cts,
+      monoCloneGenericCalls(monoIfChainElse(links)),
+    )
   }
   if n is WhileStmt {
     const wc = monoCloneGenericCalls(n.whileCond)
@@ -2770,11 +2909,25 @@ function monoPinBinOps(ix: i32, pNames: string[], pTys: i32[]) {
     return mkReturn(ca, n.pos)
   }
   if n is IfStmt {
-    const cc = monoPinBinOps(n.ifCond, pNames, pTys)
-    const ct = monoPinBinOps(n.ifThen, pNames, pTys)
-    const ce = monoPinBinOps(n.ifElse, pNames, pTys)
-    if cc == n.ifCond && ct == n.ifThen && ce == n.ifElse { return ix }
-    return mkIf(cc, ct, ce, n.pos)
+    // An `else if` chain is rewritten along its spine, so its depth costs no stack (D1990).
+    const links = monoIfChainLinks(ix)
+    const ccs: i32[] = []
+    const cts: i32[] = []
+    let k = 0
+    while k < links.length {
+      const c = P.nodes[links[k]]
+      if c is IfStmt {
+        ccs.push(monoPinBinOps(c.ifCond, pNames, pTys))
+        cts.push(monoPinBinOps(c.ifThen, pNames, pTys))
+      }
+      k = k + 1
+    }
+    return monoIfChainRebuild(
+      links,
+      ccs,
+      cts,
+      monoPinBinOps(monoIfChainElse(links), pNames, pTys),
+    )
   }
   if n is WhileStmt {
     const wc = monoPinBinOps(n.whileCond, pNames, pTys)
@@ -3001,11 +3154,25 @@ function monoFoldTyParamLayout(
     return mkReturn(ca, n.pos)
   }
   if n is IfStmt {
-    const cc = monoFoldTyParamLayout(n.ifCond, typarams, tvN, tvV)
-    const ct = monoFoldTyParamLayout(n.ifThen, typarams, tvN, tvV)
-    const ce = monoFoldTyParamLayout(n.ifElse, typarams, tvN, tvV)
-    if cc == n.ifCond && ct == n.ifThen && ce == n.ifElse { return ix }
-    return mkIf(cc, ct, ce, n.pos)
+    // An `else if` chain is rewritten along its spine, so its depth costs no stack (D1990).
+    const links = monoIfChainLinks(ix)
+    const ccs: i32[] = []
+    const cts: i32[] = []
+    let k = 0
+    while k < links.length {
+      const c = P.nodes[links[k]]
+      if c is IfStmt {
+        ccs.push(monoFoldTyParamLayout(c.ifCond, typarams, tvN, tvV))
+        cts.push(monoFoldTyParamLayout(c.ifThen, typarams, tvN, tvV))
+      }
+      k = k + 1
+    }
+    return monoIfChainRebuild(
+      links,
+      ccs,
+      cts,
+      monoFoldTyParamLayout(monoIfChainElse(links), typarams, tvN, tvV),
+    )
   }
   if n is WhileStmt {
     const wc = monoFoldTyParamLayout(n.whileCond, typarams, tvN, tvV)

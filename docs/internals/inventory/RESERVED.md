@@ -58,3 +58,4 @@ D2000-D2009  vl-11  2026-09-22  PL-014 perf lanes
 D2010-D2019  vl-11  2026-09-22  review follow-ups 2
 D2020-D2029  vl-11  2026-09-22  PL-003(b) and follow-ups
 D2030-D2039  vl-11  2026-09-22  getters v1 lanes
+D2050-D2059  vl-11  2026-09-22  review follow-ups 4

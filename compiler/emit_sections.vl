@@ -1084,28 +1084,37 @@ function startScanHeaderExpr(exprIx: i32) {
   0
 }
 
-// Scans a top-level `if` chain: the condition expression plus every arm's block (an `else if` recurses through this function).
+// Scans a top-level `if` chain: the condition expression plus every arm's block, walking an
+// `else if` chain along its spine so its depth costs no stack (D1990).
 function startScanIf(ifIx: i32) {
-  const st = P.nodes[ifIx]
-  if st is IfStmt {
-    startScanHeaderExpr(st.ifCond)
-    // Narrow across each arm (mirroring `ifChainHasStrOp` / `emitStmt`): the
-    // then-branch sees the guard's narrowing, the else-branch sees a VALUE
-    // union's complement — so a top-level `if w is string { print(w) }`
-    // reserves the string scratch frame in the start function.
-    const savedTop = narrowTop
-    const narrowed = setNarrowFromCond(st.ifCond, -1)
-    startScanBlock(st.ifThen)
-    if narrowed { restoreNarrow(savedTop) }
-    if st.ifElse >= 0 {
-      const savedElseTop = narrowTop
-      const narrowedElse = setNarrowFromCondElse(st.ifCond, -1)
-      const els = P.nodes[st.ifElse]
-      if els is Block { startScanBlock(st.ifElse) }
-      if els is IfStmt { startScanIf(st.ifElse) }
-      if narrowedElse { restoreNarrow(savedElseTop) }
+  // The outermost else narrowing restored is the state the nested restores would have left.
+  let elseTop = -1
+  let cur = ifIx
+  while cur >= 0 {
+    const st = P.nodes[cur]
+    cur = -1
+    if st is IfStmt {
+      startScanHeaderExpr(st.ifCond)
+      // Narrow across each arm (mirroring `ifChainHasStrOp` / `emitStmt`): the
+      // then-branch sees the guard's narrowing, the else-branch sees a VALUE
+      // union's complement — so a top-level `if w is string { print(w) }`
+      // reserves the string scratch frame in the start function.
+      const savedTop = narrowTop
+      const narrowed = setNarrowFromCond(st.ifCond, -1)
+      startScanBlock(st.ifThen)
+      if narrowed { restoreNarrow(savedTop) }
+      if st.ifElse >= 0 {
+        const savedElseTop = narrowTop
+        if setNarrowFromCondElse(st.ifCond, -1) {
+          if elseTop < 0 { elseTop = savedElseTop }
+        }
+        const els = P.nodes[st.ifElse]
+        if els is Block { startScanBlock(st.ifElse) }
+        if els is IfStmt { cur = st.ifElse }
+      }
     }
   }
+  if elseTop >= 0 { restoreNarrow(elseTop) }
   0
 }
 

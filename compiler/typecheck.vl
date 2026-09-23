@@ -67,6 +67,7 @@ import {
   callIsNever,
   callIsRestPacked,
   hasSpreadItem,
+  isBareBlockIf,
   markCallNever,
   markCallRestPacked,
   mkArrayLit,
@@ -282,7 +283,7 @@ import {
 // write-effect summary behind the aliased-write invalidation needs the same total
 // traversal the lint rules do, and a second copy is a second thing to keep in step with
 // the node roster.
-import { nodeChildren } from "./ast"
+import { elseIfLink, nodeSpineChildren } from "./ast"
 
 // ── type-arena variants ──────────────────────────────────────────────────────
 // One struct per type kind, prefixed field names so `is` discriminates the union (the
@@ -964,8 +965,8 @@ let pgUpKeys: string[] = []
 let pgUpTys: i32[] = []
 
 // The node index of the `if` currently being checked as the else arm of a chain, or `-1`. Set
-// immediately before `checkNode(n.ifElse)` and read-and-cleared at the very top of
-// `checkIfStmtNode`, so only the immediate callee sees it: an `if` nested inside an arm's body
+// by a link's head immediately before the next link's head runs, and read-and-cleared at the
+// very top of `checkIfHead`, so only that link sees it: an `if` nested inside an arm's body
 // has a block of its own and declares normally.
 let pgUpArmIx = -1
 
@@ -2361,16 +2362,30 @@ function nodeIsTotalAt(ix: i32, tail: boolean) {
     if callIsNever(ix) { return true }
   }
   if n is IfStmt {
-    if n.ifElse < 0 {
-      // An else-less `if`: a discriminating `is` / literal-equality chain may be exhaustive, so
-      // this defers to the dedicated exhaustiveness check, which knows the union's variants. A
-      // plain else-less `if` always has a fall-through and is not total.
-      if ifCondIsDiscriminating(n.ifCond) { return true }
-      return false
+    // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
+    let cur = ix
+    while cur >= 0 {
+      const c = P.nodes[cur]
+      const at = cur
+      cur = -1
+      if c is IfStmt {
+        if c.ifElse < 0 {
+          // An else-less `if`: a discriminating `is` / literal-equality chain may be
+          // exhaustive, so this defers to the dedicated exhaustiveness check, which knows the
+          // union's variants. A plain else-less `if` always has a fall-through and is not total.
+          return ifCondIsDiscriminating(c.ifCond)
+        }
+        // An arm that completes with no value falls off the end, whatever the other arm does.
+        if ifYieldsNoValue(at) { return false }
+        if !nodeIsTotalAt(c.ifThen, tail) { return false }
+        if P.nodes[c.ifElse] is IfStmt {
+          cur = c.ifElse
+        } else {
+          return nodeIsTotalAt(c.ifElse, tail)
+        }
+      }
     }
-    // An arm that completes with no value falls off the end, whatever the other arm does.
-    if ifYieldsNoValue(ix) { return false }
-    return nodeIsTotalAt(n.ifThen, tail) && nodeIsTotalAt(n.ifElse, tail)
+    return false
   }
   if n is WhileStmt {
     // `while true { … }` never completes normally — it diverges or returns inside.
@@ -4675,12 +4690,17 @@ function findFnDeclWalk(rootIx: i32, name: string) {
   if n is FuncDecl {
     if n.fnName == name { return rootIx }
   }
-  const kids = nodeChildren(rootIx)
-  let i = 0
-  while i < kids.length {
-    const d = findFnDeclWalk(kids[i], name)
-    if d >= 0 { return d }
-    i = i + 1
+  // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
+  let cur = rootIx
+  while cur >= 0 {
+    const kids = nodeSpineChildren(cur)
+    let i = 0
+    while i < kids.length {
+      const d = findFnDeclWalk(kids[i], name)
+      if d >= 0 { return d }
+      i = i + 1
+    }
+    cur = elseIfLink(cur)
   }
   -1
 }
@@ -4709,13 +4729,18 @@ function weScan(ix: i32, pname: string) {
     if inner == "*" { return "*" }
     acc = acc + inner
   }
-  const kids = nodeChildren(ix)
-  let i = 0
-  while i < kids.length {
-    const sub = weScan(kids[i], pname)
-    if sub == "*" { return "*" }
-    acc = acc + sub
-    i = i + 1
+  // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
+  let cur = ix
+  while cur >= 0 {
+    const kids = nodeSpineChildren(cur)
+    let i = 0
+    while i < kids.length {
+      const sub = weScan(kids[i], pname)
+      if sub == "*" { return "*" }
+      acc = acc + sub
+      i = i + 1
+    }
+    cur = elseIfLink(cur)
   }
   acc
 }
@@ -4851,11 +4876,16 @@ function fnBoundNames(fnIx: i32, out: string[]) {
     out.push(n.fiVar)
     if n.fiVar2 != "" { out.push(n.fiVar2) }
   }
-  const kids = nodeChildren(fnIx)
-  let k = 0
-  while k < kids.length {
-    if kids[k] >= 0 { fnBoundNames(kids[k], out) }
-    k = k + 1
+  // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
+  let cur = fnIx
+  while cur >= 0 {
+    const kids = nodeSpineChildren(cur)
+    let k = 0
+    while k < kids.length {
+      if kids[k] >= 0 { fnBoundNames(kids[k], out) }
+      k = k + 1
+    }
+    cur = elseIfLink(cur)
   }
   0
 }
@@ -4916,13 +4946,18 @@ function weScanFree(ix: i32, bound: string[]) {
     if inner == "*" { return "*" }
     acc = acc + inner
   }
-  const kids = nodeChildren(ix)
-  let i = 0
-  while i < kids.length {
-    const sub = weScanFree(kids[i], bound)
-    if sub == "*" { return "*" }
-    acc = acc + sub
-    i = i + 1
+  // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
+  let cur = ix
+  while cur >= 0 {
+    const kids = nodeSpineChildren(cur)
+    let i = 0
+    while i < kids.length {
+      const sub = weScanFree(kids[i], bound)
+      if sub == "*" { return "*" }
+      acc = acc + sub
+      i = i + 1
+    }
+    cur = elseIfLink(cur)
   }
   acc
 }
@@ -15524,11 +15559,17 @@ function cwFrameWalk(ix: i32, fr: i32) {
     cwFrameWalk(n.fnBody, ix)
     return 0
   }
-  const kids = nodeChildren(ix)
-  let i = 0
-  while i < kids.length {
-    cwFrameWalk(kids[i], fr)
-    i = i + 1
+  // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
+  let cur = ix
+  while cur >= 0 {
+    if cur != ix { cwFrameOf[cur] = fr }
+    const kids = nodeSpineChildren(cur)
+    let i = 0
+    while i < kids.length {
+      cwFrameWalk(kids[i], fr)
+      i = i + 1
+    }
+    cur = elseIfLink(cur)
   }
   0
 }
@@ -24837,13 +24878,18 @@ function matchTallyEnd(ix: i32, acc: i32) {
 // discards a tail value (DECISIONS.md), so there each value arm returns and a value-less
 // arm falls through like any other path, to `null` or to the missing-return refusal.
 function clearTailVerdict(ix: i32) {
-  if ix < 0 { return 0 }
-  if ix < ifNoValueAt.length { ifNoValueAt[ix] = false }
-  const n = P.nodes[ix]
-  if n is IfStmt {
-    clearTailVerdict(blockLastStmt(n.ifThen))
-    clearTailVerdict(blockLastStmt(n.ifElse))
-    clearTailVerdict(n.ifElse)
+  // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
+  let cur = ix
+  while cur >= 0 {
+    const at = cur
+    cur = -1
+    if at < ifNoValueAt.length { ifNoValueAt[at] = false }
+    const n = P.nodes[at]
+    if n is IfStmt {
+      clearTailVerdict(blockLastStmt(n.ifThen))
+      clearTailVerdict(blockLastStmt(n.ifElse))
+      cur = n.ifElse
+    }
   }
   0
 }
@@ -25397,15 +25443,15 @@ export function blockHasBareReturn(blockIx: i32): boolean {
 
 // The `else if` hop of `blockHasBareReturn`: a chain's arms are the same question.
 function ifChainHasBareReturn(ifIx: i32): boolean {
-  const st = P.nodes[ifIx]
-  if st is IfStmt {
-    if blockHasBareReturn(st.ifThen) { return true }
-    if st.ifElse >= 0 {
-      const els = P.nodes[st.ifElse]
-      if els is Block {
-        if blockHasBareReturn(st.ifElse) { return true }
-      } else if els is IfStmt {
-        if ifChainHasBareReturn(st.ifElse) { return true }
+  let cur = ifIx // walks the chain's spine, so its depth costs no stack (D1990)
+  while cur >= 0 {
+    const st = P.nodes[cur]
+    cur = -1
+    if st is IfStmt {
+      if blockHasBareReturn(st.ifThen) { return true }
+      if st.ifElse >= 0 {
+        if P.nodes[st.ifElse] is IfStmt { cur = st.ifElse }
+        else if blockHasBareReturn(st.ifElse) { return true }
       }
     }
   }
@@ -27690,6 +27736,12 @@ function checkNode(ix: i32) {
     if !tailSpineNode(ix) { retTailPos = false }
   }
   const t = checkNodeReal(ix)
+  checkNodeDone(ix, t, savedTail)
+  t
+}
+
+// `checkNode`'s exit bookkeeping, shared with `checkIfStmtNode`'s walk of an `else if` chain.
+function checkNodeDone(ix: i32, t: i32, savedTail: boolean) {
   retTailPos = savedTail
   // A call typed `never` ends its path; marked on every pass, since narrowing asks during inference too.
   if t == TY_NEVER && t >= 0 {
@@ -27702,7 +27754,7 @@ function checkNode(ix: i32) {
     if v128Seen { v128NestCheck(ix, t) }
     noteNestCstr(t, ix)
   }
-  t
+  0
 }
 
 // Set once a program names `v128` or calls a SIMD intrinsic, so `v128NestCheck` costs a program
@@ -27994,7 +28046,7 @@ function checkNodeReal(ix: i32) {
   } else if n is MatchExpr {
     return checkMatchExprNode(n, ix)
   } else if n is IfStmt {
-    return checkIfStmtNode(n, ix)
+    return checkIfStmtNode(ix)
   } else if n is RetStmt {
     return checkRetStmtNode(n, ix)
   } else if n is Block {
@@ -34820,16 +34872,15 @@ function matchIntPatValue(numIx: i32, neg: boolean) {
 }
 
 // One integer-literal arm pattern: type-checks it against the scrutinee and claims its value,
-// reporting a mismatch or a duplicate at the pattern. `keyHi`/`keyLo` are the values already
-// claimed (VL arrays are references, so the push is the caller's). Answers false only for a
-// type mismatch — the one refusal that makes the pattern cover nothing.
+// reporting a mismatch or a duplicate at the pattern. `claimed` holds the values already
+// claimed, keyed `hi:lo` so a match of any arm count stays linear (D1990). Answers false only
+// for a type mismatch — the one refusal that makes the pattern cover nothing.
 function checkIntArmLit(
   patIx: i32,
   numIx: i32,
   neg: boolean,
   st: i32,
-  keyHi: i32[],
-  keyLo: i32[],
+  claimed: {[string]: boolean},
 ) {
   // Checked as the expression it is, so `nodeTyIx` is filled for the `==` the desugar builds
   // over it — an `i32` literal reaches an `i64` scrutinee by the widening lattice, never the reverse.
@@ -34849,21 +34900,17 @@ function checkIntArmLit(
   noteBinCstr(st, "==", pt)
   const key = matchIntPatValue(numIx, neg)
   if key.length != 2 { return true }
-  let ki = 0
-  while ki < keyHi.length {
-    if keyHi[ki] == key[0] && keyLo[ki] == key[1] {
-      tErr(
-        "redundant match arm: `" +
-          matchIntPatLexeme(numIx, neg) +
-          "` is already covered",
-        patIx,
-      )
-      return true
-    }
-    ki = ki + 1
+  const k = i32ToStr(key[0]) + ":" + i32ToStr(key[1])
+  if claimed.has(k) {
+    tErr(
+      "redundant match arm: `" +
+        matchIntPatLexeme(numIx, neg) +
+        "` is already covered",
+      patIx,
+    )
+    return true
   }
-  keyHi.push(key[0])
-  keyLo.push(key[1])
+  claimed.set(k, true)
   true
 }
 
@@ -34872,9 +34919,8 @@ function checkIntArmLit(
 // over. Duplicate arms and an arm after the `_` are errors. No emitter path of its own —
 // `desugarMatchAt` already turns a non-`IsExpr` pattern into `scrut == pat`.
 function checkMatchIntArms(n: MatchExpr, ix: i32, st: i32) {
-  // The literal values already claimed, as parallel high/low halves of the 64-bit key.
-  const keyHi: i32[] = []
-  const keyLo: i32[] = []
+  // The literal values already claimed, keyed by the 64-bit value's `hi:lo` halves.
+  const claimed: {[string]: boolean} = Map()
   let hasWild = false
   let wildArm = -1
   // A pattern that is not an integer literal covers nothing — report it at the pattern and
@@ -34902,9 +34948,7 @@ function checkMatchIntArms(n: MatchExpr, ix: i32, st: i32) {
           // or a parse-recovery node) — named here rather than read as a missing member.
           sawBadPat = true
           tErr(intArmRejectMsg(st), patIx)
-        } else if (
-          !checkIntArmLit(patIx, numIx, numIx != patIx, st, keyHi, keyLo)
-        ) {
+        } else if (!checkIntArmLit(patIx, numIx, numIx != patIx, st, claimed)) {
           sawBadPat = true
         }
       }
@@ -35448,7 +35492,73 @@ function matchNulPatHint(nulLit: boolean) {
   ""
 }
 
-function checkIfStmtNode(n: IfStmt, ix: i32) {
+// One `if` link's checker state, carried from its head (condition, narrowing, then arm) to its
+// tail (else arm join, definite assignment, post-guard legs) across the links below it.
+type IfChk = {
+  ifIx: i32,
+  isElseArm: boolean,
+  pgUpMark: i32,
+  clobMark: i32,
+  ifTail: boolean,
+  ifInRetArg: boolean,
+  seedLogMark: i32,
+  seedObsMark: i32,
+  thenExits: boolean,
+  tnNames: string[],
+  enNames: string[],
+  enTys: i32[],
+  altRows: i32[],
+  thenOwnDepth: i32,
+  thenLo: i32,
+  thenHi: i32,
+  thenTy: i32,
+  daFork: i32,
+  daThenAdds: i32[],
+  daThenRems: i32[],
+  daHasElse: boolean,
+  elseOwnDepth: i32,
+  elseLo: i32,
+  exits: boolean, // `stmtAlwaysExits` of this link, set by its tail
+}
+
+// An `else if` chain is checked along its spine: every link's head runs outermost-first, then
+// every tail innermost-first, with `checkNode`'s own bookkeeping for each inner link between, so
+// the chain's depth costs no stack (D1990).
+function checkIfStmtNode(ix: i32) {
+  const frames: IfChk[] = []
+  const savedTails: boolean[] = []
+  let cur = ix
+  let elseRes = TY_VOID
+  while cur >= 0 {
+    const c = P.nodes[cur]
+    const at = cur
+    cur = -1
+    if c is IfStmt {
+      frames.push(checkIfHead(c, at))
+      if c.ifElse >= 0 {
+        if P.nodes[c.ifElse] is IfStmt {
+          // `checkNode`'s entry for the inner link; an `if` is a tail-spine node.
+          savedTails.push(retTailPos)
+          cur = c.ifElse
+        } else {
+          elseRes = checkNode(c.ifElse)
+        }
+      }
+    }
+  }
+  let k = frames.length - 1
+  let res = checkIfTailAt(frames[k], elseRes, false)
+  while k > 0 {
+    const inner = frames[k]
+    k = k - 1
+    checkNodeDone(inner.ifIx, res, savedTails[k])
+    res = checkIfTailAt(frames[k], res, inner.exits)
+  }
+  res
+}
+
+// The head of one link: everything up to checking its else arm.
+function checkIfHead(n: IfStmt, ix: i32): IfChk {
   // Am I the else arm of an enclosing `if`? Read and cleared here, so the flag reaches
   // exactly one callee and every `if` inside a branch body sees `-1` (`pgUpKeys`).
   const isElseArm = ix >= 0 && ix == pgUpArmIx
@@ -35524,7 +35634,6 @@ function checkIfStmtNode(n: IfStmt, ix: i32) {
   // marked (D1972): the post-guard leg, the `else if` hand-up and the emitter's
   // `pushPostGuardNarrow` all ask the same predicate.
   const thenExits = stmtAlwaysExits(n.ifThen)
-  const daThenDiverges = thenExits
   if guardedRet { guardAltStack.pop() }
   retTailPos = false
   const thenTy = blockTailTy
@@ -35553,16 +35662,10 @@ function checkIfStmtNode(n: IfStmt, ix: i32) {
   const daThenAdds: i32[] = []
   const daThenRems: i32[] = []
   daSplitDelta(daThenSid, daThenWas, daThenAdds, daThenRems)
-  let daElseDiverges = false
-  const daElseAdds: i32[] = []
-  const daElseRems: i32[] = []
-  let elseTy = TY_VOID
-  let elseIsLink = false
   // The else arm's own depth and row range, read by the arm join below. An absent else leaves
   // them at their no-rows defaults, which is what says the fall-through wrote nothing.
   let elseOwnDepth = -1
   let elseLo = 0
-  let elseHi = 0
   const daHasElse = n.ifElse >= 0
   if daHasElse {
     if enNames.length > 0 {
@@ -35578,9 +35681,91 @@ function checkIfStmtNode(n: IfStmt, ix: i32) {
     retTailPos = ifTail
     elseOwnDepth = T.scopes.length + 1
     elseLo = narClobKeys.length
-    const elseRes = checkNode(n.ifElse)
+  }
+  return {
+    ifIx: ix,
+    isElseArm: isElseArm,
+    pgUpMark: pgUpMark,
+    clobMark: clobMark,
+    ifTail: ifTail,
+    ifInRetArg: ifInRetArg,
+    seedLogMark: seedLogMark,
+    seedObsMark: seedObsMark,
+    thenExits: thenExits,
+    tnNames: tnNames,
+    enNames: enNames,
+    enTys: enTys,
+    altRows: altRows,
+    thenOwnDepth: thenOwnDepth,
+    thenLo: thenLo,
+    thenHi: thenHi,
+    thenTy: thenTy,
+    daFork: daFork,
+    daThenAdds: daThenAdds,
+    daThenRems: daThenRems,
+    daHasElse: daHasElse,
+    elseOwnDepth: elseOwnDepth,
+    elseLo: elseLo,
+    exits: false,
+  }
+}
+
+// The tail of one link, given its else arm's type and, for an `else if` link, whether that
+// link always exits (the chain's own `stmtAlwaysExits`, read bottom-up).
+function checkIfTailAt(f: IfChk, elseRes: i32, innerExits: boolean): i32 {
+  const n0 = P.nodes[f.ifIx]
+  if n0 is IfStmt { return checkIfTail(n0, f, elseRes, innerExits) }
+  TY_ERR
+}
+
+function checkIfTail(
+  n: IfStmt,
+  f: IfChk,
+  elseRes: i32,
+  innerExits: boolean,
+): i32 {
+  // Any else arm but an `else if` link is asked here, once it is checked, so a `never` call in it
+  // is already marked; a link's answer is its own tail's, read bottom-up.
+  let elseExits = innerExits
+  if n.ifElse >= 0 {
+    if !(P.nodes[n.ifElse] is IfStmt) || isBareBlockIf(n.ifElse) {
+      elseExits = stmtAlwaysExits(n.ifElse)
+    }
+  }
+  const ix = f.ifIx
+  const isElseArm = f.isElseArm
+  const pgUpMark = f.pgUpMark
+  const clobMark = f.clobMark
+  const ifTail = f.ifTail
+  const ifInRetArg = f.ifInRetArg
+  const seedLogMark = f.seedLogMark
+  const seedObsMark = f.seedObsMark
+  const thenExits = f.thenExits
+  const tnNames = f.tnNames
+  const enNames = f.enNames
+  const enTys = f.enTys
+  const altRows = f.altRows
+  const thenOwnDepth = f.thenOwnDepth
+  const thenLo = f.thenLo
+  const thenHi = f.thenHi
+  const thenTy = f.thenTy
+  const daFork = f.daFork
+  const daThenAdds = f.daThenAdds
+  const daThenRems = f.daThenRems
+  const daHasElse = f.daHasElse
+  const elseOwnDepth = f.elseOwnDepth
+  const elseLo = f.elseLo
+  const daThenDiverges = thenExits
+  let daElseDiverges = false
+  const daElseAdds: i32[] = []
+  const daElseRems: i32[] = []
+  let elseTy = TY_VOID
+  let elseIsLink = false
+  let elseHi = 0
+  if daHasElse {
+    const enElse = P.nodes[n.ifElse]
     elseHi = narClobKeys.length
-    daElseDiverges = stmtAlwaysExits(n.ifElse)
+    daElseDiverges = elseExits
     pgUpArmIx = -1
     retTailPos = false
     elseTy = blockTailTy
@@ -35711,6 +35896,7 @@ function checkIfStmtNode(n: IfStmt, ix: i32) {
       pgUpTys.pop()
     }
   }
+  f.exits = thenExits && daHasElse && daElseDiverges
   retTailPos = ifTail
   // An `if` with a completing arm that yields no value is a statement: it is `void` as the
   // function's tail, so the arm values it seeded leave the inferred return.

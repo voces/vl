@@ -2363,8 +2363,22 @@ export function stmtAlwaysExits(ix: i32): boolean {
     // The emitter's lowered bare block runs its arm unconditionally, so it answers as its
     // block does, or the passes on either side of that rewrite would disagree.
     if isBareBlockIf(ix) { return stmtAlwaysExits(s.ifThen) }
-    if s.ifElse < 0 { return false }
-    return stmtAlwaysExits(s.ifThen) && stmtAlwaysExits(s.ifElse)
+    // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
+    let cur = ix
+    while cur >= 0 {
+      const c = P.nodes[cur]
+      cur = -1
+      if c is IfStmt {
+        if c.ifElse < 0 { return false }
+        if !stmtAlwaysExits(c.ifThen) { return false }
+        if P.nodes[c.ifElse] is IfStmt && !isBareBlockIf(c.ifElse) {
+          cur = c.ifElse
+        } else {
+          return stmtAlwaysExits(c.ifElse)
+        }
+      }
+    }
+    return false
   } else if s is MatchExpr {
     // A checked `match` is exhaustive, and its desugar is an if/else chain ending in a bare
     // `else`, so this answer and the one read off the lowered chain agree.
@@ -2385,6 +2399,33 @@ export function stmtAlwaysExits(ix: i32): boolean {
 // result is read-only to every caller — all of them index it and read `.length`, none
 // appends — and just under half the nodes in a parse have no children at all.
 const nodeNoKids: i32[] = []
+
+// The next link of an `else if` chain: the else of the `if` at `ix` when that else is itself
+// an `if`, otherwise -1. A recursive walker loops on it rather than descending, so a chain's
+// depth — a `match` desugars to one link per arm — costs no stack (D1990).
+export function elseIfLink(ix: i32): i32 {
+  if ix < 0 || ix >= P.nodes.length { return -1 }
+  const n = P.nodes[ix]
+  if n is IfStmt {
+    if n.ifElse >= 0 && n.ifElse < P.nodes.length {
+      if P.nodes[n.ifElse] is IfStmt { return n.ifElse }
+    }
+  }
+  -1
+}
+
+// `nodeChildren` with an `else if` link left out (its slot reads -1), for a walker that loops
+// `cur = elseIfLink(cur)` around its child loop. Every other kind answers as `nodeChildren`.
+export function nodeSpineChildren(ix: i32) {
+  const next = elseIfLink(ix)
+  if next < 0 { return nodeChildren(ix) }
+  const n = P.nodes[ix]
+  if n is IfStmt {
+    const out: i32[] = [n.ifCond, n.ifThen, -1]
+    return out
+  }
+  nodeChildren(ix)
+}
 
 // The child arena indices of `P.nodes[ix]` in source order; a slot holding `-1` is pushed
 // as-is and the walker's bounds check skips it. Covers value children and type-annotation
@@ -2527,4 +2568,11 @@ export function nodeValueChildren(ix: i32): i32[] {
   if n is FieldDef { return nodeNoKids }
   if n is TypeDecl { return nodeNoKids }
   nodeChildren(ix)
+}
+
+// `nodeValueChildren` with an `else if` link left out, the value-walk twin of
+// `nodeSpineChildren`.
+export function nodeValueSpineChildren(ix: i32): i32[] {
+  if elseIfLink(ix) >= 0 { return nodeSpineChildren(ix) }
+  nodeValueChildren(ix)
 }

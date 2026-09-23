@@ -234,11 +234,13 @@ import {
   WhileStmt,
   annTsOf,
   callIsNever,
+  elseIfLink,
   externLinkOf,
   externRetIsVoid,
   hasSpreadItem,
   mkTypeRef,
   nodeChildren,
+  nodeSpineChildren,
   spreadArgOf,
   stmtAlwaysExits,
   tsHasKind,
@@ -3933,16 +3935,31 @@ function criWalkStmt(stmtIx: i32, i: i32) {
     return 0
   }
   if s is IfStmt {
-    const savedTop = narrowTop
-    setNarrowFromCond(s.ifCond, fnStmts[i])
-    criWalkBlock(s.ifThen, i)
-    restoreNarrow(savedTop)
-    if s.ifElse >= 0 {
-      const savedElseTop = narrowTop
-      setNarrowFromCondElse(s.ifCond, fnStmts[i])
-      criWalkBlock(s.ifElse, i)
-      restoreNarrow(savedElseTop)
+    // An `else if` chain is walked along its spine, so its depth costs no stack (D1990). Each
+    // link's else narrowing holds across the links below it; the outermost restore is the state
+    // the nested restores would have left.
+    let elseTop = -1
+    let cur = stmtIx
+    while cur >= 0 {
+      const c = P.nodes[cur]
+      cur = -1
+      if c is IfStmt {
+        const savedTop = narrowTop
+        setNarrowFromCond(c.ifCond, fnStmts[i])
+        criWalkBlock(c.ifThen, i)
+        restoreNarrow(savedTop)
+        if c.ifElse >= 0 {
+          if elseTop < 0 { elseTop = narrowTop }
+          setNarrowFromCondElse(c.ifCond, fnStmts[i])
+          if P.nodes[c.ifElse] is IfStmt {
+            cur = c.ifElse
+          } else {
+            criWalkBlock(c.ifElse, i)
+          }
+        }
+      }
     }
+    if elseTop >= 0 { restoreNarrow(elseTop) }
     return 0
   }
   if s is WhileStmt { return criWalkBlock(s.whileBody, i) }
@@ -4218,11 +4235,19 @@ function modLoopNoneHere(): i32 { -1 }
 function nodeSubtreeHas(ix: i32, at: i32): boolean {
   if ix < 0 { return false }
   if ix == at { return true }
-  const kids = nodeChildren(ix)
-  let i = 0
-  while i < kids.length {
-    if nodeSubtreeHas(kids[i], at) { return true }
-    i = i + 1
+  // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
+  let cur = ix
+  while cur >= 0 {
+    if cur != ix {
+      if cur == at { return true }
+    }
+    const kids = nodeSpineChildren(cur)
+    let i = 0
+    while i < kids.length {
+      if nodeSubtreeHas(kids[i], at) { return true }
+      i = i + 1
+    }
+    cur = elseIfLink(cur)
   }
   false
 }
@@ -4371,25 +4396,36 @@ export function capScan(ix: i32, bound: string[], caps: string[]) {
     return 0
   }
   if n is IfStmt {
-    capScan(n.ifCond, bound, caps)
     // While recording, each arm is scanned under the narrowing that arm sees — the same
     // `setNarrowFromCond` and `setNarrowFromCondElse` pair the emit and classify loops use,
     // so a closure's recorded narrowing is the one the rest of the compiler would compute
-    // for a read written in its place.
-    if cnRecording {
-      const savedIfTop = narrowTop
-      cnSetNarrow(n.ifCond, false)
-      capScan(n.ifThen, bound, caps)
-      restoreNarrow(savedIfTop)
-      if n.ifElse >= 0 {
-        cnSetNarrow(n.ifCond, true)
-        capScan(n.ifElse, bound, caps)
-        restoreNarrow(savedIfTop)
+    // for a read written in its place. An `else if` chain is walked along its spine (D1990).
+    const savedIfTop = narrowTop
+    let cur = ix
+    while cur >= 0 {
+      const c = P.nodes[cur]
+      cur = -1
+      if c is IfStmt {
+        capScan(c.ifCond, bound, caps)
+        if cnRecording {
+          const linkTop = narrowTop
+          cnSetNarrow(c.ifCond, false)
+          capScan(c.ifThen, bound, caps)
+          restoreNarrow(linkTop)
+          if c.ifElse >= 0 { cnSetNarrow(c.ifCond, true) }
+        } else {
+          capScan(c.ifThen, bound, caps)
+        }
+        if c.ifElse >= 0 {
+          if P.nodes[c.ifElse] is IfStmt {
+            cur = c.ifElse
+          } else {
+            capScan(c.ifElse, bound, caps)
+          }
+        }
       }
-      return 0
     }
-    capScan(n.ifThen, bound, caps)
-    if n.ifElse >= 0 { capScan(n.ifElse, bound, caps) }
+    if cnRecording { restoreNarrow(savedIfTop) }
     return 0
   }
   if n is WhileStmt {
@@ -6658,14 +6694,23 @@ export function blockPushPopBits(blockIx: i32, fnIx: i32) {
 // so a push buried under several arms is detected. The condition is walked too: `emitPop` and
 // `emitPopOr` test no `fnUses*Push` flag, so a `.pop()` there needs the frame reserved.
 function ifChainPushPopBits(ifIx: i32, fnIx: i32) {
+  // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
   let bits = 0
-  const s = P.nodes[ifIx]
-  if s is IfStmt {
-    bits = exprPopBits(s.ifCond, fnIx) | blockPushPopBits(s.ifThen, fnIx)
-    if s.ifElse >= 0 {
-      const els = P.nodes[s.ifElse]
-      if els is Block { bits = bits | blockPushPopBits(s.ifElse, fnIx) }
-      else if els is IfStmt { bits = bits | ifChainPushPopBits(s.ifElse, fnIx) }
+  let cur = ifIx
+  while cur >= 0 {
+    const s = P.nodes[cur]
+    cur = -1
+    if s is IfStmt {
+      bits = bits |
+        exprPopBits(s.ifCond, fnIx) |
+        blockPushPopBits(s.ifThen, fnIx)
+      if s.ifElse >= 0 {
+        if P.nodes[s.ifElse] is IfStmt {
+          cur = s.ifElse
+        } else {
+          bits = bits | blockPushPopBits(s.ifElse, fnIx)
+        }
+      }
     }
   }
   bits
@@ -7025,30 +7070,39 @@ function tailBlockWidensAtomToStr(blockIx: i32, fnIx: i32) {
 // same narrowing `emitIfTail` applies, an `else if` being a lone nested `IfStmt` still in tail
 // position; any other tail value statement widens exactly like a `return` of it.
 function tailStmtWidensAtomToStr(stmtIx: i32, fnIx: i32) {
-  const s = P.nodes[stmtIx]
-  if s is IfStmt {
-    if !lastStmtIsValueIf(stmtIx, fnIx) && !elseLessNullableTail(stmtIx, fnIx) {
-      return false
-    }
-    const savedTop = narrowTop
-    const narrowed = setNarrowFromCond(s.ifCond, fnIx)
-    const hitThen = tailBlockWidensAtomToStr(s.ifThen, fnIx)
-    if narrowed { restoreNarrow(savedTop) }
-    if hitThen { return true }
-    if s.ifElse >= 0 {
-      const savedElseTop = narrowTop
-      const narrowedElse = setNarrowFromCondElse(s.ifCond, fnIx)
-      const els = P.nodes[s.ifElse]
-      let hitElse = false
-      if els is Block {
-        hitElse = tailBlockWidensAtomToStr(s.ifElse, fnIx)
-      } else {
-        hitElse = tailStmtWidensAtomToStr(s.ifElse, fnIx)
+  if P.nodes[stmtIx] is IfStmt {
+    // An `else if` chain is walked along its spine, so its depth costs no stack (D1990). The
+    // outermost else narrowing restored is the state the nested restores would have left.
+    let elseTop = -1
+    let hit = false
+    let cur = stmtIx
+    while cur >= 0 {
+      const s = P.nodes[cur]
+      const at = cur
+      cur = -1
+      if s is IfStmt {
+        if lastStmtIsValueIf(at, fnIx) || elseLessNullableTail(at, fnIx) {
+          const savedTop = narrowTop
+          const narrowed = setNarrowFromCond(s.ifCond, fnIx)
+          const hitThen = tailBlockWidensAtomToStr(s.ifThen, fnIx)
+          if narrowed { restoreNarrow(savedTop) }
+          if hitThen {
+            hit = true
+          } else if s.ifElse >= 0 {
+            const savedElseTop = narrowTop
+            if setNarrowFromCondElse(s.ifCond, fnIx) {
+              if elseTop < 0 { elseTop = savedElseTop }
+            }
+            const els = P.nodes[s.ifElse]
+            if els is Block { hit = tailBlockWidensAtomToStr(s.ifElse, fnIx) }
+            else if els is IfStmt { cur = s.ifElse }
+            else { hit = tailStmtWidensAtomToStr(s.ifElse, fnIx) }
+          }
+        }
       }
-      if narrowedElse { restoreNarrow(savedElseTop) }
-      return hitElse
     }
-    return false
+    if elseTop >= 0 { restoreNarrow(elseTop) }
+    return hit
   }
   if !stmtIsTailValue(stmtIx, fnIx) { return false }
   retWidensAtomToStr(stmtIx, fnIx)
@@ -8158,32 +8212,42 @@ function blockHasStrOpScan(blockIx: i32, fnIx: i32) {
 // `else` block, or recursively a chained `else if`. Mirrors `ifChainPushPopBits`: it walks the
 // whole chain, not just one level.
 function ifChainHasStrOp(ifIx: i32, fnIx: i32) {
-  const s = P.nodes[ifIx]
-  if s is IfStmt {
-    if exprHasStrOp(s.ifCond, fnIx) { return true }
-    // Narrow across the then-branch, mirroring `emitStmt` and `collectLocalsIf`, so a string op
-    // over a narrowed variant field is detected — `exprString` resolves a variant field's string
-    // type only while the receiver's narrowing is active. Save and restore the depth.
-    const savedTop = narrowTop
-    const narrowed = setNarrowFromCond(s.ifCond, fnIx)
-    const hit = blockHasStrOp(s.ifThen, fnIx)
-    if narrowed { restoreNarrow(savedTop) }
-    if hit { return true }
-    if s.ifElse >= 0 {
-      // A value union narrows to the complement set in the else-arm, mirroring `emitStmt`'s
-      // else lowering, so `else { print(v) }` with `v` now `string` is detected as a string
-      // print and reserves the scratch frame.
-      const savedElseTop = narrowTop
-      const narrowedElse = setNarrowFromCondElse(s.ifCond, fnIx)
-      const els = P.nodes[s.ifElse]
-      let hitElse = false
-      if els is Block { hitElse = blockHasStrOp(s.ifElse, fnIx) }
-      else if els is IfStmt { hitElse = ifChainHasStrOp(s.ifElse, fnIx) }
-      if narrowedElse { restoreNarrow(savedElseTop) }
-      if hitElse { return true }
+  // An `else if` chain is walked along its spine, so its depth costs no stack (D1990). The
+  // outermost else narrowing restored is the state the nested restores would have left.
+  let elseTop = -1
+  let hit = false
+  let cur = ifIx
+  while cur >= 0 {
+    const s = P.nodes[cur]
+    cur = -1
+    if s is IfStmt {
+      if exprHasStrOp(s.ifCond, fnIx) {
+        hit = true
+      } else {
+        // Narrow across the then-branch, mirroring `emitStmt` and `collectLocalsIf`, so a string
+        // op over a narrowed variant field is detected — `exprString` resolves a variant field's
+        // string type only while the receiver's narrowing is active. Save and restore the depth.
+        const savedTop = narrowTop
+        const narrowed = setNarrowFromCond(s.ifCond, fnIx)
+        hit = blockHasStrOp(s.ifThen, fnIx)
+        if narrowed { restoreNarrow(savedTop) }
+      }
+      if !hit && s.ifElse >= 0 {
+        // A value union narrows to the complement set in the else-arm, mirroring `emitStmt`'s
+        // else lowering, so `else { print(v) }` with `v` now `string` is detected as a string
+        // print and reserves the scratch frame.
+        const savedElseTop = narrowTop
+        if setNarrowFromCondElse(s.ifCond, fnIx) {
+          if elseTop < 0 { elseTop = savedElseTop }
+        }
+        const els = P.nodes[s.ifElse]
+        if els is Block { hit = blockHasStrOp(s.ifElse, fnIx) }
+        else if els is IfStmt { cur = s.ifElse }
+      }
     }
   }
-  false
+  if elseTop >= 0 { restoreNarrow(elseTop) }
+  hit
 }
 
 // True if the `FuncDecl` at `fnIx` uses any string op, so it reserves the shared string
@@ -15078,34 +15142,65 @@ function fnDeclaresNonVoid(fnIx: i32): boolean {
 // `if` WITHOUT an `else` can fall through with no value, so it never qualifies (the existing
 // void-if path handles it). Recurses through `else if` chains.
 function ifTailIsValue(stmtIx: i32, fnIx: i32) {
-  const s = P.nodes[stmtIx]
-  if s is IfStmt {
-    // An else-less `if` never qualifies here (it can fall through with no value) — load-
-    // bearing for the `fRetVoid` fixpoint, which must not treat a void recursive tail
-    // `if n>0 { rec(n-1) }` as a value. The nullable-return case is handled separately by
-    // `elseLessNullableTail` at emit time.
-    if s.ifElse < 0 { return false }
-    // The checker's verdict: an arm that completes with no value makes the `if` a statement —
-    // in a function that is not declared non-void, the only context that discards a tail.
-    if ifYieldsNoValue(stmtIx) && !fnDeclaresNonVoid(fnIx) { return false }
-    // D1034 — an empty arm disqualifies the whole `if`: this asks "does any arm end in a
-    // bare value", so `if c { } else { buf.push(1) }` (one value arm, one empty) would
-    // otherwise be wrongly classified non-void. Not "every arm must be a value" — an
-    // explicit `return x` arm is not a bare tail value.
-    if ifTailArmIsEmpty(s.ifThen) { return false }
-    if ifTailArmIsEmpty(s.ifElse) { return false }
-    if blockTailIsValue(s.ifThen, fnIx) { return true }
-    const els = P.nodes[s.ifElse]
-    if els is Block {
-      if blockTailIsValue(s.ifElse, fnIx) { return true }
-    } else if ifTailIsValue(s.ifElse, fnIx) {
-      return true
+  // An `else if` chain is walked along its spine, so its depth costs no stack (D1990): `links`
+  // holds the links that deferred to their `else if`, and `r` is the deepest link's answer.
+  const links: i32[] = []
+  let last = -1
+  let r = false
+  let cur = stmtIx
+  while cur >= 0 {
+    const at = cur
+    cur = -1
+    const s = P.nodes[at]
+    if s is IfStmt {
+      last = at
+      const v = ifLinkTailValue(s, at, fnIx)
+      if v == 2 {
+        links.push(at)
+        cur = s.ifElse
+      } else {
+        r = v == 1
+      }
     }
-    // A member-call arm counts only when EVERY arm is a value (D1992): one `xs.push(x)` arm
-    // beside a `print(0)` arm is a statement tail, and the function stays void.
-    return ifArmsAllMemberValues(stmtIx, fnIx)
+  }
+  if r || links.length == 0 { return r }
+  // A deferring link whose next link answered false answers `ifArmsAllMemberValues` of itself:
+  // its then arm's verdict and the next link's, read bottom-up one step per link.
+  let all = ifArmsAllMemberValues(last, fnIx)
+  let k = links.length - 1
+  while k >= 0 {
+    const s = P.nodes[links[k]]
+    if s is IfStmt { all = all && armBlockAllMemberValues(s.ifThen, fnIx) }
+    if all { return true }
+    k = k - 1
   }
   false
+}
+
+// One link of `ifTailIsValue`: 1 or 0 for its answer, or 2 when it defers to its `else if`.
+function ifLinkTailValue(s: IfStmt, at: i32, fnIx: i32): i32 {
+  // An else-less `if` never qualifies here (it can fall through with no value) — load-
+  // bearing for the `fRetVoid` fixpoint, which must not treat a void recursive tail
+  // `if n>0 { rec(n-1) }` as a value. The nullable-return case is handled separately by
+  // `elseLessNullableTail` at emit time.
+  if s.ifElse < 0 { return 0 }
+  // The checker's verdict: an arm that completes with no value makes the `if` a statement —
+  // in a function that is not declared non-void, the only context that discards a tail.
+  if ifYieldsNoValue(at) && !fnDeclaresNonVoid(fnIx) { return 0 }
+  // D1034 — an empty arm disqualifies the whole `if`: this asks "does any arm end in a
+  // bare value", so `if c { } else { buf.push(1) }` (one value arm, one empty) would
+  // otherwise be wrongly classified non-void. Not "every arm must be a value" — an
+  // explicit `return x` arm is not a bare tail value.
+  if ifTailArmIsEmpty(s.ifThen) { return 0 }
+  if ifTailArmIsEmpty(s.ifElse) { return 0 }
+  if blockTailIsValue(s.ifThen, fnIx) { return 1 }
+  const els = P.nodes[s.ifElse]
+  if !(els is Block) { return 2 }
+  if blockTailIsValue(s.ifElse, fnIx) { return 1 }
+  // A member-call arm counts only when EVERY arm is a value (D1992): one `xs.push(x)` arm
+  // beside a `print(0)` arm is a statement tail, and the function stays void.
+  if ifArmsAllMemberValues(at, fnIx) { return 1 }
+  0
 }
 
 // Every arm of the else-ful `if` chain at `stmtIx` ends in a tail value or a member call the
@@ -15183,8 +15278,22 @@ function retValueExitCount(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return 0 }
   const bare = P.nodes[unwrapParen(exprIx)]
   if bare is IfStmt {
-    return retArmExitCount(bare.ifThen, fnIx) +
-      retArmExitCount(bare.ifElse, fnIx)
+    // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
+    let total = 0
+    let cur = unwrapParen(exprIx)
+    while cur >= 0 {
+      const c = P.nodes[cur]
+      cur = -1
+      if c is IfStmt {
+        total = total + retArmExitCount(c.ifThen, fnIx)
+        if c.ifElse >= 0 && P.nodes[c.ifElse] is IfStmt {
+          cur = c.ifElse
+        } else {
+          total = total + retArmExitCount(c.ifElse, fnIx)
+        }
+      }
+    }
+    return total
   }
   1
 }
@@ -15228,7 +15337,22 @@ function retExitCount(stmtIx: i32, fnIx: i32) {
     return n
   }
   if s is IfStmt {
-    return retExitCount(s.ifThen, fnIx) + retExitCount(s.ifElse, fnIx)
+    // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
+    let total = 0
+    let cur = stmtIx
+    while cur >= 0 {
+      const c = P.nodes[cur]
+      cur = -1
+      if c is IfStmt {
+        total = total + retExitCount(c.ifThen, fnIx)
+        if c.ifElse >= 0 && P.nodes[c.ifElse] is IfStmt {
+          cur = c.ifElse
+        } else {
+          total = total + retExitCount(c.ifElse, fnIx)
+        }
+      }
+    }
+    return total
   }
   if s is WhileStmt { return retExitCount(s.whileBody, fnIx) }
   if s is ForRange { return retExitCount(s.frBody, fnIx) }
@@ -31335,12 +31459,21 @@ function dsScopeWalk(
   }
   const here = dsDestSlotAt(ix, nm, frame, want)
   if here >= 0 { return here }
-  const kids = nodeChildren(ix)
-  let k = 0
-  while k < kids.length {
-    const rs = dsScopeWalk(kids[k], scopeIx, nm, frame, want)
-    if rs >= 0 { return rs }
-    k = k + 1
+  // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
+  let cur = ix
+  while cur >= 0 {
+    if cur != ix {
+      const linkHere = dsDestSlotAt(cur, nm, frame, want)
+      if linkHere >= 0 { return linkHere }
+    }
+    const kids = nodeSpineChildren(cur)
+    let k = 0
+    while k < kids.length {
+      const rs = dsScopeWalk(kids[k], scopeIx, nm, frame, want)
+      if rs >= 0 { return rs }
+      k = k + 1
+    }
+    cur = elseIfLink(cur)
   }
   -1
 }
@@ -31464,16 +31597,23 @@ function dsgWalk(ix: i32) {
   }
   let frame = -1
   if dsgStack.length > 0 { frame = dsgStack[dsgStack.length - 1] }
-  const kids = nodeChildren(ix)
-  let k = 0
-  while k < kids.length {
-    dsgNoteChild(kids[k], ix, frame)
-    k = k + 1
-  }
-  k = 0
-  while k < kids.length {
-    dsgWalk(kids[k])
-    k = k + 1
+  // An `else if` chain is walked along its spine, so its depth costs no stack (D1990); each link
+  // still notes every child, the next link included, before walking its own.
+  let cur = ix
+  while cur >= 0 {
+    const kids = nodeChildren(cur)
+    let k = 0
+    while k < kids.length {
+      dsgNoteChild(kids[k], cur, frame)
+      k = k + 1
+    }
+    const walk = nodeSpineChildren(cur)
+    k = 0
+    while k < walk.length {
+      dsgWalk(walk[k])
+      k = k + 1
+    }
+    cur = elseIfLink(cur)
   }
   if pushed { dsgStack.pop() }
   0

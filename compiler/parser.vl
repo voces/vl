@@ -2943,72 +2943,90 @@ function parseBracedBody(msg: string): i32 {
 // `Block` or an `If`. A chain is `else if` — an `else` whose branch is another `if`, since
 // there is no fused `elseif` keyword.
 function parseIf() {
-  const p0 = peekTok().start // the `if` keyword
-  advance()                  // "if"
-  const cond = parseExpr()
-  // There is no `then` single-statement sugar: the branch is a brace block. Source that
-  // spells it gets a targeted refusal naming the fix — the generic "expected {" would strand
-  // it — and the recovery is LOSSLESS, like `parseBracedBody`'s: the stranded `then` is
-  // consumed and the statement after it taken whole, so the checker still runs (DECISIONS.md).
-  let thenB = -1
-  if peekKind() == "IDENT" && peekTok().text == "then" {
-    dgMarkLossless(P.diags.length) // the index this push is about to occupy
-    P.diags.push(
-      {
-        msg: "`then` was removed — wrap the branch in braces: `if cond { … }`",
-        at: P.pos,
-      },
-    )
-    advance()              // the stranded "then"
-    thenB = oneStmtBlock() // recovery: the old one-stmt wrapper
-  } else {
-    thenB = parseBracedBody("an `if` body requires braces: `if cond { … }`")
-  }
+  // An `else if` chain is parsed along its spine, so its depth costs no stack (D1990); the
+  // links are built innermost-first, the order the recursive reading allocated them.
+  const conds: i32[] = []
+  const thens: i32[] = []
+  const starts: i32[] = []
   let els = -1
-  // The `else` may sit on a new line after the then-block's `}`. Scan past any newlines to
-  // look for it, but consume them only if an `else` actually follows: a trailing block whose
-  // `}` is merely followed by a newline must leave the cursor on that newline so the
-  // enclosing statement loop sees the next statement.
-  let look = P.pos
-  let scanning = kindAt(look) == "NEWLINE" || kindAt(look) == "SEMI"
-  while scanning {
-    look = look + 1
-    scanning = kindAt(look) == "NEWLINE" || kindAt(look) == "SEMI"
-  }
-  if kindAt(look) == "ELSE" {
-    P.pos = look + 1 // consume the skipped newlines and the `else`
-    // An `else {`-brace is a block unless it shapes up as an object literal —
-    // and empty braces (`else {}`) stay a block (the same tie-break as a
-    // function body: `looksLikeObject` calls `{}` an object, which here would
-    // synthesize a spurious `{}` expression).
-    let ebraceBlock = false
-    if peekKind() == "LBRACE" {
-      let escan = P.pos + 1
-      let enl = kindAt(escan) == "NEWLINE"
-      while enl {
-        escan = escan + 1
-        enl = kindAt(escan) == "NEWLINE"
-      }
-      ebraceBlock = kindAt(escan) == "RBRACE" || !looksLikeObject(P.pos)
-    }
-    if peekKind() == "IF" {
-      els = parseIf()
-    } else if ebraceBlock {
-      els = parseBlock()
-    } else if peekKind() == "LBRACE" {
-      // `else { a: 1 }` is an object literal, not a block — `looksLikeObject` above tells the
-      // two readings apart. It is braced, so the rule below is satisfied and this arm keeps
-      // its reading, diagnostic-free; `vl fmt` renders it as the unambiguous `else { { … } }`.
-      els = oneStmtBlock()
+  let more = true
+  while more {
+    more = false
+    const p0 = peekTok().start // the `if` keyword
+    advance()                  // "if"
+    const cond = parseExpr()
+    // There is no `then` single-statement sugar: the branch is a brace block. Source that
+    // spells it gets a targeted refusal naming the fix — the generic "expected {" would strand
+    // it — and the recovery is LOSSLESS, like `parseBracedBody`'s: the stranded `then` is
+    // consumed and the statement after it taken whole, so the checker still runs (DECISIONS.md).
+    let thenB = -1
+    if peekKind() == "IDENT" && peekTok().text == "then" {
+      dgMarkLossless(P.diags.length) // the index this push is about to occupy
+      P.diags.push(
+        {
+          msg: "`then` was removed — wrap the branch in braces: `if cond { … }`",
+          at: P.pos,
+        },
+      )
+      advance()              // the stranded "then"
+      thenB = oneStmtBlock() // recovery: the old one-stmt wrapper
     } else {
-      // There is no `else <stmt>` single-statement form: an `else` takes a brace block or
-      // another `if`, the same rule the other bodies have. It rides the shared required-brace
-      // recovery, so `else print(2)` costs one diagnostic and the parse continues; an `else`
-      // followed by something that starts no statement keeps the plain `expected `{`` reading.
-      els = parseBracedBody("an `else` body requires braces: `else { … }`")
+      thenB = parseBracedBody("an `if` body requires braces: `if cond { … }`")
     }
+    // The `else` may sit on a new line after the then-block's `}`. Scan past any newlines to
+    // look for it, but consume them only if an `else` actually follows: a trailing block whose
+    // `}` is merely followed by a newline must leave the cursor on that newline so the
+    // enclosing statement loop sees the next statement.
+    let look = P.pos
+    let scanning = kindAt(look) == "NEWLINE" || kindAt(look) == "SEMI"
+    while scanning {
+      look = look + 1
+      scanning = kindAt(look) == "NEWLINE" || kindAt(look) == "SEMI"
+    }
+    if kindAt(look) == "ELSE" {
+      P.pos = look + 1 // consume the skipped newlines and the `else`
+      // An `else {`-brace is a block unless it shapes up as an object literal —
+      // and empty braces (`else {}`) stay a block (the same tie-break as a
+      // function body: `looksLikeObject` calls `{}` an object, which here would
+      // synthesize a spurious `{}` expression).
+      let ebraceBlock = false
+      if peekKind() == "LBRACE" {
+        let escan = P.pos + 1
+        let enl = kindAt(escan) == "NEWLINE"
+        while enl {
+          escan = escan + 1
+          enl = kindAt(escan) == "NEWLINE"
+        }
+        ebraceBlock = kindAt(escan) == "RBRACE" || !looksLikeObject(P.pos)
+      }
+      if peekKind() == "IF" {
+        more = true // the chain's next link: iterate, never recurse
+      } else if ebraceBlock {
+        els = parseBlock()
+      } else if peekKind() == "LBRACE" {
+        // `else { a: 1 }` is an object literal, not a block — `looksLikeObject` above tells the
+        // two readings apart. It is braced, so the rule below is satisfied and this arm keeps
+        // its reading, diagnostic-free; `vl fmt` renders it as the unambiguous `else { { … } }`.
+        els = oneStmtBlock()
+      } else {
+        // There is no `else <stmt>` single-statement form: an `else` takes a brace block or
+        // another `if`, the same rule the other bodies have. It rides the shared required-brace
+        // recovery, so `else print(2)` costs one diagnostic and the parse continues; an `else`
+        // followed by something that starts no statement keeps the plain `expected `{`` reading.
+        els = parseBracedBody("an `else` body requires braces: `else { … }`")
+      }
+    }
+    conds.push(cond)
+    thens.push(thenB)
+    starts.push(p0)
   }
-  mkIf(cond, thenB, els, p0)
+  let i = conds.length - 1
+  let out = mkIf(conds[i], thens[i], els, starts[i])
+  while i > 0 {
+    i = i - 1
+    out = mkIf(conds[i], thens[i], out, starts[i])
+  }
+  out
 }
 
 // `match scrut { pat [| pat]* => body … }` — exhaustive value dispatch, reached from
