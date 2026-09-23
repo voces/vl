@@ -1557,22 +1557,30 @@ function cboxModuleFrame() {
 
 // ── shadow respelling (D2068) ─────────────────────────────────────────────────────────────
 // Capture questions are asked by name within a frame, while a binding is scoped by its block.
-// So a binding whose name a closure reads, and which shares it with another binding its frame
-// or an enclosing scope can see, is respelled here with every read it denotes.
+// So a binding that makes such a question ambiguous is respelled here, with every read it
+// denotes; `shrDeclare` states which bindings those are.
 
-// The names read inside a nested function of the unit being respelled; only these can make a
-// capture question ambiguous, so no other binding is touched.
+// The names read inside a function nested in the frame being walked.
 let shrLamNames: {[string]: i32} = Map()
 let shrLamAny = false
 // The module's top-level bindings and function names, visible from every frame.
 let shrGlobals: {[string]: i32} = Map()
-// Per source name, the spelling its innermost open binding carries; "" when none is open.
+// Names some call spells as a method (`x.name()`): the checker may resolve one to a local
+// binding, and a member name is not an identifier this pass can follow, so it is never respelled.
+let shrMethodNames: {[string]: i32} = Map()
+// Per source name, the spelling of its innermost open binding ("" when none is open) and the
+// frame depth that binding belongs to.
 let shrCur: {[string]: string} = Map()
+let shrCurDepth: {[string]: i32} = Map()
 // The names the frame being walked has bound so far, in any of its blocks.
 let shrFrameSeen: {[string]: i32} = Map()
-// The open bindings as (source name, the spelling it shadowed) pairs, trimmed on scope exit.
+// The one spelling the frame being walked gives its bindings that shadow an enclosing frame's.
+let shrFrameShared: {[string]: string} = Map()
+let shrDepth = 0
+// The open bindings as (source name, shadowed spelling, shadowed depth), trimmed on scope exit.
 const shrTrailName: string[] = []
 const shrTrailPrev: string[] = []
+const shrTrailPrevDepth: i32[] = []
 let shrSerial = 0
 
 // Records in `shrLamNames` every identifier under `ix` that sits inside a nested function;
@@ -1601,24 +1609,43 @@ function shrCollect(ix: i32, inFn: boolean) {
   0
 }
 
-// Opens a binding of `name` in the innermost scope and returns the spelling it carries. With
-// `respell`, a name a closure reads is respelled when an open scope, an earlier block of the
-// frame or the module already binds it; a parameter or a function name keeps its own.
+// A fresh spelling of `name`.
+function shrMint(name: string): string {
+  shrSerial = shrSerial + 1
+  name + "$s" + i32ToStr(shrSerial)
+}
+
+// Opens a binding of `name` and returns the spelling it carries. With `respell`, a binding a
+// nested function reads gets a unique spelling when another binding of the name is visible or
+// earlier in the frame, since captures resolve by name within a frame; one that shadows an
+// enclosing frame's binding or a module name gets the frame's shared spelling.
 function shrDeclare(name: string, respell: boolean): string {
   let sp = name
-  if respell && name != "" && (shrLamNames[name] ?? 0) == 1 {
+  if respell && name != "" && (shrMethodNames[name] ?? 0) == 0 {
+    const open = (shrCur[name] ?? "") != ""
     if (
-      (shrCur[name] ?? "") != "" ||
-      (shrFrameSeen[name] ?? 0) == 1 ||
-      (shrGlobals[name] ?? 0) == 1
+      (shrLamNames[name] ?? 0) == 1 &&
+      (open || (shrFrameSeen[name] ?? 0) == 1 || (shrGlobals[name] ?? 0) == 1)
     ) {
-      shrSerial = shrSerial + 1
-      sp = name + "$s" + i32ToStr(shrSerial)
+      sp = shrMint(name)
+    } else if (
+      (open && (shrCurDepth[name] ?? 0) < shrDepth) ||
+      (!open && (shrGlobals[name] ?? 0) == 1)
+    ) {
+      const shared = shrFrameShared[name] ?? ""
+      if shared != "" {
+        sp = shared
+      } else {
+        sp = shrMint(name)
+        shrFrameShared[name] = sp
+      }
     }
   }
   shrTrailName.push(name)
   shrTrailPrev.push(shrCur[name] ?? "")
+  shrTrailPrevDepth.push(shrCurDepth[name] ?? 0)
   shrCur[name] = sp
+  shrCurDepth[name] = shrDepth
   shrFrameSeen[name] = 1
   sp
 }
@@ -1629,19 +1656,29 @@ function shrTrim(mark: i32) {
   while shrTrailName.length > mark {
     const top = shrTrailName.length - 1
     shrCur[shrTrailName[top]] = shrTrailPrev[top]
+    shrCurDepth[shrTrailName[top]] = shrTrailPrevDepth[top]
     shrTrailName.pop()
     shrTrailPrev.pop()
+    shrTrailPrevDepth.pop()
   }
   0
 }
 
-// Opens function `fnIx`'s own frame — a fresh one, whose parameters keep their spellings —
-// walks its body, and closes it again.
+// Opens function `fnIx`'s own frame — a fresh one, whose parameters keep their spellings and
+// whose nested functions' reads are collected anew — walks its body, and closes it again.
 function shrWalkFrame(fnIx: i32) {
   const fn = P.nodes[fnIx]
   if fn is FuncDecl {
     const savedSeen = shrFrameSeen
+    const savedShared = shrFrameShared
+    const savedLam = shrLamNames
+    const savedAny = shrLamAny
     shrFrameSeen = Map()
+    shrFrameShared = Map()
+    shrLamNames = Map()
+    shrLamAny = false
+    shrCollect(fn.fnBody, false)
+    shrDepth = shrDepth + 1
     const mark = shrTrailName.length
     const ps = fn.fnParams
     let pi = 0
@@ -1652,7 +1689,11 @@ function shrWalkFrame(fnIx: i32) {
     }
     shrWalk(fn.fnBody)
     shrTrim(mark)
+    shrDepth = shrDepth - 1
     shrFrameSeen = savedSeen
+    shrFrameShared = savedShared
+    shrLamNames = savedLam
+    shrLamAny = savedAny
   }
   0
 }
@@ -1747,6 +1788,18 @@ export function shadowRespell(stmts: i32[]) {
     }
     gi = gi + 1
   }
+  shrMethodNames = Map()
+  let ni = 0
+  while ni < P.nodes.length {
+    const c = P.nodes[ni]
+    if c is Call {
+      const cf = P.nodes[unwrapParen(c.callFn)]
+      if cf is Member { shrMethodNames[cf.memProp] = 1 }
+      if cf is OptMember { shrMethodNames[cf.omProp] = 1 }
+    }
+    ni = ni + 1
+  }
+  shrDepth = 0
   shrLamNames = Map()
   shrLamAny = false
   let mi = 0
@@ -1756,7 +1809,9 @@ export function shadowRespell(stmts: i32[]) {
   }
   if shrLamAny {
     shrCur = Map()
+    shrCurDepth = Map()
     shrFrameSeen = Map()
+    shrFrameShared = Map()
     let si = 0
     while si < stmts.length {
       const st = P.nodes[stmts[si]]
@@ -1780,7 +1835,7 @@ export function shadowRespell(stmts: i32[]) {
       shrCollect(fn.fnBody, false)
       if shrLamAny {
         shrCur = Map()
-        shrFrameSeen = Map()
+        shrCurDepth = Map()
         shrWalkFrame(stmts[fi])
       }
     }
