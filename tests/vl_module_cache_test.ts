@@ -10,6 +10,8 @@
 //   5. Pruning retires the least-recently-used entries past `VL_CACHE_MAX_MB`, never the
 //      one just written, and runs at most once a minute.
 //   6. `vl test` goes through the same cache, under its own engine configuration.
+//   7. A cache dir another user owns, or that group or others can write, is not used at
+//      all: a forged entry there would reach `Module::deserialize`.
 //
 // Evidence is `VL_CACHE_TRACE=1`'s stderr line and the files on disk, never timing. Every
 // run gets a private `VL_CACHE_DIR`. DECISIONS.md, "A user module's Cranelift compile is
@@ -212,13 +214,44 @@ test("pruning retires the least-recently-used entries, at most once a minute", a
   }
 });
 
-test("`vl test` compiles through the same cache", async () => {
-  const dir = await Deno.makeTempDir({ prefix: "vl-modcache-" });
+test("`vl test` compiles through the same cache, under its own engine tag", async () => {
+  const { dir, cache, wasm } = await setup();
   try {
     const file = `${ROOT}/tests/fixtures/vl-test/generic.test.vl`;
-    const a = await vl(["test", file, "--compiler", COMPILER], `${dir}/cache`);
-    const b = await vl(["test", file, "--compiler", COMPILER], `${dir}/cache`);
+    const a = await vl(["test", file, "--compiler", COMPILER], cache);
+    const b = await vl(["test", file, "--compiler", COMPILER], cache);
     expect([a.trace, b.trace, a.code === b.code, a.out === b.out], [["miss"], ["hit"], true, true], "vl test");
+    // `vl test`'s engine has a smaller initial GC heap than `vl run`'s, which is part of
+    // the engine tag: the two may never share an entry.
+    const [testEntry] = entries(cache);
+    await vl(["run", wasm], cache);
+    const runEntry = entries(cache).find((n) => n !== testEntry)!;
+    const tag = (n: string) => n.replace(/\.cwasm$/, "").split("-")[1];
+    if (!tag(testEntry) || !tag(runEntry) || tag(testEntry) === tag(runEntry)) {
+      throw new Error(`engine tags should differ: test ${testEntry}, run ${runEntry}`);
+    }
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+test("a cache dir writable by group or others is not used", async () => {
+  const { dir, cache, wasm } = await setup();
+  try {
+    // A dir this test creates is owned by us, so the mode is the only thing wrong with it.
+    for (const [where, mode] of [["root", 0o777], ["root", 0o770], ["modules", 0o757]] as const) {
+      await Deno.remove(cache, { recursive: true }).catch(() => {});
+      await Deno.mkdir(`${cache}/modules`, { recursive: true, mode: 0o700 });
+      await Deno.chmod(where === "root" ? cache : `${cache}/modules`, mode);
+      const a = await vl(["run", wasm], cache);
+      expect([a.code, a.out, a.trace], [0, "cached\n", ["rejected (unsafe dir)"]], `${where} ${mode.toString(8)}`);
+      expect(entries(cache), [], `nothing written (${where} ${mode.toString(8)})`);
+    }
+    // And a dir the host creates itself is private.
+    await Deno.remove(cache, { recursive: true });
+    await vl(["run", wasm], cache);
+    expect((Deno.statSync(`${cache}/modules`).mode ?? 0) & 0o777, 0o700, "created 0700");
+    expect((await vl(["run", wasm], cache)).trace, ["hit"], "and used");
   } finally {
     await Deno.remove(dir, { recursive: true });
   }

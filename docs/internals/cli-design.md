@@ -629,6 +629,9 @@ The cache dir is the embedded seed's: `$VL_CACHE_DIR` · `$XDG_CACHE_HOME/vl` ·
 | `VL_CACHE_MAX_MB=<n>` | prune target, default 512; a soft bound, pruned at most once a minute |
 | `VL_CACHE_TRACE=1` | one stderr line per lookup: `hit`, `miss`, `rejected (<why>)`, `off` |
 
+On Unix the cache root and `modules/` are used only when owned by the effective uid with no
+group/other write bit (`private_cache_dir`, created 0700); otherwise the module compiles
+uncached (`rejected (unsafe dir)`) and the embedded seed's cache is skipped with a note.
 An entry is an envelope — magic, SHA-256 of the wasm, the engine tag, SHA-256 of the
 artifact, its length, the artifact — and every field is checked before
 `Module::deserialize` runs. A failing entry is recompiled and rewritten; writes are

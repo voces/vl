@@ -5712,10 +5712,14 @@ Measured on this box (load 15–20), median of 7, cold is `VL_NO_CACHE=1`:
 | `vl run hello.vl` | 12.0 / 25.5 | 5.5 / 5.2 |
 | distilled corpus (`regress.py`, JOBS=6, load 60–160) | 50.7 s wall, 248 CPU-s | 23.7 s wall, 133 CPU-s |
 
-A miss costs nothing measurable over no cache at all (hello 6.8 → 7.1 ms, `db.wasm` 449 → 427
-ms, both inside the noise): serializing, hashing and writing are small beside Cranelift. An
-entry is about 13× its wasm (1.33 MB for `db.wasm`, 20 KB for hello). A cold corpus run writes
-3,648 entries, 104 MB.
+A miss costs nothing measurable over no cache at all for the two programs timed that way
+(hello 6.8 → 7.1 ms, `db.wasm` 449 → 427 ms, both inside the noise): serializing, hashing and
+writing are small beside Cranelift. For the corpus the question is a whole run from an EMPTY
+cache against one with the cache off, interleaved twice: **227 and 235 CPU-s empty against 262
+and 269 off** (wall 33.3 / 42.1 s against 46.6 / 72.5 s, load 27–98). An empty-cache run is
+cheaper, not dearer, because the corpus repeats modules — its cold run writes 3,648 entries
+(104 MB) for more cells than that, and the repeats hit inside the run. An entry is about 13×
+its wasm (1.33 MB for `db.wasm`, 20 KB for hello).
 
 **Why `deserialize` is sound here.** wasmtime documents `Module::deserialize` as unsafe: its
 input is "only lightly validated", arbitrary bytes "can trivially be used to execute arbitrary
@@ -5731,10 +5735,28 @@ therefore byte-for-byte what `Module::serialize` produced for *this* wasm under 
 configuration. That rules out truncation, bit rot, a torn write and a file renamed from another
 key. `deserialize` (bytes) is used rather than `deserialize_file` (mmap) on purpose: the checked
 bytes and the loaded bytes are the same buffer, so nothing can change them between the check and
-the load. What the digest does NOT defend against is a writer who recomputes it — but that
-writer already has the user's file permissions, which is the same power as replacing the `vl`
-binary, so a keyed MAC would add a secret to guard and no security. A collision needs SHA-256
-to break.
+the load. A collision needs SHA-256 to break.
+
+**The digest is not a MAC, so the argument has a precondition: nobody but the user can write
+the directory.** A writer who can put a file there can recompute the digests and forge an entry,
+and a forged entry reaching `deserialize` is code execution. For the user themself that is no
+new power (they could replace the `vl` binary). For anyone else it would be. So the host trusts
+a cache directory only when it is owned by the process's effective uid and has no group or
+world write bit (`private_cache_dir`), checked at BOTH levels the module cache uses — the cache
+root, whose owner could swap `modules/` out, and `modules/` itself — and creates what it
+creates with mode 0700. A directory that fails is not used at all: the module compiles as if
+uncached (`VL_CACHE_TRACE` says `rejected (unsafe dir)`), and the embedded seed's cache, which
+lives in the same root and is loaded by `deserialize_file` on its path alone, is skipped with a
+stderr note naming the directory and the fix. This matters because the root is configurable: a
+`$VL_CACHE_DIR` or `$XDG_CACHE_HOME` under `/tmp` that another local user created first would
+otherwise be accepted by `create_dir_all` without a word. The check does not reach ancestors
+above the root (a root inside another user's writable directory can still be renamed away
+between check and use); `~/.cache` and a sticky `/tmp` are not such ancestors. A dir that an
+older `vl` created under `umask 002` is group-writable and is refused until `chmod go-w`. On
+Windows no check is made: the default `%LOCALAPPDATA%` is per-user, and a `%VL_CACHE_DIR%`
+pointed somewhere shared is the user's own choice. The on-disk seed's sidecar beside
+`build/vl-compiler.wasm` is not covered and need not be: whoever can write beside the seed can
+rewrite the seed, which is the compiler.
 
 **Bounded, least-recently-used, soft.** After a miss writes an entry, the host prunes
 `modules/` back to `$VL_CACHE_MAX_MB` (default 512) by deleting the entries with the oldest

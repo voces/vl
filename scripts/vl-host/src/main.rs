@@ -1459,7 +1459,12 @@ fn seed_cache_path(tag: &str) -> Option<std::path::PathBuf> {
 #[cfg(feature = "embed-seed")]
 fn seed_cache_path_impl(tag: &str) -> Option<std::path::PathBuf> {
     let dir = user_cache_root()?;
-    std::fs::create_dir_all(&dir).ok()?;
+    if let Err(why) = private_cache_dir(&dir) {
+        // Loud, unlike the module cache: without this entry every invocation recompiles
+        // the whole seed, a slowdown of seconds nobody would otherwise explain.
+        eprintln!("vl: not caching the compiler in `{}`: {why}", dir.display());
+        return None;
+    }
     let ours = dir.join(format!("seed-{}-{tag}.cwasm", env!("VL_SEED_KEY")));
     prune_seed_cache(&dir, &ours);
     Some(ours)
@@ -1481,6 +1486,38 @@ fn user_cache_root() -> Option<std::path::PathBuf> {
     } else {
         return None;
     })
+}
+
+/// Create `dir` if missing (mode 0700 on Unix) and say whether files in it may be
+/// trusted by `deserialize`: `Ok` only when it is a directory owned by this process's
+/// effective user and not writable by group or others. A cache dir someone else made
+/// first (a shared `$VL_CACHE_DIR` under /tmp) could hold forged entries, and a forged
+/// entry is code execution. On Windows the default `%LOCALAPPDATA%` is per-user and no
+/// check is made.
+fn private_cache_dir(dir: &std::path::Path) -> std::result::Result<(), &'static str> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+        if !dir.is_dir() {
+            let _ = std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir);
+        }
+        let meta = std::fs::metadata(dir).map_err(|_| "cannot create it")?;
+        if !meta.is_dir() {
+            return Err("not a directory");
+        }
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        if meta.uid() != unsafe { libc::geteuid() } {
+            return Err("owned by another user");
+        }
+        if meta.mode() & 0o022 != 0 {
+            return Err("writable by group or others (`chmod go-w` it, or remove it)");
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(dir).map_err(|_| "cannot create it")
+    }
 }
 
 /// The SEED a cache file belongs to, read out of a `seed-<seed key>-<engine tag>.cwasm`
@@ -1979,9 +2016,15 @@ fn user_module(engine: &Engine, bytes: &[u8]) -> Result<Module> {
         module_cache_trace("off", None);
         return Module::new(engine, bytes);
     }
-    let Some(dir) = user_cache_root().map(|d| d.join("modules")) else {
+    let Some(root) = user_cache_root() else {
         return Module::new(engine, bytes);
     };
+    // Both levels: files live in `modules/`, and whoever controls `root` can swap it.
+    let dir = root.join("modules");
+    if private_cache_dir(&root).is_err() || private_cache_dir(&dir).is_err() {
+        module_cache_trace("rejected (unsafe dir)", Some(&dir));
+        return Module::new(engine, bytes);
+    }
     let wasm_hash = sha256(bytes);
     let tag = engine_cache_tag(engine);
     let path = dir.join(format!("{}-{tag}.cwasm", hex(&wasm_hash)));
@@ -1995,10 +2038,8 @@ fn user_module(engine: &Engine, bytes: &[u8]) -> Result<Module> {
     }
     let module = Module::new(engine, bytes)?;
     if let Ok(artifact) = module.serialize() {
-        if std::fs::create_dir_all(&dir).is_ok() {
-            write_module_cache(&path, &wasm_hash, &tag, &artifact);
-            prune_module_cache(&dir, &path);
-        }
+        write_module_cache(&path, &wasm_hash, &tag, &artifact);
+        prune_module_cache(&dir, &path);
     }
     Ok(module)
 }
@@ -2012,10 +2053,10 @@ fn user_module(engine: &Engine, bytes: &[u8]) -> Result<Module> {
 /// target, engine configuration) is NOT a defence against corruption. Every byte
 /// handed to it here has passed an exact SHA-256 comparison against the digest this
 /// host stored when it serialized that artifact under this engine tag for this wasm,
-/// so what reaches wasmtime is byte-for-byte what `Module::serialize` produced. What
-/// the check does not defend against is a writer that recomputes the digest — that
-/// writer already has the user's own file permissions, the same power as replacing
-/// the `vl` binary.
+/// so what reaches wasmtime is byte-for-byte what `Module::serialize` produced. The
+/// digest is not a MAC: a writer that recomputes it can forge an entry. Precondition,
+/// checked by the caller (`private_cache_dir`): only this user can write the directory,
+/// so such a writer already had the power to replace the `vl` binary.
 fn read_module_cache(
     engine: &Engine,
     path: &std::path::Path,

@@ -100,7 +100,10 @@ configuration, so running an unchanged program again skips the compile — 0.3�
 loading it; one that fails is recompiled and rewritten. The directory is pruned back to
 `$VL_CACHE_MAX_MB` (default 512) least-recently-used first, at most once a minute.
 `VL_NO_CACHE=1` turns this cache off (the compiler's own cache above is unaffected), and
-`VL_CACHE_TRACE=1` prints `hit` / `miss` / `rejected (…)` per module on stderr.
+`VL_CACHE_TRACE=1` prints `hit` / `miss` / `rejected (…)` per module on stderr. On Unix, `vl`
+uses a cache directory only if you own it and neither group nor others can write it (it
+creates its own with mode 0700); anything else runs uncached, since a file planted there would
+be loaded as native code. On Windows the default `%LOCALAPPDATA%` is already per-user.
 
 `$VL_GC` picks the garbage collector `vl run` gives your program — a pure runtime
 tuning dial, with no effect on what the program computes:
