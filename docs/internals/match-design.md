@@ -34,17 +34,17 @@ expr may be a block** (Rust/Kotlin/Java/F#); the colon-`case:`-with-`break` styl
   one, because 2^32 values is not a member set to be complete over. `string`, `boolean` and the
   floats are still not scrutinees at all — `match scrutinee must be a union or an integer, got …`.
 - **Redundancy check.** A pattern already covered by an earlier arm is a compile error (dead arm).
-- **Scrutinee evaluated once.** ⚠️ **NOT WHAT WAS BUILT — measured 2026-07-28.** Phase 2a mints
-  each arm's pattern as an `IsExpr` over the SHARED scrutinee NODE, and the desugar uses those
-  pattern nodes as the chain's conditions, so the scrutinee EXPRESSION is re-emitted once per
-  tested arm. A counting probe over a 3-arm match reads **2** evaluations (n−1, the exhaustive-
-  last-arm rule), identically on this branch and on master — so it is phase 2a's, not phase 2b's.
-  It is unobserved by the corpus because a scrutinee is almost always a plain place. Phase 2b
-  inherits it and adds one read per bound field, bounded by the same reason: a binding needs the
-  arm to NARROW the scrutinee, and only a place narrows, so a side-effecting scrutinee cannot
-  carry a payload clause at all (it reports `field 'x' is not on every member of … — narrow with
-  \`is\` first`). The honest fix is to bind the scrutinee to a synthesized temp once, ahead of the
-  chain — a desugar change, not a surface one.
+- **Scrutinee evaluated once.** Built by D1991 (2026-09-22). Every arm of the desugared chain
+  tests the scrutinee NODE, so before the desugar a scrutinee that is neither a literal nor a
+  place (`x`, `o.f`, `xs[0]` — what the narrowing key covers) is bound to a synthesized
+  `const $scrut<n>` just ahead of the statement holding the match, or at the head of the arm
+  holding it, and the patterns and payload reads name that binding (`hoistMatchScrutinees`,
+  run at `checkProgram` entry). A place stays unbound, so its arms keep narrowing the place
+  itself. Because the binding is a real local, a payload clause over a call narrows too
+  (`match f() { A{a} => … }`). Where the binding cannot be placed without skipping or
+  reordering an evaluation — the right of `&&`/`||`/`??`, a `while` or `else if` condition,
+  after a non-literal sibling — the match is left as parsed and still re-reads its scrutinee
+  per tested arm (D2038).
 
 ## Patterns
 
@@ -396,10 +396,9 @@ list) all take the table.
 
 **What stays a chain, and why.**
 
-* **A scrutinee that is not a plain `Ident`** (`match x % 7`, `match f()`), because of D1991:
-  the chain re-evaluates the scrutinee once per tested arm ("Scrutinee evaluated once" above),
-  which gives a side-effecting scrutinee the wrong arm. That is a defect, not a design choice.
-  Binding the scrutinee to a temp once fixes it and makes such a match table-eligible too.
+* **A scrutinee that is not a plain `Ident`** after the binding step: a field read (`match o.k`)
+  and a scrutinee left unbound by D2038. A computed one (`match x % 7`, `match f()`) is bound
+  to a local first ("Scrutinee evaluated once" above) and takes the table like a variable.
 * **An un-annotated scrutinee** (the hole route) and a monomorphized clone: the emitter has no
   recorded `i32`/`i64` type for the node, and a hole may be pinned to a float.
 * **A value join that is nullable** (an arm yielding `null`): the chain's niche seeding owns it.
