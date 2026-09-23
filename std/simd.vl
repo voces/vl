@@ -1,0 +1,176 @@
+// `std:simd` — four f32 lanes in one 128-bit value, computed lane by lane in one instruction.
+//
+//     import { F32x4, loadF32x4, splatF32, storeF32x4 } from "std:simd"
+//
+// `F32x4` is also the graphics `vec4`: lanes 0..3 are x, y, z, w, and a vec3 is an `F32x4`
+// whose w is 0. `+ - * /` work between two `F32x4`s. `v.dot(w)` needs no import unless your
+// module has its own `dot`; then import `dot as dotF32x4` and call `v.dotF32x4(w)`.
+// Vectors enter and leave through a `Buf`, at any byte offset, with no bounds check. No fused
+// multiply-add and no relaxed ops, so finite results are the same bits on every host. Not here
+// yet: reading one lane back (store to a `Buf` and `loadF32`), negation, mask tests, integer shapes.
+
+import { Buf } from "std:buffer"
+
+// Four f32 lanes. A distinct type from `Mask32x4`: a comparison result is not accepted as
+// numbers without an `as`.
+export type F32x4 = new v128
+
+// The answer of a lane-wise comparison: each lane is all-ones where true, all-zeros where false.
+// For now its only use is `selectF32x4`.
+export type Mask32x4 = new v128
+
+// ── construct, load, store ───────────────────────────────────────────────────
+
+// All four lanes set to `x`.
+export function splatF32(x: f32): F32x4 { return __splat_f32x4__(x) as F32x4 }
+
+// A vector from its four lanes, x first.
+export function f32x4(x: f32, y: f32, z: f32, w: f32): F32x4 {
+  const v0 = __splat_f32x4__(x)
+  const v1 = __replace_lane_f32x4__(v0, 1, y)
+  const v2 = __replace_lane_f32x4__(v1, 2, z)
+  return __replace_lane_f32x4__(v2, 3, w) as F32x4
+}
+
+// The 16 bytes at byte `off` as four f32 lanes, lane 0 at the lowest address. Any `off`
+// works, aligned or not; a read past the end of `self` is not caught.
+export function loadF32x4(self: Buf, off: i32): F32x4 {
+  return __load_v128__(self.base + off) as F32x4
+}
+
+// Write `v`'s four lanes as 16 bytes at byte `off`, lane 0 at the lowest address. Any `off`
+// works; a write past the end of `self` is not caught and lands on whatever is there.
+export function storeF32x4(self: Buf, off: i32, v: F32x4) {
+  __store_v128__(self.base + off, v as! v128)
+}
+
+// ── arithmetic ───────────────────────────────────────────────────────────────
+
+// `a + b`, lane by lane. The named twins below exist so an op can be passed as a function.
+export function "+"(self: F32x4, o: F32x4): F32x4 { return addF32x4(self, o) }
+
+// `a - b`, lane by lane.
+export function "-"(self: F32x4, o: F32x4): F32x4 { return subF32x4(self, o) }
+
+// `a * b`, lane by lane.
+export function "*"(self: F32x4, o: F32x4): F32x4 { return mulF32x4(self, o) }
+
+// `a / b`, lane by lane; a zero lane in `o` gives an infinity or NaN in that lane, not a trap.
+export function "/"(self: F32x4, o: F32x4): F32x4 { return divF32x4(self, o) }
+
+// Lane-wise sum, the function form of `+`.
+export function addF32x4(self: F32x4, o: F32x4): F32x4 {
+  return __add_f32x4__(self as! v128, o as! v128) as F32x4
+}
+
+// Lane-wise difference, the function form of `-`.
+export function subF32x4(self: F32x4, o: F32x4): F32x4 {
+  return __sub_f32x4__(self as! v128, o as! v128) as F32x4
+}
+
+// Lane-wise product, the function form of `*`.
+export function mulF32x4(self: F32x4, o: F32x4): F32x4 {
+  return __mul_f32x4__(self as! v128, o as! v128) as F32x4
+}
+
+// Lane-wise quotient, the function form of `/`.
+export function divF32x4(self: F32x4, o: F32x4): F32x4 {
+  return __div_f32x4__(self as! v128, o as! v128) as F32x4
+}
+
+// The smaller of each pair of lanes. A NaN in either lane gives NaN, and -0.0 counts as
+// smaller than 0.0.
+export function minF32x4(self: F32x4, o: F32x4): F32x4 {
+  return __min_f32x4__(self as! v128, o as! v128) as F32x4
+}
+
+// The larger of each pair of lanes. A NaN in either lane gives NaN, and 0.0 counts as
+// larger than -0.0.
+export function maxF32x4(self: F32x4, o: F32x4): F32x4 {
+  return __max_f32x4__(self as! v128, o as! v128) as F32x4
+}
+
+// Each lane with its sign cleared; -0.0 becomes 0.0.
+export function absF32x4(self: F32x4): F32x4 {
+  return __abs_f32x4__(self as! v128) as F32x4
+}
+
+// The square root of each lane, correctly rounded; a negative lane gives NaN.
+export function sqrtF32x4(self: F32x4): F32x4 {
+  return __sqrt_f32x4__(self as! v128) as F32x4
+}
+
+// The four lanes added as `(x + z) + (y + w)`. That order is fixed, so a scalar loop
+// adding in the same order gets the same bits.
+export function reduceAddF32x4(self: F32x4): f32 {
+  const v = self as! v128
+  const s = __add_f32x4__(v, __shuffle_f32x4__(v, v, 2, 3, 0, 1))
+  const t = __add_f32x4__(s, __shuffle_f32x4__(s, s, 1, 0, 3, 2))
+  return __extract_lane_f32x4__(t, 0)
+}
+
+// ── compare and select ───────────────────────────────────────────────────────
+
+// Lanes where `self < o`. Every ordered comparison is false for a NaN lane.
+export function ltF32x4(self: F32x4, o: F32x4): Mask32x4 {
+  return __lt_f32x4__(self as! v128, o as! v128) as Mask32x4
+}
+
+// Lanes where `self <= o`.
+export function leF32x4(self: F32x4, o: F32x4): Mask32x4 {
+  return __le_f32x4__(self as! v128, o as! v128) as Mask32x4
+}
+
+// Lanes where `self > o`.
+export function gtF32x4(self: F32x4, o: F32x4): Mask32x4 {
+  return __gt_f32x4__(self as! v128, o as! v128) as Mask32x4
+}
+
+// Lanes where `self >= o`.
+export function geF32x4(self: F32x4, o: F32x4): Mask32x4 {
+  return __ge_f32x4__(self as! v128, o as! v128) as Mask32x4
+}
+
+// Lanes where `self == o` as numbers: NaN is never equal, and -0.0 equals 0.0.
+export function eqF32x4(self: F32x4, o: F32x4): Mask32x4 {
+  return __eq_f32x4__(self as! v128, o as! v128) as Mask32x4
+}
+
+// Lanes where `self != o`; the exact complement of `eqF32x4`, so true for a NaN lane.
+export function neF32x4(self: F32x4, o: F32x4): Mask32x4 {
+  return __ne_f32x4__(self as! v128, o as! v128) as Mask32x4
+}
+
+// Lane by lane, `a` where `mask` is true and `b` where it is false.
+export function selectF32x4(mask: Mask32x4, a: F32x4, b: F32x4): F32x4 {
+  return __bitselect_v128__(a as! v128, b as! v128, mask as! v128) as F32x4
+}
+
+// ── geometry ─────────────────────────────────────────────────────────────────
+
+// The dot product over all four lanes, summed in `reduceAddF32x4`'s order. For vec3s,
+// keep w at 0 in both.
+export function dot(self: F32x4, o: F32x4): f32 {
+  return reduceAddF32x4(mulF32x4(self, o))
+}
+
+// The 3D cross product of the x, y, z lanes; both w lanes are ignored and the result's w is 0.
+export function cross(self: F32x4, o: F32x4): F32x4 {
+  const a = self as! v128
+  const b = o as! v128
+  const l = __mul_f32x4__(
+    __shuffle_f32x4__(a, a, 1, 2, 0, 3),
+    __shuffle_f32x4__(b, b, 2, 0, 1, 3),
+  )
+  const r = __mul_f32x4__(
+    __shuffle_f32x4__(a, a, 2, 0, 1, 3),
+    __shuffle_f32x4__(b, b, 1, 2, 0, 3),
+  )
+  return __replace_lane_f32x4__(__sub_f32x4__(l, r), 3, 0.0) as F32x4
+}
+
+// `self` divided by its length `sqrt(self.dot(self))`, all four lanes. A zero vector gives
+// NaN in every lane.
+export function normalize(self: F32x4): F32x4 {
+  return divF32x4(self, splatF32(sqrt(dot(self, self))))
+}

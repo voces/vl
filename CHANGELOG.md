@@ -8,6 +8,23 @@ see **`DECISIONS.md`**.
 
 ## Type system (Track A)
 
+- **`std:simd` — the `F32x4` slice (SIMD S3, `simd-design.md` §G).** `F32x4` and `Mask32x4` are
+  `new v128` brands; the module ships `splatF32`, `f32x4(x, y, z, w)`, unaligned
+  `loadF32x4`/`storeF32x4` over a `Buf`, `+ - * /` (receiver-keyed operators, #3003) with named
+  twins `addF32x4`…`divF32x4`, `minF32x4`/`maxF32x4` (IEEE: NaN propagates, -0.0 < 0.0),
+  `absF32x4`, `sqrtF32x4`, the six compares `lt/le/gt/ge/eq/neF32x4 → Mask32x4`, `selectF32x4`,
+  `reduceAddF32x4` (fixed order `(x + z) + (y + w)`), and `dot`/`cross`/`normalize` as methods
+  reached through the vector with no import (#3005, O7). Every op lowers to one real `f32x4`/
+  `v128`/`i8x16.shuffle` instruction, `-O3` inlines the wrappers away, and a dot-product and a
+  spring-integration kernel agree with their scalar twins bit for bit. Compiler: `v128` is
+  spellable (so std can brand it), a brand over it dispatches binary operators and re-brands with
+  `as`, fourteen more `0xFD` intrinsics (sub/mul/div/min/max/abs/sqrt, six compares, bitselect,
+  replace_lane, a 4-lane shuffle), and a vector now flows through annotated and inferred locals,
+  returns, module globals, if-expressions and closure captures. `==`/`!=` and `print` on a
+  vector are refused as design; a vector inside an array/struct/map/nullable/union is refused
+  loudly (D1981, was invalid wasm for the inferred array). NOT shipped, pending an owner ruling:
+  lane read-back — `.x/.y/.z/.w` need property syntax and `laneF32x4(v, i)` cannot carry a
+  literal through a std wrapper (D1980). Function values over vectors stay emit-refused (D1982); a caller's own `dot` hides the vector's (D1984).
 - **SIMD design finalized — the owner ruled all ten open questions in `simd-design.md` §F, now
   rewritten from questions into decisions.** `std:simd`: a closed family of nominal `new`-newtype
   vector types (`F32x4`, …) over an internal `v128` substrate — a library, not a language builtin,
