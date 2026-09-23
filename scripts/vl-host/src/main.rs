@@ -5262,7 +5262,9 @@ const ESCAPE_OTHER_PREFIX: &str = "L4n.";
 
 /// The step both rungs run first when `escape_inline_choice` chooses any callee: inline
 /// exactly the functions not named `L4n.*`, whatever binaryen's size heuristics would say.
+/// `-g` keeps the name section, which carries each function's original index back out.
 const ESCAPE_INLINE_PASSES: &[&str] = &[
+    "-g",
     "--no-inline=L4n.*",
     "--always-inline-max-function-size",
     "100000",
@@ -5558,18 +5560,26 @@ fn escape_inline_step(path: &str, flag: &str, bytes: &[u8]) -> Result<Option<Vec
         ))
     })?;
     let n_after = after.n_imports + after.bodies.len() as u32;
-    let restored = rename_functions(&stepped, n_after, |_, cur| {
-        let cur = cur?;
-        match cur
-            .strip_prefix(ESCAPE_CHOSEN_PREFIX)
-            .or_else(|| cur.strip_prefix(ESCAPE_OTHER_PREFIX))
-        {
-            Some(orig) => orig
-                .parse::<u32>()
-                .ok()
-                .and_then(|o| scan.names.get(&o).cloned()),
-            None => Some(cur.to_string()),
+    // Every defined function must come back carrying the name the step gave it; one that
+    // does not means the name section was lost, and the original names with it.
+    let original = |f: u32, cur: Option<&str>| {
+        cur.and_then(|n| {
+            n.strip_prefix(ESCAPE_CHOSEN_PREFIX)
+                .or_else(|| n.strip_prefix(ESCAPE_OTHER_PREFIX))
+        })
+        .and_then(|o| o.parse::<u32>().ok())
+        .filter(|_| f >= after.n_imports)
+    };
+    if (after.n_imports..n_after)
+        .any(|f| original(f, after.names.get(&f).map(String::as_str)).is_none())
+    {
+        bail!("{flag}: the escape step's module lost the function names it was given");
+    }
+    let restored = rename_functions(&stepped, n_after, |f, cur| {
+        if f < after.n_imports {
+            return cur.map(str::to_string);
         }
+        original(f, cur).and_then(|o| scan.names.get(&o).cloned())
     })
     .ok_or_else(|| {
         Error::msg(format!(
@@ -5577,6 +5587,11 @@ fn escape_inline_step(path: &str, flag: &str, bytes: &[u8]) -> Result<Option<Vec
         ))
     })?;
     std::fs::write(path, &restored)?;
+    // `$VL_OPT_ESCAPE_DUMP=<file>`: a copy of the step's output, for tests and diagnosis — the
+    // rung overwrites `path` next. Undocumented in `vl help build`: a measurement facility.
+    if let Some(dump) = std::env::var_os("VL_OPT_ESCAPE_DUMP").filter(|v| !v.is_empty()) {
+        std::fs::write(dump, &restored)?;
+    }
     Ok(Some(restored))
 }
 

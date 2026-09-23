@@ -36,9 +36,13 @@ const FIXTURES: [string, boolean][] = [
 ];
 const BOUNDED = new Set(["cycle-helpers"]);
 const MAX_GROWTH = 2;
-const RUNGS: [string, string][] = [["-O", "OPT_PASSES"], ["-O3", "RELEASE_PASSES"]];
+const RUNGS: [string, string][] = [["-O", "OPT_PASSES"], [
+  "-O3",
+  "RELEASE_PASSES",
+]];
 
-const allocations = (wat: string): number => (wat.match(/\(struct\.new/g) ?? []).length;
+const allocations = (wat: string): number =>
+  (wat.match(/\(struct\.new/g) ?? []).length;
 
 const run = async (bin: string, args: string[]) => {
   const p = await new Deno.Command(bin, {
@@ -63,26 +67,39 @@ for (const [fx, melts] of FIXTURES) {
       try {
         const plain = `${tmp}/plain.wasm`;
         const b0 = await vl(["build", src, "-o", plain]);
-        if (b0.code !== 0) throw new Error(`${fx}: plain vl build failed: ${b0.err.trim()}`);
+        if (b0.code !== 0) {
+          throw new Error(`${fx}: plain vl build failed: ${b0.err.trim()}`);
+        }
         const r0 = await vl(["run", plain]);
-        if (r0.code !== 0 || JSON.stringify(linesOf(r0.out)) !== JSON.stringify(want)) {
+        if (
+          r0.code !== 0 ||
+          JSON.stringify(linesOf(r0.out)) !== JSON.stringify(want)
+        ) {
           throw new Error(
             `${fx}: the unoptimized build no longer prints the fixture's @log lines\n` +
-              `  want: ${JSON.stringify(want)}\n  got:  ${JSON.stringify(linesOf(r0.out))} rc=${r0.code}`,
+              `  want: ${JSON.stringify(want)}\n  got:  ${
+                JSON.stringify(linesOf(r0.out))
+              } rc=${r0.code}`,
           );
         }
-        const mainRs = Deno.readTextFileSync(`${ROOT}/scripts/vl-host/src/main.rs`);
+        const mainRs = Deno.readTextFileSync(
+          `${ROOT}/scripts/vl-host/src/main.rs`,
+        );
         const features = rustList(mainRs, "BINARYEN_FEATURES");
         for (const [rung, passes] of RUNGS) {
           const out = `${tmp}/m${rung}.wasm`;
           const b = await vl(["build", src, rung, "--wat", "-o", out]);
-          if (b.code !== 0) throw new Error(`${fx} ${rung}: vl build failed: ${b.err.trim()}`);
+          if (b.code !== 0) {
+            throw new Error(`${fx} ${rung}: vl build failed: ${b.err.trim()}`);
+          }
           const r = await vl(["run", out]);
           const got = linesOf(r.out);
           if (r.code !== 0 || JSON.stringify(got) !== JSON.stringify(want)) {
             throw new Error(
               `${fx} ${rung}: the optimized module prints something else\n` +
-                `  want: ${JSON.stringify(want)}\n  got:  ${JSON.stringify(got)} rc=${r.code}`,
+                `  want: ${JSON.stringify(want)}\n  got:  ${
+                  JSON.stringify(got)
+                } rc=${r.code}`,
             );
           }
           if (BOUNDED.has(fx)) {
@@ -97,7 +114,9 @@ for (const [fx, melts] of FIXTURES) {
             }
           }
           if (!melts) continue;
-          const left = allocations(Deno.readTextFileSync(`${tmp}/m${rung}.wat`));
+          const left = allocations(
+            Deno.readTextFileSync(`${tmp}/m${rung}.wat`),
+          );
           if (left !== 0) {
             throw new Error(
               `${fx} ${rung}: ${left} struct.new left in the optimized module\n` +
@@ -107,8 +126,18 @@ for (const [fx, melts] of FIXTURES) {
           }
           // CONTROL: the rung's own passes, without the step, leave the allocation in place.
           const c = `${tmp}/c${rung}.wasm`;
-          const opt = await run(WASM_OPT, [plain, ...rustList(mainRs, passes), ...features, "-o", c]);
-          if (opt.code !== 0) throw new Error(`${fx} ${rung}: control wasm-opt failed: ${opt.err.trim()}`);
+          const opt = await run(WASM_OPT, [
+            plain,
+            ...rustList(mainRs, passes),
+            ...features,
+            "-o",
+            c,
+          ]);
+          if (opt.code !== 0) {
+            throw new Error(
+              `${fx} ${rung}: control wasm-opt failed: ${opt.err.trim()}`,
+            );
+          }
           const dis = await run(WASM_DIS, [c, ...features]);
           if (allocations(dis.out) === 0) {
             throw new Error(
@@ -124,3 +153,73 @@ for (const [fx, melts] of FIXTURES) {
     },
   });
 }
+
+// The step renames every function to mark it, then gives each its own name back: a `--names`
+// build leaves the step with the names it came in with and none of the markers, and a build
+// without names leaves it with none. Read off the step's own output (`$VL_OPT_ESCAPE_DUMP`),
+// since the rung that follows decides separately whether the final module keeps names.
+Deno.test({
+  name:
+    "native-release: the escape step hands every function its own name back",
+  ignore: !ENABLED,
+  fn: async () => {
+    const src = `${DIR}/state-helpers.vl`;
+    const tmp = await Deno.makeTempDir();
+    try {
+      const mainRs = Deno.readTextFileSync(
+        `${ROOT}/scripts/vl-host/src/main.rs`,
+      );
+      const features = rustList(mainRs, "BINARYEN_FEATURES");
+      for (
+        const [flags, named] of [[["--names"], true], [[], false]] as [
+          string[],
+          boolean,
+        ][]
+      ) {
+        const dump = `${tmp}/step${named ? "-named" : ""}.wasm`;
+        const b = await vl([
+          "build",
+          src,
+          "-O",
+          ...flags,
+          "-o",
+          `${tmp}/m.wasm`,
+        ], {
+          VL_OPT_ESCAPE_DUMP: dump,
+        });
+        if (b.code !== 0) throw new Error(`build ${flags}: ${b.err.trim()}`);
+        let dis;
+        try {
+          dis = await run(WASM_DIS, [dump, ...features]);
+        } catch {
+          throw new Error(
+            `${flags}: no step output at ${dump} — the step did not run`,
+          );
+        }
+        const funcs = [...dis.out.matchAll(/^ \(func \$(\S+)/gm)].map((m) =>
+          m[1]
+        );
+        if (funcs.length === 0) {
+          throw new Error(`${flags}: the step's output has no functions`);
+        }
+        const markers = funcs.filter((f) => /^L4[cn]\./.test(f));
+        if (markers.length) {
+          throw new Error(
+            `${flags}: marker names left after the step: ${markers.join(", ")}`,
+          );
+        }
+        const scan = funcs.some((f) => f.startsWith("scan@"));
+        if (scan !== named) {
+          throw new Error(
+            `${flags}: want the function \`scan\` ${
+              named ? "named" : "unnamed"
+            } after the step\n` +
+              `  got: ${funcs.join(", ")}`,
+          );
+        }
+      }
+    } finally {
+      await Deno.remove(tmp, { recursive: true });
+    }
+  },
+});

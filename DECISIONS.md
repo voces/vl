@@ -6831,8 +6831,11 @@ its own pass over every function, so marking all but the chosen few cost `marks 
 7,999 marks on 8,000 functions took 1.95 s native and 5.2 s with the npm build (measured in
 review). The host
 instead renames the step's input — `L4c.<index>` for a chosen callee, `L4n.<index>` for every
-other function — and passes the one pattern `--no-inline=L4n.*`, then gives every function back
-its own name (or none) before the rung runs. On a generated 8,000-function program `-O` costs
+other function — and passes the one pattern `--no-inline=L4n.*` with `-g`, then gives every
+function back its own name (or none) before the rung runs. Without `-g` binaryen drops the name
+section, so the step refuses a result whose functions lost their markers rather than hand the
+rung a module with no way back to its names; `tests/selfhost_native_release_escape_test.ts` reads
+the step's output (`$VL_OPT_ESCAPE_DUMP`) and checks a `--names` build keeps them. On a generated 8,000-function program `-O` costs
 3.24 s native against master's 3.42 s and the first version's 4.38 s (npm: 4.10, 3.56, 6.46).
 
 The rung then runs as before on the result, with the run-once marks re-read off that result
@@ -6872,6 +6875,13 @@ So a default-path L4 is emit-time work: (b), plus scalar replacement of the stru
 scalarization until `wasm-opt` runs") already name the tension: the native default path never
 runs `wasm-opt`. Revisiting B1 for that path is a larger lane than this one, and its measured
 ceiling on this benchmark is (a)'s row.
+
+**Open, and older than this step: `vl build --names -O` writes a module with no function
+names.** Neither rung passes `-g` to `wasm-opt`, so binaryen drops the name section the build
+asked for (master: `tests/fixtures/opt-runonce/main-wrapper.vl` at `--names -O` disassembles to
+`$0`, `$1`). Whether an optimized `--names` build should keep them — `-g` on the rung when
+`--names` is given, at the cost of the section's bytes — is a decision for a follow-up; the
+escape step keeps names through itself, so it neither causes nor hides the loss.
 
 **What was rejected.**
 * *Raising binaryen's inline sizes globally* (`-aimfs 60`/`400`). `-aimfs 400` scalarises `D`
