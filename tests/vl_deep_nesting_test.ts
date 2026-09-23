@@ -88,13 +88,13 @@ const expect = (ls: Level[], a: number): number => {
 
 const want = (ls: Level[]) => [1, 0, -1].map((a) => String(expect(ls, a)));
 
-const vl = async (args: string[]) => {
+const vl = async (args: string[], extra: Record<string, string> = {}) => {
   const { code, stdout, stderr } = await new Deno.Command(VL, {
     args,
     stdout: "piped",
     stderr: "piped",
     cwd: ROOT,
-    env: { RUST_BACKTRACE: "0", NO_COLOR: "1", VL_STD: `${ROOT}/std`, PATH: Deno.env.get("PATH") ?? "" },
+    env: { RUST_BACKTRACE: "0", NO_COLOR: "1", VL_STD: `${ROOT}/std`, PATH: Deno.env.get("PATH") ?? "", ...extra },
     clearEnv: true,
   }).output();
   const dec = new TextDecoder();
@@ -138,6 +138,18 @@ for (const [name, pick] of SHAPES) {
     });
   });
 }
+
+// Where the host cannot reserve the large stack it runs the compiler on its first thread with
+// wasmtime's default wasm stack, so a deep program is the old clean refusal (exit 70), never an
+// abort from a wasm stack larger than the native one. `VL_SEED_STACK=default` forces that path.
+Deno.test({ name: "deep nesting (native): the small-stack fallback still exits 70, not an abort", ignore: !NATIVE }, async () => {
+  await withFile(gen(levels(SHAPES[3][1], 3_000)), async (file) => {
+    const run = await vl(["run", file, "--compiler", COMPILER], { VL_SEED_STACK: "default" });
+    if (run.code !== 70 || !run.err.includes("call stack")) {
+      throw new Error(`fallback vl run: want rc 70 and a call-stack report, got ${run.code}\n${run.err.slice(0, 600)}`);
+    }
+  });
+});
 
 // The editor half: the same seed under V8, whose stack is the LSP's and the playground's.
 const checker = () => {
