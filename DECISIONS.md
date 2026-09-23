@@ -6370,6 +6370,11 @@ value, and `refresh-compiler.sh` warms its sidecar with the other two.
 * *Capping the heap with a `ResourceLimiter`*: a denied growth fails the allocation. wasmtime
   does not fall back to a smaller growth step.
 
+**A side effect: D1976's witness now builds.** Its 3.2 MB source trapped on the null
+collector's 64 MiB cap for one object (an `i32[]` output buffer past 2^23 slots). The copying
+collector has no such cap. The buffer layout the row names still stands, and under
+`VL_COMPILE_GC=null` the witness still traps; the row says so.
+
 **plumb's "under 1 GB for a 10–20 MB unit" is not reachable with a collector choice.** The live
 set is the floor, and it is ~59 bytes per source byte: 592 MiB at 10 MB. `vl check`, which stops
 after the type checker, already holds ~500 MiB of it, so the front end's tables account for
