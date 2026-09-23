@@ -6637,3 +6637,63 @@ reference parameter: that keeps `decode` and `toString` fixed and leaves every v
 Every hot loop is now out of run-once code, so that gap is somewhere else — plausibly `decode`
 itself, which absorbs its helpers into one 4,400-line function. SpiderMonkey and JavaScriptCore
 were not measured: neither is installed here (bun 1.0's JSC predates WasmGC).
+
+## A string-literal type reps as the atom wherever it lives, and a `const` bound to a literal has its type (owner, 2026-09-23) — D2150, D2156, D2157
+
+*The owner's two rulings: "comparing two string literals should be allowed, even if in objects,
+but requires O(1)", and `const Z = "zz"` infers `"zz"`, not `string`.*
+
+**THE REP FOLLOWS THE MEMBER SET, NOT THE SPELLING.** A literal union's type did not carry its
+rep: a declared `type K = "a" | "b"` was the interned i32 atom, an inline `"a" | "b"` at a field,
+parameter, return, local, global, capture or type argument was a string ref compared with
+`__str_eq__`. The emitter decided by arena identity (`tyIsLitUnionAlias`), and an inline set was
+a fresh index nobody registered. The rule now is one sentence: **a string-literal set reps as the
+atom at every position, however it is spelled.** It is built by making the inline spelling an
+alias rather than by teaching every consumer a second rep: the checker registers each inline set
+as a hidden alias `#luN` when it first resolves one (`annUnionInnerTy`), and writes a
+`UnionDecl` for each into the program before canon, so the emitter's passes that walk
+declarations see it exactly as they see a written one. `#` is not an identifier character, so
+the name cannot collide, and `demangleMsg` renders it as its member set, so no user reads it.
+`mkUnionTy` hands back a registered set's own index when a join or a narrowing lands on exactly its
+members, so no twin index can read as the string rep beside it.
+
+*Alternatives.* Teaching each of the ~40 name- and index-keyed rep sites the inline set (the
+litunion-compact-rep-design.md route) is the same change spread over every consumer, with the
+cross-module and mono-pin spellings each a place to miss. Keeping the string rep and pricing its
+compare by member length meets neither ruling.
+
+**Every alias defect was an inline one waiting.** Making inline sets aliases exposed five
+defects the written alias already had (D2151–D2155): a row twin claimed by a `{f: "x"}` literal,
+a specialised function-value call, an inferred return whose set equals an alias, `is string`
+over a pinned atom, and two unions' arms folded onto one heap. Each is closed at its alias
+spelling, which is where it was reachable before.
+
+**A ONE-LITERAL TYPE IS ONE VALUE, so its compares need no read.** A bare `"z"` stays a string
+ref (its rep is not in question: no second value exists), and `==`/`!=` against one folds to a
+constant beside another literal, or to the member's atom id beside an atom, after both operands
+evaluate for their effects. Equality of two literals is by decoded value, never by lexeme, so an
+escape and the character it spells agree.
+
+**`const Z = "zz"` HAS TYPE `"zz"`, AND IT WIDENS WHERE IT IS STORED.** After TypeScript's
+widening literal: the type is minted fresh per binding and flagged, kept wherever the value is
+read, and widened to `string` where it is stored somewhere reassignable — a `let`, a list or
+object literal, a type argument, the element an empty container pins from it. Without the widening,
+`let s = Z; s = "other"`, `[Z].push("w")` and `wrap(Z).push("other")` all stop checking. The
+recorded node type is the widened `string`, so no emitter classifier sees a literal it never
+saw before; `nodeWideStrLitText` is the one question the literal answers. Scope, as ruled: a
+`const` of a string literal. A `let` keeps `string`; a numeric `const` is unchanged. Unlike a
+declared literal type, a widening one does not refuse a compare against a literal outside it:
+`const MODE = "debug"; if MODE == "release"` is a false test, not an error, because refusing it
+would break every configuration constant written that way.
+
+**One predicate for type and rep.** The getter contract prices a compare of two tag operands at 0
+through `nodeCmpsByTag`: a string literal, a value typed as one literal (`tyIsOneStrLit`, the
+same predicate the emitter's fold reads), or one whose type reps as the atom (`tyLitUnionAliasIx`,
+the predicate the rep layer assigns the valtype from). A compare the contract prices at 0 is one
+the emitter lowers to one `i32.eq` or a constant.
+
+**Not decided here.** A string-literal member of a MIXED union (`"a" | i32`) still boxes its
+member string, and its compare still calls `__str_eq__`; changing that is the tag-scheme ruling
+litunion-compact-rep-design.md §7 leaves open. A string member read on a multi-member set
+(`k.length` over `"a" | "bb"`) is still refused: it would need the atom widened first.
+

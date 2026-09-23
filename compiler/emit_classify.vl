@@ -73,6 +73,9 @@ import {
   inferRetFnKey,
   inferRetNameByNode,
   inferRetNameOf,
+  inferRetRowByNode,
+  inferRetRowOf,
+  inferRetTyIxAt,
   inferRetTyIxByNode,
   inferRetTyIxOf,
   isBoolLitExpr,
@@ -926,6 +929,22 @@ function retKindIsList(k: VKind) {
     k == "f64list" ||
     k == "i64list" ||
     k == "f32list"
+}
+
+// Whether un-annotated function `i`'s checker-inferred return is a registered literal union,
+// which reps as the interned atom: a string-repped member read it returns narrows at the
+// return (`strReppedLitUnionAt`), so the signature must not follow that read's own rep (D2153).
+export function fnInferredRetLitAtom(i: i32): boolean {
+  if i < 0 || i >= fnStmts.length { return false }
+  const fn = P.nodes[fnStmts[i]]
+  if fn is FuncDecl {
+    if fn.fnRet >= 0 { return false }
+    let row = inferRetRowOf(inferRetFnKey(fnStmts[i], fn.fnName))
+    if row < 0 { row = inferRetRowByNode(fnStmts[i]) }
+    if row < 0 { return false }
+    return tyLitUnionAliasIx(inferRetTyIxAt(row)) >= 0
+  }
+  false
 }
 
 // Store an inferred return-kind fact for function `i`: the write happens only when it
@@ -3522,7 +3541,11 @@ export function criClassify(rx0: i32, i: i32) {
   if rxe is BinExpr {
     if rxe.binOp == "=" { rx = rxe.binRight }
   }
-  if fRetKind[i] != "str" && exprString(rx, fnStmts[i]) {
+  if (
+    fRetKind[i] != "str" &&
+    !fnInferredRetLitAtom(i) &&
+    exprString(rx, fnStmts[i])
+  ) {
     criSetRetKind(i, "str")
   }
   if !retKindIsList(fRetKind[i]) && exprRefArray(rx, fnStmts[i]) {
@@ -23084,7 +23107,57 @@ export function litAtomWidenTexts(ix: i32, fnIx: i32) {
   if direct.length > 0 { return direct }
   const decl = tyLitMemberTexts(litAtomMemberTy(ix, fnIx))
   if decl.length > 0 { return decl }
-  tyLitMemberTexts(nodeTyIxOf(ix))
+  const own = tyLitMemberTexts(nodeTyIxOf(ix))
+  if own.length > 0 { return own }
+  const clo = callResultAtomTexts(ix, fnIx)
+  if clo.length > 0 { return clo }
+  memberAtomFieldTexts(ix, fnIx)
+}
+
+// The member texts of a call's atom result, read off the callee's function type — the texts
+// twin of `cloCallResultLitUnion` and of `exprIsLitAtom`'s named-callee rung, which claim the
+// atom from those same types. A call a specialisation wrote records no type of its own (D2152).
+function callResultAtomTexts(ix: i32, fnIx: i32): string[] {
+  const none: string[] = []
+  const c = unwrapParen(ix)
+  if c < 0 { return none }
+  const cn = P.nodes[c]
+  if cn is Call {
+    const ft = cloCallCalleeFnTy(c, fnIx)
+    if ft >= 0 {
+      const t = T.tys[ft]
+      if t is TyFunc { return tyLitMemberTexts(t.fnRet) }
+    }
+    if cn.callFn < 0 { return none }
+    if P.nodes[cn.callFn] is Ident {
+      const target = fnIndexOfSid(sidOfNode(cn.callFn))
+      if target >= 0 {
+        const cf = P.nodes[fnStmts[target]]
+        if cf is FuncDecl {
+          if cf.fnRet >= 0 { return tyLitMemberTexts(nodeTyIxOf(cf.fnRet)) }
+        }
+      }
+    }
+  }
+  none
+}
+
+// The member texts of the atom FIELD a `recv.f` read lands on, from the row's own sidecar. A
+// literal whose checked type is `{f: string}` can share the row a literal-union field minted,
+// so the row, not the read's recorded type, is what names the members (D2151).
+function memberAtomFieldTexts(ix: i32, fnIx: i32): string[] {
+  const e = P.nodes[unwrapParen(ix)]
+  if e is Member {
+    const si = structIndexOfExpr(e.memObj, fnIx)
+    if si >= 0 {
+      const fi = sFieldIndex(si, e.memProp)
+      if fi >= 0 && sFieldIsLitUnion(si, fi) {
+        return tyLitMemberTexts(sFieldElemTyIxAt(si, fi))
+      }
+    }
+  }
+  const none: string[] = []
+  none
 }
 
 function litAtomMemberTyAt(exprIx: i32, fnIx: i32, depth: i32): i32 {
@@ -23646,10 +23719,14 @@ export function buildVariantTwins() {
   // equality-preserving on the text, so `sigIds[d] == sigIds[i]` decides exactly what
   // comparing the two strings decided, and the memo is asked once a row rather than once a pair.
   const sigIds: i32[] = []
+  // The union each row belongs to: a shared tag is a fact about one union's arms, so the
+  // fold below never joins arms of two unions (D2155).
+  const owners: i32[] = []
   let i = 0
   while i < uVariants.length {
     keys.push(repNameCanonId(uVariants[i]))
     sigIds.push(sidOf(variantSig(i)))
+    owners.push(unionOfVariant(i))
     i = i + 1
   }
   uVarTwin = []
@@ -23674,7 +23751,11 @@ export function buildVariantTwins() {
       const sigI = sigIds[i]
       let d = 0
       while d < i {
-        if sigIds[d] == sigI && variantLitDiscriminable(d, i) {
+        if (
+          sigIds[d] == sigI &&
+          owners[d] == owners[i] &&
+          variantLitDiscriminable(d, i)
+        ) {
           rep = d
           d = i // the smallest such row, matching the guard above
         }
@@ -29950,6 +30031,11 @@ function objNestedFieldCompat(
 export function objVariantName(objIx: i32) {
   const o = P.nodes[objIx]
   if o is ObjLit {
+    // The arm the checker proved this literal is, when it names one: two arms of two unions
+    // can share every field name and field code (two literal-union fields over different
+    // member sets), and the first-match scan below would build the other one (D2155).
+    const own = variantRowOfTy(nodeRepTyIxOf(objIx))
+    if own >= 0 && objMatchesVariantIdx(objIx, own) { return uVariants[own] }
     // Only a variant whose field-name signature equals the literal's can match — the matcher
     // below needs equal counts and every variant name present — so the bucket for that
     // signature holds every candidate, in the ascending order the scan visited them.
