@@ -5690,6 +5690,74 @@ whitelist over literals, identifier reads, places and arithmetic; every kind it 
 a call, a lambda, a `MatchExpr`, every statement kind — answers "possibly effectful" and puts
 its literal on the scratch path. A kind nobody has classified is never silently reordered.
 
+## A user module's Cranelift compile is cached, behind a digest the host checks (2026-09-22) — lane L5
+
+Every `vl run` Cranelift-compiled the module it ran, every time: 0.33–0.5 s on plumb's
+~100 KB modules, the whole fixed cost of the many short tool invocations plumb makes
+(`docs/internals/perf-decoder-gap-2026-09.md` §6, L5). The seed's own compile has been cached
+since the start; the modules it emits now are too, in `modules/` under the same user cache
+directory, keyed `<sha256(wasm)>-<engine tag>.cwasm`. The tag is the one the seed's cache
+uses — wasmtime's `precompile_compatibility_hash`, which covers the wasmtime version, the target
+and every compile-relevant `Config` setting. Because the GC heap size is part of it, `vl run`
+(64 MiB) and `vl test` (8 MiB) get separate entries; no other setting needed its own handling.
+
+Measured on this box (load 15–20), median of 7, cold is `VL_NO_CACHE=1`:
+
+| run | cold wall / CPU ms | warm wall / CPU ms |
+| --- | --- | --- |
+| plumb `decode-bench` prebuilt `db.wasm`, `0` passes | 425 / 724 | **24 / 24** |
+| the same, `1` pass | 1,340 / 1,617 | 940 / 940 |
+| `vl run tools/decode-bench.vl … 0` (compile from source) | 506 / 799 | 128 / 127 |
+| `vl run hello.wasm` | 6.8 / 19.8 | 1.1 / 0.9 |
+| `vl run hello.vl` | 12.0 / 25.5 | 5.5 / 5.2 |
+| distilled corpus (`regress.py`, JOBS=6, load 60–160) | 50.7 s wall, 248 CPU-s | 23.7 s wall, 133 CPU-s |
+
+A miss costs nothing measurable over no cache at all (hello 6.8 → 7.1 ms, `db.wasm` 449 → 427
+ms, both inside the noise): serializing, hashing and writing are small beside Cranelift. An
+entry is about 13× its wasm (1.33 MB for `db.wasm`, 20 KB for hello). A cold corpus run writes
+3,648 entries, 104 MB.
+
+**Why `deserialize` is sound here.** wasmtime documents `Module::deserialize` as unsafe: its
+input is "only lightly validated", arbitrary bytes "can trivially be used to execute arbitrary
+code", and calling it is safe only on "the exact output of [`Module::serialize`] (unmodified)".
+Its version and configuration check makes a *foreign-version* file fail safely; it does not
+detect a *damaged* one. The seed's cache relies on the file's path alone, which is fine for a
+handful of files beside the seed; a directory holding thousands of entries, written by
+concurrent, interrupted and differently-versioned `vl` processes, earns more. So each entry is
+an envelope — magic, SHA-256 of the wasm, the engine tag, SHA-256 of the artifact, the
+artifact's length, then the artifact — and the host reads the whole file into memory and checks
+every field before calling `deserialize` on the bytes it just hashed. What reaches wasmtime is
+therefore byte-for-byte what `Module::serialize` produced for *this* wasm under *this* engine
+configuration. That rules out truncation, bit rot, a torn write and a file renamed from another
+key. `deserialize` (bytes) is used rather than `deserialize_file` (mmap) on purpose: the checked
+bytes and the loaded bytes are the same buffer, so nothing can change them between the check and
+the load. What the digest does NOT defend against is a writer who recomputes it — but that
+writer already has the user's file permissions, which is the same power as replacing the `vl`
+binary, so a keyed MAC would add a secret to guard and no security. A collision needs SHA-256
+to break.
+
+**Bounded, least-recently-used, soft.** After a miss writes an entry, the host prunes
+`modules/` back to `$VL_CACHE_MAX_MB` (default 512) by deleting the entries with the oldest
+mtimes, never the one it just wrote, and removes temp files older than an hour. A hit refreshes
+its entry's mtime, at most once a minute. The pass stats every entry, so it runs at most once a
+minute (a `.last-prune` stamp): a corpus run misses thousands of times a minute, and a per-miss
+scan would put a directory walk on every one of them. The bound is therefore soft — a burst can
+overshoot it until the next pass — which is the right trade for a cache. Writes are temp file +
+`rename`, so concurrent runs see a whole old file or a whole new one; sixteen concurrent cold
+runs of one module all ran correctly and left one entry.
+
+**Opt-out is an environment variable, not a flag**, because every `vl` flag is parsed in the
+guest (`compiler/cli.vl`) and the host's engine setup happens before any guest runs; `$VL_GC`
+is the same shape. `VL_NO_CACHE=1` covers only user modules: turning the seed's cache off
+would make every invocation recompile the compiler, which nobody switching off a module cache
+is asking for. `VL_CACHE_TRACE=1` exists so a test can prove a hit without timing anything
+(`tests/vl_module_cache_test.ts`).
+
+**Not wasmtime's built-in cache** (`Config::cache`, compiled in by default). It keys on
+SHA-256 and compresses, but a hit is checked only for decompressing (zstd) before it reaches
+`deserialize`, it prunes on a background worker whose timing is not ours, and it would be a
+second cache directory, with its own config file, beside the one `vl` already documents.
+
 ## The host's dependencies build at opt-level 3; the host crate stays at 1 (2026-09-22)
 
 `scripts/vl-host` shipped with `[profile.release] opt-level = 1` from its first commit (#275),
