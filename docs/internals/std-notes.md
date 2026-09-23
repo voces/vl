@@ -850,8 +850,15 @@ Slice S3 of `docs/internals/simd-design.md` — the `F32x4` surface over the `__
   the no-import spelling (D1984); the header documents the aliased-import workaround.
 - **Containers are refused in the checker, including at a generic pin** (D1981): the direct
   site, an annotation, and a generic body's `[x, x]` re-asked at the call that binds `T`.
-- **Not shipped: lane read-back** (D1980). `std:simd` cannot wrap a literal-lane intrinsic,
-  and `.x` needs property syntax. The header points callers at `storeF32x4` + `loadF32`.
+- **Lane read-back** (D1980, closed; `property-access-design.md` §E3, F3(a), F4(b)).
+  `lane(i)` / `withLane(i, x)` take `i: Lane4` (`0 | 1 | 2 | 3`) and are a four-arm `==`
+  ladder, each arm passing a LITERAL to the intrinsic, so the intrinsic's literal-lane check
+  holds inside std and no compiler line was needed. A literal argument folds to one
+  `f32x4.extract_lane N` / `replace_lane N` at `-O`/`-O3` (`tests/vl_simd_lane_codegen_test.ts`);
+  a runtime `Lane4` keeps all four arms; a plain `i32` is refused (`expected Lane4, got i32`).
+  At `-O0` a literal read is a call plus up to three compares. Unsuffixed because D1984 landed:
+  a caller's own `lane` for another `self` type steps aside (`f32x4-lanes-own-names.vl`).
+  `.x/.y/.z/.w` are getters v1 (`export get`), one intrinsic each, inside the body contract.
 - **What grades it.** `tests/cases/simd/f32x4-std-surface.vl` (every op, lane order, NaN and
   -0.0), `f32x4-geometry.vl`, `f32x4-kernel-vs-scalar.vl` (bit-identical to scalar),
-  `f32x4-positions.vl`, and the `error-*` refusals.
+  `f32x4-positions.vl`, `f32x4-lanes.vl`, and the `error-*` refusals.

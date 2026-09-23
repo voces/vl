@@ -722,6 +722,8 @@ flags a non-literal `Lane` argument.
 the immediate. It also delivers O3's deferred runtime-index fallback more cheaply than the spill
 O3 imagined, and the branch is visible in the parameter's type. (b) builds const generics for a
 single-lane read.
+*Built (2026-09-22):* std exports the index type as `Lane4`, not `Lane`, so the 8- and
+16-lane shapes of S4 can take `Lane8` / `Lane16` beside it (std-api review).
 
 **F4. The spelling of the indexed lane read.**
 (a) `laneF32x4(v, i)` / `withLaneF32x4`, following S3's width-suffixed family (`addF32x4`) and
