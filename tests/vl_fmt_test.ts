@@ -3033,3 +3033,212 @@ Deno.test({
     }
   },
 });
+
+// D1998 — A LABELLED LOOP OPENING A BLOCK ROUND-TRIPS, AND A MULTI-LINE `if`-EXPRESSION ARM
+// KEEPS ITS STATEMENTS.
+//
+// The parser now reads `{ B: while … }` as a block, so `vl fmt` must reproduce it byte for byte.
+// An `if` expression whose arms are not one simple expression each used to go through the
+// whitespace-collapsing slice (joining an arm's statements onto one line, which re-parsed
+// `const t = 4` / `[t][0]` as an index), and an `else if` arm rendered only its FIRST
+// statement. Both now render every arm as a block, and the output must still run the same —
+// in a binding, an arrow body and a lambda passed as a call argument.
+Deno.test({
+  name: "vl-fmt: a labelled loop first in a block, and multi-line if-expression arms (D1998)",
+  ignore: !ENABLED,
+  fn: async () => {
+    const witness = [
+      "function f(c: boolean): i32 {",
+      "  let n = 0",
+      "  if c {",
+      "    n = 1",
+      "  } else {",
+      "    B: while true {",
+      "      n = 2",
+      "      break B",
+      "    }",
+      "  }",
+      "  n",
+      "}",
+      "print(f(false))",
+      "",
+    ].join("\n");
+    const w = await run([], witness);
+    if (w.code !== 0 || w.out !== witness) {
+      throw new Error(`the labelled-loop witness did not round-trip (rc ${w.code}):\n${w.out}${w.err}`);
+    }
+    const cases: { src: string; want: string; prints: string }[] = [
+      {
+        src: [
+          "function k(a: boolean, b: boolean): i32 {",
+          "  let q = 0",
+          "  const r = if a { 1 } else if b {",
+          "    q = 5",
+          "    q + 1",
+          "  } else { 3 }",
+          "  r",
+          "}",
+          "print(k(false, true))",
+          "",
+        ].join("\n"),
+        want: [
+          "function k(a: boolean, b: boolean): i32 {",
+          "  let q = 0",
+          "  const r = if a {",
+          "    1",
+          "  } else if b {",
+          "    q = 5",
+          "    q + 1",
+          "  } else {",
+          "    3",
+          "  }",
+          "  r",
+          "}",
+          "print(k(false, true))",
+          "",
+        ].join("\n"),
+        prints: "6\n",
+      },
+      {
+        src: [
+          "function k(a: boolean): i32 {",
+          "  const r = if a {",
+          "    const t = 4",
+          "    [t][0]",
+          "  } else { 3 }",
+          "  r",
+          "}",
+          "print(k(true))",
+          "",
+        ].join("\n"),
+        want: [
+          "function k(a: boolean): i32 {",
+          "  const r = if a {",
+          "    const t = 4",
+          "    [t][0]",
+          "  } else {",
+          "    3",
+          "  }",
+          "  r",
+          "}",
+          "print(k(true))",
+          "",
+        ].join("\n"),
+        prints: "4\n",
+      },
+      // an arrow body
+      {
+        src: [
+          "function k(a: boolean): i32 {",
+          "  const f = () => if a {",
+          "    const t = 4",
+          "    [t][0]",
+          "  } else { 3 }",
+          "  f()",
+          "}",
+          "print(k(true))",
+          "",
+        ].join("\n"),
+        want: [
+          "function k(a: boolean): i32 {",
+          "  const f = () => if a {",
+          "    const t = 4",
+          "    [t][0]",
+          "  } else {",
+          "    3",
+          "  }",
+          "  f()",
+          "}",
+          "print(k(true))",
+          "",
+        ].join("\n"),
+        prints: "4\n",
+      },
+      // an arrow body with an `else if` arm
+      {
+        src: [
+          "function k(a: boolean): i32 {",
+          "  let q = 0",
+          "  const f = (x: i32) => if a {",
+          "    q = x",
+          "    q",
+          "  } else if !a {",
+          "    q = 5",
+          "    -q",
+          "  } else { 3 }",
+          "  f(2)",
+          "}",
+          "print(k(false))",
+          "",
+        ].join("\n"),
+        want: [
+          "function k(a: boolean): i32 {",
+          "  let q = 0",
+          "  const f = (x: i32) => if a {",
+          "    q = x",
+          "    q",
+          "  } else if !a {",
+          "    q = 5",
+          "    -q",
+          "  } else {",
+          "    3",
+          "  }",
+          "  f(2)",
+          "}",
+          "print(k(false))",
+          "",
+        ].join("\n"),
+        prints: "-5\n",
+      },
+      // a lambda passed as a call argument
+      {
+        src: [
+          "function k(xs: i32[]): i32[] {",
+          "  xs.map((x: i32) => if x > 1 {",
+          "    const t = x * 2",
+          "    [t][0]",
+          "  } else { x })",
+          "}",
+          "print(k([1, 2])[1])",
+          "",
+        ].join("\n"),
+        want: [
+          "function k(xs: i32[]): i32[] {",
+          "  xs.map(",
+          "    (x: i32) => if x > 1 {",
+          "      const t = x * 2",
+          "      [t][0]",
+          "    } else {",
+          "      x",
+          "    },",
+          "  )",
+          "}",
+          "print(k([1, 2])[1])",
+          "",
+        ].join("\n"),
+        prints: "4\n",
+      },
+    ];
+    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_d1998_" });
+    try {
+      for (const c of cases) {
+        const r = await run([], c.src);
+        if (r.code !== 0 || r.out !== c.want) {
+          throw new Error(`want:\n${c.want}\n---\ngot (rc ${r.code}):\n${r.out}${r.err}`);
+        }
+        const again = await run([], r.out);
+        if (again.code !== 0 || again.out !== r.out) {
+          throw new Error(`not idempotent (rc ${again.code}):\n${again.out}`);
+        }
+        const file = `${dir}/main.vl`;
+        await Deno.writeTextFile(file, r.out);
+        const ran = await runOn("run", file);
+        if (ran.code !== 0 || ran.out !== c.prints) {
+          throw new Error(`formatted output ran wrong (rc ${ran.code}): want ${JSON.stringify(c.prints)}, got ${JSON.stringify(ran.out)}\n${ran.err}`);
+        }
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
