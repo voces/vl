@@ -10266,6 +10266,14 @@ function memRecvNulVariantIndex(recvIx: i32, fnIx: i32) {
   nulVariantIdxOfExpr(recvIx, fnIx)
 }
 
+// The variant row an un-narrowed receiver's value is laid out at: a union ARM (variant param,
+// local, capture, call) or an `Arm | null`, or -1 when the receiver is neither.
+function memRecvArmVariantIndex(recvIx: i32, fnIx: i32): i32 {
+  const vi = exprVariantIndex(recvIx, fnIx)
+  if vi >= 0 { return vi }
+  memRecvNulVariantIndex(recvIx, fnIx)
+}
+
 // The variant row an expression is currently narrowed to, or -1 — asked of the
 // expression itself, unlike `memNarrowVariantIndex` which asks it of a Member's receiver.
 // A struct arm's read never unboxes (stays `{tag, payload}`), so a destination typed at
@@ -22848,6 +22856,14 @@ export function variantFieldElemName(vi: i32, fi: i32) {
   uFieldElemName[uFieldStart[vi] + fi]
 }
 
+// `variantFieldElemName` of variant `vi`'s field NAMED `field`, or "" when the variant has no
+// such field.
+function variantFieldElemNameOr(vi: i32, field: string): string {
+  const fi = variantFieldIndex(vi, field)
+  if fi < 0 { return "" }
+  variantFieldElemName(vi, fi)
+}
+
 // ── canonical layout twins, variant slot layer ──
 // Two union-variant slots share one WasmGC heap type under the two-layer discipline: the
 // canonical key of the variant's type (`repNameCanonId`), then a layout guard over field
@@ -30166,18 +30182,41 @@ export function refListElemNameOfExpr(exprIx: i32, fnIx: i32) {
     if raPm != "" { return refArrElemName(raPm) }
     // A `recv.field` ref-list field read — the field's element name from the receiver's
     // struct / narrowed variant.
+    // A narrowing that names no variant (a place narrowed to a plain struct) falls through to
+    // the receiver rungs below, as `memFieldTypeCode` does (D1735).
     if memIsNarrowed(exprIx) {
       const vi = memNarrowVariantIndex(exprIx)
       if vi >= 0 {
         const vfi = variantFieldIndex(vi, e.memProp)
         if vfi >= 0 { return uFieldElemName[uFieldStart[vi] + vfi] }
+        return ""
       }
-      return ""
+    }
+    // The receiver rungs of `memFieldTypeCode`, arm for arm: a union ARM value (a variant
+    // param, local, capture or call) keeps its fields in the variant tables, so a struct-only
+    // leg answers "" for a field that code already called a ref list (D1960).
+    const avi = memRecvArmVariantIndex(e.memObj, fnIx)
+    if avi >= 0 {
+      const aen = variantFieldElemNameOr(avi, e.memProp)
+      if aen != "" { return aen }
     }
     const si = structIndexOfExpr(e.memObj, fnIx)
     if si >= 0 {
       const fi = sFieldIndex(si, e.memProp)
       if fi >= 0 { return sFieldElemNameAt(si, fi) }
+    }
+    // An un-narrowed struct union whose members share the field: one element name only
+    // when every member records the same one, since the read has a single wrapper row.
+    const uvis: i32[] = []
+    const ufis: i32[] = []
+    if sharedUnionFieldPlan(e.memObj, e.memProp, fnIx, uvis, ufis) == 5 {
+      const un0 = variantFieldElemName(uvis[0], ufis[0])
+      let uk = 1
+      while uk < uvis.length {
+        if variantFieldElemName(uvis[uk], ufis[uk]) != un0 { return "" }
+        uk = uk + 1
+      }
+      return un0
     }
   }
   // The `?.` twin of the field read above: the chain resolves the receiver's row, and the
@@ -30296,8 +30335,14 @@ export function exprEmittedRefListSlot(exprIx: i32, fnIx: i32): i32 {
     }
   }
   // A field read's row is the struct table's, from the field's own storage slot — inlined here
-  // since `sFieldRefSlot` lives downstream in the emitter.
+  // since `sFieldRefSlot` lives downstream in the emitter. A union-ARM receiver has no struct
+  // row, so its field's element is read off the variant tables first (D1963).
   if e is Member {
+    const avi9 = memRecvArmVariantIndex(e.memObj, fnIx)
+    if avi9 >= 0 {
+      const en9 = variantFieldElemNameOr(avi9, e.memProp)
+      if en9 != "" { return rlSlotByName(en9) }
+    }
     const msi = structIndexOfExpr(e.memObj, fnIx)
     if msi >= 0 {
       const mfi = sFieldIndex(msi, e.memProp)
