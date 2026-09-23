@@ -1133,6 +1133,7 @@ const completionKind: Record<CompletionKind, CompletionItemKind> = {
   type: CompletionItemKind.Struct,
   keyword: CompletionItemKind.Keyword,
   snippet: CompletionItemKind.Snippet,
+  property: CompletionItemKind.Property,
 };
 
 // For items that carry a type we render it in exactly two places, never the same

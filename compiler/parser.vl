@@ -22,6 +22,7 @@ import {
   isBinOpFuncName,
   mkMatch,
 } from "./ast"
+import { getDeclAdd, getDeclName } from "./ast"
 import { BinExpr, Ident, P, Tok, dgMarkLossless, mkDeclNameTok } from "./ast"
 // The free index-operator declaration-name encoding — the parser is where
 // `function "[]"(self: T, …)` gets the receiver-carrying name it declares under.
@@ -3550,7 +3551,78 @@ function exportableFollows() {
   if k == "LET" || k == "CONST" || k == "FUNCTION" || k == "TYPE" {
     return true
   }
+  if getterFollowsAt(P.pos + 1) { return true }
   k == "IDENT" && kindAt(P.pos + 2) == "TYPE" && textAt(P.pos + 1) == "flat"
+}
+
+// Whether token `i` opens a getter declaration: the contextual keyword `get`, a name, then
+// `(`. `get` stays an identifier everywhere else, and `get x(` is no expression under any
+// parse (two identifiers in a row), so the guard is exact.
+function getterFollowsAt(i: i32): boolean {
+  kindAt(i) == "IDENT" &&
+    textAt(i) == "get" &&
+    kindAt(i + 1) == "IDENT" &&
+    kindAt(i + 2) == "LPAREN"
+}
+
+// `get NAME "(" self: T ")" ":" R body` — a read-only property of the nominal type `T`
+// (property-access-design.md §D3a). Minted under `getDeclName`, which no source spelling can
+// reach, so the checker finds it only through the receiver's type. The receiver annotation and
+// the result type are required: dispatch is on the one, and the body contract checks the other.
+function parseGetter(exported: boolean) {
+  const p0 = peekTok().start // the `get` keyword
+  const getTok = P.pos
+  advance() // "get"
+  const nameTok = P.pos
+  const prop = advance().text
+  const params = parseParamList()
+  let recv = ""
+  if params.length == 1 {
+    const p = P.nodes[params[0]]
+    if p is Param {
+      if p.parName == "self" && p.parType >= 0 {
+        const tr = P.nodes[p.parType]
+        if tr is TypeRef { recv = tr.tyName }
+      }
+    }
+  }
+  if recv == "" {
+    P.diags.push(
+      {
+        msg: "a getter takes exactly one parameter, its annotated receiver — write `get " +
+          prop +
+          "(self: T): R`",
+        at: nameTok,
+      },
+    )
+  }
+  if btDepth > 0 {
+    P.diags.push(
+      {
+        msg: "a getter is a top-level declaration — `get " +
+          prop +
+          "` cannot be declared inside a block",
+        at: getTok,
+      },
+    )
+  }
+  let ret = -1
+  if accept("COLON") {
+    ret = parseType()
+  } else {
+    P.diags.push(
+      {
+        msg: "a getter declares its result type — write `get " + prop + "(self: T): R`",
+        at: nameTok,
+      },
+    )
+  }
+  let dname = getDeclName(prop, recv)
+  if recv == "" { dname = getDeclName(prop, "?") }
+  const noTyParams: string[] = []
+  const fix = parseFuncBodyAndBuild(dname, noTyParams, params, ret, nameTok, p0)
+  getDeclAdd(fix, exported)
+  fix
 }
 
 // One statement: dispatch on the leading keyword, else an expression statement.
@@ -3576,8 +3648,10 @@ export function parseStmt() {
       )
     }
     advance()
+    if getterFollowsAt(P.pos) { return parseGetter(true) }
   }
   const k = peekKind()
+  if getterFollowsAt(P.pos) { return parseGetter(false) }
   if k == "LET" || k == "CONST" { return parseLet() }
   if k == "FUNCTION" { return parseFunc() }
   if k == "TYPE" { return parseTypeDecl(-1) }

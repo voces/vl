@@ -18,6 +18,7 @@ import {
   Unary,
   declHasExportKw,
   declNameTokOf,
+  getDeclPropOf,
   nodeToks,
   paramDefaultOf,
 } from "./ast"
@@ -39,6 +40,7 @@ import {
   isvalTok,
   isvalType,
   memcIsFn,
+  memcIsGetter,
   memcName,
   memcTok,
   memcType,
@@ -69,6 +71,8 @@ import {
   symEnabled,
   symMemCol,
   symMemEndCol,
+  symMemGetter,
+  symMemGetterDecl,
   symMemLine,
   symMemNode,
   symMemTy,
@@ -230,7 +234,7 @@ export function symOccAt(line: i32, col: i32) {
 // go-to-definition: jump to this occurrence's span.
 export function symDefAt(line: i32, col: i32) {
   const occ = symOccAt(line, col)
-  if occ < 0 { return -1 }
+  if occ < 0 { return symGetterDefAt(line, col) }
   const binding = symOccDecl[occ]
   let i = 0
   while i < symOccTok.length {
@@ -240,6 +244,30 @@ export function symDefAt(line: i32, col: i32) {
   // A binding with no recorded declaration occurrence (defensive): the use under
   // the cursor is itself the best available anchor.
   occ
+}
+// A getter read `v.x` under (line, col) has no occurrence of its own, since it names no
+// binding; its definition is the getter declaration's occurrence, or -1 off any getter read.
+function symGetterDefAt(line: i32, col: i32) {
+  let k = 0
+  while k < symMemGetter.length {
+    let m = 0
+    while m < symMemNode.length {
+      if symMemNode[m] == symMemGetter[k] && symMemLine[m] == line {
+        if col >= symMemCol[m] && col < symMemEndCol[m] {
+          const decl = symMemGetterDecl[k]
+          let i = 0
+          while i < symOccTok.length {
+            if symOccDecl[i] == decl && symOccIsDecl[i] == 1 { return i }
+            i = i + 1
+          }
+          return -1
+        }
+      }
+      m = m + 1
+    }
+    k = k + 1
+  }
+  -1
 }
 // Fill `symRefOcc` with every occurrence of the binding under (line, col), unless it
 // already holds that cursor's answer. A cursor off any binding fills it empty, which is
@@ -706,6 +734,16 @@ export function symMemberIsMethod(i: i32) {
   if symMemIsFn(symMemTy[i]) { return 1 }
   0
 }
+// 1 when recorded member `i` reads a getter (a computed, read-only property), else 0.
+export function symMemberIsGetter(i: i32) {
+  if i < 0 || i >= symMemNode.length { return 0 }
+  let k = 0
+  while k < symMemGetter.length {
+    if symMemGetter[k] == symMemNode[i] { return 1 }
+    k = k + 1
+  }
+  0
+}
 // The rendered type string of binding `declNode`, or "" when no type is retained. The
 // arena persists for the whole check, so the index renders after the scope closes. A
 // user-facing render — its one consumer is the completion detail `symScopeAt` fills —
@@ -862,6 +900,38 @@ function memcPush(nm: string, ds: string, fn: i32, tok: i32) {
   memcType.push(ds)
   memcIsFn.push(fn)
   memcTok.push(tok)
+  memcIsGetter.push(0)
+}
+
+// Offers every getter whose receiver accepts `ty` (property-access-design.md §D3a): a getter
+// is a property of its nominal type, so it completes beside the fields, marked as a getter.
+function memcPushGetters(ty: i32) {
+  let i = 0
+  while i < symBindNode.length {
+    if symBindKind[i] == 2 {
+      const d = symBindNode[i]
+      if d >= 0 && d < P.nodes.length {
+        const nd = P.nodes[d]
+        if nd is FuncDecl {
+          const prop = getDeclPropOf(nd.fnName)
+          const fty = symBindType[i]
+          if prop != "" && fty >= 0 {
+            const ft = T.tys[fty]
+            if ft is TyFunc {
+              if ft.fnParamTypes.length == 1 && ft.fnRet >= 0 {
+                if assignable(ty, ft.fnParamTypes[0]) {
+                  memcPush(prop, tyToStrUser(ft.fnRet), 0, declNameTokOf(d))
+                  memcIsGetter[memcIsGetter.length - 1] = 1
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    i = i + 1
+  }
+  0
 }
 
 // The NAME token of the one `type` declaration whose arena type is `ty`, or -1. A `TyObj`
@@ -935,6 +1005,7 @@ export function symMemberScanAt(line: i32, col: i32) {
   memcType = []
   memcIsFn = []
   memcTok = []
+  memcIsGetter = []
   const occ = symOccAt(line, col)
   if occ < 0 { return 0 }
   // The same choice hover makes (`symOccQueryTy`): a receiver under a flow narrowing
@@ -975,6 +1046,7 @@ export function symMemberScanAt(line: i32, col: i32) {
       memcPush("bytes", "() => u8[]", 0, -1)
     }
   }
+  memcPushGetters(ty)
   memcName.length
 }
 export function symMemberScanCount() { memcName.length }
@@ -997,6 +1069,10 @@ export function symMemberScanTypeCharAt(i: i32, j: i32) {
 export function symMemberScanIsFn(i: i32) {
   if i < 0 || i >= memcIsFn.length { return 0 }
   memcIsFn[i]
+}
+export function symMemberScanIsGetter(i: i32) {
+  if i < 0 || i >= memcIsGetter.length { return 0 }
+  memcIsGetter[i]
 }
 // ── UFCS candidates at (line, col) ───────────────────────────────────────────
 
@@ -1083,7 +1159,8 @@ export function symUfcsScanAt(line: i32, col: i32) {
       const d = symBindNode[i]
       if d >= 0 && d < P.nodes.length {
         const nd = P.nodes[d]
-        if nd is FuncDecl {
+        // A getter is read as a property, never called, so it is no UFCS candidate.
+        if nd is FuncDecl && getDeclPropOf(nd.fnName) == "" {
           if nd.fnParams.length > 0 {
             const p0 = P.nodes[nd.fnParams[0]]
             if p0 is Param {

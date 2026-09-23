@@ -13,6 +13,7 @@ The language and CLI as a user mental model.
 - [`guide/narrowing.md`](guide/narrowing.md) — flow narrowing (`is` / `?.` / null).
 - [`guide/doc-comments.md`](guide/doc-comments.md) — `///` vs `//`, what a doc block attaches to, and what the editor shows on hover.
 - [`guide/unions.md`](guide/unions.md) — union types and variant discrimination.
+- [`guide/getters.md`](guide/getters.md) — `get x(self: T): R`: read-only properties of a nominal type, where they are found, and the body contract that keeps a read as cheap as a field.
 - [`guide/collections-design.md`](guide/collections-design.md) — `T[]` / `Map` / `Set` syntax and semantics; §"What you write TODAY" is the shipped spelling table (a map TYPE is `{[K]: V}`, `Map()` is the constructor).
 - [`guide/strings-design.md`](guide/strings-design.md) — string representation and API.
 - [`guide/extern.md`](guide/extern.md) — `extern function`: calling a host-provided function, the types that cross, and why the return type (`: void` included) is required.
