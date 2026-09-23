@@ -12,7 +12,10 @@
 // the depth (D2091), and 5,000 is still past where the recursive passes fell.
 //
 // GATING: the native half is env-gated (`SELFHOST_NATIVE_ALIGN=1`) and needs the binary; both
-// halves need the seed, and register as ignored without it.
+// halves need the seed, and register as ignored without it. The br_table-count case ALSO
+// needs `wasm-dis` (at `node_modules/.bin`, not on PATH, per CLAUDE.md's "Disassembly" note)
+// — `ci-native` installs no npm deps, so it self-ignores there; the `ci-release-shape` job
+// names this file and runs it with npm deps.
 //
 // @test-timing native
 
@@ -25,6 +28,9 @@ const HAVE_SEED = exists(COMPILER);
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
 const NATIVE = GATED && HAVE_SEED && exists(VL);
 if (GATED && !NATIVE) console.warn("[deep-else-chain] skipped — missing vl binary or seed wasm.");
+
+const WASM_DIS = `${ROOT}/node_modules/.bin/wasm-dis`;
+const HAVE_WASM_DIS = exists(WASM_DIS);
 
 // A dense integer `match` in return position: the shape the br_table lowering serves.
 const genMatch = (n: number): string => {
@@ -104,7 +110,10 @@ for (const [name, gen, n] of PROGRAMS) {
   });
 }
 
-Deno.test({ name: `deep chain (native): the ${N}-arm dense match still lowers to one br_table`, ignore: !NATIVE }, async () => {
+Deno.test({
+  name: `deep chain (native): the ${N}-arm dense match still lowers to one br_table`,
+  ignore: !NATIVE || !HAVE_WASM_DIS,
+}, async () => {
   const dir = await Deno.makeTempDir({ prefix: "vl-deep-chain-" });
   try {
     const file = `${dir}/main.vl`;
