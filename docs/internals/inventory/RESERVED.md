@@ -71,3 +71,4 @@ D2242-D2243  vl-11  2026-09-23  D2234 lane (tail-arm return check; D2243 filed)
 D2268-D2269  intrinsic-shadow-lane  2026-09-23  import-alias intrinsic shadowing (D2268 filed)
 D2280-D2282  pl031-lane  2026-09-23  PL-031 map tombstone hang
 D2309-D2312  plumb-compile-perf  2026-09-24
+D2317-D2319  plumb-mem-floor  2026-09-24
