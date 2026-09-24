@@ -1640,9 +1640,12 @@ new: the compare-frame pre-pass never recurses into a code-15 field, so a NESTED
   the lookahead (a function/getter/lambda body, a bare block statement, and both `if`/`else`
   arms). The return type was never the ingredient, despite looking like one: it never mattered
   whether it was a user record, a primitive, absent, generic, a union or a nominal `new` type.
-  Two narrower shapes are not closed by this row and did not regress — a zero-argument call and
-  a call with a single bare-identifier argument, each followed by a brace-led statement, remain
-  ambiguous the same way they were before. Fixtures
+  Two narrower shapes — a zero-argument call and a call with a single bare-identifier argument,
+  each followed by a brace-led statement — are closed too, by a second rule: the `:` or the body
+  brace must sit on the same line as the closing `)`, matching the adjacency a real signature's
+  body already requires everywhere else (`parseFuncBodyAndBuild` never tolerated a newline
+  there, so no existing method shorthand — in `tests/cases/`, `std/`, `compiler/`, or `vl fmt`'s
+  own output — was ever spelled that way). Fixtures
   `tests/cases/parser/call-first-stmt-then-brace-tail.vl`,
   `tests/cases/parser/call-first-stmt-then-brace-tail-getter.vl`.
 - **Every bitwise and shift operator has its compound form, `&= |= ^= <<= >>= >>>=`, and so does
