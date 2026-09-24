@@ -7855,22 +7855,9 @@ fn build_cmd(args: &[String]) -> Result<()> {
     )?;
     // A unit sharing a host's memory that allocates with no window of its own starts at
     // the default base, as every other such unit does. Legal, so a warning, not a refusal.
-    // Over a SHARED import the hazard is between instances of this one module instead: each
-    // has its own bump pointer over the same window, so no `--heap-base` can separate them.
-    if link.import_memory && link.shared_pages.is_some() {
-        if let Some((store, inst)) = session.as_mut() {
-            if let Ok(read) = inst.get_typed_func::<(), i32>(&mut *store, "heapWindowRead") {
-                if read.call(&mut *store, ())? != 0 {
-                    eprintln!(
-                        "vl build: warning: `{input}` allocates from std:buffer over a shared \
-                         memory; every instance of it hands out the SAME addresses, so at most \
-                         one instance may allocate — the others must manage their own address \
-                         ranges (--heap-base cannot separate instances of one module)"
-                    );
-                }
-            }
-        }
-    } else if link.import_memory && link.heap.is_none() {
+    // Over a SHARED memory there is nothing to warn about: std:buffer's allocator keeps its
+    // pointer in the memory itself, so instances and units sharing a window share it safely.
+    if link.import_memory && link.heap.is_none() && link.shared_pages.is_none() {
         if let Some((store, inst)) = session.as_mut() {
             if let Ok(read) = inst.get_typed_func::<(), i32>(&mut *store, "heapWindowRead") {
                 if read.call(&mut *store, ())? != 0 {
