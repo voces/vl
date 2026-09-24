@@ -128,7 +128,7 @@ unfiled groups each have a minimal witness):
 
 | mechanism | S | T | E | kinds | status |
 | --- | --: | --: | --: | --- | --- |
-| a join whose first arm is `null` takes the i32 blocktype ([D2227](inventory/D2227.md)) | 221 | | 373 | all nine; also `string \| null`, so not list-only | open |
+| a join whose first arm is `null` takes the i32 blocktype ([D2227](inventory/D2227.md)) | 221 | | 373 | all nine; also `string \| null`, so not list-only | closed (the grid re-graded: `null-first-join` 561 of 576 runs) |
 | **`exprF32Array` has no if-join rung: un-annotated `if c { f32s } else { [] }` binds an i32 local** | **17** | | | f32 only; f64 twin and annotated face run | **unfiled** |
 | `u8[] \| null` as a list element or map value ([D2239](inventory/D2239.md)) | 7 | | 36 | u8 only | open |
 | `[]` into an un-annotated parameter the body pins ([D2218](inventory/D2218.md)) | 6 | | | i64 f32 f64 string struct nested | open |
