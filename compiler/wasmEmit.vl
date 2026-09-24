@@ -927,6 +927,7 @@ import {
   variantFieldIsLitUnion,
   variantFieldIsLitUnionArray,
   variantFieldLitLexes,
+  variantFieldMayOmit,
   variantFieldRefSlot,
   variantFieldTypeAt,
   variantHasDiscrimField,
@@ -1950,7 +1951,7 @@ function emitVariantStruct(body: u8[], objIx: i32, vi: i32, fnIx: i32) {
   let fj = 0
   while fj < cnt {
     const valIx = objFieldVal(objIx, uFieldNames[start + fj])
-    if valIx < 0 && stash.length == 0 {
+    if valIx < 0 && stash.length == 0 && variantFieldMayOmit(vi, fj) {
       // A field the literal leaves out holds null, as a plain struct's does, built exactly as
       // the literal `null` written there would be (D2223).
       const nullIx = mkNull("null", -1)
@@ -1971,8 +1972,36 @@ function emitVariantStruct(body: u8[], objIx: i32, vi: i32, fnIx: i32) {
     if emitVariantFieldValue(body, vi, fj, valIx, fnIx) < 0 { return -1 }
     fj = fj + 1
   }
+  if objLitHasFieldOutside(objIx, start, cnt) {
+    return emitFailAt(
+      "emitProgram: object literal writes a field its union variant does not declare",
+      objIx,
+    )
+  }
   fbStructNew(uVarHeap[vi])
   0
+}
+
+// Whether the literal at `objIx` writes a field outside `uFieldNames[start..start+cnt)`. Such
+// a literal is not this arm, whatever hint routed it to the variant builder (D2302).
+function objLitHasFieldOutside(objIx: i32, start: i32, cnt: i32): boolean {
+  const o = P.nodes[objIx]
+  if !(o is ObjLit) { return false }
+  let i = 0
+  while i < o.objFields.length {
+    const f = P.nodes[o.objFields[i]]
+    if f is FieldInit {
+      let k = 0
+      let found = false
+      while k < cnt && !found {
+        if uFieldNames[start + k] == f.fiName { found = true }
+        k = k + 1
+      }
+      if !found { return true }
+    }
+    i = i + 1
+  }
+  false
 }
 
 function seedFieldListBuild(code: i32, refSlot: i32) {
@@ -10119,6 +10148,7 @@ function emitIndex(body: u8[], idxIx: i32, fnIx: i32) {
         )
       }
       const rslot = refListSlotOfExpr(nd.idxArr, fnIx)
+      if rslot < 0 { return refListRowRefused(nd.idxArr) }
       // A live hoist row serves this access's header from locals, so the
       // RECEIVER is not emitted at all — the prologue before the loop read it
       // once. Only the index goes on the stack.
@@ -16179,6 +16209,7 @@ function emitAssign(body: u8[], binIx: i32, fnIx: i32) {
           )
         }
         const rslot = refListSlotOfExpr(target.idxArr, fnIx)
+        if rslot < 0 { return refListRowRefused(target.idxArr) }
         lTy = rlWrapIdx[rslot]
         aTy = rlBackIdx[rslot]
         idxKind = "ref"
@@ -17008,6 +17039,7 @@ function emitPush(body: u8[], callIx: i32, fnIx: i32, wantValue: boolean) {
           )
         }
         const rslot = refListSlotOfExpr(callee.memObj, fnIx)
+        if rslot < 0 { return refListRowRefused(callee.memObj) }
         pushRSlot = rslot
         lTy = rlWrapIdx[rslot]
         aTy = rlBackIdx[rslot]
@@ -17354,6 +17386,12 @@ function pushTakeElem(
   0
 }
 
+// Refuse a ref-list read, write or walk whose element row does not resolve. Every table the
+// slot indexes needs a real row, and slot 0 is one, so there is no row to borrow. Returns -1.
+function refListRowRefused(exprIx: i32): i32 {
+  emitFailAt("emitProgram: a ref list's element row does not resolve", exprIx)
+}
+
 // `xs.pop()` and `xs.get(i)` — the two checked list reads, typed identically (`T | null`),
 // differing only in the condition, element index and whether the length decrements
 // (`pushTakeCond`/`pushTakeElem`). `getIdx` is the `.get` index node, or -1 for `.pop`;
@@ -17421,6 +17459,7 @@ function emitPopGo(
           )
         }
         const rslot = refListSlotOfExpr(callee.memObj, fnIx)
+        if rslot < 0 { return refListRowRefused(callee.memObj) }
         lTy = rlWrapIdx[rslot]
         aTy = rlBackIdx[rslot]
         popRefSlot = rslot
@@ -17594,6 +17633,7 @@ function emitClear(body: u8[], callIx: i32, fnIx: i32) {
           )
         }
         const rslot = refListSlotOfExpr(callee.memObj, fnIx)
+        if rslot < 0 { return refListRowRefused(callee.memObj) }
         lTy = rlWrapIdx[rslot]
         clearRefSlot = rslot
       } else if clearEk != null {
@@ -17819,6 +17859,7 @@ function emitMapFilter(body: u8[], callIx: i32, fnIx: i32) {
           )
         }
         srcSlot = refListSlotOfExpr(callee.memObj, fnIx)
+        if srcSlot < 0 { return refListRowRefused(callee.memObj) }
         srcWrap = rlWrapIdx[srcSlot]
         srcBack = rlBackIdx[srcSlot]
         srcElemRef = !srcElemNul
@@ -17897,6 +17938,7 @@ function emitMapFilter(body: u8[], callIx: i32, fnIx: i32) {
             "emitProgram: .filter result is a ref list but ref list type not collected",
           )
         }
+        if dstSlot < 0 { return refListRowRefused(callIx) }
         dstWrap = rlWrapIdx[dstSlot]
         dstBack = rlBackIdx[dstSlot]
       } else if resK == "u8" {
@@ -18478,6 +18520,7 @@ function emitArrSlice(body: u8[], callIx: i32, fnIx: i32) {
             "emitProgram: .slice over a ref list but ref list type not collected",
           )
         }
+        if srcSlot < 0 { return refListRowRefused(callee.memObj) }
         wrap = rlWrapIdx[srcSlot]
         back = rlBackIdx[srcSlot]
       } else if recvK == "str" {
@@ -20720,6 +20763,7 @@ function emitForInStmt(body: u8[], s: ForIn, _stmtIx: i32, fnIx: i32) {
       hOk = false
     } else {
       const rslot = refListSlotOfExpr(s.fiIter, fnIx)
+      if rslot < 0 { return refListRowRefused(s.fiIter) }
       wrapTy = rlWrapIdx[rslot]
       backTy = rlBackIdx[rslot]
       hKind = "ref"
@@ -25175,6 +25219,7 @@ function emitCoalesceGo(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
               )
             }
             const gSlot = refListSlotOfExpr(gCallee.memObj, fnIx)
+            if gSlot < 0 { return refListRowRefused(gCallee.memObj) }
             // The same two operands, emitted twice each below — staged, not refused (D1677).
             listGetStageMark(unwrapParen(lhs.omObj))
             // cond: idx u< len

@@ -193,7 +193,12 @@ run "inventory refs"           deno test -A --no-check tests/vl_inventory_refs_t
 # `--names` build at 4.1 s and a profiled compile at 9.5 s (2026-09-06) — against a gate whose
 # critical path is `distilled corpus` at ~155 s, so there is no reason to leave them ungated.
 run "survey measurements"      bash scripts/survey-profile.sh
-run "conflict markers"         deno test -A --no-check tests/vl_no_conflict_markers_test.ts
+# THE PROBES' BEHAVIOURAL HALF. `tests/vl_live_sites_test.ts` checks the list's STRUCTURE
+# and says the compiling half is `run.py --live-sites`, which no gate ran: on 2026-09-24 four
+# of its rows had moved (one a compiler trap, one invalid wasm) and nothing was red (D2301).
+# `--floor` holds every probe to clause 1; a refusal passes, a trap or bad module does not.
+run "capability probes"        bash -c "\"$PY\" scripts/capability-probes/run.py --live-sites --compiler \"$SEED\" && \"$PY\" scripts/capability-probes/run.py --floor --compiler \"$SEED\""
+run "conflict markers"        deno test -A --no-check tests/vl_no_conflict_markers_test.ts
 run "splice scan"              bash -c "\"$PY\" scripts/inventory/splice-scan.py --self-test >/dev/null && \"$PY\" scripts/inventory/splice-scan.py"
 run "distilled corpus"         "$PY" scripts/silent-sweep/distilled/regress.py build/vl-compiler.wasm
 

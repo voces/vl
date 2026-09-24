@@ -205,6 +205,9 @@ def main():
     ap.add_argument("--compiler", default=SEED)
     ap.add_argument("--live-sites", action="store_true",
                     help="grade only the committed witness-backed refusal-site list")
+    ap.add_argument("--floor", action="store_true",
+                    help="grade every probe, and fail only on a clause-1 outcome: a compiler "
+                         "trap, invalid wasm, a timeout, or a run printing the wrong answer")
     a = ap.parse_args()
 
     if a.live_sites:
@@ -225,6 +228,23 @@ def main():
     if not probes:
         print("no probes found -- that is a failure, not a pass")
         return 1
+
+    if a.floor:
+        # A probe is a program `vl check` accepts, so a refusal is the gap it was written for
+        # and passes here; what cannot pass is the compiler trapping, emitting a module that
+        # does not validate, hanging, or running to the wrong answer. D2301 trapped and D2302
+        # went SILENT on two probes for a week while this directory was graded by nothing.
+        bad = []
+        for fn in probes:
+            p = os.path.join(HERE, fn)
+            verdict, detail, out = grade(p, a.compiler, expected(p))
+            if verdict in ("WRONG", "TIMEOUT") or verdict.startswith(("SILENT", "COMPILER TRAP")):
+                bad.append((fn, verdict, detail))
+        for fn, verdict, detail in bad:
+            print(f"  {verdict:<26} {fn}\n          {detail}")
+        print(f"\n{len(bad)} of {len(probes)} capability probes break clause 1 "
+              "(trap, invalid wasm, timeout or wrong output)")
+        return 1 if bad else 0
 
     still, now = [], []
     for fn in probes:
