@@ -732,7 +732,8 @@ i32`, `__atomic_notify__(addr, count): i32`, and `__atomic_fence__()`.
 
 Each rmw and cmpxchg answers the OLD value, zero-extended at a narrow width. A narrow
 operand, replacement or `expected` is wrapped to the access width first, so a narrow cmpxchg
-whose `expected` has high bits set still matches on its low bits. The address is an `i32`, as
+whose `expected` has high bits set still matches on its low bits. The wrap is the engine's
+own truncation, which the proposal defines for the instruction; VL emits no masking. The address is an `i32`, as
 for `__load_i32__`. The memarg alignment is always the access's natural one, as the proposal
 requires, and a misaligned address traps where `__load_i32__` would not. A module that uses
 one of them emits its memory as `__load_*__` does. `vl build -O` passes binaryen
