@@ -156,8 +156,8 @@ for (const [fx, melts] of FIXTURES) {
 
 // The step renames every function to mark it, then gives each its own name back: a `--names`
 // build leaves the step with the names it came in with and none of the markers, and a build
-// without names leaves it with none. Read off the step's own output (`$VL_OPT_ESCAPE_DUMP`),
-// since the rung that follows decides separately whether the final module keeps names.
+// without names leaves it with none. Read off the step's own output (`$VL_OPT_ESCAPE_DUMP`);
+// the next test pins what the rung that follows does with them.
 Deno.test({
   name:
     "native-release: the escape step hands every function its own name back",
@@ -216,6 +216,100 @@ Deno.test({
             } after the step\n` +
               `  got: ${funcs.join(", ")}`,
           );
+        }
+      }
+    } finally {
+      await Deno.remove(tmp, { recursive: true });
+    }
+  },
+});
+
+// The custom sections a module carries, by name, read off its section framing.
+const customSections = (b: Uint8Array): string[] => {
+  const uleb = (i: number): [number, number] => {
+    let v = 0, shift = 0;
+    for (;;) {
+      const x = b[i++];
+      v += (x & 0x7f) * 2 ** shift;
+      shift += 7;
+      if (x < 0x80) return [v, i];
+    }
+  };
+  const names: string[] = [];
+  let i = 8;
+  while (i < b.length) {
+    const id = b[i];
+    const [size, body] = uleb(i + 1);
+    if (id === 0) {
+      const [len, at] = uleb(body);
+      names.push(new TextDecoder().decode(b.subarray(at, at + len)));
+    }
+    i = body + size;
+  }
+  return names;
+};
+
+// `--names` survives both rungs: each `wasm-opt` run gets `-g`, so the final module keeps the
+// function names a trap backtrace prints. Its `vl-src` rows do not survive, because they are
+// offsets into the UNOPTIMIZED module's bytes and would name the wrong source line. A build
+// without `--names` carries neither section, as before.
+Deno.test({
+  name: "native-release: `--names` keeps function names through -O and -O3",
+  ignore: !ENABLED,
+  fn: async () => {
+    const src = `${ROOT}/tests/fixtures/opt-names/trap.vl`;
+    const tmp = await Deno.makeTempDir();
+    try {
+      const mainRs = Deno.readTextFileSync(
+        `${ROOT}/scripts/vl-host/src/main.rs`,
+      );
+      const features = rustList(mainRs, "BINARYEN_FEATURES");
+      for (const [rung] of RUNGS) {
+        for (const named of [true, false]) {
+          const tag = `${rung}${named ? " --names" : ""}`;
+          const out = `${tmp}/m${rung}${named ? "-named" : ""}.wasm`;
+          const b = await vl([
+            "build",
+            src,
+            rung,
+            ...(named ? ["--names"] : []),
+            "-o",
+            out,
+          ]);
+          if (b.code !== 0) throw new Error(`${tag}: build: ${b.err.trim()}`);
+          const sections = customSections(Deno.readFileSync(out));
+          const want = named ? ["name"] : [];
+          if (JSON.stringify(sections) !== JSON.stringify(want)) {
+            throw new Error(
+              `${tag}: custom sections\n  want: ${JSON.stringify(want)}\n` +
+                `  got:  ${JSON.stringify(sections)}`,
+            );
+          }
+          const dis = await run(WASM_DIS, [out, ...features]);
+          const funcs = [...dis.out.matchAll(/^ \(func \$(\S+)/gm)].map((m) =>
+            m[1]
+          );
+          const user = funcs.filter((f) => /^(pick|outer)@/.test(f));
+          if (named ? user.length === 0 : funcs.some((f) => f.includes("@"))) {
+            throw new Error(
+              `${tag}: want ${
+                named ? "`pick` or `outer` named" : "no names"
+              }\n` +
+                `  got: ${funcs.join(", ")}`,
+            );
+          }
+          if (!named) continue;
+          const r = await vl(["run", out]);
+          if (r.code === 0) throw new Error(`${tag}: the fixture did not trap`);
+          if (
+            !/vl!(pick|outer)@/.test(r.err) || /<wasm function/.test(r.err) ||
+            /vl source frames/.test(r.err)
+          ) {
+            throw new Error(
+              `${tag}: want a backtrace naming \`pick\` or \`outer\` and no source lines\n` +
+                `  got:\n${r.err}`,
+            );
+          }
         }
       }
     } finally {

@@ -6876,12 +6876,30 @@ scalarization until `wasm-opt` runs") already name the tension: the native defau
 runs `wasm-opt`. Revisiting B1 for that path is a larger lane than this one, and its measured
 ceiling on this benchmark is (a)'s row.
 
-**Open, and older than this step: `vl build --names -O` writes a module with no function
-names.** Neither rung passes `-g` to `wasm-opt`, so binaryen drops the name section the build
-asked for (master: `tests/fixtures/opt-runonce/main-wrapper.vl` at `--names -O` disassembles to
-`$0`, `$1`). Whether an optimized `--names` build should keep them — `-g` on the rung when
-`--names` is given, at the cost of the section's bytes — is a decision for a follow-up; the
-escape step keeps names through itself, so it neither causes nor hides the loss.
+**Resolved (owner, 2026-09-23): `vl build --names -O` keeps function names.** Neither rung
+used to pass `-g` to `wasm-opt`, so binaryen dropped the name section the build asked for
+(`tests/fixtures/opt-runonce/main-wrapper.vl` at `--names -O` disassembled to `$0`, `$1`, and a
+trap printed `<wasm function 32>`). Under `--names` each rung's run now leads with `-g`; binaryen
+keeps a surviving function's name through inlining, so a trap names the frame it trapped in (an
+inlined callee's work reports as its caller). Without `--names` the argv is the rung's own and
+the output is byte-identical: all 86 `bench/` programs, `compiler/entry.vl` and plumb's
+`decode-bench`, at the plain build, `-O` and `-O3`.
+
+**The `vl-src` rows are dropped from an optimized build.** They are offsets into the EMITTER's
+bytes, and binaryen keeps an unknown custom section with or without `-g` while rewriting every
+body under it — so master's `--names -O` already carried them, stale, and a trap printed a wrong
+source line (a 700-line program trapping at line 692 read `at 488:5` at `-O`, `at 419:5` at
+`-O3`). The host strips the section before the first `wasm-opt` run. Remapping the rows through
+binaryen (a source map) is the way to get lines back; until then an optimized build's frames
+carry names and no lines.
+
+**Price, `--names` over the same rung without it** (bytes, all of it the name section): the 86
+`bench/` programs +8,837 at `-O` (+9.6%, median +58 per program, range 43–453) and +6,790 at
+`-O3` (+12.2%); `decode-bench` 71,694 → 73,189 (+2.1%) at `-O`, 63,700 → 64,890 (+1.9%) at
+`-O3`; the compiler 2,147,049 → 2,303,347 (+7.3%) at `-O`, 2,091,456 → 2,241,043 (+7.2%) at `-O3`.
+Asked for by the flag, and paid only by builds that ask. `tests/selfhost_native_release_escape_test.ts`
+pins names, no `vl-src`, and a named trap frame at both rungs, and no name section without the
+flag.
 
 **What was rejected.**
 * *Raising binaryen's inline sizes globally* (`-aimfs 60`/`400`). `-aimfs 400` scalarises `D`
