@@ -8591,9 +8591,9 @@ function emitMapResize(body: u8[]) {
 }
 
 // `emitMapCompact` (mirror of the host's `mapCompactFn`): reclaim tombstones by
-// rebuilding keys/vals/live/hashes from the live entries only, preserving insertion
-// order, then rebuilding the index at a live-count-based capacity (next pow2 ≥ 2×size,
-// floored at `INITIAL_CAP`×2 = 16) — bounds both under add/delete churn.
+// rebuilding keys/vals/live/hashes from the live entries only, preserving insertion order,
+// then rebuilding the index at a capacity that agrees with `__map_resize__`'s own ceiling
+// so the two do not fight under add/delete churn (D2291).
 function emitMapCompact(body: u8[]) {
   // Fresh entry arrays sized to the OLD entry capacity (keeps spare room; lengths are
   // irrelevant to iteration — count/size bound it). Mirrors the host's `array.new_default
@@ -8712,16 +8712,21 @@ function emitMapCompact(body: u8[]) {
   pushMapRef(body)
   pushMapSize(body)
   fbStructSet(cmMapTy(), 4) // count = size
-  // Target index cap: next pow2 ≥ 2×size, floored at `INITIAL_CAP`×2 = 16; cap in slot 11.
+  // Target index cap: next pow2 above `4*size + 2*INITIAL_CAP`, floored at `INITIAL_CAP`×2 =
+  // 16 — the cap `__map_resize__` would grow into anyway before this function's own trigger
+  // next fires, so a steady churn at a fixed live size settles here instead of cycling
+  // (D2291). cap in slot 11.
   fbI32Const(16)
   setMapScr(body, 11) // cap
-  // while cap < 2*size { cap = cap * 2 }
+  // while cap <= 4*size + 2*INITIAL_CAP + 2 { cap = cap * 2 }
   fbLoop(64)           // loop, void
   pushMapScr(body, 11) // cap
   pushMapSize(body)
-  fbI32Const(2)
-  fbI32Bin(108)        // size * 2
-  fbI32Bin(79)         // 0x4f i32.ge_u (cap >= 2*size → done)
+  fbI32Const(4)
+  fbI32Bin(108)        // size * 4
+  fbI32Const(18)       // 2*INITIAL_CAP + 2
+  fbI32Bin(106)        // size*4 + 18
+  fbI32Bin(75)         // 0x4b i32.gt_u (cap > size*4+18 → done)
   fbIf(64)             // if, void
   // then: done (empty)
   fbElse()      // else
@@ -8730,7 +8735,7 @@ function emitMapCompact(body: u8[]) {
   fbI32Bin(108) // cap * 2
   setMapScr(body, 11)
   fbBr(1)       // br → loop header
-  fbEnd()       // end (ge_u if)
+  fbEnd()       // end (gt_u if)
   fbEnd()       // end (loop)
   // Rebuild the index at the chosen cap.
   pushMapScr(body, 11) // cap
