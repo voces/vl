@@ -151,6 +151,15 @@ let plCacheBlock: i32 = -1
 let plSidVal: i32[] = []
 let plSidGen: i32[] = []
 let plGen: i32 = 0
+// The owner of `plSidVal`'s first occurrence, same generation stamp — the function-scope
+// twin of `mllOwner`. `plDupGen[sid] == plGen` flags a name bound more than once in the
+// CURRENT function; its later bindings live in the flat `plMore*` rows below, filtered by
+// sid at read time (D2316).
+let plOwnerVal: i32[] = []
+let plDupGen: i32[] = []
+let plMoreSid: i32[] = []
+let plMoreIx: i32[] = []
+let plMoreOwner: i32[] = []
 
 // The loop-variable half of `plCacheMap`'s plan: `name -> ForRange/ForIn` arena index,
 // first-wins, under the same generation stamp. A `for v in …` variable is a function-scoped
@@ -216,6 +225,11 @@ export function sidResetParentLet() {
   plCacheBlock = -1
   plSidVal = []
   plSidGen = []
+  plOwnerVal = []
+  plDupGen = []
+  plMoreSid = []
+  plMoreIx = []
+  plMoreOwner = []
   plLoopSidVal = []
   plLoopSidGen = []
   plGen = 0
@@ -240,19 +254,26 @@ export function resetParentLetCache() {
 
 // Fills `plCacheMap` (via the parallel sid arrays) with every function-scoped `LetDecl`
 // reachable from `blockIx`, first-wins, in `parentLetOf`'s own pre-order. Descends both
-// `if`/`else` branches — the else slot may be a bare `Block` or a nested `IfStmt` — plus
-// `while`/`for` bodies and nested blocks, since a wasm local is scoped to the whole function.
-function plScanStmt(ix: i32) {
+// `if`/`else` branches, `while`/`for` bodies and nested blocks, since a wasm local is scoped
+// to the whole function. `owner` is the innermost enclosing block's own index (D2316).
+function plScanStmt(ix: i32, owner: i32) {
   if ix < 0 { return 0 }
   const st = P.nodes[ix]
   if st is LetDecl {
     // The id comes from the carrier — `ix` is this `LetDecl`'s arena index, so the first pass
     // over the node costs no hash. First-wins is the generation test: an earlier write in this
-    // generation blocks a later one.
+    // generation blocks a later one; a later write in the same generation is recorded as a
+    // duplicate rather than dropped (D2316).
     const lsid = sidOfNode(ix)
     if sidArrGet(plSidGen, lsid) != plGen {
       sidArrPut(plSidGen, lsid, plGen)
       sidArrPut(plSidVal, lsid, ix)
+      sidArrPut(plOwnerVal, lsid, owner)
+    } else {
+      sidArrPut(plDupGen, lsid, plGen)
+      plMoreSid.push(lsid)
+      plMoreIx.push(ix)
+      plMoreOwner.push(owner)
     }
   } else if st is IfStmt {
     // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
@@ -261,30 +282,30 @@ function plScanStmt(ix: i32) {
       const c = P.nodes[cur]
       cur = -1
       if c is IfStmt {
-        plScanStmt(c.ifThen)
+        plScanStmt(c.ifThen, c.ifThen)
         if c.ifElse >= 0 {
           if P.nodes[c.ifElse] is IfStmt {
             cur = c.ifElse
           } else {
-            plScanStmt(c.ifElse)
+            plScanStmt(c.ifElse, c.ifElse)
           }
         }
       }
     }
   } else if st is WhileStmt {
-    plScanStmt(st.whileBody)
+    plScanStmt(st.whileBody, st.whileBody)
   } else if st is ForRange {
     plRecordLoopVar(st.frVar, ix)
-    plScanStmt(st.frBody)
+    plScanStmt(st.frBody, st.frBody)
   } else if st is ForIn {
     plRecordLoopVar(st.fiVar, ix)
     if st.fiVar2 != "" { plRecordLoopVar(st.fiVar2, ix) }
-    plScanStmt(st.fiBody)
+    plScanStmt(st.fiBody, st.fiBody)
   } else if st is Block {
     const stmts = st.blkStmts
     let i = 0
     while i < stmts.length {
-      plScanStmt(stmts[i])
+      plScanStmt(stmts[i], ix)
       i = i + 1
     }
   } else if st is Program {
@@ -295,7 +316,7 @@ function plScanStmt(ix: i32) {
     const pstmts = st.progStmts
     let pi = 0
     while pi < pstmts.length {
-      plScanStmt(pstmts[pi])
+      plScanStmt(pstmts[pi], ix)
       pi = pi + 1
     }
   }
@@ -476,7 +497,15 @@ export function moduleLocalLetOfAt(rootIx: i32, name: string, atIx: i32) {
   best
 }
 
-function plBuildLetMap(blockIx: i32) { plScanStmt(blockIx) }
+// Rebuilds the per-function plan. `plMore*` holds only the CURRENT build's duplicate rows
+// (D2316) — cleared here rather than generation-stamped per row, since it is a flat list a
+// stale entry could not be told apart from a fresh one within.
+function plBuildLetMap(blockIx: i32) {
+  plMoreSid = []
+  plMoreIx = []
+  plMoreOwner = []
+  plScanStmt(blockIx, blockIx)
+}
 
 // Find a `LetDecl` for `name` anywhere in the parent body block (incl. nested if/loop
 // bodies — wasm locals are function-scoped). Returns its arena index or -1. Backed by the
@@ -502,6 +531,37 @@ export function parentLetOfSid(blockIx: i32, sid: i32) {
   if sid < 0 { return -1 }
   if sidArrGet(plSidGen, sid) != plGen { return -1 }
   sidArrGet(plSidVal, sid)
+}
+
+// `parentLetOfSid`, positioned: when `sid` binds more than one function-scoped `LetDecl`,
+// returns the LAST one preceding `atIx` whose block it has not left — `moduleLocalLetOfAt`'s
+// algorithm, function-scoped (D2316). `-1` on an ambiguous (negative) `atIx`; an unambiguous
+// name answers as `parentLetOfSid` does.
+export function parentLetOfAt(blockIx: i32, sid: i32, atIx: i32) {
+  if blockIx < 0 { return -1 }
+  if blockIx != plCacheBlock {
+    plGen = plGen + 1
+    plBuildLetMap(blockIx)
+    plCacheBlock = blockIx
+  }
+  if sid < 0 { return -1 }
+  if sidArrGet(plSidGen, sid) != plGen { return -1 }
+  const first = sidArrGet(plSidVal, sid)
+  if sidArrGet(plDupGen, sid) != plGen { return first }
+  if atIx < 0 { return -1 }
+  let best = -1
+  const fOwner = sidArrGet(plOwnerVal, sid)
+  if first < atIx && atIx <= fOwner && first > best { best = first }
+  let i = 0
+  while i < plMoreSid.length {
+    if plMoreSid[i] == sid {
+      const cand = plMoreIx[i]
+      const own = plMoreOwner[i]
+      if cand < atIx && atIx <= own && cand > best { best = cand }
+    }
+    i = i + 1
+  }
+  best
 }
 
 // Finds the `for` loop variable named `name` anywhere in the body block at `blockIx` — the

@@ -114,7 +114,7 @@ ROWS = [
     # The disable edit targets the cached-BLOCK test, not the `plScanStmt` guard of the same
     # shape: that one is the plan's FIRST-WINS write rule, and inverting it changes the answer
     # rather than dropping a cache — the compiler's own source then miscompiles.
-    ("parentLetCache", ["plSidGen", "plLoopSidGen", "plGen"], "probe", "ALL:" +
+    ("parentLetCache", ["plSidGen", "plLoopSidGen", "plGen", "plDupGen"], "probe", "ALL:" +
      "  if blockIx != plCacheBlock {" + "\x00" + "  if true {"),
     ("anonLeafIndex", ["anonIxSeen", "anonIxBindHead"], "probe",
      ("  if anonIxOn && anonIxSeen == P.nodes.length { return 0 }",
