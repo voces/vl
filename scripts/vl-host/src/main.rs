@@ -4937,12 +4937,22 @@ fn binaryen_missing_note(flag: &str, tool: &str, env_override: &str, consequence
 /// does. Fixed SIMD is wasm baseline and wasmtime 47 runs it with no host change.
 /// Relaxed SIMD is a SEPARATE `--enable-relaxed-simd` flag, deliberately NOT enabled
 /// — its ops are non-deterministic (`simd-design.md` §A4/O6). See §G (S0).
+///
+/// `--enable-threads` is the atomics flag (`simd-design.md` §G1 "Atomics"). Binaryen 130
+/// rejects every `0xFE` opcode without it ("Atomic operations require threads"), the same
+/// no-output-file failure. It is on for every module, not only one that uses an atomic,
+/// because it is byte-neutral where no atomic appears: 136 tests/cases modules at `-O` and
+/// the release profile, and the compiler seed at `-O`, optimise to identical bytes with and
+/// without it. It is independent of `shared` memory, which is a separate declaration.
+/// wasmtime needs no change: its `threads` feature is on by default and validates atomics
+/// on an ordinary (non-shared) memory.
 const BINARYEN_FEATURES: &[&str] = &[
     "--enable-reference-types",
     "--enable-gc",
     "--enable-bulk-memory",
     "--enable-tail-call",
     "--enable-simd",
+    "--enable-threads",
 ];
 
 /// `BINARYEN_FEATURES`, plus `--enable-threads` for a `--shared-memory` build: binaryen refuses

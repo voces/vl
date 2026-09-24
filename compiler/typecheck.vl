@@ -4120,6 +4120,8 @@ export function initChecker() {
   // The SIMD substrate (`simd-design.md` §D6): one declaration per row of the intrinsic table,
   // typed by the row's operand shape. A lane or shuffle index is a literal (checked below).
   declareSimdIntrinsics()
+  // The atomics (`simd-design.md` §G1): one declaration per row of the atomic table.
+  declareAtomicIntrinsics()
   // The filesystem floor (`std:fs`, `std:args`), which unlike everything above it does not
   // lower to instructions — a syscall is the one thing wasm cannot express. Bytes, not
   // strings, in both directions, so a payload crosses as one packed `u8[]` GC object. Errors are
@@ -4181,6 +4183,7 @@ export function nameIsEmitterIntrinsic(name: string) {
   // The SIMD substrate, reserved the day it acquired its emit arm — same rule: the emitter
   // rewrites the call site by name, so a user definition would be silently discarded.
   if nameIsSimdIntrinsic(name) { return true }
+  if nameIsAtomicIntrinsic(name) { return true }
   // The filesystem floor. These lower to a `call` of a host import rather than to instructions,
   // but the reservation reason is identical and is about the call site, not the lowering:
   // `emitCall` matches these names before it looks up a declaration, so a user
@@ -4446,6 +4449,126 @@ function declareSimdIntrinsics() {
   let i = 0
   while i < simdNames.length {
     declare(simdNames[i], simdRowTy(i))
+    i = i + 1
+  }
+  0
+}
+
+// The atomic intrinsics (`simd-design.md` §G1 "Atomics"), each lowered inline to one
+// `0xFE`-prefix instruction of the wasm threads proposal over linear memory. One table, read
+// by the checker's declarations, the definition reservation, the emitter and the import scan.
+// Naming: wasm `i32.atomic.rmw8.add_u` is `__atomic_rmw8_add_u_i32__`.
+export function nameIsAtomicIntrinsic(name: string) { atomicRow(name) >= 0 }
+
+// The operand shape of an atomic row. `VAL` is the row's value width (`atomicRowIsI64`); the
+// address is always an i32. LOAD (addr) → VAL; STORE (addr, VAL); RMW (addr, VAL) → VAL;
+// CMPXCHG (addr, expected, replacement) → VAL; WAIT (addr, VAL, i64 timeout) → i32;
+// NOTIFY (addr, i32 count) → i32; FENCE () with no memory operand.
+export const ATOMIC_SIG_LOAD = 1
+export const ATOMIC_SIG_STORE = 2
+export const ATOMIC_SIG_RMW = 3
+export const ATOMIC_SIG_CMPXCHG = 4
+export const ATOMIC_SIG_WAIT = 5
+export const ATOMIC_SIG_NOTIFY = 6
+export const ATOMIC_SIG_FENCE = 7
+
+const atomicNames: string[] = []
+const atomicOps: i32[] = []
+const atomicSigs: i32[] = []
+const atomicI64: boolean[] = []
+const atomicAlign: i32[] = []
+const atomicRowOf: {[string]: i32} = Map()
+
+// The table row of atomic intrinsic `name`, or -1 when it is not one. Built on first use.
+export function atomicRow(name: string): i32 {
+  if atomicNames.length == 0 { atomicTableBuild() }
+  atomicRowOf[name] ?? -1
+}
+export function atomicRowOp(row: i32): i32 { atomicOps[row] }
+export function atomicRowSig(row: i32): i32 { atomicSigs[row] }
+export function atomicRowIsI64(row: i32): boolean { atomicI64[row] }
+// The memarg alignment exponent: the access's natural alignment, which an atomic must name.
+export function atomicRowAlign(row: i32): i32 { atomicAlign[row] }
+
+function atomicAdd(name: string, op: i32, sig: i32, isI64: boolean, align: i32) {
+  atomicRowOf[name] = atomicNames.length
+  atomicNames.push(name)
+  atomicOps.push(op)
+  atomicSigs.push(sig)
+  atomicI64.push(isI64)
+  atomicAlign.push(align)
+  0
+}
+
+// The seven access widths every load, store and rmw family has, in the spec's opcode order:
+// i32, i64, i32 8-bit, i32 16-bit, i64 8-bit, i64 16-bit, i64 32-bit. `base` is the family's
+// first sub-opcode; `pre`/`mid` spell `__atomic_<pre><bits>_<mid>_<shape>__`.
+function atomicAddWidths(pre: string, mid: string, u: string, base: i32, sig: i32) {
+  const bits = ["", "", "8", "16", "8", "16", "32"]
+  const shapes = ["i32", "i64", "i32", "i32", "i64", "i64", "i64"]
+  const aligns = [2, 3, 0, 1, 0, 1, 2]
+  let i = 0
+  while i < 7 {
+    let tail = mid
+    if bits[i] != "" { tail = mid + u }
+    let name = "__atomic_" + pre + bits[i] + "_" + tail + "_" + shapes[i] + "__"
+    if tail == "" { name = "__atomic_" + pre + bits[i] + "_" + shapes[i] + "__" }
+    atomicAdd(name, base + i, sig, shapes[i] == "i64", aligns[i])
+    i = i + 1
+  }
+  0
+}
+
+// The rows; each opcode is the threads proposal's `0xFE` sub-opcode.
+function atomicTableBuild() {
+  atomicAdd("__atomic_notify__", 0x00, ATOMIC_SIG_NOTIFY, false, 2)
+  atomicAdd("__atomic_wait32__", 0x01, ATOMIC_SIG_WAIT, false, 2)
+  atomicAdd("__atomic_wait64__", 0x02, ATOMIC_SIG_WAIT, true, 3)
+  atomicAdd("__atomic_fence__", 0x03, ATOMIC_SIG_FENCE, false, 0)
+  atomicAddWidths("load", "", "u", 0x10, ATOMIC_SIG_LOAD)
+  atomicAddWidths("store", "", "", 0x17, ATOMIC_SIG_STORE)
+  const rmws = ["add", "sub", "and", "or", "xor", "xchg", "cmpxchg"]
+  let i = 0
+  while i < rmws.length {
+    let sig = ATOMIC_SIG_RMW
+    if rmws[i] == "cmpxchg" { sig = ATOMIC_SIG_CMPXCHG }
+    atomicAddWidths("rmw", rmws[i], "_u", 0x1e + i * 7, sig)
+    i = i + 1
+  }
+  0
+}
+
+// Whether atomic intrinsic `name` leaves nothing on the stack: the stores and the fence.
+export function atomicIntrinsicIsVoid(name: string): boolean {
+  const row = atomicRow(name)
+  if row < 0 { return false }
+  const sig = atomicRowSig(row)
+  sig == ATOMIC_SIG_STORE || sig == ATOMIC_SIG_FENCE
+}
+
+// The checker type of atomic row `row`, built from its operand shape and value width.
+function atomicRowTy(row: i32): i32 {
+  const a = TY_I32
+  let v = TY_I32
+  if atomicI64[row] { v = TY_I64 }
+  const sig = atomicSigs[row]
+  if sig == ATOMIC_SIG_LOAD { return mkFuncTy([a], v) }
+  if sig == ATOMIC_SIG_STORE { return mkFuncTy([a, v], TY_VOID) }
+  if sig == ATOMIC_SIG_RMW { return mkFuncTy([a, v], v) }
+  if sig == ATOMIC_SIG_CMPXCHG { return mkFuncTy([a, v, v], v) }
+  if sig == ATOMIC_SIG_WAIT { return mkFuncTy([a, v, TY_I64], TY_I32) }
+  if sig == ATOMIC_SIG_NOTIFY { return mkFuncTy([a, TY_I32], TY_I32) }
+  const noParams: i32[] = []
+  if sig == ATOMIC_SIG_FENCE { return mkFuncTy(noParams, TY_VOID) }
+  TY_ERR
+}
+
+// Declares every atomic row at the type its operand shape names.
+function declareAtomicIntrinsics() {
+  if atomicNames.length == 0 { atomicTableBuild() }
+  let i = 0
+  while i < atomicNames.length {
+    declare(atomicNames[i], atomicRowTy(i))
     i = i + 1
   }
   0
@@ -42387,6 +42510,8 @@ function getterIntrinsicName(nm: string): boolean {
     if f is TyFunc { return f.fnRet != TY_VOID }
     return false
   }
+  const arow = atomicRow(nm)
+  if arow >= 0 { return atomicRowSig(arow) == ATOMIC_SIG_LOAD }
   nm == "__trap__" || nm == "__heap_base__" || nm == "__heap_limit__"
 }
 
@@ -44000,6 +44125,17 @@ function gcBuiltinCall(r: i32, nm: string, ix: i32): i32 {
     return 0
   }
   if nm == "__memory_size__" { return 0 }
+  const arow = atomicRow(nm)
+  if arow >= 0 {
+    const asig = atomicRowSig(arow)
+    if asig == ATOMIC_SIG_LOAD { return 0 }
+    esSetWrite(r, "linear memory")
+    // A wait blocks the thread; bounded by its timeout, not by the program.
+    if asig == ATOMIC_SIG_WAIT {
+      return esUnbound(r, "it waits on an address with `" + nm + "`", -1)
+    }
+    return 0
+  }
   if nameIsMemBulkIntrinsic(nm) {
     esSetWrite(r, "linear memory")
     return esUnbound(r, "it copies or fills a byte range with `" + nm + "`", -1)
