@@ -14768,13 +14768,21 @@ function emitMemIntrinArg(body: u8[], ix: i32, fnIx: i32) {
   emitExprWideCleared(body, ix, fnIx)
 }
 
-// The value of an integer literal, or of an unshadowed top-level `const` bound to one, at `ix`
-// when it is at most `MEM_OFFSET_MAX`; else -1. The checker's `memOffsetCheckedValue` twin.
+// The value of an integer literal, of an unshadowed top-level `const` bound to one, or of an
+// exact sum of those, at `ix` when it is at most `MEM_OFFSET_MAX`; else -1. The checker's
+// `memOffsetCheckedValue` twin.
 function memOffsetConstValue(ix: i32, fnIx: i32): i64 {
   const ox = unwrapParen(ix)
   if ox < 0 || ox >= P.nodes.length { return -1 }
   const e = P.nodes[ox]
   if e is NumLit { return memOffsetLexValue(e.numText) }
+  if e is BinExpr {
+    if e.binOp != "+" { return -1 }
+    const l = memOffsetConstValue(e.binLeft, fnIx)
+    const r = memOffsetConstValue(e.binRight, fnIx)
+    if l < 0 || r < 0 || l + r > MEM_OFFSET_MAX { return -1 }
+    return l + r
+  }
   if e is Ident {
     const li = globalLetOfSidIn(fnIx, sidOfNode(ox))
     if li < 0 { return -1 }
@@ -14795,20 +14803,10 @@ function memCallArg(c: Call, base: i32, k: i32): i32 {
   c.callArgs[k]
 }
 
-// An i32 address operand's compile-time value when it is a non-negative constant (a literal,
-// an unshadowed top-level `const` bound to one, or a sum of two), else -1.
+// An i32 address operand's compile-time value when it is a constant `memOffsetConstValue`
+// reads and at most 2^31-1, so every term and the exact sum equal their i32 values; else -1.
 function memAddrConst(ix: i32, fnIx: i32): i64 {
-  const x = unwrapParen(ix)
-  if x < 0 || x >= P.nodes.length { return -1 }
-  const e = P.nodes[x]
-  if e is BinExpr {
-    if e.binOp != "+" { return -1 }
-    const l = memAddrConst(e.binLeft, fnIx)
-    const r = memAddrConst(e.binRight, fnIx)
-    if l < 0 || r < 0 || l + r > 0x7fffffff { return -1 }
-    return l + r
-  }
-  const v = memOffsetConstValue(x, fnIx)
+  const v = memOffsetConstValue(ix, fnIx)
   if v > 0x7fffffff { return -1 }
   v
 }
@@ -14847,10 +14845,12 @@ function memAddrBound(ix: i32, fnIx: i32): i64 {
       const l = memAddrBound(e.binLeft, fnIx)
       const r = memAddrBound(e.binRight, fnIx)
       if l < 0 || r < 0 { return -1 }
-      let v = l + r
-      if op == "*" { v = l * r }
-      if v > MEM_OFFSET_MAX { return -1 }
-      return v
+      if op == "*" {
+        if l > 0 && r > MEM_OFFSET_MAX / l { return -1 }
+        return l * r
+      }
+      if l + r > MEM_OFFSET_MAX { return -1 }
+      return l + r
     }
     return -1
   }
