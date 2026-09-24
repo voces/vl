@@ -787,9 +787,10 @@ const lintRankUnusedPureExpr = 6
 const lintRankDivZero = 7
 const lintRankRangeLen = 8
 const lintRankPreferInterp = 9
-const lintRankCount = 10
+const lintRankCompilerNoInterp = 10
+const lintRankCount = 11
 
-// Offer `ix` to all ten structural rules, in rank order. Each visitor opens with its
+// Offer `ix` to all eleven structural rules, in rank order. Each visitor opens with its
 // own `is` test, so this is a flat unconditional sequence: there is no rule id to
 // dispatch on and no chain a new rule could be inserted into in the wrong place.
 function lintVisitAll(ix: i32) {
@@ -803,6 +804,7 @@ function lintVisitAll(ix: i32) {
   divideByZeroVisit(ix)
   rangeLenBoundVisit(ix)
   preferInterpVisit(ix)
+  compilerNoInterpVisit(ix)
   0
 }
 
@@ -842,6 +844,7 @@ function lintRankOfCode(code: string) {
   if code == "divide-by-zero" { return lintRankDivZero }
   if code == "range-inclusive-length" { return lintRankRangeLen }
   if code == "prefer-interpolation" { return lintRankPreferInterp }
+  if code == "compiler-no-interpolation" { return lintRankCompilerNoInterp }
   lintRankCount
 }
 
@@ -1194,6 +1197,10 @@ function preferInterpVisit(ix: i32) {
   }
   if lits < piMinLiterals { return 0 }
   if cur < 0 || !piChainIsConcat(links, cur) { return 0 }
+  // compiler/*.vl cannot take this advice — interpolation there is refused outright
+  // (`compiler-no-interpolation` below) — so recommending it here would tell an author
+  // to fix a chain with a rewrite the tree does not allow.
+  if scaIsCompiler(scaPath) { return 0 }
   const first = nodeStartTok(ix)
   if first < 0 { return 0 }
   const end = nodeSpanEndTok(ix)
@@ -1264,6 +1271,35 @@ function piOperandSource(ix: i32) {
   const out = txSource.slice(lo, hi)
   if out.slice(0, ta.text.length) != ta.text { return "" }
   out
+}
+
+// ── 4e. compiler/ cannot use interpolation (compiler-no-interpolation) ────────
+
+// `compiler/*.vl` becomes the seed (`build/vl-compiler.wasm`), which loads with no
+// host imports; an interpolated string desugars to a call needing
+// `std:fmt`/`std:str` (`BinExpr.binTpl`), which pulls one in — so a self-compile
+// fails to LOAD it ("unknown import: imports::__print_i32__"). Refuse it here.
+function compilerNoInterpVisit(ix: i32) {
+  if !scaIsCompiler(scaPath) { return 0 }
+  const n = P.nodes[ix]
+  if n is BinExpr {
+    if n.binTpl == 1 {
+      const first = nodeStartTok(ix)
+      if first < 0 { return 0 }
+      const end = nodeSpanEndTok(ix)
+      lintEmitAtSpan(
+        "compiler-no-interpolation",
+        "compiler/*.vl cannot use string interpolation — the seed it becomes must stay "
+          + "import-free, and interpolation pulls in std:fmt/std:str — write the pieces "
+          + "with `+` instead",
+        "warning",
+        P.toks[first].line,
+        P.toks[first].col,
+        tokFirstLineEndCol(end),
+      )
+    }
+  }
+  0
 }
 
 // ── 5. unreachable code ──────────────────────────────────────────────────────
@@ -2827,6 +2863,12 @@ function scaIsStd(p: string): boolean {
   const b = p.length
   txAt(p, 0, b, "std/") || txAt(p, 0, b, "std:")
 }
+
+// Whether `p` names a file under `compiler/` — the tree that becomes the seed
+// (`build/vl-compiler.wasm`) and so must stay import-free. `preferInterpVisit` and
+// `compilerNoInterpVisit` (§4d/4e) both read it; same prefix-only match and the same
+// accepted residue (a user's own top-level `compiler/` still matches) as `scaIsStd`.
+function scaIsCompiler(p: string): boolean { txAt(p, 0, p.length, "compiler/") }
 
 // `txWordIsI` with the leading boundary taken here rather than by the caller, so
 // `DECISIONS` and `decisions` are the same word and neither matches inside a longer one.

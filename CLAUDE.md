@@ -536,6 +536,13 @@ worktree, and on BOTH arms of any A/B.
 Run `scripts/refresh-compiler.sh` before testing. The compiler is itself a VL program at
 `build/vl-compiler.wasm`, and a stale seed silently tests the previous compiler.
 
+**`compiler/*.vl` cannot use string interpolation** — it desugars to a call needing
+`std:fmt`/`std:str`, and this tree becomes the seed, which must load with no host
+imports. `compiler-no-interpolation` (`compiler/lint.vl`) refuses it at `vl check`
+time; `prefer-interpolation` never suggests it here either (`std/` and `scripts/`
+still can, and do). Bypassing both still fails, just later and less clearly —
+`refresh-compiler.sh`'s sanity run as `unknown import: imports::__print_i32__`.
+
 ## A COST REGRESSION SHOWS UP ONE BOOTSTRAP STEP LATE, and it looks like a broken merge
 
 **An ungated collect pass does not make the SOURCE slow. It makes the compiler BUILT FROM IT
