@@ -153,13 +153,15 @@ let plSidGen: i32[] = []
 let plGen: i32 = 0
 // The owner of `plSidVal`'s first occurrence, same generation stamp — the function-scope
 // twin of `mllOwner`. `plDupGen[sid] == plGen` flags a name bound more than once in the
-// CURRENT function; its later bindings live in the flat `plMore*` rows below, filtered by
-// sid at read time (D2316).
+// CURRENT function; its later bindings live in the flat `plMore*` rows below, chained per
+// sid through `plMoreHead`/`plMoreNext` rather than scanned whole (D2325).
 let plOwnerVal: i32[] = []
 let plDupGen: i32[] = []
 let plMoreSid: i32[] = []
 let plMoreIx: i32[] = []
 let plMoreOwner: i32[] = []
+let plMoreNext: i32[] = []
+let plMoreHead: i32[] = []
 
 // The loop-variable half of `plCacheMap`'s plan: `name -> ForRange/ForIn` arena index,
 // first-wins, under the same generation stamp. A `for v in …` variable is a function-scoped
@@ -230,6 +232,8 @@ export function sidResetParentLet() {
   plMoreSid = []
   plMoreIx = []
   plMoreOwner = []
+  plMoreNext = []
+  plMoreHead = []
   plLoopSidVal = []
   plLoopSidGen = []
   plGen = 0
@@ -271,6 +275,11 @@ function plScanStmt(ix: i32, owner: i32) {
       sidArrPut(plOwnerVal, lsid, owner)
     } else {
       sidArrPut(plDupGen, lsid, plGen)
+      // Chained into `plMoreHead[lsid]` (D2325): the new row's `plMoreNext` slot holds
+      // whatever this sid's head pointed at, then becomes the head — a query for `lsid`
+      // walks only ITS rows, not every duplicate LetDecl in the function.
+      plMoreNext.push(sidArrGet(plMoreHead, lsid))
+      sidArrPut(plMoreHead, lsid, plMoreSid.length)
       plMoreSid.push(lsid)
       plMoreIx.push(ix)
       plMoreOwner.push(owner)
@@ -504,6 +513,8 @@ function plBuildLetMap(blockIx: i32) {
   plMoreSid = []
   plMoreIx = []
   plMoreOwner = []
+  plMoreNext = []
+  plMoreHead = []
   plScanStmt(blockIx, blockIx)
 }
 
@@ -552,16 +563,43 @@ export function parentLetOfAt(blockIx: i32, sid: i32, atIx: i32) {
   let best = -1
   const fOwner = sidArrGet(plOwnerVal, sid)
   if first < atIx && atIx <= fOwner && first > best { best = first }
-  let i = 0
-  while i < plMoreSid.length {
-    if plMoreSid[i] == sid {
-      const cand = plMoreIx[i]
-      const own = plMoreOwner[i]
-      if cand < atIx && atIx <= own && cand > best { best = cand }
-    }
-    i = i + 1
+  // Walks only `sid`'s own chain (D2325), not every duplicate LetDecl in the function —
+  // `plMoreHead[sid]` is the most recently pushed row for this sid, `plMoreNext` its
+  // predecessor, terminated by -1.
+  let i = sidArrGet(plMoreHead, sid)
+  while i >= 0 {
+    const cand = plMoreIx[i]
+    const own = plMoreOwner[i]
+    if cand < atIx && atIx <= own && cand > best { best = cand }
+    i = plMoreNext[i]
   }
   best
+}
+
+// Whether a function-scoped `LetDecl` of `sid` covers `atIx` — bounds-checks even a SOLE
+// binding, unlike `parentLetOfAt`'s fast path. A dedicated reader rather than a changed
+// `parentLetOfAt`: the CAPTURE channel re-asks the latter with an `atIx` its other callers
+// still need to trust unconditionally (D2325).
+export function parentLetCoversAt(blockIx: i32, sid: i32, atIx: i32): boolean {
+  if blockIx < 0 { return false }
+  if blockIx != plCacheBlock {
+    plGen = plGen + 1
+    plBuildLetMap(blockIx)
+    plCacheBlock = blockIx
+  }
+  if sid < 0 { return false }
+  if atIx < 0 { return false }
+  if sidArrGet(plSidGen, sid) != plGen { return false }
+  const first = sidArrGet(plSidVal, sid)
+  const fOwner = sidArrGet(plOwnerVal, sid)
+  if first < atIx && atIx <= fOwner { return true }
+  if sidArrGet(plDupGen, sid) != plGen { return false }
+  let i = sidArrGet(plMoreHead, sid)
+  while i >= 0 {
+    if plMoreIx[i] < atIx && atIx <= plMoreOwner[i] { return true }
+    i = plMoreNext[i]
+  }
+  false
 }
 
 // Finds the `for` loop variable named `name` anywhere in the body block at `blockIx` — the
