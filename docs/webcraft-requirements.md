@@ -1259,6 +1259,10 @@ and needs nothing from vl beyond scalar exports.
   > and a default build stays byte-identical. Expect `vl build sim.vl --shared-memory=<pages>`
   > or similar, not a global flip.
   >
+  > **BUILT 2026-09-24: `vl build --shared-memory=<pages>`** (flag 0x03, the declared max,
+  > imported or defined), and the host now instantiates it; the detach claim below is measured
+  > (`tests/vl_shared_memory_test.ts`). DECISIONS.md, "A shared memory is a build flag".
+  >
   > **4. The `vl` host refuses a shared memory today**, and it is worth knowing it is not free:
   > `shared memory support is disabled for this engine -- see Config::shared_memory`. One
   > wasmtime `Config` line, but a real host change that has to land with the flag.

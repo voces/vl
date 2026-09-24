@@ -185,6 +185,9 @@ Five items, in order. (0) is shipped; the rest are scheduled against it.
 
 ### Ruled and sequenced (owner decisions already made, waiting only on order)
 
+- **Queued (owner, 2026-09-24, plumb):** std wrappers / compiler-level functionality over the raw
+  shared-memory and atomics intrinsics (and the raw integer SIMD intrinsics), each through
+  `std-api-reviewer`. The raw layer is `vl build --shared-memory=<pages>` plus the atomics lane.
 - **Variadics, then spread — RULED (A) 2026-09-06 night and BUILT.** One rule: a rest
   parameter `function f(a: i32, ...xs: i32[])` packs the trailing arguments, a call-site
   spread `f(1, ...ys)` unpacks a list into one, `[...a, ...b]` in a list literal is the same
