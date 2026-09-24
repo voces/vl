@@ -863,6 +863,21 @@ new: the compare-frame pre-pass never recurses into a code-15 field, so a NESTED
 
 ## Codegen, memory & runtime (Track B)
 
+- **Memory intrinsics take a memarg offset (plumb PL-037 item 1).** `__load_i64__(p, 16)`,
+  `__store_i32__(p, 8, v)`, `__load_v128__(p, 32)`, `__atomic_rmw_add_i32__(p, 4, 1)`: every
+  scalar load and store, the v128 loads and store, and every atomic but the fence takes an
+  optional second argument written into the instruction's memarg. It is a compile-time integer
+  in 0..4294967295 (a literal, a top-level `const` bound to one, or a sum of those); anything
+  else is a check error. The effective address `p + off` does not wrap and traps past the
+  memory, where `p + 16` wraps. The compiler also folds a constant into the memarg itself where
+  the add provably cannot wrap: a constant address, and `K + a` with `a` bounded by a mask, a
+  shift or a narrow load (`D + (x & 1023) * 8` is `offset=D`). `vl build -O
+  --low-memory-unused` passes binaryen's flag of that name, which folds `p + C` for `C < 1024`
+  and turns such an add's wrap into a trap: opt-in, for a layout that never touches the first
+  KiB. plumb's `mix` kernel: 2.38 → 2.18 ns in V8 with its two accesses in the offset form
+  (Rust 1.49). An existing access changes only where the fold applies, and 0 distilled-corpus
+  cells moved. simd-design.md §G1 "Offsets";
+  `tests/cases/intrinsics/memarg-offset-*.vl`, `tests/vl_memarg_offset_test.ts`.
 - **Atomic intrinsics: the wasm threads proposal's `0xFE` set over linear memory (owner
   ruling 2026-09-24, for plumb's parallel guest threads).** 67 raw `__atomic_…__`
   intrinsics, one per instruction, named from the wasm name as §G1 names SIMD

@@ -519,6 +519,10 @@ program verbatim — the only way to pass one that starts with `-`.
   {c}-O3{r}                 The release profile (closed-world + -O3; melts union
                       boxes). Wins over -O when both are given. Both rungs
                       require binaryen's wasm-opt and fail loudly without it
+  {c}--low-memory-unused{r} With -O/-O3: let wasm-opt assume the first 1 KiB of
+                      memory is never accessed, so `p + C` (C < 1024) folds
+                      into the access's offset. An address whose add would
+                      wrap past 4 GiB then traps instead of reading low memory
   {c}--names{r}             Embed the wasm \"name\" section (legible trap backtraces);
                       kept through -O/-O3, at the cost of the section's bytes
   {c}--import-memory{r}     Import the linear memory as `env.memory` instead of
@@ -4969,6 +4973,34 @@ const BINARYEN_FEATURES: &[&str] = &[
 /// marks of lane L8 still win over the size (DECISIONS.md, "`-O` inlines leaf helpers").
 const OPT_PASSES: &[&str] = &["--always-inline-max-function-size", "8", "-O"];
 
+/// `vl build -O --low-memory-unused`: binaryen's `--low-memory-unused`, under which `-O` and
+/// `-O3` also run `optimize-added-constants`, folding an address `p + C` with `C < 1024` into the
+/// access's memarg offset. That is a different program wherever `p + C` wraps past 2^32: the add
+/// lands in the first KiB, the offset form traps. So it is opt-in, for a module that never forms
+/// such an address (simd-design.md §G1 "Offsets"). Binaryen 130 fixes the bound at 1024, so the
+/// flag takes no value. Without an optimizing rung it would do nothing, and says so.
+fn low_memory_unused_flag(args: &[String], optimizing: bool) -> bool {
+    let mut seen = false;
+    for a in args.iter().skip(2) {
+        if a == "--low-memory-unused" {
+            seen = true;
+        } else if let Some(v) = a.strip_prefix("--low-memory-unused=") {
+            usage_exit(&format!(
+                "`--low-memory-unused={v}` — the flag takes no value: binaryen fixes the unused \
+                 low region at 1 KiB. For a larger constant, write the offset form \
+                 `__load_i64__(p, {v})`"
+            ));
+        }
+    }
+    if seen && !optimizing {
+        usage_exit(
+            "`--low-memory-unused` changes what `-O` / `-O3` may assume, and neither is given — \
+             add one, or drop the flag",
+        );
+    }
+    seen
+}
+
 /// `vl build -O3` — the RELEASE PROFILE, the audited flag set from
 /// `docs/internals/opt-profile-design.md`. Not a bare binaryen `-O3`: VL's `-O`
 /// family has always meant "the audited flag set for this rung" rather than a
@@ -7857,6 +7889,7 @@ fn build_cmd(args: &[String]) -> Result<()> {
     // `--names` embeds a wasm "name" custom section (legible trap backtraces).
     let names = args.iter().any(|a| a == "--names");
     let optimizing = args.iter().any(|a| a == "-O" || a == "-O3");
+    let low_memory_unused = low_memory_unused_flag(args, optimizing);
     let names_mode = match (names, optimizing) {
         (false, _) => Names::Off,
         (true, false) => Names::Full,
@@ -7946,6 +7979,9 @@ fn build_cmd(args: &[String]) -> Result<()> {
         let stepped = phase!("opt.escape_step", escape_inline_step(&sink_str, flag, &bytes))?;
         let rung_input: &[u8] = stepped.as_deref().unwrap_or(&bytes);
         let mut passes = rung_passes(passes, names);
+        if low_memory_unused {
+            passes.insert(0, "--low-memory-unused");
+        }
         let (no_inline, extra) = phase!("opt.run_once_scan", rung_scan(rung_input));
         passes.extend(extra);
         phase!("opt.rung", optimize_in_place(&sink_str, flag, &passes, &no_inline))?;
