@@ -2,12 +2,12 @@
 //
 //     import { Buffer, bufferMark, bufferRelease, loadI32, storeI32 } from "std:buffer"
 //
-// A `Buf` is an ordinary value describing an extent of linear memory, and a host reads those
-// bytes in place: the module exports its memory, or imports the host's. Only the typed views,
-// `window` and `storeBytes`/`loadBytes` check a range and trap; any other read past the end of
-// a `Buf` reads whatever is there. `base` and `length` are writable, on a view too; overwriting
-// either defeats the range check that reads it. `bufferRelease(mark)` invalidates later `Buf`s.
-// `Buffer` hands out only the build's heap window, [1024, 2 GiB) unless `vl build` moves it.
+// A `Buf` is an ordinary value describing an extent of linear memory that a host reads in
+// place. Only the typed views, `window` and `storeBytes`/`loadBytes` check a range and trap;
+// any other read past a `Buf`'s end reads whatever is there, as does one through a view whose
+// writable `base` or `length` was overwritten. `Buffer` hands out only the build's heap window,
+// [1024, 2 GiB) unless `vl build` moves it. Under `vl build --shared-memory` every instance
+// sharing the memory allocates from one pointer kept in it, so no two `Buf`s overlap.
 
 // A linear-memory extent: the byte address of its first byte, and the number of
 // bytes the caller asked for. `.length` is a plain field read.
@@ -21,17 +21,9 @@ const PAGE_MASK = 65535
 // every width's natural alignment is satisfied at offset 0.
 const ALIGN = 8
 
-// How many bytes have been handed out, counted from the heap base; the bump pointer
-// is the base plus this. The base is never 0, so `base == 0` is never a `Buf`.
-// Over a shared memory the pointer lives in the header instead, and this is where
-// THIS instance's latest allocation ended, counted from the first byte after it.
+// Bytes handed out, from the heap base; the base is never 0, so neither is a `Buf`'s.
+// Over a shared memory: where this instance's latest `Buf` ended, from the heap base + 8.
 let bumpOff = 0
-
-// Over a shared memory the window's first 8 bytes are the header every instance
-// allocates through: the bytes handed out (low word) and where the top run of one
-// instance's back-to-back allocations began (high word), both counted from the byte
-// after it. Zero-filled memory is its starting state, so nothing initialises it.
-// (A literal 8 below, not a const: a const would cost every build a global.)
 
 // `n` rounded up to the next multiple of `ALIGN`.
 function alignUp(n: i32): i32 {
@@ -53,14 +45,15 @@ function ensureCapacity(end: i32) {
   }
 }
 
-// Reserve `n` zero-filled bytes and describe them. Bytes never handed out before
-// are zero for free; one reclaimed by `bufferRelease` holds what was written there.
-// Traps on a negative length, or when it would end past the heap limit (2 GiB by default).
-// Growing the memory DETACHES a host's views of it — re-take them afterwards.
+// Reserve `n` zero-filled bytes and describe them; a byte reclaimed by `bufferRelease`
+// holds what was written there. Traps on a negative length, or past the heap limit or the
+// memory's max. Growing an unshared memory DETACHES a host's views of it — re-take them.
 export function Buffer(byteLength: i32): Buf {
   if byteLength < 0 { __trap__() }
   const heap = __heap_base__()
   if __memory_shared__() {
+    // The heap's first 8 bytes: bytes handed out (low word), and where the top run of
+    // one instance's back-to-back `Buf`s began (high word), both from `first`.
     const first = heap + 8
     // Grow before claiming, so a refused growth leaves the shared pointer where it was.
     let want = first
@@ -83,7 +76,7 @@ export function Buffer(byteLength: i32): Buf {
       const base = first + top
       if byteLength > __heap_limit__() - base { __trap__() }
       const next = base + alignUp(byteLength)
-      if next > want {
+      if ((next - 1) >> PAGE_SHIFT) >= have {
         want = next
       } else {
         let run = (word >> 32) as% i32
@@ -120,10 +113,10 @@ export function bufferMark(): i32 {
   return __heap_base__() + bumpOff
 }
 
-// Reclaim everything allocated since `mark`, in one move. Every `Buf` allocated
-// after `mark` DANGLES: reads answer another buffer's bytes and writes corrupt
-// them silently, because nothing is out of bounds. Traps on a `mark` outside
-// `[heap base, bump pointer]` — which a mark held across an earlier release is.
+// Reclaim every `Buf` allocated since `mark`; each DANGLES, and reads and writes through it
+// corrupt silently. Traps on a `mark` outside `[first Buf, bump pointer]`, as one held across
+// an earlier release is. Over a shared memory it reclaims only when this instance made every
+// `Buf` from `mark` up, back to back and last; otherwise it keeps them all.
 export function bufferRelease(mark: i32) {
   const heap = __heap_base__()
   if __memory_shared__() {

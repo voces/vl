@@ -6513,7 +6513,8 @@ memory.
 **The ask:** plumb runs each guest thread in its own Web Worker over ONE memory, so the module must
 take a memory that several instances share. **Approved as a raw, opt-in feature, and only that**:
 VL gains no threading model and no shared GC objects. Only LINEAR memory is shared; each instance
-keeps its own GC heap, globals and `std:buffer` bump pointer.
+keeps its own GC heap and globals. `std:buffer`'s bump pointer is the one exception, and it lives
+in the shared memory itself (§"std:buffer's allocator over a shared memory", below).
 
 - **`vl build --shared-memory=<pages>`** declares the one memory shared — limits flag `0x03`, min 1
   page as today, max `<pages>` (1..65536). A shared memory must declare a max, so the ceiling is
@@ -6526,16 +6527,15 @@ keeps its own GC heap, globals and `std:buffer` bump pointer.
   JS render thread can read it and a grow never detaches its views. Several instances sharing
   one memory still need `--import-memory`, since each instance of a module that defines its
   memory gets its own.
-- **At most ONE instance may allocate from `std:buffer` over a shared memory.** The bump pointer
-  is a per-instance mutable global over a heap window fixed at build time, so every instance of
-  one module hands out the SAME addresses: a second instance's first `Buffer` lands on the
-  first's live allocation (pinned by the two-Worker test). `--heap-base` cannot separate them —
-  it is baked per BUILD, and every instance of one build shares it — and the grow helper reads
-  `memory.size` then grows, which is not atomic across instances. The other instances manage
-  their own address ranges with the raw loads and stores, which is what plumb does. Top-level
-  code also runs once PER INSTANCE, so a module-scope `Buffer(...)` allocates in each. `vl build
-  --import-memory --shared-memory` warns when the unit allocates from `std:buffer`. VL emits no
-  data segments, so instantiating a later instance writes nothing into the shared memory.
+- **Every instance may allocate from `std:buffer` over a shared memory** (LIFTED 2026-09-24; it
+  shipped as "at most ONE instance may"). The bump pointer was a per-instance mutable global over
+  a heap window fixed at build time, so every instance of one module handed out the SAME
+  addresses, and `--heap-base` could not separate them — it is baked per BUILD. A shared build
+  now keeps the pointer in the memory and claims with a compare-and-swap, so instances never
+  overlap; the next section has the protocol. Top-level code still runs once PER INSTANCE, so a
+  module-scope `Buffer(...)` allocates once in each. VL emits no data segments, so instantiating
+  a later instance writes nothing into the shared memory. The build-time warning that named the
+  hazard is gone.
 - **A per-build flag, never an emitter default** (webcraft A5's answer 3): the seed uses linear
   memory itself. A default build is byte-identical; a module that touches no linear memory has
   no memory to share and the flag changes none of its bytes.
@@ -6556,6 +6556,68 @@ keeps its own GC heap, globals and `std:buffer` bump pointer.
 Atomics are a separate lane; wrappers over the raw intrinsics are queued in `ROADMAP.md`, each
 through the std review. Pinned by `tests/vl_shared_memory_test.ts`, which runs one module in two
 Workers over one `WebAssembly.Memory({ shared: true })`.
+
+## std:buffer's allocator over a shared memory (owner direction, 2026-09-24) — every instance allocates, none overlap
+
+**The ask:** the first std-level lane over the raw shared-memory and atomics layer. Several
+instances of one module (plumb's guest threads, each a Web Worker) share one memory, and each
+must be able to call `Buffer` without landing on another's live allocation.
+
+- **The pointer lives in the memory, at the heap base.** Over a shared memory the window's first
+  8 bytes are an `i64` header: the bytes handed out (low word) and where the TOP RUN began (high
+  word), both counted from `heap base + 8`, where the first `Buf` now starts. Zero-filled memory
+  is the header's starting state, so there is no initialisation to race: no first-use
+  `cmpxchg`, no instance that could reset a pointer another has already moved.
+- **`Buffer` claims with one 64-bit `cmpxchg`, in a retry loop.** It reads the header, computes
+  `[base, next)`, and swaps the header only if nobody moved it. A `fetch_add` was rejected: it
+  cannot refuse, so a request past the heap limit or the max would still move the shared pointer,
+  and every later request from every instance — including small ones that fit — would then fail
+  too.
+- **It grows BEFORE it claims.** The loop makes `[0, next)` addressable, re-reads the header, and
+  claims only a range that already has memory behind it; a refused growth traps with the pointer
+  untouched, so another instance's smaller request is still served. `memory.grow` on a shared
+  memory is atomic, but its delta is relative, so the loop treats a failure by asking the size
+  again: unchanged means the max refused it, changed means another instance grew it. **The size
+  it asks is `memory.grow(0)`, not `memory.size`**: in V8 an instance's `memory.size` can lag
+  another instance's growth (the near-max race test trapped with room left while the loop re-read
+  `memory.size`), and `memory.grow(0)` reads the memory itself. No lock: a lock would make
+  growth exact, but a Worker terminated inside it would hang every other instance forever. The
+  cost is that two instances growing at once can each add their delta; it never passes the max,
+  and the pages are handed out by the same pointer later.
+- **`bufferRelease` reclaims only an instance's own run at the top.** Each instance remembers
+  where its latest `Buf` ended (the per-instance `bumpOff`, repurposed); a claim that starts
+  there continues the header's run, any other starts a new one. A release rewinds only when the
+  header's top is where this instance's latest `Buf` ended and the mark is inside the run, so
+  every byte it reclaims was this instance's. Otherwise it reclaims nothing — a leak, not a
+  corruption, since a mark taken before another instance allocated cannot be honoured without
+  freeing that instance's live `Buf`. The mark is still range-checked and traps as before. The
+  protocol was model-checked before it was written: 300,000 random interleavings of 1–4
+  instances found no overlap, and two one-line weakenings each produced one within a second.
+- **The switch is `__memory_shared__()`, a build-time `boolean` intrinsic, and the compiler FOLDS
+  it.** An else-less `if __memory_shared__() { … }` is decided by the first emit pass
+  (`foldMemShared`): a shared build keeps the body as a bare block, any other build drops the
+  statement before anything else reads the tree. Both arms are type-checked on every build, and
+  one source file carries both allocators. A default build is byte-identical to the build before
+  this lane — 498 of 498 buildable programs (every `bench/` program and every test importing
+  `std:buffer` or `std:fs`, each at the default, `-O` and `--import-memory`) — which is why the
+  shared code is inline in the three exports: an unused private function or a `const` still costs
+  every build a function or a global. The alternative, the emitter writing a different allocator
+  when shared, was rejected: the concurrency code would be hand-emitted wasm nobody reviews as
+  VL, and std's text would no longer say what runs.
+- **Units sharing a window share its header.** Two separately built units with the same heap
+  base coordinate through the one header rather than colliding, so `vl build --import-memory
+  --shared-memory` no longer warns; the unshared `--import-memory` warning is unchanged.
+- **What it does not do:** no free list, no per-instance arena, no wait/notify. A shared
+  `Buffer` costs one `memory.size`, one atomic load and one `cmpxchg` when nothing contends and
+  nothing grows.
+
+Pinned by `tests/vl_shared_memory_test.ts`: B's first `Buffer` follows A's and A's stamps
+survive; 2, 3 and 4 Workers each make 10,000 `Buf`s at once with none overlapping, every stamp
+intact and the `Buf`s tiling the heap exactly; 4 Workers race to fill a 6-page memory in thirty
+rounds and each traps only once nothing more fits, with nothing claimed past the max; release
+keeps another instance's `Buf` and reclaims an instance's own. Controls: replacing the
+`cmpxchg` with a plain store fails the stress test in 6 of 6 runs; trapping on any refused grow
+fails the race test in 3 of 4.
 
 ## Globals cross the wasm boundary: `extern let` imports one, the entry's `export let` exports one (owner, 2026-09-22) — plumb PL-003(b)
 
