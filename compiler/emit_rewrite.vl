@@ -1392,21 +1392,32 @@ let cboxLoopUp: i32[] = []
 let cboxLoopAt = -1
 let cboxDeclLoop: {[string]: i32} = Map()
 
+// The `if` arms of the frame as a tree the same way: arm `a` is side `cboxArmSide[a]` (0 then,
+// 1 else) of the `if` at node `cboxArmIf[a]`. Two events in different arms of one `if` exclude
+// each other, unless a loop re-runs the `if`.
+let cboxArmUp: i32[] = []
+let cboxArmIf: i32[] = []
+let cboxArmSide: i32[] = []
+let cboxArmAt = -1
+
 // In walk order, each capture (a function nested one level in the frame that names the binding)
 // and each assignment by the frame itself, as per-name lists threaded through `*Next`, with the
-// loop it sits in. `cboxFnOrd` / `cboxFnLoop` describe the nested function being scanned.
+// loop and arm it sits in. `cboxFn*` describe the nested function being scanned.
 let cboxOrd = 0
 let cboxFnOrd = -1
 let cboxFnLoop = -1
+let cboxFnArm = -1
 let cboxCapSeen: {[string]: i32} = Map()
 let cboxCapHead: {[string]: i32} = Map()
 let cboxCapNext: i32[] = []
 let cboxCapOrd: i32[] = []
 let cboxCapLoop: i32[] = []
+let cboxCapArm: i32[] = []
 let cboxAsgHead: {[string]: i32} = Map()
 let cboxAsgNext: i32[] = []
 let cboxAsgOrd: i32[] = []
 let cboxAsgLoop: i32[] = []
+let cboxAsgArm: i32[] = []
 
 // The cell a boxed parameter or loop variable is read through; a boxed `let` is its own cell.
 let cboxCellOf: {[string]: string} = Map()
@@ -1465,15 +1476,22 @@ function cboxFrameReset() {
   cboxOrd = 0
   cboxFnOrd = -1
   cboxFnLoop = -1
+  cboxFnArm = -1
+  cboxArmUp = []
+  cboxArmIf = []
+  cboxArmSide = []
+  cboxArmAt = -1
   cboxCapSeen = Map()
   cboxCapHead = Map()
   cboxCapNext = []
   cboxCapOrd = []
   cboxCapLoop = []
+  cboxCapArm = []
   cboxAsgHead = Map()
   cboxAsgNext = []
   cboxAsgOrd = []
   cboxAsgLoop = []
+  cboxAsgArm = []
   cboxCellOf = Map()
   0
 }
@@ -1510,6 +1528,7 @@ function cboxNoteCap(name: string) {
   cboxCapHead[name] = cboxCapOrd.length
   cboxCapOrd.push(cboxFnOrd)
   cboxCapLoop.push(cboxFnLoop)
+  cboxCapArm.push(cboxFnArm)
   0
 }
 
@@ -1520,7 +1539,33 @@ function cboxNoteAsg(name: string) {
   cboxAsgHead[name] = cboxAsgOrd.length
   cboxAsgOrd.push(cboxOrd)
   cboxAsgLoop.push(cboxLoopAt)
+  cboxAsgArm.push(cboxArmAt)
   0
+}
+
+// Opens side `side` of the `if` at node `ifIx` as an arm nested in the current one.
+function cboxArmOpen(ifIx: i32, side: i32) {
+  cboxArmUp.push(cboxArmAt)
+  cboxArmIf.push(ifIx)
+  cboxArmSide.push(side)
+  cboxArmAt = cboxArmUp.length - 1
+  0
+}
+
+// True when arms `a` and `b` lie in different sides of one `if`, so one pass runs at most one.
+function cboxArmsExclude(a: i32, b: i32) {
+  let x = a
+  while x >= 0 {
+    let y = b
+    while y >= 0 {
+      if cboxArmIf[y] == cboxArmIf[x] {
+        return cboxArmSide[y] != cboxArmSide[x]
+      }
+      y = cboxArmUp[y]
+    }
+    x = cboxArmUp[x]
+  }
+  false
 }
 
 // The innermost loop enclosing both loop `a` and loop `b`, or -1 for the frame's top.
@@ -1538,9 +1583,9 @@ function cboxLoopMeet(a: i32, b: i32) {
 }
 
 // True when a closure can observe a change to binding `name` made after it captured it: a
-// closure writes it (`alam`), the frame assigns it later in walk order than a capture, or an
-// assignment and a capture share a loop that re-runs the capture against the same binding
-// (a loop other than the one the binding is declared in).
+// closure writes it (`alam`), the frame assigns it later in walk order than a capture and not
+// in the other arm of an `if`, or the two share a loop that re-runs the capture against the
+// same binding (a loop other than the one the binding is declared in).
 function cboxByRef(name: string, alam: string[]) {
   if capHas(alam, name) { return true }
   const declLoop = cboxDeclLoop[name] ?? -1
@@ -1548,8 +1593,13 @@ function cboxByRef(name: string, alam: string[]) {
   while ci >= 0 {
     let ai = cboxAsgHead[name] ?? -1
     while ai >= 0 {
-      if cboxAsgOrd[ai] > cboxCapOrd[ci] { return true }
       if cboxLoopMeet(cboxCapLoop[ci], cboxAsgLoop[ai]) != declLoop {
+        return true
+      }
+      if (
+        cboxAsgOrd[ai] > cboxCapOrd[ci]
+        && !cboxArmsExclude(cboxCapArm[ci], cboxAsgArm[ai])
+      ) {
         return true
       }
       ai = cboxAsgNext[ai]
@@ -1576,6 +1626,7 @@ function cboxScan(ix: i32, depth: i32, dlets: string[], alam: string[]) {
       cboxOrd = cboxOrd + 1
       cboxFnOrd = cboxOrd
       cboxFnLoop = cboxLoopAt
+      cboxFnArm = cboxArmAt
     }
     const fmark = cboxShTrail.length
     cboxShadowParams(ix)
@@ -1621,15 +1672,22 @@ function cboxScan(ix: i32, depth: i32, dlets: string[], alam: string[]) {
     return 0
   }
   if n is IfStmt {
-    // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
+    // An `else if` chain is walked along its spine, so its depth costs no stack (D1990); each
+    // link's condition and arms sit in the else arm of the link before it.
+    const armMark = cboxArmAt
     let cur = ix
     while cur >= 0 {
       const c = P.nodes[cur]
+      const at = cur
       cur = -1
       if c is IfStmt {
         cboxScan(c.ifCond, depth, dlets, alam)
+        const up = cboxArmAt
+        if depth == 0 { cboxArmOpen(at, 0) }
         cboxScan(c.ifThen, depth, dlets, alam)
+        cboxArmAt = up
         if c.ifElse >= 0 {
+          if depth == 0 { cboxArmOpen(at, 1) }
           if P.nodes[c.ifElse] is IfStmt {
             cur = c.ifElse
           } else {
@@ -1638,6 +1696,7 @@ function cboxScan(ix: i32, depth: i32, dlets: string[], alam: string[]) {
         }
       }
     }
+    cboxArmAt = armMark
     return 0
   }
   if n is WhileStmt {
