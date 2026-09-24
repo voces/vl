@@ -701,6 +701,31 @@ axis(
   (d) => twoFiles(d, genNesting(6000, true), genNesting(6000, false)),
 );
 
+// `stmts` bindings of a `depth`-deep nest of if-expressions in the THEN arm, against
+// `stmts * depth` one-level ones: the same `if` nodes either way, only how deep they sit.
+const genIfNest = (stmts: number, depth: number, nested: boolean): string => {
+  const o = ["function t(): boolean { 1 == 1 }", "function f(a: i32): i32 {", "  let acc = 0"];
+  const n = nested ? stmts : stmts * depth;
+  for (let i = 0; i < n; i++) {
+    let s = `a + ${i % 13}`;
+    for (let k = 0; k < (nested ? depth : 1); k++) s = `if t() { ${s} } else { 2 }`;
+    o.push(`  const v${i} = ${s}`, `  acc = acc + v${i}`);
+  }
+  o.push("  acc", "}", "print(f(1))");
+  return o.join("\n") + "\n";
+};
+
+// Every arm predicate of `ifExprRefKind` asked it again of the inner join, so a nest cost
+// ~2^depth: this pair read 1.53 on the seed before #3094's first head (already ~1.8^depth,
+// merely slow at depth 6), 7.27 on that head, whose f32 rung added a third asker, and 0.41
+// with the per-query memo and the scalar-join exit (D2271).
+axis(
+  "if-expression nesting depth",
+  2.5,
+  "An arm predicate is re-classifying the inner join once per path — `ifExprRefKind`'s memo or its scalar-join exit (D2271).",
+  (d) => twoFiles(d, genIfNest(1200, 6, true), genIfNest(1200, 6, false)),
+);
+
 // ── the one RUNTIME axis ─────────────────────────────────────────────────────
 // Every pair above grades COMPILE time, because every cost above is the compiler's. String
 // building is the exception: the cost lands in the EMITTED program, so this pair builds
