@@ -12156,35 +12156,81 @@ export function spreadDstBackSlot(kind: MfKind, row: i32, seq: i32) {
   scratchSlot(21, kind, row + 4096 * seq, SCRATCH_BY_BOTH)
 }
 
-// The tail-value expression of an if-expression's then arm (`ifArmValueExpr`: the arm
-// block's last statement), or -1. The arms share the checker's join type, so the then
-// arm's rep classifies the whole if-expression.
+// The tail value of the if-expression's first arm that is not a bare `null`, following an
+// `else if` chain, or -1. The arms share the checker's join type, so that arm's rep classifies
+// the whole if-expression; a `null` arm has no rep, and reading it made the join's rep depend on
+// arm order (D2227). When every arm is `null` the then arm's value is returned.
 function ifThenValueIx(ifIx: i32) {
   const s = P.nodes[ifIx]
-  if s is IfStmt { return ifArmValueExpr(s.ifThen) }
+  if s is IfStmt {
+    const tv = ifArmValueExpr(s.ifThen)
+    if !exprIsNullLike(tv) { return tv }
+    const nv = ifNonNullArmValueIx(s.ifElse)
+    if nv >= 0 { return nv }
+    return tv
+  }
   -1
 }
 
-// The then-arm value of an if-expression whose other arm is `null` — absent (an else-less
-// `if`) or a bare `null` else — at `exprIx`, parens peeled; -1 for every other shape. Such
-// an `if` is `T | null` in every position (DECISIONS), so the value's niche is the then
-// arm's own rep made nullable; both null spellings share this rung deliberately.
-export function nulArmIfThenValueIx(exprIx: i32) {
-  if exprIx < 0 { return -1 }
-  const e = P.nodes[unwrapParen(exprIx)]
-  if e is IfStmt {
-    if e.ifElse < 0 { return ifArmValueExpr(e.ifThen) }
-    const eb = P.nodes[e.ifElse]
-    if eb is Block {
-      const ev = ifArmValueExpr(e.ifElse)
-      if ev >= 0 {
-        if P.nodes[unwrapParen(ev)] is NullLit {
-          return ifArmValueExpr(e.ifThen)
-        }
-      }
+// The first non-`null` arm value at or below the else slot `elseIx` (a block or an `else if`),
+// or -1 when there is none.
+function ifNonNullArmValueIx(elseIx: i32) {
+  let cur = elseIx
+  while cur >= 0 {
+    const n = P.nodes[cur]
+    if n is IfStmt {
+      const tv = ifArmValueExpr(n.ifThen)
+      if tv >= 0 && !exprIsNullLike(tv) { return tv }
+      cur = n.ifElse
+    } else {
+      // The final else: `ifArmValueExpr` reads a block's tail value and answers -1 for any other node.
+      const ev = ifArmValueExpr(cur)
+      if ev >= 0 && !exprIsNullLike(ev) { return ev }
+      return -1
     }
   }
   -1
+}
+
+// The first non-`null` arm value of an if-expression (an `else if` chain followed) that has a
+// `null` arm — a bare `null` in any position, or a missing final else — at `exprIx`, parens
+// peeled; -1 for every other shape. Such an `if` is `T | null` in every position (DECISIONS), so
+// the value's niche is that arm's own rep made nullable, whichever arm holds the `null` (D2227).
+export function nulArmIfThenValueIx(exprIx: i32) {
+  if exprIx < 0 { return -1 }
+  let cur = unwrapParen(exprIx)
+  let val = -1
+  let first = -1
+  let sawNull = false
+  while cur >= 0 {
+    const e = P.nodes[cur]
+    if e is IfStmt {
+      const tv = ifArmValueExpr(e.ifThen)
+      if first < 0 { first = tv }
+      if exprIsNullLike(tv) { sawNull = true }
+      else if val < 0 { val = tv }
+      cur = -1
+      if e.ifElse < 0 {
+        sawNull = true
+      } else {
+        const eb = P.nodes[e.ifElse]
+        if eb is IfStmt {
+          cur = e.ifElse
+        } else if eb is Block {
+          const ev = ifArmValueExpr(e.ifElse)
+          if exprIsNullLike(ev) { sawNull = true }
+          else if val < 0 { val = ev }
+        } else {
+          return -1
+        }
+      }
+    } else {
+      return -1
+    }
+  }
+  if !sawNull { return -1 }
+  if val < 0 { return first }
+  val
 }
 
 // The value arm of an if-expression whose deciding arm is itself nullable, at `exprIx`, or
@@ -12217,6 +12263,45 @@ function nulIfArmNullableValueIx(exprIx: i32) {
 function exprIsNullLit(exprIx: i32) {
   if exprIx < 0 { return false }
   P.nodes[unwrapParen(exprIx)] is NullLit
+}
+
+// True if the expression at `exprIx` is a bare `null`, or an if-expression whose every arm is
+// one (`ifChainAllBareNull`): an arm holding either has no rep for a join to read (D2227).
+export function exprIsNullLike(exprIx: i32) {
+  if exprIsNullLit(exprIx) { return true }
+  if exprIx < 0 { return false }
+  const ix = unwrapParen(exprIx)
+  if ix < 0 || ix >= P.nodes.length { return false }
+  P.nodes[ix] is IfStmt && ifChainAllBareNull(ix)
+}
+
+// True if every arm of the if-expression at `ifIx` (an `else if` chain followed) is a block
+// holding only a bare `null`, or only another such if-expression: the join is the `null` type.
+export function ifChainAllBareNull(ifIx: i32) {
+  let cur = unwrapParen(ifIx)
+  while cur >= 0 {
+    const s = P.nodes[cur]
+    if s is IfStmt {
+      if !armIsBareNull(s.ifThen) { return false }
+      cur = -1
+      if s.ifElse >= 0 {
+        if P.nodes[s.ifElse] is IfStmt { cur = s.ifElse }
+        else if !armIsBareNull(s.ifElse) { return false }
+      }
+    } else {
+      return false
+    }
+  }
+  true
+}
+
+// True if `blockIx` is an arm block whose one statement is `exprIsNullLike`.
+function armIsBareNull(blockIx: i32) {
+  const b = P.nodes[blockIx]
+  if b is Block {
+    return b.blkStmts.length == 1 && exprIsNullLike(b.blkStmts[0])
+  }
+  false
 }
 
 // The if-expression arm whose own rep decides the join's — the then arm, except where that
@@ -26464,17 +26549,18 @@ export function exprIsNulNone(exprIx: i32, fnIx: i32): boolean {
     }
     return false
   }
-  // An if-expression whose every arm is itself `null`-typed is `null`-typed: the join of
-  // `null` with `null` is `null`. One arm carrying a real value is not this — its join is a
-  // genuine `T | null` and the niche paths own it. An else-less `if` used as a value is
-  // `T | null`, and here `T` is already `null`.
+  // An if-expression whose every arm is a bare `null` or itself `null`-typed is `null`-typed:
+  // the join of `null` with `null` is `null`. One arm carrying a real value is not this — its
+  // join is a genuine `T | null` and the niche paths own it. An else-less `if` used as a value
+  // is `T | null`, and here `T` is already `null`.
   if e is IfStmt {
     const tvNN = ifArmValueExpr(e.ifThen)
     if tvNN < 0 { return false }
-    if !exprIsNulNone(tvNN, fnIx) { return false }
+    if !exprIsNullLit(tvNN) && !exprIsNulNone(tvNN, fnIx) { return false }
     if e.ifElse < 0 { return true }
+    if P.nodes[e.ifElse] is IfStmt { return exprIsNulNone(e.ifElse, fnIx) }
     const evNN = ifArmValueExpr(e.ifElse)
-    return evNN >= 0 && exprIsNulNone(evNN, fnIx)
+    return evNN >= 0 && (exprIsNullLit(evNN) || exprIsNulNone(evNN, fnIx))
   }
   // Every other node kind asks the cell, which is the named default and not a fall-through:
   // an Ident, a captured read, and a module global all resolve through `identCellVKind`, and

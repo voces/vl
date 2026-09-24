@@ -615,6 +615,7 @@ import {
   exprIsIntegralFloat,
   exprIsLitAtom,
   exprIsNulNone,
+  exprIsNullLike,
   exprIsStrBytes,
   exprIsStrCharBoundary,
   exprIsStrCharCode,
@@ -694,6 +695,7 @@ import {
   identNullableBoolPop,
   identSlotIsUnionBox,
   ifArmIsValue,
+  ifChainAllBareNull,
   ifExprRefKind,
   ifExprRefSlot,
   ifExprValtype,
@@ -4460,6 +4462,19 @@ function fnPosRetIsNulNone(pos: i32): boolean {
 // unread under the null tag, so its only job is to be an `anyref` — which is why an ident read
 // must not route through the seed table (D1576), a `boolean | null` seed putting an i32 there.
 function emitNulNoneBoxPayload(body: u8[], exprIx: i32, fnIx: i32) {
+  const ix = unwrapParen(exprIx)
+  if ix >= 0 && ix < P.nodes.length {
+    if P.nodes[ix] is IfStmt {
+      if emitIfForEffect(body, ix, fnIx) < 0 { return -1 }
+      fbRefNullNone()
+      return 0
+    }
+  }
+  emitNulNoneLeafPayload(body, exprIx, fnIx)
+}
+
+// `emitNulNoneBoxPayload` for every node but an if-expression: a call is the payload itself.
+function emitNulNoneLeafPayload(body: u8[], exprIx: i32, fnIx: i32) {
   const n = P.nodes[unwrapParen(exprIx)]
   if n is Call { return emitExpr(body, exprIx, fnIx) }
   fbRefNullNone()
@@ -4486,16 +4501,63 @@ function nulNoneEqSide(exprIx: i32, fnIx: i32): boolean {
 }
 
 // Evaluate a `null`-typed operand for its effects and drop it, where the answer is already
-// decided. Only a call has any: an ident read has none, and emitting one would consume the
-// destination seed (`emitNullBySeed`'s one-shot `pendingNulRefHeap`) the surviving value still
-// needs. Shared by `??`, the folded null compare, and `print`.
+// decided. A call and an if-expression have effects; an ident read has none, and emitting one
+// would consume the destination seed (`emitNullBySeed`'s one-shot `pendingNulRefHeap`) the
+// surviving value still needs. Shared by `??`, the folded null compare, and `print`.
 function emitNulNoneForEffect(body: u8[], exprIx: i32, fnIx: i32) {
+  const ix = unwrapParen(exprIx)
+  if ix >= 0 && ix < P.nodes.length {
+    if P.nodes[ix] is IfStmt { return emitIfForEffect(body, ix, fnIx) }
+  }
+  emitNulNoneLeafForEffect(body, exprIx, fnIx)
+}
+
+// `emitNulNoneForEffect` for every node but an if-expression: only a call has an effect.
+function emitNulNoneLeafForEffect(body: u8[], exprIx: i32, fnIx: i32) {
   const n = P.nodes[unwrapParen(exprIx)]
   if n is Call {
     if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
     fbDrop()
   }
   0
+}
+
+// Run a `null`-typed if-expression for its effects alone: its conditions as a void `if` chain,
+// each arm's prelude, and each arm's value through `emitNulNoneForEffect`, under the narrowing
+// its condition gives (D2227).
+function emitIfForEffect(body: u8[], ifIx: i32, fnIx: i32) {
+  const s = P.nodes[ifIx]
+  if s is IfStmt {
+    if emitCondExpr(body, s.ifCond, fnIx) < 0 { return -1 }
+    fbIf(64) // 0x40 void
+    const savedTop = narrowTop
+    const narrowed = setNarrowFromCond(s.ifCond, fnIx)
+    const rcT = emitArmForEffect(body, s.ifThen, fnIx)
+    if narrowed { restoreNarrow(savedTop) }
+    if rcT < 0 { return -1 }
+    if s.ifElse >= 0 {
+      fbElse()
+      const savedElseTop = narrowTop
+      const narrowedElse = setNarrowFromCondElse(s.ifCond, fnIx)
+      let rcE = 0
+      if P.nodes[s.ifElse] is IfStmt {
+        rcE = emitIfForEffect(body, s.ifElse, fnIx)
+      } else {
+        rcE = emitArmForEffect(body, s.ifElse, fnIx)
+      }
+      if narrowedElse { restoreNarrow(savedElseTop) }
+      if rcE < 0 { return -1 }
+    }
+    fbEnd()
+    return 0
+  }
+  emitFail("emitProgram: expected an if expression")
+}
+
+// One arm of `emitIfForEffect`: its prelude, then its `null`-typed value for effect.
+function emitArmForEffect(body: u8[], blockIx: i32, fnIx: i32) {
+  if emitIfArmOpen(body, blockIx, fnIx) < 0 { return emitIfArmClose(-1) }
+  emitIfArmClose(emitNulNoneForEffect(body, ifArmValueExpr(blockIx), fnIx))
 }
 
 export function emitUnionBoxArg(
@@ -12883,6 +12945,7 @@ function emitCondExpr(body: u8[], ix: i32, fnIx: i32) {
 // recurses). Both arms are coerced to the branch-join's scalar rep (a mixed `then 1 else
 // 2.5` widens to f64); a ref-typed join (string/struct/array) routes to `emitIfExprRef` instead, for the multi-byte `(ref $ht)` blocktype a single numeric byte cannot spell.
 function emitIfExpr(body: u8[], ifIx: i32, fnIx: i32) {
+  if ifChainAllBareNull(ifIx) { return emitAllNullIf(body, ifIx, fnIx) }
   // An atom join lowers every arm in the atom context, whatever rep the arm has alone (D2206).
   if ifJoinTypedAtom(ifIx) {
     const savedLU = pendingLitUnion
@@ -12896,6 +12959,14 @@ function emitIfExpr(body: u8[], ifIx: i32, fnIx: i32) {
     return emitIfExprRef(body, ifIx, fnIx, rk, ifExprRefSlot(ifIx, fnIx, rk))
   }
   emitIfExprAs(body, ifIx, fnIx, ifExprValtype(ifIx, fnIx))
+}
+
+// An if-expression every arm of which is a bare `null` (`ifChainAllBareNull`): it runs for its
+// effects alone, and the value is the one `null` the destination seeded — the same rep a bare
+// `null` there takes, so no arm can pick a blocktype for it (D2227).
+function emitAllNullIf(body: u8[], ifIx: i32, fnIx: i32) {
+  if emitIfForEffect(body, unwrapParen(ifIx), fnIx) < 0 { return -1 }
+  emitNullBySeed(fnIx, true)
 }
 
 // Lower a ref-typed if-expression join (string / struct / array) as a value-typed `if`
@@ -12914,14 +12985,32 @@ function emitIfExprRef(
   const open: i32[] = []
   let cur = ifIx
   let rc = 1
+  let nul = false
   while rc == 1 {
-    rc = emitIfExprRefLink(body, cur, fnIx, kind, slot, open)
+    nul = nul || ifLinkYieldsNull(cur)
+    rc = emitIfExprRefLink(body, cur, fnIx, kind, slot, open, nul)
     if rc == 1 {
       const link = P.nodes[unwrapParen(cur)]
       if link is IfStmt { cur = link.ifElse }
     }
   }
   closeIfChainFrames(open, rc, false)
+}
+
+// True if the `if` link at `ifIx` can yield `null`: its recorded join is nullable, it has no
+// else, or one of its own arms is a bare `null`. A chain's blocktype is nullable from the first
+// such link inward, so a link typed `null` alone still matches its enclosing frame (D2227).
+function ifLinkYieldsNull(ifIx: i32) {
+  if nodeTyIsNullable(ifIx) { return true }
+  const s = P.nodes[unwrapParen(ifIx)]
+  if s is IfStmt {
+    if s.ifElse < 0 { return true }
+    if exprIsNullLike(ifArmValueExpr(s.ifThen)) { return true }
+    if P.nodes[s.ifElse] is Block {
+      return exprIsNullLike(ifArmValueExpr(s.ifElse))
+    }
+  }
+  false
 }
 
 // One link of `emitIfExprRef`: 0 or -1 as that function returns, or 1 when the else is another `if`
@@ -12933,11 +13022,12 @@ function emitIfExprRefLink(
   kind: VKind,
   slot: i32,
   open: i32[],
+  chainNul: boolean,
 ) {
   if ifIx < 0 || ifIx >= P.nodes.length {
     return emitFail("emitProgram: expected an if expression")
   }
-  if !nodeTyIsNullable(ifIx) {
+  if !chainNul {
     const sw = emitIntSwitch(body, ifIx, fnIx, 3, 0, kind, slot)
     if sw < 0 { return -1 }
     if sw > 0 { return 0 }
@@ -12950,11 +13040,10 @@ function emitIfExprRefLink(
     const noElse = s.ifElse < 0
     if emitCondExpr(body, s.ifCond, fnIx) < 0 { return -1 }
     fbOpenIf() // 0x04 if
-    // A join the checker typed `T | null` (one arm `null`, or absent) needs a nullable
-    // blocktype, else that arm's `(ref null $ht)` mismatches the non-null result.
-    // `nodeTyIsNullable` reads the checker's recorded join type as one generic signal for
-    // every ref kind, rather than per-kind — a non-nullable join, or a binding whose arms are both non-null, stays non-null and widens on store.
-    const nulJoin = noElse || nodeTyIsNullable(ifIx)
+    // A join that can yield `null` (`ifLinkYieldsNull`, from this link or one enclosing it)
+    // needs a nullable blocktype, else a `(ref null $ht)` arm mismatches the non-null result.
+    // A non-nullable join, or a binding whose arms are both non-null, stays non-null and widens on store.
+    const nulJoin = chainNul
     if nulJoin {
       fbValtypeNullable(kind, slot) // `(ref null $ht)` result blocktype
     } else {
@@ -13203,7 +13292,7 @@ function emitIfExprAsLink(
     fbIf(kind) // 0x04 if, <kind> result blocktype
     const savedTop = narrowTop
     const narrowed = setNarrowFromCond(s.ifCond, fnIx)
-    const rcT = emitBlockValueAs(body, s.ifThen, fnIx, kind)
+    const rcT = emitNicheArmValueAs(body, s.ifThen, fnIx, kind, ifIx)
     if narrowed { restoreNarrow(savedTop) }
     if rcT < 0 { return -1 }
     fbElse()   // 0x05 else
@@ -13218,21 +13307,7 @@ function emitIfExprAsLink(
         if narrowedElse { open.push(savedElseTop) } else { open.push(-1) }
         return 1 // `else if`: the next link, which the caller emits into this open frame
       } else {
-        // The explicit `else { null }` spelling reaches `emitNullLitNode`, whose niche arms
-        // need a boundary seed an un-annotated binding initializer never sets (D1560) — seed
-        // `pendingNulBool`/`pendingNulLitUnion` from the join's own type here, scoped to a bare-`null` tail so no other value in the arm can read it.
-        const savedNB = pendingNulBool
-        const savedNL = pendingNulLitUnion
-        const enull = ifArmValueExpr(s.ifElse)
-        if enull >= 0 {
-          if P.nodes[unwrapParen(enull)] is NullLit {
-            if nodeTyIsNulBool(ifIx) { pendingNulBool = true }
-            if nodeTyIsNulLitUnion(ifIx) { pendingNulLitUnion = true }
-          }
-        }
-        rc = emitBlockValueAs(body, s.ifElse, fnIx, kind)
-        pendingNulBool = savedNB
-        pendingNulLitUnion = savedNL
+        rc = emitNicheArmValueAs(body, s.ifElse, fnIx, kind, ifIx)
       }
     }
     if narrowedElse { restoreNarrow(savedElseTop) }
@@ -13241,6 +13316,28 @@ function emitIfExprAsLink(
     return 0
   }
   emitFail("emitProgram: expected an if expression")
+}
+
+// `emitBlockValueAs` for an arm of the i32-family join at `ifIx`. A bare `null` arm reaches
+// `emitNullLitNode`, whose niche arms need a boundary seed an un-annotated binding never sets
+// (D1560), so it is seeded from the join's own type, scoped to that tail and to either arm (D2227).
+function emitNicheArmValueAs(
+  body: u8[],
+  armIx: i32,
+  fnIx: i32,
+  kind: i32,
+  ifIx: i32,
+) {
+  const savedNB = pendingNulBool
+  const savedNL = pendingNulLitUnion
+  if exprIsNullLike(ifArmValueExpr(armIx)) {
+    if nodeTyIsNulBool(ifIx) { pendingNulBool = true }
+    if nodeTyIsNulLitUnion(ifIx) { pendingNulLitUnion = true }
+  }
+  const rc = emitBlockValueAs(body, armIx, fnIx, kind)
+  pendingNulBool = savedNB
+  pendingNulLitUnion = savedNL
+  rc
 }
 
 // The VALUE of an if-expression arm: its prelude, then its tail-value statement emitted
