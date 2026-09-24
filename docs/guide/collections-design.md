@@ -1167,6 +1167,11 @@ foo`), planned via **B8 destructuring**, and it is **not** Map-specific. **BUILT
 - `for x in set` — a set's elements; `for x, i in set` adds the index, a set being a
   sequence here rather than a map.
 
+**Writing the walked map or Set is defined** (owner ruling 2026-09-24, D2315), with JS `Map`
+semantics: each entry is visited once while it lives, an entry deleted before the walk reaches
+it is skipped, an entry inserted during the walk is visited, and an overwrite is seen by a later
+read. `for k in m { m.delete(k) }` empties `m`. (A list walk that pushes stays as §VL.6 says.)
+
 The **first** name keeps exactly the meaning it has with no second name, which is the
 rule that makes one form serve both shapes. A RANGE (`for i in 0 to 10`) counts one
 value and so refuses a second name.
