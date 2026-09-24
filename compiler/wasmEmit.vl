@@ -20576,6 +20576,31 @@ function mapCompactFnOf(sh: i32) {
   gHelpMapCompact[row]
 }
 
+// Does the code under `ix` assign the bare name `nm`, outside any nested function?
+function stmtAssignsName(ix: i32, nm: string): boolean {
+  let cur = ix
+  while cur >= 0 {
+    const n = P.nodes[cur]
+    if n is FuncDecl { return false }
+    if n is BinExpr {
+      if n.binOp == "=" {
+        const t = P.nodes[unwrapParen(n.binLeft)]
+        if t is Ident {
+          if t.identName == nm { return true }
+        }
+      }
+    }
+    const kids = nodeSpineChildren(cur)
+    let i = 0
+    while i < kids.length {
+      if stmtAssignsName(kids[i], nm) { return true }
+      i = i + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  false
+}
+
 function emitForInStmt(body: u8[], s: ForIn, _stmtIx: i32, fnIx: i32) {
   // `for v[, w] in <list> { body }` — iterate an i32 list, a string list, a struct ref list,
   // or a map's ordered keys/values list. Cursor slots in collect pre-order: the element var
@@ -20788,11 +20813,17 @@ function emitForInStmt(body: u8[], s: ForIn, _stmtIx: i32, fnIx: i32) {
     fbI32Const(0)
   }
   fbLocalSet(iIdx)
+  // A body that writes the index gets a hidden counter, and the index is a fresh copy of it
+  // each iteration, so the write never moves the walk (D2342).
+  let pCtr = -1
+  if hasPair && !pairIsVal && stmtAssignsName(s.fiBody, pairName) {
+    pCtr = strI32Slot()
+  }
   if hasPair && !pairIsVal {
     // A dense counter of body executions: the cursor is a backing offset for a string and
     // skips tombstones for a set, so it is not the index at two of the three sequences.
     fbI32Const(0)
-    fbLocalSet(pIdx)
+    if pCtr >= 0 { fbLocalSet(pCtr) } else { fbLocalSet(pIdx) }
   }
   // The body's own index receivers, as `while` and a range loop hoist theirs.
   const fiHoist = loopHoistOpen(body, -1, s.fiBody, fnIx, s.fiVar, pairName)
@@ -20907,6 +20938,10 @@ function emitForInStmt(body: u8[], s: ForIn, _stmtIx: i32, fnIx: i32) {
     }
     fbLocalSet(pIdx)
   }
+  if pCtr >= 0 {
+    fbLocalGet(pCtr)
+    fbLocalSet(pIdx)
+  }
   // Same INNER continue block as for-range: `continue` must still increment.
   const fiHasCont = blockHasContinueFor(s.fiBody, s.fiLabel, false)
   if fiHasCont {
@@ -20937,10 +20972,12 @@ function emitForInStmt(body: u8[], s: ForIn, _stmtIx: i32, fnIx: i32) {
   if hasPair && !pairIsVal {
     // Advanced on the path the BODY ran: the tombstone skip re-loops before reaching here,
     // so a deleted entry does not consume an index.
-    fbLocalGet(pIdx)
+    let pStep = pIdx
+    if pCtr >= 0 { pStep = pCtr }
+    fbLocalGet(pStep)
     fbI32Const(1)
     fbI32Bin(106) // 0x6a i32.add
-    fbLocalSet(pIdx)
+    fbLocalSet(pStep)
   }
   fbBr(0) // continue loop
   fbEnd() // end loop
