@@ -182,6 +182,7 @@ import {
   tyIsLitUnionOrLit,
   tyIsNewtypeBrand,
   tyIsNonNullHoleRead,
+  tyIsNulValueUnionBox,
   tyIsNullableLitUnion,
   tyIsU8ArrayTy,
   tyIxIsVariantMember,
@@ -15232,7 +15233,14 @@ export function mapReadScalarBoxKindTy(exprIx: i32) {
   if exprIx < 0 { return -1 }
   const e = P.nodes[unwrapParen(exprIx)]
   if !(e is Index) { return -1 }
-  const rt = nodeTyIxOf(e.idxArr)
+  mapRecvScalarBoxKindTy(e.idxArr)
+}
+
+// `mapReadScalarBoxKindTy` asked of the map RECEIVER: the atom kind its scalar value boxes at,
+// or -1 for a value with a niche of its own or no scalar rep.
+export function mapRecvScalarBoxKindTy(recvIx: i32) {
+  if recvIx < 0 { return -1 }
+  const rt = nodeTyIxOf(recvIx)
   if rt < 0 { return -1 }
   const r = T.tys[rt]
   if !(r is TyMap) { return -1 }
@@ -15383,6 +15391,16 @@ export function coalesceStaysNullable(exprIx: i32, cns: i32, _fnIx: i32) {
     }
   }
   false
+}
+
+// True when `m[k] ?? d` over the map value slot `cns` is the value-union box because `d` is
+// nullable and the value is a scalar: a `scalar | null` union value, or an f64/i64/f32 one. The
+// fused get builds exactly this rep (`emitMapGetOrScalarBox`, `emitMapGetOrUnionBox`).
+function coalesceKeepsScalarBox(exprIx: i32, cns: i32, fnIx: i32) {
+  if !coalesceStaysNullable(exprIx, cns, fnIx) { return false }
+  const k = mvValKind[cns]
+  if k == 2 { return mvUnionIsScalarNull(cns) }
+  k == 10 || k == 11 || k == 13
 }
 
 // The one nullability decision for the non-map `??` reps (the value-union box and the
@@ -27882,7 +27900,11 @@ export function exprUnion(exprIx: i32, fnIx: i32) {
   // value, which `??` peels to the raw unboxed scalar (classified by `exprIsI64`/`exprIsF64`/… ).
   if e is BinExpr {
     const cmu = coalesceMvSlot(exprIx, fnIx)
-    if cmu >= 0 { return mvValKind[cmu] == 2 && !mvUnionIsScalarNull(cmu) }
+    if cmu >= 0 {
+      if mvValKind[cmu] == 2 && !mvUnionIsScalarNull(cmu) { return true }
+      // A nullable default keeps a scalar read `S | null`, which is the box (D2253).
+      return coalesceKeepsScalarBox(exprIx, cmu, fnIx)
+    }
     // A non-map `p ?? q` over a nullable value-union box keeps the box when the default is
     // itself nullable, since the result is still `T | null`, with no unboxed rep. Without it
     // an un-annotated binding inferred the residual scalar cell and its `!= null` found no
@@ -28010,6 +28032,8 @@ export function unionNameOfIdentSid(sid: i32, fnIx: i32) {
   if cun != "" { return cun }
   const gi = globalLetOfSidIn(fnIx, sid)
   if gi >= 0 { return letUnionNameOf(gi, -1) }
+  // A module block's binding only where no frame on the reader's chain binds the name (D2252).
+  if frameChainBindsName(fnIx, name) { return "" }
   const bl = startBlockLetOfSid(sid, fnIx)
   if bl >= 0 { return letUnionNameOf(bl, -1) }
   ""
@@ -28295,6 +28319,28 @@ function nodeRegisteredUnionName(ix: i32): string {
   ""
 }
 
+// The union a value `if`'s JOIN reps as, read off the join's own recorded type and never off
+// an arm alone: an arm narrowed by the `if`'s own condition (`if n != null { n } …`) keeps its
+// declared union, while the join is the bare scalar. "" when the join is not a union.
+export function ifJoinUnionName(ifIx: i32) {
+  // Through the banked pin, as the `??` arm below is: a `??` in an ARM makes the join a
+  // deferred hole, and without this name the pinned face falls to a numeric block type (D1702).
+  const pin = nodeTyPinIxOf(ifIx)
+  const icn = tyToEmitName(pin)
+  if icn != "" {
+    if isValueUnionName(icn) { return icn }
+    if isUNameAB(4, icn, pin) { return icn }
+  }
+  // A `??` over a declared struct union desugars to this `if`, whose recorded type renders
+  // structurally, so the two rungs above miss it — named off the type instead. D1561.
+  const irn = nodeRegisteredUnionName(ifIx)
+  if irn != "" { return irn }
+  // A nullable box join no row names (a map `??` over a union value): its own member set, `null`
+  // included, so an arm that is a nullable niche boxes its null as the union's null (D2251).
+  if tyIsNulValueUnionBox(pin) { return icn }
+  ""
+}
+
 // The union NAME the expression at `exprIx` produces (the name-typed mirror of the
 // boolean `exprUnion`): a union-returning call's return annotation, a union-typed
 // ident, a parenthesized union. "" when the expression is not union-valued.
@@ -28313,20 +28359,7 @@ export function unionNameOfExpr(exprIx: i32, fnIx: i32) {
   }
   // An if-expression names its union from its own recorded type, like the `AsExpr` arm: only
   // a desugared `??` (`nodeTyCarry`) puts a type on an `if` — a source-written one has none. D969.
-  if e is IfStmt {
-    // Through the banked pin for the same reason the `??` arm below is: a `??` in an ARM makes
-    // the join a deferred hole, and this name is what routes the value to the union path at
-    // all — without it the pinned face falls to `ifExprRefKind`, which has no union rung and
-    // hands back a numeric block type over box arms (D1702).
-    const icn = tyToEmitName(nodeTyPinIxOf(unwrapParen(exprIx)))
-    if icn != "" {
-      if isValueUnionName(icn) { return icn }
-      if isUNameAB(4, icn, nodeTyPinIxOf(unwrapParen(exprIx))) { return icn }
-    }
-    // A `??` over a declared struct union desugars to this `if`, whose recorded type renders
-    // structurally, so `isValueUnionName`/`isUNameAB` above miss it — named off the type instead. D1561.
-    return nodeRegisteredUnionName(exprIx)
-  }
+  if e is IfStmt { return ifJoinUnionName(unwrapParen(exprIx)) }
   // A `??`'s desugared call-operand form still needs a name here: it drives the default's
   // coercion and makes `exprUnion` true, so a consumer boxes the result exactly once. D960.
   if e is BinExpr {
@@ -33740,17 +33773,41 @@ export function frameLetOf(fnIx: i32, name: string) {
 // The module-scope block binding a read of `name` in frame `fnIx` can denote, or -1 when that
 // frame binds the name itself — a parameter, a `let` or a loop variable shadows every module
 // block's binding of it, so a function's own `r` never takes the kind of a top-level block's `r`.
-// D2245.
+// A lifted closure also sees every enclosing frame's bindings, so any of them shadows too. D2252.
 function moduleLocalLetSeenFrom(fnIx: i32, name: string) {
-  if fnIx >= 0 {
-    if paramIndexOf(fnIx, name) >= 0 { return -1 }
-    const fn = P.nodes[fnIx]
-    if fn is FuncDecl {
-      if parentLetOf(fn.fnBody, name) >= 0 { return -1 }
-      if parentLoopVarOf(fn.fnBody, name) >= 0 { return -1 }
-    }
-  }
+  if frameChainBindsName(fnIx, name) { return -1 }
   moduleLocalLetOfUnique(emitRootIx, name)
+}
+
+// True when frame `fnIx` or any frame enclosing it binds `name`, so a read of `name` there can
+// never denote a module-scope block's binding. Outward through `fnParent`, and from a generic
+// instance into its origin, whose nested frames the instance's slot does not parent (D1817).
+function frameChainBindsName(fnIx: i32, name: string) {
+  if fnIx < 0 { return false }
+  if frameBindsName(fnIx, name) { return true }
+  let pp = fnStmtsPosOf(fnIx)
+  let steps = 0
+  while pp >= 0 && steps <= fnStmts.length {
+    if frameBindsName(fnStmts[pp], name) { return true }
+    let up = -1
+    if pp < fnParent.length { up = fnParent[pp] }
+    if up < 0 && pp < fnInstOrigin.length { up = fnInstOrigin[pp] }
+    if up >= fnStmts.length { up = -1 }
+    pp = up
+    steps = steps + 1
+  }
+  false
+}
+
+// True when the frame `fnIx` itself binds `name`: a parameter, a body `let` or a loop variable.
+function frameBindsName(fnIx: i32, name: string) {
+  if paramIndexOf(fnIx, name) >= 0 { return true }
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    if parentLetOf(fn.fnBody, name) >= 0 { return true }
+    if parentLoopVarOf(fn.fnBody, name) >= 0 { return true }
+  }
+  false
 }
 
 // True if evaluating the expression at `exprIx` yields a string-keyed map: the
