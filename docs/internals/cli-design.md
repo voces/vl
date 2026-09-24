@@ -654,15 +654,18 @@ Cranelift compile is cached".
 | `--names` | embed the wasm `name` custom section (legible trap backtraces) |
 | `--no-validate` | skip the "will the engine instantiate this" check |
 | `--import-memory` | import the memory as `env.memory` instead of defining and exporting it |
+| `--shared-memory=<pages>` | declare the memory SHARED with a max of `<pages>` (1..65536), imported or defined; at most one instance may allocate from `std:buffer` |
 | `--heap-base=<n>` | first byte `std:buffer` may hand out (default 1024; nonzero multiple of 8) |
 | `--heap-limit=<n>` | one past the last; a `Buffer` past it traps (default 2^31-8; a multiple of 8) |
 | `--compiler <f>` | the compiler module to compile with |
 
-The three layout flags are parsed strictly: a misspelled `--heap-*`/`--import*` flag, the
-space-separated `--heap-base 0x10000`, `--import-memory=<anything>`, or a repeated layout flag
+The layout flags are parsed strictly: a misspelled `--heap-*`/`--import*`/`--shared*` flag, the
+space-separated `--heap-base 0x10000`, `--import-memory=<anything>`, a bare `--shared-memory` or
+one outside 1..65536, or a repeated layout flag
 exits 2 instead of quietly building the default layout. A unit that allocates from
 `std:buffer` under `--import-memory` with no `--heap-base` builds, with a warning: its heap
-starts at 1024, like every other such unit.
+starts at 1024, like every other such unit. With `--shared-memory` too, the warning names the
+instance hazard below instead.
 
 #### Linking units to ONE memory (the provider recipe)
 
@@ -680,7 +683,16 @@ wasm-merge env.wasm env a.wasm a b.wasm b -o linked.wasm \
 
 The result imports exactly one memory, `host.memory`, and needs no multi-memory support. The
 provider cannot itself import `env.memory`, and `linked.wasm` re-exports it as `memory`.
+
 Without the provider, `wasm-merge` keeps one memory import per unit (multi-memory).
+**Under `--shared-memory`, at most ONE instance may allocate from `std:buffer`.** Each instance
+has its own bump pointer over the same build-time heap window, so two allocating instances of
+one module hand out the same addresses, and no `--heap-base` separates instances of one build;
+the others manage their own address ranges. Top-level code runs once per instance. `vl build
+--import-memory --shared-memory` warns when the unit allocates.
+
+Units built with `--shared-memory=<pages>` need a provider that imports the memory shared with
+the same max, `(memory 1 <pages> shared)`, and `--enable-threads` on the `wasm-merge` line.
 
 #### Linking units' `extern` names through a facade (the facade recipe)
 

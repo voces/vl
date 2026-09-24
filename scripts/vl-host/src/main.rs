@@ -470,6 +470,9 @@ program verbatim — the only way to pass one that starts with `-`.
                        — numbers and booleans, never a bare string — and only
                        when stdout is a terminal; --batch output is never
                        colored
+  {c}--shared-memory={r}<pages>
+                       Run the program over a SHARED linear memory with that
+                       max, as `vl build --shared-memory` would define it
   {c}-O, -O3, --names, --wat, --no-validate{r}
                        Accepted for symmetry with `vl build`; no effect here
                        (run compiles in memory and writes no artifact)
@@ -524,6 +527,15 @@ program verbatim — the only way to pass one that starts with `-`.
                       memory. HAZARD: each unit's std:buffer
                       allocator starts at the same address unless each is
                       given its own window (below)
+  {c}--shared-memory={r}<pages>
+                      Declare the linear memory SHARED with a max of <pages>
+                      64 KiB pages (1..65536), imported or defined alike, so
+                      one memory can back several instances (Web Workers).
+                      Only the memory is shared: each instance keeps its own
+                      GC heap and globals, and runs top-level code once.
+                      HAZARD: at most ONE instance may allocate from
+                      std:buffer — each instance's allocator hands out the
+                      same addresses. Growth stops at the max
   {c}--heap-base={r}<addr>  First byte std:buffer may hand out (default 1024;
                       decimal or 0x hex, a nonzero multiple of 8)
   {c}--heap-limit={r}<addr> One past the last (a multiple of 8); a Buffer() past it
@@ -970,6 +982,10 @@ fn embedded_std_hash() -> String {
 fn gc_engine(collector: Collector, initial: u64) -> Result<Engine> {
     let mut cfg = gc_config(collector);
     cfg.gc_heap_initial_size(initial);
+    // A `--shared-memory` module's memory. wasmtime reads this flag only when it creates a
+    // shared memory — no codegen, no engine hash — so a module without one pays nothing.
+    cfg.wasm_threads(true);
+    cfg.shared_memory(true);
     Engine::new(&cfg)
 }
 
@@ -2791,9 +2807,31 @@ macro_rules! phase {
 #[derive(Clone, Copy, Default)]
 struct LinkOpts {
     import_memory: bool,
+    /// `--shared-memory=<pages>`: the memory's declared max, which makes it shared.
+    shared_pages: Option<i32>,
     /// `(base, limit)`, already validated by `parse_heap_window`.
     heap: Option<(i32, i32)>,
 }
+
+/// The largest page count an i32-addressed memory can declare (4 GiB).
+const SHARED_PAGES_MAX: i64 = 65536;
+
+/// `--shared-memory=<pages>`'s value: plain decimal digits (no sign, no `_`) naming a page count
+/// in [1, 65536]; the error is the sentence each command prints before exiting 2.
+fn parse_shared_pages(raw: &str) -> std::result::Result<i32, String> {
+    let digits = !raw.is_empty() && raw.bytes().all(|b| b.is_ascii_digit());
+    match raw.parse::<i64>() {
+        Ok(n) if digits && (1..=SHARED_PAGES_MAX).contains(&n) => Ok(n as i32),
+        _ => Err(format!(
+            "`--shared-memory={raw}` — expected the memory's maximum in 64 KiB pages, a \
+             decimal count from 1 to {SHARED_PAGES_MAX}"
+        )),
+    }
+}
+
+/// The sentence for a bare `--shared-memory`, shared by `vl build` and `vl run`.
+const SHARED_MEMORY_BARE: &str = "`--shared-memory` takes the memory's maximum after `=`: \
+     `--shared-memory=<pages>` (a shared memory must declare one)";
 
 /// The refusal for a link flag the seed has no setter for.
 fn stale_seed_for(flag: &str, export: &str) -> Error {
@@ -2814,6 +2852,7 @@ const HEAP_LIMIT_DEFAULT: i64 = (i32::MAX as i64) & !7;
 /// alignment), the base is nonzero (a `Buf` at 0 must stay impossible), limit >= base.
 fn parse_link_opts(args: &[String]) -> LinkOpts {
     let mut import_memory = false;
+    let mut shared_pages: Option<i32> = None;
     let mut base: Option<i64> = None;
     let mut limit: Option<i64> = None;
     let parse = |name: &str, raw: &str| -> i64 {
@@ -2843,6 +2882,13 @@ fn parse_link_opts(args: &[String]) -> LinkOpts {
                 "`--import-memory={v}` — the flag takes no value; the import is always \
                  `env.memory`"
             ));
+        } else if let Some(v) = a.strip_prefix("--shared-memory=") {
+            if shared_pages.is_some() {
+                usage_exit("`--shared-memory=` is given twice — give it once");
+            }
+            shared_pages = Some(parse_shared_pages(v).unwrap_or_else(|m| usage_exit(&m)));
+        } else if a == "--shared-memory" {
+            usage_exit(SHARED_MEMORY_BARE);
         } else if let Some(v) = a.strip_prefix("--heap-base=") {
             once(&base, "--heap-base");
             base = Some(parse("--heap-base", v));
@@ -2851,14 +2897,15 @@ fn parse_link_opts(args: &[String]) -> LinkOpts {
             limit = Some(parse("--heap-limit", v));
         } else if a == "--heap-base" || a == "--heap-limit" {
             usage_exit(&format!("`{a}` takes its value after `=`: `{a}=<addr>`"));
-        } else if a.starts_with("--heap") || a.starts_with("--import") {
+        } else if a.starts_with("--heap") || a.starts_with("--import") || a.starts_with("--shared")
+        {
             usage_exit(&format!(
                 "unknown layout flag `{a}` — the layout flags are `--import-memory`, \
-                 `--heap-base=<addr>` and `--heap-limit=<addr>`"
+                 `--shared-memory=<pages>`, `--heap-base=<addr>` and `--heap-limit=<addr>`"
             ));
         }
     }
-    LinkOpts { import_memory, heap: heap_window(base, limit) }
+    LinkOpts { import_memory, shared_pages, heap: heap_window(base, limit) }
 }
 
 /// Validates a window from the two optional ends, or `None` when neither is given.
@@ -3206,6 +3253,16 @@ fn compile_vl_instance(
             .get_typed_func::<i32, i32>(&mut store, "setImportMemory")
             .map_err(|_| stale_seed_for("--import-memory", "setImportMemory"))?;
         set.call(&mut store, 1)?;
+    }
+    // `--shared-memory=<pages>`: refused on an old seed for the same reason — a module whose
+    // memory is not shared cannot back two instances, and fails only when a host tries.
+    if let Some(pages) = link.shared_pages {
+        let set = inst
+            .get_typed_func::<i32, i32>(&mut store, "setSharedMemory")
+            .map_err(|_| stale_seed_for("--shared-memory", "setSharedMemory"))?;
+        if set.call(&mut store, pages)? != 0 {
+            bail!("the compiler refused a shared memory of {pages} pages");
+        }
     }
     // `--heap-base=` / `--heap-limit=`: refused on an old seed for the same reason — a
     // module that ignored its window would allocate over whatever the host put there.
@@ -4888,6 +4945,16 @@ const BINARYEN_FEATURES: &[&str] = &[
     "--enable-simd",
 ];
 
+/// `BINARYEN_FEATURES`, plus `--enable-threads` for a `--shared-memory` build: binaryen refuses
+/// a shared memory without it. Added only there, so a default build's binaryen run is unchanged.
+fn binaryen_features(shared: bool) -> Vec<&'static str> {
+    let mut f = BINARYEN_FEATURES.to_vec();
+    if shared {
+        f.push("--enable-threads");
+    }
+    f
+}
+
 /// `vl build -O` — the SHRINK rung. One `-O` pass, open world. It melts a scratch
 /// allocation that reaches its uses in straight-line code (records, list literals,
 /// and a single-armed producer even across a call, since `-O` inlines). It melts
@@ -5679,7 +5746,12 @@ fn rename_functions(
 /// from everything else, inline them in one `wasm-opt` run, then give every function back the
 /// name it had, or none. Answers the rewritten bytes (also left at `path`), or `None` when no
 /// callee is chosen and the module is untouched.
-fn escape_inline_step(path: &str, flag: &str, bytes: &[u8]) -> Result<Option<Vec<u8>>> {
+fn escape_inline_step(
+    path: &str,
+    flag: &str,
+    bytes: &[u8],
+    shared: bool,
+) -> Result<Option<Vec<u8>>> {
     let Some(scan) = ModuleScan::parse(bytes) else {
         return Ok(None);
     };
@@ -5700,7 +5772,7 @@ fn escape_inline_step(path: &str, flag: &str, bytes: &[u8]) -> Result<Option<Vec
         return Ok(None);
     };
     std::fs::write(path, &named)?;
-    optimize_in_place(path, flag, ESCAPE_INLINE_PASSES, &[])?;
+    optimize_in_place(path, flag, ESCAPE_INLINE_PASSES, &[], shared)?;
     let stepped = std::fs::read(path)
         .map_err(|e| Error::from(e).context(format!("reading back the {flag}'d `{path}`")))?;
     // Inlining removes functions, so the step's output numbers them anew; the prefixed names
@@ -5763,7 +5835,13 @@ const BINARYEN_CORES_DEFAULT: usize = 4;
 /// tests carry hand-written guards that exist only to detect this. A plain
 /// `vl build` never calls this function, so a toolchain without binaryen keeps
 /// working for every build that did not ask to be optimized.
-fn optimize_in_place(path: &str, flag: &str, passes: &[&str], no_inline: &[String]) -> Result<()> {
+fn optimize_in_place(
+    path: &str,
+    flag: &str,
+    passes: &[&str],
+    no_inline: &[String],
+    shared: bool,
+) -> Result<()> {
     let Some(opt) = binaryen_tool("wasm-opt", "VL_WASM_OPT") else {
         // The unoptimized module is already on disk at this point. Leaving it there
         // would re-open the hole from the other side: a caller that ignores the exit
@@ -5785,7 +5863,8 @@ fn optimize_in_place(path: &str, flag: &str, passes: &[&str], no_inline: &[Strin
     let mut argv: Vec<&str> = vec![path];
     argv.extend(marks.iter().map(String::as_str));
     argv.extend_from_slice(passes);
-    argv.extend_from_slice(BINARYEN_FEATURES);
+    let features = binaryen_features(shared);
+    argv.extend_from_slice(&features);
     argv.extend_from_slice(&["-o", path]);
     let mut cmd = std::process::Command::new(&opt);
     cmd.args(&argv);
@@ -5812,13 +5891,14 @@ fn optimize_in_place(path: &str, flag: &str, passes: &[&str], no_inline: &[Strin
 /// tolerates bulk-memory opcodes either way (rc=0 both), so this flag changes nothing
 /// today — the shared `BINARYEN_FEATURES` is what keeps the binaryen call sites from
 /// drifting apart. A missing `wasm-dis` is a soft no-op (the `.wasm` is already written).
-fn disassemble_to_wat(wasm_path: &str, wat_path: &str) -> Result<()> {
+fn disassemble_to_wat(wasm_path: &str, wat_path: &str, shared: bool) -> Result<()> {
     let Some(dis) = binaryen_tool("wasm-dis", "VL_WASM_DIS") else {
         binaryen_missing_note("--wat", "wasm-dis", "VL_WASM_DIS", "skipped the .wat");
         return Ok(());
     };
     let mut argv: Vec<&str> = vec![wasm_path];
-    argv.extend_from_slice(BINARYEN_FEATURES);
+    let features = binaryen_features(shared);
+    argv.extend_from_slice(&features);
     argv.extend_from_slice(&["-o", wat_path]);
     let status = std::process::Command::new(&dis)
         .args(&argv)
@@ -5887,6 +5967,7 @@ fn compile_and_run(
     source_path: &str,
     run_engine: &Engine,
     palette: Palette,
+    link: LinkOpts,
 ) -> Result<()> {
     let compile_engine = compile_engine(source.len())?;
     // `_located`, so a module the engine refuses can still be traced back to the
@@ -5899,7 +5980,7 @@ fn compile_and_run(
             source_path,
             "compileSrc",
             Names::Full,
-            LinkOpts::default(),
+            link,
         )?;
     match run_program(run_engine, &bytes, palette) {
         Err(e) => Err(locate_invalid_module(e, session, source_path)),
@@ -5968,6 +6049,9 @@ fn run_cmd(args: &[String]) -> Result<()> {
     }
     let mut compiler: Option<String> = None;
     let mut inline: Option<String> = None;
+    // `--shared-memory=<pages>`, the one link flag `vl run` takes: it changes the memory's
+    // type, not who supplies it, so the run still creates the memory itself.
+    let mut link = LinkOpts::default();
     // `auto` unless the caller says otherwise — see `ColorChoice`.
     let mut color = ColorChoice::Auto;
     // Positionals in order, before the file/argument split is made. The split cannot
@@ -6003,6 +6087,15 @@ fn run_cmd(args: &[String]) -> Result<()> {
                  instantiate it from a host that provides `env.memory`",
                 None,
             ),
+            a if a.starts_with("--shared-memory=") => {
+                if link.shared_pages.is_some() {
+                    arg_error("`--shared-memory=` is given twice — give it once", None);
+                }
+                let raw = &a["--shared-memory=".len()..];
+                link.shared_pages =
+                    Some(parse_shared_pages(raw).unwrap_or_else(|m| arg_error(&m, None)));
+            }
+            "--shared-memory" => arg_error(SHARED_MEMORY_BARE, None),
             a if a.starts_with("--heap-base=") || a.starts_with("--heap-limit=") => arg_error(
                 &format!(
                     "`{a}` lays out a module for a host that shares its memory — it is a \
@@ -6073,6 +6166,16 @@ fn run_cmd(args: &[String]) -> Result<()> {
             let raw = std::fs::read(f)
                 .map_err(|e| Error::from(e).context(format!("reading `{f}`")))?;
             if raw.starts_with(b"\0asm") {
+                // A prebuilt module's memory type was fixed when it was built.
+                if link.shared_pages.is_some() {
+                    arg_error(
+                        &format!(
+                            "`--shared-memory` shapes the module `vl run` compiles, and `{f}` is \
+                             already built — its memory is whatever `vl build` declared"
+                        ),
+                        None,
+                    );
+                }
                 return finish_gc_stats(gc_stats, run_program(&run_engine, &raw, palette));
             }
             let source = String::from_utf8(raw).map_err(|e| {
@@ -6081,7 +6184,7 @@ fn run_cmd(args: &[String]) -> Result<()> {
             })?;
             return finish_gc_stats(
                 gc_stats,
-                compile_and_run(&compiler, &source, f, &run_engine, palette),
+                compile_and_run(&compiler, &source, f, &run_engine, palette, link),
             );
         }
     }
@@ -6105,7 +6208,7 @@ fn run_cmd(args: &[String]) -> Result<()> {
     }
     finish_gc_stats(
         gc_stats,
-        compile_and_run(&compiler, &source, "source.vl", &run_engine, palette),
+        compile_and_run(&compiler, &source, "source.vl", &run_engine, palette, link),
     )
 }
 
@@ -7742,6 +7845,7 @@ fn build_cmd(args: &[String]) -> Result<()> {
     // `--import-memory`: the module imports `env.memory` instead of defining and exporting
     // it (DECISIONS.md §"Linear memory is a layout contract").
     let link = parse_link_opts(args);
+    let shared = link.shared_pages.is_some();
     // `_located`, so a written module the engine refuses names the function it came
     // from (D1578). The instance is read only on that failure path.
     let (mut bytes, mut session) = compile_vl_located(
@@ -7755,7 +7859,22 @@ fn build_cmd(args: &[String]) -> Result<()> {
     )?;
     // A unit sharing a host's memory that allocates with no window of its own starts at
     // the default base, as every other such unit does. Legal, so a warning, not a refusal.
-    if link.import_memory && link.heap.is_none() {
+    // Over a SHARED import the hazard is between instances of this one module instead: each
+    // has its own bump pointer over the same window, so no `--heap-base` can separate them.
+    if link.import_memory && link.shared_pages.is_some() {
+        if let Some((store, inst)) = session.as_mut() {
+            if let Ok(read) = inst.get_typed_func::<(), i32>(&mut *store, "heapWindowRead") {
+                if read.call(&mut *store, ())? != 0 {
+                    eprintln!(
+                        "vl build: warning: `{input}` allocates from std:buffer over a shared \
+                         memory; every instance of it hands out the SAME addresses, so at most \
+                         one instance may allocate — the others must manage their own address \
+                         ranges (--heap-base cannot separate instances of one module)"
+                    );
+                }
+            }
+        }
+    } else if link.import_memory && link.heap.is_none() {
         if let Some((store, inst)) = session.as_mut() {
             if let Ok(read) = inst.get_typed_func::<(), i32>(&mut *store, "heapWindowRead") {
                 if read.call(&mut *store, ())? != 0 {
@@ -7818,12 +7937,12 @@ fn build_cmd(args: &[String]) -> Result<()> {
         // The escape step goes first, so the rung's own passes (`--heap2local` among them)
         // see each per-call struct and its uses in one function. It renumbers functions, so
         // the run-once marks are read off its output, not off `bytes`.
-        let stepped = phase!("opt.escape_step", escape_inline_step(&sink_str, flag, &bytes))?;
+        let stepped = phase!("opt.escape_step", escape_inline_step(&sink_str, flag, &bytes, shared))?;
         let rung_input: &[u8] = stepped.as_deref().unwrap_or(&bytes);
         let mut passes = rung_passes(passes, names);
         let (no_inline, extra) = phase!("opt.run_once_scan", rung_scan(rung_input));
         passes.extend(extra);
-        phase!("opt.rung", optimize_in_place(&sink_str, flag, &passes, &no_inline))?;
+        phase!("opt.rung", optimize_in_place(&sink_str, flag, &passes, &no_inline, shared))?;
         final_bytes = Some(std::fs::read(&sink).map_err(|e| {
             Error::from(e).context(format!("reading back the {flag}'d `{out_label}`"))
         })?);
@@ -7841,7 +7960,7 @@ fn build_cmd(args: &[String]) -> Result<()> {
     // Refused above under `-o -`, which has no path to write beside.
     if args.iter().any(|a| a == "--wat") {
         let wat = format!("{}.wat", out.strip_suffix(".wasm").unwrap_or(&out));
-        disassemble_to_wat(&out, &wat)?;
+        disassemble_to_wat(&out, &wat, shared)?;
     }
     // `-o -`: the module reaches stdout here and the borrowed temporary goes away.
     // BEFORE validation, so the stream mirrors the file case exactly — a module the

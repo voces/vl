@@ -6508,6 +6508,53 @@ A `vl link` command wrapping the recipe is a separate follow-up. Pinned by
 `tests/vl_import_memory_test.ts`, including the two-unit collision, its fix, and the recipe's one
 memory.
 
+## A shared memory is a build flag: `--shared-memory=<pages>` (owner, 2026-09-24) — plumb's parallel guest threads
+
+**The ask:** plumb runs each guest thread in its own Web Worker over ONE memory, so the module must
+take a memory that several instances share. **Approved as a raw, opt-in feature, and only that**:
+VL gains no threading model and no shared GC objects. Only LINEAR memory is shared; each instance
+keeps its own GC heap, globals and `std:buffer` bump pointer.
+
+- **`vl build --shared-memory=<pages>`** declares the one memory shared — limits flag `0x03`, min 1
+  page as today, max `<pages>` (1..65536). A shared memory must declare a max, so the ceiling is
+  chosen at build time and is part of the module's contract with its host (webcraft A5's answer
+  2).
+- **With `--import-memory` the IMPORT is shared; without it the module DEFINES and exports a
+  shared memory.** Defining was chosen over refusing because it is the one shape `vl run` can
+  execute (it owns the memory it creates and supplies no imports), so the host path is testable,
+  and because a single instance exporting a SharedArrayBuffer-backed memory is itself useful: a
+  JS render thread can read it and a grow never detaches its views. Several instances sharing
+  one memory still need `--import-memory`, since each instance of a module that defines its
+  memory gets its own.
+- **At most ONE instance may allocate from `std:buffer` over a shared memory.** The bump pointer
+  is a per-instance mutable global over a heap window fixed at build time, so every instance of
+  one module hands out the SAME addresses: a second instance's first `Buffer` lands on the
+  first's live allocation (pinned by the two-Worker test). `--heap-base` cannot separate them —
+  it is baked per BUILD, and every instance of one build shares it — and the grow helper reads
+  `memory.size` then grows, which is not atomic across instances. The other instances manage
+  their own address ranges with the raw loads and stores, which is what plumb does. Top-level
+  code also runs once PER INSTANCE, so a module-scope `Buffer(...)` allocates in each. `vl build
+  --import-memory --shared-memory` warns when the unit allocates from `std:buffer`. VL emits no
+  data segments, so instantiating a later instance writes nothing into the shared memory.
+- **A per-build flag, never an emitter default** (webcraft A5's answer 3): the seed uses linear
+  memory itself. A default build is byte-identical; a module that touches no linear memory has
+  no memory to share and the flag changes none of its bytes.
+- **Growth is bounded by the max and fails the way it always did.** `memory.grow` past the max
+  answers -1; `std:buffer`'s `Buffer` then traps, as it does for any refused growth, rather than
+  handing out a `Buf` with no memory behind it. The only grow in the compiler's output is the
+  `__memory_grow__` intrinsic, so there is no other path to audit.
+- **binaryen gets `--enable-threads` only on a shared build** (`-O`, `-O3`, `--wat`), so a
+  default build's binaryen run is unchanged. **The `vl` host enables wasmtime's
+  `shared_memory` on the user-program engine unconditionally**: wasmtime reads the flag only when
+  it creates a shared memory (not in codegen, not in the engine's compatibility hash), and the
+  threads proposal it needs is already on by default, so a module without a shared memory pays
+  nothing. `wasm_threads(true)` is set beside it for the reader, and is a no-op: `threads` is a
+  default wasmtime feature, which already turns the proposal on.
+
+Atomics are a separate lane; wrappers over the raw intrinsics are queued in `ROADMAP.md`, each
+through the std review. Pinned by `tests/vl_shared_memory_test.ts`, which runs one module in two
+Workers over one `WebAssembly.Memory({ shared: true })`.
+
 ## Globals cross the wasm boundary: `extern let` imports one, the entry's `export let` exports one (owner, 2026-09-22) — plumb PL-003(b)
 
 **The ask:** plumb links ~150 separately compiled units that all touch the x86 register file.

@@ -52,6 +52,8 @@ CLASSIFIED = {
                                 "a 9.6 MB module read out whole: V8 runs it and prints the sum"),
     "vl_reexport_abi_test.ts": ("standalone", "native vl build",
                                 "EXPORT section aliases the public name"),
+    "vl_shared_memory_test.ts": ("standalone", "native vl build + vl run",
+                                 "shared memory: limits, two Workers over one memory, growth to the max"),
     "vl_std_process_test.ts": ("standalone", "native vl build",
                                "std:process / std:env across both hosts"),
     "vl_std_fs_write_test.ts": ("standalone", "native vl build",
