@@ -47,10 +47,13 @@ import {
   opIdxFnAtNode,
   optCallRestamp,
   recordNodeTyFrom,
+  tyArrayElemIx,
   tyFieldTyOf,
   tyHasTyVar,
   tyIsLitUnion,
+  tyIsLitUnionOrLit,
   tyIsNulValueUnionBox,
+  tySame,
   tyToEmitName,
   voidCoerceValAt,
   voidCoerceValCount,
@@ -61,7 +64,9 @@ import {
   AsExpr,
   BinExpr,
   Block,
+  BoolLit,
   Call,
+  CharLit,
   FieldInit,
   ForIn,
   ForRange,
@@ -95,7 +100,9 @@ import {
   mkBareBlockIf,
   mkBinary,
   mkBlock,
+  mkBool,
   mkCall,
+  mkChar,
   mkFunc,
   mkIdent,
   mkIf,
@@ -106,6 +113,7 @@ import {
   mkNum,
   mkOptMember,
   mkParam,
+  mkStr,
   nodeValueSpineChildren,
   orderArgsByParamNames,
   paramDefaultIsCallsite,
@@ -1531,6 +1539,79 @@ function cboxScan(ix: i32, depth: i32, dlets: string[], alam: string[]) {
   0
 }
 
+// The boxed name on the left of `n` when `n` is a `??` or an `=` (`c ?? d`, `(c) = e`) and no
+// nested binding shadows it, or "".
+function cboxTypedLeftName(n: BinExpr, boxed: string[]) {
+  if n.binOp != "??" && n.binOp != "=" { return "" }
+  const l = P.nodes[unwrapParen(n.binLeft)]
+  if l is Ident {
+    if capHas(boxed, l.identName) && (cboxShadow[l.identName] ?? 0) == 0 {
+      return l.identName
+    }
+  }
+  ""
+}
+
+// An un-annotated function whose value is a write `v = e` to a boxed cell yields `e` at the
+// assignment's type; a re-read of `v[0]` yields the cell's. Where they differ (`Q` into
+// `Q | null`) the tail becomes `const t = e; v = t; t`, arm by arm under a tail `if`; a
+// literal `e` keeps its store and is yielded as a copy, since the store encodes an atom (D2285).
+let cboxYieldCtr = 0
+function cboxYieldTail(blockIx: i32, boxed: string[]) {
+  const b = P.nodes[blockIx]
+  if !(b is Block) { return 0 }
+  const st = b.blkStmts
+  if st.length == 0 { return 0 }
+  const tx = st[st.length - 1]
+  const tn = P.nodes[tx]
+  if tn is IfStmt {
+    if tn.ifElse < 0 { return 0 }
+    cboxYieldTail(tn.ifThen, boxed)
+    if P.nodes[tn.ifElse] is IfStmt {
+      const eb: i32[] = []
+      eb.push(tn.ifElse)
+      tn.ifElse = mkBlock(eb, -1)
+    }
+    return cboxYieldTail(tn.ifElse, boxed)
+  }
+  if !(tn is BinExpr) { return 0 }
+  const nm = cboxTypedLeftName(tn, boxed)
+  if nm == "" || tn.binOp != "=" { return 0 }
+  if P.nodes[unwrapParen(tn.binRight)] is NullLit { return 0 }
+  const elemTy = tyArrayElemIx(cboxCellTy[nm] ?? -1)
+  const valTy = nodeTyIxOf(tx)
+  if elemTy < 0 || valTy < 0 || tySame(elemTy, valTy) { return 0 }
+  if tyIsLitUnionOrLit(elemTy) { return 0 }
+  const lit = cboxLitCopy(tn.binRight)
+  if lit >= 0 {
+    nodeTyRecord(lit, valTy)
+    st.push(lit)
+    return 0
+  }
+  const tname = "__cbv" + i32ToStr(cboxYieldCtr)
+  cboxYieldCtr = cboxYieldCtr + 1
+  const tlet = mkLet("const", tname, -1, tn.binRight, -1)
+  const store = mkIdent(tname, -1)
+  nodeTyRecord(store, valTy)
+  tn.binRight = store
+  const yielded = mkIdent(tname, -1)
+  nodeTyRecord(yielded, valTy)
+  st[st.length - 1] = tlet
+  st.push(tx)
+  st.push(yielded)
+  0
+}
+
+// A fresh copy of the literal at `ix` (string, number, char, boolean), or -1 for any other node.
+function cboxLitCopy(ix: i32) {
+  const n = P.nodes[unwrapParen(ix)]
+  if n is StrLit { return mkStr(n.strText, -1) }
+  if n is NumLit { return mkNum(n.numText, -1) }
+  if n is CharLit { return mkChar(n.charText, -1) }
+  if n is BoolLit { return mkBool(n.boolVal, -1) }
+  -1
+}
+
 // How many nested function bodies `cboxWalk` is inside; a binding opened at depth 0 is the
 // maker's own and is boxed, one opened deeper shadows the maker's name.
 let cboxDepth = 0
@@ -1545,8 +1626,8 @@ function cboxWalk(ix: i32, boxed: string[]) {
   if n is Ident {
     if capHas(boxed, n.identName) && (cboxShadow[n.identName] ?? 0) == 0 {
       // The cell `c` carries the type of its list, so an element question about `c[0]` has
-      // the binding's declared type to answer from. The read `c[0]` itself stays untyped:
-      // `assignTargetReReads` takes that as the mark of a captured cell.
+      // the binding's declared type to answer from. The read `c[0]` itself is untyped here;
+      // only the left of a `??` or `=` is typed, by the `BinExpr` arm.
       const cell = mkIdent(n.identName, -1)
       const cellTy = cboxCellTy[n.identName] ?? -1
       if cellTy >= 0 { nodeTyRecord(cell, cellTy) }
@@ -1557,6 +1638,9 @@ function cboxWalk(ix: i32, boxed: string[]) {
   if n is FuncDecl {
     const fmark = cboxShTrail.length
     cboxShadowParams(ix)
+    if n.fnRet < 0 && !lambdaVoidAdoptedAt(ix) {
+      cboxYieldTail(n.fnBody, boxed)
+    }
     cboxDepth = cboxDepth + 1
     n.fnBody = cboxWalk(n.fnBody, boxed)
     cboxDepth = cboxDepth - 1
@@ -1588,33 +1672,47 @@ function cboxWalk(ix: i32, boxed: string[]) {
       if n.letType >= 0 {
         const lt = P.nodes[n.letType]
         if lt is TypeRef {
-          // The array type is constructed as one `mkArrayTy` over the element's recorded
-          // arena index, not re-parsed from the appended `[]` name. Gated on the name being
-          // a single top-level atom: `nm + "[]"` is an array spelling only then — `"i32 |
-          // string" + "[]"` denotes `i32 | (string[])`, so a composite keeps the name path.
-          let boxedTy = -1
+          // The array type is one `mkArrayTy` over the element's recorded arena index, not
+          // re-parsed from the name. A composite element (`i32 | string`, `S | null`, a
+          // function type) is parenthesized, since `nm + "[]"` would bind to its last atom.
           const elemTy = nodeTyIxOf(n.letType)
-          if annUnionAtomsOf(n.letType) == 1 {
-            if annArrowAt(lt.tyName) < 0 {
-              if elemTy >= 0 { boxedTy = mkArrayTy(elemTy) }
-            }
-          }
-          // The cell's own type is the list of the declared type at every spelling; only the
-          // synthesized annotation's NAME is limited to the one-atom case above.
+          let boxedTy = -1
+          if elemTy >= 0 { boxedTy = mkArrayTy(elemTy) }
           if boxedTy >= 0 { cboxCellTy[n.letName] = boxedTy }
-          else if elemTy >= 0 { cboxCellTy[n.letName] = mkArrayTy(elemTy) }
-          n.letType = synthTypeRefTy(lt.tyName + "[]", -1, boxedTy)
+          let cellName = lt.tyName + "[]"
+          if annUnionAtomsOf(n.letType) != 1 || annArrowAt(lt.tyName) >= 0 {
+            cellName = "(" + lt.tyName + ")[]"
+          }
+          n.letType = synthTypeRefTy(cellName, -1, boxedTy)
         }
+      }
+      // An un-annotated binding's cell is the list of its init's recorded type, so a read
+      // `c[0]` classifies as the binding did (a `false` init reads back as a boolean).
+      if n.letType < 0 {
+        const initTy = nodeTyIxOf(n.letInit)
+        if initTy >= 0 { cboxCellTy[n.letName] = mkArrayTy(initTy) }
       }
       const els: i32[] = []
       els.push(n.letInit)
       n.letInit = mkArrayLit(els, -1)
+      nodeTyRecord(n.letInit, cboxCellTy[n.letName] ?? -1)
     }
     return ix
   }
   if n is BinExpr {
+    const leftName = cboxTypedLeftName(n, boxed)
     n.binLeft = cboxWalk(n.binLeft, boxed)
     n.binRight = cboxWalk(n.binRight, boxed)
+    // The left of a `??` or `=` is typed at the binding's declared type: the coalesce lowers
+    // from its operand's type (a closure may have written the cell since any narrowing), and
+    // an assignment re-reads its target as its value only where that type is the value's.
+    // A literal-union cell stays untyped: its re-read is the atom whatever the member (D2168).
+    if leftName != "" {
+      const elemTy = tyArrayElemIx(cboxCellTy[leftName] ?? -1)
+      if n.binOp == "??" || !tyIsLitUnionOrLit(elemTy) {
+        nodeTyRecord(unwrapParen(n.binLeft), elemTy)
+      }
+    }
     return ix
   }
   if n is IfStmt {
@@ -1729,7 +1827,7 @@ function cboxWalk(ix: i32, boxed: string[]) {
 }
 
 // The init of the maker's direct `let name` (searching statements, not descending into a
-// nested lambda or an expression), or -1 — gates boxing on a known element type.
+// nested lambda or an expression), or -1 — the box is built around it.
 function cboxInitOf(ix: i32, name: string) {
   if ix < 0 { return -1 }
   const n = P.nodes[ix]
@@ -1758,21 +1856,9 @@ function cboxInitOf(ix: i32, name: string) {
   -1
 }
 
-// True if `initIx` is a scalar literal (integer, float, or string). A captured-mutated
-// local with such an init boxes cleanly into a length-1 list of the matching scalar type,
-// covering the counter/accumulator case at every scalar type. A non-scalar-literal init
-// (struct, closure, call) is left to the loud error rather than mis-lowered.
-function cboxInitScalar(initIx: i32) {
-  if initIx < 0 { return false }
-  const n = P.nodes[initIx]
-  if n is NumLit { return true }
-  if n is StrLit { return true }
-  false
-}
-
 // Per top-level function: boxes each direct `let` that is assigned inside a nested lambda
-// where no binding of the lambda shadows it, and has a scalar-literal init. Usage-gated — a
-// program with no such local rewrites nothing (identical bytes).
+// where no binding of the lambda shadows it and that has an init, of any kind (D2285).
+// Usage-gated — a program with no such local rewrites nothing (identical bytes).
 export function captureBoxRewrite(_stmts: i32[]) {
   let fe = 0
   while fe < fnStmts.length {
@@ -1788,7 +1874,7 @@ export function captureBoxRewrite(_stmts: i32[]) {
       while di < dlets.length {
         const nm = dlets[di]
         if capHas(alam, nm) {
-          if cboxInitScalar(cboxInitOf(fn.fnBody, nm)) { boxed.push(nm) }
+          if cboxInitOf(fn.fnBody, nm) >= 0 { boxed.push(nm) }
         }
         di = di + 1
       }
@@ -1823,7 +1909,7 @@ function cboxModuleFrame() {
         init = cboxInitOf(startStmts[ii], nm)
         ii = ii + 1
       }
-      if cboxInitScalar(init) { boxed.push(nm) }
+      if init >= 0 { boxed.push(nm) }
     }
     di = di + 1
   }
