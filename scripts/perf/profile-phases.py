@@ -25,7 +25,7 @@ PHASES = [
     ("1 order+validate (modVisit)", {"modVisit"}),
     ("2 lex per module (vcLoadToksMod)", {"vcLoadToksMod", "vcLoadToksEntry", "vcLoadToks"}),
     ("2 parse per module (parseProgram)", {"parseProgram"}),
-    ("2b dup / builtin-decl screens", {"modCheckDupBindings", "modCheckBuiltinTyDecls"}),
+    ("2b dup / builtin-decl screens", {"modCheckDupBindings", "modCheckReservedDecls"}),
     ("3+4 rename + rewrite per module", {
         "modCollectSelfFns", "modBuildRename", "modBankUfcsScope", "ufcsModBoundAdd",
         "modRwStmt", "modRwDeclBase",
