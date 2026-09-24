@@ -2,12 +2,12 @@
 //
 //     import { Buffer, bufferMark, bufferRelease, loadI32, storeI32 } from "std:buffer"
 //
-// A `Buf` is an ordinary value describing an extent of linear memory, and a host reads those
-// bytes in place: the module exports its memory, or imports the host's. Only the typed views,
-// `window` and `storeBytes`/`loadBytes` check a range and trap; any other read past the end of
-// a `Buf` reads whatever is there. `base` and `length` are writable, on a view too; overwriting
-// either defeats the range check that reads it. `bufferRelease(mark)` invalidates later `Buf`s.
-// `Buffer` hands out only the build's heap window, [1024, 2 GiB) unless `vl build` moves it.
+// A `Buf` is an ordinary value describing an extent of linear memory that a host reads in
+// place. Only the typed views, `window` and `storeBytes`/`loadBytes` check a range and trap;
+// any other read past a `Buf`'s end, or through a view whose `base`/`length` was overwritten,
+// reads whatever is there. `bufferRelease(mark)` invalidates every later `Buf`. `Buffer` uses
+// only the heap window, [1024, 2 GiB) unless `vl build` moves it; under `--shared-memory` its
+// first 8 bytes hold the pointer all instances share, and a release frees only its own `Buf`s.
 
 // A linear-memory extent: the byte address of its first byte, and the number of
 // bytes the caller asked for. `.length` is a plain field read.
@@ -21,8 +21,8 @@ const PAGE_MASK = 65535
 // every width's natural alignment is satisfied at offset 0.
 const ALIGN = 8
 
-// How many bytes have been handed out, counted from the heap base; the bump pointer
-// is the base plus this. The base is never 0, so `base == 0` is never a `Buf`.
+// Bytes handed out, from the heap base; the base is never 0, so neither is a `Buf`'s.
+// Over a shared memory: where this instance's latest `Buf` ended, from the heap base + 8.
 let bumpOff = 0
 
 // `n` rounded up to the next multiple of `ALIGN`.
@@ -45,13 +45,51 @@ function ensureCapacity(end: i32) {
   }
 }
 
-// Reserve `n` zero-filled bytes and describe them. Bytes never handed out before
-// are zero for free; one reclaimed by `bufferRelease` holds what was written there.
-// Traps on a negative length, or when it would end past the heap limit (2 GiB by default).
-// Growing the memory DETACHES a host's views of it — re-take them afterwards.
+// Reserve `n` zero-filled bytes and describe them; a byte reclaimed by `bufferRelease`
+// holds what was written there. Traps on a negative length, or past the heap limit or the
+// memory's max. Growing the memory detaches (unshared) or outgrows (shared) a host's views of
+// it — re-take them.
 export function Buffer(byteLength: i32): Buf {
   if byteLength < 0 { __trap__() }
   const heap = __heap_base__()
+  if __memory_shared__() {
+    // The heap's first 8 bytes: bytes handed out (low word), and where the top run of
+    // one instance's back-to-back `Buf`s began (high word), both from `first`.
+    const first = heap + 8
+    // Grow before claiming, so a refused growth leaves the shared pointer where it was.
+    let want = first
+    while true {
+      let need = want >> PAGE_SHIFT
+      if (want & PAGE_MASK) != 0 { need = need + 1 }
+      let have = __memory_size__()
+      while need > have {
+        // `memory.size` can lag another instance's growth; `memory.grow(0)` cannot.
+        have = __memory_grow__(0)
+        if need > have {
+          // Refused with the size unchanged is the max refusing; otherwise look again.
+          if __memory_grow__(need - have) < 0 {
+            if __memory_grow__(0) == have { __trap__() }
+          }
+        }
+      }
+      const word = __atomic_load_i64__(heap)
+      const top = word as% i32
+      const base = first + top
+      if byteLength > __heap_limit__() - base { __trap__() }
+      const next = base + alignUp(byteLength)
+      if ((next - 1) >> PAGE_SHIFT) >= have {
+        want = next
+      } else {
+        let run = (word >> 32) as% i32
+        if top != bumpOff { run = top }
+        const claimed = ((run as i64) << 32) | ((next - first) as i64)
+        if __atomic_rmw_cmpxchg_i64__(heap, word, claimed) == word {
+          bumpOff = next - first
+          return { base: base, length: byteLength }
+        }
+      }
+    }
+  }
   const base = heap + bumpOff
   // The window's ends are multiples of 8, so a length that fits still fits once
   // rounded up — and the comparison cannot overflow, unlike `base + length`.
@@ -63,14 +101,47 @@ export function Buffer(byteLength: i32): Buf {
 }
 
 // The current bump pointer, to hand back to `bufferRelease`.
-export function bufferMark(): i32 { return __heap_base__() + bumpOff }
+export function bufferMark(): i32 {
+  if __memory_shared__() {
+    const heap = __heap_base__()
+    // No header page yet means nothing was ever handed out.
+    const page = heap >> PAGE_SHIFT
+    if page >= __memory_size__() && page >= __memory_grow__(0) {
+      return heap + 8
+    }
+    return heap + 8 + (__atomic_load_i64__(heap) as% i32)
+  }
+  return __heap_base__() + bumpOff
+}
 
-// Reclaim everything allocated since `mark`, in one move. Every `Buf` allocated
-// after `mark` DANGLES: reads answer another buffer's bytes and writes corrupt
-// them silently, because nothing is out of bounds. Traps on a `mark` outside
-// `[heap base, bump pointer]` — which a mark held across an earlier release is.
+// Reclaim every `Buf` since `mark`; treat each as dangling either way — reads and writes
+// through one go wrong silently. Traps on a misaligned `mark`, one below the first `Buf`, or
+// (unshared) one past the pointer; a stale mark need not trap. Shared, it reclaims nothing
+// unless this instance made every `Buf` from `mark` up, last and back to back; else it leaks.
 export function bufferRelease(mark: i32) {
   const heap = __heap_base__()
+  if __memory_shared__() {
+    const first = heap + 8
+    if mark < first { __trap__() }
+    if (mark & 7) != 0 { __trap__() }
+    const page = heap >> PAGE_SHIFT
+    if page >= __memory_size__() && page >= __memory_grow__(0) { return }
+    while true {
+      const word = __atomic_load_i64__(heap)
+      const top = word as% i32
+      // Only this instance's own run at the top can go; anything else is kept. A mark past
+      // the pointer is one another instance's release rewound below, not a caller's error.
+      if mark > first + top { return }
+      if top != bumpOff { return }
+      const run = (word >> 32) as% i32
+      if mark - first < run { return }
+      const kept = ((run as i64) << 32) | ((mark - first) as i64)
+      if __atomic_rmw_cmpxchg_i64__(heap, word, kept) == word {
+        bumpOff = mark - first
+        return
+      }
+    }
+  }
   if mark < heap { __trap__() }
   if mark > heap + bumpOff { __trap__() }
   if (mark & 7) != 0 { __trap__() }

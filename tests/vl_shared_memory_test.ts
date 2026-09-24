@@ -3,7 +3,8 @@
 // The flag declares the one memory SHARED (limits flag 0x03) with a max of <pages>, imported
 // (`--import-memory`) or defined alike. It is what lets one module run in several Web Workers
 // over one `WebAssembly.Memory({ shared: true })`; only the memory is shared, each instance keeps
-// its own GC heap and globals. DECISIONS.md §"A shared memory is a build flag" has the rationale.
+// its own GC heap and globals. DECISIONS.md §"A shared memory is a build flag" has the rationale,
+// and §"std:buffer's allocator over a shared memory" the allocator every instance shares.
 //
 // Gated like the other native suites (binary + seed); the `-O` rows also need binaryen's
 // `wasm-opt` under `node_modules/.bin`. The `vl_` prefix puts it in the ci-native glob.
@@ -196,24 +197,24 @@ Deno.test({
   },
 });
 
-// Every byte outside the memory's limits is the default build's: the flag changes the memory's
-// type and nothing else, over real programs (the default path's own identity is the fixpoint's).
+// Every byte outside the memory's limits is the default build's, for a unit that does not
+// import `std:buffer` (the default path's own identity is the fixpoint's). A unit that does
+// gets the shared allocator instead, so its code differs — pinned below.
+const RAW = `__store_i32__(4096, 7)
+__memory_fill__(4100, 1, 4)
+print(__load_i32__(4096) + __load_i32__(4100))
+`;
+
 Deno.test({
-  name: "shared-memory: over bench programs the flag moves only the memory's limits",
+  name: "shared-memory: for a unit without std:buffer the flag moves only the memory's limits",
   ignore: !ENABLED,
   async fn() {
-    const programs = [
-      "bench/buffer-view-bounds/axpy-buf.vl",
-      "bench/buffer-view-bounds/reduce-view.vl",
-      "bench/buffer-view-bounds/rows-buf.vl",
-    ];
-    for (const p of programs) {
-      const path = `${ROOT}/${p}`;
-      const plain = await build({ path });
-      const shared = await build({ path }, ["--shared-memory=256"]);
+    for (const [what, src] of [["POKE", POKE], ["RAW", RAW]]) {
+      const plain = await build(src);
+      const shared = await build(src, ["--shared-memory=256"]);
       const a = memoryLimits(plain), b = memoryLimits(shared);
-      eq(a && { flag: a.flag, max: a.max }, { flag: 0, max: null }, `${p} default limits`);
-      eq(b && { flag: b.flag, max: b.max }, { flag: 3, max: 256 }, `${p} shared limits`);
+      eq(a && { flag: a.flag, max: a.max }, { flag: 0, max: null }, `${what} default limits`);
+      eq(b && { flag: b.flag, max: b.max }, { flag: 3, max: 256 }, `${what} shared limits`);
       // Swap the shared build's limits (03 01 80 02) for the default's (00 01): the same bytes.
       const s5 = sections(shared).find((s) => s.id === 5)!;
       const p5 = sections(plain).find((s) => s.id === 5)!;
@@ -222,10 +223,41 @@ Deno.test({
         ...plain.slice(p5.start - 1, p5.end),
         ...shared.slice(s5.end),
       ]);
-      eq(back.length, plain.length, `${p} length once the limits are swapped back`);
+      eq(back.length, plain.length, `${what} length once the limits are swapped back`);
       if (!back.every((x, i) => x === plain[i])) {
-        throw new Error(`${p}: the shared build differs outside the memory section`);
+        throw new Error(`${what}: the shared build differs outside the memory section`);
       }
+    }
+  },
+});
+
+// The shared allocator is decided by the build: a default build of a unit that allocates
+// carries no atomic at all, a shared build allocates through them.
+const WASM_DIS = `${ROOT}/node_modules/.bin/wasm-dis`;
+Deno.test({
+  name: "shared-memory: only a shared build allocates with atomics",
+  ignore: !ENABLED || !exists(WASM_DIS),
+  async fn() {
+    const src = `import { Buffer } from "std:buffer"
+print(Buffer(16).base)
+`;
+    const atomics = async (bytes: Uint8Array) => {
+      const tmp = await Deno.makeTempDir();
+      try {
+        await Deno.writeFile(`${tmp}/m.wasm`, bytes);
+        const { stdout } = await new Deno.Command(WASM_DIS, {
+          args: [`${tmp}/m.wasm`, "--enable-threads", "--enable-gc", "--enable-reference-types"],
+          stdout: "piped",
+        }).output();
+        return (dec.decode(stdout).match(/\bi64\.atomic\.[a-z.0-9_]+/g) ?? []).sort();
+      } finally {
+        await Deno.remove(tmp, { recursive: true });
+      }
+    };
+    eq(await atomics(await build(src)), [], "default build");
+    const shared = await atomics(await build(src, ["--shared-memory=16"]));
+    if (!shared.includes("i64.atomic.load") || !shared.includes("i64.atomic.rmw.cmpxchg")) {
+      throw new Error(`the shared build does not allocate atomically: ${shared.join(" ")}`);
     }
   },
 });
@@ -234,17 +266,39 @@ Deno.test({
 
 // One module, two instances, the reviewer's ordering: A writes and allocates, THEN B
 // instantiates. VL emits no data segment, so B's instantiation writes nothing and A's plain
-// stores survive; B reads them through its own instance. But the `std:buffer` bump pointer is a
-// per-instance global over one heap window, so B's first `Buffer` is A's — the documented reason
-// at most one instance may allocate (DECISIONS.md, "A shared memory is a build flag").
-const TWO = `import { Buffer, storeI32 } from "std:buffer"
+// stores survive; B reads them through its own instance. The `std:buffer` bump pointer lives in
+// the shared memory, so B's first `Buffer` lands after A's (DECISIONS.md, "std:buffer's
+// allocator over a shared memory").
+//
+// `fill` stamps every word of a new `Buf`; `stress` makes `count` of them back to back and
+// answers where its record of them starts (the bases, then the lengths, in a `Buf` of its own).
+const TWO = `import { Buffer, Buf, bufferMark, bufferRelease, storeI32 } from "std:buffer"
 let bumps = 0
 export function put(addr: i32, v: i32) { __store_i32__(addr, v) }
 export function peek(addr: i32): i32 { __load_i32__(addr) }
-export function alloc(n: i32, stamp: i32): i32 {
+function fill(n: i32, stamp: i32): Buf {
   const b = Buffer(n)
-  b.storeI32(0, stamp)
-  b.base
+  let off = 0
+  while off + 4 <= n {
+    b.storeI32(off, stamp)
+    off = off + 4
+  }
+  b
+}
+export function alloc(n: i32, stamp: i32): i32 { fill(n, stamp).base }
+export function mark(): i32 { bufferMark() }
+export function release(m: i32) { bufferRelease(m) }
+export function stress(count: i32, stamp: i32): i32 {
+  const rec = Buffer(count * 8)
+  let i = 0
+  while i < count {
+    const n = 4 + ((i * 7 + stamp) & 31) * 4
+    const b = fill(n, stamp + i)
+    rec.storeI32(i * 4, b.base)
+    rec.storeI32(count * 4 + i * 4, n)
+    i = i + 1
+  }
+  rec.base
 }
 export function bump(): i32 {
   bumps = bumps + 1
@@ -253,11 +307,12 @@ export function bump(): i32 {
 `;
 
 // Each worker instantiates the SAME compiled module over the memory it is handed, then runs
-// one export per message. `wait` blocks on a flag word with `Atomics.wait` — JS atomics only.
+// one export per message. `wait` blocks on a flag word with `Atomics.wait` — JS atomics only;
+// `stress`, `churn` and `flood` wait on the start flag first, so every worker allocates at once.
 const WORKER_SRC = `
 let inst, mem;
 self.onmessage = async (e) => {
-  const { op, module, memory, a, b } = e.data;
+  const { op, module, memory, a, b, c } = e.data;
   if (op === "init") {
     mem = memory;
     const imports = new Proxy({}, { get: () => () => {} });
@@ -266,10 +321,30 @@ self.onmessage = async (e) => {
     return;
   }
   const x = inst.exports;
+  const go = () => Atomics.wait(new Int32Array(mem.buffer), c >> 2, 0, 10000);
   if (op === "put") { x.put(a, b); self.postMessage({ ok: true }); }
   if (op === "peek") self.postMessage({ v: x.peek(a) });
   if (op === "alloc") self.postMessage({ v: x.alloc(a, b) });
+  if (op === "mark") self.postMessage({ v: x.mark() });
+  if (op === "release") { x.release(a); self.postMessage({ ok: true }); }
   if (op === "bump") self.postMessage({ v: x.bump() });
+  if (op === "stress") { go(); self.postMessage({ v: x.stress(a, b) }); }
+  if (op === "churn") {
+    go();
+    try { self.postMessage({ v: x.churn(a, b), r: x.reclaims() }); }
+    catch (t) { self.postMessage({ err: String(t) }); }
+  }
+  if (op === "flood") {
+    go();
+    const bases = [];
+    let err = "";
+    try {
+      for (;;) bases.push(x.alloc(a, b + bases.length));
+    } catch (t) { err = String(t); }
+    // The shared pointer just after this worker's trap (header low word + heap + 8).
+    const after = 1024 + 8 + new Int32Array(mem.buffer)[1024 >> 2];
+    self.postMessage({ v: bases, err, after });
+  }
   if (op === "wait") {
     const flags = new Int32Array(mem.buffer);
     Atomics.wait(flags, a >> 2, 0, 10000);
@@ -278,29 +353,68 @@ self.onmessage = async (e) => {
 };
 `;
 
+type Call = (w: Worker, m: Record<string, unknown>) => Promise<Record<string, unknown>>;
+
+/** `n` Workers over one module and one memory, torn down after `body`. */
+const withWorkers = async (
+  n: number,
+  bytes: Uint8Array,
+  memory: WebAssembly.Memory,
+  body: (ws: Worker[], call: Call) => Promise<void>,
+) => {
+  const module = await WebAssembly.compile(bytes as BufferSource);
+  const url = URL.createObjectURL(new Blob([WORKER_SRC], { type: "text/javascript" }));
+  const ws = Array.from({ length: n }, () => new Worker(url, { type: "module" }));
+  const call: Call = (w, m) =>
+    new Promise((res, rej) => {
+      w.onmessage = (e) => res(e.data);
+      w.onerror = (e) => {
+        e.preventDefault();
+        rej(new Error(e.message));
+      };
+      w.postMessage(m);
+    });
+  try {
+    for (const w of ws) await call(w, { op: "init", module, memory });
+    await body(ws, call);
+  } finally {
+    for (const w of ws) w.terminate();
+    URL.revokeObjectURL(url);
+  }
+};
+
+// The start flag the racing workers wait on: below the heap, which starts at 1024. The
+// shared allocator's header is the heap's first 8 bytes; its low word is the bytes handed out.
+const GO = 64;
+const HEAP = 1024;
+const start = (memory: WebAssembly.Memory) => {
+  const v = new Int32Array(memory.buffer);
+  Atomics.store(v, GO >> 2, 1);
+  Atomics.notify(v, GO >> 2);
+};
+const pointer = (memory: WebAssembly.Memory) =>
+  HEAP + 8 + new Int32Array(memory.buffer)[HEAP >> 2];
+
+/** Every extent (its length rounded up to 8, as `Buffer` does) is disjoint from the others. */
+const disjoint = (xs: { base: number; n: number }[], what: string) => {
+  const sorted = xs.map((x) => [x.base, x.base + ((x.n + 7) & ~7)]).sort((p, q) => p[0] - q[0]);
+  for (let i = 1; i < sorted.length; i++) {
+    if (sorted[i][0] < sorted[i - 1][1]) {
+      throw new Error(`${what}: [${sorted[i - 1]}) overlaps [${sorted[i]})`);
+    }
+  }
+  return sorted.length ? sorted[sorted.length - 1][1] : 0;
+};
+
 Deno.test({
-  name: "shared-memory: one module in two Workers — B instantiated after A keeps A's writes, and reuses A's Buffer address",
+  name: "shared-memory: one module in two Workers — B instantiated after A keeps A's writes, and allocates past A's Buffer",
   ignore: !ENABLED,
   async fn() {
     const bytes = await build(TWO, ["--import-memory", "--shared-memory=16"]);
-    const module = await WebAssembly.compile(bytes as BufferSource);
     const memory = new WebAssembly.Memory({ initial: 1, maximum: 16, shared: true });
-    const url = URL.createObjectURL(new Blob([WORKER_SRC], { type: "text/javascript" }));
-    const A = new Worker(url, { type: "module" });
-    const B = new Worker(url, { type: "module" });
-    const call = (w: Worker, m: Record<string, unknown>) =>
-      new Promise<Record<string, unknown>>((res, rej) => {
-        w.onmessage = (e) => res(e.data);
-        w.onerror = (e) => {
-          e.preventDefault();
-          rej(new Error(e.message));
-        };
-        w.postMessage(m);
-      });
-    const v = async (w: Worker, m: Record<string, unknown>) => (await call(w, m)).v;
-    try {
-      await call(A, { op: "init", module, memory });
-      // A writes low (where a data segment would sit) and inside the heap, then allocates.
+    await withWorkers(1, bytes, memory, async ([A], call) => {
+      const v = async (w: Worker, m: Record<string, unknown>) => (await call(w, m)).v;
+      // A writes low (where a data segment would sit) and allocates, before B exists.
       await call(A, { op: "put", a: 16, b: 0x1111 });
       await call(A, { op: "put", a: 512, b: 0x2222 });
       const aAddr = await v(A, { op: "alloc", a: 64, b: 0xaaaa }) as number;
@@ -308,59 +422,328 @@ Deno.test({
       const view = new Int32Array(memory.buffer);
       eq(view[aAddr >> 2], 0xaaaa, "A's stamp");
 
-      await call(B, { op: "init", module, memory });
-      eq([view[16 >> 2], view[512 >> 2]], [0x1111, 0x2222], "A's plain writes survive B's instantiation");
-      eq(view[aAddr >> 2], 0xaaaa, "A's allocation survives B's instantiation");
-      eq(await v(B, { op: "peek", a: 512 }), 0x2222, "B's instance reads A's store");
-      eq(await v(B, { op: "bump" }), 1, "B's globals are its own");
+      await withWorkers(1, bytes, memory, async ([B]) => {
+        eq([view[16 >> 2], view[512 >> 2]], [0x1111, 0x2222], "A's plain writes survive B's instantiation");
+        eq(view[aAddr >> 2], 0xaaaa, "A's allocation survives B's instantiation");
+        eq(await v(B, { op: "peek", a: 512 }), 0x2222, "B's instance reads A's store");
+        eq(await v(B, { op: "bump" }), 1, "B's globals are its own");
 
-      // The hazard, recorded: B's allocator starts where A's did.
-      const bAddr = await v(B, { op: "alloc", a: 64, b: 0xbbbb }) as number;
-      eq(bAddr, aAddr, "B's first Buffer is A's address — at most one instance may allocate");
-      eq(view[aAddr >> 2], 0xbbbb, "and B's stamp overwrote A's");
+        // The allocator is shared: B's first Buffer starts where A's ended.
+        const bAddr = await v(B, { op: "alloc", a: 64, b: 0xbbbb }) as number;
+        eq(bAddr, aAddr + 64, "B's first Buffer follows A's");
+        eq(Array.from(new Int32Array(memory.buffer, aAddr, 16)), Array(16).fill(0xaaaa), "A's stamps are intact");
+        eq(view[bAddr >> 2], 0xbbbb, "B's stamp");
 
-      // A cross-worker handoff through plain stores: B blocks, A writes and signals.
-      const got = v(B, { op: "wait", a: 64, b: 4096 });
-      await call(A, { op: "put", a: 4096, b: 0x5eed });
-      Atomics.store(view, 64 >> 2, 1);
-      Atomics.notify(view, 64 >> 2);
-      eq(await got, 0x5eed, "B sees A's store after the signal");
-    } finally {
-      A.terminate();
-      B.terminate();
-      URL.revokeObjectURL(url);
+        // A cross-worker handoff through plain stores: B blocks, A writes and signals.
+        const got = v(B, { op: "wait", a: GO, b: 4096 });
+        await call(A, { op: "put", a: 4096, b: 0x5eed });
+        Atomics.store(view, GO >> 2, 1);
+        Atomics.notify(view, GO >> 2);
+        eq(await got, 0x5eed, "B sees A's store after the signal");
+      });
+    });
+  },
+});
+
+// A release reclaims only the releasing instance's own allocations at the top.
+Deno.test({
+  name: "shared-memory: bufferRelease keeps another instance's allocation, and reclaims an instance's own",
+  ignore: !ENABLED,
+  async fn() {
+    const bytes = await build(TWO, ["--import-memory", "--shared-memory=16"]);
+    const memory = new WebAssembly.Memory({ initial: 1, maximum: 16, shared: true });
+    await withWorkers(2, bytes, memory, async ([A, B], call) => {
+      const v = async (w: Worker, m: Record<string, unknown>) => (await call(w, m)).v as number;
+      const view = () => new Int32Array(memory.buffer);
+      // A's temporaries with B's allocation between them: A cannot rewind past it.
+      const m0 = await v(A, { op: "mark" });
+      eq(m0, HEAP + 8, "the first Buf follows the header");
+      const a1 = await v(A, { op: "alloc", a: 32, b: 0xa1 });
+      const b1 = await v(B, { op: "alloc", a: 32, b: 0xb1 });
+      const a2 = await v(A, { op: "alloc", a: 32, b: 0xa2 });
+      eq([a1, b1, a2], [m0, m0 + 32, m0 + 64], "interleaved, back to back");
+      await call(A, { op: "release", a: m0 });
+      eq(await v(A, { op: "mark" }), m0 + 96, "A's release kept everything — B's Buf is in the range");
+      // B cannot rewind A's allocation above its own either.
+      await call(B, { op: "release", a: b1 });
+      eq(await v(B, { op: "mark" }), m0 + 96, "B's release kept A's top allocation");
+      // A's own run at the top goes, and the next Buf reuses it.
+      const m1 = await v(A, { op: "mark" });
+      await v(A, { op: "alloc", a: 48, b: 0xa3 });
+      await v(A, { op: "alloc", a: 16, b: 0xa4 });
+      await call(A, { op: "release", a: m1 });
+      eq(await v(A, { op: "mark" }), m1, "A reclaimed its own run");
+      eq(await v(B, { op: "alloc", a: 8, b: 0xb2 }), m1, "the next Buf reuses it");
+      eq([view()[a1 >> 2], view()[b1 >> 2], view()[a2 >> 2]], [0xa1, 0xb1, 0xa2], "nothing live was touched");
+    });
+  },
+});
+
+// Another instance may rewind the pointer below a mark this instance took, and the release that
+// follows is still correct: it reclaims nothing rather than trapping. Two instances driven from
+// one thread, so the order is exact (the #3123 review's witness).
+Deno.test({
+  name: "shared-memory: a release to a mark another instance rewound below does not trap",
+  ignore: !ENABLED,
+  async fn() {
+    const bytes = await build(TWO, ["--import-memory", "--shared-memory=16"]);
+    const memory = new WebAssembly.Memory({ initial: 1, maximum: 16, shared: true });
+    const mk = async () =>
+      (await WebAssembly.instantiate(bytes as BufferSource, {
+        env: { memory },
+        imports: new Proxy({}, { get: () => () => {} }),
+      })).instance.exports as Record<string, (...a: number[]) => number>;
+    const A = await mk(), B = await mk();
+    const m0 = B.mark();
+    B.alloc(32, 0xb);
+    const m = A.mark();
+    eq(m, m0 + 32, "A's mark is above B's Buf");
+    B.release(m0);
+    eq(B.mark(), m0, "B reclaimed its own run, below A's mark");
+    const a = A.alloc(8, 0xa);
+    eq(a, m0, "A's Buf reuses B's bytes");
+    A.release(m); // the pointer (m0 + 8) is below m: keep everything, do not trap
+    eq(A.mark(), m0 + 8, "A's release reclaimed nothing");
+    eq(new Int32Array(memory.buffer)[a >> 2], 0xa, "A's Buf is intact");
+  },
+});
+
+// Mark/allocate/release loops, nested, beside plain allocators: `churn` checks its own live Bufs
+// every iteration and answers how many words it found corrupted.
+const ADV = `import { Buffer, Buf, bufferMark, bufferRelease, storeI32, loadI32 } from "std:buffer"
+function fill(n: i32, stamp: i32): Buf {
+  const b = Buffer(n)
+  let off = 0
+  while off + 4 <= n {
+    b.storeI32(off, stamp)
+    off = off + 4
+  }
+  b
+}
+function bad(b: Buf, n: i32, stamp: i32): i32 {
+  let k = 0
+  let off = 0
+  while off + 4 <= n {
+    if b.loadI32(off) != stamp { k = k + 1 }
+    off = off + 4
+  }
+  k
+}
+export function stress(count: i32, stamp: i32): i32 {
+  const rec = Buffer(count * 8)
+  let i = 0
+  while i < count {
+    const n = 4 + ((i * 7 + stamp) & 31) * 4
+    const b = fill(n, stamp + i)
+    rec.storeI32(i * 4, b.base)
+    rec.storeI32(count * 4 + i * 4, n)
+    i = i + 1
+  }
+  rec.base
+}
+let reclaimed = 0
+export function reclaims(): i32 { reclaimed }
+export function churn(iters: i32, stamp: i32): i32 {
+  let seed = stamp & 65535
+  let wrong = 0
+  const anchor = fill(64, stamp)
+  let it = 0
+  while it < iters {
+    const m = bufferMark()
+    const bs: Buf[] = []
+    const ns: i32[] = []
+    seed = (seed * 1103 + 12345) & 65535
+    const k = 1 + (seed & 3)
+    let j = 0
+    while j < k {
+      seed = (seed * 1103 + 12345) & 65535
+      const n = 4 + (seed & 15) * 4
+      bs.push(fill(n, stamp + it * 8 + j))
+      ns.push(n)
+      if (seed & 64) != 0 {
+        const m2 = bufferMark()
+        const t = fill(24, stamp + 0x7000 + j)
+        wrong = wrong + bad(t, 24, stamp + 0x7000 + j)
+        bufferRelease(m2)
+      }
+      j = j + 1
+    }
+    j = 0
+    while j < k {
+      wrong = wrong + bad(bs[j], ns[j], stamp + it * 8 + j)
+      j = j + 1
+    }
+    bufferRelease(m)
+    if bufferMark() == m { reclaimed = reclaimed + 1 }
+    wrong = wrong + bad(anchor, 64, stamp)
+    it = it + 1
+  }
+  wrong
+}
+`;
+
+Deno.test({
+  name: "shared-memory: mark/release loops beside allocating Workers never trap, corrupt or overlap",
+  ignore: !ENABLED,
+  async fn() {
+    const bytes = await build(ADV, ["--import-memory", "--shared-memory=1024"]);
+    const COUNT = 20000, ITERS = 20000, ROUNDS = 5;
+    let reclaimed = 0;
+    for (let round = 0; round < ROUNDS; round++) {
+      const memory = new WebAssembly.Memory({ initial: 1, maximum: 1024, shared: true });
+      await withWorkers(4, bytes, memory, async (ws, call) => {
+        const jobs = [
+          call(ws[0], { op: "churn", a: ITERS, b: 0x10000000, c: GO }),
+          call(ws[1], { op: "churn", a: ITERS, b: 0x20000000, c: GO }),
+          call(ws[2], { op: "stress", a: COUNT, b: 0x30000000, c: GO }),
+          call(ws[3], { op: "stress", a: COUNT, b: 0x40000000, c: GO }),
+        ];
+        start(memory);
+        const outs = await Promise.all(jobs);
+        outs.forEach((o, k) => {
+          if (o.err) throw new Error(`round ${round}: worker ${k} trapped: ${o.err}`);
+        });
+        eq([outs[0].v, outs[1].v], [0, 0], `round ${round}: corrupted words seen by the churners`);
+        reclaimed += (outs[0].r as number) + (outs[1].r as number);
+        const view = new Int32Array(memory.buffer);
+        const all: { base: number; n: number }[] = [];
+        [2, 3].forEach((k) => {
+          const rec = outs[k].v as number, stamp0 = (k + 1) << 28;
+          all.push({ base: rec, n: COUNT * 8 });
+          for (let i = 0; i < COUNT; i++) {
+            const base = view[(rec >> 2) + i], len = view[(rec >> 2) + COUNT + i];
+            all.push({ base, n: len });
+            for (let w = 0; w < len; w += 4) {
+              if (view[(base + w) >> 2] !== stamp0 + i) {
+                throw new Error(`round ${round}: allocator ${k} Buf ${i} at ${base}: word ${w} overwritten`);
+              }
+            }
+          }
+        });
+        disjoint(all, `round ${round}`);
+      });
+    }
+    // The churners do reclaim, some of the time: the test is not passing by never releasing.
+    if (reclaimed === 0) throw new Error("no churn release ever reclaimed");
+  },
+});
+
+Deno.test({
+  name: "shared-memory: 2, 3 and 4 Workers × 10,000 concurrent Buffers — no two overlap and every stamp survives",
+  ignore: !ENABLED,
+  async fn() {
+    const bytes = await build(TWO, ["--import-memory", "--shared-memory=256"]);
+    const COUNT = 10000;
+    for (const n of [2, 3, 4]) {
+      const memory = new WebAssembly.Memory({ initial: 1, maximum: 256, shared: true });
+      await withWorkers(n, bytes, memory, async (ws, call) => {
+        const runs = ws.map((w, k) => call(w, { op: "stress", a: COUNT, b: (k + 1) << 24, c: GO }));
+        start(memory);
+        const recs = (await Promise.all(runs)).map((r) => r.v as number);
+        const view = new Int32Array(memory.buffer);
+        const all: { base: number; n: number }[] = [];
+        recs.forEach((rec, k) => {
+          const stamp0 = (k + 1) << 24;
+          all.push({ base: rec, n: COUNT * 8 });
+          for (let i = 0; i < COUNT; i++) {
+            const base = view[(rec >> 2) + i], len = view[(rec >> 2) + COUNT + i];
+            all.push({ base, n: len });
+            for (let w = 0; w < len; w += 4) {
+              if (view[(base + w) >> 2] !== stamp0 + i) {
+                throw new Error(
+                  `${n} workers: worker ${k} Buf ${i} at ${base}: word ${w} is ${view[(base + w) >> 2]}`,
+                );
+              }
+            }
+          }
+        });
+        eq(all.length, n * (COUNT + 1), `${n} workers: every allocation is accounted for`);
+        const end = disjoint(all, `${n} workers`);
+        // Nothing was handed out twice or skipped: the Bufs tile the heap up to the pointer.
+        eq(pointer(memory), end, `${n} workers: the shared pointer ends at the last Buf`);
+        eq(
+          all.reduce((t, x) => t + ((x.n + 7) & ~7), 0),
+          end - HEAP - 8,
+          `${n} workers: the Bufs tile the heap`,
+        );
+        const pages = memory.buffer.byteLength / 65536;
+        if (pages < Math.ceil(end / 65536) || pages > 256) {
+          throw new Error(`${n} workers: the memory is ${pages} pages for a pointer at ${end}`);
+        }
+      });
     }
   },
 });
 
 Deno.test({
-  name: "shared-memory: --import-memory --shared-memory warns about the instance hazard, not --heap-base",
+  name: "shared-memory: Workers racing to grow up to the max each trap only when it is full, and lose nothing",
+  ignore: !ENABLED,
+  async fn() {
+    // Two Bufs to a page and a small max, so the workers race for nearly every page and for
+    // the last one; a round is cheap, so run many, each over a fresh memory.
+    const MAX = 6;
+    const SIZE = 30000;
+    const ROUNDS = 30;
+    const bytes = await build(TWO, ["--import-memory", `--shared-memory=${MAX}`]);
+    const module = await WebAssembly.compile(bytes as BufferSource);
+    const fresh = () => new WebAssembly.Memory({ initial: 1, maximum: MAX, shared: true });
+    await withWorkers(4, bytes, fresh(), async (ws, call) => {
+      for (let round = 0; round < ROUNDS; round++) {
+        const memory = fresh();
+        for (const w of ws) await call(w, { op: "init", module, memory });
+        const runs = ws.map((w, k) => call(w, { op: "flood", a: SIZE, b: (k + 1) << 24, c: GO }));
+        start(memory);
+        const outs = await Promise.all(runs);
+        const view = new Int32Array(memory.buffer);
+        const all: { base: number; n: number }[] = [];
+        outs.forEach((o, k) => {
+          if (!/unreachable/.test(o.err as string)) {
+            throw new Error(`round ${round}: worker ${k} did not trap cleanly: ${o.err}`);
+          }
+          // A trap is the max refusing, never a lost race: even read after the trap, the
+          // pointer leaves no room for the Buf the worker asked for.
+          if (MAX * 65536 - (o.after as number) >= SIZE) {
+            throw new Error(`round ${round}: worker ${k} trapped with room left (pointer ${o.after})`);
+          }
+          (o.v as number[]).forEach((base, i) => {
+            all.push({ base, n: SIZE });
+            for (let w = 0; w + 4 <= SIZE; w += 4) {
+              if (view[(base + w) >> 2] !== ((k + 1) << 24) + i) {
+                throw new Error(`round ${round}: worker ${k} Buf ${i} at ${base}: word ${w} was overwritten`);
+              }
+            }
+          });
+        });
+        const end = disjoint(all, `round ${round}`);
+        eq(memory.buffer.byteLength, MAX * 65536, `round ${round}: grown to the max, and no further`);
+        // A refused growth claims nothing: the pointer ends at the last Buf handed out.
+        eq(pointer(memory), end, `round ${round}: no Buf was claimed past the max`);
+        eq(all.length, Math.floor((MAX * 65536 - HEAP - 8) / SIZE), `round ${round}: every Buf that fits`);
+      }
+    });
+  },
+});
+
+Deno.test({
+  name: "shared-memory: --import-memory --shared-memory does not warn — instances share one allocator",
   ignore: !ENABLED,
   async fn() {
     const tmp = await Deno.makeTempDir();
     try {
       await Deno.writeTextFile(`${tmp}/two.vl`, TWO);
-      await Deno.writeTextFile(`${tmp}/poke.vl`, POKE);
-      const warn = async (file: string, flags: string[]) => {
+      const warn = async (flags: string[]) => {
         const r = await vl(
-          ["build", `${tmp}/${file}`, "--compiler", COMPILER, "-o", `${tmp}/o.wasm`, ...flags],
+          ["build", `${tmp}/two.vl`, "--compiler", COMPILER, "-o", `${tmp}/o.wasm`, ...flags],
         );
-        eq(r.code, 0, `build ${file} ${flags.join(" ")}: ${r.err}`);
+        eq(r.code, 0, `build ${flags.join(" ")}: ${r.err}`);
         return r.err.split("\n").filter((l) => l.includes("warning")).join("\n");
       };
-      const shared = await warn("two.vl", ["--import-memory", "--shared-memory=16"]);
-      if (!/at most one instance may allocate/.test(shared) || /no --heap-base/.test(shared)) {
-        throw new Error(`the shared warning should name the instance hazard:\n${shared}`);
+      eq(await warn(["--import-memory", "--shared-memory=16"]), "", "shared, no window");
+      eq(await warn(["--shared-memory=16"]), "", "a defined memory");
+      // The unshared hazard between separately built units is unchanged.
+      if (!/no --heap-base/.test(await warn(["--import-memory"]))) {
+        throw new Error("an unshared --import-memory unit that allocates should still warn");
       }
-      const windowed = await warn(
-        "two.vl",
-        ["--import-memory", "--shared-memory=16", "--heap-base=0x10000"],
-      );
-      if (!/at most one instance may allocate/.test(windowed)) {
-        throw new Error(`--heap-base does not separate instances, so it still warns:\n${windowed}`);
-      }
-      eq(await warn("poke.vl", ["--import-memory", "--shared-memory=16"]), "", "no allocator, no warning");
-      eq(await warn("two.vl", ["--shared-memory=16"]), "", "a defined memory has one instance");
     } finally {
       await Deno.remove(tmp, { recursive: true });
     }
@@ -390,9 +773,23 @@ Deno.test({
   },
 });
 
+// The build decides `__memory_shared__()`: the corpus fixture pins the default face, this the
+// shared one — the folded `if`s run their bodies, and the `if`/`else` takes its first arm.
+Deno.test({
+  name: "shared-memory: __memory_shared__() is true in a shared build, at every folded site",
+  ignore: !ENABLED,
+  async fn() {
+    const fixture = `${ROOT}/tests/cases/memory/memory-shared-default-build.vl`;
+    const plain = await vl(["run", "--compiler", COMPILER, fixture]);
+    eq(plain.out.trim().split("\n"), ["false", "1", "2", "3"], `default build: ${plain.err}`);
+    const shared = await vl(["run", "--compiler", COMPILER, "--shared-memory=2", fixture]);
+    eq(shared.out.trim().split("\n"), ["true", "100", "100", "11", "100"], `shared build: ${shared.err}`);
+  },
+});
+
 // std:buffer's allocator grows the memory on demand; past the max it traps rather than handing
 // out a `Buf` with no memory behind it.
-const ALLOC = `import { Buffer, loadI32, storeI32 } from "std:buffer"
+const ALLOC =`import { Buffer, loadI32, storeI32 } from "std:buffer"
 const a = Buffer(100000)
 a.storeI32(99996, 7)
 print(a.loadI32(99996))

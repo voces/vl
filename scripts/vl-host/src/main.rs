@@ -533,11 +533,12 @@ program verbatim — the only way to pass one that starts with `-`.
                       one memory can back several instances (Web Workers).
                       Only the memory is shared: each instance keeps its own
                       GC heap and globals, and runs top-level code once.
-                      HAZARD: at most ONE instance may allocate from
-                      std:buffer — each instance's allocator hands out the
-                      same addresses. Growth stops at the max
+                      Every instance may allocate from std:buffer: its
+                      pointer lives in the heap's first 8 bytes, so no
+                      instance is handed another's Buf. Growth stops at the max
   {c}--heap-base={r}<addr>  First byte std:buffer may hand out (default 1024;
-                      decimal or 0x hex, a nonzero multiple of 8)
+                      decimal or 0x hex, a nonzero multiple of 8; the first
+                      Buf is 8 bytes later under --shared-memory)
   {c}--heap-limit={r}<addr> One past the last (a multiple of 8); a Buffer() past it
                       TRAPS rather than growing into memory the host owns
                       (default 2 GiB). Bytes
@@ -7877,22 +7878,9 @@ fn build_cmd(args: &[String]) -> Result<()> {
     )?;
     // A unit sharing a host's memory that allocates with no window of its own starts at
     // the default base, as every other such unit does. Legal, so a warning, not a refusal.
-    // Over a SHARED import the hazard is between instances of this one module instead: each
-    // has its own bump pointer over the same window, so no `--heap-base` can separate them.
-    if link.import_memory && link.shared_pages.is_some() {
-        if let Some((store, inst)) = session.as_mut() {
-            if let Ok(read) = inst.get_typed_func::<(), i32>(&mut *store, "heapWindowRead") {
-                if read.call(&mut *store, ())? != 0 {
-                    eprintln!(
-                        "vl build: warning: `{input}` allocates from std:buffer over a shared \
-                         memory; every instance of it hands out the SAME addresses, so at most \
-                         one instance may allocate — the others must manage their own address \
-                         ranges (--heap-base cannot separate instances of one module)"
-                    );
-                }
-            }
-        }
-    } else if link.import_memory && link.heap.is_none() {
+    // Over a SHARED memory there is nothing to warn about: std:buffer's allocator keeps its
+    // pointer in the memory itself, so instances and units sharing a window share it safely.
+    if link.import_memory && link.heap.is_none() && link.shared_pages.is_none() {
         if let Some((store, inst)) = session.as_mut() {
             if let Ok(read) = inst.get_typed_func::<(), i32>(&mut *store, "heapWindowRead") {
                 if read.call(&mut *store, ())? != 0 {
