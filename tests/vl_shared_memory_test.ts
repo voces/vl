@@ -262,6 +262,38 @@ print(Buffer(16).base)
   },
 });
 
+// A positive control for the origin refusal above: `std:buffer` builds and works correctly
+// in both faces `__memory_shared__()` decides between, not just the default one.
+Deno.test({
+  name: "shared-memory: std:buffer builds and works in both shared and unshared builds",
+  ignore: !ENABLED,
+  async fn() {
+    const tmp = await Deno.makeTempDir();
+    try {
+      const src = `import { Buffer, loadI32, storeI32 } from "std:buffer"
+const a = Buffer(16)
+storeI32(a, 0, 111)
+const b = Buffer(16)
+storeI32(b, 0, 222)
+print(loadI32(a, 0))
+print(loadI32(b, 0))
+print(b.base > a.base)
+`;
+      await Deno.writeTextFile(`${tmp}/w.vl`, src);
+      const plain = await vl(["run", "--compiler", COMPILER, `${tmp}/w.vl`]);
+      eq(plain.code, 0, `default build: ${plain.err}`);
+      eq(plain.out.trim().split("\n"), ["111", "222", "true"], "default build output");
+      const shared = await vl(
+        ["run", "--compiler", COMPILER, "--shared-memory=4", `${tmp}/w.vl`],
+      );
+      eq(shared.code, 0, `shared build: ${shared.err}`);
+      eq(shared.out.trim().split("\n"), ["111", "222", "true"], "shared build output");
+    } finally {
+      await Deno.remove(tmp, { recursive: true });
+    }
+  },
+});
+
 // ── 2. two Workers, one memory ───────────────────────────────────────────────
 
 // One module, two instances, the reviewer's ordering: A writes and allocates, THEN B
@@ -773,17 +805,23 @@ Deno.test({
   },
 });
 
-// The build decides `__memory_shared__()`: the corpus fixture pins the default face, this the
-// shared one — the folded `if`s run their bodies, and the `if`/`else` takes its first arm.
+// `__memory_shared__()` is std-internal (owner ruling 2026-09-24, D2355): a call from outside
+// std is refused by the checker, at every syntactic position the corpus fixture pins (top
+// level, an `if`, a function body) — and the refusal is unconditional, never reaching the
+// point where `--shared-memory` would matter.
 Deno.test({
-  name: "shared-memory: __memory_shared__() is true in a shared build, at every folded site",
+  name: "shared-memory: __memory_shared__() outside std is refused, in every build",
   ignore: !ENABLED,
   async fn() {
     const fixture = `${ROOT}/tests/cases/memory/memory-shared-default-build.vl`;
-    const plain = await vl(["run", "--compiler", COMPILER, fixture]);
-    eq(plain.out.trim().split("\n"), ["false", "1", "2", "3"], `default build: ${plain.err}`);
-    const shared = await vl(["run", "--compiler", COMPILER, "--shared-memory=2", fixture]);
-    eq(shared.out.trim().split("\n"), ["true", "100", "100", "11", "100"], `shared build: ${shared.err}`);
+    for (const flags of [[], ["--shared-memory=2"]]) {
+      const r = await vl(["run", "--compiler", COMPILER, ...flags, fixture]);
+      const label = flags.join(" ") || "default";
+      eq(r.code, 1, `${label} build: ${r.err}`);
+      if (!r.err.includes("'__memory_shared__' is internal to std")) {
+        throw new Error(`${label} build: wrong refusal: ${r.err}`);
+      }
+    }
   },
 });
 

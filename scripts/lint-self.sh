@@ -76,11 +76,33 @@ trap 'rm -rf "$WORK"' EXIT
 # `prefer-interpolation` is an `info` suggestion held the same way, by
 # scripts/interp-budget.py: the compiler's standing `+` chains are baselined rather than
 # rewritten (a rewrite moves the seed for a spelling), and a new one fails its --check.
-lint_graded() { # <target> <json path>
+lint_graded() { # <target> <json path> [3rd arg "std-origin": see below]
   local rc=0
   "$VL" check "$1" --severity info --json > "$2" 2> "$2.err" || rc=$?
   cat "$2.err"
   if [ "$rc" -gt 1 ]; then cat "$2"; return "$rc"; fi
+  # A std-internal intrinsic (`__memory_shared__`, D2355) is refused OUTSIDE std by its
+  # module KEY, never a path — so a std file checked BARE here (this walk's own entries
+  # carry a raw path, not a `std:` specifier) reads its own reserved calls as external.
+  # A real program never sees this: reached through an actual `std:` import the key
+  # resolves correctly. Dropped only for the std/ target, by message, not by file list,
+  # so a NEW std-internal intrinsic needs no edit here to stay covered.
+  if [ "${3:-}" = "std-origin" ]; then
+    "$PY" -c '
+import json, sys
+path = sys.argv[1]
+with open(path, encoding="utf-8") as fh:
+    text = fh.read().strip()
+diags = json.loads(text) if text else []
+kept = [d for d in diags if "is internal to std" not in d.get("message", "")]
+dropped = len(diags) - len(kept)
+if dropped:
+    print(f"({dropped} std-internal-intrinsic finding(s) dropped — bare per-file check "
+          "artifact, not a real origin violation; D2355)")
+with open(path, "w", encoding="utf-8") as fh:
+    json.dump(kept, fh)
+' "$2"
+  fi
   # shellcheck disable=SC2046  # the word split is the point: zero or more codes
   "$PY" scripts/comment-budget.py --filter-lint "$2" \
     $("$PY" scripts/interp-budget.py --exempt-codes) \
@@ -94,7 +116,7 @@ lint_graded() { # <target> <json path>
 # racing to Cranelift-compile (and write the same sidecar) at once. It is also the
 # only run `std-comment-audience` can fire in — the rule is scoped by module path.
 echo "== self-lint: std/ =="
-lint_graded std/ "$WORK/std.json"
+lint_graded std/ "$WORK/std.json" std-origin
 
 # The compiler is a real module graph — lint it through its entry, so the
 # checker resolves `import`/`export` across the modules exactly as a build does.
