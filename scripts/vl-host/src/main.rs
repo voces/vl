@@ -4943,7 +4943,8 @@ fn binaryen_missing_note(flag: &str, tool: &str, env_override: &str, consequence
 /// no-output-file failure. It is on for every module, not only one that uses an atomic,
 /// because it is byte-neutral where no atomic appears (measured on the corpus at both rungs
 /// and on the compiler seed; see the PR that added it). It is independent of `shared`
-/// memory, which is a separate declaration.
+/// memory, and a `--shared-memory` build needs it for the same reason: binaryen refuses a
+/// shared memory without it, and it is already here.
 /// wasmtime needs no change: its `threads` feature is on by default and validates atomics
 /// on an ordinary (non-shared) memory.
 const BINARYEN_FEATURES: &[&str] = &[
@@ -4954,16 +4955,6 @@ const BINARYEN_FEATURES: &[&str] = &[
     "--enable-simd",
     "--enable-threads",
 ];
-
-/// `BINARYEN_FEATURES`, plus `--enable-threads` for a `--shared-memory` build: binaryen refuses
-/// a shared memory without it. Added only there, so a default build's binaryen run is unchanged.
-fn binaryen_features(shared: bool) -> Vec<&'static str> {
-    let mut f = BINARYEN_FEATURES.to_vec();
-    if shared {
-        f.push("--enable-threads");
-    }
-    f
-}
 
 /// `vl build -O` — the SHRINK rung. One `-O` pass, open world. It melts a scratch
 /// allocation that reaches its uses in straight-line code (records, list literals,
@@ -5760,7 +5751,6 @@ fn escape_inline_step(
     path: &str,
     flag: &str,
     bytes: &[u8],
-    shared: bool,
 ) -> Result<Option<Vec<u8>>> {
     let Some(scan) = ModuleScan::parse(bytes) else {
         return Ok(None);
@@ -5782,7 +5772,7 @@ fn escape_inline_step(
         return Ok(None);
     };
     std::fs::write(path, &named)?;
-    optimize_in_place(path, flag, ESCAPE_INLINE_PASSES, &[], shared)?;
+    optimize_in_place(path, flag, ESCAPE_INLINE_PASSES, &[])?;
     let stepped = std::fs::read(path)
         .map_err(|e| Error::from(e).context(format!("reading back the {flag}'d `{path}`")))?;
     // Inlining removes functions, so the step's output numbers them anew; the prefixed names
@@ -5850,7 +5840,6 @@ fn optimize_in_place(
     flag: &str,
     passes: &[&str],
     no_inline: &[String],
-    shared: bool,
 ) -> Result<()> {
     let Some(opt) = binaryen_tool("wasm-opt", "VL_WASM_OPT") else {
         // The unoptimized module is already on disk at this point. Leaving it there
@@ -5873,8 +5862,7 @@ fn optimize_in_place(
     let mut argv: Vec<&str> = vec![path];
     argv.extend(marks.iter().map(String::as_str));
     argv.extend_from_slice(passes);
-    let features = binaryen_features(shared);
-    argv.extend_from_slice(&features);
+    argv.extend_from_slice(BINARYEN_FEATURES);
     argv.extend_from_slice(&["-o", path]);
     let mut cmd = std::process::Command::new(&opt);
     cmd.args(&argv);
@@ -5901,14 +5889,13 @@ fn optimize_in_place(
 /// tolerates bulk-memory opcodes either way (rc=0 both), so this flag changes nothing
 /// today — the shared `BINARYEN_FEATURES` is what keeps the binaryen call sites from
 /// drifting apart. A missing `wasm-dis` is a soft no-op (the `.wasm` is already written).
-fn disassemble_to_wat(wasm_path: &str, wat_path: &str, shared: bool) -> Result<()> {
+fn disassemble_to_wat(wasm_path: &str, wat_path: &str) -> Result<()> {
     let Some(dis) = binaryen_tool("wasm-dis", "VL_WASM_DIS") else {
         binaryen_missing_note("--wat", "wasm-dis", "VL_WASM_DIS", "skipped the .wat");
         return Ok(());
     };
     let mut argv: Vec<&str> = vec![wasm_path];
-    let features = binaryen_features(shared);
-    argv.extend_from_slice(&features);
+    argv.extend_from_slice(BINARYEN_FEATURES);
     argv.extend_from_slice(&["-o", wat_path]);
     let status = std::process::Command::new(&dis)
         .args(&argv)
@@ -7855,7 +7842,6 @@ fn build_cmd(args: &[String]) -> Result<()> {
     // `--import-memory`: the module imports `env.memory` instead of defining and exporting
     // it (DECISIONS.md §"Linear memory is a layout contract").
     let link = parse_link_opts(args);
-    let shared = link.shared_pages.is_some();
     // `_located`, so a written module the engine refuses names the function it came
     // from (D1578). The instance is read only on that failure path.
     let (mut bytes, mut session) = compile_vl_located(
@@ -7947,12 +7933,12 @@ fn build_cmd(args: &[String]) -> Result<()> {
         // The escape step goes first, so the rung's own passes (`--heap2local` among them)
         // see each per-call struct and its uses in one function. It renumbers functions, so
         // the run-once marks are read off its output, not off `bytes`.
-        let stepped = phase!("opt.escape_step", escape_inline_step(&sink_str, flag, &bytes, shared))?;
+        let stepped = phase!("opt.escape_step", escape_inline_step(&sink_str, flag, &bytes))?;
         let rung_input: &[u8] = stepped.as_deref().unwrap_or(&bytes);
         let mut passes = rung_passes(passes, names);
         let (no_inline, extra) = phase!("opt.run_once_scan", rung_scan(rung_input));
         passes.extend(extra);
-        phase!("opt.rung", optimize_in_place(&sink_str, flag, &passes, &no_inline, shared))?;
+        phase!("opt.rung", optimize_in_place(&sink_str, flag, &passes, &no_inline))?;
         final_bytes = Some(std::fs::read(&sink).map_err(|e| {
             Error::from(e).context(format!("reading back the {flag}'d `{out_label}`"))
         })?);
@@ -7970,7 +7956,7 @@ fn build_cmd(args: &[String]) -> Result<()> {
     // Refused above under `-o -`, which has no path to write beside.
     if args.iter().any(|a| a == "--wat") {
         let wat = format!("{}.wat", out.strip_suffix(".wasm").unwrap_or(&out));
-        disassemble_to_wat(&out, &wat, shared)?;
+        disassemble_to_wat(&out, &wat)?;
     }
     // `-o -`: the module reaches stdout here and the borrowed temporary goes away.
     // BEFORE validation, so the stream mirrors the file case exactly — a module the

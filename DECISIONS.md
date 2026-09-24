@@ -6543,8 +6543,10 @@ keeps its own GC heap, globals and `std:buffer` bump pointer.
   answers -1; `std:buffer`'s `Buffer` then traps, as it does for any refused growth, rather than
   handing out a `Buf` with no memory behind it. The only grow in the compiler's output is the
   `__memory_grow__` intrinsic, so there is no other path to audit.
-- **binaryen gets `--enable-threads` only on a shared build** (`-O`, `-O3`, `--wat`), so a
-  default build's binaryen run is unchanged. **The `vl` host enables wasmtime's
+- **binaryen gets `--enable-threads` on every build** (`-O`, `-O3`, `--wat`), from the
+  shared `BINARYEN_FEATURES`: the atomics lane (#3121) put it there, and it changes no bytes of
+  a module with no atomic and no shared memory (`simd-design.md` §G1 "Atomics"). A shared
+  build needs nothing further from binaryen. **The `vl` host enables wasmtime's
   `shared_memory` on the user-program engine unconditionally**: wasmtime reads the flag only when
   it creates a shared memory (not in codegen, not in the engine's compatibility hash), and the
   threads proposal it needs is already on by default, so a module without a shared memory pays
