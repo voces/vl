@@ -46238,35 +46238,42 @@ function checkForRangeNode(n: ForRange, ix: i32) {
 // ── for v in iterable ───────────────────────────────────────────────────────
 // A for-in loop over an array: the loop variable binds to the element type.
 
+// The type a for-in loop binds to its first variable (`second` false) or its second, over an
+// iterable of type `iterTy`, or TY_ERR where it is not iterable. A sequence's second binding
+// is its index and a map's the value at the key; a set is a sequence here, since its `mVal`
+// is the internal membership boolean (`collections-design.md` C2.4).
+export function forInBindTy(iterTy: i32, second: boolean): i32 {
+  if iterTy < 0 { return TY_ERR }
+  const it = T.tys[iterTy]
+  if it is TyArray {
+    if second { return TY_I32 }
+    // A `u8[]` loop var binds an `i32`, never a `u8` — one iteration is one element read,
+    // and a `u8` in a value position is exactly what `u8` may not be (same rule as an index read).
+    if primNameOf(it.aElem) == "u8" { return TY_I32 }
+    return it.aElem
+  }
+  if it is TyMap {
+    // `for k in m` over a map / set iterates its keys (the key type) — like
+    // `for k in m.keys()`.
+    if !second { return it.mKey }
+    if it.mSet == 1 { return TY_I32 }
+    return it.mVal
+  }
+  // `for ch in s` iterates a string's code units, each an i32, exactly as `s[i]` reads
+  // one — a string is a `{backing, start, len}` view over an i32 array (Stage 2b).
+  if isStringTy(iterTy) { return TY_I32 }
+  TY_ERR
+}
+
 // Extracted from `checkNodeReal`'s `ForIn` arm (C3: thin the dispatcher).
 function checkForInNode(n: ForIn, ix: i32) {
   let iterTy = checkNode(n.fiIter)
   if iterTy >= 0 { iterTy = strLitRecvTy(iterTy) }
-  let elemTy = TY_ERR
-  // The SECOND binding's type. A sequence's companion is its INDEX; a map's is the VALUE at
-  // the key just bound. A set is a sequence here, not a map: its `mVal` is the internal
-  // membership boolean, which is not a value the author wrote (`collections-design.md` C2.4).
-  let elem2Ty = TY_ERR
+  const elemTy = forInBindTy(iterTy, false)
+  const elem2Ty = forInBindTy(iterTy, true)
   const it = T.tys[iterTy]
-  if it is TyArray {
-    elemTy = it.aElem
-    // A `u8[]` loop var binds an `i32`, never a `u8` — one iteration is one element read,
-    // and a `u8` in a value position is exactly what `u8` may not be (same rule as an index read).
-    if primNameOf(it.aElem) == "u8" { elemTy = TY_I32 }
-    elem2Ty = TY_I32
-  } else if it is TyMap {
-    // `for k in m` over a map / set iterates its keys (the key type) — like
-    // `for k in m.keys()`.
-    elemTy = it.mKey
-    if it.mSet == 1 { elem2Ty = TY_I32 } else { elem2Ty = it.mVal }
-  } else if isStringTy(iterTy) {
-    // `for ch in s` iterates a string's code units, each an i32, exactly as `s[i]` reads
-    // one — a string is a `{backing, start, len}` view over an i32 array (Stage 2b).
-    elemTy = TY_I32
-    elem2Ty = TY_I32
-  } else if it is TyErr {
-    elemTy = TY_ERR
-    elem2Ty = TY_ERR
+  if it is TyArray || it is TyMap || isStringTy(iterTy) || it is TyErr {
+    // Iterable (or already reported): `forInBindTy` has typed both bindings.
   } else if it is TyObj {
     // A struct is a NOMINAL record whose fields have different types, so a loop variable over
     // one has no type to bind, and the field read the author wants needs a key no operation

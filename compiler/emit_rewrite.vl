@@ -8,7 +8,9 @@
 
 import { arrElemNameRaw, nameIsArray, nameIsSpaceFree } from "./tyname"
 import {
+  TY_I32,
   annUnionAtomsOf,
+  forInBindTy,
   ifYieldsNoValue,
   inferRetFnKey,
   inferRetIsNulList,
@@ -47,6 +49,7 @@ import {
   opIdxFnAtNode,
   optCallRestamp,
   recordNodeTyFrom,
+  strLitRecvTy,
   tyArrayElemIx,
   tyFieldTyOf,
   tyHasTyVar,
@@ -67,6 +70,7 @@ import {
   BoolLit,
   Call,
   CharLit,
+  ContinueStmt,
   FieldInit,
   ForIn,
   ForRange,
@@ -131,8 +135,10 @@ import {
   nullablePartOf,
   unwrapParen,
 } from "./emit_base"
+import { emitFailAt } from "./emit_bytes"
 import { fnIndexOfInScopeChain } from "./emit_collect"
 import {
+  cboxCellNames,
   fRetVoid,
   fnDispNames,
   fnParent,
@@ -1361,14 +1367,63 @@ export function synthParamAnnots() {
   0
 }
 
-// ── captured-mutation boxing ──────────────────────────────────────────────────────────────
-// Closures capture by value, so a local mutated inside a closure cannot be reflected back.
-// The fix boxes a captured-mutated local as a length-1 array (a shared heap ref both scopes
-// index): `let c = init` becomes `let c = [init]`, and every use of `c` becomes `c[0]`.
+// ── capture by reference ──────────────────────────────────────────────────────────────────
+// A closure copies its captures, so a binding that can change after a closure captured it is
+// boxed in a one-element list both scopes index: `let c = init` becomes `let c = [init]` and
+// every use `c[0]`; a parameter or loop variable gets a cell `c$cb` seeded from it (D2339).
 
-// The names already in the current function's `dlets`, so its dedupe is a probe rather than a
-// scan of every earlier `let` (D2090). Reset per function by `captureBoxRewrite`.
+// The names already in the current frame's `dlets`, so its dedupe is a probe rather than a
+// scan of every earlier binding (D2090). Reset per frame by `cboxFrameReset`.
 let cboxDletSeen: {[string]: i32} = Map()
+
+// What declared each of the frame's bindings: a `let`, a parameter, a for-in variable or a
+// for-range variable. A `let`'s declaration node is kept too, since the box wraps its init.
+const CBOX_LET = 0
+const CBOX_PARAM = 1
+const CBOX_FORIN = 2
+const CBOX_FORRANGE = 3
+let cboxKind: {[string]: i32} = Map()
+let cboxLetIx: {[string]: i32} = Map()
+
+// The loops of the frame as a tree (`cboxLoopUp[l]` encloses loop `l`, -1 is the frame's top),
+// the loop being scanned, and the loop each binding is declared in. A binding declared inside a
+// loop is a fresh one per iteration.
+let cboxLoopUp: i32[] = []
+let cboxLoopAt = -1
+let cboxDeclLoop: {[string]: i32} = Map()
+
+// The `if` arms of the frame as a tree the same way: arm `a` is side `cboxArmSide[a]` (0 then,
+// 1 else) of the `if` at node `cboxArmIf[a]`. Two events in different arms of one `if` exclude
+// each other, unless a loop re-runs the `if`.
+let cboxArmUp: i32[] = []
+let cboxArmIf: i32[] = []
+let cboxArmSide: i32[] = []
+let cboxArmAt = -1
+
+// In walk order, each capture (a function nested one level in the frame that names the binding)
+// and each assignment by the frame itself, as per-name lists threaded through `*Next`, with the
+// loop and arm it sits in. `cboxFn*` describe the nested function being scanned.
+let cboxOrd = 0
+let cboxFnOrd = -1
+let cboxFnLoop = -1
+let cboxFnArm = -1
+// The walk order a call with named arguments starts at, or -1: its arguments run in parameter
+// order, not source order, so a closure among them counts as created before any of them.
+let cboxArgFloor = -1
+let cboxCapSeen: {[string]: i32} = Map()
+let cboxCapHead: {[string]: i32} = Map()
+let cboxCapNext: i32[] = []
+let cboxCapOrd: i32[] = []
+let cboxCapLoop: i32[] = []
+let cboxCapArm: i32[] = []
+let cboxAsgHead: {[string]: i32} = Map()
+let cboxAsgNext: i32[] = []
+let cboxAsgOrd: i32[] = []
+let cboxAsgLoop: i32[] = []
+let cboxAsgArm: i32[] = []
+
+// The cell a boxed parameter or loop variable is read through; a boxed `let` is its own cell.
+let cboxCellOf: {[string]: string} = Map()
 
 // The names a binding inside a nested function shadows at the point being walked: a count
 // per name, and a trail trimmed on scope exit. A nested function's own `c` is neither an
@@ -1412,12 +1467,172 @@ function cboxShadowParams(fn: i32) {
   0
 }
 
-// One scan of a maker body: `dlets` = the maker's own `let` names (depth 0); `alam` = names
-// assigned inside a nested lambda (depth > 0) where no binding of that lambda shadows them.
+// Clears the per-frame tables before a frame is scanned.
+function cboxFrameReset() {
+  cboxDletSeen = Map()
+  cboxCellTy = Map()
+  cboxKind = Map()
+  cboxLetIx = Map()
+  cboxLoopUp = []
+  cboxLoopAt = -1
+  cboxDeclLoop = Map()
+  cboxOrd = 0
+  cboxFnOrd = -1
+  cboxFnLoop = -1
+  cboxFnArm = -1
+  cboxArgFloor = -1
+  cboxArmUp = []
+  cboxArmIf = []
+  cboxArmSide = []
+  cboxArmAt = -1
+  cboxCapSeen = Map()
+  cboxCapHead = Map()
+  cboxCapNext = []
+  cboxCapOrd = []
+  cboxCapLoop = []
+  cboxCapArm = []
+  cboxAsgHead = Map()
+  cboxAsgNext = []
+  cboxAsgOrd = []
+  cboxAsgLoop = []
+  cboxAsgArm = []
+  cboxCellOf = Map()
+  0
+}
+
+// Lists binding `name` of kind `kind` among the frame's own, declared in the current loop.
+// The first declaration of a name wins; a name a closure reads is unique in its frame (D2068).
+function cboxDeclare(name: string, kind: i32, declIx: i32, dlets: string[]) {
+  if (cboxDletSeen[name] ?? 0) != 0 { return 0 }
+  cboxDletSeen[name] = 1
+  dlets.push(name)
+  cboxKind[name] = kind
+  cboxLetIx[name] = declIx
+  cboxDeclLoop[name] = cboxLoopAt
+  0
+}
+
+// Opens a loop nested in the current one; `cboxLoopClose` returns to its parent.
+function cboxLoopOpen() {
+  cboxLoopUp.push(cboxLoopAt)
+  cboxLoopAt = cboxLoopUp.length - 1
+  0
+}
+
+function cboxLoopClose() {
+  if cboxLoopAt >= 0 { cboxLoopAt = cboxLoopUp[cboxLoopAt] }
+  0
+}
+
+// Records that the nested function being scanned names `name`, once per function.
+function cboxNoteCap(name: string) {
+  if (cboxCapSeen[name] ?? -1) == cboxFnOrd { return 0 }
+  cboxCapSeen[name] = cboxFnOrd
+  cboxCapNext.push(cboxCapHead[name] ?? -1)
+  cboxCapHead[name] = cboxCapOrd.length
+  cboxCapOrd.push(cboxFnOrd)
+  cboxCapLoop.push(cboxFnLoop)
+  cboxCapArm.push(cboxFnArm)
+  0
+}
+
+// Records an assignment to `name` by the frame itself, ordered after its operands.
+function cboxNoteAsg(name: string) {
+  cboxOrd = cboxOrd + 1
+  cboxAsgNext.push(cboxAsgHead[name] ?? -1)
+  cboxAsgHead[name] = cboxAsgOrd.length
+  cboxAsgOrd.push(cboxOrd)
+  cboxAsgLoop.push(cboxLoopAt)
+  cboxAsgArm.push(cboxArmAt)
+  0
+}
+
+// Opens side `side` of the `if` at node `ifIx` as an arm nested in the current one.
+function cboxArmOpen(ifIx: i32, side: i32) {
+  cboxArmUp.push(cboxArmAt)
+  cboxArmIf.push(ifIx)
+  cboxArmSide.push(side)
+  cboxArmAt = cboxArmUp.length - 1
+  0
+}
+
+// True when arms `a` and `b` lie in different sides of one `if`, so one pass runs at most one.
+function cboxArmsExclude(a: i32, b: i32) {
+  let x = a
+  while x >= 0 {
+    let y = b
+    while y >= 0 {
+      if cboxArmIf[y] == cboxArmIf[x] {
+        return cboxArmSide[y] != cboxArmSide[x]
+      }
+      y = cboxArmUp[y]
+    }
+    x = cboxArmUp[x]
+  }
+  false
+}
+
+// The innermost loop enclosing both loop `a` and loop `b`, or -1 for the frame's top.
+function cboxLoopMeet(a: i32, b: i32) {
+  let x = a
+  while x >= 0 {
+    let y = b
+    while y >= 0 {
+      if y == x { return x }
+      y = cboxLoopUp[y]
+    }
+    x = cboxLoopUp[x]
+  }
+  -1
+}
+
+// True when a closure can observe a change to binding `name` made after it captured it: a
+// closure writes it (`alam`), the frame assigns it later in walk order than a capture and not
+// in the other arm of an `if`, or the two share a loop that re-runs the capture against the
+// same binding (a loop other than the one the binding is declared in).
+function cboxByRef(name: string, alam: string[]) {
+  if capHas(alam, name) { return true }
+  const declLoop = cboxDeclLoop[name] ?? -1
+  let ci = cboxCapHead[name] ?? -1
+  while ci >= 0 {
+    let ai = cboxAsgHead[name] ?? -1
+    while ai >= 0 {
+      if cboxLoopMeet(cboxCapLoop[ci], cboxAsgLoop[ai]) != declLoop {
+        return true
+      }
+      if (
+        cboxAsgOrd[ai] > cboxCapOrd[ci]
+        && !cboxArmsExclude(cboxCapArm[ci], cboxAsgArm[ai])
+      ) {
+        return true
+      }
+      ai = cboxAsgNext[ai]
+    }
+    ci = cboxCapNext[ci]
+  }
+  false
+}
+
+// One scan of a frame body at nesting `depth` (0 is the frame's own code): lists the frame's
+// bindings in `dlets`, the names a nested function assigns (unshadowed) in `alam`, and the
+// captures, assignments and loops `cboxByRef` compares.
 function cboxScan(ix: i32, depth: i32, dlets: string[], alam: string[]) {
   if ix < 0 { return 0 }
   const n = P.nodes[ix]
+  if n is Ident {
+    if depth > 0 && (cboxShadow[n.identName] ?? 0) == 0 {
+      cboxNoteCap(n.identName)
+    }
+    return 0
+  }
   if n is FuncDecl {
+    if depth == 0 {
+      cboxOrd = cboxOrd + 1
+      cboxFnOrd = cboxOrd
+      if cboxArgFloor >= 0 { cboxFnOrd = cboxArgFloor }
+      cboxFnLoop = cboxLoopAt
+      cboxFnArm = cboxArmAt
+    }
     const fmark = cboxShTrail.length
     cboxShadowParams(ix)
     cboxScan(n.fnBody, depth + 1, dlets, alam)
@@ -1426,10 +1641,7 @@ function cboxScan(ix: i32, depth: i32, dlets: string[], alam: string[]) {
   if n is LetDecl {
     cboxScan(n.letInit, depth, dlets, alam)
     if depth == 0 {
-      if (cboxDletSeen[n.letName] ?? 0) == 0 {
-        cboxDletSeen[n.letName] = 1
-        dlets.push(n.letName)
-      }
+      cboxDeclare(n.letName, CBOX_LET, ix, dlets)
     } else {
       cboxShadowPush(n.letName)
     }
@@ -1457,18 +1669,30 @@ function cboxScan(ix: i32, depth: i32, dlets: string[], alam: string[]) {
       }
     }
     cboxScan(n.binLeft, depth, dlets, alam)
-    return cboxScan(n.binRight, depth, dlets, alam)
+    cboxScan(n.binRight, depth, dlets, alam)
+    if n.binOp == "=" && depth == 0 {
+      const w = P.nodes[unwrapParen(n.binLeft)]
+      if w is Ident { cboxNoteAsg(w.identName) }
+    }
+    return 0
   }
   if n is IfStmt {
-    // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
+    // An `else if` chain is walked along its spine, so its depth costs no stack (D1990); each
+    // link's condition and arms sit in the else arm of the link before it.
+    const armMark = cboxArmAt
     let cur = ix
     while cur >= 0 {
       const c = P.nodes[cur]
+      const at = cur
       cur = -1
       if c is IfStmt {
         cboxScan(c.ifCond, depth, dlets, alam)
+        const up = cboxArmAt
+        if depth == 0 { cboxArmOpen(at, 0) }
         cboxScan(c.ifThen, depth, dlets, alam)
+        cboxArmAt = up
         if c.ifElse >= 0 {
+          if depth == 0 { cboxArmOpen(at, 1) }
           if P.nodes[c.ifElse] is IfStmt {
             cur = c.ifElse
           } else {
@@ -1477,19 +1701,29 @@ function cboxScan(ix: i32, depth: i32, dlets: string[], alam: string[]) {
         }
       }
     }
+    cboxArmAt = armMark
     return 0
   }
   if n is WhileStmt {
+    if depth == 0 { cboxLoopOpen() }
     cboxScan(n.whileCond, depth, dlets, alam)
-    return cboxScan(n.whileBody, depth, dlets, alam)
+    cboxScan(n.whileBody, depth, dlets, alam)
+    if depth == 0 { cboxLoopClose() }
+    return 0
   }
   if n is ForRange {
     cboxScan(n.frFrom, depth, dlets, alam)
     cboxScan(n.frTo, depth, dlets, alam)
     cboxScan(n.frStep, depth, dlets, alam)
     const rmark = cboxShTrail.length
-    if depth > 0 { cboxShadowPush(n.frVar) }
+    if depth > 0 {
+      cboxShadowPush(n.frVar)
+    } else {
+      cboxLoopOpen()
+      cboxDeclare(n.frVar, CBOX_FORRANGE, ix, dlets)
+    }
     cboxScan(n.frBody, depth, dlets, alam)
+    if depth == 0 { cboxLoopClose() }
     return cboxShadowTrim(rmark)
   }
   if n is ForIn {
@@ -1498,8 +1732,13 @@ function cboxScan(ix: i32, depth: i32, dlets: string[], alam: string[]) {
     if depth > 0 {
       cboxShadowPush(n.fiVar)
       if n.fiVar2 != "" { cboxShadowPush(n.fiVar2) }
+    } else {
+      cboxLoopOpen()
+      cboxDeclare(n.fiVar, CBOX_FORIN, ix, dlets)
+      if n.fiVar2 != "" { cboxDeclare(n.fiVar2, CBOX_FORIN, ix, dlets) }
     }
     cboxScan(n.fiBody, depth, dlets, alam)
+    if depth == 0 { cboxLoopClose() }
     return cboxShadowTrim(imark)
   }
   if n is RetStmt { return cboxScan(n.retArg, depth, dlets, alam) }
@@ -1515,12 +1754,17 @@ function cboxScan(ix: i32, depth: i32, dlets: string[], alam: string[]) {
   if n is AsExpr { return cboxScan(n.asObj, depth, dlets, alam) }
   if n is Call {
     cboxScan(n.callFn, depth, dlets, alam)
+    const savedFloor = cboxArgFloor
+    if depth == 0 && savedFloor < 0 && hasNamedArgs(n.callArgNames) {
+      cboxArgFloor = cboxOrd
+    }
     const args = n.callArgs
     let ci = 0
     while ci < args.length {
       cboxScan(args[ci], depth, dlets, alam)
       ci = ci + 1
     }
+    cboxArgFloor = savedFloor
     return 0
   }
   // A spread's source is an operand like any other (D2334).
@@ -1620,6 +1864,119 @@ function cboxLitCopy(ix: i32) {
   -1
 }
 
+// Turns `let` `ix` into its cell: `let c: T = e` becomes `let c: T[] = [e]`, and the cell's
+// list type is recorded under `key`, the name whose reads become `c[0]`. A scalar annotation
+// takes its array form so the list classifies as the matching list type (`[0.0]` builds an
+// f64 list); an un-annotated cell is the list of its init's recorded type.
+function cboxBoxLet(ix: i32, key: string) {
+  const n = P.nodes[ix]
+  if !(n is LetDecl) { return 0 }
+  if n.letType >= 0 {
+    const lt = P.nodes[n.letType]
+    if lt is TypeRef {
+      // A composite element (`i32 | string`, `S | null`, a function type) is parenthesized,
+      // since `nm + "[]"` would bind to its last atom.
+      const elemTy = nodeTyIxOf(n.letType)
+      let boxedTy = -1
+      if elemTy >= 0 { boxedTy = mkArrayTy(elemTy) }
+      if boxedTy >= 0 { cboxCellTy[key] = boxedTy }
+      let cellName = lt.tyName + "[]"
+      if annUnionAtomsOf(n.letType) != 1 || annArrowAt(lt.tyName) >= 0 {
+        cellName = "(" + lt.tyName + ")[]"
+      }
+      n.letType = synthTypeRefTy(cellName, -1, boxedTy)
+    }
+  }
+  if n.letType < 0 {
+    const initTy = nodeTyIxOf(n.letInit)
+    if initTy >= 0 { cboxCellTy[key] = mkArrayTy(initTy) }
+  }
+  const els: i32[] = []
+  els.push(n.letInit)
+  n.letInit = mkArrayLit(els, -1)
+  nodeTyRecord(n.letInit, cboxCellTy[key] ?? -1)
+  0
+}
+
+// A `let <name>$cb = [<name>]` that seeds the cell of boxed parameter or loop variable `name`,
+// whose value has type `ty` and annotation `annot` (-1 for none). Reads of `name` go through
+// the cell from here on.
+function cboxSeedLet(name: string, annot: i32, ty: i32) {
+  const src = mkIdent(name, -1)
+  if ty >= 0 { nodeTyRecord(src, ty) }
+  const cell = name + "$cb"
+  const lx = mkLet("let", cell, annot, src, -1)
+  cboxBoxLet(lx, name)
+  cboxCellOf[name] = cell
+  lx
+}
+
+// Block `blk` with `first` put before its statements.
+function cboxPrepend(blk: i32, first: i32) {
+  const b = P.nodes[blk]
+  if b is Block {
+    const out: i32[] = []
+    out.push(first)
+    let i = 0
+    while i < b.blkStmts.length {
+      out.push(b.blkStmts[i])
+      i = i + 1
+    }
+    b.blkStmts = out
+  }
+  0
+}
+
+// `name = cell[0]`: a boxed range variable handed back to the loop, which steps from it.
+function cboxStoreBack(name: string) {
+  const cell = mkIdent(cboxCellOf[name] ?? name, -1)
+  const cellTy = cboxCellTy[name] ?? -1
+  if cellTy >= 0 { nodeTyRecord(cell, cellTy) }
+  mkBinary("=", mkIdent(name, -1), mkIndex(cell, mkNum("0", -1), -1), -1)
+}
+
+// Puts `name = cell[0]` before each `continue` under `ix` that targets the range loop being
+// rewritten: an unlabelled one outside any inner loop (`nest` 0), or one naming `label`.
+function cboxContStoreBack(ix: i32, name: string, label: string, nest: i32) {
+  let cur = ix
+  while cur >= 0 {
+    const n = P.nodes[cur]
+    if n is FuncDecl { return 0 }
+    if n is Block {
+      const bs = n.blkStmts
+      const out: i32[] = []
+      let i = 0
+      while i < bs.length {
+        const s = P.nodes[bs[i]]
+        if s is ContinueStmt {
+          if (
+            (s.contLabel == "" && nest == 0)
+            || (s.contLabel != "" && s.contLabel == label)
+          ) {
+            out.push(cboxStoreBack(name))
+          }
+        } else {
+          cboxContStoreBack(bs[i], name, label, nest)
+        }
+        out.push(bs[i])
+        i = i + 1
+      }
+      n.blkStmts = out
+      return 0
+    }
+    let inner = nest
+    if n is WhileStmt || n is ForRange || n is ForIn { inner = nest + 1 }
+    const kids = nodeValueSpineChildren(cur)
+    let k = 0
+    while k < kids.length {
+      cboxContStoreBack(kids[k], name, label, inner)
+      k = k + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  0
+}
+
 // How many nested function bodies `cboxWalk` is inside; a binding opened at depth 0 is the
 // maker's own and is boxed, one opened deeper shadows the maker's name.
 let cboxDepth = 0
@@ -1636,7 +1993,7 @@ function cboxWalk(ix: i32, boxed: string[]) {
       // The cell `c` carries the type of its list, so an element question about `c[0]` has
       // the binding's declared type to answer from. The read `c[0]` itself is untyped here;
       // only the left of a `??` or `=` is typed, by the `BinExpr` arm.
-      const cell = mkIdent(n.identName, -1)
+      const cell = mkIdent(cboxCellOf[n.identName] ?? n.identName, -1)
       const cellTy = cboxCellTy[n.identName] ?? -1
       if cellTy >= 0 { nodeTyRecord(cell, cellTy) }
       return mkIndex(cell, mkNum("0", -1), -1)
@@ -1672,39 +2029,7 @@ function cboxWalk(ix: i32, boxed: string[]) {
       cboxShadowPush(n.letName)
       return ix
     }
-    if capHas(boxed, n.letName) {
-      // Converts a scalar annotation to its array form so the boxed length-1 list classifies
-      // as the matching list type (`let c: f64` → `let c: f64[]`, so the `[0.0]` literal
-      // builds f32/f64 correctly). An un-annotated local needs no conversion — the `[init]`
-      // literal infers its own element type.
-      if n.letType >= 0 {
-        const lt = P.nodes[n.letType]
-        if lt is TypeRef {
-          // The array type is one `mkArrayTy` over the element's recorded arena index, not
-          // re-parsed from the name. A composite element (`i32 | string`, `S | null`, a
-          // function type) is parenthesized, since `nm + "[]"` would bind to its last atom.
-          const elemTy = nodeTyIxOf(n.letType)
-          let boxedTy = -1
-          if elemTy >= 0 { boxedTy = mkArrayTy(elemTy) }
-          if boxedTy >= 0 { cboxCellTy[n.letName] = boxedTy }
-          let cellName = lt.tyName + "[]"
-          if annUnionAtomsOf(n.letType) != 1 || annArrowAt(lt.tyName) >= 0 {
-            cellName = "(" + lt.tyName + ")[]"
-          }
-          n.letType = synthTypeRefTy(cellName, -1, boxedTy)
-        }
-      }
-      // An un-annotated binding's cell is the list of its init's recorded type, so a read
-      // `c[0]` classifies as the binding did (a `false` init reads back as a boolean).
-      if n.letType < 0 {
-        const initTy = nodeTyIxOf(n.letInit)
-        if initTy >= 0 { cboxCellTy[n.letName] = mkArrayTy(initTy) }
-      }
-      const els: i32[] = []
-      els.push(n.letInit)
-      n.letInit = mkArrayLit(els, -1)
-      nodeTyRecord(n.letInit, cboxCellTy[n.letName] ?? -1)
-    }
+    if capHas(boxed, n.letName) { cboxBoxLet(ix, n.letName) }
     return ix
   }
   if n is BinExpr {
@@ -1754,7 +2079,19 @@ function cboxWalk(ix: i32, boxed: string[]) {
     n.frStep = cboxWalk(n.frStep, boxed)
     const rmark = cboxShTrail.length
     if cboxDepth > 0 { cboxShadowPush(n.frVar) }
+    // A boxed range variable gets a cell per iteration, seeded from the counter, and hands the
+    // cell's value back to the counter wherever the iteration ends and the loop steps on.
+    let rseed = -1
+    if cboxDepth == 0 && capHas(boxed, n.frVar) {
+      rseed = cboxSeedLet(n.frVar, -1, TY_I32)
+    }
     n.frBody = cboxWalk(n.frBody, boxed)
+    if rseed >= 0 {
+      cboxContStoreBack(n.frBody, n.frVar, n.frLabel, 0)
+      const rb = P.nodes[n.frBody]
+      if rb is Block { rb.blkStmts.push(cboxStoreBack(n.frVar)) }
+      cboxPrepend(n.frBody, rseed)
+    }
     cboxShadowTrim(rmark)
     return ix
   }
@@ -1765,7 +2102,21 @@ function cboxWalk(ix: i32, boxed: string[]) {
       cboxShadowPush(n.fiVar)
       if n.fiVar2 != "" { cboxShadowPush(n.fiVar2) }
     }
+    // A boxed for-in variable gets a cell per iteration, seeded from the element.
+    let iseed = -1
+    let iseed2 = -1
+    if cboxDepth == 0 {
+      const iterTy = strLitRecvTy(nodeTyIxOf(n.fiIter))
+      if capHas(boxed, n.fiVar) {
+        iseed = cboxSeedLet(n.fiVar, -1, forInBindTy(iterTy, false))
+      }
+      if n.fiVar2 != "" && capHas(boxed, n.fiVar2) {
+        iseed2 = cboxSeedLet(n.fiVar2, -1, forInBindTy(iterTy, true))
+      }
+    }
     n.fiBody = cboxWalk(n.fiBody, boxed)
+    if iseed2 >= 0 { cboxPrepend(n.fiBody, iseed2) }
+    if iseed >= 0 { cboxPrepend(n.fiBody, iseed) }
     cboxShadowTrim(imark)
     return ix
   }
@@ -1839,93 +2190,132 @@ function cboxWalk(ix: i32, boxed: string[]) {
   return ix
 }
 
-// The init of the maker's direct `let name` (searching statements, not descending into a
-// nested lambda or an expression), or -1 — the box is built around it.
-function cboxInitOf(ix: i32, name: string) {
-  if ix < 0 { return -1 }
-  const n = P.nodes[ix]
-  if n is LetDecl {
-    if n.letName == name { return n.letInit }
-    return -1
-  }
-  if n is Block {
-    const bs = n.blkStmts
-    let i = 0
-    while i < bs.length {
-      const r = cboxInitOf(bs[i], name)
-      if r >= 0 { return r }
-      i = i + 1
-    }
-    return -1
-  }
-  if n is IfStmt {
-    const rt = cboxInitOf(n.ifThen, name)
-    if rt >= 0 { return rt }
-    return cboxInitOf(n.ifElse, name)
-  }
-  if n is WhileStmt { return cboxInitOf(n.whileBody, name) }
-  if n is ForRange { return cboxInitOf(n.frBody, name) }
-  if n is ForIn { return cboxInitOf(n.fiBody, name) }
-  -1
+// A zero value for a `let` annotated `letType` that has no init, typed at the annotation, or
+// -1 where the type has none to offer; the box needs something to hold before the first
+// assignment (a read before it is a definite-assignment error).
+function cboxZeroInit(letType: i32) {
+  if letType < 0 { return -1 }
+  const lt = P.nodes[letType]
+  if !(lt is TypeRef) { return -1 }
+  const nm = lt.tyName
+  let lit = -1
+  if nm == "i32" || nm == "i64" || nm == "u8" { lit = mkNum("0", -1) }
+  if nm == "f64" || nm == "f32" { lit = mkNum("0.0", -1) }
+  if nm == "boolean" { lit = mkBool(0, -1) }
+  if nm == "string" { lit = mkStr("", -1) }
+  if lit >= 0 { nodeTyRecord(lit, nodeTyIxOf(letType)) }
+  lit
 }
 
-// Per top-level function: boxes each direct `let` that is assigned inside a nested lambda
-// where no binding of the lambda shadows it and that has an init, of any kind (D2285).
-// Usage-gated — a program with no such local rewrites nothing (identical bytes).
+// The refusal for shared binding `nm` whose type has no zero value (D2340). Built in two
+// short chains: an interpolated string in the compiler source leaves the seed importing `print`.
+function cboxNoInitMsg(nm: string) {
+  const q = "`" + nm + "`"
+  q
+    + " is assigned after a closure captures it, so the closure shares it, and a shared binding of its type needs an initializer: give "
+    + q
+    + " one"
+}
+
+// The frame's bindings `cboxByRef` says a closure must share, from `dlets`. A `let` with no
+// init takes a zero value to box; one whose type has none cannot be boxed and is refused,
+// since capturing it by value would be silently wrong.
+function cboxPick(dlets: string[], alam: string[]) {
+  const boxed: string[] = []
+  let di = 0
+  while di < dlets.length {
+    const nm = dlets[di]
+    if cboxByRef(nm, alam) {
+      let ok = true
+      const lx = cboxLetIx[nm] ?? -1
+      if (cboxKind[nm] ?? CBOX_LET) == CBOX_LET && lx >= 0 {
+        const ld = P.nodes[lx]
+        if ld is LetDecl {
+          if ld.letInit < 0 { ld.letInit = cboxZeroInit(ld.letType) }
+          if ld.letInit < 0 {
+            emitFailAt(cboxNoInitMsg(nm), lx)
+            ok = false
+          }
+        }
+      }
+      if ok {
+        boxed.push(nm)
+        if (cboxKind[nm] ?? CBOX_LET) == CBOX_LET {
+          cboxCellNames[nm] = 1
+        } else {
+          cboxCellNames[nm + "$cb"] = 1
+        }
+      }
+    }
+    di = di + 1
+  }
+  boxed
+}
+
+// Per function frame (top-level or nested): boxes each binding a closure must share with it
+// (`cboxByRef`) — a `let`, a parameter, or a loop variable — and rewrites every use to go
+// through the cell. Usage-gated: a frame with no such binding rewrites nothing.
 export function captureBoxRewrite(_stmts: i32[]) {
+  cboxCellNames = Map()
   let fe = 0
   while fe < fnStmts.length {
     const fn = P.nodes[fnStmts[fe]]
     if fn is FuncDecl {
+      cboxFrameReset()
       const dlets: string[] = []
-      cboxDletSeen = Map()
-      cboxCellTy = Map()
       const alam: string[] = []
-      cboxScan(fn.fnBody, 0, dlets, alam)
-      const boxed: string[] = []
-      let di = 0
-      while di < dlets.length {
-        const nm = dlets[di]
-        if capHas(alam, nm) {
-          if cboxInitOf(fn.fnBody, nm) >= 0 { boxed.push(nm) }
-        }
-        di = di + 1
+      const ps = fn.fnParams
+      let pi = 0
+      while pi < ps.length {
+        const p = P.nodes[ps[pi]]
+        if p is Param { cboxDeclare(p.parName, CBOX_PARAM, ps[pi], dlets) }
+        pi = pi + 1
       }
-      if boxed.length > 0 { fn.fnBody = cboxWalk(fn.fnBody, boxed) }
+      cboxScan(fn.fnBody, 0, dlets, alam)
+      const boxed = cboxPick(dlets, alam)
+      if boxed.length > 0 {
+        // A parameter's cell is seeded at the top of the body, from the argument. An optional
+        // parameter's annotation names only the non-null part, so it takes its recorded type.
+        const seeds: i32[] = []
+        pi = 0
+        while pi < ps.length {
+          const p = P.nodes[ps[pi]]
+          if p is Param {
+            if capHas(boxed, p.parName) {
+              let annot = p.parType
+              if p.parOpt != 0 { annot = -1 }
+              seeds.push(cboxSeedLet(p.parName, annot, nodeTyIxOf(ps[pi])))
+            }
+          }
+          pi = pi + 1
+        }
+        fn.fnBody = cboxWalk(fn.fnBody, boxed)
+        let si = seeds.length - 1
+        while si >= 0 {
+          cboxPrepend(fn.fnBody, seeds[si])
+          si = si - 1
+        }
+      }
     }
     fe = fe + 1
   }
   cboxModuleFrame()
 }
 
-// The module frame's share of the rule: a `let` in a module-scope block is a start-function
-// local, captured by value like any maker's, so it boxes the same way. A top-level binding
-// is a global, which a closure assigns in place, and is not among these statements.
+// The module frame's share of the rule: a `let` in a module-scope block, and a module-scope
+// loop variable, is a start-function local, so it boxes as a function frame's does. A
+// top-level binding is a global, which a closure reads and assigns in place, and is not among
+// these statements.
 function cboxModuleFrame() {
+  cboxFrameReset()
   const dlets: string[] = []
-  cboxDletSeen = Map()
-  cboxCellTy = Map()
   const alam: string[] = []
   let si = 0
   while si < startStmts.length {
     cboxScan(startStmts[si], 0, dlets, alam)
     si = si + 1
   }
-  const boxed: string[] = []
-  let di = 0
-  while di < dlets.length {
-    const nm = dlets[di]
-    if capHas(alam, nm) {
-      let init = -1
-      let ii = 0
-      while ii < startStmts.length && init < 0 {
-        init = cboxInitOf(startStmts[ii], nm)
-        ii = ii + 1
-      }
-      if init >= 0 { boxed.push(nm) }
-    }
-    di = di + 1
-  }
+  const boxed = cboxPick(dlets, alam)
   if boxed.length == 0 { return 0 }
   let wi = 0
   while wi < startStmts.length {
