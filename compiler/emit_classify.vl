@@ -3965,8 +3965,9 @@ export function criFnIsAnonLambda(i: i32) {
 
 // Walk a block's statements classifying every `return <e>` under the same narrowing the
 // emit loops apply: each `if` arm under its condition's then or else narrowing, and a
-// divergent guard narrowing the rest of the block. The stack rewinds at block exit.
-export function criWalkBlock(blockIx: i32, i: i32) {
+// divergent guard narrowing the rest of the block. The stack rewinds at block exit. `tail`
+// says whether the block's last statement is the function's value: only then is it one.
+export function criWalkBlock(blockIx: i32, i: i32, tail: boolean) {
   if blockIx < 0 { return 0 }
   const b = P.nodes[blockIx]
   if b is Block {
@@ -3977,25 +3978,27 @@ export function criWalkBlock(blockIx: i32, i: i32) {
       // An if-arm's last statement may be a bare tail value rather than an explicit
       // `return`. For an anonymous lambda, classify it under the arm's active narrowing so a
       // value-if union return types from its arms. Lambda-gated to leave named-function
-      // inference unchanged.
+      // inference unchanged; an arm of an `if` that is not itself the tail is a statement.
+      const last = k == stmts.length - 1
       if (
-        k == stmts.length - 1 &&
+        tail &&
+        last &&
         criFnIsAnonLambda(i) &&
         stmtIsTailValue(stmts[k], fnStmts[i])
       ) {
         criClassify(stmts[k], i)
       }
-      criWalkStmt(stmts[k], i)
+      criWalkStmt(stmts[k], i, tail && last)
       pushPostGuardNarrow(stmts[k], fnStmts[i])
       k = k + 1
     }
     restoreNarrow(savedGuardTop)
     return 0
   }
-  criWalkStmt(blockIx, i)
+  criWalkStmt(blockIx, i, tail)
 }
 
-function criWalkStmt(stmtIx: i32, i: i32) {
+function criWalkStmt(stmtIx: i32, i: i32, tail: boolean) {
   if stmtIx < 0 { return 0 }
   const s = P.nodes[stmtIx]
   if s is RetStmt {
@@ -4014,7 +4017,7 @@ function criWalkStmt(stmtIx: i32, i: i32) {
       if c is IfStmt {
         const savedTop = narrowTop
         setNarrowFromCond(c.ifCond, fnStmts[i])
-        criWalkBlock(c.ifThen, i)
+        criWalkBlock(c.ifThen, i, tail)
         restoreNarrow(savedTop)
         if c.ifElse >= 0 {
           if elseTop < 0 { elseTop = narrowTop }
@@ -4022,7 +4025,7 @@ function criWalkStmt(stmtIx: i32, i: i32) {
           if P.nodes[c.ifElse] is IfStmt {
             cur = c.ifElse
           } else {
-            criWalkBlock(c.ifElse, i)
+            criWalkBlock(c.ifElse, i, tail)
           }
         }
       }
@@ -4030,14 +4033,14 @@ function criWalkStmt(stmtIx: i32, i: i32) {
     if elseTop >= 0 { restoreNarrow(elseTop) }
     return 0
   }
-  if s is WhileStmt { return criWalkBlock(s.whileBody, i) }
-  if s is ForRange { return criWalkBlock(s.frBody, i) }
-  if s is ForIn { return criWalkBlock(s.fiBody, i) }
+  if s is WhileStmt { return criWalkBlock(s.whileBody, i, false) }
+  if s is ForRange { return criWalkBlock(s.frBody, i, false) }
+  if s is ForIn { return criWalkBlock(s.fiBody, i, false) }
   // A bare `{ … }`, which reaches this walk: `computeRetInference` runs BEFORE
   // `drwBareBlock` rewrites the block to `if true { … }`, so this is one of the three ladders
   // a block can still arrive at. No witness — `fRetKind` has other producers that do
   // descend — so the arm is the exhaustiveness, not a fix (D1901).
-  if s is Block { return criWalkBlock(stmtIx, i) }
+  if s is Block { return criWalkBlock(stmtIx, i, tail) }
   0
 }
 
@@ -15618,7 +15621,7 @@ export function memberCallYieldsValue(stmtIx: i32) {
 }
 
 // Whether the assignment at `asgIx` lowers as a value by storing and re-reading its target: a
-// name, a captured name's cell (`c[0]`, minted by the capture rewrite with no checked type), or
+// name, a captured literal-union cell (`c[0]`, which the capture rewrite leaves untyped), or
 // a literal-index / field write on a named non-map place whose checked type is the assignment's.
 export function assignTargetReReads(asgIx: i32, fnIx: i32): boolean {
   const a = P.nodes[asgIx]
@@ -15639,7 +15642,7 @@ export function assignTargetReReads(asgIx: i32, fnIx: i32): boolean {
   if exprMap(recv, fnIx) { return false }
   const tt = nodeTyIxOf(a.binLeft)
   if tt < 0 { return tgt is Index && P.nodes[tgt.idxArr] is Ident }
-  tt == nodeTyIxOf(asgIx)
+  tySame(tt, nodeTyIxOf(asgIx))
 }
 
 // True if the statement at `stmtIx` is a bare value expression usable as an implicit
