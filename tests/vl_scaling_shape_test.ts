@@ -587,6 +587,40 @@ axis(
   (d) => twoFiles(d, genSiblingBlocks(2500, "unique"), genSiblingBlocks(2500, "hoisted")),
 );
 
+// `genSiblingBlocks` with five temps whose reps alternate on their OWN periods (2, 3, 5, 7,
+// 11 blocks), as a translator's `const m = 5` beside `const m = rax + 8` does. The tuple of
+// classes the five names resolve to at a slot position then repeats only every 2,310 blocks.
+const genSiblingReps = (n: number, temps: "same" | "hoisted"): string => {
+  const periods = [2, 3, 5, 7, 11];
+  const o = ["function f(a: i32): i32 {", "  let acc = 0"];
+  if (temps === "hoisted") {
+    for (let j = 0; j < periods.length; j++) o.push(`  let t${j}f = 0.0`, `  let t${j}i = 0`);
+  }
+  for (let i = 0; i < n; i++) {
+    const parts: string[] = [];
+    for (let j = 0; j < periods.length; j++) {
+      const isF = i % periods[j] === 0;
+      const name = temps === "same" ? `t${j}` : `t${j}${isF ? "f" : "i"}`;
+      const d = temps === "same" ? "const " : "";
+      parts.push(`${d}${name} = ${isF ? "1.5" : `a + ${i % 97}`}`);
+      parts.push(isF ? `print(${name})` : `acc = acc + ${name}`);
+    }
+    o.push(`  { ${parts.join("; ")} }`);
+  }
+  o.push("  acc", "}", "print(f(7))");
+  return o.join("\n") + "\n";
+};
+
+// The sweep dedupe above keys on the whole tuple, so here it re-swept the body once per
+// distinct tuple: 2,310 sweeps of a 2,500-block body. Sweeping each name's rep classes
+// instead of its slot positions takes two (D2309).
+axis(
+  "same-named locals of several reps",
+  2.5,
+  "`dupScanRun` is sweeping once per slot position or class tuple rather than per class (D2309).",
+  (d) => twoFiles(d, genSiblingReps(2500, "same"), genSiblingReps(2500, "hoisted")),
+);
+
 // One `match` of `n` arms, each reading the module global `k`, written as a closure's body or
 // as a top-level function's. Every arm's read asks whether `k` is a capture of the frame, which
 // a top-level function answers without a walk. Both arms share `fill` statements so the cheap

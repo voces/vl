@@ -6749,6 +6749,31 @@ type tables as parallel `i32[]` columns, not one GC struct per node, because eve
 a header; (3) have emit write bytes straight to the output buffer, not into intermediate lists.
 Today's policy puts plumb's REAL units (2 MB) at ~417 MB, which fits.
 
+## `wasm-opt` runs on at most four threads (2026-09-24) — plumb compile perf, D2311
+
+**The rule** (`optimize_in_place`, `scripts/vl-host/src/main.rs`): every `wasm-opt` the host
+spawns for `-O`/`-O3` gets `BINARYEN_CORES=min(4, cores)`, unless the caller's environment
+already sets `BINARYEN_CORES`, which then wins. Binaryen's own default is one worker per core.
+
+**Why.** plumb builds hundreds of units side by side and pays for CPU seconds and memory, not
+for one unit's wall clock, and binaryen's extra workers mostly spin. Measured on the escape
+step's output of three plumb units, `-g --always-inline-max-function-size 8 -O`, binaryen 133,
+24 cores, box load ~5:
+
+| unit | threads | wall | user CPU | peak RSS |
+| --- | ---: | ---: | ---: | ---: |
+| `chunk_550` (0.43 MB) | 24 / 4 / 1 | 0.13 / 0.16 / 0.48 s | 0.71 / 0.50 / 0.48 s | 33 / 29 / 27 MB |
+| `chunk_662` (2.0 MB) | 24 / 4 / 1 | 0.32 / 0.54 / 1.90 s | 2.88 / 1.92 / 1.93 s | 80 / 55 / 51 MB |
+| `chunk_466` (4.8 MB) | 24 / 4 / 1 | 2.61 / 2.78 / 3.95 s | 4.61 / 4.16 / 3.99 s | 249 / 162 / 101 MB |
+
+Four threads cost the CPU of one and keep most of the wall-clock gain; the output is
+byte-identical at every thread count. A single interactive build of a large unit pays ~0.2 s of
+wall at `chunk_662`'s size, which `BINARYEN_CORES=24` buys back.
+
+**The same change set** stops asking the seed for `vl-src` under `-O` (the host stripped it
+anyway) and drops the compiler's `Store` before the first `wasm-opt`, so a unit's GC heap is
+not resident while binaryen runs: process-tree peak RSS 663 → 420 MB on `chunk_466`.
+
 ## `-O3` keeps hot callees out of run-once code (2026-09-22) — lane L8
 
 **The defect.** V8 compiles every wasm function with its baseline compiler (Liftoff) first and

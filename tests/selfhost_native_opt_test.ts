@@ -108,3 +108,45 @@ for (const rel of CASES_LIST) {
     },
   });
 }
+
+// The host caps `wasm-opt` at four worker threads unless `$BINARYEN_CORES` says otherwise:
+// binaryen's default of one per core cost plumb's units more CPU and memory for the same bytes
+// (D2311). A wrapper standing in for `wasm-opt` records the value each run was handed.
+Deno.test({
+  name: "native-opt: -O hands wasm-opt at most four threads, and an explicit BINARYEN_CORES wins",
+  ignore: !ENABLED,
+  fn: async () => {
+    const tmp = await Deno.makeTempDir();
+    try {
+      const log = `${tmp}/cores.log`;
+      const wrap = `${tmp}/wasm-opt`;
+      Deno.writeTextFileSync(
+        wrap,
+        `#!/bin/sh\necho "\${BINARYEN_CORES-unset}" >> "${log}"\nexec "${WASM_OPT}" "$@"\n`,
+      );
+      Deno.chmodSync(wrap, 0o755);
+      const src = new URL("arith/ops.vl", CASES).pathname;
+      const runs = async (env: Record<string, string>) => {
+        try {
+          Deno.removeSync(log);
+        } catch { /* no earlier run */ }
+        const b = await vl(["build", src, "-O", "-o", `${tmp}/o.wasm`], { VL_WASM_OPT: wrap, ...env });
+        if (b.code !== 0) throw new Error(`vl build -O failed: ${b.err.trim().split("\n")[0]}`);
+        return Deno.readTextFileSync(log).trim().split("\n");
+      };
+      if (Deno.env.get("BINARYEN_CORES") === undefined) {
+        const cap = String(Math.min(4, navigator.hardwareConcurrency));
+        const got = await runs({});
+        if (got.some((v) => v !== cap)) {
+          throw new Error(`default: want every wasm-opt run at ${cap} threads, got ${JSON.stringify(got)}`);
+        }
+      }
+      const pinned = await runs({ BINARYEN_CORES: "2" });
+      if (pinned.some((v) => v !== "2")) {
+        throw new Error(`BINARYEN_CORES=2: want every run at 2, got ${JSON.stringify(pinned)}`);
+      }
+    } finally {
+      await Deno.remove(tmp, { recursive: true });
+    }
+  },
+});
