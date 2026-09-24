@@ -58,8 +58,9 @@ def main(argv: list[str]) -> int:
     st_frame = th["stackTable"]["frame"]
 
     def name_of(s: int) -> str:
-        # a merged module's functions carry the `$mN` suffix the rename pass gave them
-        return re.sub(r"\$m\d+$", "", strings[func_name[frame_func[st_frame[s]]]])
+        # a merged module's functions carry the `$mN` suffix the rename pass gave them, and a
+        # `--names` seed appends `@file:line`
+        return re.sub(r"\$m\d+(@.*)?$", "", strings[func_name[frame_func[st_frame[s]]]])
 
     memo: dict[int, str | None] = {}
 
