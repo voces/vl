@@ -178,25 +178,30 @@ def gen_rmw():
     c.write()
 
 
+REPL = -0x5A5A5A5A5A5A5A5B  # the replacement, read from a binding at its row's width
+
+
 def gen_cmpxchg():
     c = Case("cmpxchg.vl", [
         "cmpxchg at every width, on a match and on a mismatch. Each answers the OLD value;",
         "only a match stores the replacement. A narrow `expected` is wrapped to the access",
         "width before the compare, so one whose high bits are set still matches.",
     ])
+    c.body.append(f"  const r32 = {signed(REPL, 32)}")
+    c.body.append(f"  const r64 = {signed(REPL, 64)}")
     for shape, bits, n in WIDTHS:
         u = "_u" if n else ""
         name = f"__atomic_rmw{n}_cmpxchg{u}_{shape}__"
         off = OFFSET[bits]
         top = 32 if shape == "i32" else 64
-        repl = signed(-0x5A5A5A5A5A5A5A5B, top)
+        repl = signed(REPL, top)
         cur = get(SEED, off, bits)
         cases = [signed(cur, top), signed(cur + 1, top)]  # match, then mismatch
         if n:
             cases.append(signed(cur | (1 << bits) | (1 << (top - 1)), top))  # wraps to a match
         for exp in cases:
             mem = c.reset()
-            c.value(f"{name}(BASE + {off}, {lit(exp, shape)}, {lit(repl, shape)})", cur, shape)
+            c.value(f"{name}(BASE + {off}, {lit(exp, shape)}, r{top})", cur, shape)
             if exp % (1 << bits) == cur:
                 put(mem, off, bits, repl)
             c.window(mem)

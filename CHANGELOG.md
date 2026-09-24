@@ -870,7 +870,8 @@ new: the compare-frame pre-pass never recurses into a code-15 field, so a NESTED
   widths, add/sub/and/or/xor/xchg/cmpxchg at each of the seven widths,
   `__atomic_wait32__`/`__atomic_wait64__`, `__atomic_notify__` and `__atomic_fence__`. Every
   rmw answers the OLD value; a narrow access zero-extends it and wraps its operands. The
-  memarg carries the natural alignment, so a misaligned address traps. One table in
+  memarg carries the natural alignment, so a misaligned address traps. A getter may read
+  with an atomic load, as with `__load_i32__`. One table in
   `typecheck.vl` drives the declarations, the reservation, the import scan and the emitter.
   `vl build -O`/`-O3` now pass binaryen `--enable-threads`, which leaves the bytes of a
   module with no atomics unchanged (136 corpus modules at both rungs, and the compiler seed).
