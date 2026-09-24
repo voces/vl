@@ -286,6 +286,45 @@ columns would save more (a node averages ~97 B; columns ~30), roughly −20 MiB,
 2,599 `P.nodes[` sites and every `is <Node>` narrowing. That is not a bounded change and was
 not started.
 
+## Measured 2026-09-24, third pass — plumb's tail units are binaryen's (D2335, D2336)
+
+After #3108 and #3112 plumb's rebuild (625 units, `-P12`, one binaryen thread) was set by its
+tail: 23 units over 10 s. On the five slowest, frozen copies, `VL_PROFILE=1` put the time in
+`opt.rung`, not the compile: `chunk_335` 1.3 s compile against 16.1 s of `wasm-opt`,
+`chunk_568` 2.9 against 11.4. The guest side was checked with `$VL_FUEL` and is linear in the
+source (920–7,255 fuel per byte across twelve units, no outlier among the slow ones), so there
+was nothing superlinear in the compiler to find.
+
+**Binaryen per pass.** `BINARYEN_PASS_DEBUG=1 wasm-opt … --no-validation` prints each pass's
+time; `--no-validation` matters, because without it the nested runner of `inlining-optimizing`
+validates after every pass and the reading is mostly that. Capture the rung's exact input and
+argv by pointing `$VL_WASM_OPT` at a wrapper that copies `$1` and runs the real one. The five
+units split three ways:
+
+| unit | largest function | the pass that dominated |
+| --- | --- | --- |
+| `chunk_335` | 19,902 sets, 3,026 locals | `coalesce-locals` 2.4 s, then `inlining-optimizing` 6.9 s |
+| `chunk_334` | 21,661 sets | `coalesce-locals` 4.6 s |
+| `chunk_568` | 16,966 sets, 22,271 bare blocks | `code-pushing` 7.4 s |
+| `chunk_101` | 17,781 sets | `code-pushing` 2.3 s |
+| `chunk_393` | 22,917 sets | `ssa-nomerge` 2.6 s, `inlining-optimizing` 3.0 s |
+
+**Two mechanisms.** Every bare `{ … }` was emitted as `if (i32.const 1)`, and `code-pushing`'s
+`optimizeIntoIf` walks the rest of the block for each `if` it can push into (D2335). And
+`ssa-nomerge` gives every merge-free `local.set` its own local, so a function with 20,000 sets
+reaches `coalesce-locals` with ~9,000 locals, past the 8,192 at which binaryen's interference
+matrix becomes a hash map; `pickIndicesFromOrder` then does its pairwise loop in the map
+(D2336). The count of locals at `coalesce-locals`, read by running the passes before it one by
+one, is what exposed the cliff: 9,271 on `chunk_335`, with `coalesce-locals` alone 2.5 s.
+
+**Fixes and the result** (`--names -O --import-memory`, one binaryen thread, CPU min of 2
+interleaved, master host + seed against this branch): `chunk_335` 12.8 → 3.7 s, `chunk_334`
+13.2 → 6.5 s, `chunk_568` 15.0 → 6.2 s, `chunk_393` 11.9 → 8.3 s, `chunk_101` 10.1 → 7.2 s,
+`chunk_0` (median) 3.66 → 3.64 s. What is left on 334, 393 and 101 is the compile itself,
+~4 s each and linear, and `inlining-optimizing`'s one re-run of the pipeline after the PL-027
+leaves are inlined. The pass-list rule and its runtime price: DECISIONS.md, "`-O` skips
+`ssa-nomerge` for a function over 8,192 sets".
+
 ## Guards
 
 Four, and they fire at different moments. Profiling is what you do AFTER one of them does.
@@ -363,3 +402,13 @@ Four, and they fire at different moments. Profiling is what you do AFTER one of 
   live sets, so their CPU and RSS here are not #3108's or #3112's own before-numbers. ~10 s
   a run in the gate (16 s CPU), and it gates in ci-native with `--require-fuel`, where CPU is
   not graded (another machine) and `-O`'s `wasm-opt` step is stubbed out (no binaryen there).
+
+  **A second, TAIL unit** (`--shape tail`, D2335/D2336) puts the whole 2 MB in one function,
+  as plumb's slowest units do: ~38,000 `local.set`s, ~10,000 bare blocks. Its cost is
+  binaryen's, which fuel cannot see, so the wrapper that times `wasm-opt` also records two
+  facts about the rung's input that no load can move, and both units grade them exactly:
+  whether the host passed `--skip-pass=ssa-nomerge` (tail yes, main no), and how many
+  `i32.const 1; if` byte runs the module holds (zero since D2335; a revert puts it in the
+  thousands). They grade in ci-native too, where the wrapper still sees the input and argv.
+  The tail unit's `-O` CPU on a quiet box: 4.5 s with neither fix, 2.0 s with D2335 alone,
+  1.4 s with both.

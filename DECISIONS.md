@@ -7080,6 +7080,57 @@ elsewhere it is small (the compiler +0.94%, `decode-bench` +21 bytes, the 86 `be
 * *A much larger size.* L4 measured `-aimfs 400` doubling `decode-bench` and costing V8 3–6%;
   12 already buys almost nothing over 8 here.
 
+## `-O` skips `ssa-nomerge` for a function over 8,192 sets (2026-09-24) — plumb's tail units, D2336
+
+**The defect.** After #3108 and #3112, plumb's rebuild was set by its tail: 23 of 625 units
+over 10 s, `chunk_335` at 45.8 s wall inside a `-P12` run. Every one of the five slowest was
+binaryen, not the compiler (`VL_PROFILE`, 335: compile 1.3 s, `wasm-opt` 16.1 s), and every
+one holds a translated function of 10,000–28,000 `local.set`s. `ssa-nomerge` gives each of
+those sets a local of its own; `coalesce-locals` then crosses binaryen's 8,192-local limit for a
+dense interference matrix and does its N² pair loop in a hash map, `code-pushing` pushes the new
+single-assignment locals and re-walks the rest of the block per `if`, and `inlining-optimizing`
+re-runs all of it after inlining the PL-027 leaf helpers. D2336 has the per-pass readings.
+
+**The rule.** The host adds `--skip-pass=ssa-nomerge` to either rung when some function of the
+rung input holds more than 8,192 `local.set`/`local.tee` (`SSA_SPLIT_MAX_SETS`). The count is an
+upper bound on the locals `ssa-nomerge` can make, so a module under the bar can never reach the
+hash-map matrix through it, and such a module gets exactly the pass list it had.
+
+**Measured.** binaryen 133, `BINARYEN_CORES=1`, `--names -O --import-memory`, before = master
+host and seed, after = this rule and D2335, CPU min of 2 interleaved at load 3–7:
+
+| unit | largest function's sets | before | after | size |
+| --- | ---: | ---: | ---: | ---: |
+| `chunk_335` | 19,902 | 12.8 s | **3.7 s** | +0.08% |
+| `chunk_334` | 21,661 | 13.2 s | **6.5 s** | +0.07% |
+| `chunk_568` | 16,966 | 15.0 s | **6.2 s** | +0.7% |
+| `chunk_393` | 22,917 | 11.9 s | **8.3 s** | +0.2% |
+| `chunk_101` | 17,781 | 10.1 s | **7.2 s** | +0.07% |
+| `chunk_0` (median) | 253 | 3.66 s | 3.64 s | +0.02% |
+
+Of the 615 units in plumb's tree that day, 27 hold a function over the bar (counted from source
+assignments, which matched the emitted set count exactly on the units checked).
+
+**Runtime.** No `bench/` program and not `tools/decode-bench.vl` has a function over the bar:
+all 48 build byte-identical at `-O`. For the units that change there is no runnable unit (they
+import the rest of the game), so the stand-in is one generated function of 12,000
+transliterated-style blocks (registers as `i64` lets, `{ const m = …; st64(m, r) }` blocks,
+flag updates, labelled blocks left by `break`, register spills around calls), called 400,000
+times: V8 3.12 → 3.11 s, wasmtime 5.18 → 4.86 s, min of 3 interleaved, same stdout. Its build
+went 25.9 → 5.5 s.
+
+**What was rejected.**
+* *Skipping `ssa-nomerge` everywhere.* It is 7–30% off `wasm-opt` on ordinary units too, at
+  ±0.5% size, but every `-O` output in the tree would change for a pass whose runtime effect
+  on small functions was not measured here. The bar keeps the change to the modules that pay.
+* *Capping inlining into huge functions* (`--inline-max-combined-binary-size`). It removes the
+  re-optimisation, and with it PL-027's inlining of `rg`/`sr` into exactly the functions that
+  call them most: 6x on V8 in the leaf stand-in of that section.
+* *Inlining the leaves before `-O`* (`--inlining` first). The helpers only reach size 8 after
+  the first function pipeline, so the early pass inlined nothing and `-O` cost the same.
+* *Reusing locals across sibling blocks in the emitter.* `ssa-nomerge` splits them again: the
+  count it creates is set by the writes, not by the locals it is handed.
+
 ## A string-literal type reps as the atom wherever it lives, and a `const` bound to a literal has its type (owner, 2026-09-23) — D2150, D2156, D2157
 
 *The owner's two rulings: "comparing two string literals should be allowed, even if in objects,
