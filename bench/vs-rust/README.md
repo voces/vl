@@ -8,9 +8,10 @@ process so the only variable is the code the two compilers produced.
 **Provenance.** The kernels (`k.vl`, `k.rs`) were written by **plumb** (a VL consumer
 transliterating Warcraft III to wasm) while chasing exactly this question, filed as `PL-037` in
 plumb's own issue log (`docs/vl-issues.md`, a separate repository), and shared with the VL
-project for use here. They keep their original header comment (which now also credits plumb) —
-keep the VL and Rust versions semantically identical; a change to one without the matching
-change to the other invalidates the comparison.
+project for use here. They keep their original header comment (which now also credits plumb);
+`k.vl` is additionally reformatted with `vl fmt` (whitespace only, to satisfy this repo's format
+gate — the comment says so) and `k.rs` is untouched. Keep the VL and Rust versions semantically
+identical; a change to one without the matching change to the other invalidates the comparison.
 
 ## What's here
 
