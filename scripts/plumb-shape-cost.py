@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """The compile-cost ratchet on generated code: what one `vl build --names -O --import-memory`
-of a plumb-shaped unit costs, against a committed one-line baseline.
+of each of two plumb-shaped units costs, against a committed one-line baseline.
 
     python3 scripts/plumb-shape-cost.py [--check]          # grade (the gate row)
     python3 scripts/plumb-shape-cost.py --write-baseline   # after a real change, on a quiet box
@@ -22,7 +22,9 @@ its bar, each fall printed and passed:
 `wasm-opt` is timed by pointing `$VL_WASM_OPT` at this file, which runs the real one (or, for
 the fuel build or a box without a native one, nothing) and logs its rusage. It also logs two
 facts about the rung's input that no load can move, graded exactly: whether the host skipped
-`ssa-nomerge` (D2336), and how many `i32.const 1; if` byte runs the module holds (D2335).
+`ssa-nomerge` (D2336), and how many `i32.const 1; if` byte runs the module holds (D2335). A
+host built before D2336 has no size rule, so it is graded on neither the first fact nor the
+tail unit's `-O` CPU until it is rebuilt, except under `--require-fuel`.
 Measurements and the bars' reasons: docs/internals/profiling-the-compiler.md §Guards.
 """
 
@@ -309,6 +311,10 @@ def main(argv: list[str]) -> int:
         if over:
             bad.append(name)
 
+    # A host built before D2336 has no size rule to apply; like one without `$VL_FUEL`, it
+    # passes locally until the shared binary is rebuilt, and `--require-fuel` (CI) grades it.
+    with open(vl, "rb") as fh:
+        host_skips = b"--skip-pass=ssa-nomerge" in fh.read()
     for uname, m in units.items():
         b = bases[uname]
         tag = f"{uname} "
@@ -322,6 +328,9 @@ def main(argv: list[str]) -> int:
         grade(tag + "peak RSS", m["rss_mb"], b["rss_mb"], BAR_RSS, " MB")
         # Exact: a rung input's shape does not depend on the box.
         for key, what in (("skip_ssa", "skips ssa-nomerge"), ("const_ifs", "const-1 ifs")):
+            if key == "skip_ssa" and not host_skips and not require_fuel:
+                print(f"  {tag + what:15s} not graded: this host predates D2336 (rebuild scripts/vl-host)")
+                continue
             ok = m[key] == b.get(key) if key == "skip_ssa" else (m[key] or 0) <= (b.get(key) or 0)
             print(f"  {tag + what:15s} {m[key]} against {b.get(key)} {'ok' if ok else 'CHANGED'}")
             if not ok:
@@ -334,6 +343,8 @@ def main(argv: list[str]) -> int:
                        f"{100 * (QUIET - 1):.0f}% of its {base['control_cpu']:.3f}s")
         grade(tag + "compile", m["compile_cpu"], b["compile_cpu"], BAR_COMPILE_CPU, "s", cpu_why)
         opt_why = cpu_why
+        if opt_why is None and b.get("skip_ssa") and not host_skips:
+            opt_why = "this host predates D2336 (rebuild scripts/vl-host)"
         if opt_why is None and m["wasm_opt"] != b["wasm_opt"]:
             opt_why = f"wasm-opt is `{m['wasm_opt']}`, the baseline's `{b['wasm_opt']}`"
         grade(tag + "-O", m["opt_cpu"], b["opt_cpu"], BAR_OPT_CPU, "s", opt_why)

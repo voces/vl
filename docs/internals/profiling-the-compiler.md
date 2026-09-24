@@ -411,4 +411,5 @@ Four, and they fire at different moments. Profiling is what you do AFTER one of 
   `i32.const 1; if` byte runs the module holds (zero since D2335; a revert puts it in the
   thousands). They grade in ci-native too, where the wrapper still sees the input and argv.
   The tail unit's `-O` CPU on a quiet box: 4.5 s with neither fix, 2.0 s with D2335 alone,
-  1.4 s with both.
+  1.4 s with both. A host built before D2336 is graded on neither `skip_ssa` nor the tail
+  unit's `-O` CPU (it has no size rule to apply) until rebuilt, except under `--require-fuel`.
