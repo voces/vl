@@ -533,11 +533,12 @@ program verbatim — the only way to pass one that starts with `-`.
                       one memory can back several instances (Web Workers).
                       Only the memory is shared: each instance keeps its own
                       GC heap and globals, and runs top-level code once.
-                      HAZARD: at most ONE instance may allocate from
-                      std:buffer — each instance's allocator hands out the
-                      same addresses. Growth stops at the max
+                      Every instance may allocate from std:buffer: its
+                      pointer lives in the heap's first 8 bytes, so no
+                      instance is handed another's Buf. Growth stops at the max
   {c}--heap-base={r}<addr>  First byte std:buffer may hand out (default 1024;
-                      decimal or 0x hex, a nonzero multiple of 8)
+                      decimal or 0x hex, a nonzero multiple of 8; the first
+                      Buf is 8 bytes later under --shared-memory)
   {c}--heap-limit={r}<addr> One past the last (a multiple of 8); a Buffer() past it
                       TRAPS rather than growing into memory the host owns
                       (default 2 GiB). Bytes

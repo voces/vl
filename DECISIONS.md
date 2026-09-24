@@ -6596,7 +6596,9 @@ must be able to call `Buffer` without landing on another's live allocation.
 - **The switch is `__memory_shared__()`, a build-time `boolean` intrinsic, and the compiler FOLDS
   it.** An else-less `if __memory_shared__() { … }` is decided by the first emit pass
   (`foldMemShared`): a shared build keeps the body as a bare block, any other build drops the
-  statement before anything else reads the tree. Both arms are type-checked on every build, and
+  statement before anything else reads the tree. Only a call the checker resolved to the
+  intrinsic folds (`memSharedCalls`); a parameter spelled `__memory_shared__` stays an ordinary
+  call, and every other use of the intrinsic lowers to an `i32.const`. Both arms are type-checked on every build, and
   one source file carries both allocators. A default build is byte-identical to the build before
   this lane — 498 of 498 buildable programs (every `bench/` program and every test importing
   `std:buffer` or `std:fs`, each at the default, `-O` and `--import-memory`) — which is why the
