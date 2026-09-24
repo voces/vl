@@ -2774,6 +2774,9 @@ let retTailPos = false
 // already resolves a top-level function. Membership also drives the pass-2 redeclare-error skip,
 // the hoist owning the canonical declaration.
 let moduleGlobals: {[string]: boolean} = Map()
+// The integer-literal initializer of each top-level `const`, by name: what a memory
+// intrinsic's offset may name besides a literal (`memOffsetArgCheck`).
+let moduleConstIntInit: {[string]: i32} = Map()
 
 // Recursive return-type inference (binding-group fixpoint). A function whose return becomes
 // knowable only after a recursive cycle resolves cannot be inferred in one demand pass, since the
@@ -3864,6 +3867,7 @@ export function initChecker() {
   opBinDispatched = []
   opBinDeclined = []
   moduleGlobals = Map()
+  moduleConstIntInit = Map()
   topUnannotFns = []
   nestedUnannotFns = []
   nestedUnannotTys = []
@@ -4621,6 +4625,69 @@ export function nameIsMemStoreIntrinsic(name: string) {
   if name == "__store_i8__" { return true }
   if name == "__store_i16__" { return true }
   false
+}
+
+// The operand count of a linear-memory intrinsic that carries a memarg, WITHOUT the optional
+// offset, or -1 for a name that has none. The offset form takes one more argument, the
+// offset, always second: `__load_i64__(p, 16)`, `__store_i32__(p, 8, v)`. The fence has no memarg.
+function memOffsetBaseArity(name: string): i32 {
+  if name == "__load_i32__" || nameIsMemLoadIntrinsic(name) { return 1 }
+  if name == "__store_i32__" || nameIsMemStoreIntrinsic(name) { return 2 }
+  const srow = simdRow(name)
+  if srow >= 0 {
+    const ssig = simdRowSig(srow)
+    if ssig == SIMD_SIG_LOAD { return 1 }
+    if ssig == SIMD_SIG_STORE { return 2 }
+    return -1
+  }
+  const arow = atomicRow(name)
+  if arow < 0 { return -1 }
+  const asig = atomicRowSig(arow)
+  if asig == ATOMIC_SIG_LOAD { return 1 }
+  if asig == ATOMIC_SIG_STORE || asig == ATOMIC_SIG_RMW { return 2 }
+  if asig == ATOMIC_SIG_NOTIFY { return 2 }
+  if asig == ATOMIC_SIG_CMPXCHG || asig == ATOMIC_SIG_WAIT { return 3 }
+  -1
+}
+
+// The largest memarg offset: wasm32's offset immediate is a u32.
+export const MEM_OFFSET_MAX: i64 = 4294967295
+
+// The value of integer lexeme `t` when it is at most `MEM_OFFSET_MAX`, else -1. Radix prefixes
+// and `_` separators are honoured; the walk stops once the value passes the bound.
+export function memOffsetLexValue(t: string): i64 {
+  if numLexIsFloat(t) { return -1 }
+  let base: i64 = 10
+  let i = 0
+  if t.length >= 2 && t[0] == '0' {
+    const p = t[1]
+    if p == 'x' || p == 'X' {
+      base = 16
+      i = 2
+    } else if p == 'b' || p == 'B' {
+      base = 2
+      i = 2
+    } else if p == 'o' || p == 'O' {
+      base = 8
+      i = 2
+    }
+  }
+  if i >= t.length { return -1 }
+  let v: i64 = 0
+  while i < t.length {
+    const c = t[i]
+    if c != '_' {
+      let d = -1
+      if c >= '0' && c <= '9' { d = c - '0' }
+      else if c >= 'a' && c <= 'f' { d = c - 'a' + 10 }
+      else if c >= 'A' && c <= 'F' { d = c - 'A' + 10 }
+      if d < 0 || (d as i64) >= base { return -1 }
+      v = v * base + (d as i64)
+      if v > MEM_OFFSET_MAX { return -1 }
+    }
+    i = i + 1
+  }
+  v
 }
 
 // ── the host floor: one ordered list, six readers ────────────────────────────
@@ -28344,6 +28411,86 @@ function simdLaneLitCheck(nm: string, argIx: i32, max: i32) {
   0
 }
 
+// A memory intrinsic called with one argument more than it declares: the offset form, whose
+// second argument is the memarg offset. Checks the offset (`memOffsetArgCheck`) and every other
+// argument against the declared parameter it stands for; answers the call's type, or -1 when
+// the call is not this form (a shadowed name, a named argument, any other arity).
+function checkMemOffsetCall(n: Call, cfn: Ident): i32 {
+  const nm = cfn.identName
+  const base = memOffsetBaseArity(nm)
+  if base < 0 || n.callArgs.length != base + 1 { return -1 }
+  if hasNamedArgs(n.callArgNames) { return -1 }
+  if (fnDeclIx[nm] ?? -1) >= 0 || lookupDepth(nm) != 0 { return -1 }
+  const ft = T.tys[checkNode(n.callFn)]
+  if ft is TyFunc {
+    const ps = ft.fnParamTypes
+    if ps.length != base { return -1 }
+    memOffsetArgCheck(nm, n.callArgs[1])
+    let k = 0
+    while k < base {
+      let pos = k
+      if k >= 1 { pos = k + 1 }
+      const a = n.callArgs[pos]
+      seedExpected(a, ps[k])
+      const at = checkNode(a)
+      if !assignableExpr(a, at, ps[k]) { argMismatchErr(pos + 1, ps[k], at, a) }
+      k = k + 1
+    }
+    return ft.fnRet
+  }
+  -1
+}
+
+// Reports unless the offset argument at `argIx` is a compile-time integer in
+// `0..MEM_OFFSET_MAX`: a literal, a top-level `const` bound to one that no nearer binding
+// shadows, or a sum of those.
+function memOffsetArgCheck(nm: string, argIx: i32) {
+  checkNode(argIx)
+  if memOffsetCheckedValue(argIx) >= 0 { return 0 }
+  tErr(
+    nm
+      + " takes its offset (argument 2) as a compile-time integer in 0..4294967295 — a literal, a top-level `const` bound to one, or a sum of those — since it is the instruction's memarg immediate, not a runtime operand",
+    argIx,
+  )
+  0
+}
+
+// The offset value `memOffsetArgCheck` accepts at `argIx`, or -1. A sum adds exactly, with no
+// i32 wrap, and must itself stay within `MEM_OFFSET_MAX`.
+function memOffsetCheckedValue(argIx: i32): i64 {
+  const ox = parenPeelIx(argIx)
+  if ox < 0 || ox >= P.nodes.length { return -1 }
+  const e = P.nodes[ox]
+  if e is NumLit { return memOffsetLexValue(e.numText) }
+  if e is BinExpr { return memOffsetSumValue(e) }
+  memOffsetNameValue(ox)
+}
+
+// The exact sum of a `+` of two accepted offsets, or -1 for another operator or a term that is
+// not one.
+function memOffsetSumValue(e: BinExpr): i64 {
+  if e.binOp != "+" { return -1 }
+  const l = memOffsetCheckedValue(e.binLeft)
+  const r = memOffsetCheckedValue(e.binRight)
+  if l < 0 || r < 0 || l + r > MEM_OFFSET_MAX { return -1 }
+  l + r
+}
+
+// The value of the top-level integer `const` the name at `ix` denotes when no nearer binding
+// shadows it; -1 for anything else, which is every node that is not such a name.
+function memOffsetNameValue(ix: i32): i64 {
+  const e = P.nodes[ix]
+  if e is Ident {
+    if lookupDepth(e.identName) != 0 { return -1 }
+    const init = moduleConstIntInit[e.identName] ?? -1
+    if init >= 0 && init < P.nodes.length {
+      const lit = P.nodes[init]
+      if lit is NumLit { return memOffsetLexValue(lit.numText) }
+    }
+  }
+  -1
+}
+
 // Calls to a compiler builtin named by the callee identifier — `print`, `Map`/`Set`, the
 // codepoint constructors and the `__array_*` / bitcast / numeric intrinsics. None has a
 // declaration to check against, so arity and argument types are checked here. Returns the
@@ -28928,6 +29075,10 @@ function checkCallNode(n: Call, ix: i32) {
   if cfn is Ident {
     if nameIsSimdIntrinsic(cfn.identName) { v128Seen = true }
     checkSimdLaneArg(n, cfn)
+  }
+  if cfn is Ident {
+    const mo = checkMemOffsetCall(n, cfn)
+    if mo >= 0 { return mo }
   }
   if cfn is Ident {
     const bt = checkBuiltinIdentCall(n, ix, cfn)
@@ -32018,6 +32169,14 @@ function checkProgramNode(n: Program) {
           markCtnLitBinding(sm.letName, 0, sm.letInit)
         }
         moduleGlobals[sm.letName] = true
+        if sm.letKw == "const" && sm.letInit >= 0 {
+          const cin = P.nodes[parenPeelIx(sm.letInit)]
+          if cin is NumLit {
+            if !numLexIsFloat(cin.numText) {
+              moduleConstIntInit[sm.letName] = parenPeelIx(sm.letInit)
+            }
+          }
+        }
         // TDZ: in the dead-zone until pass 2 reaches the initializer.
         daAdd(sm.letName)
       }

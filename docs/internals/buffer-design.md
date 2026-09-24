@@ -733,6 +733,8 @@ width in bytes); it is a hint, not a constraint, and §H4 pins that.
 | *(control)* `__load_i32__` | `i32.load` | `0x28` | `28 02 00` | unchanged |
 | *(control)* `__store_i32__` | `i32.store` | `0x36` | `36 02 00` | unchanged |
 
+The last byte of each memarg is the offset, a u32 LEB: 0 here, and the value of the second
+argument in the offset form (`__load_i64__(a, 16)` is `29 03 10`; `simd-design.md` §G1 "Offsets").
 The trailing byte of `memory.size`/`memory.grow` is the memory **index** immediate, not a flags byte.
 Every module built for this table passes `wasm-tools validate`, and the wide trio's function
 signatures come out as `(param i32) (result i64|f32|f64)` — i.e. the checker's declared return types
