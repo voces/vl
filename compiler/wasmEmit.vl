@@ -20617,24 +20617,38 @@ function condIsLitTrue(condIx: i32) {
 }
 
 function emitWhileStmtStmt(body: u8[], s: WhileStmt, _stmtIx: i32, fnIx: i32) {
-  // structured while loop: block (void) wrapping a loop (void). The condition is
-  // checked at the top; if false, exit the block; otherwise run the body then continue
-  // the loop. Track the two control frames so break/continue compute their relative br
-  // depth. The list-header hoists open before the block, since a loop that never iterates leaves them unread.
+  // structured while loop: block (void) wrapping a loop (void), the two control frames
+  // break/continue compute their relative br depth from. A condition `condDuplicable` accepts
+  // is tested once ahead of the loop and again at its bottom (`br_if` back); any other is tested
+  // at the top. The list-header hoists open before the block, since a loop that never iterates leaves them unread.
   const whHoist = loopHoistOpen(body, s.whileCond, s.whileBody, fnIx, "", "")
   if whHoist < 0 { return -1 }
+  const litTrue = condIsLitTrue(s.whileCond)
+  const rotate = !litTrue && condDuplicable(s.whileCond, COND_DUP_MAX_NODES) >= 0
   fbBlock(64) // 0x02 block, 0x40 void blocktype
   loopBrkDepth.push(ctrlDepth)
   loopBrkLabel.push(s.whileLabel)
+  if rotate {
+    if emitExpr(body, s.whileCond, fnIx) < 0 { return -1 }
+    fbI32Eqz() // 0x45 i32.eqz — skip the loop when the condition is false on entry
+    fbBrIf(0)  // 0x0d br_if, depth 0 = out of the block
+  }
   fbLoop(64)  // 0x03 loop, 0x40 void blocktype
   loopContDepth.push(ctrlDepth)
   loopContLabel.push(s.whileLabel)
   // condition + eqz: if condition is false (zero), exit block. A literal `true` never exits,
   // so it writes no test at all.
-  if !condIsLitTrue(s.whileCond) {
+  if !litTrue && !rotate {
     if emitExpr(body, s.whileCond, fnIx) < 0 { return -1 }
     fbI32Eqz() // 0x45 i32.eqz (invert: exit if condition was false)
     fbBrIf(1)  // 0x0d br_if, depth 1 = break out of block
+  }
+  // A rotated loop's `continue` lands at the end of an inner block, so it reaches the test.
+  const whCont = rotate && blockHasContinueFor(s.whileBody, s.whileLabel, false)
+  if whCont {
+    fbBlock(64) // continue block
+    loopContDepth.push(ctrlDepth)
+    loopContLabel.push(s.whileLabel)
   }
   // the body is a narrowing scope (the checker's `checkWhileStmtNode` narrows it): the
   // condition is re-tested every iteration, so a `while e != null { … }` body reads `e`
@@ -20645,7 +20659,17 @@ function emitWhileStmtStmt(body: u8[], s: WhileStmt, _stmtIx: i32, fnIx: i32) {
   // body statements
   if emitStmts(body, s.whileBody, fnIx) < 0 { return -1 }
   if whNarrowed { restoreNarrow(whSavedTop) }
-  fbBr(0) // 0x0c br, depth 0 = continue loop
+  if whCont {
+    fbEnd() // end continue block
+    loopContDepth.pop()
+    loopContLabel.pop()
+  }
+  if rotate {
+    if emitExpr(body, s.whileCond, fnIx) < 0 { return -1 }
+    fbBrIf(0) // 0x0d br_if, depth 0 = the loop header while the condition holds
+  } else {
+    fbBr(0) // 0x0c br, depth 0 = continue loop
+  }
   fbEnd() // 0x0b end (loop)
   loopContDepth.pop()
   loopContLabel.pop()
@@ -20654,6 +20678,65 @@ function emitWhileStmtStmt(body: u8[], s: WhileStmt, _stmtIx: i32, fnIx: i32) {
   loopBrkLabel.pop()
   loopHoistClose(whHoist)
   return 0
+}
+
+// The most nodes a `while` condition may have and still be written twice.
+const COND_DUP_MAX_NODES = 12
+
+// The node count of condition `ix` when writing it twice emits the same code twice, or -1: its
+// kinds are all leaves, operators, reads and plain positional calls — no assignment, function,
+// block-bodied `if` or `match`, collection literal, or string literal. Over `cap` nodes is -1.
+function condDuplicable(ix: i32, cap: i32): i32 {
+  if ix < 0 || ix >= P.nodes.length { return -1 }
+  const n = P.nodes[ix]
+  let kids: i32[] = []
+  if n is NumLit || n is CharLit || n is BoolLit || n is NullLit || n is Ident { return 1 }
+  if n is Paren {
+    kids = [n.parInner]
+  } else if n is Unary {
+    if n.unOp == "p+" || n.unOp == "p-" { return -1 }
+    kids = [n.unArg]
+  } else if n is BinExpr {
+    if n.binOp == "=" { return -1 }
+    kids = [n.binLeft, n.binRight]
+  } else if n is Member {
+    kids = [n.memObj]
+  } else if n is Index {
+    kids = [n.idxArr, n.idxIndex]
+  } else if n is IsExpr {
+    kids = [n.isObj]
+  } else if n is Call {
+    let a = 0
+    while a < n.callArgNames.length {
+      if n.callArgNames[a] != "" { return -1 }
+      a = a + 1
+    }
+    const callee = P.nodes[n.callFn]
+    if callee is Ident {
+      kids = n.callArgs
+    } else if callee is Member {
+      kids = [callee.memObj]
+      let i = 0
+      while i < n.callArgs.length {
+        kids.push(n.callArgs[i])
+        i = i + 1
+      }
+    } else {
+      return -1
+    }
+  } else {
+    return -1
+  }
+  let cnt = 1
+  let i = 0
+  while i < kids.length {
+    const c = condDuplicable(kids[i], cap)
+    if c < 0 { return -1 }
+    cnt = cnt + c
+    if cnt > cap { return -1 }
+    i = i + 1
+  }
+  cnt
 }
 
 function emitForRangeStmt(body: u8[], s: ForRange, _stmtIx: i32, fnIx: i32) {
@@ -21390,25 +21473,34 @@ function emitForInStmt(body: u8[], s: ForIn, _stmtIx: i32, fnIx: i32) {
   if fiHoist < 0 { return -1 }
   scopeBind(s.fiVar, vSlot)
   if hasPair { scopeBind(pairName, pSlot) }
+  // A list or string walk is bottom-tested: one `cursor >= len` guard ahead of the loop, and
+  // `br_if` back while `cursor < len` after the step. A map walk keeps its test at the top,
+  // where the tombstone skip re-enters the loop.
+  const fiRotate = mapRecv < 0
+  const fiEnd: ForInEnd = {
+    iIdx: iIdx,
+    strSrc: strSrc,
+    sEnd: fiSEnd,
+    hLen: fiHLen,
+    lIdx: lIdx,
+    wrapTy: wrapTy,
+  }
   fbBlock(64) // 0x02 block, void
   loopBrkDepth.push(ctrlDepth)
   loopBrkLabel.push(s.fiLabel)
+  if fiRotate {
+    emitForInAtEnd(fiEnd)
+    fbI32Bin(78) // 0x4e i32.ge_s
+    fbBrIf(0)    // 0x0d br_if -> out of the block
+  }
   fbLoop(64)  // 0x03 loop, void
   loopContDepth.push(ctrlDepth)
   loopContLabel.push(s.fiLabel)
-  // exit when cursor >= len (the list wrapper's field 1; a STRING compares its
-  // backing-coordinate cursor against the pre-computed `start + len` bound)
-  fbLocalGet(iIdx)
-  if strSrc {
-    fbLocalGet(fiSEnd)
-  } else if fiHLen >= 0 {
-    fbLocalGet(fiHLen)
-  } else {
-    fbLocalGet(lIdx)
-    fbStructGet(wrapTy, 1)
+  if !fiRotate {
+    emitForInAtEnd(fiEnd)
+    fbI32Bin(78) // 0x4e i32.ge_s
+    fbBrIf(1)    // 0x0d br_if -> break out of block
   }
-  fbI32Bin(78) // 0x4e i32.ge_s
-  fbBrIf(1)    // 0x0d br_if -> break out of block
   // tombstone skip: if M.live[cursor] == 0, advance the cursor and re-loop WITHOUT
   // binding `v` / running the body — the deleted entry is invisible to iteration
   // (insertion order of the survivors preserved). `br 1` targets the loop header
@@ -21539,7 +21631,13 @@ function emitForInStmt(body: u8[], s: ForIn, _stmtIx: i32, fnIx: i32) {
     fbI32Bin(106) // 0x6a i32.add
     fbLocalSet(pStep)
   }
-  fbBr(0) // continue loop
+  if fiRotate {
+    emitForInAtEnd(fiEnd)
+    fbI32Bin(72) // 0x48 i32.lt_s
+    fbBrIf(0)    // 0x0d br_if -> back to the loop header while elements remain
+  } else {
+    fbBr(0) // continue loop
+  }
   fbEnd() // end loop
   loopContDepth.pop()
   loopContLabel.pop()
@@ -21551,6 +21649,31 @@ function emitForInStmt(body: u8[], s: ForIn, _stmtIx: i32, fnIx: i32) {
   if hasPair { scopeUnbind() }
   scopeUnbind()
   return 0
+}
+
+// The operands of a for-in walk's end test: its cursor, and where its bound comes from.
+type ForInEnd = {
+  iIdx: i32,
+  strSrc: boolean,
+  sEnd: i32,
+  hLen: i32,
+  lIdx: i32,
+  wrapTy: i32,
+}
+
+// Pushes the cursor and the bound it is compared against: a string's pre-computed `start + len`,
+// a hoisted `len`, or the list wrapper's field 1 read afresh.
+function emitForInAtEnd(e: ForInEnd) {
+  fbLocalGet(e.iIdx)
+  if e.strSrc {
+    fbLocalGet(e.sEnd)
+  } else if e.hLen >= 0 {
+    fbLocalGet(e.hLen)
+  } else {
+    fbLocalGet(e.lIdx)
+    fbStructGet(e.wrapTy, 1)
+  }
+  0
 }
 
 function emitBreakStmtStmt(
