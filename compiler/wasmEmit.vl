@@ -1,5 +1,23 @@
 import {
   EqCmpKind,
+  SIMD_SIG_F_V,
+  SIMD_SIG_I_V,
+  SIMD_SIG_LANE_F,
+  SIMD_SIG_LANE_I,
+  SIMD_SIG_LANE_L,
+  SIMD_SIG_LOAD,
+  SIMD_SIG_L_V,
+  SIMD_SIG_REPL_F,
+  SIMD_SIG_REPL_I,
+  SIMD_SIG_REPL_L,
+  SIMD_SIG_SHUF16,
+  SIMD_SIG_SHUF4,
+  SIMD_SIG_STORE,
+  SIMD_SIG_VI_V,
+  SIMD_SIG_VVV_V,
+  SIMD_SIG_VV_V,
+  SIMD_SIG_V_I,
+  SIMD_SIG_V_V,
   binPlusIsListByTy,
   condProvenTrue,
   covarRootFrame,
@@ -58,8 +76,10 @@ import {
   nominalStructNameOfTy,
   numLitUnionBaseName,
   numLitUnionHasBase,
-  simdF32x4LaneOpArity,
-  simdF32x4LaneOpCode,
+  simdRow,
+  simdRowLaneMax,
+  simdRowOp,
+  simdRowSig,
   tyIsLitUnion,
   tyIsLitUnionArray,
   tyIsLitUnionOrLit,
@@ -14530,13 +14550,7 @@ function fbMemoryGrow() {
 // encodes as two bytes — so `wULEB` is required, never `wU8`. Verify each sub-opcode with a
 // `wasm-dis --enable-simd` round-trip of the emitted bytes.
 const OP_SIMD_PREFIX = 0xfd
-const SIMD_V128_LOAD = 0x00
-const SIMD_V128_STORE = 0x0b
-const SIMD_F32X4_SPLAT = 0x13
-const SIMD_F32X4_EXTRACT_LANE = 0x1f
-const SIMD_F32X4_REPLACE_LANE = 0x20
 const SIMD_I8X16_SHUFFLE = 0x0d
-const SIMD_V128_BITSELECT = 0x52
 
 // One SIMD instruction with no trailing immediate (`f32x4.splat`, `f32x4.add`): the prefix,
 // then the uLEB sub-opcode. The stack effect the caller has already arranged.
@@ -14563,23 +14577,6 @@ function fbSimdLane(sub: i32, lane: i32) {
   wU8(lane)
   0
 }
-// `i8x16.shuffle` picking four 32-bit lanes (0..3 from the first vector, 4..7 from the second):
-// the sixteen immediate byte indices are each lane's four bytes, in order.
-function fbSimdShuffle4(lanes: i32[]) {
-  wU8(OP_SIMD_PREFIX)
-  wULEB(SIMD_I8X16_SHUFFLE)
-  let i = 0
-  while i < 4 {
-    const b = lanes[i] * 4
-    wU8(b)
-    wU8(b + 1)
-    wU8(b + 2)
-    wU8(b + 3)
-    i = i + 1
-  }
-  0
-}
-
 // ── numeric-opcode intrinsics ────────────────────────────────────────────────
 // The IEEE bitcasts. A bitcast moves no bits: the same 32/64-bit pattern is simply
 // read at the other type. Each is exactly one wasm instruction, so there is no
@@ -14803,8 +14800,8 @@ function emitMemIntrinArg(body: u8[], ix: i32, fnIx: i32) {
   emitExprWideCleared(body, ix, fnIx)
 }
 
-// The compile-time lane index of an `__extract_lane_f32x4__` argument, or -1 when it is not a
-// 0..3 literal. The checker (`checkSimdLaneArg`) already refused a non-literal, so this only
+// The compile-time lane index at a SIMD lane argument, or -1 when it is not a literal in
+// `0..max`. The checker (`checkSimdLaneArg`) already refused a non-literal, so this only
 // re-reads the value the immediate byte needs; -1 keeps a drift between the two loud, not silent.
 function simdLaneImm(argIx: i32, max: i32): i32 {
   const ix = unwrapParen(argIx)
@@ -14818,133 +14815,129 @@ function simdLaneImm(argIx: i32, max: i32): i32 {
   -1
 }
 
-// The SIMD substrate lowering (`simd-design.md` §D6): each intrinsic pushes its operands, then
-// writes one 0xFD-prefix instruction. Load/store take a byte address (context-cleared) and
-// force the module's memory; splat takes an f32; add/extract take v128 operands emitted at
-// their natural rep. The extract lane index is the 0..3 literal the checker pinned.
+// The SIMD lowering (`simd-design.md` §D6): push the row's operands in order, each at the width
+// its operand shape names (an address or count is a context-cleared i32), then write the one
+// 0xFD-prefix instruction with the row's immediates. Lane and shuffle indices are the literals
+// the checker pinned; a drift between the two is a loud emit failure, never a wrong byte.
 function emitSimdIntrinsic(body: u8[], c: Call, name: string, fnIx: i32) {
-  if name == "__load_v128__" {
-    if c.callArgs.length != 1 {
-      return emitFail(
-        "emitProgram: __load_v128__ takes exactly one argument (the byte address)",
-      )
+  const row = simdRow(name)
+  if row < 0 {
+    return emitFail("emitProgram: '" + name + "' is not a known SIMD intrinsic")
+  }
+  const op = simdRowOp(row)
+  const sig = simdRowSig(row)
+  const args = c.callArgs
+  if sig == SIMD_SIG_SHUF4 || sig == SIMD_SIG_SHUF16 {
+    return emitSimdShuffle(body, c, name, fnIx, sig, simdRowLaneMax(row))
+  }
+  if sig == SIMD_SIG_LOAD || sig == SIMD_SIG_STORE {
+    if emitMemIntrinArg(body, args[0], fnIx) < 0 { return -1 }
+    if sig == SIMD_SIG_STORE {
+      if emitExpr(body, args[1], fnIx) < 0 { return -1 }
     }
-    if emitMemIntrinArg(body, c.callArgs[0], fnIx) < 0 { return -1 }
-    fbSimdMem(SIMD_V128_LOAD)
+    fbSimdMem(op)
     return 0
   }
-  if name == "__store_v128__" {
-    if c.callArgs.length != 2 {
-      return emitFail(
-        "emitProgram: __store_v128__ takes exactly two arguments (the byte address and the vector)",
-      )
-    }
-    if emitMemIntrinArg(body, c.callArgs[0], fnIx) < 0 { return -1 }
-    if emitExpr(body, c.callArgs[1], fnIx) < 0 { return -1 }
-    fbSimdMem(SIMD_V128_STORE)
-    return 0
+  if sig == SIMD_SIG_I_V {
+    if emitMemIntrinArg(body, args[0], fnIx) < 0 { return -1 }
+    return fbSimdOp(op)
   }
-  if name == "__splat_f32x4__" {
-    if c.callArgs.length != 1 {
-      return emitFail(
-        "emitProgram: __splat_f32x4__ takes exactly one argument (the f32 lane value)",
-      )
-    }
-    if emitExprAsF32(body, c.callArgs[0], fnIx) < 0 { return -1 }
-    fbSimdOp(SIMD_F32X4_SPLAT)
-    return 0
+  if sig == SIMD_SIG_L_V {
+    if emitNumIntrArg(body, args[0], 3, fnIx) < 0 { return -1 }
+    return fbSimdOp(op)
   }
-  const laneOp = simdF32x4LaneOpCode(name)
-  if laneOp >= 0 {
-    const arity = simdF32x4LaneOpArity(name)
-    if c.callArgs.length != arity {
+  if sig == SIMD_SIG_F_V {
+    if emitExprAsF32(body, args[0], fnIx) < 0 { return -1 }
+    return fbSimdOp(op)
+  }
+  if emitExpr(body, args[0], fnIx) < 0 { return -1 }
+  if sig == SIMD_SIG_V_V || sig == SIMD_SIG_V_I { return fbSimdOp(op) }
+  if sig == SIMD_SIG_VV_V || sig == SIMD_SIG_VVV_V {
+    if emitExpr(body, args[1], fnIx) < 0 { return -1 }
+    if sig == SIMD_SIG_VVV_V {
+      if emitExpr(body, args[2], fnIx) < 0 { return -1 }
+    }
+    return fbSimdOp(op)
+  }
+  if sig == SIMD_SIG_VI_V {
+    if emitMemIntrinArg(body, args[1], fnIx) < 0 { return -1 }
+    return fbSimdOp(op)
+  }
+  const max = simdRowLaneMax(row)
+  const lane = simdLaneImm(args[1], max)
+  if lane < 0 {
+    return emitFail(
+      "emitProgram: " +
+        name +
+        " lane index is not a compile-time literal in 0.." +
+        i32ToStr(max),
+    )
+  }
+  if sig == SIMD_SIG_REPL_I {
+    if emitMemIntrinArg(body, args[2], fnIx) < 0 { return -1 }
+  } else if sig == SIMD_SIG_REPL_L {
+    if emitNumIntrArg(body, args[2], 3, fnIx) < 0 { return -1 }
+  } else if sig == SIMD_SIG_REPL_F {
+    if emitExprAsF32(body, args[2], fnIx) < 0 { return -1 }
+  } else if (
+    sig != SIMD_SIG_LANE_I &&
+    sig != SIMD_SIG_LANE_L &&
+    sig != SIMD_SIG_LANE_F
+  ) {
+    return emitFail(
+      "emitProgram: SIMD intrinsic '" +
+        name +
+        "' has an operand shape with no lowering",
+    )
+  }
+  fbSimdLane(op, lane)
+  0
+}
+
+// `i8x16.shuffle` over two vectors: sixteen byte-lane immediates, each in 0..31. The 16-lane
+// form writes its literals as given; the 4-lane form (`__shuffle_f32x4__`) picks 32-bit lanes
+// in 0..7 and writes each one's four bytes.
+function emitSimdShuffle(
+  body: u8[],
+  c: Call,
+  name: string,
+  fnIx: i32,
+  sig: i32,
+  max: i32,
+) {
+  const lanes: i32[] = []
+  let si = 2
+  while si < c.callArgs.length {
+    const l = simdLaneImm(c.callArgs[si], max)
+    if l < 0 {
       return emitFail(
         "emitProgram: " +
           name +
-          " takes exactly " +
-          i32ToStr(arity) +
-          " vector argument(s)",
+          " lane index is not a compile-time literal in 0.." +
+          i32ToStr(max),
       )
     }
-    let ai = 0
-    while ai < arity {
-      if emitExpr(body, c.callArgs[ai], fnIx) < 0 { return -1 }
-      ai = ai + 1
-    }
-    fbSimdOp(laneOp)
-    return 0
+    lanes.push(l)
+    si = si + 1
   }
-  if name == "__bitselect_v128__" {
-    if c.callArgs.length != 3 {
-      return emitFail(
-        "emitProgram: __bitselect_v128__ takes exactly three arguments (the two vectors and the mask)",
-      )
+  if emitExpr(body, c.callArgs[0], fnIx) < 0 { return -1 }
+  if emitExpr(body, c.callArgs[1], fnIx) < 0 { return -1 }
+  wU8(OP_SIMD_PREFIX)
+  wULEB(SIMD_I8X16_SHUFFLE)
+  let i = 0
+  while i < lanes.length {
+    if sig == SIMD_SIG_SHUF4 {
+      const b = lanes[i] * 4
+      wU8(b)
+      wU8(b + 1)
+      wU8(b + 2)
+      wU8(b + 3)
+    } else {
+      wU8(lanes[i])
     }
-    let bi = 0
-    while bi < 3 {
-      if emitExpr(body, c.callArgs[bi], fnIx) < 0 { return -1 }
-      bi = bi + 1
-    }
-    fbSimdOp(SIMD_V128_BITSELECT)
-    return 0
+    i = i + 1
   }
-  if name == "__replace_lane_f32x4__" {
-    if c.callArgs.length != 3 {
-      return emitFail(
-        "emitProgram: __replace_lane_f32x4__ takes exactly three arguments (the vector, a 0..3 lane literal and the f32)",
-      )
-    }
-    const rlane = simdLaneImm(c.callArgs[1], 3)
-    if rlane < 0 {
-      return emitFail(
-        "emitProgram: __replace_lane_f32x4__ lane index is not a compile-time literal in 0..3",
-      )
-    }
-    if emitExpr(body, c.callArgs[0], fnIx) < 0 { return -1 }
-    if emitExprAsF32(body, c.callArgs[2], fnIx) < 0 { return -1 }
-    fbSimdLane(SIMD_F32X4_REPLACE_LANE, rlane)
-    return 0
-  }
-  if name == "__shuffle_f32x4__" {
-    if c.callArgs.length != 6 {
-      return emitFail(
-        "emitProgram: __shuffle_f32x4__ takes exactly six arguments (two vectors and four 0..7 lane literals)",
-      )
-    }
-    const lanes: i32[] = []
-    let si = 2
-    while si < 6 {
-      const l = simdLaneImm(c.callArgs[si], 7)
-      if l < 0 {
-        return emitFail(
-          "emitProgram: __shuffle_f32x4__ lane index is not a compile-time literal in 0..7",
-        )
-      }
-      lanes.push(l)
-      si = si + 1
-    }
-    if emitExpr(body, c.callArgs[0], fnIx) < 0 { return -1 }
-    if emitExpr(body, c.callArgs[1], fnIx) < 0 { return -1 }
-    fbSimdShuffle4(lanes)
-    return 0
-  }
-  if name == "__extract_lane_f32x4__" {
-    if c.callArgs.length != 2 {
-      return emitFail(
-        "emitProgram: __extract_lane_f32x4__ takes exactly two arguments (the vector and a 0..3 lane literal)",
-      )
-    }
-    if emitExpr(body, c.callArgs[0], fnIx) < 0 { return -1 }
-    const lane = simdLaneImm(c.callArgs[1], 3)
-    if lane < 0 {
-      return emitFail(
-        "emitProgram: __extract_lane_f32x4__ lane index is not a compile-time literal in 0..3",
-      )
-    }
-    fbSimdLane(SIMD_F32X4_EXTRACT_LANE, lane)
-    return 0
-  }
-  emitFail("emitProgram: '" + name + "' is not a known SIMD intrinsic")
+  0
 }
 
 // A call, followed by `unreachable` when its type is `never`: the callee leaves nothing, and
@@ -15261,9 +15254,9 @@ function emitCallCore(body: u8[], callIx: i32, fnIx: i32) {
         fbMemAccess(mlOp, mlAlign)
         return 0
       }
-      // The SIMD substrate (`simd-design.md` §D6): five intrinsics, each lowered inline to a
-      // 0xFD-prefix instruction — the third prefixed family, beside the 0xfb GC and 0xfc misc
-      // ones. Dispatched by name like the memory intrinsics above it.
+      // The SIMD intrinsics (`simd-design.md` §D6), each lowered inline to a 0xFD-prefix
+      // instruction — the third prefixed family, beside the 0xfb GC and 0xfc misc ones.
+      // Dispatched by name like the memory intrinsics above it.
       if !userBindsName && nameIsSimdIntrinsic(callee.identName) {
         return emitSimdIntrinsic(body, c, callee.identName, fnIx)
       }
