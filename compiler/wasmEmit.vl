@@ -235,6 +235,7 @@ import {
   ba8Used,
   bankSpanRow,
   bl8TypeIdx,
+  callRefDepth,
   callRefSlot,
   capCacheOn,
   capCountTbl,
@@ -545,6 +546,7 @@ import {
   binEqVariantRow,
   binMixHardF64,
   callIsArrSlice,
+  callRefNestSlot,
   callSpillsFcpArg,
   calleeIsVoidExtern,
   calleeReturnsVoidAt,
@@ -15660,6 +15662,14 @@ function cloArgIsArmHeapTwin(argIx: i32, vi: i32, fnIx: i32): boolean {
   sHeapIdx[si] == uVarHeap[vi]
 }
 
+// The slot a function-value call stashes its closure in: the eager `callRefSlot` at depth
+// 0, else a lazy slot of its own depth (D2329). The id is read after the arguments, so a
+// call nested in them must not share the enclosing call's slot.
+function callRefStashSlot() {
+  if callRefDepth == 0 { return callRefSlot }
+  callRefNestSlot(callRefDepth)
+}
+
 function emitCallRef(body: u8[], callIx: i32, fnIx: i32) {
   const c = P.nodes[callIx]
   if c is Call {
@@ -15676,7 +15686,9 @@ function emitCallRef(body: u8[], callIx: i32, fnIx: i32) {
     if exprNulClosure(c.callFn, fnIx) {
       wU8(212) // 0xd4 ref.as_non_null
     }
-    fbLocalSet(callRefSlot)
+    const crDepth = callRefDepth
+    const crSlot = callRefStashSlot()
+    fbLocalSet(crSlot)
     // the callee's interned `$fnsig` key — from a function-typed annotation, an inferred
     // binding's sig, a field closure's, or a closure-array element's. Its tokens drive
     // argument coercion below and resolve the functype `ref.cast`s to; "" falls back to
@@ -15701,8 +15713,9 @@ function emitCallRef(body: u8[], callIx: i32, fnIx: i32) {
       )
     }
     // env = closure.env (field 0).
-    fbLocalGet(callRefSlot)
+    fbLocalGet(crSlot)
     fbStructGet(cloStructIdx, 0)
+    callRefDepth = crDepth + 1
     // args, each COERCED to its parameter's scalar valtype (an i32 literal widened into an i64 / f64
     // / f32 param) — the `call_ref` functype demands the exact valtype, exactly as a direct call.
     const args = c.callArgs
@@ -15829,6 +15842,7 @@ function emitCallRef(body: u8[], callIx: i32, fnIx: i32) {
     pendingI64 = savedArgI64
     pendingLitUnion = savedArgLU
     pendingNulLitUnion = savedArgNulLU
+    callRefDepth = crDepth
     // id = closure.id (field 1) — the callee's wasm function index, `call_indirect`'d at
     // the concrete `$fnsig` (the engine signature-checks the callee against it).
     let sig = -1
@@ -15839,7 +15853,7 @@ function emitCallRef(body: u8[], callIx: i32, fnIx: i32) {
         "emitProgram: function-value call arity has no interned signature",
       )
     }
-    fbLocalGet(callRefSlot)
+    fbLocalGet(crSlot)
     fbStructGet(cloStructIdx, 1)     // the callee's wasm function index
     fbCallIndirect(sig, gFnTableIdx) // 0x11 <fnsig> <table>
     return 0
@@ -23642,9 +23656,12 @@ function emitCapturedCall(body: u8[], callIx: i32, fnIx: i32, target: i32) {
   // `emitClosureValue`: the generic-value floor guards a closure that escapes its pin, and
   // this one is consumed by the call that pinned it, so an un-annotated parameter is fine.
   if emitClosureValueCore(body, target, fnIx) < 0 { return -1 }
-  fbLocalSet(callRefSlot)
-  fbLocalGet(callRefSlot)
+  const crDepth = callRefDepth
+  const crSlot = callRefStashSlot()
+  fbLocalSet(crSlot)
+  fbLocalGet(crSlot)
   fbStructGet(cloStructIdx, 0) // env
+  callRefDepth = crDepth + 1
   // Parameter-order args (named-call reorder; see the direct path below).
   const cargs = orderedDirectArgs(callIx, target)
   if directArgsBad(cargs, callIx) {
@@ -23700,6 +23717,7 @@ function emitCapturedCall(body: u8[], callIx: i32, fnIx: i32, target: i32) {
   }
   pendingLitUnion = savedCapLU
   pendingNulLitUnion = savedCapNulLU
+  callRefDepth = crDepth
   // The target's own interned `$fnsig` — the functype it is actually declared with — so the
   // `call_indirect` below passes the engine's signature check and returns the target's real
   // result type. Must be resolved from the target, never from arity alone: `fnSigIdxForArity`
@@ -23710,7 +23728,7 @@ function emitCapturedCall(body: u8[], callIx: i32, fnIx: i32, target: i32) {
       "emitProgram: captured call target has no interned signature",
     )
   }
-  fbLocalGet(callRefSlot)
+  fbLocalGet(crSlot)
   fbStructGet(cloStructIdx, 1)      // the callee's wasm function index
   fbCallIndirect(csig, gFnTableIdx) // 0x11 <fnsig> <table>
   return 0
