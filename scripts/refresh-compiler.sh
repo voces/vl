@@ -171,8 +171,34 @@ fi
 
 echo "== sanity: the refreshed compiler compiles + runs a program =="
 printf 'print(6 * 7)\nprint(1 + 2)\n' > "$WORK/hello.vl"
-out="$("$VL" run "$WORK/hello.vl" --compiler "$SHIP")"
-[ "$out" = "$(printf '42\n3')" ] || { echo "refreshed compiler misbehaves: $out"; exit 1; }
+# `out=$(...)` is itself the `if`'s condition, so a nonzero exit does not trip `set -e`
+# here (it would on a bare assignment) — the branch below is what makes the failure
+# LOUD instead of the script dying mid-line with only the raw stderr visible.
+SANITY_ERR="$WORK/sanity.err"
+if out="$("$VL" run "$WORK/hello.vl" --compiler "$SHIP" 2>"$SANITY_ERR")" \
+    && [ "$out" = "$(printf '42\n3')" ]; then
+  :
+else
+  err="$(cat "$SANITY_ERR" 2>/dev/null || true)"
+  echo "ERROR: the refreshed compiler misbehaves." >&2
+  echo "  stdout: $out" >&2
+  [ -n "$err" ] && echo "  stderr: $err" >&2
+  case "$err" in
+    *"unknown import"*)
+      # The seed loads with no host imports (it runs as a library, not a program), so
+      # this is what a compiler/*.vl source change that PULLS ONE IN looks like from
+      # here — string interpolation is the common cause (it desugars into a call
+      # needing std:fmt/std:str) but any direct `print`/`__log__`/`__trap__` use in
+      # compiler/*.vl has the same shape. `compiler-no-interpolation`
+      # (compiler/lint.vl) refuses the interpolation case at `vl check` time, before a
+      # build; run it (or scripts/lint-self.sh) over the changed compiler/*.vl files.
+      echo "  likely cause: compiler/*.vl now requires a host import the seed cannot" >&2
+      echo "  have — check recently changed compiler/*.vl files for string" >&2
+      echo "  interpolation or a direct print/__log__/__trap__ call." >&2
+      ;;
+  esac
+  exit 1
+fi
 
 mkdir -p "$(dirname "$OUT")"
 if [ "$SHIP" = "$SEED" ]; then

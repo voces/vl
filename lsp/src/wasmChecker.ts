@@ -684,8 +684,17 @@ export type WasmChecker = {
    * merges both. Empty on a parse error or a seed without the lint exports.
    * Synchronous + single-file: the lint pass is parse-only and resolves no
    * imports, so the source is staged directly (no `prepare`).
+   *
+   * `path`, when given, is staged into the seed's `lintSetPath` channel before
+   * the pass runs — checkout-root-relative, e.g. `compiler/typecheck.vl` — so a
+   * path-scoped rule (`prefer-interpolation`'s and `compiler-no-interpolation`'s
+   * `compiler/` scoping, `std-comment-audience`'s `std/` scoping) sees the same
+   * tree the CLI does. Omitted, it is as if the file has no path: every such
+   * rule declines. An older seed without the staging exports is unaffected —
+   * the guard below just skips them, the same fallback the lint's other
+   * exports already use.
    */
-  lint: (source: string) => VLDiagnostic[];
+  lint: (source: string, path?: string) => VLDiagnostic[];
   /**
    * Tell the checker a READER ANSWER may have moved, so the prepared-state memo
    * stops being reusable.
@@ -2028,7 +2037,7 @@ export const createWasmChecker = (
   // (or one built before the lint code/pos exports) lacks them, so this yields []
   // and the diagnostics path keeps its TS lint. Like `formatSrc`: single-file,
   // parse-only, no `prepare`.
-  const lint = (source: string): VLDiagnostic[] => {
+  const lint = (source: string, path?: string): VLDiagnostic[] => {
     const exp = instantiate();
     if (
       exp === undefined ||
@@ -2040,6 +2049,25 @@ export const createWasmChecker = (
     restagedSource(exp, source);
     exp.srcReset();
     pushString(exp.srcPush, source);
+    // Stage the path BEFORE `lintSrc` runs — `scaPath` (compiler/lint.vl) is read
+    // during the pass, not after — into its own accumulator (`lintPathPush` never
+    // touches `vcAcc`, so this cannot corrupt the source just staged). ALWAYS
+    // reset+commit, `path` given or not: this instance is REUSED across documents
+    // (one per keystroke, `wasmCheckerNode.ts`), and `scaPath` is a module global
+    // that otherwise carries the LAST staged path forward — an early return inside
+    // the seed (a parse error) never reaches the point that would clear it, so a
+    // conditional stage here left an unparseable "compiler/x.vl"'s path applied to
+    // the next, unrelated document's lint (review round 2). Committing with nothing
+    // pushed sets it to "", same as a caller that never staged one.
+    if (
+      typeof exp.lintPathReset === "function" &&
+      typeof exp.lintPathPush === "function" &&
+      typeof exp.lintPathCommit === "function"
+    ) {
+      exp.lintPathReset();
+      if (path !== undefined) pushString(exp.lintPathPush, path);
+      exp.lintPathCommit();
+    }
     const n = exp.lintSrc();
     if (n <= 0) return []; // -1 = parse error, 0 = no lint diagnostics
     const out: VLDiagnostic[] = [];

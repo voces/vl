@@ -128,7 +128,7 @@ export const diagnostics = async (
 ): Promise<VLDiagnostic[]> => {
   if (checker === undefined) return [];
   const errors = await checker.check(text, entryKey, reader).catch(() => []);
-  const diags = [...errors, ...checker.lint(text)];
+  const diags = [...errors, ...checker.lint(text, entryKey)];
   lastDiagnostics = { text, entryKey, diags };
   return diags;
 };

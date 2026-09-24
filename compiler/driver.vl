@@ -1211,6 +1211,51 @@ function plusLinksFor(m: i32, src: string): i32 {
   0
 }
 
+// The current document's path, staged one code point at a time — the same protocol
+// `srcPush`/`srcReset` uses for source text, since a JS host cannot construct a VL
+// `string` argument directly (only another VL caller can, via `srcSetStr`). A
+// caller that never stages one leaves `scaPath` at "" — every path-scoped rule declines.
+const lpAcc = cpAccNew()
+export function lintPathReset(): i32 {
+  cpAccReset(lpAcc)
+  0
+}
+export function lintPathPush(c: i32): i32 {
+  cpAccPush(lpAcc, c)
+  0
+}
+export function lintPathCommit(): i32 {
+  lintSetPath(cpAccTake(lpAcc))
+  0
+}
+
+// The VL checkout this process resolves `std:` from — the same tree `std_source()`
+// (scripts/vl-host/src/main.rs) picks, so a worktree pinned by `$VL_STD` scopes to
+// itself. Staged once, at startup; "" on a distribution binary (embedded std has no
+// directory) — the CLI then declines every path-scoped rule for an absolute target.
+const vrAcc = cpAccNew()
+export function vlRootPush(c: i32): i32 {
+  cpAccPush(vrAcc, c)
+  0
+}
+export function vlRootCommit(): i32 {
+  vlCheckoutRoot = cpAccTake(vrAcc)
+  0
+}
+let vlCheckoutRoot = ""
+
+// `rawKey` as `lintSetPath` wants it. Already relative (every module-graph key, and a
+// CLI argument run the documented way, from the checkout root) — unchanged, trusting
+// that convention. Absolute and inside the staged checkout root — stripped to the
+// relative remainder. Absolute and outside it (or no root staged) — "", declining.
+export function lintScopeKeyOf(rawKey: string): string {
+  if rawKey.length == 0 || rawKey[0] != '/' { return rawKey }
+  if vlCheckoutRoot.length == 0 { return "" }
+  const p = vlCheckoutRoot + "/"
+  if rawKey.length <= p.length || rawKey.slice(0, p.length) != p { return "" }
+  rawKey.slice(p.length, rawKey.length)
+}
+
 // ── lint tier ──────────────────────────────────────────────────────────────────
 // Runs the AST-derivable lint pass (`compiler/lint.vl`), on the parse alone with
 // no typecheck, matching the standalone lint harness. Returns the finding count,
@@ -1255,9 +1300,11 @@ function lintSrcRun(): i32 {
   // diagnostics are not lost — every caller reads them from the error stream before
   // or beside this call.
   if vcParseBlocked() {
-    // `lint(root)` is what normally clears the sink, so without this a caller reading
-    // the count regardless is handed the PREVIOUS source's findings against this file.
+    // `lint(root)` is what normally clears the sink AND consumes a staged path into
+    // `scaRunPath`; neither runs here, so both must be done by hand, or a caller
+    // reading regardless is handed the PREVIOUS source's findings — or its PATH.
     lintReset()
+    lintSetPath("")
     return -1
   }
   // No checker ran, so the never-returning calls are marked from the declarations alone.
@@ -1362,7 +1409,7 @@ function lintGraphRun(): i32 {
       if !vcParseBlocked() {
         markNeverCallsByDecl()
         lintSetSource(modSrcs[m])
-        lintSetPath(modKeys[m])
+        lintSetPath(lintScopeKeyOf(modKeys[m]))
         plusLinksFor(m, modSrcs[m])
         lint(root)
         lgCopySink(m)
