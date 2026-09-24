@@ -863,6 +863,22 @@ new: the compare-frame pre-pass never recurses into a code-15 field, so a NESTED
 
 ## Codegen, memory & runtime (Track B)
 
+- **Atomic intrinsics: the wasm threads proposal's `0xFE` set over linear memory (owner
+  ruling 2026-09-24, for plumb's parallel guest threads).** 67 raw `__atomic_…__`
+  intrinsics, one per instruction, named from the wasm name as §G1 names SIMD
+  (`i32.atomic.rmw8.add_u` is `__atomic_rmw8_add_u_i32__`): the seven load and seven store
+  widths, add/sub/and/or/xor/xchg/cmpxchg at each of the seven widths,
+  `__atomic_wait32__`/`__atomic_wait64__`, `__atomic_notify__` and `__atomic_fence__`. Every
+  rmw answers the OLD value; a narrow access zero-extends it and wraps its operands. The
+  memarg carries the natural alignment, so a misaligned address traps. One table in
+  `typecheck.vl` drives the declarations, the reservation, the import scan and the emitter.
+  `vl build -O`/`-O3` now pass binaryen `--enable-threads`, which leaves the bytes of a
+  module with no atomics unchanged (136 corpus modules at both rungs, and the compiler seed).
+  wasmtime needed no change. No std exports, and no `shared` memory yet: on this memory
+  `wait` traps and `notify` answers 0. Every row is graded against an independent model on
+  V8 and wasmtime, unoptimised and at `-O`/`-O3`; `--verify` checks all 67 opcodes against
+  the spec table and against binaryen's decoder. Generator `scripts/gen-atomic-cases.py`;
+  fixtures `tests/cases/atomics/`.
 - **A closure-typed PARAMETER shadowed by a same-named block-local `const` resolved to the
   parameter's own signature INSIDE the shadow's block (D2325).** `function f(g: () => f64):
   string { let out = "\{g()}"; { const g = () => "inner"; out = out + "|" + g() }; out }`
