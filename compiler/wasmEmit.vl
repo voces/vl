@@ -700,6 +700,7 @@ import {
   ifExprRefSlot,
   ifExprValtype,
   ifJoinNarrowsPerArm,
+  ifJoinUnionName,
   ifJoinTypedAtom,
   indexElemUnionName,
   indexPlaceNonNull,
@@ -4014,6 +4015,12 @@ export function emitUnionCoerce(
     fbStructNew(uBoxIdx)
     return 0
   }
+  // A `V | null` niche delivered where the box is expected: the niche carries no tag of its
+  // own, so its null must become the union's null. Ahead of the struct arms, which box a
+  // nullable record under its arm's tag whatever it holds (D2260), and of the value-atom gate.
+  const viaNulNiche = emitUnionBoxNulNiche(body, unionName, exprIx, fnIx)
+  if viaNulNiche < 0 { return -1 }
+  if viaNulNiche == 1 { return 0 }
   // A STRUCT value (an object literal, or a struct-typed expr) auto-boxes through
   // `emitExpr`'s `uDeclared` variant path; only a SCALAR value is value-boxed below.
   // This is what lets a MIXED union (`A | i32`) coerce either kind of member: an object
@@ -4225,12 +4232,6 @@ export function emitUnionCoerce(
   const viaListArm = emitUnionListLitViaRefArm(body, unionName, exprIx, fnIx)
   if viaListArm < 0 { return -1 }
   if viaListArm == 1 { return 0 }
-  // A `V | null` niche delivered where the box is expected: the niche carries no tag of its
-  // own, so the ladder below reads it as no atom at all and boxes the ref under a numeric
-  // tag. Ahead of the value-atom gate, whose raw pass-through would deliver the bare ref.
-  const viaNulNiche = emitUnionBoxNulNiche(body, unionName, exprIx, fnIx)
-  if viaNulNiche < 0 { return -1 }
-  if viaNulNiche == 1 { return 0 }
   if unionName == "" || !unionHasValueAtom(unionName) {
     return emitExpr(body, exprIx, fnIx)
   }
@@ -4650,6 +4651,26 @@ function emitUnionArmValueBox(body: u8[], exprIx: i32, fnIx: i32): i32 {
   if exprNullableVariant(exprIx, fnIx) {
     const nvi = nulVariantIdxOfExpr(exprIx, fnIx)
     if nvi >= 0 && nvi < uTags.length {
+      // Still nullable at this read (no narrow proved it): the null must become the union's
+      // null, not a box tagged with the arm over a null payload (D2260).
+      if nodeTyIsNullable(unwrapParen(exprIx)) {
+        const nvSlot = nulNicheBoxSlot()
+        const nvCtx = expCtxHere()
+        nvCtx.rawNullRead = true
+        if emitExprExpect(body, exprIx, fnIx, nvCtx) < 0 { return -1 }
+        fbLocalTee(nvSlot)
+        wU8(209)         // 0xd1 ref.is_null
+        fbIfRef(uBoxIdx) // 0x04 if, (ref $uBox) blocktype
+        fbI32Const(nullBoxTag())
+        fbRefNullNone()
+        fbStructNew(uBoxIdx)
+        fbElse()
+        fbI32Const(uTags[nvi])
+        fbLocalGet(nvSlot)
+        fbStructNew(uBoxIdx)
+        fbEnd()
+        return 1
+      }
       fbI32Const(uTags[nvi]) // 0x41 i32.const <variant tag>
       if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
       fbStructNew(uBoxIdx) // { tag, niche-ref }
@@ -12999,7 +13020,7 @@ function emitIfExpr(body: u8[], ifIx: i32, fnIx: i32) {
   // A union-valued join is the box whatever reads it, so it takes the box blocktype here and not
   // only at a union destination: an inline `(if c { a } else { b }) != null` reads it (D2250).
   if exprUnion(ifIx, fnIx) {
-    const iun = unionNameOfExpr(ifIx, fnIx)
+    const iun = ifJoinUnionName(ifIx, fnIx)
     if iun != "" { return emitUnionIfValue(body, iun, ifIx, fnIx) }
   }
   const rk = ifExprRefKind(ifIx, fnIx)
@@ -24073,7 +24094,11 @@ function emitUnionBoxNulNiche(
   )
   if nnTag < 0 { return 0 }
   const nnSlot = nulNicheBoxSlot()
-  if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
+  // Read raw: a nullable-string ident is otherwise recovered non-null, which traps on the very
+  // null this rung exists to box (D2260).
+  const nnCtx = expCtxHere()
+  nnCtx.rawNullRead = true
+  if emitExprExpect(body, exprIx, fnIx, nnCtx) < 0 { return -1 }
   fbLocalTee(nnSlot)
   wU8(209)         // 0xd1 ref.is_null
   fbIfRef(uBoxIdx) // 0x04 if, (ref $uBox) blocktype — the box is the result either way
