@@ -18453,20 +18453,24 @@ function emitArrSlice(body: u8[], callIx: i32, fnIx: i32) {
       if nulRecvNeedsRecover(callee.memObj, fnIx) {
         wU8(212) // 0xd4 ref.as_non_null
       }
+      // The receiver and both bounds reach the stack before the frame is written: the frame
+      // is shared, so a slice, `.map` or `.filter` in an argument would overwrite it (D2332).
+      if emitExpr(body, c.callArgs[0], fnIx) < 0 { return -1 }
+      if c.callArgs.length == 2 {
+        if emitExpr(body, c.callArgs[1], fnIx) < 0 { return -1 }
+        fbLocalSet(endL)
+      }
+      fbLocalSet(startL)
       fbLocalSet(srcL)
       // auxL = src.len (the wrapper's logical length, field 1)
       fbLocalGet(srcL)
       fbStructGet(wrap, 1)
       fbLocalSet(auxL)
       // start = clamp(rawStart, len)
-      if emitExpr(body, c.callArgs[0], fnIx) < 0 { return -1 }
-      fbLocalSet(startL)
       emitClampLocal(body, startL, auxL)
       fbLocalSet(startL)
       // end = clamp(rawEnd, len), or len when omitted (the 1-arg form slices to the end)
       if c.callArgs.length == 2 {
-        if emitExpr(body, c.callArgs[1], fnIx) < 0 { return -1 }
-        fbLocalSet(endL)
         emitClampLocal(body, endL, auxL)
         fbLocalSet(endL)
       } else {
@@ -23788,7 +23792,11 @@ function emitArrayNewIntr(body: u8[], callIx: i32, fnIx: i32) {
         }
       }
       if emitExpr(body, c.callArgs[0], fnIx) < 0 { return -1 }
-      fbLocalSet(arrNewScratchBase)
+      // The length is re-read after the fill runs, so a site inside another site's fill takes
+      // a slot of its own depth; the outermost keeps the frame's one slot (D2333).
+      let anLenL = arrNewScratchBase
+      if arrNewFillDepth > 0 { anLenL = widenTmpSlot(0 - 1000 - arrNewFillDepth) }
+      fbLocalSet(anLenL)
       if anIsNew {
         pendingStructIdx = anElemStructIdx
         const savedAVI = pendingVariantIdx
@@ -23807,26 +23815,31 @@ function emitArrayNewIntr(body: u8[], callIx: i32, fnIx: i32) {
             if anInner >= 0 { pendingListSlot = anInner }
           }
         }
+        arrNewFillDepth = arrNewFillDepth + 1
         const anFillRc = emitExpr(body, c.callArgs[1], fnIx)
+        arrNewFillDepth = arrNewFillDepth - 1
         pendingListKind = savedANK
         pendingListSlot = savedANS
         if anFillRc < 0 { return -1 }
         pendingStructIdx = -1
         pendingVariantIdx = savedAVI
-        fbLocalGet(arrNewScratchBase)
+        fbLocalGet(anLenL)
         fbArrayNew(anBack)
       } else {
-        fbLocalGet(arrNewScratchBase)
+        fbLocalGet(anLenL)
         fbArrayNewDefault(anBack)
       }
-      fbLocalGet(arrNewScratchBase)
-      fbLocalGet(arrNewScratchBase)
+      fbLocalGet(anLenL)
+      fbLocalGet(anLenL)
       fbStructNew(anWrap)
       return 0
     }
   }
   emitFail("emitProgram: emitArrayNewIntr expected an __array_new__ call")
 }
+
+// How many `__array_new__` fills enclose the site being lowered (D2333).
+let arrNewFillDepth = 0
 
 // The `__array_copy__(dst, dstAt, src, srcAt, count)` intrinsic lowering.
 function emitArrayCopyIntr(body: u8[], callIx: i32, fnIx: i32) {
