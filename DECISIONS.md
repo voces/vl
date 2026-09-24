@@ -7304,3 +7304,54 @@ value at all — a bare and a valued `return` are refused identically.
 `regress.py`, and a ground-truth scan of every `.vl` under `tests/cases/`, `std/`,
 `compiler/` and `scripts/` — 3,943 files, checked with the fixed compiler — found no existing
 use of a module-level return. No shipped program changed behaviour.
+
+## Deleting from a map while walking it is defined, and behaves like JS `Map` (owner ruling, 2026-09-24) — D2315
+
+**Ruled (option a): a `for` walk over a map or Set whose body deletes from, or inserts into, the
+collection it walks is DEFINED.** It behaves like JS `Map` iteration: every entry is visited once
+while it lives, an entry deleted before the walk reaches it is skipped, and an entry inserted
+during the walk is visited. `for k in m { m.delete(k) }` over 40 keys visits all 40 and leaves
+the map empty; master visited 25 and left 15, because `delete` compacted the entry arrays under
+the walk's cursor.
+
+**THE MECHANISM.** A delete never moves an entry: it clears the live flag and nulls the entry's
+key and value references (string keys, ref values), so the collector frees the payload and only
+the slots stay allocated. Compaction moved from `delete` to insert: an append compacts first when
+dead entries exceed `size + INITIAL_CAP`, through one `__map_compact_<row>__` helper per map
+shape that slides the live entries down IN PLACE (only the index is reallocated), then probes
+again. An insert can therefore still compact under a running walk, so exact JS semantics needed
+one more fact without tracking walks: each entry carries an i64 insertion sequence (map fields
+`seqs` and `next`), which grows along the entries and survives compaction. A walk keeps its
+current entry's sequence; after the body, if the entry at the cursor no longer carries it,
+`__map_resync__` moves the cursor to the first entry whose sequence is later. That is where JS
+resumes, including after the current key was deleted. Resize only rebuilds the index and a grow
+copies entries in place, so neither moves a walk.
+
+**WHY AN I64, AND WHAT IT BOUNDS.** A first cut kept the sequence in the low 31 bits of the live
+flag and compared serially. That is sound only while every LIVE entry is within 2^30 inserts of
+the walk's saved sequence, and the bound is the map's lifetime insert count while any old entry
+survives, not the span of one walk: a permanent key plus 2^30 churn inserts (about a minute) made
+a walk revisit entries or end early (D2323). An i64 sequence at one insert per nanosecond wraps
+after 292 years, so the comparison is a plain `i64.gt_s` with no window. Renumbering on
+compaction was rejected because a running walk holds a sequence the renumber would invalidate.
+
+**ONLY A MODULE THAT DELETES PAYS, AND ALL ITS MAPS DO.** `scanPrintUse` sets `gMapDeletes` when
+the module calls `.delete` anywhere, matched on the name, so one unused `.delete` switches every
+map in the module to the 9-field struct. Without it there is no dead entry, so no compaction,
+sequence or resync is emitted and the struct keeps its 7 fields: the `map-i32`, `map-string`,
+`word-freq`, `set-ops` and `live-set-churn` benches emit identical code to master. The layout is
+therefore per MODULE, and two separately built units exchanging a map would disagree on it; no
+map crosses a unit boundary today (plumb's maps live in one unit), and a cross-unit map ABI has
+to fix one layout when it is built.
+
+**THE PRICE, MEASURED** (median of 7–9, alternating master/candidate, `vl run`, box at load
+10–27): the D2291 churn (`m[k] = k` then `m.delete(k - W)`) at 25M ops costs +1% to +7% CPU
+across two runs (W = 4: 0.94 → 0.97 s; min-of-9 +4.3%, +1.6%, −2.1% for W = 4 / 100 / 1000),
+from the sequence stamp on each append. Peak RSS at 1M churn FELL from 54–76 MB to 23–29 MB, since
+compaction no longer allocates fresh entry arrays; at 25M both sit at the heap's 264 MB. A 1M
+i32 map deleted to 10 and given 1M more inserts peaks at 87.7 MB against master's 260.8 MB (1M
+inserts alone: 55.6 MB). Memory per entry grows by 8 bytes (the i64 sequence) in a deleting
+module. The seed grew 3,999 bytes (+0.14%).
+
+**FOLLOW-UP, not built (a′):** compacting on delete as well when no walk is active would reclaim
+slots in a delete-only phase, and needs the walk tracking this ruling avoided.

@@ -1,0 +1,226 @@
+// @run
+// @log 0 0 0
+// @log 0 0 0
+// @log 0 0 0
+// D2315: a walk whose body deletes from and inserts into the map it walks, against a reference
+// that is JS `Map` iteration written out: an append-only log of entries, walked by index,
+// skipping dead ones. Random ops over 64 keys, with a walk every 400 steps whose body deletes
+// (the current key, one ahead, one behind), inserts and overwrites; the delete rate keeps
+// compaction firing inside walks. Per map kind: mismatches, a walk that ended early or late,
+// and the live count against the reference's (all three 0).
+
+function i32Keys() {
+  const m: {[i32]: i32} = Map()
+  const logK: i32[] = []
+  const logV: i32[] = []
+  const logLive: boolean[] = []
+  const pos: i32[] = []
+  for i in 0 until 64 { pos.push(-1) }
+  let seed = 777
+  let bad = 0
+  let ends = 0
+  for step in 0 until 20000 {
+    seed = (seed * 1103515245 + 12345) & 2147483647
+    const k = (seed >> 8) % 64
+    const op = (seed >> 3) % 5
+    if op < 2 {
+      m.delete(k)
+      if pos[k] >= 0 { logLive[pos[k]] = false }
+      pos[k] = -1
+    } else {
+      m[k] = step
+      if pos[k] >= 0 {
+        logV[pos[k]] = step
+      } else {
+        pos[k] = logK.length
+        logK.push(k)
+        logV.push(step)
+        logLive.push(true)
+      }
+    }
+    if step % 400 == 0 {
+      let c = 0
+      let n = 0
+      for wk, wv in m {
+        while c < logK.length && !logLive[c] { c = c + 1 }
+        if c >= logK.length || logK[c] != wk || logV[c] != wv { bad = bad + 1 }
+        seed = (seed * 1103515245 + 12345) & 2147483647
+        const a = (seed >> 8) % 64
+        const wop = (seed >> 3) % 6
+        if wop == 0 || wop == 1 {
+          // delete the current key
+          m.delete(wk)
+          if pos[wk] >= 0 { logLive[pos[wk]] = false }
+          pos[wk] = -1
+        } else if wop == 2 {
+          // delete a random key: ahead, behind, or absent
+          m.delete(a)
+          if pos[a] >= 0 { logLive[pos[a]] = false }
+          pos[a] = -1
+        } else if n < 150 {
+          // insert or overwrite a random key: a new one must be visited later
+          m[a] = step + n
+          if pos[a] >= 0 {
+            logV[pos[a]] = step + n
+          } else {
+            pos[a] = logK.length
+            logK.push(a)
+            logV.push(step + n)
+            logLive.push(true)
+          }
+        }
+        n = n + 1
+        c = c + 1
+      }
+      while c < logK.length && !logLive[c] { c = c + 1 }
+      if c < logK.length { ends = ends + 1 }
+    }
+  }
+  let live = 0
+  for i in 0 until 64 {
+    if pos[i] >= 0 { live = live + 1 }
+  }
+  "\{bad} \{ends} \{m.size - live}"
+}
+
+function stringKeys() {
+  const m: {[string]: string} = Map()
+  const logK: i32[] = []
+  const logV: string[] = []
+  const logLive: boolean[] = []
+  const pos: i32[] = []
+  for i in 0 until 64 { pos.push(-1) }
+  let seed = 4242
+  let bad = 0
+  let ends = 0
+  for step in 0 until 20000 {
+    seed = (seed * 1103515245 + 12345) & 2147483647
+    const k = (seed >> 8) % 64
+    const op = (seed >> 3) % 5
+    if op < 2 {
+      m.delete("k\{k}")
+      if pos[k] >= 0 { logLive[pos[k]] = false }
+      pos[k] = -1
+    } else {
+      m["k\{k}"] = "v\{step}"
+      if pos[k] >= 0 {
+        logV[pos[k]] = "v\{step}"
+      } else {
+        pos[k] = logK.length
+        logK.push(k)
+        logV.push("v\{step}")
+        logLive.push(true)
+      }
+    }
+    if step % 400 == 0 {
+      let c = 0
+      let n = 0
+      for wk, wv in m {
+        while c < logK.length && !logLive[c] { c = c + 1 }
+        if c >= logK.length || "k\{logK[c]}" != wk || logV[c] != wv {
+          bad = bad + 1
+        }
+        const cur = if c < logK.length { logK[c] } else { 0 }
+        seed = (seed * 1103515245 + 12345) & 2147483647
+        const a = (seed >> 8) % 64
+        const wop = (seed >> 3) % 6
+        if wop == 0 || wop == 1 {
+          m.delete(wk)
+          if pos[cur] >= 0 { logLive[pos[cur]] = false }
+          pos[cur] = -1
+        } else if wop == 2 {
+          m.delete("k\{a}")
+          if pos[a] >= 0 { logLive[pos[a]] = false }
+          pos[a] = -1
+        } else if n < 150 {
+          m["k\{a}"] = "w\{n}"
+          if pos[a] >= 0 {
+            logV[pos[a]] = "w\{n}"
+          } else {
+            pos[a] = logK.length
+            logK.push(a)
+            logV.push("w\{n}")
+            logLive.push(true)
+          }
+        }
+        n = n + 1
+        c = c + 1
+      }
+      while c < logK.length && !logLive[c] { c = c + 1 }
+      if c < logK.length { ends = ends + 1 }
+    }
+  }
+  let live = 0
+  for i in 0 until 64 {
+    if pos[i] >= 0 { live = live + 1 }
+  }
+  "\{bad} \{ends} \{m.size - live}"
+}
+
+function sets() {
+  const s: {[i32]: boolean} = Set()
+  const logK: i32[] = []
+  const logLive: boolean[] = []
+  const pos: i32[] = []
+  for i in 0 until 64 { pos.push(-1) }
+  let seed = 99
+  let bad = 0
+  let ends = 0
+  for step in 0 until 20000 {
+    seed = (seed * 1103515245 + 12345) & 2147483647
+    const k = (seed >> 8) % 64
+    const op = (seed >> 3) % 5
+    if op < 2 {
+      s.delete(k)
+      if pos[k] >= 0 { logLive[pos[k]] = false }
+      pos[k] = -1
+    } else {
+      s.add(k)
+      if pos[k] < 0 {
+        pos[k] = logK.length
+        logK.push(k)
+        logLive.push(true)
+      }
+    }
+    if step % 400 == 0 {
+      let c = 0
+      let n = 0
+      for x in s {
+        while c < logK.length && !logLive[c] { c = c + 1 }
+        if c >= logK.length || logK[c] != x { bad = bad + 1 }
+        seed = (seed * 1103515245 + 12345) & 2147483647
+        const a = (seed >> 8) % 64
+        const wop = (seed >> 3) % 6
+        if wop == 0 || wop == 1 {
+          s.delete(x)
+          if pos[x] >= 0 { logLive[pos[x]] = false }
+          pos[x] = -1
+        } else if wop == 2 {
+          s.delete(a)
+          if pos[a] >= 0 { logLive[pos[a]] = false }
+          pos[a] = -1
+        } else if n < 150 {
+          s.add(a)
+          if pos[a] < 0 {
+            pos[a] = logK.length
+            logK.push(a)
+            logLive.push(true)
+          }
+        }
+        n = n + 1
+        c = c + 1
+      }
+      while c < logK.length && !logLive[c] { c = c + 1 }
+      if c < logK.length { ends = ends + 1 }
+    }
+  }
+  let live = 0
+  for i in 0 until 64 {
+    if pos[i] >= 0 { live = live + 1 }
+  }
+  "\{bad} \{ends} \{s.size - live}"
+}
+
+print(i32Keys())
+print(stringKeys())
+print(sets())
