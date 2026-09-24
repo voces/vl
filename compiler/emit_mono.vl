@@ -226,6 +226,7 @@ import {
   exprUnion,
   exprVariantIndex,
   fieldValueFeOf,
+  fnBlockShadowsAt,
   fnHasUnannotatedParam,
   fnIndexOf,
   fnIndexOfInScope,
@@ -2445,14 +2446,15 @@ function monoListSrcParamStmt(ix: i32, retName: string) {
   ""
 }
 
-// Callback specialization: rewrite every call through a closure-typed param in a cloned
-// instance body into a direct call to the concrete non-capturing function this instance
-// carries. The closure value is still passed, so non-call uses keep working;
-// a param with `cbFnNames == ""` leaves its calls as `call_ref`.
+// Callback specialization: rewrite a call through a closure-typed param into a direct call
+// to the non-capturing function this instance carries; `cbFnNames == ""` leaves it a
+// `call_ref`. `fnDeclIx` is the ORIGINAL `FuncDecl` this walk descends from, or -1 where no
+// single root names the body — a lambda-pinned generic clone, which skips the shadow check.
 function monoBakeCallback(
   ix: i32,
   cbParamNames: string[],
   cbFnNames: string[],
+  fnDeclIx: i32,
 ) {
   if ix < 0 { return ix }
   const n = P.nodes[ix]
@@ -2461,7 +2463,12 @@ function monoBakeCallback(
     let changed = false
     let i = 0
     while i < n.blkStmts.length {
-      const cs = monoBakeCallback(n.blkStmts[i], cbParamNames, cbFnNames)
+      const cs = monoBakeCallback(
+        n.blkStmts[i],
+        cbParamNames,
+        cbFnNames,
+        fnDeclIx,
+      )
       ns.push(cs)
       if cs != n.blkStmts[i] { changed = true }
       i = i + 1
@@ -2470,17 +2477,17 @@ function monoBakeCallback(
     return mkBlock(ns, n.pos)
   }
   if n is RetStmt {
-    const ca = monoBakeCallback(n.retArg, cbParamNames, cbFnNames)
+    const ca = monoBakeCallback(n.retArg, cbParamNames, cbFnNames, fnDeclIx)
     if ca == n.retArg { return ix }
     return mkReturn(ca, n.pos)
   }
   if n is LetDecl {
-    const ci = monoBakeCallback(n.letInit, cbParamNames, cbFnNames)
+    const ci = monoBakeCallback(n.letInit, cbParamNames, cbFnNames, fnDeclIx)
     if ci == n.letInit { return ix }
     return mkLet(n.letKw, n.letName, n.letType, ci, n.pos)
   }
   if n is WhileStmt {
-    const cb = monoBakeCallback(n.whileBody, cbParamNames, cbFnNames)
+    const cb = monoBakeCallback(n.whileBody, cbParamNames, cbFnNames, fnDeclIx)
     if cb == n.whileBody { return ix }
     return mkWhile(n.whileCond, cb, n.whileLabel, n.pos)
   }
@@ -2494,7 +2501,7 @@ function monoBakeCallback(
       const c = P.nodes[links[k]]
       if c is IfStmt {
         ccs.push(c.ifCond)
-        cts.push(monoBakeCallback(c.ifThen, cbParamNames, cbFnNames))
+        cts.push(monoBakeCallback(c.ifThen, cbParamNames, cbFnNames, fnDeclIx))
       }
       k = k + 1
     }
@@ -2502,11 +2509,16 @@ function monoBakeCallback(
       links,
       ccs,
       cts,
-      monoBakeCallback(monoIfChainElse(links), cbParamNames, cbFnNames),
+      monoBakeCallback(
+        monoIfChainElse(links),
+        cbParamNames,
+        cbFnNames,
+        fnDeclIx,
+      ),
     )
   }
   if n is ForRange {
-    const cb = monoBakeCallback(n.frBody, cbParamNames, cbFnNames)
+    const cb = monoBakeCallback(n.frBody, cbParamNames, cbFnNames, fnDeclIx)
     if cb == n.frBody { return ix }
     return mkForRange(
       n.frVar,
@@ -2520,34 +2532,42 @@ function monoBakeCallback(
     )
   }
   if n is ForIn {
-    const cb = monoBakeCallback(n.fiBody, cbParamNames, cbFnNames)
+    const cb = monoBakeCallback(n.fiBody, cbParamNames, cbFnNames, fnDeclIx)
     if cb == n.fiBody { return ix }
     return mkForIn(n.fiVar, n.fiVar2, n.fiIter, cb, n.fiLabel, n.pos)
   }
   if n is Paren {
-    const ci = monoBakeCallback(n.parInner, cbParamNames, cbFnNames)
+    const ci = monoBakeCallback(n.parInner, cbParamNames, cbFnNames, fnDeclIx)
     if ci == n.parInner { return ix }
     return mkParen(ci, n.pos)
   }
   if n is Call {
     // A call whose callee names a specialized closure param `f(...)` → direct call `cbFn(...)`;
-    // its arguments may themselves contain such calls (`f(g(x))`), so recurse there too.
+    // its arguments may themselves contain such calls, so recurse there too. Skipped when a
+    // block still open here shadows the param's name with a different value (D2325).
     let newCallee = n.callFn
     const callee = P.nodes[n.callFn]
     if callee is Ident {
-      let bk = 0
-      while bk < cbParamNames.length {
-        if cbFnNames[bk] != "" && callee.identName == cbParamNames[bk] {
-          newCallee = mkIdent(cbFnNames[bk], callee.pos)
+      if !fnBlockShadowsAt(fnDeclIx, sidOfNode(n.callFn), n.callFn) {
+        let bk = 0
+        while bk < cbParamNames.length {
+          if cbFnNames[bk] != "" && callee.identName == cbParamNames[bk] {
+            newCallee = mkIdent(cbFnNames[bk], callee.pos)
+          }
+          bk = bk + 1
         }
-        bk = bk + 1
       }
     }
     const nargs: i32[] = []
     let changed = newCallee != n.callFn
     let ai = 0
     while ai < n.callArgs.length {
-      const cca = monoBakeCallback(n.callArgs[ai], cbParamNames, cbFnNames)
+      const cca = monoBakeCallback(
+        n.callArgs[ai],
+        cbParamNames,
+        cbFnNames,
+        fnDeclIx,
+      )
       nargs.push(cca)
       if cca != n.callArgs[ai] { changed = true }
       ai = ai + 1
@@ -2560,8 +2580,8 @@ function monoBakeCallback(
     // reduce/fold shape). A compound-assignment node is left intact — rebuilding it
     // through `mkBinary` would drop its surface tag, and its call stays a `call_ref`.
     if n.binCompound != "" { return ix }
-    const cl = monoBakeCallback(n.binLeft, cbParamNames, cbFnNames)
-    const cr = monoBakeCallback(n.binRight, cbParamNames, cbFnNames)
+    const cl = monoBakeCallback(n.binLeft, cbParamNames, cbFnNames, fnDeclIx)
+    const cr = monoBakeCallback(n.binRight, cbParamNames, cbFnNames, fnDeclIx)
     if cl == n.binLeft && cr == n.binRight { return ix }
     return mkBinary(n.binOp, cl, cr, n.pos)
   }
@@ -3998,7 +4018,11 @@ function monoMakeInstance(
     // rewrite → the body is the same node `monoPinMapLambdas` produced.
     let instBody2 = instBody1
     if monoAnyBakedCallback(cbFnNames) {
-      instBody2 = monoBakeCallback(instBody1, pElemNames, cbFnNames)
+      // -1: `instBody1` is already a lambda-pinned clone (`monoPinBodyLambdas`/
+      // `monoPinMapLambdas`), not the original `fn.fnBody` — no single root names its
+      // block structure, so the shadow guard cannot be asked here (see the -1 contract
+      // on `monoBakeCallback`, D2325).
+      instBody2 = monoBakeCallback(instBody1, pElemNames, cbFnNames, -1)
     }
     // Per-instance copies of the direct generic calls this body makes, so instantiating
     // them rewrites only this instance's callee `Ident`s. No generic call → the same node.
@@ -4714,7 +4738,11 @@ function monoHasConcreteHOFParam() {
 function monoSpecializeConcrete(callIx: i32, fe: i32, ctx: i32) {
   const c = P.nodes[callIx]
   if c is Call {
-    const fn = P.nodes[fnStmts[fe]]
+    // The one read of `fnStmts[fe]` this function needs — kept in `fnDeclIx` rather than
+    // re-indexed below, so a second unguarded read of the same fall-through parameter does
+    // not open a second sentinel-index hit (D2325).
+    const fnDeclIx = fnStmts[fe]
+    const fn = P.nodes[fnDeclIx]
     if fn is FuncDecl {
       const params = fn.fnParams
       const args = c.callArgs
@@ -4781,7 +4809,14 @@ function monoSpecializeConcrete(callIx: i32, fe: i32, ctx: i32) {
         if monoInstOrig[kk] == fe { count = count + 1 }
         kk = kk + 1
       }
-      const instBody = monoBakeCallback(fn.fnBody, cbParamNames, cbFnNames)
+      // `fnDeclIx` is the ORIGINAL declaration `fn.fnBody` descends from, so the shadow
+      // guard walks the same tree the position names (D2325).
+      const instBody = monoBakeCallback(
+        fn.fnBody,
+        cbParamNames,
+        cbFnNames,
+        fnDeclIx,
+      )
       const nps: i32[] = []
       let pj = 0
       while pj < params.length {
