@@ -113,3 +113,34 @@ Deno.test({
     }
   },
 });
+
+// `--low-memory-unused` is opt-in: with it, `-O` folds `p + 16` (an add that may wrap, so the
+// compiler leaves it) into the offset; without it, the add stays. Alone it is a usage error.
+Deno.test({
+  name: "memarg offset: --low-memory-unused folds a small added constant at -O only when asked",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = Deno.makeTempDirSync({ prefix: "vl-memarg-lmu-" });
+    try {
+      Deno.writeTextFileSync(
+        `${dir}/lmu.vl`,
+        "function f(p: i32) { __load_i32__(p + 16) }\nprint(f(__load_i32__(0)))\n",
+      );
+      const off = await dis(dir, "lmu", ["-O"]);
+      if (count(off, "offset=16") !== 0) throw new Error(`-O alone folded the add:\n${off}`);
+      const on = await dis(dir, "lmu", ["-O", "--low-memory-unused"]);
+      if (count(on, "i32.load offset=16") !== 1) {
+        throw new Error(`-O --low-memory-unused did not fold:\n${on}`);
+      }
+      const bare = await new Deno.Command(VL, {
+        args: ["build", `${dir}/lmu.vl`, "-o", `${dir}/x.wasm`, "--compiler", COMPILER, "--low-memory-unused"],
+        env: nativeEnv({ VL_WASM_OPT: WASM_OPT }),
+        stdout: "piped",
+        stderr: "piped",
+      }).output();
+      if (bare.code !== 2) throw new Error(`want exit 2 without -O, got ${bare.code}`);
+    } finally {
+      Deno.removeSync(dir, { recursive: true });
+    }
+  },
+});

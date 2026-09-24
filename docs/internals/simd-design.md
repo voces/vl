@@ -769,10 +769,15 @@ operand value: a wholly constant address (`__load_i64__(1024 + 8)` is `i32.const
 `offset=1032`), and `a + K` where `a` is provably below `2^32 - K` — a mask by a constant, a
 logical shift right, a `__load_u8__`/`__load_u16__`, and products, left shifts and sums of those
 that stay in range. `D + (x & 1023) * 8` therefore compiles to `offset=D` with no `i32.add`;
-`D + x * 8` stays an add. Binaryen's `--low-memory-unused` is not used: it folds any `p + C`
-with `C < 1024` by assuming the first KiB is unused, which is false for a VL program (and its
-bound is fixed at 1024 in binaryen 130, so it cannot reach an address like plumb's `D` anyway).
-Not covered: the `load*_lane`/`store*_lane` SIMD forms, which tier 1 does not have.
+`D + x * 8` stays an add.
+
+Binaryen's `--low-memory-unused` folds any `p + C` with `C < 1024` by assuming the first KiB is
+never accessed, which turns a wrapping add into a trap. That is false of VL programs in general
+(the fixtures store at address 4), so it is never on by default; `vl build -O
+--low-memory-unused` (or `-O3`) passes it for a module whose layout makes it true, as plumb's
+does. Binaryen 130 fixes the bound at 1024 and ignores `low-memory-bound`, so the flag takes no
+value, and a larger constant such as plumb's `D` needs the offset form. Not covered: the
+`load*_lane`/`store*_lane` SIMD forms, which tier 1 does not have.
 
 **Where wasm and x86 SSE disagree.** A translator or a future SSE-shaped std layer has to correct
 three differences (found by plumb porting its SSE helpers, and checked against real CPU output):
