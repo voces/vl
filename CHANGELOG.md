@@ -863,6 +863,44 @@ new: the compare-frame pre-pass never recurses into a code-15 field, so a NESTED
 
 ## Codegen, memory & runtime (Track B)
 
+- **A closure-typed PARAMETER shadowed by a same-named block-local `const` resolved to the
+  parameter's own signature INSIDE the shadow's block (D2325).** `function f(g: () => f64):
+  string { let out = "\{g()}"; { const g = () => "inner"; out = out + "|" + g() }; out }`
+  printed `1.5|1.5` instead of `1.5|inner` — check-clean, then `type mismatch: expected (ref
+  null $type), found f64` at emit once the return kinds differed. `calleeCloSigKeyAt`'s
+  loop-variable/parameter/anon-leaf rungs (`loopVarCloSigKey`, `paramCloSigKey`,
+  `anonLeafCloBindSigKey`) matched by bare name with no position check and ran BEFORE the
+  positioned rungs D2316 built; a block shadow of a parameter or loop variable — which
+  `parentLetOfAt`'s table does not track at all — never got the chance to win. Closing it
+  needed a second gap in `parentLetOfAt` itself: for a name with no tracked DUPLICATE
+  `LetDecl` it answered any position unconditionally, sound under D2316 (no other binding of
+  that name existed to be confused with) and unsound the moment a parameter shares the name.
+  `parentLetCoversAt` is the strict, bounds-checked reader the new guard uses instead of
+  widening `parentLetOfAt`'s own contract, which every other caller (the CAPTURE channel
+  included, re-asking with a position from a different function's coordinate space) still
+  needs unconditional. `monoBakeCallback`'s direct-call rewrite (the monomorphizer's
+  concrete-callback specialization) carried the identical unconditional-by-name bug on a
+  separate tree walk and needed the same guard. Matrix: a param shadowed in a plain block, a
+  loop body, if/else arms, match arms; the param read again after the shadow closes; a `for
+  g in closures` loop variable shadowed inside its body; a nested closure capturing the
+  shadow vs. one capturing the param; every adjacent (param kind, shadow kind) pairing over
+  i32/f64/string/struct/list. Two of those cases (the loop variable and the capture) already
+  ran correctly pre-fix — they resolve through `scopeSlotOf` and `capturedBindingFrameOf`,
+  not the three rungs this row fixes — and stay in the matrix as controls. `parentLetOfAt`'s
+  own duplicate-chain scan is now indexed by sid (a linked list through the flat `plMore*`
+  rows) rather than scanned whole per query, since a generated function reusing many names
+  across many blocks made every query pay for every OTHER name's duplicates too; verified
+  byte-identical output on a real 85K-line generated chunk and a synthetic 6,000-name
+  construction, though CPU delta at accessible scales did not clear this box's noise floor.
+  Measured: 0 of 256,113 distilled-corpus cells moved, rep-fuzz exact, capability probes
+  unchanged at 0 of 198 clause-1 breaks, native fixpoint holds, mono-tyaram-grid 161 OK / 100
+  REJECT / 0 BAD, 4059 of 4059 ci-native tests pass, seed +1.8%. Filed on the way: **D2326**
+  — the value-union member-set ladder (`unionNameOfIdentSid`/`unionDeclTyIxOfIdentSid`/
+  `startBlockLetRowOfSid`) has the identical unpositioned-name shape and reproduces with two
+  ordinary sibling blocks (no parameter needed), left open because closing it means threading
+  a position through roughly thirty call sites. Fixtures
+  `tests/cases/closures/param-shadow-*.vl` (7 files).
+
 - **Two sibling blocks INSIDE A FUNCTION binding one closure name no longer collapse onto
   the first block's signature (D2316).** `function f(): string { { const g = () => 1.5;
   out = "\{g()}" } { const g = () => "s"; out = out + g() } }` was `vl check` rc 0 and
