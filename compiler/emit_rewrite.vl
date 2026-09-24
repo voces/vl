@@ -87,6 +87,7 @@ import {
   OptMember,
   P,
   Param,
+  Program,
   Paren,
   RetStmt,
   Spread,
@@ -144,6 +145,7 @@ import {
   fnParent,
   fnStmts,
   fnValUsed,
+  gSharedMemPages,
   startStmts,
   unNames,
   unTyIx,
@@ -166,6 +168,67 @@ import {
 } from "./emit_classify"
 import { paramIsClosure, paramNulClosure } from "./emit_query"
 import { sidNoteNodeName } from "./symbols"
+
+// ── the build-decided `if` ───────────────────────────────────────────────────
+
+// Whether the statement at `ix` is an else-less `if __memory_shared__() { … }`, the one
+// condition the build rather than the run decides.
+function isMemSharedIf(ix: i32): boolean {
+  if ix < 0 { return false }
+  const s = P.nodes[ix]
+  if s is IfStmt {
+    if s.ifElse >= 0 || s.ifCond < 0 { return false }
+    const c = P.nodes[s.ifCond]
+    if c is Call {
+      if c.callArgs.length != 0 || c.callFn < 0 { return false }
+      const f = P.nodes[c.callFn]
+      if f is Ident { return f.identName == "__memory_shared__" }
+    }
+  }
+  false
+}
+
+// Folds each `isMemSharedIf` statement before any other pass reads the tree: a shared
+// build keeps its body as a bare block, any other build drops the statement, so the
+// shared-only code costs a default build no byte (DECISIONS.md, "std:buffer's allocator
+// over a shared memory"). Both arms were already type-checked. Edits lists in place.
+function foldMemSharedList(stmts: i32[]) {
+  let r = 0
+  let w = 0
+  while r < stmts.length {
+    const ix = stmts[r]
+    if isMemSharedIf(ix) {
+      if gSharedMemPages > 0 {
+        const s = P.nodes[ix]
+        if s is IfStmt { s.ifCond = mkBool(1, s.pos) }
+        stmts[w] = ix
+        w = w + 1
+      }
+    } else {
+      stmts[w] = ix
+      w = w + 1
+    }
+    r = r + 1
+  }
+  while stmts.length > w { stmts.pop() }
+  0
+}
+
+// The pass: every statement list in the arena, so a nested or top-level fold is met too.
+export function foldMemShared() {
+  const n = P.nodes.length
+  let i = 0
+  while i < n {
+    const nd = P.nodes[i]
+    if nd is Block {
+      foldMemSharedList(nd.blkStmts)
+    } else if nd is Program {
+      foldMemSharedList(nd.progStmts)
+    }
+    i = i + 1
+  }
+  0
+}
 
 // ── self-method / operator / index-trap dispatch rewrite ─────────────────────
 // The host resolves these in its type-aware parser; the native parser is

@@ -23,7 +23,15 @@ const ALIGN = 8
 
 // How many bytes have been handed out, counted from the heap base; the bump pointer
 // is the base plus this. The base is never 0, so `base == 0` is never a `Buf`.
+// Over a shared memory the pointer lives in the header instead, and this is where
+// THIS instance's latest allocation ended, counted from the first byte after it.
 let bumpOff = 0
+
+// Over a shared memory the window's first 8 bytes are the header every instance
+// allocates through: the bytes handed out (low word) and where the top run of one
+// instance's back-to-back allocations began (high word), both counted from the byte
+// after it. Zero-filled memory is its starting state, so nothing initialises it.
+// (A literal 8 below, not a const: a const would cost every build a global.)
 
 // `n` rounded up to the next multiple of `ALIGN`.
 function alignUp(n: i32): i32 {
@@ -52,6 +60,40 @@ function ensureCapacity(end: i32) {
 export function Buffer(byteLength: i32): Buf {
   if byteLength < 0 { __trap__() }
   const heap = __heap_base__()
+  if __memory_shared__() {
+    const first = heap + 8
+    // Grow before claiming, so a refused growth leaves the shared pointer where it was.
+    let want = first
+    while true {
+      let need = want >> PAGE_SHIFT
+      if (want & PAGE_MASK) != 0 { need = need + 1 }
+      let have = __memory_size__()
+      while need > have {
+        // A failed grow with the size unchanged is the max refusing it; a changed size
+        // is another instance's growth, so look again.
+        if __memory_grow__(need - have) < 0 {
+          if __memory_size__() == have { __trap__() }
+        }
+        have = __memory_size__()
+      }
+      const word = __atomic_load_i64__(heap)
+      const top = word as% i32
+      const base = first + top
+      if byteLength > __heap_limit__() - base { __trap__() }
+      const next = base + alignUp(byteLength)
+      if next > want {
+        want = next
+      } else {
+        let run = (word >> 32) as% i32
+        if top != bumpOff { run = top }
+        const claimed = ((run as i64) << 32) | ((next - first) as i64)
+        if __atomic_rmw_cmpxchg_i64__(heap, word, claimed) == word {
+          bumpOff = next - first
+          return { base: base, length: byteLength }
+        }
+      }
+    }
+  }
   const base = heap + bumpOff
   // The window's ends are multiples of 8, so a length that fits still fits once
   // rounded up — and the comparison cannot overflow, unlike `base + length`.
@@ -63,7 +105,15 @@ export function Buffer(byteLength: i32): Buf {
 }
 
 // The current bump pointer, to hand back to `bufferRelease`.
-export function bufferMark(): i32 { return __heap_base__() + bumpOff }
+export function bufferMark(): i32 {
+  if __memory_shared__() {
+    const heap = __heap_base__()
+    // No header page yet means nothing was ever handed out.
+    if (heap >> PAGE_SHIFT) >= __memory_size__() { return heap + 8 }
+    return heap + 8 + (__atomic_load_i64__(heap) as% i32)
+  }
+  return __heap_base__() + bumpOff
+}
 
 // Reclaim everything allocated since `mark`, in one move. Every `Buf` allocated
 // after `mark` DANGLES: reads answer another buffer's bytes and writes corrupt
@@ -71,6 +121,29 @@ export function bufferMark(): i32 { return __heap_base__() + bumpOff }
 // `[heap base, bump pointer]` — which a mark held across an earlier release is.
 export function bufferRelease(mark: i32) {
   const heap = __heap_base__()
+  if __memory_shared__() {
+    const first = heap + 8
+    if mark < first { __trap__() }
+    if (mark & 7) != 0 { __trap__() }
+    if (heap >> PAGE_SHIFT) >= __memory_size__() {
+      if mark != first { __trap__() }
+      return
+    }
+    while true {
+      const word = __atomic_load_i64__(heap)
+      const top = word as% i32
+      if mark > first + top { __trap__() }
+      // Only this instance's own run at the top can go; anything else is kept.
+      if top != bumpOff { return }
+      const run = (word >> 32) as% i32
+      if mark - first < run { return }
+      const kept = ((run as i64) << 32) | ((mark - first) as i64)
+      if __atomic_rmw_cmpxchg_i64__(heap, word, kept) == word {
+        bumpOff = mark - first
+        return
+      }
+    }
+  }
   if mark < heap { __trap__() }
   if mark > heap + bumpOff { __trap__() }
   if (mark & 7) != 0 { __trap__() }
