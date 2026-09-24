@@ -1652,13 +1652,15 @@ new: the compare-frame pre-pass never recurses into a code-15 field, so a NESTED
   up. The return type was never the ingredient, despite looking like one: it never mattered
   whether it was a user record, a primitive, absent, generic, a union or a nominal `new` type.
   Fixtures `tests/cases/parser/call-first-stmt-then-brace-tail.vl`,
-  `tests/cases/parser/call-first-stmt-then-brace-tail-getter.vl`, and
-  `tests/vl_fmt_test.ts`'s dedicated same-line-shorthand test (the durable pin for a genuine
-  shorthand at this lookahead — `vl fmt` canonicalises the shape away, so a `tests/cases/`
-  fixture cannot stay fmt-clean and keep exercising it). D2293 (a next-line body brace produces
-  a confusing diagnostic instead of naming the adjacency rule) and D2294 (an unrelated
-  negation-type-in-generic-argument checker gap this row's fixture work surfaced) are filed
-  open.
+  `tests/cases/parser/call-first-stmt-then-brace-tail-getter.vl`, and two `tests/vl_fmt_test.ts`
+  cases reading raw, unformatted source (`vl fmt` canonicalises shorthand away, so a
+  `tests/cases/` fixture cannot stay fmt-clean and keep exercising this lookahead): a CONTROL
+  proving a genuine same-line shorthand still resolves as a method (passes with or without this
+  fix — it never puts a newline before the `{`), and the REGRESSION PIN, a call followed by a
+  newline then a brace-led tail, confirmed to fail with the same-line rule reverted. D2293 (a
+  next-line body brace produces a confusing diagnostic instead of naming the adjacency rule)
+  and D2294 (an unrelated negation-type-in-generic-argument checker gap this row's fixture work
+  surfaced) are filed open.
 - **Every bitwise and shift operator has its compound form, `&= |= ^= <<= >>= >>>=`, and so does
   `%` (plumb PL-021).** `x ^= y` was `expected an expression but found EQUAL`. Each is `x = x op
   (y)`: seven new token kinds, one `isCompoundAssign` predicate the climber, `rightAssoc` and
