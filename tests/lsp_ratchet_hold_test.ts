@@ -224,6 +224,46 @@ Deno.test("ratchet-hold: a code is not held OUTSIDE the trees its ratchet walks"
   await Deno.remove(dir, { recursive: true });
 });
 
+Deno.test("ratchet-hold: prefer-interpolation is held in the repo's trees and nowhere else", async () => {
+  // The compiler's standing `+` chains are baselined by scripts/interp-budget.py over
+  // compiler/, std/ and scripts/. Held there; a new chain in a held file is loud; and a
+  // consumer's own file — any other tree — sees every suggestion, unchanged.
+  const INTERP = "prefer-interpolation";
+  const info = (line: number): VLDiagnostic => ({ ...diag(INTERP, line), severity: "info" });
+  const dir = await workspace("scripts/interp-budget-baseline.json", {
+    "compiler/typecheck.vl": { [INTERP]: 2 },
+    "std/fs.vl": { [INTERP]: 1 },
+    "scripts/fuzzgen.vl": { [INTERP]: 1 },
+  });
+  for (const [file, n] of [["compiler/typecheck.vl", 2], ["std/fs.vl", 1], ["scripts/fuzzgen.vl", 1]] as const) {
+    const held = applyRatchetHold(
+      Array.from({ length: n }, (_, i) => info(i + 1)),
+      `${dir}/${file}`,
+      dir,
+      false,
+    );
+    if (held.length !== 0) {
+      throw new Error(`${file} at its baseline: want 0 published, got ${JSON.stringify(held)}`);
+    }
+  }
+  const over = applyRatchetHold([info(1), info(2), info(3)], `${dir}/compiler/typecheck.vl`, dir, false);
+  if (over.length !== 3 || !over.every((d) => d.message.startsWith("+1 over baseline: "))) {
+    throw new Error(`one over: want all three loud, got ${JSON.stringify(over)}`);
+  }
+  for (const file of ["src/app.vl", "tests/cases/strings/x.vl"]) {
+    const mine = [info(1), info(2)];
+    const out = applyRatchetHold(mine, `${dir}/${file}`, dir, false);
+    if (out.length !== 2 || out.some((d, i) => d.message !== mine[i].message || d.severity !== "info")) {
+      throw new Error(`${file} is user code: want every finding unchanged, got ${JSON.stringify(out)}`);
+    }
+  }
+  const elsewhere = applyRatchetHold([info(1)], "/home/someone/game/main.vl", dir, false);
+  if (elsewhere.length !== 1 || elsewhere[0].message !== info(1).message) {
+    throw new Error(`outside the workspace: want it unchanged, got ${JSON.stringify(elsewhere)}`);
+  }
+  await Deno.remove(dir, { recursive: true });
+});
+
 Deno.test("ratchet-hold: a re-read picks up a baseline edited on disk", async () => {
   const dir = await workspace(LADDER, {
     "compiler/x.vl": { "kind-ladder-incomplete": 3 },
@@ -338,6 +378,7 @@ const OWNERS: Record<string, string[]> = {
   "scripts/scan-budget-baseline.json": ["scripts/scan-budget.py"],
   "scripts/comment-budget-baseline.json": ["scripts/comment-budget.py"],
   "scripts/export-budget-baseline.json": ["scripts/export-budget.py"],
+  "scripts/interp-budget-baseline.json": ["scripts/interp-budget.py"],
 };
 
 /**

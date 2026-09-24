@@ -60,6 +60,12 @@ import {
 // The free index-operator declaration-name encoding.
 import { OP_INDEX_GET, OP_INDEX_SET, opDeclLabel, opDeclOpOf } from "./ast"
 import { getDeclLabel, getDeclPropOf } from "./ast"
+import {
+  nodeLastTok,
+  nodeSpanEndTok,
+  nodeStartTok,
+  tokFirstLineEndCol,
+} from "./fmt_util"
 
 // ── diagnostic sink ──────────────────────────────────────────────────────────
 
@@ -187,11 +193,15 @@ export function lint(progRoot: i32) {
     duplicateImports(stmts)
     unusedFunctions(stmts)
     preferConst()
-    // One walk offers every node to all seven structural rules; the regroup restores
+    // One walk offers every node to every structural rule; the regroup restores
     // the rule-major emit sequence a same-position tie reads.
     const walkMark = lintCodes.length
+    piSeen = []
     lintWalk(progRoot)
     lintRegroupWalkPhase(walkMark)
+    // The typed links describe one module's text; a caller that does not hand them in
+    // again is judged as having none, never as having the previous module's.
+    lintSetPlusLinks(Map(), false)
     // Not walks: neither comments, nor a loop's shape, nor a ladder's default is in
     // the arena. All four read the source the driver set, and `commentBudget` consumes
     // it, so it runs last — after the std audience pass, which reads the same text.
@@ -776,9 +786,10 @@ const lintRankUnionLetNoMelt = 5
 const lintRankUnusedPureExpr = 6
 const lintRankDivZero = 7
 const lintRankRangeLen = 8
-const lintRankCount = 9
+const lintRankPreferInterp = 9
+const lintRankCount = 10
 
-// Offer `ix` to all nine structural rules, in rank order. Each visitor opens with its
+// Offer `ix` to all ten structural rules, in rank order. Each visitor opens with its
 // own `is` test, so this is a flat unconditional sequence: there is no rule id to
 // dispatch on and no chain a new rule could be inserted into in the wrong place.
 function lintVisitAll(ix: i32) {
@@ -791,6 +802,7 @@ function lintVisitAll(ix: i32) {
   unusedPureExprVisit(ix)
   divideByZeroVisit(ix)
   rangeLenBoundVisit(ix)
+  preferInterpVisit(ix)
   0
 }
 
@@ -815,10 +827,10 @@ function lintWalk(ix: i32) {
   0
 }
 
-// The tie-break rank of a walk-rule diagnostic, read off its code — each of the eight
-// codes is emitted by exactly one visitor, so the code is the whole key. A code with no
-// rank sorts after all eight rather than being dropped; only the eight reach here,
-// since `lintRegroupWalkPhase` reads just the slice the walk appended.
+// The tie-break rank of a walk-rule diagnostic, read off its code — each walk code is
+// emitted by exactly one visitor, so the code is the whole key. A code with no rank sorts
+// after every ranked one rather than being dropped; only walk codes reach here, since
+// `lintRegroupWalkPhase` reads just the slice the walk appended.
 function lintRankOfCode(code: string) {
   if code == "unreachable-code" { return lintRankUnreachable }
   if code == "constant-condition" { return lintRankConstBranch }
@@ -829,13 +841,14 @@ function lintRankOfCode(code: string) {
   if code == "unused-pure-expression" { return lintRankUnusedPureExpr }
   if code == "divide-by-zero" { return lintRankDivZero }
   if code == "range-inclusive-length" { return lintRankRangeLen }
+  if code == "prefer-interpolation" { return lintRankPreferInterp }
   lintRankCount
 }
 
 // Regroup the diagnostics the single walk appended at or after `mark` into rank order,
-// stably — each rule's findings keep the pre-order the walk produced. This is the
-// sequence the seven separate walks emitted, and it is what breaks a same-position tie
-// downstream; `tests/vl_check_module_lint_test.ts` pins one such tie.
+// stably — each rule's findings keep the pre-order the walk produced, and every column
+// moves with its row, the span's end included (D2306). This order is what breaks a
+// same-position tie downstream; `tests/vl_check_module_lint_test.ts` pins one such tie.
 function lintRegroupWalkPhase(mark: i32) {
   const n = lintCodes.length
   if mark < 0 || n - mark < 2 { return 0 }
@@ -850,6 +863,7 @@ function lintRegroupWalkPhase(mark: i32) {
   const sevs: string[] = []
   const lines: i32[] = []
   const cols: i32[] = []
+  const ends: i32[] = []
   let r = 0
   while r <= lintRankCount {
     let j = 0
@@ -861,6 +875,7 @@ function lintRegroupWalkPhase(mark: i32) {
         sevs.push(lintSevs[at])
         lines.push(lintLines[at])
         cols.push(lintCols[at])
+        ends.push(lintEnds[at])
       }
       j = j + 1
     }
@@ -873,6 +888,7 @@ function lintRegroupWalkPhase(mark: i32) {
     lintSevs[mark + k] = sevs[k]
     lintLines[mark + k] = lines[k]
     lintCols[mark + k] = cols[k]
+    lintEnds[mark + k] = ends[k]
     k = k + 1
   }
   0
@@ -1062,6 +1078,192 @@ function reportRangeLenBound(node: ForRange) {
     }
   }
   0
+}
+
+// ── 4d. a string built by a `+` chain (prefer-interpolation) ──────────────────
+
+// `hex(a) + "-" + hex(b) + "-" + hex(c)` says in five pieces what `"\{hex(a)}-\{hex(b)}-…"`
+// says in one. A chain is the left spine of `+`, and it is a string built by concatenation
+// only when every link's left operand is a `string`: an object receiver may declare its own
+// `+`. The desugared `+` of an interpolated string, and everything inside one, is exempt.
+const piMinLiterals = 3
+const piPreviewMax = 60
+
+// The `+` links the check typed for this module, by anchor byte offset: 1 when the left
+// operand checked as a string on every check of it, 0 otherwise. `piLinksKnown` is false unless the
+// caller paired this lint with its own check, and then only a chain opening with a literal is judged —
+// a `string` left operand takes the built-in concat, so that chain is concatenation throughout.
+let piLinks: {[i32]: i32} = Map()
+let piLinksKnown = false
+
+export function lintSetPlusLinks(links: {[i32]: i32}, known: boolean) {
+  piLinks = links
+  piLinksKnown = known
+  0
+}
+
+// Whether every link in `links` concatenates strings, the chain's leftmost operand `head`.
+function piChainIsConcat(links: i32[], head: i32) {
+  if !piLinksKnown {
+    if piStrLitText(head).length > 0 { return true }
+    const h = P.nodes[head]
+    if h is BinExpr { return h.binTpl == 1 }
+    return false
+  }
+  let i = 0
+  while i < links.length {
+    const tk = nodeLastTok(links[i])
+    if tk < 0 { return false }
+    const v = piLinks[P.toks[tk].start] ?? 0
+    if v != 1 { return false }
+    i = i + 1
+  }
+  true
+}
+
+// 1 at every node already accounted for: a chain's inner links, once its root has been
+// judged, and every node of an interpolated string. Grown on demand, reset per run.
+let piSeen: i32[] = []
+
+function piMark(ix: i32) {
+  if ix < 0 { return 0 }
+  while piSeen.length <= ix { piSeen.push(0) }
+  piSeen[ix] = 1
+  0
+}
+
+function piIsSeen(ix: i32) { ix >= 0 && ix < piSeen.length && piSeen[ix] == 1 }
+
+// Mark `ix` and its whole subtree seen — an interpolated string and its holes.
+function piMarkTree(ix: i32) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  let cur = ix
+  while cur >= 0 {
+    piMark(cur)
+    const kids = nodeSpineChildren(cur)
+    let i = 0
+    while i < kids.length {
+      piMarkTree(kids[i])
+      i = i + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  0
+}
+
+// A plain `+` link of a chain: not a desugared interpolation, which `piMarkTree` owns.
+function piIsLink(ix: i32) {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = P.nodes[ix]
+  if n is BinExpr { return n.binOp == "+" && n.binTpl == 0 }
+  false
+}
+
+function preferInterpVisit(ix: i32) {
+  if piIsSeen(ix) { return 0 }
+  const n = P.nodes[ix]
+  if n is BinExpr {
+    if n.binTpl == 1 {
+      piMarkTree(ix)
+      return 0
+    }
+  }
+  if !piIsLink(ix) { return 0 }
+  // The operands, right to left along the left spine; each inner link is marked so the
+  // walk does not judge a suffix of this chain again.
+  const rev: i32[] = []
+  const links: i32[] = []
+  let cur = ix
+  while piIsLink(cur) {
+    piMark(cur)
+    links.push(cur)
+    const b = P.nodes[cur]
+    if b is BinExpr {
+      rev.push(b.binRight)
+      cur = b.binLeft
+    } else {
+      cur = -1
+    }
+  }
+  rev.push(cur)
+  let lits = 0
+  let i = 0
+  while i < rev.length {
+    if piStrLitText(rev[i]).length > 0 { lits = lits + 1 }
+    i = i + 1
+  }
+  if lits < piMinLiterals { return 0 }
+  if cur < 0 || !piChainIsConcat(links, cur) { return 0 }
+  const first = nodeStartTok(ix)
+  if first < 0 { return 0 }
+  const end = nodeSpanEndTok(ix)
+  const shown = piPreview(rev)
+  let fix = "an interpolated string `\"text \\{expr} more\"` reads better"
+  if shown.length > 0 {
+    fix = "an interpolated string reads better: `" + shown + "`"
+  }
+  lintEmitAtSpan(
+    "prefer-interpolation",
+    "this string is built from "
+      + txNumStr(rev.length)
+      + " pieces with `+`; "
+      + fix,
+    "info",
+    P.toks[first].line,
+    P.toks[first].col,
+    tokFirstLineEndCol(end),
+  )
+  0
+}
+
+// A string literal operand's lexeme when it is a plain `"…"`, else "" — the empty
+// literal `""` included, which is still a literal and answers its two quotes.
+function piStrLitText(ix: i32) {
+  if ix < 0 || ix >= P.nodes.length { return "" }
+  const n = P.nodes[ix]
+  if n is StrLit {
+    const t = n.strText
+    if t.length >= 2 && t[0] == '"' && t[t.length - 1] == '"' { return t }
+  }
+  ""
+}
+
+// The interpolated spelling of the operands `rev` (right to left), or "" when it would
+// be longer than `piPreviewMax` or an operand's source is not one line of this module.
+function piPreview(rev: i32[]) {
+  let body = ""
+  let i = rev.length - 1
+  while i >= 0 {
+    const lit = piStrLitText(rev[i])
+    if lit.length > 0 {
+      body = body + lit.slice(1, lit.length - 1)
+    } else {
+      const src = piOperandSource(rev[i])
+      if src.length == 0 { return "" }
+      body = body + "\\{" + src + "}"
+    }
+    if body.length > piPreviewMax { return "" }
+    i = i - 1
+  }
+  "\"" + body + "\""
+}
+
+// Operand `ix`'s source text when it sits on one line of the module text the driver set,
+// else "". The slice must open with its own first token, or the offsets are another
+// module's and the answer is "".
+function piOperandSource(ix: i32) {
+  const a = nodeStartTok(ix)
+  const b = nodeLastTok(ix)
+  if a < 0 || b < 0 || b < a { return "" }
+  const ta = P.toks[a]
+  const tb = P.toks[b]
+  if ta.line != tb.line { return "" }
+  const lo = ta.start
+  const hi = tb.start + tb.text.length
+  if lo < 0 || hi > txSource.length || hi <= lo { return "" }
+  const out = txSource.slice(lo, hi)
+  if out.slice(0, ta.text.length) != ta.text { return "" }
+  out
 }
 
 // ── 5. unreachable code ──────────────────────────────────────────────────────

@@ -197,6 +197,9 @@ import {
   isReservedIntrinsicName,
   jwSetGenTokStart,
   jwSiteNode,
+  plusLinkCount,
+  plusLinkStrAt,
+  plusLinkTokAt,
   printDomainStr,
   tErrBuiltinTyDecl,
 } from "./typecheck"
@@ -300,6 +303,7 @@ import {
   lintMsgAt,
   lintReset,
   lintSetPath,
+  lintSetPlusLinks,
   lintSetSource,
   lintSevAt,
 } from "./lint"
@@ -950,11 +954,13 @@ function jwSecondPass(root: i32): i32 {
   // and the marker is the first generated token (`jwTokIsGenerated` reads it).
   jwSetGenTokStart(jwGenTok)
   checkProgram(root)
+  plusLinksBank()
   0
 }
 
 // 0 = ok; 1 = lex/parse error; 2 = type error; 3 = emit error.
 export function compileSrc(): i32 {
+  plusLinksClear()
   symSetEnabled(0)
   P.toks = []
   P.nodes = []
@@ -989,6 +995,7 @@ export function compileSrc(): i32 {
   if vcParseBlocked() { return 1 }
   csPreMintLocs()
   checkProgram(root)
+  plusLinksBank()
   // Emit never proceeds past a parse diagnostic, lossless or not: `vl build`/`vl run`
   // still keep rc 1 and the same parse message. The only difference lossless recovery
   // makes is that the checker's type errors are reported alongside it, not hidden.
@@ -1064,6 +1071,7 @@ export function rbyteStore(off: i32, count: i32): i32 {
 // valid program the emitter cannot yet lower — an emit-coverage gap is not a check
 // failure. Shares the diagnostic stores (`diagLen`/`diagAt`) with `compileSrc`.
 export function checkSrc(): i32 {
+  plusLinksClear()
   symSetEnabled(0)
   P.toks = []
   P.nodes = []
@@ -1101,6 +1109,7 @@ export function checkSrc(): i32 {
   vcEpBank(vcSource(), root)
   csPreMintLocs()
   checkProgram(root)
+  plusLinksBank()
   // A lossless-recovered file reports BOTH streams and keeps rc 1 — the parse
   // mistake is still the headline error, the type errors ride with it.
   if P.diags.length > 0 { return 1 }
@@ -1115,17 +1124,101 @@ export function checkSrc(): i32 {
   0
 }
 
+// ── the `+` links the last check typed, for `prefer-interpolation` ──────────────
+// The lint has no types, so the check banks, per module and by anchor byte offset, whether
+// each `+` link's left operand checked as a string. Only a lint its caller pairs with that
+// check reads it (`lintUseCheck`): equal text under another import graph is another program.
+let plSrcs: string[] = []
+let plLinks: {[i32]: i32}[] = []
+let plGen = 0
+let plBankGen = -1
+let plArmed = false
+
+// Retire the bank: every check entry calls this before it parses, so a check that stops
+// early leaves nothing a later lint could mistake for its own.
+function plusLinksClear(): i32 {
+  plGen = plGen + 1
+  plSrcs = []
+  plLinks = []
+  0
+}
+
+// The generation of the most recent check, for a caller to hand back to `lintUseCheck`.
+export function checkGen(): i32 { plGen }
+
+// Let the next `lintSrc`/`lintGraph` read the bank, when `gen` names the check that filled
+// it and no check has started since. The caller asserts the lint is of that check's program.
+export function lintUseCheck(gen: i32): i32 {
+  plArmed = gen == plGen && plBankGen == plGen
+  0
+}
+
+function plusLinksBank(): i32 {
+  plSrcs = []
+  plLinks = []
+  plBankGen = plGen
+  if modKeys.length == 0 {
+    plSrcs.push(vcSource())
+  } else {
+    let m = 0
+    while m < modSrcs.length {
+      plSrcs.push(modSrcs[m])
+      m = m + 1
+    }
+  }
+  let k = 0
+  while k < plSrcs.length {
+    const e: {[i32]: i32} = Map()
+    plLinks.push(e)
+    k = k + 1
+  }
+  let i = 0
+  while i < plusLinkCount() {
+    const tk = plusLinkTokAt(i)
+    if tk >= 0 && tk < P.toks.length {
+      const m = modOfTok(tk)
+      if m >= 0 && m < plLinks.length {
+        const links = plLinks[m]
+        const off = P.toks[tk].start
+        const was = links[off] ?? 1
+        links[off] = if was == 1 && plusLinkStrAt(i) == 1 { 1 } else { 0 }
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// Hand the lint module `m`'s banked links when the bank covers `src`, else none.
+function plusLinksFor(m: i32, src: string): i32 {
+  const ok = plArmed && m >= 0 && m < plSrcs.length && m < plLinks.length
+  if ok && plSrcs[m] == src {
+    lintSetPlusLinks(plLinks[m], true)
+  } else {
+    const none: {[i32]: i32} = Map()
+    lintSetPlusLinks(none, false)
+  }
+  0
+}
+
 // ── lint tier ──────────────────────────────────────────────────────────────────
 // Runs the AST-derivable lint pass (`compiler/lint.vl`), on the parse alone with
 // no typecheck, matching the standalone lint harness. Returns the finding count,
 // or -1 on a lex/parse error; the host reads each via `lintCount`/`lintSev*`/`lintMsg*`.
 export function lintSrc(): i32 {
+  const n = lintSrcRun()
+  plArmed = false
+  n
+}
+
+function lintSrcRun(): i32 {
   symSetEnabled(0)
   // The tree the check on this source already built, when it left it intact — the resets
   // below are what a re-parse needs, and there is nothing to re-parse.
   const banked = vcEpReplay(vcSource())
   if banked >= 0 {
     lintSetSource(vcSource())
+    plusLinksFor(0, vcSource())
     lint(banked)
     return lintCount()
   }
@@ -1161,6 +1254,7 @@ export function lintSrc(): i32 {
   markNeverCallsByDecl()
   // Comments never reach the arena; the comment-budget rules read the text.
   lintSetSource(vcSource())
+  plusLinksFor(0, vcSource())
   lint(root)
   lintCount()
 }
@@ -1210,6 +1304,12 @@ function lgCopySink(m: i32): i32 {
 }
 
 export function lintGraph(): i32 {
+  const n = lintGraphRun()
+  plArmed = false
+  n
+}
+
+function lintGraphRun(): i32 {
   lgCodes = []
   lgMsgs = []
   lgSevs = []
@@ -1253,6 +1353,7 @@ export function lintGraph(): i32 {
         markNeverCallsByDecl()
         lintSetSource(modSrcs[m])
         lintSetPath(modKeys[m])
+        plusLinksFor(m, modSrcs[m])
         lint(root)
         lgCopySink(m)
       }
@@ -1392,6 +1493,7 @@ export function checkSymDiagsComplete(): i32 { 1 }
 // below can read occurrence and binding-type tables. Used only by the LSP's
 // go-to-def/find-refs/hover path; every other consumer forces the table off.
 export function checkSrcSym(): i32 {
+  plusLinksClear()
   symSetEnabled(1)
   P.toks = []
   P.nodes = []
@@ -1428,6 +1530,7 @@ export function checkSrcSym(): i32 {
   vcEpBank(vcSource(), root)
   csPreMintLocs()
   checkProgram(root)
+  plusLinksBank()
   // Lossless recovery: the symbol tables ARE populated for the rc-1 result too,
   // so hover / go-to-def / find-refs keep answering across a missing brace.
   if P.diags.length > 0 { return 1 }
@@ -3722,6 +3825,7 @@ function modVisit(m: i32, depth: i32): i32 {
 }
 // The whole module pipeline behind `compileSrc` (emit = 1) / `checkSrc` (0).
 function modCompile(emit: i32): i32 {
+  plusLinksClear()
   vcEtDrop()
   vcEpDrop()
   // 1. Order + validate (DFS from the entry, table index 0).
@@ -3910,6 +4014,7 @@ function modCompile(emit: i32): i32 {
   const merged = mkProgram(allStmts, -1) // synthesized merged-module root (no source token)
   csPreMintLocs()
   checkProgram(merged)
+  plusLinksBank()
   // A lossless-recovered graph CHECKS but never BUILDS — same rule as
   // `compileSrc`, and the rc stays 1 so `vl build` behaves exactly as before.
   if P.diags.length > 0 { return 1 }

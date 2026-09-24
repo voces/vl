@@ -155,6 +155,10 @@ run "sentinel-index budget"    "$PY" scripts/sentinel-budget.py --check
 # list is a blind spot — 19 exports were in it when this landed. Its baseline is at ZERO,
 # unlike the four above, because the tree reached zero in the PR that added it.
 run "dead-export budget"       "$PY" scripts/export-budget.py --check
+# The prefer-interpolation RATCHET, sixth of the same shape and the first that runs the
+# lint itself rather than a python copy of it (a `+` chain is an expression tree), so it
+# needs the seed. The compiler's standing chains are held; a new one reds here.
+run "interp budget"            "$PY" scripts/interp-budget.py --check
 # THE SHAPE FAMILY: ten pairs, same work, one axis reshaped, graded on the TIME
 # RATIO so machine speed and box load cancel. ~16-25 s; it is the only gate here
 # whose verdict is a measurement, and it reds on the pre-#2419 compiler.

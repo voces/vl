@@ -797,3 +797,46 @@ Deno.test({
     }
   },
 });
+
+// ── the typed links prefer-interpolation reads, across a shared instance ─────────────────
+//
+// The lint has no types, so a check banks, per `+` link, whether its left operand was a
+// string. The bank is only as good as the check it came from: here the same entry TEXT is
+// checked under another project whose `Widget` is a string alias, and the editor then lints
+// that text for the project whose `Widget` has its own `+`. A lint that reused the bank
+// because the text matched would suggest `"\{mk("x")}abbccc"` for a Widget — a different
+// value. The editor's lint is not paired with a check, so it must judge only a chain that
+// opens with a string literal, which no operator can take (#3105 review).
+
+const PI_ENTRY = 'import { mk } from "./w"\nconst v = mk("x") + "a" + "bb" + "ccc"\nprint(v)\n' +
+  'print("<" + "a" + "b" + "c" + ">")\n';
+const PI_ALIAS = 'export type Widget = string\nexport function mk(s: string): Widget { s }\n';
+const PI_OWN_PLUS = "export type Widget = new { s: string }\n" +
+  "export function mk(s: string): Widget {\n  const r: Widget = { s: s }\n  return r\n}\n" +
+  'function "+"(self: Widget, other: string): Widget {\n  const r: Widget = { s: other }\n  return r\n}\n';
+
+Deno.test({
+  name: "instance-leak: the editor's lint never reuses another check's typed `+` links",
+  ignore,
+  fn: async () => {
+    const c = loadWasmChecker(SEED, () => {})!;
+    const interp = () =>
+      c.lint(PI_ENTRY).filter((d) => d.code === "prefer-interpolation").map((d) => d.range.start.line);
+    const reader = (dep: string) => (key: string) => key.endsWith("w.vl") ? dep : undefined;
+
+    await c.check(PI_ENTRY, "/proj/main.vl", reader(PI_OWN_PLUS));
+    const own = interp();
+    // The byte-identical entry, checked where `Widget` is a string alias.
+    await c.check(PI_ENTRY, "/other/main.vl", reader(PI_ALIAS));
+    const after = interp();
+    for (const [what, lines] of [["after the own-`+` check", own], ["after the alias check", after]] as const) {
+      // Line 3 is the literal-led chain, which is concatenation whatever `Widget` is.
+      if (JSON.stringify(lines) !== JSON.stringify([3])) {
+        throw new Error(
+          `${what}: want only the literal-led chain (line 3), got lines ${JSON.stringify(lines)} — ` +
+            `a finding on line 1 is the Widget chain judged by a bank from another check`,
+        );
+      }
+    }
+  },
+});
