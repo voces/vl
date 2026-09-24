@@ -6664,9 +6664,10 @@ index caps that at 4 GiB, a ~15.6 MB source. plumb compiles 1.16 GB of generated
 (p50 2.0 MB, max 8.7 MB) in parallel, and memory per unit is its bottleneck.
 
 **The rule** (`compile_engine`, `scripts/vl-host/src/main.rs`): when the ENTRY FILE is under
-**1.5 MiB**, null; at or above it, the **copying** collector with a **384 MiB** first heap.
-Imports do not count.
+**1.5 MiB**, null; at or above it, the **copying** collector with a **256 MiB** first heap
+(384 MiB until 2026-09-24; see "Why 256 MiB" below). Imports do not count.
 `$VL_COMPILE_GC=auto|null|copying` overrides it; an unknown value is refused.
+`$VL_COMPILE_GC_HEAP` overrides the first heap, in the `$VL_GC_HEAP` syntax.
 `$VL_COMPILE_GC_TRACE=1` names the choice on stderr, which `tests/vl_compile_gc_test.ts` pins
 at the threshold byte.
 
@@ -6706,6 +6707,30 @@ sizes: `s20` went from 0.43 s to 0.24 s, the same as null. 384 = 3 × 128 puts t
 size and never grows. The value is part of the engine configuration, so each distinct value is
 a separate `.cwasm` sidecar and a fresh Cranelift compile of the seed. There is therefore ONE
 value, and `refresh-compiler.sh` warms its sidecar with the other two.
+
+**Why 256 MiB (2026-09-24, D2317–D2319).** The first heap follows the live set, so it moved
+only once the live set shrank. A heap census (drop each whole-program global after a compile,
+force a collection, read the bytes that left) split `chunk_662`'s 143 MiB and found three
+releasable parts: the module token cache a one-shot build never reads again (D2317), one
+string per token where 93% of lexemes are four bytes or fewer and repeat (D2318), and
+node-indexed side columns that are nearly all `-1` plus an index kept past its passes (D2319).
+After them the live set at the last collection is 79 MiB on `chunk_662` and 98 MiB on
+`chunk_466`. Compile only (`--names --import-memory`), median of 3, box load 5–15:
+
+| first heap | `chunk_662` CPU / RSS | `chunk_466` CPU / RSS |
+| --- | --- | --- |
+| 160 MiB | 1.64 s / 355 MB (grows) | 1.80 s / 358 MB (grows) |
+| 192 MiB | 1.66 s / 227 MB | 2.20 s / 230 MB |
+| 224 MiB | 1.42 s / 259 MB | 1.91 s / 262 MB |
+| **256 MiB** | **1.34 s / 291 MB** | **1.74 s / 294 MB** |
+| 288 MiB | 1.33 s / 323 MB | 1.65 s / 326 MB |
+| 384 MiB | 1.38 s / 419 MB | 1.60 s / 422 MB |
+
+256 MiB is the knee for the median 2 MB unit: no CPU against 384 MiB, 128 MB less RSS. The
+4.8 MB unit pays 9% of its compile. Below it the collections re-copy a live set that fills
+most of a semispace (wasmtime's growth rule, `perf/gc-heap-policy-2026-09.md` §1), and at
+160 MiB the heap doubles. The threshold stays 1.5 MiB: a 1.06 MB unit under copying at
+192 MiB is 226 MB against null's 330 MB but +13% CPU, and plumb has one unit in that range.
 
 **Why not the alternatives.**
 * *DRC (refcount)*: `s200`, 2.8 s under null, had run 47,169 collections in 10 minutes when
@@ -6747,7 +6772,10 @@ before emit starts (the token stream, the source's code points, per-statement pa
 scratch), since ~85% of the peak is already live when checking ends; (2) store the AST and the
 type tables as parallel `i32[]` columns, not one GC struct per node, because every object pays
 a header; (3) have emit write bytes straight to the output buffer, not into intermediate lists.
-Today's policy puts plumb's REAL units (2 MB) at ~417 MB, which fits.
+Today's policy puts plumb's REAL units (2 MB) at ~417 MB, which fits. (2026-09-24: the census
+this paragraph asked for now exists, `profiling-the-compiler.md` §"Measured 2026-09-24, second
+pass"; after D2317–D2319 the units sit at ~291 MB, and `P.nodes` plus `P.toks` are two thirds
+of what is left.)
 
 ## `wasm-opt` runs on at most four threads (2026-09-24) — plumb compile perf, D2311
 
