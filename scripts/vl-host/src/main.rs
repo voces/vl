@@ -4954,6 +4954,8 @@ struct ScanBody {
     calls: Vec<(u32, bool)>,
     /// Struct types this body allocates with `struct.new`.
     allocs: std::collections::HashSet<u32>,
+    /// `local.set` and `local.tee` instructions, each a local `ssa-nomerge` may split off.
+    sets: usize,
 }
 
 impl ModuleScan {
@@ -5088,6 +5090,7 @@ impl ModuleScan {
                         calls_defined: false,
                         calls: Vec::new(),
                         allocs: Default::default(),
+                        sets: 0,
                     };
                     // One entry per open block: whether it is a `loop`.
                     let mut ctrl: Vec<bool> = Vec::new();
@@ -5118,6 +5121,7 @@ impl ModuleScan {
                             Operator::RefFunc { function_index } => {
                                 s.escapes.insert(function_index);
                             }
+                            Operator::LocalSet { .. } | Operator::LocalTee { .. } => b.sets += 1,
                             Operator::StructNew { struct_type_index }
                             | Operator::StructNewDefault { struct_type_index } => {
                                 b.allocs.insert(struct_type_index);
@@ -5288,6 +5292,28 @@ impl ModuleScan {
     }
 }
 
+/// A function with more `local.set`/`local.tee` instructions than this makes the rung skip
+/// binaryen's `ssa-nomerge`, for the whole module. That pass gives each set without a merge
+/// its own local, and two later passes are quadratic in what it makes: `coalesce-locals`
+/// keeps a locals-by-locals matrix that turns into a hash map past 8,192 locals, and
+/// `code-pushing` re-walks the rest of a block for every `if` it can push into. A translated
+/// unit's one huge function then cost 3–5x the whole unit's other work (D2336).
+const SSA_SPLIT_MAX_SETS: usize = 8192;
+
+/// The rung's reading of its input module: the `--no-inline` marks
+/// (`run_once_hot_callees`), and the passes it adds — `--skip-pass=ssa-nomerge` when some
+/// function is over `SSA_SPLIT_MAX_SETS`. A module this cannot parse gets neither.
+fn rung_scan(bytes: &[u8]) -> (Vec<String>, Vec<&'static str>) {
+    let Some(s) = ModuleScan::parse(bytes) else {
+        return (Vec::new(), Vec::new());
+    };
+    let mut extra = Vec::new();
+    if s.bodies.iter().any(|b| b.sets > SSA_SPLIT_MAX_SETS) {
+        extra.push("--skip-pass=ssa-nomerge");
+    }
+    (run_once_hot_callees(&s), extra)
+}
+
 /// The binaryen names of the functions `-O`/`-O3` must NOT inline, because the only code
 /// that calls them runs once and calls them from inside a loop.
 ///
@@ -5306,13 +5332,7 @@ impl ModuleScan {
 /// hot code also calls would cost that caller its inlining. A tiny loop-free leaf is left
 /// inlinable (`RUN_ONCE_INLINE_LEAF_BYTES`). Any module this cannot parse gets no marks,
 /// which is exactly the old behaviour.
-fn run_once_hot_callees(bytes: &[u8]) -> Vec<String> {
-    ModuleScan::parse(bytes)
-        .map(|s| run_once_hot_in(&s))
-        .unwrap_or_default()
-}
-
-fn run_once_hot_in(s: &ModuleScan) -> Vec<String> {
+fn run_once_hot_callees(s: &ModuleScan) -> Vec<String> {
     let callers = s.callers();
     let once = s.run_once(&callers);
     if once.is_empty() {
@@ -7800,8 +7820,9 @@ fn build_cmd(args: &[String]) -> Result<()> {
         // the run-once marks are read off its output, not off `bytes`.
         let stepped = phase!("opt.escape_step", escape_inline_step(&sink_str, flag, &bytes))?;
         let rung_input: &[u8] = stepped.as_deref().unwrap_or(&bytes);
-        let passes = rung_passes(passes, names);
-        let no_inline = phase!("opt.run_once_scan", run_once_hot_callees(rung_input));
+        let mut passes = rung_passes(passes, names);
+        let (no_inline, extra) = phase!("opt.run_once_scan", rung_scan(rung_input));
+        passes.extend(extra);
         phase!("opt.rung", optimize_in_place(&sink_str, flag, &passes, &no_inline))?;
         final_bytes = Some(std::fs::read(&sink).map_err(|e| {
             Error::from(e).context(format!("reading back the {flag}'d `{out_label}`"))
