@@ -308,7 +308,7 @@ export function bump(): i32 {
 
 // Each worker instantiates the SAME compiled module over the memory it is handed, then runs
 // one export per message. `wait` blocks on a flag word with `Atomics.wait` — JS atomics only;
-// `stress` and `flood` wait on the start flag first, so every worker allocates at once.
+// `stress`, `churn` and `flood` wait on the start flag first, so every worker allocates at once.
 const WORKER_SRC = `
 let inst, mem;
 self.onmessage = async (e) => {
@@ -329,6 +329,11 @@ self.onmessage = async (e) => {
   if (op === "release") { x.release(a); self.postMessage({ ok: true }); }
   if (op === "bump") self.postMessage({ v: x.bump() });
   if (op === "stress") { go(); self.postMessage({ v: x.stress(a, b) }); }
+  if (op === "churn") {
+    go();
+    try { self.postMessage({ v: x.churn(a, b), r: x.reclaims() }); }
+    catch (t) { self.postMessage({ err: String(t) }); }
+  }
   if (op === "flood") {
     go();
     const bases = [];
@@ -471,6 +476,155 @@ Deno.test({
       eq(await v(B, { op: "alloc", a: 8, b: 0xb2 }), m1, "the next Buf reuses it");
       eq([view()[a1 >> 2], view()[b1 >> 2], view()[a2 >> 2]], [0xa1, 0xb1, 0xa2], "nothing live was touched");
     });
+  },
+});
+
+// Another instance may rewind the pointer below a mark this instance took, and the release that
+// follows is still correct: it reclaims nothing rather than trapping. Two instances driven from
+// one thread, so the order is exact (the #3123 review's witness).
+Deno.test({
+  name: "shared-memory: a release to a mark another instance rewound below does not trap",
+  ignore: !ENABLED,
+  async fn() {
+    const bytes = await build(TWO, ["--import-memory", "--shared-memory=16"]);
+    const memory = new WebAssembly.Memory({ initial: 1, maximum: 16, shared: true });
+    const mk = async () =>
+      (await WebAssembly.instantiate(bytes as BufferSource, {
+        env: { memory },
+        imports: new Proxy({}, { get: () => () => {} }),
+      })).instance.exports as Record<string, (...a: number[]) => number>;
+    const A = await mk(), B = await mk();
+    const m0 = B.mark();
+    B.alloc(32, 0xb);
+    const m = A.mark();
+    eq(m, m0 + 32, "A's mark is above B's Buf");
+    B.release(m0);
+    eq(B.mark(), m0, "B reclaimed its own run, below A's mark");
+    const a = A.alloc(8, 0xa);
+    eq(a, m0, "A's Buf reuses B's bytes");
+    A.release(m); // the pointer (m0 + 8) is below m: keep everything, do not trap
+    eq(A.mark(), m0 + 8, "A's release reclaimed nothing");
+    eq(new Int32Array(memory.buffer)[a >> 2], 0xa, "A's Buf is intact");
+  },
+});
+
+// Mark/allocate/release loops, nested, beside plain allocators: `churn` checks its own live Bufs
+// every iteration and answers how many words it found corrupted.
+const ADV = `import { Buffer, Buf, bufferMark, bufferRelease, storeI32, loadI32 } from "std:buffer"
+function fill(n: i32, stamp: i32): Buf {
+  const b = Buffer(n)
+  let off = 0
+  while off + 4 <= n {
+    b.storeI32(off, stamp)
+    off = off + 4
+  }
+  b
+}
+function bad(b: Buf, n: i32, stamp: i32): i32 {
+  let k = 0
+  let off = 0
+  while off + 4 <= n {
+    if b.loadI32(off) != stamp { k = k + 1 }
+    off = off + 4
+  }
+  k
+}
+export function stress(count: i32, stamp: i32): i32 {
+  const rec = Buffer(count * 8)
+  let i = 0
+  while i < count {
+    const n = 4 + ((i * 7 + stamp) & 31) * 4
+    const b = fill(n, stamp + i)
+    rec.storeI32(i * 4, b.base)
+    rec.storeI32(count * 4 + i * 4, n)
+    i = i + 1
+  }
+  rec.base
+}
+let reclaimed = 0
+export function reclaims(): i32 { reclaimed }
+export function churn(iters: i32, stamp: i32): i32 {
+  let seed = stamp & 65535
+  let wrong = 0
+  const anchor = fill(64, stamp)
+  let it = 0
+  while it < iters {
+    const m = bufferMark()
+    const bs: Buf[] = []
+    const ns: i32[] = []
+    seed = (seed * 1103 + 12345) & 65535
+    const k = 1 + (seed & 3)
+    let j = 0
+    while j < k {
+      seed = (seed * 1103 + 12345) & 65535
+      const n = 4 + (seed & 15) * 4
+      bs.push(fill(n, stamp + it * 8 + j))
+      ns.push(n)
+      if (seed & 64) != 0 {
+        const m2 = bufferMark()
+        const t = fill(24, stamp + 0x7000 + j)
+        wrong = wrong + bad(t, 24, stamp + 0x7000 + j)
+        bufferRelease(m2)
+      }
+      j = j + 1
+    }
+    j = 0
+    while j < k {
+      wrong = wrong + bad(bs[j], ns[j], stamp + it * 8 + j)
+      j = j + 1
+    }
+    bufferRelease(m)
+    if bufferMark() == m { reclaimed = reclaimed + 1 }
+    wrong = wrong + bad(anchor, 64, stamp)
+    it = it + 1
+  }
+  wrong
+}
+`;
+
+Deno.test({
+  name: "shared-memory: mark/release loops beside allocating Workers never trap, corrupt or overlap",
+  ignore: !ENABLED,
+  async fn() {
+    const bytes = await build(ADV, ["--import-memory", "--shared-memory=1024"]);
+    const COUNT = 20000, ITERS = 20000, ROUNDS = 5;
+    let reclaimed = 0;
+    for (let round = 0; round < ROUNDS; round++) {
+      const memory = new WebAssembly.Memory({ initial: 1, maximum: 1024, shared: true });
+      await withWorkers(4, bytes, memory, async (ws, call) => {
+        const jobs = [
+          call(ws[0], { op: "churn", a: ITERS, b: 0x10000000, c: GO }),
+          call(ws[1], { op: "churn", a: ITERS, b: 0x20000000, c: GO }),
+          call(ws[2], { op: "stress", a: COUNT, b: 0x30000000, c: GO }),
+          call(ws[3], { op: "stress", a: COUNT, b: 0x40000000, c: GO }),
+        ];
+        start(memory);
+        const outs = await Promise.all(jobs);
+        outs.forEach((o, k) => {
+          if (o.err) throw new Error(`round ${round}: worker ${k} trapped: ${o.err}`);
+        });
+        eq([outs[0].v, outs[1].v], [0, 0], `round ${round}: corrupted words seen by the churners`);
+        reclaimed += (outs[0].r as number) + (outs[1].r as number);
+        const view = new Int32Array(memory.buffer);
+        const all: { base: number; n: number }[] = [];
+        [2, 3].forEach((k) => {
+          const rec = outs[k].v as number, stamp0 = (k + 1) << 28;
+          all.push({ base: rec, n: COUNT * 8 });
+          for (let i = 0; i < COUNT; i++) {
+            const base = view[(rec >> 2) + i], len = view[(rec >> 2) + COUNT + i];
+            all.push({ base, n: len });
+            for (let w = 0; w < len; w += 4) {
+              if (view[(base + w) >> 2] !== stamp0 + i) {
+                throw new Error(`round ${round}: allocator ${k} Buf ${i} at ${base}: word ${w} overwritten`);
+              }
+            }
+          }
+        });
+        disjoint(all, `round ${round}`);
+      });
+    }
+    // The churners do reclaim, some of the time: the test is not passing by never releasing.
+    if (reclaimed === 0) throw new Error("no churn release ever reclaimed");
   },
 });
 

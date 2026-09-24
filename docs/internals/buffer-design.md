@@ -2443,15 +2443,18 @@ memory, which is its initial state: nothing initialises it, so no instance can r
   address continues the header's run; any other claim starts a run at its own base.
 - **`bufferMark()`**: the header's pointer (or `heap base + 8` when the header's page does not
   exist yet).
-- **`bufferRelease(mark)`**: traps on a mark outside `[heap base + 8, pointer]` or off an
-  8-byte boundary, as before. Rewinds only when the pointer is where this instance's latest `Buf`
-  ended and `mark` is inside the top run; otherwise keeps everything.
+- **`bufferRelease(mark)`**: traps on a mark below `heap base + 8` or off an 8-byte boundary.
+  A mark past the pointer does NOT trap, unlike an unshared build: another instance's release
+  can rewind the pointer below a mark this instance took, so that mark is legitimate. Rewinds
+  only when the pointer is where this instance's latest `Buf` ended and `mark` is inside the top
+  run; otherwise, a mark past the pointer included, keeps everything.
 
 ### N2. What a caller sees
 
 - Instances never receive overlapping `Buf`s, whatever the interleaving.
-- Zero-fill, alignment and the traps are unchanged, plus one clarified: a `Buffer` the memory's
-  max cannot hold traps (it always did, through `ensureCapacity`).
+- Zero-fill, alignment and `Buffer`'s traps are unchanged, plus one clarified: a `Buffer` the
+  memory's max cannot hold traps (it always did, through `ensureCapacity`). `bufferRelease` loses
+  one trap in a shared build — a mark past the pointer — for the reason in N1.
 - `bufferRelease` is conservative: interleaved allocation by another instance makes it reclaim
   nothing. A frame arena per Worker that never interleaves with another's reclaims as before;
   one that does leaks what it could not rewind.
@@ -2461,7 +2464,8 @@ memory, which is its initial state: nothing initialises it, so no instance can r
 
 `tests/vl_shared_memory_test.ts` (§"two Workers, one memory"): the two-Worker witness is
 positive, 2/3/4 Workers × 10,000 concurrent `Buf`s tile the heap with every stamp intact, four
-Workers racing to fill a 6-page memory over thirty rounds each trap only once nothing fits, and
-the release rules hold across two Workers. A default build is byte-identical: `foldMemShared`
+Workers racing to fill a 6-page memory over thirty rounds each trap only once nothing fits, the
+release rules hold across two Workers, a release to a mark another instance rewound below does
+not trap, and mark/release loops beside allocating Workers never trap, corrupt or overlap. A default build is byte-identical: `foldMemShared`
 removes the shared statements before any other pass, and the tests' default-build rows plus 498
 of 498 A/B builds say so.

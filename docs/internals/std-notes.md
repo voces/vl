@@ -929,5 +929,7 @@ Slice S3 of `docs/internals/simd-design.md` — the `F32x4` surface over the `__
   where this instance's latest `Buf` ended (from heap base + 8) in a shared one.
 - `memory.grow(0)` rather than `memory.size` after a refused grow, and before believing the
   header's page is absent: V8's per-instance `memory.size` can lag another instance's growth.
+- The shared `bufferRelease` returns, not traps, on a mark past the pointer: another instance's
+  release can legitimately rewind below it.
 - Protocol and rationale: DECISIONS.md §"std:buffer's allocator over a shared memory";
   layout: `buffer-design.md` §N.

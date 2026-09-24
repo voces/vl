@@ -6590,11 +6590,22 @@ must be able to call `Buffer` without landing on another's live allocation.
   header's top is where this instance's latest `Buf` ended and the mark is inside the run, so
   every byte it reclaims was this instance's. Otherwise it reclaims nothing — a leak, not a
   corruption, since a mark taken before another instance allocated cannot be honoured without
-  freeing that instance's live `Buf`. The mark is still range-checked and traps as before. The
-  protocol was model-checked before it was written: 300,000 random interleavings of 1–4
-  instances found no overlap, and two one-line weakenings each produced one within a second.
-- **The switch is `__memory_shared__()`, a build-time `boolean` intrinsic, and the compiler FOLDS
-  it.** An else-less `if __memory_shared__() { … }` is decided by the first emit pass
+  freeing that instance's live `Buf`. **A shared release traps only on a mark below the first
+  `Buf` or off an 8-byte boundary** — never on a mark past the pointer, which an unshared build
+  does trap on. Over a shared memory that mark is legitimate: another instance's release can
+  rewind the pointer below a mark this instance took, and the release that follows is correct
+  code. It shipped trapping there (`m0 = B.mark(); B.alloc(32); m = A.mark(); B.release(m0);
+  A.alloc(8); A.release(m)` hit `unreachable` with one thread and no race; the #3123 review
+  found it, and an adversarial stress with mark/release Workers beside allocating ones trapped
+  in round 0 of 5 of 5 runs). It now keeps everything, the same conservative answer as the
+  other refusals. The protocol's overlap safety was model-checked before it was written:
+  300,000 random interleavings of 1–4 instances found no overlap, and two one-line weakenings
+  each produced one within a second. That model treated the past-the-pointer mark as a no-op,
+  which is why it could not see the trap.
+- **The switch is `__memory_shared__()`, a STD-INTERNAL build-time `boolean` intrinsic, and the
+  compiler FOLDS it.** It exists for `std:buffer`; user code can spell it today, but no
+  user-facing guarantee is given — whether it is reserved to std, or offered as conditional
+  compilation, is an open owner ruling. An else-less `if __memory_shared__() { … }` is decided by the first emit pass
   (`foldMemShared`): a shared build keeps the body as a bare block, any other build drops the
   statement before anything else reads the tree. Only a call the checker resolved to the
   intrinsic folds (`memSharedCalls`); a parameter spelled `__memory_shared__` stays an ordinary
@@ -6617,9 +6628,12 @@ Pinned by `tests/vl_shared_memory_test.ts`: B's first `Buffer` follows A's and A
 survive; 2, 3 and 4 Workers each make 10,000 `Buf`s at once with none overlapping, every stamp
 intact and the `Buf`s tiling the heap exactly; 4 Workers race to fill a 6-page memory in thirty
 rounds and each traps only once nothing more fits, with nothing claimed past the max; release
-keeps another instance's `Buf` and reclaims an instance's own. Controls: replacing the
-`cmpxchg` with a plain store fails the stress test in 6 of 6 runs; trapping on any refused grow
-fails the race test in 3 of 4.
+keeps another instance's `Buf` and reclaims an instance's own; a release to a mark another
+instance rewound below does not trap (the review's one-thread witness); and two Workers running
+nested mark/release loops beside two allocating Workers, five rounds, never trap, corrupt a word
+or overlap. Controls: replacing the `cmpxchg` with a plain store fails the stress test in 6 of
+6 runs; trapping on any refused grow fails the race test in 3 of 4; restoring the trap on a
+mark past the pointer fails both release tests in 3 of 3.
 
 ## Globals cross the wasm boundary: `extern let` imports one, the entry's `export let` exports one (owner, 2026-09-22) — plumb PL-003(b)
 
