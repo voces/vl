@@ -288,7 +288,7 @@ not started.
 
 ## Guards
 
-Three, and they fire at different moments. Profiling is what you do AFTER one of them does.
+Four, and they fire at different moments. Profiling is what you do AFTER one of them does.
 
 * **`tests/vl_scaling_shape_test.ts`** — nine pairs, the same work reshaped along one axis
   (functions, types, unions, call sites, closures, callback slots, modules, generic pins,
@@ -325,3 +325,41 @@ Three, and they fire at different moments. Profiling is what you do AFTER one of
   other two missed it. HALF the factor pays for contention — the same build reads 12.2–12.7 s
   inside a fanned-out `gate.sh` at load 164 — which is why the band is not 2×. It says only
   that the bootstrap got dearer; the shape family says where.
+* **`scripts/plumb-shape-cost.py`** — what one `vl build --names -O --import-memory` of a 2 MB
+  plumb-shaped unit costs, against `scripts/plumb-shape-baseline.json`. The unit is written by
+  `scripts/perf/gen-plumb-shape.vl` (fixed seed; its hash is in the baseline, so a seed that
+  compiles the generator differently reds too): ~250 functions with a heavy tail, one 8,000-line
+  body, `m`/`x`/`y`/`r`/`t`/`v`/`w`/`c` rebound as `i32` and `i64` in sibling blocks, labelled
+  blocks nested up to ~40 deep, a 100-arm `while true { match pc { … } }`, and `i64` memory
+  traffic through `__load_*__`/`__store_*__`. Against `chunk_662` on master (`VL_PROFILE`, one
+  run each): compile 1.39 s vs 1.25 s and `-O` 0.54 s vs 0.55 s wall, CPU 3.50 s vs 3.46 s,
+  peak RSS 296.5 vs 296.7 MB, and a guest profile of 22% check / 78% `emitProgram` against
+  662's 26% / 74%. Its one 8,000-line body is what makes it see D2309, which 662 barely
+  does (+2% compile on 662, +34% on `chunk_466`, +31% here). Three readings:
+  * **Guest fuel, +5%.** `$VL_FUEL=1` makes the host meter the compiler with wasmtime fuel and
+    print `[fuel] guest: <n>` — a count of guest instructions, identical run to run (checked
+    across repeated runs, unit paths, `VL_STD` locations and box loads). It is what makes a tight
+    bar possible on a shared box. The fuel engine has its own `.cwasm` sidecar: ~12 s wall and
+    ~24 s CPU the first time a new seed is metered.
+  * **Peak RSS, +10%.** The build's largest process; 289.1–289.7 MB over every run measured.
+  * **CPU, +15% compile / +25% `wasm-opt`.** The least of three runs, graded only on the
+    baseline's machine and only from runs whose Python control read within 15% of its
+    baseline. **CPU seconds are not load-proof on this box**: measured 2026-09-24 over 40
+    runs of the same build, compile CPU read 1.37–1.42 s at load 3 and 1.8–3.3 s (1.3–2.3x)
+    at system busy 51–99%, and the control inflated 1.6–3.5x without tracking it closely
+    enough to divide out (±10% residual). Inside the gate's fan-out the CPU half is therefore
+    usually "not graded"; fuel carries the compile side and RSS the memory side there.
+
+  Measured red on 2026-09-24 against seeds built in scratch (same host):
+
+  | seed | fuel | peak RSS | compile CPU (quiet) |
+  | --- | ---: | ---: | ---: |
+  | master at 1c1e796f8 | 9,029,714,678 | 289 MB | 1.43 s |
+  | the same, D2309 reverted | **+37.6%** | +0.1% | **+26.8%** |
+  | before #3112 (7e80d135c) | **+5.2%** | **+65.2%** (478 MB) | **+87.9%** |
+  | before #3108 (403fcd5e8) | **+88.5%** | **+59.9%** (463 MB) | **+313%** |
+
+  The old seeds ran under today's host, whose 256 MiB first heap does not fit their larger
+  live sets, so their CPU and RSS here are not #3108's or #3112's own before-numbers. ~10 s
+  a run in the gate (16 s CPU), and it gates in ci-native with `--require-fuel`, where CPU is
+  not graded (another machine) and `-O`'s `wasm-opt` step is stubbed out (no binaryen there).

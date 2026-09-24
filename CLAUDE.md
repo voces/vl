@@ -174,6 +174,11 @@ to stdout). Paths resolve against the WORKING DIRECTORY, not the script — a VL
 read neither its own path nor the cwd (§D `script-self-location`) — so run it from the
 checkout root, which `gate.sh` and `ci.yml` both do.
 
+**THE COST OF GENERATED CODE IS A GATED NUMBER TOO — `scripts/plumb-shape-cost.py`.** Guest FUEL
+(+5%) and peak RSS (+10%) of one `-O` build of a 2 MB plumb-shaped unit; fuel is a count, so
+contention cannot flake it, while CPU on this box reads 1.3–2.3x under load and is graded only
+from quiet runs. `--write-baseline` on a quiet box; profiling-the-compiler.md §Guards.
+
 ## "Zero silent rows" is a claim about the INVENTORY, not about VL
 
 The filed inventories hold ~199 hand-written rows. The distilled corpus holds **7,021 cells**.

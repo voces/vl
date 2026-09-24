@@ -1118,6 +1118,9 @@ fn seed_engine_sized(collector: Collector, initial: Option<u64>) -> Result<Engin
     if guest_profile_path().is_some() {
         cfg.epoch_interruption(true);
     }
+    if guest_fuel_on() {
+        cfg.consume_fuel(true);
+    }
     Engine::new(&cfg)
 }
 
@@ -2019,6 +2022,7 @@ fn load_compiler(engine: &Engine, source: &CompilerSource) -> Result<(Store<()>,
     start_guest_profile(engine, &module)?;
     let mut store = Store::new(engine, ());
     arm_guest_profile(&mut store);
+    arm_guest_fuel(&mut store)?;
     let linker = Linker::new(engine);
     let inst = from_compiler(linker.instantiate(&mut store, &module))?;
     check_seed_abi(&mut store, &inst, source)?;
@@ -3077,6 +3081,32 @@ fn start_guest_profile(engine: &Engine, module: &Module) -> Result<()> {
     Ok(())
 }
 
+/// Whether `$VL_FUEL=1` asks for the compiler's work as a COUNT: wasmtime fuel, about one
+/// unit per guest instruction, the same on every run whatever else the box is doing. A
+/// fuel engine compiles the seed to different code, so it caches under its own `.cwasm`
+/// sidecar. `scripts/plumb-shape-cost.py` grades it.
+fn guest_fuel_on() -> bool {
+    std::env::var("VL_FUEL").ok().as_deref() == Some("1")
+}
+
+/// Give a store on a fuel engine all the fuel there is, so metering never traps. A NO-OP
+/// without `$VL_FUEL`; like `arm_guest_profile` it must run before the store runs anything.
+fn arm_guest_fuel(store: &mut Store<()>) -> Result<()> {
+    if guest_fuel_on() {
+        store.set_fuel(u64::MAX)?;
+    }
+    Ok(())
+}
+
+/// Under `$VL_FUEL=1`, print `[fuel] guest: <n>` to stderr: the fuel `store` has burned.
+fn report_guest_fuel(store: &Store<()>) {
+    if guest_fuel_on() {
+        if let Ok(left) = store.get_fuel() {
+            eprintln!("[fuel] guest: {}", u64::MAX - left);
+        }
+    }
+}
+
 /// Arm `store` so each epoch bump takes a sample. A NO-OP on an unprofiled run.
 ///
 /// Must run BEFORE the store executes anything: with epoch interruption enabled the
@@ -3208,6 +3238,7 @@ fn compile_vl_instance(
     // THE D1500 CALL. A non-zero `rc` is the compiler REPORTING on the program and
     // is not a fault; an `Err` here is the compiler dying mid-compile, which is.
     let rc = from_compiler(phase!("compile.call", compile.call(&mut store, ())))?;
+    report_guest_fuel(store);
     if rc != 0 {
         let stage = match rc {
             1 => "parse",
@@ -4715,6 +4746,7 @@ fn run_batch(args: &[String]) -> Result<()> {
     {
         let mut probe = Store::new(&compile_engine, ());
         arm_guest_profile(&mut probe);
+        arm_guest_fuel(&mut probe)?;
         let inst = from_compiler(pre.instantiate(&mut probe))?;
         check_seed_abi(&mut probe, &inst, &compiler)?;
     }
@@ -4747,6 +4779,7 @@ fn run_batch(args: &[String]) -> Result<()> {
                 })?;
                 let mut store = Store::new(&compile_engine, ());
                 arm_guest_profile(&mut store);
+                arm_guest_fuel(&mut store)?;
                 let inst = from_compiler(pre.instantiate(&mut store))?;
                 compile_vl_instance(
                     &mut store,

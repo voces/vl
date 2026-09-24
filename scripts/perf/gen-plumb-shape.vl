@@ -1,0 +1,434 @@
+// Writes a deterministic synthetic unit shaped like an x86-to-VL transliteration chunk: the
+// input the compile-cost ratchet (`scripts/plumb-shape-cost.py`) builds and prices.
+//
+//     vl run scripts/perf/gen-plumb-shape.vl -- [--bytes N] [--seed S] -o out.vl
+//
+// The shape, not the program, is the point, and nothing here is meant to run: many functions
+// with a heavy tail of huge ones; short names (`m`, `x`, `y`, `r`, `t`, `v`, `w`, `c`) rebound
+// in sibling blocks as `i32` or `i64` independently; deep labelled-block nesting; a `while
+// true { match pc { ... } }` dispatcher; memory traffic through the load/store intrinsics;
+// and `i64` arithmetic. The same `--bytes` and `--seed` always write the same file.
+
+import { Utf8Error, programArgs } from "std:args"
+import { IoError, writeTextFile } from "std:fs"
+import { exit } from "std:process"
+import { parseI64, toString } from "std:fmt"
+import { join, padStart, repeat } from "std:str"
+
+// xorshift64: the whole unit is a function of the seed.
+let rs = 88172645463325252
+
+function nextRand() {
+  rs = rs ^ (rs << 13)
+  rs = rs ^ (rs >>> 7)
+  rs = rs ^ (rs << 17)
+  rs
+}
+
+// A uniform draw in [0, n).
+function rnd(n: i32) { ((nextRand() >>> 1) % (n as i64)) as% i32 }
+
+let out: string[] = []
+let bytes = 0
+const pads: string[] = []
+
+function line(d: i32, s: string) {
+  while pads.length <= d { pads.push(repeat("  ", pads.length)) }
+  const t = pads[d] + s
+  out.push(t)
+  bytes = bytes + t.length + 1
+}
+
+let lines = 0
+function ln(d: i32, s: string) {
+  line(d, s)
+  lines = lines + 1
+}
+
+// The register file every function draws from: all `i64`, reloaded from and flushed to the
+// context block around every call, as a transliterated function does.
+const REGS = [
+  "ra", "rc", "rd", "rb", "sp", "bp", "si", "di",
+  "q8", "q9", "q10", "q11", "q12", "q13", "q14", "q15",
+]
+let live: i32[] = []
+let flags: string[] = []
+let labelNo = 0
+let bLabels: string[] = []
+
+function hex8(n: i32) { padStart(toString(n), 8, "0") }
+function reg() { REGS[live[rnd(live.length)]] }
+function off() {
+  const k = rnd(64) * 8
+  if rnd(4) == 0 { return "(-" + toString(k + 8) + ")" }
+  toString(k)
+}
+function flag() { flags[rnd(flags.length)] }
+
+// A reg-relative address makes `m` an `i64`; an absolute one makes it an `i32`.
+function addrLine(d: i32) {
+  if rnd(5) == 0 {
+    ln(d, "const m = " + toString(536870912 + rnd(1048576) * 4))
+  } else if rnd(3) == 0 {
+    ln(d, "const m = " + reg())
+  } else {
+    ln(d, "const m = " + reg() + " + " + off())
+  }
+}
+
+function simple(d: i32) {
+  const k = rnd(100)
+  const a = reg()
+  const b = reg()
+  if k < 16 {
+    ln(d, "{")
+    addrLine(d + 1)
+    ln(d + 1, "st64(m, " + b + ")")
+    ln(d, "}")
+  } else if k < 22 {
+    ln(d, "{")
+    addrLine(d + 1)
+    ln(d + 1, "st32(m, ((" + b + ") & 4294967295))")
+    ln(d, "}")
+  } else if k < 29 {
+    ln(d, "{")
+    ln(d + 1, "const v = " + a)
+    ln(d + 1, "sp = sp - 8")
+    ln(d + 1, "st64(sp, v)")
+    ln(d, "}")
+  } else if k < 35 {
+    ln(d, "{")
+    ln(d + 1, "const v = ld64(sp)")
+    ln(d + 1, "sp = sp + 8")
+    ln(d + 1, a + " = v")
+    ln(d, "}")
+  } else if k < 45 {
+    // `y` is an `i32` literal binding here and an `i64` register below.
+    ln(d, "{")
+    ln(d + 1, "const x = " + a)
+    ln(d + 1, "const y = " + toString(8 + rnd(32) * 8))
+    if rnd(2) == 0 {
+      ln(d + 1, "const r = x - y")
+    } else {
+      ln(d + 1, "const w = x + y")
+      ln(d + 1, "const r = w")
+    }
+    ln(d + 1, a + " = r")
+    ln(d, "}")
+  } else if k < 55 {
+    ln(d, "{")
+    ln(d + 1, "const x = ((" + a + ") & 4294967295)")
+    ln(d + 1, "const y = ((" + b + ") & 4294967295)")
+    ln(d + 1, "const r = ((x - y) & 4294967295)")
+    ln(d + 1, "cf = ltU(x, y)")
+    ln(d + 1, "zf = r == 0")
+    ln(d + 1, "sf = (r & 2147483648) != 0")
+    ln(d + 1, "of = ((x ^ y) & (x ^ r) & 2147483648) != 0")
+    ln(d + 1, a + " = r")
+    ln(d, "}")
+  } else if k < 64 {
+    ln(d, "{")
+    addrLine(d + 1)
+    ln(d + 1, "const t = ld64(m)")
+    ln(d + 1, b + " = t")
+    ln(d, "}")
+  } else if k < 70 {
+    ln(d, "{")
+    addrLine(d + 1)
+    ln(d + 1, "const x = ld32(m)")
+    ln(d + 1, "const y = " + toString(1 + rnd(255)))
+    ln(d + 1, "const r = ((x + y) & 4294967295)")
+    ln(d + 1, "zf = r == 0")
+    ln(d + 1, b + " = r")
+    ln(d, "}")
+  } else if k < 74 {
+    ln(d, "{")
+    ln(d + 1, "const r = ((\{a}) & 4294967295) ^ ((\{a}) & 4294967295)")
+    ln(d + 1, a + " = (r) & 4294967295")
+    ln(d, "}")
+  } else if k < 80 {
+    ln(d, "{")
+    ln(d + 1, "const r = " + a + " & " + a)
+    ln(d + 1, "zf = r == 0")
+    ln(d, "}")
+  } else if k < 84 {
+    ln(d, "{")
+    addrLine(d + 1)
+    ln(d + 1, a + " = (" + a + " & -256) | ((ld8(m)) & 255)")
+    ln(d, "}")
+  } else if k < 88 {
+    ln(d, "{")
+    ln(d + 1, "const x = " + a)
+    ln(d + 1, "const y = " + b)
+    ln(d + 1, "const r = x * y")
+    ln(d + 1, "const c = sx32(r)")
+    ln(d + 1, a + " = c")
+    ln(d, "}")
+  } else if k < 92 {
+    ln(d, "{")
+    addrLine(d + 1)
+    ln(d + 1, "const v = __load_i64__(m as% i32)")
+    ln(d + 1, "__store_i64__((m as% i32) + 8, v)")
+    ln(d, "}")
+  } else if k < 95 {
+    // `c` as an `i32` counter, against the `i64` sign-extension above.
+    ln(d, "{")
+    ln(d + 1, "const c = " + toString(rnd(16)))
+    ln(d + 1, "const w = (" + a + " >>> c) & 1")
+    ln(d + 1, "cf = w != 0")
+    ln(d, "}")
+  } else if k < 98 {
+    ln(d, a + " = " + b)
+    ln(d, "lb = 0")
+  } else {
+    ln(d, "lb = 0")
+  }
+}
+
+function flush(d: i32) {
+  for g in live { ln(d, "sr(\{g}, \{REGS[g]})") }
+}
+function reload(d: i32) {
+  for g in live { ln(d, REGS[g] + " = rg(" + toString(g) + ")") }
+}
+
+let externs = 0
+function call(d: i32) {
+  if rnd(4) == 0 {
+    ln(d, "{")
+    addrLine(d + 1)
+    ln(d + 1, "const t = ld64(m)")
+    flush(d + 1)
+    ln(
+      d + 1,
+      "if icall(t, " + toString(542000000 + rnd(1000000)) + ") != 0 { return 1 }",
+    )
+    ln(d, "}")
+  } else {
+    ln(d, "sp = sp - 8")
+    ln(d, "st64(sp, " + toString(542000000 + rnd(1000000)) + ")")
+    flush(d)
+    ln(d, "if e_" + hex8(rnd(externs)) + "() != 0 { return 1 }")
+  }
+  reload(d)
+}
+
+// Statements until `budget` lines are written at depth `d`.
+function stmts(d: i32, budget: i32) {
+  const stop = lines + budget
+  while lines < stop {
+    const left = stop - lines
+    const k = rnd(100)
+    if left > 14 && d < 40 && k < 14 { compound(d, 6 + rnd(left - 6)) }
+    else if k < 20 && left > 40 { call(d) }
+    else { simple(d) }
+  }
+}
+
+function cond() {
+  const k = rnd(6)
+  if k == 0 { return flag() }
+  if k == 1 { return "!" + flag() }
+  if k == 2 { return "(cf || zf)" }
+  if k == 3 { return "(sf != of)" }
+  if k == 4 { return "!(cf || zf)" }
+  "(zf || sf != of)"
+}
+
+function compound(d: i32, budget: i32) {
+  const k = rnd(10)
+  labelNo = labelNo + 1
+  if k < 5 {
+    const lab = "B_" + hex8(labelNo)
+    bLabels.push(lab)
+    ln(d, lab + ": while true {")
+    stmts(d + 1, budget / 3)
+    ln(d + 1, "if " + cond() + " {")
+    ln(d + 2, "break " + bLabels[rnd(bLabels.length)])
+    ln(d + 1, "} else {")
+    stmts(d + 2, budget - budget / 3)
+    ln(d + 1, "}")
+    ln(d + 1, "break " + lab)
+    ln(d, "}")
+    bLabels.pop()
+  } else if k < 8 {
+    const lab = "L_" + hex8(labelNo)
+    ln(d, lab + ": while true {")
+    stmts(d + 1, budget)
+    ln(d + 1, "if " + cond() + " {")
+    ln(d + 2, "continue " + lab)
+    ln(d + 1, "} else {")
+    ln(d + 2, "break " + lab)
+    ln(d + 1, "}")
+    ln(d, "}")
+  } else {
+    ln(d, "if " + cond() + " {")
+    stmts(d + 1, budget / 2)
+    ln(d, "} else {")
+    stmts(d + 1, budget - budget / 2)
+    ln(d, "}")
+  }
+}
+
+// The register subset a function keeps live; the stack pointer always.
+function pickLive() {
+  live = [4]
+  for i in 0 to REGS.length - 1 {
+    if i != 4 && rnd(3) != 0 { live.push(i) }
+  }
+  flags = ["zf"]
+  if rnd(2) == 0 { flags.push("cf") }
+  if rnd(2) == 0 { flags.push("sf") }
+}
+
+function prologue() {
+  ln(1, "let lb = 0")
+  for g in live { ln(1, "let \{REGS[g]} = rg(\{g})") }
+  ln(1, "let cf = false")
+  ln(1, "let zf = false")
+  ln(1, "let sf = false")
+  ln(1, "let of = false")
+}
+
+// One function of about `budget` lines in the nested-block style.
+function nestedFn(name: string, budget: i32) {
+  pickLive()
+  bLabels = []
+  ln(0, "export function " + name + "(): i32 {")
+  prologue()
+  stmts(1, budget)
+  flush(1)
+  ln(1, "return 0")
+  ln(0, "}")
+  ln(0, "")
+}
+
+// One function in the `while true { match pc { ... } }` style, `arms` arms long.
+function pcFn(name: string, arms: i32, perArm: i32) {
+  pickLive()
+  bLabels = []
+  ln(0, "export function " + name + "(): i32 {")
+  prologue()
+  ln(1, "let pc: i32 = 0")
+  ln(1, "D: while true {")
+  ln(2, "match pc {")
+  for a in 0 to arms - 1 {
+    ln(3, toString(a) + " => {")
+    stmts(4, perArm)
+    if a == arms - 1 {
+      flush(4)
+      ln(4, "return 0")
+    } else {
+      ln(4, "if " + cond() + " {")
+      ln(5, "pc = " + toString(rnd(arms)))
+      ln(5, "continue D")
+      ln(4, "} else {")
+      ln(5, "pc = " + toString(a + 1))
+      ln(5, "continue D")
+      ln(4, "}")
+    }
+    ln(3, "}")
+  }
+  ln(3, "_ => { return -1 }")
+  ln(2, "}")
+  ln(1, "}")
+  ln(1, "return 0")
+  ln(0, "}")
+  ln(0, "")
+}
+
+// A function's line budget: mostly small, a tenth large, one in fifty huge.
+function fnBudget() {
+  const k = rnd(100)
+  if k < 2 { return 3000 + rnd(1500) }
+  if k < 10 { return 800 + rnd(1200) }
+  30 + rnd(270)
+}
+
+function prelude() {
+  ln(
+    0,
+    "// Synthetic unit written by scripts/perf/gen-plumb-shape.vl. Do not edit.",
+  )
+  ln(0, "const CTX = 268435456")
+  ln(0, "function rg(i: i32): i64 { __load_i64__(CTX + i * 8) }")
+  ln(0, "function sr(i: i32, v: i64) { __store_i64__(CTX + i * 8, v) }")
+  ln(0, "function ld8(a: i64): i64 { __load_u8__(a as% i32) as% i64 }")
+  ln(
+    0,
+    "function ld32(a: i64): i64 { (__load_i32__(a as% i32) as% i64) & 4294967295 }",
+  )
+  ln(0, "function ld64(a: i64): i64 { __load_i64__(a as% i32) }")
+  ln(0, "function st32(a: i64, v: i64) { __store_i32__(a as% i32, v as% i32) }")
+  ln(0, "function st64(a: i64, v: i64) { __store_i64__(a as% i32, v) }")
+  ln(0, "function sx32(v: i64): i64 { (v << 32) >> 32 }")
+  ln(0, "export extern function icall(t: i64, site: i32): i32")
+  for i in 0 to externs - 1 {
+    ln(0, "extern function e_" + hex8(i) + "(): i32")
+  }
+  ln(0, "")
+}
+
+function usage() {
+  print(
+    "usage: vl run scripts/perf/gen-plumb-shape.vl -- [--bytes N] [--seed S] -o out.vl",
+  )
+  exit(2)
+}
+
+function main() {
+  const args = programArgs()
+  if args is Utf8Error {
+    usage()
+    return 0
+  }
+  let target: i64 = 2000000
+  let path = ""
+  let i = 0
+  while i < args.length {
+    const a = args[i]
+    if i + 1 >= args.length { usage() }
+    const v = args[i + 1]
+    if a == "--bytes" { target = parseI64(v) ?? 0 }
+    else if a == "--seed" { rs = rs ^ ((parseI64(v) ?? 0) * 2654435761) }
+    else if a == "-o" { path = v }
+    else { usage() }
+    i = i + 2
+  }
+  if path == "" || target <= 0 { usage() }
+
+  // One extern per 15 KB, as a chunk carries. Functions are written until the target is
+  // reached; the prelude and the dispatcher, which name them all, are written last and
+  // placed first.
+  externs = (target / 15000) as% i32 + 4
+  // The first two are fixed so every size carries a pc dispatcher and a huge body.
+  pcFn("f_" + hex8(0), 100, 20)
+  nestedFn("f_" + hex8(1), 8000)
+  let nFns = 2
+  while (bytes as i64) < target {
+    nestedFn("f_" + hex8(nFns), fnBudget())
+    nFns = nFns + 1
+  }
+  const body = out
+  out = []
+  prelude()
+  ln(0, "export function dispatch(rva: i32): i32 {")
+  ln(1, "match rva {")
+  for f in 0 to nFns - 1 {
+    ln(2, toString(6000000 + f * 404) + " => { return f_" + hex8(f) + "() }")
+  }
+  ln(2, "_ => { return -1 }")
+  ln(1, "}")
+  ln(0, "}")
+  ln(0, "")
+  for s in body { out.push(s) }
+  const w = writeTextFile(path, join(out, "\n"))
+  if w is IoError {
+    print("gen-plumb-shape: cannot write \{path} (\{w.msg})")
+    exit(1)
+  }
+  print("wrote \{path}: \{bytes} bytes, \{nFns} functions")
+  0
+}
+
+main()
