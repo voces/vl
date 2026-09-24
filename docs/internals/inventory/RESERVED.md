@@ -68,3 +68,4 @@ D2120-D2129  vl-11  2026-09-23  getter step budget lane (D2061-D2063 residue; D2
 D2130-D2134  d2017-lane  2026-09-23  D2017 capture-memo residue (D2130 filed)
 D2176-D2179  vl-11  2026-09-23  PL-014 lane L10 (immutable module const globals)
 D2242-D2243  vl-11  2026-09-23  D2234 lane (tail-arm return check; D2243 filed)
+D2261-D2264  d2227-lane  2026-09-23  D2227 review follow-ups (D2261 filed)
