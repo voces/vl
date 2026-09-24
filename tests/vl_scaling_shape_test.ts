@@ -726,6 +726,34 @@ axis(
   (d) => twoFiles(d, genIfNest(1200, 6, true), genIfNest(1200, 6, false)),
 );
 
+const genConcatChains = (chains: number, len: number): string => {
+  const o = [
+    "type P = { x: i32 }",
+    "function f(): i32 {",
+    "  const a: i32[] = [1]",
+    "  const b: f64[] = [1.5]",
+    "  const c: P[] = [{ x: 1 }]",
+    "  let acc = 0",
+  ];
+  for (let i = 0; i < chains; i++) {
+    for (const v of ["a", "b", "c"]) {
+      o.push(`  const ${v}${i} = ${Array(len).fill(v).join(" + ")}`, `  acc = acc + ${v}${i}.length`);
+    }
+  }
+  o.push("  acc", "}", "print(f())");
+  return o.join("\n") + "\n";
+};
+
+// One 300-operand concat per element type against 75 4-operand ones. Asking a concat's
+// list rep walked its whole left operand when the recorded type did not settle it, and the
+// per-query memo was a linear scan, so the long arm cost ~n^3 and trapped at n = 1000 (D2275).
+axis(
+  "list concat chain length",
+  2.5,
+  "A concat's list rep is re-derived from its operands instead of its recorded type, or `exprListRep`'s memo stopped being indexed by node (D2275).",
+  (d) => twoFiles(d, genConcatChains(1, 300), genConcatChains(75, 4)),
+);
+
 // ── the one RUNTIME axis ─────────────────────────────────────────────────────
 // Every pair above grades COMPILE time, because every cost above is the compiler's. String
 // building is the exception: the cost lands in the EMITTED program, so this pair builds
