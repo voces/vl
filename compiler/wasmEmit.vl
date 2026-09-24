@@ -745,6 +745,7 @@ import {
   mapReadNarrowedContainer,
   mapReadScalarBoxKind,
   mapReadScalarBoxKindTy,
+  mapRecvScalarBoxKindTy,
   mapRetExprShape,
   mapShapeOfExpr,
   mapSlotTag,
@@ -7830,6 +7831,10 @@ function emitMapGetOr(
     // A SCALAR-valued map (f64/i64) stores the value directly; its default is emitted in
     // the value's rep and it needs no `ref.as_non_null`. A ref value (string/struct) does.
     const scalarVK = mvScalarValKind(mslot)
+    if scalarVK != null && defExprNullable(defIx) {
+      const sbk = mapRecvScalarBoxKindTy(recvIx)
+      if sbk >= 0 { return emitMapGetOrScalarBox(body, sbk, defIx, fnIx) }
+    }
     // A nullable-value ref niche (value reps as `(ref null <elem>)`) stores null
     // directly in its vals slot: a missing key and a stored null both read as null, and
     // `??` coalesces on that read being null — so read the raw nullable value first and
@@ -7889,6 +7894,10 @@ function emitMapGetOr(
     hasSentinel = true
   }
   if !hasSentinel {
+    if defExprNullable(defIx) {
+      const mbk = mapRecvScalarBoxKindTy(recvIx)
+      if mbk >= 0 { return emitMapGetOrScalarBox(body, mbk, defIx, fnIx) }
+    }
     // if entry != 0 { vals.backing[entry-1] } else { d }  — a value-typed if yielding i32.
     pushMapScr(body, 5)      // entry
     fbIf(127)                // if (entry != 0 → found; a nonzero condition is true), 0x7f i32 blocktype
@@ -7959,8 +7968,9 @@ function emitMapGetOrUnionBox(body: u8[], mslot: i32, defIx: i32, fnIx: i32) {
   fbLocalSet(stashL)
   fbEnd()
   // A `scalar | null` value (exactly one non-null scalar member) peels to the RAW scalar — take
-  // the default on the null tag, else unbox the scalar payload.
-  if atoms.length == 2 {
+  // the default on the null tag, else unbox the scalar payload. A nullable default keeps the
+  // result `scalar | null`, the box itself, so it takes the multi-member arm below (D2253).
+  if atoms.length == 2 && !defExprNullable(defIx) {
     // `ak` is the residual member's banked ABI code; when unresolved (-2) it re-parses
     // the rendered atom instead. That fallback is unreached on the corpus and fuzz
     // corpora (`docs/internals/destringify-types-program.md` P-RCH/P-SITE) because an
@@ -8198,6 +8208,18 @@ function emitMapGetScalarBox(
   // ── the PAYLOAD: the boxed value on a hit, a null ref on a miss ──
   pushMapScr(body, 5) // entry
   fbIf(110)           // 0x6e anyref blocktype
+  pushMapScalarHit(body)
+  fbStructNew(vbIdx)
+  fbElse()
+  fbRefNullNone()
+  fbEnd()
+  fbStructNew(uBoxIdx)
+  0
+}
+
+// Push the raw scalar a probed scalar-valued map holds at its found entry — the hit arm of
+// every scalar read. Valid only under an `entry != 0` test, after `emitMapPrep`.
+function pushMapScalarHit(body: u8[]) {
   if cmSlot >= 0 {
     pushMapVals(body)
     fbStructGet(cmValsWrap(), 0)
@@ -8214,11 +8236,31 @@ function emitMapGetScalarBox(
     fbI32Bin(107)
     fbArrayGet(aTypeIdx)
   }
-  fbStructNew(vbIdx)
-  fbElse()
-  fbRefNullNone()
-  fbEnd()
+}
+
+// `m[k] ?? d` over a null-free scalar-valued map with a NULLABLE default: the result is still
+// `S | null`, whose rep is the box, so a hit boxes the stored scalar and a miss delivers `d`
+// as the box. After `emitMapPrep`; `ak` is the value's atom kind (D2254).
+function emitMapGetOrScalarBox(body: u8[], ak: i32, defIx: i32, fnIx: i32) {
+  const vb = vbHeapIdxOfKind(ak)
+  if vb < 0 {
+    return emitFail("emitProgram: scalar map read has no value-box type")
+  }
+  pushMapScr(body, 5)    // entry
+  fbOpenIf()             // 0x04 if
+  fbValtype("union", -1) // result blocktype: the union box `(ref $uBox)`
+  fbI32Const(scalarTagOfKind(ak))
+  pushMapScalarHit(body)
+  fbStructNew(vb)
   fbStructNew(uBoxIdx)
+  fbElse()
+  if (
+    emitUnionCoerce(body, scalarAtomNameOfKind(ak) + " | null", defIx, fnIx) <
+    0
+  ) {
+    return -1
+  }
+  fbEnd()
   0
 }
 
@@ -12953,6 +12995,12 @@ function emitIfExpr(body: u8[], ifIx: i32, fnIx: i32) {
     const rcA = emitIfExprAs(body, ifIx, fnIx, 127)
     pendingLitUnion = savedLU
     return rcA
+  }
+  // A union-valued join is the box whatever reads it, so it takes the box blocktype here and not
+  // only at a union destination: an inline `(if c { a } else { b }) != null` reads it (D2250).
+  if exprUnion(ifIx, fnIx) {
+    const iun = unionNameOfExpr(ifIx, fnIx)
+    if iun != "" { return emitUnionIfValue(body, iun, ifIx, fnIx) }
   }
   const rk = ifExprRefKind(ifIx, fnIx)
   if rk != null {
