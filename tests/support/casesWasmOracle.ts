@@ -673,11 +673,18 @@ const CORPUS_EXEMPT_CODES = new Set([
   "kind-ladder-split",
 ]);
 
-/** Run the self-hosted lint pass over `src` and read its diagnostics. */
+/**
+ * Run the self-hosted lint pass over `src` and read its diagnostics. Called only right
+ * after `driveCase` checked this same single-file `src`, which is what licenses pairing
+ * the lint with that check (`lintUseCheck`) — the CLI's own order, so a typed rule
+ * (`prefer-interpolation`) grades here as `vl check` reports it.
+ */
 const driveLint = (exp: Exports, src: string): LintDiag[] => {
+  const gen = typeof exp.checkGen === "function" ? exp.checkGen() : -1;
   exp.modReset();
   exp.srcReset();
   pushString(exp.srcPush, src);
+  if (typeof exp.lintUseCheck === "function") exp.lintUseCheck(gen);
   const n = exp.lintSrc();
   const out: LintDiag[] = [];
   if (n < 0) return out; // a lex/parse error — lint needs a valid AST

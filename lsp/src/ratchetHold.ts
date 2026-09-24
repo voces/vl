@@ -1,5 +1,5 @@
-// The editor's half of the per-file ratchets (CLAUDE.md §Gates). Five committed
-// baselines hold a per-file count for ten lint codes, and the gate's rule is that a
+// The editor's half of the per-file ratchets (CLAUDE.md §Gates). Six committed
+// baselines hold a per-file count for eleven lint codes, and the gate's rule is that a
 // file's count may only FALL. The editor's rule was different: every finding was a
 // live diagnostic, so `compiler/typecheck.vl` opened with 213 Problems that no gate
 // asks anyone to fix. This makes the two rules ONE — quiet while the debt is held,
@@ -73,6 +73,10 @@ export const RATCHET_CODES: ReadonlyMap<string, RatchetScope> = new Map([
     baseline: "scripts/export-budget-baseline.json",
     trees: COMPILER_ONLY,
   }],
+  ["prefer-interpolation", {
+    baseline: "scripts/interp-budget-baseline.json",
+    trees: ["compiler/", "std/", "scripts/"],
+  }],
 ]);
 
 /** One workspace's loaded baselines, plus the text they were parsed from. */
@@ -112,7 +116,7 @@ const baselineFiles = (): string[] =>
  * rewrites one digit, which leaves the size unchanged — so a stat-based key moves only
  * if the two writes land in different milliseconds, and under a saturated machine they
  * do not. The cache then keeps answering with the previous baseline, which is a wrong
- * answer that depends on how busy the box is. The five files are a few KB in total, so
+ * answer that depends on how busy the box is. The six files are a few KB in total, so
  * reading them per publish costs less than the stats it replaces.
  */
 const readTexts = (root: string): BaselineTexts => {
@@ -137,7 +141,7 @@ const sameTexts = (a: BaselineTexts, b: BaselineTexts): boolean => {
 };
 
 /**
- * Parse the five baselines out of `texts`. A file that is absent or unparseable leaves
+ * Parse the six baselines out of `texts`. A file that is absent or unparseable leaves
  * its codes OUT of `present`, which means "not ratcheted here" — the diagnostics then
  * publish exactly as they did before this module existed, which is what a workspace
  * that is not this repo should see.
