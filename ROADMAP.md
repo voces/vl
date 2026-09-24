@@ -753,6 +753,15 @@ Five items, in order. (0) is shipped; the rest are scheduled against it.
 
 ### Awaiting owner rulings (durable list; each row names its doc)
 
+- **Should a line starting with `- b` continue the previous expression?** (raised 2026-09-24,
+  deferred by the owner; not to be re-asked until picked up.) Today a newline ends the statement,
+  so `const x = a` then `  - b` on the next line is `x = a` plus a separate `-b` — silently, and
+  `unused-pure-expression` does not flag it. Every other binary operator already continues when it
+  leads a line, which is why `vl fmt` (#3106) keeps `-` chains trailing. Options: (a) Swift /
+  Scala 3 spacing rule — `- b` (space after) continues, `-b` starts an expression, so a tail `-b`
+  is unaffected; (b) keep today's rule and extend `unused-pure-expression` to unary/binary
+  expressions so the dropped `- b` is at least flagged. Survey and trade-offs: the 2026-09-24
+  coordinator notes (Go/Kotlin/Ruby flag it, JS continues, F#/Haskell use indentation).
 - **Constraints / nameable bounds — DONE 2026-09-01 (#2217).** Shipped whole:
   `{ toString(): string }` call-shape members, `<T: Showable>` and inline bounds,
   expression satisfaction (field first, then UFCS), strict bodies, whole-program
