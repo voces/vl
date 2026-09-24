@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """The compile-cost ratchet on generated code: what one `vl build --names -O --import-memory`
-of a plumb-shaped unit costs, against a committed one-line baseline.
+of each of two plumb-shaped units costs, against a committed one-line baseline.
 
     python3 scripts/plumb-shape-cost.py [--check]          # grade (the gate row)
     python3 scripts/plumb-shape-cost.py --write-baseline   # after a real change, on a quiet box
     python3 scripts/plumb-shape-cost.py --samples          # print every run, grade nothing
 
-The unit is written by `scripts/perf/gen-plumb-shape.vl` (2 MB, fixed seed) and built by the
-seed under test. Three readings, each red only above its bar, each fall printed and passed:
+Two units are written by `scripts/perf/gen-plumb-shape.vl` (2 MB each, fixed seed) and built by
+the seed under test: the MAIN unit, shaped like a median chunk, and the TAIL unit, the whole size
+in one function, shaped like plumb's slowest chunks. Three readings per unit, each red only above
+its bar, each fall printed and passed:
 
 * GUEST FUEL (+5%) — the compiler's work as wasmtime fuel (`$VL_FUEL=1`), the same number on
   every run however busy the box is. The one reading that can be tight.
@@ -18,8 +20,12 @@ seed under test. Three readings, each red only above its bar, each fall printed 
   when the control just before it is within 15% of its baseline.
 
 `wasm-opt` is timed by pointing `$VL_WASM_OPT` at this file, which runs the real one (or, for
-the fuel build or a box without a native one, nothing) and logs its rusage. Measurements and
-the bars' reasons: docs/internals/profiling-the-compiler.md §Guards.
+the fuel build or a box without a native one, nothing) and logs its rusage. It also logs two
+facts about the rung's input that no load can move, graded exactly: whether the host skipped
+`ssa-nomerge` (D2336), and how many `i32.const 1; if` byte runs the module holds (D2335). A
+host built before D2336 has no size rule, so it is graded on neither the first fact nor the
+tail unit's `-O` CPU until it is rebuilt, except under `--require-fuel`.
+Measurements and the bars' reasons: docs/internals/profiling-the-compiler.md §Guards.
 """
 
 import hashlib
@@ -36,6 +42,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BASELINE = os.path.join(ROOT, "scripts", "plumb-shape-baseline.json")
 GEN = os.path.join(ROOT, "scripts", "perf", "gen-plumb-shape.vl")
 UNIT_BYTES = 2000000
+# The two units: a median chunk's shape, and one function the size of the unit (D2335, D2336).
+UNITS = (("main", []), ("tail", ["--shape", "tail"]))
 BUILD_TIMEOUT = 300
 
 BAR_FUEL = 0.05
@@ -49,16 +57,40 @@ MIN_QUIET = 2
 LAST_BUSY = 0.0
 
 
+# `i32.const 1` then a void `if`: the frame a bare block lowered to before D2335.
+CONST_IF = bytes([0x41, 0x01, 0x04, 0x40])
+
+
 def as_wasm_opt() -> int:
-    """Wrapper mode: run the real `wasm-opt` (none when the variable is empty), log its CPU."""
+    """Wrapper mode: log the rung input's facts, run the real `wasm-opt` (none when the variable
+    is empty), log its CPU. One JSON line per call; the escape step is a call without `-O`."""
     real = os.environ["PLUMB_SHAPE_REAL_WASM_OPT"]
-    if not real:
-        return 0
-    p = subprocess.Popen([real] + sys.argv[1:])
-    _, status, ru = os.wait4(p.pid, 0)
+    argv = sys.argv[1:]
+    row = {"cpu": 0.0, "rung": "-O" in argv or "-O3" in argv,
+           "skip_ssa": "--skip-pass=ssa-nomerge" in argv}
+    with open(argv[0], "rb") as fh:
+        row["const_ifs"] = fh.read().count(CONST_IF)
+    code = 0
+    if real:
+        p = subprocess.Popen([real] + argv)
+        _, status, ru = os.wait4(p.pid, 0)
+        row["cpu"] = ru.ru_utime + ru.ru_stime
+        code = os.waitstatus_to_exitcode(status)
     with open(os.environ["PLUMB_SHAPE_OPT_LOG"], "a") as fh:
-        fh.write(f"{ru.ru_utime + ru.ru_stime}\n")
-    return os.waitstatus_to_exitcode(status)
+        fh.write(json.dumps(row) + "\n")
+    return code
+
+
+def read_opt_log(log: str) -> tuple[float, dict]:
+    """The logged calls' CPU in total, and the rung call's input facts."""
+    total, facts = 0.0, {}
+    with open(log) as fh:
+        for line in fh:
+            row = json.loads(line)
+            total += row["cpu"]
+            if row["rung"]:
+                facts = {"skip_ssa": row["skip_ssa"], "const_ifs": row["const_ifs"]}
+    return total, facts
 
 
 def native_wasm_opt() -> str | None:
@@ -129,14 +161,16 @@ def run(cmd: list[str], env: dict, cwd: str) -> tuple[float, float, str]:
     return ru.ru_utime + ru.ru_stime, ru.ru_maxrss / 1024.0, err
 
 
-def measure(vl: str, seed: str, runs: int, base_control: float | None, samples: bool) -> dict:
+def measure(vl: str, seed: str, runs: int, base_control: float | None, samples: bool,
+            shape: list[str]) -> dict:
     real = native_wasm_opt()
     work = tempfile.mkdtemp(prefix="plumb-shape.")
     try:
         env = dict(os.environ, VL_STD=os.environ.get("VL_STD", os.path.join(ROOT, "std")))
         env.pop("VL_FUEL", None)
         unit = os.path.join(work, "unit.vl")
-        run([vl, "run", GEN, "--compiler", seed, "--", "--bytes", str(UNIT_BYTES), "-o", unit], env, ROOT)
+        run([vl, "run", GEN, "--compiler", seed, "--", "--bytes", str(UNIT_BYTES)] + shape +
+            ["-o", unit], env, ROOT)
         with open(unit, "rb") as fh:
             sha = hashlib.sha256(fh.read()).hexdigest()[:16]
         log = os.path.join(work, "opt.log")
@@ -148,9 +182,11 @@ def measure(vl: str, seed: str, runs: int, base_control: float | None, samples: 
         # The fuel build skips `wasm-opt`: fuel counts only the guest, and binaryen is not it.
         # Its first run on a fresh seed also compiles the fuel engine's `.cwasm` sidecar,
         # which costs CPU but no fuel.
+        open(log, "w").close()
         _, _, err = run(build, dict(benv, VL_FUEL="1", PLUMB_SHAPE_REAL_WASM_OPT=""), work)
         m = re.search(r"^\[fuel\] guest: (\d+)$", err, re.M)
         fuel = int(m.group(1)) if m else None
+        _, facts = read_opt_log(log)
 
         run(build, benv, work)  # untimed: warms this engine's sidecar and the page cache
         rows = []
@@ -158,8 +194,7 @@ def measure(vl: str, seed: str, runs: int, base_control: float | None, samples: 
             ctl = control()
             open(log, "w").close()
             cpu, rss, _ = run(build, benv, work)
-            with open(log) as fh:
-                opt = sum(float(x) for x in fh.read().split())
+            opt, _ = read_opt_log(log)
             quiet = base_control is not None and ctl <= base_control * QUIET
             rows.append((ctl, cpu - opt, opt, rss, quiet))
             if samples:
@@ -178,6 +213,8 @@ def measure(vl: str, seed: str, runs: int, base_control: float | None, samples: 
             "quiet_runs": len(q),
             "runs_done": len(rows),
             "unit_sha": sha,
+            "skip_ssa": facts.get("skip_ssa"),
+            "const_ifs": facts.get("const_ifs"),
             "wasm_opt": subprocess.run([real, "--version"], capture_output=True, text=True).stdout.strip()
             if real else None,
             "cpu_host": cpu_model(),
@@ -220,65 +257,97 @@ def main(argv: list[str]) -> int:
                 return 1
     same_host = base is not None and base.get("cpu_host") == cpu_model()
     runs = int(os.environ.get("PLUMB_SHAPE_RUNS", "7" if mode == "--write-baseline" else "3"))
-    m = measure(vl, seed, runs, base["control_cpu"] if same_host else None, mode == "--samples")
+    ctl = base["control_cpu"] if same_host else None
+    units = {name: measure(vl, seed, runs, ctl, mode == "--samples", shape)
+             for name, shape in UNITS}
 
     def fmt(v, unit, nd=2):
         return "-" if v is None else f"{v:.{nd}f}{unit}"
 
-    print(f"plumb-shape unit: fuel {m['fuel'] if m['fuel'] is not None else '-'}, peak RSS "
-          f"{fmt(m['rss_mb'], ' MB', 0)}, compile {fmt(m['compile_cpu'], 's')} CPU, -O "
-          f"{fmt(m['opt_cpu'], 's')} ({m['quiet_runs']} quiet of {m['runs_done']} runs; control "
-          f"{m['control_cpu']:.3f}s)")
+    for name, m in units.items():
+        print(f"plumb-shape {name} unit: fuel {m['fuel'] if m['fuel'] is not None else '-'}, peak RSS "
+              f"{fmt(m['rss_mb'], ' MB', 0)}, compile {fmt(m['compile_cpu'], 's')} CPU, -O "
+              f"{fmt(m['opt_cpu'], 's')} ({m['quiet_runs']} quiet of {m['runs_done']} runs; control "
+              f"{m['control_cpu']:.3f}s), skip ssa-nomerge {m['skip_ssa']}, const-1 ifs {m['const_ifs']}")
     if mode == "--samples":
         return 0
     if mode == "--write-baseline":
-        if m["fuel"] is None:
+        if any(m["fuel"] is None for m in units.values()):
             print("plumb-shape: this host prints no `[fuel]` line (it predates $VL_FUEL); rebuild it first")
             return 1
-        row = dict(m, commit=head_commit())
-        del row["quiet_runs"], row["runs_done"]
+        rows = {}
+        for name, m in units.items():
+            rows[name] = dict(m)
+            del rows[name]["quiet_runs"], rows[name]["runs_done"]
+        # The main unit's readings stay at the top level; the tail unit's nest under "tail".
+        row = dict(rows["main"], tail=rows["tail"], commit=head_commit())
         with open(BASELINE, "w") as fh:
             fh.write(json.dumps(row) + "\n")
         print(f"wrote {os.path.relpath(BASELINE, ROOT)}")
         return 0
 
-    if m["unit_sha"] != base["unit_sha"]:
-        print(f"PLUMB-SHAPE UNIT CHANGED: the generator wrote {m['unit_sha']}, the baseline priced "
-              f"{base['unit_sha']}. It is deterministic, so either scripts/perf/gen-plumb-shape.vl "
-              "changed (re-baseline in the same PR) or the seed now compiles it differently.")
+    bases = {"main": base, "tail": base.get("tail")}
+    if bases["tail"] is None:
+        print("plumb-shape: the baseline has no tail unit; re-baseline with\n"
+              "  python3 scripts/plumb-shape-cost.py --write-baseline")
         return 1
+    for name, m in units.items():
+        if m["unit_sha"] != bases[name]["unit_sha"]:
+            print(f"PLUMB-SHAPE UNIT CHANGED: the generator wrote {m['unit_sha']} for the {name} unit, "
+                  f"the baseline priced {bases[name]['unit_sha']}. It is deterministic, so either "
+                  "scripts/perf/gen-plumb-shape.vl changed (re-baseline in the same PR) or the seed "
+                  "now compiles it differently.")
+            return 1
     bad = []
 
     def grade(name: str, cur, was, bar: float, unit: str, why_not: str | None = None):
         if why_not is not None:
-            print(f"  {name:10s} not graded: {why_not}")
+            print(f"  {name:15s} not graded: {why_not}")
             return
-        pct = 100.0 * (cur - was) / was
+        pct = 100.0 * (cur - was) / was if was else 0.0
         over = cur > was * (1 + bar)
-        print(f"  {name:10s} {cur:>14,.{0 if unit == '' else 2}f}{unit} against {was:,.{0 if unit == '' else 2}f}{unit} "
+        print(f"  {name:15s} {cur:>14,.{0 if unit == '' else 2}f}{unit} against {was:,.{0 if unit == '' else 2}f}{unit} "
               f"({pct:+.1f}%, bar +{100 * bar:.0f}%) {'OVER' if over else 'ok'}")
         if over:
             bad.append(name)
 
-    if m["fuel"] is None:
-        if require_fuel:
-            print("plumb-shape: this host prints no `[fuel]` line and --require-fuel was given")
-            return 1
-        grade("fuel", None, None, BAR_FUEL, "", "this host predates $VL_FUEL (rebuild scripts/vl-host)")
-    else:
-        grade("fuel", m["fuel"], base["fuel"], BAR_FUEL, "")
-    grade("peak RSS", m["rss_mb"], base["rss_mb"], BAR_RSS, " MB")
-    cpu_why = None
-    if not same_host:
-        cpu_why = f"CPU is `{cpu_model()}`, the baseline's `{base.get('cpu_host')}`"
-    elif m["quiet_runs"] < MIN_QUIET:
-        cpu_why = (f"box busy — {m['quiet_runs']} of {m['runs_done']} runs had the control within "
-                   f"{100 * (QUIET - 1):.0f}% of its {base['control_cpu']:.3f}s")
-    grade("compile", m["compile_cpu"], base["compile_cpu"], BAR_COMPILE_CPU, "s", cpu_why)
-    opt_why = cpu_why
-    if opt_why is None and m["wasm_opt"] != base["wasm_opt"]:
-        opt_why = f"wasm-opt is `{m['wasm_opt']}`, the baseline's `{base['wasm_opt']}`"
-    grade("-O", m["opt_cpu"], base["opt_cpu"], BAR_OPT_CPU, "s", opt_why)
+    # A host built before D2336 has no size rule to apply; like one without `$VL_FUEL`, it
+    # passes locally until the shared binary is rebuilt, and `--require-fuel` (CI) grades it.
+    with open(vl, "rb") as fh:
+        host_skips = b"--skip-pass=ssa-nomerge" in fh.read()
+    for uname, m in units.items():
+        b = bases[uname]
+        tag = f"{uname} "
+        if m["fuel"] is None:
+            if require_fuel:
+                print("plumb-shape: this host prints no `[fuel]` line and --require-fuel was given")
+                return 1
+            grade(tag + "fuel", None, None, BAR_FUEL, "", "this host predates $VL_FUEL (rebuild scripts/vl-host)")
+        else:
+            grade(tag + "fuel", m["fuel"], b["fuel"], BAR_FUEL, "")
+        grade(tag + "peak RSS", m["rss_mb"], b["rss_mb"], BAR_RSS, " MB")
+        # Exact: a rung input's shape does not depend on the box.
+        for key, what in (("skip_ssa", "skips ssa-nomerge"), ("const_ifs", "const-1 ifs")):
+            if key == "skip_ssa" and not host_skips and not require_fuel:
+                print(f"  {tag + what:15s} not graded: this host predates D2336 (rebuild scripts/vl-host)")
+                continue
+            ok = m[key] == b.get(key) if key == "skip_ssa" else (m[key] or 0) <= (b.get(key) or 0)
+            print(f"  {tag + what:15s} {m[key]} against {b.get(key)} {'ok' if ok else 'CHANGED'}")
+            if not ok:
+                bad.append(tag + what)
+        cpu_why = None
+        if not same_host:
+            cpu_why = f"CPU is `{cpu_model()}`, the baseline's `{base.get('cpu_host')}`"
+        elif m["quiet_runs"] < MIN_QUIET:
+            cpu_why = (f"box busy — {m['quiet_runs']} of {m['runs_done']} runs had the control within "
+                       f"{100 * (QUIET - 1):.0f}% of its {base['control_cpu']:.3f}s")
+        grade(tag + "compile", m["compile_cpu"], b["compile_cpu"], BAR_COMPILE_CPU, "s", cpu_why)
+        opt_why = cpu_why
+        if opt_why is None and b.get("skip_ssa") and not host_skips:
+            opt_why = "this host predates D2336 (rebuild scripts/vl-host)"
+        if opt_why is None and m["wasm_opt"] != b["wasm_opt"]:
+            opt_why = f"wasm-opt is `{m['wasm_opt']}`, the baseline's `{b['wasm_opt']}`"
+        grade(tag + "-O", m["opt_cpu"], b["opt_cpu"], BAR_OPT_CPU, "s", opt_why)
     if bad:
         print(f"PLUMB-SHAPE COST REGRESSION ({', '.join(bad)}): building generated code got dearer.\n"
               "  Profile the unit (docs/internals/profiling-the-compiler.md; write it with\n"
@@ -288,7 +357,6 @@ def main(argv: list[str]) -> int:
         return 1
     print("plumb-shape cost ok")
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv))
