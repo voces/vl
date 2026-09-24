@@ -937,11 +937,13 @@ Deno.test({
       await Deno.writeTextFile(f, src);
       const once = await run([f]);
       if (once.code !== 0) throw new Error(`fmt failed: ${once.err}`);
-      // Paren form: `if (` then operands at +4, then `) {`.
+      // Paren form: `if (` then operands at +4, each after the first led by its
+      // operator, then `) {`.
       if (
         !once.out.includes("  if (\n") ||
-        !once.out.includes("\n    aaaaaaaaaa &&\n") ||
-        !once.out.includes("\n    ffffffffff\n") ||
+        !once.out.includes("\n    aaaaaaaaaa\n") ||
+        !once.out.includes("\n    && bbbbbbbbbb\n") ||
+        !once.out.includes("\n    && ffffffffff\n") ||
         !once.out.includes("\n  ) {\n")
       ) {
         throw new Error(`condition did not wrap in forced parens:\n${once.out}`);
@@ -1150,8 +1152,10 @@ Deno.test({
       // The width check accounts for the leading indent, so a call (or `+`-chain)
       // that only overflows because it is nested wraps: a call breaks to one
       // argument per line with a trailing comma and `)` on its own line; a `+`-chain
-      // breaks at the operators (operator trailing each line). A string literal that
-      // can't be split stays long, but the call AROUND it still wraps.
+      // breaks at the operators (operator LEADING each continuation line). A chain with
+      // a `-` link keeps its operators trailing, since a line that begins with `-` is a
+      // new statement. A string literal that can't be split stays long, but the call
+      // AROUND it still wraps.
       const f = `${dir}/w.vl`;
       const src =
         "function emitMapSet(a: i32, b: i32, c: i32, d: i32, e: i32): i32 { a }\n" +
@@ -1164,6 +1168,10 @@ Deno.test({
         "function g(): string {\n" +
         "  let resultValue = \"alpha\" + \"beta\" + \"gamma\" + \"delta\" + \"epsilon\" + \"zeta\" + \"eta\"\n" +
         "  resultValue\n" +
+        "}\n" +
+        "function h(alphaLonger: i32, betaLonger: i32, gammaLonger: i32): i32 {\n" +
+        "  const differenceValue = alphaLonger + betaLonger - gammaLonger + alphaLonger - betaLonger\n" +
+        "  differenceValue\n" +
         "}\n";
       await Deno.writeTextFile(f, src);
       const once = await run([f]);
@@ -1178,13 +1186,23 @@ Deno.test({
       ) {
         throw new Error(`over-width call did not wrap one-arg-per-line:\n${once.out}`);
       }
-      // The over-width `+`-chain breaks at the operators (operator trailing).
+      // The over-width `+`-chain breaks at the operators (operator leading).
       if (
-        !once.out.includes("  let resultValue = \"alpha\" +\n") ||
-        !once.out.includes("\n    \"beta\" +\n") ||
-        !once.out.includes("\n    \"eta\"\n")
+        !once.out.includes("  let resultValue = \"alpha\"\n") ||
+        !once.out.includes("\n    + \"beta\"\n") ||
+        !once.out.includes("\n    + \"eta\"\n")
       ) {
         throw new Error(`over-width \`+\`-chain did not wrap at operators:\n${once.out}`);
+      }
+      // A chain holding `-` keeps every operator trailing: `- betaLonger` on a line
+      // of its own would be a statement, not a subtraction.
+      if (
+        !once.out.includes("  const differenceValue = alphaLonger +\n") ||
+        !once.out.includes("\n    gammaLonger +\n") ||
+        !once.out.includes("\n    alphaLonger -\n") ||
+        !once.out.includes("\n    betaLonger\n")
+      ) {
+        throw new Error(`a \`-\` chain did not keep its operators trailing:\n${once.out}`);
       }
       // No emitted non-comment, non-string line exceeds 80 columns.
       for (const line of once.out.split("\n")) {
