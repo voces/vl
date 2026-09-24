@@ -180,6 +180,11 @@ function startsUnderscore(name: string) {
 // count. Never traps: every arena access is bounds-checked or guarded by `is`.
 export function lint(progRoot: i32) {
   lintReset()
+  // Consumed HERE, once, unconditionally — every early return below (an invalid
+  // `progRoot`, a non-`Program` node) must still leave `scaPath` cleared, or a path
+  // staged for this run reads as staged for whichever run reads it next.
+  scaRunPath = scaPath
+  scaPath = ""
   if progRoot < 0 || progRoot >= P.nodes.length { return 0 }
   const root = P.nodes[progRoot]
   if root is Program {
@@ -1200,7 +1205,7 @@ function preferInterpVisit(ix: i32) {
   // compiler/*.vl cannot take this advice — interpolation there is refused outright
   // (`compiler-no-interpolation` below) — so recommending it here would tell an author
   // to fix a chain with a rewrite the tree does not allow.
-  if scaIsCompiler(scaPath) { return 0 }
+  if scaIsCompiler(scaRunPath) { return 0 }
   const first = nodeStartTok(ix)
   if first < 0 { return 0 }
   const end = nodeSpanEndTok(ix)
@@ -1280,7 +1285,7 @@ function piOperandSource(ix: i32) {
 // `std:fmt`/`std:str` (`BinExpr.binTpl`), which pulls one in — so a self-compile
 // fails to LOAD it ("unknown import: imports::__print_i32__"). Refuse it here.
 function compilerNoInterpVisit(ix: i32) {
-  if !scaIsCompiler(scaPath) { return 0 }
+  if !scaIsCompiler(scaRunPath) { return 0 }
   const n = P.nodes[ix]
   if n is BinExpr {
     if n.binTpl == 1 {
@@ -2745,10 +2750,7 @@ function commentBudget() {
   // `comment-style.md` is the COMPILER's rubric; a std comment is consumer API
   // surface, graded by `std-comment-audience` against `std-api-review.md` §4
   // instead. Grading std under both buried a consumer's own diagnostics (D1601).
-  // This scan is the later of the two, so it consumes the path.
-  const p = scaPath
-  scaPath = ""
-  if scaIsStd(p) { return 0 }
+  if scaIsStd(scaRunPath) { return 0 }
   klEnsureIndex(s)
   let n = 0
   let blockLine = 0
@@ -2845,33 +2847,35 @@ function commentBudget() {
 const scaHeaderBudget = 10
 const scaDocBudget = 4
 
-// The path or module key the current source belongs to. Both comment scans read it
-// and `commentBudget`, the later of the two, consumes it — so a caller that forgets
-// the setter lints nothing rather than grading this module against the previous
-// one's path.
+// The path or module key the current source belongs to, STAGED by a caller ahead of
+// `lint()` and consumed exactly once, at that call's top, into `scaRunPath` below — a
+// caller that forgets the setter lints nothing rather than grading this module
+// against the previous one's path.
 let scaPath = ""
+// This run's path, frozen for the duration of one `lint()` call — every path-scoped
+// rule (`preferInterpVisit`, `compilerNoInterpVisit`, `stdCommentAudience`,
+// `commentBudget`) reads this, never `scaPath` directly, so a rule that runs before
+// `commentBudget` (the walk) still sees the SAME answer as one that runs after it.
+let scaRunPath = ""
 export function lintSetPath(p: string) {
   scaPath = p
   0
 }
 
-// Whether `p` names a VL std module: the `std:` key the graph walk hands over, a
-// target rooted at `std/` (a checkout-relative spelling, what every gate uses), or
-// a `/std/` SEGMENT anywhere (an absolute path, which the prefix alone cannot see).
-// Residue accepted knowingly, both ways: a coincidental `src/std/` also matches.
+// Whether `p` names a VL std module: the `std:` key the graph walk hands over, or a
+// target rooted at `std/`, which is how `lint-self.sh`'s `vl check std/` names each
+// file. Prefix-only — the caller (`lintScopeKeyOf`, a checkout-root walk in the LSP)
+// turns an absolute, in-checkout path into one of these shapes and an out-of-checkout one into "".
 function scaIsStd(p: string): boolean {
   const b = p.length
-  txAt(p, 0, b, "std/") || txAt(p, 0, b, "std:") || txFind(p, 0, b, "/std/")
+  txAt(p, 0, b, "std/") || txAt(p, 0, b, "std:")
 }
 
 // Whether `p` names a file under `compiler/` — the tree that becomes the seed
-// (`build/vl-compiler.wasm`) and so must stay import-free. Same match as
-// `scaIsStd`: a checkout-relative PREFIX, or a `/compiler/` SEGMENT anywhere for
-// an absolute path — `preferInterpVisit` and `compilerNoInterpVisit` (§4d/4e) read it.
-function scaIsCompiler(p: string): boolean {
-  const b = p.length
-  txAt(p, 0, b, "compiler/") || txFind(p, 0, b, "/compiler/")
-}
+// (`build/vl-compiler.wasm`) and so must stay import-free. `preferInterpVisit` and
+// `compilerNoInterpVisit` (§4d/4e) read it; prefix-only, for the same reason as
+// `scaIsStd` above.
+function scaIsCompiler(p: string): boolean { txAt(p, 0, p.length, "compiler/") }
 
 // `txWordIsI` with the leading boundary taken here rather than by the caller, so
 // `DECISIONS` and `decisions` are the same word and neither matches inside a longer one.
@@ -2993,7 +2997,7 @@ function scaReport(
 // export and takes the tighter budget. A block followed by another comment block
 // documents nothing, so a section banner is not held to it. O(bytes), like the scan above.
 function stdCommentAudience() {
-  if !scaIsStd(scaPath) { return 0 }
+  if !scaIsStd(scaRunPath) { return 0 }
   const s = txSource
   klEnsureIndex(s)
   let n = 0

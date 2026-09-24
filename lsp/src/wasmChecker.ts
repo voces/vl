@@ -2050,18 +2050,22 @@ export const createWasmChecker = (
     exp.srcReset();
     pushString(exp.srcPush, source);
     // Stage the path BEFORE `lintSrc` runs — `scaPath` (compiler/lint.vl) is read
-    // during the pass, not after — into its own accumulator (`lintPathPush`
-    // never touches `vcAcc`, so this cannot corrupt the source just staged).
-    // An older seed lacks the three exports; the rules that read the path just
-    // see none staged, same as the source having no path at all.
+    // during the pass, not after — into its own accumulator (`lintPathPush` never
+    // touches `vcAcc`, so this cannot corrupt the source just staged). ALWAYS
+    // reset+commit, `path` given or not: this instance is REUSED across documents
+    // (one per keystroke, `wasmCheckerNode.ts`), and `scaPath` is a module global
+    // that otherwise carries the LAST staged path forward — an early return inside
+    // the seed (a parse error) never reaches the point that would clear it, so a
+    // conditional stage here left an unparseable "compiler/x.vl"'s path applied to
+    // the next, unrelated document's lint (review round 2). Committing with nothing
+    // pushed sets it to "", same as a caller that never staged one.
     if (
-      path !== undefined &&
       typeof exp.lintPathReset === "function" &&
       typeof exp.lintPathPush === "function" &&
       typeof exp.lintPathCommit === "function"
     ) {
       exp.lintPathReset();
-      pushString(exp.lintPathPush, path);
+      if (path !== undefined) pushString(exp.lintPathPush, path);
       exp.lintPathCommit();
     }
     const n = exp.lintSrc();

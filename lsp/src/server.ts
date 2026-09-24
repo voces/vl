@@ -59,8 +59,8 @@ import {
 import {
   applyRatchetHold,
   invalidateRatchetBaselines,
-  workspaceRelative,
 } from "./ratchetHold.ts";
+import { lintPathFor as lintPathForFile } from "./vlRoot.ts";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -255,15 +255,10 @@ const heldFiltered = (uri: string, diagnostics: VLDiagnostic[]): VLDiagnostic[] 
     showHeldLint,
   );
 
-// `uri`'s path as `lint()`'s `path` argument wants it: checkout-root-relative, the
-// spelling `compiler/lint.vl`'s `scaIsCompiler`/`scaIsStd` prefix-match against (the
-// CLI and the ratchets spell it the same way — CLAUDE.md, "After editing
-// compiler/*.vl"). `undefined` with no open workspace or outside it: the rules that
-// read it just decline, the same as before this channel existed.
-const lintPathFor = (uri: string): string | undefined =>
-  workspaceFolder
-    ? workspaceRelative(uriToPath(workspaceFolder), uriToPath(uri))
-    : undefined;
+// `uri`'s path as `lint()`'s `path` argument wants it — `vlRoot.ts`'s doc comment
+// has the full story (why it walks from the FILE, never from an open workspace
+// folder, and the false positives that cost it doing otherwise).
+const lintPathFor = (uri: string): string | undefined => lintPathForFile(uriToPath(uri));
 
 const toLspDiagnostic = (d: VLDiagnostic): Diagnostic => ({
   message: d.message,

@@ -127,3 +127,40 @@ Deno.test({
     await Deno.remove(dir, { recursive: true });
   },
 });
+
+// THE ABSOLUTE-PATH REGRESSION THE REVIEW CAUGHT (round 2): an unrelated project's
+// own `src/compiler/x.vl`, checked by its ABSOLUTE path (as an editor extension or a
+// hand invocation would), must behave exactly like `control` above — the `+` chain
+// suggested, the interpolation unremarkable — never like `under`. A prefix-only
+// match on the raw path cannot tell this apart from a real `compiler/…` target; the
+// CLI relativizes an absolute target against the VL checkout it resolves `std:`
+// from (`lintScopeKeyOf`, driver.vl) and declines scoping when the target sits
+// outside it, which `dir` here — an ordinary temp directory, no VL checkout marker
+// anywhere up its tree — always does.
+Deno.test({
+  name: "compiler-no-interpolation / prefer-interpolation: an unrelated project's own compiler/, by ABSOLUTE path, is never scoped",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = await Deno.makeTempDir({ prefix: "vl_fake_game_" });
+    await Deno.mkdir(`${dir}/src/compiler`, { recursive: true });
+    const abs = `${dir}/src/compiler/parse.vl`;
+    await Deno.writeTextFile(abs, FIXTURE);
+
+    const forbidden = await findings("/", abs, FORBIDDEN);
+    if (forbidden.length !== 0) {
+      throw new Error(
+        `${FORBIDDEN} fired on an unrelated project's own compiler/ (absolute path): ` +
+          `${JSON.stringify(forbidden)}`,
+      );
+    }
+    const interp = await findings("/", abs, INTERP);
+    if (interp.length !== 1 || interp[0].line !== 6) {
+      throw new Error(
+        `${INTERP} on the same file: want one finding at line 6 (unrelated projects ` +
+          `are ordinary code), got ${JSON.stringify(interp)}`,
+      );
+    }
+
+    await Deno.remove(dir, { recursive: true });
+  },
+});
