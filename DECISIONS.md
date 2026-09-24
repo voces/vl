@@ -7386,7 +7386,10 @@ iteration is seen by that iteration's closure (`for i in 0 to 2 { let j = i; fs.
 j = j * 10 }` gives 0, 10, 20). A `let` declared OUTSIDE the loop is one binding for the whole
 loop, so every closure made in it sees the last write (`let n = 0; for … { fs.push(() => n); n
 = n + 1 }` gives 3, 3, 3). A `for x in xs` variable, and both variables of `for v, k in xs`, is
-per iteration like JS `for (const x of xs)`, and writable. A range variable (`for i in a to b`)
+per iteration like JS `for (const x of xs)`, and writable; a write to the index `k` changes
+this iteration's `k` only, and the next iteration's is still the count walked, captured or not
+(D2342; master carried the write over, so a closure capturing `k` changed what printed). A range
+variable (`for i in a to b`)
 is per iteration like JS `for (let i = …; …; i++)`: a write to it, from the body or through a
 closure, is the value the next iteration steps from, and a `continue` carries it over.
 
@@ -7413,8 +7416,10 @@ the binding (D2340, open). Capturing it by value instead would print a stale val
 **THE MECHANISM.** D2285's `captureBoxRewrite` (`compiler/emit_rewrite.vl`) is the one place:
 `let c = e` becomes `let c = [e]` and every use `c[0]`, before monomorphization; a parameter or
 loop variable `v` gets a `let v$cb = [v]`. The decision is one scan per frame that records each
-capture and each assignment in walk order, with the loop and `if` arm it sits in; nothing else
-in the compiler learned a new case.
+capture and each assignment in walk order, with the loop and `if` arm it sits in. A call with
+named arguments evaluates them in parameter order, so every closure among its arguments is dated
+to the call's start (D2343). Beyond that scan, only the for-in index step and the narrowing
+replay changed.
 
 **THE PRICE, MEASURED.** Only a program with a shared binding pays, and the corpus says that is
 rare: of the 4,039 programs in `tests/cases/` and the distilled corpus that both seeds build,
@@ -7425,8 +7430,8 @@ default and `-O`, as does plumb's `chunk_662` (429,605 bytes at `-O`). What a sh
 costs is a cell access per read and write: a loop doing nothing but `acc = acc ^ i` 500M times
 on a shared `acc` takes 0.77 s against 0.12 s unshared (6.4x, the same at `-O`, since the cell
 escapes into the closure); the same loop with a `%` in it is +2%. Compile cost: guest fuel
-+0.11% on the plumb-shape unit (9,080,340,986 → 9,090,608,985) and on `chunk_662`
-(9,234,644,431 → 9,244,972,179), peak RSS unchanged; the seed grew 16,473 bytes (+0.58%).
++0.15% on the plumb-shape unit (9,080,340,986 → 9,094,068,473, the reviewer's reading) and
++0.11% on `chunk_662` (9,234,644,431 → 9,244,972,179), peak RSS unchanged; the seed grew 16,473 bytes (+0.58%).
 
 **FOLLOW-UPS, not built.** The cell is a one-element growable list because D2285 built it that
 way; a one-field mutable struct would drop the list header and bounds check from every access.
