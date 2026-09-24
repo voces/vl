@@ -917,3 +917,17 @@ Slice S3 of `docs/internals/simd-design.md` — the `F32x4` surface over the `__
 - **What grades it.** `tests/cases/simd/f32x4-std-surface.vl` (every op, lane order, NaN and
   -0.0), `f32x4-geometry.vl`, `f32x4-kernel-vs-scalar.vl` (bit-identical to scalar),
   `f32x4-positions.vl`, `f32x4-lanes.vl`, and the `error-*` refusals.
+
+## `std:buffer` over a shared memory (2026-09-24)
+
+- The shared allocator is inline in `Buffer`, `bufferMark` and `bufferRelease` under
+  `if __memory_shared__() { … }`, which the compiler folds per build (`foldMemShared`). It is
+  inline, and the header size is a literal `8`, because the compiler emits every private
+  function and every top-level `const` of an imported module whether or not a build uses it:
+  a helper or a `const` used only by the shared path would change every default build's bytes.
+- `bumpOff` means two things: bytes handed out from the heap base in an unshared build, and
+  where this instance's latest `Buf` ended (from heap base + 8) in a shared one.
+- `memory.grow(0)` rather than `memory.size` after a refused grow, and before believing the
+  header's page is absent: V8's per-instance `memory.size` can lag another instance's growth.
+- Protocol and rationale: DECISIONS.md §"std:buffer's allocator over a shared memory";
+  layout: `buffer-design.md` §N.

@@ -2410,3 +2410,58 @@ wasmtime gives back the melt on the four one-view kernels that collapsed (`scale
 (`--always-inline-max-function-size=60`) and M8's hoisted accessors are unaffected; what M4 attributes to a second call site is now what every kernel
 behind a run-once driver pays under wasmtime, which is where L4 (emit-time scalar replacement of
 a descriptor) would pay off.
+
+## N. The allocator over a shared memory (2026-09-24)
+
+`vl build --shared-memory=<pages>` (#3120) lets several instances — Web Workers — share one
+linear memory, and shipped with the rule that at most one of them may call `Buffer`: the bump
+pointer (`bumpOff`) is a per-instance global over a heap window fixed per build, so every
+instance handed out the same addresses. This section lifts the rule. The rationale and the
+alternatives are DECISIONS.md §"std:buffer's allocator over a shared memory"; what follows is
+the layout and the behaviour a caller sees.
+
+### N1. The header and the protocol
+
+| bytes | what |
+| --- | --- |
+| `[heap base, heap base + 8)` | the header, one `i64`: low word = bytes handed out, high word = where the top run began, both from `heap base + 8` |
+| `[heap base + 8, …)` | `Buf`s, back to back, each a multiple of 8 |
+
+Only a shared build has the header, so a shared build's first `Buf` is at `heap base + 8`
+(1032 by default) where an unshared build's is at `heap base`. The header starts as zero-filled
+memory, which is its initial state: nothing initialises it, so no instance can reset it.
+
+- **`Buffer(n)`**: make `[0, want)` addressable, read the header, compute `[base, next)`; if
+  `next`'s page is not yet addressable, set `want = next` and go round; otherwise
+  `cmpxchg` the header to `next` and retry on a lost race. Growth happens before the claim, so a
+  refused growth (the declared max) traps with the pointer untouched.
+- **Growth**: `memory.grow(need - have)`; on `-1`, `memory.grow(0)` answers the size itself —
+  unchanged means the max refused it (trap), changed means another instance grew (look again).
+  `memory.size` is not used for that re-read because in V8 an instance's `memory.size` can lag
+  growth by another instance.
+- **Runs**: each instance's `bumpOff` records where its latest `Buf` ended. A claim at that
+  address continues the header's run; any other claim starts a run at its own base.
+- **`bufferMark()`**: the header's pointer (or `heap base + 8` when the header's page does not
+  exist yet).
+- **`bufferRelease(mark)`**: traps on a mark outside `[heap base + 8, pointer]` or off an
+  8-byte boundary, as before. Rewinds only when the pointer is where this instance's latest `Buf`
+  ended and `mark` is inside the top run; otherwise keeps everything.
+
+### N2. What a caller sees
+
+- Instances never receive overlapping `Buf`s, whatever the interleaving.
+- Zero-fill, alignment and the traps are unchanged, plus one clarified: a `Buffer` the memory's
+  max cannot hold traps (it always did, through `ensureCapacity`).
+- `bufferRelease` is conservative: interleaved allocation by another instance makes it reclaim
+  nothing. A frame arena per Worker that never interleaves with another's reclaims as before;
+  one that does leaks what it could not rewind.
+- A shared memory is a SharedArrayBuffer, so growth does not detach a host's views.
+
+### N3. What pins it
+
+`tests/vl_shared_memory_test.ts` (§"two Workers, one memory"): the two-Worker witness is
+positive, 2/3/4 Workers × 10,000 concurrent `Buf`s tile the heap with every stamp intact, four
+Workers racing to fill a 6-page memory over thirty rounds each trap only once nothing fits, and
+the release rules hold across two Workers. A default build is byte-identical: `foldMemShared`
+removes the shared statements before any other pass, and the tests' default-build rows plus 498
+of 498 A/B builds say so.
