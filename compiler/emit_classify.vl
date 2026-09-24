@@ -30816,16 +30816,6 @@ export function exprReReadable(exprIx: i32): boolean {
 // produces the i32 array (a `(ref $aTypeIdx)`) rather than an i32. An index read
 // `a[i]` and `a.length` are i32 (not arrays), so they are deliberately absent here.
 
-// True if the function `name`, resolved from frame `fnIx`, declares or infers an `i32[]`
-// return. Scope-aware because a monomorphized instance's per-pin clone shares the template's
-// name, and the flat map answers the template (D1781).
-function fnRetArraySid(sid: i32, name: string, fnIx: i32) {
-  repOfNameResult(sid, name, fnIx).rdKind == "list"
-}
-
-// True if the already-collected declared local `name` is an i32-array ref (code `2`).
-function declaredArray(name: string) { declaredKind(name) == "list" }
-
 // The shared-field plan over an un-narrowed struct union — `(A | B).tag`, where the checker
 // proved the field present on every member. Fills `outVis`/`outFis` with each member's
 // variant index and its index for this field, in box-tag order, and returns the one field
@@ -30929,117 +30919,9 @@ function identShadowedByFrame(fnIx: i32, name: string) {
   declaredSlotOf(name) >= 0
 }
 
+// True if `exprIx` evaluates to an `i32[]` (or `boolean[]`): a projection of `exprListRep`.
 export function exprArray(exprIx: i32, fnIx: i32) {
-  if exprIx < 0 { return false }
-  // A spread literal answers from the rep `emitArrSpread` builds it at, ahead of the
-  // typed-IR path: that path claims every array kind, so `[...bs]` over a `u8[]` would bind
-  // the i32 cell while the value is the packed byte wrapper — two heap types for one value.
-  const sl = P.nodes[exprIx]
-  if sl is ArrayLit {
-    if hasSpreadItem(sl.arrElems) {
-      return spreadDestKind(sl.arrElems, fnIx) == "i32"
-    }
-  }
-  if tyKindOf(nodeTyIxOf(exprIx)) == 2 {
-    return true // typed-IR fast path (see exprIsF64)
-  }
-  const e = P.nodes[exprIx]
-  if e is ArrayLit { return !arrLitIsRef(exprIx) }
-  if e is Paren { return exprArray(e.parInner, fnIx) }
-  if e is Call {
-    // An INDEXED closure call `fs[i](x)` whose element signature returns `i32[]`.
-    if cloArrCallRetKind(exprIx, fnIx) == "list" { return true }
-    const callee = P.nodes[e.callFn]
-    if callee is Ident {
-      // The intrinsic allocators yield an i32 list unless the fill is f64
-      // (`arrNewIntrKind` 1 — then `exprF64Array` claims the call).
-      if arrNewIntrKind(exprIx, fnIx) == 0 { return true }
-      if fnRetArraySid(sidOfNode(e.callFn), callee.identName, fnIx) {
-        return true
-      }
-      // A closure-value call (`g(x)` with `g: (i32) => i32[]`) whose resolved sig result is
-      // the i32 list, so `const xs = g(x)` types `xs` as a list.
-      return calleeRetKindSid(sidOfNode(e.callFn), fnIx) == "list"
-    }
-    // `xs.map(f)`/`xs.filter(p)` yield a new list — the i32 list exactly when the result
-    // element kind is i32/boolean.
-    if callIsMapFilter(exprIx, fnIx) {
-      return mfResultKindOf(exprIx, fnIx) == "i32"
-    }
-    // `xs.slice(...)` yields the same list kind as its receiver — an i32 list iff the
-    // receiver is one.
-    if callIsArrSlice(exprIx, fnIx) {
-      return mfResultKindOf(exprIx, fnIx) == "i32"
-    }
-    // `m.values()` over an i32-valued map yields an i32 list.
-    if mapValuesResultKind(exprIx, fnIx) == 2 { return true }
-    // `m.keys()` over the i32-KEYED rep yields an i32 list of its keys — the twin of
-    // the string-keyed `.keys()` claimed by the string-list classifier.
-    const kc32 = P.nodes[e.callFn]
-    if kc32 is Member {
-      if kc32.memProp == "keys" {
-        if exprMap(kc32.memObj, fnIx) {
-          if mapShapeKeyI32(mapShapeOfExpr(kc32.memObj, fnIx)) { return true }
-        }
-      }
-    }
-    return false
-  }
-  if e is Ident {
-    // A value-union ident narrowed to a kind-7 i32-backed list atom classifies as an i32
-    // list first, since the binding's declared type is the union, not a plain list.
-    if unionIdentReadKind(exprIx, fnIx) == 7 { return true }
-    if valueAtomKind(narrowedValueAtomOf(e.identName)) == 7 { return true }
-    if paramArray(fnIx, e.identName) { return true }
-    if declaredArray(e.identName) { return true }
-    if globalIsArraySid(fnIx, sidOfNode(exprIx)) {
-      if !identShadowedByFrame(fnIx, e.identName) { return true }
-    }
-    // A nullable i32-list binding (kind 15) participates in the list machinery — narrowing
-    // is type-level, so every list op classifies the read as a list.
-    if paramNulList(fnIx, e.identName) { return true }
-    if declaredNulList(e.identName) { return true }
-    if globalIsNulListSid(fnIx, sidOfNode(exprIx)) {
-      if !identShadowedByFrame(fnIx, e.identName) { return true }
-    }
-    // A CAPTURED i32-list read (`store[k]` inside a closure capturing `store`).
-    return capturedKindOf(fnIx, e.identName) == "list"
-  }
-  // A list CONCAT `a + b` yields a NEW i32 list (collections-design §VL.4).
-  if e is BinExpr {
-    if e.binOp == "+" {
-      if (
-        exprArray(e.binLeft, fnIx) &&
-        !exprStringArray(e.binLeft, fnIx) &&
-        !exprRefArray(e.binLeft, fnIx)
-      ) {
-        return exprArray(e.binRight, fnIx)
-      }
-    }
-    // `m[k] ?? d` over an i32-LIST-valued map (`{[string]: i32[]}`) yields the value i32 list.
-    if e.binOp == "??" {
-      if mvListValKind(coalesceMvSlot(exprIx, fnIx)) == "list" { return true }
-      // The non-map `p ?? d` over the i32-list niche is the i32-list wrapper in both halves —
-      // only nullability changes, matching `exprNullableList`'s own `??` arm.
-      if exprNullableList(e.binLeft, fnIx) { return true }
-    }
-    return false
-  }
-  // A field read `p.items` whose struct field is an `i32[]` (code 4) yields the i32 list
-  // wrapper ref; a nullable list field (code 18) classifies the same way.
-  if e is Member {
-    if memFieldTypeCode(exprIx, fnIx) == 4 { return true }
-    if memFieldTypeCode(exprIx, fnIx) == 18 { return true }
-  }
-  // `m[i]` over an `i32[][]` ref list (element kind 4) yields the INNER i32 list,
-  // so a chained `m[i][j]` / `m[i].length` treats it as a list.
-  if e is Index {
-    if nestedRefListElemIs(e.idxArr, fnIx, 4) { return true }
-    // A bare `m[k]` over an i32-LIST-valued map yields the value i32 list (`V | null` — the
-    // list machinery recovers non-null at the read site).
-    if mvListValKind(mapReadMvSlot(exprIx, fnIx)) == "list" { return true }
-  }
-  false
+  exprListRep(exprIx, fnIx) == "list"
 }
 
 // True if the `LetDecl` at `letIx` declares an array-typed local: its annotation is an
@@ -32643,21 +32525,6 @@ export function letAnnVariantIdx(letIx: i32) {
     }
   }
   -1
-}
-
-// True if indexing `idxArr`, a `T[][]` ref list whose inner element kind is `elemKind`, yields
-// the inner non-null `T[]`.
-function nestedRefListElemIs(idxArr: i32, fnIx: i32, elemKind: i32) {
-  if exprRefArray(idxArr, fnIx) {
-    const slot = refListSlotOfExpr(idxArr, fnIx)
-    if slot >= 0 && slot < rlElemKindTbl.length {
-      // A nullable-niche element (kinds 6/7/8/10 with the `| null` slot key) reads as the
-      // nullable leaf list, not the non-null one — claiming it here would mis-route the read.
-      if rlElemNullable[slot] == 1 { return false }
-      if rlElemKindTbl[slot] == elemKind { return true }
-    }
-  }
-  false
 }
 
 // ── string-array-typedness of expressions (`string[]`) ──────────────────────────
