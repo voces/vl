@@ -5286,10 +5286,12 @@ bracket is a parse error today too. Three edges are part of the rule:
   `takeSep` reads that newline off `P.pos - 1` to refuse a cross-line missing-comma insert —
   consuming it unconditionally would turn a missing closer at end of line back into a missing
   comma that swallows the next statement.
-* **`vl fmt` normalises it away, and that is fine.** The formatter prints operators TRAILING,
-  so it rewrites the leading spelling; what the gate requires is that the new spelling parses
-  and that fmt's output for it re-parses and means the same thing (`tests/vl_paren_newline_test.ts`).
-  Author-break preservation stays out, exactly as in the leading-dot ruling.
+* **`vl fmt` normalises it, and that is fine.** The formatter prints operators in ONE
+  position whatever the author wrote (leading since 2026-09-24, see "`vl fmt` puts a broken
+  chain's operator at the start of the line" below); what the gate requires is that both
+  spellings parse and that fmt's output re-parses and means the same thing
+  (`tests/vl_paren_newline_test.ts`). Author-break preservation stays out, exactly as in the
+  leading-dot ruling.
 
 ## A line beginning with a token that cannot start an expression continues the previous expression (2026-09-04)
 
@@ -5342,6 +5344,39 @@ the token stream. Precedence is untouched: the operator is handed to the same cl
 `a` ⏎ `|| b` ⏎ `&& c` groups as `a || (b && c)`, exactly as the one-line spelling does. `vl fmt`
 normalises the layout away and that stays fine — the third ruling on this axis to say so, after
 the leading dot and D1581.
+
+
+## `vl fmt` puts a broken chain's operator at the start of the line (2026-09-24)
+
+**Ruling** (owner). When `vl fmt` breaks a binary-operator chain that does not fit the width,
+the operator LEADS each continuation line — the rustfmt / black / PEP 8 convention — one
+operand per line as before:
+
+```vl
+const s = hex(ld32(g), 8)
+  + "-"
+  + hex(ld32(g + 4), 4)
+```
+
+Only the operator moves. Which chains break, the flattening by precedence, and the
+indentation are unchanged, and so is the forced-paren form of an over-wide `if`/`while`
+condition, whose operands now lead with `&&` / `||` inside the parens.
+
+**A chain holding a `-` link keeps every operator trailing.** The ruling above excludes `-`
+from the line-continuing set: outside brackets `a` ⏎ `- b` is two statements, and at a
+binding it is a silent value change (`const v = a` then a discarded `-b`), not an error.
+The formatter does not track bracket depth, so it cannot know when a leading `-` would be
+safe; trailing is correct everywhere, and keeping the WHOLE chain trailing rather than only
+the `-` link avoids a chain that mixes both placements. The forced-paren condition is the
+one place the depth is known — the formatter wrote the `(` — so its operands always lead.
+
+Every other operator was graded leading-vs-trailing in fifteen positions (both bindings,
+assignment, `return`, a bare tail value, a call argument on its own line and inline, an
+array element, an object field, a lambda expression body and block body, a condition, the
+forced-paren condition, a parenthesised expression): all agree. (A string `+` in an object
+field is check-clean invalid wasm in BOTH spellings — D2305, a defect of the field, not of the
+break.) The reformat that landed the ruling was whitespace-only by construction and was
+proven so by a byte-identical seed.
 
 ## One name may not bind two IMPORTS, and the test is on the resolved DECLARATION (D1120, 2026-09-02)
 

@@ -246,3 +246,17 @@ Write the `-` at the end of the previous line, or parenthesize, to subtract acro
 same holds for a line beginning with `!`, `(`, `[`, `{`, an identifier or a literal: each can
 start a statement, so each does. Inside an open `(`, `[` or object-literal `{` there is no
 statement a newline could end, so `-` continues there like everything else.
+
+`vl fmt` prints a chain it has to break with the operator at the START of each continuation
+line, one operand per line — except a chain with a `-` in it, which keeps every operator at the
+end of the line for the reason above:
+
+```vl
+const label = prefix
+  + ": "
+  + describe(value)
+
+const span = end -
+  start +
+  padding
+```
