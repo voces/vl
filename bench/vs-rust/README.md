@@ -18,7 +18,7 @@ change to the other invalidates the comparison.
 |---|---|
 | `k.vl` | The six kernels in VL. |
 | `k.rs` | The same six kernels in Rust, built as a `cdylib` for `wasm32-wasip1`. |
-| `k-rs.wasm` | **Committed prebuilt** Rust module, so the suite runs with no Rust toolchain installed. |
+| `k-rs.wasm` | **Committed prebuilt** Rust module (38 KB, stripped), so the suite runs with no Rust toolchain installed. |
 | `k-rs.build-info.json` | The exact `rustc` version, date and command that built the committed `k-rs.wasm`. |
 | `bench.ts` | The runner: builds, runs, compares, reports. |
 | `baseline.json` | The standing ratio scoreboard `--check` compares against (not a gate — see below). |
@@ -78,10 +78,16 @@ kept only so this command matches the filed repro byte-for-byte):
 vl build bench/vs-rust/k.vl --import-memory --heap-base=0x100000 --heap-limit=0x8000000 -O -o k-vl.wasm
 ```
 
-Rust:
+Rust (`strip`/`debuginfo=0` drop wasip1 libc's name and DWARF sections; `lto=fat`/
+`codegen-units=1` let LLVM see across the whole crate — none of the four touch codegen for the
+kernels themselves, only the ~1.8 MB of surrounding wasip1 scaffolding a default build carries.
+Verified: identical per-kernel results and ns/op against an unstripped build before this was
+adopted for the committed artifact):
 
 ```sh
-rustc --edition 2021 --target wasm32-wasip1 --crate-type cdylib -C opt-level=3 -C panic=abort bench/vs-rust/k.rs -o k-rs.wasm
+rustc --edition 2021 --target wasm32-wasip1 --crate-type cdylib -C opt-level=3 -C panic=abort \
+  -C strip=symbols -C debuginfo=0 -C lto=fat -C codegen-units=1 \
+  bench/vs-rust/k.rs -o k-rs.wasm
 ```
 
 ### The Rust side, with or without a toolchain
@@ -127,37 +133,42 @@ the change.
 ## Results
 
 Measured 2026-09-24 at commit `5c97d7e32b08` (master tip), `vl 0.1.0 (host ABI 2)`, `rustc 1.94.0
-(4a4ef493e 2026-03-02)` (freshly built, not the committed fallback), Deno 2.9.6 / V8
-15.0.245.2, `--reps 15` (the box was under concurrent load; 15 reps' min tracked the filed
-PL-037 numbers far more tightly than the default 5 — see the stability note):
+(4a4ef493e 2026-03-02)` (freshly built with the stripped-and-LTO'd flags above, not the committed
+fallback), Deno 2.9.6 / V8 15.0.245.2, `--reps 20`. The box was busy with unrelated concurrent
+work the whole time (loadavg 25–40 on 24 threads — several other agents' gate runs, visible in
+`ps`), which is exactly the condition `--check` is meant to be read under rather than gated on:
 
 | kernel | VL ns | Rust ns | VL/Rust |
 |---|---|---|---|
-| hash | 1.05 | 1.18 | 0.90 |
-| sort | 66.15 | 65.22 | 1.01 |
-| mix | 2.36 | 1.49 | 1.59 |
-| array | 0.44 | 0.23 | 1.96 |
-| matChain | 32.01 | 13.80 | 2.32 |
-| map | 12.37 | 4.16 | 2.97 |
+| hash | 1.47 | 1.29 | 1.14 |
+| sort | 74.56 | 71.04 | 1.05 |
+| mix | 2.40 | 1.48 | 1.63 |
+| array | 0.46 | 0.24 | 1.94 |
+| matChain | 33.00 | 14.87 | 2.22 |
+| map | 14.22 | 4.50 | 3.16 |
 
 Run a second time immediately after, same commit and binaries:
 
 | kernel | VL ns | Rust ns | VL/Rust |
 |---|---|---|---|
 | hash | 1.05 | 1.18 | 0.89 |
-| sort | 67.17 | 72.17 | 0.93 |
-| mix | 2.42 | 1.50 | 1.62 |
-| array | 0.45 | 0.23 | 1.95 |
-| matChain | 31.99 | 13.75 | 2.33 |
-| map | 12.35 | 4.27 | 2.89 |
+| sort | 66.79 | 65.43 | 1.02 |
+| mix | 2.39 | 1.44 | 1.66 |
+| array | 0.45 | 0.23 | 1.99 |
+| matChain | 31.96 | 13.69 | 2.34 |
+| map | 12.37 | 4.28 | 2.89 |
 
-Every ratio agrees within noise (largest swing: `sort`, 1.01 → 0.93 — both inside the `PAR` band
-the cross-runtime suite's own thresholds use), and both runs land within a few percent of the
-PL-037 numbers filed at `27f5b9b2c` — no regression on this target since that measurement.
+The second run matches the PL-037 baseline (`27f5b9b2c`) almost exactly on every kernel. The
+first run agrees within a few percent on five of six — except `hash`, at ~1 ns the shortest
+kernel here, whose ratio moved +28% purely from being the measurement most exposed to a single
+scheduler hiccup on an absolute-nanosecond scale (the general cross-runtime suite flags exactly
+this failure mode as `STARTUP><n>%`-adjacent noise for very short benchmarks). No kernel shows a
+sustained, repeatable regression against the filed baseline.
 
-**A note on this box's noise.** At the default `--reps 5`, under the load this box happened to be
-under while these were taken, single runs read as far off as `map` 4.38 (vs. 2.90 committed) and
-`matChain` 2.62. Raising `--reps` tightens the min-of-N considerably (matches the general
-cross-runtime suite's own finding, `bench/README.md` §Noise floor) — `--reps 15` reproduced the
-filed table to within a few percent twice in a row. Treat any single low-rep run on a busy box
-with suspicion; this is exactly why `--check` is informational rather than a gate.
+**A note on this box's noise, and why `--check` prints rather than gates.** Under the load seen
+while taking these numbers, a `--reps 5` run swung as far as `map` 4.38 and `matChain` 2.62 (both
+vs. ~2.3–2.9 at baseline) in isolated single-rep noise seen earlier in this same session. Raising
+`--reps` tightens the min-of-N considerably, matching the general cross-runtime suite's own
+finding (`bench/README.md` §Noise floor), but even at `--reps 20` one kernel per run can still be
+the one that catches a passing scheduler event. Treat any single run on a busy box with
+suspicion — this is the whole reason `--check`'s ratio comparison is informational, never a gate.

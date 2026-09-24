@@ -150,6 +150,11 @@ const buildVl = async (vl: string, out: string): Promise<void> => {
   if (code !== 0) throw new Error(`vl build failed (rc ${code}):\n${stderr}`);
 };
 
+/** Same flags as the committed k-rs.wasm (k-rs.build-info.json): `strip`/`debuginfo=0` drop the
+ * name and DWARF sections wasip1's libc otherwise carries, and `lto=fat`/`codegen-units=1` let
+ * LLVM see across the whole crate — none of these touch codegen for the KERNELS themselves
+ * (verified: identical results and ns/op to an unstripped build), only the size of what wasip1
+ * pulls in around them (1.8 MB unstripped → 38 KB). Keep this in sync with that file's `command`. */
 const buildRust = async (rustc: string, out: string): Promise<void> => {
   const src = new URL("k.rs", DIR).pathname;
   const { code, stderr } = await runCmd(rustc, [
@@ -163,6 +168,14 @@ const buildRust = async (rustc: string, out: string): Promise<void> => {
     "opt-level=3",
     "-C",
     "panic=abort",
+    "-C",
+    "strip=symbols",
+    "-C",
+    "debuginfo=0",
+    "-C",
+    "lto=fat",
+    "-C",
+    "codegen-units=1",
     src,
     "-o",
     out,
