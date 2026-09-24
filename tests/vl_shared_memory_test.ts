@@ -619,9 +619,23 @@ Deno.test({
   },
 });
 
+// The build decides `__memory_shared__()`: the corpus fixture pins the default face, this the
+// shared one — the folded `if`s run their bodies, and the `if`/`else` takes its first arm.
+Deno.test({
+  name: "shared-memory: __memory_shared__() is true in a shared build, at every folded site",
+  ignore: !ENABLED,
+  async fn() {
+    const fixture = `${ROOT}/tests/cases/memory/memory-shared-default-build.vl`;
+    const plain = await vl(["run", "--compiler", COMPILER, fixture]);
+    eq(plain.out.trim().split("\n"), ["false", "1", "2", "3"], `default build: ${plain.err}`);
+    const shared = await vl(["run", "--compiler", COMPILER, "--shared-memory=2", fixture]);
+    eq(shared.out.trim().split("\n"), ["true", "100", "100", "11", "100"], `shared build: ${shared.err}`);
+  },
+});
+
 // std:buffer's allocator grows the memory on demand; past the max it traps rather than handing
 // out a `Buf` with no memory behind it.
-const ALLOC = `import { Buffer, loadI32, storeI32 } from "std:buffer"
+const ALLOC =`import { Buffer, loadI32, storeI32 } from "std:buffer"
 const a = Buffer(100000)
 a.storeI32(99996, 7)
 print(a.loadI32(99996))
