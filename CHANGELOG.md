@@ -863,6 +863,29 @@ new: the compare-frame pre-pass never recurses into a code-15 field, so a NESTED
 
 ## Codegen, memory & runtime (Track B)
 
+- **Two sibling blocks INSIDE A FUNCTION binding one closure name no longer collapse onto
+  the first block's signature (D2316).** `function f(): string { { const g = () => 1.5;
+  out = "\{g()}" } { const g = () => "s"; out = out + g() } }` was `vl check` rc 0 and
+  `type mismatch: expected (ref $type), found f64` at emit — the second block's call was
+  classified with the first block's f64 return. `parentLetOfSid`, the function-scope table
+  every closure-signature reader (`calleeCloSigKeyAt` and its `calleeRetKindAt`/
+  `calleeReturns*At`/`identClosureFeAt`/`identFnTypeAnnName*`/`identCopySource*` callers)
+  chases a bare binding through, was first-write-wins with no duplicate-name handling at
+  all — unlike its module-scope twin (`mllMap`/`moduleLocalLetOfAt`, D1751), which already
+  positions a reader among sibling MODULE blocks. `parentLetOfAt` is the function-scoped
+  twin, threaded through the same ladder D1862 positioned for the call-statement void
+  decision. A fourteen-case matrix (differing param types; every adjacent return-type pair
+  over i32/f64/string/struct/list/nullable; nested blocks; a block inside a loop; if/else
+  arms; match arms; module level; a captured local reused by name in a sibling block; a
+  closure name reused for a non-closure value) moves from 12 of 14 invalid wasm to 14 of 14
+  RUNS — module level and closure-then-non-closure already ran. The same mechanism closes
+  **D1935** (a field-source capture's `nulstruct` classification lost under a duplicate
+  block-local name, deferred to "a future `(name, frame)` sweep" when filed). Measured: 0 of
+  256,113 distilled-corpus cells moved, rep-fuzz exact, capability probes unchanged at 0 of
+  198 clause-1 breaks, 4025 of 4025 ci-native tests pass. Fixtures
+  `tests/cases/closures/sibling-fn-blocks-*.vl` (14 files) and
+  `capture-block-nullable-field-source-duplicate-names.vl`.
+
 - **Integer SIMD intrinsics: the wasm integer SIMD set, one raw intrinsic per instruction
   (plumb PL-026, `simd-design.md` tier 1).** plumb's V8 profile put 48.5% of its CPU in
   SSE2/SSSE3 helpers written lane by lane (`pmaddubsw`, `punpck*`, `paddsw`, `psubusb`,
