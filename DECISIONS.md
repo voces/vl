@@ -7432,7 +7432,7 @@ on a shared `acc` takes 0.77 s against 0.12 s unshared (6.4x, the same at `-O`, 
 escapes into the closure); the same loop with a `%` in it is +2%. Compile cost: guest fuel
 +0.15% on the plumb-shape unit (9,080,340,986 → 9,094,068,473 in review; 9,096,474,433, +0.18%,
 after the D2342/D2343 fixes) and +0.11% on `chunk_662`, whose output is byte-identical; peak RSS
-unchanged; the seed grew 16,473 bytes (+0.58%).
+unchanged; the seed grew 17,190 bytes (+0.61%).
 
 **FOLLOW-UPS, not built.** The cell is a one-element growable list because D2285 built it that
 way; a one-field mutable struct would drop the list header and bounds check from every access.
