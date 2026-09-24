@@ -35,6 +35,13 @@ which delivers the deferred runtime-index fallback without a spill; a plain `i32
 D1980 is closed. Vectors inside containers (D1981) and function values (D1982) are refused
 loudly. Implementation notes: `docs/internals/std-notes.md` §`std:simd`.
 
+**Build status (2026-09-23): S4's tier 1 shipped — the raw integer intrinsics (plumb PL-026).**
+Every wasm integer SIMD instruction is now a raw `__…__` intrinsic over `v128` (§G1 lists them
+and their naming). The typed tier 2 — `I32x4`/`I16x8`/`U8x16`/`I64x2`, their masks, and the
+named `std:simd` functions over them (§D1, §D4) — is **not built**: the owner has not ruled on
+its std surface, so no `std:simd` export was added. plumb, which asked only for 1:1 raw
+operations, uses tier 1 directly.
+
 **Status: the design is finalized; this is not a build ticket.** All ten open questions in §F are
 now ruled. The build itself stays gated on two prerequisites: the `std:math` deterministic numeric
 substrate (`docs/internals/std-math-design.md`, DESIGNED but not yet built — ROADMAP row 34) that
@@ -648,7 +655,9 @@ The smallest slices, in dependency order (the `buffer-design.md` §F discipline)
   ordinary methods on `F32x4` (O7 — no separate later layer). This is the whole rigid-body solver's
   need — the first thing that lets veldt measure the 4×.
 - **S4 — the integer + narrow shapes** (`I32x4`, `I16x8`, `U8x16`, widening loads, `dot`, `swizzle`).
-  This is the voxel-pass need and the `flat`-record interop (§D5).
+  This is the voxel-pass need and the `flat`-record interop (§D5). **Tier 1 shipped (§G1):** the
+  raw intrinsics for every integer instruction. Tier 2, the typed `std:simd` surface, awaits the
+  owner's ruling.
 - **S5 — relaxed SIMD (gated).** `-mrelaxed-simd`, FMA + relaxed dot, strict fallback (O6).
 - **Later, separable:** a checked `v128view`, aligned loads (O5), a `@simd`-loop hint (axis 2). A
   general static `shuffle<…>` stays unplanned rather than merely deferred — O10 rules the fixed
@@ -658,6 +667,41 @@ The smallest slices, in dependency order (the `buffer-design.md` §F discipline)
 **The first slice that gives veldt something real: S0–S3** — `F32x4` load/store/arith/compare over a
 `Buf`. It is the rigid-body solver's entire surface, and it lets veldt retire the "~4x off" number
 against a real kernel while S4's voxel shapes are built.
+
+### G1. Tier 1: the raw intrinsics
+
+One table, `simdTableBuild` in `compiler/typecheck.vl`, holds every SIMD intrinsic: its name,
+its `0xFD` sub-opcode, its operand shape and, for a lane row, the highest lane. The checker's
+declarations, its definition reservation and lane-literal check, the emitter's dispatch and the
+import scan all read it, so adding an instruction is one row. Each takes and gives a bare `v128`
+(O9 still holds for std: no `std:simd` export exposes one).
+
+**Naming.** The wasm instruction `<shape>.<op>` is `__<op>_<shape>__`, with the signedness
+suffix where wasm puts it: `i16x8.add_sat_s` is `__add_sat_s_i16x8__`, `i8x16.extract_lane_u`
+is `__extract_lane_u_i8x16__`, `v128.and` is `__and_v128__`. An op whose wasm name already
+names its source shape drops the result shape, since the source decides it:
+`i8x16.narrow_i16x8_u` is `__narrow_i16x8_u__`, `i16x8.extend_low_i8x16_u` is
+`__extend_low_i8x16_u__`, `i32x4.dot_i16x8_s` is `__dot_i16x8_s__`, `f32x4.convert_i32x4_s` is
+`__convert_i32x4_s__`. Loads keep wasm's `v128.` prefix: `__load8x8_u_v128__`,
+`__load32_splat_v128__`, `__load64_zero_v128__`.
+
+| family | intrinsics (per shape where it applies) |
+| --- | --- |
+| arithmetic | `add` `sub` (all four integer shapes); `mul` (i16x8, i32x4, i64x2); `add_sat_s/u` `sub_sat_s/u` `avgr_u` (i8x16, i16x8); `min_s/u` `max_s/u` (i8x16, i16x8, i32x4); `abs` `neg` (all four); `popcnt` (i8x16); `q15mulr_sat_s` (i16x8); `dot_i16x8_s`; `extmul_low/high_<src>_s/u` and `extadd_pairwise_<src>_s/u` |
+| bitwise | `and` `or` `xor` `andnot` `not` `bitselect` on `v128` |
+| shifts | `shl` `shr_s` `shr_u` on all four shapes; the count is an `i32`, taken modulo the lane width |
+| compares | `eq` `ne` on all four; `lt/gt/le/ge_s/u` on i8x16, i16x8, i32x4; `lt/gt/le/ge_s` on i64x2 (wasm has no unsigned i64x2 compare) |
+| reductions | `any_true_v128`; `all_true` and `bitmask` on all four, answering an `i32` |
+| shape changes | `narrow_i16x8_s/u`, `narrow_i32x4_s/u`; `extend_low/high_<src>_s/u` for i8x16, i16x8, i32x4; `trunc_sat_f32x4_s/u`, `convert_i32x4_s/u` |
+| lanes | `splat`, `extract_lane` (`_s/_u` for i8x16 and i16x8) and `replace_lane` on all four; i64x2's take and give an `i64` |
+| shuffle | `__shuffle_i8x16__(a, b, l0, …, l15)`, each lane a literal in 0..31; `__swizzle_i8x16__(a, idx)` (an index of 16 or more gives 0) |
+| loads | `load8x8/16x4/32x2_s/u`, `load8/16/32/64_splat`, `load32/64_zero` (unaligned, like `__load_v128__`) |
+
+Every lane index is a compile-time literal, checked against its shape's range where the call is
+written; a non-literal or out-of-range index is refused with the range in the message. The
+graded evidence is `tests/cases/simd/int-*.vl`, generated by `scripts/gen-simd-int-cases.py`
+from an independent model of the spec's lane semantics and run on V8 and wasmtime. Not in tier
+1: `load*_lane`/`store*_lane`, the `f64x2` shape and relaxed SIMD (O6).
 
 ### Where the code would go
 
@@ -684,6 +728,6 @@ against a real kernel while S4's voxel shapes are built.
   outright (`redeclared +`) independent of ergonomics — and **#3003** shipped the fix, generalizing
   B14's receiver-keyed exception. Cheap in the end: byte-identical on every existing program
   (tests/cases, the distilled corpus, and the compiler's own 31 modules), additive only.
-- **The exact intrinsic count.** ~60 is an estimate over the shapes in §D; the precise list falls out
-  of the op set the owner has now ruled on — O4's broadened scope and O7's added geometry
-  methods both move it up from the ~60 estimate.
+- ~~The exact intrinsic count.~~ **Resolved by building it:** tier 1 is 191 intrinsics, the
+  whole integer set plus the f32x4 slice (§G1). The ~60 estimate counted the typed surface's
+  needs, not the instruction set.
