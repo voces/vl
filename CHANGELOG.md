@@ -1634,20 +1634,31 @@ new: the compare-frame pre-pass never recurses into a code-15 field, so a NESTED
   `function mk(n: i32): Q { print("mk"); { x: n } }` was a parse error: `looksLikeObject`'s
   method-shorthand lookahead read `print("mk")` as a member signature (`print` the name,
   `"mk"` its first "parameter") whenever a `{` followed shortly after, regardless of what the
-  call's own arguments looked like. `parenLooksLikeParamList` now requires every top-level
-  argument to start with an identifier or `...` — what a real parameter always does and a
-  literal argument never does — before that reading is taken, at all four positions sharing
-  the lookahead (a function/getter/lambda body, a bare block statement, and both `if`/`else`
-  arms). The return type was never the ingredient, despite looking like one: it never mattered
+  call's own arguments looked like. Fixed by requiring the body `{` (or, with a return
+  annotation, the `:` before it) to sit on the SAME LINE as the parameter list's closing `)` —
+  the adjacency a real signature's body already requires everywhere else
+  (`parseFuncBodyAndBuild` never tolerated a newline there, so no existing method shorthand —
+  in `tests/cases/`, `std/`, `compiler/`, or `vl fmt`'s own output — was ever spelled that way),
+  at all three positions sharing the lookahead (a function/getter/lambda body, a bare block
+  statement, and the `else` arm of an `if` — never the `then` arm, which always requires a
+  brace block). The rule closes the two narrower shapes a first draft's positive,
+  item-shape check (requiring every argument to start with an identifier) could not — a
+  zero-argument call and a call with a single bare-identifier argument, both syntactically
+  identical to an equally-shaped parameter list — because neither can have its `{` on the same
+  line as a call's own closing `)` without ceasing to be two sibling statements. That first
+  draft was reverted in review: it never tracked `<…>` depth, so a multi-argument generic type
+  annotating a parameter (`Pair<i32, {[string]: i32}>`) had its own top-level comma misread as
+  a second parameter and rejected a genuine signature, reproducing this row's defect one layer
+  up. The return type was never the ingredient, despite looking like one: it never mattered
   whether it was a user record, a primitive, absent, generic, a union or a nominal `new` type.
-  Two narrower shapes — a zero-argument call and a call with a single bare-identifier argument,
-  each followed by a brace-led statement — are closed too, by a second rule: the `:` or the body
-  brace must sit on the same line as the closing `)`, matching the adjacency a real signature's
-  body already requires everywhere else (`parseFuncBodyAndBuild` never tolerated a newline
-  there, so no existing method shorthand — in `tests/cases/`, `std/`, `compiler/`, or `vl fmt`'s
-  own output — was ever spelled that way). Fixtures
-  `tests/cases/parser/call-first-stmt-then-brace-tail.vl`,
-  `tests/cases/parser/call-first-stmt-then-brace-tail-getter.vl`.
+  Fixtures `tests/cases/parser/call-first-stmt-then-brace-tail.vl`,
+  `tests/cases/parser/call-first-stmt-then-brace-tail-getter.vl`, and
+  `tests/vl_fmt_test.ts`'s dedicated same-line-shorthand test (the durable pin for a genuine
+  shorthand at this lookahead — `vl fmt` canonicalises the shape away, so a `tests/cases/`
+  fixture cannot stay fmt-clean and keep exercising it). D2293 (a next-line body brace produces
+  a confusing diagnostic instead of naming the adjacency rule) and D2294 (an unrelated
+  negation-type-in-generic-argument checker gap this row's fixture work surfaced) are filed
+  open.
 - **Every bitwise and shift operator has its compound form, `&= |= ^= <<= >>= >>>=`, and so does
   `%` (plumb PL-021).** `x ^= y` was `expected an expression but found EQUAL`. Each is `x = x op
   (y)`: seven new token kinds, one `isCompoundAssign` predicate the climber, `rightAssoc` and

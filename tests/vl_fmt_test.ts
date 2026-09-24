@@ -3024,6 +3024,65 @@ Deno.test({
   },
 });
 
+// D2292 — the same shorthand, positioned so `looksLikeObject`'s own lookahead decides the
+// enclosing `{` is an object rather than a block, not `parseObjLit`'s disjoint shorthand arm
+// (which the test above exercises via `const o = { … }`, an expression position with no
+// block/object ambiguity to resolve). `vl fmt` canonicalises every shorthand to an arrow field,
+// so a fixture under `tests/cases/` cannot stay fmt-clean AND keep exercising this branch —
+// only a raw, unformatted source read here can.
+Deno.test({
+  name: "vl-fmt: a same-line method shorthand as a function body's sole member is an object, not a block",
+  ignore: !ENABLED,
+  fn: async () => {
+    const src = [
+      "function mk1() {",
+      '  greet() { "hi" }',
+      "}",
+      "print(mk1().greet())",
+      "",
+      "function mk2() {",
+      "  double(n: i32) { n * 2 }",
+      "}",
+      "print(mk2().double(4))",
+      "",
+    ].join("\n");
+    const r = await run([], src);
+    if (r.code !== 0) {
+      throw new Error(`vl fmt rejected the shorthand (rc ${r.code}):\n${r.err}`);
+    }
+    for (const arrow of ["greet: () => {", "double: (n: i32) => {"]) {
+      if (!r.out.includes(arrow)) {
+        throw new Error(`the shorthand did not canonicalise to \`${arrow}\`:\n${r.out}`);
+      }
+    }
+    const again = await run([], r.out);
+    if (again.out !== r.out) {
+      throw new Error(`the arrow form is not a fixed point:\n${again.out}`);
+    }
+    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_shorthand_body_" });
+    try {
+      const a = `${dir}/a.vl`;
+      const b = `${dir}/b.vl`;
+      await Deno.writeTextFile(a, src);
+      await Deno.writeTextFile(b, r.out);
+      const ra = await runOn("run", a);
+      const rb = await runOn("run", b);
+      if (ra.code !== 0 || rb.code !== 0) {
+        throw new Error(`a spelling did not run (${ra.code}/${rb.code}):\n${ra.err}${rb.err}`);
+      }
+      if (ra.out !== rb.out) {
+        throw new Error(`the two spellings printed differently:\n${ra.out}\n---\n${rb.out}`);
+      }
+      // Both spellings run as an object with a method — never as a block whose two statements
+      // are an unrelated call and a discarded trailing brace.
+      if (ra.out !== "hi\n8\n") {
+        throw new Error(`expected \`hi\\n8\\n\`, got ${JSON.stringify(ra.out)}`);
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
 
 // D1880 — A MID-FILE `import` IS HOISTED ALONE, NOT WITH THE FILE'S COMMENTS.
 //
