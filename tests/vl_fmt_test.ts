@@ -3024,6 +3024,148 @@ Deno.test({
   },
 });
 
+// D2292 — a CONTROL: the same shorthand, positioned so `looksLikeObject`'s own lookahead
+// decides the enclosing `{` is an object rather than a block, not `parseObjLit`'s disjoint
+// shorthand arm (which the test above exercises via `const o = { … }`, an expression position
+// with no block/object ambiguity to resolve). `vl fmt` canonicalises every shorthand to an
+// arrow field, so a fixture under `tests/cases/` cannot stay fmt-clean AND keep exercising this
+// branch — only a raw, unformatted source read here can. This proves genuine same-line
+// shorthand still resolves as a method; it does NOT exercise the same-line REQUIREMENT itself
+// (both cases here already have their `{` on the same line) — the sibling test below does that.
+Deno.test({
+  name: "vl-fmt: a same-line method shorthand as a function body's sole member is an object, not a block",
+  ignore: !ENABLED,
+  fn: async () => {
+    const src = [
+      "function mk1() {",
+      '  greet() { "hi" }',
+      "}",
+      "print(mk1().greet())",
+      "",
+      "function mk2() {",
+      "  double(n: i32) { n * 2 }",
+      "}",
+      "print(mk2().double(4))",
+      "",
+    ].join("\n");
+    const r = await run([], src);
+    if (r.code !== 0) {
+      throw new Error(`vl fmt rejected the shorthand (rc ${r.code}):\n${r.err}`);
+    }
+    for (const arrow of ["greet: () => {", "double: (n: i32) => {"]) {
+      if (!r.out.includes(arrow)) {
+        throw new Error(`the shorthand did not canonicalise to \`${arrow}\`:\n${r.out}`);
+      }
+    }
+    const again = await run([], r.out);
+    if (again.out !== r.out) {
+      throw new Error(`the arrow form is not a fixed point:\n${again.out}`);
+    }
+    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_shorthand_body_" });
+    try {
+      const a = `${dir}/a.vl`;
+      const b = `${dir}/b.vl`;
+      await Deno.writeTextFile(a, src);
+      await Deno.writeTextFile(b, r.out);
+      const ra = await runOn("run", a);
+      const rb = await runOn("run", b);
+      if (ra.code !== 0 || rb.code !== 0) {
+        throw new Error(`a spelling did not run (${ra.code}/${rb.code}):\n${ra.err}${rb.err}`);
+      }
+      if (ra.out !== rb.out) {
+        throw new Error(`the two spellings printed differently:\n${ra.out}\n---\n${rb.out}`);
+      }
+      // Both spellings run as an object with a method — never as a block whose two statements
+      // are an unrelated call and a discarded trailing brace.
+      if (ra.out !== "hi\n8\n") {
+        throw new Error(`expected \`hi\\n8\\n\`, got ${JSON.stringify(ra.out)}`);
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
+
+// D2292 — the REGRESSION PIN, unlike the control above: each case here is a call whose
+// argument list `parenLooksLikeParamList`'s removed positive check could never rule out on
+// shape alone (zero arguments, a bare-identifier argument), reached through the same
+// `looksLikeObject` LPAREN branch, with its `{` on the NEXT LINE — the shape that misparsed
+// before this row and is closed only by the same-line rule. Raw, unformatted source for the
+// same reason as the control: `vl fmt` never emits a call statement adjacent to a brace-led
+// one without a line break between them, so this shape does not survive as a `tests/cases/`
+// fixture (mk14/mk16 in call-first-stmt-then-brace-tail.vl commit it anyway, post-format,
+// since neither is shorthand and both are already fmt-clean — this test exercises the exact
+// same programs through a second, independent harness).
+Deno.test({
+  name: "vl-fmt: a call followed by a newline then a brace-led tail is a block, never a method",
+  ignore: !ENABLED,
+  fn: async () => {
+    const cases: Array<{ src: string; want: string }> = [
+      {
+        src: [
+          "type Q = { x: i32 }",
+          "function mk(n: i32): Q {",
+          '  print("mk")',
+          "  { x: n }",
+          "}",
+          "print(mk(3).x)",
+          "",
+        ].join("\n"),
+        want: "mk\n3\n",
+      },
+      {
+        src: [
+          "type Q = { x: i32 }",
+          "function foo() { print(\"foo\") }",
+          "function mk(n: i32): Q {",
+          "  foo()",
+          "  { x: n }",
+          "}",
+          "print(mk(3).x)",
+          "",
+        ].join("\n"),
+        want: "foo\n3\n",
+      },
+      {
+        src: [
+          "type Q = { x: i32 }",
+          "function mk(n: i32): Q {",
+          "  print(n)",
+          "  { x: n }",
+          "}",
+          "print(mk(3).x)",
+          "",
+        ].join("\n"),
+        want: "3\n3\n",
+      },
+    ];
+    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_call_then_brace_" });
+    try {
+      for (const [i, c] of cases.entries()) {
+        const r = await run([], c.src);
+        if (r.code !== 0) {
+          throw new Error(`case ${i}: vl fmt rejected a plain call-then-brace block (rc ${r.code}):\n${r.err}`);
+        }
+        // Not shorthand, so formatting is a no-op — a change here would mean the shape was
+        // read as something other than a call statement followed by an object statement.
+        if (r.out !== c.src) {
+          throw new Error(`case ${i}: vl fmt changed a call-then-brace block:\n${r.out}`);
+        }
+        const f = `${dir}/case${i}.vl`;
+        await Deno.writeTextFile(f, c.src);
+        const rr = await runOn("run", f);
+        if (rr.code !== 0) {
+          throw new Error(`case ${i}: did not run (rc ${rr.code}):\n${rr.err}`);
+        }
+        if (rr.out !== c.want) {
+          throw new Error(`case ${i}: expected ${JSON.stringify(c.want)}, got ${JSON.stringify(rr.out)}`);
+        }
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
 
 // D1880 — A MID-FILE `import` IS HOISTED ALONE, NOT WITH THE FILE'S COMMENTS.
 //
