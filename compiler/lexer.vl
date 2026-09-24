@@ -154,6 +154,11 @@ let gLine = 1
 let gCol = 0
 let gDiags: Diag[] = []
 let gComments: Comment[] = []
+// The short-lexeme intern table (`lexText`): open addressing, a power-of-two size, a slot
+// empty while its value is "". `gInUsed` counts the filled slots.
+let gInKey: i32[] = []
+let gInVal: string[] = []
+let gInUsed = 0
 
 // An interpolated literal is context-sensitive: the `}` that ends a hole is spelled like
 // the one that closes a block, and the `{` depth (`gBrace`) against the depth each open
@@ -455,13 +460,55 @@ function decodeSimpleEscape(e: i32) {
 // ---- token builder -------------------------------------------------------
 
 function mkTok(kind: TokKind, start: i32, startLine: i32, startCol: i32): Tok {
-  {
-    kind: kind,
-    text: gSrc.slice(start, gPos),
-    start: start,
-    line: startLine,
-    col: startCol,
+  mkTokText(kind, lexText(start, gPos), start, startLine, startCol)
+}
+
+function mkTokText(kind: TokKind, text: string, start: i32, startLine: i32, startCol: i32): Tok {
+  { kind: kind, text: text, start: start, line: startLine, col: startCol }
+}
+
+// The lexeme `gSrc[a, b)`. One of at most four bytes is interned for the rest of this lex,
+// so every occurrence of `(`, a newline or a short name shares one string (D2318). A miss on
+// a full table, or a longer lexeme, is a fresh slice.
+function lexText(a: i32, b: i32): string {
+  const n = b - a
+  if n < 1 || n > 4 { return gSrc.slice(a, b) }
+  let key = 0
+  let i = a
+  while i < b {
+    key = (key << 8) | gSrc[i]
+    i = i + 1
   }
+  const mask = gInVal.length - 1
+  let h = (key ^ (key >>> 7) ^ (key >>> 17)) & mask
+  while gInVal[h].length > 0 {
+    if gInKey[h] == key && gInVal[h].length == n { return gInVal[h] }
+    h = (h + 1) & mask
+  }
+  const s = gSrc.slice(a, b)
+  if gInUsed * 2 < mask {
+    gInKey[h] = key
+    gInVal[h] = s
+    gInUsed = gInUsed + 1
+  }
+  s
+}
+
+// Empties the intern table for a new source, sized to it: a slot can hold a slice only of
+// the source being lexed, so an editor's instance never keeps an old file's bytes alive.
+function lexInternReset(srcLen: i32) {
+  let cap = 256
+  if srcLen >= 65536 { cap = 1024 }
+  if srcLen >= 1048576 { cap = 4096 }
+  const keys: i32[] = []
+  const vals: string[] = []
+  while keys.length < cap {
+    keys.push(0)
+    vals.push("")
+  }
+  gInKey = keys
+  gInVal = vals
+  gInUsed = 0
 }
 
 // Scan the digit run of a base-prefixed integer (`0x`/`0b`/`0o`), the prefix already
@@ -753,6 +800,7 @@ export function tplPartStrLex(raw: string): string {
 export function tokenize(source: string): LexResult {
   // Reset the module-global scanner state for this run.
   gSrc = source
+  lexInternReset(source.length)
   gPos = 0
   gLine = 1
   gCol = 0
@@ -828,8 +876,8 @@ export function tokenize(source: string): LexResult {
     // Identifier / keyword.
     if isIdStart(c) {
       while gPos < gSrc.length && isIdPart(peek()) { advance() }
-      const text = gSrc.slice(startPos, gPos)
-      toks.push(mkTok(keywordKind(text), startPos, startLine, startCol))
+      const text = lexText(startPos, gPos)
+      toks.push(mkTokText(keywordKind(text), text, startPos, startLine, startCol))
       continue
     }
 

@@ -1031,6 +1031,12 @@ fn parse_byte_size(v: &str) -> Option<u64> {
 /// prints "Begin copying collection" once per cycle at `log::Level::Trace`.
 static GC_COLLECTIONS: AtomicU64 = AtomicU64::new(0);
 
+/// The largest heap occupancy any collection left behind, from the same trace log
+/// ("After collection, GC heap's allocated bytes = 0x…"): the peak live set as seen at a
+/// collection. `vl build` prints it under `$VL_GC_STATS=1` next to the count.
+static GC_MAX_LIVE: AtomicU64 = AtomicU64::new(0);
+static GC_LAST_LIVE: AtomicU64 = AtomicU64::new(0); // CENSUS-TEMP
+
 struct GcStatsLog;
 
 impl log::Log for GcStatsLog {
@@ -1038,10 +1044,21 @@ impl log::Log for GcStatsLog {
         metadata.level() == log::Level::Trace && metadata.target().starts_with("wasmtime")
     }
     fn log(&self, record: &log::Record) {
-        if self.enabled(record.metadata())
-            && record.args().to_string().starts_with("Begin copying collection")
-        {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+        let msg = record.args().to_string();
+        if msg.starts_with("Begin copying collection") {
             GC_COLLECTIONS.fetch_add(1, Ordering::Relaxed);
+        } else if let Some(rest) = msg.strip_prefix("After collection, GC heap's allocated bytes = 0x") {
+            let hex = rest.split(' ').next().unwrap_or("");
+            if let Ok(n) = u64::from_str_radix(hex, 16) {
+                GC_MAX_LIVE.fetch_max(n, Ordering::Relaxed);
+                GC_LAST_LIVE.store(n, Ordering::Relaxed); // CENSUS-TEMP
+                if std::env::var_os("VL_GC_STATS_EACH").is_some() {
+                    eprintln!("vl: gc live {} KiB", n >> 10);
+                }
+            }
         }
     }
     fn flush(&self) {}
@@ -1128,7 +1145,9 @@ fn compile_engine(source_len: usize) -> Result<Engine> {
     }
     COMPILE_UNDER_NULL.store(!matches!(collector, Collector::Copying), Ordering::Relaxed);
     match collector {
-        Collector::Copying => seed_engine_sized(collector, Some(COPYING_COMPILE_HEAP_INITIAL)),
+        Collector::Copying => {
+            seed_engine_sized(collector, Some(compile_heap_initial(COPYING_COMPILE_HEAP_INITIAL)?))
+        }
         _ => seed_engine(collector),
     }
 }
@@ -1140,6 +1159,20 @@ const COPYING_COMPILE_THRESHOLD: usize = 3 << 19; // 1.5 MiB
 /// The copying compile's first GC heap, 192 MiB per semispace; the heap doubles from
 /// here. Starting from 0 costs CPU: the small early heaps collect over and over.
 const COPYING_COMPILE_HEAP_INITIAL: u64 = 384 << 20;
+
+/// The copying compile's first heap: `$VL_COMPILE_GC_HEAP` when set (the `$VL_GC_HEAP`
+/// syntax), else `default`. A measurement and memory-tight-box knob; a bad value is a
+/// hard error.
+fn compile_heap_initial(default: u64) -> Result<u64> {
+    match std::env::var("VL_COMPILE_GC_HEAP").ok().as_deref() {
+        None | Some("") => Ok(default),
+        Some(v) => parse_byte_size(v).ok_or_else(|| {
+            Error::msg(format!(
+                "unknown $VL_COMPILE_GC_HEAP `{v}` (bytes, or a number with a K, M or G suffix, at most 4G)"
+            ))
+        }),
+    }
+}
 
 fn compile_collector(source_len: usize) -> Result<Collector> {
     match std::env::var("VL_COMPILE_GC").ok().as_deref() {
@@ -3128,6 +3161,12 @@ fn compile_vl_instance(
     }
     // Dropping `vl-src` is an optimisation only: a seed without the export writes the
     // section, and the `-O` path strips it before binaryen runs either way.
+    // Every caller here compiles once on a fresh instance and drops it, so the compiler may
+    // release what it keeps for a later compile (the module token cache) once it has served
+    // this one (D2317). Optional, like `setEmitNames`: an older seed just keeps it.
+    if let Ok(set) = inst.get_typed_func::<i32, i32>(&mut store, "setOneShot") {
+        set.call(&mut store, 1)?;
+    }
     if emit_names == Names::NoSrcMap {
         if let Ok(set) = inst.get_typed_func::<i32, i32>(&mut store, "setEmitSrcMap") {
             set.call(&mut store, 0)?;
@@ -7604,6 +7643,7 @@ fn build_cmd(args: &[String]) -> Result<()> {
     // read before the engine is built.
     let source = std::fs::read_to_string(input)
         .map_err(|e| Error::from(e).context(format!("reading `{input}`")))?;
+    let gc_stats = maybe_install_gc_stats();
     let compile_engine = compile_engine(source.len())?;
 
     // `-o -` is the stdout spelling: the module BYTES go to stdout and no file is
@@ -7687,6 +7727,55 @@ fn build_cmd(args: &[String]) -> Result<()> {
     if let Some(f) = fault_injection()? {
         inject_fault(f, &mut bytes)?;
     }
+    if gc_stats {
+        eprintln!(
+            "vl: compile gc collections: {}, peak live after a collection: {} KiB",
+            GC_COLLECTIONS.load(Ordering::Relaxed),
+            GC_MAX_LIVE.load(Ordering::Relaxed) >> 10
+        );
+    }
+    // CENSUS-TEMP begin
+    if std::env::var_os("VL_GC_CENSUS").is_some() {
+        if let Some((store, inst)) = session.as_mut() {
+            store.gc(None)?;
+            let base = GC_LAST_LIVE.load(Ordering::Relaxed);
+            eprintln!("census base {} KiB", base >> 10);
+            if let Ok(l) = inst.get_typed_func::<i32, i32>(&mut *store, "dbgLen") {
+                for k in 0..3 {
+                    eprintln!("census len {} = {}", k, l.call(&mut *store, k)?);
+                }
+            }
+            let mut names: Vec<String> = inst
+                .exports(&mut *store)
+                .map(|e| e.name().to_string())
+                .filter(|n| n.starts_with("dbgDrop_"))
+                .collect();
+            names.sort();
+            let mut prev = base;
+            for n in names {
+                let f = inst.get_typed_func::<i32, i32>(&mut *store, &n)?;
+                let mut k = 0;
+                let ln = inst.get_typed_func::<i32, i32>(&mut *store, &format!("dbgLn_{}", &n[8..])).ok();
+                let nz = inst.get_typed_func::<i32, i32>(&mut *store, &format!("dbgNz_{}", &n[8..])).ok();
+                loop {
+                    if let (Some(ln), Some(nz)) = (&ln, &nz) {
+                        let l = ln.call(&mut *store, k)?;
+                        if l > 50000 {
+                            eprintln!("census dense {} {} len {} nz {}", &n[8..], k, l, nz.call(&mut *store, k)?);
+                        }
+                    }
+                    if f.call(&mut *store, k)? != 1 { break; }
+                    store.gc(None)?;
+                    let now = GC_LAST_LIVE.load(Ordering::Relaxed);
+                    eprintln!("census {} {} {}", &n[8..], k, (prev as i64 - now as i64) >> 10);
+                    prev = now;
+                    k += 1;
+                }
+            }
+            eprintln!("census rest {} KiB", prev >> 10);
+        }
+    }
+    // CENSUS-TEMP end
     // An optimized build never reads the compiler instance again (a refused module is
     // binaryen's bytes, which the emitter's spans do not describe), so its GC heap is freed
     // here rather than held for the whole of `wasm-opt` (D2311).
