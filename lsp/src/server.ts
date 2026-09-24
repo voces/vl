@@ -60,6 +60,7 @@ import {
   applyRatchetHold,
   invalidateRatchetBaselines,
 } from "./ratchetHold.ts";
+import { lintPathFor as lintPathForFile } from "./vlRoot.ts";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -254,6 +255,11 @@ const heldFiltered = (uri: string, diagnostics: VLDiagnostic[]): VLDiagnostic[] 
     showHeldLint,
   );
 
+// `uri`'s path as `lint()`'s `path` argument wants it — `vlRoot.ts`'s doc comment
+// has the full story (why it walks from the FILE, never from an open workspace
+// folder, and the false positives that cost it doing otherwise).
+const lintPathFor = (uri: string): string | undefined => lintPathForFile(uriToPath(uri));
+
 const toLspDiagnostic = (d: VLDiagnostic): Diagnostic => ({
   message: d.message,
   severity: severityMap[d.severity],
@@ -410,7 +416,7 @@ documents.onDidChangeContent(async (event) => {
   if (wasmChecker !== undefined) {
     try {
       const text = event.document.getText();
-      const lintDiags = wasmChecker.lint(text);
+      const lintDiags = wasmChecker.lint(text, lintPathFor(event.document.uri));
       const errors = await wasmChecker.check(
         text,
         entryKeyOf(event.document.uri),
@@ -1508,7 +1514,7 @@ connection.onCodeAction((params): CodeAction[] => {
     // introduces nothing either, and its lint is anchored at the second
     // occurrence's imported-name token precisely so this rewrite applies to it
     // unchanged.
-    const redundant = (wasmChecker?.lint(source) ?? [])
+    const redundant = (wasmChecker?.lint(source, lintPathFor(uri)) ?? [])
       .filter((d) =>
         d.code === "unused-import" || d.code === "duplicate-import"
       )

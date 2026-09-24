@@ -840,3 +840,43 @@ Deno.test({
     }
   },
 });
+
+// ── a stale `scaPath` outlives a parse error (review round 2) ────────────────────
+//
+// `lintSetPath` stages `scaPath` (compiler/lint.vl) BEFORE `lintSrc()` runs; the
+// normal path clears it again inside `lint()`, at that call's very top, into a
+// per-run copy — but a source that fails to PARSE never reaches `lint()` at all
+// (`lintSrcRun` returns -1 first), so nothing consumed the stage. On a REUSED
+// instance (exactly this file's premise) the next call inherits it: lint an
+// unparseable "compiler/bad.vl", then a valid UNRELATED document with no path
+// staged, and the second document's `+` chain reads as excluded under `compiler/`
+// — 0 `prefer-interpolation` findings for a file that plainly has one. Two
+// independent fixes close it: `wasmChecker.lint` now ALWAYS calls
+// `lintPathReset`/`lintPathCommit` (committing "" with nothing pushed when `path`
+// is undefined, rather than skipping the stage entirely), and `lintSrcRun`'s
+// parse-blocked branch now calls `lintSetPath("")` itself, since it is the one
+// early return `lint()`'s own top-of-function clearing cannot reach.
+
+const UNPARSEABLE = 'const bad = "unterminated\n';
+const UNRELATED_CHAIN = 'const chain = "a" + "b" + "c" + "d"\nprint(chain)\n';
+
+Deno.test({
+  name: "instance-leak: a stale compiler/ path does not outlive a parse error",
+  ignore,
+  fn: () => {
+    const c = loadWasmChecker(SEED, () => {})!;
+    const bad = c.lint(UNPARSEABLE, "compiler/bad.vl");
+    if (bad.length !== 0) {
+      throw new Error(`precondition: an unparseable file should lint empty, got ${JSON.stringify(bad)}`);
+    }
+    const after = c.lint(UNRELATED_CHAIN); // no path — the next, unrelated document
+    const interp = after.filter((d) => d.code === "prefer-interpolation");
+    if (interp.length !== 1) {
+      throw new Error(
+        `STALE scaPath — want one prefer-interpolation finding on the unrelated ` +
+          `document, got ${interp.length}: the previous document's "compiler/bad.vl" ` +
+          `must not still be staged`,
+      );
+    }
+  },
+});
