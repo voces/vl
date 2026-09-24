@@ -49,6 +49,7 @@ import {
   REP_SCAL_F64,
   REP_SCAL_I64,
   hcReset,
+  mapShapeKeyI32,
   msPoolReset,
   mvSlotKeyI32,
   repKindOfSigTok,
@@ -262,9 +263,11 @@ import {
   gHeapLimit,
   gHeapUsed,
   gHelpF64Rem,
+  gHelpMapCompact,
   gHelpMapProbe,
   gHelpMapProbeI32,
   gHelpMapResize,
+  gHelpMapResync,
   gHelpStrBytes,
   gHelpStrConcat,
   gHelpStrEq,
@@ -274,6 +277,7 @@ import {
   gHelpUtf8Enc,
   gImportMemory,
   gImports,
+  gMapDeletes,
   gMemLogIdx,
   gNeedsF32Print,
   gNeedsF64Print,
@@ -323,7 +327,10 @@ import {
   modNumCastSeen,
   modUnionAsHit,
   modUnionAsSeen,
+  mvMapTypeIdx,
+  mvRlSlot,
   mvTwin,
+  mvValKind,
   mvValName,
   mvValTyIx,
   narrowNames,
@@ -438,6 +445,7 @@ import {
   fbLocalTee,
   fbLoop,
   fbRefAsNonNull,
+  fbRefNull,
   fbRefNullForKind,
   fbRefNullStruct,
   fbReturn,
@@ -447,12 +455,16 @@ import {
   fbStrNew,
   fbStrSetHash,
   fbStrStart,
+  fbStructGet,
   fbStructNew,
+  fbStructSet,
   fbUnreachable,
   fbV128ConstZero,
   fbValtype,
   fbValtypeNullable,
   mapTypeIdxOf,
+  mvValElemHeapOf,
+  mvValsBackOf,
   pushFieldStorage,
   ropePush,
   ropeReset,
@@ -3092,7 +3104,7 @@ function emitMapProbeBackEdge(startL: i32) {
 // The index-capacity power-of-two invariant, which both probe helpers and the rehash rely on
 // to wrap with `i32.and` instead of `i32.rem_u`. The `index` array's length is a power of two
 // at every point in a map's life, from its only three producers (`emitMapNew` at 16,
-// `__map_resize__` at `2 * len(index)`, `emitMapCompact`) — a fourth producer must keep `mask = cap - 1`. `__map_probe__`: wrapping linear probe to the matching-or-free slot, the shared core of every map op.
+// `__map_resize__` at `2 * len(index)`, `__map_compact__`) — a fourth producer must keep `mask = cap - 1`. `__map_probe__`: wrapping linear probe to the matching-or-free slot, the shared core of every map op.
 function emitMapProbeFnCode(out: u8[]) {
   const body: u8[] = []
   const prev = wTarget(body)
@@ -3345,6 +3357,317 @@ function emitMapResizeFnCode(out: u8[]) {
   helpFrameBody(out, body)
 }
 
+// A map struct's field count: the seven every map has, plus `seqs` and `next` in a module
+// that deletes (D2315).
+function mapFieldCount() {
+  if gMapDeletes { return 9 }
+  7
+}
+
+// Fields 7 and 8 of a map struct in a module that deletes: `seqs`, the i64 insertion sequence
+// of each entry, and `next`, the sequence the next append takes (D2315).
+function mapSeqFieldTypes() {
+  if !gMapDeletes { return 0 }
+  wU8(100) // field 7 seqs: 0x64 (ref $ia64TypeIdx) — non-null i64 array
+  wSLEB(ia64TypeIdx)
+  wU8(1)   // mutable
+  wU8(126) // field 8 next: 0x7e i64
+  wU8(1)   // mutable
+  0
+}
+
+// `__map_resync__(seqs, count, seq) -> i32`: one before the first entry whose sequence is later
+// than `seq` (or `count - 1`), for a map walk whose entry a compaction moved. Sequences are i64
+// and grow along the entries, so the first later one is where JS `Map` iteration goes next.
+function emitMapResyncFnCode(out: u8[]) {
+  const body: u8[] = []
+  const prev = wTarget(body)
+  wULEB(1)      // 1 locals run
+  wULEB(1)      // count 1
+  wU8(127)      // 0x7f i32 (i)
+  fbBlock(64)
+  fbLoop(64)
+  fbLocalGet(3)
+  fbLocalGet(1)
+  fbI32Bin(78)  // 0x4e i32.ge_s (i >= count)
+  fbBrIf(1)
+  fbLocalGet(0)
+  fbLocalGet(3)
+  fbArrayGet(ia64TypeIdx)
+  fbLocalGet(2)
+  fbI32Bin(85)  // 0x55 i64.gt_s (later than seq)
+  fbBrIf(1)
+  fbLocalGet(3)
+  fbI32Const(1)
+  fbI32Bin(106)
+  fbLocalSet(3)
+  fbBr(0)
+  fbEnd()       // end (loop)
+  fbEnd()       // end (block)
+  fbLocalGet(3)
+  fbI32Const(1)
+  fbI32Bin(107) // the caller's step adds one back
+  fbEnd()       // end (function)
+  wTarget(prev)
+  helpFrameBody(out, body)
+}
+
+// The resync helper's functype: `(ref <i64 array>, i32, i64) -> i32`.
+function mapResyncFuncType() {
+  wU8(96)  // 0x60 func
+  wULEB(3)
+  wU8(100) // 0x64 (ref ht)
+  wSLEB(ia64TypeIdx)
+  wU8(127) // 0x7f i32
+  wU8(126) // 0x7e i64
+  wULEB(1)
+  wU8(127) // 0x7f i32
+  0
+}
+
+// Whether map shape `sh` (-1, -4, or an mv slot) has every heap type its compaction helper
+// names, asked without recording a failure: a slot no map op resolved gets no helper.
+function mapShapeCompactable(sh: i32): boolean {
+  if sh == -1 { return mUsed }
+  if sh == -4 { return mI32Used }
+  if sh < 0 || sh >= mvMapTypeIdx.length { return false }
+  const k = mvValKind[sh]
+  if k == 3 || k == 10 || k == 11 || k == 13 { return true }
+  const r = mvRlSlot[sh]
+  r >= 0 && r < rlBackIdx.length && r < rlWrapIdx.length
+}
+
+// The map shape the `k`th compaction helper row serves: row 0 the string-keyed mono map, row 1
+// the i32-keyed one, row `2 + s` mv slot `s`.
+function mapCompactRowShape(k: i32) {
+  if k == 0 { return -1 }
+  if k == 1 { return -4 }
+  k - 2
+}
+
+// The compaction helper's functype: `(ref <mapTy>) -> ()`.
+function mapCompactFuncType(sh: i32) {
+  wU8(96)  // 0x60 func
+  wULEB(1)
+  wU8(100) // 0x64 (ref ht)
+  wSLEB(mapTypeIdxOf(sh))
+  wULEB(0)
+  0
+}
+
+// `__map_compact__(m)` for map shape `sh`: slide the live entries down in place, in order and
+// with their sequences, clear the vacated tail (refs to null, `seqs` to -1, which no entry
+// holds), then rebuild the index at the next power of two above `4*size + 2*INITIAL_CAP`, the
+// cap `__map_resize__` would grow into anyway (D2291, D2315). Only the index is allocated.
+function emitMapCompactFnCode(out: u8[], sh: i32) {
+  const mapTy = mapTypeIdxOf(sh)
+  const keyI32 = mapShapeKeyI32(sh)
+  let keysWrap = mkListIdx
+  let keysBack = mkArrIdx
+  if keyI32 {
+    keysWrap = lTypeIdx
+    keysBack = aTypeIdx
+  }
+  let valsWrap = lTypeIdx
+  let valsBack = aTypeIdx
+  let valNull = -1
+  if sh >= 0 {
+    valsWrap = mvValsWrapOf(sh)
+    valsBack = mvValsBackOf(sh)
+    const vk = mvValKind[sh]
+    if vk != 10 && vk != 11 && vk != 13 { valNull = mvValElemHeapOf(sh) }
+  }
+  const body: u8[] = []
+  const prev = wTarget(body)
+  // locals: 1 i, 2 j, 3 count, 4 cap, 5 rslot, 6 idx
+  wULEB(2) // 2 locals runs
+  wULEB(5)
+  wU8(127) // 0x7f i32
+  wULEB(1)
+  wU8(99)  // 0x63 (ref null ht)
+  wSLEB(aTypeIdx)
+  fbLocalGet(0)
+  fbStructGet(mapTy, 4)
+  fbLocalSet(3)
+  // for i < count: if live[i] { entry j = entry i ; j++ }
+  fbBlock(64)
+  fbLoop(64)
+  fbLocalGet(1)
+  fbLocalGet(3)
+  fbI32Bin(78) // i32.ge_s
+  fbBrIf(1)
+  fbLocalGet(0)
+  fbStructGet(mapTy, 2)
+  fbLocalGet(1)
+  fbArrayGet(aTypeIdx)
+  fbIf(64)     // live[i] != 0
+  mapCompactMove(mapTy, 0, keysWrap, keysBack)
+  mapCompactMove(mapTy, 1, valsWrap, valsBack)
+  mapCompactMove(mapTy, 2, -1, aTypeIdx)
+  mapCompactMove(mapTy, 6, -1, aTypeIdx)
+  mapCompactMove(mapTy, 7, -1, ia64TypeIdx)
+  fbLocalGet(2)
+  fbI32Const(1)
+  fbI32Bin(106)
+  fbLocalSet(2)
+  fbEnd()      // end (live if)
+  fbLocalGet(1)
+  fbI32Const(1)
+  fbI32Bin(106)
+  fbLocalSet(1)
+  fbBr(0)
+  fbEnd()
+  fbEnd()
+  // the vacated tail, j <= i < count: dead, no sequence, no payload
+  fbLocalGet(2)
+  fbLocalSet(1)
+  fbBlock(64)
+  fbLoop(64)
+  fbLocalGet(1)
+  fbLocalGet(3)
+  fbI32Bin(78)
+  fbBrIf(1)
+  fbLocalGet(0)
+  fbStructGet(mapTy, 2)
+  fbLocalGet(1)
+  fbI32Const(0)
+  fbArraySet(aTypeIdx)
+  fbLocalGet(0)
+  fbStructGet(mapTy, 7)
+  fbLocalGet(1)
+  fbI64Const(-1, -1)
+  fbArraySet(ia64TypeIdx)
+  if !keyI32 {
+    fbLocalGet(0)
+    fbStructGet(mapTy, 0)
+    fbStructGet(keysWrap, 0)
+    fbLocalGet(1)
+    fbRefNull(sTypeIdx)
+    fbArraySet(keysBack)
+  }
+  if valNull >= 0 {
+    fbLocalGet(0)
+    fbStructGet(mapTy, 1)
+    fbStructGet(valsWrap, 0)
+    fbLocalGet(1)
+    fbRefNull(valNull)
+    fbArraySet(valsBack)
+  }
+  fbLocalGet(1)
+  fbI32Const(1)
+  fbI32Bin(106)
+  fbLocalSet(1)
+  fbBr(0)
+  fbEnd()
+  fbEnd()
+  // keys.len = vals.len = count = j
+  fbLocalGet(0)
+  fbStructGet(mapTy, 0)
+  fbLocalGet(2)
+  fbStructSet(keysWrap, 1)
+  fbLocalGet(0)
+  fbStructGet(mapTy, 1)
+  fbLocalGet(2)
+  fbStructSet(valsWrap, 1)
+  fbLocalGet(0)
+  fbLocalGet(2)
+  fbStructSet(mapTy, 4)
+  // cap = 16 ; while cap <= 4*size + 18 { cap *= 2 }
+  fbI32Const(16)
+  fbLocalSet(4)
+  fbBlock(64)
+  fbLoop(64)
+  fbLocalGet(4)
+  fbLocalGet(0)
+  fbStructGet(mapTy, 5)
+  fbI32Const(4)
+  fbI32Bin(108) // size * 4
+  fbI32Const(18)
+  fbI32Bin(106)
+  fbI32Bin(75)  // 0x4b i32.gt_u
+  fbBrIf(1)
+  fbLocalGet(4)
+  fbI32Const(2)
+  fbI32Bin(108)
+  fbLocalSet(4)
+  fbBr(0)
+  fbEnd()
+  fbEnd()
+  // idx = a fresh index of cap slots, entry i < j re-placed from its stored hash
+  fbLocalGet(4)
+  fbArrayNewDefault(aTypeIdx)
+  fbLocalSet(6)
+  fbI32Const(0)
+  fbLocalSet(1)
+  fbBlock(64)
+  fbLoop(64)
+  fbLocalGet(1)
+  fbLocalGet(2)
+  fbI32Bin(78) // i32.ge_s (i >= j)
+  fbBrIf(1)
+  // rslot = hashes[i] % cap
+  fbLocalGet(0)
+  fbStructGet(mapTy, 6)
+  fbLocalGet(1)
+  fbArrayGet(aTypeIdx)
+  fbLocalGet(4)
+  fbI32Bin(112) // i32.rem_u
+  fbLocalSet(5)
+  fbBlock(64)
+  fbLoop(64)
+  fbLocalGet(6)
+  fbLocalGet(5)
+  fbArrayGet(aTypeIdx)
+  fbI32Eqz()
+  fbBrIf(1)
+  fbLocalGet(5)
+  fbI32Const(1)
+  fbI32Bin(106)
+  fbLocalGet(4)
+  fbI32Bin(112) // i32.rem_u
+  fbLocalSet(5)
+  fbBr(0)
+  fbEnd()
+  fbEnd()
+  // idx[rslot] = i + 1
+  fbLocalGet(6)
+  fbLocalGet(5)
+  fbLocalGet(1)
+  fbI32Const(1)
+  fbI32Bin(106)
+  fbArraySet(aTypeIdx)
+  fbLocalGet(1)
+  fbI32Const(1)
+  fbI32Bin(106)
+  fbLocalSet(1)
+  fbBr(0)
+  fbEnd()
+  fbEnd()
+  fbLocalGet(0)
+  fbLocalGet(6)
+  fbRefAsNonNull()
+  fbStructSet(mapTy, 3)
+  fbEnd() // end (function)
+  wTarget(prev)
+  helpFrameBody(out, body)
+}
+
+// One entry-parallel array's move in `__map_compact__`: `arr[j] = arr[i]`, where `arr` is map
+// field `field` (through list wrapper `wrap` when `wrap >= 0`) and `back` its array type.
+function mapCompactMove(mapTy: i32, field: i32, wrap: i32, back: i32) {
+  fbLocalGet(0)
+  fbStructGet(mapTy, field)
+  if wrap >= 0 { fbStructGet(wrap, 0) }
+  fbLocalGet(2)
+  fbLocalGet(0)
+  fbStructGet(mapTy, field)
+  if wrap >= 0 { fbStructGet(wrap, 0) }
+  fbLocalGet(1)
+  fbArrayGet(back)
+  fbArraySet(back)
+  0
+}
+
 // `__f64_rem__(x, y) -> f64`: the truncated remainder — `x - y * trunc(x / y)` in value, with
 // the sign of the dividend (Rust's `f64::rem`, JS's `%`, C's `fmod`; wasm has no instruction
 // for it, D1586). Not that identity evaluated directly — it is off by an ulp once the
@@ -3508,6 +3831,12 @@ function emitNameSection(n: i32) {
   if gHelpMapProbe >= 0 { count = count + 2 }
   if gHelpMapProbeI32 >= 0 { count = count + 1 }
   if gHelpF64Rem >= 0 { count = count + 1 }
+  if gHelpMapResync >= 0 { count = count + 1 }
+  let cnk = 0
+  while cnk < gHelpMapCompact.length {
+    if gHelpMapCompact[cnk] >= 0 { count = count + 1 }
+    cnk = cnk + 1
+  }
   wULEB(count)
   if gImports > 0 {
     wULEB(0)
@@ -3632,6 +3961,18 @@ function emitNameSection(n: i32) {
   if gHelpF64Rem >= 0 {
     wULEB(gHelpF64Rem)
     wName("__f64_rem__")
+  }
+  if gHelpMapResync >= 0 {
+    wULEB(gHelpMapResync)
+    wName("__map_resync__")
+  }
+  let cnw = 0
+  while cnw < gHelpMapCompact.length {
+    if gHelpMapCompact[cnw] >= 0 {
+      wULEB(gHelpMapCompact[cnw])
+      wName("__map_compact_" + i32ToStr(cnw) + "__")
+    }
+    cnw = cnw + 1
   }
   wTarget(mapPrev)
 
@@ -3807,6 +4148,25 @@ function emitModule(_stmts: i32[]) {
   if gNeedsF64Rem {
     gHelpF64Rem = helpBase + nHelpers
     nHelpers = nHelpers + 1
+  }
+  // The delete family (D2315), last for the same reason, and only in a module that deletes: a
+  // map nothing deletes from never has a dead entry, so it never compacts and no walk resyncs.
+  // One compaction helper per map shape, since each names its shape's heap types.
+  gHelpMapResync = -1
+  gHelpMapCompact = []
+  if gMapDeletes && mUsed {
+    gHelpMapResync = helpBase + nHelpers
+    nHelpers = nHelpers + 1
+    let ck = 0
+    while ck < mvMapTypeIdx.length + 2 {
+      if mapShapeCompactable(mapCompactRowShape(ck)) {
+        gHelpMapCompact.push(helpBase + nHelpers)
+        nHelpers = nHelpers + 1
+      } else {
+        gHelpMapCompact.push(-1)
+      }
+      ck = ck + 1
+    }
   }
 
   // Intern the string-literal pool (its globals PRECEDE the user cells — every
@@ -4194,6 +4554,13 @@ function scanPrintUse() {
       // that does not exist. Matched on the property name alone, deliberately: over-forcing is a pair of unused 3-byte types, under-forcing is invalid wasm.
       if pcallee is Member {
         if pcallee.memProp == "bytes" { ba8Used = true }
+        // Any `.delete(…)` reserves the map delete family and the i64 array its sequences use
+        // (D2315); matched on the name alone, since over-reserving costs unused helpers and a
+        // miss only forgoes compaction.
+        if pcallee.memProp == "delete" {
+          gMapDeletes = true
+          ia64Used = true
+        }
       }
     }
     // A FLOAT `%` reserves the `__f64_rem__` helper (D1586). The node's own recorded type
@@ -4428,6 +4795,7 @@ export function emitProgram(rootIx: i32) {
   // helper INDEX is recomputed every compile while a surviving `true` would declare a
   // `__f64_rem__` this module's tail never emits. `scanPrintUse` writes it (D1586).
   gNeedsF64Rem = false
+  gMapDeletes = false
   // The module-predicate memo (`moduleHasUnionAs`/`moduleHasNumCast`) is keyed on an arena
   // prefix, so it needs the same per-compile clear: the next program's arena can be longer
   // than this one's, and a surviving `…Seen` would start the scan inside a prefix that
@@ -4494,7 +4862,7 @@ export function emitProgram(rootIx: i32) {
   // The if-expression arm blocks whose prelude locals the collect pass allocated. Arena node
   // indices, so it is the same hazard as the columns above and worse: a stale index that happens
   // to name a node in program N grants the emitter permission to lower a prelude with no allocated locals, claiming another binding's slot.
-  armPreludeBlocks = []
+  armPreludeBlocks = Map()
   emitFailed = false
   emitErr = ""
   // Fresh per program: the diagnostic anchor + the "function being lowered"
@@ -5219,54 +5587,56 @@ function emitTypeSection(
   if mUsed {
     // The map struct — the 7-field open-addressing rep documented at `mUsed`. Field order and
     // count match the host's general-purpose rep exactly (`compiler/builtins/maps.ts`): keys 0, vals 1, live 2, index 3, count 4, size 5, hashes 6.
-    wU8(95)  // 0x5f struct (map)
-    wU8(7)   // 7 fields (open-addressing hash map, host-aligned)
-    wU8(100) // field 0 keys: 0x64 (ref $mkListIdx) — non-null
+    wU8(95)              // 0x5f struct (map)
+    wU8(mapFieldCount()) // 7 fields (open-addressing hash map, host-aligned), 9 with seqs
+    wU8(100)             // field 0 keys: 0x64 (ref $mkListIdx) — non-null
     wSLEB(mkListIdx)
-    wU8(1)   // mutable
-    wU8(100) // field 1 vals: 0x64 (ref $lTypeIdx) — non-null
+    wU8(1)               // mutable
+    wU8(100)             // field 1 vals: 0x64 (ref $lTypeIdx) — non-null
     wSLEB(lTypeIdx)
-    wU8(1)   // mutable
-    wU8(100) // field 2 live: 0x64 (ref $aTypeIdx) — non-null i32 array
+    wU8(1)               // mutable
+    wU8(100)             // field 2 live: 0x64 (ref $aTypeIdx) — non-null i32 array
     wSLEB(aTypeIdx)
-    wU8(1)   // mutable
-    wU8(100) // field 3 index: 0x64 (ref $aTypeIdx) — non-null i32 array
+    wU8(1)               // mutable
+    wU8(100)             // field 3 index: 0x64 (ref $aTypeIdx) — non-null i32 array
     wSLEB(aTypeIdx)
-    wU8(1)   // mutable
-    wU8(127) // field 4 count: 0x7f i32
-    wU8(1)   // mutable
-    wU8(127) // field 5 size: 0x7f i32
-    wU8(1)   // mutable
-    wU8(100) // field 6 hashes: 0x64 (ref $aTypeIdx) — non-null i32 array
+    wU8(1)               // mutable
+    wU8(127)             // field 4 count: 0x7f i32
+    wU8(1)               // mutable
+    wU8(127)             // field 5 size: 0x7f i32
+    wU8(1)               // mutable
+    wU8(100)             // field 6 hashes: 0x64 (ref $aTypeIdx) — non-null i32 array
     wSLEB(aTypeIdx)
-    wU8(1)   // mutable
+    wU8(1)               // mutable
+    mapSeqFieldTypes()
   }
   if mI32Used {
     // The i32-KEYED map struct — the same 7 fields in the same order, with field 0
     // `keys` re-typed to the i32 list wrapper (`$lTypeIdx` over `$aTypeIdx`) instead
     // of the string-ref list. Every other field matches the twin above exactly,
     // which is why the probe/rehash/compact machinery is shared.
-    wU8(95)  // 0x5f struct (i32-keyed map)
-    wU8(7)   // 7 fields
-    wU8(100) // field 0 keys: 0x64 (ref $lTypeIdx) — non-null i32 list
+    wU8(95)              // 0x5f struct (i32-keyed map)
+    wU8(mapFieldCount()) // 7 fields, 9 with seqs
+    wU8(100)             // field 0 keys: 0x64 (ref $lTypeIdx) — non-null i32 list
     wSLEB(lTypeIdx)
-    wU8(1)   // mutable
-    wU8(100) // field 1 vals: 0x64 (ref $lTypeIdx) — non-null
+    wU8(1)               // mutable
+    wU8(100)             // field 1 vals: 0x64 (ref $lTypeIdx) — non-null
     wSLEB(lTypeIdx)
-    wU8(1)   // mutable
-    wU8(100) // field 2 live: 0x64 (ref $aTypeIdx) — non-null i32 array
+    wU8(1)               // mutable
+    wU8(100)             // field 2 live: 0x64 (ref $aTypeIdx) — non-null i32 array
     wSLEB(aTypeIdx)
-    wU8(1)   // mutable
-    wU8(100) // field 3 index: 0x64 (ref $aTypeIdx) — non-null i32 array
+    wU8(1)               // mutable
+    wU8(100)             // field 3 index: 0x64 (ref $aTypeIdx) — non-null i32 array
     wSLEB(aTypeIdx)
-    wU8(1)   // mutable
-    wU8(127) // field 4 count: 0x7f i32
-    wU8(1)   // mutable
-    wU8(127) // field 5 size: 0x7f i32
-    wU8(1)   // mutable
-    wU8(100) // field 6 hashes: 0x64 (ref $aTypeIdx) — non-null i32 array
+    wU8(1)               // mutable
+    wU8(127)             // field 4 count: 0x7f i32
+    wU8(1)               // mutable
+    wU8(127)             // field 5 size: 0x7f i32
+    wU8(1)               // mutable
+    wU8(100)             // field 6 hashes: 0x64 (ref $aTypeIdx) — non-null i32 array
     wSLEB(aTypeIdx)
-    wU8(1)   // mutable
+    wU8(1)               // mutable
+    mapSeqFieldTypes()
   }
   if fa64Used {
     // The f64 array `(array (mut f64))` (Slice 4): `0x5e` array form, `0x7c` f64
@@ -5416,27 +5786,28 @@ function emitTypeSection(
     // on rather than assumed to be the string-ref list.
     let mvKeysWrap = mkListIdx
     if mvSlotKeyI32(mvs) { mvKeysWrap = lTypeIdx }
-    wU8(95)  // 0x5f struct (ref-valued map)
-    wU8(7)   // 7 fields (host-aligned open-addressing hash map)
-    wU8(100) // field 0 keys: 0x64 (ref <this slot's keys wrapper>) — non-null
+    wU8(95)              // 0x5f struct (ref-valued map)
+    wU8(mapFieldCount()) // 7 fields (host-aligned open-addressing hash map), 9 with seqs
+    wU8(100)             // field 0 keys: 0x64 (ref <this slot's keys wrapper>) — non-null
     wSLEB(mvKeysWrap)
-    wU8(1)   // mutable
-    wU8(100) // field 1 vals: 0x64 (ref <this slot's wrapper>)
+    wU8(1)               // mutable
+    wU8(100)             // field 1 vals: 0x64 (ref <this slot's wrapper>)
     wSLEB(mvValsWrapOf(mvs))
-    wU8(1)   // mutable
-    wU8(100) // field 2 live: 0x64 (ref $aTypeIdx) — non-null i32 array
+    wU8(1)               // mutable
+    wU8(100)             // field 2 live: 0x64 (ref $aTypeIdx) — non-null i32 array
     wSLEB(aTypeIdx)
-    wU8(1)   // mutable
-    wU8(100) // field 3 index: 0x64 (ref $aTypeIdx) — non-null i32 array
+    wU8(1)               // mutable
+    wU8(100)             // field 3 index: 0x64 (ref $aTypeIdx) — non-null i32 array
     wSLEB(aTypeIdx)
-    wU8(1)   // mutable
-    wU8(127) // field 4 count: 0x7f i32
-    wU8(1)   // mutable
-    wU8(127) // field 5 size: 0x7f i32
-    wU8(1)   // mutable
-    wU8(100) // field 6 hashes: 0x64 (ref $aTypeIdx) — non-null i32 array
+    wU8(1)               // mutable
+    wU8(127)             // field 4 count: 0x7f i32
+    wU8(1)               // mutable
+    wU8(127)             // field 5 size: 0x7f i32
+    wU8(1)               // mutable
+    wU8(100)             // field 6 hashes: 0x64 (ref $aTypeIdx) — non-null i32 array
     wSLEB(aTypeIdx)
-    wU8(1)   // mutable
+    wU8(1)               // mutable
+    mapSeqFieldTypes()
     mvs = mvs + 1
   }
   // The functype param/result valtypes (`fbValtype`) stream to `curBuf == typePayload`,
@@ -5604,6 +5975,14 @@ function emitTypeSection(
   }
   if gHelpF64Rem >= 0 {
     helpFuncType("ff", "f") // __f64_rem__: (f64, f64) -> f64
+  }
+  if gHelpMapResync >= 0 {
+    mapResyncFuncType() // __map_resync__: (seqs, count, seq) -> cursor
+  }
+  let cft = 0
+  while cft < gHelpMapCompact.length {
+    if gHelpMapCompact[cft] >= 0 { mapCompactFuncType(mapCompactRowShape(cft)) }
+    cft = cft + 1
   }
   // The export-wrapper functypes last (#1265), one per export entry, each the target's own
   // signature emitted with `withEnv` false — the clean ABI shape, produced by the same
@@ -6427,6 +6806,22 @@ function buildCodePayload(
     const entry: u8[] = []
     if emitF64RemFnCode(entry) < 0 { return -1 }
     placeCodeEntry(codePayload, entry, rows, -1, -1, 3, "__f64_rem__")
+  }
+  if gHelpMapResync >= 0 {
+    const rows = emitFnSpanStart.length
+    const entry: u8[] = []
+    if emitMapResyncFnCode(entry) < 0 { return -1 }
+    placeCodeEntry(codePayload, entry, rows, -1, -1, 3, "__map_resync__")
+  }
+  let cce = 0
+  while cce < gHelpMapCompact.length {
+    if gHelpMapCompact[cce] >= 0 {
+      const rows = emitFnSpanStart.length
+      const entry: u8[] = []
+      if emitMapCompactFnCode(entry, mapCompactRowShape(cce)) < 0 { return -1 }
+      placeCodeEntry(codePayload, entry, rows, -1, -1, 3, "__map_compact__")
+    }
+    cce = cce + 1
   }
   // The export-wrapper bodies LAST, in the same order the function section declared them.
   // A wrapper's row carries the WRAPPED function's slot and node, so its name and the

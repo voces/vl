@@ -238,6 +238,54 @@ fits without growing (RSS 331 MB) but costs +80% CPU in collections, and 320 MiB
 Below 256 MiB the heap doubles and RSS rises. Shrinking the floor therefore needs a smaller
 live set, not a smaller heap.
 
+## Measured 2026-09-24, second pass — a heap census, and the floor moved (D2317–D2319)
+
+**The instrument.** `$VL_GC_STATS=1 vl build …` now prints the collection count and the largest
+live size any collection left (`peak live after a collection`), and `$VL_COMPILE_GC_HEAP` sets
+the copying compile's first heap. A small first heap (`32M`) makes the compile collect often,
+so the peak reading approaches the true peak. On these units the live set grows through the
+whole compile and peaks at the end of emit, so the heap as it stands after `compileSrc` is the
+peak's composition.
+
+The census itself is not in the tree: a script appended to each compiler module a
+`dbgDrop_<module>(k)` that resets its k-th top-level table, and a host loop called each in
+turn after the compile, forcing a collection and reading the live bytes each drop freed.
+Dropping in order attributes a shared object to the LAST holder dropped. `chunk_662`, 143 MiB
+retained before this pass:
+
+| holder | MiB |
+| --- | ---: |
+| `P.nodes` (320K nodes, ~97 B each with child lists) | 29 |
+| `P.toks` (520K `Tok` structs, 48 B each, and the array) | 26 |
+| token texts (one slice header per token; last held by the token cache) | 18 |
+| the token cache's four `i32` columns | 8 |
+| 21 node-indexed `i32[]` columns at 2 MiB (301K rows, capacity 512K) | 42 |
+| everything else named | ~12 |
+| not reset by the census (`const` tables and the like) | 10 |
+
+Eleven of the 21 columns held under 1% non-default rows, six of them none. What moved:
+
+| change | `chunk_662` live | `chunk_466` live |
+| --- | ---: | ---: |
+| master | 143 MiB | 165 MiB |
+| one-shot drops the token cache after the parse (D2317) + short lexemes interned (D2318) | 118 | 127 |
+| rarely written columns grow only to their last write (D2319) | 100 | 113 |
+| scattered columns as `{[i32]: …}` maps (D2319) | 87 | 104 |
+| anon-leaf index released after its passes (D2319) | 79 | 98 |
+
+Output is byte-identical at every step. The first heap then drops 384 → 256 MiB (the curve is
+in DECISIONS.md, "Why 256 MiB"). `--names -O --import-memory`, process-tree peak RSS sampled
+every 10 ms, median of 3 interleaved runs: `chunk_662` 415 → 291 MB, `chunk_466` 417 →
+294 MB, `chunk_550` (null collector) 170 → 156 MB.
+
+**What is left, and what it would cost.** `P.nodes` and `P.toks` are two thirds of the
+remaining live set. A `Tok` is 48 bytes because the copying collector's header is 16 and
+objects align to 16; `pos` has no reader, so dropping it and moving `start` (86 readers) to
+a side column would make it 32 bytes, about −6 MiB on `chunk_662`. The AST as `i32[]`
+columns would save more (a node averages ~97 B; columns ~30), roughly −20 MiB, but touches
+2,599 `P.nodes[` sites and every `is <Node>` narrowing. That is not a bounded change and was
+not started.
+
 ## Guards
 
 Three, and they fire at different moments. Profiling is what you do AFTER one of them does.

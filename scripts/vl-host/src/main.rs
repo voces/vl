@@ -1031,6 +1031,11 @@ fn parse_byte_size(v: &str) -> Option<u64> {
 /// prints "Begin copying collection" once per cycle at `log::Level::Trace`.
 static GC_COLLECTIONS: AtomicU64 = AtomicU64::new(0);
 
+/// The largest heap occupancy any collection left behind, from the same trace log
+/// ("After collection, GC heap's allocated bytes = 0x…"): the peak live set as seen at a
+/// collection. `vl build` prints it under `$VL_GC_STATS=1` next to the count.
+static GC_MAX_LIVE: AtomicU64 = AtomicU64::new(0);
+
 struct GcStatsLog;
 
 impl log::Log for GcStatsLog {
@@ -1038,10 +1043,17 @@ impl log::Log for GcStatsLog {
         metadata.level() == log::Level::Trace && metadata.target().starts_with("wasmtime")
     }
     fn log(&self, record: &log::Record) {
-        if self.enabled(record.metadata())
-            && record.args().to_string().starts_with("Begin copying collection")
-        {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+        let msg = record.args().to_string();
+        if msg.starts_with("Begin copying collection") {
             GC_COLLECTIONS.fetch_add(1, Ordering::Relaxed);
+        } else if let Some(rest) = msg.strip_prefix("After collection, GC heap's allocated bytes = 0x") {
+            let hex = rest.split(' ').next().unwrap_or("");
+            if let Ok(n) = u64::from_str_radix(hex, 16) {
+                GC_MAX_LIVE.fetch_max(n, Ordering::Relaxed);
+            }
         }
     }
     fn flush(&self) {}
@@ -1053,7 +1065,7 @@ static GC_STATS_LOG: GcStatsLog = GcStatsLog;
 /// print the count when the run finishes. `$VL_GC_STATS` is undocumented in `vl
 /// help run` on purpose — like `$VL_COMPILE_GC_TRACE`, it is a measurement
 /// facility, not a tuning knob. `log::set_logger` is one-shot per process, which
-/// `run_cmd` (the only caller) never exceeds.
+/// `run_cmd` and `build_cmd`, each at most once per process, never exceed.
 fn maybe_install_gc_stats() -> bool {
     if std::env::var("VL_GC_STATS").ok().as_deref() != Some("1") {
         return false;
@@ -1128,7 +1140,9 @@ fn compile_engine(source_len: usize) -> Result<Engine> {
     }
     COMPILE_UNDER_NULL.store(!matches!(collector, Collector::Copying), Ordering::Relaxed);
     match collector {
-        Collector::Copying => seed_engine_sized(collector, Some(COPYING_COMPILE_HEAP_INITIAL)),
+        Collector::Copying => {
+            seed_engine_sized(collector, Some(compile_heap_initial(COPYING_COMPILE_HEAP_INITIAL)?))
+        }
         _ => seed_engine(collector),
     }
 }
@@ -1137,9 +1151,24 @@ fn compile_engine(source_len: usize) -> Result<Engine> {
 /// collector's footprint overtakes the copying collector's first heap.
 const COPYING_COMPILE_THRESHOLD: usize = 3 << 19; // 1.5 MiB
 
-/// The copying compile's first GC heap, 192 MiB per semispace; the heap doubles from
-/// here. Starting from 0 costs CPU: the small early heaps collect over and over.
-const COPYING_COMPILE_HEAP_INITIAL: u64 = 384 << 20;
+/// The copying compile's first GC heap, 128 MiB per semispace; the heap doubles from
+/// here. Starting from 0 costs CPU: the small early heaps collect over and over. The knee
+/// of a 2 MB unit's CPU/RSS curve (D2319), and `$VL_COMPILE_GC_HEAP` overrides it.
+const COPYING_COMPILE_HEAP_INITIAL: u64 = 256 << 20;
+
+/// The copying compile's first heap: `$VL_COMPILE_GC_HEAP` when set (the `$VL_GC_HEAP`
+/// syntax), else `default`. A measurement and memory-tight-box knob; a bad value is a
+/// hard error.
+fn compile_heap_initial(default: u64) -> Result<u64> {
+    match std::env::var("VL_COMPILE_GC_HEAP").ok().as_deref() {
+        None | Some("") => Ok(default),
+        Some(v) => parse_byte_size(v).ok_or_else(|| {
+            Error::msg(format!(
+                "unknown $VL_COMPILE_GC_HEAP `{v}` (bytes, or a number with a K, M or G suffix, at most 4G)"
+            ))
+        }),
+    }
+}
 
 fn compile_collector(source_len: usize) -> Result<Collector> {
     match std::env::var("VL_COMPILE_GC").ok().as_deref() {
@@ -3125,6 +3154,12 @@ fn compile_vl_instance(
         if let Ok(set_names) = inst.get_typed_func::<i32, i32>(&mut store, "setEmitNames") {
             set_names.call(&mut store, 1)?;
         }
+    }
+    // Every caller here compiles once on a fresh instance and drops it, so the compiler may
+    // release what it keeps for a later compile (the module token cache) once it has served
+    // this one (D2317). Optional, like `setEmitNames`: an older seed just keeps it.
+    if let Ok(set) = inst.get_typed_func::<i32, i32>(&mut store, "setOneShot") {
+        set.call(&mut store, 1)?;
     }
     // Dropping `vl-src` is an optimisation only: a seed without the export writes the
     // section, and the `-O` path strips it before binaryen runs either way.
@@ -7604,6 +7639,7 @@ fn build_cmd(args: &[String]) -> Result<()> {
     // read before the engine is built.
     let source = std::fs::read_to_string(input)
         .map_err(|e| Error::from(e).context(format!("reading `{input}`")))?;
+    let gc_stats = maybe_install_gc_stats();
     let compile_engine = compile_engine(source.len())?;
 
     // `-o -` is the stdout spelling: the module BYTES go to stdout and no file is
@@ -7686,6 +7722,13 @@ fn build_cmd(args: &[String]) -> Result<()> {
     // engine's verdict, and nowhere else.
     if let Some(f) = fault_injection()? {
         inject_fault(f, &mut bytes)?;
+    }
+    if gc_stats {
+        eprintln!(
+            "vl: compile gc collections: {}, peak live after a collection: {} KiB",
+            GC_COLLECTIONS.load(Ordering::Relaxed),
+            GC_MAX_LIVE.load(Ordering::Relaxed) >> 10
+        );
     }
     // An optimized build never reads the compiler instance again (a refused module is
     // binaryen's bytes, which the emitter's spans do not describe), so its GC heap is freed
