@@ -31074,11 +31074,6 @@ export function letIsArray(letIx: i32, fnIx: i32) {
 // a ref list — `Tok[]` / `Node[]`, a `(ref $rlTypeIdx)`. Receiver shapes mirror `exprArray`
 // but for `S[]`/`N[]` annotations. `localIsRef` code `5` flags a ref-list local.
 
-// True if function `name` declares a ref array (`S[]`/`N[]`) as its return type.
-function fnRetRefArraySid(sid: i32, name: string, fnIx: i32) {
-  repOfNameResult(sid, name, fnIx).rdKind == "reflist"
-}
-
 // True if the parameter `name` of function `fnIx` is a ref-array type.
 function paramRefArray(fnIx: i32, name: string) {
   const pt = paramTypeNode(fnIx, name)
@@ -31097,105 +31092,9 @@ function paramNulRefArray(fnIx: i32, name: string) {
   retNulRefArrFlag(paramTypeNode(fnIx, name)) == 1
 }
 
-// True if the already-collected declared local `name` is a ref-list ref (code `5`).
-function declaredRefArray(name: string) { declaredKind(name) == "reflist" }
-
-// True if evaluating the expression at `exprIx` yields a ref list: a ref-element array
-// literal, a ref-array-returning call, a ref-array param/local reference, or a
-// parenthesized ref-array expression. An index read / `.length` is NOT a list.
+// True if `exprIx` evaluates to a ref list: a projection of `exprListRep`.
 export function exprRefArray(exprIx: i32, fnIx: i32) {
-  if exprIx < 0 { return false }
-  const e = P.nodes[exprIx]
-  if e is ArrayLit { return arrLitIsRef(exprIx) }
-  if e is Paren { return exprRefArray(e.parInner, fnIx) }
-  // An if-expression is the list its join blocktype is (D2210).
-  if e is IfStmt { return ifExprRefKind(exprIx, fnIx) == "reflist" }
-  // `m[k]` / `m[k] ?? d` over a struct-LIST-valued map yields a struct ref list.
-  if mapReadListKind(exprIx, fnIx) == "reflist" { return true }
-  if e is Call {
-    // `__array_new__(n, {…})` builds a ref list of the element struct (kind 3).
-    if arrNewIntrKind(exprIx, fnIx) == 3 { return true }
-    const callee = P.nodes[e.callFn]
-    if callee is Ident {
-      if fnRetRefArraySid(sidOfNode(e.callFn), callee.identName, fnIx) {
-        return true
-      }
-      // A closure-VALUE callee returning a ref list (`mk: () => S[]`) — its resolved `$fnsig`
-      // result is the ref-list wrapper (`>r<slot>;`), so `mk()[i]` indexes it directly.
-      return calleeRetKindSid(sidOfNode(e.callFn), fnIx) == "reflist"
-    }
-    // A `.filter` over a struct/union array yields the SAME ref list (kind 2).
-    if callee is Member {
-      if mfResultKindOf(exprIx, fnIx) == "ref" { return true }
-    }
-    // `m.values()` over a struct- / nested-list- / nested-map-valued map yields a ref list.
-    if mapValuesResultKind(exprIx, fnIx) == 5 { return true }
-    // General fallback for a value call the resolvers above miss (a narrowed closure arm, a
-    // struct-field or indexed-element closure): resolves via `$fnsig`, mirroring the call emit.
-    const gk = cloCallSigKey(exprIx, fnIx)
-    if sigKeyRetKind(gk) == "reflist" {
-      const gs = sigKeyRetSlot(gk)
-      if gs >= 0 && gs < rlElemKindTbl.length { return true }
-    }
-    return false
-  }
-  if e is Ident {
-    // A union binding narrowed to a ref-element array arm unboxes to the reflist wrapper, so
-    // it is a ref array in the narrowed branch — checked first, ahead of its declared type.
-    if narrowedRefArrayOf(e.identName) != "" { return true }
-    // A kind-18 NULLABLE ref-array local is a ref array too (narrowed `if t != null`) — so indexing /
-    // `.length` reuse the ref-array machinery; the index emit recovers non-null for the niche receiver.
-    if declaredKind(e.identName) == "nulreflist" { return true }
-    // A nulreflist PARAM narrowed non-null is a ref array too — index / `.length` reuse the
-    // ref-array machinery (the index emit recovers non-null for the niche receiver).
-    if paramNulRefArray(fnIx, e.identName) { return true }
-    if paramRefArray(fnIx, e.identName) { return true }
-    if declaredRefArray(e.identName) { return true }
-    // A captured ref-array is the fourth storage class, asked of the function that typed the
-    // env field so the read cannot disagree — checked ahead of the shadow test and global arms.
-    if capturedRefListSlot(fnIx, e.identName) >= 0 { return true }
-    if identShadowedByFrame(fnIx, e.identName) { return false }
-    // A kind-18 nullable ref-array global is a ref array too — without this, an empty-`[]`
-    // init misclassified as an i32 list (invalid wasm) and a `null` init matched no classifier.
-    if globalIsNulRefArraySid(fnIx, sidOfNode(exprIx)) { return true }
-    return globalIsRefArraySid(fnIx, sidOfNode(exprIx))
-  }
-  // A field read `p.items` whose struct field is a `T[]`/`N[]` (code `5`) yields the ref
-  // list wrapper ref — so `.length` / indexing / assignment treat it as a ref list.
-  if e is Member {
-    // A union-box field narrowed to a ref-element array arm unboxes to that arm's reflist
-    // wrapper, so it is a ref array in the narrowed branch — the Ident arm's rule. D1014.
-    if narrowedRefArrayOfPlace(exprIx) != "" { return true }
-    if memFieldTypeCode(exprIx, fnIx) == 5 { return true }
-    if exprNullableRefArray(exprIx, fnIx) { return true }
-  }
-  // Indexing a nested ref array (`g[i]` where `g: S[][]`): each element is the inner ref
-  // list, so the index yields a ref array too — recurses for deeper nesting.
-  if e is Index {
-    // A union-box ELEMENT whose index PLACE is narrowed to a ref-element array arm
-    // (`if xs[0] is K[]`) — the index twin of the Member arm above (D1014).
-    if narrowedRefArrayOfPlace(exprIx) != "" { return true }
-    if exprRefArray(e.idxArr, fnIx) {
-      const slot = refListSlotOfExpr(e.idxArr, fnIx)
-      if slot >= 0 && slot < rlElemKindTbl.length {
-        return rlElemKindTbl[slot] == 9
-      }
-    }
-  }
-  // `p ?? d` over the `<ref-array> | null` niche is the ref-list wrapper in both halves —
-  // only nullability changes, matching the kind-18 Ident arms above.
-  const raLhs = coalesceNicheLhs(exprIx)
-  if raLhs >= 0 {
-    if exprNullableRefArray(raLhs, fnIx) { return true }
-  }
-  // A list concat `a + b` yields a new list of the operands' own rep. Must ask itself, not
-  // a shared classifier — routing through one would cost 14^depth on a left-nested chain. D721.
-  if e is BinExpr {
-    if e.binOp == "+" {
-      if exprRefArray(e.binLeft, fnIx) { return exprRefArray(e.binRight, fnIx) }
-    }
-  }
-  false
+  exprListRep(exprIx, fnIx) == "reflist"
 }
 
 // The ref-list ELEMENT type-NAME a ref-array param `name` of function `fnIx` declares
@@ -32746,10 +32645,8 @@ export function letAnnVariantIdx(letIx: i32) {
   -1
 }
 
-// Shared `g[i]` nested-array test for the scalar-element list families (string/f64/f32/i64):
-// indexing a `T[][]` ref list whose inner element kind is `elemKind` yields the inner `T[]`.
-// The four `exprXArray` walks used an identical block, parameterized here by `elemKind` (the
-// i32 `exprArray` and ref `exprRefArray` Index cases carry extra logic and stay inline).
+// True if indexing `idxArr`, a `T[][]` ref list whose inner element kind is `elemKind`, yields
+// the inner non-null `T[]`.
 function nestedRefListElemIs(idxArr: i32, fnIx: i32, elemKind: i32) {
   if exprRefArray(idxArr, fnIx) {
     const slot = refListSlotOfExpr(idxArr, fnIx)
@@ -32769,24 +32666,6 @@ function nestedRefListElemIs(idxArr: i32, fnIx: i32, elemKind: i32) {
 // a string list — a `(ref $mkListIdx)`. An index read `xs[i]` (a string) / `.length` (i32)
 // is not a list.
 
-// True if the already-collected declared local `name` is a string-list ref (code `7`).
-function declaredStringArray(name: string) { declaredKind(name) == "strlist" }
-
-// True if function `name` declares (or, un-annotated, infers) a `string[]` return type
-// (`"strlist"`). Mirrors `fnRetArray`/`fnRetRefArray` — lets a `string[]`-returning call
-// classify so an untyped `let x = snap()` picks the string-list local kind (code `7`).
-function fnRetStringArraySid(sid: i32, name: string, fnIx: i32) {
-  repOfNameResult(sid, name, fnIx).rdKind == "strlist"
-}
-
-// True if function `name` declares (or, un-annotated, infers) an `f64[]` return — the f64
-// analogue of `fnRetStringArray`, so an untyped `let x = mk()` / a call argument classifies as
-// an f64 list (kind 12) instead of falling through to i32. Resolved from frame `fnIx` for
-// `fnRetArraySid`'s reason.
-function fnRetF64ArraySid(sid: i32, name: string, fnIx: i32) {
-  repOfNameResult(sid, name, fnIx).rdKind == "f64list"
-}
-
 // True if function `name` returns a string-keyed mono map (`{[string]: i32}`, annotated or
 // inferred — `"map"`). Lets `exprMap`/`mapShapeOfExpr` classify a call to it, so
 // `const r = mk()` (or `mk()[k]`) routes through the map lowering.
@@ -32794,110 +32673,9 @@ function fnRetMapSid(sid: i32, name: string, fnIx: i32) {
   repOfNameResult(sid, name, fnIx).rdKind == "map"
 }
 
-// True if evaluating the expression at `exprIx` yields a string list: a string-element
-// array literal, a `string[]`-returning call, a `string[]` param/local reference, a
-// parenthesized string-array, or a `string[]` field read (code `6`). An index read /
-// `.length` is NOT a list.
+// True if `exprIx` evaluates to a `string[]`: a projection of `exprListRep`.
 export function exprStringArray(exprIx: i32, fnIx: i32) {
-  if exprIx < 0 { return false }
-  if tyKindOf(nodeTyPinIxOf(exprIx)) == 7 {
-    return true // typed-IR fast path (see exprIsF64)
-  }
-  // `m[k]` / `m[k] ?? d` over a string[]-VALUED map yields a string list.
-  if mapReadListKind(exprIx, fnIx) == "strlist" { return true }
-  const e = P.nodes[exprIx]
-  if e is ArrayLit {
-    if emptyArrHoleKind(exprIx) == "strlist" { return true }
-    return arrLitIsStr(exprIx, fnIx)
-  }
-  if e is Paren { return exprStringArray(e.parInner, fnIx) }
-  if e is IfStmt { return ifExprRefKind(exprIx, fnIx) == "strlist" }
-  if e is Call {
-    // `__array_new__(n, "s")` builds a string list (intrinsic kind 2).
-    if arrNewIntrKind(exprIx, fnIx) == 2 { return true }
-    // An INDEXED closure call `fs[i](x)` whose element signature returns `string[]`.
-    if cloArrCallRetKind(exprIx, fnIx) == "strlist" { return true }
-    // `xs.map(f)`/`xs.filter(p)` yield a new list — the string list exactly when the result
-    // element kind is a string; without it a `.filter` over `(string|null)[]` misclassified.
-    if callIsMapFilter(exprIx, fnIx) {
-      return mfResultKindOf(exprIx, fnIx) == "str"
-    }
-    // `xs.slice(...)` over a string list yields a string list.
-    if callIsArrSlice(exprIx, fnIx) {
-      return mfResultKindOf(exprIx, fnIx) == "str"
-    }
-    // `m.keys()` over a STRING-keyed map yields a string list of its keys; over the
-    // i32-keyed rep it yields an i32 list, which is not this classifier's answer.
-    const kcallee = P.nodes[e.callFn]
-    if kcallee is Member {
-      if kcallee.memProp == "keys" {
-        if exprMap(kcallee.memObj, fnIx) {
-          return !mapShapeKeyI32(mapShapeOfExpr(kcallee.memObj, fnIx))
-        }
-      }
-    }
-    // `m.values()` over a string-valued map (or a Set) yields a string list.
-    if mapValuesResultKind(exprIx, fnIx) == 7 { return true }
-    const callee = P.nodes[e.callFn]
-    if callee is Ident {
-      if fnRetStringArraySid(sidOfNode(e.callFn), callee.identName, fnIx) {
-        return true
-      }
-      // A closure-VALUE call (`g(x)` with `g: (i32) => string[]`) whose resolved sig
-      // result is the string list (`>A`).
-      return calleeRetKindSid(sidOfNode(e.callFn), fnIx) == "strlist"
-    }
-    return false
-  }
-  if e is Ident {
-    // A VALUE-union ident narrowed to a string-backed LIST arm (`is string[]`, `is
-    // (string | null)[]` — value-atom kind 9) reads UNBOXED as the string list.
-    if unionIdentReadKind(exprIx, fnIx) == 9 { return true }
-    // A `(string | null)[]` binding the checker pinned as a list, whose own declaration no
-    // storage rung below names: an un-annotated alias of a narrowed read (D2211).
-    const snPin = nodeTyPinIxOf(exprIx)
-    if snPin >= 0 {
-      if T.tys[snPin] is TyArray {
-        if nodeArrayElemIsNulStr(exprIx) { return true }
-      }
-    }
-    if paramStringArray(fnIx, e.identName) { return true }
-    if narrowedHoleNulScalarListKind(exprIx, fnIx) == "nulstrlist" {
-      return true
-    }
-    if declaredStringArray(e.identName) { return true }
-    if globalIsStringArraySid(fnIx, sidOfNode(exprIx)) {
-      if !identShadowedByFrame(fnIx, e.identName) { return true }
-    }
-    // A CAPTURED string-list read (incl. a boxed captured-mutated `string` local). Kind 7.
-    return capturedKindOf(fnIx, e.identName) == "strlist"
-  }
-  // A field read `p.names` whose field is a `string[]` (code `6`) yields the string-list
-  // wrapper ref — so `.length` / indexing / assignment / `.push` treat it as a string list.
-  if e is Member {
-    if memFieldTypeCode(exprIx, fnIx) == 6 { return true }
-  }
-  // `g[i]` over a `string[][]` (ref-list element kind 6 — the inner string-list wrapper)
-  // yields a `string[]`, so `g[i][j]` reads the string element.
-  if e is Index {
-    if nestedRefListElemIs(e.idxArr, fnIx, 6) { return true }
-  }
-  // `p ?? d` over the `string[] | null` niche is the string-list wrapper in BOTH halves — the
-  // rep is unchanged, only its nullability (`exprNulScalarListKind`'s own `??` arm).
-  const salLhs = coalesceNicheLhs(exprIx)
-  if salLhs >= 0 {
-    if exprNulScalarListKind(salLhs, fnIx) == "nulstrlist" { return true }
-  }
-  // A list concat `a + b` yields a new list of the operands' own rep. Must ask itself, not
-  // a shared classifier — routing through one would cost 14^depth on a left-nested chain. D721.
-  if e is BinExpr {
-    if e.binOp == "+" {
-      if exprStringArray(e.binLeft, fnIx) {
-        return exprStringArray(e.binRight, fnIx)
-      }
-    }
-  }
-  false
+  exprListRep(exprIx, fnIx) == "strlist"
 }
 
 // True if `name` is a `(string | null)[]`, also through one `| null` wrapper
@@ -33060,9 +32838,6 @@ export function letIsStringArray(letIx: i32, fnIx: i32) {
 
 // Parallel to the i32/string-array families: decide whether an expression / param / local
 // produces an `f64[]` list. Drives the index-read dispatch and the f64-list cell kind (`12`).
-
-// True if the already-collected declared local `name` is an f64-list ref (code `12`).
-function declaredF64Array(name: string) { declaredKind(name) == "f64list" }
 
 // The scalar-list wrapper kind of an array type whose element rides a scalar list's backing
 // without being a `TyPrim` — `"list"` for a literal-union `K[]` and its nullable niches (the
@@ -33241,74 +33016,9 @@ function tyKindOfDesc(tyIx: i32): i32 {
 // `calleeRetKind` doesn't map to a list kind) without a bespoke per-position predicate.
 function tyIsF64Array(tyIx: i32) { tyKindOf(tyIx) == 12 }
 
+// True if `exprIx` evaluates to an `f64[]`: a projection of `exprListRep`.
 export function exprF64Array(exprIx: i32, fnIx: i32) {
-  if exprIx < 0 { return false }
-  // Typed-IR fast path: trust the checker's recorded type when it has one. A monomorphized
-  // instance body reads back -1 and falls through to the syntactic derivation unaffected.
-  if tyIsF64Array(nodeTyPinIxOf(exprIx)) { return true }
-  // `m[k]` / `m[k] ?? d` over an f64[]-VALUED map yields an f64 list.
-  if mapReadListKind(exprIx, fnIx) == "f64list" { return true }
-  const e = P.nodes[exprIx]
-  if e is ArrayLit {
-    if emptyArrHoleKind(exprIx) == "f64list" { return true }
-    return arrLitIsF64(exprIx, fnIx)
-  }
-  if e is Paren { return exprF64Array(e.parInner, fnIx) }
-  if e is Ident {
-    // A VALUE-union ident narrowed to the `f64[]` LIST arm (value-atom kind 8) reads
-    // UNBOXED as the f64 list — the string/i32-list classifiers carry the same arm.
-    if unionIdentReadKind(exprIx, fnIx) == 8 { return true }
-    if paramF64Array(fnIx, e.identName) { return true }
-    if narrowedHoleNulScalarListKind(exprIx, fnIx) == "nulf64list" {
-      return true
-    }
-    if declaredF64Array(e.identName) { return true }
-    if globalIsF64ArraySid(fnIx, sidOfNode(exprIx)) {
-      if !identShadowedByFrame(fnIx, e.identName) { return true }
-    }
-    // A CAPTURED f64-list read (`xs[i]` inside a closure capturing `xs` — incl. a boxed
-    // captured-mutated `f64` local, lowered to a length-1 `f64[]`). Kind 12 = f64 list.
-    return capturedKindOf(fnIx, e.identName) == "f64list"
-  }
-  // A `.map`/`.filter` whose result ELEMENT kind is f64 yields an f64 list (an f64
-  // receiver's filter, or a map whose callback returns f64). (Slices 3–4.)
-  if e is Call {
-    // `__array_new__(n, <f64 fill>)` yields an f64 list.
-    if arrNewIntrKind(exprIx, fnIx) == 1 { return true }
-    if callIsMapFilter(exprIx, fnIx) {
-      return mfResultKindOf(exprIx, fnIx) == "f64"
-    }
-    // `xs.slice(...)` over an f64 list yields an f64 list.
-    if callIsArrSlice(exprIx, fnIx) {
-      return mfResultKindOf(exprIx, fnIx) == "f64"
-    }
-    // An INDEXED closure call `fs[i](x)` whose element signature returns `f64[]`.
-    if cloArrCallRetKind(exprIx, fnIx) == "f64list" { return true }
-    const callee = P.nodes[e.callFn]
-    if callee is Ident {
-      // A NAMED function returning `f64[]` (annotated or inferred, `"f64list"`).
-      if fnRetF64ArraySid(sidOfNode(e.callFn), callee.identName, fnIx) {
-        return true
-      }
-      // A closure-VALUE call (`g(x)` with `g: (i32) => f64[]`) whose resolved sig
-      // result is the f64 list (`>D`).
-      return calleeRetKindSid(sidOfNode(e.callFn), fnIx) == "f64list"
-    }
-    return false
-  }
-  // `g[i]` over an `f64[][]` (ref-list element kind 7 — the inner f64-list wrapper) yields an
-  // `f64[]`, so `g[i][j]` reads the f64 scalar.
-  if e is Index {
-    if nestedRefListElemIs(e.idxArr, fnIx, 7) { return true }
-  }
-  // A list concat `a + b` yields a new list of the operands' own rep. Must ask itself, not
-  // a shared classifier — routing through one would cost 14^depth on a left-nested chain. D721.
-  if e is BinExpr {
-    if e.binOp == "+" {
-      if exprF64Array(e.binLeft, fnIx) { return exprF64Array(e.binRight, fnIx) }
-    }
-  }
-  false
+  exprListRep(exprIx, fnIx) == "f64list"
 }
 
 // ── f32-array typedness (the f32 sibling of the f64-array family, rep code 21) ───
@@ -33317,16 +33027,10 @@ export function exprF64Array(exprIx: i32, fnIx: i32) {
 // the syntactic f32 rungs in `exprListRep`. A bare `[1.5]` literal stays f64; a value is f32[]
 // only when a declared type or an f32 element says so.
 
-function declaredF32Array(name: string) { declaredKind(name) == "f32list" }
-
 function globalIsF32ArraySid(fnIx: i32, sid: i32) {
   const li = globalLetOfSidIn(fnIx, sid)
   if li < 0 { return false }
   letIsF32Array(li, -1)
-}
-
-function fnRetF32ArraySid(sid: i32, name: string, fnIx: i32) {
-  repOfNameResult(sid, name, fnIx).rdKind == "f32list"
 }
 
 // True if function `name` carries an annotated `f32[]` return — read straight off the
@@ -33427,54 +33131,9 @@ function annIsU8Array(tyIx: i32) {
   false
 }
 
-// True if `exprIx` evaluates to a `u8[]` — the packed byte list. The arena is enough here,
-// unlike `exprF32Array`'s per-position syntactic arms: nothing infers to `u8[]`, so the
-// recorded type says `u8[]` exactly when an annotation put it there, at every position.
+// True if `exprIx` evaluates to a `u8[]`: a projection of `exprListRep`.
 export function exprU8Array(exprIx: i32, fnIx: i32) {
-  if exprIx < 0 { return false }
-  if tyIsU8ArrayTy(nodeTyPinIxOf(exprIx)) { return true }
-  const e = P.nodes[exprIx]
-  if e is Paren { return exprU8Array(e.parInner, fnIx) }
-  if e is Call {
-    // A call of a NAMED function with an annotated `u8[]` return. The recorded type above
-    // answers at most positions; this reads the callee's own annotation for the ones it
-    // does not, which is how `const xs = mk()` binds the packed wrapper.
-    const cf = P.nodes[e.callFn]
-    if cf is Ident {
-      const cfi = fnIndexOfSid(sidOfNode(e.callFn))
-      if cfi >= 0 {
-        const fd = P.nodes[fnStmts[cfi]]
-        if fd is FuncDecl { return annIsU8Array(fd.fnRet) }
-      }
-    }
-    return false
-  }
-  if e is Ident {
-    // No narrowed-union arm here, unlike `exprArray`/`exprF32Array`: `u8[]`'s `TyPrim("u8")`
-    // element survives narrowing, so the arena leg above already answers every narrowed read.
-    // The three name positions it doesn't reach — a param inside its own body, a declared
-    // local, a module global — each ask the declaration that fixed the cell's kind instead.
-    if annIsU8Array(paramTypeNode(fnIx, e.identName)) { return true }
-    if narrowedHoleNulScalarListKind(exprIx, fnIx) == "nulu8list" {
-      return true
-    }
-    if declaredKind(e.identName) == "u8list" { return true }
-    const gli = globalLetOfSidIn(fnIx, sidOfNode(exprIx))
-    if gli >= 0 {
-      if letIsU8Array(gli, -1) {
-        return !identShadowedByFrame(fnIx, e.identName)
-      }
-    }
-    return false
-  }
-  // A list concat `a + b` yields a new list of the operands' own rep. Must ask itself, not
-  // a shared classifier — routing through one would cost 14^depth on a left-nested chain. D721.
-  if e is BinExpr {
-    if e.binOp == "+" {
-      if exprU8Array(e.binLeft, fnIx) { return exprU8Array(e.binRight, fnIx) }
-    }
-  }
-  false
+  exprListRep(exprIx, fnIx) == "u8list"
 }
 
 // How `k` relates to the list reps: 1 for one of the seven non-null lists, 2 for a nullable
@@ -33501,116 +33160,526 @@ function listRepOrNull(k: VKind | null): VKind | null {
 }
 
 // The non-null list rep the expression at `exprIx` produces, or null when this cannot name one.
-// The recorded type answers first: a list rep is the answer (an f64 one yields to an f32
-// syntactic claim, since a float literal types f64), and any other covered rep but a nullable
-// list's is a no, so the syntactic rungs run only where no type settled it (D2270).
+// The recorded type answers first, then the expression's shape. Each `expr*Array` predicate is
+// this answer compared with one kind, so no two of them can claim one expression (D2275).
 export function exprListRep(exprIx: i32, fnIx: i32): VKind | null {
   if exprIx < 0 { return null }
-  const a = arenaRepKind(exprIx)
-  if a != null {
-    const c = vkListClass(a)
-    if c == 1 && a != "f64list" { return a }
-    if c == 0 { return null }
+  if lrDepth == 0 { lrGen = lrGen + 1 }
+  if exprIx < lrMemoGen.length {
+    if lrMemoGen[exprIx] == lrGen && lrMemoFn[exprIx] == fnIx {
+      if lrMemoNul[exprIx] == 1 { return null }
+      return lrMemoKind[exprIx]
+    }
+  }
+  lrDepth = lrDepth + 1
+  const k = exprListRepOf(exprIx, fnIx)
+  lrDepth = lrDepth - 1
+  while lrMemoGen.length <= exprIx {
+    lrMemoGen.push(0)
+    lrMemoFn.push(-1)
+    lrMemoKind.push("list")
+    lrMemoNul.push(1)
+  }
+  lrMemoGen[exprIx] = lrGen
+  lrMemoFn[exprIx] = fnIx
+  if k == null {
+    lrMemoNul[exprIx] = 1
+  } else {
+    lrMemoKind[exprIx] = k
+    lrMemoNul[exprIx] = 0
+  }
+  k
+}
+
+// `exprListRep`'s answers during one outermost query, indexed by expression and stamped with
+// that query's generation, so an answer never outlives the query that computed it. A global's
+// initializer is asked once per list kind its declaration is tested for; without the memo a
+// chain of global aliases costs that many times more per link. `lrMemoNul` 1 marks a null.
+let lrDepth = 0
+let lrGen = 0
+const lrMemoGen: i32[] = []
+const lrMemoFn: i32[] = []
+const lrMemoKind: VKind[] = []
+const lrMemoNul: i32[] = []
+
+// `exprListRep` unmemoised. A recorded scalar, object, function or map type is no list, except
+// at a call, whose record can be another instantiation's. A recorded array over a primitive is
+// its list unless a float literal or spread built another; a recorded `f64[]` yields to an f32
+// shape, and the unpinned `i32[]` to any shape.
+function exprListRepOf(exprIx: i32, fnIx: i32): VKind | null {
+  const pin = nodeTyPinIxOf(exprIx)
+  const raw = nodeTyIxOf(exprIx)
+  const e = P.nodes[exprIx]
+  if pin >= 0 && pin == raw && !(e is Call) {
+    const t = T.tys[pin]
+    if t is TyPrim || t is TyObj || t is TyFunc || t is TyMap || t is TyLit {
+      return null
+    }
+  }
+  const pk = tyPrimLeafListKind(pin)
+  if pk == "strlist" || pk == "i64list" || pk == "u8list" { return pk }
+  if pk == "f32list" {
+    if !(e is ArrayLit || e is Index) { return pk }
+  }
+  if pk == "list" && pin == raw && !arrLitHasSpread(exprIx) { return pk }
+  const rd = arenaRepOf(pin)
+  if rd.rdCovered == 1 && rd.rdKind == "f32list" {
+    if !(e is ArrayLit || e is Index) { return "f32list" }
+  }
+  const a = arenaListRep(exprIx, pin, rd)
+  if a != null && a != "f64list" && a != "list" { return a }
+  // A concat's recorded list is its rep, a ref list's included; its operands are not asked, so
+  // a chain stays linear (D2275).
+  if e is BinExpr {
+    if e.binOp == "+" {
+      if a != null { return a }
+      if rd.rdCovered == 1 && rd.rdKind == "reflist" { return "reflist" }
+    }
   }
   const s = syntacticListRep(exprIx, fnIx)
   if a == "f64list" && s != "f32list" { return a }
+  if a == "list" && s == null { return a }
   s
 }
 
-// The rep kind of the checker's recorded type at `exprIx`, or null when it has none. A literal
-// and an index are never asked: a literal's recorded type is not the rep it builds, and an
-// index's rep comes from its container's element row.
-function arenaRepKind(exprIx: i32): VKind | null {
-  const e = P.nodes[exprIx]
-  if e is ArrayLit || e is Index { return null }
-  const rd = repOfTy(nodeTyPinIxOf(exprIx))
-  if rd.rdCovered != 1 { return null }
-  rd.rdKind
+// The descriptor of the recorded type `pin` when it can name a list rep: an array, or a type
+// variable or union that may stand for one. Uncovered for every other type, which asks nothing.
+function arenaRepOf(pin: i32): RepDesc {
+  if pin >= 0 {
+    const t = T.tys[pin]
+    if t is TyArray || t is TyVar || t is TyUnion { return repOfTy(pin) }
+  }
+  repOfTy(-1)
 }
 
-// `exprListRep`'s answer from the expression's shape alone, for a node with no recorded type.
-function syntacticListRep(exprIx: i32, fnIx: i32): VKind | null {
-  // A read of a list-valued map (`m[k] ?? []`, or a bare `m[k]`) is the map's value-list rep.
-  const mk = listRepOrNull(mapReadListKind(exprIx, fnIx))
-  if mk != null { return mk }
-  const e = P.nodes[exprIx]
-  if e is ArrayLit {
-    const hk = listRepOrNull(emptyArrHoleKind(exprIx))
-    if hk != null { return hk }
-    if arrLitIsF32(exprIx, fnIx) { return "f32list" }
-    return null
+// The scalar list rep the recorded type `pin` of `exprIx` names, in `tyKindOf`'s vocabulary,
+// read off its descriptor `rd`. The i32 list is read off the unpinned type, and never for a
+// spread literal, whose rep is its source's rather than the type the literal adopted.
+function arenaListRep(exprIx: i32, pin: i32, rd: RepDesc): VKind | null {
+  if pin >= 0 {
+    if T.tys[pin] is TyArray {
+      if tyIsU8ArrayTy(pin) { return "u8list" }
+      const k = arrayKindCode(pin, rd)
+      if k == 7 { return "strlist" }
+      if k == 12 { return "f64list" }
+      if k == 20 { return "i64list" }
+    }
   }
-  if e is Paren { return exprListRep(e.parInner, fnIx) }
-  // An if-expression is its join's rep, read off the arm that decides it.
-  if e is IfStmt { return listRepOrNull(ifExprRefKind(exprIx, fnIx)) }
-  if e is Ident {
-    if identIsF32List(exprIx, fnIx) { return "f32list" }
-    return null
-  }
-  // A struct-field read of an `f32[]` field (code 27).
-  if e is Member {
-    if memberFieldCode(exprIx, fnIx) == 27 { return "f32list" }
-    return null
-  }
-  if e is Call {
-    if callIsF32List(exprIx, fnIx) { return "f32list" }
-    return null
-  }
-  // `g[i]` over an `f32[][]` (ref-list element kind 10) yields the inner `f32[]`.
-  if e is Index {
-    if nestedRefListElemIs(e.idxArr, fnIx, 10) { return "f32list" }
-    return null
-  }
-  // A list concat `a + b` is a new list of its operands' shared rep. Each side is asked once,
-  // so a left-nested chain stays linear (D721).
-  if e is BinExpr {
-    if e.binOp == "+" {
-      const l = exprListRep(e.binLeft, fnIx)
-      if l != null {
-        if exprListRep(e.binRight, fnIx) == l { return l }
+  if arrLitHasSpread(exprIx) { return null }
+  const raw = nodeTyIxOf(exprIx)
+  if raw >= 0 {
+    if T.tys[raw] is TyArray {
+      if raw == pin {
+        if arrayKindCode(raw, rd) == 2 { return "list" }
+      } else {
+        if tyKindOf(raw) == 2 { return "list" }
       }
     }
   }
   null
 }
 
-// True if the name read at `exprIx` is an f32 list: a narrowed value-union arm, a parameter,
-// a narrowed nullable hole, a declared local, a module global, or a capture.
-function identIsF32List(exprIx: i32, fnIx: i32) {
-  const e = P.nodes[exprIx]
-  if e is Ident {
-    if unionIdentReadKind(exprIx, fnIx) == 12 { return true }
-    if paramF32Array(fnIx, e.identName) { return true }
-    if narrowedHoleNulScalarListKind(exprIx, fnIx) == "nulf32list" {
-      return true
-    }
-    if declaredF32Array(e.identName) { return true }
-    if globalIsF32ArraySid(fnIx, sidOfNode(exprIx)) {
-      if !identShadowedByFrame(fnIx, e.identName) { return true }
-    }
-    return capturedKindOf(fnIx, e.identName) == "f32list"
+// `tyKindOf(ty)` for an array type `ty` whose descriptor `rd` is already in hand.
+function arrayKindCode(ty: i32, rd: RepDesc): i32 {
+  const t = T.tys[ty]
+  if t is TyArray {
+    if t.aElem < 0 { return -1 }
+    if numLitUnionBaseTy(t.aElem) >= 0 { return tyKindOf(ty) }
+    if tyIsLitUnion(t.aElem) { return -1 }
+    if rd.rdCovered == 0 { return -1 }
+    return tyKindCodeOfVKind(rd.rdKind)
   }
+  -1
+}
+
+// True if `exprIx` is an array literal with a spread item.
+function arrLitHasSpread(exprIx: i32) {
+  const e = P.nodes[exprIx]
+  if e is ArrayLit { return hasSpreadItem(e.arrElems) }
   false
 }
 
-// True if the call at `exprIx` yields an f32 list: `__array_new__` with an f32 fill (D1673), a
-// `.map`/`.filter`/`.slice` whose result element is f32, or a callee whose return is `f32[]`.
-function callIsF32List(exprIx: i32, fnIx: i32) {
+// A position whose syntactic answer is narrowed to the list reps some old `expr*Array` rung
+// named there. Each gate is an open step: un-gating one is a behaviour change graded on its own
+// `list-kind-grid.py --only <kind>` run (D2277).
+type ListRepGate = "map-read"
+  | "if-join"
+  | "empty-hole"
+  | "spread"
+  | "narrowed-hole"
+  | "capture"
+  | "member-field"
+  | "closure-array-call"
+  | "map-filter"
+  | "callee-return"
+  | "callee-value"
+  | "coalesce"
+
+// `k` when it names a non-null list rep position `g` answers, else null.
+function gatedListRep(k: VKind | null, g: ListRepGate): VKind | null {
+  const r = listRepOrNull(k)
+  if r == null { return null }
+  if listRepGateAdmits(g, r) { return r }
+  null
+}
+
+// Whether position `g` answers the non-null list rep `k`.
+function listRepGateAdmits(g: ListRepGate, k: VKind): boolean {
+  match g {
+    "map-read" | "capture" | "callee-value" | "map-filter" => {
+      return k != "u8list"
+    }
+    "narrowed-hole" => {
+      return k != "list" && k != "reflist"
+    }
+    "if-join" => {
+      return k == "strlist" || k == "f32list" || k == "reflist"
+    }
+    "empty-hole" => {
+      return k == "strlist" ||
+        k == "f64list" ||
+        k == "i64list" ||
+        k == "f32list"
+    }
+    "spread" => {
+      return k != "u8list" && k != "reflist"
+    }
+    "member-field" => {
+      return k == "list" || k == "reflist" || k == "strlist" || k == "f32list"
+    }
+    "closure-array-call" => {
+      return k == "list" || k == "strlist" || k == "f64list"
+    }
+    "callee-return" => {
+      return k != "u8list" && k != "i64list"
+    }
+    "coalesce" => {
+      return k == "strlist"
+    }
+  }
+}
+
+// The non-null list rep of the nullable list niche `k`, else null.
+function nulListBase(k: VKind | null): VKind | null {
+  if k == null { return null }
+  match k {
+    "nullist" => {
+      return "list"
+    }
+    "nulu8list" => {
+      return "u8list"
+    }
+    "nuli64list" => {
+      return "i64list"
+    }
+    "nulf32list" => {
+      return "f32list"
+    }
+    "nulf64list" => {
+      return "f64list"
+    }
+    "nulstrlist" => {
+      return "strlist"
+    }
+    "nulreflist" => {
+      return "reflist"
+    }
+    "list" | "u8list" | "i64list" | "f32list" | "f64list" | "strlist" | "reflist" | "i32" | "struct" | "str" | "union" | "map" | "variant" | "nulvariant" | "nulstruct" | "i64" | "f64" | "f32" | "v128" | "closure" | "nulstr" | "nulbool" | "nulclosure" | "nulmap" | "nulnone" => {
+      return null
+    }
+  }
+}
+
+// The list rep whose element is the `.map`/`.filter`/`.slice`/spread element kind `k`.
+function listRepOfMf(k: MfKind | null): VKind | null {
+  if k == null { return null }
+  match k {
+    "i32" => {
+      return "list"
+    }
+    "u8" => {
+      return "u8list"
+    }
+    "i64" => {
+      return "i64list"
+    }
+    "f32" => {
+      return "f32list"
+    }
+    "f64" => {
+      return "f64list"
+    }
+    "str" => {
+      return "strlist"
+    }
+    "ref" => {
+      return "reflist"
+    }
+  }
+}
+
+// `exprListRep`'s answer from the expression's shape alone, for a node no recorded type settled.
+function syntacticListRep(exprIx: i32, fnIx: i32): VKind | null {
+  // A read of a list-valued map (`m[k] ?? []`, or a bare `m[k]`) is the map's value-list rep.
+  const mk = gatedListRep(mapReadListKind(exprIx, fnIx), "map-read")
+  if mk != null { return mk }
+  const e = P.nodes[exprIx]
+  if e is ArrayLit { return arrLitListRep(exprIx, fnIx) }
+  if e is Paren { return exprListRep(e.parInner, fnIx) }
+  // An if-expression is its join's rep, read off the arm that decides it (D2210).
+  if e is IfStmt { return gatedListRep(ifExprRefKind(exprIx, fnIx), "if-join") }
+  if e is Ident { return identListRep(exprIx, fnIx) }
+  if e is Member { return memberListRep(exprIx, fnIx) }
+  if e is Call { return callListRep(exprIx, fnIx) }
+  if e is Index { return indexListRep(exprIx, fnIx) }
+  if e is BinExpr { return binListRep(exprIx, fnIx) }
+  null
+}
+
+// The list rep an array literal builds: an element-pinned empty literal's hole, a spread's
+// source rep, then its elements' kind. Any other literal of non-ref elements is the i32 list.
+function arrLitListRep(exprIx: i32, fnIx: i32): VKind | null {
+  const a = P.nodes[exprIx]
+  if a is ArrayLit {
+    const hk = gatedListRep(emptyArrHoleKind(exprIx), "empty-hole")
+    if hk != null { return hk }
+    if hasSpreadItem(a.arrElems) {
+      const sk = listRepOfMf(spreadDestKind(a.arrElems, fnIx))
+      const gk = gatedListRep(sk, "spread")
+      if gk != null { return gk }
+      if arrLitIsRef(exprIx) { return "reflist" }
+      return null
+    }
+    if arrLitIsRef(exprIx) { return "reflist" }
+    if arrLitIsStr(exprIx, fnIx) { return "strlist" }
+    if arrLitIsF32(exprIx, fnIx) { return "f32list" }
+    if arrLitIsI64(exprIx, fnIx) { return "i64list" }
+    if arrLitIsF64(exprIx, fnIx) { return "f64list" }
+    return "list"
+  }
+  null
+}
+
+// The list rep of the name read at `exprIx`: a narrowed union arm, then the binding's own
+// declaration — a parameter, a narrowed nullable hole, a local, a capture, a module global.
+function identListRep(exprIx: i32, fnIx: i32): VKind | null {
+  const e = P.nodes[exprIx]
+  if e is Ident {
+    const n = e.identName
+    const uk = unionIdentReadKind(exprIx, fnIx)
+    if uk == 8 { return "f64list" }
+    if uk == 9 { return "strlist" }
+    if uk == 12 { return "f32list" }
+    if narrowedRefArrayOf(n) != "" { return "reflist" }
+    if uk == 7 { return "list" }
+    if valueAtomKind(narrowedValueAtomOf(n)) == 7 { return "list" }
+    // A `(string | null)[]` binding the checker pinned as a list, whose own declaration no
+    // storage rung below names: an un-annotated alias of a narrowed read (D2211).
+    const snPin = nodeTyPinIxOf(exprIx)
+    if snPin >= 0 {
+      if T.tys[snPin] is TyArray {
+        if nodeArrayElemIsNulStr(exprIx) { return "strlist" }
+      }
+    }
+    const pk = paramListRep(fnIx, n)
+    if pk != null { return pk }
+    const hk = gatedListRep(
+      nulListBase(narrowedHoleNulScalarListKind(exprIx, fnIx)),
+      "narrowed-hole",
+    )
+    if hk != null { return hk }
+    const dk = declaredKind(n)
+    if dk == "nullist" { return "list" }
+    if dk == "nulreflist" { return "reflist" }
+    const dl = listRepOrNull(dk)
+    if dl != null { return dl }
+    if capturedRefListSlot(fnIx, n) >= 0 { return "reflist" }
+    const ck = gatedListRep(capturedKindOf(fnIx, n), "capture")
+    if ck != null { return ck }
+    if identShadowedByFrame(fnIx, n) { return null }
+    return globalListRep(fnIx, sidOfNode(exprIx))
+  }
+  null
+}
+
+// The list rep parameter `name` of function `fnIx` declares, a nullable i32 or ref list's included.
+function paramListRep(fnIx: i32, name: string): VKind | null {
+  if paramStringArray(fnIx, name) { return "strlist" }
+  if paramF64Array(fnIx, name) { return "f64list" }
+  if paramI64Array(fnIx, name) { return "i64list" }
+  if paramF32Array(fnIx, name) { return "f32list" }
+  if annIsU8Array(paramTypeNode(fnIx, name)) { return "u8list" }
+  if paramNulRefArray(fnIx, name) { return "reflist" }
+  if paramRefArray(fnIx, name) { return "reflist" }
+  if paramArray(fnIx, name) { return "list" }
+  if paramNulList(fnIx, name) { return "list" }
+  null
+}
+
+// The list rep of the module global the name at `sid` resolves to from frame `fnIx`.
+function globalListRep(fnIx: i32, sid: i32): VKind | null {
+  if globalIsStringArraySid(fnIx, sid) { return "strlist" }
+  if globalIsF64ArraySid(fnIx, sid) { return "f64list" }
+  if globalIsI64ArraySid(fnIx, sid) { return "i64list" }
+  if globalIsF32ArraySid(fnIx, sid) { return "f32list" }
+  const gli = globalLetOfSidIn(fnIx, sid)
+  if gli >= 0 {
+    if letIsU8Array(gli, -1) { return "u8list" }
+  }
+  if globalIsNulRefArraySid(fnIx, sid) { return "reflist" }
+  if globalIsRefArraySid(fnIx, sid) { return "reflist" }
+  if globalIsArraySid(fnIx, sid) { return "list" }
+  if globalIsNulListSid(fnIx, sid) { return "list" }
+  null
+}
+
+// The list rep of the field read at `exprIx`: a place narrowed to a ref-list arm (D1014),
+// then the field's declared code, a nullable i32 or ref list's included.
+function memberListRep(exprIx: i32, fnIx: i32): VKind | null {
+  if narrowedRefArrayOfPlace(exprIx) != "" { return "reflist" }
+  const fk = gatedListRep(memberFieldListRep(exprIx, fnIx), "member-field")
+  if fk != null { return fk }
+  if exprNullableRefArray(exprIx, fnIx) { return "reflist" }
+  null
+}
+
+// The list rep the field code of the read at `exprIx` names: `i32[]` (4, or 18 nullable), a
+// ref list (5), `string[]` (6) or `f32[]` (27), else null.
+function memberFieldListRep(exprIx: i32, fnIx: i32): VKind | null {
+  const c = memFieldTypeCode(exprIx, fnIx)
+  if c == 4 || c == 18 { return "list" }
+  if c == 5 { return "reflist" }
+  if c == 6 { return "strlist" }
+  if memberFieldCode(exprIx, fnIx) == 27 { return "f32list" }
+  null
+}
+
+// The list rep the call at `exprIx` yields: an `__array_new__` fill's kind, an indexed
+// closure's signature, a `.map`/`.filter`/`.slice` result, the callee's return, or a map's
+// `.keys()`/`.values()`.
+function callListRep(exprIx: i32, fnIx: i32): VKind | null {
   const e = P.nodes[exprIx]
   if e is Call {
-    if arrNewIntrKind(exprIx, fnIx) == 6 { return true }
+    const ak = arrNewIntrKind(exprIx, fnIx)
+    if ak == 0 { return "list" }
+    if ak == 1 { return "f64list" }
+    if ak == 2 { return "strlist" }
+    if ak == 3 { return "reflist" }
+    if ak == 4 { return "i64list" }
+    if ak == 6 { return "f32list" }
+    const ck = gatedListRep(
+      cloArrCallRetKind(exprIx, fnIx),
+      "closure-array-call",
+    )
+    if ck != null { return ck }
     if callIsMapFilter(exprIx, fnIx) || callIsArrSlice(exprIx, fnIx) {
-      return mfResultKindOf(exprIx, fnIx) == "f32"
+      return gatedListRep(
+        listRepOfMf(mfResultKindOf(exprIx, fnIx)),
+        "map-filter",
+      )
     }
+    const callee = P.nodes[e.callFn]
+    if callee is Ident { return calleeListRep(exprIx, fnIx) }
+    if callee is Member {
+      if mfResultKindOf(exprIx, fnIx) == "ref" { return "reflist" }
+      if callee.memProp == "keys" {
+        if exprMap(callee.memObj, fnIx) {
+          if mapShapeKeyI32(mapShapeOfExpr(callee.memObj, fnIx)) {
+            return "list"
+          }
+          return "strlist"
+        }
+      }
+    }
+    const vk = mapValuesResultKind(exprIx, fnIx)
+    if vk == 2 { return "list" }
+    if vk == 7 { return "strlist" }
+    if vk == 5 { return "reflist" }
+    // A value call the resolvers above miss (a narrowed closure arm, a struct-field or
+    // indexed-element closure) resolves through its `$fnsig`, as the call emit does.
+    const gk = cloCallSigKey(exprIx, fnIx)
+    if sigKeyRetKind(gk) == "reflist" {
+      const gs = sigKeyRetSlot(gk)
+      if gs >= 0 && gs < rlElemKindTbl.length { return "reflist" }
+    }
+  }
+  null
+}
+
+// The list rep a call of a named callee returns: its resolved return rep (the i64 list is left
+// to the recorded type), an annotated `f32[]` or `u8[]` return, or a closure value's signature.
+function calleeListRep(exprIx: i32, fnIx: i32): VKind | null {
+  const e = P.nodes[exprIx]
+  if e is Call {
     const callee = P.nodes[e.callFn]
     if callee is Ident {
       const sid = sidOfNode(e.callFn)
-      if fnRetF32ArraySid(sid, callee.identName, fnIx) { return true }
-      if fnRetAnnF32ArraySid(sid, callee.identName, fnIx) { return true }
-      return calleeRetKindSid(sid, fnIx) == "f32list"
+      const rk = gatedListRep(
+        repOfNameResult(sid, callee.identName, fnIx).rdKind,
+        "callee-return",
+      )
+      if rk != null { return rk }
+      if fnRetAnnF32ArraySid(sid, callee.identName, fnIx) { return "f32list" }
+      const cfi = fnIndexOfSid(sid)
+      if cfi >= 0 {
+        const fd = P.nodes[fnStmts[cfi]]
+        if fd is FuncDecl {
+          if annIsU8Array(fd.fnRet) { return "u8list" }
+        }
+      }
+      return gatedListRep(calleeRetKindSid(sid, fnIx), "callee-value")
     }
   }
-  false
+  null
+}
+
+// The list rep an index read yields: a place narrowed to a ref-list arm (D1014), or the
+// element of a nested list, which is itself a list unless its row is a nullable scalar niche.
+function indexListRep(exprIx: i32, fnIx: i32): VKind | null {
+  const e = P.nodes[exprIx]
+  if e is Index {
+    if narrowedRefArrayOfPlace(exprIx) != "" { return "reflist" }
+    if exprRefArray(e.idxArr, fnIx) {
+      const slot = refListSlotOfExpr(e.idxArr, fnIx)
+      if slot >= 0 && slot < rlElemKindTbl.length {
+        const ek = rlElemKindTbl[slot]
+        if ek == 9 { return "reflist" }
+        if rlElemNullable[slot] == 1 { return null }
+        if ek == 4 { return "list" }
+        if ek == 6 { return "strlist" }
+        if ek == 7 { return "f64list" }
+        if ek == 8 { return "i64list" }
+        if ek == 10 { return "f32list" }
+      }
+    }
+  }
+  null
+}
+
+// The list rep of a binary expression: a concat `a + b` is a new list of its operands' shared
+// rep, each side asked once so a left-nested chain stays linear (D721); `p ?? d` over an i32,
+// string or ref list niche is that list's wrapper in both halves.
+function binListRep(exprIx: i32, fnIx: i32): VKind | null {
+  const e = P.nodes[exprIx]
+  if e is BinExpr {
+    if e.binOp == "+" {
+      const l = exprListRep(e.binLeft, fnIx)
+      if l != null {
+        if exprListRep(e.binRight, fnIx) == l { return l }
+      }
+      return null
+    }
+    if e.binOp == "??" {
+      const nk = gatedListRep(
+        nulListBase(exprNulScalarListKind(e.binLeft, fnIx)),
+        "coalesce",
+      )
+      if nk != null { return nk }
+      if exprNullableRefArray(e.binLeft, fnIx) { return "reflist" }
+      if exprNullableList(e.binLeft, fnIx) { return "list" }
+    }
+  }
+  null
 }
 
 // True if `exprIx` evaluates to an `f32[]`: a projection of `exprListRep`.
@@ -33624,8 +33693,6 @@ export function exprF32Array(exprIx: i32, fnIx: i32) {
 // typed-IR fast path carries annotated cases; the syntactic fallback covers a
 // monomorphized body whose nodes have no recorded type.
 function tyIsI64Array(tyIx: i32) { tyKindOf(tyIx) == 20 }
-
-function declaredI64Array(name: string) { declaredKind(name) == "i64list" }
 
 export function letIsI64Array(letIx: i32, fnIx: i32) {
   const d = P.nodes[letIx]
@@ -33681,62 +33748,9 @@ export function arrLitIsI64(arrIx: i32, fnIx: i32) {
   false
 }
 
+// True if `exprIx` evaluates to an `i64[]`: a projection of `exprListRep`.
 export function exprI64Array(exprIx: i32, fnIx: i32) {
-  if exprIx < 0 { return false }
-  if tyIsI64Array(nodeTyPinIxOf(exprIx)) { return true }
-  // `m[k]` / `m[k] ?? d` over an i64[]-VALUED map yields an i64 list.
-  if mapReadListKind(exprIx, fnIx) == "i64list" { return true }
-  const e = P.nodes[exprIx]
-  if e is ArrayLit {
-    if emptyArrHoleKind(exprIx) == "i64list" { return true }
-    return arrLitIsI64(exprIx, fnIx)
-  }
-  if e is Paren { return exprI64Array(e.parInner, fnIx) }
-  if e is Ident {
-    if paramI64Array(fnIx, e.identName) { return true }
-    if narrowedHoleNulScalarListKind(exprIx, fnIx) == "nuli64list" {
-      return true
-    }
-    if declaredI64Array(e.identName) { return true }
-    if globalIsI64ArraySid(fnIx, sidOfNode(exprIx)) {
-      if !identShadowedByFrame(fnIx, e.identName) { return true }
-    }
-    // A CAPTURED i64-list read (incl. a boxed captured-mutated `i64` local). Kind 20 = i64 list.
-    return capturedKindOf(fnIx, e.identName) == "i64list"
-  }
-  if e is Call {
-    // `__array_new__(n, <i64 fill>)` yields an i64 list — the arm `exprF64Array`,
-    // `exprStringArray`, `exprRefArray` and `exprArray` each carry for their own kind. Without
-    // it an un-annotated binding of the call kept the i32 list slot while the intrinsic built
-    // the i64 backing (D1669).
-    if arrNewIntrKind(exprIx, fnIx) == 4 { return true }
-    if callIsMapFilter(exprIx, fnIx) {
-      return mfResultKindOf(exprIx, fnIx) == "i64"
-    }
-    if callIsArrSlice(exprIx, fnIx) {
-      return mfResultKindOf(exprIx, fnIx) == "i64"
-    }
-    const callee = P.nodes[e.callFn]
-    if callee is Ident {
-      // A closure-value call whose resolved sig result is the i64 list — a named function
-      // returning `i64[]` is recognized via the typed-IR fast path above.
-      return calleeRetKindSid(sidOfNode(e.callFn), fnIx) == "i64list"
-    }
-    return false
-  }
-  // `g[i]` over an `i64[][]` (ref-list element kind 8 — the inner i64-list wrapper) yields an
-  // `i64[]`, so `g[i][j]` reads the i64 scalar.
-  if e is Index {
-    if nestedRefListElemIs(e.idxArr, fnIx, 8) { return true }
-  }
-  // A list concat `a + b` yields a new list of the operands' own rep. Must ask itself, not
-  // a shared classifier — routing through one would cost 14^depth on a left-nested chain. D721.
-  if e is BinExpr {
-    if e.binOp == "+" {
-      if exprI64Array(e.binLeft, fnIx) { return exprI64Array(e.binRight, fnIx) }
-    }
-  }
-  false
+  exprListRep(exprIx, fnIx) == "i64list"
 }
 
 // True if the `LetDecl` at `letIx` declares an `f64[]` local: its annotation is `f64[]`,

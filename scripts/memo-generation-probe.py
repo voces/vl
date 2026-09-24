@@ -133,6 +133,9 @@ ROWS = [
     ("covarValueWriteState", ["cwArenaLen", "cwRootNames", "cwRootFrames"], "probe",
      ("  if root == \"\" { return 2 }\n  if P.nodes.length != cwArenaLen {",
       "  if root == \"\" { return 2 }\n  if true {")),
+    ("listRepQuery", ["lrMemoGen"], "probe",
+     ("    if lrMemoGen[exprIx] == lrGen && lrMemoFn[exprIx] == fnIx {",
+      "    if false && lrMemoGen[exprIx] == lrGen && lrMemoFn[exprIx] == fnIx {")),
 ]
 
 # A stamp is a MODULE-level binding whose name carries one of these markers; the shapes below

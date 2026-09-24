@@ -190,7 +190,10 @@ and this grid staying green where it is green.
    cells in one blocktype decision.
 2. (a), `expr*Array` first: introduce `exprListRep` and move `exprF32Array` onto it (the one
    non-byte-identical step: it should close the 17-cell f32 row, graded here), then the other
-   six, one byte-identical PR each.
+   six, one byte-identical PR each. Done for f32 (D2270) and for the five narrow lists
+   (D2275, one PR: the shadow found only expressions two old predicates both claimed).
+   `exprArray` is wide — any non-ref literal, a global bound to `[]` — so its projection is
+   not byte-identical and moves on its own.
 3. Give the integer element-code tables a u8 code through that path (D2239, D2249 and the anon
    field row are its witnesses).
 4. (b) last and small: `ListRep` plus the gate, converting consumers as (a) touches them.
