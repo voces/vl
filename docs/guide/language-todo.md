@@ -37,12 +37,15 @@ Could be a problem if a is typed as `{foo: {}}
   complex types will be stored in linear memory.
 - Function variables will be stored as function variables if they are numbers or
   booleans; complex types will be stored in linear memory.
-  - If the function variable is used within a child function (a closure), it
-    will be stored in linear memory regardless of type. This use case must be
-    detected during type analysis. We can do this by storing is declaration
-    scope and, on references, comparing the current scope to the declaration
-    scope. We'll store `memoryType` on the variable initially as `stack`, and
-    switch it to `heap` as needed.
+  - **Built (D2339): closures capture variables by reference.** A closure always
+    sees a variable's current value, and a write through a closure is seen by the
+    function that declared it, as in JS, Swift, Kotlin, C#, Go and Python. A
+    variable that is assigned after a closure captures it lives in a shared heap
+    cell; one that is never reassigned after the capture is copied into the
+    closure, which nobody can tell apart. A `let` declared in a loop body and a
+    loop variable are a fresh binding per iteration, like JS `let` and
+    `for … of`. The rule and its edge cases: DECISIONS.md, "Closures capture
+    variables by reference".
 
 ## Block expressions
 
