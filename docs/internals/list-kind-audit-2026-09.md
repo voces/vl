@@ -195,7 +195,12 @@ and this grid staying green where it is green.
    `exprArray` was wide — any non-ref literal, a global bound to `[]` — so its projection moved
    on its own, and closed a trap its width caused in `.get(i) ?? d` (D2276).
 3. Give the integer element-code tables a u8 code through that path (D2239, D2249 and the anon
-   field row are its witnesses).
+   field row are its witnesses). Done (D2295): each table naming a list rep has one `_`-less
+   encoder from the rep, and its readers decode through it, so a missing row is a compile
+   error. `u8[] | null` got its own field code, 36. The u8 column re-graded 413 → 457 of 458
+   (the one left is the `let g = []` design question); the other kinds did not move. Grading it
+   found and closed D2296 to D2298, and filed D2299 (open). The five `u8` gates of D2277 were
+   measured open and moved nothing, so they stay gated.
 4. (b) last and small: `ListRep` plus the gate, converting consumers as (a) touches them.
    Order matters: converting consumers first leaves the producers that caused the rows unchanged.
 

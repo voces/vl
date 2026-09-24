@@ -2370,12 +2370,10 @@ export function exprNulScalarListKind(exprIx: i32, fnIx: i32): VKind | null {
   if e is Call {
     // `xs.pop()` over a `string[][]` / `f64[][]` / `i64[][]` / `f32[][]` — the
     // distinct-backing siblings of `exprNullableList`'s pop leg (D1210).
-    const pek = popRefElemKind(exprIx, fnIx)
-    if pek == 6 { return "nulstrlist" }
-    if pek == 7 { return "nulf64list" }
-    if pek == 8 { return "nuli64list" }
-    if pek == 10 { return "nulf32list" }
-    if pek == 11 { return "nulu8list" }
+    const pek = rlElemListRep(popRefElemKind(exprIx, fnIx))
+    if isScalarBackedListRep(pek) {
+      if pek != null { return vkNulNicheOf(pek) }
+    }
     const callee = P.nodes[e.callFn]
     if callee is Ident {
       const target = fnIndexOfSid(sidOfNode(e.callFn))
@@ -2404,12 +2402,10 @@ export function exprNulScalarListKind(exprIx: i32, fnIx: i32): VKind | null {
       const slot = refListSlotOfExpr(e.idxArr, fnIx)
       if slot >= 0 && slot < rlElemNullable.length {
         if rlElemNullable[slot] == 1 {
-          const k = rlElemKindTbl[slot]
-          if k == 6 { return "nulstrlist" }
-          if k == 7 { return "nulf64list" }
-          if k == 8 { return "nuli64list" }
-          if k == 10 { return "nulf32list" }
-          if k == 11 { return "nulu8list" }
+          const k = rlElemListRep(rlElemKindTbl[slot])
+          if isScalarBackedListRep(k) {
+            if k != null { return vkNulNicheOf(k) }
+          }
         }
       }
     }
@@ -5320,8 +5316,7 @@ export function nulRefMapValInnerOf(valName: string): string {
   if nameIsArray(inner) {
     // `u8[]` names itself here, ahead of the shared scalar-list classifier and for D1008's
     // reason, so the niche admits exactly the element reps its non-null twin does.
-    if nameIsU8Array(inner) { return inner }
-    if scalarListKindOfName(inner) >= 0 { return inner }
+    if scalarListRepOfName(inner) != null { return inner }
     if nameIsRefArray(inner) { return inner }
     return ""
   }
@@ -5359,17 +5354,18 @@ function mvUnionIsScalarNull(slot: i32) {
   ak >= 0 && ak != 2 && ak != 6
 }
 
-// The one home of the scalar-element list classification: which of the five scalar backings a
-// list type-name rides (0 i32-backed and its niches, 1 string, 2 `f64[]`, 3 `i64[]`, 4
-// `f32[]`), or -1. The predicates are pairwise disjoint, so arm order is not load-bearing.
+// The one home of the scalar-element list classification: the list rep a list type-name rides
+// when its element is a scalar (the i32 list and its niches, the string, f64, i64, f32 and
+// packed u8 lists), or null. The u8 test is first because it is the narrowest spelling.
 // `tyAnnRefListKind` and `nulScalarListKind` are not folded in: they split what this folds.
-export function scalarListKindOfName(t: string): i32 {
-  if nameIsI32Array(t) { return 0 }
-  if nameIsStringArray(t) { return 1 }
-  if nameIsF64Array(t) { return 2 }
-  if nameIsI64Array(t) { return 3 }
-  if nameIsF32Array(t) { return 4 }
-  -1
+export function scalarListRepOfName(t: string): VKind | null {
+  if nameIsU8Array(t) { return "u8list" }
+  if nameIsI32Array(t) { return "list" }
+  if nameIsStringArray(t) { return "strlist" }
+  if nameIsF64Array(t) { return "f64list" }
+  if nameIsI64Array(t) { return "i64list" }
+  if nameIsF32Array(t) { return "f32list" }
+  null
 }
 
 // True if the bare map spelling `mapName` has a value type the mv layer can lower —
@@ -5583,8 +5579,7 @@ export function mvValKindOfName(valName: string): i32 {
       // `(ref null <wrapper>)`, so a stored `null` is `ref.null` of that wrapper. The three
       // predicates are this ladder's kind-6 set, and they must admit the same element reps as
       // the non-null arm — `u8[]` names itself in both, or the pair splits.
-      if nameIsU8Array(nin) { return 6 }
-      if scalarListKindOfName(nin) >= 0 { return 6 }
+      if scalarListRepOfName(nin) != null { return 6 }
       if nameIsRefArray(nin) { return 6 }
       return 1
     }
@@ -5624,13 +5619,7 @@ export function mvValKindOfName(valName: string): i32 {
     // guard keeps a map-first union value out of this arm, so it reaches the union arm below.
     // The inner-value chain resolves recursively to any depth through `mvShapeOfValName`.
     kind = 6
-  } else if nameIsU8Array(valName) {
-    // The packed byte list on the same kind-6 spine: the value is the `$bl8` wrapper ref, and
-    // the ref-value list already reps a `u8[]` element (a `u8[][]` binding runs). Its OWN arm
-    // ahead of `scalarListKindOfName` rather than a sixth entry there — D1008's rule, which
-    // the struct-field site follows too (`u8[]` is field code 35, not a shared sixth kind).
-    kind = 6
-  } else if scalarListKindOfName(valName) >= 0 {
+  } else if scalarListRepOfName(valName) != null {
     // A list-valued map: the value is a list wrapper ref, stored in a ref list whose element
     // kind picks the inner list's wrapper. Same ref-value spine as a nested map.
     kind = 6
@@ -6309,24 +6298,12 @@ export function mvInnerMapShape(slot: i32): i32 {
   mapMonoShapeOfKey(rlElemMapKeyI32(mvRlSlot[slot]))
 }
 
-// The list-element rep of a list-valued map slot, or -1 when the slot's value is not a list.
-// Maps the ref-list element kind to the value list's classifier rep.
+// The list rep of a list-valued map slot's value, or null when the value is not a list: the
+// value list's ref-list element code, decoded.
 export function mvListValKind(slot: i32): VKind | null {
   if slot < 0 { return null }
   if mvValKind[slot] != 6 { return null }
-  const ek = rlElemKindTbl[mvRlSlot[slot]]
-  if ek == 4 { return "list" }
-  if ek == 6 { return "strlist" }
-  if ek == 7 { return "f64list" }
-  if ek == 8 { return "i64list" }
-  if ek == 10 {
-    return "f32list" // f32-inner list → an f32-list value (kind 21)
-  }
-  if ek == 11 { return "u8list" }
-  if ek == 9 {
-    return "reflist" // struct-list value → a ref list
-  }
-  return null
+  rlElemListRep(rlElemKindTbl[mvRlSlot[slot]])
 }
 
 // The niche twin of `mvListValKind` — the nullable `VKind` a `{[K]: T[] | null}` value binds,
@@ -6335,14 +6312,8 @@ export function mvListValKind(slot: i32): VKind | null {
 // and `emitForInStmt` must leave the element read raw, or the stored null traps.
 export function mvNulListValKind(slot: i32): VKind | null {
   const k = mvListValKind(slot)
-  if k == "list" { return "nullist" }
-  if k == "strlist" { return "nulstrlist" }
-  if k == "f64list" { return "nulf64list" }
-  if k == "i64list" { return "nuli64list" }
-  if k == "f32list" { return "nulf32list" }
-  if k == "u8list" { return "nulu8list" }
-  if k == "reflist" { return "nulreflist" }
-  null
+  if k == null { return null }
+  vkNulNicheOf(k)
 }
 
 // The mv slot of a `m[k]` or `m[k] ?? d` read over a struct-list-valued map, else -1. The hook
@@ -7656,11 +7627,8 @@ export function eqgElemClass(kind: i32, slot: i32) {
   if kind == 3 { return 2 }
   if kind == 1 {
     if slot < 0 || slot >= rlElemKindTbl.length { return 0 }
-    const ek = rlElemKindTbl[slot]
-    // 4 i32-list · 6 string-list · 7 f64-list · 8 i64-list · 10 f32-list · 9 a ref list.
-    if ek == 4 || ek == 6 || ek == 7 || ek == 8 || ek == 9 || ek == 10 {
-      return 3
-    }
+    // An inner list of any rep compares through its own list core.
+    if rlElemListRep(rlElemKindTbl[slot]) != null { return 3 }
     // A struct element, field-wise, but only over the fields whose compare needs no frame of
     // its own. A nullable element is excluded here rather than by the row lookup, and the two
     // are not the same test: `(Circle | null)[]` resolves the same row a `Circle[]` does, so a
@@ -7723,14 +7691,9 @@ export function eqgStructElemFlat(row: i32, depth: i32): boolean {
 // slot has one; `eqgElemClass` answering 3 is the precondition.
 export function eqgInnerKind(slot: i32) {
   if slot < 0 || slot >= rlElemKindTbl.length { return -1 }
-  const ek = rlElemKindTbl[slot]
-  if ek == 4 { return 0 }
-  if ek == 6 { return 3 }
-  if ek == 7 { return 4 }
-  if ek == 8 { return 6 }
-  if ek == 10 { return 7 }
-  if ek == 9 { return 1 }
-  -1
+  const k = rlElemListRep(rlElemKindTbl[slot])
+  if k == null { return -1 }
+  eqListKindOfListRep(k)
 }
 
 // The nested element's ref-list slot, or 0 for an element rep that is not slot-keyed — the
@@ -7746,22 +7709,10 @@ export function eqgInnerSlot(slot: i32) {
 // sides read it: the compare-frame reservation and the field-equality ladder, and a core
 // emitted against a frame nobody reserved refuses loudly. Code 4 is deliberately absent.
 export function eqScalarListFieldKind(code: i32): i32 {
-  if code == 6 {
-    return 3 // string[]
-  }
-  if code == 25 {
-    return 4 // f64[]
-  }
-  if code == 26 {
-    return 6 // i64[]
-  }
-  if code == 27 {
-    return 7 // f32[]
-  }
-  if code == 35 {
-    return 10 // u8[] — the packed byte list (D1008)
-  }
-  0 - 1
+  const k = listRepOfFieldCode(code)
+  if !isScalarBackedListRep(k) { return -1 }
+  if k == null { return -1 }
+  eqListKindOfListRep(k)
 }
 
 // D1180 — the non-null twin of a ref-niche field code, or -1 when the code is not one. A
@@ -7772,28 +7723,13 @@ export function nulFieldInnerCode(code: i32): i32 {
   if code == 20 {
     return 3 // `string | null`
   }
-  if code == 18 {
-    return 4 // `i32[] | null`
-  }
-  if code == 31 {
-    return 6 // `string[] | null`
-  }
-  if code == 32 {
-    return 25 // `f64[] | null`
-  }
-  if code == 33 {
-    return 26 // `i64[] | null`
-  }
-  if code == 34 {
-    return 27 // `f32[] | null`
-  }
-  if code == 28 {
-    return 5 // `S[] | null`
-  }
   if code == 22 {
     return 14 // `fn | null`
   }
-  -1
+  // A nullable list field's twin is its base list's code.
+  const base = nulListBase(listRepOfFieldCode(code))
+  if base == null { return -1 }
+  fieldCodeOfListRep(base)
 }
 
 // D1180 — the same map for a variant arm's field, differing in exactly one rung: code 4 is
@@ -9545,15 +9481,11 @@ export function rlElemCloSigKeyAt(slot: i32): string {
 // the outer pair's heap types instead of its own (D1629).
 export function refElemListBuildKind(slot: i32): i32 {
   if slot < 0 || slot >= rlElemKindTbl.length { return -1 }
-  const k = rlElemKindTbl[slot]
-  if k == 4 { return 0 }
-  if k == 6 { return 3 }
-  if k == 7 { return 4 }
-  if k == 8 { return 6 }
-  if k == 9 { return 5 }
-  if k == 10 { return 7 }
-  if k == 11 { return 10 }
-  -1
+  const k = rlElemListRep(rlElemKindTbl[slot])
+  if k == null { return -1 }
+  // An inner ref list builds at code 5 through its own row, which the caller pairs with it.
+  if k == "reflist" { return 5 }
+  listBuildKindOfVKind(k, -1)
 }
 
 // The inner ref-list slot of a nested or nullable ref-array element — the chokepoint the
@@ -17741,63 +17673,37 @@ export function isNulScalarListKind(kind: VKind | null): boolean {
     kind == "nulf32list" ||
     kind == "nulu8list"
 }
-// The struct/variant field code of a distinct-backing nullable scalar-list spelling —
-// `string[] | null` 31 · `f64[] | null` 32 · `i64[] | null` 33 · `f32[] | null` 34 — or -1.
-// Each leaf keeps its own wrapper heap type, unlike the i32-backed leaves which all fold
-// onto code 18, so `structFieldCodesEq` can split same-fieldset twins by real layout.
+// The struct/variant field code of a distinct-backing nullable scalar-list spelling (31 to
+// 34, and 36 for `u8[] | null`), or -1. Each leaf keeps its own wrapper heap type, unlike the
+// i32-backed leaves which all fold onto code 18, so `structFieldCodesEq` can split same-fieldset
+// twins by real layout.
 function nulScalarListFieldCode(name: string) {
   const k = nulScalarListKind(name)
-  // Exhaustive over `VKind` and `_`-less, `null` included: `-1` is a real answer — the
-  // spelling is not a distinct-backing nullable scalar list — so a new leaf has to claim a
-  // code rather than fold silently onto 18 (D1898).
-  match k {
-    "nulstrlist" => {
-      return 31
-    }
-    "nulf64list" => {
-      return 32
-    }
-    "nuli64list" => {
-      return 33
-    }
-    "nulf32list" => {
-      return 34
-    }
-    "nulu8list" => {
-      return 35
-    }
-    "i32" | "struct" | "list" | "str" | "union" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "i64" | "f64" | "f64list" | "f32" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "nulmap" | "nulnone" | "u8list" | "v128" | null => {
-      // No distinct wrapper of its own: the i32-backed leaves fold onto code 18, and
-      // `null` is the spelling not naming a nullable scalar list at all.
-      return -1
-    }
-  }
+  if k == null { return -1 }
+  fieldCodeOfListRep(k)
 }
-// The nullable-scalar-list VKind behind FIELD code 31..34 — the inverse of
+// The nullable-scalar-list VKind behind a field code, or null: the inverse of
 // `nulScalarListFieldCode`, so the store/read/null paths recover the leaf's build kind
 // (`nulScalarListBuildKind`) and wrapper heap (`nulScalarListWrapHeap`) from the code alone.
 export function nulScalarListCodeKind(code: i32): VKind | null {
-  if code == 31 { return "nulstrlist" }
-  if code == 32 { return "nulf64list" }
-  if code == 33 { return "nuli64list" }
-  if code == 34 { return "nulf32list" }
-  if code == 35 { return "nulu8list" }
+  const k = listRepOfFieldCode(code)
+  if isNulScalarListKind(k) { return k }
   null
 }
 // The nullable-scalar-list `VKind` a field of code `code` yields when it is read through a
 // `?.`: the receiver's `| null` is what makes the value nullable, so a NON-nullable list
 // field answers here too. `nulScalarListCodeKind`'s twin for that one delivery (D1676).
 export function optChainLeafNulListKind(code: i32): VKind | null {
-  if code == 6 { return "nulstrlist" }
-  if code == 25 { return "nulf64list" }
-  if code == 26 { return "nuli64list" }
-  if code == 27 { return "nulf32list" }
+  const k = listRepOfFieldCode(code)
+  if isScalarBackedListRep(k) {
+    if k != null { return vkNulNicheOf(k) }
+  }
   nulScalarListCodeKind(code)
 }
 
-// True if field code `c` is one of the four distinct-backing nullable-scalar-list codes.
+// True if field code `c` is one of the distinct-backing nullable-scalar-list codes.
 export function isNulScalarListFieldCode(c: i32): boolean {
-  c == 31 || c == 32 || c == 33 || c == 34
+  nulScalarListCodeKind(c) != null
 }
 
 // True if the type-annotation node `tyIx` denotes an array whose element is a nullable
@@ -19150,17 +19056,16 @@ export function refArrElemKind(name: string) {
 // Forces the wrapper/backing flags a scalar-list field storage code needs, since a
 // field-only program never builds a `u8[]`/`f64[]`/etc list literal elsewhere.
 export function forceScalarListField(code: i32) {
-  if code == 35 { ba8Used = true }
-  if code == 25 { fa64Used = true }
-  if code == 26 { ia64Used = true }
-  if code == 27 { fa32Used = true }
-  // The nullable twins (codes 32/33/34) ride the same leaf wrapper as their non-null
-  // counterparts. A field that only ever holds `null` never builds a list literal, so
-  // without this the field's `(ref null $wrapper)` storage type would reference an
-  // unallocated index. Code 31's `string[] | null` pair is forced beside the code-6 string list instead.
-  if code == 32 { fa64Used = true }
-  if code == 33 { ia64Used = true }
-  if code == 34 { fa32Used = true }
+  // A nullable twin rides the same leaf wrapper as its non-null list. A field that only ever
+  // holds `null` never builds a list literal, so without this its `(ref null $wrapper)` storage
+  // would reference an unallocated index. The string pair is forced beside the string list.
+  let k = listRepOfFieldCode(code)
+  const base = nulListBase(k)
+  if base != null { k = base }
+  if k == "u8list" { ba8Used = true }
+  if k == "f64list" { fa64Used = true }
+  if k == "i64list" { ia64Used = true }
+  if k == "f32list" { fa32Used = true }
   0
 }
 
@@ -19277,17 +19182,9 @@ function fieldCodeOfSpelling(t: string, litNode: i32) {
     return 3
   }
   if nameIsArray(t) {
-    // The scalar-element backings, in `scalarListKindOfName`'s order: `string[]` is code 6,
-    // a scalar list stores its own wrapper (25/26/27), never code 5 (struct/union/closure
-    // only). `u8[]` gets its own code 35 rather than a sixth `scalarListKindOfName` entry,
-    // which would misread silently until each of its four readers grew a matching arm (D1008).
-    if nameIsU8Array(t) { return 35 }
-    const sk = scalarListKindOfName(t)
-    if sk == 0 { return 4 }
-    if sk == 1 { return 6 }
-    if sk == 2 { return 25 }
-    if sk == 3 { return 26 }
-    if sk == 4 { return 27 }
+    // A scalar-element list stores its own wrapper, never code 5 (struct/union/closure only).
+    const sk = scalarListRepOfName(t)
+    if sk != null { return fieldCodeOfListRep(sk) }
     return 5
   }
   // A map-typed field stores a non-null ref to its value type's map struct, code 19. The mv
@@ -20655,17 +20552,7 @@ function refArrElemNameIf(name: string) {
 // any leaf — and its name carries `| null`. A value-union box (kind 2) is not a niche even
 // though `i32 | null` also has `| null`, since its null is a tag inside a non-null box.
 function rlElemNicheNullable(kind: i32, name: string) {
-  if (
-    kind != 1 &&
-    kind != 3 &&
-    kind != 4 &&
-    kind != 5 &&
-    kind != 6 &&
-    kind != 7 &&
-    kind != 8 &&
-    kind != 9 &&
-    kind != 10
-  ) {
+  if kind != 1 && kind != 3 && kind != 5 && rlElemListRep(kind) == null {
     return false
   }
   return nullablePartOf(name) != ""
@@ -21340,7 +21227,7 @@ function anonNulFieldCodeOfTy(ty: i32): i32 {
 }
 
 // The element half of `anonNulFieldCodeOfTy`'s list arm: the i32-backed leaves all fold onto
-// code 18, each distinct backing keeps its own wrapper (31..34), and a ref element is the
+// code 18, each distinct backing keeps its own wrapper (31..34, 36), and a ref element is the
 // nullable ref list, code 28. An unrecognised element answers -1 rather than guessing.
 function anonNulListFieldCodeOfElem(elem: i32): i32 {
   if elem < 0 { return -1 }
@@ -21376,7 +21263,7 @@ function anonNulListFieldCodeOfElem(elem: i32): i32 {
           return 34
         }
         "u8" => {
-          // The packed byte list rides code 35, claimed by its own spelling test.
+          return 36
         }
         "v128" => {
           // Not a nullable-list element type: v128 has no list in S1-S2.
@@ -21509,7 +21396,7 @@ function anonCodeAdmitsValue(c: i32, valIx: i32) {
 // and no companion column. Widening this set means widening `anonFieldElemName` with it.
 function anonNulCodeIsSelfContained(c: i32) {
   if c == 18 || c == 20 || c == 21 || c == 22 { return true }
-  c == 31 || c == 32 || c == 33 || c == 34
+  isNulScalarListFieldCode(c)
 }
 
 // The width of an arithmetic field value, from the arena, falling back to i32 (D1586): the
@@ -21827,7 +21714,7 @@ function fieldCodeOfTy(ty: i32): i32 {
       return fieldCodeOfDesc(ty)
     }
     TyArray => {
-      // The array arm mirrors `fieldCodeOfSpelling`'s `scalarListKindOfName` ladder, deliberately
+      // The array arm mirrors `fieldCodeOfSpelling`'s `scalarListRepOfName` ladder, deliberately
       // narrower: an unrecognised element stays uncoded (-2) and falls through to the render,
       // rather than a blanket 5. No `TyObj` arm for the array ITSELF: the spelling ladder's
       // declaration scan lets a forward reference tie into the shared rec group.
@@ -24927,20 +24814,20 @@ export function forceCloResultListTypes(nm: string) {
       const ret0 = annRetNameOf(a)
       if ret0 != "" {
         const res = nonNulBaseOf(normTypeAtom(ret0))
-        // The five scalar-element backings via the one home (`scalarListKindOfName`). This
-        // copy asks them in a different order (string first, i32 last); the five predicates
-        // are pairwise disjoint, so the home's order is the same answer.
-        const sk = scalarListKindOfName(res)
-        if sk == 1 {
+        // The scalar-element backings via the one home (`scalarListRepOfName`).
+        const sk = scalarListRepOfName(res)
+        if sk == "strlist" {
           slUsed = true
           aUsed = true
-        } else if sk == 2 {
+        } else if sk == "f64list" {
           fa64Used = true
-        } else if sk == 3 {
+        } else if sk == "i64list" {
           ia64Used = true
-        } else if sk == 4 {
+        } else if sk == "f32list" {
           fa32Used = true
-        } else if sk == 0 {
+        } else if sk == "u8list" {
+          ba8Used = true
+        } else if sk == "list" {
           lUsed = true
           aUsed = true
         } else if nameIsRefArray(res) {
@@ -26574,16 +26461,9 @@ export function vkNulNicheOf(k: VKind): VKind | null {
 // into it never owes the recover and asking for one traps on `null` (D1720).
 export function fieldCodeVKind(code: i32): VKind | null {
   if code == 3 { return "str" }
-  if code == 4 { return "list" }
-  if code == 5 { return "reflist" }
-  if code == 6 { return "strlist" }
   if code == 14 { return "closure" }
   if code == 19 { return "map" }
-  if code == 25 { return "f64list" }
-  if code == 26 { return "i64list" }
-  if code == 27 { return "f32list" }
-  if code == 35 { return "u8list" }
-  null
+  listRepOrNull(listRepOfFieldCode(code))
 }
 
 // The declared-local SLOT an ident expression names, or -1 — `identCellVKind`'s twin, so a
@@ -31582,19 +31462,39 @@ function tyPrimLeafElem(ty: i32) { tyPrimLeafElemName(ty) != null }
 // `seedFieldListBuild` from a FIELD code. `0` (the i32-list default) for every kind that is
 // not a distinct-backing list, which is also the correct seed for the i32-backed ones.
 export function listBuildKindOfVKind(kind: VKind | null, slot: i32) {
-  if kind == "strlist" { return 3 }
-  if kind == "f64list" { return 4 }
-  if kind == "i64list" { return 6 }
-  if kind == "f32list" { return 7 }
-  if kind == "u8list" { return 10 }
-  if kind == "reflist" {
-    if slot >= 0 && slot < rlElemKindTbl.length {
-      if rlElemKindTbl[slot] == 2 { return 2 }
-      if rlElemKindTbl[slot] == 5 { return 5 }
+  // Exhaustive over `VKind` and `_`-less, `null` included: `0` is the i32 list's build code,
+  // a real answer, so a new list rep has to name its own rather than inherit it.
+  match kind {
+    "strlist" => {
+      return 3
     }
-    return 1
+    "f64list" => {
+      return 4
+    }
+    "i64list" => {
+      return 6
+    }
+    "f32list" => {
+      return 7
+    }
+    "u8list" => {
+      return 10
+    }
+    "reflist" => {
+      if slot >= 0 && slot < rlElemKindTbl.length {
+        if rlElemKindTbl[slot] == 2 { return 2 }
+        if rlElemKindTbl[slot] == 5 { return 5 }
+      }
+      return 1
+    }
+    "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" => {
+      return nulScalarListBuildKind(kind)
+    }
+    "list" | "nullist" | "nulreflist" | "i32" | "struct" | "str" | "union" | "map" | "variant" | "nulvariant" | "nulstruct" | "i64" | "f64" | "f32" | "v128" | "closure" | "nulstr" | "nulbool" | "nulclosure" | "nulmap" | "nulnone" | null => {
+      // The i32-backed lists and every kind that is no list seed the i32-list default.
+      return 0
+    }
   }
-  nulScalarListBuildKind(kind)
 }
 
 // The `pendingListKind` / `pendingListSlot` pair an empty `[]` hole demands of `emitArr`.
@@ -33005,7 +32905,7 @@ export function exprU8Array(exprIx: i32, fnIx: i32) {
 
 // How `k` relates to the list reps: 1 for one of the seven non-null lists, 2 for a nullable
 // list niche, 0 for everything else. Exhaustive and `_`-less, so a new kind has to say which.
-function vkListClass(k: VKind): i32 {
+export function vkListClass(k: VKind): i32 {
   match k {
     "list" | "u8list" | "i64list" | "f32list" | "f64list" | "strlist" | "reflist" => {
       return 1
@@ -33024,6 +32924,216 @@ function listRepOrNull(k: VKind | null): VKind | null {
   if k == null { return null }
   if vkListClass(k) == 1 { return k }
   null
+}
+
+// ── the list reps' integer code tables ──
+// Each integer table that names a list rep has one `_`-less encoder from the rep, and its
+// readers decode by walking the reps in `nextListRep` order and asking that encoder, so a rep
+// with no row in some table is a compile error at the encoder, not a silent miss (D2295).
+
+// The list rep after `k` in the decoders' walk, which starts at `"list"` and visits all
+// fourteen list reps; null after the last, and for a kind that is not a list rep.
+function nextListRep(k: VKind): VKind | null {
+  match k {
+    "list" => {
+      return "u8list"
+    }
+    "u8list" => {
+      return "i64list"
+    }
+    "i64list" => {
+      return "f32list"
+    }
+    "f32list" => {
+      return "f64list"
+    }
+    "f64list" => {
+      return "strlist"
+    }
+    "strlist" => {
+      return "reflist"
+    }
+    "reflist" => {
+      return "nullist"
+    }
+    "nullist" => {
+      return "nulu8list"
+    }
+    "nulu8list" => {
+      return "nuli64list"
+    }
+    "nuli64list" => {
+      return "nulf32list"
+    }
+    "nulf32list" => {
+      return "nulf64list"
+    }
+    "nulf64list" => {
+      return "nulstrlist"
+    }
+    "nulstrlist" => {
+      return "nulreflist"
+    }
+    "nulreflist" | "i32" | "struct" | "str" | "union" | "map" | "variant" | "nulvariant" | "nulstruct" | "i64" | "f64" | "f32" | "v128" | "closure" | "nulstr" | "nulbool" | "nulclosure" | "nulmap" | "nulnone" => {
+      return null
+    }
+  }
+}
+
+// The ref-list element code (`rlElemKindTbl`) of a list element of rep `k`, or -1 for a rep
+// that is not a non-null list. Codes 1, 2, 3 and 5 (struct, union, map, closure) are not lists.
+export function rlElemCodeOfListRep(k: VKind): i32 {
+  match k {
+    "list" => {
+      return 4
+    }
+    "u8list" => {
+      return 11
+    }
+    "i64list" => {
+      return 8
+    }
+    "f32list" => {
+      return 10
+    }
+    "f64list" => {
+      return 7
+    }
+    "strlist" => {
+      return 6
+    }
+    "reflist" => {
+      return 9
+    }
+    "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulf64list" | "nulstrlist" | "nulreflist" | "i32" | "struct" | "str" | "union" | "map" | "variant" | "nulvariant" | "nulstruct" | "i64" | "f64" | "f32" | "v128" | "closure" | "nulstr" | "nulbool" | "nulclosure" | "nulmap" | "nulnone" => {
+      // A nullable list element is the non-null code plus the slot's `rlElemNullable` bit.
+      return -1
+    }
+  }
+}
+
+// The non-null list rep of ref-list element code `code`, or null when the element is no list.
+export function rlElemListRep(code: i32): VKind | null {
+  rlElemListRepFrom(code, "list")
+}
+
+function rlElemListRepFrom(code: i32, k: VKind): VKind | null {
+  if rlElemCodeOfListRep(k) == code { return k }
+  const n = nextListRep(k)
+  if n == null { return null }
+  rlElemListRepFrom(code, n)
+}
+
+// The struct/variant field code (`fieldCodeOfSpelling`'s vocabulary) of a field of list rep
+// `k`, or -1 for a rep that is not a list. Each nullable rep has its own code, since its slot
+// is a `(ref null …)` where the non-null code's is a `(ref …)`.
+export function fieldCodeOfListRep(k: VKind): i32 {
+  match k {
+    "list" => {
+      return 4
+    }
+    "u8list" => {
+      return 35
+    }
+    "i64list" => {
+      return 26
+    }
+    "f32list" => {
+      return 27
+    }
+    "f64list" => {
+      return 25
+    }
+    "strlist" => {
+      return 6
+    }
+    "reflist" => {
+      return 5
+    }
+    "nullist" => {
+      return 18
+    }
+    "nulu8list" => {
+      return 36
+    }
+    "nuli64list" => {
+      return 33
+    }
+    "nulf32list" => {
+      return 34
+    }
+    "nulf64list" => {
+      return 32
+    }
+    "nulstrlist" => {
+      return 31
+    }
+    "nulreflist" => {
+      return 28
+    }
+    "i32" | "struct" | "str" | "union" | "map" | "variant" | "nulvariant" | "nulstruct" | "i64" | "f64" | "f32" | "v128" | "closure" | "nulstr" | "nulbool" | "nulclosure" | "nulmap" | "nulnone" => {
+      return -1
+    }
+  }
+}
+
+// The list rep of field code `code`, or null when the field is no list.
+export function listRepOfFieldCode(code: i32): VKind | null {
+  listRepOfFieldCodeFrom(code, "list")
+}
+
+function listRepOfFieldCodeFrom(code: i32, k: VKind): VKind | null {
+  if fieldCodeOfListRep(k) == code { return k }
+  const n = nextListRep(k)
+  if n == null { return null }
+  listRepOfFieldCodeFrom(code, n)
+}
+
+// The generic-compare kind (`catListKindOfExpr`'s alphabet) of a list of rep `k`, or -1 for a
+// rep that is not a non-null list.
+export function eqListKindOfListRep(k: VKind): i32 {
+  match k {
+    "list" => {
+      return 0
+    }
+    "u8list" => {
+      return 10
+    }
+    "i64list" => {
+      return 6
+    }
+    "f32list" => {
+      return 7
+    }
+    "f64list" => {
+      return 4
+    }
+    "strlist" => {
+      return 3
+    }
+    "reflist" => {
+      return 1
+    }
+    "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulf64list" | "nulstrlist" | "nulreflist" | "i32" | "struct" | "str" | "union" | "map" | "variant" | "nulvariant" | "nulstruct" | "i64" | "f64" | "f32" | "v128" | "closure" | "nulstr" | "nulbool" | "nulclosure" | "nulmap" | "nulnone" => {
+      return -1
+    }
+  }
+}
+
+// True if `k` is one of the five non-null lists over a distinct scalar backing: every list but
+// the i32-backed one and the ref list.
+export function isScalarBackedListRep(k: VKind | null): boolean {
+  if k == null { return false }
+  if k == "list" || k == "reflist" { return false }
+  vkListClass(k) == 1
+}
+
+// The `pendingListKind` a literal stored into a field of code `code` builds at, when the field
+// is a non-null list over a distinct scalar backing; -1 for every other field code.
+export function fieldCodeScalarListBuildKind(code: i32): i32 {
+  const k = listRepOfFieldCode(code)
+  if !isScalarBackedListRep(k) { return -1 }
+  listBuildKindOfVKind(k, -1)
 }
 
 // The non-null list rep the expression at `exprIx` produces, or null when this cannot name one.
@@ -35013,14 +35123,10 @@ function annParamKind(t: string) {
     return repSigTokOfKind("union")
   }
   if nameIsString(t) { return repSigTokOfKind("str") }
-  // The five scalar-element list backings, via the one home `scalarListKindOfName` — the
-  // same enumeration `annRetKind` reads, so the two `$fnsig` producers cannot drift.
-  const sk = scalarListKindOfName(t)
-  if sk == 0 { return repSigTokOfKind("list") }
-  if sk == 1 { return repSigTokOfKind("strlist") }
-  if sk == 2 { return repSigTokOfKind("f64list") }
-  if sk == 3 { return repSigTokOfKind("i64list") }
-  if sk == 4 { return repSigTokOfKind("f32list") }
+  // The scalar-element list backings, via the one home `scalarListRepOfName` — the same
+  // enumeration `annRetKind` reads, so the two `$fnsig` producers cannot drift.
+  const sk = scalarListRepOfName(t)
+  if sk != null { return repSigTokOfKind(sk) }
   const si = structIndexOfTypeName(t)
   if si >= 0 { return repSigSlotTokOfKind("struct", si) }
   // A concrete-variant name (`Cat`), keyed by the variant index (matches `cloParamTok`).
@@ -35061,12 +35167,8 @@ function annRetKind(t: string) {
   if t == "f32" { return ">" + repSigTokOfKind("f32") }
   // A list return, matching `cloRetKeySuffix` — `nameIsI32Array` folds `boolean[]` and a
   // litunion `K[]` into the same i32-list token the param dual already keys.
-  const sk = scalarListKindOfName(t)
-  if sk == 0 { return ">" + repSigTokOfKind("list") }
-  if sk == 1 { return ">" + repSigTokOfKind("strlist") }
-  if sk == 2 { return ">" + repSigTokOfKind("f64list") }
-  if sk == 3 { return ">" + repSigTokOfKind("i64list") }
-  if sk == 4 { return ">" + repSigTokOfKind("f32list") }
+  const sk = scalarListRepOfName(t)
+  if sk != null { return ">" + repSigTokOfKind(sk) }
   // A ref-list return, matching `cloRetKeySuffix` — before the closure case so a closure-
   // element array's nested `=>` isn't misread, keyed by the same `rlSlotByName` the AST side uses.
   if nameIsRefArray(t) {
