@@ -2855,6 +2855,17 @@ fn usage_exit(msg: &str) -> ! {
     std::process::exit(2);
 }
 
+/// Which `--names` custom sections a compile asks the seed for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Names {
+    Off,
+    /// The name section and `vl-src`.
+    Full,
+    /// The name section alone: an `-O`/`-O3` build strips `vl-src` before binaryen, so
+    /// the seed need not build it (D2311).
+    NoSrcMap,
+}
+
 /// Load the seed, stage `source`, call `entry`, and hand the emitted bytes back
 /// ALONGSIDE the live compiler instance, so a failure that happens after the compile
 /// - the engine refusing the emitted module - can still ask it where the offending
@@ -2871,7 +2882,7 @@ fn compile_vl_located(
     source: &str,
     source_path: &str,
     entry: &str,
-    emit_names: bool,
+    emit_names: Names,
     link: LinkOpts,
 ) -> Result<(Vec<u8>, Option<(Store<()>, Instance)>)> {
     let (mut store, inst) = phase!("load_compiler", load_compiler(engine, compiler))?;
@@ -3097,7 +3108,7 @@ fn compile_vl_instance(
     source: &str,
     source_path: &str,
     entry: &str,
-    emit_names: bool,
+    emit_names: Names,
     link: LinkOpts,
 ) -> Result<Vec<u8>> {
     let mut store = store;
@@ -3110,9 +3121,16 @@ fn compile_vl_instance(
     // The export is OFF by default (the compiler leaves goldens byte-identical);
     // we flip it on only here, for the native tool's build/run paths. The export
     // is absent from older compiler modules, so treat a missing symbol as a no-op.
-    if emit_names {
+    if emit_names != Names::Off {
         if let Ok(set_names) = inst.get_typed_func::<i32, i32>(&mut store, "setEmitNames") {
             set_names.call(&mut store, 1)?;
+        }
+    }
+    // Dropping `vl-src` is an optimisation only: a seed without the export writes the
+    // section, and the `-O` path strips it before binaryen runs either way.
+    if emit_names == Names::NoSrcMap {
+        if let Ok(set) = inst.get_typed_func::<i32, i32>(&mut store, "setEmitSrcMap") {
+            set.call(&mut store, 0)?;
         }
     }
     // `vl build --import-memory`. Unlike the name section this changes what the module
@@ -4701,7 +4719,7 @@ fn run_batch(args: &[String]) -> Result<()> {
                     &source,
                     f,
                     "compileSrc",
-                    true,
+                    Names::Full,
                     LinkOpts::default(),
                 )?
             };
@@ -5640,6 +5658,11 @@ fn escape_inline_step(path: &str, flag: &str, bytes: &[u8]) -> Result<Option<Vec
     Ok(Some(restored))
 }
 
+/// The `wasm-opt` worker count when `$BINARYEN_CORES` is unset. Measured on plumb units
+/// (DECISIONS.md, "`wasm-opt` runs on at most four threads"): four threads cost the CPU of
+/// one, while binaryen's default of one per core cost 1.2-1.7x that and 2.5x the memory.
+const BINARYEN_CORES_DEFAULT: usize = 4;
+
 /// Shell out to `wasm-opt` to rewrite the emitted module IN PLACE with one of the
 /// two rungs above, or with the escape step (`ESCAPE_INLINE_PASSES`) that runs before them.
 ///
@@ -5676,8 +5699,16 @@ fn optimize_in_place(path: &str, flag: &str, passes: &[&str], no_inline: &[Strin
     argv.extend_from_slice(passes);
     argv.extend_from_slice(BINARYEN_FEATURES);
     argv.extend_from_slice(&["-o", path]);
-    let status = std::process::Command::new(&opt)
-        .args(&argv)
+    let mut cmd = std::process::Command::new(&opt);
+    cmd.args(&argv);
+    // Binaryen spins a worker per core by default; past a handful the extra threads buy
+    // little wall time and cost CPU and memory, which is what a build farm pays for. An
+    // explicit `$BINARYEN_CORES` wins. The output does not depend on the thread count.
+    if std::env::var_os("BINARYEN_CORES").is_none() {
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        cmd.env("BINARYEN_CORES", cores.min(BINARYEN_CORES_DEFAULT).to_string());
+    }
+    let status = cmd
         .status()
         .map_err(|e| Error::from(e).context(format!("running wasm-opt `{opt}`")))?;
     if !status.success() {
@@ -5779,7 +5810,7 @@ fn compile_and_run(
             source,
             source_path,
             "compileSrc",
-            true,
+            Names::Full,
             LinkOpts::default(),
         )?;
     match run_program(run_engine, &bytes, palette) {
@@ -7613,6 +7644,12 @@ fn build_cmd(args: &[String]) -> Result<()> {
     let out_label = if to_stdout { "<stdout>" } else { out.as_str() };
     // `--names` embeds a wasm "name" custom section (legible trap backtraces).
     let names = args.iter().any(|a| a == "--names");
+    let optimizing = args.iter().any(|a| a == "-O" || a == "-O3");
+    let names_mode = match (names, optimizing) {
+        (false, _) => Names::Off,
+        (true, false) => Names::Full,
+        (true, true) => Names::NoSrcMap,
+    };
     // `--import-memory`: the module imports `env.memory` instead of defining and exporting
     // it (DECISIONS.md §"Linear memory is a layout contract").
     let link = parse_link_opts(args);
@@ -7624,7 +7661,7 @@ fn build_cmd(args: &[String]) -> Result<()> {
         &source,
         input,
         "compileSrc",
-        names,
+        names_mode,
         link,
     )?;
     // A unit sharing a host's memory that allocates with no window of its own starts at
@@ -7649,6 +7686,12 @@ fn build_cmd(args: &[String]) -> Result<()> {
     // engine's verdict, and nowhere else.
     if let Some(f) = fault_injection()? {
         inject_fault(f, &mut bytes)?;
+    }
+    // An optimized build never reads the compiler instance again (a refused module is
+    // binaryen's bytes, which the emitter's spans do not describe), so its GC heap is freed
+    // here rather than held for the whole of `wasm-opt` (D2311).
+    if optimizing {
+        drop(session.take());
     }
     std::fs::write(&sink, &bytes)?;
     // Optimize the written module in place (wasm-opt, when present). Two
@@ -7679,10 +7722,11 @@ fn build_cmd(args: &[String]) -> Result<()> {
         // The escape step goes first, so the rung's own passes (`--heap2local` among them)
         // see each per-call struct and its uses in one function. It renumbers functions, so
         // the run-once marks are read off its output, not off `bytes`.
-        let stepped = escape_inline_step(&sink_str, flag, &bytes)?;
+        let stepped = phase!("opt.escape_step", escape_inline_step(&sink_str, flag, &bytes))?;
         let rung_input: &[u8] = stepped.as_deref().unwrap_or(&bytes);
         let passes = rung_passes(passes, names);
-        optimize_in_place(&sink_str, flag, &passes, &run_once_hot_callees(rung_input))?;
+        let no_inline = phase!("opt.run_once_scan", run_once_hot_callees(rung_input));
+        phase!("opt.rung", optimize_in_place(&sink_str, flag, &passes, &no_inline))?;
         final_bytes = Some(std::fs::read(&sink).map_err(|e| {
             Error::from(e).context(format!("reading back the {flag}'d `{out_label}`"))
         })?);
@@ -7719,14 +7763,15 @@ fn build_cmd(args: &[String]) -> Result<()> {
     // so a write-only or unreadable `-o` target no longer fails a check-clean
     // build (D1678).
     if !args.iter().any(|a| a == "--no-validate") {
-        if let Err(e) = validate_written_module(&compile_engine, final_bytes, out_label) {
+        if let Err(e) =
+            phase!("validate", validate_written_module(&compile_engine, final_bytes, out_label))
+        {
             // An OPTIMIZED artifact is binaryen's bytes, not the emitter's, so the
             // emitter's byte ranges do not describe it — keep the engine's own text
             // rather than naming a function off an offset that means something else.
-            let optimized = args.iter().any(|a| a == "-O" || a == "-O3");
             return Err(locate_invalid_module(
                 e,
-                if optimized { None } else { session },
+                if optimizing { None } else { session },
                 input,
             ));
         }

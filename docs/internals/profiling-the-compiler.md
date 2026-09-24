@@ -207,6 +207,37 @@ from 64.6% to 7.3%.
 **The lint is the majority of a `vl check` on a large file, and no `build` profile could say
 so.** That is the shape of the gap this instrument closed, not an incidental reading.
 
+## Measured 2026-09-24 — plumb's generated units (D2309–D2311)
+
+Three units of plumb's x86 transliteration, `vl build --names -O --import-memory`: `chunk_550`
+(0.43 MB, null collector), `chunk_662` (2.0 MB, the median unit, copying) and `chunk_466`
+(4.8 MB, 84 functions, one of them a 256 KB body with 7,313 locals). Before the fixes, CPU
+split roughly half and half between the seed (check + emit) and binaryen, and binaryen's half
+was inflated by its default of one thread per core.
+
+Guest profile, `--names` seed, share of the compile, inclusive unless marked:
+
+| frame | 662 before | 662 after | 466 before | 466 after |
+| --- | ---: | ---: | ---: | ---: |
+| `dupScanRun` (the detection sweep) | 15.3% | 15.1% | **41.7%** | 17.6% |
+| `markArmPrelude` self | 5.1% | — | 4.2% | — |
+| `externLinkOf` | 4.7% | — | 2.2% | — |
+| `emitSrcSection` (`vl-src`, stripped by `-O`) | 5.2% | — | 4.8% | — |
+| `checkProgram` | 13.1% | 16.5% | 8.6% | 11.5% |
+| `modScan` (lex + token cache) | 4.3% | 5.2% | 3.9% | 5.4% |
+| `__str_eq__` self | 13.3% | 10.6% | 12.3% | 11.9% |
+
+What is left is flat: no frame but `__str_eq__` (a third of it under `__map_probe__`) holds
+more than 2% self. The detection sweep is now one pass per frame plus one per extra rep class
+of a name, and at 15% it is the largest single cost; making the detectors resolve names with
+the scope stack live would remove the D1595 guess and the repeat outright.
+
+**Memory.** The copying collector's 384 MiB first heap is the per-unit floor (RSS 417–432 MB
+at 2–5 MB). The live set at peak is under 144 MiB on `chunk_662`: a 288 MiB first heap still
+fits without growing (RSS 331 MB) but costs +80% CPU in collections, and 320 MiB costs +20%.
+Below 256 MiB the heap doubles and RSS rises. Shrinking the floor therefore needs a smaller
+live set, not a smaller heap.
+
 ## Guards
 
 Three, and they fire at different moments. Profiling is what you do AFTER one of them does.
