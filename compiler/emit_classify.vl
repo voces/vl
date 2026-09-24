@@ -12356,11 +12356,72 @@ function ifJoinAtomMeetsString(ifIx: i32, fnIx: i32) {
   false
 }
 
+// True if the checker recorded the join at `ifIx` as a bare `i32`, `i64`, `f64`, `f32` or
+// `boolean`. The raw type, never a pin, so a generic body's hole-typed join is not claimed.
+function ifJoinIsScalarPrim(ifIx: i32) {
+  const ty = nodeTyIxOf(ifIx)
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if t is TyPrim {
+    const n = t.primName
+    return n == "i32" ||
+      n == "i64" ||
+      n == "f64" ||
+      n == "f32" ||
+      n == "boolean"
+  }
+  false
+}
+
 // The `fbValtype` kind of a ref-typed if-expression join — string, string-list, f64-list,
 // ref-list, i32-list, or struct — classified from the then arm's tail value. -1 for a
 // numeric join and for a value-union/concrete-variant join (handled upstream). The array
 // predicates run before the i32-list `exprArray`, which would also claim a wider list via its typed-IR fast path.
 export function ifExprRefKind(ifIx: i32, fnIx: i32): VKind | null {
+  // A join the checker typed as a bare number or boolean has no ref rep. Answering before the
+  // arm predicates keeps a nest of `if` arms linear, since each of them asks this of its arm.
+  if ifJoinIsScalarPrim(ifIx) { return null }
+  let i = 0
+  while i < irkMemoIx.length {
+    if irkMemoIx[i] == ifIx && irkMemoFn[i] == fnIx {
+      if irkMemoNul[i] == 1 { return null }
+      return irkMemoKind[i]
+    }
+    i = i + 1
+  }
+  irkDepth = irkDepth + 1
+  const k = ifExprRefKindOf(ifIx, fnIx)
+  irkDepth = irkDepth - 1
+  if irkDepth == 0 {
+    irkMemoIx = []
+    irkMemoFn = []
+    irkMemoKind = []
+    irkMemoNul = []
+  } else {
+    irkMemoIx.push(ifIx)
+    irkMemoFn.push(fnIx)
+    if k == null {
+      irkMemoKind.push("i32")
+      irkMemoNul.push(1)
+    } else {
+      irkMemoKind.push(k)
+      irkMemoNul.push(0)
+    }
+  }
+  k
+}
+
+// `ifExprRefKind`'s answers per (join, function) asked during one outermost query, which
+// emits nothing, so an inner join asked by several arm predicates is classified
+// once rather than once per path (exponential in the nest depth otherwise, D2271). Emptied when
+// the outermost query returns; `irkMemoNul` 1 marks a null answer.
+let irkDepth = 0
+let irkMemoIx: i32[] = []
+let irkMemoFn: i32[] = []
+let irkMemoKind: VKind[] = []
+let irkMemoNul: i32[] = []
+
+function ifExprRefKindOf(ifIx: i32, fnIx: i32): VKind | null {
   const tv = ifListArmValueIx(ifIx)
   if tv < 0 { return null }
   // A closure join (kind 14, `(ref $cloStruct)`) checked first: a bare lambda arm is a
@@ -33413,16 +33474,18 @@ export function exprU8Array(exprIx: i32, fnIx: i32) {
   false
 }
 
-// True if `k` is one of the seven non-null list reps. Exhaustive and `_`-less, so a new kind
-// has to say whether it is one; the nullable niches answer false, since a narrowed read of one
-// produces the bare list.
-function vkIsListRep(k: VKind): boolean {
+// How `k` relates to the list reps: 1 for one of the seven non-null lists, 2 for a nullable
+// list niche, 0 for everything else. Exhaustive and `_`-less, so a new kind has to say which.
+function vkListClass(k: VKind): i32 {
   match k {
     "list" | "u8list" | "i64list" | "f32list" | "f64list" | "strlist" | "reflist" => {
-      return true
+      return 1
     }
-    "i32" | "struct" | "str" | "union" | "map" | "variant" | "nulvariant" | "nulstruct" | "i64" | "f64" | "f32" | "v128" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" | "nulnone" => {
-      return false
+    "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulf64list" | "nulstrlist" | "nulreflist" => {
+      return 2
+    }
+    "i32" | "struct" | "str" | "union" | "map" | "variant" | "nulvariant" | "nulstruct" | "i64" | "f64" | "f32" | "v128" | "closure" | "nulstr" | "nulbool" | "nulclosure" | "nulmap" | "nulnone" => {
+      return 0
     }
   }
 }
@@ -33430,32 +33493,36 @@ function vkIsListRep(k: VKind): boolean {
 // `k` when it names a non-null list rep, else null.
 function listRepOrNull(k: VKind | null): VKind | null {
   if k == null { return null }
-  if vkIsListRep(k) { return k }
+  if vkListClass(k) == 1 { return k }
   null
 }
 
 // The non-null list rep the expression at `exprIx` produces, or null when this cannot name one.
-// The checker's recorded type answers first, except that it types a float literal f64, so an f64
-// answer yields to an f32 syntactic claim. The syntactic rungs name the f32 list only; the other
-// element kinds with no recorded type still answer through their own `expr*Array` predicate.
+// The recorded type answers first: a list rep is the answer (an f64 one yields to an f32
+// syntactic claim, since a float literal types f64), and any other covered rep but a nullable
+// list's is a no, so the syntactic rungs run only where no type settled it (D2270).
 export function exprListRep(exprIx: i32, fnIx: i32): VKind | null {
   if exprIx < 0 { return null }
-  const a = arenaListRep(exprIx)
-  if a != null && a != "f64list" { return a }
+  const a = arenaRepKind(exprIx)
+  if a != null {
+    const c = vkListClass(a)
+    if c == 1 && a != "f64list" { return a }
+    if c == 0 { return null }
+  }
   const s = syntacticListRep(exprIx, fnIx)
   if a == "f64list" && s != "f32list" { return a }
   s
 }
 
-// The list rep of the checker's recorded type at `exprIx`, or null. A literal and an index are
-// never asked: a literal's recorded type is not the rep it builds, and an index's rep comes from
-// its container's element row.
-function arenaListRep(exprIx: i32): VKind | null {
+// The rep kind of the checker's recorded type at `exprIx`, or null when it has none. A literal
+// and an index are never asked: a literal's recorded type is not the rep it builds, and an
+// index's rep comes from its container's element row.
+function arenaRepKind(exprIx: i32): VKind | null {
   const e = P.nodes[exprIx]
   if e is ArrayLit || e is Index { return null }
   const rd = repOfTy(nodeTyPinIxOf(exprIx))
   if rd.rdCovered != 1 { return null }
-  listRepOrNull(rd.rdKind)
+  rd.rdKind
 }
 
 // `exprListRep`'s answer from the expression's shape alone, for a node with no recorded type.
