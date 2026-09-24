@@ -532,7 +532,10 @@ program verbatim — the only way to pass one that starts with `-`.
                       64 KiB pages (1..65536), imported or defined alike, so
                       one memory can back several instances (Web Workers).
                       Only the memory is shared: each instance keeps its own
-                      GC heap and globals. Growth stops at the max
+                      GC heap and globals, and runs top-level code once.
+                      HAZARD: at most ONE instance may allocate from
+                      std:buffer — each instance's allocator hands out the
+                      same addresses. Growth stops at the max
   {c}--heap-base={r}<addr>  First byte std:buffer may hand out (default 1024;
                       decimal or 0x hex, a nonzero multiple of 8)
   {c}--heap-limit={r}<addr> One past the last (a multiple of 8); a Buffer() past it
@@ -2813,16 +2816,22 @@ struct LinkOpts {
 /// The largest page count an i32-addressed memory can declare (4 GiB).
 const SHARED_PAGES_MAX: i64 = 65536;
 
-/// `--shared-memory=<pages>`'s value: a decimal page count in [1, 65536], else exit 2.
-fn parse_shared_pages(raw: &str) -> i32 {
-    match raw.replace('_', "").parse::<i64>() {
-        Ok(n) if (1..=SHARED_PAGES_MAX).contains(&n) => n as i32,
-        _ => usage_exit(&format!(
+/// `--shared-memory=<pages>`'s value: plain decimal digits (no sign, no `_`) naming a page count
+/// in [1, 65536]; the error is the sentence each command prints before exiting 2.
+fn parse_shared_pages(raw: &str) -> std::result::Result<i32, String> {
+    let digits = !raw.is_empty() && raw.bytes().all(|b| b.is_ascii_digit());
+    match raw.parse::<i64>() {
+        Ok(n) if digits && (1..=SHARED_PAGES_MAX).contains(&n) => Ok(n as i32),
+        _ => Err(format!(
             "`--shared-memory={raw}` — expected the memory's maximum in 64 KiB pages, a \
              decimal count from 1 to {SHARED_PAGES_MAX}"
         )),
     }
 }
+
+/// The sentence for a bare `--shared-memory`, shared by `vl build` and `vl run`.
+const SHARED_MEMORY_BARE: &str = "`--shared-memory` takes the memory's maximum after `=`: \
+     `--shared-memory=<pages>` (a shared memory must declare one)";
 
 /// The refusal for a link flag the seed has no setter for.
 fn stale_seed_for(flag: &str, export: &str) -> Error {
@@ -2877,12 +2886,9 @@ fn parse_link_opts(args: &[String]) -> LinkOpts {
             if shared_pages.is_some() {
                 usage_exit("`--shared-memory=` is given twice — give it once");
             }
-            shared_pages = Some(parse_shared_pages(v));
+            shared_pages = Some(parse_shared_pages(v).unwrap_or_else(|m| usage_exit(&m)));
         } else if a == "--shared-memory" {
-            usage_exit(
-                "`--shared-memory` takes the memory's maximum after `=`: \
-                 `--shared-memory=<pages>` (a shared memory must declare one)",
-            );
+            usage_exit(SHARED_MEMORY_BARE);
         } else if let Some(v) = a.strip_prefix("--heap-base=") {
             once(&base, "--heap-base");
             base = Some(parse("--heap-base", v));
@@ -6085,8 +6091,11 @@ fn run_cmd(args: &[String]) -> Result<()> {
                 if link.shared_pages.is_some() {
                     arg_error("`--shared-memory=` is given twice — give it once", None);
                 }
-                link.shared_pages = Some(parse_shared_pages(&a["--shared-memory=".len()..]));
+                let raw = &a["--shared-memory=".len()..];
+                link.shared_pages =
+                    Some(parse_shared_pages(raw).unwrap_or_else(|m| arg_error(&m, None)));
             }
+            "--shared-memory" => arg_error(SHARED_MEMORY_BARE, None),
             a if a.starts_with("--heap-base=") || a.starts_with("--heap-limit=") => arg_error(
                 &format!(
                     "`{a}` lays out a module for a host that shares its memory — it is a \
@@ -6157,6 +6166,16 @@ fn run_cmd(args: &[String]) -> Result<()> {
             let raw = std::fs::read(f)
                 .map_err(|e| Error::from(e).context(format!("reading `{f}`")))?;
             if raw.starts_with(b"\0asm") {
+                // A prebuilt module's memory type was fixed when it was built.
+                if link.shared_pages.is_some() {
+                    arg_error(
+                        &format!(
+                            "`--shared-memory` shapes the module `vl run` compiles, and `{f}` is \
+                             already built — its memory is whatever `vl build` declared"
+                        ),
+                        None,
+                    );
+                }
                 return finish_gc_stats(gc_stats, run_program(&run_engine, &raw, palette));
             }
             let source = String::from_utf8(raw).map_err(|e| {
@@ -7840,7 +7859,22 @@ fn build_cmd(args: &[String]) -> Result<()> {
     )?;
     // A unit sharing a host's memory that allocates with no window of its own starts at
     // the default base, as every other such unit does. Legal, so a warning, not a refusal.
-    if link.import_memory && link.heap.is_none() {
+    // Over a SHARED import the hazard is between instances of this one module instead: each
+    // has its own bump pointer over the same window, so no `--heap-base` can separate them.
+    if link.import_memory && link.shared_pages.is_some() {
+        if let Some((store, inst)) = session.as_mut() {
+            if let Ok(read) = inst.get_typed_func::<(), i32>(&mut *store, "heapWindowRead") {
+                if read.call(&mut *store, ())? != 0 {
+                    eprintln!(
+                        "vl build: warning: `{input}` allocates from std:buffer over a shared \
+                         memory; every instance of it hands out the SAME addresses, so at most \
+                         one instance may allocate — the others must manage their own address \
+                         ranges (--heap-base cannot separate instances of one module)"
+                    );
+                }
+            }
+        }
+    } else if link.import_memory && link.heap.is_none() {
         if let Some((store, inst)) = session.as_mut() {
             if let Ok(read) = inst.get_typed_func::<(), i32>(&mut *store, "heapWindowRead") {
                 if read.call(&mut *store, ())? != 0 {

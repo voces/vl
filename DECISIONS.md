@@ -6526,6 +6526,16 @@ keeps its own GC heap, globals and `std:buffer` bump pointer.
   JS render thread can read it and a grow never detaches its views. Several instances sharing
   one memory still need `--import-memory`, since each instance of a module that defines its
   memory gets its own.
+- **At most ONE instance may allocate from `std:buffer` over a shared memory.** The bump pointer
+  is a per-instance mutable global over a heap window fixed at build time, so every instance of
+  one module hands out the SAME addresses: a second instance's first `Buffer` lands on the
+  first's live allocation (pinned by the two-Worker test). `--heap-base` cannot separate them —
+  it is baked per BUILD, and every instance of one build shares it — and the grow helper reads
+  `memory.size` then grows, which is not atomic across instances. The other instances manage
+  their own address ranges with the raw loads and stores, which is what plumb does. Top-level
+  code also runs once PER INSTANCE, so a module-scope `Buffer(...)` allocates in each. `vl build
+  --import-memory --shared-memory` warns when the unit allocates from `std:buffer`. VL emits no
+  data segments, so instantiating a later instance writes nothing into the shared memory.
 - **A per-build flag, never an emitter default** (webcraft A5's answer 3): the seed uses linear
   memory itself. A default build is byte-identical; a module that touches no linear memory has
   no memory to share and the flag changes none of its bytes.
@@ -6538,7 +6548,8 @@ keeps its own GC heap, globals and `std:buffer` bump pointer.
   `shared_memory` on the user-program engine unconditionally**: wasmtime reads the flag only when
   it creates a shared memory (not in codegen, not in the engine's compatibility hash), and the
   threads proposal it needs is already on by default, so a module without a shared memory pays
-  nothing.
+  nothing. `wasm_threads(true)` is set beside it for the reader, and is a no-op: `threads` is a
+  default wasmtime feature, which already turns the proposal on.
 
 Atomics are a separate lane; wrappers over the raw intrinsics are queued in `ROADMAP.md`, each
 through the std review. Pinned by `tests/vl_shared_memory_test.ts`, which runs one module in two

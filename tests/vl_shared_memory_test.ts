@@ -232,61 +232,137 @@ Deno.test({
 
 // ── 2. two Workers, one memory ───────────────────────────────────────────────
 
-// Each worker instantiates the SAME compiled module over the memory it is handed. The writer
-// stores through the guest, then raises a flag word with a JS atomic; the reader waits on the
-// flag and reads the value back through ITS instance of the guest.
+// One module, two instances, the reviewer's ordering: A writes and allocates, THEN B
+// instantiates. VL emits no data segment, so B's instantiation writes nothing and A's plain
+// stores survive; B reads them through its own instance. But the `std:buffer` bump pointer is a
+// per-instance global over one heap window, so B's first `Buffer` is A's — the documented reason
+// at most one instance may allocate (DECISIONS.md, "A shared memory is a build flag").
+const TWO = `import { Buffer, storeI32 } from "std:buffer"
+let bumps = 0
+export function put(addr: i32, v: i32) { __store_i32__(addr, v) }
+export function peek(addr: i32): i32 { __load_i32__(addr) }
+export function alloc(n: i32, stamp: i32): i32 {
+  const b = Buffer(n)
+  b.storeI32(0, stamp)
+  b.base
+}
+export function bump(): i32 {
+  bumps = bumps + 1
+  bumps
+}
+`;
+
+// Each worker instantiates the SAME compiled module over the memory it is handed, then runs
+// one export per message. `wait` blocks on a flag word with `Atomics.wait` — JS atomics only.
 const WORKER_SRC = `
+let inst, mem;
 self.onmessage = async (e) => {
-  const { module, memory, role, addr, flagAddr, value } = e.data;
-  const inst = await WebAssembly.instantiate(module, { env: { memory } });
-  const flags = new Int32Array(memory.buffer);
-  if (role === "writer") {
-    inst.exports.put(addr, value);
-    Atomics.store(flags, flagAddr >> 2, 1);
-    Atomics.notify(flags, flagAddr >> 2);
-    self.postMessage({ done: true });
-  } else {
-    self.postMessage({ ready: true });
-    Atomics.wait(flags, flagAddr >> 2, 0, 10000);
-    self.postMessage({ got: inst.exports.peek(addr) });
+  const { op, module, memory, a, b } = e.data;
+  if (op === "init") {
+    mem = memory;
+    const imports = new Proxy({}, { get: () => () => {} });
+    inst = await WebAssembly.instantiate(module, { env: { memory }, imports });
+    self.postMessage({ ok: true });
+    return;
+  }
+  const x = inst.exports;
+  if (op === "put") { x.put(a, b); self.postMessage({ ok: true }); }
+  if (op === "peek") self.postMessage({ v: x.peek(a) });
+  if (op === "alloc") self.postMessage({ v: x.alloc(a, b) });
+  if (op === "bump") self.postMessage({ v: x.bump() });
+  if (op === "wait") {
+    const flags = new Int32Array(mem.buffer);
+    Atomics.wait(flags, a >> 2, 0, 10000);
+    self.postMessage({ v: x.peek(b) });
   }
 };
 `;
 
 Deno.test({
-  name: "shared-memory: one module in two Workers over one shared memory — one writes, the other reads",
+  name: "shared-memory: one module in two Workers — B instantiated after A keeps A's writes, and reuses A's Buffer address",
   ignore: !ENABLED,
   async fn() {
-    const bytes = await build(POKE, ["--import-memory", "--shared-memory=4"]);
+    const bytes = await build(TWO, ["--import-memory", "--shared-memory=16"]);
     const module = await WebAssembly.compile(bytes as BufferSource);
-    const memory = new WebAssembly.Memory({ initial: 1, maximum: 4, shared: true });
+    const memory = new WebAssembly.Memory({ initial: 1, maximum: 16, shared: true });
     const url = URL.createObjectURL(new Blob([WORKER_SRC], { type: "text/javascript" }));
-    const reader = new Worker(url, { type: "module" });
-    const writer = new Worker(url, { type: "module" });
-    const next = (w: Worker) =>
+    const A = new Worker(url, { type: "module" });
+    const B = new Worker(url, { type: "module" });
+    const call = (w: Worker, m: Record<string, unknown>) =>
       new Promise<Record<string, unknown>>((res, rej) => {
         w.onmessage = (e) => res(e.data);
         w.onerror = (e) => {
           e.preventDefault();
           rej(new Error(e.message));
         };
+        w.postMessage(m);
       });
+    const v = async (w: Worker, m: Record<string, unknown>) => (await call(w, m)).v;
     try {
-      const msg = { module, memory, addr: 4096, flagAddr: 64, value: 0x5eed };
-      let got = next(reader);
-      reader.postMessage({ ...msg, role: "reader" });
-      eq(await got, { ready: true }, "reader armed");
-      got = next(reader);
-      const wrote = next(writer);
-      writer.postMessage({ ...msg, role: "writer" });
-      eq(await wrote, { done: true }, "writer finished");
-      eq(await got, { got: 0x5eed }, "the reader's instance sees the writer's store");
-      // And the main thread sees it too, through the same memory.
-      eq(new Int32Array(memory.buffer)[4096 >> 2], 0x5eed, "main thread view");
+      await call(A, { op: "init", module, memory });
+      // A writes low (where a data segment would sit) and inside the heap, then allocates.
+      await call(A, { op: "put", a: 16, b: 0x1111 });
+      await call(A, { op: "put", a: 512, b: 0x2222 });
+      const aAddr = await v(A, { op: "alloc", a: 64, b: 0xaaaa }) as number;
+      eq([await v(A, { op: "bump" }), await v(A, { op: "bump" })], [1, 2], "A's own global");
+      const view = new Int32Array(memory.buffer);
+      eq(view[aAddr >> 2], 0xaaaa, "A's stamp");
+
+      await call(B, { op: "init", module, memory });
+      eq([view[16 >> 2], view[512 >> 2]], [0x1111, 0x2222], "A's plain writes survive B's instantiation");
+      eq(view[aAddr >> 2], 0xaaaa, "A's allocation survives B's instantiation");
+      eq(await v(B, { op: "peek", a: 512 }), 0x2222, "B's instance reads A's store");
+      eq(await v(B, { op: "bump" }), 1, "B's globals are its own");
+
+      // The hazard, recorded: B's allocator starts where A's did.
+      const bAddr = await v(B, { op: "alloc", a: 64, b: 0xbbbb }) as number;
+      eq(bAddr, aAddr, "B's first Buffer is A's address — at most one instance may allocate");
+      eq(view[aAddr >> 2], 0xbbbb, "and B's stamp overwrote A's");
+
+      // A cross-worker handoff through plain stores: B blocks, A writes and signals.
+      const got = v(B, { op: "wait", a: 64, b: 4096 });
+      await call(A, { op: "put", a: 4096, b: 0x5eed });
+      Atomics.store(view, 64 >> 2, 1);
+      Atomics.notify(view, 64 >> 2);
+      eq(await got, 0x5eed, "B sees A's store after the signal");
     } finally {
-      reader.terminate();
-      writer.terminate();
+      A.terminate();
+      B.terminate();
       URL.revokeObjectURL(url);
+    }
+  },
+});
+
+Deno.test({
+  name: "shared-memory: --import-memory --shared-memory warns about the instance hazard, not --heap-base",
+  ignore: !ENABLED,
+  async fn() {
+    const tmp = await Deno.makeTempDir();
+    try {
+      await Deno.writeTextFile(`${tmp}/two.vl`, TWO);
+      await Deno.writeTextFile(`${tmp}/poke.vl`, POKE);
+      const warn = async (file: string, flags: string[]) => {
+        const r = await vl(
+          ["build", `${tmp}/${file}`, "--compiler", COMPILER, "-o", `${tmp}/o.wasm`, ...flags],
+        );
+        eq(r.code, 0, `build ${file} ${flags.join(" ")}: ${r.err}`);
+        return r.err.split("\n").filter((l) => l.includes("warning")).join("\n");
+      };
+      const shared = await warn("two.vl", ["--import-memory", "--shared-memory=16"]);
+      if (!/at most one instance may allocate/.test(shared) || /no --heap-base/.test(shared)) {
+        throw new Error(`the shared warning should name the instance hazard:\n${shared}`);
+      }
+      const windowed = await warn(
+        "two.vl",
+        ["--import-memory", "--shared-memory=16", "--heap-base=0x10000"],
+      );
+      if (!/at most one instance may allocate/.test(windowed)) {
+        throw new Error(`--heap-base does not separate instances, so it still warns:\n${windowed}`);
+      }
+      eq(await warn("poke.vl", ["--import-memory", "--shared-memory=16"]), "", "no allocator, no warning");
+      eq(await warn("two.vl", ["--shared-memory=16"]), "", "a defined memory has one instance");
+    } finally {
+      await Deno.remove(tmp, { recursive: true });
     }
   },
 });
@@ -367,6 +443,9 @@ Deno.test({
         [["--shared-memory=0"], /from 1 to 65536/],
         [["--shared-memory=65537"], /from 1 to 65536/],
         [["--shared-memory=x"], /from 1 to 65536/],
+        [["--shared-memory=+16"], /from 1 to 65536/],
+        [["--shared-memory=1_6"], /from 1 to 65536/],
+        [["--shared-memory="], /from 1 to 65536/],
         [["--shared-memory=4", "--shared-memory=4"], /given twice/],
       ];
       for (const [flags, want] of cases) {
@@ -374,12 +453,26 @@ Deno.test({
           ["build", `${tmp}/p.vl`, "--compiler", COMPILER, "-o", `${tmp}/p.wasm`, ...flags],
         );
         eq(r.code, 2, `build ${flags.join(" ")}: ${r.err}`);
-        if (!want.test(r.err)) throw new Error(`build ${flags.join(" ")}: ${r.err}`);
+        if (!want.test(r.err) || !r.err.startsWith("vl build:")) {
+          throw new Error(`build ${flags.join(" ")}: ${r.err}`);
+        }
       }
-      for (const flags of [["--shared-memory=0"], ["--shared-memory=4", "--shared-memory=4"]]) {
+      // `vl run` speaks as itself, and a bare flag is named rather than "unknown".
+      for (const [flags, want] of cases) {
         const r = await vl(["run", "--compiler", COMPILER, ...flags, `${tmp}/p.vl`]);
         eq(r.code, 2, `run ${flags.join(" ")}: ${r.err}`);
+        if (!want.test(r.err) || !r.err.startsWith("vl run:")) {
+          throw new Error(`run ${flags.join(" ")}: ${r.err}`);
+        }
       }
+      // A prebuilt module's memory is already declared: the flag is refused, not ignored.
+      const plain = await vl(
+        ["build", `${tmp}/p.vl`, "--compiler", COMPILER, "-o", `${tmp}/p.wasm`],
+      );
+      eq(plain.code, 0, `plain build: ${plain.err}`);
+      const pre = await vl(["run", "--shared-memory=4", `${tmp}/p.wasm`]);
+      eq(pre.code, 2, `run --shared-memory on a prebuilt module: ${pre.err}`);
+      if (!/already built/.test(pre.err)) throw new Error(`prebuilt refusal: ${pre.err}`);
     } finally {
       await Deno.remove(tmp, { recursive: true });
     }
