@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
-"""The prefer-interpolation ratchet — string `+` chains the tree already carries.
+"""The prefer-interpolation ratchet — string `+` chains std/ and scripts/ still carry.
 
 `prefer-interpolation` (compiler/lint.vl) is an `info` suggestion written for a VL
 consumer: a `+` chain with three or more string literals reads better as one
-interpolated string. The compiler builds its own messages that way by the hundred,
-and rewriting them moves the seed for no change in behaviour, so the standing ones
-are held here rather than converted: a file's count may only FALL. New code in these
-trees writes the interpolated spelling; `--write-baseline` lowers a file after a
-rewrite.
+interpolated string. `compiler/*.vl` is not held to it — interpolation there is not
+a style debt, it is impossible: it desugars to a call needing `std:fmt`/`std:str`,
+and compiler/ is what `build/vl-compiler.wasm` (the seed) is built from, which must
+load with no host imports (`compiler-no-interpolation`, compiler/lint.vl; CLAUDE.md
+"After editing compiler/*.vl"). The lint itself knows this and never fires under
+compiler/, so this ratchet holds no compiler/ debt — only std/'s and scripts/'s
+standing chains, which a rewrite would move the seed for no change in behaviour to
+convert: a file's count may only FALL. `compiler/entry.vl` stays a scanned target at
+an implicit zero baseline, so a regression in the exclusion itself (not a new chain)
+still fails `--check`.
 
 Sibling of scripts/comment-budget.py, scan-budget.py, ladder-budget.py,
 sentinel-budget.py and export-budget.py; the baseline schema and the
@@ -15,6 +20,9 @@ sentinel-budget.py and export-budget.py; the baseline schema and the
 the census is not a python re-implementation: a chain is an expression tree, so this
 runs the lint itself — `vl check --severity info --json` with the checkout's binary
 and seed — and counts its findings. It therefore needs `build/vl-compiler.wasm`.
+Every target is passed RELATIVE to the checkout root (`cwd=root` below): the lint's
+own compiler/std scoping reads the literal path `vl check` was invoked with, so an
+absolute target would silently defeat it.
 """
 
 import json
@@ -37,9 +45,14 @@ SEED = os.path.join(ratchet.ROOT, "build", "vl-compiler.wasm")
 
 
 def targets(root):
-    """What `vl check` is handed: the compiler's entry (the graph lints every module
-    with its own file attribution), `std/`, and each program under scripts/."""
-    out = [os.path.join(root, "compiler", "entry.vl"), os.path.join(root, "std")]
+    """What `vl check` is handed, each path relative to `root`: the compiler's entry
+    (the graph lints every module with its own file attribution), `std/`, and each
+    program under scripts/. Relative, not `os.path.join(root, …)` — the subprocess
+    runs with `cwd=root`, and a relative path is what lets the lint's own
+    `compiler/`/`std/` prefix scoping recognise the tree; an absolute path never
+    starts with either prefix and the exclusion silently would not apply (see the
+    module docstring)."""
+    out = ["compiler/entry.vl", "std"]
     top = os.path.join(root, "scripts")
     for dirpath, dirnames, filenames in os.walk(top):
         dirnames[:] = sorted(n for n in dirnames
@@ -49,7 +62,7 @@ def targets(root):
             rel = os.path.relpath(p, root).replace(os.sep, "/")
             if name.endswith(".vl") and not name.endswith(".matrix.vl") \
                     and not rel.startswith(SKIP):
-                out.append(p)
+                out.append(rel)
     return out
 
 
@@ -116,9 +129,11 @@ R = ratchet.Ratchet(
     ok_line=lambda t: f"interp budget ok — {t[CODE]} {CODE} (baseline "
                       f"{R.load_baseline()['total'].get(CODE, 0)} or below)",
     remedy="A string built from a `+` chain with three or more literals reads better\n"
-           "interpolated: `\"fs.\\{op} \\{path}: \\{err}\"`. Write new code that way; the\n"
-           "standing chains are held so the seed does not move for a spelling. After a\n"
-           "rewrite, lower the baseline with",
+           "interpolated: `\"fs.\\{op} \\{path}: \\{err}\"`. Write new std/ or scripts/ code\n"
+           "that way — compiler/*.vl cannot (the seed it becomes must stay import-free;\n"
+           "`compiler-no-interpolation` refuses it). The standing std/ and scripts/ chains\n"
+           "are held so the seed does not move for a spelling. After a rewrite, lower the\n"
+           "baseline with",
     wrote_line=lambda t: f"{t[CODE]} {CODE}",
     extras=lambda: (("commit", ratchet.head_commit()),),
     named=named,

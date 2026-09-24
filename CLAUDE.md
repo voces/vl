@@ -536,6 +536,42 @@ worktree, and on BOTH arms of any A/B.
 Run `scripts/refresh-compiler.sh` before testing. The compiler is itself a VL program at
 `build/vl-compiler.wasm`, and a stale seed silently tests the previous compiler.
 
+**`compiler/*.vl` cannot use string interpolation** — it desugars to a call needing
+`std:fmt`/`std:str`, and this tree becomes the seed, which must load with no host
+imports. `compiler-no-interpolation` (`compiler/lint.vl`) refuses it at `vl check`
+time; `prefer-interpolation` never suggests it here either (`std/` and `scripts/`
+still can, and do). `compiler/lint.vl`'s own match (`scaIsCompiler`/`scaIsStd`) is
+a bare PREFIX (`compiler/`/`std/`) — it trusts the caller to have already turned a
+real target into that shape, and to have blanked one that is not — because a wider
+match (a path SEGMENT anywhere) fired on an unrelated project's own `src/compiler/`
+or `src/std/` directory (review round 2).
+
+That relativizing happens once per runtime, against the VL checkout the caller
+actually resolves — never against a spelling heuristic. The CLI relativizes an
+absolute target against the tree `std_source()` resolves `std:` from
+(`lintScopeKeyOf`, driver.vl; `vlRootPush`/`vlRootCommit`, staged once from Rust),
+so a worktree pinned by `$VL_STD` scopes to itself. The LSP walks up from the
+open document's own path looking for `compiler/entry.vl` + `std/fmt.vl`
+(`lsp/src/vlRoot.ts`), independent of whatever workspace folder is open — an
+unrelated project opened as a workspace is not this tree either. Both feed
+`lintSetPath` with either a checkout-relative path or "" (declining every
+path-scoped rule); a caller on an older seed, or outside any VL checkout, sees the
+same decline.
+
+`scaPath` is staged ahead of `lint()` and consumed exactly once, at that call's
+very top, into a per-run copy (`scaRunPath`) — every reader uses the copy, never
+the live stage, so a rule that runs before the walk finishes still sees this run's
+own answer. A source that fails to PARSE never reaches that top-of-function
+consumption at all (`lintSrcRun` returns before calling `lint()`), so it clears
+the stage by hand; a caller that reuses one wasm instance across documents
+(the LSP; `wasmChecker.lint`) also stages "" itself when a call carries no path,
+rather than leaving whichever path a PREVIOUS document staged in place — the two
+together are what keep a stale "compiler/" exclusion from outliving the document
+that earned it.
+
+Bypassing the lint entirely still fails, just later and less clearly —
+`refresh-compiler.sh`'s sanity run as `unknown import: imports::__print_i32__`.
+
 ## A COST REGRESSION SHOWS UP ONE BOOTSTRAP STEP LATE, and it looks like a broken merge
 
 **An ungated collect pass does not make the SOURCE slow. It makes the compiler BUILT FROM IT

@@ -7113,6 +7113,28 @@ fn cli_pump(args: &[String]) -> Result<()> {
     }
     arg_commit.call(&mut store, ())?;
 
+    // The tree `compiler-no-interpolation`/`prefer-interpolation`/`std-comment-audience`
+    // (compiler/lint.vl) scope to — the SAME one `std_source()` resolves `std:` from,
+    // so a worktree pinned by $VL_STD scopes to itself rather than to whichever tree
+    // built this binary. `lintScopeKeyOf` (driver.vl) reads it to relativize an
+    // absolute check target inside this checkout, or decline one outside it — a VL
+    // program cannot ask the filesystem this itself. An older seed lacks the two
+    // exports; `.ok()` then leaves every such rule declining, same as before them.
+    if let (Ok(root_push), Ok(root_commit)) = (
+        inst.get_typed_func::<i32, i32>(&mut store, "vlRootPush"),
+        inst.get_typed_func::<(), i32>(&mut store, "vlRootCommit"),
+    ) {
+        let (src, _origin) = std_source();
+        if let StdSource::Dir(d) = src {
+            if let Some(root) = d.parent() {
+                for ch in root.to_string_lossy().chars() {
+                    root_push.call(&mut store, ch as i32)?;
+                }
+            }
+        }
+        root_commit.call(&mut store, ())?;
+    }
+
     let next = inst.get_typed_func::<(), i32>(&mut store, "cliNext")?;
     let cmd_path = StrOut::probe(&mut store, &inst, "cliCmdPath")?;
     let cmd_data = StrOut::probe(&mut store, &inst, "cliCmdData")?;
