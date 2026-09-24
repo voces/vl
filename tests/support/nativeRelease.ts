@@ -523,8 +523,11 @@ export const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3:
     // code"). Allocation sites unchanged; wasmtime and V8 timings unchanged.
     // `-O` fns 17 -> 16: a leaf helper of the `std:fmt` code it carries is inlined now
     // (DECISIONS.md, "`-O` inlines leaf helpers"). Allocation sites unchanged.
-    O: { bytes: 7670, fns: 16, allocs: 95, indirect: 0, refEq: 1 },
-    O3: { bytes: 2174, fns: 6, allocs: 46, indirect: 0, refEq: 1 },
+    // D2290: the probe's wrap-trap (`__map_probe__`/`__map_probe_i32__`) now streams a
+    // reason before it, cold-branch `__print_char__` code exactly like `emitNumCastTrapMsg`'s
+    // per-site message above — `-O` 7670 -> 7960, `-O3` 2174 -> 2472 bytes, structure unchanged.
+    O: { bytes: 7960, fns: 16, allocs: 95, indirect: 0, refEq: 1 },
+    O3: { bytes: 2472, fns: 6, allocs: 46, indirect: 0, refEq: 1 },
   },
   // MAP PROBE WITHOUT THE STRING COST. i32 keys, so this isolates the bucket walk and the
   // `?? -1` sentinel path from hashing and content compare — the two rows differ by exactly
@@ -536,8 +539,10 @@ export const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3:
     // Both rungs `fns` 2 -> 3: the probe helper `main`'s loop calls stays a function, because
     // `main` runs once (DECISIONS.md, "`-O3` keeps hot callees out of run-once code").
     // Allocation sites unchanged; wasmtime and V8 timings unchanged.
-    O: { bytes: 1215, fns: 3, allocs: 13, indirect: 0 },
-    O3: { bytes: 1131, fns: 3, allocs: 13, indirect: 0 },
+    // D2290: the probe's wrap-trap now streams a reason (see `collections/map-string` above)
+    // — `-O` 1215 -> 1509, `-O3` 1131 -> 1429 bytes, structure unchanged.
+    O: { bytes: 1509, fns: 3, allocs: 13, indirect: 0 },
+    O3: { bytes: 1429, fns: 3, allocs: 13, indirect: 0 },
   },
   // MIXED MAP + STRING, the realistic one: tokenize by code-point scan and slice, then a
   // read-modify-write upsert. `meta.json` decomposes VL's cost as ~64% map upsert and ~21%
@@ -573,8 +578,10 @@ export const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3:
     // Timed with the old and new modules interleaved, wasmtime and V8 are unchanged (±5%).
     // `-O` fns 17 -> 16, the same leaf of `std:fmt` as on `collections/map-string` (DECISIONS.md,
     // "`-O` inlines leaf helpers"). Allocation sites unchanged.
+    // D2290: the map upsert's probe wrap-trap now streams a reason (see `collections/map-string`
+    // above) — `-O3` 3140 -> 3383 bytes, structure unchanged; `-O` stayed within band.
     O: { bytes: 8568, fns: 16, allocs: 101, indirect: 0, refEq: 1 },
-    O3: { bytes: 3140, fns: 6, allocs: 52, indirect: 0, refEq: 1 },
+    O3: { bytes: 3383, fns: 6, allocs: 52, indirect: 0, refEq: 1 },
   },
   // ARRAY ELEMENT WRITE + READ, 400M of each, with the allocation hoisted out of the steady
   // state by construction. `fns: 1` is the load-bearing pin: every element accessor has been
