@@ -4100,40 +4100,9 @@ export function initChecker() {
   declare("__load_i64__", mkFuncTy([TY_I32], TY_I64))
   declare("__load_f32__", mkFuncTy([TY_I32], TY_F32))
   declare("__load_f64__", mkFuncTy([TY_I32], TY_F64))
-  // The SIMD substrate (`simd-design.md` §D6, slices S1-S2): load/store a 128-bit vector to
-  // linear memory (they force the module's memory like `__load_i32__`), splat an f32 across
-  // four lanes, add two f32x4 vectors, extract a lane as an f32. The lane index of
-  // `__extract_lane_f32x4__` must be a compile-time literal in 0..3 (checked below).
-  declare("__load_v128__", mkFuncTy([TY_I32], TY_V128))
-  declare("__store_v128__", mkFuncTy([TY_I32, TY_V128], TY_VOID))
-  declare("__splat_f32x4__", mkFuncTy([TY_F32], TY_V128))
-  declare("__add_f32x4__", mkFuncTy([TY_V128, TY_V128], TY_V128))
-  declare("__extract_lane_f32x4__", mkFuncTy([TY_V128, TY_I32], TY_F32))
-  // Slice S3 (`std:simd`'s F32x4): the rest of the f32x4 lane arithmetic, the six compares
-  // (each answering an all-ones/all-zeros lane mask), `v128.bitselect` and a 4-lane shuffle. A
-  // lane argument of `__replace_lane_f32x4__` / `__shuffle_f32x4__` is a literal (checked below).
-  declare("__sub_f32x4__", mkFuncTy([TY_V128, TY_V128], TY_V128))
-  declare("__mul_f32x4__", mkFuncTy([TY_V128, TY_V128], TY_V128))
-  declare("__div_f32x4__", mkFuncTy([TY_V128, TY_V128], TY_V128))
-  declare("__min_f32x4__", mkFuncTy([TY_V128, TY_V128], TY_V128))
-  declare("__max_f32x4__", mkFuncTy([TY_V128, TY_V128], TY_V128))
-  declare("__abs_f32x4__", mkFuncTy([TY_V128], TY_V128))
-  declare("__sqrt_f32x4__", mkFuncTy([TY_V128], TY_V128))
-  declare("__eq_f32x4__", mkFuncTy([TY_V128, TY_V128], TY_V128))
-  declare("__ne_f32x4__", mkFuncTy([TY_V128, TY_V128], TY_V128))
-  declare("__lt_f32x4__", mkFuncTy([TY_V128, TY_V128], TY_V128))
-  declare("__gt_f32x4__", mkFuncTy([TY_V128, TY_V128], TY_V128))
-  declare("__le_f32x4__", mkFuncTy([TY_V128, TY_V128], TY_V128))
-  declare("__ge_f32x4__", mkFuncTy([TY_V128, TY_V128], TY_V128))
-  declare("__bitselect_v128__", mkFuncTy([TY_V128, TY_V128, TY_V128], TY_V128))
-  declare(
-    "__replace_lane_f32x4__",
-    mkFuncTy([TY_V128, TY_I32, TY_F32], TY_V128),
-  )
-  declare(
-    "__shuffle_f32x4__",
-    mkFuncTy([TY_V128, TY_V128, TY_I32, TY_I32, TY_I32, TY_I32], TY_V128),
-  )
+  // The SIMD substrate (`simd-design.md` §D6): one declaration per row of the intrinsic table,
+  // typed by the row's operand shape. A lane or shuffle index is a literal (checked below).
+  declareSimdIntrinsics()
   // The filesystem floor (`std:fs`, `std:args`), which unlike everything above it does not
   // lower to instructions — a syscall is the one thing wasm cannot express. Bytes, not
   // strings, in both directions, so a payload crosses as one packed `u8[]` GC object. Errors are
@@ -4213,48 +4182,256 @@ export function nameIsMemBulkIntrinsic(name: string) {
   false
 }
 
-// The SIMD substrate intrinsics (`simd-design.md` §D6), each lowered inline to a `0xFD`-prefix
-// instruction by `emitCall`. One list, consulted by the checker's definition reservation, the
-// emitter's dispatch and the import scan, so the three cannot drift. `__load_v128__` /
-// `__store_v128__` additionally force the module's memory (see `emit_sections`/`emit_state`).
-export function nameIsSimdIntrinsic(name: string) {
-  if name == "__load_v128__" { return true }
-  if name == "__store_v128__" { return true }
-  if name == "__splat_f32x4__" { return true }
-  if name == "__extract_lane_f32x4__" { return true }
-  if name == "__replace_lane_f32x4__" { return true }
-  if name == "__shuffle_f32x4__" { return true }
-  if name == "__bitselect_v128__" { return true }
-  if simdF32x4LaneOpCode(name) >= 0 { return true }
-  false
+// The SIMD intrinsics (`simd-design.md` §D6), each lowered inline to one `0xFD`-prefix
+// instruction by `emitCall`. One table, read by the checker's declarations, its definition
+// reservation and lane check, the emitter's dispatch and the import scan, so none can drift.
+// Naming: wasm `<shape>.<op>` is `__<op>_<shape>__`; an op naming its source shape drops `<shape>`.
+export function nameIsSimdIntrinsic(name: string) { simdRow(name) >= 0 }
+
+// The operand shape of a SIMD row (`V` a v128, `I` an i32, `L` an i64, `F` an f32), read by
+// the checker to type it and by the emitter to push its operands. `LANE`/`REPL` rows carry a
+// lane immediate after the vector; `LOAD`/`STORE` a memarg; `SHUF4`/`SHUF16` their lane literals.
+export const SIMD_SIG_V_V = 1
+export const SIMD_SIG_VV_V = 2
+export const SIMD_SIG_VVV_V = 3
+export const SIMD_SIG_V_I = 4
+export const SIMD_SIG_VI_V = 5
+export const SIMD_SIG_I_V = 6
+export const SIMD_SIG_L_V = 7
+export const SIMD_SIG_F_V = 8
+export const SIMD_SIG_LOAD = 9
+export const SIMD_SIG_STORE = 10
+export const SIMD_SIG_LANE_I = 11
+export const SIMD_SIG_LANE_L = 12
+export const SIMD_SIG_LANE_F = 13
+export const SIMD_SIG_REPL_I = 14
+export const SIMD_SIG_REPL_L = 15
+export const SIMD_SIG_REPL_F = 16
+export const SIMD_SIG_SHUF4 = 17
+export const SIMD_SIG_SHUF16 = 18
+
+const simdNames: string[] = []
+const simdOps: i32[] = []
+const simdSigs: i32[] = []
+const simdLaneMax: i32[] = []
+const simdRowOf: {[string]: i32} = Map()
+
+// The table row of SIMD intrinsic `name`, or -1 when it is not one. Built on first use.
+export function simdRow(name: string): i32 {
+  if simdNames.length == 0 { simdTableBuild() }
+  simdRowOf[name] ?? -1
+}
+export function simdRowOp(row: i32): i32 { simdOps[row] }
+export function simdRowSig(row: i32): i32 { simdSigs[row] }
+// The highest index a lane row's immediate may name; for a shuffle row, each lane literal's.
+export function simdRowLaneMax(row: i32): i32 { simdLaneMax[row] }
+
+function simdAdd(name: string, op: i32, sig: i32, laneMax: i32) {
+  simdRowOf[name] = simdNames.length
+  simdNames.push(name)
+  simdOps.push(op)
+  simdSigs.push(sig)
+  simdLaneMax.push(laneMax)
+  0
 }
 
-// The `0xFD` sub-opcode of an f32x4 lane-wise intrinsic that takes one or two vectors and
-// pushes one (arithmetic, compare), or -1. One table for the checker's reservation and the
-// emitter's dispatch; `simdF32x4LaneOpArity` says how many vector operands it pops.
-export function simdF32x4LaneOpCode(name: string): i32 {
-  if name == "__eq_f32x4__" { return 0x41 }
-  if name == "__ne_f32x4__" { return 0x42 }
-  if name == "__lt_f32x4__" { return 0x43 }
-  if name == "__gt_f32x4__" { return 0x44 }
-  if name == "__le_f32x4__" { return 0x45 }
-  if name == "__ge_f32x4__" { return 0x46 }
-  if name == "__abs_f32x4__" { return 0xe0 }
-  if name == "__sqrt_f32x4__" { return 0xe3 }
-  if name == "__add_f32x4__" { return 0xe4 }
-  if name == "__sub_f32x4__" { return 0xe5 }
-  if name == "__mul_f32x4__" { return 0xe6 }
-  if name == "__div_f32x4__" { return 0xe7 }
-  if name == "__min_f32x4__" { return 0xe8 }
-  if name == "__max_f32x4__" { return 0xe9 }
-  -1
+// Rows sharing one operand shape and no lane immediate; `ops[i]` is `names[i]`'s sub-opcode.
+function simdAddAll(names: string[], ops: i32[], sig: i32) {
+  let i = 0
+  while i < names.length {
+    simdAdd(names[i], ops[i], sig, -1)
+    i = i + 1
+  }
+  0
 }
 
-// The vector operand count of a `simdF32x4LaneOpCode` intrinsic: 1 for abs/sqrt, else 2.
-export function simdF32x4LaneOpArity(name: string): i32 {
-  if name == "__abs_f32x4__" { return 1 }
-  if name == "__sqrt_f32x4__" { return 1 }
-  2
+// The rows, grouped by operand shape; each opcode is the wasm SIMD spec's sub-opcode.
+function simdTableBuild() {
+  simdAdd("__load_v128__", 0x00, SIMD_SIG_LOAD, -1)
+  simdAddAll(
+    [
+      "__load8x8_s_v128__", "__load8x8_u_v128__", "__load16x4_s_v128__",
+      "__load16x4_u_v128__", "__load32x2_s_v128__", "__load32x2_u_v128__",
+      "__load8_splat_v128__", "__load16_splat_v128__", "__load32_splat_v128__",
+      "__load64_splat_v128__", "__load32_zero_v128__", "__load64_zero_v128__",
+    ],
+    [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x5c, 0x5d],
+    SIMD_SIG_LOAD,
+  )
+  simdAdd("__store_v128__", 0x0b, SIMD_SIG_STORE, -1)
+  simdAdd("__shuffle_i8x16__", 0x0d, SIMD_SIG_SHUF16, 31)
+  simdAdd("__shuffle_f32x4__", 0x0d, SIMD_SIG_SHUF4, 7)
+  simdAddAll(
+    ["__splat_i8x16__", "__splat_i16x8__", "__splat_i32x4__"],
+    [0x0f, 0x10, 0x11],
+    SIMD_SIG_I_V,
+  )
+  simdAdd("__splat_i64x2__", 0x12, SIMD_SIG_L_V, -1)
+  simdAdd("__splat_f32x4__", 0x13, SIMD_SIG_F_V, -1)
+  simdAdd("__extract_lane_s_i8x16__", 0x15, SIMD_SIG_LANE_I, 15)
+  simdAdd("__extract_lane_u_i8x16__", 0x16, SIMD_SIG_LANE_I, 15)
+  simdAdd("__replace_lane_i8x16__", 0x17, SIMD_SIG_REPL_I, 15)
+  simdAdd("__extract_lane_s_i16x8__", 0x18, SIMD_SIG_LANE_I, 7)
+  simdAdd("__extract_lane_u_i16x8__", 0x19, SIMD_SIG_LANE_I, 7)
+  simdAdd("__replace_lane_i16x8__", 0x1a, SIMD_SIG_REPL_I, 7)
+  simdAdd("__extract_lane_i32x4__", 0x1b, SIMD_SIG_LANE_I, 3)
+  simdAdd("__replace_lane_i32x4__", 0x1c, SIMD_SIG_REPL_I, 3)
+  simdAdd("__extract_lane_i64x2__", 0x1d, SIMD_SIG_LANE_L, 1)
+  simdAdd("__replace_lane_i64x2__", 0x1e, SIMD_SIG_REPL_L, 1)
+  simdAdd("__extract_lane_f32x4__", 0x1f, SIMD_SIG_LANE_F, 3)
+  simdAdd("__replace_lane_f32x4__", 0x20, SIMD_SIG_REPL_F, 3)
+  simdAddAll(
+    [
+      "__not_v128__", "__abs_i8x16__", "__neg_i8x16__", "__popcnt_i8x16__",
+      "__abs_i16x8__", "__neg_i16x8__", "__abs_i32x4__", "__neg_i32x4__",
+      "__abs_i64x2__", "__neg_i64x2__", "__abs_f32x4__", "__sqrt_f32x4__",
+      "__extend_low_i8x16_s__", "__extend_high_i8x16_s__",
+      "__extend_low_i8x16_u__", "__extend_high_i8x16_u__",
+      "__extend_low_i16x8_s__", "__extend_high_i16x8_s__",
+      "__extend_low_i16x8_u__", "__extend_high_i16x8_u__",
+      "__extend_low_i32x4_s__", "__extend_high_i32x4_s__",
+      "__extend_low_i32x4_u__", "__extend_high_i32x4_u__",
+      "__extadd_pairwise_i8x16_s__", "__extadd_pairwise_i8x16_u__",
+      "__extadd_pairwise_i16x8_s__", "__extadd_pairwise_i16x8_u__",
+      "__trunc_sat_f32x4_s__", "__trunc_sat_f32x4_u__", "__convert_i32x4_s__",
+      "__convert_i32x4_u__",
+    ],
+    [
+      0x4d, 0x60, 0x61, 0x62, 0x80, 0x81, 0xa0, 0xa1, 0xc0, 0xc1, 0xe0, 0xe3,
+      0x87, 0x88, 0x89, 0x8a, 0xa7, 0xa8, 0xa9, 0xaa, 0xc7, 0xc8, 0xc9, 0xca,
+      0x7c, 0x7d, 0x7e, 0x7f, 0xf8, 0xf9, 0xfa, 0xfb,
+    ],
+    SIMD_SIG_V_V,
+  )
+  simdAddAll(
+    [
+      "__any_true_v128__", "__all_true_i8x16__", "__bitmask_i8x16__",
+      "__all_true_i16x8__", "__bitmask_i16x8__", "__all_true_i32x4__",
+      "__bitmask_i32x4__", "__all_true_i64x2__", "__bitmask_i64x2__",
+    ],
+    [0x53, 0x63, 0x64, 0x83, 0x84, 0xa3, 0xa4, 0xc3, 0xc4],
+    SIMD_SIG_V_I,
+  )
+  simdAddAll(
+    [
+      "__shl_i8x16__", "__shr_s_i8x16__", "__shr_u_i8x16__", "__shl_i16x8__",
+      "__shr_s_i16x8__", "__shr_u_i16x8__", "__shl_i32x4__", "__shr_s_i32x4__",
+      "__shr_u_i32x4__", "__shl_i64x2__", "__shr_s_i64x2__", "__shr_u_i64x2__",
+    ],
+    [0x6b, 0x6c, 0x6d, 0x8b, 0x8c, 0x8d, 0xab, 0xac, 0xad, 0xcb, 0xcc, 0xcd],
+    SIMD_SIG_VI_V,
+  )
+  simdAddAll(
+    [
+      "__swizzle_i8x16__", "__and_v128__", "__andnot_v128__", "__or_v128__",
+      "__xor_v128__", "__eq_i8x16__", "__ne_i8x16__", "__lt_s_i8x16__",
+      "__lt_u_i8x16__", "__gt_s_i8x16__", "__gt_u_i8x16__", "__le_s_i8x16__",
+      "__le_u_i8x16__", "__ge_s_i8x16__", "__ge_u_i8x16__", "__eq_i16x8__",
+      "__ne_i16x8__", "__lt_s_i16x8__", "__lt_u_i16x8__", "__gt_s_i16x8__",
+      "__gt_u_i16x8__", "__le_s_i16x8__", "__le_u_i16x8__", "__ge_s_i16x8__",
+      "__ge_u_i16x8__", "__eq_i32x4__", "__ne_i32x4__", "__lt_s_i32x4__",
+      "__lt_u_i32x4__", "__gt_s_i32x4__", "__gt_u_i32x4__", "__le_s_i32x4__",
+      "__le_u_i32x4__", "__ge_s_i32x4__", "__ge_u_i32x4__", "__eq_i64x2__",
+      "__ne_i64x2__", "__lt_s_i64x2__", "__gt_s_i64x2__", "__le_s_i64x2__",
+      "__ge_s_i64x2__", "__eq_f32x4__", "__ne_f32x4__", "__lt_f32x4__",
+      "__gt_f32x4__", "__le_f32x4__", "__ge_f32x4__",
+    ],
+    [
+      0x0e, 0x4e, 0x4f, 0x50, 0x51, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29,
+      0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35,
+      0x36, 0x37, 0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e, 0x3f, 0x40, 0xd6,
+      0xd7, 0xd8, 0xd9, 0xda, 0xdb, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46,
+    ],
+    SIMD_SIG_VV_V,
+  )
+  simdAddAll(
+    [
+      "__narrow_i16x8_s__", "__narrow_i16x8_u__", "__add_i8x16__",
+      "__add_sat_s_i8x16__", "__add_sat_u_i8x16__", "__sub_i8x16__",
+      "__sub_sat_s_i8x16__", "__sub_sat_u_i8x16__", "__min_s_i8x16__",
+      "__min_u_i8x16__", "__max_s_i8x16__", "__max_u_i8x16__",
+      "__avgr_u_i8x16__",
+    ],
+    [0x65, 0x66, 0x6e, 0x6f, 0x70, 0x71, 0x72, 0x73, 0x76, 0x77, 0x78, 0x79, 0x7b],
+    SIMD_SIG_VV_V,
+  )
+  simdAddAll(
+    [
+      "__q15mulr_sat_s_i16x8__", "__narrow_i32x4_s__", "__narrow_i32x4_u__",
+      "__add_i16x8__", "__add_sat_s_i16x8__", "__add_sat_u_i16x8__",
+      "__sub_i16x8__", "__sub_sat_s_i16x8__", "__sub_sat_u_i16x8__",
+      "__mul_i16x8__", "__min_s_i16x8__", "__min_u_i16x8__", "__max_s_i16x8__",
+      "__max_u_i16x8__", "__avgr_u_i16x8__", "__extmul_low_i8x16_s__",
+      "__extmul_high_i8x16_s__", "__extmul_low_i8x16_u__",
+      "__extmul_high_i8x16_u__",
+    ],
+    [
+      0x82, 0x85, 0x86, 0x8e, 0x8f, 0x90, 0x91, 0x92, 0x93, 0x95, 0x96, 0x97,
+      0x98, 0x99, 0x9b, 0x9c, 0x9d, 0x9e, 0x9f,
+    ],
+    SIMD_SIG_VV_V,
+  )
+  simdAddAll(
+    [
+      "__add_i32x4__", "__sub_i32x4__", "__mul_i32x4__", "__min_s_i32x4__",
+      "__min_u_i32x4__", "__max_s_i32x4__", "__max_u_i32x4__",
+      "__dot_i16x8_s__", "__extmul_low_i16x8_s__", "__extmul_high_i16x8_s__",
+      "__extmul_low_i16x8_u__", "__extmul_high_i16x8_u__", "__add_i64x2__",
+      "__sub_i64x2__", "__mul_i64x2__", "__extmul_low_i32x4_s__",
+      "__extmul_high_i32x4_s__", "__extmul_low_i32x4_u__",
+      "__extmul_high_i32x4_u__", "__add_f32x4__", "__sub_f32x4__",
+      "__mul_f32x4__", "__div_f32x4__", "__min_f32x4__", "__max_f32x4__",
+    ],
+    [
+      0xae, 0xb1, 0xb5, 0xb6, 0xb7, 0xb8, 0xb9, 0xba, 0xbc, 0xbd, 0xbe, 0xbf,
+      0xce, 0xd1, 0xd5, 0xdc, 0xdd, 0xde, 0xdf, 0xe4, 0xe5, 0xe6, 0xe7, 0xe8,
+      0xe9,
+    ],
+    SIMD_SIG_VV_V,
+  )
+  simdAdd("__bitselect_v128__", 0x52, SIMD_SIG_VVV_V, -1)
+  0
+}
+
+// The checker type of SIMD row `row`, built from its operand shape.
+function simdRowTy(row: i32): i32 {
+  const v = TY_V128
+  const sig = simdSigs[row]
+  if sig == SIMD_SIG_V_V { return mkFuncTy([v], v) }
+  if sig == SIMD_SIG_VV_V { return mkFuncTy([v, v], v) }
+  if sig == SIMD_SIG_VVV_V { return mkFuncTy([v, v, v], v) }
+  if sig == SIMD_SIG_V_I { return mkFuncTy([v], TY_I32) }
+  if sig == SIMD_SIG_VI_V { return mkFuncTy([v, TY_I32], v) }
+  if sig == SIMD_SIG_I_V { return mkFuncTy([TY_I32], v) }
+  if sig == SIMD_SIG_L_V { return mkFuncTy([TY_I64], v) }
+  if sig == SIMD_SIG_F_V { return mkFuncTy([TY_F32], v) }
+  if sig == SIMD_SIG_LOAD { return mkFuncTy([TY_I32], v) }
+  if sig == SIMD_SIG_STORE { return mkFuncTy([TY_I32, v], TY_VOID) }
+  if sig == SIMD_SIG_LANE_I { return mkFuncTy([v, TY_I32], TY_I32) }
+  if sig == SIMD_SIG_LANE_L { return mkFuncTy([v, TY_I32], TY_I64) }
+  if sig == SIMD_SIG_LANE_F { return mkFuncTy([v, TY_I32], TY_F32) }
+  if sig == SIMD_SIG_REPL_I { return mkFuncTy([v, TY_I32, TY_I32], v) }
+  if sig == SIMD_SIG_REPL_L { return mkFuncTy([v, TY_I32, TY_I64], v) }
+  if sig == SIMD_SIG_REPL_F { return mkFuncTy([v, TY_I32, TY_F32], v) }
+  let lanes = -1
+  if sig == SIMD_SIG_SHUF4 { lanes = 4 }
+  if sig == SIMD_SIG_SHUF16 { lanes = 16 }
+  // No other shape exists; an unknown one types as an error rather than as some shuffle.
+  if lanes < 0 { return TY_ERR }
+  const ps: i32[] = [v, v]
+  while ps.length < lanes + 2 { ps.push(TY_I32) }
+  mkFuncTy(ps, v)
+}
+
+// Declares every SIMD row at the type its operand shape names.
+function declareSimdIntrinsics() {
+  if simdNames.length == 0 { simdTableBuild() }
+  let i = 0
+  while i < simdNames.length {
+    declare(simdNames[i], simdRowTy(i))
+    i = i + 1
+  }
+  0
 }
 
 // The seven new load widths. `__load_i32__` predates them and keeps its own arm at every call
@@ -27936,27 +28113,24 @@ function checkUnimplementedIntrinsicCall(cfn: Ident, ix: i32) {
 
 // A SIMD lane argument is a wasm instruction IMMEDIATE, not a stack operand, so it MUST be a
 // compile-time integer literal in `0..max` — a non-literal (a `-` prefix parses as `Unary`, not
-// `NumLit`) or out-of-range lane is a loud check error (O3, `simd-design.md` §F). Extract and
-// replace take one lane in 0..3; the shuffle takes four, each in 0..7 across its two vectors.
+// `NumLit`) or out-of-range lane is a loud check error (O3, `simd-design.md` §F). A lane row's
+// index is its second argument; a shuffle's are every argument after its two vectors.
 function checkSimdLaneArg(n: Call, cfn: Ident) {
   const nm = cfn.identName
-  if nm == "__extract_lane_f32x4__" {
-    if n.callArgs.length == 2 { simdLaneLitCheck(nm, n.callArgs[1], 3) }
-    return 0
-  }
-  if nm == "__replace_lane_f32x4__" {
-    if n.callArgs.length == 3 { simdLaneLitCheck(nm, n.callArgs[1], 3) }
-    return 0
-  }
-  if nm == "__shuffle_f32x4__" {
-    if n.callArgs.length == 6 {
-      let k = 2
-      while k < 6 {
-        simdLaneLitCheck(nm, n.callArgs[k], 7)
-        k = k + 1
-      }
+  const row = simdRow(nm)
+  if row < 0 { return 0 }
+  const sig = simdRowSig(row)
+  const max = simdRowLaneMax(row)
+  if sig == SIMD_SIG_SHUF4 || sig == SIMD_SIG_SHUF16 {
+    let k = 2
+    while k < n.callArgs.length {
+      simdLaneLitCheck(nm, n.callArgs[k], max)
+      k = k + 1
     }
     return 0
+  }
+  if max >= 0 && n.callArgs.length >= 2 {
+    simdLaneLitCheck(nm, n.callArgs[1], max)
   }
   0
 }

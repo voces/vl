@@ -862,6 +862,26 @@ new: the compare-frame pre-pass never recurses into a code-15 field, so a NESTED
 
 ## Codegen, memory & runtime (Track B)
 
+- **Integer SIMD intrinsics: the wasm integer SIMD set, one raw intrinsic per instruction
+  (plumb PL-026, `simd-design.md` tier 1).** plumb's V8 profile put 48.5% of its CPU in
+  SSE2/SSSE3 helpers written lane by lane (`pmaddubsw`, `punpck*`, `paddsw`, `psubusb`,
+  `packuswb`, `pmaxub`), because only `f32x4` had lane ops. 170 new `__…__` intrinsics over
+  `v128`, in the `__add_f32x4__` style (`wasm <shape>.<op>` is `__<op>_<shape>__`; an op that
+  names its source shape drops the shape: `__narrow_i16x8_u__`, `__extmul_low_i8x16_u__`,
+  `__dot_i16x8_s__`): add/sub/mul, saturating add/sub, min/max, avgr, abs/neg, popcnt,
+  q15mulr, dot, extmul, extadd_pairwise, the v128 bitwise ops, any/all_true and bitmask, the
+  twelve shifts, every integer compare, narrow and extend, splat/extract_lane/replace_lane per
+  shape (i64x2 in i64), the f32x4↔i32x4 conversions, the widening/splatting/zeroing loads,
+  `__swizzle_i8x16__` and `__shuffle_i8x16__` with sixteen literal lane indices (0..31;
+  anything else is a check error naming the range, as every lane index is). One table in
+  `typecheck.vl` now drives the declarations, the reservation, the lane check, the import scan
+  and the emitter, f32x4 rows included. Each intrinsic is graded against an independent model
+  of the spec's lane semantics (saturation bounds, signedness, shift counts at and past the
+  lane width, narrow saturation of a signed input) on wasmtime and V8, unoptimised and at
+  `-O`/`-O3`, where every one survives as its instruction. No `std:simd` exports: the typed
+  tier 2 awaits the owner's ruling. Generator `scripts/gen-simd-int-cases.py`; fixtures
+  `simd/int-binary.vl`, `int-unary.vl`, `int-shift.vl`, `int-lanes.vl` and three lane-literal
+  refusals.
 - **Nesting depth is bounded by memory, not the compiler's stack (D2182).** Every pass recurses
   once per nested block, and wasmtime's default 512 KiB stack held ~950 levels (`vl run`), ~750
   for an `if` nest. The host now gives each compiler-seed engine a 512 MiB wasm stack on a
