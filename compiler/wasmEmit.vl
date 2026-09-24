@@ -9500,6 +9500,16 @@ function strBackSlot() {
   listIdxScratchBase + liKinds.length
 }
 
+// Mint a FRESH `(ref null <mapTy>)` lazy-frame slot (`liBack` 22) holding a `for`-in walk's
+// map across its body. Fresh for the reason `strBackSlot` is, and not the shared mapRef: every
+// map op in the body rewrites that, and the walk re-reads `live` and `vals` each step (D2313).
+function forInMapStashSlot(mapTy: i32) {
+  liKinds.push("i32")
+  liSlots.push(mapTy)
+  liBack.push(22)
+  listIdxScratchBase + liKinds.length
+}
+
 // Mint a FRESH i32 lazy-frame slot (`liBack` 4, the same code a hoisted list `len` uses).
 // Fresh for the same reason `strBackSlot` is.
 function strI32Slot() {
@@ -20782,18 +20792,22 @@ function emitForInStmt(body: u8[], s: ForIn, _stmtIx: i32, fnIx: i32) {
     backTy = scalarListBack("u8list")
     hKind = "u8"
   }
-  // for a map iteration, evaluate the receiver once and stash the map ref: the stash is
-  // the receiver's only evaluation, so the walked list, the loop bound and the skip's
-  // `M.live[cursor]` all read one object and its side effects run once. The pinned
-  // `cmSlot` drives the stash local, the list field and the skip's `struct.get` type alike.
+  // for a map iteration, evaluate the receiver once into the walk's own stash: the walked
+  // list, the loop bound, the skip's `M.live[cursor]` and the pair's value all read one
+  // object and its side effects run once. The stash is per loop, never the shared mapRef,
+  // which any map op in the body rewrites (D2313).
   const mapRecv = forInMapRecv(s.fiIter, fnIx)
   let mwShape = -1
+  let fiMap = -1
   if mapRecv >= 0 {
     mwShape = mapShapeOfExpr(mapRecv, fnIx)
     mwShape = mapShapeFoldSet(mwShape)
     if pushMapRecvRef(body, mapRecv, fnIx) < 0 { return -1 }
     cmSlot = mwShape
-    setMapRef(body) // mapRef
+    setMapRef(body) // mapRef — read by `emitForInList` below, before any body op rewrites it
+    fiMap = forInMapStashSlot(cmMapTy())
+    pushMapRef(body)
+    fbLocalSet(fiMap)
   }
   // list = <iter> (evaluated once); cursor = 0
   if emitForInList(body, s.fiIter, fnIx, mapRecv, mwShape) < 0 { return -1 }
@@ -20890,7 +20904,9 @@ function emitForInStmt(body: u8[], s: ForIn, _stmtIx: i32, fnIx: i32) {
   // (if-frame is 0, loop is 1). A delete-free map has live all-1s, so never taken.
   if mapRecv >= 0 {
     cmSlot = mwShape
-    pushMapLive(body)    // M.live (off the pinned mapRef)
+    // M.live, off the walk's own stash
+    fbLocalGet(fiMap)
+    fbStructGet(cmMapTy(), 2)
     fbLocalGet(iIdx)
     fbArrayGet(aTypeIdx) // M.live[cursor]
     fbI32Eqz()           // live[cursor] == 0 ?
@@ -20947,10 +20963,11 @@ function emitForInStmt(body: u8[], s: ForIn, _stmtIx: i32, fnIx: i32) {
   }
   fbLocalSet(vIdx)
   if pairIsVal {
-    // `v = M.vals.backing[cursor]` — the value beside the key just bound, off the pinned
-    // mapRef the tombstone skip already reads, so the receiver is evaluated once.
+    // `v = M.vals.backing[cursor]` — the value beside the key just bound, off the walk's
+    // stash the tombstone skip already reads, so the receiver is evaluated once.
     cmSlot = mwShape
-    pushMapVals(body)
+    fbLocalGet(fiMap)
+    fbStructGet(cmMapTy(), 1) // M.vals
     fbStructGet(pairWrapTy, 0)
     fbLocalGet(iIdx)
     fbArrayGet(pairBackTy)
