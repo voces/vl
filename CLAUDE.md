@@ -540,8 +540,15 @@ Run `scripts/refresh-compiler.sh` before testing. The compiler is itself a VL pr
 `std:fmt`/`std:str`, and this tree becomes the seed, which must load with no host
 imports. `compiler-no-interpolation` (`compiler/lint.vl`) refuses it at `vl check`
 time; `prefer-interpolation` never suggests it here either (`std/` and `scripts/`
-still can, and do). Bypassing both still fails, just later and less clearly —
-`refresh-compiler.sh`'s sanity run as `unknown import: imports::__print_i32__`.
+still can, and do). Both are scoped by the path the caller stages via
+`lintSetPath` — `vl check`/`lint-self.sh`/the ratchets pass it directly, and the
+LSP threads the open document's workspace-relative path into `lint()` the same
+way (`lintPathReset`/`Push`/`Commit`, `lsp/src/wasmChecker.ts`), so the editor
+sees the same exclusion the CLI does. A caller that stages no path (or a wasm
+checker built before these exports) sees the pre-exclusion behavior — every
+path-scoped rule just declines. Bypassing the lint entirely still fails, just
+later and less clearly — `refresh-compiler.sh`'s sanity run as `unknown import:
+imports::__print_i32__`.
 
 ## A COST REGRESSION SHOWS UP ONE BOOTSTRAP STEP LATE, and it looks like a broken merge
 

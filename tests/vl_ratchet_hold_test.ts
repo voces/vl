@@ -20,17 +20,22 @@ if (!ENABLED) {
 
 const logs: string[] = [];
 const TARGET = `${ROOT}/compiler/typecheck.vl`;
+// checkout-root-relative — the spelling `lint()`'s `path` argument wants, and the
+// spelling `scaIsCompiler` (compiler/lint.vl) prefix-matches.
+const REL = "compiler/typecheck.vl";
 const HELD_CODES = [
   "kind-ladder-incomplete",
   "sentinel-index-unguarded",
   "arena-scan-outside-pass",
 ];
 
-/** The file's lint findings for the ratcheted codes, before any hold. */
+/** The file's lint findings for the ratcheted codes, before any hold. Staged with
+ * its real path, the way the editor now does (`server.ts`'s `lintPathFor`) — none
+ * of `HELD_CODES` is path-scoped, so this does not move their counts. */
 const rawFindings = () => {
   const checker = loadWasmChecker(COMPILER, (m) => logs.push(m))!;
   const src = Deno.readTextFileSync(TARGET);
-  return { src, diags: checker.lint(src) };
+  return { src, diags: checker.lint(src, REL) };
 };
 
 Deno.test({
@@ -100,7 +105,7 @@ Deno.test({
       "",
     ].join("\n");
     const checker = loadWasmChecker(COMPILER, (m) => logs.push(m))!;
-    const after = checker.lint(added);
+    const after = checker.lint(added, REL);
     const ladders = after.filter((d) => d.code === "kind-ladder-incomplete");
     if (ladders.length !== before + 1) {
       throw new Error(
@@ -133,5 +138,89 @@ Deno.test({
       );
     }
     await Promise.resolve();
+  },
+});
+
+// ── prefer-interpolation / compiler-no-interpolation: the path threaded THROUGH ──
+//
+// The critical half of this fix: `scaPath` (compiler/lint.vl) is set from the
+// path a CALLER stages, and the LSP's `lint()` never staged one at all before
+// this PR — so `scaIsCompiler("")` was always false and the CLI's `compiler/`
+// exclusion never reached the editor. Once the interp-budget baseline's
+// `compiler/` rows were removed (they "no longer count" — CLAUDE.md, "After
+// editing compiler/*.vl"), `applyRatchetHold` had nothing left to hold
+// typecheck.vl's ~150 real findings against, and every one would have
+// published loud. `lint()` now takes the document's path and stages it
+// (`lintPathReset`/`Push`/`Commit`, wired from `server.ts`'s `lintPathFor`)
+// before the pass runs. These pin both halves against the REAL wasm checker on
+// REAL and PLANTED sources, not a recording.
+
+Deno.test({
+  name: "ratchet-hold: prefer-interpolation is EXCLUDED (not merely held) for typecheck.vl once its path is staged",
+  ignore: !ENABLED,
+  fn: () => {
+    invalidateRatchetBaselines();
+    const { diags } = rawFindings(); // staged with REL, like the editor now does
+    const found = diags.filter((d) => d.code === "prefer-interpolation");
+    if (found.length !== 0) {
+      throw new Error(
+        `want 0 raw prefer-interpolation findings for ${REL} — the exclusion, not ` +
+          `a hold — got ${found.length}: ${JSON.stringify(found.slice(0, 3))}`,
+      );
+    }
+    // Nothing for applyRatchetHold to filter — the interp-budget baseline's
+    // compiler/ rows staying gone (316 -> 45) is safe BECAUSE the exclusion holds.
+    const out = applyRatchetHold(diags, TARGET, ROOT, false);
+    const published = out.filter((d) => d.code === "prefer-interpolation");
+    if (published.length !== 0) {
+      throw new Error(`want 0 published, got ${published.length}`);
+    }
+  },
+});
+
+Deno.test({
+  name: "ratchet-hold: WITHOUT a staged path the exclusion does not apply — the control the regression hid behind",
+  ignore: !ENABLED,
+  fn: () => {
+    invalidateRatchetBaselines();
+    const checker = loadWasmChecker(COMPILER, (m) => logs.push(m))!;
+    const src = Deno.readTextFileSync(TARGET);
+    const diags = checker.lint(src); // no second argument — the pre-fix call shape
+    const found = diags.filter((d) => d.code === "prefer-interpolation").length;
+    if (found < 100) {
+      throw new Error(
+        `the scoping fix's premise is that typecheck.vl carries a large unscoped ` +
+          `prefer-interpolation count when no path is staged; got only ${found}`,
+      );
+    }
+  },
+});
+
+Deno.test({
+  name: "ratchet-hold: compiler-no-interpolation fires in the editor for a planted interpolation under compiler/, and nowhere else",
+  ignore: !ENABLED,
+  fn: () => {
+    invalidateRatchetBaselines();
+    const checker = loadWasmChecker(COMPILER, (m) => logs.push(m))!;
+    // Real interpolation (`\{x}`), not a `+` chain — this is the OTHER rule, the
+    // hard refusal, not the advisory one asserted above.
+    const planted = 'export function f(x: i32): string {\n  "n=\\{x}"\n}\n';
+
+    const under = checker.lint(planted, "compiler/probe.vl");
+    const forbidden = under.filter((d) => d.code === "compiler-no-interpolation");
+    if (forbidden.length !== 1 || forbidden[0].range.start.line !== 1) {
+      throw new Error(
+        `want one compiler-no-interpolation finding at line 2 (0-based line 1), ` +
+          `got ${JSON.stringify(forbidden)}`,
+      );
+    }
+
+    const elsewhere = checker.lint(planted, "src/probe.vl");
+    const there = elsewhere.filter((d) => d.code === "compiler-no-interpolation");
+    if (there.length !== 0) {
+      throw new Error(
+        `compiler-no-interpolation fired outside compiler/: ${JSON.stringify(there)}`,
+      );
+    }
   },
 });

@@ -59,6 +59,7 @@ import {
 import {
   applyRatchetHold,
   invalidateRatchetBaselines,
+  workspaceRelative,
 } from "./ratchetHold.ts";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -254,6 +255,16 @@ const heldFiltered = (uri: string, diagnostics: VLDiagnostic[]): VLDiagnostic[] 
     showHeldLint,
   );
 
+// `uri`'s path as `lint()`'s `path` argument wants it: checkout-root-relative, the
+// spelling `compiler/lint.vl`'s `scaIsCompiler`/`scaIsStd` prefix-match against (the
+// CLI and the ratchets spell it the same way — CLAUDE.md, "After editing
+// compiler/*.vl"). `undefined` with no open workspace or outside it: the rules that
+// read it just decline, the same as before this channel existed.
+const lintPathFor = (uri: string): string | undefined =>
+  workspaceFolder
+    ? workspaceRelative(uriToPath(workspaceFolder), uriToPath(uri))
+    : undefined;
+
 const toLspDiagnostic = (d: VLDiagnostic): Diagnostic => ({
   message: d.message,
   severity: severityMap[d.severity],
@@ -410,7 +421,7 @@ documents.onDidChangeContent(async (event) => {
   if (wasmChecker !== undefined) {
     try {
       const text = event.document.getText();
-      const lintDiags = wasmChecker.lint(text);
+      const lintDiags = wasmChecker.lint(text, lintPathFor(event.document.uri));
       const errors = await wasmChecker.check(
         text,
         entryKeyOf(event.document.uri),
@@ -1508,7 +1519,7 @@ connection.onCodeAction((params): CodeAction[] => {
     // introduces nothing either, and its lint is anchored at the second
     // occurrence's imported-name token precisely so this rewrite applies to it
     // unchanged.
-    const redundant = (wasmChecker?.lint(source) ?? [])
+    const redundant = (wasmChecker?.lint(source, lintPathFor(uri)) ?? [])
       .filter((d) =>
         d.code === "unused-import" || d.code === "duplicate-import"
       )
