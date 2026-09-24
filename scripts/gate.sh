@@ -136,6 +136,12 @@ run "comment budget"           "$PY" scripts/comment-budget.py --check
 # first orchestrator script the language runs on itself — and it is why the row sits
 # after the build rather than beside the file scans.
 run "seed size"                "$VL" run scripts/seed-size.vl --compiler "$SEED" -- --check
+# THE COST OF GENERATED CODE: guest fuel and peak RSS of one `-O` build of a 2 MB
+# plumb-shaped unit, against a committed baseline. Fuel is a count, so the fan-out's
+# contention cannot move it; CPU is graded only from runs a control says were quiet,
+# which inside this fan-out is usually none. ~10 s, plus ~12 s once per new seed while
+# the fuel engine's sidecar compiles. #3108 and #3112's wins are what it holds.
+run "plumb-shape cost"         "$PY" scripts/plumb-shape-cost.py --check
 # The arena-scan RATCHET, same shape and the same reason: `arena-scan-outside-pass`
 # is a `warning` lint-self.sh holds out while the baseline is non-zero, so this is
 # what stops a whole-program scan being added outside a pass. #2419's class.
