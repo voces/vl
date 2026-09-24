@@ -511,7 +511,8 @@ program verbatim — the only way to pass one that starts with `-`.
 {b}Flags:{r}
   {c}-o{r} <out.wasm>       Output path (default: the input with `.wasm`)
   {c}-o -{r}                Write the module to stdout; no file is created
-  {c}-O{r}                  Optimize with wasm-opt — the shrink rung (one -O pass)
+  {c}-O{r}                  Optimize with wasm-opt — the shrink rung (one -O pass,
+                      which also inlines small leaf functions)
   {c}-O3{r}                 The release profile (closed-world + -O3; melts union
                       boxes). Wins over -O when both are given. Both rungs
                       require binaryen's wasm-opt and fail loudly without it
@@ -4806,7 +4807,12 @@ const BINARYEN_FEATURES: &[&str] = &[
 /// and a single-armed producer even across a call, since `-O` inlines). It melts
 /// NOTHING that reaches its use across a control-flow JOIN — so a `{tag, value}`
 /// union box built on two arms survives `-O` entirely. `-O3` is the rung for those.
-const OPT_PASSES: &[&str] = &["-O"];
+///
+/// It also inlines every function of at most 8 binaryen size units (`rg(i) =
+/// __load_i64__(CTX + i * 8)` is 6), wherever it is called. Binaryen's own `-O` stops at 2
+/// and leaves such a leaf as a call per use; `-O3` inlines them anyway. The `--no-inline`
+/// marks of lane L8 still win over the size (DECISIONS.md, "`-O` inlines leaf helpers").
+const OPT_PASSES: &[&str] = &["--always-inline-max-function-size", "8", "-O"];
 
 /// `vl build -O3` — the RELEASE PROFILE, the audited flag set from
 /// `docs/internals/opt-profile-design.md`. Not a bare binaryen `-O3`: VL's `-O`

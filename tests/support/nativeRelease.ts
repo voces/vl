@@ -521,7 +521,9 @@ export const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3:
     // Both rungs `fns` +1: `main` runs once, so the helper its loop calls stays a function
     // instead of being inlined into it (DECISIONS.md, "`-O3` keeps hot callees out of run-once
     // code"). Allocation sites unchanged; wasmtime and V8 timings unchanged.
-    O: { bytes: 7670, fns: 17, allocs: 95, indirect: 0, refEq: 1 },
+    // `-O` fns 17 -> 16: a leaf helper of the `std:fmt` code it carries is inlined now
+    // (DECISIONS.md, "`-O` inlines leaf helpers"). Allocation sites unchanged.
+    O: { bytes: 7670, fns: 16, allocs: 95, indirect: 0, refEq: 1 },
     O3: { bytes: 2174, fns: 6, allocs: 46, indirect: 0, refEq: 1 },
   },
   // MAP PROBE WITHOUT THE STRING COST. i32 keys, so this isolates the bucket walk and the
@@ -569,7 +571,9 @@ export const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3:
     // further, 3215 -> 8568 bytes, fns 6 -> 17, allocs 51 -> 101: `toString` is no longer
     // inlined into `main`, so open-world `-O` keeps the `std:fmt` code that came with it.
     // Timed with the old and new modules interleaved, wasmtime and V8 are unchanged (±5%).
-    O: { bytes: 8568, fns: 17, allocs: 101, indirect: 0, refEq: 1 },
+    // `-O` fns 17 -> 16, the same leaf of `std:fmt` as on `collections/map-string` (DECISIONS.md,
+    // "`-O` inlines leaf helpers"). Allocation sites unchanged.
+    O: { bytes: 8568, fns: 16, allocs: 101, indirect: 0, refEq: 1 },
     O3: { bytes: 3140, fns: 6, allocs: 52, indirect: 0, refEq: 1 },
   },
   // ARRAY ELEMENT WRITE + READ, 400M of each, with the allocation hoisted out of the steady

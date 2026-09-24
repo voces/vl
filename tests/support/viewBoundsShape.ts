@@ -159,6 +159,9 @@ const c = (trap: number, call: number, sget: number): Counts => ({ trap, call, s
 // view-construction reads of `axpy-at`, `axpy-fencedhoist` and `soa-at` moved into the
 // kernel, above its loop, so those rows read 0. The comments below describe the collapsed
 // shape these rows had before; §M of `buffer-design.md` carries the re-measured costs.
+// LEAF INLINING AT `-O` (DECISIONS.md, "`-O` inlines leaf helpers"): the three `buf` rows' `-O`
+// cells read one call, the driver's per-trip one, as `-O3` does — `Buf.loadF32`/`storeF32` are
+// small enough to inline now, and the buffer base each one read is the `sget` that moved in.
 export const TABLE: Record<string, Row> = {
   "scale-view": { none: c(0, 7, 1), O: c(2, 2, 3), O3: c(4, 1, 5) },
   // Identical to `scale-view` in every cell, which is the POINT: the bracket's
@@ -173,7 +176,7 @@ export const TABLE: Record<string, Row> = {
   // here, and the kernel runs 3.0x slower (0.445 -> 1.36 ns/element). This row
   // is the evidence that the reload is NOT a "two views of one width" property.
   "scale-seedtwice": { none: c(0, 7, 1), O: c(2, 2, 3), O3: c(4, 1, 5) },
-  "scale-buf": { none: c(0, 7, 0), O: c(0, 2, 1), O3: c(0, 1, 1) },
+  "scale-buf": { none: c(0, 7, 0), O: c(0, 1, 2), O3: c(0, 1, 1) },
   "scale-hoist": { none: c(0, 5, 0), O: c(0, 1, 0), O3: c(0, 1, 0) },
   "reduce-view": { none: c(0, 6, 1), O: c(2, 1, 3), O3: c(2, 1, 3) },
   "reduce-buf": { none: c(0, 6, 0), O: c(0, 1, 1), O3: c(0, 1, 1) },
@@ -193,7 +196,7 @@ export const TABLE: Record<string, Row> = {
   // view construction in the TRIP loop, exactly as on the `fencedhoist` row) while
   // all six per-access compares survive.
   "axpy-at": { none: c(0, 8, 0), O: c(2, 3, 0), O3: c(6, 1, 0) },
-  "axpy-buf": { none: c(0, 8, 0), O: c(0, 3, 1), O3: c(0, 1, 1) },
+  "axpy-buf": { none: c(0, 8, 0), O: c(0, 1, 3), O3: c(0, 1, 1) },
   "axpy-hoist": { none: c(0, 5, 0), O: c(0, 1, 0), O3: c(0, 1, 0) },
   // ── shape `soa`: webcraft's own six-column integrator (A1) ──────────────────
   // The two-view `axpy` rows UNDERSTATE the reload, because there the per-trip
@@ -211,7 +214,7 @@ export const TABLE: Record<string, Row> = {
   "soa-view": { none: c(0, 17, 0), O: c(0, 13, 0), O3: c(24, 1, 24) },
   "soa-at": { none: c(0, 17, 0), O: c(0, 13, 0), O3: c(24, 1, 0) },
   "rows-view": { none: c(0, 7, 0), O: c(2, 2, 2), O3: c(4, 1, 4) },
-  "rows-buf": { none: c(0, 7, 0), O: c(0, 3, 0), O3: c(0, 1, 1) },
+  "rows-buf": { none: c(0, 7, 0), O: c(0, 1, 2), O3: c(0, 1, 1) },
   "rows-hoist": { none: c(0, 5, 0), O: c(0, 1, 0), O3: c(0, 1, 0) },
 };
 

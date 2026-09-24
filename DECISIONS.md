@@ -6913,6 +6913,85 @@ flag.
   still validates every module it writes.
 * *An inline hint* (`@metadata.code.inline`): binaryen 133 still ignores it, as L8 found for 130.
 
+## `-O` inlines leaf helpers (2026-09-23) — plumb PL-027
+
+**The defect.** Binaryen inlines a function with several callers only when its size is at most
+`--always-inline-max-function-size`, which is 2 at `-O`; `-O3` also inlines a "lightweight"
+function (no loop, no call) up to 20. Transliterated code reaches registers and guest memory
+through helpers a handful of instructions long — `rg(i) = __load_i64__(CTX + i * 8)` (binaryen
+size 6), `sr(i, v)` (7), `st8(a, v)` (5 instructions, which binaryen measures at 4 or less) — so at `-O`
+every use stayed a call: 14,906 calls in plumb's
+`chunk_543`, 3,993 to `sr` and 3,966 to `rg`, and 13.6% of plumb's V8 profile. V8's own wasm
+inliner does not rescue them in a function that large. `-O3` inlined them all, at +14% size and
++10% build time over `-O` in plumb's measurement.
+
+**The rule.** The `-O` rung passes `--always-inline-max-function-size 8` ahead of `-O`
+(`OPT_PASSES` in `scripts/vl-host/src/main.rs`). `-O3` is unchanged. The run-once marks of lane
+L8 still apply, because `--no-inline` wins over the size. A function of size 8 or less has no loop
+and is well under L8's 160-byte leaf bound, so L8 marks one only when it calls a defined function,
+and then the mark keeps it out of run-once code as before. The L4 escape step is separate and runs
+first, as before. `tests/fixtures/opt-leaf/leaf-helpers.vl` shows both at once: its helpers inline
+into `step`, and `step`, called from the top-level loop, stays out of the start function.
+`-O3` keeps binaryen's always-inline size of 2 and inlines leaves through its size-20
+"lightweight" rule instead, which excludes a function that makes a call; so a size-3-to-8
+function that calls another is inlined at `-O` and not at `-O3`. On `chunk_543` `-O3` still
+leaves fewer calls (2,640 against 2,684).
+
+**Measured.** binaryen 133, load 6–20. Sizes in bytes; calls counted in a `--names` build's
+disassembly; optimiser CPU is `wasm-opt` alone on the plain module, median of 3.
+
+| `-O` with size | `chunk_543` bytes | its calls | its optimiser CPU | compiler bytes | compiler optimiser CPU | 86 `bench/` bytes (changed) |
+| --- | --- | --- | --- | --- | --- | --- |
+| 2 (was) | 327,007 | 14,906 | 2.64 s | 2,147,110 | 23.3 s | 91,746 |
+| 4 | 331,260 | 11,081 | 2.83 s | 2,148,813 | 24.3 s | 91,679 (7) |
+| 6 | 353,240 | 6,722 | 3.10 s | 2,154,140 | 25.0 s | 91,629 (11) |
+| 7 | 373,151 | 2,684 | — | 2,160,289 | — | 91,629 (11) |
+| **8** | **373,151** | **2,684** | **3.25 s** | **2,167,299** | **25.9 s** | **91,629 (11)** |
+| 12 | 373,961 | 2,646 | — | 2,195,206 | — | 91,629 (11) |
+| `-O3` | 373,978 | 2,640 | 4.64 s | 2,091,517 | 43.5 s | 55,858 |
+
+Runtime, CPU seconds, median of 5 interleaved rounds. V8 is node 24 through a runner that exports
+the start function as `main`; wasmtime is `vl run` on the prebuilt module. plumb's units import
+the rest of the game and cannot run alone, so `leafbig` is a generated stand-in: one function of
+500 transliterated-style blocks (4,000 helper calls) called 100,000 times from a loop.
+
+| program | engine | size 2 (was) | 4 | 6 | **8** | `-O3` |
+| --- | --- | --- | --- | --- | --- | --- |
+| `leafbig` | V8 | 0.88 | 0.52 | 0.26 | **0.14** | 0.15 |
+| `leafbig` | wasmtime | 0.63 | 0.32 | 0.20 | **0.06** | 0.06 |
+| `decode-bench`, 3 passes | V8 | 1.33 | 1.34 | 1.30 | 1.35 | 1.36 |
+| `decode-bench`, 3 passes | wasmtime | 1.65 | 1.52 | 1.61 | 1.59 | 1.58 |
+| `buffer-view-bounds/axpy-buf` | wasmtime | 1.21 | 1.22 | — | **0.46** | 0.43 |
+| `buffer-view-bounds/rows-buf` | wasmtime | 1.03 | 1.02 | — | **0.39** | 0.36 |
+| `buffer-view-bounds/scale-buf` | wasmtime | 0.72 | 0.74 | — | **0.33** | 0.30 |
+| the compiler, building `chunk_543` | wasmtime | 1.92 | 2.01 | — | 1.90 | 1.98 |
+| the compiler, 5 sources ×20 | V8 | 1.21 | 1.20 | — | 1.22 | 1.24 |
+
+The three `buf` kernels are flat on V8, and so is the small-function twin of `leafbig` (0.22 s at
+every size), while `leafbig` itself is 6x: V8's own wasm inliner covers a small caller and runs
+out in a large one, which is plumb's case. Of the other eight `bench/` programs that change,
+seven are byte-identical between sizes 4 and 8 and move within the noise those identical pairs
+show (up to ±25% at this load); `algorithms/dispatch-table` reads V8 0.44 → 0.38 s, wasmtime flat.
+
+**Why 8.** Size 6 catches `rg` but not `sr`, and leaves 6,722 calls in the unit; 7 and 8 build
+`chunk_543` byte-identically and reach `-O3`'s call count within 44 calls and `-O3`'s speed on
+the stand-in. 8 is taken over 7 for one node of margin — a helper that masks its result, such as
+`rg(i) & M32`, is 8 — at +7 KB on the compiler. 12 buys 38 more inlined calls for +28 KB. The
+unit's size cost is the inlining itself: `-O3` is the same size.
+
+**Price.** Where leaf calls are dense the module grows to `-O3`'s size (`chunk_543` +14.1%);
+elsewhere it is small (the compiler +0.94%, `decode-bench` +21 bytes, the 86 `bench/` programs
+−117 bytes in total). The optimiser costs +23% CPU on `chunk_543` and +11% on the compiler, where
+`-O3` costs +76% and +87%.
+
+**What was rejected.**
+* *`--one-caller-inline-max-function-size`.* Binaryen already inlines every single-caller
+  function at `-O`, which is what L8 had to restrain; the leaf helpers have thousands of callers,
+  so this option cannot reach them.
+* *`--flexible-inline-max-function-size` at `-O`.* Binaryen consults it only at `-O3` or above.
+* *A much larger size.* L4 measured `-aimfs 400` doubling `decode-bench` and costing V8 3–6%;
+  12 already buys almost nothing over 8 here.
+
 ## A string-literal type reps as the atom wherever it lives, and a `const` bound to a literal has its type (owner, 2026-09-23) — D2150, D2156, D2157
 
 *The owner's two rulings: "comparing two string literals should be allowed, even if in objects,
