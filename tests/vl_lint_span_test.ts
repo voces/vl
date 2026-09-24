@@ -331,3 +331,59 @@ Deno.test({
     }
   },
 });
+
+// ── the whole-chain rule, and the regroup that must carry every column ──────
+
+Deno.test({
+  name: "lint span: prefer-interpolation covers the whole chain on its first line",
+  ignore: !ENABLED,
+  fn: async () => {
+    const { src, diags } = await run(
+      "interp.vl",
+      [
+        "function hex(i: i32) { \"\\{i}\" }",
+        "const id = hex(1) + \"-\" + hex(2) + \"-\" + hex(3) + \"-\" + hex(4)   // trailing",
+        "const two = \"x\" +",
+        "  hex(1) + \"y\" + hex(2) + \"z\"",
+        "print(id + two)",
+        "",
+      ].join("\n"),
+    );
+    const mine = diags.filter((d) => d.code === "prefer-interpolation");
+    if (mine.length !== 2) {
+      throw new Error(`want two prefer-interpolation findings, got ${JSON.stringify(mine)}`);
+    }
+    // One line: the span is the chain, first operand to last, and nothing after it.
+    want(spanText(src, mine[0]), codeFrom(src, mine[0]), "prefer-interpolation (one line)");
+    want(
+      spanText(src, mine[0]),
+      "hex(1) + \"-\" + hex(2) + \"-\" + hex(3) + \"-\" + hex(4)",
+      "prefer-interpolation (literal)",
+    );
+    // Two lines: a span is one line, so it runs from the chain's start to that line's end.
+    want(spanText(src, mine[1]), "\"x\" +", "prefer-interpolation (first line of two)");
+  },
+});
+
+Deno.test({
+  name: "lint span: the walk's rank regroup keeps each finding's own end column (D2306)",
+  ignore: !ENABLED,
+  fn: async () => {
+    // Pre-order emits range-inclusive-length (line 3) before divide-by-zero (line 4),
+    // and the rank regroup swaps them. The end column used to stay behind, so each
+    // finding carried the other's: one column of `length`, seven columns from the `0`.
+    const { src, diags } = await run(
+      "regroup.vl",
+      [
+        "const xs = [1, 2, 3]",
+        "let sum = 0",
+        "for i in 0 to xs.length { sum = sum + xs[i] }",
+        "sum = sum + 1 / 0",
+        "print(sum)",
+        "",
+      ].join("\n"),
+    );
+    want(spanText(src, one(diags, "range-inclusive-length")), "length", "range-inclusive-length");
+    want(spanText(src, one(diags, "divide-by-zero")), "0", "divide-by-zero");
+  },
+});

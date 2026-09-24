@@ -72,6 +72,10 @@ trap 'rm -rf "$WORK"' EXIT
 # exempt it from: a header over 10 lines, a doc comment over 4 lines on an export, or a
 # line citing a row id / PR number / date / compiler vocabulary under `std/` fails this
 # gate outright. The `std/` run below is where it fires.
+#
+# `prefer-interpolation` is an `info` suggestion held the same way, by
+# scripts/interp-budget.py: the compiler's standing `+` chains are baselined rather than
+# rewritten (a rewrite moves the seed for a spelling), and a new one fails its --check.
 lint_graded() { # <target> <json path>
   local rc=0
   "$VL" check "$1" --severity info --json > "$2" 2> "$2.err" || rc=$?
@@ -79,6 +83,7 @@ lint_graded() { # <target> <json path>
   if [ "$rc" -gt 1 ]; then cat "$2"; return "$rc"; fi
   # shellcheck disable=SC2046  # the word split is the point: zero or more codes
   "$PY" scripts/comment-budget.py --filter-lint "$2" \
+    $("$PY" scripts/interp-budget.py --exempt-codes) \
     $("$PY" scripts/scan-budget.py --exempt-codes) \
     $("$PY" scripts/ladder-budget.py --exempt-codes) \
     $("$PY" scripts/sentinel-budget.py --exempt-codes)

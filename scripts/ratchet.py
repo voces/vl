@@ -254,6 +254,6 @@ class Ratchet:
 if __name__ == "__main__":
     print("scripts/ratchet.py is the shared core, not a command. The ratchets are\n"
           "  comment-budget.py  ladder-budget.py  sentinel-budget.py\n"
-          "  scan-budget.py  export-budget.py\n"
+          "  scan-budget.py  export-budget.py  interp-budget.py\n"
           "and seed-size, which is VL now: scripts/seed-size.vl")
     sys.exit(2)
