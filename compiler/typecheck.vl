@@ -2746,9 +2746,11 @@ let inferDroppedTy: i32[] = []
 let inRetArg = false
 // Per node: true at an `if` some completing arm of which yields no value (a `void` tail, an empty
 // arm, a statement, or such an `if` nested as its tail). That `if` is a statement, never a value.
-let ifNoValueAt: boolean[] = []
+// Keyed maps rather than node columns: few nodes are `if`s, and a column is as long as the
+// highest one (D2319).
+let ifNoValueAt: {[i32]: boolean} = Map()
 // Per node: an `if`/`else`'s completing-arm value join (`ifTailValTyOf`), -1 where unrecorded.
-let ifValTyAt: i32[] = []
+let ifValTyAt: {[i32]: i32} = Map()
 // The value type of the most recently checked `Block` — its trailing expression's type, or
 // `TY_VOID` when the block ends in a statement. `checkNode(Block)` itself returns `TY_VOID`, so
 // this carries the tail value out of band for an `if … { v } else { w }` expression to join its
@@ -2935,8 +2937,8 @@ let bodyChecked: {[string]: boolean} = Map()
 // emitter synthesizes later fall past the end and read -1, so a consumer falls back syntactically.
 let nodeTyIx: i32[] = []
 // The `IfStmt` heads `desugarMatchAt` built from an INTEGER `match` (1 at the head's index),
-// the one chain shape the emitter may lower to a `br_table` (`intMatchHeadAt`). Sized lazily.
-let intMatchHead: i32[] = []
+// the one chain shape the emitter may lower to a `br_table` (`intMatchHeadAt`).
+let intMatchHead: {[i32]: boolean} = Map()
 // D951 — the `is`-test type sidecar: the arena type an `IsExpr`'s check type resolves to, keyed by
 // the `IsExpr` node, so the emitter's narrowing stack banks the answer instead of re-deriving the
 // narrowed type from the tested spelling. Sized with `nodeTyIx` and read through `isVarTyIxOf`; a
@@ -2984,8 +2986,8 @@ let litWide64: boolean[] = []
 // Annotation atom-count sidecar: how many top-level union atoms the annotation node's emit-time
 // spelling is joined from, banked by `canonEmitTypeNames`, the producer of that spelling. The
 // count cannot be recovered from the arena — an annotation over two same-shape declared structs
-// dedups to a plain `TyObj`. One entry per node, -1 at a non-`TypeRef`, sized to the node arena.
-let annUnionAtoms: i32[] = []
+// dedups to a plain `TyObj`. Keyed by node, holding the `TypeRef`s only: every other node reads -1.
+let annUnionAtoms: {[i32]: i32} = Map()
 // Nominal-identity sidecar: the `Ty`-arena indices of declared struct types (`cStructTyIxs`) and
 // of union-variant member types (`cVariantMemberTyIxs`). `nodeTyIsStruct` reads them as "its
 // recorded type is a declared struct and not a variant member". The arena stays purely
@@ -3874,7 +3876,7 @@ export function initChecker() {
   inferLetNulBoolIx = []
   bodyChecked = Map()
   nodeTyIx = []
-  intMatchHead = []
+  intMatchHead = Map()
   chainProvenCond = []
   optCallRetIx = []
   optCallRetTy = []
@@ -3892,7 +3894,7 @@ export function initChecker() {
   isParentElseTyIx = []
   nodeRepTyIx = []
   litWide64 = []
-  annUnionAtoms = []
+  annUnionAtoms = Map()
   cFuncPinTyIx = -1
   cObjPinTyIx = -1
   nodePinKind = []
@@ -3916,8 +3918,8 @@ export function initChecker() {
   inferRetLogTy = []
   inferRetLogSeed = []
   inferRetSeeding = false
-  ifNoValueAt = []
-  ifValTyAt = []
+  ifNoValueAt = Map()
+  ifValTyAt = Map()
   inferDroppedTy = []
   // Pass 0 and pass 1's collect tables, reset here with everything else: every
   // `checkProgram` reaches its walk through a caller that ran `initChecker` first
@@ -14930,16 +14932,14 @@ export function canonEmitTypeNames() {
   canonRawText = []
   canonCleared = []
   canonTyIxCol = []
-  annUnionAtoms = []
+  annUnionAtoms = Map()
   // Before the rewrite loop — the bank holds the declared spellings, which is the whole
   // point of it.
   collectGenAliasFieldAnns()
   let i = 0
   while i < P.nodes.length {
-    // The atom-count bank: one entry pushed per node, in node order, so the column is
-    // exactly `P.nodes.length` long and index == node index. A non-`TypeRef` node banks -1;
-    // a `TypeRef` banks the count `canonEmitName` reported directly, not re-derived by
-    // scanning the finished string. Pushing, not pre-sizing, makes the reset load-bearing.
+    // The atom-count bank: a `TypeRef` banks the count `canonEmitName` reported directly, not
+    // re-derived by scanning the finished string; every other node stays unbanked and reads -1.
     let atoms = -1
     const n = P.nodes[i]
     if n is TypeRef {
@@ -15043,7 +15043,7 @@ export function canonEmitTypeNames() {
         }
       }
     }
-    annUnionAtoms.push(atoms)
+    if atoms != -1 { annUnionAtoms[i] = atoms }
     i = i + 1
   }
   0
@@ -15730,7 +15730,8 @@ let cwDeclSlotSid: i32[] = []
 let cwDeclCap = 0
 // The enclosing frame of a frame, indexed by its `FuncDecl` node — the chain a name walks out
 // along. A lambda is a `FuncDecl` with an empty name, so capture needs no arm of its own.
-let cwFrameUp: i32[] = []
+// Keyed by the frames only, and as long as `cwFrameOf`: a node that opens none reads `CW_FR_MOD`.
+let cwFrameUp: {[i32]: i32} = Map()
 let cwFramesBuilt = false
 // The join sites (list literals, `if`s, `match`es, `??`, functions) and the `return`s the frame
 // walk reaches, for the record rule's end-of-check pass, which then needs no occurrence index.
@@ -15746,7 +15747,7 @@ function cwFrameReset() {
   cwDeclSlotFr = []
   cwDeclSlotSid = []
   cwDeclCap = 0
-  cwFrameUp = []
+  cwFrameUp = Map()
   cwFramesBuilt = false
   cwIxReset()
   0
@@ -16223,7 +16224,7 @@ function cwFrameWalk(ix: i32, fr: i32) {
   0
 }
 
-// One grow pass sizes the three columns and collects the roots as it goes, then the walk runs
+// One grow pass sizes the frame column and collects the roots as it goes, then the walk runs
 // over the roots — several `Program` nodes stand in one arena after a module merge (D661).
 // Memoised on `cwFramesBuilt`, which `covarValueWriteState` drops with the rest of the memo
 // when the monomorphizer has grown the arena under it.
@@ -16234,7 +16235,6 @@ function cwBuildFrames() {
   while cwFrameOf.length < P.nodes.length {
     const at = cwFrameOf.length
     cwFrameOf.push(CW_FR_UNKNOWN)
-    cwFrameUp.push(CW_FR_MOD)
     const n = P.nodes[at]
     if n is Program { roots.push(at) }
   }
@@ -16264,9 +16264,9 @@ function cwFrameOfUse(ix: i32, nm: string): i32 {
   let fr = cwFrameOf[ix]
   if fr == CW_FR_UNKNOWN { return CW_FR_UNKNOWN }
   const sid = sidOf(nm)
-  while fr >= 0 && fr < cwFrameUp.length {
+  while fr >= 0 && fr < cwFrameOf.length {
     if cwFrameDeclares(fr, sid) { return fr }
-    fr = cwFrameUp[fr]
+    fr = cwFrameUp[fr] ?? CW_FR_MOD
   }
   if cwFrameDeclares(CW_FR_MOD, sid) { return CW_FR_MOD }
   CW_FR_UNKNOWN
@@ -29037,8 +29037,14 @@ function dropTailIfSeeds(logMark: i32, obsMark: i32) {
 // True when the `if` at `ix` yields no value on some completing arm — a statement, whatever
 // its arms' join reads. -1 and every non-`if` node answer false.
 export function ifYieldsNoValue(ix: i32): boolean {
-  if ix < 0 || ix >= ifNoValueAt.length { return false }
-  ifNoValueAt[ix]
+  if ix < 0 { return false }
+  ifNoValueAt[ix] ?? false
+}
+
+// Clears `ix`'s no-value verdict. An unrecorded node already reads false, so only a recorded
+// `true` is written.
+function ifNoValueClear(ix: i32) {
+  if ifNoValueAt[ix] ?? false { ifNoValueAt[ix] = false }
 }
 
 // Does the if-arm `armIx`, which completes, finish without a value? `armTy` is its tail type
@@ -29062,15 +29068,13 @@ function ifArmGivesNoValue(armIx: i32, armTy: i32): boolean {
 // `matchTallyEnd` banks the completing arms' join. The running join is -1 until an arm adds.
 function matchTallyBegin(ix: i32): i32 {
   if ix < 0 { return -1 }
-  while ifNoValueAt.length <= ix { ifNoValueAt.push(false) }
-  ifNoValueAt[ix] = false
+  ifNoValueClear(ix)
   -1
 }
 
 function matchArmTally(ix: i32, body: i32, armTy: i32, acc: i32): i32 {
   if ix < 0 || stmtAlwaysExits(body) { return acc }
   if ifArmGivesNoValue(body, armTy) {
-    while ifNoValueAt.length <= ix { ifNoValueAt.push(false) }
     ifNoValueAt[ix] = true
     return acc
   }
@@ -29081,7 +29085,6 @@ function matchArmTally(ix: i32, body: i32, armTy: i32, acc: i32): i32 {
 
 function matchTallyEnd(ix: i32, acc: i32) {
   if ix < 0 { return 0 }
-  while ifValTyAt.length <= ix { ifValTyAt.push(-1) }
   if acc < 0 { ifValTyAt[ix] = TY_VOID } else { ifValTyAt[ix] = acc }
   0
 }
@@ -29096,7 +29099,7 @@ function clearTailVerdict(ix: i32) {
   while cur >= 0 {
     const at = cur
     cur = -1
-    if at < ifNoValueAt.length { ifNoValueAt[at] = false }
+    ifNoValueClear(at)
     const n = P.nodes[at]
     if n is IfStmt {
       clearTailVerdict(blockLastStmt(n.ifThen))
@@ -29226,9 +29229,10 @@ function armTailUndecided(armIx: i32): boolean {
 // The value an `if`/`else` at `ix` yields as a tail: the join of the arms that complete, an
 // exiting arm contributing nothing (`void` when none completes). `fallback` for any other node.
 function ifTailValTyOf(ix: i32, fallback: i32): i32 {
-  if ix < 0 || ix >= ifValTyAt.length { return fallback }
-  if ifValTyAt[ix] < 0 { return fallback }
-  ifValTyAt[ix]
+  if ix < 0 { return fallback }
+  const v = ifValTyAt[ix] ?? -1
+  if v < 0 { return fallback }
+  v
 }
 
 // An if-arm's tail value as `ifTailValTyOf` sees it: a nested `if`/`else` tail answers its own
@@ -35659,10 +35663,8 @@ export function nodeTyIxOf(ix: i32) {
 // `ix`'s emit-time spelling has, banked by `canonEmitTypeNames`. -1 for a node that is not a
 // `TypeRef` or that postdates the bank (an emitter-synthesized annotation); >= 1 otherwise.
 export function annUnionAtomsOf(ix: i32) {
-  if ix >= 0 {
-    if ix < annUnionAtoms.length { return annUnionAtoms[ix] }
-  }
-  -1
+  if ix < 0 { return -1 }
+  annUnionAtoms[ix] ?? -1
 }
 // The arena type the `is` test at node `ix` checks AGAINST — what the narrowing binds the
 // tested place to — or -1 for a node the checker never resolved (an emitter-synthesized
@@ -40553,8 +40555,7 @@ function checkMatchIntArms(n: MatchExpr, ix: i32, st: i32) {
   if !inferQuiet {
     desugarMatchAt(ix)
     if !sawBadPat {
-      while intMatchHead.length <= ix { intMatchHead.push(0) }
-      intMatchHead[ix] = 1
+      intMatchHead[ix] = true
     }
   }
   matchTy
@@ -40562,8 +40563,8 @@ function checkMatchIntArms(n: MatchExpr, ix: i32, st: i32) {
 
 // Whether node `ix` is the head of the if-chain an integer `match` desugared to.
 export function intMatchHeadAt(ix: i32) {
-  if ix < 0 || ix >= intMatchHead.length { return false }
-  intMatchHead[ix] == 1
+  if ix < 0 { return false }
+  intMatchHead[ix] ?? false
 }
 
 // The integer width of node `ix`'s recorded type: 1 for `i32`, 2 for `i64`, 0 for anything
@@ -41483,9 +41484,8 @@ function checkIfTail(
     }
   }
   // Written both ways: a later pass re-decides with the callees' final types.
-  if ix >= 0 && (noValue || ix < ifNoValueAt.length) {
-    while ifNoValueAt.length <= ix { ifNoValueAt.push(false) }
-    ifNoValueAt[ix] = noValue
+  if ix >= 0 {
+    if noValue { ifNoValueAt[ix] = true } else { ifNoValueClear(ix) }
   }
   if noValue && ifTail && !ifInRetArg && daHasElse {
     dropTailIfSeeds(seedLogMark, seedObsMark)
@@ -41499,7 +41499,6 @@ function checkIfTail(
       if thenExits || valTy == TY_VOID { valTy = ev }
       else if ev != TY_VOID { valTy = joinTys(valTy, ev) }
     }
-    while ifValTyAt.length <= ix { ifValTyAt.push(-1) }
     if bareArm { ifValTyAt[ix] = -1 } else { ifValTyAt[ix] = valTy }
   }
   // The `if`-expression's value type: with an `else`, the join of the two branch tail
