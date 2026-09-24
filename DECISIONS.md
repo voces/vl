@@ -7184,3 +7184,35 @@ refused: 100 corpus cells (all minted by the census's `f64lit` rep, `type F = 1.
 `tests/cases` fixtures; none in `compiler/`, `std/` or other scripts. Of the corpus cells, 35
 graded `runs`: 21 only DECLARED `F` in a shared prelude and keep running with the line removed,
 and 14 used it and are design refusals now. `gencensus.py` keeps its `f64lit` level, because cell ids are sequential over the axes and dropping a level renumbers every block and orphans the committed named sets; those cells are now design refusals. `mkmatrix.py`, whose preludes only declared the alias, drops it.
+
+## A `return` outside any function is refused (owner ruling, 2026-09-23) — D2262, plumb PL-028
+
+**Ruled: `return` — bare or with a value — is illegal at module scope, whether it stands
+directly at the top level or is reached through a top-level `if`/`while`/`for`/`match`
+block.** `const n = 3; if n > 0 { print("early"); return }` used to pass `vl check` and fail
+only when the emitter tried to classify the module's synthetic entry function, with a message
+that named the emitter's own invariant rather than the program: `emitProgram: a bare
+\`return\` in a function the emitter classified non-void — the checker owed this diagnosis`.
+The message now reads `return\` is only valid inside a function; to end the program early use
+\`exit(code)\` from \`std:process\`, or restructure with \`else\``.
+
+**THE PRECEDENT.** JavaScript's modules and Python both refuse a top-level `return` as a
+`SyntaxError` — `return` names a function's exit, and a module has none. VL's module already
+has an equivalent early exit for the whole PROCESS (`exit(code)` from `std:process`, plumb
+PL-014), so the language loses no capability by refusing the statement that looks like it
+means the same thing but does not: a top-level `return` cannot mean "stop the module" in a
+language with no implicit wrapping function, and reading the rest of the file as unreachable
+after it would be a second, silent behaviour change nobody asked for.
+
+**THE MECHANISM.** The checker already tracks "am I inside a function" as `T.curRet`, saved
+and restored around every `FuncDecl` body (a named function, a nested function, a method, a
+getter, or a lambda — anonymous or bound to a module-scope `const`) and otherwise left at the
+`-1` `initChecker` sets once. `checkRetStmtNode` read `T.curRet` to decide what type the
+return owed, but every branch was gated on `want >= 0`, so `-1` fell through every one of them
+silently. The fix is one check at the top: `T.curRet == -1` refuses, before asking about a
+value at all — a bare and a valued `return` are refused identically.
+
+**THE PRICE, MEASURED: zero.** Zero of the 7,589-cell distilled corpus moved under
+`regress.py`, and a ground-truth scan of every `.vl` under `tests/cases/`, `std/`,
+`compiler/` and `scripts/` — 3,943 files, checked with the fixed compiler — found no existing
+use of a module-level return. No shipped program changed behaviour.
