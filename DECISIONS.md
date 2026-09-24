@@ -7355,3 +7355,80 @@ module. The seed grew 3,999 bytes (+0.14%).
 
 **FOLLOW-UP, not built (a′):** compacting on delete as well when no walk is active would reclaim
 slots in a delete-only phase, and needs the walk tracking this ruling avoided.
+
+## Closures capture variables by reference (owner ruling, 2026-09-24) — D2339
+
+**Ruled (option a): a closure captures the variables it names by reference, everywhere.** It
+always sees a variable's current value, and a write through a closure is seen by the function
+that declared the variable. This is what JS, Swift, Kotlin, C#, Go and Python do. Before it the
+answer depended on something unrelated: `let k = 1; const g = () => k; k = 5; g()` returned 1
+in a function, 5 once any never-called closure also wrote `k` (D2285's box), and 5 at module
+scope, where `k` is a global.
+
+**THE RULE.** A binding is SHARED (boxed in a heap cell both scopes index) when a closure
+captures it AND an assignment to it can run after the capture:
+
+* a closure assigns it (anywhere — the closure may run at any time);
+* the declaring function assigns it later in the body than the closure is created, except in
+  the other arm of an `if` the capture sits in (one pass runs one arm);
+* or the assignment and the capture share a loop that does not also enclose the declaration,
+  so a later iteration writes the binding an earlier iteration's closure holds.
+
+Every other captured binding — never reassigned, or assigned only before every capture — is
+copied into the closure, which no program can tell apart from sharing it. That is the fast
+path, and nearly every capture takes it. `=`, compound assignment (`+=`) and `++`/`--` are all
+assignments. The rule is a sufficient condition, not an exact one: an assignment after a
+`return` that ends the capture's path still boxes. That only costs speed.
+
+**LOOPS, AS JS `let`.** A `let` declared inside a loop body is a fresh binding each iteration:
+closures made in different iterations hold different bindings, and a write later in the same
+iteration is seen by that iteration's closure (`for i in 0 to 2 { let j = i; fs.push(() => j);
+j = j * 10 }` gives 0, 10, 20). A `let` declared OUTSIDE the loop is one binding for the whole
+loop, so every closure made in it sees the last write (`let n = 0; for … { fs.push(() => n); n
+= n + 1 }` gives 3, 3, 3). A `for x in xs` variable, and both variables of `for v, k in xs`, is
+per iteration like JS `for (const x of xs)`, and writable. A range variable (`for i in a to b`)
+is per iteration like JS `for (let i = …; …; i++)`: a write to it, from the body or through a
+closure, is the value the next iteration steps from, and a `continue` carries it over.
+
+**FRAMES.** Every function frame runs the rule: a top-level function, a nested function, and a
+lambda for its own locals and parameters. A PARAMETER that must be shared gets a cell seeded
+from the argument at the top of the body (so `(p) => { const g = () => p; p = p * 2; g() }`
+returns `2p`). A closure nested in a closure shares through the outer one. A returned closure
+keeps its cell alive after the function returns. At module scope a top-level `let` is a wasm
+global, which every closure already reads and writes in place; a `let` in a module-scope block
+and a module-scope loop variable are locals of the start function and follow the rule.
+
+**NARROWING.** The checker already refuses a write that would retire a narrowing a closure
+captured (`let x: i32 | null = 3; if x != null { const g = () => x + 1; x = null }` is a type
+error), so a closure written under `x != null` may keep reading `x` as `i32` whatever later
+writes the checker admits. The emitter carries that narrowing onto the shared cell's read
+inside the closure (D2341, which was check-clean invalid wasm on master for any closure that
+wrote the variable).
+
+**A `let` WITH NO INITIALIZER** that must be shared starts at its type's zero value (`0`,
+`0.0`, `false`, `""`); definite assignment still refuses a read before the first write. A type
+with no zero value — a struct, list, map, union or function — is refused with a message naming
+the binding (D2340, open). Capturing it by value instead would print a stale value silently.
+
+**THE MECHANISM.** D2285's `captureBoxRewrite` (`compiler/emit_rewrite.vl`) is the one place:
+`let c = e` becomes `let c = [e]` and every use `c[0]`, before monomorphization; a parameter or
+loop variable `v` gets a `let v$cb = [v]`. The decision is one scan per frame that records each
+capture and each assignment in walk order, with the loop and `if` arm it sits in; nothing else
+in the compiler learned a new case.
+
+**THE PRICE, MEASURED.** Only a program with a shared binding pays, and the corpus says that is
+rare: of the 4,039 programs in `tests/cases/` and the distilled corpus that both seeds build,
+ONE compiles to different bytes (`definite-assign-nested-fn-capture-ok.vl`, whose `x` is
+assigned after a nested function captures it, 248 → 1,953 bytes, same output), and every `bench/` program (all three closure benches —
+`lambda-hot`, `dispatch-table`, `map-filter-reduce` — included) builds byte-identical wasm at
+default and `-O`, as does plumb's `chunk_662` (429,605 bytes at `-O`). What a shared binding
+costs is a cell access per read and write: a loop doing nothing but `acc = acc ^ i` 500M times
+on a shared `acc` takes 0.77 s against 0.12 s unshared (6.4x, the same at `-O`, since the cell
+escapes into the closure); the same loop with a `%` in it is +2%. Compile cost: guest fuel
++0.11% on the plumb-shape unit (9,080,340,986 → 9,090,608,985) and on `chunk_662`
+(9,234,644,431 → 9,244,972,179), peak RSS unchanged; the seed grew 16,473 bytes (+0.58%).
+
+**FOLLOW-UPS, not built.** The cell is a one-element growable list because D2285 built it that
+way; a one-field mutable struct would drop the list header and bounds check from every access.
+A loop that calls no closure could keep a shared binding in a local and store it back at the
+loop's exits.
