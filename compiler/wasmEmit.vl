@@ -651,6 +651,7 @@ import {
   exprUnion,
   exprVariantIndex,
   fieldClosureFeOfRecv,
+  fieldCodeScalarListBuildKind,
   fieldCodeVKind,
   fieldValueFeOf,
   fnAssignRetKind,
@@ -709,6 +710,7 @@ import {
   internInlineShapeTy,
   isNulScalarListFieldCode,
   isNulScalarListKind,
+  isScalarBackedListRep,
   isUNameAB,
   isUnionOfTy,
   isVariantSpelling,
@@ -737,6 +739,7 @@ import {
   listIdxKindOf,
   listIdxWrapSlot,
   listOpKindOfBin,
+  listRepOfFieldCode,
   litAtomWidenTexts,
   localIndexOf,
   localSlotIsLitAtom,
@@ -833,6 +836,7 @@ import {
   retUnionFlag,
   retVariantFlag,
   rlElemInnerSlot,
+  rlElemListRep,
   rlElemLitStructRow,
   rlElemMapShape,
   rlElemStructRow,
@@ -927,6 +931,7 @@ import {
   variantFieldTypeAt,
   variantHasDiscrimField,
   variantIndexOf,
+  vkListClass,
   vtKindOfParam,
   vtKindOfType,
   widenDstBackSlot,
@@ -1229,16 +1234,8 @@ function emitStructFieldValue(
     if rlElemKindTbl[fslot] == 2 { pendingListKind = 2 }
     else if rlElemKindTbl[fslot] == 1 { pendingListKind = 1 }
     else { pendingListKind = 5 }
-  } else if scode == 6 {
-    pendingListKind = 3
-  } else if scode == 35 {
-    pendingListKind = 10
-  } else if scode == 25 {
-    pendingListKind = 4
-  } else if scode == 26 {
-    pendingListKind = 6
-  } else if scode == 27 {
-    pendingListKind = 7
+  } else if fieldCodeScalarListBuildKind(scode) >= 0 {
+    pendingListKind = fieldCodeScalarListBuildKind(scode)
   } else if scode == 18 {
     // a bare `null` here becomes `ref.null $lTypeIdx`; a list value ignores this seed.
     pendingNulRefHeap = lTypeIdx
@@ -1377,13 +1374,11 @@ function emitFieldListWidenSite(
       refSlot,
     )
   }
-  let sfk: VKind | null = null
-  if scode == 4 { sfk = "list" }
-  if scode == 35 { sfk = "u8list" }
-  if scode == 25 { sfk = "f64list" }
-  if scode == 26 { sfk = "i64list" }
-  if scode == 27 { sfk = "f32list" }
+  // The i32 list and the distinct scalar backings widen; a string or ref list field does not.
+  const sfk = listRepOfFieldCode(scode)
   if sfk == null { return false }
+  if sfk == "strlist" || vkListClass(sfk) != 1 { return false }
+  if sfk == "reflist" { return false }
   emitScalarListWidenSite(body, valIx, fnIx, sfk)
 }
 
@@ -1854,16 +1849,8 @@ function emitVariantFieldValue(
     const vmslot29 = uFieldMapShape(vi, fj)
     pendingMapSlot = vmslot29
     pendingNulRefHeap = mapTypeIdxOf(vmslot29)
-  } else if vcode == 6 {
-    pendingListKind = 3
-  } else if vcode == 35 {
-    pendingListKind = 10
-  } else if vcode == 25 {
-    pendingListKind = 4
-  } else if vcode == 26 {
-    pendingListKind = 6
-  } else if vcode == 27 {
-    pendingListKind = 7
+  } else if fieldCodeScalarListBuildKind(vcode) >= 0 {
+    pendingListKind = fieldCodeScalarListBuildKind(vcode)
   }
 
   const savedVPSI = pendingStructIdx
@@ -2005,12 +1992,9 @@ function seedFieldListBuild(code: i32, refSlot: i32) {
     else { pendingListKind = 1 }
     return 0
   }
-  if code == 6 { pendingListKind = 3 }
-
-  if code == 35 { pendingListKind = 10 }
-  if code == 25 { pendingListKind = 4 }
-  if code == 26 { pendingListKind = 6 }
-  if code == 27 { pendingListKind = 7 }
+  if fieldCodeScalarListBuildKind(code) >= 0 {
+    pendingListKind = fieldCodeScalarListBuildKind(code)
+  }
 
   if isNulScalarListFieldCode(code) {
     pendingListKind = nulScalarListBuildKind(nulScalarListCodeKind(code))
@@ -7778,16 +7762,8 @@ function emitMapValDefault(
   // the i32-list wrapper, which the `(ref null <wrapper>)` valStash would reject.
   const dfCtx = expCtxHere()
   const lvk = mvListValKind(mslot)
-  if lvk == "strlist" {
-    dfCtx.listKind = 3
-  } else if lvk == "f64list" {
-    dfCtx.listKind = 4
-  } else if lvk == "i64list" {
-    dfCtx.listKind = 6
-  } else if lvk == "f32list" {
-    dfCtx.listKind = 7
-  } else if lvk == "u8list" {
-    dfCtx.listKind = 10
+  if isScalarBackedListRep(lvk) {
+    dfCtx.listKind = listBuildKindOfVKind(lvk, -1)
   } else if mslot >= 0 && mvValKind[mslot] == 1 {
     // A struct-valued map's `?? {f: …}` default forces the map's declared value-struct
     // index, from the slot's canonical layout rather than this slot's own — two
@@ -8813,16 +8789,8 @@ function emitMapSetValExpr(
   // the default i32-list that would mismatch the typed element slot.
   const svCtx = expCtxHere()
   const lvk = mvListValKind(mslot)
-  if lvk == "strlist" {
-    svCtx.listKind = 3
-  } else if lvk == "f64list" {
-    svCtx.listKind = 4
-  } else if lvk == "i64list" {
-    svCtx.listKind = 6
-  } else if lvk == "f32list" {
-    svCtx.listKind = 7
-  } else if lvk == "u8list" {
-    svCtx.listKind = 10
+  if isScalarBackedListRep(lvk) {
+    svCtx.listKind = listBuildKindOfVKind(lvk, -1)
   } else if mslot >= 0 {
     // A ref-list value (`S[]`, `(C|D)[]`, a nested `S[][]`, or a closure list) seeds the
     // value's ref-list slot so the literal builds as that list, recursing through its inner
@@ -15800,6 +15768,15 @@ function emitCallRef(body: u8[], callIx: i32, fnIx: i32) {
           // $array)` there and the atom local holds an i32 id — a `string` token is a ref,
           // unlike the litunion token, so it is never confusable with i32.
           if emitAtomToStr(body, args[i], fnIx) < 0 { return -1 }
+        } else if (
+          clu == 0 &&
+          (isScalarBackedListRep(pkk) || isNulScalarListKind(pkk))
+        ) {
+          // A list literal does not name its element rep when a `u8` or `f32` parameter is
+          // what decides it, so the parameter's build code is seeded as a binding's is.
+          const clCtx = expCtxHere()
+          clCtx.listKind = listBuildKindOfVKind(pkk, -1)
+          if emitExprExpect(body, args[i], fnIx, clCtx) < 0 { return -1 }
         } else if clu == 0 {
           if emitExpr(body, args[i], fnIx) < 0 { return -1 }
         } else {
@@ -16800,14 +16777,9 @@ function pushDestVKind(rslot: i32): VKind | null {
     return "variant"
   }
   if k == 3 { return "map" }
-  if k == 4 { return "list" }
   if k == 5 { return "closure" }
-  if k == 6 { return "strlist" }
-  if k == 7 { return "f64list" }
-  if k == 8 { return "i64list" }
-  if k == 9 { return "reflist" }
-  if k == 10 { return "f32list" }
-  null
+  // Code 2, the value-union box, owes nothing: its null is a tag inside a non-null box.
+  rlElemListRep(k)
 }
 
 // receiver resolution for `.push` — `listOpRecvLocal`, the one home the four list ops
