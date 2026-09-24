@@ -1629,6 +1629,22 @@ new: the compare-frame pre-pass never recurses into a code-15 field, so a NESTED
 
 ## Parser (Track G — complete)
 
+- **A call as a block's first statement no longer parses as a bogus object-literal method
+  member when a brace-led statement follows it (D2292, found in review of #3100).**
+  `function mk(n: i32): Q { print("mk"); { x: n } }` was a parse error: `looksLikeObject`'s
+  method-shorthand lookahead read `print("mk")` as a member signature (`print` the name,
+  `"mk"` its first "parameter") whenever a `{` followed shortly after, regardless of what the
+  call's own arguments looked like. `parenLooksLikeParamList` now requires every top-level
+  argument to start with an identifier or `...` — what a real parameter always does and a
+  literal argument never does — before that reading is taken, at all four positions sharing
+  the lookahead (a function/getter/lambda body, a bare block statement, and both `if`/`else`
+  arms). The return type was never the ingredient, despite looking like one: it never mattered
+  whether it was a user record, a primitive, absent, generic, a union or a nominal `new` type.
+  Two narrower shapes are not closed by this row and did not regress — a zero-argument call and
+  a call with a single bare-identifier argument, each followed by a brace-led statement, remain
+  ambiguous the same way they were before. Fixtures
+  `tests/cases/parser/call-first-stmt-then-brace-tail.vl`,
+  `tests/cases/parser/call-first-stmt-then-brace-tail-getter.vl`.
 - **Every bitwise and shift operator has its compound form, `&= |= ^= <<= >>= >>>=`, and so does
   `%` (plumb PL-021).** `x ^= y` was `expected an expression but found EQUAL`. Each is `x = x op
   (y)`: seven new token kinds, one `isCompoundAssign` predicate the climber, `rightAssoc` and
