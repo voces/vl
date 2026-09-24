@@ -7,6 +7,7 @@ import {
   ATOMIC_SIG_STORE,
   ATOMIC_SIG_WAIT,
   EqCmpKind,
+  MEM_OFFSET_MAX,
   SIMD_SIG_F_V,
   SIMD_SIG_I_V,
   SIMD_SIG_LANE_F,
@@ -50,15 +51,13 @@ import {
   isNumIntrinsicName,
   isValueUnionName,
   isVarTyIxOf,
+  memOffsetLexValue,
   nameIsAtomicIntrinsic,
   nameIsLitUnionArmValueUnion,
   nameIsLitUnionType,
   nameIsMemBulkIntrinsic,
   nameIsMemLoadIntrinsic,
   nameIsMemStoreIntrinsic,
-  memOffsetBaseArity,
-  memOffsetLexValue,
-  MEM_OFFSET_MAX,
   nameIsSimdIntrinsic,
   nodeArrayElemIsLitUnion,
   nodeArrayElemIsNulBool,
@@ -14776,16 +14775,27 @@ function memOffsetConstValue(ix: i32, fnIx: i32): i64 {
   if ox < 0 || ox >= P.nodes.length { return -1 }
   const e = P.nodes[ox]
   if e is NumLit { return memOffsetLexValue(e.numText) }
-  if e is BinExpr {
-    if e.binOp != "+" { return -1 }
-    const l = memOffsetConstValue(e.binLeft, fnIx)
-    const r = memOffsetConstValue(e.binRight, fnIx)
-    if l < 0 || r < 0 || l + r > MEM_OFFSET_MAX { return -1 }
-    return l + r
-  }
+  if e is BinExpr { return memOffsetSumConst(e, fnIx) }
+  memOffsetNameConst(ox, fnIx)
+}
+
+// The exact sum of a `+` of two constant offsets, or -1 for another operator or a term that is
+// not one.
+function memOffsetSumConst(e: BinExpr, fnIx: i32): i64 {
+  if e.binOp != "+" { return -1 }
+  const l = memOffsetConstValue(e.binLeft, fnIx)
+  const r = memOffsetConstValue(e.binRight, fnIx)
+  if l < 0 || r < 0 || l + r > MEM_OFFSET_MAX { return -1 }
+  l + r
+}
+
+// The value of the top-level integer `const` the name at `ix` denotes from inside `fnIx`, when no
+// binding of that frame shadows it; -1 for anything else, which is every node that is not one.
+function memOffsetNameConst(ix: i32, fnIx: i32): i64 {
+  const e = P.nodes[ix]
   if e is Ident {
-    const li = globalLetOfSidIn(fnIx, sidOfNode(ox))
-    if li < 0 { return -1 }
+    const li = globalLetOfSidIn(fnIx, sidOfNode(ix))
+    if li < 0 || li >= P.nodes.length { return -1 }
     const d = P.nodes[li]
     if d is LetDecl {
       if d.letKw != "const" || d.letInit < 0 { return -1 }
@@ -14820,40 +14830,52 @@ function memAddrBound(ix: i32, fnIx: i32): i64 {
   const k = memAddrConst(x, fnIx)
   if k >= 0 { return k }
   const e = P.nodes[x]
-  if e is BinExpr {
-    const op = e.binOp
-    if op == "&" {
-      const l = memAddrBound(e.binLeft, fnIx)
-      const r = memAddrBound(e.binRight, fnIx)
-      if l < 0 { return r }
-      if r < 0 || l < r { return l }
-      return r
-    }
-    if op == ">>>" || op == "<<" {
-      const sh = memAddrConst(e.binRight, fnIx)
-      if sh < 0 || sh > 31 { return -1 }
-      const l = memAddrBound(e.binLeft, fnIx)
-      if op == ">>>" {
-        if l >= 0 { return l >> sh }
-        if sh == 0 { return -1 }
-        return MEM_OFFSET_MAX >> sh
-      }
-      if l < 0 || (l << sh) > MEM_OFFSET_MAX { return -1 }
-      return l << sh
-    }
-    if op == "*" || op == "+" {
-      const l = memAddrBound(e.binLeft, fnIx)
-      const r = memAddrBound(e.binRight, fnIx)
-      if l < 0 || r < 0 { return -1 }
-      if op == "*" {
-        if l > 0 && r > MEM_OFFSET_MAX / l { return -1 }
-        return l * r
-      }
-      if l + r > MEM_OFFSET_MAX { return -1 }
-      return l + r
-    }
-    return -1
+  if e is BinExpr { return memAddrBinBound(e, fnIx) }
+  memAddrLoadBound(x, fnIx)
+}
+
+// `memAddrBound` of a binary operator: a mask is at most its smaller bounded side, a logical
+// shift right by 1..31 is below 2^(32-k), and a product, left shift or sum of bounded operands
+// is bounded while it stays below 2^32. Any other operator has no bound (-1).
+function memAddrBinBound(e: BinExpr, fnIx: i32): i64 {
+  const op = e.binOp
+  if op == "&" {
+    const l = memAddrBound(e.binLeft, fnIx)
+    const r = memAddrBound(e.binRight, fnIx)
+    if l < 0 { return r }
+    if r < 0 || l < r { return l }
+    return r
   }
+  if op == ">>>" || op == "<<" {
+    const sh = memAddrConst(e.binRight, fnIx)
+    if sh < 0 || sh > 31 { return -1 }
+    const l = memAddrBound(e.binLeft, fnIx)
+    if op == ">>>" {
+      if l >= 0 { return l >> sh }
+      if sh == 0 { return -1 }
+      return MEM_OFFSET_MAX >> sh
+    }
+    if l < 0 || (l << sh) > MEM_OFFSET_MAX { return -1 }
+    return l << sh
+  }
+  if op == "*" || op == "+" {
+    const l = memAddrBound(e.binLeft, fnIx)
+    const r = memAddrBound(e.binRight, fnIx)
+    if l < 0 || r < 0 { return -1 }
+    if op == "*" {
+      if l > 0 && r > MEM_OFFSET_MAX / l { return -1 }
+      return l * r
+    }
+    if l + r > MEM_OFFSET_MAX { return -1 }
+    return l + r
+  }
+  -1
+}
+
+// `memAddrBound` of a narrow unsigned load, which zero-extends: 255 or 65535. Any other node,
+// a call of a user function of the same name included, has no bound (-1).
+function memAddrLoadBound(ix: i32, fnIx: i32): i64 {
+  const e = P.nodes[ix]
   if e is Call {
     const f = P.nodes[e.callFn]
     if f is Ident {
@@ -14887,15 +14909,15 @@ function emitMemAddr(
     emitFail(
       "emitProgram: "
         + name
-        + " takes "
-        + i32ToStr(base)
-        + " operands, or "
-        + i32ToStr(base + 1)
-        + " with a compile-time offset in 0..4294967295 second",
+        + " has an argument count or offset the checker refuses (the offset is a compile-time integer in 0..4294967295)",
     )
     return -1
   }
   const addr = unwrapParen(c.callArgs[0])
+  if addr < 0 || addr >= P.nodes.length {
+    if emitMemIntrinArg(body, c.callArgs[0], fnIx) < 0 { return -1 }
+    return off
+  }
   const whole = memAddrConst(addr, fnIx)
   if whole >= 0 && whole + off <= MEM_OFFSET_MAX {
     fbI32Const(0)

@@ -4630,7 +4630,7 @@ export function nameIsMemStoreIntrinsic(name: string) {
 // The operand count of a linear-memory intrinsic that carries a memarg, WITHOUT the optional
 // offset, or -1 for a name that has none. The offset form takes one more argument, the
 // offset, always second: `__load_i64__(p, 16)`, `__store_i32__(p, 8, v)`. The fence has no memarg.
-export function memOffsetBaseArity(name: string): i32 {
+function memOffsetBaseArity(name: string): i32 {
   if name == "__load_i32__" || nameIsMemLoadIntrinsic(name) { return 1 }
   if name == "__store_i32__" || nameIsMemStoreIntrinsic(name) { return 2 }
   const srow = simdRow(name)
@@ -28415,7 +28415,7 @@ function simdLaneLitCheck(nm: string, argIx: i32, max: i32) {
 // second argument is the memarg offset. Checks the offset (`memOffsetArgCheck`) and every other
 // argument against the declared parameter it stands for; answers the call's type, or -1 when
 // the call is not this form (a shadowed name, a named argument, any other arity).
-function checkMemOffsetCall(n: Call, ix: i32, cfn: Ident): i32 {
+function checkMemOffsetCall(n: Call, cfn: Ident): i32 {
   const nm = cfn.identName
   const base = memOffsetBaseArity(nm)
   if base < 0 || n.callArgs.length != base + 1 { return -1 }
@@ -28462,19 +28462,31 @@ function memOffsetCheckedValue(argIx: i32): i64 {
   if ox < 0 || ox >= P.nodes.length { return -1 }
   const e = P.nodes[ox]
   if e is NumLit { return memOffsetLexValue(e.numText) }
-  if e is BinExpr {
-    if e.binOp != "+" { return -1 }
-    const l = memOffsetCheckedValue(e.binLeft)
-    const r = memOffsetCheckedValue(e.binRight)
-    if l < 0 || r < 0 || l + r > MEM_OFFSET_MAX { return -1 }
-    return l + r
-  }
+  if e is BinExpr { return memOffsetSumValue(e) }
+  memOffsetNameValue(ox)
+}
+
+// The exact sum of a `+` of two accepted offsets, or -1 for another operator or a term that is
+// not one.
+function memOffsetSumValue(e: BinExpr): i64 {
+  if e.binOp != "+" { return -1 }
+  const l = memOffsetCheckedValue(e.binLeft)
+  const r = memOffsetCheckedValue(e.binRight)
+  if l < 0 || r < 0 || l + r > MEM_OFFSET_MAX { return -1 }
+  l + r
+}
+
+// The value of the top-level integer `const` the name at `ix` denotes when no nearer binding
+// shadows it; -1 for anything else, which is every node that is not such a name.
+function memOffsetNameValue(ix: i32): i64 {
+  const e = P.nodes[ix]
   if e is Ident {
     if lookupDepth(e.identName) != 0 { return -1 }
     const init = moduleConstIntInit[e.identName] ?? -1
-    if init < 0 { return -1 }
-    const lit = P.nodes[init]
-    if lit is NumLit { return memOffsetLexValue(lit.numText) }
+    if init >= 0 && init < P.nodes.length {
+      const lit = P.nodes[init]
+      if lit is NumLit { return memOffsetLexValue(lit.numText) }
+    }
   }
   -1
 }
@@ -29065,7 +29077,7 @@ function checkCallNode(n: Call, ix: i32) {
     checkSimdLaneArg(n, cfn)
   }
   if cfn is Ident {
-    const mo = checkMemOffsetCall(n, ix, cfn)
+    const mo = checkMemOffsetCall(n, cfn)
     if mo >= 0 { return mo }
   }
   if cfn is Ident {
