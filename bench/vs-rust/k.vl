@@ -1,0 +1,119 @@
+// Measurement only: kernels written as directly as VL allows, against the same in Rust (k.rs), both to
+// wasm and timed in V8 (bench.ts). Data lives at D in linear memory.
+//
+// Written by plumb (a VL consumer transliterating Warcraft III) as PL-037, and shared with the
+// VL project for exactly this purpose. See bench/vs-rust/README.md for provenance and how this
+// is run; do not diverge VL and Rust semantically — they are meant to compute the same thing.
+const D = 0x0c000000
+
+// 1. SStrHash-shaped: a byte loop with two table loads per byte.
+export function hash(len: i32, repeat: i32): i32 {
+  const t = D
+  const s = D + 64
+  for i in 0 until 16 { __store_i32__(t + i * 4, (i * 0x9e3779b9) as% i32) }
+  for i in 0 until len { __store_i8__(s + i, 65 + (i % 26)) }
+  __store_i8__(s + len, 0)
+  let sum = 0
+  for r in 0 until repeat {
+    let s1 = r + 0x7fed7fed
+    let s2 = 0xeeeeeeee as% i32
+    let p = s
+    let ch = __load_u8__(p)
+    while ch != 0 {
+      p += 1
+      s1 = (__load_i32__(t + (ch >>> 4) * 4) - __load_i32__(t + (ch & 15) * 4)) ^ (s1 + s2)
+      s2 = s1 + 3 + s2 * 33 + ch
+      ch = __load_u8__(p)
+    }
+    sum = sum * 31 + s1
+  }
+  sum
+}
+
+// 2. 4x4 f32 matrix chain, scalar: m = m * a, n times.
+export function matChain(n: i32): i32 {
+  const m = D
+  const a = D + 64
+  const o = D + 128
+  for i in 0 until 16 {
+    __store_f32__(m + i * 4, if i % 5 == 0 { 1.0 as f32 } else { 0.0 as f32 })
+    __store_f32__(a + i * 4, ((i + 1) as f32) * (0.0625 as f32))
+  }
+  for k in 0 until n {
+    for i in 0 until 4 {
+      for j in 0 until 4 {
+        const x = __load_f32__(m + i * 16) * __load_f32__(a + j * 4) + __load_f32__(m + i * 16 + 4) * __load_f32__(a + 16 + j * 4) + __load_f32__(m + i * 16 + 8) * __load_f32__(a + 32 + j * 4) + __load_f32__(m + i * 16 + 12) * __load_f32__(a + 48 + j * 4)
+        __store_f32__(o + i * 16 + j * 4, x)
+      }
+    }
+    // Renormalise so the values stay finite.
+    const d = __load_f32__(o)
+    for i in 0 until 16 { __store_f32__(m + i * 4, __load_f32__(o + i * 4) / d) }
+  }
+  __load_i32__(m + 20)
+}
+
+// 3. Quicksort of n i32s from xorshift32, in linear memory.
+function qs(lo: i32, hi: i32) {
+  if hi - lo < 1 { return }
+  const pv = __load_i32__(D + ((lo + hi) >>> 1) * 4)
+  let i = lo
+  let j = hi
+  while i <= j {
+    while __load_i32__(D + i * 4) < pv { i += 1 }
+    while __load_i32__(D + j * 4) > pv { j -= 1 }
+    if i <= j {
+      const t = __load_i32__(D + i * 4)
+      __store_i32__(D + i * 4, __load_i32__(D + j * 4))
+      __store_i32__(D + j * 4, t)
+      i += 1
+      j -= 1
+    }
+  }
+  qs(lo, j)
+  qs(i, hi)
+}
+export function sort(n: i32): i32 {
+  let x = 2463534242 as% i32
+  for i in 0 until n {
+    x = x ^ (x << 13)
+    x = x ^ (x >>> 17)
+    x = x ^ (x << 5)
+    __store_i32__(D + i * 4, x)
+  }
+  qs(0, n - 1)
+  __load_i32__(D + (n >>> 1) * 4)
+}
+
+// 4. Translated-register-shaped: i64 state, i64 multiplies, 64-bit loads and stores at i32 addresses.
+export function mix(n: i32): i32 {
+  let a: i64 = 0x9e3779b97f4a7c15
+  let b: i64 = 1
+  for i in 0 until 1024 { __store_i64__(D + i * 8, (i as% i64) * 0x100000001b3) }
+  for i in 0 until n {
+    const p = D + ((a >>> 3) as% i32 & 1023) * 8
+    const v = __load_i64__(p)
+    a = (a ^ (a >>> 12)) * 0x2545f4914f6cdd1d + v
+    b = b + (a >>> 32)
+    __store_i64__(p, v + b)
+  }
+  (a ^ b) as% i32
+}
+
+// 5. A growable array: push n, then sum by index, repeatedly.
+export function array(n: i32): i32 {
+  const xs: i32[] = []
+  for i in 0 until n { xs.push(i * 7) }
+  let s = 0
+  for r in 0 until 20 { for i in 0 until xs.length { s = s + xs[i] * (r + 1) } }
+  s
+}
+
+// 6. An i32-keyed map: insert n keys, then probe each 10 times.
+export function map(n: i32): i32 {
+  const m: {[i32]: i32} = Map()
+  for i in 0 until n { m[i * 2654435761 as% i32] = i }
+  let s = 0
+  for r in 0 until 10 { for i in 0 until n { s = s + (m[i * 2654435761 as% i32] ?? 0) } }
+  s
+}
