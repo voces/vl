@@ -331,13 +331,12 @@ Deno.test({
   fn: async () => {
     await withDir(async (dir) => {
       const file = `${dir}/emit.vl`;
-      // The same shape `tests/cases/unions/same-field-names-i32-vs-boolean-reject.vl`
-      // carries: `vl check` accepts it and the emitter has no discriminator for it.
+      // D2492's witness: `vl check` accepts it and the emitter has no for-in over a list of maps.
       await Deno.writeTextFile(
         file,
-        "type P = { a: i32 }\ntype Q = { a: boolean }\n" +
-          "const u: P | Q = { a: true }\n" +
-          'if u is P { print("IS-P") } else { print("IS-Q") }\n',
+        "const xs: {[string]: i32}[] = [Map()]\n" +
+          'xs[0]["k"] = 1\n' +
+          "for s in xs { for k in s.keys() { print(k) } }\n",
       );
       const { code, out } = await run(["check", "--codegen", file, "--json"]);
       if (code === 0) throw new Error(`expected a refusal, got exit 0: ${out}`);
