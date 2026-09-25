@@ -7526,6 +7526,11 @@ therefore per MODULE, and two separately built units exchanging a map would disa
 map crosses a unit boundary today (plumb's maps live in one unit), and a cross-unit map ABI has
 to fix one layout when it is built.
 
+That "identical code" no longer holds since D2370: a delete-free module now keeps no `live`
+array (nothing reads it), an i32-keyed map keeps no `hashes` and probes a (key, entry) pair
+index, and so a `.delete` spelling the name scan missed would trap or return a deleted entry,
+where before it only forwent compaction.
+
 **THE PRICE, MEASURED** (median of 7–9, alternating master/candidate, `vl run`, box at load
 10–27): the D2291 churn (`m[k] = k` then `m.delete(k - W)`) at 25M ops costs +1% to +7% CPU
 across two runs (W = 4: 0.94 → 0.97 s; min-of-9 +4.3%, +1.6%, −2.1% for W = 4 / 100 / 1000),
