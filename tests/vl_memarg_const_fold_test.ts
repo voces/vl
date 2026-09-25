@@ -1,4 +1,4 @@
-// THE DECLARATION-TIME ADDRESS FOLD (D2368/D2369) — `vl_memarg_offset_test.ts`'s fold sees
+// THE DECLARATION-TIME ADDRESS FOLD — `vl_memarg_offset_test.ts`'s fold sees
 // only the expression written inside the load/store call, so `const p = D + (x & 1023) * 8;
 // __load_i64__(p)` (the vs-rust `mix` kernel's own shape) kept the `i32.add` — the compiler
 // now tees the bounded part into `p`'s own extra scratch local at its declaration, so a later
