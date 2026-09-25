@@ -308,6 +308,7 @@ import {
   gHelpMapProbe,
   gHelpMapProbeI32,
   gHelpMapResize,
+  gHelpMapResizeI32,
   gHelpMapResync,
   gHelpStrBytes,
   gHelpStrConcat,
@@ -350,6 +351,7 @@ import {
   listGetRecvStagedIx,
   listGetRecvStagedSet,
   listIdxScratchBase,
+  localDeclIx,
   localIsRef,
   localStructIdx,
   loopBrkDepth,
@@ -357,6 +359,7 @@ import {
   loopContDepth,
   loopContLabel,
   mUsed,
+  maFoldScratchBase,
   mapI32Base,
   mapKeysBase,
   mapScratchBase,
@@ -408,6 +411,7 @@ import {
   sFieldStart,
   sHeapIdx,
   sTypeIdx,
+  scopeSlotOf,
   slUsed,
   startStmts,
   strCatSlotIx,
@@ -476,7 +480,6 @@ import {
   fbI32Bin,
   fbI32Const,
   fbI32Eqz,
-  fbI32HashMix,
   fbI32TruncF32S,
   fbI32TruncF64S,
   fbI32WrapI64,
@@ -531,6 +534,7 @@ import {
   nulScalarListWrapHeap,
   rpRow,
   rpVar,
+  urBase,
   urSlot,
   urVal,
   wDropBack,
@@ -7596,58 +7600,60 @@ function pushMapSeqs(body: u8[]) {
   0
 }
 
-// The hash of the current op's target key, leaving a non-negative i32 on the stack: the FNV-1a of
-// the string in the key scratch slot (a call into the shared `__str_hash__` helper), or the
-// integer mix of the i32 key (`fbI32HashMix`, the same generator the i32-keyed probe helper's
-// body uses). Both leave the same masked range, which is what lets the two reps share `hashes`.
+// The hash of the current op's string key, leaving a non-negative i32 on the stack: the FNV-1a
+// of the string in the key slot, a call into the shared `__str_hash__` helper. An i32 key is
+// never hashed here: it is its own tag in the pair index.
 function emitMapHashOf(_body: u8[]) {
-  if cmKeyI32() {
-    // Scratch slot +9 (`hcur`) is the mix's own accumulator — dead across it.
-    fbI32HashMix(cmKeyLocal(), mapScratchBase + 9)
-    return 0
-  }
   fbLocalGet(cmKeyLocal())
   fbCall(gHelpStrHash)
   0
 }
 
-// The hash of the current op's key at a site that runs after `emitMapProbe` — the `hashes[]`
-// store on an appending `m[k] = v`. A string key's hash is the one handed to the probe, still in
-// slot +9, so the key is walked once per insert instead of twice; an i32 key's is re-mixed,
-// because `__map_probe_i32__` computes its own internally.
-function pushMapProbedHash(body: u8[]) {
-  if cmKeyI32() { return emitMapHashOf(body) }
-  pushMapScr(body, 9)
+// The index position of the current op's probe slot (scratch slot 3): the slot itself in a
+// string-keyed index; in an i32-keyed one's pairs, `2 * slot + k`, the key (`k` 0) or the entry
+// (`k` 1).
+function pushMapSlotPos(body: u8[], k: i32) {
+  pushMapScr(body, 3)
+  if !cmKeyI32() { return 0 }
+  fbI32Const(1)
+  fbI32Bin(116) // 0x74 i32.shl
+  if k != 0 {
+    fbI32Const(k)
+    fbI32Bin(114) // 0x72 i32.or
+  }
+  0
 }
 
-// Probe: with `mapRef` (slot 0) and the target `keyRef` (slot 1) set, hash the key into `M.index`
-// and linear-probe, wrapping, to the slot holding either the matching key's entry or a free (0)
-// slot. Leaves `slot` (3) = that probe slot and `entry` (5) = `index[slot]`, 0 for a miss. Shared
-// by get, has, set and delete; occupancy, dead markers included, stays under 1/2, so a free slot is reached.
+// Probe: with `mapRef` (slot 0) and the target `keyRef` (slot 1) set, linear-probe `M.index`,
+// wrapping, to the slot holding either the matching key's entry or a free (0) one. Leaves `slot`
+// (3) = that probe slot and `entry` (5) = its entry, 0 for a miss. Shared by get, has, set and
+// delete; occupancy, dead markers included, stays under 1/2, so a free slot is reached.
 
-// Tombstone-aware: a tombstoned entry (`live[entry-1] == 0`) is not a hit but a probe marker,
-// kept so delete does not break the chain, and the stored per-entry hash gates the key compare.
+// A dead entry stays a probe marker, never a hit, so delete does not break the chain (D2370).
 // The string key is hashed here, as `__map_probe__`'s first operand, on an empty operand stack so
 // no backing `struct.get` stays live across `__str_hash__`; `keepHash` parks it in scratch +9.
 function emitMapProbe(body: u8[], keepHash: boolean) {
-  if !cmKeyI32() {
+  // Push the probe's shape-agnostic components (the map struct type differs per value shape,
+  // but `index`/`hashes`/`live`/`keys` are identically typed across shapes — only these
+  // `struct.get`s stay at the call site) and call the shared helper, which returns the SLOT.
+  if cmKeyI32() {
+    pushMapIndex(body)
+    fbLocalGet(cmKeyLocal()) // the raw i32 key, its own tag
+    fbCall(gHelpMapProbeI32)
+  } else {
     emitMapHashOf(body)
     if keepHash { fbLocalTee(mapScratchBase + 9) }
+    pushMapIndex(body)
+    pushMapHashes(body)
+    pushMapLive(body)
+    pushMapKeysBacking(body)
+    fbLocalGet(cmKeyLocal()) // the target string key
+    fbCall(gHelpMapProbe)
   }
-  // Push the probe's shape-agnostic components (the map struct type differs per
-  // value shape, but `index`/`hashes`/`live`/`keys` are identically typed across
-  // shapes — only these `struct.get`s stay at the call site) and call the shared
-  // `__map_probe__` helper (`emitMapProbeFnCode`), which returns the probe SLOT.
-  pushMapIndex(body)
-  pushMapHashes(body)
-  pushMapLive(body)
-  pushMapKeysBacking(body)
-  fbLocalGet(cmKeyLocal()) // the target key (a string ref, or a raw i32)
-  if cmKeyI32() { fbCall(gHelpMapProbeI32) } else { fbCall(gHelpMapProbe) }
   setMapScr(body, 3) // slot
-  // entry = index[slot]  (0 = miss; else entry-position + 1)
+  // entry = the slot's entry  (0 = miss; else entry-position + 1)
   pushMapIndex(body)
-  pushMapScr(body, 3)
+  pushMapSlotPos(body, 1)
   fbArrayGet(aTypeIdx) // array.get
   setMapScr(body, 5)   // entry
   0
@@ -7695,21 +7701,20 @@ function emitMapNew(_body: u8[]) {
   fbI32Const(0)
   fbI32Const(0)
   fbStructNew(mvValsWrapOf(slot))
-  // live: empty i32 array (cap 0), parallel to the empty keys/vals entry lists. It
-  // grows in lockstep with the keys backing on append (a fresh entry is live = 1).
+  // live: empty i32 array (cap 0), parallel to the empty keys/vals entry lists. In a module
+  // that deletes it grows in lockstep with the keys backing (a fresh entry is live = 1).
   fbArrayNewFixed(aTypeIdx, 0)
-  // index: an i32 hash-slot array of `INITIAL_CAP * 2` (16) zero-filled slots, 0 meaning empty.
-  // Occupancy, dead probe markers included, is kept under 1/2 by resizing at `count*2 >= cap`
-  // (`__map_resize__`), so every probe reaches a free slot under any mix of inserts and deletes (D2280).
-  fbI32Const(16) // i32.const 16 (INITIAL_CAP * 2)
+  // index: `INITIAL_CAP * 2` (16) zero-filled slots, 0 meaning empty — an i32 array of 16, or of
+  // 32 for an i32 key's pairs. Occupancy, dead markers included, stays under 1/2 by resizing at
+  // `count*2 >= cap`, so every probe reaches a free slot under any mix of inserts and deletes (D2280).
+  if mapShapeKeyI32(slot) { fbI32Const(32) } else { fbI32Const(16) }
   fbArrayNewDefault(aTypeIdx)
   // count = 0, size = 0.
   fbI32Const(0)
   fbI32Const(0)
-  // hashes: empty i32 array (cap 0), parallel to the entries; grows in lockstep with
-  // the keys backing on append (the stored FNV hash of each key). Mirrors the host's
-  // 7th `struct.new` operand (`mapNewFn`); native sizes it like `live` (cap 0, grown
-  // on demand) rather than INITIAL_CAP so the entry-parallel arrays stay length-locked.
+  // hashes: empty i32 array (cap 0). A STRING-keyed map grows it in lockstep with the keys
+  // (each key's hash, which gates the probe and re-places the entry); an i32 key is its own tag
+  // in the pair index, so an i32-keyed map's stays empty.
   fbArrayNewFixed(aTypeIdx, 0)
   // seqs (empty) and the next sequence (0), in a module that deletes (D2315).
   if gMapDeletes {
@@ -8337,6 +8342,21 @@ function emitMapHas(body: u8[], recvIx: i32, keyIx: i32, fnIx: i32) {
   0
 }
 
+// Push whether entry `iL` of the `live` array in `liveL` is live: `live[i] != 0` in a module
+// that deletes, else the constant 1 — nothing else writes `live`, so it stays empty there.
+function pushMapEntryLive(liveL: i32, iL: i32) {
+  if !gMapDeletes {
+    fbI32Const(1)
+    return 0
+  }
+  fbLocalGet(liveL)
+  fbLocalGet(iL)
+  fbArrayGet(aTypeIdx)
+  fbI32Const(0)
+  fbI32Bin(71) // 0x47 i32.ne
+  0
+}
+
 // Lower `m.keys()` onto `body`, leaving a fresh string list (`$mkListIdx`) of the map's
 // live keys in insertion order — the ordered keys/live arrays carry tombstoned entries
 // after a delete, so only `live[i] != 0` keys are copied. Uses the 6-slot `mapKeysBase`
@@ -8408,12 +8428,8 @@ function emitMapKeys(body: u8[], recvIx: i32, fnIx: i32) {
   fbIf(64)
   // then: done (empty)
   fbElse()
-  // if live[i] != 0
-  fbLocalGet(liveL)
-  fbLocalGet(iL)
-  fbArrayGet(aTypeIdx)
-  fbI32Const(0)
-  fbI32Bin(71) // 0x47 i32.ne
+  // if live[i] != 0  (constant true in a module that never deletes, whose `live` stays empty)
+  pushMapEntryLive(liveL, iL)
   fbIf(64)
   // out[j] = keys[i]
   fbLocalGet(outBackL)
@@ -8507,11 +8523,7 @@ function emitMapValues(body: u8[], recvIx: i32, fnIx: i32) {
   fbI32Bin(78) // i32.ge_s
   fbIf(64)
   fbElse()
-  fbLocalGet(liveL)
-  fbLocalGet(iL)
-  fbArrayGet(aTypeIdx)
-  fbI32Const(0)
-  fbI32Bin(71) // i32.ne
+  pushMapEntryLive(liveL, iL)
   fbIf(64)
   // out[j] = vals[i]
   fbLocalGet(outBackL)
@@ -8547,11 +8559,16 @@ function emitMapValues(body: u8[], recvIx: i32, fnIx: i32) {
 function emitMapResize(body: u8[]) {
   pushMapRef(body) // the struct.set receiver
   pushMapIndex(body)
-  pushMapHashes(body)
-  pushMapLive(body)
-  pushMapCount(body)
-  pushMapSize(body)
-  fbCall(gHelpMapResize)
+  if cmKeyI32() {
+    pushMapCount(body)
+    fbCall(gHelpMapResizeI32)
+  } else {
+    pushMapHashes(body)
+    pushMapLive(body)
+    pushMapCount(body)
+    pushMapSize(body)
+    fbCall(gHelpMapResize)
+  }
   fbStructSet(cmMapTy(), 3) // struct.set field 3: index
   0
 }
@@ -8566,6 +8583,14 @@ function emitMapDelete(body: u8[], recvIx: i32, keyIx: i32, fnIx: i32) {
   // if entry == 0 { 0 } else { tombstone ; drop refs ; size-- ; 1 }
   pushMapScr(body, 5) // entry
   fbIf(127)           // if (entry != 0), 0x7f i32 blocktype
+  // an i32 key's pair: entry = -1, a probe marker never hit again (a string key's slot keeps
+  // its entry, whose `live` below is what the probe tests)
+  if cmKeyI32() {
+    pushMapIndex(body)
+    pushMapSlotPos(body, 1)
+    fbI32Const(0 - 1)
+    fbArraySet(aTypeIdx)
+  }
   // live[entry-1] = 0  (tombstone; keeps the entry's insertion-order position)
   pushMapLive(body)
   pushMapScr(body, 5)  // entry
@@ -8832,9 +8857,15 @@ function emitMapSetV(
     emitMapProbe(body, true)
     fbEnd()       // end (compact if)
   }
-  // index[slot] = count + 1  (the new entry's position + 1).
+  // the slot's entry = count + 1 (the new entry's position + 1), beside an i32 key in its pair.
+  if cmKeyI32() {
+    pushMapIndex(body)
+    pushMapSlotPos(body, 0)
+    fbLocalGet(cmKeyLocal())
+    fbArraySet(aTypeIdx) // array.set
+  }
   pushMapIndex(body)
-  pushMapScr(body, 3)  // slot
+  pushMapSlotPos(body, 1)
   pushMapCount(body)
   fbI32Const(1)
   fbI32Bin(106)        // i32.add (count + 1)
@@ -8916,37 +8947,40 @@ function emitMapPushKey(body: u8[]) {
   pushMapKeys(body)
   pushMapScr(body, 4)
   fbStructSet(cmKeysWrap(), 2) // struct.set field 2: cap
-  // live grows in LOCKSTEP with the keys backing (entry-parallel): allocate a fresh
-  // `(ref $aTypeIdx)` of newCap (slot 12), copy the live region `[0, keys.len)` over,
-  // and store it back into M.live (field 2). `keys.len` is still the pre-append count
-  // here. Mirrors the host's grow of its entry-parallel arrays.
-  pushMapScr(body, 4)             // newCap
-  fbArrayNewDefault(aTypeIdx)
-  setMapScrLB(body)               // newLiveBacking (slot 12)
-  pushMapScrLB(body)              // dest
-  fbI32Const(0)
-  pushMapLive(body)               // src (old live)
-  fbI32Const(0)
-  pushMapKeysLen(body)            // count (entries copied)
-  fbArrayCopy(aTypeIdx, aTypeIdx) // array.copy (dest type, src type)
-  pushMapRef(body)                // mapRef
-  pushMapScrLB(body)
-  fbStructSet(cmMapTy(), 2)       // struct.set field 2: live
-  // hashes grows in LOCKSTEP too (entry-parallel): fresh `(ref $aTypeIdx)` of newCap
-  // (slot 13), copy `[0, keys.len)` over, store back into M.hashes (field 6). Mirrors
-  // the host's grow of its entry-parallel `hashes` array.
-  pushMapScr(body, 4)             // newCap
-  fbArrayNewDefault(aTypeIdx)
-  setMapScrHB(body)               // newHashBacking (slot 13)
-  pushMapScrHB(body)              // dest
-  fbI32Const(0)
-  pushMapHashes(body)             // src (old hashes)
-  fbI32Const(0)
-  pushMapKeysLen(body)            // count (entries copied)
-  fbArrayCopy(aTypeIdx, aTypeIdx) // array.copy (dest type, src type)
-  pushMapRef(body)                // mapRef
-  pushMapScrHB(body)
-  fbStructSet(cmMapTy(), 6)       // struct.set field 6: hashes
+  // In a module that deletes, live grows in LOCKSTEP with the keys backing (entry-parallel):
+  // allocate a fresh `(ref $aTypeIdx)` of newCap (slot 12), copy the live region
+  // `[0, keys.len)` over, and store it back into M.live (field 2). `keys.len` is still the
+  // pre-append count here. A module that never deletes has no dead entry to mark.
+  if gMapDeletes {
+    pushMapScr(body, 4)             // newCap
+    fbArrayNewDefault(aTypeIdx)
+    setMapScrLB(body)               // newLiveBacking (slot 12)
+    pushMapScrLB(body)              // dest
+    fbI32Const(0)
+    pushMapLive(body)               // src (old live)
+    fbI32Const(0)
+    pushMapKeysLen(body)            // count (entries copied)
+    fbArrayCopy(aTypeIdx, aTypeIdx) // array.copy (dest type, src type)
+    pushMapRef(body)                // mapRef
+    pushMapScrLB(body)
+    fbStructSet(cmMapTy(), 2)       // struct.set field 2: live
+  }
+  // a string-keyed map's hashes grow in LOCKSTEP too: fresh `(ref $aTypeIdx)` of newCap
+  // (slot 13), copy `[0, keys.len)` over, store back into M.hashes (field 6).
+  if !cmKeyI32() {
+    pushMapScr(body, 4)             // newCap
+    fbArrayNewDefault(aTypeIdx)
+    setMapScrHB(body)               // newHashBacking (slot 13)
+    pushMapScrHB(body)              // dest
+    fbI32Const(0)
+    pushMapHashes(body)             // src (old hashes)
+    fbI32Const(0)
+    pushMapKeysLen(body)            // count (entries copied)
+    fbArrayCopy(aTypeIdx, aTypeIdx) // array.copy (dest type, src type)
+    pushMapRef(body)                // mapRef
+    pushMapScrHB(body)
+    fbStructSet(cmMapTy(), 6)       // struct.set field 6: hashes
+  }
   // seqs (an i64 array) grows in lockstep too, in a module that deletes (D2315).
   if gMapDeletes {
     const nsL = mapSeqsBackSlot()
@@ -8965,11 +8999,13 @@ function emitMapPushKey(body: u8[]) {
     fbStructSet(cmMapTy(), 7) // struct.set field 7: seqs
   }
   fbEnd() // end (grow if)
-  // live[keys.len] = 1  (the new entry is live).
-  pushMapLive(body)
-  pushMapKeysLen(body) // entry index (== count, pre-append)
-  fbI32Const(1)
-  fbArraySet(aTypeIdx) // array.set
+  // live[keys.len] = 1  (the new entry is live), in a module that can kill one.
+  if gMapDeletes {
+    pushMapLive(body)
+    pushMapKeysLen(body) // entry index (== count, pre-append)
+    fbI32Const(1)
+    fbArraySet(aTypeIdx) // array.set
+  }
   // seqs[keys.len] = next ; next = next + 1 — the entry's insertion sequence, an i64 that no
   // program lives long enough to wrap, which a walk resyncs by after a compaction (D2315).
   if gMapDeletes {
@@ -8985,14 +9021,14 @@ function emitMapPushKey(body: u8[]) {
     fbI32Bin(124) // 0x7c i64.add
     fbStructSet(cmMapTy(), 8)
   }
-  // hashes[keys.len] = hash(keyRef)  — cache the key's FNV hash parallel to the entry
-  // so resize/compact re-place it without re-hashing (mirrors the host's `mapSetFn`
-  // append, which stores `m.call(hash, [key()])`). `pushMapProbedHash` leaves the masked
-  // hash on the stack, reusing the probe's own for a string key.
-  pushMapHashes(body)
-  pushMapKeysLen(body) // entry index (== count, pre-append)
-  pushMapProbedHash(body)
-  fbArraySet(aTypeIdx) // array.set
+  // hashes[keys.len] = hash(keyRef) for a string key — cached parallel to the entry, it gates
+  // the probe's key compare and re-places the entry on resize; the probe's own, in slot +9.
+  if !cmKeyI32() {
+    pushMapHashes(body)
+    pushMapKeysLen(body) // entry index (== count, pre-append)
+    pushMapScr(body, 9)
+    fbArraySet(aTypeIdx) // array.set
+  }
   // keys.backing[keys.len] = key
   pushMapKeysBacking(body)
   pushMapKeysLen(body)
@@ -9220,23 +9256,93 @@ function emitListIdxGuardHoisted(row: i32, idxIx: i32) {
 // the arm asking. The rep check is the backstop that makes a classifier disagreement
 // between the prologue and the access decline, rather than read a wrongly-typed local.
 function liveHoistRow(exprIx: i32, kind: MfKind, slot: i32) {
-  if exprIx < 0 { return 0 - 1 }
-  const e = P.nodes[exprIx]
-  if e is Ident {
-    let k = 0
-    while k < lhName.length {
-      if (
-        lhLive[k] > 0
-        && lhName[k] == e.identName
-        && lhKind[k] == kind
-        && lhSlot[k] == slot
-      ) {
-        return k
-      }
-      k = k + 1
+  const nm = hoistPathName(exprIx)
+  if nm == "" { return 0 - 1 }
+  let k = 0
+  while k < lhName.length {
+    if (
+      lhLive[k] > 0
+      && lhName[k] == nm
+      && lhKind[k] == kind
+      && lhSlot[k] == slot
+    ) {
+      return k
     }
+    k = k + 1
   }
   0 - 1
+}
+
+// The name a hoist row caches the receiver at `ix` under: a bare identifier's own name, or
+// `b.xs` for a field of one; "" for any other receiver. `.` opens no identifier, so the two
+// forms never collide.
+function hoistPathName(ix: i32): string {
+  if ix < 0 || ix >= P.nodes.length { return "" }
+  const e = P.nodes[ix]
+  if e is Member {
+    const root = hoistRootName(e.memObj)
+    if root == "" { return "" }
+    return root + "." + e.memProp
+  }
+  hoistRootName(ix)
+}
+
+// The name of the bare identifier at `ix`, or "" for any other node: the one receiver a hoist
+// row keys on by itself, and the only root a field path may have.
+function hoistRootName(ix: i32): string {
+  if ix < 0 || ix >= P.nodes.length { return "" }
+  const e = P.nodes[ix]
+  if e is Ident { return e.identName }
+  ""
+}
+
+// Whether field receiver `memIx` (`b.xs`, `b` an identifier) lowers to one `struct.get` of a
+// plain struct field, so the prologue may read it ahead of the loop: not a union, variant or
+// nullable receiver, and not a narrowed read, each of which lowers through a dispatch or a guard.
+function hoistFieldRecvOk(memIx: i32, fnIx: i32): boolean {
+  const m = P.nodes[memIx]
+  if m is Member {
+    const o = m.memObj
+    if (
+      memIsNarrowed(memIx)
+      || exprUnion(o, fnIx)
+      || exprNullableStruct(o, fnIx)
+    ) {
+      return false
+    }
+    if exprVariantIndex(o, fnIx) >= 0 || nulVariantIdxOfExpr(o, fnIx) >= 0 {
+      return false
+    }
+    const si = structIndexOfExpr(o, fnIx)
+    return si >= 0 && sFieldIndex(si, m.memProp) >= 0
+  }
+  false
+}
+
+// Does the code under `ix` assign a field named `prop`, of any receiver? A cached `b.xs` is stale
+// after `c.xs = …` whenever `c` aliases `b`, and the name is all that can be compared here.
+function stmtAssignsProp(ix: i32, prop: string): boolean {
+  let cur = ix
+  while cur >= 0 {
+    if cur >= P.nodes.length { return false }
+    const n = P.nodes[cur]
+    if n is BinExpr {
+      if n.binOp == "=" {
+        const t = P.nodes[unwrapParen(n.binLeft)]
+        if t is Member {
+          if t.memProp == prop { return true }
+        }
+      }
+    }
+    const kids = nodeSpineChildren(cur)
+    let i = 0
+    while i < kids.length {
+      if stmtAssignsProp(kids[i], prop) { return true }
+      i = i + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  false
 }
 
 // Find (or mint) the hoist row for `name` at list rep (`kind`, `slot`). Minting
@@ -9700,8 +9806,8 @@ function hoistScanExpr(ix: i32) {
   const e = P.nodes[ix]
   if e is Index {
     hmIdxSeen = hmIdxSeen + 1
-    const recv = P.nodes[e.idxArr]
-    if recv is Ident { hoistScanAdd(recv.identName, ix) }
+    const pn = hoistPathName(e.idxArr)
+    if pn != "" { hoistScanAdd(pn, ix) }
     hoistScanExpr(e.idxArr)
     hoistScanExpr(e.idxIndex)
     return 0
@@ -9848,9 +9954,30 @@ function loopHoistOpen(
   let i = 0
   while i < lhScanName.length {
     const nm = lhScanName[i]
-    let ok = nm != ownVar && nm != ownVar2
-    if ok && exprReboundsName(condIx, nm) { ok = false }
-    if ok && blockReboundsName(bodyIx, nm) { ok = false }
+    // A field path `b.xs` is held to its root's rebinding, to no write of any `xs` field in
+    // the loop, and to a receiver that reads as one plain `struct.get`.
+    let root = nm
+    let prop = ""
+    const scanned = P.nodes[lhScanRep[i]]
+    if scanned is Index {
+      const recv = P.nodes[scanned.idxArr]
+      if recv is Member {
+        const ro = P.nodes[recv.memObj]
+        if ro is Ident { root = ro.identName }
+        prop = recv.memProp
+      }
+    }
+    let ok = root != ownVar && root != ownVar2
+    if ok && exprReboundsName(condIx, root) { ok = false }
+    if ok && blockReboundsName(bodyIx, root) { ok = false }
+    if ok && prop != "" {
+      if stmtAssignsProp(condIx, prop) || stmtAssignsProp(bodyIx, prop) {
+        ok = false
+      }
+      if ok && scanned is Index {
+        if !hoistFieldRecvOk(scanned.idxArr, fnIx) { ok = false }
+      }
+    }
     if ok {
       const rep = P.nodes[lhScanRep[i]]
       if rep is Index {
@@ -9939,8 +10066,7 @@ function rangeTopLenOf(s: ForRange) {
   const m = P.nodes[top]
   if m is Member {
     if m.memProp != "length" { return "" }
-    const o = P.nodes[m.memObj]
-    if o is Ident { return o.identName }
+    return hoistPathName(m.memObj)
   }
   ""
 }
@@ -14893,10 +15019,178 @@ function memAddrLoadBound(ix: i32, fnIx: i32): i64 {
   -1
 }
 
+// The constant term of a `+` whose OTHER side `memAddrBound` can bound at all, or -1 for any
+// other shape. Bounding K+bound against `MEM_OFFSET_MAX` (plus a caller's own offset) is the
+// caller's job, since only the caller knows what else shares that budget. Shared by
+// `emitMemAddr`'s own split and the declaration-time fold below.
+function memConstFoldK(a: BinExpr, fnIx: i32): i64 {
+  if a.binOp != "+" { return -1 }
+  const lc = memAddrConst(a.binLeft, fnIx)
+  if lc >= 0 && memAddrConst(a.binRight, fnIx) < 0 {
+    if memAddrBound(a.binRight, fnIx) >= 0 { return lc }
+    return -1
+  }
+  const rc = memAddrConst(a.binRight, fnIx)
+  if rc >= 0 && memAddrConst(a.binLeft, fnIx) < 0 {
+    if memAddrBound(a.binLeft, fnIx) >= 0 { return rc }
+    return -1
+  }
+  -1
+}
+
+// The non-constant side `memConstFoldK` paired its answer with, or -1 when it found none.
+function memConstFoldRest(a: BinExpr, fnIx: i32): i32 {
+  if a.binOp != "+" { return -1 }
+  if memAddrConst(a.binLeft, fnIx) >= 0 && memAddrConst(a.binRight, fnIx) < 0 {
+    return a.binRight
+  }
+  if memAddrConst(a.binRight, fnIx) >= 0 && memAddrConst(a.binLeft, fnIx) < 0 {
+    return a.binLeft
+  }
+  -1
+}
+
+// `memConstFoldK` of a LOCAL `const`'s own initializer, checked against `MEM_OFFSET_MAX` alone,
+// or -1 when the whole initializer is already constant (nothing to preserve at runtime) or
+// matches neither shape. `emitLetDeclStmt` and `maFoldCandidateCount` share this one answer,
+// since a deviation between them is unsound.
+function memConstFoldShapeK(initIx: i32, fnIx: i32): i64 {
+  const ix = unwrapParen(initIx)
+  if ix < 0 || ix >= P.nodes.length { return -1 }
+  if memAddrConst(ix, fnIx) >= 0 { return -1 }
+  const e = P.nodes[ix]
+  if !(e is BinExpr) { return -1 }
+  const kv = memConstFoldK(e, fnIx)
+  if kv < 0 { return -1 }
+  const rest = memConstFoldRest(e, fnIx)
+  const m = memAddrBound(rest, fnIx)
+  if m < 0 || m + kv > MEM_OFFSET_MAX { return -1 }
+  kv
+}
+
+// The bounded operand `memConstFoldShapeK` found, or -1 when it found none — a second, cheap
+// re-derivation rather than a two-value return, since VL has no tuple type here.
+function memConstFoldShapeRest(initIx: i32, fnIx: i32): i32 {
+  const ix = unwrapParen(initIx)
+  if ix < 0 || ix >= P.nodes.length { return -1 }
+  const e = P.nodes[ix]
+  if e is BinExpr { return memConstFoldRest(e, fnIx) }
+  -1
+}
+
+// True when `initIx`'s top-level shape is a `+` at all — the one cheap, non-recursive check
+// every caller of `memConstFoldShapeK` runs first, so the real (`memAddrConst`/`memAddrBound`)
+// analysis is skipped for the vast majority of `const`s, which are never address sums.
+function mfShapeIsSum(initIx: i32): boolean {
+  const ix = unwrapParen(initIx)
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const e = P.nodes[ix]
+  if e is BinExpr { return e.binOp == "+" }
+  false
+}
+
+// How many of this function's already-collected locals qualify for the declaration-time
+// address fold, sized before the body is walked (`fnDetectScratch`) so `fbBeginFunc` can
+// reserve them. Reads `localDeclIx` — one entry per local slot `collectLocals` already
+// allocated, however deeply nested — rather than re-walking the body a second time.
+export function maFoldCandidateCount(fnIx: i32): i32 {
+  let count = 0
+  let i = 0
+  while i < localDeclIx.length {
+    // `localIsRef[i]` is the slot kind `collectLocals` already classified — "i32" is the one a
+    // plain arithmetic sum ever takes, so this skips every i64/f32/f64/ref local (registers, in
+    // plumb-shaped code) before touching its declaration node at all.
+    if localIsRef[i] == "i32" {
+      const declIx = localDeclIx[i]
+      if declIx >= 0 && declIx < P.nodes.length {
+        const d = P.nodes[declIx]
+        if d is LetDecl {
+          if d.letKw == "const" && d.letInit >= 0 && mfShapeIsSum(d.letInit) {
+            if memConstFoldShapeK(d.letInit, fnIx) >= 0 { count = count + 1 }
+          }
+        }
+      }
+    }
+    i = i + 1
+  }
+  count
+}
+
+// The declaration-time fold's live table for the function currently emitting: parallel to
+// each qualifying `const`'s own node index, the WASM index of its scratch local and the K it
+// folded out. Cleared at the top of `emitFuncBody` — a node index is emitted at most once, so
+// stale rows from a previous function can never be mistaken for this one's.
+let maFoldDeclIx: i32[] = []
+let maFoldWasmSlot: i32[] = []
+let maFoldK: i64[] = []
+// How many of this function's scratch slots (`maFoldScratchBase` + this) are already claimed —
+// `maFoldCandidateCount`'s own visiting order, replayed by `emitLetDeclStmt` as it emits each
+// qualifying declaration in turn, so the two never need to agree on anything but that order.
+let maFoldCursor = 0
+
+// The fold table's row for declaration `declIx`, or -1 — the slot BELONGS to the declaration,
+// not to any one emission of it: an unrolled or partially-unrolled loop body (`emitRangeUnrolled`
+// and #3129's 4x partial unroll) re-emits the same `LetDecl` node once per copy, and every copy
+// must land on the ONE row `maFoldCandidateCount` reserved, not a fresh one each time.
+function maFoldRowOfDecl(declIx: i32): i32 {
+  let i = 0
+  while i < maFoldDeclIx.length {
+    if maFoldDeclIx[i] == declIx { return i }
+    i = i + 1
+  }
+  -1
+}
+
+// The fold table's row for a live read of local `name`, or -1 — resolved by the same live-slot
+// rung `startBlockLetOfSid` reads from `collectLocals`'s `localDeclIx`, so a shadowed name in a
+// nested block can never match an outer declaration's row.
+function maFoldRowOf(name: string): i32 {
+  const slot = scopeSlotOf(name)
+  if slot < 0 || slot >= localDeclIx.length { return -1 }
+  const decl = localDeclIx[slot]
+  if decl < 0 { return -1 }
+  maFoldRowOfDecl(decl)
+}
+
+// Emits a qualifying `const`'s initializer: push the bounded part, tee it into this
+// declaration's own scratch local, then finish `K + bounded` as `emitExpr` would — the value
+// is unchanged, so other reads of the name are unaffected. A re-emitted copy of the same
+// `declIx` reuses the row `maFoldRowOfDecl` finds rather than claiming a fresh slot.
+function emitMemConstFoldLet(
+  body: u8[],
+  initIx: i32,
+  k: i64,
+  fnIx: i32,
+  declIx: i32,
+): i32 {
+  const rest = memConstFoldShapeRest(initIx, fnIx)
+  if rest < 0 {
+    return emitFail(
+      "emitProgram: a declaration-time address fold lost its own split",
+    )
+  }
+  if emitExpr(body, rest, fnIx) < 0 { return -1 }
+  const existing = maFoldRowOfDecl(declIx)
+  let wasmIdx = 0
+  if existing >= 0 {
+    wasmIdx = maFoldWasmSlot[existing]
+  } else {
+    wasmIdx = maFoldScratchBase + maFoldCursor
+    maFoldCursor = maFoldCursor + 1
+    maFoldDeclIx.push(declIx)
+    maFoldWasmSlot.push(wasmIdx)
+    maFoldK.push(k)
+  }
+  fbLocalTee(wasmIdx)
+  fbI32Const(k as% i32)
+  fbI32Bin(0x6a) // i32.add
+  0
+}
+
 // Pushes the address of memory-intrinsic call `c` (`base` declared operands) and answers the
-// memarg offset to write with it, or -1 after an emit failure. A constant part of the address
-// moves into the offset only where both forms name the same effective address for every
-// operand value: a constant address, or `a + K` where `a + K` provably cannot wrap past 2^32.
+// memarg offset, or -1 after an emit failure. A constant part moves into the offset only where
+// both forms name the same effective address: a constant address, `a + K` provably not
+// wrapping, or `a` a local the fold above already reduced to just its bounded part.
 function emitMemAddr(
   body: u8[],
   c: Call,
@@ -14929,24 +15223,24 @@ function emitMemAddr(
     return whole + off
   }
   const a = P.nodes[addr]
-  if a is BinExpr {
-    if a.binOp == "+" {
-      let kx = -1
-      let rest = -1
-      if memAddrConst(a.binRight, fnIx) >= 0 {
-        kx = a.binRight
-        rest = a.binLeft
-      } else if memAddrConst(a.binLeft, fnIx) >= 0 {
-        kx = a.binLeft
-        rest = a.binRight
+  if a is Ident {
+    const mf = maFoldRowOf(a.identName)
+    if mf >= 0 {
+      const k = maFoldK[mf]
+      if k + off <= MEM_OFFSET_MAX {
+        fbLocalGet(maFoldWasmSlot[mf])
+        return k + off
       }
-      if kx >= 0 {
-        const kv = memAddrConst(kx, fnIx)
-        const m = memAddrBound(rest, fnIx)
-        if m >= 0 && m + kv + off <= MEM_OFFSET_MAX {
-          if emitMemIntrinArg(body, rest, fnIx) < 0 { return -1 }
-          return kv + off
-        }
+    }
+  }
+  if a is BinExpr {
+    const kv = memConstFoldK(a, fnIx)
+    if kv >= 0 {
+      const rest = memConstFoldRest(a, fnIx)
+      const m = memAddrBound(rest, fnIx)
+      if m >= 0 && m + kv + off <= MEM_OFFSET_MAX {
+        if emitMemIntrinArg(body, rest, fnIx) < 0 { return -1 }
+        return kv + off
       }
     }
   }
@@ -19957,7 +20251,26 @@ function emitLetDeclStmt(body: u8[], s: LetDecl, stmtIx: i32, fnIx: i32) {
     }
     const savedNulList = pendingNulList
     if letNulList15 { pendingNulList = true }
-    if emitExpr(body, s.letInit, fnIx) < 0 { return -1 }
+    // The declaration-time address fold: a `const p = K + bounded` later used as a memory
+    // address needs its bounded part kept in its own scratch local — `const`-only, since a
+    // `let` can be reassigned. The checks are `maFoldCandidateCount`'s own, in the same
+    // order, so the two can never disagree about which declarations qualify.
+    let mfK: i64 = -1
+    if (
+      fnIx >= 0
+      && localIsRef[slot] == "i32"
+      && s.letKw == "const"
+      && mfShapeIsSum(s.letInit)
+    ) {
+      mfK = memConstFoldShapeK(s.letInit, fnIx)
+    }
+    if mfK >= 0 {
+      if emitMemConstFoldLet(body, s.letInit, mfK, fnIx, stmtIx) < 0 {
+        return -1
+      }
+    } else if emitExpr(body, s.letInit, fnIx) < 0 {
+      return -1
+    }
     pendingNulBool = false
     pendingNulString = false
     pendingNulList = savedNulList
@@ -20770,7 +21083,11 @@ function emitForRangeStmt(body: u8[], s: ForRange, _stmtIx: i32, fnIx: i32) {
       stepK: stepK,
       excl: s.frExcl,
     }
-    rc = emitRangeRolled(body, s, fnIx, rt)
+    if rangePartialUnrollOk(s, stepK, dynStep, fnIx) {
+      rc = emitRangePartial(body, s, fnIx, rt)
+    } else {
+      rc = emitRangeRolled(body, s, fnIx, rt)
+    }
   }
   loopHoistClose(frHoist)
   rangeProofClose(frProof)
@@ -20884,6 +21201,158 @@ function emitRangeRolled(body: u8[], s: ForRange, fnIx: i32, rt: RangeTest) {
   0
 }
 
+// The copies per trip of a partially unrolled range loop, and the most nodes its body may hold;
+// both are chosen in DECISIONS.md, "Small variable-trip range loops are unrolled 4x".
+const PARTIAL_UNROLL_COPIES = 4
+const PARTIAL_UNROLL_MAX_NODES = 40
+
+// Whether a range loop that is not fully unrolled runs its body `PARTIAL_UNROLL_COPIES` times per
+// trip: a static step of 1, a body that holds no loop, never writes the loop var, and passes
+// `unrollCost` (no function, no call but an inline memory intrinsic) within the node cap.
+function rangePartialUnrollOk(
+  s: ForRange,
+  stepK: i32,
+  dynStep: boolean,
+  fnIx: i32,
+): boolean {
+  if dynStep || stepK != 1 { return false }
+  if stmtAssignsName(s.frBody, s.frVar) { return false }
+  partialUnrollCost(s.frBody, fnIx) >= 0
+}
+
+// The node count under `ix`, or -1 past `PARTIAL_UNROLL_MAX_NODES` or on a kind outside the
+// cheap set: literals and `null`, scalar operators, `is`, locals, field reads, `if`, a `let`,
+// `break`/`continue`/`return`, an index into a list or string, an inline memory intrinsic. Any
+// other call, a loop, a function, a map index or an allocating literal lowers to far more.
+function partialUnrollCost(ix: i32, fnIx: i32): i32 {
+  let cnt = 0
+  let cur = ix
+  while cur >= 0 {
+    if cur >= P.nodes.length { return -1 }
+    const n = P.nodes[cur]
+    let ok = n is NumLit
+      || n is CharLit
+      || n is BoolLit
+      || n is NullLit
+      || n is Ident
+    ok = ok
+      || n is Unary
+      || n is BinExpr
+      || n is Member
+      || n is Paren
+      || n is AsExpr
+    ok = ok || n is IsExpr || n is TypeRef
+    ok = ok || n is IfStmt || n is Block || n is LetDecl || n is BreakStmt
+    ok = ok || n is ContinueStmt || n is RetStmt
+    if n is Index {
+      const r = n.idxArr
+      ok = scalarListElemKind(r, fnIx) != null || exprRefArray(r, fnIx)
+      ok = ok || exprStringArray(r, fnIx) || exprString(r, fnIx)
+    }
+    if n is Call { ok = hoistSafeMemCall(cur, fnIx) }
+    if !ok { return -1 }
+    cnt = cnt + 1
+    const kids = nodeSpineChildren(cur)
+    let i = 0
+    while i < kids.length {
+      if kids[i] >= 0 {
+        const c = partialUnrollCost(kids[i], fnIx)
+        if c < 0 { return -1 }
+        cnt = cnt + c
+        if cnt > PARTIAL_UNROLL_MAX_NODES { return -1 }
+      }
+      i = i + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  cnt
+}
+
+// The range loop run as `PARTIAL_UNROLL_COPIES` body copies per trip while that many trips
+// remain (`v < bound - D`; a bound too low to subtract runs none), then rolled. Copy `k` stores
+// and reads the loop var as `u + k`, `u` the trip's first value, so two reads stay one expression
+// and the copies chain no increments. `break` leaves both loops; `continue` ends its own copy.
+function emitRangePartial(body: u8[], s: ForRange, fnIx: i32, rt: RangeTest) {
+  fbBlock(64) // 0x02 block, void — the `break` target of both loops
+  loopBrkDepth.push(ctrlDepth)
+  loopBrkLabel.push(s.frLabel)
+  let d = PARTIAL_UNROLL_COPIES - 1
+  if !rt.excl { d = d - 1 }
+  const intMin = -2147483647 - 1
+  // A constant bound too low to subtract from runs no main trip at all.
+  const mainRuns = !rt.bConst || rt.bVal >= intMin + d
+  if mainRuns {
+    let limSlot = -1
+    if !rt.bConst {
+      // lim = bound >= INT_MIN + d ? bound - d : INT_MIN
+      limSlot = strI32Slot()
+      fbLocalGet(rt.bIdx)
+      fbI32Const(d)
+      fbI32Bin(107) // 0x6b i32.sub
+      fbI32Const(intMin)
+      fbLocalGet(rt.bIdx)
+      fbI32Const(intMin + d)
+      fbI32Bin(78)  // 0x4e i32.ge_s
+      wU8(27)       // 0x1b select
+      fbLocalSet(limSlot)
+    }
+    const uSlot = strI32Slot()
+    fbBlock(64)  // 0x02 block, void — the main loop's exit
+    fbLoop(64)   // 0x03 loop, void
+    fbLocalGet(rt.vIdx)
+    if rt.bConst { fbI32Const(rt.bVal - d) } else { fbLocalGet(limSlot) }
+    fbI32Bin(72) // 0x48 i32.lt_s
+    fbI32Eqz()
+    fbBrIf(1)    // leave the main loop
+    fbLocalGet(rt.vIdx)
+    fbLocalSet(uSlot)
+    const hasCont = blockHasContinueFor(s.frBody, s.frLabel, false)
+    const cursor0 = emitLetCursor
+    let k = 0
+    while k < PARTIAL_UNROLL_COPIES {
+      emitLetCursor = cursor0
+      if k > 0 {
+        fbLocalGet(uSlot)
+        fbI32Const(k)
+        fbI32Bin(106) // 0x6a i32.add
+        fbLocalSet(rt.vIdx)
+      }
+      urSlot.push(rt.vIdx)
+      urVal.push(k)
+      urBase.push(uSlot)
+      if hasCont {
+        fbBlock(64) // this copy's continue block
+        loopContDepth.push(ctrlDepth)
+        loopContLabel.push(s.frLabel)
+      }
+      const rc = emitStmts(body, s.frBody, fnIx)
+      if hasCont {
+        fbEnd()
+        loopContDepth.pop()
+        loopContLabel.pop()
+      }
+      urSlot.pop()
+      urVal.pop()
+      urBase.pop()
+      if rc < 0 { return -1 }
+      k = k + 1
+    }
+    emitLetCursor = cursor0
+    fbLocalGet(uSlot)
+    fbI32Const(PARTIAL_UNROLL_COPIES)
+    fbI32Bin(106) // 0x6a i32.add
+    fbLocalSet(rt.vIdx)
+    fbBr(0)       // next main trip
+    fbEnd()       // end loop
+    fbEnd()       // end block
+  }
+  if emitRangeRolled(body, s, fnIx, rt) < 0 { return -1 }
+  fbEnd() // end block
+  loopBrkDepth.pop()
+  loopBrkLabel.pop()
+  0
+}
+
 // The most trips, and the most body nodes summed over every copy, a range loop is fully unrolled
 // at; the two limits are chosen in DECISIONS.md, "Small constant range loops are unrolled".
 const UNROLL_MAX_TRIPS = 16
@@ -20914,6 +21383,7 @@ function emitRangeUnrolled(
     fbLocalSet(vIdx)
     urSlot.push(vIdx)
     urVal.push(v)
+    urBase.push(-1)
     if hasCont {
       fbBlock(64) // this copy's continue block
       loopContDepth.push(ctrlDepth)
@@ -20927,6 +21397,7 @@ function emitRangeUnrolled(
     }
     urSlot.pop()
     urVal.pop()
+    urBase.pop()
     if rc < 0 { return -1 }
     v = v + stepK
     k = k + 1
@@ -21391,10 +21862,34 @@ function emitForInStmt(body: u8[], s: ForIn, _stmtIx: i32, fnIx: i32) {
   if fiHoist < 0 { return -1 }
   scopeBind(s.fiVar, vSlot)
   if hasPair { scopeBind(pairName, pSlot) }
+  // The element kinds whose loop var is a non-null ref recovered from a nullable slot.
+  const elemRecover = ek == "str"
+    || ek == "struct"
+    || ek == "variant"
+    || ek == "union"
+    || ek == "list"
+    || ek == "strlist"
+    || ek == "f64list"
+    || ek == "i64list"
+    || ek == "f32list"
+    || ek == "u8list"
+    || ek == "closure"
+    || ek == "reflist"
   fbBlock(64) // 0x02 block, void
   loopBrkDepth.push(ctrlDepth)
   loopBrkLabel.push(s.fiLabel)
-  fbLoop(64)  // 0x03 loop, void
+  if fiHBack >= 0 && !hasPair && partialUnrollCost(s.fiBody, fnIx) >= 0 {
+    const fiCopies: ForInCopies = {
+      back: fiHBack,
+      len: fiHLen,
+      cursor: iIdx,
+      v: vIdx,
+      backTy: backTy,
+      recover: elemRecover,
+    }
+    if emitForInCopies(body, s, fnIx, fiCopies) < 0 { return -1 }
+  }
+  fbLoop(64) // 0x03 loop, void
   loopContDepth.push(ctrlDepth)
   loopContLabel.push(s.fiLabel)
   // exit when cursor >= len (the list wrapper's field 1; a STRING compares its
@@ -21415,7 +21910,7 @@ function emitForInStmt(body: u8[], s: ForIn, _stmtIx: i32, fnIx: i32) {
   // (insertion order of the survivors preserved). `br 1` targets the loop header
   // (if-frame is 0, loop is 1). A delete-free map has live all-1s, so never taken.
   let fiSeq = -1
-  if mapRecv >= 0 {
+  if mapRecv >= 0 && gMapDeletes {
     cmSlot = mwShape
     // M.live, off the walk's own stash
     fbLocalGet(fiMap)
@@ -21464,20 +21959,7 @@ function emitForInStmt(body: u8[], s: ForIn, _stmtIx: i32, fnIx: i32) {
     fbLocalGet(iIdx)
     fbArrayGet(backTy)
   }
-  if (
-    ek == "str"
-    || ek == "struct"
-    || ek == "variant"
-    || ek == "union"
-    || ek == "list"
-    || ek == "strlist"
-    || ek == "f64list"
-    || ek == "i64list"
-    || ek == "f32list"
-    || ek == "u8list"
-    || ek == "closure"
-    || ek == "reflist"
-  ) {
+  if elemRecover {
     // string/struct/union-box/closure element, or a nested inner-list/ref-list wrapper: all
     // are a non-null ref recovered from the `(ref null <elem>)` slot. Every niche element
     // kind is absent on purpose, since its loop var legitimately holds null — this set and
@@ -21554,6 +22036,75 @@ function emitForInStmt(body: u8[], s: ForIn, _stmtIx: i32, fnIx: i32) {
   return 0
 }
 
+// The locals and types a `for`-in walk's unrolled copies read: the hoisted backing and `len`,
+// the cursor, the loop var, the backing's array type, and whether an element is recovered
+// non-null (`ref.as_non_null`) as the rolled walk recovers it.
+type ForInCopies = {
+  back: i32,
+  len: i32,
+  cursor: i32,
+  v: i32,
+  backTy: i32,
+  recover: boolean,
+}
+
+// Ahead of a hoisted list walk's rolled loop, the walk with its body copied
+// `PARTIAL_UNROLL_COPIES` times per trip while that many elements remain; copy `k` binds the
+// element at `cursor + k`. The rolled loop then walks the rest from the cursor this leaves.
+// Emitted inside the walk's `break` block; `continue` ends its own copy.
+function emitForInCopies(body: u8[], s: ForIn, fnIx: i32, c: ForInCopies) {
+  const limSlot = strI32Slot()
+  fbLocalGet(c.len)
+  fbI32Const(PARTIAL_UNROLL_COPIES - 1)
+  fbI32Bin(107) // 0x6b i32.sub — `len` is never negative, so this cannot wrap
+  fbLocalSet(limSlot)
+  fbBlock(64)   // 0x02 block, void — the main loop's exit
+  fbLoop(64)    // 0x03 loop, void
+  fbLocalGet(c.cursor)
+  fbLocalGet(limSlot)
+  fbI32Bin(78)  // 0x4e i32.ge_s
+  fbBrIf(1)     // leave the main loop
+  const hasCont = blockHasContinueFor(s.fiBody, s.fiLabel, false)
+  const cursor0 = emitLetCursor
+  let k = 0
+  while k < PARTIAL_UNROLL_COPIES {
+    emitLetCursor = cursor0
+    fbLocalGet(c.back)
+    fbLocalGet(c.cursor)
+    if k > 0 {
+      fbI32Const(k)
+      fbI32Bin(106) // 0x6a i32.add
+    }
+    fbArrayGet(c.backTy)
+    if c.recover {
+      wU8(212) // 0xd4 ref.as_non_null
+    }
+    fbLocalSet(c.v)
+    if hasCont {
+      fbBlock(64) // this copy's continue block
+      loopContDepth.push(ctrlDepth)
+      loopContLabel.push(s.fiLabel)
+    }
+    const rc = emitStmts(body, s.fiBody, fnIx)
+    if hasCont {
+      fbEnd()
+      loopContDepth.pop()
+      loopContLabel.pop()
+    }
+    if rc < 0 { return -1 }
+    k = k + 1
+  }
+  emitLetCursor = cursor0
+  fbLocalGet(c.cursor)
+  fbI32Const(PARTIAL_UNROLL_COPIES)
+  fbI32Bin(106) // 0x6a i32.add
+  fbLocalSet(c.cursor)
+  fbBr(0)       // next main trip
+  fbEnd()       // end loop
+  fbEnd()       // end block
+  0
+}
+
 function emitBreakStmtStmt(
   _body: u8[],
   s: BreakStmt,
@@ -21611,6 +22162,12 @@ export function emitFuncBody(body: u8[], blockIx: i32, fnIx: i32) {
     // than in `emitFuncCode` because nothing before the body needs the answer, and the
     // set is stamped with `fnIx` so a body that never scanned cannot read a stale one.
     strAccScan(blockIx, fnIx)
+    // The declaration-time address fold's table: a node index is a row at most once, but the
+    // scratch slots it names are per-function, so both are cleared here.
+    maFoldDeclIx = []
+    maFoldWasmSlot = []
+    maFoldK = []
+    maFoldCursor = 0
     hmFn = -2
     // Enter the function's top-level lexical scope (mirrors `collectLocals` on the body
     // block). The emit-time scope stack drives same-named-local resolution.
@@ -22893,7 +23450,15 @@ function emitIdentNode(body: u8[], e: Ident, exprIx: i32, fnIx: i32) {
   // A fully unrolled range loop's variable reads as its copy's constant.
   const urAt = unrolledSlotAt(idx)
   if urAt >= 0 {
-    fbI32Const(urVal[urAt])
+    if urBase[urAt] < 0 {
+      fbI32Const(urVal[urAt])
+      return 0
+    }
+    fbLocalGet(urBase[urAt])
+    if urVal[urAt] != 0 {
+      fbI32Const(urVal[urAt])
+      fbI32Bin(106) // 0x6a i32.add
+    }
     return 0
   }
   fbLocalGet(idx)
