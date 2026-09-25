@@ -26,7 +26,7 @@ if (!ENABLED) {
 
 const dec = new TextDecoder();
 
-const vl = async (args: string[]) => {
+const vl = async (args: string[], opts: { cwd?: string } = {}) => {
   const env = nativeEnv();
   if (HAVE_OPT) env.VL_WASM_OPT = WASM_OPT;
   const { code, stdout, stderr } = await new Deno.Command(VL, {
@@ -34,6 +34,7 @@ const vl = async (args: string[]) => {
     stdout: "piped",
     stderr: "piped",
     env,
+    cwd: opts.cwd,
   }).output();
   return { code, out: dec.decode(stdout), err: dec.decode(stderr) };
 };
@@ -821,6 +822,58 @@ Deno.test({
       if (!r.err.includes("'__memory_shared__' is internal to std")) {
         throw new Error(`${label} build: wrong refusal: ${r.err}`);
       }
+    }
+  },
+});
+
+// A RELATIVE path is judged by where the cwd actually puts it, not its spelling: a
+// folder named `std/` in an unrelated project must not pass just because the argument
+// happens to read `std/…` (D2355 review round 2).
+Deno.test({
+  name: "shared-memory: a relative std/ path in an unrelated project is still refused",
+  ignore: !ENABLED,
+  async fn() {
+    const tmp = await Deno.makeTempDir();
+    try {
+      await Deno.mkdir(`${tmp}/std`);
+      await Deno.writeTextFile(`${tmp}/std/evil.vl`, "print(__memory_shared__())\n");
+      for (const target of ["std/evil.vl", "std/", "std"]) {
+        const r = await vl(["check", target, "--compiler", COMPILER], { cwd: tmp });
+        if (r.code === 0 || !r.err.includes("'__memory_shared__' is internal to std")) {
+          throw new Error(`check ${target} from an unrelated project: ${r.code} ${r.err}`);
+        }
+      }
+      // Same refusal on `run`/`build` — no import means the CLI's directory-walk
+      // machinery never even runs, so this also pins the bare-entry (build/run) path.
+      const runR = await vl(["run", "std/evil.vl", "--compiler", COMPILER], { cwd: tmp });
+      if (runR.code === 0 || !runR.err.includes("'__memory_shared__' is internal to std")) {
+        throw new Error(`run std/evil.vl from an unrelated project: ${runR.code} ${runR.err}`);
+      }
+    } finally {
+      await Deno.remove(tmp, { recursive: true });
+    }
+  },
+});
+
+// The three commands must agree: `std/buffer.vl`'s own calls are std whether it is
+// checked, built or run — the origin decision is the same one in all three.
+Deno.test({
+  name: "shared-memory: check, build and run agree that std/buffer.vl is std",
+  ignore: !ENABLED,
+  async fn() {
+    const tmp = await Deno.makeTempDir();
+    try {
+      const checkR = await vl(["check", "std/buffer.vl", "--compiler", COMPILER], { cwd: ROOT });
+      if (checkR.code !== 0) throw new Error(`check std/buffer.vl: ${checkR.code} ${checkR.err}`);
+      const buildR = await vl(
+        ["build", "std/buffer.vl", "--compiler", COMPILER, "-o", `${tmp}/buffer.wasm`],
+        { cwd: ROOT },
+      );
+      if (buildR.code !== 0) throw new Error(`build std/buffer.vl: ${buildR.code} ${buildR.err}`);
+      const runR = await vl(["run", "std/buffer.vl", "--compiler", COMPILER], { cwd: ROOT });
+      if (runR.code !== 0) throw new Error(`run std/buffer.vl: ${runR.code} ${runR.err}`);
+    } finally {
+      await Deno.remove(tmp, { recursive: true });
     }
   },
 });

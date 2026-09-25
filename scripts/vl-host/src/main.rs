@@ -2682,10 +2682,60 @@ fn has_template_hole(source: &str) -> bool {
     false
 }
 
+/// Stage the two process-wide facts `lintScopeKeyOf` (driver.vl) needs to judge a
+/// RELATIVE path safely: the VL checkout `std_source()` resolves `std:` from
+/// (`vlRootPush`/`vlRootCommit`), and this process's cwd (`cwdPush`/`cwdCommit`) —
+/// what a relative CLI argument resolves against, without which `cd /tmp/proj &&
+/// vl check std/evil.vl` passed as std by spelling alone (D2355 review round 2).
+/// Shared by `cli_pump` (fmt/check/test) and `stage_program` (build/run), so the
+/// three commands agree. An older seed lacks these exports; `.ok()` then leaves
+/// every such rule declining, same as before them.
+fn stage_vl_root_and_cwd(store: &mut Store<()>, inst: &Instance) -> Result<()> {
+    if let (Ok(root_push), Ok(root_commit)) = (
+        inst.get_typed_func::<i32, i32>(&mut *store, "vlRootPush"),
+        inst.get_typed_func::<(), i32>(&mut *store, "vlRootCommit"),
+    ) {
+        let (src, _origin) = std_source();
+        if let StdSource::Dir(d) = src {
+            if let Some(root) = d.parent() {
+                for ch in root.to_string_lossy().chars() {
+                    root_push.call(&mut *store, ch as i32)?;
+                }
+            }
+        }
+        root_commit.call(&mut *store, ())?;
+    }
+    if let (Ok(cwd_push), Ok(cwd_commit)) = (
+        inst.get_typed_func::<i32, i32>(&mut *store, "cwdPush"),
+        inst.get_typed_func::<(), i32>(&mut *store, "cwdCommit"),
+    ) {
+        if let Ok(cwd) = std::env::current_dir() {
+            for ch in cwd.to_string_lossy().chars() {
+                cwd_push.call(&mut *store, ch as i32)?;
+            }
+        }
+        cwd_commit.call(&mut *store, ())?;
+    }
+    Ok(())
+}
+
 /// command-queue pump.
 fn stage_program(store: &mut Store<()>, inst: &Instance, source: &str, source_path: &str) -> Result<()> {
     let src_reset = inst.get_typed_func::<(), i32>(&mut *store, "srcReset")?;
     let src_in = StrIn::probe(store, inst, "src")?;
+    stage_vl_root_and_cwd(store, inst)?;
+    // `checkMemSharedOrigin` (D2355) needs the RAW entry path even when `source`
+    // has no imports at all, in which case the module commit below never runs —
+    // staged unconditionally so `vl build`/`vl run` agree with `vl check`.
+    if let (Ok(cep_push), Ok(cep_commit)) = (
+        inst.get_typed_func::<i32, i32>(&mut *store, "checkEntryPathPush"),
+        inst.get_typed_func::<(), i32>(&mut *store, "checkEntryPathCommit"),
+    ) {
+        for ch in source_path.chars() {
+            cep_push.call(&mut *store, ch as i32)?;
+        }
+        cep_commit.call(&mut *store, ())?;
+    }
 
     // Multi-file module resolution (H3): when the source has a line-leading
     // `import {` (the host CLI's cheap textual gate — an import-free file keeps
@@ -7145,27 +7195,7 @@ fn cli_pump(args: &[String]) -> Result<()> {
     }
     arg_commit.call(&mut store, ())?;
 
-    // The tree `compiler-no-interpolation`/`prefer-interpolation`/`std-comment-audience`
-    // (compiler/lint.vl) scope to — the SAME one `std_source()` resolves `std:` from,
-    // so a worktree pinned by $VL_STD scopes to itself rather than to whichever tree
-    // built this binary. `lintScopeKeyOf` (driver.vl) reads it to relativize an
-    // absolute check target inside this checkout, or decline one outside it — a VL
-    // program cannot ask the filesystem this itself. An older seed lacks the two
-    // exports; `.ok()` then leaves every such rule declining, same as before them.
-    if let (Ok(root_push), Ok(root_commit)) = (
-        inst.get_typed_func::<i32, i32>(&mut store, "vlRootPush"),
-        inst.get_typed_func::<(), i32>(&mut store, "vlRootCommit"),
-    ) {
-        let (src, _origin) = std_source();
-        if let StdSource::Dir(d) = src {
-            if let Some(root) = d.parent() {
-                for ch in root.to_string_lossy().chars() {
-                    root_push.call(&mut store, ch as i32)?;
-                }
-            }
-        }
-        root_commit.call(&mut store, ())?;
-    }
+    stage_vl_root_and_cwd(&mut store, &inst)?;
 
     let next = inst.get_typed_func::<(), i32>(&mut store, "cliNext")?;
     let cmd_path = StrOut::probe(&mut store, &inst, "cliCmdPath")?;

@@ -1244,6 +1244,21 @@ export function vlRootCommit(): i32 {
 }
 let vlCheckoutRoot = ""
 
+// This process's current working directory, staged once at startup like `vlCheckoutRoot`
+// — what a relative CLI argument resolves against, so `lintScopeKeyOf` (D2355) judges
+// it by where it actually is rather than trusting its spelling. "" on a caller (a test
+// harness, an older seed) that never stages it.
+const cwAcc = cpAccNew()
+export function cwdPush(c: i32): i32 {
+  cpAccPush(cwAcc, c)
+  0
+}
+export function cwdCommit(): i32 {
+  vlCwd = cpAccTake(cwAcc)
+  0
+}
+let vlCwd = ""
+
 // The file being checked, RAW (not relativized) — a bare compile with no imports never
 // populates `modKeys`, so this is the only way `checkMemSharedOrigin` (D2355) learns
 // which file it is in. `cli.vl` stages it beside `lintSetPath`; the LSP beside
@@ -1265,16 +1280,33 @@ export function checkEntryPathSet(p: string): i32 {
 }
 let checkEntryPath = ""
 
-// `rawKey` as `lintSetPath` wants it. Already relative (every module-graph key, and a
-// CLI argument run the documented way, from the checkout root) — unchanged, trusting
-// that convention. Absolute and inside the staged checkout root — stripped to the
-// relative remainder. Absolute and outside it (or no root staged) — "", declining.
+// `rawKey` as `lintSetPath` wants it. Relative (a module-graph key, or a CLI argument
+// run the documented way) — unchanged, trusting a lint finding is not a capability.
+// Absolute and inside the staged checkout root — stripped to the relative remainder;
+// outside it, or with no root staged, "".
 export function lintScopeKeyOf(rawKey: string): string {
   if rawKey.length == 0 || rawKey[0] != '/' { return rawKey }
   if vlCheckoutRoot.length == 0 { return "" }
   const p = vlCheckoutRoot + "/"
   if rawKey.length <= p.length || rawKey.slice(0, p.length) != p { return "" }
   rawKey.slice(p.length, rawKey.length)
+}
+
+// `rawKey` as `checkMemSharedOrigin` (D2355) wants it — like `lintScopeKeyOf` above,
+// but a relative key is joined with the staged cwd and normalized rather than trusted
+// by spelling, since this decides a real capability rather than a lint finding: a
+// folder merely named `std/` outside the real checkout must not pass.
+export function checkOriginKeyOf(rawKey: string): string {
+  if rawKey.length == 0 { return rawKey }
+  let abs = rawKey
+  if rawKey[0] != '/' {
+    if vlCwd.length == 0 { return "" }
+    abs = modNormalize(vlCwd + "/" + rawKey)
+  }
+  if vlCheckoutRoot.length == 0 { return "" }
+  const p = vlCheckoutRoot + "/"
+  if abs.length <= p.length || abs.slice(0, p.length) != p { return "" }
+  abs.slice(p.length, abs.length)
 }
 
 // ── lint tier ──────────────────────────────────────────────────────────────────
@@ -1666,7 +1698,7 @@ function checkMemSharedOrigin(): i32 {
     // specifier, never a relative one, so a raw path elsewhere in the graph is
     // always a user file.
     if !std && isEntry {
-      const rel = lintScopeKeyOf(checkEntryPath)
+      const rel = checkOriginKeyOf(checkEntryPath)
       std = rel.length >= 4 && rel.slice(0, 4) == "std/"
     }
     if !std {
