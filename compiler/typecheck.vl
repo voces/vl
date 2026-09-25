@@ -5391,6 +5391,13 @@ function callDeclFnIx(cn: Call) {
     const nd = findFnDeclInRoots(cf.identName)
     if nd >= 0 { return nd }
     if lookup(cf.identName) >= 0 {
+      // A binding bound once to a lambda, never re-pointed, calls that lambda's body; a callee
+      // the frame index does not hold cannot be placed, and stays opaque.
+      const lfr = covarRootFrame(cn.callFn)
+      if cwFramedNode(cn.callFn) && lfr != CW_FR_UNKNOWN {
+        const ld = cwLambdaDeclOf(cf.identName, lfr)
+        if ld >= 0 { return ld }
+      }
       return -1 // a function VALUE: target unknown
     }
     return -2 // an intrinsic named by a bare identifier
@@ -5736,7 +5743,6 @@ function declWritesPath(declIx: i32, args: i32[], key: string): boolean {
   while i < args.length {
     const ak = placeKeyOf(args[i])
     if ak != "" {
-      if key == ak { return true }
       // An index cell of an argument dies to any call that receives the array, with no effect
       // refinement — the deliberately blunt half of this rule. The summaries are `,`-terminated
       // field sub-paths and an index write records nothing in one, so consulting them here would
@@ -5798,12 +5804,11 @@ function popReBarrier() {
   if reScopeBases.length > 0 {
     reScopeBases.pop()
     reNpBases.pop()
+    // An inner loop's reads run again with every iteration of the loops around it, so they
+    // stay logged until the function's outermost loop closes.
     const m = reRdMarks[reRdMarks.length - 1]
     reRdMarks.pop()
-    if reRdMarks.length == 0 {
-      crLoopRdSlots = []
-      crLoopRdNodes = []
-    } else {
+    if reRdMarks.length <= crFnReBase() {
       while crLoopRdSlots.length > m {
         crLoopRdSlots.pop()
         crLoopRdNodes.pop()
@@ -6100,6 +6105,11 @@ function noteCallInvalidations(callIx: i32) {
       if npInvBy[i] < 0 {
         npInvBy[i] = callIx
         crPathCallRetire(i, callIx)
+      } else if i >= crFnNpBase() {
+        // Already ended, but a nested function that read it under the narrowing, or a read
+        // earlier in an enclosing loop, still sees what this writer does.
+        crLoopReadCheck(i, callIx)
+        crCaptureCallCheck(i, callIx)
       }
       narClobKeys.push(npKeys[i])
       narClobTys.push(-1)
@@ -6328,6 +6338,10 @@ let crAfterBank: {[i32]: string} = Map()
 let crBeforeBank: {[i32]: string} = Map()
 let crCondDropBank: {[i32]: string} = Map()
 let crCapWidenBank: {[i32]: string} = Map()
+// Per body, the names `crEscWalk` found escaping it, for this check.
+let crEscNames: {[i32]: string} = Map()
+// How many live records `crCapRec*` hold per handle, so a call of any other name skips the scan.
+let crCapRecCount: {[string]: i32} = Map()
 // Nested functions that kept a captured narrowing, called only by handle in the body making them:
 // that body's function depth, the handle, the name, the type captured, and the function.
 let crCapRecDepths: i32[] = []
@@ -6388,6 +6402,8 @@ function crReset() {
   crBeforeBank = Map()
   crCondDropBank = Map()
   crCapWidenBank = Map()
+  crEscNames = Map()
+  crCapRecCount = Map()
   crCapRecDepths = []
   crCapRecHandles = []
   crCapRecNames = []
@@ -6431,6 +6447,8 @@ function crFnLeave() {
     crCapRecDepths.length > 0
     && crCapRecDepths[crCapRecDepths.length - 1] > crFnBases.length
   ) {
+    const ph = crCapRecHandles[crCapRecHandles.length - 1]
+    crCapRecCount[ph] = (crCapRecCount[ph] ?? 1) - 1
     crCapRecDepths.pop()
     crCapRecHandles.pop()
     crCapRecNames.pop()
@@ -7012,9 +7030,11 @@ function crRetire(name: string, callIx: i32, atLoop: boolean, stmtIx: i32) {
 // its own body may write the binding (D2402).
 function crCaptureWiden(fnIx: i32) {
   if crCurRoot() == fnIx { return 0 }
-  // A body is checked more than once (return inference, then the real pass); the last check's
-  // answer is the one its node types carry, so the bank holds that check's answer alone.
-  crCapWidenBank[fnIx] = ","
+  // A body is checked more than once. The real pass decides alone, so it starts the bank over;
+  // a quiet pass (return inference, a monomorphization re-check of a clone, whose root the
+  // writer analysis cannot see) only adds, and widens what the bank already names.
+  const prior = crCapWidenBank[fnIx] ?? ","
+  if !inferQuiet { crCapWidenBank[fnIx] = "," }
   // A name an enclosing body widened is widened here too: the emitter records a nested
   // function's captures from the frame the whole nest is written in.
   let f = 0
@@ -7041,7 +7061,9 @@ function crCaptureWiden(fnIx: i32) {
       seen.push(nm)
       const wide = crOuterWidest(nm, base)
       if wide >= 0 && wide != lookup(nm) {
-        if crMayBeWritten(nm) && !crCallbackKeeps(fnIx, nm) {
+        if inferQuiet && prior.indexOf("," + nm + ",") >= 0 {
+          declare(nm, wide)
+        } else if crMayBeWritten(nm) && !crCallbackKeeps(fnIx, nm) {
           if escapes < 0 { escapes = crLambdaEscapes(fnIx) }
           if (
             escapes == 0
@@ -7049,7 +7071,9 @@ function crCaptureWiden(fnIx: i32) {
             && !crBodyTests(fnIx, nm)
           ) {
             crCapRecDepths.push(crFnBases.length - 1)
-            crCapRecHandles.push(crLambdaHandle(fnIx))
+            const hd = crLambdaHandle(fnIx)
+            crCapRecHandles.push(hd)
+            crCapRecCount[hd] = (crCapRecCount[hd] ?? 0) + 1
             crCapRecNames.push(nm)
             crCapRecTys.push(lookup(nm))
             crCapRecFns.push(fnIx)
@@ -7086,38 +7110,38 @@ function crLambdaEscapes(fnIx: i32): i32 {
     const pf = P.nodes[crFnIxs[crFnIxs.length - 2]]
     if pf is FuncDecl { body = pf.fnBody }
   }
-  if crHandleEscapesIn(body, h, false) { return 1 }
+  let esc = crEscNames[body] ?? ""
+  if esc == "" {
+    esc = crEscWalk(body, false, ",")
+    crEscNames[body] = esc
+  }
+  if esc.indexOf("," + h + ",") >= 0 { return 1 }
   0
 }
 
-function crHandleEscapesIn(ix: i32, h: string, nested: boolean): boolean {
-  if ix < 0 || ix >= P.nodes.length { return false }
+// One walk of a body, collecting every name used other than as that body's own callee: an
+// identifier in any other position, or any identifier inside a nested function.
+function crEscWalk(ix: i32, nested: boolean, acc: string): string {
+  if ix < 0 || ix >= P.nodes.length { return acc }
   const n = P.nodes[ix]
-  if n is Ident { return n.identName == h }
-  if n is FuncDecl { return crHandleEscapesIn(n.fnBody, h, true) }
+  if n is Ident { return crwAddName(acc, n.identName) }
+  if n is FuncDecl { return crEscWalk(n.fnBody, true, acc) }
   let skip = -1
   if n is Call {
-    const cf = P.nodes[n.callFn]
-    if cf is Ident {
-      if cf.identName == h {
-        if nested { return true }
-        skip = n.callFn
-      }
-    }
+    if !nested && P.nodes[n.callFn] is Ident { skip = n.callFn }
   }
+  let out = acc
   let cur = ix
   while cur >= 0 {
     const kids = nodeSpineChildren(cur)
     let k = 0
     while k < kids.length {
-      if kids[k] != skip && crHandleEscapesIn(kids[k], h, nested) {
-        return true
-      }
+      if kids[k] != skip { out = crEscWalk(kids[k], nested, out) }
       k = k + 1
     }
     cur = elseIfLink(cur)
   }
-  false
+  out
 }
 
 // Whether the nested function `fnIx` tests `name` itself (`name is T`, `name != null`), and so
@@ -7177,6 +7201,7 @@ function crCapRecCheck(callIx: i32) {
   const h = calleeNameOf(callIx)
   const cn = P.nodes[callIx]
   if !(cn is Call) || h == "?" { return 0 }
+  if (crCapRecCount[h] ?? 0) <= 0 { return 0 }
   let r = 0
   while r < crCapRecHandles.length {
     if crCapRecHandles[r] == h && crCapRecDepths[r] == crFnBases.length {
@@ -7224,25 +7249,69 @@ function crOuterWidest(name: string, base: i32): i32 {
   widest
 }
 
-// Whether the lambda `fnIx` is the in-place argument of an array's `map` or `filter`, which runs
-// it during the call and keeps no reference, and its body neither writes the place keyed `key`
-// nor calls what may.
+// Whether the lambda `fnIx`, written in place as a call's argument, runs only inside that call
+// and nothing then writes the place keyed `key`: the callee is an array's `map`/`filter`, or a
+// declaration whose body only ever calls that parameter, and the call reaches no writer. Its
+// own body must neither write `key` nor call what may.
 function crCallbackKeeps(fnIx: i32, key: string): boolean {
   if fnIx < 0 || fnIx >= P.nodes.length { return false }
+  const fd = P.nodes[fnIx]
+  if !(fd is FuncDecl) { return false }
+  if (
+    crSubtreeAssigns(fd.fnBody, key)
+    || crFirstWritingCall(fd.fnBody, key) >= 0
+  ) {
+    return false
+  }
   crwEnsure(crCurRoot())
   const c = crwArgCall[fnIx] ?? -1
   if c < 0 || c >= P.nodes.length { return false }
   const cn = P.nodes[c]
   if cn is Call {
+    const d = callDeclFnIx(cn)
     const cf = P.nodes[cn.callFn]
     if cf is Member {
-      if cf.memProp != "map" && cf.memProp != "filter" { return false }
-      if callDeclFnIx(cn) != -2 { return false }
-      const fd = P.nodes[fnIx]
-      if fd is FuncDecl {
-        if crSubtreeAssigns(fd.fnBody, key) { return false }
-        return crFirstWritingCall(fd.fnBody, key) < 0
+      if (cf.memProp == "map" || cf.memProp == "filter") && d == -2 {
+        return true
       }
+    }
+    if d < 0 { return false }
+    const args = callArgPlaces(cn)
+    let at = -1
+    let i = 0
+    while i < args.length {
+      if peelParenIx(args[i]) == fnIx { at = i }
+      i = i + 1
+    }
+    if at < 0 || !crParamOnlyCalled(d, at) { return false }
+    return !callMayWrite(c, key)
+  }
+  false
+}
+
+// Whether parameter `pi` of the declaration `d` is only ever called by name in its body — not
+// stored, passed, returned, shadowed, or mentioned inside a nested function.
+function crParamOnlyCalled(d: i32, pi: i32): boolean {
+  const fd = P.nodes[d]
+  if fd is FuncDecl {
+    if pi >= fd.fnParams.length { return false }
+    const p = P.nodes[fd.fnParams[pi]]
+    if p is Param {
+      const bound: string[] = []
+      fnBoundNames(d, bound)
+      let n = 0
+      let b = 0
+      while b < bound.length {
+        if bound[b] == p.parName { n = n + 1 }
+        b = b + 1
+      }
+      if n != 1 { return false }
+      let esc = crEscNames[fd.fnBody] ?? ""
+      if esc == "" {
+        esc = crEscWalk(fd.fnBody, false, ",")
+        crEscNames[fd.fnBody] = esc
+      }
+      return esc.indexOf("," + p.parName + ",") < 0
     }
   }
   false
@@ -18307,6 +18376,14 @@ function cwBuildFrames() {
   cwDeclIndex()
   cwFramesBuilt = true
   0
+}
+
+// Whether node `ix` is in the frame index, so a frame question about it has an answer rather
+// than the match-anything `CW_FR_UNKNOWN`.
+function cwFramedNode(ix: i32): boolean {
+  if ix < 0 { return false }
+  cwBuildFrames()
+  ix < cwFrameOf.length
 }
 
 // The frame the name at `ix` resolves in: walk out from `ix`'s own frame to the first that

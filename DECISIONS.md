@@ -7891,6 +7891,9 @@ conservative rule is the sound floor it would refine.
   re-test the diagnostic asks for narrows again; a read later in the same statement is still
   refused. A narrowing of an enclosing function stays a refusal, since the emitter retires only
   the function it is lowering.
+* *A call to a `const`-bound lambda is a call to its body* for the path rule, as a declared
+  function's is, so a closure that writes nothing ends nothing; and handing the narrowed value
+  itself to a callee ends nothing, since the callee holds the value, not the place.
 * *A declared operator is a call* for the path rule too (D2400): its operands are its arguments,
   the declaration is the one the checker resolved (every declaration of the operator where
   none is resolved yet), and an operator closure field is opaque, as a call through a closure
@@ -7898,14 +7901,16 @@ conservative rule is the sound floor it would refine.
 * *A path fact in a condition* is dropped when a later call in the condition may write it
   (D2404), exactly as a bare name's is.
 * *In a loop*, a call that may write a path narrowed outside the loop is refused when the loop
-  read the path before it (D2403). This differs from the bare-name rule, which retires before
+  read the path before it, an inner loop's reads included (D2403). This differs from the bare-name rule, which retires before
   the loop: which call may write a path depends on checked types the loop body does not yet
   have. A re-test inside the loop runs.
 * *A nested function made under a narrowing* (D2402) of a binding some function may write keeps
   the narrowing only when it is called by its handle in the body that makes it and neither
   writes nor tests the binding itself; each such call is refused unless the binding still holds
-  the captured type there. A lambda handed straight to an array's `map`/`filter` keeps it too.
-  Otherwise the body reads the declared type. A path a nested function read under the
+  the captured type there. A lambda handed straight to an array's `map`/`filter` keeps it too,
+  and so does one handed to a declared function whose body only ever calls that parameter, when
+  the call reaches no writer (`callMayWrite` on the call itself). Otherwise the body reads the
+  declared type. A clone a generic's instance makes of the lambda answers what it did. A path a nested function read under the
   narrowing makes a later writing call in the same function refused; a path captured by a
   closure that escapes is D2407, which needs a ruling on whether path narrowings reach nested
   functions at all.
