@@ -58,11 +58,14 @@ import {
   asgNarTyIxOf,
   atomicIntrinsicIsVoid,
   cUserTypesVer,
+  callRetireAfterOf,
+  callRetireBeforeOf,
   canonRewroteNode,
   canonTyIxOf,
   canonUnionKey,
   canonUnionKeyOfName,
   canonUnionKeyOfTy,
+  condNarrowDropOf,
   covarDeclFrame,
   covarValueWriteState,
   eqCoreKindOfTyToken,
@@ -4011,6 +4014,7 @@ export function criWalkBlock(blockIx: i32, i: i32, tail: boolean) {
       // value-if union return types from its arms. Lambda-gated to leave named-function
       // inference unchanged; an arm of an `if` that is not itself the tail is a statement.
       const last = k == stmts.length - 1
+      preStmtNarrow(stmts[k])
       if (
         tail
         && last
@@ -4638,6 +4642,7 @@ export function capScan(ix: i32, bound: {[string]: i32}, caps: string[]) {
     const savedBlkTop = narrowTop
     const mark = capTrailName.length
     while i < stmts.length {
+      if cnRecording { preStmtNarrow(stmts[i]) }
       capScan(stmts[i], bound, caps)
       // A guard `if` with no else whose then-branch always leaves narrows the rest of the
       // block, so a closure written below the guard is inside that narrowing exactly as one
@@ -6535,6 +6540,10 @@ function pushNarrowRep(name: string, variant: string, ty: i32, set: i32) {
     if name.indexOf(".") >= 0 { return narrowTop }
     if name.indexOf("[") >= 0 { return narrowTop }
   }
+  // The names the checker dropped from the condition being lowered (`condNarrowDropOf`).
+  if narrowDropWin != "" {
+    if narrowDropWin.indexOf("," + name + ",") >= 0 { return narrowTop }
+  }
   if narrowTop < narrowNames.length {
     narrowNames[narrowTop] = name
     narrowVariants[narrowTop] = variant
@@ -7397,9 +7406,11 @@ function tailBlockWidensAtomToStr(blockIx: i32, fnIx: i32) {
     if n == 0 { return false }
     let i = 0
     while i < n - 1 {
+      preStmtNarrow(stmts[i])
       pushPostGuardNarrow(stmts[i], fnIx)
       i = i + 1
     }
+    preStmtNarrow(stmts[n - 1])
     return tailStmtWidensAtomToStr(stmts[n - 1], fnIx)
   }
   false
@@ -8450,6 +8461,7 @@ function blockHasStrOpScan(blockIx: i32, fnIx: i32) {
     const stmts = b.blkStmts
     let i = 0
     while i < stmts.length {
+      preStmtNarrow(stmts[i])
       const s = P.nodes[stmts[i]]
       if s is LetDecl {
         if exprHasStrOp(s.letInit, fnIx) { return true }
@@ -14277,11 +14289,37 @@ export function indexPlaceNonNull(idxIx: i32) {
   v != "null"
 }
 
+// The names the condition being lowered may not narrow, because a call inside it may write
+// them (D2390): `,`-joined with a leading `,`, or "" outside any such condition.
+let narrowDropWin = ""
+
+// Open the decline window for condition `condIx0` on top of any enclosing one; returns the
+// window to restore.
+function openCondDropWin(condIx0: i32): string {
+  const saved = narrowDropWin
+  const d = condNarrowDropOf(condIx0)
+  if d != "" {
+    if narrowDropWin == "" {
+      narrowDropWin = d
+    } else {
+      narrowDropWin = narrowDropWin + d.slice(1, d.length)
+    }
+  }
+  saved
+}
+
 // If the `if` condition at `condIx` is `n is Variant` over a bare union identifier `n`,
 // push the narrowing (`narrowNames`/`narrowVariants`) so the then-branch's `n.field` reads
 // downcast through the box, and return true; otherwise leave the stack untouched and
 // return false. A non-identifier receiver (`f(x) is A`) has no stable name and stays un-narrowed.
 export function setNarrowFromCond(condIx0: i32, fnIx: i32) {
+  const saved = openCondDropWin(condIx0)
+  const r = setNarrowFromCondRaw(condIx0, fnIx)
+  narrowDropWin = saved
+  r
+}
+
+function setNarrowFromCondRaw(condIx0: i32, fnIx: i32) {
   // A parenthesized condition guards identically (`if (x is A)` ≡ `if x is A`), and
   // the checker's narrowing collectors already peel `Paren` — match them here so the
   // emitter narrows every branch the checker proved narrowed. Every matcher below
@@ -14644,6 +14682,13 @@ function condElseMayNarrow(condIx: i32): boolean {
 // i32` minus `i32` is `string`, which unboxes), `== null` strips `null`, and `!= null`
 // pins `null`. Struct unions keep their existing (no else-narrowing) behavior.
 export function setNarrowFromCondElse(condIx0: i32, fnIx: i32) {
+  const saved = openCondDropWin(condIx0)
+  const r = setNarrowFromCondElseRaw(condIx0, fnIx)
+  narrowDropWin = saved
+  r
+}
+
+function setNarrowFromCondElseRaw(condIx0: i32, fnIx: i32) {
   // Peel `Paren` exactly like `setNarrowFromCond` — the else-arm of `if (x is A)`
   // complement-narrows the same as the bare spelling.
   const condIx = unwrapParen(condIx0)
@@ -14946,6 +14991,27 @@ export function setNarrowFromCondElse(condIx0: i32, fnIx: i32) {
   false
 }
 
+// Retire every name in `names` — the checker's call retirements, mirrored (D2390). A name a
+// closure writes lives in a cell by then, `v[0]` for a `let` and `v$cb[0]` for a parameter or a
+// loop variable (`cboxWalk`), and its narrowing is keyed on that cell.
+function retireNarrowNames(names: string[]) {
+  let i = 0
+  while i < names.length {
+    retireNarrowFor(names[i])
+    retireNarrowForIndexCells(names[i])
+    retireNarrowForIndexCells(names[i] + "$cb")
+    i = i + 1
+  }
+  0
+}
+
+// Before a statement: a loop whose body may call a writer of a narrowed name ends that
+// narrowing before it starts, as the checker did. Every block walk calls it, as it calls
+// `pushPostGuardNarrow` after.
+export function preStmtNarrow(stmtIx: i32) {
+  retireNarrowNames(callRetireBeforeOf(stmtIx))
+}
+
 // Rewind the narrowing stack depth back to `n` (drop bindings a branch pushed). The
 // arrays keep their backing slots — only the logical depth changes, so no `.pop()`.
 export function restoreNarrow(n: i32) {
@@ -14958,6 +15024,9 @@ export function restoreNarrow(n: i32) {
 // narrowing an explicit else-arm would. `break`/`continue` leave the path exactly as
 // `return` does and are how a loop-body guard is spelled, so both are checked here too.
 export function pushPostGuardNarrow(stmtIx: i32, fnIx: i32) {
+  // A call inside the statement that may write a narrowed name ended it there, before any
+  // join or residual below re-narrows it (D2390).
+  retireNarrowNames(callRetireAfterOf(stmtIx))
   const s = P.nodes[stmtIx]
   // The arm JOIN first: it describes the code below this `if` however the residual turns out,
   // and the checker typed those reads with it, so the rep has to follow (D1846).

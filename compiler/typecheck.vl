@@ -455,6 +455,10 @@ const CODE_UFCS_NOT_METHOD = "ufcs-not-method"
 // `step`: a non-zero one flips sign, a `0` has no such fix; it never parses the sentence.
 const CODE_RANGE_NEVER_RUNS = "range-never-runs"
 
+// D2390 — a read of a bare name whose narrowing a call ended: refused in the call's own
+// statement, or a type error in a later one naming the call. No payload.
+const CODE_NARROWING_ENDED_BY_CALL = "narrowing-ended-by-call"
+
 // ── checker state (one struct, held in the global `T`) ───────────────────────
 
 // `tys` is the type arena; `scopes` the scope chain of `name → type-index` maps (index 0
@@ -4043,6 +4047,7 @@ export function initChecker() {
   asgDeclEpochs = []
   asgDeclFrames = []
   narFnEpoch = 0
+  crReset()
   reScopeBases = []
   reNpBases = []
   guardNames = []
@@ -5889,10 +5894,11 @@ function writeReNarrowTy(dcl: i32, rt: i32) {
 // are checked, so `f(o.v.length, o)` still reads `o.v` under the narrowing in force as that
 // argument is evaluated.
 function noteCallInvalidations(callIx: i32) {
+  crNoteCallBare(callIx)
   if npKeys.length == 0 { return 0 }
   let i = 0
   while i < npKeys.length {
-    if callInvalidatesNarrowedPath(callIx, npKeys[i]) {
+    if callMayWrite(callIx, npKeys[i]) {
       // The mark is first-cause-wins — a write's attribution outranks a call's, which is what
       // the diagnostic reads. The LEDGER row is unconditional, because the arm JOIN reads the
       // two arms separately and a write in one must not hide a call in the other (D1849).
@@ -5906,6 +5912,802 @@ function noteCallInvalidations(callIx: i32) {
     i = i + 1
   }
   0
+}
+
+// ── a call that may reassign a narrowed binding ends the narrowing (D2390) ─────────────────
+
+// May the call at `callIx` write the place keyed `key` — a bare name, or a path such as `o.v` or
+// `xs[0]`? The one question every narrowing-drop site asks, answering true when unsure, so a
+// finer effects summary can replace the answer without touching a caller. DECISIONS.md, "A call
+// that may reassign a narrowed binding ends the narrowing".
+function callMayWrite(callIx: i32, key: string): boolean {
+  if isPathKey(key) { return callInvalidatesNarrowedPath(callIx, key) }
+  crCallReaches(callIx, key)
+}
+
+// The function bodies being checked, innermost last: the scope depth each body starts at, since
+// a narrowing below it belongs to an enclosing function, and the root its closures are read from.
+let crFnBases: i32[] = []
+let crFnRoots: i32[] = []
+let crProgRoot = -1
+// The statements being checked, innermost last, with the function depth each belongs to and
+// where its pending and read rows start. A statement is the unit the emitter retires at, so it
+// is the unit a read is refused in.
+let crStmtIxs: i32[] = []
+let crStmtFns: i32[] = []
+let crStmtPend: i32[] = []
+let crStmtRd: i32[] = []
+// Names a call retired inside a statement still being checked, with the call and the narrowed
+// type. A read later in that statement is refused.
+let crPendNames: string[] = []
+let crPendCalls: i32[] = []
+let crPendNarTys: i32[] = []
+// Every retirement, for the note on a later misuse: the name, the call, the narrowed type, the
+// type it reads at now, and the root it happened under.
+let crRetNames: string[] = []
+let crRetCalls: i32[] = []
+let crRetNarTys: i32[] = []
+let crRetWideTys: i32[] = []
+let crRetRoots: i32[] = []
+let crRetLoops: boolean[] = []
+// Reads of a retired name in the statements still being checked: the row of the table above,
+// and the reading identifier.
+let crRdRet: i32[] = []
+let crRdIx: i32[] = []
+// The emitter's half, keyed by node: names retired after a statement, before a loop, and dropped
+// from a condition's narrowings. Each value is `,`-joined with a leading `,`.
+let crAfterBank: {[i32]: string} = Map()
+let crBeforeBank: {[i32]: string} = Map()
+let crCondDropBank: {[i32]: string} = Map()
+let crCondDropN = 0
+const crNoNames: string[] = []
+
+// The writer analysis of root `crwRoot`: its nested functions, each one's binding name ("" when
+// it is not bound by a `const`, a `let`, an assignment or its own name), the names written and
+// mentioned anywhere inside it, and every identifier use in the root with its role.
+let crwRoot = -2
+let crwFns: i32[] = []
+let crwFnHandle: string[] = []
+let crwFnWrites: string[] = []
+let crwFnMentions: string[] = []
+let crwUseNames: string[] = []
+let crwUseKinds: i32[] = []
+let crwUseFns: i32[] = []
+let crwBound = ","
+let crwStack: i32[] = []
+let crwCallee: {[i32]: boolean} = Map()
+let crwAsgLhs: {[i32]: boolean} = Map()
+let crwBindOf: {[i32]: string} = Map()
+// Per `root#name`: 0 when no closure writes the name, 1 when every function that can reach a
+// writer is only ever called by name, 2 when one escaped. The names such calls use ride beside.
+let crInfoMemo: {[string]: i32} = Map()
+let crHandleMemo: {[string]: string} = Map()
+
+function crReset() {
+  crFnBases = []
+  crFnRoots = []
+  crProgRoot = -1
+  crStmtIxs = []
+  crStmtFns = []
+  crStmtPend = []
+  crStmtRd = []
+  crPendNames = []
+  crPendCalls = []
+  crPendNarTys = []
+  crRetNames = []
+  crRetCalls = []
+  crRetNarTys = []
+  crRetWideTys = []
+  crRetRoots = []
+  crRetLoops = []
+  crRdRet = []
+  crRdIx = []
+  crAfterBank = Map()
+  crBeforeBank = Map()
+  crCondDropBank = Map()
+  crCondDropN = 0
+  crwRoot = -2
+  crInfoMemo = Map()
+  crHandleMemo = Map()
+  0
+}
+
+// Enter a function body, before its scope is pushed. A registered top-level function is its own
+// root; a nested function or a lambda reads the closures of the root it sits in.
+function crFnEnter(fnIx: i32) {
+  crFnBases.push(T.scopes.length)
+  let root = crProgRoot
+  if crFnRoots.length > 0 { root = crFnRoots[crFnRoots.length - 1] }
+  const fd = P.nodes[fnIx]
+  if fd is FuncDecl {
+    if fd.fnName != "" && (fnDeclIx[fd.fnName] ?? -1) == fnIx { root = fnIx }
+  }
+  crFnRoots.push(root)
+  0
+}
+
+function crFnLeave() {
+  if crFnBases.length > 0 {
+    crFnBases.pop()
+    crFnRoots.pop()
+  }
+  0
+}
+
+function crFnBase(): i32 {
+  if crFnBases.length == 0 { return 0 }
+  crFnBases[crFnBases.length - 1]
+}
+
+function crCurRoot(): i32 {
+  if crFnRoots.length == 0 { return crProgRoot }
+  crFnRoots[crFnRoots.length - 1]
+}
+
+// Enter and leave one statement of a block. Leaving drops the statement's pending names — the
+// emitter has retired them by then — and its read rows.
+function crStmtEnter(stmtIx: i32) {
+  crStmtIxs.push(stmtIx)
+  crStmtFns.push(crFnBases.length)
+  crStmtPend.push(crPendNames.length)
+  crStmtRd.push(crRdRet.length)
+  0
+}
+
+function crStmtLeave() {
+  const top = crStmtIxs.length - 1
+  if top < 0 { return 0 }
+  const pb = crStmtPend[top]
+  while crPendNames.length > pb {
+    crPendNames.pop()
+    crPendCalls.pop()
+    crPendNarTys.pop()
+  }
+  const rb = crStmtRd[top]
+  while crRdRet.length > rb {
+    crRdRet.pop()
+    crRdIx.pop()
+  }
+  crStmtIxs.pop()
+  crStmtFns.pop()
+  crStmtPend.pop()
+  crStmtRd.pop()
+  0
+}
+
+// `names` with `name` appended unless already present; both `,`-joined with a leading `,`.
+function crwAddName(names: string, name: string): string {
+  if names.indexOf("," + name + ",") >= 0 { return names }
+  names + name + ","
+}
+
+// Build the writer analysis of `root` unless it is the one already built.
+function crwEnsure(root: i32) {
+  if root == crwRoot { return 0 }
+  crwRoot = root
+  crwFns = []
+  crwFnHandle = []
+  crwFnWrites = []
+  crwFnMentions = []
+  crwUseNames = []
+  crwUseKinds = []
+  crwUseFns = []
+  crwBound = ","
+  crwStack = []
+  crwCallee = Map()
+  crwAsgLhs = Map()
+  crwBindOf = Map()
+  if root < 0 || root >= P.nodes.length { return 0 }
+  const r = P.nodes[root]
+  if r is FuncDecl {
+    crwBindParams(r)
+    crwVisit(r.fnBody)
+  } else {
+    crwVisit(root)
+  }
+  0
+}
+
+function crwBindParams(fd: FuncDecl) {
+  let i = 0
+  while i < fd.fnParams.length {
+    const p = P.nodes[fd.fnParams[i]]
+    if p is Param { crwBound = crwAddName(crwBound, p.parName) }
+    i = i + 1
+  }
+  0
+}
+
+// One walk of the root. A nested function is recorded on entry, so a use inside it can say
+// which one holds it; a write or mention inside it counts for every function around it too.
+function crwVisit(ix: i32) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const n = P.nodes[ix]
+  if n is FuncDecl {
+    const j = crwFns.length
+    crwFns.push(ix)
+    let h = n.fnName
+    if h == "" { h = crwBindOf[ix] ?? "" }
+    crwFnHandle.push(h)
+    crwFnWrites.push(",")
+    crwFnMentions.push(",")
+    if n.fnName != "" { crwBound = crwAddName(crwBound, n.fnName) }
+    crwBindParams(n)
+    crwStack.push(j)
+    crwVisit(n.fnBody)
+    crwStack.pop()
+    return 0
+  }
+  if n is Ident {
+    let kind = 0
+    if crwAsgLhs[ix] ?? false { kind = 2 }
+    if crwCallee[ix] ?? false { kind = 1 }
+    crwUseNames.push(n.identName)
+    crwUseKinds.push(kind)
+    let inner = -1
+    if crwStack.length > 0 { inner = crwStack[crwStack.length - 1] }
+    crwUseFns.push(inner)
+    let s = 0
+    while s < crwStack.length {
+      const f = crwStack[s]
+      crwFnMentions[f] = crwAddName(crwFnMentions[f], n.identName)
+      s = s + 1
+    }
+    return 0
+  }
+  if n is BinExpr {
+    if n.binOp == "=" {
+      const l = P.nodes[n.binLeft]
+      if l is Ident {
+        crwAsgLhs[n.binLeft] = true
+        let s = 0
+        while s < crwStack.length {
+          const f = crwStack[s]
+          crwFnWrites[f] = crwAddName(crwFnWrites[f], l.identName)
+          s = s + 1
+        }
+        if P.nodes[n.binRight] is FuncDecl {
+          crwBindOf[n.binRight] = l.identName
+        }
+      }
+    }
+  } else if n is LetDecl {
+    crwBound = crwAddName(crwBound, n.letName)
+    if n.letInit >= 0 {
+      if P.nodes[n.letInit] is FuncDecl { crwBindOf[n.letInit] = n.letName }
+    }
+  } else if n is Call {
+    if P.nodes[n.callFn] is Ident { crwCallee[n.callFn] = true }
+  } else if n is ForRange {
+    crwBound = crwAddName(crwBound, n.frVar)
+  } else if n is ForIn {
+    crwBound = crwAddName(crwBound, n.fiVar)
+    if n.fiVar2 != "" { crwBound = crwAddName(crwBound, n.fiVar2) }
+  }
+  // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
+  let cur = ix
+  while cur >= 0 {
+    const kids = nodeSpineChildren(cur)
+    let k = 0
+    while k < kids.length {
+      crwVisit(kids[k])
+      k = k + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  0
+}
+
+// Does the `,`-joined `mentions` hold any name of the `,`-joined `handles`?
+function crwMentionsAny(mentions: string, handles: string): boolean {
+  const hs = weSplit(handles)
+  let i = 0
+  while i < hs.length {
+    if mentions.indexOf("," + hs[i] + ",") >= 0 { return true }
+    i = i + 1
+  }
+  false
+}
+
+// Whether a closure of the current root writes `name`, and whether one that can reach such a
+// writer escaped: 0 / 1 / 2 as `crInfoMemo` documents. A reacher is a function that writes the
+// name or mentions a reacher's name; it escapes when it is unbound, or its name is used other
+// than as a callee, an assignment target, or inside another reacher.
+function crInfoOf(name: string): i32 {
+  const root = crCurRoot()
+  const key = i32ToStr(root) + "#" + name
+  const hit = crInfoMemo[key]
+  if hit is i32 { return hit }
+  crwEnsure(root)
+  let info = 0
+  let handles = ","
+  const reach: boolean[] = []
+  const wkey = "," + name + ","
+  let any = false
+  let j = 0
+  while j < crwFns.length {
+    const w = crwFnWrites[j].indexOf(wkey) >= 0
+    reach.push(w)
+    if w {
+      any = true
+      if crwFnHandle[j] != "" { handles = crwAddName(handles, crwFnHandle[j]) }
+    }
+    j = j + 1
+  }
+  if any {
+    info = 1
+    let changed = true
+    while changed {
+      changed = false
+      let q = 0
+      while q < crwFns.length {
+        if !reach[q] && crwMentionsAny(crwFnMentions[q], handles) {
+          reach[q] = true
+          changed = true
+          if crwFnHandle[q] != "" {
+            handles = crwAddName(handles, crwFnHandle[q])
+          }
+        }
+        q = q + 1
+      }
+    }
+    let e = 0
+    while e < crwFns.length && info == 1 {
+      if reach[e] && crwFnHandle[e] == "" { info = 2 }
+      e = e + 1
+    }
+    let u = 0
+    while u < crwUseNames.length && info == 1 {
+      if handles.indexOf("," + crwUseNames[u] + ",") >= 0 {
+        if crwUseKinds[u] == 0 {
+          const uf = crwUseFns[u]
+          if uf < 0 || !reach[uf] { info = 2 }
+        }
+      }
+      u = u + 1
+    }
+  }
+  crInfoMemo[key] = info
+  crHandleMemo[key] = handles
+  info
+}
+
+// The bare-name half of `callMayWrite`: the call names a function that can reach a writer of
+// `name`, or a writer escaped and the call is not one that provably runs none of it. An operator
+// that dispatched to a declaration is a call naming no function, so only an escape reaches.
+function crCallReaches(callIx: i32, name: string): boolean {
+  if callIx < 0 || callIx >= P.nodes.length { return false }
+  const cn = P.nodes[callIx]
+  if cn is Call { return crCallNodeReaches(cn, callIx, name) }
+  crInfoOf(name) == 2
+}
+
+// `crCallReaches` for a `Call`: its callee named by a reacher's name (bare or as a method), a
+// function written in place and called at once, or an escape the call does not rule out.
+function crCallNodeReaches(cn: Call, callIx: i32, name: string): boolean {
+  const info = crInfoOf(name)
+  if info == 0 { return false }
+  const hs = crHandleMemo[i32ToStr(crCurRoot()) + "#" + name] ?? ","
+  const cname = calleeNameOf(callIx)
+  if cname != "?" && hs.indexOf("," + cname + ",") >= 0 { return true }
+  if P.nodes[cn.callFn] is FuncDecl { return true }
+  info == 2 && !crCallBenign(cn, name)
+}
+
+// A call that runs no user code and whose function-valued arguments, if any, are lambdas written
+// in place that call only such calls and do not write `name`. A callee named by a binding of the
+// root counts as user code even before that binding is in scope.
+function crCallBenign(cn: Call, name: string): boolean {
+  const cf = P.nodes[cn.callFn]
+  if cf is Ident {
+    if crwBound.indexOf("," + cf.identName + ",") >= 0 { return false }
+  }
+  if callDeclFnIx(cn) != -2 { return false }
+  let i = 0
+  while i < cn.callArgs.length {
+    const a = cn.callArgs[i]
+    if a >= 0 && a < P.nodes.length {
+      const an = P.nodes[a]
+      if an is FuncDecl {
+        if !crSubtreeBenign(an.fnBody, name) { return false }
+      } else if crArgMayBeFn(a) {
+        return false
+      }
+    }
+    i = i + 1
+  }
+  true
+}
+
+// Whether the subtree at `ix` neither writes `name` nor makes a call `crCallBenign` refuses.
+function crSubtreeBenign(ix: i32, name: string): boolean {
+  if ix < 0 || ix >= P.nodes.length { return true }
+  const n = P.nodes[ix]
+  if n is BinExpr {
+    if n.binOp == "=" {
+      const l = P.nodes[n.binLeft]
+      if l is Ident {
+        if l.identName == name { return false }
+      }
+    }
+  } else if n is Call {
+    if !crCallBenign(n, name) { return false }
+  }
+  let cur = ix
+  while cur >= 0 {
+    const kids = nodeSpineChildren(cur)
+    let k = 0
+    while k < kids.length {
+      if !crSubtreeBenign(kids[k], name) { return false }
+      k = k + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  true
+}
+
+// Could the argument at `a` hold a function? A literal cannot; anything whose type is not yet
+// known is assumed to.
+function crArgMayBeFn(a: i32): boolean {
+  const an = P.nodes[a]
+  if (
+    an is NumLit
+    || an is StrLit
+    || an is BoolLit
+    || an is NullLit
+    || an is CharLit
+  ) {
+    return false
+  }
+  let t = nodeTyOf(a)
+  if t < 0 {
+    if an is Ident { t = lookup(an.identName) }
+  }
+  if t < 0 { return true }
+  crTyHasFn(t)
+}
+
+function crTyHasFn(t: i32): boolean {
+  if t < 0 || t >= T.tys.length { return false }
+  if tyIxIsFunc(t) || tyIxIsFunc(nonNullTy(t)) { return true }
+  const tt = T.tys[t]
+  if tt is TyUnion {
+    let i = 0
+    while i < tt.uMembers.length {
+      if crTyHasFn(tt.uMembers[i]) { return true }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// The bare names narrowed in the current function, each once.
+function crLiveNames(): string[] {
+  const out: string[] = []
+  const base = crFnBase()
+  let i = 0
+  while i < asgDeclKeys.length {
+    if asgDeclDepths[i] >= base {
+      if !nameInList(out, asgDeclKeys[i]) { out.push(asgDeclKeys[i]) }
+    }
+    i = i + 1
+  }
+  out
+}
+
+// The first bank row of `name` at depth `d`: the widest type banked there.
+function crFirstBank(name: string, d: i32): i32 {
+  let i = 0
+  while i < asgDeclKeys.length {
+    if asgDeclKeys[i] == name && asgDeclDepths[i] == d { return i }
+    i = i + 1
+  }
+  -1
+}
+
+// The type `name` reads at once every narrowing layer of the current function is gone, or -1
+// when the innermost binding is not a narrowing. Fills `depths` with the layers to rewrite.
+function crChainWidest(name: string, depths: i32[]): i32 {
+  const ds = scopeDepthsOf[name]
+  if ds == null { return -1 }
+  const base = crFnBase()
+  let widest = -1
+  let j = ds.length - 1
+  while j >= 0 {
+    const d = ds[j]
+    if d < base { return widest }
+    const e = crFirstBank(name, d)
+    if e < 0 { return widest }
+    widest = asgDeclTys[e]
+    depths.push(d)
+    j = j - 1
+  }
+  widest
+}
+
+// End the narrowing of `name` because of the call at `callIx`, in place, as a falsifying write
+// does. `atLoop` false banks it for the emitter after the statement being checked and refuses a
+// read later in that statement; true banks it before the loop `stmtIx`, which has not begun.
+function crRetire(name: string, callIx: i32, atLoop: boolean, stmtIx: i32) {
+  const depths: i32[] = []
+  const wide = crChainWidest(name, depths)
+  if wide < 0 { return 0 }
+  const cur = lookup(name)
+  if cur < 0 || cur == wide { return 0 }
+  let k = 0
+  while k < depths.length {
+    T.scopes[depths[k]][name] = wide
+    k = k + 1
+  }
+  // The arm join and the post-guard residual read this row exactly as a retiring write's. Its
+  // entry type is the widest, not `cur`: a call in a condition retires a narrowing that only
+  // part of the condition held, which is no type the `if` itself begins at.
+  narClobKeys.push(name)
+  narClobTys.push(wide)
+  narClobPrev.push(wide)
+  narClobDepths.push(T.scopes.length)
+  narClobRetired.push(1)
+  crRetNames.push(name)
+  crRetCalls.push(callIx)
+  crRetNarTys.push(cur)
+  crRetWideTys.push(wide)
+  crRetRoots.push(crCurRoot())
+  crRetLoops.push(atLoop)
+  if atLoop {
+    crBeforeBank[stmtIx] = crwAddName(crBeforeBank[stmtIx] ?? ",", name)
+  } else {
+    crPendNames.push(name)
+    crPendCalls.push(callIx)
+    crPendNarTys.push(cur)
+    crAfterBank[stmtIx] = crwAddName(crAfterBank[stmtIx] ?? ",", name)
+  }
+  0
+}
+
+// The bare-name narrowings the call at `callIx` ends — a `Call`, or an operator that dispatched
+// to a declaration. Runs after the call is checked, with the statement holding it still open.
+function crNoteCallBare(callIx: i32) {
+  if asgDeclKeys.length == 0 || crStmtIxs.length == 0 { return 0 }
+  // A body checked with no statement of its own open (a monomorphization re-check) banks
+  // nothing: the open statement is its caller's.
+  if crStmtFns[crStmtFns.length - 1] != crFnBases.length { return 0 }
+  const names = crLiveNames()
+  let i = 0
+  while i < names.length {
+    if callMayWrite(callIx, names[i]) {
+      crRetire(names[i], callIx, false, crStmtIxs[crStmtIxs.length - 1])
+    }
+    i = i + 1
+  }
+  0
+}
+
+// The first call in the subtree at `ix` that may write `name`, or -1.
+function crFirstWritingCall(ix: i32, name: string): i32 {
+  if ix < 0 || ix >= P.nodes.length { return -1 }
+  const n = P.nodes[ix]
+  if n is Call {
+    if callMayWrite(ix, name) { return ix }
+  } else if n is BinExpr {
+    if isBinOpFuncName(n.binOp) && binOpSymDeclared(n.binOp) {
+      if callMayWrite(ix, name) { return ix }
+    }
+  }
+  let cur = ix
+  while cur >= 0 {
+    const kids = nodeSpineChildren(cur)
+    let k = 0
+    while k < kids.length {
+      const c = crFirstWritingCall(kids[k], name)
+      if c >= 0 { return c }
+      k = k + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  -1
+}
+
+// A loop re-runs the reads before a call after it, so a narrowing live at the loop that a call
+// anywhere in the loop may end ends before the loop starts, in both halves.
+function crLoopPreRetire(loopIx: i32) {
+  if asgDeclKeys.length == 0 { return 0 }
+  const names = crLiveNames()
+  let i = 0
+  while i < names.length {
+    if crInfoOf(names[i]) > 0 {
+      const c = crFirstWritingCall(loopIx, names[i])
+      if c >= 0 { crRetire(names[i], c, true, loopIx) }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// Drop the bare-name facts collected since `mark` that a call inside the condition may falsify:
+// the test ran before the call. Banked at the condition for the emitter's matching decline.
+function crFilterCond(condIx: i32, names: string[], tys: i32[], mark: i32) {
+  if names.length <= mark { return 0 }
+  let w = mark
+  let i = mark
+  while i < names.length {
+    let keep = true
+    if !isPathKey(names[i]) {
+      if crInfoOf(names[i]) > 0 {
+        const wc = crFirstWritingCall(condIx, names[i])
+        if wc >= 0 {
+          keep = false
+          crCondDropBank[condIx] = crwAddName(
+            crCondDropBank[condIx] ?? ",",
+            names[i],
+          )
+          crCondDropN = crCondDropN + 1
+          crRetNames.push(names[i])
+          crRetCalls.push(wc)
+          crRetNarTys.push(tys[i])
+          crRetWideTys.push(lookup(names[i]))
+          crRetRoots.push(crCurRoot())
+          crRetLoops.push(false)
+        }
+      }
+    }
+    if keep {
+      names[w] = names[i]
+      tys[w] = tys[i]
+      w = w + 1
+    }
+    i = i + 1
+  }
+  while names.length > w {
+    names.pop()
+    tys.pop()
+  }
+  0
+}
+
+// The read hook: a read of `name` after the call that retired it, in the same statement, is
+// refused; any other read at the retired type is remembered for the misuse note. -1 lets the
+// read through.
+function crReadHook(name: string, ix: i32): i32 {
+  if crRetNames.length == 0 { return -1 }
+  let p = crPendNames.length - 1
+  while p >= 0 {
+    if crPendNames[p] == name {
+      tErrCoded(
+        "'"
+          + name
+          + "' is no longer narrowed to "
+          + tyToStr(crPendNarTys[p])
+          + ": "
+          + crCallDesc(crPendCalls[p])
+          + " earlier in this statement may reassign it — read '"
+          + name
+          + "' in a statement after the call, and re-test it there",
+        ix,
+        CODE_NARROWING_ENDED_BY_CALL,
+      )
+      return TY_ERR
+    }
+    p = p - 1
+  }
+  if crStmtIxs.length == 0 { return -1 }
+  const cur = lookup(name)
+  const root = crCurRoot()
+  let r = crRetNames.length - 1
+  while r >= 0 {
+    if crRetNames[r] == name && crRetRoots[r] == root {
+      if crRetWideTys[r] == cur {
+        crRdRet.push(r)
+        crRdIx.push(ix)
+      }
+      return -1
+    }
+    r = r - 1
+  }
+  -1
+}
+
+// The note a diagnostic at node `at` gains when a statement still being checked read a name at
+// the type a call retired it to, and the diagnostic spans that read or names that type; ""
+// otherwise.
+function crMisuseNote(msg: string, at: i32): string {
+  let i = crRdRet.length - 1
+  while i >= 0 {
+    const r = crRdRet[i]
+    const nm = crRetNames[r]
+    const hit = crSpans(at, crRdIx[i])
+      || msg.indexOf(tyToStr(crRetWideTys[r])) >= 0
+    if hit && msg.indexOf("'" + nm + "' is no longer") < 0 {
+      let where = " on line " + i32ToStr(nodeLineOf(crRetCalls[r]))
+      if crRetLoops[r] { where = where + " in the loop around this read" }
+      return " — '"
+        + nm
+        + "' is no longer narrowed to "
+        + tyToStr(crRetNarTys[r])
+        + ": "
+        + crCallDesc(crRetCalls[r])
+        + where
+        + " may reassign it; re-test '"
+        + nm
+        + "' after the call"
+    }
+    i = i - 1
+  }
+  ""
+}
+
+// A monomorphized clone of node `from` answers what `from` did in the three banks above.
+export function recordClonedCallRetire(from: i32, to: i32) {
+  if from < 0 || to < 0 { return 0 }
+  const a = crAfterBank[from]
+  if a is string { crAfterBank[to] = a }
+  const b = crBeforeBank[from]
+  if b is string { crBeforeBank[to] = b }
+  const c = crCondDropBank[from]
+  if c is string { crCondDropBank[to] = c }
+  0
+}
+
+// Does node `outer`'s source span hold node `inner`'s first token?
+function crSpans(outer: i32, inner: i32): boolean {
+  if outer < 0 || inner < 0 { return false }
+  const t = nodeStartTok(inner)
+  const a = nodeStartTok(outer)
+  if t < 0 || a < 0 { return false }
+  t >= a && t <= nodeLastTok(outer)
+}
+
+// How a diagnostic names the call at `ix`: a declared operator is a call too.
+function crCallDesc(ix: i32): string {
+  if ix >= 0 && ix < P.nodes.length {
+    const n = P.nodes[ix]
+    if n is BinExpr { return "the operator '" + n.binOp + "'" }
+  }
+  "the call to '" + calleeNameOf(ix) + "'"
+}
+
+// The emitter's reads of the banks above; each answer is a list of bare names.
+export function callRetireAfterOf(stmtIx: i32): string[] {
+  const s = crAfterBank[stmtIx]
+  if s is string { return weSplit(s) }
+  crNoNames
+}
+
+export function callRetireBeforeOf(stmtIx: i32): string[] {
+  const s = crBeforeBank[stmtIx]
+  if s is string { return weSplit(s) }
+  crNoNames
+}
+
+// The names a condition's narrowing drops, over the whole condition subtree: a sub-condition
+// that dropped a name implies the call is in the whole, whose own row may then hold nothing.
+export function condNarrowDropOf(condIx: i32): string {
+  if crCondDropN == 0 { return "" }
+  crCondDropWalk(condIx, ",")
+}
+
+function crCondDropWalk(ix: i32, acc: string): string {
+  if ix < 0 || ix >= P.nodes.length { return acc }
+  let out = acc
+  const s = crCondDropBank[ix]
+  if s is string {
+    const parts = weSplit(s)
+    let i = 0
+    while i < parts.length {
+      out = crwAddName(out, parts[i])
+      i = i + 1
+    }
+  }
+  let cur = ix
+  while cur >= 0 {
+    const kids = nodeSpineChildren(cur)
+    let k = 0
+    while k < kids.length {
+      out = crCondDropWalk(kids[k], out)
+      k = k + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  out
 }
 
 // The source line of a node, or 0 when it has no anchor token.
@@ -6888,6 +7690,12 @@ function litCmpTy(condIx: i32) {
 // null type), `a && b` contributes both conjuncts, `!(e)` contributes e's false narrowings, and
 // parens recurse. A guard over an optional chain also narrows each `?.` receiver non-null.
 function collectThenNarrows(condIx: i32, names: string[], tys: i32[]) {
+  const mark = names.length
+  collectThenNarrowsRaw(condIx, names, tys)
+  crFilterCond(condIx, names, tys, mark)
+}
+
+function collectThenNarrowsRaw(condIx: i32, names: string[], tys: i32[]) {
   const cond = P.nodes[condIx]
   if cond is Paren { return collectThenNarrows(cond.parInner, names, tys) }
   if cond is Unary {
@@ -6991,6 +7799,12 @@ function holeElseRemainderOk(tIdx: i32): boolean {
 // `a || b` contributes both disjuncts (neither held), `!(e)` contributes e's true narrowings, and
 // parens recurse. A place behind a `?.` hop is never else-narrowed, the chain being possibly null.
 function collectElseNarrows(condIx: i32, names: string[], tys: i32[]) {
+  const mark = names.length
+  collectElseNarrowsRaw(condIx, names, tys)
+  crFilterCond(condIx, names, tys, mark)
+}
+
+function collectElseNarrowsRaw(condIx: i32, names: string[], tys: i32[]) {
   const cond = P.nodes[condIx]
   if cond is Paren { return collectElseNarrows(cond.parInner, names, tys) }
   if cond is Unary {
@@ -8178,14 +8992,24 @@ export function tErrBuiltinTyDecl(name: string, at: i32): i32 {
 }
 
 function tErrPush(
-  msg: string,
+  msg0: string,
   at: i32,
   ln: i32,
   co: i32,
   endTok: i32,
-  code: string,
+  code0: string,
   data: string,
 ) {
+  // A misuse of a name a call un-narrowed says so, whichever check refused it (D2390).
+  let msg = msg0
+  let code = code0
+  if crRdRet.length > 0 {
+    const note = crMisuseNote(msg0, at)
+    if note != "" {
+      msg = msg0 + note
+      if code == "" { code = CODE_NARROWING_ENDED_BY_CALL }
+    }
+  }
   // An exact repeat (same message, same anchor) is noise, not information — two passes can resolve
   // the same annotation, the pass-1.5 hoist and the real pass both reporting a generic-alias arity
   // error at the same position. Drop the repeat; the diagnostic count stays small, so the scan is
@@ -31200,6 +32024,7 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
   narClobPrev = []
   narClobDepths = []
   narClobRetired = []
+  crFnEnter(fnIx)
   // Check the body in a fresh scope sharing the parameters.
   pushScope(n.fnBody)
   // Paired with the `flushInferRetHoles` below, which must run while this scope is still
@@ -31300,7 +32125,9 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
           seedTailArms(stmts[s], ret)
         }
       }
+      crStmtEnter(stmts[s])
       const stTy = checkNode(stmts[s])
+      crStmtLeave()
       retTailPos = savedRTPbody
       // The trailing expression is the implicit return; under inference it is a
       // return-type witness. With a CONCRETE annotated return, a trailing empty
@@ -31423,6 +32250,7 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
   // ANNOTATED body recorded nothing (those positions pin at the delivery) (D1591).
   flushInferRetHoles()
   popScope()
+  crFnLeave()
   if !inferQuiet {
     // Marks only the registered top-level decl (not a nested/shadowing namesake).
     if n.fnName != "" && (fnDeclIx[n.fnName] ?? -1) == fnIx {
@@ -32314,7 +33142,9 @@ function checkProgramNode(n: Program) {
   // Pass 2: check every top-level statement (bodies included).
   let j = 0
   while j < stmts.length {
+    crStmtEnter(stmts[j])
     checkNode(stmts[j])
+    crStmtLeave()
     j = j + 1
   }
   // A function whose return never resolved (a genuinely base-case-less recursive
@@ -33512,6 +34342,10 @@ function checkNodeReal(ix: i32) {
     // `ty` is this use's type as the checker resolved it — narrowed when the use
     // sits inside a guarded arm. Threaded in so the occurrence retains it.
     if symEnabled != 0 { symUse(ix, n.identName, ty) }
+    if ix != daWriteTarget {
+      const crr = crReadHook(n.identName, ix)
+      if crr >= 0 { return crr }
+    }
     // Definite-assignment read gate: a bare-name read of a still-unassigned binding is "used
     // before assigned". The LHS of a plain `=` is a write, not a read (the `BinExpr` `=` arm
     // marks it `daWriteTarget` before evaluating the target), so it is skipped here; a
@@ -33563,7 +34397,7 @@ function checkNodeReal(ix: i32) {
     return checkFuncDeclNode(n, ix)
     // ── while ─────────────────────────────────────────────────────────────────
   } else if n is WhileStmt {
-    return checkWhileStmtNode(n)
+    return checkWhileStmtNode(n, ix)
     // Accepted unconditionally: valid only inside a loop, but loop-nesting is
     // not tracked yet (a misplaced `break`/`continue` is a parser concern).
   } else if n is BreakStmt {
@@ -35405,6 +36239,8 @@ export function checkProgram(rootIx: i32) {
   hoistMatchScrutinees(rootIx)
   const rootN0 = P.nodes[rootIx]
   if rootN0 is Program { gRootStmts = rootN0.progStmts }
+  crReset()
+  crProgRoot = rootIx
   // Size the typed-IR table to the (now fully parsed) node arena, all holes (-1).
   nodeTyIx = []
   isVarTyIx = []
@@ -38835,6 +39671,7 @@ function monoRecheckBegin(
   }
   // Checks the body statements directly in the pushed scope (not via `checkNode` on the
   // block), which would push/pop its own scope and drop the local before it can be read back.
+  crFnEnter(declIx)
   pushScope(dn.fnBody)
   const params = dn.fnParams
   let pi = 0
@@ -38863,6 +39700,7 @@ function monoRecheckBegin(
 // stream — so the global checker state the emitter still reads matches its original values.
 function monoRecheckEnd(sv: i32[]) {
   popScope()
+  crFnLeave()
   while tpEnvNames.length > sv[17] {
     tpEnvNames.pop()
     tpEnvTys.pop()
@@ -39944,6 +40782,7 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
       const vsf = opSelfFnTy(op, lt, rt, n.binRight, ix)
       if vsf >= 0 {
         opBinSiteTook(op, true)
+        crNoteCallBare(ix)
         return vsf
       }
     }
@@ -39951,6 +40790,7 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
       const osf = opSelfFnTy(op, lt, rt, n.binRight, ix)
       if osf >= 0 {
         opBinSiteTook(op, true)
+        crNoteCallBare(ix)
         return osf
       }
       const ofld = objFieldType(odsp, op)
@@ -39969,6 +40809,7 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
                 ix,
               )
             }
+            crNoteCallBare(ix)
             return oft.fnRet
           }
         }
@@ -46441,7 +47282,8 @@ function omDotStr(n: OptMember) {
 }
 
 // Extracted from `checkNodeReal`'s `WhileStmt` arm (C3: thin the dispatcher).
-function checkWhileStmtNode(n: WhileStmt) {
+function checkWhileStmtNode(n: WhileStmt, ix: i32) {
+  crLoopPreRetire(ix)
   const wc = checkNode(n.whileCond)
   if !assignable(wc, TY_BOOL) {
     tErr("while-condition must be boolean, got " + tyToStr(wc), n.whileCond)
@@ -46624,6 +47466,7 @@ function forRangeFloatish(ty: i32) {
 
 // Extracted from `checkNodeReal`'s `ForRange` arm (C3: thin the dispatcher).
 function checkForRangeNode(n: ForRange, ix: i32) {
+  crLoopPreRetire(ix)
   const frFrom = checkNode(n.frFrom)
   const frTo = checkNode(n.frTo)
   if !assignable(frFrom, TY_I32) || !assignable(frTo, TY_I32) {
@@ -46712,6 +47555,7 @@ export function forInBindTy(iterTy: i32, second: boolean): i32 {
 
 // Extracted from `checkNodeReal`'s `ForIn` arm (C3: thin the dispatcher).
 function checkForInNode(n: ForIn, ix: i32) {
+  crLoopPreRetire(ix)
   let iterTy = checkNode(n.fiIter)
   if iterTy >= 0 { iterTy = strLitRecvTy(iterTy) }
   const elemTy = forInBindTy(iterTy, false)
@@ -46879,7 +47723,9 @@ function checkBlockNode(n: Block, ix: i32) {
     } else {
       retTailPos = false
     }
+    crStmtEnter(stmts[i])
     const sty = checkNode(stmts[i])
+    crStmtLeave()
     if i == stmts.length - 1 {
       // A value-producing trailing expression is the block's value; a trailing
       // statement (return / let / assignment / loop) leaves the block valueless.

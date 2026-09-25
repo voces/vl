@@ -7777,3 +7777,88 @@ each against the value master printed.
 plumb-shape units' fuel moves +0.05% against master. `bench/` arrays and collections build
 byte-identical (every loop there is a `while`). Under wasmtime a range sum falls 0.30 → 0.16 s
 and a list walk 0.31 → 0.17 s, plain or `-O`.
+
+## A call that may reassign a narrowed binding ends the narrowing (owner ruling, 2026-09-25) — D2390
+
+**Ruled (option a): a call that might run a closure which assigns a captured, `is`-narrowed
+binding ends that narrowing.** The code after the call reads the binding at its declared type,
+exactly as it does after a direct write the narrowing does not admit. `if v is f64 { k(); v * 2.0 }`,
+with `k = () => { v = true }`, is refused at `v * 2.0` with a message naming the call; `"\{v}"`
+there runs and prints `true`; re-testing `v` after the call narrows again. Before the ruling the
+first program was check-clean and trapped (`cast failure`) — the checker kept the narrowing
+through the call, and the emitter read the cell as the narrowed member it no longer held.
+
+**WHY NOT TYPESCRIPT'S ANSWER.** TypeScript keeps a narrowing across a call to a closure that
+reassigns the variable — `let v: boolean | number = 1.5; const k = () => { v = true }; if (typeof
+v === "number") { k(); v.toFixed() }` type-checks and throws at run time. That is a deliberate
+unsoundness in TS (its issue tracker's "trade-offs in control flow analysis"), and it costs TS
+only a thrown `TypeError`. In VL the narrowed read is a *representation* decision — the emitter
+unboxes the cell as the narrowed member — so the same unsoundness is a trap or, before D2387,
+check-clean invalid wasm. **Kotlin** refuses a smart cast on a local that a lambda captures and
+modifies ("smart cast is impossible because 'v' is a local variable that is captured by a
+changing closure"), everywhere, whether or not a call intervenes. VL's rule sits between the two:
+the narrowing holds until a call that may run the writer, and only the writer's reachability —
+not its mere existence — ends it.
+
+**THE REACHABILITY RULE** (the owner's refinement: a `map` with an unrelated lambda must keep the
+narrowing). A call ends the narrowing of `v` only if a function that WRITES `v` may be reachable
+from it. Within the top-level function the narrowing sits in (the whole module, for top-level
+code):
+
+* a *reacher* is a nested function or lambda that assigns `v`, or that mentions the name of a
+  reacher (so a closure calling the writer is one too);
+* a call reaches when its callee is a reacher's name — `k()`, a nested `function w()`, a method
+  spelled `x.k()` — or when a lambda is written in place and called at once;
+* a reacher has ESCAPED when it is not bound by name (a lambda written as an argument, stored in
+  a field, list or map), or when its name is used other than as a callee, an assignment target,
+  or inside another reacher (passed as an argument, stored, returned, assigned to another
+  binding). Once one escaped, every call reaches except one that provably runs no user code: an
+  intrinsic whose arguments are literals, values whose type holds no function, or lambdas written
+  in place that themselves call only such calls and do not write `v`;
+* an operator that dispatched to a declaration (`function "+"`, an operator closure field) is a
+  call naming no function, so it reaches only an escaped writer.
+
+A writer that is a local `const` and is only ever called by name has not escaped, so
+`xs.map((x) => x + 1)` keeps the narrowing and `xs.map((x) => { k(); x })` ends it. When unsure,
+the rule treats the writer as escaped. It is name-based and flow-insensitive: a same-named
+binding elsewhere in the root, or an escape later in the function, ends narrowings it strictly
+need not. That costs a re-test, never a wrong value.
+
+**WHERE IT ENDS, precisely.** The retirement is in place, as a falsifying write's is, so it
+outlives the block the call sits in, and the arm join at the enclosing `if` sees it.
+
+* *After the call's statement.* The emitter retires at statement granularity (the checker banks
+  the names on the statement, `callRetireAfterOf`, read by `pushPostGuardNarrow`), so a read
+  later in the SAME statement as the call is refused outright: `return k() + v` names the call
+  and asks for the read in a later statement.
+* *Before a loop.* A loop re-runs the reads before a call after it, so a narrowing live at the
+  loop that a call anywhere in the loop (condition, header or body) may end is ended before the
+  loop starts, in both halves (`callRetireBeforeOf`, `preStmtNarrow`). A re-test inside the loop
+  narrows per iteration and runs.
+* *In a condition.* A fact a condition establishes for `v` is dropped when the condition holds a
+  call that may write `v` — `!(v is f64) || k()` does not narrow the code after its early return,
+  and `v is f64 && k()` does not narrow the then-arm. The emitter declines the same names while
+  lowering that condition (`condNarrowDropOf`). This is coarser than evaluation order: `k() && v
+  is f64` also loses the fact, which a later refinement may recover.
+
+**ONE QUERY.** Every drop site asks `callMayWrite(call, key)` — "may this call write this
+place" — with `key` a bare name or a path (`o.v`, `xs[0]`). Today its bare-name answer is the
+reachability rule above and its path answer is the existing write-effect rule
+(`callInvalidatesNarrowedPath`). It is the invalidation primitive the effects summary
+(`docs/internals/function-effects-design.md`, §G6) is meant to replace: a `W` fact split per path
+answers it without any caller changing.
+
+**THE IDEAL IT DEFERS.** The owner's stated ideal is flow analysis: if `k` only ever assigned
+`v` a boolean when `v` was already a boolean, `if v is f64 { k() … }` would keep the narrowing.
+That needs the value `k` writes related to the value `v` holds when `k` runs — a per-path
+effect with a guard, the same machinery A6b Stage B's stored witnesses need. Not built; the
+conservative rule is the sound floor it would refine.
+
+**THE OTHER FORMS, surveyed and filed rather than fixed.** A field, element or map-value
+narrowing already ends at a call that may write it (the path rule), including through a method
+or a closure; the gaps are a declared operator that writes its operand's field (D2400), a module
+global written by another top-level function (D2401), a closure made under the narrowing and
+called after a writer (D2402), a path read before a writing call inside a loop (D2403), a path
+fact in a condition with a later writing call (D2404), and a path re-test that the path rule
+refuses (D2405, clause 2). Whether a declared operator may have side effects beyond its operands
+at all was floated by the owner, not decided (ROADMAP, "Narrowing invalidation across calls").
