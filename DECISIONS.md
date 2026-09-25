@@ -6603,9 +6603,13 @@ must be able to call `Buffer` without landing on another's live allocation.
   each produced one within a second. That model treated the past-the-pointer mark as a no-op,
   which is why it could not see the trap.
 - **The switch is `__memory_shared__()`, a STD-INTERNAL build-time `boolean` intrinsic, and the
-  compiler FOLDS it.** It exists for `std:buffer`; user code can spell it today, but no
-  user-facing guarantee is given — whether it is reserved to std, or offered as conditional
-  compilation, is an open owner ruling. An else-less `if __memory_shared__() { … }` is decided by the first emit pass
+  compiler FOLDS it.** It exists for `std:buffer`. **Ruled 2026-09-24, option (a): reserved to
+  std.** A call from outside std — a module whose resolved key does not start with `std:`, never
+  a filesystem path, so a user file living under a directory named `std/` does not qualify — is
+  refused by the checker (D2355): `'__memory_shared__' is internal to std; build-dependent code
+  is not a user feature yet`. Conditional compilation for user programs is deferred (ROADMAP.md,
+  "Ruled and sequenced") until a designed build-configuration surface exists, if one is ever
+  needed. An else-less `if __memory_shared__() { … }` is decided by the first emit pass
   (`foldMemShared`): a shared build keeps the body as a bare block, any other build drops the
   statement before anything else reads the tree. Only a call the checker resolved to the
   intrinsic folds (`memSharedCalls`); a parameter spelled `__memory_shared__` stays an ordinary

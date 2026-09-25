@@ -1260,3 +1260,42 @@ Deno.test({
     );
   }
 });
+
+// D2355 — `__memory_shared__()` is std-internal, refused outside std by the module's
+// resolution ORIGIN, never a path. The editor opens a std file directly (no import), so
+// `entryKey` is a bare absolute path with no `std:` specifier anywhere — `resolveVlRoot`
+// (`vlRootFor`, #3122's checkout anchor) is what lets the checker still recognize it.
+Deno.test({
+  name: "wasm-checker: std/buffer.vl opened directly checks clean (its own intrinsic calls are std)",
+  ignore,
+}, async () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  const path = new URL("../std/buffer.vl", import.meta.url).pathname;
+  const source = await Deno.readTextFile(path);
+  const diags = await checker.check(source, path, noSiblings);
+  const hit = diags.find((d) => d.message.includes("is internal to std"));
+  if (hit !== undefined) {
+    throw new Error(`std/buffer.vl should not be refused its own intrinsic: ${hit.message}`);
+  }
+});
+
+// The control: a folder literally named `std/` buys nothing when it is not this
+// checkout's own — `vlRootFor` walks up from the FILE and finds no checkout markers.
+Deno.test({
+  name: "wasm-checker: a user file under its own std/ folder (outside any VL checkout) is still refused",
+  ignore,
+}, async () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  const diags = await checker.check(
+    "print(__memory_shared__())\n",
+    "/tmp/unrelated-project/std/x.vl",
+    noSiblings,
+  );
+  const hit = diags.find((d) => d.message.includes("is internal to std"));
+  if (hit === undefined) {
+    throw new Error(
+      "expected the origin refusal for a user std/ folder outside any checkout, got: " +
+        (diags.map((d) => d.message).join("; ") || "(none)"),
+    );
+  }
+});
