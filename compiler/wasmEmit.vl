@@ -531,6 +531,7 @@ import {
   nulScalarListWrapHeap,
   rpRow,
   rpVar,
+  urBase,
   urSlot,
   urVal,
   wDropBack,
@@ -21021,12 +21022,10 @@ function partialUnrollCost(ix: i32, fnIx: i32): i32 {
   cnt
 }
 
-// The range loop with its body copied `PARTIAL_UNROLL_COPIES` times per trip while that many
-// trips remain, then the rolled loop for the rest. The main loop's test is `v < bound - D`
-// (D the copies less one, one fewer for `to`), with a bound too low to subtract from running
-// no main trip. Copy `k` sets the loop var to `u + k`, `u` the trip's first value, so every
-// read of it sees its own trip's value and the copies do not chain their increments.
-// `break` leaves one block around both loops; `continue` ends its own copy.
+// The range loop run as `PARTIAL_UNROLL_COPIES` body copies per trip while that many trips
+// remain (`v < bound - D`; a bound too low to subtract runs none), then rolled. Copy `k` stores
+// and reads the loop var as `u + k`, `u` the trip's first value, so two reads stay one expression
+// and the copies chain no increments. `break` leaves both loops; `continue` ends its own copy.
 function emitRangePartial(body: u8[], s: ForRange, fnIx: i32, rt: RangeTest) {
   fbBlock(64) // 0x02 block, void — the `break` target of both loops
   loopBrkDepth.push(ctrlDepth)
@@ -21072,6 +21071,9 @@ function emitRangePartial(body: u8[], s: ForRange, fnIx: i32, rt: RangeTest) {
         fbI32Bin(106) // 0x6a i32.add
         fbLocalSet(rt.vIdx)
       }
+      urSlot.push(rt.vIdx)
+      urVal.push(k)
+      urBase.push(uSlot)
       if hasCont {
         fbBlock(64) // this copy's continue block
         loopContDepth.push(ctrlDepth)
@@ -21083,6 +21085,9 @@ function emitRangePartial(body: u8[], s: ForRange, fnIx: i32, rt: RangeTest) {
         loopContDepth.pop()
         loopContLabel.pop()
       }
+      urSlot.pop()
+      urVal.pop()
+      urBase.pop()
       if rc < 0 { return -1 }
       k = k + 1
     }
@@ -21132,6 +21137,7 @@ function emitRangeUnrolled(
     fbLocalSet(vIdx)
     urSlot.push(vIdx)
     urVal.push(v)
+    urBase.push(-1)
     if hasCont {
       fbBlock(64) // this copy's continue block
       loopContDepth.push(ctrlDepth)
@@ -21145,6 +21151,7 @@ function emitRangeUnrolled(
     }
     urSlot.pop()
     urVal.pop()
+    urBase.pop()
     if rc < 0 { return -1 }
     v = v + stepK
     k = k + 1
@@ -23189,7 +23196,15 @@ function emitIdentNode(body: u8[], e: Ident, exprIx: i32, fnIx: i32) {
   // A fully unrolled range loop's variable reads as its copy's constant.
   const urAt = unrolledSlotAt(idx)
   if urAt >= 0 {
-    fbI32Const(urVal[urAt])
+    if urBase[urAt] < 0 {
+      fbI32Const(urVal[urAt])
+      return 0
+    }
+    fbLocalGet(urBase[urAt])
+    if urVal[urAt] != 0 {
+      fbI32Const(urVal[urAt])
+      fbI32Bin(106) // 0x6a i32.add
+    }
     return 0
   }
   fbLocalGet(idx)
