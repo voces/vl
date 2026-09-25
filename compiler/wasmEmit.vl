@@ -531,6 +531,8 @@ import {
   nulScalarListWrapHeap,
   rpRow,
   rpVar,
+  urSlot,
+  urVal,
   wDropBack,
   wLen,
   wNegateConstFrom,
@@ -20720,11 +20722,17 @@ function emitForRangeStmt(body: u8[], s: ForRange, _stmtIx: i32, fnIx: i32) {
   if !dynStep && stepK == 0 {
     return emitFail("emitProgram: for-range step must not be zero")
   }
-  // v = A; bound = B (each evaluated once, in source order)
+  // v = A; bound = B (each evaluated once, in source order). A constant bound is compared as
+  // the constant itself, so no local carries it and every test reads an immediate.
+  const bConst = rangeConstIs(s.frTo, fnIx)
+  let bVal = 0
+  if bConst { bVal = rangeConstVal(s.frTo, fnIx) }
   if emitExpr(body, s.frFrom, fnIx) < 0 { return -1 }
   fbLocalSet(vIdx)
-  if emitExpr(body, s.frTo, fnIx) < 0 { return -1 }
-  fbLocalSet(bIdx)
+  if !bConst {
+    if emitExpr(body, s.frTo, fnIx) < 0 { return -1 }
+    fbLocalSet(bIdx)
+  }
   if dynStep {
     if emitExpr(body, s.frStep, fnIx) < 0 { return -1 }
     fbLocalSet(sIdx)
@@ -20738,48 +20746,114 @@ function emitForRangeStmt(body: u8[], s: ForRange, _stmtIx: i32, fnIx: i32) {
   const frProof = rangeProofOpen(s, stepK, dynStep)
   // Bind the loop var for the body (mirrors the collect pass's scopeBind).
   scopeBind(s.frVar, vSlot)
+  const aConst = rangeConstIs(s.frFrom, fnIx)
+  let aVal = 0
+  if aConst { aVal = rangeConstVal(s.frFrom, fnIx) }
+  let trips = -1
+  if aConst && bConst && !dynStep {
+    trips = rangeUnrollTrips(s, aVal, bVal, stepK, fnIx)
+  }
+  let rc = 0
+  if trips > 0 {
+    rc = emitRangeUnrolled(body, s, fnIx, vIdx, aVal, stepK, trips)
+  } else {
+    const rt: RangeTest = {
+      vIdx: vIdx,
+      bIdx: bIdx,
+      bConst: bConst,
+      bVal: bVal,
+      sIdx: sIdx,
+      dynStep: dynStep,
+      stepK: stepK,
+      excl: s.frExcl,
+    }
+    rc = emitRangeRolled(body, s, fnIx, rt)
+  }
+  loopHoistClose(frHoist)
+  rangeProofClose(frProof)
+  // The loop variable's scope is the loop (see `scopeUnbind`).
+  scopeUnbind()
+  rc
+}
+
+// A range loop's continue test, its operands resolved: the loop var's local, the bound's local
+// or constant, and the step's local or constant. `excl` is the half-open `until`.
+type RangeTest = {
+  vIdx: i32,
+  bIdx: i32,
+  bConst: boolean,
+  bVal: i32,
+  sIdx: i32,
+  dynStep: boolean,
+  stepK: i32,
+  excl: boolean,
+}
+
+// Pushes the i32 "`v` is still in range". A dynamic step picks the direction with a `select`,
+// and a zero step makes the loop empty, the answer a backwards constant range already gives.
+function emitRangeTest(rt: RangeTest) {
+  let ascCmp = 76 // 0x4c i32.le_s
+  let descCmp = 78 // 0x4e i32.ge_s
+  if rt.excl {
+    ascCmp = 72  // 0x48 i32.lt_s — half-open ascending
+    descCmp = 74 // 0x4a i32.gt_s — half-open descending
+  }
+  if rt.dynStep {
+    fbLocalGet(rt.vIdx)
+    emitRangeBound(rt)
+    fbI32Bin(ascCmp)  // the ascending test
+    fbLocalGet(rt.vIdx)
+    emitRangeBound(rt)
+    fbI32Bin(descCmp) // the descending test
+    fbLocalGet(rt.sIdx)
+    fbI32Const(0)
+    fbI32Bin(74)      // 0x4a i32.gt_s — is the step positive?
+    wU8(27)           // 0x1b select — the ascending test iff the step is positive
+    fbLocalGet(rt.sIdx)
+    fbI32Eqz()
+    fbI32Eqz()        // step != 0
+    fbI32Bin(113)     // 0x71 i32.and
+    return 0
+  }
+  fbLocalGet(rt.vIdx)
+  emitRangeBound(rt)
+  if rt.stepK > 0 { fbI32Bin(ascCmp) } else { fbI32Bin(descCmp) }
+  0
+}
+
+function emitRangeBound(rt: RangeTest) {
+  if rt.bConst { fbI32Const(rt.bVal) } else { fbLocalGet(rt.bIdx) }
+  0
+}
+
+// The range test evaluated at compile time for `v`, for a constant bound and a static step.
+function rangeTestHolds(rt: RangeTest, v: i32): boolean {
+  const b = rt.bVal
+  if rt.stepK > 0 {
+    if rt.excl { return v < b }
+    return v <= b
+  }
+  if rt.excl { return v > b }
+  v >= b
+}
+
+// The range loop, top-tested: `block { loop { br_if block (!test); body; v += K; br loop } }`.
+// A bottom-tested `br_if` back-edge is not used: wasmtime runs it up to 2.4x slower
+// (DECISIONS.md, "Loops stay top-tested"). A `continue` lands at the end of an inner block, so it
+// still steps.
+function emitRangeRolled(body: u8[], s: ForRange, fnIx: i32, rt: RangeTest) {
   fbBlock(64) // 0x02 block, void
   loopBrkDepth.push(ctrlDepth)
   loopBrkLabel.push(s.frLabel)
   fbLoop(64)  // 0x03 loop, void
   loopContDepth.push(ctrlDepth)
   loopContLabel.push(s.frLabel)
-  // continue-condition: ascending / descending bound test, inverted to exit. `frExcl` (the
-  // half-open `until`) makes it strict — lt_s / gt_s where `to` uses le_s / ge_s. A DYNAMIC
-  // step picks the direction with a `select` at run time, and a zero step makes the loop
-  // empty — it advances nothing, the same answer a backwards constant range already gives.
-  let ascCmp = 76 // 0x4c i32.le_s
-  let descCmp = 78 // 0x4e i32.ge_s
-  if s.frExcl {
-    ascCmp = 72  // 0x48 i32.lt_s — half-open ascending
-    descCmp = 74 // 0x4a i32.gt_s — half-open descending
-  }
-  if dynStep {
-    fbLocalGet(vIdx)
-    fbLocalGet(bIdx)
-    fbI32Bin(ascCmp)  // the ascending test
-    fbLocalGet(vIdx)
-    fbLocalGet(bIdx)
-    fbI32Bin(descCmp) // the descending test
-    fbLocalGet(sIdx)
-    fbI32Const(0)
-    fbI32Bin(74)      // 0x4a i32.gt_s — is the step positive?
-    wU8(27)           // 0x1b select — the ascending test iff the step is positive
-    fbLocalGet(sIdx)
-    fbI32Eqz()
-    fbI32Eqz()        // step != 0
-    fbI32Bin(113)     // 0x71 i32.and
-  } else {
-    fbLocalGet(vIdx)
-    fbLocalGet(bIdx)
-    if stepK > 0 { fbI32Bin(ascCmp) } else { fbI32Bin(descCmp) }
-  }
-  fbI32Eqz() // 0x45 invert: exit when out of range
-  fbBrIf(1)  // 0x0d br_if -> break out of block
+  emitRangeTest(rt)
+  fbI32Eqz()  // 0x45 invert: exit when out of range
+  fbBrIf(1)   // 0x0d br_if -> break out of block
   // a body with a `continue` binding to this loop needs an inner block as the continue
   // target: branching to its end falls into the increment (a branch to the loop header
-  // would skip it — an infinite loop). A body without one keeps the two-frame shape. The
-  // inner block carries the loop's label too, shadowing the header entry.
+  // would skip it — an infinite loop). The inner block carries the loop's label too.
   const frHasCont = blockHasContinueFor(s.frBody, s.frLabel, false)
   if frHasCont {
     fbBlock(64) // continue block
@@ -20793,10 +20867,10 @@ function emitForRangeStmt(body: u8[], s: ForRange, _stmtIx: i32, fnIx: i32) {
     loopContLabel.pop()
   }
   // v = v + K
-  fbLocalGet(vIdx)
-  if dynStep { fbLocalGet(sIdx) } else { fbI32Const(stepK) }
+  fbLocalGet(rt.vIdx)
+  if rt.dynStep { fbLocalGet(rt.sIdx) } else { fbI32Const(rt.stepK) }
   fbI32Bin(106) // 0x6a i32.add
-  fbLocalSet(vIdx)
+  fbLocalSet(rt.vIdx)
   fbBr(0)       // continue loop
   fbEnd()       // end loop
   loopContDepth.pop()
@@ -20804,11 +20878,226 @@ function emitForRangeStmt(body: u8[], s: ForRange, _stmtIx: i32, fnIx: i32) {
   fbEnd()       // end block
   loopBrkDepth.pop()
   loopBrkLabel.pop()
-  loopHoistClose(frHoist)
-  rangeProofClose(frProof)
-  // The loop variable's scope is the loop (see `scopeUnbind`).
-  scopeUnbind()
-  return 0
+  0
+}
+
+// The most trips, and the most body nodes summed over every copy, a range loop is fully unrolled
+// at; the two limits are chosen in DECISIONS.md, "Small constant range loops are unrolled".
+const UNROLL_MAX_TRIPS = 16
+const UNROLL_MAX_NODES = 640
+
+// The range loop fully unrolled: `trips` copies of the body in one block, copy `k` reading the
+// loop var as the constant `A + k*K`. `break` leaves the block and `continue` ends its copy.
+// Every copy mints the body's `let`s into the same slots.
+function emitRangeUnrolled(
+  body: u8[],
+  s: ForRange,
+  fnIx: i32,
+  vIdx: i32,
+  aVal: i32,
+  stepK: i32,
+  trips: i32,
+) {
+  fbBlock(64) // 0x02 block, void — the `break` target
+  loopBrkDepth.push(ctrlDepth)
+  loopBrkLabel.push(s.frLabel)
+  const hasCont = blockHasContinueFor(s.frBody, s.frLabel, false)
+  const cursor0 = emitLetCursor
+  let k = 0
+  let v = aVal
+  while k < trips {
+    emitLetCursor = cursor0
+    fbI32Const(v)
+    fbLocalSet(vIdx)
+    urSlot.push(vIdx)
+    urVal.push(v)
+    if hasCont {
+      fbBlock(64) // this copy's continue block
+      loopContDepth.push(ctrlDepth)
+      loopContLabel.push(s.frLabel)
+    }
+    const rc = emitStmts(body, s.frBody, fnIx)
+    if hasCont {
+      fbEnd()
+      loopContDepth.pop()
+      loopContLabel.pop()
+    }
+    urSlot.pop()
+    urVal.pop()
+    if rc < 0 { return -1 }
+    v = v + stepK
+    k = k + 1
+  }
+  fbEnd() // end block
+  loopBrkDepth.pop()
+  loopBrkLabel.pop()
+  0
+}
+
+// The innermost unrolled copy whose loop var is local `idx`, or -1.
+function unrolledSlotAt(idx: i32) {
+  let j = urSlot.length - 1
+  while j >= 0 {
+    if urSlot[j] == idx { return j }
+    j = j - 1
+  }
+  -1
+}
+
+// The trip count of a constant range loop worth unrolling, or -1. The rolled loop is simulated
+// with its own i32 steps, and declined when a step would wrap (the rolled loop then never ends),
+// when the body writes the loop var, or when `unrollCost` declines it or its copies exceed
+// `UNROLL_MAX_NODES`.
+function rangeUnrollTrips(
+  s: ForRange,
+  aVal: i32,
+  bVal: i32,
+  stepK: i32,
+  fnIx: i32,
+) {
+  const rt: RangeTest = {
+    vIdx: -1,
+    bIdx: -1,
+    bConst: true,
+    bVal: bVal,
+    sIdx: -1,
+    dynStep: false,
+    stepK: stepK,
+    excl: s.frExcl,
+  }
+  let v = aVal
+  let t = 0
+  while rangeTestHolds(rt, v) {
+    t = t + 1
+    if t > UNROLL_MAX_TRIPS { return -1 }
+    const next = v + stepK
+    if stepK > 0 && next < v { return -1 }
+    if stepK < 0 && next > v { return -1 }
+    v = next
+  }
+  if t == 0 { return -1 }
+  if stmtAssignsName(s.frBody, s.frVar) { return -1 }
+  const cost = unrollCost(s.frBody, fnIx, UNROLL_MAX_NODES)
+  if cost < 0 || cost * t > UNROLL_MAX_NODES { return -1 }
+  t
+}
+
+// The node count of the code under `ix`, a nested constant range loop's body counted once per
+// trip, or -1 when it holds a function, a call that is not an inline memory intrinsic, or exceeds
+// `cap`. A call outweighs the test and step unrolling saves, and the host reads a call inside a
+// loop as hot, which the copies would hide from it.
+function unrollCost(ix: i32, fnIx: i32, cap: i32): i32 {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const n = P.nodes[ix]
+  if n is FuncDecl { return -1 }
+  if n is Call {
+    if !hoistSafeMemCall(ix, fnIx) { return -1 }
+  }
+  if n is ForRange {
+    const inner = rangeStaticTrips(n, fnIx)
+    if inner > 0 {
+      const b = unrollCost(n.frBody, fnIx, cap)
+      if b < 0 { return -1 }
+      const tot = 3 + b * inner
+      if tot > cap { return -1 }
+      return tot
+    }
+  }
+  let cnt = 1
+  let cur = ix
+  while cur >= 0 {
+    const kids = nodeSpineChildren(cur)
+    let i = 0
+    while i < kids.length {
+      const c = unrollCost(kids[i], fnIx, cap)
+      if c < 0 { return -1 }
+      cnt = cnt + c
+      if cnt > cap { return -1 }
+      i = i + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  cnt
+}
+
+// The trip count of a range loop with constant ends and a literal step when it is at most
+// `UNROLL_MAX_TRIPS`; 0 for any other.
+function rangeStaticTrips(n: ForRange, fnIx: i32) {
+  if !forRangeStepIsConst(n.frStep) { return 0 }
+  if !rangeConstIs(n.frFrom, fnIx) || !rangeConstIs(n.frTo, fnIx) { return 0 }
+  let k = 1
+  if n.frStep >= 0 {
+    if !rangeConstIs(n.frStep, fnIx) { return 0 }
+    k = rangeConstVal(n.frStep, fnIx)
+  }
+  if k == 0 { return 0 }
+  const rt: RangeTest = {
+    vIdx: -1,
+    bIdx: -1,
+    bConst: true,
+    bVal: rangeConstVal(n.frTo, fnIx),
+    sIdx: -1,
+    dynStep: false,
+    stepK: k,
+    excl: n.frExcl,
+  }
+  let v = rangeConstVal(n.frFrom, fnIx)
+  let t = 0
+  while rangeTestHolds(rt, v) && t <= UNROLL_MAX_TRIPS {
+    t = t + 1
+    v = v + k
+  }
+  if t > UNROLL_MAX_TRIPS { return 0 }
+  t
+}
+
+// Whether `ix` is a range end with a compile-time i32 value: an integer literal fitting i32, a
+// negated one, either in parens, or an unshadowed module `const` bound to one.
+function rangeConstIs(ix: i32, fnIx: i32): boolean {
+  const x = unwrapParen(ix)
+  if x < 0 || x >= P.nodes.length { return false }
+  const e = P.nodes[x]
+  if e is NumLit {
+    return !numLexIsFloat(e.numText) && numLexFitsI32(e.numText)
+  }
+  if e is Unary {
+    if e.unOp != "-" { return false }
+    const inner = P.nodes[unwrapParen(e.unArg)]
+    if inner is NumLit { return rangeConstIs(e.unArg, fnIx) }
+    return false
+  }
+  // Any other kind has a value only as the name of a module `const` bound to one of the above.
+  const init = rangeConstInitOf(x, fnIx)
+  init >= 0 && rangeConstIs(init, -1)
+}
+
+// `rangeConstIs`'s value, paired arm for arm; 0 for a node the predicate refused, so a caller
+// asks the predicate first.
+function rangeConstVal(ix: i32, fnIx: i32): i32 {
+  const x = unwrapParen(ix)
+  if x < 0 || x >= P.nodes.length { return 0 }
+  const e = P.nodes[x]
+  if e is NumLit { return parseI32(e.numText) }
+  if e is Unary { return 0 - rangeConstVal(e.unArg, fnIx) }
+  // Any other kind is the name of a module `const`, as `rangeConstIs` accepted it.
+  rangeConstVal(rangeConstInitOf(x, fnIx), -1)
+}
+
+// The initialiser of the unshadowed module `const` the name at `x` denotes from inside `fnIx`,
+// when it is unannotated or `i32` and its initialiser is a literal or a negation; else -1.
+function rangeConstInitOf(x: i32, fnIx: i32): i32 {
+  const e = P.nodes[x]
+  if !(e is Ident) { return -1 }
+  const li = globalLetOfSidIn(fnIx, sidOfNode(x))
+  if li < 0 || li >= P.nodes.length { return -1 }
+  const d = P.nodes[li]
+  if d is LetDecl {
+    if d.letKw != "const" || d.letInit < 0 { return -1 }
+    if d.letType >= 0 && tyNameOf(d.letType) != "i32" { return -1 }
+    const init = P.nodes[unwrapParen(d.letInit)]
+    if init is NumLit || init is Unary { return d.letInit }
+  }
+  -1
 }
 
 // A map walk's step after its body: when an insert in the body compacted the map, the entry at
@@ -22597,6 +22886,12 @@ function emitIdentNode(body: u8[], e: Ident, exprIx: i32, fnIx: i32) {
     return emitFail(
       "emitProgram: identifier is not a parameter, local, or global",
     )
+  }
+  // A fully unrolled range loop's variable reads as its copy's constant.
+  const urAt = unrolledSlotAt(idx)
+  if urAt >= 0 {
+    fbI32Const(urVal[urAt])
+    return 0
   }
   fbLocalGet(idx)
   // The `string | null` (kind 16) read rule for a param/local — stated at `emitMem`'s
