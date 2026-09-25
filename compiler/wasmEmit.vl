@@ -15046,33 +15046,40 @@ function memConstFoldShapeRest(initIx: i32, fnIx: i32): i32 {
   -1
 }
 
-// How many `const` declarations under `ix` qualify for the declaration-time address fold —
-// each needs its own scratch local, sized BEFORE the body is walked (`fnDetectScratch`,
-// emit_sections.vl) so `fbBeginFunc` can reserve them. Does not descend into a nested
-// `FuncDecl`: a captured local's own frame is sized when that function's body is scanned.
-export function maFoldCandidateCount(ix: i32, fnIx: i32): i32 {
-  if ix < 0 || ix >= P.nodes.length { return 0 }
-  const n = P.nodes[ix]
-  if n is FuncDecl { return 0 }
+// True when `initIx`'s top-level shape is a `+` at all — the one cheap, non-recursive check
+// every caller of `memConstFoldShapeK` runs first, so the real (`memAddrConst`/`memAddrBound`)
+// analysis is skipped for the vast majority of `const`s, which are never address sums.
+function mfShapeIsSum(initIx: i32): boolean {
+  const ix = unwrapParen(initIx)
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const e = P.nodes[ix]
+  if e is BinExpr { return e.binOp == "+" }
+  false
+}
+
+// How many of this function's already-collected locals qualify for the declaration-time
+// address fold, sized before the body is walked (`fnDetectScratch`) so `fbBeginFunc` can
+// reserve them. Reads `localDeclIx` — one entry per local slot `collectLocals` already
+// allocated, however deeply nested — rather than re-walking the body a second time.
+export function maFoldCandidateCount(fnIx: i32): i32 {
   let count = 0
-  if n is LetDecl {
-    if n.letKw == "const" && n.letInit >= 0 {
-      if memConstFoldShapeK(n.letInit, fnIx) >= 0 { count = 1 }
+  let i = 0
+  while i < localDeclIx.length {
+    // `localIsRef[i]` is the slot kind `collectLocals` already classified — "i32" is the one a
+    // plain arithmetic sum ever takes, so this skips every i64/f32/f64/ref local (registers, in
+    // plumb-shaped code) before touching its declaration node at all.
+    if localIsRef[i] == "i32" {
+      const declIx = localDeclIx[i]
+      if declIx >= 0 && declIx < P.nodes.length {
+        const d = P.nodes[declIx]
+        if d is LetDecl {
+          if d.letKw == "const" && d.letInit >= 0 && mfShapeIsSum(d.letInit) {
+            if memConstFoldShapeK(d.letInit, fnIx) >= 0 { count = count + 1 }
+          }
+        }
+      }
     }
-  }
-  // An `else if` chain (a `match`'s own desugar included) is walked along its spine via
-  // `nodeSpineChildren`/`elseIfLink`, so a 10000-arm chain costs no stack — the same guard
-  // `exprMentionsName`/`strAccWalk` need (D1990); plain `nodeChildren` recursion here blew the
-  // V8 native stack compiling the editor's own dense-match fixture.
-  let cur = ix
-  while cur >= 0 {
-    const kids = nodeSpineChildren(cur)
-    let i = 0
-    while i < kids.length {
-      count = count + maFoldCandidateCount(kids[i], fnIx)
-      i = i + 1
-    }
-    cur = elseIfLink(cur)
+    i = i + 1
   }
   count
 }
@@ -20198,12 +20205,15 @@ function emitLetDeclStmt(body: u8[], s: LetDecl, stmtIx: i32, fnIx: i32) {
     }
     const savedNulList = pendingNulList
     if letNulList15 { pendingNulList = true }
-    // The declaration-time address fold: a `const p = K + bounded` later used as a
-    // memory-intrinsic address needs its bounded part preserved in its own scratch local —
-    // only this arm's plain-i32 initializer can ever match. `const`-only, since a `let` can
-    // be reassigned; `maFoldCandidateCount` (which sized the scratch frame) agrees.
-    const mfK = memConstFoldShapeK(s.letInit, fnIx)
-    if fnIx >= 0 && s.letKw == "const" && mfK >= 0 {
+    // The declaration-time address fold: a `const p = K + bounded` later used as a memory
+    // address needs its bounded part kept in its own scratch local — `const`-only, since a
+    // `let` can be reassigned. The cheap checks lead so the real analysis (which
+    // `maFoldCandidateCount` also pays) runs only where it can possibly match.
+    let mfK: i64 = -1
+    if fnIx >= 0 && s.letKw == "const" && mfShapeIsSum(s.letInit) {
+      mfK = memConstFoldShapeK(s.letInit, fnIx)
+    }
+    if mfK >= 0 {
       if emitMemConstFoldLet(body, s.letInit, mfK, fnIx, stmtIx) < 0 {
         return -1
       }
