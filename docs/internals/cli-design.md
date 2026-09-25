@@ -703,8 +703,8 @@ shared memory (`--shared-memory=<pages>` with min < max) makes TurboFan re-read 
 size after every store instead of keeping it in a register, costing ~9–11% per frame;
 declaring the memory fixed-size (min == max) removes that penalty. Separately, declaring a
 minimum above the program's constant addresses lets V8 drop those bounds checks at compile
-time — about −9.5%, even on a non-shared build. Node 24 and browsers run the trap handler
-and show no gap either way. When importing the memory (`--import-memory`), the host that
+time — about −9.5%, even on a non-shared build. Node 24 runs the trap handler and showed
+no gap either way (browsers, untested, are expected to match). When importing the memory (`--import-memory`), the host that
 creates it must set `initial` ≥ the declared minimum.
 
 #### Linking units' `extern` names through a facade (the facade recipe)
