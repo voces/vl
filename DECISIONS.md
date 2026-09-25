@@ -7891,9 +7891,12 @@ conservative rule is the sound floor it would refine.
   re-test the diagnostic asks for narrows again; a read later in the same statement is still
   refused. A narrowing of an enclosing function stays a refusal, since the emitter retires only
   the function it is lowering.
-* *A call to a `const`-bound lambda is a call to its body* for the path rule, as a declared
-  function's is, so a closure that writes nothing ends nothing; and handing the narrowed value
-  itself to a callee ends nothing, since the callee holds the value, not the place.
+* *A call to a `const`-bound lambda that writes no place is a call to its body* for the path
+  rule, so it ends nothing: the body assigns only bare names and calls only intrinsics that
+  remove nothing and take no function. Any other lambda stays opaque, because the write
+  summaries miss a write through an alias of a captured object or through a callee it is
+  handed to (D2461). Handing the narrowed value itself to a callee ends nothing, since the
+  callee holds the value, not the place.
 * *A declared operator is a call* for the path rule too (D2400): its operands are its arguments,
   the declaration is the one the checker resolved (every declaration of the operator where
   none is resolved yet), and an operator closure field is opaque, as a call through a closure

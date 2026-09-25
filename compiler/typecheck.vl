@@ -5362,6 +5362,54 @@ function argEffectsOn(declIx: i32, args: i32[], pname: string) {
   acc
 }
 
+// Whether the lambda at `fnIx` can write no field, element or map value: its body assigns only
+// bare names, holds no nested function and no operator that may dispatch, and calls only
+// intrinsics that remove nothing and are handed no function. Only a yes is memoised: asked
+// before the body is checked, an argument's type is unknown and answers no.
+function crLambdaWritesNoPlace(fnIx: i32): boolean {
+  if crNoPlaceMemo[fnIx] ?? false { return true }
+  let ok = false
+  const fd = P.nodes[fnIx]
+  if fd is FuncDecl { ok = crSubtreeWritesNoPlace(fd.fnBody) }
+  if ok { crNoPlaceMemo[fnIx] = true }
+  ok
+}
+
+let crNoPlaceMemo: {[i32]: boolean} = Map()
+
+function crSubtreeWritesNoPlace(ix: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return true }
+  const n = P.nodes[ix]
+  if n is FuncDecl { return false }
+  if n is BinExpr {
+    if n.binOp == "=" && !(P.nodes[n.binLeft] is Ident) { return false }
+  }
+  if crIsDispatchSite(ix) { return false }
+  if n is Call {
+    if callDeclFnIx(n) != -2 { return false }
+    const cf = P.nodes[n.callFn]
+    if cf is Member {
+      if cellRemovingMethod(cf.memProp) { return false }
+    }
+    let a = 0
+    while a < n.callArgs.length {
+      if crArgMayBeFn(n.callArgs[a]) { return false }
+      a = a + 1
+    }
+  }
+  let cur = ix
+  while cur >= 0 {
+    const kids = nodeSpineChildren(cur)
+    let k = 0
+    while k < kids.length {
+      if !crSubtreeWritesNoPlace(kids[k]) { return false }
+      k = k + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  true
+}
+
 // A call's argument places in callee-parameter order. A UFCS or method callee (`o.m(a)`) puts the
 // receiver at parameter 0, which is how `m(o, a)` declares it; every other shape is the written
 // argument list.
@@ -5391,12 +5439,13 @@ function callDeclFnIx(cn: Call) {
     const nd = findFnDeclInRoots(cf.identName)
     if nd >= 0 { return nd }
     if lookup(cf.identName) >= 0 {
-      // A binding bound once to a lambda, never re-pointed, calls that lambda's body; a callee
-      // the frame index does not hold cannot be placed, and stays opaque.
+      // A binding bound once to a lambda, never re-pointed, calls that lambda's body — trusted
+      // only when that body writes no place at all, since the write summaries do not see an
+      // alias of a captured object (D2461). Anything else stays opaque.
       const lfr = covarRootFrame(cn.callFn)
       if cwFramedNode(cn.callFn) && lfr != CW_FR_UNKNOWN {
         const ld = cwLambdaDeclOf(cf.identName, lfr)
-        if ld >= 0 { return ld }
+        if ld >= 0 && crLambdaWritesNoPlace(ld) { return ld }
       }
       return -1 // a function VALUE: target unknown
     }
@@ -6238,6 +6287,8 @@ function crCaptureCallCheck(slot: i32, callIx: i32) {
     if rdn.fnName != "" { own = rdn.fnName }
   }
   if own != "" && calleeNameOf(callIx) == own { return 0 }
+  // Nor can it run later once its only handle has gone out of scope without escaping.
+  if own != "" && lookup(own) < 0 && !crNameEscapesHere(own) { return 0 }
   tErrCoded(
     "'"
       + npKeys[slot]
@@ -6415,6 +6466,7 @@ function crReset() {
   crHandleMemo = Map()
   crOpOpaque = Map()
   crOpCall = Map()
+  crNoPlaceMemo = Map()
   0
 }
 
@@ -7117,6 +7169,21 @@ function crLambdaEscapes(fnIx: i32): i32 {
   }
   if esc.indexOf("," + h + ",") >= 0 { return 1 }
   0
+}
+
+// Whether `name` is used in the body being checked other than as its own callee.
+function crNameEscapesHere(name: string): boolean {
+  let body = crProgRoot
+  if crFnIxs.length >= 1 {
+    const pf = P.nodes[crFnIxs[crFnIxs.length - 1]]
+    if pf is FuncDecl { body = pf.fnBody }
+  }
+  let esc = crEscNames[body] ?? ""
+  if esc == "" {
+    esc = crEscWalk(body, false, ",")
+    crEscNames[body] = esc
+  }
+  esc.indexOf("," + name + ",") >= 0
 }
 
 // One walk of a body, collecting every name used other than as that body's own callee: an
