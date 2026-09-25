@@ -122,6 +122,7 @@ import {
   nodeTyBearsNull,
   nodeTyCanonObjName,
   nodeTyHasTyVar,
+  nodeTyIsArrayish,
   nodeTyIsFunc,
   nodeTyIsFuncArray,
   nodeTyIsLitUnionAlias,
@@ -10519,16 +10520,32 @@ function anonValueFitsField(vc: i32, sc: i32, valIx: i32, si: i32, mfi: i32) {
 }
 
 // May an object literal's field value (coded `vc`) be stored into DECLARED row `si`'s field
-// `mfi` (coded `sc`)? The one comparator both companion-bearing codes reach: a box by its
-// member SEQUENCE, a nested struct by whether its two element rows box one. Refutation-only,
+// `mfi` (coded `sc`)? A differing code by layout; an equal companion-bearing one as a box by
+// its member SEQUENCE, a nested struct by whether its two element rows box one. Refutation-only,
 // and the caller asks it only for a row the literal's own destination does not name (D1694).
 function declRowFieldFits(vc: i32, sc: i32, valIx: i32, si: i32, mfi: i32) {
   // A declared field's code can differ from the value's through adoption, so a differing code
-  // is lenient — except between a STRING-list slot (6) and a named-heap one (5, 15, 28), which
-  // are one wasm layout apart with no adoption between them (D1704).
+  // is lenient — except between a named-heap slot (5, 15, 28) and one whose code alone decides
+  // its layout (a scalar, a string, a scalar or string list): no adoption crosses that line,
+  // whatever field names the two rows share (D2423).
   if vc != sc {
-    if sc == 6 && fieldCodeRefsElemHeapC(vc) { return false }
-    if vc == 6 && fieldCodeRefsElemHeapC(sc) { return false }
+    if fieldCodeRefsElemHeapC(vc) && anonCodeIsSelfContained(sc) {
+      return false
+    }
+    if anonCodeIsSelfContained(vc) && fieldCodeRefsElemHeapC(sc) {
+      return false
+    }
+    // A record is no list of records, nullable or not.
+    if (
+      (vc == 15) != (sc == 15)
+      && fieldCodeRefsElemHeapC(vc)
+      && fieldCodeRefsElemHeapC(sc)
+    ) {
+      return false
+    }
+    // Two scalar-list layouts differ by element: a literal re-encodes only into the row its
+    // own destination names, which the caller has already excluded.
+    if fieldCodeIsFlatList(vc) && fieldCodeIsFlatList(sc) { return false }
     return true
   }
   const vn = anonFieldElemName(valIx, vc)
@@ -10537,6 +10554,12 @@ function declRowFieldFits(vc: i32, sc: i32, valIx: i32, si: i32, mfi: i32) {
   if fn == "" { return true }
   if sc == 16 { return unionMemberSetsCompat(vn, fn) }
   elemRowsCaptureCompat(vn, fn)
+}
+
+// Is field code `c` a list whose layout its code alone decides: an `i32`, `f64`, `i64`, `f32`,
+// `u8` or `string` list?
+function fieldCodeIsFlatList(c: i32): boolean {
+  c == 4 || c == 6 || c == 25 || c == 26 || c == 27 || c == 35
 }
 
 // An open-addressed pair table, generation-stamped so a new walk costs no clearing: a slot is
@@ -10851,11 +10874,14 @@ function structIndexOfObjCtxGo(objIx: i32, fnIx: i32) {
                 // The remaining value axes, of which the f64 and i64 checks are special cases.
                 ok = false
               }
-              // A companion-bearing field on a DECLARED row, asked only where the literal's
-              // own destination names a different row: a preference, not a refusal, since
-              // delivery is what earns a declared box's widening and a declared element's
-              // own spelling (D1690, D1694).
-              if ok && (sc == 16 || fieldCodeRefsElemHeapC(sc) || sc == 6) {
+              // A companion-bearing or differently-coded field on a DECLARED row, asked only
+              // where the literal's own destination names a different row: a preference, not
+              // a refusal, since delivery is what earns a declared box's widening and a
+              // declared element's own spelling (D1690, D1694).
+              if (
+                ok
+                && (vc != sc || sc == 16 || fieldCodeRefsElemHeapC(sc) || sc == 6)
+              ) {
                 if !sIsAnonRow(si) {
                   if dstRow == 0 - 2 {
                     dstRow = repRowOfTyStruct(nodeRepTyIxOf(objIx), sLimA)
@@ -21991,6 +22017,9 @@ function anonFieldCodeSyn(valIx: i32) {
       // A concat of string VALUES has no literal in its chain: the recorded type says string,
       // and the arena rung below codes it (D2305).
       if tyPrimNameOf(nodeTyIxOf(valIx)) == "string" { return -1 }
+      // A list concatenation is a list, never arithmetic: the arena rung codes its field the
+      // way it codes any other list-valued one (D2382).
+      if nodeTyIsArrayish(valIx) { return -1 }
       return anonArithFieldCode(valIx)
     }
     return -1

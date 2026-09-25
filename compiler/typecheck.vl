@@ -715,6 +715,8 @@ const CSTR_ANYFN = -2
 let argCstrAt: i32[] = []
 let argCstrExp: i32[] = []
 let argCstrWho: string[] = []
+// The owning declaration, for the by-name `TyVar` reason `noteBinCstr` stamps one (D2424).
+let argCstrFn: i32[] = []
 
 // D401 — deferred `print` constraints over un-annotated-param and type-parameter holes.
 // `print` takes one value of `printDomainStr()`, and the two floors that say so
@@ -3786,6 +3788,7 @@ export function initChecker() {
   argCstrAt = []
   argCstrExp = []
   argCstrWho = []
+  argCstrFn = []
   printCstrTy = []
   printCstrIx = []
   printCstrFn = []
@@ -24780,14 +24783,18 @@ function binOpDefinedFor(op: string, lt0: i32, rt0: i32) {
 // of the enclosing body's own holes, which surfaces through that hole's own bindings instead.
 function noteArgCstr(at: i32, exp: i32, who: string) {
   if tyIsDeferredJoin(exp) { return 0 }
+  const owner = cstrOwnerTop()
   let k = 0
   while k < argCstrAt.length {
-    if argCstrAt[k] == at && argCstrExp[k] == exp { return 0 }
+    if argCstrAt[k] == at && argCstrExp[k] == exp && argCstrFn[k] == owner {
+      return 0
+    }
     k = k + 1
   }
   argCstrAt.push(at)
   argCstrExp.push(exp)
   argCstrWho.push(who)
+  argCstrFn.push(owner)
   0
 }
 
@@ -25068,6 +25075,7 @@ function solveUnannotParams(fnIx: i32) {
       argCstrAt.pop()
       argCstrExp.pop()
       argCstrWho.pop()
+      argCstrFn.pop()
     }
     while printCstrTy.length > savedPrintN {
       printCstrTy.pop()
@@ -25171,17 +25179,26 @@ function validateEscJoins(bNames: string[], bTys: i32[]) {
   0
 }
 
-// Re-validates every deferred call-argument constraint this call resolves: substitutes the
-// hole to the call's concrete argument type and checks it against the recorded param type. A
-// hole that substitutes to another hole (the callee's hole re-based to the caller's) is
-// re-recorded under that hole, or nothing re-checks it once the outer call finally pins it.
-function validateArgCstrs(bNames: string[], bTys: i32[], ix: i32) {
+// Re-validates every deferred call-argument constraint this call's callee owns
+// (`cstrOwnedBy`), substituting the hole to the call's argument type. A hole that substitutes
+// to another hole is re-recorded under it for the outer call that pins it, and only where the
+// callee is named, as `validateBinCstrs` does.
+function validateArgCstrs(
+  bNames: string[],
+  bTys: i32[],
+  ix: i32,
+  calleeFn: i32,
+) {
   const nOrig = argCstrAt.length
   let ci = 0
   while ci < nOrig {
+    if !cstrOwnedBy(argCstrFn[ci], calleeFn) {
+      ci = ci + 1
+      continue
+    }
     const rat = substTyDeep(argCstrAt[ci], bNames, bTys)
     const rexp = substTyDeep(argCstrExp[ci], bNames, bTys)
-    if rat != argCstrAt[ci] {
+    if rat != argCstrAt[ci] && calleeFn >= 0 {
       if tyIsHole(rat) || tyIsDeferredJoin(rat) {
         if !tyIsHole(rexp) { noteArgCstr(rat, rexp, argCstrWho[ci]) }
       }
@@ -29965,7 +29982,7 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
     )
     validatePrintCstrs(bNames, bTys, ix, cstrCallee, cstrWho)
     validateNestCstrs(bNames, bTys, ix, cstrCallee, cstrWho)
-    validateArgCstrs(bNames, bTys, ix)
+    validateArgCstrs(bNames, bTys, ix, cstrCallee)
     // The declared return rides the same pin: the body's mismatch check is vacuous under
     // a hole, and this is the first position that knows the instance (D551).
     validateRetCstrs(bNames, bTys, ix, cstrCallee, cstrWho)
