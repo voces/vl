@@ -717,6 +717,9 @@ let argCstrExp: i32[] = []
 let argCstrWho: string[] = []
 // The owning declaration, for the by-name `TyVar` reason `noteBinCstr` stamps one (D2424).
 let argCstrFn: i32[] = []
+// Whether the demand is a template hole meeting its renderer, which also delivers a `string`
+// without the call (`tplHoleHandled`), so its domain is `string` plus the renderer's (D2241).
+let argCstrTpl: boolean[] = []
 
 // D401 — deferred `print` constraints over un-annotated-param and type-parameter holes.
 // `print` takes one value of `printDomainStr()`, and the two floors that say so
@@ -3789,6 +3792,7 @@ export function initChecker() {
   argCstrExp = []
   argCstrWho = []
   argCstrFn = []
+  argCstrTpl = []
   printCstrTy = []
   printCstrIx = []
   printCstrFn = []
@@ -23588,8 +23592,12 @@ function tplHoleHandled(
   expected: i32,
 ) {
   // A string-literal type or a union of them is a set of strings, delivered as one (D1485).
+  // Not rewritten under a pinned re-check: the body is every instance's, and the emitter
+  // delivers a string-pinned hole itself (`tplStrHoleOf`, D2241).
   if isStringTy(softenLitTy(at)) {
-    arenaReplaceNode(callIx, mkParen(holeIx, callPos))
+    if monoRecheckDepth == 0 {
+      arenaReplaceNode(callIx, mkParen(holeIx, callPos))
+    }
     return true
   }
   if at < 0 { return false }
@@ -24824,13 +24832,13 @@ function binOpDefinedFor(op: string, lt0: i32, rt0: i32) {
 // concrete param type `exp` of callee `who`. Idempotent per `(at, exp)`. An `exp` still
 // carrying a hole is not recorded — after substitution at the inner call it can only be one
 // of the enclosing body's own holes, which surfaces through that hole's own bindings instead.
-function noteArgCstr(at: i32, exp: i32, who: string) {
+function noteArgCstr(at: i32, exp: i32, who: string, tpl: boolean) {
   if tyIsDeferredJoin(exp) { return 0 }
   const owner = cstrOwnerTop()
   let k = 0
   while k < argCstrAt.length {
     if argCstrAt[k] == at && argCstrExp[k] == exp && argCstrFn[k] == owner {
-      return 0
+      if argCstrTpl[k] == tpl { return 0 }
     }
     k = k + 1
   }
@@ -24838,7 +24846,15 @@ function noteArgCstr(at: i32, exp: i32, who: string) {
   argCstrExp.push(exp)
   argCstrWho.push(who)
   argCstrFn.push(owner)
+  argCstrTpl.push(tpl)
   0
+}
+
+// Whether a resolved argument demand holds: `rat` fits `rexp`, or the demand is a template
+// hole's and `rat` is a string, which the hole delivers without its renderer.
+function argCstrFits(rat: i32, rexp: i32, tpl: boolean) {
+  if tpl && isStringTy(softenLitTy(rat)) { return true }
+  assignable(rat, rexp)
 }
 
 // Records a deferred `print` constraint when the printed type still carries a hole, so the
@@ -25119,6 +25135,7 @@ function solveUnannotParams(fnIx: i32) {
       argCstrExp.pop()
       argCstrWho.pop()
       argCstrFn.pop()
+      argCstrTpl.pop()
     }
     while printCstrTy.length > savedPrintN {
       printCstrTy.pop()
@@ -25222,6 +25239,32 @@ function validateEscJoins(bNames: string[], bTys: i32[]) {
   0
 }
 
+// Raises demand `ci`'s refusal at call `ix`, in the direct spelling's words: a template
+// hole's is `tplHoleHandled`'s sentence, any other names the callee.
+function argCstrErr(rat: i32, rexp: i32, ci: i32, ix: i32) {
+  if argCstrTpl[ci] {
+    return tErr(
+      "an interpolation hole is `string` or "
+        + tyToStr(rexp)
+        + " — this one is "
+        + tyToStr(rat),
+      ix,
+    )
+  }
+  let who = argCstrWho[ci]
+  if who == "" { who = "a call" } else { who = "`" + who + "`" }
+  tErr(
+    "argument of type "
+      + tyToStr(rat)
+      + " flows into "
+      + who
+      + " expecting "
+      + tyToStr(rexp)
+      + " (the call's argument types)",
+    ix,
+  )
+}
+
 // Re-validates every deferred call-argument constraint this call's callee owns
 // (`cstrOwnedBy`), substituting the hole to the call's argument type. A hole that substitutes
 // to another hole is re-recorded under it for the outer call that pins it, and only where the
@@ -25243,26 +25286,17 @@ function validateArgCstrs(
     const rexp = substTyDeep(argCstrExp[ci], bNames, bTys)
     if rat != argCstrAt[ci] && calleeFn >= 0 {
       if tyIsHole(rat) || tyIsDeferredJoin(rat) {
-        if !tyIsHole(rexp) { noteArgCstr(rat, rexp, argCstrWho[ci]) }
+        if !tyIsHole(rexp) {
+          noteArgCstr(rat, rexp, argCstrWho[ci], argCstrTpl[ci])
+        }
       }
     }
     // A side still carrying a hole — bare, or as a deferred-join arm — is undecided at this
     // site and defers to the call that pins it.
     if !tyIsHole(rat) && !tyIsDeferredJoin(rat) {
       if !tyIsHole(rexp) && !tyIsDeferredJoin(rexp) {
-        if !assignable(rat, rexp) {
-          let who = argCstrWho[ci]
-          if who == "" { who = "a call" } else { who = "`" + who + "`" }
-          tErr(
-            "argument of type "
-              + tyToStr(rat)
-              + " flows into "
-              + who
-              + " expecting "
-              + tyToStr(rexp)
-              + " (the call's argument types)",
-            ix,
-          )
+        if !argCstrFits(rat, rexp, argCstrTpl[ci]) {
+          argCstrErr(rat, rexp, ci, ix)
         }
       }
     }
@@ -25672,7 +25706,7 @@ function argCstrsHold(bNames: string[], bTys: i32[]) {
     const rexp = substTyDeep(argCstrExp[ci], bNames, bTys)
     if !tyIsHole(rat) && !tyIsDeferredJoin(rat) {
       if !tyIsHole(rexp) && !tyIsDeferredJoin(rexp) {
-        if !assignable(rat, rexp) { return false }
+        if !argCstrFits(rat, rexp, argCstrTpl[ci]) { return false }
       }
     }
     ci = ci + 1
@@ -26058,6 +26092,60 @@ function argIsOwnGenericFnValue(argIx: i32): boolean {
       const fd = P.nodes[d]
       if fd is FuncDecl { return fd.fnTyParams.length > 0 }
     }
+  }
+  false
+}
+
+// The order `checkCall` checks a call's arguments in: source order, except that a function
+// whose parameters are still open, headed for a parameter riding a type variable, goes after
+// the rest, so the variable is bound from the values and never to the function's own hole.
+function lambdaLastOrder(params: i32[], args: i32[]): i32[] {
+  const order: i32[] = []
+  const later: i32[] = []
+  let i = 0
+  while i < args.length {
+    if i < params.length && tyHasTyVar(params[i]) && argHasOpenParams(args[i]) {
+      later.push(i)
+    } else {
+      order.push(i)
+    }
+    i = i + 1
+  }
+  let k = 0
+  while k < later.length {
+    order.push(later[k])
+    k = k + 1
+  }
+  order
+}
+
+// Is this argument a function whose parameters are still open: a literal with an
+// un-annotated parameter (D2426), or a declared generic named as a value (D2425)?
+function argHasOpenParams(argIx: i32): boolean {
+  if argIx < 0 || argIx >= P.nodes.length { return false }
+  const ax = cwPeel(argIx)
+  if ax < 0 || ax >= P.nodes.length { return false }
+  // A name resolves to its declaration; any other node is its own candidate.
+  let d = ax
+  const a = P.nodes[ax]
+  if a is Ident { d = fnDeclIx[a.identName] ?? CSTR_NODECL }
+  if d < 0 || d >= P.nodes.length { return false }
+  const fd = P.nodes[d]
+  if fd is FuncDecl {
+    if fd.fnTyParams.length > 0 { return true }
+    return fnDeclHasUnannotParam(fd)
+  }
+  false
+}
+
+function fnDeclHasUnannotParam(fd: FuncDecl): boolean {
+  let k = 0
+  while k < fd.fnParams.length {
+    const p = P.nodes[fd.fnParams[k]]
+    if p is Param {
+      if p.parType < 0 { return true }
+    }
+    k = k + 1
   }
   false
 }
@@ -28509,6 +28597,9 @@ function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
           fnDeclIx[name] ?? CSTR_NODECL,
           plainName,
         )
+        // A call argument inside the body, at the UFCS half for the same symmetry: `"s".inc()`
+        // and `inc("s")` must answer the same way (D2425).
+        validateArgCstrs(bNames, bTys, ix, fnDeclIx[name] ?? CSTR_NODECL)
         // The declared return, at the UFCS half for the same symmetry: `p.g()` and `g(p)`
         // must answer the same way, or the method spelling of D551's family stays silent beside a loud direct one.
         validateRetCstrs(
@@ -29883,8 +29974,10 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
   // `let n: i32 = id("s")` is a genuine type error downstream.
   const bNames: string[] = []
   const bTys: i32[] = []
-  let i = 0
-  while i < args.length {
+  const argOrder = lambdaLastOrder(params, args)
+  let oi = 0
+  while oi < argOrder.length {
+    const i = argOrder[oi]
     // Contextual param inference for a function-value argument: propagates the expected
     // param type into it so an un-annotated literal param infers from the signature
     // (matching `.map`/`.filter`), substituting type-param bindings from earlier arguments
@@ -29934,7 +30027,7 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
       if !tyIsHole(expected) {
         let ccWho = ""
         if cfn is Ident { ccWho = cfn.identName }
-        noteArgCstr(atCstr, expected, ccWho)
+        noteArgCstr(atCstr, expected, ccWho, nodeIsTplHole(args[i]))
       }
     }
     // A hole param whose body DEMANDED fields (member access on the hole)
@@ -29978,7 +30071,7 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
         }
       }
     }
-    i = i + 1
+    oi = oi + 1
   }
   // After the arguments, so a mismatched argument gets the more specific diagnostic first;
   // the answer itself is the callee's declaration, not this site's bindings.
@@ -39763,6 +39856,10 @@ export function monoInferListElem(
   listName
 }
 
+// How many pinned re-checks (`monoRecheckBegin`) are open. The body under one is shared by
+// every instance, so a check-time arena rewrite that depends on the pin must not run.
+let monoRecheckDepth = 0
+
 // The pinned re-check itself, in one home, opened and closed around the caller's read.
 // `monoInferListElem`, `monoInferLocalScalar` and `monoInferRetExprTy` ask the same question,
 // differing only in what they read back. Split into begin/end rather than a result selector
@@ -39781,6 +39878,7 @@ function monoRecheckBegin(
   if !(body is Block) { return false }
   // Snapshot the suppression flags and every append-only inference/diagnostic table. The
   // order is the contract `monoRecheckEnd` reads back; keep the two in step.
+  monoRecheckDepth = monoRecheckDepth + 1
   let q = 0
   if inferQuiet { q = 1 }
   sv.push(q)
@@ -39845,6 +39943,7 @@ function monoRecheckBegin(
 // append-only table back to `sv`'s saved length, then restores the flags and the diagnostic
 // stream — so the global checker state the emitter still reads matches its original values.
 function monoRecheckEnd(sv: i32[]) {
+  monoRecheckDepth = monoRecheckDepth - 1
   popScope()
   crFnLeave()
   while tpEnvNames.length > sv[17] {
