@@ -7956,9 +7956,16 @@ elements (`for x, i in s` pairs each element with its position, as a list does).
 index (`s[x]` is refused with a sentence naming `has`/`add`), no `get`/`set`, and no relation
 to `T[]` or `{[K]: V}`: neither is assignable to it and it is assignable to neither. It is
 invariant in its element. `Set()` and `Set<T>()` construct it, and it prints as `Set<T>` in
-hover and diagnostics. `{[K]: boolean}` stays legal and means a plain map of booleans, built
-by `Map()`, with nothing changed — including `.add(k)`, which a boolean-valued map has kept
-since B6a. There is no forced migration: `Set()` had zero uses in plumb, glean, veldt, sunsuz
+hover and diagnostics. One union is refused for now: a `Set<K>` beside a map whose value is one
+i32 cell (`{[K]: boolean}`, `{[K]: i32}`, a literal union), because the two lower to the same map
+struct and a union box could not tell them apart (D2493, which lifts the refusal). On master that
+union collapsed to one type, so `f(x: Set<string> | {[string]: boolean} | null)` called as
+`f(null)` ran and is now a check refusal: a loud runs→not-runs. `{[K]: boolean}` stays legal and means a plain map of booleans, built
+by `Map()`, with one change: **`.add` is a Set method only** (owner ruling, 2026-09-25, after
+#3158's review counted zero call sites in the repo and every consumer). On a boolean-valued map
+it is refused with "`.add` is a `Set` method — use `m[k] = true`, or make it a `Set<K>`"; B6a had
+admitted it there because the set flavor used to live in the binding, which Q2 retires. There is
+no forced migration: `Set()` had zero uses in plumb, glean, veldt, sunsuz
 and webcraft on 2026-09-25, and the in-repo uses (29 fixtures, one bench, 108 curated corpus
 cells and four grid generators) were rewritten from `{[K]: boolean} = Set()` to `Set<K>`.
 

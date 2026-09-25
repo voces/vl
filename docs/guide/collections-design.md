@@ -40,7 +40,9 @@ which retires §C2's interface reading — see the banner there). **`Set<T>` is 
 (ruling Q2): `add`, `has`, `delete`, `keys()`/`values()` (the elements, `T[]`), `length` and
 `for x in s`; no index and no `get`/`set`; and it is neither a list nor a map, so it flows
 to no `T[]` or `{[K]: V}` destination and neither flows to it. It prints as `Set<T>`.
-`{[K]: boolean}` is still legal and is a plain map of booleans, built with `Map()`. A bare
+`{[K]: boolean}` is still legal and is a plain map of booleans, built with `Map()`; it inserts
+with `m[k] = true`, since `.add` is a Set method. A set and a map whose value is one `i32` cell
+(`boolean`, `i32`, a literal union) cannot share a union yet (D2493). A bare
 `Map` or `Set` with no type arguments is not a type — the checker says
 `` `Map` needs its key and value types — write `Map<K, V>` ``.
 
@@ -1118,7 +1120,7 @@ the `self` param wears."
 > positional or membership subscript: `s[x]` is refused with a sentence naming `has`/`add`.
 > Q2 also settles the paragraph below that relates a set to the `{[i32]: T}` sequence core:
 > a set has no relation to lists or maps, so it is a subtype of neither. It is invariant in
-> `T`. `{[T]: boolean}` stays legal as a plain map of booleans.
+> `T`. `{[T]: boolean}` stays legal as a plain map of booleans, without `.add`.
 
 **Decision.** `Set<T>` is a **distinct concrete type** with its own surface — it is
 **not** spelled, and not structurally equal to, `{[T]:boolean}`. Its surface is:
