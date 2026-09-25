@@ -76,6 +76,7 @@ import {
   ifYieldsNoValue,
   inferRetBearsNull,
   inferRetFnKey,
+  inferRetIsNulList,
   inferRetNameByNode,
   inferRetNameOf,
   inferRetRowByNode,
@@ -16189,6 +16190,9 @@ export function fnRetNullBearing(fnIx: i32) {
   if retNulStringFlag(r) == 1 { return true }
   if retNulRefFlag(r) == 1 { return true }
   if retNulListFlag(r) == 1 { return true }
+  // Every list rep `emitNullForRet` has a `ref.null` for, not only the i32-backed one (D2495).
+  if nulScalarListKindOfNode(r) != null { return true }
+  if retNulRefArrFlag(r) == 1 { return true }
   if retNulMapFlag(r) == 1 { return true }
   // The arena, not the render's `|`-split: `nodeTyBearsNull` covers both shapes
   // `retUnionFlag` admits (a `TyUnion` with a `null` member and a `TyNullable` scalar).
@@ -16251,6 +16255,20 @@ export function assignTargetReReads(asgIx: i32, fnIx: i32): boolean {
   tySame(tt, nodeTyIxOf(asgIx))
 }
 
+// Whether the assignment at `asgIx` writes a field or an element, the targets `spillTail`
+// turns into a store of a spilled value followed by a read of it. A bare `null` is not
+// spilled: its value has no rep of its own to hold.
+function assignTargetSpills(asgIx: i32): boolean {
+  const a = P.nodes[asgIx]
+  if !(a is BinExpr) { return false }
+  if a.binOp != "=" { return false }
+  const v = unwrapParen(a.binRight)
+  if v < 0 || P.nodes[v] is NullLit { return false }
+  const t = unwrapParen(a.binLeft)
+  if t < 0 { return false }
+  P.nodes[t] is Member || P.nodes[t] is Index
+}
+
 // True if the statement at `stmtIx` is a bare value expression usable as an implicit
 // return — no `return` keyword needed. Recognized: literals, an identifier, a unary, a
 // non-assignment `BinExpr`, a paren, a member/index access, an `is` guard, an
@@ -16280,8 +16298,10 @@ export function stmtIsTailValue(stmtIx: i32, fnIx: i32) {
   if s is BinExpr {
     if s.binOp == "=" {
       // A trailing assignment is a tail value — assignment yields its right side (DECISIONS:
-      // assignment-as-expression) — wherever `assignTargetReReads` can deliver it.
-      return assignTargetReReads(stmtIx, fnIx)
+      // assignment-as-expression): re-read where `assignTargetReReads` can, and any other
+      // field or element write is rewritten by `spillTail` to yield its spilled value (D2496).
+      if assignTargetReReads(stmtIx, fnIx) { return true }
+      return assignTargetSpills(stmtIx)
     }
     return true
   }
@@ -16358,18 +16378,72 @@ export function blockTailIsValue(blockIx: i32, fnIx: i32) {
 }
 
 // D1029/D1032/D1034 — is the nullable inference's non-voidness real? `inferRetBearsNull`
-// exists for an else-less tail `if c { 5 }`, whose fall-through is the `null`. Three other
-// tail shapes (an empty arm, a bare-return guard, an index-target assignment) are not
-// values at all, so the veto applies only where the tail `if`'s arms end in values.
+// exists for an else-less tail `if c { 5 }`, whose fall-through is the `null`. An empty arm or
+// a bare-return guard is not a value, and an arm ending in a spilled write is one only where
+// that `null` lowers (D2496).
 export function tailIfNullableIsReal(blockIx: i32, fnIx: i32): boolean {
   const b = P.nodes[blockIx]
   if b is Block {
     const n = b.blkStmts.length
     if n == 0 { return true }
-    const s = P.nodes[b.blkStmts[n - 1]]
-    if s is IfStmt { return ifArmsAllValues(b.blkStmts[n - 1], fnIx) }
+    const last = b.blkStmts[n - 1]
+    if P.nodes[last] is IfStmt {
+      if !ifArmsAllValues(last, fnIx) { return false }
+      return !ifArmEndsInSpill(last, fnIx) || inferNullFallsThrough(fnIx)
+    }
   }
   true
+}
+
+// Whether some arm of the `if`/`else if` chain at `stmtIx` ends in a write only `spillTail`
+// can deliver as a value.
+function ifArmEndsInSpill(stmtIx: i32, fnIx: i32): boolean {
+  let cur = stmtIx
+  while cur >= 0 {
+    const s = P.nodes[cur]
+    if !(s is IfStmt) { return false }
+    if blockEndsInSpill(s.ifThen, fnIx) { return true }
+    if s.ifElse < 0 { return false }
+    if P.nodes[s.ifElse] is Block { return blockEndsInSpill(s.ifElse, fnIx) }
+    cur = s.ifElse
+  }
+  false
+}
+
+// Whether the block at `blockIx` ends in a write `assignTargetSpills` accepts and
+// `assignTargetReReads` does not.
+function blockEndsInSpill(blockIx: i32, fnIx: i32): boolean {
+  const b = P.nodes[blockIx]
+  if !(b is Block) { return false }
+  const n = b.blkStmts.length
+  if n == 0 { return false }
+  const last = b.blkStmts[n - 1]
+  if P.nodes[last] is IfStmt { return ifArmEndsInSpill(last, fnIx) }
+  assignTargetSpills(last) && !assignTargetReReads(last, fnIx)
+}
+
+// Whether the function at `fnIx` can return the `null` its inferred nullable return falls
+// through to: a rep `fnRetNullBearing` reads now, or one `synthNulListRetAnns` pins later.
+function inferNullFallsThrough(fnIx: i32): boolean {
+  if fnRetNullBearing(fnIx) { return true }
+  const fn = P.nodes[fnIx]
+  if !(fn is FuncDecl) { return false }
+  if fn.fnRet >= 0 { return false }
+  if inferRetNulPinned(inferRetFnKey(fnIx, fn.fnName)) { return true }
+  // An anonymous lambda's row is keyed by its node, which `fnRetNullBearing` does not ask.
+  const nk = "#" + i32ToStr(fnIx)
+  if inferRetNulPinned(nk) || inferNicheNullByName(nk) != "" { return true }
+  isValueUnionName(inferRetNameOf(nk)) && inferRetBearsNull(nk)
+}
+
+// The inferred returns `synthNulListRetAnns` pins: a nullable list, or a nullable declared
+// struct row resolved by the pair `inferNulStructRow` asks, so the pin and `retNulRefIndex`
+// cannot resolve different rows (D1220).
+export function inferRetNulPinned(irk: string): boolean {
+  if inferRetIsNulList(irk) { return true }
+  const part = nullablePartOf(inferRetNameOf(irk))
+  if part == "" { return false }
+  structIndexOfTypeName(part) >= 0
 }
 
 // Every arm of the `if`/`else if` chain at `stmtIx` ends in a bare tail VALUE. An EMPTY arm
