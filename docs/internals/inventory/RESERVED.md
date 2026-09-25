@@ -73,3 +73,4 @@ D2280-D2282  pl031-lane  2026-09-23  PL-031 map tombstone hang
 D2309-D2312  plumb-compile-perf  2026-09-24
 D2335-D2338  plumb-tail-units  2026-09-24
 D2407-D2410  lane-N  2026-09-25  narrowing invalidation (D2400-D2405 closes; D2407, D2408 filed)
+D2475-D2478  lane-S2  2026-09-25  unreachable self-functions (D2475-D2477 filed and closed)

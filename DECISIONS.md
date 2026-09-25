@@ -7975,3 +7975,46 @@ every spelling of `Set<T>` now sets, instead of in the binding that called `Set(
 reads it from the expression's type (`setShapeOfTy`), so a set passed through a parameter,
 field or return walks its elements (D2469, which printed `true`s), and the bound `.values()` of
 a bare `Set()` builds (D2470).
+
+## A self-function the resolution order can never reach is an error (owner ruling, 2026-09-25) — D2475
+
+**Ruled (collections Q6, generalised by the owner): a `self`-function whose name `recv.name(…)`
+would never reach is refused at its declaration.** `recv.name(args)` resolves in one order — a
+built-in method of the receiver's kind (list, map/set, string), then a field of the receiver
+type (a closure-typed field is called), then a `self`-function in scope — so a function named
+after a member every admitted receiver already has is dead code. Before the ruling
+`function get(self: {[i32]: i32}, k: i32)` was accepted and `m.get(1)` silently called the
+built-in; on a list, a set or a string the emitter even called the function the checker had not
+typed (D2476). The refusal names the member and the rung, and never says "built-in":
+
+> `get` is already a method of `{[i32]: i32}`, so `m.get(…)` would never call this function — rename it
+>
+> `x` is already a field of `P`, so `p.x(…)` would never call this function — rename it
+
+(code `self-fn-shadowed`, data `member` / `recv` / `rung`).
+
+**IT IS DECIDED BY THE DECLARED `self` TYPE, AND ONLY WHEN EVERY RECEIVER IT ADMITS IS SHADOWED.**
+A free function named `get` over an unrelated type stays fine; so does one whose `self` a
+receiver without the member can reach:
+
+* **a type-parameter `self` is never refused.** `function slice<T>(self: T, …)` is reached by
+  `(3).slice(…)` and shadowed by `"s".slice(…)`; the call site decides, per receiver, and the
+  emitter follows the checker's answer there (D2476). Refusing only when EVERY instantiation
+  would shadow is the conservative reading the lane was given, and for a bare `T` no such
+  bound is checked — a bound that itself names a field (`T: {x: i32}` with `x(self: T)`) is
+  therefore accepted although no instantiation reaches it. A `T[]` or `{[K]: V}` `self` is not
+  a type parameter: every instantiation is a list or a map, so `push<T>(self: T[], …)` is refused.
+* **a nullable or union `self` is not refused** (`x(self: P | null)`): the null receiver, or a
+  union receiver with no common field, reaches the function.
+* **a map and a `Set<T>` answer from their own tables**, since #3158 made them distinct types
+  (neither is assignable to the other): `has`/`delete`/`keys`/`values` are members of both,
+  `get`/`set` of a map only and `add` of a set only. So `get(self: Set<T>, …)` and
+  `add(self: {[K]: boolean}, …)` are legal and reached; on the map the function answers before
+  the "`.add` is a `Set` method" hint, which is for a map with no such function in scope.
+* **`length` and `size` are member reads**, not methods, so `xs.length()` reaches a function
+  named `length`.
+
+Why an error rather than a lint: the function is not merely unused, it is unreachable by the
+spelling its `self` parameter exists for, and the author's intent — to override or extend the
+member — is exactly what the language will not do. A warning would leave the silent half in
+place for anyone who does not read warnings; the rename costs one word.

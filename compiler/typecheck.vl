@@ -113,6 +113,7 @@ import {
   ufcsSiteAdd,
   ufcsSpecAlreadyImported,
 } from "./ast"
+import { MC_RUNG_BUILTIN, MC_RUNG_SELF_FN, memberCallRungAdd } from "./ast"
 // Getter declarations (property-access-design.md §D3a).
 import { getDeclExported, getDeclLabel, getDeclPropOf, mkIdent } from "./ast"
 // The free index-operator declaration-name encoding (B14).
@@ -461,6 +462,10 @@ const CODE_RANGE_NEVER_RUNS = "range-never-runs"
 // D2390 — a read of a bare name whose narrowing a call ended: refused in the call's own
 // statement, or a type error in a later one naming the call. No payload.
 const CODE_NARROWING_ENDED_BY_CALL = "narrowing-ended-by-call"
+
+// D2475 — a `self`-function whose name the receiver type already defines as a method or a
+// field, so the member call never reaches it. Data: `member`, `recv`, `rung` (`method`/`field`).
+const CODE_SELF_FN_SHADOWED = "self-fn-shadowed"
 
 // ── checker state (one struct, held in the global `T`) ───────────────────────
 
@@ -12642,6 +12647,104 @@ function mapMethodNames(recvTy: i32) {
     if rt.mSet == 1 { out.push("add") }
   }
   out
+}
+
+const noMethodNames: string[] = []
+
+// The built-in method names of a receiver of `recvTy`'s representation, from the tables
+// above; a record, function, union, nullable, type parameter, literal or negation has none.
+function builtinMethodNamesOf(recvTy: i32): string[] {
+  if recvTy < 0 { return noMethodNames }
+  const ix = nomErasedTyIx(recvTy)
+  if ix < 0 || ix >= T.tys.length { return noMethodNames }
+  const t = T.tys[ix]
+  match t {
+    TyArray => {
+      return listMethodNames
+    }
+    TyMap => {
+      return mapMethodNames(ix)
+    }
+    TyPrim => {
+      if t.primName == "string" { return strMethodNames }
+    }
+    TyErr | TyObj | TyFunc | TyUnion | TyNullable | TyVar | TyLit | TyNeg => {}
+  }
+  noMethodNames
+}
+
+// Whether a built-in method arm of `checkMemberCallNode` claims `recv.prop(…)`. `length` and
+// `size` are member reads, so their call spelling falls through to a `self`-function.
+function builtinMethodClaims(recvTy: i32, prop: string): boolean {
+  if prop == "length" || prop == "size" { return false }
+  nameInList(builtinMethodNamesOf(recvTy), prop)
+}
+
+// The rung of `recv.name(…)` that claims `name` for every receiver a `self` parameter of
+// `selfTy` admits, so a `self`-function of that name is never called: `SHADOW_METHOD`,
+// `SHADOW_FIELD`, or 0. A type parameter answers 0: some instantiation may lack the member.
+// A map and a `Set` are distinct types, so each answers from its own method table.
+const SHADOW_METHOD = 1
+const SHADOW_FIELD = 2
+function selfFnShadowRung(selfTy: i32, name: string): i32 {
+  if selfTy < 0 { return 0 }
+  const recvTy = strLitRecvTy(selfTy)
+  if recvTy < 0 || recvTy >= T.tys.length { return 0 }
+  const rt = T.tys[recvTy]
+  if rt is TyVar { return 0 }
+  if builtinMethodClaims(recvTy, name) { return SHADOW_METHOD }
+  if tyFieldTyOf(recvTy, name) >= 0 { return SHADOW_FIELD }
+  0
+}
+
+// A receiver's conventional spelling in the refusal's example call, so the sentence
+// reads `m.get(…)` or `p.x(…)` rather than naming the parameter `self` back to its author.
+function selfFnRecvSpelling(selfTy: i32): string {
+  const t = T.tys[nomErasedTyIx(strLitRecvTy(selfTy))]
+  match t {
+    TyArray => {
+      return "xs"
+    }
+    TyMap => {
+      if t.mSet == 1 { return "s" }
+      return "m"
+    }
+    TyPrim => {
+      return "s"
+    }
+    TyErr | TyObj | TyFunc | TyUnion | TyNullable | TyVar | TyLit | TyNeg => {}
+  }
+  "p"
+}
+
+// A `self`-function the member-call order can never reach is refused at its declaration
+// (DECISIONS.md, D2475): the receiver type already defines `name`, and that member is
+// what `recv.name(…)` calls. Coded, with `member`, `recv` and `rung` (`method`/`field`) as data.
+function checkSelfFnReachable(name: string, selfTy: i32, fnIx: i32) {
+  const rung = selfFnShadowRung(selfTy, name)
+  if rung == 0 { return 0 }
+  let what = "method"
+  if rung == SHADOW_FIELD { what = "field" }
+  const recv = demangleMsg(tyToStr(selfTy))
+  tErrCodedData(
+    "`"
+      + name
+      + "` is already a "
+      + what
+      + " of `"
+      + recv
+      + "`, so `"
+      + selfFnRecvSpelling(selfTy)
+      + "."
+      + name
+      + "(…)` would never call this function — rename it",
+    fnIx,
+    CODE_SELF_FN_SHADOWED,
+    diagDataField("member", name)
+      + diagDataField("recv", recv)
+      + diagDataField("rung", what),
+  )
+  0
 }
 
 // Free `self`-functions dispatchable on `recvTy` — the in-scope half of the edit-distance
@@ -30268,6 +30371,10 @@ function checkMemberCallNode(
     }
   }
   rt = T.tys[recvTy]
+  // Banked for the emitter's rewrite, which must take the rung this call took (D2476).
+  if builtinMethodClaims(recvTy, prop) {
+    memberCallRungAdd(ix, MC_RUNG_BUILTIN)
+  }
   if rt is TyArray {
     // The view's whole contract: a `readonly T[]` receiver refuses every method that
     // changes the list's own shape. An element's fields are untouched by it — the marker
@@ -30434,7 +30541,10 @@ function checkMemberCallNode(
     // carries no user FIELD, so a matching free `self`-function resolves
     // directly — the array dual of the string/struct/union UFCS paths.
     const au = ufcsCallTy(prop, recvTy, n, ix)
-    if au >= 0 { return au }
+    if au >= 0 {
+      memberCallRungAdd(ix, MC_RUNG_SELF_FN)
+      return au
+    }
     tErr(
       "no method '."
         + prop
@@ -30500,6 +30610,12 @@ function checkMemberCallNode(
     // `.add(x)` is a Set method only: a boolean-valued map is a map, and its insert is
     // `m[k] = true` (DECISIONS.md, "`{[K]: V}` and `T[]` are concrete types").
     if mp == "add" && rt.mSet == 0 && tyIsPrimNamed(rt.mVal, "boolean") {
+      // The hint yields to a `self`-function named `add`: a map has no such member (D2477).
+      const ma = ufcsCallTy(mp, recvTy, n, ix)
+      if ma >= 0 {
+        memberCallRungAdd(ix, MC_RUNG_SELF_FN)
+        return ma
+      }
       tErr(
         "`.add` is a `Set` method — use `m[k] = true`, or make it a `Set<"
           + tyToStr(rt.mKey)
@@ -30543,6 +30659,12 @@ function checkMemberCallNode(
       // A set's `.values()` yields its ELEMENTS (the keys); a map's its values.
       if rt.mSet == 1 { return mkArrayTy(rt.mKey) }
       return mkArrayTy(rt.mVal)
+    }
+    // A name no map arm claims is a `self`-function call, as on every other receiver (D2477).
+    const mu = ufcsCallTy(mp, recvTy, n, ix)
+    if mu >= 0 {
+      memberCallRungAdd(ix, MC_RUNG_SELF_FN)
+      return mu
     }
     tErr(
       "unknown property `"
@@ -30669,7 +30791,10 @@ function checkMemberCallNode(
       }
       // UFCS `self`-method on a string receiver (`"hello".first()`).
       const su = ufcsCallTy(sp, recvTy, n, ix)
-      if su >= 0 { return su }
+      if su >= 0 {
+        memberCallRungAdd(ix, MC_RUNG_SELF_FN)
+        return su
+      }
       // D1230 on a STRING receiver. This arm answers before the general one and
       // raises its own sentence at the CALL node, so it asks and raises here
       // rather than banking — `memberFloorErr` never sees a string method call.
@@ -30775,7 +30900,10 @@ function checkMemberCallNode(
   }
   if !ufcsHasField {
     const uu = ufcsCallTy(prop, recvTy, n, ix)
-    if uu >= 0 { return uu }
+    if uu >= 0 {
+      memberCallRungAdd(ix, MC_RUNG_SELF_FN)
+      return uu
+    }
     // The name is a self-function, just not one in scope (D1230) — asked here since only
     // the call knows the argument count, banked on the callee member node where the sentence is raised (`memberFloorErr`).
     noteUfcsMiss(
@@ -33756,6 +33884,14 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
   // Parameter DEFAULTS (`a: i32 = 0`, and the `a?: T` spelling the parser
   // desugars into one), checked once the annotations have resolved.
   checkParamDefaults(n, params, paramTys)
+  if n.fnName != "" && params.length > 0 {
+    const sp0 = P.nodes[params[0]]
+    if sp0 is Param {
+      if sp0.parName == "self" && sp0.parType >= 0 {
+        checkSelfFnReachable(demangleName(n.fnName), paramTys[0], fnIx)
+      }
+    }
+  }
   // Resolve the return-type annotation (or the pending sentinel when inferring).
   let ret = -2
   if !inferring {
@@ -47763,13 +47899,7 @@ function getterDeclCheck(gi: i32) {
 function getterMethodClash(gi: i32): string {
   const prop = getProps[gi]
   const selfTy = getSelfTys[gi]
-  const base = T.tys[nomErasedTyIx(selfTy)]
-  let names: string[] = []
-  if base is TyArray { names = listMethodNames }
-  if base is TyMap { names = mapMethodNames(nomErasedTyIx(selfTy)) }
-  if base is TyPrim {
-    if base.primName == "string" { names = strMethodNames }
-  }
+  const names = builtinMethodNamesOf(selfTy)
   let i = 0
   while i < names.length {
     if names[i] == prop {
