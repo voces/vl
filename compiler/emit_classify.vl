@@ -411,12 +411,13 @@ import {
   capMemoArmed,
   capNamesFlat,
   capStartTbl,
-  cboxCellNames,
   cloSigBase,
   cloSigKeys,
   cloSigTagNames,
   cloSigTwin,
   cnFe,
+  cnGlobOn,
+  cnGlobReads,
   cnName,
   cnRecording,
   cnScanFnIx,
@@ -4683,6 +4684,7 @@ function capRecord(name: string, bound: {[string]: i32}, caps: string[]) {
       // a binding form that is not a global: a top-level `for` variable. Without it a closure
       // in a top-level loop body addresses the module function instead of the loop variable.
       if moduleLoopEnclosing(capFrame, name) < 0 {
+        if cnGlobOn && cnRecording { cnGlobReads[name] = 1 }
         capSiblingFrees(name, bound, caps)
         return 0
       }
@@ -4802,10 +4804,18 @@ export function capScan(ix: i32, bound: {[string]: i32}, caps: string[]) {
     // the nested function shadows with a param or local, so a replayed narrowing can never
     // land on a binding that is not the capture.
     const savedScanFn = cnScanFnIx
-    if cnRecording { cnScanFnIx = ix }
+    const savedGlob = cnGlobReads
+    const savedGlobOn = cnGlobOn
+    if cnRecording {
+      cnScanFnIx = ix
+      cnGlobReads = Map()
+      cnGlobOn = true
+    }
     capScan(n.fnBody, ibound, ifree)
     cnScanFnIx = savedScanFn
-    if cnRecording { capNarrowRecord(ix, ifree) }
+    if cnRecording { capNarrowRecord(ix, ifree, cnGlobReads) }
+    cnGlobReads = savedGlob
+    cnGlobOn = savedGlobOn
     let ifi = 0
     while ifi < ifree.length {
       capRecord(ifree[ifi], bound, caps)
@@ -5292,10 +5302,10 @@ export function captureValStructIdx(fe: i32, name: string) {
   -1
 }
 
-// ── the declaration-site narrowing of a capture: record, look up, replay ──────
+// ── the declaration-site narrowing of a nested body: record, replay ──────
 // `capNarrowRecord` banks the narrowing stack at a nested function's declaration site, only
-// from `capScan` and only while `capNarrowBuild` walks; `capNarrowSlotOf` finds a banked
-// record; `capNarrowSeed` replays it for the walk of that frame's body.
+// from `capScan` and only while `capNarrowBuild` walks; `capNarrowSeed` replays the banked
+// records for the walk of that frame's body.
 
 // Push the narrowing of `condIx`'s then-arm, or with `elseSide` its complement, while
 // `capNarrowBuild` walks. The flag dance is a re-entrancy guard: `setNarrowFromCond` runs
@@ -5321,21 +5331,22 @@ function cnPostGuard(stmtIx: i32) {
 }
 
 // Bank the narrowing active at the declaration site of the nested function at arena index
-// `fnIx`, for each of its free names. One record per frame and name; under nested guards the
-// innermost is appended last and `capNarrowSlotOf` reads backward, so the innermost wins —
-// the same rule `narrowSlotOf` applies to the live stack.
-function capNarrowRecord(fnIx: i32, ifree: string[]) {
+// `fnIx`, for each key whose root the body reads: a free name in `ifree` or a module global in
+// `iglob`. Under nested guards the innermost is appended last, and a replay pushes records in
+// order, so the innermost wins, the same rule `narrowSlotOf` applies to the live stack.
+function capNarrowRecord(fnIx: i32, ifree: string[], iglob: {[string]: i32}) {
   const fe = fnStmtsPosOf(fnIx)
   if fe < 0 { return 0 }
   const widened = capWidenOf(fnIx)
   let i = 0
   while i < narrowTop {
     const nm = narrowNames[i]
+    const root = narrowKeyRoot(nm)
     // A retired entry is not a declaration-site fact: the closure below the write reads its
     // capture at the declared rep, the same as the live stack answers for it. Nor is one the
     // checker widened in this body, since a writer may run before it does (D2402).
     if (
-      (capHas(ifree, nm) || capCellReadOf(nm, ifree))
+      (capHas(ifree, root) || (iglob[root] ?? 0) == 1)
       && narrowRetired[i] == 0
       && !capWidened(widened, nm)
     ) {
@@ -5364,27 +5375,14 @@ function capWidened(widened: string, key: string): boolean {
   widened.indexOf("," + k + ",") >= 0
 }
 
-// True when narrowing key `key` is the read `c[0]` of a shared capture cell `c` in `ifree`.
-function capCellReadOf(key: string, ifree: string[]) {
-  if key.length < 4 || key.slice(key.length - 3, key.length) != "[0]" {
-    return false
+// The binding a narrowing key reads through: `xs` of `xs[0]`, `o` of `o.v.w`, a name itself.
+function narrowKeyRoot(key: string): string {
+  let i = 0
+  while i < key.length {
+    if key[i] == '.' || key[i] == '[' { return key.slice(0, i) }
+    i = i + 1
   }
-  const cell = key.slice(0, key.length - 3)
-  if (cboxCellNames[cell] ?? 0) == 0 { return false }
-  capHas(ifree, cell)
-}
-
-// The record index of the declaration-site narrowing of `name` in frame `fe`, or -1.
-// Scanned backward so the innermost banked narrowing answers (see `capNarrowRecord`).
-function capNarrowSlotOf(fe: i32, name: string) {
-  let i = cnFe.length - 1
-  while i >= 0 {
-    if cnFe[i] == fe {
-      if cnName[i] == name { return i }
-    }
-    i = i - 1
-  }
-  -1
+  key
 }
 
 // Bank the declaration-site narrowing of every frame declared inside frame `fe`'s body, by
@@ -5411,6 +5409,8 @@ export function capNarrowBuild() {
   cnVariant = []
   cnTy = []
   cnSet = []
+  cnGlobReads = Map()
+  cnGlobOn = false
   const savedTop = narrowTop
   cnRecording = true
   let fe = 0
@@ -5438,33 +5438,34 @@ export function capNarrowBuild() {
 }
 
 // Replay frame `fe`'s declaration-site narrowing onto the narrowing stack, so a walk over
-// `fe`'s body answers every rep question about a captured read under the narrowing the
-// closure is written inside. Gated on the capture's rep being the value-union box, the only
-// rep whose read needs a narrowing to pick an unboxing. Returns the depth to restore to.
+// `fe`'s body answers every rep question about a narrowed read under the narrowing the closure
+// is written inside. Returns the depth to restore to.
 export function capNarrowSeed(fe: i32) {
   const saved = narrowTop
   if fe < 0 { return saved }
   if cnFe.length == 0 { return saved }
   const caps = captureNamesOf(fe)
-  let ci = 0
-  while ci < caps.length {
-    const nm = caps[ci]
-    const si = capNarrowSlotOf(fe, nm)
-    if si >= 0 {
-      if captureValKind(fe, nm) == "union" {
-        pushNarrowRep(nm, cnVariant[si], cnTy[si], cnSet[si])
-      }
+  let i = 0
+  while i < cnFe.length {
+    if cnFe[i] == fe && capNarrowReplays(fe, cnName[i], caps) {
+      pushNarrowRep(cnName[i], cnVariant[i], cnTy[i], cnSet[i])
     }
-    // A shared cell's read carries the narrowing live where the closure is written.
-    if (cboxCellNames[nm] ?? 0) != 0 {
-      const ki = capNarrowSlotOf(fe, nm + "[0]")
-      if ki >= 0 {
-        pushNarrowRep(nm + "[0]", cnVariant[ki], cnTy[ki], cnSet[ki])
-      }
-    }
-    ci = ci + 1
+    i = i + 1
   }
   saved
+}
+
+// Whether frame `fe`'s banked narrowing of `key` binds its body's reads. A captured name only
+// when its env field holds the value-union box, the one capture rep a narrowing unboxes; a place
+// under a capture, or a module global and any place under one, read the same storage the
+// declaration site reads, so its narrowing carries over whole (D2448, D2450).
+function capNarrowReplays(fe: i32, key: string, caps: string[]): boolean {
+  const root = narrowKeyRoot(key)
+  if capHas(caps, root) {
+    if root == key { return captureValKind(fe, key) == "union" }
+    return true
+  }
+  globalIndexOf(root) >= 0
 }
 
 // Enter a new lexical block: remember the current binding count as this frame's

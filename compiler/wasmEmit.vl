@@ -51,6 +51,7 @@ import {
   isNumIntrinsicName,
   isValueUnionName,
   isVarTyIxOf,
+  matchScrutAt,
   memOffsetLexValue,
   nameIsAtomicIntrinsic,
   nameIsLitUnionArmValueUnion,
@@ -2682,12 +2683,36 @@ function emitVariantDiscrimTest(body: u8[], recvIx: i32, vi: i32, fnIx: i32) {
   0
 }
 
-// Lower a type guard `recv is X`. Fixed, load-bearing arm order: nullable-niche null
-// tests, atom/literal-union membership, box-tag compares, monomorphized-static folds,
-// then the union-variant tag+discriminant compare. A niche `is` assumes the checker
-// proved the tested shape is the sole non-null member, which monomorphization can break (D950).
+// Lower a type guard `recv is X`. Fixed, load-bearing arm order: checker-typed tautology,
+// niche null tests, atom/literal-union membership, box-tag compares, mono-static folds, then
+// the variant tag+discriminant compare. A niche `is` assumes the checker proved the tested
+// shape is the sole non-null member, which monomorphization can break (D950).
 function emitIs(body: u8[], isIx: i32, fnIx: i32) {
   const nd0 = P.nodes[isIx]
+  if nd0 is IsExpr {
+    // A tautology first: the checker typed the operand as exactly the tested type and the
+    // emitter reads it unboxed, so the test holds of every value it can read (D2447). A
+    // `match` scrutinee is excluded, being one node whose recorded type is the last arm's.
+    const isOpTy = nodeTyIxOf(nd0.isObj)
+    const isTsTy = isVarTyIxOf(isIx)
+    if (
+      isOpTy >= 0
+      && isTsTy >= 0
+      && !isUnionOfTy(isOpTy)
+      && !matchScrutAt(nd0.isObj)
+      && !exprUnion(nd0.isObj, fnIx)
+    ) {
+      if tySame(isOpTy, isTsTy) {
+        // A name's read can only trap on its rep's own recovery, so it is not made.
+        if !(P.nodes[unwrapParen(nd0.isObj)] is Ident) {
+          if emitExpr(body, nd0.isObj, fnIx) < 0 { return -1 }
+          fbDrop()
+        }
+        fbI32Const(1)
+        return 0
+      }
+    }
+  }
   if nd0 is IsExpr {
     if exprNullableRefNiche(nd0.isObj, fnIx) {
       if nulNicheIsTestImpossible(nd0.isObj, isVarTyIxOf(isIx), fnIx) {
@@ -3005,24 +3030,6 @@ function emitIs(body: u8[], isIx: i32, fnIx: i32) {
     }
   }
 
-  if nd0 is IsExpr {
-    if !uDeclared {
-      const isOpTy = nodeTyIxOf(nd0.isObj)
-      const isTsTy = isVarTyIxOf(isIx)
-      if isOpTy >= 0 {
-        if isTsTy >= 0 {
-          if !isUnionOfTy(isOpTy) {
-            if tySame(isOpTy, isTsTy) {
-              if emitExpr(body, nd0.isObj, fnIx) < 0 { return -1 }
-              fbDrop()
-              fbI32Const(1)
-              return 0
-            }
-          }
-        }
-      }
-    }
-  }
   if !uDeclared {
     return emitFail("emitProgram: `is` test but no union type declared")
   }
