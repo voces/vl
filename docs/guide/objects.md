@@ -52,7 +52,10 @@ const o = {}      // error: `{}` has no record type here to complete — give it
                   //        a record type whose fields admit `null`, or write its fields
 ```
 
-A map starts empty with `Map()`, a set with `Set()`; `{}` is never a map.
+A map starts empty with `Map()`, a set with `Set()`; `{}` is never a map. Their types are
+spelled `Map<K, V>` and `Set<T>` (or `{[K]: V}` and `{[T]: boolean}`, the same types), and a
+constructor can name its types itself — `Map<string, i32>()` is an empty map that needs no
+annotation. `docs/guide/collections-design.md` §"What you write TODAY" has the table.
 
 ## There is no empty nested block
 

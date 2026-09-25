@@ -90,6 +90,7 @@ import {
 import {
   CALLSITE_NAME,
   P,
+  callTyArgsOf,
   declNameTokOf,
   fillArgDefaults,
   fnRequiredArity,
@@ -10837,10 +10838,14 @@ export function applyGenAlias(head: string, inner: string) {
 // because the two routes must not be able to drift.
 function applyGenAliasArgs(head: string, inner: string, appIx: i32) {
   const gi = gaIndexOf(head)
-  // D1582 — `Map<string, i32>` reaches the alias-application door, not the leaf
-  // ladder, so the same hint has to be banked here too or the spelling a consumer
-  // is most likely to try is the one that stays unhelpful.
-  if gi < 0 { return builtinCtorTyLeafFail(head) }
+  // `Map<K, V>` / `Set<T>` — the builtin collections' names, reached only when no user
+  // declaration claims the head (a user `type Map<A> = …` is found by `gaIndexOf` above).
+  if gi < 0 {
+    if (head == "Map" || head == "Set") && !cUserTypes.has(head) {
+      return builtinCollAppTy(head, inner, appIx)
+    }
+    return builtinCtorTyLeafFail(head)
+  }
   // The declared parameter names, read as a slice of the flat column — split once when the alias
   // registered (D-GAPARAM), not re-split here per application. `pcount` is the declared arity.
   const pstart = gaParamStart[gi]
@@ -11263,17 +11268,149 @@ function storageTyLeafFail() {
   -1
 }
 
-// `Map`/`Set` name a constructor, never a type — the type is spelled with the index
-// signature, so this banks the suggestion on `unkTyClash` rather than adding an arm.
-// Reached only after the declared-name lookup, so a user `type Map = …` still wins
-// (D1582).
+// A bare `Map` / `Set` names the collection without its type arguments, which no position can
+// complete, so the suggestion is banked on `unkTyClash` rather than adding an arm. Reached only
+// after the declared-name lookup, so a user `type Map = …` still wins.
 function builtinCtorTyLeafFail(name: string) {
   if name == "Map" {
-    unkTyClash = "`Map` is not a type name — `Map()` is the constructor and the map TYPE is spelled `{[K]: V}`, e.g. `{[string]: i32}`"
+    unkTyClash = "`Map` needs its key and value types — write `Map<K, V>`, e.g. `Map<string, i32>`"
   } else if name == "Set" {
-    unkTyClash = "`Set` is not a type name — `Set()` is the constructor and the set TYPE is spelled `{[K]: boolean}`, e.g. `{[string]: boolean}`"
+    unkTyClash = "`Set` needs its element type — write `Set<T>`, e.g. `Set<string>`"
   }
   -1
+}
+
+// The index-signature spelling `{[K]:V}` / `{[T]:boolean}` of a builtin collection application
+// `Map<K,V>` / `Set<T>`, or "" when `name` is not one, or when a user declaration owns the head.
+export function builtinCollSpelling(name: string): string {
+  if !annGenAppSpanEnds(name) { return "" }
+  const lt = gaeLtAt(name)
+  const head = gaeHeadNameOf(name, lt)
+  if head != "Map" && head != "Set" { return "" }
+  if cUserTypes.has(head) || gaIndexOf(head) >= 0 { return "" }
+  const args: string[] = []
+  tyTopLevelSplit(gaeArgsTextOf(name, lt), ',', false, args)
+  if head == "Set" {
+    if args.length != 1 { return "" }
+    return "{[" + args[0] + "]:boolean}"
+  }
+  if args.length != 2 { return "" }
+  "{[" + args[0] + "]:" + args[1] + "}"
+}
+
+// `name` with every builtin collection application (`Map<K,V>`, `Set<T>`) rewritten, at any
+// depth, to the index signature it denotes — the spelling the emitter's name tables read.
+// Unchanged when it names none, or when a user declaration owns the head.
+export function builtinCollNorm(name: string): string {
+  if !name.includes("Map<") && !name.includes("Set<") { return name }
+  let out = ""
+  let from = 0
+  let i = 0
+  while i + 4 <= name.length {
+    const head = name.slice(i, i + 4)
+    let boundary = true
+    if i > 0 { boundary = !isIdentCharAt(name, i - 1) }
+    if boundary && (head == "Map<" || head == "Set<") {
+      const close = angleCloseAt(name, i + 3)
+      if close > i + 3 {
+        const sp = builtinCollSpelling(name.slice(i, close + 1))
+        if sp != "" {
+          out = out + name.slice(from, i) + builtinCollNorm(sp)
+          from = close + 1
+          i = close
+        }
+      }
+    }
+    i = i + 1
+  }
+  out + name.slice(from, name.length)
+}
+
+// Whether `name[i]` can continue an identifier, so a `Map<` preceded by it is part of a
+// longer name (`HashMap<`) rather than the builtin.
+function isIdentCharAt(name: string, i: i32): boolean {
+  const c = name[i]
+  (c >= 'a' && c <= 'z')
+    || (c >= 'A' && c <= 'Z')
+    || (c >= '0' && c <= '9')
+    || c == '_'
+    || c == '$'
+}
+
+// The index of the `>` closing the `<` at `lt`, depth-aware and skipping the `>` of an
+// arrow `=>`; -1 when the name ends first.
+function angleCloseAt(name: string, lt: i32): i32 {
+  let depth = 0
+  let i = lt
+  while i < name.length {
+    const c = name[i]
+    if c == '<' {
+      depth = depth + 1
+    } else if c == '>' {
+      let arrow = false
+      if i > 0 { arrow = name[i - 1] == '=' }
+      if !arrow {
+        depth = depth - 1
+        if depth == 0 { return i }
+      }
+    }
+    i = i + 1
+  }
+  -1
+}
+
+// `Map<K, V>` is the map type `{[K]: V}` and `Set<T>` is the set type `{[T]: boolean}`: long
+// spellings of the same types, so either flows where the other is written and both lower the
+// same (`builtinCollSpelling`). Arguments come from the spelling tree when `appIx` has one, else
+// from `inner`'s text. An unsupported key banks the index signature's refusal.
+function builtinCollAppTy(head: string, inner: string, appIx: i32) {
+  const argTys: i32[] = []
+  if appIx >= 0 {
+    const astart = tsKidStart[appIx]
+    const acnt = tsKidCount[appIx]
+    let ti = 0
+    while ti < acnt {
+      const kid = tsKids[astart + ti]
+      if tsKind[kid] != TS_ERR {
+        const a = tsToTy(kid)
+        if a < 0 { return -1 }
+        argTys.push(a)
+      }
+      ti = ti + 1
+    }
+  } else {
+    const argNames: string[] = []
+    tyTopLevelSplit(inner, ',', true, argNames)
+    let ai = 0
+    while ai < argNames.length {
+      const a = nameToTy(argNames[ai])
+      if a < 0 { return -1 }
+      argTys.push(a)
+      ai = ai + 1
+    }
+  }
+  let want = 2
+  if head == "Set" { want = 1 }
+  if argTys.length != want {
+    tErr(
+      "`"
+        + head
+        + "` expects "
+        + i32ToStr(want)
+        + " type arguments but got "
+        + i32ToStr(argTys.length),
+      annotDiagAt,
+    )
+    return TY_ERR
+  }
+  const k = argTys[0]
+  const kt = T.tys[k]
+  if !mapKeyTySupported(k) && !(kt is TyVar) {
+    unkTyClash = mapKeyUnsupportedMsg(tyToStr(k), head)
+    return -1
+  }
+  if head == "Set" { return mkMapTy(k, TY_BOOL, 0) }
+  mkMapTy(k, argTys[1], 0)
 }
 
 // Other-language spellings of VL's primitives (`Boolean`, `String`, `Number`, …) — a
@@ -12349,14 +12486,16 @@ function initMapCtorName(initIx: i32) {
 // (`checkInferredMapKey`) raise it, so the annotated and inferred spellings of one
 // program reject in the same channel with the same words.
 function mapKeyUnsupportedErr(keyText: string, ctor: string, at: i32) {
-  tErrUnsupported(
-    "A "
-      + keyText
-      + "-keyed "
-      + ctor
-      + " isn't supported yet — `Map`/`Set` keys must be `string` or `i32`",
-    at,
-  )
+  tErrUnsupported(mapKeyUnsupportedMsg(keyText, ctor), at)
+}
+
+// The unsupported-key refusal's sentence, shared by the index signature and `Map<K, V>`.
+function mapKeyUnsupportedMsg(keyText: string, ctor: string): string {
+  "A "
+    + keyText
+    + "-keyed "
+    + ctor
+    + " isn't supported yet — `Map`/`Set` keys must be `string` or `i32`"
 }
 
 // Adjudicates the key a usage-driven pin (`m.set(k, v)`, `s.add(k)`, `m[k] = v`) just
@@ -15619,6 +15758,9 @@ function canonEmitNameAt(name: string, ctx: i32) {
 function canonEmitNameTs(name: string, ctx: i32, root: i32) {
   canonAtoms = 1
   if name.length == 0 { return name }
+  // `Map<K, V>` / `Set<T>`, at any depth, reach the emitter as the index signature they denote.
+  const bcn = builtinCollNorm(name)
+  if bcn != name { return canonEmitNameTs(bcn, ctx, -1) }
   // A single-member union alias is transparent — render its member first, ahead of the
   // `nameNeedsCanon` early-out that would otherwise return the bare alias name unchanged.
   // Transparency doesn't move the name, so this can render at `ctx` rather than at `RC_ROOT`.
@@ -15944,7 +16086,7 @@ function collectGenAliasFieldAnns() {
               const tr = P.nodes[fnode.fdType]
               if tr is TypeRef {
                 cgpFieldNodes.push(fnode.fdType)
-                cgpFieldRaw.push(tr.tyName)
+                cgpFieldRaw.push(builtinCollNorm(tr.tyName))
               }
             }
           }
@@ -15971,7 +16113,7 @@ function collectGenAliasFieldAnns() {
               const ptr = P.nodes[pnd.parType]
               if ptr is TypeRef {
                 cgpFieldNodes.push(pnd.parType)
-                cgpFieldRaw.push(ptr.tyName)
+                cgpFieldRaw.push(builtinCollNorm(ptr.tyName))
               }
             }
           }
@@ -15981,7 +16123,7 @@ function collectGenAliasFieldAnns() {
           const rtr = P.nodes[fnd.fnRet]
           if rtr is TypeRef {
             cgpFieldNodes.push(fnd.fnRet)
-            cgpFieldRaw.push(rtr.tyName)
+            cgpFieldRaw.push(builtinCollNorm(rtr.tyName))
           }
         }
       }
@@ -29763,6 +29905,9 @@ function checkBuiltinIdentCall(n: Call, ix: i32, cfn: Ident): i32 {
     if n.callArgs.length != 0 {
       tErr(cfn.identName + " expects no arguments", ix)
     }
+    if callTyArgsOf(ix).length > 0 {
+      return collCtorTyArgsTy(cfn.identName, ix)
+    }
     if cfn.identName == "Set" {
       // A set's VALUE type is the membership boolean; the element (key) is a
       // hole pinned by the annotation or the first `.add`.
@@ -29979,7 +30124,8 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
       if !restCallPack(n, ix, restIx) { return retTy }
     }
     args = n.callArgs
-    if restIx < args.length {
+    // Written type arguments already say what the element is, which is the refusal's remedy.
+    if restIx < args.length && callTyArgsOf(ix).length == 0 {
       if restHoleUnionErr(params[restIx], args[restIx], ix) { return retTy }
     }
   } else if hasSpreadItem(args) {
@@ -30030,6 +30176,11 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
   // `let n: i32 = id("s")` is a genuine type error downstream.
   const bNames: string[] = []
   const bTys: i32[] = []
+  // Explicit type arguments bind first, so every argument is checked against them.
+  const explicitTa = callTyArgsOf(ix).length > 0
+  if explicitTa {
+    if !bindExplicitTyArgs(cfn, ix, bNames, bTys) { return TY_ERR }
+  }
   const argOrder = lambdaLastOrder(params, args)
   let oi = 0
   while oi < argOrder.length {
@@ -30134,7 +30285,9 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
   if cfn is Ident {
     let rtpDecl = fnDeclIx[cfn.identName] ?? CSTR_NODECL
     if rtpDecl == CSTR_NODECL { rtpDecl = lookupFnAliasNode(cfn.identName) }
-    checkRetTyParamBound(rtpDecl, cfn.identName, ix, ft.fnRet)
+    if !explicitTa {
+      checkRetTyParamBound(rtpDecl, cfn.identName, ix, ft.fnRet)
+    }
   }
   // Substitutes the binding into a generic return type — deep, so a structural return
   // (`{first: B, second: A}`, a generic alias body, a function-typed field) concretizes
@@ -30278,12 +30431,158 @@ function checkOptCallNode(n: Call, ix: i32, cfn: OptMember): i32 {
   rt
 }
 
+// A call's explicit type arguments are legal on `Map`/`Set` and on a direct call of a
+// declared generic function. Anything else is reported here, with its arguments still
+// checked, and the call types as an error so nothing cascades from it.
+function callTyArgsCalleeOk(cfn: Node, ix: i32): boolean {
+  if cfn is Ident {
+    const nm = cfn.identName
+    if (nm == "Map" || nm == "Set") && lookupDepth(nm) < 0 { return true }
+    const dIx = lookupFnDeclNode(nm)
+    if dIx >= 0 {
+      const d = P.nodes[dIx]
+      if d is FuncDecl {
+        if d.fnTyParams.length > 0 { return true }
+        tErr(
+          "`"
+            + nm
+            + "` is not generic, so it takes no type arguments — drop the `<…>`",
+          ix,
+        )
+        return false
+      }
+    }
+  }
+  tErr(
+    "explicit type arguments need a direct call of a declared generic function, or `Map<K, V>()` / `Set<T>()`",
+    ix,
+  )
+  false
+}
+
+// Resolves a call's explicit type-argument nodes in the call's own scope, banking each type
+// on its node for the emitter. -1 in `out` never survives: an unresolvable argument is
+// reported at its own node and the answer is false.
+function resolveCallTyArgs(ix: i32, out: i32[]): boolean {
+  const tas = callTyArgsOf(ix)
+  let ok = true
+  let i = 0
+  while i < tas.length {
+    const ta = P.nodes[tas[i]]
+    let t = -1
+    if ta is TypeRef {
+      t = nameToTyAt(ta.tyName, tas[i])
+      if t < 0 { tErr(unknownTyText(ta.tyName), tas[i]) }
+    }
+    if t < 0 {
+      ok = false
+      t = TY_ERR
+    }
+    if !inferQuiet {
+      while nodeTyIx.length <= tas[i] { nodeTyIx.push(-1) }
+      nodeTyIx[tas[i]] = t
+    }
+    out.push(t)
+    i = i + 1
+  }
+  ok
+}
+
+// `Map<K, V>()` / `Set<T>()`: the constructor at the collection type its arguments name.
+function collCtorTyArgsTy(ctor: string, ix: i32) {
+  const tys: i32[] = []
+  if !resolveCallTyArgs(ix, tys) { return TY_ERR }
+  let want = 2
+  if ctor == "Set" { want = 1 }
+  if tys.length != want {
+    tErr(
+      "`"
+        + ctor
+        + "` expects "
+        + i32ToStr(want)
+        + " type arguments but got "
+        + i32ToStr(tys.length),
+      ix,
+    )
+    return TY_ERR
+  }
+  if !mapKeyTySupported(tys[0]) {
+    const kt = T.tys[tys[0]]
+    if !(kt is TyVar) {
+      mapKeyUnsupportedErr(tyToStr(tys[0]), ctor, callTyArgsOf(ix)[0])
+      return TY_ERR
+    }
+  }
+  if ctor == "Set" { return mkMapTy(tys[0], TY_BOOL, 1) }
+  mkMapTy(tys[0], tys[1], 0)
+}
+
+// A type-parameter list as written between the angle brackets: `K, V`.
+function tyParamListText(names: string[]): string {
+  let out = ""
+  let i = 0
+  while i < names.length {
+    if i > 0 { out = out + ", " }
+    out = out + names[i]
+    i = i + 1
+  }
+  out
+}
+
+// Binds a generic callee's type parameters to the call's explicit type arguments, in
+// declaration order, ahead of any argument — so each argument is checked against them.
+// False (reported) on a count mismatch or an unresolvable argument.
+function bindExplicitTyArgs(
+  cfn: Node,
+  ix: i32,
+  bNames: string[],
+  bTys: i32[],
+): boolean {
+  if cfn is Ident {
+    const dIx = lookupFnDeclNode(cfn.identName)
+    if dIx < 0 { return true }
+    const d = P.nodes[dIx]
+    if d is FuncDecl {
+      const tys: i32[] = []
+      if !resolveCallTyArgs(ix, tys) { return false }
+      if tys.length != d.fnTyParams.length {
+        let what = "type arguments"
+        if d.fnTyParams.length == 1 { what = "type argument" }
+        tErr(
+          "`"
+            + cfn.identName
+            + "` takes "
+            + i32ToStr(d.fnTyParams.length)
+            + " "
+            + what
+            + " (`"
+            + tyParamListText(d.fnTyParams)
+            + "`), but the call gives "
+            + i32ToStr(tys.length),
+          ix,
+        )
+        return false
+      }
+      let i = 0
+      while i < tys.length {
+        bNames.push(d.fnTyParams[i])
+        bTys.push(tys[i])
+        i = i + 1
+      }
+    }
+  }
+  true
+}
+
 // A call expression, dispatched on the callee's shape: a member callee to
 // `checkMemberCallNode`, a bare identifier to `checkUnimplementedIntrinsicCall` and
 // `checkBuiltinIdentCall`, a function-typed value to `checkCallOnFuncTy`. The type-answering
 // three return `-1` for "no arm claimed it"; an unclaimed callee is reported here as `TY_ERR`.
 function checkCallNode(n: Call, ix: i32) {
   const cfn = P.nodes[n.callFn]
+  if callTyArgsOf(ix).length > 0 {
+    if !callTyArgsCalleeOk(cfn, ix) { return TY_ERR }
+  }
   if cfn is Member {
     const mt = checkMemberCallNode(n, ix, cfn.memObj, cfn.memProp, -1)
     if mt >= 0 { return mt }

@@ -137,7 +137,7 @@ import {
   tsMentionsAnyName,
   ufcsAliasAtSite,
 } from "./ast"
-import { PIN_SIGKEY } from "./ast"
+import { PIN_SIGKEY, callTyArgsOf, setCallTyArgs } from "./ast"
 // Monomorphization rewrites a call's callee name on a node the arena already holds;
 // `compiler/symbols.vl` is the discipline that in-place write follows.
 import {
@@ -1439,6 +1439,39 @@ function monoCloneBody(
   r
 }
 
+// An un-annotated binding of `Map<K, V>()` / `Set<T>()` whose type arguments name a type
+// parameter: the constructor's arguments become the binding's annotation, substituted for
+// this instance exactly as a written `{[K]: V}` would be. -1 when there is nothing to pin.
+function monoCollCtorAnn(
+  initIx: i32,
+  typarams: string[],
+  tvN: string[],
+  tvV: string[],
+): i32 {
+  if initIx < 0 { return -1 }
+  const ix = unwrapParen(initIx)
+  if ix < 0 || ix >= P.nodes.length { return -1 }
+  const c = P.nodes[ix]
+  if c is Call {
+    const f = P.nodes[c.callFn]
+    if f is Ident {
+      const tas = callTyArgsOf(ix)
+      let name = ""
+      if f.identName == "Map" && tas.length == 2 {
+        name = "{[" + tyNameOf(tas[0]) + "]:" + tyNameOf(tas[1]) + "}"
+      } else if f.identName == "Set" && tas.length == 1 {
+        name = "{[" + tyNameOf(tas[0]) + "]:boolean}"
+      }
+      if name == "" { return -1 }
+      if !monoAnnHasTyParam(name, typarams) { return -1 }
+      const sub = monoSubstAnn(name, typarams, tvN, tvV)
+      if sub == "" { return -1 }
+      return synthTypeRefTy(sub, c.pos, -1)
+    }
+  }
+  -1
+}
+
 function monoCloneBodyRaw(
   ix: i32,
   typarams: string[],
@@ -1492,6 +1525,7 @@ function monoCloneBodyRaw(
     }
     // The closure-pin rungs, for the same reason and at the same moment: an un-annotated
     // container over a pinned parameter has no other source for its element type (D1664).
+    if nt < 0 { nt = monoCollCtorAnn(n.letInit, typarams, tvN, tvV) }
     if nt < 0 { nt = monoCloPinListAnn(n.letInit) }
     if nt < 0 { nt = monoCloPinShapeAnn(n.letInit) }
     if nt == n.letType { return ix }
@@ -2688,6 +2722,82 @@ function monoSubstIsExpr(ix: i32, io: i32, variant: string) {
   ix
 }
 
+// The instance `monoCloneGenericCalls` is copying: its template's type parameters and their
+// bindings, so an explicit type argument naming one (`make<T>()`) is substituted per instance.
+let monoCgcTyParams: string[] = []
+let monoCgcTvN: string[] = []
+let monoCgcTvV: string[] = []
+
+// The explicit type-argument nodes of a cloned call, each substituted under the instance
+// being copied; an argument naming no type parameter is shared unchanged.
+function monoSubstTyArgNodes(tas: i32[]): i32[] {
+  const out: i32[] = []
+  const noN: string[] = []
+  const noT: i32[] = []
+  let i = 0
+  while i < tas.length {
+    const sub = monoSubstAnnNode(
+      tas[i],
+      monoCgcTyParams,
+      monoCgcTvN,
+      monoCgcTvV,
+      noN,
+      noT,
+    )
+    if sub >= 0 { out.push(sub) } else { out.push(tas[i]) }
+    i = i + 1
+  }
+  out
+}
+
+// The instance-key suffix `monoInstantiate` hands `monoMakeInstance` for a call with explicit
+// type arguments, consumed (and cleared) where the key is built.
+let monoKeyExtra = ""
+
+// Binds `typarams` to the call's explicit type arguments (their canonical spellings) in `tvN`
+// / `tvV`. Answers the key suffix: the bindings of the parameters no value parameter mentions,
+// the ones the pins cannot tell apart (`make<i32>()` and `make<string>()` pin nothing).
+function monoBindExplicitTyArgs(
+  callIx: i32,
+  typarams: string[],
+  params: i32[],
+  tvN: string[],
+  tvV: string[],
+): string {
+  const tas = callTyArgsOf(callIx)
+  if tas.length != typarams.length { return "" }
+  let extra = ""
+  let i = 0
+  while i < tas.length {
+    const nm = tyNameOf(tas[i])
+    if nm != "" {
+      tvN.push(typarams[i])
+      tvV.push(nm)
+      const one: string[] = [typarams[i]]
+      if !monoParamsMention(params, one) {
+        extra = extra + typarams[i] + "=" + nm + ";"
+      }
+    }
+    i = i + 1
+  }
+  extra
+}
+
+// Whether any parameter annotation in `params` names one of `typarams`.
+function monoParamsMention(params: i32[], typarams: string[]): boolean {
+  let i = 0
+  while i < params.length {
+    const p = P.nodes[params[i]]
+    if p is Param {
+      if p.parType >= 0 {
+        if monoAnnHasTyParam(tyNameOf(p.parType), typarams) { return true }
+      }
+    }
+    i = i + 1
+  }
+  false
+}
+
 // Give an instance its own copy of every direct call to a generic — the `Call` node and
 // its callee `Ident` — so the per-instance rename lands on nodes no sibling instance can
 // see. Instances otherwise share the original's body arena, so one `Ident` served every
@@ -2714,8 +2824,14 @@ function monoCloneGenericCalls(ix: i32) {
       if ca != n.callArgs[ai] { changed = true }
       ai = ai + 1
     }
-    if !changed { return ix }
-    return mkCallN(newCallee, nargs, n.callArgNames, n.pos)
+    const tas = callTyArgsOf(ix)
+    if !changed && tas.length == 0 { return ix }
+    const nc = mkCallN(newCallee, nargs, n.callArgNames, n.pos)
+    if tas.length > 0 {
+      const noEnds: i32[] = []
+      setCallTyArgs(nc, monoSubstTyArgNodes(tas), noEnds)
+    }
+    return nc
   }
   if n is Block {
     const ns: i32[] = []
@@ -3501,7 +3617,8 @@ function monoMakeInstance(
   const fn = P.nodes[monoOrigNode[origFe]]
   if fn is FuncDecl {
     const params = fn.fnParams
-    let key = i32ToStr(origFe) + "#"
+    let key = i32ToStr(origFe) + "#" + monoKeyExtra
+    monoKeyExtra = ""
     let pk = 0
     while pk < pinned.length {
       key = key + pinned[pk] + monoAnonPinDiscrim(pinned[pk], pinTys[pk]) + ","
@@ -4101,7 +4218,13 @@ function monoMakeInstance(
     }
     // Per-instance copies of the direct generic calls this body makes, so instantiating
     // them rewrites only this instance's callee `Ident`s. No generic call → the same node.
+    monoCgcTyParams = fn.fnTyParams
+    monoCgcTvN = tvN
+    monoCgcTvV = tvV
     const instBody3 = monoCloneGenericCalls(instBody2)
+    monoCgcTyParams = []
+    monoCgcTvN = []
+    monoCgcTvV = []
     // Per-instance layout constants for the type parameters this body reads
     // (`i * T.size`) — folded HERE because the binding is what makes them exist.
     const instBody4 = monoFoldTyParamLayout(instBody3, fn.fnTyParams, tvN, tvV)
@@ -4579,6 +4702,14 @@ function monoInstantiate(origFe: i32, callIx: i32, ctx: i32) {
       // wins, later uses take the binding); a concrete annotation is kept.
       const tvN: string[] = []
       const tvV: string[] = []
+      // A call's explicit type arguments bind first, so every later binding reads them.
+      monoKeyExtra = monoBindExplicitTyArgs(
+        callIx,
+        fn.fnTyParams,
+        fn.fnParams,
+        tvN,
+        tvV,
+      )
       const pinned: string[] = []
       // The arena type each pinned param denotes, parallel to `pinned`. Sourced from the
       // argument's recorded type and consumed only as a fallback where the pinned name

@@ -22,7 +22,7 @@ import {
   isBinOpFuncName,
   mkMatch,
 } from "./ast"
-import { getDeclAdd, getDeclName } from "./ast"
+import { getDeclAdd, getDeclName, setCallTyArgs } from "./ast"
 import {
   BinExpr,
   Ident,
@@ -1528,6 +1528,81 @@ function chainDotAfterNewlines(): i32 {
   -1
 }
 
+// Whether `node` may carry explicit type arguments: a bare name, the callee of a direct call.
+function calleeTakesTyArgs(node: i32): boolean {
+  const n = P.nodes[node]
+  n is Ident
+}
+
+// At a `<` after a callee, the type arguments of `f<A, B>(x)` by TypeScript's rule: the run
+// parses as a type list, closes with `>`, and is followed directly by `(`. Otherwise cursor,
+// tokens, diagnostics and spelling stack are restored and the `<` is a comparison. Returns
+// the argument `TypeRef` nodes, or an empty list when the run is not a type-argument list.
+function tryCallTyArgs(): i32[] {
+  const none: i32[] = []
+  const savePos = P.pos
+  const saveToks = P.toks
+  const saveDiags = P.diags.length
+  const saveGt = pendingGt
+  const mark = tsMark()
+  const names: string[] = []
+  const starts: i32[] = []
+  const ends: i32[] = []
+  advance() // "<"
+  let ok = true
+  let going = true
+  while going {
+    starts.push(peekTok().start)
+    names.push(parseTypeName())
+    // The argument ends where its last token does, less any `>` that token still owes.
+    const lastTok = P.toks[P.pos - 1]
+    ends.push(lastTok.start + lastTok.text.length - pendingGt)
+    if P.diags.length != saveDiags {
+      ok = false
+      going = false
+    } else if pendingGt == 0 && peekKind() == "COMMA" {
+      advance() // ","
+    } else {
+      going = false
+    }
+  }
+  if ok {
+    const gk = peekKind()
+    if pendingGt > 0 || gk == "GT" || gk == "SHR" || gk == "USHR" {
+      expectTypeGt()
+    } else {
+      ok = false
+    }
+  }
+  if ok {
+    ok = pendingGt == 0 && peekKind() == "LPAREN" && P.diags.length == saveDiags
+  }
+  if !ok {
+    P.pos = savePos
+    P.toks = saveToks
+    while P.diags.length > saveDiags { P.diags.pop() }
+    pendingGt = saveGt
+    while tsMark() > mark { tsPop() }
+    return none
+  }
+  // Each argument left one spelling root on the stack, the last argument's on top.
+  const roots: i32[] = []
+  while tsMark() > mark { roots.push(tsPop()) }
+  const out: i32[] = []
+  let i = 0
+  while i < names.length {
+    const ix = mkTypeRef(names[i], starts[i])
+    setAnnTs(ix, roots[roots.length - 1 - i])
+    out.push(ix)
+    i = i + 1
+  }
+  gCallTyArgEnds = ends
+  out
+}
+
+// Each argument's source end offset, parallel to the list `tryCallTyArgs` answers.
+let gCallTyArgEnds: i32[] = []
+
 // `primary` then a chain of call `(args)`, member `.name` and index `[i]` postfixes. A
 // leading `.` or `?.` on a later line continues the chain — see the NEWLINE arm.
 function parsePostfix() {
@@ -1545,6 +1620,16 @@ function parsePostfix() {
       advance()
       const args = parseArgs()
       node = mkCallN(node, args, gCallArgNames, p0)
+    } else if k == "LT" && calleeTakesTyArgs(node) {
+      const tas = tryCallTyArgs()
+      if tas.length == 0 {
+        going = false
+      } else {
+        advance() // "("
+        const targs = parseArgs()
+        node = mkCallN(node, targs, gCallArgNames, p0)
+        setCallTyArgs(node, tas, gCallTyArgEnds)
+      }
     } else if k == "DOT" {
       advance()
       let prop = ""

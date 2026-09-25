@@ -39,7 +39,10 @@ AST defined in `compiler/ast.vl`. Grammar covered:
   type       := IDENT                       (a single type-name annotation)
   expr       := assignment (precedence climbing, right-assoc "=")
   unary      := ("!" | "-" | "~") unary | postfix
-  postfix    := primary ( "(" args? ")" | "." IDENT )*
+  postfix    := primary ( tyArgs? "(" args? ")" | "." IDENT )*
+  tyArgs     := "<" type ("," type)* ">"   (after a bare IDENT callee only, and only when
+                the whole run parses and a "(" follows the ">" — else "<" is a comparison;
+                DECISIONS.md §Parser, "Explicit type arguments on a call")
   primary    := NUMBER | STRING | CHAR | "true" | "false" | IDENT | "(" expr ")"
 
 ── Structure: mutual recursion ──────────────────────────────────────────────
