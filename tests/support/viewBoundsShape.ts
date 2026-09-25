@@ -184,11 +184,10 @@ export const TABLE: Record<string, Row> = {
   "axpy-view": { none: c(0, 8, 1), O: c(2, 3, 3), O3: c(6, 1, 7) },
   // The ATTRIBUTION control (§M4): the same six per-access compares as
   // `axpy-view`, written by hand over a base and an extent hoisted into locals.
-  // Six traps and ZERO field reloads per element at `none`; the seventh trap and
-  // the four `struct.get`s that appear once optimized are the view CONSTRUCTION
-  // check and its field reads, inlined into the driver's TRIP loop — per trip,
-  // not per element, which is the limit of a loop-membership counter.
-  "axpy-fencedhoist": { none: c(6, 5, 0), O: c(7, 1, 0), O3: c(7, 1, 0) },
+  // Six traps and ZERO field reloads per element at every rung. A top-tested loop read a
+  // seventh trap once optimized: binaryen's `unreachable` after the loop's `if … else br`,
+  // which the bottom-tested loop (`br_if` back) does not produce.
+  "axpy-fencedhoist": { none: c(6, 5, 0), O: c(6, 1, 0), O3: c(6, 1, 0) },
   // The control above, as a LIBRARY call rather than six hand-written compares:
   // `getF32At`/`setF32At` shipped in `std:buffer` (webcraft A1). At `none` the
   // traps sit in the callees, so this reads like `axpy-view`; what matters is the
