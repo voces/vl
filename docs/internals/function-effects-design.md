@@ -388,6 +388,11 @@ These are what people and passes actually ask:
 | **getter-eligible** | effect-free ∧ ¬A ∧ ¬`R.let` ∧ `B` = `Bounded(n ≤ 16)` | `R.heap` (both roots) and `R.mem` | the getter body check |
 | **hoistable** (optimizer only) | effect-free ∧ terminating ∧ no `T`, or a trip-count guard ∧ nothing it reads is written in the loop | per §G2 | LICM, CSE |
 
+**An "overload-eligible" predicate is floated, not decided** (owner, 2026-09-25, on D2390): a
+declared operator might be restricted to no effects, or to writing only its left/right operands,
+the way a getter is restricted to describing its receiver. It would be a sixth row here, and its
+consumer is §G6.
+
 **Getter-eligible is NOT `pure`, and neither implies the other.** A getter reads its receiver's
 mutable fields by design, and the approved getter contract (property-access §D3a-contract)
 deliberately allows `__load_*` linear-memory reads, because the flat-row getter is exactly a
@@ -767,6 +772,31 @@ through a parameter exactly what the message carried.
   literal leaves.
 - B6's O(1) rule becomes checkable for compiler-owned members too. `length` is trivially
   eligible. A future `count` on a sparse collection is not, and the check would say so.
+
+### G6. Narrowing invalidation and stored witnesses (D2390, ROADMAP A6b/A6c)
+
+A narrowing holds until something may write the narrowed place, and a call is the write the
+checker cannot see syntactically. Every narrowing-drop site already asks one query,
+`callMayWrite(call, key)` (`typecheck.vl`), with `key` a bare name or a path such as `o.v` or
+`xs[0]`; today it is answered by two syntactic rules (DECISIONS.md, "A call that may reassign a
+narrowed binding ends the narrowing"). The summary replaces those answers without touching a
+caller, and to do so it needs more than §C1's `W` bit:
+
+- **`W` per PATH.** Which places the instance may write: a captured binding (a closure's own
+  free variables), and parameter-rooted paths — `p0.value`, `p0.a.b`, `p0[*]` for any element
+  of a list or map parameter. The bit says "writes something"; narrowing needs "writes this".
+  Composed through callees exactly as the fact is (§C4), with `*` for a path it cannot bound.
+- **A result⇒argument fact.** "Returns non-null iff argument 0 is i32", or "the returned tag is
+  `"i32"` iff argument 0 is i32". It is what A6b Stage A reads at `if bar(x) is null`, and what
+  Stage B stores: `const f = bar(x); if f is null` narrows `x`, held until `callMayWrite` says a
+  call may write `x` or `f`.
+- **A guarded write**, the owner's flow ideal: `k` writes `v` a boolean only when `v` is already
+  a boolean, so a narrowing to `f64` survives `k()`. A per-path `W` with the guard's condition
+  attached; the least of the three, and the one D2390 deliberately does not attempt.
+
+A declared operator is a call here too (D2400). If operators become restricted to modifying
+their own operands (§C1b, the "overload-eligible" question), an operator site's answer is its
+operands' paths alone.
 
 ---
 

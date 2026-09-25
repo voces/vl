@@ -890,3 +890,69 @@ Deno.test("diag-data: a malformed payload decodes to nothing at all", () => {
     }
   }
 });
+
+Deno.test({
+  name: "diag-code: a read a call un-narrowed carries `narrowing-ended-by-call` (D2390)",
+  ignore,
+}, () => {
+  // Two faces of one code: a type error in a later statement gains a note naming the call, and
+  // a read inside a block the call's own statement holds (an `if` arm under a condition that
+  // calls the writer) is refused outright. Both name the call; neither carries a payload.
+  const exp = instantiate();
+  const cases: { src: string; want: string }[] = [
+    {
+      src: [
+        "function f(): f64 {",
+        "  let v: boolean | f64 = 1.5",
+        "  const k = () => { v = true }",
+        "  if v is f64 {",
+        "    k()",
+        "    return v * 2.0",
+        "  }",
+        "  0.0",
+        "}",
+        "print(f())",
+        "",
+      ].join("\n"),
+      want: "the call to 'k' on line 5 may reassign it",
+    },
+    {
+      src: [
+        "function f(): f64 {",
+        "  let v: boolean | f64 = 1.5",
+        "  const k = (): boolean => {",
+        "    v = true",
+        "    true",
+        "  }",
+        "  if v is f64 {",
+        "    if k() { return v * 2.0 }",
+        "  }",
+        "  0.0",
+        "}",
+        "print(f())",
+        "",
+      ].join("\n"),
+      want: "in the statement that holds this one, may reassign it",
+    },
+  ];
+  for (const c of cases) {
+    const { rc, diags } = check(exp, c.src);
+    if (rc !== 2) throw new Error(`expected rc 2 (type stage), got ${rc}`);
+    if (diags.length !== 1) {
+      throw new Error(`expected 1 diagnostic, got: ${JSON.stringify(diags)}`);
+    }
+    if (diags[0].code !== "narrowing-ended-by-call") {
+      throw new Error(
+        `expected code "narrowing-ended-by-call", got: ${JSON.stringify(diags[0])}`,
+      );
+    }
+    if (!diags[0].message.includes(c.want)) {
+      throw new Error(
+        `want a message holding ${JSON.stringify(c.want)}, got: ${diags[0].message}`,
+      );
+    }
+    if (diags[0].raw !== "") {
+      throw new Error(`expected no payload, got: ${JSON.stringify(diags[0].raw)}`);
+    }
+  }
+});

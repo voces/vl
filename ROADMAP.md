@@ -1955,6 +1955,35 @@ in-language GC knobs.
   signatures. **Stage B:** stored witness (`const f = bar(x); … if f is null` narrows x) — needs
   binding tracking + invalidation (a lightweight borrow). Stage B also subsumes per-call tight return
   types (the forward direction of the same correlation).
+  **The dependency chain (owner, 2026-09-25).** (1) The invalidation primitive exists:
+  `callMayWrite(call, key)` in `typecheck.vl`, the one query every narrowing-drop site asks (D2390,
+  DECISIONS.md "A call that may reassign a narrowed binding ends the narrowing"). (2) The effects
+  summary (`docs/internals/function-effects-design.md` §G6) gains `W` per PATH — captured bindings
+  and parameter-rooted paths such as `p0.value` and `p0[*]` — plus a result⇒argument fact
+  ("returns non-null iff arg 0 is i32"), and answers `callMayWrite` in place of today's syntactic
+  rules. (3) Stage A reads the result⇒argument fact at a guard on a call's result. (4) Stage B
+  stores it: `const f = bar(x); if f is null` narrows `x`, and a correlated value (`tag: "i32" |
+  "boolean"` tied to `bar`'s argument) narrows its partner, each held only until `callMayWrite`
+  says a call may write `x` or `f`.
+- ⬜ **A6c. Narrowing invalidation across calls: flow analysis + the field/element/operator
+  forms.** D2390 landed the conservative rule: a call that may run a closure writing a narrowed
+  binding ends the narrowing (reachability of the writer, not flow). REMAINING: **flow analysis**,
+  the owner's ideal — keep the narrowing when the writer can only write a member the narrowing
+  already admits (`k` sets `v` to a boolean only when `v` is already a boolean), which needs the
+  per-path `W` of A6b's chain; and the forms the survey found open — a declared operator writing
+  its operand's field ([D2400](docs/internals/inventory/D2400.md)), a module global written by
+  another top-level function ([D2401](docs/internals/inventory/D2401.md)), a closure made under a
+  narrowing and called after a writer ([D2402](docs/internals/inventory/D2402.md)), a path read
+  before a writing call in a loop ([D2403](docs/internals/inventory/D2403.md)), a path fact in a
+  condition with a later writing call ([D2404](docs/internals/inventory/D2404.md)), and the path
+  re-test the path rule refuses ([D2405](docs/internals/inventory/D2405.md), clause 2). Field,
+  element and map-value narrowings through a plain call, a method or a closure already end
+  soundly (the path write-effect rule). **Open question (floated by the owner, not decided):**
+  ban side effects in operator overloads, or let one modify only its left/right operands — an
+  "overload-eligible" derived predicate beside getter-eligible (effects doc §C1b). Under the second
+  reading an operator site needs only D2400's operand-path invalidation and can never run a
+  writer — today a dispatched operator ends a narrowing when a declaration of that operator
+  reaches the writer, or when the writer escaped, as an unknown call does.
 - ⬜ **A8. Exact / Inexact variance.** Params Inexact by default (accept excess properties), values
   Exact. Guards the `a.foo = b` width footgun. (TODO.md)
   **Defaults + surface RULED 2026-08-18** — see A9.
