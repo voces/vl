@@ -224,10 +224,13 @@ let mllAny: boolean = false
 // denotes must decline rather than take the first (D1596): pinning one block's ref binding
 // over another block's i32 is a `runs -> not-runs`. `moduleLocalLetOfUnique` is that reader.
 let mllDup: {[string]: boolean} = Map()
-// The second-and-later bindings behind each `mllDup` name, as parallel (name, arena index)
-// rows, read through `moduleLocalLetAll`. Beside the first-wins map rather than in it: the
-// common name has exactly one binding and must not pay for a list.
-let mllMoreNames: string[] = []
+// The second-and-later bindings behind each `mllDup` name, as rows chained per name in walk
+// order (`mllMoreHead`/`mllMoreTail` → first/last row, `mllMoreNext` → the next, -1 ends),
+// read through `moduleLocalLetAll`. Beside the first-wins map rather than in it: the common
+// name has exactly one binding and must not pay for a list.
+let mllMoreHead: {[string]: i32} = Map()
+let mllMoreTail: {[string]: i32} = Map()
+let mllMoreNext: i32[] = []
 let mllMoreIxs: i32[] = []
 // The module-scope BLOCK node owning each binding above, parallel to the two columns and to
 // `mllMap` — the second half of a reader's scope test, since a binding is denoted only from
@@ -235,6 +238,15 @@ let mllMoreIxs: i32[] = []
 // the last index in its subtree and `atIx <= owner` IS "has not left the block".
 let mllOwner: {[string]: i32} = Map()
 let mllMoreOwners: i32[] = []
+// `moduleLocalLetOfAt`'s per-name plan, built on the name's first positioned query: its
+// bindings sorted by index into one slice of `mllSort*`, each linked to the nearest earlier
+// binding whose block encloses it. `mllSortOff[name]` is the slice start, -2 when two of the
+// name's blocks overlap without nesting, so that name keeps the linear scan.
+let mllSortOff: {[string]: i32} = Map()
+let mllSortCnt: {[string]: i32} = Map()
+let mllSortAt: i32[] = []
+let mllSortEnd: i32[] = []
+let mllSortUp: i32[] = []
 
 // Records `name` as naming a function without waiting for the fold to reach its node — the
 // escape hatch for the one writer that renames a `FuncDecl` in place after the arena already
@@ -315,10 +327,17 @@ export function resetParentLetCache() {
   mlvBuilt = false
   mllMap = Map()
   mllDup = Map()
-  mllMoreNames = []
+  mllMoreHead = Map()
+  mllMoreTail = Map()
+  mllMoreNext = []
   mllMoreIxs = []
   mllOwner = Map()
   mllMoreOwners = []
+  mllSortOff = Map()
+  mllSortCnt = Map()
+  mllSortAt = []
+  mllSortEnd = []
+  mllSortUp = []
   mllAny = false
   0
 }
@@ -445,7 +464,15 @@ function mlvScanStmt(ix: i32, owner: i32) {
       mllAny = true
     } else {
       mllDup[st.letName] = true
-      mllMoreNames.push(st.letName)
+      const row = mllMoreIxs.length
+      const tail = mllMoreTail[st.letName] ?? -1
+      if tail >= 0 && tail < mllMoreNext.length {
+        mllMoreNext[tail] = row
+      } else {
+        mllMoreHead[st.letName] = row
+      }
+      mllMoreTail[st.letName] = row
+      mllMoreNext.push(-1)
       mllMoreIxs.push(ix)
       mllMoreOwners.push(owner)
     }
@@ -544,10 +571,10 @@ export function moduleLocalLetAll(rootIx: i32, name: string, out: i32[]) {
   if first < 0 { return 0 }
   out.push(first)
   if mllDup[name] != true { return 0 }
-  let i = 0
-  while i < mllMoreNames.length {
-    if mllMoreNames[i] == name { out.push(mllMoreIxs[i]) }
-    i = i + 1
+  let i = mllMoreHead[name] ?? -1
+  while i >= 0 && i < mllMoreIxs.length {
+    out.push(mllMoreIxs[i])
+    i = mllMoreNext[i]
   }
   0
 }
@@ -561,10 +588,10 @@ export function moduleLocalLetAllOwners(rootIx: i32, name: string, out: i32[]) {
   if first < 0 { return 0 }
   out.push(mllOwner[name] ?? -1)
   if mllDup[name] != true { return 0 }
-  let i = 0
-  while i < mllMoreNames.length {
-    if mllMoreNames[i] == name { out.push(mllMoreOwners[i]) }
-    i = i + 1
+  let i = mllMoreHead[name] ?? -1
+  while i >= 0 && i < mllMoreOwners.length {
+    out.push(mllMoreOwners[i])
+    i = mllMoreNext[i]
   }
   0
 }
@@ -578,6 +605,12 @@ export function moduleLocalLetOfAt(rootIx: i32, name: string, atIx: i32) {
   if first < 0 { return -1 }
   if mllDup[name] != true { return first }
   if atIx < 0 { return -1 }
+  let off = mllSortOff[name] ?? -1
+  if off == -1 {
+    off = mllSortBuild(rootIx, name)
+    mllSortOff[name] = off
+  }
+  if off >= 0 { return mllSortFind(off, mllSortCnt[name] ?? 0, atIx) }
   const all: i32[] = []
   const owners: i32[] = []
   moduleLocalLetAll(rootIx, name, all)
@@ -590,6 +623,69 @@ export function moduleLocalLetOfAt(rootIx: i32, name: string, atIx: i32) {
     i = i + 1
   }
   best
+}
+
+// Appends `name`'s bindings to `mllSort*` in index order and returns the slice start, or -2
+// when two of its blocks overlap without one nesting in the other. The arena is post-order,
+// so a binding's scope `(at, owner]` either nests in or is disjoint from each other's.
+function mllSortBuild(rootIx: i32, name: string): i32 {
+  const all: i32[] = []
+  const owners: i32[] = []
+  moduleLocalLetAll(rootIx, name, all)
+  moduleLocalLetAllOwners(rootIx, name, owners)
+  if owners.length != all.length { return 0 - 2 }
+  // Walk order is nearly index order, so an insertion sort is close to linear.
+  const ord: i32[] = []
+  let i = 0
+  while i < all.length {
+    let j = ord.length
+    ord.push(i)
+    while j > 0 && all[ord[j - 1]] > all[i] {
+      ord[j] = ord[j - 1]
+      j = j - 1
+    }
+    ord[j] = i
+    i = i + 1
+  }
+  const off = mllSortAt.length
+  const open: i32[] = []
+  let k = 0
+  while k < ord.length {
+    const at = all[ord[k]]
+    const end = owners[ord[k]]
+    while open.length > 0 && mllSortEnd[open[open.length - 1]] < at {
+      open.pop()
+    }
+    let up = -1
+    if open.length > 0 {
+      up = open[open.length - 1]
+      if end > mllSortEnd[up] { return 0 - 2 }
+    }
+    mllSortAt.push(at)
+    mllSortEnd.push(end)
+    mllSortUp.push(up)
+    open.push(off + k)
+    k = k + 1
+  }
+  mllSortCnt[name] = ord.length
+  off
+}
+
+// The last binding in slice `[off, off + cnt)` that precedes `atIx` and whose block `atIx` has
+// not left, or -1: a binary search for the last preceding one, then up its enclosing chain.
+function mllSortFind(off: i32, cnt: i32, atIx: i32): i32 {
+  let lo = off
+  let hi = off + cnt
+  while lo < hi {
+    const mid = lo + (hi - lo) / 2
+    if mllSortAt[mid] < atIx { lo = mid + 1 } else { hi = mid }
+  }
+  let p = lo - 1
+  while p >= off && p < mllSortAt.length {
+    if atIx <= mllSortEnd[p] { return mllSortAt[p] }
+    p = mllSortUp[p]
+  }
+  -1
 }
 
 // Rebuilds the per-function plan. `plMore*` holds only the CURRENT build's duplicate rows
