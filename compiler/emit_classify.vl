@@ -486,6 +486,8 @@ import {
   mfSrcSlots,
   modFcpSpillHit,
   modFcpSpillSeen,
+  modIntMinMaxHit,
+  modIntMinMaxSeen,
   modNumCastHit,
   modNumCastSeen,
   modUnionAsHit,
@@ -11697,6 +11699,71 @@ export function moduleHasFcpSpill(): boolean {
   false
 }
 
+// Is `ix` a call of the intrinsic `min` / `max` — not a user function, and (given a frame
+// `fnIx >= 0`) not a parameter, local or closure value of that name, as `emitCall` reads it?
+export function callIsIntrMinMax(ix: i32, fnIx: i32): boolean {
+  if ix < 0 { return false }
+  const n = P.nodes[ix]
+  if !(n is Call) { return false }
+  if n.callArgs.length != 2 { return false }
+  const cf = n.callFn
+  if cf < 0 { return false }
+  const callee = P.nodes[cf]
+  if !(callee is Ident) { return false }
+  if callee.identName != "min" && callee.identName != "max" { return false }
+  if fnIndexOfSid(sidOfNode(cf)) >= 0 { return false }
+  if fnIx < 0 { return true }
+  if identNameIsUserBound(callee.identName, fnIx) { return false }
+  !exprIsClosure(cf, fnIx)
+}
+
+// The float width the checker recorded for the `min` / `max` call at `ix`, or "". The one
+// fact both the lowering and the frame reservation read, so neither can go integer alone.
+function minMaxRecordedFloat(ix: i32): string {
+  const p = nodeTyPrimName(ix)
+  if p == "f64" || p == "f32" { return p }
+  ""
+}
+
+// The width the intrinsic `min` / `max` call at `ix` computes at — "i32", "i64", "f32" or
+// "f64" — or "" when `ix` is not one. A recorded float type decides; otherwise (a generic
+// instance's clone records none) the operands as they lower: any float operand takes the
+// float rule, else i64 when an operand is i64, else i32.
+export function minMaxKind(ix: i32, fnIx: i32): string {
+  if !callIsIntrMinMax(ix, fnIx) { return "" }
+  const rec = minMaxRecordedFloat(ix)
+  if rec != "" { return rec }
+  const n = P.nodes[ix]
+  if !(n is Call) { return "" }
+  const a = n.callArgs[0]
+  const b = n.callArgs[1]
+  const aF32 = exprIsF32(a, fnIx)
+  const bF32 = exprIsF32(b, fnIx)
+  if aF32 || bF32 || exprIsF64(a, fnIx) || exprIsF64(b, fnIx) {
+    if (aF32 || bF32) && !binMixHardF64(a, b, fnIx) { return "f32" }
+    return "f64"
+  }
+  if exprIsI64(a, fnIx) || exprIsI64(b, fnIx) { return "i64" }
+  "i32"
+}
+
+// Does the module hold a `min` / `max` that may lower at an integer width? Any intrinsic call
+// `minMaxKind` does not decide as a float from its recorded type, so a generic body's call
+// reserves the frame for its instances.
+export function moduleHasIntMinMax(): boolean {
+  if modIntMinMaxHit { return true }
+  let i = modIntMinMaxSeen
+  while i < P.nodes.length {
+    if callIsIntrMinMax(i, -1) && minMaxRecordedFloat(i) == "" {
+      modIntMinMaxHit = true
+      return true
+    }
+    i = i + 1
+  }
+  modIntMinMaxSeen = P.nodes.length
+  false
+}
+
 // True if the statement/expression tree at `ix` contains a function-value call (a `Call`
 // whose callee is a closure value rather than a known function name) — so the function
 // needs the closure scratch slot for `call_ref`.
@@ -12689,6 +12756,9 @@ export function exprIsI64(exprIx: i32, fnIx: i32) {
   if tyKindOf(nodeTyIxOf(exprIx)) == 10 {
     return true // typed-IR fast path (see exprIsF64)
   }
+  // An intrinsic `min` / `max` takes its operands' width, instance by instance.
+  const mmk = minMaxKind(exprIx, fnIx)
+  if mmk != "" { return mmk == "i64" }
   if coalesceAtomKind(exprIx, fnIx) == 3 { return true }
   // `m[k] ?? d` over an i64-valued map yields an i64 (the value type).
   const cmi = coalesceMvSlot(exprIx, fnIx)
@@ -12969,6 +13039,9 @@ export function exprIsF32(exprIx: i32, fnIx: i32) {
   if tyKindOf(nodeTyIxOf(exprIx)) == 13 {
     return true // typed-IR fast path (see exprIsF64)
   }
+  // An intrinsic `min` / `max` takes its operands' width, instance by instance.
+  const mmk = minMaxKind(exprIx, fnIx)
+  if mmk != "" { return mmk == "f32" }
   if coalesceAtomKind(exprIx, fnIx) == 5 { return true }
   const e = P.nodes[exprIx]
   // An explicit `x as T` cast has exactly its target rep (see exprIsF64).
@@ -13085,6 +13158,9 @@ export function exprIsF64(exprIx: i32, fnIx: i32) {
   // Typed-IR fast path (additive — only turns false into true, so the syntactic derivation
   // below still applies to a node with no recorded type, e.g. a monomorphized instance body).
   if tyKindOf(nodeTyIxOf(exprIx)) == 11 { return true }
+  // An intrinsic `min` / `max` takes its operands' width, instance by instance.
+  const mmk = minMaxKind(exprIx, fnIx)
+  if mmk != "" { return mmk == "f64" }
   if coalesceAtomKind(exprIx, fnIx) == 4 { return true }
   // `m[k] ?? d` / `m.get(k) ?? d` over an f64-valued map yields an f64 (the value type).
   const cmf = coalesceMvSlot(exprIx, fnIx)

@@ -23765,6 +23765,20 @@ function objOpSelfFnRetTy(op: string, lt: i32) {
   -1
 }
 
+// The pin half of a `min` / `max` a generic body deferred (`minMaxHoleOperand`): the direct
+// spelling's two accepted forms — both operands integer, or both at most as wide as a float
+// the call can compute at (an `i64` never widens to a float).
+function minMaxPinOk(lt: i32, rt: i32): boolean {
+  const l = primNameOf(lt)
+  const r = primNameOf(rt)
+  const lInt = l == "i32" || l == "i64"
+  const rInt = r == "i32" || r == "i64"
+  if lInt && rInt { return true }
+  const lFloat = l == "i32" || l == "f32" || l == "f64"
+  const rFloat = r == "i32" || r == "f32" || r == "f64"
+  lFloat && rFloat
+}
+
 // Whether the emitter can lower `lt op rt` for two concrete operand types — the soundness
 // criterion a generic call site checks after substituting a hole to its argument type. A
 // still-unresolved operand defers (true — the outer call validates it). Mirrors
@@ -23773,6 +23787,7 @@ function binOpDefinedFor(op: string, lt0: i32, rt0: i32) {
   const lt = softenLitTy(lt0)
   const rt = softenLitTy(rt0)
   if tyHasHole(lt) || tyHasHole(rt) { return true }
+  if op == "min" || op == "max" { return minMaxPinOk(lt, rt) }
   // The nominal-brand mix the BODY deferred on a hole operand (D1747). Both operands are
   // concrete here, which is the precondition that question needs; only a branded PAIR is
   // judged, since a pin has no expression node for `nomBinMixes`'s literal-adoption legs.
@@ -27762,10 +27777,45 @@ function floatIntrWidth(argIxs: i32[], argTys: i32[]) {
 function intIntrWidth(argTys: i32[]) {
   let i = 0
   while i < argTys.length {
-    if primNameOf(argTys[i]) == "i64" { return TY_I64 }
+    if primNameOf(softenLitTy(argTys[i])) == "i64" { return TY_I64 }
     i = i + 1
   }
   TY_I32
+}
+
+// Is this `min` / `max` over integers only? Then it computes at the integer width
+// (`intIntrWidth`) rather than the float one, so `min(i, j)` is an i32 and not an f64.
+// An operand that is not a concrete integer primitive (a literal type counts as its base) keeps
+// the float rule.
+function intMinMaxOperands(name: string, argTys: i32[]): boolean {
+  if name != "min" && name != "max" { return false }
+  let i = 0
+  while i < argTys.length {
+    const p = primNameOf(softenLitTy(argTys[i]))
+    if p != "i32" && p != "i64" && p != "u8" { return false }
+    i = i + 1
+  }
+  true
+}
+
+// The hole a `min` / `max` over an un-annotated operand defers to, or -1. Its width is the
+// pin's to decide, as `a - b` over a hole's is: the call answers the hole, and each instance
+// re-checks the call with the bound type. A concrete float operand decides f64/f32 already.
+function minMaxHoleOperand(name: string, argTys: i32[]) {
+  if name != "min" && name != "max" { return -1 }
+  let hole = -1
+  let i = 0
+  while i < argTys.length {
+    const t = argTys[i]
+    if tyIsHole(t) {
+      if hole < 0 { hole = t }
+    } else {
+      const p = primNameOf(softenLitTy(t))
+      if p != "i32" && p != "i64" { return -1 }
+    }
+    i = i + 1
+  }
+  hole
 }
 
 // Type the float / integer intrinsic call `name(args…)`, or -1 when `name` is not one.
@@ -27793,8 +27843,15 @@ function numIntrCallTy(name: string, n: Call, ix: i32) {
     argTys.push(checkNode(args[i]))
     i = i + 1
   }
+  const holeTy = minMaxHoleOperand(name, argTys)
+  if holeTy >= 0 {
+    noteBinCstr(argTys[0], name, argTys[1])
+    return holeTy
+  }
   let width = intIntrWidth(argTys)
-  if isFloat { width = floatIntrWidth(args, argTys) }
+  if isFloat && !intMinMaxOperands(name, argTys) {
+    width = floatIntrWidth(args, argTys)
+  }
   let j = 0
   while j < args.length {
     if !assignableExpr(args[j], argTys[j], width) {

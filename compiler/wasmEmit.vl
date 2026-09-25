@@ -334,6 +334,7 @@ import {
   ia64TypeIdx,
   ia64Used,
   il64TypeIdx,
+  intMinMaxSlot,
   lTypeIdx,
   lUsed,
   lcatBases,
@@ -795,6 +796,7 @@ import {
   mfResultKindOf,
   mfResultSlotOf,
   mfSrcLocalFor,
+  minMaxKind,
   msMemberAtomsOfSet,
   msSetOfText,
   msSubNull,
@@ -14833,6 +14835,10 @@ function intIntrOpI64(name: string) {
 function emitFloatIntr(body: u8[], callIx: i32, fnIx: i32, name: string) {
   const opF32 = floatIntrOpF32(name)
   if opF32 < 0 { return NUM_INTR_NONE }
+  const mmk = minMaxKind(callIx, fnIx)
+  if mmk == "i32" || mmk == "i64" {
+    return emitIntMinMax(body, callIx, fnIx, name, mmk == "i64")
+  }
   const c = P.nodes[callIx]
   if c is Call {
     const args = c.callArgs
@@ -14865,6 +14871,42 @@ function emitFloatIntr(body: u8[], callIx: i32, fnIx: i32, name: string) {
     return fbNumOp(floatIntrOpF64(name))
   }
   NUM_INTR_NONE
+}
+
+// Lower an integer `min` / `max`, which has no wasm instruction: both operands are
+// evaluated in order before either is staged (so a nested call cannot clobber the frame),
+// then `select` over a signed compare. Staging slots: i32 at +0/+1, i64 at +2/+3.
+function emitIntMinMax(
+  body: u8[],
+  callIx: i32,
+  fnIx: i32,
+  name: string,
+  wide: boolean,
+) {
+  const c = P.nodes[callIx]
+  if !(c is Call) {
+    return emitFail("emitProgram: expected an integer min/max call")
+  }
+  let k = 0
+  let s0 = intMinMaxSlot
+  // i32.lt_s 0x48 · i32.gt_s 0x4a · i64.lt_s 0x53 · i64.gt_s 0x55
+  let cmp = 0x48
+  if wide {
+    k = 3
+    s0 = intMinMaxSlot + 2
+    cmp = 0x53
+  }
+  if name == "max" { cmp = cmp + 2 }
+  if emitNumIntrArg(body, c.callArgs[0], k, fnIx) < 0 { return -1 }
+  if emitNumIntrArg(body, c.callArgs[1], k, fnIx) < 0 { return -1 }
+  fbLocalSet(s0 + 1)
+  fbLocalTee(s0)
+  fbLocalGet(s0 + 1)
+  fbLocalGet(s0)
+  fbLocalGet(s0 + 1)
+  fbNumOp(cmp)
+  wU8(27) // 0x1b select → the first operand when the compare holds
+  0
 }
 
 // Lower an INTEGER intrinsic (`clz`, `rotl`, `divU`, `ltU`, …): push every argument at

@@ -50,7 +50,22 @@ and the width chosen from the arguments. The rule is the **binary operators' own
 operand is genuinely f32 and neither side is a genuine (non-literal) f64; a bare float literal
 adapts down, so `min(x, 0.5)` over an f32 `x` computes in f32 exactly as `x * 0.5` does. Integer
 ops take i64 when an operand is i64. All-integer operands land on f64 for a float op, where they
-widen losslessly — `sqrt(2)` is the f64 square root, as `2 / 1.0` is f64 division. The checker and
+widen losslessly — `sqrt(2)` is the f64 square root, as `2 / 1.0` is f64 division. The one
+exception is `min`/`max`: over operands that are all integer primitives (`i32`, `i64`, a `u8`
+element, or a literal type or literal union softened to one of those, so `d: 1 | 2` and
+`z: 5000000000 | 6000000000` count) they compute at the INTEGER width by the integer rule, so `min(i, j)` is an `i32` and
+`min(i, j) / 2` divides as integers (PL-038). Wasm has no integer min/max instruction, so the
+emitter stages both operands in a module-wide 4-slot frame (`intMinMaxSlot`: two i32, two i64)
+and lowers a signed compare plus `select`; the frame is reserved whenever the module holds a
+`min`/`max` not recorded as a float (`moduleHasIntMinMax`). The lowering (`minMaxKind`) reads the
+same recorded-float fact first (`minMaxRecordedFloat`), so a call the checker typed as a float can
+never lower at an integer width into a frame nobody reserved — the review found exactly that
+divergence when the checker's operand test missed literal types. An un-annotated operand (a hole) defers the
+width to each call, as `a / b` does: the body's call answers the hole and records a `min`/`max`
+constraint that `binOpDefinedFor` settles at the pin (`minMaxPinOk`: both integer, or both at
+most float-wide — an `i64` never meets a float). The instance's clone carries no recorded
+types, so `minMaxKind` reads the width off the operands as they lower, and the three
+`exprIs*` classifiers ask it, so the call and its consumer agree per instance. The checker and
 the emitter derive the width from the same facts (the checker from the argument types, the emitter
 from `exprIsF32`/`exprIsI64` + `binMixHardF64`, whose typed-IR fast path reads the very types the
 checker recorded), so they cannot disagree where the checker recorded a type.
