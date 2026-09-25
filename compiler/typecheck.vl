@@ -98,6 +98,7 @@ import {
   i32ToStr,
   isDefaultGlobalRef,
   markDefaultGlobalRef,
+  mkTypeRef,
   nodeToks,
   orderArgsByParamNames,
   paramDefaultIsCallsite,
@@ -11268,6 +11269,13 @@ function storageTyLeafFail() {
   -1
 }
 
+// The wrong-count sentence for `Map<…>` / `Set<…>`.
+function collTyArgCountMsg(head: string, want: i32, got: i32): string {
+  let what = " type arguments but got "
+  if want == 1 { what = " type argument but got " }
+  "`" + head + "` expects " + i32ToStr(want) + what + i32ToStr(got)
+}
+
 // A bare `Map` / `Set` names the collection without its type arguments, which no position can
 // complete, so the suggestion is banked on `unkTyClash` rather than adding an arm. Reached only
 // after the declared-name lookup, so a user `type Map = …` still wins.
@@ -11392,20 +11400,11 @@ function builtinCollAppTy(head: string, inner: string, appIx: i32) {
   let want = 2
   if head == "Set" { want = 1 }
   if argTys.length != want {
-    tErr(
-      "`"
-        + head
-        + "` expects "
-        + i32ToStr(want)
-        + " type arguments but got "
-        + i32ToStr(argTys.length),
-      annotDiagAt,
-    )
+    tErr(collTyArgCountMsg(head, want, argTys.length), annotDiagAt)
     return TY_ERR
   }
   const k = argTys[0]
-  const kt = T.tys[k]
-  if !mapKeyTySupported(k) && !(kt is TyVar) {
+  if !mapKeyTySupported(k) {
     unkTyClash = mapKeyUnsupportedMsg(tyToStr(k), head)
     return -1
   }
@@ -30139,7 +30138,8 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
       "wrong number of arguments: expected "
         + arityWantText(required, params.length)
         + ", got "
-        + i32ToStr(args.length),
+        + i32ToStr(args.length)
+        + tyArgReadHintIfAny(args),
       ix,
     )
     return retTy
@@ -30446,7 +30446,8 @@ function callTyArgsCalleeOk(cfn: Node, ix: i32): boolean {
         tErr(
           "`"
             + nm
-            + "` is not generic, so it takes no type arguments — drop the `<…>`",
+            + "` is not generic, so it takes no type arguments — drop the `<…>`"
+            + TY_ARG_READ_HINT,
           ix,
         )
         return false
@@ -30454,10 +30455,27 @@ function callTyArgsCalleeOk(cfn: Node, ix: i32): boolean {
     }
   }
   tErr(
-    "explicit type arguments need a direct call of a declared generic function, or `Map<K, V>()` / `Set<T>()`",
+    "explicit type arguments need a direct call of a declared generic function, or `Map<K, V>()` / `Set<T>()`"
+      + TY_ARG_READ_HINT,
     ix,
   )
   false
+}
+
+// Appended where a call read as `name<…>(…)` fails: the source may have meant a comparison,
+// `a < b, c > (d)`, which TypeScript's rule reads as type arguments.
+const TY_ARG_READ_HINT = "; `<` … `>` directly followed by `(` is read as type arguments — if this was a comparison, parenthesise it: `(a < b)`"
+
+// The hint when any of `args` is a call written with type arguments, else "".
+function tyArgReadHintIfAny(args: i32[]): string {
+  let i = 0
+  while i < args.length {
+    if args[i] >= 0 {
+      if callTyArgsOf(args[i]).length > 0 { return TY_ARG_READ_HINT }
+    }
+    i = i + 1
+  }
+  ""
 }
 
 // Resolves a call's explicit type-argument nodes in the call's own scope, banking each type
@@ -30472,7 +30490,7 @@ function resolveCallTyArgs(ix: i32, out: i32[]): boolean {
     let t = -1
     if ta is TypeRef {
       t = nameToTyAt(ta.tyName, tas[i])
-      if t < 0 { tErr(unknownTyText(ta.tyName), tas[i]) }
+      if t < 0 { tErr(unknownTyText(ta.tyName) + TY_ARG_READ_HINT, tas[i]) }
     }
     if t < 0 {
       ok = false
@@ -30495,23 +30513,12 @@ function collCtorTyArgsTy(ctor: string, ix: i32) {
   let want = 2
   if ctor == "Set" { want = 1 }
   if tys.length != want {
-    tErr(
-      "`"
-        + ctor
-        + "` expects "
-        + i32ToStr(want)
-        + " type arguments but got "
-        + i32ToStr(tys.length),
-      ix,
-    )
+    tErr(collTyArgCountMsg(ctor, want, tys.length), ix)
     return TY_ERR
   }
   if !mapKeyTySupported(tys[0]) {
-    const kt = T.tys[tys[0]]
-    if !(kt is TyVar) {
-      mapKeyUnsupportedErr(tyToStr(tys[0]), ctor, callTyArgsOf(ix)[0])
-      return TY_ERR
-    }
+    mapKeyUnsupportedErr(tyToStr(tys[0]), ctor, callTyArgsOf(ix)[0])
+    return TY_ERR
   }
   if ctor == "Set" { return mkMapTy(tys[0], TY_BOOL, 1) }
   mkMapTy(tys[0], tys[1], 0)
@@ -30525,6 +30532,153 @@ function tyParamListText(names: string[]): string {
     if i > 0 { out = out + ", " }
     out = out + names[i]
     i = i + 1
+  }
+  out
+}
+
+// Under written type arguments, a function literal's un-annotated parameter becomes annotated
+// with the callee's declared parameter spelling, its type parameters replaced by the written
+// arguments: the program is then the annotated twin every later pass already lowers. Runs
+// before checking, on spellings only; a callee the arena does not name uniquely is skipped.
+function annotateTyArgLambdas() {
+  genDeclByName = Map()
+  const n0 = P.nodes.length
+  let i = 0
+  while i < n0 {
+    const d = P.nodes[i]
+    if d is FuncDecl {
+      if d.fnTyParams.length > 0 {
+        if genDeclByName.has(d.fnName) {
+          genDeclByName[d.fnName] = -1
+        } else {
+          genDeclByName[d.fnName] = i
+        }
+      }
+    }
+    i = i + 1
+  }
+  let c = 0
+  while c < n0 {
+    const cn = P.nodes[c]
+    if cn is Call {
+      const tas = callTyArgsOf(c)
+      if tas.length > 0 { annotateCallLambdas(cn, tas) }
+    }
+    c = c + 1
+  }
+  0
+}
+
+// Each generic function name the program declares once, to its `FuncDecl`; -1 for a name
+// declared more than once. Filled by `annotateTyArgLambdas` for this program.
+let genDeclByName: {[string]: i32} = Map()
+
+// The one generic `FuncDecl` named `name` with `arity` type parameters, or -1.
+export function uniqueGenericDeclNamed(name: string, arity: i32): i32 {
+  const ix = genDeclByName[name] ?? -1
+  if ix < 0 || ix >= P.nodes.length { return -1 }
+  const d = P.nodes[ix]
+  if d is FuncDecl {
+    if d.fnTyParams.length == arity { return ix }
+  }
+  -1
+}
+
+function annotateCallLambdas(cn: Call, tas: i32[]) {
+  const f = P.nodes[cn.callFn]
+  if !(f is Ident) { return 0 }
+  const dIx = uniqueGenericDeclNamed(f.identName, tas.length)
+  if dIx < 0 { return 0 }
+  const d = P.nodes[dIx]
+  if !(d is FuncDecl) { return 0 }
+  const names: string[] = []
+  let t = 0
+  while t < tas.length {
+    const ta = P.nodes[tas[t]]
+    if ta is TypeRef { names.push(ta.tyName) } else { return 0 }
+    t = t + 1
+  }
+  let a = 0
+  while a < cn.callArgs.length && a < d.fnParams.length {
+    if a < cn.callArgNames.length && cn.callArgNames[a] != "" { return 0 }
+    const dp = P.nodes[d.fnParams[a]]
+    const lx = cwPeel(cn.callArgs[a])
+    if dp is Param && lx >= 0 && lx < P.nodes.length {
+      const lam = P.nodes[lx]
+      if lam is FuncDecl {
+        if dp.parType >= 0 {
+          annotateLambdaFrom(lam, annTsOf(dp.parType), d.fnTyParams, names)
+        }
+      }
+    }
+    a = a + 1
+  }
+  0
+}
+
+// `lam`'s un-annotated parameters, annotated from the function-type spelling `root`.
+function annotateLambdaFrom(
+  lam: FuncDecl,
+  root: i32,
+  typarams: string[],
+  args: string[],
+) {
+  if root < 0 || root >= tsKind.length { return 0 }
+  if tsKind[root] != TS_FUNC { return 0 }
+  const cnt = tsKidCount[root] - 1
+  if cnt != lam.fnParams.length { return 0 }
+  let k = 0
+  while k < cnt {
+    const p = P.nodes[lam.fnParams[k]]
+    if p is Param {
+      if p.parType < 0 {
+        const spelled = tsToName(tsKids[tsKidStart[root] + k])
+        if spelled != "" {
+          arenaEpochBump()
+          p.parType = mkTypeRef(
+            substTyParamSpelling(spelled, typarams, args),
+            p.pos,
+          )
+        }
+      }
+    }
+    k = k + 1
+  }
+  0
+}
+
+// `name` with each whole identifier naming one of `typarams` replaced by its argument, which
+// is grouped in parentheses when it is a union, an intersection or a function type and does
+// not stand for the whole spelling.
+function substTyParamSpelling(
+  name: string,
+  typarams: string[],
+  args: string[],
+): string {
+  let out = ""
+  let i = 0
+  while i < name.length {
+    if isIdentCharAt(name, i) {
+      let j = i
+      while j < name.length && isIdentCharAt(name, j) { j = j + 1 }
+      const word = name.slice(i, j)
+      let rep = word
+      let k = 0
+      while k < typarams.length {
+        if typarams[k] == word && k < args.length { rep = args[k] }
+        k = k + 1
+      }
+      if rep != word && j - i != name.length {
+        if rep.includes("|") || rep.includes("&") || rep.includes("=>") {
+          rep = "(" + rep + ")"
+        }
+      }
+      out = out + rep
+      i = j
+    } else {
+      out = out + name.slice(i, i + 1)
+      i = i + 1
+    }
   }
   out
 }
@@ -30558,7 +30712,8 @@ function bindExplicitTyArgs(
             + " (`"
             + tyParamListText(d.fnTyParams)
             + "`), but the call gives "
-            + i32ToStr(tys.length),
+            + i32ToStr(tys.length)
+            + TY_ARG_READ_HINT,
           ix,
         )
         return false
@@ -36836,6 +36991,7 @@ export function checkProgram(rootIx: i32) {
   checkerArmed = false
   // Before the tables below are sized, so every node it mints is checked (D1991).
   hoistMatchScrutinees(rootIx)
+  annotateTyArgLambdas()
   const rootN0 = P.nodes[rootIx]
   if rootN0 is Program { gRootStmts = rootN0.progStmts }
   crReset()

@@ -1957,11 +1957,15 @@ three callers instead would have been three more places to forget.
   followed DIRECTLY by `(`; otherwise the parser restores its cursor, token stream,
   diagnostics and spelling stack and the `<` is a comparison. Chosen over a lexical rule
   (no space before `<`) because it is the one a TS reader already carries, and over a
-  turbofish (`f::<T>()`) because the price is small and measured: the only programs that
-  change meaning are `a < b > (c)` and `f(a < b, c > (d))`, and at the change neither
-  occurred once in `tests/cases` (3,596 files), the distilled corpus (7,589 cells), `std/`,
-  `scripts/`, the compiler, glean (319 files) or plumb's sources (104) — the chain form was
-  already a check error, since `a < b` is a `boolean`. Scope today: a direct call of a
+  turbofish (`f::<T>()`) because the price is small and measured. Two forms change meaning.
+  The chain `a < b > (c)` was already a check error, since `a < b` is a `boolean`. The
+  COMMA form `f(a < b, c > (d))` is not: it ran before, as two comparison arguments, and
+  now reads as one call `a<b, c>(d)` and is refused — with a hint naming this rule and the
+  fix, `f((a < b), c > (d))`. Neither form occurred once in `tests/cases` (3,596 files), the
+  distilled corpus (7,589 cells), `std/`, `scripts/`, the compiler, glean (319 files) or
+  plumb's sources (104); the owner accepted the ambiguity as TypeScript does, and the comma
+  form is flagged to the owner separately. A line break inside the `<…>` is not tolerated
+  (the list must sit on one line); left as is. Scope today: a direct call of a
   declared generic function, and `Map<K, V>()` / `Set<T>()`; the written types bind the
   type parameters in declaration order before any argument is checked. A method call
   (`o.f<T>()`) and an instantiation expression without a call (`const g = id<i32>`) are

@@ -63,8 +63,9 @@ is checked at the written type, and a type parameter no parameter mentions becom
 The parse rule is TypeScript's: after a name, `<` opens type arguments only when what follows
 parses as a type list, closes with `>`, and is directly followed by `(`; every other `<` is a
 comparison. So `a < b > (c)` now reads as a generic call — a relational chain VL's checker
-never accepted, since `a < b` is a `boolean` — and `f(a < b, c > (d))` does too; parenthesise
-a comparison there: `f((a < b), c > (d))`.
+never accepted, since `a < b` is a `boolean` — and so does `f(a < b, c > (d))`, which DID run
+before as two comparisons and is now refused with a hint; parenthesise a comparison there:
+`f((a < b), c > (d))`.
 
 **Iterating a collection — reach for the element, not the index.** The first spelling to
 try binds the elements directly; it needs no bound and cannot run off the end:
