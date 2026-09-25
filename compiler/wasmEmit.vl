@@ -14050,6 +14050,9 @@ function emitNumWrapCast(body: u8[], e: AsExpr, exprIx: i32, fnIx: i32) {
   }
   // An i64 target is the sign-extend, which the i64 helper already is for both sources.
   if tgt == "i64" { return emitNumIntrArg(body, obj, 3, fnIx) }
+  // `((y >>> k) & m) as% i32` narrows to i32 ops when the mask stays in the low word.
+  const nsrc = srWrappedMask(exprIx, fnIx)
+  if nsrc.length > 0 { return srEmitNarrowed(body, nsrc, fnIx) }
   const lit = P.nodes[unwrapParen(obj)]
   let folded = false
   if lit is NumLit {
@@ -23438,6 +23441,38 @@ function srMaskOperands(ix: i32, w: i32, fnIx: i32): i64[] {
   none
 }
 
+// A masked shift at `ix` of width `w`, as [x, k, narrow, m]; [] when `ix` is not one. Either
+// `(<shift source>) & m`, or at w = 32 `((y >>> k) & m) as% i32` with y an i64, k <= 31 and
+// m < 2^(32-k): the wrap keeps the low word of `(y >>> k) & m`, and so does the narrow form.
+function srMaskedSource(ix: i32, w: i32, fnIx: i32): i64[] {
+  const mo = srMaskOperands(ix, w, fnIx)
+  if mo.length > 0 {
+    const src = srShiftSource(mo[1] as% i32, mo[0], w, fnIx)
+    if src.length == 0 { return src }
+    return [src[0], src[1], src[2], mo[0]]
+  }
+  if w != 32 { return mo }
+  srWrappedMask(unwrapParen(ix), fnIx)
+}
+
+// `srMaskedSource` of an `as% i32` wrap over an i64 masked shift, else [].
+function srWrappedMask(x: i32, fnIx: i32): i64[] {
+  const none: i64[] = []
+  if x < 0 || x >= P.nodes.length { return none }
+  const e = P.nodes[x]
+  if e is AsExpr {
+    if e.asMode != "wrap" { return none }
+    if asExprNumCastDomain(x) != "i32" || !srTyIs(x, false) { return none }
+    const mo = srMaskOperands(e.asObj, 64, fnIx)
+    if mo.length == 0 { return none }
+    const src = srShiftSource(mo[1] as% i32, mo[0], 64, fnIx)
+    if src.length == 0 { return none }
+    if src[1] > 31 || !srMaskBelow(mo[0], 32 - src[1]) { return none }
+    return [src[0], src[1], 1, mo[0]]
+  }
+  none
+}
+
 // Pushes a constant at width `w` (an i32 takes the low 32 bits).
 function srConst(v: i64, w: i32) {
   if w == 64 {
@@ -23467,10 +23502,22 @@ function srPushSource(body: u8[], src: i64[], w: i32, fnIx: i32): i32 {
   emitExpr(body, x, fnIx)
 }
 
+// Emits narrowing source `src` ([y, k, 1, m]) as `(wrap(y) >>> k) & m`, all at i32.
+function srEmitNarrowed(body: u8[], src: i64[], fnIx: i32): i32 {
+  if srPushSource(body, src, 32, fnIx) < 0 { return -1 }
+  if src[1] > 0 {
+    srConst(src[1], 32)
+    fbI32Bin(srOpcode(">>>", 32))
+  }
+  srConst(src[3], 32)
+  fbI32Bin(srOpcode("&", 32))
+  0
+}
+
 // Emits `e` (at `exprIx`, width `w`) strength-reduced when it is one of the shapes above:
 // `((x >>> k) & m) << j`, the same with `* 2^j`, or a narrowing `(y >>> k) as% i32 & m`.
-// Answers 0 when emitted, -1 on an emit failure, 1 when `e` is none of them and nothing was
-// pushed. Every operand but x is a constant, so evaluation order and traps are unchanged.
+// Answers 0 when emitted, -1 on an emit failure, 1 when `e` is none of them (nothing
+// pushed). Every operand but x is a constant, so evaluation order and traps are unchanged.
 function emitShiftMaskFold(
   body: u8[],
   e: BinExpr,
@@ -23481,18 +23528,9 @@ function emitShiftMaskFold(
   if !srTyIs(exprIx, w == 64) { return 1 }
   if e.binOp == "&" {
     if w != 32 { return 1 }
-    const mo = srMaskOperands(exprIx, w, fnIx)
-    if mo.length == 0 { return 1 }
-    const nsrc = srShiftSource(mo[1] as% i32, mo[0], w, fnIx)
+    const nsrc = srMaskedSource(exprIx, w, fnIx)
     if nsrc.length == 0 || nsrc[2] != 1 { return 1 }
-    if srPushSource(body, nsrc, w, fnIx) < 0 { return -1 }
-    if nsrc[1] > 0 {
-      srConst(nsrc[1], w)
-      fbI32Bin(srOpcode(">>>", w))
-    }
-    srConst(mo[0], w)
-    fbI32Bin(srOpcode("&", w))
-    return 0
+    return srEmitNarrowed(body, nsrc, fnIx)
   }
   let j: i64 = -1
   let inner = -1
@@ -23508,9 +23546,7 @@ function emitShiftMaskFold(
     }
   }
   if j < 0 { return 1 }
-  const mo = srMaskOperands(inner, w, fnIx)
-  if mo.length == 0 { return 1 }
-  const src = srShiftSource(mo[1] as% i32, mo[0], w, fnIx)
+  const src = srMaskedSource(inner, w, fnIx)
   if src.length == 0 { return 1 }
   if srPushSource(body, src, w, fnIx) < 0 { return -1 }
   const k = src[1]
@@ -23521,7 +23557,7 @@ function emitShiftMaskFold(
     srConst(j - k, w)
     fbI32Bin(srOpcode("<<", w))
   }
-  srConst(mo[0] << j, w)
+  srConst(src[3] << j, w)
   fbI32Bin(srOpcode("&", w))
   0
 }
