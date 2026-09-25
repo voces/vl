@@ -476,7 +476,6 @@ import {
   fbI32Bin,
   fbI32Const,
   fbI32Eqz,
-  fbI32HashMix,
   fbI32TruncF32S,
   fbI32TruncF64S,
   fbI32WrapI64,
@@ -7597,58 +7596,67 @@ function pushMapSeqs(body: u8[]) {
   0
 }
 
-// The hash of the current op's target key, leaving a non-negative i32 on the stack: the FNV-1a of
-// the string in the key scratch slot (a call into the shared `__str_hash__` helper), or the
-// integer mix of the i32 key (`fbI32HashMix`, the same generator the i32-keyed probe helper's
-// body uses). Both leave the same masked range, which is what lets the two reps share `hashes`.
+// The hash of the current op's string key, leaving a non-negative i32 on the stack: the FNV-1a
+// of the string in the key slot, a call into the shared `__str_hash__` helper. It is the key's
+// tag in the index; an i32 key is its own tag and is never hashed here.
 function emitMapHashOf(_body: u8[]) {
-  if cmKeyI32() {
-    // Scratch slot +9 (`hcur`) is the mix's own accumulator — dead across it.
-    fbI32HashMix(cmKeyLocal(), mapScratchBase + 9)
-    return 0
-  }
   fbLocalGet(cmKeyLocal())
   fbCall(gHelpStrHash)
   0
 }
 
-// The hash of the current op's key at a site that runs after `emitMapProbe` — the `hashes[]`
-// store on an appending `m[k] = v`. A string key's hash is the one handed to the probe, still in
-// slot +9, so the key is walked once per insert instead of twice; an i32 key's is re-mixed,
-// because `__map_probe_i32__` computes its own internally.
-function pushMapProbedHash(body: u8[]) {
-  if cmKeyI32() { return emitMapHashOf(body) }
+// The current op's index tag at a site that runs after `emitMapProbe`: the i32 key itself, or
+// a string key's hash, the one handed to the probe and still in slot +9, so the key is walked
+// once per insert instead of twice.
+function pushMapProbedTag(body: u8[]) {
+  if cmKeyI32() {
+    fbLocalGet(cmKeyLocal())
+    return 0
+  }
   pushMapScr(body, 9)
 }
 
-// Probe: with `mapRef` (slot 0) and the target `keyRef` (slot 1) set, hash the key into `M.index`
-// and linear-probe, wrapping, to the slot holding either the matching key's entry or a free (0)
-// slot. Leaves `slot` (3) = that probe slot and `entry` (5) = `index[slot]`, 0 for a miss. Shared
-// by get, has, set and delete; occupancy, dead markers included, stays under 1/2, so a free slot is reached.
+// `2 * slot + k` for the probe slot in scratch slot 3: the index position of the slot's tag
+// (`k` 0) or its entry (`k` 1).
+function pushMapPairPos(body: u8[], k: i32) {
+  pushMapScr(body, 3)
+  fbI32Const(1)
+  fbI32Bin(116) // 0x74 i32.shl
+  if k != 0 {
+    fbI32Const(k)
+    fbI32Bin(114) // 0x72 i32.or
+  }
+  0
+}
 
-// Tombstone-aware: a tombstoned entry (`live[entry-1] == 0`) is not a hit but a probe marker,
-// kept so delete does not break the chain, and the stored per-entry hash gates the key compare.
+// Probe: with `mapRef` (slot 0) and the target `keyRef` (slot 1) set, linear-probe `M.index`,
+// wrapping, to the pair slot holding either the matching key's entry or a free (0) one. Leaves
+// `slot` (3) = that probe slot and `entry` (5) = `index[2*slot+1]`, 0 for a miss. Shared by get,
+// has, set and delete; occupancy, dead markers included, stays under 1/2, so a free slot is reached.
+
+// A deleted entry's pair is a `-1` marker, never a hit, kept so delete does not break the chain.
 // The string key is hashed here, as `__map_probe__`'s first operand, on an empty operand stack so
 // no backing `struct.get` stays live across `__str_hash__`; `keepHash` parks it in scratch +9.
 function emitMapProbe(body: u8[], keepHash: boolean) {
-  if !cmKeyI32() {
+  // Push the probe's shape-agnostic components (the map struct type differs per value shape,
+  // but `index` and `keys` are identically typed across shapes — only these `struct.get`s stay
+  // at the call site) and call the shared helper, which returns the probe SLOT.
+  if cmKeyI32() {
+    pushMapIndex(body)
+    fbLocalGet(cmKeyLocal()) // the raw i32 key, its own tag
+    fbCall(gHelpMapProbeI32)
+  } else {
     emitMapHashOf(body)
     if keepHash { fbLocalTee(mapScratchBase + 9) }
+    pushMapIndex(body)
+    pushMapKeysBacking(body)
+    fbLocalGet(cmKeyLocal()) // the target string key
+    fbCall(gHelpMapProbe)
   }
-  // Push the probe's shape-agnostic components (the map struct type differs per
-  // value shape, but `index`/`hashes`/`live`/`keys` are identically typed across
-  // shapes — only these `struct.get`s stay at the call site) and call the shared
-  // `__map_probe__` helper (`emitMapProbeFnCode`), which returns the probe SLOT.
-  pushMapIndex(body)
-  pushMapHashes(body)
-  pushMapLive(body)
-  pushMapKeysBacking(body)
-  fbLocalGet(cmKeyLocal()) // the target key (a string ref, or a raw i32)
-  if cmKeyI32() { fbCall(gHelpMapProbeI32) } else { fbCall(gHelpMapProbe) }
   setMapScr(body, 3) // slot
-  // entry = index[slot]  (0 = miss; else entry-position + 1)
+  // entry = index[2*slot + 1]  (0 = miss; else entry-position + 1)
   pushMapIndex(body)
-  pushMapScr(body, 3)
+  pushMapPairPos(body, 1)
   fbArrayGet(aTypeIdx) // array.get
   setMapScr(body, 5)   // entry
   0
@@ -7699,18 +7707,17 @@ function emitMapNew(_body: u8[]) {
   // live: empty i32 array (cap 0), parallel to the empty keys/vals entry lists. It
   // grows in lockstep with the keys backing on append (a fresh entry is live = 1).
   fbArrayNewFixed(aTypeIdx, 0)
-  // index: an i32 hash-slot array of `INITIAL_CAP * 2` (16) zero-filled slots, 0 meaning empty.
+  // index: `INITIAL_CAP * 2` (16) zero-filled pair slots, an i32 array of 32, 0 meaning empty.
   // Occupancy, dead probe markers included, is kept under 1/2 by resizing at `count*2 >= cap`
   // (`__map_resize__`), so every probe reaches a free slot under any mix of inserts and deletes (D2280).
-  fbI32Const(16) // i32.const 16 (INITIAL_CAP * 2)
+  fbI32Const(32) // i32.const 32 (2 * INITIAL_CAP * 2)
   fbArrayNewDefault(aTypeIdx)
   // count = 0, size = 0.
   fbI32Const(0)
   fbI32Const(0)
-  // hashes: empty i32 array (cap 0), parallel to the entries; grows in lockstep with
-  // the keys backing on append (the stored FNV hash of each key). Mirrors the host's
-  // 7th `struct.new` operand (`mapNewFn`); native sizes it like `live` (cap 0, grown
-  // on demand) rather than INITIAL_CAP so the entry-parallel arrays stay length-locked.
+  // hashes: empty i32 array (cap 0), parallel to the entries of a STRING-keyed map; grows in
+  // lockstep with the keys backing on append (each key's hash, which compaction re-places
+  // from). An i32-keyed map's key is its own tag, so its `hashes` stays this empty array.
   fbArrayNewFixed(aTypeIdx, 0)
   // seqs (empty) and the next sequence (0), in a module that deletes (D2315).
   if gMapDeletes {
@@ -8548,10 +8555,7 @@ function emitMapValues(body: u8[], recvIx: i32, fnIx: i32) {
 function emitMapResize(body: u8[]) {
   pushMapRef(body) // the struct.set receiver
   pushMapIndex(body)
-  pushMapHashes(body)
-  pushMapLive(body)
   pushMapCount(body)
-  pushMapSize(body)
   fbCall(gHelpMapResize)
   fbStructSet(cmMapTy(), 3) // struct.set field 3: index
   0
@@ -8567,6 +8571,11 @@ function emitMapDelete(body: u8[], recvIx: i32, keyIx: i32, fnIx: i32) {
   // if entry == 0 { 0 } else { tombstone ; drop refs ; size-- ; 1 }
   pushMapScr(body, 5) // entry
   fbIf(127)           // if (entry != 0), 0x7f i32 blocktype
+  // index[2*slot+1] = -1  (the pair stays a probe marker, but is never a hit again)
+  pushMapIndex(body)
+  pushMapPairPos(body, 1)
+  fbI32Const(0 - 1)
+  fbArraySet(aTypeIdx)
   // live[entry-1] = 0  (tombstone; keeps the entry's insertion-order position)
   pushMapLive(body)
   pushMapScr(body, 5)  // entry
@@ -8833,9 +8842,13 @@ function emitMapSetV(
     emitMapProbe(body, true)
     fbEnd()       // end (compact if)
   }
-  // index[slot] = count + 1  (the new entry's position + 1).
+  // index[2*slot] = tag ; index[2*slot+1] = count + 1  (the new entry's position + 1).
   pushMapIndex(body)
-  pushMapScr(body, 3)  // slot
+  pushMapPairPos(body, 0)
+  pushMapProbedTag(body)
+  fbArraySet(aTypeIdx) // array.set
+  pushMapIndex(body)
+  pushMapPairPos(body, 1)
   pushMapCount(body)
   fbI32Const(1)
   fbI32Bin(106)        // i32.add (count + 1)
@@ -8933,21 +8946,22 @@ function emitMapPushKey(body: u8[]) {
   pushMapRef(body)                // mapRef
   pushMapScrLB(body)
   fbStructSet(cmMapTy(), 2)       // struct.set field 2: live
-  // hashes grows in LOCKSTEP too (entry-parallel): fresh `(ref $aTypeIdx)` of newCap
-  // (slot 13), copy `[0, keys.len)` over, store back into M.hashes (field 6). Mirrors
-  // the host's grow of its entry-parallel `hashes` array.
-  pushMapScr(body, 4)             // newCap
-  fbArrayNewDefault(aTypeIdx)
-  setMapScrHB(body)               // newHashBacking (slot 13)
-  pushMapScrHB(body)              // dest
-  fbI32Const(0)
-  pushMapHashes(body)             // src (old hashes)
-  fbI32Const(0)
-  pushMapKeysLen(body)            // count (entries copied)
-  fbArrayCopy(aTypeIdx, aTypeIdx) // array.copy (dest type, src type)
-  pushMapRef(body)                // mapRef
-  pushMapScrHB(body)
-  fbStructSet(cmMapTy(), 6)       // struct.set field 6: hashes
+  // a string-keyed map's hashes grow in LOCKSTEP too (entry-parallel): fresh `(ref $aTypeIdx)`
+  // of newCap (slot 13), copy `[0, keys.len)` over, store back into M.hashes (field 6).
+  if !cmKeyI32() {
+    pushMapScr(body, 4)             // newCap
+    fbArrayNewDefault(aTypeIdx)
+    setMapScrHB(body)               // newHashBacking (slot 13)
+    pushMapScrHB(body)              // dest
+    fbI32Const(0)
+    pushMapHashes(body)             // src (old hashes)
+    fbI32Const(0)
+    pushMapKeysLen(body)            // count (entries copied)
+    fbArrayCopy(aTypeIdx, aTypeIdx) // array.copy (dest type, src type)
+    pushMapRef(body)                // mapRef
+    pushMapScrHB(body)
+    fbStructSet(cmMapTy(), 6)       // struct.set field 6: hashes
+  }
   // seqs (an i64 array) grows in lockstep too, in a module that deletes (D2315).
   if gMapDeletes {
     const nsL = mapSeqsBackSlot()
@@ -8986,14 +9000,14 @@ function emitMapPushKey(body: u8[]) {
     fbI32Bin(124) // 0x7c i64.add
     fbStructSet(cmMapTy(), 8)
   }
-  // hashes[keys.len] = hash(keyRef)  — cache the key's FNV hash parallel to the entry
-  // so resize/compact re-place it without re-hashing (mirrors the host's `mapSetFn`
-  // append, which stores `m.call(hash, [key()])`). `pushMapProbedHash` leaves the masked
-  // hash on the stack, reusing the probe's own for a string key.
-  pushMapHashes(body)
-  pushMapKeysLen(body) // entry index (== count, pre-append)
-  pushMapProbedHash(body)
-  fbArraySet(aTypeIdx) // array.set
+  // hashes[keys.len] = hash(keyRef) for a string key — cached parallel to the entry so
+  // compaction re-places it without re-hashing; the probe's own hash, still in slot +9.
+  if !cmKeyI32() {
+    pushMapHashes(body)
+    pushMapKeysLen(body) // entry index (== count, pre-append)
+    pushMapProbedTag(body)
+    fbArraySet(aTypeIdx) // array.set
+  }
   // keys.backing[keys.len] = key
   pushMapKeysBacking(body)
   pushMapKeysLen(body)

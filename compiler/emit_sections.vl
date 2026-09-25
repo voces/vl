@@ -445,7 +445,7 @@ import {
   fbI32Bin,
   fbI32Const,
   fbI32Eqz,
-  fbI32HashMix,
+  fbMapSlotOf,
   fbI32Load,
   fbI64Const,
   fbIf,
@@ -3121,256 +3121,226 @@ function emitMapProbeBackEdge(startL: i32) {
   fbUnreachable()
 }
 
-// The index-capacity power-of-two invariant, which both probe helpers and the rehash rely on
-// to wrap with `i32.and` instead of `i32.rem_u`. The `index` array's length is a power of two
-// at every point in a map's life, from its only three producers (`emitMapNew` at 16,
-// `__map_resize__` at `2 * len(index)`, `__map_compact__`) — a fourth producer must keep `mask = cap - 1`. `__map_probe__`: wrapping linear probe to the matching-or-free slot, the shared core of every map op.
+// The index layout, shared by both key kinds and all its producers (`emitMapNew`,
+// `__map_resize__`, `__map_compact__`): an i32 array of `2 * cap` holding one (tag, entry) pair
+// per slot, `cap` a power of two. `tag` is the i32 key or a string key's hash, so a probe decides
+// a miss, and an i32 key a hit, without touching the entries; `entry` is 0 for a free slot, the
+// entry's position plus 1, or -1 for a deleted one, which stays a probe marker (D2280, D2370).
+
+// The pair-slot probe loop shared by both helpers: `mask`, `slot`, `entry`, `start` are locals,
+// `index` the index param; `emitHit` pushes the i32 hit test with `entry` loaded and nonzero.
+function emitMapProbeLoop(
+  indexL: i32,
+  tagL: i32,
+  maskL: i32,
+  slotL: i32,
+  entryL: i32,
+  startL: i32,
+  keyL: i32,
+  keyI32: boolean,
+) {
+  // mask = len(index) / 2 - 1 ; slot = start = slotOf(tag)
+  fbLocalGet(indexL)
+  fbArrayLen()
+  fbI32Const(1)
+  fbI32Bin(118) // 0x76 i32.shr_u
+  fbI32Const(1)
+  fbI32Bin(107) // 0x6b i32.sub
+  fbLocalSet(maskL)
+  fbMapSlotOf(tagL, maskL)
+  fbLocalTee(slotL)
+  fbLocalSet(startL)
+  fbBlock(64) // block (probe break target), void
+  fbLoop(64)  // loop, void
+  // entry = index[2*slot + 1] ; if entry == 0 { br out (miss) }
+  fbLocalGet(indexL)
+  fbLocalGet(slotL)
+  fbI32Const(1)
+  fbI32Bin(116) // 0x74 i32.shl
+  fbI32Const(1)
+  fbI32Bin(114) // 0x72 i32.or
+  fbArrayGet(aTypeIdx)
+  fbLocalTee(entryL)
+  fbI32Eqz()
+  fbBrIf(1) // → out of the probe block
+  // index[2*slot] == tag, and in a module that deletes, entry > 0 (not a deleted marker)
+  fbLocalGet(indexL)
+  fbLocalGet(slotL)
+  fbI32Const(1)
+  fbI32Bin(116) // i32.shl
+  fbArrayGet(aTypeIdx)
+  fbLocalGet(tagL)
+  fbI32Bin(70) // 0x46 i32.eq
+  if gMapDeletes {
+    fbLocalGet(entryL)
+    fbI32Const(0)
+    fbI32Bin(74)  // 0x4a i32.gt_s
+    fbI32Bin(113) // 0x71 i32.and
+  }
+  if !keyI32 {
+    // a string key: the tag is its hash, so the content compare rides an `if`
+    fbIf(127) // if, i32 blocktype
+    fbLocalGet(keyL - 1) // keysBack
+    fbLocalGet(entryL)
+    fbI32Const(1)
+    fbI32Bin(107)        // i32.sub (entry - 1)
+    fbArrayGet(mkArrIdx) // keysBack[entry-1] — (ref null $aTypeIdx)
+    fbRefAsNonNull()     // a stored slot is populated
+    fbLocalGet(keyL)
+    fbCall(gHelpStrEq)
+    fbElse()
+    fbI32Const(0)
+    fbEnd()
+  }
+  fbBrIf(1) // hit → out of the probe block
+  // slot = (slot + 1) & mask  (collision OR a deleted marker: keep probing)
+  fbLocalGet(slotL)
+  fbI32Const(1)
+  fbI32Bin(106)
+  fbLocalGet(maskL)
+  fbI32Bin(113) // 0x71 i32.and
+  fbLocalTee(slotL)
+  emitMapProbeBackEdge(startL)
+  fbEnd() // end (loop)
+  fbEnd() // end (probe block)
+  fbLocalGet(slotL)
+  0
+}
+
+// `__map_probe__(keyHash, index, keysBacking, key) -> slot`: the string-keyed probe to the pair
+// slot holding the key or the free slot that ends its chain.
 function emitMapProbeFnCode(out: u8[]) {
   const body: u8[] = []
   const prev = wTarget(body)
   wULEB(1) // 1 locals run
   wULEB(4) // count 4
   wU8(127) // 0x7f i32 (mask, slot, entry, start)
-  // mask = array.len(index) - 1  (the index length is a power of two)
-  fbLocalGet(1)
-  fbArrayLen()
-  fbI32Const(1)
-  fbI32Bin(107) // 0x6b i32.sub
-  fbLocalSet(6)
-  // slot = start = keyHash & mask   (== keyHash % cap)
-  fbLocalGet(0)
-  fbLocalGet(6)
-  fbI32Bin(113) // 0x71 i32.and
-  fbLocalTee(7)
-  fbLocalSet(9)
-  fbBlock(64)   // block (probe break target), void
-  fbLoop(64)    // loop, void
-  // entry = index[slot] ; if entry == 0 { br out (miss) }
-  fbLocalGet(1)
-  fbLocalGet(7)
-  fbArrayGet(aTypeIdx)
-  fbLocalSet(8)
-  fbLocalGet(8)
-  fbI32Eqz()
-  fbBrIf(1) // → out of the probe block
-  // hashes[entry-1] == keyHash && live[entry-1] != 0
-  //   ? __str_eq__(keysBack[entry-1], key) : 0
-  fbLocalGet(2)
-  fbLocalGet(8)
-  fbI32Const(1)
-  fbI32Bin(107)        // i32.sub (entry - 1)
-  fbArrayGet(aTypeIdx)
-  fbLocalGet(0)
-  fbI32Bin(70)         // 0x46 i32.eq
-  fbLocalGet(3)
-  fbLocalGet(8)
-  fbI32Const(1)
-  fbI32Bin(107)
-  fbArrayGet(aTypeIdx)
-  fbI32Const(0)
-  fbI32Bin(71)         // 0x47 i32.ne (live != 0)
-  fbI32Bin(113)        // 0x71 i32.and — the expensive compare rides an `if`
-  fbIf(127)            // if, i32 blocktype
-  fbLocalGet(4)
-  fbLocalGet(8)
-  fbI32Const(1)
-  fbI32Bin(107)
-  fbArrayGet(mkArrIdx) // keysBack[entry-1] — (ref null $aTypeIdx)
-  fbRefAsNonNull()     // a stored slot is populated
-  fbLocalGet(5)
-  fbCall(gHelpStrEq)
-  fbElse()
-  fbI32Const(0)        // hash/live mismatch → not a hit
-  fbEnd()
-  // if match { br out (hit) }
-  fbBrIf(1)
-  // slot = (slot + 1) & mask  (collision OR a tombstone marker: keep probing)
-  fbLocalGet(7)
-  fbI32Const(1)
-  fbI32Bin(106)
-  fbLocalGet(6)
-  fbI32Bin(113) // 0x71 i32.and
-  fbLocalTee(7)
-  emitMapProbeBackEdge(9)
-  fbEnd()       // end (loop)
-  fbEnd()       // end (probe block)
-  fbLocalGet(7) // the probe slot
-  fbEnd()       // end (function)
+  emitMapProbeLoop(1, 0, 4, 5, 6, 7, 3, false)
+  fbEnd() // end (function)
   wTarget(prev)
   helpFrameBody(out, body)
 }
 
-// `__map_probe_i32__(index, hashes, live, keysBacking, key) -> i32`: the i32-keyed twin of
-// `__map_probe__`, line for line, with three substitutions — the key hashes by the integer
-// mix (`fbI32HashMix`) instead of `__str_hash__`, the stored-hash gate falls through to an
-// `i32.eq` on the key, and the mix stays inline here (the string hash is hoisted to the call site instead) — everything else is identical, which lets both key kinds share `__map_resize__`, the rehash and the compaction.
+// `__map_probe_i32__(index, key) -> slot`: the i32-keyed twin, whose tag is the key itself, so
+// the whole probe reads the index alone.
 function emitMapProbeI32FnCode(out: u8[]) {
   const body: u8[] = []
   const prev = wTarget(body)
   wULEB(1) // 1 locals run
-  wULEB(5) // count 5
-  wU8(127) // 0x7f i32 (mask, keyHash, slot, entry, start)
-  // mask = array.len(index) - 1  (the index length is a power of two)
-  fbLocalGet(0)
-  fbArrayLen()
-  fbI32Const(1)
-  fbI32Bin(107) // 0x6b i32.sub
-  fbLocalSet(5)
-  // keyHash = mix(key)
-  fbI32HashMix(4, 6)
-  fbLocalSet(6)
-  // slot = start = keyHash & mask   (== keyHash % cap)
-  fbLocalGet(6)
-  fbLocalGet(5)
-  fbI32Bin(113) // 0x71 i32.and
-  fbLocalTee(7)
-  fbLocalSet(9)
-  fbBlock(64)   // block (probe break target), void
-  fbLoop(64)    // loop, void
-  // entry = index[slot] ; if entry == 0 { br out (miss) }
-  fbLocalGet(0)
-  fbLocalGet(7)
-  fbArrayGet(aTypeIdx)
-  fbLocalSet(8)
-  fbLocalGet(8)
-  fbI32Eqz()
-  fbBrIf(1) // → out of the probe block
-  // hashes[entry-1] == keyHash && live[entry-1] != 0
-  //   ? keysBack[entry-1] == key : 0
-  fbLocalGet(1)
-  fbLocalGet(8)
-  fbI32Const(1)
-  fbI32Bin(107)        // i32.sub (entry - 1)
-  fbArrayGet(aTypeIdx)
-  fbLocalGet(6)
-  fbI32Bin(70)         // 0x46 i32.eq
-  fbLocalGet(2)
-  fbLocalGet(8)
-  fbI32Const(1)
-  fbI32Bin(107)
-  fbArrayGet(aTypeIdx)
-  fbI32Const(0)
-  fbI32Bin(71)         // 0x47 i32.ne (live != 0)
-  fbI32Bin(113)        // 0x71 i32.and
-  fbIf(127)            // if, i32 blocktype
-  fbLocalGet(3)
-  fbLocalGet(8)
-  fbI32Const(1)
-  fbI32Bin(107)
-  fbArrayGet(aTypeIdx) // keysBack[entry-1] — a raw i32
-  fbLocalGet(4)
-  fbI32Bin(70)         // 0x46 i32.eq
-  fbElse()
-  fbI32Const(0)        // hash/live mismatch → not a hit
-  fbEnd()
-  // if match { br out (hit) }
-  fbBrIf(1)
-  // slot = (slot + 1) & mask  (collision OR a tombstone marker: keep probing)
-  fbLocalGet(7)
-  fbI32Const(1)
-  fbI32Bin(106)
-  fbLocalGet(5)
-  fbI32Bin(113) // 0x71 i32.and
-  fbLocalTee(7)
-  emitMapProbeBackEdge(9)
-  fbEnd()       // end (loop)
-  fbEnd()       // end (probe block)
-  fbLocalGet(7) // the probe slot
-  fbEnd()       // end (function)
+  wULEB(4) // count 4
+  wU8(127) // 0x7f i32 (mask, slot, entry, start)
+  emitMapProbeLoop(0, 1, 2, 3, 4, 5, 1, true)
+  fbEnd() // end (function)
   wTarget(prev)
   helpFrameBody(out, body)
 }
 
-// `__map_resize__(index, hashes, live, count, size) -> (ref $aTypeIdx)`: when the occupancy
-// crosses 1/2 (`count*2 >= len(index)`), allocates a doubled index and re-places every live entry
-// from its stored hash, returning it; otherwise returns `index` unchanged. The gate is `count`, not
-// `size`, because a deleted entry's slot stays a probe marker: `count` bounds the occupied slots.
+// Place pair (`tagL`, `entryL`) at the first free slot from its home in index `idxL` of mask
+// `maskL`, using `slotL` as the cursor: the one insertion loop resize and compaction share.
+function emitMapPlacePair(idxL: i32, maskL: i32, tagL: i32, entryL: i32, slotL: i32) {
+  fbMapSlotOf(tagL, maskL)
+  fbLocalSet(slotL)
+  fbBlock(64)
+  fbLoop(64)
+  fbLocalGet(idxL)
+  fbLocalGet(slotL)
+  fbI32Const(1)
+  fbI32Bin(116) // i32.shl
+  fbI32Const(1)
+  fbI32Bin(114) // i32.or
+  fbArrayGet(aTypeIdx)
+  fbI32Eqz()
+  fbBrIf(1) // free → out
+  fbLocalGet(slotL)
+  fbI32Const(1)
+  fbI32Bin(106)
+  fbLocalGet(maskL)
+  fbI32Bin(113) // i32.and
+  fbLocalSet(slotL)
+  fbBr(0)
+  fbEnd() // end (loop)
+  fbEnd() // end (block)
+  fbLocalGet(idxL)
+  fbLocalGet(slotL)
+  fbI32Const(1)
+  fbI32Bin(116)
+  fbLocalGet(tagL)
+  fbArraySet(aTypeIdx)
+  fbLocalGet(idxL)
+  fbLocalGet(slotL)
+  fbI32Const(1)
+  fbI32Bin(116)
+  fbI32Const(1)
+  fbI32Bin(114)
+  fbLocalGet(entryL)
+  fbArraySet(aTypeIdx)
+  0
+}
+
+// `__map_resize__(index, count) -> (ref $aTypeIdx)`: when the occupancy crosses 1/2
+// (`count*2 >= cap`), allocates an index of twice the slots and re-places every pair that is not
+// a deleted marker, reading only the old index; otherwise returns `index` unchanged. The gate is
+// `count`, not `size`, because a deleted entry's slot stays a probe marker until then.
 function emitMapResizeFnCode(out: u8[]) {
   const body: u8[] = []
   const prev = wTarget(body)
   wULEB(2) // 2 locals runs
-  wULEB(3) // count 3
-  wU8(127) // 0x7f i32 (newCap, i, rslot)
+  wULEB(6) // count 6
+  wU8(127) // 0x7f i32 (oldLen 2, mask 3, i 4, tag 5, entry 6, rslot 7)
   wULEB(1) // count 1
-  wU8(100) // 0x64 (ref $aTypeIdx) — newIdx
+  wU8(100) // 0x64 (ref $aTypeIdx) — newIdx 8
   wSLEB(aTypeIdx)
-  // if count * 2 >= len(index) { grow + rehash + early-return newIdx }
-  fbLocalGet(3)
+  // if count * 4 >= len(index) { grow + rehash + early-return newIdx }
+  fbLocalGet(1)
   fbI32Const(2)
-  fbI32Bin(108) // i32.mul (count * 2)
+  fbI32Bin(116) // i32.shl (count * 4)
   fbLocalGet(0)
   fbArrayLen()
+  fbLocalTee(2)
   fbI32Bin(79)  // 0x4f i32.ge_u
   fbIf(64)      // if, void
-  // newCap = 2 * len(index) ; newIdx = array.new_default $aTypeIdx newCap
-  fbLocalGet(0)
-  fbArrayLen()
-  fbI32Const(2)
-  fbI32Bin(108)
-  fbLocalSet(5)
-  fbLocalGet(5)
+  // newIdx = array.new_default (2 * oldLen) ; mask = oldLen - 1 (the new slot count is oldLen)
+  fbLocalGet(2)
+  fbI32Const(1)
+  fbI32Bin(116)
   fbArrayNewDefault(aTypeIdx)
   fbLocalSet(8)
-  // i = 0
-  fbI32Const(0)
-  fbLocalSet(6)
-  // loop { if i >= count {} else { re-place LIVE entry i ; i++ ; br } }
-  fbLoop(64)
-  fbLocalGet(6)
-  fbLocalGet(3)
-  fbI32Bin(78) // i32.ge_s (i >= count → done)
-  fbIf(64)     // then: done (empty)
-  fbElse()
-  // if live[i] != 0 { rslot = hashes[i] % newCap ; probe free ; newIdx[rslot] = i+1 }
   fbLocalGet(2)
-  fbLocalGet(6)
-  fbArrayGet(aTypeIdx)
-  fbI32Const(0)
-  fbI32Bin(71) // i32.ne
-  fbIf(64)
-  // rslot = hashes[i] % newCap — re-places from the stored hash
-  fbLocalGet(1)
-  fbLocalGet(6)
-  fbArrayGet(aTypeIdx)
-  fbLocalGet(5)
-  fbI32Bin(112) // i32.rem_u
-  fbLocalSet(7)
-  // while newIdx[rslot] != 0 { rslot = (rslot + 1) % newCap }
+  fbI32Const(1)
+  fbI32Bin(107)
+  fbLocalSet(3)
+  // for i = 0; i < oldLen; i += 2: if index[i+1] > 0 { place (index[i], index[i+1]) }
   fbBlock(64)
   fbLoop(64)
-  fbLocalGet(8)
-  fbLocalGet(7)
+  fbLocalGet(4)
+  fbLocalGet(2)
+  fbI32Bin(79) // i32.ge_u (i >= oldLen → done)
+  fbBrIf(1)
+  fbLocalGet(0)
+  fbLocalGet(4)
+  fbI32Const(1)
+  fbI32Bin(114) // i32.or
   fbArrayGet(aTypeIdx)
-  fbI32Eqz()
-  fbBrIf(1) // → out of the inner block
-  fbLocalGet(7)
-  fbI32Const(1)
+  fbLocalTee(6)
+  fbI32Const(0)
+  fbI32Bin(74) // 0x4a i32.gt_s
+  fbIf(64)
+  fbLocalGet(0)
+  fbLocalGet(4)
+  fbArrayGet(aTypeIdx)
+  fbLocalSet(5)
+  emitMapPlacePair(8, 3, 5, 6, 7)
+  fbEnd() // end (entry if)
+  fbLocalGet(4)
+  fbI32Const(2)
   fbI32Bin(106)
-  fbLocalGet(5)
-  fbI32Bin(112)
-  fbLocalSet(7)
-  fbBr(0)   // → inner loop header
-  fbEnd()   // end (inner loop)
-  fbEnd()   // end (inner block)
-  // newIdx[rslot] = i + 1
+  fbLocalSet(4)
+  fbBr(0)
+  fbEnd() // end (loop)
+  fbEnd() // end (block)
   fbLocalGet(8)
-  fbLocalGet(7)
-  fbLocalGet(6)
-  fbI32Const(1)
-  fbI32Bin(106)
-  fbArraySet(aTypeIdx)
-  fbEnd() // end (live if)
-  // i = i + 1
-  fbLocalGet(6)
-  fbI32Const(1)
-  fbI32Bin(106)
-  fbLocalSet(6)
-  fbBr(1)       // → outer loop header
-  fbEnd()       // end (ge_s if)
-  fbEnd()       // end (outer loop)
-  fbLocalGet(8)
-  fbReturn()    // the fresh, rebuilt index
-  fbEnd()       // end (resize if)
+  fbReturn() // the fresh, rebuilt index
+  fbEnd()    // end (resize if)
   fbLocalGet(0) // load factor fine → the index unchanged
   fbEnd()       // end (function)
   wTarget(prev)
@@ -3499,9 +3469,9 @@ function emitMapCompactFnCode(out: u8[], sh: i32) {
   }
   const body: u8[] = []
   const prev = wTarget(body)
-  // locals: 1 i, 2 j, 3 count, 4 cap, 5 rslot, 6 idx
+  // locals: 1 i, 2 j, 3 count, 4 cap, 5 rslot, 6 mask, 7 tag, 8 entry, 9 idx
   wULEB(2) // 2 locals runs
-  wULEB(5)
+  wULEB(8)
   wU8(127) // 0x7f i32
   wULEB(1)
   wU8(99)  // 0x63 (ref null ht)
@@ -3524,7 +3494,7 @@ function emitMapCompactFnCode(out: u8[], sh: i32) {
   mapCompactMove(mapTy, 0, keysWrap, keysBack)
   mapCompactMove(mapTy, 1, valsWrap, valsBack)
   mapCompactMove(mapTy, 2, -1, aTypeIdx)
-  mapCompactMove(mapTy, 6, -1, aTypeIdx)
+  if !keyI32 { mapCompactMove(mapTy, 6, -1, aTypeIdx) }
   mapCompactMove(mapTy, 7, -1, ia64TypeIdx)
   fbLocalGet(2)
   fbI32Const(1)
@@ -3613,10 +3583,17 @@ function emitMapCompactFnCode(out: u8[], sh: i32) {
   fbBr(0)
   fbEnd()
   fbEnd()
-  // idx = a fresh index of cap slots, entry i < j re-placed from its stored hash
+  // idx = a fresh index of cap pair slots, entry i < j re-placed with its tag: the i32 key
+  // itself, or a string key's stored hash
   fbLocalGet(4)
+  fbI32Const(1)
+  fbI32Bin(116) // i32.shl (2 * cap)
   fbArrayNewDefault(aTypeIdx)
-  fbLocalSet(6)
+  fbLocalSet(9)
+  fbLocalGet(4)
+  fbI32Const(1)
+  fbI32Bin(107)
+  fbLocalSet(6) // mask = cap - 1
   fbI32Const(0)
   fbLocalSet(1)
   fbBlock(64)
@@ -3625,37 +3602,21 @@ function emitMapCompactFnCode(out: u8[], sh: i32) {
   fbLocalGet(2)
   fbI32Bin(78) // i32.ge_s (i >= j)
   fbBrIf(1)
-  // rslot = hashes[i] % cap
   fbLocalGet(0)
-  fbStructGet(mapTy, 6)
+  if keyI32 {
+    fbStructGet(mapTy, 0)
+    fbStructGet(keysWrap, 0)
+  } else {
+    fbStructGet(mapTy, 6)
+  }
   fbLocalGet(1)
   fbArrayGet(aTypeIdx)
-  fbLocalGet(4)
-  fbI32Bin(112) // i32.rem_u
-  fbLocalSet(5)
-  fbBlock(64)
-  fbLoop(64)
-  fbLocalGet(6)
-  fbLocalGet(5)
-  fbArrayGet(aTypeIdx)
-  fbI32Eqz()
-  fbBrIf(1)
-  fbLocalGet(5)
-  fbI32Const(1)
-  fbI32Bin(106)
-  fbLocalGet(4)
-  fbI32Bin(112) // i32.rem_u
-  fbLocalSet(5)
-  fbBr(0)
-  fbEnd()
-  fbEnd()
-  // idx[rslot] = i + 1
-  fbLocalGet(6)
-  fbLocalGet(5)
+  fbLocalSet(7)
   fbLocalGet(1)
   fbI32Const(1)
   fbI32Bin(106)
-  fbArraySet(aTypeIdx)
+  fbLocalSet(8) // entry = i + 1
+  emitMapPlacePair(9, 6, 7, 8, 5)
   fbLocalGet(1)
   fbI32Const(1)
   fbI32Bin(106)
@@ -3664,7 +3625,7 @@ function emitMapCompactFnCode(out: u8[], sh: i32) {
   fbEnd()
   fbEnd()
   fbLocalGet(0)
-  fbLocalGet(6)
+  fbLocalGet(9)
   fbRefAsNonNull()
   fbStructSet(mapTy, 3)
   fbEnd() // end (function)
@@ -4156,7 +4117,7 @@ function emitModule(_stmts: i32[]) {
     nHelpers = nHelpers + 1
   }
   // The i32-KEYED probe, LAST so no existing helper index moves in a program without
-  // one (`__map_resize__` is key-agnostic — it re-places from the STORED hashes — so
+  // one (`__map_resize__` is key-agnostic — it re-places from the index's own tags — so
   // the i32-keyed map shares it and only the probe needs a twin).
   if mI32Used {
     gHelpMapProbeI32 = helpBase + nHelpers
@@ -5998,15 +5959,13 @@ function emitTypeSection(
     }
   }
   if gHelpMapProbe >= 0 {
-    // __map_probe__: (keyHash, index, hashes, live, keysBacking, key) -> slot — three 'a'
-    // i32 arrays, the 'm' string-list backing, then the 's' STRING key.
-    helpFuncType("iaaams", "i")
-    helpFuncType("aaaii", "a") // __map_resize__: (index, hashes, live, count, size) -> index'
+    // __map_probe__: (keyHash, index, keysBacking, key) -> slot — the 'a' pair index, the 'm'
+    // string-list backing, then the 's' STRING key.
+    helpFuncType("iams", "i")
+    helpFuncType("ai", "a") // __map_resize__: (index, count) -> index'
   }
   if gHelpMapProbeI32 >= 0 {
-    // __map_probe_i32__: (index, hashes, live, keysBacking, key i32) -> slot — the same
-    // five operands with an i32 keys backing (`a`) and an i32 KEY (`i`).
-    helpFuncType("aaaai", "i")
+    helpFuncType("ai", "i") // __map_probe_i32__: (index, key i32) -> slot
   }
   if gHelpF64Rem >= 0 {
     helpFuncType("ff", "f") // __f64_rem__: (f64, f64) -> f64
