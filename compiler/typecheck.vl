@@ -1993,7 +1993,7 @@ function uninferredFixText(name: string, ty: i32) {
           + useIt
           + "`const "
           + name
-          + ": {[string]: boolean} = Set()`)"
+          + ": Set<string> = Set()`)"
       }
       return "an empty Map has no key or value type"
         + useIt
@@ -8108,6 +8108,46 @@ function sharedUnionFieldTy(u: TyUnion, prop: string) {
   shared
 }
 
+// The noun a collection or function union member is named by in `unionFieldGapNote`, or ""
+// for any other member, which keeps the plain "is not an object".
+function nonRecordNoun(m: Ty): string {
+  match m {
+    TyMap => {
+      if m.mSet == 1 { "a set" } else { "a map" }
+    }
+    TyArray => {
+      "a list"
+    }
+    TyFunc => {
+      "a function"
+    }
+    TyPrim => {
+      ""
+    }
+    TyErr => {
+      ""
+    }
+    TyObj => {
+      ""
+    }
+    TyUnion => {
+      ""
+    }
+    TyNullable => {
+      ""
+    }
+    TyVar => {
+      ""
+    }
+    TyLit => {
+      ""
+    }
+    TyNeg => {
+      ""
+    }
+  }
+}
+
 // The parenthetical the unshared-field diagnostic appends: the first member of `u` that blocks the
 // read — a non-object member, or an object without `prop`. "" when every member carries the field
 // and the refusal came from the join instead (`{n: i32} | {n: f64}`), where there is no single
@@ -8124,6 +8164,10 @@ function unionFieldGapNote(u: TyUnion, prop: string) {
         return " (no '" + prop + "' on " + tyToStr(mIx) + ")"
       }
     } else {
+      const nrn = nonRecordNoun(m)
+      if nrn != "" {
+        return " (" + tyToStr(mIx) + " is " + nrn + ", not a record)"
+      }
       return " (" + tyToStr(mIx) + " is not an object)"
     }
     i = i + 1
@@ -10258,6 +10302,69 @@ function cmpF32LitAdopts(n: BinExpr, olt: i32, ort: i32) {
   primNameOf(ort) == "f32" && isF32AdoptingLitExpr(n.binLeft)
 }
 
+// The refusal a join owes when it would pair a set with a map of the same rep, handed to the
+// node whose check made the join; "" when no join is pending.
+let joinClashMsg = ""
+
+// Whether a map VALUE reps as one i32 cell, the cell a set stores its membership in: a boolean,
+// an i32, an i32-backed literal union, or a sentinel-nullable (`boolean | null`, `K | null`).
+function mapValIsI32Cell(v: i32): boolean {
+  if v < 0 { return true }
+  if tyScalarBaseIs(v, "boolean") || tyScalarBaseIs(v, "i32") { return true }
+  if tyLitUnionIsI32Backed(v) { return true }
+  const t = T.tys[v]
+  if t is TyLit { return true }
+  tyIsI32SentinelNullable(v)
+}
+
+// The refusal for a union holding a `Set<K>` and a map that shares its representation: the same
+// key hash and an i32-cell value (`{[K]: boolean}`, `{[K]: i32}`, …), worded for a join or an
+// annotation. The two lower to one heap type, so the box could not tell which member it holds
+// (D2493). "" when `members` has no such pair.
+function setMapUnionClashMsg(members: i32[], isJoin: boolean): string {
+  let i = 0
+  while i < members.length {
+    const a = members[i]
+    if a >= 0 {
+      const at = T.tys[a]
+      if at is TyMap {
+        if at.mSet == 1 {
+          let j = 0
+          while j < members.length {
+            const b = members[j]
+            if b >= 0 {
+              const bt = T.tys[b]
+              if bt is TyMap {
+                if bt.mSet == 0 && setMapKeysShareRep(at.mKey, bt.mKey) {
+                  if mapValIsI32Cell(bt.mVal) {
+                    if isJoin {
+                      return "a Set and a map do not join into one value yet: they share one representation, so `is` could not tell them apart — make every branch a Set, or every branch a map"
+                    }
+                    return "a union cannot hold both "
+                      + tyToStr(a)
+                      + " and "
+                      + tyToStr(b)
+                      + " yet: they share one representation, so `is` could not tell them apart — keep one of the two, or wrap each in a record with a discriminant field (`kind: \"set\"`)"
+                  }
+                }
+              }
+            }
+            j = j + 1
+          }
+        }
+      }
+    }
+    i = i + 1
+  }
+  ""
+}
+
+// Whether two map keys hash alike; an unpinned key (`-1`) may still become either.
+function setMapKeysShareRep(a: i32, b: i32): boolean {
+  if a < 0 || b < 0 { return true }
+  mapKeyRepTy(a) == mapKeyRepTy(b)
+}
+
 // The least upper bound used by `??` (host: `flatten(Union(nonNull(l), r))`):
 // mutually-assignable types collapse to the wider; otherwise a two-member union.
 function joinTys(a: i32, b: i32) {
@@ -10294,6 +10401,13 @@ function joinTys(a: i32, b: i32) {
     i = i + 1
   }
   if kept.length == 0 { return TY_NULL }
+  // A set joined with a map it shares a rep with has no union to become (D2493); the node whose
+  // check made the join reports it (`checkNodeDone`).
+  const jclash = setMapUnionClashMsg(kept, true)
+  if jclash != "" {
+    joinClashMsg = jclash
+    return TY_ERR
+  }
   let res = kept[0]
   if kept.length > 1 {
     res = mkUnionTy(kept)
@@ -12284,9 +12398,9 @@ function angleCloseAt(name: string, lt: i32): i32 {
   -1
 }
 
-// `Map<K, V>` is the map type `{[K]: V}` and `Set<T>` is the set type `{[T]: boolean}`: long
-// spellings of the same types, so either flows where the other is written and both lower the
-// same (`builtinCollSpelling`). Arguments come from the spelling tree when `appIx` has one, else
+// `Map<K, V>` is the map type `{[K]: V}`, a long spelling of it. `Set<T>` is its own type, the
+// set flavor (`mSet` 1) over the same rep, so both lower through the index signature
+// (`builtinCollSpelling`). Arguments come from the spelling tree when `appIx` has one, else
 // from `inner`'s text. An unsupported key banks the index signature's refusal.
 function builtinCollAppTy(head: string, inner: string, appIx: i32) {
   const argTys: i32[] = []
@@ -12325,7 +12439,7 @@ function builtinCollAppTy(head: string, inner: string, appIx: i32) {
     unkTyClash = mapKeyUnsupportedMsg(tyToStr(k), head)
     return -1
   }
-  if head == "Set" { return mkMapTy(k, TY_BOOL, 0) }
+  if head == "Set" { return mkMapTy(k, TY_BOOL, 1) }
   mkMapTy(k, argTys[1], 0)
 }
 
@@ -12516,18 +12630,16 @@ const listMethodNames = [
 ]
 
 // Map/set intrinsic names, gated exactly as `checkCallNode`'s own arms gate them: `set`/
-// `get`/`keys` are a map surface a set must not leak, and `add` is admitted by the value
-// type rather than by flavor.
+// `get` are a map surface a set must not leak, and `add` a set surface a map must not.
 function mapMethodNames(recvTy: i32) {
-  const out = ["has", "delete", "values", "length", "size"]
+  const out = ["has", "delete", "keys", "values", "length", "size"]
   const rt = T.tys[recvTy]
   if rt is TyMap {
     if rt.mSet == 0 {
       out.push("set")
       out.push("get")
-      out.push("keys")
     }
-    if rt.mSet == 1 || tyIsPrimNamed(rt.mVal, "boolean") { out.push("add") }
+    if rt.mSet == 1 { out.push("add") }
   }
   out
 }
@@ -13019,6 +13131,12 @@ function synthInlineLitUnionDecls(rootIx: i32) {
 // propagates unwrapped, since `mkNullableTy(-1)` would lose the sentinel). A declared union
 // alias with a `null` member must resolve to this same niche rep, not a plain `TyUnion`.
 function annUnionTy(members: i32[], hasNull: boolean): i32 {
+  // A declaration's own members have no annotation position; pass 0d reports those.
+  const clash = setMapUnionClashMsg(members, false)
+  if clash != "" && annotDiagAt >= 0 {
+    tErr(clash, annotDiagAt)
+    return TY_ERR
+  }
   const inner = annUnionInnerTy(members, hasNull)
   if inner < 0 { return -1 }
   if hasNull {
@@ -13587,6 +13705,12 @@ function tyToStrGo(ix: i32, nominal: boolean) {
     }
     TyMap => {
       const mk = tyToStrAt(t.mKey, nominal)
+      // A set is its own type and reads as one; the structural render keeps the index
+      // signature the emitter's name tables are keyed by.
+      if t.mSet == 1 && nominal {
+        tyStrAtoms = 1
+        return "Set<" + mk + ">"
+      }
       const mv = tyToStrAt(t.mVal, nominal)
       // The key/value separators sit inside the braces — one atom.
       tyStrAtoms = 1
@@ -15056,6 +15180,10 @@ function checkUnionDiscriminable(stmts: i32[]) {
       if declIx >= 0 {
         const m = unionDiscrimMsgNamed(declIx, sd.udVariants)
         if m != "" { tErrOncePerMsg(m, stmts[si]) }
+        const flat: i32[] = []
+        flattenVariantsInto(declIx, flat)
+        const sm = setMapUnionClashMsg(flat, false)
+        if sm != "" { tErrOncePerMsg(sm, stmts[si]) }
       }
     }
     si = si + 1
@@ -17235,6 +17363,13 @@ export function canonEmitTypeNames() {
       if opTy >= 0 {
         const ot = T.tys[opTy]
         if ot is TyUnion {
+          // `Map<K, V>` / `Set<T>` inside the tested spelling denote an index signature, the
+          // spelling canon gives the union's own member, so the test names the same arm (D2468).
+          const bci = builtinCollNorm(n.isVariant)
+          if bci != n.isVariant {
+            canonBankRaw(i, CANON_SLOT_IS, n.isVariant)
+            n.isVariant = bci
+          }
           const gis = unionMemberGenAppShape(n.isVariant)
           if gis != "" {
             if gis != n.isVariant {
@@ -24191,7 +24326,13 @@ function assignableGo(src: i32, dst: i32) {
     }
     TyMap => {
       if d is TyMap {
-        // A bare `Map()`/`Set()` (key/value holes, `-1`) is assignable to any map.
+        // A set and a map are distinct types, neither assignable to the other, and a set is
+        // invariant in its element. A bare `Map()`/`Set()` (holes, `-1`) fits its own flavor.
+        if sTail.mSet != d.mSet { return false }
+        if d.mSet == 1 {
+          return assignable(sTail.mKey, d.mKey)
+            && assignable(d.mKey, sTail.mKey)
+        }
         return assignable(sTail.mKey, d.mKey) && assignable(sTail.mVal, d.mVal)
       }
       return false
@@ -25230,6 +25371,9 @@ function memberFloorMsg(objTy: i32, prop: string) {
   if ot is TyMap {
     if prop == "length" { return "" }
     if prop == "size" { return "" }
+    if ot.mSet == 1 {
+      return "no field '" + prop + "' on set " + tyToStr(objTy)
+    }
     return "no field '" + prop + "' on map " + tyToStr(objTy)
   }
   if ot is TyPrim {
@@ -27734,6 +27878,10 @@ export function substTyDeep(tyIx: i32, bNames: string[], bTys: i32[]) {
       // string`. `out` is read unconditionally; treating it as optional would double the member list.
       const kept3: i32[] = []
       unionDropSubsumedArms(uniq, kept3)
+      // A type argument can make a set and a same-rep map meet in one union (D2493); the
+      // node whose check substituted reports it (`checkNodeDone`).
+      const sclash = setMapUnionClashMsg(kept3, false)
+      if sclash != "" { joinClashMsg = sclash }
       if kept3.length == 1 { res = kept3[0] } else { res = mkUnionTy(kept3) }
     }
   } else if t is TyMap {
@@ -30298,7 +30446,7 @@ function checkMemberCallNode(
     return TY_ERR
   }
   // Map/Set methods over the `{[K]: V}` rep, gated by flavor: a map exposes `.set`/`.get`/
-  // `.has`/`.delete`/`.keys`/`.values`; a set exposes only `.add`/`.has`/`.delete`/`.values`.
+  // `.has`/`.delete`/`.keys`/`.values`; a set exposes `.add`/`.has`/`.delete`/`.keys`/`.values`.
   // `.add` alone gates on the value's TYPE rather than the flavor bit (see its own arm). The
   // first `.set`/`.add` on a bare `Map()`/`Set()` pins its key/value holes in place.
   if rt is TyMap {
@@ -30349,11 +30497,18 @@ function checkMemberCallNode(
       }
       return mkNullableTy(rt.mVal)
     }
-    // `.add(x)`, the membership insert (`m[x] = true` as the Set surface): admitted on any
-    // map whose VALUE is `boolean`, not only one whose provenance is a `Set()` call — `mSet`
-    // is a one-way refinement written only by `Set()`, so gating on it would make `.add`
-    // depend on how the value is spelled at its binding rather than on its type.
-    if mp == "add" && (rt.mSet == 1 || tyIsPrimNamed(rt.mVal, "boolean")) {
+    // `.add(x)` is a Set method only: a boolean-valued map is a map, and its insert is
+    // `m[k] = true` (DECISIONS.md, "`{[K]: V}` and `T[]` are concrete types").
+    if mp == "add" && rt.mSet == 0 && tyIsPrimNamed(rt.mVal, "boolean") {
+      tErr(
+        "`.add` is a `Set` method — use `m[k] = true`, or make it a `Set<"
+          + tyToStr(rt.mKey)
+          + ">`",
+        ix,
+      )
+      return TY_ERR
+    }
+    if mp == "add" && rt.mSet == 1 {
       if margs2.length != 1 {
         tErr("add expects 1 argument, got " + i32ToStr(margs2.length), ix)
       } else {
@@ -30379,7 +30534,7 @@ function checkMemberCallNode(
       }
       return TY_BOOL
     }
-    if mp == "keys" && rt.mSet == 0 {
+    if mp == "keys" {
       if margs2.length != 0 { tErr("keys expects no arguments", ix) }
       return mkArrayTy(rt.mKey)
     }
@@ -35746,6 +35901,10 @@ function checkNode(ix: i32) {
 // `checkNode`'s exit bookkeeping, shared with `checkIfStmtNode`'s walk of an `else if` chain.
 function checkNodeDone(ix: i32, t: i32, savedTail: boolean) {
   retTailPos = savedTail
+  if joinClashMsg != "" {
+    if !inferQuiet && ix >= 0 { tErr(joinClashMsg, ix) }
+    joinClashMsg = ""
+  }
   // A call typed `never` ends its path; marked on every pass, since narrowing asks during inference too.
   if t == TY_NEVER && t >= 0 {
     if P.nodes[ix] is Call { markCallNever(ix) }
@@ -39842,6 +40001,7 @@ function tySameAt(a: i32, b: i32, depth: i32): boolean {
   }
   if x is TyMap {
     if y is TyMap {
+      if x.mSet != y.mSet { return false }
       if !tySameAt(x.mKey, y.mKey, depth - 1) { return false }
       return tySameAt(x.mVal, y.mVal, depth - 1)
     }
@@ -42991,6 +43151,11 @@ function checkLetDeclNode(n: LetDecl, ix: i32) {
     if tn is TypeRef {
       annot = nameToTyAt(tn.tyName, n.letType)
       if annot >= 0 && annot == collapsedTy { annotCollapsedHere = true }
+      // D1023 at a binding's inline union, as `resolveAnnotAt` asks it of a parameter's.
+      if annot >= 0 {
+        const ldm = unionDiscrimMsg(annot)
+        if ldm != "" { tErrOncePerMsg(ldm, n.letType) }
+      }
       if annot < 0 {
         // A map shape whose key is neither `string` nor `i32` has no hash in the map rep —
         // report that directly (with the supported set) rather than a bare "unknown type".
@@ -43077,15 +43242,6 @@ function checkLetDeclNode(n: LetDecl, ix: i32) {
         // that is exactly when the literal's own element join dropped one, so nothing is recorded.
         if !tyHasHole(initTy) {
           if !tyHasHole(annot) { noteLitElemCstrs(n.letInit, annot, 6) }
-        }
-      }
-      // A `Set()` initializer keeps its Set flavor even under a map-shaped annotation — the
-      // binding exposes the Set surface (`.add`, no `.set`/`.get`/`.keys`) with the annotation's key/value.
-      const it2 = T.tys[initTy]
-      if it2 is TyMap {
-        if it2.mSet == 1 {
-          const an2 = T.tys[annot]
-          if an2 is TyMap { bound = mkMapTy(an2.mKey, an2.mVal, 1) }
         }
       }
     }
@@ -47938,6 +48094,14 @@ function checkIndexNode(n: Index, ix: i32) {
   // A map index: the key must match the map's key type; a read yields the nullable value
   // (`V | null`), and an assignment target accepts a plain `V`.
   if at is TyMap {
+    // A set has no index: membership is `has`, insertion `add`.
+    if at.mSet == 1 {
+      tErr(
+        "a Set has no index — test membership with `.has(x)` and insert with `.add(x)`",
+        ix,
+      )
+      return TY_ERR
+    }
     // The expression form, for the same reason `m.get`'s does: `m["green"]` on a
     // literal-union-keyed map is a member of that union, and `checkNode` types a string
     // literal as the widened `string` with no destination to narrow it against (D1748).

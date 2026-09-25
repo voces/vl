@@ -2745,6 +2745,14 @@ function isNarrowMaskKey(recvIx: i32, fnIx: i32): string {
 function emitIsTest(body: u8[], isIx: i32, fnIx: i32) {
   const nd0 = P.nodes[isIx]
   if nd0 is IsExpr {
+    const imk = mapReadScalarBoxKind(nd0.isObj, fnIx)
+    if imk >= 0 {
+      const imr = emitScalarMapReadIs(body, isIx, nd0.isObj, imk, fnIx)
+      if imr < 0 { return -1 }
+      if imr > 0 { return 0 }
+    }
+  }
+  if nd0 is IsExpr {
     if exprNullableRefNiche(nd0.isObj, fnIx) {
       if nulNicheIsTestImpossible(nd0.isObj, isVarTyIxOf(isIx), fnIx) {
         fbI32Const(0)
@@ -8205,6 +8213,12 @@ function emitNarrowedMapReadTail(idxIx: i32, fnIx: i32) {
 // completeness so `m[k]` in value position is total (0 default).
 function emitMapGet(body: u8[], recvIx: i32, keyIx: i32, fnIx: i32) {
   if emitMapPrep(body, recvIx, keyIx, fnIx) < 0 { return -1 }
+  emitMapGetTail(body, recvIx)
+}
+
+// The value half of `emitMapGet`, after `emitMapPrep`: the stored value on a hit, the rep's
+// empty value on a miss. Leaves the probe's `entry` scratch slot as the probe set it.
+function emitMapGetTail(body: u8[], recvIx: i32) {
   if cmSlot >= 0 {
     // REF values: yield the NULLABLE element — the (ref null <elem>) vals slot on
     // a hit, `ref.null <elem>` on a miss — via the slot's valStash (same
@@ -8220,10 +8234,11 @@ function emitMapGet(body: u8[], recvIx: i32, keyIx: i32, fnIx: i32) {
     fbArrayGet(cmValsBack())
     fbLocalSet(fnMvValStashLocal(mslot))
     fbElse()            // else
-    // A miss yields the rep's empty value: 0.0 for an f64 map, 0 for an i64 map, else
-    // `ref.null` for a ref (string/struct) value.
+    // A miss yields the rep's empty value: 0.0 for an f64 or f32 map, 0 for an i64 map,
+    // else `ref.null` for a ref (string/struct) value.
     if mvValKind[mslot] == 11 { fbF64Const("0") }
     else if mvValKind[mslot] == 10 { fbI64Const(0, 0) }
+    else if mvValKind[mslot] == 13 { fbF32Const("0") }
     else { fbRefNull(mvValElemHeapOf(mslot)) }
     fbLocalSet(fnMvValStashLocal(mslot))
     fbEnd() // end
@@ -8391,6 +8406,214 @@ function emitMapHas(body: u8[], recvIx: i32, keyIx: i32, fnIx: i32) {
   pushMapScr(body, 5) // entry
   fbI32Const(0)
   fbI32Bin(71)        // 0x47 i32.ne (entry != 0 → 1, else 0)
+  0
+}
+
+// Push the current probe's hit flag, `entry != 0`. Valid after `emitMapPrep`.
+function pushMapHitFlag(body: u8[]) {
+  pushMapScr(body, 5) // entry
+  fbI32Const(0)
+  fbI32Bin(71)        // 0x47 i32.ne
+  0
+}
+
+// `print(m[k])` over a bare scalar-valued map read (D2466): the stored value through its own
+// sink on a hit, the word `null` on a miss. The probe's hit flag is the read's null, so no box
+// is built. `k` is `mapReadScalarBoxKind`'s atom kind.
+function emitPrintScalarMapRead(body: u8[], argIx: i32, k: i32, fnIx: i32) {
+  const e = P.nodes[unwrapParen(argIx)]
+  if e is Index {
+    if emitMapPrep(body, e.idxArr, e.idxIndex, fnIx) < 0 { return -1 }
+    pushMapScr(body, 5) // entry
+    fbIf(64)            // void
+    pushMapScalarHit(body)
+    if emitPrintScalarSink(k) < 0 { return -1 }
+    fbElse()
+    emitPrintNullWord()
+    fbEnd()
+    return 0
+  }
+  emitFail(
+    "emitProgram: scalar map-read print over an operand that is not an index read",
+  )
+}
+
+// `==` / `!=` with a bare scalar-valued map read on either side (D2466). A miss is `null`, so
+// it equals only a `null`: the payload compare is `and`ed with the probe's hit flag, and both
+// operands evaluate once, left to right. 1 when lowered, 0 to decline to the caller's ladder
+// (null literals, a kind mismatch, a union operand that cannot be re-read), -1 on failure.
+function emitScalarMapReadEq(body: u8[], e: BinExpr, fnIx: i32): i32 {
+  const kl = mapReadScalarBoxKind(e.binLeft, fnIx)
+  const kr = mapReadScalarBoxKind(e.binRight, fnIx)
+  if kl < 0 && kr < 0 { return 0 }
+  const ln = P.nodes[unwrapParen(e.binLeft)]
+  const rn = P.nodes[unwrapParen(e.binRight)]
+  if ln is NullLit { return 0 }
+  if rn is NullLit { return 0 }
+  let rc = 0
+  if kl >= 0 && kr >= 0 {
+    if kl != kr { return 0 }
+    rc = emitScalarMapReadPairEq(body, e.binLeft, e.binRight, kl, fnIx)
+  } else if kl >= 0 {
+    rc = emitScalarMapReadOtherEq(body, e.binLeft, e.binRight, kl, true, fnIx)
+  } else {
+    rc = emitScalarMapReadOtherEq(body, e.binRight, e.binLeft, kr, false, fnIx)
+  }
+  if rc <= 0 { return rc }
+  if e.binOp == "!=" { fbI32Eqz() }
+  1
+}
+
+// Both operands are scalar map reads of kind `k`: equal when both miss, or both hit with equal
+// values. The right read's probe is emitted once per arm of the left's hit test.
+function emitScalarMapReadPairEq(
+  body: u8[],
+  lIx: i32,
+  rIx: i32,
+  k: i32,
+  fnIx: i32,
+): i32 {
+  const l = P.nodes[unwrapParen(lIx)]
+  const r = P.nodes[unwrapParen(rIx)]
+  if l is Index {
+    if r is Index {
+      if emitMapPrep(body, l.idxArr, l.idxIndex, fnIx) < 0 { return -1 }
+      pushMapScr(body, 5) // left entry
+      fbIf(127)           // i32 result
+      pushMapScalarHit(body)
+      if emitMapPrep(body, r.idxArr, r.idxIndex, fnIx) < 0 { return -1 }
+      if emitMapGetTail(body, r.idxArr) < 0 { return -1 }
+      fbI32Bin(atomEqOpcodeOfKind(k))
+      pushMapHitFlag(body)
+      fbI32Bin(113)       // 0x71 i32.and
+      fbElse()
+      if emitMapPrep(body, r.idxArr, r.idxIndex, fnIx) < 0 { return -1 }
+      pushMapHitFlag(body)
+      fbI32Eqz()
+      fbEnd()
+      return 1
+    }
+  }
+  0
+}
+
+// One operand is a scalar map read of kind `k` (`readLeft` says which side), the other is not.
+// A plain scalar compares against the hit value; a value-union box compares by tag, its `null`
+// arm matching a miss.
+function emitScalarMapReadOtherEq(
+  body: u8[],
+  readIx: i32,
+  otherIx: i32,
+  k: i32,
+  readLeft: boolean,
+  fnIx: i32,
+): i32 {
+  const rd = P.nodes[unwrapParen(readIx)]
+  if rd is Index {
+    if exprUnion(otherIx, fnIx) && !eqAtomOperandOk(otherIx, fnIx) {
+      return emitScalarMapReadBoxEq(
+        body,
+        rd.idxArr,
+        rd.idxIndex,
+        otherIx,
+        k,
+        fnIx,
+      )
+    }
+    const atom = scalarAtomNameOfKind(k)
+    // A numeric literal widens to a wide read's own width (`emitUnionEqOther`); any other
+    // operand must already have the read's atom kind.
+    const olit = P.nodes[unwrapParen(otherIx)]
+    let oOk = unionEqAtomKindOf(otherIx, atom + " | null", fnIx) == k
+    if olit is NumLit {
+      if k >= 3 { oOk = true }
+    }
+    if !oOk { return 0 }
+    if readLeft {
+      if emitMapPrep(body, rd.idxArr, rd.idxIndex, fnIx) < 0 { return -1 }
+      pushMapHitFlag(body)
+      if emitMapGetTail(body, rd.idxArr) < 0 { return -1 }
+      if emitUnionEqOther(body, otherIx, k, fnIx) < 0 { return -1 }
+      fbI32Bin(atomEqOpcodeOfKind(k))
+      fbI32Bin(113) // 0x71 i32.and
+      return 1
+    }
+    if emitUnionEqOther(body, otherIx, k, fnIx) < 0 { return -1 }
+    if emitMapPrep(body, rd.idxArr, rd.idxIndex, fnIx) < 0 { return -1 }
+    if emitMapGetTail(body, rd.idxArr) < 0 { return -1 }
+    fbI32Bin(atomEqOpcodeOfKind(k))
+    pushMapHitFlag(body)
+    fbI32Bin(113) // 0x71 i32.and
+    return 1
+  }
+  0
+}
+
+// The read against a value-union box `u`: a hit equals `u` holding the same scalar, a miss
+// equals `u` holding `null`. `u` is re-read per arm, so it must be re-readable and must not be
+// a map read of its own (its probe would overwrite this one's entry).
+function emitScalarMapReadBoxEq(
+  body: u8[],
+  recvIx: i32,
+  keyIx: i32,
+  boxIx: i32,
+  k: i32,
+  fnIx: i32,
+): i32 {
+  if !unionEqOperandOk(boxIx) { return 0 }
+  const bn = P.nodes[unwrapParen(boxIx)]
+  if bn is Index { return 0 }
+  const un = unionNameOfExpr(boxIx, fnIx)
+  if un == "" || !unionSetHasNull(un) { return 0 }
+  if !unionHasAtom(un, scalarAtomNameOfKind(k)) { return 0 }
+  if emitMapPrep(body, recvIx, keyIx, fnIx) < 0 { return -1 }
+  pushMapScr(body, 5)     // entry
+  fbIf(127)               // i32 result
+  if emitExpr(body, boxIx, fnIx) < 0 { return -1 }
+  fbStructGet(uBoxIdx, 0) // tag
+  fbI32Const(scalarTagOfKind(k))
+  fbI32Bin(70)            // 0x46 i32.eq
+  fbIf(127)
+  pushMapScalarHit(body)
+  if emitExpr(body, boxIx, fnIx) < 0 { return -1 }
+  fbStructGet(uBoxIdx, 1) // payload
+  if emitUnionPayloadUnbox(body, k) < 0 { return -1 }
+  fbI32Bin(atomEqOpcodeOfKind(k))
+  fbElse()
+  fbI32Const(0)
+  fbEnd()
+  fbElse()
+  if emitExpr(body, boxIx, fnIx) < 0 { return -1 }
+  fbStructGet(uBoxIdx, 0) // tag
+  fbI32Const(nullBoxTag())
+  fbI32Bin(70)            // 0x46 i32.eq
+  fbEnd()
+  1
+}
+
+// `m[k] is T` over a bare scalar-valued map read (D2466): `is null` is a miss and `is` the
+// value's own scalar is a hit. 1 when lowered, 0 to decline (any other tested type).
+function emitScalarMapReadIs(
+  body: u8[],
+  isIx: i32,
+  readIx: i32,
+  k: i32,
+  fnIx: i32,
+): i32 {
+  const rd = P.nodes[unwrapParen(readIx)]
+  if rd is Index {
+    const tn = tyPrimNameOf(isVarTyIxOf(isIx))
+    if tn == null { return 0 }
+    if tn == "null" {
+      if emitMapHas(body, rd.idxArr, rd.idxIndex, fnIx) < 0 { return -1 }
+      fbI32Eqz()
+      return 1
+    }
+    if tn == scalarAtomNameOfKind(k) {
+      if emitMapHas(body, rd.idxArr, rd.idxIndex, fnIx) < 0 { return -1 }
+      return 1
+    }
+  }
   0
 }
 
@@ -15675,6 +15898,10 @@ function emitCallCore(body: u8[], callIx: i32, fnIx: i32) {
           if emitNulNoneForEffect(body, c.callArgs[0], fnIx) < 0 { return -1 }
           return emitPrintNullWord()
         }
+        const pmk = mapReadScalarBoxKind(c.callArgs[0], fnIx)
+        if pmk >= 0 {
+          return emitPrintScalarMapRead(body, c.callArgs[0], pmk, fnIx)
+        }
         // print(literal-union atom): widen it to its member string — a per-member
         // `if id == <id> { print "<name>" }` chain. Asked before `exprString`, which also
         // answers true for an atom-repped global (the softened render says `string` over a
@@ -22896,6 +23123,12 @@ function emitPrintUnionArm(body: u8[], slot: i32, k: i32) {
     fbLocalSet(strScratchBase + 0)
     return emitPrintStrFromScratch(body)
   }
+  emitPrintScalarSink(k)
+}
+
+// Print the scalar of value-atom kind `k` already on the stack through its own `__print_*__`
+// import: i32, boolean, i64, f64 and f32. Any other kind has no scalar sink and fails loud.
+function emitPrintScalarSink(k: i32) {
   if k == 0 {
     fbCall(0) // __print_i32__ (import 0)
     return 0
@@ -24322,6 +24555,9 @@ function emitBinExprNode(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
         return 0
       }
     }
+    const smq = emitScalarMapReadEq(body, e, fnIx)
+    if smq < 0 { return -1 }
+    if smq > 0 { return 0 }
     let uqNull = false
     if uql is NullLit { uqNull = true }
     if uqr is NullLit { uqNull = true }

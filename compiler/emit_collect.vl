@@ -194,6 +194,7 @@ import {
   parentLetOf,
   retBoolFlag,
   retVoidAnnFlag,
+  setShapeOfTy,
   shapeInnerFieldSplit,
   strContains,
   strLess,
@@ -4483,11 +4484,10 @@ export function mfScan(ix: i32, fnIx: i32) {
             // The i32-keyed map's values are the mono i32 list — the same self-contained
             // `mapValsBase` frame the string-keyed mono map uses.
             fnUsesMapVals = true
-          } else if vsh == -5 {
-            // An i32-keyed `Set`'s `.values()` are its keys, so the bound form is built by the
-            // key-list path and needs that frame. A Set's shape is neither the mono `-1` nor an
-            // mv slot, so the arms either side of this one both miss it. The string-keyed half
-            // is deliberately not taught here: this scan also fires on `for v in s.values()`.
+          } else if vsh == -5 || vsh == -2 {
+            // A `Set`'s `.values()` are its keys, so the bound form is built by the key-list
+            // path and needs that frame, at either key rep. A Set's shape is neither the mono
+            // `-1` nor an mv slot, so the arms either side of this one both miss it.
             fnUsesMapKeys = true
           } else if vsh >= 0 {
             fnUsesMapVals = true
@@ -5744,6 +5744,13 @@ export function collectA(_stmts: i32[]) {
         if cf.memProp == "keys" {
           slUsed = true
           aUsed = true
+        }
+        // A set's `.values()` is its keys list too, whatever produced the set.
+        if cf.memProp == "values" {
+          const vss = setShapeOfTy(nodeTyIxOf(cf.memObj))
+          if vss == -2 { slUsed = true }
+          if vss == -5 { lUsed = true }
+          if vss != 0 { aUsed = true }
         }
       }
       // Gated on the shared vocabulary, so `collectANoteIdentRename` and this arm cannot
@@ -10346,9 +10353,38 @@ function variantFieldTysEq(a: i32, b: i32) {
     // B6b — the map field's key half: the elem-name column above records only `V`, so two
     // differently-keyed maps compare equal there; this column catches it.
     if uFieldElemKeyI32At(a, fi) != uFieldElemKeyI32At(b, fi) { return false }
+    // A `Set<K>` field and a `{[K]: boolean}` field spell one index signature; the arena's set
+    // flag is what tells them apart (D2493).
+    const fnm = uFieldNames[uFieldStart[a] + fi]
+    if variantFieldSetFlag(a, fnm) != variantFieldSetFlag(b, fnm) {
+      return false
+    }
     fi = fi + 1
   }
   true
+}
+
+// The set flag of variant row `v`'s field `name` from its arena type: 1 for a `Set<K>`, 0 for
+// a map, -1 when the field is not a map or the row has no arena type.
+function variantFieldSetFlag(v: i32, name: string): i32 {
+  if v < 0 || v >= uVarTyIx.length { return -1 }
+  const vt = uVarTyIx[v]
+  if vt < 0 { return -1 }
+  const t = T.tys[vt]
+  if t is TyObj {
+    let i = 0
+    while i < t.objFieldNames.length {
+      if t.objFieldNames[i] == name {
+        const ft = t.objFieldTypes[i]
+        if ft < 0 { return -1 }
+        const f = T.tys[ft]
+        if f is TyMap { return f.mSet }
+        return -1
+      }
+      i = i + 1
+    }
+  }
+  -1
 }
 
 // D1050 — lays a mixed-spelling discriminated pair out under one rep: each field goes to

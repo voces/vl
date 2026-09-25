@@ -43,14 +43,14 @@ NAMED = os.path.normpath(os.path.join(HERE, "..", "distilled", "named"))
 REPS = {
     "set_str": ([
         'function mkSetStr(): {[string]: boolean} {',
-        '  const s: {[string]: boolean} = Set()',
+        '  const s: Set<string> = Set()',
         '  s.add("a")',
         '  return s',
         '}',
     ], "{[string]: boolean}", "mkSetStr()", "print({X}.size)", []),
     "set_i32": ([
         'function mkSetI32(): {[i32]: boolean} {',
-        '  const s: {[i32]: boolean} = Set()',
+        '  const s: Set<i32> = Set()',
         '  s.add(1)',
         '  return s',
         '}',
