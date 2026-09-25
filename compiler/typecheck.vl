@@ -6280,12 +6280,34 @@ function crCallReaches(callIx: i32, name: string): boolean {
   crOpIsReacher(crOpOf(callIx), name)
 }
 
-// The operator of a binary node, or "" for any other node — which `crOpIsReacher` answers true
+// The operator a node may dispatch to a declaration of: a binary node's own, `"[]="` for an
+// assignment to an index, `"[]"` for an index read, or "" — which `crOpIsReacher` answers true
 // for, a call of no known shape reaching whatever it might.
 function crOpOf(ix: i32): string {
   const n = P.nodes[ix]
-  if n is BinExpr { return n.binOp }
+  if n is BinExpr { return crBinOpName(n) }
+  crIndexOpOf(ix)
+}
+
+function crBinOpName(n: BinExpr): string {
+  if n.binOp == "=" {
+    if P.nodes[n.binLeft] is Index { return OP_INDEX_SET }
+  }
+  n.binOp
+}
+
+function crIndexOpOf(ix: i32): string {
+  if P.nodes[ix] is Index { return OP_INDEX_GET }
   ""
+}
+
+// Whether a node that is not a `Call` may still call a user declaration: a declared binary
+// operator, or any index read or index write once the program declares an index operator.
+// Asked before the node is checked, so it cannot read which declaration dispatched.
+function crIsDispatchSite(ix: i32): boolean {
+  const op = crOpOf(ix)
+  if op == OP_INDEX_GET || op == OP_INDEX_SET { return opIdxDeclared() }
+  op != "" && isBinOpFuncName(op) && binOpSymDeclared(op)
 }
 
 // Is a declaration of operator `op` (`+`, or a receiver-keyed `+@P`) a reacher of `name`?
@@ -6540,12 +6562,8 @@ function crNoteCallBare(callIx: i32) {
 function crFirstWritingCall(ix: i32, name: string): i32 {
   if ix < 0 || ix >= P.nodes.length { return -1 }
   const n = P.nodes[ix]
-  if n is Call {
+  if n is Call || crIsDispatchSite(ix) {
     if callMayWrite(ix, name) { return ix }
-  } else if n is BinExpr {
-    if isBinOpFuncName(n.binOp) && binOpSymDeclared(n.binOp) {
-      if callMayWrite(ix, name) { return ix }
-    }
   }
   let cur = ix
   while cur >= 0 {
@@ -6724,8 +6742,10 @@ function crCallDesc(ix: i32, withLine: boolean): string {
   const nm = calleeNameOf(ix)
   if nm != "?" { d = "the call to '" + nm + "'" }
   if ix >= 0 && ix < P.nodes.length {
-    const n = P.nodes[ix]
-    if n is BinExpr { d = "the operator '" + n.binOp + "'" }
+    if !(P.nodes[ix] is Call) {
+      const op = crOpOf(ix)
+      if op != "" { d = "the operator '" + op + "'" }
+    }
   }
   if withLine { d = d + " on line " + i32ToStr(nodeLineOf(ix)) }
   d
@@ -40571,6 +40591,7 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
               }
             }
             opIdxBank(ix, wfn)
+            crNoteCallBare(ix)
             return rt
           }
           // A read operator with no write one: name the missing half, exactly as
@@ -46381,6 +46402,7 @@ function checkIndexNode(n: Index, ix: i32) {
           }
         }
         opIdxBank(ix, rfn)
+        crNoteCallBare(ix)
         const rty = opIdxRetTy(rfn)
         if bNames.length > 0 { return substTyDeep(rty, bNames, bTys) }
         return rty

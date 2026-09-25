@@ -59,7 +59,8 @@ A use at the narrowed type is refused with a message naming the call, and carrie
 statement, or inside a block that statement holds.
 
 - sound: `call-ends-narrowing-recheck-runs.vl`
-- rejected: `call-ends-narrowing-diagnostic.vl`, `call-ends-narrowing-escaped-writer.vl`
+- rejected: `call-ends-narrowing-diagnostic.vl`, `call-ends-narrowing-escaped-writer.vl`,
+  `call-ends-narrowing-index-operator.vl`
 
 ### Nullable access
 A member access on a `T | null` value is rejected until a guard narrows it to

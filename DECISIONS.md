@@ -7815,9 +7815,12 @@ code):
   binding). Once one escaped, every call reaches except one that provably runs no user code: an
   intrinsic whose arguments are literals, values whose type holds no function, or lambdas written
   in place that themselves call only such calls and do not write `v`;
-* an operator that dispatched to a declaration is a call to that declaration: it reaches when a
-  declaration of that operator is itself a reacher (its body calls or writes the writer), or
-  when a writer has escaped. An operator closure field reaches only an escaped writer.
+* an operator that dispatched to a declaration is a call to that declaration — a binary
+  operator, and an index read `p[i]` or write `p[i] = x` dispatched to `"[]"` / `"[]="`: it
+  reaches when a declaration of that operator is itself a reacher (its body calls or writes the
+  writer), or when a writer has escaped. An operator closure field reaches only an escaped
+  writer. A getter is not a call here: its body contract refuses any effect, a call through a
+  function value included, so no getter can run a writer.
 
 A writer that is a local `const` and is only ever called by name has not escaped, so
 `xs.map((x) => x + 1)` keeps the narrowing and `xs.map((x) => { k(); x })` ends it. Any use of a
