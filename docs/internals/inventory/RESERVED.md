@@ -72,3 +72,4 @@ D2268-D2269  intrinsic-shadow-lane  2026-09-23  import-alias intrinsic shadowing
 D2280-D2282  pl031-lane  2026-09-23  PL-031 map tombstone hang
 D2309-D2312  plumb-compile-perf  2026-09-24
 D2335-D2338  plumb-tail-units  2026-09-24
+D2362-D2364  pl037-strength  2026-09-24
