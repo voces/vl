@@ -1,0 +1,99 @@
+// `std:utf16` — turning VL strings into UTF-16 code units, and back.
+//
+//     import { encodeUtf16, decodeUtf16, decodeUtf16Lossy, Utf16Error } from "std:utf16"
+//
+// Units travel as an `i32[]`, one 16-bit unit (0..0xFFFF) per element; a character past
+// U+FFFF is two units, a surrogate pair. Encoding is total: a string holding ill-formed
+// UTF-8 (only `slice` makes one) encodes each ill-formed byte as U+FFFD. Decoding is strict: a
+// lone surrogate is an error, and `decodeUtf16Lossy` is the opt-in repair. No byte order or
+// BOM (the units are numbers, not bytes), and no NUL terminator is added or expected.
+
+// Why a decode failed. `at` is the index of the offending unit, which is also the length
+// of the valid prefix; `unit` is its value; `msg` is prose for a human.
+export type Utf16Error = { at: i32, unit: i32, msg: string }
+
+// U+FFFD, the character the lossy paths substitute.
+const REPLACEMENT = 0xFFFD
+
+// The number of units `self.encodeUtf16()` produces, without building them. O(n).
+export function utf16Length(self: string) {
+  let n = 0
+  for cp in self {
+    n = n + 1
+    if cp >= 0x10000 { n = n + 1 }
+  }
+  n
+}
+
+// `self` as a fresh list of UTF-16 code units, a surrogate pair per character past U+FFFF.
+// Never fails. In a string sliced through a character, each ill-formed byte becomes one
+// U+FFFD, exactly as `for cp in self` reads it; `decodeUtf8Lossy` would give one per sequence.
+export function encodeUtf16(self: string): i32[] {
+  const out: i32[] = []
+  for cp in self {
+    if cp < 0x10000 {
+      out.push(cp)
+    } else {
+      const v = cp - 0x10000
+      out.push(0xD800 | (v >> 10), 0xDC00 | (v & 0x3FF))
+    }
+  }
+  out
+}
+
+// The one decode loop, shared so the strict and lossy spellings agree on what is ill-formed.
+function decodeCore(self: i32[], lossy: boolean): string | Utf16Error {
+  const cps: i32[] = []
+  const len = self.length
+  let i = 0
+  while i < len {
+    const u = self[i]
+    let bad = u < 0 || u > 0xFFFF || (u >= 0xDC00 && u <= 0xDFFF)
+    let cp = u
+    let size = 1
+    if u >= 0xD800 && u <= 0xDBFF {
+      const next = if i + 1 < len { self[i + 1] } else { -1 }
+      if next >= 0xDC00 && next <= 0xDFFF {
+        cp = 0x10000 + ((u - 0xD800) << 10) + (next - 0xDC00)
+        size = 2
+      } else {
+        bad = true
+      }
+    }
+    if !bad {
+      cps.push(cp)
+    } else if lossy {
+      cps.push(REPLACEMENT)
+    } else {
+      let what = "not a 16-bit unit"
+      if u >= 0xD800 && u <= 0xDFFF { what = "a lone surrogate" }
+      return {
+        at: i,
+        unit: u,
+        msg: "invalid UTF-16: unit \{u} at index \{i} is \{what}",
+      }
+    }
+    i = i + size
+  }
+  fromCodePoints(cps)
+}
+
+// The units as a string, or a `Utf16Error` locating the first bad unit: a lone surrogate
+// (a high one not followed by a low one, or a low one on its own) or a value outside
+// 0..0xFFFF. An empty list is the empty string.
+export function decodeUtf16(self: i32[]): string | Utf16Error {
+  decodeCore(self, false)
+}
+
+// The units as a string with one U+FFFD per lone surrogate or out-of-range value. Total:
+// no input is rejected, and the original values of the replaced units are gone.
+export function decodeUtf16Lossy(self: i32[]) {
+  const r = decodeCore(self, true)
+  // Unreachable: the lossy path substitutes rather than failing.
+  if r is Utf16Error {
+    __trap__(
+      "internal error in std:utf16: the lossy decode rejected an input it must accept; please report",
+    )
+  }
+  r
+}
