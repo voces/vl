@@ -10,6 +10,8 @@ import { arrElemNameRaw, nameIsArray, nameIsSpaceFree } from "./tyname"
 import {
   TY_I32,
   annUnionAtomsOf,
+  asgAnyWiderStore,
+  asgStoreTyOf,
   forInBindTy,
   ifYieldsNoValue,
   inferRetFnKey,
@@ -22,6 +24,7 @@ import {
   inferRetRungIsMapElemList,
   inferRetRungIsNestedElemUnionList,
   inferRetRungIsNestedLeafList,
+  inferRetRungIsNulListRet,
   inferRetRungIsNullable,
   inferRetRungIsParenUnionElemList,
   inferRetRungIsScalarListRet,
@@ -43,6 +46,7 @@ import {
   nodeTyMapValExcludesNull,
   nodeTyName,
   nodeTyRecord,
+  nonNullTy,
   numLitUnionAliasName,
   numLitUnionBaseName,
   numLitUnionHasBase,
@@ -51,6 +55,7 @@ import {
   optCallRestamp,
   recordNodeTyFrom,
   strLitRecvTy,
+  topStmtOrderKey,
   tyArrayElemIx,
   tyFieldTyOf,
   tyHasTyVar,
@@ -81,6 +86,7 @@ import {
   Index,
   IsExpr,
   LetDecl,
+  MatchExpr,
   Member,
   NullLit,
   NumLit,
@@ -121,6 +127,7 @@ import {
   mkOptMember,
   mkParam,
   mkStr,
+  mkUnary,
   nodeValueSpineChildren,
   orderArgsByParamNames,
   paramDefaultIsCallsite,
@@ -1171,6 +1178,479 @@ function spillTypeByTarget(decl: i32, rd: i32, t: i32) {
   0
 }
 
+// ── value-position writes to a wider name (D2398) ─────────────────────────────────────────────
+// An assignment yields its right side, a name's re-read its storage. Where the two types
+// differ (`5` into an `f64`), a write on its statement's leading evaluation path moves ahead
+// of the statement as `const v = e; a = v`, and the statement reads `v`.
+
+// The names read, in evaluation order, by operands the walk has already passed; a write the
+// walk moves ahead of them must not change what they read.
+let asvReads: string[] = []
+// Set once the walk passes an operand that it cannot prove the moved write leaves alone.
+let asvStop = false
+// Whether the statement walked is a top-level binding, which has room for one moved write.
+let asvTopLet = false
+
+// Records the operand at `ix` as passed: a name joins `asvReads`, and any operand other than
+// a name or a literal (`exprReReadable` of a leaf) ends the walk.
+function asvPassOperand(ix: i32) {
+  const u = unwrapParen(ix)
+  if u < 0 { return 0 }
+  const n = P.nodes[u]
+  if n is Ident {
+    asvReads.push(n.identName)
+    return 0
+  }
+  if !asvIsLeaf(u) { asvStop = true }
+  0
+}
+
+// A literal or a name: an operand whose evaluation neither writes nor depends on order.
+function asvIsLeaf(ix: i32): boolean {
+  if ix < 0 { return false }
+  if P.nodes[ix] is Member || P.nodes[ix] is Index { return false }
+  exprReReadable(ix)
+}
+
+// Whether evaluating `ix` can write anything: an assignment under an operator, or any node
+// `exprReReadable` does not answer for, a call among them.
+function asvMayWrite(ix: i32): boolean {
+  if ix < 0 { return false }
+  const n = P.nodes[ix]
+  if n is BinExpr {
+    if n.binOp == "=" { return true }
+    return asvMayWrite(n.binLeft) || asvMayWrite(n.binRight)
+  }
+  if n is Unary { return asvMayWrite(n.unArg) }
+  asvLeafMayWrite(ix)
+}
+
+// Whether a node that is not an operator can write: any node `exprReReadable` does not
+// answer for, a call among them.
+function asvLeafMayWrite(ix: i32): boolean { !exprReReadable(ix) }
+
+// Whether the value-position write `a = e` at `asgIx` moves ahead: its name's type is not the
+// value's, neither is a literal-union atom (a store that encodes one keeps its re-read, as
+// D2285's does), the value is not a bare `null`, and no operand already passed reads the name
+// or anything `e` may write.
+function asvMoves(asgIx: i32): boolean {
+  if !asvTypeMoves(asgIx) { return false }
+  const a = P.nodes[asgIx]
+  if !(a is BinExpr) { return false }
+  const t = P.nodes[a.binLeft]
+  if !(t is Ident) { return false }
+  let i = 0
+  let spilled = true
+  while i < asvReads.length {
+    if asvReads[i] == t.identName { return false }
+    if asvReads[i].slice(0, 4) != "asg#" { spilled = false }
+    i = i + 1
+  }
+  spilled || !asvMayWrite(a.binRight)
+}
+
+// `asvMoves`'s half that reads only the write at `asgIx`: a plain write to a name whose
+// storage type is not the value's, where neither is a literal-union atom or holds a type
+// variable, and the value is not a bare `null`.
+function asvTypeMoves(asgIx: i32): boolean {
+  const a = P.nodes[asgIx]
+  if !(a is BinExpr) { return false }
+  if a.binOp != "=" || a.binCompound != "" { return false }
+  if !(P.nodes[a.binLeft] is Ident) { return false }
+  if P.nodes[unwrapParen(a.binRight)] is NullLit { return false }
+  const lt = asgStoreTyOf(asgIx)
+  const vt = nodeTyIxOf(asgIx)
+  if lt < 0 || vt < 0 || tySame(lt, vt) { return false }
+  if tyIsLitUnionOrLit(nonNullTy(lt)) || tyIsLitUnionOrLit(vt) { return false }
+  !(tyHasTyVar(lt) || tyHasTyVar(vt))
+}
+
+// Walks the operands of `ix` that run first, moving each value-position write `asvMoves`
+// accepts onto `out`; answers the node that replaces `ix`. `isValue` is false only for a
+// statement's own top-level write, whose value nothing reads.
+function asvWalk(ix: i32, out: i32[], isValue: boolean): i32 {
+  if ix < 0 || asvStop { return ix }
+  const n = P.nodes[ix]
+  if (
+    n is Ident
+    || n is NumLit
+    || n is StrLit
+    || n is CharLit
+    || n is BoolLit
+    || n is NullLit
+  ) {
+    return ix
+  }
+  if n is Paren {
+    n.parInner = asvWalk(n.parInner, out, isValue)
+    return ix
+  }
+  if n is BinExpr {
+    if n.binOp == "=" { return asvWalkWrite(ix, n, out, isValue) }
+    n.binLeft = asvWalk(n.binLeft, out, true)
+    asvPassOperand(n.binLeft)
+    if n.binOp == "&&" || n.binOp == "||" || n.binOp == "??" { asvStop = true }
+    n.binRight = asvWalk(n.binRight, out, true)
+    return ix
+  }
+  if n is Unary {
+    n.unArg = asvWalk(n.unArg, out, true)
+    return ix
+  }
+  if n is Call {
+    const callee = P.nodes[n.callFn]
+    if callee is Member {
+      callee.memObj = asvWalk(callee.memObj, out, true)
+      asvPassOperand(callee.memObj)
+    } else if callee is Ident {
+      // A callee a binding holds is read before the arguments run.
+      if asvIsBound(callee.identName) { asvPassOperand(n.callFn) }
+    } else {
+      asvStop = true
+    }
+    // Named arguments run in parameter order, not source order (D2343), so none moves.
+    if hasNamedArgs(n.callArgNames) { return asvHalt(ix) }
+    asvWalkList(n.callArgs, out)
+    return ix
+  }
+  if n is ArrayLit {
+    asvWalkList(n.arrElems, out)
+    return ix
+  }
+  if n is ObjLit { return asvWalkObj(ix, n, out) }
+  if n is Spread {
+    n.spdArg = asvWalk(n.spdArg, out, true)
+    return ix
+  }
+  if n is Member {
+    n.memObj = asvWalk(n.memObj, out, true)
+    return ix
+  }
+  if n is Index {
+    n.idxArr = asvWalk(n.idxArr, out, true)
+    asvPassOperand(n.idxArr)
+    n.idxIndex = asvWalk(n.idxIndex, out, true)
+    return ix
+  }
+  if n is IsExpr {
+    n.isObj = asvWalk(n.isObj, out, true)
+    return ix
+  }
+  if n is AsExpr {
+    n.asObj = asvWalk(n.asObj, out, true)
+    return ix
+  }
+  asvHalt(ix)
+}
+
+// The end of the walk at `ix`, a node whose operands it does not model (a lambda, a `match`,
+// an `if` used as a value): no later write moves past it. Answers `ix` unchanged.
+function asvHalt(ix: i32): i32 {
+  asvStop = true
+  ix
+}
+
+// `asvWalk` over operands that run in order, each passed before the next is walked.
+function asvWalkList(xs: i32[], out: i32[]) {
+  let i = 0
+  while i < xs.length {
+    xs[i] = asvWalk(xs[i], out, true)
+    asvPassOperand(xs[i])
+    i = i + 1
+  }
+  0
+}
+
+// A record literal's fields run in layout order, not source order, so only a literal whose
+// other fields are all literals has an operand that provably runs first.
+function asvWalkObj(ix: i32, n: ObjLit, out: i32[]): i32 {
+  let lead = -1
+  let i = 0
+  while i < n.objFields.length {
+    const f = P.nodes[n.objFields[i]]
+    if f is FieldInit {
+      const v = P.nodes[unwrapParen(f.fiValue)]
+      if !(v is NumLit || v is StrLit || v is CharLit || v is BoolLit) {
+        if lead >= 0 {
+          asvStop = true
+          return ix
+        }
+        lead = n.objFields[i]
+      }
+    }
+    i = i + 1
+  }
+  if lead >= 0 {
+    const lf = P.nodes[lead]
+    if lf is FieldInit { lf.fiValue = asvWalk(lf.fiValue, out, true) }
+  }
+  asvStop = true
+  ix
+}
+
+// Passes the operands a write's target `ti` evaluates before its right side: a field's
+// receiver, or an element's receiver and index. A name evaluates none; any other target ends
+// the walk.
+function asvPassTarget(ti: i32) {
+  if ti < 0 { return asvHalt(ti) }
+  const t = P.nodes[ti]
+  if t is Member { return asvPassOperand(t.memObj) }
+  if t is Index {
+    asvPassOperand(t.idxArr)
+    return asvPassOperand(t.idxIndex)
+  }
+  if t is Ident { return 0 }
+  asvHalt(ti)
+}
+
+// An assignment on the leading path: its right side runs first; a name target of a value
+// write `asvMoves` accepts becomes `const v = e; a = v` on `out` and the read of `v`. A field
+// or element target is walked only when its receiver and index are names or literals.
+function asvWalkWrite(ix: i32, n: BinExpr, out: i32[], isValue: boolean): i32 {
+  asvPassTarget(unwrapParen(n.binLeft))
+  n.binRight = asvWalk(n.binRight, out, true)
+  if asvStop || !isValue || !asvMoves(ix) { return ix }
+  if asvTopLet { asvStop = true }
+  // A literal keeps its store, which may encode it at the place's width (`2.5` into `f32`),
+  // and is yielded as a copy at the value's type, as D2285's tail does.
+  const lit = asvLitCopy(n.binRight)
+  if lit >= 0 {
+    nodeTyRecord(lit, nodeTyIxOf(ix))
+    out.push(ix)
+    return lit
+  }
+  const v = spillLocal(n.binRight, ix, "nv", out, n.pos)
+  n.binRight = v
+  out.push(ix)
+  spillRead(v)
+}
+
+// `cboxLitCopy`, and a negated number literal too; -1 for any other node.
+function asvLitCopy(ix: i32): i32 {
+  const u = unwrapParen(ix)
+  if u < 0 { return -1 }
+  const n = P.nodes[u]
+  if n is Unary {
+    if n.unOp != "-" { return -1 }
+    const inner = cboxLitCopy(n.unArg)
+    if inner < 0 { return -1 }
+    nodeTyCarry(inner, n.unArg)
+    return mkUnary("-", inner, n.pos)
+  }
+  cboxLitCopy(u)
+}
+
+// The statement at `ix` with its leading value-position writes moved onto `out`: a binding's
+// initialiser, a return's value, an `if`'s condition, a `match`'s subject, or the expression.
+function asvStmt(ix: i32, out: i32[]) {
+  asvReads = []
+  asvStop = false
+  const s = P.nodes[ix]
+  if s is LetDecl {
+    s.letInit = asvWalk(s.letInit, out, true)
+  } else if s is RetStmt {
+    s.retArg = asvWalk(s.retArg, out, true)
+  } else if s is IfStmt {
+    s.ifCond = asvWalk(s.ifCond, out, true)
+  } else if s is MatchExpr {
+    s.matchScrut = asvWalk(s.matchScrut, out, true)
+  } else if (
+    !(s is FuncDecl
+      || s is WhileStmt
+      || s is ForRange
+      || s is ForIn
+      || s is Block)
+  ) {
+    asvWalk(ix, out, false)
+  }
+  0
+}
+
+// The start function's order key for the top-level nodes this pass minted, beside the node:
+// a block keeps its statement's key, and a moved write takes one less than its binding's.
+// Indexed by node, -1 for a node the pass did not mint.
+let asvKeyOf: i32[] = []
+
+// Every name a `let` or a parameter binds, so a call through a binding reads it; built on
+// the first question, since most programs never ask one.
+let asvBound: {[string]: i32} = Map()
+let asvBoundBuilt = false
+
+// Records the name the `let` at `ix` binds, if it is one.
+function asvNoteLet(ix: i32) {
+  const bn = P.nodes[ix]
+  if bn is LetDecl { asvBound[bn.letName] = 1 }
+  0
+}
+
+// Records the name the parameter at `ix` binds, if it is one.
+function asvNoteParam(ix: i32) {
+  const bn = P.nodes[ix]
+  if bn is Param { asvBound[bn.parName] = 1 }
+  0
+}
+
+// Whether some `let` or parameter binds `name`.
+function asvIsBound(name: string): boolean {
+  if !asvBoundBuilt {
+    asvBoundBuilt = true
+    const n = P.nodes.length
+    let i = 0
+    while i < n {
+      asvNoteLet(i)
+      asvNoteParam(i)
+      i = i + 1
+    }
+  }
+  (asvBound[name] ?? 0) == 1
+}
+
+// Records `key` as the start-function order key of top-level node `ix`.
+function asvSetKey(ix: i32, key: i32) {
+  while asvKeyOf.length <= ix { asvKeyOf.push(-1) }
+  asvKeyOf[ix] = key
+  0
+}
+
+// The start function's order key for top-level node `ix`: `topStmtOrderKey`'s, unless this
+// pass moved the node ahead of a binding.
+export function startOrderKey(ix: i32): i32 {
+  if ix >= 0 && ix < asvKeyOf.length {
+    const k = asvKeyOf[ix]
+    if k >= 0 { return k }
+  }
+  topStmtOrderKey(ix)
+}
+
+// Rewrites one statement list: the moved writes land ahead of their statement. A top-level
+// statement other than a binding takes them inside a bare block of its own, so they stay locals
+// of the start function. A top-level binding moves one write, as a module binding and a statement
+// that share the one order key before it; ties run the binding first.
+function asvList(stmts: i32[], top: boolean) {
+  let i = 0
+  while i < stmts.length {
+    const out: i32[] = []
+    asvTopLet = top && P.nodes[stmts[i]] is LetDecl
+    asvStmt(stmts[i], out)
+    const cn = out.length
+    if cn > 0 {
+      if top && !asvTopLet {
+        const blk = mkBareBlockIf(mkBlock(out, -1), P.nodes[stmts[i]].pos)
+        asvSetKey(blk, topStmtOrderKey(stmts[i]))
+        out.push(stmts[i])
+        stmts[i] = blk
+      } else {
+        if asvTopLet {
+          let k = 0
+          while k < cn {
+            asvSetKey(out[k], topStmtOrderKey(stmts[i]) - 1)
+            k = k + 1
+          }
+        }
+        let j = stmts.length - 1
+        while stmts.length < j + 1 + cn { stmts.push(-1) }
+        while j >= i {
+          stmts[j + cn] = stmts[j]
+          j = j - 1
+        }
+        j = 0
+        while j < cn {
+          stmts[i + j] = out[j]
+          j = j + 1
+        }
+        i = i + cn
+      }
+      plCacheBust()
+    }
+    i = i + 1
+  }
+  0
+}
+
+// Whether function `fnIx` yields its body's value: un-annotated and not adopted as a void
+// callback, or annotated with a type other than `void`.
+function asvFnYields(fnIx: i32): boolean {
+  const fn = P.nodes[fnIx]
+  if !(fn is FuncDecl) { return false }
+  if fn.fnRet < 0 { return !lambdaVoidAdoptedAt(fnIx) }
+  const rt = P.nodes[fn.fnRet]
+  if rt is TypeRef { return rt.tyName != "void" }
+  false
+}
+
+// The value tail of the block at `blockIx`, arm by arm along a tail `if`'s `else if` spine: a
+// write `asvMoves` accepts becomes `const v = e; a = v; v`, as `spillTail` does for a field.
+function asvTail(blockIx: i32) {
+  const b = P.nodes[blockIx]
+  if !(b is Block) { return 0 }
+  const st = b.blkStmts
+  if st.length == 0 { return 0 }
+  const tx = st[st.length - 1]
+  if P.nodes[tx] is IfStmt {
+    if ifYieldsNoValue(tx) || !asvChainHasElse(tx) { return 0 }
+    let cur = tx
+    while cur >= 0 {
+      const c = P.nodes[cur]
+      cur = elseIfLink(cur)
+      if c is IfStmt {
+        asvTail(c.ifThen)
+        if cur < 0 { asvTail(c.ifElse) }
+      }
+    }
+    return 0
+  }
+  if !(P.nodes[tx] is BinExpr) { return 0 }
+  asvReads = []
+  asvStop = false
+  asvTopLet = false
+  const out: i32[] = []
+  const v = asvWalk(tx, out, true)
+  if out.length == 0 { return 0 }
+  st.pop()
+  let k = 0
+  while k < out.length {
+    st.push(out[k])
+    k = k + 1
+  }
+  st.push(v)
+  plCacheBust()
+  0
+}
+
+// Whether the `else if` chain from the `if` at `ix` ends in an `else`, which a value needs.
+function asvChainHasElse(ix: i32): boolean {
+  let cur = ix
+  let last = ix
+  while cur >= 0 {
+    last = cur
+    cur = elseIfLink(cur)
+  }
+  const l = P.nodes[last]
+  if l is IfStmt { return l.ifElse >= 0 }
+  false
+}
+
+// The pass: every statement list in the arena, before collection reads the module's bindings.
+export function assignValueSpill(stmts: i32[]) {
+  asvKeyOf = []
+  asvBound = Map()
+  asvBoundBuilt = false
+  const n = P.nodes.length
+  // A program whose every write stores its right side's own type has nothing to move.
+  if !asgAnyWiderStore() { return 0 }
+  let i = 0
+  while i < n {
+    const nd = P.nodes[i]
+    if nd is Block { asvList(nd.blkStmts, false) }
+    if nd is FuncDecl {
+      if asvFnYields(i) { asvTail(nd.fnBody) }
+    }
+    i = i + 1
+  }
+  asvList(stmts, true)
+  0
+}
+
 // Pins every un-annotated lambda that returns a union to that union, consuming the
 // contextual return type the checker already computed. A body-inferred return for a
 // union join (`if … { aCat } else { aDog }`) collapses to one arm, so without the pin
@@ -1217,6 +1697,10 @@ export function synthRetAnnots() {
             // No separate map-member-union arm: it would pin the identical body the boxed-
             // union arm above already reaches, and keeping it would silently mask a gap in
             // that arm's rung set instead of surfacing an un-pinned row.
+          } else if inferRetRungIsNulListRet(ctxRow) {
+            // A nullable list at a distinct-backing element (`string[] | null`): pins as the
+            // named function's pin does, so the result declares the nullable wrapper (D2399).
+            fn.fnRet = synthTypeRefTy(ctx, -1, ctxTy)
           } else if inferRetRungIsParenUnionElemList(ctxRow) {
             // An element-value-union list return (`(f64|null)[]`, `(i64|boolean)[]`): each
             // element seeds through the value-union-box list rep (`refArrElemKind == 2`),

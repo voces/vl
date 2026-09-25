@@ -2394,6 +2394,9 @@ export function exprNulScalarListKind(exprIx: i32, fnIx: i32): VKind | null {
           if fn.fnRet >= 0 { return nulScalarListKindOfNode(fn.fnRet) }
         }
       }
+      // A closure-value call whose resolved sig result is one of these niches (D2399).
+      const cvk = calleeRetKindAt(sidOfNode(e.callFn), fnIx, e.callFn)
+      if isNulScalarListKind(cvk) { return cvk }
     }
   }
   // A field read of a nullable distinct-backing scalar list (codes 31 to 34) yields the
@@ -25458,9 +25461,9 @@ export function forceCloResultMapTypes(nm: string) {
 }
 
 // Forces the wrapper/backing types of a scalar-leaf (or string) list reached only as a
-// closure result inside a composite annotation. The whole spelling is one TypeRef whose
-// result list is invisible to every branch of the `collectA` scan, so a narrowed arm's
-// value-call index read rejected "list type not collected". The list dual of `forceCloResultMapTypes`.
+// closure's result or parameter inside a composite annotation. The whole spelling is one
+// TypeRef whose lists are invisible to every branch of the `collectA` scan, so a value call
+// found no list type. The list dual of `forceCloResultMapTypes`; parameters since D2399.
 export function forceCloResultListTypes(nm: string) {
   // Cheap pre-gate (this runs per arena TypeRef): only a name spelling BOTH an arrow
   // and an array can carry a closure-result list — two substring scans, no allocation.
@@ -25474,38 +25477,49 @@ export function forceCloResultListTypes(nm: string) {
     // test runs first so the one-char reject precedes the depth scan.
     if nameIsParenOpen(a) {
       const ret0 = annRetNameOf(a)
-      if ret0 != "" {
-        const res = nonNulBaseOf(normTypeAtom(ret0))
-        // The scalar-element backings via the one home (`scalarListRepOfName`).
-        const sk = scalarListRepOfName(res)
-        if sk == "strlist" {
-          slUsed = true
-          aUsed = true
-        } else if sk == "f64list" {
-          fa64Used = true
-        } else if sk == "i64list" {
-          ia64Used = true
-        } else if sk == "f32list" {
-          fa32Used = true
-        } else if sk == "u8list" {
-          ba8Used = true
-        } else if sk == "list" {
-          lUsed = true
-          aUsed = true
-        } else if nameIsRefArray(res) {
-          // A ref-element list result: intern its element slot and force the ref-list
-          // machinery, exactly as a bare `S[]` annotation's branch does — else a narrowed
-          // arm's value call keys a signature no producer interned, or the read finds no wrapper.
-          rlUsed = true
-          raUsed = true
-          ensureRefElem(refArrElemName(res))
-        } else if annArrowAt(res) >= 0 {
-          // A curried result (`() => () => f32[]`) recurses to ITS result.
-          forceCloResultListTypes(res)
-        }
+      if ret0 != "" { forceCloListTypeOf(ret0) }
+      const ps: string[] = []
+      annFnDecompose(a, ps)
+      let pi = 0
+      while pi < ps.length {
+        forceCloListTypeOf(ps[pi])
+        pi = pi + 1
       }
     }
     i = i + 1
+  }
+  0
+}
+
+// `forceCloResultListTypes` for one position's type name `t`, its `| null` peeled.
+function forceCloListTypeOf(t: string) {
+  const res = nonNulBaseOf(normTypeAtom(t))
+  // The scalar-element backings via the one home (`scalarListRepOfName`).
+  const sk = scalarListRepOfName(res)
+  if sk == "strlist" {
+    slUsed = true
+    aUsed = true
+  } else if sk == "f64list" {
+    fa64Used = true
+  } else if sk == "i64list" {
+    ia64Used = true
+  } else if sk == "f32list" {
+    fa32Used = true
+  } else if sk == "u8list" {
+    ba8Used = true
+  } else if sk == "list" {
+    lUsed = true
+    aUsed = true
+  } else if nameIsRefArray(res) {
+    // A ref-element list: intern its element slot and force the ref-list machinery, exactly
+    // as a bare `S[]` annotation's branch does — else a value call keys a signature no
+    // producer interned, or the read finds no wrapper.
+    rlUsed = true
+    raUsed = true
+    ensureRefElem(refArrElemName(res))
+  } else if annArrowAt(res) >= 0 {
+    // A curried position (`() => () => f32[]`) recurses into its own positions.
+    forceCloResultListTypes(res)
   }
   0
 }
@@ -36022,6 +36036,9 @@ function annParamKind(t: string) {
   // enumeration `annRetKind` reads, so the two `$fnsig` producers cannot drift.
   const sk = scalarListRepOfName(t)
   if sk != null { return repSigTokOfKind(sk) }
+  // A nullable scalar-element list, the dual of `cloParamTok`'s niche tokens (D2399).
+  const nsk = annNulListKind(t)
+  if nsk != null { return repSigTokOfKind(nsk) }
   const si = structIndexOfTypeName(t)
   if si >= 0 { return repSigSlotTokOfKind("struct", si) }
   // A concrete-variant name (`Cat`), keyed by the variant index (matches `cloParamTok`).
@@ -36046,6 +36063,13 @@ function annParamKind(t: string) {
   ""
 }
 
+// The nullable-list `VKind` of type name `t` with a `$fnsig` token: the i32-backed `nullist`
+// or one of the distinct-backing scalar lists, else `null`.
+function annNulListKind(t: string): VKind | null {
+  if nameIsNulI32List(t) { return "nullist" }
+  nulScalarListKind(t)
+}
+
 function annRetKind(t: string) {
   if t == "i32" || t == "boolean" { return ">" + repSigTokOfKind("i32") }
   if t == "f64" { return ">" + repSigTokOfKind("f64") }
@@ -36064,6 +36088,8 @@ function annRetKind(t: string) {
   // litunion `K[]` into the same i32-list token the param dual already keys.
   const sk = scalarListRepOfName(t)
   if sk != null { return ">" + repSigTokOfKind(sk) }
+  const nsk = annNulListKind(t)
+  if nsk != null { return ">" + repSigTokOfKind(nsk) }
   // A ref-list return, matching `cloRetKeySuffix` — before the closure case so a closure-
   // element array's nested `=>` isn't misread, keyed by the same `rlSlotByName` the AST side uses.
   if nameIsRefArray(t) {

@@ -111,6 +111,17 @@ const genLitSets = (n: number, k: number): string => {
 
 // N call sites either way; the many arm spreads them over N callees, the one arm over
 // N/K. Both DECLARE N functions, so only the callee distribution differs.
+// `n` value-position writes to a wider name, each a binding of its own, at module scope or in
+// one function. D2398 moves each ahead of its binding and keys the start function's order.
+const genValueWrites = (n: number, inFn: boolean): string => {
+  const o: string[] = ["function h(i: i32): i32 { i }", "let a: f64 = 0"];
+  if (inFn) o.push("function main() {");
+  const pad = inFn ? "  " : "";
+  for (let i = 0; i < n; i++) o.push(`${pad}const y${i} = (a = h(${i}))`);
+  if (inFn) o.push("}", "main()");
+  return o.join("\n") + "\n";
+};
+
 const genCallSites = (n: number, k: number): string => {
   const m = Math.max(1, Math.floor(n / k));
   const o: string[] = [];
@@ -429,6 +440,15 @@ axis(
   "No frame is above 5% on this axis any more — profile the many arm before naming a cause.",
   (d) => twoFiles(d, genUnions(2400, 1), genUnions(2400, 20)),
   0.25,
+);
+
+// D2398's pair: the start function asks each top-level node its order key, and a moved write
+// keyed by a list scan made the module-scope arm quadratic (0.96 s at 8,000, 3.82 s at 16,000).
+axis(
+  "module-scope value writes",
+  2.5,
+  "`startOrderKey` (compiler/emit_rewrite.vl) is scanning the moved nodes per merge step.",
+  (d) => twoFiles(d, genValueWrites(12000, false), genValueWrites(12000, true)),
 );
 
 // 1.09 / 0.97 / 1.13.
