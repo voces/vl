@@ -677,6 +677,38 @@ axis(
   (d) => twoFiles(d, genManyClosedSiblingReads(12000, true), genManyClosedSiblingReads(12000, false)),
 );
 
+// `n` top-level `if true` blocks, each declaring `const u` and a closure reading it — the
+// SAME shape as the axis above, but a rewrite gives each block's `u` a unique spelling
+// (`u`, `u$s1`, …) once it is captured, so `startBlockLetRowOfSid` is asked about `n` DISTINCT
+// sids rather than one. Its own per-sid scan of every start statement made that O(n) per sid,
+// O(n²) overall — the query-side fix above does not touch this, since each sid is asked once
+// (D2326).
+const genManyCapturedSiblingBlocks = (n: number, many: boolean): string => {
+  const o = ["type U = i32 | string", "function g(x: i32): U {", "  if x % 2 == 0 { return x }", '  "s"', "}"];
+  const blocks = many ? n : 1;
+  for (let i = 0; i < blocks; i++) {
+    o.push(
+      "if true {",
+      `  const u: U = g(${i})`,
+      "  const k = () => {",
+      "    if u is i32 { return u }",
+      "    0",
+      "  }",
+      "  k()",
+      "}",
+    );
+  }
+  o.push("print(1)");
+  return o.join("\n") + "\n";
+};
+
+axis(
+  "many distinct captured sibling blocks",
+  10,
+  "`startBlockLetRowOfSid` re-scans every start statement per DISTINCT sid (D2326).",
+  (d) => twoFiles(d, genManyCapturedSiblingBlocks(3000, true), genManyCapturedSiblingBlocks(3000, false)),
+);
+
 // One `match` of `n` arms, each reading the module global `k`, written as a closure's body or
 // as a top-level function's. Every arm's read asks whether `k` is a capture of the frame, which
 // a top-level function answers without a walk. Both arms share `fill` statements so the cheap

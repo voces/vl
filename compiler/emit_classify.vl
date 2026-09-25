@@ -23396,15 +23396,15 @@ export function resetLitAtoms() {
   0
 }
 
-// Drops this file's sid-keyed rows — the `startBlockLetOf` memo. Paired with
-// `symbols.sidReset` by the driver, through `emit_sections.sidKeyedTablesReset`.
 export function sidResetStartBlockLet() {
   sblVal = []
   sblGen = []
   sblEpoch = sblEpoch + 1
-  sblStmtHead = []
-  sblStmtRow = []
-  sblStmtNext = []
+  sblSortedCand = []
+  sblSortedOwner = []
+  sblSortedSkip = []
+  sblSortStart = []
+  sblSortCount = []
   0
 }
 
@@ -28210,63 +28210,154 @@ export function unionNameOfIdentAt(sid: i32, fnIx: i32, atIx: i32) {
   ""
 }
 
-// A per-program memo for `startBlockLetRowOfSid` (R6): `sid` → the `LetDecl` it resolved to,
-// or -1. `sblGen[sid] == sblEpoch` marks a row live; `resetLitAtoms` bumps the epoch alongside
-// `startStmts`, so a row cannot outlive the arena it names. Exists because the scan below hands
-// `parentLetOf`'s one-entry block cache a different block every step, thrashing it unmemoized.
 let sblVal: i32[] = []
 let sblGen: i32[] = []
 let sblEpoch: i32 = 0
-// `sid` → head index into `sblStmtRow`/`sblStmtNext`, or -1 — every `startStmts[si]` sid binds
-// at start scope, built by the same scan as `sblVal`. Read only after `sblGen[sid] ==
-// sblEpoch`, so a stale head from an earlier program is never followed —
-// `sidResetStartBlockLet` clears all three alongside `sblVal`/`sblGen`.
-let sblStmtHead: i32[] = []
-let sblStmtRow: i32[] = []
-let sblStmtNext: i32[] = []
+let sblSortedCand: i32[] = []
+let sblSortedOwner: i32[] = []
+let sblSortedSkip: i32[] = []
+let sblSortStart: i32[] = []
+let sblSortCount: i32[] = []
+
+// Every start-scope `LetDecl` binding `targetSid`, appended to `tmpCand`/`tmpOwner` in
+// ascending arena order. A direct walk of `ix`'s own ladder, not `parentLetOfAt`'s: that
+// primitive rebuilds a whole per-block plan on every distinct blockIx, which is the cost
+// this avoids over many siblings (D2326 perf).
+function sblFind(
+  ix: i32,
+  owner: i32,
+  targetSid: i32,
+  tmpCand: i32[],
+  tmpOwner: i32[],
+) {
+  if ix < 0 { return 0 }
+  const st = P.nodes[ix]
+  if st is LetDecl {
+    if sidOfNode(ix) == targetSid {
+      tmpCand.push(ix)
+      tmpOwner.push(owner)
+    }
+  } else if st is IfStmt {
+    let cur = ix
+    while cur >= 0 {
+      const c = P.nodes[cur]
+      cur = -1
+      if c is IfStmt {
+        sblFind(c.ifThen, c.ifThen, targetSid, tmpCand, tmpOwner)
+        if c.ifElse >= 0 {
+          if P.nodes[c.ifElse] is IfStmt {
+            cur = c.ifElse
+          } else {
+            sblFind(c.ifElse, c.ifElse, targetSid, tmpCand, tmpOwner)
+          }
+        }
+      }
+    }
+  } else if st is WhileStmt {
+    sblFind(st.whileBody, st.whileBody, targetSid, tmpCand, tmpOwner)
+  } else if st is ForRange {
+    sblFind(st.frBody, st.frBody, targetSid, tmpCand, tmpOwner)
+  } else if st is ForIn {
+    sblFind(st.fiBody, st.fiBody, targetSid, tmpCand, tmpOwner)
+  } else if st is Block {
+    const stmts = st.blkStmts
+    let i = 0
+    while i < stmts.length {
+      sblFind(stmts[i], ix, targetSid, tmpCand, tmpOwner)
+      i = i + 1
+    }
+  }
+  0
+}
 
 // The `LetDecl` for a module-scope binding declared inside a top-level block, or -1 — a
-// start-function local neither `globalLetOf` nor `parentLetOf` can see. An empty `startStmts`
-// is a correct, fail-safe decline. The unpositioned, memoized (`sblVal`/`sblGen`) rung of
-// `startBlockLetRowOfAt`.
+// start-function local neither `globalLetOf` nor `parentLetOf` can see. Memoized per sid
+// (`sblGen`/`sblEpoch`) over a fresh `sblFind` search of every start statement, never
+// `parentLetOf`'s single-entry cache (D2326).
 function startBlockLetRowOfSid(sid: i32) {
   if startStmts.length < 1 { return -1 }
   if sid < 0 { return -1 }
   if sidArrGet(sblGen, sid) == sblEpoch { return sidArrGet(sblVal, sid) }
+  // Evicts `parentLetOf`'s single-entry cache from whatever function body an earlier rung
+  // (`parentLetOfAt(fn.fnBody, …)`) left it pinned to. That body's OWN next ask must rebuild,
+  // not reuse a plan a later rewrite has since outgrown (a spilled tail temp) — `startStmts[0]`
+  // is never a function body's own index, so this always evicts (D2374).
+  parentLetOfSid(startStmts[0], sid)
+  const tmpCand: i32[] = []
+  const tmpOwner: i32[] = []
   let si = 0
-  let found = -1
   while si < startStmts.length {
-    const li = parentLetOfSid(startStmts[si], sid)
-    if li >= 0 {
-      if found < 0 { found = li }
-      sblStmtNext.push(sidArrGet(sblStmtHead, sid))
-      sidArrPut(sblStmtHead, sid, sblStmtRow.length)
-      sblStmtRow.push(startStmts[si])
-    }
+    sblFind(startStmts[si], startStmts[si], sid, tmpCand, tmpOwner)
     si = si + 1
   }
+  const found = sblBuildSorted(sid, tmpCand, tmpOwner)
   sidArrPut(sblGen, sid, sblEpoch)
   sidArrPut(sblVal, sid, found)
   found
 }
 
+// Builds `sid`'s sorted-plus-skip slice from `tmpCand`/`tmpOwner` (already ascending — one
+// monotonic-stack pass, `plBuildSortedDup`'s own shape) and answers the first (smallest)
+// binding, `startBlockLetRowOfSid`'s unpositioned answer.
+function sblBuildSorted(sid: i32, tmpCand: i32[], tmpOwner: i32[]): i32 {
+  const start = sblSortedCand.length
+  const stack: i32[] = []
+  let j = 0
+  while j < tmpCand.length {
+    const cand = tmpCand[j]
+    while stack.length > 0 && sblSortedOwner[stack[stack.length - 1]] <= cand {
+      stack.pop()
+    }
+    let skip = -1
+    if stack.length > 0 { skip = stack[stack.length - 1] }
+    const idx = sblSortedCand.length
+    sblSortedCand.push(cand)
+    sblSortedOwner.push(tmpOwner[j])
+    sblSortedSkip.push(skip)
+    stack.push(idx)
+    j = j + 1
+  }
+  sidArrPut(sblSortStart, sid, start)
+  sidArrPut(sblSortCount, sid, tmpCand.length)
+  if tmpCand.length > 0 { return tmpCand[0] }
+  -1
+}
+
 // `startBlockLetRowOfSid`, positioned: the memoized unpositioned answer gates the search,
-// skipped when `sid` binds nowhere at start scope. Otherwise walks only the FEW start
-// statements binding `sid` (`sblStmtHead`'s chain) via `parentLetCoversAt` — `startStmts` is
-// not arena-sorted, so a binary search over all of it can pick the wrong one (D2326).
+// skipped when `sid` binds nowhere at start scope. Otherwise binary searches `sid`'s
+// sorted-plus-skip slice for the rightmost binding `< atIx`, then follows the skip column —
+// no statement's plan is rebuilt and no other sid's rows are walked (D2326).
 function startBlockLetRowOfAt(sid: i32, atIx: i32) {
   const first = startBlockLetRowOfSid(sid)
   if first < 0 { return -1 }
   if atIx < 0 { return first }
-  let row = sidArrGet(sblStmtHead, sid)
-  while row >= 0 {
-    const blockIx = sblStmtRow[row]
-    if parentLetCoversAt(blockIx, sid, atIx) {
-      return parentLetOfAt(blockIx, sid, atIx)
+  const start = sidArrGet(sblSortStart, sid)
+  const count = sidArrGet(sblSortCount, sid)
+  let lo = 0
+  let hi = count - 1
+  let pos = -1
+  while lo <= hi {
+    const mid = (lo + hi) / 2
+    if sblSortedCand[start + mid] < atIx {
+      pos = mid
+      lo = mid + 1
+    } else {
+      hi = mid - 1
     }
-    row = sblStmtNext[row]
   }
-  -1
+  let k = start + pos
+  let searching = pos >= 0
+  let best = -1
+  while searching && k >= start {
+    if atIx <= sblSortedOwner[k] {
+      best = sblSortedCand[k]
+      searching = false
+    } else {
+      k = sblSortedSkip[k]
+      if k < start { searching = false }
+    }
+  }
+  best
 }
 
 // The start-block `LetDecl` a read of `sid` denotes, or -1 — the one home both union rungs
