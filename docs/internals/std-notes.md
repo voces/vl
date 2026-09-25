@@ -753,6 +753,36 @@ Each now says so, in the shape the `concat`-vs-`+` bullet uses.
   of `std:str` and `std:fmt` for one i32 rendering; binaryen's DCE at `-O3` removes almost all
   of it.
 
+## `std:utf16`
+
+- **Admitted by clause (a) of `std-design.md` D2**: UTF-16 is the text ABI of the Win32, JS
+  and JVM hosts, and `std:utf8` stops at bytes. plumb (PL-038, `~/plumb/docs/vl-issues.md`)
+  clears the speculative exclusion rather than admitting it: its `unitsStr`/`strUnits`/`nameLen`
+  in `src/win32.vl` are `decodeUtf16Lossy`/`encodeUtf16`/`utf16Length` by hand, the first built
+  by per-character string concatenation. Its own module rather than a section of `std:utf8`,
+  so a caller wanting one encoding does not import the other; the two decoders share no input
+  type, so `std:utf8`'s one-decoder rule is kept.
+- **The names mirror `std:utf8`** (`encodeUtf16`/`decodeUtf16`/`decodeUtf16Lossy`/
+  `utf16Length`, `Utf16Error { at, unit, msg }`) rather than the asked-for `toUtf16`/
+  `fromUtf16`: a flat namespace makes the module name part of every export name, and the two
+  modules read as one family. `decodeUtf16At` is not here — `decodeUtf8At` has a record-block
+  consumer and this module does not yet.
+- **`i32[]`, not a unit type.** VL has no `u16`; `u8` is a storage type only. Out-of-range
+  elements (negative, or above 0xFFFF) are a decode error, not a silent truncation, because an
+  astral code point handed in as ONE element is the likeliest caller bug.
+- **Encode reads the string exactly as `for cp in s` does.** A string can hold malformed
+  UTF-8 only through `slice` (the core's wrap, `std:utf8` above); such bytes encode as U+FFFD,
+  one per maximal subpart, the same answer the language's own iteration gives. `encodeUtf16`
+  therefore never fails and needs no error arm; the lossiness is confined to input that no
+  well-formed string contains, and the export comment names it.
+- **Strict decode rejects lone surrogates**, like `decodeUtf8` rejects the surrogate block —
+  there is no WTF-16 pass-through. A caller that must round-trip arbitrary Windows names
+  (which may hold lone surrogates) keeps the units; this module converts TEXT.
+- **One pass each way.** Encode pushes onto one list; decode collects code points and makes
+  ONE `fromCodePoints` call, as `std:utf8` does, so neither side concatenates strings. Measured
+  2026-09-25 at ~8–12 ms per MB either direction (`vl run`, 10 repetitions over a 1 MB mixed
+  ASCII/BMP/astral string).
+
 ## `std:base64`
 
 - **`b64Char`/`b64Val` are a ladder rather than a table** because they invert each other
