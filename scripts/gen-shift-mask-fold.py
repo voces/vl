@@ -119,25 +119,38 @@ body.append("const MASK = 1023")
 body.append("const SCALE = 8")
 body.append("const IMIN = 1 << 31")
 body.append("const IMAX = IMIN - 1")
-body.append("const LMIN: i64 = (1 as i64) << 63")
-body.append("const LMAX: i64 = LMIN - 1")
-body.append("const LMIX: i64 = 0x9e3779b97f4a7c15")
+body.append("const LMIN = (1 as i64) << 63")
+body.append("const LMAX = LMIN - 1")
+body.append("const LMIX = 0x9e3779b97f4a7c15")
 body.append("const LHALF: i64 = 0x80000000")
+body.append("const Z = 0 as i64")
+body.append("const M1 = -1 as i64")
 body.append("function mix(h: i64, v: i64) { h * 1000003 + v }")
+body.append("function d5(a: i32, b: i32, c: i32, d: i32, e: i32) {")
+body.append("  mix(")
+body.append("    mix(mix(mix(mix(0 as i64, a as i64), b as i64), c as i64), d as i64),")
+body.append("    e as i64,")
+body.append("  )")
+body.append("}")
+body.append("function d6(a: i64, b: i64, c: i64, d: i64, e: i64, f: i64) {")
+body.append("  mix(mix(mix(mix(mix(mix(0 as i64, a), b), c), d), e), f)")
+body.append("}")
+body.append("function n6(a: i32, b: i32, c: i32, d: i32, e: i32, f: i32) {")
+body.append("  d6(a as i64, b as i64, c as i64, d as i64, e as i64, f as i64)")
+body.append("}")
 for name, ty, expr, ref in funcs:
     p = "y" if name[0] in "nw" else "x"
     body.append(f"function {name}({p}: {ty}) {{ {expr} }}")
 for name, ty, expr, ref in funcs:
     ins = I32_IN if ty == "i32" else I64_IN
-    call = "0 as i64"
     h = 0
+    args = []
     for lit, v in ins:
-        arg = lit
-        if ty == "i64" and lit in ("0", "-1"):
-            arg = f"{lit} as i64"
-        call = f"mix({call}, {name}({arg}) as i64)"
+        arg = {"0": "Z", "-1": "M1"}.get(lit, lit) if ty == "i64" else lit
+        args.append(f"{name}({arg})")
         h = s64(h * 1000003 + ref(v))
-    body.append(f"print({call})")
+    d = "d5" if ty == "i32" else ("d6" if name[0] == "b" else "n6")
+    body.append(f"print({d}({', '.join(args)}))")
     logs.append(h)
 for v in logs:
     out.append(f"// @log {v}")
