@@ -870,7 +870,7 @@ new: the compare-frame pre-pass never recurses into a code-15 field, so a NESTED
   inline memory intrinsics) four times while four trips remain, then finish rolled; copy `k`
   reads the loop variable as `u + k`. `b.xs[i]` in a call-free loop that assigns no `xs` field
   reads `b.xs`'s backing and `len` once, and `until b.xs.length` drops the index guard as
-  `until xs.length` does. bench/vs-rust `array`: 2.01x → ARRAYAFTER Rust. What remains is V8's
+  `until xs.length` does. bench/vs-rust `array`: 1.9x → 1.5x Rust, the others unchanged. What remains is V8's
   `array.get` bounds check (30% of the unrolled sum, not elidable) and push growth (WasmGC has
   no `realloc`). 0 distilled-corpus cells moved. DECISIONS.md, "Small variable-trip range loops
   are unrolled 4x"; `tests/cases/loops/partial-unroll-range-loops.vl`,
