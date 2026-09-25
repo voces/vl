@@ -132,8 +132,8 @@ ROWS = [
      ("  if capMemoStamp[fe] == capMemoGen {",
       "  if false && capMemoStamp[fe] == capMemoGen {")),
     ("covarValueWriteState", ["cwArenaLen", "cwRootNames", "cwRootFrames"], "probe",
-     ("  if root == \"\" { return 2 }\n  if P.nodes.length != cwArenaLen {",
-      "  if root == \"\" { return 2 }\n  if true {")),
+     ("function cwArenaSync() {\n  if P.nodes.length != cwArenaLen {",
+      "function cwArenaSync() {\n  if true {")),
     # D2289: one frame's "does the chain bind this name" answers, dropped whenever the asked frame
     # changes and on every `resetParentLetCache`.
     ("frameBindsCache", ["fcbSidGen"], "probe",

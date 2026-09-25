@@ -2689,6 +2689,15 @@ let fnDeclIx: {[string]: i32} = Map()
 // The `__memory_shared__()` Call nodes that denote the build intrinsic rather than a local of
 // that name; `foldMemShared` folds an `if` only on one of these. Reset by `initChecker`.
 export let memSharedCalls: i32[] = []
+// By assignment node: the storage type of a name target, which a narrowed read type hides; -1
+// where the node has no name target. Reset by `initChecker`.
+let asgStoreTys: i32[] = []
+
+// The storage type the name target of assignment `ix` is checked against, or -1.
+export function asgStoreTyOf(ix: i32): i32 {
+  if ix < 0 || ix >= asgStoreTys.length { return -1 }
+  asgStoreTys[ix]
+}
 // ── free index operators (B14) ───────────────────────────────────────────────
 
 // Every `function "[]"(self: T, …)` / `function "[]="(self: T, …)` the program declares, as the
@@ -3854,6 +3863,7 @@ export function initChecker() {
   paramSolveProbe = false
   fnDeclIx = Map()
   memSharedCalls = []
+  asgStoreTys = []
   opIdxOps = []
   opIdxFns = []
   getFns = []
@@ -17431,6 +17441,7 @@ function cwBuildFrames() {
 // binder this walk does not model — and that matches every frame rather than none.
 function cwFrameOfUse(ix: i32, nm: string): i32 {
   if ix < 0 || ix >= P.nodes.length { return CW_FR_UNKNOWN }
+  cwArenaSync()
   cwBuildFrames()
   let fr = cwFrameOf[ix]
   if fr == CW_FR_UNKNOWN { return CW_FR_UNKNOWN }
@@ -17454,7 +17465,7 @@ function cwSameFrame(a: i32, b: i32): boolean {
 // The frame a root identifier at `ix` resolves in — the key the alias set carries beside the
 // name, so two same-named handles in different functions are two values.
 export function covarRootFrame(ix: i32): i32 {
-  const p = cwPeel(ix)
+  const p = cwPeelValue(ix)
   if p < 0 || p >= P.nodes.length { return CW_FR_UNKNOWN }
   const n = P.nodes[p]
   if n is Ident { return cwFrameOfUse(p, n.identName) }
@@ -17465,6 +17476,22 @@ export function covarRootFrame(ix: i32): i32 {
 // D791 lowered a read-only covariant list assignment as an element-converting copy, licensed
 // by a rep-scoped predicate that declines on an unrelated list sharing an element rep — a
 // false reject clause 2 forbids. A per-value `Writable` answer instead (D793): 0 = safe to copy, 1 = refuse, 2 = unknown, fall back to the rep-scoped scan.
+
+// The emitter rewrites and the monomorphizer add nodes to the arena after `check`, so an
+// answer computed over the smaller arena describes a program that has since changed: drop the
+// alias-closure memo and the frames, which read every `Ident` in the arena.
+function cwArenaSync() {
+  if P.nodes.length != cwArenaLen {
+    cwRootNames = []
+    cwRootFrames = []
+    cwAnswers = []
+    cwSplits = []
+    cwWriteAts = []
+    cwFrameReset()
+    cwArenaLen = P.nodes.length
+  }
+  0
+}
 
 // The alias-closure memo, keyed by the root name that seeded the analysis. The arena does
 // not change between `check` and `emit`, so the two answers are literally the same row;
@@ -17518,11 +17545,31 @@ function cwPeel(ix: i32): i32 {
   cur
 }
 
-// The name an expression roots at — a bare (possibly parenthesised) identifier — or "". A
-// member read, index, call result or literal roots at nothing on purpose: those forms'
-// provenance this analysis does not follow, and "" routes them to the `2` answer.
-export function covarRootName(ix: i32): string {
+// `cwPeel`, and through an assignment used as a value to its right side, the value it yields
+// (D2411).
+function cwPeelValue(ix: i32): i32 {
   const p = cwPeel(ix)
+  const r = cwAsgRight(p)
+  if r < 0 { return p }
+  cwPeelValue(r)
+}
+
+// The right side of the plain assignment at `p`, or -1 for any other node.
+function cwAsgRight(p: i32): i32 {
+  if p < 0 || p >= P.nodes.length { return -1 }
+  const n = P.nodes[p]
+  if n is BinExpr {
+    if n.binOp == "=" && n.binCompound == "" { return n.binRight }
+  }
+  -1
+}
+
+// The name an expression roots at — a bare (possibly parenthesised) identifier, or what an
+// assignment used as a value yields — or "". A member read, index, call result or literal
+// roots at nothing on purpose: those forms' provenance this analysis does not follow, and ""
+// routes them to the `2` answer.
+export function covarRootName(ix: i32): string {
+  const p = cwPeelValue(ix)
   if p < 0 || p >= P.nodes.length { return "" }
   const n = P.nodes[p]
   if n is Ident { return n.identName }
@@ -17939,6 +17986,12 @@ function cwAliasUse(u: i32, names: string[], frs: i32[]): boolean {
       const ln = covarRootName(n.binLeft)
       if ln == "" { return false }
       cwAdd(names, frs, ln, covarRootFrame(n.binLeft))
+      // The assignment yields its right side, so a binding, a write or an argument that
+      // consumes the assignment is one more handle (D2411).
+      const vk = cwIxUpKind[up]
+      if vk == CW_UP_LETINIT || vk == CW_UP_ASG_RHS || vk == CW_UP_ARG {
+        return cwAliasUse(up, names, frs)
+      }
       return true
     }
     return false
@@ -18509,15 +18562,24 @@ function cwGrowAt(
   if k == CW_UP_ASG_RHS {
     const n = P.nodes[up]
     if n is BinExpr {
+      let st = 0
       const ln = covarRootName(n.binLeft)
       if ln == "" {
         // `m[k] = b` / `o.f = b` — the value goes inside something. Modelled where the
         // container roots at a once-bound name, which `cwEscapedFields` has just filed and
         // every read back out matches as a handle; otherwise it cannot be named.
         if cwEscapeOwner(cwPeel(n.binLeft)) == "" { return 2 }
-        return 0
+      } else if cwAdd(set, setFr, ln, covarRootFrame(n.binLeft)) {
+        st = 1
       }
-      if cwAdd(set, setFr, ln, covarRootFrame(n.binLeft)) { return 1 }
+      // The assignment yields its right side, so what consumes the assignment is one more
+      // edge the value crosses (D2411).
+      const vk = cwIxUpKind[up]
+      if vk == CW_UP_LETINIT || vk == CW_UP_ASG_RHS || vk == CW_UP_ARG {
+        const st2 = cwGrowAt(up, set, setFr, fowners, fownerFrs, flds)
+        if st2 != 0 { return st2 }
+      }
+      return st
     }
     return 0
   }
@@ -19028,18 +19090,7 @@ export function covarDeclFrame(ix: i32): i32 { cwFrameOfDecl(ix) }
 // the pair is the value, since one name may stand for a binding in each frame that spells it.
 export function covarValueWriteState(root: string, rootFr: i32): i32 {
   if root == "" { return 2 }
-  if P.nodes.length != cwArenaLen {
-    // The monomorphizer clones nodes into the arena after `check`, so an answer computed
-    // over the smaller arena describes a program that has since changed. Drop and
-    // recompute: this analysis reads every `Ident` in the arena and a clone adds Idents.
-    cwRootNames = []
-    cwRootFrames = []
-    cwAnswers = []
-    cwSplits = []
-    cwWriteAts = []
-    cwFrameReset()
-    cwArenaLen = P.nodes.length
-  }
+  cwArenaSync()
   let m = 0
   while m < cwRootNames.length {
     if cwRootNames[m] == root {
@@ -31990,6 +32041,11 @@ function finishInferredReturn(
           irAtoms(litUnionAliasNameOfTy(inferred), 1),
         )
       }
+      // A nullable list at an element type the nullable rung does not name (`string[] |
+      // null`): `synthRetAnnots` pins it as `synthNulListRetAnns` pins a named function (D2399).
+      if unm == "" {
+        unm = irRung(IR_RUNG_NUL_LIST_RET, nulListRetName(inferred))
+      }
     }
     // The width of the name this ladder settled on, handed over by the producer that
     // joined it rather than re-derived by splitting it (#1115). The rungs short-circuit, so
@@ -36994,6 +37050,10 @@ export function inferRetRungIsScalarListRet(i: i32): boolean {
 // Rungs 6 and 7 — `nullableRetName` and `nulLitUnionRetName`, the only producers that mint a
 // top-level nullable name. Both mint `<part> + "|null"` and nothing else, so asking "is this
 // row's name a nullable" is asking exactly which producer answered.
+export function inferRetRungIsNulListRet(i: i32): boolean {
+  inferRetRungAt(i) == IR_RUNG_NUL_LIST_RET
+}
+
 export function inferRetRungIsNullable(i: i32): boolean {
   const r = inferRetRungAt(i)
   r == IR_RUNG_NULLABLE || r == IR_RUNG_NUL_LITUNION
@@ -40837,6 +40897,8 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
     // assignment in place; a straight-line non-null write narrows for the rest of the block.
     const asgTgt = P.nodes[n.binLeft]
     if asgTgt is Ident {
+      while asgStoreTys.length <= ix { asgStoreTys.push(-1) }
+      asgStoreTys[ix] = asgLt
       const asgCur = lookup(asgTgt.identName)
       if asgCur >= 0 {
         // A write to a hole binding ends the pin's jurisdiction over it: the call site pins the
