@@ -102,7 +102,8 @@ print(f([4, 5, 6]))
     out: "15\n",
   },
   // Not proofs: an inclusive `to xs.length`, a bound that is not the receiver's length, and a
-  // loop variable the body reassigns. Each keeps its guard.
+  // loop variable the body reassigns. Each keeps its guard — in `range_to_len` on every one of
+  // the five body copies each loop carries (four per unrolled trip, one in the rolled rest).
   range_to_len: {
     src: `function f(xs: i32[], n: i32): i32 {
   let s = 0
@@ -113,7 +114,7 @@ print(f([4, 5, 6]))
 print(f([4, 5, 6], 2))
 `,
     gets: (n) => n === 0,
-    selects: 2,
+    selects: 10,
     out: "24\n",
   },
   range_rebound: {
