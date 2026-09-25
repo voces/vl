@@ -863,6 +863,17 @@ new: the compare-frame pre-pass never recurses into a code-15 field, so a NESTED
 
 ## Codegen, memory & runtime (Track B)
 
+- **Small constant range loops are unrolled, and a constant range bound is an immediate
+  (plumb PL-037 item 3).** `for i in 0 until 4` with literal or module-`const` ends, a literal
+  step, 1 to 16 trips, a call-free body (inline memory intrinsics aside) and at most 640 nodes
+  over all copies is emitted as one copy per trip reading `i` as a constant; `break` leaves the
+  copies and `continue` ends one. A body that writes the variable or holds a closure stays
+  rolled. Every other range loop compares against the constant bound directly instead of a
+  local binaryen's `-O` never folds. bench/vs-rust `matChain`: 2.53x → 1.13x Rust; the other
+  kernels unchanged. Bottom-tested loops were built and measured too, and are NOT shipped:
+  1.7–2.4x slower under wasmtime, neutral on V8. 0 distilled-corpus cells moved. DECISIONS.md,
+  "Loops stay top-tested" and "Small constant range loops are unrolled";
+  `tests/cases/loops/unrolled-range-loops.vl`, `loop-control-matrix.vl`.
 - **Memory intrinsics take a memarg offset (plumb PL-037 item 1).** `__load_i64__(p, 16)`,
   `__store_i32__(p, 8, v)`, `__load_v128__(p, 32)`, `__atomic_rmw_add_i32__(p, 4, 1)`: every
   scalar load and store, the v128 loads and store, and every atomic but the fence takes an
