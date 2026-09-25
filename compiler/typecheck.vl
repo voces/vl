@@ -715,6 +715,8 @@ const CSTR_ANYFN = -2
 let argCstrAt: i32[] = []
 let argCstrExp: i32[] = []
 let argCstrWho: string[] = []
+// The owning declaration, for the by-name `TyVar` reason `noteBinCstr` stamps one (D2424).
+let argCstrFn: i32[] = []
 
 // D401 — deferred `print` constraints over un-annotated-param and type-parameter holes.
 // `print` takes one value of `printDomainStr()`, and the two floors that say so
@@ -1464,7 +1466,7 @@ function tyReachesEmptyHole(ty: i32, depth: i32): boolean {
 // values or nullable inners. Gates `recordRepTyAdopt` for the union-softening case: an ObjLit
 // field value narrower than a destination union field softens the recorded rep, so a
 // same-fieldset twin resolves wrong; re-stamping the rep to the destination corrects it.
-function tyReachesUnion(ty: i32, depth: i32): boolean {
+export function tyReachesUnion(ty: i32, depth: i32): boolean {
   if ty < 0 || depth <= 0 { return false }
   const t = T.tys[ty]
   if t is TyUnion { return true }
@@ -3786,6 +3788,7 @@ export function initChecker() {
   argCstrAt = []
   argCstrExp = []
   argCstrWho = []
+  argCstrFn = []
   printCstrTy = []
   printCstrIx = []
   printCstrFn = []
@@ -9809,6 +9812,48 @@ function recordElemRepArrayLit(srcExpr: i32, dstTy: i32, depth: i32) {
   }
   0
 }
+// Record the destination record on a record literal delivered where a field's type differs
+// from its own (`{ k: [1, 2] }` into `{ k: f64[] }`), so the emitter builds the literal at the
+// destination's row and not at another row that shares its field names (D2437).
+function recordListFieldWidenAdopt(srcExpr: i32, dstTy: i32) {
+  if inferQuiet || srcExpr < 0 || dstTy < 0 { return 0 }
+  if tyDeeperThan(dstTy, 16) { return 0 }
+  let dtix = dstTy
+  const dN = T.tys[dtix]
+  if dN is TyNullable { dtix = dN.nInner }
+  if dtix < 0 { return 0 }
+  const d = T.tys[dtix]
+  const e = P.nodes[parenPeelIx(srcExpr)]
+  if !(d is TyObj) { return 0 }
+  // A union-bearing destination is the union-softening stamp's, in `assignableExpr`.
+  if tyReachesUnion(dtix, 8) { return 0 }
+  if e is ObjLit {
+    if e.objFields.length != d.objFieldNames.length { return 0 }
+    let differs = false
+    let k = 0
+    while k < e.objFields.length {
+      const f = P.nodes[e.objFields[k]]
+      if f is FieldInit {
+        let dj = -1
+        let j = 0
+        while j < d.objFieldNames.length {
+          if d.objFieldNames[j] == f.fiName { dj = j }
+          j = j + 1
+        }
+        if dj < 0 { return 0 }
+        const own = nodeTyIxOf(f.fiValue)
+        if own < 0 { return 0 }
+        if !tyEq(own, d.objFieldTypes[dj]) { differs = true }
+      } else {
+        return 0
+      }
+      k = k + 1
+    }
+    if differs { return recordRepTyAdopt(srcExpr, dtix, 6) }
+  }
+  0
+}
+
 // True when the type at `ti` carries a bare-`null` hole in a struct-field or array-element position
 // (`{f: null}`, `{f: {f: null}}`, `null[]` inside a field): such a render is a literal's own
 // structural inference, never a spellable annotation, so no registered shape row can match it and a
@@ -10216,6 +10261,7 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
   // array element too, not just this expression-level entry.
   recordElemRepArrayLit(srcExpr, dstTy, 6)
   recordNullHoleObjAdopt(srcExpr, dstTy, 6)
+  recordListFieldWidenAdopt(srcExpr, dstTy)
   // A hex / binary / octal literal is a bit pattern of the destination's width, and this seam is
   // where every binding / argument / return / field / element / store position delivers one.
   if radixLitAdoptDst(srcExpr, dstTy) == 2 { return true }
@@ -24780,14 +24826,18 @@ function binOpDefinedFor(op: string, lt0: i32, rt0: i32) {
 // of the enclosing body's own holes, which surfaces through that hole's own bindings instead.
 function noteArgCstr(at: i32, exp: i32, who: string) {
   if tyIsDeferredJoin(exp) { return 0 }
+  const owner = cstrOwnerTop()
   let k = 0
   while k < argCstrAt.length {
-    if argCstrAt[k] == at && argCstrExp[k] == exp { return 0 }
+    if argCstrAt[k] == at && argCstrExp[k] == exp && argCstrFn[k] == owner {
+      return 0
+    }
     k = k + 1
   }
   argCstrAt.push(at)
   argCstrExp.push(exp)
   argCstrWho.push(who)
+  argCstrFn.push(owner)
   0
 }
 
@@ -25068,6 +25118,7 @@ function solveUnannotParams(fnIx: i32) {
       argCstrAt.pop()
       argCstrExp.pop()
       argCstrWho.pop()
+      argCstrFn.pop()
     }
     while printCstrTy.length > savedPrintN {
       printCstrTy.pop()
@@ -25171,17 +25222,26 @@ function validateEscJoins(bNames: string[], bTys: i32[]) {
   0
 }
 
-// Re-validates every deferred call-argument constraint this call resolves: substitutes the
-// hole to the call's concrete argument type and checks it against the recorded param type. A
-// hole that substitutes to another hole (the callee's hole re-based to the caller's) is
-// re-recorded under that hole, or nothing re-checks it once the outer call finally pins it.
-function validateArgCstrs(bNames: string[], bTys: i32[], ix: i32) {
+// Re-validates every deferred call-argument constraint this call's callee owns
+// (`cstrOwnedBy`), substituting the hole to the call's argument type. A hole that substitutes
+// to another hole is re-recorded under it for the outer call that pins it, and only where the
+// callee is named, as `validateBinCstrs` does.
+function validateArgCstrs(
+  bNames: string[],
+  bTys: i32[],
+  ix: i32,
+  calleeFn: i32,
+) {
   const nOrig = argCstrAt.length
   let ci = 0
   while ci < nOrig {
+    if !cstrOwnedBy(argCstrFn[ci], calleeFn) {
+      ci = ci + 1
+      continue
+    }
     const rat = substTyDeep(argCstrAt[ci], bNames, bTys)
     const rexp = substTyDeep(argCstrExp[ci], bNames, bTys)
-    if rat != argCstrAt[ci] {
+    if rat != argCstrAt[ci] && calleeFn >= 0 {
       if tyIsHole(rat) || tyIsDeferredJoin(rat) {
         if !tyIsHole(rexp) { noteArgCstr(rat, rexp, argCstrWho[ci]) }
       }
@@ -29965,7 +30025,7 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
     )
     validatePrintCstrs(bNames, bTys, ix, cstrCallee, cstrWho)
     validateNestCstrs(bNames, bTys, ix, cstrCallee, cstrWho)
-    validateArgCstrs(bNames, bTys, ix)
+    validateArgCstrs(bNames, bTys, ix, cstrCallee)
     // The declared return rides the same pin: the body's mismatch check is vacuous under
     // a hole, and this is the first position that knows the instance (D551).
     validateRetCstrs(bNames, bTys, ix, cstrCallee, cstrWho)
