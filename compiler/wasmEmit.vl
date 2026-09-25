@@ -9220,23 +9220,80 @@ function emitListIdxGuardHoisted(row: i32, idxIx: i32) {
 // the arm asking. The rep check is the backstop that makes a classifier disagreement
 // between the prologue and the access decline, rather than read a wrongly-typed local.
 function liveHoistRow(exprIx: i32, kind: MfKind, slot: i32) {
-  if exprIx < 0 { return 0 - 1 }
-  const e = P.nodes[exprIx]
-  if e is Ident {
-    let k = 0
-    while k < lhName.length {
-      if (
-        lhLive[k] > 0
-        && lhName[k] == e.identName
-        && lhKind[k] == kind
-        && lhSlot[k] == slot
-      ) {
-        return k
-      }
-      k = k + 1
+  const nm = hoistPathName(exprIx)
+  if nm == "" { return 0 - 1 }
+  let k = 0
+  while k < lhName.length {
+    if (
+      lhLive[k] > 0
+      && lhName[k] == nm
+      && lhKind[k] == kind
+      && lhSlot[k] == slot
+    ) {
+      return k
     }
+    k = k + 1
   }
   0 - 1
+}
+
+// The name a hoist row caches the receiver at `ix` under: a bare identifier's own name, or
+// `b.xs` for a field of one; "" for any other receiver. `.` opens no identifier, so the two
+// forms never collide.
+function hoistPathName(ix: i32): string {
+  if ix < 0 || ix >= P.nodes.length { return "" }
+  const e = P.nodes[ix]
+  if e is Ident { return e.identName }
+  if e is Member {
+    const o = P.nodes[e.memObj]
+    if o is Ident { return o.identName + "." + e.memProp }
+  }
+  ""
+}
+
+// Whether field receiver `memIx` (`b.xs`, `b` an identifier) lowers to one `struct.get` of a
+// plain struct field, so the prologue may read it ahead of the loop: not a union, variant or
+// nullable receiver, and not a narrowed read, each of which lowers through a dispatch or a guard.
+function hoistFieldRecvOk(memIx: i32, fnIx: i32): boolean {
+  const m = P.nodes[memIx]
+  if m is Member {
+    const o = m.memObj
+    if memIsNarrowed(memIx) || exprUnion(o, fnIx) || exprNullableStruct(o, fnIx) {
+      return false
+    }
+    if exprVariantIndex(o, fnIx) >= 0 || nulVariantIdxOfExpr(o, fnIx) >= 0 {
+      return false
+    }
+    const si = structIndexOfExpr(o, fnIx)
+    return si >= 0 && sFieldIndex(si, m.memProp) >= 0
+  }
+  false
+}
+
+// Does the code under `ix` assign a field named `prop`, of any receiver? A cached `b.xs` is stale
+// after `c.xs = …` whenever `c` aliases `b`, and the name is all that can be compared here.
+function stmtAssignsProp(ix: i32, prop: string): boolean {
+  let cur = ix
+  while cur >= 0 {
+    if cur >= P.nodes.length { return false }
+    const n = P.nodes[cur]
+    if n is BinExpr {
+      if n.binOp == "=" {
+        const t = P.nodes[unwrapParen(n.binLeft)]
+        if t is Member {
+          if t.memProp == prop { return true }
+        }
+      }
+    }
+    const kids = nodeSpineChildren(cur)
+    let i = 0
+    while i < kids.length {
+      if stmtAssignsProp(kids[i], prop) { return true }
+      i = i + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  false
 }
 
 // Find (or mint) the hoist row for `name` at list rep (`kind`, `slot`). Minting
@@ -9700,8 +9757,8 @@ function hoistScanExpr(ix: i32) {
   const e = P.nodes[ix]
   if e is Index {
     hmIdxSeen = hmIdxSeen + 1
-    const recv = P.nodes[e.idxArr]
-    if recv is Ident { hoistScanAdd(recv.identName, ix) }
+    const pn = hoistPathName(e.idxArr)
+    if pn != "" { hoistScanAdd(pn, ix) }
     hoistScanExpr(e.idxArr)
     hoistScanExpr(e.idxIndex)
     return 0
@@ -9848,9 +9905,28 @@ function loopHoistOpen(
   let i = 0
   while i < lhScanName.length {
     const nm = lhScanName[i]
-    let ok = nm != ownVar && nm != ownVar2
-    if ok && exprReboundsName(condIx, nm) { ok = false }
-    if ok && blockReboundsName(bodyIx, nm) { ok = false }
+    // A field path `b.xs` is held to its root's rebinding, to no write of any `xs` field in
+    // the loop, and to a receiver that reads as one plain `struct.get`.
+    let root = nm
+    let prop = ""
+    const scanned = P.nodes[lhScanRep[i]]
+    if scanned is Index {
+      const recv = P.nodes[scanned.idxArr]
+      if recv is Member {
+        const ro = P.nodes[recv.memObj]
+        if ro is Ident { root = ro.identName }
+        prop = recv.memProp
+      }
+    }
+    let ok = root != ownVar && root != ownVar2
+    if ok && exprReboundsName(condIx, root) { ok = false }
+    if ok && blockReboundsName(bodyIx, root) { ok = false }
+    if ok && prop != "" {
+      if stmtAssignsProp(condIx, prop) || stmtAssignsProp(bodyIx, prop) { ok = false }
+      if ok && scanned is Index {
+        if !hoistFieldRecvOk(scanned.idxArr, fnIx) { ok = false }
+      }
+    }
     if ok {
       const rep = P.nodes[lhScanRep[i]]
       if rep is Index {
@@ -9939,8 +10015,7 @@ function rangeTopLenOf(s: ForRange) {
   const m = P.nodes[top]
   if m is Member {
     if m.memProp != "length" { return "" }
-    const o = P.nodes[m.memObj]
-    if o is Ident { return o.identName }
+    return hoistPathName(m.memObj)
   }
   ""
 }
