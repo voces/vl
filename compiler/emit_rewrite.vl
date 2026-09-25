@@ -10,6 +10,7 @@ import { arrElemNameRaw, nameIsArray, nameIsSpaceFree } from "./tyname"
 import {
   TY_I32,
   annUnionAtomsOf,
+  asgAnyWiderStore,
   asgStoreTyOf,
   forInBindTy,
   ifYieldsNoValue,
@@ -1233,17 +1234,11 @@ function asvLeafMayWrite(ix: i32): boolean { !exprReReadable(ix) }
 // D2285's does), the value is not a bare `null`, and no operand already passed reads the name
 // or anything `e` may write.
 function asvMoves(asgIx: i32): boolean {
+  if !asvTypeMoves(asgIx) { return false }
   const a = P.nodes[asgIx]
   if !(a is BinExpr) { return false }
-  if a.binOp != "=" || a.binCompound != "" { return false }
   const t = P.nodes[a.binLeft]
   if !(t is Ident) { return false }
-  if P.nodes[unwrapParen(a.binRight)] is NullLit { return false }
-  const lt = asgStoreTyOf(asgIx)
-  const vt = nodeTyIxOf(asgIx)
-  if lt < 0 || vt < 0 || tySame(lt, vt) { return false }
-  if tyIsLitUnionOrLit(nonNullTy(lt)) || tyIsLitUnionOrLit(vt) { return false }
-  if tyHasTyVar(lt) || tyHasTyVar(vt) { return false }
   let i = 0
   let spilled = true
   while i < asvReads.length {
@@ -1252,6 +1247,22 @@ function asvMoves(asgIx: i32): boolean {
     i = i + 1
   }
   spilled || !asvMayWrite(a.binRight)
+}
+
+// `asvMoves`'s half that reads only the write at `asgIx`: a plain write to a name whose
+// storage type is not the value's, where neither is a literal-union atom or holds a type
+// variable, and the value is not a bare `null`.
+function asvTypeMoves(asgIx: i32): boolean {
+  const a = P.nodes[asgIx]
+  if !(a is BinExpr) { return false }
+  if a.binOp != "=" || a.binCompound != "" { return false }
+  if !(P.nodes[a.binLeft] is Ident) { return false }
+  if P.nodes[unwrapParen(a.binRight)] is NullLit { return false }
+  const lt = asgStoreTyOf(asgIx)
+  const vt = nodeTyIxOf(asgIx)
+  if lt < 0 || vt < 0 || tySame(lt, vt) { return false }
+  if tyIsLitUnionOrLit(nonNullTy(lt)) || tyIsLitUnionOrLit(vt) { return false }
+  !(tyHasTyVar(lt) || tyHasTyVar(vt))
 }
 
 // Walks the operands of `ix` that run first, moving each value-position write `asvMoves`
@@ -1291,9 +1302,14 @@ function asvWalk(ix: i32, out: i32[], isValue: boolean): i32 {
     if callee is Member {
       callee.memObj = asvWalk(callee.memObj, out, true)
       asvPassOperand(callee.memObj)
-    } else if !(callee is Ident) {
+    } else if callee is Ident {
+      // A callee a binding holds is read before the arguments run.
+      if asvIsBound(callee.identName) { asvPassOperand(n.callFn) }
+    } else {
       asvStop = true
     }
+    // Named arguments run in parameter order, not source order (D2343), so none moves.
+    if hasNamedArgs(n.callArgNames) { return asvHalt(ix) }
     asvWalkList(n.callArgs, out)
     return ix
   }
@@ -1372,19 +1388,26 @@ function asvWalkObj(ix: i32, n: ObjLit, out: i32[]): i32 {
   ix
 }
 
+// Passes the operands a write's target `ti` evaluates before its right side: a field's
+// receiver, or an element's receiver and index. A name evaluates none; any other target ends
+// the walk.
+function asvPassTarget(ti: i32) {
+  if ti < 0 { return asvHalt(ti) }
+  const t = P.nodes[ti]
+  if t is Member { return asvPassOperand(t.memObj) }
+  if t is Index {
+    asvPassOperand(t.idxArr)
+    return asvPassOperand(t.idxIndex)
+  }
+  if t is Ident { return 0 }
+  asvHalt(ti)
+}
+
 // An assignment on the leading path: its right side runs first; a name target of a value
 // write `asvMoves` accepts becomes `const v = e; a = v` on `out` and the read of `v`. A field
 // or element target is walked only when its receiver and index are names or literals.
 function asvWalkWrite(ix: i32, n: BinExpr, out: i32[], isValue: boolean): i32 {
-  const t = P.nodes[unwrapParen(n.binLeft)]
-  if t is Member {
-    asvPassOperand(t.memObj)
-  } else if t is Index {
-    asvPassOperand(t.idxArr)
-    asvPassOperand(t.idxIndex)
-  } else if !(t is Ident) {
-    asvStop = true
-  }
+  asvPassTarget(unwrapParen(n.binLeft))
   n.binRight = asvWalk(n.binRight, out, true)
   if asvStop || !isValue || !asvMoves(ix) { return ix }
   if asvTopLet { asvStop = true }
@@ -1445,16 +1468,56 @@ function asvStmt(ix: i32, out: i32[]) {
 
 // The start function's order key for the top-level nodes this pass minted, beside the node:
 // a block keeps its statement's key, and a moved write takes one less than its binding's.
-let asvKeyNode: i32[] = []
-let asvKeyVal: i32[] = []
+// Indexed by node, -1 for a node the pass did not mint.
+let asvKeyOf: i32[] = []
+
+// Every name a `let` or a parameter binds, so a call through a binding reads it; built on
+// the first question, since most programs never ask one.
+let asvBound: {[string]: i32} = Map()
+let asvBoundBuilt = false
+
+// Records the name the `let` at `ix` binds, if it is one.
+function asvNoteLet(ix: i32) {
+  const bn = P.nodes[ix]
+  if bn is LetDecl { asvBound[bn.letName] = 1 }
+  0
+}
+
+// Records the name the parameter at `ix` binds, if it is one.
+function asvNoteParam(ix: i32) {
+  const bn = P.nodes[ix]
+  if bn is Param { asvBound[bn.parName] = 1 }
+  0
+}
+
+// Whether some `let` or parameter binds `name`.
+function asvIsBound(name: string): boolean {
+  if !asvBoundBuilt {
+    asvBoundBuilt = true
+    const n = P.nodes.length
+    let i = 0
+    while i < n {
+      asvNoteLet(i)
+      asvNoteParam(i)
+      i = i + 1
+    }
+  }
+  (asvBound[name] ?? 0) == 1
+}
+
+// Records `key` as the start-function order key of top-level node `ix`.
+function asvSetKey(ix: i32, key: i32) {
+  while asvKeyOf.length <= ix { asvKeyOf.push(-1) }
+  asvKeyOf[ix] = key
+  0
+}
 
 // The start function's order key for top-level node `ix`: `topStmtOrderKey`'s, unless this
 // pass moved the node ahead of a binding.
 export function startOrderKey(ix: i32): i32 {
-  let i = 0
-  while i < asvKeyNode.length {
-    if asvKeyNode[i] == ix { return asvKeyVal[i] }
-    i = i + 1
+  if ix >= 0 && ix < asvKeyOf.length {
+    const k = asvKeyOf[ix]
+    if k >= 0 { return k }
   }
   topStmtOrderKey(ix)
 }
@@ -1473,16 +1536,14 @@ function asvList(stmts: i32[], top: boolean) {
     if cn > 0 {
       if top && !asvTopLet {
         const blk = mkBareBlockIf(mkBlock(out, -1), P.nodes[stmts[i]].pos)
-        asvKeyNode.push(blk)
-        asvKeyVal.push(topStmtOrderKey(stmts[i]))
+        asvSetKey(blk, topStmtOrderKey(stmts[i]))
         out.push(stmts[i])
         stmts[i] = blk
       } else {
         if asvTopLet {
           let k = 0
           while k < cn {
-            asvKeyNode.push(out[k])
-            asvKeyVal.push(topStmtOrderKey(stmts[i]) - 1)
+            asvSetKey(out[k], topStmtOrderKey(stmts[i]) - 1)
             k = k + 1
           }
         }
@@ -1571,9 +1632,12 @@ function asvChainHasElse(ix: i32): boolean {
 
 // The pass: every statement list in the arena, before collection reads the module's bindings.
 export function assignValueSpill(stmts: i32[]) {
-  asvKeyNode = []
-  asvKeyVal = []
+  asvKeyOf = []
+  asvBound = Map()
+  asvBoundBuilt = false
   const n = P.nodes.length
+  // A program whose every write stores its right side's own type has nothing to move.
+  if !asgAnyWiderStore() { return 0 }
   let i = 0
   while i < n {
     const nd = P.nodes[i]

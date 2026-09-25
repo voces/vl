@@ -2689,11 +2689,15 @@ let fnDeclIx: {[string]: i32} = Map()
 // The `__memory_shared__()` Call nodes that denote the build intrinsic rather than a local of
 // that name; `foldMemShared` folds an `if` only on one of these. Reset by `initChecker`.
 export let memSharedCalls: i32[] = []
-// By assignment node: the storage type of a name target, which a narrowed read type hides; -1
-// where the node has no name target. Reset by `initChecker`.
+// By assignment node: the storage type of a name target, which a narrowed read type hides,
+// where it is not the right side's type; -1 elsewhere. Reset by `initChecker`.
 let asgStoreTys: i32[] = []
 
-// The storage type the name target of assignment `ix` is checked against, or -1.
+// Whether any assignment's name target stores a type other than its right side's.
+export function asgAnyWiderStore(): boolean { asgStoreTys.length > 0 }
+
+// The storage type the name target of assignment `ix` is checked against where it is not the
+// right side's type, or -1.
 export function asgStoreTyOf(ix: i32): i32 {
   if ix < 0 || ix >= asgStoreTys.length { return -1 }
   asgStoreTys[ix]
@@ -17441,8 +17445,9 @@ function cwBuildFrames() {
 // binder this walk does not model — and that matches every frame rather than none.
 function cwFrameOfUse(ix: i32, nm: string): i32 {
   if ix < 0 || ix >= P.nodes.length { return CW_FR_UNKNOWN }
-  cwArenaSync()
   cwBuildFrames()
+  // A node the frame walk has no row for (a rewrite added it) answers the coarsest frame.
+  if ix >= cwFrameOf.length { return CW_FR_UNKNOWN }
   let fr = cwFrameOf[ix]
   if fr == CW_FR_UNKNOWN { return CW_FR_UNKNOWN }
   const sid = sidOf(nm)
@@ -40897,8 +40902,13 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
     // assignment in place; a straight-line non-null write narrows for the rest of the block.
     const asgTgt = P.nodes[n.binLeft]
     if asgTgt is Ident {
-      while asgStoreTys.length <= ix { asgStoreTys.push(-1) }
-      asgStoreTys[ix] = asgLt
+      if rt >= 0 && asgLt >= 0 && !tySame(asgLt, rt) {
+        while asgStoreTys.length <= ix { asgStoreTys.push(-1) }
+        asgStoreTys[ix] = asgLt
+      } else if ix < asgStoreTys.length {
+        // A re-check whose types now agree retires the earlier answer.
+        asgStoreTys[ix] = -1
+      }
       const asgCur = lookup(asgTgt.identName)
       if asgCur >= 0 {
         // A write to a hole binding ends the pin's jurisdiction over it: the call site pins the

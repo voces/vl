@@ -62,7 +62,7 @@ tree ungraded.
 | `moduleLocalLetPlan` (`mllSort*`) | the NAME; dropped with its table by `resetParentLetCache` | none: the module block-local table is built once and reset wholesale | probe |
 | `elemRowsCaptureWalk` (`ercGenP`/`ercStamp`) | **`emitPassGen`**, and a per-walk stamp so a new walk clears nothing | none: the table is rebuilt when the pass generation moves, and a slot is dead the moment its walk id is stale | pass-stamped |
 | `closureCaptureNames` (`capMemoGen`/`capMemoStamp`, D2017) | **`emitPassGen`**, `P.nodes.length`, a reported-edit count | none reachable: armed only inside `computeRetInference`, `computeRetInference#2` and `dispatchRewrite`; the first two write no table `capScan` reads, and every rewrite either mints a node or calls `capMemoNoteEdit` | pass-stamped |
-| `covarValueWriteState` (`cwArenaLen`, checked in `cwArenaSync`, which `cwFrameOfUse` also calls since D2398) | `P.nodes.length` | its own `cwIx*` index, dropped with it; and `nodeRepTyIx`, a checker sidecar written in place | probe |
+| `covarValueWriteState` (`cwArenaLen`, checked in `cwArenaSync`) | `P.nodes.length` | its own `cwIx*` index, dropped with it; and `nodeRepTyIx`, a checker sidecar written in place | probe |
 
 ## The `probe` verdict is a measurement — one row at a time
 
