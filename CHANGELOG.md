@@ -863,6 +863,19 @@ new: the compare-frame pre-pass never recurses into a code-15 field, so a NESTED
 
 ## Codegen, memory & runtime (Track B)
 
+- **Small variable-trip range loops and list walks run four body copies per trip; a list
+  reached through a field is cached ahead of a loop (plumb PL-037 item 4).** `for i in 0 until n`
+  with step 1, and a `for x in xs` whose header is hoisted, copy a body of at most 40 cheap
+  nodes (scalar operators, locals, field reads, `if`, `let`, list and string index, loop control,
+  inline memory intrinsics) four times while four trips remain, then finish rolled; copy `k`
+  reads the loop variable as `u + k`. `b.xs[i]` in a call-free loop that assigns no `xs` field
+  reads `b.xs`'s backing and `len` once, and `until b.xs.length` drops the index guard as
+  `until xs.length` does. bench/vs-rust `array`: 1.9x → 1.5x Rust, the others unchanged. What remains is V8's
+  `array.get` bounds check (30% of the unrolled sum, not elidable) and push growth (WasmGC has
+  no `realloc`). 0 distilled-corpus cells moved. DECISIONS.md, "Small variable-trip range loops
+  are unrolled 4x"; `tests/cases/loops/partial-unroll-range-loops.vl`,
+  `list-mutation-in-loop-matrix.vl`, and five `tests/cases/traps/` rounds pinned by
+  `tests/vl_hoist_trap_iteration_test.ts`.
 - **Shift/mask strength reduction (plumb PL-037 item 2).** `((x >>> k) & m) << j`, and the
   same with `* 2^j` on either side, is emitted as one shift and one mask:
   `(x >>> (k-j)) & (m << j)`, or `(x << (j-k)) & (m << j)` when j > k, and a bare mask when
