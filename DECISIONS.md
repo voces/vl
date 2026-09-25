@@ -7890,7 +7890,10 @@ conservative rule is the sound floor it would refine.
   the path for the emitter to retire after that statement, as it banks a bare name, so the
   re-test the diagnostic asks for narrows again; a read later in the same statement is still
   refused. A narrowing of an enclosing function stays a refusal, since the emitter retires only
-  the function it is lowering.
+  the function it is lowering; so does one ended inside a body with an un-annotated parameter,
+  or by a method on a receiver not yet typed, since the re-check at each call's argument types
+  decides, and a declared-type read settled earlier would reach it against types it never saw.
+  A map's `set` ends a narrowing of the key it writes, like `m[k] = v`; `push` ends none.
 * *A call to a `const`-bound lambda that writes no place is a call to its body* for the path
   rule, so it ends nothing: the body assigns only bare names and calls only intrinsics that
   remove nothing and take no function. Any other lambda stays opaque, because the write
