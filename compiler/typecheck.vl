@@ -5942,6 +5942,7 @@ let crStmtRd: i32[] = []
 let crPendNames: string[] = []
 let crPendCalls: i32[] = []
 let crPendNarTys: i32[] = []
+let crPendDepths: i32[] = []
 // Every retirement, for the note on a later misuse: the name, the call, the narrowed type, the
 // type it reads at now, and the root it happened under.
 let crRetNames: string[] = []
@@ -5972,7 +5973,6 @@ let crwFnWrites: string[] = []
 let crwFnMentions: string[] = []
 let crwUseNames: string[] = []
 let crwUseKinds: i32[] = []
-let crwUseFns: i32[] = []
 let crwBound = ","
 let crwStack: i32[] = []
 let crwCallee: {[i32]: boolean} = Map()
@@ -5994,6 +5994,7 @@ function crReset() {
   crPendNames = []
   crPendCalls = []
   crPendNarTys = []
+  crPendDepths = []
   crRetNames = []
   crRetCalls = []
   crRetNarTys = []
@@ -6062,6 +6063,7 @@ function crStmtLeave() {
     crPendNames.pop()
     crPendCalls.pop()
     crPendNarTys.pop()
+    crPendDepths.pop()
   }
   const rb = crStmtRd[top]
   while crRdRet.length > rb {
@@ -6091,7 +6093,6 @@ function crwEnsure(root: i32) {
   crwFnMentions = []
   crwUseNames = []
   crwUseKinds = []
-  crwUseFns = []
   crwBound = ","
   crwStack = []
   crwCallee = Map()
@@ -6144,9 +6145,6 @@ function crwVisit(ix: i32) {
     if crwCallee[ix] ?? false { kind = 1 }
     crwUseNames.push(n.identName)
     crwUseKinds.push(kind)
-    let inner = -1
-    if crwStack.length > 0 { inner = crwStack[crwStack.length - 1] }
-    crwUseFns.push(inner)
     let s = 0
     while s < crwStack.length {
       const f = crwStack[s]
@@ -6212,7 +6210,7 @@ function crwMentionsAny(mentions: string, handles: string): boolean {
 // Whether a closure of the current root writes `name`, and whether one that can reach such a
 // writer escaped: 0 / 1 / 2 as `crInfoMemo` documents. A reacher is a function that writes the
 // name or mentions a reacher's name; it escapes when it is unbound, or its name is used other
-// than as a callee, an assignment target, or inside another reacher.
+// than as a callee or an assignment target, inside another reacher or not.
 function crInfoOf(name: string): i32 {
   const root = crCurRoot()
   const key = i32ToStr(root) + "#" + name
@@ -6259,10 +6257,7 @@ function crInfoOf(name: string): i32 {
     let u = 0
     while u < crwUseNames.length && info == 1 {
       if handles.indexOf("," + crwUseNames[u] + ",") >= 0 {
-        if crwUseKinds[u] == 0 {
-          const uf = crwUseFns[u]
-          if uf < 0 || !reach[uf] { info = 2 }
-        }
+        if crwUseKinds[u] == 0 { info = 2 }
       }
       u = u + 1
     }
@@ -6279,7 +6274,31 @@ function crCallReaches(callIx: i32, name: string): boolean {
   if callIx < 0 || callIx >= P.nodes.length { return false }
   const cn = P.nodes[callIx]
   if cn is Call { return crCallNodeReaches(cn, callIx, name) }
-  crInfoOf(name) == 2
+  const info = crInfoOf(name)
+  if info == 0 { return false }
+  if info == 2 { return true }
+  crOpIsReacher(crOpOf(callIx), name)
+}
+
+// The operator of a binary node, or "" for any other node — which `crOpIsReacher` answers true
+// for, a call of no known shape reaching whatever it might.
+function crOpOf(ix: i32): string {
+  const n = P.nodes[ix]
+  if n is BinExpr { return n.binOp }
+  ""
+}
+
+// Is a declaration of operator `op` (`+`, or a receiver-keyed `+@P`) a reacher of `name`?
+// Asked of every declaration of `op`, since which one dispatched is the receiver's business.
+function crOpIsReacher(op: string, name: string): boolean {
+  if op == "" { return true }
+  const hs = weSplit(crHandleMemo[i32ToStr(crCurRoot()) + "#" + name] ?? ",")
+  let i = 0
+  while i < hs.length {
+    if hs[i] == op || opDeclOpOf(hs[i]) == op { return true }
+    i = i + 1
+  }
+  false
 }
 
 // `crCallReaches` for a `Call`: its callee named by a reacher's name (bare or as a method), a
@@ -6298,6 +6317,7 @@ function crCallNodeReaches(cn: Call, callIx: i32, name: string): boolean {
 // in place that call only such calls and do not write `name`. A callee named by a binding of the
 // root counts as user code even before that binding is in scope.
 function crCallBenign(cn: Call, name: string): boolean {
+  if crIsScalarRender(cn) { return true }
   const cf = P.nodes[cn.callFn]
   if cf is Ident {
     if crwBound.indexOf("," + cf.identName + ",") >= 0 { return false }
@@ -6318,6 +6338,39 @@ function crCallBenign(cn: Call, name: string): boolean {
   }
   true
 }
+
+// An interpolation hole's renderer over a scalar: std:fmt's `toString` of a primitive or a
+// union of them, which dispatches to no user code. A struct hole may reach a user `toString`.
+function crIsScalarRender(cn: Call): boolean {
+  if cn.callArgs.length != 1 { return false }
+  const a = cn.callArgs[0]
+  if !nodeIsTplHole(a) { return false }
+  let t = nodeTyOf(a)
+  if t < 0 {
+    const an = P.nodes[a]
+    if an is Ident { t = lookup(an.identName) }
+  }
+  crTyIsScalar(t)
+}
+
+function crTyIsScalar(t0: i32): boolean {
+  if t0 < 0 || t0 >= T.tys.length { return false }
+  const t = nonNullTy(t0)
+  if t < 0 || t >= T.tys.length { return false }
+  const tt = T.tys[t]
+  if tt is TyUnion {
+    let i = 0
+    while i < tt.uMembers.length {
+      if !crTyIsScalar(tt.uMembers[i]) { return false }
+      i = i + 1
+    }
+    return true
+  }
+  crTyIsLeafScalar(tt)
+}
+
+// A primitive or a literal type: nothing a renderer can dispatch on to user code.
+function crTyIsLeafScalar(tt: Ty): boolean { tt is TyPrim || tt is TyLit }
 
 // Whether the subtree at `ix` neither writes `name` nor makes a call `crCallBenign` refuses.
 function crSubtreeBenign(ix: i32, name: string): boolean {
@@ -6459,6 +6512,7 @@ function crRetire(name: string, callIx: i32, atLoop: boolean, stmtIx: i32) {
     crPendNames.push(name)
     crPendCalls.push(callIx)
     crPendNarTys.push(cur)
+    crPendDepths.push(crStmtIxs.length)
     crAfterBank[stmtIx] = crwAddName(crAfterBank[stmtIx] ?? ",", name)
   }
   0
@@ -6572,16 +6626,23 @@ function crReadHook(name: string, ix: i32): i32 {
   let p = crPendNames.length - 1
   while p >= 0 {
     if crPendNames[p] == name {
+      let tail = " earlier in this statement may reassign it — read '"
+        + name
+        + "' in a statement after the call, and re-test it there"
+      // Read inside a block the call's statement holds — an `if` arm the call's condition guards.
+      if crStmtIxs.length > crPendDepths[p] {
+        tail = ", in the statement that holds this one, may reassign it — '"
+          + name
+          + "' can be read again after that statement"
+      }
       tErrCoded(
         "'"
           + name
           + "' is no longer narrowed to "
           + tyToStr(crPendNarTys[p])
           + ": "
-          + crCallDesc(crPendCalls[p])
-          + " earlier in this statement may reassign it — read '"
-          + name
-          + "' in a statement after the call, and re-test it there",
+          + crCallDesc(crPendCalls[p], false)
+          + tail,
         ix,
         CODE_NARROWING_ENDED_BY_CALL,
       )
@@ -6617,14 +6678,14 @@ function crMisuseNote(msg: string, at: i32): string {
     const hit = crSpans(at, crRdIx[i])
       || msg.indexOf(tyToStr(crRetWideTys[r])) >= 0
     if hit && msg.indexOf("'" + nm + "' is no longer") < 0 {
-      let where = " on line " + i32ToStr(nodeLineOf(crRetCalls[r]))
-      if crRetLoops[r] { where = where + " in the loop around this read" }
+      let where = ""
+      if crRetLoops[r] { where = " in the loop around this read" }
       return " — '"
         + nm
         + "' is no longer narrowed to "
         + tyToStr(crRetNarTys[r])
         + ": "
-        + crCallDesc(crRetCalls[r])
+        + crCallDesc(crRetCalls[r], true)
         + where
         + " may reassign it; re-test '"
         + nm
@@ -6656,13 +6717,18 @@ function crSpans(outer: i32, inner: i32): boolean {
   t >= a && t <= nodeLastTok(outer)
 }
 
-// How a diagnostic names the call at `ix`: a declared operator is a call too.
-function crCallDesc(ix: i32): string {
+// How a diagnostic names the call at `ix`, a declared operator being a call too; a callee with
+// no name (`fs[0]()`) is named by its line alone.
+function crCallDesc(ix: i32, withLine: boolean): string {
+  let d = "the call"
+  const nm = calleeNameOf(ix)
+  if nm != "?" { d = "the call to '" + nm + "'" }
   if ix >= 0 && ix < P.nodes.length {
     const n = P.nodes[ix]
-    if n is BinExpr { return "the operator '" + n.binOp + "'" }
+    if n is BinExpr { d = "the operator '" + n.binOp + "'" }
   }
-  "the call to '" + calleeNameOf(ix) + "'"
+  if withLine { d = d + " on line " + i32ToStr(nodeLineOf(ix)) }
+  d
 }
 
 // The emitter's reads of the banks above; each answer is a list of bare names.

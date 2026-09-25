@@ -7815,14 +7815,20 @@ code):
   binding). Once one escaped, every call reaches except one that provably runs no user code: an
   intrinsic whose arguments are literals, values whose type holds no function, or lambdas written
   in place that themselves call only such calls and do not write `v`;
-* an operator that dispatched to a declaration (`function "+"`, an operator closure field) is a
-  call naming no function, so it reaches only an escaped writer.
+* an operator that dispatched to a declaration is a call to that declaration: it reaches when a
+  declaration of that operator is itself a reacher (its body calls or writes the writer), or
+  when a writer has escaped. An operator closure field reaches only an escaped writer.
 
 A writer that is a local `const` and is only ever called by name has not escaped, so
-`xs.map((x) => x + 1)` keeps the narrowing and `xs.map((x) => { k(); x })` ends it. When unsure,
-the rule treats the writer as escaped. It is name-based and flow-insensitive: a same-named
+`xs.map((x) => x + 1)` keeps the narrowing and `xs.map((x) => { k(); x })` ends it. Any use of a
+reacher's name other than as a callee or an assignment target is an escape, including one inside
+another reacher (`const r = () => k` escapes `k`). An interpolation hole over a scalar
+(`"\{v}"`) renders through std:fmt without reaching user code, so it ends nothing. The rule is
+name-based and flow-insensitive: a same-named
 binding elsewhere in the root, or an escape later in the function, ends narrowings it strictly
-need not. That costs a re-test, never a wrong value.
+need not. That costs a re-test, never a wrong value. What the rule cannot see — a writer that is
+a separate top-level function, or a global written from another top-level function — is D2401,
+still open; the rule is sound within the function that declares the variable.
 
 **WHERE IT ENDS, precisely.** The retirement is in place, as a falsifying write's is, so it
 outlives the block the call sits in, and the arm join at the enclosing `if` sees it.

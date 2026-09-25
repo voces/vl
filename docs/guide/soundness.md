@@ -50,6 +50,17 @@ a use that relies on the *opposite* of what was narrowed is rejected (`@error`).
   `nullable-access-guarded.vl`
 - rejected: `narrowing-is-unsound-use.vl`
 
+**A call that may reassign a narrowed variable ends the narrowing.** When a closure
+assigns a variable, a call that may run that closure — `k()`, a function that calls
+`k`, or any call once `k` has been passed, stored or returned — ends the narrowing, and
+the code after it reads the variable at its declared type. Re-test it after the call.
+A use at the narrowed type is refused with a message naming the call, and carries the
+`narrowing-ended-by-call` diagnostic code; so is a read later in the call's own
+statement, or inside a block that statement holds.
+
+- sound: `call-ends-narrowing-recheck-runs.vl`
+- rejected: `call-ends-narrowing-diagnostic.vl`, `call-ends-narrowing-escaped-writer.vl`
+
 ### Nullable access
 A member access on a `T | null` value is rejected until a guard narrows it to
 `T`. The nullable can hide one level deep in a field path (`o.v.x`).

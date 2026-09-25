@@ -1981,9 +1981,9 @@ in-language GC knobs.
   soundly (the path write-effect rule). **Open question (floated by the owner, not decided):**
   ban side effects in operator overloads, or let one modify only its left/right operands — an
   "overload-eligible" derived predicate beside getter-eligible (effects doc §C1b). Under the second
-  reading an operator site needs only D2400's operand-path invalidation and can never run an
-  escaped writer — today a dispatched operator ends the narrowing of any binding whose writer
-  escaped, as an unknown call does.
+  reading an operator site needs only D2400's operand-path invalidation and can never run a
+  writer — today a dispatched operator ends a narrowing when a declaration of that operator
+  reaches the writer, or when the writer escaped, as an unknown call does.
 - ⬜ **A8. Exact / Inexact variance.** Params Inexact by default (accept excess properties), values
   Exact. Guards the `a.foo = b` width footgun. (TODO.md)
   **Defaults + surface RULED 2026-08-18** — see A9.
