@@ -57,6 +57,7 @@ tree ungraded.
 | `parentLetCache` (`plCacheBlock`/`plGen`) | the cached BLOCK index | the arena bodies the rewrites re-point inside that block | probe |
 | `anonLeafIndex` (`anonIxSeen`) | `P.nodes.length` | its own link columns | probe |
 | `fnChildIndex` | `fnChildHead.length` vs `fnStmts.length` | `fnParent`, written in place by `monomorphize` | probe |
+| `frameBindsCache` (`fcbSidGen`/`fcbGen`, D2289) | the asked FRAME; dropped by `resetParentLetCache` | the frame chain's params, lets and loop variables, which a rewrite could re-point | probe |
 | `elemRowsCaptureWalk` (`ercGenP`/`ercStamp`) | **`emitPassGen`**, and a per-walk stamp so a new walk clears nothing | none: the table is rebuilt when the pass generation moves, and a slot is dead the moment its walk id is stale | pass-stamped |
 | `closureCaptureNames` (`capMemoGen`/`capMemoStamp`, D2017) | **`emitPassGen`**, `P.nodes.length`, a reported-edit count | none reachable: armed only inside `computeRetInference`, `computeRetInference#2` and `dispatchRewrite`; the first two write no table `capScan` reads, and every rewrite either mints a node or calls `capMemoNoteEdit` | pass-stamped |
 | `covarValueWriteState` (`cwArenaLen`) | `P.nodes.length` | its own `cwIx*` index, dropped with it; and `nodeRepTyIx`, a checker sidecar written in place | probe |
@@ -98,11 +99,12 @@ Readings on 2026-09-05, master `55f25c3e7`:
 | `parentLetCache` | byte-identical | no cell changed class |
 | `anonLeafIndex` | byte-identical | no cell changed class |
 | `fnChildIndex` | byte-identical | no cell changed class |
+| `frameBindsCache` (graded 2026-09-24; also 1,500 `@run` fixtures built byte-identical) | byte-identical | no cell changed class |
 | `covarValueWriteState` | byte-identical | no cell changed class |
 | `closureCaptureNames` (graded 2026-09-23, master `9847488c1` + D2017) | byte-identical | no cell changed class |
 
-**Seventeen of nineteen disable edits leave the compiler's own codegen of itself byte-identical
-to master's fixpoint**, and the eleven graded against the corpus — the ten `probe` rows that
+**Eighteen of twenty disable edits leave the compiler's own codegen of itself byte-identical
+to master's fixpoint**, and the twelve graded against the corpus — the eleven `probe` rows that
 can be disabled, plus `globalCellKind` — leave it unmoved. `covarValueWriteState` was
 additionally graded against all 74 capability-matrix templates — **4,292 cells, 0 moved** —
 because it is the one row whose key is a bare `P.nodes.length` and whose value reaches a

@@ -162,6 +162,13 @@ let plMoreIx: i32[] = []
 let plMoreOwner: i32[] = []
 let plMoreNext: i32[] = []
 let plMoreHead: i32[] = []
+// Every loop variable's scope in the current build, chained per sid like `plMore*`: the
+// variable is visible at `atIx` when `plLxLo < atIx <= plLxHi` (the loop header's last node,
+// then the body block's own index — the arena is post-order). Rebuilt with the rest (D2289).
+let plLxLo: i32[] = []
+let plLxHi: i32[] = []
+let plLxNext: i32[] = []
+let plLxHead: i32[] = []
 
 // The loop-variable half of `plCacheMap`'s plan: `name -> ForRange/ForIn` arena index,
 // first-wins, under the same generation stamp. A `for v in …` variable is a function-scoped
@@ -219,6 +226,32 @@ export function noteFuncName(name: string) {
   0
 }
 
+// One frame's answers to "does frame `fcbFrame` or an enclosing one bind this name", by sid:
+// `fcbSidVal` is 1 or 0 where `fcbSidGen` matches `fcbGen`. Asking about another frame bumps the
+// generation, so a stale row never answers for it (D2289).
+let fcbFrame: i32 = -1
+let fcbGen: i32 = 0
+let fcbSidGen: i32[] = []
+let fcbSidVal: i32[] = []
+
+// The banked answer for `sid` in frame `fnIx`, or -1 when none is banked.
+export function frameBindsCacheGet(fnIx: i32, sid: i32): i32 {
+  if fnIx != fcbFrame {
+    fcbFrame = fnIx
+    fcbGen = fcbGen + 1
+  }
+  if sidArrGet(fcbSidGen, sid) != fcbGen { return -1 }
+  sidArrGet(fcbSidVal, sid)
+}
+
+// Banks `v` (1 or 0) for `sid` in the frame the last `frameBindsCacheGet` asked about.
+export function frameBindsCachePut(sid: i32, v: i32) {
+  if sid < 0 { return 0 }
+  sidArrPut(fcbSidGen, sid, fcbGen)
+  sidArrPut(fcbSidVal, sid, v)
+  0
+}
+
 // Drops this file's sid-keyed rows. Paired with `symbols.sidReset` by the driver
 // (`emit_sections.sidKeyedTablesReset`) because the id space is re-keyed there: a generation
 // stamp defends against a stale key, never against a re-keyed universe — program N+1 would
@@ -234,9 +267,17 @@ export function sidResetParentLet() {
   plMoreOwner = []
   plMoreNext = []
   plMoreHead = []
+  plLxLo = []
+  plLxHi = []
+  plLxNext = []
+  plLxHead = []
   plLoopSidVal = []
   plLoopSidGen = []
   plGen = 0
+  fcbFrame = -1
+  fcbGen = 0
+  fcbSidGen = []
+  fcbSidVal = []
   0
 }
 
@@ -305,10 +346,18 @@ function plScanStmt(ix: i32, owner: i32) {
     plScanStmt(st.whileBody, st.whileBody)
   } else if st is ForRange {
     plRecordLoopVar(st.frVar, ix)
+    let head = st.frTo
+    if st.frFrom > head { head = st.frFrom }
+    if st.frStep > head { head = st.frStep }
+    plRecordLoopExtent(st.frVar, head, st.frBody)
     plScanStmt(st.frBody, st.frBody)
   } else if st is ForIn {
     plRecordLoopVar(st.fiVar, ix)
-    if st.fiVar2 != "" { plRecordLoopVar(st.fiVar2, ix) }
+    plRecordLoopExtent(st.fiVar, st.fiIter, st.fiBody)
+    if st.fiVar2 != "" {
+      plRecordLoopVar(st.fiVar2, ix)
+      plRecordLoopExtent(st.fiVar2, st.fiIter, st.fiBody)
+    }
     plScanStmt(st.fiBody, st.fiBody)
   } else if st is Block {
     const stmts = st.blkStmts
@@ -329,6 +378,17 @@ function plScanStmt(ix: i32, owner: i32) {
       pi = pi + 1
     }
   }
+  0
+}
+
+// Chains one loop variable's scope row onto its sid (`plLx*`).
+function plRecordLoopExtent(name: string, lo: i32, hi: i32) {
+  if name == "" { return 0 }
+  const lsid = sidOf(name)
+  plLxNext.push(sidArrGet(plLxHead, lsid))
+  sidArrPut(plLxHead, lsid, plLxLo.length)
+  plLxLo.push(lo)
+  plLxHi.push(hi)
   0
 }
 
@@ -510,6 +570,10 @@ export function moduleLocalLetOfAt(rootIx: i32, name: string, atIx: i32) {
 // (D2316) — cleared here rather than generation-stamped per row, since it is a flat list a
 // stale entry could not be told apart from a fresh one within.
 function plBuildLetMap(blockIx: i32) {
+  plLxLo = []
+  plLxHi = []
+  plLxNext = []
+  plLxHead = []
   plMoreSid = []
   plMoreIx = []
   plMoreOwner = []
@@ -598,6 +662,45 @@ export function parentLetCoversAt(blockIx: i32, sid: i32, atIx: i32): boolean {
   while i >= 0 {
     if plMoreIx[i] < atIx && atIx <= plMoreOwner[i] { return true }
     i = plMoreNext[i]
+  }
+  false
+}
+
+// Whether the `LetDecl` at `letIx`, a binding of `sid` in the body block at `blockIx`, is a
+// direct statement of that block rather than of a block nested in it — read off the scan's
+// owner column, so the answer costs the bindings of `sid`, not the block's statements.
+export function parentLetOwnedBy(blockIx: i32, sid: i32, letIx: i32): boolean {
+  if blockIx < 0 || sid < 0 || letIx < 0 { return false }
+  if blockIx != plCacheBlock {
+    plGen = plGen + 1
+    plBuildLetMap(blockIx)
+    plCacheBlock = blockIx
+  }
+  if sidArrGet(plSidGen, sid) != plGen { return false }
+  if sidArrGet(plSidVal, sid) == letIx {
+    return sidArrGet(plOwnerVal, sid) == blockIx
+  }
+  let i = sidArrGet(plMoreHead, sid)
+  while i >= 0 {
+    if plMoreIx[i] == letIx { return plMoreOwner[i] == blockIx }
+    i = plMoreNext[i]
+  }
+  false
+}
+
+// Whether a `for` variable of `sid` in the body block at `blockIx` is in scope at `atIx` —
+// the loop-variable twin of `parentLetCoversAt`, walking only `sid`'s own rows.
+export function parentLoopCoversAt(blockIx: i32, sid: i32, atIx: i32): boolean {
+  if blockIx < 0 || sid < 0 || atIx < 0 { return false }
+  if blockIx != plCacheBlock {
+    plGen = plGen + 1
+    plBuildLetMap(blockIx)
+    plCacheBlock = blockIx
+  }
+  let i = sidArrGet(plLxHead, sid)
+  while i >= 0 {
+    if plLxLo[i] < atIx && atIx <= plLxHi[i] { return true }
+    i = plLxNext[i]
   }
   false
 }
