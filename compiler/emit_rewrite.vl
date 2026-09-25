@@ -153,6 +153,7 @@ import {
   unTyIx,
 } from "./emit_state"
 import {
+  asgValueNode,
   capMemoNoteEdit,
   drwFieldClosure,
   exprIsClosure,
@@ -996,7 +997,7 @@ function spillTail(blockIx: i32, fnIx: i32) {
       k = k + 1
     }
     b.blkStmts.push(last)
-    b.blkStmts.push(spillRead(val))
+    b.blkStmts.push(val)
     capMemoNoteEdit()
     plCacheBust()
   }
@@ -1004,42 +1005,56 @@ function spillTail(blockIx: i32, fnIx: i32) {
 }
 
 // Rewrites the field or element write at `asgIx` to store a spilled value into a spilled place,
-// pushing the spills onto `out` in source order; the value's read, or -1 for any other node.
+// pushing the spills onto `out` in source order; the node that yields the value, or -1 for any
+// other node. A right side the checker typed at the place's type, a literal built at it, is
+// stored unspilled and yielded by re-reading the spilled place (D2395).
 function spillWrite(asgIx: i32, out: i32[]): i32 {
   const a = P.nodes[asgIx]
   if a is BinExpr {
     if a.binOp != "=" { return -1 }
     const t = unwrapParen(a.binLeft)
     if t < 0 { return -1 }
+    const byPlace = asgValueNode(asgIx) == a.binLeft
     let place = -1
+    let reread = -1
     const tn = P.nodes[t]
     if tn is Member {
-      place = mkMember(
-        spillLocal(tn.memObj, asgIx, "o", out, a.pos),
-        tn.memProp,
-        tn.pos,
-      )
+      const obj = spillLocal(tn.memObj, asgIx, "o", out, a.pos)
+      place = mkMember(obj, tn.memProp, tn.pos)
+      if byPlace { reread = mkMember(spillRead(obj), tn.memProp, tn.pos) }
     } else if tn is Index {
       const recv = spillLocal(tn.idxArr, asgIx, "o", out, a.pos)
       let idx = tn.idxIndex
       // A number re-evaluates to itself; any other index is spilled with the receiver.
-      if !(P.nodes[idx] is NumLit) {
+      const idxLit = P.nodes[idx]
+      if idxLit is NumLit {
+        if byPlace {
+          const idx2 = mkNum(idxLit.numText, idxLit.pos)
+          nodeTyCarry(idx2, idx)
+          reread = mkIndex(spillRead(recv), idx2, tn.pos)
+        }
+      } else {
         idx = spillLocal(idx, asgIx, "i", out, a.pos)
+        if byPlace { reread = mkIndex(spillRead(recv), spillRead(idx), tn.pos) }
       }
       place = mkIndex(recv, idx, tn.pos)
     }
     if place < 0 { return -1 }
     nodeTyCarry(place, t)
+    a.binLeft = place
     // A compound write reads its target inside the right-hand side, through the same node.
     const inner = P.nodes[a.binRight]
     if inner is BinExpr {
       if unwrapParen(inner.binLeft) == t { inner.binLeft = place }
     }
+    if reread >= 0 {
+      nodeTyCarry(reread, t)
+      return reread
+    }
     const val = spillLocal(a.binRight, asgIx, "v", out, a.pos)
     spillTypeByTarget(out[out.length - 1], val, t)
-    a.binLeft = place
     a.binRight = val
-    return val
+    return spillRead(val)
   }
   -1
 }

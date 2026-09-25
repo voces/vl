@@ -104,6 +104,7 @@ import {
   nameIsNewtypeBrand,
   nodeArrayElemIsBareStrLit,
   nodeArrayElemIsLitUnion,
+  nodeArrayElemIsNulBool,
   nodeArrayElemIsNulLitUnion,
   nodeArrayElemIsNulStr,
   nodeArrayElemIsStr,
@@ -3552,6 +3553,20 @@ function fnAssignRetElemName(fe: i32) {
   fnAssignCellElem(fnStmts[fe], fnAssignRetTargetName(fe))
 }
 
+// The node whose rep the value of assignment `asgIx` has: its right side, or its target where
+// the checker typed the assignment at the target's type rather than the right side's, a
+// literal built at the place's type.
+export function asgValueNode(asgIx: i32): i32 {
+  const a = P.nodes[asgIx]
+  if !(a is BinExpr) { return asgIx }
+  const at = nodeTyIxOf(asgIx)
+  const lt = nodeTyIxOf(a.binLeft)
+  const rt = nodeTyIxOf(a.binRight)
+  if at < 0 || lt < 0 || rt < 0 { return a.binRight }
+  if tySame(at, lt) && !tySame(at, rt) { return a.binLeft }
+  a.binRight
+}
+
 // Classify one valued return expression at `rx0` of the function at `fnStmts` position `i`,
 // under the current narrowing stack — the shared loop body of the narrowing-aware walk.
 export function criClassify(rx0: i32, i: i32) {
@@ -3578,10 +3593,11 @@ export function criClassify(rx0: i32, i: i32) {
     }
     return 0
   }
-  // A tail assignment yields its rhs, so the function's return kind is the rhs's kind.
+  // A tail assignment yields its rhs, so the function's return kind is the rhs's kind; a
+  // literal the target's type built (`c[0] = [3.5, 4]` over `(i32 | f64)[][]`) is the target's (D2395).
   const rxe = P.nodes[rx]
   if rxe is BinExpr {
-    if rxe.binOp == "=" { rx = rxe.binRight }
+    if rxe.binOp == "=" { rx = asgValueNode(rx) }
   }
   if (
     fRetKind[i] != "str"
@@ -3664,6 +3680,21 @@ export function criClassify(rx0: i32, i: i32) {
       || retCapturedMapShape(i, rx) != -3
     ) {
       criSetRetKind(i, "map")
+    }
+  }
+  // A returned element of a local ref list (`c[0]` over `(i32 | f64)[][]`), whose collected
+  // kind this pass does not have: the arena type names the ref-list row (D2396).
+  if !retKindIsList(fRetKind[i]) {
+    const rrTy = nodeTyIxOf(rx)
+    if rrTy >= 0 && T.tys[rrTy] is TyArray {
+      const rrs = rlSlotOfTy(tyRefArrElemOf(rrTy))
+      if rrs >= 0 && rrs < rlElemName.length {
+        if criSetRetKind(i, "reflist") {
+          if i < fRetRArrElem.length && fRetRArrElem[i] == "" {
+            fRetRArrElem[i] = rlElemName[rrs]
+          }
+        }
+      }
     }
   }
   // The not-a-list guard is what separates i32 and f64 lists here: `exprArray`'s array-literal
@@ -13163,6 +13194,8 @@ export function exprIsBool(ix: i32, fnIx: i32) {
   if e is Index {
     const iuk = indexUnionReadKind(ix, fnIx)
     if iuk != -3 { return iuk == 1 }
+    // A `(boolean | null)[]` element narrowed past null is the boolean (D2397).
+    if nodeArrayElemIsNulBool(e.idxArr) && indexPlaceNonNull(ix) { return true }
     // An element read over a boolean-element list prints as true/false: a `.map` result
     // whose callback returns boolean, or a directly declared `boolean[]`.
     if mfArrElemIsBool(e.idxArr, fnIx) { return true }
@@ -14019,6 +14052,33 @@ function pushIndexNicheNarrow(idxIx: i32, fnIx: i32) {
     if exprNulStrArray(e.idxArr, fnIx) {
       pushNarrow(ik, "string")
       return true
+    }
+    if nodeArrayElemIsNulBool(e.idxArr) {
+      pushNarrow(ik, "boolean")
+      return true
+    }
+    // A nullable scalar-list cell (`(i32[] | null)[]`): the variant is the list the recovered
+    // ref holds, and `indexListRep` reads the element's row under it (D2393).
+    if exprRefArray(e.idxArr, fnIx) {
+      const sl = refListSlotOfExpr(e.idxArr, fnIx)
+      if (
+        sl >= 0
+        && sl < rlElemName.length
+        && sl < rlElemNullable.length
+        && sl < rlElemKindTbl.length
+      ) {
+        const sk = rlElemKindTbl[sl]
+        if (
+          rlElemNullable[sl] == 1
+          && (sk == 4 || sk == 6 || sk == 7 || sk == 8 || sk == 10)
+        ) {
+          const snp = nullablePartOf(rlElemName[sl])
+          if snp != "" {
+            pushNarrow(ik, snp)
+            return true
+          }
+        }
+      }
     }
   }
   false
@@ -17145,6 +17205,14 @@ export function exprNulBool(exprIx: i32, fnIx: i32) {
   // with sentinel 2), so an un-annotated `const b = m[k]` narrows with `!= null` against 2.
   if e is Index {
     if nodeTyMapValIsNulBool(e.idxArr) { return true }
+    // A `(boolean | null)[]` element no recorded type covers, the capture cell's read, is the
+    // niche until a narrowing excludes null (D2397).
+    if (
+      nodeArrayElemIsNulBool(e.idxArr)
+      && !indexPlaceNonNull(unwrapParen(exprIx))
+    ) {
+      return true
+    }
   }
   // A `boolean | null` struct FIELD read (`a.v`, code 21) is the niche i32 sentinel.
   if e is Member { return memberFieldCode(exprIx, fnIx) == 21 }
@@ -31349,6 +31417,11 @@ export function refListElemNameOfExpr(exprIx: i32, fnIx: i32) {
   const e = P.nodes[exprIx]
   if e is ArrayLit { return arrLitElemName(exprIx) }
   if e is Paren { return refListElemNameOfExpr(e.parInner, fnIx) }
+  if e is BinExpr {
+    if e.binOp == "=" && assignTargetReReads(exprIx, fnIx) {
+      return refListElemNameOfExpr(e.binLeft, fnIx)
+    }
+  }
   // An if-expression's element is its join's row, the one its blocktype names (D2210).
   if e is IfStmt {
     if ifExprRefKind(exprIx, fnIx) != "reflist" { return "" }
@@ -34021,7 +34094,10 @@ function indexListRep(exprIx: i32, fnIx: i32): VKind | null {
       if slot >= 0 && slot < rlElemKindTbl.length {
         const ek = rlElemKindTbl[slot]
         if ek == 9 { return "reflist" }
-        if rlElemNullable[slot] == 1 { return null }
+        // A nullable element reads as its list only under a narrowing that excludes null (D2393).
+        if rlElemNullable[slot] == 1 && !indexPlaceNonNull(exprIx) {
+          return null
+        }
         if ek == 4 { return "list" }
         if ek == 6 { return "strlist" }
         if ek == 7 { return "f64list" }
@@ -34039,6 +34115,13 @@ function indexListRep(exprIx: i32, fnIx: i32): VKind | null {
 function binListRep(exprIx: i32, fnIx: i32): VKind | null {
   const e = P.nodes[exprIx]
   if e is BinExpr {
+    // An assignment's value is the re-read of its target (D2394).
+    if e.binOp == "=" {
+      if assignTargetReReads(exprIx, fnIx) {
+        return exprListRep(e.binLeft, fnIx)
+      }
+      return null
+    }
     if e.binOp == "+" {
       const l = exprListRep(e.binLeft, fnIx)
       if l != null {
