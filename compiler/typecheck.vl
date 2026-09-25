@@ -1993,7 +1993,7 @@ function uninferredFixText(name: string, ty: i32) {
           + useIt
           + "`const "
           + name
-          + ": {[string]: boolean} = Set()`)"
+          + ": Set<string> = Set()`)"
       }
       return "an empty Map has no key or value type"
         + useIt
@@ -12284,9 +12284,9 @@ function angleCloseAt(name: string, lt: i32): i32 {
   -1
 }
 
-// `Map<K, V>` is the map type `{[K]: V}` and `Set<T>` is the set type `{[T]: boolean}`: long
-// spellings of the same types, so either flows where the other is written and both lower the
-// same (`builtinCollSpelling`). Arguments come from the spelling tree when `appIx` has one, else
+// `Map<K, V>` is the map type `{[K]: V}`, a long spelling of it. `Set<T>` is its own type, the
+// set flavor (`mSet` 1) over the same rep, so both lower through the index signature
+// (`builtinCollSpelling`). Arguments come from the spelling tree when `appIx` has one, else
 // from `inner`'s text. An unsupported key banks the index signature's refusal.
 function builtinCollAppTy(head: string, inner: string, appIx: i32) {
   const argTys: i32[] = []
@@ -12325,7 +12325,7 @@ function builtinCollAppTy(head: string, inner: string, appIx: i32) {
     unkTyClash = mapKeyUnsupportedMsg(tyToStr(k), head)
     return -1
   }
-  if head == "Set" { return mkMapTy(k, TY_BOOL, 0) }
+  if head == "Set" { return mkMapTy(k, TY_BOOL, 1) }
   mkMapTy(k, argTys[1], 0)
 }
 
@@ -12516,16 +12516,15 @@ const listMethodNames = [
 ]
 
 // Map/set intrinsic names, gated exactly as `checkCallNode`'s own arms gate them: `set`/
-// `get`/`keys` are a map surface a set must not leak, and `add` is admitted by the value
+// `get` are a map surface a set must not leak, and `add` is admitted by the value
 // type rather than by flavor.
 function mapMethodNames(recvTy: i32) {
-  const out = ["has", "delete", "values", "length", "size"]
+  const out = ["has", "delete", "keys", "values", "length", "size"]
   const rt = T.tys[recvTy]
   if rt is TyMap {
     if rt.mSet == 0 {
       out.push("set")
       out.push("get")
-      out.push("keys")
     }
     if rt.mSet == 1 || tyIsPrimNamed(rt.mVal, "boolean") { out.push("add") }
   }
@@ -13587,6 +13586,12 @@ function tyToStrGo(ix: i32, nominal: boolean) {
     }
     TyMap => {
       const mk = tyToStrAt(t.mKey, nominal)
+      // A set is its own type and reads as one; the structural render keeps the index
+      // signature the emitter's name tables are keyed by.
+      if t.mSet == 1 && nominal {
+        tyStrAtoms = 1
+        return "Set<" + mk + ">"
+      }
       const mv = tyToStrAt(t.mVal, nominal)
       // The key/value separators sit inside the braces — one atom.
       tyStrAtoms = 1
@@ -17235,6 +17240,13 @@ export function canonEmitTypeNames() {
       if opTy >= 0 {
         const ot = T.tys[opTy]
         if ot is TyUnion {
+          // `Map<K, V>` / `Set<T>` inside the tested spelling denote an index signature, the
+          // spelling canon gives the union's own member, so the test names the same arm (D2468).
+          const bci = builtinCollNorm(n.isVariant)
+          if bci != n.isVariant {
+            canonBankRaw(i, CANON_SLOT_IS, n.isVariant)
+            n.isVariant = bci
+          }
           const gis = unionMemberGenAppShape(n.isVariant)
           if gis != "" {
             if gis != n.isVariant {
@@ -24191,7 +24203,13 @@ function assignableGo(src: i32, dst: i32) {
     }
     TyMap => {
       if d is TyMap {
-        // A bare `Map()`/`Set()` (key/value holes, `-1`) is assignable to any map.
+        // A set and a map are distinct types, neither assignable to the other, and a set is
+        // invariant in its element. A bare `Map()`/`Set()` (holes, `-1`) fits its own flavor.
+        if sTail.mSet != d.mSet { return false }
+        if d.mSet == 1 {
+          return assignable(sTail.mKey, d.mKey)
+            && assignable(d.mKey, sTail.mKey)
+        }
         return assignable(sTail.mKey, d.mKey) && assignable(sTail.mVal, d.mVal)
       }
       return false
@@ -30298,7 +30316,7 @@ function checkMemberCallNode(
     return TY_ERR
   }
   // Map/Set methods over the `{[K]: V}` rep, gated by flavor: a map exposes `.set`/`.get`/
-  // `.has`/`.delete`/`.keys`/`.values`; a set exposes only `.add`/`.has`/`.delete`/`.values`.
+  // `.has`/`.delete`/`.keys`/`.values`; a set exposes `.add`/`.has`/`.delete`/`.keys`/`.values`.
   // `.add` alone gates on the value's TYPE rather than the flavor bit (see its own arm). The
   // first `.set`/`.add` on a bare `Map()`/`Set()` pins its key/value holes in place.
   if rt is TyMap {
@@ -30379,7 +30397,7 @@ function checkMemberCallNode(
       }
       return TY_BOOL
     }
-    if mp == "keys" && rt.mSet == 0 {
+    if mp == "keys" {
       if margs2.length != 0 { tErr("keys expects no arguments", ix) }
       return mkArrayTy(rt.mKey)
     }
@@ -43079,15 +43097,6 @@ function checkLetDeclNode(n: LetDecl, ix: i32) {
           if !tyHasHole(annot) { noteLitElemCstrs(n.letInit, annot, 6) }
         }
       }
-      // A `Set()` initializer keeps its Set flavor even under a map-shaped annotation — the
-      // binding exposes the Set surface (`.add`, no `.set`/`.get`/`.keys`) with the annotation's key/value.
-      const it2 = T.tys[initTy]
-      if it2 is TyMap {
-        if it2.mSet == 1 {
-          const an2 = T.tys[annot]
-          if an2 is TyMap { bound = mkMapTy(an2.mKey, an2.mVal, 1) }
-        }
-      }
     }
   } else if initTy >= 0 {
     bound = constStrLitBound(n, initTy)
@@ -47938,6 +47947,14 @@ function checkIndexNode(n: Index, ix: i32) {
   // A map index: the key must match the map's key type; a read yields the nullable value
   // (`V | null`), and an assignment target accepts a plain `V`.
   if at is TyMap {
+    // A set has no index: membership is `has`, insertion `add`.
+    if at.mSet == 1 {
+      tErr(
+        "a Set has no index — test membership with `.has(x)` and insert with `.add(x)`",
+        ix,
+      )
+      return TY_ERR
+    }
     // The expression form, for the same reason `m.get`'s does: `m["green"]` on a
     // literal-union-keyed map is a member of that union, and `checkNode` types a string
     // literal as the widened `string` with no destination to narrow it against (D1748).

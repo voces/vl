@@ -36,7 +36,7 @@ HELP = """function mk() {
   m
 }
 function mkset() {
-  const s: {[string]: boolean} = Set()
+  const s: Set<string> = Set()
   s.add("a")
   s
 }

@@ -30,15 +30,19 @@ one place.
 | a sequence | `T[]` — `string[]`, `i32[][]` | `[...]` — `["a", "b"]`, `[]` |
 | a byte sequence | `u8[]` | `[...]` of `i32`s, or `std:fs`'s `readFile` |
 | a map | `Map<K, V>` or `{[K]: V}` — `Map<string, i32>` | `Map()`, `Map<string, i32>()` |
-| a set | `Set<T>` or `{[T]: boolean}` — `Set<string>` | `Set()`, `Set<string>()` |
+| a set | `Set<T>` — `Set<string>` | `Set()`, `Set<string>()` |
 
-**`Map<K, V>` and `{[K]: V}` are two spellings of ONE type** (A15), and so are `Set<T>` and
-`{[T]: boolean}`: either flows where the other is written, both carry the whole map (or set)
-surface, and a hover or an error prints the index-signature spelling for both. Today the
-type is the concrete collection; `collections-design.md` §C2 describes a future split in
-which `{[K]: V}` would name only the read-and-index capability, and whether that split
-happens is an open ruling. A bare `Map` or `Set` with no type arguments is not a type — the
-checker says `` `Map` needs its key and value types — write `Map<K, V>` ``.
+**`Map<K, V>` and `{[K]: V}` are two spellings of ONE type** (A15): either flows where the
+other is written, both carry the whole map surface, and a hover or an error prints the
+index-signature spelling. Both shorthands, `{[K]: V}` and `T[]`, name CONCRETE types with
+their full methods, and `T[]` is not a subtype of `{[i32]: T}` (owner ruling Q1, 2026-09-25,
+which retires §C2's interface reading — see the banner there). **`Set<T>` is its own type**
+(ruling Q2): `add`, `has`, `delete`, `keys()`/`values()` (the elements, `T[]`), `length` and
+`for x in s`; no index and no `get`/`set`; and it is neither a list nor a map, so it flows
+to no `T[]` or `{[K]: V}` destination and neither flows to it. It prints as `Set<T>`.
+`{[K]: boolean}` is still legal and is a plain map of booleans, built with `Map()`. A bare
+`Map` or `Set` with no type arguments is not a type — the checker says
+`` `Map` needs its key and value types — write `Map<K, V>` ``.
 
 A map is an ordinary field type, so the struct glean's VL-033 wanted is:
 
@@ -1021,7 +1025,19 @@ inference (or even single-representation-first) and tighten later.
 
 ## §C2 — Collections as structural interfaces: `{[K]:V}` as interface, `Map`/`List`/`Set` as subtypes
 
-> Status: **design / research only.** This records a decision the owner made this
+> **REVERSED 2026-09-25 (owner ruling Q1).** `{[K]: V}` and `T[]` are CONCRETE types with their
+> full methods; `Map<K, V>` is only a longer spelling of `{[K]: V}`; and `T[]` is not a subtype
+> of `{[i32]: T}` in either direction. The index contracts differ (a list read traps and has
+> type `T`, a map read on a miss yields `V | null`; a list write out of bounds traps, a map
+> write inserts), the checker never implemented the interface reading, and the bug C2 was
+> chosen to fix came from `Set` being spelled `{[T]: boolean}`, which C2.2's own `Set<T>` now
+> fixes (ruling Q2, built). "Any mapping" is a bound. The rationale is
+> `docs/internals/collections-representation-design.md` §5 and §11 (branch
+> `design-collections-representation`), and the record is DECISIONS.md, "`{[K]: V}` and `T[]`
+> are concrete types". The section below is kept as the decision history; C2.2 (`Set<T>`) and
+> C2.3/C2.4 still describe the shipped surface.
+
+> Status (original): **design / research only.** This records a decision the owner made this
 > round ("C2") about *what an index-signature type means* and *how the concrete
 > collections relate to it*. As with the rest of this doc, the `DECISIONS.md` entry
 > lands **with implementation, not before** — this section is the mental model and the
@@ -1096,6 +1112,13 @@ same readable/writable split §VL.7 draws for variance, surfaced here as "which 
 the `self` param wears."
 
 ### C2.2 — `Set<T>` is its OWN type — *not* `{[T]:boolean}`
+
+> **BUILT 2026-09-25 (owner ruling Q2).** The shipped surface is `add`, `has`, `delete`,
+> `keys()` and `values()` (both the elements, `T[]`), `length`, and `for x in s`. There is no
+> positional or membership subscript: `s[x]` is refused with a sentence naming `has`/`add`.
+> Q2 also settles the paragraph below that relates a set to the `{[i32]: T}` sequence core:
+> a set has no relation to lists or maps, so it is a subtype of neither. It is invariant in
+> `T`. `{[T]: boolean}` stays legal as a plain map of booleans.
 
 **Decision.** `Set<T>` is a **distinct concrete type** with its own surface — it is
 **not** spelled, and not structurally equal to, `{[T]:boolean}`. Its surface is:

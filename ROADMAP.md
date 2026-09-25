@@ -2122,10 +2122,10 @@ in-language GC knobs.
      long spellings of `{[K]: V}` / `{[T]: boolean}`, and TS-style explicit type arguments work
      on `Map<K, V>()`, `Set<T>()` and every declared generic (`f<a>(b)` is a generic call; the
      relational chain `f < a > (b)` is given up, and occurred nowhere — DECISIONS.md §Parser).
-     Open: whether `{[K]: V}` narrows to the read-only capability of C2 with `Map<K, V>` the
-     concrete subtype (the owner is re-deciding; the breakage count is in the A15 PR), a
-     set that is not a map-to-bool (C2.2), `o.f<T>()` on a method call, and an instantiation
-     expression without a call.
+     RULED 2026-09-25 (Q1): `{[K]: V}` stays the concrete map, `Map<K, V>` only its long
+     spelling, C2's interface reading reversed. BUILT 2026-09-25 (Q2): `Set<T>` is its own
+     type, not a map-to-bool (C2.2; DECISIONS.md, "`{[K]: V}` and `T[]` are concrete types").
+     Open: `o.f<T>()` on a method call, and an instantiation expression without a call.
   4. **`IdentityMap<K, V>` / `IdentitySet<K>`** on the flat-scan rep — the 7-field map struct
      with `ref.eq` as the probe compare and `index`/`hashes` unused; `IdentityMap <: {[K]: V}`,
      `IdentitySet` on the sequence read core like `Set`; `K` = anything `===` accepts; header:

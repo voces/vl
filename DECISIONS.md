@@ -928,13 +928,12 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   one relation); the hash folds `-0.0` into `0.0` so `0.0 == -0.0` finds its entry; a
   key mutated after insertion is lost (Java's rule). **`IdentityMap<K, V>` /
   `IdentitySet<K>` are the identity-keyed containers** — separate concrete types with
-  `Map`/`Set`'s whole surface, `K` = anything `===` accepts, and BOTH satisfy the
-  index-signature interface: `{[K]: V}` is the CAPABILITY, not the implementation, and
-  a signature names `Map<K, V>` or `IdentityMap<K, V>` when it wants the specific one
-  (the concrete names are annotation-legal and `Map<string, i32>()` parses TS-style
-  since A15 item 3 — as long spellings of `{[K]: V}` / `{[T]: boolean}`, one type each;
-  whether `{[K]: V}` later narrows to a read-only capability is an open ruling, and the
-  entry below records the parse rule). Rep: the existing 7-field map
+  `Map`/`Set`'s whole surface, `K` = anything `===` accepts. `{[K]: V}` names the
+  concrete map, not a capability (Q1, 2026-09-25, reversing C2), so a signature that
+  accepts any mapping writes a bound (the concrete names are annotation-legal and
+  `Map<string, i32>()` parses TS-style since A15 item 3 — `Map<K, V>` a long spelling of
+  `{[K]: V}`, `Set<T>` its own type per Q2; see "`{[K]: V}` and `T[]` are concrete
+  types" below, and the entry after this one for the parse rule). Rep: the existing 7-field map
   struct with `ref.eq` as the probe compare; v1 is a flat scan, and the lazy `i64`
   per-class serial is the optimisation that follows ONLY WHEN MEASURED NECESSARY — the
   API is identical, so nothing waits on it. Identity keys keep their objects alive;
@@ -7923,3 +7922,49 @@ conservative rule is the sound floor it would refine.
 
 Whether a declared operator may have side effects beyond its operands at all was floated by the
 owner, not decided (ROADMAP, "Narrowing invalidation across calls").
+
+## `{[K]: V}` and `T[]` are concrete types; `Set<T>` is a distinct type (owner rulings Q1 and Q2, 2026-09-25)
+
+Recorded from `docs/internals/collections-representation-design.md` (branch
+`design-collections-representation`, revision 2), §5 and §11 Q1/Q2.
+
+**Q1 — ruled (a): the shorthands name CONCRETE types, which reverses C2.** `{[K]: V}` is the
+built-in map with its full method surface (`get`, `set`, `has`, `delete`, `keys`, `values`,
+`length`), exactly as `T[]` is the built-in list with `push`, `pop` and `slice`. `Map<K, V>` is
+only a longer spelling of `{[K]: V}`. `T[]` is NOT a subtype of `{[i32]: T}`, in either
+direction. This reverses `collections-design.md` §C2, which read the index signature as a
+structural interface with `Map`/`List`/`Set` as its subtypes. Why:
+
+* **The index contracts differ.** `xs[i]` out of bounds traps and has type `T`; `m[k]` on a
+  miss yields `V | null`. `xs[i] = v` out of bounds traps; `m[k] = v` inserts. A subtype that
+  changes what indexing returns and what a write does is not a subtype. The iteration rule
+  (element first for a list, key first for a map, C2.4) is a second, independent reason.
+* **The checker already treats them as disjoint** (design doc §2.4, run): a list is refused
+  where `{[i32]: i32}` is written, and hole inference refuses to guess between them. C2's
+  interface reading was never implemented.
+* **The bug C2 was chosen to fix came from `Set` being spelled `{[T]: boolean}`,** not from
+  maps carrying map methods (design doc §5(i)). `Set<T>` as its own type removes it.
+* **The alternative re-decides every hand-written site.** Keeping C2 means interface
+  subtyping and a choice at each of ~2,800 `{[K]: V}` / `Map()` sites (design doc §6).
+
+"Any mapping" is written as a bound (`<M: { get(K): V | null }>`), not as `{[K]: V}`; making
+built-in methods satisfy such a bound is the design doc's step 4 (§11 Q5, not yet ruled).
+
+**Q2 — ruled (a): `Set<T>` is a distinct type.** Its surface is `add`, `has`, `delete`,
+`keys()` and `values()` (both `T[]`, the elements), `length`, and `for x in s` over the
+elements (`for x, i in s` pairs each element with its position, as a list does). It has no
+index (`s[x]` is refused with a sentence naming `has`/`add`), no `get`/`set`, and no relation
+to `T[]` or `{[K]: V}`: neither is assignable to it and it is assignable to neither. It is
+invariant in its element. `Set()` and `Set<T>()` construct it, and it prints as `Set<T>` in
+hover and diagnostics. `{[K]: boolean}` stays legal and means a plain map of booleans, built
+by `Map()`, with nothing changed — including `.add(k)`, which a boolean-valued map has kept
+since B6a. There is no forced migration: `Set()` had zero uses in plumb, glean, veldt, sunsuz
+and webcraft on 2026-09-25, and the in-repo uses (29 fixtures, one bench, 108 curated corpus
+cells and four grid generators) were rewritten from `{[K]: boolean} = Set()` to `Set<K>`.
+
+**The representation did not change.** A set is still the map struct with membership in
+`vals`. What changed is where the set flavor lives: in the TYPE (the arena's `mSet` bit), which
+every spelling of `Set<T>` now sets, instead of in the binding that called `Set()`. The emitter
+reads it from the expression's type (`setShapeOfTy`), so a set passed through a parameter,
+field or return walks its elements (D2469, which printed `true`s), and the bound `.values()` of
+a bare `Set()` builds (D2470).
