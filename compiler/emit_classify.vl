@@ -200,6 +200,7 @@ import {
   tyNestedArrLeafRenders,
   tyNomNameCycled,
   tyPrimNameOf,
+  tyReachesUnion,
   tySame,
   tyScalarBaseIs,
   tyToEmitName,
@@ -10543,11 +10544,21 @@ function declRowFieldFits(vc: i32, sc: i32, valIx: i32, si: i32, mfi: i32) {
     ) {
       return false
     }
-    // Two scalar-list layouts differ by element: a literal re-encodes only into the row its
-    // own destination names, which the caller has already excluded.
-    if fieldCodeIsFlatList(vc) && fieldCodeIsFlatList(sc) { return false }
+    // A list is never a scalar or a string, nor either of those a list (D2436).
+    if fieldCodeIsFlatList(vc) != fieldCodeIsFlatList(sc) {
+      if anonCodeIsSelfContained(vc) && anonCodeIsSelfContained(sc) {
+        return false
+      }
+    }
+    // Two scalar-list layouts differ by element. Only an array literal crosses, and only by
+    // widening its elements, since a literal re-encodes at the store.
+    if fieldCodeIsFlatList(vc) && fieldCodeIsFlatList(sc) {
+      if !(P.nodes[unwrapParen(valIx)] is ArrayLit) { return false }
+      return flatListLitWidens(vc, sc)
+    }
     return true
   }
+  if sc == 0 { return declRowScalarFits(valIx, si, mfi) }
   const vn = anonFieldElemName(valIx, vc)
   if vn == "" { return true }
   const fn = sFieldElemNameAt(si, mfi)
@@ -10560,6 +10571,30 @@ function declRowFieldFits(vc: i32, sc: i32, valIx: i32, si: i32, mfi: i32) {
 // `u8` or `string` list?
 function fieldCodeIsFlatList(c: i32): boolean {
   c == 4 || c == 6 || c == 25 || c == 26 || c == 27 || c == 35
+}
+
+// Code 0 is shared by `i32`, `boolean` and a string literal union's atom, so the code cannot
+// tell them apart: ask the declared row's own field type. Refutes a primitive value against a
+// different primitive or against a string literal set (D2435).
+function declRowScalarFits(valIx: i32, si: i32, mfi: i32): boolean {
+  if si < 0 || si >= sTyIx.length { return true }
+  if mfi < 0 || mfi >= sFieldCount[si] { return true }
+  const fty = tyFieldTyOf(sTyIx[si], sFieldNames[sFieldStart[si] + mfi])
+  const vp = tyPrimNameOf(nodeTyIxOf(valIx))
+  if vp == null || fty < 0 { return true }
+  const fp = tyPrimNameOf(fty)
+  if fp != null { return fp == vp }
+  if tyIsLitUnion(fty) || tyIsLitUnionAlias(fty) {
+    return numLitUnionBaseTy(fty) >= 0
+  }
+  true
+}
+
+// Does an array literal coded `vc` re-encode into a `sc` list by widening each element: an
+// integer literal into an `f64`, `i64`, `f32` or `u8` list, a float one into an `f32` list?
+function flatListLitWidens(vc: i32, sc: i32): boolean {
+  if vc == 4 { return sc == 25 || sc == 26 || sc == 27 || sc == 35 }
+  vc == 25 && sc == 27
 }
 
 // An open-addressed pair table, generation-stamped so a new walk costs no clearing: a slot is
@@ -10809,6 +10844,19 @@ function structIndexOfObjCtxGo(objIx: i32, fnIx: i32) {
         }
       }
     }
+    // A literal the checker delivered into a record of another type is built at that record's
+    // row: its own field types would name a different row, or several (D2437). A union-bearing
+    // destination keeps the scan, whose variant rungs own it.
+    const adopted = nodeRepTyIxOf(objIx)
+    if (
+      nf > 0
+      && adopted >= 0
+      && adopted != nodeTyIxOf(objIx)
+      && !tyReachesUnion(adopted, 8)
+    ) {
+      const ar = repRowOfTyStruct(adopted, sScanLim())
+      if ar >= 0 { return ar }
+    }
     // The name-only scan can match several structs at once (a string literal fits both
     // `{f: string}` and litunion-atom `{f: K0}`); ambiguity defers to the checker's recorded type.
     let firstSi = -1
@@ -10880,7 +10928,11 @@ function structIndexOfObjCtxGo(objIx: i32, fnIx: i32) {
               // declared element's own spelling (D1690, D1694).
               if (
                 ok
-                && (vc != sc || sc == 16 || fieldCodeRefsElemHeapC(sc) || sc == 6)
+                && (vc != sc
+                  || sc == 16
+                  || fieldCodeRefsElemHeapC(sc)
+                  || sc == 6
+                  || sc == 0)
               ) {
                 if !sIsAnonRow(si) {
                   if dstRow == 0 - 2 {
