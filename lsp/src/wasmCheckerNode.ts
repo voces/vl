@@ -51,6 +51,7 @@ import { execFileSync } from "node:child_process";
 import { readFileSync, statSync } from "node:fs";
 import type { ModuleReader } from "../../compiler/coreTypes.ts";
 import { withStd } from "./moduleGraph.ts";
+import { vlRootFor } from "./vlRoot.ts";
 import { createWasmChecker, type Exports, type WasmChecker } from "./wasmChecker.ts";
 
 export * from "./wasmChecker.ts";
@@ -188,5 +189,6 @@ export const loadWasmChecker = (
   return createWasmChecker(
     instantiate,
     (read: ModuleReader) => withStd(read, getStdDir),
+    vlRootFor,
   );
 };

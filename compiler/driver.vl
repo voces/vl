@@ -198,10 +198,12 @@ import {
   isReservedIntrinsicName,
   jwSetGenTokStart,
   jwSiteNode,
+  memSharedCalls,
   plusLinkCount,
   plusLinkStrAt,
   plusLinkTokAt,
   printDomainStr,
+  tErr,
   tErrBuiltinTyDecl,
 } from "./typecheck"
 import {
@@ -959,6 +961,7 @@ function jwSecondPass(root: i32): i32 {
   // and the marker is the first generated token (`jwTokIsGenerated` reads it).
   jwSetGenTokStart(jwGenTok)
   checkProgram(root)
+  checkMemSharedOrigin()
   plusLinksBank()
   0
 }
@@ -1000,6 +1003,7 @@ export function compileSrc(): i32 {
   if vcParseBlocked() { return 1 }
   csPreMintLocs()
   checkProgram(root)
+  checkMemSharedOrigin()
   plusLinksBank()
   // Emit never proceeds past a parse diagnostic, lossless or not: `vl build`/`vl run`
   // still keep rc 1 and the same parse message. The only difference lossless recovery
@@ -1114,6 +1118,7 @@ export function checkSrc(): i32 {
   vcEpBank(vcSource(), root)
   csPreMintLocs()
   checkProgram(root)
+  checkMemSharedOrigin()
   plusLinksBank()
   // A lossless-recovered file reports BOTH streams and keeps rc 1 — the parse
   // mistake is still the headline error, the type errors ride with it.
@@ -1239,16 +1244,69 @@ export function vlRootCommit(): i32 {
 }
 let vlCheckoutRoot = ""
 
-// `rawKey` as `lintSetPath` wants it. Already relative (every module-graph key, and a
-// CLI argument run the documented way, from the checkout root) — unchanged, trusting
-// that convention. Absolute and inside the staged checkout root — stripped to the
-// relative remainder. Absolute and outside it (or no root staged) — "", declining.
+// This process's current working directory, staged once at startup like `vlCheckoutRoot`
+// — what a relative CLI argument resolves against, so `lintScopeKeyOf` (D2355) judges
+// it by where it actually is rather than trusting its spelling. "" on a caller (a test
+// harness, an older seed) that never stages it.
+const cwAcc = cpAccNew()
+export function cwdPush(c: i32): i32 {
+  cpAccPush(cwAcc, c)
+  0
+}
+export function cwdCommit(): i32 {
+  vlCwd = cpAccTake(cwAcc)
+  0
+}
+let vlCwd = ""
+
+// The file being checked, RAW (not relativized) — a bare compile with no imports never
+// populates `modKeys`, so this is the only way `checkMemSharedOrigin` (D2355) learns
+// which file it is in. `cli.vl` stages it beside `lintSetPath`; the LSP beside
+// `vlRootPush`. Committed on every check, so a stale value cannot outlive its file.
+const cepAcc = cpAccNew()
+export function checkEntryPathPush(c: i32): i32 {
+  cpAccPush(cepAcc, c)
+  0
+}
+export function checkEntryPathCommit(): i32 {
+  checkEntryPath = cpAccTake(cepAcc)
+  0
+}
+// The VL-to-VL twin of the push/commit pair above — `cli.vl` already holds a real
+// `string`, so it sets it directly rather than re-encoding through the accumulator.
+export function checkEntryPathSet(p: string): i32 {
+  checkEntryPath = p
+  0
+}
+let checkEntryPath = ""
+
+// `rawKey` as `lintSetPath` wants it. Relative (a module-graph key, or a CLI argument
+// run the documented way) — unchanged, trusting a lint finding is not a capability.
+// Absolute and inside the staged checkout root — stripped to the relative remainder;
+// outside it, or with no root staged, "".
 export function lintScopeKeyOf(rawKey: string): string {
   if rawKey.length == 0 || rawKey[0] != '/' { return rawKey }
   if vlCheckoutRoot.length == 0 { return "" }
   const p = vlCheckoutRoot + "/"
   if rawKey.length <= p.length || rawKey.slice(0, p.length) != p { return "" }
   rawKey.slice(p.length, rawKey.length)
+}
+
+// `rawKey` as `checkMemSharedOrigin` (D2355) wants it — like `lintScopeKeyOf` above,
+// but a relative key is joined with the staged cwd and normalized rather than trusted
+// by spelling, since this decides a real capability rather than a lint finding: a
+// folder merely named `std/` outside the real checkout must not pass.
+export function checkOriginKeyOf(rawKey: string): string {
+  if rawKey.length == 0 { return rawKey }
+  let abs = rawKey
+  if rawKey[0] != '/' {
+    if vlCwd.length == 0 { return "" }
+    abs = modNormalize(vlCwd + "/" + rawKey)
+  }
+  if vlCheckoutRoot.length == 0 { return "" }
+  const p = vlCheckoutRoot + "/"
+  if abs.length <= p.length || abs.slice(0, p.length) != p { return "" }
+  abs.slice(p.length, abs.length)
 }
 
 // ── lint tier ──────────────────────────────────────────────────────────────────
@@ -1582,6 +1640,7 @@ export function checkSrcSym(): i32 {
   vcEpBank(vcSource(), root)
   csPreMintLocs()
   checkProgram(root)
+  checkMemSharedOrigin()
   plusLinksBank()
   // Lossless recovery: the symbol tables ARE populated for the rc-1 result too,
   // so hover / go-to-def / find-refs keep answering across a missing brace.
@@ -1615,6 +1674,43 @@ export function symBindingId(i: i32): i32 { symOccBinding(i) }
 // `modLoadStart`/`modLoadMod`; maps the occurrence's anchor token into that range.
 // Single-file mode (no module load) is always 0.
 export function modOfTok(tok: i32): i32 { srcmapModOfTok(tok) }
+
+// `__memory_shared__()` is std-internal (D2355): a call outside std is refused, once
+// `checkProgram` fills `memSharedCalls` with every call it resolved to the intrinsic.
+// Origin is the call's module key (`std:` only from a real specifier) OR, for the
+// entry, `checkEntryPath` relativized against the checkout root (`lintScopeKeyOf`).
+function checkMemSharedOrigin(): i32 {
+  let i = 0
+  while i < memSharedCalls.length {
+    const ix = memSharedCalls[i]
+    let std = false
+    // Whether `ix`'s module is the ENTRY — true by default, since a bare compile with
+    // no imports never populates `modKeys` at all, and its one module IS the entry.
+    let isEntry = true
+    if modKeys.length > 0 && ix >= 0 && ix < nodeToks.length {
+      const m = modOfTok(nodeToks[ix])
+      if m >= 0 && m < modKeys.length {
+        std = modKeyIsStd(modKeys[m])
+        isEntry = m == 0
+      }
+    }
+    // Only the entry: a std module reaches its siblings solely through a `std:`
+    // specifier, never a relative one, so a raw path elsewhere in the graph is
+    // always a user file.
+    if !std && isEntry {
+      const rel = checkOriginKeyOf(checkEntryPath)
+      std = rel.length >= 4 && rel.slice(0, 4) == "std/"
+    }
+    if !std {
+      tErr(
+        "'__memory_shared__' is internal to std; build-dependent code is not a user feature yet",
+        ix,
+      )
+    }
+    i = i + 1
+  }
+  0
+}
 // `__callsite__` mints one location-value node per call, before the checker runs,
 // since a default's value here IS the site (every other default form shares one
 // node). A pre-pass, not a rewrite: minted before `checkProgram` sizes `nodeTyIx`
@@ -4076,6 +4172,7 @@ function modCompile(emit: i32): i32 {
   const merged = mkProgram(allStmts, -1) // synthesized merged-module root (no source token)
   csPreMintLocs()
   checkProgram(merged)
+  checkMemSharedOrigin()
   plusLinksBank()
   // A lossless-recovered graph CHECKS but never BUILDS — same rule as
   // `compileSrc`, and the rc stays 1 so `vl build` behaves exactly as before.

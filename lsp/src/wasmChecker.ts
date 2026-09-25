@@ -789,10 +789,20 @@ const readBytes = (len: number, at: (j: number) => number): Uint8Array => {
  * loop — the std-resolution layer. The Node loader passes `withStd` (workspace
  * `std/` dir over the embedded map); the browser passes an embedded-map reader.
  * Omitted, the reader is used as-is (no std overlay).
+ *
+ * `resolveVlRoot` answers the VL checkout root an `entryKey` (a document's path)
+ * sits under, or undefined outside any — staged into the seed's `vlCheckoutRoot`
+ * (`vlRootPush`/`vlRootCommit`, driver.vl) so `checkMemSharedOrigin` can recognize
+ * a std file opened DIRECTLY (its own module key is a bare path, never `std:`) the
+ * same way the CLI does for `vl check std/…`. The Node loader passes `vlRootFor`
+ * (`vlRoot.ts`, filesystem-based); the browser has no checkout to find and omits
+ * it, so a playground snippet is never std — correctly, since it never is one.
+ * `node:fs`/`node:path` stay out of this module either way.
  */
 export const createWasmChecker = (
   instantiate: () => Exports | undefined,
   wrapReader?: (read: ModuleReader) => ModuleReader,
+  resolveVlRoot?: (entryKey: string) => string | undefined,
 ): WasmChecker => {
   /**
    * What the instance's per-module scan cache holds, AS THE HOST LAST WROTE IT:
@@ -835,6 +845,26 @@ export const createWasmChecker = (
     read: ModuleReader,
   ): Promise<void> => {
     exp.modReset();
+    // Re-staged every call (cheap, and memoized in `vlRootFor` itself): an older
+    // seed lacks the two exports and every path-scoped rule just declines, as
+    // it did before this channel existed.
+    if (
+      typeof exp.vlRootPush === "function" &&
+      typeof exp.vlRootCommit === "function"
+    ) {
+      const root = resolveVlRoot?.(entryKey);
+      if (root !== undefined) pushString(exp.vlRootPush, root);
+      exp.vlRootCommit();
+    }
+    // `checkMemSharedOrigin` (D2355) needs the RAW entry path even when `source` has
+    // no imports at all, in which case `modKeyPush`/`modCommit` below never run.
+    if (
+      typeof exp.checkEntryPathPush === "function" &&
+      typeof exp.checkEntryPathCommit === "function"
+    ) {
+      pushString(exp.checkEntryPathPush, entryKey);
+      exp.checkEntryPathCommit();
+    }
     if (needsModules(source)) {
       // `std:` keys resolve through the host's reader wrapper (the Node loader's
       // `withStd`: workspace `std/` dir first, then the embedded map — same
