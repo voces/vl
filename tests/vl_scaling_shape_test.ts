@@ -621,6 +621,62 @@ axis(
   (d) => twoFiles(d, genSiblingReps(2500, "same"), genSiblingReps(2500, "hoisted")),
 );
 
+// A value-union declared once, then `n` top-level statements (so `startStmts` holds `n`
+// entries in the many arm, one wrapping bare block in the one arm), plus `n` reads of the
+// union-returning function `g` bound to a local INSIDE `h` — a name `startBlockLetOfAt`'s
+// fallback never finds at start scope. D2326: `startBlockLetRowOfAt` rebuilt
+// `parentLetOfAt`'s whole per-function plan once per top-level statement, on every such
+// miss, instead of gating the search on the cheap memoized "bound nowhere" answer first.
+const genTopStmtsUnionMiss = (n: number, many: boolean): string => {
+  const o = ["type U = i32 | string", "function g(x: i32): U {", "  if x % 2 == 0 { return x }", '  "s"', "}"];
+  if (many) {
+    for (let i = 0; i < n; i++) o.push(`print(${i})`);
+  } else {
+    const inner: string[] = [];
+    for (let i = 0; i < n; i++) inner.push(`print(${i})`);
+    o.push(`{ ${inner.join("; ")} }`);
+  }
+  o.push("function h(): i32 {", "  let t = 0");
+  for (let i = 0; i < n; i++) {
+    o.push(`  const f${i} = g`, `  const r${i} = f${i}(${i})`, `  if r${i} is i32 { t = t + r${i} }`);
+  }
+  o.push("  t", "}", "print(h())");
+  return o.join("\n") + "\n";
+};
+
+axis(
+  "top-level statements before a union-name miss",
+  2.5,
+  "`startBlockLetRowOfAt` is rebuilding `parentLetOfAt`'s plan once per top-level statement on every miss (D2326).",
+  (d) => twoFiles(d, genTopStmtsUnionMiss(3000, true), genTopStmtsUnionMiss(3000, false)),
+);
+
+// `n` sibling blocks each shadowing `v`, all closed, then `n` reads of the OUTER `v` — the
+// many arm's duplicate chain for `v` has length `n`; the one arm's has length 1. A declared
+// union type is load-bearing here, not scenery: `uDeclared` gates whether an ordinary read
+// re-enters `parentLetOfAt` through the union ladder at all, and only THAT path calls
+// `plBestDupAt`; the same shape with no union in the program never reaches it. Because the
+// shadows are SIBLINGS, every one closes before the next opens, so a fixed answer of "no
+// enclosing declaration" should make the search past the first miss O(1). D2326:
+// `plBestDupAt`'s walk past a binary-search miss stepped to the previous SIBLING instead of
+// jumping via `plSortedSkip` to the nearest ENCLOSING one, re-walking the whole closed chain
+// on every one of the `n` reads.
+const genManyClosedSiblingReads = (n: number, many: boolean): string => {
+  const o = ["type U = i32 | string", "function h(): i32 {", "  let t = 0", "  let v = 1"];
+  const shadows = many ? n : 1;
+  for (let i = 0; i < shadows; i++) o.push(`  { const v = ${i}`, `    t = t + v }`);
+  for (let i = 0; i < n; i++) o.push("  t = t + v");
+  o.push("  t", "}", "print(h())");
+  return o.join("\n") + "\n";
+};
+
+axis(
+  "reads after many closed sibling shadows",
+  2.5,
+  "`plBestDupAt` is stepping past every closed sibling instead of jumping via `plSortedSkip` (D2326).",
+  (d) => twoFiles(d, genManyClosedSiblingReads(12000, true), genManyClosedSiblingReads(12000, false)),
+);
+
 // One `match` of `n` arms, each reading the module global `k`, written as a closure's body or
 // as a top-level function's. Every arm's read asks whether `k` is a capture of the frame, which
 // a top-level function answers without a walk. Both arms share `fill` statements so the cheap

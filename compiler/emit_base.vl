@@ -178,6 +178,11 @@ let plSortCount: i32[] = []
 let plSortGen: i32[] = []
 let plSortedCand: i32[] = []
 let plSortedOwner: i32[] = []
+// The nearest EARLIER entry (a global index into these same flat arrays, or -1) whose block
+// still encloses this one's — a monotonic-stack build in `plBuildSortedDup` lets
+// `plBestDupAt` jump past a whole closed sibling subtree in one step instead of stepping
+// past each of its members (D2326 perf).
+let plSortedSkip: i32[] = []
 
 // The loop-variable half of `plCacheMap`'s plan: `name -> ForRange/ForIn` arena index,
 // first-wins, under the same generation stamp. A `for v in …` variable is a function-scoped
@@ -285,6 +290,7 @@ export function sidResetParentLet() {
   plSortGen = []
   plSortedCand = []
   plSortedOwner = []
+  plSortedSkip = []
   plLoopSidVal = []
   plLoopSidGen = []
   plGen = 0
@@ -593,11 +599,12 @@ function plBuildLetMap(blockIx: i32) {
   plMoreOwner = []
   plMoreNext = []
   plMoreHead = []
-  // `plSortedCand`/`plSortedOwner` are flat too (a stale slice cannot be told apart from a
-  // fresh one within), while `plSortStart`/`plSortCount`/`plSortGen` are sid-indexed and
-  // self-invalidate against `plGen` like `plSidGen`/`plDupGen` do.
+  // `plSortedCand`/`plSortedOwner`/`plSortedSkip` are flat too (a stale slice cannot be told
+  // apart from a fresh one within), while `plSortStart`/`plSortCount`/`plSortGen` are
+  // sid-indexed and self-invalidate against `plGen` like `plSidGen`/`plDupGen` do.
   plSortedCand = []
   plSortedOwner = []
+  plSortedSkip = []
   plScanStmt(blockIx, blockIx)
 }
 
@@ -611,10 +618,10 @@ export function parentLetOf(blockIx: i32, name: string) {
   parentLetOfSid(blockIx, sidOf(name))
 }
 
-// The sid-taking primitive (R5/R6): no hash, no probe, two array reads — what the hot
-// callers (`unionNameOfIdent`, `identFnTypeAnnName`, `identClosureFe`, `identCopySource`)
-// use to resolve an identifier and then ask this same table about the same name, spending
-// the interned id twice. A caller holding the identifier's arena index gets it from the carrier for free.
+// The sid-taking primitive (R5/R6): no hash, no probe, two array reads. Ambiguous among
+// sibling blocks binding one name — `parentLetOfAt`'s positioned form is what every caller
+// with a real position uses; `startBlockLetRowOfSid`'s own first-wins scan is this file's
+// last unpositioned caller. A caller holding the identifier's arena index gets the sid from the carrier for free.
 export function parentLetOfSid(blockIx: i32, sid: i32) {
   if blockIx < 0 { return -1 }
   if blockIx != plCacheBlock {
@@ -627,10 +634,10 @@ export function parentLetOfSid(blockIx: i32, sid: i32) {
   sidArrGet(plSidVal, sid)
 }
 
-// Lazily materializes `sid`'s `plMore*` chain (DESCENDING — `plMoreHead` is the most
-// recently pushed row) into an ASCENDING-by-`cand` slice of the flat `plSortedCand`/
-// `plSortedOwner`, once per (function, sid). `plSortStart`/`plSortCount` locate the slice;
-// `plSortGen` gates the build to once per `plGen`.
+// Lazily materializes `sid`'s `plMore*` chain (DESCENDING) into an ASCENDING-by-`cand` slice
+// of `plSortedCand`/`plSortedOwner`, plus `plSortedSkip`: a monotonic stack of open scopes
+// gives each entry the nearest EARLIER one whose owner has not yet closed — its nearest
+// ENCLOSING declaration of the same name, exact since blocks nest as intervals.
 function plBuildSortedDup(sid: i32) {
   const tmpCand: i32[] = []
   const tmpOwner: i32[] = []
@@ -641,10 +648,20 @@ function plBuildSortedDup(sid: i32) {
     i = plMoreNext[i]
   }
   const start = plSortedCand.length
+  const stack: i32[] = []
   let j = tmpCand.length - 1
   while j >= 0 {
-    plSortedCand.push(tmpCand[j])
+    const cand = tmpCand[j]
+    while stack.length > 0 && plSortedOwner[stack[stack.length - 1]] <= cand {
+      stack.pop()
+    }
+    let skip = -1
+    if stack.length > 0 { skip = stack[stack.length - 1] }
+    const idx = plSortedCand.length
+    plSortedCand.push(cand)
     plSortedOwner.push(tmpOwner[j])
+    plSortedSkip.push(skip)
+    stack.push(idx)
     j = j - 1
   }
   sidArrPut(plSortStart, sid, start)
@@ -653,9 +670,9 @@ function plBuildSortedDup(sid: i32) {
 }
 
 // The LARGEST `cand` among `first` and sid's duplicate chain with `cand < atIx <= own` —
-// `parentLetOfAt`'s and `parentLetCoversAt`'s shared search, by binary search over the
-// lazily-sorted chain for the rightmost `cand < atIx`, then a walk toward smaller `cand`
-// bounded by nesting depth (not duplicate count) until one's owner covers `atIx` (D2326 perf).
+// `parentLetOfAt`'s and `parentLetCoversAt`'s shared search: binary search for the rightmost
+// `cand < atIx`, then follow `plSortedSkip` to the nearest ENCLOSING declaration whenever one
+// does not cover `atIx`, bounded by nesting depth rather than duplicate count.
 function plBestDupAt(sid: i32, atIx: i32, first: i32, fOwner: i32): i32 {
   let best = -1
   if first < atIx && atIx <= fOwner { best = first }
@@ -674,15 +691,16 @@ function plBestDupAt(sid: i32, atIx: i32, first: i32, fOwner: i32): i32 {
       hi = mid - 1
     }
   }
-  let k = pos
-  let searching = true
-  while searching && k >= 0 {
-    const cand = plSortedCand[start + k]
-    if atIx <= plSortedOwner[start + k] {
+  let k = start + pos
+  let searching = pos >= 0
+  while searching && k >= start {
+    const cand = plSortedCand[k]
+    if atIx <= plSortedOwner[k] {
       if cand > best { best = cand }
       searching = false
     } else {
-      k = k - 1
+      k = plSortedSkip[k]
+      if k < start { searching = false }
     }
   }
   best
