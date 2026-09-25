@@ -20770,7 +20770,11 @@ function emitForRangeStmt(body: u8[], s: ForRange, _stmtIx: i32, fnIx: i32) {
       stepK: stepK,
       excl: s.frExcl,
     }
-    rc = emitRangeRolled(body, s, fnIx, rt)
+    if rangePartialUnrollOk(s, stepK, dynStep, fnIx) {
+      rc = emitRangePartial(body, s, fnIx, rt)
+    } else {
+      rc = emitRangeRolled(body, s, fnIx, rt)
+    }
   }
   loopHoistClose(frHoist)
   rangeProofClose(frProof)
@@ -20879,6 +20883,144 @@ function emitRangeRolled(body: u8[], s: ForRange, fnIx: i32, rt: RangeTest) {
   loopContDepth.pop()
   loopContLabel.pop()
   fbEnd()       // end block
+  loopBrkDepth.pop()
+  loopBrkLabel.pop()
+  0
+}
+
+// The copies per trip of a partially unrolled range loop, and the most nodes its body may hold;
+// both are chosen in DECISIONS.md, "Small variable-trip range loops are unrolled 4x".
+const PARTIAL_UNROLL_COPIES = 4
+const PARTIAL_UNROLL_MAX_NODES = 40
+
+// Whether a range loop that is not fully unrolled runs its body `PARTIAL_UNROLL_COPIES` times per
+// trip: a static step of 1, a body that holds no loop, never writes the loop var, and passes
+// `unrollCost` (no function, no call but an inline memory intrinsic) within the node cap.
+function rangePartialUnrollOk(
+  s: ForRange,
+  stepK: i32,
+  dynStep: boolean,
+  fnIx: i32,
+): boolean {
+  if dynStep || stepK != 1 { return false }
+  if stmtAssignsName(s.frBody, s.frVar) { return false }
+  partialUnrollCost(s.frBody, fnIx) >= 0
+}
+
+// The node count under `ix`, or -1 past `PARTIAL_UNROLL_MAX_NODES` or on a kind outside the
+// cheap set: scalar operators, locals, field reads, `if`, a `let`, `break`/`continue`/`return`,
+// an index into a list or string, and an inline memory intrinsic. A loop, a function, any other
+// call, a map index and every allocating literal decline: each lowers to far more than its nodes.
+function partialUnrollCost(ix: i32, fnIx: i32): i32 {
+  let cnt = 0
+  let cur = ix
+  while cur >= 0 {
+    if cur >= P.nodes.length { return -1 }
+    const n = P.nodes[cur]
+    let ok = n is NumLit || n is CharLit || n is BoolLit || n is Ident || n is Unary
+    ok = ok || n is BinExpr || n is Member || n is Paren || n is AsExpr || n is TypeRef
+    ok = ok || n is IfStmt || n is Block || n is LetDecl || n is BreakStmt
+    ok = ok || n is ContinueStmt || n is RetStmt
+    if n is Index {
+      const r = n.idxArr
+      ok = scalarListElemKind(r, fnIx) != null || exprRefArray(r, fnIx)
+      ok = ok || exprStringArray(r, fnIx) || exprString(r, fnIx)
+    }
+    if n is Call { ok = hoistSafeMemCall(cur, fnIx) }
+    if !ok { return -1 }
+    cnt = cnt + 1
+    const kids = nodeSpineChildren(cur)
+    let i = 0
+    while i < kids.length {
+      if kids[i] >= 0 {
+        const c = partialUnrollCost(kids[i], fnIx)
+        if c < 0 { return -1 }
+        cnt = cnt + c
+        if cnt > PARTIAL_UNROLL_MAX_NODES { return -1 }
+      }
+      i = i + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  cnt
+}
+
+// The range loop with its body copied `PARTIAL_UNROLL_COPIES` times per trip while that many
+// trips remain, then the rolled loop for the rest. The main loop's test is `v < bound - D`
+// (D the copies less one, one fewer for `to`), with a bound too low to subtract from running
+// no main trip. Copy `k` sets the loop var to `u + k`, `u` the trip's first value, so every
+// read of it sees its own trip's value and the copies do not chain their increments.
+// `break` leaves one block around both loops; `continue` ends its own copy.
+function emitRangePartial(body: u8[], s: ForRange, fnIx: i32, rt: RangeTest) {
+  fbBlock(64) // 0x02 block, void — the `break` target of both loops
+  loopBrkDepth.push(ctrlDepth)
+  loopBrkLabel.push(s.frLabel)
+  let d = PARTIAL_UNROLL_COPIES - 1
+  if !rt.excl { d = d - 1 }
+  const intMin = -2147483647 - 1
+  // A constant bound too low to subtract from runs no main trip at all.
+  const mainRuns = !rt.bConst || rt.bVal >= intMin + d
+  if mainRuns {
+    let limSlot = -1
+    if !rt.bConst {
+      // lim = bound >= INT_MIN + d ? bound - d : INT_MIN
+      limSlot = strI32Slot()
+      fbLocalGet(rt.bIdx)
+      fbI32Const(d)
+      fbI32Bin(107)     // 0x6b i32.sub
+      fbI32Const(intMin)
+      fbLocalGet(rt.bIdx)
+      fbI32Const(intMin + d)
+      fbI32Bin(78)      // 0x4e i32.ge_s
+      wU8(27)           // 0x1b select
+      fbLocalSet(limSlot)
+    }
+    const uSlot = strI32Slot()
+    fbBlock(64) // 0x02 block, void — the main loop's exit
+    fbLoop(64)  // 0x03 loop, void
+    fbLocalGet(rt.vIdx)
+    if rt.bConst { fbI32Const(rt.bVal - d) } else { fbLocalGet(limSlot) }
+    fbI32Bin(72) // 0x48 i32.lt_s
+    fbI32Eqz()
+    fbBrIf(1)    // leave the main loop
+    fbLocalGet(rt.vIdx)
+    fbLocalSet(uSlot)
+    const hasCont = blockHasContinueFor(s.frBody, s.frLabel, false)
+    const cursor0 = emitLetCursor
+    let k = 0
+    while k < PARTIAL_UNROLL_COPIES {
+      emitLetCursor = cursor0
+      if k > 0 {
+        fbLocalGet(uSlot)
+        fbI32Const(k)
+        fbI32Bin(106) // 0x6a i32.add
+        fbLocalSet(rt.vIdx)
+      }
+      if hasCont {
+        fbBlock(64) // this copy's continue block
+        loopContDepth.push(ctrlDepth)
+        loopContLabel.push(s.frLabel)
+      }
+      const rc = emitStmts(body, s.frBody, fnIx)
+      if hasCont {
+        fbEnd()
+        loopContDepth.pop()
+        loopContLabel.pop()
+      }
+      if rc < 0 { return -1 }
+      k = k + 1
+    }
+    emitLetCursor = cursor0
+    fbLocalGet(uSlot)
+    fbI32Const(PARTIAL_UNROLL_COPIES)
+    fbI32Bin(106) // 0x6a i32.add
+    fbLocalSet(rt.vIdx)
+    fbBr(0)     // next main trip
+    fbEnd()     // end loop
+    fbEnd()     // end block
+  }
+  if emitRangeRolled(body, s, fnIx, rt) < 0 { return -1 }
+  fbEnd() // end block
   loopBrkDepth.pop()
   loopBrkLabel.pop()
   0
@@ -21391,9 +21533,33 @@ function emitForInStmt(body: u8[], s: ForIn, _stmtIx: i32, fnIx: i32) {
   if fiHoist < 0 { return -1 }
   scopeBind(s.fiVar, vSlot)
   if hasPair { scopeBind(pairName, pSlot) }
+  // The element kinds whose loop var is a non-null ref recovered from a nullable slot.
+  const elemRecover = ek == "str"
+    || ek == "struct"
+    || ek == "variant"
+    || ek == "union"
+    || ek == "list"
+    || ek == "strlist"
+    || ek == "f64list"
+    || ek == "i64list"
+    || ek == "f32list"
+    || ek == "u8list"
+    || ek == "closure"
+    || ek == "reflist"
   fbBlock(64) // 0x02 block, void
   loopBrkDepth.push(ctrlDepth)
   loopBrkLabel.push(s.fiLabel)
+  if fiHBack >= 0 && !hasPair && partialUnrollCost(s.fiBody, fnIx) >= 0 {
+    const fiCopies: ForInCopies = {
+      back: fiHBack,
+      len: fiHLen,
+      cursor: iIdx,
+      v: vIdx,
+      backTy: backTy,
+      recover: elemRecover,
+    }
+    if emitForInCopies(body, s, fnIx, fiCopies) < 0 { return -1 }
+  }
   fbLoop(64)  // 0x03 loop, void
   loopContDepth.push(ctrlDepth)
   loopContLabel.push(s.fiLabel)
@@ -21464,20 +21630,7 @@ function emitForInStmt(body: u8[], s: ForIn, _stmtIx: i32, fnIx: i32) {
     fbLocalGet(iIdx)
     fbArrayGet(backTy)
   }
-  if (
-    ek == "str"
-    || ek == "struct"
-    || ek == "variant"
-    || ek == "union"
-    || ek == "list"
-    || ek == "strlist"
-    || ek == "f64list"
-    || ek == "i64list"
-    || ek == "f32list"
-    || ek == "u8list"
-    || ek == "closure"
-    || ek == "reflist"
-  ) {
+  if elemRecover {
     // string/struct/union-box/closure element, or a nested inner-list/ref-list wrapper: all
     // are a non-null ref recovered from the `(ref null <elem>)` slot. Every niche element
     // kind is absent on purpose, since its loop var legitimately holds null — this set and
@@ -21552,6 +21705,73 @@ function emitForInStmt(body: u8[], s: ForIn, _stmtIx: i32, fnIx: i32) {
   if hasPair { scopeUnbind() }
   scopeUnbind()
   return 0
+}
+
+// The locals and types a `for`-in walk's unrolled copies read: the hoisted backing and `len`,
+// the cursor, the loop var, the backing's array type, and whether an element is recovered
+// non-null (`ref.as_non_null`) as the rolled walk recovers it.
+type ForInCopies = {
+  back: i32,
+  len: i32,
+  cursor: i32,
+  v: i32,
+  backTy: i32,
+  recover: boolean,
+}
+
+// Ahead of a hoisted list walk's rolled loop, the walk with its body copied
+// `PARTIAL_UNROLL_COPIES` times per trip while that many elements remain; copy `k` binds the
+// element at `cursor + k`. The rolled loop then walks the rest from the cursor this leaves.
+// Emitted inside the walk's `break` block; `continue` ends its own copy.
+function emitForInCopies(body: u8[], s: ForIn, fnIx: i32, c: ForInCopies) {
+  const limSlot = strI32Slot()
+  fbLocalGet(c.len)
+  fbI32Const(PARTIAL_UNROLL_COPIES - 1)
+  fbI32Bin(107) // 0x6b i32.sub — `len` is never negative, so this cannot wrap
+  fbLocalSet(limSlot)
+  fbBlock(64) // 0x02 block, void — the main loop's exit
+  fbLoop(64)  // 0x03 loop, void
+  fbLocalGet(c.cursor)
+  fbLocalGet(limSlot)
+  fbI32Bin(78) // 0x4e i32.ge_s
+  fbBrIf(1)    // leave the main loop
+  const hasCont = blockHasContinueFor(s.fiBody, s.fiLabel, false)
+  const cursor0 = emitLetCursor
+  let k = 0
+  while k < PARTIAL_UNROLL_COPIES {
+    emitLetCursor = cursor0
+    fbLocalGet(c.back)
+    fbLocalGet(c.cursor)
+    if k > 0 {
+      fbI32Const(k)
+      fbI32Bin(106) // 0x6a i32.add
+    }
+    fbArrayGet(c.backTy)
+    if c.recover { wU8(212) } // 0xd4 ref.as_non_null
+    fbLocalSet(c.v)
+    if hasCont {
+      fbBlock(64) // this copy's continue block
+      loopContDepth.push(ctrlDepth)
+      loopContLabel.push(s.fiLabel)
+    }
+    const rc = emitStmts(body, s.fiBody, fnIx)
+    if hasCont {
+      fbEnd()
+      loopContDepth.pop()
+      loopContLabel.pop()
+    }
+    if rc < 0 { return -1 }
+    k = k + 1
+  }
+  emitLetCursor = cursor0
+  fbLocalGet(c.cursor)
+  fbI32Const(PARTIAL_UNROLL_COPIES)
+  fbI32Bin(106) // 0x6a i32.add
+  fbLocalSet(c.cursor)
+  fbBr(0)     // next main trip
+  fbEnd()     // end loop
+  fbEnd()     // end block
+  0
 }
 
 function emitBreakStmtStmt(
