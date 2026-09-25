@@ -7752,7 +7752,7 @@ the overhead. 40 nodes covers a body of a few statements over list reads and kee
 growth to four more copies of something small; the vs-rust module grows 3,912 → 4,503 bytes.
 `mix`'s loop, which the section above measured 2x-unrolled at 0.5%, is copied too and stays
 inside the noise. bench/vs-rust, master and this interleaved twice (`--reps 15`, load 6–8):
-`array` 1.86 / 1.95 → 1.48 / 1.48x Rust, every other kernel within 0.05x.
+`array` 1.86 / 1.95 → 1.48 / 1.48x Rust; every other kernel inside run-to-run noise.
 
 **A list reached through a field is cached too.** `b.xs[i]` under `for i in 0 until b.xs.length`
 re-read `b.xs`, its backing and its `len` and kept the select on every access (binaryen's
