@@ -584,6 +584,7 @@ import {
   captureNamesOf,
   captureValKind,
   capturedIsUnionBox,
+  capturedKindOf,
   capturedNulListCellRead,
   catListKindOfBin,
   catListKindOfExpr,
@@ -785,6 +786,7 @@ import {
   mapRetExprShape,
   mapShapeOfExpr,
   mapSlotTag,
+  maskNarrowFor,
   memIsNarrowed,
   memNarrowVariantIndex,
   memReadBoxedAtomKind,
@@ -955,6 +957,7 @@ import {
   unionSetHasAtom,
   unionSetHasNull,
   unionStoreAtomKind,
+  unmaskNarrow,
   valueAtomNameOfKind,
   variantDiscrimFieldNeeded,
   variantFieldElemName,
@@ -2683,36 +2686,64 @@ function emitVariantDiscrimTest(body: u8[], recvIx: i32, vi: i32, fnIx: i32) {
   0
 }
 
-// Lower a type guard `recv is X`. Fixed, load-bearing arm order: checker-typed tautology,
-// niche null tests, atom/literal-union membership, box-tag compares, mono-static folds, then
-// the variant tag+discriminant compare. A niche `is` assumes the checker proved the tested
-// shape is the sole non-null member, which monomorphization can break (D950).
+// Lower a type guard `recv is X`: a narrowed operand's narrowing is lifted for the test, an
+// un-narrowed frame local typed as exactly `X` is a tautology, and `emitIsTest` does the rest.
 function emitIs(body: u8[], isIx: i32, fnIx: i32) {
   const nd0 = P.nodes[isIx]
   if nd0 is IsExpr {
-    // A tautology first: the checker typed the operand as exactly the tested type and the
-    // emitter reads it unboxed, so the test holds of every value it can read (D2447). A
-    // `match` scrutinee is excluded, being one node whose recorded type is the last arm's.
-    const isOpTy = nodeTyIxOf(nd0.isObj)
-    const isTsTy = isVarTyIxOf(isIx)
-    if (
-      isOpTy >= 0
-      && isTsTy >= 0
-      && !isUnionOfTy(isOpTy)
-      && !matchScrutAt(nd0.isObj)
-      && !exprUnion(nd0.isObj, fnIx)
-    ) {
-      if tySame(isOpTy, isTsTy) {
-        // A name's read can only trap on its rep's own recovery, so it is not made.
-        if !(P.nodes[unwrapParen(nd0.isObj)] is Ident) {
-          if emitExpr(body, nd0.isObj, fnIx) < 0 { return -1 }
-          fbDrop()
-        }
+    // A narrowed operand is tested at its storage, never trusted: the narrowing is lifted
+    // for the test, so the read is the declared box and the rungs below test its tag. A
+    // write the narrowing does not see (an alias, an escaped closure) is then answered (D2447).
+    const masked = maskNarrowFor(isNarrowMaskKey(nd0.isObj, fnIx))
+    if masked.length > 0 {
+      const r = emitIsTest(body, isIx, fnIx)
+      unmaskNarrow(masked)
+      return r
+    }
+    // A frame local no narrowing binds holds its own type in its slot, so where the checker
+    // typed it as exactly the tested type the test is a tautology (`const w = v` under a
+    // narrowing of `v`). A `match` scrutinee is one node whose recorded type is the last arm's.
+    const tl = P.nodes[unwrapParen(nd0.isObj)]
+    if tl is Ident {
+      const isOpTy = nodeTyIxOf(nd0.isObj)
+      const isTsTy = isVarTyIxOf(isIx)
+      if (
+        localIndexOf(fnIx, tl.identName) >= 0
+        && isOpTy >= 0
+        && isTsTy >= 0
+        && !isUnionOfTy(isOpTy)
+        && !matchScrutAt(nd0.isObj)
+        && !exprUnion(nd0.isObj, fnIx)
+        && tySame(isOpTy, isTsTy)
+      ) {
         fbI32Const(1)
         return 0
       }
     }
   }
+  emitIsTest(body, isIx, fnIx)
+}
+
+// The narrowing key `emitIs` lifts for operand `recvIx`: a name, or a member or index place,
+// or "" where the storage itself holds the narrowed rep (a capture whose env field is not the
+// union box), which lifting would misread.
+function isNarrowMaskKey(recvIx: i32, fnIx: i32): string {
+  const r = P.nodes[unwrapParen(recvIx)]
+  if r is Ident {
+    if capturedKindOf(fnIx, r.identName) != null {
+      if !capturedIsUnionBox(fnIx, r.identName) { return "" }
+    }
+    return r.identName
+  }
+  placeNarrowKeyOf(recvIx)
+}
+
+// `recv is X` over an operand read at the rep the narrowing stack leaves it. Fixed,
+// load-bearing arm order: niche null tests, atom/literal-union membership, box-tag compares,
+// mono-static folds, then the variant tag+discriminant compare. A niche `is` assumes the checker
+// proved the tested shape is the sole non-null member, which monomorphization can break (D950).
+function emitIsTest(body: u8[], isIx: i32, fnIx: i32) {
+  const nd0 = P.nodes[isIx]
   if nd0 is IsExpr {
     if exprNullableRefNiche(nd0.isObj, fnIx) {
       if nulNicheIsTestImpossible(nd0.isObj, isVarTyIxOf(isIx), fnIx) {
