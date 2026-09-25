@@ -133,6 +133,11 @@ ROWS = [
     ("covarValueWriteState", ["cwArenaLen", "cwRootNames", "cwRootFrames"], "probe",
      ("  if root == \"\" { return 2 }\n  if P.nodes.length != cwArenaLen {",
       "  if root == \"\" { return 2 }\n  if true {")),
+    # D2289: one frame's "does the chain bind this name" answers, dropped whenever the asked frame
+    # changes and on every `resetParentLetCache`.
+    ("frameBindsCache", ["fcbSidGen"], "probe",
+     ("  if sidArrGet(fcbSidGen, sid) != fcbGen { return -1 }",
+      "  if true { return -1 }")),
     ("listRepQuery", ["lrMemoGen"], "probe",
      ("    if lrMemoGen[exprIx] == lrGen && lrMemoFn[exprIx] == fnIx {",
       "    if false && lrMemoGen[exprIx] == lrGen && lrMemoFn[exprIx] == fnIx {")),

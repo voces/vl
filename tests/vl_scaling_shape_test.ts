@@ -917,6 +917,29 @@ axis(
   (d) => twoFiles(d, genGetterCallees(1600, 1), genGetterCallees(1600, 20)),
 );
 
+// `n` calls of a top-level `function w` in one function whose frame also binds `w` out of the
+// calls' scope (a closed block's `const w` and an ended `for w`), against the same function with
+// those bindings named `v`. Every call asks whether a binding of its callee's name is in scope at
+// it, and that answer comes off a per-sid index of the frame's bindings, not a body walk (D2289).
+// At 16,000 calls: 0.38 / 0.34 / 0.95 here, 15.66 / 0.36 / 39.15 on #3135's round-3 cut, and
+// 0.72 / 0.36 / 1.80 on master, whose `blockDeclaresStmt` scanned the body's statements per read.
+const genShadowedCallee = (n: number, shadow: boolean): string => {
+  const b = shadow ? "w" : "v";
+  const o = ["function w(): i32 { return 1 }", "function g(): i32 {", "  let acc = 0"];
+  o.push(`  if acc > 5 {\n    const ${b} = 3\n    acc = acc + ${b}\n  }`);
+  o.push(`  for ${b} in [1, 2] { acc = acc + ${b} }`);
+  for (let i = 0; i < n; i++) o.push(`  acc = acc + w() * ${i % 97}`);
+  o.push("  acc", "}", "print(g())");
+  return o.join("\n") + "\n";
+};
+
+axis(
+  "calls under a same-named binding",
+  2.5,
+  "A call's shadow test is walking the frame body per call (`chainShadowsAt`, D2289).",
+  (d) => twoFiles(d, genShadowedCallee(20000, true), genShadowedCallee(20000, false)),
+);
+
 // ── the instrument's own control ─────────────────────────────────────────────
 // EVERY PAIR ABOVE PASSES, so nothing above can say whether the grader still reds. The
 // control is the same `grade` over a pair that must: one source, one literal different,
