@@ -14050,6 +14050,9 @@ function emitNumWrapCast(body: u8[], e: AsExpr, exprIx: i32, fnIx: i32) {
   }
   // An i64 target is the sign-extend, which the i64 helper already is for both sources.
   if tgt == "i64" { return emitNumIntrArg(body, obj, 3, fnIx) }
+  // `((y >>> k) & m) as% i32` narrows to i32 ops when the mask stays in the low word.
+  const nsrc = srWrappedMask(exprIx, fnIx)
+  if nsrc.length > 0 { return srEmitNarrowed(body, nsrc, fnIx) }
   const lit = P.nodes[unwrapParen(obj)]
   let folded = false
   if lit is NumLit {
@@ -23325,6 +23328,240 @@ function emitF64RemCall(
   0
 }
 
+// ── Shift/mask strength reduction (plumb PL-037 item 2) ──────────────────────────────────
+// `((x >>> k) & m) << j` is `(x >>> (k-j)) & (m << j)` (or `(x << (j-k)) & (m << j)` when j > k):
+// bit i of both is m[i-j] & x[i-j+k] for i >= j and 0 below, since a logical shift fills zeros.
+// Binaryen 130 folds neither this nor the i64 narrowing below at any level, so the emitter does.
+
+// Whether node `ix` is typed exactly `i64` (`wide`) or `i32` (a paren is its inner node).
+function srTyIs(ix: i32, wide: boolean): boolean {
+  const x = unwrapParen(ix)
+  if x < 0 || x >= P.nodes.length { return false }
+  const p = tyPrimNameOf(nodeTyIxOf(x))
+  if wide { return p == "i64" }
+  p == "i32"
+}
+
+// A shift count at `ix`: a compile-time integer in 0..w-1, else -1.
+function srShiftConst(ix: i32, w: i32, fnIx: i32): i64 {
+  const v = memOffsetConstValue(ix, fnIx)
+  if v < 0 || v >= w { return -1 }
+  v
+}
+
+// A mask at `ix`: a compile-time integer that is non-negative at width `w` (at most 2^31-1 for
+// i32, 2^32-1 for i64 — `memOffsetConstValue`'s own ceiling), else -1.
+function srMaskConst(ix: i32, w: i32, fnIx: i32): i64 {
+  if w == 32 { return memAddrConst(ix, fnIx) }
+  memOffsetConstValue(ix, fnIx)
+}
+
+// The exponent j of a power-of-two multiplier at `ix`, 0..w-1, else -1: `y * 2^j` is `y << j`
+// at every width, both being multiplication modulo 2^w.
+function srPow2Exp(ix: i32, w: i32, fnIx: i32): i64 {
+  const v = srMaskConst(ix, w, fnIx)
+  if v <= 0 || (v & (v - 1)) != 0 { return -1 }
+  let j: i64 = 0
+  while ((1 as i64) << j) < v { j = j + 1 }
+  if j >= w { return -1 }
+  j
+}
+
+// Whether `m < 2^bits` for a non-negative mask `m` (every such mask is below 2^33).
+function srMaskBelow(m: i64, bits: i64): boolean {
+  if bits >= 33 { return true }
+  m < ((1 as i64) << bits)
+}
+
+// The shifted source under mask `m` at width `w`, as [x, k, narrow]; [] when `ix` is not one.
+// `x >>> k`, or `x >> k` when m < 2^(w-k) (the sign fill never reaches a mask bit), gives
+// [x, k, 0]. At w = 32, `(y >>> k) as% i32` or `(y >> k) as% i32` with y an i64 gives [y, k, 1]
+// when k <= 31 and m < 2^(32-k): the mask reads bits k..31 of y only, which `wrap(y)` keeps.
+function srShiftSource(ix: i32, m: i64, w: i32, fnIx: i32): i64[] {
+  const none: i64[] = []
+  const x = unwrapParen(ix)
+  if x < 0 || x >= P.nodes.length { return none }
+  const e = P.nodes[x]
+  if e is BinExpr { return srShiftBin(e, x, m, w, false, fnIx) }
+  srNarrowSource(x, m, w, fnIx)
+}
+
+// `srShiftSource` of a node that is not a shift: an `as% i32` wrap of an i64 shift at w = 32,
+// else [].
+function srNarrowSource(x: i32, m: i64, w: i32, fnIx: i32): i64[] {
+  const none: i64[] = []
+  const e = P.nodes[x]
+  if e is AsExpr {
+    if w != 32 || e.asMode != "wrap" { return none }
+    if asExprNumCastDomain(x) != "i32" || !srTyIs(x, false) { return none }
+    const z = unwrapParen(e.asObj)
+    if z < 0 || z >= P.nodes.length { return none }
+    const ze = P.nodes[z]
+    if ze is BinExpr { return srShiftBin(ze, z, m, 64, true, fnIx) }
+  }
+  none
+}
+
+// `srShiftSource` of the shift node `e` (at `x`, width `w`). A narrowing source must also keep
+// every mask bit inside the low word: k <= 31 and m < 2^(32-k).
+function srShiftBin(
+  e: BinExpr,
+  x: i32,
+  m: i64,
+  w: i32,
+  narrow: boolean,
+  fnIx: i32,
+): i64[] {
+  const none: i64[] = []
+  if e.binOp != ">>>" && e.binOp != ">>" { return none }
+  if !srTyIs(x, w == 64) || !srTyIs(e.binLeft, w == 64) { return none }
+  const k = srShiftConst(e.binRight, w, fnIx)
+  if k < 0 { return none }
+  if e.binOp == ">>" && !srMaskBelow(m, w - k) { return none }
+  if narrow {
+    if k > 31 || !srMaskBelow(m, 32 - k) { return none }
+    return [e.binLeft as% i64, k, 1]
+  }
+  [e.binLeft as% i64, k, 0]
+}
+
+// The mask `&` at `ix` of width `w`, as [m, other]; [] when `ix` is not one.
+function srMaskOperands(ix: i32, w: i32, fnIx: i32): i64[] {
+  const none: i64[] = []
+  const x = unwrapParen(ix)
+  if x < 0 || x >= P.nodes.length { return none }
+  const e = P.nodes[x]
+  if e is BinExpr {
+    if e.binOp != "&" || !srTyIs(x, w == 64) { return none }
+    const mr = srMaskConst(e.binRight, w, fnIx)
+    if mr >= 0 { return [mr, e.binLeft as% i64] }
+    const ml = srMaskConst(e.binLeft, w, fnIx)
+    if ml >= 0 { return [ml, e.binRight as% i64] }
+  }
+  none
+}
+
+// A masked shift at `ix` of width `w`, as [x, k, narrow, m]; [] when `ix` is not one. Either
+// `(<shift source>) & m`, or at w = 32 `((y >>> k) & m) as% i32` with y an i64, k <= 31 and
+// m < 2^(32-k): the wrap keeps the low word of `(y >>> k) & m`, and so does the narrow form.
+function srMaskedSource(ix: i32, w: i32, fnIx: i32): i64[] {
+  const mo = srMaskOperands(ix, w, fnIx)
+  if mo.length > 0 {
+    const src = srShiftSource(mo[1] as% i32, mo[0], w, fnIx)
+    if src.length == 0 { return src }
+    return [src[0], src[1], src[2], mo[0]]
+  }
+  if w != 32 { return mo }
+  srWrappedMask(unwrapParen(ix), fnIx)
+}
+
+// `srMaskedSource` of an `as% i32` wrap over an i64 masked shift, else [].
+function srWrappedMask(x: i32, fnIx: i32): i64[] {
+  const none: i64[] = []
+  if x < 0 || x >= P.nodes.length { return none }
+  const e = P.nodes[x]
+  if e is AsExpr {
+    if e.asMode != "wrap" { return none }
+    if asExprNumCastDomain(x) != "i32" || !srTyIs(x, false) { return none }
+    const mo = srMaskOperands(e.asObj, 64, fnIx)
+    if mo.length == 0 { return none }
+    const src = srShiftSource(mo[1] as% i32, mo[0], 64, fnIx)
+    if src.length == 0 { return none }
+    if src[1] > 31 || !srMaskBelow(mo[0], 32 - src[1]) { return none }
+    return [src[0], src[1], 1, mo[0]]
+  }
+  none
+}
+
+// Pushes a constant at width `w` (an i32 takes the low 32 bits).
+function srConst(v: i64, w: i32) {
+  if w == 64 {
+    fbI64Const((v >>> 32) as% i32, v as% i32)
+  } else {
+    fbI32Const(v as% i32)
+  }
+  0
+}
+
+// The opcode of `op` at width `w`.
+function srOpcode(op: string, w: i32): i32 {
+  if w == 64 { return binOpcodeI64(op) }
+  binOpcode(op)
+}
+
+// Pushes source `src` ([x, k, narrow]) exactly as the unreduced chain would have evaluated x: at
+// its own width, then `i32.wrap_i64` for a narrowing source.
+function srPushSource(body: u8[], src: i64[], w: i32, fnIx: i32): i32 {
+  const x = src[0] as% i32
+  if src[2] == 1 {
+    if emitNumIntrArg(body, x, 3, fnIx) < 0 { return -1 }
+    fbI32WrapI64()
+    return 0
+  }
+  if w == 64 { return emitExprAsI64(body, x, fnIx) }
+  emitExpr(body, x, fnIx)
+}
+
+// Emits narrowing source `src` ([y, k, 1, m]) as `(wrap(y) >>> k) & m`, all at i32.
+function srEmitNarrowed(body: u8[], src: i64[], fnIx: i32): i32 {
+  if srPushSource(body, src, 32, fnIx) < 0 { return -1 }
+  if src[1] > 0 {
+    srConst(src[1], 32)
+    fbI32Bin(srOpcode(">>>", 32))
+  }
+  srConst(src[3], 32)
+  fbI32Bin(srOpcode("&", 32))
+  0
+}
+
+// Emits `e` (at `exprIx`, width `w`) strength-reduced when it is one of the shapes above:
+// `((x >>> k) & m) << j`, the same with `* 2^j`, or a narrowing `(y >>> k) as% i32 & m`.
+// Answers 0 when emitted, -1 on an emit failure, 1 when `e` is none of them (nothing
+// pushed). Every operand but x is a constant, so evaluation order and traps are unchanged.
+function emitShiftMaskFold(
+  body: u8[],
+  e: BinExpr,
+  exprIx: i32,
+  w: i32,
+  fnIx: i32,
+): i32 {
+  if !srTyIs(exprIx, w == 64) { return 1 }
+  if e.binOp == "&" {
+    if w != 32 { return 1 }
+    const nsrc = srMaskedSource(exprIx, w, fnIx)
+    if nsrc.length == 0 || nsrc[2] != 1 { return 1 }
+    return srEmitNarrowed(body, nsrc, fnIx)
+  }
+  let j: i64 = -1
+  let inner = -1
+  if e.binOp == "<<" {
+    j = srShiftConst(e.binRight, w, fnIx)
+    inner = e.binLeft
+  } else if e.binOp == "*" {
+    j = srPow2Exp(e.binRight, w, fnIx)
+    inner = e.binLeft
+    if j < 0 {
+      j = srPow2Exp(e.binLeft, w, fnIx)
+      inner = e.binRight
+    }
+  }
+  if j < 0 { return 1 }
+  const src = srMaskedSource(inner, w, fnIx)
+  if src.length == 0 { return 1 }
+  if srPushSource(body, src, w, fnIx) < 0 { return -1 }
+  const k = src[1]
+  if k > j {
+    srConst(k - j, w)
+    fbI32Bin(srOpcode(">>>", w))
+  } else if j > k {
+    srConst(j - k, w)
+    fbI32Bin(srOpcode("<<", w))
+  }
+  srConst(src[3] << j, w)
+  fbI32Bin(srOpcode("&", w))
+  0
+}
+
 function emitBinExprNode(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
   // Assignment (`=`) is a STATEMENT, not a value expression in this slice: it has
   // no result on the stack (it `local.set`s). It is lowered by `emitAssign` from
@@ -23738,6 +23975,8 @@ function emitBinExprNode(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
   const lI64 = exprIsI64(e.binLeft, fnIx)
   const rI64 = exprIsI64(e.binRight, fnIx)
   if lI64 || rI64 {
+    const sr64 = emitShiftMaskFold(body, e, exprIx, 64, fnIx)
+    if sr64 <= 0 { return sr64 }
     const opc64 = binOpcodeI64(e.binOp)
     if opc64 >= 0 {
       if emitExprAsI64(body, e.binLeft, fnIx) < 0 { return -1 }
@@ -23746,6 +23985,8 @@ function emitBinExprNode(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
       return 0
     }
   }
+  const sr32 = emitShiftMaskFold(body, e, exprIx, 32, fnIx)
+  if sr32 <= 0 { return sr32 }
   const opcode = binOpcode(e.binOp)
   if opcode < 0 { return emitFail("emitProgram: unsupported binary operator") }
   // Operands first (left then right), then the operator — wasm's stack order.
