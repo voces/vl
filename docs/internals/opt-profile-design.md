@@ -526,6 +526,11 @@ binaryen fixed this — and the golden update is the record of it.
   both at the same magnitude.
 - **Constant propagation of the trip bound** as a contributor: 469.0 vs 469.5 ms
   with and without (§7.3).
+- **"VL should emit bottom-tested loops itself"** (PL-037 item 3, 2026-09-24). Built and
+  measured: `guard; loop { body; br_if loop }` is as slow under wasmtime as binaryen's `if`
+  form — `mixed-width` 299 → 517 ms at the plain build, its range-loop spelling 194 → 470 ms —
+  and neutral on V8. It would have moved this section's penalty into the `none` column.
+  DECISIONS.md, "Loops stay top-tested".
 - **`--gufa` as a byte win in isolation**: it GROWS the compiler module by 7.9 KB
   and only nets −593 bytes because an `-O3` runs after it (§3).
 - **`--gufa`'s ~2s cost**: under a second, within noise of its own control (§3).

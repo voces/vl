@@ -7616,3 +7616,77 @@ unchanged; the seed grew 17,190 bytes (+0.61%).
 way; a one-field mutable struct would drop the list header and bounds check from every access.
 A loop that calls no closure could keep a shared binding in a local and store it back at the
 loop's exits.
+
+## Loops stay top-tested (2026-09-24) — plumb PL-037 item 3
+
+**VL keeps emitting `block { loop { br_if block (!cond); body; br loop } }`. The bottom-tested
+form — one guard, then `loop { body; br_if loop (cond) }` — was built for every `while`, range
+and list walk, measured, and taken back out.** Under wasmtime it is up to 2.4x SLOWER, and under
+V8 it is neutral:
+
+| module (min of 7) | wasmtime, top-tested | wasmtime, bottom-tested | V8, top / bottom |
+|---|--:|--:|--:|
+| `bench/arith/mixed-width` (`while`), plain build | 299 ms | 517 ms (1.73x) | 190 / 188 ms |
+| the same kernel as `for i in 0 until n`, plain build | 194 ms | 470 ms (2.42x) | 193 / 188 ms |
+| `bench/arrays/binsearch`, plain build | 1226 ms | 1159 ms | 940 / 956 ms |
+
+It is the same Cranelift behaviour `opt-profile-design.md` §7 traced for binaryen's `loop { if
+… br }` rewrite: a loop whose back-edge is conditional costs a register shuffle per edge and a
+spill of the widest loop-carried value, graded by how many values the loop carries. Emitting the
+textbook rotation ourselves does not escape it; it moves the penalty into the default build,
+which has no flag to avoid it (§7.7's `none` column exists to catch exactly that). On V8,
+bench/vs-rust's `matChain` moved −3% to −7% over two interleaved runs, `sort` −2.5% with its
+`while` loops rotated too, and the rest stayed inside the noise; the compiler's own self-compile
+under wasmtime used 4.6% less guest fuel for the same CPU. None of that pays for 1.7–2.4x on a
+tight scalar loop under `vl run`, so it is not shipped. A `while` rotation would also write its condition twice, which
+costs the seed +1.4% (`while` is the only loop the compiler itself uses).
+
+Binaryen has no rotation pass to enable instead: `remove-unused-brs` performs the OPPOSITE
+rewrite (§7.3), and it leaves a bottom-tested loop alone.
+
+**What did ship from item 3's first two asks: a constant range bound is an immediate.** `for i in
+0 until 16` compared `i` against a local holding 16 on every trip; binaryen's `-O` and `-O2`
+leave that local in place (only `-O3`'s `precompute-propagate` folds it). A bound that is an
+integer literal, a negated one, or an unshadowed module `const` bound to one is now written as
+`i32.const` in the test and never stored. The rest of the loop is unchanged. bench/vs-rust:
+`matChain` −6% (34.2 → 32.2 ns interleaved), the module 32 bytes smaller, the other kernels
+inside the noise.
+
+## Small constant range loops are unrolled (2026-09-24) — plumb PL-037 item 3
+
+**A range loop whose ends are constants (as above) and whose step is a literal is emitted as one
+copy of its body per trip when it runs 1 to 16 times and the copies total at most 640 AST
+nodes.** Copy `k` reads the loop variable as the constant `A + k*K`, so `m + i * 16` folds and the
+row reads become loads from fixed addresses. `break` leaves one block around all the copies and
+`continue` ends its own copy, so both keep their meaning; each copy mints the body's `let`s into
+the same slots. A nested constant loop is costed once per outer trip, so a 4x4 nest is 16 inner
+bodies against the same budget.
+
+The loop stays rolled when the body writes the loop variable (the next trip steps from the
+written value), holds a function (a closure's capture of the variable is per iteration — see
+"Closures capture variables by reference"), makes a call other than an inline memory intrinsic,
+or when a step would wrap (the rolled loop then never ends, and must not start ending). The call
+rule is two reasons: a call outweighs the test and step the copies save, and the host reads a
+call inside a loop as hot, so unrolling `for k in 0 until 3 { probe(k) }` in run-once code turned
+`probe` into run-once code and it stopped being inlined (`selfhost_native_release_escape_test`'s
+`identity-alias` caught it).
+
+**The two limits are the measurement's.** `matChain`'s 4x4 product and its 16-trip renormalise
+loop both have to unroll to reach Rust (interleaved, ns per call-unit; taken while the rolled
+loops were still bottom-tested, which moves only the first row):
+
+| trips / nodes | matChain | module at `-O` |
+|---|--:|--:|
+| rolled | 31.6 | 2,147 B |
+| 4 / 640 (the product only) | 22.5 | 2,413 B |
+| 16 / 320 (the renormalise and init loops only) | 29.1 | 3,205 B |
+| **16 / 640** | **15.5** | 3,816 B |
+| 16 / 1024 | 15.4 | 3,816 B |
+
+bench/vs-rust, master → this (bench.ts `--reps 15`, two runs each, load ~18): `matChain`
+2.53x → 1.13–1.15x Rust; `hash`, `sort`, `mix`, `array` and `map` inside the noise. The kernel
+module grows 2,219 → 3,818 bytes at `-O`, most of it the unrolled one-time init loops. The
+compiler and `std` contain no range loop, so the seed (+4,142 bytes, +0.15%, all of it the
+emitter code) and the plumb-shape units (guest fuel +0.02% against the same run on master) do
+not move. A 2x partial unroll of `mix`'s variable-trip loop was measured by hand and is worth
+0.5%, inside the noise, so it is not built.
