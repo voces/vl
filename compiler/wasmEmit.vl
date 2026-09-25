@@ -360,7 +360,6 @@ import {
   mUsed,
   maFoldScratchBase,
   mapI32Base,
-  scopeSlotOf,
   mapKeysBase,
   mapScratchBase,
   mapValsBase,
@@ -411,6 +410,7 @@ import {
   sFieldStart,
   sHeapIdx,
   sTypeIdx,
+  scopeSlotOf,
   slUsed,
   startStmts,
   strCatSlotIx,
@@ -15018,11 +15018,10 @@ function memConstFoldRest(a: BinExpr, fnIx: i32): i32 {
   -1
 }
 
-// `memConstFoldK` of a LOCAL `const`'s own initializer, checked against `MEM_OFFSET_MAX` with
-// no other offset in play, or -1 when the whole initializer is already a compile-time constant
-// (nothing to preserve at runtime) or matches neither shape. `emitLetDeclStmt` and
-// `maFoldCandidateCount` share it: a deviation is unsound whenever the two answer
-// differently, so there is exactly one place that decides.
+// `memConstFoldK` of a LOCAL `const`'s own initializer, checked against `MEM_OFFSET_MAX` alone,
+// or -1 when the whole initializer is already constant (nothing to preserve at runtime) or
+// matches neither shape. `emitLetDeclStmt` and `maFoldCandidateCount` share this one answer,
+// since a deviation between them is unsound.
 function memConstFoldShapeK(initIx: i32, fnIx: i32): i64 {
   const ix = unwrapParen(initIx)
   if ix < 0 || ix >= P.nodes.length { return -1 }
@@ -15047,12 +15046,10 @@ function memConstFoldShapeRest(initIx: i32, fnIx: i32): i32 {
   -1
 }
 
-// How many `const` declarations under `ix` qualify for the declaration-time address fold:
-// each needs its own scratch local to hold its bounded part, sized here BEFORE
-// the body is walked (`fnDetectScratch`, emit_sections.vl) so `fbBeginFunc` can reserve them.
-// Does not descend into a nested `FuncDecl` — a captured local's own frame is sized when THAT
-// function's own body is scanned, and a value read across the capture boundary is a box, not
-// this local.
+// How many `const` declarations under `ix` qualify for the declaration-time address fold —
+// each needs its own scratch local, sized BEFORE the body is walked (`fnDetectScratch`,
+// emit_sections.vl) so `fbBeginFunc` can reserve them. Does not descend into a nested
+// `FuncDecl`: a captured local's own frame is sized when that function's body is scanned.
 export function maFoldCandidateCount(ix: i32, fnIx: i32): i32 {
   if ix < 0 || ix >= P.nodes.length { return 0 }
   const n = P.nodes[ix]
@@ -15108,12 +15105,10 @@ function maFoldRowOf(name: string): i32 {
   -1
 }
 
-// Emits a qualifying `const`'s initializer for the declaration-time fold: push the bounded
-// part, TEE it into this declaration's own scratch local (so a later `emitMemAddr` reads that
-// SAME value with no recomputation), then finish `K + bounded` exactly as `emitExpr` would
-// have — the caller's `fbLocalSet` right after this call, and every other read of the
-// binding's own name, are unaffected, since the value stored there is unchanged. One scratch
-// local per qualifying declaration, claimed in `maFoldCandidateCount`'s own order.
+// Emits a qualifying `const`'s initializer: push the bounded part, tee it into this
+// declaration's own scratch local, then finish `K + bounded` exactly as `emitExpr` would —
+// the stored value is unchanged, so `fbLocalSet` and every other read of the name are
+// unaffected; a later `emitMemAddr` just reads the teed local instead.
 function emitMemConstFoldLet(
   body: u8[],
   initIx: i32,
@@ -15140,11 +15135,9 @@ function emitMemConstFoldLet(
 }
 
 // Pushes the address of memory-intrinsic call `c` (`base` declared operands) and answers the
-// memarg offset to write with it, or -1 after an emit failure. A constant part of the address
-// moves into the offset only where both forms name the same effective address for every
-// operand value: a constant address, or `a + K` where `a + K` provably cannot wrap past 2^32 —
-// including where `a` is a local bound by the declaration-time fold above, whose own scratch
-// local already holds just that bounded part.
+// memarg offset, or -1 after an emit failure. A constant part moves into the offset only where
+// both forms name the same effective address: a constant address, `a + K` provably not
+// wrapping, or `a` a local the fold above already reduced to just its bounded part.
 function emitMemAddr(
   body: u8[],
   c: Call,
@@ -20205,15 +20198,18 @@ function emitLetDeclStmt(body: u8[], s: LetDecl, stmtIx: i32, fnIx: i32) {
     }
     const savedNulList = pendingNulList
     if letNulList15 { pendingNulList = true }
-    // The declaration-time address fold: a `const p = K + bounded` used later
-    // as a memory-intrinsic address needs its bounded part preserved in its own scratch
-    // local, which only this arm's plain-i32 initializer can ever match — none of the
-    // niche/list/litunion seeds above apply to an arithmetic sum. `const`-only: a `let` can
-    // be reassigned, and `maFoldCandidateCount` (which sized the scratch frame) agrees.
+    // The declaration-time address fold: a `const p = K + bounded` later used as a
+    // memory-intrinsic address needs its bounded part preserved in its own scratch local —
+    // only this arm's plain-i32 initializer can ever match. `const`-only, since a `let` can
+    // be reassigned; `maFoldCandidateCount` (which sized the scratch frame) agrees.
     const mfK = memConstFoldShapeK(s.letInit, fnIx)
     if fnIx >= 0 && s.letKw == "const" && mfK >= 0 {
-      if emitMemConstFoldLet(body, s.letInit, mfK, fnIx, stmtIx) < 0 { return -1 }
-    } else if emitExpr(body, s.letInit, fnIx) < 0 { return -1 }
+      if emitMemConstFoldLet(body, s.letInit, mfK, fnIx, stmtIx) < 0 {
+        return -1
+      }
+    } else if emitExpr(body, s.letInit, fnIx) < 0 {
+      return -1
+    }
     pendingNulBool = false
     pendingNulString = false
     pendingNulList = savedNulList
@@ -22105,8 +22101,8 @@ export function emitFuncBody(body: u8[], blockIx: i32, fnIx: i32) {
     // than in `emitFuncCode` because nothing before the body needs the answer, and the
     // set is stamped with `fnIx` so a body that never scanned cannot read a stale one.
     strAccScan(blockIx, fnIx)
-    // The declaration-time address fold's table: a node index is a row at
-    // most once, but the SCRATCH SLOTS it names are per-function, so both are cleared here.
+    // The declaration-time address fold's table: a node index is a row at most once, but the
+    // scratch slots it names are per-function, so both are cleared here.
     maFoldDeclIx = []
     maFoldWasmSlot = []
     maFoldK = []
