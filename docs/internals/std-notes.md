@@ -772,7 +772,9 @@ Each now says so, in the shape the `concat`-vs-`+` bullet uses.
   astral code point handed in as ONE element is the likeliest caller bug.
 - **Encode reads the string exactly as `for cp in s` does.** A string can hold malformed
   UTF-8 only through `slice` (the core's wrap, `std:utf8` above); such bytes encode as U+FFFD,
-  one per maximal subpart, the same answer the language's own iteration gives. `encodeUtf16`
+  one per ill-formed BYTE, the same answer the language's own iteration gives — not one per
+  maximal subpart as `decodeUtf8Lossy` does (a 3-byte cut of U+1F600 is three U+FFFD here,
+  one there). Agreeing with `for cp in s` is the chosen contract. `encodeUtf16`
   therefore never fails and needs no error arm; the lossiness is confined to input that no
   well-formed string contains, and the export comment names it.
 - **Strict decode rejects lone surrogates**, like `decodeUtf8` rejects the surrogate block —
