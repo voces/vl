@@ -2940,6 +2940,10 @@ function fnAssignRetTargetName(fe: i32) {
         const a = P.nodes[unwrapParen(tailx)]
         if a is BinExpr {
           if a.binOp == "=" {
+            // A re-read narrowed to one member yields that member, not the cell.
+            if asgReadNarrowTy(unwrapParen(tailx), fnStmts[fe]) >= 0 {
+              return ""
+            }
             const t = P.nodes[unwrapParen(a.binLeft)]
             if t is Ident { return t.identName }
           }
@@ -3436,6 +3440,13 @@ function armAssignTargetName(stmtIx: i32) {
   ""
 }
 
+// The assignment node of an arm-tail statement, seen through a `return` and parentheses.
+function asgOfArmTail(stmtIx: i32): i32 {
+  const ts = P.nodes[stmtIx]
+  if ts is RetStmt { return unwrapParen(ts.retArg) }
+  unwrapParen(stmtIx)
+}
+
 // The leftmost arm-tail assignment target under the tail `if` at `ifIx` — the candidate the
 // other arms are compared against. "" when the then-arm's tail is not an assignment. A
 // nested tail `if` in the then-arm recurses to its own first arm.
@@ -3502,7 +3513,39 @@ function ifTailAssignName(ifIx: i32, fnIx: i32) {
   const nm0 = ifTailFirstAssignName(ifIx)
   if nm0 == "" { return "" }
   if !ifTailArmsAgree(ifIx, fnIx, nm0) { return "" }
+  // Every arm re-read at one and the same member: the result is that member, not the cell.
+  if ifTailNarrowTy(ifIx, fnIx) >= 0 { return "" }
   nm0
+}
+
+// The one member every arm-tail assignment of the tail `if` at `ifIx` is re-read at
+// (`asgReadNarrowTy`), or -1 when an arm is not narrowed or two arms name different members.
+function ifTailNarrowTy(ifIx: i32, fnIx: i32): i32 {
+  const s = P.nodes[ifIx]
+  if s is IfStmt {
+    if s.ifElse < 0 { return -1 }
+    const a = armNarrowTy(s.ifThen, fnIx)
+    if a < 0 { return -1 }
+    let b = -1
+    const els = P.nodes[s.ifElse]
+    if els is IfStmt {
+      b = ifTailNarrowTy(s.ifElse, fnIx)
+    } else {
+      b = armNarrowTy(s.ifElse, fnIx)
+    }
+    if b < 0 { return -1 }
+    if !tySame(a, b) { return -1 }
+    return a
+  }
+  -1
+}
+
+// `ifTailNarrowTy`'s answer for one arm block: its tail assignment's, or a nested tail `if`'s.
+function armNarrowTy(blockIx: i32, fnIx: i32): i32 {
+  const t = armTailStmtOf(blockIx)
+  if t < 0 { return -1 }
+  if P.nodes[t] is IfStmt { return ifTailNarrowTy(t, fnIx) }
+  asgReadNarrowTy(asgOfArmTail(t), fnIx)
 }
 
 // The authoritative result `VKind` of function `fe` when its implicit return is an assignment
@@ -3571,6 +3614,105 @@ export function asgValueNode(asgIx: i32): i32 {
   if at < 0 || lt < 0 || rt < 0 { return a.binRight }
   if tySame(at, lt) && !tySame(at, rt) { return a.binLeft }
   a.binRight
+}
+
+// The member type the value of assignment `asgIx` reads back at when its target is a name
+// whose cell is a value-union box and the checker typed the value at one member of it, or
+// -1. The re-read is then lowered under that member's narrowing, so the value has the rep
+// its type names rather than the box's (D2391). A literal-union member keeps the box path.
+export function asgReadNarrowTy(asgIx: i32, fnIx: i32): i32 {
+  if asgIx < 0 { return -1 }
+  const a = P.nodes[asgIx]
+  if !(a is BinExpr) { return -1 }
+  if a.binOp != "=" { return -1 }
+  if !uDeclared { return -1 }
+  const t = unwrapParen(a.binLeft)
+  if t < 0 { return -1 }
+  if !(P.nodes[t] is Ident) { return -1 }
+  const at = nodeTyIxOf(asgIx)
+  const rt = nodeTyIxOf(a.binRight)
+  if at < 0 || rt < 0 { return -1 }
+  if !tySame(at, rt) { return -1 }
+  if tyIsLitUnion(at) { return -1 }
+  // `null` has no rep apart from the box's null tag.
+  if tyPrimNameOf(at) == "null" { return -1 }
+  const un = unionNameOfIdentAt(sidOfNode(t), fnIx, t)
+  if un == "" { return -1 }
+  if !isValueUnionName(un) { return -1 }
+  if msSoleMemberTy(asgReadNarrowSet(un, at)) < 0 { return -1 }
+  at
+}
+
+// The one-member set of union `un` that type `ty` selects, or -1, read as
+// `pushNarrowWriteReNarrow` reads it so the predicate and the push cannot disagree.
+function asgReadNarrowSet(un: string, ty: i32): i32 {
+  const r = msKeepTy(msSetOfText(un), ty)
+  if r >= 0 { return r }
+  msKeepTy(msSetOfText(unionMemberSetOf(un)), ty)
+}
+
+// The node whose rep the value of assignment `asgIx` has at a consumer: its target, which
+// the lowering re-reads, or its right side when that re-read is narrowed to the member the
+// right side has (`asgReadNarrows`).
+export function asgReadNode(asgIx: i32, fnIx: i32): i32 {
+  const a = P.nodes[asgIx]
+  if a is BinExpr {
+    if asgReadNarrows(asgIx, fnIx) { return a.binRight }
+    return a.binLeft
+  }
+  asgIx
+}
+
+// True if the re-read of assignment `asgIx`'s target is lowered narrowed: the value has one
+// member's type (`asgReadNarrowTy`) and is not a tail whose function returns the cell.
+function asgReadNarrows(asgIx: i32, fnIx: i32): boolean {
+  if asgReadNarrowTy(asgIx, fnIx) < 0 { return false }
+  !asgIsCellTail(asgIx, fnIx)
+}
+
+// Push the narrowing `asgReadNarrowTy` names for the re-read of assignment `asgIx`'s target.
+// Returns the depth to restore to, or -1 when it pushes nothing.
+export function pushAsgReadNarrow(asgIx: i32, fnIx: i32): i32 {
+  if !asgReadNarrows(asgIx, fnIx) { return -1 }
+  const ty = asgReadNarrowTy(asgIx, fnIx)
+  if asgIx < 0 { return -1 }
+  const a = P.nodes[asgIx]
+  if a is BinExpr {
+    const t = unwrapParen(a.binLeft)
+    if t < 0 { return -1 }
+    const tn = P.nodes[t]
+    if tn is Ident {
+      const saved = narrowTop
+      const un = unionNameOfIdentAt(sidOfNode(t), fnIx, t)
+      if pushNarrowWriteReNarrow(tn.identName, ty, un) { return saved }
+    }
+  }
+  -1
+}
+
+// True if assignment `asgIx` is an implicit return of function `fnIx` whose result is the
+// target cell (`fnAssignRetKind`): a tail `if` whose arms name different members keeps
+// the box, so its arms re-read the cell unnarrowed.
+function asgIsCellTail(asgIx: i32, fnIx: i32): boolean {
+  const fe = fnStmtsPosOf(fnIx)
+  if fe < 0 { return false }
+  if fnAssignRetKind(fe) == null { return false }
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl { return tailHoldsAsg(armTailStmtOf(fn.fnBody), asgIx) }
+  false
+}
+
+// True if the tail statement `t`, or an arm tail of it when it is an `if`, is `asgIx`.
+function tailHoldsAsg(t: i32, asgIx: i32): boolean {
+  if t < 0 { return false }
+  const tn = P.nodes[t]
+  if tn is IfStmt {
+    if tailHoldsAsg(armTailStmtOf(tn.ifThen), asgIx) { return true }
+    if tn.ifElse < 0 { return false }
+    if P.nodes[tn.ifElse] is IfStmt { return tailHoldsAsg(tn.ifElse, asgIx) }
+    return tailHoldsAsg(armTailStmtOf(tn.ifElse), asgIx)
+  }
+  asgOfArmTail(t) == asgIx
 }
 
 // Classify one valued return expression at `rx0` of the function at `fnStmts` position `i`,
@@ -26341,6 +26483,17 @@ export function nliNameOf(letIx: i32) {
   ""
 }
 
+// Drops the inferred-union row of the `LetDecl` at `letIx`, for a rewrite that changed what
+// the binding holds. The union stays registered; only the binding stops naming it.
+export function nliForgetLet(letIx: i32) {
+  let i = 0
+  while i < nliLetIxs.length {
+    if nliLetIxs[i] == letIx { nliLetIxs[i] = -1 }
+    i = i + 1
+  }
+  0
+}
+
 // The value-union name an un-annotated if-expression binding init carries, or "" when it
 // is not a value union the box can hold (a non-union if, a `string | null` niche, or an
 // arm the static pre-pass cannot classify). The canonical name is the deduped arm atoms in
@@ -26608,7 +26761,7 @@ export function exprStruct(exprIx: i32, fnIx: i32) {
   // claims that arm, not this one.
   if e is BinExpr {
     // A name's assignment yields a re-read of its cell, so it is the name's struct (D2170).
-    const asgCell = asgCellOf(exprIx)
+    const asgCell = asgCellOf(exprIx, fnIx)
     if asgCell >= 0 { return exprStruct(asgCell, fnIx) }
     const cms = coalesceMvSlot(exprIx, fnIx)
     if cms >= 0 {
@@ -26690,15 +26843,15 @@ export function exprStruct(exprIx: i32, fnIx: i32) {
   exprNullableStruct(exprIx, fnIx)
 }
 
-// The target of the assignment at `ix` when that target is a name, whose re-read is how the
-// assignment's value is lowered; -1 for any other node or target.
-function asgCellOf(ix: i32): i32 {
+// The node standing for the value of the assignment at `ix` when its target is a name, whose
+// re-read is how the value is lowered (`asgReadNode`); -1 for any other node or target.
+function asgCellOf(ix: i32, fnIx: i32): i32 {
   const e = P.nodes[ix]
   if e is BinExpr {
     if e.binOp == "=" {
       const t = unwrapParen(e.binLeft)
       if t < 0 { return -1 }
-      if P.nodes[t] is Ident { return t }
+      if P.nodes[t] is Ident { return asgReadNode(ix, fnIx) }
     }
   }
   -1
@@ -27784,7 +27937,7 @@ export function structIndexOfExpr(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return -1 }
   const e = P.nodes[exprIx]
   if e is ObjLit { return structIndexOfObjCtx(exprIx, fnIx) }
-  const asgCell = asgCellOf(exprIx)
+  const asgCell = asgCellOf(exprIx, fnIx)
   if asgCell >= 0 { return structIndexOfExpr(asgCell, fnIx) }
   if e is Paren { return structIndexOfExpr(e.parInner, fnIx) }
   // An if-EXPRESSION whose join is a struct (`const b = if c { mk(1) } else { mk(2) }`): the
@@ -28300,7 +28453,7 @@ export function exprUnion(exprIx: i32, fnIx: i32) {
     // states for the functype. Delegated to the target rather than re-derived, since the
     // value this node leaves on the stack is `emitExpr` of that target. Without it a tail
     // assignment over a nullable box cell struct.new'd the box as a scalar payload — invalid wasm.
-    if e.binOp == "=" { return exprUnion(e.binLeft, fnIx) }
+    if e.binOp == "=" { return exprUnion(asgReadNode(exprIx, fnIx), fnIx) }
   }
   // D969 — an if-expression is its then arm's union-ness. The `??` desugaring turns `x ?? d`
   // over a nullable value-union box into an if-expression, and with an un-annotated
@@ -30396,8 +30549,7 @@ function pushNarrowWriteReNarrow(name: string, ty: i32, un: string): boolean {
   // The DECLARED set, never the live narrowing's: the write is checked against the
   // declaration, so the member it lands on is one of the declaration's. An `is`-pinned slot
   // carries no set at all (`pushNarrowIs` banks a type), which is the common case here.
-  let r = msKeepTy(msSetOfText(un), ty)
-  if r < 0 { r = msKeepTy(msSetOfText(unionMemberSetOf(un)), ty) }
+  const r = asgReadNarrowSet(un, ty)
   if r < 0 { return false }
   const txt = msTextOf(r)
   if txt == "" { return false }
@@ -31567,7 +31719,7 @@ export function refListElemNameOfExpr(exprIx: i32, fnIx: i32) {
   if e is Paren { return refListElemNameOfExpr(e.parInner, fnIx) }
   if e is BinExpr {
     if e.binOp == "=" && assignTargetReReads(exprIx, fnIx) {
-      return refListElemNameOfExpr(e.binLeft, fnIx)
+      return refListElemNameOfExpr(asgReadNode(exprIx, fnIx), fnIx)
     }
   }
   // An if-expression's element is its join's row, the one its blocktype names (D2210).
@@ -34266,7 +34418,7 @@ function binListRep(exprIx: i32, fnIx: i32): VKind | null {
     // An assignment's value is the re-read of its target (D2394).
     if e.binOp == "=" {
       if assignTargetReReads(exprIx, fnIx) {
-        return exprListRep(e.binLeft, fnIx)
+        return exprListRep(asgReadNode(exprIx, fnIx), fnIx)
       }
       return null
     }
