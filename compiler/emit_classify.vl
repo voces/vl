@@ -284,6 +284,7 @@ import {
   memberKeyThroughIndex,
   memberPathKeyOf,
   moduleBindsLoopVar,
+  moduleLocalLetCoversAt,
   moduleLocalLetOf,
   moduleLocalLetOfAt,
   moduleLocalLetOfUnique,
@@ -4334,7 +4335,33 @@ export function fnIndexOfInScopeAt(
     }
     if binds == 1 && chainShadowsAt(fnIx, sid, name, atIx) { return -1 }
   }
+  if flat >= 0 && moduleBlockShadowsAt(fnIx, name, atIx) { return -1 }
   flat
+}
+
+// True when a module-scope block binding of `name` is in scope at `atIx` in frame `fnIx`
+// (-1 for the start function): asked of the outermost enclosing frame's own declaration,
+// because a lifted frame sees the module block that encloses its source (D2415).
+function moduleBlockShadowsAt(fnIx: i32, name: string, atIx: i32): boolean {
+  if atIx < 0 { return false }
+  if moduleLocalLetOf(emitRootIx, name) < 0 { return false }
+  let at = atIx
+  if fnIx >= 0 {
+    if frameChainBindsName(fnIx, name) { return false }
+    let pp = fnStmtsPosOf(fnIx)
+    let steps = 0
+    while pp >= 0 && steps <= fnStmts.length {
+      at = fnStmts[pp]
+      let up = -1
+      if pp < fnParent.length { up = fnParent[pp] }
+      // An instance's own node is no source position; its origin's declaration is.
+      if up < 0 && pp < fnInstOrigin.length { up = fnInstOrigin[pp] }
+      if up >= fnStmts.length { up = -1 }
+      pp = up
+      steps = steps + 1
+    }
+  }
+  moduleLocalLetCoversAt(emitRootIx, name, at)
 }
 
 // True when a binding of `name` on `fnIx`'s frame chain is in scope at `atIx`: a parameter of
@@ -28942,9 +28969,9 @@ export function coalesceNulRefNicheOperand(ix: i32, fnIx: i32): boolean {
   exprNulScalarListKind(ix, fnIx) != null
 }
 
-// Does the `??` at `ix` join a nullable-ref niche to a default of another type, so the result
-// is the union BOX and the operand cannot ride `br_on_non_null`'s raw ref out of the block?
-// Two or more non-null members is what makes the result a box; one is the niche itself (D1714).
+// Does the `??` at `ix` join a nullable-ref niche, or the `boolean | null` i32 niche, to a
+// default of another type, so the result is the union BOX rather than the niche's own rep?
+// Two or more non-null members is what makes the result a box; one is the niche itself (D2383).
 export function coalesceNicheJoinsToBox(ix: i32, fnIx: i32): boolean {
   const e = P.nodes[ix]
   if e is BinExpr {
@@ -28954,7 +28981,8 @@ export function coalesceNicheJoinsToBox(ix: i32, fnIx: i32): boolean {
     let js = unionMemberSetOf(jn)
     if js == "" { js = jn }
     if unionSetNonNullCount(js) < 2 { return false }
-    return coalesceNulRefNicheOperand(unwrapParen(e.binLeft), fnIx)
+    const l = unwrapParen(e.binLeft)
+    return coalesceNulRefNicheOperand(l, fnIx) || exprNulBool(l, fnIx)
   }
   false
 }
@@ -36421,6 +36449,15 @@ export function fnBlockShadowsAt(fnIx: i32, sid: i32, atIx: i32): boolean {
 // as a function-scoped one (D2316).
 function calleeCloSigKeyAt(sid: i32, fnIx: i32, atIx: i32): string {
   const name = sidText(sid)
+  // Where the name denotes a named function (no binding on the frame chain is in scope at
+  // `atIx`), only the callee's own checker type may answer: every rung below reads a binding,
+  // and one in a closed block would lend the call its signature (D2384). A node a rewrite
+  // minted past its frame's body carries no source position, so it cannot decide this.
+  if atIx >= 0 && atIx <= frameBodyEnd(fnIx) {
+    if fnIndexOfInScopeAt(sid, name, fnIx, atIx) >= 0 {
+      return calleeNodeSigKey(atIx)
+    }
+  }
   // A union binding narrowed to a bare-closure arm (`if x is () => i64 { x() }`): the arm's
   // function-type name interns the SAME `$fnsig` an annotated closure would — so the `call_ref`
   // casts to the right functype and the result classifiers (`calleeReturnsI64`/…) read its return.
@@ -36517,11 +36554,26 @@ function calleeCloSigKeyAt(sid: i32, fnIx: i32, atIx: i32): string {
   // Positioned, the callee node's own checker type answers last: it is the key
   // `cloCallSigKey`'s general fallback lowers the call with, so the void answer and the
   // emitted `call_ref` cannot disagree about whether a value is left (D2110).
-  if atIx >= 0 {
-    const aty = nodeTyIxOf(atIx)
-    if aty >= 0 {
-      if T.tys[aty] is TyFunc { return sigKeyOfTy(aty) }
-    }
+  calleeNodeSigKey(atIx)
+}
+
+// The last arena index of frame `fnIx`'s source (its body block; the program node for the
+// start function), or -1. The arena is post-order, so a node past it is a rewrite's own.
+function frameBodyEnd(fnIx: i32): i32 {
+  if fnIx < 0 { return emitRootIx }
+  if fnIx >= P.nodes.length { return -1 }
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl { return fn.fnBody }
+  -1
+}
+
+// The `$fnsig` key of the callee node at `atIx` from its own checker type, or "" when it has
+// no function type or no position (`atIx < 0`).
+function calleeNodeSigKey(atIx: i32): string {
+  if atIx < 0 { return "" }
+  const aty = nodeTyIxOf(atIx)
+  if aty >= 0 {
+    if T.tys[aty] is TyFunc { return sigKeyOfTy(aty) }
   }
   ""
 }

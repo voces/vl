@@ -99,6 +99,7 @@ import {
   Unary,
   WhileStmt,
   i32ToStr,
+  nodeValueChildren,
 } from "./ast"
 
 // Append all of `src` onto `dst` (in place) and return `dst`.
@@ -342,10 +343,10 @@ export function resetParentLetCache() {
   0
 }
 
-// Fills `plCacheMap` (via the parallel sid arrays) with every function-scoped `LetDecl`
-// reachable from `blockIx`, first-wins, in `parentLetOf`'s own pre-order. Descends both
-// `if`/`else` branches, `while`/`for` bodies and nested blocks, since a wasm local is scoped
-// to the whole function. `owner` is the innermost enclosing block's own index (D2316).
+// Fills `plCacheMap` (the sid arrays) with every `LetDecl` of the frame at `blockIx`,
+// first-wins in pre-order: every block, a value `if`'s or `match` arm's included, since a wasm
+// local is function-scoped; not a nested `FuncDecl`. `owner` is the innermost enclosing
+// block's own index (D2316).
 function plScanStmt(ix: i32, owner: i32) {
   if ix < 0 { return 0 }
   const st = P.nodes[ix]
@@ -370,6 +371,7 @@ function plScanStmt(ix: i32, owner: i32) {
       plMoreIx.push(ix)
       plMoreOwner.push(owner)
     }
+    plScanStmt(st.letInit, owner)
   } else if st is IfStmt {
     // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
     let cur = ix
@@ -377,6 +379,7 @@ function plScanStmt(ix: i32, owner: i32) {
       const c = P.nodes[cur]
       cur = -1
       if c is IfStmt {
+        plScanStmt(c.ifCond, owner)
         plScanStmt(c.ifThen, c.ifThen)
         if c.ifElse >= 0 {
           if P.nodes[c.ifElse] is IfStmt {
@@ -388,6 +391,7 @@ function plScanStmt(ix: i32, owner: i32) {
       }
     }
   } else if st is WhileStmt {
+    plScanStmt(st.whileCond, owner)
     plScanStmt(st.whileBody, st.whileBody)
   } else if st is ForRange {
     plRecordLoopVar(st.frVar, ix)
@@ -395,6 +399,9 @@ function plScanStmt(ix: i32, owner: i32) {
     if st.frFrom > head { head = st.frFrom }
     if st.frStep > head { head = st.frStep }
     plRecordLoopExtent(st.frVar, head, st.frBody)
+    plScanStmt(st.frFrom, owner)
+    plScanStmt(st.frTo, owner)
+    plScanStmt(st.frStep, owner)
     plScanStmt(st.frBody, st.frBody)
   } else if st is ForIn {
     plRecordLoopVar(st.fiVar, ix)
@@ -403,6 +410,7 @@ function plScanStmt(ix: i32, owner: i32) {
       plRecordLoopVar(st.fiVar2, ix)
       plRecordLoopExtent(st.fiVar2, st.fiIter, st.fiBody)
     }
+    plScanStmt(st.fiIter, owner)
     plScanStmt(st.fiBody, st.fiBody)
   } else if st is Block {
     const stmts = st.blkStmts
@@ -421,6 +429,32 @@ function plScanStmt(ix: i32, owner: i32) {
     while pi < pstmts.length {
       plScanStmt(pstmts[pi], ix)
       pi = pi + 1
+    }
+  } else if st is FuncDecl {
+    // A nested function or lambda is its own frame, scanned when its own body is asked about.
+  } else if st is Ident || st is NumLit || st is StrLit || st is BoolLit {
+    // A leaf, the commonest node: nothing below it to scan.
+  } else if st is BinExpr {
+    // Any other node is an expression, and one may hold a block (a value `if` arm, a `match`
+    // arm) whose bindings are this frame's locals (D2385). The frequent kinds walk in place.
+    plScanStmt(st.binLeft, owner)
+    plScanStmt(st.binRight, owner)
+  } else if st is Call {
+    plScanStmt(st.callFn, owner)
+    const args = st.callArgs
+    let ai = 0
+    while ai < args.length {
+      plScanStmt(args[ai], owner)
+      ai = ai + 1
+    }
+  } else if st is Member {
+    plScanStmt(st.memObj, owner)
+  } else {
+    const kids = nodeValueChildren(ix)
+    let ki = 0
+    while ki < kids.length {
+      plScanStmt(kids[ki], owner)
+      ki = ki + 1
     }
   }
   0
@@ -623,6 +657,22 @@ export function moduleLocalLetOfAt(rootIx: i32, name: string, atIx: i32) {
     i = i + 1
   }
   best
+}
+
+// Whether a module-scope block binding of `name` is in scope at `atIx` — bounds-checks even a
+// sole binding, unlike `moduleLocalLetOfAt`'s fast path; the module twin of `parentLetCoversAt`.
+export function moduleLocalLetCoversAt(
+  rootIx: i32,
+  name: string,
+  atIx: i32,
+): boolean {
+  if atIx < 0 { return false }
+  const first = moduleLocalLetOf(rootIx, name)
+  if first < 0 { return false }
+  if mllDup[name] != true {
+    return first < atIx && atIx <= (mllOwner[name] ?? -1)
+  }
+  moduleLocalLetOfAt(rootIx, name, atIx) >= 0
 }
 
 // Appends `name`'s bindings to `mllSort*` in index order and returns the slice start, or -2

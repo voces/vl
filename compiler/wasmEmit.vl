@@ -25649,6 +25649,47 @@ function emitCoalesceNulRefJoin(
   0
 }
 
+// The boxed `??` over the `boolean | null` i32 niche, for a default that joins rather than
+// fits: the operand is evaluated once into a scratch slot, its null (the value 2) takes the
+// boxed default, and a present 0/1 is boxed under the union's boolean arm (D2383).
+function emitCoalesceNulBoolJoin(
+  body: u8[],
+  e: BinExpr,
+  exprIx: i32,
+  fnIx: i32,
+) {
+  const joinN = coalesceResultUnionName(exprIx)
+  let joinSet = unionMemberSetOf(joinN)
+  if joinSet == "" { joinSet = joinN }
+  const bvb = vbHeapIdxOfKind(1)
+  if bvb < 0 || !unionHasAtomTy(joinSet, "boolean", false) {
+    return emitFailAt(
+      "emitProgram: `??` joins a nullable value into a union with no arm for the value's own type",
+      exprIx,
+    )
+  }
+  if !coalJoinDefaultBoxes(joinSet, e.binRight, fnIx) {
+    return emitFailAt(
+      "emitProgram: `??` default names no arm of the union its result is",
+      exprIx,
+    )
+  }
+  const bSlot = widenTmpSlot(4000)
+  if emitExpr(body, e.binLeft, fnIx) < 0 { return -1 }
+  fbLocalTee(bSlot)
+  fbI32Const(2)
+  fbI32Bin(70)     // 0x46 i32.eq → null?
+  fbIfRef(uBoxIdx) // 0x04 if, (ref $uBox) blocktype — the result's rep
+  if emitUnionBoxArg(body, joinN, e.binRight, fnIx) < 0 { return -1 }
+  fbElse()         // 0x05 else — present → the 0/1 under the boolean arm's tag
+  fbI32Const(scalarTagOfKind(1))
+  fbLocalGet(bSlot)
+  fbStructNew(bvb)
+  fbStructNew(uBoxIdx)
+  fbEnd()          // 0x0b end
+  0
+}
+
 // The `br_on_non_null` core every nullable-ref-niche `??` shares, with both contexts and the
 // block's null-ness spelled out by the caller. `heapIx` is the cell's own heap type,
 // `nulBlock` whether the result may still be null, `lhsCtx` the context the one lhs evaluation
@@ -25946,6 +25987,9 @@ function emitCoalesceGo(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
   // when the lhs is null. `select` evaluates both value operands unconditionally, so a
   // side-effecting default would run on the present path too — the same lowering the `K |
   // null` niche, the `string | null` niche and every nullable-ref rep already use.
+  if exprNulBool(e.binLeft, fnIx) && coalesceNicheJoinsToBox(exprIx, fnIx) {
+    return emitCoalesceNulBoolJoin(body, e, exprIx, fnIx)
+  }
   if !(lhs is Call) && exprNulBool(e.binLeft, fnIx) {
     if emitExpr(body, e.binLeft, fnIx) < 0 {
       return -1 // the niche i32
