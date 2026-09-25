@@ -729,6 +729,29 @@ axis(
   (d) => twoFiles(d, genManyCapturedSiblingBlocks(3000, true), genManyCapturedSiblingBlocks(3000, false)),
 );
 
+// `n` closures made under a narrowing of the module global `g`, each called by name. With a
+// top-level function writing `g`, every closure is asked whether it escapes its body and every
+// call whether it reads a narrowing a writer may have ended; without it neither is asked. Both
+// walks are once per body, not per closure (D2402). A closure-written LOCAL would price the
+// emitter's cell captures instead, which is not this axis.
+const genCapturedNarrowings = (n: number, writer: boolean): string => {
+  const o = ['let g: string | null = "ab"'];
+  if (writer) o.push("function setG() { g = null }");
+  o.push("function f(): i32 {", "  let t = 0", "  if g != null {");
+  for (let i = 0; i < n; i++) o.push(`    const c${i} = (): i32 => g.length`, `    t = t + c${i}()`);
+  o.push("  }", "  t", "}", "print(f())");
+  return o.join("\n") + "\n";
+};
+
+// The bar sits under the others' because the cheap arm is itself super-linear in closures
+// elsewhere, which compresses the ratio: the per-closure walk this guards read 2.2 here.
+axis(
+  "closures under a narrowing some function may end",
+  1.8,
+  "A closure made under a narrowing re-walks its enclosing body, or a call scans every capture record (D2402).",
+  (d) => twoFiles(d, genCapturedNarrowings(1600, true), genCapturedNarrowings(1600, false)),
+);
+
 // One `match` of `n` arms, each reading the module global `k`, written as a closure's body or
 // as a top-level function's. Every arm's read asks whether `k` is a capture of the frame, which
 // a top-level function answers without a walk. Both arms share `fill` statements so the cheap

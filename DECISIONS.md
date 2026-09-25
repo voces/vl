@@ -7850,9 +7850,9 @@ another reacher (`const r = () => k` escapes `k`). An interpolation hole over a 
 (`"\{v}"`) renders through std:fmt without reaching user code, so it ends nothing. The rule is
 name-based and flow-insensitive: a same-named
 binding elsewhere in the root, or an escape later in the function, ends narrowings it strictly
-need not. That costs a re-test, never a wrong value. What the rule cannot see — a writer that is
-a separate top-level function, or a global written from another top-level function — is D2401,
-still open; the rule is sound within the function that declares the variable.
+need not. That costs a re-test, never a wrong value. A module binding narrowed inside a function
+is asked the same question a second time with the whole module as the root, so a top-level
+function or a module-level closure that writes it is a writer like any other (D2401).
 
 **WHERE IT ENDS, precisely.** The retirement is in place, as a falsifying write's is, so it
 outlives the block the call sits in, and the arm join at the enclosing `if` sees it.
@@ -7884,11 +7884,42 @@ That needs the value `k` writes related to the value `v` holds when `k` runs —
 effect with a guard, the same machinery A6b Stage B's stored witnesses need. Not built; the
 conservative rule is the sound floor it would refine.
 
-**THE OTHER FORMS, surveyed and filed rather than fixed.** A field, element or map-value
-narrowing already ends at a call that may write it (the path rule), including through a method
-or a closure; the gaps are a declared operator that writes its operand's field (D2400), a module
-global written by another top-level function (D2401), a closure made under the narrowing and
-called after a writer (D2402), a path read before a writing call inside a loop (D2403), a path
-fact in a condition with a later writing call (D2404), and a path re-test that the path rule
-refuses (D2405, clause 2). Whether a declared operator may have side effects beyond its operands
-at all was floated by the owner, not decided (ROADMAP, "Narrowing invalidation across calls").
+**THE OTHER FORMS (D2400–D2405, closed).** Every one answers through `callMayWrite`.
+
+* *A path a call ends reads its declared type after the call's statement* (D2405). The call banks
+  the path for the emitter to retire after that statement, as it banks a bare name, so the
+  re-test the diagnostic asks for narrows again; a read later in the same statement is still
+  refused. A narrowing of an enclosing function stays a refusal, since the emitter retires only
+  the function it is lowering; so does one ended inside a body with an un-annotated parameter,
+  or by a method on a receiver not yet typed, since the re-check at each call's argument types
+  decides, and a declared-type read settled earlier would reach it against types it never saw.
+  A map's `set` ends a narrowing of the key it writes, like `m[k] = v`; `push` ends none.
+* *A call to a `const`-bound lambda that writes no place is a call to its body* for the path
+  rule, so it ends nothing: the body assigns only bare names and calls only intrinsics that
+  remove nothing and take no function. Any other lambda stays opaque, because the write
+  summaries miss a write through an alias of a captured object or through a callee it is
+  handed to (D2461). Handing the narrowed value itself to a callee ends nothing, since the
+  callee holds the value, not the place.
+* *A declared operator is a call* for the path rule too (D2400): its operands are its arguments,
+  the declaration is the one the checker resolved (every declaration of the operator where
+  none is resolved yet), and an operator closure field is opaque, as a call through a closure
+  field already is. Operator sites compose into a callee's write summaries.
+* *A path fact in a condition* is dropped when a later call in the condition may write it
+  (D2404), exactly as a bare name's is.
+* *In a loop*, a call that may write a path narrowed outside the loop is refused when the loop
+  read the path before it, an inner loop's reads included (D2403). This differs from the bare-name rule, which retires before
+  the loop: which call may write a path depends on checked types the loop body does not yet
+  have. A re-test inside the loop runs.
+* *A nested function made under a narrowing* (D2402) of a binding some function may write keeps
+  the narrowing only when it is called by its handle in the body that makes it and neither
+  writes nor tests the binding itself; each such call is refused unless the binding still holds
+  the captured type there. A lambda handed straight to an array's `map`/`filter` keeps it too,
+  and so does one handed to a declared function whose body only ever calls that parameter, when
+  the call reaches no writer (`callMayWrite` on the call itself). Otherwise the body reads the
+  declared type. A clone a generic's instance makes of the lambda answers what it did. A path a nested function read under the
+  narrowing makes a later writing call in the same function refused; a path captured by a
+  closure that escapes is D2407, which needs a ruling on whether path narrowings reach nested
+  functions at all.
+
+Whether a declared operator may have side effects beyond its operands at all was floated by the
+owner, not decided (ROADMAP, "Narrowing invalidation across calls").
