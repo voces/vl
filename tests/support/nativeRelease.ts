@@ -526,11 +526,11 @@ export const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3:
     // D2290: the probe's wrap-trap (`__map_probe__`/`__map_probe_i32__`) now streams a
     // reason before it, cold-branch `__print_char__` code exactly like `emitNumCastTrapMsg`'s
     // per-site message above — `-O` 7670 -> 7960, `-O3` 2174 -> 2472 bytes, structure unchanged.
-    // D2370: the pair index — a module that never deletes grows no `live` or `hashes` array per
-    // map, so both rungs lose those grow sites: `allocs` 95 -> 91 and 46 -> 42, `-O` 7960 -> 7933
-    // and `-O3` 2472 -> 2441 bytes. `fns` and `refEq` unchanged.
-    O: { bytes: 7933, fns: 16, allocs: 91, indirect: 0, refEq: 1 },
-    O3: { bytes: 2441, fns: 6, allocs: 42, indirect: 0, refEq: 1 },
+    // D2370: a module that never deletes grows no `live` array per map, so both rungs lose that
+    // grow site: `allocs` 95 -> 93 and 46 -> 44, `-O` 7960 -> 7889 and `-O3` 2472 -> 2397 bytes.
+    // `fns` and `refEq` unchanged.
+    O: { bytes: 7889, fns: 16, allocs: 93, indirect: 0, refEq: 1 },
+    O3: { bytes: 2397, fns: 6, allocs: 44, indirect: 0, refEq: 1 },
   },
   // MAP PROBE WITHOUT THE STRING COST. i32 keys, so this isolates the bucket walk and the
   // `?? -1` sentinel path from hashing and content compare — the two rows differ by exactly
@@ -585,10 +585,10 @@ export const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3:
     // "`-O` inlines leaf helpers"). Allocation sites unchanged.
     // D2290: the map upsert's probe wrap-trap now streams a reason (see `collections/map-string`
     // above) — `-O3` 3140 -> 3383 bytes, structure unchanged; `-O` stayed within band.
-    // D2370: the pair index — no `live`/`hashes` grow in a module that never deletes: `allocs`
-    // 101 -> 95 and 52 -> 46, `-O` 8568 -> 8741 and `-O3` 3383 -> 3317 bytes, `fns` unchanged.
-    O: { bytes: 8741, fns: 16, allocs: 95, indirect: 0, refEq: 1 },
-    O3: { bytes: 3317, fns: 6, allocs: 46, indirect: 0, refEq: 1 },
+    // D2370: no `live` grow in a module that never deletes (the i32-keyed map also drops its
+    // `hashes`): `allocs` 101 -> 98 and 52 -> 49, `-O` 8568 -> 8702, `-O3` 3383 -> 3278 bytes.
+    O: { bytes: 8702, fns: 16, allocs: 98, indirect: 0, refEq: 1 },
+    O3: { bytes: 3278, fns: 6, allocs: 49, indirect: 0, refEq: 1 },
   },
   // ARRAY ELEMENT WRITE + READ, 400M of each, with the allocation hoisted out of the steady
   // state by construction. `fns: 1` is the load-bearing pin: every element accessor has been
