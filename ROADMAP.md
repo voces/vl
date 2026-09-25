@@ -1970,20 +1970,18 @@ in-language GC knobs.
   binding ends the narrowing (reachability of the writer, not flow). REMAINING: **flow analysis**,
   the owner's ideal — keep the narrowing when the writer can only write a member the narrowing
   already admits (`k` sets `v` to a boolean only when `v` is already a boolean), which needs the
-  per-path `W` of A6b's chain; and the forms the survey found open — a declared operator writing
-  its operand's field ([D2400](docs/internals/inventory/D2400.md)), a module global written by
-  another top-level function ([D2401](docs/internals/inventory/D2401.md)), a closure made under a
-  narrowing and called after a writer ([D2402](docs/internals/inventory/D2402.md)), a path read
-  before a writing call in a loop ([D2403](docs/internals/inventory/D2403.md)), a path fact in a
-  condition with a later writing call ([D2404](docs/internals/inventory/D2404.md)), and the path
-  re-test the path rule refuses ([D2405](docs/internals/inventory/D2405.md), clause 2). Field,
-  element and map-value narrowings through a plain call, a method or a closure already end
-  soundly (the path write-effect rule). **Open question (floated by the owner, not decided):**
+  per-path `W` of A6b's chain. The six forms the D2390 survey filed are closed (D2400–D2405; the
+  operator, module-global, closure-capture, loop, condition and path-re-test forms, all through
+  `callMayWrite`). Still open: a path narrowing captured by a closure that outlives the guard
+  ([D2407](docs/internals/inventory/D2407.md), needs a ruling: do path narrowings reach nested
+  functions at all?), and a bare-name re-test inside the arm of a condition whose call ended the
+  narrowing ([D2408](docs/internals/inventory/D2408.md), clause 2). **Open question (floated by the owner, not decided):**
   ban side effects in operator overloads, or let one modify only its left/right operands — an
   "overload-eligible" derived predicate beside getter-eligible (effects doc §C1b). Under the second
   reading an operator site needs only D2400's operand-path invalidation and can never run a
   writer — today a dispatched operator ends a narrowing when a declaration of that operator
-  reaches the writer, or when the writer escaped, as an unknown call does.
+  reaches the writer, or when the writer escaped, as an unknown call does, and ends a path
+  narrowing of an operand a declaration may write (D2400).
 - ⬜ **A8. Exact / Inexact variance.** Params Inexact by default (accept excess properties), values
   Exact. Guards the `a.foo = b` width footgun. (TODO.md)
   **Defaults + surface RULED 2026-08-18** — see A9.
