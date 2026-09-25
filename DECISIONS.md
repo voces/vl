@@ -931,8 +931,10 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   `Map`/`Set`'s whole surface, `K` = anything `===` accepts, and BOTH satisfy the
   index-signature interface: `{[K]: V}` is the CAPABILITY, not the implementation, and
   a signature names `Map<K, V>` or `IdentityMap<K, V>` when it wants the specific one
-  (the concrete names become annotation-legal and `Map<string, i32>()` parses
-  TS-style as part of this — neither exists today). Rep: the existing 7-field map
+  (the concrete names are annotation-legal and `Map<string, i32>()` parses TS-style
+  since A15 item 3 — as long spellings of `{[K]: V}` / `{[T]: boolean}`, one type each;
+  whether `{[K]: V}` later narrows to a read-only capability is an open ruling, and the
+  entry below records the parse rule). Rep: the existing 7-field map
   struct with `ref.eq` as the probe compare; v1 is a flat scan, and the lazy `i64`
   per-class serial is the optimisation that follows ONLY WHEN MEASURED NECESSARY — the
   API is identical, so nothing waits on it. Identity keys keep their objects alive;
@@ -1949,6 +1951,25 @@ three callers instead would have been three more places to forget.
   parsing are one phase to `vl check` and a character with no meaning needs no token kind.
   The one non-additive edge is the indentation strip: `"ab\<newline>  cd"` was `ab  cd` and is
   now `abcd`, so a space that is wanted goes BEFORE the backslash, where it is content.
+- **Explicit type arguments on a call use TypeScript's disambiguation (A15 item 3).**
+  After a name, `<` opens type arguments only when the run parses as a comma-separated
+  type list with no diagnostic, closes with `>` (a fused `>>`/`>>>` included), and is
+  followed DIRECTLY by `(`; otherwise the parser restores its cursor, token stream,
+  diagnostics and spelling stack and the `<` is a comparison. Chosen over a lexical rule
+  (no space before `<`) because it is the one a TS reader already carries, and over a
+  turbofish (`f::<T>()`) because the price is small and measured. Two forms change meaning.
+  The chain `a < b > (c)` was already a check error, since `a < b` is a `boolean`. The
+  COMMA form `f(a < b, c > (d))` is not: it ran before, as two comparison arguments, and
+  now reads as one call `a<b, c>(d)` and is refused — with a hint naming this rule and the
+  fix, `f((a < b), c > (d))`. Neither form occurred once in `tests/cases` (3,596 files), the
+  distilled corpus (7,589 cells), `std/`, `scripts/`, the compiler, glean (319 files) or
+  plumb's sources (104); the owner accepted the ambiguity as TypeScript does, and the comma
+  form is flagged to the owner separately. A line break inside the `<…>` is not tolerated
+  (the list must sit on one line); left as is. Scope today: a direct call of a
+  declared generic function, and `Map<K, V>()` / `Set<T>()`; the written types bind the
+  type parameters in declaration order before any argument is checked. A method call
+  (`o.f<T>()`) and an instantiation expression without a call (`const g = id<i32>`) are
+  not parsed.
 - **Hand-written parser over a generator.** Dropped antlr4 (Java/Gradle build
   step; can't be part of a self-hosted compiler). Chose hand-written (Pratt)
   over peggy/parser-combinators for error quality and bootstrappability. (Track

@@ -23,33 +23,49 @@
 
 Everything below this section is design vocabulary and a decision record; this block is
 the shipped surface, and it is here because the rest of the document did not state it in
-one place. A consumer building a real program (glean, VL-033) read `Map()` working as a
-value, wrote `type S = { index: Map }`, was told `unknown type 'Map'`, and concluded the
-map type was unspellable. It is spellable — with the index signature, never with the
-constructor's name:
+one place.
 
 | you want | the TYPE | the VALUE |
 | --- | --- | --- |
 | a sequence | `T[]` — `string[]`, `i32[][]` | `[...]` — `["a", "b"]`, `[]` |
 | a byte sequence | `u8[]` | `[...]` of `i32`s, or `std:fs`'s `readFile` |
-| a map | `{[K]: V}` — `{[string]: i32}` | `Map()` |
-| a set | `{[K]: boolean}` — `{[string]: boolean}` | `Set()` |
+| a map | `Map<K, V>` or `{[K]: V}` — `Map<string, i32>` | `Map()`, `Map<string, i32>()` |
+| a set | `Set<T>` or `{[T]: boolean}` — `Set<string>` | `Set()`, `Set<string>()` |
 
-`Map` and `Set` are CONSTRUCTOR names, not type names, and `Map<string, i32>` is not a
-spelling either (call-site type arguments do not exist; that is A15, unbuilt). The
-checker says so at every annotation position since D1582. A map is an ordinary field
-type, so the struct VL-033 wanted is:
+**`Map<K, V>` and `{[K]: V}` are two spellings of ONE type** (A15), and so are `Set<T>` and
+`{[T]: boolean}`: either flows where the other is written, both carry the whole map (or set)
+surface, and a hover or an error prints the index-signature spelling for both. Today the
+type is the concrete collection; `collections-design.md` §C2 describes a future split in
+which `{[K]: V}` would name only the read-and-index capability, and whether that split
+happens is an open ruling. A bare `Map` or `Set` with no type arguments is not a type — the
+checker says `` `Map` needs its key and value types — write `Map<K, V>` ``.
+
+A map is an ordinary field type, so the struct glean's VL-033 wanted is:
 
 ```vl
-type Interner = { names: string[], index: {[string]: i32} }
+type Interner = { names: string[], index: Map<string, i32> }
 const it: Interner = { names: [], index: Map() }
 it.index.set("main", 0)
 print(it.index["main"] ?? -1)
 ```
 
-Keys must be `string` or `i32` (anything else is a named refusal). An EMPTY collection
-still needs its element/value type pinned by an annotation or by a use — `const m = Map()`
-alone is `cannot infer a type for 'm'`, exactly as `const xs = []` is.
+Keys must be `string` or `i32` (anything else is a named refusal, at `Map<f64, i32>` as at
+`{[f64]: i32}`). An EMPTY collection needs its key and value types from somewhere: a
+constructor that names them (`const m = Map<string, i32>()`), an annotation on its
+destination, or a later use. `const m = Map()` with none of those is
+`cannot infer a type for 'm'`, exactly as `const xs = []` is.
+
+**Explicit type arguments on any generic call.** The same `<…>` works on a call of your own
+generic function, TypeScript's way: `id<f64>(3)`, `make<string>()`. The written types bind
+the function's type parameters in declaration order before any argument is checked, so an
+argument that disagrees is the argument's error (`id<string>(3)` reports argument 1), a bound
+is checked at the written type, and a type parameter no parameter mentions becomes callable.
+The parse rule is TypeScript's: after a name, `<` opens type arguments only when what follows
+parses as a type list, closes with `>`, and is directly followed by `(`; every other `<` is a
+comparison. So `a < b > (c)` now reads as a generic call — a relational chain VL's checker
+never accepted, since `a < b` is a `boolean` — and so does `f(a < b, c > (d))`, which DID run
+before as two comparisons and is now refused with a hint; parenthesise a comparison there:
+`f((a < b), c > (d))`.
 
 **Iterating a collection — reach for the element, not the index.** The first spelling to
 try binds the elements directly; it needs no bound and cannot run off the end:

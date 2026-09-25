@@ -754,8 +754,8 @@ Five items, in order. (0) is shipped; the rest are scheduled against it.
   entry, recorded in the header); `IdentityMap`/`IdentitySet` as concrete types that SATISFY
   `{[K]: V}` (the critics' "off the interface" was refused: the index-signature is the
   capability, and a signature names the concrete type when it wants one); the serial deferred
-  until a program measures the scan as a problem. Two things the ruling asked for that do not
-  exist today ride along: concrete `Map<K, V>`/`Set<T>` names as annotation types, and
+  until a program measures the scan as a problem. Two things the ruling asked for rode along
+  and shipped 2026-09-25 (A15 item 3): `Map<K, V>`/`Set<T>` as annotation types, and
   `Map<string, i32>()` explicit type arguments. Build items in ship order under **A15**; the
   operator is routed to vl-de.
 
@@ -2120,11 +2120,14 @@ in-language GC knobs.
   2. **Struct keys for `Map`/`Set`** — key-eligible = `==`-comparable; hash and `==` share one
      lowering (D1017 first); `-0.0` folds into `0.0` in the hash; the NaN-key and mutable-key
      rules go in the `Map` header.
-  3. **`Set<T>`** (C2.2, unbuilt), the concrete names `Map<K, V>` / `Set<T>` as annotation-legal
-     types (`Map<string, i32>` is `unknown type` today — only `{[string]: i32}` works), and
-     TS-style explicit type arguments on a call (`Map<string, i32>()` is a parse error today;
-     `f<a>(b)` becomes a generic call and the relational chain `f < a > (b)` is given up, as TS
-     does).
+  3. **SHIPPED (2026-09-25) as the alias version:** `Map<K, V>` / `Set<T>` are annotation-legal
+     long spellings of `{[K]: V}` / `{[T]: boolean}`, and TS-style explicit type arguments work
+     on `Map<K, V>()`, `Set<T>()` and every declared generic (`f<a>(b)` is a generic call; the
+     relational chain `f < a > (b)` is given up, and occurred nowhere — DECISIONS.md §Parser).
+     Open: whether `{[K]: V}` narrows to the read-only capability of C2 with `Map<K, V>` the
+     concrete subtype (the owner is re-deciding; the breakage count is in the A15 PR), a
+     set that is not a map-to-bool (C2.2), `o.f<T>()` on a method call, and an instantiation
+     expression without a call.
   4. **`IdentityMap<K, V>` / `IdentitySet<K>`** on the flat-scan rep — the 7-field map struct
      with `ref.eq` as the probe compare and `index`/`hashes` unused; `IdentityMap <: {[K]: V}`,
      `IdentitySet` on the sequence read core like `Set`; `K` = anything `===` accepts; header:
