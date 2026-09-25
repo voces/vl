@@ -23402,6 +23402,9 @@ export function sidResetStartBlockLet() {
   sblVal = []
   sblGen = []
   sblEpoch = sblEpoch + 1
+  sblStmtHead = []
+  sblStmtRow = []
+  sblStmtNext = []
   0
 }
 
@@ -28214,6 +28217,13 @@ export function unionNameOfIdentAt(sid: i32, fnIx: i32, atIx: i32) {
 let sblVal: i32[] = []
 let sblGen: i32[] = []
 let sblEpoch: i32 = 0
+// `sid` → head index into `sblStmtRow`/`sblStmtNext`, or -1 — every `startStmts[si]` sid binds
+// at start scope, built by the same scan as `sblVal`. Read only after `sblGen[sid] ==
+// sblEpoch`, so a stale head from an earlier program is never followed —
+// `sidResetStartBlockLet` clears all three alongside `sblVal`/`sblGen`.
+let sblStmtHead: i32[] = []
+let sblStmtRow: i32[] = []
+let sblStmtNext: i32[] = []
 
 // The `LetDecl` for a module-scope binding declared inside a top-level block, or -1 — a
 // start-function local neither `globalLetOf` nor `parentLetOf` can see. An empty `startStmts`
@@ -28225,9 +28235,14 @@ function startBlockLetRowOfSid(sid: i32) {
   if sidArrGet(sblGen, sid) == sblEpoch { return sidArrGet(sblVal, sid) }
   let si = 0
   let found = -1
-  while si < startStmts.length && found < 0 {
+  while si < startStmts.length {
     const li = parentLetOfSid(startStmts[si], sid)
-    if li >= 0 { found = li }
+    if li >= 0 {
+      if found < 0 { found = li }
+      sblStmtNext.push(sidArrGet(sblStmtHead, sid))
+      sidArrPut(sblStmtHead, sid, sblStmtRow.length)
+      sblStmtRow.push(startStmts[si])
+    }
     si = si + 1
   }
   sidArrPut(sblGen, sid, sblEpoch)
@@ -28235,28 +28250,23 @@ function startBlockLetRowOfSid(sid: i32) {
   found
 }
 
-// `startBlockLetRowOfSid`, positioned: the cheap memoized unpositioned answer gates the
-// search, skipped entirely when `sid` binds nowhere at start scope. Otherwise binary search
-// over `startStmts` (ascending, post-order so a statement's own index ends its subtree) finds
-// the ONE statement `atIx` can be in, asking `parentLetOfAt` once, not once per statement.
+// `startBlockLetRowOfSid`, positioned: the memoized unpositioned answer gates the search,
+// skipped when `sid` binds nowhere at start scope. Otherwise walks only the FEW start
+// statements binding `sid` (`sblStmtHead`'s chain) via `parentLetCoversAt` — `startStmts` is
+// not arena-sorted, so a binary search over all of it can pick the wrong one (D2326).
 function startBlockLetRowOfAt(sid: i32, atIx: i32) {
   const first = startBlockLetRowOfSid(sid)
   if first < 0 { return -1 }
   if atIx < 0 { return first }
-  let lo = 0
-  let hi = startStmts.length - 1
-  let pos = -1
-  while lo <= hi {
-    const mid = (lo + hi) / 2
-    if startStmts[mid] >= atIx {
-      pos = mid
-      hi = mid - 1
-    } else {
-      lo = mid + 1
+  let row = sidArrGet(sblStmtHead, sid)
+  while row >= 0 {
+    const blockIx = sblStmtRow[row]
+    if parentLetCoversAt(blockIx, sid, atIx) {
+      return parentLetOfAt(blockIx, sid, atIx)
     }
+    row = sblStmtNext[row]
   }
-  if pos < 0 { return -1 }
-  parentLetOfAt(startStmts[pos], sid, atIx)
+  -1
 }
 
 // The start-block `LetDecl` a read of `sid` denotes, or -1 — the one home both union rungs
