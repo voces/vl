@@ -333,12 +333,9 @@ Deno.test({
       // +82% module size and +127% wasm-opt wall time (§M4).
       const forced = await shape(["--always-inline-max-function-size=60"]);
       const bad: string[] = [];
-      // 8 = the seven per-element reads plus the `i < y.length` entry guard a bottom-tested
-      // `while` puts ahead of its loop, which lands inside the driver's TRIP loop once `axpy`
-      // is inlined there: per trip, not per element.
-      if (base.sget !== 8 || base.snew !== 2) {
+      if (base.sget !== 7 || base.snew !== 2) {
         bad.push(
-          `release profile: in-loop struct.get=${base.sget} (want 8), struct.new=${base.snew} (want 2)`,
+          `release profile: in-loop struct.get=${base.sget} (want 7), struct.new=${base.snew} (want 2)`,
         );
       }
       if (forced.sget !== 0 || forced.snew !== 0) {
