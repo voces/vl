@@ -15096,6 +15096,19 @@ let maFoldK: i64[] = []
 // qualifying declaration in turn, so the two never need to agree on anything but that order.
 let maFoldCursor = 0
 
+// The fold table's row for declaration `declIx`, or -1 — the slot BELONGS to the declaration,
+// not to any one emission of it: an unrolled or partially-unrolled loop body (`emitRangeUnrolled`
+// and #3129's 4x partial unroll) re-emits the same `LetDecl` node once per copy, and every copy
+// must land on the ONE row `maFoldCandidateCount` reserved, not a fresh one each time.
+function maFoldRowOfDecl(declIx: i32): i32 {
+  let i = 0
+  while i < maFoldDeclIx.length {
+    if maFoldDeclIx[i] == declIx { return i }
+    i = i + 1
+  }
+  -1
+}
+
 // The fold table's row for a live read of local `name`, or -1 — resolved by the same live-slot
 // rung `startBlockLetOfSid` reads from `collectLocals`'s `localDeclIx`, so a shadowed name in a
 // nested block can never match an outer declaration's row.
@@ -15104,18 +15117,15 @@ function maFoldRowOf(name: string): i32 {
   if slot < 0 || slot >= localDeclIx.length { return -1 }
   const decl = localDeclIx[slot]
   if decl < 0 { return -1 }
-  let i = 0
-  while i < maFoldDeclIx.length {
-    if maFoldDeclIx[i] == decl { return i }
-    i = i + 1
-  }
-  -1
+  maFoldRowOfDecl(decl)
 }
 
 // Emits a qualifying `const`'s initializer: push the bounded part, tee it into this
 // declaration's own scratch local, then finish `K + bounded` exactly as `emitExpr` would —
 // the stored value is unchanged, so `fbLocalSet` and every other read of the name are
-// unaffected; a later `emitMemAddr` just reads the teed local instead.
+// unaffected; a later `emitMemAddr` just reads the teed local instead. A SECOND emission of
+// the same `declIx` (a re-emitted loop-body copy) reuses the row `maFoldRowOfDecl` already
+// finds rather than claiming another slot — `maFoldCandidateCount` reserved exactly one.
 function emitMemConstFoldLet(
   body: u8[],
   initIx: i32,
@@ -15130,14 +15140,20 @@ function emitMemConstFoldLet(
     )
   }
   if emitExpr(body, rest, fnIx) < 0 { return -1 }
-  const wasmIdx = maFoldScratchBase + maFoldCursor
-  maFoldCursor = maFoldCursor + 1
+  const existing = maFoldRowOfDecl(declIx)
+  let wasmIdx = 0
+  if existing >= 0 {
+    wasmIdx = maFoldWasmSlot[existing]
+  } else {
+    wasmIdx = maFoldScratchBase + maFoldCursor
+    maFoldCursor = maFoldCursor + 1
+    maFoldDeclIx.push(declIx)
+    maFoldWasmSlot.push(wasmIdx)
+    maFoldK.push(k)
+  }
   fbLocalTee(wasmIdx)
   fbI32Const(k as% i32)
   fbI32Bin(0x6a) // i32.add
-  maFoldDeclIx.push(declIx)
-  maFoldWasmSlot.push(wasmIdx)
-  maFoldK.push(k)
   0
 }
 
@@ -20207,10 +20223,15 @@ function emitLetDeclStmt(body: u8[], s: LetDecl, stmtIx: i32, fnIx: i32) {
     if letNulList15 { pendingNulList = true }
     // The declaration-time address fold: a `const p = K + bounded` later used as a memory
     // address needs its bounded part kept in its own scratch local — `const`-only, since a
-    // `let` can be reassigned. The cheap checks lead so the real analysis (which
-    // `maFoldCandidateCount` also pays) runs only where it can possibly match.
+    // `let` can be reassigned. The checks are `maFoldCandidateCount`'s own, in the same
+    // order, so the two can never disagree about which declarations qualify.
     let mfK: i64 = -1
-    if fnIx >= 0 && s.letKw == "const" && mfShapeIsSum(s.letInit) {
+    if (
+      fnIx >= 0
+      && localIsRef[slot] == "i32"
+      && s.letKw == "const"
+      && mfShapeIsSum(s.letInit)
+    ) {
       mfK = memConstFoldShapeK(s.letInit, fnIx)
     }
     if mfK >= 0 {
