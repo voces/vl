@@ -526,8 +526,11 @@ export const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3:
     // D2290: the probe's wrap-trap (`__map_probe__`/`__map_probe_i32__`) now streams a
     // reason before it, cold-branch `__print_char__` code exactly like `emitNumCastTrapMsg`'s
     // per-site message above — `-O` 7670 -> 7960, `-O3` 2174 -> 2472 bytes, structure unchanged.
-    O: { bytes: 7960, fns: 16, allocs: 95, indirect: 0, refEq: 1 },
-    O3: { bytes: 2472, fns: 6, allocs: 46, indirect: 0, refEq: 1 },
+    // D2370: the pair index — a module that never deletes grows no `live` or `hashes` array per
+    // map, so both rungs lose those grow sites: `allocs` 95 -> 91 and 46 -> 42, `-O` 7960 -> 7933
+    // and `-O3` 2472 -> 2441 bytes. `fns` and `refEq` unchanged.
+    O: { bytes: 7933, fns: 16, allocs: 91, indirect: 0, refEq: 1 },
+    O3: { bytes: 2441, fns: 6, allocs: 42, indirect: 0, refEq: 1 },
   },
   // MAP PROBE WITHOUT THE STRING COST. i32 keys, so this isolates the bucket walk and the
   // `?? -1` sentinel path from hashing and content compare — the two rows differ by exactly
@@ -541,8 +544,10 @@ export const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3:
     // Allocation sites unchanged; wasmtime and V8 timings unchanged.
     // D2290: the probe's wrap-trap now streams a reason (see `collections/map-string` above)
     // — `-O` 1215 -> 1509, `-O3` 1131 -> 1429 bytes, structure unchanged.
-    O: { bytes: 1509, fns: 3, allocs: 13, indirect: 0 },
-    O3: { bytes: 1429, fns: 3, allocs: 13, indirect: 0 },
+    // D2370: the pair index — the probe reads the index alone and no `live`/`hashes` grow is
+    // emitted, `allocs` 13 -> 9 at both rungs, `-O` 1509 -> 1367, `-O3` 1429 -> 1283 bytes.
+    O: { bytes: 1367, fns: 3, allocs: 9, indirect: 0 },
+    O3: { bytes: 1283, fns: 3, allocs: 9, indirect: 0 },
   },
   // MIXED MAP + STRING, the realistic one: tokenize by code-point scan and slice, then a
   // read-modify-write upsert. `meta.json` decomposes VL's cost as ~64% map upsert and ~21%
@@ -580,8 +585,10 @@ export const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3:
     // "`-O` inlines leaf helpers"). Allocation sites unchanged.
     // D2290: the map upsert's probe wrap-trap now streams a reason (see `collections/map-string`
     // above) — `-O3` 3140 -> 3383 bytes, structure unchanged; `-O` stayed within band.
-    O: { bytes: 8568, fns: 16, allocs: 101, indirect: 0, refEq: 1 },
-    O3: { bytes: 3383, fns: 6, allocs: 52, indirect: 0, refEq: 1 },
+    // D2370: the pair index — no `live`/`hashes` grow in a module that never deletes: `allocs`
+    // 101 -> 95 and 52 -> 46, `-O` 8568 -> 8741 and `-O3` 3383 -> 3317 bytes, `fns` unchanged.
+    O: { bytes: 8741, fns: 16, allocs: 95, indirect: 0, refEq: 1 },
+    O3: { bytes: 3317, fns: 6, allocs: 46, indirect: 0, refEq: 1 },
   },
   // ARRAY ELEMENT WRITE + READ, 400M of each, with the allocation hoisted out of the steady
   // state by construction. `fns: 1` is the load-bearing pin: every element accessor has been
