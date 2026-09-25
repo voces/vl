@@ -695,6 +695,18 @@ instance's own `Buf`s at the top. Top-level code still runs once per instance (D
 Units built with `--shared-memory=<pages>` need a provider that imports the memory shared with
 the same max, `(memory 1 <pages> shared)`, and `--enable-threads` on the `wasm-merge` line.
 
+#### Declared memory limits and V8 performance
+
+Deno 2.9.6's V8 runs with no wasm trap handler, so every linear-memory access carries an
+explicit bounds check. Measured on plumb's guest workload (PL-039, 2026-09-25): a growable
+shared memory (`--shared-memory=<pages>` with min < max) makes TurboFan re-read the memory
+size after every store instead of keeping it in a register, costing ~9–11% per frame;
+declaring the memory fixed-size (min == max) removes that penalty. Separately, declaring a
+minimum above the program's constant addresses lets V8 drop those bounds checks at compile
+time — about −9.5%, even on a non-shared build. Node 24 and browsers run the trap handler
+and show no gap either way. When importing the memory (`--import-memory`), the host that
+creates it must set `initial` ≥ the declared minimum.
+
 #### Linking units' `extern` names through a facade (the facade recipe)
 
 Every `extern function` / `extern let` / `extern const` is imported from the module named
