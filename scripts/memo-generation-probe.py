@@ -142,6 +142,17 @@ ROWS = [
     ("listRepQuery", ["lrMemoGen"], "probe",
      ("    if lrMemoGen[exprIx] == lrGen && lrMemoFn[exprIx] == fnIx {",
       "    if false && lrMemoGen[exprIx] == lrGen && lrMemoFn[exprIx] == fnIx {")),
+    # `fnStmtsPosOf`'s arena-node → position index: extended by length on push, retired by
+    # `fnPosIndexDrop` at every in-place slot write (`buildFnMapNoteFnSlotWrite`) and reset.
+    ("fnStmtsPosIndex", ["fnPosEpoch", "fnPosFsLen", "fnPosMoLen", "fnPosFsStamp",
+                         "fnPosMoStamp"], "probe",
+     ("  if hit != 0 - 2 { return hit }",
+      "  if false && hit != 0 - 2 { return hit }")),
+    # `moduleLocalLetOfAt`'s per-name sorted plan over the module block-local table, which is
+    # built once and reset wholesale by `resetParentLetCache`; no stamp, the plan dies with it.
+    ("moduleLocalLetPlan", [], "probe",
+     ("  if off >= 0 { return mllSortFind(off, mllSortCnt[name] ?? 0, atIx) }",
+      "  if false && off >= 0 { return mllSortFind(off, mllSortCnt[name] ?? 0, atIx) }")),
 ]
 
 # A stamp is a MODULE-level binding whose name carries one of these markers; the shapes below
@@ -270,9 +281,12 @@ def cmd_run(args):
 
 
 def cmd_revert():
+    # The snapshot is consumed: left behind, the NEXT run's interrupted-run restore would put
+    # it back over whatever the tree became since.
     n = 0
     for p in BACKUP.glob("*.vl"):
         shutil.copy(p, C / p.name)
+        p.unlink()
         n += 1
     print("reverted %d file(s)" % n)
     return 0
