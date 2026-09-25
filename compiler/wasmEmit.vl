@@ -566,6 +566,7 @@ import {
   asExprNumFallible,
   asExprNumSrcName,
   asExprNumTgtName,
+  asgReadNode,
   assignTargetReReads,
   binEqNulVariantRow,
   binEqStructRow,
@@ -847,6 +848,7 @@ import {
   preStmtNarrow,
   printUnionArmsUnrenderable,
   printUnionPlan,
+  pushAsgReadNarrow,
   pushPostGuardNarrow,
   refArrSlotTag,
   refElemListBuildKind,
@@ -13783,17 +13785,17 @@ function emitUnionIfBindingSinkLink(
 }
 
 // The expression whose rep the `emitExprAs*` widenings must classify: an assignment in
-// value position classifies by its target cell, not its right-hand side, since `g = 7`
+// value position classifies by the re-read of its target cell (`asgReadNode`), since `g = 7`
 // leaves the cell's rep on the stack (`emitBinExprNode`'s `=` arm stores, then re-reads the
 // target). Only the classification moves — the right-hand side still evaluates once — so a widening cell in any value position is not double-widened (`i64.extend_i32_s` over an already-i64 value: invalid wasm).
-function widenClassifyExpr(exprIx: i32) {
+function widenClassifyExpr(exprIx: i32, fnIx: i32) {
   const wce = P.nodes[unwrapParen(exprIx)]
   if wce is BinExpr {
     if wce.binOp == "=" {
       // Only an IDENT target is a value expression here (`emitBinExprNode` rejects the
-      // rest), and its rep is the target's own.
+      // rest), and its rep is the one `asgReadNode` names for the re-read.
       const wct = P.nodes[wce.binLeft]
-      if wct is Ident { return wce.binLeft }
+      if wct is Ident { return asgReadNode(unwrapParen(exprIx), fnIx) }
     }
   }
   exprIx
@@ -13847,7 +13849,7 @@ export function emitExprAsI64(body: u8[], exprIx: i32, fnIx: i32) {
     pendingI64 = saved
     return r
   }
-  if exprIsI64(widenClassifyExpr(exprIx), fnIx) {
+  if exprIsI64(widenClassifyExpr(exprIx, fnIx), fnIx) {
     return emitExprWideCleared(body, exprIx, fnIx)
   }
   // Non-literal i32: evaluate, then sign-extend to i64.
@@ -13865,7 +13867,7 @@ export function emitExprAsF64(body: u8[], exprIx: i32, fnIx: i32) {
   // arithmetic expression with an f32 operand emits as f32, yet `exprIsF64` also claims it
   // via its float literal — without this check the f64 fast-path would emit f32 into an f64
   // slot and trap. A pure-f64 expression is not `exprIsF32`, so it still takes the fast path.
-  const f64Cls = widenClassifyExpr(exprIx)
+  const f64Cls = widenClassifyExpr(exprIx, fnIx)
   if exprIsF32(f64Cls, fnIx) {
     if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
     fbF64PromoteF32()
@@ -13939,7 +13941,7 @@ export function emitExprAsF32(body: u8[], exprIx: i32, fnIx: i32) {
   // directly. An assignment classifies by its target cell (`widenClassifyExpr`), as the
   // i64/f64 widenings do, and owns its own width (`emitExprWideCleared`) so an f32 seed
   // reaching here belongs to the position that set it, not the i32 sub-positions inside it.
-  if exprIsF32(widenClassifyExpr(exprIx), fnIx) {
+  if exprIsF32(widenClassifyExpr(exprIx, fnIx), fnIx) {
     return emitExprWideCleared(body, exprIx, fnIx)
   }
   // Non-literal i32: evaluate, then convert to f32.
@@ -24201,7 +24203,11 @@ function emitBinExprNode(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
     // must agree with the target cell's own storage class (`fnAssignRetKind`); D29 is the `string | null` half.
     if assignTargetReReads(exprIx, fnIx) {
       if emitAssign(body, exprIx, fnIx) < 0 { return -1 }
-      return emitExpr(body, e.binLeft, fnIx)
+      // A box cell re-read at the one member the checker typed the value at (`asgReadNarrowTy`).
+      const asgTop = pushAsgReadNarrow(exprIx, fnIx)
+      const asgRc = emitExpr(body, e.binLeft, fnIx)
+      if asgTop >= 0 { restoreNarrow(asgTop) }
+      return asgRc
     }
     return emitFail(
       "emitProgram: only an identifier assignment is a value expression",
