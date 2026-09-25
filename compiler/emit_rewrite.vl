@@ -134,6 +134,7 @@ import {
   paramDefaultOf,
   ufcsAliasAtSite,
 } from "./ast"
+import { MC_RUNG_BUILTIN, MC_RUNG_SELF_FN, memberCallRungOf } from "./ast"
 import {
   annArrowAt,
   capHas,
@@ -542,11 +543,10 @@ function drwWalk(ix: i32, ctx: i32) {
           }
         }
       }
-      // D1522 — a map `m.get(k)` is the read `m[k]`, so it becomes one, here rather than
-      // as a separate emit arm: an emit arm alone leaves every consumer classifier reading
-      // the call's checker type and claiming a box the read never left. The checked type
-      // rides onto the new Index node, which the checker's own type gates.
-      if callee.memProp == "get" {
+      // D1522 — a map `m.get(k)` is the read `m[k]`, rewritten here so every consumer
+      // classifier reads the Index node (it carries the checked type) rather than claiming a
+      // box the read never left. Only where the checker took the built-in: a set's is a function.
+      if callee.memProp == "get" && memberCallRungOf(ix) != MC_RUNG_SELF_FN {
         if args.length == 1 && nodeTyIsMap(callee.memObj) {
           const mgIx = mkIndex(callee.memObj, args[0], n.pos)
           nodeTyCarry(mgIx, ix)
@@ -566,12 +566,18 @@ function drwWalk(ix: i32, ctx: i32) {
       const recvHasField = recvFieldTy >= 0
       const si = structIndexOfExpr(callee.memObj, ctx)
       let ufcs = false
-      if si >= 0 && !recvHasField {
-        if sFieldIndex(si, callee.memProp) < 0 {
+      // A call the checker resolved to a built-in method stays one: that is the rung a
+      // `self`-function of the same name loses to on this receiver (D2476).
+      const builtinRung = memberCallRungOf(ix) == MC_RUNG_BUILTIN
+      // And one it resolved to a `self`-function stays one where the struct row has the field
+      // but the checked type does not: a `P | null` receiver's row is `P`'s.
+      const selfFnRung = memberCallRungOf(ix) == MC_RUNG_SELF_FN
+      if si >= 0 && !recvHasField && !builtinRung {
+        if sFieldIndex(si, callee.memProp) < 0 || selfFnRung {
           if drwSelfFnOf(uName, args.length + 1) >= 0 { ufcs = true }
         }
       }
-      if si < 0 && !recvHasField {
+      if si < 0 && !recvHasField && !builtinRung {
         if !exprIsClosure(n.callFn, ctx) {
           if drwSelfFnOf(uName, args.length + 1) >= 0 {
             // A type-parameter receiver has no struct row yet, so `si < 0` alone cannot
