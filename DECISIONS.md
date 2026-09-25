@@ -7694,3 +7694,81 @@ compiler and `std` contain no range loop, so the seed (+4,142 bytes, +0.15%, all
 emitter code) and the plumb-shape units (guest fuel +0.02% against the same run on master) do
 not move. A 2x partial unroll of `mix`'s variable-trip loop was measured by hand and is worth
 0.5%, inside the noise, so it is not built.
+
+## Small variable-trip range loops are unrolled 4x (2026-09-24) — plumb PL-037 item 4
+
+**A range loop with step 1 that is not fully unrolled, and a list walk whose header is hoisted,
+run four copies of the body per trip while four trips remain, then the rolled loop for the
+rest — when the body is at most 40 nodes of a cheap set:** literals and `null`, scalar operators,
+`is`, locals, field reads, `if`, `let`, `break`/`continue`/`return`, an index into a list or a
+string, and an inline memory intrinsic. Any other call, a nested loop, a function, a map index or
+an allocating literal keeps the loop rolled, as does a body that writes a range loop's variable.
+The main loop's test is `v < bound - 3` (`- 2` for `to`), computed once; a bound below
+`INT_MIN + 3` runs no main trip, and a walk's `len - 3` cannot wrap. `break` leaves one block
+around both loops, `continue` ends its own copy, each copy mints the body's `let`s into the same
+slots, and the loop stays top-tested ("Loops stay top-tested").
+
+**Why the copies, and not the list wrapper: the `array` kernel's own disassembly.** At `-O`
+the kernel's list is scalarised by binaryen's Heap2Local, so its sum loop has no `struct.get`,
+no `ref.as_non_null`, and no VL `i u< len` select (the range proof dropped it) — one `array.get`,
+one multiply, one add, one compare per element. What costs is the per-trip overhead, which
+LLVM removes by unrolling 8x and V8 does not remove at all. Each overhead was measured on its
+own, in V8, on hand-written modules of the kernel's sum phase (20 passes over 1M `i32`s, min of
+15, ms):
+
+| shape | GC array (`array.get`) | linear memory (`i32.load`) |
+|---|--:|--:|
+| rolled, as emitted on master | 8.2 | 8.5 |
+| rolled, bottom-tested | 8.4 | — |
+| rolled, bound `array.len` instead of the list's `len` | 7.7 | — |
+| unrolled 4x, the loop var incremented between copies | 7.8 | 7.4 |
+| unrolled 2x, copy `k` reads `i + k` | 7.4 | — |
+| **unrolled 4x, copy `k` reads `i + k` (shipped)** | **5.6** | 3.9 |
+| unrolled 8x, copy `k` reads `i + k` | 5.4 | 4.0 |
+| unrolled 4x, guarded by `i + 3 < array.len` | 5.7 | — |
+
+Rust's whole kernel, push included, is 4.7 ms.
+
+**What is inherent to WasmGC arrays.** At the rolled shape the bounds check costs nothing
+measurable (8.2 against 8.5 on linear memory): the loop is bound by its per-trip work. Once the
+loop is unrolled it is 1.7 of the 5.6 ms (30%), and V8 elides none of it — not against the
+list's `len`, not against `array.len` in the guard. That is the part of the gap to Rust no
+emitter change reaches. Push is the other part: 1M pushes are 1.0 ms against Rust's 0.7–0.9,
+and 0.44 into a presized array, so growth costs about 0.5 ns per element — `array.new_default`
+zero-fills and `array.copy` moves, where `realloc` can extend in place. The push loop is
+already Rust's shape (a capacity compare, a store, a length store); there is no fast path left
+to take out of it.
+
+**Why copy `k` reads `u + k` as an expression, and also stores it.** Chaining the increment
+between copies (`i = i + 1`) is 7.8 against 5.6 in V8. Storing only the value (`i = u + k`, then
+`local.get i`) is correct but loses to binaryen: it sinks the store into a `local.tee` at the
+first read, and a second `xs[i]` in the same copy is then a different expression, so
+`local-cse` cannot merge the two `array.get`s. A branchy body (`if xs[i] > 100 { s += xs[i] }`)
+went 0.37 s → 0.44 s under wasmtime `-O` that way; reading `u + k` at every use, 0.31 s. The
+store stays, so a reader that bypasses the identifier path still sees the right value.
+
+**Why 4 and 40.** 8x is 4% faster than 4x on the kernel for twice the code; 2x keeps most of
+the overhead. 40 nodes covers a body of a few statements over list reads and keeps a loop's
+growth to four more copies of something small; the vs-rust module grows 3,912 → 4,503 bytes.
+`mix`'s loop, which the section above measured 2x-unrolled at 0.5%, is copied too and stays
+inside the noise. bench/vs-rust, master and this interleaved twice (`--reps 15`, load 6–8):
+`array` 1.86 / 1.95 → 1.48 / 1.48x Rust; every other kernel inside run-to-run noise.
+
+**A list reached through a field is cached too.** `b.xs[i]` under `for i in 0 until b.xs.length`
+re-read `b.xs`, its backing and its `len` and kept the select on every access (binaryen's
+`--licm` does not move a `struct.get` of a mutable field). The header hoist now caches a
+field path `b.xs` when `b` is an identifier not rebound in the loop, its field is a plain
+struct field (not a union, variant, nullable or narrowed receiver), and no field named `xs` is
+assigned in the loop on any receiver — `c.xs = …` where `c` aliases `b` looks exactly like
+that. The call-free rule the hoist already had covers every other way a list moves: a push,
+a pop, a closure, or a call that mutates through an alias. The kernel's shape over a field
+runs 10.9 ms on master, 9.4 with the copies alone, 6.9 cached.
+`tests/cases/loops/list-mutation-in-loop-matrix.vl` holds the loops that must not be cached,
+each against the value master printed.
+
+**Price.** The seed grows 6,520 bytes (+0.23%); of that, 1,491 are the compiler's own loops
+(master's source built by this compiler: 104 functions change, the field-path hoist in its
+`while` loops — the compiler has no range loop), and self-compile guest fuel falls 0.11%. The
+plumb-shape units' fuel moves +0.05% against master. `bench/` arrays and collections build
+byte-identical (every loop there is a `while`). Under wasmtime a range sum falls 0.30 → 0.16 s
+and a list walk 0.31 → 0.17 s, plain or `-O`.
