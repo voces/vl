@@ -28153,6 +28153,10 @@ export function unionNameOfIdentSid(sid: i32, fnIx: i32) {
 // block shadow of a same-named PARAMETER win over the param's own annotation
 // (`fnBlockShadowsAt`, D2325). `sidText` recovers a faithful spelling only for a `sidOf` id.
 export function unionNameOfIdentAt(sid: i32, fnIx: i32, atIx: i32) {
+  // No union anywhere in the program means no identifier can denote one — skips
+  // `parentLetOfAt`'s duplicate-chain walk for every OTHER read of a popular name a
+  // non-union program happens to reuse across many sibling blocks (D2326 perf).
+  if !uDeclared { return "" }
   const name = sidText(sid)
   if fnIx >= 0 {
     const fn = P.nodes[fnIx]
@@ -28160,25 +28164,31 @@ export function unionNameOfIdentAt(sid: i32, fnIx: i32, atIx: i32) {
       // Reads `body` before the `Param` narrowing below can rebind it.
       const body = fn.fnBody
       const params = fn.fnParams
-      if !fnBlockShadowsAt(fnIx, sid, atIx) {
-        let i = 0
-        while i < params.length {
-          // `sidOfNode(params[i])` is `sidOf(p.parName)` off a side table, so the scan compares
-          // interned ids rather than strings, and only the slot that matches pays the arena read
-          // and the `Param` narrowing below.
-          if sidOfNode(params[i]) == sid {
-            const p = P.nodes[params[i]]
-            if p is Param {
-              // The registry-membership test via the canon-keyed index instead of `isUName`'s
-              // linear scan over `unNames`: same question, same name returned, on interned ids.
-              // The spelling renders only once the row exists, since a non-union param drops it.
-              if unRowOfCanon(annRowOfNode(p.parType)) >= 0 {
-                return tyNameOf(p.parType)
-              }
-              return ""
-            }
+      // The cheap scan first: `fnBlockShadowsAt` walks a duplicate-name chain as long as the
+      // function has same-named LetDecls, so it is asked only once a param of `sid` is
+      // actually found — never on every read of every OTHER local in the function (D2326).
+      let pIx = -1
+      let i = 0
+      while i < params.length {
+        // `sidOfNode(params[i])` is `sidOf(p.parName)` off a side table, so the scan compares
+        // interned ids rather than strings, and only the slot that matches pays the arena read
+        // and the `Param` narrowing below.
+        if sidOfNode(params[i]) == sid {
+          pIx = params[i]
+          break
+        }
+        i = i + 1
+      }
+      if pIx >= 0 && !fnBlockShadowsAt(fnIx, sid, atIx) {
+        const p = P.nodes[pIx]
+        if p is Param {
+          // The registry-membership test via the canon-keyed index instead of `isUName`'s
+          // linear scan over `unNames`: same question, same name returned, on interned ids.
+          // The spelling renders only once the row exists, since a non-union param drops it.
+          if unRowOfCanon(annRowOfNode(p.parType)) >= 0 {
+            return tyNameOf(p.parType)
           }
-          i = i + 1
+          return ""
         }
       }
       const li = parentLetOfAt(body, sid, atIx)
@@ -28310,15 +28320,19 @@ function unionDeclTyIxOfIdentAt(sid: i32, fnIx: i32, atIx: i32): i32 {
     if fn is FuncDecl {
       const body = fn.fnBody
       const params = fn.fnParams
-      if !fnBlockShadowsAt(fnIx, sid, atIx) {
-        let i = 0
-        while i < params.length {
-          const p = P.nodes[params[i]]
-          if p is Param {
-            if sidOfNode(params[i]) == sid { return annRowOfNode(p.parType) }
-          }
-          i = i + 1
+      // Cheap scan first — see `unionNameOfIdentAt`'s identical guard for why.
+      let pIx = -1
+      let i = 0
+      while i < params.length {
+        if sidOfNode(params[i]) == sid {
+          pIx = params[i]
+          break
         }
+        i = i + 1
+      }
+      if pIx >= 0 && !fnBlockShadowsAt(fnIx, sid, atIx) {
+        const p = P.nodes[pIx]
+        if p is Param { return annRowOfNode(p.parType) }
       }
       const li = parentLetOfAt(body, sid, atIx)
       if li >= 0 { return letUnionDeclTyIxOf(li) }
