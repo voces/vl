@@ -29,7 +29,6 @@ import {
   TyFunc,
   TyNullable,
   TyObj,
-  TyUnion,
   TyVar,
   bindGenWalk,
   blockHasBareReturn,
@@ -74,7 +73,6 @@ import {
   tyIsMap,
   tyRenderSoftensLits,
   tyToEmitName,
-  tyToStr,
   uniqueGenericDeclNamed,
 } from "./typecheck"
 import {
@@ -82,7 +80,12 @@ import {
   AsExpr,
   BinExpr,
   Block,
+  BoolLit,
+  BreakStmt,
   Call,
+  CharLit,
+  ContinueStmt,
+  ErrExpr,
   FieldDef,
   FieldInit,
   ForIn,
@@ -90,17 +93,23 @@ import {
   FuncDecl,
   Ident,
   IfStmt,
+  ImportDecl,
   Index,
   IsExpr,
   LetDecl,
+  MatchExpr,
   Member,
+  NullLit,
+  NumLit,
   ObjLit,
   OptMember,
   P,
   Param,
   Paren,
+  Program,
   RetStmt,
   Spread,
+  StrLit,
   TypeDecl,
   TypeRef,
   Unary,
@@ -143,7 +152,13 @@ import {
   tsMentionsAnyName,
   ufcsAliasAtSite,
 } from "./ast"
-import { MC_RUNG_BUILTIN, PIN_SIGKEY, callTyArgsOf, setCallTyArgs } from "./ast"
+import {
+  MC_RUNG_BUILTIN,
+  PIN_SIGKEY,
+  callTyArgEndsOf,
+  callTyArgsOf,
+  setCallTyArgs,
+} from "./ast"
 // Monomorphization rewrites a call's callee name on a node the arena already holds;
 // `compiler/symbols.vl` is the discipline that in-place write follows.
 import {
@@ -304,6 +319,9 @@ import { collectValuedReturnsIn } from "./emit_query"
 // yet), so it would inherit the template's parent and give every instance one env
 // layout. Recorded here and re-pointed the moment the instance is lifted.
 let monoLamMintedSlots: i32[] = []
+// Every lifted slot a lambda clone took for the instance being built, nested clones included.
+// Never retired, since the instance walks each clone's body once it is registered (D2553).
+let monoLamCloneSlots: i32[] = []
 
 // The arena shape `monoRebuild`'s four whole-program passes are a pure function of:
 // `P.nodes`, `fnStmts` and `fnParent` grow, and `monoArenaTick` counts what lands IN PLACE,
@@ -1224,8 +1242,8 @@ function monoBindCols(params: i32[], tyCol: i32[], bN: string[], bT: i32[]) {
 }
 
 // Whether the generic being instantiated declares a lambda. A lambda reading a `(T | null)[]`
-// element reaches D2535's unboxing gap when `T` is a union, and a wrong heap when `T` is a
-// generic record that itself holds a `(P | null)[]`, so both refuse while this is set (D2525).
+// element reads a wrong heap when `T` is a generic record that itself holds a `(P | null)[]`,
+// so that refuses while this is set (D2525).
 let monoCurHasLam = false
 
 // Whether the generic at `fnStmts` position `slot` is the frame of any other lifted function.
@@ -1233,32 +1251,6 @@ function monoFnDeclaresLambda(slot: i32): boolean {
   if fnChildHead.length != fnStmts.length { buildFnChildIndex() }
   if slot < 0 || slot >= fnChildHead.length { return false }
   fnChildHead[slot] >= 0
-}
-
-// Refuses a union element read inside a lambda, off the argument's arena type: a literal
-// union binds `T` by its softened base name, so only the argument still shows the union.
-function monoLamNulUnionListCheck(argTy: i32) {
-  if !monoCurHasLam || argTy < 0 || argTy >= T.tys.length { return 0 }
-  const a = T.tys[argTy]
-  if a is TyArray {
-    if a.aElem >= 0 && a.aElem < T.tys.length {
-      const e = T.tys[a.aElem]
-      if e is TyNullable {
-        if (
-          e.nInner >= 0
-          && e.nInner < T.tys.length
-          && T.tys[e.nInner] is TyUnion
-        ) {
-          return emitFail(
-            "emitProgram: a nullable-"
-              + tyToStr(e.nInner)
-              + " list element has no rep; use a non-null element type",
-          )
-        }
-      }
-    }
-  }
-  0
 }
 
 // Refuses an instance whose `(T | null)[]` annotation binds `T` where `T | null` is a niche
@@ -1497,6 +1489,160 @@ function monoIfChainRebuild(
     li = li - 1
   }
   ce
+}
+
+// The operand children of expression `ix` a copy-on-write rewrite descends into, in the
+// order `monoExprRebuild` takes them back. A compound assignment names its target once and
+// its value limb, since the target node is shared between the read and the write; a postfix
+// `x++` has none. Empty for a leaf and for every statement kind, which the walkers own.
+function monoExprKids(ix: i32): i32[] {
+  const out: i32[] = []
+  if ix < 0 { return out }
+  const n = P.nodes[ix]
+  match n {
+    Call => {
+      out.push(n.callFn)
+      let ai = 0
+      while ai < n.callArgs.length {
+        out.push(n.callArgs[ai])
+        ai = ai + 1
+      }
+    }
+    BinExpr => {
+      out.push(n.binLeft)
+      if n.binCompound == "" {
+        out.push(n.binRight)
+      } else if n.binCompound != "++" && n.binCompound != "--" {
+        const inner = P.nodes[n.binRight]
+        if inner is BinExpr { out.push(inner.binRight) }
+      }
+    }
+    Unary => {
+      if n.unOp != "p+" && n.unOp != "p-" { out.push(n.unArg) }
+    }
+    Paren => {
+      out.push(n.parInner)
+    }
+    Member => {
+      out.push(n.memObj)
+    }
+    OptMember => {
+      out.push(n.omObj)
+    }
+    Index => {
+      out.push(n.idxArr)
+      out.push(n.idxIndex)
+    }
+    IsExpr => {
+      out.push(n.isObj)
+    }
+    AsExpr => {
+      out.push(n.asObj)
+    }
+    Spread => {
+      out.push(n.spdArg)
+    }
+    ArrayLit => {
+      return n.arrElems
+    }
+    ObjLit => {
+      let fi = 0
+      while fi < n.objFields.length {
+        const f = P.nodes[n.objFields[fi]]
+        if f is FieldInit { out.push(f.fiValue) } else { out.push(-1) }
+        fi = fi + 1
+      }
+    }
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | ErrExpr | TypeRef | BreakStmt | ContinueStmt => {
+      // A leaf.
+    }
+    LetDecl | Param | FuncDecl | IfStmt | WhileStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | UnionDecl | ForRange | ForIn | MatchExpr | ImportDecl => {
+      // A statement, declaration or lambda: the walker that asked owns its children.
+    }
+  }
+  out
+}
+
+// Expression `ix` rebuilt over `kids`, parallel to `monoExprKids(ix)`; `ix` itself when no
+// child changed. The rebuilt node answers the checked type `ix` did, substituted through the
+// instance binding `bN`/`bT`, since its emission reads the recorded type (D2551).
+function monoExprRebuild(ix: i32, kids: i32[], bN: string[], bT: i32[]): i32 {
+  const old = monoExprKids(ix)
+  if old.length != kids.length { return ix }
+  let changed = false
+  let i = 0
+  while i < kids.length {
+    if kids[i] != old[i] { changed = true }
+    i = i + 1
+  }
+  if !changed { return ix }
+  const nx = monoExprRemake(ix, kids)
+  if nx != ix { nodeTyRecord(nx, monoPinnedTyOf(ix, bN, bT)) }
+  nx
+}
+
+// The recorded type of `ix` at the instance binding `bN`/`bT`: substituted where that leaves
+// no type variable, else as recorded. -1 when the node has none.
+function monoPinnedTyOf(ix: i32, bN: string[], bT: i32[]): i32 {
+  const ty = nodeTyIxOf(ix)
+  if ty < 0 || ty >= T.tys.length { return ty }
+  if !tyHasTyVar(ty) { return ty }
+  const st = substTyDeep(ty, bN, bT)
+  if st < 0 || tyHasTyVar(st) { return ty }
+  st
+}
+
+// A fresh node for expression `ix` over `kids` (parallel to `monoExprKids(ix)`), or `ix`
+// for a kind it cannot remake. A call keeps its explicit type arguments, and an `is` its
+// banked row. Records no type: the caller decides which one the new node answers.
+function monoExprRemake(ix: i32, kids: i32[]): i32 {
+  const n = P.nodes[ix]
+  if n is Ident { return mkIdent(n.identName, n.pos) }
+  if n is Call {
+    const args: i32[] = []
+    let ai = 1
+    while ai < kids.length {
+      args.push(kids[ai])
+      ai = ai + 1
+    }
+    const nc = mkCallN(kids[0], args, n.callArgNames, n.pos)
+    const tas = callTyArgsOf(ix)
+    if tas.length > 0 { setCallTyArgs(nc, tas, callTyArgEndsOf(ix)) }
+    return nc
+  }
+  if n is BinExpr {
+    if n.binCompound == "++" || n.binCompound == "--" {
+      return mkPreIncr(n.binCompound, kids[0], n.pos)
+    }
+    if n.binCompound != "" {
+      return mkCompoundAssign(n.binCompound, kids[0], kids[1], n.pos)
+    }
+    return mkBinary(n.binOp, kids[0], kids[1], n.pos)
+  }
+  if n is Unary { return mkUnary(n.unOp, kids[0], n.pos) }
+  if n is Paren { return mkParen(kids[0], n.pos) }
+  if n is Member { return mkMember(kids[0], n.memProp, n.pos) }
+  if n is OptMember { return mkOptMember(kids[0], n.omProp, n.omDot, n.pos) }
+  if n is Index { return mkIndex(kids[0], kids[1], n.pos) }
+  if n is IsExpr { return monoReIsExpr(ix, kids[0]) }
+  if n is AsExpr { return mkAsExpr(kids[0], n.asTy, n.asMode, n.pos) }
+  if n is Spread { return mkSpread(kids[0], n.pos) }
+  if n is ArrayLit { return mkArrayLit(kids, n.pos) }
+  if n is ObjLit {
+    const fs: i32[] = []
+    let fi = 0
+    while fi < n.objFields.length {
+      let nf = n.objFields[fi]
+      const f = P.nodes[nf]
+      if f is FieldInit {
+        if kids[fi] != f.fiValue { nf = mkFieldInit(f.fiName, kids[fi], f.pos) }
+      }
+      fs.push(nf)
+      fi = fi + 1
+    }
+    return mkObjLit(fs, n.pos)
+  }
+  ix
 }
 
 // Clone a monomorphized instance's body, substituting every `LetDecl` type-param
@@ -1966,6 +2112,33 @@ function monoLamParentOf(fnIx: i32) {
   -1
 }
 
+// A synthesized annotation for un-annotated parameter `pi` of lambda `fnIx`, at the instance
+// binding `bN`/`bT`: its inferred type substituted, where that names the type parameter and
+// leaves none. -1 for an annotated parameter or one whose type needs no pin.
+function monoLamParamPinAnn(
+  fnIx: i32,
+  pi: i32,
+  parType: i32,
+  bN: string[],
+  bT: i32[],
+) {
+  if parType >= 0 { return -1 }
+  const lty = nodeTyIxOf(fnIx)
+  if lty < 0 || lty >= T.tys.length { return -1 }
+  const lt = T.tys[lty]
+  if lt is TyFunc {
+    if pi >= lt.fnParamTypes.length { return -1 }
+    const pty = lt.fnParamTypes[pi]
+    if pty < 0 || !tyHasTyVar(pty) { return -1 }
+    const st = substTyDeep(pty, bN, bT)
+    if st < 0 || tyHasTyVar(st) { return -1 }
+    const nm = tyToEmitName(st)
+    if nm == "" { return -1 }
+    return synthTypeRefTy(nm, -1, st)
+  }
+  -1
+}
+
 // Clone the lifted lambda at `fnIx` with every type-param-mentioning parameter and return
 // annotation substituted through this instance's binding, lift the clone into `fnStmts`,
 // and return its node index — or -1 when nothing substitutes. The body is shared with the
@@ -2008,9 +2181,19 @@ function monoCloneLambdaSubst(
           monoNoteLamNode(monoLamShared, fnIx)
           return -1
         } else {
-          // Unchanged — share the original `Param` node, so a lambda with one generic and
-          // one concrete parameter mints exactly one node.
-          ps.push(a.fnParams[i])
+          // An un-annotated parameter the checker inferred at the type parameter (a `.filter`
+          // callback over a `T[]`) is annotated at this pin, since nothing else lowers it.
+          const ipn = monoLamParamPinAnn(fnIx, i, p.parType, bN, bT)
+          if ipn >= 0 {
+            ps.push(
+              mkParam(p.parName, ipn, p.parDefault, p.parOpt, p.parRest, p.pos),
+            )
+            any = true
+          } else {
+            // Unchanged — share the original `Param` node, so a lambda with one generic
+            // and one concrete parameter mints exactly one node.
+            ps.push(a.fnParams[i])
+          }
         }
       } else {
         monoNoteLamNode(monoLamShared, fnIx)
@@ -2091,12 +2274,27 @@ function monoCloneLambdaSubst(
     // Recursing here rather than teaching that walk a `FuncDecl` arm keeps the two facts a
     // clone owns together: the body substitution above and the frame its clones hang off.
     const mark = monoLamMintedSlots.length
-    const nbody = monoPinBodyLambdas(nbodyF, typarams, tvN, tvV, bN, bT)
+    const nbodyL = monoPinBodyLambdas(nbodyF, typarams, tvN, tvV, bN, bT)
+    // A generic call in the body is instantiated by rewriting its callee in place, so each
+    // clone takes its own copy, as an instance body does (D2553).
+    const svCgcP = monoCgcTyParams
+    const svCgcN = monoCgcTvN
+    const svCgcV = monoCgcTvV
+    monoCgcTyParams = typarams
+    monoCgcTvN = tvN
+    monoCgcTvV = tvV
+    const nbody = monoCloneGenericCalls(nbodyL)
+    monoCgcTyParams = svCgcP
+    monoCgcTvN = svCgcN
+    monoCgcTvV = svCgcV
     // The lambda twin of the named clone's rule: a bare `return` in the body is void, so the
     // return-expression pin above must not give this instance a result (D1600).
     let cloneRet = nret
     if a.fnRet < 0 && blockHasBareReturn(a.fnBody) { cloneRet = -1 }
     const clone = mkFunc(nm, noTP, ps, cloneRet, nbody, a.pos)
+    // The clone is a value too, typed at this pin where the template's type substitutes.
+    const cty = monoPinnedTyOf(fnIx, bN, bT)
+    if cty >= 0 && !tyHasTyVar(cty) { nodeTyRecord(clone, cty) }
     // A lifted clone answers what its template did, the captures it widened included (D2402).
     recordClonedCallRetire(fnIx, clone)
     // D1046 — the first instance of a named nested function replaces the template's slot
@@ -2126,6 +2324,7 @@ function monoCloneLambdaSubst(
     const mySlot = fnStmts.length - 1
     monoReparentNestedLams(mark, mySlot)
     monoLamMintedSlots.push(mySlot)
+    monoLamCloneSlots.push(mySlot)
     fnDispNames.push("")
     fnValUsed = true
     monoNoteLamNode(monoLamPinned, fnIx)
@@ -2134,10 +2333,10 @@ function monoCloneLambdaSubst(
   -1
 }
 
-// Per-instance lambda monomorphization for a lambda bound in a generic body — the
-// annotated sibling of `monoPinMapLambdas`. Walks the instance's statement spine and, at
-// a `LetDecl` whose initializer is a lifted lambda still mentioning a type parameter,
-// substitutes at this pin and repoints the binding at the clone. Copy-on-write.
+// Per-instance lambda monomorphization for a generic body — the annotated sibling of
+// `monoPinMapLambdas`. Walks the whole instance body and substitutes every lambda literal
+// still mentioning a type parameter at this pin, whatever position it is written in: a
+// binding, an argument, an element, a field, a condition or a tail. Copy-on-write.
 function monoPinBodyLambdas(
   ix: i32,
   typarams: string[],
@@ -2162,15 +2361,7 @@ function monoPinBodyLambdas(
     return mkBlock(ns, n.pos)
   }
   if n is LetDecl {
-    if n.letInit >= 0 {
-      const iv = P.nodes[n.letInit]
-      if iv is FuncDecl {
-        const cl = monoCloneLambdaSubst(n.letInit, typarams, tvN, tvV, bN, bT)
-        if cl < 0 { return ix }
-        return mkLet(n.letKw, n.letName, n.letType, cl, n.pos)
-      }
-    }
-    const ci = monoPinBodyLambdas(n.letInit, typarams, tvN, tvV, bN, bT)
+    const ci = monoPinValueLambda(n.letInit, typarams, tvN, tvV, bN, bT)
     if ci == n.letInit { return ix }
     return mkLet(n.letKw, n.letName, n.letType, ci, n.pos)
   }
@@ -2183,59 +2374,21 @@ function monoPinBodyLambdas(
       monoCloneLambdaSubst(ix, typarams, tvN, tvV, bN, bT)
       return ix
     }
-    // An anonymous lambda reached here is a value — a `return` argument or a block's tail —
-    // and gets its per-instance clone as a binding's initialiser does (D2525).
+    // An anonymous lambda reached here is a block's tail value (D2525).
     const acl = monoCloneLambdaSubst(ix, typarams, tvN, tvV, bN, bT)
     if acl >= 0 { return acl }
     return ix
   }
   if n is RetStmt {
-    const ca = monoPinBodyLambdas(n.retArg, typarams, tvN, tvV, bN, bT)
+    const ca = monoPinValueLambda(n.retArg, typarams, tvN, tvV, bN, bT)
     if ca == n.retArg { return ix }
     return mkReturn(ca, n.pos)
   }
-  // D943 — an object literal's field value is a position a lambda is written in:
-  // `return { actual: value, show: () => … }` is the shape a generic builder has, a struct
-  // carrying both the `T` value and a closure over it. Recurses as well as rewriting, so a
-  // lambda nested deeper inside the literal is reached too.
-  if n is ObjLit {
-    const fs: i32[] = []
-    let fchanged = false
-    let fi = 0
-    while fi < n.objFields.length {
-      const fnode = P.nodes[n.objFields[fi]]
-      let outF = n.objFields[fi]
-      if fnode is FieldInit {
-        const fv = P.nodes[fnode.fiValue]
-        let nv = fnode.fiValue
-        if fv is FuncDecl {
-          const fcl = monoCloneLambdaSubst(
-            fnode.fiValue,
-            typarams,
-            tvN,
-            tvV,
-            bN,
-            bT,
-          )
-          if fcl >= 0 { nv = fcl }
-        } else {
-          nv = monoPinBodyLambdas(fnode.fiValue, typarams, tvN, tvV, bN, bT)
-        }
-        if nv != fnode.fiValue {
-          outF = mkFieldInit(fnode.fiName, nv, fnode.pos)
-          fchanged = true
-        }
-      }
-      fs.push(outF)
-      fi = fi + 1
-    }
-    if !fchanged { return ix }
-    return mkObjLit(fs, n.pos)
-  }
   if n is WhileStmt {
+    const cc = monoPinValueLambda(n.whileCond, typarams, tvN, tvV, bN, bT)
     const cb = monoPinBodyLambdas(n.whileBody, typarams, tvN, tvV, bN, bT)
-    if cb == n.whileBody { return ix }
-    return mkWhile(n.whileCond, cb, n.whileLabel, n.pos)
+    if cc == n.whileCond && cb == n.whileBody { return ix }
+    return mkWhile(cc, cb, n.whileLabel, n.pos)
   }
   if n is IfStmt {
     // An `else if` chain is rewritten along its spine, so its depth costs no stack (D1990).
@@ -2246,7 +2399,7 @@ function monoPinBodyLambdas(
     while k < links.length {
       const c = P.nodes[links[k]]
       if c is IfStmt {
-        ccs.push(c.ifCond)
+        ccs.push(monoPinValueLambda(c.ifCond, typarams, tvN, tvV, bN, bT))
         cts.push(monoPinBodyLambdas(c.ifThen, typarams, tvN, tvV, bN, bT))
       }
       k = k + 1
@@ -2266,30 +2419,70 @@ function monoPinBodyLambdas(
     )
   }
   if n is ForRange {
+    const ff = monoPinValueLambda(n.frFrom, typarams, tvN, tvV, bN, bT)
+    const ft = monoPinValueLambda(n.frTo, typarams, tvN, tvV, bN, bT)
+    const fs = monoPinValueLambda(n.frStep, typarams, tvN, tvV, bN, bT)
     const cb = monoPinBodyLambdas(n.frBody, typarams, tvN, tvV, bN, bT)
-    if cb == n.frBody { return ix }
-    return mkForRange(
-      n.frVar,
-      n.frFrom,
-      n.frTo,
-      n.frStep,
-      n.frExcl,
-      cb,
-      n.frLabel,
-      n.pos,
-    )
+    if ff == n.frFrom && ft == n.frTo && fs == n.frStep && cb == n.frBody {
+      return ix
+    }
+    return mkForRange(n.frVar, ff, ft, fs, n.frExcl, cb, n.frLabel, n.pos)
   }
   if n is ForIn {
+    const fi = monoPinValueLambda(n.fiIter, typarams, tvN, tvV, bN, bT)
     const cb = monoPinBodyLambdas(n.fiBody, typarams, tvN, tvV, bN, bT)
-    if cb == n.fiBody { return ix }
-    return mkForIn(n.fiVar, n.fiVar2, n.fiIter, cb, n.fiLabel, n.pos)
+    if fi == n.fiIter && cb == n.fiBody { return ix }
+    return mkForIn(n.fiVar, n.fiVar2, fi, cb, n.fiLabel, n.pos)
   }
-  if n is Paren {
-    const ci = monoPinBodyLambdas(n.parInner, typarams, tvN, tvV, bN, bT)
-    if ci == n.parInner { return ix }
-    return mkParen(ci, n.pos)
+  const ks = monoExprKids(ix)
+  if ks.length == 0 { return ix }
+  const nks: i32[] = []
+  let ki = 0
+  while ki < ks.length {
+    const kv = monoPinValueLambda(ks[ki], typarams, tvN, tvV, bN, bT)
+    if n is Call {
+      nks.push(monoPinFnValueTy(kv, ks[ki], bN, bT))
+    } else {
+      nks.push(kv)
+    }
+    ki = ki + 1
   }
-  ix
+  monoExprRebuild(ix, nks, bN, bT)
+}
+
+// A call's callee or argument `cur` (the walk's rewrite of `orig`) answering its function type
+// at this pin. A value call's `$fnsig`, and a function argument's pin, are keyed off the
+// recorded type, and a template's names the type parameter, which keys no signature (D2552).
+function monoPinFnValueTy(cur: i32, orig: i32, bN: string[], bT: i32[]): i32 {
+  const ty = nodeTyIxOf(orig)
+  if ty < 0 || ty >= T.tys.length { return cur }
+  if !(T.tys[ty] is TyFunc) { return cur }
+  const st = monoPinnedTyOf(orig, bN, bT)
+  if st == ty { return cur }
+  let nx = cur
+  if nx == orig { nx = monoExprRemake(orig, monoExprKids(orig)) }
+  if nx == orig { return cur }
+  nodeTyRecord(nx, st)
+  nx
+}
+
+// `monoPinBodyLambdas` over a value position, where a lambda literal of either kind is the
+// value itself: its per-instance clone when it is a template, else the walk below it.
+function monoPinValueLambda(
+  ix: i32,
+  typarams: string[],
+  tvN: string[],
+  tvV: string[],
+  bN: string[],
+  bT: i32[],
+) {
+  if ix < 0 { return ix }
+  if P.nodes[ix] is FuncDecl {
+    const cl = monoCloneLambdaSubst(ix, typarams, tvN, tvV, bN, bT)
+    if cl >= 0 { return cl }
+    return ix
+  }
+  monoPinBodyLambdas(ix, typarams, tvN, tvV, bN, bT)
 }
 
 // The type parameters of every enclosing lifted frame of `fe`, appended to `out`. The
@@ -2397,6 +2590,22 @@ function monoLamNodeIsTemplateCore(fnIx: i32, typarams: string[]) {
     // them — only in the `is` spelling, which `monoFoldTyParamLayout` substitutes per pin.
     // Broad on purpose: an extra clone is a correct clone, only larger.
     if monoNodeNamesTyParam(fn.fnBody, typarams) { return true }
+    // The fifth: an un-annotated parameter the checker inferred at a type variable, such as
+    // `(x) => x` over a `T[]` — its type is the instance's, as a written `x: T` would be.
+    const lty = nodeTyIxOf(fnIx)
+    if lty >= 0 && lty < T.tys.length {
+      const lt = T.tys[lty]
+      if lt is TyFunc {
+        let pi = 0
+        while pi < ps.length && pi < lt.fnParamTypes.length {
+          const pp = P.nodes[ps[pi]]
+          if pp is Param {
+            if pp.parType < 0 && tyHasTyVar(lt.fnParamTypes[pi]) { return true }
+          }
+          pi = pi + 1
+        }
+      }
+    }
   }
   false
 }
@@ -3876,7 +4085,6 @@ function monoMakeInstance(
             nt = p3.parType
           } else {
             monoNicheNulListCheck(tyNameOf(p3.parType), fn.fnTyParams, tvN, tvV)
-            monoLamNulUnionListCheck(pinTys[pj])
             nt = synthTypeRefFb(pinned[pj], -1, pinTys[pj])
             synthed = true
           }
@@ -4320,6 +4528,7 @@ function monoMakeInstance(
     // lambda, which is right for a concrete lambda and wrong for one written at `T`.
     // Copy-on-write: a body with no such lambda is the same node index.
     monoLamMintedSlots = []
+    monoLamCloneSlots = []
     monoInstIsFirst = count == 0
     const instBody0L = monoPinBodyLambdas(
       instBody0,
@@ -4329,6 +4538,8 @@ function monoMakeInstance(
       letBN,
       letBT,
     )
+    const lamClones = monoLamCloneSlots
+    monoLamCloneSlots = []
     // Pin any `.map`/`.filter` callback lambda whose receiver param this instance bound to
     // a non-i32 element: the shared body's un-annotated lambda would otherwise emit as i32.
     // Build the param→element map from the pinned param names, then clone and pin per
@@ -4468,6 +4679,16 @@ function monoMakeInstance(
     // against this instance's concrete annotations, and the callee rename lands on the
     // instance's own `Call` spine rather than on nodes its siblings share.
     if monoWalkFnBody(nfn) < 0 { return -1 }
+    // A clone's body is walked beside its instance's: its generic calls are its own copies,
+    // and the template's walk pinned the template's (D2553).
+    let lci = 0
+    while lci < lamClones.length {
+      const ls = lamClones[lci]
+      if ls >= 0 && ls < fnStmts.length {
+        if monoWalkFnBody(fnStmts[ls]) < 0 { return -1 }
+      }
+      lci = lci + 1
+    }
     if monoRebuild() < 0 { return -1 }
     return 0
   }

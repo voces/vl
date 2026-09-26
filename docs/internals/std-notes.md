@@ -99,7 +99,8 @@ Each now says so, in the shape the `concat`-vs-`+` bullet uses.
   refused. `tests/cases/std/array-sort-agrees.vl` is the differential fixture that keeps
   the two copies honest; the only intended differences are the leading copy and the
   tail, where `sorted` returns whichever buffer holds the answer.
-  `tests/cases/std/error-generic-closure-forward.vl` pins the refusal itself.
+  The refusal is lifted (D2552, `tests/cases/std/generic-closure-forward.vl`); collapsing
+  `sorted` onto `sort` is the pending follow-up.
 - **`SORT_RUN` lives inside the function** rather than beside the module header: a
   module-level `const` is emitted as a wasm global whether or not anything imports the
   export that reads it, so it would be charged to callers who never sort.

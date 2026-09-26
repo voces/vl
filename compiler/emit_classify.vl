@@ -1291,7 +1291,9 @@ export function fieldClosureFeOfRecv(recvIx: i32, prop: string, fnIx: i32) {
       }
     }
   }
-  if e is Call {
+  // A literal receiver reads its own field: a per-instance clone of it shares its shape with
+  // the template's, so the shape scan below would answer the template's closure (D2551).
+  if e is Call || e is ObjLit {
     const ffe2 = fieldClosureFeOfInit(unwrapParen(recvIx), prop, fnIx)
     if ffe2 >= 0 { return ffe2 }
   }
@@ -18188,7 +18190,11 @@ export function exprNulLitUnion(exprIx: i32, fnIx: i32) {
     // cases above miss — a chained closure call (`v(1)()` where `v: (i32) => (() => K | null)`).
     // The cheap no-render `nodeTyIsNulLitUnion` reads the checker's per-node type, mirroring
     // `exprNullableString`'s fallback, which structurally excludes the litunion niche.
-    return nodeTyIsNulLitUnion(exprIx)
+    if !nodeTyIsNulLitUnion(exprIx) { return false }
+    // The callee's `$fnsig` decides the rep: a closure keyed with a boxed result hands back the
+    // box whatever the checker's type says (D2535).
+    const nlk = cloCallSigKey(unwrapParen(exprIx), fnIx)
+    return nlk == "" || sigKeyRetKind(nlk) != "union"
   }
   if e is Ident {
     // A CAPTURED variable, resolved against the enclosing frame's binding — the niche twin of
@@ -29560,13 +29566,29 @@ function unionRetOfFnType(fnTyName: string) {
   if nameIsParenOpen(fnTyName) {
     const ret0 = annRetNameOf(fnTyName)
     if ret0 == "" { return "" }
-    const ret = normTypeAtom(ret0)
-    if isUName(ret) { return ret }
-    if isValueUnionName(ret) { return ret }
-    // A value union with a litunion-alias arm (`K0 | i64`) is neither a registered union alias
-    // nor `isValueUnionName`, yet still boxes as a value union via the alias arm's atom.
-    if nameIsLitUnionArmValueUnion(ret) { return ret }
+    return unionRetName(normTypeAtom(ret0))
   }
+  ""
+}
+
+// Whether call `callIx` goes through a function value: its callee names no lifted function.
+function callIsValueCall(callIx: i32): boolean {
+  const c = P.nodes[callIx]
+  if c is Call {
+    const callee = P.nodes[c.callFn]
+    if callee is Ident { return fnIndexOfSid(sidOfNode(c.callFn)) < 0 }
+    return true
+  }
+  false
+}
+
+// `ret` when a function result of that name boxes as a union, else "".
+function unionRetName(ret: string) {
+  if isUName(ret) { return ret }
+  if isValueUnionName(ret) { return ret }
+  // A value union with a litunion-alias arm (`K0 | i64`) is neither a registered union alias
+  // nor `isValueUnionName`, yet still boxes as a value union via the alias arm's atom.
+  if nameIsLitUnionArmValueUnion(ret) { return ret }
   ""
 }
 
@@ -29848,6 +29870,18 @@ export function unionNameOfExpr(exprIx: i32, fnIx: i32) {
             }
           }
         }
+      }
+    }
+    // A value call the callee's `$fnsig` keys with a boxed result is that union, named as the
+    // key names it, whatever the call's type renders as on its own (D2535).
+    if (
+      callIsValueCall(unwrapParen(exprIx))
+      && tyBearsNull(nodeTyIxOf(unwrapParen(exprIx)))
+    ) {
+      const cuk = cloCallSigKey(unwrapParen(exprIx), fnIx)
+      if cuk != "" && sigKeyRetKind(cuk) == "union" {
+        const kun = unionRetName(fnRetEmitName(nodeTyIxOf(unwrapParen(exprIx))))
+        if kun != "" { return kun }
       }
     }
     // Fallback scoped to a call (an if-expr has its own union path): renders from the checker's
@@ -36855,6 +36889,20 @@ function retTokOfTy(ty: i32) {
   ""
 }
 
+// A function type's result `ty` rendered as `sigKeyOfTy` keys it: a litunion alias, bare or
+// nullable, keeps its alias name, since a raw render softens it to `string`. "" when unrendered.
+function fnRetEmitName(ty: i32): string {
+  if ty < 0 { return "" }
+  const rtn = T.tys[ty]
+  if rtn is TyNullable {
+    const nal = litUnionAliasNameOfTy(rtn.nInner)
+    if nal != "" { return nal + "|null" }
+  }
+  const bal = litUnionAliasNameOfTy(ty)
+  if bal != "" { return bal }
+  tyToEmitName(ty)
+}
+
 export function sigKeyOfTy(funcTyIx: i32): string {
   if funcTyIx < 0 { return "" }
   const t = T.tys[funcTyIx]
@@ -36884,17 +36932,7 @@ export function sigKeyOfTy(funcTyIx: i32): string {
   // `>i` (not `>S`) and the arena is tried first, so a scalar/scalar-list result is never rendered.
   const raTok = retTokOfTy(t.fnRet)
   if raTok != "" { return key + raTok }
-  let rs = ""
-  const rtn = T.tys[t.fnRet]
-  if rtn is TyNullable {
-    const nal = litUnionAliasNameOfTy(rtn.nInner)
-    if nal != "" { rs = nal + "|null" }
-  }
-  if rs == "" {
-    const bal = litUnionAliasNameOfTy(t.fnRet)
-    if bal != "" { rs = bal }
-  }
-  if rs == "" { rs = tyToEmitName(t.fnRet) }
+  let rs = fnRetEmitName(t.fnRet)
   if rs == "" { return "" }
   const rt = T.tys[t.fnRet]
   if rt is TyFunc { rs = "(" + rs + ")" }

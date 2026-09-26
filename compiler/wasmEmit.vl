@@ -16477,6 +16477,38 @@ function callRefStashSlot() {
   callRefNestSlot(callRefDepth)
 }
 
+// A narrowed `X | null` argument keeps its nullable rep, so a parameter of non-null kind `pk`
+// whose slot is a bare `(ref $heap)` takes it through `ref.as_non_null`. The checker proved
+// the call guarded, so the recover cannot trap. `null` or any other kind is a no-op.
+function emitNonNullParamRecover(pk: VKind | null, argIx: i32, fnIx: i32) {
+  match pk {
+    "struct" => {
+      if exprNullableStruct(argIx, fnIx) { fbRefAsNonNull() }
+    }
+    "list" | "strlist" | "f64list" | "i64list" | "f32list" | "reflist" | "map" => {
+      if (
+        exprNullableList(argIx, fnIx)
+        || exprNulScalarListKind(argIx, fnIx) != null
+        || exprNullableRefArray(argIx, fnIx)
+        || exprNullableMap(argIx, fnIx)
+      ) {
+        fbRefAsNonNull()
+      }
+    }
+    "closure" => {
+      if exprNulClosure(argIx, fnIx) { fbRefAsNonNull() }
+    }
+    "variant" => {
+      if exprNullableVariant(argIx, fnIx) { fbRefAsNonNull() }
+    }
+    "i32" | "str" | "union" | "nulvariant" | "nulstruct" | "i64" | "f64" | "f32" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" | "nulnone" | "u8list" | "v128" | null => {
+      // Scalars and atoms have no reference to recover, a nullable slot takes the value as
+      // it is, and a union box or a `u8[]` is never narrowed into a bare heap slot.
+    }
+  }
+  0
+}
+
 function emitCallRef(body: u8[], callIx: i32, fnIx: i32) {
   const c = P.nodes[callIx]
   if c is Call {
@@ -16645,6 +16677,8 @@ function emitCallRef(body: u8[], callIx: i32, fnIx: i32) {
           if clu == 2 { cluCtx.nulLitUnion = true }
           if emitExprExpect(body, args[i], fnIx, cluCtx) < 0 { return -1 }
         }
+        // The same boundary as a direct call's, keyed off the `$fnsig` param (D2537).
+        emitNonNullParamRecover(pkk, args[i], fnIx)
       }
       i = i + 1
     }
@@ -25029,19 +25063,8 @@ function emitDirectCall(body: u8[], callIx: i32, fnIx: i32, target: i32) {
     // inner block that reads `cParams` closes before it.
     let cArgParamKind: VKind = "i32"
     let cArgParamRow = -1
-    // A non-null struct param position (kind 1, `(ref $S)`): a nullable-REP
-    // argument needs `ref.as_non_null` at the boundary (see below).
-    let cParamStruct = false
-    // The non-null list / map param positions — every kind whose slot is a
-    // `(ref $wrapper)` that a `(ref null $wrapper)` argument does not satisfy.
-    // Same boundary recover as `cParamStruct`, over the reps owning a wrapper.
-    let cParamNonNullList = false
-    // The non-null closure param position (kind 14, `(ref $cloStruct)`) and the
-    // non-null variant param position (kind 8, `(ref $uVarHeap[vi])`) — the two
-    // remaining reps whose slot is a bare `(ref $heap)` a `(ref null $heap)`
-    // argument does not satisfy. Same boundary recover as `cParamStruct`.
-    let cParamClosure = false
-    let cParamVariant = false
+    // The parameter's rep, for the narrowed-argument recover `emitNonNullParamRecover` makes.
+    let cRecoverKind: VKind | null = null
     // A UNION-typed param position (kind 4): the callee wants the box, so a raw
     // scalar/string/null argument is COERCED into the union representation
     // (`emitUnionCoerce` — the host's call-boundary `coerceUnion`). The param's
@@ -25140,24 +25163,9 @@ function emitDirectCall(body: u8[], callIx: i32, fnIx: i32, target: i32) {
         if cpMapK == "map" || cpMapK == "nulmap" {
           pendingMapSlot = paramStructIdxOf(cParams[i])
         }
-        if vtKindOfParam(cParams[i]) == "struct" { cParamStruct = true }
         const cpvk = vtKindOfParam(cParams[i])
-        if (
-          cpvk == "list"
-          || cpvk == "strlist"
-          || cpvk == "f64list"
-          || cpvk == "i64list"
-          || cpvk == "f32list"
-          || cpvk == "reflist"
-          || cpvk == "map"
-        ) {
-          cParamNonNullList = true
-        }
-        if cpvk == "closure" { cParamClosure = true }
-        if vtKindOfParam(cParams[i]) == "variant" {
-          cVi = paramStructIdxOf(cParams[i])
-          cParamVariant = true
-        }
+        cRecoverKind = cpvk
+        if cpvk == "variant" { cVi = paramStructIdxOf(cParams[i]) }
         if vtKindOfParam(cParams[i]) == "union" {
           const cp4 = P.nodes[cParams[i]]
           if cp4 is Param { cUNm = tyNameOf(cp4.parType) }
@@ -25291,43 +25299,7 @@ function emitDirectCall(body: u8[], callIx: i32, fnIx: i32, target: i32) {
           emitScalarListWidenSite(body, args[i], fnIx, cParamSLKind)
         }
         pendingVariantIdx = -1
-        // A nullable-rep value (a null-narrowed `S | null` param/local, or a recursive `S |
-        // null` field read whose wasm slot stays `(ref null $S)`) flowing into a non-null
-        // `(ref $S)` param: recover the non-null ref at the call boundary. Narrowing is
-        // type-level only, so the checker proves the value non-null but the stack value keeps its nullable rep — the cast never traps.
-        if cParamStruct {
-          if exprNullableStruct(args[i], fnIx) {
-            fbRefAsNonNull() // 0xd4
-          }
-        }
-        // The list/map dual of the recover above, over every nullable wrapper rep: `nullist`,
-        // the four distinct-backing scalar lists, `nulreflist` and `nulmap`. A `!= null`-narrowed
-        // value keeps its `(ref null $wrapper)` slot, so a call under the guard pushed it under
-        // a `(ref $type)` param: check-clean invalid wasm. The recover cannot trap — the checker proved the call guarded.
-        if cParamNonNullList {
-          if (
-            exprNullableList(args[i], fnIx)
-            || exprNulScalarListKind(args[i], fnIx) != null
-            || exprNullableRefArray(args[i], fnIx)
-            || exprNullableMap(args[i], fnIx)
-          ) {
-            fbRefAsNonNull() // 0xd4
-          }
-        }
-        // The closure and variant duals of the two recovers above, the last two reps whose
-        // param slot is a bare `(ref $heap)`. A narrowed callback forwarded in place needs no
-        // coercion (`emitCallRef` recovers on its own); only the pass-through spelling is
-        // invalid. The variant twin (`Circle | null` into `Circle`) is the same recover; both sit under the guard the checker proved, so neither traps.
-        if cParamClosure {
-          if exprNulClosure(args[i], fnIx) {
-            fbRefAsNonNull() // 0xd4
-          }
-        }
-        if cParamVariant {
-          if exprNullableVariant(args[i], fnIx) {
-            fbRefAsNonNull() // 0xd4
-          }
-        }
+        emitNonNullParamRecover(cRecoverKind, args[i], fnIx)
       }
       // The niche parameter's unbox (D1031) — `g(r)` into `g(x: Circle | null)` under `if r
       // is Circle`. The bare variant parameter's unbox is the arm below; its `| null` twin
