@@ -19695,6 +19695,14 @@ function emitReturnValue(body: u8[], retArg: i32, fnIx: i32) {
             }
           }
         }
+        // Its variant twin, the inferred half of the annotated `nulvariant` seed above: the
+        // same column the functype's result heap is read from, so a bare `return null` agrees.
+        if fRetKind[fnPos] == "nulvariant" && fnPos < fRetStructIdx.length {
+          const nvr = fRetStructIdx[fnPos]
+          if nvr >= 0 && nvr < uVarHeap.length {
+            pendingNulRefHeap = uVarHeap[nvr]
+          }
+        }
         // D937 — the nullable-map twin of the arm above: a map's null is not a struct
         // null, so the seed is `pendingNulRefHeap` rather than `pendingStructIdx`, with
         // `pendingMapSlot` seeded beside it so a returned `Map()` builds the same struct
@@ -20010,10 +20018,13 @@ function emitReturnValue(body: u8[], retArg: i32, fnIx: i32) {
       emitNarrowedArmUnboxTo(retArmHeap)
     }
   }
+  // The null heap is one-shot, and only a bare `null` consumes it: a `return { … }` or
+  // `return Map()` leaves the seed set, and it would type the next function's `null` (D2564).
   pendingStructIdx = -1
   pendingVariantIdx = -1
   pendingListKind = 0
   pendingListSlot = 0
+  pendingNulRefHeap = -1
   0
 }
 
@@ -24205,6 +24216,16 @@ function emitNullBySeed(fnIx: i32, nulNoneOk: boolean) {
       return 0
     }
   }
+  // A bare `null` VALUE: its target struct comes from the binding/argument/
+  // return seed (`pendingStructIdx`) — `ref.null $S`. Ahead of the enclosing function's
+  // own return below, which a `const c: C | null = null` inside it does not name (D2564).
+  if pendingStructIdx >= 0 {
+    if pendingStructIdx < sHeapIdx.length {
+      wU8(208) // 0xd0 ref.null
+      wSLEB(sHeapIdx[pendingStructIdx])
+      return 0
+    }
+  }
   // last resort: the enclosing function's own return annotation. Every seed above is set
   // at a boundary and cleared after it, leaving tail position unserved — an implicit
   // tail `null` reaches this node with the statement seeds reset, while `return null` is
@@ -24220,16 +24241,6 @@ function emitNullBySeed(fnIx: i32, nulNoneOk: boolean) {
           return 0
         }
       }
-    }
-  }
-  // A bare `null` VALUE: its target struct comes from the binding/argument/
-  // return seed (`pendingStructIdx`) — `ref.null $S`. With no seed it cannot
-  // be typed here; fail loudly.
-  if pendingStructIdx >= 0 {
-    if pendingStructIdx < sHeapIdx.length {
-      wU8(208) // 0xd0 ref.null
-      wSLEB(sHeapIdx[pendingStructIdx])
-      return 0
     }
   }
   // D1567 — the `null` type's own rep, and the table's true last resort: a function whose
