@@ -7989,6 +7989,10 @@ narrowing form (`is`, `!= null`, `== null` with an early return, an `||` guard, 
   lands on one member only when each of its members does; otherwise the place reads its
   declaration, unless the narrowing it had already admits every member, which it then keeps.
   A `null` write reads the declaration after it.
+* *After an `if`.* The place holds what either path left, and a numeric member is never absorbed
+  by one it widens to: a one-branch `x = 1.5` under `x is i32` leaves `i32 | f64`, not `f64`
+  (D2627). A value of such a union is refused where only its widest member is expected (`f64`),
+  because no delivery converts the box yet (D2611, open); `is` re-tests it.
 * *A null test after a write.* A guard's narrowing makes `x == null` an impossible comparison,
   and it stays refused with no write. After a write under the guard the storage may hold `null`
   again, so the test is a real question for the rest of that scope, as after an assignment's
@@ -8010,7 +8014,11 @@ narrowing form (`is`, `!= null`, `== null` with an early return, an `||` guard, 
 match: `if x is i32 { x = "s"; print(x is i32) }` over `i32 | string | null` printed `false` on
 master and is refused now, since `x` is a `string` there. 58 of the 4,600 cells of the
 narrowed-write grid (`scripts/capability-probes/narrowed-write-grid.py`) are that shape, all at
-the test of the member the write left. No other cell that ran on master changed.
+the test of the member the write left. #3184's review grid (2,373 cells) moves 22 cells from
+running to refused, all one shape: a one-branch write of a widening member whose condition was
+false on the run, read where the other member is expected, e.g. `if x is f64 { if c0() { x = 5 };
+useF64(x) }`. The same program with the condition true trapped on master; it is refused now as
+D2611's union-to-`f64` delivery. No other cell that ran on master changed.
 
 **AN ASSIGNMENT'S NARROWING REACHES A BODY ONLY WHERE NO `null` CAN FOLLOW (D2529).** A guard's
 narrowing reaches a closure called by its handle through D2402's per-call check. An assignment's

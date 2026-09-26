@@ -1200,12 +1200,58 @@ function narArmEndTy(
       if narClobDepths[i] == ownDepth {
         cur = narClobTys[i]
       } else {
-        cur = joinTys(cur, narClobTys[i])
+        cur = narJoinTys(cur, narClobTys[i])
       }
     }
     i = i + 1
   }
   cur
+}
+
+// The join of two types a place may hold after an `if`. A place holds a member of its declared
+// type, so a numeric member is never absorbed by one it widens to: `i32` and `f64` join to
+// `i32 | f64`, not `f64`, which is how the value is stored (D2627). Otherwise `joinTys`.
+function narJoinTys(a: i32, b: i32): i32 {
+  if a < 0 || b < 0 { return joinTys(a, b) }
+  if numericVariantUncovered(a, b) || numericVariantUncovered(b, a) {
+    return joinVariantTys(a, b)
+  }
+  joinTys(a, b)
+}
+
+// Whether `ix` is the `i32`, `i64`, `f32` or `f64` primitive itself.
+function isNumericPrimTy(ix: i32): boolean {
+  if ix < 0 { return false }
+  const t = T.tys[ix]
+  if t is TyPrim {
+    return t.primName == "i32"
+      || t.primName == "i64"
+      || t.primName == "f64"
+      || t.primName == "f32"
+  }
+  false
+}
+
+// Whether `a` has a numeric primitive variant that no variant of `b` is.
+function numericVariantUncovered(a: i32, b: i32): boolean {
+  const av: i32[] = []
+  flattenVariantsInto(a, av)
+  const bv: i32[] = []
+  flattenVariantsInto(b, bv)
+  let i = 0
+  while i < av.length {
+    if isNumericPrimTy(av[i]) {
+      let hit = false
+      let j = 0
+      while j < bv.length {
+        if tySame(av[i], bv[j]) { hit = true }
+        j = j + 1
+      }
+      if !hit { return true }
+    }
+    i = i + 1
+  }
+  false
 }
 
 // Is `name` already joined by a row in [lo, hi)? The join walks the ledger, which holds one row
@@ -1277,7 +1323,7 @@ function applyArmJoins(
             }
             // The ELSE side first, so a one-armed join renders in the declaration's own order
             // (`i64 | boolean`, not `boolean | i64`) — the diagnostic below reads it.
-            jt = joinTys(ee, te)
+            jt = narJoinTys(ee, te)
           }
           if path {
             // A path installs into the OVERLAY: it has no shadowing `declare` to write through,
@@ -7294,9 +7340,32 @@ function retireAliasedNarrowings(
         narClobPrev.push(-1)
         narClobDepths.push(T.scopes.length)
         narClobRetired.push(2)
+        mapCellStaysPresent(k)
       }
     }
     i = i + 1
+  }
+  0
+}
+
+// A narrowed map cell a store through an alias may have written is present either way, so it
+// reads the map's value type after, not the map read's `T | null`.
+function mapCellStaysPresent(key: string) {
+  const steps = keySteps(key)
+  if steps.length == 0 || steps[steps.length - 1][0] != '[' { return 0 }
+  const pres = keyStepPrefixTys(key, steps)
+  const ct = pres[pres.length - 1]
+  if ct < 0 { return 0 }
+  const nt = nonNullTy(ct)
+  if nt < 0 { return 0 }
+  const m = T.tys[nt]
+  if m is TyMap {
+    npKeys.push(key)
+    npTys.push(m.mVal)
+    npInvBy.push(-1)
+    npEpochs.push(narFnEpoch)
+    npSettle.push(-2)
+    npCapBy.push(-1)
   }
   0
 }
@@ -7338,6 +7407,8 @@ function aliasWriteHitsKey(
     ) {
       if s < steps.length - 1 { return true }
       if rt < 0 || npTy < 0 || !assignable(rt, npTy) { return true }
+      // A numeric value the narrowing only widens to is stored as its own member (D2609).
+      if numericVariantUncovered(rt, npTy) { return true }
     }
     s = s + 1
   }
@@ -7588,7 +7659,11 @@ function retireNarrowingsForWrite(tgtIx: i32, rt0: i32, atIx: i32) {
         endTy = writeStorageTy(tgtIx)
         if endTy < 0 { endTy = placeStoreTy(tgtIx) }
       } else {
+        // The member the write lands on, which a narrowing that only widens to it does not
+        // name (`5` under a second arm's `f64`, D2629).
+        const pst = placeStoreTy(tgtIx)
         endTy = writeReNarrowTy(prePathTy, rt)
+        if pst >= 0 { endTy = writeNarrowAfter(pst, prePathTy, rt) }
       }
     }
     if endTy < 0 { endTy = prePathTy }
@@ -9998,7 +10073,9 @@ function crLoopPreRetire(loopIx: i32) {
 function crLoopPathPreRetire(loopIx: i32) {
   let s = crFnNpBase()
   if s < 0 { s = 0 }
-  while s < npKeys.length {
+  // The entries a map cell's presence pushes below are not walked again.
+  const n0 = npKeys.length
+  while s < n0 && s < npKeys.length {
     if (
       npInvBy[s] < 0
       && npEpochs[s] == narFnEpoch
@@ -10009,6 +10086,7 @@ function crLoopPathPreRetire(loopIx: i32) {
         npInvBy[s] = a
         npSettle[s] = -1
         crAliasWr[a] = true
+        crLoopMapCellPresent(npKeys[s], a)
         crRetNames.push(npKeys[s])
         crRetCalls.push(a)
         crRetNarTys.push(npTys[s])
@@ -10031,6 +10109,26 @@ function crLoopPathPreRetire(loopIx: i32) {
   0
 }
 
+// A map cell narrowed before the loop is present, and the loop's writes keep it so: after its
+// narrowing ends it reads the stored type, not the map read's `T | null`.
+function crLoopMapCellPresent(key: string, asgIx: i32) {
+  const an = P.nodes[asgIx]
+  if an is BinExpr {
+    if placeIsMapCell(an.binLeft) {
+      const st = placeStoreTy(an.binLeft)
+      if st >= 0 {
+        npKeys.push(key)
+        npTys.push(st)
+        npInvBy.push(-1)
+        npEpochs.push(narFnEpoch)
+        npSettle.push(-2)
+        npCapBy.push(-1)
+      }
+    }
+  }
+  0
+}
+
 // The first assignment to the place keyed `key`, narrowed to `pre`, in the loop subtree at `ix`
 // whose value, typed before the loop runs, leaves that narrowing; -1 otherwise.
 function crLoopLeavingPathWrite(ix: i32, key: string, pre: i32): i32 {
@@ -10042,8 +10140,8 @@ function crLoopLeavingPathWrite(ix: i32, key: string, pre: i32): i32 {
       const store = writeStorageTy(n.binLeft)
       let vt = loopWritePeekTy(n.binRight, store)
       if vt >= 0 && store >= 0 {
-        if !isLitBearing(store) { vt = widenLitTy(vt) }
-        if !tySame(writeNarrowAfter(store, pre, vt), pre) { return ix }
+        if !isLitBearing(store) { vt = litPeekBaseTy(vt) }
+        if !writeLandsWithin(store, vt, pre) { return ix }
       }
     }
   }
@@ -10059,6 +10157,14 @@ function crLoopLeavingPathWrite(ix: i32, key: string, pre: i32): i32 {
     cur = elseIfLink(cur)
   }
   -1
+}
+
+// A literal's base type (`5` is an `i32`), for a store that is no literal union; `ty` otherwise.
+function litPeekBaseTy(ty: i32): i32 {
+  if ty < 0 { return ty }
+  const t = T.tys[ty]
+  if t is TyLit { return litBaseTy(t) }
+  ty
 }
 
 // The struct member of `store` whose field names are exactly the object literal's, or -1 when
@@ -10118,8 +10224,8 @@ function crLoopLeavingWrite(ix: i32, name: string): i32 {
       const pre = lookup(name)
       let vt = loopWritePeekTy(n.binRight, store)
       if vt >= 0 && store >= 0 && pre >= 0 {
-        if !isLitBearing(store) { vt = widenLitTy(vt) }
-        if !tySame(writeNarrowAfter(store, pre, vt), pre) { return ix }
+        if !isLitBearing(store) { vt = litPeekBaseTy(vt) }
+        if !writeLandsWithin(store, vt, pre) { return ix }
       }
     }
   }
@@ -10153,8 +10259,21 @@ function loopWritePeekTy(ix: i32, store: i32): i32 {
     return litTyOfExpr(ix)
   }
   if e is Ident { return lookup(e.identName) }
+  if e is AsExpr { return asNumericPeekTy(e) }
   // Anything else needs checking, but a call of a declared function has its return type.
   loopWriteCallTy(ix)
+}
+
+// The numeric primitive a plain `as` casts to (`0.5 as f32`), or -1.
+function asNumericPeekTy(e: AsExpr): i32 {
+  if e.asMode != "prop" { return -1 }
+  const nums = [TY_I32, TY_I64, TY_F32, TY_F64]
+  let i = 0
+  while i < nums.length {
+    if tyToStr(nums[i]) == e.asTy { return nums[i] }
+    i = i + 1
+  }
+  -1
 }
 
 // The settled declared return type of the function a call at `ix` names, or -1.
@@ -13253,8 +13372,12 @@ function joinTys(a: i32, b: i32) {
   if tpn >= 0 { return tpn }
   if assignable(b, a) { return a }
   if assignable(a, b) { return b }
-  // Distinct variants: a flattened, deduped union, with nullability folding back into a `?`
-  // wrapper.
+  joinVariantTys(a, b)
+}
+
+// The join of `a` and `b` as distinct variants: a flattened, deduped union, with nullability
+// folding back into a `?` wrapper.
+function joinVariantTys(a: i32, b: i32) {
   const vars: i32[] = []
   flattenVariantsInto(a, vars)
   flattenVariantsInto(b, vars)
@@ -27492,13 +27615,18 @@ function assignableGo(src: i32, dst: i32) {
     if assignable(TY_NULL, dst) { return assignable(s.nInner, dst) }
     return false
   }
-  // Union source: every member must be assignable to the target.
+  // Union source: every member must be assignable to the target. A value box holding a
+  // numeric member that only widens to a numeric target has no conversion yet (D2611).
   if s is TyUnion {
     const members = s.uMembers
+    const numDst = isNumericPrimTy(dst)
     let i = 0
     let ok = true
     while i < members.length {
       if !assignable(members[i], dst) { ok = false }
+      if numDst && isNumericPrimTy(members[i]) && !tySame(members[i], dst) {
+        ok = false
+      }
       i = i + 1
     }
     return ok
