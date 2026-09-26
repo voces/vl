@@ -1592,6 +1592,53 @@ function flushContainerNullHoles() {
   0
 }
 
+// Whether `ty` holds an open null hole BELOW its top: a list element, a map value or a record
+// field no write has filled yet. A binding that is itself an open hole is not one.
+function tyHoldsOpenNullHole(ty: i32, depth: i32): boolean {
+  if ty < 0 || ty >= T.tys.length || depth <= 0 { return false }
+  const t = T.tys[ty]
+  match t {
+    TyArray => nhOpen(t.aElem) || tyHoldsOpenNullHole(t.aElem, depth - 1)
+    TyMap => nhOpen(t.mVal) || tyHoldsOpenNullHole(t.mVal, depth - 1)
+    TyNullable => tyHoldsOpenNullHole(t.nInner, depth - 1)
+    TyObj => {
+      let i = 0
+      let found = false
+      while i < t.objFieldTypes.length && !found {
+        const f = t.objFieldTypes[i]
+        found = nhOpen(f) || tyHoldsOpenNullHole(f, depth - 1)
+        i = i + 1
+      }
+      found
+    }
+    // A scalar, a function, a union arm set or a hole holds no container slot of its own.
+    TyPrim | TyErr | TyFunc | TyUnion | TyVar | TyLit | TyNeg => false
+  }
+}
+
+// Refuse a call to a generic or hole-parameter function that passes a container whose element
+// or value is still an open `_ | null`: the instance is chosen here, before `T` exists, and a
+// later fill cannot reach it (D2506).
+function refuseOpenNullHoleArg(argIx: i32, who: string) {
+  if argIx < 0 { return 0 }
+  if !tyHoldsOpenNullHole(nodeTyIxOf(argIx), 4) { return 0 }
+  let nm = placeKeyOf(argIx)
+  if nm == "" { nm = "this argument" } else { nm = "`" + nm + "`" }
+  let what = "the element type of "
+  const at = T.tys[nodeTyIxOf(argIx)]
+  if at is TyMap { what = "the value type of " }
+  let callee = "this call"
+  if who != "" { callee = "`" + who + "`" }
+  tErr(
+    what
+      + nm
+      + " is still open here — fill or annotate it before passing it to "
+      + callee,
+    argIx,
+  )
+  0
+}
+
 // Whether `ty` is a hole-parameter's demanded map, which the call sites fill.
 function isHoleMapDemandTy(ty: i32): boolean {
   let i = 0
@@ -29444,32 +29491,6 @@ function cnhPinBmElem(
   0
 }
 
-// A hole body's store of `val` into slot `slot`, re-asked at a call's argument types: two open
-// null holes link, and an open one takes the other side's `T`, as the direct spelling's store
-// does (`cnhFill`) — so the call sites' later writes see one type, not two (D2506).
-function nhUnifyAtPin(slot: i32, val: i32) {
-  if slot < 0 || val < 0 { return 0 }
-  const so = nhOpen(slot)
-  const vo = nhOpen(val)
-  if so && vo { return nhLink(slot, val) }
-  if so {
-    let inner = val
-    const v = T.tys[val]
-    if v is TyNullable { inner = v.nInner }
-    if inner < 0 || isNullTy(inner) || tyHasHole(inner) { return 0 }
-    return nhFillLinked(slot, widenLitTy(inner))
-  }
-  if vo {
-    const st = T.tys[slot]
-    if st is TyNullable {
-      if st.nInner >= 0 && !tyHasHole(st.nInner) {
-        return nhFillLinked(val, st.nInner)
-      }
-    }
-  }
-  0
-}
-
 // Whether the deferred builtin-method-argument constraints this binding resolves hold — the
 // twin of `validateLetCstrs` for a `.push`/`.set`/`.add` argument rather than an assignment
 // (D582 is why `argCstr*` cannot serve this position). Same re-deferral rule, gated on either
@@ -29490,9 +29511,6 @@ function validateBmCstrs(
         cnhPinBmElem(bmCstrWant[ci], bNames, bTys, ix, bg)
       }
       const bw = substTyDeep(bmCstrWant[ci], bNames, bTys)
-      if bmCstrForm[ci] == BM_PUSH || bmCstrForm[ci] == BM_SETVAL {
-        nhUnifyAtPin(bw, bg)
-      }
       let bc = bmCstrCtx[ci]
       if bc >= 0 { bc = substTyDeep(bc, bNames, bTys) }
       // Re-records only when the callee is named — an unnamed call cannot reassign
@@ -32908,6 +32926,14 @@ function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
           fnDeclIx[name] ?? CSTR_NODECL,
           plainName,
         )
+        // After the pins above, as the direct spelling does; the receiver is an argument too.
+        const rcvN = P.nodes[n.callFn]
+        if rcvN is Member { refuseOpenNullHoleArg(rcvN.memObj, plainName) }
+        let oua = 0
+        while oua < args.length {
+          refuseOpenNullHoleArg(args[oua], plainName)
+          oua = oua + 1
+        }
         // The receiver classification of a `.length` / `x[i]` inside the body, at the UFCS
         // half for the same symmetry (D651 / D691).
         validateMemCstrs(
@@ -34464,6 +34490,14 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
     // A builtin collection method's argument inside the body, for the same reason at a
     // callee kind the deferred-argument table cannot name: a builtin has no `FuncDecl`, so its own arm is the whole check and is vacuous under a hole (D582).
     validateBmCstrs(bNames, bTys, ix, cstrCallee, cstrWho)
+    // After the pins above, which can leave an argument's element open (`cnhPinBmElem`).
+    if !inferQuiet {
+      let oa = 0
+      while oa < args.length {
+        refuseOpenNullHoleArg(args[oa], cstrWho)
+        oa = oa + 1
+      }
+    }
     // The receiver classification of a `.length` / `x[i]` inside the body: both arms admit
     // the operation on a type variable correctly (a `T` pinned to a collection has it), and
     // this is the first position that knows which rep `T` became (D651 / D691).
