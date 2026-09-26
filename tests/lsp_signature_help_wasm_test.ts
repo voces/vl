@@ -233,6 +233,8 @@ const SRC = [
   "  h.cb(1)", // 14
   '  print("v=\\{greet("q", 3)}")', // 15
   "}", // 16
+  // Read, so neither result is dropped: a function whose every call is a statement is void (D2631).
+  "const _read = nil() + idfn(1, 2)", // 17
 ].join("\n");
 
 /** The rendered signature at a cursor, or "none" — the whole pipeline in one call. */
@@ -458,6 +460,7 @@ Deno.test({
     "  pad(1)",
     '  at("x")',
     "}",
+    'const _read = greet("b") + pad(2)',
   ].join("\n");
   const one = await helpAt(src, 5, 9);
   if (one !== 'greet(name: string, punct: string = "!") => string @name: string') {
