@@ -8155,7 +8155,8 @@ to `T[]` or `{[K]: V}`: neither is assignable to it and it is assignable to neit
 invariant in its element. `Set()` and `Set<T>()` construct it, and it prints as `Set<T>` in
 hover and diagnostics. One union is refused for now: a `Set<K>` beside a map whose value is one
 i32 cell (`{[K]: boolean}`, `{[K]: i32}`, a literal union), because the two lower to the same map
-struct and a union box could not tell them apart (D2493, which lifts the refusal). On master that
+struct and a union box could not tell them apart (D2673, which lifts the refusal; the map-with-map
+pair D2493 closed with a box tag per member type). On master that
 union collapsed to one type, so `f(x: Set<string> | {[string]: boolean} | null)` called as
 `f(null)` ran and is now a check refusal: a loud runs→not-runs. `{[K]: boolean}` stays legal and means a plain map of booleans, built
 by `Map()`, with one change: **`.add` is a Set method only** (owner ruling, 2026-09-25, after

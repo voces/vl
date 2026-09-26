@@ -42,7 +42,8 @@ which retires §C2's interface reading — see the banner there). **`Set<T>` is 
 to no `T[]` or `{[K]: V}` destination and neither flows to it. It prints as `Set<T>`.
 `{[K]: boolean}` is still legal and is a plain map of booleans, built with `Map()`; it inserts
 with `m[k] = true`, since `.add` is a Set method. A set and a map whose value is one `i32` cell
-(`boolean`, `i32`, a literal union) cannot share a union yet (D2493). A bare
+(`boolean`, `i32`, a literal union) cannot share a union yet (D2673); two such maps can
+(`{[K]: i32} | {[K]: boolean}`), and `is` tells them apart. A bare
 `Map` or `Set` with no type arguments is not a type — the checker says
 `` `Map` needs its key and value types — write `Map<K, V>` ``.
 

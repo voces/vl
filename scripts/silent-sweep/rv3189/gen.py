@@ -29,7 +29,7 @@ CELLS = {
  "d2657_rv3189_k4_generic_twin_pin": {
   "grid": "k4",
   "src": "function g<V>(m: V, n: {[i32]: i32}, c: boolean): i32 {\n  let u: V | {[i32]: i32} = n\n  if c { u = m }\n  if u is {[i32]: i32} { return 1 }\n  2\n}\nconst mb: {[i32]: boolean} = Map()\nconst mi: {[i32]: i32} = Map()\nprint(g(mb, mi, true))\nprint(g(mb, mi, false))\nprint(g(\"x\", mi, true))\n",
-  "want": "1 then 2 then 2"
+  "want": "2 then 1 then 2"
  },
  "d2659_rv3189_i32_Rec_o2_global_is": {
   "grid": "i32_Rec_o2_global_is",
@@ -59,7 +59,8 @@ coords, expect = {}, {}
 for name, c in sorted(CELLS.items()):
     open(os.path.join(out, name + ".vl"), "w").write(c["src"])
     coords[name] = {"grid": c["grid"]}
-    expect[name] = c["want"]
+    # The grader compares stdout verbatim, one printed line per line.
+    expect[name] = c["want"].replace(" then ", "\n")
 json.dump({"coords": coords, "expect": expect, "block": "rv3189", "generated": len(coords)},
           open(os.path.join(out, "manifest.json"), "w"), indent=1, sort_keys=True)
 print("wrote %d cells into %s" % (len(coords), out))
