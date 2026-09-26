@@ -7929,9 +7929,17 @@ conservative rule is the sound floor it would refine.
   checks its right operand under the left operand's facts, and a write there (an assignment
   in an if-expression arm, a `match` arm, a loop in that arm) retires them as any write does;
   the arm the whole condition guards, and the code after an `||` guard's early return, then
-  read the place at its declared type, and a re-test narrows again. Evaluation order decides,
-  unlike the call rule above: a write before the test (`(… p.f = mk() …) && p.f != null`)
-  keeps the test's fact, and a write the fact admits keeps it too.
+  read the place at its declared type, and a re-test after the write narrows again, in both
+  halves. Evaluation order decides, unlike the call rule above: a write before the test
+  (`(… p.f = mk() …) && p.f != null`) keeps the test's fact. A write the fact admits keeps a
+  field's or cell's fact (`p.f = { r: 9 }`), but not a bare name's: a name written inside an
+  if-expression arm reads at its declaration after the arm, as it does after any block that
+  wrote it (D1736), so `x != null && (if c { x = { r: 9 }; true } else { false })` must
+  re-test `x`.
+* *Testing an assignment narrows its target* (D2602). `(x = e) != null`, `(x = e) == null` in
+  its else and after an early return, and `(x = e) is T` narrow the bare name `x`, which holds
+  the tested value, exactly as the same test of `x` written after the assignment would. A
+  field or cell target (`(p.f = e) != null`) does not narrow yet; the test is on the value.
 * *A nested function made under a narrowing* (D2402) of a binding some function may write keeps
   the narrowing only when it is called by its handle in the body that makes it and neither
   writes nor tests the binding itself; each such call is refused unless the binding still holds
