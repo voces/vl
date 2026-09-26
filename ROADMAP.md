@@ -2442,8 +2442,8 @@ in-language GC knobs.
   `type S` spelling covers it. The map-ARRAY annotation arm's hand-written copy of the same
   forcing went with it.
   REMAINING, all
-  loud rejects with pinned fixtures: **a UNION MEMBER** (`{[i32]: V} | i32` — the box carries no
-  map shape, `maps/error-i32-keyed-position-union-member.vl`); **a list of LISTS of maps**
+  loud rejects with pinned fixtures: ~~**a UNION MEMBER**~~ (`{[i32]: V} | i32` — lowered
+  2026-09-26 by a box tag per integer-keyed mono map struct, D2519, `maps/i32-keyed-position-union-member.vl`); **a list of LISTS of maps**
   (`{[i32]: V}[][]`, one `[]` deeper than the peel, on both the bare and the field spelling —
   `maps/error-i32-keyed-position-array.vl`); and an ARRAY OF CLOSURES returning one
   (`(() => {[i32]: V})[]`). **And the MAP-VALUE position, which the list above and the gate's own

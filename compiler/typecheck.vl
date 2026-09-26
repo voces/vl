@@ -13480,6 +13480,81 @@ function setMapUnionClashMsg(members: i32[], isJoin: boolean): string {
   ""
 }
 
+// The map-with-map twin of the refusal above (D2493), asked only where a test must tell two
+// arms apart: `x is T`, a `match` arm or an `as` naming the map `chk`, over the members `mems`.
+// Two maps whose keys hash alike and whose values each rep as one i32 cell share one map struct
+// and one box tag, so the test could not answer; a union holding both is otherwise fine.
+function mapTwinTestMsg(mems: i32[], chk: i32, what: string): string {
+  if chk < 0 { return "" }
+  // A union pattern (`is A | string`) tests each of its members; a twin it names both halves
+  // of is told apart by neither, so only a twin left outside the pattern is refused.
+  const want: i32[] = []
+  mapTwinFlatten([chk], want, 4)
+  const flat: i32[] = []
+  mapTwinFlatten(mems, flat, 4)
+  let w = 0
+  while w < want.length {
+    const c = want[w]
+    const ct = T.tys[c]
+    if ct is TyMap {
+      let i = 0
+      while i < flat.length {
+        const b = flat[i]
+        const bt = T.tys[b]
+        if bt is TyMap {
+          if mapPairSharesRep(ct, bt) && !mapTwinIn(want, b) {
+            return what
+              + " cannot tell "
+              + tyToStr(c)
+              + " from "
+              + tyToStr(b)
+              + " yet: they share one representation — wrap each in a record with a discriminant field"
+          }
+        }
+        i = i + 1
+      }
+    }
+    w = w + 1
+  }
+  ""
+}
+
+// Whether the type `b` is one of `tys`.
+function mapTwinIn(tys: i32[], b: i32): boolean {
+  let i = 0
+  while i < tys.length {
+    if tyEq(tys[i], b) { return true }
+    i = i + 1
+  }
+  false
+}
+
+// The members `mems` names, with a nested union or nullable spread into its own members.
+function mapTwinFlatten(mems: i32[], out: i32[], depth: i32) {
+  if depth <= 0 { return 0 }
+  let i = 0
+  while i < mems.length {
+    const m = mems[i]
+    if m >= 0 {
+      const t = T.tys[m]
+      if t is TyUnion { mapTwinFlatten(t.uMembers, out, depth - 1) }
+      else if t is TyNullable { mapTwinFlatten([t.nInner], out, depth - 1) }
+      else { out.push(m) }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// Whether two maps (neither a Set) share one lowering: pinned keys that hash alike and pinned
+// values that each rep as the one i32 cell.
+function mapPairSharesRep(a: TyMap, b: TyMap): boolean {
+  if a.mSet != 0 || b.mSet != 0 { return false }
+  if a.mKey < 0 || b.mKey < 0 || a.mVal < 0 || b.mVal < 0 { return false }
+  if mapKeyRepTy(a.mKey) != mapKeyRepTy(b.mKey) { return false }
+  mapValIsI32Cell(a.mVal) && mapValIsI32Cell(b.mVal)
+}
+
 // Whether two map keys hash alike; an unpinned key (`-1`) may still become either.
 function setMapKeysShareRep(a: i32, b: i32): boolean {
   if a < 0 || b < 0 { return true }
@@ -48421,6 +48496,8 @@ function checkMatchTypeArms(n: MatchExpr, ix: i32, st: i32, uMems: i32[]) {
               patIx,
             )
           }
+          const twin = mapTwinTestMsg(uMems, pt, "a `match` arm")
+          if twin != "" { tErr(twin, patIx) }
         }
       } else if pn is StrLit {
         // A string-literal pattern discriminates a litunion's member text; over a value union
@@ -49614,6 +49691,11 @@ function checkCastNode(n: AsExpr, ix: i32) {
             + tyToStr(argU),
           ix,
         )
+        return TY_ERR
+      }
+      const twin = mapTwinTestMsg([argU], target, "`as`")
+      if twin != "" {
+        tErr(twin, ix)
         return TY_ERR
       }
       const rest = subtractTy(argU, target)
@@ -53543,6 +53625,8 @@ function checkIsExprNode(n: IsExpr, ix: i32) {
         )
       }
     } else {
+      const twin = mapTwinTestMsg([objTy], chkTy, "`is`")
+      if twin != "" { tErr(twin, ix) }
       recordCollapsedIsAt(n, ix, objTy, chkTy)
     }
   }

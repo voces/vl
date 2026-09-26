@@ -537,13 +537,33 @@ declaration line the name section carries cannot spell one file two ways — the
 program: the entry is its own bare file name and the import is `lib.vl`, with no directory
 prefix from either the cwd or the entry's own path.
 
-### B6a-map-in-union-box — may a MAP be a union member, or does the box need a struct column? — raised 2026-09-07
+### B6a-map-in-union-box — may a MAP be a union member, or does the box need a struct column? — RULED 2026-09-26
+
+**Ruling (owner, 2026-09-26, Q5 (a)):** lift the refusal. An `i32`- or `i64`-keyed `Map`/`Set`
+(and `{[i32]: V}`, `{[i64]: V}`) is a union member at every position, the same as the
+string-keyed twin. D2519 closes.
+
+**Built as a tag per map STRUCT, not a struct column.** Measuring the box showed the question
+below was narrower than it reads: a map arm's tag was already keyed on its interned value slot,
+and a slot carries its key rep, so every typed-value map (`{[i32]: string}`, `{[i64]: Rec}`)
+already had its own tag and struct. Only the three MONO structs (an i32-cell value: `i32`,
+`boolean`, a literal union, a `Set`) shared one tag, `mapSlotTag(-1)`, and the narrowed unbox
+fell to the string-keyed mono struct for all three. The i32- and i64-keyed mono maps now tag at
+value-atom codes 15 and 16, above the band `uAtomBandTop` lifts only in a module whose collect
+pass saw such an arm (`mIntMonoArmUsed`), the pattern #3187 used for the vector's code 14; the
+unbox and `is` resolve a mono arm to its key's struct. Cost: a program with no integer-keyed
+mono map arm is byte-identical (270 of 270 fixture programs, including every one spelling a map
+in a union), and the seed grew 0.06%. Option (b) below changes the box's own type, so every
+module that builds a union would move. Two maps that share one struct, `{[K]: i32} |
+{[K]: boolean}`, still share a tag; that is D2493, now refused at check at a test that must tell them apart
+(`is`, a `match` arm, `as`), at every key rep, and at emit where a generic instance's union or
+pins hold the pair the checker could not see.
 
 `const u: {[i32]: i32} | i32 = m` refuses with `an i32-keyed Map/Set is supported as … not
 inside '{[i32]:i32}|i32'`, and it is the ONE container position left after B6a opened the other
 three (a nested array element, an array of map-returning closures, a map value). The refusal was
 argued from the rep and is now MEASURED: opening the arm made
-`tests/cases/maps/error-i32-keyed-position-union-member.vl` — an `is {[i32]: i32}` narrowed read
+`tests/cases/maps/i32-keyed-position-union-member.vl` (then an error fixture) — an `is {[i32]: i32}` narrowed read
 through the box — `vl check` rc 0 and then invalid wasm, `type mismatch: expected (ref null
 $type), found (ref $type)`. So the position is a clause-1 miscompile away from legal, not a peel
 away.

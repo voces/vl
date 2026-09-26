@@ -96,6 +96,8 @@ import {
   nodeTyIxOf,
   nodeTyMapKeyKind,
   nodeTyMapKeyKindSpan,
+  nodeTyMapValIsLitUnion,
+  nodeTyMapValIsNulLitUnion,
   nodeTyPrimName,
   nodeTyReachesClosure,
   nulNumLitUnionBaseName,
@@ -345,6 +347,7 @@ import {
   localLitUnion,
   mI32Used,
   mI64Used,
+  mIntMonoArmUsed,
   mNextType,
   mStructI32Idx,
   mStructI64Idx,
@@ -3591,7 +3594,17 @@ export function declareForInLocals(s: ForIn, fnIx: i32) {
       fiPk,
       forInPairStructIdx(s.fiIter, fnIx),
     )
-    if forInPairIsMapVal(s.fiIter, fnIx) { markPairVarIter(fiP2, s.fiIter) }
+    if forInPairIsMapVal(s.fiIter, fnIx) {
+      markPairVarIter(fiP2, s.fiIter)
+      // A literal-union map VALUE rides the i32 atom like the key arm above, so the value
+      // binding is flagged the same way, or a print reads the atom's index (D2656).
+      if (
+        nodeTyMapValIsLitUnion(s.fiIter)
+        || nodeTyMapValIsNulLitUnion(s.fiIter)
+      ) {
+        if fiP2 >= 0 && fiP2 < localLitUnion.length { localLitUnion[fiP2] = 1 }
+      }
+    }
     scopeBind(s.fiVar2, fiP2)
   }
   return 0
@@ -5288,6 +5301,21 @@ export function mAssignTypeIndices(_n: i32) {
 // a module with no i32-key scratch frame, `vl check` rc 0 and invalid wasm (ROADMAP B6a).
 function i32MapSpellingLowerable(name: string) {
   const bare = i32MapPeelWrappers(name)
+  // A union spelling is split first: its text can open with `{[` and close with `}` while being
+  // two members, so the span tests below would read `{[string]: R} | {[i32]: R}` as one map.
+  // Each member is asked this same question; a member that IS the map boxes under its own tag.
+  if unionMemberCount(bare) > 1 {
+    const atoms: string[] = []
+    splitUnionAtoms(bare, atoms)
+    let ai = 0
+    while ai < atoms.length {
+      if nameMentionsIntKeyedMap(atoms[ai]) {
+        if i32MapSpellingLowerable(atoms[ai]) < 0 { return -1 }
+      }
+      ai = ai + 1
+    }
+    return 0
+  }
   if nameIsMapSpanEnds(bare) {
     if mapNameKeyKind(bare) != MAP_KEY_STR { return 0 }
     // A map whose VALUE mentions an i32-keyed map (`{[string]: {[i32]: V}}`): the inner map is
@@ -5301,25 +5329,6 @@ function i32MapSpellingLowerable(name: string) {
   // the whole shape is one `TypeRef` name. Each field text is asked this same question, so the
   // set a field may hold is exactly the set any other position may hold, and nothing wider.
   if nameIsShapeSpanEnds(bare) { return i32MapShapeFieldsLowerable(bare) }
-  // A union spelling (`{f: {[i32]: V}} | i32`): every member that mentions an i32-keyed map must
-  // be a struct arm, asked as the shape above. A member that IS the map stays refused — the box
-  // records no map STRUCT, so an `is {[i32]: V}` read casts to whichever the name scan claimed,
-  // which is invalid wasm rather than a diagnostic (`open-rulings.md` §B6a-map-in-union-box).
-  if unionMemberCount(bare) > 1 {
-    const atoms: string[] = []
-    splitUnionAtoms(bare, atoms)
-    let ai = 0
-    while ai < atoms.length {
-      if nameMentionsIntKeyedMap(atoms[ai]) {
-        if !nameIsShapeSpanEnds(atoms[ai]) {
-          return i32MapSpellingUnsupported(name)
-        }
-        if i32MapShapeFieldsLowerable(atoms[ai]) < 0 { return -1 }
-      }
-      ai = ai + 1
-    }
-    return 0
-  }
   i32MapSpellingUnsupported(name)
 }
 
@@ -5368,10 +5377,9 @@ function i32MapPeelWrappers(name: string) {
   bare
 }
 
-// The gate's reject, named once: three sites raise it — the leaf test above, the union arm's
-// non-shape member, and a shape's field through the recursion — and the message must not drift
-// between them. Each position the message names is exercised by a corpus case and lowers today;
-// what it does NOT name is a union member that IS the map, whose box records no map struct.
+// The gate's reject, named once: the leaf test above and a shape's field through the
+// recursion both raise it, and the message must not drift between them. Each position the
+// message names is exercised by a corpus case and lowers today.
 function i32MapSpellingUnsupported(name: string): i32 {
   let kw = "i32"
   if !strContains(name, "{[i32]:") { kw = "i64" }
@@ -5379,11 +5387,10 @@ function i32MapSpellingUnsupported(name: string): i32 {
     "emitProgram: an "
       + kw
       + "-keyed Map/Set is supported as a binding / parameter / "
-      + "return / `| null` / an ARRAY ELEMENT at any depth / a closure result / a "
-      + "MAP VALUE / a struct or variant FIELD — not inside '"
+      + "return / `| null` / a union member / an ARRAY ELEMENT at any depth / a closure "
+      + "result / a MAP VALUE / a struct or variant FIELD — not inside '"
       + name
-      + "'. A union member that IS the map is the one position left: the box records no "
-      + "map struct. Bind the "
+      + "'. Bind the "
       + kw
       + "-keyed map on its own and pass it where you need it.",
   )
@@ -11904,6 +11911,7 @@ export function collectU(stmts: i32[]) {
   vbF32Used = false
   vbF64Used = false
   vbV128Used = false
+  mIntMonoArmUsed = false
   unNames = []
   unRowBySid = []
   unTyIx = []
