@@ -14150,6 +14150,32 @@ export function anonLeafArrElemFe(arrIx: i32, fnIx: i32): i32 {
   -1
 }
 
+// The interned `$fnsig` key every element of the array literal behind `arrIx` shares, each a
+// lambda literal, or "" when any element is not one or two keys differ. Literals only: a
+// named element resolves by name, and two frames' same-named functions share it.
+function anonLeafArrElemSelfKey(arrIx: i32, fnIx: i32): string {
+  const li = anonLeafArrLitOf(arrIx, fnIx)
+  if li < 0 { return "" }
+  const a = P.nodes[li]
+  if a is ArrayLit {
+    let key = ""
+    let i = 0
+    while i < a.arrElems.length {
+      const el = unwrapParen(a.arrElems[i])
+      if el < 0 || !(P.nodes[el] is FuncDecl) { return "" }
+      const fe = fnStmtsPosOf(el)
+      if fe < 0 { return "" }
+      const k = cloSigKeyExt(fe)
+      if k == "" { return "" }
+      if key != "" && k != key { return "" }
+      key = k
+      i = i + 1
+    }
+    if key != "" && cloSigPosOfKey(key) >= 0 { return key }
+  }
+  ""
+}
+
 // The `ArrayLit` node an indexed callee's receiver resolves to — the literal itself, or the
 // initializer of the binding that names it. -1 for anything this cannot follow, which is the
 // answer that keeps every other indexed closure call on `cloArrSlotSigKey`'s route.
@@ -14219,6 +14245,16 @@ export function cloCallSigKey(callIx: i32, fnIx: i32) {
         return k
       }
     }
+    // A lambda literal called in place is keyed by its own lifted function, as a binding holding
+    // it is; its node type renders no key for a niche signature (`string | null`), and the
+    // arity fallback below then picks an unrelated functype (D2552).
+    if cre is FuncDecl {
+      const lfe = fnStmtsPosOf(cfx)
+      if lfe >= 0 {
+        const lk = cloSigKeyExt(lfe)
+        if lk != "" && cloSigPosOfKey(lk) >= 0 { return lk }
+      }
+    }
     if cre is Member {
       const mfe = fieldClosureFeOfRecv(cre.memObj, cre.memProp, fnIx)
       if mfe >= 0 {
@@ -14278,6 +14314,11 @@ export function cloCallSigKey(callIx: i32, fnIx: i32) {
         // merge moves the element function's rows. "" outside such a family.
         const ek = anonLeafArrElemSigKey(cre.idxArr, fnIx)
         if ek != "" { return ek }
+        // A literal whose elements are lifted lambdas of one signature is keyed by it, as a
+        // lambda called in place is: the slot's name-rendered key disagrees with it at a
+        // literal union or a niche (D2552).
+        const efk = anonLeafArrElemSelfKey(cre.idxArr, fnIx)
+        if efk != "" { return efk }
         const k = cloArrSlotSigKey(refListSlotOfExpr(cre.idxArr, fnIx))
         if k != "" { return k }
       }
@@ -29875,8 +29916,8 @@ export function unionNameOfExpr(exprIx: i32, fnIx: i32) {
     // A value call the callee's `$fnsig` keys with a boxed result is that union, named as the
     // key names it, whatever the call's type renders as on its own (D2535).
     if (
-      callIsValueCall(unwrapParen(exprIx))
-      && tyBearsNull(nodeTyIxOf(unwrapParen(exprIx)))
+      tyBearsNull(nodeTyIxOf(unwrapParen(exprIx)))
+      && callIsValueCall(unwrapParen(exprIx))
     ) {
       const cuk = cloCallSigKey(unwrapParen(exprIx), fnIx)
       if cuk != "" && sigKeyRetKind(cuk) == "union" {
@@ -36675,6 +36716,17 @@ function annParamKind(t: string) {
   // the AST producer's `cloParamTok` keys, matching a nominal name too.
   const sti = structIndexOfTypeName(t)
   if sti >= 0 { return repSigSlotTokOfKind("struct", sti) }
+  // A literal union, bare or nullable, is the interned i32 atom at a parameter as at a result.
+  if nameIsLitUnionType(t) || nameIsNulLitUnion(t) {
+    return repSigTokOfKind("i32")
+  }
+  // The nullable and union params, the name twin of `cloParamTok`'s niche kinds: without them
+  // an annotation or arena type naming `string | null` keyed nothing, and the call fell to an
+  // unrelated arity functype (D2552). A nullable closure param stays outside the ABI there.
+  const uslot: i32[] = [-1]
+  const uk = annUnionSigKind(t, uslot)
+  if uk == "nulstruct" { return repSigSlotTokOfKind("nulstruct", uslot[0]) }
+  if uk != null && uk != "nulclosure" { return repSigTokOfKind(uk) }
   ""
 }
 
@@ -36726,45 +36778,55 @@ function annRetKind(t: string) {
   if si >= 0 { return ">" + repSigSlotTokOfKind("struct", si) }
   // A union/nullable return boxes, matching `cloRetKeySuffix` — a union alias resolves to its
   // member set first, so a closure returning the alias still keys the box.
+  const uslot: i32[] = [-1]
+  const uk = annUnionSigKind(t, uslot)
+  if uk == "nulstruct" {
+    return ">" + repSigSlotTokOfKind("nulstruct", uslot[0])
+  }
+  if uk != null { return ">" + repSigTokOfKind(uk) }
+  ""
+}
+
+// The value-ABI kind a union or `X | null` spelling `t` reps as in a `$fnsig`, shared by the
+// result and parameter producers: `nulstr`, `nullist`, `nulstruct` (its row in `slotOut[0]`),
+// `nulclosure`, or `union` for the box. null for a non-union and for a niche outside the ABI.
+function annUnionSigKind(t: string, slotOut: i32[]): VKind | null {
   const parts: string[] = []
   annSplitPipe(unionMemberSetOf(t), parts)
-  if parts.length >= 2 {
-    const nonNull: string[] = []
-    let hasNull = false
-    let pi = 0
-    while pi < parts.length {
-      const p = parts[pi]
-      if p == "null" { hasNull = true }
-      else if p.length > 0 { nonNull.push(p) }
-      pi = pi + 1
-    }
-    if hasNull && nonNull.length == 1 {
-      if nonNull[0] == "string" { return ">" + repSigTokOfKind("nulstr") }
-      // A nullable i32-backed list result: the i32-list wrapper made nullable, slot-free,
-      // matching `cloRetKeySuffix`'s `>o`; distinct-backing nullable lists fall through to "".
-      if nameIsI32Array(nonNull[0]) { return ">" + repSigTokOfKind("nullist") }
-      const msi = structIndexOfTypeName(nonNull[0])
-      if msi >= 0 { return ">" + repSigSlotTokOfKind("nulstruct", msi) }
-      // A nullable-closure result: the shared closure fat-pointer made nullable, slot-free,
-      // matching `cloRetKeySuffix`'s `>C` — without it the call fell to the all-i32 arity sig.
-      if strContains(nonNull[0], "=>") {
-        return ">" + repSigTokOfKind("nulclosure")
-      }
-      // A nullable numeric scalar reps as the value-union box, matching `cloRetKeySuffix` —
-      // `boolean | null` is the i32-sentinel niche instead, excluded since its valtype is plain i32.
-      if (
-        nonNull[0] == "i32"
-        || nonNull[0] == "i64"
-        || nonNull[0] == "f64"
-        || nonNull[0] == "f32"
-      ) {
-        return ">" + repSigTokOfKind("union")
-      }
-      return ""
-    }
-    if nonNull.length >= 2 { return ">" + repSigTokOfKind("union") }
+  if parts.length < 2 { return null }
+  const nonNull: string[] = []
+  let hasNull = false
+  let pi = 0
+  while pi < parts.length {
+    const p = parts[pi]
+    if p == "null" { hasNull = true }
+    else if p.length > 0 { nonNull.push(p) }
+    pi = pi + 1
   }
-  ""
+  if nonNull.length >= 2 { return "union" }
+  if !hasNull || nonNull.length != 1 { return null }
+  if nonNull[0] == "string" { return "nulstr" }
+  // A nullable i32-backed list: the i32-list wrapper made nullable, slot-free, matching
+  // `cloRetKeySuffix`'s `>o`; distinct-backing nullable lists fall through to null.
+  if nameIsI32Array(nonNull[0]) { return "nullist" }
+  const msi = structIndexOfTypeName(nonNull[0])
+  if msi >= 0 {
+    slotOut[0] = msi
+    return "nulstruct"
+  }
+  // A nullable closure: the shared fat-pointer made nullable, slot-free, matching `>C`.
+  if strContains(nonNull[0], "=>") { return "nulclosure" }
+  // A nullable numeric scalar reps as the value-union box; `boolean | null` is the i32-sentinel
+  // niche instead, outside the ABI since its valtype is plain i32.
+  if (
+    nonNull[0] == "i32"
+    || nonNull[0] == "i64"
+    || nonNull[0] == "f64"
+    || nonNull[0] == "f32"
+  ) {
+    return "union"
+  }
+  null
 }
 
 // The `$fnsig` KEY of a SOURCE function-type annotation `(params)=>ret` — the SAME

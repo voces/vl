@@ -1593,9 +1593,17 @@ function monoPinnedTyOf(ix: i32, bN: string[], bT: i32[]): i32 {
 }
 
 // A fresh node for expression `ix` over `kids` (parallel to `monoExprKids(ix)`), or `ix`
-// for a kind it cannot remake. A call keeps its explicit type arguments, and an `is` its
-// banked row. Records no type: the caller decides which one the new node answers.
+// for a kind it cannot remake. It answers the narrowing retirements `ix` did (D2390's banks).
+// Records no type: the caller decides which one the new node answers.
 function monoExprRemake(ix: i32, kids: i32[]): i32 {
+  const nx = monoExprMake(ix, kids)
+  if nx != ix { recordClonedCallRetire(ix, nx) }
+  nx
+}
+
+// `monoExprRemake`'s node maker. A call keeps its explicit type arguments, and an `is` its
+// banked row.
+function monoExprMake(ix: i32, kids: i32[]): i32 {
   const n = P.nodes[ix]
   if n is Ident { return mkIdent(n.identName, n.pos) }
   if n is Call {
@@ -2333,11 +2341,23 @@ function monoCloneLambdaSubst(
   -1
 }
 
-// Per-instance lambda monomorphization for a generic body — the annotated sibling of
-// `monoPinMapLambdas`. Walks the whole instance body and substitutes every lambda literal
-// still mentioning a type parameter at this pin, whatever position it is written in: a
-// binding, an argument, an element, a field, a condition or a tail. Copy-on-write.
+// Per-instance lambda monomorphization for a generic body: every lambda literal still naming
+// a type parameter is substituted at this pin, in any position (D2551). Copy-on-write, and a
+// rebuilt node answers the narrowing retirements its original did (D2390's banks).
 function monoPinBodyLambdas(
+  ix: i32,
+  typarams: string[],
+  tvN: string[],
+  tvV: string[],
+  bN: string[],
+  bT: i32[],
+) {
+  const r = monoPinBodyLambdasRaw(ix, typarams, tvN, tvV, bN, bT)
+  if r != ix { recordClonedCallRetire(ix, r) }
+  r
+}
+
+function monoPinBodyLambdasRaw(
   ix: i32,
   typarams: string[],
   tvN: string[],
@@ -2442,12 +2462,42 @@ function monoPinBodyLambdas(
     const kv = monoPinValueLambda(ks[ki], typarams, tvN, tvV, bN, bT)
     if n is Call {
       nks.push(monoPinFnValueTy(kv, ks[ki], bN, bT))
+    } else if ki == 0 && (n is Member || n is Index) {
+      nks.push(monoPinRecvLit(kv, ks[ki], bN, bT))
     } else {
       nks.push(kv)
     }
     ki = ki + 1
   }
   monoExprRebuild(ix, nks, bN, bT)
+}
+
+// A list literal read as a receiver (`[r].map(…)`, `[r][0]`) and typed at the type parameter,
+// re-typed at the pin: an inline `.map`/`.filter` and an element read take its element rep off
+// that type (D2554). `cur` is the walk's rewrite of `orig`; anything else is returned as is.
+function monoPinRecvLit(cur: i32, orig: i32, bN: string[], bT: i32[]): i32 {
+  if orig < 0 || !(P.nodes[orig] is ArrayLit) { return cur }
+  const aty = nodeTyIxOf(orig)
+  // A literal holding `null` beside the parameter keeps the template's type: its re-typed
+  // `.map` result reaches an inferred-return defect its concrete twin has too.
+  if aty >= 0 && aty < T.tys.length {
+    const at = T.tys[aty]
+    if at is TyArray {
+      if (
+        at.aElem >= 0
+        && at.aElem < T.tys.length
+        && T.tys[at.aElem] is TyNullable
+      ) {
+        return cur
+      }
+    }
+  }
+  const pty = monoPinnedTyOf(orig, bN, bT)
+  if pty < 0 || pty == aty { return cur }
+  let nx = cur
+  if nx == orig { nx = monoExprRemake(orig, monoExprKids(orig)) }
+  nodeTyRecord(nx, pty)
+  nx
 }
 
 // A call's callee or argument `cur` (the walk's rewrite of `orig`) answering its function type
