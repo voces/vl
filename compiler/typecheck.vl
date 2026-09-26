@@ -3090,6 +3090,25 @@ let nodeRepTyIx: i32[] = []
 // `checkNodeReal` consults it so a re-check keeps the adopted width, and the emitter reads the
 // re-stamped `nodeTyIx` — DECISIONS.md §"A hex literal is a bit pattern".
 let litWide64: boolean[] = []
+// Whether the checker has typed an identifier naming an `extern` anywhere but as a callee: the
+// one case the emitter's `synthExternValues` has work for, so a program that only calls its
+// externs skips it (D2618). `ckCalleeIx` is the callee node the general call arm is typing, or -1.
+let extValueSeen = false
+let ckCalleeIx = -1
+// The arena types externs are declared at, by index: the cheap filter in front of the name.
+let extFnTy: boolean[] = []
+
+// The least of them, so a read at any earlier-interned type (every primitive) is one compare.
+let extFnTyMin = 2147483647
+
+function extFnTyMark(ty: i32) {
+  if ty < 0 { return 0 }
+  while extFnTy.length <= ty { extFnTy.push(false) }
+  extFnTy[ty] = true
+  if ty < extFnTyMin { extFnTyMin = ty }
+  0
+}
+export function externValueSeen(): boolean { extValueSeen }
 // Annotation atom-count sidecar: how many top-level union atoms the annotation node's emit-time
 // spelling is joined from, banked by `canonEmitTypeNames`, the producer of that spelling. The
 // count cannot be recovered from the arena — an annotation over two same-shape declared structs
@@ -4012,6 +4031,10 @@ export function initChecker() {
   isParentElseTyIx = []
   nodeRepTyIx = []
   litWide64 = []
+  extValueSeen = false
+  ckCalleeIx = -1
+  extFnTy = []
+  extFnTyMin = 2147483647
   annUnionAtoms = Map()
   cFuncPinTyIx = -1
   cObjPinTyIx = -1
@@ -13351,10 +13374,10 @@ function parenPeelIx(ix: i32) {
   ix
 }
 
-// Pin the radix literal `srcExpr` delivers into `dstTy` to the destination's width. An object
-// literal's fields and an array literal's elements reach their own destination sub-type through
-// `assignableExpr`'s field-wise and element-wise recursion, which re-enters here. A unary minus is
-// not peeled: it makes the literal an operand rather than the delivered value.
+// Pin the radix literal `srcExpr` delivers into `dstTy` to the destination's width. A value
+// `if`, `match` or block delivers its tails, and an object or array literal its fields and
+// elements, so each reaches its own destination here too (D2617). A unary minus is not peeled: it
+// makes the literal an operand rather than the delivered value.
 function radixLitAdoptDst(srcExpr: i32, dstTy: i32) {
   if inferQuiet || srcExpr < 0 || dstTy < 0 { return 0 }
   const lix = parenPeelIx(srcExpr)
@@ -13365,7 +13388,173 @@ function radixLitAdoptDst(srcExpr: i32, dstTy: i32) {
     if w < 0 { return 0 }
     return radixLitAdoptWidth(lix, w)
   }
+  if e is IfStmt || e is MatchExpr || e is Block {
+    return radixLitAdoptTails(lix, dstTy)
+  }
+  if e is ObjLit { return radixLitAdoptFields(e, dstTy) }
+  if e is ArrayLit { return radixLitAdoptElems(e, dstTy) }
+  radixLitNoParts()
+}
+
+// Every other node delivers its value whole, at its own checked type: no literal in it takes the
+// destination's width.
+function radixLitNoParts(): i32 { 0 }
+
+// The fields of object literal `e`, each against its own destination field type. A bare literal
+// field is left alone: the emitter already reads it at the slot's width, and `assignableExpr`'s
+// own field-wise recursion pins it when that one runs.
+function radixLitAdoptFields(e: ObjLit, dstTy: i32) {
+  const dix = nonNullTy(dstTy)
+  if dix < 0 { return 0 }
+  const d = T.tys[dix]
+  let rc = 0
+  if d is TyObj {
+    let i = 0
+    while i < e.objFields.length {
+      const f = P.nodes[e.objFields[i]]
+      if f is FieldInit {
+        const fty = objFieldType(d, f.fiName)
+        if fty >= 0 && !(P.nodes[parenPeelIx(f.fiValue)] is NumLit) {
+          const fc = radixLitAdoptDst(f.fiValue, fty)
+          if fc > rc { rc = fc }
+        }
+      }
+      i = i + 1
+    }
+  }
+  rc
+}
+
+// The elements of array literal `e`, each against the element type of `dstTy`, a bare literal
+// element left alone as a bare field is.
+function radixLitAdoptElems(e: ArrayLit, dstTy: i32) {
+  const dix = nonNullTy(dstTy)
+  if dix < 0 { return 0 }
+  const d = T.tys[dix]
+  let rc = 0
+  if d is TyArray {
+    let i = 0
+    while i < e.arrElems.length {
+      const el = e.arrElems[i]
+      if !(P.nodes[parenPeelIx(el)] is NumLit) {
+        const ec = radixLitAdoptDst(el, d.aElem)
+        if ec > rc { rc = ec }
+      }
+      i = i + 1
+    }
+  }
+  rc
+}
+
+// Splits the value `if`, `match` or block at `ix` into `spine`, its `if` and `match` nodes, and
+// `leaves`, the tail values they yield.
+function valueTailSplit(ix: i32, spine: i32[], leaves: i32[]) {
+  const todo: i32[] = [ix]
+  while todo.length > 0 {
+    const at = cwPeel(todo.pop() ?? -1)
+    if at >= 0 && at < P.nodes.length {
+      if tailPushIfArms(at, todo) || tailPushMatchArms(at, todo) {
+        spine.push(at)
+      } else if !tailPushBlockTail(at, todo) {
+        leaves.push(at)
+      }
+    }
+  }
   0
+}
+
+// The tails of the value `if`, `match` or block at `ix`, pinned to `dstTy`. Only a join every
+// `if` and `match` of which is typed `i32` or `i64` takes part. When a tail widens to 64 bits,
+// those nodes are re-typed `i64` with it, so the emitter builds the join at that width; at a float
+// destination they are re-typed to it, so a radix tail is read as the value a bare one is.
+function radixLitAdoptTails(ix: i32, dstTy: i32) {
+  const spine: i32[] = []
+  const leaves: i32[] = []
+  valueTailSplit(ix, spine, leaves)
+  let all32 = true
+  let si = 0
+  while si < spine.length {
+    // A `match` desugared ahead of this delivery leaves its later links untyped; the head's type
+    // is the whole chain's.
+    const pt = nodeTyOf(spine[si])
+    if !(pt < 0 && spine[si] != ix) {
+      const pn = primNameOf(pt)
+      if pn != "i32" && pn != "i64" { return 0 }
+      if pn != "i32" { all32 = false }
+    }
+    si = si + 1
+  }
+  let reTy = -1
+  let rc = 0
+  const fpn = primNameOf(nonNullTy(dstTy))
+  if fpn == "f64" || fpn == "f32" {
+    if all32 && radixLeafAmong(leaves) { reTy = nonNullTy(dstTy) }
+  } else {
+    let i = 0
+    while i < leaves.length {
+      const lc = radixLitAdoptDst(leaves[i], dstTy)
+      if lc > rc { rc = lc }
+      i = i + 1
+    }
+    if rc == 1 { reTy = TY_I64 }
+  }
+  if reTy >= 0 {
+    let s = 0
+    while s < spine.length {
+      if spine[s] < nodeTyIx.length { nodeTyIx[spine[s]] = reTy }
+      s = s + 1
+    }
+  }
+  rc
+}
+
+// A value `if`, `match` or block every tail of which adopts `f32` as a bare literal does, at an
+// `f32` destination or its nullable. Its `if` and `match` nodes are re-typed `f32`, so the
+// emitter builds the join there and each literal re-encodes at single precision (D2619).
+function f32LitTailsAdopt(srcExpr: i32, dstTy: i32): boolean {
+  const fty = nonNullTy(dstTy)
+  if srcExpr < 0 || primNameOf(fty) != "f32" { return false }
+  const lix = parenPeelIx(srcExpr)
+  if lix < 0 { return false }
+  const e = P.nodes[lix]
+  if !(e is IfStmt || e is MatchExpr || e is Block) { return false }
+  const spine: i32[] = []
+  const leaves: i32[] = []
+  valueTailSplit(lix, spine, leaves)
+  if leaves.length == 0 { return false }
+  let i = 0
+  while i < leaves.length {
+    if !isF32AdoptingLitExpr(leaves[i]) { return false }
+    i = i + 1
+  }
+  if !inferQuiet {
+    let s = 0
+    while s < spine.length {
+      if spine[s] < nodeTyIx.length { nodeTyIx[spine[s]] = fty }
+      s = s + 1
+    }
+  }
+  true
+}
+
+// An operand beside an `f32` peer `peerTy` that adopts f32 as a literal does: a bare literal,
+// or a value `if`, `match` or block whose every tail is one.
+function f32AdoptingOperand(ix: i32, peerTy: i32): boolean {
+  if isF32AdoptingLitExpr(ix) { return true }
+  f32LitTailsAdopt(ix, peerTy)
+}
+
+// Whether one of the tail values `leaves` is a bare radix literal.
+function radixLeafAmong(leaves: i32[]): boolean {
+  let i = 0
+  while i < leaves.length {
+    const n = P.nodes[parenPeelIx(leaves[i])]
+    if n is NumLit {
+      if numLexRadixBits(n.numText) >= 0 { return true }
+    }
+    i = i + 1
+  }
+  false
 }
 
 // A radix literal takes the OTHER operand's width, so `x >= 0x80000000` over an `i64` compares the
@@ -13484,6 +13673,7 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
   // integer half folds the lexeme into a bignum, while `dstAdmitsF32` is a short arena walk.
   if dstAdmitsF32(dstTy) {
     if isF32AdoptingLitExpr(srcExpr) { return true }
+    if f32LitTailsAdopt(srcExpr, dstTy) { return true }
   }
   // The same grant one width up, and only its integer half: an i32-typed literal already rides
   // the `i32 -> f64` lattice edge, so what this admits is the literals between 2^31 and 2^53 that
@@ -34406,7 +34596,10 @@ function checkCallNode(n: Call, ix: i32) {
     if bt >= 0 { return bt }
     if foreignLenCall(n, cfn) { return TY_ERR }
   }
+  const savedCallee = ckCalleeIx
+  ckCalleeIx = n.callFn
   const fnTy = checkNode(n.callFn)
+  ckCalleeIx = savedCallee
   const ft = T.tys[fnTy]
   if ft is TyFunc { return checkCallOnFuncTy(n, ix, cfn, ft) }
   if ft is TyErr { return TY_ERR }
@@ -38720,6 +38913,12 @@ function checkNodeReal(ix: i32) {
       return TY_ERR
     }
     const ty = lookup(n.identName)
+    // Only a read at an extern's own type can name one, so the name lookup is asked of those alone.
+    if ty >= extFnTyMin && ty < extFnTy.length && !extValueSeen {
+      if extFnTy[ty] && ix != ckCalleeIx {
+        if externLinkOf(n.identName) >= 0 { extValueSeen = true }
+      }
+    }
     if ty < 0 {
       // `__callsite__` is legal — as a parameter default value, and nowhere else.
       // Reaching the undeclared-identifier floor means it appears in an expression, so
@@ -40567,7 +40766,10 @@ function checkExternDecls() {
           extDeclPos[d],
         )
       }
-      if extDeclVl[d] != "" { declare(extDeclVl[d], linkTys[link]) }
+      if extDeclVl[d] != "" {
+        declare(extDeclVl[d], linkTys[link])
+        extFnTyMark(linkTys[link])
+      }
     }
     d = d + 1
   }
@@ -45488,8 +45690,8 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
   }
   // A literal operand adopts the other side's f32 type (a literal re-encodes exactly at f32),
   // checked before the general mixed rule so `x + 1` stays f32 rather than widening to f64.
-  if primNameOf(lt) == "f32" && isF32AdoptingLitExpr(n.binRight) { return lt }
-  if primNameOf(rt) == "f32" && isF32AdoptingLitExpr(n.binLeft) { return rt }
+  if primNameOf(lt) == "f32" && f32AdoptingOperand(n.binRight, lt) { return lt }
+  if primNameOf(rt) == "f32" && f32AdoptingOperand(n.binLeft, rt) { return rt }
   // The f64 twin, integer half only — a `.`-literal already types f64 and needs no arm. Without
   // it `fv + 9000000000` is the mixed-numeric refusal while the same literal ASSIGNED to an f64
   // is admitted, so the two faces of one grant would disagree (D1890).

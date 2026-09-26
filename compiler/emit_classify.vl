@@ -75,6 +75,7 @@ import {
   covarDeclFrame,
   covarValueWriteState,
   eqCoreKindOfTyToken,
+  externValueSeen,
   fsIntrinsicSlot,
   fsRetIsVoid,
   fusedMapReadRecvIx,
@@ -4812,7 +4813,13 @@ function nodeSubtreeHas(ix: i32, at: i32): boolean {
 // It deliberately binds the local: a closure written before a shadowing `let` captures it.
 function capRecord(name: string, bound: {[string]: i32}, caps: string[]) {
   if capIsBound(bound, name) { return 0 }
-  if globalIndexOf(name) >= 0 || fnIndexOf(name) >= 0 {
+  // An extern is a module-level import, addressable from any frame like a function; only a
+  // program that reads one as a value can meet it here (D2618).
+  if (
+    globalIndexOf(name) >= 0
+    || fnIndexOf(name) >= 0
+    || (externValueSeen() && externLinkOf(name) >= 0)
+  ) {
     if parentBindingFrameOf(capFrame, name) < 0 {
       // The module scope is the one enclosing scope the frame walk cannot reach, and it has
       // a binding form that is not a global: a top-level `for` variable. Without it a closure
@@ -5062,7 +5069,18 @@ export function capScan(ix: i32, bound: {[string]: i32}, caps: string[]) {
         let shadowed = capIsBound(bound, cal.identName)
         if fnIndexOf(cal.identName) >= 0 { shadowed = true }
         if globalIndexOf(cal.identName) >= 0 { shadowed = true }
-        if parentBindingFrameOf(capFrame, cal.identName) >= 0 {
+        if (
+          externLinkOf(cal.identName) >= 0
+          && capFrame >= 0
+          && capFrame < fnStmts.length
+        ) {
+          // An outer frame's loop variable binds only inside its own loop (D2620).
+          if outerFrameBinds(capFrame, fnStmts[capFrame], cal.identName) {
+            shadowed = true
+          } else if moduleLoopEnclosing(capFrame, cal.identName) >= 0 {
+            shadowed = true
+          }
+        } else if parentBindingFrameOf(capFrame, cal.identName) >= 0 {
           shadowed = true
         } else if moduleLoopEnclosing(capFrame, cal.identName) >= 0 {
           // The frame walk stops short of the module scope, whose `for` variable is a
@@ -13892,8 +13910,12 @@ export function exprIsF64(exprIx: i32, fnIx: i32) {
   // A field read `p.x` whose struct field is an f64 slot (code 17) yields an f64.
   if e is Member { return memFieldTypeCode(exprIx, fnIx) == 17 }
   // A value-position if-expression is f64 when either arm's value is f64 (the branch-join
-  // widens to f64); an `else if` chain recurses through the else slot.
-  if e is IfStmt { return ifExprArmIsKind(exprIx, fnIx, "f64") }
+  // widens to f64); an `else if` chain recurses through the else slot. A join the checker typed
+  // `f32` is one whose float literal arms adopted an f32 destination, and stays f32 (D2619).
+  if e is IfStmt {
+    if tyKindOf(nodeTyIxOf(exprIx)) == 13 { return false }
+    return ifExprArmIsKind(exprIx, fnIx, "f64")
+  }
   false
 }
 
@@ -38335,6 +38357,44 @@ function identBindingNoLocal(fnIx: i32, name: string): i32 {
     steps = steps + 1
   }
   -1
+}
+
+// Whether `name` read in the frame of function node `fnIx` (-1 for the module's statements)
+// denotes a module-level declaration. A loop variable binds only inside its own loop, so the
+// caller tracks those of the frame it walks by position, and `outerFrameBinds` those of the
+// frames around it (D2620).
+export function nameFreeToModule(fnIx: i32, name: string): boolean {
+  if fnIx >= 0 {
+    const own = frameBindingNode(fnIx, name)
+    if own >= 0 {
+      const on = P.nodes[own]
+      if !(on is ForRange || on is ForIn) { return false }
+    }
+    const fe = fnStmtsPosOf(fnIx)
+    if outerFrameBinds(fe, fnIx, name) { return false }
+    if moduleLoopEnclosing(fe, name) >= 0 { return false }
+  }
+  moduleLocalLetOf(emitRootIx, name) < 0
+}
+
+// Whether a frame enclosing the lifted function at position `fe` (node `fnIx`) binds `name`
+// where `fnIx` reads it: any binding but a loop variable, and a loop variable only when `fnIx`
+// sits inside that loop.
+function outerFrameBinds(fe: i32, fnIx: i32, name: string): boolean {
+  let pp = fe
+  let steps = 0
+  while pp >= 0 && pp < fnParent.length && steps <= fnStmts.length {
+    pp = fnParent[pp]
+    if pp < 0 || pp >= fnStmts.length { return false }
+    const hit = frameBindingNode(fnStmts[pp], name)
+    if hit >= 0 {
+      const hn = P.nodes[hit]
+      if !(hn is ForRange || hn is ForIn) { return true }
+      if nodeSubtreeHas(hit, fnIx) { return true }
+    }
+    steps = steps + 1
+  }
+  false
 }
 
 function exprIsClosureNoLocal(exprIx: i32, fnIx: i32) {

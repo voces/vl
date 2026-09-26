@@ -110,6 +110,52 @@ export function last2(a: i32): i32 { return a - 1 }
 ];
 const CHAIN_LOGS = "7,3000000000000,4.5,13,10,true,2.5,11,2.5,1000000000000,30,9";
 
+// D2618 (plumb PL-042): an extern taken as a VALUE — in a list beside a local function, bound,
+// passed, returned, stored in a field, and called through each — over params of every scalar
+// and a void result. `b` is PL-042's own witness, widened to one row per delivery position.
+const VALUES: Unit[] = [
+  {
+    name: "a",
+    src: `export function g1(): i32 { return 1 }
+export function add(a: i32, b: i64): i64 { return (a as i64) + b }
+export function half(x: f64): f64 { return x / 2.0 }
+export function neg(b: boolean): boolean { return !b }
+export function say(n: i32) { print(n * 100) }
+`,
+  },
+  {
+    name: "b",
+    src: `extern function g1(): i32
+extern function add(a: i32, b: i64): i64
+extern function half(x: f64): f64
+extern function neg(b: boolean): boolean
+extern function say(n: i32): void
+function h(): i32 { 2 }
+function pick(i: i32): i32 {
+  const fs = [g1, h]
+  fs[i]()
+}
+print(pick(1))
+print(pick(0))
+const f = add
+print(f(3, 4000000000 as i64))
+function apply(k: (f64) => f64, v: f64): f64 { k(v) }
+print(apply(half, 5.0))
+function give(): (boolean) => boolean { neg }
+print(give()(false))
+type Hooks = { out: (i32) => void }
+const hk: Hooks = { out: say }
+hk.out(7)
+const run = () => {
+  const s = say
+  s(8)
+}
+run()
+`,
+  },
+];
+const VALUES_LOGS = "2,1,4000000003,2.5,true,700,800";
+
 const run = async (cmd: string, args: string[]): Promise<void> => {
   const { code, stderr } = await new Deno.Command(cmd, {
     args,
@@ -199,13 +245,23 @@ Deno.test({
 });
 
 Deno.test({
-  name: "extern link: wasm-merge folds the witness and the chain, and -O3 keeps them running",
+  name: "extern link: an extern taken as a value is callable in every position (D2618, V8)",
+  ignore: !ENABLED,
+  fn: () =>
+    withDir(async (dir) => {
+      expectLogs("V8 link", await linkV8(await buildUnits(dir, VALUES)), VALUES_LOGS);
+    }),
+});
+
+Deno.test({
+  name: "extern link: wasm-merge folds the witness, the chain and the values, and -O3 keeps them running",
   ignore: !MERGE,
   fn: () =>
     withDir(async (dir) => {
       for (const [what, units, want] of [
         ["witness", WITNESS, "42,10"],
         ["chain", CHAIN, CHAIN_LOGS],
+        ["values", VALUES, VALUES_LOGS],
       ] as const) {
         const sub = `${dir}/${what}`;
         await Deno.mkdir(sub);
