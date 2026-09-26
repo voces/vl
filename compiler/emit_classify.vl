@@ -1798,6 +1798,14 @@ export function nulVariantIdxOfExpr(exprIx: i32, fnIx: i32) {
   if e is BinExpr {
     const cri = coalesceMvSlot(exprIx, fnIx)
     if cri >= 0 { return mvValVariantOf(cri) }
+    // The index half of `exprNullableVariant`'s `??` rung: the left niche's row.
+    if e.binOp == "??" {
+      if !coalesceResultIsBox(exprIx) {
+        if exprNullableVariant(e.binLeft, fnIx) {
+          return nulVariantIdxOfExpr(e.binLeft, fnIx)
+        }
+      }
+    }
   }
   if e is AsExpr { return nulVariantIndexOf(exprIx) }
   // The index half of the nested-shape field arm — same field, same column, one fact
@@ -27590,6 +27598,17 @@ export function exprNullableVariant(exprIx: i32, fnIx: i32) {
     if exprNullableVariant(nlIfV, fnIx) { return true }
   }
   if e is AsExpr { return retNulVariantFlag(exprIx) == 1 }
+  // The `??` rung its struct twin has: a same-arm `p ?? q` over the niche stays the niche while
+  // its default is nullable, so a box it is delivered into tests it for null (D2373).
+  if e is BinExpr {
+    if e.binOp == "??" {
+      if coalesceMvSlot(exprIx, fnIx) < 0 && !coalesceResultIsBox(exprIx) {
+        if exprNullableVariant(e.binLeft, fnIx) {
+          return coalesceDefaultNullable(e.binRight, fnIx)
+        }
+      }
+    }
+  }
   if e is Call {
     const callee = P.nodes[e.callFn]
     if callee is Ident {
@@ -28350,6 +28369,8 @@ export function exprVariantIndex(exprIx: i32, fnIx: i32) {
     // it, else the right default's. A join to another type is the box and has no row (D2373).
     if e.binOp == "??" {
       if coalesceResultIsBox(exprIx) { return -1 }
+      // A nullable default keeps the result the niche, which no concrete row answers for.
+      if exprNullableVariant(exprIx, fnIx) { return -1 }
       if exprNullableVariant(e.binLeft, fnIx) {
         const lv = nulVariantIdxOfExpr(e.binLeft, fnIx)
         if lv >= 0 { return lv }
@@ -29749,6 +29770,15 @@ export function coalesceResultIsBox(ix: i32): boolean {
   const e = P.nodes[ix]
   if e is BinExpr {
     if e.binOp != "??" { return false }
+    // The arena answers first: a result that is no union, or a one-member niche, renders nothing.
+    let rt = nodeTyPinIxOf(ix)
+    if rt < 0 || rt >= T.tys.length { return false }
+    const rtt = T.tys[rt]
+    if rtt is TyNullable { rt = rtt.nInner }
+    if rt < 0 || rt >= T.tys.length { return false }
+    const rtu = T.tys[rt]
+    if !(rtu is TyUnion) { return false }
+    if rtu.uMembers.length < 2 { return false }
     const jn = coalesceResultUnionName(ix)
     if jn == "" { return false }
     let js = unionMemberSetOf(jn)
