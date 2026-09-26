@@ -503,6 +503,7 @@ import {
   localStructIdx,
   mI32Used,
   mI64Used,
+  mIntMonoArmUsed,
   mUsed,
   mfDstBases,
   mfDstKinds,
@@ -6523,7 +6524,7 @@ export function mvShapeOfValName(valNameIn: string) {
 // The mono map shape of a key rep — `-1`, `-4` or `-6`, named once. A value riding the shared
 // i32 `vals` list interns no slot on any key, so every resolver landing on "mono" still has to
 // say which of the three structs it means.
-function mapMonoShapeOfKey(keyK: i32) {
+export function mapMonoShapeOfKey(keyK: i32) {
   if keyK == MAP_KEY_I32 { return -4 }
   if keyK == MAP_KEY_I64 { return -6 }
   -1
@@ -26013,6 +26014,7 @@ export function scalarTagOf(atom: string) {
 // settled before `emitModule` runs. Conditional rather than a flat 14, since a flat lift
 // would renumber every tag in a program with no `u8[]`, though any base keeps the three bands disjoint.
 export function uAtomBandTop(): i32 {
+  if mIntMonoArmUsed { return 17 }
   if vbV128Used { return 15 }
   if ba8Used { return 14 }
   13
@@ -26031,7 +26033,14 @@ export function refArrSlotTag(slot: i32) {
 // `mvCanonRepOf` first: layout-twin value spellings share one map-struct heap type, so they
 // must share one tag, or an `is` compare would miss its own twin-spelled value.
 export function mapSlotTag(slot: i32) {
-  let s = slot
+  // The integer-keyed mono maps are the other two map structs a slot does not name, so they
+  // tag at codes 15 (i32 key) and 16 (i64 key), which exist only once `mIntMonoArmUsed` lifts
+  // the band; `mapBoxTag` refuses to box one without it. A Set shares its key's map's tag.
+  let s = mapShapeFoldSet(slot)
+  if mIntMonoArmUsed {
+    if s == -4 { return scalarTagOfKind(15) }
+    if s == -6 { return scalarTagOfKind(16) }
+  }
   if s >= 0 { s = mvCanonRepOf(s) }
   uVariants.length + uAtomBandTop() + 4 + s * 3
 }
@@ -26251,7 +26260,11 @@ export function markMapUnionArms(name: string) {
       mUsed = true
       lUsed = true
       aUsed = true
-      mvShapeOfMapName(a)
+      const sh = mvShapeOfMapName(a)
+      if sh < 0 && mapShapeKeyKind(sh) != MAP_KEY_STR {
+        markMapKeyUsed(mapShapeKeyKind(sh))
+        mIntMonoArmUsed = true
+      }
     }
     i = i + 1
   }
@@ -26366,6 +26379,9 @@ function forceCloListTypeOf(t: string) {
 // and carrier compare canonically (`mvCanonRepOf`), so a twin-spelled carrier matches the arm
 // it lowers as. A value matching no arm falls through rather than mis-tag.
 export function unionHasMapArmSlot(name: string, slot: i32) {
+  // A set compares as its key's map (they share one struct); an unsupported shape matches none.
+  if slot == -3 { return false }
+  const want = mapShapeFoldSet(slot)
   // D-UNION: the arm SHAPE test is structural (`unMemIsMap` — a `TyMap` member); the
   // SLOT comparison stays where it is, because a slot is a REP question and
   // `mvSlotOfMapValNameOrMono`/`mvCanonRepOf` already answer it canonically.
@@ -26390,7 +26406,9 @@ export function unionHasMapArmSlot(name: string, slot: i32) {
       } else {
         armSlot = mvSlotOfMapNameTy(a, aVt)
       }
-      if (mvCanonRepOf(armSlot) == mvCanonRepOf(slot)) { return true }
+      if mvCanonRepOf(mapShapeFoldSet(armSlot)) == mvCanonRepOf(want) {
+        return true
+      }
     }
     i = i + 1
   }

@@ -369,6 +369,7 @@ import {
   loopBrkLabel,
   loopContDepth,
   loopContLabel,
+  mIntMonoArmUsed,
   mUsed,
   maFoldScratchBase,
   mapI32Base,
@@ -792,6 +793,7 @@ import {
   localIndexOf,
   localSlotIsLitAtom,
   mapAnnShape,
+  mapMonoShapeOfKey,
   mapReadNarrowableSlot,
   mapReadNarrowedAtomKind,
   mapReadNarrowedContainer,
@@ -2240,9 +2242,7 @@ function isArmTagOfTy(ity: i32): i32 {
   }
   if ak >= 0 { return scalarTagOfKind(ak) }
 
-  if unMemIsMap(ity) {
-    return mapSlotTag(mvSlotOfValTyK(tyMapValOf(ity), tyMapKeyKind(ity)))
-  }
+  if unMemIsMap(ity) { return mapSlotTag(mapArmShapeOfTy(ity)) }
   if unMemIsRefElemArray(ity) {
     const sl = rlSlotOfTy(tyRefArrElemOf(ity))
     if sl >= 0 { return refArrSlotTag(sl) }
@@ -3902,19 +3902,25 @@ function emitRefArrayUnionUnboxRead(body: u8[], name: string, fnIx: i32) {
 
 // Recover the map struct ref a union binding narrowed to a map arm holds (`x[k]` or `x.has(k)`
 // under an `is` guard naming the map arm): push the box, read its `anyref` value (field 1),
-// `ref.cast` to the arm's per-value map struct heap (`mapTypeIdxOf`; the mono `$mStructIdx` for
+// `ref.cast` to the arm's per-value map struct heap (`mapTypeIdxOf`; its key's mono struct for
 // an i32 or atom value). The result is the `(ref $mapStruct)` a bare map binding pushes.
 function emitMapUnionUnboxRead(body: u8[], name: string, fnIx: i32) {
   if emitUnionBoxPush(body, name, fnIx) < 0 { return -1 }
   fbStructGet(uBoxIdx, 1) // 0xfb 0x02 <box ht> field 1: value (anyref)
   // The arm's map-value slot comes from the type the narrowing banked, not from slicing
-  // `{[K]: V}`'s value text out of the rendered arm name. `mvSlotOfTy` answers -1 for an
-  // un-interned value exactly as the name resolver does for a mono or atom-valued map, and
-  // `mapTypeIdxOf(-1)` is that shared `$mStructIdx`, so the two legs agree on the miss too.
-  const armTy = narrowedArmTyOf(name)
-  const slot = mvSlotOfValTyK(tyMapValOf(armTy), tyMapKeyKind(armTy))
-  fbRefCast(mapTypeIdxOf(slot)) // the payload IS the map struct ref
+  // `{[K]: V}`'s value text out of the rendered arm name; a mono value is its key's mono shape.
+  const shape = mapArmShapeOfTy(narrowedArmTyOf(name))
+  fbRefCast(mapTypeIdxOf(shape)) // the payload IS the map struct ref
   0
+}
+
+// The map shape of a map arm's arena type: its value's mv slot, or the mono sentinel of its
+// key rep when the value interns none, so an integer-keyed mono arm names its own struct.
+function mapArmShapeOfTy(armTy: i32): i32 {
+  const ki = tyMapKeyKind(armTy)
+  const slot = mvSlotOfValTyK(tyMapValOf(armTy), ki)
+  if slot == -1 { return mapMonoShapeOfKey(ki) }
+  slot
 }
 
 // An empty `[]` into a union with no `i32[]` arm, built and tagged as the list arm the checker
@@ -4108,6 +4114,19 @@ function cloBoxArmTy(exprIx: i32, unionName: string): i32 {
 // the box, a bare `null` as the null tag over a `ref.null` payload, a raw scalar or string as
 // its atom's tag and payload, an object literal through `emitUnionBox`'s `uDeclared` path.
 
+// The tag a map of shape `sh` is BOXED under. An integer-keyed mono map tags above the
+// value-atom band only in a module whose collect pass saw it as a union arm, so a box built
+// without that mark is refused here rather than tagged into the band below.
+function mapBoxTag(sh: i32): i32 {
+  const s = mapShapeFoldSet(sh)
+  if (s == -4 || s == -6) && !mIntMonoArmUsed {
+    return emitFail(
+      "emitProgram: an integer-keyed map union arm was not collected",
+    )
+  }
+  mapSlotTag(s)
+}
+
 // D1029 — the map arm's re-box: the arm's tag, the map ref, one `struct.new`. Returns 1
 // handled, 0 not a map arm, -1 on error. A value narrowed to the union's map arm reads unboxed
 // in that scope, so delivering it to a destination typed at the union has to put the box back.
@@ -4121,9 +4140,9 @@ function emitUnionMapArmBox(
   if unionName == "" { return 0 }
   if !exprMap(exprIx, fnIx) { return 0 }
   const sh = mapShapeOfExpr(exprIx, fnIx)
-  const tag = mapSlotTag(sh)
-  if tag < 0 { return 0 }
   if !unionHasMapArmSlot(unionName, sh) { return 0 }
+  const tag = mapBoxTag(sh)
+  if tag < 0 { return -1 }
   fbI32Const(tag)
   if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
   fbStructNew(uBoxIdx) // { tag, map struct ref }
@@ -4231,14 +4250,17 @@ export function emitUnionCoerce(
   // atom, so that gate would bail and emit the raw map ref where a `(ref $uBox)` is expected.
   if unionName != "" && exprMap(exprIx, fnIx) {
     let mSlot = mapShapeOfExpr(exprIx, fnIx)
-    if mSlot == -2 {
-      mSlot = -1 // a Set rides the mono map slot
-    }
-    if mSlot >= -1 && unionHasMapArmSlot(unionName, mSlot) {
-      fbI32Const(mapSlotTag(mSlot))
-      if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
-      fbStructNew(uBoxIdx) // { tag, map-struct ref }
-      return 0
+    // A Set rides its key's mono map slot.
+    if mSlot != -3 { mSlot = mapShapeFoldSet(mSlot) }
+    if mSlot >= -1 || mSlot == -4 || mSlot == -6 {
+      if unionHasMapArmSlot(unionName, mSlot) {
+        const mTag = mapBoxTag(mSlot)
+        if mTag < 0 { return -1 }
+        fbI32Const(mTag)
+        if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
+        fbStructNew(uBoxIdx) // { tag, map-struct ref }
+        return 0
+      }
     }
     // A mono litunion-valued map whose union arm registered through a rendered spelling: the
     // checker render widens a litunion map value to `string`, so the arm interned the
