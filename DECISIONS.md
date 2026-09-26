@@ -7893,12 +7893,10 @@ conservative rule is the sound floor it would refine.
   or by a method on a receiver not yet typed, since the re-check at each call's argument types
   decides, and a declared-type read settled earlier would reach it against types it never saw.
   A map's `set` ends a narrowing of the key it writes, like `m[k] = v`; `push` ends none.
-* *A call to a `const`-bound lambda that writes no place is a call to its body* for the path
-  rule, so it ends nothing: the body assigns only bare names and calls only intrinsics that
-  remove nothing and take no function. Any other lambda stays opaque, because the write
-  summaries miss a write through an alias of a captured object or through a callee it is
-  handed to (D2461). Handing the narrowed value itself to a callee ends nothing, since the
-  callee holds the value, not the place.
+* *A call to a `const`-bound lambda is a call to its body* for the path rule, since the write
+  shapes below see a write through an alias of a captured object (D2461; #3150 kept such a
+  lambda opaque unless it wrote no place). Handing the narrowed value itself to a callee ends
+  nothing, since the callee holds the value, not the place.
 * *A declared operator is a call* for the path rule too (D2400): its operands are its arguments,
   the declaration is the one the checker resolved (every declaration of the operator where
   none is resolved yet), and an operator closure field is opaque, as a call through a closure
@@ -7916,9 +7914,47 @@ conservative rule is the sound floor it would refine.
   and so does one handed to a declared function whose body only ever calls that parameter, when
   the call reaches no writer (`callMayWrite` on the call itself). Otherwise the body reads the
   declared type. A clone a generic's instance makes of the lambda answers what it did. A path a nested function read under the
-  narrowing makes a later writing call in the same function refused; a path captured by a
-  closure that escapes is D2407, which needs a ruling on whether path narrowings reach nested
-  functions at all.
+  narrowing makes a later writing call in the same function refused; a closure that escapes
+  reads the path at its declared type (D2407, below). A declared function that hands the
+  callback on to another that only calls it counts as only calling it.
+
+**AN ESCAPING CLOSURE LOSES WHAT IT CAPTURED (owner ruling (a), 2026-09-25 — D2407, D2462).** A
+closure that escapes the function making it — returned, stored in a field, list, map or global,
+assigned to another binding, or handed to a callee not known to only call it — reads every
+captured field, element and map-value path at its declared type, and every captured bare name
+that is assigned anywhere (a `const`, or a `let` never assigned, cannot change and keeps its
+narrowing). A closure used only by its handle in the body that makes it, or run as a callback
+inside the call it is handed to, keeps the narrowing under D2402's per-call check. The reason is
+the one D2402 gives for a bare name, made unconditional: a path can be written by any holder of
+the object, after the function that made the closure has returned, so no analysis of that
+function bounds it. A re-test inside the closure narrows again. **The owner's ideal is smarter**
+("if we know `o.v = null` doesn't happen then it's fine"): keep the narrowing when no write of
+the path can run before the closure does. That is flow analysis over every holder of the object,
+the same machinery as A6c's, and is deferred with it; the loss is the sound floor it would
+refine.
+
+**THE WRITE SHAPES (D2461, D2471, D2472, D2473).** A path's writers are found by what a write
+REPLACES, not the name it is spelled through. `fnWriteShapes` summarises a function as the fields
+it may store (`.f`), the cells it may store (`[k]` under a literal key, `[]` any) and the map cells
+it may remove (`-[k]`, `-[]`), each cell shape tagged with its container's kind and element type,
+plus the free names it may rebind (`=g`). It folds in every callee and operator declaration. A
+call of the function's own parameter `i` is `@i`, and each call site charges what its argument
+there writes, so a read-only callback keeps a narrowing and a writing one ends it wherever the
+call to it sits; inside a recursion cycle, every function value an edge hands on is charged, since
+the cycle may call it in any slot; any other unknown callee is opaque. A call ends a narrowing of a path when a
+shape hits a step of it. So a write through a second parameter, a `const` copy, a list holding the
+object, a module binding, an argument or a receiver is seen without being named: any object of
+that shape reachable to the callee is assumed to be the narrowed one. The refinements that keep
+it from refusing what cannot change: a cell shape hits only a container of the same kind whose
+element type one of them is assignable to; a write one step below a `const` the function built
+itself is left out; a store into the path's own last step is harmless when that place stores
+exactly the narrowed type. A field shape is scoped only by name, and that is not a shortcut:
+width subtyping lets a `{ x, y }` record be passed where a `{ x }` is expected, so a callee's
+`q.x = null` may be the caller's `p.x`. Built-in methods read one effect column
+(`builtinMethodEffect`), applied only when the receiver's type has that built-in: an append
+(`push`, `add`) replaces no held cell; a list's `pop` and `clear` and a map's `set` and `delete`
+may. A method a record declares, and a std function reached by the method spelling, is
+summarised from its body.
 
 Whether a declared operator may have side effects beyond its operands at all was floated by the
 owner, not decided (ROADMAP, "Narrowing invalidation across calls").
