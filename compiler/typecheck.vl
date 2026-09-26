@@ -29419,7 +29419,13 @@ function validateLetCstrs(
 
 // A deferred `.push(null)` whose receiver pins to an open list: the list's element takes the
 // open `_ | null` a bare-null write mints at a direct spelling, so the caller's writes fill it.
-function cnhPinBmElem(want: i32, bNames: string[], bTys: i32[], at: i32) {
+function cnhPinBmElem(
+  want: i32,
+  bNames: string[],
+  bTys: i32[],
+  at: i32,
+  got: i32,
+) {
   const row = hdRowOf(want)
   if row < 0 || row >= hdKind.length { return 0 }
   if hdKind[row] != HD_ELEM { return 0 }
@@ -29428,8 +29434,37 @@ function cnhPinBmElem(want: i32, bNames: string[], bTys: i32[], at: i32) {
   const a = T.tys[arr]
   if a is TyArray {
     if a.aElem < 0 {
-      a.aElem = cnhPinTy(TY_NULL, at, -1, false, false)
+      // An open hole pushed adopts that hole, as the direct spelling's pin does.
+      let pin = got
+      if isNullTy(got) { pin = cnhPinTy(TY_NULL, at, -1, false, false) }
+      a.aElem = pin
       tyMutEpoch = tyMutEpoch + 1 // a hole body's bare-null push pinned the argument in place
+    }
+  }
+  0
+}
+
+// A hole body's store of `val` into slot `slot`, re-asked at a call's argument types: two open
+// null holes link, and an open one takes the other side's `T`, as the direct spelling's store
+// does (`cnhFill`) — so the call sites' later writes see one type, not two (D2506).
+function nhUnifyAtPin(slot: i32, val: i32) {
+  if slot < 0 || val < 0 { return 0 }
+  const so = nhOpen(slot)
+  const vo = nhOpen(val)
+  if so && vo { return nhLink(slot, val) }
+  if so {
+    let inner = val
+    const v = T.tys[val]
+    if v is TyNullable { inner = v.nInner }
+    if inner < 0 || isNullTy(inner) || tyHasHole(inner) { return 0 }
+    return nhFillLinked(slot, widenLitTy(inner))
+  }
+  if vo {
+    const st = T.tys[slot]
+    if st is TyNullable {
+      if st.nInner >= 0 && !tyHasHole(st.nInner) {
+        return nhFillLinked(val, st.nInner)
+      }
     }
   }
   0
@@ -29451,8 +29486,13 @@ function validateBmCstrs(
   while ci < nOrigB {
     if cstrOwnedBy(bmCstrFn[ci], calleeFn) {
       const bg = substTyDeep(bmCstrGot[ci], bNames, bTys)
-      if isNullTy(bg) { cnhPinBmElem(bmCstrWant[ci], bNames, bTys, ix) }
+      if isNullTy(bg) || nhOpen(bg) {
+        cnhPinBmElem(bmCstrWant[ci], bNames, bTys, ix, bg)
+      }
       const bw = substTyDeep(bmCstrWant[ci], bNames, bTys)
+      if bmCstrForm[ci] == BM_PUSH || bmCstrForm[ci] == BM_SETVAL {
+        nhUnifyAtPin(bw, bg)
+      }
       let bc = bmCstrCtx[ci]
       if bc >= 0 { bc = substTyDeep(bc, bNames, bTys) }
       // Re-records only when the callee is named — an unnamed call cannot reassign
