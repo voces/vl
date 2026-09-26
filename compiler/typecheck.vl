@@ -18619,7 +18619,7 @@ export function nodeScalarBaseIs(ix: i32, nm: PrimName): boolean {
 }
 
 // The value-atom kind of the non-null member of a `<numeric scalar> | null` arena type — `0`
-// i32, `3` i64, `4` f64, `5` f32 — else -1. Only these four reps have every bit pattern
+// i32, `3` i64, `4` f64, `5` f32, `14` v128 — else -1. Only these reps have every bit pattern
 // already taken by a real value (unlike `boolean`/`string`/litunion/struct, each of which
 // has a spare bit or its own niche), so `i32 | null` is the box. A plain `TyPrim` inner only.
 export function tyNulNumScalarValKind(ty: i32): i32 {
@@ -18645,7 +18645,10 @@ export function tyNulNumScalarValKind(ty: i32): i32 {
         "f32" => {
           return 5
         }
-        "boolean" | "string" | "void" | "null" | "never" | "u8" | "v128" => {
+        "v128" => {
+          return 14
+        }
+        "boolean" | "string" | "void" | "null" | "never" | "u8" => {
           // Not a boxed nullable numeric scalar; the outer `-1` stands.
         }
       }
@@ -18674,6 +18677,7 @@ export function nulNumScalarUnionName(ty: i32): string {
   if k == 3 { return "i64|null" }
   if k == 4 { return "f64|null" }
   if k == 5 { return "f32|null" }
+  if k == 14 { return "v128|null" }
   ""
 }
 
@@ -20251,7 +20255,9 @@ export function eqRefusals(
   let vecTy = -1
   if primNameOf(lt) == "v128" { vecTy = lt }
   if primNameOf(rt) == "v128" { vecTy = rt }
-  // A null test compares no lanes; whatever makes a vector nullable is refused on its own.
+  // Two operands that may each hold a vector (`v128 | null`, `v128 | i32`) may compare two.
+  if vecTy < 0 && tyHasV128Member(lt) && tyHasV128Member(rt) { vecTy = lt }
+  // A null test compares no lanes.
   if isNullTy(lt) || isNullTy(rt) { vecTy = -1 }
   if vecTy >= 0 {
     msgs.push(
@@ -38753,9 +38759,9 @@ let v128Seen = false
 // The container types `v128NestCheck` already reported, so one type is refused once.
 let v128NestReported: i32[] = []
 
-// A v128 vector lives in locals, parameters, returns and globals; a container holding one — an
-// array element, a struct field, a map key or value, a nullable or a union member — has no
-// lowering yet, so the first node typed with such a container is refused here, before emission.
+// A v128 vector lives in locals, parameters, returns and globals, and boxed as a nullable or
+// union member; a container holding one bare — an array element, a struct field, a map key or
+// value — has no lowering yet, so the first node typed with one is refused here, before emission.
 function v128NestCheck(ix: i32, t: i32) {
   if ix < 0 || t < 0 { return 0 }
   if !tyNestsV128(t, 8) { return 0 }
@@ -38769,10 +38775,68 @@ function v128NestCheck(ix: i32, t: i32) {
   0
 }
 
+// Whether `t`, or a member within `d` levels, is a nullable or union boxing a bare vector.
+function tyBoxesV128(t: i32, d: i32): boolean {
+  if t < 0 || d <= 0 { return false }
+  if tyHasV128Member(t) { return true }
+  const tt = T.tys[t]
+  match tt {
+    TyArray => {
+      return tyBoxesV128(tt.aElem, d - 1)
+    }
+    TyNullable => {
+      return tyBoxesV128(tt.nInner, d - 1)
+    }
+    TyMap => {
+      return tyBoxesV128(tt.mVal, d - 1)
+    }
+    TyObj => {
+      let i = 0
+      while i < tt.objFieldTypes.length {
+        if tyBoxesV128(tt.objFieldTypes[i], d - 1) { return true }
+        i = i + 1
+      }
+    }
+    TyUnion => {
+      let j = 0
+      while j < tt.uMembers.length {
+        if tyBoxesV128(tt.uMembers[j], d - 1) { return true }
+        j = j + 1
+      }
+    }
+    TyPrim | TyFunc | TyVar | TyLit | TyErr | TyNeg => {
+      // No member a vector could be boxed in (a function value is D1982's).
+    }
+  }
+  false
+}
+
+// Whether `t` is a nullable or union with a bare vector member, which boxes that vector.
+function tyHasV128Member(t: i32): boolean {
+  if t < 0 { return false }
+  const tt = T.tys[t]
+  match tt {
+    TyNullable => {
+      return primNameOf(tt.nInner) == "v128"
+    }
+    TyUnion => {
+      let i = 0
+      while i < tt.uMembers.length {
+        if primNameOf(tt.uMembers[i]) == "v128" { return true }
+        i = i + 1
+      }
+    }
+    TyPrim | TyFunc | TyObj | TyArray | TyMap | TyVar | TyLit | TyErr | TyNeg => {
+      // Not a box: a bare vector, or a container `v128NestCheck` answers for.
+    }
+  }
+  false
+}
+
 // The container-of-vector refusal, one wording for the direct site and the generic pin.
 function v128NestMsg(t: i32): string {
   tyToStr(t)
-    + " holds a 128-bit vector inside an array, struct field, map, nullable or union, which has no lowering yet — keep the vector in a local, parameter, return or global, or store its lanes to a `Buf`"
+    + " holds a 128-bit vector inside an array, struct field or map, which has no lowering yet — keep the vector in a local, parameter, return or global, or in a `v128 | null`, or store its lanes to a `Buf`"
 }
 
 // A generic body's container over a type parameter (`[x, x]` at `x: T`) has no vector in it
@@ -38831,6 +38895,18 @@ function validateNestCstrs(
         }
         tErrUnsupported(pWho + v128NestMsg(ct), ix)
         return 0
+      } else if tyBoxesV128(ct, 8) {
+        // A generic body's `T | null` or union has no instance at a vector yet (D2634).
+        let bWho = "a type parameter"
+        if who != "" { bWho = "`" + who + "`'s type parameter" }
+        tErrUnsupported(
+          tyToStr(ct)
+            + " boxes "
+            + bWho
+            + " bound to a 128-bit vector, which a generic body has no lowering for yet — write the `v128 | null` spelling outside the generic function",
+          ix,
+        )
+        return 0
       }
     }
     ci = ci + 1
@@ -38843,7 +38919,9 @@ function tyNestsV128(t: i32, d: i32): boolean {
   if t < 0 || d <= 0 { return false }
   const tt = T.tys[t]
   if tt is TyArray { return tyIsOrNestsV128(tt.aElem, d - 1) }
-  if tt is TyNullable { return tyIsOrNestsV128(tt.nInner, d - 1) }
+  // A nullable or union member is boxed, so a bare vector there is not nested; one inside
+  // a container member still is.
+  if tt is TyNullable { return tyNestsV128(tt.nInner, d - 1) }
   if tt is TyMap {
     if tyIsOrNestsV128(tt.mKey, d - 1) { return true }
     return tyIsOrNestsV128(tt.mVal, d - 1)
@@ -38859,7 +38937,7 @@ function tyNestsV128(t: i32, d: i32): boolean {
   if tt is TyUnion {
     let j = 0
     while j < tt.uMembers.length {
-      if tyIsOrNestsV128(tt.uMembers[j], d - 1) { return true }
+      if tyNestsV128(tt.uMembers[j], d - 1) { return true }
       j = j + 1
     }
     return false
@@ -39467,7 +39545,11 @@ function valueUnionFromAtomKinds(kinds: i32[]) {
   }
   if nonNull >= 2 { return true }
   if nonNull == 1 && hasNull {
-    return soloKind == 0 || soloKind == 3 || soloKind == 4 || soloKind == 5
+    return soloKind == 0
+      || soloKind == 3
+      || soloKind == 4
+      || soloKind == 5
+      || soloKind == 14
   }
   false
 }
@@ -42972,7 +43054,13 @@ export function nodeTyIsUnionAlias(ix: i32) {
       const it = T.tys[inner]
       if it is TyPrim {
         const pn = it.primName
-        if pn == "i32" || pn == "f64" || pn == "i64" || pn == "f32" {
+        if (
+          pn == "i32"
+          || pn == "f64"
+          || pn == "i64"
+          || pn == "f32"
+          || pn == "v128"
+        ) {
           return true
         }
       }
@@ -44694,6 +44782,8 @@ export function valueAtomKind(name: string) {
   if name == "f64" { return 4 }
   if name == "f32" { return 5 }
   if name == "null" { return 6 }
+  // Appended: codes double as tag offsets, so the vector takes the next free one.
+  if name == "v128" { return 14 }
   // A list member of a value union (`i32[] | string`) is a ref atom — the union box's `value`
   // field holds the wrapper ref directly, so each list type needs its own distinct tag code.
   const elem = arrElemNameRaw(name)
@@ -44736,6 +44826,7 @@ export function valueRowKind(ty: i32): i32 {
     if pn == "f64" { return 4 }
     if pn == "f32" { return 5 }
     if pn == "null" { return 6 }
+    if pn == "v128" { return 14 }
     return -1 // void / never — not a value atom
   }
   // A closure member rides the box's anyref `value` directly (kind 11).
@@ -44834,7 +44925,13 @@ function valueUnionVerdict(ms: i32[], nullSeen: boolean): i32 {
   if nonNull >= 2 { return 1 }
   if nonNull == 1 && hasNull {
     // Only a numeric scalar boxes with null; boolean|null / string|null are niches.
-    if soloKind == 0 || soloKind == 3 || soloKind == 4 || soloKind == 5 {
+    if (
+      soloKind == 0
+      || soloKind == 3
+      || soloKind == 4
+      || soloKind == 5
+      || soloKind == 14
+    ) {
       return 1
     }
     return 0
@@ -44854,6 +44951,7 @@ function valueAtomKindSpan(name: string, from: i32, to: i32): i32 {
   if spanEqAt(name, from, to, "f64") { return 4 }
   if spanEqAt(name, from, to, "f32") { return 5 }
   if spanEqAt(name, from, to, "null") { return 6 }
+  if spanEqAt(name, from, to, "v128") { return 14 }
   -2
 }
 
@@ -44887,7 +44985,11 @@ export function isValueUnionName(name: string) {
   }
   if nonNull >= 2 { return true }
   if nonNull == 1 && hasNull {
-    return soloKind == 0 || soloKind == 3 || soloKind == 4 || soloKind == 5
+    return soloKind == 0
+      || soloKind == 3
+      || soloKind == 4
+      || soloKind == 5
+      || soloKind == 14
   }
   false
 }
