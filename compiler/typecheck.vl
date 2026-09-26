@@ -1318,19 +1318,146 @@ function nameInList(names: string[], name: string) {
   false
 }
 
-// The bank slot of the live guard-kind narrowing of `name`, or -1. Retirement writes through
-// this slot, so it must find exactly the entry `narDeclaredTy` reads.
+// The bank slot of the live guard or post-guard narrowing of `name`, or -1: the narrowings under
+// which a write the declaration admits is accepted and re-narrows the name.
 function narGuardSlot(name: string) {
   const d = lookupDepth(name)
   if d < 0 { return -1 }
   let i = asgDeclKeys.length - 1
   while i >= 0 {
     if asgDeclKeys[i] == name && asgDeclDepths[i] == d {
-      if asgDeclKinds[i] == NAR_KIND_GUARD { return i }
+      const k = asgDeclKinds[i]
+      if k == NAR_KIND_GUARD || k == NAR_KIND_POSTGUARD { return i }
     }
     i = i - 1
   }
   -1
+}
+
+// The type a write to the guard-narrowed name `name` is checked against: the widest layer of its
+// narrowing chain in the current function. A loop barrier caps it at the type the name had when
+// the loop began, since the reads before the write run again; -1 when every layer is outside it.
+function narWriteStorage(name: string): i32 {
+  const ds = scopeDepthsOf[name]
+  if ds == null { return -1 }
+  const base = crFnBase()
+  let bar = 0
+  if reScopeBases.length > 0 { bar = reScopeBases[reScopeBases.length - 1] }
+  let widest = -1
+  let j = ds.length - 1
+  while j >= 0 {
+    const d = ds[j]
+    if d < base { return widest }
+    const e = crFirstBank(name, d)
+    if e < 0 { return widest }
+    if d < bar {
+      if widest < 0 { return -1 }
+      return T.scopes[d][name] ?? -1
+    }
+    widest = asgDeclTys[e]
+    j = j - 1
+  }
+  widest
+}
+
+// Retire in place every narrowing layer of `name` in the current function, inside the loop
+// barrier, that does not admit `now`, the type the write left it at: each reads `store` after.
+function narRetireLayers(name: string, now: i32, store: i32) {
+  const ds = scopeDepthsOf[name]
+  if ds == null { return 0 }
+  const base = crFnBase()
+  let bar = 0
+  if reScopeBases.length > 0 { bar = reScopeBases[reScopeBases.length - 1] }
+  let j = ds.length - 1
+  while j >= 0 {
+    const d = ds[j]
+    if d < base || d < bar || crFirstBank(name, d) < 0 { return 0 }
+    const t = T.scopes[d][name] ?? -1
+    if t >= 0 && !assignable(now, t) { T.scopes[d][name] = store }
+    j = j - 1
+  }
+  0
+}
+
+// The type the write at assignment `atIx` stores, for re-narrowing: a literal's own type when the
+// declaration is a literal union, whose members are literals, else `rt`.
+function asgLitRhsTy(atIx: i32, dcl: i32, rt: i32): i32 {
+  if !isLitBearing(dcl) { return rt }
+  const an = P.nodes[atIx]
+  if an is BinExpr {
+    if an.binOp == "=" {
+      const lt = litTyOfExpr(an.binRight)
+      if lt >= 0 { return lt }
+    }
+  }
+  rt
+}
+
+// The type a write of a value typed `rt` leaves a narrowed name at: the member of `store` it
+// re-narrows to, or `pre`, what the name held, when the write names no single member and `pre`
+// admits it. `store` when neither holds.
+function writeNarrowAfter(store: i32, pre: i32, rt: i32): i32 {
+  const rn = writeMemberTy(store, rt)
+  if rn == store && rt >= 0 && pre >= 0 && writeLandsWithin(store, rt, pre) {
+    return pre
+  }
+  rn
+}
+
+// Bare names a write under a guard stored into, with the scope depth their binding reads at:
+// their storage may hold `null` again, so a null test of them is a real question, as it is for
+// an assignment's narrowing. Unwound with the scope.
+let narWrNames: string[] = []
+let narWrDepths: i32[] = []
+
+function narWrittenName(name: string): boolean {
+  const d = lookupDepth(name)
+  if d < 0 { return false }
+  let i = narWrNames.length - 1
+  while i >= 0 {
+    if narWrDepths[i] == d && narWrNames[i] == name { return true }
+    i = i - 1
+  }
+  false
+}
+
+// Whether a write under a narrowing stored into the place keyed `key` in a scope still open.
+function narWrittenPath(key: string): boolean {
+  if key == "" { return false }
+  let i = narWrNames.length - 1
+  while i >= 0 {
+    if narWrNames[i] == key { return true }
+    i = i - 1
+  }
+  false
+}
+
+// Record that a write under a guard stored into `name` (`narWrittenName`).
+function narNoteWritten(name: string) {
+  const d = lookupDepth(name)
+  if d < 0 || narWrittenName(name) { return 0 }
+  narWrNames.push(name)
+  narWrDepths.push(d)
+  0
+}
+
+// Drop the records of the scope at depth `d`, which is closing.
+function narWrPopTo(d: i32) {
+  let i = 0
+  let k = 0
+  while i < narWrNames.length {
+    if narWrDepths[i] < d {
+      narWrNames[k] = narWrNames[i]
+      narWrDepths[k] = narWrDepths[i]
+      k = k + 1
+    }
+    i = i + 1
+  }
+  while narWrNames.length > k {
+    narWrNames.pop()
+    narWrDepths.pop()
+  }
+  0
 }
 
 // Bank `name`'s declared type before a narrowing shadows it, at the scope depth the shadowing
@@ -1376,8 +1503,11 @@ function coalNarrowedPlace(ix: i32) {
 // legality question, and nothing else.
 function isAsgNarrowedName(ix: i32) {
   const n = P.nodes[ix]
-  if n is Ident { return asgDeclaredTy(n.identName) >= 0 }
-  false
+  if n is Ident {
+    return asgDeclaredTy(n.identName) >= 0 || narWrittenName(n.identName)
+  }
+  // A field or cell keys by its path; any other node keys "", which no write recorded.
+  narWrittenPath(placeKeyOf(ix))
 }
 
 // Inferred type-guard functions: a named function whose body is exactly
@@ -3291,6 +3421,7 @@ let isParentElseTyIx: i32[] = []
 // narrowing, the type the bare name reads at afterwards. Keyed by the assignment node, sized
 // with `isVarTyIx`, read through `asgNarTyIxOf`; -1 means the read is at the declared type.
 let asgNarTyIx: i32[] = []
+let asgKeepNarrow: {[i32]: boolean} = Map()
 // The length the four sidecars above present to a bounded write: the arena as `checkProgram`
 // found it, and for `isVarTyIx` also past any row a monomorphized clone banked. The columns
 // themselves hold only up to the last row written, since almost every node reads -1 (D2319).
@@ -4246,6 +4377,7 @@ export function initChecker() {
   optCallRetName = []
   isVarTyIx = []
   asgNarTyIx = []
+  asgKeepNarrow = Map()
   isTyColCap = 0
   isVarTyIxCap = 0
   pgVoid = []
@@ -4419,6 +4551,8 @@ export function initChecker() {
   asgDeclKinds = []
   asgDeclEpochs = []
   asgDeclFrames = []
+  narWrNames = []
+  narWrDepths = []
   narFnEpoch = 0
   crReset()
   reScopeBases = []
@@ -6885,8 +7019,12 @@ function npInsideBarrier(npIx: i32) {
 function writeBarredByLoop(ix: i32) {
   const n = P.nodes[ix]
   if n is Ident {
-    if narDeclaredTy(n.identName, NAR_KIND_GUARD) < 0 { return false }
-    return !narInsideBarrier(lookupDepth(n.identName))
+    if narGuardSlot(n.identName) < 0 { return false }
+    if !narInsideBarrier(lookupDepth(n.identName)) { return true }
+    // A layer inside the loop over one outside it: the loop's entry type is what refused.
+    const w = narWriteStorage(n.identName)
+    const depths: i32[] = []
+    return w >= 0 && w != crChainWidest(n.identName, depths)
   }
   if n is Member || n is Index {
     const key = placeKeyOf(ix)
@@ -6922,16 +7060,10 @@ function writeBarredErr(place: string, at: i32) {
 function writeStorageTy(ix: i32) {
   const n = P.nodes[ix]
   if n is Ident {
-    // An assignment narrowing's null write is accepted today, barrier or not — and
-    // `let x: i32 | null = null` / `x = 5` / `while c { use(x)   x = null }` is a correct program
-    // for a single-iteration loop, so barring it would newly reject working code. Only the
-    // guard-kind acceptance is bounded.
-    const gSlot = narGuardSlot(n.identName)
-    if gSlot >= 0 {
-      if asgDeclEpochs[gSlot] != narFnEpoch { return -1 }
-      if !narInsideBarrier(lookupDepth(n.identName)) { return -1 }
-      return asgDeclTys[gSlot]
-    }
+    // A guard's write is bounded by a loop barrier, and a nested function that captured the
+    // narrowing is checked at each call instead (D2402). An assignment narrowing's is not: its
+    // null write in a single-iteration loop is a correct program barring would reject.
+    if narGuardSlot(n.identName) >= 0 { return narWriteStorage(n.identName) }
     return narDeclaredTy(n.identName, NAR_KIND_ASG)
   }
   if n is Member {
@@ -6960,6 +7092,119 @@ function writeStorageTy(ix: i32) {
     if slot < 0 { return -1 }
     if npEpochs[slot] != narFnEpoch { return -1 }
     if !npInsideBarrier(slot) { return -1 }
+    const noNames: string[] = []
+    const noTys: i32[] = []
+    return placeCellStoreTy(placeCurTy(n.idxArr, noNames, noTys))
+  }
+  -1
+}
+
+// Whether a write of a value typed `rt` to the place at `tgtIx` would leave the narrowing it held
+// when an enclosing loop began, where the loop cannot re-read it: a write the declaration admits
+// still has to land within that narrowing, since the reads before it run again (D2609).
+function writeLeavesLoopEntry(tgtIx: i32, rt: i32): boolean {
+  if rt < 0 { return false }
+  const n = P.nodes[tgtIx]
+  if n is Ident {
+    if narGuardSlot(n.identName) < 0 { return false }
+    const cap = narWriteStorage(n.identName)
+    const depths: i32[] = []
+    const wide = crChainWidest(n.identName, depths)
+    if cap < 0 || wide < 0 || tySame(cap, wide) { return false }
+    return !writeLandsWithin(wide, rt, cap)
+  }
+  // A field or cell answers by its path's narrowing; any other target keys "" and has none.
+  pathWriteLeavesLoopEntry(tgtIx, rt)
+}
+
+// `writeLeavesLoopEntry` for a field or cell narrowed outside the innermost loop.
+function pathWriteLeavesLoopEntry(tgtIx: i32, rt: i32): boolean {
+  const key = placeKeyOf(tgtIx)
+  if key == "" { return false }
+  const slot = narrowedPathIx(key)
+  if slot < 0 || slot >= npKeys.length { return false }
+  if npInvBy[slot] >= 0 || npInsideBarrier(slot) { return false }
+  const store = placeStoreTy(tgtIx)
+  if store < 0 { return false }
+  !writeLandsWithin(store, rt, npTys[slot])
+}
+
+// Whether a value typed `rt` written into storage `store` lands on a member `cap` holds: each
+// member of a union value lands where it would alone, and `null` needs `cap` to admit it.
+function writeLandsWithin(store: i32, rt: i32, cap: i32): boolean {
+  const rT = T.tys[rt]
+  if rT is TyUnion {
+    let k = 0
+    while k < rT.uMembers.length {
+      if !writeLandsWithin(store, rT.uMembers[k], cap) { return false }
+      k = k + 1
+    }
+    return true
+  }
+  if isNullTy(rt) { return tyAdmitsNull(cap) }
+  if rT is TyNullable {
+    if !tyAdmitsNull(cap) || rT.nInner < 0 { return false }
+    return writeLandsWithin(store, rT.nInner, cap)
+  }
+  const m = writeMemberTy(store, rt)
+  if m == store { return assignable(rt, cap) }
+  tyMemberWithin(m, cap)
+}
+
+// Whether `m` is `cap` or one of its members.
+function tyMemberWithin(m: i32, cap: i32): boolean {
+  if m < 0 || cap < 0 { return false }
+  if tySame(m, cap) { return true }
+  let c = cap
+  const ct = T.tys[cap]
+  if ct is TyNullable {
+    if ct.nInner < 0 { return false }
+    if tySame(m, ct.nInner) { return true }
+    c = ct.nInner
+  }
+  const cu = T.tys[c]
+  if cu is TyUnion {
+    let i = 0
+    while i < cu.uMembers.length {
+      if tySame(m, cu.uMembers[i]) { return true }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// Whether `ix` is a cell of a map, `m[k]`.
+function placeIsMapCell(ix: i32): boolean {
+  const n = P.nodes[ix]
+  if n is Index {
+    const noNames: string[] = []
+    const noTys: i32[] = []
+    const rt = placeCurTy(n.idxArr, noNames, noTys)
+    if rt >= 0 {
+      const nt = nonNullTy(rt)
+      if nt >= 0 { return T.tys[nt] is TyMap }
+    }
+  }
+  false
+}
+
+// The declared type of the field or cell at `ix`, whatever narrowing or loop covers it; -1 for
+// any other node.
+function placeStoreTy(ix: i32): i32 {
+  const n = P.nodes[ix]
+  if n is Member {
+    const noNames: string[] = []
+    const noTys: i32[] = []
+    return placeFieldTy(placeCurTy(n.memObj, noNames, noTys), n.memProp, false)
+  }
+  // A cell's declared type is its container's element; any other node has none.
+  placeCellDeclTy(ix)
+}
+
+// The declared element type of the cell at `ix`, or -1 when `ix` is no cell.
+function placeCellDeclTy(ix: i32): i32 {
+  const n = P.nodes[ix]
+  if n is Index {
     const noNames: string[] = []
     const noTys: i32[] = []
     return placeCellStoreTy(placeCurTy(n.idxArr, noNames, noTys))
@@ -7246,7 +7491,8 @@ function objTysMayAlias(a: i32, b: i32): boolean {
 // shadowing entry, which would unwind at the end of whatever inner block holds the write and
 // resurrect the narrowing for the statements after it. A property path is marked in `npInvBy`; a
 // bare name's narrowing is a shadowing `declare`, so retiring it writes the declared type back.
-function retireNarrowingsForWrite(tgtIx: i32, rt: i32, atIx: i32) {
+function retireNarrowingsForWrite(tgtIx: i32, rt0: i32, atIx: i32) {
+  let rt = rt0
   const tgtKey = placeKeyOf(tgtIx)
   retireAliasedNarrowings(tgtIx, tgtKey, rt, atIx)
   // A variable-index write names no cell and therefore may have hit any of them. `xs[i] = null`
@@ -7276,6 +7522,16 @@ function retireNarrowingsForWrite(tgtIx: i32, rt: i32, atIx: i32) {
       prePathTy = npTys[preSlot]
     }
   }
+  // A literal stored into a literal union re-narrows by its own type, as for a bare name; and
+  // the storage may hold `null` again, so a null test of the place is a real question.
+  if preSlot >= 0 {
+    const pst = placeStoreTy(tgtIx)
+    rt = asgLitRhsTy(atIx, pst, rt)
+    if tyAdmitsNull(pst) && !narWrittenPath(tgtKey) {
+      narWrNames.push(tgtKey)
+      narWrDepths.push(T.scopes.length - 1)
+    }
+  }
   let i = 0
   // The member the write re-narrows `tgtKey` to, or -1 when it names none. Pushed after the
   // walk below rather than inside it: a fresh entry would be re-tested by the same loop.
@@ -7286,7 +7542,16 @@ function retireNarrowingsForWrite(tgtIx: i32, rt: i32, atIx: i32) {
     // legible: `w.f = mk()` is one statement whose right-hand side is checked first, so an opaque
     // `mk` marks the path and the write would otherwise be reported as the call's. The cause is
     // what `pathRetiredByAssign` reads to decide whether the emitter can see the retirement.
-    if writeRetiresNarrowing(tgtKey, rt, npKeys[i], npTys[i]) {
+    let hit = writeRetiresNarrowing(tgtKey, rt, npKeys[i], npTys[i])
+    // A write the narrowing admits still re-narrows the place to the member it stored, as it
+    // does a bare name (`5` into an `f64` arm of `i32 | f64`).
+    if !hit && npInvBy[i] < 0 && npKeys[i] == tgtKey {
+      const pd = writeStorageTy(tgtIx)
+      if pd >= 0 && !tySame(writeNarrowAfter(pd, npTys[i], rt), npTys[i]) {
+        hit = true
+      }
+    }
+    if hit {
       npInvBy[i] = atIx
       // The target's OWN narrowing going is what the emitter has to mirror; a path below it
       // goes through the prefix rule both sides already apply. Reads-only narrowing states one
@@ -7294,10 +7559,13 @@ function retireNarrowingsForWrite(tgtIx: i32, rt: i32, atIx: i32) {
       // name does, and reads at its declaration when the write names none (D1736, D1847).
       if npKeys[i] == tgtKey {
         pathRetired = true
-        const pdcl = writeStorageTy(tgtIx)
-        const prn = writeReNarrowTy(pdcl, rt)
+        let pdcl = writeStorageTy(tgtIx)
+        if pdcl < 0 { pdcl = placeStoreTy(tgtIx) }
+        const prn = writeMemberTy(pdcl, rt)
         recordAsgNarTyIx(atIx, prn)
-        if prn != pdcl { pathReTy = prn }
+        // A map cell reads `T | null` at its declaration, since a read may miss; the write just
+        // stored the key, so the reads after it hold the stored type.
+        if prn != pdcl || placeIsMapCell(tgtIx) { pathReTy = prn }
       }
     }
     i = i + 1
@@ -7318,6 +7586,7 @@ function retireNarrowingsForWrite(tgtIx: i32, rt: i32, atIx: i32) {
     if endTy < 0 {
       if pathRetired {
         endTy = writeStorageTy(tgtIx)
+        if endTy < 0 { endTy = placeStoreTy(tgtIx) }
       } else {
         endTy = writeReNarrowTy(prePathTy, rt)
       }
@@ -7334,15 +7603,30 @@ function retireNarrowingsForWrite(tgtIx: i32, rt: i32, atIx: i32) {
   const tn = P.nodes[tgtIx]
   if tn is Ident {
     const nm = tn.identName
-    const dcl = narDeclaredTy(nm, -1)
+    let dcl = narDeclaredTy(nm, -1)
+    const guarded = dcl >= 0 && narGuardSlot(nm) >= 0
+    if guarded {
+      const ws = narWriteStorage(nm)
+      if ws >= 0 { dcl = ws }
+    }
     if dcl >= 0 {
       const pre = lookup(nm)
-      const rn = writeReNarrowTy(dcl, rt)
-      const retires = writeRetiresNarrowing(nm, rt, nm, pre)
+      let rn = writeReNarrowTy(dcl, rt)
+      // What the arm join reads a write that kept its narrowing as ending at.
+      const keptEnd = rn
+      let retires = writeRetiresNarrowing(nm, rt, nm, pre)
+      // Under a guard the write re-narrows to what it stored, as a declaration-typed write
+      // would, even when the narrowing already admitted it (`5` into an `f64` arm).
+      if guarded {
+        rn = writeNarrowAfter(dcl, pre, asgLitRhsTy(atIx, dcl, rt))
+        retires = !tySame(rn, pre)
+        if !retires { asgKeepNarrow[atIx] = true }
+      }
       if retires {
         // The RETIREMENT goes back in place, so it outlives whatever inner block holds the
         // write: a narrowing the write falsified must not resurrect at that block's `}`.
         const d = lookupDepth(nm)
+        if guarded { narRetireLayers(nm, rn, dcl) }
         if d >= 0 { T.scopes[d][nm] = dcl }
         // The RE-NARROW — the one member of the declaration the written value can be — is a
         // shadow in the CURRENT block instead, because that is exactly how long the emitter's
@@ -7354,11 +7638,12 @@ function retireNarrowingsForWrite(tgtIx: i32, rt: i32, atIx: i32) {
         }
         recordAsgNarTyIx(atIx, rn)
       }
+      if guarded && tyAdmitsNull(dcl) { narNoteWritten(nm) }
       // Every write joins, retiring or not: an arm that wrote a member the narrowing already
       // allowed still ENDS at that member, and the first arm's in-place retirement is what
       // makes the second arm's flip look admitted (D1846).
       narClobKeys.push(nm)
-      narClobTys.push(rn)
+      if retires { narClobTys.push(rn) } else { narClobTys.push(keptEnd) }
       narClobPrev.push(pre)
       narClobDepths.push(T.scopes.length)
       let rtd = 0
@@ -7392,6 +7677,70 @@ function writeReNarrowTy(dcl: i32, rt: i32) {
     }
     if n == 1 { return hit }
   }
+  dcl
+}
+
+// The member of the declaration `dcl` a write of a value typed `rt` under a narrowing lands on,
+// or `dcl` when it names none: as `writeReNarrowTy`, but a value lands on the member it IS before
+// one it widens to, and a nullable declaration re-narrows its inner type too (D2609).
+function writeMemberTy(dcl: i32, rt: i32) {
+  if rt < 0 || dcl < 0 { return dcl }
+  if isNullTy(rt) { return dcl }
+  const rtT = T.tys[rt]
+  if rtT is TyNullable { return dcl }
+  const d = T.tys[dcl]
+  if d is TyUnion { return unionMemberOfWrite(dcl, d.uMembers, rt) }
+  // A nullable declaration re-narrows its inner type the same way; nothing else has members.
+  nullableMemberOfWrite(dcl, rt)
+}
+
+// `writeMemberTy` over a nullable declaration `dcl`: the member of its inner type, or `dcl`.
+function nullableMemberOfWrite(dcl: i32, rt: i32): i32 {
+  const d = T.tys[dcl]
+  if d is TyNullable {
+    if d.nInner < 0 { return dcl }
+    const inT = T.tys[d.nInner]
+    if inT is TyUnion { return unionMemberOfWrite(dcl, inT.uMembers, rt) }
+    if assignable(rt, d.nInner) { return d.nInner }
+  }
+  dcl
+}
+
+// The member of `ms` a written value typed `rt` lands on: the one it IS, else the sole one it is
+// assignable to (an `i32` into `i32 | f64` is the `i32` member, not a widened `f64`); `dcl` when
+// neither names one.
+function unionMemberOfWrite(dcl: i32, ms: i32[], rt: i32): i32 {
+  // A union-typed value lands on one member only when every member of it does.
+  const rT = T.tys[rt]
+  if rT is TyUnion {
+    let one = -1
+    let k = 0
+    while k < rT.uMembers.length {
+      const m = unionMemberOfWrite(dcl, ms, rT.uMembers[k])
+      if m == dcl || (one >= 0 && !tySame(m, one)) { return dcl }
+      one = m
+      k = k + 1
+    }
+    if one >= 0 { return one }
+    return dcl
+  }
+  const w = widenLitTy(rt)
+  let i = 0
+  while i < ms.length {
+    if !isNullTy(ms[i]) && tySame(w, ms[i]) { return ms[i] }
+    i = i + 1
+  }
+  let hit = -1
+  let n = 0
+  i = 0
+  while i < ms.length {
+    if assignable(rt, ms[i]) {
+      hit = ms[i]
+      n = n + 1
+    }
+    i = i + 1
+  }
+  if n == 1 { return hit }
   dcl
 }
 
@@ -8668,8 +9017,8 @@ function crCaptureWiden(fnIx: i32) {
         } else if crCaptureMayGoStale(fnIx, nm) {
           if escapes < 0 { escapes = crLambdaEscapes(fnIx) }
           const fnWriter = crMayBeWritten(nm)
-          if escapes == 0 && !fnWriter {
-            // Only a direct write can change it, and one under this capture is refused.
+          if escapes == 0 && !fnWriter && !crNameAssigned(nm) {
+            // Nothing can change it.
           } else if (
             escapes == 0
             && !crBodyMayWrite(fnIx, nm)
@@ -8701,7 +9050,6 @@ function crCaptureWiden(fnIx: i32) {
 function crCaptureMayGoStale(fnIx: i32, name: string): boolean {
   if crCallbackKeeps(fnIx, name) { return false }
   if crMayBeWritten(name) { return true }
-  if crLambdaEscapes(fnIx) == 0 { return false }
   crNameAssigned(name)
 }
 
@@ -9364,7 +9712,9 @@ function crCapRecCheck(callIx: i32) {
   while r < crCapRecHandles.length {
     if crCapRecHandles[r] == h && crCapRecDepths[r] == crFnBases.length {
       const nm = crCapRecNames[r]
-      if lookup(nm) != crCapRecTys[r] {
+      if !tySame(lookup(nm), crCapRecTys[r]) {
+        let by = "a write"
+        if crMayBeWritten(nm) { by = "a call" }
         tErrCoded(
           "'"
             + h
@@ -9374,7 +9724,9 @@ function crCapRecCheck(callIx: i32) {
             + nm
             + "' as "
             + tyToStr(crCapRecTys[r])
-            + ", a narrowing a call since then may have ended — re-test '"
+            + ", a narrowing "
+            + by
+            + " since then may have ended — re-test '"
             + nm
             + "' before this call, or inside '"
             + h
@@ -9624,17 +9976,205 @@ function crFirstWritingCall(ix: i32, name: string): i32 {
 // A loop re-runs the reads before a call after it, so a narrowing live at the loop that a call
 // anywhere in the loop may end ends before the loop starts, in both halves.
 function crLoopPreRetire(loopIx: i32) {
+  if npKeys.length > 0 { crLoopPathPreRetire(loopIx) }
   if asgDeclKeys.length == 0 { return 0 }
   const names = crLiveNames()
   let i = 0
   while i < names.length {
-    if crMayBeWritten(names[i]) {
-      const c = crFirstWritingCall(loopIx, names[i])
-      if c >= 0 { crRetire(names[i], c, true, loopIx) }
+    let c = -1
+    if crMayBeWritten(names[i]) { c = crFirstWritingCall(loopIx, names[i]) }
+    // So does a write in the loop that leaves a guard's narrowing (D2609).
+    if c < 0 && !isPathKey(names[i]) && narGuardSlot(names[i]) >= 0 {
+      c = crLoopLeavingWrite(loopIx, names[i])
     }
+    if c >= 0 { crRetire(names[i], c, true, loopIx) }
     i = i + 1
   }
   0
+}
+
+// The path twin: a live path narrowing a write in the loop may leave ends before the loop,
+// in both halves, so the reads before that write read the place's declared type.
+function crLoopPathPreRetire(loopIx: i32) {
+  let s = crFnNpBase()
+  if s < 0 { s = 0 }
+  while s < npKeys.length {
+    if (
+      npInvBy[s] < 0
+      && npEpochs[s] == narFnEpoch
+      && narrowedPathIx(npKeys[s]) == s
+    ) {
+      const a = crLoopLeavingPathWrite(loopIx, npKeys[s], npTys[s])
+      if a >= 0 {
+        npInvBy[s] = a
+        npSettle[s] = -1
+        crAliasWr[a] = true
+        crRetNames.push(npKeys[s])
+        crRetCalls.push(a)
+        crRetNarTys.push(npTys[s])
+        crRetWideTys.push(-1)
+        crRetRoots.push(crCurRoot())
+        crRetLoops.push(true)
+        crBeforeBank[loopIx] = crwAddName(
+          crBeforeBank[loopIx] ?? ",",
+          npKeys[s],
+        )
+        narClobKeys.push(npKeys[s])
+        narClobTys.push(-1)
+        narClobPrev.push(-1)
+        narClobDepths.push(T.scopes.length)
+        narClobRetired.push(2)
+      }
+    }
+    s = s + 1
+  }
+  0
+}
+
+// The first assignment to the place keyed `key`, narrowed to `pre`, in the loop subtree at `ix`
+// whose value, typed before the loop runs, leaves that narrowing; -1 otherwise.
+function crLoopLeavingPathWrite(ix: i32, key: string, pre: i32): i32 {
+  if ix < 0 || ix >= P.nodes.length { return -1 }
+  const n = P.nodes[ix]
+  if n is FuncDecl { return -1 }
+  if n is BinExpr {
+    if n.binOp == "=" && placeKeyOf(n.binLeft) == key {
+      const store = writeStorageTy(n.binLeft)
+      let vt = loopWritePeekTy(n.binRight, store)
+      if vt >= 0 && store >= 0 {
+        if !isLitBearing(store) { vt = widenLitTy(vt) }
+        if !tySame(writeNarrowAfter(store, pre, vt), pre) { return ix }
+      }
+    }
+  }
+  let cur = ix
+  while cur >= 0 {
+    const kids = nodeSpineChildren(cur)
+    let k = 0
+    while k < kids.length {
+      const a = crLoopLeavingPathWrite(kids[k], key, pre)
+      if a >= 0 { return a }
+      k = k + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  -1
+}
+
+// The struct member of `store` whose field names are exactly the object literal's, or -1 when
+// none or several are.
+function objLitMemberOf(e: ObjLit, store: i32): i32 {
+  if store < 0 { return -1 }
+  let ms: i32[] = [store]
+  const st = T.tys[store]
+  if st is TyUnion { ms = st.uMembers }
+  if st is TyNullable {
+    if st.nInner < 0 { return -1 }
+    const it = T.tys[st.nInner]
+    if it is TyUnion { ms = it.uMembers } else { ms = [st.nInner] }
+  }
+  let hit = -1
+  let i = 0
+  while i < ms.length {
+    const m = ms[i]
+    const mt = T.tys[m]
+    if mt is TyObj {
+      if objLitNamesAre(e, mt.objFieldNames) {
+        if hit >= 0 { return -1 }
+        hit = m
+      }
+    }
+    i = i + 1
+  }
+  hit
+}
+
+// Whether the object literal's fields are plain `name: value` inits naming exactly `names`.
+function objLitNamesAre(e: ObjLit, names: string[]): boolean {
+  if e.objFields.length != names.length { return false }
+  let k = 0
+  while k < e.objFields.length {
+    const f = P.nodes[e.objFields[k]]
+    if !(f is FieldInit) { return false }
+    if f is FieldInit {
+      if !nameInList(names, f.fiName) { return false }
+    }
+    k = k + 1
+  }
+  true
+}
+
+// The first assignment to the bare name `name` in the loop subtree at `ix` whose value, typed
+// before the loop runs, leaves the narrowing `name` holds there, or -1. A value whose type
+// needs the loop to decide is left to the write itself, which refuses what the loop's entry
+// type does not admit.
+function crLoopLeavingWrite(ix: i32, name: string): i32 {
+  if ix < 0 || ix >= P.nodes.length { return -1 }
+  const n = P.nodes[ix]
+  if n is FuncDecl { return -1 }
+  if n is BinExpr {
+    if n.binOp == "=" && placeKeyOf(n.binLeft) == name {
+      const store = narWriteStorage(name)
+      const pre = lookup(name)
+      let vt = loopWritePeekTy(n.binRight, store)
+      if vt >= 0 && store >= 0 && pre >= 0 {
+        if !isLitBearing(store) { vt = widenLitTy(vt) }
+        if !tySame(writeNarrowAfter(store, pre, vt), pre) { return ix }
+      }
+    }
+  }
+  let cur = ix
+  while cur >= 0 {
+    const kids = nodeSpineChildren(cur)
+    let k = 0
+    while k < kids.length {
+      const a = crLoopLeavingWrite(kids[k], name)
+      if a >= 0 { return a }
+      k = k + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  -1
+}
+
+// The type of a value known without checking it: a literal, a name, a call of a function whose
+// declared return type is settled, or an object literal whose field names are exactly those of
+// one struct member of `store`; -1 otherwise.
+function loopWritePeekTy(ix: i32, store: i32): i32 {
+  if ix < 0 || ix >= P.nodes.length { return -1 }
+  const e = P.nodes[ix]
+  if e is Paren { return loopWritePeekTy(e.parInner, store) }
+  if e is ObjLit { return objLitMemberOf(e, store) }
+  if e is NullLit { return TY_NULL }
+  if e is BoolLit { return TY_BOOL }
+  if e is StrLit { return litTyOfExpr(ix) }
+  if e is NumLit {
+    if numLexIsFloat(e.numText) { return TY_F64 }
+    return litTyOfExpr(ix)
+  }
+  if e is Ident { return lookup(e.identName) }
+  // Anything else needs checking, but a call of a declared function has its return type.
+  loopWriteCallTy(ix)
+}
+
+// The settled declared return type of the function a call at `ix` names, or -1.
+function loopWriteCallTy(ix: i32): i32 {
+  const e = P.nodes[ix]
+  if e is Call {
+    const cf = P.nodes[e.callFn]
+    if cf is Ident {
+      const ft = lookup(cf.identName)
+      if ft >= 0 {
+        const f = T.tys[ft]
+        if f is TyFunc {
+          if f.fnRet >= 0 && !tyIsHole(f.fnRet) && !tyHasTyVar(f.fnRet) {
+            return f.fnRet
+          }
+        }
+      }
+    }
+  }
+  -1
 }
 
 // Record at the `&&`/`||` node `ix` the left operand's facts its right operand retired, by a write
@@ -11420,6 +11960,7 @@ function popScope() {
     crWideNames.pop()
   }
   crPopSoleTo(T.scopes.length - 1)
+  if narWrNames.length > 0 { narWrPopTo(T.scopes.length - 1) }
   if T.scopes.length > 0 {
     for k in T.scopes[T.scopes.length - 1] {
       const ds = scopeDepthsOf[k]
@@ -41642,6 +42183,7 @@ export function checkProgram(rootIx: i32) {
   isParentTyIx = []
   isParentElseTyIx = []
   asgNarTyIx = []
+  asgKeepNarrow = Map()
   pgVoid = []
   joinHead = []
   joinName = []
@@ -42355,6 +42897,12 @@ export function isVarTyIxOf(ix: i32) {
     if ix < isVarTyIx.length { return isVarTyIx[ix] }
   }
   -1
+}
+// Whether the write at assignment node `ix` into a guard-narrowed bare name kept the narrowing it
+// found, so the reads after it lower at the member they already did.
+export function asgKeepsNarrowOf(ix: i32): boolean {
+  if asgKeepNarrow.length == 0 { return false }
+  asgKeepNarrow[ix] ?? false
 }
 // The type the assignment at node `ix` re-narrows its bare-name target to, or -1 when the
 // write retired no narrowing and the reads after it are at the declared type. The emitter's
@@ -46108,10 +46656,12 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
     // argument, or typed return already does — runs before `assignableExpr` so the pin applies first.
     constrainEmptyExpr(n.binRight, rt, asgLt)
     mapStoreValPin(n.binLeft, asgLt)
-    const asgOk = assignableExpr(n.binRight, rt, asgLt)
+    const asgFits = assignableExpr(n.binRight, rt, asgLt)
+    const asgOk = asgFits
+      && !writeLeavesLoopEntry(n.binLeft, asgLitRhsTy(ix, asgLt, rt))
     lwStoreDst = -1
     if !asgOk {
-      if asgBarred {
+      if asgFits || asgBarred || (asgDcl >= 0 && writeBarredByLoop(n.binLeft)) {
         writeBarredErr(placeKeyOf(n.binLeft), ix)
       } else {
         tErr(letAssignMsg(n.binRight, rt, asgLt, ""), n.binRight)
@@ -46159,8 +46709,11 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
             }
             // Bank the declared type before shadowing it — the narrowing itself is unchanged,
             // which is what the `let x: T | null = null` / `x = mk()` / `x.f` pattern rides.
-            noteNarShadow(asgTgt.identName, asgCur, NAR_KIND_ASG)
-            declare(asgTgt.identName, nonNullTy(asgCur))
+            // Under a guard the write re-narrows from the declaration instead, below.
+            if narGuardSlot(asgTgt.identName) < 0 {
+              noteNarShadow(asgTgt.identName, asgCur, NAR_KIND_ASG)
+              declare(asgTgt.identName, nonNullTy(asgCur))
+            }
           } else if asgCt.nInner < 0 && rtT is TyNullable {
             // A nullable write fills the hole from its non-null part and narrows nothing: the
             // value may still be null, and an unfilled hole would type the binding `null` (D2597).
