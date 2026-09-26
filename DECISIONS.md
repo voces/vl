@@ -8011,10 +8011,73 @@ receiver without the member can reach:
   `get`/`set` of a map only and `add` of a set only. So `get(self: Set<T>, …)` and
   `add(self: {[K]: boolean}, …)` are legal and reached; on the map the function answers before
   the "`.add` is a `Set` method" hint, which is for a map with no such function in scope.
-* **`length` and `size` are member reads**, not methods, so `xs.length()` reaches a function
-  named `length`.
+* **`length` is a member read**, not a method, so `xs.length()` reaches a function named
+  `length`; `size` is no member of any collection since Q9 (below), so `m.size()` reaches one
+  named `size`.
 
 Why an error rather than a lint: the function is not merely unused, it is unreachable by the
 spelling its `self` parameter exists for, and the author's intent — to override or extend the
 member — is exactly what the language will not do. A warning would leave the silent half in
 place for anyone who does not read warnings; the rename costs one word.
+
+## Every collection counts with `.length` (owner ruling Q9, 2026-09-25)
+
+**Ruled (a): `m.size` is removed, and the other languages' spellings of a count or a collection
+type are refused with the VL spelling named.** Recorded from
+`docs/internals/collections-representation-design.md` (branch `design-collections-representation`)
+§11 Q9; `collections-design.md` §C2.3 had already ruled `.size` dropped, and the checker still
+answered it on a map or a `Set`.
+
+| written | refused with |
+| --- | --- |
+| `.size` or `.count` on a list, map, `Set` or string | `no field 'size' on map {[string]: i32}; did you mean '.length'?` |
+| `len(x)`, when nothing in scope is named `len` | `undeclared identifier 'len' — a length is a member in VL; did you mean 'x.length'?` |
+| `Array<T>` | `unknown type 'Array<i32>'; did you mean 'i32[]'?` |
+| `Record<K, V>` | `unknown type 'Record<string,i32>'; did you mean '{[string]: i32}' or 'Map<string, i32>'?` |
+
+Why: two names for one property is a permanent second spelling that every reader has to learn
+is the same thing, and a refusal that names the answer teaches it in one step — the house style
+`.contains` → `.includes` already set. Each redirect is a SUFFIX on the sentence the checker
+already raised, so a consumer matching `no field '…' on` or `unknown type '…'` keeps matching.
+
+**The names stay free for a program's own use.** Only the collection built-in is removed: a
+record field named `size` reads as before, a `self`-function `size(self: {[K]: V})` is reached by
+`m.size()`, and `len`, `Array` and `Record` resolve to a program's own declarations — each
+redirect fires only after resolution has already failed. `N.size`, a `flat` record's byte size,
+is a layout constant on a TYPE name and is untouched.
+
+**Priced — BREAKING for `m.size`.** In-repo: 148 sites in 55 fixtures under `tests/cases/`, 147
+derived and 2 curated corpus cells, 6 capability probes and 4 matrix templates, one compiler
+diagnostic that recommended `m.size`, 17 inventory-row witnesses, two design-doc snippets, and eleven generator scripts (`gen.py`,
+`gencensus.py`, `mkmatrix.py`, `genorder.py`, `d341/mkgrid.py`, `day-one/grammar.py`,
+`sabotage.py` and four one-shot repro scripts) now spell `.length`; the corpus moved no cell. None in `std/` or
+`compiler/`. Consumers: plumb has three (`tools/fuzz-gen.vl:233`, `tools/translate-all.vl:251`
+and `:267`) plus the filed repros PL-025 and PL-035; glean, sunsuz and webcraft have none.
+
+## `in` is a for-loop keyword, not an operator (owner ruling Q10, 2026-09-25)
+
+**Ruled (a): `a in b` in an expression is parsed only to be refused, with the membership test
+the receiver does have.**
+
+| receiver `b` | the sentence ends |
+| --- | --- |
+| a map (or a nullable one) | ``; to test for a key, use `m.has(k)` `` |
+| a `Set` | ``; to test set membership, use `s.has(x)` `` |
+| a list | ``; use `xs.includes(x)` for a value, or `i < xs.length` for an index`` |
+| anything else | the head alone: `` `in` is not an operator in VL outside a `for` loop's head `` |
+
+Before the ruling `"a" in m` was a parse error cascade — `expected ',' but found 'in'`,
+`undeclared identifier 'in'`, a second comma error and a `print` refusal for one mistake. Why
+not make it work (option b): `has` already answers for a map and a set, and a list has two
+readings (a value or an index) that `in` would have to pick between; refusing costs one parser
+rule, teaches the right method, and keeps the keyword free if a working `in` is ever wanted.
+
+**Mechanism.** `in` stays a soft keyword, an `IDENT` token. `parseBinary` gives it the
+relational tier (`IN_PREC`, the binding power of `<`) when it follows an operand on the same
+line, and builds an ordinary `BinExpr` with op `in`; the checker refuses that op first and
+answers `boolean`, so `if x in xs && y` is one diagnostic. Nothing else changes meaning: a `for`
+head consumes its own `in` before any expression is parsed; `in` at the start of an operand is
+still an identifier (`let in = 4; print(in + 1)`); a line break before `in` still ends the
+statement, since only token kinds with a binary precedence continue a line. Every `.vl` file in
+`tests/`, `std/`, `compiler/`, `scripts/` (the distilled corpus included) was searched for `in`
+outside a `for` head: the only uses are `in` as a variable, which parse as before.

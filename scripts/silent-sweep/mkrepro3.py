@@ -79,7 +79,7 @@ P["F2_list_forin"] = evalcell("l", LISTBODY, "for v in mk() { print(v) }", "i32[
 P["F2_list_slice"] = evalcell("s", LISTBODY, "for v in mk().slice(0, 1) { print(v) }", "i32[]")
 P["F2_list_map"] = evalcell("m", LISTBODY, "for v in mk().map((z) => z) { print(v) }", "i32[]")
 P["F2_list_filter"] = evalcell("f", LISTBODY, "for v in mk().filter((z) => true) { print(v) }", "i32[]")
-P["F2_len_only"] = evalcell("n", MAPBODY, "print(mk().size)")
+P["F2_len_only"] = evalcell("n", MAPBODY, "print(mk().length)")
 P["F2_idx_only"] = evalcell("i", MAPBODY, 'print(mk()["k"] ?? 0)')
 P["F2_str_chars"] = evalcell("c", STRBODY, "print(mk().length)", "string")
 P["F2_values_twice_in_body"] = evalcell(
@@ -155,7 +155,7 @@ body(null)
 """
 P["F4_cap_nulmapstr"] = """
 function body(p: {[string]: i32} | null) {
-  function innerM() { if p != null { print(p.size) } else { print("N") } }
+  function innerM() { if p != null { print(p.length) } else { print("N") } }
   innerM()
 }
 body(null)

@@ -920,7 +920,7 @@ null | f64 | O` — `is O` RUNS.
     let m: { [string]: Json } = Map()
     m["self"] = m
     const w: Json = m
-    if w is { [string]: Json } { print(w.size) }
+    if w is { [string]: Json } { print(w.length) }
 
     function depth(v: Json): i32 {
       if v is Json[] {

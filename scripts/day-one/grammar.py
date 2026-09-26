@@ -315,7 +315,7 @@ VALUES = [
         "inline": "{[string]: i32}", "expr": None,
         "mk": ["const m: {T} = Map()", 'm["k"] = 4', "return m"],
         "alt": "Map()", "features": ["map", "scalar"],
-        "reads": [{"id": "size", "lines": ["print({v}.size)"], "want": ["1"]},
+        "reads": [{"id": "size", "lines": ["print({v}.length)"], "want": ["1"]},
                   {"id": "read", "lines": ['print({v}["k"] ?? 0)'], "want": ["4"]}],
     },
     {
@@ -324,7 +324,7 @@ VALUES = [
         "expr": None,
         "mk": ["const m: {T} = Map()", 'm["k"] = ' + REC_EXPR, "return m"],
         "alt": "Map()", "features": ["map", "struct"],
-        "reads": [{"id": "size", "lines": ["print({v}.size)"], "want": ["1"]},
+        "reads": [{"id": "size", "lines": ["print({v}.length)"], "want": ["1"]},
                   {"id": "read", "lines": ['print(({v}["k"] ?? ' + REC_ALT + ").n)"],
                    "want": ["3"]}],
     },

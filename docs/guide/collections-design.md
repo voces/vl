@@ -61,6 +61,31 @@ constructor that names them (`const m = Map<string, i32>()`), an annotation on i
 destination, or a later use. `const m = Map()` with none of those is
 `cannot infer a type for 'm'`, exactly as `const xs = []` is.
 
+**Every collection counts with `.length`, and other languages' spellings are refused with
+the VL one named** (owner ruling Q9, 2026-09-25; DECISIONS.md §"Every collection counts with
+`.length`"). A list, a map, a `Set` and a string all answer `.length`; there is no second name.
+What you might reach for from elsewhere, and what the checker says:
+
+| you wrote | the checker says |
+| --- | --- |
+| `m.size`, `s.size`, `xs.size`, `"ab".size` | ``no field 'size' on map {[string]: i32}; did you mean '.length'?`` |
+| `xs.count`, `m.count` | ``no field 'count' on array i32[]; did you mean '.length'?`` |
+| `len(xs)` | ``undeclared identifier 'len' — a length is a member in VL; did you mean 'xs.length'?`` |
+| `Array<i32>` | ``unknown type 'Array<i32>'; did you mean 'i32[]'?`` |
+| `Record<string, i32>` | ``unknown type 'Record<string,i32>'; did you mean '{[string]: i32}' or 'Map<string, i32>'?`` |
+| `xs.contains(x)` | ``no method '.contains' on array i32[]; did you mean '.includes'?`` |
+| `"a" in m` | `` `in` is not an operator in VL outside a `for` loop's head; to test for a key, use `m.has(k)` `` |
+| `x in s` (a `Set`) | ``… ; to test set membership, use `s.has(x)` `` |
+| `x in xs` (a list) | ``… ; use `xs.includes(x)` for a value, or `i < xs.length` for an index`` |
+
+The names stay free for your own use: a record field called `size`, a `self`-function
+`size(self: {[string]: i32})` called as `m.size()`, a function of your own called `len`, and a
+type of your own called `Array` or `Record` all work, and the redirects above fire only when
+nothing in scope has the name. `in` is a keyword only in a `for` head (`for x in xs`); in an
+expression it parses at a comparison's precedence purely so that `if x in xs && y` is one
+diagnostic rather than a parse cascade (ruling Q10; DECISIONS.md §"`in` is a for-loop keyword,
+not an operator").
+
 **Explicit type arguments on any generic call.** The same `<…>` works on a call of your own
 generic function, TypeScript's way: `id<f64>(3)`, `make<string>()`. The written types bind
 the function's type parameters in declaration order before any argument is checked, so an
@@ -1169,6 +1194,9 @@ never a real value a user stored; it was a representation artifact of spelling
 membership as a map-to-bool, and it should never have been observable.
 
 ### C2.3 — Size unifies on `.length`
+
+**Shipped** (ruling Q9, 2026-09-25): `m.size` is gone, and `.size`/`.count` on any collection
+or string is refused with a redirect to `.length` (see "What you write TODAY").
 
 **Decision.** Drop `.size` for `Map`/`Set`; use **`.length`** uniformly across
 `List`, `Map`, and `Set`. This is the **DECISIONS B6** member: O(1), read-only,
