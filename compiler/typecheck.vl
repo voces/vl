@@ -4250,6 +4250,8 @@ export function initChecker() {
   declareSimdIntrinsics()
   // The atomics (`simd-design.md` §G1): one declaration per row of the atomic table.
   declareAtomicIntrinsics()
+  // The scalar saturating truncations, one declaration per `0xFC` sub-opcode.
+  declareTruncSatIntrinsics()
   // The filesystem floor (`std:fs`, `std:args`), which unlike everything above it does not
   // lower to instructions — a syscall is the one thing wasm cannot express. Bytes, not
   // strings, in both directions, so a payload crosses as one packed `u8[]` GC object. Errors are
@@ -4313,6 +4315,7 @@ export function nameIsEmitterIntrinsic(name: string) {
   // rewrites the call site by name, so a user definition would be silently discarded.
   if nameIsSimdIntrinsic(name) { return true }
   if nameIsAtomicIntrinsic(name) { return true }
+  if truncSatOp(name) >= 0 { return true }
   // The filesystem floor. These lower to a `call` of a host import rather than to instructions,
   // but the reservation reason is identical and is about the call site, not the lowering:
   // `emitCall` matches these names before it looks up a declaration, so a user
@@ -4538,6 +4541,19 @@ function simdTableBuild() {
     ],
     SIMD_SIG_VV_V,
   )
+  simdAddAll(
+    ["__pmin_f32x4__", "__pmax_f32x4__", "__pmin_f64x2__", "__pmax_f64x2__"],
+    [0xea, 0xeb, 0xf6, 0xf7],
+    SIMD_SIG_VV_V,
+  )
+  simdAddAll(
+    [
+      "__demote_f64x2_zero__", "__promote_low_f32x4__",
+      "__convert_low_i32x4_s__", "__convert_low_i32x4_u__",
+    ],
+    [0x5e, 0x5f, 0xfe, 0xff],
+    SIMD_SIG_V_V,
+  )
   simdAdd("__bitselect_v128__", 0x52, SIMD_SIG_VVV_V, -1)
   0
 }
@@ -4579,6 +4595,43 @@ function declareSimdIntrinsics() {
   while i < simdNames.length {
     declare(simdNames[i], simdRowTy(i))
     i = i + 1
+  }
+  0
+}
+
+// The scalar saturating truncations, each one `0xFC <sub>` instruction: NaN gives 0 and an
+// out-of-range operand clamps to the result's bound, where `x as i32` traps. The source does
+// not decide the result, so the name keeps it: `i32.trunc_sat_f64_u` is
+// `__trunc_sat_f64_u_i32__`. A name's index is its sub-opcode.
+const TRUNC_SAT_NAMES = [
+  "__trunc_sat_f32_s_i32__", "__trunc_sat_f32_u_i32__",
+  "__trunc_sat_f64_s_i32__", "__trunc_sat_f64_u_i32__",
+  "__trunc_sat_f32_s_i64__", "__trunc_sat_f32_u_i64__",
+  "__trunc_sat_f64_s_i64__", "__trunc_sat_f64_u_i64__",
+]
+
+// The `0xFC` sub-opcode of saturating truncation `name`, or -1 when it is not one. Bit 2 of
+// the sub-opcode is an i64 result, bit 1 an f64 operand, bit 0 unsigned.
+export function truncSatOp(name: string): i32 {
+  let i = 0
+  while i < TRUNC_SAT_NAMES.length {
+    if TRUNC_SAT_NAMES[i] == name { return i }
+    i = i + 1
+  }
+  -1
+}
+export function truncSatIsI64(op: i32): boolean { (op & 4) != 0 }
+export function truncSatFromF64(op: i32): boolean { (op & 2) != 0 }
+
+function declareTruncSatIntrinsics() {
+  let op = 0
+  while op < TRUNC_SAT_NAMES.length {
+    let arg = TY_F32
+    if truncSatFromF64(op) { arg = TY_F64 }
+    let ret = TY_I32
+    if truncSatIsI64(op) { ret = TY_I64 }
+    declare(TRUNC_SAT_NAMES[op], mkFuncTy([arg], ret))
+    op = op + 1
   }
   0
 }
@@ -48159,6 +48212,7 @@ function getterLitUnionOk(ms: i32[]): boolean {
 // a new member joins here; a result-less intrinsic (every store) is refused for having no value.
 function getterIntrinsicName(nm: string): boolean {
   if isNumIntrinsicName(nm) { return true }
+  if truncSatOp(nm) >= 0 { return true }
   if nm == "__load_i32__" || nameIsMemLoadIntrinsic(nm) { return true }
   if nameIsSimdIntrinsic(nm) {
     const ft = lookup(nm)
