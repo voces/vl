@@ -1038,6 +1038,9 @@ let npEpochs: i32[] = []
 let npSettle: i32[] = []
 // The nested function that first read a slot's narrowing, or -1 (D2402).
 let npCapBy: i32[] = []
+// 1 when the slot is an assignment's strip of `null` (D1848) rather than a guard's: a nested
+// function reads the place at its declared type, and a write after one is checked against it.
+let npAsg: i32[] = []
 let npFrames: i32[] = []
 
 // Post-guard narrowings handed up by an `if` that is itself the else arm of another `if`. Such
@@ -1370,6 +1373,7 @@ function applyArmJoins(
               npEpochs.push(narFnEpoch)
               npSettle.push(-2)
               npCapBy.push(-1)
+              npAsg.push(0)
               recordArmJoin(ix, nm, jt)
             }
           } else {
@@ -4610,6 +4614,7 @@ export function initChecker() {
   npEpochs = []
   npSettle = []
   npCapBy = []
+  npAsg = []
   npFrames = []
   pgUpKeys = []
   pgUpTys = []
@@ -7160,7 +7165,7 @@ function writeStorageTy(ix: i32) {
     // ordering bug inside one statement: `lt` is read off the target before the right-hand side is
     // checked, so a callee that retires the path mid-statement would leave `asgLt` at a type the
     // storage never had. A retired narrowing means the place reads at its declared type.
-    if npEpochs[slot] != narFnEpoch { return -1 }
+    if npEpochs[slot] != narFnEpoch && npAsg[slot] != 1 { return -1 }
     if !npInsideBarrier(slot) { return -1 }
     const noNames: string[] = []
     const noTys: i32[] = []
@@ -7175,7 +7180,7 @@ function writeStorageTy(ix: i32) {
     if key == "" { return -1 }
     const slot = narrowedPathIx(key)
     if slot < 0 { return -1 }
-    if npEpochs[slot] != narFnEpoch { return -1 }
+    if npEpochs[slot] != narFnEpoch && npAsg[slot] != 1 { return -1 }
     if !npInsideBarrier(slot) { return -1 }
     const noNames: string[] = []
     const noTys: i32[] = []
@@ -7405,6 +7410,7 @@ function mapCellStaysPresent(key: string) {
     npEpochs.push(narFnEpoch)
     npSettle.push(-2)
     npCapBy.push(-1)
+    npAsg.push(0)
   }
   0
 }
@@ -7646,6 +7652,7 @@ function retireNarrowingsForWrite(tgtIx: i32, rt0: i32, atIx: i32) {
   // The member the write re-narrows `tgtKey` to, or -1 when it names none. Pushed after the
   // walk below rather than inside it: a fresh entry would be re-tested by the same loop.
   let pathReTy = -1
+  let pathReAsg = false
   let pathRetired = false
   while i < npKeys.length {
     // The write's attribution wins over a call's, and the overwrite is what makes the read below
@@ -7653,9 +7660,12 @@ function retireNarrowingsForWrite(tgtIx: i32, rt0: i32, atIx: i32) {
     // `mk` marks the path and the write would otherwise be reported as the call's. The cause is
     // what `pathRetiredByAssign` reads to decide whether the emitter can see the retirement.
     let hit = writeRetiresNarrowing(tgtKey, rt, npKeys[i], npTys[i])
+    // An enclosing function's narrowing a nested body writes ends where that body is CALLED,
+    // which the call rule settles for both halves; the write runs later than this point.
+    if i < crFnNpBase() { hit = false }
     // A write the narrowing admits still re-narrows the place to the member it stored, as it
     // does a bare name (`5` into an `f64` arm of `i32 | f64`).
-    if !hit && npInvBy[i] < 0 && npKeys[i] == tgtKey {
+    if !hit && i >= crFnNpBase() && npInvBy[i] < 0 && npKeys[i] == tgtKey {
       const pd = writeStorageTy(tgtIx)
       if pd >= 0 && !tySame(writeNarrowAfter(pd, npTys[i], rt), npTys[i]) {
         hit = true
@@ -7689,6 +7699,7 @@ function retireNarrowingsForWrite(tgtIx: i32, rt0: i32, atIx: i32) {
       const nn = nonNullTy(pst)
       if nn >= 0 && !tySame(nn, pst) {
         pathReTy = nn
+        pathReAsg = true
         recordAsgNarTyIx(atIx, nn)
       }
     }
@@ -7700,6 +7711,7 @@ function retireNarrowingsForWrite(tgtIx: i32, rt0: i32, atIx: i32) {
     npEpochs.push(narFnEpoch)
     npSettle.push(-2)
     npCapBy.push(-1)
+    if pathReAsg { npAsg.push(1) } else { npAsg.push(0) }
   }
   // Every write over a narrowed path joins, retiring or not — the first arm's retirement is
   // what makes the second arm's flip look admitted, exactly as for a bare name. The row also
@@ -8133,6 +8145,14 @@ function crLostNote(msg: string, at: i32): string {
 // the slot belongs to an enclosing function, and a function between the two escapes — it may run
 // after that function returns, when any holder of the object may have written the path (D2407).
 function crPathCaptureLost(slot: i32, key: string): boolean {
+  if (
+    slot >= 0
+    && slot < npAsg.length
+    && slot < crFnNpBase()
+    && npAsg[slot] == 1
+  ) {
+    return true
+  }
   let lv = crFnNpBases.length - 1
   while lv >= 0 && slot < crFnNpBases[lv] {
     if crFnEscapesAt(lv, key) { return true }
@@ -10178,6 +10198,7 @@ function crLoopMapCellPresent(key: string, asgIx: i32) {
         npEpochs.push(narFnEpoch)
         npSettle.push(-2)
         npCapBy.push(-1)
+        npAsg.push(0)
       }
     }
   }
@@ -12024,6 +12045,7 @@ function applyNarrows(names: string[], tys: i32[]) {
       npEpochs.push(narFnEpoch)
       npSettle.push(-2)
       npCapBy.push(-1)
+      npAsg.push(0)
     } else {
       const wasConst = isConstName(names[i])
       const declTy = lookup(names[i])
@@ -12158,6 +12180,7 @@ function popScope() {
       npEpochs.pop()
       npSettle.pop()
       npCapBy.pop()
+      npAsg.pop()
     }
   }
   if asgDeclFrames.length > 0 {
@@ -49060,6 +49083,7 @@ function checkIfTail(
           npEpochs.push(narFnEpoch)
           npSettle.push(-2)
           npCapBy.push(-1)
+          npAsg.push(0)
         }
       } else if isElseArm {
         pgUpKeys.push(gKey)
