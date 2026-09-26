@@ -4887,9 +4887,29 @@ function igWalk(
   0
 }
 
+// Whether global `gi`'s initializer builds a record or a list: an early read of one reaches the
+// object itself, and a mutation through it would outlive the declaration. Any other initializer
+// produces its value only when it runs in the start function (`globalRunsInStartFn`).
+function igInitAllocates(gi: i32): boolean {
+  const init = igLetInit(globalStmts[gi])
+  if init < 0 { return false }
+  const e = P.nodes[unwrapParen(init)]
+  if e is ArrayLit { return true }
+  if e is ObjLit { return true }
+  globalRunsInStartFn(gi)
+}
+
+// The initializer of module binding `letIx`, or -1 when it has none.
+function igLetInit(letIx: i32): i32 {
+  const d = P.nodes[letIx]
+  if d is LetDecl { return d.letInit }
+  -1
+}
+
 // Decides which module globals need the read-before-init guard (D2652): a global whose
-// initializer runs in the start function and whose name is mentioned by top-level code at or
-// before its declaration, or by a function that code can call (1); a folded `let` so assigned (2).
+// initializer runs in the start function, or builds a record or list, and whose name is mentioned
+// by top-level code at or before its declaration, or by a function that code can call (1); a
+// folded scalar or string `let` so assigned (2).
 function initGuardScan(): i32 {
   gInitGuard = []
   gInitFnReach = []
@@ -4900,10 +4920,15 @@ function initGuardScan(): i32 {
   let gi = 0
   while gi < globalStmts.length {
     gInitGuard.push(0)
-    // A folded `let` is a candidate too: a write can still precede it.
+    // A folded `let` is a candidate too (a write can still precede it), and so is a folded
+    // record or list, which a mutation can reach early.
     const cd = P.nodes[globalStmts[gi]]
     if cd is LetDecl {
-      if cd.letKw == "let" || globalIsNonConst(globalStmts[gi]) {
+      if (
+        cd.letKw == "let"
+        || globalIsNonConst(globalStmts[gi])
+        || igInitAllocates(gi)
+      ) {
         anyCand = true
       }
     }
@@ -4953,7 +4978,8 @@ function initGuardScan(): i32 {
       const g = P.nodes[node]
       if g is LetDecl {
         const bits = seen[g.letName] ?? 0
-        if globalIsNonConst(node) && (bits & 1) != 0 {
+        const early = (bits & 1) != 0
+        if early && igInitAllocates(gi) {
           gInitGuard[gi] = 1
           gInitAny = true
         } else if (g.letKw == "let" && g.letInit >= 0 && (bits & 2) != 0) {

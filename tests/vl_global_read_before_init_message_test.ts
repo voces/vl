@@ -76,6 +76,11 @@ const CASES: [string, string][] = [
     "globals/write-before-folded-let-traps.vl",
     "`g` written before its initializer ran (line 7), via setG\n",
   ],
+  // A folded record is built at instantiation; mutating it early goes through a guarded read.
+  [
+    "globals/mutate-folded-let-record-field-traps.vl",
+    "`g` read before its initializer ran (line 11), via w\n",
+  ],
   // D30's recursion witness: it must still compile, and running it now writes early.
   [
     "maps/inferred-map-return-recursion-write-before-init.vl",
