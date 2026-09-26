@@ -31,7 +31,7 @@ through either is seen through both.
 The element type decides how each element is stored, and that matters more than any other
 choice here:
 
-| element type | stored as | read, per element |
+| element type | stored as | read, per element (in order) |
 | --- | --- | --- |
 | `i32[]` | 4 bytes per element | 1.3–1.6 ns |
 | `u8[]` | 1 byte per element | 1.1 ns |
@@ -40,7 +40,9 @@ choice here:
 | `(i32 \| null)[]` | **a separate heap box per element, `null` included** | 6.1–9.2 ns, about **5×** `i32[]` |
 
 **A nullable number costs a box.** In `(i32 | null)[]` every element is its own small heap
-object. `(f64 | null)[]` is the same (7.2–10.5 ns a read, against 2.2–3.0 ns for `f64[]`);
+object. The times above read the list in order; reading a million-element list at scattered
+indices measured 59 ns per read against 4.3 ns for `i32[]`, about **14×**, since each read follows a
+pointer to its own box. `(f64 | null)[]` is the same (7.2–10.5 ns a read, against 2.2–3.0 ns for `f64[]`);
 `(boolean | null)[]` is not boxed (3.0–3.3 ns, against 1.8–2.2 ns). A boxed list allocates for
 every `null` you push too:
 `xs.push(null)` in a loop measured 16 ns per push at 2 million elements and 61 ns at 8 million,
@@ -162,8 +164,11 @@ missing):
 
 With a number as the value, each stored value is boxed (see "A nullable number costs a box"
 above), which is why `IdTable<i32>` gains little over a map. Choose `IdTable` for dense or mostly
-dense ids with record or list values. `V` cannot be `string`, `boolean`, a literal union of
-strings or a function type: the compiler refuses those, and a map serves them. Use a map when ids are large, negative, or sparse
+dense ids with record or list values.
+
+`V` cannot yet be `string`, `boolean`, a literal union of strings, a function type, a union of
+records (`Circle | Square`), or a generic record (`Box<i32>`, `IdTable<Tex>`): the compiler
+refuses those with "a nullable-… list element has no rep", and a map serves them. Use a map when ids are large, negative, or sparse
 enough that one slot per id wastes memory, or when you need insertion order.
 
 ## The rules the compiler keeps

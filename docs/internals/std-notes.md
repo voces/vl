@@ -776,8 +776,9 @@ Each now says so, in the shape the `concat`-vs-`+` bullet uses.
   compiler rows, all closed in the same PR: D2525 (a generic `(V | null)[]` refused outright),
   D2526 (the method spelling `t.set(…)` refused as a widened write), D2527 (`IdTable<Tex>()`
   from another module: "unknown type"), D2528 (an applied generic record with a nullable-record
-  list field). The niche `V` kinds (`string`, `boolean`, string literal unions, function types)
-  still refuse loudly (D2525's boundary), which the header states.
+  list field). D2525's boundary still refuses, loudly, a `V` that is a `string`, `boolean`,
+  string literal union, function type, union of records or generic record application; the
+  header names each, and D2525 says why.
 - **`set` pushes one shared `null`**, made once per call. A `null` literal pushed into a boxed
   `(i32 | null)[]` allocates a box per push: plumb's hand-rolled `push(null)` loop measured 3×
   slower than a map at a million ids with `i32` values, and the shared value brings `IdTable<i32>`

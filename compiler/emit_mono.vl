@@ -29,9 +29,11 @@ import {
   TyFunc,
   TyNullable,
   TyObj,
+  TyUnion,
   TyVar,
   bindGenWalk,
   blockHasBareReturn,
+  cUserTypes,
   canonEmitName,
   flatConstOfNameProp,
   i32TyIx,
@@ -73,6 +75,7 @@ import {
   tyIsMap,
   tyRenderSoftensLits,
   tyToEmitName,
+  tyToStr,
   uniqueGenericDeclNamed,
 } from "./typecheck"
 import {
@@ -188,9 +191,11 @@ import {
   recordedParamPinName,
 } from "./emit_rewrite"
 import {
+  buildFnChildIndex,
   caResumeArmed,
   emitRootIx,
   fmResumeArmed,
+  fnChildHead,
   fnDispNames,
   fnInstOrigin,
   fnParent,
@@ -1218,6 +1223,56 @@ function monoBindCols(params: i32[], tyCol: i32[], bN: string[], bT: i32[]) {
   0
 }
 
+// Whether the generic being instantiated declares a lambda. A lambda's capture of a
+// `(T | null)[]` reads the element at the template's rep when `T` is a list or a declared
+// union, so `monoNicheNulListCheck` refuses those too while it is set (D2525).
+let monoCurHasLam = false
+
+// Whether the generic at `fnStmts` position `slot` is the frame of any other lifted function.
+function monoFnDeclaresLambda(slot: i32): boolean {
+  if fnChildHead.length != fnStmts.length { buildFnChildIndex() }
+  if slot < 0 || slot >= fnChildHead.length { return false }
+  fnChildHead[slot] >= 0
+}
+
+// Whether `name` is a union: a declared alias (`type LI = 1 | 2`) or an inline spelling.
+function monoIsUnionAlias(name: string): boolean {
+  const atoms: string[] = []
+  splitUnionAtoms(name, atoms)
+  if atoms.length > 1 { return true }
+  const u = cUserTypes[name]
+  if u is i32 {
+    if u >= 0 && u < T.tys.length { return T.tys[u] is TyUnion }
+  }
+  false
+}
+
+// The same refusal read off an argument's arena type, where the pin name is softened: a
+// literal union binds `T` by its base name, so only the argument still shows the union.
+function monoLamNulUnionListCheck(argTy: i32) {
+  if !monoCurHasLam || argTy < 0 || argTy >= T.tys.length { return 0 }
+  const a = T.tys[argTy]
+  if a is TyArray {
+    if a.aElem >= 0 && a.aElem < T.tys.length {
+      const e = T.tys[a.aElem]
+      if e is TyNullable {
+        if (
+          e.nInner >= 0
+          && e.nInner < T.tys.length
+          && T.tys[e.nInner] is TyUnion
+        ) {
+          return emitFail(
+            "emitProgram: a nullable-"
+              + tyToStr(e.nInner)
+              + " list element has no rep; use a non-null element type",
+          )
+        }
+      }
+    }
+  }
+  0
+}
+
 // Refuses an instance whose `(T | null)[]` annotation binds `T` where `T | null` is a niche
 // rather than a box or a nullable reference: a string, boolean, literal-union or function
 // element. Those instances read the element at the template's rep (D2525).
@@ -1244,6 +1299,7 @@ function monoNicheNulListCheck(
     || b == "boolean"
     || nameIsLitUnionType(b)
     || annArrowAt(b) >= 0
+    || (monoCurHasLam && (nameIsArray(b) || monoIsUnionAlias(b)))
   ) {
     return emitFail(
       "emitProgram: a nullable-"
@@ -3718,6 +3774,7 @@ function monoMakeInstance(
   // either again, so that test is `monoOrigNode`'s length wearing another name.
   const fn = P.nodes[monoOrigNode[origFe]]
   if fn is FuncDecl {
+    monoCurHasLam = monoFnDeclaresLambda(origFe)
     const params = fn.fnParams
     let key = i32ToStr(origFe) + "#" + monoKeyExtra
     monoKeyExtra = ""
@@ -3826,6 +3883,7 @@ function monoMakeInstance(
             nt = p3.parType
           } else {
             monoNicheNulListCheck(tyNameOf(p3.parType), fn.fnTyParams, tvN, tvV)
+            monoLamNulUnionListCheck(pinTys[pj])
             nt = synthTypeRefFb(pinned[pj], -1, pinTys[pj])
             synthed = true
           }
