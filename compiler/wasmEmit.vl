@@ -670,6 +670,7 @@ import {
   exprIsStrIndexOf,
   exprIsStrOrder,
   exprIsStrSlice,
+  exprIsV128,
   exprListCellBuildKind,
   exprListCellBuildSlot,
   exprMap,
@@ -4469,6 +4470,8 @@ export function emitUnionCoerce(
     cak = 13 // "u8[]"
   } else if exprArray(exprIx, fnIx) {
     cak = 7 // "i32[]"
+  } else if exprIsV128(exprIx, fnIx) {
+    cak = 14 // "v128"
   } else if exprIsF32(exprIx, fnIx) {
     // D978 — ask the union which arm stores an f32, do not assume the f32 one. A union with
     // only an `f64` arm stores it there, losslessly, and assuming kind 5 asks for an f32 box
@@ -14686,7 +14689,8 @@ function emitAsCast(body: u8[], e: AsExpr, _exprIx: i32, fnIx: i32) {
   const tgt = e.asTy
   // A `new v128` brand cast (`x as F32x4`, `v as! v128`) re-brands the same 128 bits — the
   // checker admitted it only between two v128s, and the canon pass spelled the brand as its base.
-  if tgt == "v128" { return emitExpr(body, obj, fnIx) }
+  // A boxed `v128 | null` or union operand takes the union arm below instead.
+  if tgt == "v128" && !exprUnion(obj, fnIx) { return emitExpr(body, obj, fnIx) }
   if e.asMode == "wrap" { return emitNumWrapCast(body, e, _exprIx, fnIx) }
   // union-operand `as` is the propagating cast (`error-handling-design.md` §Trio): evaluate
   // the box once into `$unionAs`, compare its tag against T's, and on a miss `return` the
@@ -14797,7 +14801,10 @@ function emitAsCast(body: u8[], e: AsExpr, _exprIx: i32, fnIx: i32) {
       // a box already tagged with the wanted arm is a value of the target type, so hand
       // back the operand's own box, or a null box ref on the miss. Boolean is excluded —
       // `boolean | null` is the sentinel niche (`i32.const 2`), not a box.
-      if subUnion || armVi < 0 && (ak == 0 || ak == 3 || ak == 4 || ak == 5) {
+      if (
+        subUnion
+        || armVi < 0 && (ak == 0 || ak == 3 || ak == 4 || ak == 5 || ak == 14)
+      ) {
         fbIfRefNul(uBoxIdx, false) // if (result (ref $uBoxIdx))
         fbLocalGet(unionAsSlot)
         fbElse()
@@ -23353,6 +23360,12 @@ function emitPrintNulLitUnion(
 // `emitUnionUnboxTail` recovery. The `null` arm has no payload and prints the word.
 function emitPrintUnionArm(body: u8[], slot: i32, k: i32) {
   if k == nullValKind() { return emitPrintNullWord() }
+  // A vector has no print; the checker admits the print only where it narrowed the vector
+  // arm away, so the tag cannot select it.
+  if k == 14 {
+    fbUnreachable()
+    return 0
+  }
   fbLocalGet(slot)
   if emitUnionUnboxTail(k) < 0 { return -1 }
   if k == 2 {
