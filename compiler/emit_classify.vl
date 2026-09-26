@@ -1798,6 +1798,14 @@ export function nulVariantIdxOfExpr(exprIx: i32, fnIx: i32) {
   if e is BinExpr {
     const cri = coalesceMvSlot(exprIx, fnIx)
     if cri >= 0 { return mvValVariantOf(cri) }
+    // The index half of `exprNullableVariant`'s `??` rung: the left niche's row.
+    if e.binOp == "??" {
+      if !coalesceResultIsBox(exprIx) {
+        if exprNullableVariant(e.binLeft, fnIx) {
+          return nulVariantIdxOfExpr(e.binLeft, fnIx)
+        }
+      }
+    }
   }
   if e is AsExpr { return nulVariantIndexOf(exprIx) }
   // The index half of the nested-shape field arm — same field, same column, one fact
@@ -2732,6 +2740,8 @@ export function exprNullableStruct(exprIx: i32, fnIx: i32) {
     // `const nv = p ?? q` binds a non-null struct cell and its `nv != null` lowers as struct
     // equality, while an annotated consumer takes the `(ref null $S)` cell.
     if e.binOp == "??" {
+      // A join to a default of another type is the union box, never the operand's niche.
+      if coalesceResultIsBox(exprIx) { return false }
       if exprNullableStruct(e.binLeft, fnIx) {
         return coalesceDefaultNullable(e.binRight, fnIx)
       }
@@ -12587,7 +12597,15 @@ function stashHitAt(ix: i32, fnIx: i32, want: StashWant): boolean {
       // once, tests it and reads it back on the non-null path (D1714). Sharing the reservation
       // is sound because the two never stage inside one another — a `?.` operand of a joining
       // `??` has finished with its own base by the time the join tees over it.
-      return coalesceNicheJoinsToBox(ix, fnIx)
+      if coalesceNicheJoinsToBox(ix, fnIx) { return true }
+      // A left-nested chain is re-associated at emit time, so any link may become a niche
+      // join the original nodes do not show; a boxed chain reserves the slot for all of them.
+      if !coalesceResultIsBox(ix) { return false }
+      const cj = P.nodes[ix]
+      if cj is BinExpr {
+        return coalesceChainLeftmost(cj.binLeft) != unwrapParen(cj.binLeft)
+      }
+      return false
     }
     "listget" => {
       return listGetStagesOperand(ix)
@@ -27580,6 +27598,17 @@ export function exprNullableVariant(exprIx: i32, fnIx: i32) {
     if exprNullableVariant(nlIfV, fnIx) { return true }
   }
   if e is AsExpr { return retNulVariantFlag(exprIx) == 1 }
+  // The `??` rung its struct twin has: a same-arm `p ?? q` over the niche stays the niche while
+  // its default is nullable, so a box it is delivered into tests it for null (D2373).
+  if e is BinExpr {
+    if e.binOp == "??" {
+      if coalesceMvSlot(exprIx, fnIx) < 0 && !coalesceResultIsBox(exprIx) {
+        if exprNullableVariant(e.binLeft, fnIx) {
+          return coalesceDefaultNullable(e.binRight, fnIx)
+        }
+      }
+    }
+  }
   if e is Call {
     const callee = P.nodes[e.callFn]
     if callee is Ident {
@@ -28337,8 +28366,11 @@ export function exprVariantIndex(exprIx: i32, fnIx: i32) {
     // A `<T|null> ?? <T>` whose `T` is a union ARM yields the non-null arm ref — the
     // variant twin of `structIndexOfExpr`'s own `??` arm, and needed for the same reason:
     // without it `(r ?? d).field` has no layout. The left's nullable-variant row drives
-    // it, else the right default's.
+    // it, else the right default's. A join to another type is the box and has no row (D2373).
     if e.binOp == "??" {
+      if coalesceResultIsBox(exprIx) { return -1 }
+      // A nullable default keeps the result the niche, which no concrete row answers for.
+      if exprNullableVariant(exprIx, fnIx) { return -1 }
       if exprNullableVariant(e.binLeft, fnIx) {
         const lv = nulVariantIdxOfExpr(e.binLeft, fnIx)
         if lv >= 0 { return lv }
@@ -28671,6 +28703,7 @@ export function structIndexOfExpr(exprIx: i32, fnIx: i32) {
     // A `<S|null> ?? <S>` coalesce resolves to the (inner) struct index — so `(r ?? d).field` finds
     // the layout. The left's nullable struct drives it (its inner struct), else the right default.
     if e.binOp == "??" {
+      if coalesceResultIsBox(exprIx) { return -1 }
       const ls = structIndexOfExpr(e.binLeft, fnIx)
       if ls >= 0 { return ls }
       return structIndexOfExpr(e.binRight, fnIx)
@@ -29167,6 +29200,8 @@ export function exprUnion(exprIx: i32, fnIx: i32) {
     // nullable rep to test. Delegated to the name-typed mirror so the two cannot disagree.
     if e.binOp == "??" {
       if unionNameOfExpr(exprIx, fnIx) != "" { return true }
+      // A niche joined to a default of another type is the box the lowering builds (D2373).
+      if coalesceNicheJoinsToBox(exprIx, fnIx) { return true }
     }
     // D1589 — an assignment's value is its target cell, the rule `fnAssignRetKind` already
     // states for the functype. Delegated to the target rather than re-derived, since the
@@ -29719,18 +29754,57 @@ export function coalesceNulRefNicheOperand(ix: i32, fnIx: i32): boolean {
 // default of another type, so the result is the union BOX rather than the niche's own rep?
 // Two or more non-null members is what makes the result a box; one is the niche itself (D2383).
 export function coalesceNicheJoinsToBox(ix: i32, fnIx: i32): boolean {
+  if !coalesceResultIsBox(ix) { return false }
+  const e = P.nodes[ix]
+  if e is BinExpr {
+    const l = coalesceChainLeftmost(e.binLeft)
+    return coalesceNulRefNicheOperand(l, fnIx) || exprNulBool(l, fnIx)
+  }
+  false
+}
+
+// Is the `??` at `ix` typed as a union box, two or more non-null members under one row? Then
+// no single record row answers for its value, whatever rep its left operand has (D2373).
+export function coalesceResultIsBox(ix: i32): boolean {
+  if ix < 0 { return false }
   const e = P.nodes[ix]
   if e is BinExpr {
     if e.binOp != "??" { return false }
+    // The arena answers first: a result that is no union, or a one-member niche, renders nothing.
+    let rt = nodeTyPinIxOf(ix)
+    if rt < 0 || rt >= T.tys.length { return false }
+    const rtt = T.tys[rt]
+    if rtt is TyNullable { rt = rtt.nInner }
+    if rt < 0 || rt >= T.tys.length { return false }
+    const rtu = T.tys[rt]
+    if !(rtu is TyUnion) { return false }
+    if rtu.uMembers.length < 2 { return false }
     const jn = coalesceResultUnionName(ix)
     if jn == "" { return false }
     let js = unionMemberSetOf(jn)
     if js == "" { js = jn }
-    if unionSetNonNullCount(js) < 2 { return false }
-    const l = unwrapParen(e.binLeft)
-    return coalesceNulRefNicheOperand(l, fnIx) || exprNulBool(l, fnIx)
+    return unionSetNonNullCount(js) >= 2
   }
   false
+}
+
+// The first operand of a left-nested `??` chain, parens peeled: `emitCoalesceGo` lowers
+// `(a ?? b) ?? d` as `a ?? (b ?? d)` under the chain's type, so `a` is the operand whose
+// niche the lowering tests, never the inner link's box.
+function coalesceChainLeftmost(ix: i32): i32 {
+  let l = unwrapParen(ix)
+  let more = true
+  while more && l >= 0 {
+    more = false
+    const ln = P.nodes[l]
+    if ln is BinExpr {
+      if ln.binOp == "??" {
+        l = unwrapParen(ln.binLeft)
+        more = true
+      }
+    }
+  }
+  l
 }
 
 // The registered union a node's own type is, when its render cannot name it: an inference
