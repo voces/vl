@@ -555,7 +555,8 @@ unbox and `is` resolve a mono arm to its key's struct. Cost: a program with no i
 mono map arm is byte-identical (270 of 270 fixture programs, including every one spelling a map
 in a union), and the seed grew 0.06%. Option (b) below changes the box's own type, so every
 module that builds a union would move. Two maps that share one struct, `{[K]: i32} |
-{[K]: boolean}`, still share a tag; that is D2493, now refused at check for every key rep.
+{[K]: boolean}`, still share a tag; that is D2493, now refused at check at a test that must tell them apart
+(`is`, a `match` arm, `as`), at every key rep.
 
 `const u: {[i32]: i32} | i32 = m` refuses with `an i32-keyed Map/Set is supported as … not
 inside '{[i32]:i32}|i32'`, and it is the ONE container position left after B6a opened the other

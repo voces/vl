@@ -12674,45 +12674,53 @@ function setMapUnionClashMsg(members: i32[], isJoin: boolean): string {
     }
     i = i + 1
   }
-  mapPairUnionClashMsg(members, isJoin)
+  ""
 }
 
-// The map-with-map twin of the refusal above (D2493): two maps whose keys hash alike and whose
-// values each rep as one i32 cell (`{[K]: i32}` beside `{[K]: boolean}`) lower to one map
-// struct and one box tag, so `is` could not tell them apart either. Both keys and both values
-// must be pinned; an unpinned side may still become the other's type.
-function mapPairUnionClashMsg(members: i32[], isJoin: boolean): string {
+// The map-with-map twin of the refusal above (D2493), asked only where a test must tell two
+// arms apart: `x is T`, a `match` arm or an `as` naming the map `chk`, over the members `mems`.
+// Two maps whose keys hash alike and whose values each rep as one i32 cell share one map struct
+// and one box tag, so the test could not answer; a union holding both is otherwise fine.
+function mapTwinTestMsg(mems: i32[], chk: i32, what: string): string {
+  if chk < 0 { return "" }
+  const ct = T.tys[chk]
+  if !(ct is TyMap) { return "" }
+  const flat: i32[] = []
+  mapTwinFlatten(mems, flat, 4)
   let i = 0
-  while i < members.length {
-    const a = members[i]
-    if a >= 0 {
-      const at = T.tys[a]
-      if at is TyMap {
-        let j = i + 1
-        while j < members.length {
-          const b = members[j]
-          if b >= 0 {
-            const bt = T.tys[b]
-            if bt is TyMap {
-              if mapPairSharesRep(at, bt) && !tyEq(a, b) {
-                if isJoin {
-                  return "two maps do not join into one value yet: they share one representation, so `is` could not tell them apart — give every branch the same map type"
-                }
-                return "a union cannot hold both "
-                  + tyToStr(a)
-                  + " and "
-                  + tyToStr(b)
-                  + " yet: they share one representation, so `is` could not tell them apart — keep one of the two, or wrap each in a record with a discriminant field"
-              }
-            }
-          }
-          j = j + 1
-        }
+  while i < flat.length {
+    const b = flat[i]
+    const bt = T.tys[b]
+    if bt is TyMap {
+      if mapPairSharesRep(ct, bt) && !tyEq(chk, b) {
+        return what
+          + " cannot tell "
+          + tyToStr(chk)
+          + " from "
+          + tyToStr(b)
+          + " yet: they share one representation — wrap each in a record with a discriminant field"
       }
     }
     i = i + 1
   }
   ""
+}
+
+// The members `mems` names, with a nested union or nullable spread into its own members.
+function mapTwinFlatten(mems: i32[], out: i32[], depth: i32) {
+  if depth <= 0 { return 0 }
+  let i = 0
+  while i < mems.length {
+    const m = mems[i]
+    if m >= 0 {
+      const t = T.tys[m]
+      if t is TyUnion { mapTwinFlatten(t.uMembers, out, depth - 1) }
+      else if t is TyNullable { mapTwinFlatten([t.nInner], out, depth - 1) }
+      else { out.push(m) }
+    }
+    i = i + 1
+  }
+  0
 }
 
 // Whether two maps (neither a Set) share one lowering: pinned keys that hash alike and pinned
@@ -47601,6 +47609,8 @@ function checkMatchTypeArms(n: MatchExpr, ix: i32, st: i32, uMems: i32[]) {
               patIx,
             )
           }
+          const twin = mapTwinTestMsg(uMems, pt, "a `match` arm")
+          if twin != "" { tErr(twin, patIx) }
         }
       } else if pn is StrLit {
         // A string-literal pattern discriminates a litunion's member text; over a value union
@@ -48793,6 +48803,11 @@ function checkCastNode(n: AsExpr, ix: i32) {
             + tyToStr(argU),
           ix,
         )
+        return TY_ERR
+      }
+      const twin = mapTwinTestMsg([argU], target, "`as`")
+      if twin != "" {
+        tErr(twin, ix)
         return TY_ERR
       }
       const rest = subtractTy(argU, target)
@@ -52722,6 +52737,8 @@ function checkIsExprNode(n: IsExpr, ix: i32) {
         )
       }
     } else {
+      const twin = mapTwinTestMsg([objTy], chkTy, "`is`")
+      if twin != "" { tErr(twin, ix) }
       recordCollapsedIsAt(n, ix, objTy, chkTy)
     }
   }
