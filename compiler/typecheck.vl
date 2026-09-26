@@ -122,7 +122,13 @@ import {
   memberCallRungAdd,
 } from "./ast"
 // Getter declarations (property-access-design.md §D3a).
-import { getDeclExported, getDeclLabel, getDeclPropOf, mkIdent } from "./ast"
+import {
+  fnDeclExported,
+  getDeclExported,
+  getDeclLabel,
+  getDeclPropOf,
+  mkIdent,
+} from "./ast"
 // The free index-operator declaration-name encoding (B14).
 import {
   OP_INDEX_GET,
@@ -302,7 +308,7 @@ import {
 // write-effect summary behind the aliased-write invalidation needs the same total
 // traversal the lint rules do, and a second copy is a second thing to keep in step with
 // the node roster.
-import { elseIfLink, nodeSpineChildren } from "./ast"
+import { elseIfLink, nodeChildren, nodeSpineChildren } from "./ast"
 // The file a node came from, named in a record-covariance refusal that crosses modules.
 import { srcmapModOfTok, srcmapPathOf } from "./srcmap"
 
@@ -2858,6 +2864,13 @@ let inRetArg = false
 let ifNoValueAt: {[i32]: boolean} = Map()
 // Per node: an `if`/`else`'s completing-arm value join (`ifTailValTyOf`), -1 where unrecorded.
 let ifValTyAt: {[i32]: i32} = Map()
+// Per node: true at an `if` or block whose value is discarded — a statement that is not its
+// block's value, a loop body, or the tail of a void body. Such an `if` is `void` whatever its
+// arms hold, so a value nobody reads is never typed for lowering (D2631).
+let valDiscardAt: {[i32]: boolean} = Map()
+// Per discarded `if`: the value it would have had, typed on no node. A block's tail and the
+// editor's view of an unread function read it, so what a user sees is what they wrote.
+let discardValTyAt: {[i32]: i32} = Map()
 // The value type of the most recently checked `Block` — its trailing expression's type, or
 // `TY_VOID` when the block ends in a statement. `checkNode(Block)` itself returns `TY_VOID`, so
 // this carries the tail value out of band for an `if … { v } else { w }` expression to join its
@@ -4076,6 +4089,8 @@ export function initChecker() {
   inferRetSeeding = false
   ifNoValueAt = Map()
   ifValTyAt = Map()
+  valDiscardAt = Map()
+  discardValTyAt = Map()
   inferDroppedTy = []
   // Pass 0 and pass 1's collect tables, reset here with everything else: every
   // `checkProgram` reaches its walk through a caller that ran `initChecker` first
@@ -35585,6 +35600,332 @@ function checkTrailingChainTotal(stmtIx: i32, retTy: i32) {
   }
 }
 
+// Un-annotated top-level functions whose result no caller consumes, by declaration node: the
+// checker hoists and checks each as `: void` and `computeVoidFns` agrees, so a tail value
+// nobody reads is never typed for lowering (D2631). Filled once per program by `ucCompute`.
+let fnUnconsumedAt: {[i32]: boolean} = Map()
+
+export function fnResultUnconsumed(fnIx: i32): boolean {
+  if fnIx < 0 { return false }
+  fnUnconsumedAt[fnIx] ?? false
+}
+
+// A walk position: the value is read, discarded, or the tail of candidate `k >= 0` — read
+// exactly when that candidate's own result is.
+const UC_VALUE = -2
+const UC_DISCARD = -1
+let ucCandIx: {[string]: i32} = Map()
+let ucCandNode: i32[] = []
+let ucConsumed: boolean[] = []
+// Whether anything calls candidate `k`: a function nothing calls keeps its inferred return.
+let ucCalled: boolean[] = []
+// Tail calls as one linked list per caller: `ucEdgeHead[k]` is candidate `k`'s first edge.
+let ucEdgeHead: i32[] = []
+let ucEdgeTo: i32[] = []
+let ucEdgeNext: i32[] = []
+
+// A candidate's name: a plain identifier, so no getter (`T.p`) or operator declaration, both
+// of which the compiler calls without a name at the site.
+function ucNameIsPlain(name: string): boolean {
+  if name.length == 0 { return false }
+  let i = 0
+  while i < name.length {
+    const c = name.charCodeAt(i)
+    const ok = (c >= 48 && c <= 57)
+      || (c >= 65 && c <= 90)
+      || (c >= 97 && c <= 122)
+    if !ok && c != 95 && c != 36 { return false }
+    i = i + 1
+  }
+  true
+}
+
+// Could the top-level declaration at `ix` stop returning its value? Only an un-annotated,
+// un-exported plain function with a body, no `self` receiver (a protocol may call one) and no
+// `return <value>`.
+function ucIsCandidate(ix: i32): boolean {
+  const n = P.nodes[ix]
+  if !(n is FuncDecl) { return false }
+  if n.fnRet >= 0 || !ucNameIsPlain(n.fnName) || fnDeclExported(ix) {
+    return false
+  }
+  if n.fnBody < 0 || !(P.nodes[n.fnBody] is Block) { return false }
+  if n.fnParams.length > 0 {
+    const p0 = P.nodes[n.fnParams[0]]
+    if p0 is Param {
+      if p0.parName == "self" { return false }
+    }
+  }
+  !blockHasValuedRet(n.fnBody)
+}
+
+// A use of `name` whose value is read: a candidate so named keeps its result.
+function ucUse(name: string) {
+  const k = ucCandIx[name] ?? -1
+  if k >= 0 { ucConsumed[k] = true }
+  0
+}
+
+// A call of `name` at position `ctx`.
+function ucCallUse(name: string, ctx: i32) {
+  const k = ucCandIx[name] ?? -1
+  if k < 0 { return 0 }
+  ucCalled[k] = true
+  if ctx == UC_VALUE {
+    ucConsumed[k] = true
+  } else if ctx >= 0 {
+    ucEdgeTo.push(k)
+    ucEdgeNext.push(ucEdgeHead[ctx])
+    ucEdgeHead[ctx] = ucEdgeTo.length - 1
+  }
+  0
+}
+
+// Every statement of a block but the last is discarded; the last is at `lastCtx`.
+function ucBlock(ix: i32, lastCtx: i32) {
+  const b = P.nodes[ix]
+  if b is Block {
+    const n = b.blkStmts.length
+    let i = 0
+    while i < n {
+      let c = UC_DISCARD
+      if i == n - 1 { c = lastCtx }
+      ucWalk(b.blkStmts[i], c)
+      i = i + 1
+    }
+  }
+  0
+}
+
+// An `if` or `match` arm: a block takes the arm's position, a bare expression is read.
+function ucArm(ix: i32, ctx: i32) {
+  if ix < 0 { return 0 }
+  if P.nodes[ix] is Block { return ucBlock(ix, ctx) }
+  ucWalk(ix, UC_VALUE)
+}
+
+// The position a function body's last statement takes: a declared or bare-`return` void
+// discards it, a candidate reads it only when its own result is read, anything else reads it.
+function ucBodyCtx(ix: i32, n: FuncDecl): i32 {
+  if n.fnRet >= 0 {
+    const r = P.nodes[n.fnRet]
+    if r is TypeRef {
+      if r.tyName == "void" { return UC_DISCARD }
+    }
+    return UC_VALUE
+  }
+  if n.fnBody >= 0 && blockHasBareReturn(n.fnBody) { return UC_DISCARD }
+  const k = ucCandIx[n.fnName] ?? -1
+  if k >= 0 && ucCandNode[k] == ix { return k }
+  UC_VALUE
+}
+
+// Walks `ix` at position `ctx`, recording each candidate use. A nested declaration or a lambda
+// is not a candidate, and a candidate's declaration met anywhere but the top level is read.
+function ucWalk(ix: i32, ctx: i32) {
+  let cur = ix
+  while cur >= 0 && cur < P.nodes.length {
+    const at = cur
+    const n = P.nodes[at]
+    cur = -1
+    if n is Block {
+      ucBlock(at, ctx)
+    } else if n is IfStmt {
+      ucWalk(n.ifCond, UC_VALUE)
+      ucArm(n.ifThen, ctx)
+      if n.ifElse >= 0 {
+        if P.nodes[n.ifElse] is IfStmt {
+          cur = n.ifElse
+        } else {
+          ucArm(n.ifElse, ctx)
+        }
+      }
+    } else if n is MatchExpr {
+      ucWalk(n.matchScrut, UC_VALUE)
+      let mi = 0
+      while mi < n.matchBodies.length {
+        ucArm(n.matchBodies[mi], ctx)
+        mi = mi + 1
+      }
+    } else if n is Call {
+      const c = P.nodes[n.callFn]
+      if c is Ident {
+        ucCallUse(c.identName, ctx)
+      } else if c is Member {
+        ucCallUse(c.memProp, ctx)
+        ucWalk(c.memObj, UC_VALUE)
+      } else {
+        ucWalk(n.callFn, UC_VALUE)
+      }
+      let ai = 0
+      while ai < n.callArgs.length {
+        ucWalk(n.callArgs[ai], UC_VALUE)
+        ai = ai + 1
+      }
+    } else if n is Ident {
+      ucUse(n.identName)
+    } else if n is Member {
+      ucUse(n.memProp)
+      ucWalk(n.memObj, UC_VALUE)
+    } else if n is OptMember {
+      ucUse(n.omProp)
+      ucWalk(n.omObj, UC_VALUE)
+    } else if n is WhileStmt {
+      ucWalk(n.whileCond, UC_VALUE)
+      ucBlock(n.whileBody, UC_DISCARD)
+    } else if n is ForRange {
+      ucWalk(n.frFrom, UC_VALUE)
+      ucWalk(n.frTo, UC_VALUE)
+      ucWalk(n.frStep, UC_VALUE)
+      ucBlock(n.frBody, UC_DISCARD)
+    } else if n is ForIn {
+      ucWalk(n.fiIter, UC_VALUE)
+      ucBlock(n.fiBody, UC_DISCARD)
+    } else if n is FuncDecl {
+      ucFunc(at, n, false)
+    } else {
+      // Every other kind reads each child it has.
+      const kids = nodeChildren(at)
+      let ki = 0
+      while ki < kids.length {
+        ucWalk(kids[ki], UC_VALUE)
+        ki = ki + 1
+      }
+    }
+  }
+  0
+}
+
+function ucFunc(ix: i32, n: FuncDecl, top: boolean) {
+  if !top {
+    const k = ucCandIx[n.fnName] ?? -1
+    if k >= 0 && ucCandNode[k] == ix { ucConsumed[k] = true }
+  }
+  let pi = 0
+  while pi < n.fnParams.length {
+    const p = P.nodes[n.fnParams[pi]]
+    if p is Param { ucWalk(p.parDefault, UC_VALUE) }
+    pi = pi + 1
+  }
+  let bctx = UC_VALUE
+  if top { bctx = ucBodyCtx(ix, n) }
+  else if n.fnRet >= 0 { bctx = ucBodyCtx(ix, n) }
+  ucBlock(n.fnBody, bctx)
+  0
+}
+
+// Fills `fnUnconsumedAt` for the program at `rootIx`: one walk records each candidate's reads
+// and its tail calls, then a read or never-called candidate's tail callees are read too.
+function ucCompute(rootIx: i32) {
+  fnUnconsumedAt = Map()
+  ucCandIx = Map()
+  ucCandNode = []
+  ucConsumed = []
+  ucCalled = []
+  ucEdgeHead = []
+  ucEdgeTo = []
+  ucEdgeNext = []
+  const root = P.nodes[rootIx]
+  if !(root is Program) { return 0 }
+  const stmts = root.progStmts
+  let i = 0
+  while i < stmts.length {
+    const s = P.nodes[stmts[i]]
+    if s is FuncDecl {
+      // -3 is a name some other top-level declaration holds, so it is never a candidate.
+      const prev = ucCandIx[s.fnName] ?? -1
+      if prev >= 0 { ucConsumed[prev] = true }
+      if prev != -1 || !ucIsCandidate(stmts[i]) {
+        ucCandIx[s.fnName] = -3
+      } else {
+        ucCandIx[s.fnName] = ucCandNode.length
+        ucCandNode.push(stmts[i])
+        ucConsumed.push(false)
+        ucCalled.push(false)
+        ucEdgeHead.push(-1)
+      }
+    }
+    i = i + 1
+  }
+  if ucCandNode.length == 0 { return 0 }
+  i = 0
+  while i < stmts.length {
+    const s = P.nodes[stmts[i]]
+    if s is FuncDecl {
+      ucFunc(stmts[i], s, true)
+    } else {
+      ucWalk(stmts[i], UC_DISCARD)
+    }
+    i = i + 1
+  }
+  let c = 0
+  while c < ucCandNode.length {
+    if !ucCalled[c] { ucConsumed[c] = true }
+    c = c + 1
+  }
+  ucSettle()
+  let k = 0
+  while k < ucCandNode.length {
+    if !ucConsumed[k] { fnUnconsumedAt[ucCandNode[k]] = true }
+    k = k + 1
+  }
+  0
+}
+
+// Marks every candidate a read candidate tail-calls as read, transitively: a worklist over the
+// edge lists, so each edge is followed once.
+function ucSettle() {
+  const work: i32[] = []
+  let k = 0
+  while k < ucConsumed.length {
+    if ucConsumed[k] { work.push(k) }
+    k = k + 1
+  }
+  let wi = 0
+  while wi < work.length {
+    const from = work[wi]
+    wi = wi + 1
+    let e = ucEdgeHead[from]
+    while e >= 0 {
+      const to = ucEdgeTo[e]
+      if !ucConsumed[to] {
+        ucConsumed[to] = true
+        work.push(to)
+      }
+      e = ucEdgeNext[e]
+    }
+  }
+  0
+}
+
+// Does the node hold a `return <value>`, in any statement or expression but a nested function?
+function blockHasValuedRet(ix: i32): boolean {
+  let cur = ix
+  while cur >= 0 && cur < P.nodes.length {
+    const at = cur
+    const n = P.nodes[at]
+    cur = -1
+    if n is RetStmt {
+      if n.retArg >= 0 { return true }
+    } else if n is FuncDecl {
+      return false
+    } else if n is IfStmt {
+      if blockHasValuedRet(n.ifCond) || blockHasValuedRet(n.ifThen) {
+        return true
+      }
+      cur = n.ifElse
+    } else {
+      const kids = nodeChildren(at)
+      let ki = 0
+      while ki < kids.length {
+        if blockHasValuedRet(kids[ki]) { return true }
+        ki = ki + 1
+      }
+    }
+  }
+  false
+}
+
 // Does the block hold a bare `return`, recursing into if/while/for bodies but never into a
 // nested function, whose returns are its own? A bare `return` is legal only where nothing is
 // owed, so one anywhere in a body is the author writing `: void`; the checker pins the return
@@ -36469,6 +36810,11 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
       bareRetVoid = true
     }
   }
+  // ...and for a result no caller reads, which the hoist already bound as `: void` (D2631).
+  const ucVoided = inferring && fnResultUnconsumed(fnIx)
+  if ucVoided { inferring = false }
+  // The return an unread function shows in the editor: its tail's value, never lowered.
+  let ucShowRet = TY_VOID
   // The infer-stack key: a named function uses its name (so self-recursion is detected); an
   // anonymous lambda has no name and keys by node index instead — else two nested anonymous
   // lambdas would both key on "" and the inner would falsely trip the recursive-cycle guard, mis-inferring its return as `void`.
@@ -36772,10 +37118,17 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
           seedTailArms(stmts[s], ret)
         }
       }
+      // A statement before the tail, or the tail of a void body, is discarded.
+      if s < stmts.length - 1 || (!inferring && isVoidTy(ret)) {
+        markValDiscard(stmts[s])
+      }
       crStmtEnter(stmts[s])
       const stTy = checkNode(stmts[s])
       crStmtLeave()
       retTailPos = savedRTPbody
+      if ucVoided && tailIsReturn {
+        ucShowRet = discardedTailTy(stmts[s], stTy)
+      }
       // The trailing expression is the implicit return; under inference it is a
       // return-type witness. With a CONCRETE annotated return, a trailing empty
       // collection (`mk(): i32[] { … inner }`) pins its element from the return
@@ -36879,6 +37232,10 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
   // — `ifCondIsDiscriminating` looks up a discriminated param/local's type, which the
   // `popScope` below would drop. The flag is consumed after `ret` is finalized.
   const bodyTotalForRet = nodeIsTotal(n.fnBody)
+  // The editor shows an unread function's inferred return, not the `void` it lowers as.
+  if ucVoided && symEnabled != 0 && ucShowRet >= 0 && ucShowRet != TY_ERR {
+    symRetainType(fnIx, mkFuncTy(paramTys, ucShowRet), 2)
+  }
   T.curRet = savedRet
   inRetArg = savedInRetArg
   curFnEscName = savedEscName
@@ -37584,6 +37941,8 @@ function checkProgramNode(n: Program) {
           if r >= 0 { hret = r } else { hret = TY_VOID }
         }
       }
+      // A result no caller reads is not returned: hoisted as the `: void` it is checked as.
+      if hret == (-2) && fnResultUnconsumed(stmts[hi]) { hret = TY_VOID }
       declare(s.fnName, mkFuncTy(hpt, hret))
       fnDeclIx[s.fnName] = stmts[hi]
       declareFnDeclNode(s.fnName, stmts[hi])
@@ -37792,6 +38151,7 @@ function checkProgramNode(n: Program) {
   // Pass 2: check every top-level statement (bodies included).
   let j = 0
   while j < stmts.length {
+    markValDiscard(stmts[j])
     crStmtEnter(stmts[j])
     checkNode(stmts[j])
     crStmtLeave()
@@ -40963,6 +41323,7 @@ export function checkProgram(rootIx: i32) {
   // Before the tables below are sized, so every node it mints is checked (D1991).
   hoistMatchScrutinees(rootIx)
   annotateTyArgLambdas()
+  ucCompute(rootIx)
   const rootN0 = P.nodes[rootIx]
   if rootN0 is Program { gRootStmts = rootN0.progStmts }
   crReset()
@@ -47258,6 +47619,8 @@ function checkIfStmtNode(ix: i32) {
     cur = -1
     if c is IfStmt {
       frames.push(checkIfHead(c, at))
+      // A discarded chain discards every link and arm under it.
+      if c.ifElse >= 0 && valDiscarded(at) { markValDiscard(c.ifElse) }
       if c.ifElse >= 0 {
         if P.nodes[c.ifElse] is IfStmt {
           // `checkNode`'s entry for the inner link; an `if` is a tail-spine node.
@@ -47351,6 +47714,7 @@ function checkIfHead(n: IfStmt, ix: i32): IfChk {
   // this depth runs whenever the arm does and a deeper one is conditional (D1846).
   const thenOwnDepth = T.scopes.length + 1
   const thenLo = narClobKeys.length
+  if valDiscarded(ix) { markValDiscard(n.ifThen) }
   checkNode(n.ifThen)
   const thenHi = narClobKeys.length
   // The guard-clause divergence test, asked once the arm is checked so a `never` call in it is
@@ -47658,6 +48022,13 @@ function checkIfTail(
       else if ev != TY_VOID { valTy = joinTys(valTy, ev) }
     }
     if bareArm { ifValTyAt[ix] = -1 } else { ifValTyAt[ix] = valTy }
+  }
+  // A discarded `if` is a statement, whatever its arms hold.
+  if valDiscarded(ix) {
+    if ix >= 0 {
+      discardValTyAt[ix] = discardedIfValTy(daHasElse, thenTy, elseTy)
+    }
+    return TY_VOID
   }
   // The `if`-expression's value type: with an `else`, the join of the two branch tail
   // values.
@@ -52208,6 +52579,7 @@ function checkWhileStmtNode(n: WhileStmt, ix: i32) {
     pushScope(-1)
     applyNarrows(wnNames, wnTys)
   }
+  markValDiscard(n.whileBody)
   checkNode(n.whileBody)
   if wnNames.length > 0 { popScope() }
   popReBarrier()
@@ -52421,6 +52793,7 @@ function checkForRangeNode(n: ForRange, ix: i32) {
   // The loop variable is always assigned in the body — clear it from the dead-zone so a body
   // read isn't flagged when it shadows a still-uninitialized module global of the same name.
   daMarkAssigned(n.frVar)
+  markValDiscard(n.frBody)
   checkNode(n.frBody)
   daRollbackTo(daFrMark)
   daRelease(daFrMark)
@@ -52499,6 +52872,7 @@ function checkForInNode(n: ForIn, ix: i32) {
   // collide with a shadowed, still-uninitialized module global of the same name.
   daMarkAssigned(n.fiVar)
   if n.fiVar2 != "" { daMarkAssigned(n.fiVar2) }
+  markValDiscard(n.fiBody)
   checkNode(n.fiBody)
   daRollbackTo(daFiMark)
   daRelease(daFiMark)
@@ -52700,12 +53074,58 @@ function checkRetStmtNode(n: RetStmt, ix: i32) {
 }
 // ── block ─────────────────────────────────────────────────────────────────
 
+// The value a discarded `if` would have had: its arms' join, or `T | null` without an else.
+// A join clash is a value nobody reads, so it is not reported.
+function discardedIfValTy(hasElse: boolean, thenTy: i32, elseTy: i32): i32 {
+  if hasElse {
+    const savedClash = joinClashMsg
+    const j = joinTys(thenTy, elseTy)
+    joinClashMsg = savedClash
+    return j
+  }
+  if thenTy != TY_VOID && thenTy != TY_ERR { return mkNullableTy(thenTy) }
+  TY_VOID
+}
+
+// The value a discarded statement at `ix` would have had: a discarded `if`'s recorded value,
+// else its own type `ty`.
+function discardedValTyOf(ix: i32, ty: i32): i32 {
+  if ix < 0 { return ty }
+  const dv = discardValTyAt[ix] ?? -1
+  if dv >= 0 { return dv }
+  ty
+}
+
+// An unread function's tail value as inference would have taken it: an `if` with a value-less
+// arm is a statement, and a value-if answers the join of its completing arms.
+function discardedTailTy(ix: i32, ty: i32): i32 {
+  if isStmtNode(ix) && !(P.nodes[ix] is IfStmt) { return TY_VOID }
+  if ifYieldsNoValue(ix) { return TY_VOID }
+  const v = discardedValTyOf(ix, ty)
+  if v == TY_VOID || v == TY_ERR { return TY_VOID }
+  inferRetTyOf(ix, ifTailValTyOf(ix, v))
+}
+
+// Marks the `if` or block at `ix` as discarded (`valDiscardAt`); any other node is left alone.
+function markValDiscard(ix: i32) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const n = P.nodes[ix]
+  if n is IfStmt || n is Block { valDiscardAt[ix] = true }
+  0
+}
+
+function valDiscarded(ix: i32): boolean {
+  if ix < 0 { return false }
+  valDiscardAt[ix] ?? false
+}
+
 // Extracted from `checkNodeReal`'s `Block` arm (C3: thin the dispatcher).
 function checkBlockNode(n: Block, ix: i32) {
   const savedStmtBlk = chkStmtBlk
   chkStmtBlk = ix
   pushScope(ix)
   const stmts = n.blkStmts
+  const blkDiscard = valDiscarded(ix)
   const savedRTP = retTailPos
   let tailTy = TY_VOID
   let tailIx = -1
@@ -52718,6 +53138,7 @@ function checkBlockNode(n: Block, ix: i32) {
     } else {
       retTailPos = false
     }
+    if blkDiscard || i < stmts.length - 1 { markValDiscard(stmts[i]) }
     crStmtEnter(stmts[i])
     const sty = checkNode(stmts[i])
     crStmtLeave()
@@ -52732,9 +53153,11 @@ function checkBlockNode(n: Block, ix: i32) {
         // statement node — non-void only for a genuine value-`if` with an else.
         const lastN2 = P.nodes[stmts[i]]
         if lastN2 is IfStmt {
+          // A discarded tail keeps its value here, typed on no node, for an enclosing arm's join.
+          const ity = discardedValTyOf(stmts[i], sty)
           if lastN2.ifElse >= 0 {
-            if sty != TY_VOID && sty != TY_ERR {
-              tailTy = sty
+            if ity != TY_VOID && ity != TY_ERR {
+              tailTy = ity
               tailIx = stmts[i]
             }
           } else {
@@ -52742,11 +53165,11 @@ function checkBlockNode(n: Block, ix: i32) {
             // its then-arm completes with a value (D1995's ruling); a then-arm that always
             // exits yields nothing here, and its fall-through meets the function's own `null`.
             if (
-              sty != TY_VOID
-              && sty != TY_ERR
+              ity != TY_VOID
+              && ity != TY_ERR
               && !stmtAlwaysExits(lastN2.ifThen)
             ) {
-              tailTy = sty
+              tailTy = ity
               tailIx = stmts[i]
             }
           }
