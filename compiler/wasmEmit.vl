@@ -11049,8 +11049,8 @@ function emitStrConcat(body: u8[], binIx: i32, fnIx: i32) {
     // the shared `__str_concat__` helper — the allocate+copy core lives once per
     // module (`emitStrConcatFnCode`). A literal-union atom operand widens to its
     // member string (`emitStrValue`) before the call.
-    if emitStrValue(body, e.binLeft, fnIx) < 0 { return -1 }
-    if emitStrValue(body, e.binRight, fnIx) < 0 { return -1 }
+    if emitStrCatOperand(body, e.binLeft, fnIx) < 0 { return -1 }
+    if emitStrCatOperand(body, e.binRight, fnIx) < 0 { return -1 }
     fbCall(gHelpStrConcat)
     return 0
   }
@@ -11100,7 +11100,7 @@ function emitStrCatN(body: u8[], parts: i32[], fnIx: i32) {
   const n = parts.length
   let i = 0
   while i < n {
-    if emitStrValue(body, parts[i], fnIx) < 0 { return -1 }
+    if emitStrCatOperand(body, parts[i], fnIx) < 0 { return -1 }
     i = i + 1
   }
   let j = n - 1
@@ -11550,8 +11550,8 @@ function strSiteSlot(binIx: i32): i32 {
 }
 
 // Lower an armed site's chain, parts evaluated in the copying lowering's order. `mode` 1
-// extends what part 0 read, 2 what the last part read. A miss allocates `len + 2*added + 16`,
-// so a one-off append costs little; a full hit doubles, which is what makes a loop linear.
+// extends what part 0 read, 2 what the last part read. A miss allocates exact-fit, so a one-off
+// append keeps no slack; a full hit doubles, so a loop pays one extra copy and stays linear.
 function emitStrSiteCat(
   body: u8[],
   parts: i32[],
@@ -11562,7 +11562,7 @@ function emitStrSiteCat(
   const n = parts.length
   let i = 0
   while i < n {
-    if emitStrValue(body, parts[i], fnIx) < 0 { return -1 }
+    if emitStrCatOperand(body, parts[i], fnIx) < 0 { return -1 }
     i = i + 1
   }
   let j = n - 1
@@ -11633,16 +11633,14 @@ function emitStrSiteCat(
   fbLocalGet(strScratchBase + 3)
   fbI32Bin(106)
   fbI32Const(1)
-  fbI32Bin(116) // 2 * (len + added): a full hit doubles
+  fbI32Bin(116)
+  fbI32Const(16)
+  fbI32Bin(106) // 2 * (len + added) + 16: a full hit doubles
   fbLocalGet(strScratchBase + 4)
   fbLocalGet(strScratchBase + 3)
-  fbI32Const(1)
-  fbI32Bin(116)
-  fbI32Bin(106) // len + 2 * added: a miss
+  fbI32Bin(106) // len + added: a miss is exact-fit
   fbLocalGet(strScratchBase + 5)
   fbSelect()
-  fbI32Const(16)
-  fbI32Bin(106)
   fbArrayNewDefault(sBackIdx)
   fbLocalTee(strScratchBase + 2)
   fbLocalSet(sb)
@@ -11859,7 +11857,7 @@ function emitStrAccAppend(body: u8[], binIx: i32, fnIx: i32) {
       const n = parts.length
       let i = 1
       while i < n {
-        if emitStrValue(body, parts[i], fnIx) < 0 { return -1 }
+        if emitStrCatOperand(body, parts[i], fnIx) < 0 { return -1 }
         i = i + 1
       }
       let j = n - 1
@@ -24258,6 +24256,26 @@ function emitStrValue(body: u8[], ix: i32, fnIx: i32) {
   }
   const re = emitExpr(body, ix, fnIx)
   re
+}
+
+// A concatenation operand: a string VALUE even when the destination the whole chain feeds is
+// `string | null`, so that target's raw-read seed must not reach it, or a narrowed nullable
+// reads as `(ref null)` into a non-null slot (D2682).
+function emitStrCatOperand(body: u8[], ix: i32, fnIx: i32) {
+  if pendingNulString || pendingRawNullRead {
+    const ctx = expCtxHere()
+    ctx.nulString = false
+    ctx.rawNullRead = false
+    if exprIsLitAtom(ix, fnIx) {
+      const saved = expCtxHere()
+      expCtxApply(ctx)
+      const ra = emitAtomToStr(body, ix, fnIx)
+      expCtxApply(saved)
+      return ra
+    }
+    return emitExprExpect(body, ix, fnIx, ctx)
+  }
+  emitStrValue(body, ix, fnIx)
 }
 
 // Narrow a string-repped literal-union value to its interned i32 atom id — `emitAtomToStr`'s

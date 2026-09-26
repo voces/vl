@@ -5802,8 +5802,10 @@ lowering evaluates them, left to right and once; only the allocation differs, so
 evaluation order and every printed value are the copying lowering's (an aliasing grid over
 every shape and a 40-seed randomized mix of appends, prepends, snapshots, restores and shared
 strings agree with the copying compiler line for line). A miss allocates
-`len + 2*added + 16` (a one-off append pays a little slack, not a doubling) and a full hit
-doubles, which is what makes a loop linear. The binding proof still wins where it applies —
+EXACT-FIT, `len + added`, and a full hit doubles: a loop pays one extra copy on its first hit
+and stays linear, and a one-off append keeps no slack. Slack on a miss is RETAINED memory,
+not garbage — a first cut that gave a miss `len + 2*added + 16` made one append to each of
+1M objects 148 -> 295 MB and 0.06 -> 0.17 s (review of #3192). The binding proof still wins where it applies —
 its lowering has no test — so a proven local keeps its bytes.
 
 Two shapes stay quadratic, filed rather than guessed at: a site outside any loop reached from
