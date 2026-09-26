@@ -331,12 +331,11 @@ Deno.test({
   fn: async () => {
     await withDir(async (dir) => {
       const file = `${dir}/emit.vl`;
-      // D2492's witness: `vl check` accepts it and the emitter has no for-in over a list of maps.
+      // D2524's witness: `vl check` accepts it and the emitter has no rep for the pushed `null`.
       await Deno.writeTextFile(
         file,
-        "const xs: {[string]: i32}[] = [Map()]\n" +
-          'xs[0]["k"] = 1\n' +
-          "for s in xs { for k in s.keys() { print(k) } }\n",
+        "function use(v) {\n  v.push(null)\n  print(v.length)\n}\n" +
+          "const xs: (string | null)[] = []\nuse(xs)\n",
       );
       const { code, out } = await run(["check", "--codegen", file, "--json"]);
       if (code === 0) throw new Error(`expected a refusal, got exit 0: ${out}`);

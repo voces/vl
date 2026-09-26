@@ -59,6 +59,7 @@ import {
   annUnionAtomsOf,
   anyLitUnionUsed,
   asgNarTyIxOf,
+  asgStoreTyOf,
   atomicIntrinsicIsVoid,
   cUserTypesVer,
   callRetireAfterOf,
@@ -3677,9 +3678,63 @@ export function asgReadNode(asgIx: i32, fnIx: i32): i32 {
   const a = P.nodes[asgIx]
   if a is BinExpr {
     if asgReadNarrows(asgIx, fnIx) { return a.binRight }
+    if asgReadUnwidenOp(asgIx, fnIx) >= 0 { return a.binRight }
     return a.binLeft
   }
   asgIx
+}
+
+// The opcode taking the re-read of a widening assignment's target cell back to its right
+// side's rep — a scalar narrowed back, or a nullable ref recovered — or -1 where the reps
+// agree. Each widening it inverts is injective; a tail returning the cell keeps it (D2512).
+export function asgReadUnwidenOp(asgIx: i32, fnIx: i32): i32 {
+  const vt = nodeTyIxOf(asgIx)
+  const st = asgStoreTyOf(asgIx)
+  if vt < 0 || st < 0 { return -1 }
+  if asgIsCellTail(asgIx, fnIx) { return -1 }
+  // A ref written into its own nullable niche: the cell is `(ref null T)`, the value `(ref T)`.
+  const stT = T.tys[st]
+  if stT is TyNullable {
+    if stT.nInner < 0 || !tySame(stT.nInner, vt) { return -1 }
+    const vT = T.tys[vt]
+    if vT is TyObj || vT is TyArray || vT is TyMap || vT is TyFunc {
+      return 212 // 0xd4 ref.as_non_null
+    }
+    return -1
+  }
+  const vn = tyPrimNameOf(vt)
+  const sn = tyPrimNameOf(st)
+  if vn == null || sn == null { return -1 }
+  match vn {
+    "i32" => {
+      return unwidenI32From(sn)
+    }
+    "f32" => {
+      if sn == "f64" {
+        return 182 // 0xb6 f32.demote_f64
+      }
+      return -1
+    }
+    "i64" | "f64" | "boolean" | "string" | "void" | "null" | "never" | "u8" | "v128" => {
+      return -1
+    }
+  }
+}
+
+// The opcode taking an `i32` value widened into a `sn` cell back to `i32`, or -1 where `sn`
+// is no widening of it.
+function unwidenI32From(sn: PrimName): i32 {
+  match sn {
+    "f64" => {
+      return 170 // 0xaa i32.trunc_f64_s
+    }
+    "i64" => {
+      return 167 // 0xa7 i32.wrap_i64
+    }
+    "i32" | "f32" | "boolean" | "string" | "void" | "null" | "never" | "u8" | "v128" => {
+      return -1
+    }
+  }
 }
 
 // True if the re-read of assignment `asgIx`'s target is lowered narrowed: the value has one
@@ -5133,10 +5188,31 @@ function capturedBindingFrameOf(fnIx: i32, name: string) {
   parentBindingFrameArenaOf(fe, name)
 }
 
-// The `for-in` node whose loop variable binds a captured `name` of lifted frame `fe`, or -1
-// (D1142) — the third storage class of a capture, and the one with no declaration node, so
-// `captureValKind` would fall to its i32 default whatever the iterated element is. Asked
-// only where `parentBindingOf` declines, which is the right precedence by construction.
+// The loop node binding a captured `name` of lifted frame `fe` as a loop variable — either of
+// a `for-in`'s two names, or a range's counter — or -1.
+function captureLoopNodeOf(fe: i32, name: string): i32 {
+  const par = parentBindingFrameOf(fe, name)
+  if par < 0 { return moduleLoopEnclosing(fe, name) }
+  if par >= fnStmts.length { return -1 }
+  const pfn = P.nodes[fnStmts[par]]
+  if pfn is FuncDecl { return parentLoopVarOf(pfn.fnBody, name) }
+  -1
+}
+
+// Whether a captured loop variable `name` is its `for-in`'s SECOND name — a map's value or a
+// sequence's index, typed by `forInPairElemKind` rather than the element ladder (D2511).
+function captureLoopVarIsPair(fe: i32, name: string): boolean {
+  const lv = captureLoopNodeOf(fe, name)
+  if lv < 0 { return false }
+  const ln = P.nodes[lv]
+  if ln is ForIn { return ln.fiVar2 == name }
+  false
+}
+
+// The iterable of the `for-in` whose loop variable binds a captured `name` of lifted frame
+// `fe`, or -1 (D1142) — the third storage class of a capture, and the one with no declaration
+// node, so `captureValKind` would fall to its i32 default whatever the iterated element is.
+// Asked only where `parentBindingOf` declines, which is the right precedence by construction.
 function captureLoopVarIterOf(fe: i32, name: string): i32 {
   const par = parentBindingFrameOf(fe, name)
   if par < 0 {
@@ -5193,7 +5269,13 @@ export function captureValKind(fe: i32, name: string): VKind {
     // the env field and the local it is built from cannot disagree.
     const lvIter = captureLoopVarIterOf(fe, name)
     if lvIter >= 0 {
-      const lvk = forInElemKind(lvIter, parentBindingFrameArenaOf(fe, name))
+      const lvf = parentBindingFrameArenaOf(fe, name)
+      if captureLoopVarIsPair(fe, name) {
+        const lpk = forInPairElemKind(lvIter, lvf)
+        if lpk != null { return lpk }
+        return "i32"
+      }
+      const lvk = forInElemKind(lvIter, lvf)
       if lvk != null { return lvk }
     }
     return "i32"
@@ -5249,7 +5331,11 @@ export function captureValStructIdx(fe: i32, name: string) {
     // a fallback, so the two arms land together.
     const lvIter = captureLoopVarIterOf(fe, name)
     if lvIter >= 0 {
-      return forInVarStructIdx(lvIter, parentBindingFrameArenaOf(fe, name))
+      const lvf = parentBindingFrameArenaOf(fe, name)
+      if captureLoopVarIsPair(fe, name) {
+        return forInPairStructIdx(lvIter, lvf)
+      }
+      return forInVarStructIdx(lvIter, lvf)
     }
     return -1
   }
@@ -15650,6 +15736,12 @@ export function forInElemKind(iterIx: i32, fnIx: i32): VKind | null {
       if rlElemIsNulNiche(rslot) { return "nulreflist" }
       return "reflist"
     }
+    // A map element (`{[K]: V}[]`, element kind 3): the loop var binds a map local over the
+    // element's shape, and a `({[K]: V} | null)[]` element the nullable-map niche.
+    if rlElemKindTbl[rslot] == 3 {
+      if rlElemIsNulNiche(rslot) { return "nulmap" }
+      return "map"
+    }
     return null
   }
   // An f64 element list (`f64[]`): the loop var binds as a scalar f64 local (code 11), and
@@ -15779,6 +15871,12 @@ export function mapValElemKind(mapObjIx: i32, fnIx: i32): VKind | null {
     // g` does. A nullable list value rides the same vals list as its non-null twin,
     // so only the loop var differs — the niche kind, mirroring `nulstr`/`nulstruct`.
     if mvValKind[vsl] == 6 {
+      // A nested-map value (`{[K]: {[K2]: V}}`) rides the same kind-6 vals list with a map
+      // element, and binds the map local its own `m[k]` read binds (D2515).
+      if mvValIsMap(vsl) {
+        if mvSlotNullable(vsl) { return "nulmap" }
+        return "map"
+      }
       if mvSlotNullable(vsl) { return mvNulListValKind(vsl) }
       return mvListValKind(vsl)
     }
@@ -15819,13 +15917,16 @@ export function forInPairValsSlot(iterIx: i32, fnIx: i32) {
   mapShapeOfExpr(iterIx, fnIx)
 }
 
-// The struct / variant table row the second name binds, when the map's value is one — the
-// same resolution `forInRefArrayStructIdx` performs for the `.values()` walk.
+// The companion slot the second name binds: the struct row of a struct value, or the inner
+// shape of a nested-map value — the resolution `forInVarStructIdx` performs for `.values()`.
 export function forInPairStructIdx(iterIx: i32, fnIx: i32): i32 {
   const vsl = forInPairValsSlot(iterIx, fnIx)
   if vsl < 0 { return -1 }
   if mvValVariantOf(vsl) >= 0 { return -1 }
   if mvValKind[vsl] == 1 { return mvValStructIdxOf(vsl) }
+  if mvValIsMap(vsl) { return mvInnerMapShape(vsl) }
+  const lk = mvListValKind(vsl)
+  if lk == "reflist" { return mvValInnerRlSlot(vsl) }
   -1
 }
 
@@ -15875,6 +15976,15 @@ export function forInVarStructIdx(iterIx: i32, fnIx: i32): i32 {
     // A nested ref array (`S[][]`): the loop var is the inner ref list, off the outer
     // list's element slot.
     return rlElemInnerSlot(refListSlotOfExpr(iterIx, fnIx))
+  }
+  if ek == "map" || ek == "nulmap" {
+    // A map element or a nested-map value: the loop var's map shape, off the vals slot of a
+    // `.values()` walk or the element slot of a map list.
+    const mvs = forInMapValsSlot(iterIx, fnIx)
+    if mvs >= 0 { return mvInnerMapShape(mvs) }
+    const rs = refListSlotOfExpr(iterIx, fnIx)
+    if rs < 0 || rs >= rlElemKindTbl.length { return -1 }
+    return rlElemMapShape(rs)
   }
   -1
 }
@@ -28187,7 +28297,17 @@ function capturedUnionName(fnIx: i32, name: string) {
   const fe = fnStmtsPosOf(fnIx)
   if fe < 0 { return "" }
   const b = parentBindingOf(fe, name)
-  if b < 0 { return "" }
+  if b < 0 {
+    // A captured loop variable has no declaration: its member set comes from the iterable,
+    // through the rung `forInLoopVarUnionName` asks for the uncaptured read (D2521).
+    const lvIter = captureLoopVarIterOf(fe, name)
+    if lvIter < 0 { return "" }
+    const lvf = parentBindingFrameArenaOf(fe, name)
+    if captureLoopVarIsPair(fe, name) {
+      return forInPairUnionElemName(lvIter, lvf)
+    }
+    return forInIterUnionElemName(lvIter, lvf)
+  }
   const bn = P.nodes[b]
   if bn is Param {
     const pn = tyNameOf(bn.parType)
@@ -36896,12 +37016,7 @@ function frameCapturesName(fnIx: i32, name: string): boolean {
 // the table lookups `captureLoopVarIterOf` starts with, without its element-kind reads. False
 // means that function answers -1.
 function enclosingLoopVarBinds(fe: i32, name: string): boolean {
-  const par = parentBindingFrameOf(fe, name)
-  if par < 0 { return moduleLoopEnclosing(fe, name) >= 0 }
-  if par >= fnStmts.length { return false }
-  const pfn = P.nodes[fnStmts[par]]
-  if pfn is FuncDecl { return parentLoopVarOf(pfn.fnBody, name) >= 0 }
-  false
+  captureLoopNodeOf(fe, name) >= 0
 }
 
 // The `$fnsig` key a for-in loop variable `name` calls through, or "" when `name` is no
