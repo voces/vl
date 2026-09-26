@@ -1003,6 +1003,15 @@ let nhUnfilledIxs: i32[] = []
 // The holes a write did fill, as LetDecl node and its filled `T | null`, banked at the same close.
 let nhFilledIxs: i32[] = []
 let nhFilledTys: i32[] = []
+// The container null holes (D2506): an un-annotated list element or map value pinned by a bare
+// `null` write holds an open `_ | null` a later write or a destination fills. One row
+// per hole: its arena index, the write that minted it, the container's spelling, whether it is a
+// map value, and whether it is a param-hole map demand's, whose value each call site fills.
+let cnhTys: i32[] = []
+let cnhAts: i32[] = []
+let cnhNames: string[] = []
+let cnhIsVal: boolean[] = []
+let cnhDemand: boolean[] = []
 
 // D1589 — a `??` typed against an open hole is a promise, not an answer: `x ?? d` read before
 // the fill takes `nonNullTy` of a `nInner == -1` nullable, which is the hole itself. These
@@ -1474,6 +1483,88 @@ export function letNullHoleFilledTy(letIx: i32): i32 {
   -1
 }
 
+// The type an open container slot takes from its first write `vt`: the literal-widened value,
+// or for a bare `null` a fresh open `_ | null` recorded against the write `at` (D2506).
+function cnhPinTy(
+  vt: i32,
+  at: i32,
+  recv: i32,
+  isVal: boolean,
+  demand: boolean,
+): i32 {
+  if !isNullTy(vt) { return widenLitTy(vt) }
+  const h = mkNullableTy(-1)
+  cnhTys.push(h)
+  cnhAts.push(at)
+  let nm = ""
+  if recv >= 0 { nm = placeKeyOf(recv) }
+  cnhNames.push(nm)
+  cnhIsVal.push(isVal)
+  cnhDemand.push(demand)
+  h
+}
+
+// Whether `ty` is a still-open container null hole.
+function cnhIsOpen(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  const t = T.tys[ty]
+  if t is TyNullable {
+    if t.nInner >= 0 { return false }
+  } else {
+    return false
+  }
+  let i = 0
+  while i < cnhTys.length {
+    if cnhTys[i] == ty { return true }
+    i = i + 1
+  }
+  false
+}
+
+// Fill the open container null hole `slot` from a write or destination of type `vt`: its
+// non-null part becomes `T`, as the `=` arm fills a `let x = null`. A no-op on any other slot.
+function cnhFill(slot: i32, vt: i32) {
+  if vt < 0 || vt == TY_ERR || vt == TY_VOID { return 0 }
+  if !cnhIsOpen(slot) { return 0 }
+  let inner = vt
+  const v = T.tys[vt]
+  if v is TyNullable { inner = v.nInner }
+  if inner < 0 || isNullTy(inner) { return 0 }
+  const h = T.tys[slot]
+  if h is TyNullable {
+    h.nInner = widenLitTy(inner)
+    tyMutEpoch = tyMutEpoch + 1 // a container null hole filled in place
+    fillCoalHoleNodes(slot)
+  }
+  0
+}
+
+// Refuse every container null hole nothing filled: the program never said what else it holds.
+function flushContainerNullHoles() {
+  let i = 0
+  while i < cnhTys.length {
+    if !cnhDemand[i] && cnhIsOpen(cnhTys[i]) {
+      let what = "the element type of "
+      if cnhIsVal[i] { what = "the value type of " }
+      let nm = "this container"
+      if cnhNames[i] != "" { nm = "`" + cnhNames[i] + "`" }
+      tErr(what + nm + " is only ever null — annotate it", cnhAts[i])
+    }
+    i = i + 1
+  }
+  0
+}
+
+// Whether `ty` is a hole-parameter's demanded map, which the call sites fill.
+function isHoleMapDemandTy(ty: i32): boolean {
+  let i = 0
+  while i < holeMapTys.length {
+    if holeMapTys[i] == ty { return true }
+    i = i + 1
+  }
+  false
+}
+
 // Record an un-annotated empty-collection binding for the deferred scope-close check.
 function notePending(name: string, ty: i32, at: i32) {
   pendNames.push(name)
@@ -1624,6 +1715,10 @@ function constrainEmptyD(srcTy: i32, dstTy: i32, depth: i32) {
   if srcTy < 0 || dstTy < 0 || depth <= 0 { return 0 }
   const s = T.tys[srcTy]
   const d = T.tys[dstTy]
+  // A container null hole delivered to a nullable slot takes the slot's `T` (D2506).
+  if d is TyNullable {
+    if d.nInner >= 0 && cnhIsOpen(srcTy) { return cnhFill(srcTy, dstTy) }
+  }
   // A nullable destination pins the same holes its inner shape does: a `string[] | null` field
   // or map value accepts a non-null `[]`, and the hole behind it needs the element rep either
   // way. Unwrapped on the source side too, so a nullable producer flowing into a nullable slot
@@ -4174,6 +4269,11 @@ export function initChecker() {
   nhUnfilledIxs = []
   nhFilledIxs = []
   nhFilledTys = []
+  cnhTys = []
+  cnhAts = []
+  cnhNames = []
+  cnhIsVal = []
+  cnhDemand = []
   chPendNodes = []
   chPendTys = []
   chPendGiven = []
@@ -26997,6 +27097,41 @@ function holeAssignOk(srcExpr: i32, at: i32, dst: i32) {
   assignableExpr(srcExpr, at, dst)
 }
 
+// The map demand `hm` as call argument `at` meets it: a value the body only ever wrote `null`
+// to takes the argument's own nullable value type, so each call site fills `T` (D2506).
+function holeMapNullValAt(hm: i32, at: i32): i32 {
+  if at < 0 { return hm }
+  const d = T.tys[hm]
+  const a = T.tys[at]
+  if d is TyMap {
+    if !cnhIsOpen(d.mVal) { return hm }
+    if a is TyMap {
+      if a.mVal >= 0 && assignable(TY_NULL, a.mVal) {
+        return mkMapTy(d.mKey, a.mVal, d.mSet)
+      }
+    }
+  }
+  hm
+}
+
+// An open map argument `at` delivered to a demand whose value the body only wrote `null` to
+// takes an open `_ | null` of its own, which the caller's writes fill (D2506).
+function holeMapArgNullPin(hm: i32, at: i32, srcExpr: i32) {
+  if at < 0 { return 0 }
+  const d = T.tys[hm]
+  const a = T.tys[at]
+  if d is TyMap {
+    if !cnhIsOpen(d.mVal) { return 0 }
+    if a is TyMap {
+      if a.mVal < 0 {
+        a.mVal = cnhPinTy(TY_NULL, srcExpr, srcExpr, true, false)
+        tyMutEpoch = tyMutEpoch + 1 // the argument's value pinned in place
+      }
+    }
+  }
+  0
+}
+
 // Does `at` (the argument expression `srcExpr`) satisfy hole `name`'s demand? The
 // accumulated shape satisfies it, and so does any `is`-guard alternative whose still-
 // reachable demanded fields (`holeAltResidualTy`) are satisfied too. True when the hole demands nothing.
@@ -27005,8 +27140,10 @@ function holeDemandOk(name: string, srcExpr: i32, at: i32) {
   // disjunction: a hole the body used the map surface on is a map. Both pins run on the way
   // through: `constrainEmpty(at, hm)` pins an argument still open at the call; the reverse
   // pins a demand the callee left open from a concrete argument.
-  const hm = holeMapOf(name)
+  let hm = holeMapOf(name)
   if hm >= 0 {
+    holeMapArgNullPin(hm, at, srcExpr)
+    hm = holeMapNullValAt(hm, at)
     if !holeAssignOk(srcExpr, at, hm) { return false }
     constrainEmpty(at, hm)
     // A demand the callee's own operations left open is not satisfiable here, and the
@@ -29241,6 +29378,24 @@ function validateLetCstrs(
   0
 }
 
+// A deferred `.push(null)` whose receiver pins to an open list: the list's element takes the
+// open `_ | null` a bare-null write mints at a direct spelling, so the caller's writes fill it.
+function cnhPinBmElem(want: i32, bNames: string[], bTys: i32[], at: i32) {
+  const row = hdRowOf(want)
+  if row < 0 || row >= hdKind.length { return 0 }
+  if hdKind[row] != HD_ELEM { return 0 }
+  const arr = substTyDeep(hdBase[row], bNames, bTys)
+  if arr < 0 { return 0 }
+  const a = T.tys[arr]
+  if a is TyArray {
+    if a.aElem < 0 {
+      a.aElem = cnhPinTy(TY_NULL, at, -1, false, false)
+      tyMutEpoch = tyMutEpoch + 1 // a hole body's bare-null push pinned the argument in place
+    }
+  }
+  0
+}
+
 // Whether the deferred builtin-method-argument constraints this binding resolves hold — the
 // twin of `validateLetCstrs` for a `.push`/`.set`/`.add` argument rather than an assignment
 // (D582 is why `argCstr*` cannot serve this position). Same re-deferral rule, gated on either
@@ -29257,6 +29412,7 @@ function validateBmCstrs(
   while ci < nOrigB {
     if cstrOwnedBy(bmCstrFn[ci], calleeFn) {
       const bg = substTyDeep(bmCstrGot[ci], bNames, bTys)
+      if isNullTy(bg) { cnhPinBmElem(bmCstrWant[ci], bNames, bTys, ix) }
       const bw = substTyDeep(bmCstrWant[ci], bNames, bTys)
       let bc = bmCstrCtx[ci]
       if bc >= 0 { bc = substTyDeep(bc, bNames, bTys) }
@@ -33102,9 +33258,10 @@ function checkMemberCallNode(
             // The first `.push(v)` on a bare empty `[]` pins its element type to `typeof v` in
             // place — the usage-driven inference that resolves an un-annotated `const xs = []`; a later conflicting push is then a clean type error.
             if rt.aElem < 0 {
-              rt.aElem = widenLitTy(pat)
+              rt.aElem = cnhPinTy(pat, ix, recvIx, false, false)
               tyMutEpoch = tyMutEpoch + 1 // `.push` pinned the element in place
             } else {
+              cnhFill(rt.aElem, pat)
               // The pushed value's own open holes pin from the element slot — the same rule
               // `.set` / `m[k] = v` / `xs = e` apply at their own store positions.
               constrainEmptyExpr(margs[mi], pat, rt.aElem)
@@ -33264,9 +33421,10 @@ function checkMemberCallNode(
           tErr(bmArgMsg(BM_SETKEY, "set", k0, rt.mKey, -1), ix)
         }
         if rt.mVal < 0 {
-          rt.mVal = widenLitTy(v0)
+          rt.mVal = cnhPinTy(v0, ix, recvIx, true, isHoleMapDemandTy(recvTy))
           tyMutEpoch = tyMutEpoch + 1 // `.set` pinned the value in place
         } else {
+          cnhFill(rt.mVal, v0)
           // The value argument's own open holes pin from the slot, the third step
           // this store shares with `m[k] = v` (which pins in `checkBinExprNode`'s
           // `=` arm) — without it, `m.set("a", fq())` over a `{[string]: f64[]}` reaches the emitter with an unpinned `[]`.
@@ -41355,6 +41513,7 @@ export function checkProgram(rootIx: i32) {
   // The global scope (depth 0) is never popped, so flush its un-annotated
   // empty-collection bindings here: any still-open hole is genuinely uninferable.
   flushUninferred(0)
+  flushContainerNullHoles()
   // …and with every pin now in, grade what `__array_new_default__` needed to default.
   checkArrayNewDefaultElems()
   synthInlineLitUnionDecls(rootIx)
@@ -45680,8 +45839,10 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
         // happens; reported and fallen through, so no cascade follows the one diagnostic.
         if arrT0.aRead == 1 { tErr(roWriteMsg("index assignment", arrTy0), ix) }
         if arrT0.aElem < 0 {
-          arrT0.aElem = widenLitTy(rt)
+          arrT0.aElem = cnhPinTy(rt, ix, tgt.idxArr, false, false)
           tyMutEpoch = tyMutEpoch + 1 // index-write pinned the element in place
+        } else {
+          cnhFill(arrT0.aElem, rt)
         }
         // A `u8[]` store checks against the element type directly: `checkIndexNode` types a
         // `u8[]` read as `i32` (the widened value), so `lt` above can't see the out-of-range rule.
@@ -45702,8 +45863,11 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
           }
         }
         if arrT0.mVal < 0 {
-          arrT0.mVal = widenLitTy(rt)
+          const dmd = isHoleMapDemandTy(arrTy0)
+          arrT0.mVal = cnhPinTy(rt, ix, tgt.idxArr, true, dmd)
           tyMutEpoch = tyMutEpoch + 1 // index-write pinned the value in place
+        } else {
+          cnhFill(arrT0.mVal, rt)
         }
       }
       // Free index-write operator (B14): banked on THIS assignment node, not the target —

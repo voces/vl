@@ -331,11 +331,10 @@ Deno.test({
   fn: async () => {
     await withDir(async (dir) => {
       const file = `${dir}/emit.vl`;
-      // D2524's witness: `vl check` accepts it and the emitter has no rep for the pushed `null`.
+      // D2641's witness: `vl check` accepts it and the emitter interns no shape for the record.
       await Deno.writeTextFile(
         file,
-        "function use(v) {\n  v.push(null)\n  print(v.length)\n}\n" +
-          "const xs: (string | null)[] = []\nuse(xs)\n",
+        "const o: {[string]: i32} = Map()\nconst w = { f: o }\nprint(1)\n",
       );
       const { code, out } = await run(["check", "--codegen", file, "--json"]);
       if (code === 0) throw new Error(`expected a refusal, got exit 0: ${out}`);
