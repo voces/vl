@@ -116,6 +116,7 @@ import {
   externRetIsVoid,
   i32ToStr,
   isDefaultGlobalRef,
+  nodeChildren,
   nodeToks,
   tsMentionsAnyName,
 } from "./ast"
@@ -153,6 +154,7 @@ import {
 } from "./emit_query"
 import {
   ByteRope,
+  INIT_REACH_NEVER,
   VKind,
   W,
   aTypeIdx,
@@ -294,6 +296,11 @@ import {
   gHelpUtf8Enc,
   gImportMemory,
   gImports,
+  gInitAny,
+  gInitFnReach,
+  gInitGuard,
+  gInitProgIdx,
+  gInitStartOrd,
   gMapDeletes,
   gMemLogIdx,
   gNeedsF32Print,
@@ -460,6 +467,7 @@ import {
   fbEnd,
   fbF32Const,
   fbF64Const,
+  fbGlobalSet,
   fbI32Bin,
   fbI32Const,
   fbI32Eqz,
@@ -1974,6 +1982,7 @@ function emitStartFnCode(out: u8[]) {
       // ANCHOR any emit failure raised below at the top-level node being lowered (see
       // `emitCurStmtIx`) — the start function has no declaration of its own to name.
       emitCurStmtIx = globalStmts[gi]
+      gInitStartOrd = globalStmtOrd[gi]
       const gSpanAt = bodyExpr.length
       if globalRunsInStartFn(gi) {
         const g = P.nodes[globalStmts[gi]]
@@ -2187,6 +2196,15 @@ function emitStartFnCode(out: u8[]) {
             wTarget(exprPrev)
             return -1
           }
+          // A guarded global's initializer has run: advance the progress cell past it.
+          if (
+            gi < gInitGuard.length
+            && gInitGuard[gi] == 1
+            && gInitProgIdx >= 0
+          ) {
+            fbI32Const(gi + 1)
+            fbGlobalSet(gInitProgIdx)
+          }
           wTarget(setPrev)
         }
       }
@@ -2199,6 +2217,7 @@ function emitStartFnCode(out: u8[]) {
       gi = gi + 1
     } else {
       emitCurStmtIx = startStmts[si]
+      gInitStartOrd = startStmtOrd[si]
       preStmtNarrow(startStmts[si])
       const sSpanAt = bodyExpr.length
       if emitStmt(bodyExpr, startStmts[si], -1) < 0 {
@@ -2213,6 +2232,7 @@ function emitStartFnCode(out: u8[]) {
     }
   }
   scopePop()
+  gInitStartOrd = -1
   // The cursor is armed for exactly the span that streams this body; the `return -1` paths
   // above leave it set, which is what carries the anchor out to the diagnostic.
   emitCurStmtIx = -1
@@ -4685,6 +4705,132 @@ function passRowNeeds(row: string) {
 // empty wasm module is valid and every section here is already gated on having something to write, so this pass enforces nothing — it stays as a table row for the ordering edge `collectFns` declares.
 function passCheckTopLevel() { 0 }
 
+// Records `name` as mentioned at top-level position `ord`. The first mention reaches every
+// `fnStmts` slot declared under that name and queues it for its own walk (`initGuardScan`).
+function igMention(
+  name: string,
+  ord: i32,
+  seen: Map<string, boolean>,
+  head: Map<string, i32>,
+  next: i32[],
+  work: i32[],
+) {
+  if seen.has(name) { return 0 }
+  seen[name] = true
+  let p = head[name] ?? -1
+  while p >= 0 && p < gInitFnReach.length && p < next.length {
+    if gInitFnReach[p] == INIT_REACH_NEVER {
+      gInitFnReach[p] = ord
+      work.push(p)
+    }
+    p = next[p]
+  }
+  0
+}
+
+// Mentions every identifier, member name and nested function name under `root` at `ord`.
+// A name, not a binding: a local that shadows a global over-reaches, which only adds a guard.
+function igWalk(
+  root: i32,
+  ord: i32,
+  seen: Map<string, boolean>,
+  head: Map<string, i32>,
+  next: i32[],
+  work: i32[],
+) {
+  const stack: i32[] = [root]
+  while stack.length > 0 {
+    const ix = stack.pop() ?? -1
+    if ix >= 0 && ix < P.nodes.length {
+      const n = P.nodes[ix]
+      let nm = ""
+      if n is Ident { nm = n.identName }
+      else if n is Member { nm = n.memProp }
+      else if n is OptMember { nm = n.omProp }
+      else if n is FuncDecl { nm = n.fnName }
+      if nm != "" { igMention(nm, ord, seen, head, next, work) }
+      const kids = nodeChildren(ix)
+      let k = 0
+      while k < kids.length {
+        stack.push(kids[k])
+        k = k + 1
+      }
+    }
+  }
+  0
+}
+
+// Decides which module globals need the read-before-init guard (D2652): a global whose
+// initializer runs in the start function and whose name is mentioned by top-level code at or
+// before its declaration, or by a function that code can call. Sets `gInitAny` if any does.
+function initGuardScan(): i32 {
+  gInitGuard = []
+  gInitFnReach = []
+  gInitAny = false
+  gInitProgIdx = -1
+  gInitStartOrd = -1
+  let anyCand = false
+  let gi = 0
+  while gi < globalStmts.length {
+    gInitGuard.push(0)
+    if globalIsNonConst(globalStmts[gi]) { anyCand = true }
+    gi = gi + 1
+  }
+  const next: i32[] = []
+  const head: Map<string, i32> = Map()
+  let p = 0
+  while p < fnStmts.length {
+    gInitFnReach.push(INIT_REACH_NEVER)
+    next.push(-1)
+    const fd = P.nodes[fnStmts[p]]
+    if fd is FuncDecl {
+      next[p] = head[fd.fnName] ?? -1
+      head[fd.fnName] = p
+    }
+    p = p + 1
+  }
+  if !anyCand { return 0 }
+  const seen: Map<string, boolean> = Map()
+  const work: i32[] = []
+  gi = 0
+  let si = 0
+  while gi < globalStmts.length || si < startStmts.length {
+    let takeGlobal = gi < globalStmts.length
+    if takeGlobal && si < startStmts.length {
+      if startStmtOrd[si] < globalStmtOrd[gi] { takeGlobal = false }
+    }
+    let node = -1
+    let ord = 0
+    if takeGlobal {
+      node = globalStmts[gi]
+      ord = globalStmtOrd[gi]
+    } else {
+      node = startStmts[si]
+      ord = startStmtOrd[si]
+    }
+    igWalk(node, ord, seen, head, next, work)
+    while work.length > 0 {
+      const wp = work.pop() ?? -1
+      if wp >= 0 && wp < fnStmts.length {
+        igWalk(fnStmts[wp], ord, seen, head, next, work)
+      }
+    }
+    if takeGlobal {
+      const g = P.nodes[node]
+      if g is LetDecl {
+        if globalIsNonConst(node) && seen.has(g.letName) {
+          gInitGuard[gi] = 1
+          gInitAny = true
+        }
+      }
+      gi = gi + 1
+    } else {
+      si = si + 1
+    }
+  }
+  0
+}
+
 // Detects `print(...)`/memory-intrinsic use anywhere in the program: any print pulls in the
 // 4-import print family (imports shift every local function's wasm index, so this is decided
 // up front). "Any print" is the property, not the spelling `print(` — three constructs lower
@@ -4957,6 +5103,9 @@ function scanPrintUse() {
   // the module mentions a float somewhere, which is what keeps an integer-only program's
   // bytes unchanged; the flags this reads are final only now, hence after the loop.
   gNeedsF64Rem = sawFloatRem || (sawRemUnknown && (sawF64 || sawF32))
+  // A guarded global read streams its reason through the print pair before the abort, as
+  // `as!` does, so a program with one reserves the family (D2652).
+  if gInitAny { gImports = 4 }
   // An extern's own RESULT width is a scalar the annotation scan cannot see: `print(nowMillis())`
   // spells `i64` nowhere, and without this the print router would call an undeclared import.
   // Read off the manifest, which is total, exactly as `fsRetIsI64` is for the fs floor.
@@ -5077,6 +5226,7 @@ function runEmitPass(name: string, stmts: i32[], rootIx: i32) {
   if name == "collectFnValUse" { return collectFnValUse() }
   if name == "collectCloSigs" { return collectCloSigs() }
   if name == "scanPrintUse" { return scanPrintUse() }
+  if name == "initGuardScan" { return initGuardScan() }
   if name == "checkFnParams" { return checkFnParams() }
   if name == "capCacheBuild" { return capCacheBuild() }
   if name == "capNarrowBuild" { return capNarrowBuild() }
@@ -5278,7 +5428,8 @@ export function emitProgram(rootIx: i32) {
       "collectMapFilterUse > synthParamAnnots computeRetInference#2",
       "collectFnValUse > synthParamAnnots computeRetInference#2",
       "collectCloSigs > collectMapFilterUse collectFnValUse",
-      "scanPrintUse > monomorphize synthParamAnnots",
+      "initGuardScan > monomorphize synthParamAnnots synthVoidTwins synthExternValues",
+      "scanPrintUse > monomorphize synthParamAnnots initGuardScan",
       "checkFnParams > monomorphize synthParamAnnots",
       "capCacheBuild > monomorphize synthParamAnnots",
       "synthCaptureEmptyListAnns > collectA#2 capCacheBuild",
@@ -6600,13 +6751,19 @@ function emitGlobalSection() {
     nHeap = 2
     gHeapGlobalIdx = externGlobalCount() + np + nCells
   }
-  if nCells + np + nHeap > 0 {
+  // The read-before-init progress cell trails the heap pair, for the same reason (D2652).
+  let nProg = 0
+  if gInitAny {
+    nProg = 1
+    gInitProgIdx = externGlobalCount() + np + nCells + nHeap
+  }
+  if nCells + np + nHeap + nProg > 0 {
     const globalPayload: u8[] = []
     // Bind the writer at `globalPayload` for the WHOLE global-section payload build, so
     // the count, each entry's valtype (`fbValtype`), mutability flag, and init constexpr
     // (`fb*` opcodes) all stream to `curBuf == globalPayload`. Restored before framing.
     const gPrev = wTarget(globalPayload)
-    wULEB(nCells + np + nHeap)
+    wULEB(nCells + np + nHeap + nProg)
     // The string-literal pool first (indices 0..np-1, before the user cells): each entry an
     // immutable non-null string ref whose init constexpr builds the literal once
     // (`array.new_fixed` for the packed backing, then `struct.new` for the header) — every
@@ -6804,6 +6961,12 @@ function emitGlobalSection() {
       wU8(127)
       wU8(0)
       fbI32Const(gHeapLimit)
+      fbEnd()
+    }
+    if nProg == 1 {
+      wU8(127) // 0x7f i32
+      wU8(1)   // mutable
+      fbI32Const(0)
       fbEnd()
     }
     wTarget(gPrev)

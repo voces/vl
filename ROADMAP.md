@@ -185,6 +185,15 @@ Five items, in order. (0) is shipped; the rest are scheduled against it.
 
 ### Ruled and sequenced (owner decisions already made, waiting only on order)
 
+- **Initialization order — RULED (owner, 2026-09-26).** *Now:* reading a module global before
+  its initializer ran is a clear runtime error — BUILT (D2652, D2653): a read that top-level code
+  can reach before the declaration traps with "`g` read before its initializer ran (file:line),
+  via f". *Goal:* a compile error whenever init-before-read is not statically guaranteed, plus
+  compile-time reordering of initializers wherever that preserves behaviour, for globals and
+  locals. The runtime guard's reachability pass (`initGuardScan`) is the analysis the compile
+  error would start from; a write before the initializer (D2654) and an uninitialized module
+  `let` (D2655) are open beside it.
+
 - **Queued (owner, 2026-09-24, plumb):** std wrappers / compiler-level functionality over the raw
   shared-memory and atomics intrinsics (and the raw integer SIMD intrinsics), each through
   `std-api-reviewer`. The raw layer is `vl build --shared-memory=<pages>` plus the atomics lane.

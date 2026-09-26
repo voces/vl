@@ -1028,6 +1028,21 @@ import { fnIndexOfInScopeChain } from "./emit_collect"
 import { voidTwinForNode } from "./emit_rewrite"
 import { nameIsQuotedLeaf, splitUnionAtoms } from "./tyname"
 import { monoOrigNode } from "./emit_state"
+import {
+  INIT_REACH_NEVER,
+  emitCurFnPos,
+  fnDispNames,
+  fnInstOrigin,
+  fnParent,
+  gInitAny,
+  gInitFnReach,
+  gInitGuard,
+  gInitProgIdx,
+  gInitStartOrd,
+  globalStmtOrd,
+} from "./emit_state"
+import { declNameTokOf } from "./ast"
+import { srcmapFileOfTok } from "./srcmap"
 
 // Fill the capture cache (`capStartTbl` / `capCountTbl` / `capNamesFlat` in `emit_state`)
 // with every lifted function's capture list — one walk per function instead of an
@@ -23103,7 +23118,120 @@ export function emitUserGlobalGet(gi: i32) {
     fbLocalGet(gPromoSlot[gi])
     return 0
   }
+  if initGuardNeeded(gi) {
+    if emitInitGuard(gi) < 0 { return -1 }
+  }
   fbGlobalGet(userGlobalIdx(gi))
+  0
+}
+
+// Set while an assignment's value re-reads the global it just stored (`emitBinExprNode`).
+let initGuardOff = false
+
+// The earliest top-level position at which `fnStmts[p]` can run: its own, else its enclosing
+// frame's or its instance origin's, `INIT_REACH_NEVER` when no top-level code names any of them.
+function initFnReachOf(p: i32): i32 {
+  let best = INIT_REACH_NEVER
+  let cur = p
+  let steps = 0
+  while cur >= 0 && cur < gInitFnReach.length && steps <= gInitFnReach.length {
+    if gInitFnReach[cur] < best { best = gInitFnReach[cur] }
+    let up = -1
+    if cur < fnParent.length { up = fnParent[cur] }
+    if up < 0 && cur < fnInstOrigin.length { up = fnInstOrigin[cur] }
+    cur = up
+    steps = steps + 1
+  }
+  best
+}
+
+// Whether a read of guarded global `gi` at the cursor can run before its initializer: in the
+// start function, at or before the declaration's own position; in a function body, when top-level
+// code at or before that position can call it, or when no top-level code names it at all.
+function initGuardNeeded(gi: i32): boolean {
+  if !gInitAny || initGuardOff { return false }
+  if gi < 0 || gi >= gInitGuard.length || gi >= globalStmtOrd.length {
+    return false
+  }
+  if gInitGuard[gi] != 1 { return false }
+  const at = globalStmtOrd[gi]
+  if gPromoInStart { return gInitStartOrd >= 0 && gInitStartOrd <= at }
+  if emitCurFnPos < 0 { return false }
+  const r = initFnReachOf(emitCurFnPos)
+  r == INIT_REACH_NEVER || r <= at
+}
+
+// The source name of the function being lowered, for the guard's `via` clause: its declared
+// name, else its instance origin's, else the binding a lambda is bound to, else "".
+function initGuardFnName(p: i32): string {
+  let cur = p
+  let steps = 0
+  while cur >= 0 && cur < fnStmts.length && steps <= fnStmts.length {
+    const tk = declNameTokOf(fnStmts[cur])
+    if tk >= 0 && tk < P.toks.length { return P.toks[tk].text }
+    if cur < fnDispNames.length && fnDispNames[cur] != "" {
+      return fnDispNames[cur]
+    }
+    // A monomorphized instance keeps its origin's name before the `$` its pin appends.
+    const fd = P.nodes[fnStmts[cur]]
+    if fd is FuncDecl {
+      let cut = 0
+      while cut < fd.fnName.length && fd.fnName[cut] != '$' { cut = cut + 1 }
+      const base = fd.fnName.slice(0, cut)
+      if base != "" && base.slice(0, 8) != "__lambda" { return base }
+    }
+    let up = -1
+    if cur < fnInstOrigin.length { up = fnInstOrigin[cur] }
+    cur = up
+    steps = steps + 1
+  }
+  ""
+}
+
+// The guard's reason: the global's source name, where it is declared, and the reading function.
+function initGuardMsg(gi: i32): string {
+  const d = P.nodes[globalStmts[gi]]
+  let name = ""
+  if d is LetDecl { name = d.letName }
+  let tk = declNameTokOf(globalStmts[gi])
+  if tk >= 0 && tk < P.toks.length { name = P.toks[tk].text }
+  if tk < 0 && globalStmts[gi] < nodeToks.length {
+    tk = nodeToks[globalStmts[gi]]
+  }
+  let where = ""
+  if tk >= 0 && tk < P.toks.length {
+    const file = srcmapFileOfTok(tk)
+    if file == "" {
+      where = " (line " + i32ToStr(P.toks[tk].line) + ")"
+    } else {
+      where = " (" + file + ":" + i32ToStr(P.toks[tk].line) + ")"
+    }
+  }
+  let via = ""
+  if !gPromoInStart {
+    const fname = initGuardFnName(emitCurFnPos)
+    if fname == "" { via = ", via a closure" } else { via = ", via " + fname }
+  }
+  "`" + name + "` read before its initializer ran" + where + via
+}
+
+// Traps with `initGuardMsg` when the progress cell has not yet passed global `gi` (D2652).
+// The reason streams through the print pair `as!` uses, which `initGuardScan` reserved.
+function emitInitGuard(gi: i32) {
+  if gInitProgIdx < 0 || gImports < 4 {
+    return emitFail("emitProgram: read-before-init guard with no progress cell")
+  }
+  fbGlobalGet(gInitProgIdx)
+  fbI32Const(gi + 1)
+  fbI32Bin(72) // 0x48 i32.lt_s
+  fbIf(64)     // 0x40 void
+  for cp in initGuardMsg(gi) {
+    fbI32Const(cp)
+    fbCall(2) // __print_char__ (import 2)
+  }
+  fbCall(3) // __print_str_flush__ (import 3)
+  fbUnreachable()
+  fbEnd()
   0
 }
 
@@ -24762,7 +24890,11 @@ function emitBinExprNode(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
       if emitAssign(body, exprIx, fnIx) < 0 { return -1 }
       // A box cell re-read at the one member the checker typed the value at (`asgReadNarrowTy`).
       const asgTop = pushAsgReadNarrow(exprIx, fnIx)
+      // The re-read yields the value just stored, so it is never a read before init (D2652).
+      const savedGuardOff = initGuardOff
+      initGuardOff = true
       const asgRc = emitExpr(body, e.binLeft, fnIx)
+      initGuardOff = savedGuardOff
       if asgTop >= 0 { restoreNarrow(asgTop) }
       // A widened scalar cell is read back at the right side's own rep (D2512).
       const asgUnw = asgReadUnwidenOp(exprIx, fnIx)
