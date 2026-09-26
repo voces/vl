@@ -7933,6 +7933,35 @@ the path can run before the closure does. That is flow analysis over every holde
 the same machinery as A6c's, and is deferred with it; the loss is the sound floor it would
 refine.
 
+**AN ASSIGNMENT'S NARROWING REACHES A BODY ONLY WHERE NO `null` CAN FOLLOW (D2529).** A guard's
+narrowing refuses every write under it that it does not admit, which is what lets D2402 keep it
+in a closure called by its handle. An assignment's narrowing (`x = 1` over `i32 | null`, which
+removes only `null`) and a post-guard one refuse nothing, so a function body reads the binding at
+its declared type when a write that may store `null` can run before the body does:
+
+* a module `let` read by a top-level function or a module-level closure, when any assignment in
+  the program may store `null`; and, for a top-level function, which may be called before its
+  own declaration, also unless the program's first top-level write of the binding stores a
+  non-null value with no call, operator or index dispatch that may reach user code ahead of it;
+* a local captured by reference, when a write that may store `null` follows the capture, shares
+  a loop with it that the declaration is not inside, or sits in another closure. For a local of
+  a scalar nullable (`i32 | null`, `f64 | null`) any such write counts, `null` or not, because
+  the shared cell holds the value box and a closure's read of it is not yet narrowed (D2555).
+
+"May store `null`" is syntactic: a literal other than `null` (a number, string, character,
+boolean, object, array or function) cannot, nor can a `??` whose default is one, and anything
+else may. So a later `g = "abc"` into a
+`string` narrowing keeps it, while `g = mk()` ends it whatever `mk` returns. A callback run inside
+the call it is handed to (D2402) keeps the narrowing, and a re-test inside the body narrows again.
+
+**THE PRICE.** `let g: string | null = null; g = "ab"; function f() { g.length }; g = mk()` ran
+on master (the ref ops tolerate a null ref, and trap on one) and is now refused at `g.length`, and
+so is the same shape with a call before `g = "ab"`. On master the scalar-box spellings of every
+such program were check-clean invalid wasm, and the ref ones trapped as soon as the write stored
+`null` (`r2`, `r5` in #3169's review). The refinement that would recover them relates a write's
+checked type to the narrowing, which needs the write checked before the body; the conservative
+floor is what the checker's single pass can answer.
+
 **THE WRITE SHAPES (D2461, D2471, D2472, D2473).** A path's writers are found by what a write
 REPLACES, not the name it is spelled through. `fnWriteShapes` summarises a function as the fields
 it may store (`.f`), the cells it may store (`[k]` under a literal key, `[]` any) and the map cells

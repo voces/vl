@@ -523,6 +523,55 @@ axis(
   (d) => twoFiles(d, genCovar(1400, 1400), genCovar(1400, 70)),
 );
 
+// NARROWED MODULE BINDINGS read by top-level functions. Both arms declare `n` nullable module
+// `let`s, assign each once and declare `n` functions reading one each; only whether the
+// functions come after the assignments, and so are checked under their narrowings, differs.
+// A per-function pass over every narrowed binding is quadratic in the many arm (D2529).
+const genNarrowedGlobals = (n: number, after: boolean): string => {
+  const lets: string[] = [];
+  const asg: string[] = [];
+  const fns: string[] = [];
+  for (let i = 0; i < n; i++) {
+    lets.push(`let g${i}: i32 | null = null`);
+    asg.push(`g${i} = ${i % 13}`);
+    fns.push(`function f${i}() { return (g${i} ?? 0) + 1 }`);
+  }
+  const o = after ? [...lets, ...asg, ...fns] : [...lets, ...fns, ...asg];
+  o.push("let acc = 0");
+  for (let i = 0; i < n; i++) o.push(`acc = acc + f${i}()`);
+  o.push("print(acc)");
+  return o.join("\n") + "\n";
+};
+
+axis(
+  "narrowed module bindings",
+  2.5,
+  "A top-level function is asking about every narrowed module binding, not only the ones it reads (D2529).",
+  (d) => twoFiles(d, genNarrowedGlobals(600, true), genNarrowedGlobals(600, false)),
+);
+
+// CAPTURED NARROWED LOCALS. One function narrows `n` nullable locals by assignment and makes a
+// closure after each; in the many arm each closure captures its own local, in the other every
+// closure captures the first. Both arms make the same closures in one frame, so the emitter's
+// per-frame cost cancels and only the per-name capture question moves: a walk of the frame per
+// captured name is quadratic in the many arm (D2529).
+const genNarrowedCaptures = (n: number, distinct: boolean): string => {
+  const o: string[] = ["let acc = 0", "function m() {"];
+  for (let i = 0; i < n; i++) {
+    o.push(`  let g${i}: i32 | null = null`, `  g${i} = ${i % 13}`);
+    o.push(`  const h${i} = () => (g${distinct ? i : 0} ?? 0) + 1`, `  acc = acc + h${i}()`);
+  }
+  o.push("}", "m()", "print(acc)");
+  return o.join("\n") + "\n";
+};
+
+axis(
+  "captured narrowed locals",
+  2.5,
+  "A closure is re-walking its frame per captured name (D2529).",
+  (d) => twoFiles(d, genNarrowedCaptures(400, true), genNarrowedCaptures(400, false)),
+);
+
 // `n` calls handing one record to a function that reads a parameter field `n` times. `wide`
 // declares the parameter with a field wider than the record's, so every call is a covariant
 // delivery whose write analysis walks the parameter's uses; the other arm delivers the record at
