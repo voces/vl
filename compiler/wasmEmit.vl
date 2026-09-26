@@ -835,6 +835,8 @@ import {
   narrowedRefArrayOfPlace,
   narrowedStructArmVi,
   narrowedValueAtomOf,
+  nicheReadKindAt,
+  nicheReadStashSlot,
   nliNameOf,
   nodeMixedUnionName,
   nonNulBaseOf,
@@ -858,6 +860,7 @@ import {
   optRecvReReadable,
   paramStructIdxOf,
   pendingLitUnion,
+  placeNicheAtomKind,
   popUnionBoxElem,
   preStmtNarrow,
   printUnionArmsUnrenderable,
@@ -3771,6 +3774,41 @@ function atomIsRefKind(k: i32) {
 function emitValueUnionUnboxRead(body: u8[], name: string, ak: i32, fnIx: i32) {
   if emitUnionBoxPush(body, name, fnIx) < 0 { return -1 }
   emitUnionUnboxTail(ak)
+}
+
+// Read the name, field or cell at `exprIx`, narrowed under `key` to `A | null` for `A` of atom
+// kind `ak` (1 boolean, 2 string), as that niche: read once with the narrowing lifted, which
+// delivers the union box, park it, and turn its null tag into the niche's null and any other
+// tag into the unboxed payload (D2590).
+function emitNarrowedNicheRead(
+  body: u8[],
+  exprIx: i32,
+  key: string,
+  ak: i32,
+  fnIx: i32,
+) {
+  const masked = maskNarrowFor(key)
+  const rc = emitExpr(body, exprIx, fnIx)
+  unmaskNarrow(masked)
+  if rc < 0 { return -1 }
+  const st = nicheReadStashSlot()
+  fbLocalSet(st)
+  fbLocalGet(st)
+  fbStructGet(uBoxIdx, 0) // field 0: the tag
+  fbI32Const(nullBoxTag())
+  fbI32Bin(70) // 0x46 i32.eq
+  if ak == 1 {
+    fbIf(127) // 0x04 if, 0x7f i32 result blocktype
+    fbI32Const(2) // the null sentinel
+  } else {
+    fbIfRefNul(sTypeIdx, true) // if (result (ref null $sTypeIdx))
+    fbRefNull(sTypeIdx)
+  }
+  fbElse()
+  fbLocalGet(st)
+  if emitUnionUnboxTail(ak) < 0 { return -1 }
+  fbEnd()
+  0
 }
 
 // The unbox, from a box already on the stack. Extracted from `emitValueUnionUnboxRead` so the
@@ -13306,6 +13344,18 @@ export function emitExpr(body: u8[], exprIx: i32, fnIx: i32) {
   if e is CharLit { return emitCharLitNode(body, e, exprIx, fnIx) }
   if e is Ident { return emitIdentNode(body, e, exprIx, fnIx) }
   if e is Paren { return emitExpr(body, e.parInner, fnIx) }
+  if e is Member || e is Index {
+    const pnk = placeNicheAtomKind(exprIx, fnIx)
+    if pnk >= 0 {
+      return emitNarrowedNicheRead(
+        body,
+        exprIx,
+        placeNarrowKeyOf(exprIx),
+        pnk,
+        fnIx,
+      )
+    }
+  }
   if e is Unary { return emitUnaryNode(body, e, exprIx, fnIx) }
   if e is AsExpr { return emitAsCast(body, e, exprIx, fnIx) }
   if e is Call { return emitCallNode(body, e, exprIx, fnIx) }
@@ -13533,13 +13583,16 @@ function emitIfExprRefLink(
 // arm's locals; an if-expression the collect pass never descended into is rejected here rather than lowered against slots that belong to something else.
 function emitIfArmOpen(body: u8[], blockIx: i32, fnIx: i32) {
   scopePush()
+  armNarrowTops.push(narrowTop)
   const b = P.nodes[blockIx]
   if b is Block {
     const stmts = b.blkStmts
     if stmts.length > 1 {
-      if !armPreludeWalked(blockIx) {
-        return emitFail(
+      const decl = armPreludeUnwalkedDecl(blockIx)
+      if decl >= 0 {
+        return emitFailAt(
           "emitProgram: an if-expression arm that declares a local is supported only as a binding initializer inside a function",
+          decl,
         )
       }
     }
@@ -13549,10 +13602,13 @@ function emitIfArmOpen(body: u8[], blockIx: i32, fnIx: i32) {
     pendingLitUnion = 0
     let i = 0
     while i + 1 < stmts.length {
+      preStmtNarrow(stmts[i])
       if emitStmt(body, stmts[i], fnIx) < 0 {
         pendingLitUnion = savedLU
         return -1
       }
+      // A write in the prelude retires what it falsifies, as in any block (D2601).
+      pushPostGuardNarrow(stmts[i], fnIx)
       i = i + 1
     }
     pendingLitUnion = savedLU
@@ -13560,18 +13616,50 @@ function emitIfArmOpen(body: u8[], blockIx: i32, fnIx: i32) {
   0
 }
 
-// True if the collect pass allocated the prelude locals of the arm block at `blockIx`.
-function armPreludeWalked(blockIx: i32) {
-  if blockIx < 0 { return false }
-  armPreludeBlocks[blockIx] ?? false
+// The first node of the arm block at `blockIx` that binds a local no pass allocated, or -1. The
+// collect pass allocates an arm's prelude only where the arm is a binding initializer or a
+// `return` operand; an arm anywhere else lowers when its prelude declares nothing.
+function armPreludeUnwalkedDecl(blockIx: i32): i32 {
+  if blockIx < 0 { return -1 }
+  if armPreludeBlocks[blockIx] ?? false { return -1 }
+  firstLocalDeclIn(blockIx)
+}
+
+// The first node in the subtree at `ix` that binds a local of the function it sits in (a `let`
+// or a loop variable), or -1. A nested function's body binds its own, so the walk stops there.
+function firstLocalDeclIn(ix: i32): i32 {
+  if ix < 0 || ix >= P.nodes.length { return -1 }
+  const n = P.nodes[ix]
+  if n is LetDecl || n is ForRange || n is ForIn { return ix }
+  if n is FuncDecl { return -1 }
+  let cur = ix
+  while cur >= 0 {
+    const kids = nodeSpineChildren(cur)
+    let k = 0
+    while k < kids.length {
+      const d = firstLocalDeclIn(kids[k])
+      if d >= 0 { return d }
+      k = k + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  -1
 }
 
 // Pop the arm's lexical frame, passing `rc` through so an arm emitter can close and
 // return in one expression.
 function emitIfArmClose(rc: i32) {
   scopePop()
+  if armNarrowTops.length > 0 {
+    restoreNarrow(armNarrowTops[armNarrowTops.length - 1])
+    armNarrowTops.pop()
+  }
   rc
 }
+
+// The narrowing depth at each open arm, restored at its close: a prelude's pushes end with the
+// arm, while a retirement it made in place outlives it.
+const armNarrowTops: i32[] = []
 
 // The `emitFail` reason for an if-expression arm with no value on the stack: an empty arm
 // (no value expression at all), a void call (a well-formed expression yielding nothing), or
@@ -23831,6 +23919,18 @@ function emitIdentNode(body: u8[], e: Ident, exprIx: i32, fnIx: i32) {
     // where the arm's rep belongs — invalid wasm.
     if identChainTyBoxedUnion(e.identName, fnIx, 4) {
       return emitValueUnionUnboxRead(body, e.identName, vak, fnIx)
+    }
+  }
+  // a union binding narrowed to a niche-repped `A | null` reads as that niche, under the same
+  // three storage gates as the atom arm above (D2590).
+  const nNk = nicheReadKindAt(exprIx, e.identName)
+  if nNk >= 0 {
+    if (
+      unionNameOfIdentAt(isid, fnIx, exprIx) != ""
+      || capturedIsUnionBox(fnIx, e.identName)
+      || identChainTyBoxedUnion(e.identName, fnIx, 4)
+    ) {
+      return emitNarrowedNicheRead(body, exprIx, e.identName, nNk, fnIx)
     }
   }
   // a union binding narrowed to a ref-element array arm reads unboxed to the reflist

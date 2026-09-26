@@ -1219,6 +1219,7 @@ function applyArmJoins(
   hasElse: boolean,
   tnNames: string[],
   enNames: string[],
+  condIx: i32,
 ) {
   // Both arms diverging leaves no code below to describe.
   if thenDiverges && elseDiverges { return 0 }
@@ -1230,7 +1231,11 @@ function applyArmJoins(
     if !narJoinSeen(clobMark, i, nm) {
       // A name THIS `if`'s condition narrows enters its two arms at two different types, and
       // the join of that partition is the type it already had — nothing to install.
-      if !nameInList(tnNames, nm) && !nameInList(enNames, nm) {
+      if (
+        !nameInList(tnNames, nm)
+        && !nameInList(enNames, nm)
+        && !crCondRetired(condIx, nm)
+      ) {
         const path = isPathKey(nm)
         let ok = true
         if path {
@@ -7475,6 +7480,12 @@ let crRdIx: i32[] = []
 let crAfterBank: {[i32]: string} = Map()
 let crBeforeBank: {[i32]: string} = Map()
 let crCondDropBank: {[i32]: string} = Map()
+// Per `&&`/`||` node, the left operand's facts its right operand retired (`crNoteRhsRetired`).
+let crRhsRetired: {[i32]: string} = Map()
+// What retired each: the `&&`/`||` node, the name, and the write or call that ended it.
+let crRhsOps: i32[] = []
+let crRhsNames: string[] = []
+let crRhsBys: i32[] = []
 let crCapWidenBank: {[i32]: string} = Map()
 // Per body, the names `crEscWalk` found escaping it, for this check.
 let crEscNames: {[i32]: string} = Map()
@@ -7539,6 +7550,10 @@ function crReset() {
   crAfterBank = Map()
   crBeforeBank = Map()
   crCondDropBank = Map()
+  crRhsRetired = Map()
+  crRhsOps = []
+  crRhsNames = []
+  crRhsBys = []
   crCapWidenBank = Map()
   crEscNames = Map()
   crLostKeys = []
@@ -9304,6 +9319,134 @@ function crLoopPreRetire(loopIx: i32) {
   0
 }
 
+// Record at the `&&`/`||` node `ix` the left operand's facts its right operand retired, by a write
+// or a call: the arm the whole condition guards must not hold them (D2589). Runs while the
+// scope the facts live in is still open.
+function crNoteRhsRetired(
+  ix: i32,
+  rhs: i32,
+  names: string[],
+  tys: i32[],
+  npBase: i32,
+) {
+  let out = ""
+  let i = 0
+  while i < names.length {
+    let by = -1
+    if isPathKey(names[i]) {
+      let s = npBase
+      while s < npKeys.length && by < 0 {
+        if npKeys[s] == names[i] && npInvBy[s] >= 0 { by = npInvBy[s] }
+        s = s + 1
+      }
+    } else if lookup(names[i]) != tys[i] {
+      by = crFirstAssignOf(rhs, names[i])
+      if by < 0 { by = crFirstWritingCall(rhs, names[i]) }
+      if by < 0 { by = rhs }
+    }
+    if by >= 0 {
+      out = crwAddName(out, names[i])
+      crRhsOps.push(ix)
+      crRhsNames.push(names[i])
+      crRhsBys.push(by)
+    }
+    i = i + 1
+  }
+  if out == "" {
+    if crRhsRetired.length > 0 { crRhsRetired[ix] = "" }
+    return 0
+  }
+  crRhsRetired[ix] = "," + out
+  0
+}
+
+// The first assignment in the subtree at `ix` whose target is the bare name `name`, or -1.
+function crFirstAssignOf(ix: i32, name: string): i32 {
+  if ix < 0 || ix >= P.nodes.length { return -1 }
+  const n = P.nodes[ix]
+  if n is FuncDecl { return -1 }
+  if n is BinExpr {
+    if n.binOp == "=" && placeKeyOf(n.binLeft) == name { return ix }
+  }
+  let cur = ix
+  while cur >= 0 {
+    const kids = nodeSpineChildren(cur)
+    let k = 0
+    while k < kids.length {
+      const a = crFirstAssignOf(kids[k], name)
+      if a >= 0 { return a }
+      k = k + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  -1
+}
+
+// The node that retired `name` in the right operand of the `&&`/`||` at `opIx`, or -1.
+function crRhsRetiredBy(opIx: i32, name: string): i32 {
+  let i = crRhsOps.length - 1
+  while i >= 0 {
+    if crRhsOps[i] == opIx && crRhsNames[i] == name { return crRhsBys[i] }
+    i = i - 1
+  }
+  -1
+}
+
+// Whether a `&&`/`||` in the condition at `condIx` had its right operand retire `name`: the
+// condition's arms then hold no fact about it, and no join below the `if` may install one.
+function crCondRetired(condIx: i32, name: string): boolean {
+  if crRhsRetired.length == 0 || condIx < 0 || condIx >= P.nodes.length {
+    return false
+  }
+  const r = crRhsRetired[condIx] ?? ""
+  if r != "" && r.indexOf("," + name + ",") >= 0 { return true }
+  let cur = condIx
+  while cur >= 0 {
+    const kids = nodeSpineChildren(cur)
+    let k = 0
+    while k < kids.length {
+      if crCondRetired(kids[k], name) { return true }
+      k = k + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  false
+}
+
+// Drop the facts collected since `mark` that the right operand of the `&&`/`||` at `opIx` retired.
+// The emitter retires the same pushes at the same node (`condRhsRetiredOf`), so a re-test in the
+// right operand narrows again in both halves.
+function crFilterRhsRetired(opIx: i32, names: string[], tys: i32[], mark: i32) {
+  if crRhsRetired.length == 0 { return 0 }
+  const gone = crRhsRetired[opIx] ?? ""
+  if gone == "" { return 0 }
+  let w = mark
+  let i = mark
+  while i < names.length {
+    if gone.indexOf("," + names[i] + ",") >= 0 {
+      const by = crRhsRetiredBy(opIx, names[i])
+      if by >= 0 {
+        crRetNames.push(names[i])
+        crRetCalls.push(by)
+        crRetNarTys.push(tys[i])
+        crRetWideTys.push(lookup(names[i]))
+        crRetRoots.push(crCurRoot())
+        crRetLoops.push(false)
+      }
+    } else {
+      names[w] = names[i]
+      tys[w] = tys[i]
+      w = w + 1
+    }
+    i = i + 1
+  }
+  while names.length > w {
+    names.pop()
+    tys.pop()
+  }
+  0
+}
+
 // Drop the facts collected since `mark` that a call inside the condition may falsify:
 // the test ran before the call. Banked at the condition for the emitter's matching decline.
 function crFilterCond(condIx: i32, names: string[], tys: i32[], mark: i32) {
@@ -9392,6 +9535,25 @@ function crReadHook(name: string, ix: i32): i32 {
   -1
 }
 
+// The path twin of `crReadHook`'s note half: a read of `key` with no narrowing left, after a
+// condition dropped a fact about it, is remembered so a diagnostic spanning it names the cause.
+function crPathDropRead(key: string, ix: i32) {
+  if crRetNames.length == 0 || crStmtIxs.length == 0 { return 0 }
+  const root = crCurRoot()
+  let r = crRetNames.length - 1
+  while r >= 0 {
+    if crRetNames[r] == key && crRetRoots[r] == root {
+      if crRetWideTys[r] < 0 {
+        crRdRet.push(r)
+        crRdIx.push(ix)
+      }
+      return 0
+    }
+    r = r - 1
+  }
+  0
+}
+
 // The note a diagnostic at node `at` gains when a statement still being checked read a name at
 // the type a call retired it to, and the diagnostic spans that read or names that type; ""
 // otherwise.
@@ -9448,14 +9610,22 @@ function crSpans(outer: i32, inner: i32): boolean {
 
 // How a note names what ended a narrowing, after "re-test it after".
 function crAfterWord(ix: i32): string {
-  if crAliasWr[ix] ?? false { return "the assignment" }
+  if (crAliasWr[ix] ?? false) || crIsPlainAssign(ix) { return "the assignment" }
   "the call"
+}
+
+// Whether `ix` is an assignment no declared operator dispatched, so a diagnostic names it as one.
+function crIsPlainAssign(ix: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length || (crOpCall[ix] ?? false) { return false }
+  const n = P.nodes[ix]
+  if n is BinExpr { return n.binOp == "=" }
+  false
 }
 
 // How a diagnostic names the call at `ix`, a declared operator being a call too; a callee with
 // no name (`fs[0]()`) is named by its line alone.
 function crCallDesc(ix: i32, withLine: boolean): string {
-  if crAliasWr[ix] ?? false {
+  if (crAliasWr[ix] ?? false) || crIsPlainAssign(ix) {
     const an = P.nodes[ix]
     let d = "the assignment"
     if an is BinExpr {
@@ -9491,6 +9661,13 @@ export function callRetireBeforeOf(stmtIx: i32): string[] {
   const s = crBeforeBank[stmtIx]
   if s is string { return weSplit(s) }
   crNoNames
+}
+
+// The left operand's facts the right operand of the `&&`/`||` at `opIx` retired, `,`-joined with
+// a leading `,`, or "" (D2589).
+export function condRhsRetiredOf(opIx: i32): string {
+  if crRhsRetired.length == 0 { return "" }
+  crRhsRetired[opIx] ?? ""
 }
 
 // The names a condition's narrowing drops, over the whole condition subtree: a sub-condition
@@ -9600,6 +9777,22 @@ function nullCmpPlace(condIx: i32) {
     if lhs is NullLit { return cond.binRight }
   }
   -1
+}
+
+// The place a narrowing test at `ix` narrows: `ix` itself, or the bare name an assignment it
+// tests stores into (`(x = e) != null` narrows `x`, which holds the tested value, D2602).
+function asgTestedPlace(ix: i32): i32 {
+  if ix < 0 { return ix }
+  const u = condUnderParens(ix)
+  if u < 0 { return ix }
+  const n = P.nodes[u]
+  if n is BinExpr {
+    if n.binOp == "=" {
+      const t = condUnderParens(n.binLeft)
+      if t >= 0 && P.nodes[t] is Ident { return t }
+    }
+  }
+  ix
 }
 
 // Whether `ty` is the `null` primitive (compared structurally — `null` may be
@@ -10568,18 +10761,19 @@ function collectThenNarrowsRaw(condIx: i32, names: string[], tys: i32[]) {
     return 0
   }
   if cond is IsExpr {
+    const isPl = asgTestedPlace(cond.isObj)
     pushOptChainThenFacts(cond.isObj, names, tys)
     if cond.isVariant == "null" {
-      pushNarrowFact(cond.isObj, TY_NULL, names, tys)
+      pushNarrowFact(isPl, TY_NULL, names, tys)
     } else {
       let tIdx = isTypeTyRead(cond.isVariant, condIx)
       // An overlapping literal set narrows to the overlap, as `checkIsExprNode` tests it.
-      const meet = litSetMeetTy(placeCurTy(cond.isObj, names, tys), tIdx)
+      const meet = litSetMeetTy(placeCurTy(isPl, names, tys), tIdx)
       if meet >= 0 { tIdx = meet }
       if tIdx >= 0 {
-        pushNarrowFact(cond.isObj, tIdx, names, tys)
+        pushNarrowFact(isPl, tIdx, names, tys)
         pushDiscrimParentFact(
-          cond.isObj,
+          isPl,
           tIdx,
           names,
           tys,
@@ -10593,12 +10787,14 @@ function collectThenNarrowsRaw(condIx: i32, names: string[], tys: i32[]) {
   }
   if cond is BinExpr {
     if cond.binOp == "&&" {
+      const lmark = names.length
       collectThenNarrows(cond.binLeft, names, tys)
+      crFilterRhsRetired(condIx, names, tys, lmark)
       collectThenNarrows(cond.binRight, names, tys)
       return 0
     }
     if cond.binOp == "!=" {
-      const placeIx = nullCmpPlace(condIx)
+      const placeIx = asgTestedPlace(nullCmpPlace(condIx))
       if placeIx >= 0 {
         pushOptChainThenFacts(placeIx, names, tys)
         const cur = placeCurTy(placeIx, names, tys)
@@ -10677,14 +10873,13 @@ function collectElseNarrowsRaw(condIx: i32, names: string[], tys: i32[]) {
     return 0
   }
   if cond is IsExpr {
+    const isPl = asgTestedPlace(cond.isObj)
     if placeHasOptionalHop(cond.isObj) { return 0 }
-    const cur = placeCurTy(cond.isObj, names, tys)
+    const cur = placeCurTy(isPl, names, tys)
     if cond.isVariant == "null" {
       // The null face of the same hole (D1243), now the shared reader's — see its header.
       const inner = nonNullNarrowTy(cur)
-      if inner >= 0 && inner != cur {
-        pushNarrowFact(cond.isObj, inner, names, tys)
-      }
+      if inner >= 0 && inner != cur { pushNarrowFact(isPl, inner, names, tys) }
     } else {
       const tIdx = isTypeTyRead(cond.isVariant, condIx)
       if tIdx >= 0 {
@@ -10696,32 +10891,26 @@ function collectElseNarrowsRaw(condIx: i32, names: string[], tys: i32[]) {
         if sub < 0 && holeElseRemainderOk(tIdx) {
           sub = mkDerivedHole(HD_GNOT, "", -1, tIdx, cur)
         }
-        pushNarrowFact(cond.isObj, sub, names, tys)
+        pushNarrowFact(isPl, sub, names, tys)
         // The complement, banked into the else table. `setNarrowFromCondElse` declines to
         // else-narrow a struct union, so a checker-only complement would type `else { s.w }` clean
         // for an emitter still seeing the full union — trading an accurate `field 'w' is not on
         // every member` for an obscure emit reject. Both layers carry it, so they agree.
-        pushDiscrimParentFact(
-          cond.isObj,
-          sub,
-          names,
-          tys,
-          condIx,
-          true,
-          "intersect",
-        )
+        pushDiscrimParentFact(isPl, sub, names, tys, condIx, true, "intersect")
       }
     }
     return 0
   }
   if cond is BinExpr {
     if cond.binOp == "||" {
+      const lmark = names.length
       collectElseNarrows(cond.binLeft, names, tys)
+      crFilterRhsRetired(condIx, names, tys, lmark)
       collectElseNarrows(cond.binRight, names, tys)
       return 0
     }
     if cond.binOp == "==" {
-      const placeIx = nullCmpPlace(condIx)
+      const placeIx = asgTestedPlace(nullCmpPlace(condIx))
       if placeIx >= 0 {
         if !placeHasOptionalHop(placeIx) {
           const cur = placeCurTy(placeIx, names, tys)
@@ -44592,13 +44781,17 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
       collectElseNarrows(n.binLeft, cnames, ctys)
     }
     let cpushed = 0
+    const npBase = npKeys.length
     if cnames.length > 0 {
       pushScope(-1)
       applyNarrows(cnames, ctys)
       cpushed = 1
     }
     const crt = checkNode(n.binRight)
-    if cpushed == 1 { popScope() }
+    if cpushed == 1 {
+      crNoteRhsRetired(ix, n.binRight, cnames, ctys, npBase)
+      popScope()
+    }
     if !assignable(clt, TY_BOOL) || !assignable(crt, TY_BOOL) {
       tErr("operator '" + op + "' expects boolean operands", ix)
     }
@@ -46979,6 +47172,7 @@ function checkIfTail(
     daHasElse,
     tnNames,
     enNames,
+    n.ifCond,
   )
   // Guard clause: a then that always exits applies the false narrowings to the rest of the
   // block. Subtractions accumulate over a sequence of guards; restricted to bare names only.
@@ -46987,7 +47181,9 @@ function checkIfTail(
     while gi2 < enNames.length {
       const gKey = enNames[gi2]
       const gTy = enTys[gi2]
-      if narClobberedSince(clobMark, gKey) {
+      // From the arms on, not the condition: a write in the condition that follows a fact's
+      // test already dropped that fact (D2589), and one before it is what the test tested.
+      if narClobberedSince(thenLo, gKey) {
         // An arm on the fall-through path wrote a different member into `gKey`, so the
         // residual would describe a value the place does not hold. Both halves drop it: the
         // emitter reads `pgResidualVoidOf` at the same node (D1736).
@@ -47031,7 +47227,7 @@ function checkIfTail(
       let pu = pgUpKeys.length
       while pu > pgUpMark {
         pu = pu - 1
-        if narClobberedSince(clobMark, pgUpKeys[pu]) {
+        if narClobberedSince(thenLo, pgUpKeys[pu]) {
           recordPgResidualVoid(ix)
         } else {
           noteNarShadow(pgUpKeys[pu], lookup(pgUpKeys[pu]), NAR_KIND_POSTGUARD)
@@ -50398,6 +50594,7 @@ function checkMemberNode(n: Member, ix: i32) {
     if mInv >= 0 && !pathReadsDeclared(mKey, mInv, ix) {
       return pathInvalidatedErr(mKey, mInv, ix)
     }
+    if mInv < 0 { crPathDropRead(mKey, ix) }
   }
   const objTy = strLitRecvTy(checkNode(n.memObj))
   // A negative receiver type is an unpinned inference hole, not an arena index — indexing
@@ -50562,6 +50759,7 @@ function checkIndexNode(n: Index, ix: i32) {
     if xInv >= 0 && !pathReadsDeclared(xKey, xInv, ix) {
       return pathInvalidatedErr(xKey, xInv, ix)
     }
+    if xInv < 0 { crPathDropRead(xKey, ix) }
   }
   const at = T.tys[arrTy]
   // A map index: the key must match the map's key type; a read yields the nullable value
