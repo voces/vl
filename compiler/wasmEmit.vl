@@ -381,6 +381,8 @@ import {
   mfScratchBase,
   mkArrIdx,
   mkListIdx,
+  monoPinMapFe,
+  monoPinMapTy,
   mvMapTypeIdx,
   mvRlSlot,
   mvValKind,
@@ -2706,6 +2708,83 @@ function emitVariantDiscrimTest(body: u8[], recvIx: i32, vi: i32, fnIx: i32) {
   0
 }
 
+// D2493 where the checker could not see it — a generic instance, a `T | string` parameter, a
+// union formed in a body: the receiver's box holds two mono maps of one key rep, which share one
+// tag, and the pattern `patTy` names one without the other, so a tag compare would answer for
+// both. Refused loudly at `at`; -1 when refused, 0 when the test can be lowered.
+function mapTwinTagFail(
+  recvIx: i32,
+  patTy: i32,
+  fnIx: i32,
+  at: i32,
+  what: string,
+): i32 {
+  if patTy < 0 { return 0 }
+  const pat: i32[] = []
+  flattenVariantsInto(patTy, pat)
+  // The receiver's box members, plus every map this instance's pins hold: a pin can collapse
+  // the body's union so no name shows the pair, and the pins still say what `T` became.
+  const mems: i32[] = []
+  const nm = unionNameOfExpr(recvIx, fnIx)
+  if nm != "" {
+    const atoms: string[] = []
+    const armTys: i32[] = []
+    if unionSetArmTys(nm, atoms, armTys) {
+      let a = 0
+      while a < armTys.length {
+        mems.push(armTys[a])
+        a = a + 1
+      }
+    }
+  }
+  let q = 0
+  while q < monoPinMapFe.length {
+    if monoPinMapFe[q] == fnIx { mems.push(monoPinMapTy[q]) }
+    q = q + 1
+  }
+  if mems.length == 0 { return 0 }
+  let i = 0
+  while i < pat.length {
+    const pm = pat[i]
+    if unMemIsMap(pm) {
+      const ps = mapArmShapeOfTy(pm)
+      let j = 0
+      while j < mems.length {
+        const m = mems[j]
+        if ps < 0 && unMemIsMap(m) && !mapTwinInPattern(pat, m) {
+          if mapArmShapeOfTy(m) == ps {
+            return emitFailAt(
+              "emitProgram: "
+                + what
+                + " cannot tell "
+                + tyToEmitName(pm)
+                + " from "
+                + tyToEmitName(m)
+                + " yet: this instance's union holds both, and they share one representation — wrap each map in a record with a discriminant field",
+              at,
+            )
+          }
+        }
+        j = j + 1
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// Whether the arena type `m` is one of the pattern's members.
+function mapTwinInPattern(pat: i32[], m: i32): boolean {
+  let i = 0
+  while i < pat.length {
+    if tySame(pat[i], m) { return true }
+    // A set and the map it lowers as render alike; the checker already refuses that pair.
+    if tyToEmitName(pat[i]) == tyToEmitName(m) { return true }
+    i = i + 1
+  }
+  false
+}
+
 // Lower a type guard `recv is X`: a narrowed operand's narrowing is lifted for the test, an
 // un-narrowed frame local typed as exactly `X` is a tautology, and `emitIsTest` does the rest.
 function emitIs(body: u8[], isIx: i32, fnIx: i32) {
@@ -2764,6 +2843,11 @@ function isNarrowMaskKey(recvIx: i32, fnIx: i32): string {
 // proved the tested shape is the sole non-null member, which monomorphization can break (D950).
 function emitIsTest(body: u8[], isIx: i32, fnIx: i32) {
   const nd0 = P.nodes[isIx]
+  if nd0 is IsExpr {
+    if mapTwinTagFail(nd0.isObj, isVarTyIxOf(isIx), fnIx, isIx, "`is`") < 0 {
+      return -1
+    }
+  }
   if nd0 is IsExpr {
     const imk = mapReadScalarBoxKind(nd0.isObj, fnIx)
     if imk >= 0 {
@@ -14781,6 +14865,7 @@ function emitAsCast(body: u8[], e: AsExpr, _exprIx: i32, fnIx: i32) {
     if e.asMode == "null" { tty = tyPeelNul(tty) }
     // the target's arms, flattened rather than tested as `TyUnion`: a sub-union target
     // only widens the membership test (a tag chain), with no unbox at all.
+    if mapTwinTagFail(obj, tty, fnIx, _exprIx, "`as`") < 0 { return -1 }
     const wantTags: i32[] = []
     const wantVis: i32[] = []
     if !unionArmTagsOfTy(tty, wantTags, wantVis) {
