@@ -91,6 +91,7 @@ import {
   nodeTyMapValIsNulLitUnion,
   nodeTyMapValLitUnionTexts,
   nodeTyPinIxOf,
+  nodeTyProvesNonNull,
   nodeTyRecord,
   nodeUnwidenedTyOf,
   nodeWideStrLitText,
@@ -1033,6 +1034,26 @@ import { fnIndexOfInScopeChain } from "./emit_collect"
 import { voidTwinForNode } from "./emit_rewrite"
 import { nameIsQuotedLeaf, splitUnionAtoms } from "./tyname"
 import { monoOrigNode } from "./emit_state"
+import {
+  INIT_REACH_NEVER,
+  emitCurFnPos,
+  fnDispNames,
+  fnInstOrigin,
+  fnParent,
+  gHelpInitFail,
+  gInitAny,
+  gInitFnReach,
+  gInitGIdx,
+  gInitGLocs,
+  gInitGNames,
+  gInitGuard,
+  gInitProgIdx,
+  gInitReaders,
+  gInitStartOrd,
+  globalStmtOrd,
+} from "./emit_state"
+import { declNameTokOf } from "./ast"
+import { srcmapFileOfTok } from "./srcmap"
 
 // Fill the capture cache (`capStartTbl` / `capCountTbl` / `capNamesFlat` in `emit_state`)
 // with every lifted function's capture list — one walk per function instead of an
@@ -2316,6 +2337,39 @@ function isStrTagUnionNameOf(exprIx: i32, fnIx: i32) {
   ""
 }
 
+// The operand of `x == null` / `null == x` whose checked type admits no `null`, or -1.
+function deadNullTestOperand(e: BinExpr): i32 {
+  const l = unwrapParen(e.binLeft)
+  const r = unwrapParen(e.binRight)
+  if l < 0 || r < 0 || l >= P.nodes.length || r >= P.nodes.length { return -1 }
+  if (
+    P.nodes[r] is NullLit
+    && !(P.nodes[l] is NullLit)
+    && nodeTyProvesNonNull(l)
+  ) {
+    return l
+  }
+  if (
+    P.nodes[l] is NullLit
+    && !(P.nodes[r] is NullLit)
+    && nodeTyProvesNonNull(r)
+  ) {
+    return r
+  }
+  -1
+}
+
+// Lower a dead null test to its constant: the operand runs for its effects unless it is a
+// bare name, and is never read as nullable (DECISIONS.md, the dead null test).
+function emitDeadNullTest(body: u8[], opIx: i32, isNe: boolean, fnIx: i32) {
+  if !(P.nodes[opIx] is Ident) {
+    if emitExpr(body, opIx, fnIx) < 0 { return -1 }
+    fbDrop()
+  }
+  if isNe { fbI32Const(1) } else { fbI32Const(0) }
+  0
+}
+
 // The null test for a nullable value — `x == null`/`x != null` and the `x is null`/`x is
 // <member>` guard ask the same question of the same rep. Leaves a 0/1 i32 (1 = null unless
 // `invert`); 0 means no arm claims the rep. `nicheOnly` restricts to single-non-null-member
@@ -2331,11 +2385,23 @@ function emitNulIsNullTest(
     // claimed first: every arm below reads the declared nullable rep while a narrowed
     // binding is read at its arm's rep, so without this the assignment spelling gets no arm.
     const nnRef = P.nodes[unwrapParen(refIx)]
+    let nnKey = ""
     if nnRef is Ident {
-      if narrowExcludesNull(nnRef.identName) {
-        if invert { fbI32Const(1) } else { fbI32Const(0) }
-        return 1
-      }
+      nnKey = nnRef.identName
+    } else {
+      nnKey = placeNarrowKeyOf(refIx)
+    }
+    // A place the checker proved non-null under its narrowing holds no null, whatever rep the
+    // narrowing pushed for it.
+    // A field or cell folds only on the checker's proof as well, which settles a call that
+    // may have written it; a bare name's narrowing is retired where the checker's is.
+    let nnFold = nnKey != "" && narrowExcludesNull(nnKey)
+    if !(nnRef is Ident) && nnKey != "" {
+      nnFold = narrowSlotOf(nnKey) >= 0 && nodeTyProvesNonNull(refIx)
+    }
+    if nnFold {
+      if invert { fbI32Const(1) } else { fbI32Const(0) }
+      return 1
     }
   }
 
@@ -23218,7 +23284,139 @@ export function emitUserGlobalGet(gi: i32) {
     fbLocalGet(gPromoSlot[gi])
     return 0
   }
+  if initGuardNeeded(gi, false) {
+    if emitInitGuard(gi, "read") < 0 { return -1 }
+  }
   fbGlobalGet(userGlobalIdx(gi))
+  0
+}
+
+// Set while an assignment's value re-reads the global it just stored (`emitBinExprNode`).
+let initGuardOff = false
+
+// The earliest top-level position at which `fnStmts[p]` can run: its own, else its enclosing
+// frame's or its instance origin's, `INIT_REACH_NEVER` when no top-level code names any of them.
+function initFnReachOf(p: i32): i32 {
+  let best = INIT_REACH_NEVER
+  let cur = p
+  let steps = 0
+  while cur >= 0 && cur < gInitFnReach.length && steps <= gInitFnReach.length {
+    if gInitFnReach[cur] < best { best = gInitFnReach[cur] }
+    let up = -1
+    if cur < fnParent.length { up = fnParent[cur] }
+    if up < 0 && cur < fnInstOrigin.length { up = fnInstOrigin[cur] }
+    cur = up
+    steps = steps + 1
+  }
+  best
+}
+
+// Whether a read (a write, when `write`) of guarded global `gi` at the cursor can run before its initializer: in the
+// start function, at or before the declaration's own position; in a function body, when top-level
+// code at or before that position can call it, or when no top-level code names it at all.
+function initGuardNeeded(gi: i32, write: boolean): boolean {
+  if !gInitAny || initGuardOff { return false }
+  if gi < 0 || gi >= gInitGuard.length || gi >= globalStmtOrd.length {
+    return false
+  }
+  if gInitGuard[gi] != 1 && !(write && gInitGuard[gi] == 2) { return false }
+  const at = globalStmtOrd[gi]
+  if gPromoInStart { return gInitStartOrd >= 0 && gInitStartOrd <= at }
+  if emitCurFnPos < 0 { return false }
+  const r = initFnReachOf(emitCurFnPos)
+  r == INIT_REACH_NEVER || r <= at
+}
+
+// The source name of the function being lowered, for the guard's `via` clause: its declared
+// name, else its instance origin's, else the binding a lambda is bound to, else "".
+function initGuardFnName(p: i32): string {
+  let cur = p
+  let steps = 0
+  while cur >= 0 && cur < fnStmts.length && steps <= fnStmts.length {
+    const tk = declNameTokOf(fnStmts[cur])
+    if tk >= 0 && tk < P.toks.length { return P.toks[tk].text }
+    if cur < fnDispNames.length && fnDispNames[cur] != "" {
+      return fnDispNames[cur]
+    }
+    // A monomorphized instance keeps its origin's name before the `$` its pin appends.
+    const fd = P.nodes[fnStmts[cur]]
+    if fd is FuncDecl {
+      let cut = 0
+      while cut < fd.fnName.length && fd.fnName[cut] != '$' { cut = cut + 1 }
+      const base = fd.fnName.slice(0, cut)
+      if base != "" && base.slice(0, 8) != "__lambda" { return base }
+    }
+    let up = -1
+    if cur < fnInstOrigin.length { up = fnInstOrigin[cur] }
+    cur = up
+    steps = steps + 1
+  }
+  ""
+}
+
+// The `gInitGNames`/`gInitGLocs` row of global `gi`, interned on first use: its source
+// name, and where it is declared.
+function initGuardGlobalRow(gi: i32): i32 {
+  let k = 0
+  while k < gInitGIdx.length {
+    if gInitGIdx[k] == gi { return k }
+    k = k + 1
+  }
+  const d = P.nodes[globalStmts[gi]]
+  let name = ""
+  if d is LetDecl { name = d.letName }
+  let tk = declNameTokOf(globalStmts[gi])
+  if tk >= 0 && tk < P.toks.length { name = P.toks[tk].text }
+  if tk < 0 && globalStmts[gi] < nodeToks.length {
+    tk = nodeToks[globalStmts[gi]]
+  }
+  let where = ""
+  if tk >= 0 && tk < P.toks.length {
+    const file = srcmapFileOfTok(tk)
+    if file == "" {
+      where = " (line " + i32ToStr(P.toks[tk].line) + ")"
+    } else {
+      where = " (" + file + ":" + i32ToStr(P.toks[tk].line) + ")"
+    }
+  }
+  gInitGIdx.push(gi)
+  gInitGNames.push("`" + name + "` ")
+  gInitGLocs.push(where)
+  gInitGIdx.length - 1
+}
+
+// The `gInitReaders` row naming the function being lowered (empty in the start function),
+// interned on first use.
+function initGuardReaderRow(): i32 {
+  let via = ""
+  if !gPromoInStart {
+    const fname = initGuardFnName(emitCurFnPos)
+    if fname == "" { via = ", via a closure" } else { via = ", via " + fname }
+  }
+  let k = 0
+  while k < gInitReaders.length {
+    if gInitReaders[k] == via { return k }
+    k = k + 1
+  }
+  gInitReaders.push(via)
+  gInitReaders.length - 1
+}
+
+// Calls `__init_fail__` when the progress cell has not yet passed global `gi` (D2652);
+// `verb` is "read" or "written".
+function emitInitGuard(gi: i32, verb: string) {
+  if gInitProgIdx < 0 || gHelpInitFail < 0 || gImports < 4 {
+    return emitFail("emitProgram: read-before-init guard with no progress cell")
+  }
+  fbGlobalGet(gInitProgIdx)
+  fbI32Const(gi + 1)
+  fbI32Bin(72)          // 0x48 i32.lt_s
+  fbIf(64)              // 0x40 void
+  fbI32Const(initGuardGlobalRow(gi))
+  if verb == "written" { fbI32Const(1) } else { fbI32Const(0) }
+  fbI32Const(initGuardReaderRow())
+  fbCall(gHelpInitFail) // never returns
+  fbEnd()
   0
 }
 
@@ -23237,6 +23435,11 @@ export function emitUserGlobalSet(gi: i32) {
   // An immutable cell is written only by its constexpr; a store here would be invalid wasm.
   if globalCellIsImmutable(gi) {
     return emitFail("emitProgram: a store to an immutable module const")
+  }
+  // A write a function can make before the initializer ran would be overwritten by it (D2654);
+  // the start function's own writes are its initializers and the checker orders the rest.
+  if !gPromoInStart && initGuardNeeded(gi, true) {
+    if emitInitGuard(gi, "written") < 0 { return -1 }
   }
   fbGlobalSet(userGlobalIdx(gi))
   0
@@ -24877,7 +25080,11 @@ function emitBinExprNode(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
       if emitAssign(body, exprIx, fnIx) < 0 { return -1 }
       // A box cell re-read at the one member the checker typed the value at (`asgReadNarrowTy`).
       const asgTop = pushAsgReadNarrow(exprIx, fnIx)
+      // The re-read yields the value just stored, so it is never a read before init (D2652).
+      const savedGuardOff = initGuardOff
+      initGuardOff = true
       const asgRc = emitExpr(body, e.binLeft, fnIx)
+      initGuardOff = savedGuardOff
       if asgTop >= 0 { restoreNarrow(asgTop) }
       // A widened scalar cell is read back at the right side's own rep (D2512).
       const asgUnw = asgReadUnwidenOp(exprIx, fnIx)
@@ -24892,6 +25099,11 @@ function emitBinExprNode(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
   // `k`, push `vals[hit]` on a hit else the default `d`. The self-host checker reads
   // every scope map through `?? -1`. The LHS must be a map index in this slice.
   if e.binOp == "??" { return emitCoalesce(body, e, exprIx, fnIx) }
+  // A null test of a value the checker proved non-null is dead: its answer is a constant.
+  if e.binOp == "==" || e.binOp == "!=" {
+    const dnIx = deadNullTestOperand(e)
+    if dnIx >= 0 { return emitDeadNullTest(body, dnIx, e.binOp == "!=", fnIx) }
+  }
   // Short-circuit `&&`/`||` lower to a value-typed `if` (blocktype 0x7f): `a && b` is `if (a)
   // { b } else { 0 }`, `a || b` is `if (a) { 1 } else { b }`. The right operand is a narrowing
   // scope like an `if` arm — `&&` narrows it with `setNarrowFromCond`, `||` with
