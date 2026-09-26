@@ -7925,6 +7925,13 @@ conservative rule is the sound floor it would refine.
   statement, refused in a loop that read the path first or a closure made before — and a write
   inside a nested function ends an enclosing narrowing only for the rest of that body, since the
   calls that run it are what the call rule already charges.
+* *A write inside a condition* ends what the condition established before it (D2589). `&&`
+  checks its right operand under the left operand's facts, and a write there (an assignment
+  in an if-expression arm, a `match` arm, a loop in that arm) retires them as any write does;
+  the arm the whole condition guards, and the code after an `||` guard's early return, then
+  read the place at its declared type, and a re-test narrows again. Evaluation order decides,
+  unlike the call rule above: a write before the test (`(… p.f = mk() …) && p.f != null`)
+  keeps the test's fact, and a write the fact admits keeps it too.
 * *A nested function made under a narrowing* (D2402) of a binding some function may write keeps
   the narrowing only when it is called by its handle in the body that makes it and neither
   writes nor tests the binding itself; each such call is refused unless the binding still holds

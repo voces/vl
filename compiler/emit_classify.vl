@@ -1941,6 +1941,8 @@ export function letNulMapReadUnionBox(letIx: i32, fnIx: i32) {
       // …and where it unboxes to a CONTAINER arm, for the same reason: the init delivers
       // that container's own ref, so a box cell cannot hold it (D1866).
       if mapReadNarrowedContainer(unwrapParen(d.letInit), fnIx) { return false }
+      // …and where it converts to a niche `A | null` (D2590).
+      if placeNicheAtomKind(unwrapParen(d.letInit), fnIx) >= 0 { return false }
       return mvValKind[mrs] == 2
     }
   }
@@ -13942,7 +13944,12 @@ export function exprIsBool(ix: i32, fnIx: i32) {
           }
         }
       }
-      if lhs is Ident { return identNullableBoolPop(lhs.identName, fnIx) }
+      if lhs is Ident {
+        if identNullableBoolPop(lhs.identName, fnIx) { return true }
+      }
+      // A `boolean | null` niche with a boolean default is a boolean, whatever spelled the
+      // niche: a hole parameter's pin carries it only as the instance's annotation (D2593).
+      return exprNulBool(e.binLeft, fnIx) && exprIsBool(e.binRight, fnIx)
     }
     return false
   }
@@ -15081,7 +15088,7 @@ function setNarrowFromCondRaw(condIx0: i32, fnIx: i32) {
   if c is IsExpr {
     const recv = P.nodes[c.isObj]
     if recv is Ident {
-      if exprUnion(c.isObj, fnIx) {
+      if identHoldsUnionBox(c.isObj, recv.identName, fnIx) {
         pushNarrowIs(recv.identName, c.isVariant, condIx)
         return true
       }
@@ -15593,7 +15600,7 @@ function setNarrowFromCondElseRaw(condIx0: i32, fnIx: i32) {
     // further. Only a boxed struct union narrows — a 1-struct niche is a nullable ref.
     const srecv = P.nodes[unwrapParen(c.isObj)]
     if srecv is Ident {
-      if exprUnion(c.isObj, fnIx) {
+      if identHoldsUnionBox(c.isObj, srecv.identName, fnIx) {
         // The subtracted atom is the resolved spelling, not the author's, agreeing with the
         // three gates that already read it. An inline shape tested against a nominally
         // spelled union would otherwise clear no bit (`msSubAtom` finds no match), silently
@@ -18177,11 +18184,10 @@ export function calleeCloRetName(name: string, fnIx: i32) {
 // `boolean|null` — the niche scalar nullable.
 export function exprNulBool(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return false }
-  // Typed-IR fast path (additive — only turns false into true, mirroring `exprIsBool`):
-  // the checker recorded this node's type as `boolean | null`. Recovers the niche for a
-  // form the syntactic arms below can't trace — a `(boolean | null)[]` element read
-  // `p[i]` — so its `!= null` compares against sentinel 2, not a bare null.
-  if nodeTyIsNulBool(exprIx) { return true }
+  // Typed-IR fast path: the checker recorded `boolean | null`, which recovers the niche for a
+  // form the arms below cannot trace (a `(boolean | null)[]` element read) — unless the read
+  // delivers a union box, whose recorded type names a niche it does not hold (D2588).
+  if nodeTyIsNulBool(exprIx) { return !narrowedBoxPlace(exprIx, fnIx) }
   // An if-EXPRESSION whose arm is ITSELF nullable — see `nulIfArmNullableValueIx` (D1560).
   const nlIfB = nulIfArmNullableValueIx(exprIx)
   if nlIfB >= 0 {
@@ -18261,6 +18267,14 @@ export function exprNulBool(exprIx: i32, fnIx: i32) {
       if exprNulBool(e.binLeft, fnIx) { return exprNulBool(e.binRight, fnIx) }
     }
   }
+  false
+}
+
+// True when `exprIx` is a name, field or cell whose read delivers a value-union box: the
+// narrowed sub-union a condition left it at shares the box's rep, not the sub-union's own.
+function narrowedBoxPlace(exprIx: i32, fnIx: i32): boolean {
+  const e = P.nodes[unwrapParen(exprIx)]
+  if e is Ident || e is Member || e is Index { return exprUnion(exprIx, fnIx) }
   false
 }
 
@@ -29238,6 +29252,8 @@ export function exprUnion(exprIx: i32, fnIx: i32) {
     // unboxed in this scope: the host's narrowing types it as the member, not the union.
     // A sub-union narrowing (2+ atoms) keeps the box.
     if narrowedValueAtomOf(e.identName) != "" { return false }
+    // …and one narrowed to a niche-repped `A | null`, which the read converts (D2590).
+    if nicheReadKindAt(exprIx, e.identName) >= 0 { return false }
     // A union binding narrowed to a ref-element array arm reads unboxed to the reflist
     // wrapper: in this scope it is a list, not a union value — the ref-array twin of the
     // scalar-atom rule above. Without it a rebind under the narrow classified as a union
@@ -29259,6 +29275,10 @@ export function exprUnion(exprIx: i32, fnIx: i32) {
     const gi = globalLetOfIn(fnIx, e.identName)
     if gi >= 0 { return letIsUnion(gi, -1) }
     return false
+  }
+  // A field or cell narrowed to a niche-repped `A | null` reads as that niche (D2590).
+  if e is Member || e is Index {
+    if nicheReadKindAt(exprIx, placeNarrowKeyOf(exprIx)) >= 0 { return false }
   }
   // `ns[i]` over a UNION-element ref list yields the union box (G7-ref) — so the value
   // is usable with `is`-narrowing (a `let n0 = ns[i]` is a union local). Per-slot: the
@@ -30129,6 +30149,7 @@ export function unionNameOfExpr(exprIx: i32, fnIx: i32) {
   // ref array, map): a rebind under a narrow must not still be named a union here. D1252.
   if e is Ident {
     if narrowedValueAtomOf(e.identName) != "" { return "" }
+    if nicheReadKindAt(unwrapParen(exprIx), e.identName) >= 0 { return "" }
     if narrowedRefArrayOf(e.identName) != "" { return "" }
     if narrowedMapOf(e.identName) != "" { return "" }
     // The sid-taking twin, off the node's own column: `sidOfNode` of this Ident is `sidOf` of
@@ -30182,6 +30203,11 @@ export function unionNameOfExpr(exprIx: i32, fnIx: i32) {
         }
       }
     }
+  }
+  // The name-typed half of `exprUnion`'s niche decline for a field or cell (D2590).
+  if e is Member || e is Index {
+    const nrx = unwrapParen(exprIx)
+    if nicheReadKindAt(nrx, placeNarrowKeyOf(nrx)) >= 0 { return "" }
   }
   // `ns[i]` over a UNION-element ref list yields the element union's box (the
   // name-typed mirror of `exprUnion`'s Index case) — so an un-annotated
@@ -30313,6 +30339,66 @@ export function narrowedValueAtomOf(name: string) {
   // STRING ref the box stores its litunion member as (`emitUnionCoerce` boxes it so).
   if k < 0 && nameIsLitUnionType(v) { return "string" }
   ""
+}
+
+// The kind of `A` when a union binding `name` is narrowed to exactly `A | null` and that pair has a
+// niche rep of its own (`boolean | null` is an i32 with 2 for null, `string | null` a nullable ref),
+// else -1. A read then converts the box to the niche, the type the checker gave it (D2590).
+function narrowedNicheAtomOf(name: string): i32 {
+  const i = narrowSlotOf(name)
+  if i < 0 { return -1 }
+  const v = narrowVariants[i]
+  if v == "" { return -1 }
+  const atoms: string[] = []
+  splitUnionAtoms(v, atoms)
+  if atoms.length != 2 { return -1 }
+  let k = -1
+  let nulls = 0
+  let a = 0
+  while a < 2 {
+    const ak = valueAtomKind(atoms[a])
+    if ak == 6 { nulls = nulls + 1 } else { k = ak }
+    a = a + 1
+  }
+  if nulls != 1 { return -1 }
+  if k == 1 || k == 2 { return k }
+  -1
+}
+
+// The niche kind a field or cell read at `exprIx` converts to: its key is narrowed to a niche
+// `A | null` and, with that narrowing lifted, the read is the union box. -1 otherwise.
+export function placeNicheAtomKind(exprIx: i32, fnIx: i32): i32 {
+  const key = placeNarrowKeyOf(exprIx)
+  if key == "" { return -1 }
+  const nk = nicheReadKindAt(unwrapParen(exprIx), key)
+  if nk < 0 { return -1 }
+  const masked = maskNarrowFor(key)
+  const box = exprUnion(exprIx, fnIx)
+  unmaskNarrow(masked)
+  if box { return nk }
+  -1
+}
+
+// The stash a niche read parks a field's or cell's box in between its tag test and its payload
+// read. It shares the literal-`is` stash, code 17: neither holds it across any user code.
+export function nicheReadStashSlot() {
+  scratchSlot(17, "i32", 0, SCRATCH_BY_CODE)
+}
+
+// Whether the name read at `ix` holds a union box: `exprUnion`, or a read the niche narrowing
+// converts, whose storage is still the box a test on it narrows.
+function identHoldsUnionBox(ix: i32, name: string, fnIx: i32): boolean {
+  if exprUnion(ix, fnIx) { return true }
+  nicheReadKindAt(unwrapParen(ix), name) >= 0
+}
+
+// `narrowedNicheAtomOf` for the read at node `ix` of key `key`, where the checker agrees: the
+// read's recorded type is that niche. A read it typed otherwise keeps the box.
+export function nicheReadKindAt(ix: i32, key: string): i32 {
+  const nk = narrowedNicheAtomOf(key)
+  if nk == 1 && nodeTyIsNulBool(ix) { return 1 }
+  if nk == 2 && nodeTyIsNulString(ix) { return 2 }
+  -1
 }
 
 // The ref-element-array arm a union binding `name` is currently narrowed to (`if x is S[]`
