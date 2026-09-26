@@ -26,9 +26,15 @@ import {
 import {
   T,
   TyArray,
+  TyErr,
   TyFunc,
+  TyLit,
+  TyMap,
+  TyNeg,
   TyNullable,
   TyObj,
+  TyPrim,
+  TyUnion,
   TyVar,
   bindGenWalk,
   blockHasBareReturn,
@@ -2521,15 +2527,65 @@ function monoCheckedRetTyParam(origFe: i32, typarams: string[]): string {
   if !(f is TyFunc) { return "" }
   const r = f.fnRet
   if r < 0 || r >= T.tys.length { return "" }
-  const rv = T.tys[r]
-  if rv is TyVar {
-    let i = 0
-    while i < typarams.length {
-      if typarams[i] == rv.tvName { return rv.tvName }
-      i = i + 1
-    }
+  const nm = monoSoleTyVarName(r)
+  let i = 0
+  while i < typarams.length {
+    if nm != "" && typarams[i] == nm { return nm }
+    i = i + 1
   }
   ""
+}
+
+// The name of the one type variable `r` is: a bare variable, or a join whose every member is
+// that same variable (`T | T`, the checker's join of two bindings of `T`, D2186). "" otherwise.
+function monoSoleTyVarName(r: i32): string {
+  const rv = T.tys[r]
+  match rv {
+    TyVar => {
+      return rv.tvName
+    }
+    TyUnion => {
+      let nm = ""
+      let i = 0
+      while i < rv.uMembers.length {
+        const m = rv.uMembers[i]
+        if m < 0 || m >= T.tys.length { return "" }
+        const mv = T.tys[m]
+        if !(mv is TyVar) { return "" }
+        if nm != "" && mv.tvName != nm { return "" }
+        nm = mv.tvName
+        i = i + 1
+      }
+      return nm
+    }
+    TyPrim | TyErr | TyObj | TyFunc | TyNullable | TyArray | TyMap | TyLit | TyNeg => {
+      // Concrete, or a variable under a constructor: not the parameter itself.
+      return ""
+    }
+  }
+}
+
+// `rty` read at an instance whose un-annotated parameters are holes the checker typed as its
+// own type variables: each hole binds to its column in `tyCol`, since no annotation names it
+// for `monoBindCols` to walk (D2605).
+function monoHoleRetSubst(
+  rty: i32,
+  ft: TyFunc,
+  params: i32[],
+  tyCol: i32[],
+): i32 {
+  const hN: string[] = []
+  const hT: i32[] = []
+  let i = 0
+  while i < params.length && i < ft.fnParamTypes.length && i < tyCol.length {
+    const pp = P.nodes[params[i]]
+    if pp is Param {
+      if pp.parType < 0 { bindGenWalk(ft.fnParamTypes[i], tyCol[i], hN, hT) }
+    }
+    i = i + 1
+  }
+  if hN.length == 0 { return rty }
+  substTyDeep(rty, hN, hT)
 }
 
 // Whether the per-instance walk is at an operand of a list or object literal.
@@ -4676,6 +4732,9 @@ function monoMakeInstance(
           let rty = ft.fnRet
           if rty >= 0 && tyHasTyVar(rty) {
             rty = substTyDeep(rty, letBN, letBT)
+            if rty >= 0 && tyHasTyVar(rty) {
+              rty = monoHoleRetSubst(rty, ft, params, letTyCol)
+            }
             if rty >= 0 && tyHasTyVar(rty) { rty = -1 }
           }
           if rty >= 0 && tyBearsNull(rty) {
@@ -5265,6 +5324,89 @@ function monoArgsInParamOrder(callIx: i32, declIx: i32): i32[] {
   none
 }
 
+// Whether argument `ax` is an empty list literal, which names no element to bind a `T` from.
+function monoArgIsEmptyLit(ax: i32): boolean {
+  const n = P.nodes[unwrapParen(ax)]
+  if n is ArrayLit { return n.arrElems.length == 0 }
+  false
+}
+
+// The type parameter a bare `T` or `T[]` parameter annotation rides, or "".
+function monoParamBareTyParam(pIx: i32, typarams: string[]): string {
+  const p = P.nodes[pIx]
+  if p is Param {
+    if p.parType < 0 { return "" }
+    const ann = monoDeclAnnName(p.parType, tyNameOf(p.parType), typarams)
+    return monoTyParamOf(ann, typarams)
+  }
+  ""
+}
+
+// Binds, ahead of `monoInstantiate`'s first-use loop, each type parameter whose first use is
+// an empty list literal (`f([], d)`), from its first use that names an element: that loop
+// would bind it to the literal's `i32[]` default, which the checker never inferred (D2607).
+function monoPreBindPastEmptyLit(
+  params: i32[],
+  args: i32[],
+  typarams: string[],
+  ctx: i32,
+  tvN: string[],
+  tvV: string[],
+) {
+  const seen: {[string]: i32} = Map()
+  let i = 0
+  while i < args.length && i < params.length {
+    const tp = monoParamBareTyParam(params[i], typarams)
+    if tp != "" && !seen.has(tp) {
+      // arena-tick exempt: a local dedupe map, not the arena.
+      seen[tp] = 1
+      if monoBindOf(tvN, tvV, tp) == "" && monoArgIsEmptyLit(args[i]) {
+        monoBindFromLaterArg(tp, i + 1, params, args, typarams, ctx, tvN, tvV)
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// Binds `tp` from the first argument at or after `from` whose parameter rides it bare and
+// which is not an empty list literal. Binds nothing when no such argument names an element.
+function monoBindFromLaterArg(
+  tp: string,
+  from: i32,
+  params: i32[],
+  args: i32[],
+  typarams: string[],
+  ctx: i32,
+  tvN: string[],
+  tvV: string[],
+) {
+  let j = from
+  while j < args.length && j < params.length {
+    const pj = P.nodes[params[j]]
+    if pj is Param {
+      if (
+        monoParamBareTyParam(params[j], typarams) == tp
+        && !monoArgIsEmptyLit(args[j])
+      ) {
+        const annj = monoDeclAnnName(pj.parType, tyNameOf(pj.parType), typarams)
+        const an = monoArgPinName(args[j], ctx)
+        if an == "" { return 0 }
+        let bind = an
+        if annj != tp {
+          if !nameIsArray(an) { return 0 }
+          bind = listElemNameOf(an)
+        }
+        tvN.push(tp)
+        tvV.push(bind)
+        return 0
+      }
+    }
+    j = j + 1
+  }
+  0
+}
+
 // Instantiate (or reuse) the instance of generic `origFe` for the call at
 // `callIx` (whose enclosing function is `ctx`, -1 = top level), and point the
 // call site at it. Returns 0, or -1 via `emitFail`.
@@ -5332,6 +5474,7 @@ function monoInstantiate(origFe: i32, callIx: i32, ctx: i32) {
           pb = pb + 1
         }
       }
+      monoPreBindPastEmptyLit(params, args, fn.fnTyParams, ctx, tvN, tvV)
       let i = 0
       while i < args.length {
         const p = P.nodes[params[i]]

@@ -106,6 +106,7 @@ import {
   tyArrayElemPrim,
   tyIsLitSet,
   tyIsLitUnion,
+  tyIsValueUnionBox,
   tyLitMemberTexts,
   tyNomNameCycled,
   tyScalarBasePrim,
@@ -257,6 +258,7 @@ import {
   caSeenUnNames,
   caSeenUnSets,
   caSeenVariants,
+  cboxReadTy,
   cloSigBase,
   cloSigKeys,
   cloSigRepFn,
@@ -1132,7 +1134,7 @@ export function synthNarrowedReadAnn(letIx: i32, fnIx: i32) {
     const ri = unwrapParen(s.letInit)
     if ri < 0 { return 0 }
     const rid = P.nodes[ri]
-    if !(rid is Ident) { return 0 }
+    if !(rid is Ident) { return synthCellNarrowedReadAnn(s, ri) }
     const pn = nodeTyPrimName(ri)
     if !narrowedReadPrimAnnotates(pn) { return 0 }
     if exprIsLitAtom(ri, fnIx) { return 0 }
@@ -1142,6 +1144,35 @@ export function synthNarrowedReadAnn(letIx: i32, fnIx: i32) {
       return 0
     }
     s.letType = synthTypeRefTy(pn, -1, nodeTyIxOf(ri))
+  }
+  0
+}
+
+// The type of `cell` in a read `cell[0]` that `captureBoxRewrite` made of a shared binding, or
+// -1 when `ri` is not such a read.
+function cboxReadCellTy(ri: i32) {
+  if ri < 0 || !cboxReadTy.has(ri) { return -1 }
+  const n = P.nodes[ri]
+  if n is Index {
+    const cty = nodeTyIxOf(unwrapParen(n.idxArr))
+    if cty < 0 { return -1 }
+    const ct = T.tys[cty]
+    if ct is TyArray { return ct.aElem }
+  }
+  -1
+}
+
+// `synthNarrowedReadAnn` for a shared binding's read, which the capture-box rewrite turned
+// into `cell[0]`: the narrowed type survives in `cboxReadTy`, the box in the cell's element.
+function synthCellNarrowedReadAnn(s: LetDecl, ri: i32) {
+  const bty = cboxReadCellTy(ri)
+  if bty < 0 || !tyIsValueUnionBox(bty) { return 0 }
+  const rty = cboxReadTy[ri] ?? -1
+  if rty < 0 { return 0 }
+  const rt = T.tys[rty]
+  if rt is TyPrim {
+    if !narrowedReadPrimAnnotates(rt.primName) { return 0 }
+    s.letType = synthTypeRefTy(rt.primName, -1, rty)
   }
   0
 }
@@ -2171,21 +2202,54 @@ export function synthCaptureEmptyListAnns() {
   0
 }
 
-// Synthesize the annotation of an un-annotated binding copied from a name the checker typed a
-// nullable LIST, from that recorded type: the copied name's own cell is resolved only through
-// the frame's locals, which a capture's classifier does not have (D2599).
-function synthNulListCopyAnn(letIx: i32) {
+// Does a captured copy of a value of recorded type `ty` need its type written down: a nullable
+// list, a value union's box, or a string or list narrowed off a nullable source (D2606).
+// Each is a ref whose rep the copied name's cell resolves only through frame locals.
+function captureCopyAnnotates(ty: i32) {
+  if ty < 0 || ty >= T.tys.length { return false }
+  const t = T.tys[ty]
+  match t {
+    TyNullable => {
+      if t.nInner < 0 || t.nInner >= T.tys.length { return false }
+      return T.tys[t.nInner] is TyArray
+    }
+    TyUnion => {
+      return tyIsValueUnionBox(ty) && !tyIsLitUnion(ty)
+    }
+    TyArray => {
+      return true
+    }
+    TyPrim => {
+      return t.primName == "string"
+    }
+    TyObj | TyFunc | TyMap => {
+      // A record, closure or map copy classifies from its initializer's own rep already.
+      return false
+    }
+    TyErr | TyVar | TyLit | TyNeg => {
+      // No rep of their own to write down: an error, an open variable, a literal (softened
+      // to its base by the classifier) or a negation.
+      return false
+    }
+  }
+}
+
+// Synthesize the annotation of an un-annotated captured binding copied from another name, from
+// the type the checker recorded for that read: the copied name's own cell is resolved only
+// through the frame's locals, which a capture's classifier does not have (D2606).
+function synthCaptureCopyAnn(letIx: i32) {
   const s = P.nodes[letIx]
   if s is LetDecl {
     if s.letType >= 0 || s.letInit < 0 { return 0 }
     const ri = unwrapParen(s.letInit)
-    if ri < 0 || !(P.nodes[ri] is Ident) { return 0 }
-    const ty = nodeTyIxOf(ri)
-    if ty < 0 { return 0 }
-    const t = T.tys[ty]
-    if !(t is TyNullable) { return 0 }
-    if t.nInner < 0 { return 0 }
-    if !(T.tys[t.nInner] is TyArray) { return 0 }
+    if ri < 0 { return 0 }
+    let ty = -1
+    if P.nodes[ri] is Ident {
+      ty = nodeTyIxOf(ri)
+    } else {
+      ty = cboxReadTy[ri] ?? -1
+    }
+    if !captureCopyAnnotates(ty) { return 0 }
     const nm = tyToEmitName(ty)
     if nm == "" { return 0 }
     s.letType = synthTypeRefTy(nm, -1, ty)
@@ -2213,7 +2277,7 @@ export function synthCaptureReadAnns() {
         const b = parentBindingOf(fe, caps[ci])
         if b >= 0 {
           synthNarrowedReadAnn(b, parentBindingFrameArenaOf(fe, caps[ci]))
-          synthNulListCopyAnn(b)
+          synthCaptureCopyAnn(b)
         }
         ci = ci + 1
       }
