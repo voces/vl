@@ -61,7 +61,7 @@ REPS = {
     # renumber every block and orphan the committed named sets.
     "f64lit":  ("F", "1.5", "2.5", "{X}.r == 1.5"),
     "list":    ("i32[]", "[1, 2]", "[]", "{X}.r.length == 2"),
-    "map":     ("{[string]: i32}", "mkI()", "Map()", "{X}.r.size == 1"),
+    "map":     ("{[string]: i32}", "mkI()", "Map()", "{X}.r.length == 1"),
     "obj":     ("Inner", "{ q: 7 }", "{ q: 0 }", "{X}.r.q == 7"),
     "arm":     ("Shape2", "{ c2: 1 }", "{ s2: 1 }", "{X}.r is Cir2"),
     "nul":     ("i32 | null", "7", "null", "{X}.r != null"),

@@ -91,7 +91,7 @@ function body() {
   const m: {[string]: i32} = Map()
   m["k"] = 5
   m["j"] = 6
-  print(m.size)
+  print(m.length)
   for k in m.keys() { print(k) }
   for v in m.values() { print(v) }
 }

@@ -47,28 +47,28 @@ REPS = {
         '  s.add("a")',
         '  return s',
         '}',
-    ], "{[string]: boolean}", "mkSetStr()", "print({X}.size)", []),
+    ], "{[string]: boolean}", "mkSetStr()", "print({X}.length)", []),
     "set_i32": ([
         'function mkSetI32(): {[i32]: boolean} {',
         '  const s: Set<i32> = Set()',
         '  s.add(1)',
         '  return s',
         '}',
-    ], "{[i32]: boolean}", "mkSetI32()", "print({X}.size)", []),
+    ], "{[i32]: boolean}", "mkSetI32()", "print({X}.length)", []),
     "map_str": ([
         'function mkMapStr(): {[string]: i32} {',
         '  const m: {[string]: i32} = Map()',
         '  m["a"] = 1',
         '  return m',
         '}',
-    ], "{[string]: i32}", "mkMapStr()", "print({X}.size)", []),
+    ], "{[string]: i32}", "mkMapStr()", "print({X}.length)", []),
     "map_i32": ([
         'function mkMapI32(): {[i32]: string} {',
         '  const m: {[i32]: string} = Map()',
         '  m[1] = "a"',
         '  return m',
         '}',
-    ], "{[i32]: string}", "mkMapI32()", "print({X}.size)", []),
+    ], "{[i32]: string}", "mkMapI32()", "print({X}.length)", []),
     # the four scalar newtypes: `print` of `Nt | null` is already a check reject, so the
     # cheapest consuming site IS `print`, and these eight files per rep are the ones
     # #1993 priced.

@@ -151,14 +151,14 @@ rep("closure", "(i32) => i32", [],
 # --- maps -------------------------------------------------------------------
 rep("map_str", "{[string]: i32}", [],
     [("mkMapA()", "2"), ("mkMapB()", "1")], "{[string]: i32}",
-    [("size", "print({E}.size)", lambda i: ["2", "1"][i]),
+    [("size", "print({E}.length)", lambda i: ["2", "1"][i]),
      ("valsum", "for zz in {E}.values() {{ print(zz) }}",
       lambda i: ["5\n6", "9"][i]),
      ("coal", 'print({E}["k"] ?? 0)', lambda i: ["5", "9"][i])],
     family="map")
 rep("map_i32", "{[i32]: string}", [],
     [("mkMapC()", "2"), ("mkMapD()", "1")], "{[i32]: string}",
-    [("size", "print({E}.size)", lambda i: ["2", "1"][i]),
+    [("size", "print({E}.length)", lambda i: ["2", "1"][i]),
      ("valsum", "for zz in {E}.values() {{ print(zz) }}",
       lambda i: ["x\ny", "z"][i])],
     family="map")

@@ -3063,7 +3063,7 @@ if v is string {
 // `let a = v` behaves identically to `const`. Over the full six-arm `Json` the string arm
 // is SILENT and the f64 and boolean arms RUN; over `type K = f64 | K[]` the recursive
 // array arm is SILENT too (`print(a.length)`), while the recursive MAP arm RUNS
-// (`print(g.size)`).
+// (`print(g.length)`).
 ```
 
 ```vl

@@ -119,7 +119,7 @@ function mk(): {[string]: i32} {
   m["k"] = 5
   return m
 }
-print(mk().size)
+print(mk().length)
 print(nCalls)
 """
 P["D2_mapfilter"] = """
@@ -235,7 +235,7 @@ function mk(): {[string]: i32} | null {
 }
 function body() {
   const v: {[string]: i32} | null = mk()
-  if v != null { print(v.size) } else { print("N") }
+  if v != null { print(v.length) } else { print("N") }
 }
 body()
 """
@@ -260,7 +260,7 @@ function mk(): {[i32]: string} {
   return m
 }
 function body(m: {[i32]: string}) {
-  function inner() { print(m.size) }
+  function inner() { print(m.length) }
   inner()
 }
 body(mk())
@@ -272,7 +272,7 @@ function mk2(): {[string]: i32} {
   return m
 }
 function body(m: {[string]: i32}) {
-  function inner2() { print(m.size) }
+  function inner2() { print(m.length) }
   inner2()
 }
 body(mk2())
@@ -284,7 +284,7 @@ function mk3(): {[i32]: string} {
   return m
 }
 function body(m: {[i32]: string}) {
-  print(m.size)
+  print(m.length)
 }
 body(mk3())
 """
@@ -292,7 +292,7 @@ P["D6_local"] = """
 function body() {
   const m: {[i32]: string} = Map()
   m[1] = "x"
-  function inner4() { print(m.size) }
+  function inner4() { print(m.length) }
   inner4()
 }
 body()
@@ -532,7 +532,7 @@ body(null)
 """
 P["D12_map"] = """
 function body(p: {[string]: i32} | null) {
-  function inner5() { if p != null { print(p.size) } else { print("N") } }
+  function inner5() { if p != null { print(p.length) } else { print("N") } }
   inner5()
 }
 body(null)

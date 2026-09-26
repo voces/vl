@@ -12570,9 +12570,95 @@ function tySuggestFor(name: string) {
 // callers with a clause of their own route through `unknownTyTextIn` instead of
 // concatenating after this.
 function tyDidYouMean(name: string) {
+  const g = foreignGenericSpell(name)
+  if g.length > 0 { return g }
   const s = tySuggestFor(name)
   if s.length == 0 { return "" }
   "; did you mean '" + s + "'?"
+}
+
+// The `; did you mean …?` clause for another language's collection generic: `Array<T>` is
+// `T[]`, and `Record<K, V>` is `{[K]: V}` or `Map<K, V>`. "" for any other name. Reached only
+// once resolution failed, so a program that declares its own `Array` or `Record` never sees it.
+function foreignGenericSpell(name: string): string {
+  if foreignGenericHead(name) == 0 { return "" }
+  const vl = foreignGenericRespell(name)
+  if foreignGenericHead(name) == 1 { return "; did you mean '" + vl + "'?" }
+  const kv = foreignRecordSplit(name)
+  "; did you mean '"
+    + vl
+    + "' or 'Map<"
+    + foreignGenericRespell(kv[0])
+    + ", "
+    + foreignGenericRespell(kv[1])
+    + ">'?"
+}
+
+// 1 when `name` is `Array<…>`, 2 when it is a two-argument `Record<…>`, else 0.
+function foreignGenericHead(name: string): i32 {
+  if name.length < 8 || name[name.length - 1] != '>' { return 0 }
+  if name.slice(0, 6) == "Array<" { return 1 }
+  if name.slice(0, 7) == "Record<" && foreignRecordSplit(name).length == 2 {
+    return 2
+  }
+  0
+}
+
+// A `Record<K,V>` spelling's two arguments, split at its one top-level comma; [] otherwise.
+function foreignRecordSplit(name: string): string[] {
+  const inner = name.slice(7, name.length - 1)
+  let depth = 0
+  let i = 0
+  while i < inner.length {
+    const c = inner[i]
+    if c == '<' || c == '(' || c == '[' || c == '{' { depth = depth + 1 }
+    if c == '>' || c == ')' || c == ']' || c == '}' { depth = depth - 1 }
+    if c == ',' && depth == 0 {
+      return [inner.slice(0, i), inner.slice(i + 1, inner.length)]
+    }
+    i = i + 1
+  }
+  []
+}
+
+// `s` with each `|` spaced as the formatter writes a union (`string | i32`).
+function spaceUnionBars(s: string): string {
+  let out = ""
+  let i = 0
+  while i < s.length {
+    if s[i] == '|' {
+      while out.length > 0 && out[out.length - 1] == ' ' {
+        out = out.slice(0, out.length - 1)
+      }
+      out = out + " | "
+      i = i + 1
+      while i < s.length && s[i] == ' ' { i = i + 1 }
+    } else {
+      out = out + s.slice(i, i + 1)
+      i = i + 1
+    }
+  }
+  out
+}
+
+// `name` with every outermost `Array<…>`/`Record<…>` written the VL way, recursively, and
+// its unions spaced.
+function foreignGenericRespell(name: string): string {
+  const h = foreignGenericHead(name)
+  if h == 1 {
+    let el = foreignGenericRespell(name.slice(6, name.length - 1))
+    if el.includes("|") || el.includes("=>") { el = "(" + el + ")" }
+    return el + "[]"
+  }
+  if h == 2 {
+    const kv = foreignRecordSplit(name)
+    return "{["
+      + foreignGenericRespell(kv[0])
+      + "]: "
+      + foreignGenericRespell(kv[1])
+      + "}"
+  }
+  spaceUnionBars(name)
 }
 
 // The `unknown type` diagnostic text for the whole annotation `name`, naming the
@@ -12637,7 +12723,7 @@ const listMethodNames = [
 // Map/set intrinsic names, gated exactly as `checkCallNode`'s own arms gate them: `set`/
 // `get` are a map surface a set must not leak, and `add` a set surface a map must not.
 function mapMethodNames(recvTy: i32) {
-  const out = ["has", "delete", "keys", "values", "length", "size"]
+  const out = ["has", "delete", "keys", "values", "length"]
   const rt = T.tys[recvTy]
   if rt is TyMap {
     if rt.mSet == 0 {
@@ -12673,10 +12759,10 @@ function builtinMethodNamesOf(recvTy: i32): string[] {
   noMethodNames
 }
 
-// Whether a built-in method arm of `checkMemberCallNode` claims `recv.prop(…)`. `length` and
-// `size` are member reads, so their call spelling falls through to a `self`-function.
+// Whether a built-in method arm of `checkMemberCallNode` claims `recv.prop(…)`. `length` is a
+// member read, so its call spelling falls through to a `self`-function.
 function builtinMethodClaims(recvTy: i32, prop: string): boolean {
-  if prop == "length" || prop == "size" { return false }
+  if prop == "length" { return false }
   nameInList(builtinMethodNamesOf(recvTy), prop)
 }
 
@@ -17943,7 +18029,7 @@ export function eqRefusals(
         if msgs.length == msgsBefore {
           msgs.push(
             tyToStr(eqBad)
-              + " isn't equatable — a map has no defined value equality: its entries are insertion-ORDERED and observable that way (`for k in m`, `m.keys()`), so `==` would have to pick between order-sensitive and set-like and neither is what both callers mean — compare `m.size`, or the values at the keys you name",
+              + " isn't equatable — a map has no defined value equality: its entries are insertion-ORDERED and observable that way (`for k in m`, `m.keys()`), so `==` would have to pick between order-sensitive and set-like and neither is what both callers mean — compare `m.length`, or the values at the keys you name",
           )
           unsup.push(0)
         }
@@ -25469,20 +25555,31 @@ function memberFloorMsg(objTy: i32, prop: string) {
   }
   if ot is TyArray {
     if prop == "length" { return "" }
-    return "no field '" + prop + "' on array " + tyToStr(objTy)
+    return "no field '"
+      + prop
+      + "' on array "
+      + tyToStr(objTy)
+      + lengthSpellNote(prop)
   }
   if ot is TyMap {
     if prop == "length" { return "" }
-    if prop == "size" { return "" }
     if ot.mSet == 1 {
-      return "no field '" + prop + "' on set " + tyToStr(objTy)
+      return "no field '"
+        + prop
+        + "' on set "
+        + tyToStr(objTy)
+        + lengthSpellNote(prop)
     }
-    return "no field '" + prop + "' on map " + tyToStr(objTy)
+    return "no field '"
+      + prop
+      + "' on map "
+      + tyToStr(objTy)
+      + lengthSpellNote(prop)
   }
   if ot is TyPrim {
     if ot.primName == "string" {
       if prop == "length" { return "" }
-      return "no field '" + prop + "' on string"
+      return "no field '" + prop + "' on string" + lengthSpellNote(prop)
     }
   }
   if ot is TyVar { return tpMemberFloorMsg(ot.tvName, prop) }
@@ -25494,6 +25591,14 @@ function memberFloorMsg(objTy: i32, prop: string) {
     + "' on non-object "
     + tyToStr(objTy)
     + stdFmtMovedNote(prop)
+}
+
+// The redirect for another language's element-count member read on a list, map, set or
+// string. VL spells every collection's count `.length`; DECISIONS.md §"Every collection
+// counts with `.length`".
+function lengthSpellNote(prop: string): string {
+  if prop == "size" || prop == "count" { return "; did you mean '.length'?" }
+  ""
 }
 
 // The two spellings a program can reach for and fail to find, and the one import that
@@ -31674,6 +31779,16 @@ function callTyArgsCalleeOk(cfn: Node, ix: i32): boolean {
 // `a < b, c > (d)`, which TypeScript's rule reads as type arguments.
 const TY_ARG_READ_HINT = "; `<` … `>` directly followed by `(` is read as type arguments — if this was a comparison, parenthesise it: `(a < b)`"
 
+// The unknown-type sentence for a written type argument `name`, read right after it failed
+// to resolve. The comparison hint sits before any `did you mean`, and is dropped when the
+// failing part is another language's collection generic, which is plainly a type.
+function tyArgUnknownText(name: string): string {
+  let part = unkTyPart
+  if part.length == 0 { part = name }
+  if foreignGenericHead(part) != 0 { return unknownTyText(name) }
+  unknownTyTextIn(name, TY_ARG_READ_HINT)
+}
+
 // The hint when any of `args` is a call written with type arguments, else "".
 function tyArgReadHintIfAny(args: i32[]): string {
   let i = 0
@@ -31698,7 +31813,7 @@ function resolveCallTyArgs(ix: i32, out: i32[]): boolean {
     let t = -1
     if ta is TypeRef {
       t = nameToTyAt(ta.tyName, tas[i])
-      if t < 0 { tErr(unknownTyText(ta.tyName) + TY_ARG_READ_HINT, tas[i]) }
+      if t < 0 { tErr(tyArgUnknownText(ta.tyName), tas[i]) }
     }
     if t < 0 {
       ok = false
@@ -31935,6 +32050,7 @@ function checkCallNode(n: Call, ix: i32) {
   if cfn is Ident {
     const bt = checkBuiltinIdentCall(n, ix, cfn)
     if bt >= 0 { return bt }
+    if foreignLenCall(n, cfn) { return TY_ERR }
   }
   const fnTy = checkNode(n.callFn)
   const ft = T.tys[fnTy]
@@ -31973,6 +32089,28 @@ function checkCallNode(n: Call, ix: i32) {
   }
   tErr("called value is not a function (" + tyToStr(fnTy) + ")", ix)
   TY_ERR
+}
+
+// `len(x)` with no `len` in scope: refused at the callee with the VL spelling, `x.length`.
+// True when it raised. A program that declares or imports its own `len` never reaches it.
+function foreignLenCall(n: Call, cfn: Ident): boolean {
+  if cfn.identName != "len" || n.callArgs.length != 1 { return false }
+  if lookup("len") >= 0 { return false }
+  const at = strLitRecvTy(checkNode(n.callArgs[0]))
+  if !nameInList(builtinMethodNamesOf(at), "length") {
+    tErr("undeclared identifier 'len'", n.callFn)
+    return true
+  }
+  const recv = placeKeyOf(n.callArgs[0])
+  let fix = "'.length'"
+  if recv != "" { fix = "'" + recv + ".length'" }
+  tErr(
+    "undeclared identifier 'len' — a length is a member in VL; did you mean "
+      + fix
+      + "?",
+    n.callFn,
+  )
+  true
 }
 
 // Resolves a written annotation name in the context of generic type-parameter names: params
@@ -42194,6 +42332,72 @@ function checkBinExprNode(n: BinExpr, ix: i32) {
   mkBinOpRetTy(n, bTy, ltOut[0])
 }
 
+// `a in b` outside a `for` head: refused, with the membership test the receiver `b` does have.
+// Answers boolean, so the enclosing condition raises nothing further (DECISIONS.md §"`in` is a
+// for-loop keyword, not an operator").
+function checkInOpNode(n: BinExpr, ix: i32) {
+  checkNode(n.binLeft)
+  const rt = strLitRecvTy(checkNode(n.binRight))
+  if rt >= 0 && rt < T.tys.length {
+    const st = T.tys[nomErasedTyIx(rt)]
+    if st is TyPrim {
+      if st.primName == "string" {
+        tErr(
+          inOpHead() + "; to test for a substring, use `" + inStrFix(n) + "`",
+          ix,
+        )
+        return TY_BOOL
+      }
+    }
+  }
+  tErr(inOpRefusal(rt), ix)
+  TY_BOOL
+}
+
+// The refusal's first clause, shared by every receiver.
+function inOpHead(): string {
+  "`in` is not an operator in VL outside a `for` loop's head"
+}
+
+// `s.includes(a)` spelled with the program's own operands where they are a name or a string
+// literal, else the placeholders.
+function inStrFix(n: BinExpr): string {
+  let recv = placeKeyOf(n.binRight)
+  if recv == "" { recv = "s" }
+  let needle = placeKeyOf(n.binLeft)
+  const ln = P.nodes[n.binLeft]
+  if ln is StrLit { needle = ln.strText }
+  if needle == "" { needle = "x" }
+  recv + ".includes(" + needle + ")"
+}
+
+// The sentence for `a in b` over a receiver of type `rt`, naming that receiver's own test;
+// a nullable receiver answers for its inner type.
+function inOpRefusal(rt: i32): string {
+  const head = inOpHead()
+  if rt < 0 || rt >= T.tys.length { return head }
+  const base = nomErasedTyIx(rt)
+  if base < 0 || base >= T.tys.length { return head }
+  const t = T.tys[base]
+  match t {
+    TyMap => {
+      if t.mSet == 1 {
+        return head + "; to test set membership, use `s.has(x)`"
+      }
+      return head + "; to test for a key, use `m.has(k)`"
+    }
+    TyArray => {
+      return head
+        + "; use `xs.includes(x)` for a value, or `i < xs.length` for an index"
+    }
+    TyNullable => {
+      if t.nInner != base { return inOpRefusal(t.nInner) }
+    }
+    TyErr | TyObj | TyFunc | TyUnion | TyVar | TyLit | TyNeg | TyPrim => {}
+  }
+  head
+}
+
 // Record `+` link `ix`, whose left operand checked as `lt`, for `plusLinkCount` and its readers.
 function plusLinkRecord(ix: i32, lt: i32) {
   if ix < 0 || ix >= nodeToks.length { return 0 }
@@ -42245,6 +42449,7 @@ function mkBinOpRetTy(n: BinExpr, bTy: i32, lt: i32) {
 // Extracted from `checkNodeReal`'s `BinExpr` arm (C3: thin the dispatcher).
 function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
   const op = n.binOp
+  if op == "in" { return checkInOpNode(n, ix) }
   // `a && b` / `a || b`: the left side's narrowings hold while checking the right (`&&`
   // narrows on true, `||` on false — the right is reached only in that branch).
   if op == "&&" || op == "||" {
@@ -45319,7 +45524,7 @@ function memberHasBuiltin(ty: i32, prop: string): boolean {
   const t = T.tys[ty]
   if t is TyObj { return objFieldType(t, prop) >= 0 }
   if t is TyArray { return prop == "length" }
-  if t is TyMap { return prop == "length" || prop == "size" }
+  if t is TyMap { return prop == "length" }
   if t is TyPrim { return t.primName == "string" && prop == "length" }
   // No member of any other kind is built in: an error, a function, a union, a nullable, a
   // type variable, a literal and a negation have no `.prop` a getter could be confused with.
@@ -48095,10 +48300,9 @@ function checkMemberNode(n: Member, ix: i32) {
     return TY_ERR
   }
   if ot is TyMap {
-    // `.length` and `.size` are both the live-entry count (an i32) — `.size` is the
-    // JS Map/Set name, `.length` the list-consistent alias; both read the same field.
+    // `.length` is the live-entry count (an i32), the one name every collection answers;
+    // `.size` is refused with a redirect to it (`lengthSpellNote`).
     if n.memProp == "length" { return symMem(ix, TY_I32) }
-    if n.memProp == "size" { return symMem(ix, TY_I32) }
     memberFloorErr(objTy, n.memProp, ix)
     return TY_ERR
   }
@@ -49021,7 +49225,7 @@ function checkIsExprNode(n: IsExpr, ix: i32) {
     if chkClash.length > 0 {
       tErr(chkClash, ix)
     } else {
-      tErr("unknown type '" + n.isVariant + "' in 'is'", ix)
+      tErr(unknownTyTextIn(n.isVariant, " in 'is'"), ix)
     }
     // `objTy < 0` is the operand's own "no answer", not a type — indexing `T.tys` with it
     // would trap the compiler (D1462); an unresolved operand is freely testable, same as `TyErr`.

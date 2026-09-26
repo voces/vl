@@ -96,6 +96,11 @@ the quotient passes 2^53 — so `1e308 % 3.0` is `2`, not an approximation of it
 | `!` | a boolean | `boolean` | |
 | `??` | a nullable and a fallback | the non-null type | `a ?? b` yields `b` only when `a` is `null` |
 
+There is no `in` operator: `in` is a keyword of the `for` head (`for x in xs`) and nothing else.
+`a in b` in an expression is refused with the membership test the receiver does have —
+`m.has(k)` for a map, `s.has(x)` for a `Set`, `xs.includes(x)` (a value) or `i < xs.length` (an
+index) for a list, `s.includes(x)` for a string. It parses at the comparisons' precedence, so `if x in xs && y` is one error.
+
 ## Bitwise and shifts — integers only
 
 | operator | meaning |
