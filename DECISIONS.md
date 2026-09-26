@@ -6710,10 +6710,14 @@ import a mutable global another unit (or the embedder) owns, and a unit to expor
   `--rename-export-conflicts` (`cli-design.md`, "the facade recipe"). Measured for globals too: an
   imported MUTABLE global re-exported through the facade resolves to the defining unit's own
   global, with no `extern` import left and every access a direct `global.get`/`global.set`.
-- **`vl run` provides no globals and refuses at load**, naming the global and the fix (build and
-  link it). Supplying zero-initialized globals was the alternative and was declined: the program
-  would read a value nobody set, which is exactly what the contract exists to prevent. The same
-  choice `vl run --import-memory` made.
+- **`vl run` supplies a global only from `--extern NAME=VALUE`, and otherwise refuses at load**,
+  naming the global and the flag. Supplying zero-initialized globals was the alternative and was
+  declined: the program would read a value nobody set, which is exactly what the contract exists
+  to prevent. The flag keeps that contract, since the value is one the caller wrote (owner ruling
+  2026-09-26, plumb PL-046, [D2636](docs/internals/inventory/D2636.md)); the refusal is per
+  DECLARATION, and narrowing it to globals the program actually reads is a ROADMAP item. The
+  spelling `--extern` (owner ruling 2026-09-26, over `--define`/`-D` and `--define-global`) matches
+  the keyword the program declares the global with.
 
 Pinned by `tests/vl_extern_global_test.ts` (sections, a host `WebAssembly.Global` written from both
 sides, V8 and `wasm-merge` + `-O3` links, the mutability `LinkError`, the `vl run` refusal) and the

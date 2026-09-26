@@ -101,8 +101,16 @@ await WebAssembly.instantiate(bytes, { imports: { /* print sinks */ }, extern: {
 console.log(rax.value); // what the program last wrote
 ```
 
-`vl run` supplies no globals, so it refuses a module that imports one; build it with `vl build`
-and run it from a host, or link it to the unit that exports the global.
+`vl run` gives an extern global the value you pass with `--extern NAME=VALUE`, once per global:
+an integer for `i32`, `i64` and `boolean` (decimal, or hex with `0x`), a number for `f32` and
+`f64`. Without one it refuses the program, even when nothing reads the global:
+
+```sh
+vl run test.vl --extern CTXB=0 --extern scale=2.5
+```
+
+To run against a real value another unit owns, build it with `vl build` and run it from a host,
+or link it to the unit that exports the global.
 
 ## `export let` — a global another unit imports
 

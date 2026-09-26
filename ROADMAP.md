@@ -3115,6 +3115,12 @@ seed from current `compiler/*.vl` in ~40s.*
   and it is the convention `vl seed` already set. `docs/internals/cli-design.md`
   §"The output channel is RULED" carries the decision and the alternative.
   REMAINING: surfacing diagnostics with spans once the spans rungs land.
+- ⬜ **C-extern-read. `vl run` refuses an unsupplied extern global only when the program READS
+  it.** `vl run --extern NAME=VALUE` (plumb PL-046, [D2636](docs/internals/inventory/D2636.md))
+  supplies a value, and without one `vl run` refuses every DECLARED extern global, including one
+  that only an imported module declares and nothing reads. The goal (owner ruling 2026-09-26) is
+  to refuse only a global some reachable code reads or writes; that needs the emitter to report
+  which extern globals it referenced, or to drop an unreferenced import.
 
 ---
 

@@ -11,7 +11,8 @@
 //      next one's `extern` imports), through `wasm-merge` plus `-O3`, and through a merge whose
 //      `extern` is a generated facade re-exporting each name from its unit. Mutability is part of
 //      the link: an `extern let` against an `export const` is a link error.
-//   4. `vl run` PROVIDES NO GLOBALS and refuses at load, naming the global.
+//   4. `vl run` SUPPLIES A GLOBAL ONLY FROM `--extern NAME=VALUE`, and refuses at load
+//      without one, naming the global and the flag (D2636).
 //
 // GATING is the usual one (`SELFHOST_NATIVE_ALIGN=1` + binary + seed). The `wasm-merge` and
 // `wasm-dis` half needs `node_modules/.bin`, which `ci-native` does not install, so it
@@ -285,16 +286,115 @@ Deno.test({
     }),
 });
 
+
+const G4 = [
+  "extern let ctxb: i32",
+  "extern let rax: i64",
+  "extern const scale: f64",
+  "extern let ratio: f32",
+  "extern let zf: boolean",
+  "print(ctxb)",
+  "print(rax)",
+  "print(scale)",
+  "print(ratio)",
+  "print(zf)",
+  "ctxb = ctxb + 1",
+  "print(ctxb)",
+  "",
+].join("\n");
+
+/** `vl run` of `src` with `args` after the file. */
+const runSrc = async (dir: string, src: string, args: string[]): Promise<Ran> => {
+  await Deno.writeTextFile(`${dir}/g.vl`, src);
+  return await exec(VL, ["run", `${dir}/g.vl`, "--compiler", COMPILER, ...args]);
+};
+
+const expectRefused = (r: Ran, code: number, want: string): void => {
+  if (r.code !== code || !r.err.includes(want)) {
+    throw new Error(`want exit ${code} saying \`${want}\`, got ${r.code}: ${r.err}${r.out}`);
+  }
+};
+
 Deno.test({
-  name: "extern global: `vl run` refuses a module that imports a global, naming it",
+  name: "extern global: `vl run` without a value refuses, naming the global and the flag",
   ignore: !ENABLED,
   fn: () =>
     withDir(async (dir) => {
-      await Deno.writeTextFile(`${dir}/g.vl`, "extern let rax: i64\nprint(rax)\n");
-      const r = await exec(VL, ["run", `${dir}/g.vl`, "--compiler", COMPILER]);
-      const want = "extern global `rax` is declared but `vl run` provides no globals";
-      if (r.code === 0 || !r.err.includes(want)) {
-        throw new Error(`want a non-zero exit saying \`${want}\`, got ${r.code}: ${r.err}`);
+      const r = await runSrc(dir, "extern let rax: i64\nprint(rax)\n", []);
+      expectRefused(
+        r,
+        1,
+        "extern `rax` is not supplied — pass --extern rax=<value>",
+      );
+    }),
+});
+
+Deno.test({
+  name: "extern global: `vl run --extern` supplies each scalar global's value (D2636)",
+  ignore: !ENABLED,
+  fn: () =>
+    withDir(async (dir) => {
+      const r = await runSrc(dir, G4, [
+        "--extern",
+        "ctxb=0xFFFFFFFF",
+        "--extern",
+        "rax=-0x10",
+        "--extern",
+        "scale=2.5",
+        "--extern=ratio=0.25",
+        "--extern",
+        "zf=1",
+      ]);
+      expectEq("rc", r.code, 0);
+      expectEq("output", r.out.trim().split("\n"), ["-1", "-16", "2.5", "0.25", "true", "0"]);
+      // A global nothing reads still needs its value: the refusal is per declaration.
+      const unread = await runSrc(dir, "extern let CTXB: i32\nprint(5)\n", [
+        "--extern",
+        "CTXB=0",
+      ]);
+      expectEq("unread global", [unread.code, unread.out.trim()], [0, "5"]);
+    }),
+});
+
+Deno.test({
+  name: "extern global: a bad `--extern` is refused, naming the global",
+  ignore: !ENABLED,
+  fn: () =>
+    withDir(async (dir) => {
+      const two = "extern let ctxb: i32\nextern let scale: f64\nprint(ctxb)\nprint(scale)\n";
+      const both = ["--extern", "ctxb=0", "--extern", "scale=1"];
+      const cases: [string[], number, string][] = [
+        [
+          [...both, "--extern", "nope=1"],
+          1,
+          "`--extern nope=…` names no extern global this program declares " +
+          "(it declares: ctxb, scale)",
+        ],
+        [
+          ["--extern", "ctxb=1.5", "--extern", "scale=1"],
+          1,
+          "`ctxb` is an i32 global, which takes an integer, and `1.5` is not one",
+        ],
+        [
+          ["--extern", "ctxb=0x100000000", "--extern", "scale=1"],
+          1,
+          "`0x100000000` is out of range for `ctxb`'s type",
+        ],
+        [
+          ["--extern", "ctxb=0", "--extern", "scale=abc"],
+          1,
+          "`scale` is an f64 global, which takes a number, and `abc` is not one",
+        ],
+        [["--extern", "ctxb"], 2, "the value is spelled NAME=VALUE"],
+        [
+          ["--extern", "ctxb=1", "--extern", "ctxb=2"],
+          2,
+          "`--extern` gives `ctxb` twice",
+        ],
+        [["--extern"], 2, "`--extern` requires a value"],
+      ];
+      for (const [args, code, want] of cases) {
+        expectRefused(await runSrc(dir, two, args), code, want);
       }
     }),
 });
