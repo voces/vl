@@ -8031,7 +8031,7 @@ answered it on a map or a `Set`.
 | written | refused with |
 | --- | --- |
 | `.size` or `.count` on a list, map, `Set` or string | `no field 'size' on map {[string]: i32}; did you mean '.length'?` |
-| `len(x)`, when nothing in scope is named `len` | `undeclared identifier 'len' — a length is a member in VL; did you mean 'x.length'?` |
+| `len(x)`, when nothing in scope is named `len` and `x` has a length | `undeclared identifier 'len' — a length is a member in VL; did you mean 'x.length'?` (a `len` of anything else is a plain `undeclared identifier 'len'`) |
 | `Array<T>` | `unknown type 'Array<i32>'; did you mean 'i32[]'?` |
 | `Record<K, V>` | `unknown type 'Record<string,i32>'; did you mean '{[string]: i32}' or 'Map<string, i32>'?` |
 
@@ -8064,6 +8064,7 @@ the receiver does have.**
 | a map (or a nullable one) | ``; to test for a key, use `m.has(k)` `` |
 | a `Set` | ``; to test set membership, use `s.has(x)` `` |
 | a list | ``; use `xs.includes(x)` for a value, or `i < xs.length` for an index`` |
+| a string | ``; to test for a substring, use `s.includes("a")` `` (with the program's own operands) |
 | anything else | the head alone: `` `in` is not an operator in VL outside a `for` loop's head `` |
 
 Before the ruling `"a" in m` was a parse error cascade — `expected ',' but found 'in'`,
@@ -8075,9 +8076,15 @@ rule, teaches the right method, and keeps the keyword free if a working `in` is 
 **Mechanism.** `in` stays a soft keyword, an `IDENT` token. `parseBinary` gives it the
 relational tier (`IN_PREC`, the binding power of `<`) when it follows an operand on the same
 line, and builds an ordinary `BinExpr` with op `in`; the checker refuses that op first and
-answers `boolean`, so `if x in xs && y` is one diagnostic. Nothing else changes meaning: a `for`
-head consumes its own `in` before any expression is parsed; `in` at the start of an operand is
-still an identifier (`let in = 4; print(in + 1)`); a line break before `in` still ends the
-statement, since only token kinds with a binary precedence continue a line. Every `.vl` file in
-`tests/`, `std/`, `compiler/`, `scripts/` (the distilled corpus included) was searched for `in`
-outside a `for` head: the only uses are `in` as a variable, which parse as before.
+answers `boolean`, so `if x in xs && y` is one diagnostic. A `for` head consumes its own `in`
+before any expression is parsed; `in` at the start of an operand is still an identifier
+(`let in = 4; print(in + 1)`); a line break before `in` still ends the statement, since only
+token kinds with a binary precedence continue a line.
+
+**One spelling that ran now refuses.** VL accepts two statements on one line with no separator,
+so on master `print(1) in = 5` — a second statement assigning a variable named `in` — ran. `in`
+after an operand on the same line is now the operator, so that line is a parse error
+(`expected an expression but found EQUAL`). It is loud, the fix is a line break or `;`, and no
+`.vl` file in `tests/`, `std/`, `compiler/` or `scripts/` (the distilled corpus included) has it:
+the tree was searched for `in` outside a `for` head, and every use is `in` as a variable at the
+start of a statement or operand, which parses as before.

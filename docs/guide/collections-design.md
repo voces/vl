@@ -70,13 +70,14 @@ What you might reach for from elsewhere, and what the checker says:
 | --- | --- |
 | `m.size`, `s.size`, `xs.size`, `"ab".size` | ``no field 'size' on map {[string]: i32}; did you mean '.length'?`` |
 | `xs.count`, `m.count` | ``no field 'count' on array i32[]; did you mean '.length'?`` |
-| `len(xs)` | ``undeclared identifier 'len' — a length is a member in VL; did you mean 'xs.length'?`` |
+| `len(xs)` (a list, map, set or string) | ``undeclared identifier 'len' — a length is a member in VL; did you mean 'xs.length'?`` |
 | `Array<i32>` | ``unknown type 'Array<i32>'; did you mean 'i32[]'?`` |
 | `Record<string, i32>` | ``unknown type 'Record<string,i32>'; did you mean '{[string]: i32}' or 'Map<string, i32>'?`` |
 | `xs.contains(x)` | ``no method '.contains' on array i32[]; did you mean '.includes'?`` |
 | `"a" in m` | `` `in` is not an operator in VL outside a `for` loop's head; to test for a key, use `m.has(k)` `` |
 | `x in s` (a `Set`) | ``… ; to test set membership, use `s.has(x)` `` |
 | `x in xs` (a list) | ``… ; use `xs.includes(x)` for a value, or `i < xs.length` for an index`` |
+| `"a" in s` (a string) | ``… ; to test for a substring, use `s.includes("a")` `` |
 
 The names stay free for your own use: a record field called `size`, a `self`-function
 `size(self: {[string]: i32})` called as `m.size()`, a function of your own called `len`, and a

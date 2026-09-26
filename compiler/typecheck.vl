@@ -12621,7 +12621,28 @@ function foreignRecordSplit(name: string): string[] {
   []
 }
 
-// `name` with every outermost `Array<…>`/`Record<…>` written the VL way, recursively.
+// `s` with each `|` spaced as the formatter writes a union (`string | i32`).
+function spaceUnionBars(s: string): string {
+  let out = ""
+  let i = 0
+  while i < s.length {
+    if s[i] == '|' {
+      while out.length > 0 && out[out.length - 1] == ' ' {
+        out = out.slice(0, out.length - 1)
+      }
+      out = out + " | "
+      i = i + 1
+      while i < s.length && s[i] == ' ' { i = i + 1 }
+    } else {
+      out = out + s.slice(i, i + 1)
+      i = i + 1
+    }
+  }
+  out
+}
+
+// `name` with every outermost `Array<…>`/`Record<…>` written the VL way, recursively, and
+// its unions spaced.
 function foreignGenericRespell(name: string): string {
   const h = foreignGenericHead(name)
   if h == 1 {
@@ -12637,7 +12658,7 @@ function foreignGenericRespell(name: string): string {
       + foreignGenericRespell(kv[1])
       + "}"
   }
-  name
+  spaceUnionBars(name)
 }
 
 // The `unknown type` diagnostic text for the whole annotation `name`, naming the
@@ -31758,6 +31779,16 @@ function callTyArgsCalleeOk(cfn: Node, ix: i32): boolean {
 // `a < b, c > (d)`, which TypeScript's rule reads as type arguments.
 const TY_ARG_READ_HINT = "; `<` … `>` directly followed by `(` is read as type arguments — if this was a comparison, parenthesise it: `(a < b)`"
 
+// The unknown-type sentence for a written type argument `name`, read right after it failed
+// to resolve. The comparison hint sits before any `did you mean`, and is dropped when the
+// failing part is another language's collection generic, which is plainly a type.
+function tyArgUnknownText(name: string): string {
+  let part = unkTyPart
+  if part.length == 0 { part = name }
+  if foreignGenericHead(part) != 0 { return unknownTyText(name) }
+  unknownTyTextIn(name, TY_ARG_READ_HINT)
+}
+
 // The hint when any of `args` is a call written with type arguments, else "".
 function tyArgReadHintIfAny(args: i32[]): string {
   let i = 0
@@ -31782,7 +31813,7 @@ function resolveCallTyArgs(ix: i32, out: i32[]): boolean {
     let t = -1
     if ta is TypeRef {
       t = nameToTyAt(ta.tyName, tas[i])
-      if t < 0 { tErr(unknownTyText(ta.tyName) + TY_ARG_READ_HINT, tas[i]) }
+      if t < 0 { tErr(tyArgUnknownText(ta.tyName), tas[i]) }
     }
     if t < 0 {
       ok = false
@@ -32065,13 +32096,18 @@ function checkCallNode(n: Call, ix: i32) {
 function foreignLenCall(n: Call, cfn: Ident): boolean {
   if cfn.identName != "len" || n.callArgs.length != 1 { return false }
   if lookup("len") >= 0 { return false }
-  checkNode(n.callArgs[0])
-  let recv = placeKeyOf(n.callArgs[0])
-  if recv == "" { recv = "x" }
+  const at = strLitRecvTy(checkNode(n.callArgs[0]))
+  if !nameInList(builtinMethodNamesOf(at), "length") {
+    tErr("undeclared identifier 'len'", n.callFn)
+    return true
+  }
+  const recv = placeKeyOf(n.callArgs[0])
+  let fix = "'.length'"
+  if recv != "" { fix = "'" + recv + ".length'" }
   tErr(
-    "undeclared identifier 'len' — a length is a member in VL; did you mean '"
-      + recv
-      + ".length'?",
+    "undeclared identifier 'len' — a length is a member in VL; did you mean "
+      + fix
+      + "?",
     n.callFn,
   )
   true
@@ -42301,15 +42337,44 @@ function checkBinExprNode(n: BinExpr, ix: i32) {
 // for-loop keyword, not an operator").
 function checkInOpNode(n: BinExpr, ix: i32) {
   checkNode(n.binLeft)
-  const rt = checkNode(n.binRight)
+  const rt = strLitRecvTy(checkNode(n.binRight))
+  if rt >= 0 && rt < T.tys.length {
+    const st = T.tys[nomErasedTyIx(rt)]
+    if st is TyPrim {
+      if st.primName == "string" {
+        tErr(
+          inOpHead() + "; to test for a substring, use `" + inStrFix(n) + "`",
+          ix,
+        )
+        return TY_BOOL
+      }
+    }
+  }
   tErr(inOpRefusal(rt), ix)
   TY_BOOL
+}
+
+// The refusal's first clause, shared by every receiver.
+function inOpHead(): string {
+  "`in` is not an operator in VL outside a `for` loop's head"
+}
+
+// `s.includes(a)` spelled with the program's own operands where they are a name or a string
+// literal, else the placeholders.
+function inStrFix(n: BinExpr): string {
+  let recv = placeKeyOf(n.binRight)
+  if recv == "" { recv = "s" }
+  let needle = placeKeyOf(n.binLeft)
+  const ln = P.nodes[n.binLeft]
+  if ln is StrLit { needle = ln.strText }
+  if needle == "" { needle = "x" }
+  recv + ".includes(" + needle + ")"
 }
 
 // The sentence for `a in b` over a receiver of type `rt`, naming that receiver's own test;
 // a nullable receiver answers for its inner type.
 function inOpRefusal(rt: i32): string {
-  const head = "`in` is not an operator in VL outside a `for` loop's head"
+  const head = inOpHead()
   if rt < 0 || rt >= T.tys.length { return head }
   const base = nomErasedTyIx(rt)
   if base < 0 || base >= T.tys.length { return head }
@@ -49160,7 +49225,7 @@ function checkIsExprNode(n: IsExpr, ix: i32) {
     if chkClash.length > 0 {
       tErr(chkClash, ix)
     } else {
-      tErr("unknown type '" + n.isVariant + "' in 'is'", ix)
+      tErr(unknownTyTextIn(n.isVariant, " in 'is'"), ix)
     }
     // `objTy < 0` is the operand's own "no answer", not a type — indexing `T.tys` with it
     // would trap the compiler (D1462); an unresolved operand is freely testable, same as `TyErr`.
