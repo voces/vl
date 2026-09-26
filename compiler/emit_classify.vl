@@ -14908,6 +14908,59 @@ function pushIndexMapNarrow(
   true
 }
 
+// The set a null test over the index cell keyed `ik` subtracts from: a live narrowing that
+// an `is` complement left narrower than the declared set and still admitting `null`, else
+// its element union `un`'s declared set (D2586).
+function indexCellCurSet(ik: string, un: string): string {
+  const dcl = unionMemberSetOf(un)
+  const slot = narrowSlotOf(ik)
+  if slot < 0 { return dcl }
+  const cur = narrowVariants[slot]
+  if cur == "" || cur == "null" || removeAtomFromSet(cur, "null") == cur {
+    return dcl
+  }
+  if unionMemberCount(cur) >= unionMemberCount(dcl) { return dcl }
+  cur
+}
+
+// The else of `m["k"] is T` over a map cell holding a value union: subtract `T` from the cell's
+// set, its live narrowing or else the value's set with the miss's `null`, so a later null test
+// or `is` over the same cell narrows from what this one ruled out (D2586).
+function pushIndexMapComplement(
+  idxIx: i32,
+  variant: string,
+  fnIx: i32,
+): boolean {
+  const ik = indexPathKeyOf(idxIx)
+  if ik == "" { return false }
+  const mrs = mapReadNarrowableSlot(idxIx, fnIx)
+  if mrs < 0 || mvValKind[mrs] != 2 { return false }
+  const slot = narrowSlotOf(ik)
+  if slot >= 0 {
+    const cur = narrowVariants[slot]
+    if !isValueUnionName(cur) { return false }
+    if pushNarrowComplement(ik, narrowSets[slot], variant) != "" { return true }
+    const rest = removeAtomFromSet(cur, variant)
+    if rest == "" || rest == cur { return false }
+    pushNarrow(ik, rest)
+    return true
+  }
+  const e = P.nodes[unwrapParen(idxIx)]
+  if e is Index {
+    const vn = tyToEmitName(tyMapValOf(nodeTyIxOf(unwrapParen(e.idxArr))))
+    if !isValueUnionName(vn) { return false }
+    const vset = unionMemberSetOf(vn)
+    let rest = removeAtomFromSet(vset, variant)
+    if rest == "" || rest == vset { return false }
+    if rest != "null" && removeAtomFromSet(rest, "null") == rest {
+      rest = rest + "|null"
+    }
+    pushNarrow(ik, rest)
+    return true
+  }
+  false
+}
+
 // The `!= null` sense of the same place: the guard proves the key present AND the value
 // non-null, so the cell reads at the map value type's non-null face. `nonNullTy` is the
 // checker's own peel, asked here rather than re-derived — a map whose value is ITSELF
@@ -14915,7 +14968,20 @@ function pushIndexMapNarrow(
 function pushIndexMapNullNarrow(idxIx: i32, fnIx: i32) {
   const ik = indexPathKeyOf(idxIx)
   if ik == "" { return false }
-  if mapReadNarrowableSlot(idxIx, fnIx) < 0 { return false }
+  const mrs = mapReadNarrowableSlot(idxIx, fnIx)
+  if mrs < 0 { return false }
+  // A value-union cell an `is` complement already narrowed keeps what that ruled out.
+  const vslot = narrowSlotOf(ik)
+  if vslot >= 0 && mvValKind[mrs] == 2 {
+    const vcur = narrowVariants[vslot]
+    if vcur != "" && vcur != "null" {
+      const vrest = removeAtomFromSet(vcur, "null")
+      if vrest != "" && vrest != vcur {
+        pushNarrow(ik, vrest)
+        return true
+      }
+    }
+  }
   const e = P.nodes[unwrapParen(idxIx)]
   if e is Index {
     const vt = nonNullTy(tyMapValOf(nodeTyIxOf(unwrapParen(e.idxArr))))
@@ -15168,7 +15234,7 @@ function setNarrowFromCondRaw(condIx0: i32, fnIx: i32) {
               pushNarrow(ik, "null")
               return true
             }
-            const irest = removeAtomFromSet(unionMemberSetOf(ifn), "null")
+            const irest = removeAtomFromSet(indexCellCurSet(ik, ifn), "null")
             if irest != "" {
               pushNarrow(ik, irest)
               return true
@@ -15434,6 +15500,9 @@ function setNarrowFromCondElseRaw(condIx0: i32, fnIx: i32) {
           }
         }
       }
+      if eiun == "" && c.isVariant != "null" {
+        if pushIndexMapComplement(eiix, c.isVariant, fnIx) { return true }
+      }
       if c.isVariant == "null" {
         if pushIndexNicheNarrow(eiix, fnIx) { return true }
         // The map cell in the else of `m["k"] is null` — the third spelling of the same
@@ -15641,7 +15710,7 @@ function setNarrowFromCondElseRaw(condIx0: i32, fnIx: i32) {
               pushNarrow(eik, "null")
               return true
             }
-            const eirest = removeAtomFromSet(unionMemberSetOf(eifn), "null")
+            const eirest = removeAtomFromSet(indexCellCurSet(eik, eifn), "null")
             if eirest != "" {
               pushNarrow(eik, eirest)
               return true

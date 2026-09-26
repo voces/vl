@@ -6209,31 +6209,19 @@ function shapesHitKey(sum: string, key: string): boolean {
 // type its prefix holds, through the narrowings over it), "" for a field step or when unknown.
 function keyStepTags(key: string, steps: string[]): string[] {
   const out: string[] = []
-  let rootLen = 0
-  while rootLen < key.length && key[rootLen] != '.' && key[rootLen] != '[' {
-    rootLen = rootLen + 1
-  }
-  let pre = key.slice(0, rootLen)
-  let t = lookup(pre)
+  const pres = keyStepPrefixTys(key, steps)
   let s = 0
   while s < steps.length {
-    let tag = ""
-    if steps[s][0] == '[' && t >= 0 && !tyHasTyVar(t) { tag = cellTagOfTy(t) }
-    out.push(tag)
-    if t >= 0 {
-      pre = pre + steps[s]
-      const ov = narrowedPathTyRaw(pre)
-      if ov >= 0 {
-        t = ov
-      } else if steps[s][0] == '.' {
-        t = placeFieldTy(t, steps[s].slice(1, steps[s].length), false)
-      } else {
-        t = placeElemTy(t)
-      }
-    }
+    out.push(keyStepTag(steps[s], pres[s]))
     s = s + 1
   }
   out
+}
+
+// The cell tag of a subscript step whose container is typed `t`; "" for a field step or when unknown.
+function keyStepTag(step: string, t: i32): string {
+  if step[0] == '[' && t >= 0 && !tyHasTyVar(t) { return cellTagOfTy(t) }
+  ""
 }
 
 // Whether the place keyed `key` stores exactly the type its live narrowing reads it at.
@@ -6650,12 +6638,272 @@ function writeRetiresNarrowing(
   keyHasPrefix(key, tgtKey + "[")
 }
 
+// Assignments that ended a path narrowing through another place that may name the same object.
+// They settle like a call (`crPathCallRetire`), since the emitter cannot see the alias.
+let crAliasWr: {[i32]: boolean} = Map()
+// Enclosing functions' path slots such a write inside a nested function ends, with the depth of
+// the function holding the write. They hold again when that body closes: its calls run the write.
+let crAliasNestSlots: i32[] = []
+let crAliasNestDepths: i32[] = []
+
+// End every live path narrowing the write at `atIx` may reach through an alias: `q.f = null`
+// after `const q = p` falsifies `p.f`. The write's shape is matched against each step of each
+// key, as a call's write summary is; the target's own key and the paths under it are left to
+// `writeRetiresNarrowing`. A write the narrowed type still admits keeps the narrowing (D2584).
+function retireAliasedNarrowings(
+  tgtIx: i32,
+  tgtKey: string,
+  rt: i32,
+  atIx: i32,
+) {
+  if npKeys.length == 0 { return 0 }
+  const shapes = weSplit(weTargetShape(tgtIx, crNoNames, crNoNames))
+  if shapes.length != 1 || shapes[0][0] == '=' { return 0 }
+  const shape = shapes[0]
+  const recv = aliasWriteRecvIx(tgtIx)
+  let recvTy = -1
+  let recvName = ""
+  if recv >= 0 {
+    recvTy = nodeTyOf(recv)
+    const rn = P.nodes[recv]
+    if rn is Ident { recvName = rn.identName }
+  }
+  let family = ""
+  if tgtKey == "" { family = indexRootKeyOf(tgtIx) }
+  const recvFresh = recvName != "" && crSoleRefBinding(recvName)
+  const n0 = npKeys.length
+  let i = 0
+  while i < n0 {
+    const k = npKeys[i]
+    const own = tgtKey != ""
+      && (k == tgtKey
+      || keyHasPrefix(k, tgtKey + ".")
+      || keyHasPrefix(k, tgtKey + "["))
+    const fam = family != "" && keyHasPrefix(k, family + "[")
+    const kRoot = placeRootOf(k)
+    // A receiver no other place refers to cannot be any object on another key's path; a key
+    // root no other place refers to cannot be the receiver unless the receiver names it.
+    const apart = recvFresh && kRoot != recvName
+    const skip0 = kRoot != recvName && crSoleRefBinding(kRoot)
+    if (
+      npInvBy[i] < 0
+      && !own
+      && !fam
+      && !apart
+      && aliasWriteHitsKey(shape, recvTy, skip0, rt, k, npTys[i])
+    ) {
+      crAliasWr[atIx] = true
+      npInvBy[i] = atIx
+      if i < crFnNpBase() {
+        crAliasNestSlots.push(i)
+        crAliasNestDepths.push(crFnBases.length)
+      } else {
+        crPathCallRetire(i, atIx)
+        narClobKeys.push(k)
+        narClobTys.push(-1)
+        narClobPrev.push(-1)
+        narClobDepths.push(T.scopes.length)
+        narClobRetired.push(2)
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// The object a field write stores into (`q` for `q.f = …`); a cell write's is `idxRecvIx`'s.
+function aliasWriteRecvIx(tgtIx: i32): i32 {
+  const t = P.nodes[peelParenIx(tgtIx)]
+  if t is Member { return peelParenIx(t.memObj) }
+  idxRecvIx(peelParenIx(tgtIx))
+}
+
+// The container a cell write `xs[i] = …` stores into, or -1 for a target that is no cell.
+function idxRecvIx(ix: i32): i32 {
+  const t = P.nodes[ix]
+  if t is Index { return peelParenIx(t.idxArr) }
+  -1
+}
+
+// Whether a write of shape `shape` into an object typed `recvTy`, storing a value typed `rt`,
+// may falsify the narrowing of `key` to `npTy`. A field step matches only a receiver whose type
+// may be the object's, the first step not at all when `skip0`; a store the narrowed type admits
+// into the key's last step keeps it.
+function aliasWriteHitsKey(
+  shape: string,
+  recvTy: i32,
+  skip0: boolean,
+  rt: i32,
+  key: string,
+  npTy: i32,
+): boolean {
+  const steps = keySteps(key)
+  const pres = keyStepPrefixTys(key, steps)
+  let s = 0
+  while s < steps.length {
+    if (
+      shapeHitsStep(shape, steps[s], keyStepTag(steps[s], pres[s]))
+      && (steps[s][0] != '.' || objTysMayAlias(pres[s], recvTy))
+      && !(s == 0 && skip0)
+    ) {
+      if s < steps.length - 1 { return true }
+      if rt < 0 || npTy < 0 || !assignable(rt, npTy) { return true }
+    }
+    s = s + 1
+  }
+  false
+}
+
+// Per step of `key`, the type of the prefix the step reads from, -1 when unresolvable.
+function keyStepPrefixTys(key: string, steps: string[]): i32[] {
+  const out: i32[] = []
+  let rootLen = 0
+  while rootLen < key.length && key[rootLen] != '.' && key[rootLen] != '[' {
+    rootLen = rootLen + 1
+  }
+  let pre = key.slice(0, rootLen)
+  let t = lookup(pre)
+  let s = 0
+  while s < steps.length {
+    out.push(t)
+    if t >= 0 {
+      pre = pre + steps[s]
+      const ov = narrowedPathTyRaw(pre)
+      if ov >= 0 {
+        t = ov
+      } else if steps[s][0] == '.' {
+        t = placeFieldTy(t, steps[s].slice(1, steps[s].length), false)
+      } else {
+        t = placeElemTy(t)
+      }
+    }
+    s = s + 1
+  }
+  out
+}
+
+// Bindings whose object no other place refers to: a `const` bound to a new object whose name is
+// used only as a receiver (`x.f`, `x[i]`) in its root, with the scope depth of its declaration.
+let crSoleNames: string[] = []
+let crSoleDepths: i32[] = []
+// The root `crValUseNames` describes, and the names that root uses other than as a receiver.
+let crValUseRoot = -2
+let crValUseNames: {[string]: boolean} = Map()
+
+// Record the `const` just declared by `n` when its object has no other holder (D2584).
+function crNoteSoleRef(n: LetDecl) {
+  const d = lookupDepth(n.letName)
+  if d < 0 { return 0 }
+  crDropSoleAt(n.letName, d)
+  if n.letKw != "const" || !weInitIsFresh(n.letInit) { return 0 }
+  let root = crCurRoot()
+  if crFnBases.length == 0 { root = crProgRoot }
+  if root < 0 { return 0 }
+  if root != crValUseRoot {
+    crValUseNames = Map()
+    crValUseWalk(root)
+    crValUseRoot = root
+  }
+  if crValUseNames[n.letName] ?? false { return 0 }
+  crSoleNames.push(n.letName)
+  crSoleDepths.push(d)
+  0
+}
+
+// Forget a record of `name` at depth `d`: a later declaration there binds a different object.
+function crDropSoleAt(name: string, d: i32) {
+  let i = crSoleNames.length - 1
+  while i >= 0 && crSoleDepths[i] >= d {
+    if crSoleNames[i] == name && crSoleDepths[i] == d { crSoleNames[i] = "" }
+    i = i - 1
+  }
+  0
+}
+
+// Drop the records of the scope being left, at depth `d` and deeper.
+function crPopSoleTo(d: i32) {
+  while crSoleDepths.length > 0 && crSoleDepths[crSoleDepths.length - 1] >= d {
+    crSoleNames.pop()
+    crSoleDepths.pop()
+  }
+  0
+}
+
+// Whether `name`, resolved at this point, names a binding `crNoteSoleRef` recorded.
+function crSoleRefBinding(name: string): boolean {
+  if name == "" || crSoleNames.length == 0 { return false }
+  const d = lookupDepth(name)
+  if d < 0 { return false }
+  let i = crSoleNames.length - 1
+  while i >= 0 && crSoleDepths[i] >= d {
+    if crSoleNames[i] == name && crSoleDepths[i] == d { return true }
+    i = i - 1
+  }
+  false
+}
+
+// Collect into `crValUseNames` every name the subtree uses other than as the receiver of a field
+// or cell access. A method call, a getter and a dispatched index hand the receiver on, so they count.
+function crValUseWalk(ix: i32) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const n = P.nodes[ix]
+  if n is Ident {
+    crValUseNames[n.identName] = true
+    return 0
+  }
+  if n is Member {
+    if P.nodes[peelParenIx(n.memObj)] is Ident && getSiteFnOf(ix) == "" {
+      return 0
+    }
+  }
+  if n is OptMember {
+    if P.nodes[peelParenIx(n.omObj)] is Ident { return 0 }
+  }
+  if n is Index {
+    if P.nodes[peelParenIx(n.idxArr)] is Ident && opSiteDecls(ix).length == 0 {
+      crValUseWalk(n.idxIndex)
+      return 0
+    }
+  }
+  if n is Call {
+    const cf = P.nodes[peelParenIx(n.callFn)]
+    if cf is Member {
+      const cr = P.nodes[peelParenIx(cf.memObj)]
+      if cr is Ident { crValUseNames[cr.identName] = true }
+    }
+  }
+  let cur = ix
+  while cur >= 0 {
+    const kids = nodeSpineChildren(cur)
+    let i = 0
+    while i < kids.length {
+      crValUseWalk(kids[i])
+      i = i + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  0
+}
+
+// Whether values of types `a` and `b` may be one object; true when either is unknown.
+function objTysMayAlias(a: i32, b: i32): boolean {
+  if a < 0 || b < 0 { return true }
+  const na = nonNullTy(a)
+  const nb = nonNullTy(b)
+  if na < 0 || nb < 0 || na == nb { return true }
+  if tyHasTyVar(na) || tyHasTyVar(nb) || tyIsHole(na) || tyIsHole(nb) {
+    return true
+  }
+  assignable(na, nb) || assignable(nb, na)
+}
+
 // Retire every narrowing the accepted write at `atIx` falsifies, in place — never by pushing a
 // shadowing entry, which would unwind at the end of whatever inner block holds the write and
 // resurrect the narrowing for the statements after it. A property path is marked in `npInvBy`; a
 // bare name's narrowing is a shadowing `declare`, so retiring it writes the declared type back.
 function retireNarrowingsForWrite(tgtIx: i32, rt: i32, atIx: i32) {
   const tgtKey = placeKeyOf(tgtIx)
+  retireAliasedNarrowings(tgtIx, tgtKey, rt, atIx)
   // A variable-index write names no cell and therefore may have hit any of them. `xs[i] = null`
   // keys "" and the loop below would retire nothing at all, which is a soundness hole the moment
   // a narrowing can name a cell. Retire every live narrowing under the receiver; the cell keys
@@ -7301,6 +7549,13 @@ function crReset() {
   crHandleMemo = Map()
   crOpOpaque = Map()
   crOpCall = Map()
+  crAliasWr = Map()
+  crAliasNestSlots = []
+  crAliasNestDepths = []
+  crSoleNames = []
+  crSoleDepths = []
+  crValUseRoot = -2
+  crValUseNames = Map()
   0
 }
 
@@ -7328,6 +7583,17 @@ function crFnLeave() {
     crFnRoots.pop()
     crFnNpBases.pop()
     crFnReBases.pop()
+  }
+  while (
+    crAliasNestDepths.length > 0
+    && crAliasNestDepths[crAliasNestDepths.length - 1] > crFnBases.length
+  ) {
+    const ns = crAliasNestSlots[crAliasNestSlots.length - 1]
+    if ns < npInvBy.length && (crAliasWr[npInvBy[ns]] ?? false) {
+      npInvBy[ns] = -1
+    }
+    crAliasNestSlots.pop()
+    crAliasNestDepths.pop()
   }
   while (
     crCapRecDepths.length > 0
@@ -9127,7 +9393,8 @@ function crMisuseNote(msg: string, at: i32): string {
         + where
         + " may reassign it; re-test '"
         + nm
-        + "' after the call"
+        + "' after "
+        + crAfterWord(crRetCalls[r])
     }
     i = i - 1
   }
@@ -9157,9 +9424,25 @@ function crSpans(outer: i32, inner: i32): boolean {
   t >= a && t <= nodeLastTok(outer)
 }
 
+// How a note names what ended a narrowing, after "re-test it after".
+function crAfterWord(ix: i32): string {
+  if crAliasWr[ix] ?? false { return "the assignment" }
+  "the call"
+}
+
 // How a diagnostic names the call at `ix`, a declared operator being a call too; a callee with
 // no name (`fs[0]()`) is named by its line alone.
 function crCallDesc(ix: i32, withLine: boolean): string {
+  if crAliasWr[ix] ?? false {
+    const an = P.nodes[ix]
+    let d = "the assignment"
+    if an is BinExpr {
+      const ak = placeKeyOf(an.binLeft)
+      if ak != "" { d = "the assignment to '" + ak + "'" }
+    }
+    if withLine { d = d + " on line " + i32ToStr(nodeLineOf(ix)) }
+    return d
+  }
   let d = "the call"
   const nm = calleeNameOf(ix)
   if nm != "?" { d = "the call to '" + nm + "'" }
@@ -9247,8 +9530,10 @@ function calleeNameOf(callIx: i32) {
 // it, so the call cause keeps the refusal and the assignment cause reads at the declared type.
 function pathRetiredByAssign(byIx: i32) {
   if byIx < 0 { return false }
-  // An operator that dispatched to a declaration is a call, whatever node spells it (D2400).
+  // An operator that dispatched to a declaration is a call, whatever node spells it (D2400), and
+  // so is a write through an alias, which the emitter retires as it retires a call's (D2584).
   if crOpCall[byIx] ?? false { return false }
+  if crAliasWr[byIx] ?? false { return false }
   !(P.nodes[byIx] is Call)
 }
 
@@ -9260,7 +9545,9 @@ function pathInvalidatedErr(key: string, byIx: i32, at: i32) {
   const by = P.nodes[byIx]
   let what = "the assignment"
   let after = "the assignment"
-  if by is Call || (crOpCall[byIx] ?? false) {
+  if crAliasWr[byIx] ?? false {
+    what = crCallDesc(byIx, false)
+  } else if by is Call || (crOpCall[byIx] ?? false) {
     what = crCallDesc(byIx, false)
     after = "the call"
   }
@@ -10603,6 +10890,7 @@ function popScope() {
     crWideDepths.pop()
     crWideNames.pop()
   }
+  crPopSoleTo(T.scopes.length - 1)
   if T.scopes.length > 0 {
     for k in T.scopes[T.scopes.length - 1] {
       const ds = scopeDepthsOf[k]
@@ -45489,6 +45777,7 @@ function checkLetDeclNode(n: LetDecl, ix: i32) {
   // is called through the inline arm exactly like `function`, so the lambda never runs.
   checkNotEmitterIntrinsic(n.letName, ix)
   declare(n.letName, bound)
+  crNoteSoleRef(n)
   getLetBank(ix, bound)
   // The module hoist already recorded a global's row at depth 0; a second one would say the
   // same thing at the same depth (D1609).

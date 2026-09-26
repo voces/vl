@@ -7907,6 +7907,24 @@ conservative rule is the sound floor it would refine.
   read the path before it, an inner loop's reads included (D2403). This differs from the bare-name rule, which retires before
   the loop: which call may write a path depends on checked types the loop body does not yet
   have. A re-test inside the loop runs.
+* *A write through another name for the object* ends a path narrowing like a call (D2584,
+  D2585; the owner's extension of (a) to places, 2026-09-26). `q.f = null` after `const q = p`
+  ends `p.f`, as do `ys[0] = …` over an alias of `xs` and `n["k"] = …` over an alias of `m`. The
+  write's shape (`.f`, `[0]`, `["k"]`, `[]`) is matched against every step of every live key,
+  the rule a call's write summary uses, so a nested alias (`const s = p.g`, `s.f = …`) and a
+  second parameter holding the same object count. It stays sound and cheap by three facts,
+  never by flow: a field step matches only when the two receivers' types may be one object; a
+  store the narrowed type admits into the key's last step keeps the narrowing; and a `const`
+  bound to a new object whose name its root uses only as a field or cell receiver is the only
+  holder of that object. That last fact is about the BINDING in scope at the write, not the
+  name — a module `let` of the same name, or a same-named `const` in another block, is another
+  binding — and it makes the sole holder apart from everything: a write through it reaches no
+  other key, and a write through anything else never reaches its first step. Two distinct
+  objects of one type held any other way (two parameters, two call results) are the price:
+  the read after the write re-tests. It settles like a call's retirement — after the
+  statement, refused in a loop that read the path first or a closure made before — and a write
+  inside a nested function ends an enclosing narrowing only for the rest of that body, since the
+  calls that run it are what the call rule already charges.
 * *A nested function made under a narrowing* (D2402) of a binding some function may write keeps
   the narrowing only when it is called by its handle in the body that makes it and neither
   writes nor tests the binding itself; each such call is refused unless the binding still holds
