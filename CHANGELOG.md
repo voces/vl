@@ -874,6 +874,7 @@ new: the compare-frame pre-pass never recurses into a code-15 field, so a NESTED
 
 ## Codegen, memory & runtime (Track B)
 
+- **plumb-shaped units compile with 4.8% less guest work than on master, byte-identical.** The plumb-shape fuel ratchet had drifted to +3.7% (main) and +4.6% (tail) of its +5% bar; every merge since its baseline was measured, the avoidable costs taken back (a retirement-bank probe per statement per walk, two string compares per numeric classification, a per-call type-argument list and two arena passes with nothing to do), and `capNarrowBuild` no longer walks a frame with no nested function where the walk banks nothing for the frame itself (a top-level function under a live module narrowing is still walked, D2555). Against the old baseline: main −1.22%, tail −0.45%; plumb's `chunk_334`/`chunk_525`/`chunk_179` −5.0/−3.1/−5.2% fuel. Drift table: `docs/internals/profiling-the-compiler.md`, "Measured 2026-09-25".
 - **Module-level statements and binding initialisers run in source order whatever a statement
   lowers to (D2431, D2504); a `for k, v in m` value of a union-box map is that union (D2503).**
   A `?.` call, a bare block, or a block whose binding a closure captures, standing between
