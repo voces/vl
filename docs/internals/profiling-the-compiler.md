@@ -325,6 +325,56 @@ interleaved, master host + seed against this branch): `chunk_335` 12.8 → 3.7 s
 leaves are inlined. The pass-list rule and its runtime price: DECISIONS.md, "`-O` skips
 `ssa-nomerge` for a function over 8,192 sets".
 
+## Measured 2026-09-25 — the plumb-shape fuel drift, merge by merge
+
+The baseline was written at `b79b09c95`, #3119's branch head on top of #3116, so #3117 and #3118
+landed underneath it and #3119's own saving was already in it. By `039fd6832`
+the fuel read +3.69% on the main unit and +4.60% on the tail unit, against a +5% bar. A fixpoint
+seed was built for every first-parent merge that touched `compiler/` (docs-only merges cost
+nothing) and fuelled with no `wasm-opt`. The steps of at least 0.1% on either unit:
+
+| merge | main | tail | what it added |
+| --- | ---: | ---: | --- |
+| #3117 | +0.24% | +0.25% | a `Spread` arm in ~20 tree walkers, each asked at every node |
+| #3118 | +0.18% | +0.12% | closures capture by reference |
+| #3119 | −0.15% | −0.19% | D2335/D2336, the saving the baseline already held |
+| #3121 | +0.14% | +0.16% | the atomics intrinsic table |
+| #3123 | +0.23% | +0.23% | `foldMemShared`, an arena pass with nothing to fold (recovered) |
+| #3126 | +0.10% | +0.10% | memarg offsets |
+| #3134 | −0.84% | −0.83% | i32-keyed maps probe a pair index: the compiler's own maps got cheaper |
+| #3135 | +0.33% | +0.23% | a call is not classified by a same-named function off its scope chain |
+| #3136 | +1.35% | +1.10% | the union member-set ladder resolves sibling blocks by position |
+| #3141 | +0.50% | +0.50% | `minMaxKind` asked first by `exprIsI64`/`F32`/`F64`, two string compares per call (recovered) |
+| #3146 | −0.73% | +0.19% | indexed `fnStmtsPosOf` |
+| #3145 | +1.18% | +1.16% | a call ends a narrowing: a bank lookup per statement per walk (recovered) |
+| #3148 | +0.02% | +0.37% | name shadowing at closed and expression blocks |
+| #3147 | +0.11% | +0.11% | named arguments |
+| #3155 | +0.27% | +0.27% | written type arguments: an arena pass and a list per call (recovered) |
+| #3167 | +0.10% | +0.10% | map-valued maps and friends |
+
+The seed cached in `~/.claude/vl-tools/bisect-seeds/` under `30461f099` fuelled 0.8% above a
+fresh fixpoint of that commit; the other six cached seeds matched theirs. Rebuild a seed before
+attributing a step to it.
+
+**Recovered, byte-identical** (self-compile and all 3,721 `tests/cases` programs, wasm and
+diagnostics, against the master seed): an empty retirement bank answers without a map probe;
+`callIsIntrMinMax` tests the name's length before comparing; `annotateTyArgLambdas` and the
+checker's per-call questions skip when no call wrote a type argument; `foldMemShared` returns
+with no `__memory_shared__()` call. Those four took back 1.0 point. The fifth was older than
+the drift: `capNarrowBuild` walked every top-level frame with the narrowing stack live, running
+the condition, post-guard and retirement classifiers at every statement, to bank the narrowing
+at nested functions — and a frame with no nested function banks nothing. `cnWalkFrame` now asks
+`subtreeHasFuncDecl` first, in the two walks that bank nothing for the frame itself: a
+parentless frame that is not a top-level function, and a top-level function recorded under no
+live module narrowing. A top-level function under a live module narrowing is still walked,
+since that walk is its own record (D2555). That took 3.8 points, and 3–5% of the guest fuel on
+plumb's own `chunk_334`, `chunk_525` and `chunk_179` with identical output. Net against the old
+baseline, on #3169's master: main −1.22%, tail −0.45%.
+
+What remains of the drift is capability: #3136 (+1.1–1.35%) is the positional resolution D2326
+needed for correctness, and its ladder (`unionNameOfIdentAt` into `letUnionNameOf`) is ~8% of
+the tail unit's profile, the largest piece left.
+
 ## Guards
 
 Four, and they fire at different moments. Profiling is what you do AFTER one of them does.
