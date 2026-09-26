@@ -113,7 +113,12 @@ import {
   ufcsSiteAdd,
   ufcsSpecAlreadyImported,
 } from "./ast"
-import { MC_RUNG_BUILTIN, MC_RUNG_SELF_FN, memberCallRungAdd } from "./ast"
+import {
+  MC_RUNG_BUILTIN,
+  MC_RUNG_FIELD,
+  MC_RUNG_SELF_FN,
+  memberCallRungAdd,
+} from "./ast"
 // Getter declarations (property-access-design.md §D3a).
 import { getDeclExported, getDeclLabel, getDeclPropOf, mkIdent } from "./ast"
 // The free index-operator declaration-name encoding (B14).
@@ -855,6 +860,14 @@ let ufcsCstrProp: string[] = []
 let ufcsCstrIx: i32[] = []
 let ufcsCstrFn: i32[] = []
 let ufcsCstrP0: i32[] = []
+// The other call sites a row stands for: the dedupe keys on the receiver, not on the call, and
+// the pin's built-in rung checks each call's own arguments (D2517).
+let ufcsCstrMore: i32[][] = []
+// The member calls of those rows the emitter cannot re-dispatch per instance: inside a closure
+// or a nested function, or on a receiver that is not the generic's own parameter (D2520).
+let ufcsUnpinnedSites: i32[] = []
+// The function declaration whose own body is being checked, -1 at module scope; a lambda's.
+let curFnDeclIx = -1
 
 // D1230 — the missing-import answer, banked at the callee member node by the call site that
 // computed it and read back by the member arm that raises the sentence: only the call knows the
@@ -3881,6 +3894,9 @@ export function initChecker() {
   ufcsCstrIx = []
   ufcsCstrFn = []
   ufcsCstrP0 = []
+  ufcsCstrMore = []
+  ufcsUnpinnedSites = []
+  curFnDeclIx = -1
   ufcsMissAt = []
   ufcsMissSpecs = []
   ufcsWhyAt = []
@@ -13603,20 +13619,17 @@ function builtinMethodClaims(recvTy: i32, prop: string): boolean {
   nameInList(builtinMethodNamesOf(recvTy), prop)
 }
 
-// The rung of `recv.name(…)` that claims `name` for every receiver a `self` parameter of
-// `selfTy` admits, so a `self`-function of that name is never called: `SHADOW_METHOD`,
-// `SHADOW_FIELD`, or 0. A type parameter answers 0: some instantiation may lack the member.
-// A map and a `Set` are distinct types, so each answers from its own method table.
-const SHADOW_METHOD = 1
-const SHADOW_FIELD = 2
-function selfFnShadowRung(selfTy: i32, name: string): i32 {
-  if selfTy < 0 { return 0 }
-  const recvTy = strLitRecvTy(selfTy)
-  if recvTy < 0 || recvTy >= T.tys.length { return 0 }
-  const rt = T.tys[recvTy]
-  if rt is TyVar { return 0 }
-  if builtinMethodClaims(recvTy, name) { return SHADOW_METHOD }
-  if tyFieldTyOf(recvTy, name) >= 0 { return SHADOW_FIELD }
+// The member-call order on a receiver of `recvTy`: its built-in method `name`
+// (`MC_RUNG_BUILTIN`), then its field `name` (`MC_RUNG_FIELD`), then 0, the `self`-function.
+// The checker's pin and the emitter's per-instance rewrite read this one answer (D2517). A type
+// parameter answers 0: some instantiation may lack the member. A map and a `Set` differ here.
+export function memberRungOnTy(recvTy: i32, name: string): i32 {
+  if recvTy < 0 { return 0 }
+  const rTy = strLitRecvTy(recvTy)
+  if rTy < 0 || rTy >= T.tys.length { return 0 }
+  if T.tys[rTy] is TyVar { return 0 }
+  if builtinMethodClaims(rTy, name) { return MC_RUNG_BUILTIN }
+  if tyFieldTyOf(rTy, name) >= 0 { return MC_RUNG_FIELD }
   0
 }
 
@@ -13644,10 +13657,10 @@ function selfFnRecvSpelling(selfTy: i32): string {
 // (DECISIONS.md, D2475): the receiver type already defines `name`, and that member is
 // what `recv.name(…)` calls. Coded, with `member`, `recv` and `rung` (`method`/`field`) as data.
 function checkSelfFnReachable(name: string, selfTy: i32, fnIx: i32) {
-  const rung = selfFnShadowRung(selfTy, name)
+  const rung = memberRungOnTy(selfTy, name)
   if rung == 0 { return 0 }
   let what = "method"
-  if rung == SHADOW_FIELD { what = "field" }
+  if rung == MC_RUNG_FIELD { what = "field" }
   const recv = demangleMsg(tyToStr(selfTy))
   tErrCodedData(
     "`"
@@ -26969,7 +26982,12 @@ function noteUfcsCstr(recv: i32, prop: string, ix: i32, p0: i32) {
     let k = 0
     while k < ufcsCstrTy.length {
       if ufcsCstrTy[k] == recv && ufcsCstrProp[k] == prop {
-        if ufcsCstrFn[k] == owner && ufcsCstrP0[k] == p0 { return 0 }
+        if ufcsCstrFn[k] == owner && ufcsCstrP0[k] == p0 {
+          if ix != ufcsCstrIx[k] && !listHasI32(ufcsCstrMore[k], ix) {
+            ufcsCstrMore[k].push(ix)
+          }
+          return 0
+        }
       }
       k = k + 1
     }
@@ -26978,8 +26996,38 @@ function noteUfcsCstr(recv: i32, prop: string, ix: i32, p0: i32) {
     ufcsCstrIx.push(ix)
     ufcsCstrFn.push(owner)
     ufcsCstrP0.push(p0)
+    const noMore: i32[] = []
+    ufcsCstrMore.push(noMore)
   }
   0
+}
+
+// Whether the emitter can re-dispatch member call `ix` per instance of `owner`: the call sits
+// in `owner`'s own body, not a closure's, and its receiver is one of `owner`'s parameters.
+function ufcsSitePinnable(ix: i32, owner: i32): boolean {
+  if owner < 0 || owner != curFnDeclIx || ix < 0 || ix >= P.nodes.length {
+    return false
+  }
+  const c = P.nodes[ix]
+  const fd = P.nodes[owner]
+  if c is Call {
+    if fd is FuncDecl {
+      const rx = peelParenIx(ufcsRecvExpr(c))
+      if rx < 0 { return false }
+      const r = P.nodes[rx]
+      if r is Ident {
+        let i = 0
+        while i < fd.fnParams.length {
+          const pp = P.nodes[fd.fnParams[i]]
+          if pp is Param {
+            if pp.parName == r.identName { return true }
+          }
+          i = i + 1
+        }
+      }
+    }
+  }
+  false
 }
 
 // The bitwise ops and the shifts, in one list read by both `checkBinary`'s reject and
@@ -27824,8 +27872,38 @@ function validateUfcsCstrs(
         }
       }
       if !tyHasHole(ur) {
-        // A same-named field takes precedence over the `self`-fit check below.
-        if tyFieldTyOf(ur, ufcsCstrProp[ci]) < 0 {
+        // The member-call order at the pinned receiver (D2517): a built-in method or a field
+        // takes the call over the `self`-function, and must fit how the body used it.
+        const uRung = memberRungOnTy(ur, ufcsCstrProp[ci])
+        if uRung != 0 {
+          let uWho0 = "the callee's body"
+          if who != "" { uWho0 = "the body of `" + who + "`" }
+          memberPinFitsAt(
+            ufcsCstrIx[ci],
+            ur,
+            ufcsCstrProp[ci],
+            uRung,
+            bNames,
+            bTys,
+            ix,
+            uWho0,
+          )
+          let mi = 0
+          while mi < ufcsCstrMore[ci].length {
+            memberPinFitsAt(
+              ufcsCstrMore[ci][mi],
+              ur,
+              ufcsCstrProp[ci],
+              uRung,
+              bNames,
+              bTys,
+              ix,
+              uWho0,
+            )
+            mi = mi + 1
+          }
+        }
+        if uRung == 0 {
           if !assignable(ur, ufcsCstrP0[ci]) {
             let uMsg = memberFloorMsg(ur, ufcsCstrProp[ci])
             let uSuggest = ""
@@ -27856,6 +27934,192 @@ function validateUfcsCstrs(
     ci = ci + 1
   }
   0
+}
+
+// The built-in method `prop` of a receiver of `recv` called with `argc` arguments: its
+// parameter types into `out`, its result returned. -1 where the arity does not fit, or for a
+// callback method (`map`/`filter`), whose parameter this table cannot state (D2517).
+function builtinSigOf(recv: i32, prop: string, argc: i32, out: i32[]): i32 {
+  const ix = nomErasedTyIx(strLitRecvTy(recv))
+  if ix < 0 || ix >= T.tys.length { return -1 }
+  const t = T.tys[ix]
+  let res = -1
+  let arity = 0
+  match t {
+    TyArray => {
+      if prop == "push" {
+        while out.length < argc { out.push(t.aElem) }
+        if argc > 0 { return TY_I32 }
+        return -1
+      }
+      if prop == "slice" {
+        while out.length < argc { out.push(TY_I32) }
+        if argc == 1 || argc == 2 {
+          return listBuiltResultTy(ix, t.aElem, t.aRead)
+        }
+        return -1
+      }
+      if prop == "pop" { res = mkNullableTy(arrElemValueTy(t.aElem)) }
+      if prop == "get" {
+        arity = 1
+        out.push(TY_I32)
+        res = mkNullableTy(arrElemValueTy(t.aElem))
+      }
+      if prop == "clear" { res = TY_VOID }
+    }
+    TyMap => {
+      if prop == "set" {
+        arity = 2
+        out.push(t.mKey)
+        out.push(t.mVal)
+        res = TY_VOID
+      }
+      if prop == "get" || prop == "add" || prop == "has" || prop == "delete" {
+        arity = 1
+        out.push(t.mKey)
+        res = TY_BOOL
+        if prop == "get" { res = mkNullableTy(t.mVal) }
+        if prop == "add" { res = TY_VOID }
+      }
+      if prop == "keys" { res = mkArrayTy(t.mKey) }
+      if prop == "values" {
+        res = mkArrayTy(t.mVal)
+        if t.mSet == 1 { res = mkArrayTy(t.mKey) }
+      }
+    }
+    TyPrim => {
+      if prop == "slice" {
+        arity = 2
+        out.push(TY_I32)
+        out.push(TY_I32)
+        res = TY_STR
+      }
+      if prop == "indexOf" || prop == "includes" {
+        arity = 1
+        out.push(TY_STR)
+        res = TY_I32
+        if prop == "includes" { res = TY_BOOL }
+      }
+      if prop == "charCodeAt" || prop == "cpAt" || prop == "isCharBoundary" {
+        arity = 1
+        out.push(TY_I32)
+        res = TY_I32
+        if prop == "isCharBoundary" { res = TY_BOOL }
+      }
+      if prop == "cpLen" { res = TY_I32 }
+      if prop == "bytes" { res = mkArrayTy(TY_U8) }
+    }
+    TyErr | TyObj | TyFunc | TyUnion | TyNullable | TyVar | TyLit | TyNeg => {}
+  }
+  if argc != arity { return -1 }
+  res
+}
+
+// At a pin where the receiver's built-in method or field `prop` (`rung`) takes member call
+// `callIx` over the `self`-function the generic body is typed against, the call must fit
+// that member as the body used it: its arguments, and its value unless the body discarded a
+// `void`. The emitter picks per instance only on a parameter of the generic itself (D2520).
+function memberPinFitsAt(
+  callIx: i32,
+  recv: i32,
+  prop: string,
+  rung: i32,
+  bNames: string[],
+  bTys: i32[],
+  at: i32,
+  who: string,
+) {
+  if callIx < 0 || callIx >= P.nodes.length { return 0 }
+  const c = P.nodes[callIx]
+  if c is Call {
+    let what = "built-in method"
+    if rung == MC_RUNG_FIELD { what = "field" }
+    const params: i32[] = []
+    let res = -1
+    if rung == MC_RUNG_BUILTIN {
+      res = builtinSigOf(recv, prop, c.callArgs.length, params)
+    } else {
+      res = fieldSigOf(recv, prop, c.callArgs.length, params)
+    }
+    let why = ""
+    if listHasI32(ufcsUnpinnedSites, callIx) {
+      why = "and this call cannot pick it per instance from inside a closure or through a "
+        + "local — call it on the generic's own parameter"
+    } else if hasNamedArgs(c.callArgNames) {
+      why = "which takes no named arguments"
+    } else if res < 0 {
+      why = "which takes different arguments than this call passes"
+    } else {
+      let i = 0
+      while i < c.callArgs.length && why == "" {
+        const a = substTyDeep(nodeTyIxOf(c.callArgs[i]), bNames, bTys)
+        if a >= 0 && !tyHasHole(a) && !assignable(a, params[i]) {
+          why = "whose argument "
+            + i32ToStr(i + 1)
+            + " is "
+            + tyToStr(params[i])
+            + ", not "
+            + tyToStr(a)
+        }
+        i = i + 1
+      }
+      // A field's value is not held to the body's use: a field call already ran per instance
+      // before the built-in rung existed, and `print(x.tag())` reads either value.
+      const used = substTyDeep(nodeTyIxOf(callIx), bNames, bTys)
+      if (
+        why == ""
+        && rung == MC_RUNG_BUILTIN
+        && used >= 0
+        && used != TY_VOID
+        && !tyHasHole(used)
+      ) {
+        if !tyEq(used, res) {
+          why = "which returns "
+            + tyToStr(res)
+            + ", not the "
+            + tyToStr(used)
+            + " the body uses"
+        }
+      }
+    }
+    if why != "" {
+      tErr(
+        "`."
+          + prop
+          + "` on "
+          + tyToStr(recv)
+          + " is its "
+          + what
+          + ", not the `"
+          + prop
+          + "` in scope, "
+          + why
+          + " ("
+          + who
+          + " at the call's argument types)",
+        at,
+      )
+    }
+  }
+  0
+}
+
+// A callable field `prop` of `recv` called with `argc` arguments: its parameter types into
+// `out`, its return returned; -1 where the field is not a function of that arity.
+function fieldSigOf(recv: i32, prop: string, argc: i32, out: i32[]): i32 {
+  const ft = tyFieldTyOf(recv, prop)
+  if ft < 0 || ft >= T.tys.length { return -1 }
+  const f = T.tys[ft]
+  if f is TyFunc {
+    if f.fnParamTypes.length != argc { return -1 }
+    let i = 0
+    while i < argc {
+      out.push(f.fnParamTypes[i])
+      i = i + 1
+    }
+    return f.fnRet
+  }
+  -1
 }
 
 // The demanded shape an unbounded `<T>` accumulated, as one type: every member the owning
@@ -30793,6 +31057,9 @@ function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
     // The vacuous half of that gate, deferred: `assignable` answers true for a `TyVar` on
     // either side, so this row makes a hole receiver's pass mean something once resolved (see `ufcsCstrTy`'s header).
     noteUfcsCstr(recvTy, plainName, ix, params[0])
+    if tyHasHole(recvTy) && !ufcsSitePinnable(ix, cstrOwnerTop()) {
+      if !listHasI32(ufcsUnpinnedSites, ix) { ufcsUnpinnedSites.push(ix) }
+    }
     // Named arguments bind against the parameter names after `self` (the receiver is an
     // unnamed slot-0 positional), in parameter order — the full list with the receiver unnamed.
     if hasNamedArgs(n.callArgNames) {
@@ -31286,6 +31553,17 @@ function roWriteMsg(what: string, recvTy: i32): string {
     + " if it must be written through."
 }
 
+// Whether a `self`-function named `prop` is in scope at member call `ix`, so a hole receiver
+// stays open and each pin picks the built-in, a field or the function (D2518). A callback method,
+// or a site the emitter cannot re-dispatch per instance (`ufcsSitePinnable`), keeps the demand.
+function holeMethodIsSelfFn(prop: string, ix: i32): boolean {
+  if prop == "map" || prop == "filter" { return false }
+  if !ufcsSitePinnable(ix, cstrOwnerTop()) { return false }
+  const name = ufcsAliasAtSite(ix, prop)
+  if lookup(name) < 0 { return false }
+  declFirstParamIsSelf(name)
+}
+
 // Method call on a member callee (`xs.push(e)`, `m.get(k)`, `s.slice(a)`): types the
 // builtin receiver kinds directly, never as a struct field read. Returns the call type,
 // or `-1` when no builtin arm claims it and the caller falls through to the field/UFCS
@@ -31310,7 +31588,7 @@ function checkMemberCallNode(
   // an array — synthesizing one over a derived element hole and falling into the array-method
   // arm below, which pins the concrete element per call shape. Without this the hole would
   // grow a `{map: any}` struct shape no array argument could satisfy.
-  if rt is TyVar {
+  if rt is TyVar && !holeMethodIsSelfFn(prop, ix) {
     if holeArrMethod(prop) {
       noteArrayDemand(rt.tvName)
       // The synthesized receiver below is a MUTABLE list, and nothing re-checks the
@@ -34994,6 +35272,8 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
   // is actually inside.
   const savedEscName = curFnEscName
   if n.fnName != "" { curFnEscName = n.fnName }
+  const savedFnDeclIx = curFnDeclIx
+  curFnDeclIx = fnIx
   // Why this body's return type is void, for the return that disagrees with it: nobody wrote
   // `: void`, so the mismatch has to name the bare `return` that decided it.
   const savedBareRetVoid = curFnBareRetVoid
@@ -35157,6 +35437,7 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
   T.curRet = savedRet
   inRetArg = savedInRetArg
   curFnEscName = savedEscName
+  curFnDeclIx = savedFnDeclIx
   curFnBareRetVoid = savedBareRetVoid
   daLeaveFrame(daSavedUnassigned)
   let tpPop = 0
@@ -42251,9 +42532,11 @@ function tyReachesMap(ty: i32): boolean {
 // Whether node `ix` has a recorded map type (`{[K]: V}`) — a cheap, no-render variant-tag
 // check, the map dual of `nodeTyIsObj`. Gates the emitter's map classifiers so a map-returning
 // closure value call whose callee they miss still routes through the map lowering.
-export function nodeTyIsMap(ix: i32) {
-  const ty = nodeTyIxOf(ix)
-  if ty < 0 { return false }
+export function nodeTyIsMap(ix: i32) { tyIsMap(nodeTyIxOf(ix)) }
+
+// Whether arena type `ty` is a map or a set (`{[K]: V}`, `Set<K>`).
+export function tyIsMap(ty: i32) {
+  if ty < 0 || ty >= T.tys.length { return false }
   const t = T.tys[ty]
   t is TyMap
 }
