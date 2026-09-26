@@ -2476,7 +2476,7 @@ function monoPinBodyLambdasRaw(
     if n is Call {
       nks.push(monoPinFnValueTy(kv, ks[ki], bN, bT))
     } else if ki == 0 && (n is Member || n is Index) {
-      nks.push(monoPinRecvLit(kv, ks[ki], bN, bT))
+      nks.push(monoPinRecvName(monoPinRecvLit(kv, ks[ki], bN, bT), bN, bT))
     } else {
       nks.push(kv)
     }
@@ -2486,6 +2486,26 @@ function monoPinBodyLambdasRaw(
   const rb = monoExprRebuild(ix, nks, bN, bT)
   if rb != ix { return rb }
   monoPinRetype(ix, bN, bT)
+}
+
+// The type parameter of `typarams` the checked return of generic `origFe` is, bare, or "".
+function monoCheckedRetTyParam(origFe: i32, typarams: string[]): string {
+  if origFe < 0 || origFe >= monoOrigNode.length { return "" }
+  const ft = nodeTyIxOf(monoOrigNode[origFe])
+  if ft < 0 || ft >= T.tys.length { return "" }
+  const f = T.tys[ft]
+  if !(f is TyFunc) { return "" }
+  const r = f.fnRet
+  if r < 0 || r >= T.tys.length { return "" }
+  const rv = T.tys[r]
+  if rv is TyVar {
+    let i = 0
+    while i < typarams.length {
+      if typarams[i] == rv.tvName { return rv.tvName }
+      i = i + 1
+    }
+  }
+  ""
 }
 
 // Whether the per-instance walk is at an operand of a list or object literal.
@@ -2509,7 +2529,7 @@ function monoPinRetype(ix: i32, bN: string[], bT: i32[]): i32 {
 
 // The annotation spelling of the list type `ty` the checker rendered as `render`: a record
 // element, nullable or not, by its row's name (`(P|null)[]`); any other element in the parser's
-// union spelling. The render names a record by its structure, which no row is keyed on.
+// union spelling. A nullable record with no row is left as rendered.
 function monoListSpelling(render: string, ty: i32): string {
   let t = ty
   let suffix = ""
@@ -2530,6 +2550,8 @@ function monoListSpelling(render: string, ty: i32): string {
       if inner >= 0 && inner < T.tys.length && T.tys[inner] is TyObj {
         const rn = monoRetRowName(inner)
         if rn != "" { return "(" + rn + "|null)" + suffix }
+        // A record with no row of its own (a generic application) keeps the render.
+        return render
       }
     }
   }
@@ -2555,6 +2577,19 @@ function monoUnspacedUnions(s: string): string {
     }
   }
   out
+}
+
+// A name read as a receiver of a list whose element can be null (`xs[i]` at `(string | null)[]`),
+// re-typed at the pin: the read recovers a non-null element unless the receiver's recorded type
+// says otherwise. Any other name keeps the template's type, which its binding answers for.
+function monoPinRecvName(cur: i32, bN: string[], bT: i32[]): i32 {
+  if cur < 0 || !(P.nodes[cur] is Ident) { return cur }
+  const ipt = monoPinnedTyOf(cur, bN, bT)
+  if ipt < 0 || ipt >= T.tys.length { return cur }
+  const it = T.tys[ipt]
+  if !(it is TyArray) { return cur }
+  if !tyBearsNull(it.aElem) { return cur }
+  monoPinRetype(cur, bN, bT)
 }
 
 // A list literal read as a receiver (`[r].map(…)`, `[r][0]`) and typed at the type parameter,
@@ -4581,6 +4616,19 @@ function monoMakeInstance(
         let jIx = -1
         if jTy.length > 0 { jIx = jTy[0] }
         nret = synthTypeRefTy(jun, -1, jIx)
+      }
+    }
+    // An inferred return the checker typed as a bare type parameter is the `: T` annotation's
+    // twin: the pin's own spelling, which names a record or map by the argument's row.
+    if nret < 0 && fn.fnRet < 0 {
+      const tpRet = monoCheckedRetTyParam(origFe, fn.fnTyParams)
+      if tpRet != "" {
+        const tpSub = monoSubstAnn(tpRet, fn.fnTyParams, tvN, tvV)
+        if tpSub != "" && tpSub != tpRet {
+          const tpName = monoPinUnionName(tpSub)
+          if monoRegisterPinUnion(tpName) < 0 { return -1 }
+          nret = synthTypeRefTy(tpName, -1, -1)
+        }
       }
     }
     // D2037 — a body that can fall off the end returns `T | null`, a `null` no return
