@@ -5002,6 +5002,12 @@ fn binaryen_missing_note(flag: &str, tool: &str, env_override: &str, consequence
 /// shared memory without it, and it is already here.
 /// wasmtime needs no change: its `threads` feature is on by default and validates atomics
 /// on an ordinary (non-shared) memory.
+///
+/// `--enable-nontrapping-float-to-int` is the saturating-truncation flag (the eight
+/// `__trunc_sat_…__` intrinsics, `0xFC 0..7`). Binaryen 130 rejects `i32.trunc_sat_f32_s`
+/// and its siblings without it ("all used features should be allowed"), the same
+/// no-output-file failure. It is wasm 2.0 core, on by default in wasmtime and V8, and
+/// byte-neutral for a module that uses none (see the PR that added it).
 const BINARYEN_FEATURES: &[&str] = &[
     "--enable-reference-types",
     "--enable-gc",
@@ -5009,6 +5015,7 @@ const BINARYEN_FEATURES: &[&str] = &[
     "--enable-tail-call",
     "--enable-simd",
     "--enable-threads",
+    "--enable-nontrapping-float-to-int",
 ];
 
 /// `vl build -O` — the SHRINK rung. One `-O` pass, open world. It melts a scratch
