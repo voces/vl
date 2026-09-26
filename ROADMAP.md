@@ -190,9 +190,10 @@ Five items, in order. (0) is shipped; the rest are scheduled against it.
   can reach before the declaration traps with "`g` read before its initializer ran (file:line),
   via f". *Goal:* a compile error whenever init-before-read is not statically guaranteed, plus
   compile-time reordering of initializers wherever that preserves behaviour, for globals and
-  locals. The runtime guard's reachability pass (`initGuardScan`) is the analysis the compile
-  error would start from; a write before the initializer (D2654) and an uninitialized module
-  `let` (D2655) are open beside it.
+  locals. The ruling covers writes too (D2654): a write that can run before the initializer
+  traps with "`g` written before its initializer ran", and the direct top-level spelling is a
+  check error. The runtime guard's reachability pass (`initGuardScan`) is the analysis the compile
+  error would start from; an uninitialized module `let` (D2655) is open beside it.
 
 - **Queued (owner, 2026-09-24, plumb):** std wrappers / compiler-level functionality over the raw
   shared-memory and atomics intrinsics (and the raw integer SIMD intrinsics), each through

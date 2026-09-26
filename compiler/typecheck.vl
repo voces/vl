@@ -3094,6 +3094,9 @@ let retTailPos = false
 // already resolves a top-level function. Membership also drives the pass-2 redeclare-error skip,
 // the hoist owning the canonical declaration.
 let moduleGlobals: {[string]: boolean} = Map()
+// Each top-level `let`/`const` by name to its node, or -1 once pass 2 has reached the
+// declaration: a top-level write to one still mapped is a write before its initializer (D2654).
+let moduleBeforeDecl: {[string]: i32} = Map()
 // The integer-literal initializer of each top-level `const`, by name: what a memory
 // intrinsic's offset may name besides a literal (`memOffsetArgCheck`).
 let moduleConstIntInit: {[string]: i32} = Map()
@@ -4219,6 +4222,7 @@ export function initChecker() {
   opBinDispatched = []
   opBinDeclined = []
   moduleGlobals = Map()
+  moduleBeforeDecl = Map()
   moduleConstIntInit = Map()
   topUnannotFns = []
   nestedUnannotFns = []
@@ -38425,6 +38429,7 @@ function checkProgramNode(n: Program) {
         }
         // TDZ: in the dead-zone until pass 2 reaches the initializer.
         daAdd(sm.letName)
+        moduleBeforeDecl[sm.letName] = stmts[mi]
       }
     }
     mi = mi + 1
@@ -45957,6 +45962,15 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
       if isConstName(tgt.identName) {
         tErr("cannot reassign `const` " + tgt.identName, ix)
       }
+      // A top-level write above the declaration would be overwritten by its initializer.
+      if daLive.length > 0 && (moduleBeforeDecl[tgt.identName] ?? -1) >= 0 {
+        if daIsUnassignedSid(sidOf(tgt.identName)) {
+          tErr(
+            "`" + tgt.identName + "` is written before its declaration",
+            n.binLeft,
+          )
+        }
+      }
       // This write makes the binding definitely assigned on the current path.
       daMarkAssigned(tgt.identName)
     }
@@ -47098,6 +47112,9 @@ function checkLetDeclNode(n: LetDecl, ix: i32) {
   // Definite-assignment: an uninitialized `let x` starts unassigned; a later read before a
   // write is an error. An initialized `let`/`const` is assigned from the start and never tracked.
   daMarkAssigned(n.letName)
+  if (moduleBeforeDecl[n.letName] ?? -1) == ix {
+    moduleBeforeDecl[n.letName] = -1
+  }
   // An `extern let` is assigned by whoever provides the import, before any code here runs.
   if n.letInit < 0 && externGlobalLinkOfNode(ix) < 0 { daAdd(n.letName) }
   return TY_VOID

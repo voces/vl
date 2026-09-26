@@ -1,4 +1,5 @@
-// The SENTENCE a module global read before its initializer ran prints before it aborts (D2652).
+// The SENTENCE a module global read or written before its initializer ran prints before it
+// aborts (D2652, D2654).
 //
 // The corpus `@trap` directive sees only the abort, and before the guard a non-null reference
 // global already aborted (an anonymous `null reference`), so its fixture reads the same either
@@ -24,7 +25,7 @@ const runCase = async (
   name: string,
 ): Promise<{ code: number; out: string }> => {
   const { code, stdout } = await new Deno.Command(VL, {
-    args: ["run", `${ROOT}/tests/cases/globals/${name}`, "--compiler", COMPILER],
+    args: ["run", `${ROOT}/tests/cases/${name}`, "--compiler", COMPILER],
     stdout: "piped",
     stderr: "piped",
     cwd: ROOT,
@@ -38,28 +39,42 @@ const runCase = async (
 // the program would have printed from the zero default reaches the output.
 const CASES: [string, string][] = [
   [
-    "read-before-init-scalar-traps.vl",
+    "globals/read-before-init-scalar-traps.vl",
     "`n` read before its initializer ran (line 7), via rn\n",
   ],
   [
-    "read-before-init-string-traps.vl",
+    "globals/read-before-init-string-traps.vl",
     "`ls` read before its initializer ran (line 7), via rs\n",
   ],
   [
-    "read-before-init-nullable-traps.vl",
+    "globals/read-before-init-nullable-traps.vl",
     "`g` read before its initializer ran (line 7), via r\n",
   ],
   [
-    "read-before-init-via-closure-traps.vl",
+    "globals/read-before-init-via-closure-traps.vl",
     "`g` read before its initializer ran (line 7), via a closure\n",
   ],
   [
-    "read-before-init-in-loop-traps.vl",
+    "globals/read-before-init-in-loop-traps.vl",
     "`g` read before its initializer ran (line 8), via r1\n",
   ],
   [
-    "read-before-init-from-initializer-traps.vl",
+    "globals/read-before-init-from-initializer-traps.vl",
     "`g` read before its initializer ran (line 7), via r\n",
+  ],
+  // A write the initializer would overwrite says so too (D2654).
+  [
+    "globals/write-before-init-traps.vl",
+    "`n` written before its initializer ran (line 7), via setN\n",
+  ],
+  [
+    "globals/write-before-init-via-closure-traps.vl",
+    "`s` written before its initializer ran (line 8), via a closure\n",
+  ],
+  // D30's recursion witness: it must still compile, and running it now writes early.
+  [
+    "maps/inferred-map-return-recursion-write-before-init.vl",
+    "`gc` written before its initializer ran (line 15), via fc\n",
   ],
 ];
 
