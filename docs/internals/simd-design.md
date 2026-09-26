@@ -720,7 +720,7 @@ same name shadows the builtin. Graded against an independent model on V8 and was
 **The saturating truncations are dunders, for the opposite reason.** `i32.trunc_sat_f64_s` and
 its seven siblings (`0xFC 0..7`) are `__trunc_sat_<src>_<s|u>_<dst>__`, with `__trunc_sat_f64_s_i32__(x: f64): i32`
 the model: NaN gives 0 and an out-of-range operand clamps to the result's bound. That is a
-silently lossy conversion, which `x as i32` deliberately is not (it traps), so it is raw opt-in
+silently lossy conversion, which `x as! i32` deliberately is not (it traps), so it is raw opt-in
 machinery for a program that must match a host's clamp (plumb's `cvttss2si`), not a bare
 builtin. Unlike the vector `__trunc_sat_f32x4_s__`, the name keeps the result shape, since an f32
 source can land in either width. binaryen needs `--enable-nontrapping-float-to-int` for these,

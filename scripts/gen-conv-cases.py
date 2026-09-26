@@ -88,8 +88,8 @@ CANON32, CANON64 = 0x7FC00000, 0x7FF8000000000000
 
 def promote(b):
     x = f32_of(b)
-    # Only the canonical NaN is fed in: the spec fixes a canonical NaN's result, and leaves a
-    # payload-carrying NaN's to the engine.
+    # Only the canonical NaN is fed in: the spec makes its result a canonical NaN of either
+    # sign, and leaves a payload-carrying NaN's to the engine. The sign kept is x86's.
     return CANON64 if math.isnan(x) else bits64(x)
 
 
@@ -272,7 +272,8 @@ def gen_convert():
     c = Case(SIMD_OUT, "float-convert.vl", [
         "promote_low_f32x4 (lanes 0 and 1 to f64), demote_f64x2_zero (to f32 lanes 0 and 1,",
         "rounding to nearest-even, with lanes 2 and 3 zero) and convert_low_i32x4_s/u (exact).",
-        "A NaN input is the canonical one, whose result the spec fixes. Printed as bit patterns.",
+        "A NaN input is the canonical one: the spec fixes a canonical result but not its sign, so",
+        "the exact bits rely on the engines keeping the sign, as x86 does. Printed as bit patterns.",
     ], PRELUDE)
     for ls in PROMOTE_INPUTS:
         c.body.append(f"  show2(__promote_low_f32x4__({c.vec(ls)}))")
@@ -293,7 +294,7 @@ def gen_trunc_sat():
     c = Case(NUM_OUT, "trunc-sat.vl", [
         "The eight scalar saturating truncations over ±0, fractions, subnormals, the bounds of",
         "each result on both sides, ±inf and signed NaNs: NaN gives 0 and an out-of-range",
-        "operand clamps to the result's minimum or maximum, where `as` would trap.",
+        "operand clamps to the result's minimum or maximum, where `as!` would trap.",
     ], [])
     for src, edges, mk in (("f32", F32_EDGES, "f32fromBits"), ("f64", F64_EDGES, "f64fromBits")):
         lit = lit32 if src == "f32" else lit64
