@@ -180,6 +180,7 @@ import {
   pinnedHoleTyOf,
   primNameOf,
   primNameStr,
+  recordClonedCallRetire,
   recordClonedNodeTyFb,
   recordClonedNodeTyKnown,
   recordNodePin,
@@ -420,6 +421,7 @@ import {
   capMemoArmed,
   capNamesFlat,
   capStartTbl,
+  cboxCellNames,
   cloSigBase,
   cloSigKeys,
   cloSigTagNames,
@@ -480,6 +482,7 @@ import {
   gaeParams,
   genTyParamNames,
   globalIndexBySid,
+  globalStmtOrd,
   globalStmts,
   ia64Used,
   lUsed,
@@ -513,6 +516,8 @@ import {
   modNumCastSeen,
   modUnionAsHit,
   modUnionAsSeen,
+  monoInstFe,
+  monoInstOrig,
   monoOrigNode,
   msGen,
   msRowChain,
@@ -580,7 +585,10 @@ import {
   scopeStackPop,
   scopeStackPush,
   slUsed,
+  startStmtOrd,
   startStmts,
+  topFnNodes,
+  topFnOrd,
   uDeclared,
   uFieldCount,
   uFieldElemKeyKind,
@@ -3692,9 +3700,12 @@ export function asgReadUnwidenOp(asgIx: i32, fnIx: i32): i32 {
   const st = asgStoreTyOf(asgIx)
   if vt < 0 || st < 0 { return -1 }
   if asgIsCellTail(asgIx, fnIx) { return -1 }
-  // A ref written into its own nullable niche: the cell is `(ref null T)`, the value `(ref T)`.
   const stT = T.tys[st]
   if stT is TyNullable {
+    // A scalar widened into a nullable box is re-read under its inner member's narrowing.
+    const inner = asgReadNullInnerTy(asgIx, fnIx)
+    if inner >= 0 { return asgUnwidenPrim(vt, inner) }
+    // A ref written into its own nullable niche: the cell is `(ref null T)`, the value `(ref T)`.
     if stT.nInner < 0 || !tySame(stT.nInner, vt) { return -1 }
     const vT = T.tys[vt]
     if vT is TyObj || vT is TyArray || vT is TyMap || vT is TyFunc {
@@ -3702,6 +3713,37 @@ export function asgReadUnwidenOp(asgIx: i32, fnIx: i32): i32 {
     }
     return -1
   }
+  asgUnwidenPrim(vt, st)
+}
+
+// The member a nullable scalar cell of assignment `asgIx` is re-read at so that an unwidening
+// opcode can take it back to the right side's primitive rep, or -1. The checker admits only
+// widenings it can invert exactly, so the round trip is the right side's value.
+export function asgReadNullInnerTy(asgIx: i32, fnIx: i32): i32 {
+  if asgIx < 0 || asgIx >= P.nodes.length { return -1 }
+  const vt = nodeTyIxOf(asgIx)
+  const st = asgStoreTyOf(asgIx)
+  if vt < 0 || st < 0 { return -1 }
+  const stT = T.tys[st]
+  if !(stT is TyNullable) { return -1 }
+  const inner = stT.nInner
+  if inner < 0 || tySame(inner, vt) { return -1 }
+  if tyPrimNameOf(inner) == null { return -1 }
+  if asgUnwidenPrim(vt, inner) < 0 { return -1 }
+  if asgIsCellTail(asgIx, fnIx) { return -1 }
+  const a = P.nodes[asgIx]
+  if !(a is BinExpr) { return -1 }
+  const t = unwrapParen(a.binLeft)
+  if t < 0 { return -1 }
+  if !(P.nodes[t] is Ident) { return -1 }
+  const un = unionNameOfIdentAt(sidOfNode(t), fnIx, t)
+  if un == "" { return -1 }
+  if msSoleMemberTy(asgReadNarrowSet(un, inner)) < 0 { return -1 }
+  inner
+}
+
+// The opcode taking primitive `vt`, widened into a primitive `st` cell, back to `vt`, or -1.
+function asgUnwidenPrim(vt: i32, st: i32): i32 {
   const vn = tyPrimNameOf(vt)
   const sn = tyPrimNameOf(st)
   if vn == null || sn == null { return -1 }
@@ -3731,7 +3773,10 @@ function unwidenI32From(sn: PrimName): i32 {
     "i64" => {
       return 167 // 0xa7 i32.wrap_i64
     }
-    "i32" | "f32" | "boolean" | "string" | "void" | "null" | "never" | "u8" | "v128" => {
+    "f32" => {
+      return 168 // 0xa8 i32.trunc_f32_s
+    }
+    "i32" | "boolean" | "string" | "void" | "null" | "never" | "u8" | "v128" => {
       return -1
     }
   }
@@ -3744,11 +3789,13 @@ function asgReadNarrows(asgIx: i32, fnIx: i32): boolean {
   !asgIsCellTail(asgIx, fnIx)
 }
 
-// Push the narrowing `asgReadNarrowTy` names for the re-read of assignment `asgIx`'s target.
+// Push the narrowing `asgReadNarrowTy` or `asgReadNullInnerTy` names for the re-read of
+// assignment `asgIx`'s target.
 // Returns the depth to restore to, or -1 when it pushes nothing.
 export function pushAsgReadNarrow(asgIx: i32, fnIx: i32): i32 {
-  if !asgReadNarrows(asgIx, fnIx) { return -1 }
-  const ty = asgReadNarrowTy(asgIx, fnIx)
+  let ty = asgReadNullInnerTy(asgIx, fnIx)
+  if asgReadNarrows(asgIx, fnIx) { ty = asgReadNarrowTy(asgIx, fnIx) }
+  if ty < 0 { return -1 }
   if asgIx < 0 { return -1 }
   const a = P.nodes[asgIx]
   if a is BinExpr {
@@ -5509,28 +5556,137 @@ export function capNarrowBuild() {
   cnGlobOn = false
   const savedTop = narrowTop
   cnRecording = true
+  cnTopFe = Map()
+  cnTopFes = []
+  cnTopNext = []
+  let tk = 0
+  while tk < topFnNodes.length {
+    cnTopFe[topFnNodes[tk]] = -1
+    tk = tk + 1
+  }
+  // An appended generic instance's origin slot, so each instance is recorded where its
+  // template is written.
+  const instOrig: {[i32]: i32} = Map()
+  let q = 0
+  while q < monoInstFe.length && q < monoInstOrig.length {
+    instOrig[monoInstFe[q]] = monoInstOrig[q]
+    q = q + 1
+  }
   let fe = 0
   while fe < fnStmts.length {
-    if fe >= fnParent.length || fnParent[fe] < 0 { capComputeNamesOf(fe) }
+    if fe >= fnParent.length || fnParent[fe] < 0 {
+      const origin = cnFrameOrigin(fe, instOrig)
+      if cnTopFe.has(origin) {
+        cnTopNext.push(cnTopFe[origin] ?? -1)
+        cnTopFe[origin] = cnTopFes.length
+        cnTopFes.push(fe)
+      } else {
+        capComputeNamesOf(fe)
+      }
+    }
     fe = fe + 1
   }
   // Module-level statements are the start function's body. A closure written there has no
-  // enclosing frame to capture from, but a top-level `if` still narrows a module global,
-  // and the frames declared under it are frames like any other.
+  // enclosing frame to capture from, but a top-level statement still narrows a module global,
+  // and the frames declared under it, a top-level function included, are frames like any
+  // other: each is recorded at its own position among the statements (D2555).
   cnScanFnIx = -1
   const sbound: {[string]: i32} = Map()
   const scaps: string[] = []
   const smark = capTrailName.length
+  tk = 0
   let si = 0
-  while si < startStmts.length {
-    capScan(startStmts[si], sbound, scaps)
-    si = si + 1
+  let gi = 0
+  while si < startStmts.length || gi < globalStmts.length {
+    let sOrd = 2147483647
+    if si < startStmts.length && si < startStmtOrd.length {
+      sOrd = startStmtOrd[si]
+    }
+    let gOrd = 2147483647
+    if gi < globalStmts.length && gi < globalStmtOrd.length {
+      gOrd = globalStmtOrd[gi]
+    }
+    if gOrd < sOrd {
+      // A global's initializer runs in the same order; its closures are frames written here.
+      tk = cnRecordTopFns(tk, gOrd, savedTop)
+      // With no module narrowing live there is nothing a closure in it could record.
+      const gd = P.nodes[globalStmts[gi]]
+      if gd is LetDecl && narrowTop > savedTop {
+        capScan(gd.letInit, sbound, scaps)
+      }
+      gi = gi + 1
+    } else if si < startStmts.length {
+      tk = cnRecordTopFns(tk, sOrd, savedTop)
+      preStmtNarrow(startStmts[si])
+      capScan(startStmts[si], sbound, scaps)
+      cnPostGuard(startStmts[si])
+      si = si + 1
+    } else {
+      gi = gi + 1
+    }
   }
+  cnRecordTopFns(tk, 2147483647, savedTop)
   capTrim(sbound, smark)
   cnRecording = false
   cnScanFnIx = -1
   restoreNarrow(savedTop)
   0
+}
+
+// Each top-level function's `fnStmts` positions, its own and its instances': the head of a
+// list through `cnTopFes`/`cnTopNext`, or -1.
+let cnTopFe: {[i32]: i32} = Map()
+let cnTopFes: i32[] = []
+let cnTopNext: i32[] = []
+
+// Record every top-level function from the `k`th on whose position precedes `ord`, under the
+// narrowing the module statements before it leave above depth `base`; returns the next one.
+function cnRecordTopFns(k: i32, ord: i32, base: i32): i32 {
+  let i = k
+  while i < topFnNodes.length && i < topFnOrd.length && topFnOrd[i] < ord {
+    let j = cnTopFe[topFnNodes[i]] ?? -1
+    while j >= 0 && j < cnTopFes.length {
+      cnRecordTopFrame(cnTopFes[j], narrowTop > base, topFnNodes[i])
+      j = cnTopNext[j]
+    }
+    i = i + 1
+  }
+  i
+}
+
+// Record top-level frame `fe`, written as `origin`, under the live module narrowing when
+// `narrowed`, else only the frames it declares. An instance answers what its template's check
+// widened, which is the body the checker saw at this position.
+function cnRecordTopFrame(fe: i32, narrowed: boolean, origin: i32) {
+  if fe < 0 || fe >= fnStmts.length { return 0 }
+  if fnStmts[fe] != origin && capWidenOf(fnStmts[fe]) == "" {
+    recordClonedCallRetire(origin, fnStmts[fe])
+  }
+  if !narrowed {
+    capComputeNamesOf(fe)
+    cnScanFnIx = -1
+    return 0
+  }
+  const savedGlob = cnGlobReads
+  const savedGlobOn = cnGlobOn
+  cnGlobReads = Map()
+  cnGlobOn = true
+  capComputeNamesOf(fe)
+  const noFree: string[] = []
+  capNarrowRecord(fnStmts[fe], noFree, cnGlobReads)
+  cnGlobReads = savedGlob
+  cnGlobOn = savedGlobOn
+  cnScanFnIx = -1
+  0
+}
+
+// The source node of top-level frame `fe`: the pre-pass original of a slot an instance
+// overwrote, an appended instance's origin's, or the slot's own.
+function cnFrameOrigin(fe: i32, instOrig: {[i32]: i32}): i32 {
+  if fe < monoOrigNode.length { return monoOrigNode[fe] }
+  const of = instOrig[fe] ?? -1
+  if of >= 0 && of < monoOrigNode.length { return monoOrigNode[of] }
+  fnStmts[fe]
 }
 
 // Replay frame `fe`'s declaration-site narrowing onto the narrowing stack, so a walk over
@@ -16392,7 +16548,16 @@ export function assignTargetReReads(asgIx: i32, fnIx: i32): boolean {
   if exprMap(recv, fnIx) { return false }
   const tt = nodeTyIxOf(a.binLeft)
   if tt < 0 { return tgt is Index && P.nodes[tgt.idxArr] is Ident }
-  tySame(tt, nodeTyIxOf(asgIx))
+  if tySame(tt, nodeTyIxOf(asgIx)) { return true }
+  // A binding a closure shares is its cell's slot, and its re-read is taken back to the right
+  // side's rep exactly as the binding's own would be (D2557).
+  const rn = P.nodes[recv]
+  if tgt is Index && rn is Ident {
+    if (cboxCellNames[rn.identName] ?? 0) == 1 {
+      return asgReadUnwidenOp(asgIx, fnIx) >= 0
+    }
+  }
+  false
 }
 
 // Whether the assignment at `asgIx` writes a field or an element, the targets `spillTail`
@@ -28929,6 +29094,8 @@ export function exprUnion(exprIx: i32, fnIx: i32) {
   // destination the binding took a scalar cell and the box went into it — invalid wasm. The
   // arms share the checker's join type, so the then arm classifies the whole if-expression.
   if e is IfStmt {
+    // …unless the join is a numeric literal union, whose rep is the `i32` and never the box (D2531).
+    if nodeTyIsNumLitUnion(exprIx) { return false }
     // …unless the JOIN is a union neither arm is: `if c { "green" } else { 7 }` joins to
     // `string | i32` and neither arm is a union, so the then arm answers false for a node
     // whose own type is a box. Asked of the node's recorded type, which is the join (D1733).
@@ -28961,6 +29128,28 @@ export function exprUnion(exprIx: i32, fnIx: i32) {
     // union value here either, asked with the same predicate that site uses, so the consumer
     // boxes exactly what the read delivered.
     if memReadUnboxAtomKind(exprIx, fnIx) >= 0 { return false }
+    return true
+  }
+  false
+}
+
+// Whether node `ix` has a union type whose members are all integer literals (`1 | 2`).
+function nodeTyIsNumLitUnion(ix: i32): boolean {
+  const ty = nodeTyIxOf(ix)
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if t is TyUnion {
+    if t.uMembers.length < 2 { return false }
+    let i = 0
+    while i < t.uMembers.length {
+      const m = T.tys[t.uMembers[i]]
+      if m is TyLit {
+        if m.litKind != "int" { return false }
+      } else {
+        return false
+      }
+      i = i + 1
+    }
     return true
   }
   false

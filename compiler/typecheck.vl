@@ -6987,9 +6987,28 @@ function crNoteLostRead(key: string, ix: i32) {
   crLostIxs.push(ix)
   crLostFns.push(crFnIxs[crFnIxs.length - 1])
   crLostDepths.push(crFnBases.length)
+  crLostBare.push(false)
   0
 }
 
+// A read of a bare name whose captured narrowing `crCaptureLosesNarrowing` dropped (D2529).
+function crNoteLostName(name: string, ix: i32) {
+  if !crCapLossAny || crFnIxs.length == 0 { return 0 }
+  const fnIx = crFnIxs[crFnIxs.length - 1]
+  const lost = crCapLossBank[fnIx] ?? ""
+  if lost == "" || lost.indexOf("," + name + ",") < 0 { return 0 }
+  crLostKeys.push(name)
+  crLostIxs.push(ix)
+  crLostFns.push(fnIx)
+  crLostDepths.push(crFnBases.length)
+  crLostBare.push(true)
+  0
+}
+
+// The names a function body reads at the declared type because `crCaptureLosesNarrowing` said so.
+let crCapLossBank: {[i32]: string} = Map()
+let crCapLossAny = false
+let crLostBare: boolean[] = []
 let crLostKeys: string[] = []
 let crLostIxs: i32[] = []
 let crLostFns: i32[] = []
@@ -7004,6 +7023,17 @@ function crLostNote(msg: string, at: i32): string {
       crSpans(at, crLostIxs[i])
       && msg.indexOf("'" + k + "' is not narrowed") < 0
     ) {
+      if crLostBare[i] {
+        return " — '"
+          + k
+          + "' is not narrowed inside the function on line "
+          + i32ToStr(nodeLineOf(crLostFns[i]))
+          + ": it may run before '"
+          + k
+          + "' is narrowed, or after a write that may store null; re-test '"
+          + k
+          + "' inside it"
+      }
       return " — '"
         + k
         + "' is not narrowed inside the function on line "
@@ -7237,6 +7267,11 @@ function crReset() {
   crLostIxs = []
   crLostFns = []
   crLostDepths = []
+  crLostBare = []
+  crCapLossBank = Map()
+  crCapLossAny = false
+  crWideNames = []
+  crWideDepths = []
   crCapRecCount = Map()
   crCapRecDepths = []
   crCapRecHandles = []
@@ -7247,6 +7282,14 @@ function crReset() {
   crwRoot = -2
   crInfoMemo = Map()
   crAsgMemo = Map()
+  crByRefMemo = Map()
+  crByRefAnyMemo = Map()
+  crDeclMemo = Map()
+  crReadMemo = Map()
+  crReadLists = Map()
+  crMemoDone = Map()
+  crNulledNames = Map()
+  crNulledBuilt = false
   crHandleMemo = Map()
   crOpOpaque = Map()
   crOpCall = Map()
@@ -7298,6 +7341,7 @@ function crFnLeave() {
     crLostIxs.pop()
     crLostFns.pop()
     crLostDepths.pop()
+    crLostBare.pop()
   }
   0
 }
@@ -7577,9 +7621,13 @@ function crNameIsGlobal(name: string): boolean {
   if crFnBases.length == 0 || crCurRoot() == crProgRoot { return false }
   const ds = scopeDepthsOf[name]
   if ds == null { return false }
+  // A narrowing layer, or the declared-type layer `crDeclareWidened` binds, is not a binding.
   let j = ds.length - 1
   while j >= 0 {
-    if crFirstBank(name, ds[j]) < 0 { return ds[j] < crFnBases[0] }
+    if ds[j] < crFnBases[0] { return true }
+    if crFirstBank(name, ds[j]) < 0 && !crWidenedAt(name, ds[j]) {
+      return false
+    }
     j = j - 1
   }
   false
@@ -7868,12 +7916,87 @@ function crRetire(name: string, callIx: i32, atLoop: boolean, stmtIx: i32) {
   0
 }
 
+// A top-level function may be called anywhere, after any write, so its body reads a module
+// binding that some code assigns at the declared type, whatever narrowing surrounds it (D2529).
+// Bind `name` at its declared type `wide` in the body scope. The binding stands in for the
+// captured one, so a declaration of the same name in the body shadows it rather than clashing.
+function crDeclareWidened(name: string, wide: i32) {
+  declare(name, wide)
+  crWideNames.push(name)
+  crWideDepths.push(T.scopes.length - 1)
+  0
+}
+
+// Whether `name` is bound in the innermost scope only by `crDeclareWidened`.
+function crWidenedInTop(name: string): boolean {
+  crWidenedAt(name, T.scopes.length - 1)
+}
+
+// A declaration of `name` in the innermost scope replaces its `crDeclareWidened` binding.
+function crUnwidenTop(name: string) {
+  const d = T.scopes.length - 1
+  let i = crWideNames.length - 1
+  while i >= 0 && crWideDepths[i] >= d {
+    if crWideDepths[i] == d && crWideNames[i] == name { crWideNames[i] = "" }
+    i = i - 1
+  }
+  0
+}
+
+function crWidenedAt(name: string, d: i32): boolean {
+  let i = crWideNames.length - 1
+  while i >= 0 && crWideDepths[i] >= d {
+    if crWideDepths[i] == d && crWideNames[i] == name { return true }
+    i = i - 1
+  }
+  false
+}
+
+let crWideNames: string[] = []
+let crWideDepths: i32[] = []
+
+function crRootCaptureWiden(fnIx: i32) {
+  if !inferQuiet { crCapWidenBank[fnIx] = "," }
+  const base = crFnBase()
+  // Rows sit in scope order, so the first is the outermost: none below `base` means no capture.
+  if asgDeclKeys.length == 0 || asgDeclDepths[0] >= base { return 0 }
+  const reads = crBodyReadNames(fnIx)
+  let r = 0
+  while r < reads.length {
+    const nm = reads[r]
+    const i = crInnerRowBelow(nm, base)
+    if i >= 0 && crNameIsModuleTop(nm) {
+      const wide = crOuterWidest(nm, base)
+      if (
+        wide >= 0
+        && wide != lookup(nm)
+        && crRootLoses(fnIx, nm, asgDeclKinds[i])
+      ) {
+        crDeclareWidened(nm, wide)
+        crCapWidenBank[fnIx] = crwAddName(crCapWidenBank[fnIx] ?? ",", nm)
+        crCapLossBank[fnIx] = crwAddName(crCapLossBank[fnIx] ?? ",", nm)
+        crCapLossAny = true
+      }
+    }
+    r = r + 1
+  }
+  0
+}
+
+// Whether top-level function `fnIx` loses the narrowing of module binding `name`, whose innermost
+// layer has bank kind `kind`. An assignment's narrowing, which only removed `null`, is kept when
+// no write can store `null` and nothing can call the function ahead of the narrowing write.
+function crRootLoses(fnIx: i32, name: string, kind: i32): boolean {
+  if kind != NAR_KIND_ASG { return crNameAssignedInProgram(name) }
+  crNameNulledInProgram(name) || !crRootMayKeep(fnIx, name)
+}
+
 // A nested function runs when called, so a captured narrowing of a binding some function may
 // write reads at its declared type in the body, bound in the body's own scope. A lambda passed
 // straight to an array's `map` or `filter` runs inside that call and keeps the narrowing, unless
 // its own body may write the binding (D2402).
 function crCaptureWiden(fnIx: i32) {
-  if crCurRoot() == fnIx { return 0 }
+  if crCurRoot() == fnIx { return crRootCaptureWiden(fnIx) }
   // A body is checked more than once. The real pass decides alone, so it starts the bank over;
   // a quiet pass (return inference, a monomorphization re-check of a clone, whose root the
   // writer analysis cannot see) only adds, and widens what the bank already names.
@@ -7894,19 +8017,25 @@ function crCaptureWiden(fnIx: i32) {
     }
     f = f + 1
   }
-  if asgDeclKeys.length == 0 { return 0 }
   const base = crFnBase()
-  const seen: string[] = []
+  if asgDeclKeys.length == 0 || asgDeclDepths[0] >= base { return 0 }
   let escapes = -1
-  let i = asgDeclKeys.length - 1
-  while i >= 0 {
-    const nm = asgDeclKeys[i]
-    if asgDeclDepths[i] < base && !nameInList(seen, nm) {
-      seen.push(nm)
+  // Only a name the body reads needs an answer.
+  const reads = crBodyReadNames(fnIx)
+  let r = 0
+  while r < reads.length {
+    const nm = reads[r]
+    const i = crInnerRowBelow(nm, base)
+    if i >= 0 {
       const wide = crOuterWidest(nm, base)
       if wide >= 0 && wide != lookup(nm) {
         if inferQuiet && prior.indexOf("," + nm + ",") >= 0 {
-          declare(nm, wide)
+          crDeclareWidened(nm, wide)
+        } else if crCaptureLosesNarrowing(fnIx, nm, asgDeclKinds[i], wide) {
+          crDeclareWidened(nm, wide)
+          crCapWidenBank[fnIx] = crwAddName(crCapWidenBank[fnIx] ?? ",", nm)
+          crCapLossBank[fnIx] = crwAddName(crCapLossBank[fnIx] ?? ",", nm)
+          crCapLossAny = true
         } else if crCaptureMayGoStale(fnIx, nm) {
           if escapes < 0 { escapes = crLambdaEscapes(fnIx) }
           const fnWriter = crMayBeWritten(nm)
@@ -7925,13 +8054,13 @@ function crCaptureWiden(fnIx: i32) {
             crCapRecTys.push(lookup(nm))
             crCapRecFns.push(fnIx)
           } else {
-            declare(nm, wide)
+            crDeclareWidened(nm, wide)
             crCapWidenBank[fnIx] = crwAddName(crCapWidenBank[fnIx] ?? ",", nm)
           }
         }
       }
     }
-    i = i - 1
+    r = r + 1
   }
   0
 }
@@ -7976,6 +8105,503 @@ function crNameAssignedInRoot(name: string): boolean {
 // `crNameAssignedInRoot` per `"<root>#<name>"`: asked once per capture, it would otherwise
 // rebuild the writer analysis each time the question moves between a function and the module.
 let crAsgMemo: {[string]: boolean} = Map()
+
+// Whether a captured narrowing of `name` cannot outlive the capture: the nested function `fnIx`
+// may run after a write that may store `null`, and its body then reads the storage at the
+// declared type (D2529). A guard's narrowing refuses such a write under it, and a callback run
+// inside the call it is handed to runs before any later write, so both are left to D2402.
+function crCaptureLosesNarrowing(
+  fnIx: i32,
+  name: string,
+  kind: i32,
+  wide: i32,
+): boolean {
+  if kind == NAR_KIND_GUARD { return false }
+  if crCallbackKeeps(fnIx, name) { return false }
+  if crNameIsModuleTop(name) { return crNameNulledInProgram(name) }
+  // A shared cell of a scalar box is read at the box, so any later write ends it there (D2555).
+  crCaptureByRef(crDeclFrameOf(name), name, crTyIsScalarBox(wide))
+}
+
+// Whether `ty` is `T | null` over a primitive other than `string`: a cell holding the value box.
+function crTyIsScalarBox(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  const t = T.tys[ty]
+  if !(t is TyNullable) { return false }
+  const pn = tyPrimNameOf(nonNullTy(ty))
+  pn != null && pn != "string"
+}
+
+// Whether `name`'s innermost declaration is at module scope, looking through narrowing layers.
+function crNameIsModuleTop(name: string): boolean {
+  const ds = scopeDepthsOf[name]
+  if ds == null { return false }
+  let j = ds.length - 1
+  while j >= 0 {
+    if ds[j] == 0 { return true }
+    if crFirstBank(name, ds[j]) < 0 { return false }
+    j = j - 1
+  }
+  false
+}
+
+function crNameAssignedInProgram(name: string): boolean {
+  crFnRoots.push(crProgRoot)
+  const r = crNameAssignedInRoot(name)
+  crFnRoots.pop()
+  r
+}
+
+// Whether an assignment anywhere in the program may store `null` into a binding named `name`:
+// one whose right side is not a non-null literal. One walk of the program answers every name.
+function crNameNulledInProgram(name: string): boolean {
+  if !crNulledBuilt {
+    crNulledBuilt = true
+    crNulledWalk(crProgRoot)
+  }
+  crNulledNames[name] ?? false
+}
+
+function crNulledWalk(ix: i32) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const tgt = crAssignTarget(ix)
+  if tgt != "" {
+    const n = P.nodes[ix]
+    if n is BinExpr {
+      if !crRhsNonNull(n.binRight) { crNulledNames[tgt] = true }
+    }
+  }
+  let cur = ix
+  while cur >= 0 {
+    const kids = nodeSpineChildren(cur)
+    let k = 0
+    while k < kids.length {
+      crNulledWalk(kids[k])
+      k = k + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  0
+}
+
+// The bare name `ix` assigns (`x = e`), or "".
+function crAssignTarget(ix: i32): string {
+  const n = P.nodes[ix]
+  if n is BinExpr {
+    if n.binOp == "=" {
+      const l = P.nodes[crUnParen(n.binLeft)]
+      if l is Ident { return l.identName }
+    }
+  }
+  ""
+}
+
+// Whether expression `ix` is a literal that cannot be `null`, or a `??` defaulting to one, so
+// writing it keeps a narrowing that only removed `null`. Anything else may be `null` as far as
+// this syntactic test knows.
+function crRhsNonNull(ix: i32): boolean {
+  const u = crUnParen(ix)
+  if u < 0 || u >= P.nodes.length { return false }
+  if crNegLit(u) || crCoalesceNonNull(u) { return true }
+  const n = P.nodes[u]
+  n is NumLit
+    || n is StrLit
+    || n is CharLit
+    || n is BoolLit
+    || n is ObjLit
+    || n is ArrayLit
+    || n is FuncDecl
+}
+
+function crNegLit(ix: i32): boolean {
+  const n = P.nodes[ix]
+  if n is Unary {
+    return n.unOp == "-" && P.nodes[crUnParen(n.unArg)] is NumLit
+  }
+  false
+}
+
+function crCoalesceNonNull(ix: i32): boolean {
+  const n = P.nodes[ix]
+  if n is BinExpr { return n.binOp == "??" && crRhsNonNull(n.binRight) }
+  false
+}
+
+// Whether a top-level function `fnIx` may keep an assignment narrowing of module binding `name`:
+// the program's first top-level write of it stores a non-null literal, and no call runs before
+// that write, so nothing can call the function while the binding still holds `null`.
+function crRootMayKeep(fnIx: i32, name: string): boolean {
+  const pr = P.nodes[crProgRoot]
+  if !(pr is Program) { return false }
+  const stmts = pr.progStmts
+  const fnTok = crNodeTok(fnIx)
+  let sawCall = false
+  let s = 0
+  while s < stmts.length {
+    if crNodeTok(stmts[s]) >= fnTok { return false }
+    if crAssignTarget(stmts[s]) == name {
+      const a = P.nodes[stmts[s]]
+      if a is BinExpr {
+        if crRhsNonNull(a.binRight) { return !sawCall }
+      }
+      return false
+    }
+    if !sawCall && crHasCall(stmts[s]) { sawCall = true }
+    s = s + 1
+  }
+  false
+}
+
+function crNodeTok(ix: i32): i32 {
+  if ix >= 0 && ix < nodeToks.length { return nodeToks[ix] }
+  -1
+}
+
+// Whether evaluating the statement or expression `ix` may run user code: a call anywhere in it,
+// outside a nested function's body, that `crCallBenign` does not clear, or an operator or index
+// that may dispatch to a declaration.
+function crHasCall(ix: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = P.nodes[ix]
+  if n is FuncDecl { return false }
+  if n is Call {
+    if !crCallBenign(n, ix, "") { return true }
+  }
+  if crIsDispatchSite(ix) { return true }
+  let cur = ix
+  while cur >= 0 {
+    const kids = nodeSpineChildren(cur)
+    let k = 0
+    while k < kids.length {
+      if crHasCall(kids[k]) { return true }
+      k = k + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  false
+}
+
+// The distinct bare names the body of function `fnIx` reads, nested functions included.
+function crBodyReadNames(fnIx: i32): string[] {
+  const hit = crReadLists[fnIx]
+  if hit is string { return weSplit(hit) }
+  crReadAcc = ","
+  const fd = P.nodes[fnIx]
+  if fd is FuncDecl { crReadWalk(fd.fnBody, i32ToStr(fnIx) + "#") }
+  crReadLists[fnIx] = crReadAcc
+  weSplit(crReadAcc)
+}
+
+// The innermost narrowing bank row of `name` below scope depth `base`, or -1.
+function crInnerRowBelow(name: string, base: i32): i32 {
+  let i = asgDeclKeys.length - 1
+  while i >= 0 {
+    if asgDeclDepths[i] < base && asgDeclKeys[i] == name { return i }
+    i = i - 1
+  }
+  -1
+}
+
+function crReadWalk(ix: i32, pre: string) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const n = P.nodes[ix]
+  if n is Ident {
+    const key = pre + n.identName
+    if !crReadMemo.has(key) {
+      crReadMemo[key] = true
+      crReadAcc = crReadAcc + n.identName + ","
+    }
+    return 0
+  }
+  let cur = ix
+  while cur >= 0 {
+    const kids = nodeSpineChildren(cur)
+    let k = 0
+    while k < kids.length {
+      crReadWalk(kids[k], pre)
+      k = k + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  0
+}
+
+// The innermost function around the one being checked that declares `name`, or the program.
+// An outer frame than the true one only makes `crCaptureByRef` answer true more often.
+function crDeclFrameOf(name: string): i32 {
+  let k = crFnIxs.length - 2
+  while k >= 0 {
+    if crFrameDeclares(crFnIxs[k], name) { return crFnIxs[k] }
+    k = k - 1
+  }
+  crProgRoot
+}
+
+function crFrameDeclares(fnIx: i32, name: string): boolean {
+  const pre = i32ToStr(fnIx) + "#"
+  if !crMemoDone.has(pre + "d") {
+    crMemoDone[pre + "d"] = true
+    const fd = P.nodes[fnIx]
+    if fd is FuncDecl {
+      let p = 0
+      while p < fd.fnParams.length {
+        const pn = P.nodes[fd.fnParams[p]]
+        if pn is Param { crDeclMemo[pre + pn.parName] = true }
+        p = p + 1
+      }
+      crDeclWalk(fd.fnBody, pre)
+    }
+  }
+  crDeclMemo[pre + name] ?? false
+}
+
+function crDeclWalk(ix: i32, pre: string) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const n = P.nodes[ix]
+  if n is FuncDecl { return 0 }
+  if n is LetDecl {
+    crDeclMemo[pre + n.letName] = true
+  } else if n is ForRange {
+    crDeclMemo[pre + n.frVar] = true
+  } else if n is ForIn {
+    crDeclMemo[pre + n.fiVar] = true
+    if n.fiVar2 != "" { crDeclMemo[pre + n.fiVar2] = true }
+  }
+  let cur = ix
+  while cur >= 0 {
+    const kids = nodeSpineChildren(cur)
+    let k = 0
+    while k < kids.length {
+      crDeclWalk(kids[k], pre)
+      k = k + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  0
+}
+
+// Whether a closure made in `frame` may see a write of `null` to its binding `name` made after
+// it captured it: a nested function writes it, or an assignment follows a capture or shares a
+// loop with one that the binding's own declaration is not inside. Such a closure shares the
+// binding's cell. Never finer than the emitter's `cboxByRef`, since it tells no arm apart.
+function crCaptureByRef(frame: i32, name: string, anyWrite: boolean): boolean {
+  const pre = i32ToStr(frame) + "#"
+  if !crMemoDone.has(pre + "b") {
+    crMemoDone[pre + "b"] = true
+    crByRefFrame(frame, pre)
+  }
+  if anyWrite { return crByRefAnyMemo[pre + name] ?? false }
+  crByRefMemo[pre + name] ?? false
+}
+
+// Every name of `frame` whose capture is by reference, from one walk of the frame, banked under
+// the key prefix `pre`.
+function crByRefFrame(frame: i32, pre: string) {
+  crbrOrd = 0
+  crbrFnOrd = -1
+  crbrFnLoops = ","
+  crbrArgFloor = -1
+  crbrCapNames = []
+  crbrCapOrds = []
+  crbrCapLoops = []
+  crbrAsgNames = []
+  crbrAsgOrds = []
+  crbrAsgLoops = []
+  crbrAsgNested = []
+  crbrAsgNull = []
+  crbrDeclLoops = Map()
+  let body = frame
+  const fd = P.nodes[frame]
+  if fd is FuncDecl { body = fd.fnBody }
+  crbrWalk(body, 0, ",")
+  // The first capture of each name, and the loops its captures sit in.
+  const firstCap: {[string]: i32} = Map()
+  const capLoops: {[string]: string} = Map()
+  let c = 0
+  while c < crbrCapNames.length {
+    const nm = crbrCapNames[c]
+    const f0 = firstCap[nm] ?? -1
+    if f0 < 0 || crbrCapOrds[c] < f0 { firstCap[nm] = crbrCapOrds[c] }
+    capLoops[nm] = (capLoops[nm] ?? ",")
+      + crbrCapLoops[c].slice(1, crbrCapLoops[c].length)
+    c = c + 1
+  }
+  let a = 0
+  while a < crbrAsgNames.length {
+    const nm = crbrAsgNames[a]
+    const f0 = firstCap[nm] ?? -1
+    if f0 >= 0 {
+      if (
+        crbrAsgNested[a]
+        || crbrAsgOrds[a] > f0
+        || crbrLoopsMeet(
+          capLoops[nm] ?? ",",
+          crbrAsgLoops[a],
+          crbrDeclLoops[nm] ?? ",",
+        )
+      ) {
+        crByRefAnyMemo[pre + nm] = true
+        if crbrAsgNull[a] { crByRefMemo[pre + nm] = true }
+      }
+    }
+    a = a + 1
+  }
+  0
+}
+
+// One walk of a frame, in the emitter's order: an assignment is ordered after its operands, and a
+// nested function at its start, or at the call's start when it is a named call's argument. Only
+// an assignment that may store `null` is recorded.
+function crbrWalk(ix: i32, depth: i32, loops: string) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const n = P.nodes[ix]
+  if n is Ident {
+    if depth > 0 {
+      crbrCapNames.push(n.identName)
+      crbrCapOrds.push(crbrFnOrd)
+      crbrCapLoops.push(crbrFnLoops)
+    }
+    return 0
+  }
+  if n is FuncDecl {
+    if depth == 0 {
+      crbrOrd = crbrOrd + 1
+      crbrFnOrd = crbrOrd
+      if crbrArgFloor >= 0 { crbrFnOrd = crbrArgFloor }
+      crbrFnLoops = loops
+    }
+    return crbrWalk(n.fnBody, depth + 1, loops)
+  }
+  let inner = loops
+  if crIsLoop(ix) {
+    inner = loops + i32ToStr(ix) + ","
+    if depth == 0 { crbrNoteLoopDecl(ix, inner) }
+  }
+  if depth == 0 { crbrNoteLetDecl(ix, loops) }
+  const savedFloor = crbrArgFloor
+  if depth == 0 && savedFloor < 0 && crIsNamedCall(ix) {
+    crbrArgFloor = crbrOrd
+  }
+  let cur = ix
+  while cur >= 0 {
+    const kids = nodeSpineChildren(cur)
+    let k = 0
+    while k < kids.length {
+      crbrWalk(kids[k], depth, inner)
+      k = k + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  crbrArgFloor = savedFloor
+  const tgt = crAssignTarget(ix)
+  if tgt != "" {
+    crbrOrd = crbrOrd + 1
+    crbrAsgNames.push(tgt)
+    crbrAsgOrds.push(crbrOrd)
+    crbrAsgLoops.push(loops)
+    crbrAsgNested.push(depth > 0)
+    crbrAsgNull.push(!crAsgRhsNonNull(ix))
+  }
+  0
+}
+
+function crAsgRhsNonNull(ix: i32): boolean {
+  const n = P.nodes[ix]
+  if n is BinExpr { return crRhsNonNull(n.binRight) }
+  false
+}
+
+// A frame's own declaration of a name records the loops it sits in; the first one wins, as in
+// the emitter's `cboxDeclare`.
+function crbrNoteLetDecl(ix: i32, loops: string) {
+  const n = P.nodes[ix]
+  if n is LetDecl {
+    if !crbrDeclLoops.has(n.letName) { crbrDeclLoops[n.letName] = loops }
+  }
+  0
+}
+
+// A loop variable is declared inside its own loop.
+function crbrNoteLoopDecl(ix: i32, inner: string) {
+  crbrNoteRangeDecl(ix, inner)
+  crbrNoteForInDecl(ix, inner)
+}
+
+function crbrNoteRangeDecl(ix: i32, inner: string) {
+  const n = P.nodes[ix]
+  if n is ForRange {
+    if !crbrDeclLoops.has(n.frVar) { crbrDeclLoops[n.frVar] = inner }
+  }
+  0
+}
+
+function crbrNoteForInDecl(ix: i32, inner: string) {
+  const n = P.nodes[ix]
+  if n is ForIn {
+    if !crbrDeclLoops.has(n.fiVar) { crbrDeclLoops[n.fiVar] = inner }
+    if n.fiVar2 != "" && !crbrDeclLoops.has(n.fiVar2) {
+      crbrDeclLoops[n.fiVar2] = inner
+    }
+  }
+  0
+}
+
+function crIsNamedCall(ix: i32): boolean {
+  const n = P.nodes[ix]
+  if n is Call { return hasNamedArgs(n.callArgNames) }
+  false
+}
+
+function crIsLoop(ix: i32): boolean {
+  const n = P.nodes[ix]
+  n is WhileStmt || n is ForRange || n is ForIn
+}
+
+function crUnParen(ix: i32): i32 {
+  let cur = ix
+  while cur >= 0 && cur < P.nodes.length {
+    const n = P.nodes[cur]
+    if n is Paren { cur = n.parInner } else { return cur }
+  }
+  cur
+}
+
+// Whether two `,`-joined loop paths share a loop that the declaration's own path `decl` does not
+// hold: a loop around the declaration makes a fresh binding each time round.
+function crbrLoopsMeet(a: string, b: string, decl: string): boolean {
+  const ls = weSplit(a)
+  let i = 0
+  while i < ls.length {
+    const key = "," + ls[i] + ","
+    if b.indexOf(key) >= 0 && decl.indexOf(key) < 0 { return true }
+    i = i + 1
+  }
+  false
+}
+
+// Per-frame answers keyed `"<frame>#<name>"`; `crMemoDone` marks the frames each has walked.
+let crByRefMemo: {[string]: boolean} = Map()
+let crDeclMemo: {[string]: boolean} = Map()
+let crReadMemo: {[string]: boolean} = Map()
+let crReadLists: {[i32]: string} = Map()
+let crReadAcc = ","
+let crMemoDone: {[string]: boolean} = Map()
+let crNulledNames: {[string]: boolean} = Map()
+let crNulledBuilt = false
+let crbrOrd = 0
+let crbrFnOrd = -1
+let crbrFnLoops = ","
+let crbrArgFloor = -1
+let crbrCapNames: string[] = []
+let crbrCapOrds: i32[] = []
+let crbrCapLoops: string[] = []
+let crbrAsgNames: string[] = []
+let crbrAsgOrds: i32[] = []
+let crbrAsgLoops: string[] = []
+let crbrAsgNested: boolean[] = []
+let crbrAsgNull: boolean[] = []
+let crByRefAnyMemo: {[string]: boolean} = Map()
+let crbrDeclLoops: {[string]: string} = Map()
 
 // The name a nested function is only ever called by: its own, or the one binding it; "".
 function crLambdaHandle(fnIx: i32): string {
@@ -9960,6 +10586,13 @@ function pushScope(owner: i32) {
 // Leave the innermost scope, unwinding what it pushed.
 function popScope() {
   flushUninferred(T.scopes.length - 1)
+  while (
+    crWideDepths.length > 0
+    && crWideDepths[crWideDepths.length - 1] >= T.scopes.length - 1
+  ) {
+    crWideDepths.pop()
+    crWideNames.pop()
+  }
   if T.scopes.length > 0 {
     for k in T.scopes[T.scopes.length - 1] {
       const ds = scopeDepthsOf[k]
@@ -37536,6 +38169,7 @@ function checkNodeReal(ix: i32) {
     // sits inside a guarded arm. Threaded in so the occurrence retains it.
     if symEnabled != 0 { symUse(ix, n.identName, ty) }
     if ix != daWriteTarget {
+      if crCapLossAny { crNoteLostName(n.identName, ix) }
       const crr = crReadHook(n.identName, ix)
       if crr >= 0 { return crr }
     }
@@ -44789,7 +45423,9 @@ function checkLetDeclNode(n: LetDecl, ix: i32) {
   // A module global is pre-declared by the pass-1.5 hoist, so its own pass-2 declaration
   // would falsely trip the same-frame check — skip it there (top-level dups are caught in the hoist).
   const preHoisted = dtop == 0 && (moduleGlobals[n.letName] ?? false)
-  if !preHoisted && T.scopes[dtop].has(n.letName) {
+  if crWidenedInTop(n.letName) {
+    crUnwidenTop(n.letName)
+  } else if !preHoisted && T.scopes[dtop].has(n.letName) {
     tErr("redeclared " + n.letName, ix)
   }
   // The same reservation the `function` path enforces: a `const` of the emitter-intrinsic name
