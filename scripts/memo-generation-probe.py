@@ -153,11 +153,11 @@ ROWS = [
     ("moduleLocalLetPlan", [], "probe",
      ("  if off >= 0 { return mllSortFind(off, mllSortCnt[name] ?? 0, atIx) }",
       "  if false && off >= 0 { return mllSortFind(off, mllSortCnt[name] ?? 0, atIx) }")),
-    # `crDistinctFresh`'s fresh `const` names of the root being checked (D2584): keyed on the
-    # root's node index, read from the syntax tree alone, and reset with the checker's state.
-    ("crFreshNames", [], "no-refined-input",
-     ("  if root != crFreshRoot {",
-      "  if true || root != crFreshRoot {")),
+    # `crNoteSoleRef`'s names a root uses other than as a receiver (D2584): keyed on the root's
+    # node index, read from the syntax tree alone, and reset with the checker's state.
+    ("crValUseNames", [], "no-refined-input",
+     ("  if root != crValUseRoot {",
+      "  if true || root != crValUseRoot {")),
 ]
 
 # A stamp is a MODULE-level binding whose name carries one of these markers; the shapes below

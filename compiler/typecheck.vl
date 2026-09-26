@@ -6670,6 +6670,7 @@ function retireAliasedNarrowings(
   }
   let family = ""
   if tgtKey == "" { family = indexRootKeyOf(tgtIx) }
+  const recvFresh = recvName != "" && crSoleRefBinding(recvName)
   const n0 = npKeys.length
   let i = 0
   while i < n0 {
@@ -6679,11 +6680,17 @@ function retireAliasedNarrowings(
       || keyHasPrefix(k, tgtKey + ".")
       || keyHasPrefix(k, tgtKey + "["))
     const fam = family != "" && keyHasPrefix(k, family + "[")
+    const kRoot = placeRootOf(k)
+    // A receiver no other place refers to cannot be any object on another key's path; a key
+    // root no other place refers to cannot be the receiver unless the receiver names it.
+    const apart = recvFresh && kRoot != recvName
+    const skip0 = kRoot != recvName && crSoleRefBinding(kRoot)
     if (
       npInvBy[i] < 0
       && !own
       && !fam
-      && aliasWriteHitsKey(shape, recvTy, recvName, rt, k, npTys[i])
+      && !apart
+      && aliasWriteHitsKey(shape, recvTy, skip0, rt, k, npTys[i])
     ) {
       crAliasWr[atIx] = true
       npInvBy[i] = atIx
@@ -6718,14 +6725,14 @@ function idxRecvIx(ix: i32): i32 {
   -1
 }
 
-// Whether a write of shape `shape` into an object typed `recvTy`, held by the name `recvName`
-// ("" for none), storing a value typed `rt`, may falsify the narrowing of `key` to `npTy`. A
-// field step matches only a receiver whose type may be the object's, and a key's first step
-// never matches a different fresh local; a store the narrowing admits into its last step keeps it.
+// Whether a write of shape `shape` into an object typed `recvTy`, storing a value typed `rt`,
+// may falsify the narrowing of `key` to `npTy`. A field step matches only a receiver whose type
+// may be the object's, the first step not at all when `skip0`; a store the narrowed type admits
+// into the key's last step keeps it.
 function aliasWriteHitsKey(
   shape: string,
   recvTy: i32,
-  recvName: string,
+  skip0: boolean,
   rt: i32,
   key: string,
   npTy: i32,
@@ -6737,7 +6744,7 @@ function aliasWriteHitsKey(
     if (
       shapeHitsStep(shape, steps[s], keyStepTag(steps[s], pres[s]))
       && (steps[s][0] != '.' || objTysMayAlias(pres[s], recvTy))
-      && !(s == 0 && crDistinctFresh(recvName, placeRootOf(key)))
+      && !(s == 0 && skip0)
     ) {
       if s < steps.length - 1 { return true }
       if rt < 0 || npTy < 0 || !assignable(rt, npTy) { return true }
@@ -6775,25 +6782,107 @@ function keyStepPrefixTys(key: string, steps: string[]): i32[] {
   out
 }
 
-// The root whose fresh locals `crFreshNames` holds: those bound once, by a `const`, to a new object.
-let crFreshRoot = -2
-let crFreshNames: string[] = []
+// Bindings whose object no other place refers to: a `const` bound to a new object whose name is
+// used only as a receiver (`x.f`, `x[i]`) in its root, with the scope depth of its declaration.
+let crSoleNames: string[] = []
+let crSoleDepths: i32[] = []
+// The root `crValUseNames` describes, and the names that root uses other than as a receiver.
+let crValUseRoot = -2
+let crValUseNames: {[string]: boolean} = Map()
 
-// Whether `a` and `b` are two different names, each bound once in the root being checked by a
-// `const` to a new object, so they never hold one object.
-function crDistinctFresh(a: string, b: string): boolean {
-  if a == b || a == "" || b == "" { return false }
-  const root = crCurRoot()
-  if root < 0 { return false }
-  if root != crFreshRoot {
-    const bound: string[] = []
-    fnBoundNames(root, bound)
-    const fresh: string[] = []
-    weFreshNames(root, bound, fresh)
-    crFreshRoot = root
-    crFreshNames = fresh
+// Record the `const` just declared by `n` when its object has no other holder (D2584).
+function crNoteSoleRef(n: LetDecl) {
+  const d = lookupDepth(n.letName)
+  if d < 0 { return 0 }
+  crDropSoleAt(n.letName, d)
+  if n.letKw != "const" || !weInitIsFresh(n.letInit) { return 0 }
+  let root = crCurRoot()
+  if crFnBases.length == 0 { root = crProgRoot }
+  if root < 0 { return 0 }
+  if root != crValUseRoot {
+    crValUseNames = Map()
+    crValUseWalk(root)
+    crValUseRoot = root
   }
-  nameIn(crFreshNames, a) && nameIn(crFreshNames, b)
+  if crValUseNames[n.letName] ?? false { return 0 }
+  crSoleNames.push(n.letName)
+  crSoleDepths.push(d)
+  0
+}
+
+// Forget a record of `name` at depth `d`: a later declaration there binds a different object.
+function crDropSoleAt(name: string, d: i32) {
+  let i = crSoleNames.length - 1
+  while i >= 0 && crSoleDepths[i] >= d {
+    if crSoleNames[i] == name && crSoleDepths[i] == d { crSoleNames[i] = "" }
+    i = i - 1
+  }
+  0
+}
+
+// Drop the records of the scope being left, at depth `d` and deeper.
+function crPopSoleTo(d: i32) {
+  while crSoleDepths.length > 0 && crSoleDepths[crSoleDepths.length - 1] >= d {
+    crSoleNames.pop()
+    crSoleDepths.pop()
+  }
+  0
+}
+
+// Whether `name`, resolved at this point, names a binding `crNoteSoleRef` recorded.
+function crSoleRefBinding(name: string): boolean {
+  if name == "" || crSoleNames.length == 0 { return false }
+  const d = lookupDepth(name)
+  if d < 0 { return false }
+  let i = crSoleNames.length - 1
+  while i >= 0 && crSoleDepths[i] >= d {
+    if crSoleNames[i] == name && crSoleDepths[i] == d { return true }
+    i = i - 1
+  }
+  false
+}
+
+// Collect into `crValUseNames` every name the subtree uses other than as the receiver of a field
+// or cell access. A method call, a getter and a dispatched index hand the receiver on, so they count.
+function crValUseWalk(ix: i32) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const n = P.nodes[ix]
+  if n is Ident {
+    crValUseNames[n.identName] = true
+    return 0
+  }
+  if n is Member {
+    if P.nodes[peelParenIx(n.memObj)] is Ident && getSiteFnOf(ix) == "" {
+      return 0
+    }
+  }
+  if n is OptMember {
+    if P.nodes[peelParenIx(n.omObj)] is Ident { return 0 }
+  }
+  if n is Index {
+    if P.nodes[peelParenIx(n.idxArr)] is Ident && opSiteDecls(ix).length == 0 {
+      crValUseWalk(n.idxIndex)
+      return 0
+    }
+  }
+  if n is Call {
+    const cf = P.nodes[peelParenIx(n.callFn)]
+    if cf is Member {
+      const cr = P.nodes[peelParenIx(cf.memObj)]
+      if cr is Ident { crValUseNames[cr.identName] = true }
+    }
+  }
+  let cur = ix
+  while cur >= 0 {
+    const kids = nodeSpineChildren(cur)
+    let i = 0
+    while i < kids.length {
+      crValUseWalk(kids[i])
+      i = i + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  0
 }
 
 // Whether values of types `a` and `b` may be one object; true when either is unknown.
@@ -7463,8 +7552,10 @@ function crReset() {
   crAliasWr = Map()
   crAliasNestSlots = []
   crAliasNestDepths = []
-  crFreshRoot = -2
-  crFreshNames = []
+  crSoleNames = []
+  crSoleDepths = []
+  crValUseRoot = -2
+  crValUseNames = Map()
   0
 }
 
@@ -10799,6 +10890,7 @@ function popScope() {
     crWideDepths.pop()
     crWideNames.pop()
   }
+  crPopSoleTo(T.scopes.length - 1)
   if T.scopes.length > 0 {
     for k in T.scopes[T.scopes.length - 1] {
       const ds = scopeDepthsOf[k]
@@ -45685,6 +45777,7 @@ function checkLetDeclNode(n: LetDecl, ix: i32) {
   // is called through the inline arm exactly like `function`, so the lambda never runs.
   checkNotEmitterIntrinsic(n.letName, ix)
   declare(n.letName, bound)
+  crNoteSoleRef(n)
   getLetBank(ix, bound)
   // The module hoist already recorded a global's row at depth 0; a second one would say the
   // same thing at the same depth (D1609).
