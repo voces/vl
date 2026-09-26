@@ -8157,3 +8157,25 @@ keys, 40M lookups, `-O`, min of 5 interleaved at load ~12): the same keys as i64
 i32 map's time; the keys spread across the full 64 bits (`k * 4294967311`) run 0.67x, since the
 i32 map places `7i + 3` by one Fibonacci step and the i64 map by two. A module with no i64-keyed
 map builds byte-identically.
+
+## A generic's member call is resolved per instance, in the same order — D2517
+
+`recv.name(…)` inside a generic body has a type-parameter receiver, so which member it names
+depends on the instance: `x.push(1)` in `f<T>(x: T)` is the list's own `push` at `f(xs)` and a
+`push(self: i32[] | string, …)` function at `f("s")`. **Each instance resolves the call in the
+language's one order — built-in method, then field, then `self`-function — on its own receiver
+type** (`memberRungOnTy`, the same answer D2475's declaration refusal reads). The body was
+typed once, against the function, so at an instance where a built-in or a field takes the call
+the checker's pin requires that it fit how the body used it: the arity, each argument's type,
+no named arguments, and for a built-in the value's type — `x.slice(0, 2) + 1` against a
+`slice(self: string | boolean, …): i32` is refused at `f("hello")`, since the string's `slice`
+returns `string`. A field's value is not held to the body's use: a field already took the call
+per instance before this ruling (D1063), and `print(x.tag())` reads either value.
+
+**A map or set method name leaves an un-annotated parameter open when a `self`-function of
+that name is in scope (D2518)**, instead of demanding a map the function's own receiver may not
+be. `map`/`filter` still demand a list: the pin cannot state a callback's parameter.
+
+**Only a call on the generic's own parameter is re-dispatched.** A call through a local bound
+from it, or from inside a closure, is refused at an instance whose built-in or field would take
+it, naming both and the spelling that works (D2520, open); on master it ran the function.

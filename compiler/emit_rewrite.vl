@@ -132,7 +132,13 @@ import {
   paramDefaultOf,
   ufcsAliasAtSite,
 } from "./ast"
-import { MC_RUNG_BUILTIN, MC_RUNG_SELF_FN, memberCallRungOf } from "./ast"
+import {
+  MC_RUNG_BUILTIN,
+  MC_RUNG_PER_INSTANCE,
+  MC_RUNG_SELF_FN,
+  memberCallRungAdd,
+  memberCallRungOf,
+} from "./ast"
 import {
   annArrowAt,
   capHas,
@@ -283,7 +289,7 @@ function drwCloShadowed(name: string) {
 // default expressions for the trailing arguments the call omitted — runs before
 // monomorphization, so every later pass sees an ordinary full-arity call and no
 // new `$fnsig` key is minted. A call through a function value resolves nothing.
-function drwFillDefaults(ix: i32, ctx: i32) {
+export function drwFillDefaults(ix: i32, ctx: i32) {
   const n = P.nodes[ix]
   if n is Call {
     const cf = P.nodes[n.callFn]
@@ -359,21 +365,12 @@ function drwIsMapRead(ix: i32) {
   false
 }
 
-// Whether any instantiation of the enclosing generic resolves `prop` as a field of
-// the receiver, so the answer differs per instance and this rewrite must decline
-// (D1002): the body cannot answer, but the call sites can, from the checker's
-// per-argument types. Declining hands the call to the field-closure lowering instead.
-
-// D1430 — an un-annotated parameter is a generic too. `fnTyParams.length == 0` is not
-// "not generic": `function g(x) { x.tag() }` declares no type parameters but still
-// takes any type, so this must still decline and not rewrite the call onto a
-// `self`-function whose receiver type no instantiation can ever have.
-function drwAnyInstanceTakesField(recvIx: i32, prop: string, ctx: i32) {
+// Whether `recvIx` is a parameter of the generic `ctx` still typed by a type parameter, so the
+// member `recv.prop(…)` names (built-in, field or `self`-function) differs per instance and the
+// rewrite leaves the call to `monoPinBinOps` (D2517). An un-annotated parameter counts: it takes
+// any type too.
+function drwRecvIsTyParam(recvIx: i32, ctx: i32) {
   if ctx < 0 { return false }
-  // Ordered by cost: `tyHasTyVar` fans out over a union's members and an object's fields
-  // to depth 12 with no memo, exponential on a recursive union. The parameter scan runs
-  // first so a receiver naming an annotated parameter of a non-generic function returns
-  // before paying that cost.
   const fn = P.nodes[ctx]
   if fn is FuncDecl {
     const r = P.nodes[unwrapParen(recvIx)]
@@ -394,37 +391,16 @@ function drwAnyInstanceTakesField(recvIx: i32, prop: string, ctx: i32) {
       }
       if pi < 0 { return false }
       if fn.fnTyParams.length == 0 && !piHole { return false }
-      // The receiver's own recorded type must still be a hole — a concrete receiver is
-      // answered by `structIndexOfExpr` already; only an un-annotated parameter reaches here.
-      if !tyHasTyVar(nodeTyIxOf(recvIx)) { return false }
-      const gname = fn.fnName
-      if gname == "" { return false }
-      let seen = 0
-      let k = 0
-      while k < P.nodes.length {
-        const nd = P.nodes[k]
-        if nd is Call {
-          const ce = P.nodes[nd.callFn]
-          // A UFCS call naming this generic reaches it through a receiver this scan
-          // cannot line up with a parameter position — decline rather than guess.
-          if ce is Member {
-            if ce.memProp == gname { return false }
-          }
-          if ce is Ident {
-            if ce.identName == gname {
-              if pi >= nd.callArgs.length { return false }
-              if tyFieldTyOf(nodeTyIxOf(nd.callArgs[pi]), prop) >= 0 {
-                seen = seen + 1
-              }
-            }
-          }
-        }
-        k = k + 1
-      }
-      return seen > 0
+      if fn.fnName == "" { return false }
+      return tyHasTyVar(nodeTyIxOf(recvIx))
     }
   }
   false
+}
+
+// Whether the rewrite left member call `callIx` to each instance (`drwRecvIsTyParam`).
+export function drwMemberDeferred(callIx: i32) {
+  memberCallRungOf(callIx) == MC_RUNG_PER_INSTANCE
 }
 
 // A fresh node denoting the same place as `ix`, so the guard's null test and the call never
@@ -579,10 +555,10 @@ function drwWalk(ix: i32, ctx: i32) {
         if !exprIsClosure(n.callFn, ctx) {
           if drwSelfFnOf(uName, args.length + 1) >= 0 {
             // A type-parameter receiver has no struct row yet, so `si < 0` alone cannot
-            // mean "no field, so UFCS" — see `drwAnyInstanceTakesField`. Asked last, after
-            // the `self`-function has matched, since it walks the whole arena and node
-            // table and every `.push`/`.slice` receiver in a real program reaches this arm.
-            if !drwAnyInstanceTakesField(callee.memObj, callee.memProp, ctx) {
+            // mean "no field, so UFCS": each instance answers for itself.
+            if drwRecvIsTyParam(callee.memObj, ctx) {
+              memberCallRungAdd(ix, MC_RUNG_PER_INSTANCE)
+            } else {
               ufcs = true
             }
           }
