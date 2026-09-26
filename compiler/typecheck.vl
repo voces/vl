@@ -5083,6 +5083,15 @@ function narrowedPathIx(key: string) {
   -1
 }
 
+// `narrowedPathTy` without the capture question, for reading a prefix's type while a call's
+// write summary is being matched — which that question itself asks.
+function narrowedPathTyRaw(key: string) {
+  const i = narrowedPathIx(key)
+  if i < 0 { return -1 }
+  if npInvBy[i] >= 0 { return -1 }
+  npTys[i]
+}
+
 // The innermost narrowed-path overlay entry for `key`, or -1, which means either "never narrowed"
 // or "narrowed and since invalidated by an aliasing write or a falsifying assignment". One
 // function answers "is this narrowing in force", so the member read arms and `placeCurTy`'s fact
@@ -5091,6 +5100,7 @@ function narrowedPathTy(key: string) {
   const i = narrowedPathIx(key)
   if i < 0 { return -1 }
   if npInvBy[i] >= 0 { return -1 }
+  if crPathCaptureLost(i, key) { return -1 }
   npTys[i]
 }
 
@@ -5101,6 +5111,7 @@ function narrowedPathTy(key: string) {
 function narrowedPathInvBy(key: string) {
   const i = narrowedPathIx(key)
   if i < 0 { return -1 }
+  if crPathCaptureLost(i, key) { return -1 }
   npInvBy[i]
 }
 
@@ -5323,18 +5334,18 @@ function weScan(ix: i32, pname: string) {
 // parameter is a write of `a.v` here.
 function callEffectsOn(callIx: i32, pname: string) {
   const cn = P.nodes[callIx]
-  if cn is Call { return callEffectsOnReal(cn, pname) }
+  if cn is Call { return callEffectsOnReal(cn, callIx, pname) }
   ""
 }
 
-function callEffectsOnReal(cn: Call, pname: string) {
-  const declIx = callDeclFnIx(cn)
+function callEffectsOnReal(cn: Call, callIx: i32, pname: string) {
+  const declIx = callDeclFnIx(cn, callIx)
   // An intrinsic cannot write a field of anything handed to it, so a body whose only use of the
   // parameter is `print(p.v)` has no write effect. Distinguishing this from the opaque `-1` keeps
   // a read-only callee from invalidating its caller's narrowings — the false positive that
   // decides whether the rule is usable at all.
   if declIx == -2 { return "" }
-  argEffectsOn(declIx, callArgPlaces(cn), pname)
+  argEffectsOn(declIx, callArgPlaces(cn, callIx), pname)
 }
 
 // `callEffectsOn` for an operator site that may dispatch: each declaration it may run, handed
@@ -5389,62 +5400,14 @@ function argEffectsOn(declIx: i32, args: i32[], pname: string) {
   acc
 }
 
-// Whether the lambda at `fnIx` can write no field, element or map value: its body assigns only
-// bare names, holds no nested function and no operator that may dispatch, and calls only
-// intrinsics that remove nothing and are handed no function. Only a yes is memoised: asked
-// before the body is checked, an argument's type is unknown and answers no.
-function crLambdaWritesNoPlace(fnIx: i32): boolean {
-  if crNoPlaceMemo[fnIx] ?? false { return true }
-  let ok = false
-  const fd = P.nodes[fnIx]
-  if fd is FuncDecl { ok = crSubtreeWritesNoPlace(fd.fnBody) }
-  if ok { crNoPlaceMemo[fnIx] = true }
-  ok
-}
-
-let crNoPlaceMemo: {[i32]: boolean} = Map()
-
-function crSubtreeWritesNoPlace(ix: i32): boolean {
-  if ix < 0 || ix >= P.nodes.length { return true }
-  const n = P.nodes[ix]
-  if n is FuncDecl { return false }
-  if n is BinExpr {
-    if n.binOp == "=" && !(P.nodes[n.binLeft] is Ident) { return false }
-  }
-  if crIsDispatchSite(ix) { return false }
-  if n is Call {
-    if callDeclFnIx(n) != -2 { return false }
-    const cf = P.nodes[n.callFn]
-    if cf is Member {
-      if cellRemovingMethod(cf.memProp) { return false }
-    }
-    let a = 0
-    while a < n.callArgs.length {
-      if crArgMayBeFn(n.callArgs[a]) { return false }
-      a = a + 1
-    }
-  }
-  let cur = ix
-  while cur >= 0 {
-    const kids = nodeSpineChildren(cur)
-    let k = 0
-    while k < kids.length {
-      if !crSubtreeWritesNoPlace(kids[k]) { return false }
-      k = k + 1
-    }
-    cur = elseIfLink(cur)
-  }
-  true
-}
-
 // A call's argument places in callee-parameter order. A UFCS or method callee (`o.m(a)`) puts the
 // receiver at parameter 0, which is how `m(o, a)` declares it; every other shape is the written
 // argument list.
-function callArgPlaces(cn: Call) {
+function callArgPlaces(cn: Call, callIx: i32) {
   const out: i32[] = []
   const cf = P.nodes[cn.callFn]
   if cf is Member {
-    if lookupFnDeclNode(cf.memProp) >= 0 { out.push(cf.memObj) }
+    if callDeclFnIx(cn, callIx) >= 0 { out.push(cf.memObj) }
   }
   let i = 0
   while i < cn.callArgs.length {
@@ -5458,7 +5421,7 @@ function callArgPlaces(cn: Call) {
 // resolves to statically, with a UFCS receiver at parameter 0; `-1` is opaque — a function value,
 // a struct field holding one, or an unresolved receiver — so assume it writes anything reachable;
 // `-2` is an intrinsic, which writes no field of an object handed to it.
-function callDeclFnIx(cn: Call) {
+function callDeclFnIx(cn: Call, callIx: i32) {
   const cf = P.nodes[cn.callFn]
   if cf is Ident {
     const d = lookupFnDeclNode(cf.identName)
@@ -5466,21 +5429,31 @@ function callDeclFnIx(cn: Call) {
     const nd = findFnDeclInRoots(cf.identName)
     if nd >= 0 { return nd }
     if lookup(cf.identName) >= 0 {
-      // A binding bound once to a lambda, never re-pointed, calls that lambda's body — trusted
-      // only when that body writes no place at all, since the write summaries do not see an
-      // alias of a captured object (D2461). Anything else stays opaque.
+      // A binding bound once to a lambda, never re-pointed, calls that lambda's body; the write
+      // shapes see a write through an alias of a captured object (D2461). Anything else stays
+      // opaque.
       const lfr = covarRootFrame(cn.callFn)
       if cwFramedNode(cn.callFn) && lfr != CW_FR_UNKNOWN {
         const ld = cwLambdaDeclOf(cf.identName, lfr)
-        if ld >= 0 && crLambdaWritesNoPlace(ld) { return ld }
+        if ld >= 0 { return ld }
       }
       return -1 // a function VALUE: target unknown
     }
     return -2 // an intrinsic named by a bare identifier
   }
   if cf is Member {
+    // A built-in of the receiver's type runs whatever `self`-function shares its name.
+    if builtinMethodOn(nodeTyOf(cf.memObj), cf.memProp) { return -2 }
     const d = lookupFnDeclNode(cf.memProp)
     if d >= 0 { return d }
+    // A `self`-function merged from another module, by the name this site resolved to.
+    if callIx >= 0 {
+      const al = ufcsAliasAtSite(callIx, cf.memProp)
+      if al != cf.memProp {
+        const ad = lookupFnDeclNode(al)
+        if ad >= 0 { return ad }
+      }
+    }
     const nd = findFnDeclInRoots(cf.memProp)
     if nd >= 0 { return nd }
     return memberCalleeKind(cf)
@@ -5496,9 +5469,9 @@ function memberCalleeKind(cf: Member) {
     return -1 // receiver type unresolved → fail closed
   }
   const t = T.tys[rt]
-  if t is TyObj {
-    if objFieldType(t, cf.memProp) >= 0 { return -1 }
-  }
+  // A record or a collection has no other built-in method, so one not resolved above is a
+  // `self`-function this reading cannot see: opaque.
+  if t is TyObj || t is TyArray || t is TyMap { return -1 }
   -2
 }
 
@@ -5629,7 +5602,7 @@ function weScanFree(ix: i32, bound: string[]) {
 function callFreeEffects(callIx: i32) {
   const cn = P.nodes[callIx]
   if cn is Call {
-    const d = callDeclFnIx(cn)
+    const d = callDeclFnIx(cn, callIx)
     if d == -2 { return "" }
     if d < 0 { return "*" }
     return fnWriteFreePaths(d)
@@ -5650,6 +5623,635 @@ function opFreeEffects(ix: i32) {
     i = i + 1
   }
   acc
+}
+
+// The writes a function may make to an object older than the call, by what they replace, not the
+// name spelled: `.f` a field stored, `[k]` / `[]` a cell stored, `-[k]` / `-[]` a map cell removed;
+// `,`-terminated, or `"*"` opaque. Keyed on the shape, it sees a write through any alias, argument
+// or receiver (D2461).
+function fnWriteShapes(fnIx: i32) {
+  const key = i32ToStr(fnIx) + "#shape"
+  const hit = weSums[key]
+  if hit is string { return hit }
+  if weIsOpen(key) { return weCycleAnswer() }
+  const fd = P.nodes[fnIx]
+  if fd is FuncDecl {
+    const bound: string[] = []
+    fnBoundNames(fnIx, bound)
+    const fresh: string[] = []
+    weFreshNames(fd.fnBody, bound, fresh)
+    const params: string[] = []
+    let pi = 0
+    while pi < fd.fnParams.length {
+      const pn = P.nodes[fd.fnParams[pi]]
+      let nm = ""
+      if pn is Param {
+        if weBoundOnce(bound, pn.parName) { nm = pn.parName }
+      }
+      params.push(nm)
+      pi = pi + 1
+    }
+    const cutBefore = weCut
+    const unresBefore = weUnres
+    weOpen.push(key)
+    weRoots.push(fd.fnBody)
+    const acc = weScanShapes(fd.fnBody, fresh, params, bound)
+    weRoots.pop()
+    weOpen.pop()
+    if weUnres == unresBefore { weCache(key, acc, cutBefore) }
+    return acc
+  }
+  "*"
+}
+
+// Counts answers given without a receiver or container type recorded, so a summary asked before
+// its body is checked is not cached.
+let weUnres = 0
+
+// Accumulate the write shapes of a subtree, nested functions included, since one written here may
+// run during the call. A write one step below a name in `fresh` is left out: that object is new
+// to this call. A call of parameter `i` of the function summarised (`params`) is `@i`, which a call
+// site replaces with what its argument there writes; a call of any other local is opaque.
+function weScanShapes(
+  ix: i32,
+  fresh: string[],
+  params: string[],
+  bound: string[],
+) {
+  if ix < 0 || ix >= P.nodes.length { return "" }
+  let acc = ""
+  const n = P.nodes[ix]
+  if n is BinExpr {
+    if n.binOp == "=" { acc = weTargetShape(n.binLeft, fresh, bound) }
+  } else if n is Call {
+    const inner = callWriteShapes(n, ix, fresh, params, bound)
+    if inner == "*" { return "*" }
+    acc = inner
+  }
+  const ds = opSiteDecls(ix)
+  let d = 0
+  while d < ds.length {
+    if ds[d] < 0 { return "*" }
+    const sub = weClosed(fnWriteShapes(ds[d]))
+    if sub == "*" { return "*" }
+    acc = acc + sub
+    d = d + 1
+  }
+  let cur = ix
+  while cur >= 0 {
+    const kids = nodeSpineChildren(cur)
+    let i = 0
+    while i < kids.length {
+      const sub = weScanShapes(kids[i], fresh, params, bound)
+      if sub == "*" { return "*" }
+      acc = acc + sub
+      i = i + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  acc
+}
+
+// The shape an assignment to the place at `ix` writes: `.f` a field, a cell's shape, `=g` a
+// rebinding of a name `g` the function does not bind, "" a rebinding of its own local.
+function weTargetShape(ix: i32, fresh: string[], bound: string[]) {
+  const tix = peelParenIx(ix)
+  if tix < 0 || tix >= P.nodes.length { return "" }
+  const t = P.nodes[tix]
+  if t is Member {
+    if weIsFreshName(t.memObj, fresh) { return "" }
+    return "." + t.memProp + ","
+  }
+  weCellShape(tix, fresh, bound)
+}
+
+// `weTargetShape` for a target that is not a field.
+function weCellShape(ix: i32, fresh: string[], bound: string[]) {
+  const t = P.nodes[ix]
+  if t is Index {
+    if weIsFreshName(t.idxArr, fresh) { return "" }
+    return "["
+      + subscriptKeyTextOf(t.idxIndex)
+      + "]"
+      + weCellTag(t.idxArr)
+      + ","
+  }
+  weRebindShape(ix, bound)
+}
+
+function weRebindShape(ix: i32, bound: string[]) {
+  const t = P.nodes[ix]
+  if t is Ident {
+    if !nameIn(bound, t.identName) { return "=" + t.identName + "," }
+  }
+  ""
+}
+
+// The container a cell shape writes into, from the type recorded for the node at `ix`: `#a<T>` for
+// a list of `T`, `#m<V>` for a map of `V`, "" when unknown, so the shape then hits every cell.
+function weCellTag(ix: i32): string {
+  const t = nodeTyOf(ix)
+  if t < 0 {
+    weUnres = weUnres + 1
+    return ""
+  }
+  cellTagOfTy(t)
+}
+
+function cellTagOfTy(t0: i32): string {
+  const t = nonNullTy(t0)
+  if t < 0 { return "" }
+  const tt = T.tys[t]
+  if tt is TyArray { return "#a" + i32ToStr(tt.aElem) }
+  mapCellTagOfTy(t)
+}
+
+// `cellTagOfTy` for a receiver that is not a list: a map's tag, or "" for any other receiver (a
+// type variable, a union of containers), which may be either.
+function mapCellTagOfTy(t: i32): string {
+  const tt = T.tys[t]
+  if tt is TyMap { return "#m" + i32ToStr(tt.mVal) }
+  ""
+}
+
+function weIsFreshName(ix: i32, fresh: string[]): boolean {
+  const n = P.nodes[ix]
+  if n is Ident { return nameIn(fresh, n.identName) }
+  false
+}
+
+// The write shapes a call contributes: its declaration's with each `@i` replaced by what argument
+// `i` writes, a built-in method's own effect on a receiver it did not make, and those of every
+// function value it is handed that it may run. `params` and `bound` are the enclosing summary's;
+// both empty at a narrowing's own call site, where a function value from outside is opaque.
+function callWriteShapes(
+  cn: Call,
+  callIx: i32,
+  fresh: string[],
+  params: string[],
+  bound: string[],
+) {
+  const cf = P.nodes[cn.callFn]
+  if cf is Ident {
+    const pj = weParamIx(params, cf.identName)
+    if pj >= 0 { return "@" + i32ToStr(pj) + "," }
+  }
+  const d = callDeclFnIx(cn, callIx)
+  // A method spelled like a built-in of its receiver is that built-in.
+  let own = ""
+  if cf is Member {
+    if !weIsFreshName(cf.memObj, fresh) { own = builtinMethodShape(cn, cf) }
+  }
+  if d >= 0 {
+    const args = callArgPlaces(cn, callIx)
+    // A call back into a summary still being computed (a recursive edge) cannot say which slot
+    // it calls, so every function value it hands on is charged.
+    if weIsOpen(i32ToStr(d) + "#shape") {
+      const cyc = fnWriteShapes(d) + weCycleArgShapes(d, args, params, bound)
+      if cyc.indexOf("*") >= 0 { return "*" }
+      return own + cyc
+    }
+    const sub = weSubstArgs(fnWriteShapes(d), args, params, bound)
+    if sub == "*" { return "*" }
+    return own + sub
+  }
+  if d == -1 {
+    if cf is Member {
+      if nodeTyOf(cf.memObj) < 0 { weUnres = weUnres + 1 }
+    }
+    return "*"
+  }
+  if cf is Ident {
+    // A local the summary cannot see through, named like no built-in.
+    if nameIn(bound, cf.identName) { return "*" }
+  }
+  let acc = own
+  if cf is Member {
+    if !builtinMethodRunsArgs(cf.memProp) { return acc }
+  } else if cf is Ident {
+    if builtinRunsNoArg(cf.identName) { return acc }
+  }
+  let a = 0
+  while a < cn.callArgs.length {
+    const sub = weArgShapes(cn.callArgs[a], params, bound)
+    if sub == "*" { return "*" }
+    acc = acc + sub
+    a = a + 1
+  }
+  acc
+}
+
+// The index of `name` among the summary's parameters, or -1.
+function weParamIx(params: string[], name: string): i32 {
+  let i = 0
+  while i < params.length {
+    if params[i] == name { return i }
+    i = i + 1
+  }
+  -1
+}
+
+// `sum` with each `@i` replaced by the write shapes of the call's argument `i` in parameter order,
+// or "*" when one is opaque or missing.
+function weSubstArgs(
+  sum: string,
+  args: i32[],
+  params: string[],
+  bound: string[],
+) {
+  if sum == "*" { return "*" }
+  if sum.indexOf("@") < 0 { return sum }
+  const parts = weSplit(sum)
+  let acc = ""
+  let i = 0
+  while i < parts.length {
+    const w = parts[i]
+    if w[0] == '@' {
+      const j = weDigits(w.slice(1, w.length))
+      if j < 0 || j >= args.length { return "*" }
+      const sub = weArgShapes(args[j], params, bound)
+      if sub == "*" { return "*" }
+      acc = acc + sub
+    } else {
+      acc = acc + w + ","
+    }
+    i = i + 1
+  }
+  acc
+}
+
+// The write shapes of every argument in `args` handed to a parameter of `d` that may hold a
+// function, `"*"` when one is opaque. A slot whose declared type holds no function is skipped: a
+// function value reaches a call there only through a field or an element, which is opaque anyway.
+function weCycleArgShapes(
+  d: i32,
+  args: i32[],
+  params: string[],
+  bound: string[],
+): string {
+  const pts = weDeclParamTys(d)
+  let acc = ""
+  let i = 0
+  while i < args.length {
+    if weSlotMayHoldFn(pts, i) {
+      const sub = weArgShapes(args[i], params, bound)
+      if sub == "*" { return "*" }
+      acc = acc + sub
+    }
+    i = i + 1
+  }
+  acc
+}
+
+// Whether slot `i` of the declared parameter types `pts` may hold a function: its type is one, a
+// type variable, or not known.
+function weSlotMayHoldFn(pts: i32[], i: i32): boolean {
+  if i >= pts.length { return true }
+  const pt = pts[i]
+  pt < 0 || tyHasTyVar(pt) || crTyHasFn(pt)
+}
+
+// The declared parameter types of the function `d`, from the type its name is bound to; empty
+// when that binding is not `d`'s own.
+function weDeclParamTys(d: i32): i32[] {
+  const fd = P.nodes[d]
+  if fd is FuncDecl {
+    if fd.fnName != "" && lookupFnDeclNode(fd.fnName) == d {
+      const ft = lookup(fd.fnName)
+      if ft >= 0 {
+        const t = T.tys[ft]
+        if t is TyFunc { return t.fnParamTypes }
+      }
+    }
+  }
+  weNoTys
+}
+
+const weNoTys: i32[] = []
+
+// The non-negative integer spelled by the digits `t`, or -1.
+function weDigits(t: string): i32 {
+  if t.length == 0 { return -1 }
+  let v = 0
+  let i = 0
+  while i < t.length {
+    if t[i] < '0' || t[i] > '9' { return -1 }
+    v = v * 10 + (t[i] - '0')
+    i = i + 1
+  }
+  v
+}
+
+// A summary's own `@i` markers answered opaque: a function whose parameters no call site binds.
+function weClosed(sum: string): string {
+  if sum.indexOf("@") >= 0 { return "*" }
+  sum
+}
+
+// What a function value handed as an argument writes when called. Inside a summary, a function
+// written in place is part of the subtree walked already, and a parameter of the summary is `@i`;
+// a named function or a `const`-bound lambda is its declaration's; anything else is opaque.
+function weArgShapes(a: i32, params: string[], bound: string[]) {
+  if a < 0 || a >= P.nodes.length { return "" }
+  const an = P.nodes[a]
+  if an is FuncDecl {
+    if params.length > 0 || bound.length > 0 { return "" }
+    return weClosed(fnWriteShapes(a))
+  }
+  if an is Ident {
+    const pj = weParamIx(params, an.identName)
+    if pj >= 0 { return "@" + i32ToStr(pj) + "," }
+    const d = lookupFnDeclNode(an.identName)
+    if d >= 0 { return weClosed(fnWriteShapes(d)) }
+    const nd = findFnDeclInRoots(an.identName)
+    if nd >= 0 { return weClosed(fnWriteShapes(nd)) }
+    const fr = covarRootFrame(a)
+    if cwFramedNode(a) && fr != CW_FR_UNKNOWN {
+      const ld = cwLambdaDeclOf(an.identName, fr)
+      if ld >= 0 { return weClosed(fnWriteShapes(ld)) }
+    }
+    if nameIn(bound, an.identName) { return "*" }
+  }
+  if weNeverFn(a) { return "" }
+  if crArgMayBeFn(a) { return "*" }
+  ""
+}
+
+// Whether the expression at `a` can never evaluate to a function, by its form alone: a literal, a
+// record or list built in place, a test, or an operator other than `??` and assignment. Asked
+// where a callee body's types may not be recorded yet.
+function weNeverFn(a: i32): boolean {
+  const n = P.nodes[a]
+  if n is BinExpr { return n.binOp != "??" && n.binOp != "=" }
+  weNeverFnLeaf(a)
+}
+
+// `weNeverFn` for a node that is not an operator.
+function weNeverFnLeaf(a: i32): boolean {
+  const n = P.nodes[a]
+  if n is Paren { return weNeverFn(n.parInner) }
+  n is NumLit
+    || n is StrLit
+    || n is BoolLit
+    || n is NullLit
+    || n is CharLit
+    || n is Unary
+    || n is IsExpr
+    || n is ObjLit
+    || n is ArrayLit
+}
+
+// The shape a built-in method writes into its receiver, when the receiver's type has that
+// built-in (or is not known): a map's `delete` removes a cell, `pop`, `clear` and `set` store or
+// drop one, and `set` and `delete` with a literal key name it.
+function builtinMethodShape(cn: Call, cf: Member): string {
+  const p = cf.memProp
+  if builtinMethodEffect(p) != BME_CELLS { return "" }
+  const rt = nodeTyOf(cf.memObj)
+  if rt >= 0 && !builtinMethodOn(rt, p) { return "" }
+  let pre = ""
+  if p == "delete" { pre = "-" }
+  let lit = ""
+  if p == "set" && cn.callArgs.length == 2 {
+    lit = subscriptKeyTextOf(cn.callArgs[0])
+  }
+  if p == "delete" && cn.callArgs.length == 1 {
+    lit = subscriptKeyTextOf(cn.callArgs[0])
+  }
+  pre + "[" + lit + "]" + weCellTag(cf.memObj) + ","
+}
+
+// Whether a receiver of type `rt`, or its non-null part for an optional call, has the built-in
+// method `p` (`builtinMethodClaims`). Any other method is a `self`-function or a field.
+function builtinMethodOn(rt: i32, p: string): boolean {
+  if rt < 0 { return false }
+  builtinMethodClaims(nonNullTy(rt), p)
+}
+
+// Whether a built-in method may run a function it is handed: only `map` and `filter` take one.
+function builtinMethodRunsArgs(p: string): boolean {
+  p == "map" || p == "filter"
+}
+
+// Whether a built-in named by a bare identifier runs none of its arguments.
+function builtinRunsNoArg(nm: string): boolean {
+  nm == "print"
+    || nm == "Map"
+    || nm == "Set"
+    || nm == "fromCodePoint"
+    || nm == "fromCodePoints"
+}
+
+// The names a body binds only by a `const` holding an object, list or map it builds there.
+function weFreshNames(ix: i32, bound: string[], out: string[]) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const n = P.nodes[ix]
+  if n is LetDecl {
+    if (
+      n.letKw == "const"
+      && weInitIsFresh(n.letInit)
+      && weBoundOnce(bound, n.letName)
+    ) {
+      out.push(n.letName)
+    }
+  }
+  let cur = ix
+  while cur >= 0 {
+    const kids = nodeSpineChildren(cur)
+    let i = 0
+    while i < kids.length {
+      weFreshNames(kids[i], bound, out)
+      i = i + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  0
+}
+
+function weBoundOnce(bound: string[], name: string): boolean {
+  let c = 0
+  let i = 0
+  while i < bound.length {
+    if bound[i] == name { c = c + 1 }
+    i = i + 1
+  }
+  c == 1
+}
+
+// Whether the expression at `ix` builds a new object, list or map: a literal, or `Map()`/`Set()`.
+function weInitIsFresh(ix: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = P.nodes[ix]
+  if n is Call {
+    const cf = P.nodes[n.callFn]
+    if cf is Ident {
+      if cf.identName == "Map" || cf.identName == "Set" {
+        return lookup(cf.identName) < 0 && lookupFnDeclNode(cf.identName) < 0
+      }
+    }
+    return false
+  }
+  n is ObjLit || n is ArrayLit
+}
+
+// The steps of a place key below its root, in order: `.f` for a field, `[k]` for a subscript.
+function keySteps(key: string): string[] {
+  const out: string[] = []
+  let i = 0
+  while i < key.length && key[i] != '.' && key[i] != '[' { i = i + 1 }
+  while i < key.length {
+    let j = i + 1
+    if key[i] == '.' {
+      while j < key.length && key[j] != '.' && key[j] != '[' { j = j + 1 }
+      out.push(key.slice(i, j))
+    } else {
+      // a subscript's text is a digit run or a quoted literal
+      if j < key.length && key[j] == '"' {
+        j = j + 1
+        while j < key.length && key[j] != '"' {
+          if key[j] == '\\' { j = j + 1 }
+          j = j + 1
+        }
+      }
+      while j < key.length && key[j] != ']' { j = j + 1 }
+      j = j + 1
+      out.push(key.slice(i, j))
+    }
+    i = j
+  }
+  out
+}
+
+// Whether the write shape `w` may write the key step `st`, whose container's cell tag is `tag`
+// ("" for a field step, or when unknown). A cell shape and a step whose containers are both known
+// hit only when they are the same kind and one element type is assignable to the other.
+function shapeHitsStep(w: string, st: string, tag: string): boolean {
+  let s = w
+  if s.length > 0 && s[0] == '-' { s = s.slice(1, s.length) }
+  let wtag = ""
+  let h = s.length - 2
+  while h >= 0 && !(s[h] == ']' && s[h + 1] == '#') { h = h - 1 }
+  if h >= 0 {
+    wtag = s.slice(h + 1, s.length)
+    s = s.slice(0, h + 1)
+  }
+  if s != st && !(s == "[]" && st.length > 0 && st[0] == '[') { return false }
+  cellTagsMayAlias(wtag, tag)
+}
+
+function cellTagsMayAlias(a: string, b: string): boolean {
+  if a == "" || b == "" { return true }
+  if a[1] != b[1] { return false }
+  const ea = weDigits(a.slice(2, a.length))
+  const eb = weDigits(b.slice(2, b.length))
+  if ea < 0 || eb < 0 { return true }
+  assignable(ea, eb) || assignable(eb, ea)
+}
+
+// Whether a function with the write shapes `sum` may write the place keyed `key` through some
+// alias of an object on its path. A store into the key's own last step is harmless when the place
+// stores exactly the narrowed type: whatever it writes, the narrowing still holds.
+function shapesHitKey(sum: string, key: string): boolean {
+  if sum == "*" || sum.indexOf("@") >= 0 { return true }
+  if sum == "" { return false }
+  const steps = keySteps(key)
+  const tags = keyStepTags(key, steps)
+  const parts = weSplit(sum)
+  const root = placeRootOf(key)
+  let lastSafe = -1
+  let i = 0
+  while i < parts.length {
+    if parts[i][0] == '=' {
+      if parts[i].slice(1, parts[i].length) == root { return true }
+    }
+    let s = 0
+    while s < steps.length {
+      if shapeHitsStep(parts[i], steps[s], tags[s]) {
+        if s < steps.length - 1 || parts[i][0] == '-' { return true }
+        if lastSafe < 0 {
+          lastSafe = 0
+          if keyStoresNarrowedTy(key) { lastSafe = 1 }
+        }
+        if lastSafe == 0 { return true }
+      }
+      s = s + 1
+    }
+    i = i + 1
+  }
+  false
+}
+
+// Per step of `key`, the cell tag of the container a subscript step reads (`cellTagOfTy` of the
+// type its prefix holds, through the narrowings over it), "" for a field step or when unknown.
+function keyStepTags(key: string, steps: string[]): string[] {
+  const out: string[] = []
+  let rootLen = 0
+  while rootLen < key.length && key[rootLen] != '.' && key[rootLen] != '[' {
+    rootLen = rootLen + 1
+  }
+  let pre = key.slice(0, rootLen)
+  let t = lookup(pre)
+  let s = 0
+  while s < steps.length {
+    let tag = ""
+    if steps[s][0] == '[' && t >= 0 && !tyHasTyVar(t) { tag = cellTagOfTy(t) }
+    out.push(tag)
+    if t >= 0 {
+      pre = pre + steps[s]
+      const ov = narrowedPathTyRaw(pre)
+      if ov >= 0 {
+        t = ov
+      } else if steps[s][0] == '.' {
+        t = placeFieldTy(t, steps[s].slice(1, steps[s].length), false)
+      } else {
+        t = placeElemTy(t)
+      }
+    }
+    s = s + 1
+  }
+  out
+}
+
+// Whether the place keyed `key` stores exactly the type its live narrowing reads it at.
+function keyStoresNarrowedTy(key: string): boolean {
+  const slot = narrowedPathIx(key)
+  if slot < 0 { return false }
+  const nar = npTys[slot]
+  const st = keyStoreTy(key)
+  if nar < 0 || st < 0 { return false }
+  st == nar || tyToStr(st) == tyToStr(nar)
+}
+
+// The type a store into the place keyed `key` writes: the declared type of its last step, reached
+// through the narrowings in force over its prefixes; -1 when unresolvable.
+function keyStoreTy(key: string): i32 {
+  const steps = keySteps(key)
+  if steps.length == 0 { return -1 }
+  let rootLen = 0
+  while rootLen < key.length && key[rootLen] != '.' && key[rootLen] != '[' {
+    rootLen = rootLen + 1
+  }
+  let pre = key.slice(0, rootLen)
+  let t = lookup(pre)
+  let s = 0
+  while s < steps.length - 1 && t >= 0 {
+    pre = pre + steps[s]
+    const ov = narrowedPathTyRaw(pre)
+    if ov >= 0 {
+      t = ov
+    } else if steps[s][0] == '.' {
+      t = placeFieldTy(t, steps[s].slice(1, steps[s].length), false)
+    } else {
+      t = placeElemTy(t)
+    }
+    s = s + 1
+  }
+  if t < 0 { return -1 }
+  const last = steps[steps.length - 1]
+  if last[0] == '.' {
+    return placeFieldTy(t, last.slice(1, last.length), false)
+  }
+  placeCellStoreTy(t)
 }
 
 // The root name of a place key (`"o.a.v"` → `"o"`, `"xs[0].v"` → `"xs"`). Both separators, because
@@ -5673,7 +6275,7 @@ function placeRootOf(key: string) {
 // rest. It fails closed at every edge, and it is keyed on the syntactic argument, so aliases live.
 function callInvalidatesNarrowedPath(callIx: i32, key: string) {
   const cn = P.nodes[callIx]
-  if cn is Call { return callInvalidatesReal(cn, key) }
+  if cn is Call { return callInvalidatesReal(cn, callIx, key) }
   // An operator that may dispatch to a declaration is a call of it, its operands the arguments.
   const ds = opSiteDecls(callIx)
   if ds.length == 0 { return false }
@@ -5761,8 +6363,7 @@ let crOpCall: {[i32]: boolean} = Map()
 // value like `m[k] = v`. Deliberately not `cwMutatesList`'s whole set: `push` appends and `add`
 // inserts, neither of which can change what `xs[0]` or `m["a"]` holds.
 function cellRemovingMethod(p: string): boolean {
-  const k = collMethodKind(p)
-  k == CM_REMOVES_ONE || k == CM_REMOVES || p == "set"
+  builtinMethodEffect(p) == BME_CELLS
 }
 
 // The cell a `delete(<literal>)` or `set(<literal>, v)` names, as its key text, or "" when the call
@@ -5777,8 +6378,8 @@ function removedCellKeyText(cn: Call, prop: string): string {
   subscriptKeyTextOf(cn.callArgs[0])
 }
 
-function callInvalidatesReal(cn: Call, key: string) {
-  const declIx = callDeclFnIx(cn)
+function callInvalidatesReal(cn: Call, callIx: i32, key: string) {
+  const declIx = callDeclFnIx(cn, callIx)
   // A cell-removing collection method retires that cell's narrowings, and it has to be asked
   // first because it reaches neither leg below: an intrinsic answers `-2` on the next line, and
   // `callArgPlaces` puts a receiver in the argument list only for a UFCS call. The key argument
@@ -5800,20 +6401,30 @@ function callInvalidatesReal(cn: Call, key: string) {
       }
     }
   }
-  // An intrinsic writes no object field. The broad rule as filed does not make that distinction
-  // — "any call that receives the object" includes `print(o)` — so the switch bypasses this too,
-  // and the two measurements compare the filed rules rather than a hybrid.
-  if declIx == -2 && !ALIAS_RULE_BROAD { return false }
+  // An intrinsic writes only through its own effect on a receiver that may alias the path, and
+  // through the function values it is handed and may run.
+  if declIx == -2 && !ALIAS_RULE_BROAD {
+    return shapesHitKey(
+      callWriteShapes(cn, callIx, crNoNames, crNoNames, crNoNames),
+      key,
+    )
+  }
   // An opaque callee invalidates every live narrowing, not only the ones rooted at its arguments:
   // a closure that captured the object takes no argument, so an argument-keyed fallback would
   // fail open on exactly the construct that has no statically known body.
   if declIx < 0 { return true }
-  declWritesPath(declIx, callArgPlaces(cn), key)
+  declWritesPath(declIx, callArgPlaces(cn, callIx), key)
 }
 
 // Whether the declaration at `declIx`, handed the argument places `args` in parameter order,
 // may write the place keyed `key`: through a free variable, or through an argument.
 function declWritesPath(declIx: i32, args: i32[], key: string): boolean {
+  // The write shapes see every write the name-keyed legs below do — through an argument, a free
+  // variable, an alias — and each function value the callee runs is charged at its argument.
+  if !ALIAS_RULE_BROAD {
+    const sh = weSubstArgs(fnWriteShapes(declIx), args, crNoNames, crNoNames)
+    return shapesHitKey(sh, key)
+  }
   // Writes through a free variable, which likewise need no argument.
   const free = fnWriteFreePaths(declIx)
   if free == "*" { return true }
@@ -6349,6 +6960,83 @@ function crNoteCaptureRead(key: string) {
   0
 }
 
+// A read of a path whose captured narrowing `crPathCaptureLost` dropped, for the note a refusal
+// of that read gains: the function that dropped it, at the scope depth it is checked in.
+function crNoteLostRead(key: string, ix: i32) {
+  const slot = narrowedPathIx(key)
+  if slot < 0 || npInvBy[slot] >= 0 || !crPathCaptureLost(slot, key) {
+    return 0
+  }
+  crLostKeys.push(key)
+  crLostIxs.push(ix)
+  crLostFns.push(crFnIxs[crFnIxs.length - 1])
+  crLostDepths.push(crFnBases.length)
+  0
+}
+
+let crLostKeys: string[] = []
+let crLostIxs: i32[] = []
+let crLostFns: i32[] = []
+let crLostDepths: i32[] = []
+
+// The note a diagnostic at node `at` gains when it spans a read `crNoteLostRead` recorded.
+function crLostNote(msg: string, at: i32): string {
+  let i = crLostIxs.length - 1
+  while i >= 0 {
+    const k = crLostKeys[i]
+    if (
+      crSpans(at, crLostIxs[i])
+      && msg.indexOf("'" + k + "' is not narrowed") < 0
+    ) {
+      return " — '"
+        + k
+        + "' is not narrowed inside the function on line "
+        + i32ToStr(nodeLineOf(crLostFns[i]))
+        + ": it is returned, stored or handed on, so it may run after '"
+        + k
+        + "' is written through another reference to the object; re-test '"
+        + k
+        + "' inside it"
+    }
+    i = i - 1
+  }
+  ""
+}
+
+// Whether the path narrowing in overlay slot `slot` is lost to the nested function being checked:
+// the slot belongs to an enclosing function, and a function between the two escapes — it may run
+// after that function returns, when any holder of the object may have written the path (D2407).
+function crPathCaptureLost(slot: i32, key: string): boolean {
+  let lv = crFnNpBases.length - 1
+  while lv >= 0 && slot < crFnNpBases[lv] {
+    if crFnEscapesAt(lv, key) { return true }
+    lv = lv - 1
+  }
+  false
+}
+
+// Whether the function checked at level `lv` of `crFnIxs` may run other than by a call of its
+// handle in the body that makes it, or as a callback that runs inside the call it is handed to.
+function crFnEscapesAt(lv: i32, key: string): boolean {
+  const fnIx = crFnIxs[lv]
+  // A top-level function is its own root, and any code of the module may call it.
+  const isRoot = crFnRoots[lv] == fnIx
+  if isRoot { return true }
+  const h = crLambdaHandle(fnIx)
+  if h == "" { return !crCallbackKeeps(fnIx, key) }
+  let body = crProgRoot
+  if lv >= 1 {
+    const pf = P.nodes[crFnIxs[lv - 1]]
+    if pf is FuncDecl { body = pf.fnBody }
+  }
+  let esc = crEscNames[body] ?? ""
+  if esc == "" {
+    esc = crEscWalk(body, false, ",")
+    crEscNames[body] = esc
+  }
+  esc.indexOf("," + h + ",") >= 0
+}
+
 // A call that ends a path narrowing a nested function already read under is refused: that
 // function may run after the call, reading the old narrowing (D2402).
 function crCaptureCallCheck(slot: i32, callIx: i32) {
@@ -6529,6 +7217,10 @@ function crReset() {
   crCondDropBank = Map()
   crCapWidenBank = Map()
   crEscNames = Map()
+  crLostKeys = []
+  crLostIxs = []
+  crLostFns = []
+  crLostDepths = []
   crCapRecCount = Map()
   crCapRecDepths = []
   crCapRecHandles = []
@@ -6538,10 +7230,10 @@ function crReset() {
   crCondDropN = 0
   crwRoot = -2
   crInfoMemo = Map()
+  crAsgMemo = Map()
   crHandleMemo = Map()
   crOpOpaque = Map()
   crOpCall = Map()
-  crNoPlaceMemo = Map()
   0
 }
 
@@ -6581,6 +7273,15 @@ function crFnLeave() {
     crCapRecNames.pop()
     crCapRecTys.pop()
     crCapRecFns.pop()
+  }
+  while (
+    crLostDepths.length > 0
+    && crLostDepths[crLostDepths.length - 1] > crFnBases.length
+  ) {
+    crLostKeys.pop()
+    crLostIxs.pop()
+    crLostFns.pop()
+    crLostDepths.pop()
   }
   0
 }
@@ -6943,19 +7644,19 @@ function crCallNodeReaches(cn: Call, callIx: i32, name: string): boolean {
   const cname = calleeNameOf(callIx)
   if cname != "?" && hs.indexOf("," + cname + ",") >= 0 { return true }
   if P.nodes[cn.callFn] is FuncDecl { return true }
-  info == 2 && !crCallBenign(cn, name)
+  info == 2 && !crCallBenign(cn, callIx, name)
 }
 
 // A call that runs no user code and whose function-valued arguments, if any, are lambdas written
 // in place that call only such calls and do not write `name`. A callee named by a binding of the
 // root counts as user code even before that binding is in scope.
-function crCallBenign(cn: Call, name: string): boolean {
+function crCallBenign(cn: Call, callIx: i32, name: string): boolean {
   if crIsScalarRender(cn) { return true }
   const cf = P.nodes[cn.callFn]
   if cf is Ident {
     if crwBound.indexOf("," + cf.identName + ",") >= 0 { return false }
   }
-  if callDeclFnIx(cn) != -2 { return false }
+  if callDeclFnIx(cn, callIx) != -2 { return false }
   let i = 0
   while i < cn.callArgs.length {
     const a = cn.callArgs[i]
@@ -7017,7 +7718,7 @@ function crSubtreeBenign(ix: i32, name: string): boolean {
       }
     }
   } else if n is Call {
-    if !crCallBenign(n, name) { return false }
+    if !crCallBenign(n, ix, name) { return false }
   }
   let cur = ix
   while cur >= 0 {
@@ -7190,9 +7891,12 @@ function crCaptureWiden(fnIx: i32) {
       if wide >= 0 && wide != lookup(nm) {
         if inferQuiet && prior.indexOf("," + nm + ",") >= 0 {
           declare(nm, wide)
-        } else if crMayBeWritten(nm) && !crCallbackKeeps(fnIx, nm) {
+        } else if crCaptureMayGoStale(fnIx, nm) {
           if escapes < 0 { escapes = crLambdaEscapes(fnIx) }
-          if (
+          const fnWriter = crMayBeWritten(nm)
+          if escapes == 0 && !fnWriter {
+            // Only a direct write can change it, and one under this capture is refused.
+          } else if (
             escapes == 0
             && !crBodyMayWrite(fnIx, nm)
             && !crBodyTests(fnIx, nm)
@@ -7215,6 +7919,47 @@ function crCaptureWiden(fnIx: i32) {
   }
   0
 }
+
+// Whether the nested function `fnIx` may read a captured narrowing of `name` after it stopped
+// holding: some function may write the name, or the name is ever assigned and the nested function
+// escapes the body making it, so it may run after that assignment (D2462). A callback run inside
+// the call it is handed to cannot.
+function crCaptureMayGoStale(fnIx: i32, name: string): boolean {
+  if crCallbackKeeps(fnIx, name) { return false }
+  if crMayBeWritten(name) { return true }
+  if crLambdaEscapes(fnIx) == 0 { return false }
+  crNameAssigned(name)
+}
+
+// Whether `name` is the target of an assignment anywhere in the current root, or anywhere in the
+// program for a module binding.
+function crNameAssigned(name: string): boolean {
+  if crNameAssignedInRoot(name) { return true }
+  if !crNameIsGlobal(name) { return false }
+  crFnRoots.push(crProgRoot)
+  const r = crNameAssignedInRoot(name)
+  crFnRoots.pop()
+  r
+}
+
+function crNameAssignedInRoot(name: string): boolean {
+  const key = i32ToStr(crCurRoot()) + "#" + name
+  const hit = crAsgMemo[key]
+  if hit is boolean { return hit }
+  crwEnsure(crCurRoot())
+  let found = false
+  let u = 0
+  while u < crwUseNames.length && !found {
+    if crwUseKinds[u] == 2 && crwUseNames[u] == name { found = true }
+    u = u + 1
+  }
+  crAsgMemo[key] = found
+  found
+}
+
+// `crNameAssignedInRoot` per `"<root>#<name>"`: asked once per capture, it would otherwise
+// rebuild the writer analysis each time the question moves between a function and the module.
+let crAsgMemo: {[string]: boolean} = Map()
 
 // The name a nested function is only ever called by: its own, or the one binding it; "".
 function crLambdaHandle(fnIx: i32): string {
@@ -7410,7 +8155,7 @@ function crCallbackKeeps(fnIx: i32, key: string): boolean {
   if c < 0 || c >= P.nodes.length { return false }
   const cn = P.nodes[c]
   if cn is Call {
-    const d = callDeclFnIx(cn)
+    const d = callDeclFnIx(cn, c)
     const cf = P.nodes[cn.callFn]
     if cf is Member {
       if (cf.memProp == "map" || cf.memProp == "filter") && d == -2 {
@@ -7418,7 +8163,7 @@ function crCallbackKeeps(fnIx: i32, key: string): boolean {
       }
     }
     if d < 0 { return false }
-    const args = callArgPlaces(cn)
+    const args = callArgPlaces(cn, c)
     let at = -1
     let i = 0
     while i < args.length {
@@ -7448,13 +8193,84 @@ function crParamOnlyCalled(d: i32, pi: i32): boolean {
         b = b + 1
       }
       if n != 1 { return false }
-      let esc = crEscNames[fd.fnBody] ?? ""
-      if esc == "" {
-        esc = crEscWalk(fd.fnBody, false, ",")
-        crEscNames[fd.fnBody] = esc
-      }
-      return esc.indexOf("," + p.parName + ",") < 0
+      if crPocOpen.length > 16 { return false }
+      crPocOpen.push(d * 64 + pi)
+      const ok = crParamUsesOnlyCall(fd.fnBody, p.parName)
+      crPocOpen.pop()
+      return ok
     }
+  }
+  false
+}
+
+// The `crParamOnlyCalled` questions open higher in the recursion, `decl * 64 + param`; one met
+// again is answered yes, the least fixpoint of a forwarding cycle that stores nothing.
+const crPocOpen: i32[] = []
+
+// Whether every use of the parameter `pname` in the subtree calls it, or hands it straight to a
+// declared function whose own parameter there is only ever called — never stores, returns or
+// captures it (D2461 review, the `s1` refusal).
+function crParamUsesOnlyCall(ix: i32, pname: string): boolean {
+  if ix < 0 || ix >= P.nodes.length { return true }
+  const n = P.nodes[ix]
+  if n is Ident { return n.identName != pname }
+  if n is FuncDecl { return !crSubtreeMentions(n.fnBody, pname) }
+  if n is Call {
+    const cf = P.nodes[n.callFn]
+    let calleeOk = false
+    if cf is Ident { calleeOk = cf.identName == pname }
+    if !calleeOk && !crParamUsesOnlyCall(n.callFn, pname) { return false }
+    const d = callDeclFnIx(n, ix)
+    const places = callArgPlaces(n, ix)
+    const off = places.length - n.callArgs.length
+    let a = 0
+    while a < n.callArgs.length {
+      const an = n.callArgs[a]
+      if crIsIdentNamed(an, pname) {
+        if d < 0 || !crParamOnlyCalledOpen(d, a + off) { return false }
+      } else if !crParamUsesOnlyCall(an, pname) {
+        return false
+      }
+      a = a + 1
+    }
+    return true
+  }
+  let cur = ix
+  while cur >= 0 {
+    const kids = nodeSpineChildren(cur)
+    let k = 0
+    while k < kids.length {
+      if !crParamUsesOnlyCall(kids[k], pname) { return false }
+      k = k + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  true
+}
+
+function crParamOnlyCalledOpen(d: i32, pi: i32): boolean {
+  let i = 0
+  while i < crPocOpen.length {
+    if crPocOpen[i] == d * 64 + pi { return true }
+    i = i + 1
+  }
+  crParamOnlyCalled(d, pi)
+}
+
+// Whether any identifier in the subtree is named `name`.
+function crSubtreeMentions(ix: i32, name: string): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = P.nodes[ix]
+  if n is Ident { return n.identName == name }
+  let cur = ix
+  while cur >= 0 {
+    const kids = nodeSpineChildren(cur)
+    let k = 0
+    while k < kids.length {
+      if crSubtreeMentions(kids[k], name) { return true }
+      k = k + 1
+    }
+    cur = elseIfLink(cur)
   }
   false
 }
@@ -10101,6 +10917,10 @@ function tErrPush(
       msg = msg0 + note
       if code == "" { code = CODE_NARROWING_ENDED_BY_CALL }
     }
+  }
+  if crLostIxs.length > 0 {
+    const lnote = crLostNote(msg, at)
+    if lnote != "" { msg = msg + lnote }
   }
   // An exact repeat (same message, same anchor) is noise, not information — two passes can resolve
   // the same annotation, the pass-1.5 hoist and the real pass both reporting a generic-alias arity
@@ -19036,6 +19856,21 @@ function collIsListSpelling(p: string): boolean {
     || p == "includes"
     || p == "indexOf"
     || p == "join"
+}
+
+// What a built-in method does to the cells its receiver holds before the call — the effect
+// column every write question reads, the narrowing summaries and the getter effects alike. NONE
+// reads or builds; APPENDS adds a cell and leaves every held one untouched; CELLS may replace or
+// remove one.
+const BME_NONE = 0
+const BME_APPENDS = 1
+const BME_CELLS = 2
+function builtinMethodEffect(p: string): i32 {
+  if p == "push" || p == "add" { return BME_APPENDS }
+  if p == "pop" || p == "clear" || p == "set" || p == "delete" {
+    return BME_CELLS
+  }
+  BME_NONE
 }
 
 // What a built-in collection method does to its receiver's element slots — the one table every
@@ -47524,16 +48359,7 @@ function gcBuiltinMethod(r: i32, cf: Member, ix: i32): i32 {
 }
 
 function esMethodMutates(m: string): boolean {
-  m == "push"
-    || m == "pop"
-    || m == "clear"
-    || m == "set"
-    || m == "delete"
-    || m == "add"
-    || m == "sort"
-    || m == "reverse"
-    || m == "insert"
-    || m == "remove"
+  builtinMethodEffect(m) != BME_NONE
 }
 
 function esMethodBuilds(m: string): boolean {
@@ -48288,6 +49114,7 @@ function checkMemberNode(n: Member, ix: i32) {
       crNoteCaptureRead(mKey)
       return symMem(ix, mOv)
     }
+    crNoteLostRead(mKey, ix)
     const mInv = narrowedPathInvBy(mKey)
     if mInv >= 0 && !pathReadsDeclared(mKey, mInv, ix) {
       return pathInvalidatedErr(mKey, mInv, ix)
@@ -48451,6 +49278,7 @@ function checkIndexNode(n: Index, ix: i32) {
       crNoteCaptureRead(xKey)
       return xOv
     }
+    crNoteLostRead(xKey, ix)
     const xInv = narrowedPathInvBy(xKey)
     if xInv >= 0 && !pathReadsDeclared(xKey, xInv, ix) {
       return pathInvalidatedErr(xKey, xInv, ix)
@@ -49371,6 +50199,7 @@ function checkOptMemberNode(n: OptMember, ix: i32) {
       crNoteCaptureRead(omKey)
       return symMem(ix, omOv)
     }
+    crNoteLostRead(omKey, ix)
     const omInv = narrowedPathInvBy(omKey)
     if omInv >= 0 && !pathReadsDeclared(omKey, omInv, ix) {
       omGuardSet(-1, -1)

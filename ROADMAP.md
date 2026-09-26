@@ -1972,10 +1972,18 @@ in-language GC knobs.
   already admits (`k` sets `v` to a boolean only when `v` is already a boolean), which needs the
   per-path `W` of A6b's chain. The six forms the D2390 survey filed are closed (D2400–D2405; the
   operator, module-global, closure-capture, loop, condition and path-re-test forms, all through
-  `callMayWrite`). Still open: a path narrowing captured by a closure that outlives the guard
-  ([D2407](docs/internals/inventory/D2407.md), needs a ruling: do path narrowings reach nested
-  functions at all?), and a bare-name re-test inside the arm of a condition whose call ended the
-  narrowing ([D2408](docs/internals/inventory/D2408.md), clause 2). **Open question (floated by the owner, not decided):**
+  `callMayWrite`). **Escaping closures, RULED (a) 2026-09-25:** a closure that escapes (returned,
+  stored in a field/list/map/global, assigned to another binding, or handed to a callee not known
+  to only call it) loses every captured path narrowing, and every captured bare-name narrowing of
+  a name assigned anywhere; one used locally by name keeps it under D2402's per-call check
+  ([D2407](docs/internals/inventory/D2407.md), D2462, closed). The owner's ideal, deferred with the
+  flow analysis above: keep the narrowing when no write of the path can run before the closure
+  does ("if we know `o.v = null` doesn't happen then it's fine"). Path writers are found by write
+  SHAPE (`fnWriteShapes`: field stored, cell stored, map cell removed, free name rebound), so
+  aliases, arguments, receivers, built-in mutators and the function values a callee runs all
+  count, each callback charged at its own call site (D2461, D2471, D2472, D2473, closed). Still open: a bare-name re-test
+  inside the arm of a condition whose call ended the narrowing
+  ([D2408](docs/internals/inventory/D2408.md), clause 2). **Open question (floated by the owner, not decided):**
   ban side effects in operator overloads, or let one modify only its left/right operands — an
   "overload-eligible" derived predicate beside getter-eligible (effects doc §C1b). Under the second
   reading an operator site needs only D2400's operand-path invalidation and can never run a
