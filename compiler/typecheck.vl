@@ -1012,6 +1012,9 @@ let cnhAts: i32[] = []
 let cnhNames: string[] = []
 let cnhIsVal: boolean[] = []
 let cnhDemand: boolean[] = []
+// Pairs of open null holes, one written into the other, that fill together (`nhFillLinked`).
+let nhLinkA: i32[] = []
+let nhLinkB: i32[] = []
 
 // D1589 — a `??` typed against an open hole is a promise, not an answer: `x ?? d` read before
 // the fill takes `nonNullTy` of a `nInner == -1` nullable, which is the hole itself. These
@@ -1526,15 +1529,49 @@ function cnhIsOpen(ty: i32): boolean {
 function cnhFill(slot: i32, vt: i32) {
   if vt < 0 || vt == TY_ERR || vt == TY_VOID { return 0 }
   if !cnhIsOpen(slot) { return 0 }
+  if nhOpen(vt) { return nhLink(slot, vt) }
   let inner = vt
   const v = T.tys[vt]
   if v is TyNullable { inner = v.nInner }
   if inner < 0 || isNullTy(inner) { return 0 }
-  const h = T.tys[slot]
-  if h is TyNullable {
-    h.nInner = widenLitTy(inner)
-    tyMutEpoch = tyMutEpoch + 1 // a container null hole filled in place
-    fillCoalHoleNodes(slot)
+  nhFillLinked(slot, widenLitTy(inner))
+}
+
+// Whether `ty` is an open null hole: a `_ | null` (a `let x = null` binding's, or a container
+// slot's) that no write has filled yet.
+function nhOpen(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  const t = T.tys[ty]
+  if t is TyNullable { return t.nInner < 0 }
+  false
+}
+
+// Link two open null holes, one written into the other, so that one fill fills both and a
+// later write that disagrees is refused at the type the first fill chose (D2506).
+function nhLink(a: i32, b: i32) {
+  if a == b || !nhOpen(a) || !nhOpen(b) { return 0 }
+  nhLinkA.push(a)
+  nhLinkB.push(b)
+  0
+}
+
+// Fill the open null hole `h` with `inner` in place, and every hole linked to it. A hole already
+// filled stops the walk, which is what bounds it.
+function nhFillLinked(h: i32, inner: i32) {
+  const t = T.tys[h]
+  if t is TyNullable {
+    if t.nInner >= 0 { return 0 }
+    t.nInner = inner
+    tyMutEpoch = tyMutEpoch + 1 // a null hole filled in place
+    fillCoalHoleNodes(h)
+  } else {
+    return 0
+  }
+  let i = 0
+  while i < nhLinkA.length {
+    if nhLinkA[i] == h { nhFillLinked(nhLinkB[i], inner) }
+    if nhLinkB[i] == h { nhFillLinked(nhLinkA[i], inner) }
+    i = i + 1
   }
   0
 }
@@ -4274,6 +4311,8 @@ export function initChecker() {
   cnhNames = []
   cnhIsVal = []
   cnhDemand = []
+  nhLinkA = []
+  nhLinkB = []
   chPendNodes = []
   chPendTys = []
   chPendGiven = []
@@ -40210,6 +40249,19 @@ export function nominalStructNameOfTy(ty: i32): string {
   ""
 }
 
+// The `(S|null)[]` spelling of list type `ty` whose element is a nullable record a declared
+// struct `S` matches, or "": the nominal row the ref-list layer interned that list under (D2506).
+export function nulRecListNominalName(ty: i32): string {
+  const ae = tyArrayElemIx(ty)
+  if ae < 0 { return "" }
+  const el = T.tys[ae]
+  if el is TyNullable {
+    const nom = nominalStructNameOfTy(el.nInner)
+    if nom != "" { return "(" + nom + "|null)[]" }
+  }
+  ""
+}
+
 // The declared type name whose shape structurally equals object type `obj`, found by
 // scanning the program's `TypeDecl`s (`cUserTypes` is a `Map` the compiler subset cannot
 // iterate). Structural equality is bidirectional assignability, so a 1-field `{meow}` does
@@ -46003,11 +46055,9 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
         if asgCt is TyNullable {
           if rhsNonNull {
             if asgCt.nInner < 0 {
-              asgCt.nInner = widenLitTy(rt)
-              tyMutEpoch = tyMutEpoch + 1 // nullable inner pinned in place
-              // D1589 — a read typed before the fill banked the hole itself: re-derive
-              // every such `??` here, the moment its non-null part exists.
-              fillCoalHoleNodes(asgCur)
+              // D1589 — a read typed before the fill banked the hole itself: the fill
+              // re-derives every such `??`, the moment its non-null part exists.
+              nhFillLinked(asgCur, widenLitTy(rt))
             }
             // Bank the declared type before shadowing it — the narrowing itself is unchanged,
             // which is what the `let x: T | null = null` / `x = mk()` / `x.f` pattern rides.
@@ -46017,9 +46067,9 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
             // A nullable write fills the hole from its non-null part and narrows nothing: the
             // value may still be null, and an unfilled hole would type the binding `null` (D2597).
             if rtT.nInner >= 0 {
-              asgCt.nInner = widenLitTy(rtT.nInner)
-              tyMutEpoch = tyMutEpoch + 1
-              fillCoalHoleNodes(asgCur)
+              nhFillLinked(asgCur, widenLitTy(rtT.nInner))
+            } else {
+              nhLink(asgCur, rt)
             }
           }
         }
