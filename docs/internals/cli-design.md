@@ -734,6 +734,11 @@ one cell (pinned in `tests/vl_extern_global_test.ts`). The facade is the recipe 
 `extern … from "module"` clause (`DECISIONS.md` §"Globals cross the wasm boundary"). Add the
 memory provider from the recipe above as one more input when the units use `--import-memory`.
 
+When the global only needs a value, not another unit's cell — a test of functions that never
+read it, say — `vl run p.vl --extern CTXB=0` defines it in the host (D2636). Without an
+`--extern` for every declared extern global `vl run` refuses, naming the flag; refusing only a
+global the program reads is ROADMAP `C-extern-read`.
+
 #### The output channel is RULED: a file by default, stdout only when asked
 
 `vl build main.vl` writes `main.wasm` beside the source and prints nothing to stdout.
