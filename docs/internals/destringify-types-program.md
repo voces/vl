@@ -28255,7 +28255,7 @@ one file.
 * **S13 (the scope unwind) is observable across SIBLING scopes.** A narrowed `v` in one function and
   a non-nullable `v` in the next: without the unwind the bank leaks, the second guard is silently
   accepted, and the file compiles clean and dies in the emitter → folded into
-  `null-guard-on-non-nullable-rejects.vl`, which now pins two decisions.
+  `null-guard-on-non-nullable-warns.vl`, which now pins two decisions.
 * **S12 (the bank's idempotence guard) is defensive and cannot currently fire**, and the reason is
   recorded at the site rather than left as a zero: its only caller runs under `asgCt is TyNullable`,
   which the narrowing itself falsifies, and the one path that re-enters would re-bank an identical

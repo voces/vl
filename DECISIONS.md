@@ -7974,11 +7974,71 @@ the path can run before the closure does. That is flow analysis over every holde
 the same machinery as A6c's, and is deferred with it; the loss is the sound floor it would
 refine.
 
+**A WRITE UNDER A NARROWING IS CHECKED AGAINST THE DECLARATION AND RE-NARROWS (owner ruling,
+2026-09-26 — D2604, D2609, D2610, D2612).** Inside a narrowed block, any write the binding's
+DECLARED type admits is allowed, and the write re-narrows the place to the written value's type
+for the rest of the flow. This follows TypeScript and Kotlin. `if x is string { x = 5; x + 1 }`
+over `x: i32 | string` runs and `x.length` after the write is refused; `if y == null { return }`
+then `y = null` over `y: A | null` is accepted and `y == null` reads `true`. It holds for every
+narrowing form (`is`, `!= null`, `== null` with an early return, an `||` guard, a `while` guard's
+`break`), for a module binding, and for a field, list cell or map cell, and in both faces.
+
+* *Where the value lands.* A value lands on the member of the declaration it IS before one it
+  merely widens to: `5` into `i32 | f64` narrowed to `f64` re-narrows to `i32` and is stored as
+  the `i32` member, because that is the representation the emitter writes. A union-typed value
+  lands on one member only when each of its members does; otherwise the place reads its
+  declaration, unless the narrowing it had already admits every member, which it then keeps.
+  A `null` write reads the declaration after it.
+* *After an `if`.* The place holds what either path left, and a numeric member is never absorbed
+  by one it widens to: a one-branch `x = 1.5` under `x is i32` leaves `i32 | f64`, not `f64`
+  (D2627). A value of such a union is refused where only its widest member is expected (`f64`),
+  because no delivery converts the box yet (D2611, open); `is` re-tests it.
+* *A null test after a write.* After a write under a guard the storage may hold `null` again,
+  so the test is a real question for the rest of that scope, as after an assignment's
+  narrowing. Where the value is proved non-null the test is dead, which the next section rules
+  a warning.
+* *In a loop.* A write in a loop that may leave a narrowing made outside the loop ends that
+  narrowing before the loop starts, in both halves, as a call that may write it does (the
+  "before a loop" rule above), since the reads above the write run again after it. The loop
+  decides this from the value's type as the loop begins: a literal, a name, an object literal
+  naming one member's fields, or a call of a function with a declared return type. A value whose
+  type needs the loop (a local declared inside it, an expression) must still land within the
+  narrowing the loop began with, or the write is refused with the barrier's sentence.
+* *Under a closure.* A closure made under the narrowing and called by its handle keeps it, and a
+  call of it after a write that left the narrowing is refused (the D2402 per-call check, which
+  now also answers a direct write, where before the write itself was refused whenever any
+  function body had been checked since the narrowing began). A closure that escapes reads a
+  binding assigned anywhere at its declared type (D2407).
+
+**THE PRICE.** A re-narrowed place meets the existing refusal of an `is` test that can never
+match: `if x is i32 { x = "s"; print(x is i32) }` over `i32 | string | null` printed `false` on
+master and is refused now, since `x` is a `string` there. 58 of the 4,600 cells of the
+narrowed-write grid (`scripts/capability-probes/narrowed-write-grid.py`) are that shape, all at
+the test of the member the write left. #3184's review grid (2,373 cells) moves 22 cells from
+running to refused, all one shape: a one-branch write of a widening member whose condition was
+false on the run, read where the other member is expected, e.g. `if x is f64 { if c0() { x = 5 };
+useF64(x) }`. The same program with the condition true trapped on master; it is refused now as
+D2611's union-to-`f64` delivery. No other cell that ran on master changed.
+
+**A NULL TEST OF A VALUE PROVED NON-NULL IS A WARNING (owner ruling, 2026-09-26, option (a) of
+open-rulings §dead-null-test).** `x == null` or `x != null` over a value whose type admits no
+`null` (by its declaration, a narrowing or a write) compiles, with the warning "`x == null` is
+always false here (x is A | B)" (lint code `dead-null-test`, the channel `recordDeadCoalesce`
+already uses for a dead `??` default), and the emitter lowers it to its constant: the operand
+runs for its effects unless it is a bare name, and is never read as nullable. This follows
+TypeScript's split. An impossible `match` arm, `is` member or literal comparison stays an
+ERROR (D2198 stands): those name a member the type does not have, where a null test only
+asks a question whose answer is already known. "No member admits `null`" is decided by
+`assignable(null, T)` as well as the member walk, so a recursive alias that hides a `null`
+arm (`Json`) keeps its real test. The ruling lets the assignment narrowing take its path twin
+(D1848): `o.v = 5` over `o.v: i32 | null` strips `null` for the code after it, and the three
+fixtures that null-test a binding read out of such a field run with the warning.
+
 **AN ASSIGNMENT'S NARROWING REACHES A BODY ONLY WHERE NO `null` CAN FOLLOW (D2529).** A guard's
-narrowing refuses every write under it that it does not admit, which is what lets D2402 keep it
-in a closure called by its handle. An assignment's narrowing (`x = 1` over `i32 | null`, which
-removes only `null`) and a post-guard one refuse nothing, so a function body reads the binding at
-its declared type when a write that may store `null` can run before the body does:
+narrowing reaches a closure called by its handle through D2402's per-call check. An assignment's
+narrowing (`x = 1` over `i32 | null`, which removes only `null`) and a post-guard one reach a
+function body only where no write can falsify them first, so a function body reads the binding
+at its declared type when a write that may store `null` can run before the body does:
 
 * a module `let` read by a top-level function or a module-level closure, when any assignment in
   the program may store `null`; and, for a top-level function, which may be called before its
