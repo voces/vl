@@ -8174,7 +8174,8 @@ per instance before this ruling (D1063), and `print(x.tag())` reads either value
 
 **A map or set method name leaves an un-annotated parameter open when a `self`-function of
 that name is in scope (D2518)**, instead of demanding a map the function's own receiver may not
-be. `map`/`filter` still demand a list: the pin cannot state a callback's parameter.
+be. `map`/`filter` still demand a list: the pin cannot state a callback's parameter, and a site
+the emitter cannot re-dispatch per instance (below) keeps the demand, so its built-in runs.
 
 **Only a call on the generic's own parameter is re-dispatched.** A call through a local bound
 from it, or from inside a closure, is refused at an instance whose built-in or field would take
