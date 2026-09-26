@@ -3005,6 +3005,10 @@ let inferLetNulStrIx: i32[] = []
 // `const x = if c { true } else { null }` by LetDecl node index, so the emitter classifies the
 // slot as the niche i32 rep and reuses the annotated lowering.
 let inferLetNulBoolIx: i32[] = []
+// The struct-bearing union types an inline join (a `??` or a value `if`) produced, in order and
+// once each: no declaration spells them, so without a row here an arm has no tag in any box.
+let inferJoinTys: i32[] = []
+let inferJoinTySet: boolean[] = []
 let bodyChecked: {[string]: boolean} = Map()
 // Typed-IR foundation: node index → resolved type-arena index, recorded for every node on the
 // real (non-quiet) check pass so the emitter consumes the checker's computed type instead of
@@ -3960,6 +3964,8 @@ export function initChecker() {
   inferLetTy = []
   inferLetNulStrIx = []
   inferLetNulBoolIx = []
+  inferJoinTys = []
+  inferJoinTySet = []
   bodyChecked = Map()
   nodeTyIx = []
   intMatchHead = Map()
@@ -37966,6 +37972,7 @@ function checkNodeDone(ix: i32, t: i32, savedTail: boolean) {
       const wt = widenLitTy(t)
       if ix < nodeTyIx.length { nodeTyIx[ix] = wt }
       if wt != t { noteWideLitNode(ix, t) }
+      noteInferJoin(ix, wt)
     }
     if v128Seen { v128NestCheck(ix, t) }
     noteNestCstr(t, ix)
@@ -38707,30 +38714,37 @@ function tyIsValueUnion(er: i32) {
   ok
 }
 
-// Whether `er` is a MIXED union — at least two members, at least one struct/variant and at
-// least one non-struct. `valueUnionRetName` renders "" for it (a struct is not a value ATOM)
-// and it still reps as the value box, so a binding inferring one needs its row minted from
-// this side rather than from a name nothing spells (D1709).
-export function tyIsMixedUnion(er: i32) {
+// Whether `er` is a union of two or more members at least one of which is a struct, counting a
+// join of declared records only. `valueUnionRetName` renders "" for every such union and each
+// reps as the box, so a binding or join inferring one needs its row minted from this side
+// rather than from a name nothing spells (D2373).
+export function tyIsStructBearingUnion(er: i32) {
   if er < 0 { return false }
   const t = T.tys[er]
   // A nullable union is a union too: `string | A | null` interns as `TyNullable` over its
   // non-null members, and the niche holds exactly one non-null member, so two or more is the
   // same box with `null` as a member tag (D1721).
-  if t is TyNullable { return tyIsMixedUnion(t.nInner) }
+  if t is TyNullable { return tyIsStructBearingUnion(t.nInner) }
   if !(t is TyUnion) { return false }
   const ms = t.uMembers
   if ms.length < 2 { return false }
   let nObj = 0
+  let nDecl = 0
   let i = 0
   while i < ms.length {
+    // A statement `if` whose one arm yields a record joins it with `void`, which is no value.
+    if ms[i] == TY_VOID { return false }
     if ms[i] >= 0 {
       const m = T.tys[ms[i]]
       if m is TyObj { nObj = nObj + 1 }
+      if cTyIxSetHas(cStructTyIxSet, ms[i]) { nDecl = nDecl + 1 }
     }
     i = i + 1
   }
-  nObj > 0 && nObj < ms.length
+  // An all-struct join counts only over DECLARED records: two anonymous shapes merge into one
+  // row instead (D672), which a union row minted here would contradict.
+  if nObj == ms.length { return nDecl == nObj }
+  nObj > 0
 }
 
 // The emitter-format union name (`i32|string`, `i32|null`) for an inferred return type `er`
@@ -40647,6 +40661,23 @@ export function inferLetNameOf(letIx: i32) {
   ""
 }
 export function inferLetCount() { inferLetIx.length }
+
+// Records the type of join node `ix` when it is a struct-bearing union, and registers its struct
+// members as arms, as the binding route does (D2373). Only a `??` or an `if` joins two types.
+function noteInferJoin(ix: i32, t: i32) {
+  if t < 0 { return 0 }
+  const n = P.nodes[ix]
+  let isJoin = n is IfStmt
+  if n is BinExpr { isJoin = n.binOp == "??" }
+  if !isJoin { return 0 }
+  if cTyIxSetHas(inferJoinTySet, t) { return 0 }
+  if !tyIsStructBearingUnion(t) { return 0 }
+  if tyHasHole(t) { return 0 }
+  inferRegisterVariantMembers(t)
+  cTyIxSetAdd(inferJoinTys, inferJoinTySet, t)
+}
+export function inferJoinCount() { inferJoinTys.length }
+export function inferJoinTyAt(i: i32) { inferJoinTys[i] }
 export function inferLetIxAt(i: i32) { inferLetIx[i] }
 // D970 — does this body return two different concrete types? The A20 gate uses it to tell a
 // join over the function's own literals (which every instantiation shares) from a per-call-site
@@ -45423,7 +45454,7 @@ function checkLetDeclNode(n: LetDecl, ix: i32) {
       if lvn != "" {
         inferLetIx.push(ix)
         inferLetTy.push(lvn)
-      } else if tyIsMixedUnion(bound) {
+      } else if tyIsStructBearingUnion(bound) {
         // A MIXED union renders "" above — a struct member is not a value ATOM — and still reps
         // as the box, so its row is minted from the arena type instead of from a name. Its
         // struct members register as ARMS here, the one place the join is named (D1746).
