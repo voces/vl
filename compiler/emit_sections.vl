@@ -116,6 +116,7 @@ import {
   externRetIsVoid,
   i32ToStr,
   isDefaultGlobalRef,
+  nodeChildren,
   nodeToks,
   tsMentionsAnyName,
 } from "./ast"
@@ -153,6 +154,7 @@ import {
 } from "./emit_query"
 import {
   ByteRope,
+  INIT_REACH_NEVER,
   VKind,
   W,
   aTypeIdx,
@@ -230,6 +232,7 @@ import {
   fnListEqGSlots,
   fnListEqRSlots,
   fnMemAddrFoldCount,
+  fnParent,
   fnRefPushSlots,
   fnStmts,
   fnUsesArrNew,
@@ -278,6 +281,7 @@ import {
   gHeapLimit,
   gHeapUsed,
   gHelpF64Rem,
+  gHelpInitFail,
   gHelpMapCompact,
   gHelpMapProbe,
   gHelpMapProbeI32,
@@ -294,6 +298,15 @@ import {
   gHelpUtf8Enc,
   gImportMemory,
   gImports,
+  gInitAny,
+  gInitFnReach,
+  gInitGIdx,
+  gInitGLocs,
+  gInitGNames,
+  gInitGuard,
+  gInitProgIdx,
+  gInitReaders,
+  gInitStartOrd,
   gMapDeletes,
   gMemLogIdx,
   gNeedsF32Print,
@@ -460,6 +473,7 @@ import {
   fbEnd,
   fbF32Const,
   fbF64Const,
+  fbGlobalSet,
   fbI32Bin,
   fbI32Const,
   fbI32Eqz,
@@ -1974,6 +1988,7 @@ function emitStartFnCode(out: u8[]) {
       // ANCHOR any emit failure raised below at the top-level node being lowered (see
       // `emitCurStmtIx`) — the start function has no declaration of its own to name.
       emitCurStmtIx = globalStmts[gi]
+      gInitStartOrd = globalStmtOrd[gi]
       const gSpanAt = bodyExpr.length
       if globalRunsInStartFn(gi) {
         const g = P.nodes[globalStmts[gi]]
@@ -2190,6 +2205,12 @@ function emitStartFnCode(out: u8[]) {
           wTarget(setPrev)
         }
       }
+      // A guarded global's initializer has run (a folded one, at its declaration): advance the
+      // progress cell past it.
+      if gi < gInitGuard.length && gInitGuard[gi] >= 1 && gInitProgIdx >= 0 {
+        fbI32Const(gi + 1)
+        fbGlobalSet(gInitProgIdx)
+      }
       // The row the D1594 diagnostic reads: this initializer's own byte range, so an
       // offset inside it names the `const`/`let` rather than the whole start function.
       // A global whose init did not run here contributes no bytes and no row.
@@ -2199,6 +2220,7 @@ function emitStartFnCode(out: u8[]) {
       gi = gi + 1
     } else {
       emitCurStmtIx = startStmts[si]
+      gInitStartOrd = startStmtOrd[si]
       preStmtNarrow(startStmts[si])
       const sSpanAt = bodyExpr.length
       if emitStmt(bodyExpr, startStmts[si], -1) < 0 {
@@ -2213,6 +2235,7 @@ function emitStartFnCode(out: u8[]) {
     }
   }
   scopePop()
+  gInitStartOrd = -1
   // The cursor is armed for exactly the span that streams this body; the `return -1` paths
   // above leave it set, which is what carries the anchor out to the diagnostic.
   emitCurStmtIx = -1
@@ -3957,6 +3980,54 @@ function mapCompactMove(mapTy: i32, field: i32, wrap: i32, back: i32) {
   0
 }
 
+// Prints `strs[k]` when local `param` equals `k`, for every row: one `if` per row.
+function emitInitFailPick(param: i32, strs: string[]) {
+  let k = 0
+  while k < strs.length {
+    fbLocalGet(param)
+    fbI32Const(k)
+    fbI32Bin(70) // 0x46 i32.eq
+    fbIf(64)
+    emitInitFailText(strs[k])
+    fbEnd()
+    k = k + 1
+  }
+  0
+}
+
+// Streams `text` through `__print_char__`, unflushed.
+function emitInitFailText(text: string) {
+  for cp in text {
+    fbI32Const(cp)
+    fbCall(2) // __print_char__ (import 2)
+  }
+  0
+}
+
+// `__init_fail__(g, verb, r)`: prints "`name` read|written before its initializer ran (place),
+// via reader" from the rows guard sites interned, then traps (D2652). Each row's text is here
+// once, however many sites name it; the code section emits every user body first.
+function emitInitFailFnCode(out: u8[]) {
+  const body: u8[] = []
+  const prev = wTarget(body)
+  wULEB(0) // no locals
+  emitInitFailPick(0, gInitGNames)
+  fbLocalGet(1)
+  fbIf(64)
+  emitInitFailText("written")
+  fbElse()
+  emitInitFailText("read")
+  fbEnd()
+  emitInitFailText(" before its initializer ran")
+  emitInitFailPick(0, gInitGLocs)
+  emitInitFailPick(2, gInitReaders)
+  fbCall(3) // __print_str_flush__ (import 3)
+  fbUnreachable()
+  fbEnd() // end (function)
+  wTarget(prev)
+  helpFrameBody(out, body)
+}
+
 // `__f64_rem__(x, y) -> f64`: the truncated remainder — `x - y * trunc(x / y)` in value, with
 // the sign of the dividend (Rust's `f64::rem`, JS's `%`, C's `fmod`; wasm has no instruction
 // for it, D1586). Not that identity evaluated directly — it is off by an ulp once the
@@ -4127,6 +4198,7 @@ function emitNameSection(n: i32) {
     if gHelpMapCompact[cnk] >= 0 { count = count + 1 }
     cnk = cnk + 1
   }
+  if gHelpInitFail >= 0 { count = count + 1 }
   wULEB(count)
   if gImports > 0 {
     wULEB(0)
@@ -4269,6 +4341,10 @@ function emitNameSection(n: i32) {
       wName("__map_compact_" + i32ToStr(cnw) + "__")
     }
     cnw = cnw + 1
+  }
+  if gHelpInitFail >= 0 {
+    wULEB(gHelpInitFail)
+    wName("__init_fail__")
   }
   wTarget(mapPrev)
 
@@ -4471,6 +4547,16 @@ function emitModule(_stmts: i32[]) {
       }
       ck = ck + 1
     }
+  }
+  // The read-before-init trap (D2652), last for the same reason.
+  gHelpInitFail = -1
+  gInitGIdx = []
+  gInitGNames = []
+  gInitGLocs = []
+  gInitReaders = []
+  if gInitAny {
+    gHelpInitFail = helpBase + nHelpers
+    nHelpers = nHelpers + 1
   }
 
   // Intern the string-literal pool (its globals PRECEDE the user cells — every
@@ -4684,6 +4770,231 @@ function passRowNeeds(row: string) {
 // is legal — refusing it here is a clause-2 violation on a `vl check`-clean program. An
 // empty wasm module is valid and every section here is already gated on having something to write, so this pass enforces nothing — it stays as a table row for the ordering edge `collectFns` declares.
 function passCheckTopLevel() { 0 }
+
+// Records `name` as mentioned at top-level position `ord`; `seen[name]` ORs `bits`: 1 once an
+// identifier names it, 2 once one is an assignment's target, 0 for a member name. The first mention reaches every
+// `fnStmts` slot declared under that name and queues it for its own walk (`initGuardScan`),
+// except a nested one: its body is walked inside its enclosing function, in that scope.
+function igMention(
+  name: string,
+  bits: i32,
+  ord: i32,
+  seen: Map<string, i32>,
+  head: Map<string, i32>,
+  next: i32[],
+  work: i32[],
+) {
+  const had = seen.has(name)
+  seen[name] = (seen[name] ?? 0) | bits
+  if had { return 0 }
+  let p = head[name] ?? -1
+  while p >= 0 && p < gInitFnReach.length && p < next.length {
+    if gInitFnReach[p] == INIT_REACH_NEVER {
+      gInitFnReach[p] = ord
+      if p >= fnParent.length || fnParent[p] < 0 { work.push(p) }
+    }
+    p = next[p]
+  }
+  0
+}
+
+// Whether `name` is bound by a parameter or local in scope at the walk's cursor (`igWalk`).
+function igShadowed(shadow: string[], name: string): boolean {
+  let i = shadow.length - 1
+  while i >= 0 {
+    if shadow[i] == name { return true }
+    i = i - 1
+  }
+  false
+}
+
+// Mentions every identifier, member name and nested function name under `ix` at `ord`,
+// except an identifier a parameter or local in scope binds (`shadow`, restored on return).
+// A `let` binds for the statements after it in its block; a loop variable, for its body.
+function igWalk(
+  ix: i32,
+  ord: i32,
+  shadow: string[],
+  seen: Map<string, i32>,
+  head: Map<string, i32>,
+  next: i32[],
+  work: i32[],
+) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const n = P.nodes[ix]
+  const mark = shadow.length
+  if n is Ident {
+    if !igShadowed(shadow, n.identName) {
+      igMention(n.identName, 1, ord, seen, head, next, work)
+    }
+    return 0
+  }
+  if n is FuncDecl {
+    igMention(n.fnName, 0, ord, seen, head, next, work)
+    // A default is substituted at the call site, so it reads the caller's scope.
+    let pi = 0
+    while pi < n.fnParams.length {
+      igWalk(n.fnParams[pi], ord, shadow, seen, head, next, work)
+      pi = pi + 1
+    }
+    pi = 0
+    while pi < n.fnParams.length {
+      const pn = P.nodes[n.fnParams[pi]]
+      if pn is Param { shadow.push(pn.parName) }
+      pi = pi + 1
+    }
+    igWalk(n.fnBody, ord, shadow, seen, head, next, work)
+  } else if n is Block {
+    let si = 0
+    while si < n.blkStmts.length {
+      igWalk(n.blkStmts[si], ord, shadow, seen, head, next, work)
+      const sn = P.nodes[n.blkStmts[si]]
+      if sn is LetDecl { shadow.push(sn.letName) }
+      si = si + 1
+    }
+  } else if n is ForRange {
+    igWalk(n.frFrom, ord, shadow, seen, head, next, work)
+    igWalk(n.frTo, ord, shadow, seen, head, next, work)
+    igWalk(n.frStep, ord, shadow, seen, head, next, work)
+    shadow.push(n.frVar)
+    igWalk(n.frBody, ord, shadow, seen, head, next, work)
+  } else if n is ForIn {
+    igWalk(n.fiIter, ord, shadow, seen, head, next, work)
+    shadow.push(n.fiVar)
+    if n.fiVar2 != "" { shadow.push(n.fiVar2) }
+    igWalk(n.fiBody, ord, shadow, seen, head, next, work)
+  } else {
+    if n is Member { igMention(n.memProp, 0, ord, seen, head, next, work) }
+    if n is OptMember { igMention(n.omProp, 0, ord, seen, head, next, work) }
+    if n is BinExpr {
+      if n.binOp == "=" {
+        const lhs = P.nodes[n.binLeft]
+        if lhs is Ident {
+          if !igShadowed(shadow, lhs.identName) {
+            igMention(lhs.identName, 2, ord, seen, head, next, work)
+          }
+        }
+      }
+    }
+    const kids = nodeChildren(ix)
+    let k = 0
+    while k < kids.length {
+      igWalk(kids[k], ord, shadow, seen, head, next, work)
+      k = k + 1
+    }
+  }
+  while shadow.length > mark { shadow.pop() }
+  0
+}
+
+// Whether global `gi`'s initializer builds a record or a list: an early read of one reaches the
+// object itself, and a mutation through it would outlive the declaration. Any other initializer
+// produces its value only when it runs in the start function (`globalRunsInStartFn`).
+function igInitAllocates(gi: i32): boolean {
+  const init = igLetInit(globalStmts[gi])
+  if init < 0 { return false }
+  const e = P.nodes[unwrapParen(init)]
+  if e is ArrayLit { return true }
+  if e is ObjLit { return true }
+  globalRunsInStartFn(gi)
+}
+
+// The initializer of module binding `letIx`, or -1 when it has none.
+function igLetInit(letIx: i32): i32 {
+  const d = P.nodes[letIx]
+  if d is LetDecl { return d.letInit }
+  -1
+}
+
+// Decides which module globals need the read-before-init guard (D2652): a global whose
+// initializer runs in the start function, or builds a record or list, and whose name is mentioned
+// by top-level code at or before its declaration, or by a function that code can call (1); a
+// folded scalar or string `let` so assigned (2).
+function initGuardScan(): i32 {
+  gInitGuard = []
+  gInitFnReach = []
+  gInitAny = false
+  gInitProgIdx = -1
+  gInitStartOrd = -1
+  let anyCand = false
+  let gi = 0
+  while gi < globalStmts.length {
+    gInitGuard.push(0)
+    // A folded `let` is a candidate too (a write can still precede it), and so is a folded
+    // record or list, which a mutation can reach early.
+    const cd = P.nodes[globalStmts[gi]]
+    if cd is LetDecl {
+      if (
+        cd.letKw == "let"
+        || globalIsNonConst(globalStmts[gi])
+        || igInitAllocates(gi)
+      ) {
+        anyCand = true
+      }
+    }
+    gi = gi + 1
+  }
+  const next: i32[] = []
+  const head: Map<string, i32> = Map()
+  let p = 0
+  while p < fnStmts.length {
+    gInitFnReach.push(INIT_REACH_NEVER)
+    next.push(-1)
+    const fd = P.nodes[fnStmts[p]]
+    if fd is FuncDecl {
+      next[p] = head[fd.fnName] ?? -1
+      head[fd.fnName] = p
+    }
+    p = p + 1
+  }
+  if !anyCand { return 0 }
+  const seen: Map<string, i32> = Map()
+  const work: i32[] = []
+  const shadow: string[] = []
+  gi = 0
+  let si = 0
+  while gi < globalStmts.length || si < startStmts.length {
+    let takeGlobal = gi < globalStmts.length
+    if takeGlobal && si < startStmts.length {
+      if startStmtOrd[si] < globalStmtOrd[gi] { takeGlobal = false }
+    }
+    let node = -1
+    let ord = 0
+    if takeGlobal {
+      node = globalStmts[gi]
+      ord = globalStmtOrd[gi]
+    } else {
+      node = startStmts[si]
+      ord = startStmtOrd[si]
+    }
+    igWalk(node, ord, shadow, seen, head, next, work)
+    while work.length > 0 {
+      const wp = work.pop() ?? -1
+      if wp >= 0 && wp < fnStmts.length {
+        igWalk(fnStmts[wp], ord, shadow, seen, head, next, work)
+      }
+    }
+    if takeGlobal {
+      const g = P.nodes[node]
+      if g is LetDecl {
+        const bits = seen[g.letName] ?? 0
+        const early = (bits & 1) != 0
+        if early && igInitAllocates(gi) {
+          gInitGuard[gi] = 1
+          gInitAny = true
+        } else if (g.letKw == "let" && g.letInit >= 0 && (bits & 2) != 0) {
+          // A folded `let` holds its value from instantiation, so only a write can precede it.
+          gInitGuard[gi] = 2
+          gInitAny = true
+        }
+      }
+      gi = gi + 1
+    } else {
+      si = si + 1
+    }
+  }
+  0
+}
 
 // Detects `print(...)`/memory-intrinsic use anywhere in the program: any print pulls in the
 // 4-import print family (imports shift every local function's wasm index, so this is decided
@@ -4957,6 +5268,9 @@ function scanPrintUse() {
   // the module mentions a float somewhere, which is what keeps an integer-only program's
   // bytes unchanged; the flags this reads are final only now, hence after the loop.
   gNeedsF64Rem = sawFloatRem || (sawRemUnknown && (sawF64 || sawF32))
+  // A guarded global read streams its reason through the print pair before the abort, as
+  // `as!` does, so a program with one reserves the family (D2652).
+  if gInitAny { gImports = 4 }
   // An extern's own RESULT width is a scalar the annotation scan cannot see: `print(nowMillis())`
   // spells `i64` nowhere, and without this the print router would call an undeclared import.
   // Read off the manifest, which is total, exactly as `fsRetIsI64` is for the fs floor.
@@ -5077,6 +5391,7 @@ function runEmitPass(name: string, stmts: i32[], rootIx: i32) {
   if name == "collectFnValUse" { return collectFnValUse() }
   if name == "collectCloSigs" { return collectCloSigs() }
   if name == "scanPrintUse" { return scanPrintUse() }
+  if name == "initGuardScan" { return initGuardScan() }
   if name == "checkFnParams" { return checkFnParams() }
   if name == "capCacheBuild" { return capCacheBuild() }
   if name == "capNarrowBuild" { return capNarrowBuild() }
@@ -5278,7 +5593,8 @@ export function emitProgram(rootIx: i32) {
       "collectMapFilterUse > synthParamAnnots computeRetInference#2",
       "collectFnValUse > synthParamAnnots computeRetInference#2",
       "collectCloSigs > collectMapFilterUse collectFnValUse",
-      "scanPrintUse > monomorphize synthParamAnnots",
+      "initGuardScan > monomorphize synthParamAnnots synthVoidTwins synthExternValues",
+      "scanPrintUse > monomorphize synthParamAnnots initGuardScan",
       "checkFnParams > monomorphize synthParamAnnots",
       "capCacheBuild > monomorphize synthParamAnnots",
       "synthCaptureEmptyListAnns > collectA#2 capCacheBuild",
@@ -6308,6 +6624,9 @@ function emitTypeSection(
     if gHelpMapCompact[cft] >= 0 { mapCompactFuncType(mapCompactRowShape(cft)) }
     cft = cft + 1
   }
+  if gHelpInitFail >= 0 {
+    helpFuncType("iii", "") // __init_fail__: (global row, verb, reader row) -> (), never returns
+  }
   // The export-wrapper functypes last (#1265), one per export entry, each the target's own
   // signature emitted with `withEnv` false — the clean ABI shape, produced by the same
   // `emitOneFuncType` the main loop uses, so a wrapper's published type cannot drift from the function it forwards to. Empty unless `fnValUsed`.
@@ -6600,13 +6919,19 @@ function emitGlobalSection() {
     nHeap = 2
     gHeapGlobalIdx = externGlobalCount() + np + nCells
   }
-  if nCells + np + nHeap > 0 {
+  // The read-before-init progress cell trails the heap pair, for the same reason (D2652).
+  let nProg = 0
+  if gInitAny {
+    nProg = 1
+    gInitProgIdx = externGlobalCount() + np + nCells + nHeap
+  }
+  if nCells + np + nHeap + nProg > 0 {
     const globalPayload: u8[] = []
     // Bind the writer at `globalPayload` for the WHOLE global-section payload build, so
     // the count, each entry's valtype (`fbValtype`), mutability flag, and init constexpr
     // (`fb*` opcodes) all stream to `curBuf == globalPayload`. Restored before framing.
     const gPrev = wTarget(globalPayload)
-    wULEB(nCells + np + nHeap)
+    wULEB(nCells + np + nHeap + nProg)
     // The string-literal pool first (indices 0..np-1, before the user cells): each entry an
     // immutable non-null string ref whose init constexpr builds the literal once
     // (`array.new_fixed` for the packed backing, then `struct.new` for the header) — every
@@ -6804,6 +7129,12 @@ function emitGlobalSection() {
       wU8(127)
       wU8(0)
       fbI32Const(gHeapLimit)
+      fbEnd()
+    }
+    if nProg == 1 {
+      wU8(127) // 0x7f i32
+      wU8(1)   // mutable
+      fbI32Const(0)
       fbEnd()
     }
     wTarget(gPrev)
@@ -7169,6 +7500,12 @@ function buildCodePayload(
       placeCodeEntry(codePayload, entry, rows, -1, -1, 3, "__map_compact__")
     }
     cce = cce + 1
+  }
+  if gHelpInitFail >= 0 {
+    const rows = emitFnSpanStart.length
+    const entry: u8[] = []
+    if emitInitFailFnCode(entry) < 0 { return -1 }
+    placeCodeEntry(codePayload, entry, rows, -1, -1, 3, "__init_fail__")
   }
   // The export-wrapper bodies LAST, in the same order the function section declared them.
   // A wrapper's row carries the WRAPPED function's slot and node, so its name and the
