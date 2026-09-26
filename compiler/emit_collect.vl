@@ -31,6 +31,9 @@ import {
   unionMemberCount,
 } from "./tyname"
 import {
+  MAP_KEY_I32,
+  MAP_KEY_I64,
+  MAP_KEY_STR,
   T,
   TyArray,
   TyErr,
@@ -87,8 +90,8 @@ import {
   nodeTyIsNulLitUnion,
   nodeTyIsNulString,
   nodeTyIxOf,
-  nodeTyMapKeyIsI32,
-  nodeTyMapKeyIsI32Span,
+  nodeTyMapKeyKind,
+  nodeTyMapKeyKindSpan,
   nodeTyPrimName,
   nodeTyReachesClosure,
   nulNumLitUnionBaseName,
@@ -166,13 +169,13 @@ import {
   isStructAtom,
   isVariantBoxUnion,
   isVariantBoxUnionAtoms,
+  mapNameKeyKind,
   mapValNameOf,
   monoAnnHasTyParam,
   nameIsBareMap,
   nameIsClosureArrayTy,
   nameIsF32Array,
   nameIsF64Array,
-  nameIsI32KeyedMap,
   nameIsI64Array,
   nameIsLitUnionArray,
   nameIsMap,
@@ -333,13 +336,15 @@ import {
   lambdaCtr,
   localLitUnion,
   mI32Used,
+  mI64Used,
   mNextType,
   mStructI32Idx,
+  mStructI64Idx,
   mStructIdx,
   mUsed,
   mkArrIdx,
   mkListIdx,
-  mvKeyI32,
+  mvKeyKind,
   mvMapTypeIdx,
   mvRlSlot,
   mvTwin,
@@ -374,7 +379,7 @@ import {
   sDeclared,
   sFieldCloSig,
   sFieldCount,
-  sFieldElemKeyI32,
+  sFieldElemKeyKind,
   sFieldElemName,
   sFieldElemTyIx,
   sFieldNames,
@@ -391,7 +396,7 @@ import {
   uBoxIdx,
   uDeclared,
   uFieldCount,
-  uFieldElemKeyI32,
+  uFieldElemKeyKind,
   uFieldElemName,
   uFieldElemTyIx,
   uFieldLitTyIx,
@@ -449,7 +454,7 @@ import {
   annRefArrElemRow,
   annRowOfNode,
   anonFieldCode,
-  anonFieldElemKeyI32,
+  anonFieldElemKeyKind,
   anonFieldElemName,
   anonLeafFoldBlocked,
   anonLeafServingRow,
@@ -598,6 +603,7 @@ import {
   markLocalDecl,
   markLoopVarIter,
   markLoopVarSlot,
+  markMapKeyUsed,
   markMapUnionArms,
   markRefArrayArms,
   markValueUnionAtoms,
@@ -655,7 +661,7 @@ import {
   retVariantFlag,
   rlElemInnerSlot,
   rlElemListRep,
-  rlElemMapKeyI32,
+  rlElemMapKeyKind,
   rlElemMapValMvSlotAt,
   rlElemStructRow,
   rlInternName,
@@ -664,7 +670,7 @@ import {
   rlSlotByNameKeyTy,
   sFieldElemNameAt,
   sFieldElemTyIxRow,
-  sFieldRowKeyI32,
+  sFieldRowKeyKind,
   scopeBind,
   scopePop,
   scopePush,
@@ -690,9 +696,9 @@ import {
   synthTypeRefTy,
   tailIfNullableIsReal,
   tyAnnRefListSlot,
-  uFieldElemKeyI32At,
+  uFieldElemKeyKindAt,
   uFieldElemTyIxRow,
-  uFieldRowKeyI32,
+  uFieldRowKeyKind,
   uVarSTwinAt,
   uVariantsPush,
   unMemberSetPush,
@@ -4485,11 +4491,11 @@ export function mfScan(ix: i32, fnIx: i32) {
           const vsh = mapShapeOfExpr(callee.memObj, fnIx)
           if vsh == -1 {
             fnUsesMapVals = true
-          } else if vsh == -4 {
+          } else if vsh == -4 || vsh == -6 {
             // The i32-keyed map's values are the mono i32 list — the same self-contained
             // `mapValsBase` frame the string-keyed mono map uses.
             fnUsesMapVals = true
-          } else if vsh == -5 || vsh == -2 {
+          } else if vsh == -5 || vsh == -7 || vsh == -2 {
             // A `Set`'s `.values()` are its keys, so the bound form is built by the key-list
             // path and needs that frame, at either key rep. A Set's shape is neither the mono
             // `-1` nor an mv slot, so the arms either side of this one both miss it.
@@ -4621,10 +4627,10 @@ function mAllocType() {
 // literal-union atom) is never interned, so a map element resolves its struct heap to
 // `mStructIdxPre` or `mvMapTypeIdx` by this lookup. The non-failing sibling of
 // `mvSlotOfValNameFind`: the element-heap resolver below must tolerate the mono case.
-function mvSlotByValNameOrK(vn: string, keyI32: boolean): i32 {
-  const aOr = mvSlotOfValNameTyK(vn, keyI32)
+function mvSlotByValNameOrK(vn: string, keyK: i32): i32 {
+  const aOr = mvSlotOfValNameTyK(vn, keyK)
   if aOr >= 0 { return aOr }
-  mvSlotByValNameK(vn, keyI32)
+  mvSlotByValNameK(vn, keyK)
 }
 
 // The mv slot a map-element ref-list slot's value occupies — the element-heap resolver's twin of
@@ -4639,7 +4645,7 @@ function rlMapElemValSlot(slot: i32, canon: boolean): i32 {
   if enn != "" { en = enn }
   let vn = mapValNameOf(en)
   if canon { vn = mvCanonValName(vn) }
-  mvSlotByValNameOrK(vn, rlElemMapKeyI32(slot))
+  mvSlotByValNameOrK(vn, rlElemMapKeyKind(slot))
 }
 
 // The variant struct heap index of ref-list slot `slot`'s element (`Cat[]` gives the `Cat`
@@ -4762,7 +4768,9 @@ export function mAssignTypeIndices(_n: i32) {
         // has to name the key or an `{[i32]: i32}` element would twin onto a
         // `{[string]: i32}` one and take its (string-ref keys) struct.
         sig = "3:m"
-        if rlElemMapKeyI32(rss) { sig = "3:mi32" }
+        const rkk = rlElemMapKeyKind(rss)
+        if rkk == MAP_KEY_I32 { sig = "3:mi32" }
+        if rkk == MAP_KEY_I64 { sig = "3:mi64" }
       } else {
         sig = "3:" + i32ToStr(mvCanonRepOf(mmv))
       }
@@ -4825,8 +4833,14 @@ export function mAssignTypeIndices(_n: i32) {
         // The MONO map of the element's OWN key rep: the string-keyed struct, or its
         // i32-keyed twin one index later (`mStructI32Idx`, minted immediately after —
         // the same "computable up front from the counter" reasoning as `mStructIdxPre`).
-        if rlElemMapKeyI32(rs) {
+        const rk = rlElemMapKeyKind(rs)
+        if rk == MAP_KEY_I32 {
           rlElemHeap[rs] = mStructIdxPre + 1
+        } else if rk == MAP_KEY_I64 {
+          // The i64-keyed struct follows the i32-keyed one, which is minted only when used.
+          let i64At = mStructIdxPre + 1
+          if mI32Used { i64At = i64At + 1 }
+          rlElemHeap[rs] = i64At
         } else {
           rlElemHeap[rs] = mStructIdxPre
         }
@@ -4897,6 +4911,13 @@ export function mAssignTypeIndices(_n: i32) {
     mStructI32Idx = mAllocType()
   } else {
     mStructI32Idx = mStructIdx
+  }
+  // The i64-KEYED map struct, after its i32-keyed twin and gated the same way; its `keys` field
+  // is the i64 list wrapper, whose heap types `ia64Used` mints further down.
+  if mI64Used {
+    mStructI64Idx = mAllocType()
+  } else {
+    mStructI64Idx = mStructIdx
   }
   // The f64 array and list-wrapper pair, interned last among the heap types so no existing index
   // shifts: the `(array (mut f64))` backing first, then its `{backing,len,cap}` wrapper struct,
@@ -5037,11 +5058,11 @@ export function mAssignTypeIndices(_n: i32) {
 function i32MapSpellingLowerable(name: string) {
   const bare = i32MapPeelWrappers(name)
   if nameIsMapSpanEnds(bare) {
-    if nameIsI32KeyedMap(bare) { return 0 }
+    if mapNameKeyKind(bare) != MAP_KEY_STR { return 0 }
     // A map whose VALUE mentions an i32-keyed map (`{[string]: {[i32]: V}}`): the inner map is
     // delivered exactly as any other map value is, so ask this same question of it.
     const mv = mapSpellValName(bare)
-    if strContains(mv, "{[i32]:") { return i32MapSpellingLowerable(mv) }
+    if nameMentionsIntKeyedMap(mv) { return i32MapSpellingLowerable(mv) }
     return 0
   }
   // A shape spelling — an inline struct annotation or an inline union arm — delegates to its
@@ -5058,7 +5079,7 @@ function i32MapSpellingLowerable(name: string) {
     splitUnionAtoms(bare, atoms)
     let ai = 0
     while ai < atoms.length {
-      if strContains(atoms[ai], "{[i32]:") {
+      if nameMentionsIntKeyedMap(atoms[ai]) {
         if !nameIsShapeSpanEnds(atoms[ai]) {
           return i32MapSpellingUnsupported(name)
         }
@@ -5069,6 +5090,12 @@ function i32MapSpellingLowerable(name: string) {
     return 0
   }
   i32MapSpellingUnsupported(name)
+}
+
+// Whether the spelling `name` mentions an integer-keyed map anywhere, the text test the
+// position gate above is asked behind.
+function nameMentionsIntKeyedMap(name: string): boolean {
+  strContains(name, "{[i32]:") || strContains(name, "{[i64]:")
 }
 
 // Strip the wrappers that carry a map's shape through to its leaf, to a FIXPOINT: a function
@@ -5115,13 +5142,19 @@ function i32MapPeelWrappers(name: string) {
 // between them. Each position the message names is exercised by a corpus case and lowers today;
 // what it does NOT name is a union member that IS the map, whose box records no map struct.
 function i32MapSpellingUnsupported(name: string): i32 {
+  let kw = "i32"
+  if !strContains(name, "{[i32]:") { kw = "i64" }
   emitFail(
-    "emitProgram: an i32-keyed Map/Set is supported as a binding / parameter / "
+    "emitProgram: an "
+      + kw
+      + "-keyed Map/Set is supported as a binding / parameter / "
       + "return / `| null` / an ARRAY ELEMENT at any depth / a closure result / a "
       + "MAP VALUE / a struct or variant FIELD — not inside '"
       + name
       + "'. A union member that IS the map is the one position left: the box records no "
-      + "map struct. Bind the i32-keyed map on its own and pass it where you need it.",
+      + "map struct. Bind the "
+      + kw
+      + "-keyed map on its own and pass it where you need it.",
   )
 }
 
@@ -5137,7 +5170,7 @@ function i32MapShapeFieldsLowerable(nm: string): i32 {
   shapeInnerFieldSplit(groupInnerOf(nm), fnames, ftexts)
   let i = 0
   while i < ftexts.length {
-    if strContains(ftexts[i], "{[i32]:") {
+    if nameMentionsIntKeyedMap(ftexts[i]) {
       if i32MapSpellingLowerable(ftexts[i]) < 0 { return -1 }
     }
     i = i + 1
@@ -5356,7 +5389,7 @@ function caPopFieldTail() {
   caPopI32(rlElemKindTbl, caRlMark)
   caPopI32(rlElemNullable, caRlMark)
   caPopStr(mvValName, caMvMark)
-  caPopI32(mvKeyI32, caMvMark)
+  caPopI32(mvKeyKind, caMvMark)
   caPopI32(mvValTyIx, caMvMark)
   caPopI32(mvValKind, caMvMark)
   caPopI32(mvValStructIdx, caMvMark)
@@ -5556,10 +5589,11 @@ export function collectA(_stmts: i32[]) {
     rlElemNullable = []
     mUsed = false
     mI32Used = false
+    mI64Used = false
     slUsed = false
     fa64Used = false
     mvValName = []
-    mvKeyI32 = []
+    mvKeyKind = []
     mvValTyIx = []
     mvValKind = []
     mvValStructIdx = []
@@ -5755,6 +5789,7 @@ export function collectA(_stmts: i32[]) {
           const vss = setShapeOfTy(nodeTyIxOf(cf.memObj))
           if vss == -2 { slUsed = true }
           if vss == -5 { lUsed = true }
+          if vss == -7 { ia64Used = true }
           if vss != 0 { aUsed = true }
         }
       }
@@ -5779,7 +5814,7 @@ export function collectA(_stmts: i32[]) {
           // (`const m = Map()` then `m.set(1, 2)`) has no map spelling anywhere in the
           // arena for the `TypeRef` walk below to read, so the KEY comes off the
           // constructor call's own recorded type.
-          if nodeTyMapKeyIsI32(i) { mI32Used = true }
+          markMapKeyUsed(nodeTyMapKeyKind(i))
           // …and so does the value. The `TypeRef` walk's `mvShapeOfMapName` is the only other mv
           // mint, so without this an un-annotated map with a ref or wide value resolves its type
           // and never mints its rep. Idempotent: an annotated twin interns the same (key, value)
@@ -5797,11 +5832,10 @@ export function collectA(_stmts: i32[]) {
         }
       }
     } else if nd is TypeRef {
-      // The i32-keyed map's capability gate, asked of every annotation name before the
-      // type-forcing chain below reads it. The i32-keyed rep is the mono map, with no per-value
-      // map struct and no ref-list, field or element plumbing, so exactly two spellings lower and
-      // every other position is a loud reject rather than invalid wasm `vl check` cannot see.
-      if strContains(nd.tyName, "{[i32]:") {
+      // The integer-keyed maps' position gate, asked of every annotation name before the
+      // type-forcing chain below reads it: a union member that IS the map lowers into a box that
+      // records no map struct, so that position is a loud reject rather than invalid wasm.
+      if nameMentionsIntKeyedMap(nd.tyName) {
         if i32MapSpellingLowerable(nd.tyName) < 0 { return -1 }
       }
       // A CLOSURE spelled as a struct FIELD reserves nothing through the rung below —
@@ -5836,14 +5870,14 @@ export function collectA(_stmts: i32[]) {
         mUsed = true
         lUsed = true
         aUsed = true
-        // An i32-keyed map additionally forces its own map struct — its `keys` field is the i32
-        // list, not the string-ref list — and the i32-keyed probe helper. The arena where it
-        // covers the node, the name where it does not: `nodeTyMapKeyIsI32Span` answers false both
-        // for "not i32-keyed" and for "no type for this node", and this flag must not under-mint.
+        // An integer-keyed map additionally forces its own map struct — its `keys` field is the
+        // integer list, not the string-ref list — and its probe helper. The arena where it covers
+        // the node, the name where it does not: `nodeTyMapKeyKindSpan` answers the string kind both
+        // for a string key and for "no type for this node", and this flag must not under-mint.
         if nodeTyIxOf(i) >= 0 {
-          if nodeTyMapKeyIsI32Span(i) { mI32Used = true }
-        } else if nameIsI32KeyedMap(nd.tyName) {
-          mI32Used = true
+          markMapKeyUsed(nodeTyMapKeyKindSpan(i))
+        } else {
+          markMapKeyUsed(mapNameKeyKind(nd.tyName))
         }
         // A ref value type interns a per-(key, value) map slot, its own map struct over a ref
         // vals list. All mv interning happens here, since collect scans every `TypeRef`, so the
@@ -5859,13 +5893,13 @@ export function collectA(_stmts: i32[]) {
         lUsed = true
         aUsed = true
         // The arena where it covers the node, the name where it does not, and the coverage test
-        // is the point: `nodeTyMapKeyIsI32Span` answers false both for "not an i32-keyed map" and
-        // for "no type for this node", while `mI32Used` is a minting flag whose under-answer
+        // is the point: `nodeTyMapKeyKindSpan` answers the string kind both for a string key and
+        // for "no type for this node", while `markMapKeyUsed` sets a minting flag whose under-answer
         // leaves the map struct unminted. The uncovered nodes are `parser.vl`'s orphaned fields.
         if nodeTyIxOf(i) >= 0 {
-          if nodeTyMapKeyIsI32Span(i) { mI32Used = true }
-        } else if nameIsI32KeyedMap(nd.tyName) {
-          mI32Used = true
+          markMapKeyUsed(nodeTyMapKeyKindSpan(i))
+        } else {
+          markMapKeyUsed(mapNameKeyKind(nd.tyName))
         }
         mvShapeOfMapName(nulMapInnerName(nd.tyName))
       } else if nameIsStringArray(nd.tyName) {
@@ -6113,7 +6147,7 @@ export function collectA(_stmts: i32[]) {
       // pair, so a `{[i32]: string}` field must intern the i32-keyed slot. Interning the
       // string-keyed one and then resolving the i32-keyed one is the loud "map value type has no
       // interned slot"; interning against the wrong key is the silent wrong map struct.
-      const sfk = sFieldRowKeyI32(sfi)
+      const sfk = sFieldRowKeyKind(sfi)
       // …and the row's arena type, the third column of the same push. `recordSFieldElemRow`
       // computed it by calling `fieldElemTyIxOfName` on the very `sFieldElemName[sfi]` handed
       // over here, so the intern's lookup rung takes the answer instead of re-deriving it.
@@ -6122,7 +6156,7 @@ export function collectA(_stmts: i32[]) {
       // the annotation scan's bare-map arm — the site that sets `mI32Used` for every other
       // position — never sees this map. `mI32Used` gates the i32-keyed map struct, the probe
       // helper and the per-function i32-key scratch frame, whose absence is invalid wasm.
-      if sfk { mI32Used = true }
+      markMapKeyUsed(sfk)
     }
     // A ref-list field (code 5) and its nullable twin (28): intern the element so
     // `sFieldRefSlot` (`rlSlotByName`) resolves.
@@ -6193,10 +6227,10 @@ export function collectA(_stmts: i32[]) {
       // are jointly, not severally, necessary: either one alone is covered by the struct row an
       // inline union arm must spell to be narrowed. Kept anyway, because that covering row
       // belongs to another pass and not to this table's invariant.
-      const ufk = uFieldRowKeyI32(ufi)
+      const ufk = uFieldRowKeyKind(ufi)
       // The struct pass's row-type thread, one table over.
       mvShapeOfValNameRowTy(uFieldElemName[ufi], ufk, uFieldElemTyIxRow(ufi))
-      if ufk { mI32Used = true }
+      markMapKeyUsed(ufk)
     }
     ufi = ufi + 1
   }
@@ -9146,7 +9180,7 @@ function anonMintRowFor(objIx: i32) {
     const codes: i32[] = []
     const names: string[] = []
     const elemNames: string[] = []
-    const elemKeys: boolean[] = []
+    const elemKeys: i32[] = []
     let ok = true
     let fi = 0
     while fi < fields.length {
@@ -9203,7 +9237,7 @@ function anonMintRowFor(objIx: i32) {
           }
           elemNames.push(nestNm)
         }
-        elemKeys.push(anonFieldElemKeyI32(f.fiValue, code))
+        elemKeys.push(anonFieldElemKeyKind(f.fiValue, code))
       } else {
         ok = false
       }
@@ -9936,7 +9970,7 @@ function pushFieldRow(
   toVariant: boolean,
   code: i32,
   elemNm: string,
-  keyI32: boolean,
+  keyK: i32,
   fName: string,
   tyText: string,
   elemTyHint: i32,
@@ -9950,13 +9984,13 @@ function pushFieldRow(
     // otherwise. Pushed here, not per recorder, so no column drifts out of parallel across the three.
     uFieldLitTyIx.push(litSetTyIxOf(litTyIx))
     uFieldElemName.push(elemNm)
-    recordUFieldElemRowTy(elemNm, keyI32, elemTyHint) // D5 + B6b
+    recordUFieldElemRowTy(elemNm, keyK, elemTyHint) // D5 + B6b
     uFieldNames.push(fName)
   } else {
     sFieldTypes.push(code)
     sFieldElemName.push(elemNm)
     sFieldCloSig.push(cloSig)
-    recordSFieldElemRowTy(elemNm, keyI32, elemTyHint) // D5 + B6b
+    recordSFieldElemRowTy(elemNm, keyK, elemTyHint) // D5 + B6b
     sFieldNames.push(fName)
   }
   // A value-union field interns its box reps here (shared by all three recorders); without it
@@ -10051,7 +10085,7 @@ export function collectS(stmts: i32[]) {
   sFieldElemName = []
   sFieldCloSig = []
   sFieldElemTyIx = []
-  sFieldElemKeyI32 = []
+  sFieldElemKeyKind = []
   // Nested inline-shape field types intern first, so the struct decls that reference them resolve.
   collectNestedFieldShapes(stmts)
   // A `type X = {…}` that is a union variant is collected by `collectU` instead, not here; any
@@ -10135,14 +10169,14 @@ export function collectS(stmts: i32[]) {
               false,
               code,
               recNm,
-              nodeTyMapKeyIsI32Span(fnode.fdType),
+              nodeTyMapKeyKindSpan(fnode.fdType),
               fnode.fdName,
               "",
               fieldElemHintOf(fnode.fdType, code, recNm),
               -1,
               fieldCloSigOfTy(code, nodeTyIxOf(fnode.fdType)),
             )
-            // `nodeTyMapKeyIsI32Span`, not the exact twin: this column is the mv slot's key half,
+            // `nodeTyMapKeyKindSpan`, not the exact twin: this column is the mv slot's key half,
             // and the span form is what matches `mapSpellKeyName`'s cut.
             cnt = cnt + 1
           } else {
@@ -10221,7 +10255,7 @@ function collectShapeVariantFields(nm: string, shapeTy: i32) {
       true,
       fc,
       shapeFieldElemName(ftxt, fc),
-      nameIsI32KeyedMap(ftxt),
+      mapNameKeyKind(ftxt),
       fnames[fi],
       variantFieldIdText(ftxt, fldTy),
       -1,
@@ -10309,7 +10343,7 @@ function collectVariantFields(stmts: i32[], name: string) {
               true,
               code,
               elemNm,
-              nodeTyMapKeyIsI32Span(fnode.fdType),
+              nodeTyMapKeyKindSpan(fnode.fdType),
               fnode.fdName,
               variantFieldIdText(ftxt, nodeTyIxOf(fnode.fdType)),
               fieldElemHintOf(fnode.fdType, code, elemNm),
@@ -10357,7 +10391,7 @@ function variantFieldTysEq(a: i32, b: i32) {
     }
     // B6b — the map field's key half: the elem-name column above records only `V`, so two
     // differently-keyed maps compare equal there; this column catches it.
-    if uFieldElemKeyI32At(a, fi) != uFieldElemKeyI32At(b, fi) { return false }
+    if uFieldElemKeyKindAt(a, fi) != uFieldElemKeyKindAt(b, fi) { return false }
     // A `Set<K>` field and a `{[K]: boolean}` field spell one index signature; the arena's set
     // flag is what tells them apart (D2493).
     const fnm = uFieldNames[uFieldStart[a] + fi]
@@ -11644,7 +11678,7 @@ export function collectU(stmts: i32[]) {
   uFieldLitTyIx = []
   uFieldElemName = []
   uFieldElemTyIx = []
-  uFieldElemKeyI32 = []
+  uFieldElemKeyKind = []
   variantSigMemoDrop()
   objVariantIndexDrop()
   let i = 0

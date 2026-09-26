@@ -772,7 +772,7 @@ export let sFieldElemTyIx: i32[] = []
 // type is an i32-keyed map (`{[i32]: V}`, or its `| null` twin), 0 otherwise. A map
 // field records only its value, and an mv slot's identity is the (key, value) pair, so
 // without this column an i32-keyed map field resolves its string-keyed twin's struct.
-export let sFieldElemKeyI32: i32[] = []
+export let sFieldElemKeyKind: i32[] = []
 export let sHeapIdx: i32[] = []
 // Structural slot dedup, the twin pattern `rlTwin`/`mvTwin`/`uVarTwin` repeat: VL is
 // structurally typed, so `type A = {v:i32}` and `type B = {v:i32}` must share one
@@ -898,6 +898,10 @@ export let mStructIdx = 0
 // keys-list type immediates differ. `mI32Used` gates the extra heap type; `mStructI32Idx` is that struct.
 export let mI32Used = false
 export let mStructI32Idx = 0
+// The i64-keyed twin (`{[i64]: V}`): `keys` is the i64 list over `ia64TypeIdx`, and the index
+// is the i32-keyed pair layout with a hash of the key as the pair's tag.
+export let mI64Used = false
+export let mStructI64Idx = 0
 // `slUsed` is set by `collectA` when a `string[]` field appears. It reuses the same
 // string-ref list types as the map's keys list, so the keys backing+wrapper types are
 // emitted whenever `slUsed || mUsed`, while the map struct stays gated on `mUsed` alone
@@ -906,12 +910,12 @@ export let slUsed = false
 // Ref-valued map table (per-(key,value) parameterization): a `{[string]: V}` whose V is
 // a reference cannot ride the monomorphic i32 `vals` list, so each distinct ref value
 // type interns its own 7-field map struct. Slot `-1` is mono i32-valued, `-2` a Set, `-3`
-// unsupported, `-4`/`-5` i32-keyed; `mvKeyI32` is the second half of a slot's (key,value) identity.
+// unsupported, `-4`/`-5` i32-keyed, `-6`/`-7` i64-keyed; `mvKeyKind` is the second half of a slot's (key,value) identity.
 export let mvValName: string[] = [] // canonical value type-name per slot
-// The KEY half of the slot's identity: 1 when this slot's map struct has the i32 keys
-// list (`lTypeIdx` over `aTypeIdx`), 0 for the string-ref keys list. Parallel to
-// `mvValName`; read through `mvSlotKeyI32`.
-export let mvKeyI32: i32[] = []
+// The KEY half of the slot's identity, a `typecheck.mapKeyKindOfTy` kind: which keys list the
+// slot's map struct has (string-ref, i32 or i64). Parallel to `mvValName`; read through
+// `mvSlotKeyKind`.
+export let mvKeyKind: i32[] = []
 // Arena-index sidecar parallel to `mvValName`, recorded by `recordMvValTyIx` — the
 // structural input the slot resolvers key on instead of re-comparing the recorded name string.
 export let mvValTyIx: i32[] = []
@@ -981,6 +985,9 @@ export let gHelpMapProbe = -1  // (keyHash, index, hashes, live, keysBack, key) 
 export let gHelpMapProbeI32 = -1 // (index, key) -> probe slot
 export let gHelpMapResize = -1 // (index, hashes, live, count, size) -> index'
 export let gHelpMapResizeI32 = -1 // (index, count) -> index'
+// The i64-keyed probe: the pair index again, whose tag is the key's hash, so a tag match is
+// confirmed against the keys backing. Emitted only when `mI64Used`; it resizes as i32-keyed.
+export let gHelpMapProbeI64 = -1 // (index, key i64, keysBack) -> probe slot
 // D1586 — the float remainder intrinsic: wasm has no `f64.rem` instruction, so `a % b`
 // over floats calls this once-per-module `fmod`, gated on `gNeedsF64Rem` (`scanPrintUse`
 // sets it; the f32 slice promotes in and demotes out, so one helper serves both widths).
@@ -991,7 +998,8 @@ export let gNeedsF64Rem = false
 export let gMapDeletes = false
 export let gHelpMapResync = -1 // (live, count, seq) -> cursor: a walk's step after compaction
 // One compaction helper per map shape, `(ref <mapTy>) -> ()`: row 0 the string-keyed mono map,
-// row 1 the i32-keyed one, row `2 + s` mv slot `s`; -1 where the shape has none.
+// row 1 the i32-keyed one, row `2 + s` mv slot `s`, the last row the i64-keyed one; -1 where
+// the shape has none.
 export let gHelpMapCompact: i32[] = []
 // String-literal pool: distinct string literals interned once as immutable module
 // globals, so an occurrence lowers as a `global.get` rather than a fresh allocation
@@ -1199,9 +1207,9 @@ export let uFieldLitTyIx: i32[] = []
 // The `sFieldElemTyIx` sidecar for VARIANT fields (destringify D5), recorded by
 // `recordUFieldElemRow`.
 export let uFieldElemTyIx: i32[] = []
-// The `sFieldElemKeyI32` key column for variant fields (B6b) — see that column's
+// The `sFieldElemKeyKind` key column for variant fields (B6b) — see that column's
 // header for why a map field row that carries only `V` cannot resolve its map struct.
-export let uFieldElemKeyI32: i32[] = []
+export let uFieldElemKeyKind: i32[] = []
 export let fnUsesMap = false
 export let mapScratchBase = 0
 // The i32-keyed map's own scratch slots, appended after the string-keyed frame so no
@@ -1209,6 +1217,9 @@ export let mapScratchBase = 0
 //   +0 keyI32 i32 (target key) . +1 keysBk (ref $aTypeIdx) (keys backing) . +2/+3 kOut/kSrc
 //   (ref $aTypeIdx) (`.keys()` output/source) . +4 mapRef (ref $mStructI32Idx), typed apart from the string frame's mono slot.
 export let mapI32Base = 0
+// The i64-keyed twin of that frame, reserved when `fnUsesMap && mI64Used`: +0 the i64 key,
+// +1 keysBk, +2/+3 kOut/kSrc (all `(ref $ia64TypeIdx)`), +4 mapRef (ref $mStructI64Idx).
+export let mapI64Base = 0
 // `m.keys()` / `for k in m` build a fresh string list of LIVE keys: a 6-slot frame —
 // outBack (ref $mkArrIdx), keysBack (ref $mkArrIdx), live (ref $aTypeIdx), then i/j/count
 // (3 i32). Reserved when the function builds a map's key list (`fnUsesMapKeys`).

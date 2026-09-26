@@ -2575,15 +2575,32 @@ function mkMapTy(key: i32, val: i32, isSet: i32) {
   addTy(t)
 }
 
-// The one home of which hash a `Map`/`Set` key takes: the rep has exactly two, `string`
-// (element-wise, `__str_hash__`) and `i32` (the integer mix). Answers the arena type the keys
-// hash as, or -1 for a key the rep cannot hold, and every gate projects this answer. The test is
-// the LOWERING, so a newtype hashes as its base and a literal union as the i32 it reps as (D1748).
+// The one home of which hash a `Map`/`Set` key takes: the rep has exactly three, `string`
+// (element-wise, `__str_hash__`), `i32` and `i64` (the integer mixes). Answers the arena type the
+// keys hash as, or -1 for a key the rep cannot hold, and every gate projects this answer. The test
+// is the LOWERING, so a newtype hashes as its base and a literal union as the i32 it reps as (D1748).
 export function mapKeyRepTy(k: i32) {
   if tyIsPrimNamed(k, "i32") { return TY_I32 }
   if tyIsPrimNamed(k, "string") { return TY_STR }
+  if tyIsPrimNamed(k, "i64") { return TY_I64 }
   if tyLitUnionHashesI32(k) { return TY_I32 }
+  // A numeric literal union over `i64` reps as that base, so it hashes as an i64 key.
+  if numLitUnionBaseTy(k) == TY_I64 { return TY_I64 }
   -1
+}
+
+// The key rep of a map key type as the emitter's key kind: `MAP_KEY_STR`, `MAP_KEY_I32` or
+// `MAP_KEY_I64`. A key the rep cannot hold answers the string kind, which is where every gate
+// that projected `mapKeyRepTy(k) == TY_I32` already sent it.
+export const MAP_KEY_STR = 0
+export const MAP_KEY_I32 = 1
+export const MAP_KEY_I64 = 2
+export function mapKeyKindOfTy(k: i32): i32 {
+  const r = mapKeyRepTy(k)
+  if r < 0 { return MAP_KEY_STR }
+  if r == TY_I32 { return MAP_KEY_I32 }
+  if r == TY_I64 { return MAP_KEY_I64 }
+  MAP_KEY_STR
 }
 
 // A literal union whose values rep as an i32, so the integer mix hashes them: a string one as
@@ -13704,7 +13721,7 @@ function initMapCtorName(initIx: i32) {
   return "Map"
 }
 
-// The one wording for a key the map rep cannot hash (`mapKeyTySupported` has exactly two
+// The one wording for a key the map rep cannot hash (`mapKeyTySupported` has exactly three
 // hashes). Both the annotation gate (`checkLetDeclNode`) and the usage-driven pin
 // (`checkInferredMapKey`) raise it, so the annotated and inferred spellings of one
 // program reject in the same channel with the same words.
@@ -13718,7 +13735,7 @@ function mapKeyUnsupportedMsg(keyText: string, ctor: string): string {
     + keyText
     + "-keyed "
     + ctor
-    + " isn't supported yet — `Map`/`Set` keys must be `string` or `i32`"
+    + " isn't supported yet — `Map`/`Set` keys must be `string`, `i32` or `i64`"
 }
 
 // Adjudicates the key a usage-driven pin (`m.set(k, v)`, `s.add(k)`, `m[k] = v`) just
@@ -40775,6 +40792,14 @@ export function numLitUnionArrayBaseName(ty: i32): string {
   ""
 }
 
+// Whether the key spelling `name` names a declared type (an alias, newtype or literal union)
+// whose values hash as an i64 key — the name leg's twin of `mapKeyRepTy`'s i64 answer.
+export function nameIsI64HashedKey(name: string): boolean {
+  const hit = cUserTypes[name]
+  if hit is i32 { return mapKeyRepTy(hit) == TY_I64 }
+  false
+}
+
 // Whether the named type `name` (a `type K = "a" | "b"` alias) is a literal union — the
 // emitter's annotation-side query (the checker preserves literal members even though the
 // emit-side `udVariants` are widened to `"string"`).
@@ -41455,37 +41480,39 @@ export function nodeTyMapName(ix: i32) {
   ""
 }
 
-// Whether node `ix`'s recorded type is an i32-keyed map (`{[i32]: V}`), one `| null` wrapper
-// tolerated — the span form `nameIsI32KeyedMap` has (accepting `{[i32]: V}[]` too). Kept wider
-// than the exact twin `nodeTyMapKeyIsI32` deliberately: its callers are type-minting flags,
-// where under-answering leaves a needed type unminted and the module invalid.
-export function nodeTyMapKeyIsI32Span(ix: i32): boolean {
+// The key kind of node `ix`'s recorded map type under one `| null` or any list depth — the span
+// form `nameIsI32KeyedMap` has (accepting `{[i32]: V}[]` too). Kept wider than the exact twin
+// `nodeTyMapKeyKind` deliberately: its callers are type-minting flags, where under-answering
+// leaves a needed type unminted and the module invalid.
+export function nodeTyMapKeyKindSpan(ix: i32): i32 {
   const ty = nodeTyIxOf(ix)
-  if ty < 0 { return false }
-  tyMapKeyIsI32Span(ty)
+  if ty < 0 { return MAP_KEY_STR }
+  tyMapKeyKindSpan(ty)
 }
 
-function tyMapKeyIsI32Span(ty: i32): boolean {
-  if ty < 0 { return false }
+function tyMapKeyKindSpan(ty: i32): i32 {
+  if ty < 0 { return MAP_KEY_STR }
   const t = T.tys[ty]
-  if t is TyMap { return mapKeyRepTy(t.mKey) == TY_I32 }
-  if t is TyNullable { return tyMapKeyIsI32Span(t.nInner) }
-  if t is TyArray { return tyMapKeyIsI32Span(t.aElem) }
-  false
+  if t is TyMap { return mapKeyKindOfTy(t.mKey) }
+  if t is TyNullable { return tyMapKeyKindSpan(t.nInner) }
+  if t is TyArray { return tyMapKeyKindSpan(t.aElem) }
+  MAP_KEY_STR
 }
 
-export function nodeTyMapKeyIsI32(ix: i32) {
+// The key kind (`mapKeyKindOfTy`) of node `ix`'s recorded map type, one `| null` wrapper
+// tolerated; `MAP_KEY_STR` for a node with no map type.
+export function nodeTyMapKeyKind(ix: i32): i32 {
   const ty = nodeTyIxOf(ix)
-  if ty < 0 { return false }
+  if ty < 0 { return MAP_KEY_STR }
   const t = T.tys[ty]
   if t is TyNullable {
-    if t.nInner < 0 || t.nInner >= T.tys.length { return false }
+    if t.nInner < 0 || t.nInner >= T.tys.length { return MAP_KEY_STR }
     const it = T.tys[t.nInner]
-    if it is TyMap { return mapKeyRepTy(it.mKey) == TY_I32 }
-    return false
+    if it is TyMap { return mapKeyKindOfTy(it.mKey) }
+    return MAP_KEY_STR
   }
-  if t is TyMap { return mapKeyRepTy(t.mKey) == TY_I32 }
-  false
+  if t is TyMap { return mapKeyKindOfTy(t.mKey) }
+  MAP_KEY_STR
 }
 
 // Whether node `ix` has a recorded nullable-struct type (`P | null`) — a cheap, no-render

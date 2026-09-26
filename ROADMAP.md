@@ -2117,7 +2117,8 @@ in-language GC knobs.
      a === b` true · a newtype fixture proving `Id` never prints as `string`. → **vl-de**.
   2. **Struct keys for `Map`/`Set`** — key-eligible = `==`-comparable; hash and `==` share one
      lowering (D1017 first); `-0.0` folds into `0.0` in the hash; the NaN-key and mutable-key
-     rules go in the `Map` header.
+     rules go in the `Map` header. `i64` keys SHIPPED ahead of it (2026-09-25, collections Q8
+     (a), D2505), as a key probe of their own.
   3. **SHIPPED (2026-09-25) as the alias version:** `Map<K, V>` / `Set<T>` are annotation-legal
      long spellings of `{[K]: V}` / `{[T]: boolean}`, and TS-style explicit type arguments work
      on `Map<K, V>()`, `Set<T>()` and every declared generic (`f<a>(b)` is a generic call; the
