@@ -982,6 +982,35 @@ function retKindIsList(k: VKind) {
     || k == "f32list"
 }
 
+// The arena type the checker inferred for un-annotated function `i`'s return, or -1.
+function fnInferredRetTy(i: i32): i32 {
+  if i < 0 || i >= fnStmts.length { return -1 }
+  const fn = P.nodes[fnStmts[i]]
+  if fn is FuncDecl {
+    if fn.fnRet >= 0 { return -1 }
+    let row = inferRetRowOf(inferRetFnKey(fnStmts[i], fn.fnName))
+    if row < 0 { row = inferRetRowByNode(fnStmts[i]) }
+    if row < 0 { return -1 }
+    return inferRetTyIxAt(row)
+  }
+  -1
+}
+
+// `map` or `nulmap` when function `i`'s checker-inferred return is a map or a nullable map,
+// else `null`: the answer a re-entered arm join gives, where the stored kind is still a seed.
+function fnCheckedRetMapKind(i: i32): VKind | null {
+  const t = fnInferredRetTy(i)
+  if t < 0 || t >= T.tys.length { return null }
+  const tt = T.tys[t]
+  if tt is TyMap { return "map" }
+  if tt is TyNullable {
+    if tt.nInner >= 0 && tt.nInner < T.tys.length {
+      if T.tys[tt.nInner] is TyMap { return "nulmap" }
+    }
+  }
+  null
+}
+
 // Whether un-annotated function `i`'s checker-inferred return has a registered literal union's
 // member set, asked by set as the return's narrowing asks it: a string-repped member read it
 // returns narrows at the return, so the signature must not follow that read's own rep (D2153).
@@ -1565,8 +1594,24 @@ function frameLetOfLive(bodyIx: i32, name: string) {
   if slot >= 0 && slot < localDeclIx.length {
     if localDeclIx[slot] >= 0 { return localDeclIx[slot] }
   }
-  if parentLetOwnedBy(bodyIx, sidOfNode(li), li) { return li }
+  if parentLetOwnedBy(bodyIx, sidOfNode(li), li) {
+    // The emitted frame's own binding over a module global is off the stack until declared.
+    if frameLetHiddenOverGlobal(bodyIx, name) { return -1 }
+    return li
+  }
   -1
+}
+
+// True when `bodyIx` is the body being emitted and `name` is a module global: that frame's
+// binding of it is on the scope stack once declared, so a miss there is a read above it (D2664).
+function frameLetHiddenOverGlobal(bodyIx: i32, name: string) {
+  if emitCurFnIx < 0 { return false }
+  const fn = P.nodes[emitCurFnIx]
+  if fn is FuncDecl {
+    if fn.fnBody != bodyIx { return false }
+    return globalLetOf(name) >= 0
+  }
+  false
 }
 
 // `globalLetOfSid` as read from inside function `fnIx`: -1 when the frame binds the name.
@@ -2986,7 +3031,7 @@ function fnAssignRetTargetName(fe: i32) {
         // across branches: every arm pushes its own target cell's rep. `ifTailAssignName`
         // joins them to one representative name, minted only when every arm's target cell
         // has the same result identity, so the dispatch below stays a plain cell answer.
-        if ts is IfStmt { return ifTailAssignName(tailx, fnStmts[fe]) }
+        if ts is IfStmt { return ifTailAssignNameGuarded(tailx, fe) }
         if ts is RetStmt {
           if ts.retArg < 0 { return "" }
           tailx = ts.retArg
@@ -3526,6 +3571,19 @@ function fnAssignCellEq(fnIx: i32, a: string, b: string) {
   if ka == null { return false }
   if kb == null { return false }
   if ka != kb { return false }
+  if fnAssignCellColumnsEq(fnIx, a, b) { return true }
+  // Two map cells also agree on one shape, one spelled and one inferred (D2662). `-3` is a
+  // value type with no rep, which names no shape to agree on.
+  if ka == "map" || ka == "nulmap" {
+    const sa = fnAssignCellMapShape(fnIx, a, ka)
+    if sa == -3 { return false }
+    return sa == fnAssignCellMapShape(fnIx, b, kb)
+  }
+  false
+}
+
+// The struct slot, ref-list element and declared spelling of two same-kind cells all agree.
+function fnAssignCellColumnsEq(fnIx: i32, a: string, b: string) {
   if fnAssignCellSlot(fnIx, a) != fnAssignCellSlot(fnIx, b) { return false }
   if fnAssignCellElem(fnIx, a) != fnAssignCellElem(fnIx, b) { return false }
   fnAssignCellTypeName(fnIx, a) == fnAssignCellTypeName(fnIx, b)
@@ -3558,6 +3616,17 @@ function ifTailArmsAgree(ifIx: i32, fnIx: i32, nm0: string) {
     return ifTailArmsAgree(s.ifElse, fnIx, nm0)
   }
   false
+}
+
+// `ifTailAssignName` for function `fe`, declining with "" on re-entry: comparing two arms'
+// cells can ask for a cell whose initializer calls `fe` itself, whose kind needs this answer
+// (D2662). Re-entered, that cell's map shape comes from the checked type of its call.
+function ifTailAssignNameGuarded(ifIx: i32, fe: i32) {
+  if tailAssignInFlight(fe) { return "" }
+  tailAssignFlight.push(fe)
+  const nm = ifTailAssignName(ifIx, fnStmts[fe])
+  tailAssignFlight.pop()
+  nm
 }
 
 // The one representative arm-tail assignment target of the tail `if` at `ifIx`, or "" — the
@@ -3608,7 +3677,11 @@ function armNarrowTy(blockIx: i32, fnIx: i32): i32 {
 // for its `nulstr` seed: one fact, two readers, or functype and value disagree.
 export function fnAssignRetKind(fe: i32): VKind | null {
   const nm = fnAssignRetTargetName(fe)
-  if nm == "" { return null }
+  if nm == "" {
+    // Re-entered from its own arm join: the checked return, never the provisional stored kind.
+    if tailAssignInFlight(fe) { return fnCheckedRetMapKind(fe) }
+    return null
+  }
   fnAssignCellKind(fnStmts[fe], nm)
 }
 
@@ -7220,6 +7293,13 @@ export function addLocalName(name: string, isRef: VKind, structIdx: i32) {
 // resolves from the slot the scope stack hands out. The `LetDecl` twin of `markLoopVarIter`.
 export function markLocalDecl(slot: i32, declIx: i32) {
   if slot >= 0 { localDeclIx[slot] = declIx }
+  0
+}
+
+// Hide a function's own binding of a name a module global also binds until its declaration,
+// as a nested block's binding is: a read above the `let` denotes the global (D2664).
+export function markLetOverGlobal(slot: i32, name: string) {
+  if slot >= 0 && globalLetOf(name) >= 0 { localBlockLet[slot] = 1 }
   0
 }
 
@@ -19380,10 +19460,24 @@ function paramMapShape(fnIx: i32, name: string) {
 // answer is the checker's own recorded type on the call node, never a bare -1 (D30).
 let retMapFlight: i32[] = []
 
+// The `fnStmts` positions whose tail-`if` assignment target is being joined further up the stack.
+let tailAssignFlight: i32[] = []
+
 // Drop any in-flight map-return resolution. Called from `emitProgram`'s state block.
 export function resetRetMapFlight() {
   retMapFlight = []
+  tailAssignFlight = []
   0
+}
+
+// True when `fe`'s tail-`if` assignment target is already being joined further up the stack.
+function tailAssignInFlight(fe: i32) {
+  let i = 0
+  while i < tailAssignFlight.length {
+    if tailAssignFlight[i] == fe { return true }
+    i = i + 1
+  }
+  false
 }
 
 // True when `fe`'s inferred map-return shape is already being resolved further up the stack.
@@ -19416,7 +19510,9 @@ function fnRetMapShapeAt(sid: i32, callIx: i32) {
     const fn = P.nodes[fnStmts[fe]]
     if fn is FuncDecl {
       if fn.fnRet >= 0 { return mapAnnShape(fn.fnRet) }
-      if retMapInFlight(fe) { return mapRecordedCallShape(callIx) }
+      if retMapInFlight(fe) || tailAssignInFlight(fe) {
+        return mapRecordedCallShape(callIx)
+      }
       return inferredRetMapSlot(fe)
     }
   }
@@ -35900,6 +35996,8 @@ export function exprMap(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return false }
   const e = P.nodes[exprIx]
   if e is Paren { return exprMap(e.parInner, fnIx) }
+  // A value `if` whose join lowers at the map rep (D2663).
+  if e is IfStmt { return ifExprRefKind(exprIx, fnIx) == "map" }
   if e is Call {
     const callee = P.nodes[e.callFn]
     // A `Set()` is a boolean-valued string map — the same struct — treated as a map
@@ -36441,6 +36539,8 @@ export function mapShapeOfExpr(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return -1 }
   const e = P.nodes[exprIx]
   if e is Paren { return mapShapeOfExpr(e.parInner, fnIx) }
+  // A value `if`: the shape of the arm its join's rep is read off, as `ifExprRefSlot` does.
+  if e is IfStmt { return mapShapeOfExpr(ifRepArmValueIx(exprIx), fnIx) }
   // A set-typed expression is the set shape whatever produced it: the flavor is the TYPE's
   // (`mSet`), so a set reached through a parameter, field or call walks its elements too.
   const sst = setShapeOfTy(nodeTyIxOf(exprIx))
