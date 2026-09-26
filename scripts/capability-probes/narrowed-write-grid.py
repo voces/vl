@@ -34,6 +34,7 @@ type B = { s: string }
 function useI(v: i32) { print(v + 1) }
 function useF(v: f64) { print(v * 2.0) }
 function flag(): boolean { false }
+function kk(n: i32): i32 { return n }
 """
 
 # member -> (type spelling, literal a, literal b, a read that needs the member, prints(a), prints(b))
@@ -93,7 +94,26 @@ def forms(u):
         t1 = is_test(mem[1])
         out.append(("isret", mem[0], lambda b, t1=t1: f"  if x is {t1} {{ return }}\n{b}"))
         out.append(("notisor", mem[0], lambda b, t0=t0: f"  if !(x is {t0}) || flag() {{ return }}\n{b}"))
+    if t0 and (len(mem) > 1 or nul):
+        # `else if` chains of depth 2 and 3: with no final `else` no arm runs and the place keeps
+        # its narrowing on that path; with one, the final `else` makes the write.
+        for depth in (2, 3):
+            for final in (False, True):
+                name = f"chain{depth}{'e' if final else ''}"
+                out.append((name, mem[0], lambda b, t0=t0, depth=depth, final=final: chain(t0, b, depth, final)))
     return out
+
+
+def chain(t0, body, depth, final):
+    w, r = [l.strip() for l in body.split("\n")]
+    arms = " else ".join(f"if kk(0) == {i + 1} {{ {w} }}" for i in range(depth))
+    if final:
+        arms += f" else {{ {w} }}"
+    return f"  if x is {t0} {{\n    {arms}\n    {r}\n  }}"
+
+
+def chain_fallthrough(form):
+    return form.startswith("chain") and not form.endswith("e")
 
 
 def use_u(u):
@@ -131,10 +151,17 @@ def cells():
                 else:
                     rt_m, rt_val = wm, "a"
                 post = "U" if wname == "union" else wm
+                if chain_fallthrough(fname):
+                    # no arm ran: the value is the entry's, and the type is the join with it
+                    rt_m, rt_val = init_m, "a"
+                    if post != init_m:
+                        post = "U"
                 reads = []
                 if post not in ("U", "null"):
                     reads.append(("rdW", M[post][3], M[post][4 if rt_val == "a" else 5], True))
-                if init_m == "f64" and post == "U":
+                if chain_fallthrough(fname) and post == "U" and wname != "union":
+                    reads.append(("rdOld", M[init_m][3], None, False))
+                elif init_m == "f64" and post == "U":
                     pass  # `i32 | f64` into an `f64` parameter is D2611, not this rule
                 elif init_m == "f64" and post == "i32":
                     reads.append(("rdOld", M["f64"][3], str(2 * int(M["i32"][1 if rt_val == "a" else 2])), True))
@@ -144,7 +171,7 @@ def cells():
                 if tst:
                     never = post not in ("U", "null") and post != init_m
                     reads.append(("isOld", f"print(x is {tst})", "true" if rt_m == init_m else "false", not never))
-                if nul:
+                if nul and not fname.startswith("chain"):
                     reads.append(("eqnull", "print(x == null)", "true" if rt_m == "null" else "false", True))
                 pv = "N" if rt_m == "null" else (M[rt_m][4] if rt_m in ("la", "lb") else rt_m)
                 reads.append(("pass", "useU(x)", pv, True))

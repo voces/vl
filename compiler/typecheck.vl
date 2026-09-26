@@ -1254,6 +1254,28 @@ function numericVariantUncovered(a: i32, b: i32): boolean {
   false
 }
 
+// Per `if` node and written key, the type the key holds after that `if`, as its arm join found
+// it: what an enclosing `if` whose `else` is this one reads as that arm's end.
+let narIfEnds: {[string]: i32} = Map()
+
+function narNoteChainEnd(ifIx: i32, key: string, ty: i32) {
+  if ty < 0 { return 0 }
+  narIfEnds[i32ToStr(ifIx) + "#" + key] = ty
+  0
+}
+
+// The end type of the `else if` link of the `if` at `ifIx` for `key`, or -1 when its `else` is
+// no `if`, or the link's own join recorded nothing for `key`.
+function narChainEndTy(ifIx: i32, key: string): i32 {
+  const n = P.nodes[ifIx]
+  if n is IfStmt {
+    if n.ifElse >= 0 && P.nodes[n.ifElse] is IfStmt {
+      return narIfEnds[i32ToStr(n.ifElse) + "#" + key] ?? -1
+    }
+  }
+  -1
+}
+
 // Is `name` already joined by a row in [lo, hi)? The join walks the ledger, which holds one row
 // per WRITE, so a name written twice would otherwise be joined twice.
 function narJoinSeen(lo: i32, hi: i32, name: string) {
@@ -1293,6 +1315,8 @@ function applyArmJoins(
     // One join per key, and a path only when neither arm left it UNKNOWN: a call that can write
     // the place takes the fact away, and a merged entry would hand it back (D1849).
     if !narJoinSeen(clobMark, i, nm) {
+      // This pass's answer replaces an earlier check's, which may have been at other types.
+      narIfEnds[i32ToStr(ix) + "#" + nm] = -1
       // A name THIS `if`'s condition narrows enters its two arms at two different types, and
       // the join of that partition is the type it already had — nothing to install.
       if (
@@ -1310,8 +1334,15 @@ function applyArmJoins(
         const entryTy = narClobEntryTy(clobMark, nm)
         if ok && entryTy >= 0 {
           let jt = -1
+          // An `else if` link has no block of its own: its end type is its own chain's join,
+          // which counts the path where none of its arms ran (D2627).
+          let chainEnd = -1
+          if narJoinSeen(elseLo, elseHi, nm) {
+            chainEnd = narChainEndTy(ix, nm)
+          }
           if thenDiverges {
             jt = narArmEndTy(elseLo, elseHi, nm, elseOwnDepth, entryTy)
+            if chainEnd >= 0 { jt = chainEnd }
           } else if elseDiverges {
             jt = narArmEndTy(thenLo, thenHi, nm, thenOwnDepth, entryTy)
           } else {
@@ -1320,11 +1351,13 @@ function applyArmJoins(
             let ee = entryTy
             if hasElse {
               ee = narArmEndTy(elseLo, elseHi, nm, elseOwnDepth, entryTy)
+              if chainEnd >= 0 { ee = chainEnd }
             }
             // The ELSE side first, so a one-armed join renders in the declaration's own order
             // (`i64 | boolean`, not `boolean | i64`) — the diagnostic below reads it.
             jt = narJoinTys(ee, te)
           }
+          narNoteChainEnd(ix, nm, jt)
           if path {
             // A path installs into the OVERLAY: it has no shadowing `declare` to write through,
             // and the entry pops with the block the code below the `if` lives in — the same
@@ -1343,6 +1376,10 @@ function applyArmJoins(
             if jt >= 0 && cur >= 0 && jt != cur {
               const d = lookupDepth(nm)
               if d >= 0 { T.scopes[d][nm] = jt }
+              recordArmJoin(ix, nm, jt)
+            } else if jt >= 0 && chainEnd >= 0 {
+              // The `else if` link installed it already, but only this statement's join
+              // reaches the emitter (D2627).
               recordArmJoin(ix, nm, jt)
             }
           }
@@ -4424,6 +4461,7 @@ export function initChecker() {
   isVarTyIx = []
   asgNarTyIx = []
   asgKeepNarrow = Map()
+  narIfEnds = Map()
   isTyColCap = 0
   isVarTyIxCap = 0
   pgVoid = []
@@ -7688,7 +7726,7 @@ function retireNarrowingsForWrite(tgtIx: i32, rt0: i32, atIx: i32) {
       const pre = lookup(nm)
       let rn = writeReNarrowTy(dcl, rt)
       // What the arm join reads a write that kept its narrowing as ending at.
-      const keptEnd = rn
+      let keptEnd = rn
       let retires = writeRetiresNarrowing(nm, rt, nm, pre)
       // Under a guard the write re-narrows to what it stored, as a declaration-typed write
       // would, even when the narrowing already admitted it (`5` into an `f64` arm).
@@ -7696,6 +7734,8 @@ function retireNarrowingsForWrite(tgtIx: i32, rt0: i32, atIx: i32) {
         rn = writeNarrowAfter(dcl, pre, asgLitRhsTy(atIx, dcl, rt))
         retires = !tySame(rn, pre)
         if !retires { asgKeepNarrow[atIx] = true }
+        // A kept write over a declaration with no `null` ends at the member it kept.
+        if !tyAdmitsNull(dcl) { keptEnd = rn }
       }
       if retires {
         // The RETIREMENT goes back in place, so it outlives whatever inner block holds the
@@ -42312,6 +42352,7 @@ export function checkProgram(rootIx: i32) {
   isParentElseTyIx = []
   asgNarTyIx = []
   asgKeepNarrow = Map()
+  narIfEnds = Map()
   pgVoid = []
   joinHead = []
   joinName = []
