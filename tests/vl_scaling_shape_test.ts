@@ -442,12 +442,12 @@ axis(
   0.25,
 );
 
-// D2398's pair: the start function asks each top-level node its order key, and a moved write
-// keyed by a list scan made the module-scope arm quadratic (0.96 s at 8,000, 3.82 s at 16,000).
+// D2398's pair: the start function orders each top-level node, and a moved write keyed by a
+// list scan made the module-scope arm quadratic (0.96 s at 8,000, 3.82 s at 16,000).
 axis(
   "module-scope value writes",
   2.5,
-  "`startOrderKey` (compiler/emit_rewrite.vl) is scanning the moved nodes per merge step.",
+  "The start function's merge (`startStmtOrd`, compiler/emit_sections.vl) is scanning per step.",
   (d) => twoFiles(d, genValueWrites(12000, false), genValueWrites(12000, true)),
 );
 
