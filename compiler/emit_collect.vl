@@ -73,6 +73,7 @@ import {
   isBoolLitExpr,
   isTransparentAlias,
   isValueUnionName,
+  letNullHoleFilledTy,
   litUnionAliasNameOfTy,
   litUnionAliasOfLitTexts,
   litUnionInlineNameOfTy,
@@ -552,6 +553,7 @@ import {
   genTyParamArr,
   genTyParamNulArr,
   globalLetOf,
+  identChainTyBoxedUnion,
   ifExprNliName,
   internInlineShape,
   internInlineShapeTy,
@@ -648,6 +650,7 @@ import {
   nulVariantIdxOfLet,
   objVariantIndexDrop,
   objVariantName,
+  parentBindingFrameArenaOf,
   parentBindingOf,
   preStmtNarrow,
   pushPostGuardNarrow,
@@ -1089,6 +1092,36 @@ export function synthNullableAnn(letIx: i32) {
   0
 }
 
+// Synthesize the annotation of a `let x = null` whose hole a later write filled, from the type
+// the checker filled it with, so the binding takes its annotated twin's `T | null` cell (D2597).
+// Before the union registration reads `letType`, which then mints a box the type needs.
+export function synthNullHoleAnn(letIx: i32) {
+  const s = P.nodes[letIx]
+  if s is LetDecl {
+    if s.letType >= 0 || s.letInit < 0 { return 0 }
+    if !(P.nodes[unwrapParen(s.letInit)] is NullLit) { return 0 }
+    const hty = letNullHoleFilledTy(letIx)
+    if hty < 0 { return 0 }
+    const nm = tyToEmitName(hty)
+    if nm == "" { return 0 }
+    let synTyIx = hty
+    if nulNumLitUnionBaseName(hty) != "" { synTyIx = -1 }
+    s.letType = synthTypeRefTy(nm, -1, synTyIx)
+  }
+  0
+}
+
+// The arm types a narrowed read's synthesized annotation may name: the scalars and `string`,
+// each a rep of its own that the box's arm unboxes to.
+function narrowedReadPrimAnnotates(pn: string) {
+  pn == "i32"
+    || pn == "i64"
+    || pn == "f64"
+    || pn == "f32"
+    || pn == "boolean"
+    || pn == "string"
+}
+
 // Synthesize the scalar annotation of an un-annotated binding whose initializer is a name the
 // checker read narrowed off its value-union box: the lowering replays that narrowing and reads
 // the scalar, while a classifier with no narrowing in force reads the box (D2513).
@@ -1097,10 +1130,17 @@ export function synthNarrowedReadAnn(letIx: i32, fnIx: i32) {
   if s is LetDecl {
     if s.letType >= 0 || s.letInit < 0 { return 0 }
     const ri = unwrapParen(s.letInit)
-    if ri < 0 || !(P.nodes[ri] is Ident) { return 0 }
+    if ri < 0 { return 0 }
+    const rid = P.nodes[ri]
+    if !(rid is Ident) { return 0 }
     const pn = nodeTyPrimName(ri)
-    if pn != "i32" && pn != "i64" && pn != "f64" && pn != "f32" { return 0 }
-    if !exprUnion(ri, fnIx) { return 0 }
+    if !narrowedReadPrimAnnotates(pn) { return 0 }
+    if exprIsLitAtom(ri, fnIx) { return 0 }
+    // The frame's locals are not registered when a capture is synthesized, so a local's box
+    // is asked of the arena through its `let` chain as well.
+    if !exprUnion(ri, fnIx) && !identChainTyBoxedUnion(rid.identName, fnIx, 4) {
+      return 0
+    }
     s.letType = synthTypeRefTy(pn, -1, nodeTyIxOf(ri))
   }
   0
@@ -2125,6 +2165,58 @@ export function synthCaptureEmptyListAnns() {
         synthNullableAnn(b)
       }
       ci = ci + 1
+    }
+    fe = fe + 1
+  }
+  0
+}
+
+// Synthesize the annotation of an un-annotated binding copied from a name the checker typed a
+// nullable LIST, from that recorded type: the copied name's own cell is resolved only through
+// the frame's locals, which a capture's classifier does not have (D2599).
+function synthNulListCopyAnn(letIx: i32) {
+  const s = P.nodes[letIx]
+  if s is LetDecl {
+    if s.letType >= 0 || s.letInit < 0 { return 0 }
+    const ri = unwrapParen(s.letInit)
+    if ri < 0 || !(P.nodes[ri] is Ident) { return 0 }
+    const ty = nodeTyIxOf(ri)
+    if ty < 0 { return 0 }
+    const t = T.tys[ty]
+    if !(t is TyNullable) { return 0 }
+    if t.nInner < 0 { return 0 }
+    if !(T.tys[t.nInner] is TyArray) { return 0 }
+    const nm = tyToEmitName(ty)
+    if nm == "" { return 0 }
+    s.letType = synthTypeRefTy(nm, -1, ty)
+  }
+  0
+}
+
+// The capture-scope runs of the read-copy syntheses, ahead of return inference: an
+// un-annotated captured binding copied from another name is classified, for its env field and
+// for a closure yielding it, in a frame whose locals and narrowings are not in force (D2598).
+export function synthCaptureReadAnns() {
+  // A declared top-level function captures nothing, and scanning its body is the cost.
+  const declared: {[i32]: i32} = Map()
+  let tk = 0
+  while tk < topFnNodes.length {
+    declared[topFnNodes[tk]] = 1
+    tk = tk + 1
+  }
+  let fe = 0
+  while fe < fnStmts.length {
+    if !declared.has(fnStmts[fe]) {
+      const caps = captureNamesOf(fe)
+      let ci = 0
+      while ci < caps.length {
+        const b = parentBindingOf(fe, caps[ci])
+        if b >= 0 {
+          synthNarrowedReadAnn(b, parentBindingFrameArenaOf(fe, caps[ci]))
+          synthNulListCopyAnn(b)
+        }
+        ci = ci + 1
+      }
     }
     fe = fe + 1
   }
@@ -11520,6 +11612,7 @@ function collectInlineUnionsIn(stmts: i32[], walk: i32[]) {
       }
       if collectInlineUnionsBlock(stmts, fnBody) < 0 { return -1 }
     } else if s is LetDecl {
+      synthNullHoleAnn(walk[i])
       const letTy = s.letType
       // Arena walk first (bucket (c) ordering — see the return-type site).
       if collectTyReachRegister(stmts, nodeTyIxOf(letTy), 16, false) < 0 {

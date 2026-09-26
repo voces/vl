@@ -994,6 +994,9 @@ let nhPendIxs: i32[] = []
 let nhPendTys: i32[] = []
 let nhPendDepths: i32[] = []
 let nhUnfilledIxs: i32[] = []
+// The holes a write did fill, as LetDecl node and its filled `T | null`, banked at the same close.
+let nhFilledIxs: i32[] = []
+let nhFilledTys: i32[] = []
 
 // D1589 — a `??` typed against an open hole is a promise, not an answer: `x ?? d` read before
 // the fill takes `nonNullTy` of a `nInner == -1` nullable, which is the hole itself. These
@@ -1446,6 +1449,18 @@ export function letNullHoleUnfilled(letIx: i32): boolean {
     i = i + 1
   }
   false
+}
+
+// The `T | null` a write filled the A-infer-null hole of LetDecl `letIx` with, or -1 for a
+// binding that is not such a hole or that nothing filled. Answered after the scope closed.
+export function letNullHoleFilledTy(letIx: i32): i32 {
+  if letIx < 0 { return -1 }
+  let i = 0
+  while i < nhFilledIxs.length {
+    if nhFilledIxs[i] == letIx { return nhFilledTys[i] }
+    i = i + 1
+  }
+  -1
 }
 
 // Record an un-annotated empty-collection binding for the deferred scope-close check.
@@ -1983,7 +1998,12 @@ function flushNullHoles(depth: i32) {
       if ty >= 0 && ty < T.tys.length {
         const t = T.tys[ty]
         if t is TyNullable {
-          if t.nInner < 0 { nhUnfilledIxs.push(nhPendIxs[i]) }
+          if t.nInner < 0 {
+            nhUnfilledIxs.push(nhPendIxs[i])
+          } else {
+            nhFilledIxs.push(nhPendIxs[i])
+            nhFilledTys.push(ty)
+          }
         }
       }
     } else {
@@ -4094,6 +4114,8 @@ export function initChecker() {
   nhPendTys = []
   nhPendDepths = []
   nhUnfilledIxs = []
+  nhFilledIxs = []
+  nhFilledTys = []
   chPendNodes = []
   chPendTys = []
   chPendGiven = []
@@ -44893,6 +44915,14 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
             // which is what the `let x: T | null = null` / `x = mk()` / `x.f` pattern rides.
             noteNarShadow(asgTgt.identName, asgCur, NAR_KIND_ASG)
             declare(asgTgt.identName, nonNullTy(asgCur))
+          } else if asgCt.nInner < 0 && rtT is TyNullable {
+            // A nullable write fills the hole from its non-null part and narrows nothing: the
+            // value may still be null, and an unfilled hole would type the binding `null` (D2597).
+            if rtT.nInner >= 0 {
+              asgCt.nInner = widenLitTy(rtT.nInner)
+              tyMutEpoch = tyMutEpoch + 1
+              fillCoalHoleNodes(asgCur)
+            }
           }
         }
       }
