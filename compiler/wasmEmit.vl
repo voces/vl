@@ -132,15 +132,19 @@ import {
   Call,
   CharLit,
   ContinueStmt,
+  ErrExpr,
+  FieldDef,
   FieldInit,
   ForIn,
   ForRange,
   FuncDecl,
   Ident,
   IfStmt,
+  ImportDecl,
   Index,
   IsExpr,
   LetDecl,
+  MatchExpr,
   Member,
   NullLit,
   NumLit,
@@ -148,6 +152,7 @@ import {
   OptMember,
   Param,
   Paren,
+  Program,
   RetStmt,
   Spread,
   StrLit,
@@ -11035,6 +11040,10 @@ function emitStrConcat(body: u8[], binIx: i32, fnIx: i32) {
     // the maximal chain and `emitStrCatN` buys it back with one sized allocation and copy.
     const parts: i32[] = []
     strCatParts(binIx, fnIx, parts)
+    if binIx == ssArmRhs {
+      ssArmRhs = -1
+      return emitStrSiteCat(body, parts, ssArmMode, ssArmBin, fnIx)
+    }
     if parts.length > 2 { return emitStrCatN(body, parts, fnIx) }
     // Eval BOTH operands onto the stack (nested string ops complete here) and call
     // the shared `__str_concat__` helper — the allocate+copy core lives once per
@@ -11364,10 +11373,346 @@ function strAccScan(blockIx: i32, fnIx: i32) {
   saDecls = []
   saApps = []
   saBads = []
+  saSites = []
   saFnIx = fnIx
   saKnownOnly = false
   if !fnUsesStrOp { return 0 }
   strAccWalk(blockIx, fnIx, 0, false)
+  ssWalk(blockIx, fnIx, 0)
+  0
+}
+
+// ── the site-cached string append ─────────────────────────────────────────────
+// `p = p + parts` or `p = parts + p` in a loop, for a place the proof above does not cover. A
+// site's `SB` is the buffer it allocated last and `SE` that buffer's frontier; nothing else writes
+// `SB`, so a view ending at `SE` extends in place and any other copies (DECISIONS.md "String building is a lowering").
+let saSites: i32[] = []
+
+// True if `a` and `b` spell the same place: one node, or equal non-empty `strPlaceKey`s.
+function strSamePlace(a: i32, b: i32): boolean {
+  const x = unwrapParen(a)
+  const y = unwrapParen(b)
+  if x < 0 || y < 0 { return false }
+  if x == y { return true }
+  const k = strPlaceKey(x)
+  k != "" && k == strPlaceKey(y)
+}
+
+// A canonical spelling of the place at `ix` — a name, or a field or index chain over one
+// keyed by names and literals — or "" when it is not such a place.
+function strPlaceKey(ix: i32): string {
+  const u = unwrapParen(ix)
+  if u < 0 { return "" }
+  const n = P.nodes[u]
+  match n {
+    Ident => {
+      return "i" + n.identName
+    }
+    NumLit => {
+      return "n" + n.numText
+    }
+    StrLit => {
+      return "s" + i32ToStr(n.strText.length) + ":" + n.strText
+    }
+    Member => {
+      const o = strPlaceKey(n.memObj)
+      if o == "" { return "" }
+      return o + "." + n.memProp
+    }
+    Index => {
+      const o = strPlaceKey(n.idxArr)
+      const k = strPlaceKey(n.idxIndex)
+      if o == "" || k == "" { return "" }
+      return o + "[" + k + "]"
+    }
+    CharLit | BoolLit | NullLit | Unary | BinExpr | Call | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {
+      // Not an access chain: two spellings of a call or an operator need not read one place.
+      return ""
+    }
+  }
+}
+
+// The place a chain part reads: the part itself, or the left side of a `??` over it.
+function strPartPlace(ix: i32): i32 {
+  const u = unwrapParen(ix)
+  if u < 0 { return -1 }
+  const n = P.nodes[u]
+  if n is BinExpr {
+    if n.binOp == "??" { return n.binLeft }
+  }
+  u
+}
+
+// The site shape of the assignment at `binIx`: 1 an append (the chain's first part reads
+// the target), 2 a prepend (its last part does), 0 neither.
+function strSiteMode(binIx: i32, fnIx: i32): i32 {
+  const a = P.nodes[binIx]
+  if a is BinExpr {
+    if a.binOp != "=" { return 0 }
+    if !exprIsStrConcat(a.binRight, fnIx) { return 0 }
+    const parts: i32[] = []
+    strCatParts(a.binRight, fnIx, parts)
+    if parts.length < 2 { return 0 }
+    if strSamePlace(a.binLeft, strPartPlace(parts[0])) { return 1 }
+    if strSamePlace(a.binLeft, strPartPlace(parts[parts.length - 1])) {
+      return 2
+    }
+  }
+  0
+}
+
+// Note every site inside a loop of this body. A nested function is its own body.
+function ssWalk(ix: i32, fnIx: i32, depth: i32) {
+  if ix < 0 { return 0 }
+  const n = P.nodes[ix]
+  if n is FuncDecl { return 0 }
+  if n is BinExpr {
+    if depth > 0 && n.binOp == "=" {
+      if strSiteMode(ix, fnIx) > 0 { saSites.push(ix) }
+    }
+  }
+  if n is WhileStmt {
+    ssWalk(n.whileCond, fnIx, depth)
+    ssWalk(n.whileBody, fnIx, depth + 1)
+    return 0
+  }
+  if n is ForRange {
+    ssWalk(n.frBody, fnIx, depth + 1)
+    return 0
+  }
+  if n is ForIn {
+    ssWalk(n.fiBody, fnIx, depth + 1)
+    return 0
+  }
+  // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
+  let cur = ix
+  while cur >= 0 {
+    const kids = nodeSpineChildren(cur)
+    let i = 0
+    while i < kids.length {
+      ssWalk(kids[i], fnIx, depth)
+      i = i + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  0
+}
+
+// The site mode of the assignment at `binIx` when the scan noted it for this body, else 0.
+// Re-derived with the emit-time scope, like `strAccAppendOk`.
+function strSiteModeAt(binIx: i32, fnIx: i32): i32 {
+  if saFnIx != fnIx { return 0 }
+  let i = 0
+  while i < saSites.length {
+    if saSites[i] == binIx { return strSiteMode(binIx, fnIx) }
+    i = i + 1
+  }
+  0
+}
+
+// The chain root `emitStrConcat` lowers as a site, its mode, and the assignment it
+// belongs to; -1 when none is armed.
+let ssArmRhs = -1
+let ssArmMode = 0
+let ssArmBin = -1
+
+// Arm the site lowering for the assignment at `binIx`, or disarm it.
+function strSiteArm(binIx: i32, fnIx: i32) {
+  ssArmRhs = -1
+  const mode = strSiteModeAt(binIx, fnIx)
+  if mode == 0 { return 0 }
+  const a = P.nodes[binIx]
+  if a is BinExpr {
+    ssArmRhs = a.binRight
+    ssArmMode = mode
+    ssArmBin = binIx
+  }
+  0
+}
+
+// The site's `SB` local (`liBack` 24, keyed by the assignment node); `SE` is the next
+// slot. Minted on first use and reused for the rest of the function.
+function strSiteSlot(binIx: i32): i32 {
+  let i = 0
+  while i < liBack.length {
+    if liBack[i] == 24 && liSlots[i] == binIx {
+      return listIdxScratchBase + i + 1
+    }
+    i = i + 1
+  }
+  liKinds.push("i32")
+  liSlots.push(binIx)
+  liBack.push(24)
+  liKinds.push("i32")
+  liSlots.push(binIx)
+  liBack.push(25)
+  listIdxScratchBase + liKinds.length - 1
+}
+
+// Lower an armed site's chain, parts evaluated in the copying lowering's order. `mode` 1
+// extends what part 0 read, 2 what the last part read. A miss allocates `len + 2*added + 16`,
+// so a one-off append costs little; a full hit doubles, which is what makes a loop linear.
+function emitStrSiteCat(
+  body: u8[],
+  parts: i32[],
+  mode: i32,
+  binIx: i32,
+  fnIx: i32,
+) {
+  const n = parts.length
+  let i = 0
+  while i < n {
+    if emitStrValue(body, parts[i], fnIx) < 0 { return -1 }
+    i = i + 1
+  }
+  let j = n - 1
+  while j >= 0 {
+    fbLocalSet(strCatSlot(j))
+    j = j - 1
+  }
+  const sb = strSiteSlot(binIx)
+  const se = sb + 1
+  let acc = 0
+  if mode == 2 { acc = n - 1 }
+  // I0 = the added length: every part but the accumulator.
+  fbI32Const(0)
+  let k = 0
+  while k < n {
+    if k != acc {
+      fbLocalGet(strCatSlot(k))
+      fbStrLen()
+      fbI32Bin(106) // i32.add
+    }
+    k = k + 1
+  }
+  fbLocalSet(strScratchBase + 3)
+  fbLocalGet(strCatSlot(acc))
+  fbStrLen()
+  fbLocalSet(strScratchBase + 4) // I1 = the accumulator's length
+  fbLocalGet(strCatSlot(acc))
+  fbStrStart()
+  fbLocalSet(strScratchBase + 6) // I3 = its start
+  fbLocalGet(strCatSlot(acc))
+  fbStrBack()
+  fbLocalSet(strScratchBase + 2) // OUT = its backing
+  // I2 = ours: this site's buffer, and a view whose edge is the frontier.
+  fbLocalGet(strScratchBase + 2)
+  fbLocalGet(sb)
+  wU8(211) // 0xd3 ref.eq
+  fbLocalGet(strScratchBase + 6)
+  if mode == 1 {
+    fbLocalGet(strScratchBase + 4)
+    fbI32Bin(106)
+  }
+  fbLocalGet(se)
+  fbI32Bin(70)  // i32.eq
+  fbI32Bin(113) // i32.and
+  fbLocalSet(strScratchBase + 5)
+  // Grow unless ours and the slack on the growing side holds the parts.
+  fbLocalGet(strScratchBase + 5)
+  if mode == 1 {
+    fbLocalGet(strScratchBase + 6)
+    fbLocalGet(strScratchBase + 4)
+    fbI32Bin(106)
+    fbLocalGet(strScratchBase + 3)
+    fbI32Bin(106)
+    fbLocalGet(strScratchBase + 2)
+    fbArrayLen()
+    fbI32Bin(76) // i32.le_s
+  } else {
+    fbLocalGet(strScratchBase + 6)
+    fbLocalGet(strScratchBase + 3)
+    fbI32Bin(78) // i32.ge_s
+  }
+  fbI32Bin(113)
+  fbI32Eqz()
+  fbIf(64) // void
+  fbLocalGet(strScratchBase + 2)
+  fbLocalSet(strScratchBase + 7) // ABK = the old backing
+  fbLocalGet(strScratchBase + 4)
+  fbLocalGet(strScratchBase + 3)
+  fbI32Bin(106)
+  fbI32Const(1)
+  fbI32Bin(116) // 2 * (len + added): a full hit doubles
+  fbLocalGet(strScratchBase + 4)
+  fbLocalGet(strScratchBase + 3)
+  fbI32Const(1)
+  fbI32Bin(116)
+  fbI32Bin(106) // len + 2 * added: a miss
+  fbLocalGet(strScratchBase + 5)
+  fbSelect()
+  fbI32Const(16)
+  fbI32Bin(106)
+  fbArrayNewDefault(sBackIdx)
+  fbLocalTee(strScratchBase + 2)
+  fbLocalSet(sb)
+  if mode == 2 {
+    // A prepend buffer keeps its value at the END, its slack in front.
+    fbLocalGet(strScratchBase + 2)
+    fbArrayLen()
+    fbLocalGet(strScratchBase + 4)
+    fbI32Bin(107) // i32.sub
+    fbLocalSet(strScratchBase + 5)
+  } else {
+    fbI32Const(0)
+    fbLocalSet(strScratchBase + 5)
+  }
+  fbLocalGet(strScratchBase + 2)
+  fbLocalGet(strScratchBase + 5)
+  fbLocalGet(strScratchBase + 7)
+  fbLocalGet(strScratchBase + 6)
+  fbLocalGet(strScratchBase + 4)
+  fbArrayCopy(sBackIdx, sBackIdx)
+  fbLocalGet(strScratchBase + 5)
+  fbLocalSet(strScratchBase + 6)
+  fbEnd()
+  // I3 becomes the result's start and I2 the first write offset; SE the new frontier.
+  if mode == 1 {
+    fbLocalGet(strScratchBase + 6)
+    fbLocalGet(strScratchBase + 4)
+    fbI32Bin(106)
+    fbLocalTee(strScratchBase + 5)
+    fbLocalGet(strScratchBase + 3)
+    fbI32Bin(106)
+    fbLocalSet(se)
+  } else {
+    fbLocalGet(strScratchBase + 6)
+    fbLocalGet(strScratchBase + 3)
+    fbI32Bin(107)
+    fbLocalTee(strScratchBase + 6)
+    fbLocalTee(strScratchBase + 5)
+    fbLocalSet(se)
+  }
+  let m = 0
+  let left = n - 1
+  while m < n {
+    if m != acc {
+      fbLocalGet(strScratchBase + 2)
+      fbLocalGet(strScratchBase + 5)
+      fbLocalGet(strCatSlot(m))
+      fbStrBack()
+      fbLocalGet(strCatSlot(m))
+      fbStrStart()
+      fbLocalGet(strCatSlot(m))
+      fbStrLen()
+      fbArrayCopy(sBackIdx, sBackIdx)
+      left = left - 1
+      if left > 0 {
+        fbLocalGet(strScratchBase + 5)
+        fbLocalGet(strCatSlot(m))
+        fbStrLen()
+        fbI32Bin(106)
+        fbLocalSet(strScratchBase + 5)
+      }
+    }
+    m = m + 1
+  }
+  fbLocalGet(strScratchBase + 2)
+  fbLocalGet(strScratchBase + 6)
+  fbLocalGet(strScratchBase + 4)
+  fbLocalGet(strScratchBase + 3)
+  fbI32Bin(106)
+  fbStrNew()
   0
 }
 
@@ -11380,9 +11725,15 @@ export function strAccScanStart() {
   saDecls = []
   saApps = []
   saBads = []
+  saSites = []
   saFnIx = -1
   saKnownOnly = false
   if !fnUsesStrOp { return 0 }
+  let si = 0
+  while si < startStmts.length {
+    ssWalk(startStmts[si], -1, 0)
+    si = si + 1
+  }
   // Declarations first: a function is HOISTED, so a body assigning to a global can be walked
   // before the global's own `let`, and a mark that arrived before the row would be lost. Only
   // a CANDIDATE mints a row — `saFind` is a linear scan, so one row per top-level binding
@@ -17055,6 +17406,7 @@ function emitAssign(body: u8[], binIx: i32, fnIx: i32) {
     // six delivery positions; `sidOfNode(lhsIx)` is load-bearing since a `Paren` node interns its own sid.
     const lhsIx = unwrapParen(a.binLeft)
     const target = P.nodes[lhsIx]
+    strSiteArm(binIx, fnIx)
     if target is Ident {
       // the loop-local accumulator: a binding proven by `strAccScan` to append in place
       // into its own buffer's slack instead of allocating a fresh exact-fit string per

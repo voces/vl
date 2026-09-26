@@ -5778,9 +5778,38 @@ an append mentions it (which is what makes evaluating the parts before reading `
 unobservable); and no nested function mentions it. At least one self-append must be inside a
 loop, so a straight-line `s = s + x` keeps the bytes it had.
 
-NOT DONE, deliberately: a module GLOBAL accumulator. The declaration and the assignment sit
-in different scope units, so proving the invariant needs a module-wide walk rather than a
-per-function one; the pattern stays quadratic and is filed in ROADMAP item 7.
+A module GLOBAL accumulator appended at top level is the same proof over the whole module
+(#2920, `strAccScanStart`).
+
+**The site-cached append: every other place, proven at run time (D2625, 2026-09-26).** The
+binding proof cannot reach a field (`o.s = o.s + x`), a list cell, a map value
+(`m[k] = (m[k] ?? "") + x`), a global appended inside a function, a parameter, or a PREPEND
+(`s = x + s`) — each of those copied its whole prefix per append, 10–20 s for 160,000 appends.
+A static proof for them would have to see every write to the place anywhere in the program:
+struct copies, list `.slice`s, map values, generic std code. So these take a RUNTIME rule
+instead. Each `p = p + parts` or `p = parts + p` inside a loop owns two function locals: `SB`,
+the buffer that site allocated last, and `SE`, its frontier (for a prepend, the lowest start).
+The invariant is that no view into `SB` extends past `SE` (starts before it): `SB` was fresh
+when the site made it, only this site in this frame ever writes it, and it writes only
+beyond the frontier and moves the frontier with it. So a value `v` may be extended in place
+exactly when `v.backing == SB` (`ref.eq`) and `v`'s edge is `SE`; every other value — an
+alias of an older snapshot, a string shared with another place, one a part's call appended to
+meanwhile — copies into a fresh buffer that becomes `SB`. No aliasing argument is needed, so
+the rule applies to any place, and a stale answer can only cost a copy.
+
+EXACTNESS: the parts, the place's own read included, are evaluated exactly as the copying
+lowering evaluates them, left to right and once; only the allocation differs, so the
+evaluation order and every printed value are the copying lowering's (an aliasing grid over
+every shape and a 40-seed randomized mix of appends, prepends, snapshots, restores and shared
+strings agree with the copying compiler line for line). A miss allocates
+`len + 2*added + 16` (a one-off append pays a little slack, not a doubling) and a full hit
+doubles, which is what makes a loop linear. The binding proof still wins where it applies —
+its lowering has no test — so a proven local keeps its bytes.
+
+Two shapes stay quadratic, filed rather than guessed at: a site outside any loop reached from
+a caller's loop (D2669 — the locals live one call, and module-lifetime storage needs the site
+count before the global section is written), and one site cycling over several strings (D2670
+— one cached buffer per site). Ropes stay the owner's held option.
 
 **Why not a separate buffer with a materialisation point** (Part D's option B as written).
 It needs two extra locals, a loop-entry hook, a materialisation at every loop EXIT including

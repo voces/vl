@@ -1,0 +1,223 @@
+// @run
+// @log ab ab012345 ab012345zzz ab0,ab01,ab012,ab0123,ab01234,ab012345
+// @log qwwwxxxx qwwwyyyy
+// @log aaa0246 aaa1357
+// @log 0126789 0,01,012,0123,01234,012345,0126,01267,012678,0126789
+// @log ello hello!? hello!?!?!?!?!?### hello!?!?!?!?!?###
+// @log [0][1][2][3][4][5][6] [0],[0][1],[0][1][2],[0][1][2][3],[0][1][2][3][4],[0][1][2][3][4][5],[0][1][2][3][4][5][6]
+// @log s111aaaa,s111bbbb s111cc,s111cc
+// @log mmm mmmxxxx mmmyyyy
+// @log ppp76510E qqq76510E 0E,10E,210E,3210E,43210E,510E,6510E,76510E <Z,<<Z,<<<Z,<<<<Z,<<<<<Z
+// @log <<<<<<M>>>>>> M>,<M>,<M>>,<<M>>,<<M>>>,<<<M>>>,<<<M>>>>,<<<<M>>>>,<<<<M>>>>>,<<<<<M>>>>>,<<<<<M>>>>>>,<<<<<<M>>>>>>
+// @log keeeeey 1 4 true
+// @log g|0|1|2|3|4 g|,g|0|,g|0|1|,g|0|1|2|,g|0|1|2|3|
+// @log p0123 p++++ p
+// The site-cached append is a lowering, not a spelling (D2625).
+// `p = p + parts` and `p = parts + p` in a loop extend `p` in place when `p` is a view ending at
+// the frontier of the buffer that assignment allocated last, whatever place `p` is — a field, a
+// list cell, a map value, a global. Every line below prints the same thing on a compiler that
+// copies on each append; the shapes are the ones an in-place grow could break: an alias taken
+// before, during or after the appends, one string shared by two places or two objects at one
+// site, a restored older snapshot, a slice, a part that appends to the same field, and an
+// append and a prepend on one string.
+import { toString } from "std:fmt"
+import { join } from "std:str"
+
+// An alias taken before, during and after appends to a field.
+function fieldSnap() {
+  const o = { s: "ab" }
+  const t0 = o.s
+  const snaps: string[] = []
+  for k in 0 until 6 {
+    o.s = o.s + toString(k)
+    snaps.push(o.s)
+  }
+  const t1 = o.s
+  for k in 0 until 3 { o.s = o.s + "z" }
+  print("\{t0} \{t1} \{o.s} \{snaps.join(",")}")
+}
+
+// Two fields share one string and are appended at two sites in one loop.
+function twoFieldsShare() {
+  const a = { s: "q" }
+  for k in 0 until 3 { a.s = a.s + "w" }
+  const b = { s: a.s }
+  for k in 0 until 4 {
+    a.s = a.s + "x"
+    b.s = b.s + "y"
+  }
+  print("\{a.s} \{b.s}")
+}
+
+// One site, two objects sharing a string, round robin.
+function oneSiteTwoObjs() {
+  const o1 = { s: "" }
+  for k in 0 until 3 { o1.s = o1.s + "a" }
+  const o2 = { s: o1.s }
+  const objs = [o1, o2]
+  for i in 0 until 8 {
+    const o = objs[i % 2]
+    o.s = o.s + toString(i)
+  }
+  print("\{o1.s} \{o2.s}")
+}
+
+// An older snapshot restored mid-loop; the snapshots taken after it must not change.
+function restoreSnapshot() {
+  const o = { s: "" }
+  const keep: string[] = []
+  for k in 0 until 10 {
+    o.s = o.s + toString(k)
+    keep.push(o.s)
+    if k == 5 { o.s = keep[2] }
+  }
+  print("\{o.s} \{keep.join(",")}")
+}
+
+// A slice alias, and one object reached through two names.
+function sliceAndObjAlias() {
+  const o = { s: "hello" }
+  const p = o
+  const u = o.s.slice(1, 5)
+  for k in 0 until 5 {
+    o.s = o.s + "!"
+    p.s = p.s + "?"
+  }
+  const v = o.s.slice(0, 7)
+  for k in 0 until 3 { o.s = o.s + "#" }
+  print("\{u} \{v} \{o.s} \{p.s}")
+}
+
+// A part that appends to the same field of the same object: the outer append's read came first.
+const g = { s: "" }
+function bump(k: i32) {
+  if k % 3 == 0 {
+    for j in 0 until 2 { g.s = g.s + "<" + toString(k) + ">" }
+  }
+  "[\{toString(k)}]"
+}
+function reentrant() {
+  const seen: string[] = []
+  for k in 0 until 7 {
+    g.s = g.s + bump(k)
+    seen.push(g.s)
+  }
+  print("\{g.s} \{seen.join(",")}")
+}
+
+// List cells sharing a string, and a copied list.
+function listShare() {
+  const xs = ["s", ""]
+  for k in 0 until 3 { xs[0] = xs[0] + "1" }
+  xs[1] = xs[0]
+  const ys = xs.slice(0, 2)
+  for k in 0 until 4 {
+    xs[0] = xs[0] + "a"
+    xs[1] = xs[1] + "b"
+    ys[k % 2] = ys[k % 2] + "c"
+  }
+  print("\{xs.join(",")} \{ys.join(",")}")
+}
+
+// Map values sharing a string.
+function mapShare() {
+  const m: {[string]: string} = Map()
+  m["a"] = ""
+  for k in 0 until 3 { m["a"] = (m["a"] ?? "") + "m" }
+  m["b"] = m["a"] ?? ""
+  const t = m["a"] ?? ""
+  for k in 0 until 4 {
+    m["a"] = (m["a"] ?? "") + "x"
+    m["b"] = (m["b"] ?? "") + "y"
+  }
+  print("\{t} \{m["a"] ?? ""} \{m["b"] ?? ""}")
+}
+
+// Prepends: snapshots, a restore, two sharers, and a local.
+function prependGrid() {
+  const o = { s: "E" }
+  const keep: string[] = []
+  for k in 0 until 8 {
+    o.s = toString(k) + o.s
+    keep.push(o.s)
+    if k == 4 { o.s = keep[1] }
+  }
+  const b = { s: o.s }
+  for k in 0 until 3 {
+    o.s = "p" + o.s
+    b.s = "q" + b.s
+  }
+  let el = "Z"
+  const els: string[] = []
+  for k in 0 until 5 {
+    el = "<" + el
+    els.push(el)
+  }
+  print("\{o.s} \{b.s} \{keep.join(",")} \{els.join(",")}")
+}
+
+// An append and a prepend on one string in one loop.
+function mixed() {
+  const o = { s: "M" }
+  const keep: string[] = []
+  for k in 0 until 6 {
+    o.s = o.s + ">"
+    keep.push(o.s)
+    o.s = "<" + o.s
+    keep.push(o.s)
+  }
+  print("\{o.s} \{keep.join(",")}")
+}
+
+// A nested place, map keys taken from the accumulator, and an equality.
+function nestedAndKeys() {
+  const q = { a: { s: "k" }, n: 0 }
+  const seen: {[string]: i32} = Map()
+  for k in 0 until 5 {
+    q.a.s = q.a.s + "e"
+    seen[q.a.s] = k
+  }
+  const t = q.a.s
+  q.a.s = q.a.s + "y"
+  print(
+    "\{q.a.s} \{toString(seen["kee"] ?? -1)} \{toString(seen[t] ?? -1)} \{toString(t == "keeeee")}",
+  )
+}
+
+// A module global appended in a function's loop and in a helper.
+let out = "g"
+function emitLine(k: i32) { out = out + toString(k) }
+function globalGrid() {
+  const snap: string[] = []
+  for k in 0 until 5 {
+    out = out + "|"
+    snap.push(out)
+    emitLine(k)
+  }
+  print("\{out} \{snap.join(",")}")
+}
+
+// A compound assignment on a parameter copy and on a field.
+function param(s0: string) {
+  let s = s0
+  const o = { s: s0 }
+  for k in 0 until 4 {
+    s += toString(k)
+    o.s += "+"
+  }
+  "\{s} \{o.s} \{s0}"
+}
+
+fieldSnap()
+twoFieldsShare()
+oneSiteTwoObjs()
+restoreSnapshot()
+sliceAndObjAlias()
+reentrant()
+listShare()
+mapShare()
+prependGrid()
+mixed()
+nestedAndKeys()
+globalGrid()
+print(param("p"))

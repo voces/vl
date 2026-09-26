@@ -529,8 +529,14 @@ export const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3:
     // D2370: a module that never deletes grows no `live` array per map, so both rungs lose that
     // grow site: `allocs` 95 -> 93 and 46 -> 44, `-O` 7960 -> 7889 and `-O3` 2472 -> 2397 bytes.
     // `fns` and `refEq` unchanged.
-    O: { bytes: 7889, fns: 16, allocs: 93, indirect: 0, refEq: 1 },
-    O3: { bytes: 2397, fns: 6, allocs: 44, indirect: 0, refEq: 1 },
+    // D2625: `std:fmt`'s digit loop prepends, so it takes the site-cached append — one grow
+    // site (`array.new_default` + header) and one `ref.eq` frontier test: `allocs` 93 -> 95 and
+    // 44 -> 46, `refEq` 1 -> 2, bytes +160 / +240. Key building is 0.15 -> 0.10 s. The probe
+    // loop's code is unchanged, yet reads ~1.6x under the default collector: master's garbage
+    // forced one copying collection that compacted the keys, the new build's did not. Under
+    // `VL_GC=none` (no compaction in either) the whole run is 3.30 -> 3.10 s at 300 passes.
+    O: { bytes: 8049, fns: 16, allocs: 95, indirect: 0, refEq: 2 },
+    O3: { bytes: 2637, fns: 6, allocs: 46, indirect: 0, refEq: 2 },
   },
   // MAP PROBE WITHOUT THE STRING COST. i32 keys, so this isolates the bucket walk and the
   // `?? -1` sentinel path from hashing and content compare — the two rows differ by exactly
@@ -587,8 +593,12 @@ export const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3:
     // above) — `-O3` 3140 -> 3383 bytes, structure unchanged; `-O` stayed within band.
     // D2370: no `live` grow in a module that never deletes (the i32-keyed map also drops its
     // `hashes`): `allocs` 101 -> 98 and 52 -> 49, `-O` 8568 -> 8702, `-O3` 3383 -> 3278 bytes.
-    O: { bytes: 8702, fns: 16, allocs: 98, indirect: 0, refEq: 1 },
-    O3: { bytes: 3278, fns: 6, allocs: 49, indirect: 0, refEq: 1 },
+    // D2625: the document builder's `doc = doc + …` is declared twice under one name, so the
+    // binding proof declined it; both appends now take the site-cached lowering, and
+    // `std:fmt`'s digit loop a third: `allocs` 98 -> 104 and 49 -> 54, `refEq` 1 -> 4, bytes
+    // +477 / +467. Timed interleaved, 0.77 -> 0.80 s (unchanged within the box's noise).
+    O: { bytes: 9179, fns: 16, allocs: 104, indirect: 0, refEq: 4 },
+    O3: { bytes: 3745, fns: 6, allocs: 54, indirect: 0, refEq: 4 },
   },
   // ARRAY ELEMENT WRITE + READ, 400M of each, with the allocation hoisted out of the steady
   // state by construction. `fns: 1` is the load-bearing pin: every element accessor has been
