@@ -20497,6 +20497,15 @@ export function genTyParamArr(name: string) {
   genTyParamLeaf(arrLeafNameOf(name))
 }
 
+// True when `name` is `(T | null)[]` for a declared type parameter `T` — the nullable twin of
+// `genTyParamArr`, which declines every ref-array name and so never sees this one (D2525).
+export function genTyParamNulArr(name: string) {
+  if genTyParamNames.length == 0 && gaeBases.length == 0 { return false }
+  if !nameIsRefArray(name) { return false }
+  const inner = nullablePartOf(refArrElemName(name))
+  inner != "" && genTyParamLeaf(inner)
+}
+
 // The registered union the checker typed this array literal's element as, or "" — the one
 // home `arrLitIsRef`, `arrLitElemKind`, and `arrLitElemName` each need an arm for. A call or
 // an ident element is neither an object literal, nested literal, nor lambda, so the
@@ -24006,6 +24015,47 @@ function gaeArgIsTyParam(arg: string) {
   true
 }
 
+// Whether field spelling `ft` is `(P | null)[]` over the alias's own parameter `P`, applied
+// here at a generic application (`Box<GB<i32>>`). The row's field resolves no ref-list slot of
+// its own (`sFieldRefSlot` answers another list's), so a list literal holding `null` builds at a
+// union box; the application is refused until that slot is interned (D2525's boundary).
+function gaeNulParamListAtApp(ft: string, pnames: string[], args: string[]) {
+  if !nameIsArray(ft) { return false }
+  const tp = nullablePartOf(normTypeAtom(arrElemNameRaw(ft)))
+  if tp == "" { return false }
+  let i = 0
+  while i < pnames.length && i < args.length {
+    if pnames[i] == tp { return annGenAppSpanEnds(normTypeAtom(args[i])) }
+    i = i + 1
+  }
+  false
+}
+
+// Whether `name` applies a generic record alias with a `(P | null)[]` field over its own
+// parameter `P` (`IdTable<Tex>`). A lambda cloned at such an instance reads the field's
+// element at the wrong heap (D2525), so the monomorphizer refuses that instance.
+export function gaeAppHasNulParamListField(name: string) {
+  if !annGenAppSpanEnds(name) { return false }
+  const gi = gaeIndexOf(gaeHeadNameOf(name, gaeLtAt(name)))
+  if gi < 0 { return false }
+  const pnames: string[] = []
+  gaeSplitArgs(gaeParams[gi], pnames)
+  let fi = 0
+  while fi < gaeFieldCount[gi] {
+    const ft = gaeFieldTyNames[gaeFieldStart[gi] + fi]
+    if nameIsArray(ft) {
+      const tp = nullablePartOf(normTypeAtom(arrElemNameRaw(ft)))
+      let pi = 0
+      while pi < pnames.length {
+        if tp != "" && pnames[pi] == tp { return true }
+        pi = pi + 1
+      }
+    }
+    fi = fi + 1
+  }
+  false
+}
+
 // Interns the application `name` ("Box<i32>") as a struct shape, once. A field the emitter
 // cannot type (an unbound param, an unsupported shape) leaves the application un-interned —
 // its use then fails loudly downstream, never a trap.
@@ -24050,6 +24100,13 @@ export function gaeEnsure(name: string) {
   let fi = 0
   while fi < fc {
     const tn = gaeApplyFieldTy(gaeFieldTyNames[fs + fi], pnames, args)
+    if gaeNulParamListAtApp(gaeFieldTyNames[fs + fi], pnames, args) {
+      return emitFail(
+        "emitProgram: a nullable-"
+          + nullablePartOf(normTypeAtom(arrElemNameRaw(tn)))
+          + " list element has no rep; use a non-null element type",
+      )
+    }
     // A field that is ITSELF an application (or an array of one) interns
     // depth-first, so the ref/elem lookups below resolve.
     gaeEnsure(arrLeafNameOf(tn))
@@ -24074,6 +24131,15 @@ export function gaeEnsure(name: string) {
       // the one arm this path does not share with the shape-text table. The trailing-`[]`
       // cut is dischargeable: `code == 5` implies `nameIsArray(tn)`, so the two forms compute the identical slice.
       elem = arrElemNameRaw(tn)
+      // A nullable-struct element keys its slot by the paren-free spelling, as the declared
+      // struct's code-5 arm records it; the raw `(S | null)` keys no slot (D2528).
+      if (
+        nullablePartOf(normTypeAtom(elem)) != ""
+        && !isValueUnionName(normTypeAtom(elem))
+      ) {
+        const e5 = refArrElemName(tn)
+        if e5 != "" { elem = e5 }
+      }
     } else if code >= 0 {
       // Codes 15/16/4 are recorded identically from the field's spelling: the nested
       // target, the union name, and the atom-array name. This path deliberately records ""

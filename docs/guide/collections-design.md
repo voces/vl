@@ -46,6 +46,10 @@ with `m[k] = true`, since `.add` is a Set method. A set and a map whose value is
 `Map` or `Set` with no type arguments is not a type — the checker says
 `` `Map` needs its key and value types — write `Map<K, V>` ``.
 
+**What each operation costs** — its complexity, which is contract, and a measured time — is
+on [the cost page](costs.md), with when `u8[]`, a `Buf`, or `std:idtable`'s `IdTable<V>` (a
+table keyed by small ids you hand out yourself) is the right tool.
+
 A map is an ordinary field type, so the struct glean's VL-033 wanted is:
 
 ```vl
@@ -55,8 +59,8 @@ it.index.set("main", 0)
 print(it.index["main"] ?? -1)
 ```
 
-Keys must be `string` or `i32` (anything else is a named refusal, at `Map<f64, i32>` as at
-`{[f64]: i32}`). An EMPTY collection needs its key and value types from somewhere: a
+Keys must be `string`, `i32` or `i64` (anything else is a named refusal, at `Map<f64, i32>` as
+at `{[f64]: i32}`). An EMPTY collection needs its key and value types from somewhere: a
 constructor that names them (`const m = Map<string, i32>()`), an annotation on its
 destination, or a later use. `const m = Map()` with none of those is
 `cannot infer a type for 'm'`, exactly as `const xs = []` is.

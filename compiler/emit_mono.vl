@@ -29,6 +29,7 @@ import {
   TyFunc,
   TyNullable,
   TyObj,
+  TyUnion,
   TyVar,
   bindGenWalk,
   blockHasBareReturn,
@@ -73,6 +74,7 @@ import {
   tyIsMap,
   tyRenderSoftensLits,
   tyToEmitName,
+  tyToStr,
   uniqueGenericDeclNamed,
 } from "./typecheck"
 import {
@@ -188,9 +190,11 @@ import {
   recordedParamPinName,
 } from "./emit_rewrite"
 import {
+  buildFnChildIndex,
   caResumeArmed,
   emitRootIx,
   fmResumeArmed,
+  fnChildHead,
   fnDispNames,
   fnInstOrigin,
   fnParent,
@@ -248,6 +252,7 @@ import {
   fnRetExprOf,
   fnSigKeyOf,
   fnStmtsPosOf,
+  gaeAppHasNulParamListField,
   identClosureFeAt,
   identFnTypeAnnName,
   isSName,
@@ -1218,6 +1223,81 @@ function monoBindCols(params: i32[], tyCol: i32[], bN: string[], bT: i32[]) {
   0
 }
 
+// Whether the generic being instantiated declares a lambda. A lambda reading a `(T | null)[]`
+// element reaches D2535's unboxing gap when `T` is a union, and a wrong heap when `T` is a
+// generic record that itself holds a `(P | null)[]`, so both refuse while this is set (D2525).
+let monoCurHasLam = false
+
+// Whether the generic at `fnStmts` position `slot` is the frame of any other lifted function.
+function monoFnDeclaresLambda(slot: i32): boolean {
+  if fnChildHead.length != fnStmts.length { buildFnChildIndex() }
+  if slot < 0 || slot >= fnChildHead.length { return false }
+  fnChildHead[slot] >= 0
+}
+
+// Refuses a union element read inside a lambda, off the argument's arena type: a literal
+// union binds `T` by its softened base name, so only the argument still shows the union.
+function monoLamNulUnionListCheck(argTy: i32) {
+  if !monoCurHasLam || argTy < 0 || argTy >= T.tys.length { return 0 }
+  const a = T.tys[argTy]
+  if a is TyArray {
+    if a.aElem >= 0 && a.aElem < T.tys.length {
+      const e = T.tys[a.aElem]
+      if e is TyNullable {
+        if (
+          e.nInner >= 0
+          && e.nInner < T.tys.length
+          && T.tys[e.nInner] is TyUnion
+        ) {
+          return emitFail(
+            "emitProgram: a nullable-"
+              + tyToStr(e.nInner)
+              + " list element has no rep; use a non-null element type",
+          )
+        }
+      }
+    }
+  }
+  0
+}
+
+// Refuses an instance whose `(T | null)[]` annotation binds `T` where `T | null` is a niche
+// rather than a box or a nullable reference: a string, boolean, literal-union or function
+// element. Those instances read the element at the template's rep (D2525).
+function monoNicheNulListCheck(
+  ann: string,
+  typarams: string[],
+  tvN: string[],
+  tvV: string[],
+) {
+  if !nameIsArray(ann) { return 0 }
+  const tp = nullablePartOf(normTypeAtom(arrElemNameRaw(ann)))
+  if tp == "" { return 0 }
+  let isParam = false
+  let i = 0
+  while i < typarams.length {
+    if typarams[i] == tp { isParam = true }
+    i = i + 1
+  }
+  if !isParam { return 0 }
+  const b = normTypeAtom(monoBindOf(tvN, tvV, tp))
+  if b == "" { return 0 }
+  if (
+    b == "string"
+    || b == "boolean"
+    || nameIsLitUnionType(b)
+    || annArrowAt(b) >= 0
+    || (monoCurHasLam && gaeAppHasNulParamListField(b))
+  ) {
+    return emitFail(
+      "emitProgram: a nullable-"
+        + b
+        + " list element has no rep; use a non-null element type",
+    )
+  }
+  0
+}
+
 // Substitute a `LetDecl` annotation `letType` through the instance binding, returning a
 // fresh `TypeRef` when a type param substitutes (`T[]` → `f64[]`), else the original node
 // index — so a generic body's `const out: T[] = []` lowers against the instance's concrete
@@ -1234,6 +1314,7 @@ function monoSubstLetType(
   const tn = P.nodes[letType]
   if tn is TypeRef {
     if monoAnnMentionsTyParam(letType, tn.tyName, typarams) {
+      monoNicheNulListCheck(tn.tyName, typarams, tvN, tvV)
       const sub = monoSubstAnn(tn.tyName, typarams, tvN, tvV)
       if sub != "" && sub != tn.tyName {
         // The substituted type, not a re-parse of the substituted name; the name handed
@@ -2100,7 +2181,12 @@ function monoPinBodyLambdas(
   if n is FuncDecl {
     if monoFnNameIsSourceNamed(n.fnName) {
       monoCloneLambdaSubst(ix, typarams, tvN, tvV, bN, bT)
+      return ix
     }
+    // An anonymous lambda reached here is a value — a `return` argument or a block's tail —
+    // and gets its per-instance clone as a binding's initialiser does (D2525).
+    const acl = monoCloneLambdaSubst(ix, typarams, tvN, tvV, bN, bT)
+    if acl >= 0 { return acl }
     return ix
   }
   if n is RetStmt {
@@ -3681,6 +3767,7 @@ function monoMakeInstance(
   // either again, so that test is `monoOrigNode`'s length wearing another name.
   const fn = P.nodes[monoOrigNode[origFe]]
   if fn is FuncDecl {
+    monoCurHasLam = monoFnDeclaresLambda(origFe)
     const params = fn.fnParams
     let key = i32ToStr(origFe) + "#" + monoKeyExtra
     monoKeyExtra = ""
@@ -3788,6 +3875,8 @@ function monoMakeInstance(
           if pinned[pj] == tyNameOf(p3.parType) {
             nt = p3.parType
           } else {
+            monoNicheNulListCheck(tyNameOf(p3.parType), fn.fnTyParams, tvN, tvV)
+            monoLamNulUnionListCheck(pinTys[pj])
             nt = synthTypeRefFb(pinned[pj], -1, pinTys[pj])
             synthed = true
           }
@@ -3859,6 +3948,9 @@ function monoMakeInstance(
     // bare `T` / `T[]`, an application (`Box<T>`), or an inline object shape
     // (`{first:B,second:A}`); a concrete annotation passes through unchanged.
     let nret = fn.fnRet
+    if nret >= 0 {
+      monoNicheNulListCheck(tyNameOf(nret), fn.fnTyParams, tvN, tvV)
+    }
     // A hole-built return list local to annotate in the cloned instance body, so its `[]`
     // build classifies per element type. Captured from the return trace below and threaded
     // into `monoCloneBody`, which clones and annotates just that `LetDecl` per instance.
