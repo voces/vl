@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""The grid behind #3175's recorded price: the 7 cells of its review grid (`<type>__<body>__<pos>`)
-that moved loud -> silent into a defect master already has in another spelling. D2594 is a
-popped map or set bound and returned; D2595 is an un-annotated `Map()` in a generic at a
-literal-union `T`. Writes the cells and the `manifest.json` that `d243/mkset.py` reads.
+"""The grid behind #3175's recorded price: the 8 cells of its review grid (`<type>__<body>__<pos>`)
+that moved loud -> silent or trap into a defect master already has in another spelling. D2594
+is a popped map bound and returned; D2595 is a `Map()` in a generic at a literal-union `T`;
+D2596 is a null `string | null` variable stored into a map. Writes the cells and the `manifest.json` that `d243/mkset.py` reads.
 
     python3 scripts/silent-sweep/rv3175/gen.py /tmp/rv3175grid
     python3 scripts/silent-sweep/d243/mkset.py /tmp/rv3175set \\
@@ -47,6 +47,11 @@ CELLS = {
   "grid": "lit__map_val_inf__direct",
   "src": "type P = { x: i32 }\ntype Dir = \"n\" | \"s\"\ntype Box<T> = { v: T }\nconst A1: Dir = \"n\"\nconst A2: Dir = \"s\"\nfunction show(v: Dir) {\n  print(v)\n}\nfunction f<T>(x: T): {[string]: T} {\n  const m = Map()\n  m[\"k\"] = x\n  m\n}\nconst r = f(A1)[\"k\"]\nif r != null { show(r) } else { print(\"none\") }\n",
   "want": "n"
+ },
+ "d2596_mapval_inf__nstr": {
+  "grid": "ns__mapval_inf",
+  "src": "const B: string | null = null\nfunction f<T>(x: T): {[string]: T} { const m = Map(); m[\"k\"] = x; m }\nconst r = f(B)[\"k\"]\nif r == null { print(\"null\") } else { print(r) }\n",
+  "want": "null"
  }
 }
 
