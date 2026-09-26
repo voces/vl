@@ -7993,10 +7993,10 @@ narrowing form (`is`, `!= null`, `== null` with an early return, an `||` guard, 
   by one it widens to: a one-branch `x = 1.5` under `x is i32` leaves `i32 | f64`, not `f64`
   (D2627). A value of such a union is refused where only its widest member is expected (`f64`),
   because no delivery converts the box yet (D2611, open); `is` re-tests it.
-* *A null test after a write.* A guard's narrowing makes `x == null` an impossible comparison,
-  and it stays refused with no write. After a write under the guard the storage may hold `null`
-  again, so the test is a real question for the rest of that scope, as after an assignment's
-  narrowing.
+* *A null test after a write.* After a write under a guard the storage may hold `null` again,
+  so the test is a real question for the rest of that scope, as after an assignment's
+  narrowing. Where the value is proved non-null the test is dead, which the next section rules
+  a warning.
 * *In a loop.* A write in a loop that may leave a narrowing made outside the loop ends that
   narrowing before the loop starts, in both halves, as a call that may write it does (the
   "before a loop" rule above), since the reads above the write run again after it. The loop
@@ -8019,6 +8019,20 @@ running to refused, all one shape: a one-branch write of a widening member whose
 false on the run, read where the other member is expected, e.g. `if x is f64 { if c0() { x = 5 };
 useF64(x) }`. The same program with the condition true trapped on master; it is refused now as
 D2611's union-to-`f64` delivery. No other cell that ran on master changed.
+
+**A NULL TEST OF A VALUE PROVED NON-NULL IS A WARNING (owner ruling, 2026-09-26, option (a) of
+open-rulings §dead-null-test).** `x == null` or `x != null` over a value whose type admits no
+`null` (by its declaration, a narrowing or a write) compiles, with the warning "`x == null` is
+always false here (x is A | B)" (lint code `dead-null-test`, the channel `recordDeadCoalesce`
+already uses for a dead `??` default), and the emitter lowers it to its constant: the operand
+runs for its effects unless it is a bare name, and is never read as nullable. This follows
+TypeScript's split. An impossible `match` arm, `is` member or literal comparison stays an
+ERROR (D2198 stands): those name a member the type does not have, where a null test only
+asks a question whose answer is already known. "No member admits `null`" is decided by
+`assignable(null, T)` as well as the member walk, so a recursive alias that hides a `null`
+arm (`Json`) keeps its real test. The ruling lets the assignment narrowing take its path twin
+(D1848): `o.v = 5` over `o.v: i32 | null` strips `null` for the code after it, and the three
+fixtures that null-test a binding read out of such a field run with the warning.
 
 **AN ASSIGNMENT'S NARROWING REACHES A BODY ONLY WHERE NO `null` CAN FOLLOW (D2529).** A guard's
 narrowing reaches a closure called by its handle through D2402's per-call check. An assignment's

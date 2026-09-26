@@ -92,6 +92,7 @@ import {
   nodeTyMapValIsNulLitUnion,
   nodeTyMapValLitUnionTexts,
   nodeTyPinIxOf,
+  nodeTyProvesNonNull,
   nodeTyRecord,
   nodeUnwidenedTyOf,
   nodeWideStrLitText,
@@ -2312,6 +2313,39 @@ function isStrTagUnionNameOf(exprIx: i32, fnIx: i32) {
     }
   }
   ""
+}
+
+// The operand of `x == null` / `null == x` whose checked type admits no `null`, or -1.
+function deadNullTestOperand(e: BinExpr): i32 {
+  const l = unwrapParen(e.binLeft)
+  const r = unwrapParen(e.binRight)
+  if l < 0 || r < 0 || l >= P.nodes.length || r >= P.nodes.length { return -1 }
+  if (
+    P.nodes[r] is NullLit
+    && !(P.nodes[l] is NullLit)
+    && nodeTyProvesNonNull(l)
+  ) {
+    return l
+  }
+  if (
+    P.nodes[l] is NullLit
+    && !(P.nodes[r] is NullLit)
+    && nodeTyProvesNonNull(r)
+  ) {
+    return r
+  }
+  -1
+}
+
+// Lower a dead null test to its constant: the operand runs for its effects unless it is a
+// bare name, and is never read as nullable (DECISIONS.md, the dead null test).
+function emitDeadNullTest(body: u8[], opIx: i32, isNe: boolean, fnIx: i32) {
+  if !(P.nodes[opIx] is Ident) {
+    if emitExpr(body, opIx, fnIx) < 0 { return -1 }
+    fbDrop()
+  }
+  if isNe { fbI32Const(1) } else { fbI32Const(0) }
+  0
 }
 
 // The null test for a nullable value — `x == null`/`x != null` and the `x is null`/`x is
@@ -24788,6 +24822,11 @@ function emitBinExprNode(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
   // `k`, push `vals[hit]` on a hit else the default `d`. The self-host checker reads
   // every scope map through `?? -1`. The LHS must be a map index in this slice.
   if e.binOp == "??" { return emitCoalesce(body, e, exprIx, fnIx) }
+  // A null test of a value the checker proved non-null is dead: its answer is a constant.
+  if e.binOp == "==" || e.binOp == "!=" {
+    const dnIx = deadNullTestOperand(e)
+    if dnIx >= 0 { return emitDeadNullTest(body, dnIx, e.binOp == "!=", fnIx) }
+  }
   // Short-circuit `&&`/`||` lower to a value-typed `if` (blocktype 0x7f): `a && b` is `if (a)
   // { b } else { 0 }`, `a || b` is `if (a) { 1 } else { b }`. The right operand is a narrowing
   // scope like an `if` arm — `&&` narrows it with `setNarrowFromCond`, `||` with

@@ -226,6 +226,7 @@ import {
   rcoalCol,
   rcoalEnd,
   rcoalLine,
+  rcoalMsg,
   rcoalTok,
   rcoalType,
   redunECol,
@@ -7679,6 +7680,19 @@ function retireNarrowingsForWrite(tgtIx: i32, rt0: i32, atIx: i32) {
     }
     i = i + 1
   }
+  // The assignment narrowing's path twin: a non-null write to a field or list cell no narrowing
+  // covers strips `null` for the code after it, as `x = 5` does a name (D1848). A map cell's
+  // `null` is the miss, which a write says nothing about beyond this key, so it is left out.
+  if preSlot < 0 && pathReTy < 0 && !placeIsMapCell(tgtIx) {
+    const pst = placeStoreTy(tgtIx)
+    if pst >= 0 && rt >= 0 && tyAdmitsNull(pst) && !tyAdmitsNull(rt) {
+      const nn = nonNullTy(pst)
+      if nn >= 0 && !tySame(nn, pst) {
+        pathReTy = nn
+        recordAsgNarTyIx(atIx, nn)
+      }
+    }
+  }
   if pathReTy >= 0 {
     npKeys.push(tgtKey)
     npTys.push(pathReTy)
@@ -7734,8 +7748,9 @@ function retireNarrowingsForWrite(tgtIx: i32, rt0: i32, atIx: i32) {
         rn = writeNarrowAfter(dcl, pre, asgLitRhsTy(atIx, dcl, rt))
         retires = !tySame(rn, pre)
         if !retires { asgKeepNarrow[atIx] = true }
-        // A kept write over a declaration with no `null` ends at the member it kept.
-        if !tyAdmitsNull(dcl) { keptEnd = rn }
+        // A kept write ends at the member it kept; a later null test of it is a dead-test
+        // warning, not a refusal (DECISIONS.md, "A null test of a value proved non-null").
+        keptEnd = rn
       }
       if retires {
         // The RETIREMENT goes back in place, so it outlives whatever inner block holds the
@@ -12406,6 +12421,7 @@ function rcoalReset() {
   rcoalEnd = []
   rcoalTok = []
   rcoalType = []
+  rcoalMsg = []
   0
 }
 
@@ -12429,6 +12445,44 @@ function recordDeadCoalesce(ix: i32, lt: i32) {
   rcoalTok.push(tk)
   // User-facing (the finding's message quotes it) — the user render, not the raw one.
   rcoalType.push(tyToStrUser(lt))
+  rcoalMsg.push("")
+  0
+}
+
+// Record `x == null` / `x != null` over a value the checker proved non-null: the test is dead,
+// always false or always true, and the emitter folds it (DECISIONS.md, the dead null test).
+function recordDeadNullTest(ix: i32, subjIx: i32, subjTy: i32, op: string) {
+  const tk = findingStartTok(ix)
+  if tk < 0 { return 0 }
+  if jwTokIsGenerated(tk) { return 0 }
+  let i = 0
+  while i < rcoalTok.length {
+    if rcoalTok[i] == tk { return 0 }
+    i = i + 1
+  }
+  const t = P.toks[tk]
+  let subj = placeKeyOf(subjIx)
+  if subj == "" { subj = "the value" }
+  let always = "false"
+  if op == "!=" { always = "true" }
+  rcoalLine.push(t.line)
+  rcoalCol.push(t.col)
+  rcoalEnd.push(findingEndCol(ix, tk))
+  rcoalTok.push(tk)
+  rcoalType.push(tyToStrUser(subjTy))
+  rcoalMsg.push(
+    "`"
+      + subj
+      + " "
+      + op
+      + " null` is always "
+      + always
+      + " here ("
+      + subj
+      + " is "
+      + tyToStrUser(subjTy)
+      + ")",
+  )
   0
 }
 
@@ -12438,6 +12492,7 @@ function rcoalTruncate(n: i32) {
   while rcoalEnd.length > n { rcoalEnd.pop() }
   while rcoalTok.length > n { rcoalTok.pop() }
   while rcoalType.length > n { rcoalType.pop() }
+  while rcoalMsg.length > n { rcoalMsg.pop() }
   0
 }
 
@@ -45609,6 +45664,17 @@ export function nodeTyIsNullable(ix: i32) {
 // over a non-nullable lhs) turns a wrong true into a rep mismatch, invalid wasm.
 export function nodeTyExcludesNull(ix: i32) { tyExcludesNull(nodeTyIxOf(ix)) }
 
+// Whether a null test of a value typed `ty` is dead: no member admits `null`, one a recursive
+// alias hides included, which `assignable` sees and the member walk does not.
+function tyProvesNonNull(ty: i32): boolean {
+  tyExcludesNull(ty) && !assignable(TY_NULL, ty)
+}
+
+// `tyProvesNonNull` of node `ix`'s recorded type, for the emitter's fold of a dead null test.
+export function nodeTyProvesNonNull(ix: i32): boolean {
+  tyProvesNonNull(nodeTyIxOf(ix))
+}
+
 // The type-level half of `nodeTyExcludesNull` — shared so the CHECKER (which holds a
 // type, not a node) and the emit-time fold (which holds a node) cannot disagree about
 // which left operands make a `??` redundant.
@@ -46655,6 +46721,15 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
   if op != "=" && op != "&&" && op != "||" && op != "??" {
     if nomBinMixes(lt, rt, n.binLeft, n.binRight) {
       if op == "==" || op == "!=" {
+        // A null test of a newtype over a base with no `null` is dead, as for any type.
+        if isNullTy(rt) && tyProvesNonNull(lt) {
+          recordDeadNullTest(ix, n.binLeft, lt, op)
+          return TY_BOOL
+        }
+        if isNullTy(lt) && tyProvesNonNull(rt) {
+          recordDeadNullTest(ix, n.binRight, rt, op)
+          return TY_BOOL
+        }
         tErr("cannot compare " + tyToStr(lt) + " and " + tyToStr(rt), ix)
         return TY_BOOL
       }
@@ -46984,6 +47059,15 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
     // change storage, so `isAsgNarrowedName` exempts exactly the bindings an assignment narrowed.
     if isNullTy(lt) || isNullTy(rt) {
       if isAsgNarrowedName(n.binLeft) || isAsgNarrowedName(n.binRight) {
+        return TY_BOOL
+      }
+      // A value proved non-null makes the test dead: a warning, and the emitter folds it.
+      if isNullTy(rt) && !isNullTy(lt) && tyProvesNonNull(lt) {
+        recordDeadNullTest(ix, n.binLeft, lt, op)
+        return TY_BOOL
+      }
+      if isNullTy(lt) && !isNullTy(rt) && tyProvesNonNull(rt) {
+        recordDeadNullTest(ix, n.binRight, rt, op)
         return TY_BOOL
       }
     }
