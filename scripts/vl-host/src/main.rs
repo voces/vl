@@ -223,11 +223,11 @@ const COMMANDS: &[&str] = &["run", "build", "check", "fmt", "test", "seed", "std
 /// value for `--help` (`vl run -e --help` compiles the snippet `--help`).
 fn value_flags(cmd: &str) -> &'static [&'static str] {
     match cmd {
-        "run" => &["-e", "--compiler", "--out-dir"],
+        "run" => &["-e", "--compiler", "--out-dir", "--extern"],
         "build" => &["-o", "--compiler"],
         "check" => &["--compiler", "--severity", "--exclude"],
         "fmt" => &["--compiler"],
-        "test" => &["--compiler", "-t", "--jobs", "--exclude"],
+        "test" => &["--compiler", "-t", "--jobs", "--exclude", "--extern"],
         "seed" => &["--out", "--compiler"],
         "std" => &["--dump"],
         _ => &[],
@@ -443,6 +443,7 @@ Run `{c}vl help <command>{r}` (or `vl <command> --help`) for details on one comm
 fn print_command_help(cmd: &str) {
     let s = Style::stdout();
     let (b, c, d, r) = (s.bold, s.cmd, s.dim, s.reset);
+    let xf = EXTERN_FLAG;
     match cmd {
         // Parser of record: `run_cmd` / `run_batch` below.
         "run" => print!(
@@ -473,6 +474,15 @@ program verbatim — the only way to pass one that starts with `-`.
   {c}--shared-memory={r}<pages>
                        Run the program over a SHARED linear memory with that
                        max, as `vl build --shared-memory` would define it
+  {c}{xf}{r} NAME=VALUE
+                       The value of the program's `extern let`/`extern const`
+                       global NAME; repeat it once per global. i32 and i64
+                       take an integer (decimal, or hex with 0x); boolean
+                       takes true, false, 1 or 0; f32 and f64 take a number,
+                       refused if it overflows to infinity (inf, -inf, nan
+                       and -0.0 are accepted as written). Every declared
+                       extern global needs one, and each NAME must be one the
+                       program declares. `vl test` and `--batch` take it too
   {c}-O, -O3, --names, --wat, --no-validate{r}
                        Accepted for symmetry with `vl build`; no effect here
                        (run compiles in memory and writes no artifact)
@@ -501,6 +511,7 @@ program verbatim — the only way to pass one that starts with `-`.
   vl run main.vl one two            {d}the program sees arguments `one`, `two`{r}
   vl run main.vl -- --verbose       {d}`--verbose` reaches the program{r}
   vl run main.vl --color=always | less -R
+  vl run main.vl {xf} CTXB=0    {d}supplies `extern let CTXB: i32`{r}
   echo 'print(6 * 7)' | vl run
 "
         ),
@@ -655,6 +666,8 @@ tests continue in a fresh instance.
   {c}--color={r}<when>      always | never | auto (default), for the RUNNER's own
                       report; a test's captured output is always plain
   {c}--compiler{r} <wasm>   Compiler seed to use (see `vl help seed`)
+  {c}{xf}{r} NAME=VALUE  An extern global's value, as in `vl help run`; a NAME no
+                      test module declares is refused
 
 {b}Environment:{r}
   {c}VL_TEST_TRACE{r}=1     Print per-file scheduling stamps to stderr
@@ -3614,7 +3627,7 @@ fn run_program_with(
     // The instance is dropped: `vl run` runs the start function (the program's top
     // level) and exits. `vl test` needs the instance back to call exports on it, so
     // it goes through `instantiate_program` directly.
-    let _ = instantiate_program(engine, &module, sink, palette)?;
+    let _ = instantiate_program(engine, &module, &extern_bool_names(bytes), sink, palette)?;
     Ok(())
 }
 
@@ -4650,19 +4663,37 @@ fn expect_extern_sig(name: &str, ft: &FuncType, params: &[&str], result: &[&str]
 ///
 /// `vl build` does NOT apply it: a built module is for whatever host will run it, and this
 /// list describes only the one embedded here.
-fn register_extern_imports(linker: &mut Linker<()>, module: &Module) -> Result<()> {
+///
+/// An extern GLOBAL is defined only from a `vl run --extern` value (`GLOBAL_DEFINES`);
+/// without one it refuses, and a define naming no declared global refuses too.
+fn register_extern_imports(
+    linker: &mut Linker<()>,
+    store: &mut Store<()>,
+    module: &Module,
+    ext_bools: &[String],
+) -> Result<()> {
+    let defines = GLOBAL_DEFINES.lock().unwrap().clone();
+    let mut declared_globals: Vec<String> = Vec::new();
     for imp in module.imports() {
         if imp.module() != "extern" {
             continue;
         }
         let name = imp.name().to_string();
-        // An `extern let`/`extern const` is state another unit or the embedder owns; this host
-        // is neither, so it refuses at load rather than inventing a zero the program never set.
-        if let ExternType::Global(_) = imp.ty() {
-            bail!(
-                "extern global `{name}` is declared but `vl run` provides no globals — build it \
-                 with `vl build` and link it against the unit or host that exports `{name}`"
-            );
+        // An `extern let`/`extern const` is state another unit or the embedder owns, so this
+        // host defines one only from a value the caller gave; it never invents a zero.
+        if let ExternType::Global(gt) = imp.ty() {
+            let Some((_, raw)) = defines.iter().find(|(n, _)| *n == name) else {
+                bail!(
+                    "extern `{name}` is not supplied — pass {EXTERN_FLAG} {name}=<value>, or build \
+                     it with `vl build` and link it against the unit or host that exports `{name}`"
+                );
+            };
+            let is_bool = ext_bools.iter().any(|b| *b == name);
+            let val = parse_global_value(&name, gt.content(), is_bool, raw)?;
+            let global = Global::new(&mut *store, gt, val)?;
+            linker.define(&mut *store, "extern", &name, global)?;
+            declared_globals.push(name);
+            continue;
         }
         let ExternType::Func(ft) = imp.ty() else {
             bail!("extern `{name}` is not imported as a function");
@@ -4682,7 +4713,176 @@ fn register_extern_imports(linker: &mut Linker<()>, module: &Module) -> Result<(
             ),
         }
     }
+    // A define the program never declares is a typo or a stale command line, not a no-op. Under
+    // `vl test` and `vl run --batch` one command line serves many modules, so it is checked there
+    // against the name only when no module declares it (`note_used_defines`).
+    note_used_defines(&declared_globals);
+    for (name, _) in &defines {
+        if STRICT_DEFINES.load(Ordering::Relaxed) && !declared_globals.contains(name) {
+            let have = if declared_globals.is_empty() {
+                "it declares no extern global".to_string()
+            } else {
+                format!("it declares: {}", declared_globals.join(", "))
+            };
+            bail!(
+                "`{EXTERN_FLAG} {name}=…` names no extern global this program declares ({have})"
+            );
+        }
+    }
     Ok(())
+}
+
+/// The `vl run` flag that supplies an extern global's value, spelled once so a ruling on its
+/// name is a one-line change.
+const EXTERN_FLAG: &str = "--extern";
+
+/// Every `vl run --extern NAME=VALUE`, in command-line order, with the value still
+/// text: its type is the declared global's, known only once the module is loaded. Empty
+/// unless `vl run` filled it, as `PROGRAM_ARGS` is.
+static GLOBAL_DEFINES: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+
+/// Whether each module must declare every `--extern` name: true for a single `vl run`, false
+/// under `vl test` and `vl run --batch`, where one command line serves many modules.
+static STRICT_DEFINES: AtomicBool = AtomicBool::new(true);
+
+/// The `--extern` names some instantiated module declared, for the many-module check.
+static USED_DEFINES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+fn note_used_defines(declared: &[String]) {
+    let mut used = USED_DEFINES.lock().unwrap();
+    for d in declared {
+        if !used.contains(d) {
+            used.push(d.clone());
+        }
+    }
+}
+
+/// Under `vl test` / `vl run --batch`: the `--extern` names no module declared, or `None`.
+fn unused_defines_error() -> Option<String> {
+    let used = USED_DEFINES.lock().unwrap();
+    let unused: Vec<String> = GLOBAL_DEFINES
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(n, _)| !used.contains(n))
+        .map(|(n, _)| n.clone())
+        .collect();
+    if unused.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "`{EXTERN_FLAG}` names no extern global any module here declares: {}",
+        unused.join(", ")
+    ))
+}
+
+/// The names in a module's `vl-extern-bool` custom section: its `extern let`/`extern const`
+/// globals declared `boolean`, which cross as a plain i32. Empty when the section is absent (a
+/// module from another producer, or one whose custom sections were stripped).
+fn extern_bool_names(bytes: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    if bytes.len() < 8 || &bytes[0..4] != b"\0asm" {
+        return out;
+    }
+    let mut i = 8usize;
+    while i < bytes.len() {
+        let id = bytes[i];
+        i += 1;
+        let Some(size) = uleb(bytes, &mut i) else { return out };
+        let Some(end) = i.checked_add(size as usize) else { return out };
+        if end > bytes.len() {
+            return out;
+        }
+        if id == 0 {
+            let mut p = i;
+            if wasm_name(bytes, &mut p).as_deref() == Some("vl-extern-bool") {
+                let Some(n) = uleb(bytes, &mut p) else { return out };
+                for _ in 0..n {
+                    match wasm_name(bytes, &mut p) {
+                        Some(name) => out.push(name),
+                        None => return Vec::new(),
+                    }
+                }
+                return out;
+            }
+        }
+        i = end;
+    }
+    out
+}
+
+/// An integer spelled in decimal or `0x` hex, with an optional leading `-`.
+fn parse_define_int(raw: &str) -> Option<i128> {
+    let (neg, body) = match raw.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, raw),
+    };
+    let mag = match body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
+        Some(hex) if !hex.is_empty() && hex.chars().all(|c| c.is_ascii_hexdigit()) => {
+            i128::from_str_radix(hex, 16).ok()?
+        }
+        Some(_) => return None,
+        None if !body.is_empty() && body.chars().all(|c| c.is_ascii_digit()) => {
+            body.parse::<i128>().ok()?
+        }
+        None => return None,
+    };
+    Some(if neg { -mag } else { mag })
+}
+
+/// The value `--extern name=raw` gives a global of wasm type `ty`. An integer global
+/// takes an integer, signed or as its unsigned bit pattern (`0xFFFFFFFF` is an i32's -1); a
+/// float global takes any number Rust's float parser reads. Anything else names the global.
+fn parse_global_value(name: &str, ty: &ValType, is_bool: bool, raw: &str) -> Result<Val> {
+    let bad = |what: &str| -> Error {
+        Error::msg(format!("`{EXTERN_FLAG} {name}={raw}`: `{name}` is {what}, and `{raw}` is not one"))
+    };
+    let range = || -> Error {
+        Error::msg(format!("`{EXTERN_FLAG} {name}={raw}`: `{raw}` is out of range for `{name}`'s type"))
+    };
+    // A boolean crosses as an i32, and any value but 0 or 1 would be neither `true` nor `false`.
+    if is_bool && ty.is_i32() {
+        return match raw {
+            "true" | "1" => Ok(Val::I32(1)),
+            "false" | "0" => Ok(Val::I32(0)),
+            _ => Err(bad("a boolean global, which takes true, false, 1 or 0")),
+        };
+    }
+    // A finite spelling that rounds to an infinity is out of range, as an integer's would be;
+    // `inf`, `infinity` and `nan` stay accepted as what they say.
+    let spells_inf = |r: &str| r.to_ascii_lowercase().contains("inf");
+    if ty.is_i32() {
+        let v = parse_define_int(raw).ok_or_else(|| bad("an i32 global, which takes an integer"))?;
+        if v < i32::MIN as i128 || v > u32::MAX as i128 {
+            return Err(range());
+        }
+        return Ok(Val::I32(v as u32 as i32));
+    }
+    if ty.is_i64() {
+        let v = parse_define_int(raw).ok_or_else(|| bad("an i64 global, which takes an integer"))?;
+        if v < i64::MIN as i128 || v > u64::MAX as i128 {
+            return Err(range());
+        }
+        return Ok(Val::I64(v as u64 as i64));
+    }
+    if ty.is_f32() {
+        let v: f32 = raw.parse().map_err(|_| bad("an f32 global, which takes a number"))?;
+        if v.is_infinite() && !spells_inf(raw) {
+            return Err(range());
+        }
+        return Ok(Val::F32(v.to_bits()));
+    }
+    if ty.is_f64() {
+        let v: f64 = raw.parse().map_err(|_| bad("an f64 global, which takes a number"))?;
+        if v.is_infinite() && !spells_inf(raw) {
+            return Err(range());
+        }
+        return Ok(Val::F64(v.to_bits()));
+    }
+    bail!(
+        "extern global `{name}` has a type `{EXTERN_FLAG}` cannot spell \
+         (it takes i32, i64, f32 and f64 globals)"
+    )
 }
 
 /// Instantiate an already-loaded program module with the host print-import family,
@@ -4703,6 +4903,7 @@ fn register_extern_imports(linker: &mut Linker<()>, module: &Module) -> Result<(
 fn instantiate_program(
     engine: &Engine,
     module: &Module,
+    ext_bools: &[String],
     sink: impl Fn(&str) + Send + Sync + Clone + 'static,
     palette: Palette,
 ) -> Result<(Store<()>, Instance)> {
@@ -4773,7 +4974,7 @@ fn instantiate_program(
     // The USER externs, from the module's own import section. An unprovided one fails HERE,
     // before instantiation, so the message names the function instead of arriving as
     // wasmtime's `unknown import`.
-    register_extern_imports(&mut linker, module)?;
+    register_extern_imports(&mut linker, &mut store, module, ext_bools)?;
 
     // Instantiation runs the start function — the VL program's top level.
     //
@@ -4807,6 +5008,7 @@ fn instantiate_program(
 /// unwritable DIR) — per-case failure is signalled by `<name>.err` existing, so
 /// one bad case never aborts the rest of the batch.
 fn run_batch(args: &[String]) -> Result<()> {
+    let mut defines: Vec<(String, String)> = Vec::new();
     let mut compiler: Option<String> = None;
     let mut out_dir: Option<String> = None;
     let mut files: Vec<String> = Vec::new();
@@ -4822,6 +5024,19 @@ fn run_batch(args: &[String]) -> Result<()> {
                 i += 1;
             }
             "--batch" => {}
+            // `--extern NAME=VALUE`, as `vl run` takes it; one command line serves every case.
+            a if a == EXTERN_FLAG => {
+                let Some(spec) = args.get(i + 1) else {
+                    bail!("vl run --batch: `{EXTERN_FLAG}` requires a value")
+                };
+                push_global_define(&mut defines, spec)
+                    .map_err(|m| Error::msg(format!("vl run --batch: {m}")))?;
+                i += 1;
+            }
+            a if a.strip_prefix(EXTERN_FLAG).is_some_and(|r| r.starts_with('=')) => {
+                push_global_define(&mut defines, &a[EXTERN_FLAG.len() + 1..])
+                    .map_err(|m| Error::msg(format!("vl run --batch: {m}")))?;
+            }
             // ACCEPTED AND INERT, and validated anyway. A `.out` file is a machine
             // artifact the corpus compares byte-for-byte, so batch output is never
             // coloured whatever this says — but a caller who spells the flag wrong
@@ -4840,6 +5055,8 @@ fn run_batch(args: &[String]) -> Result<()> {
     let Some(out_dir) = out_dir else {
         bail!("usage: vl run --batch --out-dir <dir> <file.vl>...")
     };
+    STRICT_DEFINES.store(false, Ordering::Relaxed);
+    *GLOBAL_DEFINES.lock().unwrap() = defines;
     std::fs::create_dir_all(&out_dir)
         .map_err(|e| Error::from(e).context(format!("creating --out-dir `{out_dir}`")))?;
     let compiler = resolve_compiler(compiler);
@@ -4920,6 +5137,9 @@ fn run_batch(args: &[String]) -> Result<()> {
             // "parse error" / "failed to parse WebAssembly" / trap text) is stable.
             Err(e) => std::fs::write(&err_path, format!("{e:?}\n"))?,
         }
+    }
+    if let Some(msg) = unused_defines_error() {
+        bail!("vl run --batch: {msg}");
     }
     Ok(())
 }
@@ -6086,6 +6306,26 @@ fn flag_value(v: Option<&String>, flag: &str) -> String {
     }
 }
 
+/// Record one `--extern NAME=VALUE`, or the usage error its shape earns (each caller exits 2
+/// with it). The value is checked against the global's type only at load, where it is known.
+fn push_global_define(defines: &mut Vec<(String, String)>, spec: &str) -> Result<(), String> {
+    let Some((name, value)) = spec.split_once('=') else {
+        return Err(format!(
+            "`{EXTERN_FLAG} {spec}` — the value is spelled NAME=VALUE, e.g. `CTXB=0`"
+        ));
+    };
+    if name.is_empty() || value.is_empty() {
+        return Err(format!(
+            "`{EXTERN_FLAG} {spec}` — both the name and the value are required"
+        ));
+    }
+    if defines.iter().any(|(n, _)| n == name) {
+        return Err(format!("`{EXTERN_FLAG}` gives `{name}` twice — give it once"));
+    }
+    defines.push((name.to_string(), value.to_string()));
+    Ok(())
+}
+
 /// One `vl run` argument-parsing usage error: the message names the OFFENDING TOKEN,
 /// then the remedy that makes the command mean what the caller meant. Exit 2, the code
 /// reserved for usage errors across this CLI (`usage()` here, `cliUsageErr` in
@@ -6108,7 +6348,7 @@ fn arg_error(msg: &str, token: Option<&str>) -> ! {
     }
     eprintln!(
         "note: `vl run` itself takes -e <source>, --compiler <wasm>, --batch, \
---color=<when>, -O/-O3, --names, --wat, --no-validate."
+--color=<when>, {EXTERN_FLAG} NAME=VALUE, -O/-O3, --names, --wat, --no-validate."
     );
     eprintln!("note: `vl help run` shows the full flag list.");
     std::process::exit(2);
@@ -6141,6 +6381,7 @@ fn run_cmd(args: &[String]) -> Result<()> {
     let mut link = LinkOpts::default();
     // `auto` unless the caller says otherwise — see `ColorChoice`.
     let mut color = ColorChoice::Auto;
+    let mut defines: Vec<(String, String)> = Vec::new();
     // Positionals in order, before the file/argument split is made. The split cannot
     // be made DURING the walk because it depends on `-e`, which may arrive later:
     // with a `-e` snippet there is no source file, so `vl run -e <src> a b` has TWO
@@ -6183,6 +6424,18 @@ fn run_cmd(args: &[String]) -> Result<()> {
                     Some(parse_shared_pages(raw).unwrap_or_else(|m| arg_error(&m, None)));
             }
             "--shared-memory" => arg_error(SHARED_MEMORY_BARE, None),
+            // `--extern NAME=VALUE`, repeatable: the value an `extern let`/`extern const`
+            // global starts with. Its type is the declaration's, so the value stays text until
+            // the module is loaded (`register_extern_imports`).
+            a if a == EXTERN_FLAG => {
+                let spec = flag_value(host.get(i + 1), EXTERN_FLAG);
+                push_global_define(&mut defines, &spec).unwrap_or_else(|m| arg_error(&m, None));
+                i += 1;
+            }
+            a if a.strip_prefix(EXTERN_FLAG).is_some_and(|r| r.starts_with('=')) => {
+                push_global_define(&mut defines, &a[EXTERN_FLAG.len() + 1..])
+                    .unwrap_or_else(|m| arg_error(&m, None));
+            }
             a if a.starts_with("--heap-base=") || a.starts_with("--heap-limit=") => arg_error(
                 &format!(
                     "`{a}` lays out a module for a host that shares its memory — it is a \
@@ -6232,6 +6485,7 @@ fn run_cmd(args: &[String]) -> Result<()> {
     let mut prog_args: Vec<String> = positional.collect();
     prog_args.extend(tail.iter().skip(1).cloned());
     set_program_args(&prog_args);
+    *GLOBAL_DEFINES.lock().unwrap() = defines;
     let compiler = resolve_compiler(compiler);
 
     const USAGE: &str = concat!(
@@ -6318,6 +6572,8 @@ struct TestFile {
 /// it is paid in parallel.
 struct TestRegistry {
     module: Option<Module>,
+    /// The module's `boolean` extern globals (`extern_bool_names`), for each re-instantiation.
+    ext_bools: Vec<String>,
     names: Vec<String>,
     skips: Vec<i32>,
     /// "" unless the module failed to load or its top level trapped during
@@ -6408,6 +6664,7 @@ fn read_test_str(
 fn collect_test_file(engine: &Engine, file: &TestFile) -> TestRegistry {
     let failed = |error: String| TestRegistry {
         module: None,
+        ext_bools: Vec::new(),
         names: Vec::new(),
         skips: Vec::new(),
         error,
@@ -6426,7 +6683,9 @@ fn collect_test_file(engine: &Engine, file: &TestFile) -> TestRegistry {
     };
     // Collection DISCARDS output (the registration pass should print nothing), so
     // there is no stream to colour.
-    let (mut store, inst) = match instantiate_program(engine, &module, |_| {}, Palette::OFF) {
+    let ext_bools = extern_bool_names(&file.bytes);
+    let (mut store, inst) =
+        match instantiate_program(engine, &module, &ext_bools, |_| {}, Palette::OFF) {
         Ok(pair) => pair,
         Err(e) => return failed(trap_text(&e)),
     };
@@ -6442,6 +6701,7 @@ fn collect_test_file(engine: &Engine, file: &TestFile) -> TestRegistry {
         _ => {
             return TestRegistry {
                 module: Some(module),
+                ext_bools,
                 names: Vec::new(),
                 skips: Vec::new(),
                 error: String::new(),
@@ -6461,6 +6721,7 @@ fn collect_test_file(engine: &Engine, file: &TestFile) -> TestRegistry {
     match read {
         Ok((names, skips)) => TestRegistry {
             module: Some(module),
+            ext_bools,
             names,
             skips,
             error: String::new(),
@@ -6519,7 +6780,8 @@ fn run_test_file(
     // would land inside the reporter's own styling rather than beside it. The
     // runner's summary colours itself from the host-resolved `--color` the pump
     // injects; program output stays plain text.
-    let mut live = match instantiate_program(engine, module, sink.clone(), Palette::OFF) {
+    let mut live =
+        match instantiate_program(engine, module, &reg.ext_bools, sink.clone(), Palette::OFF) {
         Ok(pair) => pair,
         Err(e) => return bail_all(&trap_text(&e)),
     };
@@ -6595,7 +6857,7 @@ fn run_test_file(
                 ));
                 // Re-instantiate for the next test. A failure here is terminal for
                 // the rest of THIS file only.
-                match instantiate_program(engine, module, sink.clone(), Palette::OFF) {
+                match instantiate_program(engine, module, &reg.ext_bools, sink.clone(), Palette::OFF) {
                     Ok(pair) => live = pair,
                     Err(e) => {
                         let msg = format!("re-instantiating after a trap: {}", trap_text(&e));
@@ -7129,6 +7391,7 @@ fn read_cli_str(
 /// prints until the VL program reports CMD_DONE, and exit with its code.
 fn cli_pump(args: &[String]) -> Result<()> {
     use std::io::{IsTerminal, Write};
+    let args = &take_test_externs(args)[..];
     // Resolve the compiler module (host mechanism): --compiler / env / default.
     let mut compiler: Option<String> = None;
     let mut i = 0;
@@ -7451,9 +7714,52 @@ fn cli_pump(args: &[String]) -> Result<()> {
     err.flush().ok();
     // AFTER the last guest call, and before the `exit` that keeps `main`'s own
     // `finish_guest_profile` from ever running on this path.
-    let code = exit_code.call(&mut store, ())?;
+    let mut code = exit_code.call(&mut store, ())?;
     finish_guest_profile();
+    if let Some(msg) = unused_defines_error() {
+        eprintln!("vl test: {msg}");
+        code = code.max(1);
+    }
     std::process::exit(code);
+}
+
+/// `vl test`'s `--extern NAME=VALUE` flags, taken out of `args` before the VL parser (which
+/// knows no such flag) sees them, and staged for every test module's instantiation.
+fn take_test_externs(args: &[String]) -> Vec<String> {
+    if args.first().map(String::as_str) != Some("test") {
+        return args.to_vec();
+    }
+    let mut rest = Vec::with_capacity(args.len());
+    let mut defines: Vec<(String, String)> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if a == EXTERN_FLAG {
+            let Some(spec) = args.get(i + 1) else {
+                eprintln!("vl test: `{EXTERN_FLAG}` requires a value");
+                std::process::exit(2);
+            };
+            test_define(&mut defines, spec);
+            i += 2;
+            continue;
+        }
+        if let Some(spec) = a.strip_prefix(EXTERN_FLAG).and_then(|r| r.strip_prefix('=')) {
+            test_define(&mut defines, spec);
+        } else {
+            rest.push(a.clone());
+        }
+        i += 1;
+    }
+    STRICT_DEFINES.store(false, Ordering::Relaxed);
+    *GLOBAL_DEFINES.lock().unwrap() = defines;
+    rest
+}
+
+fn test_define(defines: &mut Vec<(String, String)>, spec: &str) {
+    if let Err(m) = push_global_define(defines, spec) {
+        eprintln!("vl test: {m}");
+        std::process::exit(2);
+    }
 }
 
 

@@ -127,7 +127,7 @@ the host build.)
 
 | Command | What it does |
 |---|---|
-| `vl run <file.vl>` | Compile and run; program output goes to stdout. Also `vl run -e "<src>"`, `… \| vl run` (stdin), or `vl run <prebuilt.wasm>`. |
+| `vl run <file.vl>` | Compile and run; program output goes to stdout. Also `vl run -e "<src>"`, `… \| vl run` (stdin), or `vl run <prebuilt.wasm>`. `--extern NAME=VALUE` gives an `extern let`/`extern const` global its value. |
 | `vl build <file.vl>` | Compile to WebAssembly (`-o <out.wasm>`; `-O` optimize, `-O3` the release profile, `--wat` also dump text, `--no-validate` skip the instantiability check; `--import-memory` / `--heap-base=` / `--heap-limit=` lay a unit out to share a host-owned memory; `--shared-memory=<pages>` makes that memory shared across Web Workers). |
 | `vl check <path>` | Type-check + lint (errors + warnings/hints) a file, or every `*.vl` under a directory (recursive; `vl check` ≡ `vl check .`; `--exclude <glob>` prunes paths). Pretty output (carets, TTY color) or `--concise`. `--severity <hint\|info\|warning\|error>` gates the exit code + display floor; `--codegen` also runs the emitter; `--fix` writes the safe lint fixes in place — `prefer-const` (`let`→`const`) and `redundant-type` (removes an explicit annotation the initializer already infers, e.g. `let x: i32 = 5` → `let x = 5`). |
 | `vl fmt <path>` | Format (AST-driven, via `format.vl`): stdout, `-w` write in place, `--check` CI gate, dirs recurse. |

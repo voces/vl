@@ -2834,6 +2834,16 @@ let inferSawErr = false
 // rows from its mark, so its arms' values leave the inferred return (`dropTailIfSeeds`).
 let inferRetLogTy: i32[] = []
 let inferRetLogSeed: boolean[] = []
+// The `return <void expr>` statements of the functions being inferred, per inference frame, and
+// the block each sits in: a void return, refused if its function returns a value (D2635).
+let inferVoidRetSites: i32[] = []
+let inferVoidRetBlks: i32[] = []
+// The innermost block whose statements are being checked: the block a `return` sits in.
+let chkStmtBlk = -1
+// The void returns settled in void functions, and their blocks, which `voidRetRewrite` splits
+// into the expression statement and a bare `return` once every body is checked.
+let voidRetRwRet: i32[] = []
+let voidRetRwBlk: i32[] = []
 let inferRetSeeding = false
 // The seeds `dropTailIfSeeds` removed, per inference frame: re-joined when the function turns
 // out to return a value anyway, since then the tail's value arms return (`clearTailVerdict`).
@@ -4058,6 +4068,11 @@ export function initChecker() {
   inferSawErr = false
   inferRetLogTy = []
   inferRetLogSeed = []
+  inferVoidRetSites = []
+  inferVoidRetBlks = []
+  chkStmtBlk = -1
+  voidRetRwRet = []
+  voidRetRwBlk = []
   inferRetSeeding = false
   ifNoValueAt = Map()
   ifValTyAt = Map()
@@ -36620,6 +36635,7 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
   const savedObserved = inferObserved
   const savedSawErr = inferSawErr
   const savedRetLogLen = inferRetLogTy.length
+  const savedVoidRetLen = inferVoidRetSites.length
   const savedDroppedLen = inferDroppedTy.length
   const cbBefore = cycleBreakCount
   const bbBefore = bareBraceCount
@@ -36722,6 +36738,8 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
     dj = dj + 1
   }
   const body = P.nodes[n.fnBody]
+  const savedStmtBlk = chkStmtBlk
+  chkStmtBlk = n.fnBody
   if body is Block {
     const stmts = body.blkStmts
     let s = 0
@@ -36832,6 +36850,7 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
       s = s + 1
     }
   }
+  chkStmtBlk = savedStmtBlk
   // Hover over an un-annotated param: the body has now recorded everything it demands of the
   // param hole, so re-retains the binding's type as that demand (the same disjunction the
   // call-arg diagnostic names) instead of the bare hole, which renders as an uninformative `_`.
@@ -36906,6 +36925,7 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
       clearTailVerdict(blockLastStmt(n.fnBody))
     }
   }
+  refuseVoidRetsFrom(savedVoidRetLen, ret)
   // This body's witnesses belong to its own inference, not to an enclosing `if`'s replay.
   while inferRetLogTy.length > savedRetLogLen {
     inferRetLogTy.pop()
@@ -40928,6 +40948,7 @@ export function checkProgram(rootIx: i32) {
   recordTopScalars()
   rcwRunPending()
   checkProgramEndGetters()
+  voidRetRewrite()
   T.diags.length
 }
 
@@ -52393,6 +52414,76 @@ function bareRetVoidNote(want: i32): string {
   " — a bare `return` in this body makes the function void; drop it, or return no value here"
 }
 
+// Settles the `return <void expr>` sites an inferred body recorded from `from` on: refused when
+// the function's final return type `ret` is a value, kept for `voidRetRewrite` when it is void.
+function refuseVoidRetsFrom(from: i32, ret: i32) {
+  if from < 0 || from > inferVoidRetSites.length { return 0 }
+  const valued = ret >= 0 && !isVoidTy(ret) && ret != TY_ERR && ret != TY_NEVER
+  let i = from
+  while i < inferVoidRetSites.length {
+    if valued {
+      tErr(
+        "return expects a value of type " + tyToStr(ret) + ", got void",
+        inferVoidRetSites[i],
+      )
+    } else if isVoidTy(ret) {
+      voidRetRwRet.push(inferVoidRetSites[i])
+      voidRetRwBlk.push(inferVoidRetBlks[i])
+    }
+    i = i + 1
+  }
+  while inferVoidRetSites.length > from {
+    inferVoidRetSites.pop()
+    inferVoidRetBlks.pop()
+  }
+  0
+}
+
+// Splits each settled void return `return e` into the statement `e` and a bare `return` in its
+// own block, so the emitter sees the two statements it already lowers. A site already split is
+// skipped; one whose recorded block does not list it is refused rather than left to the emitter.
+function voidRetRewrite() {
+  let changed = false
+  let i = 0
+  while i < voidRetRwRet.length {
+    const r = voidRetRwRet[i]
+    const b = voidRetRwBlk[i]
+    if r >= 0 && b >= 0 && r < P.nodes.length && b < P.nodes.length {
+      const rn = P.nodes[r]
+      const bn = P.nodes[b]
+      if rn is RetStmt && bn is Block && rn.retArg >= 0 {
+        const out: i32[] = []
+        let found = false
+        let k = 0
+        while k < bn.blkStmts.length {
+          if bn.blkStmts[k] == r {
+            out.push(cwPeel(rn.retArg))
+            found = true
+          }
+          out.push(bn.blkStmts[k])
+          k = k + 1
+        }
+        if found {
+          const nb: Node = { blkStmts: out, pos: bn.pos }
+          P.nodes[b] = nb
+          const nr: Node = { retArg: -1, pos: rn.pos }
+          P.nodes[r] = nr
+          changed = true
+        } else {
+          tErr(
+            "a `return` of a void value here is not split — write the call, then `return`",
+            r,
+          )
+        }
+      }
+    }
+    i = i + 1
+  }
+  // The banked parse differs from the tree now, so a later consumer re-parses, as after getters.
+  if changed { arenaEpochBump() }
+  0
+}
+
 // Extracted from `checkNodeReal`'s `RetStmt` arm (C3: thin the dispatcher).
 function checkRetStmtNode(n: RetStmt, ix: i32) {
   const want = T.curRet
@@ -52435,14 +52526,26 @@ function checkRetStmtNode(n: RetStmt, ix: i32) {
   // Under a pending return type (-2: this function's return is being inferred),
   // record the returned type as a witness instead of checking a mismatch.
   if want == -2 {
-    // `return <expr>` is always a value return position.
-    fnSawValueRet = true
     // A returned call whose deferred join this site could not decide contributes the
     // whole join, not the lossy collapse the emitter gets (`inferRetTyOf`).
     const savedInRetArg = inRetArg
     inRetArg = true
+    const cbArg = cycleBreakCount
     const rArgTy = checkNode(n.retArg)
     inRetArg = savedInRetArg
+    // `return <void expr>` evaluates the expression and returns nothing, so it is a void
+    // return; the function's finish refuses it if the function returns a value. A void that is
+    // only a recursive cycle's provisional answer is still a value return position (D2635).
+    if (
+      isVoidTy(rArgTy)
+      && cycleBreakCount == cbArg
+      && !voidSlotExemptExpr(n.retArg)
+    ) {
+      inferVoidRetSites.push(ix)
+      inferVoidRetBlks.push(chkStmtBlk)
+      return TY_VOID
+    }
+    fnSawValueRet = true
     // `return <void call>` names a value to return and has none — reported here rather than
     // left to the mismatch check below, which never sees this path (the return type is still inferred).
     if voidValueSlotErr(rArgTy, n.retArg, "return", ix) { return TY_VOID }
@@ -52457,10 +52560,16 @@ function checkRetStmtNode(n: RetStmt, ix: i32) {
   // Bidirectional: `function mk(): (i32) => i32 { return (x) => … }` infers the returned
   // lambda's param from the declared return type (also through a composite return shape).
   if want >= 0 { seedExpected(n.retArg, want) }
+  const cbGot = cycleBreakCount
   const got = checkNode(n.retArg)
-  // The same gate under an explicit `: void`: `assignable(void, void)` holds, so a void flowed
-  // into a module with nothing to return — every other declared type already reports its own mismatch.
+  // Under a void return `assignable` passes anything void-bearing, so this gate refuses a union
+  // that mentions void. A wholly void value is a void return: `return g()` calls, then returns (D2635).
   if isVoidTy(want) {
+    if isVoidTy(got) && cycleBreakCount == cbGot {
+      voidRetRwRet.push(ix)
+      voidRetRwBlk.push(chkStmtBlk)
+      return TY_VOID
+    }
     if voidValueSlotErr(got, n.retArg, "return", ix) { return TY_VOID }
   }
   // Redundant-return rule: witness the explicit return's natural type (before
@@ -52491,6 +52600,8 @@ function checkRetStmtNode(n: RetStmt, ix: i32) {
 
 // Extracted from `checkNodeReal`'s `Block` arm (C3: thin the dispatcher).
 function checkBlockNode(n: Block, ix: i32) {
+  const savedStmtBlk = chkStmtBlk
+  chkStmtBlk = ix
   pushScope(ix)
   const stmts = n.blkStmts
   const savedRTP = retTailPos
@@ -52544,6 +52655,7 @@ function checkBlockNode(n: Block, ix: i32) {
   }
   retTailPos = savedRTP
   popScope()
+  chkStmtBlk = savedStmtBlk
   blockTailTy = tailTy
   blockTailIx = tailIx
   return TY_VOID
