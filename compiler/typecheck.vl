@@ -7324,6 +7324,8 @@ let crAliasWr: {[i32]: boolean} = Map()
 // Enclosing functions' path slots such a write inside a nested function ends, with the depth of
 // the function holding the write. They hold again when that body closes: its calls run the write.
 let crAliasNestSlots: i32[] = []
+// Calls inside a nested body that ended an enclosing function's narrowing there (`crAliasNestSlots`).
+let crNestCallRet: {[i32]: boolean} = Map()
 let crAliasNestDepths: i32[] = []
 
 // End every live path narrowing the write at `atIx` may reach through an alias: `q.f = null`
@@ -7903,6 +7905,13 @@ function noteCallInvalidations(callIx: i32) {
       if npInvBy[i] < 0 {
         npInvBy[i] = callIx
         crPathCallRetire(i, callIx)
+        // Inside a nested body a call ends an enclosing narrowing for the rest of that body
+        // only: the enclosing function's own call of the body ends it there, in both halves.
+        if i < crFnNpBase() {
+          crNestCallRet[callIx] = true
+          crAliasNestSlots.push(i)
+          crAliasNestDepths.push(crFnBases.length)
+        }
       } else if i >= crFnNpBase() {
         // Already ended, but a nested function that read it under the narrowing, or a read
         // earlier in an enclosing loop, still sees what this writer does.
@@ -8405,6 +8414,7 @@ function crReset() {
   crOpCall = Map()
   crAliasWr = Map()
   crAliasNestSlots = []
+  crNestCallRet = Map()
   crAliasNestDepths = []
   crSoleNames = []
   crSoleDepths = []
@@ -8443,8 +8453,11 @@ function crFnLeave() {
     && crAliasNestDepths[crAliasNestDepths.length - 1] > crFnBases.length
   ) {
     const ns = crAliasNestSlots[crAliasNestSlots.length - 1]
-    if ns < npInvBy.length && (crAliasWr[npInvBy[ns]] ?? false) {
-      npInvBy[ns] = -1
+    if ns >= 0 && ns < npInvBy.length {
+      const nb = npInvBy[ns]
+      if (crAliasWr[nb] ?? false) || (crNestCallRet[nb] ?? false) {
+        npInvBy[ns] = -1
+      }
     }
     crAliasNestSlots.pop()
     crAliasNestDepths.pop()
@@ -10803,10 +10816,18 @@ function pathInvalidatedErr(key: string, byIx: i32, at: i32) {
     what = crCallDesc(byIx, false)
     after = "the call"
   }
+  // A write that stored a non-null value narrows too (D1848), and is not a guard.
+  let cause = "a guard"
+  const slot = narrowedPathIx(key)
+  if slot >= 0 && slot < npAsg.length {
+    if npAsg[slot] == 1 { cause = "a write of a non-null value" }
+  }
   tErr(
     "'"
       + key
-      + "' was narrowed by a guard, but "
+      + "' was narrowed by "
+      + cause
+      + ", but "
       + what
       + " on line "
       + i32ToStr(nodeLineOf(byIx))
