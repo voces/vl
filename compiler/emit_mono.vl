@@ -33,7 +33,6 @@ import {
   TyVar,
   bindGenWalk,
   blockHasBareReturn,
-  cUserTypes,
   canonEmitName,
   flatConstOfNameProp,
   i32TyIx,
@@ -253,6 +252,7 @@ import {
   fnRetExprOf,
   fnSigKeyOf,
   fnStmtsPosOf,
+  gaeAppHasNulParamListField,
   identClosureFeAt,
   identFnTypeAnnName,
   isSName,
@@ -1223,9 +1223,9 @@ function monoBindCols(params: i32[], tyCol: i32[], bN: string[], bT: i32[]) {
   0
 }
 
-// Whether the generic being instantiated declares a lambda. A lambda's capture of a
-// `(T | null)[]` reads the element at the template's rep when `T` is a list or a declared
-// union, so `monoNicheNulListCheck` refuses those too while it is set (D2525).
+// Whether the generic being instantiated declares a lambda. A lambda reading a `(T | null)[]`
+// element reaches D2535's unboxing gap when `T` is a union, and a wrong heap when `T` is a
+// generic record that itself holds a `(P | null)[]`, so both refuse while this is set (D2525).
 let monoCurHasLam = false
 
 // Whether the generic at `fnStmts` position `slot` is the frame of any other lifted function.
@@ -1235,20 +1235,8 @@ function monoFnDeclaresLambda(slot: i32): boolean {
   fnChildHead[slot] >= 0
 }
 
-// Whether `name` is a union: a declared alias (`type LI = 1 | 2`) or an inline spelling.
-function monoIsUnionAlias(name: string): boolean {
-  const atoms: string[] = []
-  splitUnionAtoms(name, atoms)
-  if atoms.length > 1 { return true }
-  const u = cUserTypes[name]
-  if u is i32 {
-    if u >= 0 && u < T.tys.length { return T.tys[u] is TyUnion }
-  }
-  false
-}
-
-// The same refusal read off an argument's arena type, where the pin name is softened: a
-// literal union binds `T` by its base name, so only the argument still shows the union.
+// Refuses a union element read inside a lambda, off the argument's arena type: a literal
+// union binds `T` by its softened base name, so only the argument still shows the union.
 function monoLamNulUnionListCheck(argTy: i32) {
   if !monoCurHasLam || argTy < 0 || argTy >= T.tys.length { return 0 }
   const a = T.tys[argTy]
@@ -1299,7 +1287,7 @@ function monoNicheNulListCheck(
     || b == "boolean"
     || nameIsLitUnionType(b)
     || annArrowAt(b) >= 0
-    || (monoCurHasLam && (nameIsArray(b) || monoIsUnionAlias(b)))
+    || (monoCurHasLam && gaeAppHasNulParamListField(b))
   ) {
     return emitFail(
       "emitProgram: a nullable-"
@@ -2193,7 +2181,12 @@ function monoPinBodyLambdas(
   if n is FuncDecl {
     if monoFnNameIsSourceNamed(n.fnName) {
       monoCloneLambdaSubst(ix, typarams, tvN, tvV, bN, bT)
+      return ix
     }
+    // An anonymous lambda reached here is a value — a `return` argument or a block's tail —
+    // and gets its per-instance clone as a binding's initialiser does (D2525).
+    const acl = monoCloneLambdaSubst(ix, typarams, tvN, tvV, bN, bT)
+    if acl >= 0 { return acl }
     return ix
   }
   if n is RetStmt {

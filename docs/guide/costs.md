@@ -168,7 +168,9 @@ dense ids with record or list values.
 
 `V` cannot yet be `string`, `boolean`, a literal union of strings, a function type, a union of
 records (`Circle | Square`), or a generic record (`Box<i32>`, `IdTable<Tex>`): the compiler
-refuses those with "a nullable-… list element has no rep", and a map serves them. Use a map when ids are large, negative, or sparse
+refuses those with "a nullable-… list element has no rep", and a map serves them. Inside a generic
+function that declares a lambda, a `(V | null)[]` whose `V` is a union, or a record such as
+`IdTable<Tex>` that holds one itself, is refused the same way. Use a map when ids are large, negative, or sparse
 enough that one slot per id wastes memory, or when you need insertion order.
 
 ## The rules the compiler keeps
