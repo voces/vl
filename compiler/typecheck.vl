@@ -2868,6 +2868,9 @@ let ifValTyAt: {[i32]: i32} = Map()
 // block's value, a loop body, or the tail of a void body. Such an `if` is `void` whatever its
 // arms hold, so a value nobody reads is never typed for lowering (D2631).
 let valDiscardAt: {[i32]: boolean} = Map()
+// Per discarded `if`: the value it would have had, typed on no node. A block's tail and the
+// editor's view of an unread function read it, so what a user sees is what they wrote.
+let discardValTyAt: {[i32]: i32} = Map()
 // The value type of the most recently checked `Block` — its trailing expression's type, or
 // `TY_VOID` when the block ends in a statement. `checkNode(Block)` itself returns `TY_VOID`, so
 // this carries the tail value out of band for an `if … { v } else { w }` expression to join its
@@ -4087,6 +4090,7 @@ export function initChecker() {
   ifNoValueAt = Map()
   ifValTyAt = Map()
   valDiscardAt = Map()
+  discardValTyAt = Map()
   inferDroppedTy = []
   // Pass 0 and pass 1's collect tables, reset here with everything else: every
   // `checkProgram` reaches its walk through a caller that ran `initChecker` first
@@ -36807,7 +36811,10 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
     }
   }
   // ...and for a result no caller reads, which the hoist already bound as `: void` (D2631).
-  if inferring && fnResultUnconsumed(fnIx) { inferring = false }
+  const ucVoided = inferring && fnResultUnconsumed(fnIx)
+  if ucVoided { inferring = false }
+  // The return an unread function shows in the editor: its tail's value, never lowered.
+  let ucShowRet = TY_VOID
   // The infer-stack key: a named function uses its name (so self-recursion is detected); an
   // anonymous lambda has no name and keys by node index instead — else two nested anonymous
   // lambdas would both key on "" and the inner would falsely trip the recursive-cycle guard, mis-inferring its return as `void`.
@@ -37119,6 +37126,9 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
       const stTy = checkNode(stmts[s])
       crStmtLeave()
       retTailPos = savedRTPbody
+      if ucVoided && tailIsReturn {
+        ucShowRet = discardedTailTy(stmts[s], stTy)
+      }
       // The trailing expression is the implicit return; under inference it is a
       // return-type witness. With a CONCRETE annotated return, a trailing empty
       // collection (`mk(): i32[] { … inner }`) pins its element from the return
@@ -37222,6 +37232,10 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
   // — `ifCondIsDiscriminating` looks up a discriminated param/local's type, which the
   // `popScope` below would drop. The flag is consumed after `ret` is finalized.
   const bodyTotalForRet = nodeIsTotal(n.fnBody)
+  // The editor shows an unread function's inferred return, not the `void` it lowers as.
+  if ucVoided && symEnabled != 0 && ucShowRet >= 0 && ucShowRet != TY_ERR {
+    symRetainType(fnIx, mkFuncTy(paramTys, ucShowRet), 2)
+  }
   T.curRet = savedRet
   inRetArg = savedInRetArg
   curFnEscName = savedEscName
@@ -48010,7 +48024,12 @@ function checkIfTail(
     if bareArm { ifValTyAt[ix] = -1 } else { ifValTyAt[ix] = valTy }
   }
   // A discarded `if` is a statement, whatever its arms hold.
-  if valDiscarded(ix) { return TY_VOID }
+  if valDiscarded(ix) {
+    if ix >= 0 {
+      discardValTyAt[ix] = discardedIfValTy(daHasElse, thenTy, elseTy)
+    }
+    return TY_VOID
+  }
   // The `if`-expression's value type: with an `else`, the join of the two branch tail
   // values.
   if daHasElse { return joinTys(thenTy, elseTy) }
@@ -53055,6 +53074,38 @@ function checkRetStmtNode(n: RetStmt, ix: i32) {
 }
 // ── block ─────────────────────────────────────────────────────────────────
 
+// The value a discarded `if` would have had: its arms' join, or `T | null` without an else.
+// A join clash is a value nobody reads, so it is not reported.
+function discardedIfValTy(hasElse: boolean, thenTy: i32, elseTy: i32): i32 {
+  if hasElse {
+    const savedClash = joinClashMsg
+    const j = joinTys(thenTy, elseTy)
+    joinClashMsg = savedClash
+    return j
+  }
+  if thenTy != TY_VOID && thenTy != TY_ERR { return mkNullableTy(thenTy) }
+  TY_VOID
+}
+
+// The value a discarded statement at `ix` would have had: a discarded `if`'s recorded value,
+// else its own type `ty`.
+function discardedValTyOf(ix: i32, ty: i32): i32 {
+  if ix < 0 { return ty }
+  const dv = discardValTyAt[ix] ?? -1
+  if dv >= 0 { return dv }
+  ty
+}
+
+// An unread function's tail value as inference would have taken it: an `if` with a value-less
+// arm is a statement, and a value-if answers the join of its completing arms.
+function discardedTailTy(ix: i32, ty: i32): i32 {
+  if isStmtNode(ix) && !(P.nodes[ix] is IfStmt) { return TY_VOID }
+  if ifYieldsNoValue(ix) { return TY_VOID }
+  const v = discardedValTyOf(ix, ty)
+  if v == TY_VOID || v == TY_ERR { return TY_VOID }
+  inferRetTyOf(ix, ifTailValTyOf(ix, v))
+}
+
 // Marks the `if` or block at `ix` as discarded (`valDiscardAt`); any other node is left alone.
 function markValDiscard(ix: i32) {
   if ix < 0 || ix >= P.nodes.length { return 0 }
@@ -53102,9 +53153,11 @@ function checkBlockNode(n: Block, ix: i32) {
         // statement node — non-void only for a genuine value-`if` with an else.
         const lastN2 = P.nodes[stmts[i]]
         if lastN2 is IfStmt {
+          // A discarded tail keeps its value here, typed on no node, for an enclosing arm's join.
+          const ity = discardedValTyOf(stmts[i], sty)
           if lastN2.ifElse >= 0 {
-            if sty != TY_VOID && sty != TY_ERR {
-              tailTy = sty
+            if ity != TY_VOID && ity != TY_ERR {
+              tailTy = ity
               tailIx = stmts[i]
             }
           } else {
@@ -53112,11 +53165,11 @@ function checkBlockNode(n: Block, ix: i32) {
             // its then-arm completes with a value (D1995's ruling); a then-arm that always
             // exits yields nothing here, and its fall-through meets the function's own `null`.
             if (
-              sty != TY_VOID
-              && sty != TY_ERR
+              ity != TY_VOID
+              && ity != TY_ERR
               && !stmtAlwaysExits(lastN2.ifThen)
             ) {
-              tailTy = sty
+              tailTy = ity
               tailIx = stmts[i]
             }
           }

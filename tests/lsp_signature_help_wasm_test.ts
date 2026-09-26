@@ -233,8 +233,6 @@ const SRC = [
   "  h.cb(1)", // 14
   '  print("v=\\{greet("q", 3)}")', // 15
   "}", // 16
-  // Read, so neither result is dropped: a function whose every call is a statement is void (D2631).
-  "const _read = nil() + idfn(1, 2)", // 17
 ].join("\n");
 
 /** The rendered signature at a cursor, or "none" — the whole pipeline in one call. */
@@ -460,7 +458,6 @@ Deno.test({
     "  pad(1)",
     '  at("x")',
     "}",
-    'const _read = greet("b") + pad(2)',
   ].join("\n");
   const one = await helpAt(src, 5, 9);
   if (one !== 'greet(name: string, punct: string = "!") => string @name: string') {
@@ -475,5 +472,18 @@ Deno.test({
     "at(t: string, c: {file: string, line: i32, col: i32} = __callsite__) => string @t: string";
   if (three !== wantThree) {
     throw new Error(`want the intrinsic rendered, got ${three}`);
+  }
+});
+
+Deno.test({
+  name: "signature-help(wasm): a function called only as a statement shows its inferred return",
+  ignore,
+}, async () => {
+  // Every call of `greet` is a statement, so it lowers as `void` (D2631); the signature the
+  // editor offers is still the one its body infers.
+  const src = 'function greet(n: string) {\n  print(n)\n  "hi " + n\n}\ngreet("a")\n';
+  const got = await helpAt(src, 4, 7);
+  if (got !== "greet(n: string) => string @n: string") {
+    throw new Error(`want the inferred return, got ${got}`);
   }
 });
