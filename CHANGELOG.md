@@ -872,6 +872,18 @@ new: the compare-frame pre-pass never recurses into a code-15 field, so a NESTED
 
 ## Codegen, memory & runtime (Track B)
 
+- **Module-level statements and binding initialisers run in source order whatever a statement
+  lowers to (D2431, D2504); a `for k, v in m` value of a union-box map is that union (D2503).**
+  A `?.` call, a bare block, or a block whose binding a closure captures, standing between
+  module statements, made every later module binding initialise before it and before the
+  statements after it (`let x = 1; { const z = 2 }; x = 5; const y = x` printed `1`): the start
+  function merged the two lists on the node's arena index, and those statements are replaced by
+  nodes a pass mints. It now merges on the node's position in the module's statement list, the
+  one order key, and the three arena-keyed tables are gone. In a pair walk over
+  `{[K]: i32 | null}` (or any value-union box) `print(v)` was invalid wasm and `v ?? 0` refused;
+  the second name now resolves its union from the map's vals list, as `m.values()` does.
+  Fixtures `eval-order/module-statements-run-in-source-order.vl`,
+  `maps/forin-pair-union-box-value.vl`.
 - **Small variable-trip range loops and list walks run four body copies per trip; a list
   reached through a field is cached ahead of a loop (plumb PL-037 item 4).** `for i in 0 until n`
   with step 1, and a `for x in xs` whose header is hoisted, copy a body of at most 40 cheap
