@@ -392,9 +392,109 @@ Deno.test({
           "`--extern` gives `ctxb` twice",
         ],
         [["--extern"], 2, "`--extern` requires a value"],
+        [
+          ["--extern", "ctxb=0", "--extern", "scale=1e999"],
+          1,
+          "`1e999` is out of range for `scale`'s type",
+        ],
       ];
       for (const [args, code, want] of cases) {
         expectRefused(await runSrc(dir, two, args), code, want);
       }
+      // An f32 overflows sooner than an f64; `inf` and `nan` are accepted as spelled.
+      const f32 = "extern let r: f32\nprint(r)\n";
+      expectRefused(
+        await runSrc(dir, f32, ["--extern", "r=1e39"]),
+        1,
+        "`1e39` is out of range for `r`'s type",
+      );
+      const inf = await runSrc(dir, f32, ["--extern", "r=-inf"]);
+      expectEq("f32 -inf", [inf.code, inf.out.trim()], [0, "-Infinity"]);
+    }),
+});
+
+Deno.test({
+  name: "extern global: a boolean takes true, false, 1 or 0 and nothing else (D2636)",
+  ignore: !ENABLED,
+  fn: () =>
+    withDir(async (dir) => {
+      // `z == true`, `!z` and `if z` must agree, which only a 0 or a 1 makes them do.
+      const src = [
+        "extern let z: boolean",
+        "print(z == true)",
+        "print(!z)",
+        "if z { print(1) } else { print(0) }",
+        "",
+      ].join("\n");
+      const good: [string, string][] = [
+        ["true", "true,false,1"],
+        ["1", "true,false,1"],
+        ["false", "false,true,0"],
+        ["0", "false,true,0"],
+      ];
+      for (const [v, want] of good) {
+        const r = await runSrc(dir, src, ["--extern", `z=${v}`]);
+        expectEq(`z=${v}`, [r.code, r.out.trim().split("\n").join(",")], [0, want]);
+      }
+      for (const v of ["5", "2", "-1", "yes"]) {
+        expectRefused(
+          await runSrc(dir, src, ["--extern", `z=${v}`]),
+          1,
+          `\`z\` is a boolean global, which takes true, false, 1 or 0, and \`${v}\` is not one`,
+        );
+      }
+      // An i32 global is not a boolean: it takes any integer, and `true` is not one.
+      const i = "extern let n: i32\nprint(n)\n";
+      const five = await runSrc(dir, i, ["--extern", "n=5"]);
+      expectEq("i32 n=5", [five.code, five.out.trim()], [0, "5"]);
+      expectRefused(await runSrc(dir, i, ["--extern", "n=true"]), 1, "`n` is an i32 global");
+    }),
+});
+
+Deno.test({
+  name: "extern global: `vl test` and `vl run --batch` take `--extern` (D2636)",
+  ignore: !ENABLED,
+  fn: () =>
+    withDir(async (dir) => {
+      const lib = 'import { expect, it, toEqual } from "std:test"\n';
+      await Deno.writeTextFile(
+        `${dir}/a.test.vl`,
+        lib + 'extern let base: i32\nit("reads base", () => { expect(base + 1).toEqual(8) })\n',
+      );
+      await Deno.writeTextFile(
+        `${dir}/b.test.vl`,
+        lib + 'it("plain", () => { expect(1).toEqual(1) })\n',
+      );
+      const vlTest = (extra: string[]) =>
+        exec(VL, ["test", dir, "--compiler", COMPILER, ...extra]);
+      const ok = await vlTest(["--extern", "base=7"]);
+      if (ok.code !== 0) {
+        throw new Error(`vl test --extern: want 0, got ${ok.code}\n${ok.out}${ok.err}`);
+      }
+      const none = await vlTest([]);
+      if (none.code === 0 || !(none.out + none.err).includes("extern `base` is not supplied")) {
+        throw new Error(`vl test, no --extern: want the refusal, got ${none.code}\n${none.out}`);
+      }
+      expectRefused(
+        await vlTest(["--extern", "base=7", "--extern", "nope=1"]),
+        1,
+        "`--extern` names no extern global any module here declares: nope",
+      );
+
+      await Deno.writeTextFile(`${dir}/p.vl`, "extern let base: i32\nprint(base * 2)\n");
+      const out = `${dir}/out`;
+      const b = await exec(VL, [
+        "run",
+        "--batch",
+        "--out-dir",
+        out,
+        `${dir}/p.vl`,
+        "--compiler",
+        COMPILER,
+        "--extern",
+        "base=21",
+      ]);
+      expectEq("batch rc", b.code, 0);
+      expectEq("batch out", (await Deno.readTextFile(`${out}/p.vl.out`)).trim(), "42");
     }),
 });

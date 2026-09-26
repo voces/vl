@@ -6717,7 +6717,11 @@ import a mutable global another unit (or the embedder) owns, and a unit to expor
   2026-09-26, plumb PL-046, [D2636](docs/internals/inventory/D2636.md)); the refusal is per
   DECLARATION, and narrowing it to globals the program actually reads is a ROADMAP item. The
   spelling `--extern` (owner ruling 2026-09-26, over `--define`/`-D` and `--define-global`) matches
-  the keyword the program declares the global with.
+  the keyword the program declares the global with. A `boolean` crosses as an i32, so the host
+  cannot tell one from its import; the compiler writes a `vl-extern-bool` custom section naming
+  them, only when one exists, and the host refuses any value but `true`/`false`/`1`/`0` for
+  those. The alternative, a boolean-specific import name, would have changed the ABI every other
+  host links against.
 
 Pinned by `tests/vl_extern_global_test.ts` (sections, a host `WebAssembly.Global` written from both
 sides, V8 and `wasm-merge` + `-O3` links, the mutability `LinkError`, the `vl run` refusal) and the
