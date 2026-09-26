@@ -753,6 +753,42 @@ Each now says so, in the shape the `concat`-vs-`+` bullet uses.
   of `std:str` and `std:fmt` for one i32 rendering; binaryen's DCE at `-O3` removes almost all
   of it.
 
+## `std:idtable`
+
+- **Admitted by the owner's collections Q4 ruling (2026-09-25)**: "The dense int-keyed table is
+  a named, consumer-chosen type" (DECISIONS.md, "A collection's stated cost is contract"). The
+  consumer is plumb, which hand-rolls ten of these: seven from `~/plumb/src/render.vl:313`
+  (`texsT`, `bufsT`, `viewsT`, …), `ctxs` and `shaderBinds` later in that file, and `socks` in
+  `src/win32.vl`, each a
+  `(T | null)[]` grown by `push(null)`, deleted by storing `null`, never iterated.
+- **Its own module**, not a section of `std:array`: `std:array` is helpers over `T[]`, and this is
+  a type with its own methods whose names (`get`, `set`, `has`, `delete`) would read as list
+  methods there. The names are the built-in map's, so switching a `{[i32]: V}` to an
+  `IdTable<V>` changes the type and the constructor and nothing else, unless the program
+  enumerates keys: `for k in m` and `m.keys()` become `t.ids()`, named differently on purpose
+  because the order differs (ascending, not insertion). The methods resolve through the type
+  with only `IdTable` imported, so the header's import line names nothing else and a caller's
+  own `get` is untouched; importing `get` explicitly does not shadow `m.get(k)` or `xs.get(i)`
+  either (`idtable-scalar-values.vl`). `length` is the COUNT of ids
+  present, as a map's is, not the highest id + 1. The brackets duplicate `get`/`set` for the
+  same map parity; `std:buffer`'s views set the precedent.
+- **Over `(V | null)[]`, as asked**, which is plumb's own spelling. Building it found four
+  compiler rows, all closed in the same PR: D2525 (a generic `(V | null)[]` refused outright),
+  D2526 (the method spelling `t.set(…)` refused as a widened write), D2527 (`IdTable<Tex>()`
+  from another module: "unknown type"), D2528 (an applied generic record with a nullable-record
+  list field). The niche `V` kinds (`string`, `boolean`, string literal unions, function types)
+  still refuse loudly (D2525's boundary), which the header states.
+- **`set` pushes one shared `null`**, made once per call. A `null` literal pushed into a boxed
+  `(i32 | null)[]` allocates a box per push: plumb's hand-rolled `push(null)` loop measured 3×
+  slower than a map at a million ids with `i32` values, and the shared value brings `IdTable<i32>`
+  to parity with the map. `delete` still stores a fresh `null`, one allocation per call.
+- **Measured 2026-09-25** (`docs/guide/costs.md`, `-O`, `vl run`): on plumb's pattern (ascending
+  ids 7 apart, deletes 2,000 behind, 32 lookups per insert), a record value runs 6.6 ns per
+  operation against the map's 10.6 and the hand-rolled table's 6.2–6.8; an `i32` value
+  11.3–13.7 against the map's 13.4–19.2. The three programs are `bench/collections/id-table/`.
+- **A negative id traps in `set`** (plumb silently ignored it): a dropped write is a silent loss,
+  and `std:array.filled` traps on a negative length for the same reason. Reads answer `null`.
+
 ## `std:utf16`
 
 - **Admitted by clause (a) of `std-design.md` D2**: UTF-16 is the text ABI of the Win32, JS

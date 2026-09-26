@@ -8180,3 +8180,48 @@ the emitter cannot re-dispatch per instance (below) keeps the demand, so its bui
 **Only a call on the generic's own parameter is re-dispatched.** A call through a local bound
 from it, or from inside a closure, is refused at an instance whose built-in or field would take
 it, naming both and the spelling that works (D2520, open); on master it ran the function.
+
+## A collection's stated cost is contract, and an automatic representation is never slower than the baseline (owner ruling Q3+Q4, 2026-09-25)
+
+Recorded from `docs/internals/collections-representation-design.md` (branch
+`design-collections-representation`) §11 Q3 and Q4. The ruling, verbatim:
+
+> A collection's stated complexity is contract, and so is this: no automatic representation is
+> ever slower than the collection's baseline representation. Representations are chosen (1) by
+> the type: always allowed; (2) by size only: allowed silently if it depends only on `.length`,
+> has hysteresis, and falls back exactly to the baseline; (3) by data pattern: only when a named
+> type already offers the same representation, the exit is one-way to the baseline,
+> `vl run --stats` reports each exit, and the cost page names the trigger. No representation may
+> change what a program prints. No build flag selects representations. The dense int-keyed table
+> is a named, consumer-chosen type.
+
+**The three tiers**, as a checklist for any change that gives one surface type a second
+representation:
+
+| tier | chosen by | allowed when |
+| --- | --- | --- |
+| 1 | the TYPE (`u8[]` packed bytes; a future `boolean[]` as `i8`, or a niche for `(i32 \| null)[]`) | always |
+| 2 | SIZE alone | silently, if the choice reads only `.length`, has hysteresis (no flip-flop at one boundary), and falls back to exactly the baseline representation |
+| 3 | the PATTERN of the data (density, ascending inserts) | only if a named type already offers the same representation, the exit to the baseline is one-way, `vl run --stats` reports each exit, and `docs/guide/costs.md` names the trigger |
+
+Every tier obeys the two rules above them: no representation may change what a program prints,
+and none is ever slower than the baseline representation. No build flag selects one, so a
+representation is a property of the program and not of how it was built.
+
+**What it settles.** Q3 was whether cost is contract (option (a), taken: a data-dependent mode
+ships only with an observable and a cost page). Q4 was whether the dense int-keyed map is a
+named type or a hidden holey-ascending mode inside `{[i32]: V}`. It is a named type the consumer
+chooses: `IdTable<V>` in `std:idtable`, over a `(V | null)[]`, iterating in key order and costing
+one slot per id up to the highest set. A hidden mode inside `{[i32]: V}` is not ruled out, but it
+is tier 3 and needs `IdTable` to exist first (it does) plus the `--stats` observable (it does
+not). The user-facing statement of the complexities is `docs/guide/costs.md`, and a change that
+alters a row there is a contract change.
+
+**Why a named type first** (the design doc's §7 step 2d). plumb's hand tables are already
+arrays, so a mode inside the map would speed up none of them; a slot table iterates in key
+order and keeps holes, which is a different contract and so a different type; and it adds no
+branch to every map operation. Measured on plumb's access pattern (ascending ids 7 apart in one
+shared id space, deletes 2,000 behind, 32 lookups per insert, `-O`): with a record value
+`IdTable` runs 6.6 ns per operation against the map's 10.6. With an `i32` value it is on par
+(11.3–13.7 against 13.4–19.2), because `(i32 | null)[]` boxes every element; the tier-1 niche
+above is what would close that.
