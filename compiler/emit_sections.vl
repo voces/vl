@@ -2202,17 +2202,14 @@ function emitStartFnCode(out: u8[]) {
             wTarget(exprPrev)
             return -1
           }
-          // A guarded global's initializer has run: advance the progress cell past it.
-          if (
-            gi < gInitGuard.length
-            && gInitGuard[gi] == 1
-            && gInitProgIdx >= 0
-          ) {
-            fbI32Const(gi + 1)
-            fbGlobalSet(gInitProgIdx)
-          }
           wTarget(setPrev)
         }
+      }
+      // A guarded global's initializer has run (a folded one, at its declaration): advance the
+      // progress cell past it.
+      if gi < gInitGuard.length && gInitGuard[gi] >= 1 && gInitProgIdx >= 0 {
+        fbI32Const(gi + 1)
+        fbGlobalSet(gInitProgIdx)
       }
       // The row the D1594 diagnostic reads: this initializer's own byte range, so an
       // offset inside it names the `const`/`let` rather than the whole start function.
@@ -4774,22 +4771,21 @@ function passRowNeeds(row: string) {
 // empty wasm module is valid and every section here is already gated on having something to write, so this pass enforces nothing — it stays as a table row for the ordering edge `collectFns` declares.
 function passCheckTopLevel() { 0 }
 
-// Records `name` as mentioned at top-level position `ord`; `seen[name]` is true once an
-// identifier names it, false while only a member name has. The first mention reaches every
+// Records `name` as mentioned at top-level position `ord`; `seen[name]` ORs `bits`: 1 once an
+// identifier names it, 2 once one is an assignment's target, 0 for a member name. The first mention reaches every
 // `fnStmts` slot declared under that name and queues it for its own walk (`initGuardScan`),
 // except a nested one: its body is walked inside its enclosing function, in that scope.
 function igMention(
   name: string,
-  asIdent: boolean,
+  bits: i32,
   ord: i32,
-  seen: Map<string, boolean>,
+  seen: Map<string, i32>,
   head: Map<string, i32>,
   next: i32[],
   work: i32[],
 ) {
   const had = seen.has(name)
-  if asIdent { seen[name] = true }
-  else if !had { seen[name] = false }
+  seen[name] = (seen[name] ?? 0) | bits
   if had { return 0 }
   let p = head[name] ?? -1
   while p >= 0 && p < gInitFnReach.length && p < next.length {
@@ -4819,7 +4815,7 @@ function igWalk(
   ix: i32,
   ord: i32,
   shadow: string[],
-  seen: Map<string, boolean>,
+  seen: Map<string, i32>,
   head: Map<string, i32>,
   next: i32[],
   work: i32[],
@@ -4829,12 +4825,12 @@ function igWalk(
   const mark = shadow.length
   if n is Ident {
     if !igShadowed(shadow, n.identName) {
-      igMention(n.identName, true, ord, seen, head, next, work)
+      igMention(n.identName, 1, ord, seen, head, next, work)
     }
     return 0
   }
   if n is FuncDecl {
-    igMention(n.fnName, false, ord, seen, head, next, work)
+    igMention(n.fnName, 0, ord, seen, head, next, work)
     // A default is substituted at the call site, so it reads the caller's scope.
     let pi = 0
     while pi < n.fnParams.length {
@@ -4868,9 +4864,17 @@ function igWalk(
     if n.fiVar2 != "" { shadow.push(n.fiVar2) }
     igWalk(n.fiBody, ord, shadow, seen, head, next, work)
   } else {
-    if n is Member { igMention(n.memProp, false, ord, seen, head, next, work) }
-    if n is OptMember {
-      igMention(n.omProp, false, ord, seen, head, next, work)
+    if n is Member { igMention(n.memProp, 0, ord, seen, head, next, work) }
+    if n is OptMember { igMention(n.omProp, 0, ord, seen, head, next, work) }
+    if n is BinExpr {
+      if n.binOp == "=" {
+        const lhs = P.nodes[n.binLeft]
+        if lhs is Ident {
+          if !igShadowed(shadow, lhs.identName) {
+            igMention(lhs.identName, 2, ord, seen, head, next, work)
+          }
+        }
+      }
     }
     const kids = nodeChildren(ix)
     let k = 0
@@ -4885,7 +4889,7 @@ function igWalk(
 
 // Decides which module globals need the read-before-init guard (D2652): a global whose
 // initializer runs in the start function and whose name is mentioned by top-level code at or
-// before its declaration, or by a function that code can call. Sets `gInitAny` if any does.
+// before its declaration, or by a function that code can call (1); a folded `let` so assigned (2).
 function initGuardScan(): i32 {
   gInitGuard = []
   gInitFnReach = []
@@ -4896,7 +4900,13 @@ function initGuardScan(): i32 {
   let gi = 0
   while gi < globalStmts.length {
     gInitGuard.push(0)
-    if globalIsNonConst(globalStmts[gi]) { anyCand = true }
+    // A folded `let` is a candidate too: a write can still precede it.
+    const cd = P.nodes[globalStmts[gi]]
+    if cd is LetDecl {
+      if cd.letKw == "let" || globalIsNonConst(globalStmts[gi]) {
+        anyCand = true
+      }
+    }
     gi = gi + 1
   }
   const next: i32[] = []
@@ -4913,7 +4923,7 @@ function initGuardScan(): i32 {
     p = p + 1
   }
   if !anyCand { return 0 }
-  const seen: Map<string, boolean> = Map()
+  const seen: Map<string, i32> = Map()
   const work: i32[] = []
   const shadow: string[] = []
   gi = 0
@@ -4942,8 +4952,13 @@ function initGuardScan(): i32 {
     if takeGlobal {
       const g = P.nodes[node]
       if g is LetDecl {
-        if globalIsNonConst(node) && (seen[g.letName] ?? false) {
+        const bits = seen[g.letName] ?? 0
+        if globalIsNonConst(node) && (bits & 1) != 0 {
           gInitGuard[gi] = 1
+          gInitAny = true
+        } else if (g.letKw == "let" && g.letInit >= 0 && (bits & 2) != 0) {
+          // A folded `let` holds its value from instantiation, so only a write can precede it.
+          gInitGuard[gi] = 2
           gInitAny = true
         }
       }

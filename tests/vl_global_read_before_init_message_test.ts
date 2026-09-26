@@ -71,6 +71,11 @@ const CASES: [string, string][] = [
     "globals/write-before-init-via-closure-traps.vl",
     "`s` written before its initializer ran (line 8), via a closure\n",
   ],
+  // A folded `let` has no start-time store, so only its writes are guarded.
+  [
+    "globals/write-before-folded-let-traps.vl",
+    "`g` written before its initializer ran (line 7), via setG\n",
+  ],
   // D30's recursion witness: it must still compile, and running it now writes early.
   [
     "maps/inferred-map-return-recursion-write-before-init.vl",
