@@ -787,9 +787,9 @@ queue, no deque.**
   n=1536, 1.3% at n=65,536.
 
   **The two bodies are duplicated, and that is a compiler limitation.** `sorted` should be
-  `copy; sort(out, less); return out`; a generic function cannot pass its own generic-typed
-  function parameter to another generic function, in any of four spellings
-  (`tests/cases/std/error-generic-closure-forward.vl`). `tests/cases/std/array-sort-agrees.vl`
+  `copy; sort(out, less); return out`; a generic function could not pass its own generic-typed
+  function parameter to another generic function. D2552 lifted that
+  (`tests/cases/std/generic-closure-forward.vl`), so the collapse is now a std follow-up. `tests/cases/std/array-sort-agrees.vl`
   runs both exports over every length 0..200 and fails on the first divergence, so the
   duplication is gated rather than merely deprecated.
 
