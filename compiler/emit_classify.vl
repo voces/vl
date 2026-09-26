@@ -14778,6 +14778,27 @@ function indexElemNulRefArrayName(idxIx: i32, fnIx: i32) {
   ""
 }
 
+// The else of `m["k"] is T` over a map cell a null test already narrowed to a struct-union
+// set: subtract `T` from that set. A value-union cell is left to its own arms (D2565).
+function pushIndexStructComplement(
+  idxIx: i32,
+  variant: string,
+  condIx: i32,
+): boolean {
+  const ik = indexPathKeyOf(idxIx)
+  if ik == "" { return false }
+  const slot = narrowSlotOf(ik)
+  if slot < 0 { return false }
+  const cur = narrowVariants[slot]
+  if cur == "" || isValueUnionName(cur) { return false }
+  const sVar = isVariantSpelling(variant, isVarTyIxOf(condIx))
+  if pushNarrowComplement(ik, narrowSets[slot], sVar) != "" { return true }
+  const rest = removeAtomFromSet(cur, sVar)
+  if rest == "" || rest == cur { return false }
+  pushNarrow(ik, rest)
+  true
+}
+
 // Push the narrowing for an index place whose cell is a niche — a nullable reference the
 // read leaves `(ref null …)` rather than a tagged box. Returns whether it pushed. Not one
 // rep family: of the seven nullable reps, four are boxes (`new i32`/`i64`/`f32`/`f64`) but
@@ -14899,8 +14920,12 @@ function pushIndexMapNullNarrow(idxIx: i32, fnIx: i32) {
   if e is Index {
     const vt = nonNullTy(tyMapValOf(nodeTyIxOf(unwrapParen(e.idxArr))))
     if vt < 0 { return false }
-    const nm = tyToEmitName(vt)
+    let nm = tyToEmitName(vt)
     if nm == "" || nm == "null" { return false }
+    // A join of declared records is registered under its nominal spelling, and an `is`
+    // complement of this cell subtracts from that set, so the survivors must be spelled alike.
+    const nom = tyToNominalName(vt)
+    if nom != nm && isUName(nom) { nm = nom }
     pushNarrowRep(ik, nm, vt, -1)
     return true
   }
@@ -15109,7 +15134,7 @@ function setNarrowFromCondRaw(condIx0: i32, fnIx: i32) {
   if mnull >= 0 {
     if P.nodes[mnull] is Member {
       const mfn = memberUnionFieldNameRead(mnull, fnIx)
-      if mfn != "" && isValueUnionName(mfn) {
+      if mfn != "" && nullCmpBoxUnion(mfn) {
         const mk = memberPathKeyOf(mnull)
         if mk != "" {
           const mcn = P.nodes[condIx]
@@ -15134,7 +15159,7 @@ function setNarrowFromCondRaw(condIx0: i32, fnIx: i32) {
   if mnull >= 0 {
     if P.nodes[mnull] is Index {
       const ifn = indexElemUnionName(mnull, fnIx)
-      if ifn != "" && isValueUnionName(ifn) {
+      if ifn != "" && nullCmpBoxUnion(ifn) {
         const ik = indexPathKeyOf(mnull)
         if ik != "" {
           const icn = P.nodes[condIx]
@@ -15206,6 +15231,14 @@ function nullCmpRefOf(condIx: i32) {
     }
   }
   -1
+}
+
+// Whether a place's union is a box a null compare narrows: a value union, or a struct union
+// with `null` and two or more arms — the same pair the ident arms split between them (D2565).
+function nullCmpBoxUnion(un: string): boolean {
+  if isValueUnionName(un) { return true }
+  const uset = unionMemberSetOf(un)
+  unionSetHasNull(uset) && unionSetNonNullCount(uset) >= 2
 }
 
 // The receiver name when the condition at `condIx` is `<ident> == null` /
@@ -15377,6 +15410,9 @@ function setNarrowFromCondElseRaw(condIx0: i32, fnIx: i32) {
     if mrecv is Index {
       const eiix = unwrapParen(c.isObj)
       const eiun = indexElemUnionName(eiix, fnIx)
+      if eiun == "" {
+        if pushIndexStructComplement(eiix, c.isVariant, condIx) { return true }
+      }
       if eiun != "" {
         const eik = indexPathKeyOf(eiix)
         if eik != "" {
@@ -15572,7 +15608,7 @@ function setNarrowFromCondElseRaw(condIx0: i32, fnIx: i32) {
   if emnull >= 0 {
     if P.nodes[emnull] is Member {
       const emfn = memberUnionFieldName(emnull, fnIx)
-      if emfn != "" && isValueUnionName(emfn) {
+      if emfn != "" && nullCmpBoxUnion(emfn) {
         const emk = memberPathKeyOf(emnull)
         if emk != "" {
           const emcn = P.nodes[condIx]
@@ -15596,7 +15632,7 @@ function setNarrowFromCondElseRaw(condIx0: i32, fnIx: i32) {
   if emnull >= 0 {
     if P.nodes[emnull] is Index {
       const eifn = indexElemUnionName(emnull, fnIx)
-      if eifn != "" && isValueUnionName(eifn) {
+      if eifn != "" && nullCmpBoxUnion(eifn) {
         const eik = indexPathKeyOf(emnull)
         if eik != "" {
           const eicn = P.nodes[condIx]
@@ -21064,6 +21100,12 @@ function nulRefElemEmitName(nulTy: i32, innerTy: i32): string {
     if it is TyObj {
       const nom = nominalStructNameOfTy(innerTy)
       if nom != "" { return nom + "|null" }
+    }
+    // A nullable join of declared records is a registered box row under its nominal
+    // spelling; the structural render names no row, so an `is` complement subtracts nothing (D2565).
+    if it is TyUnion {
+      const nun = tyToNominalName(nulTy)
+      if nun != "" && isUName(nun) { return nun }
     }
   }
   tyToEmitName(nulTy)
