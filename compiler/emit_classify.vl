@@ -982,6 +982,35 @@ function retKindIsList(k: VKind) {
     || k == "f32list"
 }
 
+// The arena type the checker inferred for un-annotated function `i`'s return, or -1.
+function fnInferredRetTy(i: i32): i32 {
+  if i < 0 || i >= fnStmts.length { return -1 }
+  const fn = P.nodes[fnStmts[i]]
+  if fn is FuncDecl {
+    if fn.fnRet >= 0 { return -1 }
+    let row = inferRetRowOf(inferRetFnKey(fnStmts[i], fn.fnName))
+    if row < 0 { row = inferRetRowByNode(fnStmts[i]) }
+    if row < 0 { return -1 }
+    return inferRetTyIxAt(row)
+  }
+  -1
+}
+
+// `map` or `nulmap` when function `i`'s checker-inferred return is a map or a nullable map,
+// else `null`: the answer a re-entered arm join gives, where the stored kind is still a seed.
+function fnCheckedRetMapKind(i: i32): VKind | null {
+  const t = fnInferredRetTy(i)
+  if t < 0 || t >= T.tys.length { return null }
+  const tt = T.tys[t]
+  if tt is TyMap { return "map" }
+  if tt is TyNullable {
+    if tt.nInner >= 0 && tt.nInner < T.tys.length {
+      if T.tys[tt.nInner] is TyMap { return "nulmap" }
+    }
+  }
+  null
+}
+
 // Whether un-annotated function `i`'s checker-inferred return has a registered literal union's
 // member set, asked by set as the return's narrowing asks it: a string-repped member read it
 // returns narrows at the return, so the signature must not follow that read's own rep (D2153).
@@ -3542,11 +3571,19 @@ function fnAssignCellEq(fnIx: i32, a: string, b: string) {
   if ka == null { return false }
   if kb == null { return false }
   if ka != kb { return false }
-  // A map cell's identity is its shape, whether spelled or inferred (D2662).
+  if fnAssignCellColumnsEq(fnIx, a, b) { return true }
+  // Two map cells also agree on one shape, one spelled and one inferred (D2662). `-3` is a
+  // value type with no rep, which names no shape to agree on.
   if ka == "map" || ka == "nulmap" {
-    return fnAssignCellMapShape(fnIx, a, ka)
-      == fnAssignCellMapShape(fnIx, b, kb)
+    const sa = fnAssignCellMapShape(fnIx, a, ka)
+    if sa == -3 { return false }
+    return sa == fnAssignCellMapShape(fnIx, b, kb)
   }
+  false
+}
+
+// The struct slot, ref-list element and declared spelling of two same-kind cells all agree.
+function fnAssignCellColumnsEq(fnIx: i32, a: string, b: string) {
   if fnAssignCellSlot(fnIx, a) != fnAssignCellSlot(fnIx, b) { return false }
   if fnAssignCellElem(fnIx, a) != fnAssignCellElem(fnIx, b) { return false }
   fnAssignCellTypeName(fnIx, a) == fnAssignCellTypeName(fnIx, b)
@@ -3640,7 +3677,11 @@ function armNarrowTy(blockIx: i32, fnIx: i32): i32 {
 // for its `nulstr` seed: one fact, two readers, or functype and value disagree.
 export function fnAssignRetKind(fe: i32): VKind | null {
   const nm = fnAssignRetTargetName(fe)
-  if nm == "" { return null }
+  if nm == "" {
+    // Re-entered from its own arm join: the checked return, never the provisional stored kind.
+    if tailAssignInFlight(fe) { return fnCheckedRetMapKind(fe) }
+    return null
+  }
   fnAssignCellKind(fnStmts[fe], nm)
 }
 
