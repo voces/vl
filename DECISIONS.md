@@ -8088,3 +8088,36 @@ after an operand on the same line is now the operator, so that line is a parse e
 `.vl` file in `tests/`, `std/`, `compiler/` or `scripts/` (the distilled corpus included) has it:
 the tree was searched for `in` outside a `for` head, and every use is `in` as a variable at the
 start of a statement or operand, which parses as before.
+
+## An `i64` map key is a third key probe, hashed by a 64-bit multiply into the i32 key's pair index (collections Q8 (a), owner ruling 2026-09-25) — D2505
+
+**Ruled (a): `{[i64]: V}` is a built-in key type now**, ahead of any dense-map or struct-key
+work, as one more key probe inside the existing map helpers and with no new element-kind family.
+Key equality and hashing are a function of `K` alone; there is no user `==`. It closes plumb
+PL-018 and PL-029.
+
+**THE REP.** The key is a KIND (`MAP_KEY_STR`, `MAP_KEY_I32`, `MAP_KEY_I64`, from
+`typecheck.mapKeyKindOfTy`) where the emitter used to carry an i32-keyed boolean: the mono
+sentinels are `-4`/`-5` (i32 map/Set) and `-6`/`-7` (i64), an mv slot's key column holds the
+kind, and the struct differs from the i32-keyed one only in field 0, the i64 list. The index is
+the i32 key's (tag, entry) pair layout, with a TAG in the key's place.
+
+**THE HASH.** The tag is the top 32 bits of `key * 0x9E3779B97F4A7C15 mod 2^64`, the 64-bit
+Fibonacci constant, and the slot is then placed from the tag by the same 32-bit Fibonacci step
+an i32 key takes. Three properties decided it. (1) Every bit of the key reaches the tag, and two
+keys that differ only in their high 32 bits always get different tags, because the difference of
+their products' high halves is `d * lo32(C) mod 2^32` with `lo32(C)` odd. Folding the halves
+with `xor` was the alternative the brief suggested, and it sends every key whose halves are equal
+(`(n << 32) | n`) to tag 0. (2) Because the tag is 32 bits, the pair resize
+(`__map_resize_i32__`) and the compaction re-place an i64 map exactly as an i32 one, so only the
+probe is new: `__map_probe_i64__` compares the tag first and confirms against the keys backing
+only on a tag match. (3) A tag match is not a key match — multiplication by an odd constant is a
+bijection mod 2^64, so keys can be constructed to share a tag — which is why the probe keeps the
+key compare, and why `i64-keyed-basics.vl` carries six keys with one tag: a seed whose probe
+trusted the tag failed it.
+
+**THE PRICE, MEASURED** (`bench/collections/map-i32`'s loop with only the key type changed, 200K
+keys, 40M lookups, `-O`, min of 5 interleaved at load ~12): the same keys as i64 run 1.05x the
+i32 map's time; the keys spread across the full 64 bits (`k * 4294967311`) run 0.67x, since the
+i32 map places `7i + 3` by one Fibonacci step and the i64 map by two. A module with no i64-keyed
+map builds byte-identically.

@@ -32,12 +32,12 @@ import {
   msSetNext,
   msSetRow,
   msSetText,
-  mvKeyI32,
+  mvKeyKind,
   mvValArmSig,
   mvValName,
   mvValTyIx,
   sFieldCount,
-  sFieldElemKeyI32,
+  sFieldElemKeyKind,
   sFieldElemName,
   sFieldElemTyIx,
   sFieldStart,
@@ -46,7 +46,7 @@ import {
   sRowDecl,
   sTwin,
   sTyIx,
-  uFieldElemKeyI32,
+  uFieldElemKeyKind,
   uFieldElemName,
   uFieldElemTyIx,
   uVariants,
@@ -68,9 +68,11 @@ import {
   vbI64Used,
 } from "./emit_state"
 import {
+  MAP_KEY_I32,
+  MAP_KEY_I64,
+  MAP_KEY_STR,
   PrimName,
   T,
-  TY_I32,
   TyArray,
   TyErr,
   TyFunc,
@@ -85,7 +87,7 @@ import {
   cUserTypes,
   cUserTypesVer,
   litBaseTy,
-  mapKeyRepTy,
+  mapKeyKindOfTy,
   nodeRepTyIxOf,
   nodeTyIsUnionAlias,
   nodeTyIxOf,
@@ -904,29 +906,34 @@ export function recordMvValTyIx(nm: string, rowTy: i32) {
   0
 }
 
-// The key half of an mv slot's identity: true when slot `slot`'s map struct carries
-// the i32 keys list. The one read of the `mvKeyI32` column — slot resolvers, `cm*`
-// emit accessors and the type section all ask through it. Lives here rather than
-// beside its siblings in `emit_classify`, since `emit_classify` imports from here.
-export function mvSlotKeyI32(slot: i32): boolean {
-  if slot < 0 { return false }
-  if slot >= mvKeyI32.length { return false }
-  mvKeyI32[slot] == 1
+// The key half of an mv slot's identity: the `typecheck.mapKeyKindOfTy` kind of the keys list
+// slot `slot`'s map struct carries, the string kind for a slot the column does not cover. The
+// one read of the `mvKeyKind` column; it lives here because `emit_classify` imports from here.
+export function mvSlotKeyKind(slot: i32): i32 {
+  if slot < 0 { return MAP_KEY_STR }
+  if slot >= mvKeyKind.length { return MAP_KEY_STR }
+  mvKeyKind[slot]
 }
 
-// The one key question asked of a map shape, in the vocabulary every op site
-// threads: the two mono sentinels (`-4` map, `-5` Set) plus an mv slot's own column.
-// Both halves or neither — a site testing `sh == -4` alone is correct only while an
-// i32-keyed map's value stays restricted to the mono rep.
-export function mapShapeKeyI32(sh: i32): boolean {
-  sh == -4 || sh == -5 || mvSlotKeyI32(sh)
+// The one key question asked of a map shape, in the vocabulary every op site threads: the i32
+// mono pair (`-4` map, `-5` Set), the i64 mono pair (`-6`, `-7`), or an mv slot's own column;
+// every other shape is string-keyed. A site testing one sentinel alone misses the slot half.
+export function mapShapeKeyKind(sh: i32): i32 {
+  if sh == -4 || sh == -5 { return MAP_KEY_I32 }
+  if sh == -6 || sh == -7 { return MAP_KEY_I64 }
+  mvSlotKeyKind(sh)
+}
+
+// Whether map shape `sh` has an integer key, so its index is the (tag, entry) pair layout.
+export function mapShapeKeyInt(sh: i32): boolean {
+  mapShapeKeyKind(sh) != MAP_KEY_STR
 }
 
 // D48 — the interned mv slot whose (value type, key rep, arm) triple matches
 // `ty`/`keyI32`/`armHint`, or -1 — first-match-wins over the `mvValName` scan it
 // fronts. The arm is a third identity component, since a map whose value is a
 // declared union arm and one over its exact layout twin never merge. `MV_ARM_NOHINT` matches any parity, -1 only a non-arm slot, `>= 0` only that arm's.
-export function mvSlotOfTyKArm(ty: i32, keyI32: boolean, armHint: i32): i32 {
+export function mvSlotOfTyKArm(ty: i32, keyK: i32, armHint: i32): i32 {
   if ty < 0 { return -1 }
   // The interned id, not a rebuilt spelling: comparing arena indices as raw ints
   // avoids re-rendering a full structural string and re-running `repMvValKey` for
@@ -936,7 +943,7 @@ export function mvSlotOfTyKArm(ty: i32, keyI32: boolean, armHint: i32): i32 {
   let i = 0
   while i < mvValTyIx.length {
     if mvValTyIx[i] >= 0 {
-      if mvSlotKeyI32(i) == keyI32 {
+      if mvSlotKeyKind(i) == keyK {
         if mvSlotArmMatches(i, armHint) {
           if repMvValId(mvValTyIx[i]) == k { return i }
         }
@@ -976,36 +983,32 @@ export function tyMapValOf(ty: i32): i32 {
   -1
 }
 
-// The KEY half of the same hop: true when the map type `ty` is i32-KEYED — the
-// structural form of `nameIsI32KeyedMap(name)`, and the argument every arena-side
-// `mvSlotOfValTyK` caller pairs with `tyMapValOf`. A non-map answers false, exactly as the
-// name predicate does for a non-map spelling, so the two legs decline together.
-export function tyMapKeyIsI32(ty: i32): boolean {
-  if ty < 0 { return false }
+// The KEY half of the same hop: the key kind (`typecheck.mapKeyKindOfTy`) of map type `ty`, the
+// structural form of `mapNameKeyKind(name)` and the argument every arena-side `mvSlotOfValTyK`
+// caller pairs with `tyMapValOf`. A non-map answers the string kind, as the name form does.
+export function tyMapKeyKind(ty: i32): i32 {
+  if ty < 0 { return MAP_KEY_STR }
   const t = T.tys[ty]
-  // The key's HASH is `typecheck.mapKeyRepTy`'s answer, the same one the checker's gate
-  // and `nodeTyMapKeyIsI32` project — a second structural test here would be a place the
-  // two can drift about which map struct a newtype- or alias-keyed map takes.
-  if t is TyMap { return mapKeyRepTy(t.mKey) == TY_I32 }
-  false
+  if t is TyMap { return mapKeyKindOfTy(t.mKey) }
+  MAP_KEY_STR
 }
 
 // The name bridge for the mv layer (still name-keyed at entry): resolve a map-value
 // name to its arena type, then to its (key-paired) slot; -1 when the name does not
 // resolve or no row claims it. Most traffic now routes through a caller holding an
 // annotation/expression node whose map type the checker already banked (`nodeMapValTyIx`); this covers what has only a spelling, plus the fall-through those routed sites keep.
-export function mvSlotOfValNameTyK(nm: string, keyI32: boolean): i32 {
-  mvSlotOfValNameTyKArm(nm, keyI32, MV_ARM_NOHINT)
+export function mvSlotOfValNameTyK(nm: string, keyK: i32): i32 {
+  mvSlotOfValNameTyKArm(nm, keyK, MV_ARM_NOHINT)
 }
 
 // The arm-hinted form of the name bridge — the same resolution, filtered by the
 // caller's arm state (see `mvSlotOfTyKArm`). The un-hinted entry point is unchanged.
 export function mvSlotOfValNameTyKArm(
   nm: string,
-  keyI32: boolean,
+  keyK: i32,
   armHint: i32,
 ): i32 {
-  mvSlotOfTyKArm(fieldElemTyIxOfName(nm), keyI32, armHint)
+  mvSlotOfTyKArm(fieldElemTyIxOfName(nm), keyK, armHint)
 }
 
 // The arena type a map-value spelling denotes — the rung the name bridge sits on,
@@ -1042,8 +1045,8 @@ export function tyMapKeyOf(ty: i32): i32 {
   -1
 }
 
-// Whether node `ix` records a map whose KEY is a literal union. `nodeTyMapKeyIsI32` answers
-// true for it too, so this is the half that separates a member literal — which lowers as the
+// Whether node `ix` records a map whose KEY is a literal union. `nodeTyMapKeyKind` answers
+// the i32 kind for it too, so this is the half that separates a member literal — which lowers as the
 // interned atom, not a string ref — from a genuine `{[i32]: V}` key (D1748).
 export function nodeTyMapKeyIsLitUnion(ix: i32): boolean {
   tyIsLitUnion(tyMapKeyOf(nodeMapTyIx(ix)))
@@ -1857,58 +1860,46 @@ export function declTyIxOfName(nm: string): i32 {
 // `sFieldElemName`: the element/target name's arena type (phase D5) and, for a map
 // field, the key half of the map's rep (B6b). Pads -1/0 so a skipped push self-heals
 // to uncovered. One recorder for both, since writing the key at only some push sites is exactly the parallel-array skew this table is most fragile to.
-export function recordSFieldElemRow(nm: string, keyI32: boolean) {
-  recordSFieldElemRowTy(nm, keyI32, -1)
+export function recordSFieldElemRow(nm: string, keyK: i32) {
+  recordSFieldElemRowTy(nm, keyK, -1)
 }
 
 // `recordSFieldElemRow` with the caller's arena row for `nm`; -1 is exactly the
 // unhinted call, unchanged by construction. On the sidecar side of the mint-order
 // line (D-MAPNODETY): the row is recorded beside a mint that already happened,
 // never fronting one — a mint path here is what emitted invalid wasm at `mvShapeOfValNameK`.
-export function recordSFieldElemRowTy(
-  nm: string,
-  keyI32: boolean,
-  tyHint: i32,
-) {
+export function recordSFieldElemRowTy(nm: string, keyK: i32, tyHint: i32) {
   while sFieldElemTyIx.length + 1 < sFieldElemName.length {
     sFieldElemTyIx.push(-1)
   }
   let sfTy = tyHint
   if sfTy < 0 { sfTy = fieldElemTyIxOfName(nm) }
   sFieldElemTyIx.push(sfTy)
-  while sFieldElemKeyI32.length + 1 < sFieldElemName.length {
-    sFieldElemKeyI32.push(0)
+  while sFieldElemKeyKind.length + 1 < sFieldElemName.length {
+    sFieldElemKeyKind.push(0)
   }
-  let k = 0
-  if keyI32 { k = 1 }
-  sFieldElemKeyI32.push(k)
+  sFieldElemKeyKind.push(keyK)
   0
 }
 
 // The `recordSFieldElemRow` twin for the VARIANT field table (`uFieldElemName`).
-export function recordUFieldElemRow(nm: string, keyI32: boolean) {
-  recordUFieldElemRowTy(nm, keyI32, -1)
+export function recordUFieldElemRow(nm: string, keyK: i32) {
+  recordUFieldElemRowTy(nm, keyK, -1)
 }
 
 // `recordUFieldElemRow` with the caller's arena row for `nm`; -1 is the unhinted call.
 // The sidecar side of the mint-order line, exactly as `recordSFieldElemRowTy`.
-export function recordUFieldElemRowTy(
-  nm: string,
-  keyI32: boolean,
-  tyHint: i32,
-) {
+export function recordUFieldElemRowTy(nm: string, keyK: i32, tyHint: i32) {
   while uFieldElemTyIx.length + 1 < uFieldElemName.length {
     uFieldElemTyIx.push(-1)
   }
   let ufTy = tyHint
   if ufTy < 0 { ufTy = fieldElemTyIxOfName(nm) }
   uFieldElemTyIx.push(ufTy)
-  while uFieldElemKeyI32.length + 1 < uFieldElemName.length {
-    uFieldElemKeyI32.push(0)
+  while uFieldElemKeyKind.length + 1 < uFieldElemName.length {
+    uFieldElemKeyKind.push(0)
   }
-  let k = 0
-  if keyI32 { k = 1 }
-  uFieldElemKeyI32.push(k)
+  uFieldElemKeyKind.push(keyK)
   0
 }
 

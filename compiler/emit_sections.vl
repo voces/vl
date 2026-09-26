@@ -8,6 +8,9 @@ import {
   ATOMIC_SIG_FENCE,
   ATOMIC_SIG_LOAD,
   ATOMIC_SIG_RMW,
+  MAP_KEY_I32,
+  MAP_KEY_I64,
+  MAP_KEY_STR,
   PrimName,
   SIMD_SIG_LANE_F,
   SIMD_SIG_LANE_L,
@@ -55,9 +58,9 @@ import {
   REP_SCAL_F64,
   REP_SCAL_I64,
   hcReset,
-  mapShapeKeyI32,
+  mapShapeKeyKind,
   msPoolReset,
-  mvSlotKeyI32,
+  mvSlotKeyKind,
   repKindOfSigTok,
   repMemLoadScalarMask,
   repNodeScalarMask,
@@ -276,6 +279,7 @@ import {
   gHelpMapCompact,
   gHelpMapProbe,
   gHelpMapProbeI32,
+  gHelpMapProbeI64,
   gHelpMapResize,
   gHelpMapResizeI32,
   gHelpMapResync,
@@ -307,6 +311,7 @@ import {
   globalStmts,
   ia64TypeIdx,
   ia64Used,
+  il64TypeIdx,
   lTypeIdx,
   lUsed,
   localBlockLet,
@@ -322,6 +327,7 @@ import {
   loopContDepth,
   loopContLabel,
   mI32Used,
+  mI64Used,
   mUsed,
   memLogUsed,
   memUsed,
@@ -382,7 +388,7 @@ import {
   sBackIdx,
   sDeclared,
   sFieldCount,
-  sFieldElemKeyI32,
+  sFieldElemKeyKind,
   sFieldElemTyIx,
   sFieldNames,
   sFieldStart,
@@ -407,7 +413,7 @@ import {
   uBoxNewEnd,
   uDeclared,
   uFieldCount,
-  uFieldElemKeyI32,
+  uFieldElemKeyKind,
   uFieldElemTyIx,
   uSinkFired,
   uVarHeap,
@@ -459,6 +465,7 @@ import {
   fbLocalTee,
   fbLoop,
   fbMapSlotOf,
+  fbMapTagOfI64,
   fbRefAsNonNull,
   fbRefNull,
   fbRefNullForKind,
@@ -3291,6 +3298,83 @@ function emitMapProbeI32FnCode(out: u8[]) {
   helpFrameBody(out, body)
 }
 
+// `__map_probe_i64__(index, key, keysBacking) -> slot`: the i64-keyed probe over the same pair
+// layout, whose tag is `fbMapTagOfI64` of the key, so a tag match is confirmed against the keys
+// backing. A deleted pair (entry -1) is never a hit and is never read through.
+function emitMapProbeI64FnCode(out: u8[]) {
+  const body: u8[] = []
+  const prev = wTarget(body)
+  wULEB(1) // 1 locals run
+  wULEB(5) // count 5
+  wU8(127) // 0x7f i32 (mask 3, slot 4, entry 5, start 6, tag 7)
+  // mask = len(index) / 2 - 1 ; tag = tagOf(key) ; slot = start = slotOf(tag)
+  fbLocalGet(0)
+  fbArrayLen()
+  fbI32Const(1)
+  fbI32Bin(118) // 0x76 i32.shr_u
+  fbI32Const(1)
+  fbI32Bin(107) // 0x6b i32.sub
+  fbLocalSet(3)
+  fbMapTagOfI64(1)
+  fbLocalSet(7)
+  fbMapSlotOf(7, 3)
+  fbLocalTee(4)
+  fbLocalSet(6)
+  fbBlock(64)   // block (probe break target), void
+  fbLoop(64)    // loop, void
+  // entry = index[2*slot + 1] ; if entry == 0 { br out (miss) }
+  fbLocalGet(0)
+  fbLocalGet(4)
+  fbI32Const(1)
+  fbI32Bin(116) // 0x74 i32.shl
+  fbI32Const(1)
+  fbI32Bin(114) // 0x72 i32.or
+  fbArrayGet(aTypeIdx)
+  fbLocalTee(5)
+  fbI32Eqz()
+  fbBrIf(1) // → out of the probe block
+  // index[2*slot] == tag (&& entry > 0) ? keysBacking[entry-1] == key : 0 → hit
+  fbLocalGet(0)
+  fbLocalGet(4)
+  fbI32Const(1)
+  fbI32Bin(116) // i32.shl
+  fbArrayGet(aTypeIdx)
+  fbLocalGet(7)
+  fbI32Bin(70) // 0x46 i32.eq
+  if gMapDeletes {
+    fbLocalGet(5)
+    fbI32Const(0)
+    fbI32Bin(74)  // 0x4a i32.gt_s
+    fbI32Bin(113) // 0x71 i32.and
+  }
+  fbIf(127)     // if, i32 blocktype — the key compare rides the tag match
+  fbLocalGet(2)
+  fbLocalGet(5)
+  fbI32Const(1)
+  fbI32Bin(107) // i32.sub (entry - 1)
+  fbArrayGet(ia64TypeIdx)
+  fbLocalGet(1)
+  fbI32Bin(81)  // 0x51 i64.eq
+  fbElse()
+  fbI32Const(0)
+  fbEnd()
+  fbBrIf(1)     // hit → out of the probe block
+  // slot = (slot + 1) & mask  (collision OR a deleted marker: keep probing)
+  fbLocalGet(4)
+  fbI32Const(1)
+  fbI32Bin(106)
+  fbLocalGet(3)
+  fbI32Bin(113) // 0x71 i32.and
+  fbLocalTee(4)
+  emitMapProbeBackEdge(6)
+  fbEnd() // end (loop)
+  fbEnd() // end (probe block)
+  fbLocalGet(4)
+  fbEnd() // end (function)
+  wTarget(prev)
+  helpFrameBody(out, body)
+}
+
 // Store `entryL` at the first free slot from `slotL`'s value in the index in `idxL` (mask
 // `maskL`), advancing `slotL`: the one insertion loop both resizes and the compaction share.
 // With `tagL >= 0` the index is the i32 pair layout, and `tagL`'s value goes beside the entry.
@@ -3561,11 +3645,41 @@ function mapResyncFuncType() {
   0
 }
 
+// An integer-keyed mono map struct over the keys list wrapper `keysWrap` (`$lTypeIdx` for an
+// i32 key, `$il64TypeIdx` for an i64 one).
+function emitMonoMapStructType(keysWrap: i32) {
+  // Only field 0 differs from the string-keyed struct, which is why the resize and compaction are shared.
+  wU8(95)              // 0x5f struct (integer-keyed map)
+  wU8(mapFieldCount()) // 7 fields, 9 with seqs
+  wU8(100)             // field 0 keys: 0x64 (ref <keysWrap>) — non-null integer list
+  wSLEB(keysWrap)
+  wU8(1)               // mutable
+  wU8(100)             // field 1 vals: 0x64 (ref $lTypeIdx) — non-null
+  wSLEB(lTypeIdx)
+  wU8(1)               // mutable
+  wU8(100)             // field 2 live: 0x64 (ref $aTypeIdx) — non-null i32 array
+  wSLEB(aTypeIdx)
+  wU8(1)               // mutable
+  wU8(100)             // field 3 index: 0x64 (ref $aTypeIdx) — non-null i32 array
+  wSLEB(aTypeIdx)
+  wU8(1)               // mutable
+  wU8(127)             // field 4 count: 0x7f i32
+  wU8(1)               // mutable
+  wU8(127)             // field 5 size: 0x7f i32
+  wU8(1)               // mutable
+  wU8(100)             // field 6 hashes: 0x64 (ref $aTypeIdx) — non-null i32 array
+  wSLEB(aTypeIdx)
+  wU8(1)               // mutable
+  mapSeqFieldTypes()
+  0
+}
+
 // Whether map shape `sh` (-1, -4, or an mv slot) has every heap type its compaction helper
 // names, asked without recording a failure: a slot no map op resolved gets no helper.
 function mapShapeCompactable(sh: i32): boolean {
   if sh == -1 { return mUsed }
   if sh == -4 { return mI32Used }
+  if sh == -6 { return mI64Used }
   if sh < 0 || sh >= mvMapTypeIdx.length { return false }
   const k = mvValKind[sh]
   if k == 3 || k == 10 || k == 11 || k == 13 { return true }
@@ -3574,10 +3688,11 @@ function mapShapeCompactable(sh: i32): boolean {
 }
 
 // The map shape the `k`th compaction helper row serves: row 0 the string-keyed mono map, row 1
-// the i32-keyed one, row `2 + s` mv slot `s`.
+// the i32-keyed one, row `2 + s` mv slot `s`, and the last row the i64-keyed one.
 function mapCompactRowShape(k: i32) {
   if k == 0 { return -1 }
   if k == 1 { return -4 }
+  if k == mvMapTypeIdx.length + 2 { return -6 }
   k - 2
 }
 
@@ -3597,12 +3712,16 @@ function mapCompactFuncType(sh: i32) {
 // cap `__map_resize__` would grow into anyway (D2291, D2315). Only a resized index allocates.
 function emitMapCompactFnCode(out: u8[], sh: i32) {
   const mapTy = mapTypeIdxOf(sh)
-  const keyI32 = mapShapeKeyI32(sh)
+  const keyK = mapShapeKeyKind(sh)
+  const keyInt = keyK != MAP_KEY_STR
   let keysWrap = mkListIdx
   let keysBack = mkArrIdx
-  if keyI32 {
+  if keyK == MAP_KEY_I32 {
     keysWrap = lTypeIdx
     keysBack = aTypeIdx
+  } else if keyK == MAP_KEY_I64 {
+    keysWrap = il64TypeIdx
+    keysBack = ia64TypeIdx
   }
   let valsWrap = lTypeIdx
   let valsBack = aTypeIdx
@@ -3615,13 +3734,19 @@ function emitMapCompactFnCode(out: u8[], sh: i32) {
   }
   const body: u8[] = []
   const prev = wTarget(body)
-  // locals: 1 i, 2 j, 3 count, 4 cap, 5 rslot, 6 mask, 7 tag, 8 entry, 9 idx
-  wULEB(2) // 2 locals runs
+  // locals: 1 i, 2 j, 3 count, 4 cap, 5 rslot, 6 mask, 7 tag, 8 entry, 9 idx[, 10 an i64 key]
+  let runs = 2
+  if keyK == MAP_KEY_I64 { runs = 3 }
+  wULEB(runs) // locals runs
   wULEB(8)
-  wU8(127) // 0x7f i32
+  wU8(127)    // 0x7f i32
   wULEB(1)
-  wU8(99)  // 0x63 (ref null ht)
+  wU8(99)     // 0x63 (ref null ht)
   wSLEB(aTypeIdx)
+  if keyK == MAP_KEY_I64 {
+    wULEB(1)
+    wU8(126) // 0x7e i64
+  }
   fbLocalGet(0)
   fbStructGet(mapTy, 4)
   fbLocalSet(3)
@@ -3640,7 +3765,7 @@ function emitMapCompactFnCode(out: u8[], sh: i32) {
   mapCompactMove(mapTy, 0, keysWrap, keysBack)
   mapCompactMove(mapTy, 1, valsWrap, valsBack)
   mapCompactMove(mapTy, 2, -1, aTypeIdx)
-  if !keyI32 { mapCompactMove(mapTy, 6, -1, aTypeIdx) }
+  if !keyInt { mapCompactMove(mapTy, 6, -1, aTypeIdx) }
   mapCompactMove(mapTy, 7, -1, ia64TypeIdx)
   fbLocalGet(2)
   fbI32Const(1)
@@ -3673,7 +3798,7 @@ function emitMapCompactFnCode(out: u8[], sh: i32) {
   fbLocalGet(1)
   fbI64Const(-1, -1)
   fbArraySet(ia64TypeIdx)
-  if !keyI32 {
+  if !keyInt {
     fbLocalGet(0)
     fbStructGet(mapTy, 0)
     fbStructGet(keysWrap, 0)
@@ -3731,9 +3856,9 @@ function emitMapCompactFnCode(out: u8[], sh: i32) {
   fbEnd()
   // idx = the index cleared in place when it already has cap slots (a steady churn's case),
   // else a fresh one; then entry i < j is re-placed from the entries, never the old index: an
-  // i32 key as its own pair tag, a string key at its stored hash
+  // i32 key as its own pair tag, an i64 key at its hash, a string key at its stored hash
   let pairShift = 0
-  if keyI32 { pairShift = 1 }
+  if keyInt { pairShift = 1 }
   fbLocalGet(0)
   fbStructGet(mapTy, 3)
   fbLocalTee(9)
@@ -3773,12 +3898,16 @@ function emitMapCompactFnCode(out: u8[], sh: i32) {
   fbI32Bin(106)
   fbLocalSet(8) // entry = i + 1
   fbLocalGet(0)
-  if keyI32 {
+  if keyInt {
     fbStructGet(mapTy, 0)
     fbStructGet(keysWrap, 0)
     fbLocalGet(1)
-    fbArrayGet(aTypeIdx)
-    fbLocalSet(7) // tag = keys[i]
+    fbArrayGet(keysBack)
+    if keyK == MAP_KEY_I64 {
+      fbLocalSet(10)
+      fbMapTagOfI64(10)
+    }
+    fbLocalSet(7) // tag = keys[i], or an i64 key's hash
     fbMapSlotOf(7, 6)
     fbLocalSet(5)
     emitMapPlaceEntry(9, 6, 7, 8, 5)
@@ -3983,6 +4112,7 @@ function emitNameSection(n: i32) {
   if gHelpStrBytes >= 0 { count = count + 1 }
   if gHelpMapProbe >= 0 { count = count + 2 }
   if gHelpMapProbeI32 >= 0 { count = count + 2 }
+  if gHelpMapProbeI64 >= 0 { count = count + 1 }
   if gHelpF64Rem >= 0 { count = count + 1 }
   if gHelpMapResync >= 0 { count = count + 1 }
   let cnk = 0
@@ -4112,6 +4242,10 @@ function emitNameSection(n: i32) {
     wName("__map_probe_i32__")
     wULEB(gHelpMapResizeI32)
     wName("__map_resize_i32__")
+  }
+  if gHelpMapProbeI64 >= 0 {
+    wULEB(gHelpMapProbeI64)
+    wName("__map_probe_i64__")
   }
   if gHelpF64Rem >= 0 {
     wULEB(gHelpF64Rem)
@@ -4293,10 +4427,16 @@ function emitModule(_stmts: i32[]) {
   }
   // The i32-KEYED probe and resize, LAST so no existing helper index moves in a program
   // without one: the i32-keyed index is the pair layout, which neither string helper reads.
-  if mI32Used {
+  // The i64-keyed rep resizes over the same pairs, so it mints this pair too.
+  if mI32Used || mI64Used {
     gHelpMapProbeI32 = helpBase + nHelpers
     nHelpers = nHelpers + 1
     gHelpMapResizeI32 = helpBase + nHelpers
+    nHelpers = nHelpers + 1
+  }
+  gHelpMapProbeI64 = -1
+  if mI64Used {
+    gHelpMapProbeI64 = helpBase + nHelpers
     nHelpers = nHelpers + 1
   }
   // The float remainder helper (D1586), last for the reason its neighbour above gives: no
@@ -4315,7 +4455,7 @@ function emitModule(_stmts: i32[]) {
     gHelpMapResync = helpBase + nHelpers
     nHelpers = nHelpers + 1
     let ck = 0
-    while ck < mvMapTypeIdx.length + 2 {
+    while ck < mvMapTypeIdx.length + 3 {
       if mapShapeCompactable(mapCompactRowShape(ck)) {
         gHelpMapCompact.push(helpBase + nHelpers)
         nHelpers = nHelpers + 1
@@ -5023,17 +5163,17 @@ export function emitProgram(rootIx: i32) {
   fmSeenSFields = -1
   fmSeenUFields = -1
   fmSeenTyParams = -1
-  sFieldElemTyIx = []   // a struct FIELD's element type     [collectS]
-  uFieldElemTyIx = []   // a VARIANT field's element type    [collectU]
-  sFieldElemKeyI32 = [] // a struct FIELD's map KEY rep    [collectS]
-  uFieldElemKeyI32 = [] // a VARIANT field's map KEY rep   [collectU]
-  unMemTyStart = []     // union MEMBER types per row        [collectU]
+  sFieldElemTyIx = []    // a struct FIELD's element type     [collectS]
+  uFieldElemTyIx = []    // a VARIANT field's element type    [collectU]
+  sFieldElemKeyKind = [] // a struct FIELD's map KEY rep    [collectS]
+  uFieldElemKeyKind = [] // a VARIANT field's map KEY rep   [collectU]
+  unMemTyStart = []      // union MEMBER types per row        [collectU]
   unMemTyCount = []
   unMemTys = []
-  unMemAtoms = []       // the member-REFERENCE columns      [collectU]
+  unMemAtoms = []        // the member-REFERENCE columns      [collectU]
   unMemAtomIds = []
   unMemKinds = []
-  msPoolReset()         // the member SETS interned over those columns
+  msPoolReset()          // the member SETS interned over those columns
   // The if-expression arm blocks whose prelude locals the collect pass allocated. Arena node
   // indices, so it is the same hazard as the columns above and worse: a stale index that happens
   // to name a node in program N grants the emitter permission to lower a prelude with no allocated locals, claiming another binding's slot.
@@ -5220,6 +5360,10 @@ function helpValtype(c: i32) {
     wU8(127) // 0x7f i32
     return 0
   }
+  if c == 'j' {
+    wU8(126) // 0x7e i64 — `__map_probe_i64__`'s key
+    return 0
+  }
   if c == 'f' {
     // 'f' = f64 — `__f64_rem__`'s two operands and its result (D1586). The only SCALAR
     // descriptor besides 'i', and the reason the two are handled before the ref block:
@@ -5239,6 +5383,9 @@ function helpValtype(c: i32) {
   } else if c == 'y' {
     // 'y' = the `u8[]` WRAPPER, `(ref $bl8TypeIdx)` — `__str_bytes__`'s result.
     wSLEB(bl8TypeIdx)
+  } else if c == 'k' {
+    // 'k' = the i64 array, `(ref $ia64TypeIdx)` — an i64-keyed map's keys backing.
+    wSLEB(ia64TypeIdx)
   } else {
     wSLEB(aTypeIdx)
   }
@@ -5789,34 +5936,9 @@ function emitTypeSection(
     wU8(1)               // mutable
     mapSeqFieldTypes()
   }
-  if mI32Used {
-    // The i32-KEYED map struct — the same 7 fields in the same order, with field 0
-    // `keys` re-typed to the i32 list wrapper (`$lTypeIdx` over `$aTypeIdx`) instead
-    // of the string-ref list. Every other field matches the twin above exactly,
-    // which is why the probe/rehash/compact machinery is shared.
-    wU8(95)              // 0x5f struct (i32-keyed map)
-    wU8(mapFieldCount()) // 7 fields, 9 with seqs
-    wU8(100)             // field 0 keys: 0x64 (ref $lTypeIdx) — non-null i32 list
-    wSLEB(lTypeIdx)
-    wU8(1)               // mutable
-    wU8(100)             // field 1 vals: 0x64 (ref $lTypeIdx) — non-null
-    wSLEB(lTypeIdx)
-    wU8(1)               // mutable
-    wU8(100)             // field 2 live: 0x64 (ref $aTypeIdx) — non-null i32 array
-    wSLEB(aTypeIdx)
-    wU8(1)               // mutable
-    wU8(100)             // field 3 index: 0x64 (ref $aTypeIdx) — non-null i32 array
-    wSLEB(aTypeIdx)
-    wU8(1)               // mutable
-    wU8(127)             // field 4 count: 0x7f i32
-    wU8(1)               // mutable
-    wU8(127)             // field 5 size: 0x7f i32
-    wU8(1)               // mutable
-    wU8(100)             // field 6 hashes: 0x64 (ref $aTypeIdx) — non-null i32 array
-    wSLEB(aTypeIdx)
-    wU8(1)               // mutable
-    mapSeqFieldTypes()
-  }
+  if mI32Used { emitMonoMapStructType(lTypeIdx) }
+  // The i64-keyed twin, the same struct over the i64 list wrapper, minted right after it.
+  if mI64Used { emitMonoMapStructType(il64TypeIdx) }
   if fa64Used {
     // The f64 array `(array (mut f64))` (Slice 4): `0x5e` array form, `0x7c` f64
     // storagetype, `0x01` mutable — the f64 analogue of the `5e 7f 01` i32 array.
@@ -5964,7 +6086,8 @@ function emitTypeSection(
     // refuses to twin across it), so it is read from the same column the resolvers key
     // on rather than assumed to be the string-ref list.
     let mvKeysWrap = mkListIdx
-    if mvSlotKeyI32(mvs) { mvKeysWrap = lTypeIdx }
+    if mvSlotKeyKind(mvs) == MAP_KEY_I32 { mvKeysWrap = lTypeIdx }
+    if mvSlotKeyKind(mvs) == MAP_KEY_I64 { mvKeysWrap = il64TypeIdx }
     wU8(95)              // 0x5f struct (ref-valued map)
     wU8(mapFieldCount()) // 7 fields (host-aligned open-addressing hash map), 9 with seqs
     wU8(100)             // field 0 keys: 0x64 (ref <this slot's keys wrapper>) — non-null
@@ -6150,6 +6273,9 @@ function emitTypeSection(
   if gHelpMapProbeI32 >= 0 {
     helpFuncType("ai", "i") // __map_probe_i32__: (index, key i32) -> slot
     helpFuncType("ai", "a") // __map_resize_i32__: (index, count) -> index'
+  }
+  if gHelpMapProbeI64 >= 0 {
+    helpFuncType("ajk", "i") // __map_probe_i64__: (index, key i64, keysBacking) -> slot
   }
   if gHelpF64Rem >= 0 {
     helpFuncType("ff", "f") // __f64_rem__: (f64, f64) -> f64
@@ -6995,6 +7121,12 @@ function buildCodePayload(
     rows = emitFnSpanStart.length
     if emitMapResizeI32FnCode(resize) < 0 { return -1 }
     placeCodeEntry(codePayload, resize, rows, -1, -1, 3, "__map_resize_i32__")
+  }
+  if gHelpMapProbeI64 >= 0 {
+    const rows = emitFnSpanStart.length
+    const entry: u8[] = []
+    if emitMapProbeI64FnCode(entry) < 0 { return -1 }
+    placeCodeEntry(codePayload, entry, rows, -1, -1, 3, "__map_probe_i64__")
   }
   if gHelpF64Rem >= 0 {
     const rows = emitFnSpanStart.length

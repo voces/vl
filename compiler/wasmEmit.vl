@@ -7,6 +7,9 @@ import {
   ATOMIC_SIG_STORE,
   ATOMIC_SIG_WAIT,
   EqCmpKind,
+  MAP_KEY_I32,
+  MAP_KEY_I64,
+  MAP_KEY_STR,
   MEM_OFFSET_MAX,
   SIMD_SIG_F_V,
   SIMD_SIG_I_V,
@@ -309,6 +312,7 @@ import {
   gHelpMapCompact,
   gHelpMapProbe,
   gHelpMapProbeI32,
+  gHelpMapProbeI64,
   gHelpMapResize,
   gHelpMapResizeI32,
   gHelpMapResync,
@@ -364,6 +368,7 @@ import {
   mUsed,
   maFoldScratchBase,
   mapI32Base,
+  mapI64Base,
   mapKeysBase,
   mapScratchBase,
   mapValsBase,
@@ -371,6 +376,7 @@ import {
   mfScratchBase,
   mkArrIdx,
   mkListIdx,
+  mvMapTypeIdx,
   mvRlSlot,
   mvValKind,
   mvValName,
@@ -499,6 +505,7 @@ import {
   fbLocalSet,
   fbLocalTee,
   fbLoop,
+  fbMapTagOfI64,
   fbOpenBlock,
   fbOpenIf,
   fbRefAsNonNull,
@@ -982,7 +989,8 @@ import {
 import { sidOfNode } from "./symbols"
 import {
   atomEqOpcodeOfKind,
-  mapShapeKeyI32,
+  mapShapeKeyInt,
+  mapShapeKeyKind,
   msIsValueUnion,
   msMemberValKindsOf,
   msSoloValKind,
@@ -994,7 +1002,7 @@ import {
   repScanLim,
   scalarTagOfKind,
   tyDenotesFunc,
-  tyMapKeyIsI32,
+  tyMapKeyKind,
   tyMapValOf,
   valBlockTypeOfKind,
   vbHeapIdxOfKind,
@@ -2222,7 +2230,7 @@ function isArmTagOfTy(ity: i32): i32 {
   if ak >= 0 { return scalarTagOfKind(ak) }
 
   if unMemIsMap(ity) {
-    return mapSlotTag(mvSlotOfValTyK(tyMapValOf(ity), tyMapKeyIsI32(ity)))
+    return mapSlotTag(mvSlotOfValTyK(tyMapValOf(ity), tyMapKeyKind(ity)))
   }
   if unMemIsRefElemArray(ity) {
     const sl = rlSlotOfTy(tyRefArrElemOf(ity))
@@ -3858,7 +3866,7 @@ function emitMapUnionUnboxRead(body: u8[], name: string, fnIx: i32) {
   // un-interned value exactly as the name resolver does for a mono or atom-valued map, and
   // `mapTypeIdxOf(-1)` is that shared `$mStructIdx`, so the two legs agree on the miss too.
   const armTy = narrowedArmTyOf(name)
-  const slot = mvSlotOfValTyK(tyMapValOf(armTy), tyMapKeyIsI32(armTy))
+  const slot = mvSlotOfValTyK(tyMapValOf(armTy), tyMapKeyKind(armTy))
   fbRefCast(mapTypeIdxOf(slot)) // the payload IS the map struct ref
   0
 }
@@ -7508,7 +7516,8 @@ function emitArr(body: u8[], arrIx: i32, fnIx: i32) {
 
 // The i32-keyed rep re-types four of those slots and appends its own frame (`mapI32Base`, minted
 // only when the module has one, so no offset above moves): +0 the i32 key, +1 keys backing, +2
-// and +3 the key-list builder's backings, +4 mapRef. `cmKeyI32` picks, through the `cm*` helpers.
+// and +3 the key-list builder's backings, +4 mapRef. The i64-keyed rep has the same frame at
+// `mapI64Base`. `cmKeyKind` picks, through the `cm*` helpers.
 
 // The current op's map struct heap type / vals wrapper / vals backing.
 function cmMapTy() { mapTypeIdxOf(cmSlot) }
@@ -7518,32 +7527,43 @@ function cmValsBack() { mvValsBackOf(cmSlot) }
 // True when the current op runs on the i32-keyed rep. Two sources, because a map shape carries
 // the key in two places depending on the value: the mono-value sentinels -4 (map) and -5 (Set),
 // where a value on the shared i32 `vals` list interns no slot so the key has nowhere else to
-// live; and an mv slot's own `mvKeyI32` column, the slot's identity being the (key, value) pair.
+// live; and an mv slot's own `mvKeyKind` column, the slot's identity being the (key, value) pair.
 
 // Asked by every accessor below that picks between the two keys lists, the two probe helpers and
 // the two key scratch slots. Everything else is key-blind by construction: it reads the value
 // side, which the slot answers on its own.
-function cmKeyI32() { mapShapeKeyI32(cmSlot) }
+function cmKeyKind() { mapShapeKeyKind(cmSlot) }
+// Whether the current op's index is the (tag, entry) pair layout: an i32 or an i64 key.
+function cmKeyInt() { cmKeyKind() != MAP_KEY_STR }
+// The current op's integer-key frame base: the i32 frame or the i64 one.
+function cmIntKeyBase() {
+  if cmKeyKind() == MAP_KEY_I64 { return mapI64Base }
+  mapI32Base
+}
 // The current op's keys-list wrapper and backing heap types: the string-ref pair for the
-// string-keyed rep, the i32 list pair for the i32-keyed one.
+// string-keyed rep, the i32 or i64 list pair for an integer-keyed one.
 function cmKeysWrap() {
-  if cmKeyI32() { return lTypeIdx }
+  const k = cmKeyKind()
+  if k == MAP_KEY_I32 { return lTypeIdx }
+  if k == MAP_KEY_I64 { return il64TypeIdx }
   mkListIdx
 }
 function cmKeysBack() {
-  if cmKeyI32() { return aTypeIdx }
+  const k = cmKeyKind()
+  if k == MAP_KEY_I32 { return aTypeIdx }
+  if k == MAP_KEY_I64 { return ia64TypeIdx }
   mkArrIdx
 }
 // The current op's target-key scratch local: the string frame's slot 1, a `(ref $sTypeIdx)`
-// string, or the i32 frame's slot 0, a raw i32.
+// string, or an integer frame's slot 0, the raw key.
 function cmKeyLocal() {
-  if cmKeyI32() { return mapI32Base }
+  if cmKeyInt() { return cmIntKeyBase() }
   mapScratchBase + 1
 }
 // The current op's grown or compacted keys-backing scratch local: the string frame's slot 6, or
-// the i32 frame's slot 1.
+// an integer frame's slot 1.
 function cmKeysBkLocal() {
-  if cmKeyI32() { return mapI32Base + 1 }
+  if cmKeyInt() { return cmIntKeyBase() + 1 }
   mapScratchBase + 6
 }
 // The current op's mapRef local. An mv slot always uses its own typed frame slot, asked first
@@ -7552,7 +7572,7 @@ function cmKeysBkLocal() {
 // the i32-keyed frame's own, the mono local being typed to the string-keyed struct.
 function cmMapRefLocal() {
   if cmSlot >= 0 { return fnMvMapRefLocal(cmSlot) }
-  if cmKeyI32() { return mapI32Base + 4 }
+  if cmKeyInt() { return cmIntKeyBase() + 4 }
   mapScratchBase
 }
 // The current op's vals-backing scratch local (grow/compact temporary).
@@ -7670,11 +7690,11 @@ function emitMapHashOf(_body: u8[]) {
 }
 
 // The index position of the current op's probe slot (scratch slot 3): the slot itself in a
-// string-keyed index; in an i32-keyed one's pairs, `2 * slot + k`, the key (`k` 0) or the entry
-// (`k` 1).
+// string-keyed index; in an integer-keyed one's pairs, `2 * slot + k`, the tag (`k` 0) or the
+// entry (`k` 1).
 function pushMapSlotPos(body: u8[], k: i32) {
   pushMapScr(body, 3)
-  if !cmKeyI32() { return 0 }
+  if !cmKeyInt() { return 0 }
   fbI32Const(1)
   fbI32Bin(116) // 0x74 i32.shl
   if k != 0 {
@@ -7696,10 +7716,16 @@ function emitMapProbe(body: u8[], keepHash: boolean) {
   // Push the probe's shape-agnostic components (the map struct type differs per value shape,
   // but `index`/`hashes`/`live`/`keys` are identically typed across shapes — only these
   // `struct.get`s stay at the call site) and call the shared helper, which returns the SLOT.
-  if cmKeyI32() {
+  const pk = cmKeyKind()
+  if pk == MAP_KEY_I32 {
     pushMapIndex(body)
     fbLocalGet(cmKeyLocal()) // the raw i32 key, its own tag
     fbCall(gHelpMapProbeI32)
+  } else if pk == MAP_KEY_I64 {
+    pushMapIndex(body)
+    fbLocalGet(cmKeyLocal()) // the i64 key; the helper hashes it to its tag
+    pushMapKeysBacking(body)
+    fbCall(gHelpMapProbeI64)
   } else {
     emitMapHashOf(body)
     if keepHash { fbLocalTee(mapScratchBase + 9) }
@@ -7745,6 +7771,7 @@ function emitMapNew(_body: u8[]) {
   if slot == -3 { return failMapValueType() }
   if slot == -2 { slot = -1 }
   if slot == -5 { slot = -4 }
+  if slot == -7 { slot = -6 }
   // The keys/vals accessors below read the op context, so pin it to the shape being
   // constructed (a `Map()` is not reached through `emitMapRecvKey`).
   const savedCm = cmSlot
@@ -7767,7 +7794,7 @@ function emitMapNew(_body: u8[]) {
   // index: `INITIAL_CAP * 2` (16) zero-filled slots, 0 meaning empty — an i32 array of 16, or of
   // 32 for an i32 key's pairs. Occupancy, dead markers included, stays under 1/2 by resizing at
   // `count*2 >= cap`, so every probe reaches a free slot under any mix of inserts and deletes (D2280).
-  if mapShapeKeyI32(slot) { fbI32Const(32) } else { fbI32Const(16) }
+  if mapShapeKeyInt(slot) { fbI32Const(32) } else { fbI32Const(16) }
   fbArrayNewDefault(aTypeIdx)
   // count = 0, size = 0.
   fbI32Const(0)
@@ -7815,7 +7842,13 @@ function emitMapRecvKey(body: u8[], recvIx: i32, keyIx: i32, fnIx: i32) {
   // member written as a string literal must lower as that id rather than as a ref — the
   // checker has already proved the spelling is a member (D1748).
   let keyLitU = false
-  if mapShapeKeyI32(mshape) {
+  const keyK = mapShapeKeyKind(mshape)
+  if keyK == MAP_KEY_I64 {
+    // An i64 key is emitted at its own width below; the checker proved it is an i64.
+    if exprString(keyIx, fnIx) {
+      return emitFail("emitProgram: i64-keyed map indexed with a string key")
+    }
+  } else if keyK == MAP_KEY_I32 {
     if exprString(keyIx, fnIx) {
       if !nodeTyMapKeyIsLitUnion(unwrapParen(recvIx)) {
         return emitFail("emitProgram: i32-keyed map indexed with a string key")
@@ -7842,11 +7875,9 @@ function emitMapRecvKey(body: u8[], recvIx: i32, keyIx: i32, fnIx: i32) {
   pendingLitUnion = 0
   if keyLitU { pendingLitUnion = 1 }
   let kr = 0
-  if keyAtom {
-    kr = emitAtomToStr(body, keyIx, fnIx)
-  } else {
-    kr = emitExpr(body, keyIx, fnIx)
-  }
+  if keyAtom { kr = emitAtomToStr(body, keyIx, fnIx) }
+  else if keyK == MAP_KEY_I64 { kr = emitScalarValue(body, keyIx, fnIx, "i64") }
+  else { kr = emitExpr(body, keyIx, fnIx) }
   pendingLitUnion = savedKeyLU
   if kr < 0 { return -1 }
   cmSlot = mshape
@@ -8648,26 +8679,29 @@ function emitMapKeys(body: u8[], recvIx: i32, fnIx: i32) {
   // A Set's keys() runs on the mono machinery of its own KEY rep.
   const shape = mapShapeFoldSet(shape0)
   // The KEY rep, from the mono sentinel OR the mv slot's own column — the same question
-  // `cmKeyI32` asks. A `{[i32]: string}`'s `.keys()` is an `i32[]` even though its shape
+  // `cmKeyKind` asks. A `{[i32]: string}`'s `.keys()` is an `i32[]` even though its shape
   // is an mv slot, so this cannot key off the sentinel alone.
-  const keyI32 = mapShapeKeyI32(shape)
-  if !keyI32 && !slUsed {
+  const keyK = mapShapeKeyKind(shape)
+  if keyK == MAP_KEY_STR && !slUsed {
     return emitFail("emitProgram: .keys() but string list type not collected")
   }
   const mapTy = mapTypeIdxOf(shape)
   // The KEY rep's list wrapper / backing, and — since the builder's frame slots are
-  // typed per rep — the i32 frame's own out/src slots for an i32-keyed map.
+  // typed per rep — an integer frame's own out/src slots for an integer-keyed map.
   let keysWrap = mkListIdx
   let keysBack = mkArrIdx
-  if keyI32 {
-    keysWrap = lTypeIdx
-    keysBack = aTypeIdx
-  }
   let outBackL = mapKeysBase + 0
   let keysBackL = mapKeysBase + 1
-  if keyI32 {
+  if keyK == MAP_KEY_I32 {
+    keysWrap = lTypeIdx
+    keysBack = aTypeIdx
     outBackL = mapI32Base + 2
     keysBackL = mapI32Base + 3
+  } else if keyK == MAP_KEY_I64 {
+    keysWrap = il64TypeIdx
+    keysBack = ia64TypeIdx
+    outBackL = mapI64Base + 2
+    keysBackL = mapI64Base + 3
   }
   const liveL = mapKeysBase + 2
   const iL = mapKeysBase + 3
@@ -8746,7 +8780,9 @@ function emitMapValues(body: u8[], recvIx: i32, fnIx: i32) {
   const shape = mapShapeOfExpr(recvIx, fnIx)
   // A SET's `.values()` yields its ELEMENTS (its keys), built by `emitMapKeys` — for
   // both key reps, which is why the Set sentinel is a PAIR.
-  if shape == -2 || shape == -5 { return emitMapKeys(body, recvIx, fnIx) }
+  if shape == -2 || shape == -5 || shape == -7 {
+    return emitMapKeys(body, recvIx, fnIx)
+  }
   if shape == -3 { return failMapValueType() }
   if !fnUsesMapVals {
     return emitFail("emitProgram: .values() scratch frame not reserved")
@@ -8834,7 +8870,7 @@ function emitMapValues(body: u8[], recvIx: i32, fnIx: i32) {
 function emitMapResize(body: u8[]) {
   pushMapRef(body) // the struct.set receiver
   pushMapIndex(body)
-  if cmKeyI32() {
+  if cmKeyInt() {
     pushMapCount(body)
     fbCall(gHelpMapResizeI32)
   } else {
@@ -8858,9 +8894,9 @@ function emitMapDelete(body: u8[], recvIx: i32, keyIx: i32, fnIx: i32) {
   // if entry == 0 { 0 } else { tombstone ; drop refs ; size-- ; 1 }
   pushMapScr(body, 5) // entry
   fbIf(127)           // if (entry != 0), 0x7f i32 blocktype
-  // an i32 key's pair: entry = -1, a probe marker never hit again (a string key's slot keeps
+  // an integer key's pair: entry = -1, a probe marker never hit again (a string key's slot keeps
   // its entry, whose `live` below is what the probe tests)
-  if cmKeyI32() {
+  if cmKeyInt() {
     pushMapIndex(body)
     pushMapSlotPos(body, 1)
     fbI32Const(0 - 1)
@@ -8873,8 +8909,8 @@ function emitMapDelete(body: u8[], recvIx: i32, keyIx: i32, fnIx: i32) {
   fbI32Bin(107)        // i32.sub (entry - 1)
   fbI32Const(0)
   fbArraySet(aTypeIdx) // array.set live[entry-1] = 0
-  // keys.backing[entry-1] = null  (a string key; an i32 key holds no payload)
-  if !cmKeyI32() {
+  // keys.backing[entry-1] = null  (a string key; an integer key holds no payload)
+  if !cmKeyInt() {
     pushMapKeysBacking(body)
     pushMapScr(body, 5)
     fbI32Const(1)
@@ -9132,11 +9168,16 @@ function emitMapSetV(
     emitMapProbe(body, true)
     fbEnd()       // end (compact if)
   }
-  // the slot's entry = count + 1 (the new entry's position + 1), beside an i32 key in its pair.
-  if cmKeyI32() {
+  // the slot's entry = count + 1 (the new entry's position + 1), beside an integer key's tag in
+  // its pair: an i32 key is its own tag, an i64 key's is its hash.
+  if cmKeyInt() {
     pushMapIndex(body)
     pushMapSlotPos(body, 0)
-    fbLocalGet(cmKeyLocal())
+    if cmKeyKind() == MAP_KEY_I64 {
+      fbMapTagOfI64(cmKeyLocal())
+    } else {
+      fbLocalGet(cmKeyLocal())
+    }
     fbArraySet(aTypeIdx) // array.set
   }
   pushMapIndex(body)
@@ -9242,7 +9283,7 @@ function emitMapPushKey(body: u8[]) {
   }
   // a string-keyed map's hashes grow in LOCKSTEP too: fresh `(ref $aTypeIdx)` of newCap
   // (slot 13), copy `[0, keys.len)` over, store back into M.hashes (field 6).
-  if !cmKeyI32() {
+  if !cmKeyInt() {
     pushMapScr(body, 4)             // newCap
     fbArrayNewDefault(aTypeIdx)
     setMapScrHB(body)               // newHashBacking (slot 13)
@@ -9298,7 +9339,7 @@ function emitMapPushKey(body: u8[]) {
   }
   // hashes[keys.len] = hash(keyRef) for a string key — cached parallel to the entry, it gates
   // the probe's key compare and re-places the entry on resize; the probe's own, in slot +9.
-  if !cmKeyI32() {
+  if !cmKeyInt() {
     pushMapHashes(body)
     pushMapKeysLen(body) // entry index (== count, pre-append)
     pushMapScr(body, 9)
@@ -21957,6 +21998,7 @@ function mapCompactFnOf(sh: i32) {
   let row = sh + 2
   if sh == -1 || sh == -2 { row = 0 }
   if sh == -4 || sh == -5 { row = 1 }
+  if sh == -6 || sh == -7 { row = mvMapTypeIdx.length + 2 }
   if row < 0 || row >= gHelpMapCompact.length { return -1 }
   gHelpMapCompact[row]
 }
