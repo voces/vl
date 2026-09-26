@@ -12,6 +12,7 @@ import {
   annUnionAtomsOf,
   asgAnyWiderStore,
   asgStoreTyOf,
+  externValueSeen,
   forInBindTy,
   ifYieldsNoValue,
   inferRetFnKey,
@@ -103,6 +104,10 @@ import {
   WhileStmt,
   callSiteLocOf,
   elseIfLink,
+  externArityAt,
+  externLinkOf,
+  externParamAt,
+  externRetAt,
   fillArgDefaults,
   fnRequiredArity,
   hasNamedArgs,
@@ -126,6 +131,7 @@ import {
   mkParam,
   mkStr,
   mkUnary,
+  nodeSpineChildren,
   nodeValueSpineChildren,
   orderArgsByParamNames,
   paramDefaultIsCallsite,
@@ -156,6 +162,7 @@ import { fnIndexOfInScopeChain } from "./emit_collect"
 import {
   cboxCellNames,
   cboxReadTy,
+  emitRootIx,
   fRetVoid,
   fnDispNames,
   fnParent,
@@ -175,6 +182,7 @@ import {
   fnIndexOf,
   inferRetNulPinned,
   letDeclIsClosureNoLocal,
+  nameFreeToModule,
   nameIsWholeSpanShape,
   nliForgetLet,
   resolveShapeToNominal,
@@ -3240,7 +3248,7 @@ export function synthVoidTwins(_stmts: i32[]) {
             const callIx = mkCall(mkIdent(name, tfn.pos), argIds, tfn.pos)
             const bodyIx = mkBlock([callIx], tfn.pos)
             const twin = mkFunc(
-              "__voidtw_" + name,
+              name + "$voidtw",
               noTyParams,
               nps,
               synthTypeRefTy("void", -1, -1),
@@ -3259,5 +3267,138 @@ export function synthVoidTwins(_stmts: i32[]) {
     }
     i = i + 1
   }
+  0
+}
+
+// ── synthExternValues — a callee for an `extern` taken as a value ────────────────
+// A function value is called with its closure env as the leading argument, which a host
+// import does not take. So each extern read other than as a callee gets one capture-free
+// forwarding function `<name>$extv`, a spelling no program can write, and the read is respelled to name it (D2618).
+let extValName: string[] = []
+let extValFe: i32[] = []
+
+// The forwarding function minted for the extern named `name`, or -1.
+function externValueFe(name: string): i32 {
+  let i = 0
+  while i < extValName.length {
+    if extValName[i] == name { return extValFe[i] }
+    i = i + 1
+  }
+  -1
+}
+
+export function synthExternValues() {
+  extValName = []
+  extValFe = []
+  extvLoopVars = []
+  if !externValueSeen() || emitRootIx < 0 { return 0 }
+  const root = P.nodes[emitRootIx]
+  if root is Program {
+    let s = 0
+    while s < root.progStmts.length {
+      extvRespellIn(root.progStmts[s], -1)
+      s = s + 1
+    }
+  }
+  const nFns = fnStmts.length
+  let fe = 0
+  while fe < nFns {
+    const fn = P.nodes[fnStmts[fe]]
+    if fn is FuncDecl { extvRespellIn(fn.fnBody, fnStmts[fe]) }
+    fe = fe + 1
+  }
+  0
+}
+
+// The loop variables of the `for`s of the walked frame the respell walk is inside: each is in
+// scope only in its own loop, which a whole-frame lookup cannot see.
+let extvLoopVars: string[] = []
+
+// Respell every extern read as a value in the subtree at `ix`, which lies in the frame of
+// function node `fnIx` (-1 for the module's statements). A nested function is its own
+// `fnStmts` frame and is not entered; a callee is a call to the import and is left alone.
+function extvRespellIn(ix: i32, fnIx: i32) {
+  let cur = ix
+  while cur >= 0 && cur < P.nodes.length {
+    const n = P.nodes[cur]
+    if n is FuncDecl { return 0 }
+    if n is Ident {
+      const nm = n.identName
+      if externLinkOf(nm) >= 0 && extvNameFree(fnIx, nm) {
+        if externValueFe(nm) < 0 { synthExternValueFn(nm, n.pos) }
+        if externValueFe(nm) >= 0 {
+          n.identName = nm + "$extv"
+          sidNoteNodeName(cur)
+        }
+      }
+      return 0
+    }
+    const mark = extvLoopVars.length
+    if n is ForRange { extvLoopVars.push(n.frVar) }
+    if n is ForIn {
+      extvLoopVars.push(n.fiVar)
+      extvLoopVars.push(n.fiVar2)
+    }
+    let skip = -1
+    if n is Call {
+      if P.nodes[unwrapParen(n.callFn)] is Ident { skip = n.callFn }
+    }
+    const kids = nodeSpineChildren(cur)
+    let k = 0
+    while k < kids.length {
+      if kids[k] != skip { extvRespellIn(kids[k], fnIx) }
+      k = k + 1
+    }
+    while extvLoopVars.length > mark { extvLoopVars.pop() }
+    cur = elseIfLink(cur)
+  }
+  0
+}
+
+// Whether the extern `name` read in the frame of `fnIx` means the extern and not a binding.
+function extvNameFree(fnIx: i32, name: string): boolean {
+  if capHas(extvLoopVars, name) { return false }
+  nameFreeToModule(fnIx, name)
+}
+
+// Mint `function <name>$extv(a0: P0, …): R { name(a0, …) }` for the extern `name`, from
+// its link row's own parameter and result spellings.
+function synthExternValueFn(name: string, pos: i32) {
+  const k = externLinkOf(name)
+  const n = externArityAt(k)
+  if n < 0 { return 0 }
+  const ps: i32[] = []
+  const args: i32[] = []
+  let i = 0
+  while i < n {
+    const pn = "__a" + i32ToStr(i)
+    const pty = synthTypeRefTy(externParamAt(k, i), pos, -1)
+    ps.push(mkParam(pn, pty, -1, 0, 0, pos))
+    const arg = mkIdent(pn, pos)
+    recordNodeTyFrom(arg, pty)
+    args.push(arg)
+    i = i + 1
+  }
+  let ret = externRetAt(k)
+  if ret == "" { ret = "void" }
+  const rty = synthTypeRefTy(ret, pos, -1)
+  const noTyParams: string[] = []
+  // The minted nodes postdate the checker, so each carries the type its annotation names.
+  const call = mkCall(mkIdent(name, pos), args, pos)
+  recordNodeTyFrom(call, rty)
+  const fe = mkFunc(
+    name + "$extv",
+    noTyParams,
+    ps,
+    rty,
+    mkBlock([call], pos),
+    pos,
+  )
+  fnStmts.push(fe)
+  fnParent.push(-1)
+  fnDispNames.push("")
+  fnValUsed = true
+  extValName.push(name)
+  extValFe.push(fnStmts.length - 1)
   0
 }
