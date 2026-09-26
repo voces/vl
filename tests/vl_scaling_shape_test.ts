@@ -1087,6 +1087,68 @@ Deno.test({
   },
 });
 
+// The same axis at a PLACE the binding proof does not cover: a field, a list cell, a map value
+// and a prepend, each appended `n` times in one loop, against the same four strings built
+// through std's builder. Each place copied its whole prefix per append before the site-cached
+// lowering (D2625), which made the many arm quadratic in any one of the four.
+const genPlaceAppendLoop = (n: number): string =>
+  [
+    "function build(n: i32): string {",
+    '  const o = { s: "" }',
+    '  const xs = ["", ""]',
+    "  const m: {[i32]: string} = Map()",
+    '  let p = ""',
+    "  let i = 0",
+    "  while i < n {",
+    '    o.s = o.s + "0123456789"',
+    '    xs[1] = xs[1] + "0123456789"',
+    '    m[0] = (m[0] ?? "") + "0123456789"',
+    '    p = "0123456789" + p',
+    "    i = i + 1",
+    "  }",
+    '  return o.s + xs[1] + (m[0] ?? "") + p',
+    "}",
+    `print(build(${n}).length)`,
+    "",
+  ].join("\n");
+
+const genPlaceJoinBuild = (n: number): string =>
+  [
+    'import { join } from "std:str"',
+    "function build(n: i32): string {",
+    "  let parts: string[] = []",
+    "  let i = 0",
+    '  while i < 4 * n { parts.push("0123456789"); i = i + 1 }',
+    '  return join(parts, "")',
+    "}",
+    `print(build(${n}).length)`,
+    "",
+  ].join("\n");
+
+Deno.test({
+  name: "scaling shape: place string append loop",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = await Deno.makeTempDir({ prefix: "vl_scale_pstrappend_" });
+    try {
+      const [manySrc, oneSrc] = twoFiles(dir, genPlaceAppendLoop(20000), genPlaceJoinBuild(20000));
+      await grade(
+        "place string append loop",
+        2.5,
+        "20,000 appends each to a field, a list cell, a map value and a prepended local, " +
+          "against the same strings through std's builder: the site-cached lowering " +
+          "(`strSiteArm` / `emitStrSiteCat`, compiler/wasmEmit.vl) stopped firing for at least " +
+          "one of the four, so its appends copy the whole prefix again (D2625).",
+        () => runProg(manySrc),
+        () => runProg(oneSrc),
+        RUN_FLOOR,
+      );
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
+
 // 1.27 / 1.13 / 1.12 (wall, idle-ish box). GETTER CALLEES (D2135): the per-function summary is
 // one walk per callee instance, memoised, so N distinct callee chains cost what N/K chains read
 // K times each do. A summary that scans the program per callee separates the two arms.
