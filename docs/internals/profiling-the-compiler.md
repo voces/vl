@@ -400,13 +400,37 @@ cache evicted by each call to an inferred-return callee) and D2688 (an occurrenc
 per name, not per name and frame). Ladders are fuel, one build each, from generated
 programs whose one knob is the entity count; a quadratic reads ~4x per doubling.
 
+**That attribution was a prediction, and closing both rows refuted it.** D2687 now parks up to
+three built let plans beside the current one, and D2688 chains the occurrence index per (name,
+frame); both ladders are linear (the rows carry them). On the self-compile, re-measured on
+`fdd0050af` with the #3196 recipe (441 spans stripped on that tree):
+
+| source, seed | fuel |
+| --- | ---: |
+| master's, master | 50.67G |
+| annotations stripped, master | 51.65G |
+| master's, after D2687 + D2688 | 50.54G |
+| annotations stripped, after D2687 + D2688 | 51.51G |
+
+All four reproduce master's seed byte for byte. The stripped source still costs +0.97G, so the
+residual is neither row. Stripping one file at a time (master's source otherwise, the after
+seed) spreads it: `emit_rep` +397M, `ast` +347M, `emit_rewrite` +239M, `tyname` +197M,
+`lexer` +155M, the other 17 files under 120M each. And inside `emit_rep` it is not per
+annotation: any ONE of twelve stripped returns costs 86–99M alone, all twelve together 115M,
+so the first inferred return in a file pays a fixed cost of about one pass over something
+large. A sampled profile of that difference is diffuse (`__str_eq__`, `__map_probe__`, no
+function above noise), and a chain of inferred returns declared callee-last is linear
+(40.6M / 80.8M / 167.6M at 100 / 200 / 400), so it is not `computeRetInference`'s fixpoint
+rounds either. The mechanism is open.
+
 ## Guards
 
 Four, and they fire at different moments. Profiling is what you do AFTER one of them does.
 
 * **`tests/vl_scaling_shape_test.ts`** — nine pairs, the same work reshaped along one axis
   (functions, types, unions, call sites, closures, callback slots, modules, generic pins,
-  covariant bindings),
+  covariant bindings; later pairs include calls to inferred-return callees and a list name
+  shared across functions),
   graded on the ratio of the two arms' CPU (user+sys) so machine speed and box load cancel.
   **The ratio has to be of CPU, because `gate.sh`'s fan-out is not a uniform slowdown**: the
   two arms run at different moments and a burst inflates whichever one it lands on. Measured

@@ -21694,10 +21694,30 @@ let cwIxWrRecv: i32[] = []
 // program with nothing to separate.
 let cwIxAnyWrite = 0
 let cwIxBuilt = false
+// The same rows chained per (name, frame), built for a name on its first frame-keyed query: the
+// next row of each row's pair, and an open-addressed table from the pair to its newest and
+// oldest row. A reader keyed on one frame walks its own pair and the `CW_FR_UNKNOWN` pair, not
+// every frame's occurrences of the name (D2688).
+let cwIxPNext: i32[] = []
+let cwIxPDone: i32[] = []
+let cwIxPSlotFr: i32[] = []
+let cwIxPSlotSid: i32[] = []
+let cwIxPSlotHead: i32[] = []
+let cwIxPSlotTail: i32[] = []
+let cwIxPCap = 0
+let cwIxPUsed = 0
 
 function cwIxReset() {
   cwIxHead = []
   cwIxNext = []
+  cwIxPNext = []
+  cwIxPDone = []
+  cwIxPSlotFr = []
+  cwIxPSlotSid = []
+  cwIxPSlotHead = []
+  cwIxPSlotTail = []
+  cwIxPCap = 0
+  cwIxPUsed = 0
   cwIxNode = []
   cwIxFr = []
   cwIxKind = []
@@ -21962,18 +21982,146 @@ function cwIxBuild() {
   0
 }
 
+// The slot the pair (`fr`, `sid`) occupies, or the free slot it would take.
+function cwIxPSlotOf(fr: i32, sid: i32): i32 {
+  let h = (fr + 3) * 1000003 + sid
+  h = h % cwIxPCap
+  if h < 0 { h = h + cwIxPCap }
+  while cwIxPSlotSid[h] >= 0 {
+    if cwIxPSlotSid[h] == sid {
+      if cwIxPSlotFr[h] == fr { return h }
+    }
+    h = h + 1
+    if h == cwIxPCap { h = 0 }
+  }
+  h
+}
+
+// Doubles the pair table (or opens it at 64 slots) and re-places every pair it holds.
+function cwIxPGrow() {
+  const oFr = cwIxPSlotFr
+  const oSid = cwIxPSlotSid
+  const oHead = cwIxPSlotHead
+  const oTail = cwIxPSlotTail
+  let cap = 64
+  if cwIxPCap > 0 { cap = cwIxPCap * 2 }
+  cwIxPCap = cap
+  cwIxPSlotFr = []
+  cwIxPSlotSid = []
+  cwIxPSlotHead = []
+  cwIxPSlotTail = []
+  while cwIxPSlotSid.length < cap {
+    cwIxPSlotSid.push(-1)
+    cwIxPSlotFr.push(0)
+    cwIxPSlotHead.push(-1)
+    cwIxPSlotTail.push(-1)
+  }
+  let i = 0
+  while i < oSid.length {
+    const s = cwIxPSlotOf(oFr[i], oSid[i])
+    if oSid[i] >= 0 && s >= 0 && s < cwIxPSlotSid.length {
+      cwIxPSlotSid[s] = oSid[i]
+      cwIxPSlotFr[s] = oFr[i]
+      cwIxPSlotHead[s] = oHead[i]
+      cwIxPSlotTail[s] = oTail[i]
+    }
+    i = i + 1
+  }
+  0
+}
+
+// Chains every row of `sid`'s name chain onto its (name, frame) pair, once per index. The name
+// chain is newest first, so appending at each pair's tail keeps the pairs newest first too.
+function cwIxPairEnsure(sid: i32) {
+  if sid < 0 || sid >= cwIxHead.length { return 0 }
+  while cwIxPDone.length <= sid { cwIxPDone.push(0) }
+  if cwIxPDone[sid] == 1 { return 0 }
+  cwIxPDone[sid] = 1
+  while cwIxPNext.length < cwIxNext.length { cwIxPNext.push(-1) }
+  let r = cwIxHead[sid]
+  while r >= 0 {
+    if (cwIxPUsed + 1) * 2 > cwIxPCap { cwIxPGrow() }
+    const fr = cwIxFr[r]
+    const s = cwIxPSlotOf(fr, sid)
+    if s < 0 || s >= cwIxPSlotSid.length { return 0 }
+    if cwIxPSlotSid[s] < 0 {
+      cwIxPSlotSid[s] = sid
+      cwIxPSlotFr[s] = fr
+      cwIxPSlotHead[s] = r
+      cwIxPUsed = cwIxPUsed + 1
+    } else {
+      cwIxPNext[cwIxPSlotTail[s]] = r
+    }
+    cwIxPSlotTail[s] = r
+    r = cwIxNext[r]
+  }
+  0
+}
+
+// The newest row of the pair (`fr`, `sid`), or -1.
+function cwIxPairHead(fr: i32, sid: i32): i32 {
+  cwIxPairEnsure(sid)
+  if cwIxPCap == 0 { return -1 }
+  const s = cwIxPSlotOf(fr, sid)
+  if s < 0 || s >= cwIxPSlotSid.length { return -1 }
+  if cwIxPSlotSid[s] != sid { return -1 }
+  if cwIxPSlotFr[s] != fr { return -1 }
+  cwIxPSlotHead[s]
+}
+
+// The rows of `nm`'s chain whose frame `cwSameFrame` matches `fr` come off two cursors, both
+// newest first: `cwIxFrHead`/`cwIxFrNext` walk the pair's own rows (the whole chain, filtered,
+// when `fr` is unknown or the index is not built), `cwIxUnkHead`/`cwIxPNext` the
+// `CW_FR_UNKNOWN` pair's. A reader takes the larger row of the two each step.
+function cwIxFrHead(nm: string, fr: i32): i32 {
+  if fr == CW_FR_UNKNOWN || !cwIxBuilt { return cwIxFrSkip(cwIxChain(nm), fr) }
+  const sid = sidLookup(nm)
+  if sid < 0 { return -1 }
+  cwIxPairHead(fr, sid)
+}
+
+// The `CW_FR_UNKNOWN` pair's newest row, when `cwIxFrHead`'s cursor does not already cover it.
+function cwIxUnkHead(nm: string, fr: i32): i32 {
+  if fr == CW_FR_UNKNOWN || !cwIxBuilt { return -1 }
+  const sid = sidLookup(nm)
+  if sid < 0 { return -1 }
+  cwIxPairHead(CW_FR_UNKNOWN, sid)
+}
+
+// The row after `r` on `cwIxFrHead`'s cursor.
+function cwIxFrNext(r: i32, fr: i32): i32 {
+  if fr == CW_FR_UNKNOWN || !cwIxBuilt { return cwIxFrSkip(cwIxNext[r], fr) }
+  if r < 0 || r >= cwIxPNext.length { return -1 }
+  cwIxPNext[r]
+}
+
+// The first row from `r` down the name chain that `cwSameFrame` matches with `fr`, or -1.
+function cwIxFrSkip(r: i32, fr: i32): i32 {
+  let at = r
+  while at >= 0 {
+    if cwSameFrame(cwIxFr[at], fr) { return at }
+    at = cwIxNext[at]
+  }
+  -1
+}
+
 // Every arena node that is an occurrence of a member of `set` in the kind `kind`. A pair is
 // carried, not a bare name, so a same-named handle in another frame contributes nothing.
 function cwSetOccs(set: string[], setFr: i32[], kind: i32, out: i32[]) {
   cwIxBuild()
   let i = 0
   while i < set.length {
-    let r = cwIxChain(set[i])
-    while r >= 0 {
-      if cwIxKind[r] == kind {
-        if cwSameFrame(cwIxFr[r], setFr[i]) { out.push(cwIxNode[r]) }
+    let ixA = cwIxFrHead(set[i], setFr[i])
+    let ixU = cwIxUnkHead(set[i], setFr[i])
+    while ixA >= 0 || ixU >= 0 {
+      let r = ixA
+      if ixU > ixA {
+        r = ixU
+        ixU = cwIxPNext[ixU]
+      } else {
+        ixA = cwIxFrNext(ixA, setFr[i])
       }
-      r = cwIxNext[r]
+      if cwIxKind[r] == kind { out.push(cwIxNode[r]) }
     }
     i = i + 1
   }
@@ -22382,21 +22530,26 @@ function cwLambdaDeclOf(nm: string, fr: i32): i32 {
   if nm == "" { return -1 }
   cwIxBuild()
   if !cwBoundOnce(nm, fr) { return -1 }
-  let r = cwIxChain(nm)
-  while r >= 0 {
+  let ixA = cwIxFrHead(nm, fr)
+  let ixU = cwIxUnkHead(nm, fr)
+  while ixA >= 0 || ixU >= 0 {
+    let r = ixA
+    if ixU > ixA {
+      r = ixU
+      ixU = cwIxPNext[ixU]
+    } else {
+      ixA = cwIxFrNext(ixA, fr)
+    }
     if cwIxKind[r] == CW_OCC_BIND {
-      if cwSameFrame(cwIxFr[r], fr) {
-        const b = P.nodes[cwIxNode[r]]
-        if b is LetDecl {
-          const init = cwPeel(b.letInit)
-          if init >= 0 && init < P.nodes.length {
-            const f = P.nodes[init]
-            if f is FuncDecl { return init }
-          }
+      const b = P.nodes[cwIxNode[r]]
+      if b is LetDecl {
+        const init = cwPeel(b.letInit)
+        if init >= 0 && init < P.nodes.length {
+          const f = P.nodes[init]
+          if f is FuncDecl { return init }
         }
       }
     }
-    r = cwIxNext[r]
   }
   -1
 }
@@ -22660,14 +22813,19 @@ function cwContainerAliases(
     // The set grows by at least one name per name visited or the walk ends, so the bound is
     // the number of names in the program; a surprise past it declines rather than hangs.
     if names.length > 256 { return false }
-    let r = cwIxChain(names[i])
-    while r >= 0 {
-      if cwIxKind[r] == CW_OCC_USE {
-        if cwSameFrame(cwIxFr[r], frs[i]) {
-          if !cwAliasUse(cwIxNode[r], names, frs) { ok = false }
-        }
+    let ixA = cwIxFrHead(names[i], frs[i])
+    let ixU = cwIxUnkHead(names[i], frs[i])
+    while ixA >= 0 || ixU >= 0 {
+      let r = ixA
+      if ixU > ixA {
+        r = ixU
+        ixU = cwIxPNext[ixU]
+      } else {
+        ixA = cwIxFrNext(ixA, frs[i])
       }
-      r = cwIxNext[r]
+      if cwIxKind[r] == CW_OCC_USE {
+        if !cwAliasUse(cwIxNode[r], names, frs) { ok = false }
+      }
     }
     i = i + 1
   }
@@ -23006,14 +23164,19 @@ function cwEscapedHandleNodes(
   cwIxBuild()
   let i = 0
   while i < owners.length {
-    let r = cwIxChain(owners[i])
-    while r >= 0 {
-      if cwIxKind[r] == CW_OCC_USE {
-        if cwSameFrame(cwIxFr[r], ownerFrs[i]) {
-          cwHandleUpChain(cwIxNode[r], flds[i], out)
-        }
+    let ixA = cwIxFrHead(owners[i], ownerFrs[i])
+    let ixU = cwIxUnkHead(owners[i], ownerFrs[i])
+    while ixA >= 0 || ixU >= 0 {
+      let r = ixA
+      if ixU > ixA {
+        r = ixU
+        ixU = cwIxPNext[ixU]
+      } else {
+        ixA = cwIxFrNext(ixA, ownerFrs[i])
       }
-      r = cwIxNext[r]
+      if cwIxKind[r] == CW_OCC_USE {
+        cwHandleUpChain(cwIxNode[r], flds[i], out)
+      }
     }
     i = i + 1
   }
@@ -23054,17 +23217,22 @@ function cwBoundOnceSealed(nm: string, fr: i32): i32 {
   let proj = 0
   // Each projection has one object and each identifier one parent, so counting the two sides
   // is the same answer as marking them, and it fits the one chain walk.
-  let r = cwIxChain(nm)
-  while r >= 0 {
-    if cwSameFrame(cwIxFr[r], fr) {
-      if cwIxKind[r] == CW_OCC_ASG { return 0 }
-      if cwIxKind[r] == CW_OCC_BIND { binds = binds + 1 }
-      if cwIxKind[r] == CW_OCC_USE {
-        uses = uses + 1
-        if cwIxIsObj[cwIxNode[r]] == 1 { proj = proj + 1 }
-      }
+  let ixA = cwIxFrHead(nm, fr)
+  let ixU = cwIxUnkHead(nm, fr)
+  while ixA >= 0 || ixU >= 0 {
+    let r = ixA
+    if ixU > ixA {
+      r = ixU
+      ixU = cwIxPNext[ixU]
+    } else {
+      ixA = cwIxFrNext(ixA, fr)
     }
-    r = cwIxNext[r]
+    if cwIxKind[r] == CW_OCC_ASG { return 0 }
+    if cwIxKind[r] == CW_OCC_BIND { binds = binds + 1 }
+    if cwIxKind[r] == CW_OCC_USE {
+      uses = uses + 1
+      if cwIxIsObj[cwIxNode[r]] == 1 { proj = proj + 1 }
+    }
   }
   if binds != 1 { return 0 }
   if uses == proj { return 2 }
@@ -23428,14 +23596,19 @@ function cwContainerSealed(nm: string, fr: i32, path: string): boolean {
   if !cwContainerAliases(nm, fr, names, frs) { return false }
   let i = 0
   while i < names.length {
-    let r = cwIxChain(names[i])
-    while r >= 0 {
-      if cwIxKind[r] == CW_OCC_USE {
-        if cwSameFrame(cwIxFr[r], frs[i]) {
-          if !cwChainSealed(cwIxNode[r], path) { return false }
-        }
+    let ixA = cwIxFrHead(names[i], frs[i])
+    let ixU = cwIxUnkHead(names[i], frs[i])
+    while ixA >= 0 || ixU >= 0 {
+      let r = ixA
+      if ixU > ixA {
+        r = ixU
+        ixU = cwIxPNext[ixU]
+      } else {
+        ixA = cwIxFrNext(ixA, frs[i])
       }
-      r = cwIxNext[r]
+      if cwIxKind[r] == CW_OCC_USE {
+        if !cwChainSealed(cwIxNode[r], path) { return false }
+      }
     }
     i = i + 1
   }
@@ -24366,16 +24539,23 @@ function rcwPlaceRoot(ix: i32): i32 {
 
 // The initializer of the `const` binding `nm` in frame `fr`, or -1.
 function rcwConstInit(nm: string, fr: i32): i32 {
-  let r = cwIxChain(nm)
-  while r >= 0 {
-    if cwIxKind[r] == CW_OCC_BIND && cwSameFrame(cwIxFr[r], fr) {
+  let ixA = cwIxFrHead(nm, fr)
+  let ixU = cwIxUnkHead(nm, fr)
+  while ixA >= 0 || ixU >= 0 {
+    let r = ixA
+    if ixU > ixA {
+      r = ixU
+      ixU = cwIxPNext[ixU]
+    } else {
+      ixA = cwIxFrNext(ixA, fr)
+    }
+    if cwIxKind[r] == CW_OCC_BIND {
       const b = P.nodes[cwIxNode[r]]
       if b is LetDecl {
         if b.letKw == "const" { return b.letInit }
       }
       return -1
     }
-    r = cwIxNext[r]
   }
   -1
 }
@@ -25698,24 +25878,29 @@ function rcwNameWrites(
       }
       rcwSeen[ak] = true
     }
-    let r = cwIxChain(names[i])
-    while r >= 0 && !res {
+    let ixA = cwIxFrHead(names[i], frs[i])
+    let ixU = cwIxUnkHead(names[i], frs[i])
+    while (ixA >= 0 || ixU >= 0) && !res {
+      let r = ixA
+      if ixU > ixA {
+        r = ixU
+        ixU = cwIxPNext[ixU]
+      } else {
+        ixA = cwIxFrNext(ixA, frs[i])
+      }
       if cwIxKind[r] == CW_OCC_USE {
-        if cwSameFrame(cwIxFr[r], frs[i]) {
-          const u = cwIxNode[r]
-          const al = rcwPlainAlias(u)
-          if al >= 0 {
-            const ld = P.nodes[al]
-            if ld is LetDecl {
-              names.push(ld.letName)
-              frs.push(cwFrameOfDecl(al))
-            }
-          } else {
-            res = rcwValueWrites(u, covs, depth + 1)
+        const u = cwIxNode[r]
+        const al = rcwPlainAlias(u)
+        if al >= 0 {
+          const ld = P.nodes[al]
+          if ld is LetDecl {
+            names.push(ld.letName)
+            frs.push(cwFrameOfDecl(al))
           }
+        } else {
+          res = rcwValueWrites(u, covs, depth + 1)
         }
       }
-      r = cwIxNext[r]
     }
     i = i + 1
   }
@@ -26835,15 +27020,20 @@ function constStoresForeignList(nm: string, fr: i32): boolean {
   lwFreshDepth = lwFreshDepth + 1
   cwIxBuild()
   let found = false
-  let r = cwIxChain(nm)
-  while r >= 0 && !found {
-    if cwIxKind[r] == CW_OCC_USE {
-      if cwSameFrame(cwIxFr[r], fr) {
-        const st = cwUseStoreNode(cwIxNode[r])
-        if st >= 0 && lwStoreCarriesForeignList(st) { found = true }
-      }
+  let ixA = cwIxFrHead(nm, fr)
+  let ixU = cwIxUnkHead(nm, fr)
+  while (ixA >= 0 || ixU >= 0) && !found {
+    let r = ixA
+    if ixU > ixA {
+      r = ixU
+      ixU = cwIxPNext[ixU]
+    } else {
+      ixA = cwIxFrNext(ixA, fr)
     }
-    r = cwIxNext[r]
+    if cwIxKind[r] == CW_OCC_USE {
+      const st = cwUseStoreNode(cwIxNode[r])
+      if st >= 0 && lwStoreCarriesForeignList(st) { found = true }
+    }
   }
   lwFreshDepth = lwFreshDepth - 1
   found

@@ -113,10 +113,14 @@ ROWS = [
       "    if false && msSetGen[hit] == msGen { return hit }")),
     # The disable edit targets the cached-BLOCK test, not the `plScanStmt` guard of the same
     # shape: that one is the plan's FIRST-WINS write rule, and inverting it changes the answer
-    # rather than dropping a cache — the compiler's own source then miscompiles.
+    # rather than dropping a cache — the compiler's own source then miscompiles. With the
+    # current-block hit gone and every miss built in place, no parked plan is ever read (D2687).
     ("parentLetCache",
-     ["plSidGen", "plLoopSidGen", "plGen", "plDupGen", "plSortGen"], "probe", "ALL:" +
-     "  if blockIx != plCacheBlock {" + "\x00" + "  if true {"),
+     ["plSidGen", "plLoopSidGen", "plGen", "plDupGen", "plSortGen"], "probe",
+     ("  if blockIx == plCacheBlock { return 0 }\n"
+      "  // No current plan (the first ask, or after a bust) — nothing to park, build in place.\n"
+      "  if plCacheBlock < 0 {",
+      "  if true {")),
     ("anonLeafIndex", ["anonIxSeen", "anonIxBindHead"], "probe",
      ("  if anonIxOn && anonIxSeen == P.nodes.length { return 0 }",
       "  if false && anonIxOn && anonIxSeen == P.nodes.length { return 0 }")),
