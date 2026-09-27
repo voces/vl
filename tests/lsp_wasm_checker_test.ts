@@ -125,6 +125,68 @@ Deno.test({ name: "wasm-checker: `unknown type` carries the `did you mean` suffi
   }
 });
 
+// D2860 (plumb PL-052) — a mismatch whose value reads an un-annotated numeric literal names that
+// declaration and the annotation, on the same message the CLI prints. The control annotates the
+// declaration wrongly, so the mismatch stands and the note must not.
+Deno.test({ name: "wasm-checker: a defaulted numeric literal names its declaration", ignore }, async () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  const msgs = async (src: string) =>
+    (await checker.check(src, "/tmp/x.vl", noSiblings))
+      .filter((d) => d.severity === "error")
+      .map((d) => d.message);
+  const body = "function mul32(a: f32, b: f32): f32 { a * b }\n" +
+    "const TABLE = [1.0, 0.0, 0.0, 1.0]\n" +
+    "function f(): f32 { mul32(TABLE[0], 1.0) }\nprint(f())\n";
+  const hit = await msgs(body);
+  const wantHit = [
+    "argument 1: expected f32, got f64 — `TABLE` on line 2 has no annotation, so its literal " +
+    "defaulted to `f64[]`; annotate it: `const TABLE: f32[] = …`",
+  ];
+  if (JSON.stringify(hit) !== JSON.stringify(wantHit)) {
+    throw new Error(`want ${JSON.stringify(wantHit)}, got ${JSON.stringify(hit)}`);
+  }
+  // No note: an annotated declaration, a non-literal initializer, a `let` a non-literal write
+  // reaches (after the use, too), and a type the literal does not fit.
+  const g = "function g(a: f32): f32 { a }\nfunction src(): f64 { 3.0 }\n";
+  const misses = [
+    body.replace("const TABLE =", "const TABLE: f64[] ="),
+    g + "const T: f64[] = [1.0]\nconst V = T[0]\nprint(g(V))\n",
+    g + "let w = 1.5\nprint(g(w))\nw = src()\n",
+    g + "let u = 1.5\nu += src()\nprint(g(u))\n",
+    // A non-literal element write or push: the suggested `f32[]` would refuse it.
+    g + "const A = [1.0, 0.0]\nA[1] = src()\nprint(g(A[0]))\n",
+    g + "const B = [1.0, 0.0]\nB.push(src())\nprint(g(B[0]))\n",
+    g + "let C = [1.0, 0.0]\nC[0] = src()\nprint(g(C[0]))\n",
+    g + "const D = [1.0, 0.0]\nconst E = D\nE[0] = src()\nprint(g(D[0]))\n",
+  ];
+  for (const src of misses) {
+    const miss = await msgs(src);
+    if (JSON.stringify(miss) !== JSON.stringify(["argument 1: expected f32, got f64"])) {
+      throw new Error(`want the bare mismatch for ${JSON.stringify(src)}, got ${JSON.stringify(miss)}`);
+    }
+  }
+  const noFit = await msgs("function h(a: i32): i32 { a }\nconst F = 2.5\nprint(h(F))\n");
+  if (JSON.stringify(noFit) !== JSON.stringify(["argument 1: expected i32, got f64"])) {
+    throw new Error(`want the bare mismatch, got ${JSON.stringify(noFit)}`);
+  }
+  // An exported declaration in another module, read through an import alias: the note names the
+  // declaring file and keeps `export`.
+  const lib = "export const TABLE = [1.0, 2.0]\n";
+  const read = (key: string) => key.endsWith("lib.vl") ? lib : undefined;
+  const cross = (await checker.check(
+    'import { TABLE as T } from "./lib"\nfunction g(a: f32): f32 { a }\nprint(g(T[0]))\n',
+    "/proj/main.vl",
+    read,
+  )).filter((d) => d.severity === "error").map((d) => d.message);
+  const wantCross = [
+    "argument 1: expected f32, got f64 — `TABLE` on line 1 of lib.vl has no annotation, so its " +
+    "literal defaulted to `f64[]`; annotate it: `export const TABLE: f32[] = …`",
+  ];
+  if (JSON.stringify(cross) !== JSON.stringify(wantCross)) {
+    throw new Error(`want ${JSON.stringify(wantCross)}, got ${JSON.stringify(cross)}`);
+  }
+});
+
 Deno.test({ name: "wasm-checker: an emitter-capability rejection surfaces its stable code", ignore }, async () => {
   const checker = loadWasmChecker(SEED, log)!;
   // Type-valid, but codegen cannot lower an INFERRED nullable i32-KEYED MAP return — raised
