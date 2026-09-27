@@ -63,6 +63,9 @@ const codeFrom = (src: string, d: Diag): string => {
 
 const run = async (name: string, src: string): Promise<{ src: string; diags: Diag[] }> => {
   const dir = await Deno.makeTempDir({ prefix: "vl_lint_span_" });
+  // A repo-policy rule grades `compiler/` alone (docs/internals/lint-rule-scope.md), so
+  // its fixtures are named `compiler/<file>`, checked relative to the temp root.
+  if (name.startsWith("compiler/")) await Deno.mkdir(`${dir}/compiler`);
   await Deno.writeTextFile(`${dir}/${name}`, src);
   const diags = await check(dir, name);
   await Deno.remove(dir, { recursive: true });
@@ -93,7 +96,7 @@ Deno.test({
   ignore: !ENABLED,
   fn: async () => {
     const { src, diags } = await run(
-      "sentinel.vl",
+      "compiler/sentinel.vl",
       [
         "type Node = { nKid: i32 }",
         "let nodes: Node[] = []",
@@ -121,7 +124,7 @@ Deno.test({
   ignore: !ENABLED,
   fn: async () => {
     const { src, diags } = await run(
-      "ladder.vl",
+      "compiler/ladder.vl",
       [
         "function pick(k: string): i32 {",
         "  if k == \"nulbool\" { return 1 }   // a trailing comment is not the ladder",
@@ -152,7 +155,7 @@ Deno.test({
   ignore: !ENABLED,
   fn: async () => {
     const { src, diags } = await run(
-      "scan.vl",
+      "compiler/scan.vl",
       [
         "type Node = { nKid: i32 }",
         "let sNames: string[] = []",
@@ -233,7 +236,7 @@ Deno.test({
   ignore: !ENABLED,
   fn: async () => {
     const { src, diags } = await run(
-      "comments.vl",
+      "compiler/comments.vl",
       [
         "print(0)",
         "",
@@ -303,7 +306,7 @@ Deno.test({
     // `endCol`). A rule that measured a multi-line lexeme would silently produce an
     // endCol past the line and the editor would clamp it somewhere arbitrary.
     const { src, diags } = await run(
-      "wide.vl",
+      "compiler/wide.vl",
       [
         "// a header block that runs past the four-line budget on purpose",
         "// second line",

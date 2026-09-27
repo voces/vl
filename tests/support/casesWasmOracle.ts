@@ -651,27 +651,10 @@ const readIsval = (exp: Exports): LintDiag[] => {
   return out;
 };
 
-// Rules the CORPUS is exempt from. They police the hygiene of source WE maintain
-// (`scripts/comment-budget.py` and `scripts/ladder-budget.py` ratchet it); these
-// cases pin what the compiler says about a PROGRAM, not about our prose or our
-// dispatch tables. `tests/` is excluded from `lint-self.sh` for the same reason.
-//
-// The four comment rules (docs/internals/comment-style.md): a case file's header is
-// documentation OF the case, and hundreds carry a long one, a shouted emphasis or a
-// sentence about what the compiler used to do — which is the point of the case. The
-// kind-ladder rules: their closed sets are the COMPILER's (`VKind`, `Node`, `MfKind`,
-// …), read out of `compiler/*.vl`, so a case declaring
-// `type Kind = "i32" | "str" | "bool"` is graded against a vocabulary that is not its
-// own — `literal-unions/atom-basics.vl` is exactly that collision, and its `classify`
-// covers its OWN union completely.
-const CORPUS_EXEMPT_CODES = new Set([
-  "comment-block-too-long",
-  "comment-measurement-uncited",
-  "comment-shouting",
-  "comment-history",
-  "kind-ladder-incomplete",
-  "kind-ladder-split",
-]);
+// No code is filtered here. The repo-policy rules (the comment rubric, the kind-ladder
+// and sentinel-index rules, …) grade only the VL tree's own `compiler/`/`std/`, and a
+// case is linted with no path staged, so they decline by themselves
+// (docs/internals/lint-rule-scope.md); a case that saw one would be that scoping broken.
 
 /**
  * Run the self-hosted lint pass over `src` and read its diagnostics. Called only right
@@ -689,8 +672,6 @@ const driveLint = (exp: Exports, src: string): LintDiag[] => {
   const out: LintDiag[] = [];
   if (n < 0) return out; // a lex/parse error — lint needs a valid AST
   for (let i = 0; i < n; i++) {
-    const code = readString(exp.lintCodeLen(i), (j) => exp.lintCodeByte(i, j));
-    if (CORPUS_EXEMPT_CODES.has(code)) continue;
     out.push({
       sev: readString(exp.lintSevLen(i), (j) => exp.lintSevByte(i, j)),
       line: exp.lintLineAt(i),

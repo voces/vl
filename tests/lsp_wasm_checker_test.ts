@@ -752,7 +752,8 @@ Deno.test({ name: "wasm-checker: a sentinel-index range covers the whole read", 
     "  kid.nKid\n" +
     "}\n" +
     "print(holeOf({ nKid: 1 }) + readIt({ nKid: 0 }))\n";
-  const diags = checker.lint(src);
+  // A repo-policy rule, so it grades `compiler/` alone (docs/internals/lint-rule-scope.md).
+  const diags = checker.lint(src, "compiler/probe.vl");
   const d = diags.find((x) => x.code === "sentinel-index-unguarded");
   if (d === undefined) throw new Error("no sentinel-index-unguarded fired");
   const named = /`([^`]*)`/.exec(d.message)?.[1] ?? "";
