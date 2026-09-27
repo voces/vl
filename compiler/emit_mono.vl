@@ -4311,8 +4311,13 @@ function monoRegisterPinUnion(name: string) {
 }
 
 // Per template slot: 1 when its body tests a value of a type parameter, directly or through a
-// generic it calls with one, 0 when not, 2 while being asked; -1 or absent when not yet asked.
+// generic it calls with one, 0 when not; -1 or absent when not settled. While being asked it
+// holds -2 - d, where d is its depth on the walk's stack.
 let monoExactMemo: i32[] = []
+// The walk's stack depth, and the shallowest in-progress template the current walk reached: a
+// "no" that read a template still being asked above it is not final, so it is not cached.
+let monoExactDepth = 0
+let monoExactLow = 0
 
 // Whether generic `fe` is keyed by its exact pins: its body has an `is`, `as` or `match` over a
 // value whose type names a type parameter, or passes such a value to a generic that has.
@@ -4321,13 +4326,31 @@ function monoNeedsExactKey(fe: i32): boolean {
   while monoExactMemo.length <= fe { monoExactMemo.push(-1) }
   const m = monoExactMemo[fe]
   if m >= 0 { return m == 1 }
+  if m <= -2 {
+    // In progress: this answer is provisional until the template at depth -2 - m settles.
+    const d = -2 - m
+    if d < monoExactLow { monoExactLow = d }
+    return false
+  }
+  const depth = monoExactDepth
+  const outerLow = monoExactLow
+  monoExactDepth = depth + 1
+  monoExactLow = depth + 1
   // arena-tick exempt: a memo of the template's body, which no rebuild pass reads.
-  monoExactMemo[fe] = 2
+  monoExactMemo[fe] = -2 - depth
   let r = false
   const fn = P.nodes[monoOrigNode[fe]]
   if fn is FuncDecl { r = monoTestsTyVar(fn.fnBody) }
+  const low = monoExactLow
+  monoExactDepth = depth
+  // A "yes" is final. A "no" is final only if it read no template still being asked above it.
+  let settled = -1
+  if r { settled = 1 }
+  else if low >= depth { settled = 0 }
   // arena-tick exempt: the same memo.
-  if r { monoExactMemo[fe] = 1 } else { monoExactMemo[fe] = 0 }
+  monoExactMemo[fe] = settled
+  monoExactLow = outerLow
+  if low < monoExactLow { monoExactLow = low }
   r
 }
 
@@ -4456,6 +4479,10 @@ function monoExactPinTys(pinTys: i32[], ctx: i32) {
   }
   0
 }
+
+// Per template slot: how many of its instances are being walked, one inside another.
+let monoActiveDepth: i32[] = []
+const MONO_NEST_MAX = 32
 
 // The instance-creation core shared by `monoInstantiate` (call-driven) and
 // `monoInstanceFor` (annotation-driven): clone or reuse the instance of generic `origFe`
@@ -5251,10 +5278,25 @@ function monoMakeInstance(
       monoArenaTouch()
     }
     if monoRebuild() < 0 { return -1 }
+    // A nested walk of one template here mints a new pin, since a repeated pin hits the
+    // registry; past the bound the pins grow without end, as in `f<T>` calling `f<T[]>` (D2721).
+    while monoActiveDepth.length <= origFe { monoActiveDepth.push(0) }
+    if monoActiveDepth[origFe] >= MONO_NEST_MAX {
+      return emitFail(
+        "emitProgram: monomorphize: `"
+          + fn.fnName
+          + "` instantiates itself at a new type on every call, so it has no finite set of instances",
+      )
+    }
+    // arena-tick exempt: a walk counter, which no rebuild pass reads.
+    monoActiveDepth[origFe] = monoActiveDepth[origFe] + 1
     // Walk this instance's body — a nested generic call instantiates its own callee
     // against this instance's concrete annotations, and the callee rename lands on the
     // instance's own `Call` spine rather than on nodes its siblings share.
-    if monoWalkFnBody(nfn) < 0 { return -1 }
+    const walked = monoWalkFnBody(nfn)
+    // arena-tick exempt: the same counter.
+    monoActiveDepth[origFe] = monoActiveDepth[origFe] - 1
+    if walked < 0 { return -1 }
     // A clone's body is walked beside its instance's: its generic calls are its own copies,
     // and the template's walk pinned the template's (D2553).
     let lci = 0
@@ -6609,6 +6651,9 @@ export function monomorphize(stmts: i32[]) {
   monoExactSubN = []
   monoExactSubT = []
   monoExactMemo = []
+  monoActiveDepth = []
+  monoExactDepth = 0
+  monoExactLow = 0
   monoProgStmts = stmts
   // The index follows the table it answers for, at the write and not at a build point:
   // between the two there is no reader, so `monoModuleLetOf` cannot see an empty column.
