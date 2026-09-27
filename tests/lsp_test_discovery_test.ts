@@ -239,7 +239,7 @@ Deno.test("plan: the trailing separator excludes a same-named sibling `it`", () 
 });
 
 Deno.test("plan: an ambiguous `it` name reports what its filter over-runs", () => {
-  // `-t` is a SUBSTRING filter (`cliContains`), and an `it` has no handle longer
+  // `-t` is a SUBSTRING filter (`strContains`), and an `it` has no handle longer
   // than its own path — so this run is genuinely generous, and says so.
   const all = ["adds", "outer > adds", "other"];
   const specs = planFileRun(all, [{ path: "adds", kind: "it" }]);

@@ -16,6 +16,8 @@ import {
   f64LitOverflows,
   intLexemeIsExactF32,
   intLexemeIsExactF64,
+  numLexFitsI32,
+  numLexIs2Pow31,
   numLexIsFloat,
   numLexRadixBits,
   parseI32,
@@ -312,6 +314,7 @@ import {
 import { elseIfLink, nodeChildren, nodeSpineChildren } from "./ast"
 // The file a node came from, named in a record-covariance refusal that crosses modules.
 import { srcmapModOfTok, srcmapPathOf } from "./srcmap"
+import { i32ListHas, strListHas, strListIndexOf } from "./listutil"
 
 // ── type-arena variants ──────────────────────────────────────────────────────
 // One struct per type kind, prefixed field names so `is` discriminates the union (the
@@ -1324,8 +1327,8 @@ function applyArmJoins(
       // A name THIS `if`'s condition narrows enters its two arms at two different types, and
       // the join of that partition is the type it already had — nothing to install.
       if (
-        !nameInList(tnNames, nm)
-        && !nameInList(enNames, nm)
+        !strListHas(tnNames, nm)
+        && !strListHas(enNames, nm)
         && !crCondRetired(condIx, nm)
       ) {
         const path = isPathKey(nm)
@@ -1394,16 +1397,6 @@ function applyArmJoins(
     i = i + 1
   }
   0
-}
-
-// Does `names` hold `name`? The join asks it of the condition's own narrowing lists.
-function nameInList(names: string[], name: string) {
-  let i = 0
-  while i < names.length {
-    if names[i] == name { return true }
-    i = i + 1
-  }
-  false
 }
 
 // The bank slot of the live guard or post-guard narrowing of `name`, or -1: the narrowings under
@@ -1816,7 +1809,7 @@ function flushContainerNullHoles() {
 function tyHoldsOpenNullHole(ty: i32, seen: i32[]): boolean {
   if ty < 0 || ty >= T.tys.length { return false }
   // Each type is walked once, which is what ends a recursive type; the walk has no depth cap.
-  if listHasI32(seen, ty) { return false }
+  if i32ListHas(seen, ty) { return false }
   seen.push(ty)
   const t = T.tys[ty]
   match t {
@@ -3116,7 +3109,7 @@ function holePinKey(owner: string, tvName: string): string {
 // a member of `16 | 32`. A lexeme whose value exceeds the i32 range keeps its raw spelling, an
 // i64-sized literal never denoting a literal-union member.
 function canonIntLexeme(t: string) {
-  if !intLexemeFitsI32(t) { return t }
+  if !numLexFitsI32(t) { return t }
   let v = 0
   let i = 0
   let base = 10
@@ -3762,11 +3755,11 @@ function isValBindLambda(nodeIx: i32) {
 // so an explicit `return expr` inside it mismatches and a value-bearing tail is discarded.
 let voidCtxLambdaNodes: i32[] = []
 function noteVoidCtxLambda(nodeIx: i32) {
-  if !listHasI32(voidCtxLambdaNodes, nodeIx) { voidCtxLambdaNodes.push(nodeIx) }
+  if !i32ListHas(voidCtxLambdaNodes, nodeIx) { voidCtxLambdaNodes.push(nodeIx) }
   0
 }
 export function lambdaVoidAdoptedAt(nodeIx: i32) {
-  listHasI32(voidCtxLambdaNodes, nodeIx)
+  i32ListHas(voidCtxLambdaNodes, nodeIx)
 }
 
 // `voidCoerceValNodes`: expression nodes (paren-peeled idents naming a module-scope `function`)
@@ -3776,26 +3769,17 @@ export function lambdaVoidAdoptedAt(nodeIx: i32) {
 let voidCoerceValNodes: i32[] = []
 let voidCoerceValNames: string[] = []
 function noteVoidCoerceVal(nodeIx: i32, name: string) {
-  if !listHasI32(voidCoerceValNodes, nodeIx) {
+  if !i32ListHas(voidCoerceValNodes, nodeIx) {
     voidCoerceValNodes.push(nodeIx)
     voidCoerceValNames.push(name)
   }
   0
 }
 export function voidCoerceValAt(nodeIx: i32) {
-  listHasI32(voidCoerceValNodes, nodeIx)
+  i32ListHas(voidCoerceValNodes, nodeIx)
 }
 export function voidCoerceValCount() { voidCoerceValNodes.length }
 export function voidCoerceValNameAt(i: i32) { voidCoerceValNames[i] }
-
-function listHasI32(xs: i32[], v: i32) {
-  let i = 0
-  while i < xs.length {
-    if xs[i] == v { return true }
-    i = i + 1
-  }
-  false
-}
 
 // Record `paramTys` as the expected param types of the lambda at `nodeIx` (latest wins).
 function recordCbExpected(nodeIx: i32, paramTys: i32[]) {
@@ -3889,7 +3873,7 @@ function objLitWidenFields(
       const fvn = P.nodes[fv]
       if fvn is NumLit {
         if numLexIsFloat(fvn.numText) { return false }
-        if !intLexemeFitsI32(fvn.numText) { return false }
+        if !numLexFitsI32(fvn.numText) { return false }
         recNodes.push(fv)
         recTys.push(dty)
       } else {
@@ -6112,15 +6096,6 @@ function fnBoundNames(fnIx: i32, out: string[]) {
   0
 }
 
-function nameIn(names: string[], name: string) {
-  let i = 0
-  while i < names.length {
-    if names[i] == name { return true }
-    i = i + 1
-  }
-  false
-}
-
 // The full place keys a function writes through a free variable — a captured local or a
 // module-level binding — `,`-terminated, or `"*"` for opaque. This channel exists because the
 // parameter channel is keyed on arguments, so a callee that takes none is invisible to it:
@@ -6161,7 +6136,7 @@ function weScanFree(ix: i32, bound: string[]) {
       // A bare free name counts too: rebinding `g` replaces every place below it.
       const k = placeKeyOf(n.binLeft)
       if k != "" {
-        if !nameIn(bound, placeRootOf(k)) { acc = acc + k + "," }
+        if !strListHas(bound, placeRootOf(k)) { acc = acc + k + "," }
       }
     }
   } else if n is Call {
@@ -6339,7 +6314,7 @@ function weCellShape(ix: i32, fresh: string[], bound: string[]) {
 function weRebindShape(ix: i32, bound: string[]) {
   const t = P.nodes[ix]
   if t is Ident {
-    if !nameIn(bound, t.identName) { return "=" + t.identName + "," }
+    if !strListHas(bound, t.identName) { return "=" + t.identName + "," }
   }
   ""
 }
@@ -6373,7 +6348,7 @@ function mapCellTagOfTy(t: i32): string {
 
 function weIsFreshName(ix: i32, fresh: string[]): boolean {
   const n = P.nodes[ix]
-  if n is Ident { return nameIn(fresh, n.identName) }
+  if n is Ident { return strListHas(fresh, n.identName) }
   false
 }
 
@@ -6390,7 +6365,7 @@ function callWriteShapes(
 ) {
   const cf = P.nodes[cn.callFn]
   if cf is Ident {
-    const pj = weParamIx(params, cf.identName)
+    const pj = strListIndexOf(params, cf.identName)
     if pj >= 0 { return "@" + i32ToStr(pj) + "," }
   }
   const d = callDeclFnIx(cn, callIx)
@@ -6420,7 +6395,7 @@ function callWriteShapes(
   }
   if cf is Ident {
     // A local the summary cannot see through, named like no built-in.
-    if nameIn(bound, cf.identName) { return "*" }
+    if strListHas(bound, cf.identName) { return "*" }
   }
   let acc = own
   if cf is Member {
@@ -6436,16 +6411,6 @@ function callWriteShapes(
     a = a + 1
   }
   acc
-}
-
-// The index of `name` among the summary's parameters, or -1.
-function weParamIx(params: string[], name: string): i32 {
-  let i = 0
-  while i < params.length {
-    if params[i] == name { return i }
-    i = i + 1
-  }
-  -1
 }
 
 // `sum` with each `@i` replaced by the write shapes of the call's argument `i` in parameter order,
@@ -6556,7 +6521,7 @@ function weArgShapes(a: i32, params: string[], bound: string[]) {
     return weClosed(fnWriteShapes(a))
   }
   if an is Ident {
-    const pj = weParamIx(params, an.identName)
+    const pj = strListIndexOf(params, an.identName)
     if pj >= 0 { return "@" + i32ToStr(pj) + "," }
     const d = lookupFnDeclNode(an.identName)
     if d >= 0 { return weClosed(fnWriteShapes(d)) }
@@ -6567,7 +6532,7 @@ function weArgShapes(a: i32, params: string[], bound: string[]) {
       const ld = cwLambdaDeclOf(an.identName, fr)
       if ld >= 0 { return weClosed(fnWriteShapes(ld)) }
     }
-    if nameIn(bound, an.identName) { return "*" }
+    if strListHas(bound, an.identName) { return "*" }
   }
   if weNeverFn(a) { return "" }
   if crArgMayBeFn(a) { return "*" }
@@ -8011,16 +7976,7 @@ function npSettledAt(slot: i32): boolean {
   const st = npSettle[slot]
   if st == -1 { return true }
   if st < 0 { return false }
-  !i32InList(crStmtIxs, st)
-}
-
-function i32InList(xs: i32[], x: i32): boolean {
-  let i = 0
-  while i < xs.length {
-    if xs[i] == x { return true }
-    i = i + 1
-  }
-  false
+  !i32ListHas(crStmtIxs, st)
 }
 
 // The overlay slot a read of `key` resolves through when a call has ended its narrowing and the
@@ -8984,7 +8940,7 @@ function crLiveNames(): string[] {
   let i = 0
   while i < asgDeclKeys.length {
     if asgDeclDepths[i] >= base {
-      if !nameInList(out, asgDeclKeys[i]) { out.push(asgDeclKeys[i]) }
+      if !strListHas(out, asgDeclKeys[i]) { out.push(asgDeclKeys[i]) }
     }
     i = i + 1
   }
@@ -10296,7 +10252,7 @@ function objLitNamesAre(e: ObjLit, names: string[]): boolean {
     const f = P.nodes[e.objFields[k]]
     if !(f is FieldInit) { return false }
     if f is FieldInit {
-      if !nameInList(names, f.fiName) { return false }
+      if !strListHas(names, f.fiName) { return false }
     }
     k = k + 1
   }
@@ -11414,7 +11370,7 @@ function operandKind(ix: i32) {
 // i32 slot.
 export function litBaseTy(t: TyLit) {
   if t.litKind == "str" { return TY_STR }
-  if intLexemeFitsI32(t.litText) { return TY_I32 }
+  if numLexFitsI32(t.litText) { return TY_I32 }
   TY_I64
 }
 
@@ -13502,7 +13458,7 @@ function mapTwinTestMsg(mems: i32[], chk: i32, what: string): string {
         const b = flat[i]
         const bt = T.tys[b]
         if bt is TyMap {
-          if mapPairSharesRep(ct, bt) && !mapTwinIn(want, b) {
+          if mapPairSharesRep(ct, bt) && !tyArrHasEq(want, b) {
             return what
               + " cannot tell "
               + tyToStr(c)
@@ -13517,16 +13473,6 @@ function mapTwinTestMsg(mems: i32[], chk: i32, what: string): string {
     w = w + 1
   }
   ""
-}
-
-// Whether the type `b` is one of `tys`.
-function mapTwinIn(tys: i32[], b: i32): boolean {
-  let i = 0
-  while i < tys.length {
-    if tyEq(tys[i], b) { return true }
-    i = i + 1
-  }
-  false
 }
 
 // The members `mems` names, with a nested union or nullable spread into its own members.
@@ -14998,7 +14944,7 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
 
 // The value of an integer lexeme, saturated at 256 — "256" means "above the `u8` range", whatever
 // the lexeme is. Saturating rather than folding keeps this free of the bignum path
-// `intLexemeFitsI32` needs: the walk stops the moment the accumulator passes 255. Radix prefixes
+// `numLexFitsI32` needs: the walk stops the moment the accumulator passes 255. Radix prefixes
 // and `_` separators are honoured; a lexeme with a digit its radix does not admit saturates too.
 export function u8LexValue(t: string) {
   let base = 10
@@ -15033,79 +14979,16 @@ export function u8LexValue(t: string) {
   v
 }
 
-// Does the non-negative integer lexeme `t` default to i32? A DECIMAL lexeme denotes a value and
-// defaults by its magnitude, widening to i64 rather than silently wrapping. A RADIX lexeme
-// (`0x`, `0b`, `0o`) denotes a bit pattern and defaults by its width (`numLexRadixBits`), which
-// is the ruled literal rule — DECISIONS.md §"A hex literal is a bit pattern".
-export function intLexemeFitsI32(t: string) {
-  const rb = numLexRadixBits(t)
-  if rb >= 0 { return rb <= 32 }
-  let v = 0
-  let i = 0
-  const base = 10
-  while i < t.length {
-    const c = t[i]
-    if c == '_' {
-      i = i + 1
-    } else {
-      const d = c - '0'
-      if v > (2147483647 - d) / base { return false }
-      v = v * base + d
-      i = i + 1
-    }
-  }
-  true
-}
-
-// Is the integer lexeme's magnitude exactly 2^31 (2147483648)? The parser folds a negated literal
-// into a signed literal before defaulting, so `-2147483648` sits at I32_MIN and defaults to i32
-// even though the bare magnitude is one past I32_MAX; the unary `-` arm uses this for parity.
-// Compares the significant digits against 2^31 written in the lexeme's own base.
-export function intLexemeIs2Pow31(t: string) {
-  let digits = "2147483648"
-  let i = 0
-  if t.length >= 2 && t[0] == '0' {
-    const p = t[1]
-    if p == 'x' || p == 'X' {
-      digits = "80000000"
-      i = 2
-    } else if p == 'b' || p == 'B' {
-      digits = "10000000000000000000000000000000"
-      i = 2
-    } else if p == 'o' || p == 'O' {
-      digits = "20000000000"
-      i = 2
-    }
-  }
-  let started = false
-  let j = 0
-  while i < t.length {
-    const c = t[i]
-    if c == '_' {
-      i = i + 1
-    } else if !started && c == '0' {
-      i = i + 1
-    } else {
-      started = true
-      if j >= digits.length { return false }
-      if c != digits[j] { return false }
-      i = i + 1
-      j = j + 1
-    }
-  }
-  j == digits.length
-}
-
 // Is the expression at `ix`, peeling parens, an integer literal of magnitude exactly 2^31 — the one
 // operand whose negation fits i32 while the bare literal does not? Companion of
-// `intLexemeIs2Pow31` for the unary `-` arm.
+// `numLexIs2Pow31` for the unary `-` arm.
 function isNegI32MinLit(ix: i32) {
   if ix < 0 { return false }
   const e = P.nodes[ix]
   if e is Paren { return isNegI32MinLit(e.parInner) }
   if e is NumLit {
     if numLexIsFloat(e.numText) { return false }
-    return intLexemeIs2Pow31(e.numText)
+    return numLexIs2Pow31(e.numText)
   }
   false
 }
@@ -16143,7 +16026,7 @@ function builtinMethodNamesOf(recvTy: i32): string[] {
 // member read, so its call spelling falls through to a `self`-function.
 function builtinMethodClaims(recvTy: i32, prop: string): boolean {
   if prop == "length" { return false }
-  nameInList(builtinMethodNamesOf(recvTy), prop)
+  strListHas(builtinMethodNamesOf(recvTy), prop)
 }
 
 // The member-call order on a receiver of `recvTy`: its built-in method `name`
@@ -23242,7 +23125,7 @@ function cwRetFrames(set: string[], setFr: i32[], frames: i32[]) {
     if cwIxUpKind[u] == CW_UP_RET { owner = cwFrameOfDecl(cwIxUp[u]) }
     if cwIxUpKind[u] == CW_UP_TAIL { owner = cwIxUp[u] }
     if owner >= 0 {
-      if !cwIntHas(frames, owner) { frames.push(owner) }
+      if !i32ListHas(frames, owner) { frames.push(owner) }
     }
     i = i + 1
   }
@@ -23522,16 +23405,6 @@ function cwContainerSealed(nm: string, fr: i32, path: string): boolean {
   true
 }
 
-// Is (`v`, `list`) present? The membership test for the small `i32` lists this pass carries.
-function cwIntHas(list: i32[], v: i32): boolean {
-  let i = 0
-  while i < list.length {
-    if list[i] == v { return true }
-    i = i + 1
-  }
-  false
-}
-
 // Is the literal `lit`, carrying the value at `fld`, delivered into a container the claim may
 // pass through? `cwLitOwners` is the same walk the escape filing takes, so what the claim
 // passes a delivery through is exactly what the write scan can see. D1628, D1682.
@@ -23647,8 +23520,8 @@ function cwUseAccounted(u: i32, retOk: i32[]): boolean {
   }
   if k == CW_UP_FIELD { return cwLitClaimed(up, cwFieldNameOf(cwIxUpAux[u])) }
   if k == CW_UP_ELEM { return cwLitClaimed(up, CW_ELEM_FLD) }
-  if k == CW_UP_RET { return cwIntHas(retOk, cwFrameOfDecl(up)) }
-  if k == CW_UP_TAIL { return cwIntHas(retOk, up) }
+  if k == CW_UP_RET { return i32ListHas(retOk, cwFrameOfDecl(up)) }
+  if k == CW_UP_TAIL { return i32ListHas(retOk, up) }
   false
 }
 
@@ -24914,7 +24787,7 @@ function rcwValueWrites(v: i32, covs0: string[], depth: i32): boolean {
       if pu < 0 || pu >= P.nodes.length { return rcwFound(v) }
       const pn = P.nodes[pu]
       if pn is Member {
-        if nameIn(getProps, pn.memProp) {
+        if strListHas(getProps, pn.memProp) {
           if rcwUnder(covs0, path).length > 0 { return rcwFound(pu) }
           return false
         }
@@ -25243,7 +25116,7 @@ function rcwArgWrites(
       if rcwParamWrites(ds[di], argNo + 1, covs, depth + 1) { return true }
       di = di + 1
     }
-    if nameIn(getProps, f.memProp) { return rcwFound(callIx) }
+    if strListHas(getProps, f.memProp) { return rcwFound(callIx) }
     if rcwStoresElem(f.memProp) {
       return rcwPlaceWrites(f.memObj, "[]", covs, depth + 1)
     }
@@ -25510,7 +25383,7 @@ function rcwTvName(t: i32, tps: string[]): string {
   if t < 0 || t >= T.tys.length { return "" }
   const tt = T.tys[t]
   if tt is TyVar {
-    if nameIn(tps, tt.tvName) { return tt.tvName }
+    if strListHas(tps, tt.tvName) { return tt.tvName }
   }
   ""
 }
@@ -26079,7 +25952,7 @@ function rcwParamDeliveryWrites(
 
 // The refusal, at the delivery, naming the write — or the place the analysis could not follow.
 function rcwErr(srcExpr: i32, srcTy: i32, dstTy: i32) {
-  if nameInI32(rcwReported, srcExpr) { return 0 }
+  if i32ListHas(rcwReported, srcExpr) { return 0 }
   rcwReported.push(srcExpr)
   tErr(
     "a "
@@ -26304,7 +26177,7 @@ function isIdentCharCode(c: i32): boolean {
 
 // The bound spelling of the refusal.
 function rcwBoundErr(arg: i32, conc: i32) {
-  if nameInI32(rcwReported, arg) { return 0 }
+  if i32ListHas(rcwReported, arg) { return 0 }
   rcwReported.push(arg)
   tErr(
     "a "
@@ -26319,15 +26192,6 @@ function rcwBoundErr(arg: i32, conc: i32) {
     arg,
   )
   0
-}
-
-function nameInI32(xs: i32[], x: i32): boolean {
-  let i = 0
-  while i < xs.length {
-    if xs[i] == x { return true }
-    i = i + 1
-  }
-  false
 }
 
 // Does reaching `dst` from `src` need an object-shape adapter that codegen does not have?
@@ -29566,7 +29430,7 @@ function noteUfcsCstr(recv: i32, prop: string, ix: i32, p0: i32) {
     while k < ufcsCstrTy.length {
       if ufcsCstrTy[k] == recv && ufcsCstrProp[k] == prop {
         if ufcsCstrFn[k] == owner && ufcsCstrP0[k] == p0 {
-          if ix != ufcsCstrIx[k] && !listHasI32(ufcsCstrMore[k], ix) {
+          if ix != ufcsCstrIx[k] && !i32ListHas(ufcsCstrMore[k], ix) {
             ufcsCstrMore[k].push(ix)
           }
           return 0
@@ -30655,7 +30519,7 @@ function memberPinFitsAt(
       res = fieldSigOf(recv, prop, c.callArgs.length, params)
     }
     let why = ""
-    if listHasI32(ufcsUnpinnedSites, callIx) {
+    if i32ListHas(ufcsUnpinnedSites, callIx) {
       why = "and this call cannot pick it per instance from inside a closure or through a "
         + "local — call it on the generic's own parameter"
     } else if hasNamedArgs(c.callArgNames) {
@@ -30746,7 +30610,7 @@ function tpDemandTy(recv: i32, calleeFn: i32) {
   while k < memCstrTy.length {
     if memCstrTy[k] == recv && memCstrDem[k] {
       if cstrOwnedBy(memCstrFn[k], calleeFn) {
-        if !listHasStr(names, memCstrProp[k]) {
+        if !strListHas(names, memCstrProp[k]) {
           names.push(memCstrProp[k])
           tys.push(mkTyVarOwned("?", "#c" + i32ToStr(calleeFn)))
         }
@@ -33267,7 +33131,7 @@ function ufcsMissingImportSpecs(prop: string, recvTy: i32, argc: i32) {
   while i < ufcsImpName.length {
     if ufcsImpName[i] == prop {
       if ufcsWouldDispatch(ufcsImpMangled[i], recvTy, argc) {
-        if !listHasStr(specs, ufcsImpSpec[i]) { specs.push(ufcsImpSpec[i]) }
+        if !strListHas(specs, ufcsImpSpec[i]) { specs.push(ufcsImpSpec[i]) }
       }
     }
     i = i + 1
@@ -33671,7 +33535,7 @@ function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
     // either side, so this row makes a hole receiver's pass mean something once resolved (see `ufcsCstrTy`'s header).
     noteUfcsCstr(recvTy, plainName, ix, params[0])
     if tyHasHole(recvTy) && !ufcsSitePinnable(ix, cstrOwnerTop()) {
-      if !listHasI32(ufcsUnpinnedSites, ix) { ufcsUnpinnedSites.push(ix) }
+      if !i32ListHas(ufcsUnpinnedSites, ix) { ufcsUnpinnedSites.push(ix) }
     }
     // Named arguments bind against the parameter names after `self` (the receiver is an
     // unnamed slot-0 positional), in parameter order — the full list with the receiver unnamed.
@@ -35862,7 +35726,7 @@ function foreignLenCall(n: Call, cfn: Ident): boolean {
   if cfn.identName != "len" || n.callArgs.length != 1 { return false }
   if lookup("len") >= 0 { return false }
   const at = strLitRecvTy(checkNode(n.callArgs[0]))
-  if !nameInList(builtinMethodNamesOf(at), "length") {
+  if !strListHas(builtinMethodNamesOf(at), "length") {
     tErr("undeclared identifier 'len'", n.callFn)
     return true
   }
@@ -36339,10 +36203,10 @@ function noteNaturalRet(t: i32) {
 function opBinSiteTook(op: string, dispatched: boolean) {
   if inferQuiet { return 0 }
   if dispatched {
-    if !listHasStr(opBinDispatched, op) { opBinDispatched.push(op) }
+    if !strListHas(opBinDispatched, op) { opBinDispatched.push(op) }
     return 0
   }
-  if !listHasStr(opBinDeclined, op) { opBinDeclined.push(op) }
+  if !strListHas(opBinDeclined, op) { opBinDeclined.push(op) }
   0
 }
 
@@ -36354,8 +36218,8 @@ function checkProgramEndOpDecls() {
   let i = 0
   while i < opBinHoleDeclName.length {
     const nm = opBinHoleDeclName[i]
-    if !listHasStr(opBinDispatched, nm) {
-      if listHasStr(opBinDeclined, nm) {
+    if !strListHas(opBinDispatched, nm) {
+      if strListHas(opBinDeclined, nm) {
         let why = "`self` has NO ANNOTATION, so its type is inferred and whether it fires is "
         if opBinHoleDeclAnn[i] {
           why = "`self` is a TYPE PARAMETER, so whether it fires is "
@@ -36376,15 +36240,6 @@ function checkProgramEndOpDecls() {
     i = i + 1
   }
   0
-}
-
-function listHasStr(xs: string[], v: string) {
-  let i = 0
-  while i < xs.length {
-    if xs[i] == v { return true }
-    i = i + 1
-  }
-  false
 }
 
 // Whether `ix` is a statement node, not a value-producing expression. A body whose last node
@@ -37198,7 +37053,7 @@ function finishInferredReturn(
     // is still pending: defer, so the binding-group fixpoint re-infers this once the
     // cycle's resolvable members settle. Genuine void recursion has no value return
     // position (`fnSawValueRet` is false), so it is never deferred this way.
-    if !listHasStr(inferTentative, n.fnName) { inferTentative.push(n.fnName) }
+    if !strListHas(inferTentative, n.fnName) { inferTentative.push(n.fnName) }
     inferred = TY_VOID
   } else if inferSawErr {
     // Only err-ish types flowed back: no basis. An uninferable param or a bare `{}` in the
@@ -39281,7 +39136,7 @@ function checkProgramNode(n: Program) {
           const initN = P.nodes[sm.letInit]
           if initN is NumLit {
             if numLexIsFloat(initN.numText) { mty = TY_F64 }
-            else if intLexemeFitsI32(initN.numText) { mty = TY_I32 }
+            else if numLexFitsI32(initN.numText) { mty = TY_I32 }
             else { mty = TY_I64 }
           } else if initN is StrLit {
             mty = TY_STR
@@ -39439,7 +39294,7 @@ function bareBraceNode(ix: i32): boolean {
   if at < 0 || at >= P.nodes.length { return false }
   const e = P.nodes[at]
   if e is ObjLit {
-    return e.objFields.length == 0 && !listHasI32(stmtBraceNodes, at)
+    return e.objFields.length == 0 && !i32ListHas(stmtBraceNodes, at)
   }
   false
 }
@@ -39505,9 +39360,9 @@ function bareBraceDeliver(
     bareBraceDeliverFields(e.objFields, dstTy, depth)
     return false
   }
-  if listHasI32(stmtBraceNodes, srcExpr) {
+  if i32ListHas(stmtBraceNodes, srcExpr) {
     // A block's last `{}` whose value is delivered is refused naming the `({})` spelling.
-    if !listHasI32(stmtBraceTails, srcExpr) || bareBraceSpec > 0 {
+    if !i32ListHas(stmtBraceTails, srcExpr) || bareBraceSpec > 0 {
       return false
     }
     while bareBraceMark.length <= srcExpr { bareBraceMark.push(0) }
@@ -39608,7 +39463,7 @@ function bareBraceUndelivered() {
       d = d + 1
     }
     if !marked {
-      if listHasI32(stmtBraceTails, ix) {
+      if i32ListHas(stmtBraceTails, ix) {
         tErr("an empty block does nothing; remove it", ix)
       } else {
         tErr(
@@ -40512,7 +40367,7 @@ function checkNodeReal(ix: i32) {
   if n is NumLit {
     // A literal with a "." is f64. An integer literal defaults to the NARROWEST
     // type that holds it exactly — i32 if its magnitude fits, else i64 — the
-    // host's `defaultIntegerType` rule (`intLexemeFitsI32`).
+    // host's `defaultIntegerType` rule (`numLexFitsI32`).
     if numLexIsFloat(n.numText) {
       // A literal whose magnitude rounds past the largest finite double names a value f64
       // cannot represent — and VL has no infinity spelling to encode it honestly, so it is an
@@ -40528,7 +40383,7 @@ function checkNodeReal(ix: i32) {
       tErr(radixLitTooWideMsg(n.numText, 64), ix)
       return TY_I64
     }
-    if intLexemeFitsI32(n.numText) { return TY_I32 }
+    if numLexFitsI32(n.numText) { return TY_I32 }
     return TY_I64
   } else if n is StrLit {
     return TY_STR
@@ -52915,9 +52770,9 @@ function checkObjLitNode(n: ObjLit, ix: i32) {
   if fields.length == 0 {
     // A `{}` statement is an empty block, refused by the parser, or for a block's last
     // statement by `bareBraceDeliver` / `bareBraceUndelivered`; the error type keeps it at one.
-    if listHasI32(stmtBraceNodes, ix) {
+    if i32ListHas(stmtBraceNodes, ix) {
       bareBraceCount = bareBraceCount + 1
-      if listHasI32(stmtBraceTails, ix) { bareBraceLits.push(ix) }
+      if i32ListHas(stmtBraceTails, ix) { bareBraceLits.push(ix) }
       return TY_ERR
     }
     bareBraceLits.push(ix)
@@ -53123,16 +52978,6 @@ function jsonExactMemberOf(ut: i32, mt: i32): boolean {
   false
 }
 
-// A `seen` membership test for the recursion guard below (VL lists carry no `.has`).
-function jwSeenHas(seen: i32[], ix: i32): boolean {
-  let i = 0
-  while i < seen.length {
-    if seen[i] == ix { return true }
-    i = i + 1
-  }
-  false
-}
-
 // The target side. "" when `ix` is a JSON shape the walker can build; otherwise the offending
 // component, in words that name what the author wrote — the refusal blames the `is` site's `T`,
 // never a std file. Vocabulary is `docs/serde-design.md`'s: prims, `T[]`, `{[string]: T}`,
@@ -53146,7 +52991,7 @@ export function jsonShapeBad(ix: i32, recvTy: i32, seen: i32[]): string {
   if nw != "" {
     return "`" + nw + "` is a newtype; a JSON shape carries no brand"
   }
-  if jwSeenHas(seen, ix) {
+  if i32ListHas(seen, ix) {
     return "`"
       + tyToStr(ix)
       + "` is recursive; a recursive JSON shape has no walker yet"
@@ -53874,7 +53719,7 @@ function constIntLeafIs(ix: i32) {
   const e = P.nodes[ix]
   if e is NumLit {
     if numLexIsFloat(e.numText) { return false }
-    return intLexemeFitsI32(e.numText)
+    return numLexFitsI32(e.numText)
   }
   false
 }

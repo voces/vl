@@ -457,7 +457,7 @@ axis("call sites", 2.5, "Callee resolution is scaling with the number of callees
 
 // 1.99 / 2.47 / 2.58 / 2.75 over four runs — the widest spread in the family and a known
 // super-linear axis, so the bar clears the top of it. `modIndexOfKey` (compiler/driver.vl)
-// and `capHas` (compiler/emit_base.vl) are 47% and 35% INCLUSIVE on a 400-module build,
+// and `strListHas` (compiler/listutil.vl, once `capHas`) are 47% and 35% INCLUSIVE on a 400-module build,
 // both linear scans of a string-keyed table asked once per module, with `__str_eq__` under
 // them at 73% self. 800 modules against 400 is 4.45x, so a per-module arena scan would
 // roughly double this ratio and still be caught. Each function carries 30 statements so

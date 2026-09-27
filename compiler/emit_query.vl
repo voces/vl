@@ -244,132 +244,6 @@ export function paramIndexOf(fnIx: i32, name: string) {
   }
   -1
 }
-// True if the expression at `exprIx` contains an intrinsic allocator call
-// (`__array_new__` / `__array_new_default__`) anywhere.
-export function exprHasArrNew(exprIx: i32) {
-  if exprIx < 0 { return false }
-  const e = P.nodes[exprIx]
-  if e is Call {
-    const callee = P.nodes[e.callFn]
-    if callee is Ident {
-      if callee.identName == "__array_new__" { return true }
-      if callee.identName == "__array_new_default__" { return true }
-    }
-    if exprHasArrNew(e.callFn) { return true }
-    const args = e.callArgs
-    let i = 0
-    while i < args.length {
-      if exprHasArrNew(args[i]) { return true }
-      i = i + 1
-    }
-    return false
-  }
-  if e is BinExpr {
-    if exprHasArrNew(e.binLeft) { return true }
-    return exprHasArrNew(e.binRight)
-  }
-  if e is Member { return exprHasArrNew(e.memObj) }
-  // The `?.` receiver, walked like the `.` one above (D1667).
-  if e is OptMember { return exprHasArrNew(e.omObj) }
-  if e is Index {
-    if exprHasArrNew(e.idxArr) { return true }
-    return exprHasArrNew(e.idxIndex)
-  }
-  if e is Unary { return exprHasArrNew(e.unArg) }
-  if e is Paren { return exprHasArrNew(e.parInner) }
-  if e is IsExpr { return exprHasArrNew(e.isObj) }
-  if e is AsExpr { return exprHasArrNew(e.asObj) }
-  // An if-expression (`if c { __array_new__(n,0) } else {…}`) is an `IfStmt` node in
-  // value position; without this arm its allocator length never reaches the arrNew slot.
-  if e is IfStmt { return ifChainHasArrNew(exprIx) }
-  if e is ObjLit {
-    const fields = e.objFields
-    let i = 0
-    while i < fields.length {
-      const f = P.nodes[fields[i]]
-      if f is FieldInit {
-        if exprHasArrNew(f.fiValue) { return true }
-      }
-      i = i + 1
-    }
-    return false
-  }
-  // A spread's source is an operand like any other (D2334).
-  if e is Spread { return exprHasArrNew(e.spdArg) }
-  if e is ArrayLit {
-    const elems = e.arrElems
-    let i = 0
-    while i < elems.length {
-      if exprHasArrNew(elems[i]) { return true }
-      i = i + 1
-    }
-    return false
-  }
-  false
-}
-// True if any statement in the block at `blockIx` (descending into if/else arms and
-// loop bodies) contains an intrinsic allocator call. The non-statement case falls
-// through to the expression walker rather than enumerating shapes — an expression-
-// bodied lambda's synthetic one-statement Block is exactly what a fixed set would miss.
-export function blockHasArrNew(blockIx: i32) {
-  const b = P.nodes[blockIx]
-  if b is Block {
-    const stmts = b.blkStmts
-    let i = 0
-    while i < stmts.length {
-      const s = P.nodes[stmts[i]]
-      if s is LetDecl {
-        if exprHasArrNew(s.letInit) { return true }
-      } else if s is RetStmt {
-        if exprHasArrNew(s.retArg) { return true }
-      } else if s is IfStmt {
-        if ifChainHasArrNew(stmts[i]) { return true }
-      } else if s is WhileStmt {
-        if exprHasArrNew(s.whileCond) { return true }
-        if blockHasArrNew(s.whileBody) { return true }
-      } else if s is ForIn {
-        if exprHasArrNew(s.fiIter) { return true }
-        if blockHasArrNew(s.fiBody) { return true }
-      } else if s is ForRange {
-        if exprHasArrNew(s.frFrom) { return true }
-        if exprHasArrNew(s.frTo) { return true }
-        if exprHasArrNew(s.frStep) { return true }
-        if blockHasArrNew(s.frBody) { return true }
-      } else {
-        if exprHasArrNew(stmts[i]) { return true }
-      }
-      i = i + 1
-    }
-  }
-  false
-}
-// True if any arm of the `if` / `else if` chain at `ifIx` contains an intrinsic
-// allocator call — condition, then-branch, `else` block, or a chained `else if`.
-function ifChainHasArrNew(ifIx: i32) {
-  // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
-  let cur = ifIx
-  while cur >= 0 {
-    const s = P.nodes[cur]
-    cur = -1
-    if s is IfStmt {
-      if exprHasArrNew(s.ifCond) { return true }
-      if blockHasArrNew(s.ifThen) { return true }
-      if s.ifElse >= 0 {
-        const els = P.nodes[s.ifElse]
-        if els is Block { return blockHasArrNew(s.ifElse) }
-        if els is IfStmt { cur = s.ifElse }
-      }
-    }
-  }
-  false
-}
-// True if the FuncDecl at `fnIx` allocates via an intrinsic allocator — so it
-// reserves the 1-slot arrNew scratch frame.
-export function fnHasArrNew(fnIx: i32) {
-  const fn = P.nodes[fnIx]
-  if fn is FuncDecl { return blockHasArrNew(fn.fnBody) }
-  false
-}
 // `f(x) ?? d` scratch slot: a `??` whose left operand is a call cannot re-evaluate its
 // lhs like `x ?? d` can, so it stashes the call's result in a 1-slot `(ref $uBoxIdx)`
 // frame. `coalChainHasCallLhs` walks the left spine of a `??` chain (excluding the
@@ -401,69 +275,86 @@ function coalChainHasCallLhs(binIx: i32) {
   }
   false
 }
-export function exprHasCoalesceCall(exprIx: i32) {
+
+// What a scratch-frame scan looks for: "arrNew" is an intrinsic allocator call
+// (`__array_new__` / `__array_new_default__`), which reserves the 1-slot arrNew frame;
+// "coalesceCall" is a `??` whose left spine cannot be re-read (`coalChainHasCallLhs`),
+// which reserves the 1-slot coalesce-call frame.
+export type ScratchQuery = "arrNew" | "coalesceCall"
+
+// True if the expression at `exprIx` contains what `q` asks for anywhere.
+export function exprHasScratch(exprIx: i32, q: ScratchQuery) {
   if exprIx < 0 { return false }
   const e = P.nodes[exprIx]
-  if e is BinExpr {
-    if e.binOp == "??" {
-      if coalChainHasCallLhs(exprIx) { return true }
-    }
-    if exprHasCoalesceCall(e.binLeft) { return true }
-    return exprHasCoalesceCall(e.binRight)
-  }
   if e is Call {
-    if exprHasCoalesceCall(e.callFn) { return true }
+    if q == "arrNew" {
+      const callee = P.nodes[e.callFn]
+      if callee is Ident {
+        if callee.identName == "__array_new__" { return true }
+        if callee.identName == "__array_new_default__" { return true }
+      }
+    }
+    if exprHasScratch(e.callFn, q) { return true }
     const args = e.callArgs
     let i = 0
     while i < args.length {
-      if exprHasCoalesceCall(args[i]) { return true }
+      if exprHasScratch(args[i], q) { return true }
       i = i + 1
     }
     return false
   }
-  if e is Member { return exprHasCoalesceCall(e.memObj) }
-  if e is OptMember { return exprHasCoalesceCall(e.omObj) }
-  if e is Index {
-    if exprHasCoalesceCall(e.idxArr) { return true }
-    return exprHasCoalesceCall(e.idxIndex)
+  if e is BinExpr {
+    if q == "coalesceCall" && e.binOp == "??" {
+      if coalChainHasCallLhs(exprIx) { return true }
+    }
+    if exprHasScratch(e.binLeft, q) { return true }
+    return exprHasScratch(e.binRight, q)
   }
-  if e is Unary { return exprHasCoalesceCall(e.unArg) }
-  if e is Paren { return exprHasCoalesceCall(e.parInner) }
-  if e is IsExpr { return exprHasCoalesceCall(e.isObj) }
-  if e is AsExpr { return exprHasCoalesceCall(e.asObj) }
-  // An if-expression (`if c { f(n) ?? 0 } else { 0 }`) is an `IfStmt` in value
-  // position; without this arm its `??` never reserves `coalesceCallSlot`.
-  if e is IfStmt { return ifChainHasCoalesceCall(exprIx) }
+  if e is Member { return exprHasScratch(e.memObj, q) }
+  // The `?.` receiver, walked like the `.` one above (D1667).
+  if e is OptMember { return exprHasScratch(e.omObj, q) }
+  if e is Index {
+    if exprHasScratch(e.idxArr, q) { return true }
+    return exprHasScratch(e.idxIndex, q)
+  }
+  if e is Unary { return exprHasScratch(e.unArg, q) }
+  if e is Paren { return exprHasScratch(e.parInner, q) }
+  if e is IsExpr { return exprHasScratch(e.isObj, q) }
+  if e is AsExpr { return exprHasScratch(e.asObj, q) }
+  // An if-expression is an `IfStmt` node in value position; without this arm neither its
+  // allocator length nor its `??` would reach the frame the scan reserves.
+  if e is IfStmt { return ifChainHasScratch(exprIx, q) }
   if e is ObjLit {
     const fields = e.objFields
     let i = 0
     while i < fields.length {
       const f = P.nodes[fields[i]]
       if f is FieldInit {
-        if exprHasCoalesceCall(f.fiValue) { return true }
+        if exprHasScratch(f.fiValue, q) { return true }
       }
       i = i + 1
     }
     return false
   }
   // A spread's source is an operand like any other (D2334).
-  if e is Spread { return exprHasCoalesceCall(e.spdArg) }
+  if e is Spread { return exprHasScratch(e.spdArg, q) }
   if e is ArrayLit {
     const elems = e.arrElems
     let i = 0
     while i < elems.length {
-      if exprHasCoalesceCall(elems[i]) { return true }
+      if exprHasScratch(elems[i], q) { return true }
       i = i + 1
     }
     return false
   }
   false
 }
-// True if any statement in the block at `blockIx` (descending into if/else arms and
-// loop bodies) contains a call-lhs `??`. Mirrors `blockHasArrNew`'s expression-statement
-// fall-through: naming a fixed set of shapes missed cases like `[f(n) ?? 0]` and, above
-// all, the synthetic one-statement Block a bare-expression lambda body parses into.
-export function blockHasCoalesceCall(blockIx: i32) {
+
+// True if any statement in the block at `blockIx` (descending into if/else arms and loop
+// bodies) contains what `q` asks for. The non-statement case falls through to the
+// expression walker rather than enumerating shapes — an expression-bodied lambda's
+// synthetic one-statement Block is exactly what a fixed set would miss.
+export function blockHasScratch(blockIx: i32, q: ScratchQuery) {
   const b = P.nodes[blockIx]
   if b is Block {
     const stmts = b.blkStmts
@@ -471,54 +362,56 @@ export function blockHasCoalesceCall(blockIx: i32) {
     while i < stmts.length {
       const s = P.nodes[stmts[i]]
       if s is LetDecl {
-        if exprHasCoalesceCall(s.letInit) { return true }
+        if exprHasScratch(s.letInit, q) { return true }
       } else if s is RetStmt {
-        if exprHasCoalesceCall(s.retArg) { return true }
+        if exprHasScratch(s.retArg, q) { return true }
       } else if s is IfStmt {
-        if ifChainHasCoalesceCall(stmts[i]) { return true }
+        if ifChainHasScratch(stmts[i], q) { return true }
       } else if s is WhileStmt {
-        if exprHasCoalesceCall(s.whileCond) { return true }
-        if blockHasCoalesceCall(s.whileBody) { return true }
+        if exprHasScratch(s.whileCond, q) { return true }
+        if blockHasScratch(s.whileBody, q) { return true }
       } else if s is ForIn {
-        if exprHasCoalesceCall(s.fiIter) { return true }
-        if blockHasCoalesceCall(s.fiBody) { return true }
+        if exprHasScratch(s.fiIter, q) { return true }
+        if blockHasScratch(s.fiBody, q) { return true }
       } else if s is ForRange {
-        if exprHasCoalesceCall(s.frFrom) { return true }
-        if exprHasCoalesceCall(s.frTo) { return true }
-        if exprHasCoalesceCall(s.frStep) { return true }
-        if blockHasCoalesceCall(s.frBody) { return true }
+        if exprHasScratch(s.frFrom, q) { return true }
+        if exprHasScratch(s.frTo, q) { return true }
+        if exprHasScratch(s.frStep, q) { return true }
+        if blockHasScratch(s.frBody, q) { return true }
       } else {
-        if exprHasCoalesceCall(stmts[i]) { return true }
+        if exprHasScratch(stmts[i], q) { return true }
       }
       i = i + 1
     }
   }
   false
 }
-// True if any arm of the `if` / `else if` chain at `ifIx` contains a call-LHS `??`.
-export function ifChainHasCoalesceCall(ifIx: i32) {
+
+// True if any arm of the `if` / `else if` chain at `ifIx` contains what `q` asks for —
+// condition, then-branch, `else` block, or a chained `else if`.
+function ifChainHasScratch(ifIx: i32, q: ScratchQuery) {
   // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
   let cur = ifIx
   while cur >= 0 {
     const s = P.nodes[cur]
     cur = -1
     if s is IfStmt {
-      if exprHasCoalesceCall(s.ifCond) { return true }
-      if blockHasCoalesceCall(s.ifThen) { return true }
+      if exprHasScratch(s.ifCond, q) { return true }
+      if blockHasScratch(s.ifThen, q) { return true }
       if s.ifElse >= 0 {
         const els = P.nodes[s.ifElse]
-        if els is Block { return blockHasCoalesceCall(s.ifElse) }
+        if els is Block { return blockHasScratch(s.ifElse, q) }
         if els is IfStmt { cur = s.ifElse }
       }
     }
   }
   false
 }
-// True if the FuncDecl at `fnIx` contains a call-LHS `??` — so it reserves the 1-slot
-// coalesce-call scratch frame.
-export function fnHasCoalesceCall(fnIx: i32) {
+
+// True if the FuncDecl at `fnIx` contains what `q` asks for, so it reserves that frame.
+export function fnHasScratch(fnIx: i32, q: ScratchQuery) {
   const fn = P.nodes[fnIx]
-  if fn is FuncDecl { return blockHasCoalesceCall(fn.fnBody) }
+  if fn is FuncDecl { return blockHasScratch(fn.fnBody, q) }
   false
 }
 // True if the expression at `ix` is an if-EXPRESSION (an `IfStmt` in value position).

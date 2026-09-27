@@ -284,7 +284,6 @@ import {
   arrLeafNameOf,
   callMemProp,
   callOriginOf,
-  capHas,
   capIsBound,
   frameBindsCacheGet,
   frameBindsCachePut,
@@ -360,7 +359,6 @@ import {
   retVoidAnnFlag,
   setShapeOfTy,
   shapeInnerFieldSplit,
-  strContains,
   tyGroupWrapsWhole,
   tyIsBool,
   tyIsFuncType,
@@ -693,6 +691,8 @@ import {
   sidOfNode,
   sidText,
 } from "./symbols"
+import { strListHas } from "./listutil"
+import { strContains } from "./strutil"
 
 // The `$fnsig` param-spine token for parameter `paramIx` — one token per distinct param
 // valtype, so two functions share a `$fnsig` exactly when their param valtypes byte-match.
@@ -4483,11 +4483,11 @@ function fnPosOnScopeChain(frame: i32, pos: i32): boolean {
   false
 }
 
-// The `fnStmts` position of a lifted function named `name` whose parent frame is the
-// `fnStmts` position `pp`, or -1 — one rung of the scope-chain walk in
-// `fnIndexOfInScopeSid`, and the twin of `emit_collect.nestedFnDeclaredIn`. Both walk the
-// one `fnChildHead`/`fnChildNext` index, so both see `pp`'s children in `fnStmts` order.
-function nestedFnDeclaredInFrame(name: string, pp: i32) {
+// The `fnStmts` position of a lifted function named `name` whose parent frame is the `fnStmts`
+// position `pp`, or -1 when that frame declares no such function. Visits `pp`'s children in
+// `fnStmts` order, so the first declaration wins. The length compare is the lazy build: the
+// index is minted per program and re-mints after a late `fnStmts` push, so it is not a flag.
+export function nestedFnDeclaredIn(name: string, pp: i32) {
   if fnChildHead.length != fnStmts.length { buildFnChildIndex() }
   if pp < 0 || pp >= fnChildHead.length { return -1 }
   let i = fnChildHead[pp]
@@ -4501,6 +4501,27 @@ function nestedFnDeclaredInFrame(name: string, pp: i32) {
   -1
 }
 
+// The `fnStmts` position of the nearest function named `name` declared by a frame on
+// `fnIx`'s scope chain, innermost first, or -1 when none is. An instance frame declares none
+// of its origin's nested functions, so the chain continues into the origin (D1817). Callers
+// gate it on `nestedNameBySid`, which is false for most names, so the call is rarely paid.
+export function nestedFnOnChain(name: string, fnIx: i32) {
+  let pp = fnStmtsPosOf(fnIx)
+  // `fnStmts.length` bounds the walk: a parent chain cannot be longer than the function
+  // count, so this terminates even if `fnParent` ever held a cycle.
+  let steps = 0
+  while pp >= 0 && steps <= fnStmts.length {
+    const hit = nestedFnDeclaredIn(name, pp)
+    if hit >= 0 { return hit }
+    let up = -1
+    if pp < fnParent.length { up = fnParent[pp] }
+    if up < 0 && pp < fnInstOrigin.length { up = fnInstOrigin[pp] }
+    pp = up
+    steps = steps + 1
+  }
+  -1
+}
+
 // `fnIndexOf` but scope-aware for a name referenced inside `fnIx`: when two lifted functions
 // share a name the flat map always returns the first. Resolution walks outward from the
 // calling frame and from an instance into its origin frame, stopping at the first scope
@@ -4509,8 +4530,7 @@ export function fnIndexOfInScope(name: string, fnIx: i32) {
   fnIndexOfInScopeSid(sidLookup(name), name, fnIx)
 }
 
-// The sid-taking primitive. `emit_collect.fnIndexOfInScopeChainSid` is the deliberate twin:
-// this file cannot import `emit_collect`, since the module graph runs the other way.
+// The sid-taking primitive, for a caller with no reading position.
 export function fnIndexOfInScopeSid(sid: i32, name: string, fnIx: i32) {
   fnIndexOfInScopeAt(sid, name, fnIx, -1)
 }
@@ -4523,24 +4543,10 @@ export function fnIndexOfInScopeAt(
   fnIx: i32,
   atIx: i32,
 ) {
-  // The parent-matching scan can only succeed for a nested function named `name`; skip it
-  // entirely when no lifted function carries this name.
+  // The chain scan can only succeed for a nested function named `name`.
   if fnIx >= 0 && sidArrGet(nestedNameBySid, sid) == 1 {
-    let pp = fnStmtsPosOf(fnIx)
-    // `fnStmts.length` bounds the walk: a parent chain cannot be longer than the function
-    // count, so this terminates even if `fnParent` ever held a cycle.
-    let steps = 0
-    while pp >= 0 && steps <= fnStmts.length {
-      const hit = nestedFnDeclaredInFrame(name, pp)
-      if hit >= 0 { return hit }
-      let up = -1
-      if pp < fnParent.length { up = fnParent[pp] }
-      // An instance frame declares none of its origin's nested functions, so the chain
-      // continues there rather than running out into the flat map (D1817).
-      if up < 0 && pp < fnInstOrigin.length { up = fnInstOrigin[pp] }
-      pp = up
-      steps = steps + 1
-    }
+    const hit = nestedFnOnChain(name, fnIx)
+    if hit >= 0 { return hit }
   }
   // No frame on the chain declares a function `name`, so the flat answer is a top-level one or
   // nested off the chain; a binding of `name` on the chain shadows either (D2289).
@@ -4910,7 +4916,7 @@ function capRecord(name: string, bound: {[string]: i32}, caps: string[]) {
   // The builtin-name exemption is positional and lives in `capScan`'s `Call` arm, not here:
   // a builtin name denotes instructions where it is called and nowhere else, so filtering it
   // at every identifier would suppress a genuine capture of a local sharing the name.
-  if capHas(caps, name) { return 0 }
+  if strListHas(caps, name) { return 0 }
   caps.push(name)
   0
 }
@@ -4932,7 +4938,7 @@ function capSiblingFrees(name: string, bound: {[string]: i32}, caps: string[]) {
   let fe = 0 - 1
   let steps = 0
   while pp >= 0 && steps <= fnStmts.length {
-    const hit = nestedFnDeclaredInFrame(name, pp)
+    const hit = nestedFnDeclaredIn(name, pp)
     if hit >= 0 {
       fe = hit
       pp = 0 - 1
@@ -5605,7 +5611,7 @@ function capNarrowRecord(fnIx: i32, ifree: string[], iglob: {[string]: i32}) {
     // capture at the declared rep, the same as the live stack answers for it. Nor is one the
     // checker widened in this body, since a writer may run before it does (D2402).
     if (
-      (capHas(ifree, root) || (iglob[root] ?? 0) == 1)
+      (strListHas(ifree, root) || (iglob[root] ?? 0) == 1)
       && narrowRetired[i] == 0
       && !capWidened(widened, nm)
     ) {
@@ -5858,7 +5864,7 @@ export function capNarrowSeed(fe: i32) {
 // declaration site reads, so its narrowing carries over whole (D2448, D2450).
 function capNarrowReplays(fe: i32, key: string, caps: string[]): boolean {
   const root = narrowKeyRoot(key)
-  if capHas(caps, root) {
+  if strListHas(caps, root) {
     if root == key { return captureValKind(fe, key) == "union" }
     return true
   }
@@ -7430,7 +7436,7 @@ export function identIsEnvCapture(fnIx: i32, name: string): boolean {
   if fnIx < 0 || !fnValUsed { return false }
   const fe = fnStmtsPosOf(fnIx)
   if fe < 0 { return false }
-  capHas(captureNamesOf(fe), name)
+  strListHas(captureNamesOf(fe), name)
 }
 
 // True when captured `name` of lifted frame `fnIx` rides a NULLABLE list env field — the
@@ -25878,18 +25884,6 @@ export function variantFieldLitLexes(vi: i32, fi: i32) {
   tyLitSetMemberLexes(uFieldLitTyIx[row])
 }
 
-// Is LEXEME `lex` one of `lexes`? `emit_base.litLexIsMember`'s twin for a list that is
-// already quoted — that one quotes each element before comparing, which would re-quote a
-// lexeme and answer false for every member.
-function lexInLexes(lex: string, lexes: string[]): boolean {
-  let i = 0
-  while i < lexes.length {
-    if lexes[i] == lex { return true }
-    i = i + 1
-  }
-  false
-}
-
 // Do variants `a` and `b` carry the SAME literal set at field `fi`? Set equality, not list
 // equality: `"x" | "y"` and `"y" | "x"` are one type, and a test that called them different
 // would emit a membership compare that is a tautology in both directions.
@@ -25899,12 +25893,12 @@ function variantFieldLitSetSame(a: i32, b: i32, fi: i32): boolean {
   if la.length != lb.length { return false }
   let i = 0
   while i < la.length {
-    if !lexInLexes(la[i], lb) { return false }
+    if !strListHas(lb, la[i]) { return false }
     i = i + 1
   }
   let j = 0
   while j < lb.length {
-    if !lexInLexes(lb[j], la) { return false }
+    if !strListHas(la, lb[j]) { return false }
     j = j + 1
   }
   true
