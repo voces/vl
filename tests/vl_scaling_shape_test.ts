@@ -1211,6 +1211,65 @@ axis(
   (d) => twoFiles(d, genListLits(4, 1200, false), genListLits(4, 1200, true)),
 );
 
+// `n` callees returning a list, each called once from ONE caller, with the returns inferred
+// against annotated. Asking about an inferred-return callee's body used to evict the caller's
+// let plan, which the caller's next question rebuilt, so each call cost the caller (D2687).
+const genInferredCallees = (n: number, annotated: boolean): string => {
+  const t = annotated ? ": i32[]" : "";
+  const o = ["type U = i32 | string"];
+  for (let f = 0; f < n; f++) {
+    o.push(`function f${f}(n: i32)${t} {`, `  const out: i32[] = [n, ${f % 13}]`, "  out", "}");
+  }
+  o.push("function main() {", "  let acc = 0");
+  for (let f = 0; f < n; f++) {
+    o.push(`  acc = acc + f${f}(${f % 5}).length`);
+    fill(o, f, 2);
+  }
+  o.push("  print(acc)", "}", "main()");
+  return o.join("\n") + "\n";
+};
+
+axis(
+  "calls to inferred-return callees",
+  2.5,
+  "Asking about an inferred-return callee rebuilt the calling function's let plan (`plEnsure`, compiler/emit_base.vl; D2687).",
+  (d) => twoFiles(d, genInferredCallees(3000, false), genInferredCallees(3000, true)),
+);
+
+// `fns` functions each binding an un-annotated list `out`, beside one function that assigns
+// its own local `20 * fns` times, named `out` in the many arm and `sink` in the one. A
+// binding's store scan walked its name's occurrences in every frame rather than its own
+// (`cwIxFrHead`, compiler/typecheck.vl; D2688), so the sink's rows cost each binding.
+const genSharedListName = (fns: number, shared: boolean): string => {
+  const o = ["type U = i32 | string"];
+  for (let f = 0; f < fns; f++) {
+    o.push(
+      `function g${f}(n: i32): i32[] {`,
+      "  if n == 0 {",
+      "    const out = [n, n + 1]",
+      "    return out",
+      "  }",
+      "  const out = [n]",
+      "  out",
+      "}",
+    );
+  }
+  const s = shared ? "out" : "sink";
+  o.push("function h(k: i32): i32 {", `  let ${s} = k`);
+  for (let j = 0; j < 20 * fns; j++) o.push(`  ${s} = ${s} + ${j % 7}`);
+  o.push(`  ${s}`, "}", "let acc = h(1)");
+  for (let f = 0; f < fns; f += 50) o.push(`acc = acc + g${f}(${f}).length`);
+  o.push("print(acc)");
+  return o.join("\n") + "\n";
+};
+
+axis(
+  "a list name shared across functions",
+  2.0,
+  "An un-annotated list const's store scan walked its name's occurrences in every function (`constStoresForeignList`, D2688).",
+  (d) => twoFiles(d, genSharedListName(2000, true), genSharedListName(2000, false)),
+);
+
 // ── the instrument's own control ─────────────────────────────────────────────
 // EVERY PAIR ABOVE PASSES, so nothing above can say whether the grader still reds. The
 // control is the same `grade` over a pair that must: one source, one literal different,

@@ -137,17 +137,63 @@ export function isBuiltinFnName(name: string) {
   if name == "Set" { return true }
   false
 }
-// A single-entry cache for `parentLetOf`, keyed by block: the block whose name → `LetDecl`
-// map is built, and the map itself (`name -> LetDecl` arena index, first-wins). Every
-// `parentLetOf` caller passes its function's body block, so the cache rebuilds once per
-// function. `resetParentLetCache` clears it at `emitProgram` start — a stale block index from a prior compile must not be trusted.
+// The block whose let plan the `pl*` tables below hold, or -1. The plan is the current entry
+// of a small most-recently-used cache (`plSaved*`), so a question about a callee's body does
+// not cost the caller a rebuild of its own (D2687). `resetParentLetCache` clears every entry
+// at `emitProgram` start — a stale block index from a prior compile must not be trusted.
 let plCacheBlock: i32 = -1
 
-// Evicts the single-entry cache without resetting `plGen`'s own counter — the next ask for
-// ANY block, even the one just built, rebuilds. Nothing here can distinguish "this block's
-// own plan changed" from "a different block is being asked about", so a caller that knows
-// the arena moved under a cached block must call this explicitly (D2389).
-export function plCacheBust() { plCacheBlock = -1 }
+// Evicts every cached plan — the next ask for ANY block, even the one just built, rebuilds.
+// Nothing here can distinguish "this block's own plan changed" from "a different block is
+// being asked about", so a caller that knows the arena moved under a cached block must call
+// this explicitly (D2389).
+export function plCacheBust() {
+  plCacheBlock = -1
+  let i = 0
+  while i < plSavedBlock.length {
+    plSavedBlock[i] = -1
+    i = i + 1
+  }
+  0
+}
+
+// One cached plan's tables, parked while another block's plan is current. Field for field the
+// `pl*` globals below; `plSave`/`plLoad` are the only code that moves between the two.
+type PlPlan = {
+  sidVal: i32[],
+  sidGen: i32[],
+  ownerVal: i32[],
+  dupGen: i32[],
+  moreSid: i32[],
+  moreIx: i32[],
+  moreOwner: i32[],
+  moreNext: i32[],
+  moreHead: i32[],
+  lxLo: i32[],
+  lxHi: i32[],
+  lxNext: i32[],
+  lxHead: i32[],
+  sortStart: i32[],
+  sortCount: i32[],
+  sortGen: i32[],
+  sortedCand: i32[],
+  sortedOwner: i32[],
+  sortedSkip: i32[],
+  loopSidVal: i32[],
+  loopSidGen: i32[],
+}
+
+// The parked plans, most recent first, with the block and generation each belongs to. A
+// parked plan's stamps all name its own generation, so loading it back needs no rebuild.
+let plSaved: PlPlan[] = []
+let plSavedBlock: i32[] = []
+let plSavedGen: i32[] = []
+// How many plans stay parked besides the current one: a caller, its callee, and the chain a
+// callee's own inferred return reaches.
+const PL_PARKED = 3
+// The last generation any build took. Each build takes the next one, so a recycled plan's
+// older stamps can never read as present.
+let plGenTop: i32 = 0
 // `plSidVal`/`plSidGen` are the R6 form of `plCacheMap`: a dense sid-indexed array replaces a
 // per-block `{[string]: i32}` that could not be cleared cheaply. A slot counts as present only
 // when its `plSidGen` stamp equals the current `plGen`, so clearing is O(1). `plGen` starts at
@@ -310,6 +356,10 @@ export function sidResetParentLet() {
   plLoopSidVal = []
   plLoopSidGen = []
   plGen = 0
+  plGenTop = 0
+  plSaved = []
+  plSavedBlock = []
+  plSavedGen = []
   fcbFrame = -1
   fcbGen = 0
   fcbSidGen = []
@@ -771,9 +821,128 @@ function plBuildLetMap(blockIx: i32) {
   plScanStmt(blockIx, blockIx)
 }
 
+// The current plan's tables, to park.
+function plSave(): PlPlan {
+  const p: PlPlan = {
+    sidVal: plSidVal,
+    sidGen: plSidGen,
+    ownerVal: plOwnerVal,
+    dupGen: plDupGen,
+    moreSid: plMoreSid,
+    moreIx: plMoreIx,
+    moreOwner: plMoreOwner,
+    moreNext: plMoreNext,
+    moreHead: plMoreHead,
+    lxLo: plLxLo,
+    lxHi: plLxHi,
+    lxNext: plLxNext,
+    lxHead: plLxHead,
+    sortStart: plSortStart,
+    sortCount: plSortCount,
+    sortGen: plSortGen,
+    sortedCand: plSortedCand,
+    sortedOwner: plSortedOwner,
+    sortedSkip: plSortedSkip,
+    loopSidVal: plLoopSidVal,
+    loopSidGen: plLoopSidGen,
+  }
+  p
+}
+
+// Makes the parked plan `p` current.
+function plLoad(p: PlPlan) {
+  plSidVal = p.sidVal
+  plSidGen = p.sidGen
+  plOwnerVal = p.ownerVal
+  plDupGen = p.dupGen
+  plMoreSid = p.moreSid
+  plMoreIx = p.moreIx
+  plMoreOwner = p.moreOwner
+  plMoreNext = p.moreNext
+  plMoreHead = p.moreHead
+  plLxLo = p.lxLo
+  plLxHi = p.lxHi
+  plLxNext = p.lxNext
+  plLxHead = p.lxHead
+  plSortStart = p.sortStart
+  plSortCount = p.sortCount
+  plSortGen = p.sortGen
+  plSortedCand = p.sortedCand
+  plSortedOwner = p.sortedOwner
+  plSortedSkip = p.sortedSkip
+  plLoopSidVal = p.loopSidVal
+  plLoopSidGen = p.loopSidGen
+  0
+}
+
+// Makes `blockIx`'s plan current: already current, parked (loaded back), or built — into the
+// least recently used parked plan's tables once `PL_PARKED` are held, else into fresh ones.
+// The plan it replaces is parked first, most recent.
+function plEnsure(blockIx: i32) {
+  if blockIx == plCacheBlock { return 0 }
+  // No current plan (the first ask, or after a bust) — nothing to park, build in place.
+  if plCacheBlock < 0 {
+    plGenTop = plGenTop + 1
+    plGen = plGenTop
+    plBuildLetMap(blockIx)
+    plCacheBlock = blockIx
+    return 0
+  }
+  const cur = plSave()
+  const curBlock = plCacheBlock
+  const curGen = plGen
+  let hit = -1
+  let i = 0
+  while i < plSavedBlock.length && hit < 0 {
+    if plSavedBlock[i] == blockIx { hit = i }
+    i = i + 1
+  }
+  // The slot the current plan is parked over: the hit, the oldest when full, else a new one.
+  let slot = hit
+  if slot < 0 {
+    if plSaved.length >= PL_PARKED {
+      slot = plSaved.length - 1
+      plLoad(plSaved[slot])
+    } else {
+      slot = plSaved.length
+      plSaved.push(cur)
+      plSavedBlock.push(-1)
+      plSavedGen.push(0)
+      plSidVal = []
+      plSidGen = []
+      plOwnerVal = []
+      plDupGen = []
+      plSortStart = []
+      plSortCount = []
+      plSortGen = []
+      plLoopSidVal = []
+      plLoopSidGen = []
+    }
+    plGenTop = plGenTop + 1
+    plGen = plGenTop
+    plBuildLetMap(blockIx)
+  } else {
+    plLoad(plSaved[hit])
+    plGen = plSavedGen[hit]
+  }
+  // Shift the entries before `slot` down one and park the old current plan at the front.
+  let j = slot
+  while j > 0 {
+    plSaved[j] = plSaved[j - 1]
+    plSavedBlock[j] = plSavedBlock[j - 1]
+    plSavedGen[j] = plSavedGen[j - 1]
+    j = j - 1
+  }
+  plSaved[0] = cur
+  plSavedBlock[0] = curBlock
+  plSavedGen[0] = curGen
+  plCacheBlock = blockIx
+  0
+}
+
 // Find a `LetDecl` for `name` anywhere in the parent body block (incl. nested if/loop
 // bodies — wasm locals are function-scoped). Returns its arena index or -1. Backed by the
-// single-entry per-block cache above (built on a miss, then O(1)).
+// per-block plan cache above (built on a miss, then O(1)).
 export function parentLetOf(blockIx: i32, name: string) {
   // `sidOf`, not `sidLookup`: this table is built lazily on the miss inside `parentLetOfSid`,
   // so a name interned only by that build would resolve to -1 for an id taken earlier —
@@ -787,11 +956,7 @@ export function parentLetOf(blockIx: i32, name: string) {
 // unpositioned ones. A caller holding the identifier's arena index gets the sid from the carrier for free.
 export function parentLetOfSid(blockIx: i32, sid: i32) {
   if blockIx < 0 { return -1 }
-  if blockIx != plCacheBlock {
-    plGen = plGen + 1
-    plBuildLetMap(blockIx)
-    plCacheBlock = blockIx
-  }
+  plEnsure(blockIx)
   if sid < 0 { return -1 }
   if sidArrGet(plSidGen, sid) != plGen { return -1 }
   sidArrGet(plSidVal, sid)
@@ -891,11 +1056,7 @@ function plBestDupAt(sid: i32, atIx: i32, first: i32, fOwner: i32): i32 {
 // name answers as `parentLetOfSid` does.
 export function parentLetOfAt(blockIx: i32, sid: i32, atIx: i32) {
   if blockIx < 0 { return -1 }
-  if blockIx != plCacheBlock {
-    plGen = plGen + 1
-    plBuildLetMap(blockIx)
-    plCacheBlock = blockIx
-  }
+  plEnsure(blockIx)
   if sid < 0 { return -1 }
   if sidArrGet(plSidGen, sid) != plGen { return -1 }
   const first = sidArrGet(plSidVal, sid)
@@ -910,11 +1071,7 @@ export function parentLetOfAt(blockIx: i32, sid: i32, atIx: i32) {
 // still need to trust unconditionally (D2325).
 export function parentLetCoversAt(blockIx: i32, sid: i32, atIx: i32): boolean {
   if blockIx < 0 { return false }
-  if blockIx != plCacheBlock {
-    plGen = plGen + 1
-    plBuildLetMap(blockIx)
-    plCacheBlock = blockIx
-  }
+  plEnsure(blockIx)
   if sid < 0 { return false }
   if atIx < 0 { return false }
   if sidArrGet(plSidGen, sid) != plGen { return false }
@@ -937,11 +1094,7 @@ export function parentLetOwnedBy(blockIx: i32, sid: i32, letIx: i32): boolean {
 // the answer costs the bindings of `sid`, not the block's statements.
 export function parentLetOwnerOf(blockIx: i32, sid: i32, letIx: i32): i32 {
   if blockIx < 0 || sid < 0 || letIx < 0 { return -1 }
-  if blockIx != plCacheBlock {
-    plGen = plGen + 1
-    plBuildLetMap(blockIx)
-    plCacheBlock = blockIx
-  }
+  plEnsure(blockIx)
   if sidArrGet(plSidGen, sid) != plGen { return -1 }
   if sidArrGet(plSidVal, sid) == letIx { return sidArrGet(plOwnerVal, sid) }
   let i = sidArrGet(plMoreHead, sid)
@@ -956,11 +1109,7 @@ export function parentLetOwnerOf(blockIx: i32, sid: i32, letIx: i32): i32 {
 // the loop-variable twin of `parentLetCoversAt`, walking only `sid`'s own rows.
 export function parentLoopCoversAt(blockIx: i32, sid: i32, atIx: i32): boolean {
   if blockIx < 0 || sid < 0 || atIx < 0 { return false }
-  if blockIx != plCacheBlock {
-    plGen = plGen + 1
-    plBuildLetMap(blockIx)
-    plCacheBlock = blockIx
-  }
+  plEnsure(blockIx)
   let i = sidArrGet(plLxHead, sid)
   while i >= 0 {
     if plLxLo[i] < atIx && atIx <= plLxHi[i] { return true }
@@ -981,11 +1130,7 @@ export function parentLoopVarOf(blockIx: i32, name: string) {
 // table under one generation, so either lookup builds both).
 function parentLoopVarOfSid(blockIx: i32, sid: i32) {
   if blockIx < 0 { return -1 }
-  if blockIx != plCacheBlock {
-    plGen = plGen + 1
-    plBuildLetMap(blockIx)
-    plCacheBlock = blockIx
-  }
+  plEnsure(blockIx)
   if sid < 0 { return -1 }
   if sidArrGet(plLoopSidGen, sid) != plGen { return -1 }
   sidArrGet(plLoopSidVal, sid)

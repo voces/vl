@@ -54,7 +54,7 @@ tree ungraded.
 | `structIndexOfObjCtx` (`sio*`) | `sNames.length`, the asking frame | `sFieldTypes`, through the field-set match | probe |
 | `startBlockLetRow` (`sbl*`) | `sblEpoch`, bumped beside `startStmts` | `startStmts`, re-pointed by `dispatchRewrite` | probe |
 | `memberSetIntern` (`msSetGen`/`msGen`) | `msGen` | the member-set rows | probe |
-| `parentLetCache` (`plCacheBlock`/`plGen`) | the cached BLOCK index | the arena bodies the rewrites re-point inside that block | probe |
+| `parentLetCache` (`plCacheBlock`/`plGen`, and since D2687 up to three parked plans in `plSaved*`, each with its own block and generation) | the cached BLOCK index, current or parked | the arena bodies the rewrites re-point inside that block; `plCacheBust` drops the parked plans with the current one | probe |
 | `anonLeafIndex` (`anonIxSeen`) | `P.nodes.length` | its own link columns | probe |
 | `fnChildIndex` | `fnChildHead.length` vs `fnStmts.length` | `fnParent`, written in place by `monomorphize` | probe |
 | `frameBindsCache` (`fcbSidGen`/`fcbGen`, D2289) | the asked FRAME; dropped by `resetParentLetCache` | the frame chain's params, lets and loop variables, which a rewrite could re-point | probe |
@@ -63,7 +63,7 @@ tree ungraded.
 | `elemRowsCaptureWalk` (`ercGenP`/`ercStamp`) | **`emitPassGen`**, and a per-walk stamp so a new walk clears nothing | none: the table is rebuilt when the pass generation moves, and a slot is dead the moment its walk id is stale | pass-stamped |
 | `closureCaptureNames` (`capMemoGen`/`capMemoStamp`, D2017) | **`emitPassGen`**, `P.nodes.length`, a reported-edit count | none reachable: armed only inside `computeRetInference`, `computeRetInference#2` and `dispatchRewrite`; the first two write no table `capScan` reads, and every rewrite either mints a node or calls `capMemoNoteEdit` | pass-stamped |
 | `crValUseNames` (`crValUseRoot`, D2584) | the root's node INDEX; reset by `crReset` | none: the names a root uses other than as a receiver are read off the syntax tree, which the checker does not rewrite | no-refined-input |
-| `covarValueWriteState` (`cwArenaLen`, checked in `cwArenaSync`) | `P.nodes.length` | its own `cwIx*` index, dropped with it; and `nodeRepTyIx`, a checker sidecar written in place | probe |
+| `covarValueWriteState` (`cwArenaLen`, checked in `cwArenaSync`) | `P.nodes.length` | its own `cwIx*` index, dropped with it (the per-(name, frame) chains of D2688, `cwIxP*`, included); and `nodeRepTyIx`, a checker sidecar written in place | probe |
 
 ## The `probe` verdict is a measurement — one row at a time
 
