@@ -14796,6 +14796,9 @@ function litTreeWideTy(ix: i32, dstTy: i32): i32 {
   // A bare literal is not a tree, and is the common operand: reject it before reading its digits.
   const top = P.nodes[parenPeelIx(ix)]
   if !(top is BinExpr || top is Unary) { return -1 }
+  if !litTreeFloatAdopts() && dstTy != TY_I64 && !litTreeDstMayWiden(dstTy) {
+    return -1
+  }
   const k = litTreeOps(ix, 32)
   if k < 1 { return -1 }
   if dstIntWidth(dstTy, 3) == 64 { return TY_I64 }
@@ -14810,6 +14813,13 @@ function litTreeWideTy(ix: i32, dstTy: i32): i32 {
 // Whether a literal tree adopts a float destination (`7 / 2` read as 3.5 at an `f64`). Off: it
 // changes the value of programs that run today and awaits the owner's ruling (D2711).
 function litTreeFloatAdopts(): boolean { false }
+
+// Whether a destination other than a bare `i64` could still be 64 bits wide (nullable or union).
+function litTreeDstMayWiden(dstTy: i32): boolean {
+  if dstTy < 0 { return false }
+  const d = T.tys[dstTy]
+  d is TyNullable || d is TyUnion
+}
 
 // Types every node of the literal tree at `ix` as `ty`, its literals through `litTreeTy` so a
 // re-check keeps the width. Answers `ty`.
@@ -14867,7 +14877,9 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
   recordListFieldWidenAdopt(srcExpr, dstTy)
   // A hex / binary / octal literal is a bit pattern of the destination's width, and this seam is
   // where every binding / argument / return / field / element / store position delivers one.
-  if litTreeAdoptDst(parenPeelIx(srcExpr), dstTy) >= 0 { return true }
+  if srcTy == TY_I32 && litTreeAdoptDst(parenPeelIx(srcExpr), dstTy) >= 0 {
+    return true
+  }
   if radixLitAdoptDst(srcExpr, dstTy) == 2 { return true }
   // Rep sidecar: an ObjLit/ArrayLit whose source type reaches an unresolved empty-collection hole
   // (`{nodes: []}`, `{m: Map()}`) is plainly `assignable` to its concrete destination, so the
@@ -47462,12 +47474,14 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
   if op != "=" && op != "&&" && op != "||" {
     if radixLitAdoptPeer64(n.binLeft, rt) == 1 { lt = TY_I64 }
     if radixLitAdoptPeer64(n.binRight, lt) == 1 { rt = TY_I64 }
-    if op != "??" {
+    if lt == TY_I32 && rt == TY_I64 && op != "??" {
       const lpa = litTreeAdoptDst(n.binLeft, rt)
       if lpa >= 0 { lt = lpa }
     }
-    const rpa = litTreeAdoptDst(n.binRight, lt)
-    if rpa >= 0 { rt = rpa }
+    if rt == TY_I32 && lt == TY_I64 {
+      const rpa = litTreeAdoptDst(n.binRight, lt)
+      if rpa >= 0 { rt = rpa }
+    }
   }
   // A re-check pushes the node again; `checkShiftCounts` grades each once.
   if binShiftOp(op) && intLitLexemeOf(n.binRight) != "" {
@@ -50269,7 +50283,7 @@ function emptyArrCastHint(objIx: i32, target: i32): string {
 }
 
 function checkCastNode(n: AsExpr, ix: i32) {
-  const arg = checkNode(n.asObj)
+  let arg = checkNode(n.asObj)
   let target = nameToTyAt(n.asTy, ix)
   const targetClash = if target < 0 { unkTyClash } else { "" }
   // `x as u8` is the i64->i32 narrowing with a different domain (D1587): `u8` is a storage
@@ -50284,6 +50298,11 @@ function checkCastNode(n: AsExpr, ix: i32) {
       tErr("unknown type `" + n.asTy + "` in `as` cast", ix)
     }
     return TY_ERR
+  }
+  // A literal tree cast exactly to `i64` is computed there, as one delivered to an `i64` is
+  // (D2709). The wrap cast keeps the 32-bit reading it names.
+  if target == TY_I64 && arg == TY_I32 && n.asMode != "wrap" {
+    if litTreeAdoptDst(parenPeelIx(n.asObj), TY_I64) >= 0 { arg = TY_I64 }
   }
   // A hole operand answers neither of the trio's type-level questions, so the numeric ladder
   // admits it on purpose — park both on the hole, re-asked at the call site that pins it (D1342).
