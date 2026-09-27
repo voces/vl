@@ -33363,32 +33363,6 @@ function genAppCarry(origTy: i32, newTy: i32, bNames: string[], bTys: i32[]) {
 }
 
 // The members of a union re-joined one at a time, as the join that made it would at these types.
-// A pinned join `j` of two lists stored as the one i32 list (`boolean[]` beside `i32[]`) is
-// the list the parameter's member pins, as before D2783: no tag tells the two apart, and the
-// generic's call had read that list. `ms` are the join's members, `out` their pins.
-function tpJoinSharedListPick(j: i32, ms: i32[], out: i32[]): i32 {
-  if j < 0 || j >= T.tys.length || ms.length != 2 || out.length != 2 {
-    return j
-  }
-  const jt = T.tys[j]
-  if !(jt is TyUnion) { return j }
-  if !listStoredAsI32List(out[0]) || !listStoredAsI32List(out[1]) { return j }
-  const v0 = tyHasTyVar(ms[0])
-  if v0 == tyHasTyVar(ms[1]) { return j }
-  if v0 { return out[0] }
-  out[1]
-}
-
-// Whether `ty` is a list stored as the i32 list: an `i32` or `boolean` element.
-function listStoredAsI32List(ty: i32): boolean {
-  if ty < 0 || ty >= T.tys.length { return false }
-  const t = T.tys[ty]
-  if t is TyArray {
-    return tyIsPrimNamed(t.aElem, "i32") || tyIsPrimNamed(t.aElem, "boolean")
-  }
-  false
-}
-
 function rejoinMembers(ms: i32[]): i32 {
   if ms.length == 0 { return -1 }
   let r = ms[0]
@@ -33482,7 +33456,7 @@ export function substTyDeep(tyIx: i32, bNames: string[], bTys: i32[]) {
       // A union the return-set join kept apart re-joins under the same rule (D2784).
       const tpSaved = tpApartConcrete
       tpApartConcrete = true
-      res = tpJoinSharedListPick(rejoinMembers(out3), ms, out3)
+      res = rejoinMembers(out3)
       tpApartConcrete = tpSaved
     } else if changed3 {
       // Dedupes by arena-index identity only (not `sameVariantTy`) then rebuilds: substitution
@@ -42601,7 +42575,8 @@ function retAtomKindOf(er: i32) {
       // `i32[]` / `boolean[]` are matched by exact name AHEAD of `valueAtomKind`'s
       // litunion-array arm; the other list atoms sit BEHIND it, so a declared litunion
       // alias spelled like a primitive would claim them — ask the same question here.
-      if en == "i32" || en == "boolean" { return 7 }
+      if en == "i32" { return 7 }
+      if en == "boolean" { return 17 }
       if nameIsLitUnionType(en) { return 7 }
       if en == "f64" { return 8 }
       if en == "string" { return 9 }
@@ -48471,9 +48446,9 @@ export function isInferLetNulBool(letIx: i32) {
 // An inline union annotation's synthetic name (`"A|B"`) has no `unNames` entry the way a
 // named alias does — register it as a union alias too, so the same tables/tags/lookups apply.
 
-// The value-atom kind of a niche-nullable scalar-element list member name — `(boolean |
-// null)[]`/`(K | null)[]` share the i32-list backing (kind 7), `(string | null)[]` the
-// string-list backing (kind 9); -1 otherwise. Decided over `elem`'s member spans with no
+// The value-atom kind of a niche-nullable scalar-element list member name — `(K | null)[]`
+// rides the i32-list backing (kind 7), `(boolean | null)[]` too under its own tag (kind 18),
+// `(string | null)[]` the string-list backing (kind 9); -1 otherwise. Decided over `elem`'s member spans with no
 // split and no per-member slice, mirroring the three arms of the splitting form it replaces.
 
 function nulElemListAtomKind(name: string): i32 {
@@ -48506,7 +48481,7 @@ function nulElemListAtomKind(name: string): i32 {
   if !sawNull { return -1 }
   if nonNull == 0 { return -1 }
   if nonNull == 1 {
-    if spanEqAt(elem, soloFrom, soloTo, "boolean") { return 7 }
+    if spanEqAt(elem, soloFrom, soloTo, "boolean") { return 18 }
     if spanEqAt(elem, soloFrom, soloTo, "string") { return 9 }
     if nameIsLitUnionType(elem.slice(soloFrom, soloTo)) { return 7 }
     return -1
@@ -48564,7 +48539,7 @@ function litUnionArrayElemOf(name: string) {
 }
 
 // The atom kind of a value-union member type name: 0 i32, 1 boolean, 2 string, 3 i64, 4 f64,
-// 5 f32, 6 null, 11 closure (a ref atom), 7-10/12/13 scalar-element lists — or -1 for anything
+// 5 f32, 6 null, 11 closure (a ref atom), 7-10/12/13/17 scalar-element lists — or -1 for anything
 // else (a struct name, an inline shape, a ref-element array). Doubles as the atom's tag offset.
 export function valueAtomKind(name: string) {
   if name == "i32" { return 0 }
@@ -48579,7 +48554,10 @@ export function valueAtomKind(name: string) {
   // A list member of a value union (`i32[] | string`) is a ref atom — the union box's `value`
   // field holds the wrapper ref directly, so each list type needs its own distinct tag code.
   const elem = arrElemNameRaw(name)
-  if elem == "i32" || elem == "boolean" { return 7 }
+  // A boolean list shares the `i32[]` storage but takes its own code, so a union box tags the
+  // two arms apart; code 17 sits above the band, which `uAtomBandTop` lifts only when used.
+  if elem == "i32" { return 7 }
+  if elem == "boolean" { return 17 }
   // A literal-union array (`K[]`) shares the exact `i32[]` backing and rides the same kind-7
   // atom; a real `i32[]`/`boolean[]` member cannot coexist with it in one union (same tag).
   if litUnionArrayElemOf(name) != "" { return 7 }
@@ -48639,7 +48617,8 @@ function valueRowListKind(elem: i32): i32 {
   const e = T.tys[elem]
   if e is TyPrim {
     const en = e.primName
-    if en == "i32" || en == "boolean" { return 7 }
+    if en == "i32" { return 7 }
+    if en == "boolean" { return 17 }
     if en == "f64" { return 8 }
     if en == "string" { return 9 }
     if en == "i64" { return 10 }
@@ -48663,7 +48642,7 @@ function valueRowNulElemKind(inner: i32): i32 {
   if inner < 0 { return -2 }
   const it = T.tys[inner]
   if it is TyPrim {
-    if it.primName == "boolean" { return 7 }
+    if it.primName == "boolean" { return 18 }
     if it.primName == "string" { return 9 }
     return -2
   }
