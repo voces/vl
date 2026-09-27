@@ -8387,3 +8387,19 @@ shared id space, deletes 2,000 behind, 32 lookups per insert, `-O`): with a reco
 `IdTable` runs 6.6 ns per operation against the map's 10.6. With an `i32` value it is on par
 (11.3–13.7 against 13.4–19.2), because `(i32 | null)[]` boxes every element; the tier-1 niche
 above is what would close that.
+
+## A tree of integer literals takes a 64-bit destination's width, and a literal shift count must be below the operand's (2026-09-26) — D2709, D2710
+
+**The rule.** A bare literal already takes its destination's type: `const x: i64 = 5` stores 5
+at 64 bits. An operator tree over integer literals alone — `3 << 32`, `2147483647 + 1` — now
+takes an `i64` destination too, so it is computed at 64 bits rather than wrapped at 32 bits and
+then widened, and an operand beside an `i64` one takes that one's type, so `x + (1 << 40)` adds
+2^40. An `i32` variable is never widened, so a tree that mixes one keeps the 32-bit rule, and an
+`i32` destination is unchanged, wraparound included. A float destination is unchanged too: the
+reading there changes the value of programs that run today and awaits a ruling (D2711).
+
+**The shift count.** Wasm takes a shift count modulo the width, so `x << 32` over an `i32` is
+`x`. A literal count below 0 or at or above the operand's width is refused, as in Rust and Go;
+the refusal is graded after every literal tree has its width, so `const a: i64 = 1 << 40` is
+accepted and `const b = 1 << 40` is not. A computed count keeps the wasm modulo. The one
+program in the repo that relied on the wrap was a fixture that had recorded it by mistake.
