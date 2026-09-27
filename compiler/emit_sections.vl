@@ -125,7 +125,6 @@ import { srcmapFileOfTok, srcmapPathOf } from "./srcmap"
 import {
   NEW_FIXED_MAX,
   appendAll,
-  capHas,
   cpsToUtf8,
   decodeStr,
   nulCloFlag,
@@ -135,19 +134,15 @@ import {
   retNulListFlag,
   retNulStringFlag,
   sidResetParentLet,
-  strContains,
   strToCps,
   tyIsFuncType,
   tyIsNulBool,
   unwrapParen,
 } from "./emit_base"
 import {
-  blockHasArrNew,
-  blockHasCoalesceCall,
-  exprHasArrNew,
-  exprHasCoalesceCall,
-  fnHasArrNew,
-  fnHasCoalesceCall,
+  blockHasScratch,
+  exprHasScratch,
+  fnHasScratch,
   globalCellIsImmutable,
   globalIsNonConst,
   letIsNulBoolAnn,
@@ -705,6 +700,8 @@ import {
   strAccScanStart,
   userGlobalIdx,
 } from "./wasmEmit"
+import { strListHas } from "./listutil"
+import { strContains } from "./strutil"
 
 // Host opt-in for the name section (see `gEmitNames`). The driver does NOT call
 // this, so every golden/fixpoint emit leaves names OFF; only the native tool
@@ -1177,8 +1174,8 @@ function recordStartRefPushSlot(stmtIx: i32) {
 function startScanBlock(blockIx: i32) {
   applyPushPopBits(blockPushPopBits(blockIx, -1))
   if blockHasStrOp(blockIx, -1) { fnUsesStrOp = true }
-  if blockHasArrNew(blockIx) { fnUsesArrNew = true }
-  if blockHasCoalesceCall(blockIx) { fnUsesCoalesceCall = true }
+  if blockHasScratch(blockIx, "arrNew") { fnUsesArrNew = true }
+  if blockHasScratch(blockIx, "coalesceCall") { fnUsesCoalesceCall = true }
   if blockHasMapOp(blockIx, -1) { fnUsesMap = true }
   collectRefPushSlots(blockIx, -1)
   collectMemberPopRefSlots(blockIx, -1)
@@ -1192,8 +1189,8 @@ function startScanBlock(blockIx: i32) {
 function startScanHeaderExpr(exprIx: i32) {
   if exprIx < 0 { return 0 }
   if exprHasStrOp(exprIx, -1) { fnUsesStrOp = true }
-  if exprHasArrNew(exprIx) { fnUsesArrNew = true }
-  if exprHasCoalesceCall(exprIx) { fnUsesCoalesceCall = true }
+  if exprHasScratch(exprIx, "arrNew") { fnUsesArrNew = true }
+  if exprHasScratch(exprIx, "coalesceCall") { fnUsesCoalesceCall = true }
   if exprHasMapOp(exprIx, -1) { fnUsesMap = true }
   applyPushPopBits(exprPopBits(exprIx, -1))
   collectMemberPopRefSlotsExpr(exprIx, -1)
@@ -1512,10 +1509,10 @@ function fnDetectScratch(fnIx: i32) {
       if fnHasStrOp(fnIx) { fnUsesStrOp = true }
     }
     if !fnUsesArrNew {
-      if fnHasArrNew(fnIx) { fnUsesArrNew = true }
+      if fnHasScratch(fnIx, "arrNew") { fnUsesArrNew = true }
     }
     if !fnUsesCoalesceCall {
-      if fnHasCoalesceCall(fnIx) { fnUsesCoalesceCall = true }
+      if fnHasScratch(fnIx, "coalesceCall") { fnUsesCoalesceCall = true }
     }
     if !fnUsesMap {
       if fnHasMap(fnIx) { fnUsesMap = true }
@@ -1718,8 +1715,8 @@ function startFnDetectScratch() {
         // A `string` global initialized with a literal-union atom widens via the runtime tower
         // (`emitAtomToStr`), which stages the atom id in the string-op scratch frame.
         if globalInitWidensAtomToStr(globalStmts[gi]) { fnUsesStrOp = true }
-        if exprHasArrNew(ix) { fnUsesArrNew = true }
-        if exprHasCoalesceCall(ix) { fnUsesCoalesceCall = true }
+        if exprHasScratch(ix, "arrNew") { fnUsesArrNew = true }
+        if exprHasScratch(ix, "coalesceCall") { fnUsesCoalesceCall = true }
         if exprHasMapOp(ix, -1) { fnUsesMap = true }
         if fnValUsed {
           if blockHasCallRef(ix, -1) { fnUsesCallRef = true }
@@ -1782,8 +1779,10 @@ function startFnDetectScratch() {
       applyPushPopBits(callPushBits(startStmts[si], -1))
       applyPushPopBits(exprPopBits(startStmts[si], -1))
       if exprHasStrOp(startStmts[si], -1) { fnUsesStrOp = true }
-      if exprHasArrNew(startStmts[si]) { fnUsesArrNew = true }
-      if exprHasCoalesceCall(startStmts[si]) { fnUsesCoalesceCall = true }
+      if exprHasScratch(startStmts[si], "arrNew") { fnUsesArrNew = true }
+      if exprHasScratch(startStmts[si], "coalesceCall") {
+        fnUsesCoalesceCall = true
+      }
       if exprHasMapOp(startStmts[si], -1) { fnUsesMap = true }
       if callIsPushKind(startStmts[si], -1, "ref") {
         recordStartRefPushSlot(startStmts[si])
@@ -4798,16 +4797,6 @@ function igMention(
   0
 }
 
-// Whether `name` is bound by a parameter or local in scope at the walk's cursor (`igWalk`).
-function igShadowed(shadow: string[], name: string): boolean {
-  let i = shadow.length - 1
-  while i >= 0 {
-    if shadow[i] == name { return true }
-    i = i - 1
-  }
-  false
-}
-
 // Mentions every identifier, member name and nested function name under `ix` at `ord`,
 // except an identifier a parameter or local in scope binds (`shadow`, restored on return).
 // A `let` binds for the statements after it in its block; a loop variable, for its body.
@@ -4824,7 +4813,7 @@ function igWalk(
   const n = P.nodes[ix]
   const mark = shadow.length
   if n is Ident {
-    if !igShadowed(shadow, n.identName) {
+    if !strListHas(shadow, n.identName) {
       igMention(n.identName, 1, ord, seen, head, next, work)
     }
     return 0
@@ -4870,7 +4859,7 @@ function igWalk(
       if n.binOp == "=" {
         const lhs = P.nodes[n.binLeft]
         if lhs is Ident {
-          if !igShadowed(shadow, lhs.identName) {
+          if !strListHas(shadow, lhs.identName) {
             igMention(lhs.identName, 2, ord, seen, head, next, work)
           }
         }
@@ -7167,7 +7156,7 @@ function exportPublicNames(): string[] {
   while rxi < reExpName.length {
     if (
       exportSlotOfTarget(reExpTarget[rxi]) >= 0
-      && !capHas(nms, reExpName[rxi])
+      && !strListHas(nms, reExpName[rxi])
     ) {
       nms.push(reExpName[rxi])
     }
@@ -7185,7 +7174,7 @@ function exportTargetSlots(): i32[] {
   let rxi = 0
   while rxi < reExpName.length {
     const hit = exportSlotOfTarget(reExpTarget[rxi])
-    if hit >= 0 && !capHas(seen, reExpName[rxi]) {
+    if hit >= 0 && !strListHas(seen, reExpName[rxi]) {
       seen.push(reExpName[rxi])
       slots.push(hit)
     }
@@ -7252,8 +7241,8 @@ function emitExportSection(_n: i32, wrapBase: i32) {
     const gxg = exportGlobalOfTarget(reExpTarget[gxi])
     if (
       gxg >= 0
-      && !capHas(reExpNm, reExpName[gxi])
-      && !capHas(gExpNm, reExpName[gxi])
+      && !strListHas(reExpNm, reExpName[gxi])
+      && !strListHas(gExpNm, reExpName[gxi])
       && !(memExported && reExpName[gxi] == "memory")
     ) {
       gExpNm.push(reExpName[gxi])
