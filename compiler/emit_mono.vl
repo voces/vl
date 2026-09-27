@@ -169,6 +169,7 @@ import {
   mkSpread,
   mkUnary,
   mkWhile,
+  nodeChildren,
   nodeSpineChildren,
   orderArgsByParamNames,
   tsMentionsAnyName,
@@ -1646,6 +1647,66 @@ function ftRetHadTyVar(ft: TyFunc): boolean {
   ft.fnRet >= 0 && tyHasTyVar(ft.fnRet)
 }
 
+// Whether every value body `body` returns is a record literal it builds itself, directly or
+// through a local bound to one, with no nested function sharing its nodes. A pin's own record
+// row is built only there; a record from a call or a closure keeps the shared rep (D2850).
+function monoBodyReturnsOwnRecord(body: i32): boolean {
+  const b = P.nodes[body]
+  if !(b is Block) { return false }
+  const stack: i32[] = []
+  stack.push(body)
+  let steps = 0
+  while stack.length > 0 {
+    steps = steps + 1
+    if steps > 4096 { return false }
+    const ix = stack.pop() ?? -1
+    if ix >= 0 && ix < P.nodes.length {
+      const n = P.nodes[ix]
+      if n is FuncDecl && ix != body { return false }
+      if n is RetStmt {
+        if !monoIsOwnRecord(body, n.retArg) { return false }
+      }
+      const kids = nodeChildren(ix)
+      let k = 0
+      while k < kids.length {
+        stack.push(kids[k])
+        k = k + 1
+      }
+    }
+  }
+  if b is Block {
+    const st = b.blkStmts
+    if st.length > 0 {
+      const tail = P.nodes[st[st.length - 1]]
+      if !(tail is RetStmt) && !(tail is LetDecl) {
+        if !monoIsOwnRecord(body, st[st.length - 1]) { return false }
+      }
+    }
+  }
+  true
+}
+
+// Whether `ix` is a record literal, or a name `body` binds to one.
+function monoIsOwnRecord(body: i32, ix: i32): boolean {
+  const v = unwrapParen(ix)
+  if v < 0 { return false }
+  if P.nodes[v] is ObjLit { return true }
+  const li = parentLetOf(body, monoIdentNameOf(v))
+  if li < 0 { return false }
+  const d = P.nodes[li]
+  if d is LetDecl {
+    if d.letInit >= 0 { return P.nodes[unwrapParen(d.letInit)] is ObjLit }
+  }
+  false
+}
+
+// The name node `v` reads, or "" for any node that is not a name.
+function monoIdentNameOf(v: i32): string {
+  const n = P.nodes[v]
+  if n is Ident { return n.identName }
+  ""
+}
+
 // A record none of whose fields is a function: a function field carries the closure's own
 // signature row, which the render-to-row path does not intern.
 function tyIsPlainRecord(ty: i32): boolean {
@@ -1679,7 +1740,7 @@ function monoTyParamShapeAnn(initIx: i32, bN: string[], bT: i32[]): i32 {
     sty = substTyDeep(sty, monoHoleBN, monoHoleBT)
   }
   if sty < 0 || tyHasTyVar(sty) { return -1 }
-  if !(T.tys[sty] is TyObj) { return -1 }
+  if !tyIsPlainRecord(sty) { return -1 }
   const nm = tyToEmitName(sty)
   if nm == "" { return -1 }
   synthTypeRefTy(nm, -1, sty)
@@ -5471,6 +5532,7 @@ function monoMakeInstance(
             && nret < 0
             && ftRetHadTyVar(ft)
             && tyIsPlainRecord(rty)
+            && monoBodyReturnsOwnRecord(fn.fnBody)
           ) {
             // A record whose shape named the hole is this pin's own row: the template's literal
             // has none, and a sibling row with the same field names may hold another kind (D2850).

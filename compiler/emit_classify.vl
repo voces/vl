@@ -11534,6 +11534,27 @@ function atomFieldTakesStr(valIx: i32, si: i32, mfi: i32): boolean {
   false
 }
 
+// Whether a nested-record field of type `fty` may share row `si`'s field `fi`: the field's
+// target row and `fty` must agree canonically where both are known (D2850).
+function nestedAnonRowFits(fty: i32, si: i32, fi: i32): boolean {
+  const rowElem = sFieldElemNameAt(si, fi)
+  if rowElem == "" || tyHasTyVar(fty) { return true }
+  let cr = repNameCanonId(rowElem)
+  if cr < 0 { cr = rowCanonIdOfName(rowElem) }
+  if cr < 0 { return true }
+  repCanonId(fty) == cr
+}
+
+// `code0TextFitsRow` from an arena field type: false only when both kinds are known and differ.
+function code0TyFitsRow(fty: i32, si: i32, fi: i32): boolean {
+  const tk = code0KindOf(fty)
+  if tk == 0 || si < 0 || si >= sTyIx.length { return true }
+  const rk = code0KindOf(
+    tyFieldTyOf(sTyIx[si], sFieldNames[sFieldStart[si] + fi]),
+  )
+  rk == 0 || rk == tk
+}
+
 // Whether a code-0 field spelled `text` may share row `si`'s field `fi`: false only when the
 // spelling and the row's own field type are two different known code-0 kinds.
 function code0TextFitsRow(text: string, si: i32, fi: i32): boolean {
@@ -11687,7 +11708,24 @@ function elemRowsCaptureCompatAt(vn: string, dn: string): boolean {
       fits = false
     } else {
       const dcode = sFieldTypes[at]
-      if dcode == sFieldTypeAt(vi, vj) {
+      const vcode = sFieldTypeAt(vi, vj)
+      // A string and a non-string scalar or list cannot share a nested row: no adoption widens
+      // one into the other, unlike the numeric widenings a delivery grants (D2841).
+      if (
+        (dcode == FC_STR) != (vcode == FC_STR)
+        && anonCodeIsSelfContained(dcode)
+        && anonCodeIsSelfContained(vcode)
+      ) {
+        fits = false
+      }
+      if dcode == FC_I32 && vcode == FC_I32 {
+        if vi < sTyIx.length && sTyIx[vi] >= 0 {
+          if !code0TyFitsRow(tyFieldTyOf(sTyIx[vi], sFieldNames[at]), di, k) {
+            fits = false
+          }
+        }
+      }
+      if dcode == vcode {
         const dv = sFieldElemName[at]
         const vv = sFieldElemNameAt(vi, vj)
         if dv != "" && vv != "" {
@@ -18874,7 +18912,8 @@ function variantRowOfObjFieldSetK(ty: i32, widen: boolean): i32 {
                 const rowElem = variantFieldElemName(vi, fj)
                 if rowElem != "" {
                   const cq = repCanonId(ftys[k])
-                  const cr = repNameCanonId(rowElem)
+                  let cr = repNameCanonId(rowElem)
+                  if cr < 0 { cr = rowCanonIdOfName(rowElem) }
                   if cq >= 0 {
                     if cr >= 0 {
                       if cq != cr { ok = false }
@@ -19070,6 +19109,16 @@ function structRowOfObjFieldSetK(ty: i32, widen: boolean): i32 {
               } else if want != sFieldTypeAt(si, fj) {
                 ok = false
               }
+              if ok && want == FC_I32 && !code0TyFitsRow(ftys[k], si, fj) {
+                ok = false
+              }
+              if (
+                ok
+                && want == FC_STRUCT
+                && !nestedAnonRowFits(ftys[k], si, fj)
+              ) {
+                ok = false
+              }
             } else {
               // An uncoded field is lenient, matching the render path's `shapeFieldTypeCompat`
               // (refutes only proven mismatches), with its one tightening: a code-15 nested-
@@ -19079,7 +19128,8 @@ function structRowOfObjFieldSetK(ty: i32, widen: boolean): i32 {
                 const rowElem = sFieldElemNameAt(si, fj)
                 if rowElem != "" {
                   const cq = repCanonId(ftys[k])
-                  const cr = repNameCanonId(rowElem)
+                  let cr = repNameCanonId(rowElem)
+                  if cr < 0 { cr = rowCanonIdOfName(rowElem) }
                   if cq >= 0 {
                     if cr >= 0 {
                       if cq != cr { ok = false }
