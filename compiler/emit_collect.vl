@@ -160,9 +160,11 @@ import {
   elseIfLink,
   externGlobalLinkOfNode,
   i32ToStr,
+  nodeChildren,
   nodeSpineChildren,
   orderArgsByParamNames,
   tsKind,
+  valueIfNodes,
 } from "./ast"
 import {
   annArrowAt,
@@ -308,9 +310,12 @@ import {
   cloSigTwin,
   cloSigWalkRoots,
   cloStructIdx,
+  collectByNode,
   criChanged,
+  declSlotByNode,
   emitCurStmtIx,
   emitFailed,
+  exprArmLocalsAny,
   fRetBool,
   fRetKind,
   fRetLitAtom,
@@ -386,6 +391,8 @@ import {
   lTypeIdx,
   lUsed,
   lambdaCtr,
+  localByNode,
+  localDeclIx,
   localLitUnion,
   mI32Used,
   mI64Used,
@@ -3663,6 +3670,15 @@ export function collectLocals(blockIx: i32, fnIx: i32) {
         // minted, both past the point where a caller's annotation could re-aim an instance's
         // signature. Every binding the pre-mono pass pinned is declined by the `letType` guard.
         synthDstPinAnn(stmts[i], fnIx, -1)
+        // An if-expression initializer whose arms declare locals is walked first, by node, and
+        // those locals are bound while the binding is classified, so an arm's tail naming one
+        // reads its slot rather than a type parameter's recorded type (D2785).
+        let initArms = 0
+        if exprArmLocalsAny { initArms = letInitArmsFirst(s.letInit, fnIx) }
+        if initArms < 0 {
+          scopePop()
+          return -1
+        }
         // Classify the init type before binding the name, then allocate a fresh slot and bind
         // `name → slot` so a later reference (or a shadowing inner `let`) resolves to this slot.
         // `slot` is the new slot's declared-local position.
@@ -3927,11 +3943,14 @@ export function collectLocals(blockIx: i32, fnIx: i32) {
         // carries (`localDeclIx`), so a rep question about a read of this local has nowhere else
         // to go.
         markLocalDecl(slot, stmts[i])
+        if collectByNode > 0 { declSlotByNode[stmts[i]] = slot }
         if fnIx >= 0 { markLetOverGlobal(slot, s.letName) }
         // An if-expression initializer's arm preludes declare locals of their own. They are
         // allocated after this binding's own slot and before its name is bound, because that is
         // the order `emitLetDeclStmt` walks: `emitLetCursor`, then the init, then `scopeBind`.
-        if collectIfExprLocals(s.letInit, fnIx) < 0 {
+        if initArms == 1 {
+          scopePop()
+        } else if collectIfExprLocals(s.letInit, fnIx) < 0 {
           scopePop()
           return -1
         }
@@ -3943,11 +3962,23 @@ export function collectLocals(blockIx: i32, fnIx: i32) {
         }
       } else if s is WhileStmt {
         // Wasm locals are function-scoped, so collect locals from the while body too.
-        if collectLocalsWhile(stmts[i], fnIx) < 0 {
+        if (
+          collectExprArms(s.whileCond, fnIx) < 0
+          || collectLocalsWhile(stmts[i], fnIx) < 0
+        ) {
           scopePop()
           return -1
         }
       } else if s is ForRange {
+        if (
+          collectExprArms(s.frFrom, fnIx) < 0
+          || collectExprArms(s.frTo, fnIx) < 0
+          || collectExprArms(s.frStep, fnIx) < 0
+        ) {
+          scopePop()
+          return -1
+        }
+        markByNodeDecl(stmts[i], localByNode.length)
         declareForRangeLocals(s)
         if collectLocals(s.frBody, fnIx) < 0 {
           scopePop()
@@ -3956,6 +3987,11 @@ export function collectLocals(blockIx: i32, fnIx: i32) {
         // The loop variable's scope is the loop (see `scopeUnbind`).
         scopeUnbind()
       } else if s is ForIn {
+        if collectExprArms(s.fiIter, fnIx) < 0 {
+          scopePop()
+          return -1
+        }
+        markByNodeDecl(stmts[i], localByNode.length)
         if declareForInLocals(s, fnIx) < 0 {
           scopePop()
           return -1
@@ -3976,6 +4012,9 @@ export function collectLocals(blockIx: i32, fnIx: i32) {
           scopePop()
           return -1
         }
+      } else if exprArmLocalsAny && collectExprArms(stmts[i], fnIx) < 0 {
+        scopePop()
+        return -1
       }
       // Post-guard complement narrowing, mirroring `emitStmts`: a guard `if` with no else whose
       // then-branch always returns narrows the rest of this block, so the bindings below it are
@@ -3993,13 +4032,171 @@ export function collectLocals(blockIx: i32, fnIx: i32) {
 
 // Allocate the arm-prelude locals of an if-expression standing as a statement's whole value
 // expression — a binding initializer or a `return` operand, which is also where a `match` in
-// value position lands. Only this shape is walked: an if-expression nested deeper inside an
-// expression is reached by the emitter in an order this pass does not replay.
+// value position lands — off the emitter's cursor. An if-expression nested deeper inside the
+// expression is allocated by node instead (`collectExprArms`).
 function collectIfExprLocals(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return 0 }
   const bare = unwrapParen(exprIx)
   const n = P.nodes[bare]
   if n is IfStmt { return collectLocalsIf(bare, fnIx) }
+  if !exprArmLocalsAny { return 0 }
+  collectExprArms(exprIx, fnIx)
+}
+
+// Walk the arm locals of a binding's bare if-expression initializer by node, ahead of the
+// binding's own classification, and push a frame binding each arm's top-level locals: 1 when it
+// did (the caller pops the frame), 0 when the initializer declares nothing, -1 on failure.
+function letInitArmsFirst(initIx: i32, fnIx: i32): i32 {
+  if !exprArmLocalsAny || initIx < 0 { return 0 }
+  const bare = unwrapParen(initIx)
+  if bare < 0 || !(P.nodes[bare] is IfStmt) { return 0 }
+  if firstLocalDeclIn(bare) < 0 { return 0 }
+  collectByNode = collectByNode + 1
+  const rc = collectLocalsIf(bare, fnIx)
+  collectByNode = collectByNode - 1
+  if rc < 0 { return -1 }
+  scopePush()
+  armPreludeBindChain(bare)
+  1
+}
+
+// Allocate the locals of every if-expression nested in the expression at `ix` that declares
+// one, by node (`declSlotByNode`): the emitter reaches such an arm wherever its position lowers
+// it, in an order this pass does not replay (D2785). Stops at a nested function, whose body
+// owns its own frame, and at a statement block, which `collectLocals` walks itself.
+export function collectExprArms(ix: i32, fnIx: i32): i32 {
+  if !exprArmLocalsAny { return 0 }
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const n = P.nodes[ix]
+  if n is FuncDecl || n is Block { return 0 }
+  if n is IfStmt {
+    if firstLocalDeclIn(ix) < 0 { return 0 }
+    collectByNode = collectByNode + 1
+    const rc = collectLocalsIf(ix, fnIx)
+    collectByNode = collectByNode - 1
+    return rc
+  }
+  const kids = nodeChildren(ix)
+  let k = 0
+  while k < kids.length {
+    if collectExprArms(kids[k], fnIx) < 0 { return -1 }
+    k = k + 1
+  }
+  0
+}
+
+// Bind the prelude locals of every arm along the chain at `ifIx`, deepest else first.
+export function armPreludeBindChain(ifIx: i32) {
+  const links: i32[] = []
+  let cur = ifIx
+  while cur >= 0 {
+    const s = P.nodes[cur]
+    cur = -1
+    if s is IfStmt {
+      links.push(s.ifThen)
+      if s.ifElse >= 0 {
+        if P.nodes[s.ifElse] is IfStmt {
+          cur = s.ifElse
+        } else {
+          links.push(s.ifElse)
+        }
+      }
+    }
+  }
+  let k = links.length - 1
+  while k >= 0 {
+    armPreludeBind(links[k])
+    k = k - 1
+  }
+  0
+}
+
+// Bind each top-level `let` of the arm block's prelude to the slot the collect pass gave it.
+function armPreludeBind(blockIx: i32) {
+  const b = P.nodes[blockIx]
+  if b is Block {
+    let i = 0
+    while i + 1 < b.blkStmts.length {
+      const d = P.nodes[b.blkStmts[i]]
+      if d is LetDecl {
+        const slot = declSlotOfNode(b.blkStmts[i])
+        if slot >= 0 { scopeBind(d.letName, slot) }
+      }
+      i = i + 1
+    }
+    // An arm whose value is another `if` yields that `if`'s arms, whose locals bind after these.
+    const k = b.blkStmts.length
+    if k > 0 {
+      const tail = unwrapParen(b.blkStmts[k - 1])
+      if tail >= 0 && P.nodes[tail] is IfStmt { armPreludeBindChain(tail) }
+    }
+  }
+  0
+}
+
+// The slot the collect pass gave the `let` at `declIx` in the frame being emitted, or -1.
+export function declSlotOfNode(declIx: i32): i32 {
+  const pinned = declSlotPinned(declIx)
+  if pinned >= 0 { return pinned }
+  let i = 0
+  while i < localDeclIx.length {
+    if localDeclIx[i] == declIx { return i }
+    i = i + 1
+  }
+  -1
+}
+
+// The slot the collect walk pinned to the declaration at `declIx` by node, or -1 when it took
+// its slot off the cursor. A program with no expression-position arm local pins nothing.
+export function declSlotPinned(declIx: i32): i32 {
+  if !exprArmLocalsAny || declIx < 0 { return -1 }
+  declSlotByNode[declIx] ?? -1
+}
+
+// Pin the first slot of the loop at `declIx` to its node when the walk is inside an
+// expression-position if-expression, so the emitter finds the run by node.
+function markByNodeDecl(declIx: i32, pos: i32) {
+  if collectByNode > 0 { declSlotByNode[declIx] = pos }
+  0
+}
+
+// The first node in the subtree at `ix` that binds a local of the function it sits in (a `let`
+// or a loop variable), or -1. A nested function's body binds its own, so the walk stops there.
+export function firstLocalDeclIn(ix: i32): i32 {
+  if ix < 0 || ix >= P.nodes.length { return -1 }
+  const n = P.nodes[ix]
+  if n is LetDecl || n is ForRange || n is ForIn { return ix }
+  if n is FuncDecl { return -1 }
+  let cur = ix
+  while cur >= 0 {
+    const kids = nodeSpineChildren(cur)
+    let k = 0
+    while k < kids.length {
+      const d = firstLocalDeclIn(kids[k])
+      if d >= 0 { return d }
+      k = k + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  -1
+}
+
+// Whether any if-expression in expression position declares a local (`exprArmLocalsAny`):
+// the parser recorded each one (`valueIfNodes`), so this reads that list, not the arena. A
+// statement `if` is walked by `collectLocals` itself.
+export function scanExprArmLocals() {
+  exprArmLocalsAny = false
+  let i = 0
+  while i < valueIfNodes.length {
+    const ix = valueIfNodes[i]
+    if ix >= 0 && ix < P.nodes.length && P.nodes[ix] is IfStmt {
+      if firstLocalDeclIn(ix) >= 0 {
+        exprArmLocalsAny = true
+        return 0
+      }
+    }
+    i = i + 1
+  }
   0
 }
 
@@ -4049,6 +4246,7 @@ export function collectLocalsIf(ifIx: i32, fnIx: i32) {
     const s = P.nodes[cur]
     cur = -1
     if s is IfStmt {
+      if exprArmLocalsAny && collectExprArms(s.ifCond, fnIx) < 0 { return -1 }
       markArmPrelude(s.ifThen)
       if s.ifElse >= 0 { markArmPrelude(s.ifElse) }
       // Narrow `n` to its variant across the then-branch, mirroring `emitStmt`, so a

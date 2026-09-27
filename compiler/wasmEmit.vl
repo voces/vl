@@ -434,6 +434,7 @@ import {
   listGetRecvStagedIx,
   listGetRecvStagedSet,
   listIdxScratchBase,
+  localByNode,
   localDeclIx,
   localIsRef,
   localStructIdx,
@@ -1120,7 +1121,12 @@ import {
   monoInstantiatedAny,
   monoPinnedSigsOf,
 } from "./emit_mono"
-import { fnIndexOfInScopeChain } from "./emit_collect"
+import {
+  armPreludeBindChain,
+  declSlotPinned,
+  firstLocalDeclIn,
+  fnIndexOfInScopeChain,
+} from "./emit_collect"
 import { voidTwinForNode } from "./emit_rewrite"
 import { nameIsQuotedLeaf, splitUnionAtoms } from "./tyname"
 import { monoOrigNode } from "./emit_state"
@@ -5384,6 +5390,14 @@ function emitUnionIfArm(
         // shape to `emitUnionCoerce`; plain `emitUnionCoerce` would emit the raw variant ref.
         return emitIfArmClose(emitUnionBoxArg(body, unionName, tv, fnIx))
       }
+      // An arm ending in an if-expression joins into the same box: its arms are lowered as
+      // this join's own, so every leaf boxes once, whatever the inner `if` alone would type.
+      if P.nodes[unwrapParen(tv)] is IfStmt {
+        if emitIfArmOpen(body, blockIx, fnIx) < 0 { return emitIfArmClose(-1) }
+        return emitIfArmClose(
+          emitUnionIfValue(body, unionName, unwrapParen(tv), fnIx),
+        )
+      }
     }
     return ifArmNoValueFail("union if-expression arm", blockIx)
   }
@@ -5594,6 +5608,13 @@ function emitVariantIfArm(body: u8[], vi: i32, blockIx: i32, fnIx: i32) {
       if stmtIsTailValue(tv, fnIx) {
         if emitIfArmOpen(body, blockIx, fnIx) < 0 { return emitIfArmClose(-1) }
         return emitIfArmClose(emitVariantCoerce(body, vi, tv, fnIx))
+      }
+      // An arm ending in an if-expression joins at the same variant, as the union twin does.
+      if P.nodes[unwrapParen(tv)] is IfStmt {
+        if emitIfArmOpen(body, blockIx, fnIx) < 0 { return emitIfArmClose(-1) }
+        return emitIfArmClose(
+          emitVariantIfValue(body, vi, unwrapParen(tv), fnIx),
+        )
       }
     }
     return ifArmNoValueFail("variant if-expression arm", blockIx)
@@ -6405,6 +6426,21 @@ function emitUnionUnionEq(
     }
   }
   if !unionEqOperandOk(lIx) || !unionEqOperandOk(rIx) {
+    // An operand that cannot be re-read is evaluated once and compared by the staged core,
+    // over the left union's arms: tags are per atom, so a right-hand arm the left lacks
+    // fails the tag test, and a shared tag names the same payload rep on both sides.
+    const sArms: string[] = []
+    const sVis: i32[] = []
+    const sAks: i32[] = []
+    if (
+      lname != ""
+      && rname != ""
+      && unionBoxEqColumns(lname, sArms, sVis, sAks)
+    ) {
+      if emitExpr(body, lIx, fnIx) < 0 { return -1 }
+      if emitExpr(body, rIx, fnIx) < 0 { return -1 }
+      return emitUnionBoxEqStaged(body, sArms, sVis, sAks, isNe, lname, fnIx)
+    }
     return emitFail(
       "emitProgram: union `==` over a non-binding union value is not supported yet",
     )
@@ -14344,26 +14380,91 @@ function emitCondExpr(body: u8[], ix: i32, fnIx: i32) {
 // recurses). Both arms are coerced to the branch-join's scalar rep (a mixed `then 1 else
 // 2.5` widens to f64); a ref-typed join (string/struct/array) routes to `emitIfExprRef` instead, for the multi-byte `(ref $ht)` blocktype a single numeric byte cannot spell.
 function emitIfExpr(body: u8[], ifIx: i32, fnIx: i32) {
-  if ifChainAllBareNull(ifIx) { return emitAllNullIf(body, ifIx, fnIx) }
-  // An atom join lowers every arm in the atom context, whatever rep the arm has alone (D2206).
-  if ifJoinTypedAtom(ifIx) {
+  // The join is classified from its arms' tail values, and a tail naming its own prelude's
+  // local reads that local's slot, bound for the classification alone and popped before any
+  // arm lowers: in a generic instance the checker's type of such a tail is the type parameter.
+  const scoped = armPreludeScopeOpen(ifIx)
+  let how = 0
+  let vt = 127
+  let iun = ""
+  let rk: VKind | null = null
+  let rslot = -1
+  if ifChainAllBareNull(ifIx) {
+    how = 1
+  } else if ifJoinTypedAtom(ifIx) {
+    // An atom join lowers every arm in the atom context, whatever rep the arm has alone (D2206).
+    how = 2
+  } else {
+    // A union-valued join is the box whatever reads it, so it takes the box blocktype here and
+    // not only at a union destination: an inline `(if c { a } else { b }) != null` reads it (D2250).
+    if exprUnion(ifIx, fnIx) { iun = ifJoinUnionName(ifIx) }
+    if iun != "" {
+      how = 3
+    } else {
+      rk = ifExprRefKind(ifIx, fnIx)
+      if rk != null {
+        how = 4
+        rslot = ifExprRefSlot(ifIx, fnIx, rk)
+      } else {
+        vt = ifExprValtype(ifIx, fnIx)
+      }
+    }
+  }
+  if scoped { scopePop() }
+  if how == 1 { return emitAllNullIf(body, ifIx, fnIx) }
+  if how == 2 {
     const savedLU = pendingLitUnion
     pendingLitUnion = 1
     const rcA = emitIfExprAs(body, ifIx, fnIx, 127)
     pendingLitUnion = savedLU
     return rcA
   }
-  // A union-valued join is the box whatever reads it, so it takes the box blocktype here and not
-  // only at a union destination: an inline `(if c { a } else { b }) != null` reads it (D2250).
-  if exprUnion(ifIx, fnIx) {
-    const iun = ifJoinUnionName(ifIx)
-    if iun != "" { return emitUnionIfValue(body, iun, ifIx, fnIx) }
+  if how == 3 { return emitUnionIfValue(body, iun, ifIx, fnIx) }
+  if rk != null { return emitIfExprRef(body, ifIx, fnIx, rk, rslot) }
+  emitIfExprAs(body, ifIx, fnIx, vt)
+}
+
+// Whether any arm of the if-expression at `ifIx` binds a local its tail could name; when so,
+// a scope frame holding each such local's slot is pushed (else arms first, so the then arm's
+// binding of a shared name is the one a read finds). The caller pops it.
+function armPreludeScopeOpen(ifIx: i32): boolean {
+  const any = chainHasPrelude(ifIx)
+  if !any { return false }
+  scopePush()
+  armPreludeBindChain(ifIx)
+  true
+}
+
+// Whether the arm block at `blockIx` has a statement before its value.
+function armHasPrelude(blockIx: i32): boolean {
+  if blockIx < 0 { return false }
+  const b = P.nodes[blockIx]
+  if b is Block {
+    if b.blkStmts.length > 1 { return true }
+    // An arm whose value is another `if` has that `if`'s arm preludes (D2825).
+    if b.blkStmts.length == 1 {
+      const tail = unwrapParen(b.blkStmts[0])
+      if tail >= 0 && P.nodes[tail] is IfStmt { return chainHasPrelude(tail) }
+    }
   }
-  const rk = ifExprRefKind(ifIx, fnIx)
-  if rk != null {
-    return emitIfExprRef(body, ifIx, fnIx, rk, ifExprRefSlot(ifIx, fnIx, rk))
+  false
+}
+
+// Whether any arm along the `if` chain at `ifIx` has a prelude (`armHasPrelude`).
+function chainHasPrelude(ifIx: i32): boolean {
+  let cur = ifIx
+  while cur >= 0 {
+    const s = P.nodes[cur]
+    cur = -1
+    if s is IfStmt {
+      if armHasPrelude(s.ifThen) { return true }
+      if s.ifElse >= 0 {
+        if P.nodes[s.ifElse] is IfStmt { cur = s.ifElse }
+        else if armHasPrelude(s.ifElse) { return true }
+      }
+    }
   }
-  emitIfExprAs(body, ifIx, fnIx, ifExprValtype(ifIx, fnIx))
+  false
 }
 
 // An if-expression every arm of which is a bare `null` (`ifChainAllBareNull`): it runs for its
@@ -14491,9 +14592,9 @@ function emitIfExprRefLink(
 // desugared `match u { A{a} => a }` shape). `emitIfArmOpen` pushes the frame and lowers the prelude; the caller emits the value and closes with `emitIfArmClose`, split in two because each arm emitter lowers the value differently while the prelude and frame are shared.
 
 // Push the arm's lexical frame and lower every statement before the arm's value. Returns
-// 0, or -1 (the caller still owes `emitIfArmClose`). A non-empty prelude is lowered only
-// when `collectLocalsIf` walked this arm (`armPreludeBlocks`) — the walk that allocated the
-// arm's locals; an if-expression the collect pass never descended into is rejected here rather than lowered against slots that belong to something else.
+// 0, or -1 (the caller still owes `emitIfArmClose`). A prelude declaring a local lowers only
+// where `collectLocalsIf` allocated it (`armPreludeBlocks`); any other arm is rejected rather
+// than lowered against slots that belong to something else.
 function emitIfArmOpen(body: u8[], blockIx: i32, fnIx: i32) {
   scopePush()
   armNarrowTops.push(narrowTop)
@@ -14504,7 +14605,7 @@ function emitIfArmOpen(body: u8[], blockIx: i32, fnIx: i32) {
       const decl = armPreludeUnwalkedDecl(blockIx)
       if decl >= 0 {
         return emitFailAt(
-          "emitProgram: an if-expression arm that declares a local is supported only as a binding initializer inside a function",
+          "emitProgram: an if-expression arm declares a local the collect pass did not allocate",
           decl,
         )
       }
@@ -14529,34 +14630,12 @@ function emitIfArmOpen(body: u8[], blockIx: i32, fnIx: i32) {
   0
 }
 
-// The first node of the arm block at `blockIx` that binds a local no pass allocated, or -1. The
-// collect pass allocates an arm's prelude only where the arm is a binding initializer or a
-// `return` operand; an arm anywhere else lowers when its prelude declares nothing.
+// The first node of the arm block at `blockIx` that binds a local no pass allocated, or -1: an
+// arm the collect pass walked, or one whose prelude declares nothing, lowers.
 function armPreludeUnwalkedDecl(blockIx: i32): i32 {
   if blockIx < 0 { return -1 }
   if armPreludeBlocks[blockIx] ?? false { return -1 }
   firstLocalDeclIn(blockIx)
-}
-
-// The first node in the subtree at `ix` that binds a local of the function it sits in (a `let`
-// or a loop variable), or -1. A nested function's body binds its own, so the walk stops there.
-function firstLocalDeclIn(ix: i32): i32 {
-  if ix < 0 || ix >= P.nodes.length { return -1 }
-  const n = P.nodes[ix]
-  if n is LetDecl || n is ForRange || n is ForIn { return ix }
-  if n is FuncDecl { return -1 }
-  let cur = ix
-  while cur >= 0 {
-    const kids = nodeSpineChildren(cur)
-    let k = 0
-    while k < kids.length {
-      const d = firstLocalDeclIn(kids[k])
-      if d >= 0 { return d }
-      k = k + 1
-    }
-    cur = elseIfLink(cur)
-  }
-  -1
 }
 
 // Pop the arm's lexical frame, passing `rc` through so an arm emitter can close and
@@ -14704,6 +14783,17 @@ function emitRefIfArm(
           if nulNicheRecoverOwed(kind, tv, fnIx) { fbRefAsNonNull() }
         }
         return emitIfArmClose(rcV)
+      }
+      // An arm ending in an if-expression the value test declines (an else-less one yields
+      // `null` on its missing path) joins at this rep too, once this frame can hold its null.
+      const inner = unwrapParen(tv)
+      if (
+        inner >= 0
+        && P.nodes[inner] is IfStmt
+        && (nulJoin || !ifLinkYieldsNull(inner))
+      ) {
+        if emitIfArmOpen(body, blockIx, fnIx) < 0 { return emitIfArmClose(-1) }
+        return emitIfArmClose(emitIfExprRef(body, inner, fnIx, kind, slot))
       }
     }
     return ifArmNoValueFail("if-expression arm", blockIx)
@@ -21549,9 +21639,6 @@ function emitUnionRetIfSink(body: u8[], ifIx: i32, fnIx: i32) {
 function emitUnionRetIfSinkLink(body: u8[], ifIx: i32, fnIx: i32, open: i32[]) {
   const s = P.nodes[ifIx]
   if s is IfStmt {
-    if s.ifElse < 0 {
-      return emitFail("emitProgram: union if-expression requires an else arm")
-    }
     if emitCondExpr(body, s.ifCond, fnIx) < 0 { return -1 }
     fbIf(64) // 0x04 if, 0x40 void blocktype
     const savedTop = narrowTop
@@ -21563,9 +21650,13 @@ function emitUnionRetIfSinkLink(body: u8[], ifIx: i32, fnIx: i32, open: i32[]) {
     // A VALUE union narrows to the COMPLEMENT set in the else-arm (see `emitStmt`).
     const savedElseTop = narrowTop
     const narrowedElse = setNarrowFromCondElse(s.ifCond, fnIx)
-    const els = P.nodes[s.ifElse]
     let rc = 0
-    if els is IfStmt {
+    if s.ifElse < 0 {
+      // An else-less `if` yields `null` on its missing path (D2040): that path returns the
+      // function's own null, exiting like every other arm.
+      rc = emitNullForRet(body, fnIx)
+      if rc >= 0 { rc = emitUnionRetSink(fnIx) }
+    } else if P.nodes[s.ifElse] is IfStmt {
       if narrowedElse { open.push(savedElseTop) } else { open.push(-1) }
       return 1 // `else if`: the next link, which the caller emits into this open frame
     } else {
@@ -21803,8 +21894,13 @@ function emitLetDeclStmt(body: u8[], s: LetDecl, stmtIx: i32, fnIx: i32) {
   // `let x = <expr>` / `const x = <expr>`: emit the init, then store it into the local's
   // slot. This `LetDecl`'s slot is the next cursor position, not name-resolved (a name
   // lookup would hit an outer same-named binding still in scope here).
-  const slot = emitLetCursor
-  emitLetCursor = emitLetCursor + 1
+  const slot = declSlotTake(stmtIx, 1)
+  if slot < 0 || slot >= localIsRef.length {
+    return emitFailAt(
+      "emitProgram: a local declaration has no collected slot",
+      stmtIx,
+    )
+  }
   let paramN = 0
   // The START function (`fnIx == -1`, top-level statements) has no params — and no
   // arena node to read, so the lookup must be guarded.
@@ -22347,6 +22443,38 @@ function monoStaticIsGuardOf(condIx: i32, fnIx: i32) {
   -1
 }
 
+// The first of the `n` consecutive slots the declaration at `declIx` owns: the slot the collect
+// walk pinned to its node when it sits in an expression-position if-expression, else the next
+// `n` cursor positions, stepping over every position such a declaration owns (D2785).
+function declSlotTake(declIx: i32, n: i32): i32 {
+  const pinned = declSlotPinned(declIx)
+  if pinned >= 0 { return pinned }
+  if localByNode.length > 0 { cursorSkipByNode() }
+  const first = emitLetCursor
+  emitLetCursor = emitLetCursor + n
+  first
+}
+
+// Step `emitLetCursor` past the positions a by-node declaration owns (`localByNode`).
+function cursorSkipByNode() {
+  while emitLetCursor < localByNode.length && localByNode[emitLetCursor] == 1 {
+    emitLetCursor = emitLetCursor + 1
+  }
+  0
+}
+
+// Advance `emitLetCursor` over `n` cursor-owned positions, as a skipped subtree's declarations
+// would have taken them one by one.
+function cursorAdvance(n: i32) {
+  let k = 0
+  while k < n {
+    cursorSkipByNode()
+    emitLetCursor = emitLetCursor + 1
+    k = k + 1
+  }
+  0
+}
+
 // D932 — the `emitLetCursor` positions that emitting the subtree at `ix` would consume. A
 // dead-arm skip is a control-flow change the locals layout never hears about, since
 // `collectLocals` allocates slots in pre-order over the whole body; every skip below must
@@ -22359,6 +22487,8 @@ function cursorSlotsUnder(ix: i32): i32 {
   if n is LetDecl { cnt = 1 }
   if n is ForRange { cnt = 2 }
   if n is ForIn { cnt = 3 }
+  // A declaration found by node took no cursor position.
+  if declSlotPinned(ix) >= 0 { cnt = 0 }
   // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
   let cur = ix
   while cur >= 0 {
@@ -22739,7 +22869,7 @@ function emitIfLinkStmt(body: u8[], s: IfStmt, fnIx: i32, open: i32[]) {
     if emitStmts(body, s.ifThen, fnIx) < 0 { return -1 }
   } else {
     // D932 — the skipped arm's `let`s still own their collect-allocated slots.
-    emitLetCursor = emitLetCursor + cursorSlotsUnder(s.ifThen)
+    cursorAdvance(cursorSlotsUnder(s.ifThen))
   }
   if narrowed { restoreNarrow(savedTop) }
   if s.ifElse >= 0 && staticGuard != 1 {
@@ -22761,7 +22891,7 @@ function emitIfLinkStmt(body: u8[], s: IfStmt, fnIx: i32, open: i32[]) {
     if narrowedElse { restoreNarrow(savedElseTop) }
   } else if s.ifElse >= 0 {
     // D932 — the statically-dead else arm, same slot accounting as the then skip.
-    emitLetCursor = emitLetCursor + cursorSlotsUnder(s.ifElse)
+    cursorAdvance(cursorSlotsUnder(s.ifElse))
   }
   fbEnd() // 0x0b end
   return 0
@@ -22814,24 +22944,18 @@ function emitWhileStmtStmt(body: u8[], s: WhileStmt, _stmtIx: i32, fnIx: i32) {
   return 0
 }
 
-function emitForRangeStmt(body: u8[], s: ForRange, _stmtIx: i32, fnIx: i32) {
+function emitForRangeStmt(body: u8[], s: ForRange, stmtIx: i32, fnIx: i32) {
   // `for v in A to B [step K] { body }` — a numeric range, lowered to the same block/loop
   // shape as `while`: the loop var and a bound temp take the next two cursor slots, a
   // non-constant step a third (evaluated once). The step's sign picks the exit test (dynamic
   // via `select`); `frExcl` (`until`) makes it strict — `v < B` not `v <= B`, so `0 until 0` is empty.
-  const vSlot = emitLetCursor
-  emitLetCursor = emitLetCursor + 1
-  const bSlot = emitLetCursor
-  emitLetCursor = emitLetCursor + 1
-  // A step that is not a folded constant is evaluated ONCE into a third slot, minted in the
-  // same pre-order the collect pass mints it (`forRangeStepIsConst` is shared, or the two
-  // cursors disagree and every later local is off by one).
   const dynStep = !forRangeStepIsConst(s.frStep)
+  let nSlots = 2
+  if dynStep { nSlots = 3 }
+  const vSlot = declSlotTake(stmtIx, nSlots)
+  const bSlot = vSlot + 1
   let sSlot = -1
-  if dynStep {
-    sSlot = emitLetCursor
-    emitLetCursor = emitLetCursor + 1
-  }
+  if dynStep { sSlot = vSlot + 2 }
   let paramN = 0
   if fnIx >= 0 {
     const fn = P.nodes[fnIx]
@@ -23476,7 +23600,7 @@ function stmtAssignsName(ix: i32, nm: string): boolean {
   false
 }
 
-function emitForInStmt(body: u8[], s: ForIn, _stmtIx: i32, fnIx: i32) {
+function emitForInStmt(body: u8[], s: ForIn, stmtIx: i32, fnIx: i32) {
   // `for v[, w] in <list> { body }` — iterate an i32 list, a string list, a struct ref list,
   // or a map's ordered keys/values list. Cursor slots in collect pre-order: the element var
   // `v`, a hidden cursor `v#i`, a hidden list temp `v#l` (the iterable evaluates once), and
@@ -23496,20 +23620,16 @@ function emitForInStmt(body: u8[], s: ForIn, _stmtIx: i32, fnIx: i32) {
   if u8Src && !ba8Used {
     return emitFail("emitProgram: u8 for-in but u8 list type not collected")
   }
-  const vSlot = emitLetCursor
-  emitLetCursor = emitLetCursor + 1
-  const iSlot = emitLetCursor
-  emitLetCursor = emitLetCursor + 1
-  const lSlot = emitLetCursor
-  emitLetCursor = emitLetCursor + 1
   // The SECOND name's slot, minted last in the same pre-order the collect pass mints it.
   const pairName = s.fiVar2
   const hasPair = pairName != ""
+  let nSlots = 3
+  if hasPair { nSlots = 4 }
+  const vSlot = declSlotTake(stmtIx, nSlots)
+  const iSlot = vSlot + 1
+  const lSlot = vSlot + 2
   let pSlot = -1
-  if hasPair {
-    pSlot = emitLetCursor
-    emitLetCursor = emitLetCursor + 1
-  }
+  if hasPair { pSlot = vSlot + 3 }
   let paramN = 0
   if fnIx >= 0 {
     const fn = P.nodes[fnIx]
@@ -24089,7 +24209,7 @@ export function emitFuncBody(body: u8[], blockIx: i32, fnIx: i32) {
         // otherwise bind one slot early. See `cursorSlotsUnder`.
         let cutAt = i + 1
         while cutAt < n {
-          emitLetCursor = emitLetCursor + cursorSlotsUnder(stmts[cutAt])
+          cursorAdvance(cursorSlotsUnder(stmts[cutAt]))
           cutAt = cutAt + 1
         }
         i = n
@@ -24143,7 +24263,7 @@ function emitStmts(body: u8[], blockIx: i32, fnIx: i32) {
         // D932 — slot accounting over the truncated tail; see `cursorSlotsUnder`.
         let cutAt = i + 1
         while cutAt < stmts.length {
-          emitLetCursor = emitLetCursor + cursorSlotsUnder(stmts[cutAt])
+          cursorAdvance(cursorSlotsUnder(stmts[cutAt]))
           cutAt = cutAt + 1
         }
         i = stmts.length
@@ -24188,7 +24308,7 @@ function emitStmtsTail(body: u8[], blockIx: i32, fnIx: i32) {
         // statement included); see `cursorSlotsUnder`.
         let cutAt = i + 1
         while cutAt < n {
-          emitLetCursor = emitLetCursor + cursorSlotsUnder(stmts[cutAt])
+          cursorAdvance(cursorSlotsUnder(stmts[cutAt]))
           cutAt = cutAt + 1
         }
         cut = true
@@ -24275,7 +24395,7 @@ function emitIfLinkTail(body: u8[], s: IfStmt, fnIx: i32, open: i32[]) {
   if staticGuard != 0 {
     if emitStmtsTail(body, s.ifThen, fnIx) < 0 { return -1 }
   } else {
-    emitLetCursor = emitLetCursor + cursorSlotsUnder(s.ifThen)
+    cursorAdvance(cursorSlotsUnder(s.ifThen))
   }
   if narrowed { restoreNarrow(savedTop) }
   if s.ifElse >= 0 && staticGuard != 1 {
@@ -24296,7 +24416,7 @@ function emitIfLinkTail(body: u8[], s: IfStmt, fnIx: i32, open: i32[]) {
     }
     if narrowedElse { restoreNarrow(savedElseTop) }
   } else if s.ifElse >= 0 {
-    emitLetCursor = emitLetCursor + cursorSlotsUnder(s.ifElse)
+    cursorAdvance(cursorSlotsUnder(s.ifElse))
   }
   fbEnd() // 0x0b end
   return 0
