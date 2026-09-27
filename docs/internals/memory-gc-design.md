@@ -11,8 +11,8 @@ choice belongs. Companion to `DECISIONS.md` ("Allocation = WasmGC") and
   heap itself — costs a hand-written tracing collector *plus* a shadow stack on every
   call (wasm exposes no way to scan a frame's locals), and it discards the wasm
   validator as VL's memory-safety proof. That is a bad trade for the common case.
-- **Linear memory is becoming a design, but is not one yet.** Seventeen memory
-  builtins are declared in the checker; fifteen are lowered. Since the webcraft P0.2
+- **Linear memory is becoming a design, but is not one yet.** Twenty memory
+  builtins are declared in the checker; eighteen are lowered. Since the webcraft P0.2
   slice it has a full LOAD width matrix, `memory.grow`/`memory.size`, and an exported
   memory — so it is no longer a fixed 64 KiB scratch page a host cannot see — and the
   three WIDE store widths have since landed, so every scalar VL has round-trips at its
@@ -62,13 +62,15 @@ Linear memory in VL predates the WasmGC decision and was never revisited. Curren
 state, verified against `compiler/typecheck.vl`, `compiler/wasmEmit.vl` and
 `compiler/emit_sections.vl`:
 
-- **Seventeen builtins are declared** in the checker's default scope: `__store_i32__`,
+- **Twenty builtins are declared** in the checker's default scope: `__store_i32__`,
   `__store_i64__`, `__store_f32__`, `__store_f64__`, `__load_i32__`,
   `__store_string__`, `__log_string__`, `__log__`, `__memory_grow__`,
-  `__memory_size__`, and the seven load widths `__load_i8__`, `__load_u8__`,
-  `__load_i16__`, `__load_u16__`, `__load_i64__`, `__load_f32__`, `__load_f64__`.
-- **Fifteen are lowered** by the emitter: `__store_i32__`, `__load_i32__`, `__log__`,
-  the seven load widths, the three WIDE store widths (`__store_i64__` → `i64.store`,
+  `__memory_size__`, and the ten load widths `__load_i8__`, `__load_u8__`,
+  `__load_i16__`, `__load_u16__`, `__load_i64__`, `__load_f32__`, `__load_f64__`, and
+  the zero-extending i64 trio `__load_u8_i64__`, `__load_u16_i64__`, `__load_u32_i64__`
+  (`i64.load{8,16,32}_u`; `buffer-design.md` §H2).
+- **Eighteen are lowered** by the emitter: `__store_i32__`, `__load_i32__`, `__log__`,
+  the ten load widths, the three WIDE store widths (`__store_i64__` → `i64.store`,
   `__store_f32__` → `f32.store`, `__store_f64__` → `f64.store`), `__memory_size__` and
   `__memory_grow__`.
   The other **two have no emitter arm**: `__store_string__` and `__log_string__`.
