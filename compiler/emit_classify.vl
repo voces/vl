@@ -34447,12 +34447,10 @@ function dsDestSlotAt(i: i32, nm: string, fnIx: i32, want: i32): i32 {
         const arg = P.nodes[unwrapParen(nd.callArgs[ai])]
         if arg is Ident {
           if arg.identName == nm {
-            // A local lambda shadows a top-level function of its name, so it is asked first.
-            const lam = dsCalleeLambdaOf(callee.identName, i, fnIx)
-            if lam >= 0 {
-              const ls = fnDeclParamKindListSlot(lam, ai, want)
-              if ls >= 0 { return ls }
-            } else {
+            // A binding in scope shadows a top-level function of its name, so it is asked first.
+            const bs = dsCalleeParamSlot(callee.identName, i, fnIx, ai, want)
+            if bs >= 0 { return bs }
+            if bs == DS_CALLEE_UNBOUND {
               const rs = fnParamKindListSlot(callee.identName, ai, want)
               if rs >= 0 { return rs }
             }
@@ -34873,22 +34871,79 @@ function fnDeclParamKindListSlot(fdIx: i32, argIx: i32, want: i32): i32 {
   -1
 }
 
-// The lambda a call's callee name is bound to at `callIx` — a local `const k = (…) => …` of
-// the frame `fnIx`, else a module global's — or -1 when the name binds no lambda there.
-function dsCalleeLambdaOf(name: string, callIx: i32, fnIx: i32): i32 {
-  let li = -1
-  if fnIx >= 0 {
+// `dsCalleeParamSlot`'s answer when no binding in scope names the callee, so the name can
+// only denote a top-level function.
+const DS_CALLEE_UNBOUND = -2
+
+// The ref-list slot of kind `want` that parameter `argIx` of the callee `name` declares, where
+// `name` is a binding in scope at `callIx` inside frame `fnIx`: a lambda-valued `const`, a
+// function-typed parameter or annotation, or a `const` naming a top-level function. -1 when
+// the binding declares none; `DS_CALLEE_UNBOUND` when nothing in scope binds `name` (D2696).
+function dsCalleeParamSlot(
+  name: string,
+  callIx: i32,
+  fnIx: i32,
+  argIx: i32,
+  want: i32,
+): i32 {
+  let b = -1
+  if fnIx >= 0 && fnIx < P.nodes.length {
     const fn = P.nodes[fnIx]
-    if fn is FuncDecl { li = parentLetOfAt(fn.fnBody, sidOf(name), callIx) }
+    if fn is FuncDecl { b = parentLetOfAt(fn.fnBody, sidOf(name), callIx) }
   }
-  if li < 0 { li = globalLetOf(name) }
-  if li < 0 || li >= P.nodes.length { return -1 }
-  const d = P.nodes[li]
-  if d is LetDecl {
-    if d.letInit < 0 { return -1 }
-    const ini = unwrapParen(d.letInit)
-    if ini < 0 || ini >= P.nodes.length { return -1 }
-    if P.nodes[ini] is FuncDecl { return ini }
+  if b < 0 { b = identBindingNoLocal(fnIx, name) }
+  if b < 0 { b = globalLetOf(name) }
+  if b < 0 || b >= P.nodes.length { return DS_CALLEE_UNBOUND }
+  const bn = P.nodes[b]
+  if bn is Param { return fnTyAnnParamKindListSlot(bn.parType, argIx, want) }
+  dsLetCalleeParamSlot(b, fnIx, argIx, want)
+}
+
+// `dsCalleeParamSlot` for a callee bound by the `LetDecl` at `b`: its function-type
+// annotation, else a lambda initializer's own parameter, else an alias's; -1 for any other
+// binding (a `for` variable, a let bound to a value this scan cannot follow).
+function dsLetCalleeParamSlot(b: i32, fnIx: i32, argIx: i32, want: i32): i32 {
+  const d = P.nodes[b]
+  if !(d is LetDecl) { return -1 }
+  if d.letType >= 0 { return fnTyAnnParamKindListSlot(d.letType, argIx, want) }
+  if d.letInit < 0 { return -1 }
+  const ini = unwrapParen(d.letInit)
+  if ini < 0 || ini >= P.nodes.length { return -1 }
+  if P.nodes[ini] is FuncDecl {
+    return fnDeclParamKindListSlot(ini, argIx, want)
+  }
+  dsAliasCalleeParamSlot(ini, fnIx, argIx, want)
+}
+
+// A `const k = sum` alias: the top-level function it names, when no scope around `fnIx`
+// rebinds that name; -1 for any other initializer.
+function dsAliasCalleeParamSlot(
+  ini: i32,
+  fnIx: i32,
+  argIx: i32,
+  want: i32,
+): i32 {
+  const iv = P.nodes[ini]
+  if iv is Ident {
+    if nameFreeToModule(fnIx, iv.identName) {
+      return fnParamKindListSlot(iv.identName, argIx, want)
+    }
+  }
+  -1
+}
+
+// The ref-list slot of kind `want` that parameter `argIx` of the function-type annotation
+// node `tyNodeIx` (`(Shape[]) => i32`) names, read off its recorded type; -1 otherwise.
+function fnTyAnnParamKindListSlot(tyNodeIx: i32, argIx: i32, want: i32): i32 {
+  if tyNodeIx < 0 { return -1 }
+  const ft = nodeTyIxOf(tyNodeIx)
+  if ft < 0 || ft >= T.tys.length { return -1 }
+  const t = T.tys[ft]
+  if t is TyFunc {
+    if argIx < t.fnParamTypes.length {
+      const rs = rlSlotOfTy(tyRefArrElemOf(t.fnParamTypes[argIx]))
+      if rlSlotIsKindList(rs, want) { return rs }
+    }
   }
   -1
 }
