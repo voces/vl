@@ -257,7 +257,9 @@ import {
   globalCellIsImmutable,
   ifArmValueExpr,
   letIsF32,
+  paramIndexOf,
   paramNulString,
+  paramTypeNode,
 } from "./emit_query"
 import {
   FC_CLOSURE,
@@ -313,6 +315,7 @@ import {
   f32PushScratchBase,
   f64PushScratchBase,
   fRetKind,
+  fRetRArrElem,
   fRetStructIdx,
   fRetVoid,
   fa32TypeIdx,
@@ -14451,20 +14454,36 @@ function ifArmNoValueFail(what: string, blockIx: i32) {
   )
 }
 
-// Seed an empty `[]` returned from the un-annotated function at `fnPos` with that function's
-// inferred list kind. Inside a generic instance the literal's recorded type is the template's
-// `T[]`, which names no rep, while the instance's return kind does (D2209).
-function emptyArrRetSeedFromKind(retArg: i32, fnPos: i32) {
-  const ra = P.nodes[unwrapParen(retArg)]
-  if ra is ArrayLit {
-    if ra.arrElems.length != 0 { return 0 }
-  } else {
-    return 0
+// The `Param` node an assignment to `name` inside `fnIx` writes, or -1 when a live local
+// shadows it or no parameter has that name.
+function assignParamNode(fnIx: i32, name: string): i32 {
+  if fnIx < 0 || fnIx >= P.nodes.length { return -1 }
+  if paramTypeNode(fnIx, name) < 0 { return -1 }
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    const pi = paramIndexOf(fnIx, name)
+    if pi >= 0 && pi < fn.fnParams.length { return fn.fnParams[pi] }
   }
+  -1
+}
+
+// Seed an array literal returned from the un-annotated function at `fnPos` with that
+// function's inferred list kind, as an annotation seeds it. An empty `[]` inside a generic
+// instance records the template's `T[]` (D2209); a `return ["s"]` beside a `return [1, "s"]`
+// records `string[]` while the joined result is `(i32 | string)[]` (D2716).
+function arrLitRetSeedFromKind(retArg: i32, fnPos: i32) {
+  const ra = P.nodes[unwrapParen(retArg)]
+  if !(ra is ArrayLit) { return 0 }
   if fnPos < 0 || fnPos >= fRetKind.length || fnPos >= fRetStructIdx.length {
     return 0
   }
-  const rs = fRetStructIdx[fnPos]
+  let rs = fRetStructIdx[fnPos]
+  // A non-empty literal's ref-list row is the one the result valtype names, by element name.
+  if ra is ArrayLit {
+    if ra.arrElems.length > 0 && fnPos < fRetRArrElem.length {
+      if fRetKind[fnPos] == "reflist" { rs = rlSlotByName(fRetRArrElem[fnPos]) }
+    }
+  }
   const jk = listBuildKindOfVKind(fRetKind[fnPos], rs)
   if jk == 0 { return 0 }
   pendingListKind = jk
@@ -14502,11 +14521,11 @@ function emitRefIfArm(
           pendingListKind = 5
           pendingListSlot = slot
         }
-        // An empty `[]` arm is built at the join's list rep, which its own recorded type can
-        // miss inside a generic instance (D2209).
+        // An array-literal arm is built at the join's list rep, which its own recorded type
+        // can miss: an empty `[]` inside a generic instance (D2209), a `[2]` beside a `[1.5]` (D2716).
         const ea = P.nodes[unwrapParen(tv)]
         if ea is ArrayLit {
-          if ea.arrElems.length == 0 && kind != "reflist" {
+          if kind != "reflist" {
             const jk = listBuildKindOfVKind(kind, slot)
             if jk != 0 { pendingListKind = jk }
           }
@@ -17873,6 +17892,17 @@ function emitAssign(body: u8[], binIx: i32, fnIx: i32) {
           const asSi = structIndexOfExpr(lhsIx, fnIx)
           if asSi >= 0 { asCtx.structIdx = asSi }
         }
+        // A struct cell seeds its own row, as its declaration does, so an object-literal RHS
+        // or `if` arm builds the cell's struct rather than the literal's shape twin (D2730).
+        if identCellVKind(lhsIx, fnIx) == "struct" {
+          const asPn = assignParamNode(fnIx, target.identName)
+          const asSs = identCellSlot(lhsIx)
+          if asPn >= 0 {
+            asCtx.structIdx = paramStructIdxOf(asPn)
+          } else if asSs >= 0 && asSs < localStructIdx.length {
+            asCtx.structIdx = localStructIdx[asSs]
+          }
+        }
         const asNSK = exprNulScalarListKind(lhsIx, fnIx)
         if asNSK != null {
           asCtx.listKind = nulScalarListBuildKind(asNSK)
@@ -20652,7 +20682,7 @@ function emitReturnValue(body: u8[], retArg: i32, fnIx: i32) {
         pendingListKind = hbk
         pendingListSlot = emptyArrHoleBuildSlot(retArg)
       } else {
-        emptyArrRetSeedFromKind(retArg, fnPos)
+        arrLitRetSeedFromKind(retArg, fnPos)
       }
     }
   }
