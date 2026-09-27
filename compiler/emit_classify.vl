@@ -108,6 +108,9 @@ import {
   joinRowTy,
   letNullHoleUnfilled,
   litUnionAliasNameOfTy,
+  mapDeliveryRecorded,
+  mapRetagAllRows,
+  mapUnboxTyOf,
   mapValIsI32Cell,
   mapValSoftBase,
   nameIsEmitterIntrinsic,
@@ -510,6 +513,8 @@ import {
   mIntMonoArmUsed,
   mTwinCodes,
   mTwinExtra,
+  mTwinRetagMemo,
+  mTwinSettled,
   mTwinShapes,
   mTwinTys,
   mUsed,
@@ -12141,6 +12146,8 @@ export function moduleHasUnionAs(): boolean {
   // Memoised on an arena prefix (never a plain boolean): asked once per emitted function,
   // so a full rescan on every call would cost noticeably more self-compile time.
   if modUnionAsHit { return true }
+  // A box retagged on delivery stages in the same slot (`emitMapRetag`).
+  if mTwinSettled && mapRetagAnyEmitted() { return true }
   let i = modUnionAsSeen
   while i < P.nodes.length {
     if asExprIsUnionCast(i) {
@@ -22460,6 +22467,9 @@ export function repMapValSlotsTwin(a: i32, b: i32): i32 {
   // without this the inner merge lands but the outer map keeps two structs. Hoisted rather
   // than widened: the arm is unchanged, only the canonical-key precondition is dropped.
   if k == 6 && rlSlotsLayoutTwin(mvRlSlot[a], mvRlSlot[b]) == 1 { return 1 }
+  // Every union value is the one shared box ref, whatever its members, so two union-valued
+  // slots of one key rep are one vals list and one map struct.
+  if k == 2 { return 1 }
   const ka = mvValTwinCanonId(a)
   if ka < 0 { return 0 }
   if ka != mvValTwinCanonId(b) { return 0 }
@@ -26146,15 +26156,16 @@ export function mapSlotTag(slot: i32) {
 }
 
 // Registers the union arm `ty`, a map of folded shape `sh`, in the same-struct family table:
-// the first type of a mono shape keeps the shape's tag, each further distinct type claims a
-// code above the value-atom band. Only a type the band has not yet been sized for is refused.
+// the first type of a struct keeps the shape's tag, each further distinct type claims a code
+// above the value-atom band. Only a type the band has not yet been sized for is refused.
 export function mapTwinNote(tyIn: i32, sh: i32) {
   const ty = unMemPeelAliasWrapper(tyIn)
-  if ty < 0 || !mapShapeIsMono(sh) || !mapArmIsI32Cell(ty) { return 0 }
+  if ty < 0 || !mapTwinShapeHolds(sh, ty) { return 0 }
+  if sh >= 0 && !mTwinSettled { return mapTwinNoteSlot(ty, sh) }
   let first = true
   let i = 0
   while i < mTwinTys.length {
-    if mTwinShapes[i] == sh {
+    if mapTwinOneStruct(mTwinShapes[i], sh) {
       if mapTwinSame(mTwinTys[i], ty) { return 0 }
       first = false
     }
@@ -26173,6 +26184,106 @@ export function mapTwinNote(tyIn: i32, sh: i32) {
   }
   mTwinTys.push(ty)
   mTwinShapes.push(sh)
+  0
+}
+
+// Records the value-slot arm `ty` of shape `sh`, once per type, with no code yet: which slots
+// emit one struct is settled when collection ends (`mapTwinSettle`).
+function mapTwinNoteSlot(ty: i32, sh: i32) {
+  let i = 0
+  while i < mTwinTys.length {
+    if mTwinShapes[i] == sh && mapTwinSame(mTwinTys[i], ty) { return 0 }
+    i = i + 1
+  }
+  mTwinTys.push(ty)
+  mTwinShapes.push(sh)
+  mTwinCodes.push(-1)
+  0
+}
+
+// The tag pairs a retag rows' types need, pushed onto `fromTags`/`toTags`: one per row whose
+// two maps share a struct and whose tags differ; a row of two structs is left as it is boxed.
+export function mapRetagTagPairs(
+  from: i32[],
+  to: i32[],
+  fromTags: i32[],
+  toTags: i32[],
+) {
+  let i = 0
+  while i < from.length {
+    const fs = mapShapeFoldSet(mapArmShapeOfTy(from[i]))
+    const ts = mapShapeFoldSet(mapArmShapeOfTy(to[i]))
+    if mapTwinOneStruct(fs, ts) {
+      const ft = mapArmTagOfTy(from[i], fs)
+      const tt = mapArmTagOfTy(to[i], ts)
+      if ft >= 0 && tt >= 0 && ft != tt {
+        fromTags.push(ft)
+        toTags.push(tt)
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// Whether any delivery in the program retags a box (`mapRetagTagPairs` over every row).
+function mapRetagAnyEmitted(): boolean {
+  if mTwinRetagMemo >= 0 { return mTwinRetagMemo == 1 }
+  mTwinRetagMemo = 0
+  const from: i32[] = []
+  const to: i32[] = []
+  mapRetagAllRows(from, to)
+  const ft: i32[] = []
+  const tt: i32[] = []
+  mapRetagTagPairs(from, to, ft, tt)
+  if ft.length > 0 { mTwinRetagMemo = 1 }
+  ft.length > 0
+}
+
+// Drops the value-slot rows: they name slots of the mv tables, which a collect pass is about to
+// clear and re-intern. Mono rows name no slot and keep their codes.
+export function mapTwinDropSlots() {
+  const tys: i32[] = []
+  const shapes: i32[] = []
+  const codes: i32[] = []
+  let i = 0
+  while i < mTwinTys.length {
+    if mTwinShapes[i] < 0 {
+      tys.push(mTwinTys[i])
+      shapes.push(mTwinShapes[i])
+      codes.push(mTwinCodes[i])
+    }
+    i = i + 1
+  }
+  mTwinTys = tys
+  mTwinShapes = shapes
+  mTwinCodes = codes
+  0
+}
+
+// Groups the value-slot rows by the struct each emits: the first type of a struct keeps its
+// slot's tag and every other claims a code of its own. Runs once, before any tag is read.
+export function mapTwinSettle() {
+  mTwinSettled = true
+  let i = 0
+  while i < mTwinTys.length {
+    const sh = mTwinShapes[i]
+    if sh >= 0 {
+      let first = true
+      let j = 0
+      while j < i {
+        if mTwinShapes[j] >= 0 && mapTwinOneStruct(mTwinShapes[j], sh) {
+          first = false
+        }
+        j = j + 1
+      }
+      if !first {
+        mTwinCodes[i] = mTwinExtra
+        mTwinExtra = mTwinExtra + 1
+      }
+    }
+    i = i + 1
+  }
   0
 }
 
@@ -26210,6 +26321,21 @@ function mapArmIsI32Cell(ty: i32): boolean {
 // Whether a folded map shape is one of the three mono structs a slot does not name.
 function mapShapeIsMono(sh: i32): boolean { sh == -1 || sh == -4 || sh == -6 }
 
+// Whether two folded shapes name one map struct: two value slots that are canonical twins
+// (a nullable-ref value and its non-null twin store alike), or one mono shape. A mono shape is
+// compared as it stands, so collection never asks a value slot's struct before it is settled.
+export function mapTwinOneStruct(a: i32, b: i32): boolean {
+  if a < 0 || b < 0 { return a == b }
+  mvCanonRepOf(a) == mvCanonRepOf(b)
+}
+
+// Whether the map `ty` of folded shape `sh` can share its struct with another map type: any
+// map with a value slot, or a mono map whose value is one i32 cell.
+function mapTwinShapeHolds(sh: i32, ty: i32): boolean {
+  if sh >= 0 { return true }
+  mapShapeIsMono(sh) && mapArmIsI32Cell(ty)
+}
+
 // Whether two map arm types are the one member: the checker's type equality, alias peeled. A
 // union spells `Set<K>` as the boolean map, so the two are one atom and one member (D2673).
 export function mapTwinSame(a: i32, b: i32): boolean {
@@ -26239,10 +26365,12 @@ function mapSetSpelledAs(s: i32, m: i32): boolean {
 // Whether the module's unions hold two map types of the folded shape `sh`, so a box of that
 // shape tags by member type rather than by shape.
 export function mapShapeTwinned(sh: i32): boolean {
-  if mTwinExtra == 0 || !mapShapeIsMono(sh) { return false }
+  if mTwinExtra == 0 || !(sh >= 0 || mapShapeIsMono(sh)) { return false }
   let i = 0
   while i < mTwinTys.length {
-    if mTwinShapes[i] == sh && mTwinCodes[i] >= 0 { return true }
+    if mTwinCodes[i] >= 0 && mapTwinOneStruct(mTwinShapes[i], sh) {
+      return true
+    }
     i = i + 1
   }
   false
@@ -26260,7 +26388,7 @@ export function mapArmTagOfTy(ty: i32, sh: i32): i32 {
   if !mapShapeTwinned(sh) { return mapSlotTag(sh) }
   let i = 0
   while i < mTwinTys.length {
-    if mTwinShapes[i] == sh && mapTwinSame(mTwinTys[i], ty) {
+    if mapTwinOneStruct(mTwinShapes[i], sh) && mapTwinSame(mTwinTys[i], ty) {
       if mTwinCodes[i] < 0 { return mapSlotTag(sh) }
       return scalarTagOfKind(17 + mTwinCodes[i])
     }
@@ -36446,6 +36574,8 @@ function frameBindsName(fnIx: i32, name: string) {
 // expression.
 export function exprMap(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return false }
+  // A union of maps delivered as one map reads as that map (`emitMapUnionPayload`).
+  if mapDeliveryRecorded && mapUnboxTyOf(exprIx) >= 0 { return true }
   const e = P.nodes[exprIx]
   if e is Paren { return exprMap(e.parInner, fnIx) }
   // A value `if` whose join lowers at the map rep (D2663).
@@ -37007,6 +37137,10 @@ function letMapDestShape(letIx: i32, fnIx: i32): i32 {
 // params stay mono-only — a ref-valued map cannot cross a call boundary.
 export function mapShapeOfExpr(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return -1 }
+  if mapDeliveryRecorded {
+    const mub = mapUnboxTyOf(exprIx)
+    if mub >= 0 { return mapArmShapeOfTy(mub) }
+  }
   const e = P.nodes[exprIx]
   if e is Paren { return mapShapeOfExpr(e.parInner, fnIx) }
   if e is BinExpr {
