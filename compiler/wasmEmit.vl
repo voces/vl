@@ -749,6 +749,7 @@ import {
   exprListCellBuildKind,
   exprListCellBuildSlot,
   exprMap,
+  exprNarrowedToNull,
   exprNulBool,
   exprNulClosure,
   exprNulLitUnion,
@@ -17253,6 +17254,9 @@ function emitCallCore(body: u8[], callIx: i32, fnIx: i32) {
           if emitNulNoneForEffect(body, c.callArgs[0], fnIx) < 0 { return -1 }
           return emitPrintNullWord()
         }
+        // A read the active narrowing pins to `null` holds the null whatever its cell's rep,
+        // so it prints the word; every ladder below would unbox an arm it does not hold (D2801).
+        if exprNarrowedToNull(c.callArgs[0]) { return emitPrintNullWord() }
         const pmk = mapReadScalarBoxKind(c.callArgs[0], fnIx)
         if pmk >= 0 {
           return emitPrintScalarMapRead(body, c.callArgs[0], pmk, fnIx)
@@ -27781,6 +27785,25 @@ function emitCoalesceScalarDefault(
   emitExpr(body, defIx, fnIx)
 }
 
+// The default of `??` alone, at the coalesce's rep: a numeric scalar widened like the box arm's
+// default, a value union coerced into its box, anything else as the default emits itself.
+function emitCoalesceDefaultAtRep(
+  body: u8[],
+  e: BinExpr,
+  exprIx: i32,
+  fnIx: i32,
+) {
+  const dk = valueAtomKind(tyToEmitName(nodeTyIxOf(exprIx)))
+  if nulBoxScalarValtype(dk) >= 0 {
+    return emitCoalesceScalarDefault(body, e.binRight, dk, fnIx)
+  }
+  if exprUnion(exprIx, fnIx) {
+    const dNm = unionNameOfExpr(exprIx, fnIx)
+    if dNm != "" { return emitUnionCoerce(body, dNm, e.binRight, fnIx) }
+  }
+  emitExpr(body, e.binRight, fnIx)
+}
+
 function emitCoalesceGo(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
   // Unwrap a parenthesized lhs so `(m[k]) ?? d` / `(m.get(k)) ?? d` take the same fused
   // map-get path as the bare forms — parens must not change `??` semantics. `lhsIx` is the
@@ -27813,6 +27836,11 @@ function emitCoalesceGo(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
   if exprIsNulNone(lhsIx, fnIx) {
     if emitNulNoneForEffect(body, lhsIx, fnIx) < 0 { return -1 }
     return emitExpr(body, e.binRight, fnIx)
+  }
+  // Its mirror under a narrowing: a read pinned to `null` selects the default, delivered at the
+  // coalesce's own rep since its cell's rep is the nullable one (D2801).
+  if exprNarrowedToNull(lhsIx) {
+    return emitCoalesceDefaultAtRep(body, e, exprIx, fnIx)
   }
   // A narrowing that excludes null makes the default dead: `x ?? d` is `x` there, and the
   // read is the only lowering whose rep can be right. Every niche arm below evaluates its lhs

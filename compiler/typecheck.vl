@@ -708,6 +708,8 @@ let dJoinTy: i32[] = []
 let escJoinTy: i32[] = []
 let escJoinIx: i32[] = []
 let escJoinWho: string[] = []
+// The body each join escaped inside (`cstrOwnerTop`), -1 at module scope (D2805).
+let escJoinFn: i32[] = []
 
 // Deferred binary-op constraints over un-annotated-param holes: with a hole operand, `a + b` /
 // `s + "!"` / `n < 2` cannot be decided in the body, a hole being permissively assignable to
@@ -4484,6 +4486,7 @@ export function initChecker() {
   escJoinTy = []
   escJoinIx = []
   escJoinWho = []
+  escJoinFn = []
   binCstrLt = []
   binCstrOp = []
   binCstrRt = []
@@ -30944,16 +30947,21 @@ function noteEscJoin(ty: i32, ix: i32, who: string) {
   escJoinTy.push(ty)
   escJoinIx.push(ix)
   escJoinWho.push(who)
+  escJoinFn.push(cstrOwnerTop())
   0
 }
 
-// Re-validates every escaped deferred join this call's bindings decide. A join that re-folds
-// to a single type collapsed faithfully — the common case where every arm agrees for this
-// argument. One that re-folds to a genuine multi-member union did not, and rejects at the
+// Re-validates every escaped join inside the body `calleeFn` instantiates; a join at module
+// scope names holes no later call binds. One that re-folds to a single type collapsed
+// faithfully; one that re-folds to a genuine multi-member union did not, and rejects at the
 // inner call, naming both the callee and the union its arms resolve to.
-function validateEscJoins(bNames: string[], bTys: i32[]) {
+function validateEscJoins(bNames: string[], bTys: i32[], calleeFn: i32) {
   let ci = 0
   while ci < escJoinTy.length {
+    if escJoinFn[ci] < 0 || !cstrOwnedBy(escJoinFn[ci], calleeFn) {
+      ci = ci + 1
+      continue
+    }
     const rj = substTyDeep(escJoinTy[ci], bNames, bTys)
     if rj != escJoinTy[ci] && !tyIsHole(rj) && !tyIsDeferredJoin(rj) {
       const rt = T.tys[rj]
@@ -32454,6 +32462,71 @@ export function bindGenWalk(
   }
   bgSrcStack.pop()
   bgDstStack.pop()
+  0
+}
+
+// The union arm `bindGenWalk` lacks, into bindings of its own: a parameter `T | string` binds its
+// one open member to the argument's members no concrete member admits (`R` at `string | R`).
+// Only the call's deferred checks read them, so the pin is held to the body (D2803).
+function bindGenUnionArm(expIx: i32, atIx: i32, uNames: string[], uTys: i32[]) {
+  if expIx < 0 || atIx < 0 { return 0 }
+  if !(T.tys[expIx] is TyUnion) { return 0 }
+  const gms: i32[] = []
+  flattenVariantsInto(expIx, gms)
+  let open = -1
+  let i = 0
+  while i < gms.length {
+    if gms[i] >= 0 && tyHasTyVar(gms[i]) {
+      if open >= 0 { return 0 }
+      open = gms[i]
+    }
+    i = i + 1
+  }
+  if open < 0 { return 0 }
+  if !(T.tys[open] is TyVar) { return 0 }
+  const pms: i32[] = []
+  flattenVariantsInto(atIx, pms)
+  const rest: i32[] = []
+  let k = 0
+  while k < pms.length {
+    if pms[k] < 0 || tyHasTyVar(pms[k]) { return 0 }
+    let covered = false
+    let m = 0
+    while m < gms.length && !covered {
+      if gms[m] != open && assignable(pms[k], gms[m]) { covered = true }
+      m = m + 1
+    }
+    if !covered { rest.push(pms[k]) }
+    k = k + 1
+  }
+  if rest.length == 0 { return 0 }
+  bindGenWalk(open, tyOfMembers(rest), uNames, uTys)
+}
+
+// The call's bindings with each union-arm binding whose name the call left unbound appended:
+// what the deferred checks judge the body at.
+function withUnionArmBinds(
+  bNames: string[],
+  bTys: i32[],
+  uNames: string[],
+  uTys: i32[],
+  outN: string[],
+  outT: i32[],
+) {
+  let i = 0
+  while i < bNames.length {
+    outN.push(bNames[i])
+    outT.push(bTys[i])
+    i = i + 1
+  }
+  let j = 0
+  while j < uNames.length {
+    if bindOf(bNames, bTys, uNames[j]) < 0 {
+      outN.push(uNames[j])
+      outT.push(uTys[j])
+    }
+    j = j + 1
+  }
   0
 }
 
@@ -36036,6 +36109,8 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
   // `let n: i32 = id("s")` is a genuine type error downstream.
   const bNames: string[] = []
   const bTys: i32[] = []
+  const uNames: string[] = []
+  const uTys: i32[] = []
   // Explicit type arguments bind first, so every argument is checked against them.
   const explicitTa = callHasTyArgs(ix)
   if explicitTa {
@@ -36072,6 +36147,7 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
     // argument's shape (first use wins), then check the argument against the
     // SUBSTITUTED expected type — a later disagreeing use errors here.
     bindGenWalk(params[i], at, bNames, bTys)
+    bindGenUnionArm(params[i], at, uNames, uTys)
     const expected = substTyDeep(params[i], bNames, bTys)
     // A `u8[]` argument meeting a generic parameter: `bindGenWalk` above declined to bind
     // `T` to storage type `u8`, so `expected` still carries the unsolved hole and
@@ -36153,7 +36229,10 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
   // (`{first: B, second: A}`, a generic alias body, a function-typed field) concretizes
   // per call site; a derived `?ret.` hole collapses to the pinned callee's return
   // (`substTyDeep`).
-  if bNames.length > 0 {
+  const vNames: string[] = []
+  const vTys: i32[] = []
+  withUnionArmBinds(bNames, bTys, uNames, uTys, vNames, vTys)
+  if vNames.length > 0 {
     const dBeforeC = T.diags.length
     let cstrCallee = CSTR_NODECL
     let cstrWho = ""
@@ -36176,8 +36255,8 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
     const dhArgNode: i32[] = []
     holeArgOrigins(params, args, 0, dhNames, dhArgNo, dhArgNode)
     validateBinCstrs(
-      bNames,
-      bTys,
+      vNames,
+      vTys,
       ix,
       cstrCallee,
       cstrWho,
@@ -36185,18 +36264,18 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
       dhArgNo,
       dhArgNode,
     )
-    validatePrintCstrs(bNames, bTys, ix, cstrCallee, cstrWho)
-    validateNestCstrs(bNames, bTys, ix, cstrCallee, cstrWho)
-    validateArgCstrs(bNames, bTys, ix, cstrCallee)
+    validatePrintCstrs(vNames, vTys, ix, cstrCallee, cstrWho)
+    validateNestCstrs(vNames, vTys, ix, cstrCallee, cstrWho)
+    validateArgCstrs(vNames, vTys, ix, cstrCallee)
     // The declared return rides the same pin: the body's mismatch check is vacuous under
     // a hole, and this is the first position that knows the instance (D551).
-    validateRetCstrs(bNames, bTys, ix, cstrCallee, cstrWho)
+    validateRetCstrs(vNames, vTys, ix, cstrCallee, cstrWho)
     // The destination seam, for the same reason: a value landing in a hole-typed local /
     // field / element inside the body is a mismatch the body's own gate cannot decide (D572).
-    validateLetCstrs(bNames, bTys, ix, cstrCallee, cstrWho)
+    validateLetCstrs(vNames, vTys, ix, cstrCallee, cstrWho)
     // A builtin collection method's argument inside the body, for the same reason at a
     // callee kind the deferred-argument table cannot name: a builtin has no `FuncDecl`, so its own arm is the whole check and is vacuous under a hole (D582).
-    validateBmCstrs(bNames, bTys, ix, cstrCallee, cstrWho)
+    validateBmCstrs(vNames, vTys, ix, cstrCallee, cstrWho)
     // After the pins above, which can leave an argument's element open (`cnhPinBmElem`).
     if !inferQuiet {
       let oa = 0
@@ -36209,8 +36288,8 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
     // the operation on a type variable correctly (a `T` pinned to a collection has it), and
     // this is the first position that knows which rep `T` became (D651 / D691).
     validateMemCstrs(
-      bNames,
-      bTys,
+      vNames,
+      vTys,
       ix,
       cstrCallee,
       cstrWho,
@@ -36218,18 +36297,20 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
       dhArgNo,
       dhArgNode,
     )
-    validateUfcsCstrs(bNames, bTys, ix, cstrCallee, cstrWho)
+    validateUfcsCstrs(vNames, vTys, ix, cstrCallee, cstrWho)
     // Not a validation: the `??` result holes are substituted here for their BANK, which is
     // the only route the emitter has to the type this call gave the expression (D1702).
-    bankCoalHoles(bNames, bTys, cstrCallee)
+    if bNames.length > 0 { bankCoalHoles(bNames, bTys, cstrCallee) }
     // The bounds the callee declared, judged here in this site's own scope against the
     // types this site bound — not deferred, since a bound is written at the declaration:
     // there is nothing to record on the way in, only something to check on the way out.
     checkBoundsAtCall(cstrWho, cstrCallee, bNames, bTys, ix)
     // The escaped-join reject is a fallback, not an additional voice: when this site
     // already reported a precise operand/argument-flow diagnostic, a join report would only repeat it in vaguer words.
-    if T.diags.length == dBeforeC { validateEscJoins(bNames, bTys) }
-    retTy = substTyDeep(retTy, bNames, bTys)
+    if T.diags.length == dBeforeC && bNames.length > 0 {
+      validateEscJoins(bNames, bTys, cstrCallee)
+    }
+    retTy = substTyDeep(retTy, vNames, vTys)
   }
   // A deferred join the re-fold could not decide here (the callee's arms name a hole this
   // site does not bind) must not escape as this call's type — the emitter has no rep for a
@@ -47024,7 +47105,7 @@ export function nodeTyExcludesNull(ix: i32) { tyExcludesNull(nodeTyIxOf(ix)) }
 
 // Whether a null test of a value typed `ty` is dead: no member admits `null`, one a recursive
 // alias hides included, which `assignable` sees and the member walk does not.
-function tyProvesNonNull(ty: i32): boolean {
+export function tyProvesNonNull(ty: i32): boolean {
   tyExcludesNull(ty) && !assignable(TY_NULL, ty)
 }
 
@@ -47243,6 +47324,8 @@ function monoRecheckBegin(
   sv.push(inferTentative.length)
   sv.push(redunName.length)
   sv.push(tpEnvNames.length)
+  sv.push(rcoalTok.length)
+  sv.push(isvalTok.length)
   inferQuiet = true
   symEnabled = 0
   // Binds the type parameters too, not only the value ones: `checkFuncDecl` keeps them in
@@ -47327,6 +47410,8 @@ function monoRecheckEnd(sv: i32[]) {
   while inferStack.length > sv[14] { inferStack.pop() }
   while inferTentative.length > sv[15] { inferTentative.pop() }
   redunTruncate(sv[16])
+  rcoalTruncate(sv[18])
+  isvalTruncate(sv[19])
   while T.diags.length > sv[2] { T.diags.pop() }
   symEnabled = sv[1]
   inferQuiet = sv[0] == 1
