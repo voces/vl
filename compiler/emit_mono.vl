@@ -288,6 +288,7 @@ import {
   fnHasUnannotatedParam,
   fnIndexOf,
   fnIndexOfInScope,
+  fnIndexOfInScopeAt,
   fnRetExprOf,
   fnSigKeyOf,
   fnStmtsPosOf,
@@ -2628,6 +2629,31 @@ function monoSoleTyVarName(r: i32): string {
     TyPrim | TyErr | TyObj | TyFunc | TyNullable | TyArray | TyMap | TyLit | TyNeg => {
       // Concrete, or a variable under a constructor: not the parameter itself.
       return ""
+    }
+  }
+}
+
+// Whether an instance's checked result `ty` is a list, or a union whose every member is one.
+function monoRetIsListOrListJoin(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  const t = T.tys[ty]
+  match t {
+    TyArray => {
+      return true
+    }
+    TyUnion => {
+      if t.uMembers.length == 0 { return false }
+      let i = 0
+      while i < t.uMembers.length {
+        const m = t.uMembers[i]
+        if m < 0 || m >= T.tys.length || !(T.tys[m] is TyArray) { return false }
+        i = i + 1
+      }
+      return true
+    }
+    TyPrim | TyErr | TyFunc | TyObj | TyNullable | TyVar | TyLit | TyNeg | TyMap => {
+      // A scalar, record, map or closure result has its own rung above, or none is owed.
+      return false
     }
   }
 }
@@ -5163,7 +5189,10 @@ function monoMakeInstance(
             }
             if rty >= 0 && tyHasTyVar(rty) { rty = -1 }
           }
-          if rty >= 0 && tyBearsNull(rty) {
+          // A list, or a join of lists, that no rung above named takes the checked type
+          // too: unpinned, the result falls to the scalar `i32` seed over a list (D2217).
+          const rtyList = rty >= 0 && nret < 0 && monoRetIsListOrListJoin(rty)
+          if rty >= 0 && (tyBearsNull(rty) || rtyList) {
             const rnm = monoPinUnionName(tyToEmitName(rty))
             if rnm != "" {
               if monoRegisterPinUnion(rnm) < 0 { return -1 }
@@ -5327,7 +5356,11 @@ function monoMakeInstance(
         }
       }
       fnStmts.push(nfn)
-      fnParent.push(-1)
+      // A nested template's later instance keeps the template's frame, so its captures
+      // resolve where the first instance's do and its env fields take their real types (D2749).
+      let instParent = -1
+      if origFe < fnParent.length { instParent = fnParent[origFe] }
+      fnParent.push(instParent)
       fnDispNames.push("")
       instFe = fnStmts.length - 1
       // D943 — the clones' frame is this instance, not the template. `captureValKind`
@@ -5547,7 +5580,7 @@ function monoStructFieldTypes(
 // innermost-scope rule for a name a `FuncDecl` carries; `identClosureFeSid` covers an
 // arrow lambda, which parses to a nameless `FuncDecl` and carries its name on the binding.
 function monoFnFeOfIdent(identIx: i32, name: string, ctx: i32) {
-  const fe = fnIndexOfInScope(name, ctx)
+  const fe = fnIndexOfInScopeAt(sidOfNode(identIx), name, ctx, identIx)
   if fe >= 0 { return fe }
   identClosureFeAt(sidOfNode(identIx), ctx, identIx)
 }
@@ -6170,8 +6203,11 @@ function monoSpecializableCallbackName(argIx: i32, ctx: i32) {
   // `fnIndexOf` hands every frame the module's first function of this name, so the two
   // soundness gates below would be asked about the wrong function whenever two frames
   // declare a same-named callback.
-  if an is FuncDecl { fe = fnStmtsPosOf(ax) }
-  else if an is Ident { fe = fnIndexOfInScope(an.identName, ctx) }
+  if an is FuncDecl {
+    fe = fnStmtsPosOf(ax)
+  } else if an is Ident {
+    fe = fnIndexOfInScopeAt(sidOfNode(ax), an.identName, ctx, ax)
+  }
   if fe < 0 || fe >= fnStmts.length { return "" }
   if captureCountOf(fe) > 0 { return "" }
   if fe < monoGen.length {
@@ -6402,10 +6438,15 @@ function monoWalk(ix: i32, ctx: i32) {
         }
         ca = ca + 1
       }
-      // Scope-aware, and that is load-bearing: `wasmEmit` lowers this same call through
-      // `fnIndexOfInScopeChain`, so on a shared name the flat `fnIndexOf` disagrees and
-      // leaves a nested `<T>` template for the prune to stub while the emitter calls it.
-      let fe = fnIndexOfInScope(callee.identName, ctx)
+      // Scope-aware and positioned, as `wasmEmit` resolves this call: the flat `fnIndexOf`
+      // would hand a nested `<T>` template to the prune while the emitter calls it, and a
+      // binding in scope at the call must shadow a namesake nested in another frame (D2759).
+      let fe = fnIndexOfInScopeAt(
+        sidOfNode(n.callFn),
+        callee.identName,
+        ctx,
+        n.callFn,
+      )
       if fe < 0 {
         // A direct call through a value binding to a generic named function: resolve it
         // to the lifted slot and monomorphize per call site. Named functions only, and

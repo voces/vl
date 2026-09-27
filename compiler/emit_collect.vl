@@ -107,6 +107,7 @@ import {
   optCallRetNodeAt,
   primNameOf,
   primNameStr,
+  recordJoinSeen,
   tyArrayElemPrim,
   tyIsLitSet,
   tyIsLitUnion,
@@ -137,6 +138,7 @@ import {
   Index,
   IsExpr,
   LetDecl,
+  MatchExpr,
   Member,
   NullLit,
   NumLit,
@@ -611,6 +613,7 @@ import {
   globalLetOf,
   identChainTyBoxedUnion,
   ifExprNliName,
+  initJoinsWiderRecord,
   internInlineShape,
   internInlineShapeTy,
   internShapeAs,
@@ -6525,10 +6528,48 @@ export function collectA(_stmts: i32[]) {
   0
 }
 
+// Annotate an un-annotated binding whose initializer joins records into one (D2731) with the
+// joined type, so its arms are built at that row as the annotated spelling's are.
+function synthJoinedRecordAnn(letIx: i32) {
+  if !recordJoinSeen() { return 0 }
+  const s = P.nodes[letIx]
+  if s is LetDecl {
+    if s.letType >= 0 || s.letInit < 0 { return 0 }
+    const ini = unwrapParen(s.letInit)
+    if ini < 0 { return 0 }
+    const n = P.nodes[ini]
+    if !(n is IfStmt) && !(n is MatchExpr) && !(n is ArrayLit) { return 0 }
+    const ty = nodeTyIxOf(ini)
+    if !initJoinsWiderRecord(ini, ty) { return 0 }
+    const nm = tyToEmitName(ty)
+    if nm == "" { return 0 }
+    s.letType = synthTypeRefTy(nm, -1, ty)
+  }
+  0
+}
+
+// Interns the row of a value `if` or `match` that joins records into a wider one (D2731), so
+// its literal arms can be built at the join's row wherever the join is delivered.
+function internJoinedRecordRow(ix: i32) {
+  if !recordJoinSeen() { return 0 }
+  const ty = nodeTyIxOf(ix)
+  if !initJoinsWiderRecord(ix, ty) { return 0 }
+  const nm = tyToEmitName(ty)
+  if nm == "" { return 0 }
+  internArmFieldShape(nm)
+  internShapeDeepTy(nm, ty)
+}
+
 export function collectAnnShapes() {
+  const joins = recordJoinSeen()
   let ti = 0
   while ti < P.nodes.length {
     const tn = P.nodes[ti]
+    // Ahead of the TypeRef arm: the annotation it mints is appended, so this loop interns it.
+    if joins {
+      synthJoinedRecordAnn(ti)
+      internJoinedRecordRow(ti)
+    }
     if tn is TypeRef {
       // One gate and one switch, each closing a disagreement between the recorded type and what
       // the name resolves to in the emitter's context. The gate: no generic-alias type parameter
@@ -11756,6 +11797,7 @@ function collectInlineUnionsIn(stmts: i32[], walk: i32[]) {
       if collectInlineUnionsBlock(stmts, fnBody) < 0 { return -1 }
     } else if s is LetDecl {
       synthNullHoleAnn(walk[i])
+      synthJoinedRecordAnn(walk[i])
       const letTy = s.letType
       // Arena walk first (bucket (c) ordering — see the return-type site).
       if collectTyReachRegister(stmts, nodeTyIxOf(letTy), 16, false) < 0 {

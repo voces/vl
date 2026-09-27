@@ -71,6 +71,7 @@ import {
   canonUnionKeyOfName,
   canonUnionKeyOfTy,
   capWidenOf,
+  collectRetValues,
   condNarrowDropOf,
   condRhsRetiredOf,
   covarDeclFrame,
@@ -194,6 +195,7 @@ import {
   recordClonedCallRetire,
   recordClonedNodeTyFb,
   recordClonedNodeTyKnown,
+  recordJoinSeen,
   recordNodePin,
   substTyDeep,
   tyArrayElemIx,
@@ -229,6 +231,7 @@ import {
   unionAliasDeclNameOfTy,
   valueAtomKind,
   valueRowKind,
+  valueTailLeaves,
 } from "./typecheck"
 import {
   ArrayLit,
@@ -248,6 +251,7 @@ import {
   IsExpr,
   LetDecl,
   MC_RUNG_PER_INSTANCE,
+  MatchExpr,
   Member,
   NullLit,
   NumLit,
@@ -5692,10 +5696,48 @@ function captureLoopVarIterOf(fe: i32, name: string): i32 {
   -1
 }
 
+// The `for-in` variable an un-annotated captured binding `name` of lifted frame `fe` is a bare
+// copy of, or "". The copy's own cell is typed with the frame's locals in force, which the env
+// field is not, so the field takes the loop variable's type as a direct capture of it does.
+function captureLoopCopySrc(fe: i32, name: string): string {
+  captureLoopCopySrcAt(fe, name, 0)
+}
+
+// `captureLoopCopySrc` `depth` copies down the chain, bounded against a shadowing cycle.
+function captureLoopCopySrcAt(fe: i32, name: string, depth: i32): string {
+  if depth > 8 { return "" }
+  const b = parentBindingOf(fe, name)
+  if b < 0 { return "" }
+  const bn = P.nodes[b]
+  if bn is LetDecl {
+    if bn.letType >= 0 || bn.letInit < 0 { return "" }
+    const src = P.nodes[unwrapParen(bn.letInit)]
+    if src is Ident {
+      const sn = src.identName
+      if sn == name { return "" }
+      // A copy of a copy is typed as the loop variable at the end of the chain.
+      if parentBindingOf(fe, sn) >= 0 {
+        return captureLoopCopySrcAt(fe, sn, depth + 1)
+      }
+      // A boxed element is not redirected: the closure's narrowed reads of the copy resolve
+      // its union through the copy's own binding, which has no loop in scope (D2523).
+      if (
+        captureLoopVarIterOf(fe, sn) >= 0
+        && captureValKind(fe, sn) != "union"
+      ) {
+        return sn
+      }
+    }
+  }
+  ""
+}
+
 // The `fbValtype` kind for a captured variable `name` of lifted function `fe`, resolved
 // against the parent frame's binding — a param's annotation, or a local `let`'s annotation
 // or initializer. Defaults to i32.
 export function captureValKind(fe: i32, name: string): VKind {
+  const cps = captureLoopCopySrc(fe, name)
+  if cps != "" { return captureValKind(fe, cps) }
   const b = parentBindingOf(fe, name)
   if b < 0 {
     // A captured `for-in` loop variable (D1142) — typed off the very ladder
@@ -5758,6 +5800,8 @@ export function captureValKind(fe: i32, name: string): VKind {
 // slot an annotation selects, and `captureValKind` hands the same annotation node to
 // `vtKindOfType`, so kind and index cannot come from different ladders.
 export function captureValStructIdx(fe: i32, name: string) {
+  const cps = captureLoopCopySrc(fe, name)
+  if cps != "" { return captureValStructIdx(fe, cps) }
   const b = parentBindingOf(fe, name)
   if b < 0 {
     // The loop-variable pair's second half (D1142) — `captureValKind`'s companion, from the
@@ -13649,6 +13693,462 @@ function ifExprRefKindOf(ifIx: i32, fnIx: i32): VKind | null {
   null
 }
 
+// The return type a recorded function type `ty` carries, or -1 when `ty` is not a function.
+export function fnTyRetOf(ty: i32): i32 {
+  if ty < 0 || ty >= T.tys.length { return -1 }
+  const t = T.tys[ty]
+  if t is TyFunc { return t.fnRet }
+  -1
+}
+
+// A record type with any nullable wrapper removed, or -1 when `ty` is not a record.
+function recordBaseTy(ty: i32): i32 {
+  if ty < 0 || ty >= T.tys.length { return -1 }
+  const t = T.tys[ty]
+  match t {
+    TyObj => {
+      return ty
+    }
+    TyNullable => {
+      return recordBaseTy(t.nInner)
+    }
+    TyPrim | TyErr | TyFunc | TyUnion | TyArray | TyVar | TyLit | TyNeg | TyMap => {
+      // No record, or a union of several, which is no single row.
+      return -1
+    }
+  }
+}
+
+// The struct row a value `if` or `match` joining records into a wider one is built at, or -1.
+function joinedRecordRowOf(ix: i32): i32 {
+  if !recordJoinSeen() { return -1 }
+  const ty = nodeTyIxOf(ix)
+  if !initJoinsWiderRecord(ix, ty) { return -1 }
+  joinRowOfTy(recordBaseTy(ty))
+}
+
+// The struct row of the joined record `ty`: its own arena row, else the row an equal join
+// elsewhere interned under the same spelling, which is the one row both are built at.
+function joinRowOfTy(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  const r = structIndexOfTy(ty)
+  if r >= 0 { return r }
+  const nm = tyToEmitName(ty)
+  if nm == "" { return -1 }
+  structIndexOfTypeName(nm)
+}
+
+// Whether the non-literal record arm `tv` of a join built at struct row `slot` is built at a row
+// storing a field in another rep: a bare value where `slot` has a union box, or another scalar.
+export function refIfArmNeedsRecordCopy(
+  tv: i32,
+  slot: i32,
+  fnIx: i32,
+): boolean {
+  if !recordJoinSeen() { return false }
+  const vn = P.nodes[unwrapParen(tv)]
+  if vn is ObjLit || vn is NullLit { return false }
+  if slot < 0 || slot >= sTyIx.length { return false }
+  // The row the arm's value is built at, which an un-annotated source may share with the join.
+  // A nullable record value answers no row syntactically; its checked type names one.
+  const ar = rjaRowOf(tv, fnIx)
+  if ar < 0 || ar == slot || ar >= sTyIx.length { return false }
+  recordRepDiffers(sTyIx[ar], sTyIx[slot], 0)
+}
+
+// Whether a record stored at the row of type `a` differs, somewhere in its fields, from one
+// stored at the row of type `b`: the two are then two wasm structs, and handing one where the
+// other is declared needs a converting copy. Field types are compared through nested records.
+function recordRepDiffers(a: i32, b: i32, depth: i32): boolean {
+  const ra = recordBaseTy(a)
+  const rb = recordBaseTy(b)
+  if ra < 0 || rb < 0 || depth > 8 || tyEq(ra, rb) { return false }
+  const ta = T.tys[ra]
+  const tb = T.tys[rb]
+  if ta is TyObj {
+    if tb is TyObj {
+      let i = 0
+      while i < tb.objFieldNames.length {
+        const bf = tb.objFieldTypes[i]
+        let af = -1
+        let k = 0
+        while k < ta.objFieldNames.length {
+          if ta.objFieldNames[k] == tb.objFieldNames[i] {
+            af = ta.objFieldTypes[k]
+          }
+          k = k + 1
+        }
+        if fieldRepDiffers(af, bf, depth) { return true }
+        i = i + 1
+      }
+    }
+  }
+  false
+}
+
+// Whether a field of type `af` and one of type `bf` are stored differently.
+function fieldRepDiffers(af: i32, bf: i32, depth: i32): boolean {
+  if af < 0 || bf < 0 || af >= T.tys.length || bf >= T.tys.length {
+    return false
+  }
+  if tyEq(af, bf) { return false }
+  if recordBaseTy(af) >= 0 && recordBaseTy(bf) >= 0 {
+    return recordRepDiffers(af, bf, depth + 1)
+  }
+  const sb = fieldStorageTag(bf)
+  if sb != 0 && sb != fieldStorageTag(af) { return true }
+  const bp = primNameOf(bf)
+  const ap = primNameOf(af)
+  bp != null && ap != null && bp != ap
+}
+
+// 1 for a union box, 2 for a nullable, 0 for a type stored by its own kind.
+function fieldStorageTag(ty: i32): i32 {
+  const t = T.tys[ty]
+  match t {
+    TyUnion => {
+      return 1
+    }
+    TyNullable => {
+      return 2
+    }
+    TyPrim | TyErr | TyFunc | TyObj | TyArray | TyVar | TyLit | TyNeg | TyMap => {
+      // Stored by its own kind, which the scalar comparison after it tells apart.
+      return 0
+    }
+  }
+}
+
+// The refusal a record value meets where a join of records needs it converted (D2765).
+const RECORD_COPY_MSG = "emitProgram: this branch hands over a record whose field types differ from the record the branches join to, and a record is shared rather than converted — write the branch as an object literal, or give the value the joined type where it is declared"
+
+// Refuses, at the value, every record a join of records would have to convert: an `if` or
+// `match` tail, a list literal's element, and a function's returned value, each against the
+// row of the join or of the declared return. Literal leaves are built at that row (D2765).
+export function auditRecordJoinLeaves() {
+  if !recordJoinSeen() || emitRootIx < 0 { return 0 }
+  const root = P.nodes[emitRootIx]
+  if root is Program {
+    let s = 0
+    while s < root.progStmts.length {
+      if rjaWalk(root.progStmts[s], -1) < 0 { return -1 }
+      s = s + 1
+    }
+  }
+  let fe = 0
+  while fe < fnStmts.length {
+    const fnIx = fnStmts[fe]
+    const fn = P.nodes[fnIx]
+    if fn is FuncDecl {
+      if fn.fnRet >= 0 {
+        const rrow = joinRowOfTy(recordBaseTy(nodeTyIxOf(fn.fnRet)))
+        if rrow >= 0 {
+          const rets: i32[] = []
+          collectRetValues(fn.fnBody, rets)
+          if rjaLeaves(rets, rrow, fnIx) < 0 { return -1 }
+        }
+      }
+      if rjaWalk(fn.fnBody, fnIx) < 0 { return -1 }
+    }
+    fe = fe + 1
+  }
+  0
+}
+
+// Every tail of each value in `vals` against the row `row`: -1 once one is refused.
+function rjaLeaves(vals: i32[], row: i32, fnIx: i32): i32 {
+  let i = 0
+  while i < vals.length {
+    const ls = valueTailLeaves(vals[i])
+    let k = 0
+    while k < ls.length {
+      if refIfArmNeedsRecordCopy(ls[k], row, fnIx) {
+        return emitFailAt(RECORD_COPY_MSG, ls[k])
+      }
+      if rjaLitFields(ls[k], row, fnIx, 0) < 0 { return -1 }
+      k = k + 1
+    }
+    i = i + 1
+  }
+  0
+}
+
+// The type record `t` gives field `name`, or -1.
+function recordFieldTy(t: TyObj, name: string): i32 {
+  let i = 0
+  while i < t.objFieldNames.length {
+    if t.objFieldNames[i] == name { return t.objFieldTypes[i] }
+    i = i + 1
+  }
+  -1
+}
+
+// A literal leaf built at `row`: each field holding a record, against that field's row, so a
+// record value nested in the literal meets the same test as one at the top (D2765).
+function rjaLitFields(ix: i32, row: i32, fnIx: i32, depth: i32): i32 {
+  const o = P.nodes[unwrapParen(ix)]
+  if depth > 8 || row < 0 || row >= sTyIx.length { return 0 }
+  const rb = recordBaseTy(sTyIx[row])
+  if rb < 0 { return 0 }
+  const rt = T.tys[rb]
+  if o is ObjLit {
+    if rt is TyObj {
+      let i = 0
+      while i < o.objFields.length {
+        const f = P.nodes[o.objFields[i]]
+        if f is FieldInit {
+          const fr = joinRowOfTy(recordBaseTy(recordFieldTy(rt, f.fiName)))
+          if fr >= 0 {
+            const one: i32[] = [f.fiValue]
+            if rjaLeaves(one, fr, fnIx) < 0 { return -1 }
+          }
+        }
+        i = i + 1
+      }
+    }
+  }
+  0
+}
+
+// Whether two record values, neither a literal, are stored as different records.
+function rjaValuesPart(a: i32, b: i32, fnIx: i32): boolean {
+  const na = P.nodes[unwrapParen(a)]
+  const nb = P.nodes[unwrapParen(b)]
+  if na is ObjLit || nb is ObjLit || na is NullLit || nb is NullLit {
+    return false
+  }
+  const ra = rjaRowOf(a, fnIx)
+  const rb = rjaRowOf(b, fnIx)
+  if ra < 0 || rb < 0 || ra == rb || ra >= sTyIx.length || rb >= sTyIx.length {
+    return false
+  }
+  recordRepDiffers(sTyIx[ra], sTyIx[rb], 0)
+}
+
+// The struct row a record value is built at: its own, else its checked type's, else -1.
+function rjaRowOf(ix: i32, fnIx: i32): i32 {
+  const r = structIndexOfExpr(ix, fnIx)
+  if r >= 0 { return r }
+  structIndexOfTy(recordBaseTy(nodeTyIxOf(ix)))
+}
+
+// Whether the callee at `calleeIx` declares parameter `pi` in source, as a type naming no type
+// parameter: the argument is then built at that declared type, as an annotation would build it.
+function calleeParamDeclared(calleeIx: i32, pi: i32, fnIx: i32): boolean {
+  const ce = P.nodes[unwrapParen(calleeIx)]
+  if ce is Ident {
+    const fe = fnIndexOfInScopeAt(
+      sidOfNode(calleeIx),
+      ce.identName,
+      fnIx,
+      calleeIx,
+    )
+    if fe < 0 || fe >= fnStmts.length { return false }
+    const fd = P.nodes[fnStmts[fe]]
+    if fd is FuncDecl {
+      if pi >= fd.fnParams.length { return false }
+      const p = P.nodes[fd.fnParams[pi]]
+      if p is Param {
+        if p.parType < 0 { return false }
+        const tr = P.nodes[p.parType]
+        if tr is TypeRef {
+          if tr.pos < 0 { return false }
+          return !tyHasTyVar(nodeTyIxOf(p.parType))
+        }
+      }
+    }
+  }
+  false
+}
+
+// The refusal a function-value argument meets when its result is a join of nested records.
+const NESTED_LAMBDA_JOIN_MSG = "emitProgram: this function value returns records that join into one whose fields hold records, and handed to a parameter it would be read at another row of those field names — annotate the function value's return type with the joined record"
+
+// Whether the lambda at `ix` returns a join of records wider than its tails, one of whose
+// fields is itself a record.
+function lambdaJoinsNestedRecord(ix: i32): boolean {
+  const ln = P.nodes[ix]
+  if ln is FuncDecl {
+    // A return the author declared names its row by that declaration, and runs.
+    if ln.fnRet >= 0 {
+      const rt = P.nodes[ln.fnRet]
+      if rt is TypeRef {
+        if rt.pos >= 0 { return false }
+      }
+    }
+  } else {
+    return false
+  }
+  const rty = fnTyRetOf(nodeTyIxOf(ix))
+  if !fnRetJoinsWiderRecord(ix, rty) { return false }
+  const rb = recordBaseTy(rty)
+  if rb < 0 { return false }
+  const t = T.tys[rb]
+  if t is TyObj {
+    let i = 0
+    while i < t.objFieldTypes.length {
+      if recordBaseTy(t.objFieldTypes[i]) >= 0 { return true }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// The joins of records under `ix` in frame `fnIx`, a nested function's aside.
+function rjaWalk(ix: i32, fnIx: i32): i32 {
+  let cur = ix
+  while cur >= 0 && cur < P.nodes.length {
+    const n = P.nodes[cur]
+    if n is FuncDecl { return 0 }
+    if n is IfStmt || n is MatchExpr {
+      const jr = joinedRecordRowOf(cur)
+      if jr >= 0 {
+        const one: i32[] = [cur]
+        if rjaLeaves(one, jr, fnIx) < 0 { return -1 }
+      }
+    } else if n is Call {
+      // A function value returning a join of nested records reaches its parameter's row by
+      // shape, which names the first row of those field names, not the join's (D2765).
+      let ai = 0
+      while ai < n.callArgs.length {
+        const la = unwrapParen(n.callArgs[ai])
+        if la >= 0 && lambdaJoinsNestedRecord(la) {
+          if !calleeParamDeclared(n.callFn, ai, fnIx) {
+            return emitFailAt(NESTED_LAMBDA_JOIN_MSG, la)
+          }
+        }
+        ai = ai + 1
+      }
+    } else if n is BinExpr && n.binOp == "??" {
+      // A `??` joins its two operands as an `if` does its arms.
+      const cr = joinRowOfTy(recordBaseTy(nodeTyIxOf(cur)))
+      if cr >= 0 {
+        const two: i32[] = [n.binLeft, n.binRight]
+        if rjaLeaves(two, cr, fnIx) < 0 { return -1 }
+      } else if rjaValuesPart(n.binLeft, n.binRight, fnIx) {
+        // No row holds the join, so the two records meet as they are.
+        return emitFailAt(RECORD_COPY_MSG, n.binRight)
+      }
+    } else if n is ArrayLit {
+      const ety = arrTyElemOf(nodeTyIxOf(cur))
+      if initJoinsWiderRecord(cur, nodeTyIxOf(cur)) {
+        const er = joinRowOfTy(recordBaseTy(ety))
+        if er >= 0 && rjaLeaves(n.arrElems, er, fnIx) < 0 { return -1 }
+      }
+    }
+    const kids = nodeSpineChildren(cur)
+    let k = 0
+    while k < kids.length {
+      if rjaWalk(kids[k], fnIx) < 0 { return -1 }
+      k = k + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  0
+}
+
+// Whether the value `if`, `match` or list literal `ini`, checked at `ty`, joins records into a
+// record none of its leaves is (D2731): a leaf literal would build its own row, not the join's.
+export function initJoinsWiderRecord(ini: i32, ty: i32): boolean {
+  if ini < 0 || ty < 0 || ty >= T.tys.length { return false }
+  const n = P.nodes[ini]
+  // The joined record is asked for first, so a statement `if` costs no walk of its chain.
+  let base = -1
+  const leaves: i32[] = []
+  if n is ArrayLit {
+    base = recordBaseTy(arrTyElemOf(ty))
+    if base < 0 { return false }
+    let e = 0
+    while e < n.arrElems.length {
+      const ls = valueTailLeaves(n.arrElems[e])
+      let k = 0
+      while k < ls.length {
+        leaves.push(ls[k])
+        k = k + 1
+      }
+      e = e + 1
+    }
+  } else if n is IfStmt || n is MatchExpr {
+    base = recordBaseTy(ty)
+    if base < 0 { return false }
+    const ls = valueTailLeaves(ini)
+    let k = 0
+    while k < ls.length {
+      leaves.push(ls[k])
+      k = k + 1
+    }
+  } else {
+    return false
+  }
+  let i = 0
+  while i < leaves.length {
+    const lb = recordBaseTy(nodeTyIxOf(leaves[i]))
+    if lb >= 0 && !tyEq(lb, base) { return true }
+    i = i + 1
+  }
+  false
+}
+
+// The element type of the list type `ty`, or -1 when `ty` is no list.
+function arrTyElemOf(ty: i32): i32 {
+  if ty < 0 || ty >= T.tys.length { return -1 }
+  const t = T.tys[ty]
+  if t is TyArray { return t.aElem }
+  -1
+}
+
+// Whether function `fnIx`, checked to return the record `rty`, returns a record of another
+// type anywhere: the returns join to `rty` and each must be built at its row (D2731).
+export function fnRetJoinsWiderRecord(fnIx: i32, rty: i32): boolean {
+  if !recordJoinSeen() || fnIx < 0 { return false }
+  const base = recordBaseTy(rty)
+  if base < 0 { return false }
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    const rets: i32[] = []
+    collectRetValues(fn.fnBody, rets)
+    let i = 0
+    while i < rets.length {
+      const ls = valueTailLeaves(rets[i])
+      let k = 0
+      while k < ls.length {
+        const lb = recordBaseTy(nodeTyIxOf(ls[k]))
+        if lb >= 0 && !tyEq(lb, base) { return true }
+        k = k + 1
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// Whether `ty` is a record, or a list of one, with a union-typed field: the type the checker
+// gives a join of records that share a field-name set, which no arm literal builds itself.
+export function tyIsJoinedRecord(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  const t = T.tys[ty]
+  match t {
+    TyArray => {
+      return tyIsJoinedRecord(t.aElem)
+    }
+    TyObj => {
+      let i = 0
+      while i < t.objFieldTypes.length {
+        const ft = t.objFieldTypes[i]
+        if ft >= 0 && ft < T.tys.length {
+          if T.tys[ft] is TyUnion { return true }
+        }
+        i = i + 1
+      }
+      return false
+    }
+    TyPrim | TyErr | TyFunc | TyUnion | TyNullable | TyVar | TyLit | TyNeg | TyMap => {
+      // No record whose field a join could have widened into a union.
+      return false
+    }
+  }
+}
+
 // The `fbValtype` slot (second arg) for a ref-typed if-expression join of `kind`: the
 // struct table index (kind 1) or the ref-list wrapper slot (kind 5); the other ref kinds
 // ignore the slot. Prefers the pending context seed (a struct/list return or binding)
@@ -13673,6 +14173,9 @@ export function ifExprRefSlot(ifIx: i32, fnIx: i32, kind: VKind) {
     if pendingStructIdx >= 0 && P.nodes[unwrapParen(tv)] is ObjLit {
       return pendingStructIdx
     }
+    // With no destination, a join of records into a wider one builds at the join's own row.
+    const jrow = joinedRecordRowOf(ifIx)
+    if jrow >= 0 { return jrow }
     const si = structIndexOfExpr(tv, fnIx)
     if si >= 0 { return si }
     if pendingStructIdx >= 0 { return pendingStructIdx }
@@ -21412,8 +21915,35 @@ function arrLitBoxElem(arrIx: i32): boolean {
 export function arrLitInferUnionElemName(arrIx: i32): string {
   const cen = arrLitBoxElemName(arrIx)
   if cen == "" { return "" }
-  if arrLitIsRef(arrIx) { return "" }
+  if arrLitIsRef(arrIx) && !arrLitObjBesideNonRecord(arrIx) { return "" }
   cen
+}
+
+// Whether the literal's first element is an object literal while its recorded element union
+// has a member that is no record (`[{ v: 2 }, "s"]`): the first-element probe claims a struct
+// list, which cannot hold that member, so the union's box row must exist (D2727).
+function arrLitObjBesideNonRecord(arrIx: i32): boolean {
+  const a = P.nodes[arrIx]
+  if a is ArrayLit {
+    if a.arrElems.length < 2 { return false }
+    if !(P.nodes[a.arrElems[0]] is ObjLit) { return false }
+    const aty = nodeTyIxOf(arrIx)
+    if aty < 0 || aty >= T.tys.length { return false }
+    const at = T.tys[aty]
+    if at is TyArray {
+      if at.aElem < 0 || at.aElem >= T.tys.length { return false }
+      const el = T.tys[at.aElem]
+      if el is TyUnion {
+        let i = 0
+        while i < el.uMembers.length {
+          const m = el.uMembers[i]
+          if m >= 0 && m < T.tys.length && !(T.tys[m] is TyObj) { return true }
+          i = i + 1
+        }
+      }
+    }
+  }
+  false
 }
 
 // True if the struct type at `ty` has a map field anywhere in its (nested-struct) shape,
@@ -30063,6 +30593,9 @@ export function structIndexOfExpr(exprIx: i32, fnIx: i32) {
   // THEN arm's struct index classifies the whole `if` (the checker proved the arms agree), so an
   // un-annotated binding resolves the same struct heap type the `emitIfExprRef` join emits.
   if e is IfStmt {
+    // A join of records wider than its arms is its own row, whatever row an arm takes (D2731).
+    const jr = joinedRecordRowOf(exprIx)
+    if jr >= 0 { return jr }
     const tv = ifThenValueIx(exprIx)
     if tv >= 0 { return structIndexOfExpr(tv, fnIx) }
   }

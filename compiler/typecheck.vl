@@ -3040,6 +3040,17 @@ function mkMapTy(key: i32, val: i32, isSet: i32) {
 // skip work, never a map (`mapDeliveryMayRecord`).
 let tyMapMinted = false
 
+// The unions `joinTys` made of two type parameters (D2760). At a pin their members re-join as a
+// non-generic join would, so `A | B` at `i32` and `f64` is `f64`, not a box of the two.
+let tpJoinUnions: {[i32]: i32} = Map()
+
+// Whether any join has made one record of two (`joinObjFieldwise`). Only ever set, so the
+// emitter passes that build a join's arms at its row can skip a program with none (D2731).
+let recordJoinMinted = false
+
+// The emitter's read of `recordJoinMinted`.
+export function recordJoinSeen(): boolean { recordJoinMinted }
+
 // The one home of which hash a `Map`/`Set` key takes: the rep has exactly three, `string`
 // (element-wise, `__str_hash__`), `i32` and `i64` (the integer mixes). Answers the arena type the
 // keys hash as, or -1 for a key the rep cannot hold, and every gate projects this answer. The test
@@ -4283,6 +4294,8 @@ export function initChecker() {
   voidCoerceValNodes = []
   voidCoerceValNames = []
   T.tys = []
+  tpJoinUnions = Map()
+  recordJoinMinted = false
   T.scopes = []
   scopeDepthsOf = Map()
   T.diags = []
@@ -11282,6 +11295,8 @@ function sameVariantTy(a: i32, b: i32) {
   // Named variants resolve to one canonical arena entry (`cUserTypes`), so
   // the common same-variant case is index equality — skip both traversals.
   if a == b { return true }
+  // `A[]` and `B[]` are two variants though each is assignable to the other in the body (D2760).
+  if tyParamsPart(a, b, 0) { return false }
   if !assignable(a, b) { return false }
   assignable(b, a)
 }
@@ -13584,9 +13599,78 @@ function joinTys(a: i32, b: i32) {
   constrainEmpty(b, a)
   const tpn = joinTyParamNull(a, b)
   if tpn >= 0 { return tpn }
+  // Two different declared type parameters are two types, though a type variable is
+  // assignable either way inside a generic body: collapsing would type the join as one
+  // side and every instance binding them apart would read the other as it (D2760).
+  if tyParamsPart(a, b, 0) {
+    const tj = joinVariantTys(a, b)
+    // arena-tick exempt: a per-program mark on a fresh arena row.
+    tpJoinUnions[tj] = 1
+    return tj
+  }
+  // Two different records may join wider than either (`{f: i32}` into `{f: f64}`) (D2731).
+  if !recordJoinMinted && a != b {
+    if T.tys[a] is TyObj && T.tys[b] is TyObj { recordJoinMinted = true }
+  }
   if assignable(b, a) && !joinWidensMap(b, a) { return a }
   if assignable(a, b) && !joinWidensMap(a, b) { return b }
   joinVariantTys(a, b)
+}
+
+// Whether `a` and `b` hold two differently named declared type parameters at one position
+// under a list element or nullable wrapper; a hole (`?…`) is inference, not a type.
+function tyParamsPart(a: i32, b: i32, depth: i32): boolean {
+  if a < 0 || b < 0 || a >= T.tys.length || b >= T.tys.length || depth > 8 {
+    return false
+  }
+  const ta = T.tys[a]
+  match ta {
+    TyVar => {
+      // Two bare parameters keep the collapse: each instance stores the join in the scalar or
+      // ref cell of its pin, as before D2760; only under a constructor are the two storages apart.
+      if depth == 0 { return false }
+      return tyParamNamesPart(ta.tvName, b)
+    }
+    TyArray => {
+      const eb = arrElemTyOrNone(b)
+      if eb < 0 { return false }
+      return tyParamsPart(ta.aElem, eb, depth + 1)
+    }
+    TyNullable => {
+      const ib = nullableInnerOrNone(b)
+      if ib < 0 { return false }
+      return tyParamsPart(ta.nInner, ib, depth + 1)
+    }
+    TyPrim | TyErr | TyFunc | TyObj | TyUnion | TyLit | TyNeg | TyMap => {
+      // Read no further: a join through these keeps the answer `assignable` gives it.
+      return false
+    }
+  }
+}
+
+// Whether the declared type parameter `an` and the type `b` are two differently named ones.
+function tyParamNamesPart(an: string, b: i32): boolean {
+  const tb = T.tys[b]
+  if tb is TyVar {
+    if an.length == 0 || tb.tvName.length == 0 { return false }
+    if an[0] == "?"[0] || tb.tvName[0] == "?"[0] { return false }
+    return an != tb.tvName
+  }
+  false
+}
+
+// The element of the list type `ty`, or -1.
+function arrElemTyOrNone(ty: i32): i32 {
+  const t = T.tys[ty]
+  if t is TyArray { return t.aElem }
+  -1
+}
+
+// The inner of the nullable type `ty`, or -1.
+function nullableInnerOrNone(ty: i32): i32 {
+  const t = T.tys[ty]
+  if t is TyNullable { return t.nInner }
+  -1
 }
 
 // Whether collapsing the map `src` into the wider map `dst` would store a key or value
@@ -13639,6 +13723,13 @@ function joinVariantTys(a: i32, b: i32) {
       while j < kept.length {
         if kept[j] == v { dup = true }
         if sameVariantTy(kept[j], v) { dup = true }
+        if !dup {
+          const fw = joinObjFieldwise(kept[j], v)
+          if fw >= 0 {
+            kept[j] = fw
+            dup = true
+          }
+        }
         j = j + 1
       }
       if !dup { kept.push(v) }
@@ -13664,6 +13755,84 @@ function joinVariantTys(a: i32, b: i32) {
   }
   if hasNull { return mkNullableTy(res) }
   res
+}
+
+// Two records sharing a field-name set that D1023 would refuse as union arms join as one
+// record of per-field joins, the type the annotated spelling names (D2731); -1 otherwise.
+function joinObjFieldwise(a: i32, b: i32): i32 {
+  if a < 0 || b < 0 || a >= T.tys.length || b >= T.tys.length { return -1 }
+  const ta = T.tys[a]
+  const tb = T.tys[b]
+  if ta is TyObj {
+    if tb is TyObj {
+      if !objSigSame(ta, tb) || objArmsSameType(ta, tb) { return -1 }
+      if objArmsDiscriminable(ta, tb) { return -1 }
+      let k = 0
+      while k < ta.objFieldNames.length {
+        if (
+          !fieldJoinKeepsRecordsApart(
+            ta.objFieldTypes[k],
+            objPairedTy(ta, tb, k),
+          )
+        ) {
+          return -1
+        }
+        k = k + 1
+      }
+      const names: string[] = []
+      const tys: i32[] = []
+      let i = 0
+      while i < ta.objFieldNames.length {
+        names.push(ta.objFieldNames[i])
+        tys.push(joinTys(ta.objFieldTypes[i], objPairedTy(ta, tb, i)))
+        i = i + 1
+      }
+      recordJoinMinted = true
+      return mkObjTy(names, tys)
+    }
+  }
+  -1
+}
+
+// Whether one field's two types join without making a union of records: equal types, two
+// records of one field-name set (they join the same way, a level down), or no record at all.
+function fieldJoinKeepsRecordsApart(fa: i32, fb: i32): boolean {
+  if fa < 0 || fb < 0 || tySame(fa, fb) { return true }
+  const ra = tyHoldsRecord(fa, 0)
+  const rb = tyHoldsRecord(fb, 0)
+  if !ra && !rb { return true }
+  const oa = T.tys[fa]
+  const ob = T.tys[fb]
+  if oa is TyObj {
+    if ob is TyObj { return objSigSame(oa, ob) }
+  }
+  false
+}
+
+// Whether `ty` is a record, or a union or nullable with a record member.
+function tyHoldsRecord(ty: i32, depth: i32): boolean {
+  if ty < 0 || ty >= T.tys.length || depth > 8 { return false }
+  const t = T.tys[ty]
+  match t {
+    TyObj => {
+      return true
+    }
+    TyNullable => {
+      return tyHoldsRecord(t.nInner, depth + 1)
+    }
+    TyUnion => {
+      let i = 0
+      while i < t.uMembers.length {
+        if tyHoldsRecord(t.uMembers[i], depth + 1) { return true }
+        i = i + 1
+      }
+      return false
+    }
+    TyPrim | TyErr | TyFunc | TyArray | TyVar | TyLit | TyNeg | TyMap => {
+      // A list or map of records is its own rep, not a record in the field itself.
+      return false
+    }
+  }
 }
 
 // The return-inference join, for `noteInferredRet` alone — not the general `joinTys`. A hole must
@@ -32063,6 +32232,18 @@ function genAppCarry(origTy: i32, newTy: i32, bNames: string[], bTys: i32[]) {
   0
 }
 
+// The members of a union re-joined one at a time, as the join that made it would at these types.
+function rejoinMembers(ms: i32[]): i32 {
+  if ms.length == 0 { return -1 }
+  let r = ms[0]
+  let i = 1
+  while i < ms.length {
+    r = joinTys(r, ms[i])
+    i = i + 1
+  }
+  r
+}
+
 // Deep substitution of a call's bindings into a type: a bound `TyVar` becomes its binding; a
 // derived return hole collapses to the pinned function's return. Composites rebuild only when
 // a child actually changed, so a concrete type keeps its arena identity (and the in-place
@@ -32141,6 +32322,8 @@ export function substTyDeep(tyIx: i32, bNames: string[], bTys: i32[]) {
     // checked even when nothing changed — an unresolved member is dead precisely because it did not resolve.
     if isJoinHoleUnion(tyIx) {
       res = refoldJoinUnion(tyIx, ms, out3, changed3, bNames, bTys)
+    } else if changed3 && tpJoinUnions.has(tyIx) {
+      res = rejoinMembers(out3)
     } else if changed3 {
       // Dedupes by arena-index identity only (not `sameVariantTy`) then rebuilds: substitution
       // can make two members the same type, and matching structurally here would merge members this walk must leave alone (the mixed-union arena shape is load-bearing).
@@ -43580,6 +43763,11 @@ function a20CollectRets(blockIx: i32, out: i32[]) {
   a20RetWalk(blockIx, true, out)
 }
 
+// Every value a function body at `blockIx` hands back: each valued `return`, and its tail.
+export function collectRetValues(blockIx: i32, out: i32[]) {
+  a20RetWalk(blockIx, true, out)
+}
+
 // Every valued `return` under `blockIx` in source order, at any depth but a nested function's.
 export function collectValuedReturns(blockIx: i32, out: i32[]) {
   a20RetWalk(blockIx, false, out)
@@ -43890,7 +44078,7 @@ function recordMapUnbox(srcExpr: i32, srcTy: i32, dstIn: i32, depth: i32) {
 
 // The values a delivery of `srcExpr` hands over: the value itself, or every tail of a value
 // `if`, `match` or block, so a literal in an arm is walked as the bare literal is (D2730).
-function valueTailLeaves(srcExpr: i32): i32[] {
+export function valueTailLeaves(srcExpr: i32): i32[] {
   const spine: i32[] = []
   const leaves: i32[] = []
   valueTailSplit(srcExpr, spine, leaves)
@@ -44049,8 +44237,29 @@ function mapDeliveryMayRecord(srcExpr: i32, srcTy: i32): boolean {
     const st = T.tys[srcTy]
     if st is TyUnion || st is TyNullable { return true }
   }
-  const n = P.nodes[srcExpr]
+  if nodeIsCtorLit(srcExpr) { return true }
+  if !nodeIsValueJoin(srcExpr) { return false }
+  // Every tail of a value `if` or `match`, which joins record literals as one record rather
+  // than a union (D2731).
+  const ls = valueTailLeaves(srcExpr)
+  let i = 0
+  while i < ls.length {
+    if nodeIsCtorLit(ls[i]) { return true }
+    i = i + 1
+  }
+  false
+}
+
+// Whether node `ix` is a list or record literal.
+function nodeIsCtorLit(ix: i32): boolean {
+  const n = P.nodes[ix]
   n is ArrayLit || n is ObjLit
+}
+
+// Whether node `ix` is an `if` or a `match`, the two value joins with tails.
+function nodeIsValueJoin(ix: i32): boolean {
+  const n = P.nodes[ix]
+  n is IfStmt || n is MatchExpr
 }
 
 // `recordMapUnbox` over each element of a list literal `srcExpr` delivered as `elemTy[]`.
