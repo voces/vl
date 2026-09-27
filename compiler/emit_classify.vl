@@ -449,6 +449,16 @@ import {
   LBK_STR_LIST,
   LBK_U8_LIST,
   LBK_UNION,
+  MVK_CLOSURE,
+  MVK_F32,
+  MVK_F64,
+  MVK_I64,
+  MVK_MONO,
+  MVK_REF,
+  MVK_STR,
+  MVK_STRUCT,
+  MVK_UNION,
+  MVK_UNSUPPORTED,
   MfKind,
   RLK_CLOSURE,
   RLK_F32_LIST,
@@ -2067,7 +2077,7 @@ export function letNulMapReadValKind(letIx: i32, fnIx: i32): VKind | null {
   if d.letInit < 0 { return null }
   const mrs = mapReadMvSlot(d.letInit, fnIx)
   if mrs < 0 { return null }
-  if mvValKind[mrs] != 6 { return null }
+  if mvValKind[mrs] != MVK_REF { return null }
   const lvk = mvListValKind(mrs)
   if lvk == "list" { return "nullist" }
   if lvk == "strlist" { return "nulstrlist" }
@@ -2116,7 +2126,7 @@ export function letNulMapReadUnionBox(letIx: i32, fnIx: i32) {
       if mapReadNarrowedContainer(unwrapParen(d.letInit), fnIx) { return false }
       // …and where it converts to a niche `A | null` (D2590).
       if placeNicheAtomKind(unwrapParen(d.letInit), fnIx) >= 0 { return false }
-      return mvValKind[mrs] == 2
+      return mvValKind[mrs] == MVK_UNION
     }
   }
   false
@@ -2744,7 +2754,7 @@ export function exprNullableString(exprIx: i32, fnIx: i32) {
   // `(ref null)` value unrecovered, the string dual of the bare struct-map read.
   if e is Index {
     const mrs = mapReadMvSlot(exprIx, fnIx)
-    if mrs >= 0 { return mvValKind[mrs] == 3 }
+    if mrs >= 0 { return mvValKind[mrs] == MVK_STR }
     // A `(string | null)[]` element read yields `string | null` — the string-ref niche kept
     // `(ref null $aTypeIdx)` by the dedicated `emitIndex` arm — so `const t = p[i]` binds the
     // nullable-string kind and `t != null` narrows against it.
@@ -2761,7 +2771,10 @@ export function exprNullableString(exprIx: i32, fnIx: i32) {
       // included, to a non-null string.
       const cns = coalesceMvSlot(exprIx, fnIx)
       if cns >= 0 {
-        if mvValKind[cns] == 3 && coalesceStaysNullable(exprIx, cns, fnIx) {
+        if (
+          mvValKind[cns] == MVK_STR
+          && coalesceStaysNullable(exprIx, cns, fnIx)
+        ) {
           return true
         }
       }
@@ -2928,7 +2941,7 @@ export function exprNullableStruct(exprIx: i32, fnIx: i32) {
     // `const v = m[k]` binds the nullable-struct niche; a `?? d` read over a non-null value
     // stays the non-null struct, which the `BinExpr` arm settles.
     const mrs = mapReadMvSlot(exprIx, fnIx)
-    if mrs >= 0 { return mvValKind[mrs] == 1 }
+    if mrs >= 0 { return mvValKind[mrs] == MVK_STRUCT }
   }
   // A `m[k] ?? d` read over a nullable-struct-valued map stays `S | null` only when the
   // default is itself nullable; a non-null default coalesces every null, stored included,
@@ -2936,7 +2949,8 @@ export function exprNullableStruct(exprIx: i32, fnIx: i32) {
   if e is BinExpr {
     const cns = coalesceMvSlot(exprIx, fnIx)
     if cns >= 0 {
-      return mvValKind[cns] == 1 && coalesceStaysNullable(exprIx, cns, fnIx)
+      return mvValKind[cns] == MVK_STRUCT
+        && coalesceStaysNullable(exprIx, cns, fnIx)
     }
     // The non-map `??` over the same niche obeys the identical rule — the consumer half of
     // the decision `emitCoalesce`'s nullable-struct arm makes. Without it an un-annotated
@@ -6214,7 +6228,7 @@ export function mvSlotNullable(slot: i32) {
 // `??` result classifies as that scalar. A multi-member `A | B | null` stays a boxed union.
 function mvUnionIsScalarNull(slot: i32) {
   if slot < 0 { return false }
-  if mvValKind[slot] != 2 { return false }
+  if mvValKind[slot] != MVK_UNION { return false }
   const ar = mvValUnionScalarNullAt(slot)
   if ar >= 0 { return ar == 1 }
   const vn = mvValName[slot]
@@ -6248,7 +6262,7 @@ export function scalarListRepOfName(t: string): VKind | null {
 // the classifier gates that would otherwise each spell out the slice and the sentinel, and
 // each have to be found again if the sentinel moves.
 function mapValKindLowerable(mapName: string) {
-  mvValKindOfName(mapValNameOf(mapName)) != -3
+  mvValKindOfName(mapValNameOf(mapName)) != MVK_UNSUPPORTED
 }
 
 // 1 when this map value type unambiguously lowers, 0 for "ask the spelling". A strict subset
@@ -6401,7 +6415,7 @@ function mapTyValKindLowerable(mty: i32) {
   const mt = T.tys[mty]
   if !(mt is TyMap) { return false }
   if mvValLowersTy(mt.mVal) == 1 { return true }
-  mvValKindOfName(tyToEmitName(mt.mVal)) != -3
+  mvValKindOfName(tyToEmitName(mt.mVal)) != MVK_UNSUPPORTED
 }
 
 // `mapTyValKindLowerable` asked of a node's recorded type.
@@ -6414,16 +6428,16 @@ function mapNodeValKindLowerable(ix: i32) {
 // unsupported, else the per-slot kind. Read by both `mvShapeOfValName`, the slot interner, and
 // `retMapFlag`, the param and return valtype gate, so the two cannot drift.
 export function mvValKindOfName(valName: string): i32 {
-  if valName == "i32" || valName == "boolean" { return -1 }
+  if valName == "i32" || valName == "boolean" { return MVK_MONO }
   // A literal-union atom value: each value is the interned atom code, a plain i32, so the map
   // is the mono i32 map. Checked before the union arm, whose member count would otherwise
   // claim the alias and box the values.
-  if nameIsLitUnionType(valName) { return -1 }
+  if nameIsLitUnionType(valName) { return MVK_MONO }
   // A nullable-atom value that reps as a plain i32 niche with no box — a nullable litunion
   // (atom ids, `-1` for null) or a nullable boolean (0/1, `2` for null). Each value is an i32
   // with a spare sentinel, so the map is the mono i32 map. Checked before the union arm, whose
   // member count would else box a raw i32 niche into a `(ref $box)` cell.
-  if nameIsNulLitUnion(valName) || nameIsNulBool(valName) { return -1 }
+  if nameIsNulLitUnion(valName) || nameIsNulBool(valName) { return MVK_MONO }
   // A nullable union value has three sound shapes: a niche nullable ref value — one struct,
   // map or list member plus null — riding the same vals rep as its non-null twin; a pure
   // scalar nullable value-union, which boxes; and one with two or more non-null members, which
@@ -6431,8 +6445,8 @@ export function mvValKindOfName(valName: string): i32 {
   if unionSetHasNull(valName) {
     const nin = nulRefMapValInnerOf(valName)
     if nin != "" {
-      if nin == "string" { return 3 }
-      if nameIsMap(nin) { return 6 }
+      if nin == "string" { return MVK_STR }
+      if nameIsMap(nin) { return MVK_REF }
       // A nullable-closure value is kind 14: the vals element is already the
       // `(ref null $cloStruct)` fat-pointer, so the niche rides the non-null closure rep. A
       // litunion result stays a loud reject — the read stays nullable, so the call needs a
@@ -6447,16 +6461,18 @@ export function mvValKindOfName(valName: string): i32 {
         const nret = fnRetTextOf(ncl, nca)
         let nri = 0
         while nri < nret.length && nret[nri] == ' ' { nri = nri + 1 }
-        if nameIsLitUnionType(nret.slice(nri, nret.length)) { return -3 }
-        return 14
+        if nameIsLitUnionType(nret.slice(nri, nret.length)) {
+          return MVK_UNSUPPORTED
+        }
+        return MVK_CLOSURE
       }
       // A nullable list value is kind 6, like its non-null twin: the vals element is already
       // `(ref null <wrapper>)`, so a stored `null` is `ref.null` of that wrapper. The three
       // predicates are this ladder's kind-6 set, and they must admit the same element reps as
       // the non-null arm — `u8[]` names itself in both, or the pair splits.
-      if scalarListRepOfName(nin) != null { return 6 }
-      if nameIsRefArray(nin) { return 6 }
-      return 1
+      if scalarListRepOfName(nin) != null { return MVK_REF }
+      if nameIsRefArray(nin) { return MVK_REF }
+      return MVK_STRUCT
     }
     const nulAtoms: string[] = []
     splitUnionAtoms(valName, nulAtoms)
@@ -6472,66 +6488,66 @@ export function mvValKindOfName(valName: string): i32 {
       }
       na = na + 1
     }
-    if refMember && nonNull < 2 { return -3 }
-    if !refMember && !isValueUnionName(valName) { return -3 }
+    if refMember && nonNull < 2 { return MVK_UNSUPPORTED }
+    if !refMember && !isValueUnionName(valName) { return MVK_UNSUPPORTED }
   }
   let kind = -1
   if valName == "string" {
-    kind = 3
+    kind = MVK_STR
   } else if valName == "f64" {
     // An f64-valued map: its vals list is the scalar f64 list, not a ref list. It rides the
     // existing mv-slot frame, but the value is a scalar, so its typed valStash is an f64
     // local rather than a nullable ref.
-    kind = 11
+    kind = MVK_F64
   } else if valName == "i64" {
     // An i64-valued map: the scalar i64 list (`$il64TypeIdx`/`$ia64TypeIdx`); valStash i64.
-    kind = 10
+    kind = MVK_I64
   } else if valName == "f32" {
     // An f32-valued map: the scalar f32 list (`$fl32TypeIdx`/`$fa32TypeIdx`); valStash f32.
-    kind = 13
+    kind = MVK_F32
   } else if nameIsBareMap(valName) {
     // A nested map: the value is an inner map struct ref, stored in a ref list whose element
     // kind is 3, reusing the same ref-value spine as a struct-valued map. The member-union
     // guard keeps a map-first union value out of this arm, so it reaches the union arm below.
     // The inner-value chain resolves recursively to any depth through `mvShapeOfValName`.
-    kind = 6
+    kind = MVK_REF
   } else if scalarListRepOfName(valName) != null {
     // A list-valued map: the value is a list wrapper ref, stored in a ref list whose element
     // kind picks the inner list's wrapper. Same ref-value spine as a nested map.
-    kind = 6
+    kind = MVK_REF
   } else if nameIsRefArray(valName) {
     // Any ref-array map value — a struct list, a union list, a nested `S[][]`, a closure list
     // — is a list wrapper ref stored in a ref-value list whose element is this value's
     // wrapper. The store seeds the value literal off this slot and the read classifies the
     // element recursively, so any nesting falls out with no per-shape special cases.
-    kind = 6
+    kind = MVK_REF
   } else if unionMemberCount(unionMemberSetOf(valName)) > 1 {
     // A union-valued map: each value is the shared union box ref, stored in a ref list whose
     // element kind is 2 — the same ref-value spine as a struct value, differing only in the
     // element heap and the store-coerce. A map member boxes exactly as it does in binding
     // position, and `markMapUnionArms` interns the arm's mv slot so tag and read agree.
-    kind = 2
+    kind = MVK_UNION
   } else if annArrowAt(valName) >= 0 {
     // A function-valued map: each value is a closure fat-pointer stored in a ref list whose
     // element kind is 5, the same rep an `((i32) => i32)[]` array uses. A litunion result
     // rides it too — the call's `$fnsig` keys the i32 atom and the atom widens at the print
     // seam, since `exprString` gates its `>S` claim on the call node's litunion-alias type.
-    kind = 14
+    kind = MVK_CLOSURE
   } else {
-    if structIndexByValName(valName) >= 0 { kind = 1 }
+    if structIndexByValName(valName) >= 0 { kind = MVK_STRUCT }
     // The nominal half of that rung (D47): `structIndexByValName` is a `sNames` lookup and
     // `collectS` skips a `type X = {…}` that is a union member, so an arm spelled by its own
     // name has no struct row. Reached only by the name-keyed gates, which do not canon and
     // must not disagree with the interner. Nominal: an exact `uVariants` lookup, no shape scan.
-    if kind < 0 && variantIndexOf(valName) >= 0 { kind = 1 }
+    if kind < 0 && variantIndexOf(valName) >= 0 { kind = MVK_STRUCT }
     // The shape rung the adopter already took (D671), reached only when both lookups above
     // decline — the one state in which the render names no row at all, and one the node side
     // put it in. `mvValRowOfShape` is the name-keyed reading of `collectAnonShapes`' own gate:
     // a literal whose `#anon` row is suppressed because a declared row or an arm adopts it.
-    if kind < 0 && mvValArmOfShape(valName) >= 0 { kind = 1 }
-    if kind < 0 && mvValRowOfShape(valName) >= 0 { kind = 1 }
+    if kind < 0 && mvValArmOfShape(valName) >= 0 { kind = MVK_STRUCT }
+    if kind < 0 && mvValRowOfShape(valName) >= 0 { kind = MVK_STRUCT }
   }
-  if kind < 0 { return -3 }
+  if kind < 0 { return MVK_UNSUPPORTED }
   kind
 }
 
@@ -6994,7 +7010,7 @@ function mvShapeOfValNameArmTyGo(
   const valNameIn = mvArmKeyName(valNameInRaw, armTy)
   const valName = mvCanonValName(valNameIn)
   const kind = mvValKindOfName(valName)
-  if kind == -1 { return -1 }
+  if kind == MVK_MONO { return -1 }
   if kind < 0 { return -3 }
   // A niche-nullable value name resolves its struct or map identity — and keys its vals
   // ref-list slot — through the single non-null member, so the slot shares the vals rep and
@@ -7003,18 +7019,20 @@ function mvShapeOfValNameArmTyGo(
   const nin = nulRefMapValInnerOf(valName)
   if nin != "" { bare = nin }
   let vsi = -1
-  if kind == 1 { vsi = anonLeafSupersedeOf(structIndexByValName(bare)) }
+  if kind == MVK_STRUCT {
+    vsi = anonLeafSupersedeOf(structIndexByValName(bare))
+  }
   // The adopted row (D671), read through the same resolver the kind rung used. Without it a
   // shape the kind rung admitted mints a slot whose struct column is -1 — a vals element over
   // no heap. Reached only where the strict lookup declined and the shape is not an arm; the
   // arm half is the variant column below, and the two are never both set.
-  if kind == 1 && vsi < 0 && mvValArmOfShape(bare) < 0 {
+  if kind == MVK_STRUCT && vsi < 0 && mvValArmOfShape(bare) < 0 {
     vsi = mvValRowOfShape(bare)
   }
   // A value union also interns its scalar value-box reps; a struct or heterogeneous union just
   // rides the box payload and needs none. A map arm's mv value slot is interned so the
   // store-coerce tag and the narrowed read resolve the same slot.
-  if kind == 2 {
+  if kind == MVK_UNION {
     if isValueUnionName(valName) { registerValueUnionName(valName) }
     markMapUnionArms(valName)
   }
@@ -7037,7 +7055,7 @@ function mvShapeOfValNameArmTyGo(
   // the recursive interning runs before this slot's parallel arrays are pushed: a reentrant
   // intern between two pushes would land its own entry at this slot's index and skew the rest.
   let rls6 = -1
-  if kind == 6 {
+  if kind == MVK_REF {
     lUsed = true
     aUsed = true
     if nameIsMap(bare) {
@@ -7093,7 +7111,7 @@ function mvShapeOfValNameArmTyGo(
   let mvSigRow = mvArmSigOfTy(armTy)
   if mvSigRow < 0 { mvSigRow = mvArmSigOfName(valName, 8) }
   mvValArmSig.push(mvSigRow)
-  if kind == 1 {
+  if kind == MVK_STRUCT {
     // The kind-1 site is deliberately unhinted: it interns `sNames[vsi]`, not `valName`, and
     // that row's `sTyIx` sidecar has two producers that answer differently for an `#anonN` row.
     // It is keyed by the arm's name where the value is one (D34), since `sNames[vsi]` is the
@@ -7115,18 +7133,18 @@ function mvShapeOfValNameArmTyGo(
     }
     rlUsed = true
     raUsed = true
-  } else if kind == 2 {
+  } else if kind == MVK_UNION {
     // A union-value ref list: element kind 2, the union box, heap `uBoxIdx`.
     mvRlSlot.push(rlInternNameTy(valName, RLK_UNION, vRowTy))
     rlUsed = true
     raUsed = true
-  } else if kind == 6 {
+  } else if kind == MVK_REF {
     // The map's value is a ref list or a nested map: the vals ref-list slot interned above,
     // before this slot's parallel-array pushes.
     mvRlSlot.push(rls6)
     rlUsed = true
     raUsed = true
-  } else if kind == 14 {
+  } else if kind == MVK_CLOSURE {
     // A closure-value ref list: element kind 5, the closure fat-pointer, heap `cloStructIdx`.
     mvRlSlot.push(rlInternNameTy(valName, RLK_CLOSURE, vRowTy))
     rlUsed = true
@@ -7134,12 +7152,12 @@ function mvShapeOfValNameArmTyGo(
   } else {
     mvRlSlot.push(-1)
   }
-  if kind == 11 { fa64Used = true }
-  if kind == 10 { ia64Used = true }
-  if kind == 13 { fa32Used = true }
+  if kind == MVK_F64 { fa64Used = true }
+  if kind == MVK_I64 { ia64Used = true }
+  if kind == MVK_F32 { fa32Used = true }
   // A string-valued map: force the string-list value flag so a bound `m.values()` supports
   // `.length` and indexing, which gate on `slUsed`.
-  if kind == 3 {
+  if kind == MVK_STR {
     slUsed = true
     aUsed = true
   }
@@ -7160,7 +7178,7 @@ function mvSlotOfValNameFindK(valNameIn: string, keyK: i32) {
   // literal-union atom value, and the nullable-atom niches all ride the shared mono
   // `$mStructIdx` with no interned slot. A two-name test rejects the atom spellings loudly
   // even though the same map lowers fine as a binding.
-  if mvValKindOfName(valName) == -1 { return -1 }
+  if mvValKindOfName(valName) == MVK_MONO { return -1 }
   const aFd = mvSlotOfValNameTyK(valNameIn, keyK)
   if aFd >= 0 { return aFd }
   const nmFd = mvSlotByValNameK(valName, keyK)
@@ -7174,7 +7192,7 @@ function mvSlotOfValNameFindK(valNameIn: string, keyK: i32) {
 // thing: `m[k]` over a nested map is a Map, over a list-valued map an i32 list.
 export function mvValIsMap(slot: i32) {
   if slot < 0 { return false }
-  if mvValKind[slot] != 6 { return false }
+  if mvValKind[slot] != MVK_REF { return false }
   rlElemKindTbl[mvRlSlot[slot]] == RLK_MAP
 }
 
@@ -7192,7 +7210,7 @@ export function mvInnerMapShape(slot: i32): i32 {
 // value list's ref-list element code, decoded.
 export function mvListValKind(slot: i32): VKind | null {
   if slot < 0 { return null }
-  if mvValKind[slot] != 6 { return null }
+  if mvValKind[slot] != MVK_REF { return null }
   rlElemListRep(rlElemKindTbl[mvRlSlot[slot]])
 }
 
@@ -13665,7 +13683,7 @@ export function exprIsI64(exprIx: i32, fnIx: i32) {
   // `m[k] ?? d` over an i64-valued map yields an i64 (the value type).
   const cmi = coalesceMvSlot(exprIx, fnIx)
   if cmi >= 0 {
-    if mvValKind[cmi] == 10 { return true }
+    if mvValKind[cmi] == MVK_I64 { return true }
   }
   const e = P.nodes[exprIx]
   // An explicit `x as T` cast has exactly its target rep (see exprIsF64).
@@ -13684,7 +13702,7 @@ export function exprIsI64(exprIx: i32, fnIx: i32) {
     if exprI64Array(e.idxArr, fnIx) { return true }
     const mri = mapReadMvSlot(exprIx, fnIx)
     if mri >= 0 {
-      if mvValKind[mri] == 10 { return true }
+      if mvValKind[mri] == MVK_I64 { return true }
     }
   }
   // A bare integer literal past the i32 range is typed i64 by the checker (the host's
@@ -14063,7 +14081,7 @@ export function exprIsF64(exprIx: i32, fnIx: i32) {
   // `m[k] ?? d` / `m.get(k) ?? d` over an f64-valued map yields an f64 (the value type).
   const cmf = coalesceMvSlot(exprIx, fnIx)
   if cmf >= 0 {
-    if mvValKind[cmf] == 11 { return true }
+    if mvValKind[cmf] == MVK_F64 { return true }
   }
   const e = P.nodes[exprIx]
   // An explicit `x as T` cast has exactly its target rep — classify syntactically
@@ -14079,7 +14097,7 @@ export function exprIsF64(exprIx: i32, fnIx: i32) {
     if exprF64Array(e.idxArr, fnIx) { return true }
     const mrs = mapReadMvSlot(exprIx, fnIx)
     if mrs >= 0 {
-      if mvValKind[mrs] == 11 { return true }
+      if mvValKind[mrs] == MVK_F64 { return true }
     }
     return false
   }
@@ -15141,7 +15159,7 @@ export function mapReadNarrowableSlot(idxIx: i32, fnIx: i32) {
   const mrs = mapReadMvSlot(idxIx, fnIx)
   if mrs < 0 || mrs >= mvValKind.length { return -1 }
   const k = mvValKind[mrs]
-  if k == 10 || k == 11 || k == 13 { return -1 }
+  if k == MVK_I64 || k == MVK_F64 || k == MVK_F32 { return -1 }
   mrs
 }
 
@@ -15152,7 +15170,7 @@ export function mapReadNarrowableSlot(idxIx: i32, fnIx: i32) {
 export function mapReadNarrowedAtomKind(exprIx: i32, fnIx: i32) {
   const mrs = mapReadNarrowableSlot(exprIx, fnIx)
   if mrs < 0 { return -1 }
-  if mvValKind[mrs] != 2 { return -1 }
+  if mvValKind[mrs] != MVK_UNION { return -1 }
   const a = narrowedValueAtomOf(indexPathKeyOf(exprIx))
   if a == "" { return -1 }
   const ak = valueAtomKind(a)
@@ -15167,7 +15185,7 @@ export function mapReadNarrowedAtomKind(exprIx: i32, fnIx: i32) {
 export function mapReadNarrowedContainer(exprIx: i32, fnIx: i32): boolean {
   const mrs = mapReadNarrowableSlot(exprIx, fnIx)
   if mrs < 0 { return false }
-  if mvValKind[mrs] != 2 { return false }
+  if mvValKind[mrs] != MVK_UNION { return false }
   if narrowedMapOfPlace(exprIx) != "" { return true }
   narrowedRefArrayOfPlace(exprIx) != ""
 }
@@ -15215,7 +15233,7 @@ function pushIndexMapComplement(
   const ik = indexPathKeyOf(idxIx)
   if ik == "" { return false }
   const mrs = mapReadNarrowableSlot(idxIx, fnIx)
-  if mrs < 0 || mvValKind[mrs] != 2 { return false }
+  if mrs < 0 || mvValKind[mrs] != MVK_UNION { return false }
   const slot = narrowSlotOf(ik)
   if slot >= 0 {
     const cur = narrowVariants[slot]
@@ -15253,7 +15271,7 @@ function pushIndexMapNullNarrow(idxIx: i32, fnIx: i32) {
   if mrs < 0 { return false }
   // A value-union cell an `is` complement already narrowed keeps what that ruled out.
   const vslot = narrowSlotOf(ik)
-  if vslot >= 0 && mvValKind[mrs] == 2 {
+  if vslot >= 0 && mvValKind[mrs] == MVK_UNION {
     const vcur = narrowVariants[vslot]
     if vcur != "" && vcur != "null" {
       const vrest = removeAtomFromSet(vcur, "null")
@@ -16526,7 +16544,7 @@ export function forInMapValsSlot(iterIx: i32, fnIx: i32) {
 export function mapValElemKind(mapObjIx: i32, fnIx: i32): VKind | null {
   const vsl = mapShapeOfExpr(mapObjIx, fnIx)
   if vsl >= 0 {
-    if mvValKind[vsl] == 3 {
+    if mvValKind[vsl] == MVK_STR {
       // A nullable string value (`{[string]: string | null}`) rides the same kind-3
       // vals list as its non-null twin (the element slot is nullable either way), so
       // only the loop var differs: the `string | null` niche, exactly as `const v =
@@ -16534,23 +16552,23 @@ export function mapValElemKind(mapObjIx: i32, fnIx: i32): VKind | null {
       if mvSlotNullable(vsl) { return "nulstr" }
       return "str" // string value
     }
-    if mvValKind[vsl] == 11 {
+    if mvValKind[vsl] == MVK_F64 {
       return "f64" // f64 value (scalar local)
     }
-    if mvValKind[vsl] == 10 {
+    if mvValKind[vsl] == MVK_I64 {
       return "i64" // i64 value (scalar local)
     }
-    if mvValKind[vsl] == 13 {
+    if mvValKind[vsl] == MVK_F32 {
       return "f32" // f32 value (scalar local)
     }
-    if mvValKind[vsl] == 14 {
+    if mvValKind[vsl] == MVK_CLOSURE {
       return "closure" // closure value (`{[string]: (i32) => i32}` — loop var calls each)
     }
     // A list value (`{[string]: i32[]}` / `S[]` …): the loop var binds the inner
     // value list's own rep (`mvListValKind`), exactly as a nested-array `for row in
     // g` does. A nullable list value rides the same vals list as its non-null twin,
     // so only the loop var differs — the niche kind, mirroring `nulstr`/`nulstruct`.
-    if mvValKind[vsl] == 6 {
+    if mvValKind[vsl] == MVK_REF {
       // A nested-map value (`{[K]: {[K2]: V}}`) rides the same kind-6 vals list with a map
       // element, and binds the map local its own `m[k]` read binds (D2515).
       if mvValIsMap(vsl) {
@@ -16562,7 +16580,7 @@ export function mapValElemKind(mapObjIx: i32, fnIx: i32): VKind | null {
     }
     // A union-box value (`{[string]: i32 | null}`, `{[string]: C | S}`): the vals
     // element IS `$uBox`, so the loop var binds as a kind-4 union-box local.
-    if mvValKind[vsl] == 2 { return "union" }
+    if mvValKind[vsl] == MVK_UNION { return "union" }
     // A nullable-struct value (`{[string]: S | null}`) rides the same kind-1 vals
     // list as its non-null twin; the loop var is the kind-9 niche instead.
     if mvSlotNullable(vsl) { return "nulstruct" }
@@ -16603,7 +16621,7 @@ export function forInPairStructIdx(iterIx: i32, fnIx: i32): i32 {
   const vsl = forInPairValsSlot(iterIx, fnIx)
   if vsl < 0 { return -1 }
   if mvValVariantOf(vsl) >= 0 { return -1 }
-  if mvValKind[vsl] == 1 { return mvValStructIdxOf(vsl) }
+  if mvValKind[vsl] == MVK_STRUCT { return mvValStructIdxOf(vsl) }
   if mvValIsMap(vsl) { return mvInnerMapShape(vsl) }
   const lk = mvListValKind(vsl)
   if lk == "reflist" { return mvValInnerRlSlot(vsl) }
@@ -16621,7 +16639,7 @@ export function forInRefArrayStructIdx(iterIx: i32, fnIx: i32) {
     // layout lives in the variant table, and this resolver's contract is a struct index. It
     // declines rather than handing back a row from the other namespace.
     if mvValVariantOf(mvs) >= 0 { return -1 }
-    if mvValKind[mvs] == 1 { return mvValStructIdxOf(mvs) }
+    if mvValKind[mvs] == MVK_STRUCT { return mvValStructIdxOf(mvs) }
     return -1
   }
   if !exprRefArray(iterIx, fnIx) { return -1 }
@@ -16765,13 +16783,13 @@ export function mapReadScalarBoxKind(exprIx: i32, fnIx: i32) {
   if nodeTyMapValIsNumLitUnion(e.idxArr) { return -1 }
   const sl = mapShapeOfExpr(e.idxArr, fnIx)
   if sl >= 0 {
-    if mvValKind[sl] == 10 {
+    if mvValKind[sl] == MVK_I64 {
       return 3 // i64
     }
-    if mvValKind[sl] == 11 {
+    if mvValKind[sl] == MVK_F64 {
       return 4 // f64
     }
-    if mvValKind[sl] == 13 {
+    if mvValKind[sl] == MVK_F32 {
       return 5 // f32
     }
     return -1
@@ -16890,8 +16908,8 @@ export function coalesceStaysNullable(exprIx: i32, cns: i32, _fnIx: i32) {
 function coalesceKeepsScalarBox(exprIx: i32, cns: i32, fnIx: i32) {
   if !coalesceStaysNullable(exprIx, cns, fnIx) { return false }
   const k = mvValKind[cns]
-  if k == 2 { return mvUnionIsScalarNull(cns) }
-  k == 10 || k == 11 || k == 13
+  if k == MVK_UNION { return mvUnionIsScalarNull(cns) }
+  k == MVK_I64 || k == MVK_F64 || k == MVK_F32
 }
 
 // The one nullability decision for the non-map `??` reps (the value-union box and the
@@ -17689,13 +17707,13 @@ function mapValuesResultKind(exprIx: i32, fnIx: i32) {
           }
           if sh >= 0 {
             const vk = mvValKind[sh]
-            if vk == 3 {
+            if vk == MVK_STR {
               return 7 // string-valued → string list
             }
-            if vk == 11 {
+            if vk == MVK_F64 {
               return 12 // f64-valued → f64 list
             }
-            if vk == 10 {
+            if vk == MVK_I64 {
               return 20 // i64-valued → i64 list
             }
             return 5 // struct / nested-list / nested-map → ref list
@@ -18217,10 +18235,10 @@ function shapeFieldParse(name: string, outNames: string[], outTypes: string[]) {
 function mvValNamesCompat(va: string, ve: string): boolean {
   const ka = mvValKindOfName(va)
   const ke = mvValKindOfName(ve)
-  if ka == -3 || ke == -3 { return true }
+  if ka == MVK_UNSUPPORTED || ke == MVK_UNSUPPORTED { return true }
   if ka != ke {
-    if ka == 3 && ke == -1 && nameIsLitUnionType(ve) { return true }
-    if ke == 3 && ka == -1 && nameIsLitUnionType(va) { return true }
+    if ka == MVK_STR && ke == MVK_MONO && nameIsLitUnionType(ve) { return true }
+    if ke == MVK_STR && ka == MVK_MONO && nameIsLitUnionType(va) { return true }
     return false
   }
   const sa = mvSlotOfMapValNameOrMono(va)
@@ -22601,12 +22619,14 @@ export function repMapValSlotsTwin(a: i32, b: i32): i32 {
   // The map struct's identity is exactly (keys wrapper, vals wrapper): two kind-1 slots that
   // interned the same vals ref-list slot emit byte-equal map structs whatever the checker
   // says about value types. Asked as slot equality rather than `rlSlotsLayoutTwin`, to skip its cross-table arm.
-  if k == 1 && mvRlSlot[a] >= 0 && mvRlSlot[a] == mvRlSlot[b] { return 1 }
+  if k == MVK_STRUCT && mvRlSlot[a] >= 0 && mvRlSlot[a] == mvRlSlot[b] {
+    return 1
+  }
   // ── same wrapper, not same slot (D301) ──
   // The rung above is slot equality; the vals half of a map struct's identity is the wrapper.
   // Two declared names of one layout intern two rows, which slot equality cannot see past, so
   // this leg asks the struct-row question directly through `repStructSlotsTwin`.
-  if k == 1 {
+  if k == MVK_STRUCT {
     const wa = mvValsElemStructRow(a)
     const wb = mvValsElemStructRow(b)
     if wa >= 0 && wb >= 0 && repStructSlotsTwin(wa, wb) == 1 { return 1 }
@@ -22615,16 +22635,18 @@ export function repMapValSlotsTwin(a: i32, b: i32): i32 {
   // kind 6, and its recursion bottoms out in the pair the rung above just merged — so
   // without this the inner merge lands but the outer map keeps two structs. Hoisted rather
   // than widened: the arm is unchanged, only the canonical-key precondition is dropped.
-  if k == 6 && rlSlotsLayoutTwin(mvRlSlot[a], mvRlSlot[b]) == 1 { return 1 }
+  if k == MVK_REF && rlSlotsLayoutTwin(mvRlSlot[a], mvRlSlot[b]) == 1 {
+    return 1
+  }
   // Every union value is the one shared box ref, whatever its members, so two union-valued
   // slots of one key rep are one vals list and one map struct.
-  if k == 2 { return 1 }
+  if k == MVK_UNION { return 1 }
   const ka = mvValTwinCanonId(a)
   if ka < 0 { return 0 }
   if ka != mvValTwinCanonId(b) { return 0 }
-  if k == 3 || k == 10 || k == 11 || k == 13 { return 1 }
-  if k == 2 || k == 14 { return 1 }
-  if k == 1 {
+  if k == MVK_STR || k == MVK_I64 || k == MVK_F64 || k == MVK_F32 { return 1 }
+  if k == MVK_UNION || k == MVK_CLOSURE { return 1 }
+  if k == MVK_STRUCT {
     // The direct question, asked before the proxy (D123): what decides whether two mv slots
     // emit one map struct is the vals list wrapper, via `rlSlotsLayoutTwin`. The proxy below
     // stays as the fall-through, since it is not a mere approximation — some arm-twin merges
@@ -22652,7 +22674,7 @@ export function repMapValSlotsTwin(a: i32, b: i32): i32 {
     if mva >= 0 { return repVariantSlotsTwin(mva, mvb) }
     return repStructSlotsTwin(mvValStructIdx[a], mvValStructIdx[b])
   }
-  if k == 6 { return rlSlotsLayoutTwin(mvRlSlot[a], mvRlSlot[b]) }
+  if k == MVK_REF { return rlSlotsLayoutTwin(mvRlSlot[a], mvRlSlot[b]) }
   0
 }
 
@@ -28547,7 +28569,8 @@ export function exprStruct(exprIx: i32, fnIx: i32) {
     if cms >= 0 {
       // A nullable-value slot with a NON-null default coalesces to the non-null struct too
       // (stored null included) — only a nullable default leaves it `S | null`.
-      return mvValKind[cms] == 1 && !coalesceStaysNullable(exprIx, cms, fnIx)
+      return mvValKind[cms] == MVK_STRUCT
+        && !coalesceStaysNullable(exprIx, cms, fnIx)
     }
     // A `<S|null> ?? <S>` coalesce yields the non-null struct (the generic nullable-struct `??` emit) —
     // so a bound `const p = r ?? d` classifies struct and `(r ?? d).x` resolves. The left is the
@@ -29075,7 +29098,7 @@ export function exprNulClosure(exprIx: i32, fnIx: i32) {
       }
     }
     const mrs = mapReadMvSlot(ux, fnIx)
-    if mrs >= 0 { return mvValKind[mrs] == 14 }
+    if mrs >= 0 { return mvValKind[mrs] == MVK_CLOSURE }
   }
   // A `m[k] ?? d` read over a nullable-closure-valued map stays nullable only when the
   // default is itself nullable; a non-null default coalesces every null (stored included)
@@ -29083,7 +29106,8 @@ export function exprNulClosure(exprIx: i32, fnIx: i32) {
   if e is BinExpr {
     const cns = coalesceMvSlot(ux, fnIx)
     if cns >= 0 {
-      return mvValKind[cns] == 14 && coalesceStaysNullable(ux, cns, fnIx)
+      return mvValKind[cns] == MVK_CLOSURE
+        && coalesceStaysNullable(ux, cns, fnIx)
     }
   }
   false
@@ -29771,7 +29795,7 @@ export function structIndexOfExpr(exprIx: i32, fnIx: i32) {
     if cms >= 0 {
       // An ARM value has no `sNames` row; its layout is `exprVariantIndex`'s (D34).
       if mvValVariantOf(cms) >= 0 { return -1 }
-      if mvValKind[cms] == 1 { return mvValStructIdxOf(cms) }
+      if mvValKind[cms] == MVK_STRUCT { return mvValStructIdxOf(cms) }
     }
     // A `<S|null> ?? <S>` coalesce resolves to the (inner) struct index — so `(r ?? d).field` finds
     // the layout. The left's nullable struct drives it (its inner struct), else the right default.
@@ -29965,7 +29989,7 @@ export function structIndexOfExpr(exprIx: i32, fnIx: i32) {
     if mrs >= 0 {
       // An ARM value has no `sNames` row; its layout is `exprVariantIndex`'s (D34).
       if mvValVariantOf(mrs) >= 0 { return -1 }
-      if mvValKind[mrs] == 1 { return mvValStructIdxOf(mrs) }
+      if mvValKind[mrs] == MVK_STRUCT { return mvValStructIdxOf(mrs) }
     }
   }
   // The `?.` producer (D1084): `o?.f` over `o: T | null` with `T = {f: S}` banks `S | null`,
@@ -30265,7 +30289,7 @@ export function exprUnion(exprIx: i32, fnIx: i32) {
       // The container arms of the same narrowing, exactly as the ref-list arm above declines
       // them — the read delivers the map or list wrapper, not the box (D1866).
       if mapReadNarrowedContainer(exprIx, fnIx) { return false }
-      return mvValKind[mri] == 2
+      return mvValKind[mri] == MVK_UNION
     }
   }
   // `m[k] ?? d` over a UNION-valued map yields the value union box — EXCEPT a `scalar | null`
@@ -30273,7 +30297,9 @@ export function exprUnion(exprIx: i32, fnIx: i32) {
   if e is BinExpr {
     const cmu = coalesceMvSlot(exprIx, fnIx)
     if cmu >= 0 {
-      if mvValKind[cmu] == 2 && !mvUnionIsScalarNull(cmu) { return true }
+      if mvValKind[cmu] == MVK_UNION && !mvUnionIsScalarNull(cmu) {
+        return true
+      }
       // A nullable default keeps a scalar read `S | null`, which is the box (D2253).
       return coalesceKeepsScalarBox(exprIx, cmu, fnIx)
     }
@@ -31127,7 +31153,7 @@ export function unionNameOfExpr(exprIx: i32, fnIx: i32) {
     const cmu = coalesceMvSlot(unwrapParen(exprIx), fnIx)
     if cmu >= 0 {
       // `scalar | null` peels to a raw scalar (not a union), so it has no union name here.
-      if mvValKind[cmu] == 2 && !mvUnionIsScalarNull(cmu) {
+      if mvValKind[cmu] == MVK_UNION && !mvUnionIsScalarNull(cmu) {
         return mvValName[cmu]
       }
     }
@@ -31200,7 +31226,7 @@ export function unionNameOfExpr(exprIx: i32, fnIx: i32) {
     // so it carries no union name either — the two must answer together.
     const mri = mapReadMvSlot(unwrapParen(exprIx), fnIx)
     if mri >= 0 {
-      if mvValKind[mri] == 2 {
+      if mvValKind[mri] == MVK_UNION {
         if mapReadNarrowedAtomKind(unwrapParen(exprIx), fnIx) >= 0 { return "" }
         if mapReadNarrowedContainer(unwrapParen(exprIx), fnIx) { return "" }
         return mvValName[mri]
@@ -31555,7 +31581,7 @@ function indexUnionReadKind(exprIx: i32, fnIx: i32) {
     // A union-valued map's bare read is the same box a union-element cell is (D1025), and a
     // narrowed cell unboxes at the read — the map receiver just one container over.
     const mrs = mapReadNarrowableSlot(exprIx, fnIx)
-    if mrs >= 0 && mvValKind[mrs] == 2 {
+    if mrs >= 0 && mvValKind[mrs] == MVK_UNION {
       const mak = mapReadNarrowedAtomKind(exprIx, fnIx)
       if mak >= 0 { return mak }
       return -2
@@ -33128,7 +33154,7 @@ function objMapFieldCompat(objIx: i32, fname: string, elem: string): boolean {
   const valIx = objFieldVal(objIx, fname)
   if valIx < 0 { return true }
   if !nodeTyIsMap(valIx) { return true }
-  if nodeTyMapValIsLitUnion(valIx) { return mvValKindOfName(elem) == -1 }
+  if nodeTyMapValIsLitUnion(valIx) { return mvValKindOfName(elem) == MVK_MONO }
   mvValNamesCompat(nodeTyMapValName(valIx), elem)
 }
 
@@ -37656,7 +37682,7 @@ function mvSlotOfMapValNameOrMonoKTy(ivIn: string, keyK: i32, valTy: i32): i32 {
   // (rendered name, recorded value type), so the op find keys exactly what the mint keyed.
   const ivK = mvArmKeyName(ivIn, valTy)
   const iv = mvCanonValName(ivK)
-  if mvValKindOfName(iv) == -1 { return -1 }
+  if mvValKindOfName(iv) == MVK_MONO { return -1 }
   // The find's half of the arm component (D48) — the same tri-state the mint threads,
   // answering nominally when `valTy` is known, else via `MV_ARM_NOHINT`.
   const armMo = mvArmHintOfTy(valTy)
@@ -37830,7 +37856,8 @@ export function exprString(exprIx: i32, fnIx: i32) {
     // type); a nullable value with a nullable default stays `string | null`.
     const cms = coalesceMvSlot(exprIx, fnIx)
     if cms >= 0 {
-      return mvValKind[cms] == 3 && !coalesceStaysNullable(exprIx, cms, fnIx)
+      return mvValKind[cms] == MVK_STR
+        && !coalesceStaysNullable(exprIx, cms, fnIx)
     }
     // `r ?? d` over a `string | null` LHS yields a (non-null) string — the coalesce
     // recovers the non-null array ref, so `.length`/`+`/etc. on the result work.
@@ -37873,7 +37900,7 @@ export function exprString(exprIx: i32, fnIx: i32) {
     // question the ref-list arm of the index READ asks before it recovers non-null (D1735).
     const smv = mapReadMvSlot(exprIx, fnIx)
     if smv >= 0 {
-      if mvValKind[smv] == 3 { return indexPlaceNonNull(exprIx) }
+      if mvValKind[smv] == MVK_STR { return indexPlaceNonNull(exprIx) }
     }
   }
   // A field read `p.f` where `f` is a STRING struct field yields a string ref (gap #2:
@@ -38091,14 +38118,15 @@ export function exprIsClosure(exprIx: i32, fnIx: i32) {
     // A bare `m[k]` over a FUNCTION-valued map (`{[string]: (i32) => i32}`, mv kind 14) reads
     // back the closure (nullable — narrow with `if f != null`).
     const mrs = mapReadMvSlot(exprIx, fnIx)
-    if mrs >= 0 { return mvValKind[mrs] == 14 }
+    if mrs >= 0 { return mvValKind[mrs] == MVK_CLOSURE }
   }
   // `m[k] ?? d` over a function-valued map yields the closure — a non-null default coalesces
   // to non-null, a nullable default stays `closure | null` (`exprNullableClosure`'s).
   if e is BinExpr {
     const cm = coalesceMvSlot(exprIx, fnIx)
     if cm >= 0 {
-      return mvValKind[cm] == 14 && !coalesceStaysNullable(exprIx, cm, fnIx)
+      return mvValKind[cm] == MVK_CLOSURE
+        && !coalesceStaysNullable(exprIx, cm, fnIx)
     }
   }
   false
