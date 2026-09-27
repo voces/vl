@@ -13422,6 +13422,31 @@ export function spreadDstBackSlot(kind: MfKind, row: i32, seq: i32) {
   scratchSlot(21, kind, row + 4096 * seq, SCRATCH_BY_BOTH)
 }
 
+// Whether every arm of the if-join at `ifIx` that has a list rep of its own has `k`: a `null` or
+// empty `[]` arm takes the join's, and any other disagreement is a join of two list types, which
+// the if-join gate keeps apart from either (D2831).
+function ifArmsAgreeOnListRep(ifIx: i32, k: VKind, fnIx: i32): boolean {
+  let cur = ifIx
+  while cur >= 0 {
+    const s = P.nodes[cur]
+    cur = -1
+    if s is IfStmt {
+      if !armAgreesOnListRep(s.ifThen, k, fnIx) { return false }
+      if s.ifElse >= 0 {
+        if P.nodes[s.ifElse] is IfStmt { cur = s.ifElse }
+        else if !armAgreesOnListRep(s.ifElse, k, fnIx) { return false }
+      }
+    }
+  }
+  true
+}
+
+function armAgreesOnListRep(blockIx: i32, k: VKind, fnIx: i32): boolean {
+  const tv = armTailValue(blockIx)
+  if tv < 0 || exprIsNullLike(tv) || emptyArrLitIxOf(tv) >= 0 { return true }
+  exprListRep(tv, fnIx) == k
+}
+
 // The arm block's tail value, seen through to the initializer when the tail names a local of
 // the arm's own prelude that no scope has bound yet: a classifier asked before the arm lowers
 // (a global's cell, say) would otherwise read the name as unbound (D2785).
@@ -37957,11 +37982,16 @@ function syntacticListRep(exprIx: i32, fnIx: i32): VKind | null {
   // An if-expression is its join's rep, read off the arm that decides it (D2210).
   if e is IfStmt {
     const ik = ifExprRefKind(exprIx, fnIx)
-    // In a generic instance the join's recorded type is the type parameter, which answers
-    // nothing, so the arms' list rep is the join's (D2825).
-    if tyHasTyVar(nodeTyIxOf(exprIx)) {
+    // In a generic instance the join's recorded type is the type parameter, or absent on a
+    // join the instance rebuilt; neither answers, so arms that agree give the join's rep (D2825).
+    const jt = nodeTyIxOf(exprIx)
+    if jt < 0 || tyHasTyVar(jt) {
       const tk = listRepOrNull(ik)
-      if tk != null { return tk }
+      if tk != null {
+        // Arms that disagree join two list types, which no one list rep holds (D2832).
+        if ifArmsAgreeOnListRep(exprIx, tk, fnIx) { return tk }
+        return null
+      }
     }
     return gatedListRep(ik, "if-join")
   }
