@@ -231,6 +231,9 @@ import {
   fnValUsed,
   invalidateFnChildIndex,
   lambdaCtr,
+  monoExactSubN,
+  monoExactSubRow,
+  monoExactSubT,
   monoGen,
   monoInstFe,
   monoInstName,
@@ -247,7 +250,7 @@ import {
   uVariants,
   unNames,
 } from "./emit_state"
-import { emitFail } from "./emit_bytes"
+import { emitFail, emitFailAt } from "./emit_bytes"
 import {
   anonHandleTyIx,
   arrLitElemName,
@@ -287,6 +290,7 @@ import {
   identFnTypeAnnName,
   isSName,
   isUName,
+  monoExactSubRowOf,
   monoRetRowName,
   nodeMapArmNominalName,
   nominalizeFnTypeOfTy,
@@ -302,6 +306,7 @@ import {
   synthTypeRef,
   synthTypeRefFb,
   synthTypeRefTy,
+  tyCanonKey,
   tyNulFuncInner,
   unRowOfCanon,
   unionArmsOf,
@@ -3303,13 +3308,15 @@ function monoSubstIsExpr(ix: i32, io: i32, variant: string) {
 let monoCgcTyParams: string[] = []
 let monoCgcTvN: string[] = []
 let monoCgcTvV: string[] = []
+// The instance's exact bindings when it is keyed by its exact pins, so a type argument naming a
+// type parameter records the exact pinned type rather than its spelling; empty otherwise.
+let monoCgcSubN: string[] = []
+let monoCgcSubT: i32[] = []
 
 // The explicit type-argument nodes of a cloned call, each substituted under the instance
 // being copied; an argument naming no type parameter is shared unchanged.
 function monoSubstTyArgNodes(tas: i32[]): i32[] {
   const out: i32[] = []
-  const noN: string[] = []
-  const noT: i32[] = []
   let i = 0
   while i < tas.length {
     const sub = monoSubstAnnNode(
@@ -3317,8 +3324,8 @@ function monoSubstTyArgNodes(tas: i32[]): i32[] {
       monoCgcTyParams,
       monoCgcTvN,
       monoCgcTvV,
-      noN,
-      noT,
+      monoCgcSubN,
+      monoCgcSubT,
     )
     if sub >= 0 { out.push(sub) } else { out.push(tas[i]) }
     i = i + 1
@@ -4303,6 +4310,197 @@ function monoRegisterPinUnion(name: string) {
   0
 }
 
+// Per template slot: 1 when its body tests a value of a type parameter, directly or through a
+// generic it calls with one, 0 when not, -1 or absent when not yet asked. A slot on the walk's
+// stack holds -2 - n, n its visit number: asked, or answered "no" pending its cycle's root.
+let monoExactMemo: i32[] = []
+// The walk's stack of slots, its next visit number, and the lowest visit number of a slot on the
+// stack the current walk has read (Tarjan's lowlink), so a cycle settles once at its root.
+let monoExactStack: i32[] = []
+let monoExactNext = 0
+let monoExactLow = 0
+
+// Whether generic `fe` is keyed by its exact pins: its body has an `is`, `as` or `match` over a
+// value whose type names a type parameter, or passes such a value to a generic that has.
+function monoNeedsExactKey(fe: i32): boolean {
+  if fe < 0 || fe >= monoOrigNode.length { return false }
+  while monoExactMemo.length <= fe { monoExactMemo.push(-1) }
+  const m = monoExactMemo[fe]
+  if m >= 0 { return m == 1 }
+  if m <= -2 {
+    // On the stack: a provisional "no" until the cycle through it settles.
+    if -2 - m < monoExactLow { monoExactLow = -2 - m }
+    return false
+  }
+  const me = monoExactNext
+  monoExactNext = me + 1
+  const outerLow = monoExactLow
+  monoExactLow = me
+  // arena-tick exempt: a memo of the template's body, which no rebuild pass reads.
+  monoExactMemo[fe] = -2 - me
+  monoExactStack.push(fe)
+  let r = false
+  const fn = P.nodes[monoOrigNode[fe]]
+  if fn is FuncDecl { r = monoTestsTyVar(fn.fnBody) }
+  const low = monoExactLow
+  monoExactLow = outerLow
+  if r {
+    // A "yes" is final, and every "no" pending above it may have read it as a "no".
+    monoExactUnwind(fe, 1, -1)
+  } else if low >= me {
+    // The root of its cycle: its walk read nothing below it on the stack, so all of it is "no".
+    monoExactUnwind(fe, 0, 0)
+  } else if low < outerLow {
+    monoExactLow = low
+  }
+  r
+}
+
+// Pops the walk's stack down to and including `fe`, settling `fe` to `mine` and every slot above
+// it to `rest`: 0 for a cycle that settled "no", -1 to re-ask after a "yes".
+function monoExactUnwind(fe: i32, mine: i32, rest: i32) {
+  while monoExactStack.length > 0 {
+    const top = monoExactStack[monoExactStack.length - 1]
+    monoExactStack.pop()
+    let v = rest
+    if top == fe { v = mine }
+    // arena-tick exempt: the same memo.
+    if top >= 0 && top < monoExactMemo.length { monoExactMemo[top] = v }
+    if top == fe { return 0 }
+  }
+  0
+}
+
+// Whether the node recorded at `ix` has a type naming a type parameter.
+function monoTyVarTyped(ix: i32): boolean {
+  const t = nodeTyIxOf(unwrapParen(ix))
+  t >= 0 && tyHasTyVar(t)
+}
+
+// `monoNeedsExactKey`'s walk over one subtree, nested lambdas included.
+function monoTestsTyVar(ix: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = P.nodes[ix]
+  if n is IsExpr {
+    if monoTyVarTyped(n.isObj) { return true }
+  }
+  if n is AsExpr {
+    if monoTyVarTyped(n.asObj) { return true }
+  }
+  if n is MatchExpr {
+    if monoTyVarTyped(n.matchScrut) { return true }
+  }
+  if n is Call {
+    const cf = P.nodes[n.callFn]
+    if cf is Ident {
+      if monoCalleeIsGeneric(cf.identName) {
+        let passes = callTyArgsOf(ix).length > 0
+        let a = 0
+        while a < n.callArgs.length && !passes {
+          passes = monoTyVarTyped(n.callArgs[a])
+          a = a + 1
+        }
+        // A callee still being asked is on this walk's own cycle and answers nothing new.
+        if passes && monoNeedsExactKey(fnIndexOf(cf.identName)) { return true }
+      }
+    }
+  }
+  // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
+  let cur = ix
+  while cur >= 0 {
+    const kids = nodeSpineChildren(cur)
+    let i = 0
+    while i < kids.length {
+      if monoTestsTyVar(kids[i]) { return true }
+      i = i + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  false
+}
+
+// Binds the type parameters of `fn` to the exact types this instance is pinned at into `outN`
+// / `outT`: the explicit type arguments first, then each parameter's pin. False, and nothing
+// bound, when some parameter's pin is unknown or still names a type variable.
+function monoExactBind(
+  params: i32[],
+  typarams: string[],
+  pinTys: i32[],
+  exBN: string[],
+  exBT: i32[],
+  outN: string[],
+  outT: i32[],
+): boolean {
+  let e = 0
+  while e < exBN.length && e < exBT.length {
+    outN.push(exBN[e])
+    outT.push(exBT[e])
+    e = e + 1
+  }
+  let j = 0
+  while j < params.length && j < pinTys.length {
+    const p = P.nodes[params[j]]
+    if p is Param {
+      if p.parType >= 0 {
+        const gt = nodeTyIxOf(p.parType)
+        if gt >= 0 && tyHasTyVar(gt) {
+          if pinTys[j] < 0 || tyHasTyVar(pinTys[j]) {
+            return monoExactClear(outN, outT)
+          }
+          bindGenWalk(gt, pinTys[j], outN, outT)
+        }
+      }
+    }
+    j = j + 1
+  }
+  let k = 0
+  while k < typarams.length {
+    let bound = false
+    let b = 0
+    while b < outN.length {
+      if outN[b] == typarams[k] { bound = true }
+      b = b + 1
+    }
+    if !bound { return monoExactClear(outN, outT) }
+    k = k + 1
+  }
+  true
+}
+
+// Empties a partial binding, so an instance with a pin it cannot bind exactly keeps its shared
+// key; always false.
+function monoExactClear(outN: string[], outT: i32[]): boolean {
+  while outN.length > 0 { outN.pop() }
+  while outT.length > 0 { outT.pop() }
+  false
+}
+
+// The pin `t` read inside function `ctx`: where it names a type parameter of the exact instance
+// `ctx` is, or is lifted inside, that instance's exact binding substituted; else `t` itself.
+function monoExactPinTyOf(t: i32, ctx: i32): i32 {
+  if t < 0 || !tyHasTyVar(t) { return t }
+  const row = monoExactSubRowOf(ctx)
+  if row < 0 || row >= monoExactSubN.length { return t }
+  const st = substTyDeep(t, monoExactSubN[row], monoExactSubT[row])
+  if st < 0 || tyHasTyVar(st) { return t }
+  st
+}
+
+// `monoExactPinTyOf` over each pin of one call.
+function monoExactPinTys(pinTys: i32[], ctx: i32) {
+  let i = 0
+  while i < pinTys.length {
+    // arena-tick exempt: the caller's own pin column, not an arena node.
+    pinTys[i] = monoExactPinTyOf(pinTys[i], ctx)
+    i = i + 1
+  }
+  0
+}
+
+// Per template slot: how many of its instances are being walked, one inside another.
+let monoActiveDepth: i32[] = []
+const MONO_NEST_MAX = 32
+
 // The instance-creation core shared by `monoInstantiate` (call-driven) and
 // `monoInstanceFor` (annotation-driven): clone or reuse the instance of generic `origFe`
 // for the already-built `pinned` names and point `calleeIx` at it. `annotateI32` annotates
@@ -4345,6 +4543,21 @@ function monoMakeInstance(
     while pk < pinned.length {
       key = key + pinned[pk] + monoAnonPinDiscrim(pinned[pk], pinTys[pk]) + ","
       pk = pk + 1
+    }
+    // A body testing a value of a type parameter is keyed by the exact types, which a pin's
+    // spelling can merge (a Set and its boolean map), so each instance binds them to one.
+    const exSubN: string[] = []
+    const exSubT: i32[] = []
+    if monoNeedsExactKey(origFe) {
+      if (
+        monoExactBind(params, fn.fnTyParams, pinTys, exBN, exBT, exSubN, exSubT)
+      ) {
+        let xk = 0
+        while xk < exSubN.length {
+          key = key + "~" + exSubN[xk] + "=" + tyCanonKey(exSubT[xk], 16) + ";"
+          xk = xk + 1
+        }
+      }
     }
     // The baked-callback identities extend the key, so two calls passing the same pinned
     // types but different non-capturing callbacks get distinct instances. No baked
@@ -4986,10 +5199,14 @@ function monoMakeInstance(
     monoCgcTyParams = fn.fnTyParams
     monoCgcTvN = tvN
     monoCgcTvV = tvV
+    monoCgcSubN = exSubN
+    monoCgcSubT = exSubT
     const instBody3 = monoCloneGenericCalls(instBody2)
     monoCgcTyParams = []
     monoCgcTvN = []
     monoCgcTvV = []
+    monoCgcSubN = []
+    monoCgcSubT = []
     // Per-instance layout constants for the type parameters this body reads
     // (`i * T.size`) — folded HERE because the binding is what makes them exist.
     const instBody4 = monoFoldTyParamLayout(instBody3, fn.fnTyParams, tvN, tvV)
@@ -5067,16 +5284,37 @@ function monoMakeInstance(
     monoInstOrig.push(origFe)
     monoInstName.push(instName)
     monoInstFe.push(instFe)
+    if exSubN.length > 0 {
+      monoExactSubRow.set(instFe, monoExactSubN.length)
+      monoExactSubN.push(exSubN)
+      monoExactSubT.push(exSubT)
+    }
     while fnInstOrigin.length <= instFe { fnInstOrigin.push(-1) }
     if instFe != origFe {
       fnInstOrigin[instFe] = origFe
       monoArenaTouch()
     }
     if monoRebuild() < 0 { return -1 }
+    // A nested walk of one template here mints a new pin, since a repeated pin hits the
+    // registry; past the bound the pins grow without end, as in `f<T>` calling `f<T[]>` (D2721).
+    while monoActiveDepth.length <= origFe { monoActiveDepth.push(0) }
+    if monoActiveDepth[origFe] >= MONO_NEST_MAX {
+      return emitFailAt(
+        "emitProgram: monomorphize: `"
+          + fn.fnName
+          + "` instantiates itself at a new type on every call, so it has no finite set of instances",
+        calleeIx,
+      )
+    }
+    // arena-tick exempt: a walk counter, which no rebuild pass reads.
+    monoActiveDepth[origFe] = monoActiveDepth[origFe] + 1
     // Walk this instance's body — a nested generic call instantiates its own callee
     // against this instance's concrete annotations, and the callee rename lands on the
     // instance's own `Call` spine rather than on nodes its siblings share.
-    if monoWalkFnBody(nfn) < 0 { return -1 }
+    const walked = monoWalkFnBody(nfn)
+    // arena-tick exempt: the same counter.
+    monoActiveDepth[origFe] = monoActiveDepth[origFe] - 1
+    if walked < 0 { return -1 }
     // A clone's body is walked beside its instance's: its generic calls are its own copies,
     // and the template's walk pinned the template's (D2553).
     let lci = 0
@@ -5685,7 +5923,7 @@ function monoInstantiate(origFe: i32, callIx: i32, ctx: i32) {
                 pinned.push(pinC)
                 // A generic function value's own type still rides its type variables, so
                 // it names no row this pin denotes; the substituted spelling is the answer.
-                let pinCTy = monoArgPinTyIx(args[i], ctx)
+                let pinCTy = monoExactPinTyOf(monoArgPinTyIx(args[i], ctx), ctx)
                 if pinCTy >= 0 && tyHasTyVar(pinCTy) { pinCTy = -1 }
                 pinTys.push(pinCTy)
               } else {
@@ -5748,6 +5986,7 @@ function monoInstantiate(origFe: i32, callIx: i32, ctx: i32) {
         cbFnNames.push(monoSpecializableCallbackName(args[ci], ctx))
         ci = ci + 1
       }
+      monoExactPinTys(pinTys, ctx)
       const pinKinds: i32[] = []
       const pinPays: string[] = []
       monoBuildPinCol(pinned, pinKinds, pinPays)
@@ -6426,6 +6665,14 @@ export function monomorphize(stmts: i32[]) {
   monoInstName = []
   monoInstFe = []
   monoParamPinTy = Map()
+  monoExactSubRow = Map()
+  monoExactSubN = []
+  monoExactSubT = []
+  monoExactMemo = []
+  monoActiveDepth = []
+  monoExactStack = []
+  monoExactNext = 0
+  monoExactLow = 0
   monoProgStmts = stmts
   // The index follows the table it answers for, at the write and not at a build point:
   // between the two there is no reader, so `monoModuleLetOf` cannot see an empty column.

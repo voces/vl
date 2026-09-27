@@ -194,6 +194,7 @@ import {
   recordClonedNodeTyFb,
   recordClonedNodeTyKnown,
   recordNodePin,
+  substTyDeep,
   tyArrayElemIx,
   tyArrayElemPrimName,
   tyBearsNull,
@@ -223,6 +224,7 @@ import {
   tyScalarBaseIs,
   tyToEmitName,
   tyToNominalName,
+  tyToStr,
   unionAliasDeclNameOfTy,
   valueAtomKind,
   valueRowKind,
@@ -368,6 +370,7 @@ import {
   retVoidAnnFlag,
   setShapeOfTy,
   shapeInnerFieldSplit,
+  strLess,
   tyGroupWrapsWhole,
   tyIsBool,
   tyIsFuncType,
@@ -594,6 +597,9 @@ import {
   modNumCastSeen,
   modUnionAsHit,
   modUnionAsSeen,
+  monoExactSubN,
+  monoExactSubRow,
+  monoExactSubT,
   monoInstFe,
   monoInstOrig,
   monoOrigNode,
@@ -26639,9 +26645,134 @@ function tyDistinctNonNullMembers(ty: i32): i32 {
   seen.length
 }
 
-// Whether two map types are the one type, alias peeled; a Set is never its boolean map.
-export function mapTwinExact(a: i32, b: i32): boolean {
-  tyEq(unMemPeelAliasWrapper(a), unMemPeelAliasWrapper(b))
+// Whether two map types are the one type, alias peeled and union members compared as a set at
+// every level; a Set is never its boolean map. Compares only: box tags stay positional.
+export function mapTwinExact(a: i32, b: i32): boolean { tySameSet(a, b, 16) }
+
+// Whether `a` and `b` are one type up to the order and repetition of union members, at any
+// depth; a record, function, literal or primitive compares as `tyEq` does.
+export function tySameSet(a: i32, b: i32, depth: i32): boolean {
+  if a == b { return true }
+  if a < 0 || b < 0 || depth <= 0 { return false }
+  const xs: i32[] = []
+  const ys: i32[] = []
+  flattenVariantsInto(unMemPeelAliasWrapper(a), xs)
+  flattenVariantsInto(unMemPeelAliasWrapper(b), ys)
+  if xs.length > 1 || ys.length > 1 {
+    return tyMembersCover(xs, ys, depth) && tyMembersCover(ys, xs, depth)
+  }
+  const x = xs[0]
+  const y = ys[0]
+  if x < 0 || y < 0 { return x == y }
+  const tx = T.tys[x]
+  match tx {
+    TyMap => {
+      return tySameSetMap(tx.mSet, tx.mKey, tx.mVal, y, depth)
+    }
+    TyArray => {
+      return tySameSetList(tx.aElem, y, depth)
+    }
+    // The flattening above leaves no union or nullable here, and no other kind has members.
+    TyPrim | TyErr | TyFunc | TyUnion | TyNullable | TyVar | TyLit | TyNeg | TyObj => {
+      return tyEq(x, y)
+    }
+  }
+}
+
+// Whether `y` is a map or set with this kind, key and value, as `tySameSet` compares them.
+function tySameSetMap(
+  mSet: i32,
+  key: i32,
+  val: i32,
+  y: i32,
+  depth: i32,
+): boolean {
+  const ty = T.tys[y]
+  if ty is TyMap {
+    if mSet != ty.mSet { return false }
+    return tySameSet(key, ty.mKey, depth - 1)
+      && tySameSet(val, ty.mVal, depth - 1)
+  }
+  false
+}
+
+// Whether `y` is a list of this element, as `tySameSet` compares them.
+function tySameSetList(elem: i32, y: i32, depth: i32): boolean {
+  const ty = T.tys[y]
+  if ty is TyArray { return tySameSet(elem, ty.aElem, depth - 1) }
+  false
+}
+
+// Whether every member of `xs` is `tySameSet` as some member of `ys`.
+function tyMembersCover(xs: i32[], ys: i32[], depth: i32): boolean {
+  let i = 0
+  while i < xs.length {
+    let hit = false
+    let j = 0
+    while j < ys.length && !hit {
+      hit = tySameSet(xs[i], ys[j], depth - 1)
+      j = j + 1
+    }
+    if !hit { return false }
+    i = i + 1
+  }
+  true
+}
+
+// An identity key for `ty` that `tySameSet` types share: union members flattened, keyed, deduped
+// and sorted at every level of a map, list or union; any other type is its `tyToStr`.
+export function tyCanonKey(ty: i32, depth: i32): string {
+  if ty < 0 { return "?" }
+  if depth <= 0 { return tyToStr(ty) }
+  const xs: i32[] = []
+  flattenVariantsInto(unMemPeelAliasWrapper(ty), xs)
+  if xs.length > 1 {
+    const ks: string[] = []
+    let i = 0
+    while i < xs.length {
+      const k = tyCanonKey(xs[i], depth - 1)
+      let at = 0
+      while at < ks.length && strLess(ks[at], k) { at = at + 1 }
+      if at >= ks.length || ks[at] != k {
+        ks.push(k)
+        let m = ks.length - 1
+        while m > at {
+          ks[m] = ks[m - 1]
+          m = m - 1
+        }
+        ks[at] = k
+      }
+      i = i + 1
+    }
+    let out = "("
+    let j = 0
+    while j < ks.length {
+      if j > 0 { out = out + "|" }
+      out = out + ks[j]
+      j = j + 1
+    }
+    return out + ")"
+  }
+  const x = xs[0]
+  if x < 0 { return "?" }
+  const t = T.tys[x]
+  match t {
+    TyMap => {
+      if t.mSet == 1 { return "Set<" + tyCanonKey(t.mKey, depth - 1) + ">" }
+      return "{["
+        + tyCanonKey(t.mKey, depth - 1)
+        + "]:"
+        + tyCanonKey(t.mVal, depth - 1)
+        + "}"
+    }
+    TyArray => {
+      return "[" + tyCanonKey(t.aElem, depth - 1) + "]"
+    }
+    // The flattening above leaves no union or nullable here, and no other kind has members.
+    TyPrim | TyErr | TyFunc | TyUnion | TyNullable | TyVar | TyLit | TyNeg | TyObj => {
+      return tyToStr(x)
+    }
+  }
 }
 
 // Whether the map `patTy` a test names is not the map `heldTy` a nullable niche holds, so the
@@ -26650,7 +26781,7 @@ export function mapNicheLacks(heldTy: i32, patTy: i32): boolean {
   if heldTy < 0 || patTy < 0 { return false }
   const h = unMemPeelAliasWrapper(heldTy)
   const p = unMemPeelAliasWrapper(patTy)
-  if tyEq(h, p) { return false }
+  if tySameSet(h, p, 16) { return false }
   // A spelling renders a Set as its boolean map, so the two are told apart only by the pin.
   if mapSetSpelledAs(h, p) || mapSetSpelledAs(p, h) { return false }
   // A pinned annotation spells a literal-union value by its base, so a literal value on either
@@ -26710,6 +26841,62 @@ function mapPinnedParamTyAt(exprIx: i32, fnIx: i32, depth: i32): i32 {
     }
   }
   -1
+}
+
+// The row of `monoExactSubN`/`monoExactSubT` binding the type parameters of the instance that
+// function `fnIx` is, or is lifted inside; -1 when that instance is shared between pins.
+export function monoExactSubRowOf(fnIx: i32): i32 {
+  if fnIx < 0 { return -1 }
+  let pos = fnStmtsPosOf(fnIx)
+  let guard = 0
+  while pos >= 0 && guard <= fnStmts.length {
+    const row = monoExactSubRow.get(pos) ?? -1
+    if row >= 0 { return row }
+    if pos >= fnParent.length { return -1 }
+    pos = fnParent[pos]
+    guard = guard + 1
+  }
+  -1
+}
+
+// The type of `exprIx` inside an exact instance: its recorded type names a type parameter,
+// which that instance binds to one pinned type. -1 outside one, or when nothing substitutes.
+export function exactOperandTyOf(exprIx: i32, fnIx: i32): i32 {
+  const row = monoExactSubRowOf(fnIx)
+  if row < 0 || row >= monoExactSubN.length { return -1 }
+  const ax = unwrapParen(exprIx)
+  if ax < 0 { return -1 }
+  const ty = nodeTyIxOf(ax)
+  if ty < 0 || !tyHasTyVar(ty) { return -1 }
+  const st = substTyDeep(ty, monoExactSubN[row], monoExactSubT[row])
+  if st < 0 || tyHasTyVar(st) { return -1 }
+  st
+}
+
+// The exact map a nullable niche `exprIx` holds inside an exact instance, or -1.
+export function mapExactHeldTyOf(exprIx: i32, fnIx: i32): i32 {
+  const st = exactOperandTyOf(exprIx, fnIx)
+  if st < 0 { return -1 }
+  mapTyPeel(st)
+}
+
+// Whether the exact type of union operand `exprIx` has no member that is the map `patTy`
+// exactly, so `is patTy` is false though a box tag may be shared with its twin (D2720).
+export function exactUnionLacksMap(
+  exprIx: i32,
+  patTy: i32,
+  fnIx: i32,
+): boolean {
+  const st = exactOperandTyOf(exprIx, fnIx)
+  if st < 0 || patTy < 0 { return false }
+  const flat: i32[] = []
+  flattenVariantsInto(st, flat)
+  let i = 0
+  while i < flat.length {
+    if flat[i] >= 0 && mapTwinExact(flat[i], patTy) { return false }
+    i = i + 1
+  }
+  true
 }
 
 // The maps the parameters of instance `fnIx` are pinned at, their unions and nullables
