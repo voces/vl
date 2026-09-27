@@ -281,9 +281,13 @@ const script = async (path: string): Promise<Hits> => {
   return { at, msgs: {} };
 };
 
-const lint = async (path: string, file: string): Promise<Hits> => {
+// The rule grades `compiler/` alone (docs/internals/lint-rule-scope.md), so the fixture
+// is checked as `compiler/<file>` relative to its temp root.
+const lint = async (dir: string, file: string): Promise<Hits> => {
+  const path = `compiler/${file}`;
   const { code, stdout, stderr } = await new Deno.Command(VL, {
     args: ["check", path, "--severity", "info", "--json", "--compiler", COMPILER],
+    cwd: dir,
     stdout: "piped",
     stderr: "piped",
     env: nativeEnv({ NO_COLOR: "1" }),
@@ -298,7 +302,7 @@ const lint = async (path: string, file: string): Promise<Hits> => {
     col: number;
     message: string;
   }[];
-  const diags = all.filter((d) => d.file.endsWith(`/${file}`) || d.file === file);
+  const diags = all.filter((d) => d.file.endsWith(`/${path}`) || d.file === path);
   const at: Record<string, string[]> = {};
   const msgs: Record<string, string[]> = {};
   for (const c of CODES) {
@@ -316,12 +320,13 @@ Deno.test({
   ignore: !ENABLED,
   fn: async () => {
     const dir = await Deno.makeTempDir({ prefix: "vl_sentinel_index_" });
+    await Deno.mkdir(`${dir}/compiler`);
 
     for (const f of FIXTURES) {
-      const path = `${dir}/${f.name}`;
+      const path = `${dir}/compiler/${f.name}`;
       await Deno.writeTextFile(path, f.src);
       const s = await script(path);
-      const l = await lint(path, f.name);
+      const l = await lint(dir, f.name);
 
       for (const c of CODES) {
         if (!eq(s.at[c], l.at[c])) {

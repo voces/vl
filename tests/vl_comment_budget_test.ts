@@ -163,9 +163,14 @@ const script = async (path: string): Promise<Hits> => {
   return { lines, msgs: [] };
 };
 
-const lint = async (path: string, file: string): Promise<Hits> => {
+// The four codes grade `compiler/` alone (docs/internals/lint-rule-scope.md), so the
+// fixture is checked as `compiler/<file>` relative to its temp root, the shape
+// `lint-self.sh` hands the CLI.
+const lint = async (dir: string, file: string): Promise<Hits> => {
+  const path = `compiler/${file}`;
   const { code, stdout, stderr } = await new Deno.Command(VL, {
     args: ["check", path, "--severity", "info", "--json", "--compiler", COMPILER],
+    cwd: dir,
     stdout: "piped",
     stderr: "piped",
     env: nativeEnv({ NO_COLOR: "1" }),
@@ -180,7 +185,7 @@ const lint = async (path: string, file: string): Promise<Hits> => {
     message: string;
   }[];
   // A graph target lints its deps too; only the fixture under test is compared.
-  const diags = all.filter((d) => d.file.endsWith(`/${file}`) || d.file === file);
+  const diags = all.filter((d) => d.file.endsWith(`/${path}`) || d.file === path);
   const lines: Record<string, number[]> = {};
   for (const c of CODES) {
     lines[c] = diags.filter((d) => d.code === c).map((d) => d.line).sort((x, y) => x - y);
@@ -198,13 +203,14 @@ Deno.test({
   ignore: !ENABLED,
   fn: async () => {
     const dir = await Deno.makeTempDir({ prefix: "vl_comment_budget_" });
-    await Deno.writeTextFile(`${dir}/dep.vl`, DEP);
+    await Deno.mkdir(`${dir}/compiler`);
+    await Deno.writeTextFile(`${dir}/compiler/dep.vl`, DEP);
 
     for (const f of FIXTURES) {
-      const path = `${dir}/${f.name}`;
+      const path = `${dir}/compiler/${f.name}`;
       await Deno.writeTextFile(path, f.src);
       const s = await script(path);
-      const l = await lint(path, f.name);
+      const l = await lint(dir, f.name);
 
       for (const c of CODES) {
         if (!eq(s.lines[c], l.lines[c])) {
