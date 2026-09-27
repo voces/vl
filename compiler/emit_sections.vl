@@ -187,6 +187,7 @@ import {
   cloSigTwin,
   ctrlDepth,
   curBuf,
+  declSlotByNode,
   dupScanActive,
   dupSlotBias,
   dupSlotMore,
@@ -335,6 +336,7 @@ import {
   lTypeIdx,
   lUsed,
   localBlockLet,
+  localByNode,
   localDeclIx,
   localIsRef,
   localLitUnion,
@@ -646,6 +648,7 @@ import {
   collectAnnShapes,
   collectArrNewFrames,
   collectCloSigs,
+  collectExprArms,
   collectFnValUse,
   collectFns,
   collectGenAliasShapes,
@@ -670,6 +673,7 @@ import {
   mfScan,
   reconcileVariantFieldSpans,
   scanArrLitCommit,
+  scanExprArmLocals,
   synthCaptureEmptyListAnns,
   synthCaptureReadAnns,
   synthDstPinAnns,
@@ -813,6 +817,8 @@ function buildLocals(fnIx: i32) {
   localPairIter = []
   localDeclIx = []
   localLitUnion = []
+  localByNode = []
+  declSlotByNode = Map()
   // Reset the lexical scope stack per function. `collectLocals` pushes/pops frames as
   // it walks (leaving it balanced/empty), then the emit pass rebuilds it in lockstep.
   scopeNames = []
@@ -1867,6 +1873,8 @@ function collectStartLocals() {
   localPairIter = []
   localDeclIx = []
   localLitUnion = []
+  localByNode = []
+  declSlotByNode = Map()
   scopeNames = []
   scopeSlots = []
   scopeFrames = []
@@ -1875,6 +1883,14 @@ function collectStartLocals() {
   while i < startStmts.length {
     const s = P.nodes[startStmts[i]]
     if s is ForRange {
+      if (
+        collectExprArms(s.frFrom, -1) < 0
+        || collectExprArms(s.frTo, -1) < 0
+        || collectExprArms(s.frStep, -1) < 0
+      ) {
+        scopePop()
+        return -1
+      }
       // SHARED with the function-scope walk, for the reason the `ForIn` arm below states:
       // a top-level `for` and an in-function `for` need identical slots. Duplicating it is
       // how a non-constant `step` at module scope emitted against a local nothing declared.
@@ -1889,7 +1905,7 @@ function collectStartLocals() {
       // The loop-var / cursor / `#l`-temp declaration is `declareForInLocals` — SHARED with
       // the function-scope walk, because a top-level `for` and an in-function `for` need
       // identical slots (`fnIx` -1 is the only difference, and it is a parameter).
-      if declareForInLocals(s, -1) < 0 {
+      if collectExprArms(s.fiIter, -1) < 0 || declareForInLocals(s, -1) < 0 {
         scopePop()
         return -1
       }
@@ -1900,7 +1916,10 @@ function collectStartLocals() {
       // The loop variable's scope is the loop (see `scopeUnbind`).
       scopeUnbind()
     } else if s is WhileStmt {
-      if collectLocalsWhile(startStmts[i], -1) < 0 {
+      if (
+        collectExprArms(s.whileCond, -1) < 0
+        || collectLocalsWhile(startStmts[i], -1) < 0
+      ) {
         scopePop()
         return -1
       }
@@ -1909,16 +1928,27 @@ function collectStartLocals() {
         scopePop()
         return -1
       }
+    } else if collectExprArms(startStmts[i], -1) < 0 {
+      // Every other statement is an expression, whose if-expression arms' locals are this frame's.
+      scopePop()
+      return -1
     }
     i = i + 1
   }
-  scopePop()
   // The promoted top-level bindings (G2c) claim their slots last, after every local the
   // statement walk declared, so a program promoting nothing emits the frame it always did.
   // The slot registers under `<name>#g`, not the binding's own name — `#` cannot occur in a
   // source identifier, so nothing resolves to this slot by name; the only reader is `emitUserGlobalGet`/`emitUserGlobalSet` via `gPromoSlot`.
   let pgi = 0
   while pgi < globalStmts.length {
+    // A global's initializer runs in this function, so its if-expression arms' locals are ours.
+    const gd = P.nodes[globalStmts[pgi]]
+    if gd is LetDecl {
+      if collectExprArms(gd.letInit, -1) < 0 {
+        scopePop()
+        return -1
+      }
+    }
     if gPromoOk[pgi] == 1 {
       const pg = P.nodes[globalStmts[pgi]]
       if pg is LetDecl {
@@ -1934,6 +1964,7 @@ function collectStartLocals() {
     }
     pgi = pgi + 1
   }
+  scopePop()
   localNames.length
 }
 
@@ -5421,6 +5452,7 @@ function runEmitPass(name: string, stmts: i32[], rootIx: i32) {
   if name == "capNarrowBuild#2" { return capNarrowBuild() }
   if name == "synthCaptureEmptyListAnns" { return synthCaptureEmptyListAnns() }
   if name == "synthCaptureReadAnns" { return synthCaptureReadAnns() }
+  if name == "scanExprArmLocals" { return scanExprArmLocals() }
   emitFail("emitProgram: unknown pass in the pass table: " + name)
 }
 
@@ -5622,6 +5654,7 @@ export function emitProgram(rootIx: i32) {
       "capCacheBuild > monomorphize synthParamAnnots",
       "synthCaptureEmptyListAnns > collectA#2 capCacheBuild",
       "auditRecordJoinLeaves > collectA#2 buildFnMap#2 capCacheBuild",
+      "scanExprArmLocals > monomorphize synthParamAnnots synthVoidTwins synthExternValues",
     ]
     // synthVoidTwins mints the void twins for coerced function VALUES — after
     // mono (`fnStmts` positions are final; the twin table stores them) and
