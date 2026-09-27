@@ -651,6 +651,8 @@ import {
   arrNewIntrKind,
   arrNewKindNamed,
   asExprHoleNumOpt,
+  asExprHoleNumSad,
+  asExprHolePinSrc,
   asExprIsUnionCastIn,
   asExprNumCastDomain,
   asExprNumFallible,
@@ -732,6 +734,7 @@ import {
   exprF64Array,
   exprI64Array,
   exprIsBool,
+  exprIsBoolList,
   exprIsClosure,
   exprIsF32,
   exprIsF64,
@@ -4983,7 +4986,12 @@ export function emitUnionCoerce(
   // 13 — but `emitArr` reads the elements to pick a backing and a bare `[1, 2, 255]` reads as
   // i32, so without the build kind the narrowed read's `ref.cast $bl8` traps at run time.
   if cak == 13 { coerceListKind = LBK_U8_LIST }
-  if cak == 7 && !unionHasAtomTy(unionName, "i32", true) {
+  // A boolean list is its own arm, never a number to widen (D2796).
+  if (
+    cak == 7
+    && !unionHasAtomTy(unionName, "i32", true)
+    && !(unionHasAtomTy(unionName, "boolean", true) && exprIsBoolList(bareIx, fnIx))
+  ) {
     if unionHasAtomTy(unionName, "i64", true) {
       cak = 10 // "i64[]"
       coerceListKind = LBK_I64_LIST
@@ -15516,6 +15524,21 @@ function emitNumExactCastFrom(
   emitNumExactConvert(src, tgt)
 }
 
+// The sad path of `as!` or bare `as` over a type parameter pinned at no number: the value is
+// never the target, so `as!` traps with its reason and `as` returns the function's own null.
+function emitHoleNumCastMiss(body: u8[], e: AsExpr, exprIx: i32, fnIx: i32) {
+  if emitExpr(body, e.asObj, fnIx) < 0 { return -1 }
+  fbDrop()
+  if e.asMode == "trap" {
+    if emitNumCastTrapMsg(exprIx, asExprNumCastDomain(exprIx)) < 0 { return -1 }
+    fbUnreachable()
+    return 0
+  }
+  if emitReturnValue(body, numCastNullNode(), fnIx) < 0 { return -1 }
+  fbReturn()
+  0
+}
+
 // `x as% T` — the wrap cast (`DECISIONS.md` §"`as%` is the wrap cast"). It cannot fail, so
 // there is no test, no sad path and no staging slot: one conversion opcode, and the byte mask
 // at the `u8` domain. A literal operand folds to the constant it denotes, which is what lets a
@@ -15669,6 +15692,12 @@ function emitAsCast(body: u8[], e: AsExpr, _exprIx: i32, fnIx: i32) {
         return 0
       }
     }
+  }
+  // A type-parameter operand fails as the direct spelling does at this instance's pin (D2791).
+  if asExprHoleNumSad(_exprIx) && !asExprIsUnionCastIn(_exprIx, fnIx) {
+    const hps = asExprHolePinSrc(_exprIx, fnIx)
+    if hps == "-" { return emitHoleNumCastMiss(body, e, _exprIx, fnIx) }
+    if hps != "" { return emitNumExactCastFrom(body, e, _exprIx, hps, fnIx) }
   }
   // numeric exact-or-fail (D1041) is checked ahead of the union arm and disjoint from it by
   // operand; only a cast that can fail comes here, the rest fall through to the plain ladder.
