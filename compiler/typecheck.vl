@@ -2053,7 +2053,7 @@ function flushInferRetHoles() {
 }
 
 // The inferred return `observed` of the body whose witness frame is on top, re-typed f32 when
-// some witness is an f32 value and every other is a literal that adopts f32 beside it, as an
+// some witness is an f32 value and every other is a float literal, as an
 // `if` join does (`joinF32LitTails`). Retires the frame whether or not it re-types.
 function inferRetF32Join(inferring: boolean, observed: i32): i32 {
   if irwMarks.length == 0 { return observed }
@@ -2098,7 +2098,7 @@ function inferRetF32Of(mark: i32): i32 {
 }
 
 // The f32 type a join of the values `exprs`, typed `tys`, takes when some are f32 values and
-// every other adopts f32 as a literal does beside an operator's f32 operand; else -1. The
+// every other is a float literal or a join of them (`floatLitTails`); else -1. The
 // literals' `if` and `match` nodes are re-typed f32 only when the whole join qualifies.
 function f32LitJoinOf(exprs: i32[], tys: i32[]): i32 {
   // The common join has no f32 member; it is answered by type tests alone.
@@ -2112,7 +2112,7 @@ function f32LitJoinOf(exprs: i32[], tys: i32[]): i32 {
   let i = 0
   while i < exprs.length && lits >= 0 {
     if primNameOf(tys[i]) == "f32" { fTy = joinTys(fTy, tys[i]) }
-    else if f32AdoptingOperand(exprs[i], TY_F32) { lits = lits + 1 }
+    else if floatLitTails(exprs[i]) { lits = lits + 1 }
     else { lits = -1 }
     i = i + 1
   }
@@ -14993,8 +14993,8 @@ function f32LitTailsAdopt(srcExpr: i32, dstTy: i32): boolean {
 }
 
 // The type of the value `if` or `match` at `ix` when some tail is an `f32` value and every other
-// tail adopts f32 as a literal does beside an operator's f32 operand (`raw * 2.0`), else -1. Its
-// `if` and `match` nodes are re-typed f32, so each literal re-encodes at single precision.
+// is a float literal, which adopts f32 as it does beside an operator (`raw * 2.0`); else -1. Its
+// `if`/`match` nodes are re-typed f32, so each literal re-encodes at single precision (D2775).
 function joinF32LitTails(ix: i32): i32 {
   const spine: i32[] = []
   const leaves: i32[] = []
@@ -15004,7 +15004,7 @@ function joinF32LitTails(ix: i32): i32 {
   let i = 0
   while i < leaves.length {
     const lt = nodeTyOf(leaves[i])
-    if isF32AdoptingLitExpr(leaves[i]) { lits = lits + 1 }
+    if isFloatLitExpr(leaves[i]) { lits = lits + 1 }
     else if lt >= 0 && primNameOf(lt) == "f32" { fTy = joinTys(fTy, lt) }
     else { return -1 }
     i = i + 1
@@ -15021,10 +15021,10 @@ function joinF32LitTails(ix: i32): i32 {
   fTy
 }
 
-// An inner join `joinF32LitTails` re-typed f32 under the join at `ix`, which is typed `ty`
-// instead: the inner one takes `ty` back, so its literals keep the value they have today.
-function f32JoinRevert(ix: i32, ty: i32) {
-  if f32JoinAdoptCount == 0 || ix < 0 || primNameOf(ty) != "f64" { return 0 }
+// An inner join `joinF32LitTails` re-typed f32 under the join at `ix`, which does not adopt:
+// the inner one takes back the `f64` it has without adoption, so its literals keep their value.
+function f32JoinRevert(ix: i32) {
+  if f32JoinAdoptCount == 0 || ix < 0 { return 0 }
   const spine: i32[] = []
   const leaves: i32[] = []
   valueTailSplit(ix, spine, leaves)
@@ -15032,13 +15032,52 @@ function f32JoinRevert(ix: i32, ty: i32) {
   while s < spine.length {
     const at = spine[s]
     if at != ix && (f32JoinAdopted[at] ?? false) {
-      if !inferQuiet && at < nodeTyIx.length { nodeTyIx[at] = ty }
-      if ifValTyAt.has(at) { ifValTyAt[at] = ty }
+      if !inferQuiet && at < nodeTyIx.length { nodeTyIx[at] = TY_F64 }
+      if ifValTyAt.has(at) { ifValTyAt[at] = TY_F64 }
       f32JoinAdopted[at] = false
     }
     s = s + 1
   }
   0
+}
+
+// The type an arm at `armIx` typed `ty` contributes to a join that does not adopt f32: `f64`, the
+// type it has without adoption, when its tail is a join `joinF32LitTails` re-typed.
+function f32ArmPlainTy(armIx: i32, ty: i32): i32 {
+  if f32JoinAdoptCount == 0 || armIx < 0 { return ty }
+  let at = parenPeelIx(armIx)
+  // A block arm's value is its last statement.
+  while at >= 0 && P.nodes[at] is Block {
+    const b = P.nodes[at]
+    at = -1
+    if b is Block {
+      if b.blkStmts.length > 0 {
+        at = parenPeelIx(b.blkStmts[b.blkStmts.length - 1])
+      }
+    }
+  }
+  if at >= 0 && (f32JoinAdopted[at] ?? false) { return TY_F64 }
+  ty
+}
+
+// Whether the value at `ix` is a float literal, or an `if`, `match` or block every tail of which
+// is one: the values a join beside an f32 value adopts f32 as.
+function floatLitTails(ix: i32): boolean {
+  if isFloatLitExpr(ix) { return true }
+  const lix = parenPeelIx(ix)
+  if lix < 0 { return false }
+  const e = P.nodes[lix]
+  if !(e is IfStmt || e is MatchExpr || e is Block) { return false }
+  const spine: i32[] = []
+  const leaves: i32[] = []
+  valueTailSplit(lix, spine, leaves)
+  if leaves.length == 0 { return false }
+  let i = 0
+  while i < leaves.length {
+    if !isFloatLitExpr(leaves[i]) { return false }
+    i = i + 1
+  }
+  true
 }
 
 // Whether a join whose arms are typed `a` and `b` could be one `joinF32LitTails` re-types: one
@@ -15053,13 +15092,12 @@ function joinMayAdoptF32(a: i32, b: i32): boolean {
 function matchF32Join(ix: i32, matchTy: i32): i32 {
   if ix < 0 || matchTy < 0 { return -1 }
   let j = -1
-  const m = T.tys[matchTy]
-  if primNameOf(matchTy) == "f64" || m is TyUnion {
+  if primNameOf(matchTy) == "f64" {
     if !valDiscarded(ix) && (!matchInRetTail || f32JoinRetypesRunning()) {
       j = joinF32LitTails(ix)
     }
   }
-  if j < 0 { f32JoinRevert(ix, matchTy) }
+  if j < 0 { f32JoinRevert(ix) }
   j
 }
 
@@ -36896,7 +36934,7 @@ function matchArmTally(ix: i32, body: i32, armTy: i32, acc: i32): i32 {
     ifNoValueAt[ix] = true
     return acc
   }
-  const v = ifArmValTy(body, armTy)
+  const v = f32ArmPlainTy(body, ifArmValTy(body, armTy))
   if acc < 0 { return v }
   joinTys(acc, v)
 }
@@ -49571,7 +49609,7 @@ function checkMatchIntArms(n: MatchExpr, ix: i32, st: i32) {
       // sentinel TY_ERR (both are -1), so a void-arm `match` must not be read as an error.
       if armTy < 0 { armTy = TY_VOID }
     }
-    matchTy = joinTys(matchTy, armTy)
+    matchTy = joinTys(matchTy, f32ArmPlainTy(body, armTy))
     matchValAcc = matchArmTally(ix, body, armTy, matchValAcc)
     ai = ai + 1
   }
@@ -49885,7 +49923,7 @@ function checkMatchTypeArms(n: MatchExpr, ix: i32, st: i32, uMems: i32[]) {
       if armTy < 0 { armTy = TY_VOID }
     }
     if scoped { popScope() }
-    matchTy = joinTys(matchTy, armTy)
+    matchTy = joinTys(matchTy, f32ArmPlainTy(body, armTy))
     matchValAcc = matchArmTally(ix, body, armTy, matchValAcc)
     bi = bi + 1
   }
@@ -50069,7 +50107,7 @@ function checkMatchExprNode(n: MatchExpr, ix: i32) {
       // sentinel TY_ERR (both are -1), so a void-arm `match` must not be mistaken for an error.
       if armTy < 0 { armTy = TY_VOID }
     }
-    matchTy = joinTys(matchTy, armTy)
+    matchTy = joinTys(matchTy, f32ArmPlainTy(body, armTy))
     matchValAcc = matchArmTally(ix, body, armTy, matchValAcc)
     ai = ai + 1
   }
@@ -50572,10 +50610,12 @@ function checkIfTail(
   }
   if daHasElse && ix >= 0 {
     let valTy = TY_VOID
-    if !thenExits { valTy = ifArmValTy(n.ifThen, thenTy) }
+    if !thenExits {
+      valTy = f32ArmPlainTy(n.ifThen, ifArmValTy(n.ifThen, thenTy))
+    }
     if !daElseDiverges {
       // A `void` here is an else-less link's value-less fall-through, which adds nothing.
-      const ev = ifArmValTy(n.ifElse, elseTy)
+      const ev = f32ArmPlainTy(n.ifElse, ifArmValTy(n.ifElse, elseTy))
       if thenExits || valTy == TY_VOID { valTy = ev }
       else if ev != TY_VOID { valTy = joinTys(valTy, ev) }
     }
@@ -50593,8 +50633,11 @@ function checkIfTail(
   // values.
   if f32Join >= 0 { return f32Join }
   if daHasElse {
-    const plainJoin = joinTys(thenTy, elseTy)
-    f32JoinRevert(ix, plainJoin)
+    const plainJoin = joinTys(
+      f32ArmPlainTy(n.ifThen, thenTy),
+      f32ArmPlainTy(n.ifElse, elseTy),
+    )
+    f32JoinRevert(ix)
     return plainJoin
   }
   // An else-less `if` used as a value is `T | null` in every position — the false fall-through
