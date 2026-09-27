@@ -158,7 +158,11 @@ import {
   unwrapParen,
 } from "./emit_base"
 import { emitFailAt } from "./emit_bytes"
-import { fnIndexOfInScopeChain } from "./emit_collect"
+import {
+  assignTags,
+  fnIndexOfInScopeChain,
+  registerInlineUnion,
+} from "./emit_collect"
 import {
   cboxCellNames,
   cboxReadTy,
@@ -170,6 +174,7 @@ import {
   fnValUsed,
   gSharedMemPages,
   startStmts,
+  uVariants,
   unNames,
   unTyIx,
 } from "./emit_state"
@@ -184,6 +189,7 @@ import {
   fnTyRetOf,
   inferRetNulPinned,
   letDeclIsClosureNoLocal,
+  listUnionEmitName,
   nameFreeToModule,
   nameIsWholeSpanShape,
   nliForgetLet,
@@ -193,6 +199,7 @@ import {
   structIndexOfExpr,
   synthTypeRefTy,
   tyIsJoinedRecord,
+  tyIsListUnion,
   tyStructHasMapField,
 } from "./emit_classify"
 import { paramIsClosure, paramNulClosure } from "./emit_query"
@@ -1788,15 +1795,41 @@ export function synthNulListRetAnns() {
           // A return joining records into one (D2731) takes the joined type, so each
           // returned literal is built at its row as under the annotated spelling.
           const jty = fnTyRetOf(nodeTyIxOf(fnStmts[i]))
-          if tyIsJoinedRecord(jty) || fnRetJoinsWiderRecord(fnStmts[i], jty) {
-            const jnm = tyToEmitName(jty)
-            if jnm != "" { fn.fnRet = synthTypeRefTy(jnm, -1, jty) }
+          // So does a return set joining lists of different storage, built as the union box.
+          if (
+            tyIsJoinedRecord(jty)
+            || fnRetJoinsWiderRecord(fnStmts[i], jty)
+            || tyIsListUnion(jty)
+          ) {
+            if tyIsListUnion(jty) {
+              if synthListUnionRet(fn, jty) < 0 { return -1 }
+            } else {
+              const jnm = tyToEmitName(jty)
+              if jnm != "" { fn.fnRet = synthTypeRefTy(jnm, -1, jty) }
+            }
           }
         }
       }
     }
     i = i + 1
   }
+  0
+}
+
+// Pins `fn`'s return to the list union `jty`, registering the union a record list arm needs
+// after `collectU` has run, as an annotated spelling registers it there (D2768).
+function synthListUnionRet(fn: FuncDecl, jty: i32): i32 {
+  const jnm = listUnionEmitName(jty)
+  if jnm == "" || emitRootIx < 0 { return 0 }
+  const root = P.nodes[emitRootIx]
+  if root is Program {
+    const before = uVariants.length
+    if registerInlineUnion(root.progStmts, jnm) < 0 { return -1 }
+    if uVariants.length != before {
+      if assignTags() < 0 { return -1 }
+    }
+  }
+  fn.fnRet = synthTypeRefTy(jnm, -1, jty)
   0
 }
 
