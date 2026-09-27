@@ -21,7 +21,9 @@ import {
   nameIsBraceSpanEnds,
   nameIsParenOpen,
   nameIsParenSpanEnds,
+  peelGroupParens,
   splitUnionAtoms,
+  unionMemberCount,
 } from "./tyname"
 import {
   T,
@@ -81,6 +83,7 @@ import {
   tyEq,
   tyExcludesNull,
   tyHasTyVar,
+  tyHasTyVarWasCapped,
   tyIsLitUnion,
   tyIsLitUnionArray,
   tyIsMap,
@@ -191,12 +194,14 @@ import {
   moduleLocalLetAll,
   moduleLocalLetOfUnique,
   monoAnnHasTyParam,
+  monoAnnIsOpenUnion,
   monoBindFromAnn,
   monoBindOf,
   monoDeclAnnName,
   monoIsGenericDecl,
   monoSubstAnn,
   monoTyParamOf,
+  monoUnionLeavesOpenFree,
   nameIsBareMap,
   nameIsClosureArray,
   nameIsF64Array,
@@ -258,11 +263,13 @@ import {
 } from "./emit_state"
 import { emitFail, emitFailAt } from "./emit_bytes"
 import {
+  TY_WALK_DEPTH,
   anonHandleTyIx,
   arrLitElemName,
   captureCountOf,
   cloRetTypeName,
   criFnIsAnonLambda,
+  exactBindWalk,
   exprArray,
   exprF32Array,
   exprF64Array,
@@ -342,7 +349,7 @@ import {
 // names)` and registered before the body is walked so a recursive self-call at the
 // same shape hits the registry.
 
-import { i32ListHas } from "./listutil"
+import { i32ListHas, strListHas } from "./listutil"
 
 // D943 — the lifted slots `monoPinBodyLambdas` minted for the instance being built. A
 // clone's `fnParent` cannot be set at clone time (its own `FuncDecl` does not exist
@@ -3440,6 +3447,11 @@ function monoBindExplicitTyArgs(
     const nm = tyNameOf(tas[i])
     if nm != "" {
       const at = nodeTyIxOf(tas[i])
+      if at >= 0 && tyHasTyVar(at) && tyHasTyVarWasCapped() {
+        emitFail(
+          "emitProgram: monomorphize: a type argument nested past 20000 levels or with more than 100000 distinct parts cannot be pinned",
+        )
+      }
       if at >= 0 && !tyHasTyVar(at) {
         monoExplicitBN.push(typarams[i])
         monoExplicitBT.push(at)
@@ -4357,15 +4369,32 @@ function monoTyHoldsRefArm(ty: i32): boolean {
   false
 }
 
-// Whether the member type at `m` boxes under a registered row: a map or a record. Every other
-// kind rides a value atom's tag or is not a union member at all.
+// Whether the member type at `m` boxes under a registered row: a map, a record, or a list of
+// references (its reflist slot). Every other kind rides a value atom's tag or is not a member.
 function monoTyIsRefArm(m: i32): boolean {
   const mt = T.tys[m]
   match mt {
     TyMap | TyObj => {
       return true
     }
-    TyPrim | TyErr | TyFunc | TyUnion | TyNullable | TyArray | TyVar | TyLit | TyNeg => {
+    TyArray => {
+      return monoTyIsRefElem(mt.aElem)
+    }
+    TyPrim | TyErr | TyFunc | TyUnion | TyNullable | TyVar | TyLit | TyNeg => {
+      return false
+    }
+  }
+}
+
+// Whether list element `e` is a reference other than a string: a record, map, list or union.
+function monoTyIsRefElem(e: i32): boolean {
+  if e < 0 || e >= T.tys.length { return false }
+  const et = T.tys[e]
+  match et {
+    TyMap | TyObj | TyArray | TyUnion | TyNullable => {
+      return true
+    }
+    TyPrim | TyErr | TyFunc | TyVar | TyLit | TyNeg => {
       return false
     }
   }
@@ -4497,6 +4526,22 @@ function monoTestsTyVar(ix: i32): boolean {
   false
 }
 
+// Whether `ty` is a union with a type-parameter member and a concrete member besides `null`,
+// the shape the checker's binding walk passes over (`monoAnnIsOpenUnion`'s arena twin).
+function monoTyIsOpenUnion(ty: i32): boolean {
+  const ms: i32[] = []
+  flattenVariantsInto(ty, ms)
+  if ms.length < 2 { return false }
+  let i = 0
+  while i < ms.length {
+    if ms[i] >= 0 && !tyHasTyVar(ms[i]) && tyToEmitName(ms[i]) != "null" {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
 // Binds the type parameters of `fn` to the exact types this instance is pinned at into `outN`
 // / `outT`: the explicit type arguments first, then each parameter's pin. False, and nothing
 // bound, when some parameter's pin is unknown or still names a type variable.
@@ -4515,21 +4560,31 @@ function monoExactBind(
     outT.push(exBT[e])
     e = e + 1
   }
-  let j = 0
-  while j < params.length && j < pinTys.length {
-    const p = P.nodes[params[j]]
-    if p is Param {
-      if p.parType >= 0 {
-        const gt = nodeTyIxOf(p.parType)
-        if gt >= 0 && tyHasTyVar(gt) {
-          if pinTys[j] < 0 || tyHasTyVar(pinTys[j]) {
-            return monoExactClear(outN, outT)
+  // Two passes, a union annotation's last: its type-parameter member binds only what no other
+  // parameter binds, as the pin's spelling does (`monoPreBindPastUnionRest`).
+  let pass = 0
+  while pass < 2 {
+    let j = 0
+    while j < params.length && j < pinTys.length {
+      const p = P.nodes[params[j]]
+      if p is Param {
+        if p.parType >= 0 {
+          const gt = nodeTyIxOf(p.parType)
+          if (
+            gt >= 0
+            && tyHasTyVar(gt)
+            && (monoTyIsOpenUnion(gt) == (pass == 1))
+          ) {
+            if pinTys[j] < 0 || tyHasTyVar(pinTys[j]) {
+              return monoExactClear(outN, outT)
+            }
+            exactBindWalk(gt, pinTys[j], outN, outT)
           }
-          bindGenWalk(gt, pinTys[j], outN, outT)
         }
       }
+      j = j + 1
     }
-    j = j + 1
+    pass = pass + 1
   }
   let k = 0
   while k < typarams.length {
@@ -4632,7 +4687,12 @@ function monoMakeInstance(
       ) {
         let xk = 0
         while xk < exSubN.length {
-          key = key + "~" + exSubN[xk] + "=" + tyCanonKey(exSubT[xk], 16) + ";"
+          key = key
+            + "~"
+            + exSubN[xk]
+            + "="
+            + tyCanonKey(exSubT[xk], TY_WALK_DEPTH)
+            + ";"
           xk = xk + 1
         }
       }
@@ -4868,7 +4928,12 @@ function monoMakeInstance(
         // D1042 — a union the pin mints is spelled the way the direct spelling is. `rs`
         // substitutes the bound name into the declared text, so `T | "err"` arrives
         // literal, while every other producer of that key softens it to `i32|string`.
-        const rsC = monoPinUnionName(rs)
+        // A grouped union (`(T | string)`) keys the union itself, as the direct spelling does.
+        let rsG = rs
+        if unionMemberCount(peelGroupParens(rs)) > 1 {
+          rsG = peelGroupParens(rs)
+        }
+        const rsC = monoPinUnionName(rsG)
         nret = synthTypeRefTy(rsC, -1, retTy)
         // And register it: `collectU`, the only pass that mints union rows, runs before
         // this one. Registering under the canon'd key reuses the row a direct spelling
@@ -5451,11 +5516,33 @@ function monoFnTypeAnnParamsName(name: string, out: string[]) {
   annFnDecompose(name, out) != ""
 }
 
+// The parameter types of the concrete function type `t` (the value's recorded type, or the
+// destination's), when it has `n` of them and names no type variable; empty otherwise.
+function monoFnValueParamTys(t: i32, n: i32): i32[] {
+  const out: i32[] = []
+  if t < 0 || tyHasTyVar(t) { return out }
+  const ft = T.tys[t]
+  if ft is TyFunc {
+    if ft.fnParamTypes.length != n { return out }
+    let i = 0
+    while i < n {
+      out.push(ft.fnParamTypes[i])
+      i = i + 1
+    }
+  }
+  out
+}
+
 // Materialize or reuse the instance of generic `origFe` for an annotated function-typed
 // binding, pinning each parameter to the annotation's param type name and pointing
 // `letInitIx` at it. Unlike the call-driven path this carries the value's concrete type
 // independent of any call, so a binding that escapes is `call_ref`'d at that type.
-function monoInstanceFor(origFe: i32, pinnedNames: string[], letInitIx: i32) {
+function monoInstanceFor(
+  origFe: i32,
+  pinnedNames: string[],
+  letInitIx: i32,
+  expTy: i32,
+) {
   const fn = P.nodes[monoOrigNode[origFe]]
   if fn is FuncDecl {
     const params = fn.fnParams
@@ -5511,13 +5598,15 @@ function monoInstanceFor(origFe: i32, pinnedNames: string[], letInitIx: i32) {
       v = v + 1
     }
     const pinned: string[] = []
-    // No argument node on this path (an annotation-driven binding), so nothing is known —
-    // an all -1 column is exactly today's behaviour.
+    // No argument node on this path: the pins are the parameter types of the function type the
+    // checker recorded for the value, where it has one, so an exact instance keys on them (D2755).
     const pinTys: i32[] = []
+    let vty = monoFnValueParamTys(nodeTyIxOf(letInitIx), pinnedNames.length)
+    if vty.length == 0 { vty = monoFnValueParamTys(expTy, pinnedNames.length) }
     let j = 0
     while j < pinnedNames.length {
       pinned.push(pinnedNames[j])
-      pinTys.push(-1)
+      if j < vty.length { pinTys.push(vty[j]) } else { pinTys.push(-1) }
       j = j + 1
     }
     // The annotation-driven binding path (`const c: (f64,f64)=>f64 = add`) bakes no callback — the
@@ -5589,7 +5678,12 @@ function monoFnFeOfIdent(identIx: i32, name: string, ctx: i32) {
 // named by `tname`: materialize the instance for an `Ident` naming a generic, or recurse
 // into an array literal's elements and an object literal's field values against their
 // declared types. The checker has already proved the instantiation valid; this emits it.
-function monoCoerceFnValueName(exprIx: i32, tname: string, ctx: i32) {
+function monoCoerceFnValueName(
+  exprIx: i32,
+  tname: string,
+  ctx: i32,
+  expTy: i32,
+) {
   if exprIx < 0 { return 0 }
   const e = P.nodes[exprIx]
   if e is ObjLit {
@@ -5608,7 +5702,12 @@ function monoCoerceFnValueName(exprIx: i32, tname: string, ctx: i32) {
           while d < fnames.length {
             if fnames[d] == f.fiName {
               if (
-                monoCoerceFnValueName(f.fiValue, normTypeAtom(ftexts[d]), ctx)
+                monoCoerceFnValueName(
+                  f.fiValue,
+                  normTypeAtom(ftexts[d]),
+                  ctx,
+                  -1,
+                )
                 < 0
               ) {
                 return -1
@@ -5631,26 +5730,26 @@ function monoCoerceFnValueName(exprIx: i32, tname: string, ctx: i32) {
       const es = e.arrElems
       let k = 0
       while k < es.length {
-        if monoCoerceFnValueName(es[k], elemName, ctx) < 0 { return -1 }
+        if monoCoerceFnValueName(es[k], elemName, ctx, -1) < 0 { return -1 }
         k = k + 1
       }
     }
     return 0
   }
-  if e is Paren { return monoCoerceFnValueName(e.parInner, tname, ctx) }
+  if e is Paren { return monoCoerceFnValueName(e.parInner, tname, ctx, expTy) }
   if e is IfStmt {
     // An if-expression in value position. The expected type reaches every arm unchanged —
     // each arm independently produces the whole value — so the recursion is per-arm, not
     // per-element as it is for the composite literals. A `match` needs no limb: the checker
     // lowers an exhaustive one to an if/else chain in place.
-    if monoCoerceFnValueName(e.ifThen, tname, ctx) < 0 { return -1 }
-    return monoCoerceFnValueName(e.ifElse, tname, ctx)
+    if monoCoerceFnValueName(e.ifThen, tname, ctx, expTy) < 0 { return -1 }
+    return monoCoerceFnValueName(e.ifElse, tname, ctx, expTy)
   }
   if e is Block {
     // An arm's VALUE is its LAST statement, so that is the only position the expected type reaches.
     const bs = e.blkStmts
     if bs.length == 0 { return 0 }
-    return monoCoerceFnValueName(bs[bs.length - 1], tname, ctx)
+    return monoCoerceFnValueName(bs[bs.length - 1], tname, ctx, expTy)
   }
   if e is Ident {
     // A bare function name, or a value binding holding a generic function (`const add =
@@ -5661,7 +5760,7 @@ function monoCoerceFnValueName(exprIx: i32, tname: string, ctx: i32) {
       if monoGen[gfe] == 1 {
         const pnames: string[] = []
         if monoFnTypeAnnParamsName(tname, pnames) {
-          return monoInstanceFor(gfe, pnames, exprIx)
+          return monoInstanceFor(gfe, pnames, exprIx, expTy)
         }
       }
     }
@@ -5694,7 +5793,12 @@ function monoNameIsAssigned(name: string) {
 // no-op). `ctx` is the enclosing function (-1 = top level), for resolving a value binding.
 function monoCoerceFnValue(exprIx: i32, expectedTyIx: i32, ctx: i32) {
   if expectedTyIx < 0 { return 0 }
-  return monoCoerceFnValueName(exprIx, tyNameOf(expectedTyIx), ctx)
+  return monoCoerceFnValueName(
+    exprIx,
+    tyNameOf(expectedTyIx),
+    ctx,
+    nodeTyIxOf(expectedTyIx),
+  )
 }
 
 // The written type-annotation node of parameter `i` of the function occupying `fnStmts`
@@ -5893,6 +5997,157 @@ function monoBindFromLaterArg(
   0
 }
 
+// Whether parameter annotation `ann` at argument `act` binds only after the call's others: a
+// union the checker's walk passes over, or one whose argument leaves its type parameter free.
+function monoPinDefers(ann: string, act: string, typarams: string[]): boolean {
+  monoAnnIsOpenUnion(ann, typarams)
+    || monoUnionLeavesOpenFree(ann, act, typarams)
+}
+
+// Per parameter of the call being instantiated: the argument's own spelling where the union
+// parameter's substituted spelling cannot hold it, else "" (`monoPreBindPastUnionRest`).
+let monoUnionRestPin: string[] = []
+
+// Where some parameter's annotation is a union over a type parameter (`u: T | string`), binds
+// every other type-parameter annotation from its argument first, so the union only fills a
+// type parameter nothing else binds, as the checker's inference does (D2734).
+function monoPreBindPastUnionRest(
+  params: i32[],
+  args: i32[],
+  typarams: string[],
+  ctx: i32,
+  tvN: string[],
+  tvV: string[],
+) {
+  monoUnionRestPin = []
+  let z = 0
+  while z < params.length {
+    monoUnionRestPin.push("")
+    z = z + 1
+  }
+  const anns: string[] = []
+  const acts: string[] = []
+  let any = false
+  let i = 0
+  while i < params.length && i < args.length {
+    let ann = ""
+    let act = ""
+    const p = P.nodes[params[i]]
+    if p is Param {
+      if p.parType >= 0 {
+        ann = monoDeclAnnName(p.parType, tyNameOf(p.parType), typarams)
+        if annArrowAt(ann) >= 1 || !monoAnnHasTyParam(ann, typarams) {
+          ann = ""
+        }
+      }
+    }
+    // Only a union annotation can defer, so only its argument is spelled here: a pin name
+    // renders the whole argument type, which a wide type makes dear.
+    if ann != "" && unionMemberCount(ann) > 1 {
+      act = monoPreBindArgName(args[i], ctx)
+      if act != "" && monoPinDefers(ann, act, typarams) { any = true }
+    }
+    anns.push(ann)
+    acts.push(act)
+    i = i + 1
+  }
+  if !any { return 0 }
+  let a = 0
+  while a < anns.length {
+    // arena-tick exempt: the call's own argument-name column, not an arena node.
+    if anns[a] != "" && acts[a] == "" {
+      acts[a] = monoPreBindArgName(args[a], ctx)
+    }
+    a = a + 1
+  }
+  let j = 0
+  while j < anns.length {
+    if anns[j] != "" && acts[j] != "" {
+      if !monoPinDefers(anns[j], acts[j], typarams) {
+        monoBindFromAnn(anns[j], acts[j], typarams, tvN, tvV)
+      }
+    }
+    j = j + 1
+  }
+  // A union parameter whose spelling, at the bindings above, cannot hold its argument is pinned
+  // at the argument's own type, as an un-annotated parameter is, so the two reps agree.
+  let k = 0
+  while k < anns.length {
+    if anns[k] != "" && acts[k] != "" {
+      if monoAnnIsOpenUnion(anns[k], typarams) {
+        const sub = monoSubstAnn(anns[k], typarams, tvN, tvV)
+        if (
+          sub != ""
+          && !monoAtomsCover(canonEmitName(sub), canonEmitName(acts[k]))
+        ) {
+          // arena-tick exempt: the call's own pin column, not an arena node.
+          monoUnionRestPin[k] = acts[k]
+        }
+      }
+    }
+    k = k + 1
+  }
+  monoBindBareArenaPins(params, args, typarams, ctx)
+  0
+}
+
+// Adds to the call's arena bindings (`monoExplicitBN`/`monoExplicitBT`) each type parameter a
+// bare `T` parameter binds from its argument's type, so a union parameter over `T` is minted at
+// the bound type exactly as an explicit type argument mints it (D2734).
+function monoBindBareArenaPins(
+  params: i32[],
+  args: i32[],
+  typarams: string[],
+  ctx: i32,
+) {
+  let i = 0
+  while i < params.length && i < args.length {
+    const p = P.nodes[params[i]]
+    if p is Param {
+      if p.parType >= 0 {
+        const ann = monoDeclAnnName(p.parType, tyNameOf(p.parType), typarams)
+        const tp = monoTyParamOf(ann, typarams)
+        if tp != "" && tp == ann && !strListHas(monoExplicitBN, tp) {
+          const at = monoExactPinTyOf(monoArgPinTyIx(args[i], ctx), ctx)
+          if at >= 0 && !tyHasTyVar(at) {
+            monoExplicitBN.push(tp)
+            monoExplicitBT.push(at)
+          }
+        }
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// The pin name of argument `ax` for the pre-bind: a bare `null` names no type a parameter could
+// bind from, whatever its default pin.
+function monoPreBindArgName(ax: i32, ctx: i32): string {
+  if P.nodes[unwrapParen(ax)] is NullLit { return "null" }
+  monoArgPinName(ax, ctx)
+}
+
+// Whether every atom of union spelling `inner` is an atom of `outer`.
+function monoAtomsCover(outer: string, inner: string): boolean {
+  const os: string[] = []
+  splitUnionAtoms(outer, os)
+  const ins: string[] = []
+  splitUnionAtoms(inner, ins)
+  let i = 0
+  while i < ins.length {
+    let hit = false
+    let j = 0
+    while j < os.length && !hit {
+      if normTypeAtom(os[j]) == normTypeAtom(ins[i]) { hit = true }
+      j = j + 1
+    }
+    if !hit { return false }
+    i = i + 1
+  }
+  true
+}
+
 // Instantiate (or reuse) the instance of generic `origFe` for the call at
 // `callIx` (whose enclosing function is `ctx`, -1 = top level), and point the
 // call site at it. Returns 0, or -1 via `emitFail`.
@@ -6032,6 +6287,7 @@ function monoInstantiateCall(origFe: i32, callIx: i32, ctx: i32) {
         }
         ta = ta + 1
       }
+      monoPreBindPastUnionRest(params, args, fn.fnTyParams, ctx, tvN, tvV)
       let i = 0
       while i < args.length {
         const p = P.nodes[params[i]]
@@ -6087,7 +6343,10 @@ function monoInstantiateCall(origFe: i32, callIx: i32, ctx: i32) {
                   )
                 }
                 monoBindFromAnn(ann, anC, fn.fnTyParams, tvN, tvV)
-                const pinC = monoSubstAnn(ann, fn.fnTyParams, tvN, tvV)
+                let pinC = monoSubstAnn(ann, fn.fnTyParams, tvN, tvV)
+                if i < monoUnionRestPin.length && monoUnionRestPin[i] != "" {
+                  pinC = monoUnionRestPin[i]
+                }
                 if pinC == "" {
                   return emitFail(
                     "emitProgram: monomorphize: unsupported argument type for `"
@@ -6101,7 +6360,9 @@ function monoInstantiateCall(origFe: i32, callIx: i32, ctx: i32) {
                 // would be the type variables themselves. `pinC` is the substituted
                 // spelling, the concrete function type that parameter takes.
                 if annArrowAt(ann) >= 1 {
-                  if monoCoerceFnValueName(args[i], pinC, ctx) < 0 { return -1 }
+                  if monoCoerceFnValueName(args[i], pinC, ctx, -1) < 0 {
+                    return -1
+                  }
                 }
                 pinned.push(pinC)
                 // A generic function value's own type still rides its type variables, so
@@ -6534,7 +6795,7 @@ function monoWalk(ix: i32, ctx: i32) {
       if tgt is Ident {
         const atn = identFnTypeAnnName(tgt.identName, ctx)
         if atn != "" {
-          if monoCoerceFnValueName(n.binRight, atn, ctx) < 0 { return -1 }
+          if monoCoerceFnValueName(n.binRight, atn, ctx, -1) < 0 { return -1 }
         }
       }
     }
@@ -6950,7 +7211,9 @@ export function monomorphize(stmts: i32[]) {
             const own = P.nodes[fnStmts[fe3]]
             if own is FuncDecl {
               if own.fnParams.length == pins.length {
-                if monoInstanceFor(fe3, pins, fnStmts[fe3]) < 0 { return -1 }
+                if monoInstanceFor(fe3, pins, fnStmts[fe3], -1) < 0 {
+                  return -1
+                }
               }
             }
           }

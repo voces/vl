@@ -1081,8 +1081,12 @@ let bgDstStack: i32[] = []
 let stSeenStack: i32[] = []
 
 // Depth guard for `tyToStr` on recursive named types: a cyclic arena shape would otherwise
-// render forever — past a fixed depth it prints `…`.
+// render forever, so past a fixed depth a type already being rendered prints `…`. An acyclic
+// type renders whole to a far deeper cap, since a render is a table key (D2751).
 let tyToStrDepth = 0
+let tyToStrStack: i32[] = []
+// The nodes a render may still spend past the shallow depth.
+let tyToStrBudget = 4096
 
 // The top-level atom width of the render the last `tyToStrAt` returned, produced by the renderer
 // rather than re-derived by scanning the finished string: a render gains a top-level `|` at
@@ -3000,6 +3004,16 @@ function mkFuncTy(params: i32[], ret: i32) {
   addTy(t)
 }
 
+// The type whose members are `ms`: the one member itself, `X | null` as the nullable, else a union.
+export function tyOfMembers(ms: i32[]): i32 {
+  if ms.length == 1 { return ms[0] }
+  if ms.length == 2 {
+    if ms[1] == TY_NULL && ms[0] != TY_NULL { return mkNullableTy(ms[0]) }
+    if ms[0] == TY_NULL && ms[1] != TY_NULL { return mkNullableTy(ms[1]) }
+  }
+  mkUnionTy(ms)
+}
+
 function mkUnionTy(members: i32[]) {
   const t: Ty = { uMembers: members }
   addTy(t)
@@ -4666,6 +4680,7 @@ export function initChecker() {
   asgSrcStack = []
   asgDstStack = []
   tyToStrDepth = 0
+  tyToStrStack = []
   asgDeclKeys = []
   narClobKeys = []
   narClobTys = []
@@ -17444,9 +17459,23 @@ function tyToStrAt(ix: i32, nominal: boolean) {
   // Angle brackets are reserved for an error that already happened (`<error>` for `TyErr`);
   // collapsing the two would send a reader with a rejected annotation to hunt a missing one.
   if ix < 0 { return "_" }
-  if tyToStrDepth > 8 { return "…" }
+  if tyToStrDepth <= 8 {
+    if tyToStrDepth == 0 { tyToStrBudget = 4096 }
+    tyToStrDepth = tyToStrDepth + 1
+    const s0 = tyToStrGo(ix, nominal)
+    tyToStrDepth = tyToStrDepth - 1
+    return s0
+  }
+  // A cycle entered past the shallow depth meets one of its own types again there, and a
+  // shared subtree (a diamond) is bounded by a node budget per render.
+  if tyToStrDepth > 64 || tyToStrBudget <= 0 || i32ListHas(tyToStrStack, ix) {
+    return "…"
+  }
+  tyToStrBudget = tyToStrBudget - 1
   tyToStrDepth = tyToStrDepth + 1
+  tyToStrStack.push(ix)
   const s = tyToStrGo(ix, nominal)
+  tyToStrStack.pop()
   tyToStrDepth = tyToStrDepth - 1
   s
 }
@@ -17690,6 +17719,20 @@ export function tyArrayElemIx(ix: i32): i32 {
 const tyEqAStack: i32[] = []
 const tyEqBStack: i32[] = []
 
+// Set only inside `tyEqSameHoles`: `tyEq` then tells two inference holes apart by name.
+let tyEqHolesExact = false
+
+// `tyEq` with each inference hole equal only to itself, so two types it calls equal name the
+// same holes and substitute alike.
+export function tyEqSameHoles(a: i32, b: i32): boolean {
+  if a == b { return true }
+  const was = tyEqHolesExact
+  tyEqHolesExact = true
+  const r = tyEq(a, b)
+  tyEqHolesExact = was
+  r
+}
+
 export function tyEq(a: i32, b: i32) {
   if a == b { return true }
   if a < 0 || b < 0 { return false }
@@ -17770,8 +17813,9 @@ function tyEqGo(a: i32, b: i32) {
     }
     TyVar => {
       if tb is TyVar {
-        // An inference hole renders `_` regardless of its internal name.
-        if ta.tvName[0] == '?' { return tb.tvName[0] == '?' }
+        // An inference hole renders `_` regardless of its internal name, except to a caller
+        // asking for the same holes (`tyEqSameHoles`).
+        if ta.tvName[0] == '?' && !tyEqHolesExact { return tb.tvName[0] == '?' }
         return ta.tvName == tb.tvName
       }
       return false
@@ -29209,10 +29253,15 @@ function cstrOwnedBy(owner: i32, calleeFn: i32) {
 function noteBinCstr(lt: i32, op: string, rt: i32) {
   if tyHasHole(lt) || tyHasHole(rt) {
     const owner = cstrOwnerTop()
+    // A structurally equal constraint of the same body is the same constraint: a call's
+    // substitution mints fresh arena copies, and keying on the index alone let each copy of a
+    // callee's constraints re-record in every caller, exponential over a cycle of generics (D2757).
     let k = 0
     while k < binCstrOp.length {
-      if binCstrLt[k] == lt && binCstrOp[k] == op && binCstrRt[k] == rt {
-        if binCstrFn[k] == owner { return 0 }
+      if binCstrOp[k] == op && binCstrFn[k] == owner {
+        if tyEqSameHoles(binCstrLt[k], lt) && tyEqSameHoles(binCstrRt[k], rt) {
+          return 0
+        }
       }
       k = k + 1
     }
@@ -45849,15 +45898,53 @@ export function nodeTyIsUnion(ix: i32) {
   false
 }
 
-// Completeness of a substitution: does `ty` still contain an unresolved `TyVar` anywhere
-// inside it? `substTyDeep` rebuilds only children that changed, so an unbound type parameter
-// is left in place rather than reported — recording a partly-substituted return type on a
-// monomorphized instance is a wrong type. Depth-bounded; running out of depth returns true.
-export function tyHasTyVar(ty: i32) { tyHasTyVarGo(ty, 12) }
+// Whether `ty` still holds an unresolved `TyVar`: `substTyDeep` leaves an unbound parameter in
+// place, and a partly-substituted type recorded on an instance is a wrong type. An acyclic type
+// is read whole, each distinct part once; a cycle is cut, and only the far caps answer true.
+export function tyHasTyVar(ty: i32) {
+  tyHasTyVarBudget = 100000
+  tyHasTyVarCapped = false
+  if tyHasTyVarFreeN > 0 {
+    tyHasTyVarFree = Map()
+    tyHasTyVarFreeN = 0
+  }
+  tyHasTyVarGo(ty, 20000)
+}
+
+// Whether the last `tyHasTyVar` answered true only because it ran out of depth or budget.
+export function tyHasTyVarWasCapped(): boolean { tyHasTyVarCapped }
+
+let tyHasTyVarCapped = false
+
+// The walk's stack below the shallow depth, where a revisit is a cycle and adds nothing.
+const tyHasTyVarDeep: i32[] = []
+// The distinct parts the walk may still visit below the shallow depth, and the parts it has
+// found free of a type variable there, so a shared part (a diamond) is read once.
+let tyHasTyVarBudget = 100000
+let tyHasTyVarFree: {[i32]: boolean} = Map()
+let tyHasTyVarFreeN = 0
 
 function tyHasTyVarGo(ty: i32, depth: i32) {
   if ty < 0 { return false }
-  if depth <= 0 { return true }
+  if depth > 19988 { return tyHasTyVarAt(ty, depth) }
+  if tyHasTyVarFree.has(ty) { return false }
+  if depth <= 0 || tyHasTyVarBudget <= 0 {
+    tyHasTyVarCapped = true
+    return true
+  }
+  tyHasTyVarBudget = tyHasTyVarBudget - 1
+  if i32ListHas(tyHasTyVarDeep, ty) { return false }
+  tyHasTyVarDeep.push(ty)
+  const r = tyHasTyVarAt(ty, depth)
+  tyHasTyVarDeep.pop()
+  if !r {
+    tyHasTyVarFree.set(ty, true)
+    tyHasTyVarFreeN = tyHasTyVarFreeN + 1
+  }
+  r
+}
+
+function tyHasTyVarAt(ty: i32, depth: i32) {
   const t = T.tys[ty]
   if t is TyVar { return true }
   if t is TyArray { return tyHasTyVarGo(t.aElem, depth - 1) }
@@ -50647,7 +50734,18 @@ function checkCastNode(n: AsExpr, ix: i32) {
   // admits it on purpose — park both on the hole, re-asked at the call site that pins it (D1342).
   if arg >= 0 {
     const argH = T.tys[arg]
-    if argH is TyVar { noteCastDemand(argH.tvName, n, ix, target) }
+    if argH is TyVar {
+      noteCastDemand(argH.tvName, n, ix, target)
+      // A pin may make `as?` to a number miss (a union arm, a narrowing number, another type),
+      // so over a type parameter it is `N | null` at every pin, as over a union (D2754).
+      if (
+        n.asMode == "null"
+        && argH.tvName[0] != '?'
+        && isNumericPrimTy(target)
+      ) {
+        return mkNullableTy(target)
+      }
+    }
   }
   // Union-operand `as` is the ruled propagation cast: `x as T` over `x: A|B|...` names the arm
   // wanted, everything else is the error. A nullable operand is a union operand — one arm, no second ladder.
