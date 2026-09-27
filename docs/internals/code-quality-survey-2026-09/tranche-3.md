@@ -188,6 +188,11 @@ In order, each its own PR:
 Tranche 3 is structure: row 7(b) family by family, row 10's boolean parameters, row 11's
 split after a call-graph census, row 19's long functions.
 
+Row 7(b)'s first family, the struct and variant FIELD CODES, is named: the `FC_*` consts
+beside `sFieldTypes` in `emit_state.vl`, used at 533 sites (comparisons against a field
+code, the producers' literal returns, and literal codes passed or stored). Row 7(a) folds
+every read into the literal, so the seed was byte-identical to master's.
+
 ## 6 · What the earlier passes left undone
 
 Still standing at `5eee42758`, re-checked: first-pass row 12's remaining classifier sites
