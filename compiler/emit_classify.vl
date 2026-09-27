@@ -39703,6 +39703,7 @@ function annParamKind(t: string) {
   if t == "f64" { return repSigTokOfKind("f64") }
   if t == "i64" { return repSigTokOfKind("i64") }
   if t == "f32" { return repSigTokOfKind("f32") }
+  if t == "v128" { return repSigTokOfKind("v128") }
   // A registered union name is the `{tag, value}` box, except a litunion alias, whose rep is
   // the interned i32 atom — gated on `isUName` since only a declared alias registers a name.
   if isUName(t) {
@@ -39773,6 +39774,7 @@ function annRetKind(t: string) {
   if t == "string" { return ">" + repSigTokOfKind("str") }
   if t == "i64" { return ">" + repSigTokOfKind("i64") }
   if t == "f32" { return ">" + repSigTokOfKind("f32") }
+  if t == "v128" { return ">" + repSigTokOfKind("v128") }
   // A list return, matching `cloRetKeySuffix` — `nameIsI32Array` folds `boolean[]` and a
   // litunion `K[]` into the same i32-list token the param dual already keys.
   const sk = scalarListRepOfName(t)
@@ -39838,13 +39840,14 @@ function annUnionSigKind(t: string, slotOut: i32[]): VKind | null {
   }
   // A nullable closure: the shared fat-pointer made nullable, slot-free, matching `>C`.
   if strContains(nonNull[0], "=>") { return "nulclosure" }
-  // A nullable numeric scalar reps as the value-union box; `boolean | null` is the i32-sentinel
-  // niche instead, outside the ABI since its valtype is plain i32.
+  // A nullable numeric scalar or vector reps as the value-union box; `boolean | null` is the
+  // i32-sentinel niche instead, outside the ABI since its valtype is plain i32.
   if (
     nonNull[0] == "i32"
     || nonNull[0] == "i64"
     || nonNull[0] == "f64"
     || nonNull[0] == "f32"
+    || nonNull[0] == "v128"
   ) {
     return "union"
   }
@@ -39891,6 +39894,7 @@ function paramTokOfTy(ty: i32) {
       if pn == "f64" { return repSigTokOfKind("f64") }
       if pn == "i64" { return repSigTokOfKind("i64") }
       if pn == "f32" { return repSigTokOfKind("f32") }
+      if pn == "v128" { return repSigTokOfKind("v128") }
       if pn == "string" { return repSigTokOfKind("str") }
       return ""
     }
@@ -39937,6 +39941,7 @@ function retTokOfTy(ty: i32) {
       if pn == "f64" { return ">" + repSigTokOfKind("f64") }
       if pn == "i64" { return ">" + repSigTokOfKind("i64") }
       if pn == "f32" { return ">" + repSigTokOfKind("f32") }
+      if pn == "v128" { return ">" + repSigTokOfKind("v128") }
       if pn == "string" { return ">" + repSigTokOfKind("str") }
       return ""
     }
@@ -39994,35 +39999,110 @@ export function sigKeyOfTy(funcTyIx: i32): string {
   let key = ""
   let i = 0
   while i < t.fnParamTypes.length {
-    // A litunion-alias parameter is preserved (as the return leg is): a raw render softens it
-    // to `string`, disagreeing with the two other `$fnsig` producers which key the i32 atom.
-    let pc = paramTokOfTy(t.fnParamTypes[i])
-    if pc == "" {
-      let pnm = ""
-      if tyIsLitUnion(t.fnParamTypes[i]) {
-        // `tyLitUnionAliasIx`, not the bare `unionAliasDeclNameOfTy`: it follows the checker's
-        // alias provenance, so a narrowed-copy alias param resolves its source name, not `string`.
-        pnm = unionAliasDeclNameOfTy(tyLitUnionAliasIx(t.fnParamTypes[i]))
-      }
-      if pnm == "" { pnm = tyToEmitName(t.fnParamTypes[i]) }
-      if pnm == "" { return "" }
-      pc = annParamKind(pnm)
-    }
+    const pc = sigParamTokOfTy(t.fnParamTypes[i])
     if pc == "" { return "" }
     key = key + pc
     i = i + 1
   }
-  // The return render mirrors `tyToEmitName`'s TyFunc arm: litunion-alias preservation keys
-  // `>i` (not `>S`) and the arena is tried first, so a scalar/scalar-list result is never rendered.
-  const raTok = retTokOfTy(t.fnRet)
-  if raTok != "" { return key + raTok }
-  let rs = fnRetEmitName(t.fnRet)
-  if rs == "" { return "" }
-  const rt = T.tys[t.fnRet]
-  if rt is TyFunc { rs = "(" + rs + ")" }
-  const rc = annRetKind(rs)
+  const rc = sigRetTokOfTy(t.fnRet)
   if rc == "" { return "" }
   key + rc
+}
+
+// One parameter's `$fnsig` token for `sigKeyOfTy`, arena first, else its render. A
+// litunion-alias parameter keeps its alias name, since a raw render softens it to `string`
+// while the other producers key the i32 atom. "" when the type has no token.
+function sigParamTokOfTy(pty: i32): string {
+  const pc = paramTokOfTy(pty)
+  if pc != "" { return pc }
+  let pnm = ""
+  if tyIsLitUnion(pty) {
+    // `tyLitUnionAliasIx` follows the checker's alias provenance, so a narrowed-copy alias
+    // param resolves its source name, not `string`.
+    pnm = unionAliasDeclNameOfTy(tyLitUnionAliasIx(pty))
+  }
+  if pnm == "" { pnm = tyToEmitName(pty) }
+  if pnm == "" { return "" }
+  annParamKind(pnm)
+}
+
+// The result half of `sigKeyOfTy` (`>X`), arena first so a scalar or scalar-list result is
+// never rendered; the render keeps a litunion alias so it keys `>i`, not `>S`. "" when none.
+function sigRetTokOfTy(rty: i32): string {
+  const raTok = retTokOfTy(rty)
+  if raTok != "" { return raTok }
+  let rs = fnRetEmitName(rty)
+  if rs == "" { return "" }
+  const rt = T.tys[rty]
+  if rt is TyFunc { rs = "(" + rs + ")" }
+  annRetKind(rs)
+}
+
+// True when value call `callIx`'s callee type has a parameter or result with no `$fnsig`
+// token and no derived i32 rep: the all-i32 arity functype would then be called at the wrong
+// type, so the caller refuses instead of falling back (D2810).
+export function cloCallArityFallbackUnsound(callIx: i32): boolean {
+  const c = P.nodes[callIx]
+  if c is Call {
+    const fty = nodeTyIxOf(c.callFn)
+    if fty >= 0 {
+      const t = T.tys[fty]
+      if t is TyFunc {
+        let i = 0
+        while i < t.fnParamTypes.length {
+          if sigParamTokOfTy(t.fnParamTypes[i]) == "" {
+            if cloArityRepIsWide(t.fnParamTypes[i]) { return true }
+          }
+          i = i + 1
+        }
+        if sigRetTokOfTy(t.fnRet) == "" { return cloArityRepIsWide(t.fnRet) }
+      }
+    }
+  }
+  false
+}
+
+// Whether type `ty` may be something other than the i32 valtype: only a derived `i32` or
+// `boolean | null` rep is known to ride an i32, so an underived rep answers true.
+function cloArityRepIsWide(ty: i32): boolean {
+  const d = repOfTy(ty)
+  if d.rdCovered == 0 { return true }
+  d.rdKind != "i32" && d.rdKind != "nulbool"
+}
+
+// Why a value call `callIx` found no `$fnsig`: the first parameter or the result of the
+// callee's function type that has no token, walked in `sigKeyOfTy`'s order, else the whole
+// signature, which then has a key that no function value of that type interned.
+export function cloCallSigRejectWhat(callIx: i32): string {
+  const c = P.nodes[callIx]
+  if c is Call {
+    const fty = nodeTyIxOf(c.callFn)
+    if fty >= 0 {
+      const t = T.tys[fty]
+      if t is TyFunc {
+        let i = 0
+        while i < t.fnParamTypes.length {
+          if sigParamTokOfTy(t.fnParamTypes[i]) == "" {
+            return "parameter "
+              + i32ToStr(i + 1)
+              + " of type `"
+              + tyToEmitName(t.fnParamTypes[i])
+              + "` has no representation in the function-value ABI"
+          }
+          i = i + 1
+        }
+        if sigRetTokOfTy(t.fnRet) == "" {
+          return "its result type `"
+            + tyToEmitName(t.fnRet)
+            + "` has no representation in the function-value ABI"
+        }
+        return "no function value of type `"
+          + tyToEmitName(fty)
+          + "` reaches this call to intern its signature"
+      }
+    }
+  }
+  "the callee has no function type to key a signature from"
 }
 
 // The `$fnsig` key of a union member-set arm (a `splitUnionAtoms` atom), or "" for a
