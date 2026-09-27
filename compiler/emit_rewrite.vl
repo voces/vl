@@ -35,6 +35,7 @@ import {
   litUnionAliasNameOfTy,
   memSharedCalls,
   mkArrayTy,
+  mkNullableTyOf,
   nameIsLitUnionType,
   nodeTyCarry,
   nodeTyExcludesNull,
@@ -62,6 +63,7 @@ import {
   tyIsLitUnion,
   tyIsLitUnionOrLit,
   tyIsNulValueUnionBox,
+  tyPrimNameOf,
   tySame,
   tyToEmitName,
   voidCoerceValAt,
@@ -114,6 +116,7 @@ import {
   hasNamedArgs,
   i32ToStr,
   mkArrayLit,
+  mkAsExpr,
   mkBareBlockIf,
   mkBinary,
   mkBlock,
@@ -2047,6 +2050,7 @@ function cboxShadowParams(fn: i32) {
 function cboxFrameReset() {
   cboxDletSeen = Map()
   cboxCellTy = Map()
+  cboxVecCells = Map()
   cboxKind = Map()
   cboxLetIx = Map()
   cboxLoopUp = []
@@ -2449,6 +2453,7 @@ function cboxLitCopy(ix: i32) {
 function cboxBoxLet(ix: i32, key: string) {
   const n = P.nodes[ix]
   if !(n is LetDecl) { return 0 }
+  if cboxVecBoxLet(ix, n, key) { return 0 }
   if n.letType >= 0 {
     const lt = P.nodes[n.letType]
     if lt is TypeRef {
@@ -2477,6 +2482,32 @@ function cboxBoxLet(ix: i32, key: string) {
   n.letInit = mkArrayLit(els, -1)
   nodeTyRecord(n.letInit, cboxCellTy[key] ?? -1)
   0
+}
+
+// A vector has no list backing, so its cell is a list of `v128 | null` boxes: every read
+// unboxes with `as!`, and a store boxes (D2826). Names such a cell in `cboxVecCells`.
+let cboxVecCells: {[string]: i32} = Map()
+// Set while `cboxWalk` rewrites the bare target of an `=`, which a vector cell stores into
+// rather than unboxes.
+let cboxStoreTarget = false
+function cboxVecBoxLet(ix: i32, n: LetDecl, key: string): boolean {
+  let vty = -1
+  if n.letType >= 0 {
+    vty = nodeTyIxOf(n.letType)
+  } else {
+    vty = nodeTyIxOf(n.letInit)
+  }
+  if tyPrimNameOf(vty) != "v128" { return false }
+  const cellTy = mkArrayTy(mkNullableTyOf(vty))
+  cboxCellTy[key] = cellTy
+  cboxVecCells[key] = 1
+  if n.letType < 0 { nliForgetLet(ix) }
+  n.letType = synthTypeRefTy("(v128|null)[]", -1, cellTy)
+  const els: i32[] = []
+  els.push(n.letInit)
+  n.letInit = mkArrayLit(els, -1)
+  nodeTyRecord(n.letInit, cellTy)
+  true
 }
 
 // A `let <name>$cb = [<name>]` that seeds the cell of boxed parameter or loop variable `name`,
@@ -2581,6 +2612,13 @@ function cboxWalk(ix: i32, boxed: string[]) {
       if cellTy >= 0 { nodeTyRecord(cell, cellTy) }
       const rd = mkIndex(cell, mkNum("0", -1), -1)
       const rty = nodeTyIxOf(ix)
+      if (cboxVecCells[n.identName] ?? 0) == 1 {
+        if cboxStoreTarget { return rd }
+        nodeTyRecord(rd, tyArrayElemIx(cellTy))
+        const un = mkAsExpr(rd, "v128", "trap", -1)
+        if rty >= 0 { nodeTyRecord(un, rty) }
+        return un
+      }
       if rd >= 0 && rty >= 0 { cboxReadTy[rd] = rty }
       return rd
     }
@@ -2620,7 +2658,9 @@ function cboxWalk(ix: i32, boxed: string[]) {
   }
   if n is BinExpr {
     const leftName = cboxTypedLeftName(n, boxed)
+    cboxStoreTarget = n.binOp == "=" && P.nodes[unwrapParen(n.binLeft)] is Ident
     n.binLeft = cboxWalk(n.binLeft, boxed)
+    cboxStoreTarget = false
     n.binRight = cboxWalk(n.binRight, boxed)
     // The left of a `??` or `=` is typed at the binding's declared type: the coalesce lowers
     // from its operand's type (a closure may have written the cell since any narrowing), and

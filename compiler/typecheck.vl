@@ -3147,6 +3147,9 @@ export function mkArrayTy(elem: i32) {
   addTy(t)
 }
 
+// `ty | null`, for an emit-side rewrite that needs a box over a value with no niche (D2826).
+export function mkNullableTyOf(ty: i32) { mkNullableTy(ty) }
+
 // The read-only view over the same element (`readonly T[]`). A sibling constructor rather
 // than a flag on `mkArrayTy`, so every existing mint stays a mutable list by construction.
 export function mkArrayViewTy(elem: i32) {
@@ -22819,7 +22822,11 @@ function eqCmpKindOfNulInner(inner: i32): EqCmpKind {
     if it.primName == "string" { return "nulstr" }
     return ""
   }
-  if it is TyLit { return "" }
+  // `"x" | null` reps as `string | null` (D2827).
+  if it is TyLit {
+    if it.litKind == "str" { return "nulstr" }
+    return ""
+  }
   if it is TyUnion { return "" }
   if it is TyErr { return "" }
   if it is TyVar { return "" }
@@ -46265,12 +46272,22 @@ export function nodeTyWidenedRepName(ix: i32) {
   }
   ""
 }
-// Whether node `ix`'s type is `string | null` (kind 16, nullable raw-array ref) — a
-// `TyNullable` over the bare `string` prim; a `K | null` litunion niche is not this.
-// Paired with `nodeTyIsNullableString`, which answers a wider question (also accepts a
-// `TyLit` string or an all-string `TyUnion`) — using the wrong one of the pair narrows silently.
-export function nodeTyIsNulString(ix: i32) {
-  tyNulInnerIsPrim(nodeTyIxOf(ix), "string")
+// Whether node `ix`'s type is `string | null` (kind 16) — a `TyNullable` over `string` or one
+// string literal (D2827); a `K | null` litunion niche is not this. Paired with the wider
+// `nodeTyIsNullableString` (an all-string `TyUnion` too); the wrong one narrows silently.
+export function nodeTyIsNulString(ix: i32) { tyIsNulStringRep(nodeTyIxOf(ix)) }
+// `tyNulInnerIsPrim(ty, "string")`, plus the one-literal `"x" | null`, which canon softens
+// to `string | null` and so shares its niche.
+function tyIsNulStringRep(ty: i32): boolean {
+  if tyNulInnerIsPrim(ty, "string") { return true }
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if t is TyNullable {
+    if t.nInner < 0 || t.nInner >= T.tys.length { return false }
+    const inner = T.tys[t.nInner]
+    if inner is TyLit { return inner.litKind == "str" }
+  }
+  false
 }
 // Whether node `ix`'s recorded type contains a type variable — it is one, or one sits under
 // a constructor (`T[]`, `T | null`, `{v: T}`). Inside a monomorphized instance the operand
@@ -47652,7 +47669,7 @@ export function nodeArrayElemIsBareStrLit(ix: i32) {
 // stored `(ref null $sTypeIdx)`, so a read `p[i]` stays nullable rather than recovering
 // non-null the way a plain `string[]` element does. Mirrors `nodeArrayElemIsNulBool`.
 export function nodeArrayElemIsNulStr(ix: i32) {
-  tyNulInnerIsPrim(nodeArrayElemTyIx(ix), "string")
+  tyIsNulStringRep(nodeArrayElemTyIx(ix))
 }
 
 // Whether node `ix` has a recorded array type whose element is `K | null` (a literal union

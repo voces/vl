@@ -217,6 +217,7 @@ import {
   tyIsNulValueUnionBox,
   tyIsNullableLitUnion,
   tyIsU8ArrayTy,
+  tyIsValueUnionBox,
   tyIxIsVariantMember,
   tyLitMemberTexts,
   tyLitSetMemberLexes,
@@ -11336,6 +11337,9 @@ function anonValueFitsField(vc: i32, sc: i32, valIx: i32, si: i32, mfi: i32) {
     return true
   }
   if vc == sc {
+    // Code 0 holds `i32`, `boolean` and a string literal union's atom alike, and a read
+    // formats by the row, so an anon row keeps them apart (D2841).
+    if anonRow && vc == FC_I32 { return anonRowScalarFits(valIx, si, mfi) }
     // A named-heap field (`fieldCodeRefsElemHeapC`: a nested struct, a ref list, its `| null`
     // niche) must also agree on which ELEMENT — the code alone does not name the heap type, so
     // two anon rows can field-set and code match while emitting different layouts (D1689).
@@ -11362,8 +11366,13 @@ function anonValueFitsField(vc: i32, sc: i32, valIx: i32, si: i32, mfi: i32) {
   }
   if vc == FC_STR {
     // A code-0 field is a plain i32/boolean slot unless it's a literal-union atom slot
-    // (recorded in `sFieldElemName`), which a string literal legitimately writes.
-    if sc == FC_I32 { return sFieldElemNameAt(si, mfi) != "" }
+    // (recorded in `sFieldElemName`), which a string literal legitimately writes. An anon
+    // row's atom slot takes only a literal among its members; any other string is its own row.
+    if sc == FC_I32 {
+      if sFieldElemNameAt(si, mfi) == "" { return false }
+      if anonRow { return atomFieldTakesStr(valIx, si, mfi) }
+      return true
+    }
     // `string | null` (the same ref, nullable) and `K | null` (a string literal names
     // the atom) are the two niches a string value fills.
     if sc == FC_NUL_STR { return true }
@@ -11391,6 +11400,9 @@ function anonValueFitsField(vc: i32, sc: i32, valIx: i32, si: i32, mfi: i32) {
 // its member SEQUENCE, a nested struct by whether its two element rows box one. Refutation-only,
 // and the caller asks it only for a row the literal's own destination does not name (D1694).
 function declRowFieldFits(vc: i32, sc: i32, valIx: i32, si: i32, mfi: i32) {
+  // A string into a declared code-0 field: only a member literal of its literal set, since the
+  // atom slot cannot hold any other string (D2841).
+  if vc == FC_STR && sc == FC_I32 { return atomFieldTakesStr(valIx, si, mfi) }
   // A declared field's code can differ from the value's through adoption, so a differing code
   // is lenient — except between a named-heap slot (5, 15, 28) and one whose code alone decides
   // its layout (a scalar, a string, a scalar or string list): no adoption crosses that line,
@@ -11451,6 +11463,10 @@ function declRowScalarFits(valIx: i32, si: i32, mfi: i32): boolean {
   if si < 0 || si >= sTyIx.length { return true }
   if mfi < 0 || mfi >= sFieldCount[si] { return true }
   const fty = tyFieldTyOf(sTyIx[si], sFieldNames[sFieldStart[si] + mfi])
+  // The anon row's comparator first, so the two readers cannot disagree on a known kind.
+  const fk = code0KindOf(fty)
+  const vk = code0KindOf(nodeTyIxOf(valIx))
+  if fk != 0 && vk != 0 { return fk == vk }
   const vp = tyPrimNameOf(nodeTyIxOf(valIx))
   if vp == null || fty < 0 { return true }
   const fp = tyPrimNameOf(fty)
@@ -11459,6 +11475,89 @@ function declRowScalarFits(valIx: i32, si: i32, mfi: i32): boolean {
     return numLitUnionBaseTy(fty) >= 0
   }
   true
+}
+
+// `declRowScalarFits`' anonymous-row twin, symmetric because both sides come from literals:
+// a `boolean`, an `i32` and a string literal set are three code-0 kinds, and two known kinds
+// fit only when equal. A kind this cannot name (a hole, a numeric literal set) stays lenient.
+function anonRowScalarFits(valIx: i32, si: i32, mfi: i32): boolean {
+  if si < 0 || si >= sTyIx.length { return true }
+  if mfi < 0 || mfi >= sFieldCount[si] { return true }
+  const fk = code0KindOf(
+    tyFieldTyOf(sTyIx[si], sFieldNames[sFieldStart[si] + mfi]),
+  )
+  const vk = code0KindOf(nodeTyIxOf(valIx))
+  if fk == 0 || vk == 0 { return true }
+  fk == vk
+}
+
+// The code-0 kind of type `ty`: 1 `i32`, 2 `boolean`, 3 a string literal or literal set, 0
+// for anything else, which no caller refutes on.
+function code0KindOf(ty: i32): i32 {
+  if ty < 0 { return 0 }
+  const p = tyPrimNameOf(ty)
+  if p != null {
+    // Exhaustive over `PrimName` and `_`-less: only two prims are code-0 kinds.
+    match p {
+      "i32" => {
+        return 1
+      }
+      "boolean" => {
+        return 2
+      }
+      "string" | "i64" | "f64" | "f32" | "v128" | "void" | "null" | "never" | "u8" => {
+        return 0
+      }
+    }
+  }
+  if tyIsLitUnionOrLit(ty) { return 3 }
+  0
+}
+
+// Whether the string value at `valIx` is a string literal naming a member of row `si`'s atom
+// field `mfi`; an unknown field type stays lenient, and a non-literal field takes no string.
+function atomFieldTakesStr(valIx: i32, si: i32, mfi: i32): boolean {
+  if si < 0 || si >= sTyIx.length { return true }
+  if mfi < 0 || mfi >= sFieldCount[si] { return true }
+  const fty = tyFieldTyOf(sTyIx[si], sFieldNames[sFieldStart[si] + mfi])
+  if fty < 0 { return true }
+  if code0KindOf(fty) != 3 { return false }
+  const v = P.nodes[unwrapParen(valIx)]
+  if v is StrLit {
+    const texts = tyLitMemberTexts(fty)
+    let i = 0
+    while i < texts.length {
+      if texts[i] == v.strText { return true }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// Whether a nested-record field of type `fty` may share row `si`'s field `fi`: the field's
+// target row and `fty` must agree canonically where both are known (D2841).
+function nestedAnonRowFits(fty: i32, si: i32, fi: i32): boolean {
+  if tyHasTyVar(fty) { return true }
+  // The row's recorded element type answers the common agreeing case without resolving a name.
+  const ety = sFieldElemTyIxAt(si, fi)
+  if ety >= 0 && repCanonId(ety) == repCanonId(fty) { return true }
+  const rowElem = sFieldElemNameAt(si, fi)
+  if rowElem == "" { return true }
+  let cr = repNameCanonId(rowElem)
+  if cr < 0 { cr = rowCanonIdOfName(rowElem) }
+  if cr < 0 { return true }
+  repCanonId(fty) == cr
+}
+
+// Whether a code-0 field of type `fty` may share row `si`'s field `fi`: false only when both
+// code-0 kinds are known and differ (D2841).
+function code0TyFitsRow(fty: i32, si: i32, fi: i32): boolean {
+  const tk = code0KindOf(fty)
+  if tk == 0 || si < 0 || si >= sTyIx.length { return true }
+  const rk = code0KindOf(
+    tyFieldTyOf(sTyIx[si], sFieldNames[sFieldStart[si] + fi]),
+  )
+  rk == 0 || rk == tk
 }
 
 // Does an array literal coded `vc` re-encode into a `sc` list by widening each element: an
@@ -11600,7 +11699,24 @@ function elemRowsCaptureCompatAt(vn: string, dn: string): boolean {
       fits = false
     } else {
       const dcode = sFieldTypes[at]
-      if dcode == sFieldTypeAt(vi, vj) {
+      const vcode = sFieldTypeAt(vi, vj)
+      // A string and a non-string scalar or list cannot share a nested row: no adoption widens
+      // one into the other, unlike the numeric widenings a delivery grants (D2841).
+      if (
+        (dcode == FC_STR) != (vcode == FC_STR)
+        && anonCodeIsSelfContained(dcode)
+        && anonCodeIsSelfContained(vcode)
+      ) {
+        fits = false
+      }
+      if dcode == FC_I32 && vcode == FC_I32 {
+        if vi < sTyIx.length && sTyIx[vi] >= 0 {
+          if !code0TyFitsRow(tyFieldTyOf(sTyIx[vi], sFieldNames[at]), di, k) {
+            fits = false
+          }
+        }
+      }
+      if dcode == vcode {
         const dv = sFieldElemName[at]
         const vv = sFieldElemNameAt(vi, vj)
         if dv != "" && vv != "" {
@@ -18787,7 +18903,8 @@ function variantRowOfObjFieldSetK(ty: i32, widen: boolean): i32 {
                 const rowElem = variantFieldElemName(vi, fj)
                 if rowElem != "" {
                   const cq = repCanonId(ftys[k])
-                  const cr = repNameCanonId(rowElem)
+                  let cr = repNameCanonId(rowElem)
+                  if cr < 0 { cr = rowCanonIdOfName(rowElem) }
                   if cq >= 0 {
                     if cr >= 0 {
                       if cq != cr { ok = false }
@@ -18983,6 +19100,16 @@ function structRowOfObjFieldSetK(ty: i32, widen: boolean): i32 {
               } else if want != sFieldTypeAt(si, fj) {
                 ok = false
               }
+              if ok && want == FC_I32 && !code0TyFitsRow(ftys[k], si, fj) {
+                ok = false
+              }
+              if (
+                ok
+                && want == FC_STRUCT
+                && !nestedAnonRowFits(ftys[k], si, fj)
+              ) {
+                ok = false
+              }
             } else {
               // An uncoded field is lenient, matching the render path's `shapeFieldTypeCompat`
               // (refutes only proven mismatches), with its one tightening: a code-15 nested-
@@ -18992,7 +19119,8 @@ function structRowOfObjFieldSetK(ty: i32, widen: boolean): i32 {
                 const rowElem = sFieldElemNameAt(si, fj)
                 if rowElem != "" {
                   const cq = repCanonId(ftys[k])
-                  const cr = repNameCanonId(rowElem)
+                  let cr = repNameCanonId(rowElem)
+                  if cr < 0 { cr = rowCanonIdOfName(rowElem) }
                   if cq >= 0 {
                     if cr >= 0 {
                       if cq != cr { ok = false }
@@ -19303,9 +19431,21 @@ function nestedStructNamesCompat(ta: string, elem: string): boolean {
   if ta == elem { return true }
   const ka = repNameCanonId(ta)
   if ka < 0 { return true }
-  const ke = repNameCanonId(elem)
+  let ke = repNameCanonId(elem)
+  // An anonymous row's name resolves to no declaration; its own recorded type is its identity,
+  // so `{f: boolean}` does not take a `{f: 4}` literal's row (D2841).
+  if ke < 0 { ke = rowCanonIdOfName(elem) }
   if ke < 0 { return true }
   ka == ke
+}
+
+// The canonical identity of the struct row named `name` from the type it recorded, or -1.
+function rowCanonIdOfName(name: string): i32 {
+  const si = structIndexByName(name)
+  if si < 0 || si >= sTyIx.length { return -1 }
+  const ty = sTyIx[si]
+  if ty < 0 || tyHasTyVar(ty) { return -1 }
+  repCanonId(ty)
 }
 
 // The arm whose own canonical render is `name` (D762) — strictly tighter than
@@ -39752,6 +39892,9 @@ export function exprString(exprIx: i32, fnIx: i32) {
     // The join's checked type is arm-order-independent: a `string`-typed join may lead with
     // an atom arm, which widens at `emitRefIfArm` — so the value is still a string.
     if tyKindOf(nodeTyIxOf(exprIx)) == TK_STR { return true }
+    // A join the checker kept as a value union is that union's box, whatever its then arm
+    // is, so a string then arm does not make the `if` a string (D2839).
+    if tyIsValueUnionBox(nodeTyIxOf(exprIx)) { return false }
     // The arm-read of that same signal, for the body where the recorded join type is one
     // arm's — the three sites this one decision moves through (`ifExprRefKind`,
     // `exprHasStrOp`, here), or the rep and its readers disagree.
