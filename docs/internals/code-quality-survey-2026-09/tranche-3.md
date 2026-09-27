@@ -193,6 +193,30 @@ beside `sFieldTypes` in `emit_state.vl`, used at 702 sites (comparisons against 
 code, the producers' literal returns, and literal codes passed or stored). Row 7(a) folds
 every read into the literal, so the seed was byte-identical to master's.
 
+The next four families are named the same way, each in its own commit and each
+byte-identical. The sites were derived mechanically, by a fixpoint over every compiler
+module that joins a call's lines and learns from both sides of every `==`/`!=`:
+
+| family | consts | where | sites |
+| --- | --- | --- | ---: |
+| ref-list element kinds (`rlElemKindTbl`) | `RLK_STRUCT` … `RLK_U8_LIST` | `emit_state.vl` | 266 |
+| list build kinds (`pendingListKind`, `ExpCtx.listKind`, `ListBuild.lbKind`, the concat and compare reps) | `LBK_I32_LIST` … `LBK_NUL_U8_LIST` | `emit_state.vl` | 197 |
+| map value kinds (`mvValKind`, `mvValKindOfName`) | `MVK_MONO`, `MVK_UNSUPPORTED`, `MVK_STRUCT` … `MVK_CLOSURE` | `emit_state.vl` | 161 |
+| `tyKindOf` codes | `TK_I32` … `TK_I64_LIST` | `emit_classify.vl`, module-local | 54 |
+
+Four field-code literals the first family's derivation missed were named too. The scalar
+codes (`scode`/`sc`/`vcode`/`vc`) turned out to be field codes, so they were already named;
+no literal comparison of them remains.
+
+The families overlap by value, and no name crosses from one to another. `RLK` and `LBK`
+agree at 1 and 2, and `MVK` and `TK` agree at 3, 10, 11 and 13. The destination-slot
+cluster's `want` parameter is compared with both a build kind and an element kind, so it
+is left to neither family.
+
+These vocabularies are not yet named: the list-op kind (`listOpKindOf`, 0/3/4), the
+`__array_new__` element kind (`arrNewIntrKind`), the legacy rep-kind codes
+`mapValuesResultKind` returns, and `eqgElemClass`'s answers.
+
 ## 6 · What the earlier passes left undone
 
 Still standing at `5eee42758`, re-checked: first-pass row 12's remaining classifier sites
