@@ -986,6 +986,7 @@ import {
   tyIsUnionMemberOf,
   tyPeelNul,
   tyRefArrElemOf,
+  tySameSet,
   uFieldElemTyIxRow,
   uFieldMapShape,
   uFieldStorageSlot,
@@ -2847,6 +2848,30 @@ function emitVariantDiscrimTest(body: u8[], recvIx: i32, vi: i32, fnIx: i32) {
   0
 }
 
+// The member of the union `recvIx` holds that a tested map `patTy` names up to the order of its
+// value union's members, so the test reads that member's tag; `patTy` itself when the union has
+// it exactly, has no such member, or `patTy` is not a map (D2733).
+function isPatUnionArmTy(recvIx: i32, patTy: i32, fnIx: i32): i32 {
+  if patTy < 0 || !unMemIsMap(patTy) { return patTy }
+  const nm = unionNameOfExpr(recvIx, fnIx)
+  if nm == "" { return patTy }
+  const atoms: string[] = []
+  const arms: i32[] = []
+  unionSetArmTys(nm, atoms, arms)
+  let same = -1
+  let i = 0
+  while i < arms.length {
+    const a = arms[i]
+    if a >= 0 && unMemIsMap(a) {
+      if mapTwinSame(a, patTy) { return patTy }
+      if same < 0 && tySameSet(a, patTy, 16) { same = a }
+    }
+    i = i + 1
+  }
+  if same >= 0 { return same }
+  patTy
+}
+
 // A box test naming a map with a numeric literal-union value, or its base twin, where the box
 // cannot say which it holds: the receiver's union has two members of that one member class, or
 // the instance is pinned at the other (D2493). Refused at `at`; -1 when refused, else 0.
@@ -3096,20 +3121,19 @@ function emitIsTest(body: u8[], isIx: i32, fnIx: i32) {
 
   const ndv = P.nodes[isIx]
   if ndv is IsExpr {
-    if mapSoftTwinTagFail(ndv.isObj, isVarTyIxOf(isIx), fnIx, isIx) < 0 {
-      return -1
-    }
-    const armTag = isArmTagOfTy(isVarTyIxOf(isIx))
+    const patTy = isPatUnionArmTy(ndv.isObj, isVarTyIxOf(isIx), fnIx)
+    if mapSoftTwinTagFail(ndv.isObj, patTy, fnIx, isIx) < 0 { return -1 }
+    const armTag = isArmTagOfTy(patTy)
     // An exact instance's union may hold the pattern's twin under one tag (a Set and its
     // boolean map), so a member set without the pattern itself answers false.
-    const lacksExact = (unMemIsMap(isVarTyIxOf(isIx))
+    const lacksExact = (unMemIsMap(patTy)
       && exprUnion(ndv.isObj, fnIx)
-      && exactUnionLacksMap(ndv.isObj, isVarTyIxOf(isIx), fnIx))
+      && exactUnionLacksMap(ndv.isObj, patTy, fnIx))
     // A map type no arm of the box registered is a member of no value it can hold (a generic
     // body's `is M` at a pin whose union lacks `M`): the answer is false, after the receiver.
     if (
       lacksExact
-      || armTag < 0 && unMemIsMap(isVarTyIxOf(isIx)) && exprUnion(ndv.isObj, fnIx)
+      || armTag < 0 && unMemIsMap(patTy) && exprUnion(ndv.isObj, fnIx)
     ) {
       if emitExpr(body, ndv.isObj, fnIx) < 0 { return -1 }
       fbDrop()
