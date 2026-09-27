@@ -8387,3 +8387,26 @@ shared id space, deletes 2,000 behind, 32 lookups per insert, `-O`): with a reco
 `IdTable` runs 6.6 ns per operation against the map's 10.6. With an `i32` value it is on par
 (11.3–13.7 against 13.4–19.2), because `(i32 | null)[]` boxes every element; the tier-1 niche
 above is what would close that.
+
+## A tree of integer literals takes its destination's width, and a literal shift count must be below the operand's (2026-09-26) — D2709, D2710
+
+**The rule.** A bare literal already takes its destination's type: `const x: i64 = 5` and
+`const y: f64 = 5` store 5 at that width. An operator tree over integer literals alone —
+`3 << 32`, `2147483647 + 1`, `-(7 / 2)` — now takes it too, so it is computed at 64 bits (or as
+a float) rather than wrapped at 32 bits and then widened. This is Swift's reading
+(`let x: Double = 7 / 2` is 3.5), not Go's (untyped constants divide as integers, so 3); the
+Go reading is a known gotcha and VL has no untyped-constant mode for it to fall out of. An
+operand beside a wide one takes that one's type the same way, so `x + (1 << 40)` over an `i64`
+adds 2^40.
+
+**Limits, each chosen.** A float destination adopts only a tree whose every operator has a float
+form (`+ - * / %` and unary `-`) and whose every literal is exact there; a tree with a bitwise or
+shift operator keeps its `i32` reading and converts. An `i32` variable is never widened, so a
+tree that mixes one keeps the 32-bit rule — only the literal-only part adopts. An `i32`
+destination is unchanged, wraparound included.
+
+**The shift count.** Wasm takes a shift count modulo the width, so `x << 32` over an `i32` is
+`x`. A literal count below 0 or at or above the operand's width is refused, as in Rust and Go;
+the refusal is graded after every literal tree has its width, so `const a: i64 = 1 << 40` is
+accepted and `const b = 1 << 40` is not. A computed count keeps the wasm modulo. The one
+program in the repo that relied on the wrap was a fixture that had recorded it by mistake.

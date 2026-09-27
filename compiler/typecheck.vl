@@ -3548,6 +3548,12 @@ let mapRetagToTy: i32[] = []
 // `checkNodeReal` consults it so a re-check keeps the adopted width, and the emitter reads the
 // re-stamped `nodeTyIx` — DECISIONS.md §"A hex literal is a bit pattern".
 let litWide64: boolean[] = []
+// The type an integer literal of an operator tree adopted from its destination or a wide peer
+// (`litTreeAdopt`), parallel to `nodeTyIx`; -1 where none did. Read by `checkNodeReal` so a
+// re-check keeps the width (D2709).
+let litTreeTy: i32[] = []
+// The shift nodes whose count is a literal, graded once every width is in (`checkShiftCounts`).
+let shiftCountNodes: i32[] = []
 // Whether the checker has typed an identifier naming an `extern` anywhere but as a callee: the
 // one case the emitter's `synthExternValues` has work for, so a program that only calls its
 // externs skips it (D2618). `ckCalleeIx` is the callee node the general call arm is typing, or -1.
@@ -4489,6 +4495,8 @@ export function initChecker() {
   mapRetagFromTy = []
   mapRetagToTy = []
   litWide64 = []
+  litTreeTy = []
+  shiftCountNodes = []
   extValueSeen = false
   ckCalleeIx = -1
   extFnTy = []
@@ -14522,6 +14530,10 @@ function radixLitAdoptDst(srcExpr: i32, dstTy: i32) {
   }
   if e is ObjLit { return radixLitAdoptFields(e, dstTy) }
   if e is ArrayLit { return radixLitAdoptElems(e, dstTy) }
+  if e is BinExpr || e is Unary {
+    if litTreeAdoptDst(lix, dstTy) == TY_I64 { return 1 }
+    return 0
+  }
   radixLitNoParts()
 }
 
@@ -14617,7 +14629,15 @@ function radixLitAdoptTails(ix: i32, dstTy: i32) {
   let rc = 0
   const fpn = primNameOf(nonNullTy(dstTy))
   if fpn == "f64" || fpn == "f32" {
-    if all32 && radixLeafAmong(leaves) { reTy = nonNullTy(dstTy) }
+    let treeLeaf = false
+    let ti = 0
+    while ti < leaves.length {
+      if litTreeAdoptDst(parenPeelIx(leaves[ti]), dstTy) >= 0 {
+        treeLeaf = true
+      }
+      ti = ti + 1
+    }
+    if all32 && (treeLeaf || radixLeafAmong(leaves)) { reTy = nonNullTy(dstTy) }
   } else {
     let i = 0
     while i < leaves.length {
@@ -14653,7 +14673,9 @@ function f32LitTailsAdopt(srcExpr: i32, dstTy: i32): boolean {
   if leaves.length == 0 { return false }
   let i = 0
   while i < leaves.length {
-    if !isF32AdoptingLitExpr(leaves[i]) { return false }
+    if !isF32AdoptingLitExpr(leaves[i]) {
+      if litTreeAdoptDst(parenPeelIx(leaves[i]), fty) < 0 { return false }
+    }
     i = i + 1
   }
   if !inferQuiet {
@@ -14694,6 +14716,126 @@ function radixLitAdoptPeer64(exprIx: i32, peerTy: i32) {
   radixLitAdoptDst(exprIx, peerTy)
 }
 
+// How the node at `ix` stands as an operator tree over integer literals alone: -1 when it is not
+// one, 0 for a bare (or negated) literal, 1 for a tree of arithmetic operators, 2 for one with a
+// bitwise or shift operator, which has no float form. A tree deeper than `depth` answers -1 and
+// keeps the width its literals imply, which bounds the walk every wide delivery pays.
+function litTreeOps(ix: i32, depth: i32): i32 {
+  if ix < 0 || ix >= P.nodes.length || depth <= 0 { return -1 }
+  const e = P.nodes[ix]
+  if e is Paren { return litTreeOps(e.parInner, depth - 1) }
+  if e is NumLit {
+    if numLexIsFloat(e.numText) || numLexRadixBits(e.numText) > 64 { return -1 }
+    return 0
+  }
+  if e is Unary {
+    const u = litTreeOps(e.unArg, depth - 1)
+    if u < 0 { return -1 }
+    if e.unOp == "-" { return u }
+    if e.unOp == "~" { return 2 }
+    return -1
+  }
+  if e is BinExpr {
+    let k = -1
+    if binIntOnlyOp(e.binOp) {
+      k = 2
+    } else if (
+      e.binOp == "+"
+      || e.binOp == "-"
+      || e.binOp == "*"
+      || e.binOp == "/"
+      || e.binOp == "%"
+    ) {
+      k = 1
+    }
+    if k < 0 { return -1 }
+    const l = litTreeOps(e.binLeft, depth - 1)
+    if l < 0 { return -1 }
+    const r = litTreeOps(e.binRight, depth - 1)
+    if r < 0 { return -1 }
+    if l > k { k = l }
+    if r > k { k = r }
+    return k
+  }
+  litTreeNotOne()
+}
+
+// Every other node, a name, call or float among them, is not a tree of integer literals.
+function litTreeNotOne(): i32 { -1 }
+
+// Whether every literal of the tree at `ix` holds its value exactly at the float `fty`.
+function litTreeLeavesExact(ix: i32, fty: i32): boolean {
+  const e = P.nodes[ix]
+  if e is Paren { return litTreeLeavesExact(e.parInner, fty) }
+  if e is Unary { return litTreeLeavesExact(e.unArg, fty) }
+  if e is BinExpr {
+    return litTreeLeavesExact(e.binLeft, fty)
+      && litTreeLeavesExact(e.binRight, fty)
+  }
+  if fty == TY_F32 { return isExactF32IntLitExpr(ix) }
+  numLexFitsI32(intLitLexemeOf(ix)) || isExactF64IntLitExpr(ix)
+}
+
+// The type the literal tree at `ix` computes at when delivered into `dstTy`: `i64` at a 64-bit
+// integer destination, the float at an `f64` or `f32` one when every operator has a float form
+// and every literal is exact there, else -1 (the tree keeps the width its literals imply).
+function litTreeWideTy(ix: i32, dstTy: i32): i32 {
+  if dstTy < 0 { return -1 }
+  if dstIntWidth(dstTy, 3) == 64 {
+    if litTreeOps(ix, 32) < 1 { return -1 }
+    return TY_I64
+  }
+  const fty = nonNullTy(dstTy)
+  const pn = primNameOf(fty)
+  if pn != "f64" && pn != "f32" { return -1 }
+  if litTreeOps(ix, 32) != 1 || !litTreeLeavesExact(ix, fty) { return -1 }
+  fty
+}
+
+// Types every node of the literal tree at `ix` as `ty`, its literals through `litTreeTy` so a
+// re-check keeps the width. Answers `ty`.
+function litTreeAdopt(ix: i32, ty: i32): i32 {
+  if ix < nodeTyIx.length { nodeTyIx[ix] = ty }
+  const e = P.nodes[ix]
+  if e is Paren { return litTreeAdopt(e.parInner, ty) }
+  if e is Unary { return litTreeAdopt(e.unArg, ty) }
+  if e is BinExpr {
+    litTreeAdopt(e.binLeft, ty)
+    // A shift count is not an operand of the result's width; it keeps its own.
+    if binShiftOp(e.binOp) { return ty }
+    return litTreeAdopt(e.binRight, ty)
+  }
+  litTreeAdoptLeaf(ix, ty)
+}
+
+// A tree's other nodes are its literals (`litTreeOps` admits no other), each recorded so a
+// re-check keeps the width.
+function litTreeAdoptLeaf(ix: i32, ty: i32): i32 {
+  while litTreeTy.length <= ix { litTreeTy.push(-1) }
+  litTreeTy[ix] = ty
+  ty
+}
+
+// A tree of integer literals takes its destination's width, as a bare literal does, so
+// `const a: i64 = 3 << 32` computes at 64 bits rather than wrapping at 32 first, and the operand
+// beside a wide one takes that one's, so `x + (1 << 40)` over an `i64` adds 2^40 (D2709).
+// Answers the adopted type, or -1; a speculative check answers without recording.
+function litTreeAdoptDst(ix: i32, dstTy: i32): i32 {
+  if ix < 0 { return -1 }
+  const ty = litTreeWideTy(ix, dstTy)
+  if ty < 0 || inferQuiet { return ty }
+  litTreeAdopt(ix, ty)
+}
+
+function litTreeTyOf(ix: i32): i32 {
+  if ix >= 0 && ix < litTreeTy.length { return litTreeTy[ix] }
+  -1
+}
+
+function binShiftOp(op: string): boolean {
+  op == "<<" || op == ">>" || op == ">>>"
+}
+
 export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
   // A bare `{}` completes against a record destination; a required field it omits is refused
   // here, in words, instead of as the site's generic mismatch (D2223).
@@ -14706,6 +14848,7 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
   recordListFieldWidenAdopt(srcExpr, dstTy)
   // A hex / binary / octal literal is a bit pattern of the destination's width, and this seam is
   // where every binding / argument / return / field / element / store position delivers one.
+  if litTreeAdoptDst(parenPeelIx(srcExpr), dstTy) >= 0 { return true }
   if radixLitAdoptDst(srcExpr, dstTy) == 2 { return true }
   // Rep sidecar: an ObjLit/ArrayLit whose source type reaches an unresolved empty-collection hole
   // (`{nodes: []}`, `{m: Map()}`) is plainly `assignable` to its concrete destination, so the
@@ -40678,6 +40821,8 @@ function checkNodeReal(ix: i32) {
     // A radix literal that adopted a 64-bit destination keeps that width across re-checks; one
     // wider than 64 bits has no destination at all, and says so here rather than wrapping.
     if litWide64Of(ix) { return TY_I64 }
+    const ltt = litTreeTyOf(ix)
+    if ltt >= 0 { return ltt }
     if numLexRadixBits(n.numText) > 64 {
       tErr(radixLitTooWideMsg(n.numText, 64), ix)
       return TY_I64
@@ -42742,10 +42887,76 @@ export function checkProgram(rootIx: i32) {
   }
   checkProgramEndOpDecls()
   recordTopScalars()
+  checkShiftCounts()
   rcwRunPending()
   checkProgramEndGetters()
   voidRetRewrite()
   T.diags.length
+}
+
+// A literal shift count must be below its operand's width: wasm takes the count modulo the
+// width, so `x << 32` over an `i32` would shift by nothing (D2710). Graded once every literal tree
+// has its destination's width, so `const a: i64 = 1 << 40` is not refused at 32 bits.
+function checkShiftCounts() {
+  const seen: boolean[] = []
+  let i = 0
+  while i < shiftCountNodes.length {
+    const ix = shiftCountNodes[i]
+    while seen.length <= ix { seen.push(false) }
+    const n = P.nodes[ix]
+    if !seen[ix] && n is BinExpr {
+      seen[ix] = true
+      let w = -1
+      const lt = nodeTyOf(n.binLeft)
+      if lt == TY_I32 { w = 32 }
+      if lt == TY_I64 { w = 64 }
+      const lex = intLitLexemeOf(n.binRight)
+      if w > 0 && lex != "" {
+        const neg = intLitIsNegated(n.binRight)
+        if neg || !numLexFitsI32(lex) || parseI32(lex) >= w {
+          tErr(shiftCountMsg(n.binOp, lex, neg, w), n.binRight)
+        }
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// Whether the integer literal at `ix` is under an odd number of unary minuses.
+function intLitIsNegated(ix: i32): boolean {
+  const e = P.nodes[ix]
+  if e is Paren { return intLitIsNegated(e.parInner) }
+  if e is Unary {
+    if e.unOp == "-" { return !intLitIsNegated(e.unArg) }
+  }
+  intLitSignless()
+}
+
+// The literal itself, the one other node `intLitLexemeOf` admits, carries no sign.
+function intLitSignless(): boolean { false }
+
+function shiftCountMsg(op: string, lex: string, neg: boolean, w: i32): string {
+  let c = lex
+  if neg { c = "-" + lex }
+  const ws = i32ToStr(w)
+  const msg = "shift count "
+    + c
+    + " is out of range for an i"
+    + ws
+    + " operand (0 to "
+    + i32ToStr(w - 1)
+    + ") — `"
+    + op
+    + "` would take it modulo "
+    + ws
+  if w != 32 || neg || !numLexFitsI32(lex) || parseI32(lex) >= 64 { return msg }
+  msg
+    + "; widen the operand (`(x as i64) "
+    + op
+    + " "
+    + c
+    + "`) or give it an i64 destination"
 }
 
 // The module bindings whose checked type is one of the scalars a wasm global can export
@@ -47230,6 +47441,16 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
   if op != "=" && op != "&&" && op != "||" {
     if radixLitAdoptPeer64(n.binLeft, rt) == 1 { lt = TY_I64 }
     if radixLitAdoptPeer64(n.binRight, lt) == 1 { rt = TY_I64 }
+    if op != "??" {
+      const lpa = litTreeAdoptDst(n.binLeft, rt)
+      if lpa >= 0 { lt = lpa }
+    }
+    const rpa = litTreeAdoptDst(n.binRight, lt)
+    if rpa >= 0 { rt = rpa }
+  }
+  // A re-check pushes the node again; `checkShiftCounts` grades each once.
+  if binShiftOp(op) && intLitLexemeOf(n.binRight) != "" {
+    shiftCountNodes.push(ix)
   }
   // A binary op with a hole operand can't decide its form until the hole is bound at the call —
   // record the deferred constraint (skipping assignment / logical, handled by their own arms).
