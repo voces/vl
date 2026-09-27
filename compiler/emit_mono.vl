@@ -202,6 +202,7 @@ import {
   normTypeAtom,
   noteCallOrigin,
   nullablePartOf,
+  parenUnionArrElemName,
   parentLetOf,
   pushUniqueAtom,
   tyIsFuncType,
@@ -1364,7 +1365,13 @@ function monoSubstLetType(
             if !tyHasTyVar(s2) { sty = s2 }
           }
         }
-        return synthTypeRefTy(monoPinMintedUnion(sub, sty), tn.pos, sty)
+        const subC = monoPinMintedUnion(sub, sty)
+        // A union takes the type its registered spelling names, the one an assignment's
+        // `letUnionNameOf` resolves against the registry, not the substitution's own row (D2676).
+        const subAtoms: string[] = []
+        splitUnionAtoms(subC, subAtoms)
+        if subAtoms.length >= 2 { return synthTypeRefTy(subC, tn.pos, -1) }
+        return synthTypeRefTy(subC, tn.pos, sty)
       }
     }
   }
@@ -3321,6 +3328,11 @@ function monoSubstTyArgNodes(tas: i32[]): i32[] {
 // The instance-key suffix `monoInstantiate` hands `monoMakeInstance` for a call with explicit
 // type arguments, consumed (and cleared) where the key is built.
 let monoKeyExtra = ""
+// The same call's explicit bindings as arena types, consumed beside `monoKeyExtra`: the type
+// column a body annotation substitutes through, which the parameters alone cannot bind for a
+// type parameter no parameter mentions (D2676).
+let monoExplicitBN: string[] = []
+let monoExplicitBT: i32[] = []
 
 // Binds `typarams` to the call's explicit type arguments (their canonical spellings) in `tvN`
 // / `tvV`. Answers the key suffix: the bindings of the parameters no value parameter mentions,
@@ -3332,6 +3344,8 @@ function monoBindExplicitTyArgs(
   tvN: string[],
   tvV: string[],
 ): string {
+  monoExplicitBN = []
+  monoExplicitBT = []
   const tas = callTyArgsOf(callIx)
   if tas.length != typarams.length { return "" }
   let extra = ""
@@ -3339,6 +3353,11 @@ function monoBindExplicitTyArgs(
   while i < tas.length {
     const nm = tyNameOf(tas[i])
     if nm != "" {
+      const at = nodeTyIxOf(tas[i])
+      if at >= 0 && !tyHasTyVar(at) {
+        monoExplicitBN.push(typarams[i])
+        monoExplicitBT.push(at)
+      }
       tvN.push(typarams[i])
       tvV.push(nm)
       const one: string[] = [typarams[i]]
@@ -4168,11 +4187,18 @@ function monoPinUnionName(rs: string): string {
 }
 
 // The spelling a parameter or local annotation of type `ty` takes when a pin substitutes into a
-// union holding a map (`V | {[K]: i32}` at `V := {[K]: boolean}`): registered under the canon key
-// a direct spelling reuses, as a return's is, since `collectU` ran before this pass. Unboxed, the
-// binding would be the bare map of its initializer and `is` would answer from that (D2657).
+// union holding a map or a record (`V | {[K]: i32}` at `V := {[K]: boolean}`): registered under
+// the canon key a direct spelling reuses, as a return's is, since `collectU` ran before this pass.
+// Unboxed, the binding would be the bare member of its initializer (D2657, D2676).
 function monoPinMintedUnion(name: string, ty: i32): string {
-  if !monoTyHoldsMap(ty) || isUName(name) { return name }
+  if !monoTyHoldsRefArm(ty) || isUName(name) { return name }
+  // A list of such a union registers its element union, as a direct `(A | B)[]` does (D2678).
+  const pun = parenUnionArrElemName(name)
+  if pun != "" {
+    const pc = monoPinUnionName(pun)
+    if monoRegisterPinUnion(pc) < 0 { return name }
+    return "(" + pc + ")[]"
+  }
   const atoms: string[] = []
   splitUnionAtoms(name, atoms)
   if atoms.length < 2 { return name }
@@ -4226,6 +4252,39 @@ function monoTyHoldsMap(ty: i32): boolean {
   false
 }
 
+// Whether the union or nullable `ty` has a map or a record among its members: the arms a
+// union box holds under a registered row, where a value atom's tag needs none.
+function monoTyHoldsRefArm(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  const lt = T.tys[ty]
+  if lt is TyArray { return monoTyHoldsRefArm(lt.aElem) }
+  const flat: i32[] = []
+  flattenVariantsInto(ty, flat)
+  let i = 0
+  while i < flat.length {
+    const m = flat[i]
+    if m >= 0 && m < T.tys.length {
+      if monoTyIsRefArm(m) { return true }
+    }
+    i = i + 1
+  }
+  false
+}
+
+// Whether the member type at `m` boxes under a registered row: a map or a record. Every other
+// kind rides a value atom's tag or is not a union member at all.
+function monoTyIsRefArm(m: i32): boolean {
+  const mt = T.tys[m]
+  match mt {
+    TyMap | TyObj => {
+      return true
+    }
+    TyPrim | TyErr | TyFunc | TyUnion | TyNullable | TyArray | TyVar | TyLit | TyNeg => {
+      return false
+    }
+  }
+}
+
 // D1042 — register a union that exists only because a pin minted it here. `collectU`
 // runs before `monomorphize` and nothing re-runs it, so a `T | E` return at a concrete `T`
 // has no row and every consumer of the box hits its floor. `registerInlineUnion` self-gates
@@ -4277,6 +4336,10 @@ function monoMakeInstance(
     const params = fn.fnParams
     let key = i32ToStr(origFe) + "#" + monoKeyExtra
     monoKeyExtra = ""
+    const exBN = monoExplicitBN
+    const exBT = monoExplicitBT
+    monoExplicitBN = []
+    monoExplicitBT = []
     let pk = 0
     while pk < pinned.length {
       key = key + pinned[pk] + monoAnonPinDiscrim(pinned[pk], pinTys[pk]) + ","
@@ -4383,8 +4446,15 @@ function monoMakeInstance(
             nt = p3.parType
           } else {
             monoNicheNulListCheck(tyNameOf(p3.parType), fn.fnTyParams, tvN, tvV)
+            // The argument's type is one member of a union parameter; the explicit type
+            // arguments substituted through the annotation name the union itself (D2679).
+            let gateTy = pinTys[pj]
+            if !monoTyHoldsRefArm(gateTy) && exBN.length > 0 {
+              const pst = substTyDeep(nodeTyIxOf(p3.parType), exBN, exBT)
+              if pst >= 0 && !tyHasTyVar(pst) { gateTy = pst }
+            }
             nt = synthTypeRefFb(
-              monoPinMintedUnion(pinned[pj], pinTys[pj]),
+              monoPinMintedUnion(pinned[pj], gateTy),
               -1,
               pinTys[pj],
             )
@@ -4452,8 +4522,8 @@ function monoMakeInstance(
       letTyCol.push(lt)
       lj = lj + 1
     }
-    const letBN: string[] = []
-    const letBT: i32[] = []
+    const letBN: string[] = exBN
+    const letBT: i32[] = exBT
     monoBindCols(params, letTyCol, letBN, letBT)
     // Substitute a type-param-riding RETURN annotation through the binding —
     // bare `T` / `T[]`, an application (`Box<T>`), or an inline object shape
@@ -4490,13 +4560,10 @@ function monoMakeInstance(
         let retTy = -1
         const origRet = nodeTyIxOf(fn.fnRet)
         if origRet >= 0 {
-          const bN: string[] = []
-          const bT: i32[] = []
-          // The same column the parameter slot and the body's bindings take, and that
-          // agreement is the invariant: the registry is keyed on `pinned` alone, so a
-          // result sourced elsewhere makes the instance a function the key cannot see.
-          monoBindCols(params, letTyCol, bN, bT)
-          const sub2 = substTyDeep(origRet, bN, bT)
+          // The body's own binding column, and that agreement is the invariant: the registry
+          // is keyed on the pins, so a result sourced elsewhere makes the instance a function
+          // the key cannot see.
+          const sub2 = substTyDeep(origRet, letBN, letBT)
           if sub2 >= 0 {
             if sub2 != origRet {
               // `substTyDeep`'s union arm dedupes and collapses, so a `T | string` at

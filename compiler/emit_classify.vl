@@ -1005,6 +1005,28 @@ function fnInferredRetTy(i: i32): i32 {
   -1
 }
 
+// Whether function `i`'s checker-inferred return is a union, or a nullable one, with a map
+// member: its result is the union box whatever map an arm's own expression yields (D2666).
+function fnCheckedRetIsMapUnion(i: i32): boolean {
+  let t = fnInferredRetTy(i)
+  if t < 0 || t >= T.tys.length { return false }
+  const tn = T.tys[t]
+  if tn is TyNullable { t = tn.nInner }
+  if t < 0 || t >= T.tys.length { return false }
+  const tu = T.tys[t]
+  if tu is TyUnion {
+    let k = 0
+    while k < tu.uMembers.length {
+      const m = tu.uMembers[k]
+      if m >= 0 && m < T.tys.length {
+        if T.tys[m] is TyMap { return true }
+      }
+      k = k + 1
+    }
+  }
+  false
+}
+
 // `map` or `nulmap` when function `i`'s checker-inferred return is a map or a nullable map,
 // else `null`: the answer a re-entered arm join gives, where the stored kind is still a seed.
 function fnCheckedRetMapKind(i: i32): VKind | null {
@@ -2678,6 +2700,18 @@ export function nulRefStructIdxOfLet(letIx: i32, fnIx: i32) {
   -1
 }
 
+// The struct row an `x as? S` yields `S | null` over, where `S` has a struct row and no
+// `nulvariant` one; else -1. A record first made a union member by a generic pin is a checker
+// variant member that kept its struct row, so neither niche's usual rung claims it (D2676).
+function asNulStructRow(asIx: i32): i32 {
+  if nulVariantIndexOf(asIx) >= 0 { return -1 }
+  const t = nodeTyIxOf(asIx)
+  if t < 0 { return -1 }
+  const tn = T.tys[t]
+  if tn is TyNullable { return structIndexOfTy(tn.nInner) }
+  -1
+}
+
 // True if evaluating the expression at `exprIx` yields a nullable struct ref — a
 // nullable-annotated param, local or global reference, or a `S | null`-returning call.
 export function exprNullableStruct(exprIx: i32, fnIx: i32) {
@@ -2704,7 +2738,10 @@ export function exprNullableStruct(exprIx: i32, fnIx: i32) {
   // `x as? S` over a union yields `S | null`, the nullable struct ref. The `AsExpr` twin of
   // the `exprNullableString` arm; both read the cast's own recorded type, which for the
   // coalescing member is the nullable result.
-  if e is AsExpr { return retNulRefFlag(exprIx) == 1 }
+  if e is AsExpr {
+    if retNulRefFlag(exprIx) == 1 { return true }
+    return asNulStructRow(exprIx) >= 0
+  }
   if e is Call {
     const callee = P.nodes[e.callFn]
     if callee is Ident {
@@ -3685,6 +3722,8 @@ function armNarrowTy(blockIx: i32, fnIx: i32): i32 {
 // to agreeing cells — else `null`. Exported because `emitReturnValue` needs the same answer
 // for its `nulstr` seed: one fact, two readers, or functype and value disagree.
 export function fnAssignRetKind(fe: i32): VKind | null {
+  // Arms assigning two map types return their union's box, not either cell (D2666).
+  if fnCheckedRetIsMapUnion(fe) { return null }
   const nm = fnAssignRetTargetName(fe)
   if nm == "" {
     // Re-entered from its own arm join: the checked return, never the provisional stored kind.
@@ -3948,6 +3987,13 @@ function tailHoldsAsg(t: i32, asgIx: i32): boolean {
 // under the current narrowing stack — the shared loop body of the narrowing-aware walk.
 export function criClassify(rx0: i32, i: i32) {
   let rx = rx0
+  if fnCheckedRetIsMapUnion(i) {
+    if fRetKind[i] != "union" {
+      fRetKind[i] = "union"
+      criChanged = true
+    }
+    return 0
+  }
   // An assignment's value is its target cell, not the rhs expression, and that is a property
   // of the function rather than of this return node — so it answers for every node of such a
   // function and returns, letting no expression fact touch the slot afterwards. The cell kind
@@ -13306,6 +13352,25 @@ export function ifExprRefKind(ifIx: i32, fnIx: i32): VKind | null {
   k
 }
 
+// Whether the `if` join at `ifIx` is checked as a union with a map member: its arms are
+// different map types, so no single map rep holds both.
+function ifJoinIsMapUnion(ifIx: i32): boolean {
+  const ty = nodeTyIxOf(ifIx)
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if t is TyUnion {
+    let i = 0
+    while i < t.uMembers.length {
+      const m = t.uMembers[i]
+      if m >= 0 {
+        if T.tys[m] is TyMap { return true }
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+
 // `ifExprRefKind`'s answers per (join, function) asked during one outermost query, which
 // emits nothing, so an inner join asked by several arm predicates is classified
 // once rather than once per path (exponential in the nest depth otherwise, D2271). Emptied when
@@ -13319,6 +13384,8 @@ let irkMemoNul: i32[] = []
 function ifExprRefKindOf(ifIx: i32, fnIx: i32): VKind | null {
   const tv = ifListArmValueIx(ifIx)
   if tv < 0 { return null }
+  // A join of two maps the checker kept apart is their union box, not the then arm's map (D2666).
+  if ifJoinIsMapUnion(ifIx) { return null }
   // A closure join (kind 14, `(ref $cloStruct)`) checked first: a bare lambda arm is a
   // function value, not a string/array/struct.
   if exprIsClosure(tv, fnIx) { return "closure" }
@@ -29428,6 +29495,10 @@ export function structIndexOfExpr(exprIx: i32, fnIx: i32) {
   const asgCell = asgCellOf(exprIx, fnIx)
   if asgCell >= 0 { return structIndexOfExpr(asgCell, fnIx) }
   if e is Paren { return structIndexOfExpr(e.parInner, fnIx) }
+  if e is AsExpr {
+    const asr = asNulStructRow(exprIx)
+    if asr >= 0 { return asr }
+  }
   // An if-EXPRESSION whose join is a struct (`const b = if c { mk(1) } else { mk(2) }`): the
   // THEN arm's struct index classifies the whole `if` (the checker proved the arms agree), so an
   // un-annotated binding resolves the same struct heap type the `emitIfExprRef` join emits.
@@ -30467,15 +30538,16 @@ export function nodeMixedUnionName(ix: i32): string {
   nm
 }
 
-// The registered name of a union carrying at least one struct VARIANT arm, or "". Wider than
-// `nodeMixedUnionName`, whose second clause also excludes an ALL-variant join (`A | B`); both
-// exclude a literal union, which is an interned i32 and not a box.
+// The registered name of a union carrying at least one struct VARIANT or map arm, or "". Wider
+// than `nodeMixedUnionName`, whose second clause also excludes an ALL-variant join (`A | B`);
+// both exclude a literal union, which is an interned i32 and not a box. A map arm boxes under
+// its own tag with no variant row, so a join of two maps is the box too (D2666).
 export function nodeVariantUnionName(ix: i32): string {
   const nm = nodeRegisteredUnionName(ix)
   if nm == "" { return "" }
   const u = unRowOfName(nm)
   if u < 0 { return "" }
-  if unVarCount[u] < 1 { return "" }
+  if unVarCount[u] < 1 && !unionHasMapArm(nm) { return "" }
   nm
 }
 
@@ -36373,6 +36445,13 @@ export function exprMap(exprIx: i32, fnIx: i32) {
   if e is Paren { return exprMap(e.parInner, fnIx) }
   // A value `if` whose join lowers at the map rep (D2663).
   if e is IfStmt { return ifExprRefKind(exprIx, fnIx) == "map" }
+  // An assignment's value is its target cell, as `exprUnion` states it (D2602).
+  if e is BinExpr {
+    if e.binOp == "=" {
+      const mar = asgReadNode(exprIx, fnIx)
+      if mar != exprIx { return exprMap(mar, fnIx) }
+    }
+  }
   if e is AsExpr {
     if asUnionMapTy(exprIx, fnIx, false) >= 0 { return true }
   }
@@ -36925,6 +37004,12 @@ export function mapShapeOfExpr(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return -1 }
   const e = P.nodes[exprIx]
   if e is Paren { return mapShapeOfExpr(e.parInner, fnIx) }
+  if e is BinExpr {
+    if e.binOp == "=" {
+      const msr = asgReadNode(exprIx, fnIx)
+      if msr != exprIx { return mapShapeOfExpr(msr, fnIx) }
+    }
+  }
   // A value `if`: the shape of the arm its join's rep is read off, as `ifExprRefSlot` does.
   if e is IfStmt { return mapShapeOfExpr(ifRepArmValueIx(exprIx), fnIx) }
   // A set-typed expression is the set shape whatever produced it: the flavor is the TYPE's

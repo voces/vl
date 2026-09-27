@@ -4347,15 +4347,74 @@ function emitUnionMapArmBox(
   if unionName == "" { return 0 }
   // A value `if` boxes arm by arm (`emitUnionCoerce`'s join): its two arms may be two members.
   if P.nodes[unwrapParen(exprIx)] is IfStmt { return 0 }
-  if !exprMap(exprIx, fnIx) { return 0 }
+  let nullable = false
+  if !exprMap(exprIx, fnIx) {
+    if !exprNullableMap(exprIx, fnIx) { return 0 }
+    nullable = true
+  }
   const sh = mapShapeOfExpr(exprIx, fnIx)
   if !unionHasMapArmSlot(unionName, sh) { return 0 }
   const tag = mapBoxTagOf(sh, unionName, exprIx, fnIx)
   if tag < 0 { return -1 }
+  if nullable { return emitNulMapArmBox(body, tag, exprIx, "", -1, fnIx) }
   fbI32Const(tag)
   if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
   fbStructNew(uBoxIdx) // { tag, map struct ref }
   1
+}
+
+// A `M | null` value into a box holding `M`: the map arm's box, or when the value is null the
+// null-tagged box, or `defIx` boxed into `unionName` for a `??` (D2666). The tag rides under
+// the value into `br_on_null`, so the value is read once and no scratch slot is needed.
+function emitNulMapArmBox(
+  body: u8[],
+  tag: i32,
+  exprIx: i32,
+  unionName: string,
+  defIx: i32,
+  fnIx: i32,
+): i32 {
+  fbOpenBlock()
+  wU8(100) // 0x64 (ref $uBox) blocktype
+  wSLEB(uBoxIdx)
+  fbBlock(127) // i32: the tag, carried out when the value is null
+  fbI32Const(tag)
+  const nmCtx = expCtxHere()
+  nmCtx.rawNullRead = true
+  if emitExprExpect(body, exprIx, fnIx, nmCtx) < 0 { return -1 }
+  wU8(213) // 0xd5 br_on_null 0
+  wULEB(0)
+  fbStructNew(uBoxIdx) // { tag, map struct ref }
+  fbBr(1)
+  fbEnd()
+  fbDrop()
+  if defIx >= 0 {
+    if emitUnionBoxArg(body, unionName, defIx, fnIx) < 0 { return -1 }
+  } else {
+    fbI32Const(nullBoxTag())
+    fbRefNullNone()
+    fbStructNew(uBoxIdx) // { null tag, unread }
+  }
+  fbEnd()
+  1
+}
+
+// `l ?? d` whose left is a nullable map and whose result is a union box holding that map, as a
+// join of two map types is: the left's arm box, else `d` boxed. 1 handled, 0 not this shape.
+function emitCoalesceMapJoin(
+  body: u8[],
+  e: BinExpr,
+  exprIx: i32,
+  fnIx: i32,
+): i32 {
+  if !exprNullableMap(e.binLeft, fnIx) { return 0 }
+  const un = coalesceResultUnionName(exprIx)
+  if un == "" { return 0 }
+  const sh = mapShapeOfExpr(e.binLeft, fnIx)
+  if !unionHasMapArmSlot(un, sh) { return 0 }
+  const tag = mapBoxTagOf(sh, un, e.binLeft, fnIx)
+  if tag < 0 { return -1 }
+  emitNulMapArmBox(body, tag, e.binLeft, un, e.binRight, fnIx)
 }
 
 export function emitUnionCoerce(
@@ -27214,6 +27273,9 @@ function emitCoalesceGo(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
       return emitMapGetOr(body, lhs.idxArr, lhs.idxIndex, e.binRight, fnIx)
     }
   }
+  const cmj = emitCoalesceMapJoin(body, e, exprIx, fnIx)
+  if cmj < 0 { return -1 }
+  if cmj > 0 { return 0 }
   // The METHOD form `recv.get(k) ?? d` over a map receiver is the SAME fused
   // get-with-default as `recv[k] ?? d` — lower it identically. (The LIST `.get`
   // at ~6890 is a distinct struct-element get and is NOT a map; `exprMap` gates
