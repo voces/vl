@@ -114,6 +114,7 @@ import {
   mapUnboxTyOf,
   mapValIsI32Cell,
   mapValSoftBase,
+  memCstrMsg,
   nameIsEmitterIntrinsic,
   nameIsInlineLitUnion,
   nameIsLitUnionArmValueUnion,
@@ -604,6 +605,7 @@ import {
   monoInstOrig,
   monoOrigNode,
   monoParamPinTy,
+  monoTwoListRet,
   msGen,
   msRowChain,
   msSetByText,
@@ -1103,14 +1105,16 @@ function fnCheckedRetIsMapUnion(i: i32): boolean {
 
 // Re-seat function `i`'s list return kind on the checker's joined result when an earlier
 // return's literal settled a different one: `return [2]` beside `return [1.5]` is an `f64[]`,
-// and `return ["s"]` beside `return [1, "s"]` an `(i32 | string)[]` row (D2716).
-function criJoinedListKind(i: i32) {
+// and `return ["s"]` beside `return [1, "s"]` an `(i32 | string)[]` row (D2716). A return
+// `rx` that relays such a function's call takes the callee's joined result (D2746).
+function criJoinedListKind(i: i32, rx: i32) {
   if i < 0 || i >= fnStmts.length { return 0 }
   const fn = P.nodes[fnStmts[i]]
   let t = -1
   if fn is FuncDecl {
     if fn.fnRet >= 0 { return 0 }
-    t = inferJoinListTyOf(inferRetFnKey(fnStmts[i], fn.fnName))
+    t = criFnJoinListTy(i)
+    if t < 0 { t = criRelayJoinListTy(rx, i, 4) }
   }
   if t < 0 || t >= T.tys.length { return 0 }
   if !(T.tys[t] is TyArray) { return 0 }
@@ -1133,6 +1137,93 @@ function criJoinedListKind(i: i32) {
   if i < fRetRArrElem.length { fRetRArrElem[i] = nm }
   criChanged = true
   0
+}
+
+// The joined list type the checker banked for un-annotated function `i`, or -1.
+function criFnJoinListTy(i: i32): i32 {
+  const fn = P.nodes[fnStmts[i]]
+  if fn is FuncDecl {
+    if fn.fnRet < 0 {
+      return inferJoinListTyOf(inferRetFnKey(fnStmts[i], fn.fnName))
+    }
+  }
+  -1
+}
+
+// The joined list type a return `rx` of function `i` relays: `rx` calls a named function whose
+// returns join to one (`criFnJoinListTy`), directly or through up to `depth` more relays; -1 else.
+function criRelayJoinListTy(rx: i32, i: i32, depth: i32): i32 {
+  if rx < 0 || depth < 0 { return -1 }
+  const u = unwrapParen(rx)
+  if u < 0 || u >= P.nodes.length { return -1 }
+  const n = P.nodes[u]
+  if !(n is Call) { return -1 }
+  if n.callFn < 0 || n.callFn >= P.nodes.length { return -1 }
+  if !(P.nodes[n.callFn] is Ident) { return -1 }
+  const cfi = fnIndexOfSid(sidOfNode(n.callFn))
+  if cfi < 0 || cfi == i || cfi >= fnStmts.length { return -1 }
+  const t = criFnJoinListTy(cfi)
+  if t >= 0 { return t }
+  criRelayJoinListTy(fnRetExprOf(fnStmts[cfi]), cfi, depth - 1)
+}
+
+// The checker's refusal of `prop` (`OP_INDEX_GET` for an index) on the receiver `recvIx` when
+// it is a call of an instance whose returns join to two list types, or an un-annotated binding
+// of one: the call is typed as one list, and the same function spelled without a type
+// parameter is typed as the union, where this use is refused (D2766). "" otherwise.
+export function twoListUseMsg(recvIx: i32, prop: string, fnIx: i32): string {
+  const t = twoListValueTy(recvIx, fnIx)
+  if t < 0 { return "" }
+  memCstrMsg(t, prop)
+}
+
+// The two-list union `recvIx` holds when it is a call of an instance recorded in
+// `monoTwoListRet`, or an un-annotated, un-narrowed binding of one; -1 otherwise.
+export function twoListValueTy(recvIx: i32, fnIx: i32): i32 {
+  let u = unwrapParen(recvIx)
+  if u < 0 || u >= P.nodes.length { return -1 }
+  const rn = P.nodes[u]
+  if rn is Ident {
+    // Narrowed by `is`, the binding reads as the one list the test names.
+    if narrowVariantFor(rn.identName) != "" { return -1 }
+    let li = -1
+    if fnIx >= 0 && fnIx < P.nodes.length {
+      const fn = P.nodes[fnIx]
+      if fn is FuncDecl { li = parentLetOf(fn.fnBody, rn.identName) }
+    }
+    if li < 0 { li = globalLetOf(rn.identName) }
+    if li < 0 || li >= P.nodes.length { return -1 }
+    const ld = P.nodes[li]
+    if !(ld is LetDecl) { return -1 }
+    if ld.letType >= 0 { return -1 }
+    u = unwrapParen(ld.letInit)
+    if u < 0 || u >= P.nodes.length { return -1 }
+  }
+  const c = P.nodes[u]
+  if !(c is Call) { return -1 }
+  if c.callFn < 0 || c.callFn >= P.nodes.length { return -1 }
+  const cf = P.nodes[c.callFn]
+  if !(cf is Ident) { return -1 }
+  const t = monoTwoListRet[cf.identName]
+  if t is i32 { return t }
+  -1
+}
+
+// The first member of the union of list types `ty` when every member is stored as the same
+// scalar list (`boolean[]` beside `i32[]`), so one of them builds the whole set; -1 otherwise.
+export function listUnionSharedRep(ty: i32): i32 {
+  if ty < 0 || ty >= T.tys.length { return -1 }
+  const t = T.tys[ty]
+  if !(t is TyUnion) { return -1 }
+  if t.uMembers.length < 2 { return -1 }
+  const k0 = tyPrimLeafListKind(t.uMembers[0])
+  if k0 == null { return -1 }
+  let i = 1
+  while i < t.uMembers.length {
+    if tyPrimLeafListKind(t.uMembers[i]) != k0 { return -1 }
+    i = i + 1
+  }
+  t.uMembers[0]
 }
 
 // `map` or `nulmap` when function `i`'s checker-inferred return is a map or a nullable map,
@@ -4112,7 +4203,7 @@ export function criClassify(rx0: i32, i: i32) {
     }
     return 0
   }
-  if retKindIsList(fRetKind[i]) { criJoinedListKind(i) }
+  if retKindIsList(fRetKind[i]) { criJoinedListKind(i, rx0) }
   // An assignment's value is its target cell, not the rhs expression, and that is a property
   // of the function rather than of this return node — so it answers for every node of such a
   // function and returns, letting no expression fact touch the slot afterwards. The cell kind
@@ -35422,8 +35513,153 @@ function dsCalleeParamSlot(
   if b < 0 { b = globalLetOf(name) }
   if b < 0 || b >= P.nodes.length { return DS_CALLEE_UNBOUND }
   const bn = P.nodes[b]
-  if bn is Param { return fnTyAnnParamKindListSlot(bn.parType, argIx, want) }
+  if bn is Param {
+    if bn.parType < 0 { return dsLamParamCalleeSlot(b, fnIx, argIx, want) }
+    return fnTyAnnParamKindListSlot(bn.parType, argIx, want)
+  }
   dsLetCalleeParamSlot(b, fnIx, argIx, want)
+}
+
+// `dsCalleeParamSlot` for an un-annotated parameter `parIx` of the lambda or nested function
+// `lamIx`: the checker leaves its type open, so the function a call of it hands that parameter
+// is the callee, and its parameter `argIx` is the destination (D2748). -1 when none is found.
+function dsLamParamCalleeSlot(
+  parIx: i32,
+  lamIx: i32,
+  argIx: i32,
+  want: i32,
+): i32 {
+  if lamIx < 0 || lamIx >= P.nodes.length { return -1 }
+  const lam = P.nodes[lamIx]
+  if !(lam is FuncDecl) { return -1 }
+  let pi = 0
+  while pi < lam.fnParams.length && lam.fnParams[pi] != parIx { pi = pi + 1 }
+  if pi >= lam.fnParams.length { return -1 }
+  const pp = fnStmtsPosOf(lamIx)
+  if pp < 0 || pp >= fnParent.length { return -1 }
+  const up = fnParent[pp]
+  let scope = emitRootIx
+  if up >= 0 && up < fnStmts.length {
+    const pf = P.nodes[fnStmts[up]]
+    if pf is FuncDecl { scope = pf.fnBody }
+  }
+  if scope < 0 { return -1 }
+  dslEnsure(scope)
+  let nm = ""
+  const lr = dslLamRow[lamIx]
+  if lr is i32 { nm = dslLamName[lr] }
+  if nm == "" { nm = lam.fnName }
+  if nm == "" { return -1 }
+  const h = dslCallHead[nm]
+  let r = -1
+  if h is i32 { r = h }
+  while r >= 0 && r < dslCallIx.length {
+    const c = P.nodes[dslCallIx[r]]
+    if c is Call {
+      if (
+        pi < c.callArgs.length
+        && !dslFrameRebinds(dslCallFrame[r], scope, nm)
+      ) {
+        const rs = fnTyParamKindListSlot(
+          nodeTyIxOf(c.callArgs[pi]),
+          argIx,
+          want,
+        )
+        if rs >= 0 { return rs }
+      }
+    }
+    r = dslCallNext[r]
+  }
+  -1
+}
+
+// One scope's lambda bindings and named calls, in walk order: the index `dsLamParamCalleeSlot`
+// reads, so a scope holding many lambdas is walked once rather than once per lambda. Kept
+// across queries only once the arena is final (`emitArenaFinal`), and rebuilt per query before.
+let dslRoot = -1
+let dslLen = -1
+let dslLamRow: {[i32]: i32} = Map()
+let dslLamName: string[] = []
+let dslCallHead: {[string]: i32} = Map()
+let dslCallTail: {[string]: i32} = Map()
+let dslCallIx: i32[] = []
+let dslCallFrame: i32[] = []
+let dslCallNext: i32[] = []
+
+// Builds the index for `scope` unless the one in hand already is it.
+function dslEnsure(scope: i32) {
+  if !emitArenaFinal { dslRoot = -1 }
+  if dslRoot == scope && dslLen == P.nodes.length { return 0 }
+  dslRoot = scope
+  dslLen = P.nodes.length
+  dslLamRow = Map()
+  dslLamName = []
+  dslCallHead = Map()
+  dslCallTail = Map()
+  dslCallIx = []
+  dslCallFrame = []
+  dslCallNext = []
+  dslWalk(scope, -1)
+}
+
+// Records the lambda bindings and named calls under `ix`; `frame` is the nearest enclosing
+// function inside the scope, -1 at the scope's own level.
+function dslWalk(ix: i32, frame: i32) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const n = P.nodes[ix]
+  let fr = frame
+  if n is LetDecl {
+    const li = unwrapParen(n.letInit)
+    if li >= 0 && li < P.nodes.length {
+      if P.nodes[li] is FuncDecl {
+        dslLamRow[li] = dslLamName.length
+        dslLamName.push(n.letName)
+      }
+    }
+  } else if n is FuncDecl {
+    fr = ix
+  } else if n is Call {
+    const cf = P.nodes[unwrapParen(n.callFn)]
+    if cf is Ident {
+      const row = dslCallIx.length
+      dslCallIx.push(ix)
+      dslCallFrame.push(frame)
+      dslCallNext.push(-1)
+      const t = dslCallTail[cf.identName]
+      if t is i32 {
+        dslCallNext[t] = row
+      } else {
+        dslCallHead[cf.identName] = row
+      }
+      dslCallTail[cf.identName] = row
+    }
+  }
+  const kids = nodeChildren(ix)
+  let k = 0
+  while k < kids.length {
+    dslWalk(kids[k], fr)
+    k = k + 1
+  }
+  0
+}
+
+// Whether a function between the call's frame `frame` and the scope `scope` rebinds `nm`, so
+// the call names that binding rather than the lambda's `const`.
+function dslFrameRebinds(frame: i32, scope: i32, nm: string): boolean {
+  let pp = fnStmtsPosOf(frame)
+  let steps = 0
+  while pp >= 0 && pp < fnStmts.length && steps < 64 {
+    const fx = fnStmts[pp]
+    const fn = P.nodes[fx]
+    if fn is FuncDecl {
+      if fn.fnBody == scope { return false }
+    }
+    if dsRebindsName(fx, nm) { return true }
+    if pp >= fnParent.length { return false }
+    pp = fnParent[pp]
+    steps = steps + 1
+  }
+  false
 }
 
 // `dsCalleeParamSlot` for a callee bound by the `LetDecl` at `b`: its function-type

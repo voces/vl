@@ -550,6 +550,46 @@ axis(
   (d) => twoFiles(d, genNarrowedGlobals(600, true), genNarrowedGlobals(600, false)),
 );
 
+// UN-ANNOTATED CALLBACK LAMBDAS. `n` lambdas `(g) => g(out)`, each called once with a
+// function, either all in one function over one list or one per function. A list handed to an
+// un-annotated parameter used as the callee asks which function each call of the lambda passes
+// it (D2748); asked by walking the scope once per lambda, the one-function arm is quadratic.
+const genCallbackLambdas = (n: number, oneFn: boolean): string => {
+  const o: string[] = [
+    "type Circle = { r: i32 }",
+    "type Sq = { s: i32 }",
+    "type Shape = Circle | Sq",
+    "function sum(xs: Shape[]): i32 { xs.length * 3 }",
+    "function lenC(xs: Circle[]): i32 { xs.length * 5 }",
+    "function main() {",
+    "  const sh: Shape[] = [{ r: 1 }]",
+    "  print(sum(sh))",
+  ];
+  if (oneFn) o.push("  const out = [{ r: 3 }]");
+  for (let i = 0; i < n; i++) {
+    if (oneFn) o.push(`  const ap${i} = (g) => g(out)`, `  print(ap${i}(lenC))`);
+  }
+  o.push("}", "main()");
+  for (let i = 0; i < n && !oneFn; i++) {
+    o.push(
+      `function f${i}() {`,
+      "  const out = [{ r: 3 }]",
+      `  const ap${i} = (g) => g(out)`,
+      `  print(ap${i}(lenC))`,
+      "}",
+      `f${i}()`,
+    );
+  }
+  return o.join("\n") + "\n";
+};
+
+axis(
+  "un-annotated callback lambdas per function",
+  2.5,
+  "The lambda's calls are being found by a scope walk per lambda rather than off `dslEnsure`'s per-scope index (D2748).",
+  (d) => twoFiles(d, genCallbackLambdas(120, true), genCallbackLambdas(120, false)),
+);
+
 // CAPTURED NARROWED LOCALS. One function narrows `n` nullable locals by assignment and makes a
 // closure after each; in the many arm each closure captures its own local, in the other every
 // closure captures the first. Both arms make the same closures in one frame, so the emitter's

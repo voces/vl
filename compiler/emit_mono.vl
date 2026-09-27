@@ -39,6 +39,7 @@ import {
   bindGenWalk,
   blockHasBareReturn,
   canonEmitName,
+  collectValuedReturns,
   flatConstOfNameProp,
   flattenVariantsInto,
   fnResultUnconsumed,
@@ -51,6 +52,7 @@ import {
   monoInferListElem,
   monoInferLocalScalar,
   monoInferRetExprTy,
+  monoInferRetSetListTy,
   monoInferRetSetUnionName,
   nameIsLitUnionType,
   nodeTyArrayElemIsBoolPrim,
@@ -84,6 +86,7 @@ import {
   tyIsMap,
   tyRenderSoftensLits,
   tyToEmitName,
+  tyToStr,
   uniqueGenericDeclNamed,
 } from "./typecheck"
 import {
@@ -209,7 +212,7 @@ import {
   tyNameOf,
   unwrapParen,
 } from "./emit_base"
-import { paramTypeNode } from "./emit_query"
+import { paramIndexOf, paramTypeNode } from "./emit_query"
 import {
   drwFillDefaults,
   drwMemberDeferred,
@@ -244,8 +247,11 @@ import {
   monoOrigNode,
   monoParamPinTy,
   monoProgStmts,
+  monoTwoListRet,
   reExpName,
   reExpTarget,
+  rlElemName,
+  rlElemTyIx,
   sNames,
   uVariants,
   unNames,
@@ -290,6 +296,8 @@ import {
   identFnTypeAnnName,
   isSName,
   isUName,
+  letRefListDestSlot,
+  listUnionSharedRep,
   monoExactSubRowOf,
   monoRetRowName,
   nodeMapArmNominalName,
@@ -306,6 +314,7 @@ import {
   synthTypeRef,
   synthTypeRefFb,
   synthTypeRefTy,
+  twoListValueTy,
   tyCanonKey,
   tyNulFuncInner,
   unRowOfCanon,
@@ -332,7 +341,6 @@ import {
 // names)` and registered before the body is walked so a recursive self-call at the
 // same shape hits the registry.
 
-import { collectValuedReturnsIn } from "./emit_query"
 import { i32ListHas } from "./listutil"
 
 // D943 — the lifted slots `monoPinBodyLambdas` minted for the instance being built. A
@@ -457,7 +465,7 @@ function monoRetJoinDisagrees(fnNodeIx: i32, reIx: i32): boolean {
   const f = P.nodes[fnNodeIx]
   if f is FuncDecl {
     const rets: i32[] = []
-    collectValuedReturnsIn(f.fnBody, rets)
+    collectValuedReturns(f.fnBody, rets)
     let i = 0
     while i < rets.length {
       const rt = nodeTyIxOf(rets[i])
@@ -851,6 +859,42 @@ function monoNicheWidenedPinName(ax: i32, chosen: string): string {
   n
 }
 
+// The pin an un-annotated list binding takes from the declared union-element destination its
+// literal is built for (`letRefListDestSlot`), or "": its checked type names the literal's own
+// element, and an instance pinned there would receive the destination's list (D2747).
+function monoDestListPinName(letIx: i32, fnIx: i32): string {
+  if monoDestPinOff { return "" }
+  const s = letRefListDestSlot(letIx, fnIx)
+  if s < 0 || s >= rlElemName.length { return "" }
+  let en = rlElemName[s]
+  if s < rlElemTyIx.length {
+    const ur = unRowOfCanon(rlElemTyIx[s])
+    if ur >= 0 && ur < unNames.length { en = unNames[ur] }
+  }
+  if en == "" { return "" }
+  monoAnnPinName(en + "[]")
+}
+
+// `monoDestListPinName` of the binding a closure at `fnIx` captures as `name`: the nearest
+// enclosing frame's `let`, or "" once a frame binds the name as a parameter.
+function monoCapturedDestListPin(name: string, fnIx: i32): string {
+  let pp = fnStmtsPosOf(fnIx)
+  let steps = 0
+  while pp >= 0 && pp < fnParent.length && steps < 64 {
+    pp = fnParent[pp]
+    if pp < 0 || pp >= fnStmts.length { return "" }
+    const fx = fnStmts[pp]
+    const fn = P.nodes[fx]
+    if fn is FuncDecl {
+      const li = parentLetOf(fn.fnBody, name)
+      if li >= 0 { return monoDestListPinName(li, fx) }
+      if paramIndexOf(fx, name) >= 0 { return "" }
+    }
+    steps = steps + 1
+  }
+  ""
+}
+
 // `monoArgTyName` at a monomorphization pin — the ladder's answer, narrowed to what the
 // checker recorded for this node where that is one of the annotation's own members.
 // Separate from `monoArgTyName` because `wasmEmit`'s `monoStaticIsResult` also asks that
@@ -1008,6 +1052,8 @@ export function monoArgTyName(ix: i32, fnIx: i32) {
               if r != "" { return r }
             }
             if ld.letType < 0 && ld.letInit >= 0 {
+              const ldp = monoDestListPinName(li, fnIx)
+              if ldp != "" { return ldp }
               // An empty list literal has no element for the recursion to read, and
               // the recursion answers anyway (D764). The checker pinned the binding
               // from its destination, so read the argument reference's recorded type.
@@ -1026,6 +1072,10 @@ export function monoArgTyName(ix: i32, fnIx: i32) {
               if innerTy == "" { return "" }
             }
           }
+        }
+        if li < 0 && paramIndexOf(fnIx, argN.identName) < 0 {
+          const cdp = monoCapturedDestListPin(argN.identName, fnIx)
+          if cdp != "" { return cdp }
         }
       }
       // A struct-typed param argument (`g(v)` inside a generic body where `v: P`): same as
@@ -1061,6 +1111,8 @@ export function monoArgTyName(ix: i32, fnIx: i32) {
         // only its initializer knows. The recursion is the local arm's verbatim,
         // including its two rules on an `"i32"` answer and on a `""` refusal.
         if gd.letType < 0 && gd.letInit >= 0 {
+          const gdp = monoDestListPinName(gli, -1)
+          if gdp != "" { return gdp }
           // The empty-literal rung's module-scope twin (D764) — see the local arm for the
           // ablation and the witness. A rung added to one scope and not the other is the
           // asymmetry this ladder exists to make unstateable.
@@ -5030,20 +5082,46 @@ function monoMakeInstance(
     // ladder above named. It overrides the ladder rather than filling its -1: the shape
     // whitelist reaches its own answer and that answer is still one arm. A still-holey arm
     // declines the whole set, and `monoRegisterPinUnion` makes the minted name resolvable.
+    let twoListTy = -1
     if fn.fnRet < 0 {
       const jTy: i32[] = []
-      const jun = monoInferRetSetUnionName(
-        monoOrigNode[origFe],
-        pinnedTyIx,
-        letBN,
-        letBT,
-        jTy,
-      )
+      const jDecl = monoOrigNode[origFe]
+      const jl = monoInferRetSetListTy(jDecl, pinnedTyIx, letBN, letBT)
+      // Two list types stored alike (`boolean[]`, `i32[]`) build as one of them; any other
+      // pair builds the union box and is refused at a use that needs one list.
+      let sharedRep = -1
+      if jl >= 0 && T.tys[jl] is TyUnion {
+        sharedRep = listUnionSharedRep(jl)
+        if sharedRep < 0 { twoListTy = jl }
+      }
+      let jun = ""
+      if sharedRep < 0 {
+        jun = monoInferRetSetUnionName(jDecl, pinnedTyIx, letBN, letBT, jTy)
+      } else {
+        // The list the checker types the call as, where it is one of the members.
+        let pick = sharedRep
+        const dft = nodeTyIxOf(jDecl)
+        if dft >= 0 && dft < T.tys.length {
+          const dfn = T.tys[dft]
+          if dfn is TyFunc {
+            const cr = substTyDeep(dfn.fnRet, letBN, letBT)
+            if cr >= 0 && cr < T.tys.length && !tyHasTyVar(cr) {
+              if T.tys[cr] is TyArray { pick = cr }
+            }
+          }
+        }
+        const srn = tyToEmitName(pick)
+        if srn != "" { nret = synthTypeRefTy(srn, -1, pick) }
+      }
       if jun != "" {
         if monoRegisterPinUnion(jun) < 0 { return -1 }
         let jIx = -1
         if jTy.length > 0 { jIx = jTy[0] }
         nret = synthTypeRefTy(jun, -1, jIx)
+      } else if jl >= 0 && T.tys[jl] is TyArray {
+        let jln = monoRetListRowName(jl)
+        if jln == "" { jln = tyToEmitName(jl) }
+        if jln != "" { nret = synthTypeRefTy(jln, -1, jl) }
       }
     }
     // An inferred return the checker typed as a bare type parameter is the `: T` annotation's
@@ -5284,6 +5362,7 @@ function monoMakeInstance(
     monoInstOrig.push(origFe)
     monoInstName.push(instName)
     monoInstFe.push(instFe)
+    if twoListTy >= 0 { monoTwoListRet.set(instName, twoListTy) }
     if exSubN.length > 0 {
       monoExactSubRow.set(instFe, monoExactSubN.length)
       monoExactSubN.push(exSubN)
@@ -5785,6 +5864,56 @@ function monoBindFromLaterArg(
 // `callIx` (whose enclosing function is `ctx`, -1 = top level), and point the
 // call site at it. Returns 0, or -1 via `emitFail`.
 function monoInstantiate(origFe: i32, callIx: i32, ctx: i32) {
+  const saved = monoDestPinOff
+  monoDestPinOff = monoCalleeHasTyParamArrow(origFe)
+  const r = monoInstantiateCall(origFe, callIx, ctx)
+  monoDestPinOff = saved
+  r
+}
+
+// Whether the generic at `origFe` declares a function-typed parameter that mentions one of its
+// type parameters: a lambda argument there is built at the type the checker bound, so a list
+// argument may not be re-pinned at its destination's list (D2747).
+function monoCalleeHasTyParamArrow(origFe: i32): boolean {
+  if origFe < 0 || origFe >= monoOrigNode.length { return false }
+  const fn = P.nodes[monoOrigNode[origFe]]
+  if fn is FuncDecl {
+    let i = 0
+    while i < fn.fnParams.length {
+      const p = P.nodes[fn.fnParams[i]]
+      if p is Param {
+        if p.parType >= 0 {
+          const ann = monoDeclAnnName(
+            p.parType,
+            tyNameOf(p.parType),
+            fn.fnTyParams,
+          )
+          if annArrowAt(ann) >= 1 && monoAnnHasTyParam(ann, fn.fnTyParams) {
+            return true
+          }
+        }
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// Whether parameter `pIx` is annotated as a list whose spelling names one of `typarams`.
+function monoParamIsTyParamList(pIx: i32, typarams: string[]): boolean {
+  const p = P.nodes[pIx]
+  if p is Param {
+    if p.parType < 0 { return false }
+    const ann = monoDeclAnnName(p.parType, tyNameOf(p.parType), typarams)
+    return nameIsArray(ann) && monoAnnHasTyParam(ann, typarams)
+  }
+  false
+}
+
+// Set while the call being instantiated has such a parameter (`monoCalleeHasTyParamArrow`).
+let monoDestPinOff = false
+
+function monoInstantiateCall(origFe: i32, callIx: i32, ctx: i32) {
   const c = P.nodes[callIx]
   const fn = P.nodes[monoOrigNode[origFe]]
   if c is Call {
@@ -5849,6 +5978,27 @@ function monoInstantiate(origFe: i32, callIx: i32, ctx: i32) {
         }
       }
       monoPreBindPastEmptyLit(params, args, fn.fnTyParams, ctx, tvN, tvV)
+      // A value of two list types handed to a parameter a type parameter spells binds no one
+      // `T`, as the same function spelled without a type parameter cannot (D2766).
+      let ta = 0
+      while ta < args.length {
+        const tat = twoListValueTy(args[ta], ctx)
+        if (
+          tat >= 0
+          && ta < params.length
+          && monoParamIsTyParamList(params[ta], fn.fnTyParams)
+        ) {
+          return emitFailAt(
+            "argument "
+              + i32ToStr(ta + 1)
+              + ": "
+              + tyToStr(tat)
+              + " is two list types, not one list — narrow with `is` first",
+            args[ta],
+          )
+        }
+        ta = ta + 1
+      }
       let i = 0
       while i < args.length {
         const p = P.nodes[params[i]]
@@ -6666,6 +6816,7 @@ export function monomorphize(stmts: i32[]) {
   monoInstFe = []
   monoParamPinTy = Map()
   monoExactSubRow = Map()
+  monoTwoListRet = Map()
   monoExactSubN = []
   monoExactSubT = []
   monoExactMemo = []

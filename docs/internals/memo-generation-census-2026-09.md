@@ -40,6 +40,7 @@ tree ungraded.
 | `globalCellKind` | `tyMutEpoch`, `P.nodes.length`, 4 collect lengths, **`emitPassGen`** | `fRetKind` and its five siblings (D1655) | pass-stamped |
 | `refArrShapeIndex` (`ras*`) | `tyMutEpoch`, `cUserTypesVer`, `P.nodes.length`, 4 collect lengths, **`emitPassGen`** | none named; the row also carries the arena epoch and the declared-type version, and the identity proof is the compiler's own codegen plus 3,045 corpus modules | pass-stamped |
 | `dsgReady` (declared-struct graph) | `emitRootIx`, `P.nodes.length` | none reachable: the `emitArenaFinal` gate means no pass runs after it is built | pass-stamped |
+| `dslEnsure` (a scope's lambda bindings and named calls, D2748) | `dslRoot` (the scope), `dslLen` | none reachable: kept only once `emitArenaFinal` is set, rebuilt per query before | pass-stamped |
 | `variantSig` | `uFieldNames`/`uFieldStart`/`uFieldCount` lengths | none: it reads field NAMES, and all three tables are push-only | no-refined-input |
 | `objVariantIndex` (`ovn*`) | `uVariants`/`uFieldStart`/`uFieldCount` lengths | none, the same three tables through `variantSig` | no-refined-input |
 | `declStructNodeOf` | top-level `stmts.length` | none: it indexes `TypeDecl` nodes, which no pass rewrites | no-refined-input |
