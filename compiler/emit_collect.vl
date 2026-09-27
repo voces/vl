@@ -208,7 +208,6 @@ import {
   retVoidAnnFlag,
   setShapeOfTy,
   shapeInnerFieldSplit,
-  strContains,
   strLess,
   tyIsFuncType,
   tyNameOf,
@@ -250,7 +249,6 @@ import {
   ba8TypeIdx,
   ba8Used,
   bl8TypeIdx,
-  buildFnChildIndex,
   caMvMark,
   caResumeArmed,
   caRlMark,
@@ -549,7 +547,6 @@ import {
   fnRetExprOf,
   fnReturnsClosure,
   fnSigKeyOf,
-  fnStmtsPosOf,
   forInElemKind,
   forInMapValsSlot,
   forInPairElemKind,
@@ -655,6 +652,7 @@ import {
   nameIsNulRefList,
   nameIsRefArray,
   nameIsWholeSpanShape,
+  nestedFnOnChain,
   nonNulBaseOf,
   nulFieldInnerCode,
   nulMapInnerName,
@@ -750,6 +748,8 @@ import {
   variantSig,
   variantSigMemoDrop,
 } from "./emit_classify"
+import { strListHas } from "./listutil"
+import { strContains } from "./strutil"
 
 // Open the union type block for a value-union join the program declares nowhere. Registration
 // is what sets `uDeclared`, and the variant structs, the box and the per-rep value boxes are
@@ -1719,7 +1719,7 @@ function dstPinElemFwdArg(callIx: i32) {
           if !monoAnnHasTyParam(rn, cfn.fnTyParams) { return -1 }
           // A whole-value conduit is `dstPinFwdArg`'s and not this one's: it is crossed
           // above, and claiming it here too would give an `Index` one hop too many.
-          if dstPinIsTyParam(rn, cfn.fnTyParams) { return -1 }
+          if strListHas(cfn.fnTyParams, rn) { return -1 }
           let j = 0
           while j < cfn.fnParams.length {
             const pp = P.nodes[cfn.fnParams[j]]
@@ -1777,7 +1777,7 @@ function dstPinFwdArg(callIx: i32) {
           if cfn.fnRet < 0 { return -1 }
           const rn = tyNameOf(cfn.fnRet)
           if rn == "" { return -1 }
-          if !dstPinIsTyParam(rn, cfn.fnTyParams) { return -1 }
+          if !strListHas(cfn.fnTyParams, rn) { return -1 }
           let j = 0
           while j < cfn.fnParams.length {
             const pp = P.nodes[cfn.fnParams[j]]
@@ -1793,15 +1793,6 @@ function dstPinFwdArg(callIx: i32) {
     }
   }
   -1
-}
-
-function dstPinIsTyParam(name: string, typarams: string[]) {
-  let i = 0
-  while i < typarams.length {
-    if typarams[i] == name { return true }
-    i = i + 1
-  }
-  false
 }
 
 // Leg 1 — `gsto = c`, a module global assignment. The target must not resolve to a
@@ -3186,53 +3177,21 @@ export function buildFnMap(_stmts: i32[]) {
   fnStmts.length
 }
 
-// The `fnStmts` position of a lifted function named `name` whose parent frame is the `fnStmts`
-// position `pp`, or -1 when that frame declares no such function. Visits `pp`'s children in
-// `fnStmts` order, so the first declaration wins. The length compare is the lazy build: the
-// index is minted per program and re-mints after a late `fnStmts` push, so it is not a flag.
-function nestedFnDeclaredIn(name: string, pp: i32) {
-  if fnChildHead.length != fnStmts.length { buildFnChildIndex() }
-  if pp < 0 || pp >= fnChildHead.length { return -1 }
-  let i = fnChildHead[pp]
-  while i >= 0 {
-    const s = P.nodes[fnStmts[i]]
-    if s is FuncDecl {
-      if s.fnName == name { return i }
-    }
-    i = fnChildNext[i]
-  }
-  -1
-}
-
 // Resolve a callee name through the calling frame's lexical scope chain, not `fnIndexOf`'s
 // flat map, which hands every frame the module's first function of that name. Innermost scope
 // wins and an instance continues into its origin frame; the flat answer stands only past both.
-// `fnIndexOfInScope` is the twin, and cannot delegate here: import cycle.
+// `emit_classify.fnIndexOfInScope` walks the same chain and also honours a shadowing binding.
 export function fnIndexOfInScopeChain(name: string, fnIx: i32) {
   fnIndexOfInScopeChainSid(sidLookup(name), name, fnIx)
 }
 
 // The sid-taking primitive: a caller holding the callee's arena index passes `sidOfNode(ix)`
-// and pays nothing for the gate below, while the string form above pays one `sidLookup`. `name`
-// still rides along because the scan the gate guards (`nestedFnDeclaredIn`) compares
-// `FuncDecl.fnName` strings, and that scan is off the hot path by construction.
+// and pays nothing for the gate below, while the string form above pays one `sidLookup`.
+// `name` still rides along because the chain scan compares `FuncDecl.fnName`.
 export function fnIndexOfInScopeChainSid(sid: i32, name: string, fnIx: i32) {
   if fnIx >= 0 && sidArrGet(nestedNameBySid, sid) == 1 {
-    let pp = fnStmtsPosOf(fnIx)
-    // `fnStmts.length` bounds the walk: a parent chain cannot be longer than the function
-    // count, so this terminates even if `fnParent` ever held a cycle.
-    let steps = 0
-    while pp >= 0 && steps <= fnStmts.length {
-      const hit = nestedFnDeclaredIn(name, pp)
-      if hit >= 0 { return hit }
-      let up = -1
-      if pp < fnParent.length { up = fnParent[pp] }
-      // An instance frame declares none of its origin's nested functions, so the chain
-      // continues there rather than running out into the flat map (D1817).
-      if up < 0 && pp < fnInstOrigin.length { up = fnInstOrigin[pp] }
-      pp = up
-      steps = steps + 1
-    }
+    const hit = nestedFnOnChain(name, fnIx)
+    if hit >= 0 { return hit }
   }
   fnIndexOfSid(sid)
 }
@@ -4249,7 +4208,7 @@ export function collectMemberPopRefSlotsExpr(exprIx: i32, fnIx: i32) {
   }
   if e is Unary { return collectMemberPopRefSlotsExpr(e.unArg, fnIx) }
   if e is Paren { return collectMemberPopRefSlotsExpr(e.parInner, fnIx) }
-  // The node set below is the one `exprHasCoalesceCall` (emit_query.vl) carries: a ref-list
+  // The node set below is the one `exprHasScratch` (emit_query.vl) carries: a ref-list
   // `.pop` in an `is` guard, an `as` operand, an array-literal element, an object-literal field
   // value or an if-expression arm records its slot here. `fnUsesRefPush` is inert in
   // `fbBeginFunc`, so without this the frame is never reserved and the build fails.
@@ -4308,7 +4267,7 @@ export function collectMemberPopRefSlots(blockIx: i32, fnIx: i32) {
         collectMemberPopRefSlots(s.frBody, fnIx)
       } else {
         // Bare expression statement — a fall-through, not only the `BinExpr` and `Call` shapes.
-        // See `blockHasArrNew`.
+        // See `blockHasScratch`.
         collectMemberPopRefSlotsExpr(stmts[i], fnIx)
       }
       i = i + 1
