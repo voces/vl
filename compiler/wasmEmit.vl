@@ -929,6 +929,7 @@ import {
   narrowedRefArrayOf,
   narrowedRefArrayOfPlace,
   narrowedStructArmVi,
+  narrowedToNullKey,
   narrowedValueAtomOf,
   nicheReadKindAt,
   nicheReadStashSlot,
@@ -17282,6 +17283,15 @@ function emitCallCore(body: u8[], callIx: i32, fnIx: i32) {
           if emitNulNoneForEffect(body, c.callArgs[0], fnIx) < 0 { return -1 }
           return emitPrintNullWord()
         }
+        // A read the narrowing pins to `null` is printed with the narrowing lifted, so the box's
+        // own tag decides: every ladder below would unbox an arm it does not hold (D2801).
+        const pnKey = narrowedToNullKey(c.callArgs[0])
+        if pnKey != "" {
+          const pnMask = maskNarrowFor(pnKey)
+          const pnRc = emitCallCore(body, callIx, fnIx)
+          unmaskNarrow(pnMask)
+          return pnRc
+        }
         const pmk = mapReadScalarBoxKind(c.callArgs[0], fnIx)
         if pmk >= 0 {
           return emitPrintScalarMapRead(body, c.callArgs[0], pmk, fnIx)
@@ -27810,6 +27820,51 @@ function emitCoalesceScalarDefault(
   emitExpr(body, defIx, fnIx)
 }
 
+// `x ?? d` over a nullable value box read with its narrowing lifted: the box's tag decides, the
+// present arm unboxed at the coalesce's rep (a numeric scalar, or the value box itself).
+function emitCoalesceBoxRuntime(
+  body: u8[],
+  e: BinExpr,
+  exprIx: i32,
+  fnIx: i32,
+) {
+  const bk = valueAtomKind(tyToEmitName(nodeTyIxOf(exprIx)))
+  const bVt = nulBoxScalarValtype(bk)
+  const bVb = vbHeapIdxOfKind(bk)
+  let bNm = ""
+  if exprUnion(exprIx, fnIx) { bNm = unionNameOfExpr(exprIx, fnIx) }
+  if (bVt < 0 || bVb < 0) && bNm == "" {
+    return emitFail(
+      "emitProgram: `??` over a null-narrowed value box has no rep for its result",
+    )
+  }
+  const bSlot = sharedFieldRecvSlot()
+  if emitExpr(body, e.binLeft, fnIx) < 0 { return -1 }
+  fbLocalSet(bSlot)
+  fbLocalGet(bSlot)
+  fbStructGet(uBoxIdx, 0) // field 0: tag
+  fbI32Const(nullBoxTag())
+  fbI32Bin(71) // 0x47 i32.ne — present?
+  if bVt >= 0 && bVb >= 0 {
+    fbIf(bVt)
+    fbLocalGet(bSlot)
+    fbStructGet(uBoxIdx, 1) // field 1: the payload anyref
+    fbRefCast(bVb)
+    fbStructGet(bVb, 0)
+    fbElse()
+    if emitCoalesceScalarDefault(body, e.binRight, bk, fnIx) < 0 { return -1 }
+    fbEnd()
+    return 0
+  }
+  fbIfRefNul(uBoxIdx, false) // if (result (ref $uBox))
+  fbLocalGet(bSlot)
+  wU8(212) // 0xd4 ref.as_non_null
+  fbElse()
+  if emitUnionCoerce(body, bNm, e.binRight, fnIx) < 0 { return -1 }
+  fbEnd()
+  0
+}
+
 function emitCoalesceGo(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
   // Unwrap a parenthesized lhs so `(m[k]) ?? d` / `(m.get(k)) ?? d` take the same fused
   // map-get path as the bare forms — parens must not change `??` semantics. `lhsIx` is the
@@ -27842,6 +27897,15 @@ function emitCoalesceGo(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
   if exprIsNulNone(lhsIx, fnIx) {
     if emitNulNoneForEffect(body, lhsIx, fnIx) < 0 { return -1 }
     return emitExpr(body, e.binRight, fnIx)
+  }
+  // A read the narrowing pins to `null` may have been written since the test (a loop, a
+  // closure, a call), so the narrowing is lifted and the box tested at run time (D2801).
+  const cnKey = narrowedToNullKey(lhsIx)
+  if cnKey != "" {
+    const cnMask = maskNarrowFor(cnKey)
+    const cnRc = emitCoalesceBoxRuntime(body, e, exprIx, fnIx)
+    unmaskNarrow(cnMask)
+    return cnRc
   }
   // A narrowing that excludes null makes the default dead: `x ?? d` is `x` there, and the
   // read is the only lowering whose rep can be right. Every niche arm below evaluates its lhs
