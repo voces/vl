@@ -13724,7 +13724,18 @@ function joinedRecordRowOf(ix: i32): i32 {
   if !recordJoinSeen() { return -1 }
   const ty = nodeTyIxOf(ix)
   if !initJoinsWiderRecord(ix, ty) { return -1 }
-  structIndexOfTy(recordBaseTy(ty))
+  joinRowOfTy(recordBaseTy(ty))
+}
+
+// The struct row of the joined record `ty`: its own arena row, else the row an equal join
+// elsewhere interned under the same spelling, which is the one row both are built at.
+function joinRowOfTy(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  const r = structIndexOfTy(ty)
+  if r >= 0 { return r }
+  const nm = tyToEmitName(ty)
+  if nm == "" { return -1 }
+  structIndexOfTypeName(nm)
 }
 
 // Whether the non-literal record arm `tv` of a join built at struct row `slot` is built at a row
@@ -13830,7 +13841,7 @@ export function auditRecordJoinLeaves() {
     const fn = P.nodes[fnIx]
     if fn is FuncDecl {
       if fn.fnRet >= 0 {
-        const rrow = structIndexOfTy(recordBaseTy(nodeTyIxOf(fn.fnRet)))
+        const rrow = joinRowOfTy(recordBaseTy(nodeTyIxOf(fn.fnRet)))
         if rrow >= 0 {
           const rets: i32[] = []
           collectRetValues(fn.fnBody, rets)
@@ -13854,9 +13865,47 @@ function rjaLeaves(vals: i32[], row: i32, fnIx: i32): i32 {
       if refIfArmNeedsRecordCopy(ls[k], row, fnIx) {
         return emitFailAt(RECORD_COPY_MSG, ls[k])
       }
+      if rjaLitFields(ls[k], row, fnIx, 0) < 0 { return -1 }
       k = k + 1
     }
     i = i + 1
+  }
+  0
+}
+
+// The type record `t` gives field `name`, or -1.
+function recordFieldTy(t: TyObj, name: string): i32 {
+  let i = 0
+  while i < t.objFieldNames.length {
+    if t.objFieldNames[i] == name { return t.objFieldTypes[i] }
+    i = i + 1
+  }
+  -1
+}
+
+// A literal leaf built at `row`: each field holding a record, against that field's row, so a
+// record value nested in the literal meets the same test as one at the top (D2765).
+function rjaLitFields(ix: i32, row: i32, fnIx: i32, depth: i32): i32 {
+  const o = P.nodes[unwrapParen(ix)]
+  if depth > 8 || row < 0 || row >= sTyIx.length { return 0 }
+  const rb = recordBaseTy(sTyIx[row])
+  if rb < 0 { return 0 }
+  const rt = T.tys[rb]
+  if o is ObjLit {
+    if rt is TyObj {
+      let i = 0
+      while i < o.objFields.length {
+        const f = P.nodes[o.objFields[i]]
+        if f is FieldInit {
+          const fr = joinRowOfTy(recordBaseTy(recordFieldTy(rt, f.fiName)))
+          if fr >= 0 {
+            const one: i32[] = [f.fiValue]
+            if rjaLeaves(one, fr, fnIx) < 0 { return -1 }
+          }
+        }
+        i = i + 1
+      }
+    }
   }
   0
 }
@@ -13883,6 +13932,39 @@ function rjaRowOf(ix: i32, fnIx: i32): i32 {
   structIndexOfTy(recordBaseTy(nodeTyIxOf(ix)))
 }
 
+// The refusal a function-value argument meets when its result is a join of nested records.
+const NESTED_LAMBDA_JOIN_MSG = "emitProgram: this function value returns records that join into one whose fields hold records, and handed to a parameter it would be read at another row of those field names — annotate the function value's return type with the joined record"
+
+// Whether the lambda at `ix` returns a join of records wider than its tails, one of whose
+// fields is itself a record.
+function lambdaJoinsNestedRecord(ix: i32): boolean {
+  const ln = P.nodes[ix]
+  if ln is FuncDecl {
+    // A return the author declared names its row by that declaration, and runs.
+    if ln.fnRet >= 0 {
+      const rt = P.nodes[ln.fnRet]
+      if rt is TypeRef {
+        if rt.pos >= 0 { return false }
+      }
+    }
+  } else {
+    return false
+  }
+  const rty = fnTyRetOf(nodeTyIxOf(ix))
+  if !fnRetJoinsWiderRecord(ix, rty) { return false }
+  const rb = recordBaseTy(rty)
+  if rb < 0 { return false }
+  const t = T.tys[rb]
+  if t is TyObj {
+    let i = 0
+    while i < t.objFieldTypes.length {
+      if recordBaseTy(t.objFieldTypes[i]) >= 0 { return true }
+      i = i + 1
+    }
+  }
+  false
+}
+
 // The joins of records under `ix` in frame `fnIx`, a nested function's aside.
 function rjaWalk(ix: i32, fnIx: i32): i32 {
   let cur = ix
@@ -13895,9 +13977,20 @@ function rjaWalk(ix: i32, fnIx: i32): i32 {
         const one: i32[] = [cur]
         if rjaLeaves(one, jr, fnIx) < 0 { return -1 }
       }
+    } else if n is Call {
+      // A function value returning a join of nested records reaches its parameter's row by
+      // shape, which names the first row of those field names, not the join's (D2765).
+      let ai = 0
+      while ai < n.callArgs.length {
+        const la = unwrapParen(n.callArgs[ai])
+        if la >= 0 && lambdaJoinsNestedRecord(la) {
+          return emitFailAt(NESTED_LAMBDA_JOIN_MSG, la)
+        }
+        ai = ai + 1
+      }
     } else if n is BinExpr && n.binOp == "??" {
       // A `??` joins its two operands as an `if` does its arms.
-      const cr = structIndexOfTy(recordBaseTy(nodeTyIxOf(cur)))
+      const cr = joinRowOfTy(recordBaseTy(nodeTyIxOf(cur)))
       if cr >= 0 {
         const two: i32[] = [n.binLeft, n.binRight]
         if rjaLeaves(two, cr, fnIx) < 0 { return -1 }
@@ -13908,7 +14001,7 @@ function rjaWalk(ix: i32, fnIx: i32): i32 {
     } else if n is ArrayLit {
       const ety = arrTyElemOf(nodeTyIxOf(cur))
       if initJoinsWiderRecord(cur, nodeTyIxOf(cur)) {
-        const er = structIndexOfTy(recordBaseTy(ety))
+        const er = joinRowOfTy(recordBaseTy(ety))
         if er >= 0 && rjaLeaves(n.arrElems, er, fnIx) < 0 { return -1 }
       }
     }
@@ -30469,6 +30562,9 @@ export function structIndexOfExpr(exprIx: i32, fnIx: i32) {
   // THEN arm's struct index classifies the whole `if` (the checker proved the arms agree), so an
   // un-annotated binding resolves the same struct heap type the `emitIfExprRef` join emits.
   if e is IfStmt {
+    // A join of records wider than its arms is its own row, whatever row an arm takes (D2731).
+    const jr = joinedRecordRowOf(exprIx)
+    if jr >= 0 { return jr }
     const tv = ifThenValueIx(exprIx)
     if tv >= 0 { return structIndexOfExpr(tv, fnIx) }
   }
