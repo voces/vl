@@ -13541,9 +13541,39 @@ function joinTys(a: i32, b: i32) {
   constrainEmpty(b, a)
   const tpn = joinTyParamNull(a, b)
   if tpn >= 0 { return tpn }
-  if assignable(b, a) { return a }
-  if assignable(a, b) { return b }
+  if assignable(b, a) && !joinWidensMap(b, a) { return a }
+  if assignable(a, b) && !joinWidensMap(a, b) { return b }
   joinVariantTys(a, b)
+}
+
+// Whether collapsing the map `src` into the wider map `dst` would store a key or value
+// differently (`containerElemClassDiffers`, the class a delivery's map arm compares, and a
+// map-valued value asked the same way): the two keep their own storage, so the join is their
+// union. A same-storage pair collapses to the wider map, as master did (D2666).
+function joinWidensMap(src: i32, dst: i32): boolean {
+  if src < 0 || dst < 0 { return false }
+  const s = T.tys[src]
+  const d = T.tys[dst]
+  if s is TyMap {
+    if d is TyMap {
+      if containerElemClassDiffers(joinStoreTy(s.mKey), joinStoreTy(d.mKey)) {
+        return true
+      }
+      if containerElemClassDiffers(joinStoreTy(s.mVal), joinStoreTy(d.mVal)) {
+        return true
+      }
+      return joinWidensMap(s.mVal, d.mVal)
+    }
+  }
+  false
+}
+
+// The type a map key or value is stored as: a numeric literal union is its base scalar, which
+// its own map shares with the base's map, so the pair does not keep separate storage.
+function joinStoreTy(ty: i32): i32 {
+  const b = numLitUnionBaseTy(ty)
+  if b >= 0 { return b }
+  ty
 }
 
 // The join of `a` and `b` as distinct variants: a flattened, deduped union, with nullability
@@ -37451,6 +37481,8 @@ function finishInferredReturn(
       // reaches. An inline litunion (no alias to record) still floors below.
     } else if variantBoxUnionRetName(inferred) != "" {
       // lowers un-annotated — no floor
+    } else if mapUnionRetName(inferred) != "" {
+      // A map-member union lowers un-annotated through the recorder's map-union rung (D2666).
     } else if tyIsLitUnion(inferred) {
       // A pure un-named literal union lowers un-annotated as a string ref, the same rep its
       // annotated twin carries — `collectF` records `retPrim = "string"` for this shape and
@@ -42607,6 +42639,11 @@ function a20RecordFn(key: string, efn: FuncDecl, eftt: TyFunc) {
         // box an annotated spelling interns — export the render so `collectU` registers it.
         const vbn = variantBoxUnionRetName(er)
         recordInferRet(key, vbn, er, inferRetNameAtoms, IR_RUNG_VARIANT_BOX)
+      } else if mapUnionRetName(er) != "" {
+        // A union with a map member boxes each arm under its own tag, as the annotated
+        // union does; the join of two map types lands here (D2666).
+        const mun = mapUnionRetName(er)
+        recordInferRet(key, mun, er, inferRetNameAtoms, IR_RUNG_MAP_UNION)
       } else {
         // A niche nullable (`boolean | null`, `string | null`) lowers via its sentinel
         // rep, not the box, so `valueUnionRetName` declines it — export the niche name instead.
@@ -42952,10 +42989,41 @@ function noteInferJoin(ix: i32, t: i32) {
   if n is BinExpr { isJoin = n.binOp == "??" }
   if !isJoin { return 0 }
   if cTyIxSetHas(inferJoinTySet, t) { return 0 }
-  if !tyIsStructBearingUnion(t) { return 0 }
+  if !tyIsStructBearingUnion(t) && !tyIsMapJoinUnion(t, n is IfStmt) {
+    return 0
+  }
   if tyHasHole(t) { return 0 }
   inferRegisterVariantMembers(t)
   cTyIxSetAdd(inferJoinTys, inferJoinTySet, t)
+}
+// Whether `er` is a union, or a nullable one, that a join of maps makes: two or more map types,
+// which a delivery would not widen one into the other, or for an `if` one map beside any other
+// member, whose binding is the box (D2666).
+function tyIsMapJoinUnion(er: i32, isIf: boolean): boolean {
+  if er < 0 { return false }
+  const t = T.tys[er]
+  match t {
+    TyNullable => {
+      return tyIsMapJoinUnion(t.nInner, isIf)
+    }
+    TyUnion => {
+      let maps = 0
+      let i = 0
+      while i < t.uMembers.length {
+        const m = t.uMembers[i]
+        if m == TY_VOID { return false }
+        if m >= 0 {
+          if T.tys[m] is TyMap { maps = maps + 1 }
+        }
+        i = i + 1
+      }
+      if isIf { return maps >= 1 && t.uMembers.length >= 2 }
+      return maps >= 2
+    }
+    TyPrim | TyErr | TyObj | TyFunc | TyArray | TyMap | TyVar | TyLit | TyNeg => {
+      return false
+    }
+  }
 }
 export function inferJoinCount() { inferJoinTys.length }
 export function inferJoinTyAt(i: i32) { inferJoinTys[i] }
