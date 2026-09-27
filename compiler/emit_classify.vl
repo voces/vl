@@ -11535,7 +11535,7 @@ function atomFieldTakesStr(valIx: i32, si: i32, mfi: i32): boolean {
 }
 
 // Whether a nested-record field of type `fty` may share row `si`'s field `fi`: the field's
-// target row and `fty` must agree canonically where both are known (D2850).
+// target row and `fty` must agree canonically where both are known (D2841).
 function nestedAnonRowFits(fty: i32, si: i32, fi: i32): boolean {
   if tyHasTyVar(fty) { return true }
   // The row's recorded element type answers the common agreeing case without resolving a name.
@@ -11549,24 +11549,11 @@ function nestedAnonRowFits(fty: i32, si: i32, fi: i32): boolean {
   repCanonId(fty) == cr
 }
 
-// `code0TextFitsRow` from an arena field type: false only when both kinds are known and differ.
+// Whether a code-0 field of type `fty` may share row `si`'s field `fi`: false only when both
+// code-0 kinds are known and differ (D2841).
 function code0TyFitsRow(fty: i32, si: i32, fi: i32): boolean {
   const tk = code0KindOf(fty)
   if tk == 0 || si < 0 || si >= sTyIx.length { return true }
-  const rk = code0KindOf(
-    tyFieldTyOf(sTyIx[si], sFieldNames[sFieldStart[si] + fi]),
-  )
-  rk == 0 || rk == tk
-}
-
-// Whether a code-0 field spelled `text` may share row `si`'s field `fi`: false only when the
-// spelling and the row's own field type are two different known code-0 kinds.
-function code0TextFitsRow(text: string, si: i32, fi: i32): boolean {
-  if si < 0 || si >= sTyIx.length { return true }
-  let tk = 0
-  if text == "i32" { tk = 1 }
-  if text == "boolean" { tk = 2 }
-  if tk == 0 { return true }
   const rk = code0KindOf(
     tyFieldTyOf(sTyIx[si], sFieldNames[sFieldStart[si] + fi]),
   )
@@ -19067,82 +19054,6 @@ function variantFieldCodeWidens(qc: i32, rc: i32, vi: i32, fj: i32): boolean {
   fieldCodeWidensElem(qc, rc, variantFieldElemName(vi, fj))
 }
 
-// The one row below `rowLim` a record of type `ty` widens into numerically when no row holds
-// it exactly: every field equal, or an `i32` under an `i64`, `f64` or `f32`, or an `f32` under
-// an `f64`, with at least one widening. -1 when a strict row exists, or none or several claim it.
-export function structRowWidenedOnlyOf(ty: i32, rowLim: i32): i32 {
-  if ty < 0 { return -1 }
-  const t = T.tys[ty]
-  if !(t is TyObj) { return -1 }
-  if !tyObjHasWidenableField(ty) { return -1 }
-  let hit = -1
-  let n = 0
-  let si = 0
-  let lim = sScanLim()
-  if rowLim < lim { lim = rowLim }
-  while si < lim {
-    if (
-      sFieldCount[si] == t.objFieldNames.length
-      && structRowWidensFrom(ty, si)
-    ) {
-      hit = si
-      n = n + 1
-    }
-    si = si + 1
-  }
-  if n != 1 { return -1 }
-  if structRowOfObjFieldSetK(ty, false) >= 0 { return -1 }
-  hit
-}
-
-// Whether record `ty` has an `i32` or `f32` field, the only ones a numeric widening moves.
-function tyObjHasWidenableField(ty: i32): boolean {
-  const t = T.tys[ty]
-  if t is TyObj {
-    let k = 0
-    while k < t.objFieldTypes.length {
-      const c = fieldCodeForMatch(t.objFieldTypes[k])
-      if c == FC_I32 || c == FC_F32 { return true }
-      k = k + 1
-    }
-  }
-  false
-}
-
-// Whether row `si` holds every field of record `ty`, at least one by a numeric widening.
-function structRowWidensFrom(ty: i32, si: i32): boolean {
-  const t = T.tys[ty]
-  if t is TyObj {
-    let widened = false
-    let k = 0
-    while k < t.objFieldNames.length {
-      const fj = sFieldIndex(si, t.objFieldNames[k])
-      if fj < 0 { return false }
-      const qc = fieldCodeForMatch(t.objFieldTypes[k])
-      const rc = sFieldTypeAt(si, fj)
-      if qc < 0 { return false }
-      if qc == rc {
-        if qc == FC_I32 && !code0TyFitsRow(t.objFieldTypes[k], si, fj) {
-          return false
-        }
-        if qc == FC_STRUCT && !nestedAnonRowFits(t.objFieldTypes[k], si, fj) {
-          return false
-        }
-      } else if qc == FC_I32 && (rc == FC_I64 || rc == FC_F64 || rc == FC_F32) {
-        if code0KindOf(t.objFieldTypes[k]) != 1 { return false }
-        widened = true
-      } else if qc == FC_F32 && rc == FC_F64 {
-        widened = true
-      } else {
-        return false
-      }
-      k = k + 1
-    }
-    return widened
-  }
-  false
-}
-
 // `structIndexOfTypeName`'s arena twin — the struct row whose field set matches the
 // `TyObj` `ty`, or -1 (D-FIELDSETOFTY). Asks the fields directly instead of rendering and
 // re-parsing the type, with the same scan order and half-built-row guard as the name path:
@@ -19308,12 +19219,6 @@ function shapeRowScanK(fnames: string[], ftypes: string[], lenient: i32): i32 {
             lenient,
           )
         ) {
-          ok = false
-        } else if (
-          sFieldTypeAt(si2, fj) == FC_I32
-          && !code0TextFitsRow(ftypes[k], si2, fj)
-        ) {
-          // The code-0 split the literal side makes, from the render (D2841).
           ok = false
         }
         k = k + 1
@@ -25950,9 +25855,6 @@ function annShapeIndexOf(names: string[], codes: i32[], texts: string[]) {
           } else if codes[i] == FC_I32_LIST && nameIsLitUnionArray(texts[i]) {
             // The atom-array sibling: same shared-layout split — the atom-element context
             // is per-row (`sFieldIsLitUnionArray`), so the rows must stay distinct.
-            allIn = false
-          } else if codes[i] == FC_I32 && !code0TextFitsRow(texts[i], si, fi) {
-            // `i32` and `boolean` share code 0 too, and a read formats by the row (D2841).
             allIn = false
           } else if !sFieldCloSigCompat(si, fi, codes[i], texts[i]) {
             // Signature-identity split, the closure field's twin of the two atom splits

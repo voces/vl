@@ -169,7 +169,6 @@ import {
   mkSpread,
   mkUnary,
   mkWhile,
-  nodeChildren,
   nodeSpineChildren,
   orderArgsByParamNames,
   tsMentionsAnyName,
@@ -257,7 +256,6 @@ import {
   monoLamShared,
   monoOrigNode,
   monoParamPinTy,
-  monoPinRowAnns,
   monoProgStmts,
   monoTwoListRet,
   reExpName,
@@ -1643,117 +1641,6 @@ function monoCloPinShapeAnn(initIx: i32): i32 {
   -1
 }
 
-// Whether a checked function type's result mentions a type variable.
-function ftRetHadTyVar(ft: TyFunc): boolean {
-  ft.fnRet >= 0 && tyHasTyVar(ft.fnRet)
-}
-
-// Whether every value body `body` returns is a record literal it builds itself, directly or
-// through a local bound to one, with no nested function sharing its nodes. A pin's own record
-// row is built only there; a record from a call or a closure keeps the shared rep (D2850).
-function monoBodyReturnsOwnRecord(body: i32): boolean {
-  const b = P.nodes[body]
-  if !(b is Block) { return false }
-  const stack: i32[] = []
-  stack.push(body)
-  let steps = 0
-  while stack.length > 0 {
-    steps = steps + 1
-    if steps > 4096 { return false }
-    const ix = stack.pop() ?? -1
-    if ix >= 0 && ix < P.nodes.length {
-      const n = P.nodes[ix]
-      if n is FuncDecl && ix != body { return false }
-      if n is RetStmt {
-        if !monoIsOwnRecord(body, n.retArg) { return false }
-      }
-      const kids = nodeChildren(ix)
-      let k = 0
-      while k < kids.length {
-        stack.push(kids[k])
-        k = k + 1
-      }
-    }
-  }
-  if b is Block {
-    const st = b.blkStmts
-    if st.length > 0 {
-      const tail = P.nodes[st[st.length - 1]]
-      if !(tail is RetStmt) && !(tail is LetDecl) {
-        if !monoIsOwnRecord(body, st[st.length - 1]) { return false }
-      }
-    }
-  }
-  true
-}
-
-// Whether `ix` is a record literal, or a name `body` binds to one.
-function monoIsOwnRecord(body: i32, ix: i32): boolean {
-  const v = unwrapParen(ix)
-  if v < 0 { return false }
-  if P.nodes[v] is ObjLit { return true }
-  const li = parentLetOf(body, monoIdentNameOf(v))
-  if li < 0 { return false }
-  const d = P.nodes[li]
-  if d is LetDecl {
-    if d.letInit >= 0 { return P.nodes[unwrapParen(d.letInit)] is ObjLit }
-  }
-  false
-}
-
-// The name node `v` reads, or "" for any node that is not a name.
-function monoIdentNameOf(v: i32): string {
-  const n = P.nodes[v]
-  if n is Ident { return n.identName }
-  ""
-}
-
-// A record none of whose fields is a function: a function field carries the closure's own
-// signature row, which the render-to-row path does not intern.
-function tyIsPlainRecord(ty: i32): boolean {
-  const t = T.tys[ty]
-  if t is TyObj {
-    let i = 0
-    while i < t.objFieldTypes.length {
-      const ft = t.objFieldTypes[i]
-      if ft < 0 || T.tys[ft] is TyFunc { return false }
-      i = i + 1
-    }
-    return true
-  }
-  false
-}
-
-// The annotation an un-annotated binding of an object literal whose recorded shape mentions a
-// type parameter owes at this pin: the shape substituted through the instance's binding. No
-// anonymous row is minted for the template's literal, so the instance's annotation is its row.
-function monoTyParamShapeAnn(initIx: i32, bN: string[], bT: i32[]): i32 {
-  if initIx < 0 { return -1 }
-  if bN.length == 0 && monoHoleBN.length == 0 { return -1 }
-  const rd = unwrapParen(initIx)
-  if rd < 0 || rd >= P.nodes.length { return -1 }
-  if !(P.nodes[rd] is ObjLit) { return -1 }
-  const ty = nodeTyIxOf(rd)
-  if ty < 0 || !tyHasTyVar(ty) { return -1 }
-  let sty = ty
-  if bN.length > 0 { sty = substTyDeep(sty, bN, bT) }
-  if sty >= 0 && tyHasTyVar(sty) && monoHoleBN.length > 0 {
-    sty = substTyDeep(sty, monoHoleBN, monoHoleBT)
-  }
-  if sty < 0 || tyHasTyVar(sty) { return -1 }
-  if !tyIsPlainRecord(sty) { return -1 }
-  const nm = tyToEmitName(sty)
-  if nm == "" { return -1 }
-  const ann = synthTypeRefTy(nm, -1, sty)
-  monoPinRowAnns.push(ann)
-  ann
-}
-
-// The instance's un-annotated parameter holes, each bound to its pin (`monoHoleRetSubst`'s
-// binding), set around the body clone so a record binding naming a hole takes its row (D2850).
-let monoHoleBN: string[] = []
-let monoHoleBT: i32[] = []
-
 // The links of the `else if` chain headed by the `if` at `ix`, outermost first. A rewriter
 // maps each link's condition and then arm in this order, then the last link's else
 // (`monoIfChainElse`), and `monoIfChainRebuild` reassembles them — the node order of the
@@ -2118,7 +2005,6 @@ function monoCloneBodyRaw(
     if nt < 0 { nt = monoCollCtorAnn(n.letInit, typarams, tvN, tvV) }
     if nt < 0 { nt = monoCloPinListAnn(n.letInit) }
     if nt < 0 { nt = monoCloPinShapeAnn(n.letInit) }
-    if nt < 0 { nt = monoTyParamShapeAnn(n.letInit, bN, bT) }
     if nt < 0 { nt = monoApartJoinAnn(n.letInit, bN, bT) }
     if nt == n.letType { return ix }
     return mkLet(n.letKw, n.letName, nt, n.letInit, n.pos)
@@ -5530,20 +5416,6 @@ function monoMakeInstance(
               if monoRegisterPinUnion(rnm) < 0 { return -1 }
               nret = synthTypeRefTy(rnm, -1, rty)
             }
-          } else if (
-            rty >= 0
-            && nret < 0
-            && ftRetHadTyVar(ft)
-            && tyIsPlainRecord(rty)
-            && monoBodyReturnsOwnRecord(fn.fnBody)
-          ) {
-            // A record whose shape named the hole is this pin's own row: the template's literal
-            // has none, and a sibling row with the same field names may hold another kind (D2850).
-            const onm = tyToEmitName(rty)
-            if onm != "" {
-              nret = synthTypeRefTy(onm, -1, rty)
-              monoPinRowAnns.push(nret)
-            }
           }
         }
       }
@@ -5575,35 +5447,6 @@ function monoMakeInstance(
     // Substitute type-param annotations in the body's `LetDecl`s for this instance (a
     // `const out: T[]` becomes `const out: f64[]`); shares the body wholesale when it has
     // no such annotation.
-    monoHoleBN = []
-    monoHoleBT = []
-    if origFe >= 0 && origFe < monoOrigNode.length {
-      const hft = nodeTyIxOf(monoOrigNode[origFe])
-      if hft >= 0 && hft < T.tys.length {
-        const hf = T.tys[hft]
-        if hf is TyFunc {
-          let hi = 0
-          while (
-            hi < params.length
-            && hi < hf.fnParamTypes.length
-            && hi < letTyCol.length
-          ) {
-            const hp = P.nodes[params[hi]]
-            if hp is Param {
-              if hp.parType < 0 {
-                bindGenWalk(
-                  hf.fnParamTypes[hi],
-                  letTyCol[hi],
-                  monoHoleBN,
-                  monoHoleBT,
-                )
-              }
-            }
-            hi = hi + 1
-          }
-        }
-      }
-    }
     const instBody0 = monoCloneBody(
       fn.fnBody,
       fn.fnTyParams,
@@ -5630,8 +5473,6 @@ function monoMakeInstance(
       letBN,
       letBT,
     )
-    monoHoleBN = []
-    monoHoleBT = []
     const lamClones = monoLamCloneSlots
     monoLamCloneSlots = []
     // Pin any `.map`/`.filter` callback lambda whose receiver param this instance bound to
@@ -7419,7 +7260,6 @@ function monoSlotParamPins(fe: i32, out: string[]) {
 // bodies are walked as they are created. Usage-gated: a program with no generic
 // declaration and no concrete higher-order function returns immediately.
 export function monomorphize(stmts: i32[]) {
-  monoPinRowAnns = []
   monoArenaTick = 0
   monoRebuiltStamp = 0 - 1
   monoGen = []
