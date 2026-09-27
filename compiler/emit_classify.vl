@@ -11370,7 +11370,7 @@ function anonValueFitsField(vc: i32, sc: i32, valIx: i32, si: i32, mfi: i32) {
     // row's atom slot takes only a literal among its members; any other string is its own row.
     if sc == FC_I32 {
       if sFieldElemNameAt(si, mfi) == "" { return false }
-      if anonRow { return anonAtomFieldTakesStr(valIx, si, mfi) }
+      if anonRow { return atomFieldTakesStr(valIx, si, mfi) }
       return true
     }
     // `string | null` (the same ref, nullable) and `K | null` (a string literal names
@@ -11400,6 +11400,9 @@ function anonValueFitsField(vc: i32, sc: i32, valIx: i32, si: i32, mfi: i32) {
 // its member SEQUENCE, a nested struct by whether its two element rows box one. Refutation-only,
 // and the caller asks it only for a row the literal's own destination does not name (D1694).
 function declRowFieldFits(vc: i32, sc: i32, valIx: i32, si: i32, mfi: i32) {
+  // A string into a declared code-0 field: only a member literal of its literal set, since the
+  // atom slot cannot hold any other string (D2841).
+  if vc == FC_STR && sc == FC_I32 { return atomFieldTakesStr(valIx, si, mfi) }
   // A declared field's code can differ from the value's through adoption, so a differing code
   // is lenient — except between a named-heap slot (5, 15, 28) and one whose code alone decides
   // its layout (a scalar, a string, a scalar or string list): no adoption crosses that line,
@@ -11511,12 +11514,14 @@ function code0KindOf(ty: i32): i32 {
   0
 }
 
-// Whether the string value at `valIx` is a string literal naming a member of anon row `si`'s
-// atom field `mfi`; an unknown field type stays lenient.
-function anonAtomFieldTakesStr(valIx: i32, si: i32, mfi: i32): boolean {
+// Whether the string value at `valIx` is a string literal naming a member of row `si`'s atom
+// field `mfi`; an unknown field type stays lenient, and a non-literal field takes no string.
+function atomFieldTakesStr(valIx: i32, si: i32, mfi: i32): boolean {
   if si < 0 || si >= sTyIx.length { return true }
+  if mfi < 0 || mfi >= sFieldCount[si] { return true }
   const fty = tyFieldTyOf(sTyIx[si], sFieldNames[sFieldStart[si] + mfi])
   if fty < 0 { return true }
+  if code0KindOf(fty) != 3 { return false }
   const v = P.nodes[unwrapParen(valIx)]
   if v is StrLit {
     const texts = tyLitMemberTexts(fty)
@@ -19391,9 +19396,21 @@ function nestedStructNamesCompat(ta: string, elem: string): boolean {
   if ta == elem { return true }
   const ka = repNameCanonId(ta)
   if ka < 0 { return true }
-  const ke = repNameCanonId(elem)
+  let ke = repNameCanonId(elem)
+  // An anonymous row's name resolves to no declaration; its own recorded type is its identity,
+  // so `{f: boolean}` does not take a `{f: 4}` literal's row (D2841).
+  if ke < 0 { ke = rowCanonIdOfName(elem) }
   if ke < 0 { return true }
   ka == ke
+}
+
+// The canonical identity of the struct row named `name` from the type it recorded, or -1.
+function rowCanonIdOfName(name: string): i32 {
+  const si = structIndexByName(name)
+  if si < 0 || si >= sTyIx.length { return -1 }
+  const ty = sTyIx[si]
+  if ty < 0 || tyHasTyVar(ty) { return -1 }
+  repCanonId(ty)
 }
 
 // The arm whose own canonical render is `name` (D762) — strictly tighter than

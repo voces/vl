@@ -1641,23 +1641,54 @@ function monoCloPinShapeAnn(initIx: i32): i32 {
   -1
 }
 
+// Whether a checked function type's result mentions a type variable.
+function ftRetHadTyVar(ft: TyFunc): boolean {
+  ft.fnRet >= 0 && tyHasTyVar(ft.fnRet)
+}
+
+// A record none of whose fields is a function: a function field carries the closure's own
+// signature row, which the render-to-row path does not intern.
+function tyIsPlainRecord(ty: i32): boolean {
+  const t = T.tys[ty]
+  if t is TyObj {
+    let i = 0
+    while i < t.objFieldTypes.length {
+      const ft = t.objFieldTypes[i]
+      if ft < 0 || T.tys[ft] is TyFunc { return false }
+      i = i + 1
+    }
+    return true
+  }
+  false
+}
+
 // The annotation an un-annotated binding of an object literal whose recorded shape mentions a
 // type parameter owes at this pin: the shape substituted through the instance's binding. No
 // anonymous row is minted for the template's literal, so the instance's annotation is its row.
 function monoTyParamShapeAnn(initIx: i32, bN: string[], bT: i32[]): i32 {
-  if initIx < 0 || bN.length == 0 { return -1 }
+  if initIx < 0 { return -1 }
+  if bN.length == 0 && monoHoleBN.length == 0 { return -1 }
   const rd = unwrapParen(initIx)
   if rd < 0 || rd >= P.nodes.length { return -1 }
   if !(P.nodes[rd] is ObjLit) { return -1 }
   const ty = nodeTyIxOf(rd)
   if ty < 0 || !tyHasTyVar(ty) { return -1 }
-  const sty = substTyDeep(ty, bN, bT)
+  let sty = ty
+  if bN.length > 0 { sty = substTyDeep(sty, bN, bT) }
+  if sty >= 0 && tyHasTyVar(sty) && monoHoleBN.length > 0 {
+    sty = substTyDeep(sty, monoHoleBN, monoHoleBT)
+  }
   if sty < 0 || tyHasTyVar(sty) { return -1 }
   if !(T.tys[sty] is TyObj) { return -1 }
   const nm = tyToEmitName(sty)
   if nm == "" { return -1 }
   synthTypeRefTy(nm, -1, sty)
 }
+
+// The instance's un-annotated parameter holes, each bound to its pin (`monoHoleRetSubst`'s
+// binding), set around the body clone so a record binding naming a hole takes its row (D2850).
+let monoHoleBN: string[] = []
+let monoHoleBT: i32[] = []
 
 // The links of the `else if` chain headed by the `if` at `ix`, outermost first. A rewriter
 // maps each link's condition and then arm in this order, then the last link's else
@@ -5435,6 +5466,16 @@ function monoMakeInstance(
               if monoRegisterPinUnion(rnm) < 0 { return -1 }
               nret = synthTypeRefTy(rnm, -1, rty)
             }
+          } else if (
+            rty >= 0
+            && nret < 0
+            && ftRetHadTyVar(ft)
+            && tyIsPlainRecord(rty)
+          ) {
+            // A record whose shape named the hole is this pin's own row: the template's literal
+            // has none, and a sibling row with the same field names may hold another kind (D2850).
+            const onm = tyToEmitName(rty)
+            if onm != "" { nret = synthTypeRefTy(onm, -1, rty) }
           }
         }
       }
@@ -5466,6 +5507,35 @@ function monoMakeInstance(
     // Substitute type-param annotations in the body's `LetDecl`s for this instance (a
     // `const out: T[]` becomes `const out: f64[]`); shares the body wholesale when it has
     // no such annotation.
+    monoHoleBN = []
+    monoHoleBT = []
+    if origFe >= 0 && origFe < monoOrigNode.length {
+      const hft = nodeTyIxOf(monoOrigNode[origFe])
+      if hft >= 0 && hft < T.tys.length {
+        const hf = T.tys[hft]
+        if hf is TyFunc {
+          let hi = 0
+          while (
+            hi < params.length
+            && hi < hf.fnParamTypes.length
+            && hi < letTyCol.length
+          ) {
+            const hp = P.nodes[params[hi]]
+            if hp is Param {
+              if hp.parType < 0 {
+                bindGenWalk(
+                  hf.fnParamTypes[hi],
+                  letTyCol[hi],
+                  monoHoleBN,
+                  monoHoleBT,
+                )
+              }
+            }
+            hi = hi + 1
+          }
+        }
+      }
+    }
     const instBody0 = monoCloneBody(
       fn.fnBody,
       fn.fnTyParams,
@@ -5492,6 +5562,8 @@ function monoMakeInstance(
       letBN,
       letBT,
     )
+    monoHoleBN = []
+    monoHoleBT = []
     const lamClones = monoLamCloneSlots
     monoLamCloneSlots = []
     // Pin any `.map`/`.filter` callback lambda whose receiver param this instance bound to
