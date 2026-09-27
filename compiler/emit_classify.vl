@@ -2153,7 +2153,7 @@ export function exprNullableList(exprIx: i32, fnIx: i32) {
   // where only the nullable one does for a `.` (D1676).
   if e is OptMember {
     const olc = optChainLeafFieldCode(exprIx, fnIx)
-    return olc == 4 || olc == 18
+    return olc == FC_I32_LIST || olc == FC_NUL_I32_LIST
   }
   // Indexing a `(i32[] | null)[]`, a ref list whose element slot keeps the `| null`, yields
   // a nullable i32 list: the read leaves `(ref null $lTypeIdx)`, so `if t != null` narrows.
@@ -2261,7 +2261,7 @@ export function exprNullableRefArray(exprIx: i32, fnIx: i32) {
   // non-nullable ref-list field's read nullable (D1676).
   if e is OptMember {
     const orc = optChainLeafFieldCode(exprIx, fnIx)
-    return orc == 5 || orc == 28
+    return orc == FC_REF_LIST || orc == FC_NUL_REF_LIST
   }
   if e is Index {
     if exprRefArray(e.idxArr, fnIx) {
@@ -2359,7 +2359,9 @@ function nulRefArrayInnerSlot(exprIx: i32, fnIx: i32) {
   // non-nullable ref-list field's read nullable, so code 5 answers here too (D1681).
   if e is OptMember {
     const orc = optChainLeafFieldCode(exprIx, fnIx)
-    if orc == 5 || orc == 28 { return refListSlotOfExpr(exprIx, fnIx) }
+    if orc == FC_REF_LIST || orc == FC_NUL_REF_LIST {
+      return refListSlotOfExpr(exprIx, fnIx)
+    }
     return -1
   }
   if e is Index {
@@ -2674,7 +2676,7 @@ export function exprNullableString(exprIx: i32, fnIx: i32) {
   // un-annotated binding the string rep (D802).
   if e is OptMember {
     const occ = optChainLeafFieldCode(exprIx, fnIx)
-    return occ == 3 || occ == 20
+    return occ == FC_STR || occ == FC_NUL_STR
   }
   // A bare `m[k]` over a string-valued map is `string | null` — `emitMapGet` yields the
   // `(ref null)` value unrecovered, the string dual of the bare struct-map read.
@@ -10981,14 +10983,16 @@ export function structIndexOfObj(objIx: i32) { structIndexOfObjCtx(objIx, -1) }
 function anonValueFitsField(vc: i32, sc: i32, valIx: i32, si: i32, mfi: i32) {
   if vc < 0 { return true }
   const anonRow = sIsAnonRow(si)
-  if sc == 16 {
+  if sc == FC_UNION {
     // A nested-object literal isn't an atom: it fits a box field (16) only where the
     // box's own member set has a struct arm to hold it (D1242).
-    if vc == 15 { return unionSetCanHoldStruct(sFieldElemNameAt(si, mfi)) }
+    if vc == FC_STRUCT {
+      return unionSetCanHoldStruct(sFieldElemNameAt(si, mfi))
+    }
     // An anon row's box field is identified by its member set: two holders boxing different
     // sets are two layouts, and the box's tags are positional (D1689). A value that is not
     // itself a box names no set, keeping the leniency the declared side needs.
-    if vc == 16 && anonRow {
+    if vc == FC_UNION && anonRow {
       const bv = anonFieldElemName(valIx, FC_UNION)
       const bf = sFieldElemNameAt(si, mfi)
       if bv != "" && bf != "" {
@@ -10999,7 +11003,7 @@ function anonValueFitsField(vc: i32, sc: i32, valIx: i32, si: i32, mfi: i32) {
     // on the niche's null) while a box slot is a `(ref)`. Keyed on the value naming a
     // literal union, since a plain scalar still boxes into this field (D1715).
     if anonRow {
-      if vc == 0 || vc == 30 {
+      if vc == FC_I32 || vc == FC_NUL_LIT_UNION {
         const atomNm = anonFieldElemName(valIx, vc)
         if atomNm != "" {
           if nameIsLitUnionType(atomNm) { return false }
@@ -11020,36 +11024,38 @@ function anonValueFitsField(vc: i32, sc: i32, valIx: i32, si: i32, mfi: i32) {
     }
     return true
   }
-  if vc == 0 {
+  if vc == FC_I32 {
     // `boolean | null` (21) is an i32-sentinel niche only a boolean value fills — an
     // integer collides with the sentinel, so `isBoolLitExpr` asks the node directly.
-    if sc == 21 { return isBoolLitExpr(valIx) }
+    if sc == FC_NUL_BOOL { return isBoolLitExpr(valIx) }
     // `K | null` — the i32 atom niche, spare value -1.
-    if sc == 30 { return true }
+    if sc == FC_NUL_LIT_UNION { return true }
     // Wider numeric/map slots (i64 23, f32 24, map 19/29): a declared field can reach
     // these via checker adoption, but an anon row's numeric field carries no such promise.
-    if sc == 23 || sc == 24 || sc == 19 || sc == 29 { return !anonRow }
+    if sc == FC_I64 || sc == FC_F32 || sc == FC_MAP || sc == FC_NUL_MAP {
+      return !anonRow
+    }
     return false
   }
-  if vc == 3 {
+  if vc == FC_STR {
     // A code-0 field is a plain i32/boolean slot unless it's a literal-union atom slot
     // (recorded in `sFieldElemName`), which a string literal legitimately writes.
-    if sc == 0 { return sFieldElemNameAt(si, mfi) != "" }
+    if sc == FC_I32 { return sFieldElemNameAt(si, mfi) != "" }
     // `string | null` (the same ref, nullable) and `K | null` (a string literal names
     // the atom) are the two niches a string value fills.
-    if sc == 20 { return true }
-    if sc == 30 { return true }
+    if sc == FC_NUL_STR { return true }
+    if sc == FC_NUL_LIT_UNION { return true }
     return false
   }
   // Composite value codes, anon rows only (a declared row's codes can differ through
   // adoption). Each arm names the ONE nullable spelling of its own backing that its value
   // widens into: `i32[] | null`, `((…) => …) | null`, f64 for f32, `f64[] | null`, `i64[] | null`.
   if !anonRow { return true }
-  if vc == 4 { return sc == 18 }
-  if vc == 14 { return sc == 22 }
-  if vc == 24 { return sc == 17 }
-  if vc == 25 { return sc == 32 }
-  if vc == 26 { return sc == 33 }
+  if vc == FC_I32_LIST { return sc == FC_NUL_I32_LIST }
+  if vc == FC_CLOSURE { return sc == FC_NUL_CLOSURE }
+  if vc == FC_F32 { return sc == FC_F64 }
+  if vc == FC_F64_LIST { return sc == FC_NUL_F64_LIST }
+  if vc == FC_I64_LIST { return sc == FC_NUL_I64_LIST }
   // The default REFUSES, and names what it excludes: an anon row's codes are read off its own
   // literal, so a value fits its own code (the equal-code arm above), the union box (the top
   // arm), or a widening an arm here spells — and nothing else. A `true` default let a string
@@ -11075,7 +11081,7 @@ function declRowFieldFits(vc: i32, sc: i32, valIx: i32, si: i32, mfi: i32) {
     }
     // A record is no list of records, nullable or not.
     if (
-      (vc == 15) != (sc == 15)
+      (vc == FC_STRUCT) != (sc == FC_STRUCT)
       && fieldCodeRefsElemHeapC(vc)
       && fieldCodeRefsElemHeapC(sc)
     ) {
@@ -11095,19 +11101,24 @@ function declRowFieldFits(vc: i32, sc: i32, valIx: i32, si: i32, mfi: i32) {
     }
     return true
   }
-  if sc == 0 { return declRowScalarFits(valIx, si, mfi) }
+  if sc == FC_I32 { return declRowScalarFits(valIx, si, mfi) }
   const vn = anonFieldElemName(valIx, vc)
   if vn == "" { return true }
   const fn = sFieldElemNameAt(si, mfi)
   if fn == "" { return true }
-  if sc == 16 { return unionMemberSetsCompat(vn, fn) }
+  if sc == FC_UNION { return unionMemberSetsCompat(vn, fn) }
   elemRowsCaptureCompat(vn, fn)
 }
 
 // Is field code `c` a list whose layout its code alone decides: an `i32`, `f64`, `i64`, `f32`,
 // `u8` or `string` list?
 function fieldCodeIsFlatList(c: i32): boolean {
-  c == 4 || c == 6 || c == 25 || c == 26 || c == 27 || c == 35
+  c == FC_I32_LIST
+    || c == FC_STR_LIST
+    || c == FC_F64_LIST
+    || c == FC_I64_LIST
+    || c == FC_F32_LIST
+    || c == FC_U8_LIST
 }
 
 // Code 0 is shared by `i32`, `boolean` and a string literal union's atom, so the code cannot
@@ -11130,8 +11141,13 @@ function declRowScalarFits(valIx: i32, si: i32, mfi: i32): boolean {
 // Does an array literal coded `vc` re-encode into a `sc` list by widening each element: an
 // integer literal into an `f64`, `i64`, `f32` or `u8` list, a float one into an `f32` list?
 function flatListLitWidens(vc: i32, sc: i32): boolean {
-  if vc == 4 { return sc == 25 || sc == 26 || sc == 27 || sc == 35 }
-  vc == 25 && sc == 27
+  if vc == FC_I32_LIST {
+    return sc == FC_F64_LIST
+      || sc == FC_I64_LIST
+      || sc == FC_F32_LIST
+      || sc == FC_U8_LIST
+  }
+  vc == FC_F64_LIST && sc == FC_F32_LIST
 }
 
 // An open-addressed pair table, generation-stamped so a new walk costs no clearing: a slot is
@@ -17876,22 +17892,22 @@ function fieldCodeWidensElem(qc: i32, rc: i32, elem: string): boolean {
   if qc == rc { return true }
   // A union-BOX field takes any member — `anonValueFitsField`'s own first line, and the
   // pairing D461 added to the NAME side of this same question.
-  if rc == 16 { return true }
-  if qc == 0 {
+  if rc == FC_UNION { return true }
+  if qc == FC_I32 {
     // An i32/boolean/litunion-atom value widens into wider numeric slots and the `K | null`
     // atom niche — not the `boolean | null` niche (21), which needs a boolean literal, a
     // distinction the code has erased and a type can't recover; not the map slots either.
-    if rc == 23 { return true }
-    if rc == 24 { return true }
-    if rc == 30 { return true }
+    if rc == FC_I64 { return true }
+    if rc == FC_F32 { return true }
+    if rc == FC_NUL_LIT_UNION { return true }
     return false
   }
-  if qc == 3 {
+  if qc == FC_STR {
     // A string value: the `string | null` ref niche, the `K | null` atom niche, and a
     // literal-union atom slot (records its union name in the element column).
-    if rc == 20 { return true }
-    if rc == 30 { return true }
-    if rc == 0 { return elem != "" }
+    if rc == FC_NUL_STR { return true }
+    if rc == FC_NUL_LIT_UNION { return true }
+    if rc == FC_I32 { return elem != "" }
     return false
   }
   false
@@ -22727,40 +22743,40 @@ function anonNulFieldCodeOfTy(ty: i32): i32 {
   if !(t is TyNullable) { return -1 }
   const inner = t.nInner
   if inner < 0 { return -1 }
-  if tyIsLitUnionAlias(inner) { return 30 }
+  if tyIsLitUnionAlias(inner) { return FC_NUL_LIT_UNION }
   const it = T.tys[inner]
   // Exhaustive over `Ty` and deliberately `_`-less: a twelfth arena variant breaks the
   // self-compile here rather than taking the -1 that hands the literal to the render ladder.
   // The deliberate leaves are empty arms carrying their reason.
   match it {
     TyPrim => {
-      if it.primName == "string" { return 20 }
-      if it.primName == "boolean" { return 21 }
+      if it.primName == "string" { return FC_NUL_STR }
+      if it.primName == "boolean" { return FC_NUL_BOOL }
       // A scalar plus null is the value-union box, which the caller claimed above.
     }
     TyFunc => {
-      return 22
+      return FC_NUL_CLOSURE
     }
     TyObj => {
-      return 15
+      return FC_STRUCT
     }
     TyArray => {
       // A LITERAL-union element list is the i32 ATOM backing, so its niche is the nullable
       // i32 list wrapper — code 18, the rep the declared spelling already codes through
       // `annRepKindOf`'s `nullist` arm. `tyIsNulLitUnionArr` is the nullable-ELEMENT twin,
       // which the same atom backing claims, and both subtract before the ref ladder (D1710).
-      if tyIsLitUnionArray(inner) { return 18 }
-      if tyIsNulLitUnionArr(inner) { return 18 }
+      if tyIsLitUnionArray(inner) { return FC_NUL_I32_LIST }
+      if tyIsNulLitUnionArr(inner) { return FC_NUL_I32_LIST }
       // An element hole nothing pinned (`if c { [] } else { null }`) takes the nullable i32
       // list, the rep the same value gets when bound to a plain local (D2228).
-      if it.aElem < 0 { return 18 }
+      if it.aElem < 0 { return FC_NUL_I32_LIST }
       return anonNulListFieldCodeOfElem(it.aElem)
     }
     TyMap => {
       // A nullable map field is code 29, the nullable ref to the value type's mv struct —
       // the rep the declared `{[K]: V} | null` spelling already codes. Gated to the value
       // kinds the mv layer lowers, so an unrepresentable value keeps refusing loudly (D1665).
-      if mapTyValKindLowerable(inner) { return 29 }
+      if mapTyValKindLowerable(inner) { return FC_NUL_MAP }
     }
     TyUnion => {
       // A union plus null is the box, not a niche — `anonUnionFieldName` claims it above.
@@ -22793,8 +22809,8 @@ function anonNulListFieldCodeOfElem(elem: i32): i32 {
   // plain code-5 field whose wrapper it shares. The render that would have answered for a
   // nested list, a map or a nullable ref is unreachable here: `anonTySpellable` declines a
   // `TyNullable`, so this ladder's decline is terminal and had to be complete (D1691).
-  if tyElemIsRefListElem(elem) { return 28 }
-  if tyElemIsNulRefListElem(elem) { return 28 }
+  if tyElemIsRefListElem(elem) { return FC_NUL_REF_LIST }
+  if tyElemIsNulRefListElem(elem) { return FC_NUL_REF_LIST }
   const et = T.tys[elem]
   // Exhaustive over `Ty` and `_`-less, for the reason its caller is.
   match et {
@@ -22803,25 +22819,25 @@ function anonNulListFieldCodeOfElem(elem: i32): i32 {
       // fold onto code 18; each distinct backing keeps its own wrapper.
       match et.primName {
         "i32" => {
-          return 18
+          return FC_NUL_I32_LIST
         }
         "boolean" => {
-          return 18
+          return FC_NUL_I32_LIST
         }
         "string" => {
-          return 31
+          return FC_NUL_STR_LIST
         }
         "f64" => {
-          return 32
+          return FC_NUL_F64_LIST
         }
         "i64" => {
-          return 33
+          return FC_NUL_I64_LIST
         }
         "f32" => {
-          return 34
+          return FC_NUL_F32_LIST
         }
         "u8" => {
-          return 36
+          return FC_NUL_U8_LIST
         }
         "v128" => {
           // Not a nullable-list element type: v128 has no list in S1-S2.
@@ -22918,11 +22934,20 @@ function anonRefListElemKeyOfTy(arrTy: i32): string {
 // the scalars, the string ref, the scalar-backed list wrappers, and the closure fat pointer.
 // Widening this set means widening `anonFieldElemName` in the same change, not relaxing the gate.
 function anonCodeIsSelfContained(c: i32) {
-  if c == 0 || c == 3 || c == 17 || c == 23 || c == 24 { return true }
-  if c == 4 || c == 6 || c == 25 || c == 26 || c == 27 || c == 35 {
+  if c == FC_I32 || c == FC_STR || c == FC_F64 || c == FC_I64 || c == FC_F32 {
     return true
   }
-  c == 14
+  if (
+    c == FC_I32_LIST
+    || c == FC_STR_LIST
+    || c == FC_F64_LIST
+    || c == FC_I64_LIST
+    || c == FC_F32_LIST
+    || c == FC_U8_LIST
+  ) {
+    return true
+  }
+  c == FC_CLOSURE
 }
 
 // The admission rule the recorded-type rung actually applies: `anonCodeIsSelfContained` plus
@@ -22935,14 +22960,16 @@ function anonCodeAdmitsValue(c: i32, valIx: i32) {
   // names a struct row (and the nullable struct `fieldCodeForMatch` folds onto it), 28 its
   // ref-list element's, and 30 the union whose members its i32 atom is an id into — a
   // self-contained slot would lose that membership (D1627, D1710).
-  if c == 15 || c == 28 || c == 30 { return anonFieldElemName(valIx, c) != "" }
+  if c == FC_STRUCT || c == FC_NUL_REF_LIST || c == FC_NUL_LIT_UNION {
+    return anonFieldElemName(valIx, c) != ""
+  }
   // Code 29 the same way: the nullable map's slot is a ref to its value type's mv struct, so
   // the value name is the companion the emitter re-finds that slot by (D1665).
-  if c == 29 { return anonFieldElemName(valIx, c) != "" }
+  if c == FC_NUL_MAP { return anonFieldElemName(valIx, c) != "" }
   // Code 5 the same way, once its companion can name a non-struct element (D1688). The
   // struct-row rung stays its own disjunct: an EMPTY array literal resolves a row and names
   // no element, so folding the two would refuse a shape that mints today.
-  if c == 5 {
+  if c == FC_REF_LIST {
     if anonRefListElemRow(valIx) >= 0 { return true }
     return anonRefListElemKeyOf(valIx) != ""
   }
@@ -22953,7 +22980,14 @@ function anonCodeAdmitsValue(c: i32, valIx: i32) {
 // module-global heap type or a raw valtype, so the `| null` costs the field a nullable ref
 // and no companion column. Widening this set means widening `anonFieldElemName` with it.
 function anonNulCodeIsSelfContained(c: i32) {
-  if c == 18 || c == 20 || c == 21 || c == 22 { return true }
+  if (
+    c == FC_NUL_I32_LIST
+    || c == FC_NUL_STR
+    || c == FC_NUL_BOOL
+    || c == FC_NUL_CLOSURE
+  ) {
+    return true
+  }
   isNulScalarListFieldCode(c)
 }
 
@@ -22963,10 +22997,10 @@ function anonNulCodeIsSelfContained(c: i32) {
 // checker never recorded, since i32 is what the surrounding ladder assumes there.
 function anonArithFieldCode(valIx: i32) {
   const bk = tyKindOf(nodeTyIxOf(valIx))
-  if bk == 10 { return 23 }
-  if bk == 11 { return 17 }
-  if bk == 13 { return 24 }
-  0
+  if bk == 10 { return FC_I64 }
+  if bk == 11 { return FC_F64 }
+  if bk == 13 { return FC_F32 }
+  FC_I32
 }
 
 // The syntax half of `anonFieldCode` — the field value's own literal form. Kept separate
@@ -23545,19 +23579,19 @@ export function internShapeDeepTy(nm: string, ty: i32) {
 // field (a typed-value map, a value-union box, or a ref list). A code-18 nullable i32-backed
 // scalar list is lowerable too, since it is the same wrapper slot any non-closure struct uses.
 function funcTypeFieldCodeSafe(c: i32): boolean {
-  c == 0
-    || c == 3
-    || c == 4
-    || c == 6
-    || c == 15
-    || c == 17
-    || c == 18
-    || c == 23
-    || c == 24
-    || c == 25
-    || c == 26
-    || c == 27
-    || c == 35
+  c == FC_I32
+    || c == FC_STR
+    || c == FC_I32_LIST
+    || c == FC_STR_LIST
+    || c == FC_STRUCT
+    || c == FC_F64
+    || c == FC_NUL_I32_LIST
+    || c == FC_I64
+    || c == FC_F32
+    || c == FC_F64_LIST
+    || c == FC_I64_LIST
+    || c == FC_F32_LIST
+    || c == FC_U8_LIST
     || isNulScalarListFieldCode(c)
 }
 
@@ -23956,7 +23990,7 @@ function annShapeWiderRowOf(names: string[], codes: i32[], texts: string[]) {
           allIn = false
         } else {
           const rc = sFieldTypeAt(si, fi)
-          if rc == FC_UNION && codes[i] != 16 {
+          if rc == FC_UNION && codes[i] != FC_UNION {
             boxed = true
             if !unionSetNamesAtom(sFieldElemNameAt(si, fi), texts[i]) {
               allIn = false
@@ -24249,7 +24283,7 @@ function internInlineShapeTyGo(nm: string, tyIx: i32) {
     // whose element is a map. `nameIsI32KeyedMap`'s key cut needs only the `{[K]:` prefix,
     // so it answers correctly for a map spelling's list and `| null` widths too.
     const fkK = mapNameKeyKind(texts[pi])
-    if codes[pi] == 5 {
+    if codes[pi] == FC_REF_LIST {
       // A ref-list field records its canonical ref-array element name (parens stripped for
       // a value-union element, so it keys the same slot every other union position uses),
       // so `sFieldRefSlot` finds the element's interned slot. Without this an inline-shape
@@ -24285,7 +24319,7 @@ function internInlineShapeTyGo(nm: string, tyIx: i32) {
       sFieldElemName.push(e5)
       recordSFieldElemRow(e5, fkK) // D5 + B6b
       if isValueUnionName(e5) { registerValueUnionName(e5) }
-    } else if codes[pi] == 28 {
+    } else if codes[pi] == FC_NUL_REF_LIST {
       // A nullable ref-list field's element name is the ref-array element of the non-null
       // part; the element shape or union is pre-interned in the parse loop.
       let e28 = refArrElemName(nullablePartOf(texts[pi]))
@@ -24327,7 +24361,7 @@ function internInlineShapeTyGo(nm: string, tyIx: i32) {
       // The union FIELD's name keys its atom set; registering it interns the shared
       // box + the value-box reps it needs (this runs after `collectU`, but before any
       // type-index math).
-      if codes[pi] == 16 { registerValueUnionName(en) }
+      if codes[pi] == FC_UNION { registerValueUnionName(en) }
     }
     pj = pj + 1
   }
@@ -24541,7 +24575,7 @@ function annShapeIndexOf(names: string[], codes: i32[], texts: string[]) {
     // field records none — in which case the atom bit carries the split instead.
     let qb = shapeFieldElemName(texts[qi], codes[qi])
     if qb != "" {
-      if codes[qi] == 15 { qb = nonNulBaseOf(qb) }
+      if codes[qi] == FC_STRUCT { qb = nonNulBaseOf(qb) }
     }
     qElems.push(qb)
     let kb = 0
@@ -24549,9 +24583,9 @@ function annShapeIndexOf(names: string[], codes: i32[], texts: string[]) {
     qKeys.push(kb)
     let ab = 0
     if qb == "" {
-      if codes[qi] == 0 {
+      if codes[qi] == FC_I32 {
         if nameIsLitUnionType(texts[qi]) { ab = 1 }
-      } else if codes[qi] == 4 {
+      } else if codes[qi] == FC_I32_LIST {
         if nameIsLitUnionArray(texts[qi]) { ab = 1 }
       }
     }
@@ -24585,15 +24619,15 @@ function annShapeIndexOf(names: string[], codes: i32[], texts: string[]) {
             // from reject to mismatch, a narrowing test taking the wrong branch. The
             // constant-false on five codes is conservative and stays until the merge is understood.
             let bi = texts[i]
-            if codes[i] == 15 { bi = nonNulBaseOf(bi) }
+            if codes[i] == FC_STRUCT { bi = nonNulBaseOf(bi) }
             if en != bi { allIn = false }
-          } else if codes[i] == 0 && nameIsLitUnionType(texts[i]) {
+          } else if codes[i] == FC_I32 && nameIsLitUnionType(texts[i]) {
             // Atom-identity split (code 0 is layout-shared): a litunion-atom field must not
             // dedup onto a plain i32/boolean row — layout-equal but encoding-different, since
             // the shared row served both and the atom side's member literal emitted as a
             // string ref into the i32 slot, invalid wasm.
             allIn = false
-          } else if codes[i] == 4 && nameIsLitUnionArray(texts[i]) {
+          } else if codes[i] == FC_I32_LIST && nameIsLitUnionArray(texts[i]) {
             // The atom-array sibling: same shared-layout split — the atom-element context
             // is per-row (`sFieldIsLitUnionArray`), so the rows must stay distinct.
             allIn = false
@@ -25336,7 +25370,7 @@ export function exprIsLitAtom(exprIx: i32, fnIx: i32) {
     // claim cannot drift; code 0 alone is not sufficient, since it is also plain i32/boolean.
     const avis: i32[] = []
     const afis: i32[] = []
-    if sharedUnionFieldPlan(e.memObj, e.memProp, fnIx, avis, afis) == 0 {
+    if sharedUnionFieldPlan(e.memObj, e.memProp, fnIx, avis, afis) == FC_I32 {
       let allAtom = avis.length > 0
       let ai = 0
       while ai < avis.length {
@@ -29967,7 +30001,7 @@ export function exprUnion(exprIx: i32, fnIx: i32) {
     // A value-union leaf (code 16) is already the box, and the chain only adds `null` to
     // its member set, so the whole `?.` is a box value too (D803): without this arm the
     // chain classified as a scalar while `emitOptMemberValue` built the box.
-    return optChainLeafFieldCode(exprIx, fnIx) == 16
+    return optChainLeafFieldCode(exprIx, fnIx) == FC_UNION
   }
   // `x as Shape` over a wider union yields the BOX at a narrower type — the sub-union cast
   // does not unbox, so its result is a union value like any other. Answered from the cast's
@@ -30961,7 +30995,7 @@ export function unionNameOfExpr(exprIx: i32, fnIx: i32) {
   // A `?.` whose leaf is a value-union field (code 16): the checker's own type for the node
   // is exactly the union plus `null`, so it is rendered rather than assembled here. D803.
   if e is OptMember {
-    if optChainLeafFieldCode(exprIx, fnIx) == 16 {
+    if optChainLeafFieldCode(exprIx, fnIx) == FC_UNION {
       return nodeUnionName(unwrapParen(exprIx))
     }
     return ""
@@ -30996,7 +31030,7 @@ export function unionNameOfExpr(exprIx: i32, fnIx: i32) {
       // union minus `null` — rendered rather than assembled, as the `?.` arm above. D803.
       const olh = P.nodes[unwrapParen(e.binLeft)]
       if olh is OptMember {
-        if optChainLeafFieldCode(e.binLeft, fnIx) == 16 {
+        if optChainLeafFieldCode(e.binLeft, fnIx) == FC_UNION {
           return nodeUnionName(unwrapParen(exprIx))
         }
       }
@@ -33749,7 +33783,10 @@ export function refListElemNameOfExpr(exprIx: i32, fnIx: i32) {
     // when every member records the same one, since the read has a single wrapper row.
     const uvis: i32[] = []
     const ufis: i32[] = []
-    if sharedUnionFieldPlan(e.memObj, e.memProp, fnIx, uvis, ufis) == 5 {
+    if (
+      sharedUnionFieldPlan(e.memObj, e.memProp, fnIx, uvis, ufis)
+      == FC_REF_LIST
+    ) {
       const un0 = variantFieldElemName(uvis[0], ufis[0])
       let uk = 1
       while uk < uvis.length {
