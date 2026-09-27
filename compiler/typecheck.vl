@@ -3031,9 +3031,14 @@ export function mkArrayViewTy(elem: i32) {
 }
 
 function mkMapTy(key: i32, val: i32, isSet: i32) {
+  tyMapMinted = true
   const t: Ty = { mKey: key, mVal: val, mSet: isSet }
   addTy(t)
 }
+
+// Whether any map type has been minted in this instance. Only ever set, so a gate on it can
+// skip work, never a map (`mapDeliveryMayRecord`).
+let tyMapMinted = false
 
 // The one home of which hash a `Map`/`Set` key takes: the rep has exactly three, `string`
 // (element-wise, `__str_hash__`), `i32` and `i64` (the integer mixes). Answers the arena type the
@@ -3529,6 +3534,9 @@ let nodeRepTyIx: i32[] = []
 // Per node, the map type a union of maps is delivered as (D2692): the members share that map's
 // storage, so the emitter unboxes the union's payload there. -1 where nothing is recorded.
 let mapUnboxTyIx: i32[] = []
+// Whether any delivery recorded an unbox or a retag: one flag the emitter's per-expression
+// hooks read before asking the tables.
+export let mapDeliveryRecorded = false
 // Per node, the retag rows of a union delivered into a union lacking one of its map members
 // (`recordMapRetag`): the first row and the count, over the two parallel type columns.
 let mapRetagAt: {[i32]: i32} = Map()
@@ -4475,6 +4483,7 @@ export function initChecker() {
   isParentElseTyIx = []
   nodeRepTyIx = []
   mapUnboxTyIx = []
+  mapDeliveryRecorded = false
   mapRetagAt = Map()
   mapRetagN = Map()
   mapRetagFromTy = []
@@ -14741,7 +14750,9 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
       // D2060 — the record twin: a field widened by this delivery is shared with the source,
       // so it is legal only where nothing the delivery reaches writes it.
       rcwPend(srcExpr, srcTy, dstTy)
-      recordMapUnbox(srcExpr, srcTy, dstTy, 8)
+      if mapDeliveryMayRecord(srcExpr, srcTy) {
+        recordMapUnbox(srcExpr, srcTy, dstTy, 8)
+      }
       if objShapeAdapterlessAt(srcExpr, srcTy, dstTy) {
         objShapeAdapterlessErr(srcExpr, srcTy, dstTy)
       }
@@ -43558,10 +43569,11 @@ function recordMapUnbox(srcExpr: i32, srcTy: i32, dstIn: i32, depth: i32) {
       if !tyAllMaps(srcTy) { return 0 }
       while mapUnboxTyIx.length <= srcExpr { mapUnboxTyIx.push(-1) }
       mapUnboxTyIx[srcExpr] = dstTy
+      mapDeliveryRecorded = true
       return 0
     }
     TyUnion => {
-      return recordMapRetag(srcExpr, srcTy, dstTy)
+      return recordMapRetagTails(srcExpr, dstTy, depth)
     }
     // No other destination holds a map a union of maps can be delivered as.
     TyPrim | TyErr | TyFunc | TyVar | TyLit | TyNeg | TyNullable => {
@@ -43570,13 +43582,37 @@ function recordMapUnbox(srcExpr: i32, srcTy: i32, dstIn: i32, depth: i32) {
   }
 }
 
+// `recordMapRetag` at each value a delivery into the union `dstTy` hands over: every tail of a
+// value `if`, `match` or block, and the left operand of a `??`, each at its own type.
+function recordMapRetagTails(srcExpr: i32, dstTy: i32, depth: i32) {
+  if !tyHasMapMember(dstTy, 8) { return 0 }
+  const spine: i32[] = []
+  const leaves: i32[] = []
+  valueTailSplit(srcExpr, spine, leaves)
+  let i = 0
+  while i < leaves.length {
+    const lf = leaves[i]
+    const n = P.nodes[lf]
+    if n is BinExpr && n.binOp == "??" && depth > 0 {
+      recordMapRetagTails(n.binLeft, dstTy, depth - 1)
+      recordMapRetagTails(n.binRight, dstTy, depth - 1)
+    } else {
+      recordMapRetag(lf, nodeTyIxOf(lf), dstTy)
+    }
+    i = i + 1
+  }
+  0
+}
+
 // Records, for a union `srcTy` delivered into the union `dstTy`, each map member the
 // destination lacks beside the destination member it is assignable to: a box built under the
 // source member must carry that member's tag in the destination (`mapRetagRowsOf`).
 function recordMapRetag(srcExpr: i32, srcTy: i32, dstTy: i32) {
-  if !(T.tys[srcTy] is TyUnion) { return 0 }
+  if srcExpr < 0 || srcTy < 0 || srcTy >= T.tys.length { return 0 }
+  // A box is a union of two or more non-null members, `| null` or not; one member is a niche.
   const sm: i32[] = []
   unionLeavesInto(srcTy, sm, 8)
+  if sm.length < 2 { return 0 }
   const dm: i32[] = []
   unionLeavesInto(dstTy, dm, 8)
   const start = mapRetagFromTy.length
@@ -43598,10 +43634,38 @@ function recordMapRetag(srcExpr: i32, srcTy: i32, dstTy: i32) {
     i = i + 1
   }
   if mapRetagFromTy.length > start {
+    mapDeliveryRecorded = true
     mapRetagAt.set(srcExpr, start)
     mapRetagN.set(srcExpr, mapRetagFromTy.length - start)
   }
   0
+}
+
+// Whether `ty` is a map or holds one through unions and `| null`: the cheap gate a retag
+// needs, which allocates nothing.
+function tyHasMapMember(ty: i32, depth: i32): boolean {
+  if ty < 0 || ty >= T.tys.length || depth <= 0 { return false }
+  const t = T.tys[ty]
+  match t {
+    TyMap => {
+      return true
+    }
+    TyNullable => {
+      return tyHasMapMember(t.nInner, depth - 1)
+    }
+    TyUnion => {
+      let i = 0
+      while i < t.uMembers.length {
+        if tyHasMapMember(t.uMembers[i], depth - 1) { return true }
+        i = i + 1
+      }
+      return false
+    }
+    // No other type is or holds a union member that is a map.
+    TyPrim | TyErr | TyObj | TyFunc | TyArray | TyVar | TyLit | TyNeg => {
+      return false
+    }
+  }
 }
 
 // The non-null members of `ty`, through nested unions and `| null`, into `out`.
@@ -43631,6 +43695,12 @@ function tyAmong(ty: i32, tys: i32[]): boolean {
   false
 }
 
+// Whether `recordMapRetag` recorded a row at `ix`: the cheap gate ahead of `mapRetagRowsOf`.
+export function mapRetagHas(ix: i32): boolean {
+  if mapRetagFromTy.length == 0 { return false }
+  mapRetagAt.has(ix)
+}
+
 // The retag rows `recordMapRetag` recorded at `ix`, pushed onto `from` and `to`.
 export function mapRetagRowsOf(ix: i32, from: i32[], to: i32[]) {
   const st = mapRetagAt.get(ix) ?? -1
@@ -43654,6 +43724,18 @@ export function mapRetagAllRows(from: i32[], to: i32[]) {
     i = i + 1
   }
   0
+}
+
+// The cheap gate ahead of `recordMapUnbox`: only a union (a box, or a value join typed as one)
+// or a list or record literal, which is walked to its parts, can record anything.
+function mapDeliveryMayRecord(srcExpr: i32, srcTy: i32): boolean {
+  if !tyMapMinted { return false }
+  if srcTy >= 0 && srcTy < T.tys.length {
+    const st = T.tys[srcTy]
+    if st is TyUnion || st is TyNullable { return true }
+  }
+  const n = P.nodes[srcExpr]
+  n is ArrayLit || n is ObjLit
 }
 
 // `recordMapUnbox` over each element of a list literal `srcExpr` delivered as `elemTy[]`.
