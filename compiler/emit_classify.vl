@@ -344,6 +344,7 @@ import {
   parentLetOf,
   parentLetOfAt,
   parentLetOwnedBy,
+  parentLetOwnerOf,
   parentLoopCoversAt,
   parentLoopVarOf,
   placeNarrowKeyOf,
@@ -34437,7 +34438,7 @@ function dsDestSlotAt(i: i32, nm: string, fnIx: i32, want: i32): i32 {
       }
     }
   }
-  // (d) `take(nm)` into a `take(c: Shape[])` parameter.
+  // (d) `take(nm)` into a `take(c: Shape[])` parameter, or a lambda's `k(nm)`.
   if nd is Call {
     const callee = P.nodes[nd.callFn]
     if callee is Ident {
@@ -34446,8 +34447,13 @@ function dsDestSlotAt(i: i32, nm: string, fnIx: i32, want: i32): i32 {
         const arg = P.nodes[unwrapParen(nd.callArgs[ai])]
         if arg is Ident {
           if arg.identName == nm {
-            const rs = fnParamKindListSlot(callee.identName, ai, want)
-            if rs >= 0 { return rs }
+            // A binding in scope shadows a top-level function of its name, so it is asked first.
+            const bs = dsCalleeParamSlot(callee.identName, i, fnIx, ai, want)
+            if bs >= 0 { return bs }
+            if bs == DS_CALLEE_UNBOUND {
+              const rs = fnParamKindListSlot(callee.identName, ai, want)
+              if rs >= 0 { return rs }
+            }
           }
         }
         ai = ai + 1
@@ -34478,14 +34484,16 @@ function dsDestSlotAt(i: i32, nm: string, fnIx: i32, want: i32): i32 {
 }
 
 // The scope a name-matched destination scan has to stay inside (D661), as an arena index to
-// start the walk at, or -1 when this binding's scope is not knowable here. Two scopes and a
-// decline, since a wrong scope is worse than none: a local (`parentLetOf`), a global
-// (`globalLetOf`), or neither — keep the whole-arena scan rather than miss a real destination.
+// start the walk at, or -1 when this binding's scope is not knowable here. A local's first
+// binding walks the body, a later same-named one the block holding it (D2685), a global the
+// program; otherwise decline, keeping the whole-arena scan rather than miss a destination.
 function dsScopeRootOf(letIx: i32, nm: string, fnIx: i32): i32 {
   if fnIx >= 0 {
     const fn = P.nodes[fnIx]
     if fn is FuncDecl {
       if parentLetOf(fn.fnBody, nm) == letIx { return fn.fnBody }
+      const own = parentLetOwnerOf(fn.fnBody, sidOfNode(letIx), letIx)
+      if own >= 0 { return own }
     }
   }
   if globalLetOf(nm) == letIx {
@@ -34837,20 +34845,105 @@ function fnParamKindListSlot(fnName: string, argIx: i32, want: i32): i32 {
   while i < P.nodes.length {
     const nd = P.nodes[i]
     if nd is FuncDecl {
-      if nd.fnName == fnName {
-        if argIx < nd.fnParams.length {
-          const p = P.nodes[nd.fnParams[argIx]]
-          if p is Param {
-            if tyAnnRefListKind(p.parType) == want {
-              const rs = tyAnnRefListSlot(p.parType)
-              if rlSlotIsKindList(rs, want) { return rs }
-            }
-          }
-        }
-        return -1
-      }
+      if nd.fnName == fnName { return fnDeclParamKindListSlot(i, argIx, want) }
     }
     i = i + 1
+  }
+  -1
+}
+
+// The ref-list slot of element kind `want` that parameter `argIx` of the `FuncDecl` at
+// `fdIx` declares, or -1 when it declares none or `fdIx` is not a function.
+function fnDeclParamKindListSlot(fdIx: i32, argIx: i32, want: i32): i32 {
+  if fdIx < 0 || fdIx >= P.nodes.length { return -1 }
+  const nd = P.nodes[fdIx]
+  if nd is FuncDecl {
+    if argIx < nd.fnParams.length {
+      const p = P.nodes[nd.fnParams[argIx]]
+      if p is Param {
+        if tyAnnRefListKind(p.parType) == want {
+          const rs = tyAnnRefListSlot(p.parType)
+          if rlSlotIsKindList(rs, want) { return rs }
+        }
+      }
+    }
+  }
+  -1
+}
+
+// `dsCalleeParamSlot`'s answer when no binding in scope names the callee, so the name can
+// only denote a top-level function.
+const DS_CALLEE_UNBOUND = -2
+
+// The ref-list slot of kind `want` that parameter `argIx` of the callee `name` declares, where
+// `name` is a binding in scope at `callIx` inside frame `fnIx`: a lambda-valued `const`, a
+// function-typed parameter or annotation, or a `const` naming a top-level function. -1 when
+// the binding declares none; `DS_CALLEE_UNBOUND` when nothing in scope binds `name` (D2696).
+function dsCalleeParamSlot(
+  name: string,
+  callIx: i32,
+  fnIx: i32,
+  argIx: i32,
+  want: i32,
+): i32 {
+  let b = -1
+  if fnIx >= 0 && fnIx < P.nodes.length {
+    const fn = P.nodes[fnIx]
+    if fn is FuncDecl { b = parentLetOfAt(fn.fnBody, sidOf(name), callIx) }
+  }
+  if b < 0 { b = identBindingNoLocal(fnIx, name) }
+  if b < 0 { b = globalLetOf(name) }
+  if b < 0 || b >= P.nodes.length { return DS_CALLEE_UNBOUND }
+  const bn = P.nodes[b]
+  if bn is Param { return fnTyAnnParamKindListSlot(bn.parType, argIx, want) }
+  dsLetCalleeParamSlot(b, fnIx, argIx, want)
+}
+
+// `dsCalleeParamSlot` for a callee bound by the `LetDecl` at `b`: its function-type
+// annotation, else a lambda initializer's own parameter, else an alias's; -1 for any other
+// binding (a `for` variable, a let bound to a value this scan cannot follow).
+function dsLetCalleeParamSlot(b: i32, fnIx: i32, argIx: i32, want: i32): i32 {
+  const d = P.nodes[b]
+  if !(d is LetDecl) { return -1 }
+  if d.letType >= 0 { return fnTyAnnParamKindListSlot(d.letType, argIx, want) }
+  if d.letInit < 0 { return -1 }
+  const ini = unwrapParen(d.letInit)
+  if ini < 0 || ini >= P.nodes.length { return -1 }
+  if P.nodes[ini] is FuncDecl {
+    return fnDeclParamKindListSlot(ini, argIx, want)
+  }
+  dsAliasCalleeParamSlot(ini, fnIx, argIx, want)
+}
+
+// A `const k = sum` alias: the top-level function it names, when no scope around `fnIx`
+// rebinds that name; -1 for any other initializer.
+function dsAliasCalleeParamSlot(
+  ini: i32,
+  fnIx: i32,
+  argIx: i32,
+  want: i32,
+): i32 {
+  const iv = P.nodes[ini]
+  if iv is Ident {
+    if nameFreeToModule(fnIx, iv.identName) {
+      return fnParamKindListSlot(iv.identName, argIx, want)
+    }
+  }
+  -1
+}
+
+// The ref-list slot of kind `want` that parameter `argIx` of the function-type annotation
+// node `tyNodeIx` (`(Shape[]) => i32`) names, read off its recorded type; -1 otherwise.
+function fnTyAnnParamKindListSlot(tyNodeIx: i32, argIx: i32, want: i32): i32 {
+  if tyNodeIx < 0 { return -1 }
+  const ft = nodeTyIxOf(tyNodeIx)
+  if ft < 0 || ft >= T.tys.length { return -1 }
+  const t = T.tys[ft]
+  if t is TyFunc {
+    if argIx < t.fnParamTypes.length {
+      const rs = rlSlotOfTy(tyRefArrElemOf(t.fnParamTypes[argIx]))
+      if rlSlotIsKindList(rs, want) { return rs }
+    }
   }
   -1
 }

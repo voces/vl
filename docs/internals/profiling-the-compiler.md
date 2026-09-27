@@ -375,6 +375,31 @@ What remains of the drift is capability: #3136 (+1.1–1.35%) is the positional 
 needed for correctness, and its ladder (`unionNameOfIdentAt` into `letUnionNameOf`) is ~8% of
 the tail unit's profile, the largest piece left.
 
+## Measured 2026-09-26 — what a "redundant" annotation was paying for (D2685–D2688)
+
+The third code-quality survey deleted the checker's `redundant-type` spans outside the hot
+files (432 on this tree) and got a byte-identical seed whose self-compile cost **88.18G** fuel
+against **51.68G** for master's source. Byte identity cannot see work. `VL_FUEL=1` on one
+file at a time put almost all of it in `ast.vl`'s 23 `const out: i32[] = [...]`, and the
+`--names` profile put 23% of the build in `fnParamKindListSlot`: an un-annotated list
+literal's destination scan knew a function body as its scope only for the FIRST binding of
+its name, so every later sibling-block `const out` walked the whole arena (D2685). Rooting
+that walk at the block holding the binding, plus stopping the hint recorder's `=` scan at
+the `=` (D2686, which had made the ANNOTATED spelling quadratic too), gives:
+
+| source, seed | fuel |
+| --- | ---: |
+| master's, master | 51.68G |
+| annotations stripped, master | 88.18G |
+| master's, after | 50.25G |
+| annotations stripped, after | 51.15G |
+
+Both after-builds reproduce master's seed byte for byte. The remaining +0.9G is inferred
+returns and shared names, filed with their own ladders as D2687 (a single-entry let-plan
+cache evicted by each call to an inferred-return callee) and D2688 (an occurrence chain
+per name, not per name and frame). Ladders are fuel, one build each, from generated
+programs whose one knob is the entity count; a quadratic reads ~4x per doubling.
+
 ## Guards
 
 Four, and they fire at different moments. Profiling is what you do AFTER one of them does.
