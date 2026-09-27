@@ -1103,14 +1103,16 @@ function fnCheckedRetIsMapUnion(i: i32): boolean {
 
 // Re-seat function `i`'s list return kind on the checker's joined result when an earlier
 // return's literal settled a different one: `return [2]` beside `return [1.5]` is an `f64[]`,
-// and `return ["s"]` beside `return [1, "s"]` an `(i32 | string)[]` row (D2716).
-function criJoinedListKind(i: i32) {
+// and `return ["s"]` beside `return [1, "s"]` an `(i32 | string)[]` row (D2716). A return
+// `rx` that relays such a function's call takes the callee's joined result (D2746).
+function criJoinedListKind(i: i32, rx: i32) {
   if i < 0 || i >= fnStmts.length { return 0 }
   const fn = P.nodes[fnStmts[i]]
   let t = -1
   if fn is FuncDecl {
     if fn.fnRet >= 0 { return 0 }
-    t = inferJoinListTyOf(inferRetFnKey(fnStmts[i], fn.fnName))
+    t = criFnJoinListTy(i)
+    if t < 0 { t = criRelayJoinListTy(rx, i, 4) }
   }
   if t < 0 || t >= T.tys.length { return 0 }
   if !(T.tys[t] is TyArray) { return 0 }
@@ -1133,6 +1135,34 @@ function criJoinedListKind(i: i32) {
   if i < fRetRArrElem.length { fRetRArrElem[i] = nm }
   criChanged = true
   0
+}
+
+// The joined list type the checker banked for un-annotated function `i`, or -1.
+function criFnJoinListTy(i: i32): i32 {
+  const fn = P.nodes[fnStmts[i]]
+  if fn is FuncDecl {
+    if fn.fnRet < 0 {
+      return inferJoinListTyOf(inferRetFnKey(fnStmts[i], fn.fnName))
+    }
+  }
+  -1
+}
+
+// The joined list type a return `rx` of function `i` relays: `rx` calls a named function whose
+// returns join to one (`criFnJoinListTy`), directly or through up to `depth` more relays; -1 else.
+function criRelayJoinListTy(rx: i32, i: i32, depth: i32): i32 {
+  if rx < 0 || depth < 0 { return -1 }
+  const u = unwrapParen(rx)
+  if u < 0 || u >= P.nodes.length { return -1 }
+  const n = P.nodes[u]
+  if !(n is Call) { return -1 }
+  if n.callFn < 0 || n.callFn >= P.nodes.length { return -1 }
+  if !(P.nodes[n.callFn] is Ident) { return -1 }
+  const cfi = fnIndexOfSid(sidOfNode(n.callFn))
+  if cfi < 0 || cfi == i || cfi >= fnStmts.length { return -1 }
+  const t = criFnJoinListTy(cfi)
+  if t >= 0 { return t }
+  criRelayJoinListTy(fnRetExprOf(fnStmts[cfi]), cfi, depth - 1)
 }
 
 // `map` or `nulmap` when function `i`'s checker-inferred return is a map or a nullable map,
@@ -4112,7 +4142,7 @@ export function criClassify(rx0: i32, i: i32) {
     }
     return 0
   }
-  if retKindIsList(fRetKind[i]) { criJoinedListKind(i) }
+  if retKindIsList(fRetKind[i]) { criJoinedListKind(i, rx0) }
   // An assignment's value is its target cell, not the rhs expression, and that is a property
   // of the function rather than of this return node — so it answers for every node of such a
   // function and returns, letting no expression fact touch the slot afterwards. The cell kind
@@ -35422,8 +35452,96 @@ function dsCalleeParamSlot(
   if b < 0 { b = globalLetOf(name) }
   if b < 0 || b >= P.nodes.length { return DS_CALLEE_UNBOUND }
   const bn = P.nodes[b]
-  if bn is Param { return fnTyAnnParamKindListSlot(bn.parType, argIx, want) }
+  if bn is Param {
+    if bn.parType < 0 { return dsLamParamCalleeSlot(b, fnIx, argIx, want) }
+    return fnTyAnnParamKindListSlot(bn.parType, argIx, want)
+  }
   dsLetCalleeParamSlot(b, fnIx, argIx, want)
+}
+
+// `dsCalleeParamSlot` for an un-annotated parameter `parIx` of the lambda or nested function
+// `lamIx`: the checker leaves its type open, so the function a call of it hands that parameter
+// is the callee, and its parameter `argIx` is the destination (D2748). -1 when none is found.
+function dsLamParamCalleeSlot(
+  parIx: i32,
+  lamIx: i32,
+  argIx: i32,
+  want: i32,
+): i32 {
+  if lamIx < 0 || lamIx >= P.nodes.length { return -1 }
+  const lam = P.nodes[lamIx]
+  if !(lam is FuncDecl) { return -1 }
+  let pi = 0
+  while pi < lam.fnParams.length && lam.fnParams[pi] != parIx { pi = pi + 1 }
+  if pi >= lam.fnParams.length { return -1 }
+  const pp = fnStmtsPosOf(lamIx)
+  if pp < 0 || pp >= fnParent.length { return -1 }
+  const up = fnParent[pp]
+  let scope = emitRootIx
+  if up >= 0 && up < fnStmts.length {
+    const pf = P.nodes[fnStmts[up]]
+    if pf is FuncDecl { scope = pf.fnBody }
+  }
+  if scope < 0 { return -1 }
+  let nm = dsLamLetName(scope, lamIx)
+  if nm == "" { nm = lam.fnName }
+  if nm == "" { return -1 }
+  dsLamCallArgSlot(scope, nm, pi, argIx, want)
+}
+
+// The name of the `const` in `ix`'s scope whose initializer is the lambda `lamIx`, or "".
+function dsLamLetName(ix: i32, lamIx: i32): string {
+  if ix < 0 || ix >= P.nodes.length { return "" }
+  const n = P.nodes[ix]
+  if n is LetDecl {
+    if unwrapParen(n.letInit) == lamIx { return n.letName }
+  }
+  if n is FuncDecl { return "" }
+  const kids = nodeChildren(ix)
+  let k = 0
+  while k < kids.length {
+    const r = dsLamLetName(kids[k], lamIx)
+    if r != "" { return r }
+    k = k + 1
+  }
+  ""
+}
+
+// The first call `nm(…)` in `ix`'s scope whose argument `pi` is a function value whose parameter
+// `argIx` names a ref-list slot of kind `want`; -1 when none does.
+function dsLamCallArgSlot(
+  ix: i32,
+  nm: string,
+  pi: i32,
+  argIx: i32,
+  want: i32,
+): i32 {
+  if ix < 0 || ix >= P.nodes.length { return -1 }
+  const n = P.nodes[ix]
+  if n is FuncDecl {
+    if dsRebindsName(ix, nm) { return -1 }
+  }
+  if n is Call {
+    const cf = P.nodes[unwrapParen(n.callFn)]
+    if cf is Ident {
+      if cf.identName == nm && pi < n.callArgs.length {
+        const rs = fnTyParamKindListSlot(
+          nodeTyIxOf(n.callArgs[pi]),
+          argIx,
+          want,
+        )
+        if rs >= 0 { return rs }
+      }
+    }
+  }
+  const kids = nodeChildren(ix)
+  let k = 0
+  while k < kids.length {
+    const r = dsLamCallArgSlot(kids[k], nm, pi, argIx, want)
+    if r >= 0 { return r }
+    k = k + 1
+  }
+  -1
 }
 
 // `dsCalleeParamSlot` for a callee bound by the `LetDecl` at `b`: its function-type

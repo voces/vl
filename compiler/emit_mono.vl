@@ -39,6 +39,7 @@ import {
   bindGenWalk,
   blockHasBareReturn,
   canonEmitName,
+  collectValuedReturns,
   flatConstOfNameProp,
   flattenVariantsInto,
   fnResultUnconsumed,
@@ -51,6 +52,7 @@ import {
   monoInferListElem,
   monoInferLocalScalar,
   monoInferRetExprTy,
+  monoInferRetSetListTy,
   monoInferRetSetUnionName,
   nameIsLitUnionType,
   nodeTyArrayElemIsBoolPrim,
@@ -209,7 +211,7 @@ import {
   tyNameOf,
   unwrapParen,
 } from "./emit_base"
-import { paramTypeNode } from "./emit_query"
+import { paramIndexOf, paramTypeNode } from "./emit_query"
 import {
   drwFillDefaults,
   drwMemberDeferred,
@@ -246,6 +248,8 @@ import {
   monoProgStmts,
   reExpName,
   reExpTarget,
+  rlElemName,
+  rlElemTyIx,
   sNames,
   uVariants,
   unNames,
@@ -290,6 +294,7 @@ import {
   identFnTypeAnnName,
   isSName,
   isUName,
+  letRefListDestSlot,
   monoExactSubRowOf,
   monoRetRowName,
   nodeMapArmNominalName,
@@ -332,7 +337,6 @@ import {
 // names)` and registered before the body is walked so a recursive self-call at the
 // same shape hits the registry.
 
-import { collectValuedReturnsIn } from "./emit_query"
 import { i32ListHas } from "./listutil"
 
 // D943 — the lifted slots `monoPinBodyLambdas` minted for the instance being built. A
@@ -457,7 +461,7 @@ function monoRetJoinDisagrees(fnNodeIx: i32, reIx: i32): boolean {
   const f = P.nodes[fnNodeIx]
   if f is FuncDecl {
     const rets: i32[] = []
-    collectValuedReturnsIn(f.fnBody, rets)
+    collectValuedReturns(f.fnBody, rets)
     let i = 0
     while i < rets.length {
       const rt = nodeTyIxOf(rets[i])
@@ -851,6 +855,41 @@ function monoNicheWidenedPinName(ax: i32, chosen: string): string {
   n
 }
 
+// The pin an un-annotated list binding takes from the declared union-element destination its
+// literal is built for (`letRefListDestSlot`), or "": its checked type names the literal's own
+// element, and an instance pinned there would receive the destination's list (D2747).
+function monoDestListPinName(letIx: i32, fnIx: i32): string {
+  const s = letRefListDestSlot(letIx, fnIx)
+  if s < 0 || s >= rlElemName.length { return "" }
+  let en = rlElemName[s]
+  if s < rlElemTyIx.length {
+    const ur = unRowOfCanon(rlElemTyIx[s])
+    if ur >= 0 && ur < unNames.length { en = unNames[ur] }
+  }
+  if en == "" { return "" }
+  monoAnnPinName(en + "[]")
+}
+
+// `monoDestListPinName` of the binding a closure at `fnIx` captures as `name`: the nearest
+// enclosing frame's `let`, or "" once a frame binds the name as a parameter.
+function monoCapturedDestListPin(name: string, fnIx: i32): string {
+  let pp = fnStmtsPosOf(fnIx)
+  let steps = 0
+  while pp >= 0 && pp < fnParent.length && steps < 64 {
+    pp = fnParent[pp]
+    if pp < 0 || pp >= fnStmts.length { return "" }
+    const fx = fnStmts[pp]
+    const fn = P.nodes[fx]
+    if fn is FuncDecl {
+      const li = parentLetOf(fn.fnBody, name)
+      if li >= 0 { return monoDestListPinName(li, fx) }
+      if paramIndexOf(fx, name) >= 0 { return "" }
+    }
+    steps = steps + 1
+  }
+  ""
+}
+
 // `monoArgTyName` at a monomorphization pin — the ladder's answer, narrowed to what the
 // checker recorded for this node where that is one of the annotation's own members.
 // Separate from `monoArgTyName` because `wasmEmit`'s `monoStaticIsResult` also asks that
@@ -1008,6 +1047,8 @@ export function monoArgTyName(ix: i32, fnIx: i32) {
               if r != "" { return r }
             }
             if ld.letType < 0 && ld.letInit >= 0 {
+              const ldp = monoDestListPinName(li, fnIx)
+              if ldp != "" { return ldp }
               // An empty list literal has no element for the recursion to read, and
               // the recursion answers anyway (D764). The checker pinned the binding
               // from its destination, so read the argument reference's recorded type.
@@ -1026,6 +1067,10 @@ export function monoArgTyName(ix: i32, fnIx: i32) {
               if innerTy == "" { return "" }
             }
           }
+        }
+        if li < 0 && paramIndexOf(fnIx, argN.identName) < 0 {
+          const cdp = monoCapturedDestListPin(argN.identName, fnIx)
+          if cdp != "" { return cdp }
         }
       }
       // A struct-typed param argument (`g(v)` inside a generic body where `v: P`): same as
@@ -1061,6 +1106,8 @@ export function monoArgTyName(ix: i32, fnIx: i32) {
         // only its initializer knows. The recursion is the local arm's verbatim,
         // including its two rules on an `"i32"` answer and on a `""` refusal.
         if gd.letType < 0 && gd.letInit >= 0 {
+          const gdp = monoDestListPinName(gli, -1)
+          if gdp != "" { return gdp }
           // The empty-literal rung's module-scope twin (D764) — see the local arm for the
           // ablation and the witness. A rung added to one scope and not the other is the
           // asymmetry this ladder exists to make unstateable.
@@ -5032,18 +5079,20 @@ function monoMakeInstance(
     // declines the whole set, and `monoRegisterPinUnion` makes the minted name resolvable.
     if fn.fnRet < 0 {
       const jTy: i32[] = []
-      const jun = monoInferRetSetUnionName(
-        monoOrigNode[origFe],
-        pinnedTyIx,
-        letBN,
-        letBT,
-        jTy,
-      )
+      const jDecl = monoOrigNode[origFe]
+      const jun = monoInferRetSetUnionName(jDecl, pinnedTyIx, letBN, letBT, jTy)
       if jun != "" {
         if monoRegisterPinUnion(jun) < 0 { return -1 }
         let jIx = -1
         if jTy.length > 0 { jIx = jTy[0] }
         nret = synthTypeRefTy(jun, -1, jIx)
+      } else {
+        const jl = monoInferRetSetListTy(jDecl, pinnedTyIx, letBN, letBT)
+        if jl >= 0 {
+          let jln = monoRetListRowName(jl)
+          if jln == "" { jln = tyToEmitName(jl) }
+          if jln != "" { nret = synthTypeRefTy(jln, -1, jl) }
+        }
       }
     }
     // An inferred return the checker typed as a bare type parameter is the `: T` annotation's

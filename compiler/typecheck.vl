@@ -43577,25 +43577,53 @@ function a20RetSetDisagrees(blockIx: i32): boolean {
 }
 
 function a20CollectRets(blockIx: i32, out: i32[]) {
-  if blockIx < 0 { return 0 }
-  const b = P.nodes[blockIx]
-  if b is Block {
-    const stmts = b.blkStmts
-    let i = 0
-    while i < stmts.length {
-      const st = P.nodes[stmts[i]]
-      if st is RetStmt {
-        if st.retArg >= 0 { out.push(st.retArg) }
-      } else if st is IfStmt {
-        a20CollectRets(st.ifThen, out)
-        a20CollectRets(st.ifElse, out)
+  a20RetWalk(blockIx, true, out)
+}
+
+// Every valued `return` under `blockIx` in source order, at any depth but a nested function's.
+export function collectValuedReturns(blockIx: i32, out: i32[]) {
+  a20RetWalk(blockIx, false, out)
+}
+
+// Every valued `return` under `ix` in source order, a nested function's aside, and when `tail`
+// holds the values `ix` yields as the body's tail: a block's last statement and each arm of a
+// tail `if`, an `else if` chain along its spine. A loop body's last statement is not a tail (D2745).
+function a20RetWalk(ix: i32, tail: boolean, out: i32[]) {
+  let cur = ix
+  while cur >= 0 && cur < P.nodes.length {
+    const at = cur
+    const n = P.nodes[at]
+    cur = -1
+    if n is RetStmt {
+      if n.retArg >= 0 {
+        a20RetWalk(n.retArg, false, out)
+        out.push(n.retArg)
       }
-      if i == stmts.length - 1 {
-        if !(st is RetStmt) {
-          if !(st is IfStmt) { out.push(stmts[i]) }
-        }
+    } else if n is FuncDecl {
+      return 0
+    } else if n is Block {
+      const stmts = n.blkStmts
+      let i = 0
+      while i < stmts.length {
+        a20RetWalk(stmts[i], tail && i == stmts.length - 1, out)
+        i = i + 1
       }
-      i = i + 1
+    } else if n is IfStmt {
+      a20RetWalk(n.ifCond, false, out)
+      a20RetWalk(n.ifThen, tail, out)
+      if elseIfLink(at) >= 0 {
+        cur = n.ifElse
+      } else {
+        a20RetWalk(n.ifElse, tail, out)
+      }
+    } else {
+      const kids = nodeChildren(at)
+      let ki = 0
+      while ki < kids.length {
+        a20RetWalk(kids[ki], false, out)
+        ki = ki + 1
+      }
+      if tail { out.push(at) }
     }
   }
   0
@@ -46908,6 +46936,47 @@ export function monoInferRetSetUnionName(
   monoRecheckEnd(sv)
   name
 }
+// The list type the whole return set joins to at this pin when its returns disagree (`[2]`
+// beside `[1.5]` is an `f64[]`), or -1: `monoInferRetSetUnionName`'s list twin, which no one
+// return's own list describes (D2745).
+export function monoInferRetSetListTy(
+  declIx: i32,
+  paramTyIxs: i32[],
+  tpNames: string[],
+  tpTys: i32[],
+): i32 {
+  if declIx < 0 { return -1 }
+  const dn0 = P.nodes[declIx]
+  if !(dn0 is FuncDecl) { return -1 }
+  const rets: i32[] = []
+  a20CollectRets(dn0.fnBody, rets)
+  if rets.length < 2 { return -1 }
+  const sv: i32[] = []
+  if !monoRecheckBegin(declIx, paramTyIxs, tpNames, tpTys, sv) { return -1 }
+  let joined = -1
+  let first = -1
+  let differ = false
+  let ok = true
+  let i = 0
+  while i < rets.length {
+    const rt = checkNode(rets[i])
+    if rt < 0 || rt == TY_VOID || rt == TY_ERR || tyHasHole(rt) {
+      ok = false
+    } else if joined < 0 {
+      joined = rt
+      first = rt
+    } else {
+      if !tySame(rt, first) { differ = true }
+      joined = joinTys(joined, rt)
+    }
+    i = i + 1
+  }
+  monoRecheckEnd(sv)
+  if !ok || !differ || joined < 0 || joined >= T.tys.length { return -1 }
+  if !(T.tys[joined] is TyArray) { return -1 }
+  joined
+}
+
 // Whether the LetDecl at `letIx` is recorded as an inferred `string | null` niche
 // if-binding (the niche analogue of `inferLetNameOf`). The emitter's `letIsNulString`
 // consults this so the slot classifies as kind 16 and reuses the annotated lowering.
