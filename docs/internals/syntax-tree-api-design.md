@@ -19,7 +19,7 @@ One API serves four uses:
 
 | # | question | recommendation |
 | --- | --- | --- |
-| 1 | tree model | A **surface view** over the compiler's arena. Nodes are opaque `Syntax` handles with surface kinds and full `[start, end)` byte spans. They sit over a lossless **token layer** that holds every token and comment, with whitespace recoverable from the retained source. Edits are byte-exact outside their range. No green tree yet. |
+| 1 | tree model | A **surface view** over the compiler's arena. Nodes are opaque `Syntax` handles with surface kinds and full `[start, end)` byte spans. They sit over a lossless **token layer** that holds every token and comment, with whitespace recoverable from the retained source. Edits are byte-exact outside their range. Handles are chosen over public recursive structs for stability and privacy; VL could express the structs (§1(d)). No green tree yet. |
 | 2 | stability | The node set is **additive-only**. A kind or slot name is never removed or given a new meaning. One grammar file is the source of truth, and a snapshot ratchet fails any removal. The API ships under an explicitly unstable name until the migration proves it. Only then does it become `std:syntax` (§2). |
 | 3 | query | **Layered.** The primary layer is patterns written in plain VL with `$X` / `$$$XS` metavariables; `$` cannot start a VL identifier, so these never collide. Logic uses a typed VL cursor API. There is **no** selector string language and **no** YAML. |
 | 4 | edit model | Edits travel as **text edits over spans**. Structural helpers (`replace`, `remove`, `insertBefore`, `wrap`) lower to text edits. Replacement code is a **VL template** with metavariables. Fixes carry a safety level: `"safe"`, `"unsafe"` or `"suggestion"`. Fixes are applied to a fixed point, overlapping fixes are dropped, and a fix that does not converge is an error. |
@@ -33,11 +33,13 @@ One API serves four uses:
 
 Each has options and a recommendation. The sections below argue each one in full.
 
-1. **What is the public tree?** (a) A surface view over today's arena, with a lossless token
-   layer beside it. (b) A real lossless green tree that the parser emits, as in Roslyn or
-   rust-analyzer. **Recommend (a).** It is weeks, not a parser rewrite, and it makes the
-   same byte-exact promise. (b) stays open if the LSP later needs incremental reparse.
-   See §1.
+1. **What is the public tree?** (a) A surface view over today's arena, as opaque handles,
+   with a lossless token layer beside it. (b) A real lossless green tree that the parser
+   emits, as in Roslyn or rust-analyzer. (d) Public recursive node structs, ESTree-style,
+   which VL can express. **Recommend (a).** It is weeks, not a parser rewrite, it makes the
+   same byte-exact promise, and handles can gain slots where a struct's field set would be
+   frozen. (d) is viable if reading comfort outweighs that cost, ideally as a derived
+   `toStruct(n)` view. (b) stays open if the LSP later needs incremental reparse. See §1.
 2. **Stability policy for a permanent node set.** (a) Ship `std:syntax` now, additive-only.
    (b) Ship it under an explicitly unstable name, promoted to `std:syntax` after the
    migration (P4). (c) Leave it versionless and unstable for good, as rust-analyzer does.
@@ -79,7 +81,7 @@ and what VL should copy. A full evaluation of each system would be a separate pi
 | system | does well | does badly | VL copies |
 | --- | --- | --- | --- |
 | **ESLint** | `context.report({node, message, fix, suggest})`. A fixer object (`replaceText`, `insertTextBefore`, `remove`) that returns text edits. `meta.fixable` and separate `suggest` entries, so an unsafe edit is never applied by `--fix`. Fixes run in up to 10 passes, and overlapping fixes are skipped until the next pass. `RuleTester` takes `valid`/`invalid` fixtures. | ESTree drops tokens and comments, so rules reach for `sourceCode.getTokens*`. Selectors (esquery) are a string mini-language with no type checking. A text fix can produce code that does not parse, and nothing reparses it. | report + fixer returning text edits; fix vs suggestion; the multi-pass conflict loop; fixture-table rule tests |
-| **jscodeshift / recast** | A collections API: `find(CallExpression, {callee: {name}})`, then `.replaceWith`. Recast reprints only the nodes you changed and keeps the original text everywhere else. | Builders are verbose (`j.callExpression(j.identifier(…), […])`). Reprinted nodes sometimes lose parentheses or formatting. It has no types, and a transform is a JS program run with no dry-run convention. | print-preserving edits (VL gets them from span splicing); a chainable find/filter over matches |
+| **jscodeshift / recast** | A collections API: `find(CallExpression, {callee: {name}})`, then `.replaceWith`. Recast reprints only the nodes you changed and keeps the original text everywhere else. | Builders are verbose (`j.callExpression(j.identifier(…), […])`). Reprinted nodes sometimes lose parentheses or formatting. It has no types. It has a dry run (`-d/--dry` with `--print`), but writing is the default. | print-preserving edits (VL gets them from span splicing); a chainable find/filter over matches |
 | **ts-morph** | Full TypeScript type checker access, with navigation and manipulation on one object model. | Every manipulation reparses, so large codemods are slow and memory-hungry. The API surface is enormous. | types-on-demand, but not its size or its mutate-then-reparse model |
 | **Babel plugins** | A visitor keyed by node type. `path` carries parent, scope and bindings (`path.scope.getBinding`), plus `replaceWith`, `insertBefore` and `remove`. `template` builds nodes from source text. | The tree is mutable and results depend on plugin order. The generator reprints the whole file, so formatting is lost. | `path`-style parent/scope navigation; building replacement code from **source templates**, not builders |
 | **Roslyn** | Immutable red/green trees with full-fidelity trivia. Analyzers register per `SyntaxKind`, per symbol or per operation. `CodeFixProvider` is keyed on a diagnostic id, and FixAll applies it everywhere. A semantic model sits beside the tree. Severity is configured in `.editorconfig`. The API is additive-only across releases. | Heavy boilerplate, and the fix provider is a separate class from the analyzer. The API is very large. Analyzer cost in the IDE is a standing complaint. | an **additive-only public node set**; per-kind registration so the host dispatches cheaply; fix-all |
@@ -90,7 +92,7 @@ and what VL should copy. A full evaluation of each system would be a separate pi
 | **GritQL (Biome plugins)** | A declarative query language: patterns in backticks, `=>` rewrites, `where` clauses. Biome adopted it for plugins, which makes it the nearest precedent for "a repo's own rules in a language the tool owns". | A second language to learn, and one LLMs have seen little of. | rewrite-as-part-of-the-pattern; **but** VL's rules are written in VL itself, which LLMs already write |
 | **tree-sitter queries** | S-expression patterns with `@captures` and `#eq?`/`#match?` predicates. Very fast, incremental, over a CST that keeps every token. | Hard to read, predicates are limited, there is no rewrite, and grammar node names break between grammar versions. | nothing on the surface; the lesson that **node names are API and break consumers when renamed** |
 | **Comby** | Needs no parser: `:[hole]` over balanced delimiters works in any language. | It matches text, not syntax, so false matches happen. | nothing; VL has a parser |
-| **Biome (Rust rules)** | The `Rule` trait: `Query`, `State`, `run`, `diagnostic` and `action`, over a rowan-style lossless CST. `FixKind::Safe/Unsafe`, with config that can promote an unsafe fix. | Rules are Rust compiled into the tool, which is the shape the owner ruled out for VL's repo rules. | per-rule `fix` safety in the rule's metadata; config can **demote but not promote** safety (§4.3) |
+| **Biome (Rust rules)** | The `Rule` trait: `Query`, `State`, `run`, `diagnostic` and `action`, over a rowan-style lossless CST. `FixKind::Safe/Unsafe`, and config can promote or demote a rule's fix safety. | Rules are Rust compiled into the tool, which is the shape the owner ruled out for VL's repo rules. | per-rule `fix` safety in the rule's metadata. VL **departs** from Biome on configuration: its config can demote safety but never promote it (§4.3) |
 | **Ruff** | Fix safety of `safe`, `unsafe` or `display-only`, with `--unsafe-fixes` and per-rule overrides. It iterates fixes to a fixed point and **reports "failed to converge"** when it cannot. | Rules are Rust in-tree only. | the three safety names; **non-convergence is an error, not a loop** |
 | **rust-analyzer** | Rowan green/red trees, and typed AST wrappers **generated from `ungrammar`**. SSR (`$a.foo($b) ==>> bar($a, $b)`) is a source-shaped pattern that resolves paths with type information. | The syntax crates are explicitly unstable, with no semver. | **one grammar file generating the typed accessors**; SSR's evidence that patterns in source can be type-aware |
 | **LibCST (Python)** | A concrete tree that holds whitespace nodes, declarative matchers, and a codemod runner. | Whitespace-as-nodes makes hand-built trees tedious. | confirmation that a lossless tree plus matchers plus a codemod runner is the right package |
@@ -161,10 +163,47 @@ desugaring, the registry-by-key migration. The only obligation is that the view 
 still produces the same public kinds. The compiler owes the view one new table, a start
 token per node, which the parser can stamp beside `nodeToks` at the same site.
 
-A public node set is not optional here. VL cannot express a recursive type alias; that is
-why the arena uses `i32` children. So a public tree of recursive structs is not
-expressible either, and **opaque handles plus accessor functions** is both the only shape
-available and the shape that keeps internals private.
+**Why not expose the arena itself.** The arena is internal, and it is partly desugared. It
+is keyed by `i32` indices that passes rewrite in place (`arenaReplaceNode`,
+`arenaSetNode`). Its field names (`binLeft`, `callArgs`) follow a prefix convention that
+exists only so that `is` can tell variants apart by shape. None of that should become
+permanent API.
+
+* **(d) Public recursive node structs.** VL can express these:
+  `type Tree = { value: i32, children: Tree[] }` checks and runs, and `std:json` already
+  ships the recursive alias `Json`. The public tree could therefore be a union of kind
+  structs with direct children, such as `If = { cond: Expr, then: Block, els: Stmt | null, span: Span }`,
+  that a rule reads as `n is If` and `n.cond`.
+
+  *For:* it is the most natural VL to read. There are no accessor functions or generated
+  wrappers, a tree dumps to JSON directly, and it is the ESTree and Babel shape that
+  LLMs know best.
+
+  *Against:*
+  * **Every field of every kind is frozen.** A struct type is structural, so adding a field
+    changes the type that any consumer constructing or annotating it has written. Handles
+    can gain slots freely.
+  * **The field-name prefix rule is inherited.** Variants must stay distinguishable by
+    shape, so the public field names carry the same prefix rule forever.
+  * **The whole tree is materialised as a copy on every parse.** Under the linked execution
+    of §6.4, that copy is a GC object graph passed between two wasm modules rather than
+    `i32` handles.
+  * **There are no parent links without mutation.** An immutable struct cannot point up, so
+    `parentOf` and `ancestors` still need a side table, and the handle machinery comes
+    back anyway.
+  * **It invites mutation as the edit model,** which recast shows is where formatting and
+    comments are lost.
+
+  A closed union of kinds has one cost that both (a) and (d) share: an exhaustive `match`
+  in a consumer breaks when a kind is added. The grammar therefore documents the kind set
+  as open, and a consumer `match` must carry a `_` arm.
+
+**Recommendation: (a), with opaque handles over a closed kind set,** chosen for stability
+and privacy rather than forced by the language. Generated typed wrappers (§2) recover most
+of (d)'s readability, for example `ifCond(n)`. If the owner weighs reading comfort above
+the frozen-field cost, (d) is viable. The cheapest way to get it is a **derived** struct
+tree that a function builds on demand from the handle view (`toStruct(n)`), versioned with
+the grammar, rather than making structs the primary representation.
 
 ```vl
 import { Syntax, kindOf, slot, slots, text, tokensOf, commentsOf, parentOf } from "std:syntax"
@@ -182,7 +221,7 @@ string. A misspelt kind is then a check error in the rule, not a rule that silen
 matches nothing. Slot names are a literal union per kind too, and generated typed wrappers
 (§2) make them methods: `ifCond(n)`.
 
-**Recommendation: (a).** Keep (b) as a P5 option, taken only if the LSP measures that
+**Recommendation: (a)** (see the (d) discussion above). Keep (b) as a P5 option, taken only if the LSP measures that
 full-module rebuilds are too slow.
 
 ## §2 Stability and versioning
@@ -330,7 +369,9 @@ verify step becomes the driver's last pass.
 | `"suggestion"` | one of several alternatives, or has placeholders | the editor only, never in batch |
 
 The repo config may **demote** a rule's fixes, never promote them. A rule author's claim
-of safety is the ceiling.
+of safety is the ceiling. This is a deliberate departure from Biome and Ruff, whose configs
+can do both: a promotion lets a config silently batch-apply an edit its own author called
+behaviour-changing.
 
 **4.4 Idempotence** is tested, not hoped for. The rule test harness (§7) runs every
 `invalid` fixture's fix twice and requires that the second run produces no edits.
