@@ -14748,16 +14748,27 @@ function litTreeOps(ix: i32, depth: i32): i32 {
     ) {
       k = 1
     }
-    if k < 0 { return -1 }
-    const l = litTreeOps(e.binLeft, depth - 1)
-    if l < 0 { return -1 }
+    // Both operands' kinds before any digits are read: `x + 1` rejects at `x` for the price of
+    // two tag tests.
+    if k < 0 || !litTreeNodeKind(e.binLeft) || !litTreeNodeKind(e.binRight) {
+      return -1
+    }
     const r = litTreeOps(e.binRight, depth - 1)
     if r < 0 { return -1 }
+    const l = litTreeOps(e.binLeft, depth - 1)
+    if l < 0 { return -1 }
     if l > k { k = l }
     if r > k { k = r }
     return k
   }
   litTreeNotOne()
+}
+
+// Whether the node at `ix` is of a kind a literal tree is made of (its digits unread).
+function litTreeNodeKind(ix: i32): boolean {
+  if ix < 0 { return false }
+  const e = P.nodes[ix]
+  e is NumLit || e is BinExpr || e is Unary || e is Paren
 }
 
 // Every other node, a name, call or float among them, is not a tree of integer literals.
@@ -14777,20 +14788,28 @@ function litTreeLeavesExact(ix: i32, fty: i32): boolean {
 }
 
 // The type the literal tree at `ix` computes at when delivered into `dstTy`: `i64` at a 64-bit
-// integer destination, the float at an `f64` or `f32` one when every operator has a float form
-// and every literal is exact there, else -1 (the tree keeps the width its literals imply).
+// integer destination, the float at an `f64` or `f32` one when float adoption is on and every
+// operator has a float form and every literal is exact there, else -1 (the tree keeps the width
+// its literals imply).
 function litTreeWideTy(ix: i32, dstTy: i32): i32 {
-  if dstTy < 0 { return -1 }
-  if dstIntWidth(dstTy, 3) == 64 {
-    if litTreeOps(ix, 32) < 1 { return -1 }
-    return TY_I64
-  }
+  if dstTy < 0 || ix < 0 { return -1 }
+  // A bare literal is not a tree, and is the common operand: reject it before reading its digits.
+  const top = P.nodes[parenPeelIx(ix)]
+  if !(top is BinExpr || top is Unary) { return -1 }
+  const k = litTreeOps(ix, 32)
+  if k < 1 { return -1 }
+  if dstIntWidth(dstTy, 3) == 64 { return TY_I64 }
+  if !litTreeFloatAdopts() || k != 1 { return -1 }
   const fty = nonNullTy(dstTy)
   const pn = primNameOf(fty)
   if pn != "f64" && pn != "f32" { return -1 }
-  if litTreeOps(ix, 32) != 1 || !litTreeLeavesExact(ix, fty) { return -1 }
+  if !litTreeLeavesExact(ix, fty) { return -1 }
   fty
 }
+
+// Whether a literal tree adopts a float destination (`7 / 2` read as 3.5 at an `f64`). Off: it
+// changes the value of programs that run today and awaits the owner's ruling (D2711).
+function litTreeFloatAdopts(): boolean { false }
 
 // Types every node of the literal tree at `ix` as `ty`, its literals through `litTreeTy` so a
 // re-check keeps the width. Answers `ty`.
@@ -42898,14 +42917,12 @@ export function checkProgram(rootIx: i32) {
 // width, so `x << 32` over an `i32` would shift by nothing (D2710). Graded once every literal tree
 // has its destination's width, so `const a: i64 = 1 << 40` is not refused at 32 bits.
 function checkShiftCounts() {
-  const seen: boolean[] = []
+  const reported: {[i32]: boolean} = Map()
   let i = 0
   while i < shiftCountNodes.length {
     const ix = shiftCountNodes[i]
-    while seen.length <= ix { seen.push(false) }
     const n = P.nodes[ix]
-    if !seen[ix] && n is BinExpr {
-      seen[ix] = true
+    if n is BinExpr {
       let w = -1
       const lt = nodeTyOf(n.binLeft)
       if lt == TY_I32 { w = 32 }
@@ -42913,7 +42930,11 @@ function checkShiftCounts() {
       const lex = intLitLexemeOf(n.binRight)
       if w > 0 && lex != "" {
         const neg = intLitIsNegated(n.binRight)
-        if neg || !numLexFitsI32(lex) || parseI32(lex) >= w {
+        if (
+          (neg || !numLexFitsI32(lex) || parseI32(lex) >= w)
+          && !(reported[ix] ?? false)
+        ) {
+          reported[ix] = true
           tErr(shiftCountMsg(n.binOp, lex, neg, w), n.binRight)
         }
       }

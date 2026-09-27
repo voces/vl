@@ -2,7 +2,7 @@
 """The D2709/D2710 grid: trees of integer literals x delivery positions x destination widths
 (i32, i64, f64, f32), graded against values computed here. Run from the checkout root.
 
-Usage: scripts/literal-tree-grid.py <seed.wasm> [--show] [--json=<path>]
+Usage: scripts/literal-tree-grid.py <seed.wasm> [--show] [--json=<path>] [--float-adopt]
 Prints one row per position with `as-expected/total` per width; --show lists every miss."""
 import math, os, re, struct, subprocess, sys, tempfile
 from concurrent.futures import ThreadPoolExecutor
@@ -11,6 +11,8 @@ W = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 VL = os.environ.get("VL", W + "/scripts/vl-host/target/release/vl")
 SEED = sys.argv[1]
 SHOW = "--show" in sys.argv
+# expect float destinations to adopt a literal tree (D2711, pending a ruling; off in the compiler)
+FLOAT_ADOPT = "--float-adopt" in sys.argv
 TMP = tempfile.mkdtemp(prefix="literal-tree-grid-")
 
 EXPRS = [
@@ -141,7 +143,7 @@ def expect(e, w):
             return ("value", ieval(n, 32))
         if w == "i64":
             return ("value", ieval(n, 64))
-        if kind(n) == 1 and (w == "f64" or leaves_exact_f32(n)):
+        if FLOAT_ADOPT and kind(n) == 1 and (w == "f64" or leaves_exact_f32(n)):
             return ("value", feval(n, w == "f32"))
         if w == "f32":
             return ("refuse",)  # an i32 value is not implicitly an f32

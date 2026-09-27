@@ -8388,22 +8388,15 @@ shared id space, deletes 2,000 behind, 32 lookups per insert, `-O`): with a reco
 (11.3–13.7 against 13.4–19.2), because `(i32 | null)[]` boxes every element; the tier-1 niche
 above is what would close that.
 
-## A tree of integer literals takes its destination's width, and a literal shift count must be below the operand's (2026-09-26) — D2709, D2710
+## A tree of integer literals takes a 64-bit destination's width, and a literal shift count must be below the operand's (2026-09-26) — D2709, D2710
 
-**The rule.** A bare literal already takes its destination's type: `const x: i64 = 5` and
-`const y: f64 = 5` store 5 at that width. An operator tree over integer literals alone —
-`3 << 32`, `2147483647 + 1`, `-(7 / 2)` — now takes it too, so it is computed at 64 bits (or as
-a float) rather than wrapped at 32 bits and then widened. This is Swift's reading
-(`let x: Double = 7 / 2` is 3.5), not Go's (untyped constants divide as integers, so 3); the
-Go reading is a known gotcha and VL has no untyped-constant mode for it to fall out of. An
-operand beside a wide one takes that one's type the same way, so `x + (1 << 40)` over an `i64`
-adds 2^40.
-
-**Limits, each chosen.** A float destination adopts only a tree whose every operator has a float
-form (`+ - * / %` and unary `-`) and whose every literal is exact there; a tree with a bitwise or
-shift operator keeps its `i32` reading and converts. An `i32` variable is never widened, so a
-tree that mixes one keeps the 32-bit rule — only the literal-only part adopts. An `i32`
-destination is unchanged, wraparound included.
+**The rule.** A bare literal already takes its destination's type: `const x: i64 = 5` stores 5
+at 64 bits. An operator tree over integer literals alone — `3 << 32`, `2147483647 + 1` — now
+takes an `i64` destination too, so it is computed at 64 bits rather than wrapped at 32 bits and
+then widened, and an operand beside an `i64` one takes that one's type, so `x + (1 << 40)` adds
+2^40. An `i32` variable is never widened, so a tree that mixes one keeps the 32-bit rule, and an
+`i32` destination is unchanged, wraparound included. A float destination is unchanged too: the
+reading there changes the value of programs that run today and awaits a ruling (D2711).
 
 **The shift count.** Wasm takes a shift count modulo the width, so `x << 32` over an `i32` is
 `x`. A literal count below 0 or at or above the operand's width is refused, as in Rust and Go;
