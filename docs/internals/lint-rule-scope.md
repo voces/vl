@@ -113,6 +113,12 @@ same set before and after; only `compiler/lint.vl`'s own line numbers moved.
 
 ## Repo-local rules
 
+**Superseded (owner ruling, 2026-09-27):** the owner chose (b), done properly, over (c).
+Repo-local rules will be written in VL over a syntax-tree API that also serves autofixes,
+codemods and LLM agents. The design is
+[`syntax-tree-api-design.md`](syntax-tree-api-design.md). The options below are kept as
+the record of what was weighed.
+
 The scoping above is a path filter inside the compiler: the policy of one repository ships
 in every consumer's seed and is switched off by a prefix test. The owner asked for a
 mechanism by which a repository defines its **own** rules, so the VL repo's policy lives in
