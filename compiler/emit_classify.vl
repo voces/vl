@@ -13422,6 +13422,45 @@ export function spreadDstBackSlot(kind: MfKind, row: i32, seq: i32) {
   scratchSlot(21, kind, row + 4096 * seq, SCRATCH_BY_BOTH)
 }
 
+// The arm block's tail value, seen through to the initializer when the tail names a local of
+// the arm's own prelude that no scope has bound yet: a classifier asked before the arm lowers
+// (a global's cell, say) would otherwise read the name as unbound (D2785).
+function armTailValue(blockIx: i32): i32 {
+  const tv = ifArmValueExpr(blockIx)
+  if tv < 0 { return tv }
+  const b = P.nodes[blockIx]
+  if b is Block {
+    let cur = tv
+    let before = b.blkStmts.length - 1
+    let going = true
+    while going {
+      going = false
+      const n = P.nodes[unwrapParen(cur)]
+      if n is Ident {
+        if scopeSlotOf(n.identName) < 0 {
+          let i = before - 1
+          while i >= 0 {
+            const d = P.nodes[b.blkStmts[i]]
+            if d is LetDecl {
+              if d.letName == n.identName {
+                if d.letInit >= 0 {
+                  cur = d.letInit
+                  before = i
+                  going = true
+                }
+                i = -1
+              }
+            }
+            i = i - 1
+          }
+        }
+      }
+    }
+    return cur
+  }
+  tv
+}
+
 // The tail value of the if-expression's first arm that is not a bare `null`, following an
 // `else if` chain, or -1. The arms share the checker's join type, so that arm's rep classifies
 // the whole if-expression; a `null` arm has no rep, and reading it made the join's rep depend on
@@ -13429,7 +13468,7 @@ export function spreadDstBackSlot(kind: MfKind, row: i32, seq: i32) {
 function ifThenValueIx(ifIx: i32) {
   const s = P.nodes[ifIx]
   if s is IfStmt {
-    const tv = ifArmValueExpr(s.ifThen)
+    const tv = armTailValue(s.ifThen)
     if !exprIsNullLike(tv) { return tv }
     const nv = ifNonNullArmValueIx(s.ifElse)
     if nv >= 0 { return nv }
@@ -13445,12 +13484,12 @@ function ifNonNullArmValueIx(elseIx: i32) {
   while cur >= 0 {
     const n = P.nodes[cur]
     if n is IfStmt {
-      const tv = ifArmValueExpr(n.ifThen)
+      const tv = armTailValue(n.ifThen)
       if tv >= 0 && !exprIsNullLike(tv) { return tv }
       cur = n.ifElse
     } else {
       // The final else: `ifArmValueExpr` reads a block's tail value and answers -1 for any other node.
-      const ev = ifArmValueExpr(cur)
+      const ev = armTailValue(cur)
       if ev >= 0 && !exprIsNullLike(ev) { return ev }
       return -1
     }
@@ -13602,7 +13641,7 @@ function ifElseValueIx(ifIx: i32) {
   const s = P.nodes[ifIx]
   if s is IfStmt {
     if s.ifElse >= 0 {
-      if P.nodes[s.ifElse] is Block { return ifArmValueExpr(s.ifElse) }
+      if P.nodes[s.ifElse] is Block { return armTailValue(s.ifElse) }
     }
   }
   -1
@@ -37916,7 +37955,16 @@ function syntacticListRep(exprIx: i32, fnIx: i32): VKind | null {
   if e is ArrayLit { return arrLitListRep(exprIx, fnIx) }
   if e is Paren { return exprListRep(e.parInner, fnIx) }
   // An if-expression is its join's rep, read off the arm that decides it (D2210).
-  if e is IfStmt { return gatedListRep(ifExprRefKind(exprIx, fnIx), "if-join") }
+  if e is IfStmt {
+    const ik = ifExprRefKind(exprIx, fnIx)
+    // In a generic instance the join's recorded type is the type parameter, which answers
+    // nothing, so the arms' list rep is the join's (D2825).
+    if tyHasTyVar(nodeTyIxOf(exprIx)) {
+      const tk = listRepOrNull(ik)
+      if tk != null { return tk }
+    }
+    return gatedListRep(ik, "if-join")
+  }
   if e is Ident { return identListRep(exprIx, fnIx) }
   if e is Member { return memberListRep(exprIx, fnIx) }
   if e is Call { return callListRep(exprIx, fnIx) }
