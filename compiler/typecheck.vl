@@ -95,6 +95,7 @@ import {
   callHasTyArgs,
   callTyArgsAny,
   callTyArgsOf,
+  declHasExportKw,
   declNameTokOf,
   fillArgDefaults,
   fnRequiredArity,
@@ -979,6 +980,19 @@ let objLitBindName: string[] = []
 let ctnLitBindDepth: i32[] = []
 let ctnLitBindName: string[] = []
 let ctnLitBindInit: i32[] = []
+// The same rows for an un-annotated `let`/`const` whose initializer is a numeric literal or a list
+// of them, with its declaration. A mismatch whose value reads one of these names the declaration
+// and the annotation that would fix it; the note is appended at the end of the check
+// (`numLitNotesApply`).
+let numLitBindDepth: i32[] = []
+let numLitBindName: string[] = []
+let numLitBindDecl: i32[] = []
+// Pending notes: the diagnostic's index and raw message, the note, and the declaration it names.
+let nlnDiag: i32[] = []
+let nlnMsg: string[] = []
+let nlnText: string[] = []
+let nlnDecl: i32[] = []
+let nlnUse: string[] = []
 
 // The un-inferred empty-collection floor: an un-annotated empty `[]` / `Map()` / `Set()` whose
 // element/key/value hole is never pinned — by an annotation or a downstream `.push`/`.set`/
@@ -12737,6 +12751,14 @@ function isvalReset() {
   ctnLitBindDepth = []
   ctnLitBindName = []
   ctnLitBindInit = []
+  numLitBindDepth = []
+  numLitBindName = []
+  numLitBindDecl = []
+  nlnDiag = []
+  nlnMsg = []
+  nlnText = []
+  nlnDecl = []
+  nlnUse = []
   collRetFnNodes = []
   collapsedAliases = Map()
   annotCollapsed = Map()
@@ -12886,6 +12908,290 @@ function collBindPopTo(depth: i32) {
   bindMarkPopTo(objLitBindDepth, objLitBindName, depth)
   bindMarkPopTo(ctnLitBindDepth, ctnLitBindName, depth)
   while ctnLitBindInit.length > ctnLitBindName.length { ctnLitBindInit.pop() }
+  // Tested inline: a module-level literal keeps this table non-empty in nearly every scope.
+  const nl = numLitBindDepth.length
+  if nl > 0 && numLitBindDepth[nl - 1] >= depth {
+    bindMarkPopTo(numLitBindDepth, numLitBindName, depth)
+    while numLitBindDecl.length > numLitBindName.length { numLitBindDecl.pop() }
+  }
+}
+
+// Is `ix` a numeric literal, possibly negated or parenthesised?
+function exprIsNumLit(ix: i32): boolean {
+  const e = P.nodes[parenPeelIx(ix)]
+  if e is Unary { return e.unOp == "-" && exprIsNumLit(e.unArg) }
+  e is NumLit
+}
+
+// Is `ix` a `let`/`const` with no annotation whose initializer is a numeric literal, or a
+// non-empty list literal of them?
+function letDeclIsUnannotNumLit(ix: i32): boolean {
+  const n = P.nodes[ix]
+  if n is LetDecl {
+    if n.letType >= 0 || n.letInit < 0 { return false }
+    const iv = P.nodes[parenPeelIx(n.letInit)]
+    if iv is ArrayLit {
+      if iv.arrElems.length == 0 { return false }
+      for el in iv.arrElems {
+        if !exprIsNumLit(el) { return false }
+      }
+      return true
+    }
+    return exprIsNumLit(n.letInit)
+  }
+  false
+}
+
+// Can a binding of type `ty` hold a defaulted numeric literal: `f64`, `i32`, or a list? The
+// cheap test every declaration pays before the initializer is read.
+function numLitBindCandidateTy(ty: i32): boolean {
+  if ty == TY_F64 || ty == TY_I32 { return true }
+  if ty < 0 || ty >= T.tys.length { return false }
+  T.tys[ty] is TyArray
+}
+
+// Mark the binding `name` declared by `decl` at `depth` when `letDeclIsUnannotNumLit` holds.
+function markNumLitBinding(name: string, depth: i32, decl: i32) {
+  if !letDeclIsUnannotNumLit(decl) { return 0 }
+  bindMarkPush(numLitBindDepth, numLitBindName, name, depth)
+  numLitBindDecl.push(decl)
+  0
+}
+
+// The declaration of the numeric-literal binding `name` resolves to, or -1. Paired by depth as
+// `ctnLitInitOf` is, so shadowing holds.
+function numLitDeclOf(name: string): i32 {
+  const d = lookupDepth(name)
+  if d < 0 { return -1 }
+  let i = numLitBindName.length - 1
+  while i >= 0 && numLitBindDepth[i] >= d {
+    if numLitBindDepth[i] == d && numLitBindName[i] == name {
+      if i < numLitBindDecl.length { return numLitBindDecl[i] }
+      return -1
+    }
+    i = i - 1
+  }
+  -1
+}
+
+// The name `ix` spells, through parentheses, or "".
+function numLitNameAt(ix: i32): string {
+  const p = parenPeelIx(ix)
+  if p < 0 || p >= P.nodes.length { return "" }
+  const n = P.nodes[p]
+  if n is Ident { return n.identName }
+  ""
+}
+
+// The written value of assignment `n`: its right side, or a compound assignment's operand.
+function numLitAssignedValue(n: BinExpr): i32 {
+  const inner = P.nodes[n.binRight]
+  if n.binCompound != "" && inner is BinExpr { return inner.binRight }
+  n.binRight
+}
+
+// Does call `c` pass a value to list method `prop` that is not a numeric literal? A reader or
+// remover by `collMethodKind`, or a callback-taking walk, stores nothing, so it never counts.
+function numLitCallStoresNonLit(c: Call, prop: string, from: i32): boolean {
+  const k = collMethodKind(prop)
+  if (
+    k == CM_READS
+    || k == CM_RETURNS
+    || k == CM_REMOVES
+    || k == CM_REMOVES_ONE
+  ) {
+    return false
+  }
+  if prop == "map" || prop == "filter" || prop == "slice" || prop == "length" {
+    return false
+  }
+  let i = from
+  while i < c.callArgs.length {
+    if !exprIsNumLit(c.callArgs[i]) { return true }
+    i = i + 1
+  }
+  false
+}
+
+// The subset of `names` the program can store a non-literal through: a whole-name assignment, an
+// element assignment, a storing method call, or an alias (`const b = name`, `x = name`). The
+// suggested annotation would refuse that store, so those notes are dropped. By name, so a
+// shadowing binding counts too; one walk for every queued note.
+function numLitNamesStoredNonLit(
+  names: {[string]: boolean},
+): {[string]: boolean} {
+  const out: {[string]: boolean} = Map()
+  const stack: i32[] = []
+  for s in gRootStmts { stack.push(s) }
+  while stack.length > 0 {
+    const ix = stack[stack.length - 1]
+    stack.pop()
+    const n = P.nodes[ix]
+    let hit = ""
+    if n is BinExpr {
+      if n.binOp == "=" {
+        const tgt = P.nodes[parenPeelIx(n.binLeft)]
+        let tn = numLitNameAt(n.binLeft)
+        if tgt is Index { tn = numLitNameAt(tgt.idxArr) }
+        if tn != "" && !exprIsNumLit(numLitAssignedValue(n)) { hit = tn }
+        const alias = numLitNameAt(n.binRight)
+        if alias != "" { out[alias] = true }
+      }
+    } else if n is LetDecl {
+      if n.letInit >= 0 && n.letType < 0 {
+        const alias = numLitNameAt(n.letInit)
+        if alias != "" { out[alias] = true }
+      }
+    } else if n is Call {
+      const cf = P.nodes[parenPeelIx(n.callFn)]
+      if cf is Member {
+        const rn = numLitNameAt(cf.memObj)
+        if rn != "" && numLitCallStoresNonLit(n, cf.memProp, 0) { hit = rn }
+      } else if cf is Ident && n.callArgs.length > 0 {
+        const rn = numLitNameAt(n.callArgs[0])
+        if rn != "" && numLitCallStoresNonLit(n, cf.identName, 1) { hit = rn }
+      }
+    }
+    if hit != "" && (names[hit] ?? false) { out[hit] = true }
+    for k in nodeChildren(ix) {
+      if k >= 0 && k < P.nodes.length { stack.push(k) }
+    }
+  }
+  out
+}
+
+// Does `msg` name the type `tok` as a whole word, and not as the element of a longer list type?
+function msgNamesTy(msg: string, tok: string): boolean {
+  let i = 0
+  while i + tok.length <= msg.length {
+    if msg.slice(i, i + tok.length) == tok {
+      const j = i + tok.length
+      const before = i == 0 || !isIdentCharAt(msg, i - 1)
+      const after = j >= msg.length || (!isIdentCharAt(msg, j) && msg[j] != '[')
+      if before && after { return true }
+    }
+    i = i + 1
+  }
+  false
+}
+
+// The binding a mismatch's value reads, directly or through one index, or -1.
+function numLitReadIdent(at: i32): i32 {
+  let v = parenPeelIx(at)
+  if v < 0 || v >= P.nodes.length { return -1 }
+  const vn = P.nodes[v]
+  if vn is Index { v = parenPeelIx(vn.idxArr) }
+  if v < 0 || v >= P.nodes.length { return -1 }
+  const id = P.nodes[v]
+  if id is Ident { return v }
+  -1
+}
+
+// The note for a mismatch `msg` at `at` whose value reads a numeric-literal binding, when the
+// message names both the literal's default type and another numeric type the literal also fits;
+// "" otherwise. The annotation it suggests is that other type.
+function numLitDefaultNote(msg: string, at: i32, idIx: i32, decl: i32): string {
+  const id = P.nodes[idIx]
+  const dn = P.nodes[decl]
+  if id is Ident && dn is LetDecl {
+    const viaIndex = parenPeelIx(at) != idIx
+    const bt = lookup(id.identName)
+    if bt < 0 { return "" }
+    let base = bt
+    let list = ""
+    const btt = T.tys[bt]
+    if btt is TyArray {
+      if btt.aRead != 0 { return "" }
+      base = btt.aElem
+      list = "[]"
+    } else if viaIndex {
+      return ""
+    }
+    const bn = primNameOf(base)
+    let cands: string[] = []
+    if bn == "f64" { cands = ["f32"] }
+    if bn == "i32" { cands = ["i64", "f32", "f64"] }
+    let have = tyToStr(bt)
+    if viaIndex { have = tyToStr(base) }
+    if cands.length == 0 || !msgNamesTy(msg, have) { return "" }
+    for c in cands {
+      let want = c
+      if !viaIndex { want = c + list }
+      if msgNamesTy(msg, want) {
+        const nm = demangleName(dn.letName)
+        return " — `"
+          + nm
+          + "` on "
+          + rcwWhere(decl, at)
+          + " has no annotation, so its literal defaulted to `"
+          + tyToStr(bt)
+          + "`; annotate it: `"
+          + exportKwOf(decl)
+          + dn.letKw
+          + " "
+          + nm
+          + ": "
+          + c
+          + list
+          + " = …`"
+      }
+    }
+  }
+  ""
+}
+
+// Queue the note for the diagnostic about to be pushed at index `di`, if it has one.
+function numLitNoteQueue(msg: string, at: i32, di: i32) {
+  if numLitBindName.length == 0 { return 0 }
+  const idIx = numLitReadIdent(at)
+  if idIx < 0 { return 0 }
+  const id = P.nodes[idIx]
+  if id is Ident {
+    const decl = numLitDeclOf(id.identName)
+    if decl < 0 { return 0 }
+    const note = numLitDefaultNote(msg, at, idIx, decl)
+    if note == "" { return 0 }
+    nlnDiag.push(di)
+    nlnMsg.push(msg)
+    nlnText.push(note)
+    nlnDecl.push(decl)
+    nlnUse.push(id.identName)
+  }
+  0
+}
+
+// `export ` when the top-level declaration `decl` carries the keyword, else "".
+function exportKwOf(decl: i32): string {
+  if declHasExportKw(decl) { return "export " }
+  ""
+}
+
+// Append each queued note whose diagnostic survived, unless the binding is one
+// `numLitNamesStoredNonLit` finds a non-literal store to, under its declared or its used name.
+function numLitNotesApply() {
+  if nlnDiag.length == 0 { return 0 }
+  const names: {[string]: boolean} = Map()
+  let j = 0
+  while j < nlnDiag.length {
+    names[nlnUse[j]] = true
+    const dj = P.nodes[nlnDecl[j]]
+    if dj is LetDecl { names[dj.letName] = true }
+    j = j + 1
+  }
+  const stored = numLitNamesStoredNonLit(names)
+  let i = 0
+  while i < nlnDiag.length {
+    const di = nlnDiag[i]
+    const dn = P.nodes[nlnDecl[i]]
+    let keep = di >= 0 && di < T.diags.length && !(stored[nlnUse[i]] ?? false)
+    if keep && dn is LetDecl { keep = !(stored[dn.letName] ?? false) }
+    if keep {
+      const d = T.diags[di]
+      if d.tmsg == nlnMsg[i] { d.tmsg = d.tmsg + nlnText[i] }
+    }
+    i = i + 1
+  }
+  0
 }
 
 // Mark or test a function declaration whose return annotation collapsed. Deduped: pass 1 hoists
@@ -13387,6 +13693,7 @@ function tErrPush(
     if d.tat == at && d.tmsg == msg { return 0 }
     di = di + 1
   }
+  numLitNoteQueue(msg, at, T.diags.length)
   T.diags.push(
     {
       tmsg: msg,
@@ -40982,6 +41289,7 @@ function checkProgramNode(n: Program) {
         if letDeclIsUnannotCtnLit(stmts[mi]) {
           markCtnLitBinding(sm.letName, 0, sm.letInit)
         }
+        markNumLitBinding(sm.letName, 0, stmts[mi])
         moduleGlobals[sm.letName] = true
         if sm.letKw == "const" && sm.letInit >= 0 {
           const cin = P.nodes[parenPeelIx(sm.letInit)]
@@ -44280,6 +44588,7 @@ export function checkProgram(rootIx: i32) {
   rcwRunPending()
   checkProgramEndGetters()
   voidRetRewrite()
+  numLitNotesApply()
   T.diags.length
 }
 
@@ -50216,6 +50525,9 @@ function checkLetDeclNode(n: LetDecl, ix: i32) {
   }
   if !preHoisted && letDeclIsUnannotCtnLit(ix) {
     markCtnLitBinding(n.letName, T.scopes.length - 1, n.letInit)
+  }
+  if !preHoisted && numLitBindCandidateTy(bound) {
+    markNumLitBinding(n.letName, T.scopes.length - 1, ix)
   }
   // D1048's second hint: marks a binding whose type came from a spelling that collapsed a
   // subsumed literal arm. A bare call initializer is the whole rung, deliberately narrow.
