@@ -43738,6 +43738,82 @@ export function nodeTyPrimName(ix: i32) {
   if t is TyPrim { return t.primName }
   ""
 }
+// The inner type of arena type `ty` when it is a `TyNullable` whose inner is resolved, else -1:
+// `nInner` is bound-tested rather than trusted, since an unresolved inner is the hole -1 and
+// `T.tys[-1]` traps (D1440).
+function tyNulInnerTy(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  const t = T.tys[ty]
+  if t is TyNullable {
+    if t.nInner < 0 || t.nInner >= T.tys.length { return -1 }
+    return t.nInner
+  }
+  -1
+}
+
+// The element type of arena type `ty` when it is a `TyArray` whose element is resolved, else -1,
+// bound-tested for the reason `tyNulInnerTy` gives.
+function tyArrElemTy(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  const t = T.tys[ty]
+  if t is TyArray {
+    if t.aElem < 0 || t.aElem >= T.tys.length { return -1 }
+    return t.aElem
+  }
+  -1
+}
+
+// Whether arena type `ty` is a `TyNullable` whose resolved inner is the primitive `p`.
+function tyNulInnerIsPrim(ty: i32, p: PrimName): boolean {
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if t is TyNullable {
+    if t.nInner < 0 || t.nInner >= T.tys.length { return false }
+    const inner = T.tys[t.nInner]
+    if inner is TyPrim { return inner.primName == p }
+  }
+  false
+}
+
+// Whether arena type `ty` is a function type; -1 answers false.
+function tyIsFuncTy(ty: i32): boolean {
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if t is TyFunc { return true }
+  false
+}
+
+// Whether arena type `ty` is a plain declared or inline struct: a `TyObj` that is not a variant
+// member. -1 answers false.
+function tyIsPlainStructTy(ty: i32): boolean {
+  if ty < 0 { return false }
+  if cTyIxSetHas(cVariantMemberTyIxSet, ty) { return false }
+  if cTyIxSetHas(cStructTyIxSet, ty) { return true }
+  const t = T.tys[ty]
+  if t is TyObj { return true }
+  false
+}
+
+// Node `ix`'s recorded type with up to seven one-member `UnionDecl` wrappers peeled, or -1 when it
+// is unrecorded or still wrapped after the bound. A canonicalized object intersection
+// (`{a} & {b}`) arrives as `TyUnion[TyObj]`, so the peel is load-bearing.
+function nodeTyPeelOneMember(ix: i32): i32 {
+  let cur = nodeTyIxOf(ix)
+  let peels = 0
+  while peels < 8 {
+    if cur < 0 { return -1 }
+    const t = T.tys[cur]
+    if t is TyUnion {
+      if t.uMembers.length != 1 { return cur }
+      cur = t.uMembers[0]
+    } else {
+      return cur
+    }
+    peels = peels + 1
+  }
+  -1
+}
+
 // Whether node `ix`'s recorded type is a function type (`TyFunc`). Structural, so a func
 // array (`((i32)=>i32)[]`, a `TyArray`) or a nullable closure (a `TyNullable`) is excluded
 // for free, unlike a depth-aware `=>` test on the rendered name.
@@ -43752,30 +43828,12 @@ export function nodeTyIsFunc(ix: i32) {
 // a ref-list cell whose element is a closure. `aElem` is bound-tested rather than trusted:
 // an unresolved element is the hole `-1`, and `T.tys[-1]` traps (D1440).
 export function nodeTyIsFuncArray(ix: i32) {
-  const ty = nodeTyIxOf(ix)
-  if ty < 0 { return false }
-  const t = T.tys[ty]
-  if t is TyArray {
-    if t.aElem < 0 { return false }
-    if t.aElem >= T.tys.length { return false }
-    const el = T.tys[t.aElem]
-    if el is TyFunc { return true }
-  }
-  false
+  tyIsFuncTy(tyArrElemTy(nodeTyIxOf(ix)))
 }
 // A NULLABLE function (`TyNullable` over `TyFunc`) — the niche twin of `nodeTyIsFunc`, for
 // the `nulclosure` rep. `nInner` is bound-tested for the reason above (D1440).
 export function nodeTyIsNulFunc(ix: i32) {
-  const ty = nodeTyIxOf(ix)
-  if ty < 0 { return false }
-  const t = T.tys[ty]
-  if t is TyNullable {
-    if t.nInner < 0 { return false }
-    if t.nInner >= T.tys.length { return false }
-    const inner = T.tys[t.nInner]
-    if inner is TyFunc { return true }
-  }
-  false
+  tyIsFuncTy(tyNulInnerTy(nodeTyIxOf(ix)))
 }
 // The `primName` of `ty`'s array element, or "" unless `ty` is a `TyArray` whose element is a
 // bare `TyPrim` — the arena twin of the `arrElemNameRaw(name) == "<scalar>"` cut, factored
@@ -43893,15 +43951,7 @@ export function nodeTyWidenedRepName(ix: i32) {
 // Paired with `nodeTyIsNullableString`, which answers a wider question (also accepts a
 // `TyLit` string or an all-string `TyUnion`) — using the wrong one of the pair narrows silently.
 export function nodeTyIsNulString(ix: i32) {
-  const ty = nodeTyIxOf(ix)
-  if ty < 0 { return false }
-  const t = T.tys[ty]
-  if t is TyNullable {
-    if t.nInner < 0 || t.nInner >= T.tys.length { return false }
-    const inner = T.tys[t.nInner]
-    if inner is TyPrim { return inner.primName == "string" }
-  }
-  false
+  tyNulInnerIsPrim(nodeTyIxOf(ix), "string")
 }
 // Whether node `ix`'s recorded type contains a type variable — it is one, or one sits under
 // a constructor (`T[]`, `T | null`, `{v: T}`). Inside a monomorphized instance the operand
@@ -44032,17 +44082,7 @@ function refuseLocalNomEscape(t: i32, at: i32) {
 // it can't trace (a `(boolean | null)[]` element read, an inferred `const`), routing `!=
 // null`/`?? d`/print to the sentinel compare. Mirrors `nodeTyIsNulString`.
 export function nodeTyIsNulBool(ix: i32) {
-  const ty = nodeTyIxOf(ix)
-  if ty < 0 { return false }
-  const t = T.tys[ty]
-  if t is TyNullable {
-    // `nInner` is -1 while the inner type is still a hole (a bare `null` element whose list
-    // never pinned one); unguarded this traps the compiler on a check-clean program (D1440).
-    if t.nInner < 0 || t.nInner >= T.tys.length { return false }
-    const inner = T.tys[t.nInner]
-    if inner is TyPrim { return inner.primName == "boolean" }
-  }
-  false
+  tyNulInnerIsPrim(nodeTyIxOf(ix), "boolean")
 }
 // Whether node `ix`'s type is a nullable numeric scalar (`i32|null`, `i64|null`, `f64|null`,
 // `f32|null`) — its inner has no spare value to niche into, so it reps as the value-union
@@ -44173,20 +44213,9 @@ export function nodeTyIsVariant(ix: i32) {
   false
 }
 
+// Whether node `ix`'s recorded type is a nullable plain struct (`S | null`), a variant excluded.
 export function nodeTyIsNulStruct(ix: i32) {
-  const ty = nodeTyIxOf(ix)
-  if ty < 0 { return false }
-  const t = T.tys[ty]
-  if t is TyNullable {
-    const inner = t.nInner
-    if inner < 0 { return false }
-    if cTyIxSetHas(cVariantMemberTyIxSet, inner) { return false }
-    if cTyIxSetHas(cStructTyIxSet, inner) { return true }
-    const it = T.tys[inner]
-    if it is TyObj { return true }
-    return false
-  }
-  false
+  tyIsPlainStructTy(tyNulInnerTy(nodeTyIxOf(ix)))
 }
 // Whether node `ix`'s recorded type is a union box — a `TyUnion` of more than one member, or a
 // `TyNullable`. A literal union is excluded (an interned i32 atom, not a box). The arena twin
@@ -44216,19 +44245,10 @@ export function nodeTyIsUnionish(ix: i32): boolean {
 // every gap in the name registry (generic instances, `#anon0` shapes) stops mattering. The
 // peel is load-bearing: a canonicalized object intersection (`{a} & {b}`) arrives as `TyUnion[TyObj]`.
 export function nodeTyIsStructish(ix: i32): boolean {
-  let cur = nodeTyIxOf(ix)
-  let peels = 0
-  while peels < 8 {
-    if cur < 0 { return false }
-    const t = T.tys[cur]
-    if t is TyObj { return true }
-    if t is TyUnion {
-      if t.uMembers.length == 1 { cur = t.uMembers[0] } else { return false }
-    } else {
-      return false
-    }
-    peels = peels + 1
-  }
+  const ty = nodeTyPeelOneMember(ix)
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if t is TyObj { return true }
   false
 }
 
@@ -44251,19 +44271,10 @@ export function tyIsU8ArrayTy(ty: i32): boolean {
 // twin of `nameIsArray`, which tested the rendering for a trailing `]` — that test also
 // claimed a union whose last arm is an array, which `nodeTyIsUnionish` now claims first.
 export function nodeTyIsArrayish(ix: i32): boolean {
-  let cur = nodeTyIxOf(ix)
-  let peels = 0
-  while peels < 8 {
-    if cur < 0 { return false }
-    const t = T.tys[cur]
-    if t is TyArray { return true }
-    if t is TyUnion {
-      if t.uMembers.length == 1 { cur = t.uMembers[0] } else { return false }
-    } else {
-      return false
-    }
-    peels = peels + 1
-  }
+  const ty = nodeTyPeelOneMember(ix)
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if t is TyArray { return true }
   false
 }
 
@@ -44328,19 +44339,7 @@ export function nodeTyReachesClosure(ix: i32): boolean {
 // case of the emitter's recursive `nameIsRefArray`. Confirms only the plain struct-element
 // list (element in `cStructTyIxs`, not a variant member); other ref arrays fall to the name path.
 export function nodeTyIsStructArray(ix: i32) {
-  const ty = nodeTyIxOf(ix)
-  if ty < 0 { return false }
-  const t = T.tys[ty]
-  if t is TyArray {
-    const e = t.aElem
-    if e < 0 { return false }
-    if cTyIxSetHas(cVariantMemberTyIxSet, e) { return false }
-    if cTyIxSetHas(cStructTyIxSet, e) { return true }
-    const et = T.tys[e]
-    if et is TyObj { return true }
-    return false
-  }
-  false
+  tyIsPlainStructTy(tyArrElemTy(nodeTyIxOf(ix)))
 }
 // Whether node `ix`'s recorded type is a nullable literal union — the per-node form of
 // `tyIsNullableLitUnion`, the one home of this question. Canon preserves a nullable litunion's
@@ -44964,11 +44963,7 @@ export function nodeTyCanonObjName(ix: i32) {
 // constant. `TyPrim`-only, deliberately: a literal union canon-softens to `string` at several
 // positions, and a caller that wants the softened answer should read the render instead.
 export function nodeTyIsStringPrim(ix: i32): boolean {
-  const ty = nodeTyIxOf(ix)
-  if ty < 0 { return false }
-  const t = T.tys[ty]
-  if t is TyPrim { return t.primName == "string" }
-  false
+  primNameOf(nodeTyIxOf(ix)) == "string"
 }
 
 // The rendered name of the scalar/string type the checker recorded for node `ix` (`"f64"`,
@@ -45265,21 +45260,7 @@ function nodeArrayElemPeelTy(ix: i32) {
 // `(boolean | null)[]` literal). The emitter seeds `pendingNulBool` for such a literal's
 // elements so a `null` element lowers as the sentinel 2.
 export function nodeArrayElemIsNulBool(ix: i32) {
-  const pty = nodeArrayElemPeelTy(ix)
-  if pty < 0 { return false }
-  const t = T.tys[pty]
-  if t is TyArray {
-    const e = t.aElem
-    if e >= 0 {
-      const et = T.tys[e]
-      if et is TyNullable {
-        if et.nInner < 0 || et.nInner >= T.tys.length { return false }
-        const en = T.tys[et.nInner]
-        if en is TyPrim { return en.primName == "boolean" }
-      }
-    }
-  }
-  false
+  tyNulInnerIsPrim(nodeArrayElemTyIx(ix), "boolean")
 }
 
 // Whether node `ix` has a recorded array type whose element is a plain `string` — the
@@ -45287,17 +45268,7 @@ export function nodeArrayElemIsNulBool(ix: i32) {
 // by its first element, so an atom-first literal under a `string[]` annotation built the atom
 // list while the binding's slot held the string wrapper (check-clean invalid wasm without this).
 export function nodeArrayElemIsStr(ix: i32) {
-  const pty = nodeArrayElemPeelTy(ix)
-  if pty < 0 { return false }
-  const t = T.tys[pty]
-  if t is TyArray {
-    const e = t.aElem
-    if e >= 0 {
-      const et = T.tys[e]
-      if et is TyPrim { return et.primName == "string" }
-    }
-  }
-  false
+  primNameOf(nodeArrayElemTyIx(ix)) == "string"
 }
 
 // Whether node `ix` has a recorded array type whose element is a bare string literal — the
@@ -45305,16 +45276,10 @@ export function nodeArrayElemIsStr(ix: i32) {
 // `"a"` is a `TyLit`, not a `TyUnion` (D1460). The list this reps as is the string one, not the
 // atom one, so it is a sibling of `nodeArrayElemIsStr` rather than of the litunion exclusion.
 export function nodeArrayElemIsBareStrLit(ix: i32) {
-  const pty = nodeArrayElemPeelTy(ix)
-  if pty < 0 { return false }
-  const t = T.tys[pty]
-  if t is TyArray {
-    const e = t.aElem
-    if e >= 0 {
-      const et = T.tys[e]
-      if et is TyLit { return et.litKind == "str" }
-    }
-  }
+  const e = nodeArrayElemTyIx(ix)
+  if e < 0 { return false }
+  const et = T.tys[e]
+  if et is TyLit { return et.litKind == "str" }
   false
 }
 
@@ -45322,21 +45287,7 @@ export function nodeArrayElemIsBareStrLit(ix: i32) {
 // stored `(ref null $sTypeIdx)`, so a read `p[i]` stays nullable rather than recovering
 // non-null the way a plain `string[]` element does. Mirrors `nodeArrayElemIsNulBool`.
 export function nodeArrayElemIsNulStr(ix: i32) {
-  const pty = nodeArrayElemPeelTy(ix)
-  if pty < 0 { return false }
-  const t = T.tys[pty]
-  if t is TyArray {
-    const e = t.aElem
-    if e >= 0 {
-      const et = T.tys[e]
-      if et is TyNullable {
-        if et.nInner < 0 || et.nInner >= T.tys.length { return false }
-        const en = T.tys[et.nInner]
-        if en is TyPrim { return en.primName == "string" }
-      }
-    }
-  }
-  false
+  tyNulInnerIsPrim(nodeArrayElemTyIx(ix), "string")
 }
 
 // Whether node `ix` has a recorded array type whose element is `K | null` (a literal union
