@@ -530,6 +530,7 @@ import {
   monoInstFe,
   monoInstOrig,
   monoOrigNode,
+  monoParamPinTy,
   msGen,
   msRowChain,
   msSetByText,
@@ -26206,6 +26207,13 @@ export function mapTwinNotePattern(ty: i32) {
   0
 }
 
+// `mapTwinNotePattern` over `ty` when it is a union; any other type registers nothing.
+export function mapTwinNoteUnionTy(ty: i32) {
+  if ty < 0 || ty >= T.tys.length { return 0 }
+  if T.tys[ty] is TyUnion { return mapTwinNotePattern(ty) }
+  0
+}
+
 // Whether the map `ty` stores one i32 cell per key — a Set, or a value the checker reps so —
 // the maps that share a mono struct; any other value takes its own slot and struct.
 function mapArmIsI32Cell(ty: i32): boolean {
@@ -26274,6 +26282,40 @@ export function mapArmTagOfTy(ty: i32, sh: i32): i32 {
   -1
 }
 
+// How many distinct non-null members the union `ty` has (1 for `A | A | null`, whose rep is
+// the one member's niche); 0 for -1.
+function tyDistinctNonNullMembers(ty: i32): i32 {
+  if ty < 0 { return 0 }
+  const flat: i32[] = []
+  flattenVariantsInto(ty, flat)
+  const seen: i32[] = []
+  let i = 0
+  while i < flat.length {
+    const m = unMemPeelAliasWrapper(flat[i])
+    let isNull = false
+    if m >= 0 {
+      const mt = T.tys[m]
+      if mt is TyPrim { isNull = mt.primName == "null" }
+    }
+    if m >= 0 && !isNull {
+      let dup = false
+      let j = 0
+      while j < seen.length {
+        if tyEq(seen[j], m) { dup = true }
+        j = j + 1
+      }
+      if !dup { seen.push(m) }
+    }
+    i = i + 1
+  }
+  seen.length
+}
+
+// Whether two map types are the one type, alias peeled; a Set is never its boolean map.
+export function mapTwinExact(a: i32, b: i32): boolean {
+  tyEq(unMemPeelAliasWrapper(a), unMemPeelAliasWrapper(b))
+}
+
 // Whether the map `patTy` a test names is not the map `heldTy` a nullable niche holds, so the
 // test is false whatever the niche is: a niche carries no tag, only non-null.
 export function mapNicheLacks(heldTy: i32, patTy: i32): boolean {
@@ -26281,6 +26323,8 @@ export function mapNicheLacks(heldTy: i32, patTy: i32): boolean {
   const h = unMemPeelAliasWrapper(heldTy)
   const p = unMemPeelAliasWrapper(patTy)
   if tyEq(h, p) { return false }
+  // A spelling renders a Set as its boolean map, so the two are told apart only by the pin.
+  if mapSetSpelledAs(h, p) || mapSetSpelledAs(p, h) { return false }
   // A pinned annotation spells a literal-union value by its base, so a literal value on either
   // side is told apart from the other only by a differing base.
   const hv = tyMapValOf(h)
@@ -26306,14 +26350,75 @@ function mapValBase(v: i32): string {
   tyToEmitName(v)
 }
 
+// The map an un-narrowed instance parameter `exprIx` is pinned at, read from the pin itself
+// (`monoParamPinTy`) rather than its spelling, which renders a Set as its boolean map and a
+// literal-union value by its base; -1 for any other expression.
+export function mapPinnedParamTyOf(exprIx: i32, fnIx: i32): i32 {
+  mapPinnedParamTyAt(exprIx, fnIx, 4)
+}
+
+// `mapPinnedParamTyOf` through at most `depth` `const` locals initialized from another name.
+function mapPinnedParamTyAt(exprIx: i32, fnIx: i32, depth: i32): i32 {
+  const ax = unwrapParen(exprIx)
+  if ax < 0 || depth <= 0 { return -1 }
+  const n = P.nodes[ax]
+  if n is Ident {
+    if narrowSlotOf(n.identName) >= 0 { return -1 }
+    const ptn = paramTypeNode(fnIx, n.identName)
+    if ptn >= 0 { return mapTyPeel(monoParamPinTy.get(ptn) ?? -1) }
+    if fnIx >= 0 {
+      const fd = P.nodes[fnIx]
+      if fd is FuncDecl {
+        const li = parentLetOf(fd.fnBody, n.identName)
+        if li >= 0 {
+          const ld = P.nodes[li]
+          if ld is LetDecl {
+            if ld.letKw == "const" {
+              return mapPinnedParamTyAt(ld.letInit, fnIx, depth - 1)
+            }
+          }
+        }
+      }
+    }
+  }
+  -1
+}
+
+// Whether an instance parameter of `fnIx` is pinned at a map a spelling cannot name exactly
+// (a Set, or a literal-union value), so a map type read from a spelling there may be either.
+export function fnHasInexactMapPin(fnIx: i32): boolean {
+  if fnIx < 0 { return false }
+  const fd = P.nodes[fnIx]
+  if fd is FuncDecl {
+    let i = 0
+    while i < fd.fnParams.length {
+      const pn = P.nodes[fd.fnParams[i]]
+      if pn is Param {
+        if pn.parType >= 0 {
+          const pt = mapTyPeel(monoParamPinTy.get(pn.parType) ?? -1)
+          if pt >= 0 {
+            const t = T.tys[pt]
+            if t is TyMap {
+              if t.mSet == 1 || tyIsLitUnion(t.mVal) { return true }
+              if t.mVal >= 0 && t.mVal < T.tys.length {
+                if T.tys[t.mVal] is TyLit { return true }
+              }
+            }
+          }
+        }
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+
 // The static map type of the map-valued expression `exprIx`, or -1: its recorded type, else —
 // inside a generic instance, whose clone nodes carry the parameter — a narrowing's arm, or the
 // pinned annotation of the parameter or local it names.
 export function mapValueTyOf(exprIx: i32, fnIx: i32): i32 {
   const ax = unwrapParen(exprIx)
   if ax < 0 { return -1 }
-  const own = mapTyPeel(nodeTyIxOf(ax))
-  if own >= 0 { return own }
   const n = P.nodes[ax]
   if n is Ident {
     const ni = narrowSlotOf(n.identName)
@@ -26321,6 +26426,12 @@ export function mapValueTyOf(exprIx: i32, fnIx: i32): i32 {
       const nt = mapTyPeel(narrowSlotTy(ni))
       if nt >= 0 { return nt }
     }
+    const pp = mapPinnedParamTyOf(ax, fnIx)
+    if pp >= 0 { return pp }
+  }
+  const own = mapTyPeel(nodeTyIxOf(ax))
+  if own >= 0 { return own }
+  if n is Ident {
     const pt = mapTyPeel(nodeTyIxOf(paramTypeNode(fnIx, n.identName)))
     if pt >= 0 { return pt }
     if fnIx >= 0 {
@@ -36580,7 +36691,12 @@ export function letIsNulMap(letIx: i32, fnIx: i32) {
       if retNulMapFlag(d.letType) == 1 { return true }
       // A union annotation is the box its initializer is coerced into, however the
       // initializer reps alone (`if c { m } else { null }` is a nullable map) (D2683).
-      if annRepKindOf(d.letType) == "union" { return false }
+      if (
+        annRepKindOf(d.letType) == "union"
+        && tyDistinctNonNullMembers(nodeTyIxOf(d.letType)) > 1
+      ) {
+        return false
+      }
     }
     return exprNullableMap(d.letInit, fnIx)
   }
