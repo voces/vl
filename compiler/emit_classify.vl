@@ -11337,6 +11337,9 @@ function anonValueFitsField(vc: i32, sc: i32, valIx: i32, si: i32, mfi: i32) {
     return true
   }
   if vc == sc {
+    // Code 0 holds `i32`, `boolean` and a string literal union's atom alike, and a read
+    // formats by the row, so an anon row keeps them apart (D2841).
+    if anonRow && vc == FC_I32 { return anonRowScalarFits(valIx, si, mfi) }
     // A named-heap field (`fieldCodeRefsElemHeapC`: a nested struct, a ref list, its `| null`
     // niche) must also agree on which ELEMENT — the code alone does not name the heap type, so
     // two anon rows can field-set and code match while emitting different layouts (D1689).
@@ -11363,8 +11366,13 @@ function anonValueFitsField(vc: i32, sc: i32, valIx: i32, si: i32, mfi: i32) {
   }
   if vc == FC_STR {
     // A code-0 field is a plain i32/boolean slot unless it's a literal-union atom slot
-    // (recorded in `sFieldElemName`), which a string literal legitimately writes.
-    if sc == FC_I32 { return sFieldElemNameAt(si, mfi) != "" }
+    // (recorded in `sFieldElemName`), which a string literal legitimately writes. An anon
+    // row's atom slot takes only a literal among its members; any other string is its own row.
+    if sc == FC_I32 {
+      if sFieldElemNameAt(si, mfi) == "" { return false }
+      if anonRow { return anonAtomFieldTakesStr(valIx, si, mfi) }
+      return true
+    }
     // `string | null` (the same ref, nullable) and `K | null` (a string literal names
     // the atom) are the two niches a string value fills.
     if sc == FC_NUL_STR { return true }
@@ -11452,6 +11460,10 @@ function declRowScalarFits(valIx: i32, si: i32, mfi: i32): boolean {
   if si < 0 || si >= sTyIx.length { return true }
   if mfi < 0 || mfi >= sFieldCount[si] { return true }
   const fty = tyFieldTyOf(sTyIx[si], sFieldNames[sFieldStart[si] + mfi])
+  // The anon row's comparator first, so the two readers cannot disagree on a known kind.
+  const fk = code0KindOf(fty)
+  const vk = code0KindOf(nodeTyIxOf(valIx))
+  if fk != 0 && vk != 0 { return fk == vk }
   const vp = tyPrimNameOf(nodeTyIxOf(valIx))
   if vp == null || fty < 0 { return true }
   const fp = tyPrimNameOf(fty)
@@ -11460,6 +11472,75 @@ function declRowScalarFits(valIx: i32, si: i32, mfi: i32): boolean {
     return numLitUnionBaseTy(fty) >= 0
   }
   true
+}
+
+// `declRowScalarFits`' anonymous-row twin, symmetric because both sides come from literals:
+// a `boolean`, an `i32` and a string literal set are three code-0 kinds, and two known kinds
+// fit only when equal. A kind this cannot name (a hole, a numeric literal set) stays lenient.
+function anonRowScalarFits(valIx: i32, si: i32, mfi: i32): boolean {
+  if si < 0 || si >= sTyIx.length { return true }
+  if mfi < 0 || mfi >= sFieldCount[si] { return true }
+  const fk = code0KindOf(
+    tyFieldTyOf(sTyIx[si], sFieldNames[sFieldStart[si] + mfi]),
+  )
+  const vk = code0KindOf(nodeTyIxOf(valIx))
+  if fk == 0 || vk == 0 { return true }
+  fk == vk
+}
+
+// The code-0 kind of type `ty`: 1 `i32`, 2 `boolean`, 3 a string literal or literal set, 0
+// for anything else, which no caller refutes on.
+function code0KindOf(ty: i32): i32 {
+  if ty < 0 { return 0 }
+  const p = tyPrimNameOf(ty)
+  if p != null {
+    // Exhaustive over `PrimName` and `_`-less: only two prims are code-0 kinds.
+    match p {
+      "i32" => {
+        return 1
+      }
+      "boolean" => {
+        return 2
+      }
+      "string" | "i64" | "f64" | "f32" | "v128" | "void" | "null" | "never" | "u8" => {
+        return 0
+      }
+    }
+  }
+  if tyIsLitUnionOrLit(ty) { return 3 }
+  0
+}
+
+// Whether the string value at `valIx` is a string literal naming a member of anon row `si`'s
+// atom field `mfi`; an unknown field type stays lenient.
+function anonAtomFieldTakesStr(valIx: i32, si: i32, mfi: i32): boolean {
+  if si < 0 || si >= sTyIx.length { return true }
+  const fty = tyFieldTyOf(sTyIx[si], sFieldNames[sFieldStart[si] + mfi])
+  if fty < 0 { return true }
+  const v = P.nodes[unwrapParen(valIx)]
+  if v is StrLit {
+    const texts = tyLitMemberTexts(fty)
+    let i = 0
+    while i < texts.length {
+      if texts[i] == v.strText { return true }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// Whether a code-0 field spelled `text` may share row `si`'s field `fi`: false only when the
+// spelling and the row's own field type are two different known code-0 kinds.
+function code0TextFitsRow(text: string, si: i32, fi: i32): boolean {
+  if si < 0 || si >= sTyIx.length { return true }
+  let tk = 0
+  if text == "i32" { tk = 1 }
+  if text == "boolean" { tk = 2 }
+  if tk == 0 { return true }
+  const rk = code0KindOf(
+    tyFieldTyOf(sTyIx[si], sFieldNames[sFieldStart[si] + fi]),
+  )
+  rk == 0 || rk == tk
 }
 
 // Does an array literal coded `vc` re-encode into a `sc` list by widening each element: an
@@ -19093,6 +19174,12 @@ function shapeRowScanK(fnames: string[], ftypes: string[], lenient: i32): i32 {
           )
         ) {
           ok = false
+        } else if (
+          sFieldTypeAt(si2, fj) == FC_I32
+          && !code0TextFitsRow(ftypes[k], si2, fj)
+        ) {
+          // The code-0 split the literal side makes, from the render (D2841).
+          ok = false
         }
         k = k + 1
       }
@@ -25716,6 +25803,9 @@ function annShapeIndexOf(names: string[], codes: i32[], texts: string[]) {
           } else if codes[i] == FC_I32_LIST && nameIsLitUnionArray(texts[i]) {
             // The atom-array sibling: same shared-layout split — the atom-element context
             // is per-row (`sFieldIsLitUnionArray`), so the rows must stay distinct.
+            allIn = false
+          } else if codes[i] == FC_I32 && !code0TextFitsRow(texts[i], si, fi) {
+            // `i32` and `boolean` share code 0 too, and a read formats by the row (D2841).
             allIn = false
           } else if !sFieldCloSigCompat(si, fi, codes[i], texts[i]) {
             // Signature-identity split, the closure field's twin of the two atom splits
