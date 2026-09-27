@@ -3529,6 +3529,12 @@ let nodeRepTyIx: i32[] = []
 // Per node, the map type a union of maps is delivered as (D2692): the members share that map's
 // storage, so the emitter unboxes the union's payload there. -1 where nothing is recorded.
 let mapUnboxTyIx: i32[] = []
+// Per node, the retag rows of a union delivered into a union lacking one of its map members
+// (`recordMapRetag`): the first row and the count, over the two parallel type columns.
+let mapRetagAt: {[i32]: i32} = Map()
+let mapRetagN: {[i32]: i32} = Map()
+let mapRetagFromTy: i32[] = []
+let mapRetagToTy: i32[] = []
 // Literal-width sidecar, parallel to `nodeTyIx`: true at a radix `NumLit` whose destination is a
 // 64-bit slot, so its bit pattern is read at 64 bits rather than at the width its digits imply.
 // `checkNodeReal` consults it so a re-check keeps the adopted width, and the emitter reads the
@@ -4469,6 +4475,10 @@ export function initChecker() {
   isParentElseTyIx = []
   nodeRepTyIx = []
   mapUnboxTyIx = []
+  mapRetagAt = Map()
+  mapRetagN = Map()
+  mapRetagFromTy = []
+  mapRetagToTy = []
   litWide64 = []
   extValueSeen = false
   ckCalleeIx = -1
@@ -21568,13 +21578,17 @@ function containerElemClassDiffers(se: i32, de: i32): boolean {
   sc != dc
 }
 
-// Whether a map value `se` delivered as `de` changes storage though both are references: a
-// value stored bare against a union of two or more non-null members, which is stored boxed.
+// Whether a map value `se` delivered as `de` changes storage though both store as references:
+// a value stored bare against a union of two or more non-null members, which is stored boxed.
+// Any other storage class (a literal union is one atom id) is `containerElemClassDiffers`'s.
 function mapValBoxDiffers(se: i32, de: i32): boolean {
   if se < 0 || de < 0 || se >= T.tys.length || de >= T.tys.length {
     return false
   }
   if tyReachesHole(se, 8) || tyReachesHole(de, 8) { return false }
+  if elemStoreClassOf(se, 8) != ESC_REF || elemStoreClassOf(de, 8) != ESC_REF {
+    return false
+  }
   refLeafCount(de, 8) >= 2 && refLeafCount(se, 8) < 2
 }
 
@@ -43546,11 +43560,100 @@ function recordMapUnbox(srcExpr: i32, srcTy: i32, dstIn: i32, depth: i32) {
       mapUnboxTyIx[srcExpr] = dstTy
       return 0
     }
-    // No other destination is one map a union of maps can be delivered as.
-    TyPrim | TyErr | TyFunc | TyUnion | TyVar | TyLit | TyNeg | TyNullable => {
+    TyUnion => {
+      return recordMapRetag(srcExpr, srcTy, dstTy)
+    }
+    // No other destination holds a map a union of maps can be delivered as.
+    TyPrim | TyErr | TyFunc | TyVar | TyLit | TyNeg | TyNullable => {
       return 0
     }
   }
+}
+
+// Records, for a union `srcTy` delivered into the union `dstTy`, each map member the
+// destination lacks beside the destination member it is assignable to: a box built under the
+// source member must carry that member's tag in the destination (`mapRetagRowsOf`).
+function recordMapRetag(srcExpr: i32, srcTy: i32, dstTy: i32) {
+  if !(T.tys[srcTy] is TyUnion) { return 0 }
+  const sm: i32[] = []
+  unionLeavesInto(srcTy, sm, 8)
+  const dm: i32[] = []
+  unionLeavesInto(dstTy, dm, 8)
+  const start = mapRetagFromTy.length
+  let i = 0
+  while i < sm.length {
+    const a = sm[i]
+    if T.tys[a] is TyMap && !tyAmong(a, dm) {
+      let j = 0
+      let found = false
+      while j < dm.length && !found {
+        if T.tys[dm[j]] is TyMap && assignable(a, dm[j]) {
+          mapRetagFromTy.push(a)
+          mapRetagToTy.push(dm[j])
+          found = true
+        }
+        j = j + 1
+      }
+    }
+    i = i + 1
+  }
+  if mapRetagFromTy.length > start {
+    mapRetagAt.set(srcExpr, start)
+    mapRetagN.set(srcExpr, mapRetagFromTy.length - start)
+  }
+  0
+}
+
+// The non-null members of `ty`, through nested unions and `| null`, into `out`.
+function unionLeavesInto(ty: i32, out: i32[], depth: i32) {
+  if ty < 0 || ty >= T.tys.length || depth <= 0 { return 0 }
+  const t = T.tys[ty]
+  if t is TyUnion {
+    let i = 0
+    while i < t.uMembers.length {
+      unionLeavesInto(t.uMembers[i], out, depth - 1)
+      i = i + 1
+    }
+    return 0
+  }
+  if t is TyNullable { return unionLeavesInto(t.nInner, out, depth - 1) }
+  if !isNullTy(ty) { out.push(ty) }
+  0
+}
+
+// Whether `ty` is `tyEq` to one of `tys`.
+function tyAmong(ty: i32, tys: i32[]): boolean {
+  let i = 0
+  while i < tys.length {
+    if tyEq(ty, tys[i]) { return true }
+    i = i + 1
+  }
+  false
+}
+
+// The retag rows `recordMapRetag` recorded at `ix`, pushed onto `from` and `to`.
+export function mapRetagRowsOf(ix: i32, from: i32[], to: i32[]) {
+  const st = mapRetagAt.get(ix) ?? -1
+  if st < 0 { return 0 }
+  const n = mapRetagN.get(ix) ?? 0
+  let i = st
+  while i < st + n && i < mapRetagFromTy.length {
+    from.push(mapRetagFromTy[i])
+    to.push(mapRetagToTy[i])
+    i = i + 1
+  }
+  0
+}
+
+// Every retag row recorded in the program, pushed onto `from` and `to`.
+export function mapRetagAllRows(from: i32[], to: i32[]) {
+  let i = 0
+  while i < mapRetagFromTy.length {
+    from.push(mapRetagFromTy[i])
+    to.push(mapRetagToTy[i])
+    i = i + 1
+  }
+  0
 }
 
 // `recordMapUnbox` over each element of a list literal `srcExpr` delivered as `elemTy[]`.

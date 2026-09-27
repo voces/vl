@@ -54,6 +54,7 @@ import {
   isNumIntrinsicName,
   isValueUnionName,
   isVarTyIxOf,
+  mapRetagRowsOf,
   mapUnboxTyOf,
   matchScrutAt,
   memOffsetLexValue,
@@ -812,6 +813,7 @@ import {
   mapReadScalarBoxKindTy,
   mapRecvScalarBoxKindTy,
   mapRetExprShape,
+  mapRetagTagPairs,
   mapShapeOfExpr,
   mapShapeTwinned,
   mapSlotTag,
@@ -13983,6 +13985,49 @@ function emitMapUnionPayload(body: u8[], exprIx: i32, dstTy: i32, fnIx: i32) {
   0
 }
 
+// A union box delivered into a union lacking one of its map members (D2690): a box tagged
+// with such a member takes the tag of the destination member it is assignable to, so `is`,
+// `match` and `as` in the destination read the member it holds there.
+function emitMapRetag(
+  body: u8[],
+  exprIx: i32,
+  from: i32[],
+  to: i32[],
+  fnIx: i32,
+) {
+  const fromTags: i32[] = []
+  const toTags: i32[] = []
+  mapRetagTagPairs(from, to, fromTags, toTags)
+  const held = mapUnboxHeld
+  mapUnboxHeld = exprIx
+  const boxed = exprUnion(exprIx, fnIx)
+  const r = emitExpr(body, exprIx, fnIx)
+  mapUnboxHeld = held
+  if r < 0 || !boxed || fromTags.length == 0 { return r }
+  fbLocalSet(unionAsSlot)
+  let i = 0
+  while i < fromTags.length {
+    fbLocalGet(unionAsSlot)
+    fbStructGet(uBoxIdx, 0)
+    fbI32Const(fromTags[i])
+    fbI32Bin(70) // i32.eq
+    fbIfRefNul(uBoxIdx, false)
+    fbI32Const(toTags[i])
+    fbLocalGet(unionAsSlot)
+    fbStructGet(uBoxIdx, 1)
+    fbStructNew(uBoxIdx)
+    fbElse()
+    i = i + 1
+  }
+  fbLocalGet(unionAsSlot)
+  let e = 0
+  while e < fromTags.length {
+    fbEnd()
+    e = e + 1
+  }
+  0
+}
+
 export function emitExpr(body: u8[], exprIx: i32, fnIx: i32) {
   // Stop after a recorded failure: `emitFail` banks the first message and returns -1 but
   // does not halt the pass, so a caller that drops the -1 keeps emitting over invalidated
@@ -13993,6 +14038,12 @@ export function emitExpr(body: u8[], exprIx: i32, fnIx: i32) {
   if exprIx != mapUnboxHeld {
     const mub = mapUnboxTyOf(exprIx)
     if mub >= 0 { return emitMapUnionPayload(body, exprIx, mub, fnIx) }
+    const rtFrom: i32[] = []
+    const rtTo: i32[] = []
+    mapRetagRowsOf(exprIx, rtFrom, rtTo)
+    if rtFrom.length > 0 {
+      return emitMapRetag(body, exprIx, rtFrom, rtTo, fnIx)
+    }
   }
   // A string-repped literal union reaching an atom-typed destination narrows to its
   // interned id here — one hook rather than one per destination, since `pendingLitUnion`
