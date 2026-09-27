@@ -250,6 +250,24 @@ import {
   FC_STRUCT,
   FC_STR_LIST,
   FC_UNION,
+  LBK_I32_LIST,
+  LBK_REF,
+  LBK_STR_LIST,
+  MVK_CLOSURE,
+  MVK_REF,
+  MVK_STRUCT,
+  MVK_UNION,
+  RLK_CLOSURE,
+  RLK_F32_LIST,
+  RLK_F64_LIST,
+  RLK_I32_LIST,
+  RLK_I64_LIST,
+  RLK_MAP,
+  RLK_REF_LIST,
+  RLK_STRUCT,
+  RLK_STR_LIST,
+  RLK_U8_LIST,
+  RLK_UNION,
   VKind,
   aTypeIdx,
   aUsed,
@@ -676,6 +694,7 @@ import {
   mvSlotByValNameK,
   nameFieldCode,
   nameFieldCodeTy,
+  nameFreeToModule,
   nameIsNulRefList,
   nameIsRefArray,
   nameIsWholeSpanShape,
@@ -1405,7 +1424,7 @@ function dstPinAnnIn(
     const dstN: string[] = []
     const dstT: i32[] = []
     if retIx >= 0 { dstPinRetDest(bodyIx, retIx, letIx, dstN, dstT) }
-    dstPinScan(bodyIx, bodyIx, letIx, dstN, dstT)
+    dstPinScan(bodyIx, bodyIx, fnIx, letIx, dstN, dstT)
     dstPinCallerDests(letIx, fnIx, rootIx, dstN, dstT)
     if dstN.length == 0 { return 0 }
     const pinName = dstN[0]
@@ -1464,25 +1483,26 @@ function dstPinCallerDests(
       if ofx != fnIx {
         const ofn = P.nodes[ofx]
         if ofn is FuncDecl {
-          dstPinScan(ofn.fnBody, ofn.fnBody, letIx, outN, outT)
+          dstPinScan(ofn.fnBody, ofn.fnBody, ofx, letIx, outN, outT)
         }
       }
       fe = fe + 1
     }
     // The module's own statements, with the program node as the scope: `dstPinScan` skips a
     // `FuncDecl` child, so the top-level walk never sees a function's body twice.
-    dstPinScan(rootIx, rootIx, letIx, outN, outT)
+    dstPinScan(rootIx, rootIx, -1, letIx, outN, outT)
   }
   0
 }
 
-// Collect, into the parallel `outN` / `outT`, the pin name every destination inside `ix`
-// demands of the binding at `letIx`, and the annotation node to source its recorded type from
-// (-1 = mint from the name); a destination with no nominal claim pushes "". `bodyIx` is the
-// scope chains resolve in, and no nested `FuncDecl` is entered: a shadow would fake a delivery.
+// Collect into `outN` / `outT` the pin name each destination inside `ix` demands of the
+// binding at `letIx` and the annotation node its type comes from (-1: mint from the name; "":
+// no nominal claim). `bodyIx` is the scope, `scopeFn` its function (-1 for the module), and a
+// nested `FuncDecl` is not entered: a shadow would fake a delivery.
 function dstPinScan(
   ix: i32,
   bodyIx: i32,
+  scopeFn: i32,
   letIx: i32,
   outN: string[],
   outT: i32[],
@@ -1496,7 +1516,7 @@ function dstPinScan(
   // another's cells and no cell needs two.
   dstPinGlobalAssign(ix, bodyIx, letIx, outN, outT)
   dstPinLocalDest(ix, bodyIx, letIx, outN, outT)
-  dstPinCallArgs(ix, bodyIx, letIx, outN, outT)
+  dstPinCallArgs(ix, bodyIx, scopeFn, letIx, outN, outT)
   dstPinMapValue(ix, bodyIx, letIx, outN, outT)
   // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
   let cur = ix
@@ -1504,13 +1524,13 @@ function dstPinScan(
     if cur != ix {
       dstPinGlobalAssign(cur, bodyIx, letIx, outN, outT)
       dstPinLocalDest(cur, bodyIx, letIx, outN, outT)
-      dstPinCallArgs(cur, bodyIx, letIx, outN, outT)
+      dstPinCallArgs(cur, bodyIx, scopeFn, letIx, outN, outT)
       dstPinMapValue(cur, bodyIx, letIx, outN, outT)
     }
     const kids = nodeSpineChildren(cur)
     let k = 0
     while k < kids.length {
-      dstPinScan(kids[k], bodyIx, letIx, outN, outT)
+      dstPinScan(kids[k], bodyIx, scopeFn, letIx, outN, outT)
       k = k + 1
     }
     cur = elseIfLink(cur)
@@ -1947,6 +1967,7 @@ function dstPinMapValue(
 function dstPinCallArgs(
   ix: i32,
   bodyIx: i32,
+  scopeFn: i32,
   letIx: i32,
   outN: string[],
   outT: i32[],
@@ -1955,7 +1976,11 @@ function dstPinCallArgs(
   if n is Call {
     const cf = P.nodes[unwrapParen(n.callFn)]
     if cf is Ident {
-      const cfe = fnIndexOf(cf.identName)
+      // A parameter or local of the callee's name shadows the module function (D2704).
+      let cfe = -1
+      if nameFreeToModule(scopeFn, cf.identName) {
+        cfe = fnIndexOf(cf.identName)
+      }
       if cfe >= 0 && cfe < fnStmts.length {
         const cfn = P.nodes[fnStmts[cfe]]
         if cfn is FuncDecl {
@@ -4351,18 +4376,18 @@ function collectMemberPopRefSlotsIf(ifIx: i32, fnIx: i32) {
 // its own frame. The three older cores reserve through their own flags and stop.
 function leqgNoteRep(kind: i32, slot: i32, depth: i32) {
   if depth > 32 { return 0 }
-  if kind == 0 {
+  if kind == LBK_I32_LIST {
     fnUsesListEqI = true
     return 0
   }
-  if kind == 3 {
+  if kind == LBK_STR_LIST {
     fnUsesListEqS = true
     // The per-element string compares stage operands in the string-op frame.
     fnUsesStrOp = true
     return 0
   }
-  if kind == 1 && slot >= 0 && slot < rlElemKindTbl.length {
-    if rlElemKindTbl[slot] == 4 {
+  if kind == LBK_REF && slot >= 0 && slot < rlElemKindTbl.length {
+    if rlElemKindTbl[slot] == RLK_I32_LIST {
       // The `i32[][]` core, which recurses into the i32 one.
       fnUsesListEqI = true
       let ri = 0
@@ -4439,7 +4464,7 @@ function leqNoteVariantFields(vi: i32) {
         const en = uFieldElemName[start + j]
         if en != "" {
           const rs = rlSlotByNameKeyTy(en, 0 - 1)
-          if rs >= 0 { leqgNoteRep(1, rs, 0) }
+          if rs >= 0 { leqgNoteRep(LBK_REF, rs, 0) }
         }
       }
       const lk = eqVariantListFieldKind(c)
@@ -4525,7 +4550,7 @@ function leqNoteBin(binIx: i32, fnIx: i32) {
         const en = sFieldElemNameAt(eqRow, fj)
         if en != "" {
           const rs = rlSlotByNameKeyTy(en, -1)
-          if rs >= 0 { leqgNoteRep(1, rs, 0) }
+          if rs >= 0 { leqgNoteRep(LBK_REF, rs, 0) }
         }
       }
       // …and a scalar-backed list field needs one for the same reason (D1020): the cores exist
@@ -4988,16 +5013,16 @@ export function mAssignTypeIndices(_n: i32) {
   while rss < rlElemName.length {
     const rsk = rlElemKindTbl[rss]
     let sig = "u:" + i32ToStr(rss) // default: unique (no dedup)
-    if rsk == 2 {
+    if rsk == RLK_UNION {
       sig = "h:" + i32ToStr(uBoxIdx)
-    } else if rsk == 4 {
+    } else if rsk == RLK_I32_LIST {
       sig = "h:" + i32ToStr(lTypeIdx)
-    } else if rsk == 5 || isScalarBackedListRep(rlElemListRep(rsk)) {
+    } else if rsk == RLK_CLOSURE || isScalarBackedListRep(rlElemListRep(rsk)) {
       sig = "k:" + i32ToStr(rsk)
-    } else if rsk == 9 {
+    } else if rsk == RLK_REF_LIST {
       const inner = rlElemInnerSlot(rss)
       if inner >= 0 { sig = "9:" + i32ToStr(rlTwin[inner]) }
-    } else if rsk == 3 {
+    } else if rsk == RLK_MAP {
       // A map element. A mono map element resolves the shared `mStructIdxPre`; a typed-value
       // one resolves its value slot's `mvMapTypeIdx`, whose twin decision is knowable here from
       // the canonical value slot (`mvCanonRepOf`). A nullable map element strips to its inner
@@ -5062,9 +5087,9 @@ export function mAssignTypeIndices(_n: i32) {
       rlBackIdx[rs] = mAllocType()
       rlWrapIdx[rs] = mAllocType()
     }
-    if rlElemKindTbl[rs] == 2 {
+    if rlElemKindTbl[rs] == RLK_UNION {
       rlElemHeap[rs] = uBoxIdx
-    } else if rlElemKindTbl[rs] == 3 {
+    } else if rlElemKindTbl[rs] == RLK_MAP {
       // A map-struct element. The mono map (i32, boolean or atom value) is the shared
       // `mStructIdxPre`; a typed-value map element has its own map struct (`mvMapTypeIdx`,
       // minted after this loop) and is deferred to the second pass below. This is the
@@ -5087,22 +5112,22 @@ export function mAssignTypeIndices(_n: i32) {
       } else {
         rlElemHeap[rs] = 0
       }
-    } else if rlElemKindTbl[rs] == 4 {
+    } else if rlElemKindTbl[rs] == RLK_I32_LIST {
       // An `i32[][]` slot's element is the i32-list WRAPPER (interned just above,
       // so `lTypeIdx` is already assigned).
       rlElemHeap[rs] = lTypeIdx
     } else if (
-      rlElemKindTbl[rs] == 6
-      || rlElemKindTbl[rs] == 7
-      || rlElemKindTbl[rs] == 8
-      || rlElemKindTbl[rs] == 10
-      || rlElemKindTbl[rs] == 11
+      rlElemKindTbl[rs] == RLK_STR_LIST
+      || rlElemKindTbl[rs] == RLK_F64_LIST
+      || rlElemKindTbl[rs] == RLK_I64_LIST
+      || rlElemKindTbl[rs] == RLK_F32_LIST
+      || rlElemKindTbl[rs] == RLK_U8_LIST
     ) {
       // string[][] / f64[][] / i64[][]: the element is the inner list's WRAPPER
       // (`mkListIdx` / `fl64TypeIdx` / `il64TypeIdx`) — but those wrappers are allocated AFTER
       // this loop, so a second pass (below) fills these heaps once they exist.
       rlElemHeap[rs] = 0
-    } else if rlElemKindTbl[rs] == 9 {
+    } else if rlElemKindTbl[rs] == RLK_REF_LIST {
       // A struct-LIST value (`S[]`): the element is the inner struct-list WRAPPER, the ref-list
       // wrapper of the inner `S` slot (interned at a LOWER index, so its `rlWrapIdx` is set).
       rlElemHeap[rs] = rlWrapIdx[rlElemInnerSlot(rs)]
@@ -5206,11 +5231,17 @@ export function mAssignTypeIndices(_n: i32) {
   // / ia64Used), so the index is real here.
   let rsfix = 0
   while rsfix < rlElemName.length {
-    if rlElemKindTbl[rsfix] == 6 { rlElemHeap[rsfix] = mkListIdx }
-    else if rlElemKindTbl[rsfix] == 7 { rlElemHeap[rsfix] = fl64TypeIdx }
-    else if rlElemKindTbl[rsfix] == 10 { rlElemHeap[rsfix] = fl32TypeIdx }
-    else if rlElemKindTbl[rsfix] == 8 { rlElemHeap[rsfix] = il64TypeIdx }
-    else if rlElemKindTbl[rsfix] == 11 { rlElemHeap[rsfix] = bl8TypeIdx }
+    if rlElemKindTbl[rsfix] == RLK_STR_LIST {
+      rlElemHeap[rsfix] = mkListIdx
+    } else if rlElemKindTbl[rsfix] == RLK_F64_LIST {
+      rlElemHeap[rsfix] = fl64TypeIdx
+    } else if rlElemKindTbl[rsfix] == RLK_F32_LIST {
+      rlElemHeap[rsfix] = fl32TypeIdx
+    } else if rlElemKindTbl[rsfix] == RLK_I64_LIST {
+      rlElemHeap[rsfix] = il64TypeIdx
+    } else if rlElemKindTbl[rsfix] == RLK_U8_LIST {
+      rlElemHeap[rsfix] = bl8TypeIdx
+    }
     rsfix = rsfix + 1
   }
   // The function-value closure types, interned last among the heap types so no existing index
@@ -5226,7 +5257,7 @@ export function mAssignTypeIndices(_n: i32) {
     // null $cloStructIdx)))` forward-references it within the shared rec group.
     let rcs = 0
     while rcs < rlElemName.length {
-      if rlElemKindTbl[rcs] == 5 { rlElemHeap[rcs] = cloStructIdx }
+      if rlElemKindTbl[rcs] == RLK_CLOSURE { rlElemHeap[rcs] = cloStructIdx }
       rcs = rcs + 1
     }
     // One `$fnsig` functype per distinct value-call signature (`cloSigKeys`).
@@ -5259,7 +5290,12 @@ export function mAssignTypeIndices(_n: i32) {
     mvTwin.push(mvRep)
     if mvRep < mvi {
       const k6 = mvValKind[mvi]
-      if k6 == 1 || k6 == 2 || k6 == 6 || k6 == 14 {
+      if (
+        k6 == MVK_STRUCT
+        || k6 == MVK_UNION
+        || k6 == MVK_REF
+        || k6 == MVK_CLOSURE
+      ) {
         if rlWrapIdx[mvRlSlot[mvi]] != rlWrapIdx[mvRlSlot[mvRep]] {
           return emitFail(
             "emitProgram: map-value layout twins resolved different vals wrappers",
@@ -5277,7 +5313,7 @@ export function mAssignTypeIndices(_n: i32) {
   // struct. A mono / atom map element kept `mStructIdxPre` in the first pass (slot -1).
   let rmf = 0
   while rmf < rlElemName.length {
-    if rlElemKindTbl[rmf] == 3 {
+    if rlElemKindTbl[rmf] == RLK_MAP {
       // `canon` means the value-name leg canonicalizes (`mvCanonValName`) before its lookup: the
       // mv table is keyed canonically, so a raw element-map name would miss the slot and leave
       // the element heap at the shared mono map while the map's own binding uses the box-backed
@@ -5706,7 +5742,7 @@ function collectArrNewIntr(callIx: i32) {
     if anFillTy >= 0 {
       ensureRefElemTy(refListElemNameOfExpr(callIx, -1), anFillTy)
     } else {
-      rlInternName(refListElemNameOfExpr(callIx, -1), 1)
+      rlInternName(refListElemNameOfExpr(callIx, -1), RLK_STRUCT)
     }
     return 0
   }
@@ -5871,7 +5907,7 @@ export function collectA(_stmts: i32[]) {
           raUsed = true
           // Hinted with the literal's own recorded element row; every corpus firing agrees
           // with the name path, and the hint is available at each.
-          rlInternNameTy(emptyElem, 2, rlHintElemTy(i))
+          rlInternNameTy(emptyElem, RLK_UNION, rlHintElemTy(i))
         }
         // The same hole at the nested-array element kind: `const outer = []` then
         // `outer.push(inner)` with `inner: i32[]` reaches this pass with the element pinned to an
@@ -5886,27 +5922,27 @@ export function collectA(_stmts: i32[]) {
           // level) has to intern its inner row first, because the outer element's heap is that
           // inner wrapper and the tables are read forward in this same pass. `ensureRefElemTy`
           // is the one home of that inner-first walk (D702).
-          if nestKind == 9 {
+          if nestKind == RLK_REF_LIST {
             ensureRefElemTy(nestElem, rlHintElemTy(i))
           } else {
             // Same hint, same provenance; every corpus firing agrees.
             rlInternNameTy(nestElem, nestKind, rlHintElemTy(i))
-            if nestKind == 4 {
+            if nestKind == RLK_I32_LIST {
               lUsed = true
               aUsed = true
             }
-            if nestKind == 6 {
+            if nestKind == RLK_STR_LIST {
               slUsed = true
               aUsed = true
             }
-            if nestKind == 7 { fa64Used = true }
-            if nestKind == 8 { ia64Used = true }
+            if nestKind == RLK_F64_LIST { fa64Used = true }
+            if nestKind == RLK_I64_LIST { ia64Used = true }
             // The two leaf kinds this arm never had a flag for: an f32 inner list (10) rides
             // `$fl32TypeIdx`, and a map inner element (3) rides the map struct plus the i32 list
             // and array its `index` and `vals` fields use. Same flags as the `arrLitIsRef` arm.
-            if nestKind == 10 { fa32Used = true }
-            if nestKind == 11 { ba8Used = true }
-            if nestKind == 3 {
+            if nestKind == RLK_F32_LIST { fa32Used = true }
+            if nestKind == RLK_U8_LIST { ba8Used = true }
+            if nestKind == RLK_MAP {
               mUsed = true
               lUsed = true
               aUsed = true
@@ -5945,7 +5981,7 @@ export function collectA(_stmts: i32[]) {
         // empty-literal arm above and the annotated spelling do: the outer element's heap is the
         // inner wrapper, and this pass reads the tables forward (D702). Additive by construction,
         // since the first-element rung answers 4/6/7/8 for a nested `ArrayLit`.
-        if arrLitElemKind(i) == 9 {
+        if arrLitElemKind(i) == RLK_REF_LIST {
           ensureRefElemTy(arrLitElemName(i), arrLitElemHintTy(i))
         } else {
           // Hinted with the arm-for-arm arena twin. -1 on every arm whose answer is a
@@ -5959,21 +5995,21 @@ export function collectA(_stmts: i32[]) {
           // i32 list + raw array types for them. A string / f64 / i64 leaf (kinds
           // 6/7/8, the self-classified nested literal) forces ITS inner list's
           // wrapper+backing pair, exactly as the `T[][]` annotation branch does.
-          if arrLitElemKind(i) == 4 {
+          if arrLitElemKind(i) == RLK_I32_LIST {
             lUsed = true
             aUsed = true
           }
-          if arrLitElemKind(i) == 6 {
+          if arrLitElemKind(i) == RLK_STR_LIST {
             slUsed = true
             aUsed = true
           }
-          if arrLitElemKind(i) == 7 { fa64Used = true }
-          if arrLitElemKind(i) == 8 { ia64Used = true }
+          if arrLitElemKind(i) == RLK_F64_LIST { fa64Used = true }
+          if arrLitElemKind(i) == RLK_I64_LIST { ia64Used = true }
           // A map element (kind 3) forces the map struct plus the i32 list and array its `index`
           // and `vals` fields ride — the three flags an annotated map element gets from
           // `ensureRefElem`'s `k == 3` arm, which a bare literal never reaches. `mI32Used`, that
           // arm's fourth, is already flipped for this shape by the `Map()` constructor arm.
-          if arrLitElemKind(i) == 3 {
+          if arrLitElemKind(i) == RLK_MAP {
             mUsed = true
             lUsed = true
             aUsed = true
@@ -5981,8 +6017,8 @@ export function collectA(_stmts: i32[]) {
           // The f32 inner list (kind 10), the leaf the old allow-list could not admit — its
           // element is the `$fl32TypeIdx` wrapper, so force that pair exactly as 6/7/8 above
           // force theirs. Beside kind 3 for the same reason: both are now reachable here.
-          if arrLitElemKind(i) == 10 { fa32Used = true }
-          if arrLitElemKind(i) == 11 { ba8Used = true }
+          if arrLitElemKind(i) == RLK_F32_LIST { fa32Used = true }
+          if arrLitElemKind(i) == RLK_U8_LIST { ba8Used = true }
         }
       } else if arrLitIsStr(i, -1) {
         // A STRING-element literal is a string-ref list — the same wrapper/backing
@@ -6180,7 +6216,7 @@ export function collectA(_stmts: i32[]) {
         // `(string | null)[]` — one non-null member plus null, deliberately not a value union)
         // has no list rep: the box lowering would emit the element's raw value. Reject cleanly.
         // A value-union element and a struct or heterogeneous element box as usual.
-        if raKind == 2 {
+        if raKind == RLK_UNION {
           const renNul = nullablePartOf(ren)
           if !isValueUnionName(ren) && renNul != "" {
             return emitFail(
@@ -6208,21 +6244,21 @@ export function collectA(_stmts: i32[]) {
         recordAnnRlSlot(i, ensureRefElemTy(ren, renTy), ranNul)
         // An `i32[][]` annotation's ELEMENTS are i32-list wrappers — force the
         // i32 list + raw array so `lTypeIdx`/`aTypeIdx` exist for the elements.
-        if raKind == 4 {
+        if raKind == RLK_I32_LIST {
           lUsed = true
           aUsed = true
         }
         // A nested NON-i32 scalar / string 2D array (`string[][]`/`f64[][]`/`i64[][]`, element
         // kinds 6/7/8) forces its INNER list's backing+wrapper, as the LIST-valued map path
         // does — else the element wrapper heap (`mkListIdx`/`fl64`/`il64`) is never allocated.
-        if raKind == 6 {
+        if raKind == RLK_STR_LIST {
           slUsed = true
           aUsed = true
         }
-        if raKind == 7 { fa64Used = true }
-        if raKind == 10 { fa32Used = true }
-        if raKind == 11 { ba8Used = true }
-        if raKind == 8 { ia64Used = true }
+        if raKind == RLK_F64_LIST { fa64Used = true }
+        if raKind == RLK_F32_LIST { fa32Used = true }
+        if raKind == RLK_U8_LIST { ba8Used = true }
+        if raKind == RLK_I64_LIST { ia64Used = true }
         // A map element (`{[K]: V}[]`, `({[K]: V} | null)[]`) forces the map machinery — the
         // three type flags, the element map's mv value slot and `mI32Used` for an i32 key —
         // inside `ensureRefElem` above, whose `k == 3` arm is the one home of that forcing and
@@ -9441,7 +9477,7 @@ function anonMintRowFor(objIx: i32) {
         // D672 — a joined owner's field is a union box, not a nested ref: where two owner literals
         // disagree at a nested field and something joins them, the code is 16 (`anonNestPolyUnionName` gates it, "" elsewhere).
         const boxU = anonNestPolyUnionName(ai, f.fiName, unwrapParen(f.fiValue))
-        if boxU != "" { code = 16 }
+        if boxU != "" { code = FC_UNION }
         // D804 — the leaf twin, one layer down: two `??`-joined literals disagreeing at a scalar
         // field need the merged row too, so the code comes from the merged spelling, not 16.
         let leafSet = ""
@@ -9456,7 +9492,7 @@ function anonMintRowFor(objIx: i32) {
         if code < 0 && hasFnField {
           const iv = P.nodes[f.fiValue]
           if iv is Ident {
-            if !nameNamesFunction(iv.identName) { code = 0 }
+            if !nameNamesFunction(iv.identName) { code = FC_I32 }
           }
         }
         if code < 0 { ok = false }
@@ -9784,7 +9820,7 @@ function anonLeafPolyUnionSetOpen(ow: i32, fname: string, val: i32): string {
   if folded != "" {
     if (
       !anonLeafJoinLhsIndexed(ow, fname, owAtom)
-      && !anonLeafFoldBlocked(ow, fname, 0, nameFieldCode(folded))
+      && !anonLeafFoldBlocked(ow, fname, FC_I32, nameFieldCode(folded))
     ) {
       return folded
     }
@@ -10495,7 +10531,7 @@ function collectShapeVariantFields(nm: string, shapeTy: i32) {
     if fc < 0 {
       // A nested-struct variant field: validated here only, since `collectU` runs before
       // `collectS`; `collectA`'s variant pass interns the shape once acceptance is decidable.
-      if variantNestedShapeOkTy(ftxt, fldTy) { fc = 15 }
+      if variantNestedShapeOkTy(ftxt, fldTy) { fc = FC_STRUCT }
     }
     if fc < 0 {
       // D1518 — `fieldTypeRefusalMsg`'s sentence, one table over: what reaches here is an
@@ -12241,7 +12277,7 @@ export function collectMapFilterUse() {
                 if rsi >= 0 && rsi < sNames.length {
                   // Hinted with the struct table's own type column, so the hint skips `resolveAnnot` rather
                   // than racing it; the read is bounded since `sTyIx` is padded lazily and a short column yields -1 (today's unhinted call).
-                  rlInternNameTy(sNames[rsi], 1, rlColAt(sTyIx, rsi))
+                  rlInternNameTy(sNames[rsi], RLK_STRUCT, rlColAt(sTyIx, rsi))
                   rlUsed = true
                   raUsed = true
                 }
@@ -12252,7 +12288,11 @@ export function collectMapFilterUse() {
                 if cvi >= 0 && cvi < uVariants.length {
                   // Hinted with the variant table's TYPE column, same provenance and
                   // same bound as the struct arm above.
-                  rlInternNameTy(uVariants[cvi], 1, rlColAt(uVarTyIx, cvi))
+                  rlInternNameTy(
+                    uVariants[cvi],
+                    RLK_STRUCT,
+                    rlColAt(uVarTyIx, cvi),
+                  )
                   rlUsed = true
                   raUsed = true
                 }
@@ -12263,14 +12303,14 @@ export function collectMapFilterUse() {
               ) {
                 // A union-returning callback's result is a ref list of union boxes; interns the union
                 // alias's slot so a map whose source is not itself a union array still has a result backing.
-                rlInternNameTy(unNames[0], 2, rlColAt(unTyIx, 0))
+                rlInternNameTy(unNames[0], RLK_UNION, rlColAt(unTyIx, 0))
                 rlUsed = true
                 raUsed = true
               } else if csr >= 0 && csr < sNames.length {
                 // A closure-VALUE callback (`f: (A) => B` delivered as a parameter or binding)
                 // has no lifted entry to ask, so the call's own recorded type names the struct
                 // row its result list needs; without it the result has no ref-list row (D2301).
-                rlInternNameTy(sNames[csr], 1, rlColAt(sTyIx, csr))
+                rlInternNameTy(sNames[csr], RLK_STRUCT, rlColAt(sTyIx, csr))
                 rlUsed = true
                 raUsed = true
               } else {
