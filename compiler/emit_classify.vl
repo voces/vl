@@ -71,6 +71,7 @@ import {
   canonUnionKeyOfName,
   canonUnionKeyOfTy,
   capWidenOf,
+  collectRetValues,
   condNarrowDropOf,
   condRhsRetiredOf,
   covarDeclFrame,
@@ -5699,6 +5700,12 @@ function captureLoopVarIterOf(fe: i32, name: string): i32 {
 // copy of, or "". The copy's own cell is typed with the frame's locals in force, which the env
 // field is not, so the field takes the loop variable's type as a direct capture of it does.
 function captureLoopCopySrc(fe: i32, name: string): string {
+  captureLoopCopySrcAt(fe, name, 0)
+}
+
+// `captureLoopCopySrc` `depth` copies down the chain, bounded against a shadowing cycle.
+function captureLoopCopySrcAt(fe: i32, name: string, depth: i32): string {
+  if depth > 8 { return "" }
   const b = parentBindingOf(fe, name)
   if b < 0 { return "" }
   const bn = P.nodes[b]
@@ -5707,7 +5714,11 @@ function captureLoopCopySrc(fe: i32, name: string): string {
     const src = P.nodes[unwrapParen(bn.letInit)]
     if src is Ident {
       const sn = src.identName
-      if sn == name || parentBindingOf(fe, sn) >= 0 { return "" }
+      if sn == name { return "" }
+      // A copy of a copy is typed as the loop variable at the end of the chain.
+      if parentBindingOf(fe, sn) >= 0 {
+        return captureLoopCopySrcAt(fe, sn, depth + 1)
+      }
       // A boxed element is not redirected: the closure's narrowed reads of the copy resolve
       // its union through the copy's own binding, which has no loop in scope (D2523).
       if (
@@ -13728,37 +13739,188 @@ export function refIfArmNeedsRecordCopy(
   if vn is ObjLit || vn is NullLit { return false }
   if slot < 0 || slot >= sTyIx.length { return false }
   // The row the arm's value is built at, which an un-annotated source may share with the join.
-  const ar = structIndexOfExpr(tv, fnIx)
+  // A nullable record value answers no row syntactically; its checked type names one.
+  const ar = rjaRowOf(tv, fnIx)
   if ar < 0 || ar == slot || ar >= sTyIx.length { return false }
-  const r = recordBaseTy(sTyIx[slot])
-  const a = recordBaseTy(sTyIx[ar])
-  if r < 0 || a < 0 || tyEq(a, r) { return false }
-  const rt = T.tys[r]
-  const at = T.tys[a]
-  if rt is TyObj {
-    if at is TyObj {
+  recordRepDiffers(sTyIx[ar], sTyIx[slot], 0)
+}
+
+// Whether a record stored at the row of type `a` differs, somewhere in its fields, from one
+// stored at the row of type `b`: the two are then two wasm structs, and handing one where the
+// other is declared needs a converting copy. Field types are compared through nested records.
+function recordRepDiffers(a: i32, b: i32, depth: i32): boolean {
+  const ra = recordBaseTy(a)
+  const rb = recordBaseTy(b)
+  if ra < 0 || rb < 0 || depth > 8 || tyEq(ra, rb) { return false }
+  const ta = T.tys[ra]
+  const tb = T.tys[rb]
+  if ta is TyObj {
+    if tb is TyObj {
       let i = 0
-      while i < rt.objFieldNames.length {
-        const rf = rt.objFieldTypes[i]
+      while i < tb.objFieldNames.length {
+        const bf = tb.objFieldTypes[i]
         let af = -1
         let k = 0
-        while k < at.objFieldNames.length {
-          if at.objFieldNames[k] == rt.objFieldNames[i] {
-            af = at.objFieldTypes[k]
+        while k < ta.objFieldNames.length {
+          if ta.objFieldNames[k] == tb.objFieldNames[i] {
+            af = ta.objFieldTypes[k]
           }
           k = k + 1
         }
-        if rf >= 0 && af >= 0 && rf < T.tys.length && af < T.tys.length {
-          if T.tys[rf] is TyUnion && !(T.tys[af] is TyUnion) { return true }
-          const rp = primNameOf(rf)
-          const ap = primNameOf(af)
-          if rp != null && ap != null && rp != ap { return true }
-        }
+        if fieldRepDiffers(af, bf, depth) { return true }
         i = i + 1
       }
     }
   }
   false
+}
+
+// Whether a field of type `af` and one of type `bf` are stored differently.
+function fieldRepDiffers(af: i32, bf: i32, depth: i32): boolean {
+  if af < 0 || bf < 0 || af >= T.tys.length || bf >= T.tys.length {
+    return false
+  }
+  if tyEq(af, bf) { return false }
+  if recordBaseTy(af) >= 0 && recordBaseTy(bf) >= 0 {
+    return recordRepDiffers(af, bf, depth + 1)
+  }
+  const sb = fieldStorageTag(bf)
+  if sb != 0 && sb != fieldStorageTag(af) { return true }
+  const bp = primNameOf(bf)
+  const ap = primNameOf(af)
+  bp != null && ap != null && bp != ap
+}
+
+// 1 for a union box, 2 for a nullable, 0 for a type stored by its own kind.
+function fieldStorageTag(ty: i32): i32 {
+  const t = T.tys[ty]
+  match t {
+    TyUnion => {
+      return 1
+    }
+    TyNullable => {
+      return 2
+    }
+    TyPrim | TyErr | TyFunc | TyObj | TyArray | TyVar | TyLit | TyNeg | TyMap => {
+      // Stored by its own kind, which the scalar comparison after it tells apart.
+      return 0
+    }
+  }
+}
+
+// The refusal a record value meets where a join of records needs it converted (D2765).
+const RECORD_COPY_MSG = "emitProgram: this branch hands over a record whose field types differ from the record the branches join to, and a record is shared rather than converted — write the branch as an object literal, or give the value the joined type where it is declared"
+
+// Refuses, at the value, every record a join of records would have to convert: an `if` or
+// `match` tail, a list literal's element, and a function's returned value, each against the
+// row of the join or of the declared return. Literal leaves are built at that row (D2765).
+export function auditRecordJoinLeaves() {
+  if !recordJoinSeen() || emitRootIx < 0 { return 0 }
+  const root = P.nodes[emitRootIx]
+  if root is Program {
+    let s = 0
+    while s < root.progStmts.length {
+      if rjaWalk(root.progStmts[s], -1) < 0 { return -1 }
+      s = s + 1
+    }
+  }
+  let fe = 0
+  while fe < fnStmts.length {
+    const fnIx = fnStmts[fe]
+    const fn = P.nodes[fnIx]
+    if fn is FuncDecl {
+      if fn.fnRet >= 0 {
+        const rrow = structIndexOfTy(recordBaseTy(nodeTyIxOf(fn.fnRet)))
+        if rrow >= 0 {
+          const rets: i32[] = []
+          collectRetValues(fn.fnBody, rets)
+          if rjaLeaves(rets, rrow, fnIx) < 0 { return -1 }
+        }
+      }
+      if rjaWalk(fn.fnBody, fnIx) < 0 { return -1 }
+    }
+    fe = fe + 1
+  }
+  0
+}
+
+// Every tail of each value in `vals` against the row `row`: -1 once one is refused.
+function rjaLeaves(vals: i32[], row: i32, fnIx: i32): i32 {
+  let i = 0
+  while i < vals.length {
+    const ls = valueTailLeaves(vals[i])
+    let k = 0
+    while k < ls.length {
+      if refIfArmNeedsRecordCopy(ls[k], row, fnIx) {
+        return emitFailAt(RECORD_COPY_MSG, ls[k])
+      }
+      k = k + 1
+    }
+    i = i + 1
+  }
+  0
+}
+
+// Whether two record values, neither a literal, are stored as different records.
+function rjaValuesPart(a: i32, b: i32, fnIx: i32): boolean {
+  const na = P.nodes[unwrapParen(a)]
+  const nb = P.nodes[unwrapParen(b)]
+  if na is ObjLit || nb is ObjLit || na is NullLit || nb is NullLit {
+    return false
+  }
+  const ra = rjaRowOf(a, fnIx)
+  const rb = rjaRowOf(b, fnIx)
+  if ra < 0 || rb < 0 || ra == rb || ra >= sTyIx.length || rb >= sTyIx.length {
+    return false
+  }
+  recordRepDiffers(sTyIx[ra], sTyIx[rb], 0)
+}
+
+// The struct row a record value is built at: its own, else its checked type's, else -1.
+function rjaRowOf(ix: i32, fnIx: i32): i32 {
+  const r = structIndexOfExpr(ix, fnIx)
+  if r >= 0 { return r }
+  structIndexOfTy(recordBaseTy(nodeTyIxOf(ix)))
+}
+
+// The joins of records under `ix` in frame `fnIx`, a nested function's aside.
+function rjaWalk(ix: i32, fnIx: i32): i32 {
+  let cur = ix
+  while cur >= 0 && cur < P.nodes.length {
+    const n = P.nodes[cur]
+    if n is FuncDecl { return 0 }
+    if n is IfStmt || n is MatchExpr {
+      const jr = joinedRecordRowOf(cur)
+      if jr >= 0 {
+        const one: i32[] = [cur]
+        if rjaLeaves(one, jr, fnIx) < 0 { return -1 }
+      }
+    } else if n is BinExpr && n.binOp == "??" {
+      // A `??` joins its two operands as an `if` does its arms.
+      const cr = structIndexOfTy(recordBaseTy(nodeTyIxOf(cur)))
+      if cr >= 0 {
+        const two: i32[] = [n.binLeft, n.binRight]
+        if rjaLeaves(two, cr, fnIx) < 0 { return -1 }
+      } else if rjaValuesPart(n.binLeft, n.binRight, fnIx) {
+        // No row holds the join, so the two records meet as they are.
+        return emitFailAt(RECORD_COPY_MSG, n.binRight)
+      }
+    } else if n is ArrayLit {
+      const ety = arrTyElemOf(nodeTyIxOf(cur))
+      if initJoinsWiderRecord(cur, nodeTyIxOf(cur)) {
+        const er = structIndexOfTy(recordBaseTy(ety))
+        if er >= 0 && rjaLeaves(n.arrElems, er, fnIx) < 0 { return -1 }
+      }
+    }
+    const kids = nodeSpineChildren(cur)
+    let k = 0
+    while k < kids.length {
+      if rjaWalk(kids[k], fnIx) < 0 { return -1 }
+      k = k + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  0
 }
 
 // Whether the value `if`, `match` or list literal `ini`, checked at `ty`, joins records into a
@@ -13809,6 +13971,31 @@ function arrTyElemOf(ty: i32): i32 {
   const t = T.tys[ty]
   if t is TyArray { return t.aElem }
   -1
+}
+
+// Whether function `fnIx`, checked to return the record `rty`, returns a record of another
+// type anywhere: the returns join to `rty` and each must be built at its row (D2731).
+export function fnRetJoinsWiderRecord(fnIx: i32, rty: i32): boolean {
+  if !recordJoinSeen() || fnIx < 0 { return false }
+  const base = recordBaseTy(rty)
+  if base < 0 { return false }
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    const rets: i32[] = []
+    collectRetValues(fn.fnBody, rets)
+    let i = 0
+    while i < rets.length {
+      const ls = valueTailLeaves(rets[i])
+      let k = 0
+      while k < ls.length {
+        const lb = recordBaseTy(nodeTyIxOf(ls[k]))
+        if lb >= 0 && !tyEq(lb, base) { return true }
+        k = k + 1
+      }
+      i = i + 1
+    }
+  }
+  false
 }
 
 // Whether `ty` is a record, or a list of one, with a union-typed field: the type the checker
