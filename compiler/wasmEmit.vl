@@ -317,6 +317,10 @@ import {
   gF32PrintIdx,
   gF64PrintIdx,
   gFnTableIdx,
+  gFoldAt,
+  gFoldLen,
+  gFoldOk,
+  gFoldPool,
   gHeapGlobalIdx,
   gHelpF64Rem,
   gHelpMapCompact,
@@ -23685,11 +23689,14 @@ export function userGlobalIdx(gi: i32) {
   nImp + gStrPoolTexts.length + gCellIdx[gi]
 }
 
-// the storage-class chokepoint for a user top-level binding: `fbGlobalGet`/`fbGlobalSet`
-// are the module's only `0x23`/`0x24` writers, so routing every user cell through this
-// pair makes cell-vs-local one decision no emit site can bypass. A promoted binding
-// reached from outside the start function's own frame is rejected loudly here instead.
+// the storage-class chokepoint for a user top-level binding: every user cell's `0x23`/`0x24`
+// goes through this pair, so cell, local or immediate is one decision no emit site can bypass.
+// A promoted binding read outside the start function's frame is rejected loudly; a folded
+// const is its immediate, never uninitialised, so it takes no guard.
 export function emitUserGlobalGet(gi: i32) {
+  if gi >= 0 && gi < gFoldOk.length && gFoldOk[gi] == 1 {
+    return emitFoldedConstRead(gi)
+  }
   if gi >= 0 && gi < gPromoOk.length && gPromoOk[gi] == 1 {
     if !gPromoInStart || gPromoSlot[gi] < 0 {
       return emitFail(
@@ -23703,6 +23710,29 @@ export function emitUserGlobalGet(gi: i32) {
     if emitInitGuard(gi, "read") < 0 { return -1 }
   }
   fbGlobalGet(userGlobalIdx(gi))
+  0
+}
+
+// Writes the immediate `captureFoldedConsts` banked for folded const `gi`. A read before the
+// capture ran has no cell to fall back on, so it fails loudly.
+function emitFoldedConstRead(gi: i32) {
+  if gi >= gFoldAt.length || gi >= gFoldLen.length || gFoldAt[gi] < 0 {
+    return emitFail(
+      "emitProgram: a folded module const read before its value was captured",
+    )
+  }
+  const at = gFoldAt[gi]
+  const end = at + gFoldLen[gi]
+  if end > gFoldPool.length {
+    return emitFail(
+      "emitProgram: a folded module const read past its banked bytes",
+    )
+  }
+  let k = at
+  while k < end {
+    wU8(gFoldPool[k])
+    k = k + 1
+  }
   0
 }
 

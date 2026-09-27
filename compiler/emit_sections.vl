@@ -269,6 +269,10 @@ import {
   gExtIdx,
   gF32PrintIdx,
   gF64PrintIdx,
+  gFoldAt,
+  gFoldLen,
+  gFoldOk,
+  gFoldPool,
   gFsIdx,
   gFsUse,
   gHeapBase,
@@ -506,6 +510,7 @@ import {
   ropePush,
   ropeReset,
   wBytes,
+  wIsOneScalarConst,
   wLen,
   wName,
   wRangeEq,
@@ -1381,11 +1386,18 @@ export function computeGlobalPromotion() {
   gPromoOk = []
   gPromoSlot = []
   gCellIdx = []
+  gFoldOk = []
+  gFoldAt = []
+  gFoldLen = []
+  gFoldPool = []
   let ri = 0
   while ri < globalStmts.length {
     gPromoOk.push(0)
     gPromoSlot.push(-1)
     gCellIdx.push(-1)
+    gFoldOk.push(0)
+    gFoldAt.push(-1)
+    gFoldLen.push(0)
     ri = ri + 1
   }
   // P1: promotion never mints a start function, so it needs an existing one.
@@ -6898,6 +6910,7 @@ function emitFunctionSection(
 }
 
 function emitGlobalSection() {
+  if captureFoldedConsts() < 0 { return -1 }
   // Global section (id 6): one global per top-level `let`/`const`, in declaration
   // order (that order is the global index `global.get`/`global.set` use). Each entry is
   // `<valtype> <mutability> <init constexpr> 0x0b`, immutable for a constant `const`; a non-constexpr init fails loudly via `emitExpr`.
@@ -7002,117 +7015,20 @@ function emitGlobalSection() {
           }
           fbEnd() // 0x0b end of init expr
         } else {
-          // Every `pending*` seed the arm below writes is scoped to this one cell's init, so the
-          // ambient seeds are snapshotted here and restored after it. A const cell's constexpr
-          // runs before every function body and before the start function, so a leaked null rep
-          // retypes a bare `null` anywhere in the module, not only in the next cell (D1563).
-          const gcSaved = expCtxHere()
-          // The cell's valtype comes from the binding's annotation when present, falling back to the
-          // literal-init kind for an un-annotated global. The init constexpr must build the same wasm
-          // type: `pendingStructIdx` seeds an `ObjLit` to the annotated struct, and
-          // `pendingListKind`/`pendingListSlot` seed an empty `[]` to the annotation's ref/string list, exactly as the local-`let` path threads them.
+          // The valtype names the cell's table slot: a ref-array cell its ref-list slot (the
+          // element wrapper, annotation-first), a map cell its map SHAPE, anything else the struct
+          // or variant row `globalCellStructIdx` finds (-1 for a scalar).
           const gck = globalCellKind(globalStmts[gi])
           let gcs = globalCellStructIdx(globalStmts[gi])
-          if gck == "struct" { pendingStructIdx = gcs }
-          // A kind-8 variant cell seeds the variant context instead, so the object-literal init
-          // builds the bare variant struct rather than looking for a standalone struct row that does
-          // not exist. Bound, because the two ladders can disagree: `gcs` is the variant index only
-          // where `globalCellStructIdx` found one, and its last rung falls through to `structIndexOfExpr` — an unbounded seed could pass a struct row's number here instead, another table's index entirely.
-          if gck == "variant" {
-            if gcs >= 0 && gcs < uVarHeap.length { pendingVariantIdx = gcs }
-          }
-          // A NULLABLE-struct cell (kind 9) seeds the same struct context: a bare
-          // `null` init lowers as `ref.null $S` (a valid constexpr), a struct
-          // literal as that struct.
-          if gck == "nulstruct" { pendingStructIdx = gcs }
-          // A nullable-variant cell seeds the variant context, for the same reason its non-null
-          // sibling above does: the init literal must build the concrete variant struct `uVarHeap[vi]`
-          // the cell is typed with, not a standalone struct row — there is none. Bounded for the same reason too; the bound already covers the heap read alone, and the seed itself needs the same one.
-          if gck == "nulvariant" {
-            if gcs >= 0 && gcs < uVarHeap.length {
-              pendingVariantIdx = gcs
-              pendingNulRefHeap = uVarHeap[gcs]
-            }
-          }
-          const gcLb = letListBuild(globalStmts[gi], -1)
-          pendingListKind = gcLb.lbKind
-          pendingListSlot = gcLb.lbSlot
-          // The rungs a cell derives from its kind alone, shared with the local `let`, the
-          // start-function init and the `global.set` arm: a distinct-backing nullable scalar
-          // list's leaf build code (a small `i64` literal would otherwise build the i32 list),
-          // and the nullable-list and nullable-closure null reps. Scoped by the snapshot above.
-          expCtxApply(expCtxForCell(gck))
-          // A ref-array cell (kind 5) passes the ref-list table slot as `fbValtype`'s second arg
-          // (`globalCellStructIdx` is -1 for a ref array) so the cell valtype selects this global's
-          // element wrapper — annotation-first, init-inferred when un-annotated — not slot 0's.
           if gck == "reflist" { gcs = globalRefListSlot(globalStmts[gi]) }
-          // A nullable ref-array cell (kind 18): the ref-list table slot selects this global's
-          // element wrapper for the `(ref null $rlWrap)` cell valtype, matching the init's reflist build.
           if gck == "nulreflist" { gcs = letAnnRefListSlot(globalStmts[gi]) }
-          // A map cell (kind 6): the map SHAPE picks the struct type; the
-          // `pendingMapSlot` seed makes the `Map()` init constexpr build it.
-          if gck == "map" {
-            gcs = letMapShapeOf(globalStmts[gi], -1)
-            pendingMapSlot = gcs
-          }
-          // A NULLABLE map cell (kind `nulmap`): the map SHAPE picks the struct type; a bare `null`
-          // init lowers as `ref.null $mapStruct` (`pendingNulRefHeap`), a `Map()` init builds it
-          // (`pendingMapSlot`). Both are valid WasmGC constexprs.
-          if gck == "nulmap" {
-            gcs = nulMapShapeOf(globalStmts[gi], -1)
-            pendingMapSlot = gcs
-            pendingNulRefHeap = mapTypeIdxOf(gcs)
-          }
+          if gck == "map" { gcs = letMapShapeOf(globalStmts[gi], -1) }
+          if gck == "nulmap" { gcs = nulMapShapeOf(globalStmts[gi], -1) }
           fbValtype(gck, gcs) // valtype
           // A `const` cell is immutable: nothing but this constexpr writes it, and an exported one
           // is what an `extern const` import links to. A constexpr `let` stays mutable.
           if globalCellIsImmutable(gi) { wU8(0) } else { wU8(1) }
-          // An `: i64` global lowers its literal init as `i64.const` (kind 10 / 0x7e);
-          // an `: f32`/`: f64` global as `f32.const`/`f64.const` (kind 13 / 0x7d, 11 /
-          // 0x7c) — re-encoding an integer literal directly so the init stays a valid
-          // constexpr (no convert op). (Slice 5.)
-          pendingI64 = (gck == "i64")
-          pendingF32 = (gck == "f32")
-          pendingF64 = (gck == "f64")
-          // A literal-union const global (`const D: K = "a"`) lowers its member init as `i32.const <id>`
-          // (a valid constexpr).
-          if letIsLitUnion(globalStmts[gi]) { pendingLitUnion = 1 }
-          // A nullable-litunion const global (`const g: K0 | null = "404"`): the member init lowers
-          // as its atom id and a bare `null` as the -1 sentinel, the nullable twin of the arm above.
-          // Un-seeded, a member init emitted the string ref into the i32 niche cell — invalid wasm — and a `null` init drew a loud reject.
-          if g.letType >= 0 {
-            if nodeTyIsNulLitUnion(g.letType) {
-              pendingLitUnion = 1
-              pendingNulLitUnion = true
-            }
-          }
-          // A UNION cell (kind 4) with a CONST init boxes it in the constexpr —
-          // `struct.new` / `array.new_fixed` / `i32.const` are all constant in
-          // WasmGC, so `let w: string | i32 = "a"` builds the box inline.
-          let gun2 = ""
-          if gck == "union" { gun2 = letUnionNameOf(globalStmts[gi], -1) }
-          // A module-level `const f = add` aliasing a GENERIC (un-annotated-param) named
-          // function, used only as a direct-call callee: emit the closure through the
-          // floor-LESS core, exactly as the function-body twin in `emitLetDeclStmt` does.
-          // `struct.new` is a valid WasmGC constexpr, so the cell builds inline.
-          const gAliasFe = monoGenericAliasFe(globalStmts[gi])
-          if gun2 != "" {
-            if emitUnionCoerce(globalPayload, gun2, g.letInit, -1) < 0 {
-              return -1
-            }
-          } else if gAliasFe >= 0 {
-            if emitClosureValueCore(globalPayload, gAliasFe, -1) < 0 {
-              return -1 // init constexpr
-            }
-          } else {
-            if emitExpr(globalPayload, g.letInit, -1) < 0 {
-              return -1 // init constexpr
-            }
-          }
-          // The snapshot restored, rather than a chosen list of seeds cleared: this arm can arm a
-          // map shape and a null-rep heap as well as the struct, list and literal-union seeds,
-          // and one it leaves standing outlives the whole global section.
-          expCtxApply(gcSaved)
+          if emitConstCellInit(globalPayload, gi) < 0 { return -1 }
           fbEnd() // 0x0b end of init expr
         }
       }
@@ -7137,6 +7053,127 @@ function emitGlobalSection() {
     }
     wTarget(gPrev)
     wSection(6, globalPayload)
+  }
+  0
+}
+
+// Lowers the initializer of the constexpr cell at `globalStmts` position `gi` into `buf`, under
+// the seeds its cell kind implies. Every seed is scoped to this one init and restored after it:
+// a constexpr runs before every function body, so a leaked null rep would retype a bare `null`
+// anywhere in the module (D1563). Shared by the global section and `captureFoldedConsts`.
+function emitConstCellInit(buf: u8[], gi: i32): i32 {
+  const g = P.nodes[globalStmts[gi]]
+  if g is LetDecl {
+    const gcSaved = expCtxHere()
+    // The init must build the cell's wasm type: `pendingStructIdx` seeds an `ObjLit` to the
+    // annotated struct, `pendingListKind`/`pendingListSlot` an empty `[]` to its list.
+    const gck = globalCellKind(globalStmts[gi])
+    const gcs = globalCellStructIdx(globalStmts[gi])
+    if gck == "struct" { pendingStructIdx = gcs }
+    // A variant cell seeds the variant context, so the literal builds the bare variant struct.
+    // Bounded, because `gcs` is a variant index only where `globalCellStructIdx` found one; its
+    // last rung falls through to `structIndexOfExpr`, another table's index entirely.
+    if gck == "variant" {
+      if gcs >= 0 && gcs < uVarHeap.length { pendingVariantIdx = gcs }
+    }
+    // A nullable-struct cell seeds the same struct context: a bare `null` init lowers as
+    // `ref.null $S` (a valid constexpr), a struct literal as that struct.
+    if gck == "nulstruct" { pendingStructIdx = gcs }
+    // A nullable-variant cell seeds the variant context and its own typed null, bounded for the
+    // same reason as its non-null sibling.
+    if gck == "nulvariant" {
+      if gcs >= 0 && gcs < uVarHeap.length {
+        pendingVariantIdx = gcs
+        pendingNulRefHeap = uVarHeap[gcs]
+      }
+    }
+    const gcLb = letListBuild(globalStmts[gi], -1)
+    pendingListKind = gcLb.lbKind
+    pendingListSlot = gcLb.lbSlot
+    // The rungs a cell derives from its kind alone, shared with the local `let`, the
+    // start-function init and the `global.set` arm: a distinct-backing nullable scalar
+    // list's leaf build code (a small `i64` literal would otherwise build the i32 list),
+    // and the nullable-list and nullable-closure null reps.
+    expCtxApply(expCtxForCell(gck))
+    // A map cell's `Map()` init builds the struct of its map SHAPE; a nullable one's bare
+    // `null` lowers as `ref.null $mapStruct`. Both are valid WasmGC constexprs.
+    if gck == "map" { pendingMapSlot = letMapShapeOf(globalStmts[gi], -1) }
+    if gck == "nulmap" {
+      const nms = nulMapShapeOf(globalStmts[gi], -1)
+      pendingMapSlot = nms
+      pendingNulRefHeap = mapTypeIdxOf(nms)
+    }
+    // A wider numeric cell re-encodes an integer literal directly as `i64.const`/`f32.const`/
+    // `f64.const`, so the init stays a constexpr (no convert op).
+    pendingI64 = (gck == "i64")
+    pendingF32 = (gck == "f32")
+    pendingF64 = (gck == "f64")
+    // A literal-union const lowers its member init as `i32.const <id>`; a nullable one lowers a
+    // bare `null` as the -1 sentinel. Un-seeded, a member init emitted the string ref into the
+    // i32 niche cell (invalid wasm) and a `null` init drew a loud reject.
+    if letIsLitUnion(globalStmts[gi]) { pendingLitUnion = 1 }
+    if g.letType >= 0 {
+      if nodeTyIsNulLitUnion(g.letType) {
+        pendingLitUnion = 1
+        pendingNulLitUnion = true
+      }
+    }
+    // A union cell boxes its init in the constexpr (`struct.new` / `array.new_fixed` /
+    // `i32.const` are all constant in WasmGC), and a `const f = add` aliasing a generic named
+    // function emits its closure through the floor-less core, as `emitLetDeclStmt` does.
+    let gun2 = ""
+    if gck == "union" { gun2 = letUnionNameOf(globalStmts[gi], -1) }
+    const gAliasFe = monoGenericAliasFe(globalStmts[gi])
+    let rc = 0
+    if gun2 != "" { rc = emitUnionCoerce(buf, gun2, g.letInit, -1) }
+    else if gAliasFe >= 0 { rc = emitClosureValueCore(buf, gAliasFe, -1) }
+    else { rc = emitExpr(buf, g.letInit, -1) }
+    // The snapshot restored, rather than a chosen list of seeds cleared: one this function
+    // leaves standing would outlive the whole global section.
+    expCtxApply(gcSaved)
+    if rc < 0 { return -1 }
+    return 0
+  }
+  emitFail("emitProgram: a module global cell that is not a binding")
+}
+
+// Folds every immutable cell whose own constexpr is exactly one scalar `*.const`: its bytes go
+// to `gFoldPool` for `emitFoldedConstRead`, and the cell is dropped unless an export names it.
+// Runs before the global section writes its count and before any body reads a global index.
+function captureFoldedConsts(): i32 {
+  let gi = 0
+  while gi < globalStmts.length {
+    if gCellIdx[gi] >= 0 && globalCellIsImmutable(gi) {
+      const one: u8[] = []
+      const prev = wTarget(one)
+      const rc = emitConstCellInit(one, gi)
+      wTarget(prev)
+      if rc < 0 { return -1 }
+      if wIsOneScalarConst(one) {
+        gFoldOk[gi] = 1
+        gFoldAt[gi] = gFoldPool.length
+        gFoldLen[gi] = one.length
+        let k = 0
+        while k < one.length {
+          gFoldPool.push(one[k])
+          k = k + 1
+        }
+      }
+    }
+    gi = gi + 1
+  }
+  let cell = 0
+  gi = 0
+  while gi < globalStmts.length {
+    if gCellIdx[gi] >= 0 {
+      if gFoldOk[gi] == 1 && !globalIsExportTarget(gi) {
+        gCellIdx[gi] = -1
+      } else {
+        gCellIdx[gi] = cell
+        cell = cell + 1
+      }
+    }
+    gi = gi + 1
   }
   0
 }
