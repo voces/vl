@@ -247,6 +247,7 @@ import {
   monoOrigNode,
   monoParamPinTy,
   monoProgStmts,
+  monoTwoListRet,
   reExpName,
   reExpTarget,
   rlElemName,
@@ -296,6 +297,7 @@ import {
   isSName,
   isUName,
   letRefListDestSlot,
+  listUnionSharedRep,
   monoExactSubRowOf,
   monoRetRowName,
   nodeMapArmNominalName,
@@ -312,6 +314,7 @@ import {
   synthTypeRef,
   synthTypeRefFb,
   synthTypeRefTy,
+  twoListValueTy,
   tyCanonKey,
   tyNulFuncInner,
   unRowOfCanon,
@@ -5079,29 +5082,43 @@ function monoMakeInstance(
     // ladder above named. It overrides the ladder rather than filling its -1: the shape
     // whitelist reaches its own answer and that answer is still one arm. A still-holey arm
     // declines the whole set, and `monoRegisterPinUnion` makes the minted name resolvable.
+    let twoListTy = -1
     if fn.fnRet < 0 {
       const jTy: i32[] = []
       const jDecl = monoOrigNode[origFe]
       const jl = monoInferRetSetListTy(jDecl, pinnedTyIx, letBN, letBT)
+      // Two list types stored alike (`boolean[]`, `i32[]`) build as one of them; any other
+      // pair builds the union box and is refused at a use that needs one list.
+      let sharedRep = -1
       if jl >= 0 && T.tys[jl] is TyUnion {
-        // Two list types, which the checker refuses to use as one list when the function is
-        // spelled without a type parameter; refused here, where the pin makes the join (D2745).
-        return emitFailAt(
-          "`"
-            + fn.fnName
-            + "` returns "
-            + tyToStr(jl)
-            + " at this call: two list types, not one list; annotate its return or make its returns agree",
-          calleeIx,
-        )
+        sharedRep = listUnionSharedRep(jl)
+        if sharedRep < 0 { twoListTy = jl }
       }
-      const jun = monoInferRetSetUnionName(jDecl, pinnedTyIx, letBN, letBT, jTy)
+      let jun = ""
+      if sharedRep < 0 {
+        jun = monoInferRetSetUnionName(jDecl, pinnedTyIx, letBN, letBT, jTy)
+      } else {
+        // The list the checker types the call as, where it is one of the members.
+        let pick = sharedRep
+        const dft = nodeTyIxOf(jDecl)
+        if dft >= 0 && dft < T.tys.length {
+          const dfn = T.tys[dft]
+          if dfn is TyFunc {
+            const cr = substTyDeep(dfn.fnRet, letBN, letBT)
+            if cr >= 0 && cr < T.tys.length && !tyHasTyVar(cr) {
+              if T.tys[cr] is TyArray { pick = cr }
+            }
+          }
+        }
+        const srn = tyToEmitName(pick)
+        if srn != "" { nret = synthTypeRefTy(srn, -1, pick) }
+      }
       if jun != "" {
         if monoRegisterPinUnion(jun) < 0 { return -1 }
         let jIx = -1
         if jTy.length > 0 { jIx = jTy[0] }
         nret = synthTypeRefTy(jun, -1, jIx)
-      } else if jl >= 0 {
+      } else if jl >= 0 && T.tys[jl] is TyArray {
         let jln = monoRetListRowName(jl)
         if jln == "" { jln = tyToEmitName(jl) }
         if jln != "" { nret = synthTypeRefTy(jln, -1, jl) }
@@ -5345,6 +5362,7 @@ function monoMakeInstance(
     monoInstOrig.push(origFe)
     monoInstName.push(instName)
     monoInstFe.push(instFe)
+    if twoListTy >= 0 { monoTwoListRet.set(instName, twoListTy) }
     if exSubN.length > 0 {
       monoExactSubRow.set(instFe, monoExactSubN.length)
       monoExactSubN.push(exSubN)
@@ -5881,6 +5899,17 @@ function monoCalleeHasTyParamArrow(origFe: i32): boolean {
   false
 }
 
+// Whether parameter `pIx` is annotated as a list whose spelling names one of `typarams`.
+function monoParamIsTyParamList(pIx: i32, typarams: string[]): boolean {
+  const p = P.nodes[pIx]
+  if p is Param {
+    if p.parType < 0 { return false }
+    const ann = monoDeclAnnName(p.parType, tyNameOf(p.parType), typarams)
+    return nameIsArray(ann) && monoAnnHasTyParam(ann, typarams)
+  }
+  false
+}
+
 // Set while the call being instantiated has such a parameter (`monoCalleeHasTyParamArrow`).
 let monoDestPinOff = false
 
@@ -5949,6 +5978,27 @@ function monoInstantiateCall(origFe: i32, callIx: i32, ctx: i32) {
         }
       }
       monoPreBindPastEmptyLit(params, args, fn.fnTyParams, ctx, tvN, tvV)
+      // A value of two list types handed to a parameter a type parameter spells binds no one
+      // `T`, as the same function spelled without a type parameter cannot (D2766).
+      let ta = 0
+      while ta < args.length {
+        const tat = twoListValueTy(args[ta], ctx)
+        if (
+          tat >= 0
+          && ta < params.length
+          && monoParamIsTyParamList(params[ta], fn.fnTyParams)
+        ) {
+          return emitFailAt(
+            "argument "
+              + i32ToStr(ta + 1)
+              + ": "
+              + tyToStr(tat)
+              + " is two list types, not one list — narrow with `is` first",
+            args[ta],
+          )
+        }
+        ta = ta + 1
+      }
       let i = 0
       while i < args.length {
         const p = P.nodes[params[i]]
@@ -6766,6 +6816,7 @@ export function monomorphize(stmts: i32[]) {
   monoInstFe = []
   monoParamPinTy = Map()
   monoExactSubRow = Map()
+  monoTwoListRet = Map()
   monoExactSubN = []
   monoExactSubT = []
   monoExactMemo = []
