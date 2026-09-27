@@ -73,6 +73,13 @@ built. Relative imports between the sections resolve. See `split_files`.
 
 A witness whose defect is its SIZE writes `@@repeat(<N>, "<text>")@@` for N copies of
 <text>, expanded before the program is written. See `expand_repeats`.
+
+A row whose defect is a WRONG VALUE states the correct stdout in a `Want:` block, beside its
+`Repro:`, and the grader compares what the program prints. A program that exits 0 is `runs`
+on every channel above whether its value is right or not, so without it a fixed wrong-value
+row and a regressed one grade the same. See `WANT` and `grade`; a row that ran and printed
+something other than its `Want:` is `wrong_output`, counted in MOVED and on the summary's
+second line.
 """
 import json, re, subprocess, sys, tempfile, os
 from pathlib import Path
@@ -241,7 +248,9 @@ def split_files(src):
 
 def run_program(src):
     """Classify what the compiler does with `src`, on the same three channels the
-    silent-sweep harness separates: check (diagnostic), run (value), build (module)."""
+    silent-sweep harness separates: check (diagnostic), run (value), build (module).
+    Returns (outcome, detail, stdout); `stdout` is the run's whole output when it ran, else
+    "", and is what a row's `Want:` block is compared against."""
     with tempfile.TemporaryDirectory() as td:
         for name, body in split_files(src):
             f = os.path.join(td, name)
@@ -253,29 +262,29 @@ def run_program(src):
         if chk.returncode != 0:
             diag = (chk.stdout + chk.stderr).strip()
             if PARSE_STAGE in diag:
-                return "witness_unparsed", diag[:200]
-            return "check_reject", diag[:200]
+                return "witness_unparsed", diag[:200], ""
+            return "check_reject", diag[:200], ""
         if run.returncode == 0:
-            return "runs", run.stdout.strip()[:200]
+            return "runs", run.stdout.strip()[:200], run.stdout
         err = (run.stdout + run.stderr).strip()
         if "emit error" in err:
-            return "emit_reject", err[:200]
+            return "emit_reject", err[:200], ""
         # No module at all vs a module that exists.
         out = os.path.join(td, "w.wasm")
         bld = subprocess.run([VL, "build", f, "--compiler", COMPILER, "-o", out],
                              capture_output=True, text=True, timeout=120)
         if bld.returncode != 0 and not os.path.exists(out):
-            return "compiler_trap", err[:200]
+            return "compiler_trap", err[:200], ""
         # A module WAS written, and TWO different outcomes used to share this name.
         # The engine REFUSING it (nothing runs) and the engine LOADING it and the
         # PROGRAM trapping (it runs, prints, then dies) are different defects in
         # different layers; `silent_invalid_wasm` for both sent readers to the emitter
         # when the miscompile was in what the emitted code DOES.
         if any(m in err for m in INVALID_MARKERS):
-            return "silent_invalid_wasm", err[:200]
+            return "silent_invalid_wasm", err[:200], ""
         if any(m in err for m in TRAP_MARKERS):
-            return "trap_loads", err[:200]
-        return "silent_invalid_wasm", err[:200]
+            return "trap_loads", err[:200], ""
+        return "silent_invalid_wasm", err[:200], ""
 
 
 # Specimens whose outcome is known BY CONSTRUCTION, for `--self-test`. Predicted here,
@@ -306,18 +315,55 @@ SELF_TEST = [
 ]
 
 
+# `Want:` specimens: (declared outcome, repro, Want block or None, grade predicted). The
+# program prints `4` then `x`, so each row below differs from its neighbour in ONE input.
+WANT_PROG = "print(4)\nprint(\"x\")\n"
+SELF_TEST_WANT = [
+    # A closed row that prints its Want grades `runs`; one that prints anything else is
+    # `wrong_output`, which is the regression the outcome channels cannot see.
+    ("runs", WANT_PROG, "4\nx\n", "runs"),
+    ("runs", WANT_PROG, "4\ny\n", "wrong_output"),
+    # A closed row with no `Want:` grades exactly as before.
+    ("runs", WANT_PROG, None, "runs"),
+    # An open wrong-value row is as filed while it differs from Want, and moves once it
+    # prints Want, with or without a `// PRINTS` line.
+    ("silent_wrong_value", WANT_PROG, "5\nx\n", "silent_wrong_value"),
+    ("silent_wrong_value", WANT_PROG, "4\nx\n", "runs"),
+    # `// PRINTS` is the WHOLE of stdout, so its specimens print one line.
+    ("silent_wrong_value", "print(4)\n// PRINTS 4\n", "5\n", "silent_wrong_value"),
+    # ... and a `// PRINTS` that no longer matches, with Want unmet too: wrong differently.
+    ("silent_wrong_value", "print(4)\n// PRINTS 3\n", "5\n", "wrong_output"),
+    # Trailing whitespace is not representable in a Markdown block, so it is not compared.
+    ("runs", WANT_PROG, "4  \nx\n\n", "runs"),
+]
+
+
 def self_test():
     print("outcome-vocabulary self-test (prediction stated in source, before the run)")
     bad = 0
     for want, src in SELF_TEST:
-        got, detail = run_program(src)
+        got, detail, _ = run_program(src)
         ok = got == want
         if not ok:
             bad += 1
         print(f"  want {want:20s} got {got:20s} {'ok' if ok else '** WRONG **'}")
         if not ok:
             print(f"      {detail.splitlines()[0] if detail else ''}")
-    print(f"{len(SELF_TEST)} specimens · {len(SELF_TEST)-bad} routed correctly · {bad} wrong")
+    n = len(SELF_TEST) + len(SELF_TEST_WANT)
+    print("`Want:` grading (declared, Want -> predicted)")
+    outs = {}
+    for declared, src, wanted, predicted in SELF_TEST_WANT:
+        if src not in outs:
+            outs[src] = run_program(src)
+        got, detail, stdout = outs[src]
+        row = {"status": "", "repro": src, "want": wanted}
+        graded, why = grade(row, declared, got, detail, stdout)
+        ok = graded == predicted
+        if not ok:
+            bad += 1
+        print(f"  {declared:20s} {json.dumps(wanted):16s} want {predicted:20s} "
+              f"got {graded or why!s:20s} {'ok' if ok else '** WRONG **'}")
+    print(f"{n} specimens · {n-bad} routed correctly · {bad} wrong")
     return 1 if bad else 0
 
 SEC = re.compile(r"^#{2,4}\s+(D\d+(?:-?[A-Za-z][A-Za-z0-9]*)?|[A-Z]\d+)\s+[—-]\s+(.*)$")
@@ -413,6 +459,83 @@ def block_at(lines, i):
     return src + "\n" if src.strip() else ""
 
 
+# THE ROW'S EXPECTED OUTPUT. A wrong VALUE exits 0, so on the three channels above a fixed
+# wrong-value row and a regressed one are the same `runs`; only the printed text tells them
+# apart. A row states the CORRECT stdout in a `Want:` block beside its `Repro:`:
+#
+#     Want:
+#
+#         4
+#
+# The block must follow its label after blank lines only (no prose in between, unlike
+# `Repro`'s lead-in), and holds the whole of stdout, one indented line per output line.
+# A CLOSED row must print exactly it; an OPEN `check-clean silently wrong` row grades as
+# filed while its output still differs from it. `// PRINTS` inside a repro keeps its meaning,
+# the wrong output an open row prints today.
+WANT = re.compile(r"^Want\b")
+
+
+def want_block(lines, i):
+    """The indented block directly under the `Want` lead-in at `lines[i]`, or "" when the
+    next non-blank line is not indented (a label with no block, which is ungradeable)."""
+    j = i + 1
+    while j < len(lines) and not lines[j].strip():
+        j += 1
+    if j >= len(lines) or not lines[j].startswith("    "):
+        return ""
+    body = []
+    while j < len(lines) and (lines[j].startswith("    ") or not lines[j].strip()):
+        body.append(lines[j][4:] if lines[j].startswith("    ") else "")
+        j += 1
+    return "\n".join(body).rstrip() + "\n"
+
+
+def norm_output(text):
+    """Stdout as a `Want:` block can spell it: trailing whitespace on each line and trailing
+    blank lines are not representable in Markdown, so neither is compared."""
+    return "\n".join(l.rstrip() for l in text.splitlines()).rstrip("\n")
+
+
+def grade(row, want, got, detail, stdout):
+    """(outcome to compare against the declared `want`, None), or (None, reason) when the
+    row cannot be graded. Only a row that RAN reads its output, so every other outcome
+    passes through untouched."""
+    if got == "witness_unparsed":
+        # AN UNPARSED WITNESS IS NOT A GRADE, it is a row with no program. A status may
+        # file a parse-stage refusal deliberately (D46, D444, D471 all do) and those
+        # grade as the check reject they declare; anything else lands in the fourth
+        # column. Retiring the indented fallback did not retire this: a label can be
+        # written above a paragraph too, and only running the block says so.
+        if not names_parse_error(row["status"]):
+            return None, ("the witness does not PARSE, and the status does not file a "
+                          "parse error as the outcome")
+        return "check_reject", None
+    if got != "runs":
+        return got, None
+    wanted = row.get("want")
+    matches = None if wanted is None else norm_output(stdout) == norm_output(wanted)
+    # A WRONG VALUE IS INVISIBLE ON THE THREE CHANNELS `run_program` reads: the program
+    # exits 0 either way. An open row declaring one names what it prints today
+    # (`// PRINTS <text>`, a VL comment so the program still runs verbatim), what it should
+    # print (`Want:`), or both; the grader then separates "still wrong" from "fixed" from
+    # "wrong differently". Without `Want:` the `// PRINTS` rule is exactly what it was.
+    if want == "silent_wrong_value":
+        pr = [l.split("PRINTS", 1)[1].strip()
+              for l in row["repro"].splitlines() if "// PRINTS" in l]
+        if not pr and wanted is None:
+            return None, ("declares a wrong VALUE but carries neither a `// PRINTS` line "
+                          "nor a `Want:` block")
+        if pr and detail.strip() == pr[-1]:
+            return "silent_wrong_value", None
+        if matches is False:
+            return ("wrong_output" if pr else "silent_wrong_value"), None
+        return "runs", None
+    # Every other declared outcome: a row that ran and names its output must print it.
+    if matches is False:
+        return "wrong_output", None
+    return "runs", None
+
+
 def parse(doc):
     """Yield (id, title, declared_status_line, repro_source) per section."""
     lines = Path(doc).read_text().splitlines()
@@ -422,7 +545,7 @@ def parse(doc):
         if m:
             if cur: rows.append(cur)
             cur = {"id": m.group(1), "title": m.group(2).strip(), "status": None,
-                   "repro": "", "doc": doc, "line": i + 1}
+                   "repro": "", "want": None, "want_labels": 0, "doc": doc, "line": i + 1}
             continue
         if ANYHEAD.match(ln):
             # A non-row heading CLOSES the row it follows; see `ANYHEAD`.
@@ -455,6 +578,13 @@ def parse(doc):
         # relied on the fallback now carry labels over their own unchanged programs, so the
         # rule is retired with nothing to catch. Taking the FIRST labelled block is what
         # keeps a row's `**Control**` program from being mistaken for its defect program.
+        if WANT.match(ln):
+            # The FIRST `Want` lead-in is the row's; a second is refused, not ignored, so
+            # a row cannot carry two answers and have the grader pick one silently.
+            cur["want_labels"] += 1
+            if cur["want_labels"] == 1:
+                cur["want"] = want_block(lines, i)
+            continue
         if cur["repro"] or not re.match(r"^Repro\b", ln):
             continue
         cur["repro"] = block_at(lines, i)
@@ -473,6 +603,7 @@ def main(argv):
         print(__doc__); return 2
 
     results, moved, ungradable, unparsed = [], [], [], []
+    want_checked = 0
     for doc in [d for arg in docs for d in resolve(arg)]:
         for ln_no, head in unparsed_row_heads(doc):
             unparsed.append((doc, ln_no, head))
@@ -482,34 +613,20 @@ def main(argv):
             want = declared_outcome(r["status"] or "")
             if want is None:
                 ungradable.append((r, "status line names no known outcome")); continue
-            got, detail = run_program(r["repro"])
-            # AN UNPARSED WITNESS IS NOT A GRADE, it is a row with no program. A status may
-            # file a parse-stage refusal deliberately (D46, D444, D471 all do) and those
-            # grade as the check reject they declare; anything else lands in the fourth
-            # column. Retiring the indented fallback did not retire this: a label can be
-            # written above a paragraph too, and only running the block says so.
-            if got == "witness_unparsed":
-                if not names_parse_error(r["status"]):
-                    ungradable.append((r, "the witness does not PARSE, and the status does "
-                                          "not file a parse error as the outcome"))
-                    continue
-                got = "check_reject"
-            # A WRONG VALUE IS INVISIBLE ON THE THREE CHANNELS `run_program` reads: the
-            # program exits 0 and the grader has nothing to compare its output against, so
-            # every `check-clean silently wrong` row graded `runs` and reported itself MOVED
-            # forever. That is the same blind spot the doc's own §7 says the ladder audit has,
-            # reproduced in the instrument written to catch it. A row declaring that outcome
-            # must carry the wrong output it produces, as a `// PRINTS <text>` line in its own
-            # repro (a VL comment, so the program still runs verbatim); the grader then
-            # separates "still prints the wrong thing" from "prints something else now".
-            if want == "silent_wrong_value" and got == "runs":
-                pr = [l.split("PRINTS", 1)[1].strip()
-                      for l in r["repro"].splitlines() if "// PRINTS" in l]
-                if not pr:
-                    ungradable.append(
-                        (r, "declares a wrong VALUE but the repro carries no `// PRINTS` line"))
-                    continue
-                got = "silent_wrong_value" if detail.strip() == pr[-1] else "runs"
+            if r["want_labels"] > 1:
+                ungradable.append((r, "carries more than one `Want:` block")); continue
+            if r["want_labels"] and not r["want"]:
+                ungradable.append((r, "a `Want:` label with no indented block under it"))
+                continue
+            got, detail, stdout = run_program(r["repro"])
+            got, why = grade(r, want, got, detail, stdout)
+            if got is None:
+                ungradable.append((r, why)); continue
+            if r["want"] is not None and got in ("runs", "silent_wrong_value", "wrong_output"):
+                want_checked += 1
+            if got == "wrong_output":
+                detail = ("prints " + json.dumps(norm_output(stdout))[:120] +
+                          ", Want " + json.dumps(norm_output(r["want"]))[:120])
             rec = {**r, "declared": want, "actual": got, "detail": detail,
                    "agrees": got == want}
             results.append(rec)
@@ -524,9 +641,14 @@ def main(argv):
     for r, why in ungradable:
         print(f"{r['id']:<{w}}  {'-':<22} {'-':<22} not graded ({why})")
 
+    mismatch = sum(1 for r in results if r["actual"] == "wrong_output")
     print(f"\n{len(results)} graded · {len(results)-len(moved)} as filed · "
           f"{len(moved)} MOVED · {len(ungradable)} not graded · "
           f"{len(unparsed)} UNPARSED")
+    # The OUTPUT half, on its own line so the columns above read as they always have: how
+    # many rows that ran were compared against their `Want:`, and how many printed something
+    # else. A mismatch is also counted in MOVED.
+    print(f"{want_checked} output-checked against Want · {mismatch} output mismatch")
     # EVERY ROW ABOVE WAS GRADED AGAINST A SEED, so the summary names which one. A grade is a
     # statement about the compiler that seed was built from, and on 2026-09-06 a hand run after
     # a branch switch — no `refresh-compiler.sh` — reported three MOVED rows whose fixes had

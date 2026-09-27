@@ -184,7 +184,10 @@ run "mono-tyaram-grid"         bash scripts/mono-tyaram-grid.sh
 # discipline already list both paths, and this line named one. They graded `17 as filed`
 # the day they were added here, so the gap was latent rather than a live wrong claim —
 # which is exactly the state a filed row is supposed to decay into unnoticed.
-run "filed witnesses"          "$PY" scripts/check-filed-witnesses.py --strict docs/internals/inventory docs/internals/inventory-2
+#
+# `--self-test` first (~0.3 s): the grader's outcome vocabulary and its `Want:` output rule
+# are each seen to fire on specimens before the rows are graded by them.
+run "filed witnesses"          bash -c "\"$PY\" scripts/check-filed-witnesses.py --self-test >/dev/null && \"$PY\" scripts/check-filed-witnesses.py --strict docs/internals/inventory docs/internals/inventory-2"
 # THE OTHER HALF: a row that stopped EXISTING. #2405 resolved a conflict in the inventory's
 # tail and deleted a ROW, with its citations left standing, and every gate was green —
 # the instruments above all read the rows that are there. ~0.2s, and it also runs inside

@@ -159,6 +159,20 @@ function blockFollows(lines: string[], at: number): boolean {
   return false;
 }
 
+// THE ROW'S EXPECTED OUTPUT. A wrong-value row states the correct stdout in a `Want:` block
+// beside its `Repro:`, and the grader compares what the program prints: a wrong value exits 0,
+// so without it a fixed row and a regressed one both grade `runs`. The grader's `want_block`
+// is this: the indented block must follow the label after blank lines ONLY, and a row carries
+// at most one — a second answer the grader silently ignored would be a second source of truth.
+const WANT = /^Want\b/;
+
+/** `want_block` mirrored: does the `Want` lead-in at `at` have an indented block under it? */
+function wantBlockFollows(lines: string[], at: number): boolean {
+  let j = at + 1;
+  while (j < lines.length && lines[j].trim() === "") j++;
+  return j < lines.length && lines[j].startsWith("    ");
+}
+
 type Row = {
   id: string;
   title: string;
@@ -166,6 +180,9 @@ type Row = {
   status?: string;
   sawReproLabel: boolean;
   hasRepro: boolean;
+  wantLabels: number;
+  hasWant: boolean;
+  wantBeforeRepro: boolean;
 };
 
 /** Rows and the two properties that make one gradeable — the grader's own rules. */
@@ -183,6 +200,9 @@ function parseRows(text: string): Row[] {
         line: i + 1,
         sawReproLabel: false,
         hasRepro: false,
+        wantLabels: 0,
+        hasWant: false,
+        wantBeforeRepro: false,
       };
       continue;
     }
@@ -217,6 +237,14 @@ function parseRows(text: string): Row[] {
     // label alone here would pass a row the grader reports as `no Repro block` — the exact
     // drift this test exists to prevent. Found by sabotage: deleting a row's program while
     // leaving its `Repro (…):` line made this pass and the grader fail.
+    if (WANT.test(ln)) {
+      cur.wantLabels++;
+      if (cur.wantLabels === 1) {
+        cur.hasWant = wantBlockFollows(lines, i);
+        cur.wantBeforeRepro = !cur.hasRepro;
+      }
+      continue;
+    }
     if (!cur.hasRepro && REPRO.test(ln)) {
       cur.sawReproLabel = true;
       cur.hasRepro = blockFollows(lines, i);
@@ -268,6 +296,27 @@ Deno.test("every filed inventory row carries a witness the checker can run", asy
             `${doc}:${r.line}  ${r.id} — status line names no known outcome\n` +
               `      want: a status containing one of [${phrases.join(", ")}]\n` +
               `      got:  ${r.status ?? "(no **bold** status line at all)"}`,
+          );
+        }
+        if (r.wantLabels > 1) {
+          bad.push(
+            `${doc}:${r.line}  ${r.id} — ${r.wantLabels} \`Want:\` blocks\n` +
+              `      want: at most one, the whole of the program's correct stdout\n` +
+              `      got:  ${r.wantLabels}. The grader refuses to pick one.`,
+          );
+        }
+        if (r.wantLabels > 0 && !r.hasWant) {
+          bad.push(
+            `${doc}:${r.line}  ${r.id} — a \`Want:\` label with no block under it\n` +
+              `      want: the correct stdout, indented four spaces, after blank lines only\n` +
+              `      got:  prose or nothing between the label and any indented block`,
+          );
+        }
+        if (r.hasWant && r.wantBeforeRepro) {
+          bad.push(
+            `${doc}:${r.line}  ${r.id} — \`Want:\` precedes \`Repro:\`\n` +
+              `      want: the \`Want:\` block beside and AFTER the program it grades\n` +
+              `      got:  a \`Want:\` above the row's \`Repro:\``,
           );
         }
         if (!r.hasRepro) {
@@ -352,6 +401,41 @@ const SHAPE_SPECIMENS: Array<[string, boolean, string]> = [
   ["a `Repro:` label with no block", false, "Repro (prints 42):\n\nand then prose.\n"],
   ["a parenthesised lead-in", true, "Repro (now runs, printing `42`):\n\n    print(6 * 7)\n"],
 ];
+
+// THE `Want:` RULE, SEEN TO FIRE. (specimen, hasWant predicted, wantLabels predicted).
+const WANT_SPECIMENS: Array<[string, boolean, number, string]> = [
+  ["one line", true, 1, "Want:\n\n    4\n"],
+  ["several lines", true, 1, "Want:\n\n    4\n    x\n"],
+  ["a label with no block", false, 1, "Want:\n\nprose\n"],
+  // `Repro`'s lead-in may wrap onto prose; `Want`'s may not, so prose then a block is no block.
+  ["prose between label and block", false, 1, "Want:\nprose\n\n    4\n"],
+  ["two blocks", true, 2, "Want:\n\n    4\n\nWant:\n\n    5\n"],
+  ["no label", false, 0, ""],
+];
+
+Deno.test("a `Want:` block is an indented block directly under its label", () => {
+  const bad: string[] = [];
+  for (const [name, want, labels, body] of WANT_SPECIMENS) {
+    const text = `### D1 — specimen\n**closed**\n\nRepro:\n\n    print(4)\n\n${body}`;
+    const rows = parseRows(text);
+    if (rows.length !== 1) {
+      bad.push(`${name}: want 1 parsed row, got ${rows.length}`);
+      continue;
+    }
+    if (rows[0].hasWant !== want || rows[0].wantLabels !== labels) {
+      bad.push(
+        `${name}: want hasWant ${want} / ${labels} labels, ` +
+          `got ${rows[0].hasWant} / ${rows[0].wantLabels}`,
+      );
+    }
+    if (!rows[0].hasRepro) bad.push(`${name}: the Want: block cost the row its repro`);
+  }
+  const above = parseRows("### D1 — s\n**closed**\n\nWant:\n\n    4\n\nRepro:\n\n    print(4)\n");
+  if (!above[0]?.wantBeforeRepro) bad.push("a Want: above the Repro: was not flagged");
+  if (bad.length > 0) {
+    throw new Error(`the Want: rule misroutes:\n  ${bad.join("\n  ")}`);
+  }
+});
 
 Deno.test("only a labelled indented block counts as a repro", () => {
   const bad: string[] = [];
