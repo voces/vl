@@ -676,6 +676,7 @@ import {
   mvSlotByValNameK,
   nameFieldCode,
   nameFieldCodeTy,
+  nameFreeToModule,
   nameIsNulRefList,
   nameIsRefArray,
   nameIsWholeSpanShape,
@@ -1405,7 +1406,7 @@ function dstPinAnnIn(
     const dstN: string[] = []
     const dstT: i32[] = []
     if retIx >= 0 { dstPinRetDest(bodyIx, retIx, letIx, dstN, dstT) }
-    dstPinScan(bodyIx, bodyIx, letIx, dstN, dstT)
+    dstPinScan(bodyIx, bodyIx, fnIx, letIx, dstN, dstT)
     dstPinCallerDests(letIx, fnIx, rootIx, dstN, dstT)
     if dstN.length == 0 { return 0 }
     const pinName = dstN[0]
@@ -1464,25 +1465,26 @@ function dstPinCallerDests(
       if ofx != fnIx {
         const ofn = P.nodes[ofx]
         if ofn is FuncDecl {
-          dstPinScan(ofn.fnBody, ofn.fnBody, letIx, outN, outT)
+          dstPinScan(ofn.fnBody, ofn.fnBody, ofx, letIx, outN, outT)
         }
       }
       fe = fe + 1
     }
     // The module's own statements, with the program node as the scope: `dstPinScan` skips a
     // `FuncDecl` child, so the top-level walk never sees a function's body twice.
-    dstPinScan(rootIx, rootIx, letIx, outN, outT)
+    dstPinScan(rootIx, rootIx, -1, letIx, outN, outT)
   }
   0
 }
 
-// Collect, into the parallel `outN` / `outT`, the pin name every destination inside `ix`
-// demands of the binding at `letIx`, and the annotation node to source its recorded type from
-// (-1 = mint from the name); a destination with no nominal claim pushes "". `bodyIx` is the
-// scope chains resolve in, and no nested `FuncDecl` is entered: a shadow would fake a delivery.
+// Collect into `outN` / `outT` the pin name each destination inside `ix` demands of the
+// binding at `letIx` and the annotation node its type comes from (-1: mint from the name; "":
+// no nominal claim). `bodyIx` is the scope, `scopeFn` its function (-1 for the module), and a
+// nested `FuncDecl` is not entered: a shadow would fake a delivery.
 function dstPinScan(
   ix: i32,
   bodyIx: i32,
+  scopeFn: i32,
   letIx: i32,
   outN: string[],
   outT: i32[],
@@ -1496,7 +1498,7 @@ function dstPinScan(
   // another's cells and no cell needs two.
   dstPinGlobalAssign(ix, bodyIx, letIx, outN, outT)
   dstPinLocalDest(ix, bodyIx, letIx, outN, outT)
-  dstPinCallArgs(ix, bodyIx, letIx, outN, outT)
+  dstPinCallArgs(ix, bodyIx, scopeFn, letIx, outN, outT)
   dstPinMapValue(ix, bodyIx, letIx, outN, outT)
   // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
   let cur = ix
@@ -1504,13 +1506,13 @@ function dstPinScan(
     if cur != ix {
       dstPinGlobalAssign(cur, bodyIx, letIx, outN, outT)
       dstPinLocalDest(cur, bodyIx, letIx, outN, outT)
-      dstPinCallArgs(cur, bodyIx, letIx, outN, outT)
+      dstPinCallArgs(cur, bodyIx, scopeFn, letIx, outN, outT)
       dstPinMapValue(cur, bodyIx, letIx, outN, outT)
     }
     const kids = nodeSpineChildren(cur)
     let k = 0
     while k < kids.length {
-      dstPinScan(kids[k], bodyIx, letIx, outN, outT)
+      dstPinScan(kids[k], bodyIx, scopeFn, letIx, outN, outT)
       k = k + 1
     }
     cur = elseIfLink(cur)
@@ -1947,6 +1949,7 @@ function dstPinMapValue(
 function dstPinCallArgs(
   ix: i32,
   bodyIx: i32,
+  scopeFn: i32,
   letIx: i32,
   outN: string[],
   outT: i32[],
@@ -1955,7 +1958,11 @@ function dstPinCallArgs(
   if n is Call {
     const cf = P.nodes[unwrapParen(n.callFn)]
     if cf is Ident {
-      const cfe = fnIndexOf(cf.identName)
+      // A parameter or local of the callee's name shadows the module function (D2704).
+      let cfe = -1
+      if nameFreeToModule(scopeFn, cf.identName) {
+        cfe = fnIndexOf(cf.identName)
+      }
       if cfe >= 0 && cfe < fnStmts.length {
         const cfn = P.nodes[fnStmts[cfe]]
         if cfn is FuncDecl {

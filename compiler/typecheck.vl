@@ -3459,6 +3459,9 @@ let inferRetTyIx: i32[] = []
 // stay for the emitter's indexed access (`inferRetCount`/`inferRetTyAt`) and to hold the string
 // type the map cannot.
 let inferRetIdx: {[string]: i32} = Map()
+// An un-annotated function whose returns disagree and join to one list type, keyed as
+// `inferRetIdx` is: the joined `Ty` index, which no single return's own list rep names (D2716).
+let inferJoinListIdx: {[string]: i32} = Map()
 // The binding analogue of `inferRetFn`/`inferRetTy`: an un-annotated `const`/`let` whose inferred
 // type is a value union, recorded by its LetDecl node index so the emitter classifies and lowers
 // it like an annotated value-union binding even when the initializer is one it cannot statically
@@ -4460,6 +4463,7 @@ export function initChecker() {
   inferRetTyIx = []
   inferRetRung = []
   inferRetIdx = Map()
+  inferJoinListIdx = Map()
   inferLetIx = []
   inferLetTy = []
   inferLetNulStrIx = []
@@ -43069,6 +43073,9 @@ function a20RecordFn(key: string, efn: FuncDecl, eftt: TyFunc) {
     if tyIsDeferredJoin(eftt.fnParamTypes[gp]) { generic = true }
     gp = gp + 1
   }
+  if !generic && er >= 0 && T.tys[er] is TyArray {
+    if a20RetSetDisagrees(efn.fnBody) { inferJoinListIdx[key] = er }
+  }
   if !generic && er >= 0 && er != TY_VOID && er != TY_ERR {
     // Only scalar/string returns are recorded — a structural name (`{x:i32}`, `A|B`,
     // `Tok[]`) can mis-classify, and the emitter's expression-based fallback covers those.
@@ -43266,6 +43273,13 @@ export function inferRetFnKey(declIx: i32, name: string): string {
     i = i + 1
   }
   name
+}
+
+// The joined list type `inferJoinListIdx` banked for the function keyed `name`, or -1.
+export function inferJoinListTyOf(name: string): i32 {
+  const h = inferJoinListIdx[name]
+  if h is i32 { return h }
+  -1
 }
 
 export function inferRetNameOf(name: string) {
@@ -43804,10 +43818,22 @@ function recordMapUnbox(srcExpr: i32, srcTy: i32, dstIn: i32, depth: i32) {
   const d = T.tys[dstTy]
   match d {
     TyArray => {
-      return mapUnboxListLit(srcExpr, d.aElem, depth)
+      const al = valueTailLeaves(srcExpr)
+      let ai = 0
+      while ai < al.length {
+        mapUnboxListLit(al[ai], d.aElem, depth)
+        ai = ai + 1
+      }
+      return 0
     }
     TyObj => {
-      return mapUnboxRecordLit(srcExpr, d.objFieldNames, d.objFieldTypes, depth)
+      const ol = valueTailLeaves(srcExpr)
+      let oi = 0
+      while oi < ol.length {
+        mapUnboxRecordLit(ol[oi], d.objFieldNames, d.objFieldTypes, depth)
+        oi = oi + 1
+      }
+      return 0
     }
     TyMap => {
       if !tyAllMaps(srcTy) { return 0 }
@@ -43824,6 +43850,15 @@ function recordMapUnbox(srcExpr: i32, srcTy: i32, dstIn: i32, depth: i32) {
       return 0
     }
   }
+}
+
+// The values a delivery of `srcExpr` hands over: the value itself, or every tail of a value
+// `if`, `match` or block, so a literal in an arm is walked as the bare literal is (D2730).
+function valueTailLeaves(srcExpr: i32): i32[] {
+  const spine: i32[] = []
+  const leaves: i32[] = []
+  valueTailSplit(srcExpr, spine, leaves)
+  leaves
 }
 
 // `recordMapRetag` at each value a delivery into the union `dstTy` hands over: every tail of a
