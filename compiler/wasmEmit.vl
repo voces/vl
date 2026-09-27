@@ -15544,6 +15544,11 @@ function emitAsNulNiche(body: u8[], e: AsExpr, fnIx: i32) {
 function emitAsCast(body: u8[], e: AsExpr, _exprIx: i32, fnIx: i32) {
   const obj = e.asObj
   const tgt = e.asTy
+  // An unsigned narrow load widened to i64 is the zero-extending i64 load (`zextLoadOf`).
+  if tgt == "i64" {
+    const zlAs = zextLoadOf(_exprIx, fnIx)
+    if zlAs >= 0 { return emitZextLoad(body, zlAs, fnIx) }
+  }
   // A `new v128` brand cast (`x as F32x4`, `v as! v128`) re-brands the same 128 bits — the
   // checker admitted it only between two v128s, and the canon pass spelled the brand as its base.
   // A boxed `v128 | null` or union operand takes the union arm below instead.
@@ -15842,6 +15847,9 @@ const OP_I32_LOAD8_S = 0x2c
 const OP_I32_LOAD8_U = 0x2d
 const OP_I32_LOAD16_S = 0x2e
 const OP_I32_LOAD16_U = 0x2f
+const OP_I64_LOAD8_U = 0x31
+const OP_I64_LOAD16_U = 0x33
+const OP_I64_LOAD32_U = 0x35
 const OP_I64_STORE = 0x37
 const OP_F32_STORE = 0x38
 const OP_F64_STORE = 0x39
@@ -15868,6 +15876,9 @@ function memLoadOpcode(name: string) {
   if name == "__load_i64__" { return OP_I64_LOAD }
   if name == "__load_f32__" { return OP_F32_LOAD }
   if name == "__load_f64__" { return OP_F64_LOAD }
+  if name == "__load_u8_i64__" { return OP_I64_LOAD8_U }
+  if name == "__load_u16_i64__" { return OP_I64_LOAD16_U }
+  if name == "__load_u32_i64__" { return OP_I64_LOAD32_U }
   -1
 }
 
@@ -15883,6 +15894,9 @@ function memLoadAlignExp(name: string) {
   if name == "__load_i64__" { return 3 }
   if name == "__load_f32__" { return 2 }
   if name == "__load_f64__" { return 3 }
+  if name == "__load_u8_i64__" { return 0 }
+  if name == "__load_u16_i64__" { return 1 }
+  if name == "__load_u32_i64__" { return 2 }
   -1
 }
 
@@ -16375,6 +16389,154 @@ function memAddrLoadBound(ix: i32, fnIx: i32): i64 {
     }
   }
   -1
+}
+
+// The width in bits of the zero-extended value a load intrinsic `name` can stand for in an
+// i64 fold: 8 or 16 for the unsigned narrow loads and their i64 twins, 32 for `__load_i32__`
+// and `__load_u32_i64__`, 0 for any other name.
+function zextLoadWidth(name: string): i32 {
+  if name == "__load_u8__" || name == "__load_u8_i64__" { return 8 }
+  if name == "__load_u16__" || name == "__load_u16_i64__" { return 16 }
+  if name == "__load_i32__" || name == "__load_u32_i64__" { return 32 }
+  0
+}
+
+// The node of the call at `ix` (parens peeled) when it calls a load intrinsic with a
+// `zextLoadWidth` that no binding of `fnIx` shadows, else -1.
+function zextLoadCallAt(ix: i32, fnIx: i32): i32 {
+  const x = unwrapParen(ix)
+  if x < 0 || x >= P.nodes.length { return -1 }
+  const e = P.nodes[x]
+  if e is Call {
+    const f = P.nodes[e.callFn]
+    if f is Ident {
+      if zextLoadWidth(f.identName) == 0 { return -1 }
+      if identNameIsUserBound(f.identName, fnIx) { return -1 }
+      return x
+    }
+  }
+  -1
+}
+
+// The callee name of a call node `zextLoadCallAt` answered.
+function zextLoadCallName(callIx: i32): string {
+  const e = P.nodes[callIx]
+  if e is Call {
+    const f = P.nodes[e.callFn]
+    if f is Ident { return f.identName }
+  }
+  ""
+}
+
+// An i64 `&` mask operand's value when it is 0xff, 0xffff or 0xffffffff — an integer literal,
+// or a top-level i64 `const` bound to one — else -1. An i32 const is refused: widening it
+// sign-extends, so its 0xffffffff is an all-ones i64.
+function zextMaskValue(ix: i32, fnIx: i32): i64 {
+  const x = unwrapParen(ix)
+  if x < 0 || x >= P.nodes.length { return -1 }
+  const e = P.nodes[x]
+  let v: i64 = -1
+  if e is NumLit {
+    v = memOffsetLexValue(e.numText)
+  } else if e is Ident {
+    if !exprIsI64(x, fnIx) { return -1 }
+    v = memOffsetNameConst(x, fnIx)
+  }
+  if v == 0xff || v == 0xffff || v == MEM_OFFSET_MAX { return v }
+  -1
+}
+
+// The load call whose ZERO-extended i64 value the expression at `ix` provably is, or -1: a
+// `__load_u*_i64__` call, or `__load_u8__`/`__load_u16__` cast `as`/`as%` to i64 (non-negative,
+// so its sign-extension is its zero-extension). A masked form is `zextLoadMasked`'s.
+function zextLoadOf(ix: i32, fnIx: i32): i32 {
+  const x = unwrapParen(ix)
+  if x < 0 || x >= P.nodes.length { return -1 }
+  const e = P.nodes[x]
+  if e is Call {
+    const c = zextLoadCallAt(x, fnIx)
+    if c < 0 { return -1 }
+    const cn = zextLoadCallName(c)
+    if cn == "__load_u8_i64__" || cn == "__load_u16_i64__" { return c }
+    if cn == "__load_u32_i64__" { return c }
+    return -1
+  }
+  if e is AsExpr {
+    if e.asTy != "i64" { return -1 }
+    if e.asMode != "prop" && e.asMode != "wrap" { return -1 }
+    const ac = zextLoadCallAt(e.asObj, fnIx)
+    if ac < 0 { return -1 }
+    if zextLoadCallName(ac) == "__load_i32__" { return -1 }
+    return ac
+  }
+  zextLoadMasked(x, fnIx)
+}
+
+// Whether the node at `ix` (parens peeled) is a call, a cast or an `&`: the only shapes a
+// `zextLoadOf` match can have, tested before the other side's mask is read.
+function zextLoadShape(ix: i32): boolean {
+  const x = unwrapParen(ix)
+  if x < 0 || x >= P.nodes.length { return false }
+  const e = P.nodes[x]
+  if e is BinExpr { return e.binOp == "&" }
+  e is Call || e is AsExpr
+}
+
+// `zextLoadOf` of an `&` whose one side is a `zextMaskValue` covering the other's load width:
+// the other side is a `zextLoadOf` match, or `__load_i32__` cast to i64 under exactly
+// 0xffffffff, the one mask that turns its sign-extension into a zero-extension. Else -1.
+function zextLoadMasked(x: i32, fnIx: i32): i32 {
+  const e = P.nodes[x]
+  if e is BinExpr {
+    if e.binOp != "&" { return -1 }
+    let m: i64 = -1
+    let other = -1
+    if zextLoadShape(e.binLeft) {
+      m = zextMaskValue(e.binRight, fnIx)
+      other = e.binLeft
+    }
+    if m < 0 && zextLoadShape(e.binRight) {
+      m = zextMaskValue(e.binLeft, fnIx)
+      other = e.binRight
+    }
+    if m < 0 { return -1 }
+    const inner = zextLoadOf(other, fnIx)
+    if inner >= 0 {
+      const w = zextLoadWidth(zextLoadCallName(inner))
+      if m == MEM_OFFSET_MAX || w == 8 || (w == 16 && m == 0xffff) {
+        return inner
+      }
+      return -1
+    }
+    if m != MEM_OFFSET_MAX { return -1 }
+    const o = P.nodes[unwrapParen(other)]
+    if o is AsExpr {
+      if o.asTy != "i64" { return -1 }
+      if o.asMode != "prop" && o.asMode != "wrap" { return -1 }
+      const sc = zextLoadCallAt(o.asObj, fnIx)
+      if sc >= 0 && zextLoadCallName(sc) == "__load_i32__" { return sc }
+    }
+  }
+  -1
+}
+
+// Lowers the expression `zextLoadOf` matched to its one zero-extending i64 load of `callIx`'s
+// width, the call's own address and memarg offset kept.
+function emitZextLoad(body: u8[], callIx: i32, fnIx: i32) {
+  const c = P.nodes[callIx]
+  if c is Call {
+    const w = zextLoadWidth(zextLoadCallName(callIx))
+    let nm = "__load_u32_i64__"
+    if w == 8 { nm = "__load_u8_i64__" }
+    if w == 16 { nm = "__load_u16_i64__" }
+    const off = emitMemAddr(body, c, 1, fnIx, nm)
+    if off < 0 { return -1 }
+    fbMemAccess(memLoadOpcode(nm), memLoadAlignExp(nm), off)
+    return 0
+  }
+  emitFail(
+    "emitProgram: a zero-extending load fold matched a node that is not a call",
+  )
 }
 
 // The constant term of a `+` whose OTHER side `memAddrBound` can bound at all, or -1 for any
@@ -17122,7 +17284,7 @@ function emitCallCore(body: u8[], callIx: i32, fnIx: i32) {
         }
         return 0
       }
-      // The seven other load widths (`buffer-design.md` §C2): push the address, write the
+      // The ten other load widths (`buffer-design.md` §C2): push the address, write the
       // opcode at its natural alignment — the per-width difference is exactly two bytes,
       // held in `memLoadOpcode`/`memLoadAlignExp`. `__load_i32__` keeps its own arm above.
       if !userBindsName && nameIsMemLoadIntrinsic(callee.identName) {
@@ -25842,6 +26004,11 @@ function emitShiftMaskFold(
 }
 
 function emitBinExprNode(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
+  // A mask that only zero-extends a load is the zero-extending load itself (`zextLoadOf`).
+  if e.binOp == "&" {
+    const zlAnd = zextLoadOf(exprIx, fnIx)
+    if zlAnd >= 0 { return emitZextLoad(body, zlAnd, fnIx) }
+  }
   // Assignment (`=`) is a STATEMENT, not a value expression in this slice: it has
   // no result on the stack (it `local.set`s). It is lowered by `emitAssign` from
   // `emitStmt`, so seeing it as an operand here is an unsupported nested-assignment.
