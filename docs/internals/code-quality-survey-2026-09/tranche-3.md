@@ -4,8 +4,8 @@ Surveyed at `5eee42758` for the owner's cleanup ask: duplicate code, excessive c
 non-semantic usage (redundant annotations, magic numbers, ints standing in for named
 kinds, boolean parameters, sentinel ints) and giant files, under one hard constraint:
 **the compiler must stay fast.** Each row names the file and lines, the problem, the
-change, the risk, the expected perf effect and the proof it owes. The first three
-passes are [README.md](README.md) and its linked area surveys; §6 says which of their
+change, the risk, the expected perf effect and the proof it owes. The earlier passes
+are [README.md](README.md), its three first-pass area surveys and their second passes; §6 says which of their
 rows still stand.
 
 Every number here comes from a script in §7 and should be re-derived from it, not
@@ -25,9 +25,9 @@ quoted, once the tree moves.
 | `emit_mono.vl` | 6,563 | 1,268 | 19.3 | 2 |
 | `lint.vl` | 5,117 | 935 | 18.3 | 0 |
 | `driver.vl` | 5,088 | 1,004 | 19.7 | 0 |
-| everything else (23 files) | 35,867 | 7,650 | 21.3 | 3 |
+| everything else (23 files) | 35,867 | 7,650 | 21.3 | 2 |
 
-**6,684 functions**; 226 are over 100 lines, 75 over 200, **22 over 400**. The largest:
+**7,126 top-level functions**, 445 of them one line; 222 are over 100 lines, 73 over 200, **21 over 400**. The largest:
 
 | lines | function |
 | ---: | --- |
@@ -43,7 +43,7 @@ quoted, once the tree moves.
 | 588 | `wasmEmit.vl:7146 emitArr` |
 
 **Duplicate clusters.** Normalising every identifier to `X`, number to `N` and string to
-`S` and grouping functions of six or more lines by body: **161 groups holding 484
+`S` and grouping functions of six or more lines by body: **165 groups holding 502
 functions.** Most small groups are the same SHAPE over different tables (the `fb*`
 instruction encoders, the per-type `binOpcode*` tables) and are not duplication in any
 useful sense. The real ones are §3's rows.
@@ -82,7 +82,7 @@ code, before measurement; tranche 1's rows carry their measured effect in §4.
 | # | finding | where | change | risk | perf | proof | tranche |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | 1 | **2,659 redundant-type hints**: return and binding annotations the checker infers exactly — and **removing them makes the self-compile slower** (§4.1) | `typecheck` 929, `emit_classify` 694, `driver` 330, `wasmEmit` 148, `emit_collect` 123, `emit_rep` 101, 17 more files 334 | first make inference cheap (a checker perf row, §4.1), then delete the spans | none for the output: 379 removals gave a byte-identical seed | **+70% self-compile fuel** as measured; ~2–13M fuel per inferred return, 1.4G per un-annotated list literal in `nodeChildren` | byte-identical seed AND self-compile fuel per file | not until the inference cost is fixed |
-| 2 | **the same eight-line membership scan, 38 times**; the same index-of scan 18 times | every file; see §3.1 | `compiler/listutil.vl`: `strListHas`, `i32ListHas`, `strListIndexOf` | none: identical bodies | none for the parameterised copies (a direct call replaces a direct call) | IDENTITY | **1** (15 parameterised copies); 2 (the table-bound ones, §3.1) |
+| 2 | **the same eight-line membership scan, 40 times**; the same index-of scan 18 times | every file; see §3.1 | `compiler/listutil.vl`: `strListHas`, `i32ListHas`, `strListIndexOf` | none: identical bodies | none for the parameterised copies (a direct call replaces a direct call) | IDENTITY | **1** (16 parameterised copies); 2 (the table-bound ones, §3.1) |
 | 3 | **the checker and the emitter each own a copy of the i32-lexeme tests** whose comments say they must agree | `typecheck.vl:15040`, `:15064`; `emit_bignum.vl:83`, `:106` | the checker calls `emit_bignum`'s | none | none | IDENTITY | **1** |
 | 4 | **two substring scans** | `cli_util.vl:343 cliContains`, `emit_base.vl:2989 strContains` | one `strContains` in `strutil.vl` | none | none | IDENTITY | **1** |
 | 5 | **`nestedFnDeclaredIn` twice, and the scope-chain walk around it twice**; the headers say the twin exists because of an import cycle that no longer runs that way | `emit_classify.vl:4490`, `emit_collect.vl:3181`, `:3207` | one `nestedFnDeclaredIn`, one `nestedFnOnChain`, both resolvers call it | low | none: the `nestedNameBySid` gate stays inline, so the shared walk is called only when it can hit | IDENTITY | **1** |
@@ -90,7 +90,7 @@ code, before measurement; tranche 1's rows carry their measured effect in §4.
 | 7 | **1,387 comparisons of a non-length value against a raw int** outside {-1, 0, 1}: field codes (`code`, `sFieldTypes`, `uFieldTypes`, `variantFieldTypeAt`, `memberFieldCode`: ~230), `rlElemKindTbl` (69), `mvValKind` (67), scalar codes (`scode`/`sc`/`vcode`/`vc`: ~110), list kinds (`pendingListKind`/`elemNest`/`nestKind`/`ank`: ~50) | `emit_classify` 567, `wasmEmit` 364, `typecheck` 125, `emit_collect` 109, `emit_bytes` 83 | first (a): the emitter folds a literal-initialised immutable global into `i32.const` at each read, which makes every existing named constant free; then (b) one code family at a time becomes a literal-union type (`FieldCode`, …), or named `const`s once (a) lands | (a) low, (b) medium per family | (a) removes 1,386 loads from the seed; (b) neutral after (a) | (a) corpus `cmp` plus `plumb-shape-cost`; (b) IDENTITY per family | 2 (a); 3 (b) |
 | 8 | **the rep-key renderer is written five times** (`repCanonKeyGo`, `repElemKeyGo`, `repMvValKeyGo` at 85–98% pairwise; three identical 33-line `*Id` entry points) — emitter pass 2 §5.1, not landed | `emit_rep.vl:422`, `:597`, `:802`, `:1356`, `:1586`, `:1636` | `repKeyGo(ty, mode)`; one entry body | medium: the fold table is the content | neutral | byte-identical seed; `rep-fuzz-check.sh` (mandatory) | 2 |
 | 9 | **37 `nodeTyIs*` / `nodeArrayElemIs*` predicates**, four pairs identical after normalisation — front-end pass 2 §7, not landed | `typecheck.vl:44056`–`:45676` | one `nodeArrayElemTy(ix)` and the leaf delegated to the `tyIs*` sibling | low | neutral | IDENTITY | 2 |
-| 10 | **133 functions take a `boolean` parameter** (typecheck 50, wasmEmit 29); the largest are `finishInferredReturn(causeReported)`, `tyToNameGo(nominal)`, `emitPush(wantValue)`, `emitPopGo(nulBox)`, `objShapeAdapterless(direct)` | §7 census | a two-member literal union per parameter, named for what the caller means (`"value" \| "discard"`) | low | none: both are an i32 | IDENTITY | 2 (quiet files), 3 |
+| 10 | **137 functions take a `boolean` parameter** (typecheck 52, wasmEmit 30); the largest are `finishInferredReturn(causeReported)`, `tyToNameGo(nominal)`, `emitPush(wantValue)`, `emitPopGo(nulBox)`, `objShapeAdapterless(direct)` | §7 census | a two-member literal union per parameter, named for what the caller means (`"value" \| "discard"`) | low | none: both are an i32 | IDENTITY | 2 (quiet files), 3 |
 | 11 | **`typecheck.vl` is 54k lines** with banner-marked regions that are candidate modules: the function-effects summary and getter budget (`:50747`–`:52583`), flat layouts and nominal newtypes (`:18519`–`:20239`), the deep-`is` predicates (`:52998`–`:53651`) | `typecheck.vl` | split only a region whose call graph reaches back into the checker through a narrow, listed set, since a module cannot import its importer | medium | neutral | the module graph compiles; fixpoint | 3 (needs a call-graph census first) |
 | 12 | **41,927 comment lines, 21.6% of the compiler, 2,824 `D<id>` citations**; the four comment lint codes are at zero, so what remains is content the lint cannot see: 239 backticked identifiers in comments that exist nowhere in the tree (after wasm spellings like `structref`, most are names the code no longer has — `plCacheMap`, `pushVT`, `declareLocals`, `nullSentinel`, `emitCodeSection`) | every file; `wasmEmit` 53, `emit_classify` 52, `typecheck` 42 | a stale-identifier detector as a fifth comment code, then the sweep | none | none | byte-identical seed | 2 |
 | 13 | **the `exprIsStr*` family**: four methods (`Slice`, `CpAt`, `CpLen`, `Bytes`) identical after normalisation, seven in all — first pass §4.2 | `emit_classify.vl:8837`–`:8916` | one `exprIsStrMethod(ix, name)` | low | neutral | IDENTITY | 2 |
@@ -99,7 +99,7 @@ code, before measurement; tranche 1's rows carry their measured effect in §4.
 | 16 | **the operator set is spelled three times** and one header is wrong about the other two — front-end pass 2 §8 | `ast.vl:1896`, `parser.vl:2809`, `:2827` | derive the three from one list | low | neutral | byte-identical seed | 2 |
 | 17 | **`ErrExpr.errWhat` / `errAt` are written and never read** — front-end pass 2 §10.5 | `ast.vl:75`, `:2175` | drop the fields | low | a smaller node | fixpoint; parse-error fixtures | 2 |
 | 18 | **sentinel `-1` returns: ~2,300 `return -1`** (wasmEmit 951, emit_classify 643, typecheck 418) | every file | none wholesale: an `i32 \| null` is a box, and these sit on the hottest paths. The honest-type work is the sentinel lint's (`sentinel-index-unguarded`, 326 reads) | — | a nullable would cost an allocation per answer | — | not scheduled |
-| 19 | **22 functions over 400 lines** (table in §1) | `wasmEmit` 9, `typecheck` 6 | split at seams with few live locals, as #2591 did for `checkFuncDeclNode` | medium | neutral to slightly positive (smaller frames) | byte-identical seed | 3 |
+| 19 | **21 functions over 400 lines** (table in §1) | `wasmEmit` 9, `typecheck` 6 | split at seams with few live locals, as #2591 did for `checkFuncDeclNode` | medium | neutral to slightly positive (smaller frames) | byte-identical seed | 3 |
 | 20 | **594 unused-parameter hints**, all `_`-prefixed and deliberate (a uniform signature across a family) | `wasmEmit` 57 in-file | none | — | — | — | not scheduled |
 
 Rows 2–6 are tranche 1 and are §4. Row 1 was tranche 1 until it was measured (§4.1). Rows
@@ -203,7 +203,8 @@ and 14 (row 17). Consolidated rows 19 and 20 are owner rulings. Emitter pass 2 r
 All read-only, from the worktree at `5eee42758`:
 
 * **Functions, sizes, duplicate groups, boolean parameters**: a function is
-  `^(export )?function NAME(` to the next column-0 `}`; bodies normalised as §1 says.
+  `^(export )?function NAME(` to the next column-0 `}`, or its own line when that line closes
+  its braces; bodies normalised as §1 says.
 * **Redundant annotations**: `vl check compiler/<file>.vl --severity hint --json` per file
   (the hint is reported for the entry module only), code `redundant-type`.
 * **Magic numbers**: every `<subject> (==|!=|<|<=|>|>=) <int>` outside comments and
