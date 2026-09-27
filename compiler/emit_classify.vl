@@ -718,6 +718,7 @@ import {
   unTyIx,
   unVarCount,
   unVarStart,
+  vbBoolListTop,
   vbF32Used,
   vbF64Used,
   vbI32Used,
@@ -1092,10 +1093,26 @@ function fnInferredRetTy(i: i32): i32 {
   -1
 }
 
+// The return type an un-annotated function at `fnStmts` position `i` is checked at, off its
+// recorded function type, for one with no inferred-return row (a lambda); -1 otherwise.
+function lambdaCheckedRetTy(i: i32): i32 {
+  if i < 0 || i >= fnStmts.length { return -1 }
+  const fn = P.nodes[fnStmts[i]]
+  if fn is FuncDecl {
+    if fn.fnRet >= 0 { return -1 }
+    const ft = nodeTyIxOf(fnStmts[i])
+    if ft < 0 || ft >= T.tys.length { return -1 }
+    const f = T.tys[ft]
+    if f is TyFunc { return f.fnRet }
+  }
+  -1
+}
+
 // Whether function `i`'s checker-inferred return is a union, or a nullable one, with a map
 // member: its result is the union box whatever map an arm's own expression yields (D2666).
 function fnCheckedRetIsMapUnion(i: i32): boolean {
   let t = fnInferredRetTy(i)
+  if t < 0 { t = lambdaCheckedRetTy(i) }
   if t < 0 || t >= T.tys.length { return false }
   const tn = T.tys[t]
   if tn is TyNullable { t = tn.nInner }
@@ -1220,18 +1237,19 @@ export function twoListValueTy(recvIx: i32, fnIx: i32): i32 {
   -1
 }
 
-// The first member of the union of list types `ty` when every member is stored as the same
-// scalar list (`boolean[]` beside `i32[]`), so one of them builds the whole set; -1 otherwise.
+// The first member of the union of list types `ty` when every member is the same scalar
+// list, so one of them builds the whole set; -1 otherwise. `boolean[]` beside `i32[]` shares
+// the storage but not the box tag, so the two stay a union.
 export function listUnionSharedRep(ty: i32): i32 {
   if ty < 0 || ty >= T.tys.length { return -1 }
   const t = T.tys[ty]
   if !(t is TyUnion) { return -1 }
   if t.uMembers.length < 2 { return -1 }
-  const k0 = tyPrimLeafListKind(t.uMembers[0])
+  const k0 = tyPrimLeafElemName(t.uMembers[0])
   if k0 == null { return -1 }
   let i = 1
   while i < t.uMembers.length {
-    if tyPrimLeafListKind(t.uMembers[i]) != k0 { return -1 }
+    if tyPrimLeafElemName(t.uMembers[i]) != k0 { return -1 }
     i = i + 1
   }
   t.uMembers[0]
@@ -2378,6 +2396,12 @@ export function exprNullableList(exprIx: i32, fnIx: i32) {
       return calleeRetKindAt(sidOfNode(e.callFn), fnIx, e.callFn) == "nullist"
     }
   }
+  // `u as? i32[]` out of a union box yields the arm's list or null.
+  if e is AsExpr {
+    if tyIsI32LeafElem(tyArrayElemIx(asUnionNulArmTy(exprIx, fnIx))) {
+      return true
+    }
+  }
   // `p ?? d` over the same niche stays `i32[] | null` exactly when the default can still be
   // null — the consumer half of `emitCoalesce`'s nullable-collection arm. `exprArray` claims
   // the rep in both halves; only the nullability is this classifier's question.
@@ -2405,6 +2429,9 @@ export function exprNullableRefArray(exprIx: i32, fnIx: i32) {
   // An if-expression with a null arm over a ref-array arm — see `nulArmIfThenValueIx`.
   const elIfR = nulArmIfThenValueIx(exprIx)
   if elIfR >= 0 { return exprRefArray(elIfR, fnIx) }
+  if e is AsExpr {
+    if unMemIsRefElemArray(asUnionNulArmTy(exprIx, fnIx)) { return true }
+  }
   if e is Index {
     // The map read (D1039), the sibling of `exprNullableList`'s map arm, which carries the
     // reason one arm covers both the inline `if m[k] != null` and the un-annotated binding.
@@ -2491,6 +2518,11 @@ function nulRefArrayInnerSlot(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return -1 }
   const e = P.nodes[exprIx]
   if e is Paren { return nulRefArrayInnerSlot(e.parInner, fnIx) }
+  // `u as? S[]` out of a union box: the arm's own row.
+  if e is AsExpr {
+    const asArm = asUnionNulArmTy(exprIx, fnIx)
+    if unMemIsRefElemArray(asArm) { return rlSlotOfTy(tyRefArrElemOf(asArm)) }
+  }
   // The slot half of `exprNullableRefArray`'s if-expression rung (D1560) — read off the arm
   // the kind comes from, or the binding takes slot -1 and `fbValtypeNullable` has no shape
   // to name.
@@ -2675,6 +2707,11 @@ export function exprNulScalarListKind(exprIx: i32, fnIx: i32): VKind | null {
     if exprF64Array(elIfK, fnIx) { return "nulf64list" }
     if exprI64Array(elIfK, fnIx) { return "nuli64list" }
     return null
+  }
+  // `u as? f64[]` out of a union box: the arm's distinct-backing list or null.
+  if e is AsExpr {
+    const asl = asUnionNulArmTy(exprIx, fnIx)
+    if asl >= 0 { return nulScalarListKind(tyToEmitName(asl) + "|null") }
   }
   if e is Index {
     // The map read (D1039), the sibling of `exprNullableList`'s map arm, which carries the
@@ -8911,7 +8948,7 @@ export function eqVariantListFieldKind(code: i32): i32 {
 // wrapper ref directly, so an arm's compare is a list compare over that wrapper. The two
 // alphabets differ — an atom's `7` is `i32[]`, a compare kind's `7` is `f32[]` — hence a name.
 export function leqCoreKindOfAtomKind(k: i32): i32 {
-  if k == 7 {
+  if k == 7 || k == 17 || k == 18 {
     return 0 // i32[] / boolean[] / K[]
   }
   if k == 8 {
@@ -10999,7 +11036,11 @@ function tyValueAtomKindOf(ty: i32): i32 {
       return 11
     }
     TyArray => {
-      if tyIsI32LeafElem(t.aElem) { return 7 }
+      if tyIsI32LeafElem(t.aElem) {
+        const tbk = boolTagElemKind(t.aElem)
+        if tbk >= 0 { return tbk }
+        return 7
+      }
       if tyIsStrLeafElem(t.aElem) { return 9 }
       if t.aElem < 0 { return -1 }
       const et = T.tys[t.aElem]
@@ -15702,6 +15743,22 @@ function listAnnNameOf(ix: i32, fnIx: i32) {
   if e is Index {
     const outer = listAnnNameOf(e.idxArr, fnIx)
     if outer != "" { return arrElemNameRaw(outer) }
+  }
+  // A direct call's declared return: inside a generic instance the call node keeps the
+  // template's type, and only the callee instance's return names the pinned list (D2820).
+  if e is Call {
+    if e.callFn >= 0 && P.nodes[e.callFn] is Ident {
+      const target = fnIndexOfSid(sidOfNode(e.callFn))
+      if target >= 0 && target < fnStmts.length {
+        const fn = P.nodes[fnStmts[target]]
+        if fn is FuncDecl {
+          if fn.fnRet >= 0 {
+            const rt = P.nodes[fn.fnRet]
+            if rt is TypeRef { return rt.tyName }
+          }
+        }
+      }
+    }
   }
   ""
 }
@@ -27238,11 +27295,161 @@ export function scalarTagOf(atom: string) {
 // settled before `emitModule` runs. Conditional rather than a flat 14, since a flat lift
 // would renumber every tag in a program with no `u8[]`, though any base keeps the three bands disjoint.
 export function uAtomBandTop(): i32 {
-  if mTwinExtra > 0 { return 17 + mTwinExtra }
+  if mTwinExtra > 0 { return mTwinCodeBase() + mTwinExtra }
+  if vbBoolListTop >= 0 { return mTwinCodeBase() }
   if mIntMonoArmUsed { return 17 }
   if vbV128Used { return 15 }
   if ba8Used { return 14 }
   13
+}
+
+// The first map-twin code: 17, or the first code above the boolean-leaf list codes.
+function mTwinCodeBase(): i32 {
+  if vbBoolListTop >= 0 { return 19 + vbBoolListTop }
+  17
+}
+
+// How many list layers sit above a `boolean` leaf, less one: 0 for `boolean[]`, 1 for
+// `boolean[][]`; -1 for any other type, a nullable layer included.
+export function boolLeafListDepthOfTy(ty: i32): i32 {
+  let cur = ty
+  let d = -1
+  while cur >= 0 && cur < T.tys.length && d < 64 {
+    const t = T.tys[cur]
+    if !(t is TyArray) {
+      if d >= 0 && primNameOf(cur) == "boolean" { return d }
+      return -1
+    }
+    cur = t.aElem
+    d = d + 1
+  }
+  -1
+}
+
+// The atom code a list of element `e` takes on the i32 list's storage: 17 for `boolean`, 18
+// for its `boolean | null` niche, -1 for any other element.
+export function boolTagElemKind(e: i32): i32 {
+  if primNameOf(e) == "boolean" { return 17 }
+  if e < 0 || e >= T.tys.length { return -1 }
+  const t = T.tys[e]
+  if t is TyNullable {
+    if primNameOf(t.nInner) == "boolean" { return 18 }
+  }
+  -1
+}
+
+// The boolean-list atom code of the list type `ty`: 17, 18, or `18 + depth` for a nested
+// boolean leaf; -1 for any other type.
+function tyBoolListCode(ty: i32): i32 {
+  if ty < 0 || ty >= T.tys.length { return -1 }
+  const d = boolLeafListDepthOfTy(ty)
+  if d >= 1 { return 18 + d }
+  if d == 0 { return 17 }
+  const t = T.tys[ty]
+  if t is TyArray { return boolTagElemKind(t.aElem) }
+  -1
+}
+
+// `tyBoolListCode` over a rendered list spelling.
+function boolListCodeOfName(name: string): i32 {
+  const d = boolLeafListDepthOfName(name)
+  if d >= 1 { return 18 + d }
+  if d == 0 { return 17 }
+  if valueAtomKind(name) == 18 { return 18 }
+  -1
+}
+
+// `boolLeafListDepthOfTy` over a rendered member spelling.
+function boolLeafListDepthOfName(name: string): i32 {
+  let n = name.length
+  let d = -1
+  while n >= 2 && name[n - 1] == ']' && name[n - 2] == '[' {
+    n = n - 2
+    d = d + 1
+  }
+  if d >= 0 && name.slice(0, n) == "boolean" { return d }
+  -1
+}
+
+// The boolean-list atom code of the value `ix` builds (`tyBoolListCode`): its recorded type's,
+// else inside a generic instance the pinned type's, else for a list literal its first
+// element's; -1 for any other value.
+export function exprBoolListCode(ix: i32, fnIx: i32): i32 {
+  if ix < 0 || ix >= P.nodes.length { return -1 }
+  const bix = unwrapParen(ix)
+  if bix < 0 || bix >= P.nodes.length { return -1 }
+  const c = tyBoolListCode(nodeTyIxOf(bix))
+  if c >= 0 { return c }
+  const ec = tyBoolListCode(exactOperandTyOf(bix, fnIx))
+  if ec >= 0 { return ec }
+  const pc = tyBoolListCode(nodeTyPinIxOf(bix))
+  if pc >= 0 { return pc }
+  // A name or call read inside an instance: a parameter's substituted annotation, or the callee
+  // instance's declared return (D2820's rung).
+  const an = listAnnNameOf(bix, fnIx)
+  if an != "" { return boolListCodeOfName(an) }
+  const init = frameLetInitOf(bix, fnIx)
+  if init >= 0 { return exprBoolListCode(init, fnIx) }
+  arrLitBoolListCode(bix, fnIx)
+}
+
+// The initializer of the frame binding the name read `ix` names, or -1 when `ix` is no such
+// name (or is that initializer itself).
+function frameLetInitOf(ix: i32, fnIx: i32): i32 {
+  const n = P.nodes[ix]
+  if !(n is Ident) { return -1 }
+  if fnIx < 0 || fnIx >= P.nodes.length { return -1 }
+  const fd = P.nodes[fnIx]
+  if !(fd is FuncDecl) { return -1 }
+  const li = parentLetOf(fd.fnBody, n.identName)
+  if li < 0 { return -1 }
+  const d = P.nodes[li]
+  if !(d is LetDecl) { return -1 }
+  if d.letInit < 0 || unwrapParen(d.letInit) == ix { return -1 }
+  d.letInit
+}
+
+// The boolean-list code a list literal `ix` builds from its first element; -1 for any other.
+function arrLitBoolListCode(ix: i32, fnIx: i32): i32 {
+  const n = P.nodes[ix]
+  if !(n is ArrayLit) { return -1 }
+  if n.arrElems.length == 0 { return -1 }
+  const e = n.arrElems[0]
+  if exprIsBool(e, fnIx) { return 17 }
+  const sc = exprBoolListCode(e, fnIx)
+  if sc == 17 { return 19 }
+  if sc >= 19 { return sc + 1 }
+  -1
+}
+
+// The box tag of the ref-element list `ix` built at reflist slot `slot` into union `un`: a
+// boolean-leaf list's own code where `un` has that arm, else the slot's tag.
+export function refArrBoxTagOf(ix: i32, fnIx: i32, slot: i32, un: string): i32 {
+  const c = exprBoolListCode(ix, fnIx)
+  if c >= 19 && unionHasBoolLeafArm(un, c - 18) {
+    return boolListArmTag(c - 18)
+  }
+  refArrSlotTag(slot)
+}
+
+// Whether union `un` has the boolean-leaf list arm of depth `d`.
+function unionHasBoolLeafArm(un: string, d: i32): boolean {
+  const arms: string[] = []
+  splitUnionAtoms(un, arms)
+  let i = 0
+  while i < arms.length {
+    if boolLeafListDepthOfName(arms[i]) == d { return true }
+    i = i + 1
+  }
+  false
+}
+
+// The box tag of the boolean-leaf list arm of depth `d` (code 17, or `18 + d` when nested), or
+// -1 when no union registered one that deep, which no box or test may guess at.
+export function boolListArmTag(d: i32): i32 {
+  if d < 0 || d > vbBoolListTop { return -1 }
+  if d == 0 { return scalarTagOfKind(17) }
+  scalarTagOfKind(18 + d)
 }
 
 // The globally-stable tag of the ref-element-array arm whose interned reflist slot is `slot`,
@@ -27666,7 +27873,7 @@ export function mapArmTagOfTy(ty: i32, sh: i32): i32 {
   while i < mTwinTys.length {
     if mapTwinOneStruct(mTwinShapes[i], sh) && mapTwinSame(mTwinTys[i], ty) {
       if mTwinCodes[i] < 0 { return mapSlotTag(sh) }
-      return scalarTagOfKind(17 + mTwinCodes[i])
+      return scalarTagOfKind(mTwinCodeBase() + mTwinCodes[i])
     }
     i = i + 1
   }
@@ -28343,6 +28550,20 @@ function asUnionMapTy(exprIx: i32, fnIx: i32, wantNull: boolean): i32 {
   -1
 }
 
+// The arm type `u as? T` tests for out of a union box, `T` itself; -1 for any other node.
+function asUnionNulArmTy(exprIx: i32, fnIx: i32): i32 {
+  if exprIx < 0 { return -1 }
+  const e = P.nodes[exprIx]
+  if e is AsExpr {
+    if e.asMode != "null" { return -1 }
+    if !exprUnion(e.asObj, fnIx) || !asExprIsUnionCastIn(exprIx, fnIx) {
+      return -1
+    }
+    return tyPeelNul(nodeTyIxOf(exprIx))
+  }
+  -1
+}
+
 // The map shape of a map arm's arena type: its value's mv slot, or the mono sentinel of its
 // key rep when the value interns none, so an integer-keyed mono arm names its own struct.
 export function mapArmShapeOfTy(armTy: i32): i32 {
@@ -28467,6 +28688,12 @@ export function markValueUnionAtoms(name: string) {
       lUsed = true
       aUsed = true
     }
+    // A boolean list (or its `| null` niche) rides the i32 list and lifts the band off code 17.
+    if k == 17 || k == 18 {
+      lUsed = true
+      aUsed = true
+      if vbBoolListTop < 0 { vbBoolListTop = 0 }
+    }
     if k == 8 { fa64Used = true }
     if k == 9 {
       slUsed = true
@@ -28526,6 +28753,13 @@ export function markRefArrayArms(name: string) {
       // covered row hands the arm's type straight down instead of resolving `a` again.
       let aTy = -1
       if cov { aTy = mems[i] }
+      let bd = -1
+      if cov {
+        bd = boolLeafListDepthOfTy(aTy)
+      } else {
+        bd = boolLeafListDepthOfName(a)
+      }
+      if bd > vbBoolListTop { vbBoolListTop = bd }
       internShapeDeepTy(a, aTy)
       const elem = refArrElemName(a)
       if elem != "" {
@@ -34451,7 +34685,11 @@ export function unMemAtomKind(m: i32): i32 {
     TyArray => {
       const e = t.aElem
       if e < 0 { return -1 }
-      if tyIsI32LeafElem(e) { return 7 }
+      if tyIsI32LeafElem(e) {
+        const ubk = boolTagElemKind(e)
+        if ubk >= 0 { return ubk }
+        return 7
+      }
       const et = T.tys[e]
       if et is TyPrim {
         // Exhaustive over `PrimName` and `_`-less over the per-width numeric + byte leaves; the
@@ -38103,8 +38341,9 @@ function identListRep(exprIx: i32, fnIx: i32): VKind | null {
     if uk == 9 { return "strlist" }
     if uk == 12 { return "f32list" }
     if narrowedRefArrayOf(n) != "" { return "reflist" }
-    if uk == 7 { return "list" }
-    if valueAtomKind(narrowedValueAtomOf(n)) == 7 { return "list" }
+    if uk == 7 || uk == 17 || uk == 18 { return "list" }
+    const nvk = valueAtomKind(narrowedValueAtomOf(n))
+    if nvk == 7 || nvk == 17 || nvk == 18 { return "list" }
     // A `(string | null)[]` binding the checker pinned as a list, whose own declaration no
     // storage rung below names: an un-annotated alias of a narrowed read (D2211).
     const snPin = nodeTyPinIxOf(exprIx)
@@ -38276,7 +38515,7 @@ function indexListRep(exprIx: i32, fnIx: i32): VKind | null {
     // A union-box cell narrowed to a list atom reads as that list, as `identListRep` reads a
     // narrowed name.
     const iuk = indexUnionReadKind(exprIx, fnIx)
-    if iuk == 7 { return "list" }
+    if iuk == 7 || iuk == 17 || iuk == 18 { return "list" }
     if iuk == 8 { return "f64list" }
     if iuk == 9 { return "strlist" }
     if iuk == 10 { return "i64list" }

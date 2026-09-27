@@ -522,6 +522,7 @@ import {
   unionAsSlot,
   unionSinkBase,
   variantReboxSlot,
+  vbBoolListTop,
 } from "./emit_state"
 import {
   catBackIdxOf,
@@ -666,6 +667,8 @@ import {
   binEqStructRow,
   binEqVariantRow,
   binMixHardF64,
+  boolLeafListDepthOfTy,
+  boolListArmTag,
   callIsArrSlice,
   callRefNestSlot,
   callSpillsFcpArg,
@@ -732,6 +735,7 @@ import {
   exactUnionLacksMap,
   exactUnionLacksTwin,
   exprArray,
+  exprBoolListCode,
   exprEmittedRefListSlot,
   exprF32Array,
   exprF64Array,
@@ -967,6 +971,7 @@ import {
   printUnionPlan,
   pushAsgReadNarrow,
   pushPostGuardNarrow,
+  refArrBoxTagOf,
   refArrSlotTag,
   refElemListBuildKind,
   refIfArmNeedsRecordCopy,
@@ -2400,6 +2405,11 @@ function isArmTagOfTy(ity: i32): i32 {
   let ak = unMemAtomKind(ity)
 
   if ak == 11 { return cloArmTagOfTy(ity) }
+  if ak == 17 { return boolListArmTag(0) }
+  if ak == 18 {
+    if vbBoolListTop < 0 { return -1 }
+    return scalarTagOfKind(18)
+  }
   if ak < 0 {
     if tyIsLitUnion(ity) { ak = 2 }
   }
@@ -2410,6 +2420,9 @@ function isArmTagOfTy(ity: i32): i32 {
   if unMemIsMap(ity) {
     return mapArmTagOfTy(ity, mapShapeFoldSet(mapArmShapeOfTy(ity)))
   }
+  // A nested boolean-leaf list shares its reflist slot with the `i32` twin, not its tag.
+  const bd = boolLeafListDepthOfTy(ity)
+  if bd >= 1 { return boolListArmTag(bd) }
   if unMemIsRefElemArray(ity) {
     // A list of Sets shares its element slot with the list of boolean maps, so that slot's tag
     // is not the Set list's own and no box is known to carry it (D2753).
@@ -4054,6 +4067,11 @@ function emitUnionBoxPush(_body: u8[], name: string, fnIx: i32) {
 // spellings `f64[]` / `i64[]` / `f32[]`. The caller already needs the kind for its tag.
 function listWrapHeapOfKind(k: i32) {
   if k == 7 { return lTypeIdx }
+  // A boolean list rides the i32 list; its tag code exists only once a union registered it.
+  if k == 17 || k == 18 {
+    if vbBoolListTop < 0 { return -1 }
+    return lTypeIdx
+  }
   if k == 8 { return fl64TypeIdx }
   if k == 9 { return mkListIdx }
   if k == 10 { return il64TypeIdx }
@@ -4281,7 +4299,7 @@ function emitEmptyArrUnionArm(
   } else if k == "reflist" {
     const slot = emptyArrUnionArmSlot(exprIx)
     if !unionHasRefArrayArmSlot(unionName, slot) { return 0 }
-    tag = refArrSlotTag(slot)
+    tag = refArrBoxTagOf(exprIx, fnIx, slot, unionName)
   }
   if tag < 0 { return 0 }
   fbI32Const(tag)
@@ -4378,7 +4396,11 @@ function emitUnionListLitViaRefArm(
     let armSlot = unionRefArrayArmSlotForElem(unionName, elemAtom)
     if selfArm { armSlot = selfSlot }
     if armSlot < 0 { return 0 }
-    fbI32Const(refArrSlotTag(armSlot))
+    const armTag = refArrBoxTagOf(exprIx, fnIx, armSlot, unionName)
+    if armTag < 0 {
+      return emitFail("emitProgram: boolean list arm has no tag")
+    }
+    fbI32Const(armTag)
     const savedK = pendingListKind
     const savedS = pendingListSlot
     pendingListKind = LBK_UNION
@@ -4412,7 +4434,11 @@ function emitUnionNestedListLit(
   if bare is ArrayLit {
     const armSlot = unionNestedArrayArmSlot(unionName)
     if armSlot < 0 { return 0 }
-    fbI32Const(refArrSlotTag(armSlot))
+    const nestTag = refArrBoxTagOf(exprIx, fnIx, armSlot, unionName)
+    if nestTag < 0 {
+      return emitFail("emitProgram: boolean list arm has no tag")
+    }
+    fbI32Const(nestTag)
     const savedK = pendingListKind
     const savedS = pendingListSlot
     pendingListKind = LBK_REF
@@ -4738,7 +4764,11 @@ export function emitUnionCoerce(
   if unionName != "" && exprRefArray(exprIx, fnIx) {
     const raSlot = refListSlotOfExpr(exprIx, fnIx)
     if unionHasRefArrayArmSlot(unionName, raSlot) {
-      fbI32Const(refArrSlotTag(raSlot))
+      const raTag = refArrBoxTagOf(exprIx, fnIx, raSlot, unionName)
+      if raTag < 0 {
+        return emitFail("emitProgram: boolean list arm has no tag")
+      }
+      fbI32Const(raTag)
       if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
       fbStructNew(uBoxIdx) // { tag, reflist-wrapper ref }
       return 0
@@ -4930,6 +4960,14 @@ export function emitUnionCoerce(
     cak = 13 // "u8[]"
   } else if exprArray(exprIx, fnIx) {
     cak = 7 // "i32[]"
+    // "boolean[]" (17) or "(boolean | null)[]" (18), read at this instance's pin
+    const bcode = exprBoolListCode(bareIx, fnIx)
+    if bcode == 17 || bcode == 18 { cak = bcode }
+    // A literal the union holds as another list on the same storage (`[false]` into a
+    // `(boolean | null)[]` arm) takes that arm's code.
+    if cak == 17 && !unionHasAtomKindArm(unionName, 17) {
+      if unionHasAtomKindArm(unionName, 18) { cak = 18 }
+    }
   } else if exprIsV128(exprIx, fnIx) {
     cak = 14 // "v128"
   } else if exprIsF32(exprIx, fnIx) {
@@ -15840,6 +15878,12 @@ function emitAsCast(body: u8[], e: AsExpr, _exprIx: i32, fnIx: i32) {
       if armVi < 0 && ak < 0 && unMemIsMap(tty) {
         mapHeap = mapTypeIdxOf(mapShapeFoldSet(mapArmShapeOfTy(tty)))
       }
+      // A list arm's payload is its list wrapper ref, recovered like a map's by one heap cast.
+      if armVi < 0 && ak >= 0 { mapHeap = listWrapHeapOfKind(ak) }
+      if armVi < 0 && ak < 0 && mapHeap < 0 && unMemIsRefElemArray(tty) {
+        const rs = rlSlotOfTy(tyRefArrElemOf(tty))
+        if rs >= 0 && rs < rlWrapIdx.length { mapHeap = rlWrapIdx[rs] }
+      }
     }
     // `unionArmTagsOfTy` owns the empty-arm case, so what is left is a single arm the tag
     // reached but neither the variant table nor the atom kinds can name.
@@ -15891,7 +15935,7 @@ function emitAsCast(body: u8[], e: AsExpr, _exprIx: i32, fnIx: i32) {
         fbEnd()
         return 0
       }
-      // a map target's `M | null` is the nullable map ref: the payload on the hit, a null.
+      // a map or list target's `M | null` is the nullable ref: the payload on the hit, a null.
       if mapHeap >= 0 {
         fbIfRefNul(mapHeap, true)
         fbLocalGet(unionAsSlot)
@@ -27534,7 +27578,13 @@ function nulScalarListAtomKind(kind: VKind): i32 {
 // Read off the NICHE, since the value is still nullable and classifies as no atom at all.
 function coalNicheAtomKind(lhsIx: i32, fnIx: i32): i32 {
   if exprNullableString(lhsIx, fnIx) { return 2 }
-  if exprNullableList(lhsIx, fnIx) { return 7 }
+  if exprNullableList(lhsIx, fnIx) {
+    // A boolean list tags apart from the `i32` list it shares storage with.
+    if boolLeafListDepthOfTy(tyPeelNul(nodeTyIxOf(unwrapParen(lhsIx)))) == 0 {
+      return 17
+    }
+    return 7
+  }
   const nsk = exprNulScalarListKind(lhsIx, fnIx)
   if nsk != null { return nulScalarListAtomKind(nsk) }
   -1
@@ -27546,6 +27596,7 @@ function coalNicheAtomKind(lhsIx: i32, fnIx: i32): i32 {
 function refAtomElemName(k: i32): string {
   if k == 2 { return "string" }
   if k == 7 { return "i32" }
+  if k == 17 { return "boolean" }
   if k == 8 { return "f64" }
   if k == 9 { return "string" }
   if k == 10 { return "i64" }
