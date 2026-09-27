@@ -54,6 +54,7 @@ import {
   isNumIntrinsicName,
   isValueUnionName,
   isVarTyIxOf,
+  mapUnboxTyOf,
   matchScrutAt,
   memOffsetLexValue,
   nameIsAtomicIntrinsic,
@@ -816,6 +817,7 @@ import {
   mapSlotTag,
   mapSoftTwin,
   mapTwinExact,
+  mapTwinOneStruct,
   mapTwinSame,
   mapValueTyOf,
   maskNarrowFor,
@@ -4308,7 +4310,10 @@ function mapBoxTagOf(sh: i32, unionName: string, exprIx: i32, fnIx: i32): i32 {
     let i = 0
     while i < mems.length {
       const m = mems[i]
-      if unMemIsMap(m) && mapShapeFoldSet(mapArmShapeOfTy(m)) == s {
+      if (
+        unMemIsMap(m)
+        && mapTwinOneStruct(mapShapeFoldSet(mapArmShapeOfTy(m)), s)
+      ) {
         // Members the same type count once: `A | B` over two equal maps is one member.
         if only < 0 || !mapTwinSame(only, m) { n = n + 1 }
         only = m
@@ -13945,6 +13950,39 @@ function emitStrBytes(body: u8[], callIx: i32, fnIx: i32) {
   emitFail("emitProgram: expected a string bytes call")
 }
 
+// The node `emitMapUnionPayload` is emitting as its union box, so the re-entry emits the box.
+let mapUnboxHeld = -1
+
+// A union of maps delivered as the one map `dstTy` whose storage every member shares (D2692):
+// the box, then its payload cast to that map's struct. A member of another struct is refused.
+function emitMapUnionPayload(body: u8[], exprIx: i32, dstTy: i32, fnIx: i32) {
+  const held = mapUnboxHeld
+  mapUnboxHeld = exprIx
+  const boxed = exprUnion(exprIx, fnIx)
+  const r = emitExpr(body, exprIx, fnIx)
+  mapUnboxHeld = held
+  if r < 0 || !boxed { return r }
+  const sh = mapShapeFoldSet(mapArmShapeOfTy(dstTy))
+  const mems: i32[] = []
+  flattenVariantsInto(nodeTyIxOf(exprIx), mems)
+  let i = 0
+  while i < mems.length {
+    const msh = mapShapeFoldSet(mapArmShapeOfTy(mems[i]))
+    if !mapTwinOneStruct(msh, sh) {
+      return emitFailAt(
+        "emitProgram: a union of maps cannot be delivered as "
+          + tyToEmitName(dstTy)
+          + ": a member is stored differently",
+        exprIx,
+      )
+    }
+    i = i + 1
+  }
+  fbStructGet(uBoxIdx, 1)
+  fbRefCast(mapTypeIdxOf(sh))
+  0
+}
+
 export function emitExpr(body: u8[], exprIx: i32, fnIx: i32) {
   // Stop after a recorded failure: `emitFail` banks the first message and returns -1 but
   // does not halt the pass, so a caller that drops the -1 keeps emitting over invalidated
@@ -13952,6 +13990,10 @@ export function emitExpr(body: u8[], exprIx: i32, fnIx: i32) {
   // diagnostic prints. Checking the flag at the two recursion roots makes a failure terminal wherever it happened, instead of relying on every caller in between to thread -1 outward.
   if emitFailed { return -1 }
   if exprIx < 0 { return emitFail("emitProgram: missing expression") }
+  if exprIx != mapUnboxHeld {
+    const mub = mapUnboxTyOf(exprIx)
+    if mub >= 0 { return emitMapUnionPayload(body, exprIx, mub, fnIx) }
+  }
   // A string-repped literal union reaching an atom-typed destination narrows to its
   // interned id here — one hook rather than one per destination, since `pendingLitUnion`
   // is already the context every atom-typed slot seeds. Without it the store is a

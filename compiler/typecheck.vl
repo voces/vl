@@ -3526,6 +3526,9 @@ let joinNext: i32[] = []
 // `nodeTyIx` keeps the checker's self-inferred type for its existing consumers; the emitter's rep
 // keying reads `nodeRepTyIxOf`, which falls back to `nodeTyIxOf` when nothing is recorded.
 let nodeRepTyIx: i32[] = []
+// Per node, the map type a union of maps is delivered as (D2692): the members share that map's
+// storage, so the emitter unboxes the union's payload there. -1 where nothing is recorded.
+let mapUnboxTyIx: i32[] = []
 // Literal-width sidecar, parallel to `nodeTyIx`: true at a radix `NumLit` whose destination is a
 // 64-bit slot, so its bit pattern is read at 64 bits rather than at the width its digits imply.
 // `checkNodeReal` consults it so a re-check keeps the adopted width, and the emitter reads the
@@ -4465,6 +4468,7 @@ export function initChecker() {
   isParentTyIx = []
   isParentElseTyIx = []
   nodeRepTyIx = []
+  mapUnboxTyIx = []
   litWide64 = []
   extValueSeen = false
   ckCalleeIx = -1
@@ -13562,6 +13566,7 @@ function joinWidensMap(src: i32, dst: i32): boolean {
       if containerElemClassDiffers(joinStoreTy(s.mVal), joinStoreTy(d.mVal)) {
         return true
       }
+      if mapValBoxDiffers(s.mVal, d.mVal) { return true }
       return joinWidensMap(s.mVal, d.mVal)
     }
   }
@@ -14726,6 +14731,7 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
       // D2060 — the record twin: a field widened by this delivery is shared with the source,
       // so it is legal only where nothing the delivery reaches writes it.
       rcwPend(srcExpr, srcTy, dstTy)
+      recordMapUnbox(srcExpr, srcTy, dstTy, 8)
       if objShapeAdapterlessAt(srcExpr, srcTy, dstTy) {
         objShapeAdapterlessErr(srcExpr, srcTy, dstTy)
       }
@@ -21562,6 +21568,42 @@ function containerElemClassDiffers(se: i32, de: i32): boolean {
   sc != dc
 }
 
+// Whether a map value `se` delivered as `de` changes storage though both are references: a
+// value stored bare against a union of two or more non-null members, which is stored boxed.
+function mapValBoxDiffers(se: i32, de: i32): boolean {
+  if se < 0 || de < 0 || se >= T.tys.length || de >= T.tys.length {
+    return false
+  }
+  if tyReachesHole(se, 8) || tyReachesHole(de, 8) { return false }
+  refLeafCount(de, 8) >= 2 && refLeafCount(se, 8) < 2
+}
+
+// How many non-null members `ty` has, through nested unions and `| null`; 1 for a non-union.
+function refLeafCount(ty: i32, depth: i32): i32 {
+  if ty < 0 || ty >= T.tys.length || depth <= 0 { return 1 }
+  const t = T.tys[ty]
+  match t {
+    TyNullable => {
+      return refLeafCount(t.nInner, depth - 1)
+    }
+    TyUnion => {
+      let n = 0
+      let i = 0
+      while i < t.uMembers.length {
+        if !isNullTy(t.uMembers[i]) {
+          n = n + refLeafCount(t.uMembers[i], depth - 1)
+        }
+        i = i + 1
+      }
+      return n
+    }
+    // Every other type is one member.
+    TyPrim | TyErr | TyObj | TyFunc | TyMap | TyVar | TyLit | TyNeg | TyArray => {
+      return 1
+    }
+  }
+}
+
 // Is a list element `de` strictly wider than `se`, so a store through the wider handle could
 // put in a value `se` forbids? An inference hole or `never` source decides nothing yet.
 function listElemWidens(se: i32, de: i32): boolean {
@@ -27427,7 +27469,10 @@ function objShapeAdapterless(
         shapeAdaptWidthField = false
         return true
       }
-      if containerElemClassDiffers(s.mVal, d.mVal) {
+      if (
+        containerElemClassDiffers(s.mVal, d.mVal)
+        || mapValBoxDiffers(s.mVal, d.mVal)
+      ) {
         shapeAdaptSrcTy = src
         shapeAdaptDstTy = dst
         shapeAdaptSrcExpr = cx
@@ -43473,6 +43518,99 @@ export function nodeRepTyIxOf(ix: i32) {
   }
   nodeTyIxOf(ix)
 }
+// The map type a union of maps at `ix` is delivered as, or -1 (`recordMapUnbox`).
+export function mapUnboxTyOf(ix: i32): i32 {
+  if ix >= 0 && ix < mapUnboxTyIx.length { return mapUnboxTyIx[ix] }
+  -1
+}
+
+// Records `dstTy` for a delivery of `srcExpr` whose type `srcTy` is a union of maps and whose
+// destination is one map, or that map's nullable: every member is assignable to it, so every
+// member shares its storage. A list or record literal is walked to its elements and fields.
+function recordMapUnbox(srcExpr: i32, srcTy: i32, dstIn: i32, depth: i32) {
+  if srcExpr < 0 || srcTy < 0 || dstIn < 0 || depth <= 0 { return 0 }
+  if srcTy >= T.tys.length || dstIn >= T.tys.length { return 0 }
+  const dstTy = nonNullTy(dstIn)
+  if dstTy < 0 || dstTy >= T.tys.length { return 0 }
+  const d = T.tys[dstTy]
+  match d {
+    TyArray => {
+      return mapUnboxListLit(srcExpr, d.aElem, depth)
+    }
+    TyObj => {
+      return mapUnboxRecordLit(srcExpr, d.objFieldNames, d.objFieldTypes, depth)
+    }
+    TyMap => {
+      if !tyAllMaps(srcTy) { return 0 }
+      while mapUnboxTyIx.length <= srcExpr { mapUnboxTyIx.push(-1) }
+      mapUnboxTyIx[srcExpr] = dstTy
+      return 0
+    }
+    // No other destination is one map a union of maps can be delivered as.
+    TyPrim | TyErr | TyFunc | TyUnion | TyVar | TyLit | TyNeg | TyNullable => {
+      return 0
+    }
+  }
+}
+
+// `recordMapUnbox` over each element of a list literal `srcExpr` delivered as `elemTy[]`.
+function mapUnboxListLit(srcExpr: i32, elemTy: i32, depth: i32) {
+  const e = P.nodes[srcExpr]
+  if e is ArrayLit {
+    let i = 0
+    while i < e.arrElems.length {
+      const el = e.arrElems[i]
+      recordMapUnbox(el, nodeTyIxOf(el), elemTy, depth - 1)
+      i = i + 1
+    }
+  }
+  0
+}
+
+// `recordMapUnbox` over each field of a record literal `srcExpr` delivered as the record whose
+// field names and types are `names` and `tys`.
+function mapUnboxRecordLit(
+  srcExpr: i32,
+  names: string[],
+  tys: i32[],
+  depth: i32,
+) {
+  const e = P.nodes[srcExpr]
+  if e is ObjLit {
+    let k = 0
+    while k < e.objFields.length {
+      const f = P.nodes[e.objFields[k]]
+      if f is FieldInit {
+        let j = 0
+        while j < names.length {
+          if names[j] == f.fiName {
+            recordMapUnbox(f.fiValue, nodeTyIxOf(f.fiValue), tys[j], depth - 1)
+          }
+          j = j + 1
+        }
+      }
+      k = k + 1
+    }
+  }
+  0
+}
+
+// Whether `ty` is a union every member of which is a map.
+function tyAllMaps(ty: i32): boolean {
+  const s = T.tys[ty]
+  if s is TyUnion {
+    let i = 0
+    while i < s.uMembers.length {
+      const m = s.uMembers[i]
+      if m < 0 || m >= T.tys.length { return false }
+      if !(T.tys[m] is TyMap) { return false }
+      i = i + 1
+    }
+    return true
+  }
+  false
+}
+
 // Stamps the context (destination) type `dstTy` onto a literal source `srcExpr` (recursively,
 // into `ObjLit` fields / `ArrayLit` elements) into the `nodeRepTyIx` sidecar, at arena-pure
 // adoption sites — reads only `T.tys`/`P.nodes`, writes only `nodeRepTyIx`. Nullable wrappers
