@@ -77,6 +77,7 @@ import {
   covarValueWriteState,
   eqCoreKindOfTyToken,
   externValueSeen,
+  flattenVariantsInto,
   fsIntrinsicSlot,
   fsRetIsVoid,
   fusedMapReadRecvIx,
@@ -107,6 +108,8 @@ import {
   joinRowTy,
   letNullHoleUnfilled,
   litUnionAliasNameOfTy,
+  mapValIsI32Cell,
+  mapValSoftBase,
   nameIsEmitterIntrinsic,
   nameIsInlineLitUnion,
   nameIsLitUnionArmValueUnion,
@@ -190,6 +193,7 @@ import {
   tyArrayElemIx,
   tyArrayElemPrimName,
   tyBearsNull,
+  tyEq,
   tyFieldTyOf,
   tyHasTyVar,
   tyIsI32SentinelNullable,
@@ -503,6 +507,10 @@ import {
   mI32Used,
   mI64Used,
   mIntMonoArmUsed,
+  mTwinCodes,
+  mTwinExtra,
+  mTwinShapes,
+  mTwinTys,
   mUsed,
   mfDstBases,
   mfDstKinds,
@@ -521,6 +529,7 @@ import {
   monoInstFe,
   monoInstOrig,
   monoOrigNode,
+  monoParamPinTy,
   msGen,
   msRowChain,
   msSetByText,
@@ -6604,7 +6613,7 @@ export function mvShapeOfValName(valNameIn: string) {
 // The mono map shape of a key rep — `-1`, `-4` or `-6`, named once. A value riding the shared
 // i32 `vals` list interns no slot on any key, so every resolver landing on "mono" still has to
 // say which of the three structs it means.
-export function mapMonoShapeOfKey(keyK: i32) {
+function mapMonoShapeOfKey(keyK: i32) {
   if keyK == MAP_KEY_I32 { return -4 }
   if keyK == MAP_KEY_I64 { return -6 }
   -1
@@ -26115,6 +26124,7 @@ export function scalarTagOf(atom: string) {
 // settled before `emitModule` runs. Conditional rather than a flat 14, since a flat lift
 // would renumber every tag in a program with no `u8[]`, though any base keeps the three bands disjoint.
 export function uAtomBandTop(): i32 {
+  if mTwinExtra > 0 { return 17 + mTwinExtra }
   if mIntMonoArmUsed { return 17 }
   if vbV128Used { return 15 }
   if ba8Used { return 14 }
@@ -26144,6 +26154,373 @@ export function mapSlotTag(slot: i32) {
   }
   if s >= 0 { s = mvCanonRepOf(s) }
   uVariants.length + uAtomBandTop() + 4 + s * 3
+}
+
+// Registers the union arm `ty`, a map of folded shape `sh`, in the same-struct family table:
+// the first type of a mono shape keeps the shape's tag, each further distinct type claims a
+// code above the value-atom band. Only a type the band has not yet been sized for is refused.
+export function mapTwinNote(tyIn: i32, sh: i32) {
+  const ty = unMemPeelAliasWrapper(tyIn)
+  if ty < 0 || !mapShapeIsMono(sh) || !mapArmIsI32Cell(ty) { return 0 }
+  let first = true
+  let i = 0
+  while i < mTwinTys.length {
+    if mTwinShapes[i] == sh {
+      if mapTwinSame(mTwinTys[i], ty) { return 0 }
+      first = false
+    }
+    i = i + 1
+  }
+  if first {
+    mTwinCodes.push(-1)
+  } else {
+    if emitArenaFinal {
+      return emitFail(
+        "emitProgram: a map union arm was not collected before emission",
+      )
+    }
+    mTwinCodes.push(mTwinExtra)
+    mTwinExtra = mTwinExtra + 1
+  }
+  mTwinTys.push(ty)
+  mTwinShapes.push(sh)
+  0
+}
+
+// Registers each map a test pattern `ty` names (its union and nullable members flattened) in
+// the family table, as `mapTwinNote` does a union arm.
+export function mapTwinNotePattern(ty: i32) {
+  if ty < 0 { return 0 }
+  const flat: i32[] = []
+  flattenVariantsInto(ty, flat)
+  let i = 0
+  while i < flat.length {
+    const m = unMemPeelAliasWrapper(flat[i])
+    if unMemIsMap(m) { mapTwinNote(m, mapShapeFoldSet(mapArmShapeOfTy(m))) }
+    i = i + 1
+  }
+  0
+}
+
+// `mapTwinNotePattern` over `ty` when it is a union; any other type registers nothing.
+export function mapTwinNoteUnionTy(ty: i32) {
+  if ty < 0 || ty >= T.tys.length { return 0 }
+  if T.tys[ty] is TyUnion { return mapTwinNotePattern(ty) }
+  0
+}
+
+// Whether the map `ty` stores one i32 cell per key — a Set, or a value the checker reps so —
+// the maps that share a mono struct; any other value takes its own slot and struct.
+function mapArmIsI32Cell(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  const t = T.tys[ty]
+  if t is TyMap { return t.mSet == 1 || mapValIsI32Cell(t.mVal) }
+  false
+}
+
+// Whether a folded map shape is one of the three mono structs a slot does not name.
+function mapShapeIsMono(sh: i32): boolean { sh == -1 || sh == -4 || sh == -6 }
+
+// Whether two map arm types are the one member: the checker's type equality, alias peeled. A
+// union spells `Set<K>` as the boolean map, so the two are one atom and one member (D2673).
+export function mapTwinSame(a: i32, b: i32): boolean {
+  const x = unMemPeelAliasWrapper(a)
+  const y = unMemPeelAliasWrapper(b)
+  tyEq(x, y)
+    || mapSetSpelledAs(x, y)
+    || mapSetSpelledAs(y, x)
+    || mapSoftTwin(x, y)
+}
+
+// Whether `s` is a `Set<K>` and `m` the `{[K]: boolean}` a union spelling renders it as.
+function mapSetSpelledAs(s: i32, m: i32): boolean {
+  if s < 0 || m < 0 { return false }
+  const st = T.tys[s]
+  const mt = T.tys[m]
+  if st is TyMap {
+    if mt is TyMap {
+      if st.mSet == 1 && mt.mSet == 0 {
+        return tyEq(st.mKey, mt.mKey) && tyScalarBaseIs(mt.mVal, "boolean")
+      }
+    }
+  }
+  false
+}
+
+// Whether the module's unions hold two map types of the folded shape `sh`, so a box of that
+// shape tags by member type rather than by shape.
+export function mapShapeTwinned(sh: i32): boolean {
+  if mTwinExtra == 0 || !mapShapeIsMono(sh) { return false }
+  let i = 0
+  while i < mTwinTys.length {
+    if mTwinShapes[i] == sh && mTwinCodes[i] >= 0 { return true }
+    i = i + 1
+  }
+  false
+}
+
+// The box tag of the map arm type `ty` of folded shape `sh`: its family row's code, or the
+// shape's own tag when the shape has one type. -1 for a type no union arm registered in a
+// shape that has several, which no box or test may guess at.
+export function mapArmTagOfTy(ty: i32, sh: i32): i32 {
+  // A value that is not one i32 cell rides a slot of its own; with none interned, no union
+  // arm holds this map, and the mono shape it would fall to belongs to other maps.
+  if mapShapeIsMono(sh) && !mapArmIsI32Cell(unMemPeelAliasWrapper(ty)) {
+    return -1
+  }
+  if !mapShapeTwinned(sh) { return mapSlotTag(sh) }
+  let i = 0
+  while i < mTwinTys.length {
+    if mTwinShapes[i] == sh && mapTwinSame(mTwinTys[i], ty) {
+      if mTwinCodes[i] < 0 { return mapSlotTag(sh) }
+      return scalarTagOfKind(17 + mTwinCodes[i])
+    }
+    i = i + 1
+  }
+  -1
+}
+
+// How many distinct non-null members the union `ty` has (1 for `A | A | null`, whose rep is
+// the one member's niche); 0 for -1.
+function tyDistinctNonNullMembers(ty: i32): i32 {
+  if ty < 0 { return 0 }
+  const flat: i32[] = []
+  flattenVariantsInto(ty, flat)
+  const seen: i32[] = []
+  let i = 0
+  while i < flat.length {
+    const m = unMemPeelAliasWrapper(flat[i])
+    let isNull = false
+    if m >= 0 {
+      const mt = T.tys[m]
+      if mt is TyPrim { isNull = mt.primName == "null" }
+    }
+    if m >= 0 && !isNull {
+      let dup = false
+      let j = 0
+      while j < seen.length {
+        if tyEq(seen[j], m) { dup = true }
+        j = j + 1
+      }
+      if !dup { seen.push(m) }
+    }
+    i = i + 1
+  }
+  seen.length
+}
+
+// Whether two map types are the one type, alias peeled; a Set is never its boolean map.
+export function mapTwinExact(a: i32, b: i32): boolean {
+  tyEq(unMemPeelAliasWrapper(a), unMemPeelAliasWrapper(b))
+}
+
+// Whether the map `patTy` a test names is not the map `heldTy` a nullable niche holds, so the
+// test is false whatever the niche is: a niche carries no tag, only non-null.
+export function mapNicheLacks(heldTy: i32, patTy: i32): boolean {
+  if heldTy < 0 || patTy < 0 { return false }
+  const h = unMemPeelAliasWrapper(heldTy)
+  const p = unMemPeelAliasWrapper(patTy)
+  if tyEq(h, p) { return false }
+  // A spelling renders a Set as its boolean map, so the two are told apart only by the pin.
+  if mapSetSpelledAs(h, p) || mapSetSpelledAs(p, h) { return false }
+  // A pinned annotation spells a literal-union value by its base, so a literal value on either
+  // side is told apart from the other only by a differing base.
+  const hv = tyMapValOf(h)
+  const pv = tyMapValOf(p)
+  if (
+    tyIsLitUnionOrLit(hv)
+    || tyIsLitUnionOrLit(pv)
+    || numLitUnionBaseName(hv) != ""
+    || numLitUnionBaseName(pv) != ""
+  ) {
+    if tyMapKeyKind(h) == tyMapKeyKind(p) && mapValBase(hv) == mapValBase(pv) {
+      return false
+    }
+  }
+  true
+}
+
+// The scalar a map value reps as: a literal union's base, else its own spelling.
+function mapValBase(v: i32): string {
+  const nb = numLitUnionBaseName(v)
+  if nb != "" { return nb }
+  if tyIsLitUnionOrLit(v) { return "string" }
+  tyToEmitName(v)
+}
+
+// The map an un-narrowed instance parameter `exprIx` is pinned at, read from the pin itself
+// (`monoParamPinTy`) rather than its spelling, which renders a Set as its boolean map and a
+// literal-union value by its base; -1 for any other expression.
+export function mapPinnedParamTyOf(exprIx: i32, fnIx: i32): i32 {
+  mapPinnedParamTyAt(exprIx, fnIx, 4)
+}
+
+// `mapPinnedParamTyOf` through at most `depth` `const` locals initialized from another name.
+function mapPinnedParamTyAt(exprIx: i32, fnIx: i32, depth: i32): i32 {
+  const ax = unwrapParen(exprIx)
+  if ax < 0 || depth <= 0 { return -1 }
+  const n = P.nodes[ax]
+  if n is Ident {
+    if narrowSlotOf(n.identName) >= 0 { return -1 }
+    const ptn = paramTypeNode(fnIx, n.identName)
+    if ptn >= 0 { return mapTyPeel(monoParamPinTy.get(ptn) ?? -1) }
+    if fnIx >= 0 {
+      const fd = P.nodes[fnIx]
+      if fd is FuncDecl {
+        const li = parentLetOf(fd.fnBody, n.identName)
+        if li >= 0 {
+          const ld = P.nodes[li]
+          if ld is LetDecl {
+            if ld.letKw == "const" {
+              return mapPinnedParamTyAt(ld.letInit, fnIx, depth - 1)
+            }
+          }
+        }
+      }
+    }
+  }
+  -1
+}
+
+// The maps the parameters of instance `fnIx` are pinned at, their unions and nullables
+// flattened; -2 for a parameter whose instance serves pins of two different map types.
+export function instancePinnedMaps(fnIx: i32, out: i32[]) {
+  if fnIx < 0 { return 0 }
+  const fd = P.nodes[fnIx]
+  if fd is FuncDecl {
+    let i = 0
+    while i < fd.fnParams.length {
+      const pn = P.nodes[fd.fnParams[i]]
+      if pn is Param {
+        if pn.parType >= 0 {
+          const pt = monoParamPinTy.get(pn.parType) ?? -1
+          if pt == -2 { out.push(-2) }
+          if pt >= 0 {
+            const flat: i32[] = []
+            flattenVariantsInto(pt, flat)
+            let j = 0
+            while j < flat.length {
+              const m = mapTyPeel(flat[j])
+              if m >= 0 { out.push(m) }
+              j = j + 1
+            }
+          }
+        }
+      }
+      i = i + 1
+    }
+  }
+  0
+}
+
+// Whether a niche `is P` in instance `fnIx` needs the exact pinned map to answer, with none
+// reaching the operand: a pin that is shared, spelled inexactly (a Set, a literal-union value),
+// or another map of P's struct (D2684).
+export function mapNicheNeedsPin(fnIx: i32, patTy: i32): boolean {
+  const pins: i32[] = []
+  instancePinnedMaps(fnIx, pins)
+  const ps = mapShapeFoldSet(mapArmShapeOfTy(unMemPeelAliasWrapper(patTy)))
+  let i = 0
+  while i < pins.length {
+    const q = pins[i]
+    if q < 0 { return true }
+    const t = T.tys[q]
+    if t is TyMap {
+      if t.mSet == 1 || tyIsLitUnion(t.mVal) { return true }
+      if t.mVal >= 0 && t.mVal < T.tys.length {
+        if T.tys[t.mVal] is TyLit { return true }
+      }
+    }
+    if mapShapeIsMono(ps) && mapShapeFoldSet(mapArmShapeOfTy(q)) == ps {
+      if !mapTwinExact(q, patTy) { return true }
+    }
+    i = i + 1
+  }
+  false
+}
+
+// Whether two maps are one box member but not one type: a numeric literal-union value reads as
+// its base (`{[K]: 1 | 2}` beside `{[K]: i32}`), so no tag can tell them apart (D2493).
+export function mapSoftTwin(a: i32, b: i32): boolean {
+  const x = unMemPeelAliasWrapper(a)
+  const y = unMemPeelAliasWrapper(b)
+  if x < 0 || y < 0 || tyEq(x, y) { return false }
+  const xt = T.tys[x]
+  const yt = T.tys[y]
+  if xt is TyMap {
+    if yt is TyMap {
+      if xt.mSet != yt.mSet || !tyEq(xt.mKey, yt.mKey) { return false }
+      return tyEq(mapValSoftBase(xt.mVal), mapValSoftBase(yt.mVal))
+    }
+  }
+  false
+}
+
+// The static map type of the map-valued expression `exprIx`, or -1: its recorded type, else —
+// inside a generic instance, whose clone nodes carry the parameter — a narrowing's arm, or the
+// pinned annotation of the parameter or local it names.
+export function mapValueTyOf(exprIx: i32, fnIx: i32): i32 {
+  const ax = unwrapParen(exprIx)
+  if ax < 0 { return -1 }
+  const n = P.nodes[ax]
+  if n is Ident {
+    const ni = narrowSlotOf(n.identName)
+    if ni >= 0 {
+      const nt = mapTyPeel(narrowSlotTy(ni))
+      if nt >= 0 { return nt }
+    }
+    const pp = mapPinnedParamTyOf(ax, fnIx)
+    if pp >= 0 { return pp }
+  }
+  const own = mapTyPeel(nodeTyIxOf(ax))
+  if own >= 0 { return own }
+  if n is Ident {
+    const pt = mapTyPeel(nodeTyIxOf(paramTypeNode(fnIx, n.identName)))
+    if pt >= 0 { return pt }
+    if fnIx >= 0 {
+      const fd = P.nodes[fnIx]
+      if fd is FuncDecl {
+        const li = parentLetOf(fd.fnBody, n.identName)
+        if li >= 0 {
+          const ld = P.nodes[li]
+          if ld is LetDecl { return mapTyPeel(nodeTyIxOf(ld.letType)) }
+        }
+      }
+    }
+  }
+  -1
+}
+
+// The map an `as` cast out of a union box yields (`u as! M`), or with `wantNull` the map of
+// `u as? M`, whose result is the nullable map ref; -1 when `exprIx` is no such cast.
+function asUnionMapTy(exprIx: i32, fnIx: i32, wantNull: boolean): i32 {
+  const e = P.nodes[exprIx]
+  if e is AsExpr {
+    if (e.asMode == "null") != wantNull { return -1 }
+    if !exprUnion(e.asObj, fnIx) || !asExprIsUnionCastIn(exprIx, fnIx) {
+      return -1
+    }
+    return mapTyPeel(nodeTyIxOf(exprIx))
+  }
+  -1
+}
+
+// The map shape of a map arm's arena type: its value's mv slot, or the mono sentinel of its
+// key rep when the value interns none, so an integer-keyed mono arm names its own struct.
+export function mapArmShapeOfTy(armTy: i32): i32 {
+  const ki = tyMapKeyKind(armTy)
+  const slot = mvSlotOfValTyK(tyMapValOf(armTy), ki)
+  if slot == -1 { return mapMonoShapeOfKey(ki) }
+  slot
+}
+
+// `ty` when it is a map, or a nullable map's inner map; -1 otherwise.
+function mapTyPeel(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  const t = T.tys[ty]
+  if t is TyNullable { return mapTyPeel(t.nInner) }
+  if unMemIsMap(ty) { return unMemPeelAliasWrapper(ty) }
+  -1
 }
 
 // The slot the function type rendered `nm` claims in the closure-signature tag table,
@@ -26366,6 +26743,7 @@ export function markMapUnionArms(name: string) {
         markMapKeyUsed(mapShapeKeyKind(sh))
         mIntMonoArmUsed = true
       }
+      if cov && sh != -3 { mapTwinNote(mems[i], mapShapeFoldSet(sh)) }
     }
     i = i + 1
   }
@@ -35864,6 +36242,9 @@ export function exprNullableMap(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return false }
   const e = P.nodes[exprIx]
   if e is Paren { return exprNullableMap(e.parInner, fnIx) }
+  if e is AsExpr {
+    if asUnionMapTy(exprIx, fnIx, true) >= 0 { return true }
+  }
   // …and the same `if` whose arm is itself nullable — see `nulIfArmNullableValueIx` (D1560).
   const nlIfM = nulIfArmNullableValueIx(exprIx)
   if nlIfM >= 0 {
@@ -35992,6 +36373,9 @@ export function exprMap(exprIx: i32, fnIx: i32) {
   if e is Paren { return exprMap(e.parInner, fnIx) }
   // A value `if` whose join lowers at the map rep (D2663).
   if e is IfStmt { return ifExprRefKind(exprIx, fnIx) == "map" }
+  if e is AsExpr {
+    if asUnionMapTy(exprIx, fnIx, false) >= 0 { return true }
+  }
   if e is Call {
     const callee = P.nodes[e.callFn]
     // A `Set()` is a boolean-valued string map — the same struct — treated as a map
@@ -36348,6 +36732,14 @@ export function letIsNulMap(letIx: i32, fnIx: i32) {
   if d is LetDecl {
     if d.letType >= 0 {
       if retNulMapFlag(d.letType) == 1 { return true }
+      // A union annotation is the box its initializer is coerced into, however the
+      // initializer reps alone (`if c { m } else { null }` is a nullable map) (D2683).
+      if (
+        annRepKindOf(d.letType) == "union"
+        && tyDistinctNonNullMembers(nodeTyIxOf(d.letType)) > 1
+      ) {
+        return false
+      }
     }
     return exprNullableMap(d.letInit, fnIx)
   }
@@ -36539,6 +36931,15 @@ export function mapShapeOfExpr(exprIx: i32, fnIx: i32) {
   // (`mSet`), so a set reached through a parameter, field or call walks its elements too.
   const sst = setShapeOfTy(nodeTyIxOf(exprIx))
   if sst != 0 { return sst }
+  if e is AsExpr {
+    let amt = asUnionMapTy(exprIx, fnIx, false)
+    if amt < 0 { amt = asUnionMapTy(exprIx, fnIx, true) }
+    if amt >= 0 {
+      const ast = setShapeOfTy(amt)
+      if ast != 0 { return ast }
+      return mapArmShapeOfTy(amt)
+    }
+  }
   if e is Call {
     const callee = P.nodes[e.callFn]
     if callee is Ident {

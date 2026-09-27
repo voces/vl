@@ -76,6 +76,7 @@ import {
   recordClonedNodeTy,
   substTyDeep,
   tyBearsNull,
+  tyEq,
   tyExcludesNull,
   tyHasTyVar,
   tyIsLitUnion,
@@ -236,8 +237,7 @@ import {
   monoLamPinned,
   monoLamShared,
   monoOrigNode,
-  monoPinMapFe,
-  monoPinMapTy,
+  monoParamPinTy,
   monoProgStmts,
   reExpName,
   reExpTarget,
@@ -1364,7 +1364,7 @@ function monoSubstLetType(
             if !tyHasTyVar(s2) { sty = s2 }
           }
         }
-        return synthTypeRefTy(sub, tn.pos, sty)
+        return synthTypeRefTy(monoPinMintedUnion(sub, sty), tn.pos, sty)
       }
     }
   }
@@ -4167,6 +4167,65 @@ function monoPinUnionName(rs: string): string {
   c
 }
 
+// The spelling a parameter or local annotation of type `ty` takes when a pin substitutes into a
+// union holding a map (`V | {[K]: i32}` at `V := {[K]: boolean}`): registered under the canon key
+// a direct spelling reuses, as a return's is, since `collectU` ran before this pass. Unboxed, the
+// binding would be the bare map of its initializer and `is` would answer from that (D2657).
+function monoPinMintedUnion(name: string, ty: i32): string {
+  if !monoTyHoldsMap(ty) || isUName(name) { return name }
+  const atoms: string[] = []
+  splitUnionAtoms(name, atoms)
+  if atoms.length < 2 { return name }
+  const c = monoPinUnionName(name)
+  if monoRegisterPinUnion(c) < 0 { return name }
+  c
+}
+
+// A registry hit serves this call's pins from an instance built for others: a parameter whose
+// recorded pin is a different type is marked -2, so no test answers from either (D2684).
+function monoPoisonSharedPins(instFe: i32, pinTys: i32[]) {
+  if instFe < 0 || instFe >= fnStmts.length { return 0 }
+  const fd = P.nodes[fnStmts[instFe]]
+  if fd is FuncDecl {
+    let j = 0
+    while j < fd.fnParams.length && j < pinTys.length {
+      const pn = P.nodes[fd.fnParams[j]]
+      if pn is Param {
+        if pn.parType >= 0 && pinTys[j] >= 0 {
+          // Only two different MAP pins conflict: a `null` argument holds no map, so a map pin
+          // arriving after one takes its place.
+          const was = monoParamPinTy.get(pn.parType) ?? -1
+          if was >= 0 && monoTyHoldsMap(pinTys[j]) && !tyEq(was, pinTys[j]) {
+            if monoTyHoldsMap(was) {
+              monoParamPinTy.set(pn.parType, -2)
+            } else {
+              monoParamPinTy.set(pn.parType, pinTys[j])
+            }
+          }
+        }
+      }
+      j = j + 1
+    }
+  }
+  0
+}
+
+// Whether the union or nullable `ty` has a map among its members.
+function monoTyHoldsMap(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  const flat: i32[] = []
+  flattenVariantsInto(ty, flat)
+  let i = 0
+  while i < flat.length {
+    const m = flat[i]
+    if m >= 0 && m < T.tys.length {
+      if T.tys[m] is TyMap { return true }
+    }
+    i = i + 1
+  }
+  false
+}
+
 // D1042 — register a union that exists only because a pin minted it here. `collectU`
 // runs before `monomorphize` and nothing re-runs it, so a `T | E` return at a concrete `T`
 // has no row and every consumer of the box hits its floor. `registerInlineUnion` self-gates
@@ -4181,31 +4240,6 @@ function monoRegisterPinUnion(name: string) {
   // Re-rank only when a variant is pushed: `assignTags` ranks variants globally and a value
   // union pushes none, so unconditional re-ranking would be quadratic.
   if uVariants.length != before { return assignTags() }
-  0
-}
-
-// Record every map the pinned types `pinTys` hold, flattened out of unions, against the
-// instance `instFe`'s declaration node (`monoPinMapFe`/`monoPinMapTy`); the node, since
-// `fnStmts` positions move after this pass.
-function monoNotePinMaps(instFe: i32, pinTys: i32[]) {
-  let i = 0
-  while i < pinTys.length {
-    const flat: i32[] = []
-    if pinTys[i] >= 0 { flattenVariantsInto(pinTys[i], flat) }
-    let j = 0
-    while j < flat.length {
-      const m = flat[j]
-      if m >= 0 && m < T.tys.length {
-        const mt = T.tys[m]
-        if mt is TyMap && instFe >= 0 && instFe < fnStmts.length {
-          monoPinMapFe.push(fnStmts[instFe])
-          monoPinMapTy.push(m)
-        }
-      }
-      j = j + 1
-    }
-    i = i + 1
-  }
   0
 }
 
@@ -4268,6 +4302,7 @@ function monoMakeInstance(
     let k = 0
     while k < monoKeys.length {
       if monoKeys[k] == key {
+        monoPoisonSharedPins(monoInstFe[k], pinTys)
         const cal = P.nodes[calleeIx]
         if cal is Ident {
           // A registry hit on a capturing lambda in the binding's own slot must stay a
@@ -4348,7 +4383,12 @@ function monoMakeInstance(
             nt = p3.parType
           } else {
             monoNicheNulListCheck(tyNameOf(p3.parType), fn.fnTyParams, tvN, tvV)
-            nt = synthTypeRefFb(pinned[pj], -1, pinTys[pj])
+            nt = synthTypeRefFb(
+              monoPinMintedUnion(pinned[pj], pinTys[pj]),
+              -1,
+              pinTys[pj],
+            )
+            if pinTys[pj] >= 0 { monoParamPinTy.set(nt, pinTys[pj]) }
             synthed = true
           }
         } else if annotateI32 || pinned[pj] != "i32" {
@@ -4959,7 +4999,6 @@ function monoMakeInstance(
     monoInstOrig.push(origFe)
     monoInstName.push(instName)
     monoInstFe.push(instFe)
-    monoNotePinMaps(instFe, pinTys)
     while fnInstOrigin.length <= instFe { fnInstOrigin.push(-1) }
     if instFe != origFe {
       fnInstOrigin[instFe] = origFe
@@ -6318,8 +6357,7 @@ export function monomorphize(stmts: i32[]) {
   monoInstOrig = []
   monoInstName = []
   monoInstFe = []
-  monoPinMapFe = []
-  monoPinMapTy = []
+  monoParamPinTy = Map()
   monoProgStmts = stmts
   // The index follows the table it answers for, at the write and not at a build point:
   // between the two there is no reader, so `monoModuleLetOf` cannot see an empty column.

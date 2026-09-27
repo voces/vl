@@ -387,8 +387,6 @@ import {
   mfScratchBase,
   mkArrIdx,
   mkListIdx,
-  monoPinMapFe,
-  monoPinMapTy,
   mvMapTypeIdx,
   mvRlSlot,
   mvValKind,
@@ -763,6 +761,7 @@ import {
   indexElemUnionName,
   indexPlaceNonNull,
   inferredRetMapSlot,
+  instancePinnedMaps,
   internAtom,
   internInlineShapeTy,
   isNulScalarListFieldCode,
@@ -801,7 +800,11 @@ import {
   localIndexOf,
   localSlotIsLitAtom,
   mapAnnShape,
-  mapMonoShapeOfKey,
+  mapArmShapeOfTy,
+  mapArmTagOfTy,
+  mapNicheLacks,
+  mapNicheNeedsPin,
+  mapPinnedParamTyOf,
   mapReadNarrowableSlot,
   mapReadNarrowedAtomKind,
   mapReadNarrowedContainer,
@@ -810,7 +813,12 @@ import {
   mapRecvScalarBoxKindTy,
   mapRetExprShape,
   mapShapeOfExpr,
+  mapShapeTwinned,
   mapSlotTag,
+  mapSoftTwin,
+  mapTwinExact,
+  mapTwinSame,
+  mapValueTyOf,
   maskNarrowFor,
   memIsNarrowed,
   memNarrowVariantIndex,
@@ -834,7 +842,6 @@ import {
   mvListValKind,
   mvSlotNullable,
   mvSlotOfMapNameTy,
-  mvSlotOfValTyK,
   mvValInnerRlSlot,
   mvValIsMap,
   mvValStructIdxOf,
@@ -1024,8 +1031,6 @@ import {
   repScanLim,
   scalarTagOfKind,
   tyDenotesFunc,
-  tyMapKeyKind,
-  tyMapValOf,
   valBlockTypeOfKind,
   vbHeapIdxOfKind,
 } from "./emit_rep"
@@ -2271,7 +2276,11 @@ function isArmTagOfTy(ity: i32): i32 {
   }
   if ak >= 0 { return scalarTagOfKind(ak) }
 
-  if unMemIsMap(ity) { return mapSlotTag(mapArmShapeOfTy(ity)) }
+  // A map type no box arm registered claims no tag (-1): a nullable single map is a niche whose
+  // test is the null test, and no box can hold a type none of its arms is (D2493).
+  if unMemIsMap(ity) {
+    return mapArmTagOfTy(ity, mapShapeFoldSet(mapArmShapeOfTy(ity)))
+  }
   if unMemIsRefElemArray(ity) {
     const sl = rlSlotOfTy(tyRefArrElemOf(ity))
     if sl >= 0 { return refArrSlotTag(sl) }
@@ -2610,6 +2619,25 @@ function nulNicheBaseClass(recvIx: i32, fnIx: i32) {
 // so `recv is <ity>` is statically false — else the niche's own null test would wrongly
 // answer true for every present value too. One-sided: both halves must be positively known.
 function nulNicheIsTestImpossible(recvIx: i32, ity: i32, fnIx: i32) {
+  // A map niche holds one map type: a pattern naming another map is never it (D2493).
+  if unMemIsMap(ity) && !exprUnion(recvIx, fnIx) {
+    // An instance parameter's pin names the niche's map exactly; a spelling needs the lenient
+    // comparison, which declines where a Set or a literal union could be either.
+    const pin = mapPinnedParamTyOf(recvIx, fnIx)
+    if pin >= 0 { return !mapTwinExact(pin, ity) }
+    // No pin reaches this receiver, and the answer turns on which of the instance's maps it
+    // holds, which its spelling cannot say (D2684).
+    if mapNicheNeedsPin(fnIx, ity) {
+      emitFailAt(
+        "emitProgram: `is` cannot tell "
+          + tyToEmitName(ity)
+          + " from this instance's pinned map yet: test the parameter itself",
+        recvIx,
+      )
+      return false
+    }
+    return mapNicheLacks(mapValueTyOf(recvIx, fnIx), ity)
+  }
   const pTest = isTestValuePrimName(ity)
   if pTest == "" { return false }
   const base = nulNicheBaseClass(recvIx, fnIx)
@@ -2779,81 +2807,55 @@ function emitVariantDiscrimTest(body: u8[], recvIx: i32, vi: i32, fnIx: i32) {
   0
 }
 
-// D2493 where the checker could not see it — a generic instance, a `T | string` parameter, a
-// union formed in a body: the receiver's box holds two mono maps of one key rep, which share one
-// tag, and the pattern `patTy` names one without the other, so a tag compare would answer for
-// both. Refused loudly at `at`; -1 when refused, 0 when the test can be lowered.
-function mapTwinTagFail(
-  recvIx: i32,
-  patTy: i32,
-  fnIx: i32,
-  at: i32,
-  what: string,
-): i32 {
+// A box test naming a map with a numeric literal-union value, or its base twin, where the box
+// cannot say which it holds: the receiver's union has two members of that one member class, or
+// the instance is pinned at the other (D2493). Refused at `at`; -1 when refused, else 0.
+function mapSoftTwinTagFail(recvIx: i32, patTy: i32, fnIx: i32, at: i32): i32 {
   if patTy < 0 { return 0 }
   const pat: i32[] = []
   flattenVariantsInto(patTy, pat)
-  // The receiver's box members, plus every map this instance's pins hold: a pin can collapse
-  // the body's union so no name shows the pair, and the pins still say what `T` became.
-  const mems: i32[] = []
+  const arms: i32[] = []
   const nm = unionNameOfExpr(recvIx, fnIx)
   if nm != "" {
     const atoms: string[] = []
-    const armTys: i32[] = []
-    if unionSetArmTys(nm, atoms, armTys) {
-      let a = 0
-      while a < armTys.length {
-        mems.push(armTys[a])
-        a = a + 1
-      }
-    }
+    unionSetArmTys(nm, atoms, arms)
   }
-  let q = 0
-  while q < monoPinMapFe.length {
-    if monoPinMapFe[q] == fnIx { mems.push(monoPinMapTy[q]) }
-    q = q + 1
-  }
-  if mems.length == 0 { return 0 }
+  const pins: i32[] = []
+  instancePinnedMaps(fnIx, pins)
   let i = 0
   while i < pat.length {
     const pm = pat[i]
     if unMemIsMap(pm) {
-      const ps = mapArmShapeOfTy(pm)
+      let inClass = 0
+      let soft = false
       let j = 0
-      while j < mems.length {
-        const m = mems[j]
-        if ps < 0 && unMemIsMap(m) && !mapTwinInPattern(pat, m) {
-          if mapArmShapeOfTy(m) == ps {
-            return emitFailAt(
-              "emitProgram: "
-                + what
-                + " cannot tell "
-                + tyToEmitName(pm)
-                + " from "
-                + tyToEmitName(m)
-                + " yet: this instance's union holds both, and they share one representation — wrap each map in a record with a discriminant field",
-              at,
-            )
-          }
+      while j < arms.length {
+        if unMemIsMap(arms[j]) && mapTwinSame(arms[j], pm) {
+          inClass = inClass + 1
+          if !mapTwinExact(arms[j], pm) { soft = true }
         }
         j = j + 1
+      }
+      let q = 0
+      while q < pins.length {
+        if pins[q] >= 0 && mapSoftTwin(pins[q], pm) {
+          soft = true
+          inClass = 2
+        }
+        q = q + 1
+      }
+      if soft && inClass > 1 {
+        return emitFailAt(
+          "emitProgram: a test cannot tell "
+            + tyToEmitName(pm)
+            + " from the map its numeric literal union reads as yet — wrap each map in a record with a discriminant field",
+          at,
+        )
       }
     }
     i = i + 1
   }
   0
-}
-
-// Whether the arena type `m` is one of the pattern's members.
-function mapTwinInPattern(pat: i32[], m: i32): boolean {
-  let i = 0
-  while i < pat.length {
-    if tySame(pat[i], m) { return true }
-    // A set and the map it lowers as render alike; the checker already refuses that pair.
-    if tyToEmitName(pat[i]) == tyToEmitName(m) { return true }
-    i = i + 1
-  }
-  false
 }
 
 // Lower a type guard `recv is X`: a narrowed operand's narrowing is lifted for the test, an
@@ -2914,11 +2916,6 @@ function isNarrowMaskKey(recvIx: i32, fnIx: i32): string {
 // proved the tested shape is the sole non-null member, which monomorphization can break (D950).
 function emitIsTest(body: u8[], isIx: i32, fnIx: i32) {
   const nd0 = P.nodes[isIx]
-  if nd0 is IsExpr {
-    if mapTwinTagFail(nd0.isObj, isVarTyIxOf(isIx), fnIx, isIx, "`is`") < 0 {
-      return -1
-    }
-  }
   if nd0 is IsExpr {
     const imk = mapReadScalarBoxKind(nd0.isObj, fnIx)
     if imk >= 0 {
@@ -3059,7 +3056,22 @@ function emitIsTest(body: u8[], isIx: i32, fnIx: i32) {
 
   const ndv = P.nodes[isIx]
   if ndv is IsExpr {
+    if mapSoftTwinTagFail(ndv.isObj, isVarTyIxOf(isIx), fnIx, isIx) < 0 {
+      return -1
+    }
     const armTag = isArmTagOfTy(isVarTyIxOf(isIx))
+    // A map type no arm of the box registered is a member of no value it can hold (a generic
+    // body's `is M` at a pin whose union lacks `M`): the answer is false, after the receiver.
+    if (
+      armTag < 0
+      && unMemIsMap(isVarTyIxOf(isIx))
+      && exprUnion(ndv.isObj, fnIx)
+    ) {
+      if emitExpr(body, ndv.isObj, fnIx) < 0 { return -1 }
+      fbDrop()
+      fbI32Const(0)
+      return 0
+    }
 
     // the tag compare below is unsound for a litunion tested type over a box with two
     // string-repped arms: the litunion arm shares kind 2's tag with a plain `string` arm,
@@ -4077,15 +4089,6 @@ function emitMapUnionUnboxRead(body: u8[], name: string, fnIx: i32) {
   0
 }
 
-// The map shape of a map arm's arena type: its value's mv slot, or the mono sentinel of its
-// key rep when the value interns none, so an integer-keyed mono arm names its own struct.
-function mapArmShapeOfTy(armTy: i32): i32 {
-  const ki = tyMapKeyKind(armTy)
-  const slot = mvSlotOfValTyK(tyMapValOf(armTy), ki)
-  if slot == -1 { return mapMonoShapeOfKey(ki) }
-  slot
-}
-
 // An empty `[]` into a union with no `i32[]` arm, built and tagged as the list arm the checker
 // adopted it as. The value-atom ladder classifies every empty literal `i32[]` and re-maps only
 // onto the scalar-list arms, so a string or ref-list arm got the i32 backing (D2202).
@@ -4290,6 +4293,43 @@ function mapBoxTag(sh: i32): i32 {
   mapSlotTag(s)
 }
 
+// The tag the map value `exprIx` of shape `sh` boxes under in `unionName`. Where two map types
+// of the module's unions share that struct (D2493), each owns a tag, so the member is chosen by
+// TYPE: the union's one arm of the shape, else the arm the value's static type is.
+function mapBoxTagOf(sh: i32, unionName: string, exprIx: i32, fnIx: i32): i32 {
+  const s = mapShapeFoldSet(sh)
+  if !mapShapeTwinned(s) { return mapBoxTag(s) }
+  const vt = mapValueTyOf(exprIx, fnIx)
+  let arm = -1
+  let only = -1
+  let n = 0
+  const atoms: string[] = []
+  const mems: i32[] = []
+  if unionSetArmTys(unionName, atoms, mems) {
+    let i = 0
+    while i < mems.length {
+      const m = mems[i]
+      if unMemIsMap(m) && mapShapeFoldSet(mapArmShapeOfTy(m)) == s {
+        // Members the same type count once: `A | B` over two equal maps is one member.
+        if only < 0 || !mapTwinSame(only, m) { n = n + 1 }
+        only = m
+        if vt >= 0 && mapTwinSame(m, vt) { arm = m }
+      }
+      i = i + 1
+    }
+  }
+  if arm < 0 && n == 1 { arm = only }
+  if arm < 0 && n == 0 { arm = vt }
+  const tag = mapArmTagOfTy(arm, s)
+  if tag < 0 {
+    return emitFailAt(
+      "emitProgram: a map value's union arm cannot be told from another map of its representation",
+      exprIx,
+    )
+  }
+  tag
+}
+
 // D1029 — the map arm's re-box: the arm's tag, the map ref, one `struct.new`. Returns 1
 // handled, 0 not a map arm, -1 on error. A value narrowed to the union's map arm reads unboxed
 // in that scope, so delivering it to a destination typed at the union has to put the box back.
@@ -4301,10 +4341,12 @@ function emitUnionMapArmBox(
   fnIx: i32,
 ): i32 {
   if unionName == "" { return 0 }
+  // A value `if` boxes arm by arm (`emitUnionCoerce`'s join): its two arms may be two members.
+  if P.nodes[unwrapParen(exprIx)] is IfStmt { return 0 }
   if !exprMap(exprIx, fnIx) { return 0 }
   const sh = mapShapeOfExpr(exprIx, fnIx)
   if !unionHasMapArmSlot(unionName, sh) { return 0 }
-  const tag = mapBoxTag(sh)
+  const tag = mapBoxTagOf(sh, unionName, exprIx, fnIx)
   if tag < 0 { return -1 }
   fbI32Const(tag)
   if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
@@ -4417,7 +4459,7 @@ export function emitUnionCoerce(
     if mSlot != -3 { mSlot = mapShapeFoldSet(mSlot) }
     if mSlot >= -1 || mSlot == -4 || mSlot == -6 {
       if unionHasMapArmSlot(unionName, mSlot) {
-        const mTag = mapBoxTag(mSlot)
+        const mTag = mapBoxTagOf(mSlot, unionName, exprIx, fnIx)
         if mTag < 0 { return -1 }
         fbI32Const(mTag)
         if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
@@ -4434,7 +4476,9 @@ export function emitUnionCoerce(
       && nodeTyMapValIsLitUnion(bareIx)
       && unionHasCollapsedStringMapArm(unionName)
     ) {
-      fbI32Const(mapSlotTag(-1))
+      const luTag = mapBoxTagOf(-1, unionName, exprIx, fnIx)
+      if luTag < 0 { return -1 }
+      fbI32Const(luTag)
       if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
       fbStructNew(uBoxIdx) // { tag, mono map-struct ref }
       return 0
@@ -15280,7 +15324,7 @@ function emitAsCast(body: u8[], e: AsExpr, _exprIx: i32, fnIx: i32) {
     if e.asMode == "null" { tty = tyPeelNul(tty) }
     // the target's arms, flattened rather than tested as `TyUnion`: a sub-union target
     // only widens the membership test (a tag chain), with no unbox at all.
-    if mapTwinTagFail(obj, tty, fnIx, _exprIx, "`as`") < 0 { return -1 }
+    if mapSoftTwinTagFail(obj, tty, fnIx, _exprIx) < 0 { return -1 }
     const wantTags: i32[] = []
     const wantVis: i32[] = []
     if !unionArmTagsOfTy(tty, wantTags, wantVis) {
@@ -15295,13 +15339,18 @@ function emitAsCast(body: u8[], e: AsExpr, _exprIx: i32, fnIx: i32) {
     const subUnion = wantTags.length > 1
     let armVi = -1
     let ak = 0
+    // A map arm's payload is its map struct ref, recovered by the heap cast its shape names.
+    let mapHeap = -1
     if !subUnion {
       ak = unMemAtomKind(tty)
       armVi = wantVis[0]
+      if armVi < 0 && ak < 0 && unMemIsMap(tty) {
+        mapHeap = mapTypeIdxOf(mapShapeFoldSet(mapArmShapeOfTy(tty)))
+      }
     }
     // `unionArmTagsOfTy` owns the empty-arm case, so what is left is a single arm the tag
     // reached but neither the variant table nor the atom kinds can name.
-    if !subUnion && armVi < 0 && ak < 0 {
+    if !subUnion && armVi < 0 && ak < 0 && mapHeap < 0 {
       return emitFail(
         "emitProgram: `as "
           + tgt
@@ -15346,6 +15395,17 @@ function emitAsCast(body: u8[], e: AsExpr, _exprIx: i32, fnIx: i32) {
         fbI32Const(nullBoxTag())
         fbRefNullNone() // the payload slot is unread under the null tag
         fbStructNew(uBoxIdx)
+        fbEnd()
+        return 0
+      }
+      // a map target's `M | null` is the nullable map ref: the payload on the hit, a null.
+      if mapHeap >= 0 {
+        fbIfRefNul(mapHeap, true)
+        fbLocalGet(unionAsSlot)
+        fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
+        fbRefCast(mapHeap)
+        fbElse()
+        fbRefNull(mapHeap)
         fbEnd()
         return 0
       }
@@ -15418,6 +15478,11 @@ function emitAsCast(body: u8[], e: AsExpr, _exprIx: i32, fnIx: i32) {
     if armVi >= 0 {
       fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
       fbRefCast(uVarHeap[armVi])
+      return 0
+    }
+    if mapHeap >= 0 {
+      fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
+      fbRefCast(mapHeap)
       return 0
     }
     return emitUnionUnboxTail(ak)
