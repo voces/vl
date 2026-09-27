@@ -710,7 +710,6 @@ import {
   fieldValueFeOf,
   fnAssignRetKind,
   fnEnvIdxOf,
-  fnHasInexactMapPin,
   fnHasUnannotatedParam,
   fnIndexOf,
   fnIndexOfInScopeSid,
@@ -762,6 +761,7 @@ import {
   indexElemUnionName,
   indexPlaceNonNull,
   inferredRetMapSlot,
+  instancePinnedMaps,
   internAtom,
   internInlineShapeTy,
   isNulScalarListFieldCode,
@@ -803,6 +803,7 @@ import {
   mapArmShapeOfTy,
   mapArmTagOfTy,
   mapNicheLacks,
+  mapNicheNeedsPin,
   mapPinnedParamTyOf,
   mapReadNarrowableSlot,
   mapReadNarrowedAtomKind,
@@ -814,6 +815,7 @@ import {
   mapShapeOfExpr,
   mapShapeTwinned,
   mapSlotTag,
+  mapSoftTwin,
   mapTwinExact,
   mapTwinSame,
   mapValueTyOf,
@@ -2623,11 +2625,13 @@ function nulNicheIsTestImpossible(recvIx: i32, ity: i32, fnIx: i32) {
     // comparison, which declines where a Set or a literal union could be either.
     const pin = mapPinnedParamTyOf(recvIx, fnIx)
     if pin >= 0 { return !mapTwinExact(pin, ity) }
-    // No pin reaches this receiver, and its spelling may name a Set or a literal-union map
-    // by another map's name: the test cannot be answered from it (D2684).
-    if fnHasInexactMapPin(fnIx) {
+    // No pin reaches this receiver, and the answer turns on which of the instance's maps it
+    // holds, which its spelling cannot say (D2684).
+    if mapNicheNeedsPin(fnIx, ity) {
       emitFailAt(
-        "emitProgram: `is` cannot tell which map this instance's nullable value holds: its type is spelled from a pin that renders a Set or a literal-union value as another map — test the parameter itself",
+        "emitProgram: `is` cannot tell "
+          + tyToEmitName(ity)
+          + " from this instance's pinned map yet: test the parameter itself",
         recvIx,
       )
       return false
@@ -2800,6 +2804,57 @@ function emitVariantDiscrimTest(body: u8[], recvIx: i32, vi: i32, fnIx: i32) {
   fbElse()
   fbI32Const(0)
   fbEnd()
+  0
+}
+
+// A box test naming a map with a numeric literal-union value, or its base twin, where the box
+// cannot say which it holds: the receiver's union has two members of that one member class, or
+// the instance is pinned at the other (D2493). Refused at `at`; -1 when refused, else 0.
+function mapSoftTwinTagFail(recvIx: i32, patTy: i32, fnIx: i32, at: i32): i32 {
+  if patTy < 0 { return 0 }
+  const pat: i32[] = []
+  flattenVariantsInto(patTy, pat)
+  const arms: i32[] = []
+  const nm = unionNameOfExpr(recvIx, fnIx)
+  if nm != "" {
+    const atoms: string[] = []
+    unionSetArmTys(nm, atoms, arms)
+  }
+  const pins: i32[] = []
+  instancePinnedMaps(fnIx, pins)
+  let i = 0
+  while i < pat.length {
+    const pm = pat[i]
+    if unMemIsMap(pm) {
+      let inClass = 0
+      let soft = false
+      let j = 0
+      while j < arms.length {
+        if unMemIsMap(arms[j]) && mapTwinSame(arms[j], pm) {
+          inClass = inClass + 1
+          if !mapTwinExact(arms[j], pm) { soft = true }
+        }
+        j = j + 1
+      }
+      let q = 0
+      while q < pins.length {
+        if pins[q] >= 0 && mapSoftTwin(pins[q], pm) {
+          soft = true
+          inClass = 2
+        }
+        q = q + 1
+      }
+      if soft && inClass > 1 {
+        return emitFailAt(
+          "emitProgram: a test cannot tell "
+            + tyToEmitName(pm)
+            + " from the map its numeric literal union reads as yet — wrap each map in a record with a discriminant field",
+          at,
+        )
+      }
+    }
+    i = i + 1
+  }
   0
 }
 
@@ -3001,6 +3056,9 @@ function emitIsTest(body: u8[], isIx: i32, fnIx: i32) {
 
   const ndv = P.nodes[isIx]
   if ndv is IsExpr {
+    if mapSoftTwinTagFail(ndv.isObj, isVarTyIxOf(isIx), fnIx, isIx) < 0 {
+      return -1
+    }
     const armTag = isArmTagOfTy(isVarTyIxOf(isIx))
     // A map type no arm of the box registered is a member of no value it can hold (a generic
     // body's `is M` at a pin whose union lacks `M`): the answer is false, after the receiver.
@@ -15266,6 +15324,7 @@ function emitAsCast(body: u8[], e: AsExpr, _exprIx: i32, fnIx: i32) {
     if e.asMode == "null" { tty = tyPeelNul(tty) }
     // the target's arms, flattened rather than tested as `TyUnion`: a sub-union target
     // only widens the membership test (a tag chain), with no unbox at all.
+    if mapSoftTwinTagFail(obj, tty, fnIx, _exprIx) < 0 { return -1 }
     const wantTags: i32[] = []
     const wantVis: i32[] = []
     if !unionArmTagsOfTy(tty, wantTags, wantVis) {

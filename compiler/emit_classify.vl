@@ -109,6 +109,7 @@ import {
   letNullHoleUnfilled,
   litUnionAliasNameOfTy,
   mapValIsI32Cell,
+  mapValSoftBase,
   nameIsEmitterIntrinsic,
   nameIsInlineLitUnion,
   nameIsLitUnionArmValueUnion,
@@ -26231,7 +26232,10 @@ function mapShapeIsMono(sh: i32): boolean { sh == -1 || sh == -4 || sh == -6 }
 export function mapTwinSame(a: i32, b: i32): boolean {
   const x = unMemPeelAliasWrapper(a)
   const y = unMemPeelAliasWrapper(b)
-  tyEq(x, y) || mapSetSpelledAs(x, y) || mapSetSpelledAs(y, x)
+  tyEq(x, y)
+    || mapSetSpelledAs(x, y)
+    || mapSetSpelledAs(y, x)
+    || mapSoftTwin(x, y)
 }
 
 // Whether `s` is a `Set<K>` and `m` the `{[K]: boolean}` a union spelling renders it as.
@@ -26384,10 +26388,10 @@ function mapPinnedParamTyAt(exprIx: i32, fnIx: i32, depth: i32): i32 {
   -1
 }
 
-// Whether an instance parameter of `fnIx` is pinned at a map a spelling cannot name exactly
-// (a Set, or a literal-union value), so a map type read from a spelling there may be either.
-export function fnHasInexactMapPin(fnIx: i32): boolean {
-  if fnIx < 0 { return false }
+// The maps the parameters of instance `fnIx` are pinned at, their unions and nullables
+// flattened; -2 for a parameter whose instance serves pins of two different map types.
+export function instancePinnedMaps(fnIx: i32, out: i32[]) {
+  if fnIx < 0 { return 0 }
   const fd = P.nodes[fnIx]
   if fd is FuncDecl {
     let i = 0
@@ -26395,19 +26399,64 @@ export function fnHasInexactMapPin(fnIx: i32): boolean {
       const pn = P.nodes[fd.fnParams[i]]
       if pn is Param {
         if pn.parType >= 0 {
-          const pt = mapTyPeel(monoParamPinTy.get(pn.parType) ?? -1)
+          const pt = monoParamPinTy.get(pn.parType) ?? -1
+          if pt == -2 { out.push(-2) }
           if pt >= 0 {
-            const t = T.tys[pt]
-            if t is TyMap {
-              if t.mSet == 1 || tyIsLitUnion(t.mVal) { return true }
-              if t.mVal >= 0 && t.mVal < T.tys.length {
-                if T.tys[t.mVal] is TyLit { return true }
-              }
+            const flat: i32[] = []
+            flattenVariantsInto(pt, flat)
+            let j = 0
+            while j < flat.length {
+              const m = mapTyPeel(flat[j])
+              if m >= 0 { out.push(m) }
+              j = j + 1
             }
           }
         }
       }
       i = i + 1
+    }
+  }
+  0
+}
+
+// Whether a niche `is P` in instance `fnIx` needs the exact pinned map to answer, with none
+// reaching the operand: a pin that is shared, spelled inexactly (a Set, a literal-union value),
+// or another map of P's struct (D2684).
+export function mapNicheNeedsPin(fnIx: i32, patTy: i32): boolean {
+  const pins: i32[] = []
+  instancePinnedMaps(fnIx, pins)
+  const ps = mapShapeFoldSet(mapArmShapeOfTy(unMemPeelAliasWrapper(patTy)))
+  let i = 0
+  while i < pins.length {
+    const q = pins[i]
+    if q < 0 { return true }
+    const t = T.tys[q]
+    if t is TyMap {
+      if t.mSet == 1 || tyIsLitUnion(t.mVal) { return true }
+      if t.mVal >= 0 && t.mVal < T.tys.length {
+        if T.tys[t.mVal] is TyLit { return true }
+      }
+    }
+    if mapShapeIsMono(ps) && mapShapeFoldSet(mapArmShapeOfTy(q)) == ps {
+      if !mapTwinExact(q, patTy) { return true }
+    }
+    i = i + 1
+  }
+  false
+}
+
+// Whether two maps are one box member but not one type: a numeric literal-union value reads as
+// its base (`{[K]: 1 | 2}` beside `{[K]: i32}`), so no tag can tell them apart (D2493).
+export function mapSoftTwin(a: i32, b: i32): boolean {
+  const x = unMemPeelAliasWrapper(a)
+  const y = unMemPeelAliasWrapper(b)
+  if x < 0 || y < 0 || tyEq(x, y) { return false }
+  const xt = T.tys[x]
+  const yt = T.tys[y]
+  if xt is TyMap {
+    if yt is TyMap {
+      if xt.mSet != yt.mSet || !tyEq(xt.mKey, yt.mKey) { return false }
+      return tyEq(mapValSoftBase(xt.mVal), mapValSoftBase(yt.mVal))
     }
   }
   false
