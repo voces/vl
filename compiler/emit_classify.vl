@@ -7545,6 +7545,23 @@ function pushNarrowIs(name: string, variant: string, condIx: i32) {
   pushNarrowRep(name, isVariantSpelling(variant, ity), ity, -1)
 }
 
+// The atom of member set `set` that spells variant `v`: `v` itself, else the atom naming the
+// same record row by its shape (`{r:i32}[]` for a tested `Circle[]`), else `v`.
+function setAtomSpelling(set: string, v: string): string {
+  const atoms: string[] = []
+  splitUnionAtoms(set, atoms)
+  if strListHas(atoms, v) { return v }
+  const nv = resolveShapeToNominal(v)
+  let i = 0
+  while i < atoms.length {
+    if nameIsRefArray(atoms[i]) || isSName(atoms[i]) {
+      if resolveShapeToNominal(atoms[i]) == nv { return atoms[i] }
+    }
+    i = i + 1
+  }
+  v
+}
+
 // The `uVariants` spelling of an `is`-tested type: the author's own spelling when it names a
 // variant row, otherwise the declared name of the struct that spelling's type equals. The
 // emitter resolves an `is` test by an exact string compare against `uVariants`, so which
@@ -12692,6 +12709,46 @@ export function exprIsIntegralFloat(exprIx: i32, _fnIx: i32): boolean {
   nm == "trunc" || nm == "floor" || nm == "ceil" || nm == "nearest"
 }
 
+// Whether `ix` is a list of booleans: typed `boolean[]`, or a literal whose first element is one.
+export function exprIsBoolList(ix: i32, fnIx: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  if primNameOf(tyArrayElemIx(nodeTyIxOf(ix))) == "boolean" { return true }
+  const n = P.nodes[ix]
+  if n is ArrayLit {
+    if n.arrElems.length > 0 { return exprIsBool(n.arrElems[0], fnIx) }
+  }
+  // Any other node typed as no boolean list is not one.
+  false
+}
+
+// Whether the `AsExpr` at `ix` is an `as!` or bare `as` to a number over a type-parameter
+// operand: the checker cannot tell there whether it can fail, so each instance asks (D2791).
+export function asExprHoleNumSad(ix: i32): boolean {
+  if ix < 0 { return false }
+  const n = P.nodes[ix]
+  if !(n is AsExpr) { return false }
+  if n.asMode != "trap" && n.asMode != "prop" { return false }
+  if !asExprOperandIsHole(ix) { return false }
+  const d = asExprNumCastDomain(ix)
+  d == "i32" || d == "i64" || d == "f32" || d == "f64" || d == "u8"
+}
+
+// The number instance `fnIx` pins the operand of `asExprHoleNumSad` cast `ix` at, when the
+// cast can fail there; "-" when the pin is no number, which is never the target; "" when the
+// plain conversion is exact or the instance has no exact pin.
+export function asExprHolePinSrc(ix: i32, fnIx: i32): string {
+  if !asExprHoleNumSad(ix) { return "" }
+  const n = P.nodes[ix]
+  if n is AsExpr {
+    const hx = exactOperandTyOf(n.asObj, fnIx)
+    if hx < 0 { return "" }
+    const hs = primNameStr(primNameOf(hx))
+    if hs != "i32" && hs != "i64" && hs != "f32" && hs != "f64" { return "-" }
+    if numCastCanFail(hs, asExprNumCastDomain(ix)) { return hs }
+  }
+  ""
+}
+
 // Does the module contain a fallible numeric cast? The `moduleHasUnionAs` twin, reserving
 // the three staging slots by the same linear arena walk, since an exactness test's operand
 // is read twice and is typically not re-readable. Memoised the same way, for the same reason.
@@ -12699,9 +12756,11 @@ export function moduleHasNumCast(): boolean {
   if modNumCastHit { return true }
   let i = modNumCastSeen
   while i < P.nodes.length {
-    if P.nodes[i] is AsExpr && (asExprNumFallible(i) || asExprHoleNumOpt(i)) {
-      modNumCastHit = true
-      return true
+    if P.nodes[i] is AsExpr {
+      if asExprNumFallible(i) || asExprHoleNumOpt(i) || asExprHoleNumSad(i) {
+        modNumCastHit = true
+        return true
+      }
     }
     i = i + 1
   }
@@ -14149,6 +14208,61 @@ export function fnRetJoinsWiderRecord(fnIx: i32, rty: i32): boolean {
     }
   }
   false
+}
+
+// Whether `ty` is a union of two or more list types, or that union with `null`, with no type
+// parameter left in it: returns joining lists of different storage, boxed per list (D2768).
+export function tyIsListUnion(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length || tyHasTyVar(ty) { return false }
+  const t = T.tys[ty]
+  match t {
+    TyNullable => {
+      return tyIsListUnion(t.nInner)
+    }
+    TyUnion => {
+      if t.uMembers.length < 2 { return false }
+      let i = 0
+      while i < t.uMembers.length {
+        if tyArrayElemIx(t.uMembers[i]) < 0 { return false }
+        i = i + 1
+      }
+      return true
+    }
+    TyPrim | TyErr | TyObj | TyFunc | TyArray | TyMap | TyVar | TyLit | TyNeg => {
+      // Not a union: a bare list, or no list at all.
+      return false
+    }
+  }
+}
+
+// The emitter-format name of the list union `ty`, a record element spelled by its row
+// (`Circle[]|i32[]`); "" when a member has no name.
+export function listUnionEmitName(ty: i32): string {
+  if ty < 0 || ty >= T.tys.length { return "" }
+  const t = T.tys[ty]
+  match t {
+    TyNullable => {
+      const inn = listUnionEmitName(t.nInner)
+      if inn == "" { return "" }
+      return inn + "|null"
+    }
+    TyUnion => {
+      let nm = ""
+      let i = 0
+      while i < t.uMembers.length {
+        const mn = resolveShapeToNominal(tyToEmitName(t.uMembers[i]))
+        if mn == "" { return "" }
+        if i > 0 { nm = nm + "|" }
+        nm = nm + mn
+        i = i + 1
+      }
+      return nm
+    }
+    TyPrim | TyErr | TyObj | TyFunc | TyArray | TyMap | TyVar | TyLit | TyNeg => {
+      // `tyIsListUnion` admits only the two shapes above.
+      return ""
+    }
+  }
 }
 
 // Whether `ty` is a record, or a list of one, with a union-typed field: the type the checker
@@ -16564,7 +16678,14 @@ function setNarrowFromCondElseRaw(condIx0: i32, fnIx: i32) {
         // three gates that already read it. An inline shape tested against a nominally
         // spelled union would otherwise clear no bit (`msSubAtom` finds no match), silently
         // handing the else arm an unchanged, un-narrowed set while the checker did narrow.
-        const sVar = isVariantSpelling(c.isVariant, isVarTyIxOf(condIx))
+        const sVar = setAtomSpelling(
+          currentStructNarrowSetAt(
+            srecv.identName,
+            fnIx,
+            unwrapParen(isObj),
+          ),
+          isVariantSpelling(c.isVariant, isVarTyIxOf(condIx)),
+        )
         const ssid = currentStructNarrowSetIdAt(
           srecv.identName,
           fnIx,

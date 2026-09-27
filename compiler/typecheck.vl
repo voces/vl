@@ -3153,6 +3153,9 @@ let tyMapMinted = false
 // The unions `joinTys` made of two type parameters (D2760). At a pin their members re-join as a
 // non-generic join would, so `A | B` at `i32` and `f64` is `f64`, not a box of the two.
 let tpJoinUnions: {[i32]: i32} = Map()
+// Set while a return set joins: there a type parameter's list stays apart from a concrete list
+// (D2783); a join inside a body keeps the collapse its own reads are checked under.
+let tpApartConcrete = false
 
 // Whether any join has made one record of two (`joinObjFieldwise`). Only ever set, so the
 // emitter passes that build a join's arms at its row can skip a program with none (D2731).
@@ -13728,7 +13731,11 @@ function joinTys(a: i32, b: i32) {
   // Two different declared type parameters are two types, though a type variable is
   // assignable either way inside a generic body: collapsing would type the join as one
   // side and every instance binding them apart would read the other as it (D2760).
-  if tyParamsPart(a, b, 0) {
+  if (
+    tyParamsPart(a, b, 0)
+    || tyParamArmAbsorbs(a, b)
+    || tyParamArmAbsorbs(b, a)
+  ) {
     const tj = joinVariantTys(a, b)
     // arena-tick exempt: a per-program mark on a fresh arena row.
     tpJoinUnions[tj] = 1
@@ -13748,6 +13755,13 @@ function joinTys(a: i32, b: i32) {
 function tyParamsPart(a: i32, b: i32, depth: i32): boolean {
   if a < 0 || b < 0 || a >= T.tys.length || b >= T.tys.length || depth > 8 {
     return false
+  }
+  // Under a constructor, in a return set, a declared parameter is apart from a concrete type
+  // too: `T[]` beside `i32[]` is `string[] | i32[]` at `T := string` (D2783).
+  if depth > 0 && tpApartConcrete {
+    if tyParamBesideConcrete(a, b) || tyParamBesideConcrete(b, a) {
+      return true
+    }
   }
   const ta = T.tys[a]
   match ta {
@@ -13772,6 +13786,60 @@ function tyParamsPart(a: i32, b: i32, depth: i32): boolean {
       return false
     }
   }
+}
+
+// Whether `ty` is a union whose every member is a list.
+function tyUnionAllLists(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  const t = T.tys[ty]
+  if t is TyUnion {
+    let i = 0
+    while i < t.uMembers.length {
+      const m = t.uMembers[i]
+      if m < 0 || m >= T.tys.length { return false }
+      if !(T.tys[m] is TyArray) { return false }
+      i = i + 1
+    }
+    return t.uMembers.length >= 2
+  }
+  false
+}
+
+// Whether union `u` holds a member apart from some member of `o` (`tyParamsPart`) that no
+// member of `u` is the same variant as: `T[] | f64[]` beside `string[]` keeps all three, where
+// assignability through `T` would absorb the third (D2783).
+function tyParamArmAbsorbs(u: i32, o: i32): boolean {
+  if !tpApartConcrete { return false }
+  if u < 0 || u >= T.tys.length || !(T.tys[u] is TyUnion) { return false }
+  const us: i32[] = []
+  flattenVariantsInto(u, us)
+  const os: i32[] = []
+  flattenVariantsInto(o, os)
+  let j = 0
+  while j < os.length {
+    let same = false
+    let apart = false
+    let i = 0
+    while i < us.length {
+      if us[i] == os[j] || sameVariantTy(us[i], os[j]) { same = true }
+      if tyParamsPart(us[i], os[j], 0) { apart = true }
+      i = i + 1
+    }
+    if apart && !same { return true }
+    j = j + 1
+  }
+  false
+}
+
+// Whether `p` is a declared type parameter and `c` a type holding none, nor a hole or error.
+function tyParamBesideConcrete(p: i32, c: i32): boolean {
+  const tp = T.tys[p]
+  if tp is TyVar {
+    if tp.tvName.length == 0 || tp.tvName[0] == "?"[0] { return false }
+    if c == TY_ERR || tyHasTyVar(c) { return false }
+    return true
+  }
+  false
 }
 
 // Whether the declared type parameter `an` and the type `b` are two differently named ones.
@@ -13969,7 +14037,13 @@ function joinRetTys(a: i32, b: i32) {
   if a < 0 { return b }
   if b < 0 { return a }
   if a == b { return a }
-  if !tyIsHole(a) && !tyIsHole(b) { return joinTys(a, b) }
+  if !tyIsHole(a) && !tyIsHole(b) {
+    const saved = tpApartConcrete
+    tpApartConcrete = true
+    const j = joinTys(a, b)
+    tpApartConcrete = saved
+    return j
+  }
   const kept: i32[] = []
   flattenVariantsInto(a, kept)
   flattenVariantsInto(b, kept)
@@ -32572,6 +32646,32 @@ function genAppCarry(origTy: i32, newTy: i32, bNames: string[], bTys: i32[]) {
 }
 
 // The members of a union re-joined one at a time, as the join that made it would at these types.
+// A pinned join `j` of two lists stored as the one i32 list (`boolean[]` beside `i32[]`) is
+// the list the parameter's member pins, as before D2783: no tag tells the two apart, and the
+// generic's call had read that list. `ms` are the join's members, `out` their pins.
+function tpJoinSharedListPick(j: i32, ms: i32[], out: i32[]): i32 {
+  if j < 0 || j >= T.tys.length || ms.length != 2 || out.length != 2 {
+    return j
+  }
+  const jt = T.tys[j]
+  if !(jt is TyUnion) { return j }
+  if !listStoredAsI32List(out[0]) || !listStoredAsI32List(out[1]) { return j }
+  const v0 = tyHasTyVar(ms[0])
+  if v0 == tyHasTyVar(ms[1]) { return j }
+  if v0 { return out[0] }
+  out[1]
+}
+
+// Whether `ty` is a list stored as the i32 list: an `i32` or `boolean` element.
+function listStoredAsI32List(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  const t = T.tys[ty]
+  if t is TyArray {
+    return tyIsPrimNamed(t.aElem, "i32") || tyIsPrimNamed(t.aElem, "boolean")
+  }
+  false
+}
+
 function rejoinMembers(ms: i32[]): i32 {
   if ms.length == 0 { return -1 }
   let r = ms[0]
@@ -32662,7 +32762,11 @@ export function substTyDeep(tyIx: i32, bNames: string[], bTys: i32[]) {
     if isJoinHoleUnion(tyIx) {
       res = refoldJoinUnion(tyIx, ms, out3, changed3, bNames, bTys)
     } else if changed3 && tpJoinUnions.has(tyIx) {
-      res = rejoinMembers(out3)
+      // A union the return-set join kept apart re-joins under the same rule (D2784).
+      const tpSaved = tpApartConcrete
+      tpApartConcrete = true
+      res = tpJoinSharedListPick(rejoinMembers(out3), ms, out3)
+      tpApartConcrete = tpSaved
     } else if changed3 {
       // Dedupes by arena-index identity only (not `sameVariantTy`) then rebuilds: substitution
       // can make two members the same type, and matching structurally here would merge members this walk must leave alone (the mixed-union arena shape is load-bearing).
@@ -38470,11 +38574,14 @@ function finishInferredReturn(
       // `softenLitTy` states everywhere) and this arm accepts exactly what it banks. The
       // string litunion two arms up is the shape that keeps an identity (the interned atom), which is why it is a separate question.
     } else if itt is TyUnion {
-      // A pure struct-union whose every member maps to a named type lowers un-annotated via
-      // the variant-boxed rep, exactly like the annotated form — so it does not floor. The
-      // export uses the same `structUnionRetName` predicate, so the floor accepts exactly
-      // what the emitter can register.
-      if structUnionRetName(inferred, gRootStmts) == "" {
+      // No floor for a union the emitter lowers as its annotation: a struct union it can register
+      // (`structUnionRetName`), a union of lists it pins (D2768), and a union over a type
+      // parameter (`T[] | i32[]`), which is decided per instance where `T` is bound.
+      if (
+        structUnionRetName(inferred, gRootStmts) == ""
+        && !tyHasTyVar(inferred)
+        && !tyUnionAllLists(inferred)
+      ) {
         tErrUnsupported(
           "'"
             + n.fnName
@@ -50963,7 +51070,9 @@ function castPinAdjudicate(k: i32, at: i32) {
     return 0
   }
   const sn = primNameStr(primNameOf(at))
-  if !numCastCanFail(sn, dom) { return 0 }
+  // A pin at no number is never the target, so the cast fails there as a fallible one can.
+  const snNum = sn == "i32" || sn == "i64" || sn == "f32" || sn == "f64"
+  if snNum && !numCastCanFail(sn, dom) { return 0 }
   if mode == "null" { return castPinNullLand(k, castIx, target) }
   castPropagationFits(TY_NULL, holeCastTgtName[k], castIx, holeCastRet[k])
   0
