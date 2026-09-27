@@ -1270,6 +1270,35 @@ axis(
   (d) => twoFiles(d, genSharedListName(2000, true), genSharedListName(2000, false)),
 );
 
+// `n` generics that each call every other one at `<T>`, as one cycle or as a chain (a call to
+// an earlier one goes to a concrete twin instead), with no `is` anywhere. Whether a generic is
+// keyed by its exact pins is asked once per template, so a cycle settles once at its root; a
+// "no" left unsettled inside the cycle re-walked it per ask, exponential in `n` (D2684).
+const genGenericCycle = (n: number, cycle: boolean): string => {
+  const o: string[] = [];
+  for (let i = 0; i < n; i++) {
+    o.push(`function h${i}(n: i32): boolean { n > 0 }`);
+    o.push(`function f${i}<T>(u: T | null, n: i32): boolean {`, "  if n <= 0 { return u == null }");
+    for (let j = 0; j < n; j++) {
+      if (j === i) continue;
+      const call = cycle || j > i ? `f${j}<T>(u, n - 1)` : `h${j}(n - 1)`;
+      o.push(`  if n % ${n} == ${j} { return ${call} }`);
+    }
+    o.push("  false", "}");
+  }
+  o.push("let acc = 0");
+  for (let i = 0; i < 2400; i++) fill(o, i, 6);
+  o.push("const s: i32[] = []", `print(f0<i32[]>(s, ${n}))`, "print(acc)");
+  return o.join("\n") + "\n";
+};
+
+axis(
+  "generics calling each other in a cycle",
+  2.5,
+  "A generic's exact-keying answer is being re-derived per ask inside a call cycle (D2684).",
+  (d) => twoFiles(d, genGenericCycle(14, true), genGenericCycle(14, false)),
+);
+
 // ── the instrument's own control ─────────────────────────────────────────────
 // EVERY PAIR ABOVE PASSES, so nothing above can say whether the grader still reds. The
 // control is the same `grade` over a pair that must: one source, one literal different,

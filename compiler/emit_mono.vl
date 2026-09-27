@@ -84,7 +84,6 @@ import {
   tyIsMap,
   tyRenderSoftensLits,
   tyToEmitName,
-  tyToStr,
   uniqueGenericDeclNamed,
 } from "./typecheck"
 import {
@@ -251,7 +250,7 @@ import {
   uVariants,
   unNames,
 } from "./emit_state"
-import { emitFail } from "./emit_bytes"
+import { emitFail, emitFailAt } from "./emit_bytes"
 import {
   anonHandleTyIx,
   arrLitElemName,
@@ -307,6 +306,7 @@ import {
   synthTypeRef,
   synthTypeRefFb,
   synthTypeRefTy,
+  tyCanonKey,
   tyNulFuncInner,
   unRowOfCanon,
   unionArmsOf,
@@ -4311,12 +4311,13 @@ function monoRegisterPinUnion(name: string) {
 }
 
 // Per template slot: 1 when its body tests a value of a type parameter, directly or through a
-// generic it calls with one, 0 when not; -1 or absent when not settled. While being asked it
-// holds -2 - d, where d is its depth on the walk's stack.
+// generic it calls with one, 0 when not, -1 or absent when not yet asked. A slot on the walk's
+// stack holds -2 - n, n its visit number: asked, or answered "no" pending its cycle's root.
 let monoExactMemo: i32[] = []
-// The walk's stack depth, and the shallowest in-progress template the current walk reached: a
-// "no" that read a template still being asked above it is not final, so it is not cached.
-let monoExactDepth = 0
+// The walk's stack of slots, its next visit number, and the lowest visit number of a slot on the
+// stack the current walk has read (Tarjan's lowlink), so a cycle settles once at its root.
+let monoExactStack: i32[] = []
+let monoExactNext = 0
 let monoExactLow = 0
 
 // Whether generic `fe` is keyed by its exact pins: its body has an `is`, `as` or `match` over a
@@ -4327,31 +4328,47 @@ function monoNeedsExactKey(fe: i32): boolean {
   const m = monoExactMemo[fe]
   if m >= 0 { return m == 1 }
   if m <= -2 {
-    // In progress: this answer is provisional until the template at depth -2 - m settles.
-    const d = -2 - m
-    if d < monoExactLow { monoExactLow = d }
+    // On the stack: a provisional "no" until the cycle through it settles.
+    if -2 - m < monoExactLow { monoExactLow = -2 - m }
     return false
   }
-  const depth = monoExactDepth
+  const me = monoExactNext
+  monoExactNext = me + 1
   const outerLow = monoExactLow
-  monoExactDepth = depth + 1
-  monoExactLow = depth + 1
+  monoExactLow = me
   // arena-tick exempt: a memo of the template's body, which no rebuild pass reads.
-  monoExactMemo[fe] = -2 - depth
+  monoExactMemo[fe] = -2 - me
+  monoExactStack.push(fe)
   let r = false
   const fn = P.nodes[monoOrigNode[fe]]
   if fn is FuncDecl { r = monoTestsTyVar(fn.fnBody) }
   const low = monoExactLow
-  monoExactDepth = depth
-  // A "yes" is final. A "no" is final only if it read no template still being asked above it.
-  let settled = -1
-  if r { settled = 1 }
-  else if low >= depth { settled = 0 }
-  // arena-tick exempt: the same memo.
-  monoExactMemo[fe] = settled
   monoExactLow = outerLow
-  if low < monoExactLow { monoExactLow = low }
+  if r {
+    // A "yes" is final, and every "no" pending above it may have read it as a "no".
+    monoExactUnwind(fe, 1, -1)
+  } else if low >= me {
+    // The root of its cycle: its walk read nothing below it on the stack, so all of it is "no".
+    monoExactUnwind(fe, 0, 0)
+  } else if low < outerLow {
+    monoExactLow = low
+  }
   r
+}
+
+// Pops the walk's stack down to and including `fe`, settling `fe` to `mine` and every slot above
+// it to `rest`: 0 for a cycle that settled "no", -1 to re-ask after a "yes".
+function monoExactUnwind(fe: i32, mine: i32, rest: i32) {
+  while monoExactStack.length > 0 {
+    const top = monoExactStack[monoExactStack.length - 1]
+    monoExactStack.pop()
+    let v = rest
+    if top == fe { v = mine }
+    // arena-tick exempt: the same memo.
+    if top >= 0 && top < monoExactMemo.length { monoExactMemo[top] = v }
+    if top == fe { return 0 }
+  }
+  0
 }
 
 // Whether the node recorded at `ix` has a type naming a type parameter.
@@ -4537,7 +4554,7 @@ function monoMakeInstance(
       ) {
         let xk = 0
         while xk < exSubN.length {
-          key = key + "~" + exSubN[xk] + "=" + tyToStr(exSubT[xk]) + ";"
+          key = key + "~" + exSubN[xk] + "=" + tyCanonKey(exSubT[xk], 16) + ";"
           xk = xk + 1
         }
       }
@@ -5282,10 +5299,11 @@ function monoMakeInstance(
     // registry; past the bound the pins grow without end, as in `f<T>` calling `f<T[]>` (D2721).
     while monoActiveDepth.length <= origFe { monoActiveDepth.push(0) }
     if monoActiveDepth[origFe] >= MONO_NEST_MAX {
-      return emitFail(
+      return emitFailAt(
         "emitProgram: monomorphize: `"
           + fn.fnName
           + "` instantiates itself at a new type on every call, so it has no finite set of instances",
+        calleeIx,
       )
     }
     // arena-tick exempt: a walk counter, which no rebuild pass reads.
@@ -6652,7 +6670,8 @@ export function monomorphize(stmts: i32[]) {
   monoExactSubT = []
   monoExactMemo = []
   monoActiveDepth = []
-  monoExactDepth = 0
+  monoExactStack = []
+  monoExactNext = 0
   monoExactLow = 0
   monoProgStmts = stmts
   // The index follows the table it answers for, at the write and not at a build point:
