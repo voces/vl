@@ -3156,6 +3156,26 @@ let tpJoinUnions: {[i32]: i32} = Map()
 // Set while a return set joins: there a type parameter's list stays apart from a concrete list
 // (D2783); a join inside a body keeps the collapse its own reads are checked under.
 let tpApartConcrete = false
+// An if-join a generic body reads collapsed (`T[]` beside `string[]` is `T[]`) that the
+// return-set rule keeps apart, by `if` node: the apart join, which a pin re-joins (D2832).
+let tpIfJoinAt: {[i32]: i32} = Map()
+// The same joins by owning declaration, re-asked at each call that pins the owner.
+let tpIfFn: i32[] = []
+let tpIfJoin: i32[] = []
+let tpIfNode: i32[] = []
+// Whether each row's join is delivered where an instance builds its union (`tpIfMarkOk`).
+let tpIfOk: boolean[] = []
+// The if-expressions a binding, an argument or a return delivers (`tpIfMarkOk`).
+let tpIfOkAt: {[i32]: boolean} = Map()
+// A call from a generic body whose pin leaves such a join open: the callee, the caller that
+// pins it later, and the callee's bindings and parameter types in the caller's terms.
+let tpIfReFn: i32[] = []
+let tpIfReOwner: i32[] = []
+let tpIfReStart: i32[] = []
+let tpIfReCount: i32[] = []
+let tpIfReNames: string[] = []
+let tpIfReTys: i32[] = []
+let tpIfReParams: i32[][] = []
 
 // Whether any join has made one record of two (`joinObjFieldwise`). Only ever set, so the
 // emitter passes that build a join's arms at its row can skip a program with none (D2731).
@@ -4419,6 +4439,19 @@ export function initChecker() {
   voidCoerceValNames = []
   T.tys = []
   tpJoinUnions = Map()
+  tpIfJoinAt = Map()
+  tpIfFn = []
+  tpIfJoin = []
+  tpIfNode = []
+  tpIfOk = []
+  tpIfOkAt = Map()
+  tpIfReFn = []
+  tpIfReOwner = []
+  tpIfReStart = []
+  tpIfReCount = []
+  tpIfReNames = []
+  tpIfReTys = []
+  tpIfReParams = []
   recordJoinMinted = false
   T.scopes = []
   scopeDepthsOf = Map()
@@ -13786,6 +13819,598 @@ function tyParamsPart(a: i32, b: i32, depth: i32): boolean {
       return false
     }
   }
+}
+
+// Records the if-join `ix` of `a` and `b`, collapsed to `j`, when the return-set rule would
+// keep a type parameter's list apart in it; a pin that re-joins it apart re-checks the body.
+// `ok` says the join is delivered where an instance can build it as a union (`tpIfMarkOk`).
+function noteTpIfJoin(ix: i32, a: i32, b: i32, j: i32, ok: boolean) {
+  if tpEnvNames.length == 0 || monoRecheckDepth > 0 { return 0 }
+  if ix < 0 || a < 0 || b < 0 || j < 0 { return 0 }
+  if !tyHasTyVar(a) && !tyHasTyVar(b) { return 0 }
+  const saved = tpApartConcrete
+  tpApartConcrete = true
+  let aj = -1
+  if (
+    tyParamsPart(a, b, 0)
+    || tyParamArmAbsorbs(a, b)
+    || tyParamArmAbsorbs(b, a)
+  ) {
+    aj = joinTys(a, b)
+  }
+  tpApartConcrete = saved
+  noteTpJoinRow(ix, aj, j, ok)
+}
+
+// Whether the `match` being checked is delivered where its union is built (`tpIfMarkOk`).
+let tpMatchOk = false
+
+// The join of the arm types `ts` under the return-set rule, or -1 when none names a type
+// parameter (only then can it differ from the collapse).
+function tpApartJoinOf(ts: i32[]): i32 {
+  if ts.length < 2 || monoRecheckDepth > 0 || !tysHaveTyVarIn(ts) { return -1 }
+  const saved = tpApartConcrete
+  tpApartConcrete = true
+  const savedClash = joinClashMsg
+  let j = ts[0]
+  let i = 1
+  while i < ts.length {
+    if ts[i] >= 0 { j = joinTys(j, ts[i]) }
+    i = i + 1
+  }
+  joinClashMsg = savedClash
+  tpApartConcrete = saved
+  j
+}
+
+// Records the join at `ix` that a generic body reads collapsed to `j` while the return-set rule
+// keeps it apart as `aj` (-1: none), for its pins to re-ask (D2832).
+function noteTpJoinRow(ix: i32, aj: i32, j: i32, ok: boolean) {
+  if ix < 0 || aj < 0 || j < 0 || monoRecheckDepth > 0 { return 0 }
+  if aj == j || tyEq(aj, j) { return 0 }
+  if !tyHasTyVar(aj) || !(T.tys[aj] is TyUnion) { return 0 }
+  tpIfJoinAt.set(ix, aj)
+  const owner = cstrOwnerTop()
+  if owner < 0 { return 0 }
+  let k = 0
+  while k < tpIfFn.length {
+    if tpIfFn[k] == owner && tpIfNode[k] == ix {
+      tpIfJoin[k] = aj
+      tpIfOk[k] = ok
+      return 0
+    }
+    k = k + 1
+  }
+  tpIfFn.push(owner)
+  tpIfJoin.push(aj)
+  tpIfNode.push(ix)
+  tpIfOk.push(ok)
+  0
+}
+
+// Marks `ix`, when it is an if-expression, as delivered where an instance builds a join of two
+// list types as their union: a binding's initializer, a call's argument, a returned value.
+function tpIfMarkOk(ix: i32) {
+  if tpEnvNames.length == 0 || ix < 0 || ix >= P.nodes.length { return 0 }
+  const u = crUnParen(ix)
+  if u < 0 || u >= P.nodes.length { return 0 }
+  const un = P.nodes[u]
+  if un is IfStmt || un is MatchExpr { tpIfOkAt.set(u, true) }
+  0
+}
+
+// Whether the if-expression `child` is an arm value, or an `else if` link, of the if-expression
+// `parent`, at any depth through such arms: it is built wherever `parent` is.
+function tpIfArmOf(parent: i32, child: i32, depth: i32): boolean {
+  if parent < 0 || depth > 16 { return false }
+  const p = P.nodes[parent]
+  if p is IfStmt {
+    if tpIfArmTailIs(p.ifThen, child, depth) { return true }
+    if p.ifElse >= 0 {
+      if P.nodes[p.ifElse] is IfStmt {
+        if p.ifElse == child { return true }
+        return tpIfArmOf(p.ifElse, child, depth + 1)
+      }
+      return tpIfArmTailIs(p.ifElse, child, depth)
+    }
+  }
+  false
+}
+
+function tpIfArmTailIs(blockIx: i32, child: i32, depth: i32): boolean {
+  if blockIx < 0 { return false }
+  const b = P.nodes[blockIx]
+  if b is Block {
+    if b.blkStmts.length == 0 { return false }
+    const tv = crUnParen(b.blkStmts[b.blkStmts.length - 1])
+    if tv == child { return true }
+    if tv >= 0 && P.nodes[tv] is IfStmt {
+      return tpIfArmOf(tv, child, depth + 1)
+    }
+  }
+  false
+}
+
+// Whether row `k`'s join is built where it is delivered: its own position, or an arm of a join
+// of the same body that is.
+function tpIfRowBuilt(k: i32): boolean {
+  if tpIfOk[k] { return true }
+  let q = 0
+  while q < tpIfFn.length {
+    if q != k && tpIfFn[q] == tpIfFn[k] && tpIfOk[q] {
+      if tpIfArmOf(tpIfNode[q], tpIfNode[k], 0) { return true }
+    }
+    q = q + 1
+  }
+  false
+}
+
+// The type an un-annotated binding of the if-join `init` takes where its concrete list absorbed
+// a type parameter's (`string[]` beside `T[]`): the parameter's list, which each instance reads
+// at its own pin (D2832). A number or boolean list keeps the collapse, since a pin may store the
+// two alike or widen one into the other, and the instance then builds the concrete one.
+function tpIfBindTy(init: i32, bound: i32): i32 {
+  if init < 0 || bound < 0 || tpIfJoinAt.length == 0 || monoRecheckDepth > 0 {
+    return bound
+  }
+  if tyHasTyVar(bound) { return bound }
+  const be = arrElemTyOrNone(bound)
+  if be < 0 || isNumeric(be) || tyIsPrimNamed(be, "boolean") { return bound }
+  const aj = tpIfJoinAt.get(crUnParen(init)) ?? -1
+  if aj < 0 { return bound }
+  const ms: i32[] = []
+  flattenVariantsInto(aj, ms)
+  let i = 0
+  while i < ms.length {
+    const m = ms[i]
+    if m >= 0 && T.tys[m] is TyArray && tyHasTyVar(m) { return m }
+    i = i + 1
+  }
+  bound
+}
+
+// The apart join of the if-expression at `ix` at the bindings `bNames`/`bTys` when it is a
+// union of lists there, else -1: the type an un-annotated binding of it takes in that instance.
+export function tpIfJoinPinTy(ix: i32, bNames: string[], bTys: i32[]): i32 {
+  const aj = tpIfJoinAt.get(ix) ?? -1
+  if aj < 0 { return -1 }
+  const sj = substTyDeep(aj, bNames, bTys)
+  if sj < 0 || sj >= T.tys.length || tyHasTyVar(sj) { return -1 }
+  if !tyUnionAllLists(sj) { return -1 }
+  sj
+}
+
+// The union name an instance spells the pinned join `sj` by, as the return set's is; "" when
+// it has none.
+export function tpIfJoinPinName(sj: i32): string {
+  let name = valueUnionRetName(sj)
+  if name == "" { name = structUnionRetName(sj, gRootStmts) }
+  if name == "" { name = variantBoxUnionRetName(sj) }
+  name
+}
+
+// The if-joins of `calleeFn` a call re-asks at its bindings: a join that stays apart there
+// re-checks the callee's body at the pinned parameter types `pTys`, and one still open (a
+// generic caller) is parked until the caller's own pin (D2832).
+function validateTpIfJoins(
+  bNames: string[],
+  bTys: i32[],
+  pTys: i32[],
+  retTy: i32,
+  ix: i32,
+  calleeFn: i32,
+) {
+  if calleeFn < 0 || monoRecheckDepth > 0 || inferQuiet { return 0 }
+  const owner = cstrOwnerTop()
+  if tysHaveTyVarIn(bTys) {
+    if owner >= 0 && tpIfFnHasRow(calleeFn) {
+      noteTpIfRe(calleeFn, owner, bNames, bTys, pTys)
+    }
+  } else {
+    tpIfPinCheck(calleeFn, pTys, bNames, bTys, retTy, ix)
+  }
+  // The joins a generic callee of this body left open, now pinned in this body's terms.
+  const n0 = tpIfReFn.length
+  let r = 0
+  while r < n0 {
+    if tpIfReOwner[r] == calleeFn {
+      const rNames: string[] = []
+      const rTys: i32[] = []
+      let q = 0
+      while q < tpIfReCount[r] {
+        rNames.push(tpIfReNames[tpIfReStart[r] + q])
+        rTys.push(substTyDeep(tpIfReTys[tpIfReStart[r] + q], bNames, bTys))
+        q = q + 1
+      }
+      const rParams: i32[] = []
+      const ps = tpIfReParams[r]
+      let pi = 0
+      while pi < ps.length {
+        rParams.push(substTyDeep(ps[pi], bNames, bTys))
+        pi = pi + 1
+      }
+      if tysHaveTyVarIn(rTys) {
+        if owner >= 0 { noteTpIfRe(tpIfReFn[r], owner, rNames, rTys, rParams) }
+      } else {
+        tpIfPinCheck(tpIfReFn[r], rParams, rNames, rTys, -1, ix)
+      }
+    }
+    r = r + 1
+  }
+  0
+}
+
+// Whether any of `tys` names a type parameter or a hole.
+function tysHaveTyVarIn(tys: i32[]): boolean {
+  let i = 0
+  while i < tys.length {
+    if tys[i] >= 0 && tyHasTyVar(tys[i]) { return true }
+    i = i + 1
+  }
+  false
+}
+
+function tpIfFnHasRow(fn: i32): boolean {
+  let k = 0
+  while k < tpIfFn.length {
+    if tpIfFn[k] == fn { return true }
+    k = k + 1
+  }
+  false
+}
+
+// The joins of `fn` at the concrete bindings `bNames`/`bTys`: one that stays apart where it is
+// not built as a union refuses the call, and otherwise the body is re-checked there.
+function tpIfPinCheck(
+  fn: i32,
+  pTys: i32[],
+  bNames: string[],
+  bTys: i32[],
+  retTy: i32,
+  ix: i32,
+) {
+  let apartJ = -1
+  let unbuilt = -1
+  let k = 0
+  while k < tpIfFn.length {
+    if tpIfFn[k] == fn {
+      const sj = substTyDeep(tpIfJoin[k], bNames, bTys)
+      if sj >= 0 && !tyHasTyVar(sj) && tyUnionAllLists(sj) {
+        // The widest names the whole chain of an `else if`, whose links are rows too.
+        if apartJ < 0 || unionMemberCountOf(sj) > unionMemberCountOf(apartJ) {
+          apartJ = sj
+        }
+        if unbuilt < 0 && !tpIfRowBuilt(k) { unbuilt = sj }
+      }
+    }
+    k = k + 1
+  }
+  if apartJ < 0 { return 0 }
+  let msg = ""
+  if unbuilt >= 0 {
+    apartJ = unbuilt
+    msg = "no one list holds it where its value goes — bind it to a `const`, or deliver it where its union is declared"
+  } else {
+    msg = tpIfRecheck(fn, pTys, bNames, bTys, retTy)
+  }
+  if msg == "" { return 0 }
+  let fWho = "the callee's body"
+  const fd = P.nodes[fn]
+  if fd is FuncDecl {
+    if fd.fnName != "" { fWho = "the body of `" + fd.fnName + "`" }
+  }
+  tErr(
+    "at the call's argument types, the branches of an `if` or `match` in "
+      + fWho
+      + " join "
+      + tpMembersListText(apartJ)
+      + ": "
+      + msg,
+    ix,
+  )
+  0
+}
+
+// Parks the bindings of a call to `fn` its caller `owner` pins later, with `fn`'s parameters.
+function noteTpIfRe(
+  fn: i32,
+  owner: i32,
+  names: string[],
+  tys: i32[],
+  params: i32[],
+) {
+  let k = 0
+  while k < tpIfReFn.length {
+    if (
+      tpIfReFn[k] == fn
+      && tpIfReOwner[k] == owner
+      && tpIfReCount[k] == tys.length
+    ) {
+      let same = true
+      let q = 0
+      while q < tys.length && same {
+        if !tyEq(tpIfReTys[tpIfReStart[k] + q], tys[q]) { same = false }
+        q = q + 1
+      }
+      if same { return 0 }
+    }
+    k = k + 1
+  }
+  tpIfReFn.push(fn)
+  tpIfReOwner.push(owner)
+  tpIfReStart.push(tpIfReNames.length)
+  tpIfReCount.push(names.length)
+  let i = 0
+  while i < names.length {
+    tpIfReNames.push(names[i])
+    tpIfReTys.push(tys[i])
+    i = i + 1
+  }
+  const ps: i32[] = []
+  let p = 0
+  while p < params.length {
+    ps.push(params[p])
+    p = p + 1
+  }
+  tpIfReParams.push(ps)
+  0
+}
+
+// Re-checks the body of `fn` at the pinned parameter types `pTys`, where a join of its is a
+// union of lists, and answers the first sentence that body earns there ("" for none). A value
+// the body hands back is held to the call's type `retTy` (-1: not asked), and a list or record
+// the instance would build of the join at the template's one-list type is refused.
+function tpIfRecheck(
+  fn: i32,
+  pTys: i32[],
+  bNames: string[],
+  bTys: i32[],
+  retTy: i32,
+): string {
+  const dn = P.nodes[fn]
+  if !(dn is FuncDecl) { return "" }
+  let i = 0
+  while i < pTys.length {
+    if pTys[i] < 0 || tyHasTyVar(pTys[i]) { return "" }
+    i = i + 1
+  }
+  let want = retTy
+  if want >= 0 && (tyHasTyVar(want) || want == TY_ERR || isVoidTy(want)) {
+    want = -1
+  }
+  const cs = cstrTablesMark()
+  const savedRet = T.curRet
+  const savedFn = curFnDeclIx
+  const savedNat = retNatural
+  const savedNatErr = retNaturalErr
+  // An unasked return is `TY_ERR`, which every value passes: `-2` would bank the returns as
+  // witnesses of whatever function is being inferred around this call.
+  if want >= 0 { T.curRet = want } else { T.curRet = TY_ERR }
+  curFnDeclIx = fn
+  cstrOwnerStack.push(fn)
+  tpIfCmpNames = bNames
+  tpIfCmpTys = bTys
+  tpIfCmpBad = ""
+  tpIfCmpOn = true
+  const d0 = T.diags.length
+  const sv: i32[] = []
+  let msg = ""
+  if monoRecheckBegin(fn, pTys, bNames, bTys, sv) {
+    if T.diags.length > d0 { msg = T.diags[d0].tmsg }
+    if msg == "" && want >= 0 {
+      const rets: i32[] = []
+      collectRetValues(dn.fnBody, rets)
+      let r = 0
+      while r < rets.length && msg == "" {
+        const rt = checkNode(rets[r])
+        if rt >= 0 && rt != TY_ERR && rt != TY_VOID && rt != TY_NEVER {
+          if !assignable(rt, want) {
+            msg = "it returns "
+              + tyToStr(rt)
+              + ", which the call reads as "
+              + tyToStr(want)
+          }
+        }
+        r = r + 1
+      }
+    }
+    monoRecheckEnd(sv)
+  }
+  tpIfCmpOn = false
+  if msg == "" { msg = tpIfCmpBad }
+  cstrOwnerStack.pop()
+  curFnDeclIx = savedFn
+  T.curRet = savedRet
+  retNatural = savedNat
+  retNaturalErr = savedNatErr
+  cstrTablesTruncate(cs)
+  msg
+}
+
+// Set while `tpIfRecheck` runs, with its bindings: each node the re-check types is compared with
+// the type the template recorded for it, as the instance will build it (`tpIfCmpNode`).
+let tpIfCmpOn = false
+let tpIfCmpNames: string[] = []
+let tpIfCmpTys: i32[] = []
+let tpIfCmpBad = ""
+
+// Records the first node the instance would build at a type other than the one the re-check
+// gives it, where that type holds a union of lists: a node the template typed concretely is
+// built at that type, and a list, record or function literal at its substitution.
+function tpIfCmpNode(ix: i32, t: i32) {
+  if tpIfCmpBad != "" || ix < 0 || t < 0 || ix >= nodeTyIx.length { return 0 }
+  const tpl = nodeTyIx[ix]
+  if tpl < 0 || tpIfJoinAt.has(ix) { return 0 }
+  const wt = widenLitTy(t)
+  if wt == tpl || !tyHoldsListUnion(wt, 0) { return 0 }
+  let st = tpl
+  if tyHasTyVar(tpl) {
+    const n = P.nodes[ix]
+    if !(n is ArrayLit || n is ObjLit || n is FuncDecl) { return 0 }
+    st = substTyDeep(tpl, tpIfCmpNames, tpIfCmpTys)
+  }
+  if st == wt || tyEq(st, wt) { return 0 }
+  tpIfCmpBad = "the value is "
+    + tyToStr(wt)
+    + " where the body builds "
+    + tyToStr(st)
+    + " — narrow it with `is` first"
+  0
+}
+
+// Whether `ty` is, or holds within a few levels, a union of lists.
+function tyHoldsListUnion(ty: i32, depth: i32): boolean {
+  if ty < 0 || ty >= T.tys.length || depth > 4 { return false }
+  if tyUnionAllLists(ty) { return true }
+  const t = T.tys[ty]
+  match t {
+    TyArray => {
+      return tyHoldsListUnion(t.aElem, depth + 1)
+    }
+    TyNullable => {
+      return tyHoldsListUnion(t.nInner, depth + 1)
+    }
+    TyObj => {
+      let i = 0
+      while i < t.objFieldTypes.length {
+        if tyHoldsListUnion(t.objFieldTypes[i], depth + 1) { return true }
+        i = i + 1
+      }
+      return false
+    }
+    TyFunc => {
+      return tyHoldsListUnion(t.fnRet, depth + 1)
+    }
+    TyUnion => {
+      let j = 0
+      while j < t.uMembers.length {
+        if tyHoldsListUnion(t.uMembers[j], depth + 1) { return true }
+        j = j + 1
+      }
+      return false
+    }
+    TyMap => {
+      return tyHoldsListUnion(t.mVal, depth + 1)
+    }
+    TyPrim | TyErr | TyVar | TyLit | TyNeg => {
+      return false
+    }
+  }
+}
+
+// How many members `ty` has as a union, else 1.
+function unionMemberCountOf(ty: i32): i32 {
+  const t = T.tys[ty]
+  if t is TyUnion { return t.uMembers.length }
+  1
+}
+
+// The members of `ty` as `a and b`.
+function tpMembersListText(ty: i32): string {
+  const ms: i32[] = []
+  flattenVariantsInto(ty, ms)
+  let out = ""
+  let i = 0
+  while i < ms.length {
+    if i > 0 { out = out + " and " }
+    out = out + tyToStr(ms[i])
+    i = i + 1
+  }
+  out
+}
+
+// The lengths of the deferred-constraint tables, so a pinned re-check can drop what it recorded.
+function cstrTablesMark(): i32[] {
+  [
+    argCstrAt.length,
+    nestCstrTy.length,
+    retCstrGot.length,
+    letCstrGot.length,
+    bmCstrGot.length,
+    memCstrTy.length,
+    ufcsCstrTy.length,
+    escJoinTy.length,
+    coalHoleTy.length,
+    tpIfFn.length,
+    tpIfReFn.length,
+  ]
+}
+
+function cstrTablesTruncate(m: i32[]) {
+  while argCstrAt.length > m[0] {
+    argCstrAt.pop()
+    argCstrExp.pop()
+    argCstrWho.pop()
+    argCstrFn.pop()
+    argCstrTpl.pop()
+  }
+  while nestCstrTy.length > m[1] {
+    nestCstrTy.pop()
+    nestCstrIx.pop()
+    nestCstrFn.pop()
+  }
+  while retCstrGot.length > m[2] {
+    retCstrGot.pop()
+    retCstrWant.pop()
+    retCstrIx.pop()
+    retCstrFn.pop()
+    retCstrWOnly.pop()
+  }
+  while letCstrGot.length > m[3] {
+    letCstrGot.pop()
+    letCstrWant.pop()
+    letCstrIx.pop()
+    letCstrFn.pop()
+    letCstrName.pop()
+  }
+  while bmCstrGot.length > m[4] {
+    bmCstrGot.pop()
+    bmCstrWant.pop()
+    bmCstrCtx.pop()
+    bmCstrIx.pop()
+    bmCstrFn.pop()
+    bmCstrForm.pop()
+    bmCstrLabel.pop()
+  }
+  while memCstrTy.length > m[5] {
+    memCstrTy.pop()
+    memCstrProp.pop()
+    memCstrIx.pop()
+    memCstrFn.pop()
+    memCstrDem.pop()
+  }
+  while ufcsCstrTy.length > m[6] {
+    ufcsCstrTy.pop()
+    ufcsCstrProp.pop()
+    ufcsCstrIx.pop()
+    ufcsCstrFn.pop()
+    ufcsCstrP0.pop()
+    ufcsCstrMore.pop()
+  }
+  while escJoinTy.length > m[7] {
+    escJoinTy.pop()
+    escJoinIx.pop()
+    escJoinWho.pop()
+    escJoinFn.pop()
+  }
+  while coalHoleTy.length > m[8] {
+    coalHoleTy.pop()
+    coalHoleFn.pop()
+  }
+  while tpIfFn.length > m[9] {
+    tpIfFn.pop()
+    tpIfJoin.pop()
+    tpIfNode.pop()
+    tpIfOk.pop()
+  }
+  while tpIfReFn.length > m[10] {
+    tpIfReFn.pop()
+    tpIfReOwner.pop()
+    tpIfReStart.pop()
+    tpIfReCount.pop()
+    tpIfReParams.pop()
+  }
+  0
 }
 
 // Whether `ty` is a union whose every member is a list.
@@ -36230,6 +36855,7 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
     // (matching `.map`/`.filter`), substituting type-param bindings from earlier arguments
     // first — `mapArr(xs: T[], f: (T) => R)` called with `[1,2,3]` binds `T = i32` before seeding `f`'s param as `i32`.
     seedExpected(args[i], substTyDeep(params[i], bNames, bTys))
+    if tpEnvNames.length > 0 { tpIfMarkOk(args[i]) }
     const at = checkNode(args[i])
     // A template hole meeting its injected renderer. This line is the first
     // moment the hole's type exists, which is why the type-directed half of
@@ -36416,6 +37042,15 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
       validateEscJoins(bNames, bTys, cstrCallee)
     }
     retTy = substTyDeep(retTy, vNames, vTys)
+    if tpIfFn.length > 0 || tpIfReFn.length > 0 {
+      const pinTys: i32[] = []
+      let pp = 0
+      while pp < params.length {
+        pinTys.push(substTyDeep(params[pp], vNames, vTys))
+        pp = pp + 1
+      }
+      validateTpIfJoins(vNames, vTys, pinTys, retTy, ix, cstrCallee)
+    }
   }
   // A deferred join the re-fold could not decide here (the callee's arms name a hole this
   // site does not bind) must not escape as this call's type — the emitter has no rep for a
@@ -39281,6 +39916,8 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
       // A statement before the tail, or the tail of a void body, is discarded.
       if s < stmts.length - 1 || (!inferring && isVoidTy(ret)) {
         markValDiscard(stmts[s])
+      } else if tailIsReturn && tpEnvNames.length > 0 {
+        tpIfMarkOk(stmts[s])
       }
       crStmtEnter(stmts[s])
       const stTy = checkNode(stmts[s])
@@ -41275,6 +41912,7 @@ function checkNodeDone(ix: i32, t: i32, savedTail: boolean) {
     if v128Seen { v128NestCheck(ix, t) }
     noteNestCstr(t, ix)
   }
+  if tpIfCmpOn { tpIfCmpNode(ix, t) }
   0
 }
 
@@ -42133,7 +42771,7 @@ export function tyIsStructBearingUnion(er: i32) {
 // if it is a value union the emitter can box (≥2 non-null value atoms, or one numeric scalar
 // + null), else "". Drives `registerValueUnionName`, the `"union"` return kind, and
 // `emitUnionCoerce` at the return site, exactly like the annotated path — built only for unions that are value unions, to avoid a render-join-resplit of every non-union return.
-function valueUnionRetName(er: i32) {
+export function valueUnionRetName(er: i32) {
   if er < 0 { return "" }
   // Decline a union with any composite leaf WITHOUT rendering it (`retAtomsCheap`) —
   // its atom cannot classify anyway, and the render of a recursive struct leaf is
@@ -48275,7 +48913,12 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
   // read of the same place inside the value can pin the element rather than answer `TY_ERR`.
   const savedAsgRow = asgOpenElemRow
   asgOpenElemRow = -1
-  if op == "=" { asgOpenElemRow = asgOpenElemRowOf(n.binLeft) }
+  if op == "=" {
+    asgOpenElemRow = asgOpenElemRowOf(n.binLeft)
+    if tpEnvNames.length > 0 && P.nodes[n.binLeft] is Ident {
+      tpIfMarkOk(n.binRight)
+    }
+  }
   let rt = checkNode(n.binRight)
   asgOpenElemRow = savedAsgRow
   // The right operand takes the same answer, for the same reason: without it, an operator's
@@ -49356,7 +49999,10 @@ function checkLetDeclNode(n: LetDecl, ix: i32) {
       if liN.fnName == "" { noteValBindLambda(n.letInit) }
     }
   }
-  if n.letInit >= 0 { initTy = checkNode(n.letInit) }
+  if n.letInit >= 0 {
+    if tpEnvNames.length > 0 { tpIfMarkOk(n.letInit) }
+    initTy = checkNode(n.letInit)
+  }
   // A `void` initializer has no value to bind — reject with a source-located message,
   // poisoning `initTy`. Exempted: an if-expression init, whose false path is implicit `null`.
   // A minted scrutinee binding (D1991) keeps the `void`, so the `match` reports it in its own words.
@@ -49414,6 +50060,7 @@ function checkLetDeclNode(n: LetDecl, ix: i32) {
     }
   } else if initTy >= 0 {
     bound = constStrLitBound(n, initTy)
+    if tpIfJoinAt.length > 0 { bound = tpIfBindTy(n.letInit, bound) }
     // A-infer-null: an un-annotated `let x = null` binds a nullable with an open inner hole;
     // the first non-null assignment fills it in place (the `=` arm), so `x` becomes `T | null`.
     if isNullTy(initTy) {
@@ -49759,6 +50406,7 @@ function checkMatchIntArms(n: MatchExpr, ix: i32, st: i32) {
   // -1 is the "unset" join seed (`joinTys` returns the other operand); the positive TY_ERR
   // sentinel would poison the join, so never seed with it.
   let matchTy = -1
+  const matchArmTys: i32[] = []
   let matchValAcc = matchTallyBegin(ix)
   const nArms = n.matchArmStart.length
   let ai = 0
@@ -49803,6 +50451,7 @@ function checkMatchIntArms(n: MatchExpr, ix: i32, st: i32) {
       if armTy < 0 { armTy = TY_VOID }
     }
     matchTy = joinTys(matchTy, f32ArmPlainTy(body, armTy))
+    if tpEnvNames.length > 0 { matchArmTys.push(f32ArmPlainTy(body, armTy)) }
     matchValAcc = matchArmTally(ix, body, armTy, matchValAcc)
     ai = ai + 1
   }
@@ -49811,6 +50460,8 @@ function checkMatchIntArms(n: MatchExpr, ix: i32, st: i32) {
   if mf32 >= 0 {
     matchTy = mf32
     matchValAcc = mf32
+  } else {
+    noteTpJoinRow(ix, tpApartJoinOf(matchArmTys), matchTy, tpMatchOk)
   }
   matchTallyEnd(ix, matchValAcc)
   // Exhaustiveness is the wildcard, and it is required — an integer has no closed member set,
@@ -50078,6 +50729,7 @@ function checkMatchTypeArms(n: MatchExpr, ix: i32, st: i32, uMems: i32[]) {
   // Pass 3 (source order): check each arm body under its branch's narrowing, joining arm value
   // types. -1 is the "unset" join seed; the positive TY_ERR sentinel would poison the join.
   let matchTy = -1
+  const matchArmTys: i32[] = []
   let matchValAcc = matchTallyBegin(ix)
   let bi = 0
   while bi < nArms {
@@ -50117,6 +50769,7 @@ function checkMatchTypeArms(n: MatchExpr, ix: i32, st: i32, uMems: i32[]) {
     }
     if scoped { popScope() }
     matchTy = joinTys(matchTy, f32ArmPlainTy(body, armTy))
+    if tpEnvNames.length > 0 { matchArmTys.push(f32ArmPlainTy(body, armTy)) }
     matchValAcc = matchArmTally(ix, body, armTy, matchValAcc)
     bi = bi + 1
   }
@@ -50125,6 +50778,8 @@ function checkMatchTypeArms(n: MatchExpr, ix: i32, st: i32, uMems: i32[]) {
   if mf32 >= 0 {
     matchTy = mf32
     matchValAcc = mf32
+  } else {
+    noteTpJoinRow(ix, tpApartJoinOf(matchArmTys), matchTy, tpMatchOk)
   }
   matchTallyEnd(ix, matchValAcc)
   // Exhaustiveness: `_` is allowed but never required — a match naming every member is
@@ -50160,6 +50815,7 @@ function checkMatchExprNode(n: MatchExpr, ix: i32) {
   matchInRetTail = matchTailNode == ix
   retTailPos = false
   const st = checkNode(n.matchScrut)
+  tpMatchOk = mTail || tpIfOkAt.has(ix)
   // The scrutinee and arm bodies are NOT in return-tail position — restore the flag on every
   // exit so a `match` subexpression stays transparent to a sibling in the same statement.
   if tyIsIntMatchScrut(st) || (tyIsHole(st) && matchArmsAreIntLits(n)) {
@@ -50218,6 +50874,7 @@ function checkMatchExprNode(n: MatchExpr, ix: i32) {
   // -1 is the "unset" join seed (`joinTys` returns the other operand); the positive TY_ERR
   // sentinel would poison the join (every arm joins back to error), so never seed with it.
   let matchTy = -1
+  const matchArmTys: i32[] = []
   let matchValAcc = matchTallyBegin(ix)
   let ai = 0
   while ai < n.matchArmStart.length {
@@ -50301,6 +50958,7 @@ function checkMatchExprNode(n: MatchExpr, ix: i32) {
       if armTy < 0 { armTy = TY_VOID }
     }
     matchTy = joinTys(matchTy, f32ArmPlainTy(body, armTy))
+    if tpEnvNames.length > 0 { matchArmTys.push(f32ArmPlainTy(body, armTy)) }
     matchValAcc = matchArmTally(ix, body, armTy, matchValAcc)
     ai = ai + 1
   }
@@ -50311,6 +50969,8 @@ function checkMatchExprNode(n: MatchExpr, ix: i32) {
   if mf32 >= 0 {
     matchTy = mf32
     matchValAcc = mf32
+  } else {
+    noteTpJoinRow(ix, tpApartJoinOf(matchArmTys), matchTy, tpMatchOk)
   }
   matchTallyEnd(ix, matchValAcc)
   // Exhaustiveness: every member covered, or a wildcard. Skipped after an invalid pattern —
@@ -50826,11 +51486,21 @@ function checkIfTail(
   // values.
   if f32Join >= 0 { return f32Join }
   if daHasElse {
-    const plainJoin = joinTys(
-      f32ArmPlainTy(n.ifThen, thenTy),
-      f32ArmPlainTy(n.ifElse, elseTy),
-    )
+    const thenPlain = f32ArmPlainTy(n.ifThen, thenTy)
+    const elsePlain = f32ArmPlainTy(n.ifElse, elseTy)
+    const plainJoin = joinTys(thenPlain, elsePlain)
     f32JoinRevert(ix)
+    if tpEnvNames.length > 0 && !thenExits && !daElseDiverges {
+      let elseApart = elsePlain
+      if elseIsLink { elseApart = tpIfJoinAt.get(n.ifElse) ?? elsePlain }
+      noteTpIfJoin(
+        ix,
+        thenPlain,
+        elseApart,
+        plainJoin,
+        ifTail || tpIfOkAt.has(ix),
+      )
+    }
     return plainJoin
   }
   // An else-less `if` used as a value is `T | null` in every position — the false fall-through
@@ -55790,6 +56460,7 @@ function voidRetRewrite() {
 // Extracted from `checkNodeReal`'s `RetStmt` arm (C3: thin the dispatcher).
 function checkRetStmtNode(n: RetStmt, ix: i32) {
   const want = T.curRet
+  if tpEnvNames.length > 0 { tpIfMarkOk(n.retArg) }
   // `T.curRet` is only ever `-1` at its `initChecker` reset, never written by a
   // function-body check (`checkFuncDeclNode` always saves/restores a real return type or
   // the `-2` inferring sentinel) — so `-1` here means this `return` is not inside any
@@ -55933,11 +56604,19 @@ function discardedTailTy(ix: i32, ty: i32): i32 {
   inferRetTyOf(ix, ifTailValTyOf(ix, v))
 }
 
-// Marks the `if` or block at `ix` as discarded (`valDiscardAt`); any other node is left alone.
+// Marks the `if` or block at `ix` as discarded (`valDiscardAt`), and a `match` (`tpIfMarkDiscard`);
+// any other node is left alone.
 function markValDiscard(ix: i32) {
   if ix < 0 || ix >= P.nodes.length { return 0 }
   const n = P.nodes[ix]
   if n is IfStmt || n is Block { valDiscardAt[ix] = true }
+  if tpEnvNames.length > 0 { tpIfMarkDiscard(ix) }
+  0
+}
+
+// A discarded `match` builds no value, so its join is never read as one list (D2832).
+function tpIfMarkDiscard(ix: i32) {
+  if P.nodes[ix] is MatchExpr { tpIfOkAt.set(ix, true) }
   0
 }
 
