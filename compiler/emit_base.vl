@@ -3430,6 +3430,132 @@ export function monoSubstAnn(
   }
   ann
 }
+// The index of the one atom of union pattern `pats` that names a type parameter, or -1 when
+// none or several do.
+function monoUnionOpenAtom(pats: string[], typarams: string[]): i32 {
+  let open = -1
+  let i = 0
+  while i < pats.length {
+    if monoAnnHasTyParam(pats[i], typarams) {
+      if open >= 0 { return -1 }
+      open = i
+    }
+    i = i + 1
+  }
+  open
+}
+
+// Whether pairing `pats` with `acts` by position meets every concrete pattern atom with itself.
+function monoUnionPairsAlign(
+  pats: string[],
+  acts: string[],
+  open: i32,
+): boolean {
+  if pats.length != acts.length { return false }
+  let i = 0
+  while i < pats.length {
+    if i != open && normTypeAtom(pats[i]) != normTypeAtom(acts[i]) {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+// Whether annotation `pat` is a union with one type-parameter atom and a concrete atom besides
+// `null`. Its binding yields to every other parameter's, since the checker binds a type
+// parameter from a nullable (`T | null`) in order but from such a union not at all.
+export function monoAnnIsOpenUnion(pat: string, typarams: string[]): boolean {
+  if unionMemberCount(pat) < 2 { return false }
+  const pats: string[] = []
+  splitUnionAtoms(pat, pats)
+  const open = monoUnionOpenAtom(pats, typarams)
+  if open < 0 { return false }
+  let i = 0
+  while i < pats.length {
+    if i != open && normTypeAtom(pats[i]) != "null" { return true }
+    i = i + 1
+  }
+  false
+}
+
+// Whether every atom of argument `actual` is a concrete atom of union annotation `pat`, so its
+// one type-parameter atom is left free (`T | null` at `null`) and should bind elsewhere first.
+export function monoUnionLeavesOpenFree(
+  pat: string,
+  actual: string,
+  typarams: string[],
+): boolean {
+  if unionMemberCount(pat) < 2 { return false }
+  const pats: string[] = []
+  splitUnionAtoms(pat, pats)
+  const open = monoUnionOpenAtom(pats, typarams)
+  if open < 0 { return false }
+  const acts: string[] = []
+  splitUnionAtoms(actual, acts)
+  let i = 0
+  while i < acts.length {
+    let covered = false
+    let j = 0
+    while j < pats.length && !covered {
+      if j != open && normTypeAtom(pats[j]) == normTypeAtom(acts[i]) {
+        covered = true
+      }
+      j = j + 1
+    }
+    if !covered { return false }
+    i = i + 1
+  }
+  true
+}
+
+// The union spelling of `atoms`, in their order.
+function joinUnionAtoms(atoms: string[]): string {
+  let out = ""
+  let i = 0
+  while i < atoms.length {
+    if i > 0 { out = out + "|" }
+    out = out + atoms[i]
+    i = i + 1
+  }
+  out
+}
+
+// Binds the open atom of union pattern `pats` to the atoms of `acts` that no concrete atom of
+// the pattern names, in their own order (`string | T` at `M | null` binds `T` to `M|null`).
+function monoBindUnionRest(
+  pats: string[],
+  acts: string[],
+  open: i32,
+  typarams: string[],
+  tvN: string[],
+  tvV: string[],
+) {
+  let rest = ""
+  let n = 0
+  let i = 0
+  while i < acts.length {
+    let covered = false
+    let j = 0
+    while j < pats.length && !covered {
+      if j != open && normTypeAtom(pats[j]) == normTypeAtom(acts[i]) {
+        covered = true
+      }
+      j = j + 1
+    }
+    if !covered {
+      if n > 0 { rest = rest + "|" }
+      rest = rest + acts[i]
+      n = n + 1
+    }
+    i = i + 1
+  }
+  // The argument is all concrete members (`f("s")` at `T | string`): `T` is otherwise free, and
+  // the argument's own spelling is a binding the substitution reproduces.
+  if n == 0 { rest = joinUnionAtoms(acts) }
+  monoBindFromAnn(pats[open], rest, typarams, tvN, tvV)
+}
+
 // Bind type params by matching a parameter's annotation PATTERN against the
 // argument's concrete type name: `T` against anything, `T[]` against `X[]`,
 // `Box<T>` against `Box<i32>` (same head, pairwise arguments). First use wins.
@@ -3469,6 +3595,10 @@ export function monoBindFromAnn(
     splitUnionAtoms(pat, puatoms)
     const auatoms: string[] = []
     splitUnionAtoms(actual, auatoms)
+    const open = monoUnionOpenAtom(puatoms, typarams)
+    if open >= 0 && !monoUnionPairsAlign(puatoms, auatoms, open) {
+      return monoBindUnionRest(puatoms, auatoms, open, typarams, tvN, tvV)
+    }
     if puatoms.length == auatoms.length {
       let ui = 0
       while ui < puatoms.length {

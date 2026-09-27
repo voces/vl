@@ -100,8 +100,11 @@ import {
   nodeUnwidenedTyOf,
   nodeWideStrLitText,
   nominalStructNameOfTy,
+  numCastCanFail,
   numLitUnionBaseName,
   numLitUnionHasBase,
+  primNameOf,
+  primNameStr,
   simdRow,
   simdRowLaneMax,
   simdRowOp,
@@ -631,6 +634,7 @@ import {
   wULEB,
 } from "./emit_bytes"
 import {
+  TY_WALK_DEPTH,
   annRowOfNode,
   annValtypeSlotOf,
   anonLeafRetMovedOf,
@@ -646,6 +650,7 @@ import {
   arrLitIsStr,
   arrNewIntrKind,
   arrNewKindNamed,
+  asExprHoleNumOpt,
   asExprIsUnionCastIn,
   asExprNumCastDomain,
   asExprNumFallible,
@@ -718,7 +723,9 @@ import {
   eqgInnerSlot,
   eqgListKindOfBin,
   eqgListSlotOfBin,
+  exactOperandTyOf,
   exactUnionLacksMap,
+  exactUnionLacksTwin,
   exprArray,
   exprEmittedRefListSlot,
   exprF32Array,
@@ -1018,9 +1025,11 @@ import {
   tyAnnRefListKind,
   tyAnnRefListSlot,
   tyIsUnionMemberOf,
+  tyMentionsSet,
   tyPeelNul,
   tyRefArrElemOf,
   tySameSet,
+  tySameSpelled,
   uFieldElemTyIxRow,
   uFieldMapShape,
   uFieldStorageSlot,
@@ -2286,6 +2295,27 @@ function emitStructExprAsVariantBox(
   0
 }
 
+// Whether print's argument `ax` is a union box that the scalar ladder would print as its tag:
+// a call's result, or a name whose slot is the box and no narrowing unboxes.
+function printArgIsUnclassifiedBox(ax: i32, fnIx: i32): boolean {
+  if !exprUnion(ax, fnIx) { return false }
+  const ax0 = unwrapParen(ax)
+  if ax0 < 0 { return false }
+  if P.nodes[ax0] is Call { return true }
+  printArgIsBoxName(ax0, fnIx)
+}
+
+// Whether `ix` names a slot holding a union box that no narrowing unboxes to one type: a partial
+// narrowing (the `else` of `is string` over `i32 | R | string`) still leaves the box.
+function printArgIsBoxName(ix: i32, fnIx: i32): boolean {
+  const n = P.nodes[ix]
+  if n is Ident {
+    return narrowedArmTyOf(n.identName) < 0
+      && identSlotIsUnionBox(fnIx, n.identName)
+  }
+  false
+}
+
 // The compile-time value of a monomorphized-instance `is` guard: 1 (always true), 0
 // (always false), or -1 (not statically decidable, so `emitIs`'s runtime paths handle
 // it). Each instance pins an un-annotated param to one concrete type.
@@ -2299,6 +2329,20 @@ function monoStaticIsResult(isIx: i32, fnIx: i32) {
       if variantIndexOf(rsp) >= 0 { return -1 }
     }
     if exprUnion(nd.isObj, fnIx) { return -1 }
+
+    // An exact instance knows the operand's type, where a spelling renders a Set as its
+    // boolean map: a union is no static answer, and a single type is its own (D2753).
+    const ext = exactOperandTyOf(nd.isObj, fnIx)
+    if ext >= 0 {
+      const exm: i32[] = []
+      flattenVariantsInto(ext, exm)
+      if exm.length > 1 { return -1 }
+      const ept = isVarTyIxOf(isIx)
+      if ept >= 0 {
+        if tySameSet(ext, ept, TY_WALK_DEPTH) { return 1 }
+        if tySameSpelled(ext, ept, TY_WALK_DEPTH) { return 0 }
+      }
+    }
 
     if nodeTyIsNullable(nd.isObj) { return -1 }
     const sk = monoArgTyName(nd.isObj, fnIx)
@@ -2354,6 +2398,9 @@ function isArmTagOfTy(ity: i32): i32 {
     return mapArmTagOfTy(ity, mapShapeFoldSet(mapArmShapeOfTy(ity)))
   }
   if unMemIsRefElemArray(ity) {
+    // A list of Sets shares its element slot with the list of boolean maps, so that slot's tag
+    // is not the Set list's own and no box is known to carry it (D2753).
+    if tyMentionsSet(tyRefArrElemOf(ity), TY_WALK_DEPTH) { return -1 }
     const sl = rlSlotOfTy(tyRefArrElemOf(ity))
     if sl >= 0 { return refArrSlotTag(sl) }
   }
@@ -2691,6 +2738,8 @@ function nulNicheBaseClass(recvIx: i32, fnIx: i32) {
 // so `recv is <ity>` is statically false — else the niche's own null test would wrongly
 // answer true for every present value too. One-sided: both halves must be positively known.
 function nulNicheIsTestImpossible(recvIx: i32, ity: i32, fnIx: i32) {
+  // An exact instance knows the member the niche holds: its twin shares the pattern's row (D2753).
+  if exactUnionLacksTwin(recvIx, ity, fnIx) { return true }
   // A map niche holds one map type: a pattern naming another map is never it (D2493).
   if unMemIsMap(ity) && !exprUnion(recvIx, fnIx) {
     // An instance parameter's pin names the niche's map exactly; a spelling needs the lenient
@@ -2883,8 +2932,8 @@ function emitVariantDiscrimTest(body: u8[], recvIx: i32, vi: i32, fnIx: i32) {
 }
 
 // The member of the union `recvIx` holds that a tested map `patTy` names up to the order of its
-// value union's members, so the test reads that member's tag; `patTy` itself when the union has
-// it exactly, has no such member, or `patTy` is not a map (D2733).
+// value union's members or a nested Set's spelling, so the test reads that member's tag; `patTy`
+// itself when the union has it exactly, has no such member, or `patTy` is not a map (D2733).
 function isPatUnionArmTy(recvIx: i32, patTy: i32, fnIx: i32): i32 {
   if patTy < 0 || !unMemIsMap(patTy) { return patTy }
   const nm = unionNameOfExpr(recvIx, fnIx)
@@ -2898,7 +2947,8 @@ function isPatUnionArmTy(recvIx: i32, patTy: i32, fnIx: i32): i32 {
     const a = arms[i]
     if a >= 0 && unMemIsMap(a) {
       if mapTwinSame(a, patTy) { return patTy }
-      if same < 0 && tySameSet(a, patTy, 16) { same = a }
+      if same < 0 && tySameSet(a, patTy, TY_WALK_DEPTH) { same = a }
+      if same < 0 && tySameSpelled(a, patTy, TY_WALK_DEPTH) { same = a }
     }
     i = i + 1
   }
@@ -3162,7 +3212,9 @@ function emitIsTest(body: u8[], isIx: i32, fnIx: i32) {
     // boolean map), so a member set without the pattern itself answers false.
     const lacksExact = (unMemIsMap(patTy)
       && exprUnion(ndv.isObj, fnIx)
-      && exactUnionLacksMap(ndv.isObj, patTy, fnIx))
+      && exactUnionLacksMap(ndv.isObj, isVarTyIxOf(isIx), fnIx))
+      || (exprUnion(ndv.isObj, fnIx)
+      && exactUnionLacksTwin(ndv.isObj, isVarTyIxOf(isIx), fnIx))
     // A map type no arm of the box registered is a member of no value it can hold (a generic
     // body's `is M` at a pin whose union lacks `M`): the answer is false, after the receiver.
     if (
@@ -15388,6 +15440,18 @@ function numCastNullNode(): i32 { mkNull("null", -1) }
 // `NullLit` builds, so every delivery position already knows the null); `as!` is the
 // reason, `unreachable`, then the conversion; a bare `as` returns the enclosing function's own null (built by the return path) then the conversion.
 function emitNumExactCast(body: u8[], e: AsExpr, exprIx: i32, fnIx: i32) {
+  emitNumExactCastFrom(body, e, exprIx, asExprNumSrcName(exprIx), fnIx)
+}
+
+// `emitNumExactCast` from the source rep `srcIn`, which a type-parameter operand reads off
+// its instance rather than its recorded type.
+function emitNumExactCastFrom(
+  body: u8[],
+  e: AsExpr,
+  exprIx: i32,
+  srcIn: string,
+  fnIx: i32,
+) {
   const tgt = asExprNumTgtName(exprIx)
   // The domain and the target are two names (D1587): the domain decides the range test and
   // the `as!` message, the target decides the conversion opcode and the box row. At `u8`
@@ -15396,7 +15460,7 @@ function emitNumExactCast(body: u8[], e: AsExpr, exprIx: i32, fnIx: i32) {
   // An i32 source exists only at the `u8` domain, and rides the i64 path rather than a
   // fourth scratch slot: `i64.extend_i32_s` is exact for every i32, the range test is the
   // same two compares, and `i32.wrap_i64` brings the proven 0..255 value back unchanged.
-  let src = asExprNumSrcName(exprIx)
+  let src = srcIn
   if src == "i32" { src = "i64" }
   // Stage the operand ONCE — the test reads it up to three times and it is typically a call.
   if src == "i64" {
@@ -15608,6 +15672,9 @@ function emitAsCast(body: u8[], e: AsExpr, _exprIx: i32, fnIx: i32) {
   }
   // numeric exact-or-fail (D1041) is checked ahead of the union arm and disjoint from it by
   // operand; only a cast that can fail comes here, the rest fall through to the plain ladder.
+  if asExprHoleNumOpt(_exprIx) && !asExprIsUnionCastIn(_exprIx, fnIx) {
+    return emitHoleNumAsOpt(body, e, _exprIx, fnIx)
+  }
   if asExprNumFallible(_exprIx) {
     // the peephole: `trunc(d) as! i32`/`floor`/`ceil`/`nearest` — the operand is integral, so
     // only range can fail (excludes `u8`, D1587: `i32.trunc_f64_s` enforces i32's range, not 0..255).
@@ -15790,16 +15857,67 @@ function emitAsCast(body: u8[], e: AsExpr, _exprIx: i32, fnIx: i32) {
     }
     return emitUnionUnboxTail(ak)
   }
-  // the numeric `x as T` lowering: the operand goes out in its own source rep through the
-  // `emitExprAs*` helpers, then one wasm conversion opcode for the pair (float-to-int traps
-  // rather than wraps). The width is the cast's, not the delivery position, so
-  // `emitNumIntrArg` clears the enclosing wide-scalar context — else a `: f32` binding's `pendingF32` would double-widen it.
+  emitNumPlainCast(body, obj, tgt, fnIx)
+}
+
+// The source rep of numeric operand `obj` as this instance emits it: f32 first, since
+// `exprIsF64` over-claims an f32 literal.
+function numCastSrcRepOf(obj: i32, fnIx: i32): string {
+  if exprIsF32(obj, fnIx) { return "f32" }
+  if exprIsI64(obj, fnIx) { return "i64" }
+  if exprIsF64(obj, fnIx) { return "f64" }
+  "i32"
+}
+
+// `u as? N` over a type-parameter operand pinned at a number: `N | null` at every pin (D2754),
+// so a cast that cannot fail at this pin still boxes its value, and one that can takes the
+// exact-or-fail box.
+function emitHoleNumAsOpt(body: u8[], e: AsExpr, exprIx: i32, fnIx: i32) {
+  const tgt = asExprNumTgtName(exprIx)
+  const nck = valueAtomKind(tgt)
+  const nvb = vbHeapIdxOfKind(nck)
+  if nvb < 0 || !uDeclared {
+    return emitFail(
+      "emitProgram: `as? "
+        + tgt
+        + "` has no value box — the `"
+        + tgt
+        + " | null` row was never registered",
+    )
+  }
+  // The instance's exact pin decides: a number converts, any other type is never the target.
+  const ext = exactOperandTyOf(e.asObj, fnIx)
+  if ext < 0 {
+    return emitFail(
+      "emitProgram: `as? "
+        + tgt
+        + "` over a type parameter needs the instance's exact pin",
+    )
+  }
+  const src = primNameStr(primNameOf(ext))
+  if src != "i32" && src != "i64" && src != "f32" && src != "f64" {
+    fbI32Const(nullBoxTag())
+    fbRefNullNone()
+    fbStructNew(uBoxIdx)
+    return 0
+  }
+  if numCastCanFail(src, asExprNumCastDomain(exprIx)) {
+    return emitNumExactCastFrom(body, e, exprIx, src, fnIx)
+  }
+  fbI32Const(scalarTagOfKind(nck))
+  if emitNumPlainCast(body, e.asObj, tgt, fnIx) < 0 { return -1 }
+  fbStructNew(nvb)
+  fbStructNew(uBoxIdx)
+  0
+}
+
+// The numeric `x as T` lowering: the operand goes out in its own source rep through the
+// `emitExprAs*` helpers, then one wasm conversion opcode for the pair (float-to-int traps
+// rather than wraps). The width is the cast's, not the delivery position, so
+// `emitNumIntrArg` clears the enclosing wide-scalar context — else a `: f32` binding's `pendingF32` would double-widen it.
+function emitNumPlainCast(body: u8[], obj: i32, tgt: string, fnIx: i32) {
   if tgt == "f64" { return emitNumIntrArg(body, obj, 4, fnIx) }
-  // classify the source rep: f32 first, since `exprIsF64` over-claims an f32 literal.
-  let src = "i32"
-  if exprIsF32(obj, fnIx) { src = "f32" }
-  else if exprIsI64(obj, fnIx) { src = "i64" }
-  else if exprIsF64(obj, fnIx) { src = "f64" }
+  const src = numCastSrcRepOf(obj, fnIx)
   if tgt == "i64" {
     // i32→i64 widening (and i64→i64 no-op) via the existing helper.
     if src == "i32" || src == "i64" {
@@ -17191,7 +17309,10 @@ function emitCallCore(body: u8[], callIx: i32, fnIx: i32) {
         // ends in `call __print_i32__` with a `(ref $uBox)` on the stack, check-clean
         // invalid wasm (D711). The checker gates on the type, this on the expression, so
         // the residue is whatever the expression-side resolvers cannot name.
-        if printUnionArmsUnrenderable(c.callArgs[0], fnIx) {
+        if (
+          printUnionArmsUnrenderable(c.callArgs[0], fnIx)
+          || printArgIsUnclassifiedBox(c.callArgs[0], fnIx)
+        ) {
           return emitFail(
             "emitProgram: print of a union value whose arms the tag dispatch cannot classify",
           )

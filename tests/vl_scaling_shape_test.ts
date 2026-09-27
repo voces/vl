@@ -1339,6 +1339,36 @@ axis(
   (d) => twoFiles(d, genGenericCycle(14, true), genGenericCycle(14, false)),
 );
 
+// `n` generics that each call every other one at `<T>` over a `T | null` they compare with
+// `==`, against the same generics calling a concrete helper instead. Each call copies its
+// callee's deferred operator constraints into the caller under substitution, and a copy keyed
+// on its fresh arena index re-recorded every one, exponential in `n` (D2757). At 16: 3.9 s of
+// `vl check` alone on the seed before D2757.
+const genGenericClique = (n: number, clique: boolean): string => {
+  const o: string[] = [];
+  for (let i = 0; i < n; i++) {
+    o.push(`function h${i}(n: i32): boolean { n > 0 }`);
+    o.push(`function f${i}<T>(u: T | null, n: i32): boolean {`, "  if n <= 0 { return u == null }");
+    for (let j = 0; j < n; j++) {
+      if (j === i) continue;
+      const call = clique ? `f${j}<T>(u, n - 1)` : `h${j}(n - 1)`;
+      o.push(`  if n % ${n} == ${j} { return ${call} }`);
+    }
+    o.push("  false", "}");
+  }
+  o.push("let acc = 0");
+  for (let i = 0; i < 3600; i++) fill(o, i, 6);
+  o.push("const s: i32[] = []", `print(f0<i32[]>(s, ${n}))`, "print(acc)");
+  return o.join("\n") + "\n";
+};
+
+axis(
+  "generics calling each other in a complete graph",
+  2.5,
+  "A call to a generic is re-recording its callee's deferred constraints per copy (`noteBinCstr`, compiler/typecheck.vl; D2757).",
+  (d) => twoFiles(d, genGenericClique(16, true), genGenericClique(16, false)),
+);
+
 // ── the instrument's own control ─────────────────────────────────────────────
 // EVERY PAIR ABOVE PASSES, so nothing above can say whether the grader still reds. The
 // control is the same `grade` over a pair that must: one source, one literal different,
