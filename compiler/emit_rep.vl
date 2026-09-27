@@ -366,7 +366,7 @@ function repCanonFieldTy(ty: i32): i32 {
 }
 
 // D1093 — the `string` prim an inline string literal-union field keys as, or -1: the
-// multi-member twin of `repCanonKeyGo`'s bare-`TyLit` arm. An inline `k: "a" | "b"`
+// multi-member twin of `repKeyGo`'s bare-`TyLit` arm. An inline `k: "a" | "b"`
 // field codes 3 (a plain string ref, same slot as `k: string`), so without this key
 // `variantStructHeapTwinAt` could never recognise the arm's own row. The alias spelling (`k: K`) is excluded: it codes 0, a different layout.
 function inlineLitUnionFieldBase(ty: i32): i32 {
@@ -389,37 +389,115 @@ function inlineLitUnionFieldBase(ty: i32): i32 {
   -1
 }
 
-export function repCanonKey(ty: i32): string {
-  if ty < 0 { return "!" }
-  let si = repKeyStack.length - 1
-  while si >= 0 {
-    if repKeyStack[si] == ty { return "#" + i32ToStr(repKeyStack.length - si) }
-    si = si - 1
-  }
-  const top = repKeyStack.length == 0
-  if top {
-    repKeyMemoSync()
-    if ty < repKeyMemo.length {
-      if repKeyMemo[ty] != "" { return repKeyMemo[ty] }
+// Which equivalence a rep key renders. `canon` is the full structural key; `elem` is the
+// ref-list element key, which folds the i32- and string-backed leaf lists to one token each and
+// keeps a declared struct nominal; `mv` is the map-value key, nominal like `elem` but with no
+// leaf fold, since `i32[]`, `boolean[]` and `K[]` are distinct mv rows.
+type RepKeyMode = "canon" | "elem" | "mv"
+
+// Whether `mode` is the full structural key: it expands a declared struct, softens a
+// literal-union field to its base, and keys a bare literal as its base scalar.
+function repKeyIsCanon(mode: RepKeyMode): boolean {
+  match mode {
+    "canon" => {
+      return true
+    }
+    "elem" | "mv" => {
+      return false
     }
   }
-  repKeyStack.push(ty)
-  let s = repCanonKeyGo(ty)
-  repKeyStack.pop()
-  // Runaway cap (same crash family as `repNameCanonId`'s): a render past any sane
-  // structural-key size collapses to an arena-index-unique sentinel — never equal to
-  // another type's key, so it can only decline a merge, never create one. Capped here, not per-arm, so one bound covers every composition arm.
-  if s.length > 262144 { s = "@big:" + i32ToStr(ty) }
-  if top {
-    // `repCanonKeyGo` only READS the arena (no checker re-entry), so the epoch
-    // synced above still holds — the write cannot stamp a stale key.
-    while repKeyMemo.length <= ty { repKeyMemo.push("") }
-    repKeyMemo[ty] = s
+}
+
+// Whether `mode` folds an i32- or string-backed leaf array to its shared list wrapper.
+function repKeyFoldsLeafList(mode: RepKeyMode): boolean {
+  match mode {
+    "elem" => {
+      return true
+    }
+    "canon" | "mv" => {
+      return false
+    }
   }
+}
+
+export function repCanonKey(ty: i32): string { repKeyOf(ty, "canon") }
+
+// The one entry every key render recurses through. Each mode owns its cycle stack, and
+// `canon` and `elem` a depth-0 memo: a back-edge is a function of the caller's depth, so only
+// a top-of-recursion answer is banked. A render past any sane size collapses to an
+// index-unique sentinel, which can only decline a merge, never create one.
+function repKeyOf(ty: i32, mode: RepKeyMode): string {
+  if ty < 0 { return "!" }
+  const stack = repKeyStackOf(mode)
+  let si = stack.length - 1
+  while si >= 0 {
+    if stack[si] == ty { return "#" + i32ToStr(stack.length - si) }
+    si = si - 1
+  }
+  const top = stack.length == 0
+  if top {
+    const hit = repKeyMemoGet(ty, mode)
+    if hit != "" { return hit }
+  }
+  stack.push(ty)
+  let s = repKeyGo(ty, mode)
+  stack.pop()
+  if s.length > 262144 { s = "@big:" + i32ToStr(ty) }
+  // The walk only reads the arena and the slot cache, so the generation the read synced
+  // still holds and the write cannot stamp a stale key.
+  if top { repKeyMemoPut(ty, mode, s) }
   s
 }
 
-function repCanonKeyGo(ty: i32): string {
+function repKeyStackOf(mode: RepKeyMode): i32[] {
+  match mode {
+    "canon" => {
+      return repKeyStack
+    }
+    "elem" => {
+      return repElemKeyStack
+    }
+    "mv" => {
+      return repMvKeyStack
+    }
+  }
+}
+
+// The depth-0 memo's key for `ty` under `mode`, `""` for a miss; `mv` keeps no memo.
+function repKeyMemoGet(ty: i32, mode: RepKeyMode): string {
+  match mode {
+    "canon" => {
+      repKeyMemoSync()
+      if ty < repKeyMemo.length { return repKeyMemo[ty] }
+      return ""
+    }
+    "elem" => {
+      repElemMemoSync()
+      if ty < repElemMemo.length { return repElemMemo[ty] }
+      return ""
+    }
+    "mv" => {
+      return ""
+    }
+  }
+}
+
+function repKeyMemoPut(ty: i32, mode: RepKeyMode, s: string) {
+  match mode {
+    "canon" => {
+      while repKeyMemo.length <= ty { repKeyMemo.push("") }
+      repKeyMemo[ty] = s
+    }
+    "elem" => {
+      while repElemMemo.length <= ty { repElemMemo.push("") }
+      repElemMemo[ty] = s
+    }
+    "mv" => {}
+  }
+  0
+}
+
+function repKeyGo(ty: i32, mode: RepKeyMode): string {
   const t = T.tys[ty]
   // Exhaustive over `Ty` and deliberately `_`-less: a 12th arena variant breaks the
   // self-compile here instead of silently taking the index sentinel, which never
@@ -429,140 +507,144 @@ function repCanonKeyGo(ty: i32): string {
       return t.primName
     }
     TyObj => {
+      // `canon` expands every struct; the slot keys keep a DECLARED struct nominal and
+      // expand only an inline shape (`structural-twin-reflist-dedup.vl`).
+      const canon = repKeyIsCanon(mode)
+      if !canon {
+        const ds = repSlotOfTyDecl(ty)
+        if ds >= 0 { return "S" + i32ToStr(ds) }
+      }
       let s = "{"
       let i = 0
       while i < t.objFieldNames.length {
-        s = s
-          + t.objFieldNames[i]
-          + ":"
-          + repCanonKey(repCanonFieldTy(t.objFieldTypes[i]))
-          + ","
+        let ft = t.objFieldTypes[i]
+        if canon { ft = repCanonFieldTy(ft) }
+        s = s + t.objFieldNames[i] + ":" + repKeyOf(ft, mode) + ","
         i = i + 1
       }
       return s + "}"
     }
     TyArray => {
-      return repCanonKey(t.aElem) + "[]"
+      if repKeyFoldsLeafList(mode) {
+        // A top-level i32-backed leaf array (`i32[]`, `boolean[]`, litunion `K[]`, `(boolean
+        // | null)[]`) shares the i32-list wrapper, and a string-backed one (`string[]`,
+        // `(string | null)[]`) the string-list wrapper. A top-level-nullable list carries its
+        // `| null` outside and is not this arm.
+        if tyIsI32LeafElem(t.aElem) { return "$rlI32L" }
+        if tyIsStrLeafElem(t.aElem) { return "$rlStrL" }
+      }
+      return repKeyOf(t.aElem, mode) + "[]"
     }
     TyNullable => {
-      return repCanonKey(t.nInner) + "?"
+      return repKeyOf(t.nInner, mode) + "?"
     }
     TyUnion => {
-      // Mix-widening (the `mvCanonValName`/`rlInternName` discipline at the key layer): a
-      // litunion member of a mixed union (a non-null, non-litunion sibling present) is
-      // string-repped in the box, so its key renders "string" — without this, a declared
-      // and an inline spelling of one union keyed differently and mismatched at the call boundary. A pure litunion keeps its atom-i32 render, guarded by `structFieldCodesEq`.
-      let mixHasOther = false
-      let mi = 0
-      while mi < t.uMembers.length {
-        const mt = T.tys[t.uMembers[mi]]
-        let mLit = tyIsLitUnion(t.uMembers[mi])
-        if mt is TyLit { mLit = true }
-        let mNull = false
-        if mt is TyPrim {
-          if mt.primName == "null" { mNull = true }
-        }
-        if !mLit && !mNull { mixHasOther = true }
-        mi = mi + 1
-      }
-      let s = "("
-      let emitted = 0
-      let sawWideStr = false
-      let i = 0
-      while i < t.uMembers.length {
-        let r = repCanonKey(t.uMembers[i])
-        let skip = false
-        if mixHasOther {
-          let iLit = tyIsLitUnion(t.uMembers[i])
-          const it = T.tys[t.uMembers[i]]
-          if it is TyLit { iLit = true }
-          if iLit { r = "string" }
-          if r == "string" {
-            if sawWideStr { skip = true }
-            sawWideStr = true
-          }
-        }
-        if !skip {
-          if emitted > 0 { s = s + "|" }
-          s = s + r
-          emitted = emitted + 1
-        }
-        i = i + 1
-      }
-      return s + ")"
+      return repKeyUnion(t.uMembers, mode)
     }
     TyFunc => {
       let s = "("
       let i = 0
       while i < t.fnParamTypes.length {
         if i > 0 { s = s + "," }
-        s = s + repCanonKey(t.fnParamTypes[i])
+        s = s + repKeyOf(t.fnParamTypes[i], mode)
         i = i + 1
       }
-      return s + ")=>" + repCanonKey(t.fnRet)
+      return s + ")=>" + repKeyOf(t.fnRet, mode)
     }
     TyMap => {
       let s = "M"
       if t.mSet == 1 { s = "Se" }
-      return s + "[" + repCanonKey(t.mKey) + ":" + repCanonKey(t.mVal) + "]"
+      return s
+        + "["
+        + repKeyOf(t.mKey, mode)
+        + ":"
+        + repKeyOf(t.mVal, mode)
+        + "]"
     }
     TyNeg => {
-      return "!" + repCanonKey(t.negTy)
+      return "!" + repKeyOf(t.negTy, mode)
     }
     TyVar => {
       // A generic type PARAMETER: no structural render exists before the
       // monomorphizer substitutes it, so it takes the index sentinel below.
     }
     TyLit => {
-      // D1031 — a bare literal type keys as its base scalar, the rep it actually has: the
-      // arena-index sentinel this arm fell to made every spelling its own entry, so two
-      // identically-spelled declared shapes never compared as twins and each minted a heap
-      // type for one checker type. Keying as the base matches what the field already emits, guarded by `structFieldCodesEq`.
-      return repCanonKey(litBaseTy(t))
+      // D1031 — under `canon` a bare literal type keys as its base scalar, the rep the field
+      // actually emits (guarded by `structFieldCodesEq`). The slot keys give it no row of its
+      // own: the softening applies only to a litunion MEMBER.
+      if repKeyIsCanon(mode) { return repKeyOf(litBaseTy(t), mode) }
     }
     TyErr => {
       // The error/unknown hole — assignable both ways, so any structural render
       // would claim an equivalence it does not have; the index sentinel below.
     }
   }
-  // The three empty match arms land here: not narrowable to a structural render, so
-  // each keys by arena index — unique per index, so it can only decline a merge (the loud direction), never invent one.
+  // The empty arms land here: keyed by arena index, unique per index, so this can only
+  // decline a merge (the loud direction), never invent one.
   "@" + i32ToStr(ty)
+}
+
+// Whether union member `m` is a literal: a litunion, or a bare `TyLit`.
+function repMemberIsLit(m: i32): boolean {
+  if tyIsLitUnion(m) { return true }
+  const mt = T.tys[m]
+  if mt is TyLit { return true }
+  false
+}
+
+// Whether a union over `mems` is MIXED: some member is neither a literal nor `null`. A
+// litunion member of a mixed union is string-repped in the box, so every key renders it as
+// `string` (the `mvCanonValName`/`rlInternName` discipline at the key layer).
+function repUnionIsMixed(mems: i32[]): boolean {
+  let mi = 0
+  while mi < mems.length {
+    if !repMemberIsLit(mems[mi]) {
+      const mt = T.tys[mems[mi]]
+      let mNull = false
+      if mt is TyPrim {
+        if mt.primName == "null" { mNull = true }
+      }
+      if !mNull { return true }
+    }
+    mi = mi + 1
+  }
+  false
+}
+
+// The union arm: without the mix-widening a declared and an inline spelling of one union
+// keyed differently and mismatched at the call boundary. A pure litunion keeps its atom-i32
+// render, guarded by `structFieldCodesEq`.
+function repKeyUnion(mems: i32[], mode: RepKeyMode): string {
+  const mixed = repUnionIsMixed(mems)
+  let s = "("
+  let emitted = 0
+  let sawWideStr = false
+  let i = 0
+  while i < mems.length {
+    let r = repKeyOf(mems[i], mode)
+    let skip = false
+    if mixed {
+      if repMemberIsLit(mems[i]) { r = "string" }
+      if r == "string" {
+        if sawWideStr { skip = true }
+        sawWideStr = true
+      }
+    }
+    if !skip {
+      if emitted > 0 { s = s + "|" }
+      s = s + r
+      emitted = emitted + 1
+    }
+    i = i + 1
+  }
+  s + ")"
 }
 
 // repElemKey — the ref-list element rep key (destringify D2): a canonical key for an
 // element's representation (its WasmGC wrapper-equivalence class), not its type —
 // equal iff two elements ride one wrapper heap type. Unlike `repCanonKey`, it folds
 // `i32[]`/`boolean[]`/litunion `K[]` to one token (they share a backing) and keeps a declared struct nominal, expanding only an inline shape.
-export function repElemKey(ty: i32): string {
-  if ty < 0 { return "!" }
-  let si = repElemKeyStack.length - 1
-  while si >= 0 {
-    if repElemKeyStack[si] == ty {
-      return "#" + i32ToStr(repElemKeyStack.length - si)
-    }
-    si = si - 1
-  }
-  const top = repElemKeyStack.length == 0
-  if top {
-    repElemMemoSync()
-    if ty < repElemMemo.length {
-      if repElemMemo[ty] != "" { return repElemMemo[ty] }
-    }
-  }
-  repElemKeyStack.push(ty)
-  let s = repElemKeyGo(ty)
-  repElemKeyStack.pop()
-  if s.length > 262144 { s = "@big:" + i32ToStr(ty) }
-  if top {
-    // `repElemKeyGo` only READS (the arena, and the slot cache through
-    // `repSlotOfTyDecl`), so the generations synced above still hold and the write
-    // cannot stamp a stale key — `repKeyMemo`'s note, one cache over.
-    while repElemMemo.length <= ty { repElemMemo.push("") }
-    repElemMemo[ty] = s
-  }
-  s
-}
+export function repElemKey(ty: i32): string { repKeyOf(ty, "elem") }
 
 // Cycle guard (de Bruijn back-edges), mirroring `repKeyStack` — a recursive type
 // reaches `repElemKey` through a declared struct (keyed nominally, which already
@@ -592,122 +674,6 @@ function repElemMemoSync() {
     repElemMemoLen = sNames.length
   }
   0
-}
-
-function repElemKeyGo(ty: i32): string {
-  const t = T.tys[ty]
-  // EXHAUSTIVE over `Ty` and deliberately `_`-less, for the same reason as
-  // `repCanonKeyGo`: a 12th arena variant breaks the self-compile here rather
-  // than silently taking the index sentinel and declining every slot merge.
-  match t {
-    TyArray => {
-      // Top-level i32-backed leaf array (`i32[]`, `boolean[]`, litunion `K[]`,
-      // `(boolean | null)[]` — `nameIsI32Array`) -> the shared i32-list wrapper. The `|
-      // null` niche rides inside the elements (the outer list ref is non-null), so a
-      // top-level-nullable list (`i32[] | null`) carries its `| null` outside and is not this arm.
-      if tyIsI32LeafElem(t.aElem) { return "$rlI32L" }
-      // Top-level string-backed leaf array (`string[]`, `(string | null)[]` —
-      // `nameIsStringArray`) → the shared string-list wrapper.
-      if tyIsStrLeafElem(t.aElem) { return "$rlStrL" }
-      // A nested ref array (`S[][]`, `(K0|i32)[][]`): recurse — the inner litunion
-      // softening still applies, the inner struct stays nominal.
-      return repElemKey(t.aElem) + "[]"
-    }
-    TyObj => {
-      // A struct: the NOMINAL slot for a DECLARED one, a structural field expansion for an
-      // INLINE shape — see the header (and `structural-twin-reflist-dedup.vl`).
-
-      const ds = repSlotOfTyDecl(ty)
-      if ds >= 0 { return "S" + i32ToStr(ds) }
-      let s = "{"
-      let i = 0
-      while i < t.objFieldNames.length {
-        s = s + t.objFieldNames[i] + ":" + repElemKey(t.objFieldTypes[i]) + ","
-        i = i + 1
-      }
-      return s + "}"
-    }
-    TyPrim => {
-      return t.primName
-    }
-    TyNullable => {
-      return repElemKey(t.nInner) + "?"
-    }
-    TyUnion => {
-      // Mirror `repCanonKeyGo`'s MIX-widening: a litunion member of a MIXED union
-      // (one with a non-null, non-litunion sibling) is STRING-repped in the box, so
-      // it keys "string" — the same niche guard `rlCanonLitUnionAtoms` applies.
-      let mixHasOther = false
-      let mi = 0
-      while mi < t.uMembers.length {
-        const mt = T.tys[t.uMembers[mi]]
-        let mLit = tyIsLitUnion(t.uMembers[mi])
-        if mt is TyLit { mLit = true }
-        let mNull = false
-        if mt is TyPrim {
-          if mt.primName == "null" { mNull = true }
-        }
-        if !mLit && !mNull { mixHasOther = true }
-        mi = mi + 1
-      }
-      let s = "("
-      let emitted = 0
-      let sawWideStr = false
-      let i = 0
-      while i < t.uMembers.length {
-        let r = repElemKey(t.uMembers[i])
-        let skip = false
-        if mixHasOther {
-          let iLit = tyIsLitUnion(t.uMembers[i])
-          const it = T.tys[t.uMembers[i]]
-          if it is TyLit { iLit = true }
-          if iLit { r = "string" }
-          if r == "string" {
-            if sawWideStr { skip = true }
-            sawWideStr = true
-          }
-        }
-        if !skip {
-          if emitted > 0 { s = s + "|" }
-          s = s + r
-          emitted = emitted + 1
-        }
-        i = i + 1
-      }
-      return s + ")"
-    }
-    TyFunc => {
-      let s = "("
-      let i = 0
-      while i < t.fnParamTypes.length {
-        if i > 0 { s = s + "," }
-        s = s + repElemKey(t.fnParamTypes[i])
-        i = i + 1
-      }
-      return s + ")=>" + repElemKey(t.fnRet)
-    }
-    TyMap => {
-      let s = "M"
-      if t.mSet == 1 { s = "Se" }
-      return s + "[" + repElemKey(t.mKey) + ":" + repElemKey(t.mVal) + "]"
-    }
-    TyNeg => {
-      return "!" + repElemKey(t.negTy)
-    }
-    TyVar => {
-      // A generic type PARAMETER: no wrapper class before substitution.
-    }
-    TyLit => {
-      // A bare literal type reached without its enclosing union — no wrapper of
-      // its own; the softening above only applies to litunion MEMBERS.
-    }
-    TyErr => {
-      // The error/unknown hole — it must never share a slot with anything.
-    }
-  }
-  // The three empty match arms land here: keep them distinct by arena index (never a
-  // false merge), matching `repCanonKeyGo`.
-  "@" + i32ToStr(ty)
 }
 
 // True when element type `e` rides the i32-list backing as a LEAF — `i32`,
@@ -780,123 +746,10 @@ export function repElemIdOfNameTy(name: string, ty: i32): i32 {
 // type's mv-table slot identity, equal iff two spellings intern one `mvValName` row.
 // Unlike `repElemKey` it does not fold shared-wrapper leaf lists (each interns its
 // own row); unlike `repCanonKey` it keeps a declared struct nominal, not expanded. A finer key only declines a resolve, never hands back another row's.
-export function repMvValKey(ty: i32): string {
-  if ty < 0 { return "!" }
-  let si = repMvKeyStack.length - 1
-  while si >= 0 {
-    if repMvKeyStack[si] == ty {
-      return "#" + i32ToStr(repMvKeyStack.length - si)
-    }
-    si = si - 1
-  }
-  repMvKeyStack.push(ty)
-  let s = repMvValKeyGo(ty)
-  repMvKeyStack.pop()
-  if s.length > 262144 { s = "@big:" + i32ToStr(ty) }
-  s
-}
+export function repMvValKey(ty: i32): string { repKeyOf(ty, "mv") }
 
 // Cycle guard (de Bruijn back-edges), mirroring `repElemKeyStack`.
 const repMvKeyStack: i32[] = []
-
-function repMvValKeyGo(ty: i32): string {
-  const t = T.tys[ty]
-  // No leaf-list fold: `i32[]` / `boolean[]` / `K[]` are DISTINCT mv rows.
-  // EXHAUSTIVE over `Ty` and deliberately `_`-less: a 12th arena variant breaks
-  // the self-compile here rather than silently taking the index sentinel.
-  match t {
-    TyArray => {
-      return repMvValKey(t.aElem) + "[]"
-    }
-    TyObj => {
-      const ds = repSlotOfTyDecl(ty)
-      if ds >= 0 { return "S" + i32ToStr(ds) }
-      let s = "{"
-      let i = 0
-      while i < t.objFieldNames.length {
-        s = s + t.objFieldNames[i] + ":" + repMvValKey(t.objFieldTypes[i]) + ","
-        i = i + 1
-      }
-      return s + "}"
-    }
-    TyPrim => {
-      return t.primName
-    }
-    TyNullable => {
-      return repMvValKey(t.nInner) + "?"
-    }
-    TyUnion => {
-      let mixHasOther = false
-      let mi = 0
-      while mi < t.uMembers.length {
-        const mt = T.tys[t.uMembers[mi]]
-        let mLit = tyIsLitUnion(t.uMembers[mi])
-        if mt is TyLit { mLit = true }
-        let mNull = false
-        if mt is TyPrim {
-          if mt.primName == "null" { mNull = true }
-        }
-        if !mLit && !mNull { mixHasOther = true }
-        mi = mi + 1
-      }
-      let s = "("
-      let emitted = 0
-      let sawWideStr = false
-      let i = 0
-      while i < t.uMembers.length {
-        let r = repMvValKey(t.uMembers[i])
-        let skip = false
-        if mixHasOther {
-          let iLit = tyIsLitUnion(t.uMembers[i])
-          const it = T.tys[t.uMembers[i]]
-          if it is TyLit { iLit = true }
-          if iLit { r = "string" }
-          if r == "string" {
-            if sawWideStr { skip = true }
-            sawWideStr = true
-          }
-        }
-        if !skip {
-          if emitted > 0 { s = s + "|" }
-          s = s + r
-          emitted = emitted + 1
-        }
-        i = i + 1
-      }
-      return s + ")"
-    }
-    TyFunc => {
-      let s = "("
-      let i = 0
-      while i < t.fnParamTypes.length {
-        if i > 0 { s = s + "," }
-        s = s + repMvValKey(t.fnParamTypes[i])
-        i = i + 1
-      }
-      return s + ")=>" + repMvValKey(t.fnRet)
-    }
-    TyMap => {
-      let s = "M"
-      if t.mSet == 1 { s = "Se" }
-      return s + "[" + repMvValKey(t.mKey) + ":" + repMvValKey(t.mVal) + "]"
-    }
-    TyNeg => {
-      return "!" + repMvValKey(t.negTy)
-    }
-    TyVar => {
-      // A generic type PARAMETER: no mv row before substitution.
-    }
-    TyLit => {
-      // A bare literal type reached without its enclosing union — no mv row of
-      // its own.
-    }
-    TyErr => {
-      // The error/unknown hole — it must never share an mv row with anything.
-    }
-  }
-  // The three empty match arms land here: keep them distinct by arena index (never a false merge).
-  "@" + i32ToStr(ty)
-}
 
 // Record the arena type of the map value name just pushed onto `mvValName`, padded
 // with -1 so a site that skips this self-heals to uncovered. `rowTy` is the caller's
@@ -1123,7 +976,7 @@ function repSlotCacheSync() {
     }
     si = si + 1
   }
-  // Stamp after the build: `repCanonKeyGo`'s walk only reads the arena, so the
+  // Stamp after the build: `repKeyGo`'s walk only reads the arena, so the
   // generations compared at entry still hold for everything just recorded.
   repSlotCacheEpoch = tyMutEpoch
   repSlotCacheUserVer = cUserTypesVer
@@ -1357,105 +1210,159 @@ function hcPrimId(name: string): i32 {
   hcIntern(HC_PRIM, a, name.length)
 }
 
-// The identity twin of `repCanonKey`. Same stack, same cap, same memo discipline — the
-// memo is per arena index and top-of-recursion only, because the back-edge is a function
-// of the caller's DEPTH rather than of `ty`.
+// The identity twins of the three rep keys: one interned id per key, each mode with its own
+// cycle stack and depth-0 memo, exactly as `repKeyOf` keeps them. `canon`'s memo rides
+// `repKeyMemo`'s generation; `elem`'s and `mv`'s ride `repElemMemo`'s triple, since both walks
+// read `repSlotOfTyDecl`, which is sid-keyed and reset inside the module-parse loop.
 let hcCanonMemo: i32[] = []
 const hcCanonStack: i32[] = []
+let hcElemMemo: i32[] = []
+const hcElemStack: i32[] = []
+let hcMvMemo: i32[] = []
+const hcMvStack: i32[] = []
 
-export function repCanonId(ty: i32): i32 {
+export function repCanonId(ty: i32): i32 { repIdOf(ty, "canon") }
+
+export function repElemId(ty: i32): i32 { repIdOf(ty, "elem") }
+
+function repMvValId(ty: i32): i32 { repIdOf(ty, "mv") }
+
+// The one entry every identity walk recurses through, so a nested call re-enters its own
+// mode's stack: sharing one stack between two modes would report a cycle in one walk as a
+// back-edge in the other.
+function repIdOf(ty: i32, mode: RepKeyMode): i32 {
   if ty < 0 { return hcIntern(HC_ERRTY, hcNoArgs, 1) }
-  let si = hcCanonStack.length - 1
+  const stack = hcStackOf(mode)
+  let si = stack.length - 1
   while si >= 0 {
-    if hcCanonStack[si] == ty {
-      const d = hcCanonStack.length - si
+    if stack[si] == ty {
+      const d = stack.length - si
       const a: i32[] = []
       a.push(d)
       return hcIntern(HC_BACK, a, 1 + hcDigits(d))
     }
     si = si - 1
   }
-  const top = hcCanonStack.length == 0
+  const top = stack.length == 0
   if top {
-    repKeyMemoSync()
-    if ty < hcCanonMemo.length {
-      if hcCanonMemo[ty] >= 0 { return hcCanonMemo[ty] }
-    }
+    const hit = hcMemoGet(ty, mode)
+    if hit >= 0 { return hit }
   }
-  hcCanonStack.push(ty)
-  let r = repCanonIdGo(ty)
-  hcCanonStack.pop()
+  stack.push(ty)
+  let r = repIdGo(ty, mode)
+  stack.pop()
   if hcLen[r] > 262144 {
     const a: i32[] = []
     a.push(ty)
     r = hcIntern(HC_BIG, a, 5 + hcDigits(ty))
   }
-  if top {
-    while hcCanonMemo.length <= ty { hcCanonMemo.push(-1) }
-    hcCanonMemo[ty] = r
-  }
+  if top { hcMemoPut(ty, mode, r) }
   r
 }
 
-function repCanonIdGo(ty: i32): i32 {
+function hcStackOf(mode: RepKeyMode): i32[] {
+  match mode {
+    "canon" => {
+      return hcCanonStack
+    }
+    "elem" => {
+      return hcElemStack
+    }
+    "mv" => {
+      return hcMvStack
+    }
+  }
+}
+
+// The depth-0 memo's id for `ty` under `mode`, -1 for a miss.
+function hcMemoGet(ty: i32, mode: RepKeyMode): i32 {
+  match mode {
+    "canon" => {
+      repKeyMemoSync()
+      if ty < hcCanonMemo.length { return hcCanonMemo[ty] }
+      return -1
+    }
+    "elem" => {
+      repElemMemoSync()
+      if ty < hcElemMemo.length { return hcElemMemo[ty] }
+      return -1
+    }
+    "mv" => {
+      repElemMemoSync()
+      if ty < hcMvMemo.length { return hcMvMemo[ty] }
+      return -1
+    }
+  }
+}
+
+function hcMemoPut(ty: i32, mode: RepKeyMode, r: i32) {
+  match mode {
+    "canon" => {
+      while hcCanonMemo.length <= ty { hcCanonMemo.push(-1) }
+      hcCanonMemo[ty] = r
+    }
+    "elem" => {
+      while hcElemMemo.length <= ty { hcElemMemo.push(-1) }
+      hcElemMemo[ty] = r
+    }
+    "mv" => {
+      while hcMvMemo.length <= ty { hcMvMemo.push(-1) }
+      hcMvMemo[ty] = r
+    }
+  }
+  0
+}
+
+// The identity walk, arm for arm the id of `repKeyGo`'s string, with one deliberate
+// difference: a union's members, and under `canon` an object's fields, are sorted, so a
+// reordered spelling of one type is one id (D1712) where the string keeps spelling order.
+function repIdGo(ty: i32, mode: RepKeyMode): i32 {
   const t = T.tys[ty]
   match t {
     TyPrim => {
       return hcPrimId(t.primName)
     }
     TyObj => {
-      // The key is the brace-wrapped concatenation of `name:child,` over the fields, field
-      // order sorted out of it: `{a: i32, b: string}` and `{b: string, a: i32}` are the same
-      // type, and declaration order alone keyed the twins differently, minting two heap
-      // types for one shape. Safe by construction: field names are unique, so ordering by sid is a bijection, able to merge twins and never collide distinct types.
-      const sortedSid: i32[] = []
-      const sortedIx: i32[] = []
-      let si2 = 0
-      while si2 < t.objFieldNames.length {
-        const sd = sidOf(t.objFieldNames[si2])
-        let j2 = sortedSid.length
-        sortedSid.push(sd)
-        sortedIx.push(si2)
-        while j2 > 0 {
-          if sortedSid[j2 - 1] <= sd {
-            j2 = 0
-          } else {
-            sortedSid[j2] = sortedSid[j2 - 1]
-            sortedIx[j2] = sortedIx[j2 - 1]
-            sortedSid[j2 - 1] = sd
-            sortedIx[j2 - 1] = si2
-            j2 = j2 - 1
-          }
-        }
-        si2 = si2 + 1
+      if repKeyIsCanon(mode) { return hcCanonObjId(t) }
+      const ds = repSlotOfTyDecl(ty)
+      if ds >= 0 {
+        const a: i32[] = []
+        a.push(ds)
+        return hcIntern(HC_SLOT, a, 1 + hcDigits(ds))
       }
-      const a: i32[] = []
+      const a2: i32[] = []
       let len = 2
       let i = 0
-      while i < sortedIx.length {
-        const fx = sortedIx[i]
-        const c = repCanonId(repCanonFieldTy(t.objFieldTypes[fx]))
-        a.push(sortedSid[i])
-        a.push(c)
-        len = len + t.objFieldNames[fx].length + 1 + hcLen[c] + 1
+      while i < t.objFieldNames.length {
+        const c = repIdOf(t.objFieldTypes[i], mode)
+        a2.push(sidOf(t.objFieldNames[i]))
+        a2.push(c)
+        len = len + t.objFieldNames[i].length + 1 + hcLen[c] + 1
         i = i + 1
       }
-      return hcIntern(HC_OBJ, a, len)
+      return hcIntern(HC_OBJ, a2, len)
     }
     TyArray => {
-      const c = repCanonId(t.aElem)
+      // Only the ref-list elem key folds an i32/string leaf array to a single shared row; the
+      // map-value key must not, since folding would make a `{[K]: i32[]}` resolve a `{[K]:
+      // boolean[]}`'s slot.
+      if repKeyFoldsLeafList(mode) {
+        if tyIsI32LeafElem(t.aElem) { return hcIntern(HC_RLI32, hcNoArgs, 7) }
+        if tyIsStrLeafElem(t.aElem) { return hcIntern(HC_RLSTR, hcNoArgs, 7) }
+      }
+      const c = repIdOf(t.aElem, mode)
       const a: i32[] = []
       a.push(c)
       return hcIntern(HC_ARRAY, a, hcLen[c] + 2)
     }
     TyNullable => {
-      const c = repCanonId(t.nInner)
+      const c = repIdOf(t.nInner, mode)
       const a: i32[] = []
       a.push(c)
       return hcIntern(HC_NUL, a, hcLen[c] + 1)
     }
     TyUnion => {
-      return hcUnionId(t.uMembers, 0)
+      return hcUnionId(t.uMembers, mode)
     }
     TyFunc => {
       // `"(" + join(",", params) + ")=>" + ret` — ONE for the open paren; the closer is
@@ -1465,19 +1372,19 @@ function repCanonIdGo(ty: i32): i32 {
       let i = 0
       while i < t.fnParamTypes.length {
         if i > 0 { len = len + 1 }
-        const c = repCanonId(t.fnParamTypes[i])
+        const c = repIdOf(t.fnParamTypes[i], mode)
         a.push(c)
         len = len + hcLen[c]
         i = i + 1
       }
-      const rc = repCanonId(t.fnRet)
+      const rc = repIdOf(t.fnRet, mode)
       a.push(rc)
       len = len + 3 + hcLen[rc]
       return hcIntern(HC_FUNC, a, len)
     }
     TyMap => {
-      const kc = repCanonId(t.mKey)
-      const vc = repCanonId(t.mVal)
+      const kc = repIdOf(t.mKey, mode)
+      const vc = repIdOf(t.mVal, mode)
       const a: i32[] = []
       a.push(kc)
       a.push(vc)
@@ -1490,18 +1397,15 @@ function repCanonIdGo(ty: i32): i32 {
       return hcIntern(tag, a, head + 1 + hcLen[kc] + 1 + hcLen[vc] + 1)
     }
     TyNeg => {
-      const c = repCanonId(t.negTy)
+      const c = repIdOf(t.negTy, mode)
       const a: i32[] = []
       a.push(c)
       return hcIntern(HC_NEG, a, 1 + hcLen[c])
     }
     TyVar => {}
     TyLit => {
-      // The identity twin of `repCanonKeyGo`'s literal arm — a bare literal keys as its
-      // base scalar, the rep it emits, dual-written so a divergence is a merge one side
-      // makes and the other does not. Not carried into `repIdOfGo`'s elem/mv walks, which
-      // key a different equivalence (which slot two spellings share) that no witness asks to merge a bare literal onto.
-      return repCanonId(litBaseTy(t))
+      // `repKeyGo`'s literal arm: under `canon` a bare literal keys as its base scalar.
+      if repKeyIsCanon(mode) { return repIdOf(litBaseTy(t), mode) }
     }
     TyErr => {}
   }
@@ -1510,24 +1414,49 @@ function repCanonIdGo(ty: i32): i32 {
   hcIntern(HC_IDX, a, 1 + hcDigits(ty))
 }
 
-// The union arm, shared by both identities since the mix-widening rule is one rule
-// written twice in the string builders and must not become three. `mode` (0 canon, 1
-// ref-list elem, 2 map-value) selects which child identity to recurse with — the
-// litunion-collapse is identical across all three; only the recursion differs.
-function hcUnionId(mems: i32[], mode: i32): i32 {
-  let mixHasOther = false
-  let mi = 0
-  while mi < mems.length {
-    const mt = T.tys[mems[mi]]
-    let mLit = tyIsLitUnion(mems[mi])
-    if mt is TyLit { mLit = true }
-    let mNull = false
-    if mt is TyPrim {
-      if mt.primName == "null" { mNull = true }
+// The canonical id of an object: the `name:child,` pairs with field order sorted out, since
+// `{a: i32, b: string}` and `{b: string, a: i32}` are one type and keying them by declaration
+// order minted two heap types for one shape. Field names are unique, so ordering by sid is a
+// bijection: it can merge twins and never collide distinct types.
+function hcCanonObjId(t: TyObj): i32 {
+  const sortedSid: i32[] = []
+  const sortedIx: i32[] = []
+  let si2 = 0
+  while si2 < t.objFieldNames.length {
+    const sd = sidOf(t.objFieldNames[si2])
+    let j2 = sortedSid.length
+    sortedSid.push(sd)
+    sortedIx.push(si2)
+    while j2 > 0 {
+      if sortedSid[j2 - 1] <= sd {
+        j2 = 0
+      } else {
+        sortedSid[j2] = sortedSid[j2 - 1]
+        sortedIx[j2] = sortedIx[j2 - 1]
+        sortedSid[j2 - 1] = sd
+        sortedIx[j2 - 1] = si2
+        j2 = j2 - 1
+      }
     }
-    if !mLit && !mNull { mixHasOther = true }
-    mi = mi + 1
+    si2 = si2 + 1
   }
+  const a: i32[] = []
+  let len = 2
+  let i = 0
+  while i < sortedIx.length {
+    const fx = sortedIx[i]
+    const c = repIdOf(repCanonFieldTy(t.objFieldTypes[fx]), "canon")
+    a.push(sortedSid[i])
+    a.push(c)
+    len = len + t.objFieldNames[fx].length + 1 + hcLen[c] + 1
+    i = i + 1
+  }
+  hcIntern(HC_OBJ, a, len)
+}
+
+// The union arm of the identity walk: `repKeyUnion`'s mix-widening, over ids.
+function hcUnionId(mems: i32[], mode: RepKeyMode): i32 {
+  const mixed = repUnionIsMixed(mems)
   const strId = hcPrimId("string")
   const a: i32[] = []
   let len = 2
@@ -1535,29 +1464,10 @@ function hcUnionId(mems: i32[], mode: i32): i32 {
   let sawWideStr = false
   let i = 0
   while i < mems.length {
-    let r = -1
-    // Explicit per mode, no catch-all: a mode this function does not know (a future
-    // fourth, or a miscomputed `mvMode`) would otherwise silently mint elem ids inside an
-    // mv union — a wrong slot with no diagnostic. Matches `repElemIdGo`'s own policy: deliberately `_`-less, so a new arena variant breaks the self-compile rather than hiding behind the sentinel.
-    if mode == 0 {
-      r = repCanonId(mems[i])
-    } else if mode == 1 {
-      r = repElemId(mems[i])
-    } else if mode == 2 {
-      r = repMvValId(mems[i])
-    } else {
-      // Unreachable: those three are the only modes minted, at the three entry points.
-      // Keyed by arena index so an impossible mode can only ever split, never merge two distinct types.
-      const bad: i32[] = []
-      bad.push(mems[i])
-      r = hcIntern(HC_IDX, bad, 1 + hcDigits(mems[i]))
-    }
+    let r = repIdOf(mems[i], mode)
     let skip = false
-    if mixHasOther {
-      let iLit = tyIsLitUnion(mems[i])
-      const it = T.tys[mems[i]]
-      if it is TyLit { iLit = true }
-      if iLit { r = strId }
+    if mixed {
+      if repMemberIsLit(mems[i]) { r = strId }
       if r == strId {
         if sawWideStr { skip = true }
         sawWideStr = true
@@ -1587,194 +1497,6 @@ function hcUnionId(mems: i32[], mode: i32): i32 {
     ui = ui + 1
   }
   hcIntern(HC_UNION, a, len)
-}
-
-// The identity twin of `repElemKey`. Its memo carries the same triple as `repElemMemo`.
-let hcElemMemo: i32[] = []
-const hcElemStack: i32[] = []
-
-export function repElemId(ty: i32): i32 {
-  if ty < 0 { return hcIntern(HC_ERRTY, hcNoArgs, 1) }
-  let si = hcElemStack.length - 1
-  while si >= 0 {
-    if hcElemStack[si] == ty {
-      const d = hcElemStack.length - si
-      const a: i32[] = []
-      a.push(d)
-      return hcIntern(HC_BACK, a, 1 + hcDigits(d))
-    }
-    si = si - 1
-  }
-  const top = hcElemStack.length == 0
-  if top {
-    repElemMemoSync()
-    if ty < hcElemMemo.length {
-      if hcElemMemo[ty] >= 0 { return hcElemMemo[ty] }
-    }
-  }
-  hcElemStack.push(ty)
-  let r = repElemIdGo(ty, false)
-  hcElemStack.pop()
-  if hcLen[r] > 262144 {
-    const a: i32[] = []
-    a.push(ty)
-    r = hcIntern(HC_BIG, a, 5 + hcDigits(ty))
-  }
-  if top {
-    while hcElemMemo.length <= ty { hcElemMemo.push(-1) }
-    hcElemMemo[ty] = r
-  }
-  r
-}
-
-// The mode dispatch for the shared walk's recursion. Each entry point owns its own cycle stack
-// and its own depth-0 memo, so a nested call has to re-enter through the RIGHT one — recursing
-// straight into `repElemIdGo` would share `repElemId`'s stack with an mv walk and let a cycle in
-// one be reported as a back-edge in the other.
-function repIdOf(ty: i32, mv: boolean): i32 {
-  if mv { return repMvValId(ty) }
-  repElemId(ty)
-}
-
-// The identity twin of `repMvValKey` — the map-value slot key as an interned id. Its
-// memo carries the same triple as `repElemMemo` because it shares that walk's
-// `repSlotOfTyDecl` read, which is sid-keyed: `sidKeyedTablesReset` runs inside the
-// module-parse loop, so a memo that does not ride the same generation would answer out of the previous space's rows.
-let hcMvMemo: i32[] = []
-const hcMvStack: i32[] = []
-
-function repMvValId(ty: i32): i32 {
-  if ty < 0 { return hcIntern(HC_ERRTY, hcNoArgs, 1) }
-  let si = hcMvStack.length - 1
-  while si >= 0 {
-    if hcMvStack[si] == ty {
-      const d = hcMvStack.length - si
-      const a: i32[] = []
-      a.push(d)
-      return hcIntern(HC_BACK, a, 1 + hcDigits(d))
-    }
-    si = si - 1
-  }
-  const top = hcMvStack.length == 0
-  if top {
-    repElemMemoSync()
-    if ty < hcMvMemo.length {
-      if hcMvMemo[ty] >= 0 { return hcMvMemo[ty] }
-    }
-  }
-  hcMvStack.push(ty)
-  let r = repElemIdGo(ty, true)
-  hcMvStack.pop()
-  if hcLen[r] > 262144 {
-    const a: i32[] = []
-    a.push(ty)
-    r = hcIntern(HC_BIG, a, 5 + hcDigits(ty))
-  }
-  if top {
-    while hcMvMemo.length <= ty { hcMvMemo.push(-1) }
-    hcMvMemo[ty] = r
-  }
-  r
-}
-
-// The map-value id is this same walk with the ref-list leaf folds switched off, the
-// only place the two structural keys differ (`repMvValKey`'s header: no leaf-list
-// fold, since `i32[]`/`boolean[]`/`K[]` are distinct mv rows). Shared rather than
-// copied so the two cannot drift arm for arm.
-function repElemIdGo(ty: i32, mv: boolean): i32 {
-  let mvMode = 1
-  if mv { mvMode = 2 }
-  const t = T.tys[ty]
-  match t {
-    TyArray => {
-      // The one divergence between the two walks: the ref-list elem key folds an i32/string
-      // leaf array to a single shared row; the map-value key must not, since `i32[]`,
-      // `boolean[]` and `K[]` are distinct mv rows and folding them would make a `{[K]:
-      // i32[]}` resolve a `{[K]: boolean[]}`'s slot.
-      if !mv {
-        if tyIsI32LeafElem(t.aElem) { return hcIntern(HC_RLI32, hcNoArgs, 7) }
-        if tyIsStrLeafElem(t.aElem) { return hcIntern(HC_RLSTR, hcNoArgs, 7) }
-      }
-      const c = repIdOf(t.aElem, mv)
-      const a: i32[] = []
-      a.push(c)
-      return hcIntern(HC_ARRAY, a, hcLen[c] + 2)
-    }
-    TyObj => {
-      const ds = repSlotOfTyDecl(ty)
-      if ds >= 0 {
-        const a: i32[] = []
-        a.push(ds)
-        return hcIntern(HC_SLOT, a, 1 + hcDigits(ds))
-      }
-      const a2: i32[] = []
-      let len = 2
-      let i = 0
-      while i < t.objFieldNames.length {
-        const c = repIdOf(t.objFieldTypes[i], mv)
-        a2.push(sidOf(t.objFieldNames[i]))
-        a2.push(c)
-        len = len + t.objFieldNames[i].length + 1 + hcLen[c] + 1
-        i = i + 1
-      }
-      return hcIntern(HC_OBJ, a2, len)
-    }
-    TyPrim => {
-      return hcPrimId(t.primName)
-    }
-    TyNullable => {
-      const c = repIdOf(t.nInner, mv)
-      const a: i32[] = []
-      a.push(c)
-      return hcIntern(HC_NUL, a, hcLen[c] + 1)
-    }
-    TyUnion => {
-      return hcUnionId(t.uMembers, mvMode)
-    }
-    TyFunc => {
-      // See the canon twin: 1 for the open paren, the closer rides in `")=>"`.
-      const a: i32[] = []
-      let len = 1
-      let i = 0
-      while i < t.fnParamTypes.length {
-        if i > 0 { len = len + 1 }
-        const c = repIdOf(t.fnParamTypes[i], mv)
-        a.push(c)
-        len = len + hcLen[c]
-        i = i + 1
-      }
-      const rc = repIdOf(t.fnRet, mv)
-      a.push(rc)
-      len = len + 3 + hcLen[rc]
-      return hcIntern(HC_FUNC, a, len)
-    }
-    TyMap => {
-      const kc = repIdOf(t.mKey, mv)
-      const vc = repIdOf(t.mVal, mv)
-      const a: i32[] = []
-      a.push(kc)
-      a.push(vc)
-      let head = 1
-      let tag = HC_MAP
-      if t.mSet == 1 {
-        head = 2
-        tag = HC_SET
-      }
-      return hcIntern(tag, a, head + 1 + hcLen[kc] + 1 + hcLen[vc] + 1)
-    }
-    TyNeg => {
-      const c = repIdOf(t.negTy, mv)
-      const a: i32[] = []
-      a.push(c)
-      return hcIntern(HC_NEG, a, 1 + hcLen[c])
-    }
-    TyVar => {}
-    TyLit => {}
-    TyErr => {}
-  }
-  const a: i32[] = []
-  a.push(ty)
-  hcIntern(HC_IDX, a, 1 + hcDigits(ty))
 }
 
 // Structural heap-type dedup (roadmap Next#1, slot layer): the canonical structural
