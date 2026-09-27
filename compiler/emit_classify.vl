@@ -35483,65 +35483,122 @@ function dsLamParamCalleeSlot(
     if pf is FuncDecl { scope = pf.fnBody }
   }
   if scope < 0 { return -1 }
-  let nm = dsLamLetName(scope, lamIx)
+  dslEnsure(scope)
+  let nm = ""
+  const lr = dslLamRow[lamIx]
+  if lr is i32 { nm = dslLamName[lr] }
   if nm == "" { nm = lam.fnName }
   if nm == "" { return -1 }
-  dsLamCallArgSlot(scope, nm, pi, argIx, want)
-}
-
-// The name of the `const` in `ix`'s scope whose initializer is the lambda `lamIx`, or "".
-function dsLamLetName(ix: i32, lamIx: i32): string {
-  if ix < 0 || ix >= P.nodes.length { return "" }
-  const n = P.nodes[ix]
-  if n is LetDecl {
-    if unwrapParen(n.letInit) == lamIx { return n.letName }
-  }
-  if n is FuncDecl { return "" }
-  const kids = nodeChildren(ix)
-  let k = 0
-  while k < kids.length {
-    const r = dsLamLetName(kids[k], lamIx)
-    if r != "" { return r }
-    k = k + 1
-  }
-  ""
-}
-
-// The first call `nm(…)` in `ix`'s scope whose argument `pi` is a function value whose parameter
-// `argIx` names a ref-list slot of kind `want`; -1 when none does.
-function dsLamCallArgSlot(
-  ix: i32,
-  nm: string,
-  pi: i32,
-  argIx: i32,
-  want: i32,
-): i32 {
-  if ix < 0 || ix >= P.nodes.length { return -1 }
-  const n = P.nodes[ix]
-  if n is FuncDecl {
-    if dsRebindsName(ix, nm) { return -1 }
-  }
-  if n is Call {
-    const cf = P.nodes[unwrapParen(n.callFn)]
-    if cf is Ident {
-      if cf.identName == nm && pi < n.callArgs.length {
+  const h = dslCallHead[nm]
+  let r = -1
+  if h is i32 { r = h }
+  while r >= 0 && r < dslCallIx.length {
+    const c = P.nodes[dslCallIx[r]]
+    if c is Call {
+      if (
+        pi < c.callArgs.length
+        && !dslFrameRebinds(dslCallFrame[r], scope, nm)
+      ) {
         const rs = fnTyParamKindListSlot(
-          nodeTyIxOf(n.callArgs[pi]),
+          nodeTyIxOf(c.callArgs[pi]),
           argIx,
           want,
         )
         if rs >= 0 { return rs }
       }
     }
+    r = dslCallNext[r]
+  }
+  -1
+}
+
+// One scope's lambda bindings and named calls, in walk order: the index `dsLamParamCalleeSlot`
+// reads, so a scope holding many lambdas is walked once rather than once per lambda. Kept
+// across queries only once the arena is final (`emitArenaFinal`), and rebuilt per query before.
+let dslRoot = -1
+let dslLen = -1
+let dslLamRow: {[i32]: i32} = Map()
+let dslLamName: string[] = []
+let dslCallHead: {[string]: i32} = Map()
+let dslCallTail: {[string]: i32} = Map()
+let dslCallIx: i32[] = []
+let dslCallFrame: i32[] = []
+let dslCallNext: i32[] = []
+
+// Builds the index for `scope` unless the one in hand already is it.
+function dslEnsure(scope: i32) {
+  if !emitArenaFinal { dslRoot = -1 }
+  if dslRoot == scope && dslLen == P.nodes.length { return 0 }
+  dslRoot = scope
+  dslLen = P.nodes.length
+  dslLamRow = Map()
+  dslLamName = []
+  dslCallHead = Map()
+  dslCallTail = Map()
+  dslCallIx = []
+  dslCallFrame = []
+  dslCallNext = []
+  dslWalk(scope, -1)
+}
+
+// Records the lambda bindings and named calls under `ix`; `frame` is the nearest enclosing
+// function inside the scope, -1 at the scope's own level.
+function dslWalk(ix: i32, frame: i32) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const n = P.nodes[ix]
+  let fr = frame
+  if n is LetDecl {
+    const li = unwrapParen(n.letInit)
+    if li >= 0 && li < P.nodes.length {
+      if P.nodes[li] is FuncDecl {
+        dslLamRow[li] = dslLamName.length
+        dslLamName.push(n.letName)
+      }
+    }
+  } else if n is FuncDecl {
+    fr = ix
+  } else if n is Call {
+    const cf = P.nodes[unwrapParen(n.callFn)]
+    if cf is Ident {
+      const row = dslCallIx.length
+      dslCallIx.push(ix)
+      dslCallFrame.push(frame)
+      dslCallNext.push(-1)
+      const t = dslCallTail[cf.identName]
+      if t is i32 {
+        dslCallNext[t] = row
+      } else {
+        dslCallHead[cf.identName] = row
+      }
+      dslCallTail[cf.identName] = row
+    }
   }
   const kids = nodeChildren(ix)
   let k = 0
   while k < kids.length {
-    const r = dsLamCallArgSlot(kids[k], nm, pi, argIx, want)
-    if r >= 0 { return r }
+    dslWalk(kids[k], fr)
     k = k + 1
   }
-  -1
+  0
+}
+
+// Whether a function between the call's frame `frame` and the scope `scope` rebinds `nm`, so
+// the call names that binding rather than the lambda's `const`.
+function dslFrameRebinds(frame: i32, scope: i32, nm: string): boolean {
+  let pp = fnStmtsPosOf(frame)
+  let steps = 0
+  while pp >= 0 && pp < fnStmts.length && steps < 64 {
+    const fx = fnStmts[pp]
+    const fn = P.nodes[fx]
+    if fn is FuncDecl {
+      if fn.fnBody == scope { return false }
+    }
+    if dsRebindsName(fx, nm) { return true }
+    if pp >= fnParent.length { return false }
+    pp = fnParent[pp]
+    steps = steps + 1
+  }
+  false
 }
 
 // `dsCalleeParamSlot` for a callee bound by the `LetDecl` at `b`: its function-type

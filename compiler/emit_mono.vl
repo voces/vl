@@ -86,6 +86,7 @@ import {
   tyIsMap,
   tyRenderSoftensLits,
   tyToEmitName,
+  tyToStr,
   uniqueGenericDeclNamed,
 } from "./typecheck"
 import {
@@ -859,6 +860,7 @@ function monoNicheWidenedPinName(ax: i32, chosen: string): string {
 // literal is built for (`letRefListDestSlot`), or "": its checked type names the literal's own
 // element, and an instance pinned there would receive the destination's list (D2747).
 function monoDestListPinName(letIx: i32, fnIx: i32): string {
+  if monoDestPinOff { return "" }
   const s = letRefListDestSlot(letIx, fnIx)
   if s < 0 || s >= rlElemName.length { return "" }
   let en = rlElemName[s]
@@ -5080,19 +5082,29 @@ function monoMakeInstance(
     if fn.fnRet < 0 {
       const jTy: i32[] = []
       const jDecl = monoOrigNode[origFe]
+      const jl = monoInferRetSetListTy(jDecl, pinnedTyIx, letBN, letBT)
+      if jl >= 0 && T.tys[jl] is TyUnion {
+        // Two list types, which the checker refuses to use as one list when the function is
+        // spelled without a type parameter; refused here, where the pin makes the join (D2745).
+        return emitFailAt(
+          "`"
+            + fn.fnName
+            + "` returns "
+            + tyToStr(jl)
+            + " at this call: two list types, not one list; annotate its return or make its returns agree",
+          calleeIx,
+        )
+      }
       const jun = monoInferRetSetUnionName(jDecl, pinnedTyIx, letBN, letBT, jTy)
       if jun != "" {
         if monoRegisterPinUnion(jun) < 0 { return -1 }
         let jIx = -1
         if jTy.length > 0 { jIx = jTy[0] }
         nret = synthTypeRefTy(jun, -1, jIx)
-      } else {
-        const jl = monoInferRetSetListTy(jDecl, pinnedTyIx, letBN, letBT)
-        if jl >= 0 {
-          let jln = monoRetListRowName(jl)
-          if jln == "" { jln = tyToEmitName(jl) }
-          if jln != "" { nret = synthTypeRefTy(jln, -1, jl) }
-        }
+      } else if jl >= 0 {
+        let jln = monoRetListRowName(jl)
+        if jln == "" { jln = tyToEmitName(jl) }
+        if jln != "" { nret = synthTypeRefTy(jln, -1, jl) }
       }
     }
     // An inferred return the checker typed as a bare type parameter is the `: T` annotation's
@@ -5834,6 +5846,45 @@ function monoBindFromLaterArg(
 // `callIx` (whose enclosing function is `ctx`, -1 = top level), and point the
 // call site at it. Returns 0, or -1 via `emitFail`.
 function monoInstantiate(origFe: i32, callIx: i32, ctx: i32) {
+  const saved = monoDestPinOff
+  monoDestPinOff = monoCalleeHasTyParamArrow(origFe)
+  const r = monoInstantiateCall(origFe, callIx, ctx)
+  monoDestPinOff = saved
+  r
+}
+
+// Whether the generic at `origFe` declares a function-typed parameter that mentions one of its
+// type parameters: a lambda argument there is built at the type the checker bound, so a list
+// argument may not be re-pinned at its destination's list (D2747).
+function monoCalleeHasTyParamArrow(origFe: i32): boolean {
+  if origFe < 0 || origFe >= monoOrigNode.length { return false }
+  const fn = P.nodes[monoOrigNode[origFe]]
+  if fn is FuncDecl {
+    let i = 0
+    while i < fn.fnParams.length {
+      const p = P.nodes[fn.fnParams[i]]
+      if p is Param {
+        if p.parType >= 0 {
+          const ann = monoDeclAnnName(
+            p.parType,
+            tyNameOf(p.parType),
+            fn.fnTyParams,
+          )
+          if annArrowAt(ann) >= 1 && monoAnnHasTyParam(ann, fn.fnTyParams) {
+            return true
+          }
+        }
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// Set while the call being instantiated has such a parameter (`monoCalleeHasTyParamArrow`).
+let monoDestPinOff = false
+
+function monoInstantiateCall(origFe: i32, callIx: i32, ctx: i32) {
   const c = P.nodes[callIx]
   const fn = P.nodes[monoOrigNode[origFe]]
   if c is Call {
