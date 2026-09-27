@@ -1182,6 +1182,35 @@ axis(
   (d) => twoFiles(d, genShadowedCallee(20000, true), genShadowedCallee(20000, false)),
 );
 
+// `fns` functions of `arms` sibling blocks, each binding its function's one list name to a
+// literal and returning it, against the same program with every binding annotated `i32[]`.
+// The declared union is load-bearing: it is what makes the emitter look for a destination
+// that would re-type an un-annotated literal. A later same-named binding had no known scope
+// there and scanned the whole arena, so each cost the program (D2685). At 4 x 1,200: 7.49 /
+// 0.53 / 14.13 on the seed before D2685, 0.52 / 0.46 / 1.13 after.
+const genListLits = (fns: number, arms: number, annotated: boolean): string => {
+  const t = annotated ? ": i32[]" : "";
+  const o = ["type U = i32 | string"];
+  for (let f = 0; f < fns; f++) {
+    o.push(`function f${f}(n: i32): i32[] {`);
+    for (let a = 0; a < arms; a++) {
+      o.push(`  if n == ${a} {`, `    const out${f}${t} = [n, n + ${a}]`, `    return out${f}`, "  }");
+    }
+    o.push(`  const out${f}${t} = [n]`, `  out${f}`, "}");
+  }
+  o.push("let acc = 0");
+  for (let f = 0; f < fns; f++) o.push(`acc = acc + f${f}(${f}).length`);
+  o.push("print(acc)");
+  return o.join("\n") + "\n";
+};
+
+axis(
+  "un-annotated list literals",
+  2.5,
+  "An un-annotated list literal's destination scan (`dsScopeRootOf`, compiler/emit_classify.vl) lost its binding's scope and walked the arena (D2685).",
+  (d) => twoFiles(d, genListLits(4, 1200, false), genListLits(4, 1200, true)),
+);
+
 // ── the instrument's own control ─────────────────────────────────────────────
 // EVERY PAIR ABOVE PASSES, so nothing above can say whether the grader still reds. The
 // control is the same `grade` over a pair that must: one source, one literal different,
