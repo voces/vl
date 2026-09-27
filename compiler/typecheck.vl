@@ -23745,6 +23745,7 @@ let cwArenaLen = -1
 
 export function covarWriteReset() {
   rcwReported = []
+  ljwReported = []
   rcwMemo = Map()
   rcwPendSrc = []
   rcwPendCovs = []
@@ -27420,6 +27421,86 @@ function rcwPendJoinOperand(op: i32, j: i32) {
   rcwPend(p, t, j)
 }
 
+// The join leaves already refused by `listJoinWidenCheck`, so a leaf of two nested joins is
+// reported once.
+let ljwReported: i32[] = []
+
+// Whether a list of `src` joined as `dst` would change how some level's elements are stored,
+// through `| null` and nested lists. Unknown storage declines.
+function listJoinStorageDiffers(src: i32, dst: i32, depth: i32): boolean {
+  if (
+    src < 0
+    || dst < 0
+    || src >= T.tys.length
+    || dst >= T.tys.length
+    || depth <= 0
+  ) {
+    return false
+  }
+  const d = T.tys[dst]
+  if d is TyNullable { return listJoinStorageDiffers(src, d.nInner, depth - 1) }
+  const s = T.tys[src]
+  match s {
+    TyNullable => {
+      return listJoinStorageDiffers(s.nInner, dst, depth - 1)
+    }
+    TyArray => {
+      const de = arrElemTyOrNone(dst)
+      if de < 0 { return false }
+      if containerElemClassDiffers(s.aElem, de) { return true }
+      return listJoinStorageDiffers(s.aElem, de, depth - 1)
+    }
+    // A join reaching any other shape is not a list the join could copy.
+    TyPrim | TyErr | TyObj | TyFunc | TyUnion | TyMap | TyVar | TyLit | TyNeg => {
+      return false
+    }
+  }
+}
+
+// Refuses each value an `if`, `match`, `??` or inferred return set hands to its joined list
+// type `j` when the join would store that list's elements differently: that takes a copy,
+// and a list never widens by copying (DECISIONS.md §"No implicit container widening"). A list
+// literal leaf is built at the joined type and needs none (D2838, D2274).
+function listJoinWidenCheck(at: i32, op: i32, j: i32) {
+  if op < 0 || j < 0 || j >= T.tys.length || valDiscarded(at) { return 0 }
+  const leaves = valueTailLeaves(op)
+  let i = 0
+  while i < leaves.length {
+    const lf = leaves[i]
+    const n = P.nodes[lf]
+    if n is BinExpr && n.binOp == "??" {
+      listJoinWidenCheck(at, n.binLeft, j)
+      listJoinWidenCheck(at, n.binRight, j)
+    } else if !(n is ArrayLit) && !i32ListHas(ljwReported, lf) {
+      const lt = nodeTyOf(lf)
+      if listJoinStorageDiffers(lt, j, 8) {
+        ljwReported.push(lf)
+        const src = nonNullTy(lt)
+        const dst = nonNullTy(j)
+        // `.map` copies one level, so it is offered only where that level is the one that differs.
+        let hint = ""
+        if listJoinStorageDiffers(src, dst, 1) {
+          hint = containerWidenCopyHint(src, dst)
+        }
+        tErr(
+          tyToStr(src)
+            + " is not "
+            + tyToStr(dst)
+            + ": this join would hold both, and a container never widens implicitly. Its "
+            + "elements would be stored differently, so it would be a copy, and a write through "
+            + "either list would not reach the other. Build it as `"
+            + tyToStr(sourceBuildTy(dst))
+            + "`"
+            + hint,
+          lf,
+        )
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
 // Walk the join sites the occurrence index collected.
 function rcwPendJoins() {
   let i = 0
@@ -27448,11 +27529,14 @@ function rcwPendJoins() {
     } else if n is IfStmt {
       if jt >= 0 {
         rcwPendJoinOperand(rcwBlockTail(n.ifThen), jt)
+        listJoinWidenCheck(at, rcwBlockTail(n.ifThen), jt)
         if n.ifElse >= 0 && n.ifElse < P.nodes.length {
           if P.nodes[n.ifElse] is IfStmt {
             rcwPendJoinOperand(n.ifElse, jt)
+            listJoinWidenCheck(at, n.ifElse, jt)
           } else {
             rcwPendJoinOperand(rcwBlockTail(n.ifElse), jt)
+            listJoinWidenCheck(at, rcwBlockTail(n.ifElse), jt)
           }
         }
       }
@@ -27460,19 +27544,25 @@ function rcwPendJoins() {
       if jt >= 0 {
         rcwPendJoinOperand(n.binLeft, jt)
         rcwPendJoinOperand(n.binRight, jt)
+        listJoinWidenCheck(at, n.binLeft, jt)
+        listJoinWidenCheck(at, n.binRight, jt)
       }
     } else if n is MatchExpr {
       if jt >= 0 {
         let mb = 0
         while mb < n.matchBodies.length {
           rcwPendJoinOperand(rcwBlockTail(n.matchBodies[mb]), jt)
+          listJoinWidenCheck(at, rcwBlockTail(n.matchBodies[mb]), jt)
           mb = mb + 1
         }
       }
     } else if n is FuncDecl {
       if n.fnRet < 0 {
         const tail = cwFnTailStmt(at)
-        if tail >= 0 { rcwPendJoinOperand(tail, rcwInferredRetTy(at)) }
+        if tail >= 0 {
+          rcwPendJoinOperand(tail, rcwInferredRetTy(at))
+          listJoinWidenCheck(at, tail, rcwInferredRetTy(at))
+        }
       }
     }
     i = i + 1
@@ -27489,6 +27579,7 @@ function rcwPendJoins() {
           if fd is FuncDecl {
             if fd.fnRet < 0 {
               rcwPendJoinOperand(rn.retArg, rcwInferredRetTy(f))
+              listJoinWidenCheck(ri, rn.retArg, rcwInferredRetTy(f))
             }
           }
         }
