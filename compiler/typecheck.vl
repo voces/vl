@@ -1007,9 +1007,24 @@ let nlnUse: string[] = []
 // `.f` a field; "" for a read), and the stored (element) type the note suggests.
 let nlnSlot: string[] = []
 let nlnWant: i32[] = []
+// Per note: the annotation it suggests for the binding, or "" for a note about a field literal.
+let nlnAnn: string[] = []
+// Per read note on a scalar binding: the read it names and the type it suggests; -1 otherwise.
+let nlnLeaf: i32[] = []
+let nlnLeafTy: i32[] = []
 // The target and the value's type of the assignment whose refusal is being raised, or -1.
 let nlAsgTgt = -1
 let nlAsgGot = -1
+// The destination type of the mismatch being raised, when its site knows one, or -1.
+let nlWantTy = -1
+// The annotation the last read note suggested (`numLitDefaultNote`), and the type the binding a
+// composite or arithmetic value reads should carry (`numLitLeafFor`).
+let nlDefaultAnn = ""
+let nlDefaultTy = -1
+// While `numLitReadsRefuted` grades: each noted scalar binding's name and the type its note
+// suggests, so an operand that is another noted binding is read at its annotated type.
+let nlSugg: {[string]: i32} = Map()
+let nlLeafWant = -1
 // While a compound assignment's value (`s + v` of `s += v`) is checked: that node and the target.
 let nlCmpdInner = -1
 let nlCmpdTgt = -1
@@ -12798,8 +12813,12 @@ function isvalReset() {
   nlnUse = []
   nlnSlot = []
   nlnWant = []
+  nlnAnn = []
+  nlnLeaf = []
+  nlnLeafTy = []
   nlAsgTgt = -1
   nlAsgGot = -1
+  nlWantTy = -1
   nlCmpdInner = -1
   nlCmpdTgt = -1
   collRetFnNodes = []
@@ -13067,11 +13086,12 @@ function numLitCallStoresNonLit(c: Call, prop: string, from: i32): boolean {
 }
 
 // The subset of `names` the program can store a non-literal through: a whole-name assignment, an
-// element assignment, a storing method call, or an alias (`const b = name`, `x = name`). The
-// suggested annotation would refuse that store, so those notes are dropped. By name, so a
-// shadowing binding counts too; one walk for every queued note.
+// element assignment, a storing method call on a name in `lists`, or an alias (`const b = name`,
+// `x = name`). The suggested annotation would refuse that store, so those notes are dropped. By
+// name, so a shadowing binding counts too; one walk for every queued note.
 function numLitNamesStoredNonLit(
   names: {[string]: boolean},
+  lists: {[string]: boolean},
 ): {[string]: boolean} {
   const out: {[string]: boolean} = Map()
   const stack: i32[] = []
@@ -13097,13 +13117,16 @@ function numLitNamesStoredNonLit(
       }
     } else if n is Call {
       const cf = P.nodes[parenPeelIx(n.callFn)]
+      let rn = ""
       if cf is Member {
-        const rn = numLitNameAt(cf.memObj)
-        if rn != "" && numLitCallStoresNonLit(n, cf.memProp, 0) { hit = rn }
+        rn = numLitNameAt(cf.memObj)
+        if !numLitCallStoresNonLit(n, cf.memProp, 0) { rn = "" }
       } else if cf is Ident && n.callArgs.length > 0 {
-        const rn = numLitNameAt(n.callArgs[0])
-        if rn != "" && numLitCallStoresNonLit(n, cf.identName, 1) { hit = rn }
+        rn = numLitNameAt(n.callArgs[0])
+        if !numLitCallStoresNonLit(n, cf.identName, 1) { rn = "" }
       }
+      // A scalar is passed by value, so a call stores into a list binding only.
+      if rn != "" && (lists[rn] ?? false) { hit = rn }
     }
     if hit != "" && (names[hit] ?? false) { out[hit] = true }
     for k in nodeChildren(ix) {
@@ -13170,7 +13193,10 @@ function numLitDefaultNote(msg: string, at: i32, idIx: i32, decl: i32): string {
     for c in cands {
       let want = c
       if !viaIndex { want = c + list }
-      if msgNamesTy(msg, want) {
+      if msgNamesTy(msg, want) && numLitValuesFit(dn.letInit, c) {
+        nlDefaultAnn = c + list
+        nlDefaultTy = -1
+        if list == "" { nlDefaultTy = numLitPrimTy(c) }
         return numLitAnnotNote(dn, decl, at, bt, c + list)
       }
     }
@@ -13326,6 +13352,9 @@ function numLitAsgNoteQueue(msg: string, di: i32) {
       const gn = primNameStr(primNameOf(gotBase))
       const bytes = slot == "=" && list != "" && numLitListIsBytes(dn.letInit)
       if !numLitFitsStore(bn, gn, bytes) { return 0 }
+      let litAt = dn.letInit
+      if fieldLit >= 0 { litAt = fieldLit }
+      if !numLitValuesFit(litAt, gn) { return 0 }
       // A `const` refuses the whole store already; annotating it would not help.
       if slot == "=" && dn.letKw == "const" { return 0 }
       let note = ""
@@ -13356,6 +13385,14 @@ function numLitAsgNoteQueue(msg: string, di: i32) {
       if list != "" && slot == "=" { slot = "=[]" }
       nlnSlot.push(slot)
       nlnWant.push(gotBase)
+      if fieldLit >= 0 { nlnAnn.push("") } else { nlnAnn.push(gn + list) }
+      nlnLeaf.push(-1)
+      // A whole scalar store's suggestion is graded against the binding's reads as well.
+      if slot == "=" && fieldLit < 0 {
+        nlnLeafTy.push(gotBase)
+      } else {
+        nlnLeafTy.push(-1)
+      }
     }
   }
   0
@@ -13366,20 +13403,246 @@ function numLitNoteQueue(msg: string, at: i32, di: i32) {
   if numLitBindName.length == 0 { return 0 }
   if nlAsgTgt >= 0 { return numLitAsgNoteQueue(msg, di) }
   const idIx = numLitReadIdent(at)
-  if idIx < 0 { return 0 }
-  const id = P.nodes[idIx]
+  if idIx >= 0 {
+    const id = P.nodes[idIx]
+    if id is Ident {
+      const decl = numLitDeclOf(id.identName)
+      if decl >= 0 {
+        const note = numLitDefaultNote(msg, at, idIx, decl)
+        if note != "" {
+          let leaf = -1
+          if nlDefaultTy >= 0 { leaf = idIx }
+          numLitReadNotePush(di, msg, note, decl, id.identName, nlDefaultAnn)
+          return numLitReadLeafPush(leaf, nlDefaultTy)
+        }
+      }
+    }
+  }
+  numLitLeafNoteQueue(msg, at, di)
+}
+
+// Queue a read's note: the diagnostic, its raw message, the note, the declaration it names, the
+// name the value read, and the annotation it suggests.
+function numLitReadNotePush(
+  di: i32,
+  msg: string,
+  note: string,
+  decl: i32,
+  use: string,
+  ann: string,
+) {
+  nlnDiag.push(di)
+  nlnMsg.push(msg)
+  nlnText.push(note)
+  nlnDecl.push(decl)
+  nlnUse.push(use)
+  nlnSlot.push("")
+  nlnWant.push(-1)
+  nlnAnn.push(ann)
+  0
+}
+
+// Record the read the note just queued names, and the scalar type it suggests (-1 for a list).
+function numLitReadLeafPush(leaf: i32, ty: i32) {
+  nlnLeaf.push(leaf)
+  nlnLeafTy.push(ty)
+  0
+}
+
+// The primitive type a scalar suggestion names: `f32`, `i64` or `f64`.
+function numLitPrimTy(c: string): i32 {
+  if c == "f32" { return TY_F32 }
+  if c == "i64" { return TY_I64 }
+  if c == "f64" { return TY_F64 }
+  -1
+}
+
+// Does every integer literal in initializer `ix` (a literal, or a list of them) keep its value as
+// primitive `ty`? An `f32` holds integers up to 2^24 exactly; every other suggestion holds an
+// `i32`. A literal this cannot read is refused.
+function numLitValuesFit(ix: i32, ty: string): boolean {
+  if ty != "f32" { return true }
+  const e = P.nodes[parenPeelIx(ix)]
+  if e is ArrayLit {
+    for el in e.arrElems {
+      if !numLitValuesFit(el, ty) { return false }
+    }
+    return true
+  }
+  if !exprIsNumLit(ix) { return true }
+  let t = numLitText(ix)
+  if t.length > 0 && t[0] == '-' { t = t.slice(1, t.length) }
+  let base = 10.0
+  let i = 0
+  if t.length > 2 && t[0] == '0' && (t[1] == 'x' || t[1] == 'X') {
+    base = 16.0
+    i = 2
+  }
+  let v = 0.0
+  while i < t.length {
+    const c = t.charCodeAt(i)
+    let d = -1
+    if c >= 48 && c <= 57 { d = c - 48 }
+    if base == 16.0 && c >= 97 && c <= 102 { d = c - 87 }
+    if base == 16.0 && c >= 65 && c <= 70 { d = c - 55 }
+    // A float literal's digits need no integer range: f64 to f32 is the suggestion's own rounding.
+    if base == 10.0 && (c == 46 || c == 101 || c == 69) { return true }
+    if c != 95 {
+      if d < 0 { return false }
+      v = v * base + (d as f64)
+    }
+    i = i + 1
+  }
+  v <= 16777216.0
+}
+
+// Is `op` an arithmetic operator, whose result has its operands' numeric type?
+function numLitArithOp(op: string): boolean {
+  op == "+" || op == "-" || op == "*" || op == "/" || op == "%"
+}
+
+// Would value `v` have type `want` once every numeric-literal binding it reads is annotated
+// `want`? Through arithmetic and negation; every other leaf must be a literal that fits or
+// already have that type.
+function numLitArithFits(v: i32, want: i32, depth: i32): boolean {
+  const p = parenPeelIx(v)
+  if depth <= 0 || p < 0 || p >= P.nodes.length { return false }
+  const n = P.nodes[p]
+  const wn = primNameStr(primNameOf(want))
+  let t = widenLitTy(nodeTyIxOf(p))
+  if n is Ident {
+    if numLitDeclOf(n.identName) >= 0 { t = lookup(n.identName) }
+  }
+  if t >= 0 && tySame(t, want) { return true }
+  if n is Unary {
+    if n.unOp == "-" { return numLitArithFits(n.unArg, want, depth - 1) }
+    return false
+  }
+  if n is BinExpr {
+    if !numLitArithOp(n.binOp) { return false }
+    return numLitArithFits(n.binLeft, want, depth - 1)
+      && numLitArithFits(n.binRight, want, depth - 1)
+  }
+  if n is Ident {
+    if numLitDeclOf(n.identName) < 0 { return false }
+  } else if !(n is NumLit) {
+    return false
+  }
+  numLitFitsStore(primNameStr(primNameOf(t)), wn, false)
+}
+
+// The numeric-literal binding read within value `v` that a `want`-typed destination refuses and
+// whose annotation `want` fixes, through record and list literals, arithmetic and negation; -1
+// when none. Sets `nlLeafWant` to the type the binding should carry.
+function numLitLeafFor(v: i32, want: i32, depth: i32): i32 {
+  const p = parenPeelIx(v)
+  if depth <= 0 || want < 0 || want >= T.tys.length { return -1 }
+  if p < 0 || p >= P.nodes.length { return -1 }
+  const n = P.nodes[p]
+  const wt = T.tys[want]
+  if n is Ident {
+    if numLitDeclOf(n.identName) < 0 { return -1 }
+    const bt = lookup(n.identName)
+    if bt < 0 || tySame(bt, want) { return -1 }
+    const bn = primNameStr(primNameOf(bt))
+    const wn = primNameStr(primNameOf(want))
+    if !numLitFitsStore(bn, wn, false) { return -1 }
+    const decl = numLitDeclOf(n.identName)
+    if decl < 0 || decl >= P.nodes.length { return -1 }
+    const dn = P.nodes[decl]
+    if dn is LetDecl {
+      if !numLitValuesFit(dn.letInit, wn) { return -1 }
+    }
+    nlLeafWant = want
+    return p
+  }
+  if n is ObjLit {
+    if wt is TyObj {
+      for fi in n.objFields {
+        const f = P.nodes[fi]
+        if f is FieldInit {
+          const r = numLitLeafFor(
+            f.fiValue,
+            objFieldType(wt, f.fiName),
+            depth - 1,
+          )
+          if r >= 0 { return r }
+        }
+      }
+    }
+    return -1
+  }
+  if n is ArrayLit {
+    if wt is TyArray {
+      for el in n.arrElems {
+        const r = numLitLeafFor(el, wt.aElem, depth - 1)
+        if r >= 0 { return r }
+      }
+    }
+    return -1
+  }
+  numLitLeafInOp(p, want, depth)
+}
+
+// `numLitLeafFor` through a negation or an arithmetic operator whose value fits `want` once its
+// literal bindings do; -1 for every other node, which reads no binding a note can name.
+function numLitLeafInOp(p: i32, want: i32, depth: i32): i32 {
+  const n = P.nodes[p]
+  if n is BinExpr {
+    if !numLitArithOp(n.binOp) || !numLitArithFits(p, want, 8) { return -1 }
+    const r = numLitLeafFor(n.binLeft, want, depth - 1)
+    if r >= 0 { return r }
+    return numLitLeafFor(n.binRight, want, depth - 1)
+  }
+  const neg = exprNegatedArg(p)
+  if neg >= 0 { return numLitLeafFor(neg, want, depth - 1) }
+  -1
+}
+
+// The operand of a unary minus `p`, or -1 when `p` is not one.
+function exprNegatedArg(p: i32): i32 {
+  const n = P.nodes[p]
+  if n is Unary {
+    if n.unOp == "-" { return n.unArg }
+  }
+  -1
+}
+
+// The note for a mismatch whose value holds a numeric-literal binding inside a record or list
+// literal or an arithmetic expression, found against the destination type `nlWantTy`; for an
+// `operator … mixes` refusal, against the other operand's type.
+function numLitLeafNoteQueue(msg: string, at: i32, di: i32) {
+  const v = parenPeelIx(at)
+  if v < 0 || v >= P.nodes.length { return 0 }
+  let leaf = -1
+  if nlWantTy >= 0 {
+    leaf = numLitLeafFor(v, nlWantTy, 8)
+  } else {
+    const bn = P.nodes[v]
+    if bn is BinExpr && msg.slice(0, 10) == "operator '" {
+      const lt = widenLitTy(nodeTyIxOf(bn.binLeft))
+      const rt = widenLitTy(nodeTyIxOf(bn.binRight))
+      if rt >= 0 && numLitArithFits(v, rt, 8) {
+        leaf = numLitLeafFor(bn.binLeft, rt, 8)
+      }
+      if leaf < 0 && lt >= 0 && numLitArithFits(v, lt, 8) {
+        leaf = numLitLeafFor(bn.binRight, lt, 8)
+      }
+    }
+  }
+  if leaf < 0 { return 0 }
+  const id = P.nodes[leaf]
   if id is Ident {
     const decl = numLitDeclOf(id.identName)
     if decl < 0 { return 0 }
-    const note = numLitDefaultNote(msg, at, idIx, decl)
-    if note == "" { return 0 }
-    nlnDiag.push(di)
-    nlnMsg.push(msg)
-    nlnText.push(note)
-    nlnDecl.push(decl)
-    nlnUse.push(id.identName)
-    nlnSlot.push("")
-    nlnWant.push(-1)
+    const dn = P.nodes[decl]
+    const bt = lookup(id.identName)
+    if dn is LetDecl {
+      const ann = primNameStr(primNameOf(nlLeafWant))
+      const note = numLitAnnotNote(dn, decl, at, bt, ann)
+      numLitReadNotePush(di, msg, note, decl, id.identName, ann)
+      return numLitReadLeafPush(leaf, nlLeafWant)
+    }
   }
   0
 }
@@ -13514,12 +13777,268 @@ function numLitAsgNotesRefuted(drop: boolean[]) {
   0
 }
 
+// Would the read `r` of a numeric-literal binding still check with the binding annotated `s`?
+// Yes as a cast operand, a `print` argument, an argument whose parameter takes `s`, either side of
+// a store to the binding itself (stores are `numLitAsgNotesRefuted`'s), a comparison operand the
+// other side meets, or an arithmetic operand whose result still fits where it goes; else no.
+function numLitUseAccepts(
+  r: i32,
+  s: i32,
+  nm: string,
+  par: {[i32]: i32},
+  depth: i32,
+): boolean {
+  if depth <= 0 { return false }
+  let c = r
+  let p = par[c] ?? -1
+  while p >= 0 && P.nodes[p] is Paren {
+    c = p
+    p = par[p] ?? -1
+  }
+  if p < 0 { return false }
+  const pn = P.nodes[p]
+  if pn is AsExpr { return true }
+  if pn is Unary {
+    if pn.unOp == "-" { return numLitUseAccepts(p, s, nm, par, depth - 1) }
+    return false
+  }
+  if pn is Call {
+    const cf = P.nodes[parenPeelIx(pn.callFn)]
+    if pn.callFn == c { return false }
+    if cf is Ident {
+      if cf.identName == "print" { return true }
+    }
+    const ft = nodeTyIxOf(pn.callFn)
+    if ft < 0 || ft >= T.tys.length { return false }
+    const ftt = T.tys[ft]
+    if ftt is TyFunc {
+      let i = 0
+      while i < pn.callArgs.length && i < ftt.fnParamTypes.length {
+        // A type parameter takes `s` too, and hands it on to where this walk cannot follow.
+        if pn.callArgs[i] == c {
+          return numLitParamTakes(ftt.fnParamTypes[i], s)
+        }
+        i = i + 1
+      }
+    }
+    return false
+  }
+  if pn is RetStmt || numLitIsFnTail(c, p, par) {
+    return numLitRetTakes(p, s, par)
+  }
+  if pn is BinExpr {
+    if pn.binOp == "=" { return numLitNameAt(pn.binLeft) == nm }
+    // The operand a compound store `nm op= v` reads back is the store's own, graded as a store.
+    const up = par[p] ?? -1
+    if up >= 0 && up < P.nodes.length && pn.binLeft == c {
+      const un = P.nodes[up]
+      if un is BinExpr {
+        if un.binOp == "=" && un.binCompound != "" && un.binRight == p {
+          return numLitNameAt(un.binLeft) == nm
+        }
+      }
+    }
+    let o = pn.binLeft
+    if o == c { o = pn.binRight }
+    let ot = widenLitTy(nodeTyIxOf(o))
+    const on = numLitNameAt(o)
+    if on == nm { ot = s }
+    else if on != "" { ot = nlSugg[on] ?? ot }
+    if ot < 0 || ot >= T.tys.length { return false }
+    const lit = exprIsNumLit(o)
+    const litFits = lit
+      && (tySame(ot, s)
+      || numLitFitsStore(
+      primNameStr(primNameOf(ot)),
+      primNameStr(primNameOf(s)),
+      false,
+    ))
+    const op = pn.binOp
+    // Equality takes a literal at its own default type; ordering adapts it.
+    if op == "==" || op == "!=" {
+      return assignable(ot, s) || assignable(s, ot)
+    }
+    if op == "<" || op == ">" || op == "<=" || op == ">=" {
+      return litFits || assignable(ot, s) || assignable(s, ot)
+    }
+    if !numLitArithOp(op) { return false }
+    let res = -1
+    if litFits || assignable(ot, s) { res = s }
+    else if assignable(s, ot) { res = ot }
+    else { return false }
+    const old = widenLitTy(nodeTyIxOf(p))
+    // An integer `/` or `%` that becomes a float one computes a different value.
+    if (op == "/" || op == "%") && numLitIsInt(old) && !numLitIsInt(res) {
+      return false
+    }
+    if old >= 0 && tySame(res, old) { return true }
+    return numLitUseAccepts(p, res, nm, par, depth - 1)
+  }
+  false
+}
+
+// Does a parameter of type `pt` take a value of type `s`? Never a type parameter's, whose
+// instance would change with the annotation.
+function numLitParamTakes(pt: i32, s: i32): boolean {
+  if pt < 0 || pt >= T.tys.length || tyHasHole(pt) { return false }
+  if T.tys[pt] is TyVar { return false }
+  assignable(s, pt)
+}
+
+// Is primitive type `t` an integer one?
+function numLitIsInt(t: i32): boolean {
+  t == TY_I32 || t == TY_I64 || t == TY_U8
+}
+
+// Is `c` the last statement of block `p`, the body of a function?
+function numLitIsFnTail(c: i32, p: i32, par: {[i32]: i32}): boolean {
+  const b = P.nodes[p]
+  if b is Block {
+    const n = b.blkStmts.length
+    if n == 0 || b.blkStmts[n - 1] != c { return false }
+    const f = par[p] ?? -1
+    if f < 0 || f >= P.nodes.length { return false }
+    const fd = P.nodes[f]
+    if fd is FuncDecl { return fd.fnBody == p }
+  }
+  false
+}
+
+// Does the function a return at `p` leaves take `s`? A declared return type decides; an inferred
+// one follows the value, so it takes it.
+function numLitRetTakes(p: i32, s: i32, par: {[i32]: i32}): boolean {
+  let f = p
+  let k = 0
+  while f >= 0 && k < 4096 {
+    const fd = P.nodes[f]
+    if fd is FuncDecl {
+      if fd.fnRet < 0 { return true }
+      const ft = nodeTyIxOf(f)
+      if ft < 0 || ft >= T.tys.length { return false }
+      const ftt = T.tys[ft]
+      if ftt is TyFunc { return numLitParamTakes(ftt.fnRet, s) }
+      return false
+    }
+    f = par[f] ?? -1
+    k = k + 1
+  }
+  false
+}
+
+// Drop each read note whose suggested annotation another read of its binding would refuse: every
+// read of the name within the top-level statement that declares it (anywhere, for a module-level
+// one), other than the reads the notes themselves name, must pass `numLitUseAccepts`. One walk.
+function numLitReadsRefuted(drop: boolean[]) {
+  const names: {[string]: boolean} = Map()
+  let any = false
+  let j = 0
+  while j < nlnSlot.length {
+    if nlnAnn[j] != "" && nlnLeafTy[j] >= 0 {
+      names[nlnUse[j]] = true
+      any = true
+    }
+    j = j + 1
+  }
+  if !any { return 0 }
+  nlSugg = Map()
+  let q = 0
+  while q < nlnAnn.length {
+    if nlnAnn[q] != "" && nlnLeafTy[q] >= 0 && !(nlSugg.has(nlnUse[q])) {
+      nlSugg[nlnUse[q]] = nlnLeafTy[q]
+    }
+    q = q + 1
+  }
+  const par: {[i32]: i32} = Map()
+  const reads: i32[] = []
+  const readOwner: i32[] = []
+  const declOwner: i32[] = []
+  while declOwner.length < nlnDecl.length { declOwner.push(-1) }
+  const stack: i32[] = []
+  const owners: i32[] = []
+  for s in gRootStmts {
+    stack.push(s)
+    owners.push(s)
+  }
+  while stack.length > 0 {
+    const ix = stack[stack.length - 1]
+    const own = owners[owners.length - 1]
+    stack.pop()
+    owners.pop()
+    let k0 = 0
+    while k0 < nlnDecl.length {
+      if nlnDecl[k0] == ix { declOwner[k0] = own }
+      k0 = k0 + 1
+    }
+    const n = P.nodes[ix]
+    if n is Ident {
+      if names[n.identName] ?? false {
+        reads.push(ix)
+        readOwner.push(own)
+      }
+    }
+    for c in nodeChildren(ix) {
+      if c >= 0 && c < P.nodes.length {
+        par[c] = ix
+        stack.push(c)
+        owners.push(own)
+      }
+    }
+  }
+  let k = 0
+  while k < nlnSlot.length {
+    if nlnAnn[k] != "" && nlnLeafTy[k] >= 0 && !drop[k] {
+      const scoped = declOwner[k] >= 0 && declOwner[k] != nlnDecl[k]
+      const s = nlnLeafTy[k]
+      let ri = 0
+      while ri < reads.length && !drop[k] {
+        const r = reads[ri]
+        const id = P.nodes[r]
+        let mine = false
+        if id is Ident { mine = id.identName == nlnUse[k] }
+        if mine && (!scoped || readOwner[ri] == declOwner[k]) {
+          let named = false
+          let m = 0
+          while m < nlnLeaf.length {
+            if nlnLeaf[m] == r && nlnAnn[m] == nlnAnn[k] { named = true }
+            m = m + 1
+          }
+          if !named && !numLitUseAccepts(r, s, nlnUse[k], par, 8) {
+            drop[k] = true
+          }
+        }
+        ri = ri + 1
+      }
+    }
+    k = k + 1
+  }
+  0
+}
+
+// Drop every note on a declaration whose notes suggest two different annotations: no single one
+// fixes all of its uses.
+function numLitNotesDisagree(drop: boolean[]) {
+  let i = 0
+  while i < nlnDecl.length {
+    let k = i + 1
+    while nlnAnn[i] != "" && k < nlnDecl.length {
+      if nlnDecl[k] == nlnDecl[i] && nlnAnn[k] != "" && nlnAnn[k] != nlnAnn[i] {
+        drop[i] = true
+        drop[k] = true
+      }
+      k = k + 1
+    }
+    i = i + 1
+  }
+  0
+}
+
 // Append each queued note whose diagnostic survived. A read's note is dropped when
 // `numLitNamesStoredNonLit` finds a non-literal store to the binding, under its declared or its
 // used name; a store's note when `numLitAsgNotesRefuted` finds a store its annotation refuses.
 function numLitNotesApply() {
   if nlnDiag.length == 0 { return 0 }
   const names: {[string]: boolean} = Map()
+  const lists: {[string]: boolean} = Map()
   const drop: boolean[] = []
   let j = 0
   while j < nlnDiag.length {
@@ -13527,12 +14046,20 @@ function numLitNotesApply() {
     if nlnSlot[j] == "" {
       names[nlnUse[j]] = true
       const dj = P.nodes[nlnDecl[j]]
-      if dj is LetDecl { names[dj.letName] = true }
+      if dj is LetDecl {
+        names[dj.letName] = true
+        if P.nodes[parenPeelIx(dj.letInit)] is ArrayLit {
+          lists[nlnUse[j]] = true
+          lists[dj.letName] = true
+        }
+      }
     }
     j = j + 1
   }
-  const stored = numLitNamesStoredNonLit(names)
+  const stored = numLitNamesStoredNonLit(names, lists)
   numLitAsgNotesRefuted(drop)
+  numLitReadsRefuted(drop)
+  numLitNotesDisagree(drop)
   let i = 0
   while i < nlnDiag.length {
     const di = nlnDiag[i]
@@ -13931,6 +14458,15 @@ export function lookup(name: string) {
 // lookup is bounds-checked: a harness that builds `P.nodes` by hand yields an out-of-range index,
 // which degrades to "no position" (`tline == 0`) rather than trapping.
 export function tErr(msg: string, at: i32) { tErrCoded(msg, at, "") }
+
+// `tErr` for a value delivered to a `want`-typed destination, which lets the numeric-literal note
+// find a literal binding inside a record, list or arithmetic value.
+function tErrWant(msg: string, at: i32, want: i32) {
+  nlWantTy = want
+  tErr(msg, at)
+  nlWantTy = -1
+  0
+}
 
 // The emitter-capability channel: raise an error for a construct the type system accepts but
 // codegen cannot lower yet, under the stable `unsupported-lowering` category code. Both are errors,
@@ -30814,7 +31350,7 @@ function argMismatchErr(argN: i32, expected: i32, at: i32, argIx: i32) {
       return tErr(msg, argIx)
     }
   }
-  tErr(msg, argIx)
+  tErrWant(msg, argIx, expected)
 }
 
 // The offending return site of function-literal `fn` for an `expected` vs `at`
@@ -38724,7 +39260,7 @@ function checkTailArmsAgainst(ix: i32, ret: i32) {
     if lt >= 0 && lt != TY_ERR && lt != TY_NEVER && !isVoidTy(lt) {
       if !isStmtNode(lf) && !stmtAlwaysExits(lf) {
         if !assignableExpr(lf, lt, ret) {
-          tErr("expected " + tyToStr(ret) + ", got " + tyToStr(lt), lf)
+          tErrWant("expected " + tyToStr(ret) + ", got " + tyToStr(lt), lf, ret)
         } else {
           noteRetCstr(lt, ret, lf)
         }
@@ -40802,9 +41338,10 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
               // A `never` body is graded whole below, not by its tail's value.
               if !isVoidTy(ret) && ret != TY_NEVER {
                 if !assignableExpr(stmts[s], stTy, ret) {
-                  tErr(
+                  tErrWant(
                     "expected " + tyToStr(ret) + ", got " + tyToStr(stTy),
                     stmts[s],
+                    ret,
                   )
                 } else {
                   // The check above is vacuous whenever a side is a hole, exactly as the
@@ -51030,7 +51567,11 @@ function checkLetDeclNode(n: LetDecl, ix: i32) {
       if !neverAnnot && !assignableExpr(n.letInit, initTy, annot) {
         // Three sentences, one home: `letAssignMsg` picks between the object-literal-into-a-map,
         // lossy-numeric and opaque forms; the pin calls the same function on the substituted pair.
-        tErr(letAssignMsg(n.letInit, initTy, annot, n.letName), n.letInit)
+        tErrWant(
+          letAssignMsg(n.letInit, initTy, annot, n.letName),
+          n.letInit,
+          annot,
+        )
       } else if !neverAnnot {
         // The check above is vacuous whenever a side is a hole — record the pair for the pin to
         // re-ask under substitution, only on the PASSING side (a failing one already reported, D572).
@@ -57989,7 +58530,7 @@ function checkRetStmtNode(n: RetStmt, ix: i32) {
   // declared return type — usage-driven inference clearing the floor.
   constrainEmptyExpr(n.retArg, got, want)
   if want >= 0 && !assignableExpr(n.retArg, got, want) {
-    tErr(
+    tErrWant(
       "return type mismatch: expected "
         + tyToStr(want)
         + ", got "
@@ -57997,6 +58538,7 @@ function checkRetStmtNode(n: RetStmt, ix: i32) {
         + bareRetVoidNote(want)
         + charLitForStringNote(n.retArg, want),
       n.retArg,
+      want,
     )
   } else if want >= 0 {
     // The check above is vacuous whenever a side is a hole — record the pair for the pin to
