@@ -1013,11 +1013,7 @@ function parseTypeAtom() {
       while fgoing {
         const fm = tsMark()
         let fname = ""
-        if peekKind() == "IDENT" {
-          fname = advance().text
-        } else {
-          expect("IDENT")
-        }
+        if atFieldName() { fname = advance().text } else { expect("IDENT") }
         let ftyName = ""
         if peekKind() == "LPAREN" {
           if !first { name = name + "," }
@@ -1410,6 +1406,13 @@ function bracesAreEmpty(bracePos: i32) {
   kindAt(i) == "RBRACE"
 }
 
+// Whether the cursor is on a field name: an identifier, or `type`, which is a keyword only where
+// a declaration can start and so is free to name a field (a record's `type: i32`, `r.type`).
+function atFieldName(): boolean {
+  const k = peekKind()
+  k == "IDENT" || k == "TYPE"
+}
+
 // An object literal `{ name: value, … }`, the cursor on the leading `{`. A field is
 // `IDENT ":" expr`, a string key `"+": expr` (operator and index-trap fields, decoded with
 // quotes stripped), a method shorthand `add(a, b) { … }`, or a bare-IDENT shorthand `{ x }`.
@@ -1430,7 +1433,15 @@ function parseObjLit() {
     let name = ""
     let stringKey = false
     let badKey = false
-    if peekKind() == "IDENT" {
+    // `type` names a field only with its value spelled out: `{ type }` would read a binding
+    // no program can declare.
+    if peekKind() == "TYPE" && kindAt(P.pos + 1) != "COLON" {
+      P.diags.push(
+        { msg: "a field named `type` needs its value: `type: …`", at: P.pos },
+      )
+      advance()
+      badKey = true
+    } else if atFieldName() {
       name = advance().text
     } else if peekKind() == "STRING" {
       // A STRING key (`"+": fn`, `"[]": fn`) names an operator / index-trap
@@ -1484,7 +1495,7 @@ function parseObjLit() {
     skipNewlines()
     // An object literal's element starts with its key — an IDENT or a STRING
     // (`"+": fn`) — so `{x: 1 y: 2}` is a missing separator, not a missing `}`.
-    if takeSep(peekKind() == "IDENT" || peekKind() == "STRING") {
+    if takeSep(atFieldName() || peekKind() == "STRING") {
       skipNewlines()
       going = peekKind() != "RBRACE"
     } else {
@@ -1640,11 +1651,7 @@ function parsePostfix() {
     } else if k == "DOT" {
       advance()
       let prop = ""
-      if peekKind() == "IDENT" {
-        prop = advance().text
-      } else {
-        expect("IDENT")
-      }
+      if atFieldName() { prop = advance().text } else { expect("IDENT") }
       if guarded {
         node = mkOptMember(node, prop, true, p0)
       } else {
@@ -1655,11 +1662,7 @@ function parsePostfix() {
       // type re-wrapped nullable when the receiver is nullable.
       advance()
       let oprop = ""
-      if peekKind() == "IDENT" {
-        oprop = advance().text
-      } else {
-        expect("IDENT")
-      }
+      if atFieldName() { oprop = advance().text } else { expect("IDENT") }
       node = mkOptMember(node, oprop, false, p0)
       guarded = true
     } else if k == "LBRACK" {
@@ -2189,7 +2192,7 @@ function parseTypeDecl(flatAt: i32) {
   while going {
     const fp0 = peekTok().start // the field's name token
     let fname = ""
-    if peekKind() == "IDENT" { fname = advance().text } else { expect("IDENT") }
+    if atFieldName() { fname = advance().text } else { expect("IDENT") }
     // A method member (`toString(): string`) — the same production `parseTypeAtom`'s inline
     // object arm reads, so the two spellings of one bound cannot drift. It declares a call,
     // not a field, so it pushes no `FieldDef`: the declaration is minted with the fields it
@@ -3421,7 +3424,11 @@ function parseMatchPayloadFields(base: i32, lets: i32[]): i32 {
   let going = peekKind() != "RBRACE" && peekKind() != "EOF"
   while going {
     const fp = peekTok().start
-    if peekKind() == "IDENT" {
+    // A field named `type` binds only under another name (`type: t`).
+    if (
+      peekKind() == "IDENT"
+      || (peekKind() == "TYPE" && peek2Kind() == "COLON")
+    ) {
       const fname = advance().text
       if peekKind() == "COLON" {
         advance() // ":"
@@ -3694,6 +3701,8 @@ function looksLikeObject(bracePos: i32) {
   }
   const first = kindAt(i)
   if first == "RBRACE" { return true }
+  // `type` opens a declaration only before a name, so `{ type: … }` is an object.
+  if first == "TYPE" && kindAt(i + 1) == "COLON" { return true }
   if isStmtKeyword(first) { return false }
   if first == "IDENT" || first == "STRING" {
     let j = i + 1

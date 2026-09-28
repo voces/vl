@@ -8537,6 +8537,8 @@ function crLoopReadCheck(slot: i32, callIx: i32) {
 // that may reassign a narrowed binding ends the narrowing".
 function callMayWrite(callIx: i32, key: string): boolean {
   if isPathKey(key) { return callInvalidatesNarrowedPath(callIx, key) }
+  // Nothing reassigns a `const`, whatever a callee writes under its name (D3019).
+  if isConstName(key) { return false }
   crCallReaches(callIx, key)
 }
 
@@ -8618,6 +8620,8 @@ let crwStack: i32[] = []
 let crwCallee: {[i32]: boolean} = Map()
 let crwAsgLhs: {[i32]: boolean} = Map()
 let crwBindOf: {[i32]: string} = Map()
+// Assignment targets that resolve to a binding local to a nested function (use kind 3).
+let crwAsgInner: {[i32]: boolean} = Map()
 // A lambda written as a call's argument, mapped to that call.
 let crwArgCall: {[i32]: i32} = Map()
 // Per `root#name`: 0 when no closure writes the name, 1 when every function that can reach a
@@ -8835,8 +8839,10 @@ function crwEnsure(root: i32) {
   crwStack = []
   crwCallee = Map()
   crwAsgLhs = Map()
+  crwAsgInner = Map()
   crwBindOf = Map()
   crwArgCall = Map()
+  crsReset()
   if root < 0 || root >= P.nodes.length { return 0 }
   const r = P.nodes[root]
   if r is FuncDecl {
@@ -8858,11 +8864,84 @@ function crwBindParams(fd: FuncDecl) {
   0
 }
 
+// The declarations a writer walk has in scope, innermost last, each with the depth of the nested
+// function making it (0 for the root's own level). A write resolving to one of depth > 0 cannot
+// reach a binding of the root's level or the module, whatever its name (D3019).
+let crsNames: string[] = []
+let crsDepths: i32[] = []
+
+function crsReset() {
+  crsNames = []
+  crsDepths = []
+  0
+}
+
+function crsDeclare(name: string, depth: i32) {
+  crsNames.push(name)
+  crsDepths.push(depth)
+  0
+}
+
+// Drop the declarations made since `mark`, the height the walk saw on entering a node.
+function crsLeave(mark: i32) {
+  while crsNames.length > mark {
+    crsNames.pop()
+    crsDepths.pop()
+  }
+  0
+}
+
+// The function depth of the declaration `name` resolves to here, or 0 when it resolves to none
+// the walk saw. A declaration the walk does not track (a loop variable, a pattern binding) makes
+// its writes count as the outer binding's, which only ends more narrowings.
+function crsDepthOf(name: string): i32 {
+  let i = crsNames.length - 1
+  while i >= 0 {
+    if crsNames[i] == name { return crsDepths[i] }
+    i = i - 1
+  }
+  0
+}
+
+// The body of the function declared at `ix`, or -1 when `ix` declares none.
+function crFnBodyOf(ix: i32): i32 {
+  const n = P.nodes[ix]
+  if n is FuncDecl { return n.fnBody }
+  -1
+}
+
+// The name the `let`/`const` at `ix` declares, or "" when `ix` declares none.
+function crLetNameOf(ix: i32): string {
+  const n = P.nodes[ix]
+  if n is LetDecl { return n.letName }
+  ""
+}
+
+function crsDeclareFnParams(ix: i32, depth: i32) {
+  const n = P.nodes[ix]
+  if n is FuncDecl { crsDeclareParams(n, depth) }
+  0
+}
+
+// Declare the parameters of a nested function at depth `depth`.
+function crsDeclareParams(fd: FuncDecl, depth: i32) {
+  let i = 0
+  while i < fd.fnParams.length {
+    const p = P.nodes[fd.fnParams[i]]
+    if p is Param { crsDeclare(p.parName, depth) }
+    i = i + 1
+  }
+  0
+}
+
 // One walk of the root. A nested function is recorded on entry, so a use inside it can say
-// which one holds it; a write or mention inside it counts for every function around it too.
+// which one holds it; a write or mention inside it counts for every function around it too, up
+// to the one declaring the binding it writes. A write to a binding local to a nested function is
+// recorded under `name@` (`crWriteKey`).
 function crwVisit(ix: i32) {
   if ix < 0 || ix >= P.nodes.length { return 0 }
   const n = P.nodes[ix]
+  const mark = crsNames.length
   if n is FuncDecl {
     const j = crwFns.length
     crwFns.push(ix)
@@ -8874,13 +8953,16 @@ function crwVisit(ix: i32) {
     if n.fnName != "" { crwBound = crwAddName(crwBound, n.fnName) }
     crwBindParams(n)
     crwStack.push(j)
+    crsDeclareParams(n, crwStack.length)
     crwVisit(n.fnBody)
     crwStack.pop()
+    crsLeave(mark)
     return 0
   }
   if n is Ident {
     let kind = 0
     if crwAsgLhs[ix] ?? false { kind = 2 }
+    if crwAsgInner[ix] ?? false { kind = 3 }
     if crwCallee[ix] ?? false { kind = 1 }
     crwUseNames.push(n.identName)
     crwUseKinds.push(kind)
@@ -8892,15 +8974,22 @@ function crwVisit(ix: i32) {
     }
     return 0
   }
+  let declName = ""
   if n is BinExpr {
     if n.binOp == "=" {
       const l = P.nodes[n.binLeft]
       if l is Ident {
         crwAsgLhs[n.binLeft] = true
-        let s = 0
+        const d = crsDepthOf(l.identName)
+        let wn = l.identName
+        if d > 0 {
+          crwAsgInner[n.binLeft] = true
+          wn = wn + "@"
+        }
+        let s = d
         while s < crwStack.length {
           const f = crwStack[s]
-          crwFnWrites[f] = crwAddName(crwFnWrites[f], l.identName)
+          crwFnWrites[f] = crwAddName(crwFnWrites[f], wn)
           s = s + 1
         }
         if P.nodes[n.binRight] is FuncDecl {
@@ -8909,6 +8998,7 @@ function crwVisit(ix: i32) {
       }
     }
   } else if n is LetDecl {
+    declName = n.letName
     crwBound = crwAddName(crwBound, n.letName)
     if n.letInit >= 0 {
       if P.nodes[n.letInit] is FuncDecl { crwBindOf[n.letInit] = n.letName }
@@ -8940,6 +9030,9 @@ function crwVisit(ix: i32) {
     }
     cur = elseIfLink(cur)
   }
+  crsLeave(mark)
+  // A declaration is in scope from after its initializer to the end of the enclosing node.
+  if declName != "" { crsDeclare(declName, crwStack.length) }
   0
 }
 
@@ -8954,13 +9047,43 @@ function crwMentionsAny(mentions: string, handles: string): boolean {
   false
 }
 
+// The key the writer analysis answers `name` under: the name itself for a binding of the root's
+// own level or the module, which no write resolving inside a nested function can reach, else
+// `name@`, which also counts those writes. Unsure is `name@`, the answer ending more narrowings.
+function crWriteKey(name: string): string {
+  if crNameAtRootLevel(name) { return name }
+  name + "@"
+}
+
+// The memo key of `crInfoOf(name)` under the current root.
+function crInfoKey(name: string): string {
+  i32ToStr(crCurRoot()) + "#" + crWriteKey(name)
+}
+
+// Whether `name` reads, through its narrowing layers, a binding declared outside every function
+// body being checked or in the body of the current root itself.
+function crNameAtRootLevel(name: string): boolean {
+  const ds = scopeDepthsOf[name]
+  if ds == null || ds.length == 0 { return false }
+  let j = ds.length - 1
+  while j > 0 && (crFirstBank(name, ds[j]) >= 0 || crWidenedAt(name, ds[j])) {
+    j = j - 1
+  }
+  const d = ds[j]
+  let f = crFnBases.length - 1
+  while f >= 0 && crFnBases[f] > d { f = f - 1 }
+  if f < 0 { return true }
+  crFnIxs[f] == crCurRoot()
+}
+
 // Whether a closure of the current root writes `name`, and whether one that can reach such a
 // writer escaped: 0 / 1 / 2 as `crInfoMemo` documents. A reacher is a function that writes the
 // name or mentions a reacher's name; it escapes when it is unbound, or its name is used other
 // than as a callee or an assignment target, inside another reacher or not.
 function crInfoOf(name: string): i32 {
   const root = crCurRoot()
-  const key = i32ToStr(root) + "#" + name
+  const wk = crWriteKey(name)
+  const key = i32ToStr(root) + "#" + wk
   const hit = crInfoMemo[key]
   if hit is i32 { return hit }
   crwEnsure(root)
@@ -8968,10 +9091,14 @@ function crInfoOf(name: string): i32 {
   let handles = ","
   const reach: boolean[] = []
   const wkey = "," + name + ","
+  // A binding local to a nested function is written also by writes resolving there.
+  let ikey = wkey
+  if wk != name { ikey = "," + wk + "," }
   let any = false
   let j = 0
   while j < crwFns.length {
-    const w = crwFnWrites[j].indexOf(wkey) >= 0
+    const fw = crwFnWrites[j]
+    const w = fw.indexOf(wkey) >= 0 || fw.indexOf(ikey) >= 0
     reach.push(w)
     if w {
       any = true
@@ -9055,6 +9182,7 @@ function crNameIsGlobal(name: string): boolean {
 // alone decides (D2401, D2404).
 function crMayBeWritten(key: string): boolean {
   if isPathKey(key) { return true }
+  if isConstName(key) { return false }
   if crInfoOf(key) > 0 { return true }
   if !crNameIsGlobal(key) { return false }
   crFnRoots.push(crProgRoot)
@@ -9107,7 +9235,7 @@ function crIsDispatchSite(ix: i32): boolean {
 // Asked of every declaration of `op`, since which one dispatched is the receiver's business.
 function crOpIsReacher(op: string, name: string): boolean {
   if op == "" { return true }
-  const hs = weSplit(crHandleMemo[i32ToStr(crCurRoot()) + "#" + name] ?? ",")
+  const hs = weSplit(crHandleMemo[crInfoKey(name)] ?? ",")
   let i = 0
   while i < hs.length {
     if hs[i] == op || opDeclOpOf(hs[i]) == op { return true }
@@ -9121,7 +9249,7 @@ function crOpIsReacher(op: string, name: string): boolean {
 function crCallNodeReaches(cn: Call, callIx: i32, name: string): boolean {
   const info = crInfoOf(name)
   if info == 0 { return false }
-  const hs = crHandleMemo[i32ToStr(crCurRoot()) + "#" + name] ?? ","
+  const hs = crHandleMemo[crInfoKey(name)] ?? ","
   const cname = calleeNameOf(callIx)
   if cname != "?" && hs.indexOf("," + cname + ",") >= 0 { return true }
   if P.nodes[cn.callFn] is FuncDecl { return true }
@@ -9504,14 +9632,18 @@ function crNameAssigned(name: string): boolean {
 }
 
 function crNameAssignedInRoot(name: string): boolean {
-  const key = i32ToStr(crCurRoot()) + "#" + name
+  const key = crInfoKey(name)
   const hit = crAsgMemo[key]
   if hit is boolean { return hit }
   crwEnsure(crCurRoot())
+  // A write resolving to a nested function's own binding (kind 3) counts only for such a binding.
+  let inner = 2
+  if crWriteKey(name) != name { inner = 3 }
   let found = false
   let u = 0
   while u < crwUseNames.length && !found {
-    if crwUseKinds[u] == 2 && crwUseNames[u] == name { found = true }
+    const k = crwUseKinds[u]
+    if (k == 2 || k == inner) && crwUseNames[u] == name { found = true }
     u = u + 1
   }
   crAsgMemo[key] = found
@@ -9568,35 +9700,46 @@ function crNameAssignedInProgram(name: string): boolean {
   r
 }
 
-// Whether an assignment anywhere in the program may store `null` into a binding named `name`:
-// one whose right side is not a non-null literal. One walk of the program answers every name.
+// Whether an assignment anywhere in the program may store `null` into the module binding `name`:
+// one whose right side is not a non-null literal, and whose target does not resolve to a binding
+// local to a function. One walk of the program answers every name.
 function crNameNulledInProgram(name: string): boolean {
   if !crNulledBuilt {
     crNulledBuilt = true
-    crNulledWalk(crProgRoot)
+    crsReset()
+    crNulledWalk(crProgRoot, 0)
   }
   crNulledNames[name] ?? false
 }
 
-function crNulledWalk(ix: i32) {
+// `depth` counts the functions around `ix`; `crsDepthOf` resolves a target against them.
+function crNulledWalk(ix: i32, depth: i32) {
   if ix < 0 || ix >= P.nodes.length { return 0 }
   const tgt = crAssignTarget(ix)
-  if tgt != "" {
+  if tgt != "" && crsDepthOf(tgt) == 0 {
     const n = P.nodes[ix]
     if n is BinExpr {
       if !crRhsNonNull(n.binRight) { crNulledNames[tgt] = true }
     }
   }
+  const mark = crsNames.length
+  const body = crFnBodyOf(ix)
+  let inner = depth
+  if body >= 0 { inner = depth + 1 }
   let cur = ix
   while cur >= 0 {
     const kids = nodeSpineChildren(cur)
     let k = 0
     while k < kids.length {
-      crNulledWalk(kids[k])
+      if kids[k] == body { crsDeclareFnParams(ix, inner) }
+      crNulledWalk(kids[k], inner)
       k = k + 1
     }
     cur = elseIfLink(cur)
   }
+  crsLeave(mark)
+  const ln = crLetNameOf(ix)
+  if ln != "" { crsDeclare(ln, depth) }
   0
 }
 
