@@ -224,7 +224,7 @@ import {
   tyNameOf,
   unwrapParen,
 } from "./emit_base"
-import { paramIndexOf, paramTypeNode } from "./emit_query"
+import { ifArmValueExpr, paramIndexOf, paramTypeNode } from "./emit_query"
 import {
   drwFillDefaults,
   drwMemberDeferred,
@@ -1688,11 +1688,120 @@ function monoIfChainRebuild(
         ce = links[li]
       } else {
         ce = mkIf(ccs[li], cts[li], ce, c.pos)
+        // The rebuilt link answers the join its original did, which a value `if` is typed by.
+        const ot = nodeTyIxOf(links[li])
+        if ot >= 0 { nodeTyRecord(ce, ot) }
       }
     }
     li = li - 1
   }
   ce
+}
+
+// `monoIfChainRebuild` for the per-instance walk: a link whose recorded join names a type
+// parameter this instance binds is re-made answering the pinned join, since a value `if`'s
+// blocktype is read off that type and the template's names the parameter itself (D2876).
+function monoIfChainRebuildPinned(
+  links: i32[],
+  ccs: i32[],
+  cts: i32[],
+  ce0: i32,
+  bN: string[],
+  bT: i32[],
+): i32 {
+  let ce = ce0
+  let li = links.length - 1
+  while li >= 0 {
+    const at = links[li]
+    const c = P.nodes[at]
+    if c is IfStmt {
+      // Only where every arm's value is the join or one of its members: a hole arm absorbs
+      // the checker's join, so a sibling can hold another type (a literal `5`).
+      const raw = nodeTyIxOf(at)
+      let pty = -1
+      if monoIfArmsAllTy(at, raw) { pty = monoPinnedTyOf(at, bN, bT) }
+      const retype = pty >= 0 && pty != raw && monoPinKeepsMembers(raw, pty)
+      if (
+        ccs[li] == c.ifCond
+        && cts[li] == c.ifThen
+        && ce == c.ifElse
+        && !retype
+      ) {
+        ce = at
+      } else {
+        ce = mkIf(ccs[li], cts[li], ce, c.pos)
+        if retype { monoPinRecordTy(ce, pty) }
+      }
+    }
+    li = li - 1
+  }
+  ce
+}
+
+// Whether `ty` names a type parameter and every arm value of the `if` chain at `ix` is typed
+// `ty` too (or never completes), an arm whose value is itself an `if` answering for its own.
+function monoIfArmsAllTy(ix: i32, ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length || !tyHasTyVar(ty) { return false }
+  let cur = ix
+  while cur >= 0 {
+    const c = P.nodes[cur]
+    cur = -1
+    if c is IfStmt {
+      if !monoArmTailIsTy(c.ifThen, ty) { return false }
+      if c.ifElse < 0 { return false }
+      if P.nodes[c.ifElse] is IfStmt { cur = c.ifElse }
+      else if !monoArmTailIsTy(c.ifElse, ty) { return false }
+    }
+  }
+  true
+}
+
+// Whether the tail value of arm block `blockIx` is typed `ty`, or is a call that never returns.
+function monoArmTailIsTy(blockIx: i32, ty: i32): boolean {
+  const v = ifArmValueExpr(blockIx)
+  if v < 0 { return false }
+  const vt = nodeTyIxOf(v)
+  if vt == ty { return true }
+  if vt < 0 || vt >= T.tys.length { return false }
+  const t = T.tys[vt]
+  if t is TyPrim && t.primName == "never" { return true }
+  if monoTySameOrVar(vt, ty) { return true }
+  // A member of a union join, which the pinned union still holds apart.
+  const u = T.tys[ty]
+  if u is TyUnion {
+    let i = 0
+    while i < u.uMembers.length {
+      if monoTySameOrVar(vt, u.uMembers[i]) { return true }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// Whether `a` and `b` are one type: one index, one type parameter's name, or equal.
+function monoTySameOrVar(a: i32, b: i32): boolean {
+  if a == b { return true }
+  if a < 0 || b < 0 || a >= T.tys.length || b >= T.tys.length { return false }
+  const ta = T.tys[a]
+  const tb = T.tys[b]
+  if ta is TyVar {
+    if tb is TyVar { return ta.tvName == tb.tvName }
+    return false
+  }
+  if tb is TyVar { return false }
+  tyEq(a, b)
+}
+
+// Whether pinned `pty` keeps every member union `raw` has: a pin that merges two members
+// (`boolean | i32`, `T[] | i32[]` at `i32`) is left to its arms, which still tell them apart.
+function monoPinKeepsMembers(raw: i32, pty: i32): boolean {
+  const r = T.tys[raw]
+  if r is TyUnion {
+    const p = T.tys[pty]
+    if p is TyUnion { return p.uMembers.length == r.uMembers.length }
+    return false
+  }
+  true
 }
 
 // The operand children of expression `ix` a copy-on-write rewrite descends into, in the
@@ -2592,8 +2701,11 @@ function monoPinBodyLambdasRaw(
   }
   if n is LetDecl {
     const ci = monoPinValueLambda(n.letInit, typarams, tvN, tvV, bN, bT)
-    if ci == n.letInit { return ix }
-    return mkLet(n.letKw, n.letName, n.letType, ci, n.pos)
+    // A binding inside an expression (an `if` arm's prelude), which the statement clone does
+    // not reach, has its annotation substituted here.
+    const nt = monoSubstLetType(n.letType, typarams, tvN, tvV, bN, bT)
+    if ci == n.letInit && nt == n.letType { return ix }
+    return mkLet(n.letKw, n.letName, nt, ci, n.pos)
   }
   // D1046 — a nested named `function` statement is the declaration form of the same
   // thing, and `collectFns` lifts it exactly like a lambda. The statement itself emits
@@ -2634,7 +2746,7 @@ function monoPinBodyLambdasRaw(
       }
       k = k + 1
     }
-    return monoIfChainRebuild(
+    return monoIfChainRebuildPinned(
       links,
       ccs,
       cts,
@@ -2646,6 +2758,8 @@ function monoPinBodyLambdasRaw(
         bN,
         bT,
       ),
+      bN,
+      bT,
     )
   }
   if n is ForRange {

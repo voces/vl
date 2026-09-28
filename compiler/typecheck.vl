@@ -3685,6 +3685,8 @@ let luWriteTgt: {[i32]: boolean} = Map()
 // The source position of each loop binding the list-union rewrite minted: the iterable's node,
 // which precedes every read of the binding in the body, though the binding is minted later.
 let luDeclPos: {[i32]: i32} = Map()
+// The type each annotation the list-union rewrite minted stands for, keyed by its `TypeRef`.
+let luAnnTy: {[i32]: i32} = Map()
 // D951 — the `is`-test type sidecar: the arena type an `IsExpr`'s check type resolves to, keyed by
 // the `IsExpr` node, so the emitter's narrowing stack banks the answer instead of re-deriving the
 // narrowed type from the tested spelling. Sized with `nodeTyIx` and read through `isVarTyIxOf`; a
@@ -4693,6 +4695,7 @@ export function initChecker() {
   isVarTyIxCap = 0
   luWriteTgt = Map()
   luDeclPos = Map()
+  luAnnTy = Map()
   pgVoid = []
   joinHead = []
   joinName = []
@@ -14081,6 +14084,22 @@ function joinTyParamNull(a: i32, b: i32) {
   -1
 }
 
+// Whether `v` is a type parameter and `u` a union with `v` among its members.
+function tyVarMemberOf(v: i32, u: i32): boolean {
+  if v < 0 || u < 0 || v >= T.tys.length || u >= T.tys.length { return false }
+  if !(T.tys[v] is TyVar) { return false }
+  const ut = T.tys[u]
+  if ut is TyUnion {
+    let i = 0
+    while i < ut.uMembers.length {
+      const m = ut.uMembers[i]
+      if m == v || (m >= 0 && sameVariantTy(m, v)) { return true }
+      i = i + 1
+    }
+  }
+  false
+}
+
 // The least upper bound used by `??` (host: `flatten(Union(nonNull(l), r))`):
 // mutually-assignable types collapse to the wider; otherwise a two-member union.
 function joinTys(a: i32, b: i32) {
@@ -14105,6 +14124,10 @@ function joinTys(a: i32, b: i32) {
     tpJoinUnions[tj] = 1
     return tj
   }
+  // A type parameter beside a union holding it joins as that union: inside the body the
+  // parameter is assignable to either, and taking it alone drops the union's other members (D2876).
+  if tyVarMemberOf(a, b) { return b }
+  if tyVarMemberOf(b, a) { return a }
   // Two different records may join wider than either (`{f: i32}` into `{f: f64}`) (D2731).
   if !recordJoinMinted && a != b {
     if T.tys[a] is TyObj && T.tys[b] is TyObj { recordJoinMinted = true }
@@ -33702,6 +33725,13 @@ function genAppCarry(origTy: i32, newTy: i32, bNames: string[], bTys: i32[]) {
   0
 }
 
+// Whether two union members are the same list type at two arena indices.
+function substListTwin(a: i32, b: i32): boolean {
+  if a < 0 || b < 0 { return false }
+  if !(T.tys[a] is TyArray) || !(T.tys[b] is TyArray) { return false }
+  tyEq(a, b)
+}
+
 // The members of a union re-joined one at a time, as the join that made it would at these types.
 function rejoinMembers(ms: i32[]): i32 {
   if ms.length == 0 { return -1 }
@@ -33808,6 +33838,8 @@ export function substTyDeep(tyIx: i32, bNames: string[], bTys: i32[]) {
         let w = 0
         while w < uniq.length {
           if uniq[w] == out3[q] { seen = true }
+          // `T[] | i32[]` at `T := i32` is one list; the substituted `T[]` is a fresh index (D2818).
+          if substListTwin(uniq[w], out3[q]) { seen = true }
           w = w + 1
         }
         if !seen { uniq.push(out3[q]) }
@@ -50393,7 +50425,14 @@ function checkLetDeclNode(n: LetDecl, ix: i32) {
   if n.letType >= 0 {
     const tn = P.nodes[n.letType]
     if tn is TypeRef {
-      annot = nameToTyAt(tn.tyName, n.letType)
+      // A binding the list-union rewrite minted is typed as the rewrite typed it, since a
+      // written `T[] | i32[]` resolves to one list (D2876).
+      const lua = luAnnTy[n.letType] ?? -1
+      if lua >= 0 {
+        annot = lua
+      } else {
+        annot = nameToTyAt(tn.tyName, n.letType)
+      }
       if annot >= 0 && annot == collapsedTy { annotCollapsedHere = true }
       // D1023 at a binding's inline union, as `resolveAnnotAt` asks it of a parameter's.
       if annot >= 0 {
@@ -55278,7 +55317,7 @@ function luMembers(ty: i32): i32[] {
       if m < 0 { return none }
       const mt = T.tys[m]
       if mt is TyArray {
-        if mt.aElem < 0 || mt.aRead == 1 || tyHasTyVar(m) { return none }
+        if mt.aElem < 0 || mt.aRead == 1 { return none }
         if luHasLit(mt.aElem, 8) { return none }
       } else {
         return none
@@ -55346,7 +55385,25 @@ function luSpell(ty: i32): string {
   if luSpellsAs(dn, ty) { return dn }
   const en = tyToEmitName(ty)
   if en != "" && luSpellsAs(en, ty) { return en }
+  // A union naming a type parameter, whose written form resolves to one member when its lists
+  // meet: spelled for the pin to substitute, and typed through `luAnnTy`.
+  if luUnionSpellsByMember(ty) { return dn }
   ""
+}
+
+// Whether `ty` is a union naming a type parameter each of whose members has a spelling.
+function luUnionSpellsByMember(ty: i32): boolean {
+  if ty < 0 || !tyHasTyVar(ty) { return false }
+  const t = T.tys[ty]
+  if t is TyUnion {
+    let i = 0
+    while i < t.uMembers.length {
+      if luSpell(t.uMembers[i]) == "" { return false }
+      i = i + 1
+    }
+    return true
+  }
+  false
 }
 
 // `s` with the spaces around each ` | ` dropped, the form an annotation's union name takes.
@@ -55409,7 +55466,10 @@ function luDecl(
   pos: i32,
 ): i32 {
   let tr = -1
-  if ann >= 0 { tr = luAt(mkTypeRef(luSpell(ann), pos), site) }
+  if ann >= 0 {
+    tr = luAt(mkTypeRef(luSpell(ann), pos), site)
+    luAnnTy.set(tr, ann)
+  }
   luAt(mkLet(kw, name, tr, init, pos), site)
 }
 
@@ -55442,10 +55502,42 @@ function luChain(
   pos: i32,
 ): i32 {
   const arm = luArm(recv, idx, elem, site, pos)
-  if k >= ms.length - 1 { return arm }
+  // A union with a type parameter's list tests its last member too: a complement cannot
+  // narrow it, since the parameter may be the same list at the pin.
+  const open = luAnyTyVar(ms)
+  if k >= ms.length - 1 && !open { return arm }
   const test = luAt(mkIsExpr(luRef(recv, site, pos), luSpell(ms[k]), pos), site)
+  if k >= ms.length - 1 {
+    const tl: i32[] = []
+    tl.push(luAt(mkCall(luRef("__trap__", site, pos), [], pos), site))
+    return luAt(mkIf(test, arm, luAt(mkBlock(tl, pos), site), pos), site)
+  }
   const rest = luChain(ms, k + 1, recv, idx, elem, site, pos)
   luAt(mkIf(test, arm, rest, pos), site)
+}
+
+// Whether receiver `recv` of a union with members `ms` lowers at each pin: a type parameter's
+// list returned through a function value is not built as the union there, so its reads stay
+// refused rather than lowered over a value of another rep.
+function luRecvLowers(recv: i32, ms: i32[]): boolean {
+  if !luAnyTyVar(ms) { return true }
+  const r = P.nodes[peelParenIx(recv)]
+  if r is Call {
+    const f = P.nodes[r.callFn]
+    if f is Ident { return lookupFnDeclNode(f.identName) >= 0 }
+    return false
+  }
+  true
+}
+
+// Whether any of the members `ms` names a type parameter.
+function luAnyTyVar(ms: i32[]): boolean {
+  let i = 0
+  while i < ms.length {
+    if tyHasTyVar(ms[i]) { return true }
+    i = i + 1
+  }
+  false
 }
 
 // Sizes the node-keyed columns to the nodes the rewrite minted, so the real pass records them.
@@ -55476,7 +55568,7 @@ function luValueAt(site: i32, stmts: i32[], pos: i32) {
 function luLengthAt(n: Member, ix: i32, objTy: i32): i32 {
   if luOwnRecv(n.memObj) || (luWriteTgt[ix] ?? false) { return -1 }
   const ms = luMembers(objTy)
-  if ms.length == 0 { return -1 }
+  if ms.length == 0 || !luRecvLowers(n.memObj, ms) { return -1 }
   if inferQuiet { return symMem(ix, TY_I32) }
   if !luAllSpell(objTy, ms) { return -1 }
   const recv = "$lu" + i32ToStr(ix)
@@ -55493,7 +55585,7 @@ function luIndexAt(n: Index, ix: i32, arrTy: i32): i32 {
   if luWriteTgt[ix] ?? false { return -1 }
   if luOwnRecv(n.idxArr) { return -1 }
   const ms = luMembers(arrTy)
-  if ms.length == 0 { return -1 }
+  if ms.length == 0 || !luRecvLowers(n.idxArr, ms) { return -1 }
   const elem = luElemTy(ms)
   if elem < 0 { return -1 }
   if inferQuiet { return elem }
@@ -57120,7 +57212,8 @@ function checkForInNode(n: ForIn, ix: i32) {
   let elemTy = forInBindTy(iterTy, false)
   let elem2Ty = forInBindTy(iterTy, true)
   const it = T.tys[iterTy]
-  const luMs = luMembers(iterTy)
+  let luMs = luMembers(iterTy)
+  if !luRecvLowers(n.fiIter, luMs) { luMs = [] }
   const luElem = if luMs.length > 0 { luElemTy(luMs) } else { -1 }
   if luElem >= 0 {
     if !inferQuiet {
