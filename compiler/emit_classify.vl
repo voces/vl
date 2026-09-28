@@ -2006,7 +2006,7 @@ function globalIsStringSid(fnIx: i32, sid: i32) {
   if li < 0 { return false }
   // A `string | null` global reads as a string under narrowing: the global read recovers
   // non-null, and the `!= null` check reads the cell raw.
-  letIsString(li, -1) || letIsNulString(li, -1)
+  globalReadAsk(sid, li, 2)
 }
 
 function globalIsRefArraySid(fnIx: i32, sid: i32) {
@@ -15369,7 +15369,7 @@ function declaredI64(name: string) { declaredKind(name) == "i64" }
 function globalIsI64Sid(fnIx: i32, sid: i32) {
   const li = globalLetOfSidIn(fnIx, sid)
   if li < 0 { return false }
-  letIsI64(li, -1)
+  globalReadAsk(sid, li, 1)
 }
 
 // The unboxed scalar atom kind of a value-union null-coalesce `lhs ?? d` (`lhs` an ident
@@ -15810,7 +15810,7 @@ function declaredF64(name: string) { declaredKind(name) == "f64" }
 function globalIsF64Sid(fnIx: i32, sid: i32) {
   const li = globalLetOfSidIn(fnIx, sid)
   if li < 0 { return false }
-  letIsF64(li, -1)
+  globalReadAsk(sid, li, 0)
 }
 
 // True if evaluating `exprIx` yields an f64: a float `.` literal, a reference to an f64
@@ -21905,9 +21905,63 @@ function gckDrop() {
   if gckGen < 0 {
     gckHave = []
     gckVal = []
+    grStamp = []
+    grLet = []
+    grKnown = []
+    grVal = []
     gckGen = 1
   }
   gckStamp()
+}
+
+// ── the module-global read memo (D3051) ──────────────────────────────────────
+// Whether a global reads as an f64, an i64 or a string re-classifies its initializer, which
+// names earlier globals, so a const chain naming its predecessor twice is 2^depth walks. One
+// answer per global and question, under `globalCellKind`'s generation: same inputs, same pass.
+let grStamp: i32[] = []
+let grLet: i32[] = []
+let grKnown: i32[] = []
+let grVal: i32[] = []
+
+// `letIsF64` for `q == 0`, `letIsI64` for 1, and `letIsString` or `letIsNulString` for 2, of
+// the global `letIx` that `sid` names, memoised by its ordinal in `globalStmts`.
+function globalReadAsk(sid: i32, letIx: i32, q: i32): boolean {
+  if gckDepth == 0 {
+    if gckStale() { gckDrop() }
+  }
+  const gi = sidArrGet(globalIndexBySid, sid)
+  const bit = 1 << q
+  if gi >= 0 && gi < grStamp.length {
+    if grStamp[gi] == gckGen && grLet[gi] == letIx && (grKnown[gi] & bit) != 0 {
+      return (grVal[gi] & bit) != 0
+    }
+  }
+  gckDepth = gckDepth + 1
+  let v = false
+  if q == 0 { v = letIsF64(letIx, -1) }
+  else if q == 1 { v = letIsI64(letIx, -1) }
+  else { v = letIsString(letIx, -1) || letIsNulString(letIx, -1) }
+  gckDepth = gckDepth - 1
+  if gi >= 0 {
+    while grStamp.length <= gi {
+      grStamp.push(0)
+      grLet.push(-1)
+      grKnown.push(0)
+      grVal.push(0)
+    }
+    if grStamp[gi] != gckGen || grLet[gi] != letIx {
+      grStamp[gi] = gckGen
+      grLet[gi] = letIx
+      grKnown[gi] = 0
+      grVal[gi] = 0
+    }
+    grKnown[gi] = grKnown[gi] | bit
+    if v { grVal[gi] = grVal[gi] | bit }
+  }
+  if gckDepth == 0 {
+    if gckStale() { gckDrop() }
+  }
+  v
 }
 
 export function globalCellKind(letIx: i32): VKind {

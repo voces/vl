@@ -57,7 +57,12 @@ ROWS = [
                         "gckGenN"], "pass-stamped",
      ("    if gckHave[letIx] == gckGen { return gckVal[letIx] }",
       "    if false && gckHave[letIx] == gckGen { return gckVal[letIx] }")),
-    ("refArrShapeIndex", ["rasGen", "rasRowGen", "rasGenTy", "rasGenUV", "rasGenS",
+    # D3051: whether a global reads as an f64, i64 or string, one answer per global, on
+    # `globalCellKind`'s generation and so on its stamps, which that row already carries.
+    ("globalReadAsk", ["grStamp"], "pass-stamped",
+     ("    if grStamp[gi] == gckGen && grLet[gi] == letIx && (grKnown[gi] & bit) != 0 {",
+      "    if false && grStamp[gi] == gckGen && grLet[gi] == letIx && (grKnown[gi] & bit) != 0 {")),
+    ("refArrShapeIndex",["rasGen", "rasRowGen", "rasGenTy", "rasGenUV", "rasGenS",
                           "rasGenSF", "rasGenU", "rasGenV", "rasGenN", "rasGenP"],
      "pass-stamped",
      ("  if rasRowGen[slot] != rasGen { return false }",

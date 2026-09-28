@@ -38,6 +38,7 @@ tree ungraded.
 | memo | key reads | in-place-filled input after it can first be asked | verdict |
 | --- | --- | --- | --- |
 | `globalCellKind` | `tyMutEpoch`, `P.nodes.length`, 4 collect lengths, **`emitPassGen`** | `fRetKind` and its five siblings (D1655) | pass-stamped |
+| `globalReadAsk` (`grStamp`/`grKnown`/`grVal`, one row per global: whether a global reads as an f64, an i64 or a string, D3051) | `globalCellKind`'s generation, so the same stamps | the same inputs `globalCellKind`'s ladder reads, through the same `letIs*` predicates | pass-stamped |
 | `refArrShapeIndex` (`ras*`) | `tyMutEpoch`, `cUserTypesVer`, `P.nodes.length`, 4 collect lengths, **`emitPassGen`** | none named; the row also carries the arena epoch and the declared-type version, and the identity proof is the compiler's own codegen plus 3,045 corpus modules | pass-stamped |
 | `dsgReady` (declared-struct graph) | `emitRootIx`, `P.nodes.length` | none reachable: the `emitArenaFinal` gate means no pass runs after it is built | pass-stamped |
 | `rsIxReady` (a re-seated list's use index: parents and same-name identifier chains, D2914) | `emitRootIx`, `P.nodes.length` | none reachable: the `emitArenaFinal` gate means no pass runs after it is built; reset per program with the other sid-keyed tables | pass-stamped |
@@ -88,6 +89,7 @@ Readings on 2026-09-05, master `55f25c3e7`:
 | row | compiler's own self-compile | distilled corpus |
 | --- | --- | --- |
 | `globalCellKind` | byte-identical to master's fixpoint | no cell changed class |
+| `globalReadAsk` (graded 2026-09-28 on lane NG's tree) | byte-identical | no cell changed class |
 | `declaredStructGraph` | byte-identical | not run (see below) |
 | `variantSig` | byte-identical | not run |
 | `objVariantIndex` | byte-identical | not run |
