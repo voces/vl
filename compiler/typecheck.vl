@@ -1003,6 +1003,16 @@ let nlnMsg: string[] = []
 let nlnText: string[] = []
 let nlnDecl: i32[] = []
 let nlnUse: string[] = []
+// Per note: the slot a refused store wrote (`=` a scalar, `=[]` a whole list, `[]` an element,
+// `.f` a field; "" for a read), and the stored (element) type the note suggests.
+let nlnSlot: string[] = []
+let nlnWant: i32[] = []
+// The target and the value's type of the assignment whose refusal is being raised, or -1.
+let nlAsgTgt = -1
+let nlAsgGot = -1
+// While a compound assignment's value (`s + v` of `s += v`) is checked: that node and the target.
+let nlCmpdInner = -1
+let nlCmpdTgt = -1
 
 // The un-inferred empty-collection floor: an un-annotated empty `[]` / `Map()` / `Set()` whose
 // element/key/value hole is never pinned — by an annotation or a downstream `.push`/`.set`/
@@ -12786,6 +12796,12 @@ function isvalReset() {
   nlnText = []
   nlnDecl = []
   nlnUse = []
+  nlnSlot = []
+  nlnWant = []
+  nlAsgTgt = -1
+  nlAsgGot = -1
+  nlCmpdInner = -1
+  nlCmpdTgt = -1
   collRetFnNodes = []
   collapsedAliases = Map()
   annotCollapsed = Map()
@@ -12950,13 +12966,22 @@ function exprIsNumLit(ix: i32): boolean {
   e is NumLit
 }
 
-// Is `ix` a `let`/`const` with no annotation whose initializer is a numeric literal, or a
-// non-empty list literal of them?
+// Is `ix` a `let`/`const` with no annotation whose initializer is a numeric literal, a
+// non-empty list literal of them, or a record literal with a numeric-literal field?
 function letDeclIsUnannotNumLit(ix: i32): boolean {
   const n = P.nodes[ix]
   if n is LetDecl {
     if n.letType >= 0 || n.letInit < 0 { return false }
     const iv = P.nodes[parenPeelIx(n.letInit)]
+    if iv is ObjLit {
+      for fi in iv.objFields {
+        const f = P.nodes[fi]
+        if f is FieldInit {
+          if exprIsNumLit(f.fiValue) { return true }
+        }
+      }
+      return false
+    }
     if iv is ArrayLit {
       if iv.arrElems.length == 0 { return false }
       for el in iv.arrElems {
@@ -12969,12 +12994,13 @@ function letDeclIsUnannotNumLit(ix: i32): boolean {
   false
 }
 
-// Can a binding of type `ty` hold a defaulted numeric literal: `f64`, `i32`, or a list? The
-// cheap test every declaration pays before the initializer is read.
+// Can a binding of type `ty` hold a defaulted numeric literal: `f64`, `i32`, a list or a
+// record? The cheap test every declaration pays before the initializer is read.
 function numLitBindCandidateTy(ty: i32): boolean {
   if ty == TY_F64 || ty == TY_I32 { return true }
   if ty < 0 || ty >= T.tys.length { return false }
-  T.tys[ty] is TyArray
+  const t = T.tys[ty]
+  t is TyArray || t is TyObj
 }
 
 // Mark the binding `name` declared by `decl` at `depth` when `letDeclIsUnannotNumLit` holds.
@@ -13145,31 +13171,200 @@ function numLitDefaultNote(msg: string, at: i32, idIx: i32, decl: i32): string {
       let want = c
       if !viaIndex { want = c + list }
       if msgNamesTy(msg, want) {
-        const nm = demangleName(dn.letName)
-        return " — `"
-          + nm
-          + "` on "
-          + rcwWhere(decl, at)
-          + " has no annotation, so its literal defaulted to `"
-          + tyToStr(bt)
-          + "`; annotate it: `"
-          + exportKwOf(decl)
-          + dn.letKw
-          + " "
-          + nm
-          + ": "
-          + c
-          + list
-          + " = …`"
+        return numLitAnnotNote(dn, decl, at, bt, c + list)
       }
     }
   }
   ""
 }
 
+// The note naming declaration `decl` of binding `dn`, whose literal defaulted to `bt`, and the
+// annotation `ann` that fixes the mismatch raised at `at`.
+function numLitAnnotNote(
+  dn: LetDecl,
+  decl: i32,
+  at: i32,
+  bt: i32,
+  ann: string,
+): string {
+  const nm = demangleName(dn.letName)
+  " — `"
+    + nm
+    + "` on "
+    + rcwWhere(decl, at)
+    + " has no annotation, so its literal defaulted to `"
+    + tyToStr(bt)
+    + "`; annotate it: `"
+    + exportKwOf(decl)
+    + dn.letKw
+    + " "
+    + nm
+    + ": "
+    + ann
+    + " = …`"
+}
+
+// The source text of numeric literal `ix`, possibly negated once or parenthesised; `…` for any
+// other shape, which `exprIsNumLit` callers never pass.
+function numLitText(ix: i32): string {
+  const e = P.nodes[parenPeelIx(ix)]
+  let neg = ""
+  let lit = e
+  if e is Unary {
+    neg = "-"
+    lit = P.nodes[parenPeelIx(e.unArg)]
+  }
+  if lit is NumLit { return neg + lit.numText }
+  "…"
+}
+
+// Is every element of list literal `ix` a decimal literal in 0..255, so `u8[]` holds it?
+function numLitListIsBytes(ix: i32): boolean {
+  const l = P.nodes[parenPeelIx(ix)]
+  if l is ArrayLit {
+    for el in l.arrElems {
+      const e = P.nodes[parenPeelIx(el)]
+      if !(e is NumLit) { return false }
+      if e is NumLit {
+        const t = e.numText
+        if t.length == 0 || t.length > 3 { return false }
+        let v = 0
+        let k = 0
+        while k < t.length {
+          const c = t.charCodeAt(k)
+          if c < 48 || c > 57 { return false }
+          v = v * 10 + c - 48
+          k = k + 1
+        }
+        if v > 255 { return false }
+      }
+    }
+    return true
+  }
+  false
+}
+
+// Does a literal defaulted to primitive `base` also fit primitive `got`, so annotating the
+// declaration `got` fixes a refused store? `u8` only for a whole list of byte literals.
+function numLitFitsStore(
+  base: string,
+  got: string,
+  byteList: boolean,
+): boolean {
+  if base == "i32" {
+    return got == "i64"
+      || got == "f32"
+      || got == "f64"
+      || (got == "u8" && byteList)
+  }
+  base == "f64" && got == "f32"
+}
+
+// The note for the refused store into `nlAsgTgt` of a value typed `nlAsgGot`, when the target is
+// a numeric-literal binding written whole, through one index, or at one literal field, and the
+// literal also fits the stored type; queued with the slot and the suggested type.
+function numLitAsgNoteQueue(msg: string, di: i32) {
+  const tgt = parenPeelIx(nlAsgTgt)
+  if tgt < 0 || tgt >= P.nodes.length { return 0 }
+  let idIx = tgt
+  let slot = "="
+  let fname = ""
+  const tn = P.nodes[tgt]
+  if tn is Index {
+    idIx = parenPeelIx(tn.idxArr)
+    slot = "[]"
+  } else if tn is Member {
+    idIx = parenPeelIx(tn.memObj)
+    fname = tn.memProp
+    slot = "." + fname
+  }
+  if idIx < 0 || idIx >= P.nodes.length { return 0 }
+  const id = P.nodes[idIx]
+  if !(id is Ident) { return 0 }
+  if id is Ident {
+    const decl = numLitDeclOf(id.identName)
+    if decl < 0 { return 0 }
+    const dn = P.nodes[decl]
+    const bt = lookup(id.identName)
+    if bt < 0 || nlAsgGot < 0 { return 0 }
+    const btt = T.tys[bt]
+    const got = widenLitTy(nlAsgGot)
+    if got < 0 || got >= T.tys.length { return 0 }
+    if dn is LetDecl {
+      let base = bt
+      let gotBase = got
+      let list = ""
+      let fieldLit = -1
+      if btt is TyArray {
+        if btt.aRead != 0 || fname != "" { return 0 }
+        base = btt.aElem
+        list = "[]"
+        if slot == "=" {
+          const gt = T.tys[got]
+          if !(gt is TyArray) { return 0 }
+          if gt is TyArray { gotBase = gt.aElem }
+        }
+      } else if btt is TyObj {
+        if fname == "" { return 0 }
+        base = objFieldType(btt, fname)
+        const iv = P.nodes[parenPeelIx(dn.letInit)]
+        if iv is ObjLit {
+          for fi in iv.objFields {
+            const f = P.nodes[fi]
+            if f is FieldInit {
+              if f.fiName == fname && exprIsNumLit(f.fiValue) {
+                fieldLit = f.fiValue
+              }
+            }
+          }
+        }
+        if fieldLit < 0 { return 0 }
+      } else if slot != "=" {
+        return 0
+      }
+      const bn = primNameStr(primNameOf(base))
+      const gn = primNameStr(primNameOf(gotBase))
+      const bytes = slot == "=" && list != "" && numLitListIsBytes(dn.letInit)
+      if !numLitFitsStore(bn, gn, bytes) { return 0 }
+      // A `const` refuses the whole store already; annotating it would not help.
+      if slot == "=" && dn.letKw == "const" { return 0 }
+      let note = ""
+      if fieldLit >= 0 {
+        note = " — field `"
+          + demangleName(fname)
+          + "` of `"
+          + demangleName(dn.letName)
+          + "` on "
+          + rcwWhere(decl, nlAsgTgt)
+          + " has no annotation, so its literal defaulted to `"
+          + bn
+          + "`; write it `"
+          + demangleName(fname)
+          + ": "
+          + numLitText(fieldLit)
+          + " as "
+          + gn
+          + "`"
+      } else {
+        note = numLitAnnotNote(dn, decl, nlAsgTgt, bt, gn + list)
+      }
+      nlnDiag.push(di)
+      nlnMsg.push(msg)
+      nlnText.push(note)
+      nlnDecl.push(decl)
+      nlnUse.push(id.identName)
+      if list != "" && slot == "=" { slot = "=[]" }
+      nlnSlot.push(slot)
+      nlnWant.push(gotBase)
+    }
+  }
+  0
+}
+
 // Queue the note for the diagnostic about to be pushed at index `di`, if it has one.
 function numLitNoteQueue(msg: string, at: i32, di: i32) {
   if numLitBindName.length == 0 { return 0 }
+  if nlAsgTgt >= 0 { return numLitAsgNoteQueue(msg, di) }
   const idIx = numLitReadIdent(at)
   if idIx < 0 { return 0 }
   const id = P.nodes[idIx]
@@ -13183,6 +13378,8 @@ function numLitNoteQueue(msg: string, at: i32, di: i32) {
     nlnText.push(note)
     nlnDecl.push(decl)
     nlnUse.push(id.identName)
+    nlnSlot.push("")
+    nlnWant.push(-1)
   }
   0
 }
@@ -13193,25 +13390,158 @@ function exportKwOf(decl: i32): string {
   ""
 }
 
-// Append each queued note whose diagnostic survived, unless the binding is one
-// `numLitNamesStoredNonLit` finds a non-literal store to, under its declared or its used name.
+// Would the store of `v` into a slot annotated `want` be refused? A list value is compared by
+// element; an integer literal fits every numeric type, a float literal only a float.
+function numLitStoreRefused(v: i32, want: i32, wholeList: boolean): boolean {
+  let vt = nodeTyIxOf(parenPeelIx(v))
+  if vt < 0 || want < 0 { return false }
+  vt = widenLitTy(vt)
+  if vt < 0 || vt >= T.tys.length { return false }
+  if wholeList {
+    const vtt = T.tys[vt]
+    if P.nodes[parenPeelIx(v)] is ArrayLit {
+      if vtt is TyArray { vt = vtt.aElem } else { return false }
+    } else {
+      if vtt is TyArray { return !tySame(vtt.aElem, want) }
+      return false
+    }
+  }
+  if exprIsNumLit(v) { return vt == TY_F64 && want != TY_F32 && want != TY_F64 }
+  !assignable(vt, want)
+}
+
+// Drop the queued store notes (`nlnSlot` non-empty) whose suggested type another store to the
+// same binding and slot would be refused by: a whole or compound assignment, an element or
+// field assignment, or a `push`. By name, within the top-level statement that declares the
+// binding (anywhere, for a module-level one); one walk.
+function numLitAsgNotesRefuted(drop: boolean[]) {
+  const names: {[string]: boolean} = Map()
+  const declOwner: i32[] = []
+  let any = false
+  let j = 0
+  while j < nlnSlot.length {
+    declOwner.push(-1)
+    if nlnSlot[j] != "" {
+      names[nlnUse[j]] = true
+      any = true
+    }
+    j = j + 1
+  }
+  if !any { return 0 }
+  // Each store to a queued name: its name, slot, value, and the top-level statement it sits in.
+  const sName: string[] = []
+  const sSlot: string[] = []
+  const sVal: i32[] = []
+  const sOwner: i32[] = []
+  const stack: i32[] = []
+  const owners: i32[] = []
+  for s in gRootStmts {
+    stack.push(s)
+    owners.push(s)
+  }
+  while stack.length > 0 {
+    const ix = stack[stack.length - 1]
+    const own = owners[owners.length - 1]
+    stack.pop()
+    owners.pop()
+    let k0 = 0
+    while k0 < nlnDecl.length {
+      if nlnDecl[k0] == ix { declOwner[k0] = own }
+      k0 = k0 + 1
+    }
+    const n = P.nodes[ix]
+    let tn = ""
+    let slot = ""
+    let v = -1
+    if n is BinExpr {
+      if n.binOp == "=" {
+        const tgt = P.nodes[parenPeelIx(n.binLeft)]
+        tn = numLitNameAt(n.binLeft)
+        slot = "="
+        if tgt is Index {
+          tn = numLitNameAt(tgt.idxArr)
+          slot = "[]"
+        } else if tgt is Member {
+          tn = numLitNameAt(tgt.memObj)
+          slot = "." + tgt.memProp
+        }
+        v = numLitAssignedValue(n)
+      }
+    } else if n is Call {
+      const cf = P.nodes[parenPeelIx(n.callFn)]
+      if cf is Member && cf.memProp == "push" && n.callArgs.length > 0 {
+        tn = numLitNameAt(cf.memObj)
+        slot = "[]"
+        v = n.callArgs[0]
+      }
+    }
+    if tn != "" && (names[tn] ?? false) {
+      sName.push(tn)
+      sSlot.push(slot)
+      sVal.push(v)
+      sOwner.push(own)
+    }
+    for c in nodeChildren(ix) {
+      if c >= 0 && c < P.nodes.length {
+        stack.push(c)
+        owners.push(own)
+      }
+    }
+  }
+  let k = 0
+  while k < nlnSlot.length {
+    const ks = nlnSlot[k]
+    // A module-level declaration is its own top-level statement, and any store may reach it.
+    const scoped = declOwner[k] >= 0 && declOwner[k] != nlnDecl[k]
+    let si = 0
+    while ks != "" && si < sName.length {
+      if sName[si] == nlnUse[k] && (!scoped || sOwner[si] == declOwner[k]) {
+        // A list's note (`[]` or `=[]`) is refuted by an element store or a whole one.
+        const slot = sSlot[si]
+        const listNote = ks == "[]" || ks == "=[]"
+        let hit = false
+        if listNote && (slot == "=" || slot == "[]") {
+          hit = numLitStoreRefused(sVal[si], nlnWant[k], slot == "=")
+        } else if ks == slot {
+          hit = numLitStoreRefused(sVal[si], nlnWant[k], false)
+        }
+        if hit { drop[k] = true }
+      }
+      si = si + 1
+    }
+    k = k + 1
+  }
+  0
+}
+
+// Append each queued note whose diagnostic survived. A read's note is dropped when
+// `numLitNamesStoredNonLit` finds a non-literal store to the binding, under its declared or its
+// used name; a store's note when `numLitAsgNotesRefuted` finds a store its annotation refuses.
 function numLitNotesApply() {
   if nlnDiag.length == 0 { return 0 }
   const names: {[string]: boolean} = Map()
+  const drop: boolean[] = []
   let j = 0
   while j < nlnDiag.length {
-    names[nlnUse[j]] = true
-    const dj = P.nodes[nlnDecl[j]]
-    if dj is LetDecl { names[dj.letName] = true }
+    drop.push(false)
+    if nlnSlot[j] == "" {
+      names[nlnUse[j]] = true
+      const dj = P.nodes[nlnDecl[j]]
+      if dj is LetDecl { names[dj.letName] = true }
+    }
     j = j + 1
   }
   const stored = numLitNamesStoredNonLit(names)
+  numLitAsgNotesRefuted(drop)
   let i = 0
   while i < nlnDiag.length {
     const di = nlnDiag[i]
     const dn = P.nodes[nlnDecl[i]]
-    let keep = di >= 0 && di < T.diags.length && !(stored[nlnUse[i]] ?? false)
-    if keep && dn is LetDecl { keep = !(stored[dn.letName] ?? false) }
+    let keep = di >= 0 && di < T.diags.length && !drop[i]
+    if nlnSlot[i] == "" {
+      keep = keep && !(stored[nlnUse[i]] ?? false)
+      if keep && dn is LetDecl { keep = !(stored[dn.letName] ?? false) }
+    }
     if keep {
       const d = T.diags[di]
       if d.tmsg == nlnMsg[i] { d.tmsg = d.tmsg + nlnText[i] }
@@ -49491,7 +49821,15 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
       tpIfMarkOk(n.binRight)
     }
   }
+  const savedCmpdInner = nlCmpdInner
+  const savedCmpdTgt = nlCmpdTgt
+  if op == "=" && n.binCompound != "" {
+    nlCmpdInner = parenPeelIx(n.binRight)
+    nlCmpdTgt = n.binLeft
+  }
   let rt = checkNode(n.binRight)
+  nlCmpdInner = savedCmpdInner
+  nlCmpdTgt = savedCmpdTgt
   asgOpenElemRow = savedAsgRow
   // The right operand takes the same answer, for the same reason: without it, an operator's
   // annotated face runs while the un-annotated one is check-clean invalid wasm (D1566).
@@ -49746,7 +50084,10 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
     // argument, or typed return already does — runs before `assignableExpr` so the pin applies first.
     constrainEmptyExpr(n.binRight, rt, asgLt)
     mapStoreValPin(n.binLeft, asgLt)
+    nlAsgTgt = n.binLeft
+    nlAsgGot = rt
     const asgFits = assignableExpr(n.binRight, rt, asgLt)
+    nlAsgTgt = -1
     const asgOk = asgFits
       && !writeLeavesLoopEntry(n.binLeft, asgLitRhsTy(ix, asgLt, rt))
     lwStoreDst = -1
@@ -49754,7 +50095,10 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
       if asgFits || asgBarred || (asgDcl >= 0 && writeBarredByLoop(n.binLeft)) {
         writeBarredErr(placeKeyOf(n.binLeft), ix)
       } else {
+        nlAsgTgt = n.binLeft
+        nlAsgGot = rt
         tErr(letAssignMsg(n.binRight, rt, asgLt, ""), n.binRight)
+        nlAsgTgt = -1
       }
     } else {
       // The same vacuous-gate check covers three write spellings (`r = e`, `b.v = e`,
@@ -50149,10 +50493,16 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
   // done before the same-type check so a compatible mixed pair is accepted (B2).
   if mixesNumeric(lt, rt) { return widerNumeric(lt, rt) }
   if !sameNumeric(lt, rt) {
+    // A compound assignment's operand the target's defaulted literal does not mix with.
+    if ix == nlCmpdInner {
+      nlAsgTgt = nlCmpdTgt
+      nlAsgGot = rt
+    }
     tErr(
       "operator '" + op + "' mixes " + tyToStr(lt) + " and " + tyToStr(rt),
       ix,
     )
+    nlAsgTgt = -1
     return TY_ERR
   }
   return lt
