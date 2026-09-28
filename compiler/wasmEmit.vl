@@ -111,6 +111,7 @@ import {
   simdRowSig,
   truncSatFromF64,
   truncSatOp,
+  tyArrayElemPrimName,
   tyIsLitUnion,
   tyIsLitUnionArray,
   tyIsLitUnionOrLit,
@@ -7394,6 +7395,8 @@ function emitArrSpread(body: u8[], arrIx: i32, fnIx: i32) {
   const a = P.nodes[arrIx]
   if a is ArrayLit {
     const elems = a.arrElems
+    const boxRow = spreadBoxDestRow(elems, fnIx)
+    if boxRow >= 0 { return emitArrSpreadBoxed(body, arrIx, boxRow, fnIx) }
     const boxSrc = spreadBoxingSource(arrIx, fnIx)
     if boxSrc >= 0 {
       return emitFailAt(
@@ -7476,57 +7479,219 @@ function emitArrSpread(body: u8[], arrIx: i32, fnIx: i32) {
       fbLocalSet(gs)
       g = g + 1
     }
-    pendingListKind = LBK_I32_LIST
-    pendingListSlot = 0
-    const totL = widenTmpSlot(2000 + 2 * seq)
-    const offL = widenTmpSlot(2001 + 2 * seq)
-    const dstL = spreadDstBackSlot(kk, row, seq)
-    fbI32Const(0)
-    fbLocalSet(totL)
-    let t = 0
-    while t < slots.length {
-      fbLocalGet(totL)
-      fbLocalGet(slots[t])
-      fbStructGet(wrap, 1) // the group's logical length
-      fbI32Bin(106)        // 0x6a i32.add
-      fbLocalSet(totL)
-      t = t + 1
-    }
-    fbLocalGet(totL)
-    fbArrayNewDefault(back)
-    fbLocalSet(dstL)
-    // The result wrapper is built FIRST and left on the stack, so the `array.copy` runs below
-    // consume their own operands and nothing has to re-read it — `emitArrSlice`'s discipline.
-    // The backing rides a NULLABLE frame slot and the wrapper's field is not, so it recovers.
-    fbLocalGet(dstL)
-    wU8(212) // 0xd4 ref.as_non_null
-    fbLocalGet(totL)
-    fbLocalGet(totL)
-    fbStructNew(wrap)
-    fbI32Const(0)
-    fbLocalSet(offL)
-    let c = 0
-    while c < slots.length {
-      fbLocalGet(dstL)     // dest backing
-      fbLocalGet(offL)     // dest offset
-      fbLocalGet(slots[c])
-      fbStructGet(wrap, 0) // src backing
-      fbI32Const(0)        // src offset
-      fbLocalGet(slots[c])
-      fbStructGet(wrap, 1) // count
-      fbArrayCopy(back, back)
-      if c + 1 < slots.length {
-        fbLocalGet(offL)
-        fbLocalGet(slots[c])
-        fbStructGet(wrap, 1)
-        fbI32Bin(106) // i32.add
-        fbLocalSet(offL)
-      }
-      c = c + 1
-    }
-    return 0
+    return spreadJoinGroups(slots, wrap, back, kk, row, seq)
   }
   emitFail("emitProgram: expected an array literal")
+}
+
+// Join a spread literal's item groups, each already a list at (`kk`, `row`) in its own frame
+// slot: allocate the destination once, then one `array.copy` per group in source order.
+function spreadJoinGroups(
+  slots: i32[],
+  wrap: i32,
+  back: i32,
+  kk: MfKind,
+  row: i32,
+  seq: i32,
+) {
+  pendingListKind = LBK_I32_LIST
+  pendingListSlot = 0
+  const totL = widenTmpSlot(2000 + 2 * seq)
+  const offL = widenTmpSlot(2001 + 2 * seq)
+  const dstL = spreadDstBackSlot(kk, row, seq)
+  fbI32Const(0)
+  fbLocalSet(totL)
+  let t = 0
+  while t < slots.length {
+    fbLocalGet(totL)
+    fbLocalGet(slots[t])
+    fbStructGet(wrap, 1) // the group's logical length
+    fbI32Bin(106)        // 0x6a i32.add
+    fbLocalSet(totL)
+    t = t + 1
+  }
+  fbLocalGet(totL)
+  fbArrayNewDefault(back)
+  fbLocalSet(dstL)
+  // The result wrapper is built FIRST and left on the stack, so the `array.copy` runs below
+  // consume their own operands and nothing has to re-read it — `emitArrSlice`'s discipline.
+  // The backing rides a NULLABLE frame slot and the wrapper's field is not, so it recovers.
+  fbLocalGet(dstL)
+  wU8(212) // 0xd4 ref.as_non_null
+  fbLocalGet(totL)
+  fbLocalGet(totL)
+  fbStructNew(wrap)
+  fbI32Const(0)
+  fbLocalSet(offL)
+  let c = 0
+  while c < slots.length {
+    fbLocalGet(dstL)     // dest backing
+    fbLocalGet(offL)     // dest offset
+    fbLocalGet(slots[c])
+    fbStructGet(wrap, 0) // src backing
+    fbI32Const(0)        // src offset
+    fbLocalGet(slots[c])
+    fbStructGet(wrap, 1) // count
+    fbArrayCopy(back, back)
+    if c + 1 < slots.length {
+      fbLocalGet(offL)
+      fbLocalGet(slots[c])
+      fbStructGet(wrap, 1)
+      fbI32Bin(106) // i32.add
+      fbLocalSet(offL)
+    }
+    c = c + 1
+  }
+  0
+}
+
+// The union-box list row a spread literal builds at when its destination threaded one
+// (`const q: (i32 | null)[] = [...ints]`) and some spread source is another list, whose
+// elements are then each boxed; -1 otherwise, including when nothing threaded (D2869).
+function spreadBoxDestRow(elems: i32[], fnIx: i32): i32 {
+  if pendingListKind != LBK_UNION { return -1 }
+  const row = pendingListSlot
+  if row < 0 || row >= rlElemKindTbl.length || row >= rlElemName.length {
+    return -1
+  }
+  if rlElemKindTbl[row] != RLK_UNION { return -1 }
+  let boxes = false
+  let i = 0
+  while i < elems.length {
+    const src = spreadArgOf(elems[i])
+    if src >= 0 {
+      const sb = spreadSrcBoxes(src, row, fnIx)
+      if sb < 0 { return -1 }
+      if sb == 1 { boxes = true }
+    }
+    i = i + 1
+  }
+  if boxes { return row }
+  -1
+}
+
+// How spread source `src` reaches union-box row `row`: 1 boxed per element (a scalar list whose
+// element is a member, a record list the element-converting copy widens), 0 a list of that row,
+// -1 neither, which keeps the plain backing copy (a union-box list shares the backing).
+function spreadSrcBoxes(src: i32, row: i32, fnIx: i32): i32 {
+  if row < 0 || row >= rlElemName.length { return -1 }
+  const k = mfRecvKindOf(src, fnIx)
+  if k == null || k == "u8" { return -1 }
+  if k == "ref" {
+    const s = refListSlotOfExpr(src, fnIx)
+    if s == row { return 0 }
+    if s < 0 || s >= rlElemKindTbl.length { return -1 }
+    if rlElemKindTbl[s] == RLK_UNION { return -1 }
+    if rlWidenVariantOf(s, row) < 0 { return -1 }
+    return 1
+  }
+  const ak = spreadSrcAtomKind(src)
+  if ak < 0 || !unionHasAtomKindArm(rlElemName[row], ak) { return -1 }
+  1
+}
+
+// The value atom a scalar list `src`'s element boxes under, or -1 when its element is none.
+function spreadSrcAtomKind(src: i32): i32 {
+  const pn = tyArrayElemPrimName(nodeTyIxOf(src))
+  if pn == "" { return -1 }
+  const k = valueAtomKind(pn)
+  if k < 0 || k > 5 { return -1 }
+  k
+}
+
+// `emitArrSpread` for a destination list of union boxes: a same-row source copies as it is,
+// a record list is boxed by the element-converting copy, a scalar list by its boxing sibling,
+// and a plain run builds at the row; the groups then join as every spread's do.
+function emitArrSpreadBoxed(body: u8[], arrIx: i32, row: i32, fnIx: i32) {
+  const a = P.nodes[arrIx]
+  if !(a is ArrayLit) {
+    return emitFail("emitProgram: expected an array literal")
+  }
+  const kk: MfKind = "ref"
+  const wrap = spreadWrapIdx(kk, row)
+  const back = spreadBackIdx(kk, row)
+  if wrap < 0 || back < 0 {
+    return emitFail("emitProgram: spread literal but list type not collected")
+  }
+  const groups: i32[] = []
+  const isSrc: boolean[] = []
+  let run: i32[] = []
+  let i = 0
+  while i < a.arrElems.length {
+    const src = spreadArgOf(a.arrElems[i])
+    if src >= 0 {
+      if run.length > 0 {
+        groups.push(spreadRunLit(run, arrIx, a.pos))
+        isSrc.push(false)
+        run = []
+      }
+      groups.push(src)
+      isSrc.push(true)
+    } else {
+      run.push(a.arrElems[i])
+    }
+    i = i + 1
+  }
+  if run.length > 0 {
+    groups.push(spreadRunLit(run, arrIx, a.pos))
+    isSrc.push(false)
+  }
+  const seq = liKinds.length
+  const slots: i32[] = []
+  let g = 0
+  while g < groups.length {
+    if emitSpreadGroupBoxed(body, groups[g], isSrc[g], row, fnIx) < 0 {
+      return -1
+    }
+    const gs = spreadGroupWrapSlot(kk, row, seq + g)
+    slots.push(gs)
+    fbLocalSet(gs)
+    g = g + 1
+  }
+  spreadJoinGroups(slots, wrap, back, kk, row, seq)
+}
+
+// One group of `emitArrSpreadBoxed`, left on the stack as a list at union-box row `row`.
+function emitSpreadGroupBoxed(
+  body: u8[],
+  grp: i32,
+  isSrc: boolean,
+  row: i32,
+  fnIx: i32,
+): i32 {
+  pendingListKind = LBK_UNION
+  pendingListSlot = row
+  if !isSrc { return emitExpr(body, grp, fnIx) }
+  const k = mfRecvKindOf(grp, fnIx)
+  if k == "ref" {
+    const s = refListSlotOfExpr(grp, fnIx)
+    pendingListKind = LBK_REF
+    pendingListSlot = s
+    if emitExpr(body, grp, fnIx) < 0 { return -1 }
+    if s == row { return 0 }
+    if rlWidenVariantOf(s, row) < 0 {
+      return emitFailAt(
+        "emitProgram: a boxing spread reached a source `spreadSrcBoxes` does not admit",
+        grp,
+      )
+    }
+    return emitRefListWidenTop(body, s, row)
+  }
+  const ak = spreadSrcAtomKind(grp)
+  let un = ""
+  if row >= 0 && row < rlElemName.length { un = rlElemName[row] }
+  // Unreachable past `spreadSrcBoxes`, which admits only a scalar source whose element is a
+  // member; a widening source (`i32` into `(f64 | null)[]`) keeps the plain copy (D2882).
+  if k == null || k == "u8" || ak < 0 || !unionHasAtomKindArm(un, ak) {
+    return emitFailAt(
+      "emitProgram: a boxing spread reached a source `spreadSrcBoxes` does not admit",
+      grp,
+    )
+  }
+  pendingListKind = pendingKindOfMf(k, 0)
+  pendingListSlot = 0
+  if emitExpr(body, grp, fnIx) < 0 { return -1 }
+  emitScalarListBoxTop(spreadScalarVKind(k), ak, row)
 }
 
 // The element kind group `g` of a spread literal building at `kk` is emitted at: a spread
@@ -20762,6 +20927,75 @@ function emitScalarListWidenTop(_body: u8[], srcKind: VKind, dstKind: VKind) {
   fbEnd()
   // { backing, len, cap } — field 0 is a NON-null ref, so the nullable frame slot
   // recovers here and only here. `cap == len`: the copy is exact-sized.
+  fbLocalGet(dL)
+  wU8(212) // 0xd4 ref.as_non_null
+  fbLocalGet(nL)
+  fbLocalGet(nL)
+  fbStructNew(dstWrap)
+  0
+}
+
+// Consume a scalar list of `srcKind` on the stack and leave a `(ref $rlWrapIdx[dstSlot])` whose
+// union-box elements each hold one source element under value atom `atomK`'s tag: the boxing
+// sibling of `emitScalarListWidenTop`, for a spread into a list of a union element (D2869).
+function emitScalarListBoxTop(srcKind: VKind, atomK: i32, dstSlot: i32) {
+  let vb = -1
+  if atomK != 2 {
+    vb = vbHeapIdxOfKind(atomK)
+    if vb < 0 {
+      return emitFail(
+        "emitProgram: a spread boxing a scalar list has no value box for its element",
+      )
+    }
+  }
+  if dstSlot < 0 || dstSlot >= rlWrapIdx.length || dstSlot >= rlBackIdx.length {
+    return emitFail(
+      "emitProgram: a spread boxing a scalar list has no destination row",
+    )
+  }
+  const srcWrap = scalarListWrap(srcKind)
+  const srcBack = scalarListBack(srcKind)
+  const dstWrap = rlWrapIdx[dstSlot]
+  const dstBack = rlBackIdx[dstSlot]
+  let sk = scalarElemMfKind(srcKind)
+  if srcKind == "str" { sk = "str" }
+  const sL = widenScalarWrapSlot(sk)
+  const dL = widenDstBackSlot(dstSlot)
+  const iL = widenTmpSlot(0)
+  const nL = widenTmpSlot(1)
+  fbLocalSet(sL)
+  fbLocalGet(sL)
+  fbStructGet(srcWrap, 1)
+  fbLocalSet(nL)
+  fbLocalGet(nL)
+  fbArrayNewDefault(dstBack)
+  fbLocalSet(dL)
+  fbI32Const(0)
+  fbLocalSet(iL)
+  // block { loop { if i >= n br 1; back[i] = {tag, box(src.back[i])}; i++; br 0 } }
+  fbBlock(64)
+  fbLoop(64)
+  fbLocalGet(iL)
+  fbLocalGet(nL)
+  fbI32Bin(78) // 0x4e i32.ge_s
+  fbBrIf(1)
+  fbLocalGet(dL)
+  fbLocalGet(iL)
+  fbI32Const(scalarTagOfKind(atomK))
+  fbLocalGet(sL)
+  fbStructGet(srcWrap, 0)
+  fbLocalGet(iL)
+  fbArrayGet(srcBack)
+  if vb >= 0 { fbStructNew(vb) }
+  fbStructNew(uBoxIdx)
+  fbArraySet(dstBack)
+  fbLocalGet(iL)
+  fbI32Const(1)
+  fbI32Bin(106) // 0x6a i32.add
+  fbLocalSet(iL)
+  fbBr(0)
+  fbEnd()
+  fbEnd()
   fbLocalGet(dL)
   wU8(212) // 0xd4 ref.as_non_null
   fbLocalGet(nL)
