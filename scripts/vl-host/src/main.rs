@@ -604,6 +604,7 @@ hints only for the file(s) you name, unless asked for (below).
   {c}--include-imports{r}   Report warnings and hints inside the modules a named file
                       imports too. Without it they are withheld (a count is
                       printed); each module reports its own when checked.
+                      std: stays hidden unless --include-std is also passed.
   {c}--include-std{r}       Report warnings and hints inside imported std: modules
                       too. Without it they are withheld (a count is printed) —
                       nothing in std is yours to fix. std ERRORS are always

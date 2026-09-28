@@ -152,6 +152,14 @@ GRAPH_RC=0
 wait "$GRAPH_PID" || GRAPH_RC=$?
 cat "$WORK/graph.log"
 [ "$GRAPH_RC" = 0 ] || exit "$GRAPH_RC"
+# Coverage guard: the graph run must attribute findings to more than the entry. Without
+# `--include-imports` every import's findings are withheld and this run would pass on
+# zero findings having linted nothing but entry.vl.
+GRAPH_FILES=$("$PY" -c 'import json,sys; print(len({d["file"] for d in json.load(open(sys.argv[1]))}))' "$WORK/graph.json")
+if [ "$GRAPH_FILES" -lt 2 ]; then
+  echo "self-lint: the compiler graph run named $GRAPH_FILES file(s); expected the whole module graph — is --include-imports still passed?"
+  exit 1
+fi
 [ "$FMT_RC" = 0 ] || exit "$FMT_RC"
 
 echo "self-lint + fmt-check clean ✅"
