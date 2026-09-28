@@ -49002,6 +49002,11 @@ export function valueAtomKind(name: string) {
   if name == "null" { return 6 }
   // Appended: codes double as tag offsets, so the vector takes the next free one.
   if name == "v128" { return 14 }
+  // A view and its list are one rep, so they are one atom (D2887).
+  if name.length > 9 && name[0] == 'r' {
+    const roIn = roListInnerName(name)
+    if roIn != "" { return valueAtomKind(roIn) }
+  }
   // A list member of a value union (`i32[] | string`) is a ref atom — the union box's `value`
   // field holds the wrapper ref directly, so each list type needs its own distinct tag code.
   const elem = arrElemNameRaw(name)
@@ -55369,8 +55374,8 @@ function luOwnRecv(recv: i32): boolean {
 }
 
 // The members of `ty` when it is a union of two or more lists, otherwise empty. Not over a
-// type parameter's list (D2876), a readonly list (D2887) or a literal element (D2886), whose
-// narrowed reads do not lower; nor under a pinned re-check, whose body instances share.
+// type parameter's list (D2876), a literal element (D2886), or a readonly member beside any
+// member holding a readonly list (D2913), whose reads do not lower; nor under a pinned re-check.
 function luMembers(ty: i32): i32[] {
   const none: i32[] = []
   if ty < 0 || monoRecheckDepth > 0 { return none }
@@ -55378,21 +55383,52 @@ function luMembers(ty: i32): i32[] {
   if t is TyUnion {
     if t.uMembers.length < 2 { return none }
     let i = 0
+    let anyRo = false
+    let anyView = false
     while i < t.uMembers.length {
       const m = t.uMembers[i]
       if m < 0 { return none }
       const mt = T.tys[m]
       if mt is TyArray {
-        if mt.aElem < 0 || mt.aRead == 1 { return none }
+        if mt.aElem < 0 { return none }
         if luHasLit(mt.aElem, 8) { return none }
+        if mt.aRead == 1 { anyRo = true }
+        if luHasView(mt.aElem, 8) { anyView = true }
       } else {
         return none
       }
       i = i + 1
     }
+    if anyRo && anyView { return none }
     return t.uMembers
   }
   none
+}
+
+// Whether `ty` is or holds a readonly list, through a list, a nullable or a union.
+function luHasView(ty: i32, depth: i32): boolean {
+  if ty < 0 || depth <= 0 { return false }
+  const t = T.tys[ty]
+  match t {
+    TyArray => {
+      t.aRead == 1 || luHasView(t.aElem, depth - 1)
+    }
+    TyNullable => {
+      luHasView(t.nInner, depth - 1)
+    }
+    TyUnion => {
+      let hit = false
+      let i = 0
+      while i < t.uMembers.length {
+        if luHasView(t.uMembers[i], depth - 1) { hit = true }
+        i = i + 1
+      }
+      hit
+    }
+    TyPrim | TyErr | TyObj | TyVar | TyNeg | TyMap | TyLit | TyFunc => {
+      false
+    }
+  }
 }
 
 // Whether `ty` is or holds a literal type, through a nullable or a union.
