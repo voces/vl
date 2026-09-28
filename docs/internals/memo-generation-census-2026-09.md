@@ -27,7 +27,7 @@ tree ungraded.
 
 | verdict | rows | what it means |
 | --- | --- | --- |
-| `pass-stamped` | 5 | the key reads `emitPassGen`, or a phase flag that is one |
+| `pass-stamped` | 6 | the key reads `emitPassGen`, or a phase flag that is one |
 | `no-refined-input` | 3 | every table its value reads is push-only or reset wholesale |
 | `resume-reseeds` | 2 | a resume bank that writes the refined columns back before reusing them |
 | `not-a-memo` | 9 | a visit mark or a per-row flag — no cached ANSWER to go stale |
@@ -41,6 +41,7 @@ tree ungraded.
 | `refArrShapeIndex` (`ras*`) | `tyMutEpoch`, `cUserTypesVer`, `P.nodes.length`, 4 collect lengths, **`emitPassGen`** | none named; the row also carries the arena epoch and the declared-type version, and the identity proof is the compiler's own codegen plus 3,045 corpus modules | pass-stamped |
 | `dsgReady` (declared-struct graph) | `emitRootIx`, `P.nodes.length` | none reachable: the `emitArenaFinal` gate means no pass runs after it is built | pass-stamped |
 | `rsIxReady` (a re-seated list's use index: parents and same-name identifier chains, D2914) | `emitRootIx`, `P.nodes.length` | none reachable: the `emitArenaFinal` gate means no pass runs after it is built; reset per program with the other sid-keyed tables | pass-stamped |
+| `objLitBindDestRow` (`rsRecRow`, a record literal's re-seated row, D2933; `rsLetDst` beside it for a list's) | `sNames.length`, and the use index's reset | none reachable: answered only once `emitArenaFinal` is set, and both reset with the use index they read | pass-stamped |
 | `dslEnsure` (a scope's lambda bindings and named calls, D2748) | `dslRoot` (the scope), `dslLen` | none reachable: kept only once `emitArenaFinal` is set, rebuilt per query before | pass-stamped |
 | `variantSig` | `uFieldNames`/`uFieldStart`/`uFieldCount` lengths | none: it reads field NAMES, and all three tables are push-only | no-refined-input |
 | `objVariantIndex` (`ovn*`) | `uVariants`/`uFieldStart`/`uFieldCount` lengths | none, the same three tables through `variantSig` | no-refined-input |

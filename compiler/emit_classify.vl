@@ -12030,7 +12030,10 @@ export function anonLeafJoinRowOf(objIx: i32, si: i32): i32 {
 }
 
 export function structIndexOfObjCtx(objIx: i32, fnIx: i32) {
-  anonLeafJoinRowOf(objIx, structIndexOfObjCtxMemo(objIx, fnIx))
+  const own = anonLeafJoinRowOf(objIx, structIndexOfObjCtxMemo(objIx, fnIx))
+  const dst = objLitBindDestRow(objIx, own)
+  if dst >= 0 { return dst }
+  own
 }
 
 function structIndexOfObjCtxMemo(objIx: i32, fnIx: i32) {
@@ -37032,7 +37035,8 @@ function letRecordListDestSlot(letIx: i32, fnIx: i32): i32 {
       }
       const own = rlSlotByName(arrLitElemNameIn(ai, fnIx))
       if !rlSlotIsKindList(own, RLK_STRUCT) { return -1 }
-      const dst = letRefListDestSlotK(letIx, fnIx, RLK_STRUCT)
+      let dst = letRefListDestSlotK(letIx, fnIx, RLK_STRUCT)
+      if dst < 0 { dst = rsElemListDestSlot(letIx, fnIx, own) }
       if dst < 0 || dst == own { return -1 }
       if rsRowsDiffer(dst, own) {
         const built = rsFirstBuiltElem(ini.arrElems)
@@ -37134,12 +37138,15 @@ function rsNarrowUseRefuse(letIx: i32, fnIx: i32, nm: string, dst: i32) {
     rwOwnLet: letIx,
     rwName: nm,
     rwElem: false,
-    rwDst: dst,
+    rwRow: rsSlotRow(dst),
     rwList: nm,
     rwHome: rsFrameOf(letIx),
+    rwCall: false,
   }
+  rsSibHit = -1
   const bad = rsUsesOf(w, 0)
   if bad < 0 { return 0 }
+  if bad == rsSibHit { return rsBuiltElemFail(bad, dst) }
   emitFailAt(
     "emitProgram: this list is built as `"
       + rlElemName[dst]
@@ -37153,17 +37160,250 @@ function rsNarrowUseRefuse(letIx: i32, fnIx: i32, nm: string, dst: i32) {
   0
 }
 
+// The struct row an un-annotated binding of the object literal at `objIx` is built at, or -1
+// to keep `own`: a declared destination's record of the literal's field names, when the
+// literal's own record would reach it unconverted (D2933). Memoised per literal in `rsRecRow`.
+export function objLitBindDestRow(objIx: i32, own: i32): i32 {
+  if own < 0 || objIx < 0 || !emitArenaFinal { return -1 }
+  if rsRecVer != sNames.length {
+    rsRecRow = []
+    rsRecVer = sNames.length
+  }
+  if objIx < rsRecRow.length {
+    if rsRecRow[objIx] != -2 { return rsRecRow[objIx] }
+  }
+  let r = -1
+  if objLitNamesTwoRows(objIx) && rsIxReady() {
+    rsRecRowPut(objIx, -1)
+    r = objLitBindDestRowGo(objIx, own)
+  }
+  rsRecRowPut(objIx, r)
+  r
+}
+
+function rsRecRowPut(objIx: i32, r: i32) {
+  while rsRecRow.length <= objIx { rsRecRow.push(-2) }
+  rsRecRow[objIx] = r
+  0
+}
+
+// Re-seats the binding only where a use hands it to another row and every use then reads that
+// row; a binding that one use needs at each row is refused, since a record is shared.
+function objLitBindDestRowGo(objIx: i32, own: i32): i32 {
+  const li = rsUp(objIx)
+  if li < 0 || li >= P.nodes.length || !rsLetInitIs(li, objIx) { return -1 }
+  const d = P.nodes[li]
+  if d is LetDecl {
+    const fr = rsFrameOf(li)
+    const scopeIx = dsScopeRootOf(li, d.letName, fr)
+    if scopeIx < 0 { return -1 }
+    const w: RsWalk = {
+      rwScope: scopeIx,
+      rwOwnLet: li,
+      rwName: d.letName,
+      rwElem: true,
+      rwRow: own,
+      rwList: "",
+      rwHome: fr,
+      rwCall: false,
+    }
+    const bad = rsUsesOf(w, 0)
+    if bad < 0 { return -1 }
+    const dst = rsElemDestRow(bad)
+    if dst < 0 || rsSameRow(dst, own) || !rsRowNamesObjLit(dst, objIx) {
+      return -1
+    }
+    // A row a `??` merge moved is read at the merged row, which a checked type does not name.
+    if anonLeafSupersedeOf(dst) != dst || anonLeafSupersedeOf(own) != own {
+      return -1
+    }
+    const wd: RsWalk = {
+      rwScope: scopeIx,
+      rwOwnLet: li,
+      rwName: d.letName,
+      rwElem: true,
+      rwRow: dst,
+      rwList: "",
+      rwHome: fr,
+      rwCall: false,
+    }
+    const bad2 = rsUsesOf(wd, 0)
+    if bad2 < 0 { return dst }
+    emitFailAt(
+      "emitProgram: this record is handed on here at its own type, and elsewhere to a "
+        + "declared record type of the same field names that stores them differently; a "
+        + "record is shared, not converted, so the program is type-valid but cannot build. "
+        + "Annotate the binding with the type this use needs, or build a second literal",
+      bad2,
+    )
+  }
+  -1
+}
+
+// The struct row the record value at `vx` is delivered to by a declared type, or -1: a typed
+// destination's, a field's of the object literal holding it, or an annotated list literal's
+// element.
+function rsElemDestRow(vx: i32): i32 {
+  const r = structIdxOfElemTy(rsElemDestTy(vx))
+  if r >= 0 { return r }
+  const par = rsUp(vx)
+  if par < 0 || par >= P.nodes.length { return -1 }
+  const gp = rsUp(par)
+  const fr = rsFieldDestRow(vx, par, gp)
+  if fr >= 0 { return fr }
+  if rsAnnLetInitIs(gp, par) && P.nodes[par] is ArrayLit {
+    return rsSlotRow(letAnnDestKindListSlot(gp, RLK_STRUCT))
+  }
+  -1
+}
+
+// The struct row field initializer `par` of the object literal `gp` stores its value at, or -1.
+function rsFieldDestRow(vx: i32, par: i32, gp: i32): i32 {
+  if par < 0 || par >= P.nodes.length || gp < 0 || gp >= P.nodes.length {
+    return -1
+  }
+  if !(P.nodes[gp] is ObjLit) { return -1 }
+  const p = P.nodes[par]
+  if p is FieldInit {
+    const si = structIndexOfObjCtx(gp, rsFrameOf(vx))
+    if si < 0 || si >= sFieldCount.length { return -1 }
+    const fi = sFieldIndex(si, p.fiName)
+    if fi < 0 { return -1 }
+    return sFieldTgtStructIdx(si, fi)
+  }
+  -1
+}
+
+// Whether the node at `li` is an annotated `let` whose initializer is `x`.
+function rsAnnLetInitIs(li: i32, x: i32): boolean {
+  if li < 0 { return false }
+  const d = P.nodes[li]
+  if d is LetDecl {
+    if d.letType >= 0 && d.letInit >= 0 { return unwrapParen(d.letInit) == x }
+  }
+  false
+}
+
+// The declared type the value at `vx` is delivered to, `| null` peeled: a parameter, an
+// annotated binding, or a declared return. -1 at any other use.
+function rsElemDestTy(vx: i32): i32 {
+  const par = rsUp(vx)
+  if par < 0 || par >= P.nodes.length { return -1 }
+  const p = P.nodes[par]
+  let ty = -1
+  if p is Call {
+    if unwrapParen(p.callFn) == vx { return -1 }
+    ty = rsCallParamTy(p, vx)
+  } else if p is LetDecl {
+    if p.letType < 0 { return -1 }
+    ty = nodeTyIxOf(p.letType)
+  } else {
+    const fr = rsFrameOf(vx)
+    if fr >= 0 && fr < P.nodes.length && rsIsReturned(vx, par, fr) {
+      const fd = P.nodes[fr]
+      if fd is FuncDecl {
+        if fd.fnRet >= 0 { ty = nodeTyIxOf(fd.fnRet) }
+      }
+    }
+  }
+  if ty < 0 || ty >= T.tys.length { return -1 }
+  const t = T.tys[ty]
+  if t is TyNullable { return t.nInner }
+  ty
+}
+
+// The record-list slot an un-annotated list of object literals is built at when no list
+// destination names one but an element is handed to a declared record of the literal's field
+// names (D2933), or -1. Such a list with no interned list of that record is refused.
+function rsElemListDestSlot(letIx: i32, fnIx: i32, own: i32): i32 {
+  if !rsIxReady() { return -1 }
+  if letIx < 0 || letIx >= rsLetDst.length { return -1 }
+  if rsLetDst[letIx] != -2 { return rsLetDst[letIx] }
+  rsLetDst[letIx] = -1
+  const r = rsElemListDestSlotGo(letIx, fnIx, own)
+  if letIx < rsLetDst.length { rsLetDst[letIx] = r }
+  r
+}
+
+function rsElemListDestSlotGo(letIx: i32, fnIx: i32, own: i32): i32 {
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    const scopeIx = dsScopeRootOf(letIx, d.letName, fnIx)
+    if scopeIx < 0 { return -1 }
+    const w: RsWalk = {
+      rwScope: scopeIx,
+      rwOwnLet: letIx,
+      rwName: d.letName,
+      rwElem: false,
+      rwRow: rsSlotRow(own),
+      rwList: d.letName,
+      rwHome: rsFrameOf(letIx),
+      rwCall: false,
+    }
+    const bad = rsUsesOf(w, 0)
+    if bad < 0 { return -1 }
+    const dty = rsElemDestTy(bad)
+    const drow = structIdxOfElemTy(dty)
+    if drow < 0 || rsSameRow(drow, w.rwRow) { return -1 }
+    if anonLeafSupersedeOf(drow) != drow { return -1 }
+    const ai = unwrapParen(d.letInit)
+    if ai < 0 || ai >= P.nodes.length { return -1 }
+    const ini = P.nodes[ai]
+    if ini is ArrayLit {
+      if ini.arrElems.length < 1 { return -1 }
+      const e0 = unwrapParen(ini.arrElems[0])
+      if e0 < 0 || !rsRowNamesObjLit(drow, e0) { return -1 }
+    }
+    const slot = rlSlotOfTy(dty)
+    if rlSlotIsKindList(slot, RLK_STRUCT) && rsSameRow(rsSlotRow(slot), drow) {
+      return slot
+    }
+    emitFailAt(
+      "emitProgram: an element of this list is handed on here to a record type of the same "
+        + "field names that stores them differently, and the list is built at its own "
+        + "element type; a record is shared, not converted, so the program is type-valid but "
+        + "cannot build. Declare the list with this use's element type",
+      bad,
+    )
+  }
+  -1
+}
+
+// Whether struct row `si` has exactly the field names of the object literal at `objIx`.
+function rsRowNamesObjLit(si: i32, objIx: i32): boolean {
+  const o = P.nodes[objIx]
+  if o is ObjLit {
+    if si >= sFieldCount.length || sFieldCount[si] != o.objFields.length {
+      return false
+    }
+    let k = 0
+    while k < o.objFields.length {
+      const f = P.nodes[o.objFields[k]]
+      if f is FieldInit {
+        if sFieldIndex(si, f.fiName) < 0 { return false }
+      } else {
+        return false
+      }
+      k = k + 1
+    }
+    return true
+  }
+  false
+}
+
 // One question `rsUsesOf` asks of a scope: the uses of `rwName`, which names the re-seated
-// list or (`rwElem`) one element of it, bound by `rwOwnLet`, whose row is `rwDst`'s element;
-// `rwList` is the list's own name and `rwHome` the function binding it, -1 at the top level.
+// list, one element of it (`rwElem`), or a function whose calls return one (`rwCall`), bound by
+// `rwOwnLet` and stored at struct row `rwRow`; `rwList` is the list's own name and `rwHome` the
+// function binding it, -1 at the top level.
 type RsWalk = {
   rwScope: i32,
   rwOwnLet: i32,
   rwName: string,
   rwElem: boolean,
-  rwDst: i32,
+  rwRow: i32,
   rwList: string,
   rwHome: i32,
+  rwCall: boolean,
 }
 
 // The use index `rsUsesOf` reads, built once per final arena like `dsgReady`'s: each node's
@@ -37181,6 +37421,9 @@ let rsFnOccHead: {[string]: i32} = Map()
 let rsFnKidHead: i32[] = []
 let rsFnKidNext: i32[] = []
 let rsDoneLet: i32[] = []
+let rsRecRow: i32[] = []
+let rsRecVer: i32 = -1
+let rsLetDst: i32[] = []
 
 // Drops the use index, beside the global-destination index it mirrors.
 export function rsResetUseIx() {
@@ -37195,6 +37438,9 @@ export function rsResetUseIx() {
   rsFnKidHead = []
   rsFnKidNext = []
   rsDoneLet = []
+  rsRecRow = []
+  rsRecVer = -1
+  rsLetDst = []
   0
 }
 
@@ -37216,6 +37462,7 @@ function rsIxReady(): boolean {
     rsFnKidHead.push(-1)
     rsFnKidNext.push(-1)
     rsDoneLet.push(0)
+    rsLetDst.push(-2)
     i = i + 1
   }
   const stack: i32[] = [emitRootIx]
@@ -37402,6 +37649,18 @@ function rsStmtBefore(stmts: i32[], a: i32, b: i32): boolean {
 function rsUseOf(o: i32, w: RsWalk, depth: i32): i32 {
   const par = rsUp(o)
   if par < 0 { return -1 }
+  if w.rwCall {
+    const c = P.nodes[par]
+    if c is Call {
+      if unwrapParen(c.callFn) == o {
+        const vw = rsWalkAt(w, w.rwScope, -1, w.rwName, w.rwElem)
+        return rsUseOf(par, vw, depth + 1)
+      }
+    }
+    return -1
+  }
+  const j = rsJoinUse(o, par, w, depth)
+  if j != -2 { return j }
   const gp = rsUp(par)
   const al = rsAliasOf(o, par, gp, w)
   if al >= 0 {
@@ -37412,9 +37671,10 @@ function rsUseOf(o: i32, w: RsWalk, depth: i32): i32 {
         rwOwnLet: al,
         rwName: d.letName,
         rwElem: w.rwElem || al == gp,
-        rwDst: w.rwDst,
+        rwRow: w.rwRow,
         rwList: w.rwList,
         rwHome: w.rwHome,
+        rwCall: false,
       }
       return rsUsesOf(aw, depth + 1)
     }
@@ -37428,14 +37688,201 @@ function rsUseOf(o: i32, w: RsWalk, depth: i32): i32 {
         rwOwnLet: -1,
         rwName: fv,
         rwElem: true,
-        rwDst: w.rwDst,
+        rwRow: w.rwRow,
         rwList: w.rwList,
         rwHome: w.rwHome,
+        rwCall: false,
       }
       return rsUsesOf(fw, depth + 1)
     }
   }
   rsUseSafe(o, par, gp, rsFrameOf(o), w)
+}
+
+// `w` asked of the name `nm` bound by `own` in `scope`, naming the list or (`elem`) an element.
+function rsWalkAt(
+  w: RsWalk,
+  scope: i32,
+  own: i32,
+  nm: string,
+  elem: boolean,
+): RsWalk {
+  const e: RsWalk = {
+    rwScope: scope,
+    rwOwnLet: own,
+    rwName: nm,
+    rwElem: elem,
+    rwRow: w.rwRow,
+    rwList: w.rwList,
+    rwHome: w.rwHome,
+    rwCall: false,
+  }
+  e
+}
+
+// A use at `o` that an `if` joins or a function returns un-annotated: the other arms must build
+// the same storage, and the join's or the call's own uses are followed in its place. -2 at any
+// other use, which `rsUseSafe` answers.
+function rsJoinUse(o: i32, par: i32, w: RsWalk, depth: i32): i32 {
+  let v = o
+  let elem = w.rwElem
+  if !elem && rsIndexOfName(par, w.rwName) {
+    v = par
+    elem = true
+  }
+  if o < 0 || o >= rsFrame.length { return -2 }
+  const fr = rsFrame[o]
+  const top = rsIfTop(v)
+  if top < 0 { return rsRetCallUse(v, elem, fr, w, depth) }
+  const sib = rsJoinSiblingBad(top, elem, fr, w)
+  if sib >= 0 { return sib }
+  rsUseOf(top, rsWalkAt(w, w.rwScope, w.rwOwnLet, w.rwName, elem), depth + 1)
+}
+
+// The list or (`elem`) an element returned by an un-annotated function other than the list's
+// own: that function's calls hand it on, so their uses are followed (D2922). -2 where
+// `rsUseSafe` answers.
+function rsRetCallUse(
+  vx: i32,
+  elem: boolean,
+  fr: i32,
+  w: RsWalk,
+  depth: i32,
+): i32 {
+  if fr < 0 || fr == w.rwHome || !rsFnRetInferred(fr) { return -2 }
+  if !rsIsReturned(vx, rsUp(vx), fr) { return -2 }
+  const fd = P.nodes[fr]
+  if fd is FuncDecl {
+    const scope = rsPar[fr]
+    if scope < 0 { return -2 }
+    const cw: RsWalk = {
+      rwScope: scope,
+      rwOwnLet: -1,
+      rwName: fd.fnName,
+      rwElem: elem,
+      rwRow: w.rwRow,
+      rwList: w.rwList,
+      rwHome: w.rwHome,
+      rwCall: true,
+    }
+    return rsUsesOf(cw, depth + 1)
+  }
+  -2
+}
+
+// The outermost `if` whose arm ends in the value at `v`, following an `else if` chain up, or -1
+// when `v` is no arm's tail.
+function rsIfTop(v: i32): i32 {
+  const blk = rsUp(v)
+  if blk < 0 || !rsIsLastStmt(blk, v) { return -1 }
+  let cur = rsUp(blk)
+  if cur < 0 { return -1 }
+  const s = P.nodes[cur]
+  if s is IfStmt {
+    if s.ifThen != blk && s.ifElse != blk { return -1 }
+  } else {
+    return -1
+  }
+  let up = rsUp(cur)
+  while up >= 0 {
+    const u = P.nodes[up]
+    if u is IfStmt {
+      if u.ifElse != cur { return cur }
+    } else {
+      return cur
+    }
+    cur = up
+    up = rsUp(cur)
+  }
+  cur
+}
+
+// The first arm value of the `if` chain at `top` that builds another record than `w.rwRow`: a
+// list literal holding an already-built record, or (`elem`) a built record itself. An arm that
+// reads the walked name again is the same storage. -1 when every arm agrees.
+function rsJoinSiblingBad(top: i32, elem: boolean, fr: i32, w: RsWalk): i32 {
+  const b = rsJoinSiblingFind(top, elem, fr, w)
+  if b >= 0 { rsSibHit = b }
+  b
+}
+
+// The node `rsJoinSiblingBad` last refused, which `rsNarrowUseRefuse` names as a built record.
+let rsSibHit: i32 = -1
+
+function rsJoinSiblingFind(top: i32, elem: boolean, fr: i32, w: RsWalk): i32 {
+  let cur = top
+  while cur >= 0 {
+    const s = P.nodes[cur]
+    if s is IfStmt {
+      const b = rsArmBuildsOther(ifArmValueExpr(s.ifThen), elem, fr, w)
+      if b >= 0 { return b }
+      if s.ifElse < 0 || s.ifElse >= P.nodes.length { return -1 }
+      if P.nodes[s.ifElse] is IfStmt {
+        cur = s.ifElse
+      } else {
+        return rsArmBuildsOther(ifArmValueExpr(s.ifElse), elem, fr, w)
+      }
+    } else {
+      return -1
+    }
+  }
+  -1
+}
+
+// `rsJoinSiblingBad` for one arm value `a`: the node to refuse, or -1.
+function rsArmBuildsOther(a0: i32, elem: boolean, fr: i32, w: RsWalk): i32 {
+  const a = unwrapParen(a0)
+  if a < 0 || a >= P.nodes.length { return -1 }
+  if rsIdentName(a) == w.rwName || rsIndexOfName(a, w.rwList) { return -1 }
+  if elem {
+    if !rsIsBuiltRecord(a) { return -1 }
+    return rsBuiltRowOther(a, fr, w)
+  }
+  const n = P.nodes[a]
+  if n is ArrayLit {
+    const b = rsFirstBuiltElem(n.arrElems)
+    if b >= 0 { return rsBuiltRowOther(b, fr, w) }
+  }
+  -1
+}
+
+// `x` when the record at `x` is known to be built at a row other than `w.rwRow`, else -1.
+function rsBuiltRowOther(x: i32, fr: i32, w: RsWalk): i32 {
+  const r = structIndexOfExpr(x, fr)
+  if r >= 0 && !rsSameRow(r, w.rwRow) { return x }
+  -1
+}
+
+// `rsUseSafe` at a field initializer `fx` of the object literal `lit`: the field the literal's
+// own row stores the value in must hold `w.rwRow` (`list`: a list of it). -2 when that row or
+// field is unknown.
+function rsFieldInitSafe(
+  vx: i32,
+  fx: i32,
+  lit: i32,
+  fr: i32,
+  list: boolean,
+  w: RsWalk,
+): i32 {
+  const f = P.nodes[fx]
+  if f is FieldInit {
+    if lit < 0 || !(P.nodes[lit] is ObjLit) { return -2 }
+    const si = structIndexOfObjCtx(lit, fr)
+    if si < 0 || si >= sFieldCount.length { return -2 }
+    const fi = sFieldIndex(si, f.fiName)
+    if fi < 0 { return -2 }
+    if list {
+      const slot = rlSlotByName(sFieldElemNameAt(si, fi))
+      if !rlSlotIsKindList(slot, RLK_STRUCT) { return -2 }
+      if rsSlotIsRow(slot, w) { return -1 }
+      return vx
+    }
+    const r = sFieldTgtStructIdx(si, fi)
+    if r < 0 { return -2 }
+    if rsSameRow(r, w.rwRow) { return -1 }
+    return vx
+  }
+  -2
 }
 
 // The loop variable of a `for` at `par` iterating the list at `o`, or "".
@@ -37515,6 +37962,11 @@ function rsUseSafe(ix: i32, par: i32, gp: i32, fr: i32, w: RsWalk): i32 {
     if rsAnnListIsRow(gp, true, w) { return -1 }
     return ix
   }
+  if p is FieldInit {
+    const fs = rsFieldInitSafe(ix, par, gp, fr, true, w)
+    if fs != -2 { return fs }
+    return -1
+  }
   // An inferred return of the function binding the list types it from the literal's own
   // record; one captured by another function returns the storage's row.
   if rsIsReturned(ix, par, fr) {
@@ -37553,6 +38005,8 @@ function rsElemUseSafe(vx: i32, par: i32, gp: i32, fr: i32, w: RsWalk): i32 {
   // An object literal bound un-annotated types its field from this element, so it builds the
   // element's own row; one delivered somewhere declared is left to that destination.
   if p is FieldInit {
+    const fs = rsFieldInitSafe(vx, par, gp, fr, false, w)
+    if fs != -2 { return fs }
     if rsLetUnannotated(rsUp(gp)) { return vx }
     return -1
   }
@@ -37634,8 +38088,15 @@ function rsElemAssignSafe(vx: i32, x: string, fr: i32, w: RsWalk): i32 {
   -1
 }
 
-// The checked type of the parameter the argument `argIx` of call `c` is passed to, or -1.
+// The checked type of the parameter the argument `argIx` of call `c` is passed to, or -1. A
+// `.push` stores its argument as the receiver list's element.
 function rsCallParamTy(c: Call, argIx: i32): i32 {
+  const cf = P.nodes[unwrapParen(c.callFn)]
+  if cf is Member {
+    if cf.memProp == "push" {
+      return tyRefArrElemOf(nodeTyIxOf(unwrapParen(cf.memObj)))
+    }
+  }
   const ft = nodeTyIxOf(c.callFn)
   if ft < 0 || ft >= T.tys.length { return -1 }
   const t = T.tys[ft]
@@ -37707,13 +38168,13 @@ function rsRowsDiffer(a: i32, b: i32): boolean {
 
 // Whether ref-list `slot` holds the re-seated row, nullable or not.
 function rsSlotIsRow(slot: i32, w: RsWalk): boolean {
-  rsSameRow(rsSlotRow(slot), rsSlotRow(w.rwDst))
+  rsSameRow(rsSlotRow(slot), w.rwRow)
 }
 
 // Whether arena type `ty` is the re-seated row, nullable or not.
 function rsTyIsRow(ty: i32, w: RsWalk): boolean {
   if ty < 0 { return false }
-  rsSameRow(structIdxOfElemTy(ty), rsSlotRow(w.rwDst))
+  rsSameRow(structIdxOfElemTy(ty), w.rwRow)
 }
 
 // Whether two or more struct rows carry exactly the field names of the object literal at `ix`:
