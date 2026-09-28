@@ -36964,15 +36964,497 @@ function letRecordListDestSlot(letIx: i32, fnIx: i32): i32 {
     if ini is ArrayLit {
       if ini.arrElems.length < 1 { return -1 }
       const e0 = unwrapParen(ini.arrElems[0])
-      if e0 < 0 || !objLitNamesTwoRows(e0) { return -1 }
+      if e0 < 0 { return -1 }
+      if !objLitNamesTwoRows(e0) {
+        if rsIsBuiltRecord(e0) { rsBuiltElemRefuse(letIx, fnIx, ai) }
+        return -1
+      }
       const own = rlSlotByName(arrLitElemNameIn(ai, fnIx))
       if !rlSlotIsKindList(own, RLK_STRUCT) { return -1 }
       const dst = letRefListDestSlotK(letIx, fnIx, RLK_STRUCT)
       if dst < 0 || dst == own { return -1 }
+      if rsSlotRow(dst) != rsSlotRow(own) {
+        const built = rsFirstBuiltElem(ini.arrElems)
+        if built >= 0 { rsBuiltElemFail(built, dst) }
+        rsNarrowUseRefuse(letIx, fnIx, d.letName, dst)
+      }
       return dst
     }
   }
   -1
+}
+
+// The first element of a list literal that is neither an object literal nor `null`, or -1: a
+// record some other expression already built, at a row of its own, which a re-seated list
+// cannot hold.
+function rsFirstBuiltElem(elems: i32[]): i32 {
+  let k = 0
+  while k < elems.length {
+    const e = unwrapParen(elems[k])
+    if e >= 0 && rsIsBuiltRecord(e) { return e }
+    k = k + 1
+  }
+  -1
+}
+
+// Whether the element at `e` is neither an object literal nor `null`.
+function rsIsBuiltRecord(e: i32): boolean {
+  const n = P.nodes[e]
+  if n is ObjLit { return false }
+  !(n is NullLit)
+}
+
+// A list literal led by an already-built record, bound where a declared destination names
+// another record of the same field names: its elements are that other row, and a record is
+// shared rather than converted, so no build of the list serves the destination (D2917).
+function rsBuiltElemRefuse(letIx: i32, fnIx: i32, ai: i32) {
+  const own = rlSlotByName(arrLitElemNameIn(ai, fnIx))
+  if !rlSlotIsKindList(own, RLK_STRUCT) { return 0 }
+  if !structNamesTwoRows(rsSlotRow(own)) { return 0 }
+  const dst = letRefListDestSlotK(letIx, fnIx, RLK_STRUCT)
+  if dst < 0 || rsSlotRow(dst) == rsSlotRow(own) { return 0 }
+  const ini = P.nodes[ai]
+  if ini is ArrayLit {
+    const built = rsFirstBuiltElem(ini.arrElems)
+    if built >= 0 { rsBuiltElemFail(built, dst) }
+  }
+  0
+}
+
+function rsBuiltElemFail(at: i32, dst: i32) {
+  emitFailAt(
+    "emitProgram: this record was built as another record type than the `"
+      + rlElemName[dst]
+      + "` a declared destination makes this list hold; a record is shared, not converted, so "
+      + "the program is type-valid but cannot build. Build the element as an object literal "
+      + "here, or declare its source as `"
+      + rlElemName[dst]
+      + "`",
+    at,
+  )
+}
+
+// Whether struct row `si` shares its exact field-name set with another row: the
+// `objLitNamesTwoRows` question for a record already built at a row.
+function structNamesTwoRows(si: i32): boolean {
+  const lim = sScanLim()
+  if si < 0 || si >= lim { return false }
+  const nf = sFieldCount[si]
+  const st = sFieldStart[si]
+  let oj = 0
+  while oj < lim {
+    if oj != si && sFieldCount[oj] == nf {
+      let ok = true
+      let k = 0
+      while k < nf && ok {
+        if sFieldIndex(oj, sFieldNames[st + k]) < 0 { ok = false }
+        k = k + 1
+      }
+      if ok { return true }
+    }
+    oj = oj + 1
+  }
+  false
+}
+
+// A list re-seated at a destination's record row (D2881) is still typed with its own
+// elements' record, so a use that hands the list or an element on at that type delivers the
+// destination's row where the other is expected. The first such use is refused here rather
+// than built as an invalid module (D2914); `rsUseSafe` names the uses that convert.
+function rsNarrowUseRefuse(letIx: i32, fnIx: i32, nm: string, dst: i32) {
+  const scopeIx = dsScopeRootOf(letIx, nm, fnIx)
+  if scopeIx < 0 { return 0 }
+  const w: RsWalk = {
+    rwScope: scopeIx,
+    rwOwnLet: letIx,
+    rwName: nm,
+    rwElem: false,
+    rwDst: dst,
+    rwList: nm,
+  }
+  const anc: i32[] = []
+  const bad = rsUseWalk(scopeIx, anc, fnIx, w)
+  if bad < 0 { return 0 }
+  emitFailAt(
+    "emitProgram: this list is built as `"
+      + rlElemName[dst]
+      + "[]` for a declared destination, and is handed on here at its own element type; one "
+      + "list has one element storage and a record is shared, not converted, so the program "
+      + "is type-valid but cannot build. Declare the list as `"
+      + rlElemName[dst]
+      + "[]`, or build a second literal for this use",
+    bad,
+  )
+  0
+}
+
+// One question `rsUseWalk` asks of a scope: the uses of `rwName`, which names the re-seated
+// list or (`rwElem`) one element of it, bound by `rwOwnLet`, whose row is `rwDst`'s element;
+// `rwList` is the list's own name.
+type RsWalk = {
+  rwScope: i32,
+  rwOwnLet: i32,
+  rwName: string,
+  rwElem: boolean,
+  rwDst: i32,
+  rwList: string,
+}
+
+// The first use under `ix` that `rsUseSafe` does not clear, or -1. `anc` holds the node's
+// ancestors, nearest last, and `fr` is its enclosing function; a nested function that rebinds
+// the name is not entered.
+function rsUseWalk(ix: i32, anc: i32[], fr: i32, w: RsWalk): i32 {
+  if ix < 0 || ix >= P.nodes.length { return -1 }
+  const n = P.nodes[ix]
+  if n is Ident {
+    if n.identName != w.rwName { return -1 }
+    return rsUseSafe(ix, anc, fr, w)
+  }
+  anc.push(ix)
+  const r = rsUseWalkIn(ix, anc, fr, w)
+  anc.pop()
+  r
+}
+
+// `rsUseWalk` below `ix`, which `anc` already ends with.
+function rsUseWalkIn(ix: i32, anc: i32[], fr: i32, w: RsWalk): i32 {
+  const n = P.nodes[ix]
+  let frame = fr
+  if ix != w.rwScope {
+    if n is FuncDecl {
+      if dsRebindsName(ix, w.rwName) { return -1 }
+      frame = ix
+    }
+  }
+  if n is Block { return rsStmtsWalk(n.blkStmts, 0, anc, frame, w) }
+  if n is Program { return rsStmtsWalk(n.progStmts, 0, anc, frame, w) }
+  if n is ForIn {
+    const it = unwrapParen(n.fiIter)
+    if it >= 0 && !w.rwElem && n.fiVar != w.rwName {
+      const itn = P.nodes[it]
+      if itn is Ident {
+        if itn.identName == w.rwName {
+          const ew: RsWalk = {
+            rwScope: n.fiBody,
+            rwOwnLet: -1,
+            rwName: n.fiVar,
+            rwElem: true,
+            rwDst: w.rwDst,
+            rwList: w.rwList,
+          }
+          const r = rsUseWalk(n.fiBody, anc, frame, ew)
+          if r >= 0 { return r }
+        }
+      }
+    }
+  }
+  let cur = ix
+  while cur >= 0 {
+    const kids = nodeSpineChildren(cur)
+    let k = 0
+    while k < kids.length {
+      const r = rsUseWalk(kids[k], anc, frame, w)
+      if r >= 0 { return r }
+      k = k + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  -1
+}
+
+// `rsUseWalk` over one statement list from `from` on: a `let` rebinding the name ends it after
+// its initializer, and an un-annotated `const x = il` or `const x = il[k]` walks the rest for
+// `x` too, since it is the same value by another name.
+function rsStmtsWalk(
+  stmts: i32[],
+  from: i32,
+  anc: i32[],
+  fr: i32,
+  w: RsWalk,
+): i32 {
+  let k = from
+  while k < stmts.length {
+    const sx = stmts[k]
+    const st = P.nodes[sx]
+    if st is LetDecl {
+      if st.letName == w.rwName && sx != w.rwOwnLet {
+        anc.push(sx)
+        const ri = rsUseWalk(st.letInit, anc, fr, w)
+        anc.pop()
+        return ri
+      }
+      if st.letType < 0 && st.letName != w.rwName {
+        const al = rsAliasLevel(st.letInit, w)
+        if al >= 0 {
+          const aw: RsWalk = {
+            rwScope: w.rwScope,
+            rwOwnLet: sx,
+            rwName: st.letName,
+            rwElem: al == 1,
+            rwDst: w.rwDst,
+            rwList: w.rwList,
+          }
+          const ra = rsStmtsWalk(stmts, k + 1, anc, fr, aw)
+          if ra >= 0 { return ra }
+        }
+      }
+    }
+    const r = rsUseWalk(sx, anc, fr, w)
+    if r >= 0 { return r }
+    k = k + 1
+  }
+  -1
+}
+
+// 0 when `init` is the list itself, 1 when it is one element of it (or the walked name is
+// already an element), -1 when it is neither.
+function rsAliasLevel(init: i32, w: RsWalk): i32 {
+  const x = unwrapParen(init)
+  if x < 0 { return -1 }
+  if rsIdentName(x) == w.rwName {
+    if w.rwElem { return 1 }
+    return 0
+  }
+  if !w.rwElem && rsIndexOfName(x, w.rwName) { return 1 }
+  -1
+}
+
+// The name the identifier at `x` reads, or "" when `x` is not an identifier.
+function rsIdentName(x: i32): string {
+  if x < 0 || x >= P.nodes.length { return "" }
+  const n = P.nodes[x]
+  if n is Ident { return n.identName }
+  ""
+}
+
+// Whether the node at `x` is an index read `nm[k]`.
+function rsIndexOfName(x: i32, nm: string): boolean {
+  const n = P.nodes[x]
+  if n is Index { return rsIdentName(unwrapParen(n.idxArr)) == nm }
+  false
+}
+
+// The `up`-th ancestor in `anc` (0 the parent), or -1.
+function rsAnc(anc: i32[], up: i32): i32 {
+  const k = anc.length - 1 - up
+  if k < 0 { return -1 }
+  anc[k]
+}
+
+// -1 when the use at `ix` (ancestors `anc`, function `fr`) reads the re-seated storage where it
+// is, else `ix`. The list converts through an element read, `.length`, a `for` and a delivery
+// at the destination's row; an element through a field read and the same delivery. A form not
+// named here is left to build as it does.
+function rsUseSafe(ix: i32, anc: i32[], fr: i32, w: RsWalk): i32 {
+  const par = rsAnc(anc, 0)
+  const gp = rsAnc(anc, 1)
+  if par < 0 { return -1 }
+  const p = P.nodes[par]
+  if w.rwElem { return rsElemUseSafe(ix, par, gp, rsAnc(anc, 2), fr, w) }
+  if p is Index {
+    if unwrapParen(p.idxArr) != ix { return -1 }
+    return rsElemUseSafe(par, gp, rsAnc(anc, 2), rsAnc(anc, 3), fr, w)
+  }
+  if p is Member {
+    if p.memProp == "length" { return -1 }
+    return ix
+  }
+  if p is Spread { return ix }
+  if p is Call {
+    if p.callFn == ix { return -1 }
+    const pt = rsCallParamTy(p, ix)
+    if rsTyIsRow(tyRefArrElemOf(pt), w) { return -1 }
+    return ix
+  }
+  if p is LetDecl {
+    if p.letType < 0 { return -1 }
+    if rsSlotIsRow(letAnnDestKindListSlot(par, RLK_STRUCT), w) { return -1 }
+    return ix
+  }
+  if p is ArrayLit {
+    if gp >= 0 {
+      const g = P.nodes[gp]
+      if g is LetDecl {
+        if g.letType >= 0 {
+          if (
+            rsSlotIsRow(
+              rlInnerKindListSlot(letAnnRefListSlot(gp), RLK_STRUCT),
+              w,
+            )
+          ) {
+            return -1
+          }
+        }
+      }
+    }
+    return ix
+  }
+  if rsIsReturned(ix, par, fr) {
+    if rsFnRetListIsRow(fr, w) { return -1 }
+    return ix
+  }
+  // The value of an `if` arm joins the list with the other arm at its own element type.
+  if rsIsLastStmt(par, ix) && gp >= 0 && P.nodes[gp] is IfStmt { return ix }
+  -1
+}
+
+// `rsUseSafe` for a value that is one element of the re-seated list.
+function rsElemUseSafe(
+  vx: i32,
+  par: i32,
+  gp: i32,
+  ggp: i32,
+  fr: i32,
+  w: RsWalk,
+): i32 {
+  if par < 0 || par >= P.nodes.length { return -1 }
+  const p = P.nodes[par]
+  if p is Call {
+    if p.callFn == vx { return -1 }
+    if rsTyIsRow(rsCallParamTy(p, vx), w) { return -1 }
+    return vx
+  }
+  if p is LetDecl {
+    if p.letType < 0 { return -1 }
+    if rsTyIsRow(nodeTyIxOf(p.letType), w) { return -1 }
+    return vx
+  }
+  if p is ArrayLit {
+    if gp >= 0 {
+      const g = P.nodes[gp]
+      if g is LetDecl {
+        if g.letType >= 0 {
+          if rsSlotIsRow(letAnnDestKindListSlot(gp, RLK_STRUCT), w) {
+            return -1
+          }
+        }
+      }
+    }
+    return vx
+  }
+  if p is BinExpr {
+    if p.binOp == "=" && unwrapParen(p.binRight) == vx {
+      return rsElemAssignSafe(vx, rsIdentName(unwrapParen(p.binLeft)), fr, w)
+    }
+    return -1
+  }
+  // An object literal bound un-annotated types its field from this element, so it builds the
+  // element's own row; one delivered somewhere declared is left to that destination.
+  if p is FieldInit {
+    if rsLetUnannotated(ggp) { return vx }
+    return -1
+  }
+  if rsIsReturned(vx, par, fr) {
+    if fr < 0 { return -1 }
+    const fd = P.nodes[fr]
+    if fd is FuncDecl {
+      if fd.fnRet < 0 { return -1 }
+      if rsTyIsRow(nodeTyIxOf(fd.fnRet), w) { return -1 }
+      return vx
+    }
+  }
+  -1
+}
+
+// `x = e` for an element `e` at `vx`: the binding `x` holds the re-seated row only when it is
+// declared at it, or bound un-annotated from an element of the same list.
+function rsElemAssignSafe(vx: i32, x: string, fr: i32, w: RsWalk): i32 {
+  if x == "" { return -1 }
+  const li = destLetOf(x, fr)
+  if li < 0 { return -1 }
+  const d = P.nodes[li]
+  if d is LetDecl {
+    if d.letType >= 0 {
+      if rsTyIsRow(nodeTyIxOf(d.letType), w) { return -1 }
+      return vx
+    }
+    if d.letInit >= 0 && rsIndexOfName(unwrapParen(d.letInit), w.rwList) {
+      return -1
+    }
+    return vx
+  }
+  -1
+}
+
+// The checked type of the parameter the argument `argIx` of call `c` is passed to, or -1.
+function rsCallParamTy(c: Call, argIx: i32): i32 {
+  const ft = nodeTyIxOf(c.callFn)
+  if ft < 0 || ft >= T.tys.length { return -1 }
+  const t = T.tys[ft]
+  if t is TyFunc {
+    let k = 0
+    while k < c.callArgs.length {
+      if unwrapParen(c.callArgs[k]) == argIx {
+        if k < t.fnParamTypes.length { return t.fnParamTypes[k] }
+        return -1
+      }
+      k = k + 1
+    }
+  }
+  -1
+}
+
+// Whether the value at `ix`, whose parent node is `par`, is what function `fr` returns:
+// a `return` operand or the tail of its body.
+function rsIsReturned(ix: i32, par: i32, fr: i32): boolean {
+  if fr < 0 { return false }
+  if P.nodes[par] is RetStmt { return true }
+  const fd = P.nodes[fr]
+  if fd is FuncDecl {
+    if par == fr { return fd.fnBody == ix }
+    if par == fd.fnBody { return rsIsLastStmt(par, ix) }
+  }
+  false
+}
+
+// Whether the node at `ix` is a `let` or `const` with no annotation.
+function rsLetUnannotated(ix: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const d = P.nodes[ix]
+  if d is LetDecl { return d.letType < 0 }
+  false
+}
+
+// Whether `ix` is the last statement of the block at `bx`.
+function rsIsLastStmt(bx: i32, ix: i32): boolean {
+  const b = P.nodes[bx]
+  if b is Block {
+    const n = b.blkStmts.length
+    return n > 0 && b.blkStmts[n - 1] == ix
+  }
+  false
+}
+
+// Whether function `fr` declares a list of the re-seated row as its return.
+function rsFnRetListIsRow(fr: i32, w: RsWalk): boolean {
+  if fr < 0 { return false }
+  const fd = P.nodes[fr]
+  if fd is FuncDecl {
+    if fd.fnRet < 0 { return false }
+    return rsTyIsRow(tyRefArrElemOf(nodeTyIxOf(fd.fnRet)), w)
+  }
+  false
+}
+
+// The struct row a ref-list slot's element is, `| null` peeled, or -1.
+function rsSlotRow(slot: i32): i32 {
+  if slot < 0 || slot >= rlElemName.length { return -1 }
+  const a = rlElemStructIdxAt(slot)
+  if a >= 0 { return a }
+  structIdxOfElemName(rlElemName[slot])
+}
+
+// Whether ref-list `slot` holds the re-seated row, nullable or not.
+function rsSlotIsRow(slot: i32, w: RsWalk): boolean {
+  const r = rsSlotRow(slot)
+  r >= 0 && r == rsSlotRow(w.rwDst)
+}
+
+// Whether arena type `ty` is the re-seated row, nullable or not.
+function rsTyIsRow(ty: i32, w: RsWalk): boolean {
+  if ty < 0 { return false }
+  const r = structIdxOfElemTy(ty)
+  r >= 0 && r == rsSlotRow(w.rwDst)
 }
 
 // Whether two or more struct rows carry exactly the field names of the object literal at `ix`:
