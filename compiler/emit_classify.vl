@@ -219,6 +219,7 @@ import {
   tyIsLitUnionOrLit,
   tyIsNewtypeBrand,
   tyIsNonNullHoleRead,
+  tyIsNulLitUnionNiche,
   tyIsNulValueUnionBox,
   tyIsNullableLitUnion,
   tyIsU8ArrayTy,
@@ -230,6 +231,7 @@ import {
   tyMutEpoch,
   tyNestedArrLeafRenders,
   tyNomNameCycled,
+  tyNulLitUnionMemberTexts,
   tyOfMembers,
   tyPrimNameOf,
   tyReachesUnion,
@@ -242,6 +244,7 @@ import {
   valueAtomKind,
   valueRowKind,
   valueTailLeaves,
+  widenRetagAny,
 } from "./typecheck"
 import {
   ArrayLit,
@@ -13016,6 +13019,7 @@ export function moduleHasUnionAs(): boolean {
   if modUnionAsHit { return true }
   // A box retagged on delivery stages in the same slot (`emitMapRetag`).
   if mTwinSettled && mapRetagAnyEmitted() { return true }
+  if widenRetagAny() { return true }
   let i = modUnionAsSeen
   while i < P.nodes.length {
     if asExprIsUnionCast(i) {
@@ -20429,6 +20433,14 @@ export function letNulBool(letIx: i32, fnIx: i32) {
 // litunion dual of `exprNulBool`; consulted at the `== null` compare and the `null`-seed boundaries.
 export function exprNulLitUnion(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return false }
+  // A node the generic body shares, typed at a hole this instance pins to the niche (D2978).
+  if (
+    monoHoleSubN.length > 0
+    && tyIsNulLitUnionNiche(holeOperandTyOf(exprIx, fnIx))
+    && holeLitReadIsAtom(exprIx, fnIx, 0)
+  ) {
+    return true
+  }
   const e = P.nodes[unwrapParen(exprIx)]
   // …and the same `if` whose arm is itself nullable — see `nulIfArmNullableValueIx` (D1560).
   const nlIfA = nulIfArmNullableValueIx(exprIx)
@@ -20444,6 +20456,12 @@ export function exprNulLitUnion(exprIx: i32, fnIx: i32) {
   // from the array's element type so `p[i] != null` narrows against `-1`, not a bare null.
   if e is Index {
     if nodeArrayElemIsNulLitUnion(e.idxArr) { return true }
+    if (
+      monoHoleSubN.length > 0
+      && tyIsNulLitUnionNiche(holeNulLitElemTy(e.idxArr, fnIx))
+    ) {
+      return true
+    }
     // A bare map read `m[k]` over `{[string]: K | null}` yields the niche i32 (a member id
     // or `-1`), so `const t = m[k]` narrows with `!= null` against `-1`.
     if nodeTyMapValIsNulLitUnion(e.idxArr) { return true }
@@ -27055,6 +27073,60 @@ function arrElemLitUnionTyAt(arrIx: i32, fnIx: i32, depth: i32): i32 {
 // `arrElemLitUnionTy` dual for a value that is the atom rather than the array holding it.
 export function litAtomMemberTy(exprIx: i32, fnIx: i32) {
   litAtomMemberTyAt(exprIx, fnIx, 0)
+}
+
+// The member texts of `ix` when it holds the `K | null` niche, empty otherwise. A node an
+// instance shares with its generic body records the type parameter, so the instance's pin is
+// read in its place (D2978).
+export function nulLitAtomTexts(ix: i32, fnIx: i32): string[] {
+  nulLitAtomTextsAt(ix, fnIx, 0)
+}
+
+// `nulLitAtomTexts` through at most `declFallbackDepthCap` un-annotated local initializers.
+function nulLitAtomTextsAt(ix: i32, fnIx: i32, depth: i32): string[] {
+  const own = nodeNulLitUnionMemberTexts(ix)
+  if own.length > 0 { return own }
+  const hole = tyNulLitUnionMemberTexts(holeOperandTyOf(ix, fnIx))
+  if hole.length > 0 { return hole }
+  const e = P.nodes[unwrapParen(ix)]
+  if e is Index {
+    const elem = tyNulLitUnionMemberTexts(holeNulLitElemTy(e.idxArr, fnIx))
+    if elem.length > 0 { return elem }
+  }
+  // A call of a named function, whose return annotation `exprNulLitUnion` claimed it by.
+  if e is Call && e.callFn >= 0 && P.nodes[e.callFn] is Ident {
+    const t = fnIndexOfSid(sidOfNode(e.callFn))
+    if t >= 0 {
+      const cf = P.nodes[fnStmts[t]]
+      if cf is FuncDecl && cf.fnRet >= 0 {
+        return nodeNulLitUnionMemberTexts(cf.fnRet)
+      }
+    }
+  }
+  // An instance's parameter or local, whose declaration is what `exprNulLitUnion` claimed it by.
+  if e is Ident && depth < declFallbackDepthCap() {
+    const pt = paramTypeNode(fnIx, e.identName)
+    if pt >= 0 { return nodeNulLitUnionMemberTexts(pt) }
+    const d = bindingDeclInScope(e.identName)
+    if d >= 0 {
+      const dn = P.nodes[d]
+      if dn is LetDecl {
+        if dn.letType >= 0 { return nodeNulLitUnionMemberTexts(dn.letType) }
+        if dn.letInit >= 0 {
+          return nulLitAtomTextsAt(dn.letInit, fnIx, depth + 1)
+        }
+      }
+    }
+  }
+  tyNulLitUnionMemberTexts(exactOperandTyOf(ix, fnIx))
+}
+
+// The element type of receiver `arrIx`, which a hole instance `fnIx` pins to a list; -1 for any
+// other receiver, and for a list literal built as strings, whose elements are no atom niche.
+function holeNulLitElemTy(arrIx: i32, fnIx: i32): i32 {
+  const rt = holeOperandTyOf(arrIx, fnIx)
+  if rt < 0 || idxRecvIsStrList(arrIx, fnIx) { return -1 }
+  tyStepElem(rt)
 }
 
 // The member texts to spell atom-repped node `ix` with — one home for the ladder the two

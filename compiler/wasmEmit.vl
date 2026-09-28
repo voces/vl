@@ -40,6 +40,7 @@ import {
   covarRootFrame,
   covarRootName,
   covarValueWriteState,
+  deliveryRetagHas,
   eqCoreKindOfTyToken,
   flattenVariantsInto,
   fsArgIsI64,
@@ -55,7 +56,6 @@ import {
   isValueUnionName,
   isVarTyIxOf,
   mapDeliveryRecorded,
-  mapRetagHas,
   mapRetagRowsOf,
   mapUnboxTyOf,
   matchScrutAt,
@@ -74,7 +74,6 @@ import {
   nodeEqCmpKind,
   nodeHasWideStrLit,
   nodeLitMembersWithin,
-  nodeNulLitUnionMemberTexts,
   nodeNumScalarBaseName,
   nodeTyIntWidth,
   nodeTyIsLitUnion,
@@ -128,6 +127,7 @@ import {
   tyToEmitName,
   u8LexValue,
   valueAtomKind,
+  widenRetagRowsOf,
 } from "./typecheck"
 import {
   ArrayLit,
@@ -947,6 +947,7 @@ import {
   nodeMixedUnionName,
   nonNulBaseOf,
   nulFieldInnerCode,
+  nulLitAtomTexts,
   nulMapShapeOf,
   nulNicheBoxSlot,
   nulNicheCastWiredTy,
@@ -14569,12 +14570,15 @@ function emitMapUnionPayload(body: u8[], exprIx: i32, dstTy: i32, fnIx: i32) {
 
 // A union box delivered into a union lacking one of its map members (D2690): a box tagged
 // with such a member takes the tag of the destination member it is assignable to, so `is`,
-// `match` and `as` in the destination read the member it holds there.
+// `match` and `as` in the destination read the member it holds there. A scalar member the
+// destination holds only widened (`wFrom` to `wTo`) is rebuilt with the widened payload (D2974).
 function emitMapRetag(
   body: u8[],
   exprIx: i32,
   from: i32[],
   to: i32[],
+  wFrom: i32[],
+  wTo: i32[],
   fnIx: i32,
 ) {
   const fromTags: i32[] = []
@@ -14585,8 +14589,14 @@ function emitMapRetag(
   const boxed = exprUnion(exprIx, fnIx)
   const r = emitExpr(body, exprIx, fnIx)
   mapUnboxHeld = held
-  if r < 0 || !boxed || fromTags.length == 0 { return r }
+  const arms = fromTags.length + wFrom.length
+  if r < 0 || !boxed || arms == 0 { return r }
   fbLocalSet(unionAsSlot)
+  let w = 0
+  while w < wFrom.length {
+    if emitWidenRetagArm(wFrom[w], wTo[w]) < 0 { return -1 }
+    w = w + 1
+  }
   let i = 0
   while i < fromTags.length {
     fbLocalGet(unionAsSlot)
@@ -14603,10 +14613,47 @@ function emitMapRetag(
   }
   fbLocalGet(unionAsSlot)
   let e = 0
-  while e < fromTags.length {
+  while e < arms {
     fbEnd()
     e = e + 1
   }
+  0
+}
+
+// The convert opcode from value atom `fk` to `tk` for the widenings `recordWidenRetag` records,
+// or -1 for any other pair.
+function widenConvOpOfKinds(fk: i32, tk: i32): i32 {
+  if fk == 0 && tk == 3 { return scalarWidenConvOp("i32", "i64") }
+  if fk == 0 && tk == 4 { return scalarWidenConvOp("i32", "f64") }
+  if fk == 5 && tk == 4 { return scalarWidenConvOp("f32", "f64") }
+  -1
+}
+
+// One arm of `emitMapRetag`'s chain for a scalar member `fromTy` the destination holds widened
+// as `toTy`: under `fromTy`'s tag, the box in `unionAsSlot` is rebuilt under `toTy`'s with its
+// payload converted; the arm is left open on its `else`.
+function emitWidenRetagArm(fromTy: i32, toTy: i32) {
+  const fk = valueAtomKind(tyToEmitName(fromTy))
+  const tk = valueAtomKind(tyToEmitName(toTy))
+  const conv = widenConvOpOfKinds(fk, tk)
+  const vb = vbHeapIdxOfKind(tk)
+  if conv < 0 || vb < 0 {
+    return emitFail(
+      "emitProgram: a union delivered widened has no box for its widened member",
+    )
+  }
+  fbLocalGet(unionAsSlot)
+  fbStructGet(uBoxIdx, 0)
+  fbI32Const(scalarTagOfKind(fk))
+  fbI32Bin(70) // i32.eq
+  fbIfRefNul(uBoxIdx, false)
+  fbI32Const(scalarTagOfKind(tk))
+  fbLocalGet(unionAsSlot)
+  if emitUnionUnboxTail(fk) < 0 { return -1 }
+  wU8(conv)
+  fbStructNew(vb)
+  fbStructNew(uBoxIdx)
+  fbElse()
   0
 }
 
@@ -14620,11 +14667,14 @@ export function emitExpr(body: u8[], exprIx: i32, fnIx: i32) {
   if mapDeliveryRecorded && exprIx != mapUnboxHeld {
     const mub = mapUnboxTyOf(exprIx)
     if mub >= 0 { return emitMapUnionPayload(body, exprIx, mub, fnIx) }
-    if mapRetagHas(exprIx) {
+    if deliveryRetagHas(exprIx) {
       const rtFrom: i32[] = []
       const rtTo: i32[] = []
       mapRetagRowsOf(exprIx, rtFrom, rtTo)
-      return emitMapRetag(body, exprIx, rtFrom, rtTo, fnIx)
+      const wtFrom: i32[] = []
+      const wtTo: i32[] = []
+      widenRetagRowsOf(exprIx, wtFrom, wtTo)
+      return emitMapRetag(body, exprIx, rtFrom, rtTo, wtFrom, wtTo, fnIx)
     }
   }
   // A string-repped literal union reaching an atom-typed destination narrows to its
@@ -17788,7 +17838,7 @@ function emitCallCore(body: u8[], callIx: i32, fnIx: i32) {
           // its member or the word `null`, exactly like the two niches beside it. Asked
           // first: the expanded spelling also satisfies the member-only query below, and
           // only this arm emits the sentinel.
-          const lpNul = nodeNulLitUnionMemberTexts(c.callArgs[0])
+          const lpNul = nulLitAtomTexts(c.callArgs[0], fnIx)
           if lpNul.length > 0 {
             return emitPrintNulLitUnion(body, c.callArgs[0], lpNul, fnIx)
           }

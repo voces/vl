@@ -3160,6 +3160,11 @@ export function tyOfMembers(ms: i32[]): i32 {
 }
 
 function mkUnionTy(members: i32[]) {
+  let i = 0
+  while i < members.length && !tyWideUnionMinted {
+    if tyIsWidePrim(members[i]) { tyWideUnionMinted = true }
+    i = i + 1
+  }
   const t: Ty = { uMembers: members }
   addTy(t)
 }
@@ -3173,6 +3178,7 @@ function mkNullableTy(inner: i32) {
     const innerT = T.tys[inner]
     if innerT is TyNullable { return inner }
   }
+  if tyIsWidePrim(inner) { tyWideUnionMinted = true }
   const t: Ty = { nInner: inner }
   addTy(t)
 }
@@ -3201,6 +3207,22 @@ function mkMapTy(key: i32, val: i32, isSet: i32) {
 // Whether any map type has been minted in this instance. Only ever set, so a gate on it can
 // skip work, never a map (`mapDeliveryMayRecord`).
 let tyMapMinted = false
+
+// Whether any union or `| null` with an `i64` or `f64` member has been minted: the same kind of
+// gate for a delivery a narrower member widens into (`recordWidenRetag`).
+let tyWideUnionMinted = false
+
+// Whether the delivery being checked is an argument to a parameter whose declared type names a
+// type parameter: an instance shared across pins holds the member unwidened, so no retag.
+let widenRetagGenArg = false
+
+// Whether `ty` is the primitive `i64` or `f64`.
+function tyIsWidePrim(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  const t = T.tys[ty]
+  if t is TyPrim { return t.primName == "i64" || t.primName == "f64" }
+  false
+}
 
 // The unions `joinTys` made of two type parameters (D2760). At a pin their members re-join as a
 // non-generic join would, so `A | B` at `i32` and `f64` is `f64`, not a box of the two.
@@ -3764,6 +3786,12 @@ let mapRetagAt: {[i32]: i32} = Map()
 let mapRetagN: {[i32]: i32} = Map()
 let mapRetagFromTy: i32[] = []
 let mapRetagToTy: i32[] = []
+// Per node, the rows of a union box delivered into a union that lacks one of its scalar members
+// but holds one it widens to (`recordWidenRetag`): the first row and the count, as above.
+let widenRetagAt: {[i32]: i32} = Map()
+let widenRetagN: {[i32]: i32} = Map()
+let widenRetagFromTy: i32[] = []
+let widenRetagToTy: i32[] = []
 // Literal-width sidecar, parallel to `nodeTyIx`: true at a radix `NumLit` whose destination is a
 // 64-bit slot, so its bit pattern is read at 64 bits rather than at the width its digits imply.
 // `checkNodeReal` consults it so a re-check keeps the adopted width, and the emitter reads the
@@ -4735,6 +4763,10 @@ export function initChecker() {
   mapRetagN = Map()
   mapRetagFromTy = []
   mapRetagToTy = []
+  widenRetagAt = Map()
+  widenRetagN = Map()
+  widenRetagFromTy = []
+  widenRetagToTy = []
   litWide64 = []
   litTreeTy = []
   shiftCountNodes = []
@@ -17275,7 +17307,7 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
       // D2060 — the record twin: a field widened by this delivery is shared with the source,
       // so it is legal only where nothing the delivery reaches writes it.
       rcwPend(srcExpr, srcTy, dstTy)
-      if mapDeliveryMayRecord(srcExpr, srcTy) {
+      if mapDeliveryMayRecord(srcExpr, srcTy, dstTy) {
         recordMapUnbox(srcExpr, srcTy, dstTy, 8)
       }
       if objShapeAdapterlessAt(srcExpr, srcTy, dstTy) {
@@ -30108,7 +30140,10 @@ function objShapeAdapterless(
       if objShapeAdapterless(-1, s.aElem, d.aElem, depth - 1, false) {
         return true
       }
-      if containerElemClassDiffers(s.aElem, d.aElem) {
+      if (
+        containerElemClassDiffers(s.aElem, d.aElem)
+        || (d.aRead == 0 && unionElemMemberWidens(s.aElem, d.aElem))
+      ) {
         // Only a `readonly` destination takes the converting copy (D965), and only where
         // nothing writes the source: the copy is a snapshot. An unknown write state (2) refuses.
         if d.aRead == 1 && scalarElemWidenServed(s.aElem, d.aElem) {
@@ -30151,6 +30186,7 @@ function objShapeAdapterless(
       if (
         containerElemClassDiffers(s.mVal, d.mVal)
         || mapValBoxDiffers(s.mVal, d.mVal)
+        || unionElemMemberWidens(s.mVal, d.mVal)
       ) {
         shapeAdaptSrcTy = src
         shapeAdaptDstTy = dst
@@ -30291,6 +30327,7 @@ function containerWidenReadonlyServes(src: i32, dst: i32): boolean {
     if d is TyArray {
       if d.aRead == 1 { return false }
       if scalarElemWidenServed(s.aElem, d.aElem) { return true }
+      if unionElemMemberWidens(s.aElem, d.aElem) { return false }
       return !containerElemClassDiffers(s.aElem, d.aElem)
     }
   }
@@ -38321,7 +38358,11 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
     // its element type from the param (`len(empty)` resolves `empty` to `i32[]`),
     // clearing its uninferred floor — pure downstream-usage inference, no push.
     constrainEmptyExpr(args[i], at, expected)
-    if !assignableExpr(args[i], at, expected) {
+    const savedGenArg = widenRetagGenArg
+    widenRetagGenArg = tyWideUnionMinted && tyHasTyVar(params[i])
+    const argOk = assignableExpr(args[i], at, expected)
+    widenRetagGenArg = savedGenArg
+    if !argOk {
       // Anchored at the offending argument (or its offending return site),
       // never at the call node — see `argMismatchErr`.
       argMismatchErr(i + 1, expected, at, args[i])
@@ -46569,6 +46610,7 @@ export function mapUnboxTyOf(ix: i32): i32 {
 function recordMapUnbox(srcExpr: i32, srcTy: i32, dstIn: i32, depth: i32) {
   if srcExpr < 0 || srcTy < 0 || dstIn < 0 || depth <= 0 { return 0 }
   if srcTy >= T.tys.length || dstIn >= T.tys.length { return 0 }
+  recordWidenRetagTails(srcExpr, dstIn)
   const dstTy = nonNullTy(dstIn)
   if dstTy < 0 || dstTy >= T.tys.length { return 0 }
   const d = T.tys[dstTy]
@@ -46676,6 +46718,228 @@ function recordMapRetag(srcExpr: i32, srcTy: i32, dstTy: i32) {
   0
 }
 
+// `recordWidenRetag` at each value a delivery into `dstTy` hands over, when `dstTy` is a union
+// or nullable with an `i64` or `f64` member a narrower scalar member can widen to (D2974).
+function recordWidenRetagTails(srcExpr: i32, dstTy: i32) {
+  if widenRetagGenArg || dstTy < 0 || dstTy >= T.tys.length { return 0 }
+  const dt = T.tys[dstTy]
+  if !(dt is TyUnion || dt is TyNullable) { return 0 }
+  if !unionLeafIsWide(dstTy, 8) { return 0 }
+  const dm: i32[] = []
+  unionLeavesInto(dstTy, dm, 8)
+  if primAmong("i64", dm) < 0 && primAmong("f64", dm) < 0 { return 0 }
+  const leaves = valueTailLeaves(srcExpr)
+  let i = 0
+  while i < leaves.length {
+    recordWidenRetag(leaves[i], nodeTyIxOf(leaves[i]), dm)
+    i = i + 1
+  }
+  0
+}
+
+// Records, for a union box `srcTy` delivered into a union whose non-null members are `dm`,
+// each scalar member `dm` lacks beside the member it widens to: the box built under the source
+// member's tag must hold the widened payload under the destination member's (`widenRetagRowsOf`).
+function recordWidenRetag(srcExpr: i32, srcTy: i32, dm: i32[]) {
+  if srcExpr < 0 { return 0 }
+  const start = widenRetagFromTy.length
+  widenMemberPairs(srcTy, dm, widenRetagFromTy, widenRetagToTy)
+  if widenRetagFromTy.length > start {
+    mapDeliveryRecorded = true
+    widenRetagAt.set(srcExpr, start)
+    widenRetagN.set(srcExpr, widenRetagFromTy.length - start)
+  }
+  0
+}
+
+// The scalar members of union box `srcTy` that the non-null members `dm` hold only widened,
+// pushed onto `from` beside the member each widens to on `to`; nothing when `srcTy` is no box.
+function widenMemberPairs(srcTy: i32, dm: i32[], from: i32[], to: i32[]) {
+  if srcTy < 0 || srcTy >= T.tys.length { return 0 }
+  const sm: i32[] = []
+  unionLeavesInto(srcTy, sm, 8)
+  // A box is a union of two non-null members, or `i32 | null`; any other nullable is a niche.
+  if sm.length == 0 { return 0 }
+  if sm.length == 1 && !(tyPrimNameIs(sm[0], "i32") && tyHasNullMember(srcTy)) {
+    return 0
+  }
+  let i = 0
+  while i < sm.length {
+    const a = sm[i]
+    if !tyAmong(a, dm) {
+      const w = widenTargetOf(a, dm)
+      if w >= 0 {
+        from.push(a)
+        to.push(w)
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// Whether a union box element `se` stored where `de` is wanted needs a member widened, which
+// changes what its box holds: a list or map of them is stored differently (D2982).
+function unionElemMemberWidens(se: i32, de: i32): boolean {
+  if de < 0 || de >= T.tys.length { return false }
+  if !tyWideUnionMinted || !unionLeafIsWide(de, 8) { return false }
+  const dm: i32[] = []
+  unionLeavesInto(de, dm, 8)
+  if dm.length < 2 && !tyHasNullMember(de) { return false }
+  const from: i32[] = []
+  const to: i32[] = []
+  widenMemberPairs(se, dm, from, to)
+  from.length > 0
+}
+
+// The member of `dm` scalar `a` widens to without loss: `i64` then `f64` for an `i32`, `f64` for
+// an `f32`; -1 for any other `a`, or when `dm` holds neither.
+function widenTargetOf(a: i32, dm: i32[]): i32 {
+  if tyPrimNameIs(a, "i32") {
+    const w = primAmong("i64", dm)
+    if w >= 0 { return w }
+    return primAmong("f64", dm)
+  }
+  if tyPrimNameIs(a, "f32") { return primAmong("f64", dm) }
+  -1
+}
+
+// The first of `tys` that is the primitive `name`, or -1.
+function primAmong(name: string, tys: i32[]): i32 {
+  let i = 0
+  while i < tys.length {
+    if tyPrimNameIs(tys[i], name) { return tys[i] }
+    i = i + 1
+  }
+  -1
+}
+
+// Whether `ty` is `| null` or a union with a `null` member.
+function tyHasNullMember(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  const t = T.tys[ty]
+  match t {
+    TyNullable => {
+      return true
+    }
+    TyUnion => {
+      let i = 0
+      while i < t.uMembers.length {
+        if isNullTy(t.uMembers[i]) { return true }
+        i = i + 1
+      }
+      return false
+    }
+    // Any other type is one member, which a caller asks `isNullTy` of directly.
+    TyPrim | TyErr | TyObj | TyMap | TyFunc | TyArray | TyVar | TyLit | TyNeg => {
+      return false
+    }
+  }
+}
+
+// Whether `ty` is the primitive `name`.
+function tyPrimNameIs(ty: i32, name: string): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  const t = T.tys[ty]
+  if t is TyPrim { return t.primName == name }
+  false
+}
+
+// Whether `ty` holds an `i64` or `f64` through unions, `| null`, list elements and record
+// fields: the cheap gate a widening retag needs in a program with no map type.
+function tyHoldsWideScalar(ty: i32, depth: i32): boolean {
+  if ty < 0 || ty >= T.tys.length || depth <= 0 { return false }
+  const t = T.tys[ty]
+  match t {
+    TyPrim => {
+      return t.primName == "i64" || t.primName == "f64"
+    }
+    TyNullable => {
+      return tyHoldsWideScalar(t.nInner, depth - 1)
+    }
+    TyArray => {
+      return tyHoldsWideScalar(t.aElem, depth - 1)
+    }
+    TyUnion => {
+      return tysHoldWideScalar(t.uMembers, depth - 1)
+    }
+    TyObj => {
+      return tysHoldWideScalar(t.objFieldTypes, depth - 1)
+    }
+    // No other type is or holds a member a union box can widen into.
+    TyErr | TyMap | TyFunc | TyVar | TyLit | TyNeg => {
+      return false
+    }
+  }
+}
+
+// Whether a member of `ty`, through unions and `| null` only, is `i64` or `f64`: the check
+// ahead of `unionLeavesInto`, which allocates.
+function unionLeafIsWide(ty: i32, depth: i32): boolean {
+  if ty < 0 || ty >= T.tys.length || depth <= 0 { return false }
+  const t = T.tys[ty]
+  match t {
+    TyPrim => {
+      return t.primName == "i64" || t.primName == "f64"
+    }
+    TyNullable => {
+      return unionLeafIsWide(t.nInner, depth - 1)
+    }
+    TyUnion => {
+      let i = 0
+      while i < t.uMembers.length {
+        if unionLeafIsWide(t.uMembers[i], depth - 1) { return true }
+        i = i + 1
+      }
+      return false
+    }
+    // A list, record or any other type is one member that is not a scalar.
+    TyErr | TyObj | TyMap | TyFunc | TyArray | TyVar | TyLit | TyNeg => {
+      return false
+    }
+  }
+}
+
+// `tyHoldsWideScalar` of any of `tys`.
+function tysHoldWideScalar(tys: i32[], depth: i32): boolean {
+  let i = 0
+  while i < tys.length {
+    if tyHoldsWideScalar(tys[i], depth) { return true }
+    i = i + 1
+  }
+  false
+}
+
+// Whether `recordMapRetag` or `recordWidenRetag` recorded a row at `ix`: one gate for the
+// emitter's per-expression hook.
+export function deliveryRetagHas(ix: i32): boolean {
+  if mapRetagFromTy.length == 0 && widenRetagFromTy.length == 0 { return false }
+  mapRetagAt.has(ix) || widenRetagAt.has(ix)
+}
+
+// Whether a widening retag row rebuilds a box under the primitive `name`, whose value box the
+// module must then carry even where no declared union names it (a pin can mint the member).
+export function widenRetagToHas(name: string): boolean {
+  primAmong(name, widenRetagToTy) >= 0
+}
+
+// Whether any delivery in the program records a widening retag.
+export function widenRetagAny(): boolean { widenRetagFromTy.length > 0 }
+
+// The widening rows `recordWidenRetag` recorded at `ix`, pushed onto `from` and `to`.
+export function widenRetagRowsOf(ix: i32, from: i32[], to: i32[]) {
+  const st = widenRetagAt.get(ix) ?? -1
+  if st < 0 { return 0 }
+  const n = widenRetagN.get(ix) ?? 0
+  let i = st
+  while i < st + n && i < widenRetagFromTy.length {
+    from.push(widenRetagFromTy[i])
+    to.push(widenRetagToTy[i])
+    i = i + 1
+  }
+  0
+}
+
 // Whether `ty` is a map or holds one through unions and `| null`: the cheap gate a retag
 // needs, which allocates nothing.
 function tyHasMapMember(ty: i32, depth: i32): boolean {
@@ -46730,12 +46994,6 @@ function tyAmong(ty: i32, tys: i32[]): boolean {
   false
 }
 
-// Whether `recordMapRetag` recorded a row at `ix`: the cheap gate ahead of `mapRetagRowsOf`.
-export function mapRetagHas(ix: i32): boolean {
-  if mapRetagFromTy.length == 0 { return false }
-  mapRetagAt.has(ix)
-}
-
 // The retag rows `recordMapRetag` recorded at `ix`, pushed onto `from` and `to`.
 export function mapRetagRowsOf(ix: i32, from: i32[], to: i32[]) {
   const st = mapRetagAt.get(ix) ?? -1
@@ -46763,8 +47021,10 @@ export function mapRetagAllRows(from: i32[], to: i32[]) {
 
 // The cheap gate ahead of `recordMapUnbox`: only a union (a box, or a value join typed as one)
 // or a list or record literal, which is walked to its parts, can record anything.
-function mapDeliveryMayRecord(srcExpr: i32, srcTy: i32): boolean {
-  if !tyMapMinted { return false }
+function mapDeliveryMayRecord(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
+  if !tyMapMinted && !(tyWideUnionMinted && tyHoldsWideScalar(dstTy, 8)) {
+    return false
+  }
   if srcTy >= 0 && srcTy < T.tys.length {
     const st = T.tys[srcTy]
     if st is TyUnion || st is TyNullable { return true }
@@ -48678,7 +48938,10 @@ export function anyLitUnionUsed() {
     // also counts — checked on the recorded type, not the annotation name, at every node.
     if nodeTyIsLitUnion(i) { return true }
     if nodeTyIsNulLitUnion(i) { return true }
-    if nodeArrayElemIsLitUnion(i) { return true }
+    const et = nodeArrayElemTyIx(i)
+    if et >= 0 {
+      if tyIsLitUnion(et) || tyIsNullableLitUnion(et) { return true }
+    }
     i = i + 1
   }
   false
@@ -49110,9 +49373,20 @@ export function nodeLitUnionMemberTexts(ix: i32) {
 // exactly the widenable members. Empty when `ix` is not the nullable niche — how `print`'s
 // dispatch tells the two widening chains apart, asked first since the expanded spelling satisfies both.
 export function nodeNulLitUnionMemberTexts(ix: i32) {
-  const ty = nulLitUnionPeelTy(nodeTyIxOf(ix))
-  if ty < 0 { return emptyTextList() }
-  tyLitMemberTexts(ty)
+  tyNulLitUnionMemberTexts(nodeTyIxOf(ix))
+}
+
+// `nodeNulLitUnionMemberTexts` asked of arena type `ty` itself, for a caller whose node records a
+// type parameter and whose type is the instance's pin instead.
+export function tyNulLitUnionMemberTexts(ty: i32) {
+  const lt = nulLitUnionPeelTy(ty)
+  if lt < 0 { return emptyTextList() }
+  tyLitMemberTexts(lt)
+}
+
+// Whether `ty` is the nullable literal-union niche, `tyNulLitUnionMemberTexts` without the list.
+export function tyIsNulLitUnionNiche(ty: i32): boolean {
+  nulLitUnionPeelTy(ty) >= 0
 }
 
 // Peels every nullable wrapper off `ty` and answers the arena index of the litunion
