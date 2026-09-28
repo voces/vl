@@ -684,7 +684,7 @@ Cranelift compile is cached".
 |---|---|
 | `-o <out.wasm>` | output path (default: the input with `.vl` → `.wasm`) |
 | `-o -` | write the module BYTES to stdout and nothing to disk |
-| `-O` | **shrink rung** — one open-world `wasm-opt -O`, inlining leaf functions up to size 8 (DECISIONS.md, "`-O` inlines leaf helpers") |
+| `-O` | **shrink rung** — one open-world `wasm-opt -O`, inlining functions up to size 16 (DECISIONS.md, "`-O` inlines leaf helpers", "`-O` inlines a fast path") |
 | `-O3` | **release profile** — `wasm-opt --closed-world -O3 --gufa -O3` |
 | `--wat` | also dump a `.wat` beside the module (`wasm-dis`), AFTER optimization |
 | `--names` | embed the wasm `name` custom section (legible trap backtraces) |

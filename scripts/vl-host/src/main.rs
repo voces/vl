@@ -526,7 +526,7 @@ program verbatim — the only way to pass one that starts with `-`.
   {c}-o{r} <out.wasm>       Output path (default: the input with `.wasm`)
   {c}-o -{r}                Write the module to stdout; no file is created
   {c}-O{r}                  Optimize with wasm-opt — the shrink rung (one -O pass,
-                      which also inlines small leaf functions)
+                      which also inlines small functions)
   {c}-O3{r}                 The release profile (closed-world + -O3; melts union
                       boxes). Wins over -O when both are given. Both rungs
                       require binaryen's wasm-opt and fail loudly without it
@@ -5250,11 +5250,12 @@ const BINARYEN_FEATURES: &[&str] = &[
 /// NOTHING that reaches its use across a control-flow JOIN — so a `{tag, value}`
 /// union box built on two arms survives `-O` entirely. `-O3` is the rung for those.
 ///
-/// It also inlines every function of at most 8 binaryen size units (`rg(i) =
-/// __load_i64__(CTX + i * 8)` is 6), wherever it is called. Binaryen's own `-O` stops at 2
-/// and leaves such a leaf as a call per use; `-O3` inlines them anyway. The `--no-inline`
-/// marks of lane L8 still win over the size (DECISIONS.md, "`-O` inlines leaf helpers").
-const OPT_PASSES: &[&str] = &["--always-inline-max-function-size", "8", "-O"];
+/// It also inlines every function of at most 16 binaryen size units, wherever it is called:
+/// a leaf such as `rg(i) = __load_i64__(CTX + i * 8)` (6), and a fast path that branches to
+/// an out-of-line slow call, such as a NaN-exact `fmul32` (11 or 12) whose `nan32` stays a
+/// call. Binaryen's own `-O` stops at 2. The `--no-inline` marks of lane L8 still win over
+/// the size (DECISIONS.md, "`-O` inlines leaf helpers" and "`-O` inlines a fast path").
+const OPT_PASSES: &[&str] = &["--always-inline-max-function-size", "16", "-O"];
 
 /// `vl build -O --low-memory-unused`: binaryen's `--low-memory-unused`, under which `-O` and
 /// `-O3` also run `optimize-added-constants`, folding an address `p + C` with `C < 1024` into the

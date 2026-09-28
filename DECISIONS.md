@@ -7270,6 +7270,84 @@ elsewhere it is small (the compiler +0.94%, `decode-bench` +21 bytes, the 86 `be
 * *A much larger size.* L4 measured `-aimfs 400` doubling `decode-bench` and costing V8 3–6%;
   12 already buys almost nothing over 8 here.
 
+PL-053 later raised the size to 16, for a helper whose fast path branches to a slow call (the
+next section).
+
+## `-O` inlines a fast path that calls out to a slow one (2026-09-28) — plumb PL-053
+
+**The defect.** plumb does every float operation through a helper that reproduces x86's NaN:
+`function fmul32(a: f32, b: f32): f32 { const r = a * b; if r != r { nan32(a, b) } else { r } }`,
+where `nan32` picks the first NaN operand, quieted, else `0xffc00000`. Binaryen sizes that helper
+at 11, or 12 in the `if r != r { return nan32(a, b) }; r` form plumb's `rt.vl` uses, just over
+PL-027's size of 8, so at `-O` every float operation in a translated unit was a call: 5,692 of
+them in `chunk_464`. V8 does not inline them in a function that large either; in plumb's Chrome
+profile `fmul32` alone was 1.18% of the game worker's ticks and `fsub32` 0.51%. plumb measured
+binaryen's `--always-inline-max-function-size=16 --inlining-optimizing` run after `vl build -O`
+on every unit: +2% size (164.4 → 167.6 MB) and Mac Chrome 272 → 309 fps.
+
+**The rule.** The `-O` rung's size goes from 8 to 16 (`OPT_PASSES` in
+`scripts/vl-host/src/main.rs`). `nan32`, at about 20, stays a call: the fast path is inlined and
+the slow path is not. L8's run-once marks still win, and `-O3` is unchanged.
+
+**What was rejected.**
+* *Partial inlining* (`--partial-inlining-ifs`, `-pii 1` and `3`). Binaryen splits only a
+  function whose body STARTS with the `if`; this one starts by computing `r`, so it inlines
+  nothing here (0 of 601 calls in the stand-in), at every setting measured.
+* *12.* The smallest size that inlines both forms of the helper. It builds the float-heavy units
+  as 16 does, and the compiler 1.0% smaller. 16 is what plumb measured end to end, and leaves
+  room for a helper one or two nodes larger (an extra operand, a mask on the result).
+* *A host step that inlines only "fast path plus a call" functions.* The host can already force
+  exactly chosen callees inline (lane L4's renaming step), but that costs a second `wasm-opt`
+  run over each 2 MB unit, while the plain size costs the compiler 2.3% and plumb's units
+  without float helpers under 1.3%.
+* *An `inline` hint on a function.* A language change; left to the owner (PL-053's report).
+* *The same size at `-O3`.* `-O3` inlines a "lightweight" function up to 20, but a function
+  that makes a call is not lightweight, so `-O3` also keeps `fmul32` a call (5,692 in
+  `chunk_464`). plumb builds at `-O`; changing the release rung is a separate measurement.
+
+**Measured.** binaryen 133 (130 inlines the same sizes). Sizes in bytes of a `--names -O
+--import-memory` build, as plumb builds its units; optimiser CPU is `wasm-opt` alone at load
+3–24, so read it as noise within ±10%.
+
+| `-O` with size | 8 (was) | 12 | **16** |
+| --- | --- | --- | --- |
+| plumb `chunk_464` (most `fmul32` uses) | 275,874 | 412,722 | **412,722** |
+| its calls to `f{add,sub,mul,div}{32,64}` | 5,692 | 0 | **0** |
+| plumb `chunk_448` | 264,303 | 348,715 | **348,672** |
+| plumb, every 64th unit (10), bytes | 2,594,630 | 2,680,920 (+3.33%) | **2,688,466 (+3.62%)** |
+| the same 10, optimiser CPU / largest RSS | 20.1 s / 68 MB | 20.8 s / 69 MB | **20.6 s / 73 MB** |
+| the compiler, `-O` bytes | 2,690,477 | 2,723,319 (+1.22%) | **2,751,172 (+2.26%)** |
+| 90 `bench/` programs, bytes (changed) | 103,443 | — | **105,537 (3)** |
+| `plumb-shape-cost.py`'s two units | — | — | **byte-identical to 8** |
+
+Eight of the ten sampled units change by under 1.3%; the growth is in the float-heavy units
+(`chunk_448` +32%, `chunk_464` +50%), and it is the inlining itself. plumb's whole game grew 2%.
+
+Runtime, CPU seconds, median of 7 alternating rounds at load 2–4. V8 is node 24 instantiating
+the module; wasmtime is `vl run` on the prebuilt module. The stand-ins are verbatim copies of
+plumb's helpers called from a kernel: `big` is one function of 600 helper calls run 10^6 times,
+`small` one of 9 calls run 10^8 times.
+
+| program | engine | size 8 (was) | **16** | `-O3` |
+| --- | --- | --- | --- | --- |
+| `big` | V8 | 0.769 | **0.686** (−11%) | 0.807 |
+| `big` | wasmtime | 0.670 | **0.690** (+3%) | 0.720 |
+| `small` | V8 | 0.555 | **0.550** | 0.559 |
+| `small` | wasmtime | 0.910 | **0.560** (−38%) | 0.920 |
+| `bench/` `binarytrees`, `struct-alloc`, `fib` (the 3 that change) | both | — | flat within noise | — |
+| the compiler building `chunk_543` | wasmtime | 1.54 | **1.51**, identical output | — |
+
+V8's own inliner covers the small kernel and runs out in the large one, as PL-027 found; plumb's
+frame rate is the large case. Neither the seed nor its size gate moves: the seed is built without
+`-O`.
+
+**Correctness.** Inlining must not move a NaN's bits. `tests/fixtures/opt-leaf/nan-exact.vl`
+runs every helper over signalling and quiet NaNs with payloads on either side, `Inf - Inf`,
+`0 * Inf` and ordinary operands, in both operand orders; its 72 expected lines were checked
+against an independent numpy model of the x86 rule, and `-O` must print them exactly, with every
+helper inlined and `nan32`/`nan64` still called. The -O output under binaryen 133 and under V8
+prints the same.
+
 ## `-O` skips `ssa-nomerge` for a function over 8,192 sets (2026-09-24) — plumb's tail units, D2336
 
 **The defect.** After #3108 and #3112, plumb's rebuild was set by its tail: 23 of 625 units
