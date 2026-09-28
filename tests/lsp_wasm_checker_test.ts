@@ -1483,3 +1483,21 @@ Deno.test({
     );
   }
 });
+
+// D3069 — a keyword naming a binding is ONE editor diagnostic, spanning the keyword at the
+// declaration; the uses of the name after it add nothing (they were a cascade of three).
+Deno.test({ name: "wasm-checker: a keyword parameter name is one diagnostic at the declaration", ignore }, async () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  const diags = await checker.check(
+    "function f(type: i64) { if type == 0 { return -1 }; type + 1 }\n",
+    "/tmp/x.vl",
+    noSiblings,
+  );
+  const want = "`type` is a keyword and can't name a parameter — rename it";
+  const got = diags.map((d) =>
+    `${d.severity} ${d.range.start.line}:${d.range.start.character}-${d.range.end.character} ${d.message}`
+  );
+  if (got.length !== 1 || got[0] !== `error 0:11-15 ${want}`) {
+    throw new Error(`want exactly [error 0:11-15 ${want}], got: ${JSON.stringify(got)}`);
+  }
+});

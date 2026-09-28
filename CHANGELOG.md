@@ -1814,6 +1814,14 @@ new: the compare-frame pre-pass never recurses into a code-15 field, so a NESTED
 
 ## Parser (Track G — complete)
 
+- **A keyword naming a binding is one error, at the declaration (D3069, plumb PL-071).**
+  `function f(type: i64) { if type == 0 { return -1 }; type + 1 }` printed four errors, one
+  per later use of the name plus a location-less `A type alias requires a body`. A parameter,
+  `let`, `const`, either `for` variable, a lambda parameter or a function name now says
+  `` `type` is a keyword and can't name a parameter — rename it ``, and the parser reads the
+  keyword as that name for recovery wherever the keyword itself cannot stand, so the uses add
+  nothing; a genuine later error is still reported. Which programs parse is unchanged — whether
+  a keyword may name a binding is left to the owner.
 - **A call as a block's first statement no longer parses as a bogus object-literal method
   member when a brace-led statement follows it (D2292, found in review of #3100).**
   `function mk(n: i32): Q { print("mk"); { x: n } }` was a parse error: `looksLikeObject`'s
