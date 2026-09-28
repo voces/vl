@@ -12771,13 +12771,17 @@ function armFieldUnionName(memIx: i32, fnIx: i32) {
   ""
 }
 
-// The read-side composite: `memberUnionFieldName` first, then the declared-arm rung
-// (`armFieldUnionName`). The three read classifiers ask this; the `is`-narrowing push
-// sites keep asking `memberUnionFieldName` directly, since a pushed value there is
-// already a bare variant ref, not a box `emitNarrowedMem` could unwrap (D220).
+// The read-side composite: `memberUnionFieldName` (the receiver's own spelling where the read
+// narrows a wider box), then the declared-arm rung (`armFieldUnionName`). The read classifiers
+// ask this; the `is`-narrowing push sites ask `memberUnionFieldName` directly, since a pushed
+// value there is already a bare variant ref, not a box `emitNarrowedMem` could unwrap (D220).
 export function memberUnionFieldNameRead(memIx: i32, fnIx: i32) {
   const r = memberUnionFieldName(memIx, fnIx)
-  if r != "" { return r }
+  if r != "" {
+    const nn = memReadBoxNarrowName(memIx, fnIx)
+    if nn != "" { return nn }
+    return r
+  }
   armFieldUnionName(memIx, fnIx)
 }
 
@@ -15571,7 +15575,10 @@ export function exprIsF32(exprIx: i32, fnIx: i32) {
     if exprF32Array(e.idxArr, fnIx) { return true }
   }
   // A field read `s.x` whose struct field is an f32 slot (code 24) yields an f32.
-  if e is Member { return memFieldTypeCode(exprIx, fnIx) == FC_F32 }
+  if e is Member {
+    return memFieldTypeCode(exprIx, fnIx) == FC_F32
+      && memReadNarrowOp(exprIx, fnIx) < 0
+  }
   if e is Ident {
     // A value-union ident classifies by its narrowed atom (see exprIsI64).
     const uk = unionIdentReadKind(exprIx, fnIx)
@@ -36376,45 +36383,150 @@ export function sharedUnionFieldPlan(
   code
 }
 
-// The opcode narrowing the field read at `memIx` back to the `i32` the checker typed it, or -1:
-// an `i64` or `f64` slot of a record literal built at a wider declared record of its field names
-// and read at its own type. Exact, since nothing writes a covariant delivery's widened slot (D2987).
+// The opcode narrowing the field read at `memIx` back to the `i32` or `f32` the checker typed it,
+// or -1: a wider scalar slot of a record built at a wider declared record of its field names,
+// read through any handle at its own type. Exact, since nothing writes a covariant delivery's
+// widened slot (D2987).
 export function memReadNarrowOp(memIx: i32, fnIx: i32): i32 {
   const ty = nodeTyIxOf(memIx)
-  if ty < 0 || ty >= T.tys.length || tyKindOf(ty) != TK_I32 { return -1 }
+  if ty < 0 || ty >= T.tys.length { return -1 }
   const t = T.tys[ty]
-  if t is TyPrim {
-    if t.primName != "i32" { return -1 }
-  }
+  let own = ""
+  if t is TyPrim { own = t.primName }
+  if own != "i32" && own != "f32" { return -1 }
+  if !memRecvIsRecord(memIx, fnIx) { return -1 }
   const fc = memFieldTypeCode(memIx, fnIx)
-  if fc != FC_I64 && fc != FC_F64 { return -1 }
-  if !memRecvIsObjLitBinding(memIx, fnIx) { return -1 }
-  if fc == FC_I64 {
-    return 167 // i32.wrap_i64
-  }
-  170 // i32.trunc_f64_s
+  let wk = -1
+  if fc == FC_I64 { wk = 3 }
+  if fc == FC_F64 { wk = 4 }
+  if fc == FC_F32 { wk = 5 }
+  atomNarrowOp(wk, valueAtomKind(own))
 }
 
-// Whether the receiver of the field read at `memIx` names an un-annotated binding of an object
-// literal, the one receiver a wider declared record can be built for without a checked type.
-function memRecvIsObjLitBinding(memIx: i32, fnIx: i32): boolean {
+// Whether the checker typed the receiver of the field read at `memIx` as a record, `| null`
+// peeled: the one receiver whose storage can be a wider record of the same field names.
+function memRecvIsRecord(memIx: i32, fnIx: i32): boolean {
   if memIx < 0 || memIx >= P.nodes.length { return false }
   const m = P.nodes[memIx]
   if m is Member {
-    const rx = unwrapParen(m.memObj)
-    if rx < 0 { return false }
-    const r = P.nodes[rx]
-    if r is Ident {
-      const li = identLetOfAt(sidOfNode(rx), fnIx, rx)
-      if li < 0 { return false }
-      const d = P.nodes[li]
-      if d is LetDecl {
-        if d.letType >= 0 || d.letInit < 0 { return false }
-        return P.nodes[unwrapParen(d.letInit)] is ObjLit
-      }
+    // A read the variant tables serve is lowered by `emitMem`'s variant rungs, not its struct one.
+    if memIsNarrowed(memIx) && memNarrowVariantIndex(memIx) >= 0 {
+      return false
     }
+    if exprVariantIndex(m.memObj, fnIx) >= 0 { return false }
+    if memRecvNulVariantIndex(m.memObj, fnIx) >= 0 { return false }
+    return rsTyIsRecord(recvCheckedTyOf(unwrapParen(m.memObj), fnIx, 0))
   }
   false
+}
+
+// The checker's type of the receiver `rx`, or, where it recorded none for the node (a narrowed
+// member read's receiver), of the binding or record field `rx` names; -1 when neither is known.
+function recvCheckedTyOf(rx: i32, fnIx: i32, depth: i32): i32 {
+  const t = nodeTyIxOf(rx)
+  if t >= 0 || rx < 0 || rx >= P.nodes.length || depth > 16 { return t }
+  const n = P.nodes[rx]
+  if n is Member {
+    let ot = recvCheckedTyOf(unwrapParen(n.memObj), fnIx, depth + 1)
+    if ot < 0 || ot >= T.tys.length { return -1 }
+    const o = T.tys[ot]
+    if o is TyNullable { ot = o.nInner }
+    return tyFieldTyOf(ot, n.memProp)
+  }
+  identDeclTyOf(rx, fnIx)
+}
+
+// The declared type of the binding or parameter the identifier at `rx` names in function `fnIx`
+// (an un-annotated binding's initializer's type), or -1 for any other node.
+function identDeclTyOf(rx: i32, fnIx: i32): i32 {
+  if rx < 0 || rx >= P.nodes.length { return -1 }
+  const n = P.nodes[rx]
+  if n is Ident {
+    const li = identLetOfAt(sidOfNode(rx), fnIx, rx)
+    if li >= 0 {
+      const d = P.nodes[li]
+      if d is LetDecl {
+        if d.letType >= 0 { return annRowOfNode(d.letType) }
+        return nodeTyIxOf(unwrapParen(d.letInit))
+      }
+    }
+    const pi = paramIndexOf(fnIx, n.identName)
+    const ft = nodeTyIxOf(fnIx)
+    if pi < 0 || ft < 0 || ft >= T.tys.length { return -1 }
+    const f = T.tys[ft]
+    if f is TyFunc {
+      if pi < f.fnParamTypes.length { return f.fnParamTypes[pi] }
+    }
+  }
+  -1
+}
+
+// The narrowing opcode from value atom `wk` back to the atom `k` a delivery widened it from
+// (`i32` from `i64`, `f64` or `f32`, `f32` from `f64`), or -1: `unwidenI32From`'s table by kind.
+export function atomNarrowOp(wk: i32, k: i32): i32 {
+  if k == 0 && wk == 3 {
+    return 167 // i32.wrap_i64
+  }
+  if k == 0 && wk == 4 {
+    return 170 // i32.trunc_f64_s
+  }
+  if k == 0 && wk == 5 {
+    return 168 // i32.trunc_f32_s
+  }
+  if k == 5 && wk == 4 {
+    return 182 // f32.demote_f64
+  }
+  -1
+}
+
+// The receiver record's own spelling of the union-box field read at `memIx` when its storage is
+// a wider record's: each stored scalar member the own union lacks is one of its members widened.
+// The read site rebuilds such a box at the own member, so every consumer reads it (D3006).
+export function memReadBoxNarrowName(memIx: i32, fnIx: i32): string {
+  if memIx < 0 || memIx >= P.nodes.length { return "" }
+  const m = P.nodes[memIx]
+  if m is Member {
+    const si = structIndexOfExpr(m.memObj, fnIx)
+    if si < 0 { return "" }
+    const fi = sFieldIndex(si, m.memProp)
+    if fi < 0 || sFieldTypeAt(si, fi) != FC_UNION { return "" }
+    if !memRecvIsRecord(memIx, fnIx) { return "" }
+    const rt = recvCheckedTyOf(unwrapParen(m.memObj), fnIx, 0)
+    if rt < 0 || rt >= T.tys.length { return "" }
+    let ot = rt
+    const t = T.tys[rt]
+    if t is TyNullable { ot = t.nInner }
+    const own = tyToEmitName(tyFieldTyOf(ot, m.memProp))
+    const phys = sFieldElemNameAt(si, fi)
+    if own == "" || own == phys { return "" }
+    const pa: string[] = []
+    splitUnionAtoms(phys, pa)
+    const oa: string[] = []
+    splitUnionAtoms(own, oa)
+    let narrowed = false
+    let i = 0
+    while i < pa.length {
+      if !strListHas(oa, pa[i]) {
+        if boxNarrowAtomFor(pa[i], oa, pa) < 0 { return "" }
+        narrowed = true
+      }
+      i = i + 1
+    }
+    if narrowed { return own }
+  }
+  ""
+}
+
+// The kind of the member of `own` that the stored member `p` widened, one `stored` lacks, or -1.
+function boxNarrowAtomFor(p: string, own: string[], stored: string[]): i32 {
+  const wk = valueAtomKind(p)
+  let j = 0
+  while j < own.length {
+    const k = valueAtomKind(own[j])
+    if !strListHas(stored, own[j]) && atomNarrowOp(wk, k) >= 0 { return k }
+    j = j + 1
+  }
+  -1
 }
 
 // The wasm-type code of the struct/variant field a `Member` expression at `memIx` reads
@@ -37670,11 +37782,13 @@ function objLitBindDestRowGo(objIx: i32, own: i32): i32 {
 }
 
 // The struct row the record value at `vx` is delivered to by a declared type, or -1: a typed
-// destination's, a field's of the object literal holding it, or an annotated list literal's
-// element.
+// destination's, a literal-bound name's it is assigned to, a field's of the object literal
+// holding it, or an annotated list literal's element.
 function rsElemDestRow(vx: i32): i32 {
   const r = structIdxOfElemTy(rsElemDestTy(vx))
   if r >= 0 { return r }
+  const ar = rsAssignLitRow(vx)
+  if ar >= 0 { return ar }
   const par = rsUp(vx)
   if par < 0 || par >= P.nodes.length { return -1 }
   const gp = rsUp(par)
@@ -37725,7 +37839,7 @@ function rsElemDestTy(vx: i32): i32 {
     ty = rsCallParamTy(p, vx)
   } else if p is BinExpr {
     if p.binOp != "=" || unwrapParen(p.binRight) != vx { return -1 }
-    ty = rsPlaceStoreTy(p)
+    ty = rsPlaceStoreTy(p, rsFrameOf(vx))
   } else if p is LetDecl {
     if p.letType < 0 { return -1 }
     ty = nodeTyIxOf(p.letType)
@@ -38452,7 +38566,7 @@ function rsElemUseSafe(vx: i32, par: i32, gp: i32, fr: i32, w: RsWalk): i32 {
   }
   if p is BinExpr {
     if p.binOp == "=" && unwrapParen(p.binRight) == vx {
-      const pty = rsPlaceStoreTy(p)
+      const pty = rsPlaceStoreTy(p, fr)
       if pty >= 0 {
         if !rsTyIsRow(pty, w) { return vx }
         // A store is itself a value, and a function body's statement may be what it returns.
@@ -38463,6 +38577,9 @@ function rsElemUseSafe(vx: i32, par: i32, gp: i32, fr: i32, w: RsWalk): i32 {
         return -1
       }
       return rsElemAssignSafe(vx, rsIdentName(unwrapParen(p.binLeft)), fr, w)
+    }
+    if p.binOp == "=" && unwrapParen(p.binLeft) == vx && w.rwList == "" {
+      return rsAssignIntoSafe(vx, p, w)
     }
     return -1
   }
@@ -38557,16 +38674,73 @@ function rsFnRetInferred(fr: i32): boolean {
   false
 }
 
-// The type a store `place = v` delivers its value at when the place is an element or a field
-// (a map's read type carries a `| null` every caller peels), or -1 for a bare name (D2990).
-function rsPlaceStoreTy(p: BinExpr): i32 {
+// The type a store `place = v` in function `fr` delivers its value at: an element's or a
+// field's (a map's read type carries a `| null` every caller peels), or a bare name's declared
+// one, a parameter's or an annotated binding's (D2990). -1 for an un-annotated binding.
+function rsPlaceStoreTy(p: BinExpr, fr: i32): i32 {
   const lx = unwrapParen(p.binLeft)
-  if lx < 0 || lx >= P.nodes.length || P.nodes[lx] is Ident { return -1 }
+  if lx < 0 || lx >= P.nodes.length { return -1 }
+  const l = P.nodes[lx]
+  if l is Ident {
+    if paramIndexOf(fr, l.identName) < 0 {
+      const li = destLetOf(l.identName, fr)
+      if li < 0 || rsLetUnannotated(li) { return -1 }
+    }
+  }
   nodeTyIxOf(lx)
 }
 
+// The row a bare-name store `x = v` at `vx` delivers into when `x` is bound un-annotated to an
+// object literal: the row that literal is built at, which a delivery may have re-seated. -1 else.
+function rsAssignLitRow(vx: i32): i32 {
+  const par = rsUp(vx)
+  if par < 0 || par >= P.nodes.length { return -1 }
+  const p = P.nodes[par]
+  if p is BinExpr {
+    if p.binOp != "=" || unwrapParen(p.binRight) != vx { return -1 }
+    const fr = rsFrameOf(vx)
+    const li = destLetOf(rsIdentName(unwrapParen(p.binLeft)), fr)
+    if li < 0 || paramIndexOf(fr, letBoundName(li)) >= 0 { return -1 }
+    return rsLetLitRow(li)
+  }
+  -1
+}
+
+// `x = v` into the literal's own binding `x` at `vx`: a fresh literal is built at the binding's
+// row, a literal-bound name follows it there (`rsAssignLitRow`), and any other record of a known
+// row must already be that row, since a record is shared, not converted (D3010).
+function rsAssignIntoSafe(vx: i32, p: BinExpr, w: RsWalk): i32 {
+  const rx = unwrapParen(p.binRight)
+  if rx < 0 || rx >= P.nodes.length || P.nodes[rx] is ObjLit { return -1 }
+  const li = destLetOf(rsIdentName(rx), rsFrameOf(vx))
+  if rsLetLitInit(li) >= 0 { return -1 }
+  const r = structIdxOfElemTy(nodeTyIxOf(rx))
+  if r < 0 || rsSameRow(r, w.rwRow) { return -1 }
+  vx
+}
+
+// The row the un-annotated binding at `li` of an object literal is built at, or -1.
+function rsLetLitRow(li: i32): i32 {
+  const ini = rsLetLitInit(li)
+  if ini < 0 { return -1 }
+  structIndexOfObjCtx(ini, rsFrameOf(li))
+}
+
+// The object literal the un-annotated binding at `li` is initialised with, or -1.
+function rsLetLitInit(li: i32): i32 {
+  if li < 0 || li >= P.nodes.length { return -1 }
+  const d = P.nodes[li]
+  if d is LetDecl {
+    if d.letType >= 0 || d.letInit < 0 { return -1 }
+    const ini = unwrapParen(d.letInit)
+    if ini >= 0 && P.nodes[ini] is ObjLit { return ini }
+  }
+  -1
+}
+
 // `x = e` for an element `e` at `vx`: the binding `x` holds the re-seated row only when it is
-// declared at it, or bound un-annotated from an element of the same list.
+// declared at it, bound un-annotated from an element of the same list, or bound un-annotated to
+// an object literal built at that row (D3008).
 function rsElemAssignSafe(vx: i32, x: string, fr: i32, w: RsWalk): i32 {
   if x == "" { return -1 }
   const li = destLetOf(x, fr)
@@ -38580,6 +38754,7 @@ function rsElemAssignSafe(vx: i32, x: string, fr: i32, w: RsWalk): i32 {
     if d.letInit >= 0 && rsIndexOfName(unwrapParen(d.letInit), w.rwList) {
       return -1
     }
+    if rsSameRow(rsLetLitRow(li), w.rwRow) { return -1 }
     return vx
   }
   -1

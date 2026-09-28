@@ -664,6 +664,7 @@ import {
   asgReadNode,
   asgReadUnwidenOp,
   assignTargetReReads,
+  atomNarrowOp,
   binEqNulVariantRow,
   binEqStructRow,
   binEqVariantRow,
@@ -904,6 +905,7 @@ import {
   maskNarrowFor,
   memIsNarrowed,
   memNarrowVariantIndex,
+  memReadBoxNarrowName,
   memReadBoxedAtomKind,
   memReadBoxedAtomKinds,
   memReadNarrowOp,
@@ -1148,6 +1150,7 @@ import {
 } from "./emit_collect"
 import { voidTwinForNode } from "./emit_rewrite"
 import { nameIsQuotedLeaf, nameIsShapeOpen, splitUnionAtoms } from "./tyname"
+import { strListHas } from "./listutil"
 import { monoOrigNode } from "./emit_state"
 import {
   INIT_REACH_NEVER,
@@ -5264,7 +5267,23 @@ function emitArmForEffect(body: u8[], blockIx: i32, fnIx: i32) {
   emitIfArmClose(emitNulNoneForEffect(body, ifArmValueExpr(blockIx), fnIx))
 }
 
+// The value at `exprIx` boxed into the union `unionName`. A box of a member set holding a member
+// `unionName` holds only widened is rebuilt there (`emitBoxAtomRetag`), so a record built or
+// written at a wider record's field reads back through every handle (D3006).
 export function emitUnionBoxArg(
+  body: u8[],
+  unionName: string,
+  exprIx: i32,
+  fnIx: i32,
+) {
+  if emitUnionBoxArgGo(body, unionName, exprIx, fnIx) < 0 { return -1 }
+  if !exprUnion(exprIx, fnIx) || deliveryRetagHas(exprIx) { return 0 }
+  const vun = unionNameOfExpr(exprIx, fnIx)
+  if !boxRetagNeeded(vun, unionName) { return 0 }
+  emitBoxAtomRetag(vun, unionName, exprIx)
+}
+
+function emitUnionBoxArgGo(
   body: u8[],
   unionName: string,
   exprIx: i32,
@@ -7302,6 +7321,12 @@ function emitMem(body: u8[], memIx: i32, fnIx: i32) {
     // ident read; an un-narrowed read is the box. `narrowedValueAtomOf` rather than the raw pair,
     // so a litunion-alias narrow unboxes as the string ref the box stores its member as.
     if sFieldTypeAt(si, idx) == FC_UNION {
+      const own = memReadBoxNarrowName(memIx, fnIx)
+      if own != "" {
+        if emitBoxAtomRetag(sFieldElemNameAt(si, idx), own, memIx) < 0 {
+          return -1
+        }
+      }
       if emitUnionFieldNarrowUnbox(memIx, fnIx) < 0 { return -1 }
     }
     return 0
@@ -14630,6 +14655,43 @@ function widenConvOpOfKinds(fk: i32, tk: i32): i32 {
   -1
 }
 
+// The opcode converting value atom `fk` to `tk` exactly, either way a box retag crosses: a
+// widening `widenConvOpOfKinds` names, or the narrowing back from one (`atomNarrowOp`).
+function atomConvOp(fk: i32, tk: i32): i32 {
+  const w = widenConvOpOfKinds(fk, tk)
+  if w >= 0 { return w }
+  atomNarrowOp(fk, tk)
+}
+
+// Whether a box held at member set `from` needs `emitBoxAtomRetag` to be read at `to`.
+function boxRetagNeeded(from: string, to: string): boolean {
+  if from == "" || to == "" || from == to { return false }
+  const fa: string[] = []
+  splitUnionAtoms(from, fa)
+  const ta: string[] = []
+  splitUnionAtoms(to, ta)
+  let i = 0
+  while i < fa.length {
+    if boxAtomRetagKind(fa[i], ta, fa) >= 0 { return true }
+    i = i + 1
+  }
+  false
+}
+
+// The kind of the member of `to` that member `p` of `from` converts to, when `to` lacks `p`
+// and `from` lacks that member, or -1.
+function boxAtomRetagKind(p: string, to: string[], from: string[]): i32 {
+  if strListHas(to, p) { return -1 }
+  const fk = valueAtomKind(p)
+  let j = 0
+  while j < to.length {
+    const k = valueAtomKind(to[j])
+    if !strListHas(from, to[j]) && atomConvOp(fk, k) >= 0 { return k }
+    j = j + 1
+  }
+  -1
+}
+
 // One arm of `emitMapRetag`'s chain for a scalar member `fromTy` the destination holds widened
 // as `toTy`: under `fromTy`'s tag, the box in `unionAsSlot` is rebuilt under `toTy`'s with its
 // payload converted; the arm is left open on its `else`.
@@ -14655,6 +14717,54 @@ function emitWidenRetagArm(fromTy: i32, toTy: i32) {
   fbStructNew(vb)
   fbStructNew(uBoxIdx)
   fbElse()
+  0
+}
+
+// The union box on the stack, held at the member set `from`, rebuilt at `to`: each scalar member
+// `to` lacks is re-boxed as the member of `to` it converts to exactly (`boxAtomRetagKind`). A
+// field read narrows a wider record's box back (D3006); a literal built there widens it.
+function emitBoxAtomRetag(from: string, to: string, at: i32) {
+  const fa: string[] = []
+  splitUnionAtoms(from, fa)
+  const ta: string[] = []
+  splitUnionAtoms(to, ta)
+  const slot = sharedFieldRecvSlot()
+  fbLocalSet(slot)
+  let arms = 0
+  let i = 0
+  while i < fa.length {
+    const k = boxAtomRetagKind(fa[i], ta, fa)
+    if k >= 0 {
+      const fk = valueAtomKind(fa[i])
+      const vb = vbHeapIdxOfKind(k)
+      if vb < 0 {
+        return emitFailAt(
+          "emitProgram: a union stored at a wider record's field has no box for its member",
+          at,
+        )
+      }
+      fbLocalGet(slot)
+      fbStructGet(uBoxIdx, 0)
+      fbI32Const(scalarTagOfKind(fk))
+      fbI32Bin(70) // i32.eq
+      fbIfRefNul(uBoxIdx, false)
+      fbI32Const(scalarTagOfKind(k))
+      fbLocalGet(slot)
+      if emitUnionUnboxTail(fk) < 0 { return -1 }
+      wU8(atomConvOp(fk, k))
+      fbStructNew(vb)
+      fbStructNew(uBoxIdx)
+      fbElse()
+      arms = arms + 1
+    }
+    i = i + 1
+  }
+  fbLocalGet(slot)
+  wU8(212) // ref.as_non_null
+  while arms > 0 {
+    fbEnd()
+    arms = arms - 1
+  }
   0
 }
 
@@ -29673,7 +29783,10 @@ function emitCoalesceGo(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
       const mfi = sFieldIndex(msi, lhs.memProp)
       if mfi >= 0 {
         if sFieldTypeAt(msi, mfi) == FC_UNION {
-          const munm = sFieldElemNameAt(msi, mfi)
+          // A wider record's box is read at the receiver's own member set (D3006).
+          const mphys = sFieldElemNameAt(msi, mfi)
+          let munm = memReadBoxNarrowName(lhsIx, fnIx)
+          if munm == "" { munm = mphys }
           // D-VALUNION + D-SETONCE — see the call arm above.
           const msid = msSetOfText(munm)
           if (
@@ -29709,7 +29822,10 @@ function emitCoalesceGo(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
                 fbElse() // 0x05 else — present → re-read the field
                 if emitExpr(body, lhs.memObj, fnIx) < 0 { return -1 }
                 fbStructGet(sHeapIdx[msi], mfi)
-                fbEnd()  // 0x0b end
+                if munm != mphys {
+                  if emitBoxAtomRetag(mphys, munm, lhsIx) < 0 { return -1 }
+                }
+                fbEnd() // 0x0b end
                 return 0
               }
               if emitExpr(body, lhs.memObj, fnIx) < 0 { return -1 }
@@ -29722,7 +29838,10 @@ function emitCoalesceGo(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
               fbElse()                        // 0x05 else — present → unbox
               if emitExpr(body, lhs.memObj, fnIx) < 0 { return -1 }
               fbStructGet(sHeapIdx[msi], mfi)
-              fbStructGet(uBoxIdx, 1)         // field 1: value (anyref)
+              if munm != mphys {
+                if emitBoxAtomRetag(mphys, munm, lhsIx) < 0 { return -1 }
+              }
+              fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
               const mvb = vbHeapIdxOfKind(mak)
               if mvb < 0 {
                 return emitFail(
