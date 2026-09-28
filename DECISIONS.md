@@ -8540,9 +8540,18 @@ emitter meets it before binaryen runs (`-O --low-memory-unused` builds the two t
 function bodies, and a module holding both deduplicates them), for the sized promise too, where
 no binaryen pass can. A pre-pass would have to be a wasm rewriter in the host, which has none.
 
-**Not covered: a helper inlined by binaryen.** `function ld64(a: i64) { __load_i64__(a as% i32) }`
-called as `ld64(rsp + 32)` has nothing to fold when the emitter sees it; after `-O` inlines it
-the address is `i32.wrap_i64(i64.add(rsp, 32))`, which no binaryen pass folds. Rewriting that to
-`i32.add(i32.wrap_i64(rsp), 32)` is always sound (the identity above) and would let binaryen
-fold it, but it has to run after inlining, so it needs a wasm rewrite step in the host. plumb's
-translator writes the direct form, so this is left until a consumer's inlined helpers ask.
+**A trivial accessor's call folds too (PL-061, part 2).** `function ld64(a: i64): i64 {
+__load_i64__(a as% i32) }` called as `ld64(rsp + 32)` has nothing to fold inside `ld64`, and once
+`-O` inlines it the address is `i32.wrap_i64(i64.add(rsp, 32))`, which no binaryen pass folds.
+Under the promise the emitter emits such a call in place (`emitLowMemAccessorCall` in
+`compiler/wasmEmit.vl`): the accessor's own body, with its address operand replaced by `wrap(rsp)`
+and 32 added to the memarg, and its value parameter's read replaced by the caller's argument. That
+is the direct spelling `__load_i64__((rsp + 32) as% i32)`, so the argument above covers it. It
+stays exact because only a trivial accessor qualifies: not generic, i64 parameters with no
+default, one expression that is a scalar load of `a as% i32` under `as` casts and a `&` with a
+literal or module `const`, or a store of `v` or `v as T` there, each parameter read once and in
+parameter order. The arguments are then evaluated once each, in their order, before the access,
+as the call evaluated them; a non-constant address, a named argument, an i32 argument or a
+missing flag keeps the call. A rewrite after binaryen's inlining would have needed a wasm pass in
+the host and could only reach binaryen's 1 KiB, and it would not have met the target: the two
+spellings build to identical wasm only if they reach binaryen identical.
