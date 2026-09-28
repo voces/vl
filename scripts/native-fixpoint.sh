@@ -55,6 +55,6 @@ echo "NATIVE FIXPOINT HOLDS: stage3 == stage4 byte-for-byte ($(wc -c < "$WORK/st
 # the compiler, and that is the run that hangs (CLAUDE.md, "A COST REGRESSION SHOWS UP
 # ONE BOOTSTRAP STEP LATE"; measured 2026-09-02 on D1090, 32 s at L1 against 321 s at
 # L2). USER+SYS, not wall: the box is shared, and CPU seconds are the honest column.
-# `scripts/self-compile-time.sh` grades the same quantity against a committed baseline.
+# `scripts/self-compile-time.sh` grades the same build, in guest fuel, against a baseline.
 awk '/^user/{u=$2} /^sys/{s=$2} END{printf "stage4 self-compile CPU %.2fs\nSELF_COMPILE_USER_SECONDS=%.2f\n", u + s, u + s}' \
   "$WORK/stage4.time"

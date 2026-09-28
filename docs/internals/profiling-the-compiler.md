@@ -431,13 +431,16 @@ Four, and they fire at different moments. Profiling is what you do AFTER one of 
   (functions, types, unions, call sites, closures, callback slots, modules, generic pins,
   covariant bindings; later pairs include calls to inferred-return callees and a list name
   shared across functions),
-  graded on the ratio of the two arms' CPU (user+sys) so machine speed and box load cancel.
-  **The ratio has to be of CPU, because `gate.sh`'s fan-out is not a uniform slowdown**: the
-  two arms run at different moments and a burst inflates whichever one it lands on. Measured
-  2026-09-05 over three fanned-out gate runs, the `functions` pair's WALL ratio read
-  2.95 / 3.34 / 4.51 against a bar of 2.5 while its CPU ratio read 1.14 / 1.18 / 1.19 — the
-  row had gone red on three unrelated PRs that way. A tenth case is the family's own CONTROL,
-  a pair that MUST red: one source with one literal changed, the many arm running its inner
+  graded on the ratio of the two arms' guest FUEL (`$VL_FUEL=1`), a count of guest
+  instructions that box load cannot move. **It was CPU, and CPU was not enough**: a ratio of
+  CPU cancels a uniform slowdown, and `gate.sh`'s fan-out delivers bursts that land on one
+  arm. `functions` once read 2.95–4.51 on WALL against a bar of 2.5, and on 2026-09-27 `reads
+  after many closed sibling shadows` read 1.13–2.75 on CPU against the same bar while its
+  fuel ratio was 2.708 on every run, loaded or idle. A compile bar is now the default 2.5, or
+  1.25× the axis's fuel ratio where that is higher. The three RUNTIME pairs (string appends)
+  stay on CPU, since fuel meters only the compiler. Two CONTROLS must red, one per grader: the
+  fuel one compiles 20× the statements against 1× (reads 19.9), and the CPU one is a pair
+  whose many arm runs its inner
   loop n times per outer step against the one arm's once, so the quadratic is the PROGRAM's
   own algorithm and no compiler improvement can retire it. **That is deliberate** — the
   control was first built on a compiler gap (a struct-field string accumulator, which the
@@ -458,11 +461,16 @@ Four, and they fire at different moments. Profiling is what you do AFTER one of 
   It is a REVIEW aid and not a proof: every one of D1514's twenty-five scans was reported here
   and carried in the baseline, so the count falling is what a fix looks like, not what a
   regression is caught by.
-* **`scripts/self-compile-time.sh`** — the candidate compiling the compiler, in CPU seconds
-  against `scripts/self-compile-baseline.json` (6.3 s idle), tripping past 4×. Fires when the
-  other two missed it. HALF the factor pays for contention — the same build reads 12.2–12.7 s
-  inside a fanned-out `gate.sh` at load 164 — which is why the band is not 2×. It says only
-  that the bootstrap got dearer; the shape family says where.
+* **`scripts/self-compile-time.sh`** — the candidate compiling the compiler, in guest FUEL
+  against `scripts/self-compile-baseline.json`, tripping past 1.5×. Fires when the other two
+  missed it. It was CPU seconds against a 6.3 s idle baseline at 4×, half of the factor paying
+  for contention, and it still flaked: docs-only PRs whose seed WAS master's fixpoint read
+  26.8 s and 27.6 s at load 40–50 against a 25.2 s line. Fuel is identical run to run, so the
+  factor now pays only for the compiler growing between re-baselines. The line is coarse: one
+  injected whole-arena scan per emitted function (a quarter of them) read +57% and red, while
+  a weaker injection read +34% and passed — as it also would have on the CPU row. It catches
+  the D1090 class, a many-fold blowup; the shape family is what sees a smaller multiplier, and
+  says where.
 * **`scripts/plumb-shape-cost.py`** — what one `vl build --names -O --import-memory` of a 2 MB
   plumb-shaped unit costs, against `scripts/plumb-shape-baseline.json`. The unit is written by
   `scripts/perf/gen-plumb-shape.vl` (fixed seed; its hash is in the baseline, so a seed that

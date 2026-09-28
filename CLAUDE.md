@@ -606,15 +606,15 @@ an unbounded recursion or a fixpoint that does not converge, and that is the def
 **Three gates now catch this class, at three different moments.** `arena-scan-outside-pass`
 (`compiler/lint.vl` + `scripts/scan-budget.py`'s ratchet) fires at REVIEW time on a loop
 bounded by a whole-program table outside a pass — 132 stand, the count may only fall.
-`tests/vl_scaling_shape_test.ts` compiles ten pairs of same-work-different-shape programs (the tenth, `covariant bindings`, joined with #2685)
-and grades the ratio of the two arms' CPU, so machine speed and load cancel and the failure
-NAMES the axis. **A ratio cancels a UNIFORM slowdown and the gate's fan-out is not one** —
-the arms run at different moments, so a burst inflates one alone: the `functions` pair read
-2.95 – 4.51 on WALL against a bar of 2.5 inside three gate runs while its CPU read
-1.14 – 1.19, and three unrelated PRs went red that way. A tenth case is the grader's own
-CONTROL, a pair that must red, so an instrument that stopped measuring cannot pass quietly.
-`scripts/self-compile-time.sh` trips past 4× a committed CPU-second baseline for the L2
-build — half the factor pays for contention, which doubles CPU seconds on this box. Details and when each fires: `docs/internals/profiling-the-compiler.md` §Guards.
+`tests/vl_scaling_shape_test.ts` compiles ~38 pairs of same-work-different-shape programs
+and grades the ratio of the two arms' guest FUEL (`$VL_FUEL=1`), so the failure NAMES the
+axis and load cannot move it. **A ratio of time cancels only a UNIFORM slowdown and the
+gate's fan-out is not one** — the arms run at different moments and a burst inflates one
+alone: on WALL `functions` read 2.95 – 4.51 against a bar of 2.5, and on CPU one axis read
+1.13 – 2.75 while its fuel ratio was 2.708 every time. Two controls, one per grader, must
+red, so an instrument that stopped measuring cannot pass quietly.
+`scripts/self-compile-time.sh` trips past 1.5× a committed guest-FUEL baseline for the L2
+build; as CPU seconds at 4× it flaked on docs-only PRs at load 40–50. Details and when each fires: `docs/internals/profiling-the-compiler.md` §Guards.
 
 ## Comments state the contract; measurements live in the inventory
 

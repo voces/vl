@@ -68,8 +68,9 @@ run "python preflight"         bash scripts/python-preflight.sh "$LOGS/python.di
 # and ci.yml keep the full set, CI running them as separate jobs (pass-2 survey §7).
 #
 # A file the three single-file rows below own leaves both lists, so the dedicated row is
-# the only place it runs. vl_scaling_shape_test.ts is the one that must: it grades a TIME
-# RATIO, and measured concurrently with itself it grades the box. The other two are pure
+# the only place it runs. vl_scaling_shape_test.ts is the one that must: its runtime pairs
+# grade a CPU RATIO, and measured concurrently with itself that grades the box (its compile
+# pairs grade guest fuel, which load cannot move). The other two are pure
 # file scans — no seed, no SELFHOST_NATIVE_ALIGN — so they run identically wherever they land.
 OWN_ROW=$'tests/vl_scaling_shape_test.ts\ntests/vl_inventory_refs_test.ts\ntests/vl_no_conflict_markers_test.ts'
 # Filtered in bash, not with `--ignore`: `--ignore` next to an explicit multi-glob file
@@ -166,9 +167,9 @@ run "dead-export budget"       "$PY" scripts/export-budget.py --check
 # lint itself rather than a python copy of it (a `+` chain is an expression tree), so it
 # needs the seed. The compiler's standing chains are held; a new one reds here.
 run "interp budget"            "$PY" scripts/interp-budget.py --check
-# THE SHAPE FAMILY: ten pairs, same work, one axis reshaped, graded on the TIME
-# RATIO so machine speed and box load cancel. ~16-25 s; it is the only gate here
-# whose verdict is a measurement, and it reds on the pre-#2419 compiler.
+# THE SHAPE FAMILY: pairs of the same work, one axis reshaped, graded on the ratio of
+# the compiler's guest FUEL (a count, so load cannot move it; the runtime pairs on CPU).
+# ~40 s, and it reds on the pre-#2419 compiler.
 run "scaling shape"            deno test -A --no-check tests/vl_scaling_shape_test.ts
 run "deno lint"                deno lint
 run "rep-fuzz"                 bash scripts/rep-fuzz-check.sh

@@ -7,10 +7,10 @@
 // predicates re-derived once per emitted FUNCTION were 59% of a self-compile, and the
 // functions pair below reads 5.81x on that compiler against 1.02x after.
 //
-// The ratio is of the child's CPU (user+sys), because a ratio cancels only a UNIFORM
-// slowdown and a fanned-out gate delivers bursts: the two arms run at different moments,
-// and the one a burst lands on is inflated alone. The last case below is the CONTROL, a
-// pair that must red, so a grader that stopped measuring cannot pass in silence.
+// A compile pair's ratio is of the compiler's guest FUEL (`$VL_FUEL=1`), a count of guest
+// instructions that box load cannot move; the runtime pairs are of the child's CPU. The two
+// CONTROLS at the end are pairs that must red, one per grader, so a grader that stopped
+// measuring cannot pass in silence.
 //
 // One pair per axis a pass could accidentally multiply over. The "many" arm spreads the
 // same work over N entities, the "one" arm over N/K. Method and profiles:
@@ -18,14 +18,15 @@
 //
 // @test-timing instrument
 
-// TWO AXES ARE SUPER-LINEAR TODAY and carry a bar above their measured ratio rather than
-// the default. That is recorded DEBT, not tolerance: each names the function that makes it
-// so, and both answer a name by linear scan over a registry table, which is why `__str_eq__`
-// tops their profiles. Two have left the list: `generic pins` when its per-instance pass
-// learned to resume, and `unions` when the five scans under it came off — and reading either
-// as still super-linear costs a campaign. Lower a bar when the thing it names stops
-// multiplying, and RESIZE the pair when its cheap arm falls under the floor, because from
-// there the reading is a budget on the dear arm and not a ratio at all.
+// A COMPILE BAR IS THE FAMILY DEFAULT 2.5, OR 1.25x THE AXIS'S FUEL RATIO WHERE THAT IS
+// HIGHER; an axis whose bar is deliberately tighter keeps it. A fuel ratio is the same on
+// every run, so the margin pays only for the compiler changing, not for the box. Four axes
+// sit above the default because they are super-linear today — `types`, `modules`, `reads
+// after many closed sibling shadows`, `list concat chain length` — and that is recorded
+// DEBT, not tolerance: lower a bar when the thing it names stops multiplying. Two are GROWTH
+// pairs, the same shape at `n` against `n/4`, so linear reads 4 rather than 1: `many
+// distinct captured sibling blocks` and `list concat chain length`. The CPU readings quoted
+// beside individual pairs below predate fuel grading.
 
 import { ROOT, VL, exists } from "./support/tree.ts";
 
@@ -271,14 +272,16 @@ const writeModules = (dir: string, mods: number, per: number, body: number): str
 
 // ── the runner ───────────────────────────────────────────────────────────────
 
-// WHAT IS GRADED IS THE CHILD'S CPU, NOT THE CLOCK. A ratio cancels a UNIFORM slowdown,
-// and `gate.sh` does not deliver one: 24 rows fan out, so the two arms of a pair run at
-// different moments against a load that moves by the second, and the arm a burst lands on
-// is inflated alone. Measured beside a fanned-out gate, one arm's WALL reading moved 2.6x
-// while its own user+sys did not — the axes then read 3.69 and 6.54 against bars of 2.5
-// and 4.0 with nothing wrong. Contention costs a process waiting; it does not make it
-// execute more instructions, so user+sys is what a reshaped pair can be compared on.
-type Cost = { wall: number; cpu: number };
+// A COMPILE PAIR IS GRADED ON GUEST FUEL. `$VL_FUEL=1` makes the host meter the compiler in
+// wasmtime fuel, about one unit per guest instruction: a count, identical on every run of the
+// same seed over the same source however busy the box is. A CPU ratio is not that — the two
+// arms run at different moments and a burst inflates one alone, so one axis read 2.1 - 2.75
+// against a 2.5 bar across gate runs while its fuel ratio was 2.705 every time. A fuel ratio
+// needs no retry round and no floor, and its two arms can run at once.
+//
+// A RUNTIME pair (the string-append axes, the control) is graded on the child's CPU, because
+// fuel meters only the compiler: that cost lands in the emitted program, which runs unmetered.
+type Cost = { wall: number; cpu: number; fuel: number };
 
 // `times`' SECOND line is the shell's reaped children — this spawn's `vl` and nothing
 // else, the shell's own cost being the first line. A POSIX builtin, so this needs no
@@ -292,36 +295,65 @@ const childCpu = (out: string): number => {
   return s;
 };
 
-const spawn = async (what: string, argv: string[]): Promise<Cost> => {
+const spawn = async (what: string, argv: string[], fuel: boolean): Promise<Cost> => {
   const t0 = Date.now();
+  const env: Record<string, string> = { RUST_BACKTRACE: "0", NO_COLOR: "1", VL_STD: `${ROOT}/std` };
+  if (fuel) env.VL_FUEL = "1";
   const { code, stdout, stderr } = await new Deno.Command("/bin/sh", {
     args: ["-c", '"$@"; rc=$?; times; exit $rc', "sh", VL, ...argv],
     stdout: "piped",
     stderr: "piped",
-    env: { RUST_BACKTRACE: "0", NO_COLOR: "1", VL_STD: `${ROOT}/std` },
+    env,
   }).output();
   const wall = (Date.now() - t0) / 1000;
-  if (code !== 0) {
-    throw new Error(`vl ${what} failed: ${new TextDecoder().decode(stderr).slice(0, 400)}`);
+  const err = new TextDecoder().decode(stderr);
+  if (code !== 0) throw new Error(`vl ${what} failed: ${err.slice(0, 400)}`);
+  const m = err.match(/^\[fuel\] guest: (\d+)$/m);
+  if (fuel && !m) {
+    throw new Error(`vl ${what} printed no \`[fuel]\` line: this host predates $VL_FUEL; rebuild scripts/vl-host`);
   }
-  return { wall, cpu: childCpu(new TextDecoder().decode(stdout)) };
+  return { wall, cpu: childCpu(new TextDecoder().decode(stdout)), fuel: m ? Number(m[1]) : 0 };
 };
 
 const build = (src: string, out: string): Promise<Cost> =>
-  spawn(`build on ${src}`, ["build", src, "-o", out, "--compiler", COMPILER]);
+  spawn(`build on ${src}`, ["build", src, "-o", out, "--compiler", COMPILER], true);
 
-// The floor on the denominator keeps one spike on a sub-second arm from dominating the
-// quotient; every pair below is sized so the cheaper arm clears it on an idle box, so the
-// floor is a safety net and not the thing being measured. Its two values carry over from
-// the wall-clock reading unchanged, because an idle `vl build` spends what it takes: CPU
-// ran 4-8% over wall across every axis.
-const FLOOR = 0.4;
+// The floor on a RUNTIME pair's denominator keeps one spike on a sub-second arm from
+// dominating the quotient. A fuel pair has none: no spike can land on a count.
 const RUN_FLOOR = 0.05;
 const VERBOSE = Deno.env.get("VL_SCALING_VERBOSE") === "1";
 
-// A suspicious ratio buys one more INTERLEAVED round — many, one, many, one — and takes
-// the per-side minimum, so a burst that hits one arm is dropped rather than being divided
-// by an arm it missed. A spike does not repeat, a quadratic does.
+const fail = (axis: string, bar: number, note: string, reading: string, why: string): never => {
+  throw new Error(
+    `${axis}: the many-entity arm cost ${reading} for the same work reshaped (bar ${bar}) — ` +
+      `something is being re-derived per ${axis} entity. ${note} Profile it with ` +
+      `docs/internals/profiling-the-compiler.md and bank the answer. ${why}`,
+  );
+};
+
+// A compile pair: both arms at once, graded on the ratio of their guest fuel.
+const gradeFuel = async (
+  axis: string,
+  bar: number,
+  note: string,
+  many: () => Promise<Cost>,
+  one: () => Promise<Cost>,
+): Promise<number> => {
+  const [m, o] = await Promise.all([many(), one()]);
+  if (!(m.fuel > 0 && o.fuel > 0)) throw new Error(`${axis}: an arm read no fuel (${m.fuel}, ${o.fuel})`);
+  const ratio = m.fuel / o.fuel;
+  const reading = `${m.fuel.toExponential(3)} fuel against ${o.fuel.toExponential(3)} ` +
+    `(ratio ${ratio.toFixed(3)}; ${m.cpu.toFixed(2)}s / ${o.cpu.toFixed(2)}s cpu)`;
+  if (VERBOSE) console.log(`[scaling] ${axis}: ${reading} bar ${bar}`);
+  if (ratio > bar) {
+    fail(axis, bar, note, reading, "(The ratio is of guest fuel, a count, so box load cannot move it.)");
+  }
+  return ratio;
+};
+
+// A runtime pair, on CPU. A suspicious ratio buys one more INTERLEAVED round — many, one,
+// many, one — and takes the per-side minimum, so a burst that hits one arm is dropped
+// rather than being divided by an arm it missed. A spike does not repeat, a quadratic does.
 const grade = async (
   axis: string,
   bar: number,
@@ -339,20 +371,17 @@ const grade = async (
   }
   const say = (xs: Cost[]) =>
     `${least(xs, (c) => c.cpu).toFixed(2)}s cpu (${least(xs, (c) => c.wall).toFixed(2)}s wall)`;
-  if (VERBOSE) {
-    console.log(
-      `[scaling] ${axis}: many ${say(ms)} one ${say(os)} ` +
-        `ratio ${ratio().toFixed(2)} bar ${bar}`,
-    );
-  }
+  const reading = `${say(ms)} against ${say(os)} (ratio ${ratio().toFixed(2)})`;
+  if (VERBOSE) console.log(`[scaling] ${axis}: ${reading} bar ${bar}`);
   if (ratio() > bar) {
-    throw new Error(
-      `${axis}: the many-entity arm cost ${say(ms)} against ${say(os)} for the same work ` +
-        `reshaped (ratio ${ratio().toFixed(2)}, bar ${bar}) — something is being ` +
-        `re-derived per ${axis} entity. ${note} Profile it with ` +
-        `docs/internals/profiling-the-compiler.md and bank the answer. (The ratio is of ` +
-        `CPU, so box load is not the explanation; wall far above cpu means only that the ` +
-        `run was starved.)`,
+    fail(
+      axis,
+      bar,
+      note,
+      reading,
+      "(The ratio is of CPU, which cancels a uniform slowdown but NOT a burst that lands on " +
+        "one arm; it read over the bar in two interleaved rounds, which a burst rarely does twice. " +
+        "Wall far above cpu means only that the run was starved.)",
     );
   }
 };
@@ -362,18 +391,16 @@ const gradePair = async (
   bar: number,
   note: string,
   mk: (dir: string) => Promise<[string, string]> | [string, string],
-  floor: number = FLOOR,
-): Promise<void> => {
+): Promise<number> => {
   const dir = await Deno.makeTempDir({ prefix: `vl_scale_${axis}_` });
   try {
     const [manySrc, oneSrc] = await mk(dir);
-    await grade(
+    return await gradeFuel(
       axis,
       bar,
       note,
       () => build(manySrc, `${dir}/many.wasm`),
       () => build(oneSrc, `${dir}/one.wasm`),
-      floor,
     );
   } finally {
     await Deno.remove(dir, { recursive: true });
@@ -386,17 +413,13 @@ const twoFiles = (dir: string, many: string, one: string): [string, string] => {
   return [`${dir}/many.vl`, `${dir}/one.vl`];
 };
 
-const axis = (
-  name: string,
-  bar: number,
-  note: string,
-  mk: (d: string) => [string, string],
-  floor?: number,
-) =>
+const axis = (name: string, bar: number, note: string, mk: (d: string) => [string, string]) =>
   Deno.test({
     name: `scaling shape: ${name}`,
     ignore: !ENABLED,
-    fn: () => gradePair(name, bar, note, mk, floor),
+    fn: async () => {
+      await gradePair(name, bar, note, mk);
+    },
   });
 
 // Measured 2026-09-03, box load 3 to 101 — absolute times moved 3x over that range while
@@ -423,23 +446,21 @@ axis("literal-union sets", 2.5, "A literal-union lookup is scanning the union re
   twoFiles(d, genLitSets(3000, 1), genLitSets(3000, 20)));
 
 // 1.37 / 1.15 / 1.19.
-axis("types", 2.5, "A per-declaration cost is scaling with the type table.", (d) =>
+axis("types", 2.8, "A per-declaration cost is scaling with the type table.", (d) =>
   twoFiles(d, genTypes(2500, 1), genTypes(2500, 20)));
 
 // The pair moved 800 -> 2,400 because at 800 the cheap arm ran 0.16 s under a 0.25 s floor:
 // the floor was the denominator, so the reading was an absolute budget and a constant-factor
 // regression was invisible. At 2,400 the cheap arm is 0.6 to 1.2 s, 2.4 to 3.2x the floor, so
 // the reading is a ratio again — median 1.28 to 1.40 over 44 interleaved rounds spanning load
-// 22 to 235, against master's 1.42 to 1.48 beside it. The arms have converged, so the bar
-// would be the family default; it sits at 3.0 because one round of the 44 drew 2.30 and 2.5
-// would have 1.09x on that. 3.0 is 1.3x the worst round and 1.8x the second worst, and the
-// pre-#2630 compiler — still carrying the scans since taken off this axis — reads 4.42 here.
+// 22 to 235, against master's 1.42 to 1.48 beside it. The arms have converged, so the bar is
+// the family default (fuel reads 1.88); the pre-#2630 compiler — still carrying the scans
+// since taken off this axis — read 4.42 here on CPU.
 axis(
   "unions",
-  3.0,
+  2.5,
   "No frame is above 5% on this axis any more — profile the many arm before naming a cause.",
   (d) => twoFiles(d, genUnions(2400, 1), genUnions(2400, 20)),
-  0.25,
 );
 
 // D2398's pair: the start function orders each top-level node, and a moved write keyed by a
@@ -455,30 +476,20 @@ axis(
 axis("call sites", 2.5, "Callee resolution is scaling with the number of callees.", (d) =>
   twoFiles(d, genCallSites(6000, 1), genCallSites(6000, 20)));
 
-// 1.99 / 2.47 / 2.58 / 2.75 over four runs — the widest spread in the family and a known
-// super-linear axis, so the bar clears the top of it. `modIndexOfKey` (compiler/driver.vl)
+// A known super-linear axis: fuel reads 3.21, so the bar is 1.25x that. `modIndexOfKey` (compiler/driver.vl)
 // and `strListHas` (compiler/listutil.vl, once `capHas`) are 47% and 35% INCLUSIVE on a 400-module build,
 // both linear scans of a string-keyed table asked once per module, with `__str_eq__` under
 // them at 73% self. 800 modules against 400 is 4.45x, so a per-module arena scan would
 // roughly double this ratio and still be caught. Each function carries 30 statements so
 // the linear half is not startup-dominated; shrink that once those two stop scanning.
-// The super-linear axes' bars carry ~2x headroom over the IDLE ratio (modules 2.58,
-// closures 2.22): a ratio is load-tolerant but not load-proof, and the pairs that move
-// most with load are the ones whose cheap arm clamps on `FLOOR` while the dear arm does
-// not — the quotient is then an absolute budget on the dear arm. That is why a
-// super-linear bar sits above its measurement rather than at it, and why an axis whose
-// two arms cost the same can take the family default.
-// A doubling of the class (a new scan per entity) still clears every bar.
-axis("modules", 5.0, "The module merge is scaling with the file count.", (d) => [
+axis("modules", 4.1, "The module merge is scaling with the file count.", (d) => [
   writeModules(`${d}/many`, 400, 2, 30),
   writeModules(`${d}/one`, 200, 4, 30),
 ]);
 
-// 1.14 / 0.51 / 2.22, and RISING with N (1.89 at 2,000, 3.39 at 6,000) — a known
-// super-linear axis, so the bar is set above the measurement rather than at 2.5.
-// `fnStmtsPosOf` (compiler/emit_classify.vl) is 21.2% self time on the many arm and
-// absent from the one arm: a linear scan of `fnStmts` asked once per closure.
-axis("closures", 4.0, "`fnStmtsPosOf` scans `fnStmts` once per closure.", (d) =>
+// Fuel reads 1.27, so the bar is the family default. `fnStmtsPosOf` (compiler/emit_classify.vl)
+// is the scan that once made this axis super-linear: `fnStmts` walked once per closure.
+axis("closures", 2.5, "`fnStmtsPosOf` scans `fnStmts` once per closure.", (d) =>
   twoFiles(d, genClosures(3000, 1), genClosures(3000, 20)));
 
 // 2.06 / 1.03 / 1.92, stable over three runs (1.92 / 1.89 / 1.97) and holding at load 57.
@@ -492,7 +503,7 @@ axis("closures", 4.0, "`fnStmtsPosOf` scans `fnStmts` once per closure.", (d) =>
 // 0.035 / 0.029. The residual ~1.9 here is the many arm's extra function declarations.
 axis(
   "callback slots",
-  4.0,
+  2.5,
   "`anonLeafCloSlotMark` / `anonLeafParamFnTargetAt` are scaling with the callback-parameter count (D1514).",
   (d) => twoFiles(d, genCallbacks(300, 1), genCallbacks(300, 20)),
 );
@@ -781,7 +792,7 @@ const genManyClosedSiblingReads = (n: number, many: boolean): string => {
 
 axis(
   "reads after many closed sibling shadows",
-  2.5,
+  3.4,
   "`plBestDupAt` is stepping past every closed sibling instead of jumping via `plSortedSkip` (D2326).",
   (d) => twoFiles(d, genManyClosedSiblingReads(12000, true), genManyClosedSiblingReads(12000, false)),
 );
@@ -791,7 +802,9 @@ axis(
 // (`u`, `u$s1`, …) once it is captured, so `startBlockLetRowOfSid` is asked about `n` DISTINCT
 // sids rather than one. Its own per-sid scan of every start statement made that O(n) per sid,
 // O(n²) overall — the query-side fix above does not touch this, since each sid is asked once
-// (D2326).
+// (D2326). A GROWTH pair — `n` blocks against `n/4` — because a one-block arm is an empty
+// compile, and a ratio against it is a budget. Linear reads 4 and quadratic 16; today it reads
+// 7.14, and with `startBlockLetRowOfSid`'s memo disabled 15.3.
 const genManyCapturedSiblingBlocks = (n: number, many: boolean): string => {
   const o = ["type U = i32 | string", "function g(x: i32): U {", "  if x % 2 == 0 { return x }", '  "s"', "}"];
   const blocks = many ? n : 1;
@@ -813,9 +826,9 @@ const genManyCapturedSiblingBlocks = (n: number, many: boolean): string => {
 
 axis(
   "many distinct captured sibling blocks",
-  10,
+  8.9,
   "`startBlockLetRowOfSid` re-scans every start statement per DISTINCT sid (D2326).",
-  (d) => twoFiles(d, genManyCapturedSiblingBlocks(3000, true), genManyCapturedSiblingBlocks(3000, false)),
+  (d) => twoFiles(d, genManyCapturedSiblingBlocks(3000, true), genManyCapturedSiblingBlocks(750, true)),
 );
 
 // `n` closures made under a narrowing of the module global `g`, each called by name. With a
@@ -998,14 +1011,15 @@ const genConcatChains = (chains: number, len: number): string => {
   return o.join("\n") + "\n";
 };
 
-// One 300-operand concat per element type against 75 4-operand ones. Asking a concat's
-// list rep walked its whole left operand when the recorded type did not settle it, and the
-// per-query memo was a linear scan, so the long arm cost ~n^3 and trapped at n = 1000 (D2275).
+// A GROWTH pair: one 300-operand concat per element type against one 75-operand one, so
+// linear reads 4, quadratic 16 and cubic 64. Asking a concat's list rep walked its whole left
+// operand when the recorded type did not settle it, and the per-query memo was a linear scan,
+// so the long arm cost ~n^3 and trapped at n = 1000 (D2275). Quadratic today.
 axis(
   "list concat chain length",
-  2.5,
+  17.3,
   "A concat's list rep is re-derived from its operands instead of its recorded type, or `exprListRep`'s memo stopped being indexed by node (D2275).",
-  (d) => twoFiles(d, genConcatChains(1, 300), genConcatChains(75, 4)),
+  (d) => twoFiles(d, genConcatChains(1, 300), genConcatChains(1, 75)),
 );
 
 // ── the one RUNTIME axis ─────────────────────────────────────────────────────
@@ -1023,7 +1037,7 @@ axis(
 // quadratic. Measured 2026-09-03 at 40,000 appends: **16.10 on master, 0.32 after** (the
 // append arm 0.805 s -> 0.02 s against the builder arm 0.028 s / 0.03 s). Bar 2.5.
 const runProg = (src: string): Promise<Cost> =>
-  spawn(`run on ${src}`, ["run", src, "--compiler", COMPILER]);
+  spawn(`run on ${src}`, ["run", src, "--compiler", COMPILER], false);
 
 const genAppendLoop = (n: number): string =>
   [
@@ -1426,6 +1440,38 @@ Deno.test({
       }
     } finally {
       await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
+
+// THE FUEL GRADER'S CONTROL. The same program at 20x the statements against 1x: twenty times
+// the work by construction, so it must red a 2.5 bar, and only a broken fuel reading (no
+// `[fuel]` line parsed, a constant, both arms metered as one) can pass it. Its many arm is
+// linear, so no compiler improvement can turn it green.
+const genStatements = (n: number): string => {
+  const o = ["let acc = 0"];
+  for (let i = 0; i < n; i++) fill(o, i, 6);
+  o.push("print(acc)");
+  return o.join("\n") + "\n";
+};
+
+Deno.test({
+  name: "scaling shape: control — twenty times the work reds the fuel grader",
+  ignore: !ENABLED,
+  fn: async () => {
+    let red = "";
+    try {
+      await gradePair("fuel control", 2.5, "unreachable: the control exists to fail.", (d) =>
+        twoFiles(d, genStatements(4000), genStatements(200)));
+    } catch (e) {
+      red = String(e);
+    }
+    if (!red.includes("fuel control: the many-entity arm")) {
+      throw new Error(
+        "the fuel control did not red: 4,000 statements against 200 of the same came in under " +
+          `2.5x the guest fuel. The fuel reading has stopped measuring, so every compile axis ` +
+          `above is worth nothing — fix the grader, not this case. (${red || "no error"})`,
+      );
     }
   },
 });
