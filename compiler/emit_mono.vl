@@ -89,6 +89,7 @@ import {
   tyIsLitUnion,
   tyIsLitUnionArray,
   tyIsMap,
+  tyPrimNameOf,
   tyProvesNonNull,
   tyRenderSoftensLits,
   tyToEmitName,
@@ -2494,7 +2495,13 @@ function monoCloneLambdaSubst(
     monoCgcTyParams = typarams
     monoCgcTvN = tvN
     monoCgcTvV = tvV
+    const svCgcBN = monoCgcBN
+    const svCgcBT = monoCgcBT
+    monoCgcBN = bN
+    monoCgcBT = bT
     const nbody = monoCloneGenericCalls(nbodyL)
+    monoCgcBN = svCgcBN
+    monoCgcBT = svCgcBT
     monoCgcTyParams = svCgcP
     monoCgcTvN = svCgcN
     monoCgcTvV = svCgcV
@@ -3480,8 +3487,19 @@ function monoSubstIsExpr(ix: i32, io: i32, variant: string) {
 let monoCgcTyParams: string[] = []
 let monoCgcTvN: string[] = []
 let monoCgcTvV: string[] = []
+// The re-made list literals `monoLitReachesPinDefaultClash` answered for: the emitter refuses
+// each rather than build it untyped or print D2816's value.
+export let monoClashLits: i32[] = []
+
+// Whether list literal `ix` is one of `monoClashLits`.
+export function monoIsClashLit(ix: i32): boolean {
+  monoSeenHas(monoClashLits, ix)
+}
 // The instance's exact bindings when it is keyed by its exact pins, so a type argument naming a
 // type parameter records the exact pinned type rather than its spelling; empty otherwise.
+// The instance's type-parameter bindings as arena types, read by the D2816 clash rung.
+let monoCgcBN: string[] = []
+let monoCgcBT: i32[] = []
 let monoCgcSubN: string[] = []
 let monoCgcSubT: i32[] = []
 
@@ -3578,6 +3596,140 @@ function monoParamsMention(params: i32[], typarams: string[]): boolean {
 // see. Instances otherwise share the original's body arena, so one `Ident` served every
 // instance and the last shape to instantiate won. Clone-if-changed over `monoWalk`'s walk.
 function monoCloneGenericCalls(ix: i32) {
+  const nx = monoCloneGenericCallsRaw(ix)
+  // A re-made list literal answers the type its template did, which a later pin substitutes:
+  // its rep is read off that type (D2849). A call's is the instance's own.
+  if nx != ix && ix >= 0 && nx >= 0 && P.nodes[nx] is ArrayLit {
+    if monoLitReachesPinDefaultClash(ix, nx) {
+      monoClashLits.push(nx)
+      return nx
+    }
+    const t = nodeTyIxOf(ix)
+    if t >= 0 { nodeTyRecord(nx, t) }
+  }
+  nx
+}
+
+// Whether re-made list literal `nx`, whose template is `tpl` and typed `T[][]`, holds a generic
+// call whose returned value is a `??` over a list with a list-literal default this instance
+// builds as `T`'s pinned list: a boolean default where `T` is a number, or the reverse (D2816).
+// Such a literal stays untyped, as before D2849, and the emitter refuses it.
+function monoLitReachesPinDefaultClash(tpl: i32, nx: i32): boolean {
+  const b = monoLitElemPin(nodeTyIxOf(tpl))
+  if b == "" { return false }
+  const a = P.nodes[nx]
+  if !(a is ArrayLit) { return false }
+  const seen: i32[] = []
+  let i = 0
+  while i < a.arrElems.length {
+    if monoRetReachesClash(unwrapParen(a.arrElems[i]), b, seen, 0) {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+// The pin of `X` where `lt` is `X[][]`: `X` itself when a primitive (the instance already
+// substituted it), else its binding when a type parameter of the instance being copied, or "".
+function monoLitElemPin(lt: i32): string {
+  if lt < 0 || lt >= T.tys.length { return "" }
+  const o = T.tys[lt]
+  if !(o is TyArray) || o.aElem < 0 { return "" }
+  const m = T.tys[o.aElem]
+  if !(m is TyArray) || m.aElem < 0 { return "" }
+  // Already substituted by the instance's retype: the pin is the element itself.
+  const mp = tyPrimNameOf(m.aElem)
+  if mp != null { return mp }
+  const v = T.tys[m.aElem]
+  if !(v is TyVar) { return "" }
+  let j = 0
+  while j < monoCgcBN.length && j < monoCgcBT.length {
+    if monoCgcBN[j] == v.tvName {
+      const bp = tyPrimNameOf(monoCgcBT[j])
+      if bp != null { return bp }
+      return ""
+    }
+    j = j + 1
+  }
+  let i = 0
+  while i < monoCgcTvN.length && i < monoCgcTvV.length {
+    if monoCgcTvN[i] == v.tvName { return monoCgcTvV[i] }
+    i = i + 1
+  }
+  ""
+}
+
+// Whether value `ix` is a `??` whose default clashes with pin `b`, or a call to a generic whose
+// returned value is, through any chain of such calls.
+function monoRetReachesClash(
+  ix: i32,
+  b: string,
+  seen: i32[],
+  depth: i32,
+): boolean {
+  if ix < 0 || ix >= P.nodes.length || depth > 16 { return false }
+  const n = P.nodes[ix]
+  if n is BinExpr {
+    if n.binOp == "??" { return monoCoalDefaultClashesPin(n, b) }
+    return false
+  }
+  if !(n is Call) { return false }
+  const c = P.nodes[n.callFn]
+  if !(c is Ident) { return false }
+  if !monoCalleeIsGeneric(c.identName) { return false }
+  const fe = fnIndexOf(c.identName)
+  if fe < 0 || fe >= fnStmts.length || monoSeenHas(seen, fe) { return false }
+  seen.push(fe)
+  const f = P.nodes[fnStmts[fe]]
+  if !(f is FuncDecl) { return false }
+  const rets: i32[] = []
+  collectValuedReturns(f.fnBody, rets)
+  const body = P.nodes[f.fnBody]
+  if body is Block {
+    if body.blkStmts.length > 0 {
+      rets.push(body.blkStmts[body.blkStmts.length - 1])
+    }
+  }
+  let i = 0
+  while i < rets.length {
+    let r = rets[i]
+    const rn = P.nodes[r]
+    if rn is RetStmt { r = rn.retArg }
+    if monoRetReachesClash(unwrapParen(r), b, seen, depth + 1) { return true }
+    i = i + 1
+  }
+  false
+}
+
+// Whether `xs` holds `v`.
+function monoSeenHas(xs: i32[], v: i32): boolean {
+  let i = 0
+  while i < xs.length {
+    if xs[i] == v { return true }
+    i = i + 1
+  }
+  false
+}
+
+// Whether `??` node `n`, over a list typed by a type parameter, has a list-literal default
+// whose element is boolean where pin `b` is a number, or a number where `b` is boolean.
+function monoCoalDefaultClashesPin(n: BinExpr, b: string): boolean {
+  const lt = nodeTyIxOf(n.binLeft)
+  if lt < 0 || !tyHasTyVar(lt) { return false }
+  const d = P.nodes[unwrapParen(n.binRight)]
+  if !(d is ArrayLit) { return false }
+  if d.arrElems.length == 0 { return false }
+  const et = nodeTyIxOf(d.arrElems[0])
+  if et < 0 { return false }
+  const dp = tyPrimNameOf(et)
+  if dp == null { return false }
+  const dNum = dp == "i32" || dp == "i64" || dp == "f32" || dp == "f64"
+  const bNum = b == "i32" || b == "i64" || b == "f32" || b == "f64"
+  (dp == "boolean" && bNum) || (dNum && b == "boolean")
+}
+
+function monoCloneGenericCallsRaw(ix: i32) {
   if ix < 0 { return ix }
   const n = P.nodes[ix]
   if n is Call {
@@ -5574,7 +5726,11 @@ function monoMakeInstance(
     monoCgcTvV = tvV
     monoCgcSubN = exSubN
     monoCgcSubT = exSubT
+    monoCgcBN = letBN
+    monoCgcBT = letBT
     const instBody3 = monoCloneGenericCalls(instBody2)
+    monoCgcBN = []
+    monoCgcBT = []
     monoCgcTyParams = []
     monoCgcTvN = []
     monoCgcTvV = []
@@ -7315,6 +7471,7 @@ function monoSlotParamPins(fe: i32, out: string[]) {
 // declaration and no concrete higher-order function returns immediately.
 export function monomorphize(stmts: i32[]) {
   monoArenaTick = 0
+  monoClashLits = []
   monoRebuiltStamp = 0 - 1
   monoGen = []
   monoOrigNode = []

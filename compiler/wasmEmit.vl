@@ -1023,10 +1023,13 @@ import {
   sigParamCoerceKind,
   sigParamKindAt,
   sigParamSlotAt,
+  spreadBoxingSource,
   spreadDestKind,
   spreadDestRow,
   spreadDstBackSlot,
+  spreadElemWidens,
   spreadGroupWrapSlot,
+  spreadSourcesWidenTo,
   stmtIsTailValue,
   structEqStashSlot,
   structIdxOfElemName,
@@ -1125,6 +1128,7 @@ import {
   monoArgPinTyIx,
   monoArgTyName,
   monoInstantiatedAny,
+  monoIsClashLit,
   monoPinnedSigsOf,
 } from "./emit_mono"
 import {
@@ -7380,7 +7384,26 @@ function emitArrSpread(body: u8[], arrIx: i32, fnIx: i32) {
   const a = P.nodes[arrIx]
   if a is ArrayLit {
     const elems = a.arrElems
-    const kk = spreadDestKind(elems, fnIx)
+    const boxSrc = spreadBoxingSource(arrIx, fnIx)
+    if boxSrc >= 0 {
+      return emitFailAt(
+        "emitProgram: a spread whose elements must each be boxed into a union or nullable "
+          + "element has no lowering yet; build the source list at the literal's element type",
+        boxSrc,
+      )
+    }
+    let kk = spreadDestKind(arrIx, fnIx)
+    // A destination that threaded a wider scalar list (`const q: f64[] = [...ints]`) is
+    // built at, since the literal is built at the type it flows into.
+    const pdk = spreadPendingScalar(pendingListKind)
+    if (
+      kk != null
+      && pdk != null
+      && pdk != kk
+      && spreadSourcesWidenTo(elems, pdk, fnIx)
+    ) {
+      kk = pdk
+    }
     if kk == null {
       return emitFail(
         "emitProgram: a spread's source is not a list this rep knows",
@@ -7420,9 +7443,24 @@ function emitArrSpread(body: u8[], arrIx: i32, fnIx: i32) {
     const slots: i32[] = []
     let g = 0
     while g < groups.length {
+      // A source of another scalar element builds at its own rep, then copies converting.
+      const gk = spreadGroupSrcKind(groups[g], elems, kk, fnIx)
       pendingListKind = pk
+      if gk != kk { pendingListKind = pendingKindOfMf(gk, 0) }
       pendingListSlot = row
       if emitExpr(body, groups[g], fnIx) < 0 { return -1 }
+      if gk != kk {
+        if (
+          emitScalarListWidenTop(
+            body,
+            spreadScalarVKind(gk),
+            spreadScalarVKind(kk),
+          )
+          < 0
+        ) {
+          return -1
+        }
+      }
       const gs = spreadGroupWrapSlot(kk, row, seq + g)
       slots.push(gs)
       fbLocalSet(gs)
@@ -7481,6 +7519,61 @@ function emitArrSpread(body: u8[], arrIx: i32, fnIx: i32) {
   emitFail("emitProgram: expected an array literal")
 }
 
+// The element kind group `g` of a spread literal building at `kk` is emitted at: a spread
+// source's own kind where it widens to `kk`, else `kk` itself (a plain run, or a same-kind source).
+function spreadGroupSrcKind(
+  g: i32,
+  elems: i32[],
+  kk: MfKind,
+  fnIx: i32,
+): MfKind {
+  let i = 0
+  while i < elems.length {
+    if spreadArgOf(elems[i]) == g {
+      const sk = mfRecvKindOf(g, fnIx)
+      if sk != null && spreadElemWidens(sk, kk) { return sk }
+      return kk
+    }
+    i = i + 1
+  }
+  kk
+}
+
+// The scalar element kind a threaded `pendingListKind` build code names, or `null`.
+function spreadPendingScalar(pk: i32): MfKind | null {
+  if pk == LBK_F64_LIST { return "f64" }
+  if pk == LBK_I64_LIST { return "i64" }
+  if pk == LBK_F32_LIST { return "f32" }
+  null
+}
+
+// The scalar `VKind` spelling of a spread element kind, for the converting copy.
+function spreadScalarVKind(k: MfKind): VKind {
+  match k {
+    "f64" => {
+      return "f64"
+    }
+    "i64" => {
+      return "i64"
+    }
+    "f32" => {
+      return "f32"
+    }
+    "i32" => {
+      return "i32"
+    }
+    "u8" => {
+      return "u8list"
+    }
+    "str" => {
+      return "str"
+    }
+    "ref" => {
+      return "reflist"
+    }
+  }
+}
+
 // A run of plain elements as its own `ArrayLit`, reporting at the spread literal's position.
 // A synthesized node takes the parser's last cursor otherwise, which would put a diagnostic
 // over it at the end of the file.
@@ -7499,6 +7592,14 @@ function emitArr(body: u8[], arrIx: i32, fnIx: i32) {
   if a is ArrayLit {
     const elems = a.arrElems
     if hasSpreadItem(elems) { return emitArrSpread(body, arrIx, fnIx) }
+    if monoIsClashLit(arrIx) {
+      return emitFailAt(
+        "emitProgram: a list literal around a generic call whose `??` default is a list of "
+          + "another element at this type argument has no lowering yet; give the default the "
+          + "operand's own element type",
+        arrIx,
+      )
+    }
     // An empty `[]` no destination threaded a kind to builds at the element type the checker
     // pinned on the literal itself — a join arm's sibling, a return's witness (D2209).
     if elems.length == 0 && pendingListKind == LBK_I32_LIST {

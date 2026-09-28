@@ -3187,11 +3187,16 @@ export function mapRetExprShape(rx: i32, fe: i32) {
   if e is Call {
     const callee = P.nodes[e.callFn]
     if callee is Ident {
-      // A bare `Map()` or `Set()` returned straight out carries no spelling — neither value
-      // type nor key rep — so it falls to the recorded ladder at the bottom rather than
-      // short-circuiting to the string-keyed mono sentinel; `-1` and `-4` are two structs.
-      if callee.identName != "Map" && callee.identName != "Set" {
-        return fnRetMapShapeAt(sidOfNode(e.callFn), u)
+      // A bare `Map()` or `Set()`, and a call through a function-typed parameter or local
+      // (D2867), name no declaration's map, so they take the recorded ladder at the bottom
+      // rather than the string-keyed mono sentinel; `-1` and `-4` are two structs.
+      const csid = sidOfNode(e.callFn)
+      if (
+        callee.identName != "Map"
+        && callee.identName != "Set"
+        && fnIndexOfSid(csid) >= 0
+      ) {
+        return fnRetMapShapeAt(csid, u)
       }
     }
   }
@@ -13618,20 +13623,125 @@ export function widenTmpSlot(which: i32) {
   scratchSlot(10, "i32", which, SCRATCH_BY_KEY)
 }
 
-// The rep a spread literal builds at, read off a spread's SOURCE: the checker has already made
-// every item's element type agree, so any one source names the whole literal's rep. `null` when
-// no source is a list the emitter knows, which is the caller's refusal.
-export function spreadDestKind(elems: i32[], fnIx: i32): MfKind | null {
+// The rep the spread literal at `arrIx` builds at: its first known source's, or the scalar
+// element the checker typed the literal at when every source widens to it losslessly
+// (`[...ints, 2.5]` is `f64[]`), each such group then copied converting. `null` when no source
+// is a list the emitter knows, which is the caller's refusal.
+export function spreadDestKind(arrIx: i32, fnIx: i32): MfKind | null {
+  const a = P.nodes[arrIx]
+  if !(a is ArrayLit) { return null }
+  const elems = a.arrElems
+  let k: MfKind | null = null
   let i = 0
-  while i < elems.length {
+  while i < elems.length && k == null {
     const src = spreadArgOf(elems[i])
+    if src >= 0 { k = mfRecvKindOf(src, fnIx) }
+    i = i + 1
+  }
+  if k == null { return null }
+  const de = spreadLitScalarElem(arrIx)
+  if de == null || de == k { return k }
+  if spreadSourcesWidenTo(elems, de, fnIx) { return de }
+  k
+}
+
+// The spread source of literal `arrIx` whose elements would each need boxing: the literal is
+// typed a list of a union element and this source's element is another type, or of a nullable
+// element and this source is a scalar list, which has no null niche. -1 when none (D2868).
+export function spreadBoxingSource(arrIx: i32, fnIx: i32): i32 {
+  const a = P.nodes[arrIx]
+  if !(a is ArrayLit) { return -1 }
+  const de = listElemTyOf(nodeTyIxOf(arrIx))
+  if de < 0 { return -1 }
+  const dT = T.tys[de]
+  if !(dT is TyUnion || dT is TyNullable) { return -1 }
+  if tyIsLitUnion(de) { return -1 }
+  let i = 0
+  while i < a.arrElems.length {
+    const src = spreadArgOf(a.arrElems[i])
     if src >= 0 {
-      const k = mfRecvKindOf(src, fnIx)
-      if k != null { return k }
+      const se = listElemTyOf(nodeTyIxOf(src))
+      if se >= 0 && !tySame(se, de) {
+        if dT is TyUnion { return src }
+        const sk = mfRecvKindOf(src, fnIx)
+        if sk != "ref" && sk != "str" { return src }
+      }
     }
     i = i + 1
   }
-  null
+  -1
+}
+
+// The element type of list type `t`, or -1 when `t` is no list.
+function listElemTyOf(t: i32): i32 {
+  if t < 0 { return -1 }
+  const at = T.tys[t]
+  if at is TyArray { return at.aElem }
+  -1
+}
+
+// Whether every spread source among `elems` is a `de` list or one that widens to it.
+export function spreadSourcesWidenTo(
+  elems: i32[],
+  de: MfKind,
+  fnIx: i32,
+): boolean {
+  let j = 0
+  while j < elems.length {
+    const src = spreadArgOf(elems[j])
+    if src >= 0 {
+      const sk = mfRecvKindOf(src, fnIx)
+      if sk != de && !spreadElemWidens(sk, de) { return false }
+    }
+    j = j + 1
+  }
+  true
+}
+
+// The scalar element kind the checker typed list literal `arrIx` at, or `null` for any other.
+function spreadLitScalarElem(arrIx: i32): MfKind | null {
+  const t = nodeTyIxOf(arrIx)
+  if t < 0 { return null }
+  const at = T.tys[t]
+  if !(at is TyArray) { return null }
+  if at.aElem < 0 { return null }
+  const p = tyPrimNameOf(at.aElem)
+  // A record, list or union element is no primitive, and has no converting copy.
+  if p == null { return null }
+  match p {
+    "f64" => {
+      return "f64"
+    }
+    "i64" => {
+      return "i64"
+    }
+    "f32" => {
+      return "f32"
+    }
+    "i32" => {
+      return "i32"
+    }
+    "boolean" | "string" | "void" | "null" | "never" | "u8" | "v128" => {
+      return null
+    }
+  }
+}
+
+// Whether a spread source of element kind `sk` converts losslessly into a `de` element: the
+// three widenings scalar assignability admits (i32 to i64, i32 to f64, f32 to f64).
+export function spreadElemWidens(sk: MfKind | null, de: MfKind): boolean {
+  if sk == null { return false }
+  match sk {
+    "i32" => {
+      return de == "f64" || de == "i64"
+    }
+    "f32" => {
+      return de == "f64"
+    }
+    "f64" | "i64" | "u8" | "str" | "ref" => {
+      return false
+    }
+  }
 }
 
 // Whether the literal at `ix` is a SPREAD literal whose destination rep is the packed byte
@@ -13642,7 +13752,7 @@ export function spreadLitIsU8(ix: i32): boolean {
   const n = P.nodes[ix]
   if n is ArrayLit {
     if !hasSpreadItem(n.arrElems) { return false }
-    return spreadDestKind(n.arrElems, -1) == "u8"
+    return spreadDestKind(ix, -1) == "u8"
   }
   false
 }
@@ -22833,9 +22943,7 @@ export function arrLitIsStr(arrIx: i32, fnIx: i32) {
   const a = P.nodes[arrIx]
   if a is ArrayLit {
     if a.arrElems.length < 1 { return false }
-    if hasSpreadItem(a.arrElems) {
-      return spreadDestKind(a.arrElems, fnIx) == "str"
-    }
+    if hasSpreadItem(a.arrElems) { return spreadDestKind(arrIx, fnIx) == "str" }
     // An atom-element literal (the checker adopted a `K[]` context) is the i32 atom-id
     // list, not a string list — its elements are string exprs syntactically but each lowers
     // as its interned atom id. Without this the literal claims the string-list build while
@@ -22880,9 +22988,7 @@ export function arrLitIsF64(arrIx: i32, fnIx: i32) {
     // A spread element is no f64 VALUE, so the element scan below would read `[...fs]` as
     // the i32 default while `emitArrSpread` builds the source's rep — two heap types for
     // one value. Both sides ask `spreadDestKind`, so they cannot disagree.
-    if hasSpreadItem(a.arrElems) {
-      return spreadDestKind(a.arrElems, fnIx) == "f64"
-    }
+    if hasSpreadItem(a.arrElems) { return spreadDestKind(arrIx, fnIx) == "f64" }
     // A box-list literal with an f64 member: the checker recorded a value union, so the
     // elements box and the f64-list build would store a string ref into an `(array (mut
     // f64))` backing. The scan below is order-blind (any f64 member claims the list), so
@@ -38013,9 +38119,7 @@ export function arrLitIsF32(arrIx: i32, fnIx: i32) {
   const a = P.nodes[arrIx]
   if a is ArrayLit {
     if a.arrElems.length < 1 { return false }
-    if hasSpreadItem(a.arrElems) {
-      return spreadDestKind(a.arrElems, fnIx) == "f32"
-    }
+    if hasSpreadItem(a.arrElems) { return spreadDestKind(arrIx, fnIx) == "f32" }
     // The checker types an f32 element beside literal ones `f32[]`; the literals adopt it.
     if tyIsF32ArrayTy(nodeTyIxOf(arrIx)) { return true }
     let i = 0
@@ -38571,7 +38675,7 @@ function arrLitListRep(exprIx: i32, fnIx: i32): VKind | null {
     const hk = gatedListRep(emptyArrHoleKind(exprIx), "empty-hole")
     if hk != null { return hk }
     if hasSpreadItem(a.arrElems) {
-      const sk = listRepOfMf(spreadDestKind(a.arrElems, fnIx))
+      const sk = listRepOfMf(spreadDestKind(exprIx, fnIx))
       const gk = gatedListRep(sk, "spread")
       if gk != null { return gk }
       if arrLitIsRef(exprIx) { return "reflist" }
@@ -38877,9 +38981,7 @@ export function arrLitIsI64(arrIx: i32, fnIx: i32) {
   const a = P.nodes[arrIx]
   if a is ArrayLit {
     if a.arrElems.length < 1 { return false }
-    if hasSpreadItem(a.arrElems) {
-      return spreadDestKind(a.arrElems, fnIx) == "i64"
-    }
+    if hasSpreadItem(a.arrElems) { return spreadDestKind(arrIx, fnIx) == "i64" }
     // A box-list literal with an i64 member is the f64 arm's twin (see `arrLitBoxElem`): the
     // scan is order-blind, so any i64 element (not just the first) makes this an i64 list.
     if arrLitBoxElem(arrIx) { return false }
