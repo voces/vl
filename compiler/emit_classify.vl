@@ -2918,6 +2918,9 @@ export function exprNullableString(exprIx: i32, fnIx: i32) {
   // syntactic arms below cannot trace — an else-less `if` printed directly, whose join is the
   // niche and which otherwise falls past every arm to the non-null string print (D1766).
   if nodeTyIsNullableString(exprIx) { return true }
+  // A value the hole instance `fnIx` is pins at `string | null`, where the recorded type is
+  // the hole's variable: a join of the parameter reads no arm as nullable (D3016).
+  if tyIsNulPrim(holeOperandTyOf(exprIx, fnIx), "string") { return true }
   // An if-expression whose arm is itself nullable — see `nulIfArmNullableValueIx` (D1560).
   const nlIfStr = nulIfArmNullableValueIx(exprIx)
   if nlIfStr >= 0 {
@@ -29650,6 +29653,9 @@ export function iterElemPinTy(iterIx: i32, fnIx: i32): i32 {
       const lp = monoParamPinTy.get(lpt) ?? nodeTyIxOf(lpt)
       if lp >= 0 && !tyHasTyVar(lp) { return lp }
     }
+    // A literal of other reads, `[l[0]]` or `[y]`, holds what they hold there (D3066).
+    const rp = arrLitReadsPinTy(n.arrElems, fnIx)
+    if rp >= 0 { return rp }
   }
   if monoHoleSubN.length == 0 { return -1 }
   const hv = nodeArrayElemTyIx(iterIx)
@@ -29659,6 +29665,51 @@ export function iterElemPinTy(iterIx: i32, fnIx: i32): i32 {
   const b = holePinReadOf(hv, monoHoleSubN[row], monoHoleSubT[row])
   if b < 0 || b >= T.tys.length || tyHasTyVar(b) { return -1 }
   b
+}
+
+// The one type every element of `elems` holds at the pin of the instance `fnIx` is, each an
+// element read or a name (`valueReadPinTy`); -1 when one answers none or they differ.
+function arrLitReadsPinTy(elems: i32[], fnIx: i32): i32 {
+  if elems.length == 0 { return -1 }
+  const t0 = valueReadPinTy(elems[0], fnIx, 0)
+  if t0 < 0 { return -1 }
+  let i = 1
+  while i < elems.length {
+    if valueReadPinTy(elems[i], fnIx, 0) != t0 { return -1 }
+    i = i + 1
+  }
+  t0
+}
+
+// The type the read `ix` holds at the pin of the instance `fnIx` is: an element read's list
+// element (`iterElemPinTy`), a parameter's pin, or a local's annotation or initializer. -1 for
+// any other node, or where the type still names a type parameter.
+function valueReadPinTy(ix: i32, fnIx: i32, depth: i32): i32 {
+  const rx = unwrapParen(ix)
+  if rx < 0 || fnIx < 0 || depth > 4 { return -1 }
+  const n = P.nodes[rx]
+  if n is Index { return iterElemPinTy(n.idxArr, fnIx) }
+  if !(n is Ident) { return -1 }
+  const fn = P.nodes[fnIx]
+  if !(fn is FuncDecl) { return -1 }
+  const pt = paramTypeNode(fnIx, n.identName)
+  if pt >= 0 {
+    const pp = monoParamPinTy.get(pt) ?? nodeTyIxOf(pt)
+    if pp >= 0 && !tyHasTyVar(pp) { return pp }
+    return -1
+  }
+  const li = parentLetOf(fn.fnBody, n.identName)
+  if li < 0 { return -1 }
+  const d = P.nodes[li]
+  if d is LetDecl {
+    if d.letType >= 0 {
+      const lt = nodeTyIxOf(d.letType)
+      if lt >= 0 && !tyHasTyVar(lt) { return lt }
+      return -1
+    }
+    return valueReadPinTy(d.letInit, fnIx, depth + 1)
+  }
+  -1
 }
 
 // The name every element of `elems` reads, all one bare Ident; "" otherwise.
