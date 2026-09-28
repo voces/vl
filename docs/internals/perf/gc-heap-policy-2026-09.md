@@ -25,7 +25,7 @@ Read from the pinned crate's source (`wasmtime-47.0.2`, `src/config.rs`, `src/ru
 | `ResourceLimiter::memory_growing` | consulted when the GC heap's memory grows | veto only; it cannot start or enlarge a growth |
 | `Config::total_gc_heaps` | pooling-allocator slot count | no |
 | collection statistics | **none public**. The post-collection live size (`GcStore::last_post_gc_allocated_bytes`) is crate-private and appears only in `log::trace!` output | the stats counter (`$VL_GC_STATS`) already scrapes that log |
-| a growth policy, a GC callback, or a "grow when survivors exceed X%" knob | **none** | — |
+| a growth policy, a GC callback, or a "grow when survivors exceed X%" knob | **none** | — (§4: VL now carries one as a patch) |
 
 **The growth rule itself** (`retry_after_gc_async` and `should_collect_first`): when an allocation
 fails, wasmtime collects first unless `last_live + bytes_needed >= capacity / 2`. That collection
@@ -119,3 +119,72 @@ must fail. Checked both ways: the master binary (64 MiB, no override) fails the 
 **When to revisit.** When wasmtime grows a copying heap by the live set's share of a semispace
 (the upstream issue), the default can come back down to 64 MiB or below, and the RSS price goes with
 it. A generational or mark-region collector upstream would change the whole table.
+
+## 4 · Growing with the live set (2026-09-28, plumb PL-065)
+
+§1's missing hook is now a patch. `scripts/vl-host/vendor/wasmtime` is wasmtime 47.0.2 plus
+`vendor/wasmtime.patch` (two files, ~70 lines), wired by `[patch.crates-io]` in the host's
+`Cargo.toml`; `vendor/update-wasmtime.sh VERSION` re-vendors it on an upgrade and `--diff` rewrites
+the patch. It adds one engine knob, `Config::gc_heap_grow_with_live_set`, off by default.
+
+**The problem.** A live set that only grows (plumb's `vl-probes/pdb/gc-live.vl`: every item kept) made
+the default heap quadratic. At stock policy the heap grows only once a collection frees less than
+the pending allocation, so as the live set approaches a semispace every collection re-copies all of
+it to free a sliver: 21 / 45 / 69 / 93 collections at 0.75 / 1.5 / 3 / 6 M items.
+
+**The rule.** With the knob on and the copying collector, a collection that leaves the live set above
+a third of the heap (two thirds of a semispace) grows the heap. If the active semispace is the first
+half, it grows at once, which costs no collection. In the second half, wasmtime must collect before it
+can grow, so the growth waits for the next out-of-memory, which then grows instead of collecting
+first. `grow_gc_heap` at least doubles, so a live set that keeps growing gets one collection per
+doubling or so, and a steady live set is copied at most two bytes per byte a collection frees.
+
+**Where it is on.** Only in `gc_engine`, the user program's engine (`vl run`, `--batch`, `vl test`).
+The compiler's copying compile keeps the stock rule: on plumb's `chunk_990.vl` (6.6 MB entry file,
+a 115 MB live set) the rule cut collections 18 → 8 and user CPU −13%, but raised peak RSS 300 →
+557 MB, and plumb compiles thousands of units side by side. The knob is not part of the engine's
+compatibility hash, so compiled-module cache entries are unchanged.
+
+**Measured** (median of 3, cores 0–15, load 7–25; user CPU / wall / max RSS / collections; the
+`VL_GC=none` column is the floor, one run):
+
+| gc-live N | before | after | `VL_GC=none` |
+| --- | --- | --- | --- |
+| 375,000 | 0.16 / 0.24 s / 264 MB / 2 | 0.15 / 0.24 s / 264 MB / 2 | 0.06 s / 149 MB |
+| 750,000 | 1.07 / 1.15 s / 469 MB / 21 | 0.28 / 0.42 s / 484 MB / 3 | 0.09 s / 266 MB |
+| 1,500,000 | 3.37 / 3.47 s / 929 MB / 45 | 0.74 / 0.92 s / 949 MB / 5 | 0.18 s / 523 MB |
+| 3,000,000 | 8.41 / 8.65 s / 1850 MB / 69 | 1.49 / 2.05 s / 1886 MB / 7 | 0.35 s / 1038 MB |
+| 6,000,000 | 17.03 / 17.27 s / 3692 MB / 93 | 2.98 / 4.00 s / 3763 MB / 9 | — |
+
+After, CPU doubles with N (×2.6, ×2.0, ×2.0 per doubling); before it was ×3.1, ×2.5, ×2.0, and 5.6×
+the CPU at 3 M. RSS is +2–3%.
+
+The price is where a live set sits near a third of the heap and the program keeps allocating
+garbage. A steady live set of N three-field records then 20 M short-lived ones
+(`churn-live.vl` in the lane's scratch):
+
+| live records | before | after |
+| --- | --- | --- |
+| 1,500,000 | 0.24 s / 264 MB / 8 | 0.24 s / 264 MB / 8 |
+| 2,500,000 | 0.67 s / 264 MB / 17 | 0.26 s / 520 MB / 5 |
+| 3,000,000 | 1.23 s / 264 MB / 30 | 0.29 s / 520 MB / 5 |
+
+`vl test` over 12 files (six churn over a 400,000-struct live set, six growing to 300,000 items, one
+worker per file): user 19.37 → 4.85 s, wall 2.79 → 0.73 s, peak RSS 843 → 1,119 MB. No program
+under `bench/` changes: the seven that collect at all keep their collection counts and RSS
+(`algorithms/binarytrees` 53 / 520 MB, `strings/int-format` 77 / 264 MB, …), and the rest never
+collect. `binarytrees` is why the threshold is two thirds and not one half: its 2 M-node tree sits
+between the two, and at one half, measured first, it grew to 904 MB for four fewer collections.
+plumb's decoder (a 5.6 MB live set) and `plumb-shape-cost.py` are unchanged.
+
+**Browser and Deno (V8).** None of this applies. There the WasmGC objects live on V8's own
+generational heap, which the module cannot size: V8 grows its old generation in proportion to the
+live set after each full collection, and a long-lived object is promoted once instead of re-copied.
+The same probe under Deno (`tests/support/runWasm.ts`) runs 0.15 / 0.28 / 0.44 / 1.02 s wall at 0.375 /
+0.75 / 1.5 / 3 M with 214 / 323 / 560 / 1,003 MB RSS, linear. The only sizing lever there is the
+embedder's (`--max-old-space-size` for Node or Deno); a browser page has none.
+
+**When to revisit.** Drop the patch when upstream grows a copying heap with its live set (the
+draft issue beside this file). Until then, `update-wasmtime.sh` carries it across upgrades, and
+`tests/vl_gc_heap_shape_test.ts` holds it: a growing 750,000-item live set must collect at most 8
+times (3 with the patch, 23 without).
