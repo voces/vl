@@ -530,10 +530,11 @@ program verbatim — the only way to pass one that starts with `-`.
   {c}-O3{r}                 The release profile (closed-world + -O3; melts union
                       boxes). Wins over -O when both are given. Both rungs
                       require binaryen's wasm-opt and fail loudly without it
-  {c}--low-memory-unused{r} With -O/-O3: let wasm-opt assume the first 1 KiB of
-                      memory is never accessed, so `p + C` (C < 1024) folds
-                      into the access's offset. An address whose add would
-                      wrap past 4 GiB then traps instead of reading low memory
+  {c}--low-memory-unused{r}[=<bytes>] With -O/-O3: promise no access reaches the
+                      first <bytes> of memory (default 1 KiB), so `p + C` and
+                      `(p + C) as% i32` fold C into the access's offset when
+                      C plus that offset is below <bytes>. An address whose add
+                      would wrap past 4 GiB then traps instead of reading low memory
   {c}--names{r}             Embed the wasm \"name\" section (legible trap backtraces);
                       kept through -O/-O3, at the cost of the section's bytes
   {c}--import-memory{r}     Import the linear memory as `env.memory` instead of
@@ -2885,6 +2886,8 @@ struct LinkOpts {
     shared_pages: Option<i32>,
     /// `(base, limit)`, already validated by `parse_heap_window`.
     heap: Option<(i32, i32)>,
+    /// `--low-memory-unused[=<bytes>]`: no access reaches below this address (`None`: no promise).
+    low_memory: Option<i32>,
 }
 
 /// The largest page count an i32-addressed memory can declare (4 GiB).
@@ -2979,7 +2982,7 @@ fn parse_link_opts(args: &[String]) -> LinkOpts {
             ));
         }
     }
-    LinkOpts { import_memory, shared_pages, heap: heap_window(base, limit) }
+    LinkOpts { import_memory, shared_pages, heap: heap_window(base, limit), low_memory: None }
 }
 
 /// Validates a window from the two optional ends, or `None` when neither is given.
@@ -3346,6 +3349,22 @@ fn compile_vl_instance(
             .map_err(|_| stale_seed_for("--heap-base / --heap-limit", "setHeapWindow"))?;
         if set.call(&mut store, (base, limit))? != 0 {
             bail!("the compiler refused the heap window [{base:#x}, {limit:#x})");
+        }
+    }
+    // `--low-memory-unused`: the seed folds `a + K` into the memarg under the promise. The bare
+    // flag's 1 KiB is also binaryen's, which folds an i32 `a + K` on its own, so an older seed
+    // only loses the i64 form there; a sized promise is the seed's alone and needs the export.
+    if let Some(bytes) = link.low_memory {
+        match inst.get_typed_func::<i32, i32>(&mut store, "setLowMemoryUnused") {
+            Ok(set) => {
+                if set.call(&mut store, bytes)? != 0 {
+                    bail!("the compiler refused --low-memory-unused={bytes}");
+                }
+            }
+            Err(_) if bytes as i64 == LOW_MEMORY_BINARYEN => {}
+            Err(_) => {
+                return Err(stale_seed_for("--low-memory-unused=<bytes>", "setLowMemoryUnused"))
+            }
         }
     }
 
@@ -5257,32 +5276,53 @@ const BINARYEN_FEATURES: &[&str] = &[
 /// the size (DECISIONS.md, "`-O` inlines leaf helpers" and "`-O` inlines a fast path").
 const OPT_PASSES: &[&str] = &["--always-inline-max-function-size", "16", "-O"];
 
-/// `vl build -O --low-memory-unused`: binaryen's `--low-memory-unused`, under which `-O` and
-/// `-O3` also run `optimize-added-constants`, folding an address `p + C` with `C < 1024` into the
-/// access's memarg offset. That is a different program wherever `p + C` wraps past 2^32: the add
-/// lands in the first KiB, the offset form traps. So it is opt-in, for a module that never forms
-/// such an address (simd-design.md §G1 "Offsets"). Binaryen 130 fixes the bound at 1024, so the
-/// flag takes no value. Without an optimizing rung it would do nothing, and says so.
-fn low_memory_unused_flag(args: &[String], optimizing: bool) -> bool {
-    let mut seen = false;
+/// The low region binaryen's own `--low-memory-unused` assumes, fixed in binaryen 130.
+const LOW_MEMORY_BINARYEN: i64 = 1024;
+
+/// `vl build -O --low-memory-unused[=<bytes>]`: a promise that no access's effective address is
+/// below `<bytes>` (default 1 KiB), so an address `a + K` with `K` plus the access's offset below
+/// it may move `K` into the memarg offset. The two differ only where `a + K` wraps past 2^32, which
+/// lands below `K`: an access the promise excludes (DECISIONS.md, "PL-061"). The seed folds under
+/// it; a promise of at least 1 KiB also passes binaryen's flag of that name, which folds the same
+/// shapes after inlining. Only an optimizing rung reads it, and without one the flag says so.
+fn low_memory_unused_flag(args: &[String], optimizing: bool) -> Option<i64> {
+    let mut seen: Option<i64> = None;
     for a in args.iter().skip(2) {
-        if a == "--low-memory-unused" {
-            seen = true;
+        let value = if a == "--low-memory-unused" {
+            LOW_MEMORY_BINARYEN
         } else if let Some(v) = a.strip_prefix("--low-memory-unused=") {
-            usage_exit(&format!(
-                "`--low-memory-unused={v}` — the flag takes no value: binaryen fixes the unused \
-                 low region at 1 KiB. For a larger constant, write the offset form \
-                 `__load_i64__(p, {v})`"
-            ));
+            parse_low_memory(v).unwrap_or_else(|m| usage_exit(&m))
+        } else {
+            continue;
+        };
+        if seen.is_some() {
+            usage_exit("`--low-memory-unused` is given twice — give it once");
         }
+        seen = Some(value);
     }
-    if seen && !optimizing {
+    if seen.is_some() && !optimizing {
         usage_exit(
             "`--low-memory-unused` changes what `-O` / `-O3` may assume, and neither is given — \
              add one, or drop the flag",
         );
     }
     seen
+}
+
+/// `--low-memory-unused=<bytes>`'s value: decimal or `0x` hex, 1 to 2^31 - 1.
+fn parse_low_memory(raw: &str) -> std::result::Result<i64, String> {
+    let parsed = match raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) {
+        Some(hex) => i64::from_str_radix(&hex.replace('_', ""), 16),
+        None => raw.replace('_', "").parse::<i64>(),
+    };
+    match parsed {
+        Ok(n) if (1..=i32::MAX as i64).contains(&n) => Ok(n),
+        _ => Err(format!(
+            "`--low-memory-unused={raw}` — expected the size of the unused low region in bytes, \
+             decimal or 0x hex, from 1 to {}",
+            i32::MAX
+        )),
+    }
 }
 
 /// `vl build -O3` — the RELEASE PROFILE, the audited flag set from
@@ -8239,7 +8279,7 @@ fn build_cmd(args: &[String]) -> Result<()> {
     // `--names` embeds a wasm "name" custom section (legible trap backtraces).
     let names = args.iter().any(|a| a == "--names");
     let optimizing = args.iter().any(|a| a == "-O" || a == "-O3");
-    let low_memory_unused = low_memory_unused_flag(args, optimizing);
+    let low_memory = low_memory_unused_flag(args, optimizing);
     let names_mode = match (names, optimizing) {
         (false, _) => Names::Off,
         (true, false) => Names::Full,
@@ -8247,7 +8287,18 @@ fn build_cmd(args: &[String]) -> Result<()> {
     };
     // `--import-memory`: the module imports `env.memory` instead of defining and exporting
     // it (DECISIONS.md §"Linear memory is a layout contract").
-    let link = parse_link_opts(args);
+    let mut link = parse_link_opts(args);
+    link.low_memory = low_memory.map(|n| n as i32);
+    // A heap window that starts inside the promised-unused region breaks the promise with the
+    // first allocation, so the two flags contradict each other.
+    if let (Some(n), Some((base, _))) = (low_memory, link.heap) {
+        if (base as i64) < n {
+            usage_exit(&format!(
+                "`--heap-base={base:#x}` lies inside `--low-memory-unused={n}`'s region — \
+                 raise the base to at least {n:#x}, or shrink the promise"
+            ));
+        }
+    }
     // `_located`, so a written module the engine refuses names the function it came
     // from (D1578). The instance is read only on that failure path.
     let (mut bytes, mut session) = compile_vl_located(
@@ -8263,6 +8314,23 @@ fn build_cmd(args: &[String]) -> Result<()> {
     // the default base, as every other such unit does. Legal, so a warning, not a refusal.
     // Over a SHARED memory there is nothing to warn about: std:buffer's allocator keeps its
     // pointer in the memory itself, so instances and units sharing a window share it safely.
+    // The default window starts at 1 KiB, inside a larger promise: refused once the module is
+    // known to allocate, since a module that never allocates is unaffected by where it starts.
+    if let (Some(n), None) = (low_memory, link.heap) {
+        if n > HEAP_BASE_DEFAULT {
+            if let Some((store, inst)) = session.as_mut() {
+                if let Ok(read) = inst.get_typed_func::<(), i32>(&mut *store, "heapWindowRead") {
+                    if read.call(&mut *store, ())? != 0 {
+                        usage_exit(&format!(
+                            "`{input}` allocates from std:buffer, whose default heap starts at \
+                             {HEAP_BASE_DEFAULT:#x}, inside `--low-memory-unused={n}`'s region — \
+                             give `--heap-base=` at least {n:#x}"
+                        ));
+                    }
+                }
+            }
+        }
+    }
     if link.import_memory && link.heap.is_none() && link.shared_pages.is_none() {
         if let Some((store, inst)) = session.as_mut() {
             if let Ok(read) = inst.get_typed_func::<(), i32>(&mut *store, "heapWindowRead") {
@@ -8329,7 +8397,7 @@ fn build_cmd(args: &[String]) -> Result<()> {
         let stepped = phase!("opt.escape_step", escape_inline_step(&sink_str, flag, &bytes))?;
         let rung_input: &[u8] = stepped.as_deref().unwrap_or(&bytes);
         let mut passes = rung_passes(passes, names);
-        if low_memory_unused {
+        if low_memory.is_some_and(|n| n >= LOW_MEMORY_BINARYEN) {
             passes.insert(0, "--low-memory-unused");
         }
         let (no_inline, extra) = phase!("opt.run_once_scan", rung_scan(rung_input));

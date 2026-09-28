@@ -938,6 +938,7 @@ new: the compare-frame pre-pass never recurses into a code-15 field, so a NESTED
   1.7–2.4x slower under wasmtime, neutral on V8. 0 distilled-corpus cells moved. DECISIONS.md,
   "Loops stay top-tested" and "Small constant range loops are unrolled";
   `tests/cases/loops/unrolled-range-loops.vl`, `loop-control-matrix.vl`.
+- **`--low-memory-unused` folds an i64 address's constant, and takes a size (plumb PL-061).** Under the promise the compiler moves the added constants of an address into the access's memarg offset while their sum plus the offset is below the promised size: an i32 `q + C`, and an i64 `(p + C) as% i32`, which lowered to `i32.wrap_i64(i64.add(p, C))` that no binaryen pass folds. `__load_i64__((p + 32) as% i32)` now builds to the same wasm as `__load_i64__(p as% i32, 32)`. `--low-memory-unused=<bytes>` promises more than binaryen's fixed 1 KiB (plumb: `=65536` covers 99.65% of its constant offsets); the bare flag is `=1024`. A `--heap-base` inside the region, or a module that allocates from the default window under a larger promise, exits 2. Without the flag nothing changes and the add wraps. DECISIONS.md, "PL-061"; `tests/vl_memarg_offset_test.ts`, `tests/cases/intrinsics/memarg-i64-address-wraps.vl`.
 - **Memory intrinsics take a memarg offset (plumb PL-037 item 1).** `__load_i64__(p, 16)`,
   `__store_i32__(p, 8, v)`, `__load_v128__(p, 32)`, `__atomic_rmw_add_i32__(p, 4, 1)`: every
   scalar load and store, the v128 loads and store, and every atomic but the fence takes an

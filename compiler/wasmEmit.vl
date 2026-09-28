@@ -400,6 +400,7 @@ import {
   gHelpUtf8Dec,
   gHelpUtf8Enc,
   gImports,
+  gLowMemUnused,
   gMapDeletes,
   gMemLogIdx,
   gNeedsF32Print,
@@ -17458,8 +17459,105 @@ function emitMemAddr(
       }
     }
   }
+  if gLowMemUnused > 0 {
+    const lk = memLowFoldK(addr, fnIx)
+    if lk > 0 && lk + off < gLowMemUnused {
+      const wide = memLowWrapped(addr, fnIx)
+      const rest = memLowFoldRest(addr, fnIx)
+      if wide >= 0 {
+        if emitNumIntrArg(body, rest, 3, fnIx) < 0 { return -1 }
+        fbI32WrapI64()
+      } else if emitMemIntrinArg(body, rest, fnIx) < 0 {
+        return -1
+      }
+      return lk + off
+    }
+  }
   if emitMemIntrinArg(body, c.callArgs[0], fnIx) < 0 { return -1 }
   off
+}
+
+// The i64 operand of an address `x as% i32` when `x` is an i64, else -1. Under
+// `gLowMemUnused` its constant terms fold as an i32 address's do: `wrap(x + K)` is
+// `wrap(x) + K` modulo 2^32, the same wrap `memLowFoldK` argues about.
+function memLowWrapped(addr: i32, fnIx: i32): i32 {
+  const e = P.nodes[addr]
+  if e is AsExpr {
+    if e.asMode != "wrap" { return -1 }
+    let tgt = asExprNumTgtName(addr)
+    if tgt == "" { tgt = e.asTy }
+    if tgt != "i32" || asExprNumCastDomain(addr) == "u8" { return -1 }
+    if asExprIsUnionCastIn(addr, fnIx) || !exprIsI64(e.asObj, fnIx) {
+      return -1
+    }
+    return e.asObj
+  }
+  -1
+}
+
+// The non-constant side of a `+` at `ix` whose other side is a `memAddrConst`, or -1.
+function memLowStep(ix: i32, fnIx: i32): i32 {
+  const x = unwrapParen(ix)
+  if x < 0 || x >= P.nodes.length { return -1 }
+  const e = P.nodes[x]
+  if e is BinExpr {
+    if e.binOp != "+" { return -1 }
+    const lc = memAddrConst(e.binLeft, fnIx)
+    const rc = memAddrConst(e.binRight, fnIx)
+    if rc >= 0 && lc < 0 { return e.binLeft }
+    if lc >= 0 && rc < 0 { return e.binRight }
+  }
+  -1
+}
+
+// The constant that `memLowStep` peeled from the `+` at `ix`; only called where it answered.
+function memLowStepK(ix: i32, fnIx: i32): i64 {
+  const e = P.nodes[unwrapParen(ix)]
+  if e is BinExpr {
+    const rc = memAddrConst(e.binRight, fnIx)
+    if rc >= 0 { return rc }
+    return memAddrConst(e.binLeft, fnIx)
+  }
+  emitFail("emitProgram: a low-memory address fold lost its own `+`")
+  -1
+}
+
+// The address operand `emitMemAddr` pushes for `addr` (the i64 operand under a wrap).
+function memLowBase(addr: i32, fnIx: i32): i32 {
+  const w = memLowWrapped(addr, fnIx)
+  if w >= 0 { return w }
+  addr
+}
+
+// The sum of the constant terms `a + K1 + K2 ...` adds to address `addr`, or -1 when it adds
+// none or more than `MEM_OFFSET_MAX`. Moving them into the memarg changes the address only where
+// the sum wraps past 2^32, where the add's own address is below that sum, and so below
+// `gLowMemUnused` once the caller has checked it: an access the promise excludes.
+function memLowFoldK(addr: i32, fnIx: i32): i64 {
+  let x = memLowBase(addr, fnIx)
+  let k: i64 = 0
+  let next = memLowStep(x, fnIx)
+  while next >= 0 {
+    const sk = memLowStepK(x, fnIx)
+    if sk < 0 { return -1 }
+    k = k + sk
+    if k > MEM_OFFSET_MAX { return -1 }
+    x = next
+    next = memLowStep(x, fnIx)
+  }
+  if k == 0 { return -1 }
+  k
+}
+
+// The operand left once `memLowFoldK`'s constant terms are peeled from `addr`.
+function memLowFoldRest(addr: i32, fnIx: i32): i32 {
+  let x = memLowBase(addr, fnIx)
+  let next = memLowStep(x, fnIx)
+  while next >= 0 {
+    x = next
+    next = memLowStep(x, fnIx)
+  }
+  x
 }
 
 // The compile-time lane index at a SIMD lane argument, or -1 when it is not a literal in

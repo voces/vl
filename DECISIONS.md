@@ -8481,3 +8481,68 @@ reading there changes the value of programs that run today and awaits a ruling (
 the refusal is graded after every literal tree has its width, so `const a: i64 = 1 << 40` is
 accepted and `const b = 1 << 40` is not. A computed count keeps the wasm modulo. The one
 program in the repo that relied on the wrap was a fixture that had recorded it by mistake.
+
+## `--low-memory-unused` folds an i64 address's constant, and takes a size (2026-09-28) — plumb PL-061
+
+**The ask.** plumb's translator addresses guest memory through i64 registers, so its natural
+spelling of `[rsp + 32]` is `__load_i64__((rsp + 32) as% i32)`. That lowered to
+`i32.wrap_i64(i64.add(rsp, 32))` and a load at offset 0: one add per access, which V8 cannot fold
+into the machine addressing mode. Binaryen's `optimize-added-constants`, which `vl build -O
+--low-memory-unused` already runs, folds only an `i32.add(x, C)` pointer, and has no rule for a
+wrap of an i64 add. So plumb spelled every access in the explicit offset form
+(`{ const mb = rsp; __load_i64__(mb as% i32, 32) }`), 28% of its 43.5M generated lines.
+
+**The two programs, precisely.** Write `a = wrap(p)` (the low 32 bits of `p`) and `o` for the
+access's own memarg offset. `wrap` is a ring homomorphism from i64 to i32, so the original
+address `wrap(p + C)` is exactly `(a + C) mod 2^32`, for any `C`: the i64 spelling and the i32
+spelling `a + C` are the same program, and the only question is the one the i32 fold already
+answers. Wasm adds the memarg offset to the address WITHOUT wrapping, so
+
+* original: effective address `((a + C) mod 2^32) + o`;
+* folded, `wrap(p)` with offset `C + o`: effective address `a + C + o`.
+
+They are equal whenever `a + C < 2^32`. Otherwise, for `0 <= C < 2^32`, the original's address
+is `a + C - 2^32 + o`, which is below `C + o` because `a < 2^32`; the folded form's is at least
+2^32, beyond any wasm32 memory (at most 65,536 pages, 4 GiB), so it traps. Peeling several
+constants (`p + 8 + 24`) is the same argument over their sum: every wrap it can take lands below
+the sum. **So the two differ exactly on an access whose effective address is below `C + o`,
+and a promise that no access reaches below `N` makes them the same program whenever `C + o < N`.**
+Not below `C` alone: with `o = 2000` and `C = 8`, the original's wrapped access lands in
+`[2000, 2008)`, outside a 1 KiB promise. Binaryen checks the same total (`offset=1000` over
+`+ 8` folds to 1008; `offset=2000` over `+ 8` stays an add).
+
+**What VL's flag promises.** Before this change, `--low-memory-unused` passed binaryen's flag of
+that name and promised exactly what binaryen assumes: the first 1 KiB is never accessed
+(binaryen 130 fixes the bound at 1024 and ignores `--pass-arg=low-memory-bound@N`, checked).
+Nothing VL itself emits touches linear memory below the heap window (no data section, no shadow
+stack), so the promise is about the program's own intrinsic accesses and `std:buffer`'s window.
+
+**The rule.**
+* Under `--low-memory-unused` the EMITTER folds an address's added constants into the memarg
+  when their sum plus the access's offset is below the promised size: an i32 `q + C`, and an
+  i64 `(p + C) as% i32` as `wrap(p)` with offset `C` (`memLowFoldK` in `compiler/wasmEmit.vl`,
+  set by the host through the seed's `setLowMemoryUnused`). Without the flag nothing changes,
+  and the add wraps as before (`tests/cases/intrinsics/memarg-i64-address-wraps.vl`).
+* `--low-memory-unused=<bytes>` promises a larger region; the bare flag is `=1024`, today's
+  promise. plumb never maps its low 64 KiB and measured its accesses' constants: 95.13% below
+  1024, 2.73% in 1024–4095, 1.79% in 4096–65535, 0.35% at 65536 or more, so `=65536` covers
+  99.65% of them. Only VL can use a larger size, since binaryen cannot be told one; binaryen's
+  own pass still runs for any promise of at least 1 KiB, and folds what inlining exposes.
+* A heap window that starts inside the promise contradicts it: `--heap-base` below the size exits
+  2, and so does a module that allocates from the default window (base 1024) under a larger
+  promise. A module that never allocates is unaffected by where the window starts.
+* The flag still needs `-O`/`-O3`, as before: it is a licence to optimise, and a debug build
+  keeps every add.
+
+**Why the emitter and not a pre-pass before binaryen.** The minimal target was that
+`__load_i64__((p + 32) as% i32)` and `__load_i64__(p as% i32, 32)` build to the same wasm; the
+emitter meets it before binaryen runs (`-O --low-memory-unused` builds the two to identical
+function bodies, and a module holding both deduplicates them), for the sized promise too, where
+no binaryen pass can. A pre-pass would have to be a wasm rewriter in the host, which has none.
+
+**Not covered: a helper inlined by binaryen.** `function ld64(a: i64) { __load_i64__(a as% i32) }`
+called as `ld64(rsp + 32)` has nothing to fold when the emitter sees it; after `-O` inlines it
+the address is `i32.wrap_i64(i64.add(rsp, 32))`, which no binaryen pass folds. Rewriting that to
+`i32.add(i32.wrap_i64(rsp), 32)` is always sound (the identity above) and would let binaryen
+fold it, but it has to run after inlining, so it needs a wasm rewrite step in the host. plumb's
+translator writes the direct form, so this is left until a consumer's inlined helpers ask.
