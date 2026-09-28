@@ -32,6 +32,7 @@ import {
   nameIsShapeOpen,
   nameStripSpaces,
   peelGroupParens,
+  roListInnerName,
   spanEqAt,
   splitUnionAtoms,
   tyTopIndexOf,
@@ -34904,10 +34905,28 @@ export function removeAtomFromSet(set: string, removed: string): string {
     let r = -1
     // `null` is a keyword, not a rendered shape — the one member the structural path
     // identifies without any name at all, and the dominant removal (`!= null` else-branches).
-    if removed == "null" { r = msSubNull(s) } else { r = msSubAtom(s, removed) }
+    if removed == "null" {
+      r = msSubNull(s)
+    } else {
+      r = msSubAtomOrView(s, removed)
+    }
     if r >= 0 { return msTextOf(r) }
   }
-  removeAtomFrom(set, removed)
+  const out = removeAtomFrom(set, removed)
+  if out != set { return out }
+  const roIn = roListInnerName(removed)
+  if roIn != "" { return removeAtomFrom(set, roIn) }
+  out
+}
+
+// `msSubAtom`, where a set that spells a view's member as its list still loses it: the two are
+// one rep and one atom, so `is readonly f64[]` rules out an `f64[]` member (D2887).
+function msSubAtomOrView(s: i32, removed: string): i32 {
+  const r = msSubAtom(s, removed)
+  if r != s { return r }
+  const roIn = roListInnerName(removed)
+  if roIn == "" { return r }
+  msSubAtom(s, roIn)
 }
 
 // Set subtraction that keeps the set identity: subtract `removed` from set `s` and push the
@@ -34917,7 +34936,11 @@ export function removeAtomFromSet(set: string, removed: string): string {
 function pushNarrowComplement(name: string, s: i32, removed: string): string {
   if s < 0 { return "" }
   let r = -1
-  if removed == "null" { r = msSubNull(s) } else { r = msSubAtom(s, removed) }
+  if removed == "null" {
+    r = msSubNull(s)
+  } else {
+    r = msSubAtomOrView(s, removed)
+  }
   if r < 0 { return "" }
   const txt = msTextOf(r)
   if txt == "" { return "" }
@@ -36083,6 +36106,9 @@ function declaredRefArrayName(name: string) {
 function globalRefArrayName(fnIx: i32, name: string) {
   const li = globalLetOfIn(fnIx, name)
   if li < 0 { return "" }
+  // The row the cell holds when a declared destination re-seated the literal (D2881).
+  const rs = letRecordListDestSlot(li, -1)
+  if rs >= 0 && rs < rlElemName.length { return rlElemName[rs] }
   letRefListElemName(li, -1)
 }
 
@@ -36913,7 +36939,33 @@ export function letRefListSlot(letIx: i32, fnIx: i32) {
   // `letRefListDestSlot`. The local's cell and the literal's build read one answer.
   const dsl = letRefListDestSlot(letIx, fnIx)
   if dsl >= 0 { return dsl }
+  const rsl = letRecordListDestSlot(letIx, fnIx)
+  if rsl >= 0 { return rsl }
   rlSlotByName(letRefListElemName(letIx, fnIx))
+}
+
+// The record row a declared destination names for an un-annotated list of object literals
+// whose own elements would pick another row, or -1. The literal is built at the destination's
+// row so the one list both handles hold is the one the destination reads (D2881).
+function letRecordListDestSlot(letIx: i32, fnIx: i32): i32 {
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 || d.letInit < 0 { return -1 }
+    const ai = unwrapParen(d.letInit)
+    if ai < 0 { return -1 }
+    const ini = P.nodes[ai]
+    if ini is ArrayLit {
+      if ini.arrElems.length < 1 { return -1 }
+      const e0 = unwrapParen(ini.arrElems[0])
+      if e0 < 0 || !(P.nodes[e0] is ObjLit) { return -1 }
+      const own = rlSlotByName(arrLitElemNameIn(ai, fnIx))
+      if !rlSlotIsKindList(own, RLK_STRUCT) { return -1 }
+      const dst = letRefListDestSlotK(letIx, fnIx, RLK_STRUCT)
+      if dst < 0 || dst == own { return -1 }
+      return dst
+    }
+  }
+  -1
 }
 
 // The bound `LetDecl`'s own name, or "" out of range / not a let.
@@ -36962,13 +37014,13 @@ export function letListDestKindConflict(letIx: i32, fnIx: i32): boolean {
   letRefListDestSlotK(letIx, fnIx, 1) >= 0
 }
 
-// The kind-parameterised scan (D411). `want` 2 is the union BOX — the only kind this rung
-// ever ANSWERS with, and the behaviour every caller had before — and `want` 1 is the plain
-// struct-row element list, asked only by the conflict detector above.
+// The kind-parameterised scan (D411). `want` 2 is the union box; `want` 1 is the plain
+// struct-row element list, asked by the conflict detector above and by
+// `letRecordListDestSlot`, which re-seats a literal whose own row differs (D2881).
 export function letRefListDestSlotK(letIx: i32, fnIx: i32, want: i32): i32 {
-  // O(1) necessary condition keeping the O(arena) scan off most programs: this rung only
-  // ever returns a union-box row, and a module declaring no union has none.
-  if !uDeclared { return -1 }
+  // O(1) necessary condition keeping the O(arena) scan off most programs: a module declaring
+  // no union has no union-box row.
+  if want == RLK_UNION && !uDeclared { return -1 }
   const d = P.nodes[letIx]
   if d is LetDecl {
     // An annotated binding already names its own slot, and a passthrough init names the
@@ -37530,6 +37582,11 @@ export function letListBuild(letIx: i32, fnIx: i32): ListBuild {
   if ds >= 0 {
     const dst: ListBuild = { lbKind: LBK_UNION, lbSlot: ds }
     return dst
+  }
+  const rs = letRecordListDestSlot(letIx, fnIx)
+  if rs >= 0 {
+    const rdst: ListBuild = { lbKind: LBK_REF, lbSlot: rs }
+    return rdst
   }
   const own: ListBuild = {
     lbKind: LBK_I32_LIST,
