@@ -166,9 +166,9 @@ run "dead-export budget"       "$PY" scripts/export-budget.py --check
 # lint itself rather than a python copy of it (a `+` chain is an expression tree), so it
 # needs the seed. The compiler's standing chains are held; a new one reds here.
 run "interp budget"            "$PY" scripts/interp-budget.py --check
-# THE SHAPE FAMILY: ten pairs, same work, one axis reshaped, graded on the TIME
-# RATIO so machine speed and box load cancel. ~16-25 s; it is the only gate here
-# whose verdict is a measurement, and it reds on the pre-#2419 compiler.
+# THE SHAPE FAMILY: pairs of the same work, one axis reshaped, graded on the ratio of
+# the compiler's guest FUEL (a count, so load cannot move it; the runtime pairs on CPU).
+# ~40 s, and it reds on the pre-#2419 compiler.
 run "scaling shape"            deno test -A --no-check tests/vl_scaling_shape_test.ts
 run "deno lint"                deno lint
 run "rep-fuzz"                 bash scripts/rep-fuzz-check.sh

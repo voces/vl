@@ -19,6 +19,10 @@ USAGE
     python3 scripts/check-filed-witnesses.py --json out.json <doc-or-dir>...
     python3 scripts/check-filed-witnesses.py --strict <doc-or-dir>...
     python3 scripts/check-filed-witnesses.py --self-test
+    JOBS=8 python3 scripts/check-filed-witnesses.py --strict <doc-or-dir>...
+
+Rows are graded `$JOBS` at a time (default 4, the gate's own setting); the report is in doc
+order whatever the setting, byte for byte the same as `JOBS=1`.
 
 An argument may be a MONOLITH or a DIRECTORY of one-row files — see `resolve`. Both grade
 identically, which is what lets the gate command stay put while the split lands.
@@ -82,6 +86,7 @@ something other than its `Want:` is `wrong_output`, counted in MOVED and on the 
 second line.
 """
 import json, re, subprocess, sys, tempfile, os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -89,6 +94,8 @@ import seed_provenance
 
 VL = "./scripts/vl-host/target/release/vl"
 COMPILER = "build/vl-compiler.wasm"
+# Rows graded at once; `gate.sh` exports its own JOBS, so the row takes the gate's setting.
+JOBS = int(os.environ.get("JOBS", "4"))
 
 # Declared-status vocabulary -> canonical outcome. Ordered: first match wins, so the more
 # specific phrases precede the substrings they contain.
@@ -257,13 +264,13 @@ def run_program(src):
             Path(f).write_text(body)
         chk = subprocess.run([VL, "check", f, "--compiler", COMPILER],
                              capture_output=True, text=True, timeout=120)
-        run = subprocess.run([VL, "run", f, "--compiler", COMPILER],
-                             capture_output=True, text=True, timeout=120)
         if chk.returncode != 0:
             diag = (chk.stdout + chk.stderr).strip()
             if PARSE_STAGE in diag:
                 return "witness_unparsed", diag[:200], ""
             return "check_reject", diag[:200], ""
+        run = subprocess.run([VL, "run", f, "--compiler", COMPILER],
+                             capture_output=True, text=True, timeout=120)
         if run.returncode == 0:
             return "runs", run.stdout.strip()[:200], run.stdout
         err = (run.stdout + run.stderr).strip()
@@ -604,34 +611,44 @@ def main(argv):
 
     results, moved, ungradable, unparsed = [], [], [], []
     want_checked = 0
+    rows = []
     for doc in [d for arg in docs for d in resolve(arg)]:
         for ln_no, head in unparsed_row_heads(doc):
             unparsed.append((doc, ln_no, head))
         for r in parse(doc):
             if not r["repro"]:
-                ungradable.append((r, "no Repro block")); continue
+                rows.append((r, None, "no Repro block")); continue
             want = declared_outcome(r["status"] or "")
             if want is None:
-                ungradable.append((r, "status line names no known outcome")); continue
+                rows.append((r, None, "status line names no known outcome")); continue
             if r["want_labels"] > 1:
-                ungradable.append((r, "carries more than one `Want:` block")); continue
+                rows.append((r, None, "carries more than one `Want:` block")); continue
             if r["want_labels"] and not r["want"]:
-                ungradable.append((r, "a `Want:` label with no indented block under it"))
+                rows.append((r, None, "a `Want:` label with no indented block under it"))
                 continue
-            got, detail, stdout = run_program(r["repro"])
-            got, why = grade(r, want, got, detail, stdout)
-            if got is None:
-                ungradable.append((r, why)); continue
-            if r["want"] is not None and got in ("runs", "silent_wrong_value", "wrong_output"):
-                want_checked += 1
-            if got == "wrong_output":
-                detail = ("prints " + json.dumps(norm_output(stdout))[:120] +
-                          ", Want " + json.dumps(norm_output(r["want"]))[:120])
-            rec = {**r, "declared": want, "actual": got, "detail": detail,
-                   "agrees": got == want}
-            results.append(rec)
-            if not rec["agrees"]:
-                moved.append(rec)
+            rows.append((r, want, None))
+    # Each row is two or three `vl` processes and nothing else, so the rows fan out over a
+    # thread pool. `map` hands the answers back in submission order, the doc order the
+    # serial loop graded in, so the report is byte-identical whatever finished first.
+    with ThreadPoolExecutor(max(1, JOBS)) as ex:
+        ran = list(ex.map(lambda row: run_program(row[0]["repro"]) if row[1] else None, rows))
+    for (r, want, why), out in zip(rows, ran):
+        if want is None:
+            ungradable.append((r, why)); continue
+        got, detail, stdout = out
+        got, why = grade(r, want, got, detail, stdout)
+        if got is None:
+            ungradable.append((r, why)); continue
+        if r["want"] is not None and got in ("runs", "silent_wrong_value", "wrong_output"):
+            want_checked += 1
+        if got == "wrong_output":
+            detail = ("prints " + json.dumps(norm_output(stdout))[:120] +
+                      ", Want " + json.dumps(norm_output(r["want"]))[:120])
+        rec = {**r, "declared": want, "actual": got, "detail": detail,
+               "agrees": got == want}
+        results.append(rec)
+        if not rec["agrees"]:
+            moved.append(rec)
 
     w = max([len(r["id"]) for r in results] + [4])
     print(f"{'ID':<{w}}  {'FILED':<22} {'TODAY':<22} VERDICT")
