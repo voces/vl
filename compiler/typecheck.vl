@@ -13326,6 +13326,8 @@ function numLitAsgNoteQueue(msg: string, di: i32) {
       const gn = primNameStr(primNameOf(gotBase))
       const bytes = slot == "=" && list != "" && numLitListIsBytes(dn.letInit)
       if !numLitFitsStore(bn, gn, bytes) { return 0 }
+      // A `const` refuses the whole store already; annotating it would not help.
+      if slot == "=" && dn.letKw == "const" { return 0 }
       let note = ""
       if fieldLit >= 0 {
         note = " — field `"
@@ -13410,12 +13412,15 @@ function numLitStoreRefused(v: i32, want: i32, wholeList: boolean): boolean {
 
 // Drop the queued store notes (`nlnSlot` non-empty) whose suggested type another store to the
 // same binding and slot would be refused by: a whole or compound assignment, an element or
-// field assignment, or a `push`. By name, like `numLitNamesStoredNonLit`; one walk.
+// field assignment, or a `push`. By name, within the top-level statement that declares the
+// binding (anywhere, for a module-level one); one walk.
 function numLitAsgNotesRefuted(drop: boolean[]) {
   const names: {[string]: boolean} = Map()
+  const declOwner: i32[] = []
   let any = false
   let j = 0
   while j < nlnSlot.length {
+    declOwner.push(-1)
     if nlnSlot[j] != "" {
       names[nlnUse[j]] = true
       any = true
@@ -13423,11 +13428,27 @@ function numLitAsgNotesRefuted(drop: boolean[]) {
     j = j + 1
   }
   if !any { return 0 }
+  // Each store to a queued name: its name, slot, value, and the top-level statement it sits in.
+  const sName: string[] = []
+  const sSlot: string[] = []
+  const sVal: i32[] = []
+  const sOwner: i32[] = []
   const stack: i32[] = []
-  for s in gRootStmts { stack.push(s) }
+  const owners: i32[] = []
+  for s in gRootStmts {
+    stack.push(s)
+    owners.push(s)
+  }
   while stack.length > 0 {
     const ix = stack[stack.length - 1]
+    const own = owners[owners.length - 1]
     stack.pop()
+    owners.pop()
+    let k0 = 0
+    while k0 < nlnDecl.length {
+      if nlnDecl[k0] == ix { declOwner[k0] = own }
+      k0 = k0 + 1
+    }
     const n = P.nodes[ix]
     let tn = ""
     let slot = ""
@@ -13455,26 +13476,40 @@ function numLitAsgNotesRefuted(drop: boolean[]) {
       }
     }
     if tn != "" && (names[tn] ?? false) {
-      let k = 0
-      while k < nlnSlot.length {
-        const ks = nlnSlot[k]
-        if ks != "" && nlnUse[k] == tn {
-          // A list's note (`[]` or `=[]`) is refuted by an element store or a whole one.
-          const listNote = ks == "[]" || ks == "=[]"
-          let hit = false
-          if listNote && (slot == "=" || slot == "[]") {
-            hit = numLitStoreRefused(v, nlnWant[k], slot == "=")
-          } else if ks == slot {
-            hit = numLitStoreRefused(v, nlnWant[k], false)
-          }
-          if hit { drop[k] = true }
-        }
-        k = k + 1
-      }
+      sName.push(tn)
+      sSlot.push(slot)
+      sVal.push(v)
+      sOwner.push(own)
     }
     for c in nodeChildren(ix) {
-      if c >= 0 && c < P.nodes.length { stack.push(c) }
+      if c >= 0 && c < P.nodes.length {
+        stack.push(c)
+        owners.push(own)
+      }
     }
+  }
+  let k = 0
+  while k < nlnSlot.length {
+    const ks = nlnSlot[k]
+    // A module-level declaration is its own top-level statement, and any store may reach it.
+    const scoped = declOwner[k] >= 0 && declOwner[k] != nlnDecl[k]
+    let si = 0
+    while ks != "" && si < sName.length {
+      if sName[si] == nlnUse[k] && (!scoped || sOwner[si] == declOwner[k]) {
+        // A list's note (`[]` or `=[]`) is refuted by an element store or a whole one.
+        const slot = sSlot[si]
+        const listNote = ks == "[]" || ks == "=[]"
+        let hit = false
+        if listNote && (slot == "=" || slot == "[]") {
+          hit = numLitStoreRefused(sVal[si], nlnWant[k], slot == "=")
+        } else if ks == slot {
+          hit = numLitStoreRefused(sVal[si], nlnWant[k], false)
+        }
+        if hit { drop[k] = true }
+      }
+      si = si + 1
+    }
+    k = k + 1
   }
   0
 }

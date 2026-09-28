@@ -226,6 +226,17 @@ Deno.test({ name: "wasm-checker: a store into a defaulted literal names its decl
       ["cannot assign i64 to i32", "cannot assign f32 to i32"],
     ],
     [g + "let c = 0.5\nc = big()\nprint(c)\n", ["cannot assign i64 to f64"]],
+    // A whole store to a `const` is refused already, so annotating it would not help.
+    [
+      "function big(): i64 { 5000000000 }\nconst t = 0\n" +
+      "function run() { const s = 0; s += big(); t = big() }\nrun()\n",
+      [
+        "cannot reassign `const` s",
+        "cannot assign i64 to i32",
+        "cannot reassign `const` t",
+        "cannot assign i64 to i32",
+      ],
+    ],
   ];
   for (const [src, want] of misses) {
     const got = await msgs(src);
