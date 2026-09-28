@@ -360,6 +360,16 @@ Deno.test({ name: "wasm-checker: a function value's defaulted literal return nam
     [g + "function h(x: i64) { 7 }\nconst al = h\nprint(ap(h))\nprint(a32(al))\n", [mis]],
     // A return that is not a literal.
     [g + "function m(x: i64) { 2 * 3 }\nprint(ap(m))\n", [mis]],
+    // A call result the annotation would change: cast, operator, inferred tail, member call.
+    [g + "function c1(x: i64) { 5 }\nprint(ap(c1))\nprint(c1(1) as i32)\n", [mis]],
+    [g + "function c2(x: i64) { 5 }\nprint(ap(c2))\nprint(c2(1) * 1000000000)\n", [mis]],
+    [
+      g + "function c3(x: i64) { 5 }\nprint(ap(c3))\nfunction w() { c3(1) }\nfunction t(v: i32): i32 { v }\nprint(t(w()))\n",
+      [mis],
+    ],
+    [g + "function c4(self: i64) { 5 }\nprint(ap(c4))\nconst q: i32 = (1 as i64).c4()\nprint(q)\n", [mis]],
+    // An exported function: another module may read its result at the old type.
+    [g + "export function c5(x: i64) { 5 }\nprint(ap(c5))\n", [mis]],
   ];
   for (const [src, want] of misses) {
     const got = await msgs(src);

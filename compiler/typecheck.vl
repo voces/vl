@@ -14117,6 +14117,8 @@ function numLitFnFits(p: i32, wt: TyFunc): boolean {
   const gt = T.tys[got]
   if f is FuncDecl && gt is TyFunc {
     if f.fnRet >= 0 || f.fnTyParams.length > 0 { return false }
+    // Another module may use an exported function's result where only the old return fits.
+    if declHasExportKw(bind) { return false }
     const np = gt.fnParamTypes.length
     if np != wt.fnParamTypes.length || np != f.fnParams.length { return false }
     let i = 0
@@ -14253,21 +14255,12 @@ function numLitFnSig(ann: string): string {
     }
     const ps = "(" + numLitFnParams(f) + "): " + ann
     if f.fnName != "" {
-      sig = exportKwOf(nlFnDecl)
-        + "function "
-        + demangleName(f.fnName)
-        + ps
-        + body
+      sig = "function " + demangleName(f.fnName) + ps + body
     } else {
       sig = ps + " =>" + body
     }
     if b is LetDecl {
-      sig = exportKwOf(nlFnBind)
-        + b.letKw
-        + " "
-        + demangleName(b.letName)
-        + " = "
-        + sig
+      sig = b.letKw + " " + demangleName(b.letName) + " = " + sig
     }
   }
   sig
@@ -14303,9 +14296,9 @@ function numLitFnParams(f: FuncDecl): string {
 }
 
 // Drop each function-value note whose suggested return another use of the function would refuse:
-// every read of its name within the top-level statement that declares it (anywhere, for a
-// module-level one) must be a read some note names, a call whose result passes
-// `numLitUseAccepts` at the suggested type, or a call statement whose result is discarded.
+// every read of its name, or member call by it, within the top-level statement that declares it
+// (anywhere, for a module-level one) must be a read some note names or a call whose result
+// `numLitFnCallAccepts` keeps.
 function numLitFnNotesRefuted(drop: boolean[]) {
   const names: {[string]: boolean} = Map()
   const decls: {[i32]: boolean} = Map()
@@ -14338,11 +14331,12 @@ function numLitFnNotesRefuted(drop: boolean[]) {
     owners.pop()
     if decls[ix] ?? false { owner[ix] = own }
     const n = P.nodes[ix]
-    if n is Ident {
-      if names[n.identName] ?? false {
-        reads.push(ix)
-        readOwner.push(own)
-      }
+    let rn = ""
+    if n is Ident { rn = n.identName }
+    if n is Member { rn = n.memProp }
+    if rn != "" && (names[rn] ?? false) {
+      reads.push(ix)
+      readOwner.push(own)
     }
     for c in nodeChildren(ix) {
       if c >= 0 && c < P.nodes.length {
@@ -14369,6 +14363,7 @@ function numLitFnNotesRefuted(drop: boolean[]) {
         const id = P.nodes[r]
         let mine = false
         if id is Ident { mine = id.identName == nlnUse[k] }
+        if id is Member { mine = id.memProp == nlnUse[k] }
         if mine && (!scoped || readOwner[ri] == own) {
           if (
             !numLitFnReadNamed(r, nlnAnn[k])
@@ -14395,21 +14390,13 @@ function numLitFnReadNamed(r: i32, ann: string): boolean {
   false
 }
 
-// Is the read `r` the callee of a call whose result still checks at type `s`: discarded as a
-// statement that is not a block's last, or accepted by `numLitUseAccepts`?
+// Is the read `r` the callee of a call whose result keeps its value at type `s` wherever it goes:
+// discarded as a statement, a `print` argument, an argument whose parameter takes `s`, an
+// annotated `let` that takes `s`, or the return of a function whose declared return takes `s`?
+// Anything else (a cast, an operator, an inferred return or binding) refutes the note (D3070).
 function numLitFnCallAccepts(r: i32, s: i32, par: {[i32]: i32}): boolean {
-  let c = r
-  let p = par[c] ?? -1
-  while p >= 0 && P.nodes[p] is Paren {
-    c = p
-    p = par[p] ?? -1
-  }
+  const p = numLitFnCallOf(r, par)
   if p < 0 { return false }
-  const call = P.nodes[p]
-  if !(call is Call) { return false }
-  if call is Call {
-    if call.callFn != c { return false }
-  }
   const up = par[p] ?? -1
   // A top-level statement has no parent here, and its result is discarded.
   if up < 0 { return true }
@@ -14417,12 +14404,77 @@ function numLitFnCallAccepts(r: i32, s: i32, par: {[i32]: i32}): boolean {
   if un is Block {
     const n = un.blkStmts.length
     if n > 0 && un.blkStmts[n - 1] != p { return true }
+    return numLitIsFnTail(p, up, par) && numLitFnRetTakes(up, s, par)
   }
   if un is LetDecl {
     const lt = nodeTyIxOf(un.letType)
     return un.letInit == p && un.letType >= 0 && lt >= 0 && assignable(s, lt)
   }
-  numLitUseAccepts(p, s, "#fn", par, 8)
+  if un is RetStmt { return numLitFnRetTakes(up, s, par) }
+  numLitFnArgTakes(up, p, s)
+}
+
+// The call whose callee is the read `r` (a name, or a member call by it), through parentheses;
+// -1 when `r` is not a callee.
+function numLitFnCallOf(r: i32, par: {[i32]: i32}): i32 {
+  let c = r
+  let p = par[c] ?? -1
+  while p >= 0 && P.nodes[p] is Paren {
+    c = p
+    p = par[p] ?? -1
+  }
+  if p < 0 { return -1 }
+  const call = P.nodes[p]
+  if call is Call {
+    if call.callFn == c { return p }
+  }
+  -1
+}
+
+// Is `c` an argument of call `p` that `print` takes, or whose non-generic parameter takes `s`?
+function numLitFnArgTakes(p: i32, c: i32, s: i32): boolean {
+  const pn = P.nodes[p]
+  if pn is Call {
+    if pn.callFn == c { return false }
+    const cf = P.nodes[parenPeelIx(pn.callFn)]
+    if cf is Ident {
+      if cf.identName == "print" && pn.callArgs.length == 1 { return true }
+    }
+    const ft = nodeTyIxOf(pn.callFn)
+    if ft < 0 || ft >= T.tys.length { return false }
+    const ftt = T.tys[ft]
+    if ftt is TyFunc {
+      let i = 0
+      while i < pn.callArgs.length && i < ftt.fnParamTypes.length {
+        if pn.callArgs[i] == c {
+          return numLitParamTakes(ftt.fnParamTypes[i], s)
+        }
+        i = i + 1
+      }
+    }
+  }
+  false
+}
+
+// Does the function the node `p` sits in declare a return type that takes `s`? An inferred return
+// follows the value, so the suggestion would change it: no.
+function numLitFnRetTakes(p: i32, s: i32, par: {[i32]: i32}): boolean {
+  let f = p
+  let k = 0
+  while f >= 0 && k < 4096 {
+    const fd = P.nodes[f]
+    if fd is FuncDecl {
+      if fd.fnRet < 0 { return false }
+      const ft = nodeTyIxOf(f)
+      if ft < 0 || ft >= T.tys.length { return false }
+      const ftt = T.tys[ft]
+      if ftt is TyFunc { return numLitParamTakes(ftt.fnRet, s) }
+      return false
+    }
+    f = par[f] ?? -1
+    k = k + 1
+  }
+  false
 }
 
 // `export ` when the top-level declaration `decl` carries the keyword, else "".
