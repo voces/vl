@@ -94,6 +94,7 @@ ROWS = [
     ("monoGeneric", ["monoGen"], "not-a-memo", None),
     ("definiteAssign", ["daGen"], "not-a-memo", None),
     ("lintGoalSeen", ["klGSeen"], "not-a-memo", None),
+    ("reseatReturnWalkMark", ["rsRetSeenE", "rsRetSeenL"], "not-a-memo", None),
     ("narrowingBank", ["npEpochs", "asgDeclEpochs"], "not-a-memo", None),
     ("checkVisitMarks", ["emitNameSeen", "nomNameSeen", "stSeenStack"], "not-a-memo", None),
     ("rootStmtList", ["gRootStmts"], "not-a-memo", None),
