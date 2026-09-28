@@ -466,10 +466,11 @@ Four, and they fire at different moments. Profiling is what you do AFTER one of 
   missed it. It was CPU seconds against a 6.3 s idle baseline at 4×, half of the factor paying
   for contention, and it still flaked: docs-only PRs whose seed WAS master's fixpoint read
   26.8 s and 27.6 s at load 40–50 against a 25.2 s line. Fuel is identical run to run, so the
-  factor now pays only for the compiler growing between re-baselines. A whole-arena scan per
-  emitted function injected into a quarter of the functions reads +57% and reds; the CPU row
-  read 23.8 s for that same build and would have passed. It says only that the bootstrap got
-  dearer; the shape family says where.
+  factor now pays only for the compiler growing between re-baselines. The line is coarse: one
+  injected whole-arena scan per emitted function (a quarter of them) read +57% and red, while
+  a weaker injection read +34% and passed — as it also would have on the CPU row. It catches
+  the D1090 class, a many-fold blowup; the shape family is what sees a smaller multiplier, and
+  says where.
 * **`scripts/plumb-shape-cost.py`** — what one `vl build --names -O --import-memory` of a 2 MB
   plumb-shaped unit costs, against `scripts/plumb-shape-baseline.json`. The unit is written by
   `scripts/perf/gen-plumb-shape.vl` (fixed seed; its hash is in the baseline, so a seed that

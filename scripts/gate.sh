@@ -68,8 +68,9 @@ run "python preflight"         bash scripts/python-preflight.sh "$LOGS/python.di
 # and ci.yml keep the full set, CI running them as separate jobs (pass-2 survey §7).
 #
 # A file the three single-file rows below own leaves both lists, so the dedicated row is
-# the only place it runs. vl_scaling_shape_test.ts is the one that must: it grades a TIME
-# RATIO, and measured concurrently with itself it grades the box. The other two are pure
+# the only place it runs. vl_scaling_shape_test.ts is the one that must: its runtime pairs
+# grade a CPU RATIO, and measured concurrently with itself that grades the box (its compile
+# pairs grade guest fuel, which load cannot move). The other two are pure
 # file scans — no seed, no SELFHOST_NATIVE_ALIGN — so they run identically wherever they land.
 OWN_ROW=$'tests/vl_scaling_shape_test.ts\ntests/vl_inventory_refs_test.ts\ntests/vl_no_conflict_markers_test.ts'
 # Filtered in bash, not with `--ignore`: `--ignore` next to an explicit multi-glob file

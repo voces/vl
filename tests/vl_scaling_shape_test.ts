@@ -23,8 +23,10 @@
 // every run, so the margin pays only for the compiler changing, not for the box. Four axes
 // sit above the default because they are super-linear today — `types`, `modules`, `reads
 // after many closed sibling shadows`, `list concat chain length` — and that is recorded
-// DEBT, not tolerance: lower a bar when the thing it names stops multiplying. The CPU
-// readings quoted beside individual pairs below predate fuel grading.
+// DEBT, not tolerance: lower a bar when the thing it names stops multiplying. Two are GROWTH
+// pairs, the same shape at `n` against `n/4`, so linear reads 4 rather than 1: `many
+// distinct captured sibling blocks` and `list concat chain length`. The CPU readings quoted
+// beside individual pairs below predate fuel grading.
 
 import { ROOT, VL, exists } from "./support/tree.ts";
 
@@ -800,8 +802,9 @@ axis(
 // (`u`, `u$s1`, …) once it is captured, so `startBlockLetRowOfSid` is asked about `n` DISTINCT
 // sids rather than one. Its own per-sid scan of every start statement made that O(n) per sid,
 // O(n²) overall — the query-side fix above does not touch this, since each sid is asked once
-// (D2326). A DOUBLING pair — `n` blocks against `n/2` — because a one-block arm is an empty
-// compile, and a ratio against it is a budget; linear reads 2.0 here, and today it reads 2.83.
+// (D2326). A GROWTH pair — `n` blocks against `n/4` — because a one-block arm is an empty
+// compile, and a ratio against it is a budget. Linear reads 4 and quadratic 16; today it reads
+// 7.14, and with `startBlockLetRowOfSid`'s memo disabled 15.3.
 const genManyCapturedSiblingBlocks = (n: number, many: boolean): string => {
   const o = ["type U = i32 | string", "function g(x: i32): U {", "  if x % 2 == 0 { return x }", '  "s"', "}"];
   const blocks = many ? n : 1;
@@ -823,9 +826,9 @@ const genManyCapturedSiblingBlocks = (n: number, many: boolean): string => {
 
 axis(
   "many distinct captured sibling blocks",
-  3.6,
+  8.9,
   "`startBlockLetRowOfSid` re-scans every start statement per DISTINCT sid (D2326).",
-  (d) => twoFiles(d, genManyCapturedSiblingBlocks(3000, true), genManyCapturedSiblingBlocks(1500, true)),
+  (d) => twoFiles(d, genManyCapturedSiblingBlocks(3000, true), genManyCapturedSiblingBlocks(750, true)),
 );
 
 // `n` closures made under a narrowing of the module global `g`, each called by name. With a
@@ -1008,14 +1011,15 @@ const genConcatChains = (chains: number, len: number): string => {
   return o.join("\n") + "\n";
 };
 
-// One 300-operand concat per element type against 75 4-operand ones. Asking a concat's
-// list rep walked its whole left operand when the recorded type did not settle it, and the
-// per-query memo was a linear scan, so the long arm cost ~n^3 and trapped at n = 1000 (D2275).
+// A GROWTH pair: one 300-operand concat per element type against one 75-operand one, so
+// linear reads 4, quadratic 16 and cubic 64. Asking a concat's list rep walked its whole left
+// operand when the recorded type did not settle it, and the per-query memo was a linear scan,
+// so the long arm cost ~n^3 and trapped at n = 1000 (D2275). Quadratic today.
 axis(
   "list concat chain length",
-  16.4,
+  17.3,
   "A concat's list rep is re-derived from its operands instead of its recorded type, or `exprListRep`'s memo stopped being indexed by node (D2275).",
-  (d) => twoFiles(d, genConcatChains(1, 300), genConcatChains(75, 4)),
+  (d) => twoFiles(d, genConcatChains(1, 300), genConcatChains(1, 75)),
 );
 
 // ── the one RUNTIME axis ─────────────────────────────────────────────────────
