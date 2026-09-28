@@ -15868,6 +15868,7 @@ export function exprIsBool(ix: i32, fnIx: i32) {
   if nodeTyWidenedRepName(ix) == "boolean" { return true }
   // A node the generic body shares, typed at a hole this instance pins to `boolean` (D2919).
   if tyPrimNameOf(holeOperandTyOf(ix, fnIx)) == "boolean" { return true }
+  if tyPrimNameOf(loopVarPinTyOf(ix, fnIx)) == "boolean" { return true }
   const e = P.nodes[ix]
   if e is BoolLit { return true }
   if e is IsExpr { return true }
@@ -18091,6 +18092,8 @@ export function forInElemKind(iterIx: i32, fnIx: i32): VKind | null {
   // exactly as `const e = xs[i]` does. Checked before `exprStringArray`, which would claim
   // the same backing for a non-null element and trap on a stored null.
   if exprNulStrArray(iterIx, fnIx) { return "nulstr" }
+  // …and so does a list whose recorded element is a type parameter pinned there (D3015).
+  if tyIsNulPrim(iterElemPinTy(iterIx, fnIx), "string") { return "nulstr" }
   if exprStringArray(iterIx, fnIx) { return "str" }
   // A struct-element ref list (`S[]`): the element is a struct ref, so bind the loop var
   // as a code-1 struct local. (Union-box (2) / map-array ref lists aren't wired here yet.)
@@ -20326,6 +20329,10 @@ export function exprNulBool(exprIx: i32, fnIx: i32) {
   if tyIsNulPrim(holeOperandTyOf(exprIx, fnIx), "boolean") {
     return !narrowedBoxPlace(exprIx, fnIx)
   }
+  // …and a loop variable an instance pins to it (D2983).
+  if tyIsNulPrim(loopVarPinTyOf(exprIx, fnIx), "boolean") {
+    return !narrowedBoxPlace(exprIx, fnIx)
+  }
   // An if-EXPRESSION whose arm is ITSELF nullable — see `nulIfArmNullableValueIx` (D1560).
   const nlIfB = nulIfArmNullableValueIx(exprIx)
   if nlIfB >= 0 {
@@ -20558,7 +20565,10 @@ export function exprNulLitUnion(exprIx: i32, fnIx: i32) {
     // slot as the atom; nullability comes from the checker's per-read recorded type.
     const nluSlot = declaredSlotOf(e.identName)
     if nluSlot >= 0 && nluSlot < localLitUnion.length {
-      if localLitUnion[nluSlot] == 1 { return nodeTyIsNulLitUnion(exprIx) }
+      if localLitUnion[nluSlot] == 1 {
+        return nodeTyIsNulLitUnion(exprIx)
+          || tyIsNulLitUnionNiche(loopVarPinTyOf(exprIx, fnIx))
+      }
     }
     return false
   }
@@ -27095,6 +27105,8 @@ function nulLitAtomTextsAt(ix: i32, fnIx: i32, depth: i32): string[] {
   if own.length > 0 { return own }
   const hole = tyNulLitUnionMemberTexts(holeOperandTyOf(ix, fnIx))
   if hole.length > 0 { return hole }
+  const lv = tyNulLitUnionMemberTexts(loopVarPinTyOf(ix, fnIx))
+  if lv.length > 0 { return lv }
   const e = P.nodes[unwrapParen(ix)]
   if e is Index {
     const elem = tyNulLitUnionMemberTexts(holeNulLitElemTy(e.idxArr, fnIx))
@@ -27236,7 +27248,14 @@ function litAtomMemberTyAt(exprIx: i32, fnIx: i32, depth: i32): i32 {
       // ITERABLE — the one storage class with no declaration node to read, so it is asked
       // ahead of the declaration walk rather than through it.
       const iter = localLoopIter[slot]
-      if iter >= 0 { return arrElemLitUnionTyAt(iter, fnIx, depth + 1) }
+      if iter >= 0 {
+        const lvTy = arrElemLitUnionTyAt(iter, fnIx, depth + 1)
+        if lvTy >= 0 { return lvTy }
+        // …or read at the instance's pin, where the iterable records a type parameter (D2983).
+        const lvPin = loopVarPinTyOf(ix, fnIx)
+        if tyIsLitUnion(lvPin) { return lvPin }
+        return 0 - 1
+      }
     }
     const d = bindingDeclInScope(e.identName)
     if d >= 0 { return declLitUnionTyAt(d, fnIx, depth, false) }
@@ -29281,6 +29300,98 @@ export function holeOperandI32PinTyOf(exprIx: i32, fnIx: i32): i32 {
   -1
 }
 
+// The `i32`-niche type argument `exprIx` holds at the pin of the instance `fnIx` is, a nullable
+// literal union or `boolean | null`, which no rep names apart from `i32`; -1 otherwise (D2998,
+// D2985). Read off the node, else the hole it shares, the instance parameter's own annotation,
+// or the receiver of an element read.
+export function argNichePinTyOf(exprIx: i32, fnIx: i32): i32 {
+  const ix = unwrapParen(exprIx)
+  if ix < 0 { return -1 }
+  const own = nodeTyIxOf(ix)
+  if tyIsI32NichePin(own) { return own }
+  if own >= 0 && !tyHasTyVar(own) { return -1 }
+  const h = holeOperandTyOf(ix, fnIx)
+  if h >= 0 {
+    if tyIsI32NichePin(h) && holeLitReadIsAtom(ix, fnIx, 0) { return h }
+    if tyIsI32NichePin(h) && paramIndexOf(fnIx, identNameOrEmpty(ix)) >= 0 {
+      return h
+    }
+    return -1
+  }
+  const e = P.nodes[ix]
+  if e is Ident {
+    const pt = paramTypeNode(fnIx, e.identName)
+    if pt >= 0 {
+      const ptTy = monoParamPinTy.get(pt) ?? nodeTyIxOf(pt)
+      if tyIsI32NichePin(ptTy) { return ptTy }
+    }
+    return -1
+  }
+  elemNichePinTyOf(ix, fnIx)
+}
+
+// `argNichePinTyOf`'s element read `l[i]`, at the element its receiver holds at the pin; -1
+// for any other node.
+function elemNichePinTyOf(ix: i32, fnIx: i32): i32 {
+  const e = P.nodes[ix]
+  if e is Index {
+    if idxRecvIsStrList(e.idxArr, fnIx) { return -1 }
+    const et = iterElemPinTy(e.idxArr, fnIx)
+    if tyIsI32NichePin(et) { return et }
+  }
+  -1
+}
+
+// The `i32`-shared element (`tyIsI32AtomPin`) of list literal `exprIx` at the instance `fnIx`
+// is, read off its first element that pins one, unless the literal's own recorded type is
+// concrete and holds some other element. -1 for any other node (D2998, D2983).
+export function litAtomPinElemTyOf(exprIx: i32, fnIx: i32): i32 {
+  const ix = unwrapParen(exprIx)
+  if ix < 0 { return -1 }
+  const n = P.nodes[ix]
+  if n is ArrayLit {
+    const lt = nodeTyIxOf(ix)
+    if lt >= 0 && !tyHasTyVar(lt) && !tyIsI32NichePin(tyStepElem(lt)) {
+      return -1
+    }
+    let i = 0
+    while i < n.arrElems.length {
+      const el = n.arrElems[i]
+      let t = argNichePinTyOf(el, fnIx)
+      if t < 0 { t = holeOperandI32PinTyOf(el, fnIx) }
+      // The hole instance's own parameter, whose pin `holeOperandI32PinTyOf` leaves to its
+      // annotation, which a list built over it does not carry.
+      if t < 0 && paramIndexOf(fnIx, identNameOrEmpty(unwrapParen(el))) >= 0 {
+        const hp = holeOperandTyOf(el, fnIx)
+        if tyIsI32AtomPin(hp) { t = hp }
+      }
+      if t < 0 && tyIsI32AtomPin(loopVarPinTyOf(el, fnIx)) {
+        t = loopVarPinTyOf(el, fnIx)
+      }
+      if t >= 0 { return t }
+      i = i + 1
+    }
+  }
+  -1
+}
+
+// Whether `ty` is `boolean` or a literal union, `i32` values a pin tells apart only by type.
+function tyIsI32AtomPin(ty: i32): boolean {
+  tyPrimNameOf(ty) == "boolean" || tyIsLitUnion(ty) || tyIsI32NichePin(ty)
+}
+
+// Whether `ty` is a nullable literal union or `boolean | null`, the two `i32` niches.
+function tyIsI32NichePin(ty: i32): boolean {
+  tyIsNullableLitUnion(ty) || tyIsNulPrim(ty, "boolean")
+}
+
+// The name of Ident node `ix`, or "" for any other node.
+function identNameOrEmpty(ix: i32): string {
+  const e = P.nodes[ix]
+  if e is Ident { return e.identName }
+  ""
+}
+
 // Whether `exprIx`, typed at a hole instance `fnIx` pins to a literal union, holds the atom: not
 // a join, whose string arm makes it a string ref (D1728), nor the instance's own parameter, which
 // its annotation already pins. A local answers by its un-annotated initializer.
@@ -29301,6 +29412,146 @@ function holeLitReadIsAtom(exprIx: i32, fnIx: i32, depth: i32): boolean {
     return holeLitReadIsAtom(d.letInit, fnIx, depth + 1)
   }
   !nodeIsValueJoin(ix)
+}
+
+// The element type iterable `iterIx` holds at the pin of the instance `fnIx` is: the hole and
+// exact rungs, an instance parameter's annotation, a local's own or its initializer's recorded
+// type, else its recorded element's hole. -1 anywhere else. Needs no locals table.
+export function iterElemPinTy(iterIx: i32, fnIx: i32): i32 {
+  if fnIx < 0 { return -1 }
+  const own = holeOperandTyOf(iterIx, fnIx)
+  if own >= 0 { return tyStepElem(own) }
+  const ex = exactOperandTyOf(iterIx, fnIx)
+  if ex >= 0 { return tyStepElem(ex) }
+  const n = P.nodes[unwrapParen(iterIx)]
+  const fn = P.nodes[fnIx]
+  if n is Ident {
+    if fn is FuncDecl {
+      let et = -1
+      const pt = paramTypeNode(fnIx, n.identName)
+      if pt >= 0 {
+        et = tyStepElem(monoParamPinTy.get(pt) ?? nodeTyIxOf(pt))
+      } else {
+        const li = parentLetOf(fn.fnBody, n.identName)
+        if li >= 0 {
+          const d = P.nodes[li]
+          if d is LetDecl {
+            if d.letType >= 0 { et = tyStepElem(nodeTyIxOf(d.letType)) }
+            else if d.letInit >= 0 { et = tyStepElem(nodeTyIxOf(d.letInit)) }
+          }
+        }
+      }
+      if et >= 0 && !tyHasTyVar(et) { return et }
+    }
+  }
+  // A list literal of the instance's own parameter, `[x, x]`, holds that parameter's pin.
+  if n is ArrayLit {
+    const ln = arrLitSameIdentName(n.arrElems)
+    const lpt = if ln == "" { -1 } else { paramTypeNode(fnIx, ln) }
+    if lpt >= 0 {
+      const lp = monoParamPinTy.get(lpt) ?? nodeTyIxOf(lpt)
+      if lp >= 0 && !tyHasTyVar(lp) { return lp }
+    }
+  }
+  if monoHoleSubN.length == 0 { return -1 }
+  const hv = nodeArrayElemTyIx(iterIx)
+  if hv < 0 || hv >= T.tys.length || !(T.tys[hv] is TyVar) { return -1 }
+  const row = monoHoleSubRow.get(fnStmtsPosOf(fnIx)) ?? -1
+  if row < 0 || row >= monoHoleSubN.length { return -1 }
+  const b = holePinReadOf(hv, monoHoleSubN[row], monoHoleSubT[row])
+  if b < 0 || b >= T.tys.length || tyHasTyVar(b) { return -1 }
+  b
+}
+
+// The name every element of `elems` reads, all one bare Ident; "" otherwise.
+function arrLitSameIdentName(elems: i32[]): string {
+  if elems.length == 0 { return "" }
+  const name = identNameOrEmpty(unwrapParen(elems[0]))
+  let i = 1
+  while i < elems.length {
+    if identNameOrEmpty(unwrapParen(elems[i])) != name { return "" }
+    i = i + 1
+  }
+  name
+}
+
+// The type the for-in loop variable `exprIx` names holds at the pin of the instance `fnIx` is,
+// where its recorded type names a type parameter or hole and its list holds `i32` cells; -1
+// for any other read (D2983). Found by walking the body, so it needs no locals table.
+export function loopVarPinTyOf(exprIx: i32, fnIx: i32): i32 {
+  const t = loopVarElemPinTyOf(exprIx, fnIx)
+  if t < 0 || fnIx < 0 { return -1 }
+  const fn = P.nodes[fnIx]
+  if !(fn is FuncDecl) { return -1 }
+  if !loopVarReadIsAtom(unwrapParen(exprIx), fn.fnBody, fnIx) { return -1 }
+  t
+}
+
+// `loopVarPinTyOf` for a list of any cells: the element the loop variable's list holds at the
+// instance's pin, or -1.
+function loopVarElemPinTyOf(exprIx: i32, fnIx: i32): i32 {
+  const ix = unwrapParen(exprIx)
+  if ix < 0 || fnIx < 0 || !(P.nodes[ix] is Ident) { return -1 }
+  const rt = nodeTyIxOf(ix)
+  if rt < 0 || rt >= T.tys.length || !tyHasTyVar(rt) { return -1 }
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    if paramIndexOf(fnIx, identNameOrEmpty(ix)) >= 0 { return -1 }
+    if parentLetOf(fn.fnBody, identNameOrEmpty(ix)) >= 0 { return -1 }
+    const lp = loopVarForIn(ix, fn.fnBody)
+    if lp < 0 { return -1 }
+    const fl = P.nodes[lp]
+    if fl is ForIn { return iterElemPinTy(fl.fiIter, fnIx) }
+  }
+  -1
+}
+
+// The pin `monoArgTyName` names for-in loop variable `exprIx` at in instance `fnIx`: its list's
+// element there. A type sharing the `i32` rep keys so only where the atom readers claim it and
+// never in a hole instance, whose other reads key it as the cascade does (D3015).
+export function loopVarArgPinTyOf(exprIx: i32, fnIx: i32): i32 {
+  const t = loopVarElemPinTyOf(exprIx, fnIx)
+  if t < 0 || !tyIsI32AtomPin(t) { return t }
+  if monoHoleSubRow.has(fnStmtsPosOf(fnIx)) { return -1 }
+  loopVarPinTyOf(exprIx, fnIx)
+}
+
+// The `for`-in statement of body `bodyIx` whose first binding is Ident `ix`'s name and whose body
+// holds `ix`, or -1.
+function loopVarForIn(ix: i32, bodyIx: i32): i32 {
+  const name = identNameOrEmpty(ix)
+  if name == "" { return -1 }
+  const lp = modLoopHolding(bodyIx, name, ix)
+  if lp < 0 { return -1 }
+  const fl = P.nodes[lp]
+  if fl is ForIn {
+    if fl.fiVar == name { return lp }
+  }
+  -1
+}
+
+// Whether Ident `ix` is a for-in loop variable of body `bodyIx` whose list holds `i32` cells, not
+// the string refs a literal of strings builds (D2983).
+function loopVarReadIsAtom(ix: i32, bodyIx: i32, fnIx: i32): boolean {
+  const lp = loopVarForIn(ix, bodyIx)
+  if lp < 0 { return false }
+  const fl = P.nodes[lp]
+  if fl is ForIn {
+    const it = P.nodes[unwrapParen(fl.fiIter)]
+    if it is Ident {
+      const il = parentLetOf(bodyIx, it.identName)
+      if il >= 0 {
+        const d = P.nodes[il]
+        if d is LetDecl {
+          if d.letType < 0 && d.letInit >= 0 && P.nodes[d.letInit] is ArrayLit {
+            return !arrLitIsStr(d.letInit, fnIx)
+          }
+        }
+      }
+    }
+    return true
+  }
+  false
 }
 
 // Whether node `ix` is an `if` or `match` in value position, whose value joins its arms.
