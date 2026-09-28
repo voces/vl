@@ -1704,6 +1704,16 @@ function feParamTyName(fe: i32, name: string) {
   ""
 }
 
+// Whether statement `stmtIx` is the second-to-last statement of block `blockIx`.
+function stmtPrecedesTail(blockIx: i32, stmtIx: i32): boolean {
+  const b = P.nodes[blockIx]
+  if b is Block {
+    const n = b.blkStmts.length
+    return n >= 2 && b.blkStmts[n - 2] == stmtIx
+  }
+  false
+}
+
 // The return expression of maker `mk`, seen through a `const` it binds to an object literal
 // and returns (`const r = { ... }; return r`), so the record is read per instance (D2853).
 function makerRetObjLitOf(mk: i32): i32 {
@@ -1718,7 +1728,12 @@ function makerRetObjLitOf(mk: i32): i32 {
       if li >= 0 {
         const ld = P.nodes[li]
         if ld is LetDecl {
-          if ld.letKw == "const" && ld.letInit >= 0 {
+          // A `let` is followed only when the return is the very next statement, so nothing
+          // can reassign it in between (D2862).
+          if (
+            (ld.letKw == "const" || stmtPrecedesTail(fd.fnBody, li))
+            && ld.letInit >= 0
+          ) {
             if P.nodes[unwrapParen(ld.letInit)] is ObjLit { return ld.letInit }
           }
         }
@@ -11495,6 +11510,84 @@ function declRowFieldFits(vc: i32, sc: i32, valIx: i32, si: i32, mfi: i32) {
   elemRowsCaptureCompat(vn, fn)
 }
 
+// The refusal a call `callIx` in instance `fnIx` owes when its callee is a closure reading a
+// field of the instance's parameter (`localCloPinFieldTail`), or "". The lifted closure is
+// shared by every pin, and a list element or an argument cannot follow a niche or box read
+// per pin (D2879).
+export function cloTailRefusal(callIx: i32, fnIx: i32): string {
+  const c = P.nodes[callIx]
+  if !(c is Call) { return "" }
+  // The closures this reads take no argument; most calls pass one.
+  if c.callArgs.length != 0 { return "" }
+  if c.callFn < 0 { return "" }
+  if !(P.nodes[c.callFn] is Ident) { return "" }
+  // A named function is no local closure, and most calls name one.
+  if fnIndexOfSid(sidOfNode(c.callFn)) >= 0 { return "" }
+  const t = localCloPinFieldTail(c.callFn, fnIx)
+  if t < 0 { return "" }
+  const code = memberFieldCode(t, fnIx)
+  const perPin = code == FC_NUL_BOOL
+    || code == FC_NUL_LIT_UNION
+    || code == FC_UNION
+  if perPin && callIsElemOrArgIn(fnIx, callIx) {
+    return "emitProgram: a closure in a function with an un-annotated parameter delivers a record field read per pin into a list or an argument"
+  }
+  ""
+}
+
+// Whether `target` is an element of a list literal, or an argument `argTakesPerPin` accepts,
+// anywhere in the body of the function at `fnIx`.
+function callIsElemOrArgIn(fnIx: i32, target: i32): boolean {
+  const fd = P.nodes[fnIx]
+  if fd is FuncDecl { return nodeHoldsAsElemOrArg(fd.fnBody, target) }
+  false
+}
+
+// The walk `callIsElemOrArgIn` makes from node `ix`.
+function nodeHoldsAsElemOrArg(ix: i32, target: i32): boolean {
+  if ix < 0 { return false }
+  const n = P.nodes[ix]
+  if n is ArrayLit {
+    if i32ListHas(n.arrElems, target) { return true }
+  }
+  if n is Call {
+    let ai = 0
+    while ai < n.callArgs.length {
+      if n.callArgs[ai] == target { return argTakesPerPin(n, ai) }
+      ai = ai + 1
+    }
+  }
+  const kids = nodeChildren(ix)
+  let i = 0
+  while i < kids.length {
+    if nodeHoldsAsElemOrArg(kids[i], target) { return true }
+    i = i + 1
+  }
+  false
+}
+
+// Whether argument `ai` of call `c` is delivered where a per-pin read cannot follow: a
+// parameter left to inference or naming a type parameter, or any callee this cannot resolve.
+// `print` and a concretely annotated parameter convert at the boundary.
+function argTakesPerPin(c: Call, ai: i32): boolean {
+  if c.callFn < 0 { return true }
+  const f = P.nodes[c.callFn]
+  if !(f is Ident) { return true }
+  if f.identName == "print" { return false }
+  const fe = fnIndexOfSid(sidOfNode(c.callFn))
+  if fe < 0 || fe >= fnStmts.length { return true }
+  const fd = P.nodes[fnStmts[fe]]
+  if fd is FuncDecl {
+    if ai >= fd.fnParams.length { return true }
+    const pn = P.nodes[fd.fnParams[ai]]
+    if pn is Param {
+      if pn.parType < 0 { return true }
+      return tyHasTyVar(nodeTyIxOf(pn.parType))
+    }
+  }
+  true
+}
+
 // Is field code `c` a list whose layout its code alone decides: an `i32`, `f64`, `i64`, `f32`,
 // `u8` or `string` list?
 function fieldCodeIsFlatList(c: i32): boolean {
@@ -11606,12 +11699,20 @@ function atomFieldTakesStr(valIx: i32, si: i32, mfi: i32): boolean {
   const fty = tyFieldTyOf(sTyIx[si], sFieldNames[sFieldStart[si] + mfi])
   if fty < 0 { return true }
   if code0KindOf(fty) != 3 { return false }
+  strLitNamesMember(valIx, tyLitMemberTexts(fty))
+}
+
+// Whether the value at `valIx` is a string literal whose text is one of `texts`. `strText`
+// keeps the quotes a member text drops.
+function strLitNamesMember(valIx: i32, texts: string[]): boolean {
   const v = P.nodes[unwrapParen(valIx)]
   if v is StrLit {
-    const texts = tyLitMemberTexts(fty)
+    const raw = v.strText
+    if raw.length < 2 { return false }
+    const body = raw.slice(1, raw.length - 1)
     let i = 0
     while i < texts.length {
-      if texts[i] == v.strText { return true }
+      if texts[i] == body { return true }
       i = i + 1
     }
   }
@@ -15396,6 +15497,54 @@ function anonParamPinFieldTy(recvIx: i32, prop: string, fnIx: i32): i32 {
   -1
 }
 
+// The tail of the lambda a call's callee `callFnIx` names, when it is a `const` of instance
+// `fnIx` bound to an un-annotated one-expression lambda whose value reads a field of one of
+// `fnIx`'s own parameters, else -1. The lambda is lifted once, so its shared result kind is the
+// template's; reading this tail at the enclosing instance answers per pin instead (D2864).
+function localCloPinFieldTail(callFnIx: i32, fnIx: i32): i32 {
+  if fnIx < 0 { return -1 }
+  const fd = P.nodes[fnIx]
+  if !(fd is FuncDecl) { return -1 }
+  const li = parentLetOfAt(fd.fnBody, sidOfNode(callFnIx), callFnIx)
+  if li < 0 { return -1 }
+  const ld = P.nodes[li]
+  if !(ld is LetDecl) { return -1 }
+  if ld.letKw != "const" || ld.letInit < 0 { return -1 }
+  const lam = unwrapParen(ld.letInit)
+  if lam < 0 { return -1 }
+  const lf = P.nodes[lam]
+  if !(lf is FuncDecl) { return -1 }
+  if lf.fnRet >= 0 { return -1 }
+  const lb = P.nodes[lf.fnBody]
+  if !(lb is Block) { return -1 }
+  if lb.blkStmts.length != 1 { return -1 }
+  const tx = fnRetExprOf(lam)
+  if tx < 0 { return -1 }
+  const te = P.nodes[unwrapParen(tx)]
+  if !(te is Member) { return -1 }
+  const r = P.nodes[unwrapParen(te.memObj)]
+  if !(r is Ident) { return -1 }
+  if fnHasParamNamed(lam, r.identName) { return -1 }
+  if !fnHasParamNamed(fnIx, r.identName) { return -1 }
+  unwrapParen(tx)
+}
+
+// Whether the function declared at `fnIx` has a parameter named `name`.
+function fnHasParamNamed(fnIx: i32, name: string): boolean {
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    let i = 0
+    while i < fn.fnParams.length {
+      const p = P.nodes[fn.fnParams[i]]
+      if p is Param {
+        if p.parName == name { return true }
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+
 export function exprIsBool(ix: i32, fnIx: i32) {
   if ix < 0 { return false }
   // Typed-IR fast path (additive, mirroring exprIsF64): boolean shares the i32 rep
@@ -15473,6 +15622,8 @@ export function exprIsBool(ix: i32, fnIx: i32) {
       }
     }
     if callee is Ident {
+      const lct = localCloPinFieldTail(e.callFn, fnIx)
+      if lct >= 0 && exprIsBool(lct, fnIx) { return true }
       const target = fnIndexOf(callee.identName)
       if target >= 0 {
         const fn = P.nodes[fnStmts[target]]
@@ -19460,17 +19611,53 @@ function shapeRowScanK(fnames: string[], ftypes: string[], lenient: i32): i32 {
         k = k + 1
       }
       if ok {
-        if lenient < 2 { return si2 }
-        if uniq < 0 { uniq = si2 }
-        nHit = nHit + 1
+        // A strict match on a declared row whose `i32` or `boolean` field is the other kind is
+        // kept only as a fallback: the two share a layout, but a read formats by the row, and
+        // the spelling's own row may come later in the table (D2866).
+        if lenient == 0 {
+          if sIsAnonRow(si2) || code0SpellingFitsRow(fnames, ftypes, si2) {
+            return si2
+          }
+          if uniq < 0 { uniq = si2 }
+        } else {
+          if lenient < 2 { return si2 }
+          if uniq < 0 { uniq = si2 }
+          nHit = nHit + 1
+        }
       }
     }
     si2 = si2 + 1
   }
+  if lenient == 0 { return uniq }
   if lenient >= 2 {
     if nHit == 1 { return uniq }
   }
   -1
+}
+
+// Whether every field a shape spelling writes as `i32` or `boolean` has that same code-0 kind
+// in row `si`'s own type; a row whose field type is unknown or a hole agrees.
+function code0SpellingFitsRow(
+  fnames: string[],
+  ftypes: string[],
+  si: i32,
+): boolean {
+  if si < 0 || si >= sTyIx.length { return true }
+  let k = 0
+  while k < fnames.length {
+    let tk = 0
+    if ftypes[k] == "i32" { tk = 1 }
+    if ftypes[k] == "boolean" { tk = 2 }
+    if tk != 0 {
+      let rk = code0KindOf(tyFieldTyOf(sTyIx[si], fnames[k]))
+      if rk == 0 {
+        rk = code0KindOf(tyFieldTyOf(sAnonOwnTy.get(si) ?? -1, fnames[k]))
+      }
+      if rk != 0 && rk != tk { return false }
+    }
+    k = k + 1
+  }
+  true
 }
 
 // Parse a canonical inline shape name `{a:T,b:U}` into parallel field-name / field-type
@@ -19828,6 +20015,8 @@ export function exprNulBool(exprIx: i32, fnIx: i32) {
   if e is Call {
     const callee = P.nodes[e.callFn]
     if callee is Ident {
+      const lct = localCloPinFieldTail(e.callFn, fnIx)
+      if lct >= 0 && exprNulBool(lct, fnIx) { return true }
       const t = fnIndexOfSid(sidOfNode(e.callFn))
       if t >= 0 {
         const cfn = P.nodes[fnStmts[t]]
@@ -26636,6 +26825,8 @@ function litAtomMemberTyAt(exprIx: i32, fnIx: i32, depth: i32): i32 {
   if tyIsLitUnion(direct) { return direct }
   if depth >= declFallbackDepthCap() { return 0 - 1 }
   if e is Index { return arrElemLitUnionTyAt(e.idxArr, fnIx, depth + 1) }
+  // A field read names its row's atom field members, as `memberAtomFieldTexts` reads them: a
+  // hole parameter's read records the hole, and its pinned row holds the set (D2866).
   if e is Ident {
     const slot = declaredSlotOf(e.identName)
     if slot >= 0 {
