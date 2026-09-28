@@ -171,9 +171,11 @@ import {
   mkPreIncr,
   mkReturn,
   mkSpread,
+  mkTplHole,
   mkUnary,
   mkWhile,
   nodeChildren,
+  nodeIsTplHole,
   nodeSpineChildren,
   orderArgsByParamNames,
   tsMentionsAnyName,
@@ -281,6 +283,7 @@ import {
   TY_WALK_DEPTH,
   anonHandleTyIx,
   anonRowKindsAgree,
+  argNichePinTyOf,
   arrLitElemName,
   captureCountOf,
   cloRetTypeName,
@@ -324,6 +327,8 @@ import {
   isUName,
   letRefListDestSlot,
   listUnionSharedRep,
+  litAtomPinElemTyOf,
+  loopVarArgPinTyOf,
   monoExactSubRowOf,
   monoRetRowName,
   nodeMapArmNominalName,
@@ -999,6 +1004,14 @@ function monoArmTailLocalInit(ix: i32): i32 {
   -1
 }
 
+// The pin spelling of type `ty`: an alias through the annotation ladder, as the hole rung
+// spells it, else its render.
+function monoI32AtomPinName(ty: i32): string {
+  const an = monoAnnPinName(tyToEmitName(ty))
+  if an != "" { return an }
+  tyToEmitName(ty)
+}
+
 export function monoArgTyName(ix: i32, fnIx: i32) {
   const cax = unwrapParen(ix)
   // A node the generic body shares, typed at a hole this instance pins to a boolean or a literal
@@ -1007,6 +1020,27 @@ export function monoArgTyName(ix: i32, fnIx: i32) {
   if hbt >= 0 {
     const hbn = monoAnnPinName(tyToEmitName(hbt))
     if hbn != "" { return hbn }
+  }
+  // An `i32` niche, a nullable literal union or `boolean | null`: the annotation's name and the
+  // scalar cascade both name its raw `i32`, or its non-null half (D2998, D2985).
+  const nluTy = argNichePinTyOf(cax, fnIx)
+  if nluTy >= 0 {
+    const nluName = tyToEmitName(nluTy)
+    if nluName != "" { return nluName }
+  }
+  // A for-in loop variable records the type parameter, so it pins at its list's element at
+  // this instance (D3015). A flat literal union keys as the alias arm below keys it, its `i32`
+  // atom, never a softened string, so a result stored into a `T` slot agrees.
+  const lvPin = loopVarArgPinTyOf(cax, fnIx)
+  if lvPin >= 0 {
+    const lvName = if tyIsLitUnion(lvPin) { litUnionAliasNameOfTy(lvPin) } else { monoI32AtomPinName(lvPin) }
+    if lvName != "" { return lvName }
+  }
+  // …and a list literal of them, whose element the cascade names the same way.
+  const nluEl = litAtomPinElemTyOf(cax, fnIx)
+  if nluEl >= 0 {
+    const nluElName = monoI32AtomPinName(nluEl)
+    if nluElName != "" { return arrElemSuffixed(nluElName) }
   }
   // The third channel, read before both arms below because both need it: an instance's
   // own `x: T` parameter or `const y: T = x` local carries the pin as its annotation, and
@@ -2099,6 +2133,7 @@ function monoPinnedTyOf(ix: i32, bN: string[], bT: i32[]): i32 {
 function monoExprRemake(ix: i32, kids: i32[]): i32 {
   const nx = monoExprMake(ix, kids)
   if nx != ix { recordClonedCallRetire(ix, nx) }
+  monoKeepTplHole(ix, nx)
   nx
 }
 
@@ -2182,7 +2217,14 @@ function monoCloneBody(
   )
   // A rebuilt statement keeps the narrowings its original's calls ended (D2390).
   if r != ix { recordClonedCallRetire(ix, r) }
+  monoKeepTplHole(ix, r)
   r
+}
+
+// A rebuilt interpolation hole stays one, which is what renders an atom by its member (D2984).
+function monoKeepTplHole(ix: i32, nx: i32) {
+  if nx != ix && nx >= 0 && nodeIsTplHole(ix) { mkTplHole(nx) }
+  0
 }
 
 // The annotation an un-annotated list literal typed at the instance's holes takes, where its
@@ -4717,6 +4759,7 @@ function monoCloneGenericCalls(ix: i32) {
   const nx = monoCloneGenericCallsRaw(ix)
   // A rebuilt node keeps the narrowings its original's calls ended (D2390).
   if nx != ix { recordClonedCallRetire(ix, nx) }
+  monoKeepTplHole(ix, nx)
   // A re-made list literal answers the type its template did, which a later pin substitutes:
   // its rep is read off that type (D2849). A call's is the instance's own.
   if nx != ix && ix >= 0 && nx >= 0 && P.nodes[nx] is ArrayLit {
