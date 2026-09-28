@@ -3679,7 +3679,8 @@ let intMatchHead: {[i32]: boolean} = Map()
 // The scrutinee nodes `desugarMatchAt` shared across a chain's arm tests: one node per `match`,
 // so its recorded type is the last arm's and says nothing about any one test (`matchScrutAt`).
 let matchScrutNode: {[i32]: boolean} = Map()
-// The `Index` nodes an assignment writes through, which the list-union read rewrite leaves alone.
+// The `Index` and `Member` nodes an assignment writes through, which the list-union read
+// rewrite leaves alone.
 let luWriteTgt: {[i32]: boolean} = Map()
 // The source position of each loop binding the list-union rewrite minted: the iterable's node,
 // which precedes every read of the binding in the body, though the binding is minted later.
@@ -49308,7 +49309,7 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
     const wtgt = P.nodes[n.binLeft]
     if wtgt is Ident { daWriteTarget = n.binLeft }
     if wtgt is Member { getWriteTarget = n.binLeft }
-    if wtgt is Index { luWriteTgt.set(n.binLeft, true) }
+    if wtgt is Index || wtgt is Member { luWriteTgt.set(n.binLeft, true) }
   }
   let lt = checkNode(n.binLeft)
   daWriteTarget = savedWriteTarget
@@ -55263,8 +55264,8 @@ function luOwnRecv(recv: i32): boolean {
 }
 
 // The members of `ty` when it is a union of two or more lists, otherwise empty. Not over a
-// type parameter's list: a generic body's narrowed value read does not lower at a pin (D2876).
-// Not under a pinned re-check either, whose body every instance shares and so is never rewritten.
+// type parameter's list (D2876), a readonly list (D2887) or a literal element (D2886), whose
+// narrowed reads do not lower; nor under a pinned re-check, whose body instances share.
 function luMembers(ty: i32): i32[] {
   const none: i32[] = []
   if ty < 0 || monoRecheckDepth > 0 { return none }
@@ -55277,7 +55278,8 @@ function luMembers(ty: i32): i32[] {
       if m < 0 { return none }
       const mt = T.tys[m]
       if mt is TyArray {
-        if mt.aElem < 0 || tyHasTyVar(m) { return none }
+        if mt.aElem < 0 || mt.aRead == 1 || tyHasTyVar(m) { return none }
+        if luHasLit(mt.aElem, 8) { return none }
       } else {
         return none
       }
@@ -55286,6 +55288,33 @@ function luMembers(ty: i32): i32[] {
     return t.uMembers
   }
   none
+}
+
+// Whether `ty` is or holds a literal type, through a nullable or a union.
+function luHasLit(ty: i32, depth: i32): boolean {
+  if ty < 0 || depth <= 0 { return false }
+  const t = T.tys[ty]
+  match t {
+    TyLit => {
+      true
+    }
+    TyNullable => {
+      luHasLit(t.nInner, depth - 1)
+    }
+    TyUnion => {
+      let hit = false
+      let i = 0
+      while i < t.uMembers.length {
+        if luHasLit(t.uMembers[i], depth - 1) { hit = true }
+        i = i + 1
+      }
+      hit
+    }
+    // A composite's literal sits inside its own container, which the element read keeps.
+    TyPrim | TyErr | TyObj | TyVar | TyNeg | TyMap | TyArray | TyFunc => {
+      false
+    }
+  }
 }
 
 // The union of the members' element types, each read at its value type, kept apart rather
@@ -55445,7 +55474,7 @@ function luValueAt(site: i32, stmts: i32[], pos: i32) {
 
 // `recv.length` over a union of lists: i32, or -1 when `objTy` is not one the rewrite names.
 function luLengthAt(n: Member, ix: i32, objTy: i32): i32 {
-  if luOwnRecv(n.memObj) { return -1 }
+  if luOwnRecv(n.memObj) || (luWriteTgt[ix] ?? false) { return -1 }
   const ms = luMembers(objTy)
   if ms.length == 0 { return -1 }
   if inferQuiet { return symMem(ix, TY_I32) }
@@ -55871,6 +55900,10 @@ function checkIndexNode(n: Index, ix: i32) {
     tErr("array index must be i32, got " + tyToStr(idxTy), n.idxIndex)
   }
   if at is TyUnion {
+    // An index that is not an `i32` is already reported above.
+    if !assignable(idxTy, TY_I32) && luMembers(arrTy).length > 0 {
+      return TY_ERR
+    }
     const lui = luIndexAt(n, ix, arrTy)
     if lui >= 0 { return lui }
     // A read rewrites; a write is refused by design, since the stored value would have to
