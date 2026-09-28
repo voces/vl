@@ -46,7 +46,12 @@ import {
   WhileStmt,
   nodeChildren,
 } from "./ast"
-import { numLexFitsI32, numLexIsFloat, parseI64Pair } from "./emit_bignum"
+import {
+  numLexFitsI32,
+  numLexIs2Pow31,
+  numLexIsFloat,
+  parseI64Pair,
+} from "./emit_bignum"
 import {
   isConstInit,
   nulCloFlag,
@@ -533,12 +538,16 @@ function constFoldExpr(ix: i32, wide: boolean, budget: i32): ConstFold {
   if budget <= 0 || ix < 0 { return cfNo() }
   const e = P.nodes[ix]
   if e is Paren { return constFoldExpr(e.parInner, wide, budget - 1) }
-  if e is NumLit { return constFoldLit(e.numText, wide) }
+  if e is NumLit {
+    if !wide && constFoldLitWide(ix) { return cfNo() }
+    return constFoldLit(e.numText, wide)
+  }
   const tn = nodeTyPrimName(ix)
   if e is AsExpr { return constFoldCast(e, tn, wide, budget) }
   if (wide && tn != "i64") || (!wide && tn != "i32") { return cfNo() }
   if e is Ident { return constFoldIdent(ix, wide, budget) }
   if e is Unary {
+    if constFoldNegLit(ix) >= 0 { return constFoldNegLitAt(ix, wide) }
     const a = constFoldExpr(e.unArg, wide, budget - 1)
     if !a.cfOk { return a }
     if e.unOp == "-" {
@@ -570,17 +579,66 @@ function constFoldCast(
   if e.asTy != tn || (wide && tn != "i64") || (!wide && tn != "i32") {
     return cfNo()
   }
-  // A literal operand is its own magnitude, which is what a cast of it converts.
+  // A literal operand, negated or not, is converted from its full magnitude, as the emitter
+  // builds it at the cast's source width.
   let from = nodeTyPrimName(e.asObj)
   const lit = P.nodes[unwrapParen(e.asObj)]
   if lit is NumLit { from = "i64" }
+  const neg = constFoldNegLit(e.asObj)
+  if neg >= 0 { from = "i64" }
   if from != "i32" && from != "i64" { return cfNo() }
-  const a = cfStep(constFoldExpr(e.asObj, from == "i64", budget - 1))
+  let a = cfNo()
+  if neg >= 0 {
+    a = cfStep(constFoldNegLitAt(e.asObj, from == "i64"))
+  } else {
+    a = cfStep(constFoldExpr(e.asObj, from == "i64", budget - 1))
+  }
   if !a.cfOk || wide || from == "i32" { return a }
   if e.asMode == "wrap" { return constFoldWrap(a.cfV, false, a.cfN) }
   const lo = constFoldWrap(a.cfV, false, a.cfN)
   if lo.cfV != a.cfV { return cfNo() }
   lo
+}
+
+// The literal under `ix` when `ix` is `-` of an integer literal, through parentheses, else -1.
+function constFoldNegLit(ix: i32): i32 {
+  const u = P.nodes[unwrapParen(ix)]
+  if u is Unary {
+    if u.unOp != "-" { return -1 }
+    const k = unwrapParen(u.unArg)
+    if k < 0 || k >= P.nodes.length { return -1 }
+    const lit = P.nodes[k]
+    if lit is NumLit { return k }
+  }
+  -1
+}
+
+// Whether the integer literal at `ix` is an i64: the emitter builds it as `i64.const`, and a
+// `-` in front of it negates that value, not its low 32 bits.
+function constFoldLitWide(ix: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const lit = P.nodes[ix]
+  if lit is NumLit {
+    return nodeTyPrimName(ix) == "i64" || !numLexFitsI32(lit.numText)
+  }
+  false
+}
+
+// `-literal` at `ix` folded at i64 when `wide`: the negated literal's full value, which at i32
+// is refused unless it fits (`-2147483648` does).
+function constFoldNegLitAt(ix: i32, wide: boolean): ConstFold {
+  const k = constFoldNegLit(ix)
+  if k < 0 { return cfNo() }
+  const lit = P.nodes[k]
+  if lit is NumLit {
+    if !wide && constFoldLitWide(k) && !numLexIs2Pow31(lit.numText) {
+      return cfNo()
+    }
+    const a = constFoldLit(lit.numText, true)
+    if !a.cfOk { return a }
+    return constFoldWrap((0 as i64) - a.cfV, wide, 2)
+  }
+  cfNo()
 }
 
 // `a` with one more visited node charged to it.
