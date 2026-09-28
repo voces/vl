@@ -1177,6 +1177,9 @@ let narClobDepths: i32[] = []
 // Whether the write RETIRED the narrowing, as against writing a member it already allowed. Only
 // a retiring write can falsify a post-guard residual; the arm join reads every row (D1846).
 let narClobRetired: i32[] = []
+// The scope depth of the binding each row is about, or -1 for whatever the name resolves to. A
+// call under a shadowing declaration retires a binding the name does not reach there (D3020).
+let narClobBind: i32[] = []
 let asgDeclKeys: string[] = []
 let asgDeclTys: i32[] = []
 let asgDeclDepths: i32[] = []
@@ -1218,7 +1221,7 @@ function asgDeclaredTy(name: string) { narDeclaredTy(name, NAR_KIND_ASG) }
 function narClobberedSince(mark: i32, name: string) {
   let i = mark
   while i < narClobKeys.length {
-    if narClobKeys[i] == name {
+    if narClobHits(i, name) {
       if narClobRetired[i] == 1 { return true }
     }
     i = i + 1
@@ -1231,7 +1234,7 @@ function narClobberedSince(mark: i32, name: string) {
 function narCallInvalidatedIn(lo: i32, hi: i32, name: string) {
   let i = lo
   while i < hi {
-    if narClobKeys[i] == name {
+    if narClobHits(i, name) {
       if narClobRetired[i] == 2 { return true }
     }
     i = i + 1
@@ -1245,7 +1248,7 @@ function narCallInvalidatedIn(lo: i32, hi: i32, name: string) {
 function narClobEntryTy(mark: i32, name: string) {
   let i = mark
   while i < narClobKeys.length {
-    if narClobKeys[i] == name { return narClobPrev[i] }
+    if narClobHits(i, name) { return narClobPrev[i] }
     i = i + 1
   }
   -1
@@ -1264,7 +1267,7 @@ function narArmEndTy(
   let cur = entryTy
   let i = lo
   while i < hi {
-    if narClobKeys[i] == name {
+    if narClobHits(i, name) {
       if narClobDepths[i] == ownDepth {
         cur = narClobTys[i]
       } else {
@@ -1349,10 +1352,17 @@ function narChainEndTy(ifIx: i32, key: string): i32 {
 function narJoinSeen(lo: i32, hi: i32, name: string) {
   let i = lo
   while i < hi {
-    if narClobKeys[i] == name { return true }
+    if narClobHits(i, name) { return true }
     i = i + 1
   }
   false
+}
+
+// Whether ledger row `i` is about `name` as it resolves here: a row naming a binding counts only
+// where the name reaches that binding.
+function narClobHits(i: i32, name: string): boolean {
+  if narClobKeys[i] != name { return false }
+  narClobBind[i] < 0 || narClobBind[i] == crBindDepthOf(name)
 }
 
 // Join the narrowing column across an `if`'s arms and install it for the code below. For each
@@ -1382,7 +1392,7 @@ function applyArmJoins(
     const nm = narClobKeys[i]
     // One join per key, and a path only when neither arm left it UNKNOWN: a call that can write
     // the place takes the fact away, and a merged entry would hand it back (D1849).
-    if !narJoinSeen(clobMark, i, nm) {
+    if narClobHits(i, nm) && !narJoinSeen(clobMark, i, nm) {
       // This pass's answer replaces an earlier check's, which may have been at other types.
       narIfEnds[i32ToStr(ix) + "#" + nm] = -1
       // A name THIS `if`'s condition narrows enters its two arms at two different types, and
@@ -4938,6 +4948,7 @@ export function initChecker() {
   narClobPrev = []
   narClobDepths = []
   narClobRetired = []
+  narClobBind = []
   asgDeclTys = []
   asgDeclDepths = []
   asgDeclKinds = []
@@ -7677,6 +7688,7 @@ function retireAliasedNarrowings(
         narClobPrev.push(-1)
         narClobDepths.push(T.scopes.length)
         narClobRetired.push(2)
+        narClobBind.push(-1)
         mapCellStaysPresent(k)
       }
     }
@@ -8031,6 +8043,7 @@ function retireNarrowingsForWrite(tgtIx: i32, rt0: i32, atIx: i32) {
     let prtd = 0
     if pathRetired { prtd = 1 }
     narClobRetired.push(prtd)
+    narClobBind.push(-1)
   }
   const tn = P.nodes[tgtIx]
   if tn is Ident {
@@ -8084,6 +8097,7 @@ function retireNarrowingsForWrite(tgtIx: i32, rt0: i32, atIx: i32) {
       let rtd = 0
       if retires { rtd = 1 }
       narClobRetired.push(rtd)
+      narClobBind.push(-1)
     }
   }
   0
@@ -8214,6 +8228,7 @@ function noteCallInvalidations(callIx: i32) {
       narClobPrev.push(-1)
       narClobDepths.push(T.scopes.length)
       narClobRetired.push(2)
+      narClobBind.push(-1)
     }
     i = i + 1
   }
@@ -9436,19 +9451,19 @@ function crChainWidest(name: string, depths: i32[]): i32 {
 // does. `atLoop` false banks it for the emitter after the statement being checked and refuses a
 // read later in that statement; true banks it before the loop `stmtIx`, which has not begun.
 function crRetire(name: string, callIx: i32, atLoop: boolean, stmtIx: i32) {
-  crRetireAt(name, callIx, atLoop, stmtIx, !atLoop, true)
+  crRetireAt(name, callIx, atLoop, stmtIx, !atLoop, -1)
 }
 
 // `crRetire`, with the emitter's bank at `stmtIx` after it (`atLoop` false) or before it, a later
-// read in the statement being checked refused only when `pend`, and the arm-join row kept only
-// when `clob`: the join resolves the row by name, at every `if` closing around this point.
+// read in the statement being checked refused only when `pend`, and the arm-join row about the
+// binding at scope depth `bind`, or -1 for the one the name reaches (`narClobBind`).
 function crRetireAt(
   name: string,
   callIx: i32,
   atLoop: boolean,
   stmtIx: i32,
   pend: boolean,
-  clob: boolean,
+  bind: i32,
 ) {
   const depths: i32[] = []
   const wide = crChainWidest(name, depths)
@@ -9463,13 +9478,12 @@ function crRetireAt(
   // The arm join and the post-guard residual read this row exactly as a retiring write's. Its
   // entry type is the widest, not `cur`: a call in a condition retires a narrowing that only
   // part of the condition held, which is no type the `if` itself begins at.
-  if clob {
-    narClobKeys.push(name)
-    narClobTys.push(wide)
-    narClobPrev.push(wide)
-    narClobDepths.push(T.scopes.length)
-    narClobRetired.push(1)
-  }
+  narClobKeys.push(name)
+  narClobTys.push(wide)
+  narClobPrev.push(wide)
+  narClobDepths.push(T.scopes.length)
+  narClobRetired.push(1)
+  narClobBind.push(bind)
   crRetNames.push(name)
   crRetCalls.push(callIx)
   crRetNarTys.push(cur)
@@ -9510,6 +9524,16 @@ function crShadowedHeight(name: string, from: i32): i32 {
   j + 1
 }
 
+// The scope depth of the binding `name` reads through its narrowing layers; the outermost layer
+// when every one is banked, since the declaration's own scope may bank a narrowing too.
+function crBindDepthOf(name: string): i32 {
+  const ds = scopeDepthsOf[name]
+  if ds == null || ds.length == 0 { return -1 }
+  let j = ds.length - 1
+  while j > 0 && crIsNarrowLayer(name, ds[j]) { j = j - 1 }
+  ds[j]
+}
+
 // The innermost open statement that holds the scope at depth `d`, or -1.
 function crStmtHolding(d: i32): i32 {
   let i = crStmtIxs.length - 1
@@ -9544,16 +9568,10 @@ function crRetireShadowed(name: string, callIx: i32, loopIx: i32) {
     } else if !callMayWrite(c, name) {
       c = -1
     }
-    // Past a single shadowing declaration the name reaches this binding again; with two, the
-    // join closing around the inner one would take the row as the outer one's.
-    let decls = 0
-    let q = 0
-    while q < hidden.length {
-      if !crIsNarrowLayer(name, hidden[q]) { decls = decls + 1 }
-      q = q + 1
+    // The join row names this binding, which only the joins outside the shadow reach.
+    if c >= 0 && st >= 0 {
+      crRetireAt(name, c, false, st, false, crBindDepthOf(name))
     }
-    const clob = decls == 1
-    if c >= 0 && st >= 0 { crRetireAt(name, c, false, st, false, clob) }
     let k = hidden.length - 1
     while k >= 0 {
       ds.push(hidden[k])
@@ -10714,6 +10732,7 @@ function crLoopPathPreRetire(loopIx: i32) {
         narClobPrev.push(-1)
         narClobDepths.push(T.scopes.length)
         narClobRetired.push(2)
+        narClobBind.push(-1)
       }
     }
     s = s + 1
@@ -26932,6 +26951,27 @@ export function covarValueWriteAt(root: string, rootFr: i32): i32 {
   -1
 }
 
+// Whether the list `ix` delivers is a `const` bound once to a list literal, the one provenance
+// `covarValueWriteState` follows every alias of. Its 0 for any other root (a parameter, or a
+// binding of a call result) says nothing of the caller's handles, so a snapshot there is unsound.
+export function covarRootFreshLocal(ix: i32): boolean {
+  const root = covarRootName(ix)
+  if root == "" { return false }
+  cwArenaSync()
+  const set: string[] = [root]
+  const setFr: i32[] = [covarRootFrame(ix)]
+  const binds: i32[] = []
+  cwSetOccs(set, setFr, CW_OCC_BIND, binds)
+  if binds.length != 1 { return false }
+  const b = P.nodes[binds[0]]
+  if b is LetDecl {
+    if b.letKw == "const" && b.letInit >= 0 {
+      return P.nodes[cwPeel(b.letInit)] is ArrayLit
+    }
+  }
+  false
+}
+
 // —— the checker's `Writable` rule (DECISIONS.md A9, D793) ——
 // A covariant list assignment is legal exactly where it is read-only: where the value is
 // written through, the two element storages cannot both be honoured, so the assignment
@@ -41488,6 +41528,7 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
   narClobPrev = []
   narClobDepths = []
   narClobRetired = []
+  narClobBind = []
   crFnEnter(fnIx)
   // Check the body in a fresh scope sharing the parameters.
   pushScope(n.fnBody)
