@@ -108,11 +108,16 @@ import {
   primNameOf,
   primNameStr,
   recordJoinSeen,
+  substTyDeep,
   tyArrayElemPrim,
+  tyFieldTyOf,
+  tyHasTyVar,
   tyIsLitSet,
   tyIsLitUnion,
+  tyIsNulLitUnionNiche,
   tyIsValueUnionBox,
   tyLitMemberTexts,
+  tyLitUnionAliasIx,
   tyNomNameCycled,
   tyScalarBasePrim,
   tyToEmitName,
@@ -412,6 +417,8 @@ import {
   mUsed,
   mkArrIdx,
   mkListIdx,
+  monoInstFe,
+  monoInstOrig,
   monoOrigNode,
   mvKeyKind,
   mvMapTypeIdx,
@@ -428,6 +435,7 @@ import {
   nliLetIxs,
   nliNames,
   pendingNulRefHeap,
+  postMonoShapes,
   rElemKind,
   raTypeIdx,
   raUsed,
@@ -605,6 +613,7 @@ import {
   fnRetExprOf,
   fnReturnsClosure,
   fnSigKeyOf,
+  fnTyRetOf,
   forInElemKind,
   forInMapValsSlot,
   forInPairElemKind,
@@ -636,6 +645,7 @@ import {
   isUNameAB,
   isUNameKeyAB,
   isUnionOfTy,
+  iterElemPinTy,
   leqCoreKindOfAtomKind,
   letAnnIsUninternedShape,
   letInfersF32,
@@ -727,6 +737,7 @@ import {
   objVariantName,
   parentBindingFrameArenaOf,
   parentBindingOf,
+  pinnedValTyOf,
   preStmtNarrow,
   pushPostGuardNarrow,
   recordAnnRlSlot,
@@ -3472,6 +3483,14 @@ export function computeRetInference() {
   0
 }
 
+// Whether iterable `iterIx`'s element is a literal-union atom only at the pin of the instance
+// `fnIx` is, its recorded element naming a type parameter or hole (D2983).
+function forInElemPinIsAtom(iterIx: i32, fnIx: i32): boolean {
+  const hp = iterElemPinTy(iterIx, fnIx)
+  if hp >= 0 { return tyLitUnionAliasIx(hp) >= 0 || tyIsNulLitUnionNiche(hp) }
+  false
+}
+
 // Declare the locals a `for v in A to B [step S]` needs, in the pre-order `emitForRangeStmt`
 // consumes them: the loop variable, a bound temp, and a step temp when the step is not a
 // folded constant. Leaves `v` bound, for the caller to `scopeUnbind`. ONE home — the start
@@ -3576,6 +3595,7 @@ export function declareForInLocals(s: ForIn, fnIx: i32) {
     nodeArrayElemIsLitUnion(s.fiIter)
     || nodeArrayElemIsNulLitUnion(s.fiIter)
     || nodeTyMapKeyIsLitUnion(s.fiIter)
+    || fiEk == "i32" && forInElemPinIsAtom(s.fiIter, fnIx)
   ) {
     localLitUnion[fiSlot] = 1
   }
@@ -3890,7 +3910,7 @@ export function collectLocals(blockIx: i32, fnIx: i32) {
           // so `letIsVariant` declines and the pair `("struct", -1)` reached `fbValtype`'s
           // guard. Gated on the `-1`, so it can only fire on a pair that is a loud reject.
           const lsi = structIndexOfLet(stmts[i], fnIx)
-          const lov = letObjLitVariantIdx(stmts[i])
+          const lov = letObjLitVariantIdx(stmts[i], fnIx)
           if lsi < 0 && lov >= 0 {
             slot = addLocalName(s.letName, "variant", lov)
           } else {
@@ -6793,6 +6813,133 @@ export function collectAnnShapes() {
     }
     ti = ti + 1
   }
+  if postMonoShapes { mintPinnedObjLitRows() }
+  0
+}
+
+// Every generic instance's record literals with a field at a type parameter get the row of
+// their type at that instance's pins, which the collect pass could not mint from the template's
+// type (D3032). A literal whose pins do not all resolve mints nothing and refuses at emit. Not
+// in a constructor, whose record leaves the instance and is built where it is delivered (D2850).
+function mintPinnedObjLitRows() {
+  let k = 0
+  while k < monoInstFe.length && k < monoInstOrig.length {
+    const fe = monoInstFe[k]
+    if (
+      fe >= 0
+      && fe < fnStmts.length
+      && instRetKeepsRecordsIn(monoInstOrig[k])
+    ) {
+      const fd = P.nodes[fnStmts[fe]]
+      if fd is FuncDecl {
+        mintPinnedObjLitsIn(fd.fnBody, fnStmts[fe], fd.fnBody, 0)
+      }
+    }
+    k = k + 1
+  }
+  0
+}
+
+// Whether the generic at monomorphization row `orig` returns no value built at a type
+// parameter other than one of the parameters themselves: a concrete type or a bare `T`.
+function instRetKeepsRecordsIn(orig: i32): boolean {
+  if orig < 0 || orig >= monoOrigNode.length { return false }
+  const r = fnTyRetOf(nodeTyIxOf(monoOrigNode[orig]))
+  if r < 0 || r >= T.tys.length { return false }
+  if !tyHasTyVar(r) { return true }
+  T.tys[r] is TyVar
+}
+
+// `mintPinnedObjLitRows` over the subtree at `ix` of instance `fnIx`, whose body is `body`,
+// stopping at a nested function, whose literals are pinned by its own instance if any. A list
+// literal names its element row once for every instance (D3036), so a literal it holds, or
+// one bound to a name it holds, is left to that row.
+function mintPinnedObjLitsIn(ix: i32, fnIx: i32, body: i32, depth: i32) {
+  if ix < 0 || ix >= P.nodes.length || depth > 256 { return 0 }
+  const n = P.nodes[ix]
+  if n is FuncDecl || n is ArrayLit { return 0 }
+  let lit = ix
+  if n is LetDecl {
+    const li = unwrapParen(n.letInit)
+    if (
+      li >= 0
+      && P.nodes[li] is ObjLit
+      && nameInListLit(body, n.letName, false, 0)
+    ) {
+      lit = li
+    }
+  }
+  if n is ObjLit { mintPinnedObjLit(ix, fnIx) }
+  const kids = nodeChildren(ix)
+  let i = 0
+  while i < kids.length {
+    if kids[i] == lit && lit != ix {
+      const lk = nodeChildren(lit)
+      let j = 0
+      while j < lk.length {
+        mintPinnedObjLitsIn(lk[j], fnIx, body, depth + 2)
+        j = j + 1
+      }
+    } else {
+      mintPinnedObjLitsIn(kids[i], fnIx, body, depth + 1)
+    }
+    i = i + 1
+  }
+  0
+}
+
+// Whether an identifier `name` is read inside a list literal under `ix`; `inList` says whether
+// `ix` already is inside one.
+function nameInListLit(
+  ix: i32,
+  name: string,
+  inList: boolean,
+  depth: i32,
+): boolean {
+  if ix < 0 || ix >= P.nodes.length || depth > 256 { return false }
+  const n = P.nodes[ix]
+  if n is Ident { return inList && n.identName == name }
+  let inner = inList
+  if n is ArrayLit { inner = true }
+  const kids = nodeChildren(ix)
+  let i = 0
+  while i < kids.length {
+    if nameInListLit(kids[i], name, inner, depth + 1) { return true }
+    i = i + 1
+  }
+  false
+}
+
+// Interns the row of the record literal at `objIx` at instance `fnIx`'s pins, when a field of
+// its recorded type is a type parameter and every such field's value has a pin.
+function mintPinnedObjLit(objIx: i32, fnIx: i32) {
+  const lt = nodeTyIxOf(objIx)
+  if lt < 0 || lt >= T.tys.length || !tyHasTyVar(lt) { return 0 }
+  const o = P.nodes[objIx]
+  if !(o is ObjLit) { return 0 }
+  const bNames: string[] = []
+  const bTys: i32[] = []
+  let i = 0
+  while i < o.objFields.length {
+    const f = P.nodes[o.objFields[i]]
+    if f is FieldInit {
+      const ft = tyFieldTyOf(lt, f.fiName)
+      if ft >= 0 && ft < T.tys.length {
+        const fty = T.tys[ft]
+        if fty is TyVar {
+          const pin = pinnedValTyOf(f.fiValue, fnIx)
+          if pin < 0 { return 0 }
+          bNames.push(fty.tvName)
+          bTys.push(pin)
+        }
+      }
+    }
+    i = i + 1
+  }
+  if bNames.length == 0 { return 0 }
+  const st = substTyDeep(lt, bNames, bTys)
+  if st < 0 || tyHasTyVar(st) { return 0 }
+  internShapeDeepTy(tyToEmitName(st), st)
   0
 }
 
@@ -10580,6 +10727,27 @@ function flatHasSubWordField(sx: i32, stmts: i32[], depth: i32): boolean {
   false
 }
 
+// Empties the struct table and the indexes keyed on its spellings, so the next program's rows
+// never answer with this one's names. `collectU` runs first and reads it, so it resets it too.
+function structTableReset() {
+  structNameIxReset()
+  shapeSetIxReset()
+  structTyIxReset()
+  sNames = []
+  sRowDecl = []
+  sTyIx = []
+  sAnonOwnTy = Map()
+  sFieldNames = []
+  sFieldStart = []
+  sFieldCount = []
+  sFieldTypes = []
+  sFieldElemName = []
+  sFieldCloSig = []
+  sFieldElemTyIx = []
+  sFieldElemKeyKind = []
+  0
+}
+
 // ── struct-type collection ───────────────────────────────────────────────────
 // Scans top-level statements for every struct `type` declaration into the flat multi-struct
 // table; each interns its own WasmGC struct heap type, and a field whose type has no code
@@ -10605,23 +10773,7 @@ export function collectS(stmts: i32[]) {
   // answer the next program with this one's nodes.
   anonIxOn = false
   anonIxSeen = 0
-  // The struct-row name index keys this table's spellings — reset it with the table, or the
-  // next program's rows answer with this one's names.
-  structNameIxReset()
-  shapeSetIxReset()
-  structTyIxReset()
-  sNames = []
-  sRowDecl = []
-  sTyIx = []
-  sAnonOwnTy = Map()
-  sFieldNames = []
-  sFieldStart = []
-  sFieldCount = []
-  sFieldTypes = []
-  sFieldElemName = []
-  sFieldCloSig = []
-  sFieldElemTyIx = []
-  sFieldElemKeyKind = []
+  structTableReset()
   // Nested inline-shape field types intern first, so the struct decls that reference them resolve.
   collectNestedFieldShapes(stmts)
   // A `type X = {…}` that is a union variant is collected by `collectU` instead, not here; any
@@ -12185,6 +12337,9 @@ export function reconcileVariantFieldSpans() {
 // `uVariants` list, and collects each variant's fields into the flat table. Multiple unions
 // coexist. Returns 0, or -1 (via `emitFail`).
 export function collectU(stmts: i32[]) {
+  // The struct table does not exist yet in this program: a previous program's rows would
+  // resolve a variant's nested field to a row of theirs (D3031).
+  structTableReset()
   // The declared-struct-name index, rebuilt here rather than memoised: a second module in the
   // same instance can present a statement list of the same length, which the index's own
   // stamp cannot see. Every `isStructAtom` ask in this pass and in mono's reads it.

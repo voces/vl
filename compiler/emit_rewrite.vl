@@ -2998,6 +2998,10 @@ function cboxModuleFrame() {
 // The names read inside a function nested in the frame being walked.
 let shrLamNames: {[string]: i32} = Map()
 let shrLamAny = false
+// Names a function nested in the frame being walked takes as a parameter, and names such a
+// function reads where no nested function around the read takes one of that name (D3025).
+let shrLamParams: {[string]: i32} = Map()
+let shrLamFree: {[string]: i32} = Map()
 // The module's top-level bindings and function names, visible from every frame.
 let shrGlobals: {[string]: i32} = Map()
 // Names a call in the unit being respelled spells as a method (`x.name()`): the checker may
@@ -3045,6 +3049,53 @@ function shrCollect(ix: i32, inFn: boolean) {
   0
 }
 
+// Records `shrLamParams` and `shrLamFree` under `ix`, where `ps` holds the parameters of the
+// nested functions around it and `inFn` says whether there is one. An `else if` chain is walked
+// along its spine.
+function shrCollectParams(ix: i32, ps: string[], inFn: boolean) {
+  let cur = ix
+  while cur >= 0 && cur < P.nodes.length {
+    const n = P.nodes[cur]
+    if n is Ident {
+      if inFn && !strListHas(ps, n.identName) { shrLamFree[n.identName] = 1 }
+      return 0
+    }
+    if n is FuncDecl {
+      const inner: string[] = []
+      let i = 0
+      while i < ps.length {
+        inner.push(ps[i])
+        i = i + 1
+      }
+      let pi = 0
+      while pi < n.fnParams.length {
+        const pn = P.nodes[n.fnParams[pi]]
+        if pn is Param {
+          shrLamParams[pn.parName] = 1
+          inner.push(pn.parName)
+        }
+        pi = pi + 1
+      }
+      return shrCollectParams(n.fnBody, inner, true)
+    }
+    const kids = nodeValueSpineChildren(cur)
+    let i = 0
+    while i < kids.length {
+      shrCollectParams(kids[i], ps, inFn)
+      i = i + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  0
+}
+
+// Whether a binding of `name` in the frame being walked is read by a nested function that
+// reaches it through another nested function taking a parameter of that name: a capture
+// forwarded by name would resolve to the parameter, so the binding needs its own spelling.
+function shrParamShadows(name: string): boolean {
+  (shrLamFree[name] ?? 0) == 1 && (shrLamParams[name] ?? 0) == 1
+}
+
 // Records in `shrMethodNames` every name a call under `ix` spells as a method. An `else if`
 // chain is walked along its spine.
 function shrCollectMethods(ix: i32) {
@@ -3083,7 +3134,10 @@ function shrDeclare(name: string, respell: boolean): string {
     const open = (shrCur[name] ?? "") != ""
     if (
       (shrLamNames[name] ?? 0) == 1
-      && (open || (shrFrameSeen[name] ?? 0) == 1 || (shrGlobals[name] ?? 0) == 1)
+      && (open
+        || (shrFrameSeen[name] ?? 0) == 1
+        || (shrGlobals[name] ?? 0) == 1
+        || shrParamShadows(name))
     ) {
       sp = shrMint(name)
     } else if (
@@ -3100,6 +3154,11 @@ function shrDeclare(name: string, respell: boolean): string {
       }
     }
   }
+  shrOpen(name, sp)
+}
+
+// Opens a binding of `name` spelled `sp`, and returns `sp`.
+function shrOpen(name: string, sp: string): string {
   shrTrailName.push(name)
   shrTrailPrev.push(shrCur[name] ?? "")
   shrTrailPrevDepth.push(shrCurDepth[name] ?? 0)
@@ -3132,29 +3191,67 @@ function shrWalkFrame(fnIx: i32) {
     const savedShared = shrFrameShared
     const savedLam = shrLamNames
     const savedAny = shrLamAny
+    const savedParams = shrLamParams
+    const savedFree = shrLamFree
     shrFrameSeen = Map()
     shrFrameShared = Map()
     shrLamNames = Map()
     shrLamAny = false
+    shrLamParams = Map()
+    shrLamFree = Map()
     shrCollect(fn.fnBody, false)
+    shrCollectParams(fn.fnBody, [], false)
     shrDepth = shrDepth + 1
     const mark = shrTrailName.length
     const ps = fn.fnParams
+    // A parameter keeps its spelling, which a named argument matches, so one that needs its own
+    // is copied into a respelled local at the top of the body.
+    const seeds: i32[] = []
     let pi = 0
     while pi < ps.length {
       const p = P.nodes[ps[pi]]
-      if p is Param { shrDeclare(p.parName, false) }
+      if p is Param {
+        if shrParamNeedsSeed(p.parName, fn.fnBody) {
+          const sp = shrMint(p.parName)
+          let annot = p.parType
+          if p.parOpt != 0 { annot = -1 }
+          const src = mkIdent(p.parName, -1)
+          const pty = nodeTyIxOf(ps[pi])
+          if pty >= 0 { nodeTyRecord(src, pty) }
+          seeds.push(mkLet("let", sp, annot, src, -1))
+          shrOpen(p.parName, sp)
+        } else {
+          shrDeclare(p.parName, false)
+        }
+      }
       pi = pi + 1
     }
     shrWalk(fn.fnBody)
+    let si = seeds.length - 1
+    while si >= 0 {
+      cboxPrepend(fn.fnBody, seeds[si])
+      si = si - 1
+    }
     shrTrim(mark)
     shrDepth = shrDepth - 1
     shrFrameSeen = savedSeen
     shrFrameShared = savedShared
     shrLamNames = savedLam
     shrLamAny = savedAny
+    shrLamParams = savedParams
+    shrLamFree = savedFree
   }
   0
+}
+
+// Whether parameter `name` of the frame whose body is `body` is seeded into a respelled local:
+// `shrParamShadows` holds, the body is a block to seed, and nothing spells the name as a method.
+function shrParamNeedsSeed(name: string, body: i32): boolean {
+  if name == "" || name == "self" { return false }
+  if (shrMethodNames[name] ?? 0) == 1 { return false }
+  if !shrParamShadows(name) { return false }
+  if body < 0 || body >= P.nodes.length { return false }
+  P.nodes[body] is Block
 }
 
 // Respells the bindings under `ix` that `shrDeclare` decides to, and every read of one. A
@@ -3251,10 +3348,13 @@ export function shadowRespell(stmts: i32[]) {
   shrMethodNames = Map()
   shrLamNames = Map()
   shrLamAny = false
+  shrLamParams = Map()
+  shrLamFree = Map()
   let mi = 0
   while mi < stmts.length {
     if P.nodes[stmts[mi]] !is FuncDecl {
       shrCollect(stmts[mi], false)
+      shrCollectParams(stmts[mi], [], false)
       shrCollectMethods(stmts[mi])
     }
     mi = mi + 1
