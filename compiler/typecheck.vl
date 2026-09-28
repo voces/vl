@@ -3810,6 +3810,12 @@ let listRetagN: {[i32]: i32} = Map()
 // write analysis cannot see, one bit per pair: 1 `i32`->`i64`, 2 `i32`->`f64`, 4 `f32`->`f64`.
 // Such a delivery is a view that reads through its source, not a copy (D3028).
 export let scalarViewPairs = 0
+// The record element types delivered as a list of a union holding them from a source whose other
+// handles the write analysis cannot see. Such a delivery is a view of its source (D3041).
+export let refViewSrcTys: i32[] = []
+// The source expressions of those deliveries whose destination is `readonly`: a view serves them
+// whatever writes the source, since nothing writes through the view.
+let refViewRoNodes: i32[] = []
 // Literal-width sidecar, parallel to `nodeTyIx`: true at a radix `NumLit` whose destination is a
 // 64-bit slot, so its bit pattern is read at 64 bits rather than at the width its digits imply.
 // `checkNodeReal` consults it so a re-check keeps the adopted width, and the emitter reads the
@@ -4788,6 +4794,8 @@ export function initChecker() {
   listRetagAt = Map()
   listRetagN = Map()
   scalarViewPairs = 0
+  refViewSrcTys = []
+  refViewRoNodes = []
   litWide64 = []
   litTreeTy = []
   shiftCountNodes = []
@@ -17583,6 +17591,7 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
         covarTwoUnionsErr(srcExpr, srcTy, dstTy)
         return true
       }
+      noteRefListView(srcExpr, srcTy, dstTy)
       // D2060 — the record twin: a field widened by this delivery is shared with the source,
       // so it is legal only where nothing the delivery reaches writes it.
       rcwPend(srcExpr, srcTy, dstTy)
@@ -27033,6 +27042,90 @@ function covarWriteThrough(srcExpr: i32, srcTy: i32, dstTy: i32): i32 {
     }
   }
   0
+}
+
+// Record a record list delivered as a list of a boxed union from a root other than a fresh
+// `const` literal (`refViewSrcTys`): the emitter builds such a delivery as a view (D3041).
+function noteRefListView(srcExpr: i32, srcTy: i32, dstTy: i32) {
+  if srcTy == dstTy || srcTy < 0 || dstTy < 0 { return 0 }
+  if srcTy >= T.tys.length || dstTy >= T.tys.length { return 0 }
+  const s = T.tys[srcTy]
+  const d = T.tys[dstTy]
+  // A literal delivers each of its fields or elements at the destination's own, one seam down.
+  let cx = -1
+  if srcExpr >= 0 && srcExpr < P.nodes.length { cx = cwPeel(srcExpr) }
+  if cx >= 0 && cx < P.nodes.length {
+    const ce = P.nodes[cx]
+    if ce is ObjLit { return noteRefListViewFields(ce.objFields, dstTy) }
+    if ce is ArrayLit { return noteRefListViewElems(ce.arrElems, dstTy) }
+  }
+  if s is TyArray {
+    if d is TyArray {
+      const se = s.aElem
+      const de = d.aElem
+      if se < 0 || de < 0 || se >= T.tys.length || de >= T.tys.length {
+        return 0
+      }
+      // A `| null` record element rides the box's own null tag.
+      let sr = se
+      const sn = T.tys[se]
+      if sn is TyNullable { sr = sn.nInner }
+      if sr < 0 || sr >= T.tys.length { return 0 }
+      const st = T.tys[sr]
+      // A `| null` over the union still boxes, with `null` a tag inside the box.
+      let du = de
+      const dn = T.tys[de]
+      if dn is TyNullable { du = dn.nInner }
+      if du < 0 || du >= T.tys.length { return 0 }
+      const dt = T.tys[du]
+      if st is TyObj {
+        if dt is TyUnion {
+          if covarNonNullArms(dt.uMembers) < 2 { return 0 }
+          if covarRootFreshLocal(srcExpr) { return 0 }
+          if !i32ListHas(refViewSrcTys, se) { refViewSrcTys.push(se) }
+          if d.aRead == 1 && !i32ListHas(refViewRoNodes, srcExpr) {
+            refViewRoNodes.push(srcExpr)
+          }
+        }
+      }
+    }
+  }
+  0
+}
+
+// `noteRefListView` over an object literal's fields, each at its destination field's type.
+function noteRefListViewFields(fields: i32[], dstTy: i32) {
+  const d = T.tys[dstTy]
+  if d is TyObj {
+    let fi = 0
+    while fi < fields.length {
+      const fn = P.nodes[fields[fi]]
+      if fn is FieldInit {
+        const dft = objFieldType(d, fn.fiName)
+        if dft >= 0 { noteRefListView(fn.fiValue, nodeTyIxOf(fn.fiValue), dft) }
+      }
+      fi = fi + 1
+    }
+  }
+  0
+}
+
+// `noteRefListView` over a list literal's elements, each at the destination's element type.
+function noteRefListViewElems(elems: i32[], dstTy: i32) {
+  const d = T.tys[dstTy]
+  if d is TyArray {
+    let ei = 0
+    while ei < elems.length {
+      noteRefListView(elems[ei], nodeTyIxOf(elems[ei]), d.aElem)
+      ei = ei + 1
+    }
+  }
+  0
+}
+
+// Whether the record list `srcExpr` delivers is delivered as a `readonly` union-box list.
+export function refViewReadonlyAt(srcExpr: i32): boolean {
+  i32ListHas(refViewRoNodes, srcExpr)
 }
 
 // How many members of a union are not `null`.
