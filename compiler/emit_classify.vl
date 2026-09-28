@@ -13793,10 +13793,123 @@ export function spreadDestKind(arrIx: i32, fnIx: i32): MfKind | null {
     i = i + 1
   }
   if k == null { return null }
+  // A union element whose sources each box into it builds at its union-box row.
+  if (
+    spreadBoxingSource(arrIx, fnIx) >= 0
+    && spreadOwnBoxRow(arrIx, elems, fnIx) >= 0
+  ) {
+    return "ref"
+  }
+  if spreadLitElemIsString(arrIx) && spreadSourcesStrOrAtoms(elems, fnIx) {
+    return "str"
+  }
   const de = spreadLitScalarElem(arrIx)
   if de == null || de == k { return k }
   if spreadSourcesWidenTo(elems, de, fnIx) { return de }
   k
+}
+
+// The row name a spread literal of ref-list sources builds at: its first source's own row
+// (`spreadDestRow`), not a record the checker's structural element type resolves to, which
+// can be a same-layout record declared earlier (D2938). "" for any other literal.
+export function spreadLitSrcRowName(arrIx: i32, fnIx: i32): string {
+  const a = P.nodes[arrIx]
+  if !(a is ArrayLit) || !hasSpreadItem(a.arrElems) { return "" }
+  if spreadDestKind(arrIx, fnIx) != "ref" { return "" }
+  if spreadBoxingSource(arrIx, fnIx) >= 0 { return "" }
+  const row = spreadDestRow(a.arrElems, fnIx)
+  if row < 0 || row >= rlElemName.length { return "" }
+  rlElemName[row]
+}
+
+// The ref-list row of the element the checker typed list literal `arrIx` at, or -1.
+export function spreadLitElemRow(arrIx: i32): i32 {
+  const de = listElemTyOf(nodeTyIxOf(arrIx))
+  if de < 0 { return -1 }
+  rlSlotOfTy(de)
+}
+
+// The union-box row of spread literal `arrIx`'s own typed element, when every source reaches
+// it (`spreadSrcBoxes`); -1 otherwise, which keeps the caller's refusal.
+export function spreadOwnBoxRow(arrIx: i32, elems: i32[], fnIx: i32): i32 {
+  const row = spreadLitElemRow(arrIx)
+  if row < 0 || row >= rlElemKindTbl.length { return -1 }
+  if rlElemKindTbl[row] != RLK_UNION { return -1 }
+  let i = 0
+  while i < elems.length {
+    const src = spreadArgOf(elems[i])
+    if src >= 0 && spreadSrcBoxes(src, row, fnIx) < 0 { return -1 }
+    i = i + 1
+  }
+  row
+}
+
+// How spread source `src` reaches union-box row `row`: 1 boxed per element (a scalar list whose
+// element is a member, a record list the element-converting copy widens), 0 a list of that row,
+// -1 neither, which keeps the plain backing copy (a union-box list shares the backing).
+export function spreadSrcBoxes(src: i32, row: i32, fnIx: i32): i32 {
+  if row < 0 || row >= rlElemName.length { return -1 }
+  const k = mfRecvKindOf(src, fnIx)
+  if k == null || k == "u8" { return -1 }
+  if k == "ref" {
+    const s = refListSlotOfExpr(src, fnIx)
+    if s == row { return 0 }
+    if s < 0 || s >= rlElemKindTbl.length { return -1 }
+    if rlElemKindTbl[s] == RLK_UNION { return -1 }
+    if rlWidenVariantOf(s, row) < 0 { return -1 }
+    return 1
+  }
+  if spreadSrcBoxAtom(src, rlElemName[row]) < 0 { return -1 }
+  1
+}
+
+// The value atom a scalar list `src`'s element boxes under in union `un`: its own when that is
+// a member, else the member it widens to losslessly (`i32` to `i64` or `f64`, `f32` to `f64`),
+// each element then converted before it is boxed (D2882). -1 when neither.
+export function spreadSrcBoxAtom(src: i32, un: string): i32 {
+  const pn = tyArrayElemPrimName(nodeTyIxOf(src))
+  if pn == "" { return -1 }
+  const k = valueAtomKind(pn)
+  if k < 0 || k > 5 { return -1 }
+  if unionHasAtomKindArm(un, k) { return k }
+  if k == 0 && unionHasAtomKindArm(un, 3) { return 3 }
+  if (k == 0 || k == 5) && unionHasAtomKindArm(un, 4) { return 4 }
+  -1
+}
+
+// Whether the checker typed spread literal `arrIx` a `string[]` or a `(string | null)[]`,
+// which share one rep.
+function spreadLitElemIsString(arrIx: i32): boolean {
+  let de = listElemTyOf(nodeTyIxOf(arrIx))
+  if de < 0 { return false }
+  const dt = T.tys[de]
+  if dt is TyNullable { de = dt.nInner }
+  if de < 0 { return false }
+  tyPrimNameOf(de) == "string"
+}
+
+// The member texts of spread source `src` when it is a list of an atom-repped literal union,
+// whose elements each widen to their string in a `string[]` destination (D2868); else empty.
+export function spreadSrcAtomTexts(src: i32, fnIx: i32): string[] {
+  const none: string[] = []
+  if mfRecvKindOf(src, fnIx) != "i32" { return none }
+  tyLitMemberTexts(listElemTyOf(nodeTyIxOf(src)))
+}
+
+// Whether every spread source among `elems` is a string list or a list of literal-union atoms,
+// and at least one is the latter: the sources a `string[]` spread builds from.
+export function spreadSourcesStrOrAtoms(elems: i32[], fnIx: i32): boolean {
+  let atoms = false
+  let j = 0
+  while j < elems.length {
+    const src = spreadArgOf(elems[j])
+    if src >= 0 {
+      if spreadSrcAtomTexts(src, fnIx).length > 0 { atoms = true }
+      else if mfRecvKindOf(src, fnIx) != "str" { return false }
+    }
+    j = j + 1
+  }
+  atoms
 }
 
 // The spread source of literal `arrIx` whose elements would each need boxing: the literal is
@@ -13810,6 +13923,10 @@ export function spreadBoxingSource(arrIx: i32, fnIx: i32): i32 {
   const dT = T.tys[de]
   if !(dT is TyUnion || dT is TyNullable) { return -1 }
   if tyIsLitUnion(de) { return -1 }
+  // A nullable string list is the string list's rep, which atom sources widen into.
+  if spreadLitElemIsString(arrIx) && spreadSourcesStrOrAtoms(a.arrElems, fnIx) {
+    return -1
+  }
   let i = 0
   while i < a.arrElems.length {
     const src = spreadArgOf(a.arrElems[i])
@@ -23589,6 +23706,8 @@ function elemNameIsNominalAt(en: string, depth: i32): boolean {
 // instance's parameter pin names it (`[[t]]` at `T := string` keys `string[]`); the pin-blind
 // answer when the leaf reads the same, or when the pinned leaf has no element row (D2798).
 export function arrLitElemNameIn(arrIx: i32, fnIx: i32): string {
+  const sn = spreadLitSrcRowName(arrIx, fnIx)
+  if sn != "" { return sn }
   const nm = arrLitElemName(arrIx)
   if fnIx < 0 || nm != "i32[]" { return nm }
   const a = P.nodes[arrIx]
