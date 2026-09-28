@@ -7,7 +7,8 @@
 # The compiler is a real module graph (entry.vl → driver → the pipeline), and a
 # single-file `vl check` lints EVERY module of the resolved graph (the
 # per-module lint tier), each finding attributed to its own file — so checking
-# the entry covers all of compiler/*.vl with source-file positions.
+# the entry covers all of compiler/*.vl with source-file positions. That needs
+# `--include-imports`: without it an import reports its errors only (plumb PL-055).
 # `prefer-const` stays safe on cross-module reassignment because EXPORTED
 # bindings are exempt (another module may rebind them). `std/` is linted as
 # ordinary modules EXCEPT for the four comment codes, which implement the
@@ -78,7 +79,7 @@ trap 'rm -rf "$WORK"' EXIT
 # rewritten (a rewrite moves the seed for a spelling), and a new one fails its --check.
 lint_graded() { # <target> <json path>
   local rc=0
-  "$VL" check "$1" --severity info --json > "$2" 2> "$2.err" || rc=$?
+  "$VL" check "$1" --severity info --include-imports --json > "$2" 2> "$2.err" || rc=$?
   cat "$2.err"
   if [ "$rc" -gt 1 ]; then cat "$2"; return "$rc"; fi
   # shellcheck disable=SC2046  # the word split is the point: zero or more codes
