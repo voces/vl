@@ -3792,6 +3792,10 @@ let widenRetagAt: {[i32]: i32} = Map()
 let widenRetagN: {[i32]: i32} = Map()
 let widenRetagFromTy: i32[] = []
 let widenRetagToTy: i32[] = []
+// Per node, the same rows for each element of a list of such boxes delivered as a `readonly`
+// list (`recordListWidenRetag`), over the two columns above.
+let listRetagAt: {[i32]: i32} = Map()
+let listRetagN: {[i32]: i32} = Map()
 // Literal-width sidecar, parallel to `nodeTyIx`: true at a radix `NumLit` whose destination is a
 // 64-bit slot, so its bit pattern is read at 64 bits rather than at the width its digits imply.
 // `checkNodeReal` consults it so a re-check keeps the adopted width, and the emitter reads the
@@ -4767,6 +4771,8 @@ export function initChecker() {
   widenRetagN = Map()
   widenRetagFromTy = []
   widenRetagToTy = []
+  listRetagAt = Map()
+  listRetagN = Map()
   litWide64 = []
   litTreeTy = []
   shiftCountNodes = []
@@ -8561,6 +8567,8 @@ let crStmtIxs: i32[] = []
 let crStmtFns: i32[] = []
 let crStmtPend: i32[] = []
 let crStmtRd: i32[] = []
+// The scope count on entering each statement, so a scope depth names the statement holding it.
+let crStmtScopes: i32[] = []
 // Names a call retired inside a statement still being checked, with the call and the narrowed
 // type. A read later in that statement is refused.
 let crPendNames: string[] = []
@@ -8641,6 +8649,7 @@ function crReset() {
   crStmtFns = []
   crStmtPend = []
   crStmtRd = []
+  crStmtScopes = []
   crPendNames = []
   crPendCalls = []
   crPendNarTys = []
@@ -8794,6 +8803,7 @@ function crStmtEnter(stmtIx: i32) {
   crStmtFns.push(crFnBases.length)
   crStmtPend.push(crPendNames.length)
   crStmtRd.push(crRdRet.length)
+  crStmtScopes.push(T.scopes.length)
   0
 }
 
@@ -8816,6 +8826,7 @@ function crStmtLeave() {
   crStmtFns.pop()
   crStmtPend.pop()
   crStmtRd.pop()
+  crStmtScopes.pop()
   0
 }
 
@@ -9425,6 +9436,20 @@ function crChainWidest(name: string, depths: i32[]): i32 {
 // does. `atLoop` false banks it for the emitter after the statement being checked and refuses a
 // read later in that statement; true banks it before the loop `stmtIx`, which has not begun.
 function crRetire(name: string, callIx: i32, atLoop: boolean, stmtIx: i32) {
+  crRetireAt(name, callIx, atLoop, stmtIx, !atLoop, true)
+}
+
+// `crRetire`, with the emitter's bank at `stmtIx` after it (`atLoop` false) or before it, a later
+// read in the statement being checked refused only when `pend`, and the arm-join row kept only
+// when `clob`: the join resolves the row by name, at every `if` closing around this point.
+function crRetireAt(
+  name: string,
+  callIx: i32,
+  atLoop: boolean,
+  stmtIx: i32,
+  pend: boolean,
+  clob: boolean,
+) {
   const depths: i32[] = []
   const wide = crChainWidest(name, depths)
   if wide < 0 { return 0 }
@@ -9438,11 +9463,13 @@ function crRetire(name: string, callIx: i32, atLoop: boolean, stmtIx: i32) {
   // The arm join and the post-guard residual read this row exactly as a retiring write's. Its
   // entry type is the widest, not `cur`: a call in a condition retires a narrowing that only
   // part of the condition held, which is no type the `if` itself begins at.
-  narClobKeys.push(name)
-  narClobTys.push(wide)
-  narClobPrev.push(wide)
-  narClobDepths.push(T.scopes.length)
-  narClobRetired.push(1)
+  if clob {
+    narClobKeys.push(name)
+    narClobTys.push(wide)
+    narClobPrev.push(wide)
+    narClobDepths.push(T.scopes.length)
+    narClobRetired.push(1)
+  }
   crRetNames.push(name)
   crRetCalls.push(callIx)
   crRetNarTys.push(cur)
@@ -9452,11 +9479,87 @@ function crRetire(name: string, callIx: i32, atLoop: boolean, stmtIx: i32) {
   if atLoop {
     crBeforeBank[stmtIx] = crwAddName(crBeforeBank[stmtIx] ?? ",", name)
   } else {
-    crPendNames.push(name)
-    crPendCalls.push(callIx)
-    crPendNarTys.push(cur)
-    crPendDepths.push(crStmtIxs.length)
+    if pend {
+      crPendNames.push(name)
+      crPendCalls.push(callIx)
+      crPendNarTys.push(cur)
+      crPendDepths.push(crStmtIxs.length)
+    }
     crAfterBank[stmtIx] = crwAddName(crAfterBank[stmtIx] ?? ",", name)
+  }
+  0
+}
+
+// Whether the scope layer `d` of `name` is a narrowing rather than a declaration.
+function crIsNarrowLayer(name: string, d: i32): boolean {
+  crFirstBank(name, d) >= 0 || crWidenedAt(name, d)
+}
+
+// The height of the scope-depth list of `name` down to its innermost binding declared in the
+// current function that an inner declaration shadows and that is itself narrowed, or -1. The
+// layers above that height are the shadowing declarations and their own narrowings (D3020).
+function crShadowedHeight(name: string, from: i32): i32 {
+  const ds = scopeDepthsOf[name]
+  if ds == null { return -1 }
+  const base = crFnBase()
+  let j = from - 1
+  while j >= 0 && ds[j] >= base && crIsNarrowLayer(name, ds[j]) { j = j - 1 }
+  if j < 0 || ds[j] < base { return -1 }
+  while j >= 0 && ds[j] >= base && !crIsNarrowLayer(name, ds[j]) { j = j - 1 }
+  if j < 0 || ds[j] < base { return -1 }
+  j + 1
+}
+
+// The innermost open statement that holds the scope at depth `d`, or -1.
+function crStmtHolding(d: i32): i32 {
+  let i = crStmtIxs.length - 1
+  while i >= 0 {
+    if crStmtFns[i] != crFnBases.length { return -1 }
+    if crStmtScopes[i] <= d { return crStmtIxs[i] }
+    i = i - 1
+  }
+  -1
+}
+
+// A declaration in a block inside a narrowed binding's scope shadows it, and a call there may
+// still write that binding. Its narrowing ends in the checker at once, since nothing in the block
+// can read it, and in the emitter after the statement holding the block, where the name reaches it
+// again. `loopIx` >= 0 asks of the loop there rather than of the call `callIx` (D3020).
+function crRetireShadowed(name: string, callIx: i32, loopIx: i32) {
+  const ds = scopeDepthsOf[name]
+  // A shadow needs the binding, a narrowing of it and a declaration over both.
+  if ds == null || ds.length < 3 { return 0 }
+  let h = crShadowedHeight(name, ds.length)
+  while h > 0 {
+    const hidden: i32[] = []
+    while ds.length > h {
+      hidden.push(ds[ds.length - 1])
+      ds.pop()
+    }
+    const st = crStmtHolding(hidden[hidden.length - 1])
+    let c = callIx
+    if loopIx >= 0 {
+      c = -1
+      if crMayBeWritten(name) { c = crFirstWritingCall(loopIx, name) }
+    } else if !callMayWrite(c, name) {
+      c = -1
+    }
+    // Past a single shadowing declaration the name reaches this binding again; with two, the
+    // join closing around the inner one would take the row as the outer one's.
+    let decls = 0
+    let q = 0
+    while q < hidden.length {
+      if !crIsNarrowLayer(name, hidden[q]) { decls = decls + 1 }
+      q = q + 1
+    }
+    const clob = decls == 1
+    if c >= 0 && st >= 0 { crRetireAt(name, c, false, st, false, clob) }
+    let k = hidden.length - 1
+    while k >= 0 {
+      ds.push(hidden[k])
+      k = k - 1
+    }
+    h = crShadowedHeight(name, h)
   }
   0
 }
@@ -10529,6 +10632,7 @@ function crNoteCallBare(callIx: i32) {
     if callMayWrite(callIx, names[i]) {
       crRetire(names[i], callIx, false, crStmtIxs[crStmtIxs.length - 1])
     }
+    crRetireShadowed(names[i], callIx, -1)
     i = i + 1
   }
   0
@@ -10570,6 +10674,7 @@ function crLoopPreRetire(loopIx: i32) {
       c = crLoopLeavingWrite(loopIx, names[i])
     }
     if c >= 0 { crRetire(names[i], c, true, loopIx) }
+    crRetireShadowed(names[i], -1, loopIx)
     i = i + 1
   }
   0
@@ -17452,6 +17557,8 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
       rcwPend(srcExpr, srcTy, dstTy)
       if mapDeliveryMayRecord(srcExpr, srcTy, dstTy) {
         recordMapUnbox(srcExpr, srcTy, dstTy, 8)
+      } else if tyWideUnionMinted {
+        recordListWidenRetag(srcExpr, srcTy, dstTy)
       }
       if objShapeAdapterlessAt(srcExpr, srcTy, dstTy) {
         objShapeAdapterlessErr(srcExpr, srcTy, dstTy)
@@ -46754,6 +46861,7 @@ function recordMapUnbox(srcExpr: i32, srcTy: i32, dstIn: i32, depth: i32) {
   if srcExpr < 0 || srcTy < 0 || dstIn < 0 || depth <= 0 { return 0 }
   if srcTy >= T.tys.length || dstIn >= T.tys.length { return 0 }
   recordWidenRetagTails(srcExpr, dstIn)
+  if tyWideUnionMinted { recordListWidenRetag(srcExpr, srcTy, dstIn) }
   const dstTy = nonNullTy(dstIn)
   if dstTy < 0 || dstTy >= T.tys.length { return 0 }
   const d = T.tys[dstTy]
@@ -46875,6 +46983,48 @@ function recordWidenRetagTails(srcExpr: i32, dstTy: i32) {
   let i = 0
   while i < leaves.length {
     recordWidenRetag(leaves[i], nodeTyIxOf(leaves[i]), dm)
+    i = i + 1
+  }
+  0
+}
+
+// A list of union boxes delivered as a `readonly` list whose element holds one of their scalar
+// members only widened is copied, each box rebuilt as `recordWidenRetag` rebuilds one (D2999).
+function recordListWidenRetag(srcExpr: i32, srcTy: i32, dstTy: i32) {
+  if srcExpr < 0 || srcTy < 0 || dstTy < 0 { return 0 }
+  if srcTy >= T.tys.length || dstTy >= T.tys.length { return 0 }
+  const s = T.tys[srcTy]
+  // A destination that may be null holds the copy as it would the list.
+  const dn = nonNullTy(dstTy)
+  if dn < 0 || dn >= T.tys.length { return 0 }
+  const d = T.tys[dn]
+  if !(s is TyArray) || !(d is TyArray) { return 0 }
+  if d.aRead != 1 || !unionElemMemberWidens(s.aElem, d.aElem) { return 0 }
+  const dm: i32[] = []
+  unionLeavesInto(d.aElem, dm, 8)
+  const start = widenRetagFromTy.length
+  widenMemberPairs(s.aElem, dm, widenRetagFromTy, widenRetagToTy)
+  if widenRetagFromTy.length > start {
+    listRetagAt.set(srcExpr, start)
+    listRetagN.set(srcExpr, widenRetagFromTy.length - start)
+  }
+  0
+}
+
+// The rows `recordListWidenRetag` recorded at `ix`, pushed onto `from` and `to`.
+export function listWidenRetagRowsOf(ix: i32, from: i32[], to: i32[]) {
+  if listRetagN.length == 0 { return 0 }
+  const st = listRetagAt.get(ix) ?? -1
+  if st < 0 { return 0 }
+  widenRetagRowsFrom(st, listRetagN.get(ix) ?? 0, from, to)
+}
+
+// The `n` widening rows from `st`, pushed onto `from` and `to`.
+function widenRetagRowsFrom(st: i32, n: i32, from: i32[], to: i32[]) {
+  let i = st
+  while i < st + n && i < widenRetagFromTy.length {
+    from.push(widenRetagFromTy[i])
+    to.push(widenRetagToTy[i])
     i = i + 1
   }
   0
@@ -47073,14 +47223,7 @@ export function widenRetagAny(): boolean { widenRetagFromTy.length > 0 }
 export function widenRetagRowsOf(ix: i32, from: i32[], to: i32[]) {
   const st = widenRetagAt.get(ix) ?? -1
   if st < 0 { return 0 }
-  const n = widenRetagN.get(ix) ?? 0
-  let i = st
-  while i < st + n && i < widenRetagFromTy.length {
-    from.push(widenRetagFromTy[i])
-    to.push(widenRetagToTy[i])
-    i = i + 1
-  }
-  0
+  widenRetagRowsFrom(st, widenRetagN.get(ix) ?? 0, from, to)
 }
 
 // Whether `ty` is a map or holds one through unions and `| null`: the cheap gate a retag

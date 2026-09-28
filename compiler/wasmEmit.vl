@@ -55,6 +55,7 @@ import {
   isNumIntrinsicName,
   isValueUnionName,
   isVarTyIxOf,
+  listWidenRetagRowsOf,
   mapDeliveryRecorded,
   mapRetagRowsOf,
   mapUnboxTyOf,
@@ -9998,13 +9999,12 @@ function emitMapSetValExpr(
   // reads; it declines for every non-ref-list value type without parsing.
   if mslot >= 0 {
     const mvWiden = mvValInnerRlSlot(mslot)
+    const mvSrc = exprEmittedRefListSlot(valIx, fnIx)
     if mvWiden >= 0 {
-      emitRefListWidenSite(
-        body,
-        valIx,
-        exprEmittedRefListSlot(valIx, fnIx),
-        mvWiden,
-      )
+      emitRefListWidenSite(body, valIx, mvSrc, mvWiden)
+    } else {
+      // A list of union boxes has no row of its own here; its copy keeps the source's type.
+      emitRefListWidenSite(body, valIx, mvSrc, mvSrc)
     }
     // the scalar copy at the same boundary (D965, D2163) — `m["k"] = ints` over a
     // `{[string]: readonly f64[]}`, keyed by the value list's own element kind.
@@ -21358,6 +21358,53 @@ function emitMapFilter(body: u8[], callIx: i32, fnIx: i32) {
   emitFail("emitProgram: expected a .map/.filter call")
 }
 
+// The frame every element-converting list copy shares: the source list on the stack is held in
+// `sL`, a destination backing of its length made in `dL`, and a loop over `i` entered with the
+// store's array and index pushed when the element step writes; the step then leaves the element.
+function emitCopyLoopOpen(
+  sL: i32,
+  srcWrap: i32,
+  nL: i32,
+  dstBack: i32,
+  dL: i32,
+  iL: i32,
+) {
+  fbLocalSet(sL)
+  fbLocalGet(sL)
+  fbStructGet(srcWrap, 1)
+  fbLocalSet(nL)
+  fbLocalGet(nL)
+  fbArrayNewDefault(dstBack)
+  fbLocalSet(dL)
+  fbI32Const(0)
+  fbLocalSet(iL)
+  fbBlock(64)
+  fbLoop(64)
+  fbLocalGet(iL)
+  fbLocalGet(nL)
+  fbI32Bin(78) // i32.ge_s
+  fbBrIf(1)
+  0
+}
+
+// Close `emitCopyLoopOpen`'s loop after the element's store and leave the destination list, whose
+// backing field is non-null and whose capacity is its length.
+function emitCopyLoopClose(iL: i32, dL: i32, nL: i32, dstWrap: i32) {
+  fbLocalGet(iL)
+  fbI32Const(1)
+  fbI32Bin(106) // i32.add
+  fbLocalSet(iL)
+  fbBr(0)
+  fbEnd()
+  fbEnd()
+  fbLocalGet(dL)
+  wU8(212) // ref.as_non_null
+  fbLocalGet(nL)
+  fbLocalGet(nL)
+  fbStructNew(dstWrap)
+  0
+}
+
 // ── the element-converting copy (read-only covariance, D791) ──────────────────
 // Consume a `(ref $rlWrapIdx[srcSlot])` on the stack and leave a `(ref $rlWrapIdx[dstSlot])`
 // holding the same elements boxed into the shared union box — the only lowering the pair
@@ -21395,25 +21442,8 @@ function emitRefListWidenTop(_body: u8[], srcSlot: i32, dstSlot: i32) {
   // `rlWidenVariantOf` bounded.
   const srcNul = srcSlot < rlElemNullable.length && rlElemNullable[srcSlot] == 1
   // src = <stack>, evaluated ONCE by the caller.
-  fbLocalSet(sL)
-  // n = src.len  (`struct.get` accepts a nullable ref and traps on null, so the
-  // nullable frame slot needs no recover here).
-  fbLocalGet(sL)
-  fbStructGet(srcWrap, 1)
-  fbLocalSet(nL)
-  // back = array.new_default <dstBack> n
-  fbLocalGet(nL)
-  fbArrayNewDefault(dstBack)
-  fbLocalSet(dL)
-  fbI32Const(0)
-  fbLocalSet(iL)
+  emitCopyLoopOpen(sL, srcWrap, nL, dstBack, dL, iL)
   // block { loop { if i >= n br 1; back[i] = {tag, src.back[i]}; i++; br 0 } }
-  fbBlock(64)
-  fbLoop(64)
-  fbLocalGet(iL)
-  fbLocalGet(nL)
-  fbI32Bin(78) // 0x4e i32.ge_s
-  fbBrIf(1)
   fbLocalGet(dL)
   fbLocalGet(iL)
   if srcNul {
@@ -21447,20 +21477,7 @@ function emitRefListWidenTop(_body: u8[], srcSlot: i32, dstSlot: i32) {
     fbStructNew(uBoxIdx)
   }
   fbArraySet(dstBack)
-  fbLocalGet(iL)
-  fbI32Const(1)
-  fbI32Bin(106) // 0x6a i32.add
-  fbLocalSet(iL)
-  fbBr(0)
-  fbEnd()
-  fbEnd()
-  // { backing, len, cap } — the wrapper's field 0 is a NON-null `(ref $dstBack)`, so the
-  // nullable frame slot recovers here and only here.
-  fbLocalGet(dL)
-  wU8(212) // 0xd4 ref.as_non_null
-  fbLocalGet(nL)
-  fbLocalGet(nL)
-  fbStructNew(dstWrap)
+  emitCopyLoopClose(iL, dL, nL, dstWrap)
   0
 }
 
@@ -21506,27 +21523,8 @@ function emitScalarListWidenTop(_body: u8[], srcKind: VKind, dstKind: VKind) {
   const iL = widenTmpSlot(0)
   const nL = widenTmpSlot(1)
   // src = <stack>, evaluated ONCE by the caller.
-  fbLocalSet(sL)
-  // n = src.len  (field 1 of the shared `{ backing, len, cap }` wrapper; `struct.get`
-  // accepts a nullable ref and traps on null, so the nullable frame slot needs no
-  // recover here).
-  fbLocalGet(sL)
-  fbStructGet(srcWrap, 1)
-  fbLocalSet(nL)
-  // back = array.new_default <dstBack> n  — the destination element's ZERO, which is
-  // the right fill for every pair above (they are all numeric).
-  fbLocalGet(nL)
-  fbArrayNewDefault(dstBack)
-  fbLocalSet(dL)
-  fbI32Const(0)
-  fbLocalSet(iL)
+  emitCopyLoopOpen(sL, srcWrap, nL, dstBack, dL, iL)
   // block { loop { if i >= n br 1; back[i] = conv(src.back[i]); i++; br 0 } }
-  fbBlock(64)
-  fbLoop(64)
-  fbLocalGet(iL)
-  fbLocalGet(nL)
-  fbI32Bin(78) // 0x4e i32.ge_s
-  fbBrIf(1)
   fbLocalGet(dL)
   fbLocalGet(iL)
   fbLocalGet(sL)
@@ -21535,20 +21533,7 @@ function emitScalarListWidenTop(_body: u8[], srcKind: VKind, dstKind: VKind) {
   fbArrayGet(srcBack) // yields the element in the SOURCE's rep
   wU8(op) // ...and this is the one byte that makes it the destination's
   fbArraySet(dstBack)
-  fbLocalGet(iL)
-  fbI32Const(1)
-  fbI32Bin(106) // 0x6a i32.add
-  fbLocalSet(iL)
-  fbBr(0)
-  fbEnd()
-  fbEnd()
-  // { backing, len, cap } — field 0 is a NON-null ref, so the nullable frame slot
-  // recovers here and only here. `cap == len`: the copy is exact-sized.
-  fbLocalGet(dL)
-  wU8(212) // 0xd4 ref.as_non_null
-  fbLocalGet(nL)
-  fbLocalGet(nL)
-  fbStructNew(dstWrap)
+  emitCopyLoopClose(iL, dL, nL, dstWrap)
   0
 }
 
@@ -21570,22 +21555,8 @@ function emitAtomListToStrTop(texts: string[]) {
   const iL = widenTmpSlot(0)
   const nL = widenTmpSlot(1)
   const aL = widenTmpSlot(2)
-  fbLocalSet(sL)
-  fbLocalGet(sL)
-  fbStructGet(srcWrap, 1)
-  fbLocalSet(nL)
-  fbLocalGet(nL)
-  fbArrayNewDefault(dstBack)
-  fbLocalSet(dL)
-  fbI32Const(0)
-  fbLocalSet(iL)
+  emitCopyLoopOpen(sL, srcWrap, nL, dstBack, dL, iL)
   // block { loop { if i >= n br 1; a = src.back[i]; back[i] = str(a); i++; br 0 } }
-  fbBlock(64)
-  fbLoop(64)
-  fbLocalGet(iL)
-  fbLocalGet(nL)
-  fbI32Bin(78) // 0x4e i32.ge_s
-  fbBrIf(1)
   fbLocalGet(sL)
   fbStructGet(srcWrap, 0)
   fbLocalGet(iL)
@@ -21595,18 +21566,7 @@ function emitAtomListToStrTop(texts: string[]) {
   fbLocalGet(iL)
   if emitAtomLocalToStrChain(texts, 0, aL) < 0 { return -1 }
   fbArraySet(dstBack)
-  fbLocalGet(iL)
-  fbI32Const(1)
-  fbI32Bin(106) // 0x6a i32.add
-  fbLocalSet(iL)
-  fbBr(0)
-  fbEnd()
-  fbEnd()
-  fbLocalGet(dL)
-  wU8(212) // 0xd4 ref.as_non_null
-  fbLocalGet(nL)
-  fbLocalGet(nL)
-  fbStructNew(dstWrap)
+  emitCopyLoopClose(iL, dL, nL, dstWrap)
   0
 }
 
@@ -21680,22 +21640,8 @@ function emitScalarListBoxTop(srcKind: VKind, atomK: i32, dstSlot: i32) {
   const dL = widenDstBackSlot(dstSlot)
   const iL = widenTmpSlot(0)
   const nL = widenTmpSlot(1)
-  fbLocalSet(sL)
-  fbLocalGet(sL)
-  fbStructGet(srcWrap, 1)
-  fbLocalSet(nL)
-  fbLocalGet(nL)
-  fbArrayNewDefault(dstBack)
-  fbLocalSet(dL)
-  fbI32Const(0)
-  fbLocalSet(iL)
+  emitCopyLoopOpen(sL, srcWrap, nL, dstBack, dL, iL)
   // block { loop { if i >= n br 1; back[i] = {tag, box(src.back[i])}; i++; br 0 } }
-  fbBlock(64)
-  fbLoop(64)
-  fbLocalGet(iL)
-  fbLocalGet(nL)
-  fbI32Bin(78) // 0x4e i32.ge_s
-  fbBrIf(1)
   fbLocalGet(dL)
   fbLocalGet(iL)
   fbI32Const(scalarTagOfKind(atomK))
@@ -21707,18 +21653,7 @@ function emitScalarListBoxTop(srcKind: VKind, atomK: i32, dstSlot: i32) {
   if vb >= 0 { fbStructNew(vb) }
   fbStructNew(uBoxIdx)
   fbArraySet(dstBack)
-  fbLocalGet(iL)
-  fbI32Const(1)
-  fbI32Bin(106) // 0x6a i32.add
-  fbLocalSet(iL)
-  fbBr(0)
-  fbEnd()
-  fbEnd()
-  fbLocalGet(dL)
-  wU8(212) // 0xd4 ref.as_non_null
-  fbLocalGet(nL)
-  fbLocalGet(nL)
-  fbStructNew(dstWrap)
+  emitCopyLoopClose(iL, dL, nL, dstWrap)
   0
 }
 
@@ -21775,6 +21710,12 @@ export function emitRefListWidenSite(
   srcSlot: i32,
   dstSlot: i32,
 ): boolean {
+  const rtFrom: i32[] = []
+  const rtTo: i32[] = []
+  listWidenRetagRowsOf(srcIx, rtFrom, rtTo)
+  if rtFrom.length > 0 {
+    return emitRefListRetagSite(srcIx, srcSlot, dstSlot, rtFrom, rtTo)
+  }
   // Not a widenable pair: the same slot, or two element reps with no conversion between
   // them. The common case at every delivery, and nothing is owed.
   if rlWidenVariantOf(srcSlot, dstSlot) < 0 { return false }
@@ -21789,6 +21730,68 @@ export function emitRefListWidenSite(
     return emitRefListWidenDeclined(srcIx, srcSlot, dstSlot)
   }
   if emitRefListWidenTop(body, srcSlot, dstSlot) < 0 { return false }
+  true
+}
+
+// A list of union boxes delivered as a `readonly` list whose element holds member `from[k]` only
+// as `to[k]` (D2999): copied, each box rebuilt under the widened member, where nothing writes the
+// source. A written source keeps the shared view, which only a read of such a member misreads.
+function emitRefListRetagSite(
+  srcIx: i32,
+  srcSlot: i32,
+  dstSlot: i32,
+  from: i32[],
+  to: i32[],
+): boolean {
+  if covarValueWriteState(covarRootName(srcIx), covarRootFrame(srcIx)) != 0 {
+    return false
+  }
+  if (
+    srcSlot < 0
+    || dstSlot < 0
+    || srcSlot >= rlWrapIdx.length
+    || dstSlot >= rlWrapIdx.length
+    || srcSlot >= rlBackIdx.length
+    || dstSlot >= rlBackIdx.length
+  ) {
+    emitFailAt(
+      "emitProgram: a union list delivered widened has no interned list type",
+      srcIx,
+    )
+    return false
+  }
+  const srcWrap = rlWrapIdx[srcSlot]
+  const srcBack = rlBackIdx[srcSlot]
+  const dstWrap = rlWrapIdx[dstSlot]
+  const dstBack = rlBackIdx[dstSlot]
+  const sL = widenSrcWrapSlot(srcSlot)
+  const dL = widenDstBackSlot(dstSlot)
+  const iL = widenTmpSlot(0)
+  const nL = widenTmpSlot(1)
+  emitCopyLoopOpen(sL, srcWrap, nL, dstBack, dL, iL)
+  // block { loop { if i >= n br 1; back[i] = retag(src.back[i]); i++; br 0 } }
+  fbLocalGet(dL)
+  fbLocalGet(iL)
+  fbLocalGet(sL)
+  fbStructGet(srcWrap, 0)
+  fbLocalGet(iL)
+  fbArrayGet(srcBack)
+  // Below `len` every element is a box: a `null` member is boxed under its own tag.
+  wU8(212) // ref.as_non_null
+  fbLocalSet(unionAsSlot)
+  let w = 0
+  while w < from.length {
+    if emitWidenRetagArm(from[w], to[w]) < 0 { return false }
+    w = w + 1
+  }
+  fbLocalGet(unionAsSlot)
+  let e = 0
+  while e < from.length {
+    fbEnd()
+    e = e + 1
+  }
+  fbArraySet(dstBack)
+  emitCopyLoopClose(iL, dL, nL, dstWrap)
   true
 }
 
