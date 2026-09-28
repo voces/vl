@@ -46,7 +46,12 @@ import {
   WhileStmt,
   nodeChildren,
 } from "./ast"
-import { numLexFitsI32, numLexIsFloat } from "./emit_bignum"
+import {
+  numLexFitsI32,
+  numLexIs2Pow31,
+  numLexIsFloat,
+  parseI64Pair,
+} from "./emit_bignum"
 import {
   isConstInit,
   nulCloFlag,
@@ -67,7 +72,8 @@ import {
   tyNameOf,
   unwrapParen,
 } from "./emit_base"
-import { globalStmts, scopeSlotOf } from "./emit_state"
+import { globalIndexBySid, globalStmts, scopeSlotOf } from "./emit_state"
+import { sidArrGet, sidOfNode } from "./symbols"
 
 // True if param `name` of function `fnIx` is a nullable function value (`fn | null`,
 // kind 19) — the closure dual of `paramNulRef`.
@@ -477,6 +483,11 @@ export function globalIsNonConst(letIx: i32) {
 // a negated numeric literal, which folds to one constant (`wNegateConstFrom`) — but only into
 // a bare numeric cell, since a union box widens an i64 operand with `i64.extend_i32_s`.
 function letInitIsConst(d: LetDecl): boolean {
+  letInitIsLiteral(d) || constFoldOfLet(d).cfOk
+}
+
+// Whether a module binding's initializer is itself a constant expression, needing no fold.
+function letInitIsLiteral(d: LetDecl): boolean {
   if isConstInit(d.letInit) { return true }
   const u = P.nodes[unwrapParen(d.letInit)]
   if u is Unary {
@@ -489,6 +500,241 @@ function letInitIsConst(d: LetDecl): boolean {
     }
   }
   false
+}
+
+// Whether module `const` `d` is a constant only by `constFoldOfLet`: its cell holds the folded
+// value, and a read of it before its declaration is still guarded as the start function's is.
+export function letInitFoldsExpr(d: LetDecl): boolean {
+  !letInitIsLiteral(d) && constFoldOfLet(d).cfOk
+}
+
+// A compile-time integer: `cfOk` false when the expression does not fold, `cfV` the value
+// (an i32 result sign-extended), `cfN` the nodes the fold visited against its budget.
+export type ConstFold = { cfOk: boolean, cfV: i64, cfN: i32 }
+
+// The nodes one fold may visit, referenced initializers included. A const whose expansion is
+// larger keeps its cell, which bounds a doubling chain like `B = A + A; C = B + B`.
+const CONST_FOLD_BUDGET = 256
+
+function cfNo(): ConstFold { { cfOk: false, cfV: 0 as i64, cfN: 0 } }
+
+// The value of module `const` `d` when its initializer is an integer constant expression of
+// its own type: integer literals, other such consts, `+ - * / % & | ^ << >> >>>`, unary
+// `-`/`~`, and integer casts. Computed with the runtime's own operators, so it wraps and
+// masks shift counts identically; a division that would trap is left to trap.
+export function constFoldOfLet(d: LetDecl): ConstFold {
+  if d.letKw != "const" || d.letInit < 0 { return cfNo() }
+  const tn = nodeTyPrimName(d.letInit)
+  if tn != "i32" && tn != "i64" { return cfNo() }
+  if d.letType >= 0 {
+    if tyNameOf(d.letType) != tn { return cfNo() }
+  }
+  constFoldExpr(d.letInit, tn == "i64", CONST_FOLD_BUDGET)
+}
+
+// `ix` folded at i64 when `wide`, else at i32, visiting at most `budget` nodes. Every
+// operator node must carry the fold's own type, so no operand is widened on the way.
+function constFoldExpr(ix: i32, wide: boolean, budget: i32): ConstFold {
+  if budget <= 0 || ix < 0 { return cfNo() }
+  const e = P.nodes[ix]
+  if e is Paren { return constFoldExpr(e.parInner, wide, budget - 1) }
+  if e is NumLit {
+    if !wide && constFoldLitWide(ix) { return cfNo() }
+    return constFoldLit(e.numText, wide)
+  }
+  const tn = nodeTyPrimName(ix)
+  if e is AsExpr { return constFoldCast(e, tn, wide, budget) }
+  if (wide && tn != "i64") || (!wide && tn != "i32") { return cfNo() }
+  if e is Ident { return constFoldIdent(ix, wide, budget) }
+  if e is Unary {
+    if constFoldNegLit(ix) >= 0 { return constFoldNegLitAt(ix, wide) }
+    const a = constFoldExpr(e.unArg, wide, budget - 1)
+    if !a.cfOk { return a }
+    if e.unOp == "-" {
+      return constFoldWrap((0 as i64) - a.cfV, wide, a.cfN + 1)
+    }
+    if e.unOp == "~" { return constFoldWrap(~a.cfV, wide, a.cfN + 1) }
+    return cfNo()
+  }
+  if e is BinExpr {
+    const l = constFoldExpr(e.binLeft, wide, budget - 1)
+    if !l.cfOk { return l }
+    const r = constFoldExpr(e.binRight, wide, budget - 1 - l.cfN)
+    if !r.cfOk { return r }
+    const n = l.cfN + r.cfN + 1
+    if wide { return constFoldOp64(e.binOp, l.cfV, r.cfV, n) }
+    return constFoldOp32(e.binOp, l.cfV as% i32, r.cfV as% i32, n)
+  }
+  cfNo()
+}
+
+// An integer cast to the fold's own width: `as i64` of an i32 sign-extends, `as% i32` of an
+// i64 keeps the low 32 bits, and a checked narrowing folds only where it cannot fail.
+function constFoldCast(
+  e: AsExpr,
+  tn: string,
+  wide: boolean,
+  budget: i32,
+): ConstFold {
+  if e.asTy != tn || (wide && tn != "i64") || (!wide && tn != "i32") {
+    return cfNo()
+  }
+  // A literal operand, negated or not, is converted from its full magnitude, as the emitter
+  // builds it at the cast's source width.
+  let from = nodeTyPrimName(e.asObj)
+  const lit = P.nodes[unwrapParen(e.asObj)]
+  if lit is NumLit { from = "i64" }
+  const neg = constFoldNegLit(e.asObj)
+  if neg >= 0 { from = "i64" }
+  if from != "i32" && from != "i64" { return cfNo() }
+  let a = cfNo()
+  if neg >= 0 {
+    a = cfStep(constFoldNegLitAt(e.asObj, from == "i64"))
+  } else {
+    a = cfStep(constFoldExpr(e.asObj, from == "i64", budget - 1))
+  }
+  if !a.cfOk || wide || from == "i32" { return a }
+  if e.asMode == "wrap" { return constFoldWrap(a.cfV, false, a.cfN) }
+  const lo = constFoldWrap(a.cfV, false, a.cfN)
+  if lo.cfV != a.cfV { return cfNo() }
+  lo
+}
+
+// The literal under `ix` when `ix` is `-` of an integer literal, through parentheses, else -1.
+function constFoldNegLit(ix: i32): i32 {
+  const u = P.nodes[unwrapParen(ix)]
+  if u is Unary {
+    if u.unOp != "-" { return -1 }
+    const k = unwrapParen(u.unArg)
+    if k < 0 || k >= P.nodes.length { return -1 }
+    const lit = P.nodes[k]
+    if lit is NumLit { return k }
+  }
+  -1
+}
+
+// Whether the integer literal at `ix` is an i64: the emitter builds it as `i64.const`, and a
+// `-` in front of it negates that value, not its low 32 bits.
+function constFoldLitWide(ix: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const lit = P.nodes[ix]
+  if lit is NumLit {
+    return nodeTyPrimName(ix) == "i64" || !numLexFitsI32(lit.numText)
+  }
+  false
+}
+
+// `-literal` at `ix` folded at i64 when `wide`: the negated literal's full value, which at i32
+// is refused unless it fits (`-2147483648` does).
+function constFoldNegLitAt(ix: i32, wide: boolean): ConstFold {
+  const k = constFoldNegLit(ix)
+  if k < 0 { return cfNo() }
+  const lit = P.nodes[k]
+  if lit is NumLit {
+    if !wide && constFoldLitWide(k) && !numLexIs2Pow31(lit.numText) {
+      return cfNo()
+    }
+    const a = constFoldLit(lit.numText, true)
+    if !a.cfOk { return a }
+    return constFoldWrap((0 as i64) - a.cfV, wide, 2)
+  }
+  cfNo()
+}
+
+// `a` with one more visited node charged to it.
+function cfStep(a: ConstFold): ConstFold {
+  { cfOk: a.cfOk, cfV: a.cfV, cfN: a.cfN + 1 }
+}
+
+// An integer literal at the fold's width: at i32 its low 32 bits, the bit pattern the
+// runtime's `i32.const` carries.
+function constFoldLit(text: string, wide: boolean): ConstFold {
+  if numLexIsFloat(text) { return cfNo() }
+  const pr = parseI64Pair(text)
+  const lo = (pr[1] as i64) & (0xffffffff as i64)
+  constFoldWrap(((pr[0] as i64) << (32 as i64)) | lo, wide, 1)
+}
+
+// A read of another module `const`, folded through that const's own initializer.
+function constFoldIdent(ix: i32, wide: boolean, budget: i32): ConstFold {
+  const gi = sidArrGet(globalIndexBySid, sidOfNode(ix))
+  if gi < 0 || gi >= globalStmts.length { return cfNo() }
+  const g = P.nodes[globalStmts[gi]]
+  if g is LetDecl {
+    if g.letKw != "const" || g.letInit < 0 { return cfNo() }
+    return cfStep(constFoldExpr(g.letInit, wide, budget - 1))
+  }
+  cfNo()
+}
+
+// `v` cut to the fold's width: an i32 result is its low 32 bits, sign-extended.
+function constFoldWrap(v: i64, wide: boolean, n: i32): ConstFold {
+  if wide { return { cfOk: true, cfV: v, cfN: n } }
+  { cfOk: true, cfV: (v << (32 as i64)) >> (32 as i64), cfN: n }
+}
+
+// One i32 operator, computed by the operator the runtime lowers it with. A zero divisor and
+// `INT_MIN / -1` trap at run time, so they do not fold.
+function constFoldOp32(op: string, a: i32, b: i32, n: i32): ConstFold {
+  let v = 0
+  if op == "+" {
+    v = a + b
+  } else if op == "-" {
+    v = a - b
+  } else if op == "*" {
+    v = a * b
+  } else if op == "&" {
+    v = a & b
+  } else if op == "|" {
+    v = a | b
+  } else if op == "^" {
+    v = a ^ b
+  } else if op == "<<" {
+    v = a << b
+  } else if op == ">>" {
+    v = a >> b
+  } else if op == ">>>" {
+    v = a >>> b
+  } else if op == "/" || op == "%" {
+    if b == 0 || (b == -1 && a == -2147483647 - 1) { return cfNo() }
+    if op == "/" { v = a / b } else { v = a % b }
+  } else {
+    return cfNo()
+  }
+  { cfOk: true, cfV: v as i64, cfN: n }
+}
+
+// The i64 twin of `constFoldOp32`.
+function constFoldOp64(op: string, a: i64, b: i64, n: i32): ConstFold {
+  let v = 0 as i64
+  if op == "+" {
+    v = a + b
+  } else if op == "-" {
+    v = a - b
+  } else if op == "*" {
+    v = a * b
+  } else if op == "&" {
+    v = a & b
+  } else if op == "|" {
+    v = a | b
+  } else if op == "^" {
+    v = a ^ b
+  } else if op == "<<" {
+    v = a << b
+  } else if op == ">>" {
+    v = a >> b
+  } else if op == ">>>" {
+    v = a >>> b
+  } else if op == "/" || op == "%" {
+    const zero = 0 as i64
+    if b == zero || (b == zero - (1 as i64) && a == (1 as i64) << (63 as i64)) {
+      return cfNo()
+    }
+    if op == "/" { v = a / b } else { v = a % b }
+  } else {
+    return cfNo()
+  }
+  { cfOk: true, cfV: v, cfN: n }
 }
 // Whether the cell at `globalStmts` position `gi` is an immutable wasm global: a `const`
 // whose initializer is a constant expression, so the global section is its only writer.
