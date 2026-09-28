@@ -152,6 +152,16 @@ import {
 } from "./fmt_util"
 import { sidArrGet, sidArrPut, sidLookup, sidOf } from "./symbols"
 import { arenaReplaceNode, isBinOpDecl, isBinOpFuncName } from "./ast"
+import {
+  mkBool,
+  mkBreak,
+  mkCall,
+  mkIndex,
+  mkIsExpr,
+  mkMember,
+  mkWhile,
+  valueIfAdd,
+} from "./ast"
 // The extern manifest: parsed in any module, declared here, imported by the emitter.
 import {
   extDeclLink,
@@ -3669,6 +3679,12 @@ let intMatchHead: {[i32]: boolean} = Map()
 // The scrutinee nodes `desugarMatchAt` shared across a chain's arm tests: one node per `match`,
 // so its recorded type is the last arm's and says nothing about any one test (`matchScrutAt`).
 let matchScrutNode: {[i32]: boolean} = Map()
+// The `Index` and `Member` nodes an assignment writes through, which the list-union read
+// rewrite leaves alone.
+let luWriteTgt: {[i32]: boolean} = Map()
+// The source position of each loop binding the list-union rewrite minted: the iterable's node,
+// which precedes every read of the binding in the body, though the binding is minted later.
+let luDeclPos: {[i32]: i32} = Map()
 // D951 — the `is`-test type sidecar: the arena type an `IsExpr`'s check type resolves to, keyed by
 // the `IsExpr` node, so the emitter's narrowing stack banks the answer instead of re-deriving the
 // narrowed type from the tested spelling. Sized with `nodeTyIx` and read through `isVarTyIxOf`; a
@@ -4675,6 +4691,8 @@ export function initChecker() {
   narIfEnds = Map()
   isTyColCap = 0
   isVarTyIxCap = 0
+  luWriteTgt = Map()
+  luDeclPos = Map()
   pgVoid = []
   joinHead = []
   joinName = []
@@ -28379,6 +28397,11 @@ function listWidenWalk(
     return listWidenWalk(x, src, d.nInner, depth - 1, true)
   }
   if d is TyUnion {
+    // A union source is delivered member by member, each to the member that accepts it, so
+    // `f64[] | i32[]` into itself is not refused for `i32[]` meeting `f64[]` first (D2877).
+    if T.tys[src] is TyUnion {
+      return listWidenFromSrc(x, src, dst, depth, underNul)
+    }
     return listWidenIntoUnion(x, src, d.uMembers, depth, underNul)
   }
   listWidenFromSrc(x, src, dst, depth, underNul)
@@ -49286,6 +49309,7 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
     const wtgt = P.nodes[n.binLeft]
     if wtgt is Ident { daWriteTarget = n.binLeft }
     if wtgt is Member { getWriteTarget = n.binLeft }
+    if wtgt is Index || wtgt is Member { luWriteTgt.set(n.binLeft, true) }
   }
   let lt = checkNode(n.binLeft)
   daWriteTarget = savedWriteTarget
@@ -55225,6 +55249,330 @@ function checkProgramEndGetters() {
   0
 }
 
+// ── a union of lists (D2874) ────────────────────────────────────────────────
+// `.length`, `u[i]` and `for v in u` over a union whose every member is a list. The real pass
+// rewrites each site in place into an `is` chain over a `const` holding the receiver, so it
+// lowers as the narrowed spelling does; a quiet pass may see a partial union and only types it.
+
+// Whether `recv` is a receiver the rewrite itself bound. An arm reading one as a union is an
+// `is` test that did not narrow, which a second rewrite would only repeat without end.
+function luOwnRecv(recv: i32): boolean {
+  if recv < 0 { return false }
+  const r = P.nodes[recv]
+  if r is Ident { return r.identName.slice(0, 3) == "$lu" }
+  false
+}
+
+// The members of `ty` when it is a union of two or more lists, otherwise empty. Not over a
+// type parameter's list (D2876), a readonly list (D2887) or a literal element (D2886), whose
+// narrowed reads do not lower; nor under a pinned re-check, whose body instances share.
+function luMembers(ty: i32): i32[] {
+  const none: i32[] = []
+  if ty < 0 || monoRecheckDepth > 0 { return none }
+  const t = T.tys[ty]
+  if t is TyUnion {
+    if t.uMembers.length < 2 { return none }
+    let i = 0
+    while i < t.uMembers.length {
+      const m = t.uMembers[i]
+      if m < 0 { return none }
+      const mt = T.tys[m]
+      if mt is TyArray {
+        if mt.aElem < 0 || mt.aRead == 1 || tyHasTyVar(m) { return none }
+        if luHasLit(mt.aElem, 8) { return none }
+      } else {
+        return none
+      }
+      i = i + 1
+    }
+    return t.uMembers
+  }
+  none
+}
+
+// Whether `ty` is or holds a literal type, through a nullable or a union.
+function luHasLit(ty: i32, depth: i32): boolean {
+  if ty < 0 || depth <= 0 { return false }
+  const t = T.tys[ty]
+  match t {
+    TyLit => {
+      true
+    }
+    TyNullable => {
+      luHasLit(t.nInner, depth - 1)
+    }
+    TyUnion => {
+      let hit = false
+      let i = 0
+      while i < t.uMembers.length {
+        if luHasLit(t.uMembers[i], depth - 1) { hit = true }
+        i = i + 1
+      }
+      hit
+    }
+    // A composite's literal sits inside its own container, which the element read keeps.
+    TyPrim | TyErr | TyObj | TyVar | TyNeg | TyMap | TyArray | TyFunc => {
+      false
+    }
+  }
+}
+
+// The union of the members' element types, each read at its value type, kept apart rather
+// than widened (`f64[] | i32[]` reads `f64 | i32`). -1 when the elements have no union.
+function luElemTy(ms: i32[]): i32 {
+  let e = -1
+  let i = 0
+  while i < ms.length {
+    const a = T.tys[ms[i]]
+    if a is TyArray {
+      const v = arrElemValueTy(a.aElem)
+      if v < 0 { return -1 }
+      if e < 0 { e = v } else { e = joinVariantTys(e, v) }
+    }
+    i = i + 1
+  }
+  if e == TY_ERR {
+    joinClashMsg = ""
+    return -1
+  }
+  e
+}
+
+// The spelling the rewrite names `ty` by in an `is` test or an annotation: the first of its
+// display name and its emit name that resolves back to `ty`, or "" when neither does. A failed
+// resolution's diagnostics are dropped, since the answer is the whole point of asking.
+function luSpell(ty: i32): string {
+  const dn = luPipeTight(tyToStr(ty))
+  if luSpellsAs(dn, ty) { return dn }
+  const en = tyToEmitName(ty)
+  if en != "" && luSpellsAs(en, ty) { return en }
+  ""
+}
+
+// `s` with the spaces around each ` | ` dropped, the form an annotation's union name takes.
+function luPipeTight(s: string): string {
+  let out = ""
+  let i = 0
+  while i < s.length {
+    if i + 2 < s.length && s[i] == ' ' && s[i + 1] == '|' && s[i + 2] == ' ' {
+      out = out + "|"
+      i = i + 3
+    } else {
+      out = out + s.slice(i, i + 1)
+      i = i + 1
+    }
+  }
+  out
+}
+
+function luSpellsAs(name: string, ty: i32): boolean {
+  const mark = T.diags.length
+  const back = nameToTy(name)
+  while T.diags.length > mark { T.diags.pop() }
+  back >= 0 && (tySame(back, ty) || tyEq(back, ty))
+}
+
+// Whether the union `u` and each of its members `ms` have a spelling. The receiver's `const`
+// is annotated at `u` itself, since an un-annotated copy of a null-narrowed union reads its
+// complement arm at the wrong rep (D2875).
+function luAllSpell(u: i32, ms: i32[]): boolean {
+  if luSpell(u) == "" { return false }
+  let i = 0
+  while i < ms.length {
+    if luSpell(ms[i]) == "" { return false }
+    i = i + 1
+  }
+  true
+}
+
+// Where declaration `ix` stands in source order: its own index, or for a loop binding the
+// list-union rewrite minted after its body, the position of the loop's iterable.
+export function luDeclPosOf(ix: i32): i32 { luDeclPos[ix] ?? ix }
+
+// Node `n`, minted by the rewrite, anchored at the rewritten site's token.
+function luAt(n: i32, site: i32): i32 {
+  adoptNodeTok(n, site)
+  n
+}
+
+function luRef(name: string, site: i32, pos: i32): i32 {
+  luAt(mkIdent(name, pos), site)
+}
+
+// `kw name[: ann] = init`, where `ann` is a type rendered to its spelling (-1: none).
+function luDecl(
+  kw: string,
+  name: string,
+  ann: i32,
+  init: i32,
+  site: i32,
+  pos: i32,
+): i32 {
+  let tr = -1
+  if ann >= 0 { tr = luAt(mkTypeRef(luSpell(ann), pos), site) }
+  luAt(mkLet(kw, name, tr, init, pos), site)
+}
+
+// One arm's value over list `recv`: its `.length`, or with an index its element, delivered
+// through a `const` at the element union so each arm boxes into the same rep.
+function luArm(recv: string, idx: string, elem: i32, site: i32, pos: i32): i32 {
+  const stmts: i32[] = []
+  if idx == "" {
+    stmts.push(luAt(mkMember(luRef(recv, site, pos), "length", pos), site))
+  } else {
+    const rd = luAt(
+      mkIndex(luRef(recv, site, pos), luRef(idx, site, pos), pos),
+      site,
+    )
+    const tmp = "$le" + i32ToStr(site)
+    stmts.push(luDecl("const", tmp, elem, rd, site, pos))
+    stmts.push(luRef(tmp, site, pos))
+  }
+  luAt(mkBlock(stmts, pos), site)
+}
+
+// The `is` chain over `recv`'s members from `k` on, the last member being the bare `else`.
+function luChain(
+  ms: i32[],
+  k: i32,
+  recv: string,
+  idx: string,
+  elem: i32,
+  site: i32,
+  pos: i32,
+): i32 {
+  const arm = luArm(recv, idx, elem, site, pos)
+  if k >= ms.length - 1 { return arm }
+  const test = luAt(mkIsExpr(luRef(recv, site, pos), luSpell(ms[k]), pos), site)
+  const rest = luChain(ms, k + 1, recv, idx, elem, site, pos)
+  luAt(mkIf(test, arm, rest, pos), site)
+}
+
+// Sizes the node-keyed columns to the nodes the rewrite minted, so the real pass records them.
+function luGrow() {
+  while nodeTyIx.length < P.nodes.length { nodeTyIx.push(-1) }
+  isTyColCap = P.nodes.length
+  isVarTyIxCap = P.nodes.length
+  0
+}
+
+// Overwrites `site` with `if true { stmts } else { __trap__() }`, the value form of a block.
+// The condition has no position, which is how the constant-condition lint tells it is not the author's.
+function luValueAt(site: i32, stmts: i32[], pos: i32) {
+  const cond = luAt(mkBool(1, -1), site)
+  const thenB = luAt(mkBlock(stmts, pos), site)
+  const none: i32[] = []
+  const trap = luAt(mkCall(luRef("__trap__", site, pos), none, pos), site)
+  const tl: i32[] = []
+  tl.push(trap)
+  const elseB = luAt(mkBlock(tl, pos), site)
+  const w: Node = { ifCond: cond, ifThen: thenB, ifElse: elseB, pos: pos }
+  arenaSetNode(site, w)
+  valueIfAdd(site)
+  luGrow()
+}
+
+// `recv.length` over a union of lists: i32, or -1 when `objTy` is not one the rewrite names.
+function luLengthAt(n: Member, ix: i32, objTy: i32): i32 {
+  if luOwnRecv(n.memObj) || (luWriteTgt[ix] ?? false) { return -1 }
+  const ms = luMembers(objTy)
+  if ms.length == 0 { return -1 }
+  if inferQuiet { return symMem(ix, TY_I32) }
+  if !luAllSpell(objTy, ms) { return -1 }
+  const recv = "$lu" + i32ToStr(ix)
+  const stmts: i32[] = []
+  stmts.push(luDecl("const", recv, objTy, n.memObj, ix, n.pos))
+  stmts.push(luChain(ms, 0, recv, "", -1, ix, n.pos))
+  luValueAt(ix, stmts, n.pos)
+  checkNode(ix)
+}
+
+// `recv[i]` read over a union of lists: the element union, or -1 as `luLengthAt`. A write
+// through the index is not rewritten, since storing one arm's element in another is unsound.
+function luIndexAt(n: Index, ix: i32, arrTy: i32): i32 {
+  if luWriteTgt[ix] ?? false { return -1 }
+  if luOwnRecv(n.idxArr) { return -1 }
+  const ms = luMembers(arrTy)
+  if ms.length == 0 { return -1 }
+  const elem = luElemTy(ms)
+  if elem < 0 { return -1 }
+  if inferQuiet { return elem }
+  if !luAllSpell(arrTy, ms) || luSpell(elem) == "" { return -1 }
+  const recv = "$lu" + i32ToStr(ix)
+  const idx = "$li" + i32ToStr(ix)
+  const stmts: i32[] = []
+  stmts.push(luDecl("const", recv, arrTy, n.idxArr, ix, n.pos))
+  stmts.push(luDecl("const", idx, -1, n.idxIndex, ix, n.pos))
+  stmts.push(luChain(ms, 0, recv, idx, elem, ix, n.pos))
+  luValueAt(ix, stmts, n.pos)
+  checkNode(ix)
+}
+
+// `for v[, i] in recv { body }` over a union of lists, rewritten in place to
+// `{ const $lu = recv; let $li = 0; while true { if $li >= <len> { break }; let i = $li;
+// $li = $li + 1; let v: E = <$lu[i]>; body } }`, which re-reads the length every pass as a
+// list's own loop does. -1 when a member or the element union has no spelling.
+function luForInAt(n: ForIn, ix: i32, iterTy: i32, ms: i32[], elem: i32): i32 {
+  if !luAllSpell(iterTy, ms) || luSpell(elem) == "" { return -1 }
+  const pos = n.pos
+  const recv = "$lu" + i32ToStr(ix)
+  const ctr = "$li" + i32ToStr(ix)
+  let at = n.fiVar2
+  if at == "" { at = "$lk" + i32ToStr(ix) }
+  const outer: i32[] = []
+  outer.push(luDecl("const", recv, iterTy, n.fiIter, ix, pos))
+  outer.push(luDecl("let", ctr, -1, luAt(mkNum("0", pos), ix), ix, pos))
+  const lenCond = luAt(
+    mkBinary(
+      ">=",
+      luRef(ctr, ix, pos),
+      valueIfAdd(luChain(ms, 0, recv, "", -1, ix, pos)),
+      pos,
+    ),
+    ix,
+  )
+  const brk: i32[] = []
+  brk.push(luAt(mkBreak("break", "", pos), ix))
+  const loop: i32[] = []
+  loop.push(luAt(mkIf(lenCond, luAt(mkBlock(brk, pos), ix), -1, pos), ix))
+  const atDecl = luDecl("let", at, -1, luRef(ctr, ix, pos), ix, pos)
+  luDeclPos.set(atDecl, n.fiIter)
+  loop.push(atDecl)
+  const inc = luAt(
+    mkBinary("+", luRef(ctr, ix, pos), luAt(mkNum("1", pos), ix), pos),
+    ix,
+  )
+  loop.push(luAt(mkBinary("=", luRef(ctr, ix, pos), inc, pos), ix))
+  const val = valueIfAdd(luChain(ms, 0, recv, at, elem, ix, pos))
+  const vDecl = luDecl("let", n.fiVar, elem, val, ix, pos)
+  luDeclPos.set(vDecl, n.fiIter)
+  loop.push(vDecl)
+  const bn = P.nodes[n.fiBody]
+  if bn is Block {
+    let i = 0
+    while i < bn.blkStmts.length {
+      loop.push(bn.blkStmts[i])
+      i = i + 1
+    }
+  } else {
+    loop.push(n.fiBody)
+  }
+  const cond = luAt(mkBool(1, -1), ix)
+  const body = luAt(mkBlock(loop, pos), ix)
+  outer.push(luAt(mkWhile(cond, body, n.fiLabel, pos), ix))
+  // `if true { … }` rather than a bare block, the statement form every walk descends.
+  const once = luAt(mkBool(1, -1), ix)
+  const w: Node = {
+    ifCond: once,
+    ifThen: luAt(mkBlock(outer, pos), ix),
+    ifElse: -1,
+    pos: pos,
+  }
+  arenaSetNode(ix, w)
+  luGrow()
+  checkNode(ix)
+}
+
 // ── member `o.field` ───────────────────────────────────────────────────────
 
 // Extracted from `checkNodeReal`'s `Member` arm (C3: thin the dispatcher).
@@ -55276,6 +55624,10 @@ function checkMemberNode(n: Member, ix: i32) {
   if ot is TyUnion {
     const sf = sharedUnionFieldTy(ot, n.memProp)
     if sf >= 0 { return symMem(ix, sf) }
+    if n.memProp == "length" {
+      const lul = luLengthAt(n, ix, objTy)
+      if lul >= 0 { return lul }
+    }
     // The field is on some but not all members — unsafe until narrowed to a member that
     // has it. Names the offending member so a reader need not diff a four-arm union by hand.
     memberFloorErr(objTy, n.memProp, ix)
@@ -55546,6 +55898,25 @@ function checkIndexNode(n: Index, ix: i32) {
   }
   if !assignable(idxTy, TY_I32) {
     tErr("array index must be i32, got " + tyToStr(idxTy), n.idxIndex)
+  }
+  if at is TyUnion {
+    // An index that is not an `i32` is already reported above.
+    if !assignable(idxTy, TY_I32) && luMembers(arrTy).length > 0 {
+      return TY_ERR
+    }
+    const lui = luIndexAt(n, ix, arrTy)
+    if lui >= 0 { return lui }
+    // A read rewrites; a write is refused by design, since the stored value would have to
+    // fit every member's element at once.
+    if (luWriteTgt[ix] ?? false) && luMembers(arrTy).length > 0 {
+      tErr(
+        "cannot write through an index of "
+          + tyToStr(arrTy)
+          + ": the value would have to fit every member's element — narrow with `is` first",
+        ix,
+      )
+      return TY_ERR
+    }
   }
   if at is TyArray {
     // The element's value type — a `u8[]` read is an `i32`, never a `u8`. Same shape as the
@@ -56746,10 +57117,22 @@ function checkForInNode(n: ForIn, ix: i32) {
   crLoopPreRetire(ix)
   let iterTy = checkNode(n.fiIter)
   if iterTy >= 0 { iterTy = strLitRecvTy(iterTy) }
-  const elemTy = forInBindTy(iterTy, false)
-  const elem2Ty = forInBindTy(iterTy, true)
+  let elemTy = forInBindTy(iterTy, false)
+  let elem2Ty = forInBindTy(iterTy, true)
   const it = T.tys[iterTy]
-  if it is TyArray || it is TyMap || isStringTy(iterTy) || it is TyErr {
+  const luMs = luMembers(iterTy)
+  const luElem = if luMs.length > 0 { luElemTy(luMs) } else { -1 }
+  if luElem >= 0 {
+    if !inferQuiet {
+      const luf = luForInAt(n, ix, iterTy, luMs, luElem)
+      if luf >= 0 { return TY_VOID }
+    }
+    elemTy = luElem
+    elem2Ty = TY_I32
+  }
+  if luElem >= 0 && inferQuiet {
+    // Typed as the rewrite will type it; the real pass rewrites the loop.
+  } else if it is TyArray || it is TyMap || isStringTy(iterTy) || it is TyErr {
     // Iterable (or already reported): `forInBindTy` has typed both bindings.
   } else if it is TyObj {
     // A struct is a NOMINAL record whose fields have different types, so a loop variable over
