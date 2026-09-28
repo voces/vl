@@ -1771,19 +1771,17 @@ function monoIfArmsPinJoin(ix: i32, raw: i32, bN: string[], bT: i32[]): i32 {
   // A concrete join (`5` first) is re-asked only where an arm's own type names a parameter.
   if !(T.tys[raw] is TyVar) && !monoIfArmHasTyVar(ix) { return -1 }
   const ts: i32[] = []
-  let cur = ix
-  while cur >= 0 {
-    const c = P.nodes[cur]
-    cur = -1
-    if c is IfStmt {
-      if monoArmPinnedTy(c.ifThen, bN, bT, ts) < 0 { return -1 }
-      if c.ifElse < 0 { return -1 }
-      if P.nodes[c.ifElse] is IfStmt { cur = c.ifElse }
-      else if monoArmPinnedTy(c.ifElse, bN, bT, ts) < 0 { return -1 }
-    }
-  }
-  const j = joinPinnedArmTys(ts)
+  const got = monoChainPinnedTys(ix, bN, bT, ts)
+  if got < 0 { return -1 }
+  let j = joinPinnedArmTys(ts)
   if j < 0 || j >= T.tys.length || tyHasTyVar(j) { return -1 }
+  // A nested arm joins into its enclosing box, which only a union join builds.
+  if got == 1 && !(T.tys[j] is TyUnion) { return -1 }
+  if T.tys[j] is TyUnion && monoPinRetTy >= 0 && monoPinLetReaches {
+    // A join the body returns is the return's own box, whose tags are positional (D2912).
+    if !monoTySameMembers(j, monoPinRetTy) { return -1 }
+    j = monoPinRetTy
+  }
   if T.tys[j] is TyUnion {
     const name = valueUnionRetName(j)
     if name == "" || monoRegisterPinUnion(name) < 0 { return -1 }
@@ -1815,8 +1813,35 @@ function monoArmTyHasTyVar(blockIx: i32): boolean {
   vt >= 0 && vt < T.tys.length && tyHasTyVar(vt)
 }
 
-// Appends the pinned type of arm block `blockIx`'s tail value to `out`; 0, or -1 when it has
-// none. An arm that never completes adds nothing.
+// Whether `monoArmPinnedTy` is inside a nested arm's own chain.
+let monoArmNested = false
+
+// Appends the pinned types of every arm along the `if` chain at `ix` to `out`: 0, 1 when an arm
+// is itself an `if`, or -1 when an arm has none or the chain has no `else`.
+function monoChainPinnedTys(ix: i32, bN: string[], bT: i32[], out: i32[]): i32 {
+  let nested = 0
+  let cur = ix
+  while cur >= 0 {
+    const c = P.nodes[cur]
+    cur = -1
+    if c is IfStmt {
+      const rt = monoArmPinnedTy(c.ifThen, bN, bT, out)
+      if rt < 0 || c.ifElse < 0 { return -1 }
+      if rt == 1 { nested = 1 }
+      if P.nodes[c.ifElse] is IfStmt {
+        cur = c.ifElse
+      } else {
+        const re = monoArmPinnedTy(c.ifElse, bN, bT, out)
+        if re < 0 { return -1 }
+        if re == 1 { nested = 1 }
+      }
+    }
+  }
+  nested
+}
+
+// Appends the pinned type of arm block `blockIx`'s tail value to `out`; 0, 1 for an arm that is
+// an `if`, or -1 when it has none. An arm that never completes adds nothing.
 function monoArmPinnedTy(
   blockIx: i32,
   bN: string[],
@@ -1824,7 +1849,17 @@ function monoArmPinnedTy(
   out: i32[],
 ): i32 {
   const v = ifArmValueExpr(blockIx)
-  if v < 0 || P.nodes[unwrapParen(v)] is IfStmt { return -1 }
+  if v < 0 { return -1 }
+  // An arm whose value is an `if` adds its own arms, as the union lowering joins them (1). One
+  // level only: a deeper nest is left to its template type.
+  if P.nodes[unwrapParen(v)] is IfStmt {
+    if monoArmNested { return -1 }
+    monoArmNested = true
+    const rc = monoChainPinnedTys(unwrapParen(v), bN, bT, out)
+    monoArmNested = false
+    if rc < 0 { return -1 }
+    return 1
+  }
   const vt = nodeTyIxOf(v)
   if vt < 0 || vt >= T.tys.length { return -1 }
   const t = T.tys[vt]
@@ -2903,7 +2938,10 @@ function monoPinBodyLambdasRaw(
   }
   if n is LetDecl {
     monoPinSink = n.letType < 0 && !(monoPinUnsafeNames.get(n.letName) ?? false)
+    const savedReach = monoPinLetReaches
+    monoPinLetReaches = monoPinReachNames.get(n.letName) ?? false
     const ci = monoPinValueLambda(n.letInit, typarams, tvN, tvV, bN, bT)
+    monoPinLetReaches = savedReach
     monoPinSink = false
     // A binding inside an expression (an `if` arm's prelude), which the statement clone does
     // not reach, has its annotation substituted here.
@@ -3027,8 +3065,12 @@ function monoPinCoalJoin(ix: i32, rb: i32, bN: string[], bT: i32[]): i32 {
   const pr = monoPinArmSubst(rt, bN, bT)
   if pl < 0 || pr < 0 { return rb }
   const ts: i32[] = [nonNullTy(pl), pr]
-  const j = joinPinnedArmTys(ts)
+  let j = joinPinnedArmTys(ts)
   if j < 0 || j >= T.tys.length || tyHasTyVar(j) { return rb }
+  if T.tys[j] is TyUnion && monoPinRetTy >= 0 && monoPinLetReaches {
+    if !monoTySameMembers(j, monoPinRetTy) { return rb }
+    j = monoPinRetTy
+  }
   const cur = nodeTyIxOf(rb)
   if cur == j || (cur >= 0 && tyEq(cur, j)) { return rb }
   if T.tys[j] is TyUnion {
@@ -3191,6 +3233,275 @@ function monoPinArmExtends(bN: string[], bT: i32[]): boolean {
   true
 }
 
+// Whether the value-atom box `rty` an instance's return would be annotated with cannot carry a
+// join its body `body` binds (`monoPinBodyJoinUncovered`), read as the walk will read it.
+function monoPinBoxUncovered(
+  body: i32,
+  rty: i32,
+  params: i32[],
+  tyCol: i32[],
+  bN: string[],
+  bT: i32[],
+): boolean {
+  monoPinReachNames = Map()
+  monoPinNoteReach(body)
+  // A reaching name declared twice is not told apart by name, so the box is kept.
+  if monoPinReachShadowed(body) {
+    monoPinReachNames = Map()
+    return false
+  }
+  monoPinArmBinds(params, tyCol, bN, bT)
+  monoPinUnsafeNames = Map()
+  monoPinRetBox = !tyBearsNull(rty)
+  monoPinNoteUnsafeBody(body)
+  monoPinRetBox = false
+  monoPinBodyJoinUncovered(body, rty, bN, bT)
+}
+
+// Whether a name in `monoPinReachNames` is declared more than once under `body`.
+function monoPinReachShadowed(body: i32): boolean {
+  const seen: {[string]: i32} = Map()
+  monoPinCountDecls(body, seen) > 0
+}
+
+// Counts every `let`/`const` declaration name under `ix` into `seen`; how many reaching names
+// it finds declared a second time.
+function monoPinCountDecls(ix: i32, seen: {[string]: i32}): i32 {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const n = P.nodes[ix]
+  let dup = 0
+  if n is LetDecl {
+    const c = (seen.get(n.letName) ?? 0) + 1
+    // arena-tick exempt: a per-call name count the box decision reads, no pass's input.
+    seen[n.letName] = c
+    if c > 1 && (monoPinReachNames.get(n.letName) ?? false) { dup = 1 }
+  }
+  let cur = ix
+  while cur >= 0 {
+    const kids = nodeSpineChildren(cur)
+    let i = 0
+    while i < kids.length {
+      dup = dup + monoPinCountDecls(kids[i], seen)
+      i = i + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  dup
+}
+
+// The bindings whose value reaches the instance's return: a name the body returns, and a name
+// such a binding is initialized from. Only these can put a join's rep into the return box.
+let monoPinReachNames: {[string]: boolean} = Map()
+
+// Whether the binding whose initializer the per-instance walk is in reaches the return.
+let monoPinLetReaches = false
+
+function monoPinNoteReach(body: i32) {
+  const b = P.nodes[body]
+  if b is Block {
+    if b.blkStmts.length > 0 {
+      monoPinNoteReachExpr(b.blkStmts[b.blkStmts.length - 1])
+    }
+  }
+  monoPinNoteReturns(body)
+  // Follow initializers that are bare names, to a bound depth.
+  let round = 0
+  while round < 8 {
+    if !monoPinReachStep(body) { return 0 }
+    round = round + 1
+  }
+  0
+}
+
+// Records a bare name `ix` hands out as reaching the return.
+function monoPinNoteReachExpr(ix: i32) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const u = unwrapParen(ix)
+  if u < 0 || u >= P.nodes.length { return 0 }
+  const n = P.nodes[u]
+  // arena-tick exempt: a per-instance name set the box decision reads, no pass's input.
+  if n is Ident { monoPinReachNames[n.identName] = true }
+  0
+}
+
+// Records the operand of every `return` under `ix` outside a nested function.
+function monoPinNoteReturns(ix: i32) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const n = P.nodes[ix]
+  if n is FuncDecl { return 0 }
+  if n is RetStmt { return monoPinNoteReachExpr(n.retArg) }
+  let cur = ix
+  while cur >= 0 {
+    const kids = nodeSpineChildren(cur)
+    let i = 0
+    while i < kids.length {
+      monoPinNoteReturns(kids[i])
+      i = i + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  0
+}
+
+// One pass adding the name a reaching binding is initialized from; whether it added any.
+function monoPinReachStep(ix: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = P.nodes[ix]
+  if n is FuncDecl { return false }
+  let grew = false
+  if n is LetDecl {
+    if (monoPinReachNames.get(n.letName) ?? false) && n.letInit >= 0 {
+      const u = unwrapParen(n.letInit)
+      if u >= 0 && u < P.nodes.length {
+        const iu = P.nodes[u]
+        if iu is Ident {
+          if !(monoPinReachNames.get(iu.identName) ?? false) {
+            // arena-tick exempt: a per-instance name set the box decision reads, no pass's input.
+            monoPinReachNames[iu.identName] = true
+            grew = true
+          }
+        }
+      }
+    }
+  }
+  let cur = ix
+  while cur >= 0 {
+    const kids = nodeSpineChildren(cur)
+    let i = 0
+    while i < kids.length {
+      if monoPinReachStep(kids[i]) { grew = true }
+      i = i + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  grew
+}
+
+// Whether a binding under `ix` (outside a nested function) that reaches the return joins, at the
+// binding `bN`/`bT`, other than its template type where the instance cannot re-type it to the
+// return box `retTy` (read outside a sink, or other members): the box would carry the wrong
+// rep, so it is withheld and the return refuses (D2912).
+function monoPinBodyJoinUncovered(
+  ix: i32,
+  retTy: i32,
+  bN: string[],
+  bT: i32[],
+): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = P.nodes[ix]
+  if n is FuncDecl { return false }
+  if n is LetDecl {
+    if (
+      n.letType < 0
+      && n.letInit >= 0
+      && (monoPinReachNames.get(n.letName) ?? false)
+    ) {
+      const init = unwrapParen(n.letInit)
+      if init >= 0 && init < P.nodes.length {
+        const j = monoJoinPinnedAt(init, bN, bT)
+        if j != -1 {
+          if j < -1 { return true }
+          const isUnsafe = monoPinUnsafeNames.get(n.letName) ?? false
+          if (
+            isUnsafe
+            || !(T.tys[j] is TyUnion)
+            || !monoTySameMembers(j, retTy)
+          ) {
+            return true
+          }
+        }
+      }
+    }
+  }
+  let cur = ix
+  while cur >= 0 {
+    const kids = nodeSpineChildren(cur)
+    let i = 0
+    while i < kids.length {
+      if monoPinBodyJoinUncovered(kids[i], retTy, bN, bT) { return true }
+      i = i + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  false
+}
+
+// The join of value join `ix` (an `if`, a `??`, a `match`) at the binding `bN`/`bT` when it
+// differs from its template type there; -1 when it agrees or `ix` is no join, and -2 when an
+// arm has no pinned type to tell.
+function monoJoinPinnedAt(ix: i32, bN: string[], bT: i32[]): i32 {
+  if ix < 0 || ix >= P.nodes.length { return -1 }
+  const n = P.nodes[ix]
+  const ts: i32[] = []
+  if n is IfStmt {
+    if monoChainPinnedTys(ix, bN, bT, ts) < 0 { return -2 }
+  } else if monoIsCoalesce(ix) {
+    const b = P.nodes[ix]
+    if b is BinExpr {
+      const pl = monoPinArmSubst(nodeTyIxOf(b.binLeft), bN, bT)
+      const pr = monoPinArmSubst(nodeTyIxOf(b.binRight), bN, bT)
+      if pl < 0 || pr < 0 { return -2 }
+      ts.push(nonNullTy(pl))
+      ts.push(pr)
+    }
+  } else {
+    return monoMatchPinnedAt(ix)
+  }
+  const j = joinPinnedArmTys(ts)
+  const pj = monoPinnedTyOf(ix, bN, bT)
+  if j < 0 || pj < 0 || tyHasTyVar(pj) { return -2 }
+  if j == pj || tyEq(j, pj) || monoTySameMembers(j, pj) { return -1 }
+  j
+}
+
+function monoIsCoalesce(ix: i32): boolean {
+  const n = P.nodes[ix]
+  if n is BinExpr { return n.binOp == "??" && n.binCompound == "" }
+  false
+}
+
+// A `match` over a type parameter's values is not re-typed per pin: -2 when its recorded type
+// names one, else -1.
+function monoMatchPinnedAt(ix: i32): i32 {
+  const n = P.nodes[ix]
+  if n is MatchExpr {
+    const t = nodeTyIxOf(ix)
+    if t >= 0 && t < T.tys.length && tyHasTyVar(t) { return -2 }
+  }
+  -1
+}
+
+// Whether the instance being walked returns an annotated union box, so a binding its body
+// returns by name is delivered as that union too (D2912).
+let monoPinRetBox = false
+
+// That box's type during the instance's body walk, else -1.
+let monoPinRetTy = -1
+
+// Whether unions `a` and `b` hold the same members, in any order.
+function monoTySameMembers(a: i32, b: i32): boolean {
+  const ta = T.tys[a]
+  const tb = T.tys[b]
+  if ta is TyUnion {
+    if tb is TyUnion {
+      if ta.uMembers.length != tb.uMembers.length { return false }
+      let i = 0
+      while i < ta.uMembers.length {
+        let hit = false
+        let k = 0
+        while k < tb.uMembers.length && !hit {
+          if tyEq(ta.uMembers[i], tb.uMembers[k]) { hit = true }
+          k = k + 1
+        }
+        if !hit { return false }
+        i = i + 1
+      }
+      return true
+    }
+  }
+  false
+}
+
 // Records in `monoPinUnsafeNames` every name read under `ix` outside a sink.
 function monoPinNoteUnsafe(ix: i32) {
   let cur = ix
@@ -3201,7 +3512,10 @@ function monoPinNoteUnsafe(ix: i32) {
       monoPinUnsafeNames[n.identName] = true
       return 0
     }
-    const safe = monoPinSinkKids(cur)
+    // A nested function's returns are its own, not the instance's.
+    const savedRB = monoPinRetBox
+    if n is FuncDecl { monoPinRetBox = false }
+    const safe = monoPinSinkKids(cur) || monoPinIsBoxReturn(cur)
     const kids = nodeSpineChildren(cur)
     let i = 0
     while i < kids.length {
@@ -3211,9 +3525,37 @@ function monoPinNoteUnsafe(ix: i32) {
       }
       i = i + 1
     }
+    monoPinRetBox = savedRB
     cur = elseIfLink(cur)
   }
   0
+}
+
+// `monoPinNoteUnsafe` over an instance body, whose tail name is its return (`monoPinRetBox`).
+function monoPinNoteUnsafeBody(body: i32) {
+  const b = P.nodes[body]
+  if b is Block {
+    if monoPinRetBox && b.blkStmts.length > 0 {
+      const last = b.blkStmts.length - 1
+      if P.nodes[unwrapParen(b.blkStmts[last])] is Ident {
+        let i = 0
+        while i < last {
+          monoPinNoteUnsafe(b.blkStmts[i])
+          i = i + 1
+        }
+        return 0
+      }
+    }
+  }
+  monoPinNoteUnsafe(body)
+}
+
+// Whether `ix` hands its operand out as the instance's union-box return: a `return x`.
+function monoPinIsBoxReturn(ix: i32): boolean {
+  if !monoPinRetBox { return false }
+  const n = P.nodes[ix]
+  if n is RetStmt { return true }
+  false
 }
 
 // Whether the operands of expression `ix` are sinks: a `print` call's. An `==` is not one,
@@ -6399,6 +6741,14 @@ function monoMakeInstance(
             && T.tys[rty] is TyUnion
             && !tyIsLitUnion(rty)
             && !monoTyHoldsRefArm(rty)
+            && !monoPinBoxUncovered(
+            fn.fnBody,
+            rty,
+            params,
+            letTyCol,
+            letBN,
+            letBT,
+          )
           if rty >= 0 && (tyBearsNull(rty) || rtyList || rtyBox) {
             const rnm = monoPinUnionName(tyToEmitName(rty))
             if rnm != "" {
@@ -6460,8 +6810,25 @@ function monoMakeInstance(
     monoInstIsFirst = count == 0
     monoCgcLamNames = monoInstLamNames(instBody0)
     monoPinUnsafeNames = Map()
-    monoPinNoteUnsafe(instBody0)
+    monoPinRetBox = false
+    if fn.fnRet < 0 && nret >= 0 {
+      const nrb = nodeTyIxOf(nret)
+      // A null-bearing box is left out: its caller reads the call at the template's type.
+      monoPinRetBox = nrb >= 0
+        && nrb < T.tys.length
+        && T.tys[nrb] is TyUnion
+        && !tyBearsNull(nrb)
+    }
     monoPinArmBinds(params, letTyCol, letBN, letBT)
+    monoPinReachNames = Map()
+    monoPinNoteReach(instBody0)
+    if monoPinReachShadowed(instBody0) {
+      monoPinRetBox = false
+      monoPinReachNames = Map()
+    }
+    monoPinNoteUnsafeBody(instBody0)
+    if monoPinRetBox { monoPinRetTy = nodeTyIxOf(nret) }
+    monoPinRetBox = false
     const instBody0L = monoPinBodyLambdas(
       instBody0,
       fn.fnTyParams,
@@ -6470,6 +6837,7 @@ function monoMakeInstance(
       letBN,
       letBT,
     )
+    monoPinRetTy = -1
     const lamClones = monoLamCloneSlots
     monoLamCloneSlots = []
     // Pin any `.map`/`.filter` callback lambda whose receiver param this instance bound to
