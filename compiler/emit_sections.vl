@@ -4854,13 +4854,36 @@ function igMention(
   0
 }
 
+// The names a parameter or local in scope binds during `igWalk`: a stack, for restoring on
+// return, and a count per name, so a lookup does not scan every binding in scope (D2872).
+type IgShadow = { names: string[], live: Map<string, i32> }
+
+function igShadowHas(s: IgShadow, name: string): boolean {
+  (s.live[name] ?? 0) > 0
+}
+
+function igShadowPush(s: IgShadow, name: string) {
+  s.names.push(name)
+  s.live[name] = (s.live[name] ?? 0) + 1
+  0
+}
+
+// Unbinds every name pushed since the stack held `mark` names.
+function igShadowPop(s: IgShadow, mark: i32) {
+  while s.names.length > mark {
+    const name = s.names.pop() ?? ""
+    s.live[name] = (s.live[name] ?? 0) - 1
+  }
+  0
+}
+
 // Mentions every identifier, member name and nested function name under `ix` at `ord`,
 // except an identifier a parameter or local in scope binds (`shadow`, restored on return).
 // A `let` binds for the statements after it in its block; a loop variable, for its body.
 function igWalk(
   ix: i32,
   ord: i32,
-  shadow: string[],
+  shadow: IgShadow,
   seen: Map<string, i32>,
   head: Map<string, i32>,
   next: i32[],
@@ -4868,9 +4891,9 @@ function igWalk(
 ) {
   if ix < 0 || ix >= P.nodes.length { return 0 }
   const n = P.nodes[ix]
-  const mark = shadow.length
+  const mark = shadow.names.length
   if n is Ident {
-    if !strListHas(shadow, n.identName) {
+    if !igShadowHas(shadow, n.identName) {
       igMention(n.identName, 1, ord, seen, head, next, work)
     }
     return 0
@@ -4886,7 +4909,7 @@ function igWalk(
     pi = 0
     while pi < n.fnParams.length {
       const pn = P.nodes[n.fnParams[pi]]
-      if pn is Param { shadow.push(pn.parName) }
+      if pn is Param { igShadowPush(shadow, pn.parName) }
       pi = pi + 1
     }
     igWalk(n.fnBody, ord, shadow, seen, head, next, work)
@@ -4895,19 +4918,19 @@ function igWalk(
     while si < n.blkStmts.length {
       igWalk(n.blkStmts[si], ord, shadow, seen, head, next, work)
       const sn = P.nodes[n.blkStmts[si]]
-      if sn is LetDecl { shadow.push(sn.letName) }
+      if sn is LetDecl { igShadowPush(shadow, sn.letName) }
       si = si + 1
     }
   } else if n is ForRange {
     igWalk(n.frFrom, ord, shadow, seen, head, next, work)
     igWalk(n.frTo, ord, shadow, seen, head, next, work)
     igWalk(n.frStep, ord, shadow, seen, head, next, work)
-    shadow.push(n.frVar)
+    igShadowPush(shadow, n.frVar)
     igWalk(n.frBody, ord, shadow, seen, head, next, work)
   } else if n is ForIn {
     igWalk(n.fiIter, ord, shadow, seen, head, next, work)
-    shadow.push(n.fiVar)
-    if n.fiVar2 != "" { shadow.push(n.fiVar2) }
+    igShadowPush(shadow, n.fiVar)
+    if n.fiVar2 != "" { igShadowPush(shadow, n.fiVar2) }
     igWalk(n.fiBody, ord, shadow, seen, head, next, work)
   } else {
     if n is Member { igMention(n.memProp, 0, ord, seen, head, next, work) }
@@ -4916,7 +4939,7 @@ function igWalk(
       if n.binOp == "=" {
         const lhs = P.nodes[n.binLeft]
         if lhs is Ident {
-          if !strListHas(shadow, lhs.identName) {
+          if !igShadowHas(shadow, lhs.identName) {
             igMention(lhs.identName, 2, ord, seen, head, next, work)
           }
         }
@@ -4929,7 +4952,7 @@ function igWalk(
       k = k + 1
     }
   }
-  while shadow.length > mark { shadow.pop() }
+  igShadowPop(shadow, mark)
   0
 }
 
@@ -4996,7 +5019,8 @@ function initGuardScan(): i32 {
   if !anyCand { return 0 }
   const seen: Map<string, i32> = Map()
   const work: i32[] = []
-  const shadow: string[] = []
+  const shadowLive: Map<string, i32> = Map()
+  const shadow: IgShadow = { names: [], live: shadowLive }
   gi = 0
   let si = 0
   while gi < globalStmts.length || si < startStmts.length {
