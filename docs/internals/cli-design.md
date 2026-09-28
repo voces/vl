@@ -259,7 +259,7 @@ subcommands (`test`) reuse the same pump unchanged.
 A `cli.vl` module, joined into the compile alongside the driver, that:
 
 1. reads argv, classifies the subcommand and flags (`--severity`, `--concise`,
-   `--exclude`, `--include-std`, `-w`, `--fix`, …);
+   `--exclude`, `--include-std`, `--include-imports`, `-w`, `--fix`, …);
 2. drives the work: for `check`/`fmt`, push the target onto a work-stack; while it
    has pending directories, emit `CMD_LIST_DIR` and, on each committed entry,
    apply `SKIP_DIRS` + the glob matcher (VL) to decide recurse / collect / skip;
@@ -442,6 +442,42 @@ The complementary half is in the lint: `comment-block-too-long`,
 `docs/internals/comment-style.md`, which is the **compiler's** rubric, and are
 skipped for a std module — std's comments are consumer API surface and are graded
 by `std-comment-audience` against `std-api-review.md` §4 instead.
+
+## An import's warnings and hints are withheld unless asked for (`--include-imports`)
+
+The same problem one level out. A single-file check lints every module of the
+resolved graph, so each import's own findings were reported against a check of
+the file that imports it: plumb's `vl check src/ntempest/hierarchy.vl` printed
+103 diagnostics, **62 of them from the three modules it imports**, all already
+known, and `--exclude` did not filter them (plumb PL-055,
+`~/plumb/docs/vl-issues.md`).
+
+So a non-error owned by any module other than the named file is withheld unless
+`--include-imports` is passed, with exactly the `--include-std` contract: it
+counts nowhere while withheld, and the run says so on stderr
+(`(62 import warnings hidden — --include-imports shows them)`). The two flags
+are independent — `--include-imports` does not reveal std, `--include-std` does
+not reveal the rest.
+
+The boundaries, and why each is where it is:
+
+- **Errors are always shown.** A type error in an import fails the build of the
+  named file; hiding it would leave a failing check with no diagnostic.
+- **Warnings go with hints, not with errors.** A warning never fails a build at
+  the default gate; it is advice about the module that owns it, and that module
+  reports it when it is checked itself — a directory run names every file, and
+  each file in it is graded as its own entry. Keeping an import's warnings would
+  have left plumb's report dominated by the same pre-existing findings, which is
+  the ask.
+- **`--exclude` reaches imports.** A pattern that matches an import's key (the
+  path the report labels it with) or its basename drops that module's warnings
+  and hints even under `--include-imports`. It is explicitly asked for, so it is
+  not announced; errors survive it for the reason above.
+- **The whole-graph lint is still one flag away.** `scripts/lint-self.sh` and
+  `scripts/interp-budget.py` pass `--include-imports` on `compiler/entry.vl`, so
+  the self-lint still covers every compiler module through the entry.
+- **The editor is unaffected.** The LSP lints the open document and reports
+  per document; it never went through this report.
 
 ## Where a `vl` binary finds std and its seed
 
