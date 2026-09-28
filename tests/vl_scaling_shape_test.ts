@@ -576,6 +576,27 @@ axis(
   (d) => twoFiles(d, genReturnChain(200), genReturnChain(50)),
 );
 
+// D3051's DEPTH pair: module const chains 200 deep against 50, each const naming the one
+// before it twice, so linear reads 4 and a classifier re-walking a named const's initializer
+// reads 2^150. Fuel reads 3.43; master `0b618d160` traps on both arms, and with the f64 and i64
+// answers memoised but not the string one it read 6.31.
+const genConstChain = (depth: number): string => {
+  const o: string[] = [];
+  for (const [p, a0] of [["A", "3"], ["F", "3.0"], ["L", "3 as i64"]]) {
+    o.push(`const ${p}0 = ${a0}`);
+    for (let i = 1; i <= depth; i++) o.push(`const ${p}${i} = ${p}${i - 1} * 3 + ${p}${i - 1}`);
+  }
+  o.push(`function g() { print(A${depth}) print(F${depth}) print(L${depth}) }`, "g()");
+  return o.join("\n") + "\n";
+};
+
+axis(
+  "module const chain depth",
+  5.0,
+  "A float, i64 or string classifier (`globalReadAsk`, compiler/emit_classify.vl) is re-walking a named global's initializer per mention.",
+  (d) => twoFiles(d, genConstChain(200), genConstChain(50)),
+);
+
 // 1.09 / 0.97 / 1.13.
 axis("call sites", 2.5, "Callee resolution is scaling with the number of callees.", (d) =>
   twoFiles(d, genCallSites(6000, 1), genCallSites(6000, 20)));
