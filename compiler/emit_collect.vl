@@ -108,6 +108,7 @@ import {
   primNameOf,
   primNameStr,
   recordJoinSeen,
+  refViewSrcTys,
   substTyDeep,
   tyArrayElemPrim,
   tyFieldTyOf,
@@ -378,6 +379,7 @@ import {
   gFoldLen,
   gFoldOk,
   gFoldPool,
+  gHelpRvSync,
   gPromoOk,
   gPromoSlot,
   gaeBases,
@@ -452,6 +454,11 @@ import {
   rlWrAns,
   rlWrSlots,
   rlWrapIdx,
+  rvNul,
+  rvSrcSlot,
+  rvUnionSlot,
+  rvVariant,
+  rvViewTy,
   sAnonOwnTy,
   sBackIdx,
   sDeclared,
@@ -769,6 +776,8 @@ import {
   rlInternNameTy,
   rlSlotByName,
   rlSlotByNameKeyTy,
+  rlSlotOfTy,
+  rlWidenVariantOf,
   sFieldElemNameAt,
   sFieldElemTyIxRow,
   sFieldRowKeyKind,
@@ -5151,6 +5160,58 @@ function rlElemVariantHeap(slot: i32): i32 {
   uVarHeap[evi]
 }
 
+// The record-list views (D3041): one per record row the checker saw delivered as a union-box list
+// from an unfresh root, and a view type each, after the wrappers it subtypes and keeps a source of.
+// Rows are taken at their twin representative, so twins share a view.
+function rvAssignViews() {
+  rvUnionSlot = -1
+  rvSrcSlot = []
+  rvVariant = []
+  rvNul = []
+  rvViewTy = []
+  if gHelpRvSync < 0 { return 0 }
+  let u = 0
+  while u < rlElemKindTbl.length && rvUnionSlot < 0 {
+    if rlElemKindTbl[u] == RLK_UNION && u < rlTwin.length {
+      rvUnionSlot = rlTwin[u]
+    }
+    u = u + 1
+  }
+  if rvUnionSlot < 0 { return 0 }
+  let k = 0
+  while k < refViewSrcTys.length {
+    const s0 = rlSlotOfTy(refViewSrcTys[k])
+    if s0 >= 0 && s0 < rlTwin.length && s0 < rlElemNullable.length {
+      const s = rlTwin[s0]
+      const vi = rlWidenVariantOf(s0, rvUnionSlot)
+      if vi >= 0 && vi < uTags.length {
+        let p = rvPairOf(s, vi)
+        if p < 0 {
+          p = rvSrcSlot.length
+          rvSrcSlot.push(s)
+          rvVariant.push(vi)
+          rvNul.push(0)
+          rvViewTy.push(mAllocType())
+        }
+        // A nullable row twins its non-null one, so the view it shares tests for `null`.
+        if rlElemNullable[s0] == 1 { rvNul[p] = 1 }
+      }
+    }
+    k = k + 1
+  }
+  0
+}
+
+// The view row for source row `s` (a twin representative) boxing as variant `vi`, or -1.
+export function rvPairOf(s: i32, vi: i32): i32 {
+  let p = 0
+  while p < rvSrcSlot.length {
+    if rvSrcSlot[p] == s && rvVariant[p] == vi { return p }
+    p = p + 1
+  }
+  -1
+}
+
 // Walk the type-section emit order with the `mAllocType` counter, assigning each type's heap
 // index into the module-global index state; returns the functype base index (`typeOffset`). The
 // order must match the type-section emission exactly. An absent type family mints nothing, and
@@ -5459,6 +5520,7 @@ export function mAssignTypeIndices(_n: i32) {
     if svPairOn(svk) { svViewTy[svk] = mAllocType() }
     svk = svk + 1
   }
+  rvAssignViews()
   // Second pass: fill the NON-i32 nested-list ref-list element heaps now that the inner
   // string/f64/i64 list wrappers exist (a `string[]`/`f64[]`/`i64[]`-VALUED map's vals
   // ref-list — kinds 6/7/8). The wrappers are forced by `mvShapeOfValName` (slUsed / fa64Used

@@ -107,6 +107,7 @@ import {
   numLitUnionHasBase,
   primNameOf,
   primNameStr,
+  refViewReadonlyAt,
   simdRow,
   simdRowLaneMax,
   simdRowOp,
@@ -396,6 +397,9 @@ import {
   gHelpMapResize,
   gHelpMapResizeI32,
   gHelpMapResync,
+  gHelpRvGet,
+  gHelpRvLen,
+  gHelpRvSync,
   gHelpStrBytes,
   gHelpStrConcat,
   gHelpStrEq,
@@ -498,8 +502,13 @@ import {
   rlElemKindTbl,
   rlElemName,
   rlElemNullable,
+  rlTwin,
   rlUsed,
   rlWrapIdx,
+  rvMayView,
+  rvSrcSlot,
+  rvUnionSlot,
+  rvViewTy,
   sBackIdx,
   sDeclared,
   sFieldCount,
@@ -1163,6 +1172,7 @@ import {
   declSlotPinned,
   firstLocalDeclIn,
   fnIndexOfInScopeChain,
+  rvPairOf,
 } from "./emit_collect"
 import { voidTwinForNode } from "./emit_rewrite"
 import { nameIsQuotedLeaf, nameIsShapeOpen, splitUnionAtoms } from "./tyname"
@@ -11513,13 +11523,17 @@ function emitIndexGo(body: u8[], idxIx: i32, fnIx: i32) {
       pendingF32 = false
       if emitExpr(body, nd.idxIndex, fnIx) < 0 { return -1 }
       pendingF32 = savedRlIxF32
-      // Guard `i u< len`, unwrap to the backing (`struct.get` field 0), read.
+      // Guard `i u< len`, unwrap to the backing (`struct.get` field 0), read. A list that may be
+      // a view reads its element through the view's source (D3041).
       if rlHz >= 0 {
         emitListIdxGuardHoisted(rlHz, nd.idxIndex)
+        fbArrayGet(rlBackIdx[rslot]) // 0xfb 0x0b <this slot's ref backing array>
+      } else if rvMayView(rslot) {
+        emitRvIndexRead(rslot)
       } else {
         emitListIdxGuard(listIdxWrapSlot("ref", rslot), rlWrapIdx[rslot])
+        fbArrayGet(rlBackIdx[rslot]) // 0xfb 0x0b <this slot's ref backing array>
       }
-      fbArrayGet(rlBackIdx[rslot]) // 0xfb 0x0b <this slot's ref backing array>
       // A nullable-niche element legitimately holds null, so the read stays `(ref null
       // $elem)` with no `ref.as_non_null` recover (the caller narrows with `e != null`).
       // `listElemStaysNullable` is the shared answer — `.map`/`.filter`'s element step asks
@@ -11674,7 +11688,28 @@ function emitArrLen(body: u8[], memIx: i32, fnIx: i32) {
           m.memObj,
         )
       }
+      if rvMayView(rslot) {
+        // A loop's cached header is refreshed at its entry and holds for its body.
+        const rlenHz = liveHoistRow(m.memObj, "ref", rslot)
+        if rlenHz >= 0 {
+          fbLocalGet(lhLen[rlenHz])
+          return 0
+        }
+      }
       if emitExpr(body, m.memObj, fnIx) < 0 { return -1 }
+      if rvMayView(rslot) {
+        const rwL = listIdxWrapSlot("ref", rslot)
+        fbLocalSet(rwL)
+        rvTestView(rwL)
+        fbIf(127) // i32
+        fbLocalGet(rwL)
+        fbCall(gHelpRvLen)
+        fbElse()
+        fbLocalGet(rwL)
+        fbStructGet(rlWrapIdx[rslot], 1)
+        fbEnd()
+        return 0
+      }
       fbStructGet(rlWrapIdx[rslot], 1) // 0xfb 0x02 <ref-list wrapper> field 1: len
       return 0
     }
@@ -20850,7 +20885,7 @@ function emitPopGo(
         false,
       )
       if lIdx < 0 { return -1 }
-      // A `.get` of a view reads its refreshed snapshot (D3028).
+      // A `.get` of a view reads its refreshed snapshot (D3028, D3041).
       if getIdx >= 0 && popEk != null {
         const gsv = svDstOfKind(popEk)
         if gsv >= 0 {
@@ -20858,6 +20893,11 @@ function emitPopGo(
           fbCall(gHelpSvSync[gsv])
           fbDrop()
         }
+      }
+      if getIdx >= 0 && rvRecvMayView(callee.memObj, fnIx) {
+        fbLocalGet(lIdx)
+        fbCall(gHelpRvSync)
+        fbDrop()
       }
       if true {
         // A BOOLEAN-element list pops CHECKED: `boolean | null` rides the i32
@@ -21340,6 +21380,7 @@ function emitMapFilter(body: u8[], callIx: i32, fnIx: i32) {
       mfSrcSlot = -1
       if srcElemRef { mfSrcSlot = srcSlot }
       mfSvDst = svDstOfKind(scalarListElemKind(callee.memObj, fnIx))
+      mfRv = rvRecvMayView(callee.memObj, fnIx)
       // clo = the callback's closure value, built ONCE before the loop. An inline
       // literal / named function constructs it directly; a let-bound value reads its
       // binding (an `Ident` read — it cannot itself contain a HOF site, so the frame
@@ -21418,6 +21459,7 @@ function emitMapFilter(body: u8[], callIx: i32, fnIx: i32) {
       fbEnd()       // end block
       mfSrcSlot = -1
       mfSvDst = -1
+      mfRv = false
       // result = wrapper{ back, len, cap }: len = n (map) / j (filter), cap = n.
       fbLocalGet(dstL)
       if isMap { fbLocalGet(nL) } else { fbLocalGet(jL) }
@@ -21798,7 +21840,15 @@ export function emitRefListWidenSite(
       dstSlot,
     )
   ) {
+    // A `readonly` destination needs no write proof: a view reads the source as it is (D3041).
+    if refViewReadonlyAt(srcIx) && rvMayView(dstSlot) {
+      if rvEmitView(srcSlot) { return true }
+    }
     return emitRefListWidenDeclined(srcIx, srcSlot, dstSlot)
+  }
+  // A source other handles may write is delivered as a view that reads through it (D3041).
+  if !covarRootFreshLocal(srcIx) && rvMayView(dstSlot) {
+    if rvEmitView(srcSlot) { return true }
   }
   if emitRefListWidenTop(body, srcSlot, dstSlot) < 0 { return false }
   true
@@ -21979,6 +22029,10 @@ function svDstOfKind(k: VKind | null): i32 {
 // Refresh the list just emitted for `recvIx` when it may be a view, before an operation reads
 // its backing whole: the view's snapshot then holds its source as it is now (D3028).
 function svSyncRecv(recvIx: i32, fnIx: i32) {
+  if rvRecvMayView(recvIx, fnIx) {
+    fbCall(gHelpRvSync)
+    return 0
+  }
   if svPairs == 0 { return 0 }
   const d = svDstOfKind(scalarListElemKind(recvIx, fnIx))
   if d >= 0 { fbCall(gHelpSvSync[d]) }
@@ -22092,9 +22146,76 @@ function svHoistBlocked(
   condIx: i32,
   bodyIx: i32,
 ): boolean {
+  if rvRecvMayView(recvIx, fnIx) {
+    return storesIndex(condIx, fnIx) || storesIndex(bodyIx, fnIx)
+  }
   if svPairs == 0 { return false }
   if svDstOfKind(scalarListElemKind(recvIx, fnIx)) < 0 { return false }
   storesIndex(condIx, fnIx) || storesIndex(bodyIx, fnIx)
+}
+
+// Whether the list `recvIx` reads may be a record-list view (D3041): a union-box list in a module
+// that builds one.
+function rvRecvMayView(recvIx: i32, fnIx: i32): boolean {
+  if rvSrcSlot.length == 0 || !exprRefArray(recvIx, fnIx) { return false }
+  rvMayView(refListSlotOfExpr(recvIx, fnIx))
+}
+
+// Push whether the list in local `wL` is a record-list view: one `ref.test` per view type.
+function rvTestView(wL: i32) {
+  let p = 0
+  while p < rvViewTy.length {
+    fbLocalGet(wL)
+    wU8(251) // 0xfb GC prefix
+    wU8(20)  // 0x14 ref.test
+    wSLEB(rvViewTy[p])
+    if p > 0 {
+      fbI32Bin(114) // 0x72 i32.or
+    }
+    p = p + 1
+  }
+  if rvViewTy.length == 0 { fbI32Const(0) }
+  0
+}
+
+// The element read of a union-box list at ref-list row `rslot` that may be a view, with the list
+// and the index on the stack: a view boxes the element out of its source, any other list reads its
+// backing. Leaves the backing's own `(ref null $uBox)`.
+function emitRvIndexRead(rslot: i32) {
+  const wL = listIdxWrapSlot("ref", rslot)
+  fbLocalSet(listIdxScratchBase)
+  fbLocalSet(wL)
+  rvTestView(wL)
+  fbIfRefNul(uBoxIdx, true)
+  fbLocalGet(wL)
+  fbLocalGet(listIdxScratchBase)
+  fbCall(gHelpRvGet)
+  fbElse()
+  fbLocalGet(wL)
+  fbLocalGet(listIdxScratchBase)
+  emitListIdxGuard(wL, rlWrapIdx[rslot])
+  fbArrayGet(rlBackIdx[rslot])
+  fbEnd()
+  0
+}
+
+// Build a view of the record list on the stack, at source row `srcSlot` (D3041): a snapshot the
+// sync helper fills, beside the list itself. False where the row has no view type.
+function rvEmitView(srcSlot: i32): boolean {
+  if srcSlot < 0 || srcSlot >= rlTwin.length || rvUnionSlot < 0 { return false }
+  const p = rvPairOf(rlTwin[srcSlot], rlWidenVariantOf(srcSlot, rvUnionSlot))
+  if p < 0 || rvUnionSlot >= rlBackIdx.length { return false }
+  const sL = widenSrcWrapSlot(srcSlot)
+  fbLocalSet(sL)
+  fbI32Const(0)
+  fbArrayNewDefault(rlBackIdx[rvUnionSlot])
+  fbI32Const(0)
+  fbI32Const(0)
+  fbLocalGet(sL)
+  fbRefAsNonNull()
+  fbStructNew(rvViewTy[p])
+  fbCall(gHelpRvSync)
+  true
 }
 
 // `emitClampIdx`'s dual over plain wasm i32 LOCALS (not the string-op frame): emit
@@ -22334,6 +22455,13 @@ function emitMfElem(
     fbCall(gHelpSvGet[mfSvDst])
     return 0
   }
+  if mfRv && srcElemRef {
+    fbLocalGet(srcL)
+    fbLocalGet(iL)
+    fbCall(gHelpRvGet)
+    if mfSrcSlot >= 0 { return emitStaleBoxRetag(mfSrcSlot, -1) }
+    return 0
+  }
   fbLocalGet(srcL)
   fbStructGet(srcWrap, 0) // field 0: backing
   fbLocalGet(iL)
@@ -22351,6 +22479,8 @@ let mfSrcSlot = -1
 // The view destination `emitMfElem` reads each element through, as a callback's write to the
 // source must be seen by the next read (D3028); -1 where the source cannot be a view.
 let mfSvDst = -1
+// Whether `emitMfElem`'s source may be a record-list view, read element by element (D3041).
+let mfRv = false
 
 // The members a union box read out of ref-list slot `slot` may hold beyond its own: each narrower
 // scalar the slot's union holds only widened, which a list shared across a widening delivery
@@ -25227,6 +25357,7 @@ function emitForInStmt(body: u8[], s: ForIn, stmtIx: i32, fnIx: i32) {
   // step, as it re-reads a shared list's header (D3028).
   let fiSv = -1
   if fiHLen < 0 && (ek == "f64" || ek == "i64") { fiSv = svDstOfKind(ek) }
+  const fiRv = fiHLen < 0 && hKind == "ref" && rvMayView(hSlot)
   // a string source runs its cursor in backing coordinates: the `#l` temp holds the
   // header, so hoist the backing into its own slot and pre-compute the exit bound — one
   // `array.get` per code point and no `struct.get` in the loop, since binaryen is not
@@ -25314,6 +25445,9 @@ function emitForInStmt(body: u8[], s: ForIn, stmtIx: i32, fnIx: i32) {
   } else if fiSv >= 0 {
     fbLocalGet(lIdx)
     fbCall(gHelpSvLen[fiSv])
+  } else if fiRv {
+    fbLocalGet(lIdx)
+    fbCall(gHelpRvLen)
   } else {
     fbLocalGet(lIdx)
     fbStructGet(wrapTy, 1)
@@ -25372,6 +25506,10 @@ function emitForInStmt(body: u8[], s: ForIn, stmtIx: i32, fnIx: i32) {
     fbLocalGet(lIdx)
     fbLocalGet(iIdx)
     fbCall(gHelpSvGet[fiSv])
+  } else if fiRv {
+    fbLocalGet(lIdx)
+    fbLocalGet(iIdx)
+    fbCall(gHelpRvGet)
   } else {
     fbLocalGet(lIdx)
     fbStructGet(wrapTy, 0)

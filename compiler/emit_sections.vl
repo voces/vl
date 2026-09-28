@@ -47,6 +47,7 @@ import {
   nodeTyIxOf,
   nodeTyPrimName,
   numLitUnionHasBase,
+  refViewSrcTys,
   scalarViewPairs,
   simdRow,
   simdRowSig,
@@ -65,6 +66,7 @@ import {
   mapShapeKeyKind,
   msPoolReset,
   mvSlotKeyKind,
+  nullBoxTag,
   repKindOfSigTok,
   repMemLoadScalarMask,
   repNodeScalarMask,
@@ -159,6 +161,7 @@ import {
   MVK_F64,
   MVK_I64,
   MVK_STR,
+  RLK_UNION,
   VKind,
   W,
   aTypeIdx,
@@ -300,6 +303,9 @@ import {
   gHelpMapResize,
   gHelpMapResizeI32,
   gHelpMapResync,
+  gHelpRvGet,
+  gHelpRvLen,
+  gHelpRvSync,
   gHelpStrBytes,
   gHelpStrConcat,
   gHelpStrEq,
@@ -413,15 +419,22 @@ import {
   pendingStructIdx,
   pendingVariantIdx,
   postMonoShapes,
+  raUsed,
   reExpName,
   reExpTarget,
   refPushBaseBySlot,
   rlBackIdx,
   rlElemHeap,
+  rlElemKindTbl,
   rlElemName,
   rlElemTyIx,
   rlTwin,
   rlWrapIdx,
+  rvNul,
+  rvSrcSlot,
+  rvUnionSlot,
+  rvVariant,
+  rvViewTy,
   sAnonOwnTy,
   sBackIdx,
   sDeclared,
@@ -459,6 +472,7 @@ import {
   uFieldElemKeyKind,
   uFieldElemTyIx,
   uSinkFired,
+  uTags,
   uVarHeap,
   uVarTwin,
   uVariantRowBySid,
@@ -505,6 +519,7 @@ import {
   fbI32Load,
   fbI64Const,
   fbIf,
+  fbIfRefNul,
   fbLocalGet,
   fbLocalSet,
   fbLocalTee,
@@ -515,6 +530,7 @@ import {
   fbRefCast,
   fbRefNull,
   fbRefNullForKind,
+  fbRefNullNone,
   fbRefNullStruct,
   fbReturn,
   fbSelect,
@@ -4540,6 +4556,318 @@ function svLenFnCode(out: u8[], d: i32) {
   helpFrameBody(out, body)
 }
 
+// —— record-list views (D3041) ——
+// A view of source row `p` is `{back, len, cap, src}`, a final subtype of the union-box list's
+// wrapper: the first three fields a snapshot the sync helper refreshes, `src` the record list
+// whose elements it boxes under variant `rvVariant[p]`.
+
+// Whether this module reserves the view helpers: the checker saw a record row delivered as a
+// union-box list from an unfresh root, and the module has a union-box list.
+function rvWanted(): boolean {
+  if !raUsed || refViewSrcTys.length == 0 { return false }
+  let u = 0
+  while u < rlElemKindTbl.length {
+    if rlElemKindTbl[u] == RLK_UNION { return true }
+    u = u + 1
+  }
+  false
+}
+
+function rvWrap(): i32 { rlWrapIdx[rvUnionSlot] }
+
+function rvBack(): i32 { rlBackIdx[rvUnionSlot] }
+
+function rvSrcWrap(p: i32): i32 { rlWrapIdx[rvSrcSlot[p]] }
+
+function rvSrcBack(p: i32): i32 { rlBackIdx[rvSrcSlot[p]] }
+
+// Whether the view types exist: the helpers are reserved and the union-box list has a row.
+function rvBuilt(): boolean {
+  gHelpRvSync >= 0
+    && rvUnionSlot >= 0
+    && rvUnionSlot < rlWrapIdx.length
+    && rvUnionSlot < rlBackIdx.length
+}
+
+function rvHelperCount(): i32 {
+  if gHelpRvSync < 0 { return 0 }
+  3
+}
+
+function rvHelperNames() {
+  if gHelpRvSync < 0 { return 0 }
+  wULEB(gHelpRvSync)
+  wName("__rv_sync__")
+  wULEB(gHelpRvGet)
+  wName("__rv_get__")
+  wULEB(gHelpRvLen)
+  wName("__rv_len__")
+  0
+}
+
+// The three helper functypes. With no union-box list row resolved, each still needs a type, so
+// they take `i32` and name no heap: their bodies are then a bare `unreachable`.
+function rvHelperFuncTypes() {
+  if gHelpRvSync < 0 { return 0 }
+  if !rvBuilt() {
+    svFuncType([-1], -1)
+    svFuncType([-1, -1], -1)
+    svFuncType([-1], -1)
+    return 0
+  }
+  svFuncType([rvWrap()], rvWrap())
+  svFuncType([rvWrap(), -1], uBoxIdx)
+  svFuncType([rvWrap()], -1)
+  0
+}
+
+function rvPlaceHelpers(codePayload: ByteRope) {
+  if gHelpRvSync < 0 { return 0 }
+  let rows = emitFnSpanStart.length
+  const sync: u8[] = []
+  rvSyncFnCode(sync)
+  placeCodeEntry(codePayload, sync, rows, -1, -1, 3, "__rv_sync__")
+  rows = emitFnSpanStart.length
+  const get: u8[] = []
+  rvGetFnCode(get)
+  placeCodeEntry(codePayload, get, rows, -1, -1, 3, "__rv_get__")
+  rows = emitFnSpanStart.length
+  const len: u8[] = []
+  rvLenFnCode(len)
+  placeCodeEntry(codePayload, len, rows, -1, -1, 3, "__rv_len__")
+  0
+}
+
+// A helper body for a module whose view rows did not resolve: never called.
+function rvUnreachableBody(out: u8[]) {
+  const body: u8[] = []
+  const prev = wTarget(body)
+  wULEB(0)
+  wU8(0) // unreachable
+  fbEnd()
+  wTarget(prev)
+  helpFrameBody(out, body)
+}
+
+// Open the union-box list's wrapper, at ref-list row `slot`, as a type a view may subtype.
+function rvOpenParent(slot: i32) {
+  if rvSrcSlot.length == 0 || slot != rvUnionSlot { return 0 }
+  wU8(80) // 0x50 sub
+  wULEB(0)
+  0
+}
+
+// The view types, in row order: each `sub final` of the union-box list's wrapper.
+function rvViewTypes() {
+  if !rvBuilt() { return 0 }
+  let p = 0
+  while p < rvViewTy.length {
+    wU8(79) // 0x4f sub final
+    wULEB(1)
+    wULEB(rvWrap())
+    wU8(95) // 0x5f struct
+    wU8(4)
+    wU8(100)
+    wSLEB(rvBack())
+    wU8(1)
+    wU8(127)
+    wU8(1)
+    wU8(127)
+    wU8(1)
+    wU8(100) // field 3 src: the record list, immutable
+    wSLEB(rvSrcWrap(p))
+    wU8(0)
+    p = p + 1
+  }
+  0
+}
+
+// Push element `idx` of the record list in local `sL`, for view row `p`: `idx` a local, or with
+// `guard` the index in local 1 bounded against that list's length.
+function rvSrcElem(p: i32, sL: i32, idx: i32, guard: boolean) {
+  fbLocalGet(sL)
+  fbStructGet(rvSrcWrap(p), 0)
+  if guard { svGuardedIdx(idx, sL, rvSrcWrap(p)) } else { fbLocalGet(idx) }
+  fbArrayGet(rvSrcBack(p))
+  0
+}
+
+// Box that element under view row `p`'s variant, `{tag, record}`; a `null` element of a
+// nullable record row boxes under the null tag, as the element-converting copy does.
+function rvBoxElem(p: i32, sL: i32, idx: i32, guard: boolean) {
+  if rvNul[p] == 1 {
+    rvSrcElem(p, sL, idx, guard)
+    wU8(209) // 0xd1 ref.is_null
+    fbIfRefNul(uBoxIdx, false)
+    fbI32Const(nullBoxTag())
+    fbRefNullNone()
+    fbStructNew(uBoxIdx)
+    fbElse()
+    fbI32Const(uTags[rvVariant[p]])
+    rvSrcElem(p, sL, idx, guard)
+    fbStructNew(uBoxIdx)
+    fbEnd()
+    return 0
+  }
+  fbI32Const(uTags[rvVariant[p]])
+  rvSrcElem(p, sL, idx, guard)
+  fbStructNew(uBoxIdx)
+  0
+}
+
+// `__rv_sync__(x) -> x`: when `x` is a view, refill its snapshot from its source, each record
+// boxed. Locals: 1 `n`, 2 `i`, 3 the backing, then a view and a source local per row.
+function rvSyncFnCode(out: u8[]) {
+  if !rvBuilt() { return rvUnreachableBody(out) }
+  const body: u8[] = []
+  const prev = wTarget(body)
+  wULEB(2 + 2 * rvViewTy.length)
+  wULEB(2)
+  wU8(127)
+  wULEB(1)
+  wU8(99) // 0x63 (ref null ht)
+  wSLEB(rvBack())
+  let j = 0
+  while j < rvViewTy.length {
+    wULEB(1)
+    wU8(99)
+    wSLEB(rvViewTy[j])
+    wULEB(1)
+    wU8(99)
+    wSLEB(rvSrcWrap(j))
+    j = j + 1
+  }
+  j = 0
+  while j < rvViewTy.length {
+    const vt = rvViewTy[j]
+    const vL = 4 + 2 * j
+    const sL = 5 + 2 * j
+    fbLocalGet(0)
+    svRefTest(vt)
+    fbIf(64)
+    fbLocalGet(0)
+    fbRefCast(vt)
+    fbLocalSet(vL)
+    fbLocalGet(vL)
+    fbStructGet(vt, 3)
+    fbLocalSet(sL)
+    fbLocalGet(sL)
+    fbStructGet(rvSrcWrap(j), 1)
+    fbLocalSet(1)
+    fbLocalGet(vL)
+    fbStructGet(vt, 2)
+    fbLocalGet(1)
+    fbI32Bin(72) // 0x48 i32.lt_s
+    fbIf(64)
+    fbLocalGet(vL)
+    fbLocalGet(1)
+    fbArrayNewDefault(rvBack())
+    fbStructSet(vt, 0)
+    fbLocalGet(vL)
+    fbLocalGet(1)
+    fbStructSet(vt, 2)
+    fbEnd()
+    fbLocalGet(vL)
+    fbStructGet(vt, 0)
+    fbLocalSet(3)
+    fbI32Const(0)
+    fbLocalSet(2)
+    fbBlock(64)
+    fbLoop(64)
+    fbLocalGet(2)
+    fbLocalGet(1)
+    fbI32Bin(78) // 0x4e i32.ge_s
+    fbBrIf(1)
+    fbLocalGet(3)
+    fbLocalGet(2)
+    rvBoxElem(j, sL, 2, false)
+    fbArraySet(rvBack())
+    fbLocalGet(2)
+    fbI32Const(1)
+    fbI32Bin(106) // 0x6a i32.add
+    fbLocalSet(2)
+    fbBr(0)
+    fbEnd()
+    fbEnd()
+    fbLocalGet(vL)
+    fbLocalGet(1)
+    fbStructSet(vt, 1)
+    fbEnd()
+    j = j + 1
+  }
+  fbLocalGet(0)
+  fbRefAsNonNull()
+  fbEnd()
+  wTarget(prev)
+  helpFrameBody(out, body)
+}
+
+// `__rv_get__(x, i)`: element `i` of `x`, boxed from the source when `x` is a view.
+function rvGetFnCode(out: u8[]) {
+  if !rvBuilt() { return rvUnreachableBody(out) }
+  const body: u8[] = []
+  const prev = wTarget(body)
+  wULEB(rvViewTy.length)
+  let j = 0
+  while j < rvViewTy.length {
+    wULEB(1)
+    wU8(99)
+    wSLEB(rvSrcWrap(j))
+    j = j + 1
+  }
+  j = 0
+  while j < rvViewTy.length {
+    const vt = rvViewTy[j]
+    const sL = 2 + j
+    fbLocalGet(0)
+    svRefTest(vt)
+    fbIf(64)
+    fbLocalGet(0)
+    fbRefCast(vt)
+    fbStructGet(vt, 3)
+    fbLocalSet(sL)
+    rvBoxElem(j, sL, 1, true)
+    fbReturn()
+    fbEnd()
+    j = j + 1
+  }
+  fbLocalGet(0)
+  fbStructGet(rvWrap(), 0)
+  svGuardedIdx(1, 0, rvWrap())
+  fbArrayGet(rvBack())
+  fbRefAsNonNull()
+  fbEnd()
+  wTarget(prev)
+  helpFrameBody(out, body)
+}
+
+// `__rv_len__(x) -> i32`: the length of `x`, its source's when `x` is a view.
+function rvLenFnCode(out: u8[]) {
+  if !rvBuilt() { return rvUnreachableBody(out) }
+  const body: u8[] = []
+  const prev = wTarget(body)
+  wULEB(0)
+  let j = 0
+  while j < rvViewTy.length {
+    const vt = rvViewTy[j]
+    fbLocalGet(0)
+    svRefTest(vt)
+    fbIf(64)
+    fbLocalGet(0)
+    fbRefCast(vt)
+    fbStructGet(vt, 3)
+    fbStructGet(rvSrcWrap(j), 1)
+    fbReturn()
+    fbEnd()
+    j = j + 1
+  }
+  fbLocalGet(0)
+  fbStructGet(rvWrap(), 1)
+  fbEnd()
+  wTarget(prev)
+  helpFrameBody(out, body)
+}
+
 // `__f64_rem__(x, y) -> f64`: the truncated remainder — `x - y * trunc(x / y)` in value, with
 // the sign of the dividend (Rust's `f64::rem`, JS's `%`, C's `fmod`; wasm has no instruction
 // for it, D1586). Not that identity evaluated directly — it is off by an ulp once the
@@ -4712,6 +5040,7 @@ function emitNameSection(n: i32) {
   }
   if gHelpInitFail >= 0 { count = count + 1 }
   count = count + svHelperCount()
+  count = count + rvHelperCount()
   wULEB(count)
   if gImports > 0 {
     wULEB(0)
@@ -4860,6 +5189,7 @@ function emitNameSection(n: i32) {
     wName("__init_fail__")
   }
   svHelperNames()
+  rvHelperNames()
   wTarget(mapPrev)
 
   // ── assemble the section payload: wName("name") + the two subsections ─────────
@@ -5092,6 +5422,16 @@ function emitModule(_stmts: i32[]) {
       nHelpers = nHelpers + 3
     }
     svd = svd + 1
+  }
+  // The record-list views (D3041), after them: a sync, an element and a length helper.
+  gHelpRvSync = -1
+  gHelpRvGet = -1
+  gHelpRvLen = -1
+  if rvWanted() {
+    gHelpRvSync = helpBase + nHelpers
+    gHelpRvGet = helpBase + nHelpers + 1
+    gHelpRvLen = helpBase + nHelpers + 2
+    nHelpers = nHelpers + 3
   }
 
   // Intern the string-literal pool (its globals PRECEDE the user cells — every
@@ -6788,6 +7128,7 @@ function emitTypeSection(
       wU8(99)               // 0x63 (ref null ht) — nullable element ref
       wSLEB(rlElemHeap[rti])
       wU8(1)                // mutable
+      rvOpenParent(rti)
       wU8(95)               // 0x5f struct (ref-list wrapper)
       wU8(3)                // 3 fields
       wU8(100)              // field 0 backing: 0x64 (ref ht) — non-null
@@ -6924,6 +7265,7 @@ function emitTypeSection(
     wU8(1)            // mutable
   }
   svViewTypes()
+  rvViewTypes()
   if fnValUsed {
     // The closure fat-pointer struct `{ env: (ref null struct), id: i32 }` — field 0 a nullable
     // `structref` env (null when non-capturing), field 1 the lifted function's wasm index, both
@@ -7204,6 +7546,7 @@ function emitTypeSection(
     helpFuncType("iii", "") // __init_fail__: (global row, verb, reader row) -> (), never returns
   }
   svHelperFuncTypes()
+  rvHelperFuncTypes()
   // The export-wrapper functypes last (#1265), one per export entry, each the target's own
   // signature emitted with `withEnv` false — the clean ABI shape, produced by the same
   // `emitOneFuncType` the main loop uses, so a wrapper's published type cannot drift from the function it forwards to. Empty unless `fnValUsed`.
@@ -8138,6 +8481,7 @@ function buildCodePayload(
     placeCodeEntry(codePayload, entry, rows, -1, -1, 3, "__init_fail__")
   }
   svPlaceHelpers(codePayload)
+  rvPlaceHelpers(codePayload)
   // The export-wrapper bodies LAST, in the same order the function section declared them.
   // A wrapper's row carries the WRAPPED function's slot and node, so its name and the
   // `file:line:col` of its declaration fall out of the same readers a user body uses.
