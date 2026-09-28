@@ -2886,6 +2886,8 @@ struct LinkOpts {
     shared_pages: Option<i32>,
     /// `(base, limit)`, already validated by `parse_heap_window`.
     heap: Option<(i32, i32)>,
+    /// Whether `--heap-base=` was given, rather than defaulted beside a `--heap-limit=`.
+    heap_base_given: bool,
     /// `--low-memory-unused[=<bytes>]`: no access reaches below this address (`None`: no promise).
     low_memory: Option<i32>,
 }
@@ -2982,7 +2984,13 @@ fn parse_link_opts(args: &[String]) -> LinkOpts {
             ));
         }
     }
-    LinkOpts { import_memory, shared_pages, heap: heap_window(base, limit), low_memory: None }
+    LinkOpts {
+        import_memory,
+        shared_pages,
+        heap: heap_window(base, limit),
+        heap_base_given: base.is_some(),
+        low_memory: None,
+    }
 }
 
 /// Validates a window from the two optional ends, or `None` when neither is given.
@@ -5307,6 +5315,12 @@ fn low_memory_unused_flag(args: &[String], optimizing: bool) -> Option<i64> {
         );
     }
     seen
+}
+
+/// The lowest heap base outside a `--low-memory-unused=<bytes>` promise: `bytes` rounded up to
+/// the multiple of 8 every base has to be.
+fn heap_base_above(bytes: i64) -> i64 {
+    (bytes + 7) & !7
 }
 
 /// `--low-memory-unused=<bytes>`'s value: decimal or `0x` hex, 1 to 2^31 - 1.
@@ -8293,9 +8307,17 @@ fn build_cmd(args: &[String]) -> Result<()> {
     // first allocation, so the two flags contradict each other.
     if let (Some(n), Some((base, _))) = (low_memory, link.heap) {
         if (base as i64) < n {
+            let at_least = heap_base_above(n);
+            if link.heap_base_given {
+                usage_exit(&format!(
+                    "`--heap-base={base:#x}` lies inside `--low-memory-unused={n}`'s region — \
+                     raise the base to at least {at_least:#x}, or shrink the promise"
+                ));
+            }
             usage_exit(&format!(
-                "`--heap-base={base:#x}` lies inside `--low-memory-unused={n}`'s region — \
-                 raise the base to at least {n:#x}, or shrink the promise"
+                "`--heap-limit=` without `--heap-base=` keeps the default heap base {base:#x}, \
+                 inside `--low-memory-unused={n}`'s region — give `--heap-base=` at least \
+                 {at_least:#x}, or shrink the promise"
             ));
         }
     }
@@ -8324,7 +8346,8 @@ fn build_cmd(args: &[String]) -> Result<()> {
                         usage_exit(&format!(
                             "`{input}` allocates from std:buffer, whose default heap starts at \
                              {HEAP_BASE_DEFAULT:#x}, inside `--low-memory-unused={n}`'s region — \
-                             give `--heap-base=` at least {n:#x}"
+                             give `--heap-base=` at least {:#x}",
+                            heap_base_above(n)
                         ));
                     }
                 }

@@ -14665,6 +14665,11 @@ export function emitExpr(body: u8[], exprIx: i32, fnIx: i32) {
   // diagnostic prints. Checking the flag at the two recursion roots makes a failure terminal wherever it happened, instead of relying on every caller in between to thread -1 outward.
   if emitFailed { return -1 }
   if exprIx < 0 { return emitFail("emitProgram: missing expression") }
+  if exprIx == lmaValNode {
+    const lmaArg = lmaValArg
+    lmaValNode = -1
+    return emitExprAsI64(body, lmaArg, lmaCallerFn)
+  }
   if mapDeliveryRecorded && exprIx != mapUnboxHeld {
     const mub = mapUnboxTyOf(exprIx)
     if mub >= 0 { return emitMapUnionPayload(body, exprIx, mub, fnIx) }
@@ -17428,6 +17433,14 @@ function emitMemAddr(
     return -1
   }
   const addr = unwrapParen(c.callArgs[0])
+  if addr >= 0 && addr == lmaAddrNode {
+    const lmaRest = lmaAddrRest
+    const lmaK = lmaAddrK
+    lmaAddrNode = -1
+    if emitNumIntrArg(body, lmaRest, 3, lmaCallerFn) < 0 { return -1 }
+    fbI32WrapI64()
+    return lmaK + off
+  }
   if addr < 0 || addr >= P.nodes.length {
     if emitMemIntrinArg(body, c.callArgs[0], fnIx) < 0 { return -1 }
     return off
@@ -17547,6 +17560,268 @@ function memLowFoldK(addr: i32, fnIx: i32): i64 {
   }
   if k == 0 { return -1 }
   k
+}
+
+// The frame of an accessor call `emitLowMemAccessorCall` inlines: the accessor's own address
+// operand, and the caller's operand and constant that replace it; the accessor's value
+// parameter read, and the caller's argument it stands for. Each node is -1 once consumed.
+let lmaAddrNode = -1
+let lmaAddrRest = -1
+let lmaAddrK: i64 = 0
+let lmaValNode = -1
+let lmaValArg = -1
+let lmaCallerFn = -1
+
+// Under `gLowMemUnused`, a call `f(x + K, v)` of a trivial memory accessor (`lmaAccessBody`)
+// emits `f`'s body in place, its address as `wrap(x)` with K in the memarg, exactly as the
+// direct spelling `__load_i64__(x as% i32, K)` folds. 1 when the call does not qualify.
+function emitLowMemAccessorCall(
+  body: u8[],
+  callIx: i32,
+  fnIx: i32,
+  target: i32,
+): i32 {
+  const c = P.nodes[callIx]
+  const fd = P.nodes[fnStmts[target]]
+  if c is Call {
+    if fd is FuncDecl {
+      const bx = lmaAccessBody(target)
+      if bx < 0 || c.callArgs.length != fd.fnParams.length { return 1 }
+      for nm in c.callArgNames {
+        if nm != "" { return 1 }
+      }
+      const a0 = c.callArgs[0]
+      if a0 < 0 || !exprIsI64(a0, fnIx) { return 1 }
+      const k = memLowFoldK(a0, fnIx)
+      const acc = lmaAccessCall(bx, target)
+      if acc < 0 { return 1 }
+      const ac = P.nodes[acc]
+      if ac is Call {
+        let own: i64 = 0
+        if ac.callArgs.length == memOffsetBaseArityOf(ac) + 1 {
+          own = memOffsetConstValue(ac.callArgs[1], target)
+        }
+        if (
+          k <= 0
+          || own < 0
+          || k + own >= gLowMemUnused
+          || k + own > MEM_OFFSET_MAX
+        ) {
+          return 1
+        }
+        let valNode = -1
+        let valArg = -1
+        if fd.fnParams.length == 2 {
+          valArg = c.callArgs[1]
+          if valArg < 0 || !exprIsI64(valArg, fnIx) { return 1 }
+          valNode = lmaValueRead(memCallArg(ac, 2, 1))
+        }
+        const sAddr = lmaAddrNode
+        const sRest = lmaAddrRest
+        const sK = lmaAddrK
+        const sVal = lmaValNode
+        const sArg = lmaValArg
+        const sFn = lmaCallerFn
+        const sF32 = pendingF32
+        const sF64 = pendingF64
+        const sI64 = pendingI64
+        const sLU = pendingLitUnion
+        const sNulLU = pendingNulLitUnion
+        lmaAddrNode = unwrapParen(ac.callArgs[0])
+        lmaAddrRest = memLowFoldRest(a0, fnIx)
+        lmaAddrK = k
+        lmaValNode = valNode
+        lmaValArg = valArg
+        lmaCallerFn = fnIx
+        pendingF32 = false
+        pendingF64 = false
+        pendingI64 = false
+        pendingLitUnion = 0
+        pendingNulLitUnion = false
+        const rc = emitExpr(body, bx, target)
+        const missed = lmaAddrNode >= 0 || lmaValNode >= 0
+        lmaAddrNode = sAddr
+        lmaAddrRest = sRest
+        lmaAddrK = sK
+        lmaValNode = sVal
+        lmaValArg = sArg
+        lmaCallerFn = sFn
+        pendingF32 = sF32
+        pendingF64 = sF64
+        pendingI64 = sI64
+        pendingLitUnion = sLU
+        pendingNulLitUnion = sNulLU
+        if rc < 0 { return -1 }
+        if missed {
+          return emitFail(
+            "emitProgram: an inlined memory accessor left an operand unread",
+          )
+        }
+        return 0
+      }
+    }
+  }
+  1
+}
+
+// The operand count of memory intrinsic call `c` without its optional offset.
+function memOffsetBaseArityOf(c: Call): i32 {
+  const f = P.nodes[c.callFn]
+  if f is Ident {
+    if f.identName == "__store_i32__" || nameIsMemStoreIntrinsic(f.identName) {
+      return 2
+    }
+  }
+  1
+}
+
+// The body expression of function `fi` when it is a trivial memory accessor, else -1: not
+// generic, i64 parameters with no default, and one expression that is a load of `a as% i32`
+// (under `as` casts and `&` with a constant, returning its own type) or a store of `v` or
+// `v as T` there, where `a` and `v` are the parameters in order and each is read once.
+function lmaAccessBody(fi: i32): i32 {
+  if fi < 0 || fi >= fnStmts.length || captureCountOf(fi) > 0 { return -1 }
+  const fd = P.nodes[fnStmts[fi]]
+  if fd is FuncDecl {
+    if fd.fnTyParams.length > 0 || fd.fnBody < 0 { return -1 }
+    const np = fd.fnParams.length
+    if np < 1 || np > 2 { return -1 }
+    for p in fd.fnParams {
+      const pn = P.nodes[p]
+      if pn is Param {
+        if pn.parDefault >= 0 || pn.parOpt != 0 || pn.parRest != 0 { return -1 }
+        if lmaTypeName(pn.parType) != "i64" { return -1 }
+      } else {
+        return -1
+      }
+    }
+    const blk = P.nodes[fd.fnBody]
+    if blk is Block {
+      if blk.blkStmts.length != 1 { return -1 }
+      const bx = blk.blkStmts[0]
+      const acc = lmaAccessCall(bx, fi)
+      if acc < 0 || !lmaIsIntrinsic(acc, fi) { return -1 }
+      const ac = P.nodes[acc]
+      if ac is Call {
+        const arity = memOffsetBaseArityOf(ac)
+        if ac.callArgs.length != arity && ac.callArgs.length != arity + 1 {
+          return -1
+        }
+        if unwrapParen(ac.callArgs[0]) < 0 { return -1 }
+        if (
+          lmaParamRead(memLowWrapped(unwrapParen(ac.callArgs[0]), fi))
+          != lmaParamName(fd, 0)
+        ) {
+          return -1
+        }
+        if arity == 2 {
+          if np != 2 || fd.fnRet >= 0 || unwrapParen(bx) != acc { return -1 }
+          const vr = lmaValueRead(memCallArg(ac, 2, 1))
+          if lmaParamRead(vr) != lmaParamName(fd, 1) { return -1 }
+          return bx
+        }
+        if np != 1 { return -1 }
+        const rt = lmaTypeName(fd.fnRet)
+        if rt == "" || rt != lmaPrimOf(bx, fi) { return -1 }
+        return bx
+      }
+    }
+  }
+  -1
+}
+
+// The intrinsic call at the core of accessor expression `ix`: the call itself, or the call
+// under `as` casts and a `&` whose other side is a constant (`memOffsetConstValue`, so it has no
+// effect and reads no parameter); -1 otherwise.
+function lmaAccessCall(ix: i32, fi: i32): i32 {
+  let x = unwrapParen(ix)
+  let depth = 0
+  while depth < 4 && x >= 0 {
+    const n = P.nodes[x]
+    if n is Call { return x }
+    if n is AsExpr {
+      x = unwrapParen(n.asObj)
+    } else if n is BinExpr {
+      if n.binOp != "&" { return -1 }
+      if memOffsetConstValue(n.binRight, fi) >= 0 {
+        x = unwrapParen(n.binLeft)
+      } else if memOffsetConstValue(n.binLeft, fi) >= 0 {
+        x = unwrapParen(n.binRight)
+      } else {
+        return -1
+      }
+    } else {
+      return -1
+    }
+    depth = depth + 1
+  }
+  -1
+}
+
+// Whether call `acc` in function `fi` is a scalar load or store intrinsic rather than a binding
+// of that name.
+function lmaIsIntrinsic(acc: i32, fi: i32): boolean {
+  const ac = P.nodes[acc]
+  if ac is Call {
+    const f = P.nodes[ac.callFn]
+    if f is Ident {
+      const nm = f.identName
+      if (
+        identNameIsUserBound(nm, fi)
+        || fnIndexOfSid(sidOfNode(ac.callFn)) >= 0
+      ) {
+        return false
+      }
+      return (nm == "__load_i32__"
+        || nm == "__store_i32__"
+        || nameIsMemLoadIntrinsic(nm)
+        || nameIsMemStoreIntrinsic(nm))
+    }
+  }
+  false
+}
+
+// The parameter read a store's value operand `ix` is: `v`, or `v as T`; else -1.
+function lmaValueRead(ix: i32): i32 {
+  const x = unwrapParen(ix)
+  if x < 0 { return -1 }
+  const n = P.nodes[x]
+  if n is AsExpr { return unwrapParen(n.asObj) }
+  x
+}
+
+// The name an `Ident` node `ix` reads, or "" for any other node.
+function lmaParamRead(ix: i32): string {
+  if ix < 0 { return "" }
+  const n = P.nodes[unwrapParen(ix)]
+  if n is Ident { return n.identName }
+  ""
+}
+
+// The name of parameter `k` of `fd`.
+function lmaParamName(fd: FuncDecl, k: i32): string {
+  const p = P.nodes[fd.fnParams[k]]
+  if p is Param { return p.parName }
+  ""
+}
+
+// The primitive a type annotation node names, or "" for none or any other type.
+function lmaTypeName(ix: i32): string {
+  if ix < 0 { return "" }
+  const t = P.nodes[ix]
+  if t is TypeRef {
+    const nm = t.tyName
+    if nm == "i32" || nm == "i64" || nm == "f32" || nm == "f64" { return nm }
+  }
+  ""
+}
+
+// The primitive expression `ix` of function `fi` yields, as `lmaTypeName` spells it.
+function lmaPrimOf(ix: i32, fi: i32): string {
+  if exprIsI64(ix, fi) { return "i64" }
+  if exprIsF64(ix, fi) { return "f64" }
+  if exprIsF32(ix, fi) { return "f32" }
+  "i32"
 }
 
 // The operand left once `memLowFoldK`'s constant terms are peeled from `addr`.
@@ -18351,6 +18626,10 @@ function emitCallCore(body: u8[], callIx: i32, fnIx: i32) {
       // no-lambda module never enters this path.
       if fnValUsed && captureCountOf(target) > 0 {
         return emitCapturedCall(body, callIx, fnIx, target)
+      }
+      if gLowMemUnused > 0 {
+        const lmaRc = emitLowMemAccessorCall(body, callIx, fnIx, target)
+        if lmaRc <= 0 { return lmaRc }
       }
       return emitDirectCall(body, callIx, fnIx, target)
     }
