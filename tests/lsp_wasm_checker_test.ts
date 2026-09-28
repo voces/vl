@@ -246,6 +246,56 @@ Deno.test({ name: "wasm-checker: a store into a defaulted literal names its decl
   }
 });
 
+// D2977 (plumb PL-056) — the refused value reads the literal binding as a first argument, an
+// operand, or inside a record or list literal. The misses pin the note's ABSENCE when another read
+// wants the literal's own type: the suggestion would refuse that read.
+Deno.test({ name: "wasm-checker: a defaulted literal read inside a value names its declaration", ignore }, async () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  const msgs = async (src: string) =>
+    (await checker.check(src, "/tmp/x.vl", noSiblings))
+      .filter((d) => d.severity === "error")
+      .map((d) => d.message);
+  const note = (nm: string, ln: number, def: string, ann: string) =>
+    ` — \`${nm}\` on line ${ln} has no annotation, so its literal defaulted to \`${def}\`; ` +
+    `annotate it: \`${ann} = …\``;
+  const g = "function mul(a: f32, b: f32): f32 { a * b }\nfunction gi(a: i32): i32 { a }\n";
+  const hits: [string, string][] = [
+    [
+      g + "const x = 0.0\nfunction f(y: f32): f32 { mul(x, y) }\nprint(f(2.0))\n",
+      "argument 1: expected f32, got f64" + note("x", 3, "f64", "const x: f32"),
+    ],
+    [
+      g + "function f(y: f32): f32 {\n  const n = 3\n  n * y\n}\nprint(f(2.0))\n",
+      "operator '*' mixes i32 and f32" + note("n", 4, "i32", "const n: f32"),
+    ],
+    [
+      g + "type V = { v: f32 }\nlet fv = 1.5\nconst r: V = { v: fv }\nprint(r.v)\n",
+      "cannot assign {v: f64} to 'r' of type V" + note("fv", 4, "f64", "let fv: f32"),
+    ],
+    [
+      g + "const e = 4\nconst xs: f32[] = [e]\nprint(xs[0])\n",
+      "cannot assign i32[] to 'xs' of type f32[]" + note("e", 3, "i32", "const e: f32"),
+    ],
+  ];
+  for (const [src, want] of hits) {
+    const got = await msgs(src);
+    if (JSON.stringify(got) !== JSON.stringify([want])) {
+      throw new Error(`want ${JSON.stringify([want])}, got ${JSON.stringify(got)}`);
+    }
+  }
+  const misses = [
+    g + "const b = 3\nprint(mul(b, 1.0))\nprint(gi(b))\n",
+    g + "const i = 1\nconst ys = [7, 8]\nprint(ys[i])\nprint(mul(i, 1.0))\n",
+    g + "const m = 3\nfunction a(): f32 { mul(m, 1.0) }\nfunction c(n: i32): boolean { m < n }\nprint(a())\n",
+  ];
+  for (const src of misses) {
+    const got = await msgs(src);
+    if (JSON.stringify(got) !== JSON.stringify(["argument 1: expected f32, got i32"])) {
+      throw new Error(`want the bare mismatch for ${JSON.stringify(src)}, got ${JSON.stringify(got)}`);
+    }
+  }
+});
+
 Deno.test({ name: "wasm-checker: an emitter-capability rejection surfaces its stable code", ignore }, async () => {
   const checker = loadWasmChecker(SEED, log)!;
   // Type-valid, but codegen cannot lower an INFERRED nullable i32-KEYED MAP return — raised
