@@ -84,6 +84,7 @@ import {
   fsIntrinsicSlot,
   fsRetIsVoid,
   fusedMapReadRecvIx,
+  holePinReadOf,
   ifYieldsNoValue,
   inferJoinListTyOf,
   inferRetBearsNull,
@@ -617,6 +618,9 @@ import {
   monoExactSubN,
   monoExactSubRow,
   monoExactSubT,
+  monoHoleSubN,
+  monoHoleSubRow,
+  monoHoleSubT,
   monoInstFe,
   monoInstOrig,
   monoOrigNode,
@@ -3746,6 +3750,32 @@ function letInitCellKind(letIx: i32, fnIx: i32): VKind {
   // The `boolean | null` niche — a plain i32 to `fbValtype`, but a dedicated kind so the
   // sentinel-2 rep is reachable and a later `x = null` stays valid.
   if letNulBool(letIx, fnIx) { return "nulbool" }
+  letInitHoleKind(letIx, fnIx)
+}
+
+// The last rung of `letInitCellKind`: an initializer the generic body shares, typed at a hole
+// that instance `fnIx` pins to a scalar or a string, takes the pin's rep, since every rung above
+// read the hole (D2918). `"i32"` for anything else, the ladder's default.
+function letInitHoleKind(letIx: i32, fnIx: i32): VKind {
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    const t = holeOperandTyOf(d.letInit, fnIx)
+    if t >= 0 {
+      const rd = repOfTy(t)
+      if rd.rdCovered == 1 {
+        const k = rd.rdKind
+        if (
+          k == "f64"
+          || k == "i64"
+          || k == "f32"
+          || k == "str"
+          || k == "nulstr"
+        ) {
+          return k
+        }
+      }
+    }
+  }
   "i32"
 }
 
@@ -15552,6 +15582,8 @@ export function exprIsBool(ix: i32, fnIx: i32) {
   // everywhere, so the syntactic derivations below still cover paths that lose the tag
   // (a struct-field read, a map `??` result, a closure-value call, a `boolean[]` param).
   if nodeTyWidenedRepName(ix) == "boolean" { return true }
+  // A node the generic body shares, typed at a hole this instance pins to `boolean` (D2919).
+  if tyPrimNameOf(holeOperandTyOf(ix, fnIx)) == "boolean" { return true }
   const e = P.nodes[ix]
   if e is BoolLit { return true }
   if e is IsExpr { return true }
@@ -20006,6 +20038,10 @@ export function exprNulBool(exprIx: i32, fnIx: i32) {
   // form the arms below cannot trace (a `(boolean | null)[]` element read) — unless the read
   // delivers a union box, whose recorded type names a niche it does not hold (D2588).
   if nodeTyIsNulBool(exprIx) { return !narrowedBoxPlace(exprIx, fnIx) }
+  // …and a node the generic body shares, typed at a hole this instance pins to it (D2921).
+  if tyIsNulPrim(holeOperandTyOf(exprIx, fnIx), "boolean") {
+    return !narrowedBoxPlace(exprIx, fnIx)
+  }
   // An if-EXPRESSION whose arm is ITSELF nullable — see `nulIfArmNullableValueIx` (D1560).
   const nlIfB = nulIfArmNullableValueIx(exprIx)
   if nlIfB >= 0 {
@@ -28849,6 +28885,31 @@ export function exactOperandTyOf(exprIx: i32, fnIx: i32): i32 {
   const st = substTyDeep(ty, monoExactSubN[row], monoExactSubT[row])
   if st < 0 || tyHasTyVar(st) { return -1 }
   st
+}
+
+// The type of `exprIx` inside the hole instance `fnIx` is: its recorded type is a hole's
+// variable, which that instance binds. A read, not a substitution, which would bank pins. -1
+// anywhere else, including a lambda lifted inside the instance, which may be shared (D2921).
+export function holeOperandTyOf(exprIx: i32, fnIx: i32): i32 {
+  if monoHoleSubN.length == 0 || fnIx < 0 { return -1 }
+  const ax = unwrapParen(exprIx)
+  if ax < 0 { return -1 }
+  const ty = nodeTyIxOf(ax)
+  if ty < 0 || ty >= T.tys.length { return -1 }
+  if !(T.tys[ty] is TyVar) { return -1 }
+  const row = monoHoleSubRow.get(fnStmtsPosOf(fnIx)) ?? -1
+  if row < 0 || row >= monoHoleSubN.length { return -1 }
+  const b = holePinReadOf(ty, monoHoleSubN[row], monoHoleSubT[row])
+  if b < 0 || b >= T.tys.length || tyHasTyVar(b) { return -1 }
+  b
+}
+
+// `holeOperandTyOf` where that type is `boolean` or `boolean | null`, which share the `i32` rep
+// and so are told apart from it only by the type; -1 otherwise (D2919).
+export function holeOperandBoolTyOf(exprIx: i32, fnIx: i32): i32 {
+  const t = holeOperandTyOf(exprIx, fnIx)
+  if tyPrimNameOf(t) == "boolean" || tyIsNulPrim(t, "boolean") { return t }
+  -1
 }
 
 // The exact map a nullable niche `exprIx` holds inside an exact instance, or -1.
