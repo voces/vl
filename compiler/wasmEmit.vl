@@ -111,7 +111,6 @@ import {
   simdRowSig,
   truncSatFromF64,
   truncSatOp,
-  tyArrayElemPrimName,
   tyIsLitUnion,
   tyIsLitUnionArray,
   tyIsLitUnionOrLit,
@@ -1031,7 +1030,12 @@ import {
   spreadDstBackSlot,
   spreadElemWidens,
   spreadGroupWrapSlot,
+  spreadOwnBoxRow,
+  spreadSourcesStrOrAtoms,
   spreadSourcesWidenTo,
+  spreadSrcAtomTexts,
+  spreadSrcBoxAtom,
+  spreadSrcBoxes,
   stmtIsTailValue,
   structEqStashSlot,
   structIdxOfElemName,
@@ -7447,6 +7451,9 @@ function emitArrSpread(body: u8[], arrIx: i32, fnIx: i32) {
     if boxRow >= 0 { return emitArrSpreadBoxed(body, arrIx, boxRow, fnIx) }
     const boxSrc = spreadBoxingSource(arrIx, fnIx)
     if boxSrc >= 0 {
+      // Nothing threaded a row, so the literal builds at its own typed union-box row.
+      const own = spreadOwnBoxRow(arrIx, elems, fnIx)
+      if own >= 0 { return emitArrSpreadBoxed(body, arrIx, own, fnIx) }
       return emitFailAt(
         "emitProgram: a spread whose elements must each be boxed into a union or nullable "
           + "element has no lowering yet; build the source list at the literal's element type",
@@ -7464,6 +7471,14 @@ function emitArrSpread(body: u8[], arrIx: i32, fnIx: i32) {
       && spreadSourcesWidenTo(elems, pdk, fnIx)
     ) {
       kk = pdk
+    }
+    // A `string[]` destination builds a literal-union atom source's strings (D2868).
+    if (
+      kk == "i32"
+      && pendingListKind == LBK_STR_LIST
+      && spreadSourcesStrOrAtoms(elems, fnIx)
+    ) {
+      kk = "str"
     }
     if kk == null {
       return emitFail(
@@ -7510,7 +7525,11 @@ function emitArrSpread(body: u8[], arrIx: i32, fnIx: i32) {
       if gk != kk { pendingListKind = pendingKindOfMf(gk, 0) }
       pendingListSlot = row
       if emitExpr(body, groups[g], fnIx) < 0 { return -1 }
-      if gk != kk {
+      if gk != kk && kk == "str" {
+        if emitAtomListToStrTop(spreadSrcAtomTexts(groups[g], fnIx)) < 0 {
+          return -1
+        }
+      } else if gk != kk {
         if (
           emitScalarListWidenTop(
             body,
@@ -7625,35 +7644,6 @@ function spreadBoxDestRow(elems: i32[], fnIx: i32): i32 {
   -1
 }
 
-// How spread source `src` reaches union-box row `row`: 1 boxed per element (a scalar list whose
-// element is a member, a record list the element-converting copy widens), 0 a list of that row,
-// -1 neither, which keeps the plain backing copy (a union-box list shares the backing).
-function spreadSrcBoxes(src: i32, row: i32, fnIx: i32): i32 {
-  if row < 0 || row >= rlElemName.length { return -1 }
-  const k = mfRecvKindOf(src, fnIx)
-  if k == null || k == "u8" { return -1 }
-  if k == "ref" {
-    const s = refListSlotOfExpr(src, fnIx)
-    if s == row { return 0 }
-    if s < 0 || s >= rlElemKindTbl.length { return -1 }
-    if rlElemKindTbl[s] == RLK_UNION { return -1 }
-    if rlWidenVariantOf(s, row) < 0 { return -1 }
-    return 1
-  }
-  const ak = spreadSrcAtomKind(src)
-  if ak < 0 || !unionHasAtomKindArm(rlElemName[row], ak) { return -1 }
-  1
-}
-
-// The value atom a scalar list `src`'s element boxes under, or -1 when its element is none.
-function spreadSrcAtomKind(src: i32): i32 {
-  const pn = tyArrayElemPrimName(nodeTyIxOf(src))
-  if pn == "" { return -1 }
-  const k = valueAtomKind(pn)
-  if k < 0 || k > 5 { return -1 }
-  k
-}
-
 // `emitArrSpread` for a destination list of union boxes: a same-row source copies as it is,
 // a record list is boxed by the element-converting copy, a scalar list by its boxing sibling,
 // and a plain run builds at the row; the groups then join as every spread's do.
@@ -7732,12 +7722,12 @@ function emitSpreadGroupBoxed(
     }
     return emitRefListWidenTop(body, s, row)
   }
-  const ak = spreadSrcAtomKind(grp)
   let un = ""
   if row >= 0 && row < rlElemName.length { un = rlElemName[row] }
+  const ak = spreadSrcBoxAtom(grp, un)
   // Unreachable past `spreadSrcBoxes`, which admits only a scalar source whose element is a
-  // member; a widening source (`i32` into `(f64 | null)[]`) keeps the plain copy (D2882).
-  if k == null || k == "u8" || ak < 0 || !unionHasAtomKindArm(un, ak) {
+  // member or widens to one.
+  if k == null || k == "u8" || ak < 0 {
     return emitFailAt(
       "emitProgram: a boxing spread reached a source `spreadSrcBoxes` does not admit",
       grp,
@@ -7762,6 +7752,7 @@ function spreadGroupSrcKind(
     if spreadArgOf(elems[i]) == g {
       const sk = mfRecvKindOf(g, fnIx)
       if sk != null && spreadElemWidens(sk, kk) { return sk }
+      if kk == "str" && spreadSrcAtomTexts(g, fnIx).length > 0 { return "i32" }
       return kk
     }
     i = i + 1
@@ -21011,10 +21002,110 @@ function emitScalarListWidenTop(_body: u8[], srcKind: VKind, dstKind: VKind) {
   0
 }
 
+// Consume a list of literal-union atoms (`i32` ids) on the stack and leave a `string[]` whose
+// elements are each atom's member string, `texts` giving the members (D2868). The string-list
+// sibling of `emitScalarListWidenTop`; the per-element tower is `emitAtomToStr`'s.
+function emitAtomListToStrTop(texts: string[]) {
+  if texts.length == 0 {
+    return emitFail(
+      "emitProgram: a spread widening literal-union atoms to strings has no members",
+    )
+  }
+  const srcWrap = scalarListWrap("i32")
+  const srcBack = scalarListBack("i32")
+  const dstWrap = scalarListWrap("str")
+  const dstBack = scalarListBack("str")
+  const sL = widenScalarWrapSlot("i32")
+  const dL = widenScalarBackSlot("str")
+  const iL = widenTmpSlot(0)
+  const nL = widenTmpSlot(1)
+  const aL = widenTmpSlot(2)
+  fbLocalSet(sL)
+  fbLocalGet(sL)
+  fbStructGet(srcWrap, 1)
+  fbLocalSet(nL)
+  fbLocalGet(nL)
+  fbArrayNewDefault(dstBack)
+  fbLocalSet(dL)
+  fbI32Const(0)
+  fbLocalSet(iL)
+  // block { loop { if i >= n br 1; a = src.back[i]; back[i] = str(a); i++; br 0 } }
+  fbBlock(64)
+  fbLoop(64)
+  fbLocalGet(iL)
+  fbLocalGet(nL)
+  fbI32Bin(78) // 0x4e i32.ge_s
+  fbBrIf(1)
+  fbLocalGet(sL)
+  fbStructGet(srcWrap, 0)
+  fbLocalGet(iL)
+  fbArrayGet(srcBack)
+  fbLocalSet(aL)
+  fbLocalGet(dL)
+  fbLocalGet(iL)
+  if emitAtomLocalToStrChain(texts, 0, aL) < 0 { return -1 }
+  fbArraySet(dstBack)
+  fbLocalGet(iL)
+  fbI32Const(1)
+  fbI32Bin(106) // 0x6a i32.add
+  fbLocalSet(iL)
+  fbBr(0)
+  fbEnd()
+  fbEnd()
+  fbLocalGet(dL)
+  wU8(212) // 0xd4 ref.as_non_null
+  fbLocalGet(nL)
+  fbLocalGet(nL)
+  fbStructNew(dstWrap)
+  0
+}
+
+// `emitAtomToStrChain` over an atom id held in local `aL` rather than the string-op frame,
+// which a function reserves only when it has a string operation of its own.
+function emitAtomLocalToStrChain(texts: string[], i: i32, aL: i32) {
+  if i >= texts.length - 1 {
+    return emitStr([], mkStr(quoteLex(texts[i]), -1), -1)
+  }
+  if emitStr([], mkStr(quoteLex(texts[i]), -1), -1) < 0 { return -1 }
+  if emitAtomLocalToStrChain(texts, i + 1, aL) < 0 { return -1 }
+  fbLocalGet(aL)
+  fbI32Const(internAtom(quoteLex(texts[i])))
+  fbI32Bin(70) // i32.eq
+  wU8(28)      // 0x1c select_t
+  wU8(1)       // one result valtype
+  wU8(100)     // 0x64 (ref ht) — non-null
+  wSLEB(sTypeIdx)
+  0
+}
+
+// The convert opcode an element of `srcKind` takes before it is boxed under value atom
+// `atomK`: -1 when the atom is the element's own, -2 when no lossless widening reaches it.
+function scalarBoxWidenOp(srcKind: VKind, atomK: i32): i32 {
+  if atomK == 3 {
+    if srcKind == "i64" { return -1 }
+    const o = scalarWidenConvOp(srcKind, "i64")
+    if o < 0 { return -2 }
+    return o
+  }
+  if atomK == 4 {
+    if srcKind == "f64" { return -1 }
+    const o = scalarWidenConvOp(srcKind, "f64")
+    if o < 0 { return -2 }
+    return o
+  }
+  -1
+}
+
 // Consume a scalar list of `srcKind` on the stack and leave a `(ref $rlWrapIdx[dstSlot])` whose
 // union-box elements each hold one source element under value atom `atomK`'s tag: the boxing
 // sibling of `emitScalarListWidenTop`, for a spread into a list of a union element (D2869).
 function emitScalarListBoxTop(srcKind: VKind, atomK: i32, dstSlot: i32) {
+  const conv = scalarBoxWidenOp(srcKind, atomK)
+  if conv == -2 {
+    return emitFail(
+      "emitProgram: a spread boxing a scalar list has no convert into its element's atom",
+    )
+  }
   let vb = -1
   if atomK != 2 {
     vb = vbHeapIdxOfKind(atomK)
@@ -21062,6 +21153,7 @@ function emitScalarListBoxTop(srcKind: VKind, atomK: i32, dstSlot: i32) {
   fbStructGet(srcWrap, 0)
   fbLocalGet(iL)
   fbArrayGet(srcBack)
+  if conv >= 0 { wU8(conv) }
   if vb >= 0 { fbStructNew(vb) }
   fbStructNew(uBoxIdx)
   fbArraySet(dstBack)

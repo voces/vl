@@ -6,7 +6,7 @@
 // consumer's `vl check tools/replay-info.vl` printed 44 warnings, 42 of them inside
 // std, burying the two that were about the target (glean VL-014; D1601).
 //
-// Policy pinned here (compiler/cli.vl, `cliDiagStdHidden`):
+// Policy pinned here (compiler/cli.vl, `cliDiagWithheld`):
 //   - a non-error whose owning module key starts with `std:` is WITHHELD unless
 //     `--include-std` is passed, and counts nowhere while withheld — not in the
 //     tally, not in the `--severity` gate, not in the `--json` array;
