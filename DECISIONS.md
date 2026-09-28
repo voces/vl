@@ -50,8 +50,20 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   A pattern past 64 bits is refused at the literal itself, since no VL destination is wider.
   **Upward adoption only at an operand peer**: an i64 peer widens the literal, a 32-bit peer
   leaves a wider one alone, so `x + 0x1_0000_0000` over an `i32` still widens to i64 rather
-  than becoming a new refusal. And unary minus is NOT peeled — the literal is then an operand
-  rather than the delivered value — which is also Java's answer (`long x = -0xFFFFFFFF` is 1).
+  than becoming a new refusal. A negated literal is read at the destination's width too, so
+  `const x: i64 = -0xFFFFFFFF` is −4294967295 (unlike Java's `long x = -0xFFFFFFFF`, which is 1);
+  the next entry makes that one rule for every negation chain.
+
+- **A NEGATION CHAIN OVER ONE INTEGER LITERAL IS A LITERAL TREE, ADOPTED AT A 64-BIT DESTINATION**
+  (2026-09-28, D3043/D3049/D3050, #3265). An i64 binding, return, argument, operator peer or
+  `as i64` computes `-(-lit)` at 64 bits exactly as it computes `1 + 2`, so the checker and the
+  emitter agree on a chain's type and value at every nesting. This CHANGES the value of programs
+  that ran: `const x: i64 = -(-0x80000000)` was −2147483648 and is 2147483648, and
+  `const C0: i64 = -(-2147483648)` likewise; `-(-0xffffffff)` at i64 was −1 and is 4294967295.
+  The old values were the checker typing the chain i32 while the emitter read one negation at
+  64 bits — no reading of the language produced them. With no 64-bit destination a chain keeps
+  its own width, so `print(-(-2147483648))` still wraps at i32. A chain over a decimal that fits
+  i32 never wraps, so it is left at i32 and widened after (same value, no adoption cost).
 
 - **`T | null` IS VALUE-COMPARABLE EXACTLY WHEN `T` IS** (2026-09-03, D1180). `isEquatable`
   refused every nullable field on the stated ground that "discriminating the variant would be
