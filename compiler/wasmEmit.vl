@@ -56,6 +56,7 @@ import {
   isNumIntrinsicName,
   isValueUnionName,
   isVarTyIxOf,
+  listWidenRetagAny,
   listWidenRetagRowsOf,
   mapDeliveryRecorded,
   mapRetagRowsOf,
@@ -399,6 +400,10 @@ import {
   gHelpStrConcat,
   gHelpStrEq,
   gHelpStrHash,
+  gHelpSvGet,
+  gHelpSvLen,
+  gHelpSvMk,
+  gHelpSvSync,
   gHelpUtf8CpLen,
   gHelpUtf8Dec,
   gHelpUtf8Enc,
@@ -508,6 +513,9 @@ import {
   strCatSlotIx,
   strPushScratchBase,
   strScratchBase,
+  svDstOn,
+  svPairOn,
+  svPairs,
   tailCallEnd,
   tailCallIdx,
   u8PushScratchBase,
@@ -3869,7 +3877,8 @@ function emitListGetIdx(body: u8[], idxIx: i32, fnIx: i32) {
 // heap when this call staged it, else the expression itself. `heap` is that wrapper.
 function emitListGetRecv(body: u8[], objIx: i32, fnIx: i32, heap: i32) {
   if listGetRecvStagedIx < 0 || listGetRecvStagedIx != unwrapParen(objIx) {
-    return emitExpr(body, objIx, fnIx)
+    if emitExpr(body, objIx, fnIx) < 0 { return -1 }
+    return svSyncRecv(objIx, fnIx)
   }
   if listGetRecvStagedSet {
     fbLocalGet(listGetRecvSlot)
@@ -3878,6 +3887,7 @@ function emitListGetRecv(body: u8[], objIx: i32, fnIx: i32, heap: i32) {
       return emitFailAt("emitProgram: `.get` operand stash not reserved", objIx)
     }
     if emitExpr(body, objIx, fnIx) < 0 { return -1 }
+    svSyncRecv(objIx, fnIx)
     fbLocalTee(listGetRecvSlot)
     listGetRecvStagedSet = true
   }
@@ -7564,6 +7574,7 @@ function emitArrSpread(body: u8[], arrIx: i32, fnIx: i32) {
       if gk != kk { pendingListKind = pendingKindOfMf(gk, 0) }
       pendingListSlot = row
       if emitExpr(body, groups[g], fnIx) < 0 { return -1 }
+      svSyncRecv(groups[g], fnIx)
       if gk != kk && kk == "str" {
         if emitAtomListToStrTop(spreadSrcAtomTexts(groups[g], fnIx)) < 0 {
           return -1
@@ -11175,6 +11186,8 @@ function hoistRowOfRecv(recvIx: i32, name: string, fnIx: i32) {
   const ek = scalarListElemKind(recvIx, fnIx)
   if ek != null {
     if !scalarListUsed(ek) { return 0 - 1 }
+    // A view's header is its snapshot; its element reads go through its source (D3028).
+    if svDstOfKind(ek) >= 0 { return 0 - 1 }
     return listHoistRow(name, listIdxKindOf(ek), 0)
   }
   // A raw string receiver is checked last, after every list rep, so `exprString` never
@@ -11454,6 +11467,11 @@ function emitIndexGo(body: u8[], idxIx: i32, fnIx: i32) {
       if nsk == "nuli64list" { nek = "i64" }
       if nsk == "nulf32list" { nek = "f32" }
       if nsk == "nulu8list" { nek = "u8list" }
+      const nsv = svDstOfKind(nek)
+      if nsv >= 0 {
+        fbCall(gHelpSvGet[nsv])
+        return 0
+      }
       emitListIdxGuard(
         listIdxWrapSlot(listIdxKindOf(nek), 0),
         scalarListWrap(nek),
@@ -11515,6 +11533,7 @@ function emitIndexGo(body: u8[], idxIx: i32, fnIx: i32) {
         return 0
       }
       wU8(212) // 0xd4 ref.as_non_null (recover the non-null element)
+      if emitStaleBoxRetag(rslot, idxIx) < 0 { return -1 }
       // A union-box cell whose index place is narrowed to one scalar atom unboxes here
       // (D451): without it `vl check` proves `xs[0]` non-null and every classifier calls it
       // an `i32`, but this arm still leaves the raw `(ref $uBox)` for an unboxed consumer —
@@ -11600,6 +11619,12 @@ function emitIndexGo(body: u8[], idxIx: i32, fnIx: i32) {
       pendingF32 = false
       if emitExpr(body, nd.idxIndex, fnIx) < 0 { return -1 }
       pendingF32 = savedIxF32
+      // A list that may be a view reads its element through the view's source (D3028).
+      const ixSv = svDstOfKind(ek)
+      if ixSv >= 0 && skHz < 0 {
+        fbCall(gHelpSvGet[ixSv])
+        return 0
+      }
       // Guard `i u< len`, unwrap to the backing (`struct.get` field 0), read.
       if skHz >= 0 {
         emitListIdxGuardHoisted(skHz, nd.idxIndex)
@@ -11669,6 +11694,11 @@ function emitArrLen(body: u8[], memIx: i32, fnIx: i32) {
       && (lek == "f64" || lek == "i64" || lek == "f32" || lek == "u8list")
     ) {
       if emitExpr(body, m.memObj, fnIx) < 0 { return -1 }
+      const lenSv = svDstOfKind(lek)
+      if lenSv >= 0 {
+        fbCall(gHelpSvLen[lenSv])
+        return 0
+      }
       fbStructGet(scalarListWrap(lek), 1) // field 1: len
       return 0
     }
@@ -13355,8 +13385,10 @@ function emitListConcatG(
   // A NARROWED nullable operand's cell still holds a `(ref null …)` while the frame slot
   // is non-null — the same recovery the compare cores make, off the same one home.
   if emitEqRecoverNarrowed(leftIx, fnIx) < 0 { return -1 }
+  svSyncRecv(leftIx, fnIx)
   if emitExpr(body, rightIx, fnIx) < 0 { return -1 }
   if emitEqRecoverNarrowed(rightIx, fnIx) < 0 { return -1 }
+  svSyncRecv(rightIx, fnIx)
   fbLocalSet(bA + 1)   // B
   fbLocalSet(bA + 0)   // A
   fbLocalGet(bA + 0)
@@ -20868,6 +20900,7 @@ function emitPopGo(
               return -1
             }
             fbRefAsNonNull()
+            if emitStaleBoxRetag(popRefSlot, callIx) < 0 { return -1 }
             fbElse() // 0x05 else — absent → the null-tagged box
             fbI32Const(nullBoxTag())
             fbRefNullNone()
@@ -21277,7 +21310,10 @@ function emitMapFilter(body: u8[], callIx: i32, fnIx: i32) {
       if nulRecvNeedsRecover(callee.memObj, fnIx) {
         wU8(212) // 0xd4 ref.as_non_null
       }
+      svSyncRecv(callee.memObj, fnIx)
       fbLocalSet(srcL)
+      mfSrcSlot = -1
+      if srcElemRef { mfSrcSlot = srcSlot }
       // clo = the callback's closure value, built ONCE before the loop. An inline
       // literal / named function constructs it directly; a let-bound value reads its
       // binding (an `Ident` read — it cannot itself contain a HOF site, so the frame
@@ -21354,6 +21390,7 @@ function emitMapFilter(body: u8[], callIx: i32, fnIx: i32) {
       fbBr(0)       // continue the loop
       fbEnd()       // end loop
       fbEnd()       // end block
+      mfSrcSlot = -1
       // result = wrapper{ back, len, cap }: len = n (map) / j (filter), cap = n.
       fbLocalGet(dstL)
       if isMap { fbLocalGet(nL) } else { fbLocalGet(jL) }
@@ -21876,8 +21913,48 @@ function emitScalarListWidenSiteElem(
   if covarValueWriteState(covarRootName(srcIx), covarRootFrame(srcIx)) != 0 {
     return false
   }
+  // A source other handles may write is delivered as a view that reads through it (D3028).
+  if !covarRootFreshLocal(srcIx) {
+    const p = svPairOfKinds(sk, de)
+    if p >= 0 {
+      fbCall(gHelpSvMk[p])
+      return true
+    }
+  }
   if emitScalarListWidenTop(body, sk, de) < 0 { return false }
   true
+}
+
+// The view pair (`svPairOn`) serving a `src` list read as a `dst` one, or -1 where none is built.
+// The three pairs are exactly the three converts `scalarWidenConvOp` names, in its order.
+function svPairOfKinds(src: VKind, dst: VKind): i32 {
+  const op = scalarWidenConvOp(src, dst)
+  const ops = [172, 183, 187]
+  let p = 0
+  while p < ops.length {
+    if ops[p] == op && svPairOn(p) { return p }
+    p = p + 1
+  }
+  -1
+}
+
+// The view destination a scalar list of element `k` reads as (0 `i64`, 1 `f64`), or -1 where
+// no view of that element is built: `k` is a destination exactly when an `i32` widens to it.
+function svDstOfKind(k: VKind | null): i32 {
+  if svPairs == 0 || k == null { return -1 }
+  const d = svPairOfKinds("i32", k)
+  if d == 0 { return 0 }
+  if svDstOn(1) && scalarWidenConvOp("i32", k) == 183 { return 1 }
+  -1
+}
+
+// Refresh the list just emitted for `recvIx` when it may be a view, before an operation reads
+// its backing whole: the view's snapshot then holds its source as it is now (D3028).
+function svSyncRecv(recvIx: i32, fnIx: i32) {
+  if svPairs == 0 { return 0 }
+  const d = svDstOfKind(scalarListElemKind(recvIx, fnIx))
+  if d >= 0 { fbCall(gHelpSvSync[d]) }
+  0
 }
 
 // `emitClampIdx`'s dual over plain wasm i32 LOCALS (not the string-op frame): emit
@@ -22040,6 +22117,7 @@ function emitArrSlice(body: u8[], callIx: i32, fnIx: i32) {
       if nulRecvNeedsRecover(callee.memObj, fnIx) {
         wU8(212) // 0xd4 ref.as_non_null
       }
+      svSyncRecv(callee.memObj, fnIx)
       // The receiver and both bounds reach the stack before the frame is written: the frame
       // is shared, so a slice, `.map` or `.filter` in an argument would overwrite it (D2332).
       if emitExpr(body, c.callArgs[0], fnIx) < 0 { return -1 }
@@ -22116,8 +22194,55 @@ function emitMfElem(
   fbArrayGet(srcBack)     // 0xfb 0x0b <srcBack>
   if srcElemRef {
     wU8(212) // 0xd4 ref.as_non_null
+    if mfSrcSlot >= 0 { return emitStaleBoxRetag(mfSrcSlot, -1) }
   }
   0
+}
+
+// The ref-list slot `emitMfElem` reads from, for a read-side retag of its union boxes; -1 outside
+// a `.map`/`.filter` loop or where the source is not a ref list.
+let mfSrcSlot = -1
+
+// The members a union box read out of ref-list slot `slot` may hold beyond its own: each narrower
+// scalar the slot's union holds only widened, which a list shared across a widening delivery
+// still carries (D3026). "" when there is none, or no such delivery in the module.
+function staleBoxFrom(slot: i32): string {
+  if !listWidenRetagAny() { return "" }
+  if slot < 0 || slot >= rlElemName.length || slot >= rlElemKindTbl.length {
+    return ""
+  }
+  if rlElemKindTbl[slot] != RLK_UNION { return "" }
+  const u = rlElemName[slot]
+  const ua: string[] = []
+  splitUnionAtoms(u, ua)
+  // Which of the value atoms (`valueAtomKind` 0..5) the union holds.
+  const has = [false, false, false, false, false, false]
+  let i = 0
+  while i < ua.length {
+    const ak = valueAtomKind(ua[i])
+    if ak >= 0 && ak < has.length { has[ak] = true }
+    i = i + 1
+  }
+  const hasI32 = has[0]
+  const hasI64 = has[3]
+  const hasF64 = has[4]
+  const hasF32 = has[5]
+  // A member no box of this module is built for cannot be carried.
+  let from = ""
+  if !hasI32 && (hasI64 || hasF64) && vbHeapIdxOfKind(0) >= 0 { from = "i32" }
+  if !hasF32 && hasF64 && vbHeapIdxOfKind(5) >= 0 {
+    if from == "" { from = "f32" } else { from = from + "|f32" }
+  }
+  from
+}
+
+// Rebuild the union box on the stack, read out of ref-list slot `slot`, under the member of its
+// own union that a narrower member it still carries widens to (`staleBoxFrom`).
+function emitStaleBoxRetag(slot: i32, at: i32) {
+  if slot < 0 || slot >= rlElemName.length { return 0 }
+  const from = staleBoxFrom(slot)
+  if from == "" { return 0 }
+  emitBoxAtomRetag(from, rlElemName[slot], at)
 }
 
 // Invoke the callback closure (stashed in local `cL`) on `elem(i)`: push its env
@@ -22180,7 +22305,8 @@ function emitForInList(
     if forInMapWalksVals(iterIx, fnIx) { return pushMapVals(body) }
     return pushMapKeys(body)
   }
-  emitExpr(body, iterIx, fnIx)
+  if emitExpr(body, iterIx, fnIx) < 0 { return -1 }
+  svSyncRecv(iterIx, fnIx)
 }
 
 // Lower a return-value expression `retArg` for function `fnIx`: seed the return context
@@ -24947,6 +25073,10 @@ function emitForInStmt(body: u8[], s: ForIn, stmtIx: i32, fnIx: i32) {
     fbStructGet(wrapTy, 1)
     fbLocalSet(fiHLen)
   }
+  // A walk whose body may write reads a view's length and elements through its source at every
+  // step, as it re-reads a shared list's header (D3028).
+  let fiSv = -1
+  if fiHLen < 0 && (ek == "f64" || ek == "i64") { fiSv = svDstOfKind(ek) }
   // a string source runs its cursor in backing coordinates: the `#l` temp holds the
   // header, so hoist the backing into its own slot and pre-compute the exit bound — one
   // `array.get` per code point and no `struct.get` in the loop, since binaryen is not
@@ -25031,6 +25161,9 @@ function emitForInStmt(body: u8[], s: ForIn, stmtIx: i32, fnIx: i32) {
     fbLocalGet(fiSEnd)
   } else if fiHLen >= 0 {
     fbLocalGet(fiHLen)
+  } else if fiSv >= 0 {
+    fbLocalGet(lIdx)
+    fbCall(gHelpSvLen[fiSv])
   } else {
     fbLocalGet(lIdx)
     fbStructGet(wrapTy, 1)
@@ -25085,6 +25218,10 @@ function emitForInStmt(body: u8[], s: ForIn, stmtIx: i32, fnIx: i32) {
     fbLocalGet(fiHBack)
     fbLocalGet(iIdx)
     fbArrayGet(backTy)
+  } else if fiSv >= 0 {
+    fbLocalGet(lIdx)
+    fbLocalGet(iIdx)
+    fbCall(gHelpSvGet[fiSv])
   } else {
     fbLocalGet(lIdx)
     fbStructGet(wrapTy, 0)
@@ -25097,6 +25234,9 @@ function emitForInStmt(body: u8[], s: ForIn, stmtIx: i32, fnIx: i32) {
     // kind is absent on purpose, since its loop var legitimately holds null — this set and
     // `forInElemKind`'s niche arms are one decision, or a loud reject turns into invalid wasm.
     wU8(212) // 0xd4 ref.as_non_null
+    if hKind == "ref" && hSlot >= 0 {
+      if emitStaleBoxRetag(hSlot, s.fiIter) < 0 { return -1 }
+    }
   }
   fbLocalSet(vIdx)
   if pairIsVal {
@@ -27771,8 +27911,10 @@ function emitBinExprNode(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
     if gK >= 0 {
       if emitExpr(body, e.binLeft, fnIx) < 0 { return -1 }
       if emitEqRecoverNarrowed(e.binLeft, fnIx) < 0 { return -1 }
+      svSyncRecv(e.binLeft, fnIx)
       if emitExpr(body, e.binRight, fnIx) < 0 { return -1 }
       if emitEqRecoverNarrowed(e.binRight, fnIx) < 0 { return -1 }
+      svSyncRecv(e.binRight, fnIx)
       if emitListEqAnyRep(body, gK, eqgListSlotOfBin(exprIx, fnIx), fnIx) < 0 {
         return -1
       }
@@ -27793,8 +27935,10 @@ function emitBinExprNode(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
     }
     if emitExpr(body, e.binLeft, fnIx) < 0 { return -1 }
     if emitEqRecoverNarrowed(e.binLeft, fnIx) < 0 { return -1 }
+    svSyncRecv(e.binLeft, fnIx)
     if emitExpr(body, e.binRight, fnIx) < 0 { return -1 }
     if emitEqRecoverNarrowed(e.binRight, fnIx) < 0 { return -1 }
+    svSyncRecv(e.binRight, fnIx)
     if emitEqNonNullCore(body, exprIx, fnIx) < 0 { return -1 }
     if e.binOp == "!=" {
       fbI32Eqz() // 0x45 i32.eqz (`!=` negates value-equality)
