@@ -27,10 +27,10 @@ tree ungraded.
 
 | verdict | rows | what it means |
 | --- | --- | --- |
-| `pass-stamped` | 5 | the key reads `emitPassGen`, or a phase flag that is one |
+| `pass-stamped` | 6 | the key reads `emitPassGen`, or a phase flag that is one |
 | `no-refined-input` | 3 | every table its value reads is push-only or reset wholesale |
 | `resume-reseeds` | 2 | a resume bank that writes the refined columns back before reusing them |
-| `not-a-memo` | 9 | a visit mark or a per-row flag — no cached ANSWER to go stale |
+| `not-a-memo` | 10 | a visit mark or a per-row flag — no cached ANSWER to go stale |
 | `probe` | 12 | safety is measured, not argued |
 
 ### The rows
@@ -41,13 +41,14 @@ tree ungraded.
 | `refArrShapeIndex` (`ras*`) | `tyMutEpoch`, `cUserTypesVer`, `P.nodes.length`, 4 collect lengths, **`emitPassGen`** | none named; the row also carries the arena epoch and the declared-type version, and the identity proof is the compiler's own codegen plus 3,045 corpus modules | pass-stamped |
 | `dsgReady` (declared-struct graph) | `emitRootIx`, `P.nodes.length` | none reachable: the `emitArenaFinal` gate means no pass runs after it is built | pass-stamped |
 | `rsIxReady` (a re-seated list's use index: parents and same-name identifier chains, D2914) | `emitRootIx`, `P.nodes.length` | none reachable: the `emitArenaFinal` gate means no pass runs after it is built; reset per program with the other sid-keyed tables | pass-stamped |
+| `objLitBindDestRow` (`rsRecRow`, a record literal's re-seated row, D2933; `rsLetDst` beside it for a list's) | `sNames.length`, and the use index's reset | none reachable: answered only once `emitArenaFinal` is set, and both reset with the use index they read | pass-stamped |
 | `dslEnsure` (a scope's lambda bindings and named calls, D2748) | `dslRoot` (the scope), `dslLen` | none reachable: kept only once `emitArenaFinal` is set, rebuilt per query before | pass-stamped |
 | `variantSig` | `uFieldNames`/`uFieldStart`/`uFieldCount` lengths | none: it reads field NAMES, and all three tables are push-only | no-refined-input |
 | `objVariantIndex` (`ovn*`) | `uVariants`/`uFieldStart`/`uFieldCount` lengths | none, the same three tables through `variantSig` | no-refined-input |
 | `declStructNodeOf` | top-level `stmts.length` | none: it indexes `TypeDecl` nodes, which no pass rewrites | no-refined-input |
 | `buildFnMapResumable` | 8 collect lengths | `fRetKind` and siblings — and `buildFnMapReseedPrefix` writes the banked seed back over the prefix, which is what makes the resume exact rather than merely cheap | resume-reseeds |
 | `collectAResumable` | `P.nodes.length` + 7 collect lengths | the annotation sidecars; the bank is armed only for a run no arena-editing pass crosses | resume-reseeds |
-| `monoGen`, `daGen`, `klGSeen`, `npEpochs`/`asgDeclEpochs`, `emitNameSeen`/`nomNameSeen`/`stSeenStack`, `gRootStmts`, `repSeenGen`, `rtWalkGen`, `gwBoxedSeen` (the getter walk's once-per-type report mark) | — | — | not-a-memo |
+| `monoGen`, `daGen`, `klGSeen`, `npEpochs`/`asgDeclEpochs`, `emitNameSeen`/`nomNameSeen`/`stSeenStack`, `gRootStmts`, `repSeenGen`, `rtWalkGen`, `gwBoxedSeen` (the getter walk's once-per-type report mark), `rsRetSeenE`/`rsRetSeenL` (the re-seat return walk's once-per-query function mark, D2922) | — | — | not-a-memo |
 | `repKeyMemo` / `hcCanonMemo` | `tyMutEpoch` | its own canon-key columns | probe |
 | `repElemMemo` / `hcElemMemo` / `hcMvMemo` | `tyMutEpoch`, `cUserTypesVer`, `sNames.length` | its own columns | probe |
 | `repSlotCache` | `tyMutEpoch`, `cUserTypesVer`, `sNames.length` | `sFieldTypes`, which `unifyMixedLitRepArms` re-lays in place at the end of `collectS` | probe |

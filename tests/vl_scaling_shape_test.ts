@@ -297,6 +297,32 @@ const genAdoptedListsFn = (nf: number): string => {
   return o.join("\n") + "\n";
 };
 
+// D2933's same-name twin: `nf` functions, each binding its own record literal `r` and handing an
+// alias of it to a declared record of the same field names, so each literal is re-seated.
+const genReseatedRecordsFn = (nf: number): string => {
+  const o = ["type J = { f: i32 | null }", "type I = { f: i32 }", "function use(j: J): i32 { j.f ?? 0 }"];
+  for (let k = 0; k < nf; k++) {
+    o.push(`function h${k}(): i32 {`, `  const r = { f: ${k % 13} }`, "  const q = r", "  use(q) + r.f", "}");
+  }
+  o.push("let acc = 0");
+  for (let k = 0; k < nf; k++) o.push(`acc = acc + h${k}()`);
+  o.push("print(acc)");
+  return o.join("\n") + "\n";
+};
+
+// D2922's DEPTH twin: a chain of `k` un-annotated functions, each returning the previous one's
+// call from three `return`s, over a record literal a declared record of its field names could
+// re-seat, so a use walk that followed each call once per path would read 3^k calls.
+const genReturnChain = (k: number): string => {
+  const o = ["type J = { f: i32 | null }", "type I = { f: i32 }", "const r = { f: 7 }", "function g0(n: i32) { return r }"];
+  for (let i = 1; i <= k; i++) {
+    o.push(`function g${i}(n: i32) {`, `  if n > 2 { return g${i - 1}(n - 1) }`);
+    o.push(`  if n > 1 { return g${i - 1}(n - 2) }`, `  return g${i - 1}(n)`, "}");
+  }
+  o.push(`print(g${k}(3).f)`);
+  return o.join("\n") + "\n";
+};
+
 // ── the runner ───────────────────────────────────────────────────────────────
 
 // A COMPILE PAIR IS GRADED ON GUEST FUEL. `$VL_FUEL=1` makes the host meter the compiler in
@@ -528,6 +554,26 @@ axis(
   5.0,
   "A re-seated list's use check (`rsUsesOf`, compiler/emit_classify.vl) is reading other functions' identifiers.",
   (d) => twoFiles(d, genAdoptedListsFn(800), genAdoptedListsFn(200)),
+);
+
+// D2933's same-name GROWTH pair: 800 functions each re-seating its own `r` against 200, so
+// linear reads 4 and quadratic 16. Fuel reads 3.94 on master `8615a730d` and with the re-seat
+// alike, so the bar is 1.25x that.
+axis(
+  "re-seated record literals sharing a name",
+  5.0,
+  "A record literal's re-seat (`objLitBindDestRow`, compiler/emit_classify.vl) is reading other functions' identifiers.",
+  (d) => twoFiles(d, genReseatedRecordsFn(800), genReseatedRecordsFn(200)),
+);
+
+// D2922's DEPTH pair: a return chain 200 functions deep against 50, so linear reads 4. Fuel reads
+// 3.96 on master `8615a730d` and 3.95 with the call walk, so the bar is 1.25x that; a walk with
+// no per-query visited set traps the compiler on both arms.
+axis(
+  "records returned through a deep call chain",
+  5.0,
+  "A re-seated value's return walk (`rsRetCallUse`, compiler/emit_classify.vl) is re-walking a function's calls per path.",
+  (d) => twoFiles(d, genReturnChain(200), genReturnChain(50)),
 );
 
 // 1.09 / 0.97 / 1.13.
