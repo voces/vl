@@ -610,6 +610,7 @@ import {
   modNumCastSeen,
   modUnionAsHit,
   modUnionAsSeen,
+  monoAnonParamPinTy,
   monoExactSubN,
   monoExactSubRow,
   monoExactSubT,
@@ -665,6 +666,7 @@ import {
   rlWrAns,
   rlWrSlots,
   rlWrapIdx,
+  sAnonOwnTy,
   sDeclared,
   sFieldCloSig,
   sFieldCount,
@@ -1683,6 +1685,30 @@ function feParamTyName(fe: i32, name: string) {
   ""
 }
 
+// The return expression of maker `mk`, seen through a `const` it binds to an object literal
+// and returns (`const r = { ... }; return r`), so the record is read per instance (D2853).
+function makerRetObjLitOf(mk: i32): i32 {
+  const rx = fnRetExprOf(fnStmts[mk])
+  if rx < 0 { return rx }
+  const ux = unwrapParen(rx)
+  const re = P.nodes[ux]
+  if re is Ident {
+    const fd = P.nodes[fnStmts[mk]]
+    if fd is FuncDecl {
+      const li = parentLetOf(fd.fnBody, re.identName)
+      if li >= 0 {
+        const ld = P.nodes[li]
+        if ld is LetDecl {
+          if ld.letKw == "const" && ld.letInit >= 0 {
+            if P.nodes[unwrapParen(ld.letInit)] is ObjLit { return ld.letInit }
+          }
+        }
+      }
+    }
+  }
+  rx
+}
+
 // Boolean-ness of a field-closure trap call `recv.prop(...)`. Monomorphized maker instances
 // share the closure body, so its inferred return kind cannot distinguish `wrap(true)` from
 // `wrap(99)`; follow the receiver to its maker instance and read the closure's tail through
@@ -1690,7 +1716,7 @@ function feParamTyName(fe: i32, name: string) {
 function fieldCloCallIsBool(recvIx: i32, prop: string, fnIx: i32) {
   const mk = recvMakerFnOf(recvIx, fnIx)
   if mk >= 0 {
-    const rx = fnRetExprOf(fnStmts[mk])
+    const rx = makerRetObjLitOf(mk)
     if rx >= 0 {
       const re = P.nodes[unwrapParen(rx)]
       if re is ObjLit {
@@ -11483,12 +11509,46 @@ function declRowScalarFits(valIx: i32, si: i32, mfi: i32): boolean {
 function anonRowScalarFits(valIx: i32, si: i32, mfi: i32): boolean {
   if si < 0 || si >= sTyIx.length { return true }
   if mfi < 0 || mfi >= sFieldCount[si] { return true }
-  const fk = code0KindOf(
-    tyFieldTyOf(sTyIx[si], sFieldNames[sFieldStart[si] + mfi]),
-  )
+  const fnm = sFieldNames[sFieldStart[si] + mfi]
+  let fk = code0KindOf(tyFieldTyOf(sTyIx[si], fnm))
+  if fk == 0 { fk = code0KindOf(tyFieldTyOf(sAnonOwnTy.get(si) ?? -1, fnm)) }
   const vk = code0KindOf(nodeTyIxOf(valIx))
+  // A row recorded at a hole has no field type to ask; its atom companion still says whether
+  // the slot holds a literal set (D2762).
+  if fk == 0 && vk != 0 {
+    return (vk == 3) == (sFieldElemNameAt(si, mfi) != "")
+  }
   if fk == 0 || vk == 0 { return true }
   fk == vk
+}
+
+// Whether a parameter of instance `fnIx` read as a field value may be stored in row `si`'s
+// field `mfi`: an `i32` or `boolean` pin takes no literal-set slot, whose reads print a member.
+// The shared literal records the template's hole, so the instance's parameter type says it (D2762).
+function instParamAtomFits(valIx: i32, si: i32, mfi: i32, fnIx: i32): boolean {
+  if fnIx < 0 { return true }
+  const v = P.nodes[unwrapParen(valIx)]
+  if !(v is Ident) { return true }
+  if narrowSlotOf(v.identName) >= 0 { return true }
+  const fd = P.nodes[fnIx]
+  if !(fd is FuncDecl) { return true }
+  let vk = 0
+  let i = 0
+  while i < fd.fnParams.length {
+    const p = P.nodes[fd.fnParams[i]]
+    if p is Param {
+      if p.parName == v.identName {
+        if p.parType < 0 {
+          vk = 1
+        } else {
+          vk = code0KindOf(nodeTyIxOf(p.parType))
+        }
+      }
+    }
+    i = i + 1
+  }
+  if vk != 1 && vk != 2 { return true }
+  sFieldElemNameAt(si, mfi) == ""
 }
 
 // The code-0 kind of type `ty`: 1 `i32`, 2 `boolean`, 3 a string literal or literal set, 0
@@ -11764,6 +11824,29 @@ export function anonHandleTyIx(nm: string): i32 {
   sTyIx[si]
 }
 
+// Whether record type `ty` agrees, field by code-0 kind, with the type the anonymous row `nm`
+// is minted from: 1 it does, so a value of the row reads correctly at `ty`; 0 it does not;
+// -1 when the row or its minting type is unknown (D2762).
+export function anonRowKindsAgree(nm: string, ty: i32): i32 {
+  const si = structIndexOfTypeName(nm)
+  if si < 0 || !sIsAnonRow(si) || si >= sTyIx.length || ty < 0 { return -1 }
+  let rt = sAnonOwnTy.get(si) ?? -1
+  if rt < 0 && !tyHasTyVar(sTyIx[si]) { rt = sTyIx[si] }
+  if rt < 0 { return -1 }
+  const t = T.tys[ty]
+  if t is TyObj {
+    let i = 0
+    while i < t.objFieldNames.length {
+      const rf = tyFieldTyOf(rt, t.objFieldNames[i])
+      if rf < 0 { return -1 }
+      if code0KindOf(rf) != code0KindOf(t.objFieldTypes[i]) { return 0 }
+      i = i + 1
+    }
+    return 1
+  }
+  -1
+}
+
 // A memo over `structIndexOfObjCtxGo`, keyed by node index and the querying `fnIx` (the
 // f64 axis is per-instance). A hit is stable since rows only append, so an existing
 // first match stays first; a miss is stamped with the row count and only recomputed
@@ -11845,6 +11928,7 @@ function structIndexOfObjCtxGo(objIx: i32, fnIx: i32) {
       && adopted >= 0
       && adopted != nodeTyIxOf(objIx)
       && !tyReachesUnion(adopted, 8)
+      && !tyHasTyVar(adopted)
     ) {
       const ar = repRowOfTyStruct(adopted, sScanLim())
       if ar >= 0 { return ar }
@@ -11912,6 +11996,12 @@ function structIndexOfObjCtxGo(objIx: i32, fnIx: i32) {
                 if fnIx >= 0 || vc >= 0 { ok = false }
               } else if !anonValueFitsField(vc, sc, f.fiValue, si, mfi) {
                 // The remaining value axes, of which the f64 and i64 checks are special cases.
+                ok = false
+              } else if (
+                sc == FC_I32
+                && sIsAnonRow(si)
+                && !instParamAtomFits(f.fiValue, si, mfi, fnIx)
+              ) {
                 ok = false
               }
               // A companion-bearing or differently-coded field on a DECLARED row, asked only
@@ -15162,6 +15252,21 @@ export function exprIsF64(exprIx: i32, fnIx: i32) {
   false
 }
 
+// The type of field `prop` of an un-narrowed parameter of instance `fnIx` pinned at an
+// anonymous record row, read from the argument's own record type, or -1 (D2762).
+function anonParamPinFieldTy(recvIx: i32, prop: string, fnIx: i32): i32 {
+  const r = P.nodes[unwrapParen(recvIx)]
+  if r is Ident {
+    if narrowSlotOf(r.identName) >= 0 { return -1 }
+    const ptn = paramTypeNode(fnIx, r.identName)
+    if ptn < 0 { return -1 }
+    const pt = monoAnonParamPinTy.get(ptn) ?? -1
+    if pt < 0 { return -1 }
+    return tyFieldTyOf(pt, prop)
+  }
+  -1
+}
+
 export function exprIsBool(ix: i32, fnIx: i32) {
   if ix < 0 { return false }
   // Typed-IR fast path (additive, mirroring exprIsF64): boolean shares the i32 rep
@@ -15271,6 +15376,8 @@ export function exprIsBool(ix: i32, fnIx: i32) {
     // clone shares its leaf nodes, so the checker's bank on `self.actual` still carries the
     // original's `T`, and the struct table alone can't answer since a boolean field is code
     // 0, layout-shared with i32. The instance's own row (`sTyIx`) still holds the precise type.
+    const pft = anonParamPinFieldTy(e.memObj, e.memProp, fnIx)
+    if pft >= 0 { return tyToEmitName(pft) == "boolean" }
     const msi = structIndexOfExpr(e.memObj, fnIx)
     if msi >= 0 && msi < sTyIx.length {
       const mfty = tyFieldTyOf(sTyIx[msi], e.memProp)
@@ -26609,6 +26716,16 @@ export function exprIsLitAtom(exprIx: i32, fnIx: i32) {
     if msi >= 0 {
       const mfi = sFieldIndex(msi, e.memProp)
       if mfi >= 0 {
+        // A plain i32 slot the checker reads as a literal-set alias holds its atom id: a record
+        // with a function field keeps its ident fields as i32 slots with no atom table (D2853).
+        if !sFieldIsLitUnion(msi, mfi) && sFieldTypeAt(msi, mfi) == FC_I32 {
+          if (
+            nodeTyIsLitUnionAlias(mIxA)
+            && numLitUnionBaseTy(nodeTyIxOf(mIxA)) < 0
+          ) {
+            return true
+          }
+        }
         const r = sFieldIsLitUnion(msi, mfi)
         return r
       }
