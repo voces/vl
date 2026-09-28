@@ -287,12 +287,24 @@ Deno.test({ name: "wasm-checker: a defaulted literal read inside a value names i
     g + "const b = 3\nprint(mul(b, 1.0))\nprint(gi(b))\n",
     g + "const i = 1\nconst ys = [7, 8]\nprint(ys[i])\nprint(mul(i, 1.0))\n",
     g + "const m = 3\nfunction a(): f32 { mul(m, 1.0) }\nfunction c(n: i32): boolean { m < n }\nprint(a())\n",
+    // An integer `/` would become a float one, and `f32 == 3` is refused (D2980).
+    g + "const d = 7\nprint(mul(d, 1.0))\nprint(d / 2)\n",
+    g + "const q = 3\nprint(mul(q, 1.0))\nprint(q == 3)\n",
+    // A type parameter hands the annotated type on, here into an `i32` operator.
+    g + "function id<T>(a: T): T { a }\nconst p = 3\nprint(mul(p, 1.0))\nprint(id(p) + gi(1))\n",
+    // An `f32` holds integers only up to 2^24 exactly.
+    g + "const v = 16777217\nprint(mul(v, 1.0))\n",
   ];
   for (const src of misses) {
     const got = await msgs(src);
     if (JSON.stringify(got) !== JSON.stringify(["argument 1: expected f32, got i32"])) {
       throw new Error(`want the bare mismatch for ${JSON.stringify(src)}, got ${JSON.stringify(got)}`);
     }
+  }
+  // D2981: a store's suggestion is refused by a later read of the binding.
+  const store = await msgs(g + "const b = 1.5\nlet w = 0\nw = b\nprint(gi(w))\n");
+  if (JSON.stringify(store) !== JSON.stringify(["cannot assign f64 to i32"])) {
+    throw new Error(`want the bare store refusal, got ${JSON.stringify(store)}`);
   }
 });
 
