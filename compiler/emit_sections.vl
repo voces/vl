@@ -45,6 +45,7 @@ import {
   nodeTyIsStructish,
   nodeTyIsUnionish,
   nodeTyIxOf,
+  nodeTyPrimName,
   numLitUnionHasBase,
   simdRow,
   simdRowSig,
@@ -141,10 +142,12 @@ import {
 } from "./emit_base"
 import {
   blockHasScratch,
+  constFoldOfLet,
   exprHasScratch,
   fnHasScratch,
   globalCellIsImmutable,
   globalIsNonConst,
+  letInitFoldsExpr,
   letIsNulBoolAnn,
 } from "./emit_query"
 import {
@@ -4972,13 +4975,18 @@ function igWalk(
 
 // Whether global `gi`'s initializer builds a record or a list: an early read of one reaches the
 // object itself, and a mutation through it would outlive the declaration. Any other initializer
-// produces its value only when it runs in the start function (`globalRunsInStartFn`).
+// produces its value only when it runs in the start function (`globalRunsInStartFn`), or is a
+// folded constant expression, which keeps the guard its start-function store had.
 function igInitAllocates(gi: i32): boolean {
   const init = igLetInit(globalStmts[gi])
   if init < 0 { return false }
   const e = P.nodes[unwrapParen(init)]
   if e is ArrayLit { return true }
   if e is ObjLit { return true }
+  const d = P.nodes[globalStmts[gi]]
+  if d is LetDecl {
+    if letInitFoldsExpr(d) { return true }
+  }
   globalRunsInStartFn(gi)
 }
 
@@ -7217,10 +7225,17 @@ function emitConstCellInit(buf: u8[], gi: i32): i32 {
     let gun2 = ""
     if gck == "union" { gun2 = letUnionNameOf(globalStmts[gi], -1) }
     const gAliasFe = monoGenericAliasFe(globalStmts[gi])
+    // An integer constant expression over other consts is written as its folded value.
     let rc = 0
-    if gun2 != "" { rc = emitUnionCoerce(buf, gun2, g.letInit, -1) }
-    else if gAliasFe >= 0 { rc = emitClosureValueCore(buf, gAliasFe, -1) }
-    else { rc = emitExpr(buf, g.letInit, -1) }
+    if letInitFoldsExpr(g) {
+      rc = emitConstFoldValue(buf, gck, g.letInit, constFoldOfLet(g).cfV)
+    } else if gun2 != "" {
+      rc = emitUnionCoerce(buf, gun2, g.letInit, -1)
+    } else if gAliasFe >= 0 {
+      rc = emitClosureValueCore(buf, gAliasFe, -1)
+    } else {
+      rc = emitExpr(buf, g.letInit, -1)
+    }
     // The snapshot restored, rather than a chosen list of seeds cleared: one this function
     // leaves standing would outlive the whole global section.
     expCtxApply(gcSaved)
@@ -7230,13 +7245,34 @@ function emitConstCellInit(buf: u8[], gi: i32): i32 {
   emitFail("emitProgram: a module global cell that is not a binding")
 }
 
+// Writes the folded value `v` of the integer constant expression `init` into `buf` as the
+// one `*.const` of a cell of kind `gck`, which must be the init's own width.
+function emitConstFoldValue(buf: u8[], gck: VKind, init: i32, v: i64): i32 {
+  const wide = nodeTyPrimName(init) == "i64"
+  if wide != (gck == "i64") || (!wide && gck != "i32") {
+    return emitFail(
+      "emitProgram: a folded constant's cell is not its own integer width",
+    )
+  }
+  const prev = wTarget(buf)
+  if wide {
+    fbI64Const((v >> (32 as i64)) as% i32, v as% i32)
+  } else {
+    fbI32Const(v as% i32)
+  }
+  wTarget(prev)
+  0
+}
+
 // Folds every immutable cell whose own constexpr is exactly one scalar `*.const`: its bytes go
 // to `gFoldPool` for `emitFoldedConstRead`, and the cell is dropped unless an export names it.
 // Runs before the global section writes its count and before any body reads a global index.
 function captureFoldedConsts(): i32 {
   let gi = 0
   while gi < globalStmts.length {
-    if gCellIdx[gi] >= 0 && globalCellIsImmutable(gi) {
+    // A guarded cell keeps its reads, so one before the declaration still traps (D2652).
+    const guarded = gi < gInitGuard.length && gInitGuard[gi] >= 1
+    if gCellIdx[gi] >= 0 && globalCellIsImmutable(gi) && !guarded {
       const one: u8[] = []
       const prev = wTarget(one)
       const rc = emitConstCellInit(one, gi)
