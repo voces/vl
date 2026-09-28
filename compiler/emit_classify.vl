@@ -37105,15 +37105,20 @@ type RsWalk = {
   rwHome: i32,
 }
 
-// The use index `rsUsesOf` reads: each node's parent on the tree reached from the root (the
-// first found, for a leaf shared by two parents) and each identifier chained to the next of the
-// same name. Built once per final arena like `dsgReady`'s index, so N re-seated lists cost N
-// chain walks rather than N program walks. `rsDoneLet` is 1 at a binding already asked.
+// The use index `rsUsesOf` reads, built once per final arena like `dsgReady`'s: each node's
+// first parent from the root and its function, each identifier chained by name program-wide and
+// within its function, and each function's nested ones. A list's uses then cost its own
+// function's identifiers; `rsDoneLet` is 1 at a binding already asked.
 let rsIxRoot: i32 = -1
 let rsIxLen: i32 = -1
 let rsPar: i32[] = []
+let rsFrame: i32[] = []
 let rsOccNext: i32[] = []
 let rsOccHead: {[string]: i32} = Map()
+let rsFnOccNext: i32[] = []
+let rsFnOccHead: {[string]: i32} = Map()
+let rsFnKidHead: i32[] = []
+let rsFnKidNext: i32[] = []
 let rsDoneLet: i32[] = []
 
 // Drops the use index, beside the global-destination index it mirrors.
@@ -37121,11 +37126,19 @@ export function rsResetUseIx() {
   rsIxRoot = -1
   rsIxLen = -1
   rsPar = []
+  rsFrame = []
   rsOccNext = []
   rsOccHead = Map()
+  rsFnOccNext = []
+  rsFnOccHead = Map()
+  rsFnKidHead = []
+  rsFnKidNext = []
   rsDoneLet = []
   0
 }
+
+// The key of `nm`'s identifier chain within function `fr` (-1 the top level).
+function rsFnKey(nm: string, fr: i32): string { nm + "@" + i32ToStr(fr) }
 
 function rsIxReady(): boolean {
   if !emitArenaFinal { return false }
@@ -37136,13 +37149,19 @@ function rsIxReady(): boolean {
   let i = 0
   while i < n {
     rsPar.push(-1)
+    rsFrame.push(-1)
     rsOccNext.push(-1)
+    rsFnOccNext.push(-1)
+    rsFnKidHead.push(-1)
+    rsFnKidNext.push(-1)
     rsDoneLet.push(0)
     i = i + 1
   }
   const stack: i32[] = [emitRootIx]
   while stack.length > 0 {
     const x = stack.pop() ?? -1
+    let inner = rsFrame[x]
+    if P.nodes[x] is FuncDecl { inner = x }
     const kids = nodeChildren(x)
     let k = 0
     while k < kids.length {
@@ -37150,7 +37169,12 @@ function rsIxReady(): boolean {
       if c >= 0 && c < n && c != emitRootIx {
         if rsPar[c] < 0 {
           rsPar[c] = x
+          rsFrame[c] = inner
           stack.push(c)
+          if P.nodes[c] is FuncDecl && inner >= 0 {
+            rsFnKidNext[c] = rsFnKidHead[inner]
+            rsFnKidHead[inner] = c
+          }
         }
       }
       k = k + 1
@@ -37159,6 +37183,9 @@ function rsIxReady(): boolean {
     if nd is Ident {
       rsOccNext[x] = rsOccHead[nd.identName] ?? -1
       rsOccHead[nd.identName] = x
+      const key = rsFnKey(nd.identName, rsFrame[x])
+      rsFnOccNext[x] = rsFnOccHead[key] ?? -1
+      rsFnOccHead[key] = x
     }
   }
   rsIxRoot = emitRootIx
@@ -37167,17 +37194,46 @@ function rsIxReady(): boolean {
 }
 
 // The lowest use of `w.rwName` in its scope that `rsUseSafe` does not clear, or -1. An
-// un-annotated alias and a `for` variable over the list are followed as further names.
+// un-annotated alias and a `for` variable over the list are followed as further names. A scope
+// inside a function reads that function's identifiers and its nested functions'; a top-level
+// one reads the program's.
 function rsUsesOf(w: RsWalk, depth: i32): i32 {
   if depth > 32 { return -1 }
+  if w.rwScope < 0 || w.rwScope >= rsFrame.length { return -1 }
+  let home = rsFrame[w.rwScope]
+  if P.nodes[w.rwScope] is FuncDecl { home = w.rwScope }
+  if home < 0 { return rsChainUses(rsOccHead[w.rwName] ?? -1, false, w, depth) }
+  rsFnUses(home, w, depth)
+}
+
+// `rsUsesOf` over function `fr`'s own identifiers and, recursively, its nested functions'.
+function rsFnUses(fr: i32, w: RsWalk, depth: i32): i32 {
+  let best = rsChainUses(
+    rsFnOccHead[rsFnKey(w.rwName, fr)] ?? -1,
+    true,
+    w,
+    depth,
+  )
+  let kid = rsFnKidHead[fr]
+  while kid >= 0 {
+    const r = rsFnUses(kid, w, depth)
+    if r >= 0 && (best < 0 || r < best) { best = r }
+    kid = rsFnKidNext[kid]
+  }
+  best
+}
+
+// The lowest use `rsUseSafe` does not clear along one identifier chain starting at `o`,
+// following the per-function links when `perFn`.
+function rsChainUses(start: i32, perFn: boolean, w: RsWalk, depth: i32): i32 {
   let best = -1
-  let o = rsOccHead[w.rwName] ?? -1
+  let o = start
   while o >= 0 && o < rsOccNext.length {
     if rsInScope(o, w) {
       const r = rsUseOf(o, w, depth)
       if r >= 0 && (best < 0 || r < best) { best = r }
     }
-    o = rsOccNext[o]
+    if perFn { o = rsFnOccNext[o] } else { o = rsOccNext[o] }
   }
   best
 }

@@ -283,6 +283,20 @@ const genAdoptedLists = (nl: number, per: number): string => {
   return o.join("\n") + "\n";
 };
 
+// The same-name twin: `nf` functions, each binding its own `il` and adopting it, so a use check
+// that walked every identifier of the name program-wide would read each function's lists.
+const genAdoptedListsFn = (nf: number): string => {
+  const o = ["const i: { f: i32 } = { f: 4 }", "type I = { f: i64 | null }"];
+  for (let k = 0; k < nf; k++) {
+    o.push(`function h${k}(): i32 {`, `  const il = [{ f: ${k % 13} }]`, "  const ic: I[] = il");
+    o.push("  il[0].f + ic.length", "}");
+  }
+  o.push("let acc = 0");
+  for (let k = 0; k < nf; k++) o.push(`acc = acc + h${k}()`);
+  o.push("print(acc)", "print(i.f)");
+  return o.join("\n") + "\n";
+};
+
 // ── the runner ───────────────────────────────────────────────────────────────
 
 // A COMPILE PAIR IS GRADED ON GUEST FUEL. `$VL_FUEL=1` makes the host meter the compiler in
@@ -504,6 +518,16 @@ axis(
   10.5,
   "A re-seated list's use check (`rsNarrowUseRefuse`, compiler/emit_classify.vl) is walking the program per list.",
   (d) => twoFiles(d, genAdoptedLists(400, 1), genAdoptedLists(100, 1)),
+);
+
+// D2914's same-name GROWTH pair: 800 functions each adopting its own `il` against 200, so
+// linear reads 4 and quadratic 16. Fuel reads 4.03 on master `e91e04a8f` and with the use check
+// alike, so the bar is 1.25x that; the check that walked every `il` in the program read 5.78.
+axis(
+  "adopted record lists sharing a name",
+  5.0,
+  "A re-seated list's use check (`rsUsesOf`, compiler/emit_classify.vl) is reading other functions' identifiers.",
+  (d) => twoFiles(d, genAdoptedListsFn(800), genAdoptedListsFn(200)),
 );
 
 // 1.09 / 0.97 / 1.13.
