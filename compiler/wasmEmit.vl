@@ -1144,7 +1144,7 @@ import {
   fnIndexOfInScopeChain,
 } from "./emit_collect"
 import { voidTwinForNode } from "./emit_rewrite"
-import { nameIsQuotedLeaf, splitUnionAtoms } from "./tyname"
+import { nameIsQuotedLeaf, nameIsShapeOpen, splitUnionAtoms } from "./tyname"
 import { monoOrigNode } from "./emit_state"
 import {
   INIT_REACH_NEVER,
@@ -2406,6 +2406,29 @@ function monoStaticIsResult(isIx: i32, fnIx: i32) {
   -1
 }
 
+// Whether no arm of the union box `recvIx` reads at can carry the value-arm tag `tag`: each arm
+// claims another value tag, or is a struct variant, whose tag is below every value tag. False
+// when the union is unnamed or an arm is neither, so its tag set is not known.
+function unionBoxLacksTag(recvIx: i32, tag: i32, fnIx: i32): boolean {
+  if tag < uVariants.length { return false }
+  const nm = unionNameOfExpr(recvIx, fnIx)
+  if nm == "" { return false }
+  const atoms: string[] = []
+  const arms: i32[] = []
+  if !unionSetArmTys(nm, atoms, arms) || arms.length == 0 { return false }
+  let i = 0
+  while i < arms.length {
+    const t = isArmTagOfTy(arms[i])
+    if t == tag { return false }
+    if t < 0 {
+      const an = tyToEmitName(arms[i])
+      if variantIndexOf(an) < 0 && !nameIsShapeOpen(an) { return false }
+    }
+    i = i + 1
+  }
+  true
+}
+
 // The union-box tag the type `ity` claims as a value-union arm, or -1 when it claims none
 // (a struct variant, a literal, an un-interned shape). A bare function-type arm tags on
 // its interned signature slot rather than the flat kind-11 value-atom tag — kind 11 alone
@@ -3274,6 +3297,12 @@ function emitIsTest(body: u8[], isIx: i32, fnIx: i32) {
     }
     if armTag >= 0 {
       const vrecv = P.nodes[unwrapParen(ndv.isObj)]
+      // No arm of this box carries the tag (a generic body's `is i32[]` at a pin whose union
+      // has no list), so the test is false and a bare name needs no read (D2955).
+      if vrecv is Ident && unionBoxLacksTag(ndv.isObj, armTag, fnIx) {
+        fbI32Const(0)
+        return 0
+      }
       if vrecv is Ident {
         // pushes the raw box slot directly, even when an outer arm already narrowed it to
         // a single atom — the narrowed Ident read would unbox instead of yielding the box.
@@ -23052,11 +23081,17 @@ function emittedCondConst(condStart: i32): i32 {
   -1
 }
 
-// `emittedCondConst` of an `is` test `condIx` emitted since `condStart`, or -1 for any other
-// condition: an instance decides its own `is` tests, so one value arm can be dead there.
+// `emittedCondConst` of an `is` test `condIx`, or its `!`, emitted since `condStart`, or -1 for
+// any other condition: an instance decides its own `is` tests, so one arm can be dead there.
 function staticIsGuard(condIx: i32, condStart: i32): i32 {
   if condIx < 0 { return -1 }
-  if !(P.nodes[unwrapParen(condIx)] is IsExpr) { return -1 }
+  const c = P.nodes[unwrapParen(condIx)]
+  if c is Unary {
+    if c.unOp != "!" { return -1 }
+    if !(P.nodes[unwrapParen(c.unArg)] is IsExpr) { return -1 }
+    return emittedCondConst(condStart)
+  }
+  if !(c is IsExpr) { return -1 }
   emittedCondConst(condStart)
 }
 
@@ -23075,9 +23110,26 @@ function emitDeadValueArm(blockIx: i32): i32 {
 function monoStaticGuardEndsBlock(stmtIx: i32, fnIx: i32) {
   const s = P.nodes[stmtIx]
   if s is IfStmt {
+    if negGuardDecidedTrue(s.ifCond, fnIx) { return stmtAlwaysExits(s.ifThen) }
     if monoStaticIsGuardOf(s.ifCond, fnIx) != 1 { return false }
     return stmtAlwaysExits(s.ifThen)
   }
+  false
+}
+
+// The function, condition node and emitted constant (`staticIsGuard`) of the most recently
+// lowered statement `if`: the enclosing block asks whether that guard is decided.
+let negGuardFn = -1
+let negGuardCond = -1
+let negGuardVal = -1
+
+// Whether `condIx` is a `!is` the statement `if` just lowered decided true: the instance's pin
+// cannot hold the tested type, so a tail after an exiting arm reads it at that type (D2957).
+function negGuardDecidedTrue(condIx: i32, fnIx: i32): boolean {
+  if condIx < 0 || condIx != negGuardCond || negGuardVal != 1 { return false }
+  if fnIx != negGuardFn { return false }
+  const c = P.nodes[unwrapParen(condIx)]
+  if c is Unary { return c.unOp == "!" }
   false
 }
 
@@ -23406,9 +23458,10 @@ function emitIfLinkStmt(body: u8[], s: IfStmt, fnIx: i32, open: i32[]) {
   // off the emitted condition itself (`emittedCondConst`), not a parallel predicate.
   const condStart = wLen()
   if emitCondExpr(body, s.ifCond, fnIx) < 0 { return -1 }
-  let staticGuard = -1
-  const condN = P.nodes[unwrapParen(s.ifCond)]
-  if condN is IsExpr { staticGuard = emittedCondConst(condStart) }
+  const staticGuard = staticIsGuard(s.ifCond, condStart)
+  negGuardFn = fnIx
+  negGuardCond = s.ifCond
+  negGuardVal = staticGuard
   fbIf(64) // 0x04 if, 0x40 void blocktype
   // If the condition is `n is Variant` over a bare union identifier, narrow `n` to
   // that variant for the THEN-branch only (so `n.field` downcasts). Save/restore the
@@ -24936,9 +24989,7 @@ function emitIfLinkTail(body: u8[], s: IfStmt, fnIx: i32, open: i32[]) {
   // else { "o" } }` emitted the statically-false arm's narrowed use in the i32 instance.
   const condStart = wLen()
   if emitCondExpr(body, s.ifCond, fnIx) < 0 { return -1 }
-  let staticGuard = -1
-  const condN = P.nodes[unwrapParen(s.ifCond)]
-  if condN is IsExpr { staticGuard = emittedCondConst(condStart) }
+  const staticGuard = staticIsGuard(s.ifCond, condStart)
   fbIf(64) // 0x04 if, 0x40 void blocktype
   const savedTop = narrowTop
   const narrowed = setNarrowFromCond(s.ifCond, fnIx)
@@ -26206,7 +26257,16 @@ function emitUnaryNode(body: u8[], e: Unary, _exprIx: i32, fnIx: i32) {
   // Logical not `!a`: a boolean rides in an i32 (0/1), so `i32.eqz` (0x45) maps
   // 0→1 and any non-zero→0 — exactly `a == 0`. Push the operand, then eqz.
   if e.unOp == "!" {
+    const ngStart = wLen()
     if emitExpr(body, e.unArg, fnIx) < 0 { return -1 }
+    // An instance's decided `is` stays one constant under `!`, so `staticIsGuard` reads the
+    // negated test as decided too and the dead arm is not lowered (D2957).
+    const ngK = staticIsGuard(e.unArg, ngStart)
+    if ngK >= 0 {
+      wDropBack(2)
+      fbI32Const(1 - ngK)
+      return 0
+    }
     fbI32Eqz() // 0x45 i32.eqz
     return 0
   }

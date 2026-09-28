@@ -188,6 +188,7 @@ let cliSeverityGiven = 0
 let cliBatch = 0               // --batch: many paths, one verdict record per file
 let cliExcludes: string[] = [] // --exclude glob patterns (normalized)
 let cliIncludeStd = 0          // --include-std: report std's own warnings too
+let cliIncludeImports = 0      // --include-imports: report imported modules' warnings too
 let cliArgErr = ""             // a fatal arg-parse message (printed, exit 2)
 
 // ── work + output ──────────────────────────────────────────────────────────────
@@ -238,6 +239,9 @@ let cliGating = 0
 // is dropped in silence (D1601).
 let cliStdHidden = 0
 let cliStdHiddenWarn = 0
+// The same count for the target's non-std imports, which `--include-imports` reveals.
+let cliImpHidden = 0
+let cliImpHiddenWarn = 0
 // fmt mode (A-impl 3): the walk + file collection are shared with `check`; only
 // the per-file action and the finish differ.
 let cliCmd = 0         // subcommand: 0 = check, 1 = fmt
@@ -421,6 +425,7 @@ export function cliArgReset() {
   cliSeverityGiven = 0
   cliExcludes = []
   cliIncludeStd = 0
+  cliIncludeImports = 0
   cliArgErr = ""
   cliEntrySrc = ""
   cliModMode = 0
@@ -451,6 +456,8 @@ export function cliArgReset() {
   cliGating = 0
   cliStdHidden = 0
   cliStdHiddenWarn = 0
+  cliImpHidden = 0
+  cliImpHiddenWarn = 0
   cliCmd = 0
   cliFmtWrite = 0
   cliFmtCheck = 0
@@ -783,17 +790,29 @@ function cliDiagFile(d: i32) {
   if cliModMode != 0 && m >= 0 && m < cliModKeys.length { return cliModKeys[m] }
   cliCurFile
 }
-// Whether diagnostic `d` is one the target's author cannot act on: a non-error located
-// in a `std:` module the target only reached by importing. A std error means the
-// toolchain is broken and is never withheld; `--include-std` keeps the rest. The `std:`
-// spelling is an import's, so `vl check std/fmt.vl` (std's own author) is unaffected (D1601).
-function cliDiagStdHidden(d: i32) {
-  if cliIncludeStd != 0 { return 0 }
-  if dgSev[d] == "error" { return 0 }
+// Why diagnostic `d` is withheld from the report, or "shown". Errors and the entry's own
+// diagnostics are always shown; an import's non-error is withheld when its key matches
+// `--exclude`, or without `--include-std` for a `std:` module (D1601) and without
+// `--include-imports` for any other (plumb PL-055).
+type CliWithheld = "shown" | "std" | "import" | "exclude"
+function cliDiagWithheld(d: i32): CliWithheld {
+  if dgSev[d] == "error" { return "shown" }
+  const m = dgMod[d]
+  if cliModMode == 0 || m <= 0 { return "shown" }
   const f = cliDiagFile(d)
-  if f.length < 4 { return 0 }
-  if f.slice(0, 4) != "std:" { return 0 }
-  1
+  if cliExcluded(f, cliBaseName(f)) { return "exclude" }
+  if f.length >= 4 && f.slice(0, 4) == "std:" {
+    if cliIncludeStd != 0 { return "shown" }
+    return "std"
+  }
+  if cliIncludeImports != 0 { return "shown" }
+  "import"
+}
+// The last `/`-separated segment of `path`, for an `--exclude` basename match.
+function cliBaseName(path: string) {
+  let i = path.length
+  while i > 0 && path[i - 1] != '/' { i = i - 1 }
+  path.slice(i, path.length)
 }
 // The source lines of diagnostic `d`'s owning module (its caret-context line),
 // memoized by module index. Falls back to `cliSrcLines` outside module mode.
@@ -978,6 +997,8 @@ function cliParseArgs() {
       cliBatch = 1
     } else if sub == "check" && a == "--include-std" {
       cliIncludeStd = 1
+    } else if sub == "check" && a == "--include-imports" {
+      cliIncludeImports = 1
     } else if sub == "check" && a == "--severity" {
       cliSeverityGiven = 1
       if i + 1 < cliArgs.length && !cliIsFlag(cliArgs[i + 1]) {
@@ -1385,15 +1406,27 @@ function cliCheckCurFileRest() {
   // Fold this file's counts into the running tally (gating + error/warning).
   let gi = 0
   while gi < dgSev.length {
-    // A withheld std diagnostic counts nowhere — not in the tally, not in the gate:
-    // a comment in std must not fail a consumer's build.
-    if cliDiagStdHidden(gi) != 0 {
-      cliStdHidden = cliStdHidden + 1
-      if dgSev[gi] == "warning" { cliStdHiddenWarn = cliStdHiddenWarn + 1 }
-    } else {
-      if cliSevRank(dgSev[gi]) >= thr { cliGating = cliGating + 1 }
-      if dgSev[gi] == "error" { cliErrors = cliErrors + 1 }
-      if dgSev[gi] == "warning" { cliWarnings = cliWarnings + 1 }
+    // A withheld diagnostic counts nowhere — not in the tally, not in the gate: a
+    // warning in an import must not fail the build of the file that imports it. The
+    // hidden count takes only what the display floor would have shown.
+    const why = cliDiagWithheld(gi)
+    const warn = dgSev[gi] == "warning"
+    const shownAt = cliSevRank(dgSev[gi]) >= disp
+    match why {
+      "shown" => {
+        if cliSevRank(dgSev[gi]) >= thr { cliGating = cliGating + 1 }
+        if dgSev[gi] == "error" { cliErrors = cliErrors + 1 }
+        if warn { cliWarnings = cliWarnings + 1 }
+      }
+      "std" => {
+        if shownAt { cliStdHidden = cliStdHidden + 1 }
+        if shownAt && warn { cliStdHiddenWarn = cliStdHiddenWarn + 1 }
+      }
+      "import" => {
+        if shownAt { cliImpHidden = cliImpHidden + 1 }
+        if shownAt && warn { cliImpHiddenWarn = cliImpHiddenWarn + 1 }
+      }
+      "exclude" => {}
     }
     gi = gi + 1
   }
@@ -1401,7 +1434,7 @@ function cliCheckCurFileRest() {
   const order: i32[] = []
   let oj = 0
   while oj < dgSev.length {
-    if cliSevRank(dgSev[oj]) >= disp && cliDiagStdHidden(oj) == 0 {
+    if cliSevRank(dgSev[oj]) >= disp && cliDiagWithheld(oj) == "shown" {
       order.push(oj)
     }
     oj = oj + 1
@@ -1456,18 +1489,23 @@ function cliBatchUnreadable() {
   cliStartFile()
 }
 
-// Say what `--include-std` withheld, so a hidden diagnostic is never a silent one.
-// It rides `cliOut` (stderr) rather than the report, so a `--json` caller is told
-// too without a non-diagnostic entering the array on stdout (D1601).
-function cliStdHiddenNote() {
-  if cliStdHidden == 0 { return 0 }
-  let noun = "std diagnostic"
-  if cliStdHiddenWarn == cliStdHidden { noun = "std warning" }
+// Say what `--include-std` and `--include-imports` withheld, so a hidden diagnostic is
+// never a silent one. It rides `cliOut` (stderr) rather than the report, so a `--json`
+// caller is told too without a non-diagnostic entering the array on stdout (D1601).
+function cliHiddenNotes() {
+  cliHiddenNote(cliImpHidden, cliImpHiddenWarn, "import", "--include-imports")
+  cliHiddenNote(cliStdHidden, cliStdHiddenWarn, "std", "--include-std")
+}
+// One withheld-count line: `n` hidden, `nWarn` of them warnings, from `what` modules.
+function cliHiddenNote(n: i32, nWarn: i32, what: string, flag: string) {
+  if n == 0 { return 0 }
+  let noun = what + " diagnostic"
+  if nWarn == n { noun = what + " warning" }
   cliOut.push(
     cliAnsi(
       cliColor,
       "2",
-      "(" + cliPlural(cliStdHidden, noun) + " hidden — --include-std shows them)",
+      "(" + cliPlural(n, noun) + " hidden — " + flag + " shows them)",
     ),
   )
   0
@@ -1499,7 +1537,7 @@ function cliFinishSummary() {
     if cliBatchUnread != 0 { cliExit = 2 }
     if cliInvalidModule > 0 { cliExit = 70 }
     // `--batch` already wrote a record per file; its stdout is those, not one array.
-    if cliBatch != 0 { return cliStdHiddenNote() }
+    if cliBatch != 0 { return cliHiddenNotes() }
     const buf: i32[] = []
     buf.push('[')
     let ji = 0
@@ -1513,7 +1551,7 @@ function cliFinishSummary() {
     buf.push(']')
     buf.push('\n')
     cliJsonOut = fromCodePoints(buf)
-    return cliStdHiddenNote()
+    return cliHiddenNotes()
   }
   let summary = ""
   if cliErrors == 0 && cliWarnings == 0 {
@@ -1547,7 +1585,7 @@ function cliFinishSummary() {
     summary = cliAnsi(cliColor, code, text)
   }
   cliOut.push(summary)
-  cliStdHiddenNote()
+  cliHiddenNotes()
   cliExit = 0
   if cliGating > 0 { cliExit = 1 }
   if cliBatchUnread != 0 { cliExit = 2 }

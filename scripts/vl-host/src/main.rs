@@ -586,7 +586,8 @@ program verbatim — the only way to pass one that starts with `-`.
        vl check --batch [path]... [flags]
 
 A single file checks its whole resolved module graph; a directory walks
-every .vl file under it.
+every .vl file under it. Errors are reported wherever they sit; warnings and
+hints only for the file(s) you name, unless asked for (below).
 
 {b}Flags:{r}
   {c}--severity{r} <s>      Gate the exit code at error | warning | info | hint
@@ -600,11 +601,16 @@ every .vl file under it.
   {c}--codegen{r}           Also run the emitter and VALIDATE the emitted module
   {c}--no-validate{r}       (with --codegen) skip the engine's verdict
   {c}--fix{r}               Apply safe autofixes, writing files in place
+  {c}--include-imports{r}   Report warnings and hints inside the modules a named file
+                      imports too. Without it they are withheld (a count is
+                      printed); each module reports its own when checked.
+                      std: stays hidden unless --include-std is also passed.
   {c}--include-std{r}       Report warnings and hints inside imported std: modules
                       too. Without it they are withheld (a count is printed) —
                       nothing in std is yours to fix. std ERRORS are always
                       shown: one means the toolchain itself is broken.
-  {c}--exclude{r} <glob>    Skip matching paths (repeatable; also --exclude=<glob>)
+  {c}--exclude{r} <glob>    Skip matching paths, and the warnings and hints of a
+                      matching import (repeatable; also --exclude=<glob>)
   {c}--color={r}<when>      always | never | auto (default: color iff stdout is a
                       terminal); an explicit value overrides NO_COLOR
   {c}--compiler{r} <wasm>   Compiler seed to use (see `vl help seed`)

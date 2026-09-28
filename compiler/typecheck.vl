@@ -34332,8 +34332,8 @@ function substHoleTy(tyIx: i32, bNames: string[], bTys: i32[]) {
 }
 
 // `substHoleTyReal`'s read of a hole against `bNames`/`bTys`, noting no pin: a direct binding,
-// or a field or element derivation off one. -1 for any other derivation, an unbound hole, or a
-// non-hole. What the emitter asks of a node a hole instance shares (D2921).
+// or a field, element or element-value derivation off one. -1 for any other derivation, an
+// unbound hole, or a non-hole. What the emitter asks of a node a hole instance shares (D2921).
 export function holePinReadOf(tyIx: i32, bNames: string[], bTys: i32[]): i32 {
   holePinReadAt(tyIx, bNames, bTys, 0)
 }
@@ -34352,10 +34352,15 @@ function holePinReadAt(
   const row = hdRowOf(tyIx)
   if row < 0 { return -1 }
   const kind = hdKind[row]
-  if kind != HD_FLD && kind != HD_ELEM { return -1 }
+  if kind != HD_FLD && kind != HD_ELEM && kind != HD_ELEMV { return -1 }
   const inner = holePinReadAt(hdBase[row], bNames, bTys, depth + 1)
   if inner < 0 || inner >= T.tys.length { return -1 }
   if kind == HD_ELEM { return tyArrayElemIx(inner) }
+  if kind == HD_ELEMV {
+    const ev = tyArrayElemIx(inner)
+    if ev < 0 { return -1 }
+    return arrElemValueTy(ev)
+  }
   if hdField[row].length == 0 { return -1 }
   tyFieldTyOf(inner, hdField[row])
 }
@@ -44165,7 +44170,7 @@ export function valueUnionRetName(er: i32) {
   // its atom cannot classify anyway, and the render of a recursive struct leaf is
   // exponential in the `tyToStr` depth cap.
   if !retAtomsCheap(er) { return "" }
-  if !tyIsValueUnion(er) { return "" }
+  if !tyIsValueUnion(er) { return litUnionArmValueUnionRetName(er) }
   const atoms: string[] = []
   collectRetAtoms(er, atoms)
   let nm = ""
@@ -44179,6 +44184,41 @@ export function valueUnionRetName(er: i32) {
   // `retAtomsCheap` every admitted leaf renders to a single top-level atom (no `|`, no
   // `=>`, balanced groupers), so the join's width is the leaf count. (#1115.)
   irAtoms(nm, atoms.length)
+}
+
+// The emitter name (`K|i32`) of an inferred union `er` whose string literals group into a
+// literal-union arm beside other value atoms, as the annotated spelling boxes it, or "". The
+// flattened join `"a" | "b" | i32` has no value atom for a literal, so the atom walk declines it (D2952).
+function litUnionArmValueUnionRetName(er: i32) {
+  if !tyHasLitLeaf(er, 8) { return "" }
+  const nm = tyToEmitName(er)
+  if !nameIsLitUnionArmValueUnion(nm) { return "" }
+  irRendered(nm)
+}
+
+// Whether a leaf of the union or nullable `er` is a literal, within `depth` levels.
+function tyHasLitLeaf(er: i32, depth: i32): boolean {
+  if er < 0 || er >= T.tys.length || depth <= 0 { return false }
+  const t = T.tys[er]
+  match t {
+    TyLit => {
+      return true
+    }
+    TyNullable => {
+      return tyHasLitLeaf(t.nInner, depth - 1)
+    }
+    TyUnion => {
+      let i = 0
+      while i < t.uMembers.length {
+        if tyHasLitLeaf(t.uMembers[i], depth - 1) { return true }
+        i = i + 1
+      }
+    }
+    TyPrim | TyErr | TyObj | TyFunc | TyArray | TyMap | TyVar | TyNeg => {
+      // A leaf that is no literal, or a container whose elements are not the union's leaves.
+    }
+  }
+  false
 }
 
 // Whether union `er` has a litunion-array member (`K0[]`, `("a"|"b")[]`) — the arm
@@ -46176,8 +46216,9 @@ export function inferLetNameOf(letIx: i32) {
 }
 export function inferLetCount() { inferLetIx.length }
 
-// Records the type of join node `ix` when it is a struct-bearing union, and registers its struct
-// members as arms, as the binding route does (D2373). Only a `??` or an `if` joins two types.
+// Records the type of join node `ix` when it is a struct-bearing union or carries a literal-union
+// arm, and registers its struct members as arms, as the binding route does (D2373). Only a `??`
+// or an `if` joins two types.
 function noteInferJoin(ix: i32, t: i32) {
   if t < 0 { return 0 }
   const n = P.nodes[ix]
@@ -46185,7 +46226,11 @@ function noteInferJoin(ix: i32, t: i32) {
   if n is BinExpr { isJoin = n.binOp == "??" }
   if !isJoin { return 0 }
   if cTyIxSetHas(inferJoinTySet, t) { return 0 }
-  if !tyIsStructBearingUnion(t) && !tyIsMapJoinUnion(t, n is IfStmt) {
+  if (
+    !tyIsStructBearingUnion(t)
+    && !tyIsMapJoinUnion(t, n is IfStmt)
+    && litUnionArmValueUnionRetName(t) == ""
+  ) {
     return 0
   }
   if tyHasHole(t) { return 0 }

@@ -78,7 +78,7 @@ def findings(root):
 
     def one(target):
         p = subprocess.run([VL, "check", target, "--severity", "info", "--json",
-                            "--compiler", SEED], cwd=root, env=env,
+                            "--include-imports", "--compiler", SEED], cwd=root, env=env,
                            capture_output=True, text=True, timeout=600)
         text = p.stdout.strip()
         if p.returncode > 2 or not text.startswith("["):
