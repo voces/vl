@@ -15288,7 +15288,10 @@ export function exprIsI64(exprIx: i32, fnIx: i32) {
   if e is AsExpr { return e.asTy == "i64" }
   if e is Paren { return exprIsI64(e.parInner, fnIx) }
   // A field read `s.x` whose struct field is an i64 slot (code 23) yields an i64.
-  if e is Member { return memFieldTypeCode(exprIx, fnIx) == FC_I64 }
+  if e is Member {
+    return memFieldTypeCode(exprIx, fnIx) == FC_I64
+      && memReadNarrowOp(exprIx, fnIx) < 0
+  }
   // A bare `m[k]` read over an i64-valued map yields an i64.
   if e is Index {
     // A union-box cell narrowed to one atom reads as that atom (see `indexUnionReadKind`).
@@ -15773,7 +15776,10 @@ export function exprIsF64(exprIx: i32, fnIx: i32) {
     return false
   }
   // A field read `p.x` whose struct field is an f64 slot (code 17) yields an f64.
-  if e is Member { return memFieldTypeCode(exprIx, fnIx) == FC_F64 }
+  if e is Member {
+    return memFieldTypeCode(exprIx, fnIx) == FC_F64
+      && memReadNarrowOp(exprIx, fnIx) < 0
+  }
   // A value-position if-expression is f64 when either arm's value is f64 (the branch-join
   // widens to f64); an `else if` chain recurses through the else slot. A join the checker typed
   // `f32` is one whose float literal arms adopted an f32 destination, and stays f32 (D2619).
@@ -36370,6 +36376,47 @@ export function sharedUnionFieldPlan(
   code
 }
 
+// The opcode narrowing the field read at `memIx` back to the `i32` the checker typed it, or -1:
+// an `i64` or `f64` slot of a record literal built at a wider declared record of its field names
+// and read at its own type. Exact, since nothing writes a covariant delivery's widened slot (D2987).
+export function memReadNarrowOp(memIx: i32, fnIx: i32): i32 {
+  const ty = nodeTyIxOf(memIx)
+  if ty < 0 || ty >= T.tys.length || tyKindOf(ty) != TK_I32 { return -1 }
+  const t = T.tys[ty]
+  if t is TyPrim {
+    if t.primName != "i32" { return -1 }
+  }
+  const fc = memFieldTypeCode(memIx, fnIx)
+  if fc != FC_I64 && fc != FC_F64 { return -1 }
+  if !memRecvIsObjLitBinding(memIx, fnIx) { return -1 }
+  if fc == FC_I64 {
+    return 167 // i32.wrap_i64
+  }
+  170 // i32.trunc_f64_s
+}
+
+// Whether the receiver of the field read at `memIx` names an un-annotated binding of an object
+// literal, the one receiver a wider declared record can be built for without a checked type.
+function memRecvIsObjLitBinding(memIx: i32, fnIx: i32): boolean {
+  if memIx < 0 || memIx >= P.nodes.length { return false }
+  const m = P.nodes[memIx]
+  if m is Member {
+    const rx = unwrapParen(m.memObj)
+    if rx < 0 { return false }
+    const r = P.nodes[rx]
+    if r is Ident {
+      const li = identLetOfAt(sidOfNode(rx), fnIx, rx)
+      if li < 0 { return false }
+      const d = P.nodes[li]
+      if d is LetDecl {
+        if d.letType >= 0 || d.letInit < 0 { return false }
+        return P.nodes[unwrapParen(d.letInit)] is ObjLit
+      }
+    }
+  }
+  false
+}
+
 // The wasm-type code of the struct/variant field a `Member` expression at `memIx` reads
 // (`0` i32, `3` string, `4` i32-list, `5` ref-list), or `-1` if not a known field read.
 // Mirrors `exprString`'s Member dispatch: a narrowed union identifier reads the variant
@@ -37676,6 +37723,9 @@ function rsElemDestTy(vx: i32): i32 {
   if p is Call {
     if unwrapParen(p.callFn) == vx { return -1 }
     ty = rsCallParamTy(p, vx)
+  } else if p is BinExpr {
+    if p.binOp != "=" || unwrapParen(p.binRight) != vx { return -1 }
+    ty = rsPlaceStoreTy(p)
   } else if p is LetDecl {
     if p.letType < 0 { return -1 }
     ty = nodeTyIxOf(p.letType)
@@ -38402,6 +38452,16 @@ function rsElemUseSafe(vx: i32, par: i32, gp: i32, fr: i32, w: RsWalk): i32 {
   }
   if p is BinExpr {
     if p.binOp == "=" && unwrapParen(p.binRight) == vx {
+      const pty = rsPlaceStoreTy(p)
+      if pty >= 0 {
+        if !rsTyIsRow(pty, w) { return vx }
+        // A store is itself a value, and a function body's statement may be what it returns.
+        if rsIsBodyStmtOf(par, gp, fr) {
+          const rt = rsFnRetTy(fr)
+          if rsTyIsRecord(rt) && !rsTyIsRow(rt, w) { return par }
+        }
+        return -1
+      }
       return rsElemAssignSafe(vx, rsIdentName(unwrapParen(p.binLeft)), fr, w)
     }
     return -1
@@ -38464,12 +38524,45 @@ function rsFnRetDeclaredNot(fr: i32, list: boolean, w: RsWalk): boolean {
   false
 }
 
+// The checked return type of function `fr`, or -1.
+function rsFnRetTy(fr: i32): i32 {
+  const ft = nodeTyIxOf(fr)
+  if ft < 0 || ft >= T.tys.length { return -1 }
+  const t = T.tys[ft]
+  if t is TyFunc { return t.fnRet }
+  -1
+}
+
+// Whether `ix`, under parent `par`, is a statement of function `fr`'s own body block.
+function rsIsBodyStmtOf(ix: i32, par: i32, fr: i32): boolean {
+  if fr < 0 || fr >= P.nodes.length || ix < 0 { return false }
+  const fd = P.nodes[fr]
+  if fd is FuncDecl { return par == fd.fnBody || unwrapParen(fd.fnBody) == ix }
+  false
+}
+
+// Whether arena type `ty` is a record, `| null` peeled.
+function rsTyIsRecord(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  const t = T.tys[ty]
+  if t is TyNullable { return rsTyIsRecord(t.nInner) }
+  t is TyObj
+}
+
 // Whether function `fr` has no declared return type.
 function rsFnRetInferred(fr: i32): boolean {
   if fr < 0 { return false }
   const fd = P.nodes[fr]
   if fd is FuncDecl { return fd.fnRet < 0 }
   false
+}
+
+// The type a store `place = v` delivers its value at when the place is an element or a field
+// (a map's read type carries a `| null` every caller peels), or -1 for a bare name (D2990).
+function rsPlaceStoreTy(p: BinExpr): i32 {
+  const lx = unwrapParen(p.binLeft)
+  if lx < 0 || lx >= P.nodes.length || P.nodes[lx] is Ident { return -1 }
+  nodeTyIxOf(lx)
 }
 
 // `x = e` for an element `e` at `vx`: the binding `x` holds the re-seated row only when it is
