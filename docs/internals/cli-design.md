@@ -651,6 +651,25 @@ runs under a host that has it.
 policy is thin and already mostly host-mechanism), so they can stay on today's
 host path until the protocol is proven on `check`.
 
+### The user program's GC heap (host)
+
+The program runs in its own wasmtime engine (`gc_engine`), separate from the compiler's.
+
+| variable | effect |
+| --- | --- |
+| `VL_GC=auto\|tracing\|refcount\|none` | the collector; `auto` (default) is wasmtime's copying collector |
+| `VL_GC_HEAP=<bytes>[K\|M\|G]` | the first heap size: 256 MiB for `vl run`, 64 MiB per `--batch` case, 8 MiB per `vl test` worker; at most 4G, a bad value is a hard error |
+
+Past its first size the heap grows with the live set: after a collection that leaves it more
+than a third full of live data, it at least doubles (`Config::gc_heap_grow_with_live_set`, a
+patch the host carries in `scripts/vl-host/vendor/wasmtime`). Stock wasmtime grew only once a
+collection freed less than the pending allocation, which made a growing live set quadratic
+(plumb PL-065). The compiler's engines keep the stock rule. None of this reaches a module run in
+the browser, Deno or Node: V8 sizes its own generational heap, and only the embedder's flags
+(`--max-old-space-size`) change it. Policy and measurements:
+`docs/internals/perf/gc-heap-policy-2026-09.md`; rationale: DECISIONS.md, "A program's GC heap
+grows with its live set".
+
 ### The user-module cache (host)
 
 Every path that instantiates a user module — `run` (a `.wasm` or the module a `.vl`

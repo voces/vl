@@ -23,6 +23,11 @@
 // `none` or `refcount` never run the copying collector at all, which reads as "0
 // collections", the same shape as a dead counter.
 //
+// A fourth run grades the GROWTH policy (plumb PL-065): a live set that only grows, 750,000
+// kept records, must collect at most `MAX_GROWING` times. Stock wasmtime grew a copying heap
+// only once a collection freed less than the pending allocation, so this collected 23 times
+// (69 at 3,000,000, 5x the CPU); the vendored patch `gc_heap_grow_with_live_set` gives 3.
+//
 // GATING: requires the vl binary + seed wasm; absent either, the test registers
 // ignored with a one-line how-to-build note.
 //
@@ -69,9 +74,33 @@ const MAX_DEFAULT = 10;
 // 20 / 3 at the time of writing; 128 MiB as the default gives 20 / 7 and fails it.
 const MIN_SPREAD = 3;
 
-async function run(tmp: string, env: Record<string, string>) {
+// plumb's vl-probes/pdb/gc-live.vl at a fixed N: every item stays reachable.
+const GROWING_SRC = `type Loc = { kind: i32, reg: i32, start: i32, gaps: i32[] }
+type Item = { name: string, ty: i32, locs: Loc[] }
+
+const keep: Item[] = []
+let total = 0
+for i in 0 until 750_000 {
+  const it: Item = { name: "v\\{i % 1000}", ty: i, locs: [] }
+  it.locs.push({ kind: 1, reg: i & 15, start: i, gaps: [] })
+  keep.push(it)
+  total += it.locs.length
+}
+print(total)
+`;
+
+const GROWING_EXPECT = "750000\n";
+
+// 3 with the growth policy, 23 without it.
+const MAX_GROWING = 8;
+
+async function run(
+  tmp: string,
+  env: Record<string, string>,
+  src: string = SRC,
+) {
   const srcPath = `${tmp}/churn.vl`;
-  await Deno.writeTextFile(srcPath, SRC);
+  await Deno.writeTextFile(srcPath, src);
   const { code, stdout, stderr } = await new Deno.Command(VL, {
     args: ["run", srcPath, "--compiler", COMPILER],
     stdout: "piped",
@@ -89,16 +118,18 @@ async function collections(
   tmp: string,
   env: Record<string, string>,
   label: string,
+  src: string = SRC,
+  expect: string = EXPECT,
 ): Promise<number> {
-  const { code, out, err } = await run(tmp, env);
+  const { code, out, err } = await run(tmp, env, src);
   if (code !== 0) {
     throw new Error(
       `${label}: vl run exited ${code}\nstdout: ${out}\nstderr: ${err}`,
     );
   }
-  if (out !== EXPECT) {
+  if (out !== expect) {
     throw new Error(
-      `${label}: stdout mismatch\n  want ${JSON.stringify(EXPECT)}\n  got  ${
+      `${label}: stdout mismatch\n  want ${JSON.stringify(expect)}\n  got  ${
         JSON.stringify(out)
       }`,
     );
@@ -143,6 +174,34 @@ Deno.test({
           `VL_GC_HEAP=64M collected ${small} times against the default's ${n}, want at least ` +
             `${MIN_SPREAD}x — either the override is not reaching the engine or the default ` +
             "is no longer larger than 64 MiB",
+        );
+      }
+    } finally {
+      await Deno.remove(tmp, { recursive: true });
+    }
+  },
+});
+
+Deno.test({
+  name:
+    "gc-heap-shape: a live set that only grows grows the heap with it (PL-065)",
+  ignore: !ENABLED,
+  fn: async () => {
+    const tmp = await Deno.makeTempDir();
+    try {
+      const n = await collections(
+        tmp,
+        {},
+        "growing live set",
+        GROWING_SRC,
+        GROWING_EXPECT,
+      );
+      if (n < 1 || n > MAX_GROWING) {
+        throw new Error(
+          `${n} collections for a live set that only grows, want 1..${MAX_GROWING} — the heap ` +
+            "no longer grows with the live set (gc_heap_grow_with_live_set in gc_engine, " +
+            "scripts/vl-host/src/main.rs, and its patch in scripts/vl-host/vendor/wasmtime). " +
+            "Stock wasmtime gives 23.",
         );
       }
     } finally {

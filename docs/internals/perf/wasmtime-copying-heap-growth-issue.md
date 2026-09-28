@@ -5,6 +5,10 @@ For the coordinator to file at `bytecodealliance/wasmtime`. Everything below the
 47.0.2 that VL pins. Check the references against `main` before filing. Context for VL:
 `gc-heap-policy-2026-09.md` beside this file.
 
+2026-09-28: VL now carries a fix as a patch (`scripts/vl-host/vendor/wasmtime.patch`, measured in
+`gc-heap-policy-2026-09.md` §4); it is a candidate for the upstream PR, and a growing live set
+(plumb's PL-065, 69 → 7 collections at 3 M items) is a second repro worth adding to the issue.
+
 ---
 
 **Title:** Copying collector: the heap grows only when the live set nearly fills a semispace, so a

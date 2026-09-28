@@ -495,7 +495,8 @@ program verbatim — the only way to pass one that starts with `-`.
                       `vl test` worker). Larger collects less often and
                       commits more memory: a program that allocates past it
                       holds all of it, so under a memory cap of ~256M or less
-                      set VL_GC_HEAP=64M
+                      set VL_GC_HEAP=64M. The heap grows past it once a
+                      collection leaves it a third full of live data
   {c}VL_COMPILE_GC{r}       Collector for the compiler: auto (default: null when the
                       ENTRY FILE is under 1.5 MiB, copying at or above; imports do
                       not count) | null | copying
@@ -1004,9 +1005,16 @@ fn embedded_std_hash() -> String {
 /// semispace, so from 0 a program collects every few MiB of allocation (plumb's decoder:
 /// 1,248 collections). The price: committed memory tracks TOTAL allocation up to
 /// `initial`, per store. Sizes and measurements: docs/internals/perf-decoder-gap-2026-09.md.
+///
+/// Past `initial`, the heap grows with the live set (`gc_heap_grow_with_live_set`, a patch
+/// in `vendor/wasmtime`): stock wasmtime re-copied a growing live set at every few free
+/// bytes, which made building a large structure quadratic (plumb PL-065). The compiler's
+/// engines keep the stock policy, which costs less memory on a copying compile.
+/// docs/internals/perf/gc-heap-policy-2026-09.md §4.
 fn gc_engine(collector: Collector, initial: u64) -> Result<Engine> {
     let mut cfg = gc_config(collector);
     cfg.gc_heap_initial_size(initial);
+    cfg.gc_heap_grow_with_live_set(true);
     // A `--shared-memory` module's memory. wasmtime reads this flag only when it creates a
     // shared memory — no codegen, no engine hash — so a module without one pays nothing.
     cfg.wasm_threads(true);

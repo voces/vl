@@ -1,0 +1,115 @@
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -201,6 +201,8 @@
+     pub(crate) x86_float_abi_ok: Option<bool>,
+     pub(crate) shared_memory: bool,
+     pub(crate) rr_config: RRConfig,
++    /// VL patch: see [`Config::gc_heap_grow_with_live_set`].
++    pub(crate) gc_heap_grow_with_live_set: bool,
+ }
+ 
+ /// User-provided configuration for the compiler.
+@@ -317,6 +319,7 @@
+             x86_float_abi_ok: None,
+             shared_memory: false,
+             rr_config: RRConfig::None,
++            gc_heap_grow_with_live_set: false,
+         };
+         ret.wasm_backtrace_details(WasmBacktraceDetails::Environment);
+         ret
+@@ -2097,6 +2100,19 @@
+         self
+     }
+ 
++    /// VL patch: grow a copying collector's heap once a collection leaves its live set
++    /// filling more than two thirds of a semispace, instead of only once a collection
++    /// frees less than the pending allocation. A growing live set is then copied a
++    /// bounded number of times per doubling; the price is a heap up to twice as large.
++    ///
++    /// ## Default
++    ///
++    /// `false`, which is stock wasmtime's policy.
++    pub fn gc_heap_grow_with_live_set(&mut self, enable: bool) -> &mut Self {
++        self.gc_heap_grow_with_live_set = enable;
++        self
++    }
++
+     /// Indicates whether GC heaps are allowed to be reallocated after initial
+     /// allocation at runtime.
+     ///
+--- a/src/runtime/store/gc.rs
++++ b/src/runtime/store/gc.rs
+@@ -251,6 +251,31 @@
+     ) -> Result<()> {
+         log::trace!("collect_and_maybe_grow_gc_heap(bytes_needed = {bytes_needed:#x?})");
+         self.do_gc(asyncness).await?;
++        let mut limiter = limiter;
++        // VL patch: a copying heap whose live set outgrew its semispace grows now, while
++        // growing costs no collection (the active space is the first half); in the other
++        // half the next out-of-memory grows it instead (`retry_after_gc_async`).
++        if self.live_set_outgrew_semispace()
++            && !self
++                .gc_store
++                .as_ref()
++                .map_or(true, |gc| gc.gc_heap.needs_gc_before_next_growth())
++        {
++            let capacity = u64::try_from(self.gc_heap_capacity())?;
++            let live = u64::try_from(self.last_live_bytes())?;
++            // A semispace of 1.5x the live set; `grow_gc_heap` at least doubles anyway.
++            let want = (live * 3).min(1 << 32);
++            if let Err(e) = self
++                .grow_gc_heap(limiter.as_deref_mut(), want.saturating_sub(capacity).max(1), asyncness)
++                .await
++            {
++                if e.is::<GcHeapGrowthFailed>() {
++                    log::trace!("ignoring GC heap growth failure: {e}");
++                } else {
++                    return Err(e);
++                }
++            }
++        }
+         if let Some(n) = bytes_needed
+             && n > u64::try_from(self.gc_heap_capacity())?.saturating_sub(
+                 self.gc_store.as_ref().map_or(0, |gc| {
+@@ -269,6 +294,28 @@
+         Ok(())
+     }
+ 
++    /// VL patch: the live set the last collection left behind, in bytes (0 before any).
++    fn last_live_bytes(&self) -> usize {
++        self.gc_store
++            .as_ref()
++            .map_or(0, |gc| gc.last_post_gc_allocated_bytes.unwrap_or(0))
++    }
++
++    /// VL patch: whether `Config::gc_heap_grow_with_live_set` is on and this is a copying
++    /// heap, below the 4 GiB index space, whose last live set fills more than two thirds
++    /// of a semispace (a third of the heap). Growing there bounds the copying at two bytes
++    /// per byte a collection frees. Stock wasmtime grows only once a collection frees less
++    /// than the pending allocation, so a growing live set was re-copied every few free
++    /// bytes (plumb PL-065).
++    fn live_set_outgrew_semispace(&self) -> bool {
++        let capacity = self.gc_heap_capacity();
++        self.engine().config().gc_heap_grow_with_live_set
++            && self.engine().tunables().collector == Some(wasmtime_environ::Collector::Copying)
++            && capacity > 0
++            && (capacity as u64) < (1 << 32)
++            && (self.last_live_bytes() as u64) * 3 > capacity as u64
++    }
++
+     /// Attempt to grow the GC heap by `bytes_needed` bytes.
+     ///
+     /// Returns an error if growing the GC heap fails.
+@@ -446,7 +493,11 @@
+                         gc_store.last_post_gc_allocated_bytes.unwrap_or(0)
+                     });
+ 
+-                    if should_collect_first(bytes_needed, gc_heap_capacity, last_gc_heap_usage) {
++                    // VL patch: a live set that outgrew its semispace grows the heap
++                    // rather than being re-copied to free a sliver.
++                    if !store.live_set_outgrew_semispace()
++                        && should_collect_first(bytes_needed, gc_heap_capacity, last_gc_heap_usage)
++                    {
+                         log::trace!(
+                             "Collecting first, then retrying; growing GC heap if collecting didn't \
+                              free up enough space, then retrying again"

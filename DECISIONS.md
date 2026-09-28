@@ -7507,6 +7507,9 @@ every operator does, rather than refusing it as a type that "can never match".
 
 ## `vl run` starts the GC heap at 256 MiB, and no host-side policy can be adaptive (2026-09-23) — plumb PL-014 lane 1
 
+(2026-09-28: the adaptive half now exists as a vendored wasmtime patch; see "A program's GC heap
+grows with its live set, through a vendored wasmtime patch" below. The initial sizes stand.)
+
 #3022 started `vl run`'s GC heap at 64 MiB. plumb's decoder still spent ~45% of its time on
 wasmtime re-copying a 5.6 MB live set 89 times per pass (`docs/internals/perf/decode-bench-gap-2026-09.md`
 §3 A1). `vl run` now starts at 256 MiB, `vl run --batch` stays at 64 MiB, `vl test` at 8 MiB per
@@ -8546,3 +8549,41 @@ the address is `i32.wrap_i64(i64.add(rsp, 32))`, which no binaryen pass folds. R
 `i32.add(i32.wrap_i64(rsp), 32)` is always sound (the identity above) and would let binaryen
 fold it, but it has to run after inlining, so it needs a wasm rewrite step in the host. plumb's
 translator writes the direct form, so this is left until a consumer's inlined helpers ask.
+
+## A program's GC heap grows with its live set, through a vendored wasmtime patch (2026-09-28) — plumb PL-065
+
+A live set that only grows made the default heap quadratic: stock wasmtime grows a copying heap only
+once a collection frees less than the pending allocation, so near a full semispace every collection
+re-copies the whole live set to free a sliver (plumb's `gc-live.vl`: 69 collections and 8.4 s of CPU
+at 3 M kept items, against 0.35 s with no collector). The host now builds on wasmtime 47.0.2 plus one
+patch, `scripts/vl-host/vendor/wasmtime.patch`: `Config::gc_heap_grow_with_live_set` grows the heap
+after a collection that leaves it more than a third full of live data (7 collections, 1.49 s).
+Measurements: `docs/internals/perf/gc-heap-policy-2026-09.md` §4.
+
+**Why a patch and not the host.** The 256 MiB section above lists what wasmtime 47 exposes, and 49
+(the latest) is the same: no collection callback, no public live size, no way to ask for growth. The
+epoch-balloon route cost 11–16% CPU on every program. The patch is ~70 lines in two files, it touches
+only when to grow and never how a collection runs, and it is off unless an engine asks. The price is a
+vendored crate (~5 MB of source), kept honest by `vendor/update-wasmtime.sh`, which rebuilds it from
+the registry and the patch, and `--diff`, which rewrites the patch from the tree. The CI binary caches
+hash `scripts/vl-host/vendor/**`, so an edit there rebuilds the host.
+
+**Why a third of the heap.** It bounds a steady live set's cost at two bytes copied per byte freed,
+and it leaves `bench/algorithms/binarytrees` alone: its 2 M-node tree sits between a third and a
+quarter of the 256 MiB heap, and at a quarter (a semispace twice the live set, the textbook rule) it
+grew to 904 MB for four fewer collections of 53. On the growing probe the two thresholds give the same
+counts, because wasmtime's growth at least doubles the heap either way.
+
+**Why the user program only.** The compiler's copying compile (`VL_COMPILE_GC`, entry files of
+1.5 MiB and up) was sized for memory (D2319), and plumb compiles thousands of units side by side. The
+new rule cut a 6.6 MB unit's compile CPU 13% but raised its peak RSS 300 → 557 MB, so `seed_engine`
+keeps the stock rule and `gc_engine` alone turns the knob on.
+
+**The price, measured.** A program whose live set sits near a third of the heap and that keeps making
+garbage commits up to twice the memory: 264 → 520 MB for 2.6–4.2× less CPU, and a 12-file `vl test`
+of growing and churning programs 843 → 1,119 MB for 19.4 → 4.9 s. `$VL_GC_HEAP` is still the lever
+for a memory cap: a live set below a third of it never triggers this rule.
+
+**V8 is out of scope.** In the browser and Deno, WasmGC objects live on V8's generational heap, which
+a module cannot size and which already grows with the live set: the same probe is linear there (1.02 s
+wall at 3 M). Only an embedder flag such as `--max-old-space-size` reaches it.
