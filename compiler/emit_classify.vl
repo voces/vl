@@ -8526,6 +8526,14 @@ function retWidensAtomToStr(retArgIx: i32, fnIx: i32) {
       if exprIsLitAtom(retArgIx, fnIx) { return true }
       if identShadowMayBeLitAtom(retArgIx, fnIx) { return true }
     }
+    // An inferred union return holding the atom as its string (`K|i32`, D2952).
+    if (
+      fn.fnRet < 0
+      && unionTakesAtomAsStr(inferRetNameOf(inferRetFnKey(fnIx, fn.fnName)))
+    ) {
+      if exprIsLitAtom(retArgIx, fnIx) { return true }
+      if identShadowMayBeLitAtom(retArgIx, fnIx) { return true }
+    }
   }
   false
 }
@@ -9472,6 +9480,13 @@ export function exprHasStrOp(exprIx: i32, fnIx: i32) {
     }
     // The same widening reached through the arms, where the join records one arm's type.
     if ifJoinAtomMeetsString(exprIx, fnIx) { return true }
+    // An atom arm boxed into a join whose union holds it as its string (`K|i32`, D2952).
+    if (
+      gLitUnionUsed != 0
+      && unionTakesAtomAsStr(coalesceResultUnionName(exprIx))
+    ) {
+      if ifChainHasAtomArm(exprIx, fnIx) { return true }
+    }
     if blockHasStrOp(e.ifThen, fnIx) { return true }
     if e.ifElse >= 0 { return blockHasStrOp(e.ifElse, fnIx) }
     return false
@@ -13793,10 +13808,136 @@ export function spreadDestKind(arrIx: i32, fnIx: i32): MfKind | null {
     i = i + 1
   }
   if k == null { return null }
+  // A union element whose sources each box into it builds at its union-box row.
+  if (
+    spreadBoxingSource(arrIx, fnIx) >= 0
+    && spreadOwnBoxRow(arrIx, elems, fnIx) >= 0
+  ) {
+    return "ref"
+  }
+  if spreadLitElemIsString(arrIx) && spreadSourcesStrOrAtoms(elems, fnIx) {
+    return "str"
+  }
   const de = spreadLitScalarElem(arrIx)
   if de == null || de == k { return k }
   if spreadSourcesWidenTo(elems, de, fnIx) { return de }
   k
+}
+
+// The row name a spread literal of ref-list sources builds at: its first source's own row
+// (`spreadDestRow`), not a record the checker's structural element type resolves to, which
+// can be a same-layout record declared earlier (D2938). "" for any other literal.
+export function spreadLitSrcRowName(arrIx: i32, fnIx: i32): string {
+  const a = P.nodes[arrIx]
+  if !(a is ArrayLit) || !hasSpreadItem(a.arrElems) { return "" }
+  if spreadDestKind(arrIx, fnIx) != "ref" { return "" }
+  if spreadBoxingSource(arrIx, fnIx) >= 0 { return "" }
+  // Only when the literal's element IS every source's: a `null` or a nullable source joins
+  // the literal to `C | null`, whose row is not the source's.
+  const de = listElemTyOf(nodeTyIxOf(arrIx))
+  if de < 0 || T.tys[de] is TyNullable { return "" }
+  let i = 0
+  while i < a.arrElems.length {
+    const src = spreadArgOf(a.arrElems[i])
+    if src >= 0 {
+      const se = listElemTyOf(nodeTyIxOf(src))
+      if se < 0 || !tySame(se, de) { return "" }
+    }
+    i = i + 1
+  }
+  const row = spreadDestRow(a.arrElems, fnIx)
+  if row < 0 || row >= rlElemName.length { return "" }
+  rlElemName[row]
+}
+
+// The ref-list row of the element the checker typed list literal `arrIx` at, or -1.
+export function spreadLitElemRow(arrIx: i32): i32 {
+  const de = listElemTyOf(nodeTyIxOf(arrIx))
+  if de < 0 { return -1 }
+  rlSlotOfTy(de)
+}
+
+// The union-box row of spread literal `arrIx`'s own typed element, when every source reaches
+// it (`spreadSrcBoxes`); -1 otherwise, which keeps the caller's refusal.
+export function spreadOwnBoxRow(arrIx: i32, elems: i32[], fnIx: i32): i32 {
+  const row = spreadLitElemRow(arrIx)
+  if row < 0 || row >= rlElemKindTbl.length { return -1 }
+  if rlElemKindTbl[row] != RLK_UNION { return -1 }
+  let i = 0
+  while i < elems.length {
+    const src = spreadArgOf(elems[i])
+    if src >= 0 && spreadSrcBoxes(src, row, fnIx) < 0 { return -1 }
+    i = i + 1
+  }
+  row
+}
+
+// How spread source `src` reaches union-box row `row`: 1 boxed per element (a scalar list whose
+// element is a member, a record list the element-converting copy widens), 0 a list of that row,
+// -1 neither, which keeps the plain backing copy (a union-box list shares the backing).
+export function spreadSrcBoxes(src: i32, row: i32, fnIx: i32): i32 {
+  if row < 0 || row >= rlElemName.length { return -1 }
+  const k = mfRecvKindOf(src, fnIx)
+  if k == null || k == "u8" { return -1 }
+  if k == "ref" {
+    const s = refListSlotOfExpr(src, fnIx)
+    if s == row { return 0 }
+    if s < 0 || s >= rlElemKindTbl.length { return -1 }
+    if rlElemKindTbl[s] == RLK_UNION { return -1 }
+    if rlWidenVariantOf(s, row) < 0 { return -1 }
+    return 1
+  }
+  if spreadSrcBoxAtom(src, rlElemName[row]) < 0 { return -1 }
+  1
+}
+
+// The value atom a scalar list `src`'s element boxes under in union `un`: its own when that is
+// a member, else the member it widens to losslessly (`i32` to `i64` or `f64`, `f32` to `f64`),
+// each element then converted before it is boxed (D2882). -1 when neither.
+export function spreadSrcBoxAtom(src: i32, un: string): i32 {
+  const pn = tyArrayElemPrimName(nodeTyIxOf(src))
+  if pn == "" { return -1 }
+  const k = valueAtomKind(pn)
+  if k < 0 || k > 5 { return -1 }
+  if unionHasAtomKindArm(un, k) { return k }
+  if k == 0 && unionHasAtomKindArm(un, 3) { return 3 }
+  if (k == 0 || k == 5) && unionHasAtomKindArm(un, 4) { return 4 }
+  -1
+}
+
+// Whether the checker typed spread literal `arrIx` a `string[]` or a `(string | null)[]`,
+// which share one rep.
+function spreadLitElemIsString(arrIx: i32): boolean {
+  let de = listElemTyOf(nodeTyIxOf(arrIx))
+  if de < 0 { return false }
+  const dt = T.tys[de]
+  if dt is TyNullable { de = dt.nInner }
+  if de < 0 { return false }
+  tyPrimNameOf(de) == "string"
+}
+
+// The member texts of spread source `src` when it is a list of an atom-repped literal union,
+// whose elements each widen to their string in a `string[]` destination (D2868); else empty.
+export function spreadSrcAtomTexts(src: i32, fnIx: i32): string[] {
+  const none: string[] = []
+  if mfRecvKindOf(src, fnIx) != "i32" { return none }
+  tyLitMemberTexts(listElemTyOf(nodeTyIxOf(src)))
+}
+
+// Whether every spread source among `elems` is a string list or a list of literal-union atoms,
+// and at least one is the latter: the sources a `string[]` spread builds from.
+export function spreadSourcesStrOrAtoms(elems: i32[], fnIx: i32): boolean {
+  let atoms = false
+  let j = 0
+  while j < elems.length {
+    const src = spreadArgOf(elems[j])
+    if src >= 0 {
+      if spreadSrcAtomTexts(src, fnIx).length > 0 { atoms = true }
+      else if mfRecvKindOf(src, fnIx) != "str" { return false }
+    }
+    j = j + 1
+  }
+  atoms
 }
 
 // The spread source of literal `arrIx` whose elements would each need boxing: the literal is
@@ -13810,6 +13951,10 @@ export function spreadBoxingSource(arrIx: i32, fnIx: i32): i32 {
   const dT = T.tys[de]
   if !(dT is TyUnion || dT is TyNullable) { return -1 }
   if tyIsLitUnion(de) { return -1 }
+  // A nullable string list is the string list's rep, which atom sources widen into.
+  if spreadLitElemIsString(arrIx) && spreadSourcesStrOrAtoms(a.arrElems, fnIx) {
+    return -1
+  }
   let i = 0
   while i < a.arrElems.length {
     const src = spreadArgOf(a.arrElems[i])
@@ -15344,6 +15489,11 @@ export function exprIsF32(exprIx: i32, fnIx: i32) {
         e.callFn,
       )
       if target >= 0 { return repOfFnSlot(target).rdKind == "f32" }
+      // A function-value (closure) callee returning f32, as `exprIsF64`'s arm reads it: a
+      // lambda a hole instance lifts records the hole as its call's type (D2932).
+      if calleeRetKindAt(sidOfNode(e.callFn), fnIx, e.callFn) == "f32" {
+        return true
+      }
     }
     // An f32-returning field-closure call the typed-IR fast path can't see: the emitter's own
     // `dispatchRewrite` mints a `Call` with no arena entry for `x[i]` over a `"[]"` closure
@@ -22797,10 +22947,7 @@ export function arrLitBoxElemName(arrIx: i32): string {
   if !(el is TyUnion) { return "" }
   if el.uMembers.length < 2 { return "" }
   if tyIsLitUnion(t.aElem) { return "" }
-  const cen = nodeArrayElemName(arrIx)
-  if cen == "" { return "" }
-  if nameIsLitUnionArmValueUnion(cen) { return "" }
-  cen
+  nodeArrayElemName(arrIx)
 }
 
 // The nullable spelling of the same box (D1372): `arrLitBoxElemName` reads `TyUnion`, but a
@@ -23589,6 +23736,8 @@ function elemNameIsNominalAt(en: string, depth: i32): boolean {
 // instance's parameter pin names it (`[[t]]` at `T := string` keys `string[]`); the pin-blind
 // answer when the leaf reads the same, or when the pinned leaf has no element row (D2798).
 export function arrLitElemNameIn(arrIx: i32, fnIx: i32): string {
+  const sn = spreadLitSrcRowName(arrIx, fnIx)
+  if sn != "" { return sn }
   const nm = arrLitElemName(arrIx)
   if fnIx < 0 || nm != "i32[]" { return nm }
   const a = P.nodes[arrIx]
@@ -26792,6 +26941,10 @@ export function litAtomMemberTy(exprIx: i32, fnIx: i32) {
 export function litAtomWidenTexts(ix: i32, fnIx: i32) {
   const direct = nodeLitUnionMemberTexts(ix)
   if direct.length > 0 { return direct }
+  if holeLitReadIsAtom(ix, fnIx, 0) {
+    const hole = tyLitMemberTexts(holeOperandTyOf(ix, fnIx))
+    if hole.length > 0 { return hole }
+  }
   const decl = tyLitMemberTexts(litAtomMemberTy(ix, fnIx))
   if decl.length > 0 { return decl }
   const own = tyLitMemberTexts(nodeTyIxOf(ix))
@@ -26953,6 +27106,14 @@ export function exprIsLitAtom(exprIx: i32, fnIx: i32) {
   // rep survives (`coalesceLitUnionFits`). Without it an inferred `const v = p ?? "a"` bound
   // a bare i32 and every atom consumer saw a number instead of the member.
   if coalesceLitUnionFits(exprIx, fnIx) { return true }
+  // A node the generic body shares, typed at a hole this instance pins to a literal union,
+  // which every rung below reads at the hole (D2942).
+  if (
+    tyLitUnionAliasIx(holeOperandTyOf(exprIx, fnIx)) >= 0
+    && holeLitReadIsAtom(exprIx, fnIx, 0)
+  ) {
+    return true
+  }
   const e = P.nodes[unwrapParen(exprIx)]
   // An assignment's value is lowered as a re-read of its target, so it is an atom exactly
   // when that target is one whose members are known (D2168).
@@ -28907,12 +29068,42 @@ export function holeOperandTyOf(exprIx: i32, fnIx: i32): i32 {
   b
 }
 
-// `holeOperandTyOf` where that type is `boolean` or `boolean | null`, which share the `i32` rep
-// and so are told apart from it only by the type; -1 otherwise (D2919).
-export function holeOperandBoolTyOf(exprIx: i32, fnIx: i32): i32 {
+// `holeOperandTyOf` where that type is `boolean`, `boolean | null` or a literal union, which
+// share the `i32` rep and so are told apart from it only by the type; -1 otherwise (D2919).
+export function holeOperandI32PinTyOf(exprIx: i32, fnIx: i32): i32 {
   const t = holeOperandTyOf(exprIx, fnIx)
   if tyPrimNameOf(t) == "boolean" || tyIsNulPrim(t, "boolean") { return t }
+  if tyLitUnionAliasIx(t) >= 0 && holeLitReadIsAtom(exprIx, fnIx, 0) {
+    return t
+  }
   -1
+}
+
+// Whether `exprIx`, typed at a hole instance `fnIx` pins to a literal union, holds the atom: not
+// a join, whose string arm makes it a string ref (D1728), nor the instance's own parameter, which
+// its annotation already pins. A local answers by its un-annotated initializer.
+function holeLitReadIsAtom(exprIx: i32, fnIx: i32, depth: i32): boolean {
+  if fnIx < 0 || exprIx < 0 || depth > 4 { return false }
+  const ix = unwrapParen(exprIx)
+  if ix < 0 { return false }
+  const e = P.nodes[ix]
+  if e is Ident {
+    if paramIndexOf(fnIx, e.identName) >= 0 { return false }
+    const fn = P.nodes[fnIx]
+    if !(fn is FuncDecl) { return false }
+    const li = parentLetOf(fn.fnBody, e.identName)
+    if li < 0 { return false }
+    const d = P.nodes[li]
+    if !(d is LetDecl) { return false }
+    if d.letType >= 0 { return true }
+    return holeLitReadIsAtom(d.letInit, fnIx, depth + 1)
+  }
+  !nodeIsValueJoin(ix)
+}
+
+// Whether node `ix` is an `if` or `match` in value position, whose value joins its arms.
+function nodeIsValueJoin(ix: i32): boolean {
+  P.nodes[ix] is IfStmt || P.nodes[ix] is MatchExpr
 }
 
 // The exact map a nullable niche `exprIx` holds inside an exact instance, or -1.
@@ -33250,6 +33441,8 @@ export function coalesceResultUnionName(ix: i32): string {
   const nm = tyToEmitName(nodeTyPinIxOf(ix))
   if nm != "" {
     if isValueUnionName(nm) { return nm }
+    // A join grouping string literals into a literal-union arm (`K|i32`) boxes as its row (D2952).
+    if nameIsLitUnionArmValueUnion(nm) && unRowOfName(nm) >= 0 { return nm }
   }
   const vn = nodeVariantUnionName(ix)
   if vn != "" { return vn }

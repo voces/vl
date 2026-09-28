@@ -111,7 +111,6 @@ import {
   simdRowSig,
   truncSatFromF64,
   truncSatOp,
-  tyArrayElemPrimName,
   tyIsLitUnion,
   tyIsLitUnionArray,
   tyIsLitUnionOrLit,
@@ -1031,7 +1030,12 @@ import {
   spreadDstBackSlot,
   spreadElemWidens,
   spreadGroupWrapSlot,
+  spreadOwnBoxRow,
+  spreadSourcesStrOrAtoms,
   spreadSourcesWidenTo,
+  spreadSrcAtomTexts,
+  spreadSrcBoxAtom,
+  spreadSrcBoxes,
   stmtIsTailValue,
   structEqStashSlot,
   structIdxOfElemName,
@@ -1140,7 +1144,7 @@ import {
   fnIndexOfInScopeChain,
 } from "./emit_collect"
 import { voidTwinForNode } from "./emit_rewrite"
-import { nameIsQuotedLeaf, splitUnionAtoms } from "./tyname"
+import { nameIsQuotedLeaf, nameIsShapeOpen, splitUnionAtoms } from "./tyname"
 import { monoOrigNode } from "./emit_state"
 import {
   INIT_REACH_NEVER,
@@ -2402,6 +2406,29 @@ function monoStaticIsResult(isIx: i32, fnIx: i32) {
   -1
 }
 
+// Whether no arm of the union box `recvIx` reads at can carry the value-arm tag `tag`: each arm
+// claims another value tag, or is a struct variant, whose tag is below every value tag. False
+// when the union is unnamed or an arm is neither, so its tag set is not known.
+function unionBoxLacksTag(recvIx: i32, tag: i32, fnIx: i32): boolean {
+  if tag < uVariants.length { return false }
+  const nm = unionNameOfExpr(recvIx, fnIx)
+  if nm == "" { return false }
+  const atoms: string[] = []
+  const arms: i32[] = []
+  if !unionSetArmTys(nm, atoms, arms) || arms.length == 0 { return false }
+  let i = 0
+  while i < arms.length {
+    const t = isArmTagOfTy(arms[i])
+    if t == tag { return false }
+    if t < 0 {
+      const an = tyToEmitName(arms[i])
+      if variantIndexOf(an) < 0 && !nameIsShapeOpen(an) { return false }
+    }
+    i = i + 1
+  }
+  true
+}
+
 // The union-box tag the type `ity` claims as a value-union arm, or -1 when it claims none
 // (a struct variant, a literal, an un-interned shape). A bare function-type arm tags on
 // its interned signature slot rather than the flat kind-11 value-atom tag — kind 11 alone
@@ -3270,6 +3297,12 @@ function emitIsTest(body: u8[], isIx: i32, fnIx: i32) {
     }
     if armTag >= 0 {
       const vrecv = P.nodes[unwrapParen(ndv.isObj)]
+      // No arm of this box carries the tag (a generic body's `is i32[]` at a pin whose union
+      // has no list), so the test is false and a bare name needs no read (D2955).
+      if vrecv is Ident && unionBoxLacksTag(ndv.isObj, armTag, fnIx) {
+        fbI32Const(0)
+        return 0
+      }
       if vrecv is Ident {
         // pushes the raw box slot directly, even when an outer arm already narrowed it to
         // a single atom — the narrowed Ident read would unbox instead of yielding the box.
@@ -7418,6 +7451,9 @@ function emitArrSpread(body: u8[], arrIx: i32, fnIx: i32) {
     if boxRow >= 0 { return emitArrSpreadBoxed(body, arrIx, boxRow, fnIx) }
     const boxSrc = spreadBoxingSource(arrIx, fnIx)
     if boxSrc >= 0 {
+      // Nothing threaded a row, so the literal builds at its own typed union-box row.
+      const own = spreadOwnBoxRow(arrIx, elems, fnIx)
+      if own >= 0 { return emitArrSpreadBoxed(body, arrIx, own, fnIx) }
       return emitFailAt(
         "emitProgram: a spread whose elements must each be boxed into a union or nullable "
           + "element has no lowering yet; build the source list at the literal's element type",
@@ -7435,6 +7471,14 @@ function emitArrSpread(body: u8[], arrIx: i32, fnIx: i32) {
       && spreadSourcesWidenTo(elems, pdk, fnIx)
     ) {
       kk = pdk
+    }
+    // A `string[]` destination builds a literal-union atom source's strings (D2868).
+    if (
+      kk == "i32"
+      && pendingListKind == LBK_STR_LIST
+      && spreadSourcesStrOrAtoms(elems, fnIx)
+    ) {
+      kk = "str"
     }
     if kk == null {
       return emitFail(
@@ -7481,7 +7525,11 @@ function emitArrSpread(body: u8[], arrIx: i32, fnIx: i32) {
       if gk != kk { pendingListKind = pendingKindOfMf(gk, 0) }
       pendingListSlot = row
       if emitExpr(body, groups[g], fnIx) < 0 { return -1 }
-      if gk != kk {
+      if gk != kk && kk == "str" {
+        if emitAtomListToStrTop(spreadSrcAtomTexts(groups[g], fnIx)) < 0 {
+          return -1
+        }
+      } else if gk != kk {
         if (
           emitScalarListWidenTop(
             body,
@@ -7596,35 +7644,6 @@ function spreadBoxDestRow(elems: i32[], fnIx: i32): i32 {
   -1
 }
 
-// How spread source `src` reaches union-box row `row`: 1 boxed per element (a scalar list whose
-// element is a member, a record list the element-converting copy widens), 0 a list of that row,
-// -1 neither, which keeps the plain backing copy (a union-box list shares the backing).
-function spreadSrcBoxes(src: i32, row: i32, fnIx: i32): i32 {
-  if row < 0 || row >= rlElemName.length { return -1 }
-  const k = mfRecvKindOf(src, fnIx)
-  if k == null || k == "u8" { return -1 }
-  if k == "ref" {
-    const s = refListSlotOfExpr(src, fnIx)
-    if s == row { return 0 }
-    if s < 0 || s >= rlElemKindTbl.length { return -1 }
-    if rlElemKindTbl[s] == RLK_UNION { return -1 }
-    if rlWidenVariantOf(s, row) < 0 { return -1 }
-    return 1
-  }
-  const ak = spreadSrcAtomKind(src)
-  if ak < 0 || !unionHasAtomKindArm(rlElemName[row], ak) { return -1 }
-  1
-}
-
-// The value atom a scalar list `src`'s element boxes under, or -1 when its element is none.
-function spreadSrcAtomKind(src: i32): i32 {
-  const pn = tyArrayElemPrimName(nodeTyIxOf(src))
-  if pn == "" { return -1 }
-  const k = valueAtomKind(pn)
-  if k < 0 || k > 5 { return -1 }
-  k
-}
-
 // `emitArrSpread` for a destination list of union boxes: a same-row source copies as it is,
 // a record list is boxed by the element-converting copy, a scalar list by its boxing sibling,
 // and a plain run builds at the row; the groups then join as every spread's do.
@@ -7703,12 +7722,12 @@ function emitSpreadGroupBoxed(
     }
     return emitRefListWidenTop(body, s, row)
   }
-  const ak = spreadSrcAtomKind(grp)
   let un = ""
   if row >= 0 && row < rlElemName.length { un = rlElemName[row] }
+  const ak = spreadSrcBoxAtom(grp, un)
   // Unreachable past `spreadSrcBoxes`, which admits only a scalar source whose element is a
-  // member; a widening source (`i32` into `(f64 | null)[]`) keeps the plain copy (D2882).
-  if k == null || k == "u8" || ak < 0 || !unionHasAtomKindArm(un, ak) {
+  // member or widens to one.
+  if k == null || k == "u8" || ak < 0 {
     return emitFailAt(
       "emitProgram: a boxing spread reached a source `spreadSrcBoxes` does not admit",
       grp,
@@ -7733,6 +7752,7 @@ function spreadGroupSrcKind(
     if spreadArgOf(elems[i]) == g {
       const sk = mfRecvKindOf(g, fnIx)
       if sk != null && spreadElemWidens(sk, kk) { return sk }
+      if kk == "str" && spreadSrcAtomTexts(g, fnIx).length > 0 { return "i32" }
       return kk
     }
     i = i + 1
@@ -20982,10 +21002,110 @@ function emitScalarListWidenTop(_body: u8[], srcKind: VKind, dstKind: VKind) {
   0
 }
 
+// Consume a list of literal-union atoms (`i32` ids) on the stack and leave a `string[]` whose
+// elements are each atom's member string, `texts` giving the members (D2868). The string-list
+// sibling of `emitScalarListWidenTop`; the per-element tower is `emitAtomToStr`'s.
+function emitAtomListToStrTop(texts: string[]) {
+  if texts.length == 0 {
+    return emitFail(
+      "emitProgram: a spread widening literal-union atoms to strings has no members",
+    )
+  }
+  const srcWrap = scalarListWrap("i32")
+  const srcBack = scalarListBack("i32")
+  const dstWrap = scalarListWrap("str")
+  const dstBack = scalarListBack("str")
+  const sL = widenScalarWrapSlot("i32")
+  const dL = widenScalarBackSlot("str")
+  const iL = widenTmpSlot(0)
+  const nL = widenTmpSlot(1)
+  const aL = widenTmpSlot(2)
+  fbLocalSet(sL)
+  fbLocalGet(sL)
+  fbStructGet(srcWrap, 1)
+  fbLocalSet(nL)
+  fbLocalGet(nL)
+  fbArrayNewDefault(dstBack)
+  fbLocalSet(dL)
+  fbI32Const(0)
+  fbLocalSet(iL)
+  // block { loop { if i >= n br 1; a = src.back[i]; back[i] = str(a); i++; br 0 } }
+  fbBlock(64)
+  fbLoop(64)
+  fbLocalGet(iL)
+  fbLocalGet(nL)
+  fbI32Bin(78) // 0x4e i32.ge_s
+  fbBrIf(1)
+  fbLocalGet(sL)
+  fbStructGet(srcWrap, 0)
+  fbLocalGet(iL)
+  fbArrayGet(srcBack)
+  fbLocalSet(aL)
+  fbLocalGet(dL)
+  fbLocalGet(iL)
+  if emitAtomLocalToStrChain(texts, 0, aL) < 0 { return -1 }
+  fbArraySet(dstBack)
+  fbLocalGet(iL)
+  fbI32Const(1)
+  fbI32Bin(106) // 0x6a i32.add
+  fbLocalSet(iL)
+  fbBr(0)
+  fbEnd()
+  fbEnd()
+  fbLocalGet(dL)
+  wU8(212) // 0xd4 ref.as_non_null
+  fbLocalGet(nL)
+  fbLocalGet(nL)
+  fbStructNew(dstWrap)
+  0
+}
+
+// `emitAtomToStrChain` over an atom id held in local `aL` rather than the string-op frame,
+// which a function reserves only when it has a string operation of its own.
+function emitAtomLocalToStrChain(texts: string[], i: i32, aL: i32) {
+  if i >= texts.length - 1 {
+    return emitStr([], mkStr(quoteLex(texts[i]), -1), -1)
+  }
+  if emitStr([], mkStr(quoteLex(texts[i]), -1), -1) < 0 { return -1 }
+  if emitAtomLocalToStrChain(texts, i + 1, aL) < 0 { return -1 }
+  fbLocalGet(aL)
+  fbI32Const(internAtom(quoteLex(texts[i])))
+  fbI32Bin(70) // i32.eq
+  wU8(28)      // 0x1c select_t
+  wU8(1)       // one result valtype
+  wU8(100)     // 0x64 (ref ht) — non-null
+  wSLEB(sTypeIdx)
+  0
+}
+
+// The convert opcode an element of `srcKind` takes before it is boxed under value atom
+// `atomK`: -1 when the atom is the element's own, -2 when no lossless widening reaches it.
+function scalarBoxWidenOp(srcKind: VKind, atomK: i32): i32 {
+  if atomK == 3 {
+    if srcKind == "i64" { return -1 }
+    const o = scalarWidenConvOp(srcKind, "i64")
+    if o < 0 { return -2 }
+    return o
+  }
+  if atomK == 4 {
+    if srcKind == "f64" { return -1 }
+    const o = scalarWidenConvOp(srcKind, "f64")
+    if o < 0 { return -2 }
+    return o
+  }
+  -1
+}
+
 // Consume a scalar list of `srcKind` on the stack and leave a `(ref $rlWrapIdx[dstSlot])` whose
 // union-box elements each hold one source element under value atom `atomK`'s tag: the boxing
 // sibling of `emitScalarListWidenTop`, for a spread into a list of a union element (D2869).
 function emitScalarListBoxTop(srcKind: VKind, atomK: i32, dstSlot: i32) {
+  const conv = scalarBoxWidenOp(srcKind, atomK)
+  if conv == -2 {
+    return emitFail(
+      "emitProgram: a spread boxing a scalar list has no convert into its element's atom",
+    )
+  }
   let vb = -1
   if atomK != 2 {
     vb = vbHeapIdxOfKind(atomK)
@@ -21033,6 +21153,7 @@ function emitScalarListBoxTop(srcKind: VKind, atomK: i32, dstSlot: i32) {
   fbStructGet(srcWrap, 0)
   fbLocalGet(iL)
   fbArrayGet(srcBack)
+  if conv >= 0 { wU8(conv) }
   if vb >= 0 { fbStructNew(vb) }
   fbStructNew(uBoxIdx)
   fbArraySet(dstBack)
@@ -22960,11 +23081,17 @@ function emittedCondConst(condStart: i32): i32 {
   -1
 }
 
-// `emittedCondConst` of an `is` test `condIx` emitted since `condStart`, or -1 for any other
-// condition: an instance decides its own `is` tests, so one value arm can be dead there.
+// `emittedCondConst` of an `is` test `condIx`, or its `!`, emitted since `condStart`, or -1 for
+// any other condition: an instance decides its own `is` tests, so one arm can be dead there.
 function staticIsGuard(condIx: i32, condStart: i32): i32 {
   if condIx < 0 { return -1 }
-  if !(P.nodes[unwrapParen(condIx)] is IsExpr) { return -1 }
+  const c = P.nodes[unwrapParen(condIx)]
+  if c is Unary {
+    if c.unOp != "!" { return -1 }
+    if !(P.nodes[unwrapParen(c.unArg)] is IsExpr) { return -1 }
+    return emittedCondConst(condStart)
+  }
+  if !(c is IsExpr) { return -1 }
   emittedCondConst(condStart)
 }
 
@@ -22983,9 +23110,26 @@ function emitDeadValueArm(blockIx: i32): i32 {
 function monoStaticGuardEndsBlock(stmtIx: i32, fnIx: i32) {
   const s = P.nodes[stmtIx]
   if s is IfStmt {
+    if negGuardDecidedTrue(s.ifCond, fnIx) { return stmtAlwaysExits(s.ifThen) }
     if monoStaticIsGuardOf(s.ifCond, fnIx) != 1 { return false }
     return stmtAlwaysExits(s.ifThen)
   }
+  false
+}
+
+// The function, condition node and emitted constant (`staticIsGuard`) of the most recently
+// lowered statement `if`: the enclosing block asks whether that guard is decided.
+let negGuardFn = -1
+let negGuardCond = -1
+let negGuardVal = -1
+
+// Whether `condIx` is a `!is` the statement `if` just lowered decided true: the instance's pin
+// cannot hold the tested type, so a tail after an exiting arm reads it at that type (D2957).
+function negGuardDecidedTrue(condIx: i32, fnIx: i32): boolean {
+  if condIx < 0 || condIx != negGuardCond || negGuardVal != 1 { return false }
+  if fnIx != negGuardFn { return false }
+  const c = P.nodes[unwrapParen(condIx)]
+  if c is Unary { return c.unOp == "!" }
   false
 }
 
@@ -23314,9 +23458,10 @@ function emitIfLinkStmt(body: u8[], s: IfStmt, fnIx: i32, open: i32[]) {
   // off the emitted condition itself (`emittedCondConst`), not a parallel predicate.
   const condStart = wLen()
   if emitCondExpr(body, s.ifCond, fnIx) < 0 { return -1 }
-  let staticGuard = -1
-  const condN = P.nodes[unwrapParen(s.ifCond)]
-  if condN is IsExpr { staticGuard = emittedCondConst(condStart) }
+  const staticGuard = staticIsGuard(s.ifCond, condStart)
+  negGuardFn = fnIx
+  negGuardCond = s.ifCond
+  negGuardVal = staticGuard
   fbIf(64) // 0x04 if, 0x40 void blocktype
   // If the condition is `n is Variant` over a bare union identifier, narrow `n` to
   // that variant for the THEN-branch only (so `n.field` downcasts). Save/restore the
@@ -24844,9 +24989,7 @@ function emitIfLinkTail(body: u8[], s: IfStmt, fnIx: i32, open: i32[]) {
   // else { "o" } }` emitted the statically-false arm's narrowed use in the i32 instance.
   const condStart = wLen()
   if emitCondExpr(body, s.ifCond, fnIx) < 0 { return -1 }
-  let staticGuard = -1
-  const condN = P.nodes[unwrapParen(s.ifCond)]
-  if condN is IsExpr { staticGuard = emittedCondConst(condStart) }
+  const staticGuard = staticIsGuard(s.ifCond, condStart)
   fbIf(64) // 0x04 if, 0x40 void blocktype
   const savedTop = narrowTop
   const narrowed = setNarrowFromCond(s.ifCond, fnIx)
@@ -26114,7 +26257,16 @@ function emitUnaryNode(body: u8[], e: Unary, _exprIx: i32, fnIx: i32) {
   // Logical not `!a`: a boolean rides in an i32 (0/1), so `i32.eqz` (0x45) maps
   // 0→1 and any non-zero→0 — exactly `a == 0`. Push the operand, then eqz.
   if e.unOp == "!" {
+    const ngStart = wLen()
     if emitExpr(body, e.unArg, fnIx) < 0 { return -1 }
+    // An instance's decided `is` stays one constant under `!`, so `staticIsGuard` reads the
+    // negated test as decided too and the dead arm is not lowered (D2957).
+    const ngK = staticIsGuard(e.unArg, ngStart)
+    if ngK >= 0 {
+      wDropBack(2)
+      fbI32Const(1 - ngK)
+      return 0
+    }
     fbI32Eqz() // 0x45 i32.eqz
     return 0
   }

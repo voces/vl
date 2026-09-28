@@ -187,6 +187,127 @@ Deno.test({ name: "wasm-checker: a defaulted numeric literal names its declarati
   }
 });
 
+// D2966 (plumb PL-054) — a store the defaulted literal refuses names the declaration too. The
+// misses pin the note's ABSENCE, which a fixture's substring directive cannot.
+Deno.test({ name: "wasm-checker: a store into a defaulted literal names its declaration", ignore }, async () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  const msgs = async (src: string) =>
+    (await checker.check(src, "/tmp/x.vl", noSiblings))
+      .filter((d) => d.severity === "error")
+      .map((d) => d.message);
+  const witness = "function ld32(a: i64) { (__load_i32__(a as% i32) as% i64) & 4294967295 }\n" +
+    "function sum(p: i64, n: i64) { let s = 0; let i = 0; while i < n { s += ld32(p + i * 4); i += 1 }; s }\n" +
+    "print(sum(0, 0))\n";
+  const hits: [string, string][] = [
+    [
+      witness,
+      "cannot assign i64 to i32 — `s` on line 2 has no annotation, so its literal defaulted to " +
+      "`i32`; annotate it: `let s: i64 = …`",
+    ],
+    [
+      "function fl(): f32 { 1.5 }\nconst r = { x: 0 }\nr.x += fl()\nprint(r.x)\n",
+      "operator '+' mixes i32 and f32 — field `x` of `r` on line 2 has no annotation, so its " +
+      "literal defaulted to `i32`; write it `x: 0 as f32`",
+    ],
+  ];
+  for (const [src, want] of hits) {
+    const got = await msgs(src);
+    if (JSON.stringify(got) !== JSON.stringify([want])) {
+      throw new Error(`want ${JSON.stringify([want])}, got ${JSON.stringify(got)}`);
+    }
+  }
+  // No note: an annotated declaration, two stores wanting different types, and a float literal
+  // an i64 store cannot hold.
+  const g = "function big(): i64 { 5 }\nfunction fl(): f32 { 1.5 }\n";
+  const misses: [string, string[]][] = [
+    [g + "let a: i32 = 0\na = big()\nprint(a)\n", ["cannot assign i64 to i32"]],
+    [
+      g + "let b = 0\nb = big()\nb = fl()\nprint(b)\n",
+      ["cannot assign i64 to i32", "cannot assign f32 to i32"],
+    ],
+    [g + "let c = 0.5\nc = big()\nprint(c)\n", ["cannot assign i64 to f64"]],
+    // A whole store to a `const` is refused already, so annotating it would not help.
+    [
+      "function big(): i64 { 5000000000 }\nconst t = 0\n" +
+      "function run() { const s = 0; s += big(); t = big() }\nrun()\n",
+      [
+        "cannot reassign `const` s",
+        "cannot assign i64 to i32",
+        "cannot reassign `const` t",
+        "cannot assign i64 to i32",
+      ],
+    ],
+  ];
+  for (const [src, want] of misses) {
+    const got = await msgs(src);
+    if (JSON.stringify(got) !== JSON.stringify(want)) {
+      throw new Error(`want ${JSON.stringify(want)} for ${JSON.stringify(src)}, got ${JSON.stringify(got)}`);
+    }
+  }
+});
+
+// D2977 (plumb PL-056) — the refused value reads the literal binding as a first argument, an
+// operand, or inside a record or list literal. The misses pin the note's ABSENCE when another read
+// wants the literal's own type: the suggestion would refuse that read.
+Deno.test({ name: "wasm-checker: a defaulted literal read inside a value names its declaration", ignore }, async () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  const msgs = async (src: string) =>
+    (await checker.check(src, "/tmp/x.vl", noSiblings))
+      .filter((d) => d.severity === "error")
+      .map((d) => d.message);
+  const note = (nm: string, ln: number, def: string, ann: string) =>
+    ` — \`${nm}\` on line ${ln} has no annotation, so its literal defaulted to \`${def}\`; ` +
+    `annotate it: \`${ann} = …\``;
+  const g = "function mul(a: f32, b: f32): f32 { a * b }\nfunction gi(a: i32): i32 { a }\n";
+  const hits: [string, string][] = [
+    [
+      g + "const x = 0.0\nfunction f(y: f32): f32 { mul(x, y) }\nprint(f(2.0))\n",
+      "argument 1: expected f32, got f64" + note("x", 3, "f64", "const x: f32"),
+    ],
+    [
+      g + "function f(y: f32): f32 {\n  const n = 3\n  n * y\n}\nprint(f(2.0))\n",
+      "operator '*' mixes i32 and f32" + note("n", 4, "i32", "const n: f32"),
+    ],
+    [
+      g + "type V = { v: f32 }\nlet fv = 1.5\nconst r: V = { v: fv }\nprint(r.v)\n",
+      "cannot assign {v: f64} to 'r' of type V" + note("fv", 4, "f64", "let fv: f32"),
+    ],
+    [
+      g + "const e = 4\nconst xs: f32[] = [e]\nprint(xs[0])\n",
+      "cannot assign i32[] to 'xs' of type f32[]" + note("e", 3, "i32", "const e: f32"),
+    ],
+  ];
+  for (const [src, want] of hits) {
+    const got = await msgs(src);
+    if (JSON.stringify(got) !== JSON.stringify([want])) {
+      throw new Error(`want ${JSON.stringify([want])}, got ${JSON.stringify(got)}`);
+    }
+  }
+  const misses = [
+    g + "const b = 3\nprint(mul(b, 1.0))\nprint(gi(b))\n",
+    g + "const i = 1\nconst ys = [7, 8]\nprint(ys[i])\nprint(mul(i, 1.0))\n",
+    g + "const m = 3\nfunction a(): f32 { mul(m, 1.0) }\nfunction c(n: i32): boolean { m < n }\nprint(a())\n",
+    // An integer `/` would become a float one, and `f32 == 3` is refused (D2980).
+    g + "const d = 7\nprint(mul(d, 1.0))\nprint(d / 2)\n",
+    g + "const q = 3\nprint(mul(q, 1.0))\nprint(q == 3)\n",
+    // A type parameter hands the annotated type on, here into an `i32` operator.
+    g + "function id<T>(a: T): T { a }\nconst p = 3\nprint(mul(p, 1.0))\nprint(id(p) + gi(1))\n",
+    // An `f32` holds integers only up to 2^24 exactly.
+    g + "const v = 16777217\nprint(mul(v, 1.0))\n",
+  ];
+  for (const src of misses) {
+    const got = await msgs(src);
+    if (JSON.stringify(got) !== JSON.stringify(["argument 1: expected f32, got i32"])) {
+      throw new Error(`want the bare mismatch for ${JSON.stringify(src)}, got ${JSON.stringify(got)}`);
+    }
+  }
+  // D2981: a store's suggestion is refused by a later read of the binding.
+  const store = await msgs(g + "const b = 1.5\nlet w = 0\nw = b\nprint(gi(w))\n");
+  if (JSON.stringify(store) !== JSON.stringify(["cannot assign f64 to i32"])) {
+    throw new Error(`want the bare store refusal, got ${JSON.stringify(store)}`);
+  }
+});
+
 Deno.test({ name: "wasm-checker: an emitter-capability rejection surfaces its stable code", ignore }, async () => {
   const checker = loadWasmChecker(SEED, log)!;
   // Type-valid, but codegen cannot lower an INFERRED nullable i32-KEYED MAP return — raised
