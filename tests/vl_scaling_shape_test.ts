@@ -23,9 +23,9 @@
 // every run, so the margin pays only for the compiler changing, not for the box. Four axes
 // sit above the default because they are super-linear today — `types`, `modules`, `reads
 // after many closed sibling shadows`, `list concat chain length` — and that is recorded
-// DEBT, not tolerance: lower a bar when the thing it names stops multiplying. Two are GROWTH
+// DEBT, not tolerance: lower a bar when the thing it names stops multiplying. Three are GROWTH
 // pairs, the same shape at `n` against `n/4`, so linear reads 4 rather than 1: `many
-// distinct captured sibling blocks` and `list concat chain length`. The CPU readings quoted
+// distinct captured sibling blocks`, `list concat chain length` and `in-function value writes`. The CPU readings quoted
 // beside individual pairs below predate fuel grading.
 
 import { ROOT, VL, exists } from "./support/tree.ts";
@@ -470,6 +470,16 @@ axis(
   2.5,
   "The start function's merge (`startStmtOrd`, compiler/emit_sections.vl) is scanning per step.",
   (d) => twoFiles(d, genValueWrites(12000, false), genValueWrites(12000, true)),
+);
+
+// D2872's GROWTH pair: the in-function arm at `n` against `n/4`, so linear reads 4 and
+// quadratic 16. Fuel reads 4.02; master read 14.97, from a per-name scan of every local in
+// scope (`igWalk`) and a list shift per moved write (`asvList`).
+axis(
+  "in-function value writes",
+  5.0,
+  "`igWalk`'s shadow lookup (compiler/emit_sections.vl) or `asvList`'s rewrite (compiler/emit_rewrite.vl) is scanning per write.",
+  (d) => twoFiles(d, genValueWrites(12000, true), genValueWrites(3000, true)),
 );
 
 // 1.09 / 0.97 / 1.13.
