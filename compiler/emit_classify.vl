@@ -15489,6 +15489,11 @@ export function exprIsF32(exprIx: i32, fnIx: i32) {
         e.callFn,
       )
       if target >= 0 { return repOfFnSlot(target).rdKind == "f32" }
+      // A function-value (closure) callee returning f32, as `exprIsF64`'s arm reads it: a
+      // lambda a hole instance lifts records the hole as its call's type (D2932).
+      if calleeRetKindAt(sidOfNode(e.callFn), fnIx, e.callFn) == "f32" {
+        return true
+      }
     }
     // An f32-returning field-closure call the typed-IR fast path can't see: the emitter's own
     // `dispatchRewrite` mints a `Call` with no arena entry for `x[i]` over a `"[]"` closure
@@ -26936,6 +26941,10 @@ export function litAtomMemberTy(exprIx: i32, fnIx: i32) {
 export function litAtomWidenTexts(ix: i32, fnIx: i32) {
   const direct = nodeLitUnionMemberTexts(ix)
   if direct.length > 0 { return direct }
+  if holeLitReadIsAtom(ix, fnIx, 0) {
+    const hole = tyLitMemberTexts(holeOperandTyOf(ix, fnIx))
+    if hole.length > 0 { return hole }
+  }
   const decl = tyLitMemberTexts(litAtomMemberTy(ix, fnIx))
   if decl.length > 0 { return decl }
   const own = tyLitMemberTexts(nodeTyIxOf(ix))
@@ -27097,6 +27106,14 @@ export function exprIsLitAtom(exprIx: i32, fnIx: i32) {
   // rep survives (`coalesceLitUnionFits`). Without it an inferred `const v = p ?? "a"` bound
   // a bare i32 and every atom consumer saw a number instead of the member.
   if coalesceLitUnionFits(exprIx, fnIx) { return true }
+  // A node the generic body shares, typed at a hole this instance pins to a literal union,
+  // which every rung below reads at the hole (D2942).
+  if (
+    tyLitUnionAliasIx(holeOperandTyOf(exprIx, fnIx)) >= 0
+    && holeLitReadIsAtom(exprIx, fnIx, 0)
+  ) {
+    return true
+  }
   const e = P.nodes[unwrapParen(exprIx)]
   // An assignment's value is lowered as a re-read of its target, so it is an atom exactly
   // when that target is one whose members are known (D2168).
@@ -29051,12 +29068,42 @@ export function holeOperandTyOf(exprIx: i32, fnIx: i32): i32 {
   b
 }
 
-// `holeOperandTyOf` where that type is `boolean` or `boolean | null`, which share the `i32` rep
-// and so are told apart from it only by the type; -1 otherwise (D2919).
-export function holeOperandBoolTyOf(exprIx: i32, fnIx: i32): i32 {
+// `holeOperandTyOf` where that type is `boolean`, `boolean | null` or a literal union, which
+// share the `i32` rep and so are told apart from it only by the type; -1 otherwise (D2919).
+export function holeOperandI32PinTyOf(exprIx: i32, fnIx: i32): i32 {
   const t = holeOperandTyOf(exprIx, fnIx)
   if tyPrimNameOf(t) == "boolean" || tyIsNulPrim(t, "boolean") { return t }
+  if tyLitUnionAliasIx(t) >= 0 && holeLitReadIsAtom(exprIx, fnIx, 0) {
+    return t
+  }
   -1
+}
+
+// Whether `exprIx`, typed at a hole instance `fnIx` pins to a literal union, holds the atom: not
+// a join, whose string arm makes it a string ref (D1728), nor the instance's own parameter, which
+// its annotation already pins. A local answers by its un-annotated initializer.
+function holeLitReadIsAtom(exprIx: i32, fnIx: i32, depth: i32): boolean {
+  if fnIx < 0 || exprIx < 0 || depth > 4 { return false }
+  const ix = unwrapParen(exprIx)
+  if ix < 0 { return false }
+  const e = P.nodes[ix]
+  if e is Ident {
+    if paramIndexOf(fnIx, e.identName) >= 0 { return false }
+    const fn = P.nodes[fnIx]
+    if !(fn is FuncDecl) { return false }
+    const li = parentLetOf(fn.fnBody, e.identName)
+    if li < 0 { return false }
+    const d = P.nodes[li]
+    if !(d is LetDecl) { return false }
+    if d.letType >= 0 { return true }
+    return holeLitReadIsAtom(d.letInit, fnIx, depth + 1)
+  }
+  !nodeIsValueJoin(ix)
+}
+
+// Whether node `ix` is an `if` or `match` in value position, whose value joins its arms.
+function nodeIsValueJoin(ix: i32): boolean {
+  P.nodes[ix] is IfStmt || P.nodes[ix] is MatchExpr
 }
 
 // The exact map a nullable niche `exprIx` holds inside an exact instance, or -1.
