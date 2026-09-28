@@ -270,6 +270,33 @@ const writeModules = (dir: string, mods: number, per: number, body: number): str
   return `${dir}/main.vl`;
 };
 
+// D2914's pair: `nl` un-annotated lists of object literals, each adopted `per` times by a
+// declared record list, beside an annotated record of the same field names, so every list is
+// built at the destination's record and its uses are checked.
+const genAdoptedLists = (nl: number, per: number): string => {
+  const o = ["const i: { f: i32 } = { f: 4 }", "type I = { f: i64 | null }"];
+  for (let k = 0; k < nl; k++) {
+    o.push(`const il${k} = [{ f: ${k % 13} }]`);
+    for (let j = 0; j < per; j++) o.push(`const ic${k}_${j}: I[] = il${k}`, `print(il${k}[0].f + ${j % 7})`);
+  }
+  o.push("print(i.f)");
+  return o.join("\n") + "\n";
+};
+
+// The same-name twin: `nf` functions, each binding its own `il` and adopting it, so a use check
+// that walked every identifier of the name program-wide would read each function's lists.
+const genAdoptedListsFn = (nf: number): string => {
+  const o = ["const i: { f: i32 } = { f: 4 }", "type I = { f: i64 | null }"];
+  for (let k = 0; k < nf; k++) {
+    o.push(`function h${k}(): i32 {`, `  const il = [{ f: ${k % 13} }]`, "  const ic: I[] = il");
+    o.push("  il[0].f + ic.length", "}");
+  }
+  o.push("let acc = 0");
+  for (let k = 0; k < nf; k++) o.push(`acc = acc + h${k}()`);
+  o.push("print(acc)", "print(i.f)");
+  return o.join("\n") + "\n";
+};
+
 // ── the runner ───────────────────────────────────────────────────────────────
 
 // A COMPILE PAIR IS GRADED ON GUEST FUEL. `$VL_FUEL=1` makes the host meter the compiler in
@@ -480,6 +507,27 @@ axis(
   5.0,
   "`igWalk`'s shadow lookup (compiler/emit_sections.vl) or `asvList`'s rewrite (compiler/emit_rewrite.vl) is scanning per write.",
   (d) => twoFiles(d, genValueWrites(12000, true), genValueWrites(3000, true)),
+);
+
+// D2914's GROWTH pair, 400 re-seated lists against 100, so linear reads 4 and quadratic 16. A
+// known super-linear axis: fuel reads 8.42 on master `a41bd80e8`, before the use check existed,
+// and 8.33 with it, so the bar is 1.25x that. A check that walked the program once per list
+// read 15.4 here.
+axis(
+  "adopted record lists",
+  10.5,
+  "A re-seated list's use check (`rsNarrowUseRefuse`, compiler/emit_classify.vl) is walking the program per list.",
+  (d) => twoFiles(d, genAdoptedLists(400, 1), genAdoptedLists(100, 1)),
+);
+
+// D2914's same-name GROWTH pair: 800 functions each adopting its own `il` against 200, so
+// linear reads 4 and quadratic 16. Fuel reads 4.03 on master `e91e04a8f` and with the use check
+// alike, so the bar is 1.25x that; the check that walked every `il` in the program read 5.78.
+axis(
+  "adopted record lists sharing a name",
+  5.0,
+  "A re-seated list's use check (`rsUsesOf`, compiler/emit_classify.vl) is reading other functions' identifiers.",
+  (d) => twoFiles(d, genAdoptedListsFn(800), genAdoptedListsFn(200)),
 );
 
 // 1.09 / 0.97 / 1.13.
