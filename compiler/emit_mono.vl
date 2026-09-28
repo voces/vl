@@ -2136,7 +2136,7 @@ function monoCloneBody(
 }
 
 // The annotation an un-annotated list literal typed at the instance's holes takes, where its
-// element is a value union or a list: nothing else types such a local's build (D2898). -1
+// element is a union, a nullable or a list: nothing else types such a local's build (D2898). -1
 // otherwise.
 function monoHoleListLitAnn(initIx: i32): i32 {
   if initIx < 0 || monoCgcHoleN.length == 0 { return -1 }
@@ -2149,11 +2149,35 @@ function monoHoleListLitAnn(initIx: i32): i32 {
   const lt = T.tys[ht]
   if !(lt is TyArray) || lt.aElem < 0 { return -1 }
   const et = T.tys[lt.aElem]
-  const box = et is TyUnion && !tyIsLitUnion(lt.aElem) && !tyBearsNull(lt.aElem)
-  if !box && !(et is TyArray) { return -1 }
+  const nul = et is TyNullable
+  const box = et is TyUnion && !tyIsLitUnion(lt.aElem)
+  if !box && !nul && !(et is TyArray) { return -1 }
   const nm = monoListSpelling(tyToEmitName(ht), ht)
   if nm == "" { return -1 }
+  monoHoleListLitTy = -1
+  if nul { monoHoleListLitTy = ht }
   synthTypeRefTy(nm, -1, ht)
+}
+
+// The instance type `monoHoleListLitAnn`'s last annotation gave a nullable element, whose
+// literal is re-made at that type: the build reads its element rep off the literal, and the
+// template's casts the null away (D2899). -1 for any other element.
+let monoHoleListLitTy = -1
+
+// The list literal `initIx` re-made at `monoHoleListLitTy`, or `initIx` when there is none.
+function monoHoleListLitCopy(initIx: i32): i32 {
+  const t = monoHoleListLitTy
+  monoHoleListLitTy = -1
+  if t < 0 { return initIx }
+  const ix = unwrapParen(initIx)
+  if ix < 0 { return initIx }
+  const n = P.nodes[ix]
+  if n is ArrayLit {
+    const nx = mkArrayLit(n.arrElems, n.pos)
+    nodeTyRecord(nx, t)
+    return nx
+  }
+  initIx
 }
 
 // An un-annotated binding of `Map<K, V>()` / `Set<T>()` whose type arguments name a type
@@ -2268,9 +2292,13 @@ function monoCloneBodyRaw(
     if nt < 0 { nt = monoCloPinListAnn(n.letInit) }
     if nt < 0 { nt = monoCloPinShapeAnn(n.letInit) }
     if nt < 0 { nt = monoApartJoinAnn(n.letInit, bN, bT) }
-    if nt < 0 { nt = monoHoleListLitAnn(n.letInit) }
+    let ninit = n.letInit
+    if nt < 0 {
+      nt = monoHoleListLitAnn(n.letInit)
+      if nt >= 0 { ninit = monoHoleListLitCopy(n.letInit) }
+    }
     if nt == n.letType { return ix }
-    return mkLet(n.letKw, n.letName, nt, n.letInit, n.pos)
+    return mkLet(n.letKw, n.letName, nt, ninit, n.pos)
   }
   if n is WhileStmt {
     const cb = monoCloneBody(
@@ -2716,7 +2744,8 @@ function monoCloneLambdaSubst(
       // holds its join, as the named clone's does.
       if rex < 0 { rty = monoLamCheckedRet(fnIx) }
       if rty >= 0 && tyHasTyVar(rty) {
-        const rs = substTyDeep(rty, bN, bT)
+        let rs = substTyDeep(rty, bN, bT)
+        if monoRetReadsHoleParam(rex, fnIx) { rs = monoHoleTy(rs) }
         if rs >= 0 && rs != rty {
           if !tyHasTyVar(rs) && !(rex < 0 && monoTyHasLitMember(rs)) {
             const rnm = tyToEmitName(rs)
@@ -3965,12 +3994,118 @@ let monoCgcHoleT: i32[] = []
 // variable stays.
 function monoLamCallTy(t: i32): i32 {
   if t < 0 || !tyHasTyVar(t) { return t }
-  let st = substTyDeep(t, monoCgcBN, monoCgcBT)
-  if st >= 0 && tyHasTyVar(st) {
-    st = substTyDeep(st, monoCgcHoleN, monoCgcHoleT)
-  }
+  const st = monoHoleTy(substTyDeep(t, monoCgcBN, monoCgcBT))
   if st < 0 || tyHasTyVar(st) { return t }
   st
+}
+
+// Whether lambda `fnIx`, bound by a `const` of the instance body that only calls it directly,
+// returns a hole parameter of the instance or a field chain off one, which its env stores at
+// the pin. Any other lambda keeps its inferred return: a value read of its binding, or a call
+// from inside another lambda, sees the template's signature (D2878).
+function monoRetReadsHoleParam(rex: i32, fnIx: i32): boolean {
+  if rex < 0 || !i32ListHas(monoCgcLamDeclX, fnIx) { return false }
+  let at = unwrapParen(rex)
+  let hops = 0
+  while at >= 0 && hops < 16 {
+    const n = P.nodes[at]
+    if n is Member {
+      at = unwrapParen(n.memObj)
+    } else if n is Ident {
+      if monoFnBindsParam(fnIx, n.identName) { return false }
+      return monoStrListHas(monoCgcHoleParams, n.identName)
+    } else {
+      return false
+    }
+    hops = hops + 1
+  }
+  false
+}
+
+// The lambdas the instance body binds by an un-annotated `const`, once, and reads only as the
+// callee of a direct call outside any lambda (`monoCollectLamDecls`).
+let monoCgcLamDeclX: i32[] = []
+
+// Appends to the table each such lambda under `body`, whose binder counts are `bn`/`bc`.
+function monoCollectLamDecls(ix: i32, body: i32, bn: string[], bc: i32[]) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const n = P.nodes[ix]
+  if n is LetDecl {
+    if n.letKw == "const" && n.letType < 0 && n.letInit >= 0 {
+      const li = unwrapParen(n.letInit)
+      if (
+        li >= 0
+        && P.nodes[li] is FuncDecl
+        && monoBinderCount(bn, bc, n.letName) == 1
+        && monoNameOnlyCalled(body, n.letName, false)
+      ) {
+        monoCgcLamDeclX.push(li)
+      }
+    }
+  }
+  const kids = nodeChildren(ix)
+  let i = 0
+  while i < kids.length {
+    monoCollectLamDecls(kids[i], body, bn, bc)
+    i = i + 1
+  }
+  0
+}
+
+// Whether every read of `name` under `ix` is the callee of a direct call outside any lambda;
+// `inLam` is whether `ix` is inside one.
+function monoNameOnlyCalled(ix: i32, name: string, inLam: boolean): boolean {
+  if ix < 0 || ix >= P.nodes.length { return true }
+  const n = P.nodes[ix]
+  if n is Ident { return n.identName != name }
+  let skip = -1
+  if n is Call {
+    const cal = P.nodes[n.callFn]
+    if cal is Ident {
+      if cal.identName == name {
+        if inLam { return false }
+        skip = n.callFn
+      }
+    }
+  }
+  const lam = inLam || n is FuncDecl
+  const kids = nodeChildren(ix)
+  let i = 0
+  while i < kids.length {
+    if kids[i] != skip && !monoNameOnlyCalled(kids[i], name, lam) {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+// The instance's un-annotated parameter names, beside `monoCgcHoleN`.
+let monoCgcHoleParams: string[] = []
+
+// `t` with the instance's holes substituted, when it still names a variable; `t` otherwise.
+function monoHoleTy(t: i32): i32 {
+  if t < 0 || !tyHasTyVar(t) || monoCgcHoleN.length == 0 { return t }
+  substTyDeep(t, monoCgcHoleN, monoCgcHoleT)
+}
+
+// The names of the un-annotated parameters in `params` that `body` binds nowhere again.
+function monoHoleParamNames(params: i32[], body: i32): string[] {
+  const bn: string[] = []
+  const bc: i32[] = []
+  monoBinderCounts(body, bn, bc)
+  const out: string[] = []
+  let i = 0
+  while i < params.length {
+    const pp = P.nodes[params[i]]
+    if pp is Param {
+      if pp.parType < 0 && monoBinderCount(bn, bc, pp.parName) == 0 {
+        out.push(pp.parName)
+      }
+    }
+    i = i + 1
+  }
+  out
 }
 
 // Binds, into `hN`/`hT`, each hole parameter of the generic at `origFe` to its column in
@@ -4000,7 +4135,8 @@ function monoHoleBinding(
 }
 
 // Appends to `out` each name an un-annotated `let`/`const` under `ix` binds to a lambda with a
-// hole parameter, which is instantiated per call, or to a name already in `out`.
+// hole parameter, which is instantiated per call, to one whose type names a hole of this
+// instance's (a capture: D2900), or to a name already in `out`.
 function monoLamBoundNames(ix: i32, out: string[]) {
   if ix < 0 || ix >= P.nodes.length { return 0 }
   const n = P.nodes[ix]
@@ -4008,9 +4144,9 @@ function monoLamBoundNames(ix: i32, out: string[]) {
     if n.letType < 0 && n.letInit >= 0 {
       const iv = P.nodes[unwrapParen(n.letInit)]
       if iv is FuncDecl {
-        if monoIsGenericDecl(unwrapParen(n.letInit)) {
-          monoNoteName(out, n.letName)
-        }
+        const li = unwrapParen(n.letInit)
+        const capHole = monoCgcHoleN.length > 0 && monoLamTyNamesHoleValue(li)
+        if monoIsGenericDecl(li) || capHole { monoNoteName(out, n.letName) }
       } else if iv is Ident {
         if monoStrListHas(out, iv.identName) { monoNoteName(out, n.letName) }
       }
@@ -4032,6 +4168,8 @@ function monoInstLamNames(body: i32): string[] {
   const bn: string[] = []
   const bc: i32[] = []
   monoBinderCounts(body, bn, bc)
+  monoCgcLamDeclX = []
+  monoCollectLamDecls(body, body, bn, bc)
   const own: string[] = []
   monoLamBoundNames(body, own)
   const out: string[] = []
@@ -4049,6 +4187,22 @@ function monoInstLamNames(body: i32): string[] {
     k = k + 1
   }
   out
+}
+
+// Whether lambda `li`'s type names a type variable, its result is not a function (a call of a
+// returned function is typed by no copy) and its return is pinned at the holes, so a copied
+// call's type is the rep the lambda returns (`monoRetReadsHoleParam`).
+function monoLamTyNamesHoleValue(li: i32): boolean {
+  const t = nodeTyIxOf(li)
+  if t < 0 || !tyHasTyVar(t) { return false }
+  const rex = fnRetExprOf(li)
+  if rex < 0 || !monoRetReadsHoleParam(rex, li) { return false }
+  const ft = T.tys[t]
+  if ft is TyFunc {
+    if ft.fnRet < 0 { return false }
+    return !(T.tys[ft.fnRet] is TyFunc)
+  }
+  false
 }
 
 // How many binders `bn`/`bc` counted for `name`.
@@ -6285,6 +6439,7 @@ function monoMakeInstance(
     monoCgcHoleN = []
     monoCgcHoleT = []
     monoHoleBinding(origFe, params, letTyCol, monoCgcHoleN, monoCgcHoleT)
+    monoCgcHoleParams = monoHoleParamNames(params, fn.fnBody)
     const instBody0 = monoCloneBody(
       fn.fnBody,
       fn.fnTyParams,
@@ -6372,8 +6527,10 @@ function monoMakeInstance(
     monoCgcBT = letBT
     const instBody3 = monoCloneGenericCalls(instBody2)
     monoCgcLamNames = []
+    monoCgcLamDeclX = []
     monoCgcHoleN = []
     monoCgcHoleT = []
+    monoCgcHoleParams = []
     monoCgcBN = []
     monoCgcBT = []
     monoCgcTyParams = []
