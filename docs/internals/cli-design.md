@@ -693,6 +693,7 @@ Cranelift compile is cached".
 | `--shared-memory=<pages>` | declare the memory SHARED with a max of `<pages>` (1..65536), imported or defined; every instance allocates from `std:buffer` through one pointer in the memory |
 | `--heap-base=<n>` | first byte `std:buffer` may hand out (default 1024; nonzero multiple of 8) |
 | `--heap-limit=<n>` | one past the last; a `Buffer` past it traps (default 2^31-8; a multiple of 8) |
+| `--low-memory-unused[=<bytes>]` | with `-O`/`-O3`: promise no access reaches the first `<bytes>` (default 1024; decimal or `0x`, 1..2^31-1), so `p + C` and `(p + C) as% i32` move `C` into the memarg while `C` plus the access's offset is below it; a heap base inside the region exits 2 (DECISIONS.md, "PL-061") |
 | `--compiler <f>` | the compiler module to compile with |
 
 The layout flags are parsed strictly: a misspelled `--heap-*`/`--import*`/`--shared*` flag, the

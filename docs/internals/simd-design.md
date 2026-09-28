@@ -789,10 +789,11 @@ that stay in range. `D + (x & 1023) * 8` therefore compiles to `offset=D` with n
 Binaryen's `--low-memory-unused` folds any `p + C` with `C < 1024` by assuming the first KiB is
 never accessed, which turns a wrapping add into a trap. That is false of VL programs in general
 (the fixtures store at address 4), so it is never on by default; `vl build -O
---low-memory-unused` (or `-O3`) passes it for a module whose layout makes it true, as plumb's
-does. Binaryen 130 fixes the bound at 1024 and ignores `low-memory-bound`, so the flag takes no
-value, and a larger constant such as plumb's `D` needs the offset form. Not covered: the
-`load*_lane`/`store*_lane` SIMD forms, which tier 1 does not have.
+--low-memory-unused` (or `-O3`) promises it for a module whose layout makes it true, as plumb's
+does. Under the promise the compiler folds too, before binaryen: `p + C` and an i64 `(p + C) as%
+i32` put `C` in the memarg while `C` plus the access's offset is below the promised size, and
+`--low-memory-unused=<bytes>` promises more than binaryen's fixed 1 KiB (DECISIONS.md,
+"PL-061"). Not covered: the `load*_lane`/`store*_lane` SIMD forms, which tier 1 does not have.
 
 **Where wasm and x86 SSE disagree.** A translator or a future SSE-shaped std layer has to correct
 three differences (found by plumb porting its SSE helpers, and checked against real CPU output):
