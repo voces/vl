@@ -113,6 +113,7 @@ import {
   joinRowNext,
   joinRowTy,
   letNullHoleUnfilled,
+  litBaseTy,
   litUnionAliasNameOfTy,
   luDeclPosOf,
   mapDeliveryRecorded,
@@ -11556,6 +11557,114 @@ function declRowFieldFits(vc: i32, sc: i32, valIx: i32, si: i32, mfi: i32) {
   elemRowsCaptureCompat(vn, fn)
 }
 
+// Whether declared row `si`'s field `mfi` stores field `name` of the object literal at `objIx`
+// with the scalar type the checker gave it. Two rows of one field name can share a code (`i32`
+// and `boolean`) or differ by one the value's code cannot see (an `i32` beside an `f32`), and a
+// read formats and types by the row. Refutation only: an unknown kind on either side agrees.
+function declRowFieldKindFits(
+  objIx: i32,
+  name: string,
+  si: i32,
+  mfi: i32,
+): boolean {
+  if si < 0 || si >= sTyIx.length { return true }
+  if mfi < 0 || mfi >= sFieldCount[si] { return true }
+  const rk = fieldScalarKindOf(
+    tyFieldTyOf(sTyIx[si], sFieldNames[sFieldStart[si] + mfi]),
+  )
+  if rk == 0 { return true }
+  const lk = fieldScalarKindOf(tyFieldTyOf(nodeRepTyIxOf(objIx), name))
+  if lk == 0 { return true }
+  fieldKindWidens(lk, rk)
+}
+
+// Whether a field of kind `lk` (`fieldScalarKindOf`) may be stored at one of kind `rk`: the same
+// kind, a numeric widening the checker lets a record take, or either into a `| null`. An `i32`
+// field is not an `f32` one, since the checker refuses that record assignment.
+function fieldKindWidens(lk: i32, rk: i32): boolean {
+  if lk == rk { return true }
+  if rk > 8 {
+    if lk > 8 { return fieldKindWidens(lk - 8, rk - 8) }
+    return fieldKindWidens(lk, rk - 8)
+  }
+  if lk > 8 { return false }
+  if lk == 1 { return rk == 3 || rk == 5 }
+  if lk == 3 || lk == 4 { return rk == 5 }
+  false
+}
+
+// The layout kind of a union field type: 7 when every member is a string literal (`"a" | "b"`,
+// stored as a member id, not a string), else 0. A `| null` over it is the `TyNullable` around it.
+function litSetScalarKindOf(members: i32[]): i32 {
+  let i = 0
+  while i < members.length {
+    const m = members[i]
+    if m < 0 || m >= T.tys.length { return 0 }
+    const mt = T.tys[m]
+    if !(mt is TyLit) { return 0 }
+    if mt.litKind != "str" { return 0 }
+    i = i + 1
+  }
+  if members.length == 0 { return 0 }
+  7
+}
+
+// The layout kind of a record field of type `ty`: 1 `i32`, 2 `boolean`, 3 `i64`, 4 `f32`,
+// 5 `f64`, 6 `string`, 7 a string literal set, each plus 8 as `| null`; a literal type reads as
+// its base. 0 for any other type, which `declRowFieldKindFits` does not refute on.
+function fieldScalarKindOf(ty: i32): i32 {
+  if ty < 0 || ty >= T.tys.length { return 0 }
+  const t = T.tys[ty]
+  // Exhaustive over `Ty` and `_`-less.
+  match t {
+    TyNullable => {
+      const k = fieldScalarKindOf(t.nInner)
+      if k == 0 || k > 8 { return 0 }
+      return k + 8
+    }
+    TyLit => {
+      return fieldScalarKindOf(litBaseTy(t))
+    }
+    TyUnion => {
+      return litSetScalarKindOf(t.uMembers)
+    }
+    TyPrim => {
+      return primScalarKindOf(t.primName)
+    }
+    TyErr | TyObj | TyFunc | TyArray | TyMap | TyVar | TyNeg => {
+      return 0
+    }
+  }
+}
+
+// `fieldScalarKindOf` of a primitive; 0 for one no record field stores as a scalar.
+function primScalarKindOf(p: PrimName): i32 {
+  // Exhaustive over `PrimName` and `_`-less.
+  match p {
+    "i32" => {
+      return 1
+    }
+    "boolean" => {
+      return 2
+    }
+    "i64" => {
+      return 3
+    }
+    "f32" => {
+      return 4
+    }
+    "f64" => {
+      return 5
+    }
+    "string" => {
+      return 6
+    }
+    "v128" | "void" | "null" | "never" | "u8" => {
+      return 0
+    }
+  }
+}
+
 // The refusal a call `callIx` in instance `fnIx` owes when its callee is a closure reading a
 // field of the instance's parameter (`localCloPinFieldTail`), or "". The lifted closure is
 // shared by every pin, and a list element or an argument cannot follow a niche or box read
@@ -12199,6 +12308,11 @@ function structIndexOfObjCtxGo(objIx: i32, fnIx: i32) {
                       ok = false
                     }
                   }
+                }
+              }
+              if ok && !sIsAnonRow(si) {
+                if !declRowFieldKindFits(objIx, f.fiName, si, mfi) {
+                  ok = false
                 }
               }
               // A nested object-literal field value aligns only with a nested-struct (15)
@@ -26476,6 +26590,9 @@ function annShapeIndexOf(names: string[], codes: i32[], texts: string[]) {
         }
         i = i + 1
       }
+      // An `i32` field and a `boolean` one share code 0, and a read formats by the row, so a
+      // spelling does not dedup onto a row that stores the other kind (D2866's comparator).
+      if allIn && !code0SpellingFitsRow(names, texts, si) { allIn = false }
       if allIn { return si }
     }
     si = sSetNext[si]
