@@ -36483,50 +36483,99 @@ export function atomNarrowOp(wk: i32, k: i32): i32 {
 // a wider record's: each stored scalar member the own union lacks is one of its members widened.
 // The read site rebuilds such a box at the own member, so every consumer reads it (D3006).
 export function memReadBoxNarrowName(memIx: i32, fnIx: i32): string {
-  if memIx < 0 || memIx >= P.nodes.length { return "" }
+  const nm: string[] = []
+  if memReadBoxNames(memIx, fnIx, nm) != 1 { return "" }
+  nm[0]
+}
+
+// Whether the union-box field read at `memIx` holds a stored member that two of the receiver's
+// own members widen to, so no read at the own type can tell which one it held.
+export function memReadBoxAmbiguous(memIx: i32, fnIx: i32): boolean {
+  const nm: string[] = []
+  memReadBoxNames(memIx, fnIx, nm) == 2
+}
+
+// Appends the own and the stored spelling of the union-box field read at `memIx` to `out`, and
+// answers 1 when every stored member the own union lacks narrows back to exactly one of its
+// members, 2 when one of them narrows back to two, and 0 for any other read.
+function memReadBoxNames(memIx: i32, fnIx: i32, out: string[]): i32 {
+  if memIx < 0 || memIx >= P.nodes.length { return 0 }
   const m = P.nodes[memIx]
   if m is Member {
     const si = structIndexOfExpr(m.memObj, fnIx)
-    if si < 0 { return "" }
+    if si < 0 { return 0 }
     const fi = sFieldIndex(si, m.memProp)
-    if fi < 0 || sFieldTypeAt(si, fi) != FC_UNION { return "" }
-    if !memRecvIsRecord(memIx, fnIx) { return "" }
+    if fi < 0 || sFieldTypeAt(si, fi) != FC_UNION { return 0 }
+    if !memRecvIsRecord(memIx, fnIx) { return 0 }
     const rt = recvCheckedTyOf(unwrapParen(m.memObj), fnIx, 0)
-    if rt < 0 || rt >= T.tys.length { return "" }
+    if rt < 0 || rt >= T.tys.length { return 0 }
     let ot = rt
     const t = T.tys[rt]
     if t is TyNullable { ot = t.nInner }
     const own = tyToEmitName(tyFieldTyOf(ot, m.memProp))
     const phys = sFieldElemNameAt(si, fi)
-    if own == "" || own == phys { return "" }
+    if own == "" || own == phys { return 0 }
+    out.push(own)
+    out.push(phys)
     const pa: string[] = []
     splitUnionAtoms(phys, pa)
     const oa: string[] = []
     splitUnionAtoms(own, oa)
-    let narrowed = false
+    let narrowed = 0
     let i = 0
     while i < pa.length {
       if !strListHas(oa, pa[i]) {
-        if boxNarrowAtomFor(pa[i], oa, pa) < 0 { return "" }
-        narrowed = true
+        const k = boxNarrowAtomFor(pa[i], oa, pa)
+        if k == -2 { return 2 }
+        if k < 0 { return 0 }
+        narrowed = 1
       }
       i = i + 1
     }
-    if narrowed { return own }
+    return narrowed
   }
-  ""
+  0
 }
 
-// The kind of the member of `own` that the stored member `p` widened, one `stored` lacks, or -1.
-function boxNarrowAtomFor(p: string, own: string[], stored: string[]): i32 {
-  const wk = valueAtomKind(p)
+// Whether a box retag widens value atom `fk` to `tk`: `i32` to `i64` or `f64`, `f32` to `f64`.
+export function atomWidens(fk: i32, tk: i32): boolean {
+  (fk == 0 && (tk == 3 || tk == 4)) || (fk == 5 && tk == 4)
+}
+
+// The kind member `p` of `from` is stored as in a union `to` lacking it, or -1: the FIRST member
+// of `to`, in `to`'s order, that `from` lacks and `p` widens to. A read inverts exactly this
+// first-match rule (`boxNarrowAtomFor`), so the two directions cannot disagree.
+export function boxWidenAtomFor(p: string, to: string[], from: string[]): i32 {
+  if strListHas(to, p) { return -1 }
+  const fk = valueAtomKind(p)
   let j = 0
-  while j < own.length {
-    const k = valueAtomKind(own[j])
-    if !strListHas(stored, own[j]) && atomNarrowOp(wk, k) >= 0 { return k }
+  while j < to.length {
+    const k = valueAtomKind(to[j])
+    if !strListHas(from, to[j]) && atomWidens(fk, k) { return k }
     j = j + 1
   }
   -1
+}
+
+// The kind of the one member of `own` that `boxWidenAtomFor` stores as the stored member `p`,
+// -1 when none is, or -2 when two are and a read cannot tell them apart.
+export function boxNarrowAtomFor(
+  p: string,
+  own: string[],
+  stored: string[],
+): i32 {
+  const pk = valueAtomKind(p)
+  if pk < 0 || strListHas(own, p) { return -1 }
+  let found = -1
+  let j = 0
+  while j < own.length {
+    if boxWidenAtomFor(own[j], stored, own) == pk {
+      if found >= 0 { return -2 }
+      found = valueAtomKind(own[j])
+    }
+    j = j + 1
+  }
+  found
 }
 
 // The wasm-type code of the struct/variant field a `Member` expression at `memIx` reads

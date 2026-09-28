@@ -671,6 +671,8 @@ import {
   binMixHardF64,
   boolLeafListDepthOfTy,
   boolListArmTag,
+  boxNarrowAtomFor,
+  boxWidenAtomFor,
   callIsArrSlice,
   callRefNestSlot,
   callSpillsFcpArg,
@@ -905,6 +907,7 @@ import {
   maskNarrowFor,
   memIsNarrowed,
   memNarrowVariantIndex,
+  memReadBoxAmbiguous,
   memReadBoxNarrowName,
   memReadBoxedAtomKind,
   memReadBoxedAtomKinds,
@@ -1150,7 +1153,6 @@ import {
 } from "./emit_collect"
 import { voidTwinForNode } from "./emit_rewrite"
 import { nameIsQuotedLeaf, nameIsShapeOpen, splitUnionAtoms } from "./tyname"
-import { strListHas } from "./listutil"
 import { monoOrigNode } from "./emit_state"
 import {
   INIT_REACH_NEVER,
@@ -7321,6 +7323,7 @@ function emitMem(body: u8[], memIx: i32, fnIx: i32) {
     // ident read; an un-narrowed read is the box. `narrowedValueAtomOf` rather than the raw pair,
     // so a litunion-alias narrow unboxes as the string ref the box stores its member as.
     if sFieldTypeAt(si, idx) == FC_UNION {
+      if memReadBoxAmbiguous(memIx, fnIx) { return emitBoxAmbiguousFail(memIx) }
       const own = memReadBoxNarrowName(memIx, fnIx)
       if own != "" {
         if emitBoxAtomRetag(sFieldElemNameAt(si, idx), own, memIx) < 0 {
@@ -14663,6 +14666,16 @@ function atomConvOp(fk: i32, tk: i32): i32 {
   atomNarrowOp(fk, tk)
 }
 
+// The refusal of a field read at `memIx` whose wider record stores two of its own members as one.
+function emitBoxAmbiguousFail(memIx: i32) {
+  emitFailAt(
+    "emitProgram: this field is stored at a wider record whose member two of its own members "
+      + "widen to, so a read at its own type cannot tell which one it held. Annotate the "
+      + "binding with the wider record's type, or build a second literal",
+    memIx,
+  )
+}
+
 // Whether a box held at member set `from` needs `emitBoxAtomRetag` to be read at `to`.
 function boxRetagNeeded(from: string, to: string): boolean {
   if from == "" || to == "" || from == to { return false }
@@ -14678,17 +14691,14 @@ function boxRetagNeeded(from: string, to: string): boolean {
   false
 }
 
-// The kind of the member of `to` that member `p` of `from` converts to, when `to` lacks `p`
-// and `from` lacks that member, or -1.
+// The kind of the member of `to` that member `p` of `from` is rebuilt as, or -1: widened by
+// `boxWidenAtomFor`'s first-match rule, else narrowed back by its exact inverse
+// (`boxNarrowAtomFor`); a stored member two members widen to answers -1, never a guess.
 function boxAtomRetagKind(p: string, to: string[], from: string[]): i32 {
-  if strListHas(to, p) { return -1 }
-  const fk = valueAtomKind(p)
-  let j = 0
-  while j < to.length {
-    const k = valueAtomKind(to[j])
-    if !strListHas(from, to[j]) && atomConvOp(fk, k) >= 0 { return k }
-    j = j + 1
-  }
+  const w = boxWidenAtomFor(p, to, from)
+  if w >= 0 { return w }
+  const n = boxNarrowAtomFor(p, to, from)
+  if n >= 0 { return n }
   -1
 }
 
@@ -29785,6 +29795,9 @@ function emitCoalesceGo(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
         if sFieldTypeAt(msi, mfi) == FC_UNION {
           // A wider record's box is read at the receiver's own member set (D3006).
           const mphys = sFieldElemNameAt(msi, mfi)
+          if memReadBoxAmbiguous(lhsIx, fnIx) {
+            return emitBoxAmbiguousFail(lhsIx)
+          }
           let munm = memReadBoxNarrowName(lhsIx, fnIx)
           if munm == "" { munm = mphys }
           // D-VALUNION + D-SETONCE — see the call arm above.
