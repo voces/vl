@@ -689,6 +689,7 @@ import {
   sFieldTypes,
   sHeapIdx,
   sNames,
+  sRowDecl,
   sTwin,
   sTyIx,
   scopeFrames,
@@ -3721,7 +3722,7 @@ function letInitCellKind(letIx: i32, fnIx: i32): VKind {
     // `"variant"`. The kind selects the table — `fbValtype` reads `sHeapIdx` for a struct
     // and `uVarHeap` for a variant — so the flip has to happen here or the slot is wrong.
     if structIndexOfLet(letIx, fnIx) < 0 {
-      if letObjLitVariantIdx(letIx) >= 0 { return "variant" }
+      if letObjLitVariantIdx(letIx, fnIx) >= 0 { return "variant" }
     }
     return "struct"
   }
@@ -4542,7 +4543,7 @@ export function criClassify(rx0: i32, i: i32) {
       // there is no local to hand it. Three classifiers and one emit seed mint the pair
       // (`"struct"`, -1), so each one left behind is a program that still refuses.
       if rsx < 0 {
-        const rov = objLitVariantIdxNoStructRow(rx)
+        const rov = objLitVariantIdxNoStructRow(rx, fnStmts[i])
         if rov >= 0 {
           fRetKind[i] = "variant"
           criChanged = true
@@ -4614,7 +4615,7 @@ export function criClassify(rx0: i32, i: i32) {
         // union member, so the pair (`"struct"`, -1) trips `fbValtype`'s bounds guard. The `-1`
         // is the gate; the kind is written directly because the two share one `retKindPri` tier.
         if rsi < 0 {
-          const rov = letObjLitVariantIdx(rll)
+          const rov = letObjLitVariantIdx(rll, fnStmts[i])
           if rov >= 0 {
             fRetKind[i] = "variant"
             criChanged = true
@@ -5997,7 +5998,7 @@ export function captureValStructIdx(fe: i32, name: string) {
       if letIsStruct(b, pf) {
         const csi = structIndexOfLet(b, pf)
         if csi < 0 {
-          const cov = letObjLitVariantIdx(b)
+          const cov = letObjLitVariantIdx(b, pf)
           if cov >= 0 { return cov }
         }
         return csi
@@ -11581,6 +11582,98 @@ function declRowFieldKindFits(
   fieldKindWidens(lk, rk)
 }
 
+// Whether row `si`'s field `mfi` stores field `name` of the object literal at `objIx` at the
+// type instance `fnIx` binds it to (`pinKindFitsTy`). True outside an instance.
+function pinFieldKindFits(
+  objIx: i32,
+  name: string,
+  si: i32,
+  mfi: i32,
+  fnIx: i32,
+): boolean {
+  if fnIx < 0 || si < 0 || si >= sTyIx.length { return true }
+  if mfi < 0 || mfi >= sFieldCount[si] { return true }
+  pinKindFitsTy(
+    objIx,
+    name,
+    tyFieldTyOf(sTyIx[si], sFieldNames[sFieldStart[si] + mfi]),
+    fnIx,
+  )
+}
+
+// Whether a field of type `rowTy` stores field `name` of the object literal at `objIx`, whose
+// checked type is a type parameter, at the type instance `fnIx` binds it to: kind 0 reads as
+// agreeing everywhere else, so every pin would share one row (D3032). A `boolean` pin keeps the
+// `i32` slot it shared before an instance had a row of its own. True outside an instance.
+function pinKindFitsTy(
+  objIx: i32,
+  name: string,
+  rowTy: i32,
+  fnIx: i32,
+): boolean {
+  if fnIx < 0 || rowTy < 0 || rowTy >= T.tys.length { return true }
+  const lt = tyFieldTyOf(nodeRepTyIxOf(objIx), name)
+  if lt < 0 || !tyHasTyVar(lt) { return true }
+  const valIx = objFieldVal(objIx, name)
+  if valIx < 0 { return true }
+  const pin = pinnedValTyOf(valIx, fnIx)
+  if pin < 0 { return true }
+  const lk = fieldScalarKindOf(pin)
+  const rk = fieldScalarKindOf(rowTy)
+  if lk == 2 && rk == 1 { return true }
+  if lk != 0 && rk != 0 { return fieldKindWidens(lk, rk) }
+  // A scalar and a reference share no slot, and two references one only as one type.
+  const pRef = tyIsRefShaped(pin)
+  const rRef = tyIsRefShaped(rowTy)
+  if pRef && rRef { return tySameSet(pin, rowTy, TY_WALK_DEPTH) }
+  if pRef { return rk == 0 }
+  if rRef { return lk == 0 }
+  true
+}
+
+// Whether row `si` stores every field of the object literal at `objIx` whose checked type is a
+// type parameter at its pin in instance `fnIx`: at exactly its kind, or else at one it widens to
+// (no `boolean` in an `i32` slot). False when no field is a type parameter or a pin is unknown.
+function pinRowFits(objIx: i32, si: i32, fnIx: i32, exact: boolean): boolean {
+  if fnIx < 0 || si < 0 || si >= sTyIx.length { return false }
+  const lt = nodeRepTyIxOf(objIx)
+  if lt < 0 || lt >= T.tys.length || !tyHasTyVar(lt) { return false }
+  const o = P.nodes[objIx]
+  if !(o is ObjLit) { return false }
+  let any = false
+  let i = 0
+  while i < o.objFields.length {
+    const f = P.nodes[o.objFields[i]]
+    if f is FieldInit {
+      const ft = tyFieldTyOf(lt, f.fiName)
+      if ft >= 0 && tyHasTyVar(ft) {
+        const pin = pinnedValTyOf(f.fiValue, fnIx)
+        if pin < 0 { return false }
+        const rt = tyFieldTyOf(sTyIx[si], f.fiName)
+        if rt < 0 || rt >= T.tys.length { return false }
+        const pk = fieldScalarKindOf(pin)
+        if pk != 0 {
+          const rk = fieldScalarKindOf(rt)
+          if exact && pk != rk { return false }
+          if !fieldKindWidens(pk, rk) { return false }
+        } else if !tySameSet(pin, rt, TY_WALK_DEPTH) {
+          return false
+        }
+        any = true
+      }
+    }
+    i = i + 1
+  }
+  any
+}
+
+// Whether `ty` is a record, list, map or function: a reference that no scalar slot holds.
+function tyIsRefShaped(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  const t = T.tys[ty]
+  t is TyObj || t is TyArray || t is TyMap || t is TyFunc
+}
+
 // Whether a field of kind `lk` (`fieldScalarKindOf`) may be stored at one of kind `rk`: the same
 // kind, a numeric widening the checker lets a record take, or either into a `| null`. An `i32`
 // field is not an `f32` one, since the checker refuses that record assignment.
@@ -12227,6 +12320,12 @@ function structIndexOfObjCtxGo(objIx: i32, fnIx: i32) {
     // code-15/16 fields, tracked beside the lenient `matches` as the tiebreak of last resort.
     let strictSi = -1
     let strictCount = 0
+    // Among candidates storing every type-parameter field at its pin (D3032): a declared row
+    // at the pin's own kind wins whatever the declaration order, then a declared row it widens
+    // to, then any row at its own kind.
+    let pinSi = -1
+    let pinExactDeclSi = -1
+    let pinDeclSi = -1
     // The row this literal's OWN destination names, computed on first need (D1690). -2 is
     // "not asked yet": a literal with no union-box field never pays for the lookup.
     let dstRow = 0 - 2
@@ -12317,6 +12416,21 @@ function structIndexOfObjCtxGo(objIx: i32, fnIx: i32) {
                 if !declRowFieldKindFits(objIx, f.fiName, si, mfi) {
                   ok = false
                 }
+                // A nested literal holds its own kinds, to any depth (D3031).
+                if (
+                  sc == FC_STRUCT
+                  && !objLitFitsRow(
+                    unwrapParen(f.fiValue),
+                    sFieldTgtStructIdx(si, mfi),
+                    8,
+                    false,
+                  )
+                ) {
+                  ok = false
+                }
+              }
+              if ok && !pinFieldKindFits(objIx, f.fiName, si, mfi, fnIx) {
+                ok = false
               }
               // A nested object-literal field value aligns only with a nested-struct (15)
               // or union-box (16) field; this narrows `strictSi` only, `matches` stays lenient.
@@ -12332,6 +12446,14 @@ function structIndexOfObjCtxGo(objIx: i32, fnIx: i32) {
         }
         if ok {
           if firstSi < 0 { firstSi = si }
+          const pinExact = pinRowFits(objIx, si, fnIx, true)
+          if pinSi < 0 && pinExact { pinSi = si }
+          if si < sRowDecl.length && sRowDecl[si] == 1 {
+            if pinExactDeclSi < 0 && pinExact { pinExactDeclSi = si }
+            if pinDeclSi < 0 && pinRowFits(objIx, si, fnIx, false) {
+              pinDeclSi = si
+            }
+          }
           matches = matches + 1
           if strict {
             if strictSi < 0 { strictSi = si }
@@ -12346,6 +12468,15 @@ function structIndexOfObjCtxGo(objIx: i32, fnIx: i32) {
     // correct and wins before the name/arena resolvers run — which can otherwise return
     // the wrong same-fieldset niche twin for a lambda-body literal with a mis-recorded type.
     if matches >= 2 && strictCount == 1 && strictSi >= 0 { return strictSi }
+    if matches >= 2 && pinExactDeclSi >= 0 { return pinExactDeclSi }
+    if matches >= 2 && pinDeclSi >= 0 {
+      // The row a reader asking without the instance takes, when the pin fits it, so a list
+      // literal naming its element row that way agrees with the literal.
+      const blind = structIndexOfObjCtxGo(objIx, -1)
+      if blind >= 0 && pinRowFits(objIx, blind, fnIx, false) { return blind }
+      return pinDeclSi
+    }
+    if matches >= 2 && pinSi >= 0 { return pinSi }
     if matches >= 2 {
       // A genuine shape collision (name/scalar-code alone matched 2+ structs): consult
       // the checker's recorded type for this literal, resolving through
@@ -21644,7 +21775,7 @@ function globalKind(initIx: i32): VKind {
     // already carry: `collectLocals` and `criClassify` both ask this same question for
     // their own storage classes, but a module global asked neither, so `const iv = {r: 7}`
     // beside `type Shape = Circle | Sq` fell to the union box instead of the bare arm.
-    if objLitVariantIdxNoStructRow(initIx) >= 0 { return "variant" }
+    if objLitVariantIdxNoStructRow(initIx, -1) >= 0 { return "variant" }
     if uDeclared { return "union" }
     return "struct"
   }
@@ -21951,7 +22082,7 @@ export function globalCellStructIdx(letIx: i32) {
     // The object-literal leg of the same pairing (D244): the rung above carries no
     // object-literal field-set arm by design, so `globalKind`'s `variant` arm and this slot
     // must read the same helper (`objLitVariantIdxNoStructRow`) or they'd disagree.
-    const govi = letObjLitVariantIdx(letIx)
+    const govi = letObjLitVariantIdx(letIx, -1)
     if govi >= 0 { return govi }
     // The UN-ANNOTATED nullable-variant cell (`const c = h(true)` where `h` returns
     // `Circle | null`) — its slot comes from the callee's return, the same place its
@@ -29211,18 +29342,31 @@ function mapValBase(v: i32): string {
 // (`monoParamPinTy`) rather than its spelling, which renders a Set as its boolean map and a
 // literal-union value by its base; -1 for any other expression.
 export function mapPinnedParamTyOf(exprIx: i32, fnIx: i32): i32 {
-  mapPinnedParamTyAt(exprIx, fnIx, 4)
+  mapTyPeel(pinnedParamTyAt(exprIx, fnIx, 4))
 }
 
-// `mapPinnedParamTyOf` through at most `depth` `const` locals initialized from another name.
-function mapPinnedParamTyAt(exprIx: i32, fnIx: i32, depth: i32): i32 {
+// The type the value at `valIx`, recorded at a type parameter, has in the instance `fnIx`: an
+// exact instance's substitution, a hole's binding, or the pin of the parameter it names. -1 when
+// none answers, or the answer still carries a type parameter.
+export function pinnedValTyOf(valIx: i32, fnIx: i32): i32 {
+  if fnIx < 0 || valIx < 0 { return -1 }
+  let pin = exactOperandTyOf(valIx, fnIx)
+  if pin < 0 { pin = holeOperandTyOf(valIx, fnIx) }
+  if pin < 0 { pin = pinnedParamTyAt(valIx, fnIx, 4) }
+  if pin < 0 || pin >= T.tys.length || tyHasTyVar(pin) { return -1 }
+  pin
+}
+
+// The type an un-narrowed parameter of instance `fnIx` named by `exprIx` is pinned at, through
+// at most `depth` `const` locals initialized from another name; -1 for any other expression.
+function pinnedParamTyAt(exprIx: i32, fnIx: i32, depth: i32): i32 {
   const ax = unwrapParen(exprIx)
   if ax < 0 || depth <= 0 { return -1 }
   const n = P.nodes[ax]
   if n is Ident {
     if narrowSlotOf(n.identName) >= 0 { return -1 }
     const ptn = paramTypeNode(fnIx, n.identName)
-    if ptn >= 0 { return mapTyPeel(monoParamPinTy.get(ptn) ?? -1) }
+    if ptn >= 0 { return monoParamPinTy.get(ptn) ?? -1 }
     if fnIx >= 0 {
       const fd = P.nodes[fnIx]
       if fd is FuncDecl {
@@ -29231,7 +29375,7 @@ function mapPinnedParamTyAt(exprIx: i32, fnIx: i32, depth: i32): i32 {
           const ld = P.nodes[li]
           if ld is LetDecl {
             if ld.letKw == "const" {
-              return mapPinnedParamTyAt(ld.letInit, fnIx, depth - 1)
+              return pinnedParamTyAt(ld.letInit, fnIx, depth - 1)
             }
           }
         }
@@ -32293,17 +32437,17 @@ export function variantIndexOfLet(letIx: i32, fnIx: i32) {
   -1
 }
 
-// The union-variant row an un-annotated object-literal `LetDecl` initializer denotes:
-// `objVariantName`'s field-set match, or -1 if `structIndexOfObj` already claims a row (D39,
-// D51). Re-asks under the opposite precondition from `structIndexOfLet`'s -1, since a bare
-// `{ r: n }` can have two nominal claimants and only one remains once a struct row is ruled out.
-export function objLitVariantIdxNoStructRow(exprIx: i32) {
+// The union-variant row an un-annotated object-literal initializer in function `fnIx` denotes:
+// `objVariantName`'s match, or -1 if `structIndexOfObj` already claims a row (D39, D51). Re-asks
+// under the opposite precondition from `structIndexOfLet`'s -1, since a bare `{ r: n }` can have
+// two nominal claimants and only one remains once a struct row is ruled out.
+export function objLitVariantIdxNoStructRow(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return -1 }
   const oi = unwrapParen(exprIx)
   const e = P.nodes[oi]
   if e is ObjLit {
     if structIndexOfObj(oi) >= 0 { return -1 }
-    const vn = objVariantName(oi)
+    const vn = objVariantNameCtx(oi, fnIx)
     if vn == "" { return -1 }
     return variantIndexOf(vn)
   }
@@ -32313,11 +32457,11 @@ export function objLitVariantIdxNoStructRow(exprIx: i32) {
 // The same answer for a `LetDecl`'s INITIALIZER, and only for an UN-annotated binding:
 // an ANNOTATED one is `letAnnVariantIdx`'s (D52), whose nominal answer must not be
 // second-guessed by a field-set scan in either direction.
-export function letObjLitVariantIdx(letIx: i32) {
+export function letObjLitVariantIdx(letIx: i32, fnIx: i32) {
   const d = P.nodes[letIx]
   if d is LetDecl {
     if d.letType >= 0 { return -1 }
-    return objLitVariantIdxNoStructRow(d.letInit)
+    return objLitVariantIdxNoStructRow(d.letInit, fnIx)
   }
   -1
 }
@@ -36261,9 +36405,8 @@ function objMapFieldCompat(objIx: i32, fname: string, elem: string): boolean {
 }
 
 // The nested-struct compat of an object literal's field value against a candidate
-// variant's code-15 field: a nested literal value's field-name set must equal the target
-// struct's — deliberately name-set only, since the checker records the literal's inferred
-// leaf types, and a non-literal value stays lenient (it fails loudly downstream if wrong).
+// variant's code-15 field: a nested literal value fits the target struct by
+// `objLitFitsRow`. A non-literal value stays lenient (it fails loudly downstream if wrong).
 function objNestedFieldCompat(
   objIx: i32,
   fname: string,
@@ -36271,14 +36414,43 @@ function objNestedFieldCompat(
 ): boolean {
   const valIx = objFieldVal(objIx, fname)
   if valIx < 0 { return true }
-  const v = P.nodes[unwrapParen(valIx)]
+  objLitFitsRow(unwrapParen(valIx), structIndexOfTypeName(elem), 8, true)
+}
+
+// Whether the object literal at `litIx` fits struct row `si`: each scalar field of a kind the
+// row's stores (`declRowFieldKindFits`) and each nested literal fitting its own target row, to
+// `depth` levels (D3031); with `exact`, also the same field-name set. True for a non-literal or
+// an unknown row.
+function objLitFitsRow(
+  litIx: i32,
+  si: i32,
+  depth: i32,
+  exact: boolean,
+): boolean {
+  if litIx < 0 || si < 0 || si >= sFieldCount.length || depth <= 0 {
+    return true
+  }
+  const v = P.nodes[litIx]
   if v is ObjLit {
-    const si = structIndexOfTypeName(elem)
-    if si < 0 { return true }
-    if v.objFields.length != sFieldCount[si] { return false }
+    if exact && v.objFields.length != sFieldCount[si] { return false }
     let fi = 0
     while fi < sFieldCount[si] {
-      if objFieldVal(valIx, sFieldNames[sFieldStart[si] + fi]) < 0 {
+      const name = sFieldNames[sFieldStart[si] + fi]
+      const fv = objFieldVal(litIx, name)
+      if fv < 0 {
+        if exact { return false }
+      } else if sFieldTypeAt(si, fi) == FC_STRUCT {
+        if (
+          !objLitFitsRow(
+            unwrapParen(fv),
+            sFieldTgtStructIdx(si, fi),
+            depth - 1,
+            exact,
+          )
+        ) {
+          return false
+        }
+      } else if !declRowFieldKindFits(litIx, name, si, fi) {
         return false
       }
       fi = fi + 1
@@ -36291,7 +36463,10 @@ function objNestedFieldCompat(
 // field-name set equals the literal's field names (order-independent), or "" if none. A
 // map-typed candidate field is further tightened by its value rep, so two unions' arms
 // sharing field names but differing in map value type cannot collide onto the wrong slot.
-export function objVariantName(objIx: i32) {
+export function objVariantName(objIx: i32) { objVariantNameCtx(objIx, -1) }
+
+// `objVariantName` inside function `fnIx`, whose instance binds a type-parameter field (D3032).
+export function objVariantNameCtx(objIx: i32, fnIx: i32) {
   const o = P.nodes[objIx]
   if o is ObjLit {
     // The arm the checker proved this literal is, when it names one: two arms of two unions
@@ -36300,13 +36475,15 @@ export function objVariantName(objIx: i32) {
     const own = variantRowOfTy(nodeRepTyIxOf(objIx))
     // A bare `{}` names its arm only through the checker, having no field to match by (D2223).
     if own >= 0 && o.objFields.length == 0 { return uVariants[own] }
-    if own >= 0 && objMatchesVariantIdx(objIx, own) { return uVariants[own] }
+    if own >= 0 && objMatchesVariantIdx(objIx, own, fnIx) {
+      return uVariants[own]
+    }
     // Only a variant whose field-name signature equals the literal's can match — the matcher
     // below needs equal counts and every variant name present — so the bucket for that
     // signature holds every candidate, in the ascending order the scan visited them.
     let vi = ovnFirst(objLitFieldSig(objIx))
     while vi >= 0 {
-      if objMatchesVariantIdx(objIx, vi) { return uVariants[vi] }
+      if objMatchesVariantIdx(objIx, vi, fnIx) { return uVariants[vi] }
       vi = ovnNextOf(vi)
     }
   }
@@ -36431,7 +36608,7 @@ function ovnNextOf(vi: i32) {
 // variant's (order-independent), tightened per field — a map by `objMapFieldCompat`, a nested
 // struct by `objNestedFieldCompat`, a scalar by `variantFieldKindFits`. The one matcher behind
 // both `objVariantName` and `unionArmVariantForObj`, so the two never diverge.
-function objMatchesVariantIdx(objIx: i32, vi: i32): boolean {
+function objMatchesVariantIdx(objIx: i32, vi: i32, fnIx: i32): boolean {
   const o = P.nodes[objIx]
   if o is ObjLit {
     const cnt = uFieldCount[vi]
@@ -36466,6 +36643,16 @@ function objMatchesVariantIdx(objIx: i32, vi: i32): boolean {
         }
       } else if !variantFieldKindFits(objIx, uFieldNames[start + fj], vi) {
         allMatch = false
+      } else if (
+        vi < uVarTyIx.length
+        && !pinKindFitsTy(
+          objIx,
+          uFieldNames[start + fj],
+          tyFieldTyOf(uVarTyIx[vi], uFieldNames[start + fj]),
+          fnIx,
+        )
+      ) {
+        allMatch = false
       }
       fj = fj + 1
     }
@@ -36488,7 +36675,11 @@ function unionSetCanHoldStruct(set: string): boolean {
 // `unionSet` that the object literal at `objIx` matches, or -1. Union-context-restricted:
 // the global `objVariantName` scan could land on another union's arm sharing field names,
 // silently boxing the wrong tag. Falls back to -1 when `unionSet` is not a registered union.
-export function unionArmVariantForObj(unionSet: string, objIx: i32): i32 {
+export function unionArmVariantForObj(
+  unionSet: string,
+  objIx: i32,
+  fnIx: i32,
+): i32 {
   // The row the forward scan stopped at is the EARLIER of the first row named `unionSet` and
   // the first row whose member set is, since the scan tested both on every row and took
   // whichever came first. Each index is first-wins, so the smaller of the two is that row.
@@ -36500,7 +36691,7 @@ export function unionArmVariantForObj(unionSet: string, objIx: i32): i32 {
   if u < 0 || u >= unVarStart.length || u >= unVarCount.length { return -1 }
   let vi = unVarStart[u]
   while vi < unVarStart[u] + unVarCount[u] {
-    if objMatchesVariantIdx(objIx, vi) { return vi }
+    if objMatchesVariantIdx(objIx, vi, fnIx) { return vi }
     vi = vi + 1
   }
   -1
