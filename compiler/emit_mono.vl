@@ -169,6 +169,7 @@ import {
   mkSpread,
   mkUnary,
   mkWhile,
+  nodeChildren,
   nodeSpineChildren,
   orderArgsByParamNames,
   tsMentionsAnyName,
@@ -244,6 +245,7 @@ import {
   fnValUsed,
   invalidateFnChildIndex,
   lambdaCtr,
+  monoAnonParamPinTy,
   monoExactSubN,
   monoExactSubRow,
   monoExactSubT,
@@ -270,6 +272,7 @@ import { emitFail, emitFailAt } from "./emit_bytes"
 import {
   TY_WALK_DEPTH,
   anonHandleTyIx,
+  anonRowKindsAgree,
   arrLitElemName,
   captureCountOf,
   cloRetTypeName,
@@ -3510,6 +3513,9 @@ let monoKeyExtra = ""
 // type parameter no parameter mentions (D2676).
 let monoExplicitBN: string[] = []
 let monoExplicitBT: i32[] = []
+// Which arguments of the direct call being instantiated are object literals, consumed beside
+// `monoKeyExtra`: only a literal's own type is certain of its field values (D2762).
+let monoPinArgLit: boolean[] = []
 
 // Binds `typarams` to the call's explicit type arguments (their canonical spellings) in `tvN`
 // / `tvV`. Answers the key suffix: the bindings of the parameters no value parameter mentions,
@@ -4406,6 +4412,28 @@ function monoBuildPinCol(pinned: string[], kinds: i32[], pays: string[]) {
   0
 }
 
+// Whether the subtree at `ix` mentions the identifier `name` anywhere: a read, an alias, a copy
+// or a capture of it. Deeper than `depth` 400 answers true, so a miss is never guessed.
+function monoSubtreeNamesIdent(ix: i32, name: string, depth: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  if depth > 400 { return true }
+  const n = P.nodes[ix]
+  if n is Ident { return n.identName == name }
+  const kids = nodeChildren(ix)
+  let i = 0
+  while i < kids.length {
+    if monoSubtreeNamesIdent(kids[i], name, depth + 1) { return true }
+    i = i + 1
+  }
+  false
+}
+
+// Whether `ty` is a record type with no type variable left in it.
+function monoConcreteObjTy(ty: i32): boolean {
+  if ty < 0 { return false }
+  T.tys[ty] is TyObj && !tyHasTyVar(ty)
+}
+
 // D988 — the key suffix an anonymous-shape pin needs, or "" for every other pin. A hole
 // parameter pins the argument's type name, and two object literals with the same field
 // names share one synthetic row whatever their field types are, so both key the same
@@ -4818,8 +4846,10 @@ function monoMakeInstance(
     monoKeyExtra = ""
     const exBN = monoExplicitBN
     const exBT = monoExplicitBT
+    const argLit = monoPinArgLit
     monoExplicitBN = []
     monoExplicitBT = []
+    monoPinArgLit = []
     let pk = 0
     while pk < pinned.length {
       key = key + pinned[pk] + monoAnonPinDiscrim(pinned[pk], pinTys[pk]) + ","
@@ -4992,6 +5022,24 @@ function monoMakeInstance(
         // column is what the re-check windows declare the parameters as.
         const anonTy = anonHandleTyIx(pinned[pj])
         if anonTy >= 0 { pinTy = anonTy }
+        let isLit = pj < argLit.length && argLit[pj]
+        const agree = anonRowKindsAgree(pinned[pj], pinTys[pj])
+        if !isLit && anonTy >= 0 { isLit = agree == 1 }
+        // A record spelled by its fields names the first row of its layout, which can hold
+        // another code-0 kind; the instance would read that row while its caller builds its own.
+        if (
+          anonTy >= 0
+          && agree == 0
+          && pinned[pj][0] != "#"[0]
+          && monoSubtreeNamesIdent(fn.fnBody, p3.parName, 0)
+        ) {
+          return emitFail(
+            "emitProgram: a record argument's fields name a row that holds another field kind, and a record is shared rather than converted",
+          )
+        }
+        if anonTy >= 0 && nt >= 0 && isLit && monoConcreteObjTy(pinTys[pj]) {
+          monoAnonParamPinTy.set(nt, pinTys[pj])
+        }
         nps.push(
           mkParam(p3.parName, nt, p3.parDefault, p3.parOpt, p3.parRest, -1),
         )
@@ -6587,6 +6635,12 @@ function monoInstantiateCall(origFe: i32, callIx: i32, ctx: i32) {
       const pinKinds: i32[] = []
       const pinPays: string[] = []
       monoBuildPinCol(pinned, pinKinds, pinPays)
+      monoPinArgLit = []
+      let li = 0
+      while li < args.length {
+        monoPinArgLit.push(P.nodes[unwrapParen(args[li])] is ObjLit)
+        li = li + 1
+      }
       return monoMakeInstance(
         origFe,
         pinned,
@@ -7270,6 +7324,7 @@ export function monomorphize(stmts: i32[]) {
   monoInstName = []
   monoInstFe = []
   monoParamPinTy = Map()
+  monoAnonParamPinTy = Map()
   monoExactSubRow = Map()
   monoTwoListRet = Map()
   monoExactSubN = []
