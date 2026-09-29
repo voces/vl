@@ -1394,6 +1394,39 @@ the interaction with early `return`, `break` out of a loop, a trap (which ends t
 so no cleanup can run), and closures that capture the resource. (a) and (b) are both
 additive syntax.
 
+### boolean-into-i32 — should a `boolean` value keep flowing into an `i32` slot as `1`/`0`? — raised 2026-09-29
+
+**A language ruling, not a defect.** D3218 was filed as a soundness hole: `const aa: boolean =
+true` then `f(aa)` into `f(x: i32)` checks clean and prints `2`. That is the A7 coercion
+(`2ac5805a2`, #152): a `boolean`-typed VALUE is accepted wherever the destination is exactly
+`i32` (binding, argument, return, field, element, push, store), as `1`/`0`, and a bare
+`true`/`false` literal is refused. The `u8` element slot takes a `boolean` value the same way.
+It is pinned by six fixtures (`tests/cases/types/boolean-to-i32*.vl`,
+`tests/cases/arrays/joined-element-adopts-the-annotated-list.vl`, and three
+`tests/cases/generics/*-at-pin-keeps.vl`), and DECISIONS.md cites it three times as a rule the
+generic pins must keep. The checker is doing what the design says.
+
+**The price of retiring it**, measured by deleting the arm on master `94670f728` (lane BI):
+156 distilled-corpus cells go `runs` → `loud check reject`, every one in a grid built to
+exercise A7 (`d591` 54, `d581` 28, `d551` 24, `d572` 16, `d591t` 16, `d532x` 8, `d581o` 4,
+`d582s` 4, `d572o` 2), and every refusal names `boolean` against `i32`. The six fixtures above
+flip. No line of `compiler/`, `std/`, `scripts/`, or plumb's 507 units (`out/vl-hd`, `src`,
+`tools`) relies on it, and the compiler self-compiles unchanged without it.
+
+**Options.**
+(a) **Keep it** (today). The one crossing between the two scalar families; it costs nothing
+at runtime and saves `if b { 1 } else { 0 }` when counting.
+(b) **Retire it**, refusing in the literal's words (`argument 1: expected i32, got boolean`),
+and retire the `u8` element's `boolean` arm with it. `b as i32` is refused today (`as`
+supports numeric conversions only), so the only spelling left would be the `if`.
+(c) **Retire it and let `as` convert** `boolean` to `i32`/`u8`, so the conversion is written
+where it happens.
+
+**Recommendation: (c).** Implicit crossings are what VL avoids everywhere else (a lossless
+`i32` into `f32` is refused because it can round), a `boolean` that silently becomes a count
+is the confusion a type exists to catch, and nothing outside A7's own grids and fixtures uses
+it. (b) without (c) leaves no short explicit spelling.
+
 ## Dismissed — filed as owner rulings, verified NOT open
 
 Kept so the same 22 are not re-swept. `ALREADY-RULED` = the answer exists elsewhere; `SHIPPED` = the code already does it; `STALE-PREMISE` = the question rests on something no longer true; `NOT-AN-OWNER-CALL` = ordinary work, or a measurement settles it.
