@@ -771,6 +771,13 @@ let nestCstrTy: i32[] = []
 let nestCstrIx: i32[] = []
 let nestCstrFn: i32[] = []
 let nestCstrSeen: {[string]: boolean} = Map()
+// An `is` test over a hole parameter, re-asked at the pin as the annotated spelling asks it:
+// the tested operand's type, the checked type, the test's spelling, the node, and the owner.
+let isCstrTy: i32[] = []
+let isCstrChk: i32[] = []
+let isCstrName: string[] = []
+let isCstrIx: i32[] = []
+let isCstrFn: i32[] = []
 
 // D1470 — every `__array_new_default__(n)` call, its node and the array-hole row it returned.
 // `array.new_default` writes each slot's zero, so the element type is decided by what pins the
@@ -4668,6 +4675,11 @@ export function initChecker() {
   nestCstrIx = []
   nestCstrFn = []
   nestCstrSeen = Map()
+  isCstrTy = []
+  isCstrChk = []
+  isCstrName = []
+  isCstrIx = []
+  isCstrFn = []
   arrDefCallIx = []
   arrDefCallTy = []
   holeLinkA = []
@@ -16411,6 +16423,7 @@ function cstrTablesMark(): i32[] {
     coalHoleTy.length,
     tpIfFn.length,
     tpIfReFn.length,
+    isCstrTy.length,
   ]
 }
 
@@ -16426,6 +16439,13 @@ function cstrTablesTruncate(m: i32[]) {
     nestCstrTy.pop()
     nestCstrIx.pop()
     nestCstrFn.pop()
+  }
+  while isCstrTy.length > m[11] {
+    isCstrTy.pop()
+    isCstrChk.pop()
+    isCstrName.pop()
+    isCstrIx.pop()
+    isCstrFn.pop()
   }
   while retCstrGot.length > m[2] {
     retCstrGot.pop()
@@ -35380,6 +35400,20 @@ function holePinReadAt(
   tyFieldTyOf(inner, hdField[row])
 }
 
+// True when union `pin` has a member assignable to `alt`: an `is alt` guard over a parameter
+// pinned at `pin` can pass. A non-union pin answers false; its own assignability is asked first.
+function pinHasMemberOf(pin: i32, alt: i32): boolean {
+  const vs: i32[] = []
+  flattenVariantsInto(pin, vs)
+  if vs.length < 2 { return false }
+  let i = 0
+  while i < vs.length {
+    if holeAssignOk(-1, vs[i], alt) { return true }
+    i = i + 1
+  }
+  false
+}
+
 // Resolves a (possibly derived) hole against a call's bindings: a direct binding on its name
 // wins; a return derivation collapses to the pinned function's return; a field derivation to
 // the pinned object's field. A base that resolves to another hole re-bases onto it
@@ -35406,6 +35440,9 @@ function substHoleTyReal(tyIx: i32, bNames: string[], bTys: i32[]) {
     if gPin < 0 { return -1 }
     if tyIsHole(gPin) { return rebaseDerivedHole(row, gPin) }
     if holeAssignOk(-1, gPin, gAlt) { return gInner }
+    // A union pin with a member of the tested type reaches the branch too, so its return is a
+    // member of the call's type, as the annotated parameter's is (D3094).
+    if pinHasMemberOf(gPin, gAlt) { return gInner }
     return -1
   }
   // The guard's complement (`else` on a hole): the pin is the first place a remainder exists
@@ -37811,6 +37848,13 @@ function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
           fnDeclIx[name] ?? CSTR_NODECL,
           plainName,
         )
+        validateIsCstrs(
+          bNames,
+          bTys,
+          ix,
+          fnDeclIx[name] ?? CSTR_NODECL,
+          plainName,
+        )
         // A call argument inside the body, at the UFCS half for the same symmetry: `"s".inc()`
         // and `inc("s")` must answer the same way (D2425).
         validateArgCstrs(bNames, bTys, ix, fnDeclIx[name] ?? CSTR_NODECL)
@@ -39406,6 +39450,7 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
     )
     validatePrintCstrs(vNames, vTys, ix, cstrCallee, cstrWho)
     validateNestCstrs(vNames, vTys, ix, cstrCallee, cstrWho)
+    validateIsCstrs(vNames, vTys, ix, cstrCallee, cstrWho)
     validateArgCstrs(vNames, vTys, ix, cstrCallee)
     // The declared return rides the same pin: the body's mismatch check is vacuous under
     // a hole, and this is the first position that knows the instance (D551).
@@ -40519,6 +40564,7 @@ function cstrRowCount(): i32 {
     + argCstrAt.length
     + printCstrTy.length
     + nestCstrTy.length
+    + isCstrTy.length
     + retCstrGot.length
     + letCstrGot.length
     + bmCstrGot.length
@@ -44590,6 +44636,98 @@ function noteNestCstr(t: i32, ix: i32) {
   nestCstrTy.push(t)
   nestCstrIx.push(ix)
   nestCstrFn.push(owner)
+  0
+}
+
+// Whether `t` is an un-annotated parameter's hole (`paramHoleName`), not a declared type
+// parameter, whose body is checked for every instance by design.
+function tyIsParamHole(t: i32): boolean {
+  if t < 0 { return false }
+  const v = T.tys[t]
+  if v is TyVar { return v.tvName.length > 0 && v.tvName[0] == '?' }
+  false
+}
+
+// Records an `is` test of a record type whose operand type `ot` carries a hole, once per owner
+// and node (D3109).
+function noteIsCstr(ot: i32, chk: i32, name: string, ix: i32) {
+  if chk < 0 || !(T.tys[chk] is TyObj) { return 0 }
+  const owner = cstrOwnerTop()
+  let k = 0
+  while k < isCstrTy.length {
+    if (
+      isCstrFn[k] == owner
+      && isCstrIx[k] == ix
+      && tyEqSameHoles(isCstrTy[k], ot)
+    ) {
+      return 0
+    }
+    k = k + 1
+  }
+  isCstrTy.push(ot)
+  isCstrChk.push(chk)
+  isCstrName.push(name)
+  isCstrIx.push(ix)
+  isCstrFn.push(owner)
+  0
+}
+
+// Whether `t` is a record or a union with a record member.
+function tyHasObjMember(t: i32): boolean {
+  const vs: i32[] = []
+  flattenVariantsInto(t, vs)
+  let i = 0
+  while i < vs.length {
+    if vs[i] >= 0 && T.tys[vs[i]] is TyObj { return true }
+    i = i + 1
+  }
+  false
+}
+
+// Re-asks every recorded `is` test this call resolves to a nullable record operand, with the
+// annotated spelling's refusal when the tested record is not its record: that operand carries
+// no tag, so the test reads the layout and can answer true for the wrong record.
+function validateIsCstrs(
+  bNames: string[],
+  bTys: i32[],
+  ix: i32,
+  calleeFn: i32,
+  who: string,
+) {
+  const nOrig = isCstrTy.length
+  let ci = 0
+  while ci < nOrig {
+    if cstrOwnedBy(isCstrFn[ci], calleeFn) {
+      const ct = substTyDeep(isCstrTy[ci], bNames, bTys)
+      if tyHasHole(ct) {
+        if calleeFn >= 0 && ct != isCstrTy[ci] {
+          noteIsCstr(ct, isCstrChk[ci], isCstrName[ci], isCstrIx[ci])
+        }
+      } else if ct >= 0 {
+        const t = T.tys[ct]
+        let base = -1
+        if t is TyUnion { base = ct }
+        if t is TyNullable { base = t.nInner }
+        const chk = isCstrChk[ci]
+        const bad = base >= 0
+          && (!assignable(chk, base) || isWidenNotVariant(chk, base))
+        if bad && t is TyNullable && tyHasObjMember(base) {
+          let pWho = "a parameter is tested here: "
+          if who != "" { pWho = "`" + who + "` tests its parameter here: " }
+          tErr(
+            pWho
+              + "`is` check type '"
+              + isCstrName[ci]
+              + "' is not a variant of "
+              + tyToStr(ct),
+            ix,
+          )
+          return 0
+        }
+      }
+    }
+    ci = ci + 1
+  }
   0
 }
 
@@ -59224,6 +59362,8 @@ function checkIsExprNode(n: IsExpr, ix: i32) {
     // `objTy < 0` is the operand's own "no answer", not a type — indexing `T.tys` with it
     // would trap the compiler (D1462); an unresolved operand is freely testable, same as `TyErr`.
   } else if n.isVariant != "null" && objTy >= 0 {
+    // A record test over a hole is re-asked at each pin (D3109).
+    if tyIsParamHole(objTy) { noteIsCstr(objTy, chkTy, n.isVariant, ix) }
     // Soundness: `x is T` is meaningful only when `T` is assignable to `x`'s type, since the
     // then branch narrows verbatim — an ungated test would launder invalid wasm through a newtype.
     const ot = T.tys[objTy]

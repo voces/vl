@@ -612,6 +612,7 @@ import {
   fbOpenIf,
   fbRefAsNonNull,
   fbRefCast,
+  fbRefCastNull,
   fbRefNull,
   fbRefNullNone,
   fbRefNullOfKind,
@@ -965,6 +966,7 @@ import {
   narrowVariantFor,
   narrowedMapOf,
   narrowedMapOfPlace,
+  narrowedNulStructArm,
   narrowedRefArrayOf,
   narrowedRefArrayOfPlace,
   narrowedStructArmVi,
@@ -5560,18 +5562,24 @@ function emitUnionIfArm(
 // must satisfy, and where the arm is merged with a declared twin the indices are the same
 // anyway. Not a change to `exprUnion`, which would move every narrowed struct receiver.
 function narrowedArmNeedsUnbox(exprIx: i32, fnIx: i32): boolean {
-  if narrowedStructArmVi(exprIx) < 0 { return false }
+  if narrowedStructArmVi(exprIx) < 0 && !narrowedNulStructArm(exprIx) {
+    return false
+  }
   exprUnion(exprIx, fnIx)
 }
 
-// The unbox itself: recover the box's `anyref` payload and cast it to `heapIdx`. Emitted after
-// the value, so the box is already on the stack. A negative `heapIdx` emits nothing — the bounds
-// discipline `fbValtype` states: a destination whose table slot never resolved has no cast
-// target, and `ref.cast -1` would put a garbage heap index in the module.
-function emitNarrowedArmUnboxTo(heapIdx: i32) {
+// The unbox itself: recover the box's `anyref` payload and cast it to `heapIdx`, nullably when
+// `exprIx` is narrowed to `X | null`. Emitted after the value, so the box is already on the
+// stack. A negative `heapIdx` emits nothing: a destination whose table slot never resolved has
+// no cast target, and `ref.cast -1` would put a garbage heap index in the module.
+function emitNarrowedArmUnboxTo(heapIdx: i32, exprIx: i32) {
   if heapIdx < 0 { return 0 }
   fbStructGet(uBoxIdx, 1) // 0xfb 0x02 <box ht> field 1: value (anyref)
-  fbRefCast(heapIdx)      // 0xfb 0x16 <dest struct/variant heap> ref.cast (non-null)
+  if narrowedNulStructArm(exprIx) {
+    fbRefCastNull(heapIdx)
+  } else {
+    fbRefCast(heapIdx)
+  }
   0
 }
 
@@ -5581,7 +5589,7 @@ function emitNarrowedArmUnboxTo(heapIdx: i32) {
 function emitArmDelivery(body: u8[], exprIx: i32, fnIx: i32, heapIdx: i32) {
   const owed = narrowedArmNeedsUnbox(exprIx, fnIx)
   if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
-  if owed && heapIdx >= 0 { emitNarrowedArmUnboxTo(heapIdx) }
+  if owed && heapIdx >= 0 { emitNarrowedArmUnboxTo(heapIdx, exprIx) }
   0
 }
 
@@ -8369,7 +8377,9 @@ function emitArr(body: u8[], arrIx: i32, fnIx: i32) {
           // The narrowed-arm unbox at a ref-list element (D1031) — `[s]` of a `Circle[]` under
           // `if s is Circle`. The slot's own element heap is the destination, the same one
           // `rlBackIdx` types the backing array with.
-          if elArmOwed { emitNarrowedArmUnboxTo(rlElemArmHeapOf(rslot)) }
+          if elArmOwed {
+            emitNarrowedArmUnboxTo(rlElemArmHeapOf(rslot), elems[i])
+          }
           // Read-only covariance at a nested-list element (D791, D965) — `[lv1]` of a
           // `(readonly Shape[])[]`.
           emitNestedListWidenSite(body, elems[i], fnIx, rslot)
@@ -10022,7 +10032,9 @@ function emitMapSetValExpr(
   // The narrowed-arm unbox at the map-value boundary (D1031) — `m[k] = s` under `if s is
   // Circle` over a `{[string]: Circle}` — targets the vals element's own heap, the same
   // one `mvSlotNullable`'s `ref.null` seed above reads.
-  if mvArmOwed && mslot >= 0 { emitNarrowedArmUnboxTo(mvValElemHeapOf(mslot)) }
+  if mvArmOwed && mslot >= 0 {
+    emitNarrowedArmUnboxTo(mvValElemHeapOf(mslot), valIx)
+  }
   // Read-only covariance at the map-value boundary (D791) — `mU["k"] = lv1` over a
   // `{[string]: Shape[]}` — targets the same `mvValInnerRlSlot` row the build seed above
   // reads; it declines for every non-ref-list value type without parsing.
@@ -19077,7 +19089,12 @@ function emitCallRef(body: u8[], callIx: i32, fnIx: i32) {
         // interned i32 atom id, and a `null` argument into a `K | null` param as the
         // sentinel `-1` — without them a string ref reached an i32 param slot, invalid
         // wasm with `vl check` clean, in every function-value shape.
-        const clu = cloCallParamLitUnion(callIx, i)
+        let clu = cloCallParamLitUnion(callIx, i)
+        // An un-annotated parameter pinned at a literal union has a hole in the callee's type,
+        // so the `i` token is the only word, and an atom argument makes it the atom (D3076).
+        if clu == 0 && (pkk == "i32" || pkk == null) {
+          if tyIsLitUnion(nodeTyIxOf(args[i])) { clu = 1 }
+        }
         // the value-union param position (the box `u`): the kind comes off the resolved
         // `$fnsig` key so the coercion cannot disagree with the bytes; the box's own
         // identity comes from the checker type instead, since it is slot-free in the ABI —
@@ -19128,6 +19145,28 @@ function emitCallRef(body: u8[], callIx: i32, fnIx: i32) {
             fbStructGet(uBoxIdx, 1)     // 0xfb 0x02 <box ht> field 1: value (anyref)
             fbRefCast(uVarHeap[cvSlot]) // 0xfb 0x16 <variant struct> ref.cast (non-null)
           }
+        } else if pkk == "nulvariant" {
+          // The niche parameter (D3074), seeded as the direct call's argument rung seeds it:
+          // a `null` is the arm heap's null, an object literal builds the arm, and a value
+          // narrowed out of a box is unboxed to the arm.
+          const cnvSlot = sigParamSlotAt(ckey, i)
+          if cnvSlot < 0 || cnvSlot >= uVarHeap.length {
+            return emitFail(
+              "emitProgram: value-call nullable union-arm parameter has no variant slot",
+            )
+          }
+          const cnvCtx = expCtxHere()
+          cnvCtx.variantIdx = cnvSlot
+          const cnvArg = P.nodes[unwrapParen(args[i])]
+          if cnvArg is NullLit { cnvCtx.nulRefHeap = uVarHeap[cnvSlot] }
+          if emitExprExpect(body, args[i], fnIx, cnvCtx) < 0 { return -1 }
+          pendingVariantIdx = -1
+          if narrowedArmNeedsUnbox(args[i], fnIx) {
+            emitNarrowedArmUnboxTo(
+              armDestHeapOf("nulvariant", cnvSlot),
+              args[i],
+            )
+          }
         } else if cuNm != "" {
           if emitUnionBoxArg(body, cuNm, args[i], fnIx) < 0 { return -1 }
         } else if (
@@ -19161,6 +19200,14 @@ function emitCallRef(body: u8[], callIx: i32, fnIx: i32) {
           cuCtx.nulClosure = pkk == "nulclosure"
           cuCtx.nulList = pkk == "nullist"
           if emitExprExpect(body, args[i], fnIx, cuCtx) < 0 { return -1 }
+          // A value narrowed out of a box into a struct parameter is unboxed, as the direct
+          // call unboxes it (D1723); the slot is the key's, so the cast agrees with the bytes.
+          if pkk != null && narrowedArmNeedsUnbox(args[i], fnIx) {
+            emitNarrowedArmUnboxTo(
+              armDestHeapOf(pkk, sigParamSlotAt(ckey, i)),
+              args[i],
+            )
+          }
         } else {
           const cluCtx = expCtxHere()
           cluCtx.litUnion = 1
@@ -19352,7 +19399,7 @@ function emitAssign(body: u8[], binIx: i32, fnIx: i32) {
           // the narrowed-arm unbox at the same boundary (D1031) — `gv = s` under `if s is
           // Circle`, between two module globals; `armDestHeapOf` reads the destination pair.
           if narrowedArmNeedsUnbox(a.binRight, fnIx) {
-            emitNarrowedArmUnboxTo(armDestHeapOf(gaKind, gaArmIdx))
+            emitNarrowedArmUnboxTo(armDestHeapOf(gaKind, gaArmIdx), a.binRight)
           }
           // the nullable-niche recover at the same boundary (D1115) — `g = y` under
           // `if y != null`, into a global whose cell is a non-null ref.
@@ -19522,6 +19569,7 @@ function emitAssign(body: u8[], binIx: i32, fnIx: i32) {
         ) {
           emitNarrowedArmUnboxTo(
             armDestHeapOf(localIsRef[asgSlot], localStructIdx[asgSlot]),
+            a.binRight,
           )
         }
       }
@@ -19739,9 +19787,15 @@ function emitAssign(body: u8[], binIx: i32, fnIx: i32) {
       // lands, and those two seeds are what the value emits under (D1685).
       if narrowedArmNeedsUnbox(a.binRight, fnIx) {
         if storeVariantIdx >= 0 {
-          emitNarrowedArmUnboxTo(armDestHeapOf("variant", storeVariantIdx))
+          emitNarrowedArmUnboxTo(
+            armDestHeapOf("variant", storeVariantIdx),
+            a.binRight,
+          )
         } else if storeStructIdx >= 0 {
-          emitNarrowedArmUnboxTo(armDestHeapOf("struct", storeStructIdx))
+          emitNarrowedArmUnboxTo(
+            armDestHeapOf("struct", storeStructIdx),
+            a.binRight,
+          )
         }
       }
       pendingStructIdx = -1
@@ -20586,7 +20640,7 @@ function emitPush(body: u8[], callIx: i32, fnIx: i32, wantValue: boolean) {
         // the narrowed-arm unbox at the `.push` boundary (D1031) — `xs.push(s)` into a
         // `Circle[]` under `if s is Circle`. The element-literal twin is in `emitArr`; both
         // read the same slot heap, so the two spellings of one store cannot disagree.
-        if pushArmOwed { emitNarrowedArmUnboxTo(pushArmHeap) }
+        if pushArmOwed { emitNarrowedArmUnboxTo(pushArmHeap, c.callArgs[0]) }
         // the read-only covariant copy at the `.push` boundary (D2163)
         if pushRSlot >= 0 {
           emitNestedListWidenSite(body, c.callArgs[0], fnIx, pushRSlot)
@@ -23031,7 +23085,7 @@ function emitReturnValue(body: u8[], retArg: i32, fnIx: i32) {
   // (kind, slot) pair the result valtype is written from.
   if retArmHeap >= 0 && retVi < 0 {
     if narrowedArmNeedsUnbox(retArg, fnIx) {
-      emitNarrowedArmUnboxTo(retArmHeap)
+      emitNarrowedArmUnboxTo(retArmHeap, retArg)
     }
   }
   // The null heap is one-shot, and only a bare `null` consumes it: a `return { … }` or
@@ -23788,7 +23842,7 @@ function emitLetDeclStmt(body: u8[], s: LetDecl, stmtIx: i32, fnIx: i32) {
   // moves the narrowing stack.
   if letArmOwed {
     const letArmHeap = armDestHeapOf(localIsRef[slot], localStructIdx[slot])
-    if letArmHeap >= 0 { emitNarrowedArmUnboxTo(letArmHeap) }
+    if letArmHeap >= 0 { emitNarrowedArmUnboxTo(letArmHeap, s.letInit) }
   }
   // the nullable-niche recover at the BINDING boundary (D1115) — `const z: i32[] = y` under
   // `if y != null`. The cell's own kind is the destination, exactly as the two widen sites
@@ -25269,6 +25323,7 @@ function emitForInStmt(body: u8[], s: ForIn, stmtIx: i32, fnIx: i32) {
   } else if (
     ek == "struct"
     || ek == "variant"
+    || ek == "nulvariant"
     || ek == "union"
     || ek == "nulstruct"
     || ek == "list"
@@ -28689,6 +28744,7 @@ function emitDirectCall(body: u8[], callIx: i32, fnIx: i32, target: i32) {
         if narrowedArmNeedsUnbox(args[i], fnIx) {
           emitNarrowedArmUnboxTo(
             armDestHeapOf("nulvariant", cParamNulVariantIdx),
+            args[i],
           )
         }
       }
@@ -28704,7 +28760,10 @@ function emitDirectCall(body: u8[], callIx: i32, fnIx: i32, target: i32) {
       // boundary; guarded so the three arms cannot both fire (D1723).
       if cVi < 0 && cParamNulVariantIdx < 0 {
         if narrowedArmNeedsUnbox(args[i], fnIx) {
-          emitNarrowedArmUnboxTo(armDestHeapOf(cArgParamKind, cArgParamRow))
+          emitNarrowedArmUnboxTo(
+            armDestHeapOf(cArgParamKind, cArgParamRow),
+            args[i],
+          )
         }
       }
       pendingStructIdx = -1
@@ -28804,6 +28863,14 @@ function emitCapturedCall(body: u8[], callIx: i32, fnIx: i32, target: i32) {
       if emitAtomToStr(body, cargs[cai], fnIx) < 0 { return -1 }
     } else {
       if emitExpr(body, cargs[cai], fnIx) < 0 { return -1 }
+      // A value narrowed out of a box into an arm or nullable-arm parameter is unboxed, as
+      // the direct call's argument rung unboxes it.
+      if cai < cps.length && narrowedArmNeedsUnbox(cargs[cai], fnIx) {
+        emitNarrowedArmUnboxTo(
+          armDestHeapOf(cpKind, paramStructIdxOf(cps[cai])),
+          cargs[cai],
+        )
+      }
     }
     cai = cai + 1
   }

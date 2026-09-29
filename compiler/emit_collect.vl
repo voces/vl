@@ -168,6 +168,7 @@ import {
   annTsOf,
   elseIfLink,
   externGlobalLinkOfNode,
+  funcDeclNodes,
   i32ToStr,
   nodeChildren,
   nodeSpineChildren,
@@ -3534,7 +3535,7 @@ export function declareForInLocals(s: ForIn, fnIx: i32) {
   let fiLk: VKind = "list"
   if fiEk == "struct" {
     fiLk = "reflist"
-  } else if fiEk == "variant" {
+  } else if fiEk == "variant" || fiEk == "nulvariant" {
     // A union-arm element (code 8): the loop var carries the variant-table row, so its cell is
     // `(ref $(uVarHeap[vi]))` — what a `const c: Circle = …` local binds. The `#l` temp is the
     // ref-list wrapper (code 5), as for every other ref element (D50).
@@ -3619,6 +3620,7 @@ export function declareForInLocals(s: ForIn, fnIx: i32) {
   if (
     fiEk == "struct"
     || fiEk == "variant"
+    || fiEk == "nulvariant"
     || fiEk == "union"
     || fiEk == "nulstruct"
     || fiEk == "list"
@@ -12197,8 +12199,12 @@ function collectInlineUnions(stmts: i32[]) {
   nliLetIxs = []
   nliNames = []
   cloSigWalkRoots = []
+  ciuFnSeen = Map()
   collectInlineUnionsIn(stmts, stmts)
 }
+
+// The functions `collectInlineUnionsIn` has registered, so `collectU`'s lambda walk skips them.
+let ciuFnSeen: {[i32]: boolean} = Map()
 
 // The recursive worker: scans the statement list `walk` (registering against the top-level
 // `stmts`, where struct `TypeDecl`s live), descending into function bodies and branch blocks
@@ -12208,6 +12214,7 @@ function collectInlineUnionsIn(stmts: i32[], walk: i32[]) {
   while i < walk.length {
     const s = P.nodes[walk[i]]
     if s is FuncDecl {
+      ciuFnSeen[walk[i]] = true
       // Read both annotation-bearing fields of the narrowed `s` before the inner loop introduces
       // a `Param` narrowing, which would unpin `s`'s own `FuncDecl` narrowing.
       const params = s.fnParams
@@ -12565,6 +12572,20 @@ export function collectU(stmts: i32[]) {
   // Inline union annotations carry no `UnionDecl`; registers each as a synthetic alias so
   // every name-keyed lookup treats it like a named one. Runs after `UnionDecl`, before `assignTags`.
   if collectInlineUnions(stmts) < 0 { return -1 }
+  // A lambda sits in an expression, which the statement walk does not enter, so its
+  // parameters, result and body register here, as a declared function's do (D3075).
+  let li = 0
+  while li < funcDeclNodes.length {
+    const fx = funcDeclNodes[li]
+    if fx < P.nodes.length && P.nodes[fx] is FuncDecl && !ciuFnSeen.has(fx) {
+      ciuFnSeen.set(fx, true)
+      const one: i32[] = []
+      one.push(fx)
+      if collectInlineUnionsIn(stmts, one) < 0 { return -1 }
+    }
+    li = li + 1
+  }
+  ciuFnSeen = Map()
   // Inferred value-union and struct-union returns register here too, even when an inferred
   // return is the program's only union; self-gated (`isUName`), so already-declared ones no-op.
   let iru = 0
