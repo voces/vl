@@ -35727,7 +35727,9 @@ function holePinReadAt(
   if inner < 0 || inner >= T.tys.length { return -1 }
   // The result of calling a hole the pin reads as a function (D3117).
   if kind == HD_RET {
-    const ft = T.tys[inner]
+    const fi = callPinFnTy(inner)
+    if fi < 0 { return -1 }
+    const ft = T.tys[fi]
     if ft is TyFunc { return ft.fnRet }
     return -1
   }
@@ -35816,8 +35818,11 @@ function substHoleTyReal(tyIx: i32, bNames: string[], bTys: i32[]) {
   if kind == HD_RET {
     const inner = substHoleTy(hdBase[row], bNames, bTys)
     if inner >= 0 {
-      const it = T.tys[inner]
-      if it is TyFunc { return it.fnRet }
+      const fi = callPinFnTy(inner)
+      if fi >= 0 {
+        const it = T.tys[fi]
+        if it is TyFunc { return it.fnRet }
+      }
       return rebaseDerivedHole(row, inner)
     }
     return -1
@@ -50746,6 +50751,43 @@ function tyMapValIsLitUnion(ti: i32, depth: i32): boolean {
   false
 }
 
+// Whether `ti` is a function type, bare or nullable, whose result is a literal union. A
+// `| null` result is not counted: its atom reads are D3198's.
+function tyFnRetIsLitUnion(ti: i32): boolean {
+  const f = nonNullTy(ti)
+  if f < 0 || f >= T.tys.length { return false }
+  const ft = T.tys[f]
+  if !(ft is TyFunc) { return false }
+  tyIsLitUnion(ft.fnRet)
+}
+
+// `ti` with up to `depth` list element and map value layers peeled, `| null` on each.
+function tyPeelElems(ti: i32, depth: i32): i32 {
+  const n = nonNullTy(ti)
+  if n < 0 || n >= T.tys.length || depth <= 0 { return n }
+  const ae = tyArrayElemIx(n)
+  if ae >= 0 { return tyPeelElems(ae, depth - 1) }
+  const t = T.tys[n]
+  if t is TyMap { return tyPeelElems(t.mVal, depth - 1) }
+  n
+}
+
+// The function a call runs through when its callee's pin is `ty`: `ty` itself, or the function
+// a `| null` pin holds (D3192), except one whose result is a nullable literal union (D3198).
+// -1 when `ty` is neither.
+function callPinFnTy(ty: i32): i32 {
+  if ty < 0 || ty >= T.tys.length { return -1 }
+  if T.tys[ty] is TyFunc { return ty }
+  const f = nonNullTy(ty)
+  if f < 0 || f >= T.tys.length { return -1 }
+  const ft = T.tys[f]
+  if ft is TyFunc {
+    if tyIsNullableLitUnion(ft.fnRet) { return -1 }
+    return f
+  }
+  -1
+}
+
 // Whether `ti` is a record with a literal-union field, bare or nullable, at any record-nesting
 // depth up to `depth`. The record-field usage arm of `anyLitUnionUsed`.
 function tyObjFieldIsLitUnion(ti: i32, depth: i32): boolean {
@@ -50765,6 +50807,7 @@ function tyObjFieldIsLitUnion(ti: i32, depth: i32): boolean {
       }
       if f >= 0 {
         if tyIsLitUnion(f) { return true }
+        if tyFnRetIsLitUnion(f) { return true }
         if tyObjFieldIsLitUnion(f, depth - 1) { return true }
       }
       i = i + 1
@@ -50786,6 +50829,10 @@ export function anyLitUnionUsed() {
       if tyMapValIsLitUnion(nodeTyIxOf(i), 4) { return true }
       // So does one used only as a record field, which a hole parameter reads (D2866).
       if tyObjFieldIsLitUnion(nodeTyIxOf(i), 4) { return true }
+      // And one used only as a function type's result, a list element's or a map value's
+      // included, which a call in an instance reads (D3193, D3199).
+      const pe = tyPeelElems(nodeTyIxOf(i), 4)
+      if tyFnRetIsLitUnion(pe) || tyObjFieldIsLitUnion(pe, 4) { return true }
     }
     // A litunion used only as an array element (or any expression the checker typed as one)
     // also counts — checked on the recorded type, not the annotation name, at every node.
