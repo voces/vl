@@ -46,6 +46,7 @@ import {
   flatConstOfNameProp,
   flattenVariantsInto,
   fnResultUnconsumed,
+  holePinReadOf,
   i32TyIx,
   inferRetFnKey,
   inferRetNameOf,
@@ -6141,15 +6142,52 @@ function monoExactClear(outN: string[], outT: i32[]): boolean {
   false
 }
 
-// The pin `t` read inside function `ctx`: where it names a type parameter of the exact instance
-// `ctx` is, or is lifted inside, that instance's exact binding substituted; else `t` itself.
+// The pin `t` read inside function `ctx`: where it names a type parameter of the instance `ctx`
+// is, or is lifted inside, that instance's exact binding substituted, else its parameters'
+// pinned types; else `t` itself.
 function monoExactPinTyOf(t: i32, ctx: i32): i32 {
   if t < 0 || !tyHasTyVar(t) { return t }
   const row = monoExactSubRowOf(ctx)
-  if row < 0 || row >= monoExactSubN.length { return t }
-  const st = substTyDeep(t, monoExactSubN[row], monoExactSubT[row])
-  if st < 0 || tyHasTyVar(st) { return t }
-  st
+  if row >= 0 && row < monoExactSubN.length {
+    const st = substTyDeep(t, monoExactSubN[row], monoExactSubT[row])
+    if st >= 0 && !tyHasTyVar(st) { return st }
+  }
+  monoPinSubTyOf(t, ctx)
+}
+
+// Each instance's type parameters bound to its parameters' pinned types, by `fnStmts` slot. A
+// generic call in an instance that is not exact reads its argument's type here, or it pins the
+// callee at the caller's own type parameter (D3044).
+let monoPinSubRow: {[i32]: i32} = Map()
+let monoPinSubN: string[][] = []
+let monoPinSubT: i32[][] = []
+
+// `t` with the pinned binding of the instance `ctx` is, or is lifted inside, substituted, a
+// type parameter's or a hole's; `t` itself where no instance binds every one it names.
+function monoPinSubTyOf(t: i32, ctx: i32): i32 {
+  if ctx < 0 { return t }
+  let pos = fnStmtsPosOf(ctx)
+  let guard = 0
+  while pos >= 0 && guard <= fnStmts.length {
+    const row = monoPinSubRow.get(pos) ?? -1
+    if row >= 0 && row < monoPinSubN.length {
+      const st = substTyDeep(t, monoPinSubN[row], monoPinSubT[row])
+      if st < 0 || tyHasTyVar(st) { return t }
+      return st
+    }
+    // A hole instance binds its holes, which the argument's recorded type may name directly.
+    const hrow = monoHoleSubRow.get(pos) ?? -1
+    if hrow >= 0 && hrow < monoHoleSubN.length {
+      let ht = holePinReadOf(t, monoHoleSubN[hrow], monoHoleSubT[hrow])
+      if ht < 0 { ht = substTyDeep(t, monoHoleSubN[hrow], monoHoleSubT[hrow]) }
+      if ht < 0 || tyHasTyVar(ht) { return t }
+      return ht
+    }
+    if pos >= fnParent.length { return t }
+    pos = fnParent[pos]
+    guard = guard + 1
+  }
+  t
 }
 
 // `monoExactPinTyOf` over each pin of one call.
@@ -7077,6 +7115,11 @@ function monoMakeInstance(
       monoExactSubRow.set(instFe, monoExactSubN.length)
       monoExactSubN.push(exSubN)
       monoExactSubT.push(exSubT)
+    }
+    if letBN.length > 0 {
+      monoPinSubRow.set(instFe, monoPinSubN.length)
+      monoPinSubN.push(letBN)
+      monoPinSubT.push(letBT)
     }
     if instHoleN.length > 0 {
       monoHoleSubRow.set(instFe, monoHoleSubN.length)
@@ -8859,6 +8902,9 @@ export function monomorphize(stmts: i32[]) {
   monoHoleSubRow = Map()
   monoHoleSubN = []
   monoHoleSubT = []
+  monoPinSubRow = Map()
+  monoPinSubN = []
+  monoPinSubT = []
   monoExactMemo = []
   monoActiveDepth = []
   monoExactStack = []
