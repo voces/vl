@@ -21,7 +21,8 @@ outer: for i in 0 until 10 {
 - `continue :B` starts the next iteration of the loop labelled `B`.
 - A bare `break` leaves the innermost loop **or labelled block**; a bare `continue` continues the
   innermost **loop** (a labelled block is not one, so `continue` passes through it).
-- A label names only a loop or block the jump is written inside, in the same function.
+- A label names only a loop or block the jump is written inside, in the same function; a
+  `break` in a lambda does not reach the loop around the lambda.
 
 The old spelling `break outer` is refused with the fix (`labels are written `break :outer``),
 because `break x` now means "break with the value of `x`". `scripts/codemods/break-label-colon.py`

@@ -3,10 +3,10 @@
 
 A label is marked at the exit since the 2026-09-29 ruling (DECISIONS.md, "Labels are marked at
 the exit"), and `break x` now breaks with the value of `x`. This rewrites a `break`/`continue`
-followed on the same line by a name that the same file declares as a loop label (`B: while`,
-`B: for`) and nothing else before the statement ends. Comments and string literals are left
-alone. A name no loop in the file declares is reported, not rewritten: under the new reading
-it is a value, and only the author knows which was meant.
+followed on the same line by a name, and nothing else before the statement ends, when that
+name labels a loop (`B: while`, `B: for`) the jump is lexically inside. Comments and string
+literals are left alone. Any other name is reported, not rewritten: under the new reading it is
+a value, and only the author knows which was meant.
 
 Usage: break-label-colon.py [--check] PATH...   (a directory is walked for *.vl files)
 Exit status: 0 when nothing needed rewriting (or --check found nothing), 1 otherwise.
@@ -79,27 +79,55 @@ def code_spans(line, state):
 
 
 def rewrite(src):
-    labels = set(LABEL_DECL.findall(src))
+    """Rewrite each jump whose name labels a loop the jump is lexically inside."""
     state = {"block": False}
     lines = src.split("\n")
     changed = 0
     unknown = []
+    depth = 0          # open `{` in code
+    active = []        # (label, depth of the loop body's `{`)
+    pending = None     # a label declared, whose loop body `{` is still to come
     for li, line in enumerate(lines):
         runs = code_spans(line, state)
         if "".join(t for t, _ in runs) != line:
             continue  # a run split that does not round-trip: leave the line alone
         new = []
         for text, is_code in runs:
-            if is_code:
-                def sub(m):
-                    nonlocal changed
-                    if m.group(3) in labels:
+            if not is_code:
+                new.append(text)
+                continue
+            out = []
+            i = 0
+            while i < len(text):
+                m = LABEL_DECL.match(text, i)
+                if m and (i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")):
+                    pending = m.group(1)
+                    out.append(m.group(0))
+                    i = m.end()
+                    continue
+                j = JUMP.match(text, i)
+                if j and (i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")):
+                    if any(lab == j.group(3) for lab, _ in active):
                         changed += 1
-                        return m.group(1) + m.group(2) + ":" + m.group(3)
-                    unknown.append((li + 1, m.group(0)))
-                    return m.group(0)
-                text = JUMP.sub(sub, text)
-            new.append(text)
+                        out.append(j.group(1) + j.group(2) + ":" + j.group(3))
+                    else:
+                        unknown.append((li + 1, j.group(0)))
+                        out.append(j.group(0))
+                    i = j.end()
+                    continue
+                c = text[i]
+                if c == "{":
+                    depth += 1
+                    if pending is not None:
+                        active.append((pending, depth))
+                        pending = None
+                elif c == "}":
+                    while active and active[-1][1] == depth:
+                        active.pop()
+                    depth -= 1
+                out.append(c)
+                i += 1
+            new.append("".join(out))
         lines[li] = "".join(new)
     return "\n".join(lines), changed, unknown
 
@@ -129,7 +157,7 @@ def main(argv):
         out, n, unknown = rewrite(src)
         for ln, text in unknown:
             if text.startswith("continue"):
-                print(f"{f}:{ln}: `{text}` names no loop label in this file; fix it by hand")
+                print(f"{f}:{ln}: `{text}` names no enclosing loop label; fix it by hand")
         if n:
             total += n
             print(f"{f}: {n} jump(s) {'to rewrite' if check else 'rewritten'}")

@@ -4905,6 +4905,8 @@ export function initChecker() {
   lpValTy = []
   lpValUsed = []
   lpValTail = []
+  exitArmBlocks = []
+  exitArmSeen = []
   lpValSeen = false
   lpLabels = []
   lpJoin = []
@@ -41977,6 +41979,8 @@ function ucBlock(ix: i32, lastCtx: i32) {
     while i < n {
       let c = UC_DISCARD
       if i == n - 1 { c = lastCtx }
+      // A `break v`'s value is the statement before the break, and it is read.
+      if brkValSeen && breakValueAt(b.blkStmts, i) { c = UC_VALUE }
       ucWalk(b.blkStmts[i], c)
       i = i + 1
     }
@@ -42059,7 +42063,10 @@ function ucWalk(ix: i32, ctx: i32) {
       ucWalk(n.omObj, UC_VALUE)
     } else if n is WhileStmt {
       ucWalk(n.whileCond, UC_VALUE)
-      ucBlock(n.whileBody, UC_DISCARD)
+      // A labelled block's tail is its value, read as the block is.
+      let tailCtx = UC_DISCARD
+      if n.whileBlk == 1 { tailCtx = ctx }
+      ucBlock(n.whileBody, tailCtx)
     } else if n is ForRange {
       ucWalk(n.frFrom, UC_VALUE)
       ucWalk(n.frTo, UC_VALUE)
@@ -43428,7 +43435,10 @@ function checkFuncDeclNodeIn(n: FuncDecl, fnIx: i32) {
         tpIfMarkOk(stmts[s])
       }
       crStmtEnter(stmts[s])
+      const savedSpine = spinePos
+      spinePos = s == stmts.length - 1
       const stTy = checkNode(stmts[s])
+      spinePos = savedSpine
       crStmtLeave()
       retTailPos = savedRTPbody
       if ucVoided && tailIsReturn {
@@ -45395,6 +45405,13 @@ function tailSpineNode(ix: i32) {
   nd is Block || nd is IfStmt || nd is RetStmt || nd is Paren
 }
 
+// Whether node `ix` hands a function's tail position on to its arms or last statement, as
+// the emitter lowers them: a block, an `if` or a `match`. Anything else delivers a value.
+function exitSpineNode(ix: i32): boolean {
+  const nd = P.nodes[ix]
+  nd is Block || nd is IfStmt || nd is MatchExpr
+}
+
 // —— the Node visitor (dispatch; per-kind helpers above take narrowed variants) ——
 // Thin recording wrapper around `checkNodeReal`: on the real (non-quiet) pass, stores each
 // node's resolved type-arena index into the typed-IR table. Recording the arena index, not a
@@ -45407,7 +45424,13 @@ function checkNode(ix: i32) {
       retTailPos = false
     }
   }
+  let spineLeft = false
+  if spinePos && !exitSpineNode(ix) {
+    spinePos = false
+    spineLeft = true
+  }
   const t = checkNodeReal(ix)
+  if spineLeft { spinePos = true }
   checkNodeDone(ix, t, savedTail)
   t
 }
@@ -54551,9 +54574,11 @@ function checkMatchIntArms(n: MatchExpr, ix: i32, st: i32) {
       // sentinel TY_ERR (both are -1), so a void-arm `match` must not be read as an error.
       if armTy < 0 { armTy = TY_VOID }
     }
-    matchTy = joinTys(matchTy, f32ArmPlainTy(body, armTy))
-    if tpEnvNames.length > 0 { matchArmTys.push(f32ArmPlainTy(body, armTy)) }
-    matchValAcc = matchArmTally(ix, body, armTy, matchValAcc)
+    if !matchArmExits(body, armTy) {
+      matchTy = joinTys(matchTy, f32ArmPlainTy(body, armTy))
+      if tpEnvNames.length > 0 { matchArmTys.push(f32ArmPlainTy(body, armTy)) }
+      matchValAcc = matchArmTally(ix, body, armTy, matchValAcc)
+    }
     ai = ai + 1
   }
   if matchTy < 0 { matchTy = TY_VOID }
@@ -54688,6 +54713,19 @@ function checkMatchBindDecls(bIx: i32) {
     }
   }
   0
+}
+
+// Whether the `match` arm `body` is a block that always exits, which hands the join nothing and
+// is noted for the emitter's `never` tail, as an `if` arm is (D3222).
+function matchArmExits(body: i32, armTy: i32): boolean {
+  // An arm with a value cannot always exit, and a statement or tail `match` (`matchOnSpine`)
+  // lowers its arms without one, so neither pays for the walk of the arm.
+  if matchOnSpine || !isVoidTy(armTy) || !(P.nodes[body] is Block) {
+    return false
+  }
+  if !stmtAlwaysExits(body) { return false }
+  noteExitArm(body)
+  true
 }
 
 function checkMatchTypeArms(n: MatchExpr, ix: i32, st: i32, uMems: i32[]) {
@@ -54869,9 +54907,11 @@ function checkMatchTypeArms(n: MatchExpr, ix: i32, st: i32, uMems: i32[]) {
       if armTy < 0 { armTy = TY_VOID }
     }
     if scoped { popScope() }
-    matchTy = joinTys(matchTy, f32ArmPlainTy(body, armTy))
-    if tpEnvNames.length > 0 { matchArmTys.push(f32ArmPlainTy(body, armTy)) }
-    matchValAcc = matchArmTally(ix, body, armTy, matchValAcc)
+    if !matchArmExits(body, armTy) {
+      matchTy = joinTys(matchTy, f32ArmPlainTy(body, armTy))
+      if tpEnvNames.length > 0 { matchArmTys.push(f32ArmPlainTy(body, armTy)) }
+      matchValAcc = matchArmTally(ix, body, armTy, matchValAcc)
+    }
     bi = bi + 1
   }
   if matchTy < 0 { matchTy = TY_VOID }
@@ -54909,6 +54949,19 @@ function checkMatchTypeArms(n: MatchExpr, ix: i32, st: i32, uMems: i32[]) {
 
 // Extracted from `checkNodeReal`'s `MatchExpr` arm (C3: thin the dispatcher).
 function checkMatchExprNode(n: MatchExpr, ix: i32) {
+  // A discarded `match` lowers its arms as statements, as a spine one does, and so do the
+  // blocks, `if`s and `match`es at their tails.
+  const savedOnSpine = matchOnSpine
+  const savedSpine = spinePos
+  matchOnSpine = spinePos || valDiscarded(ix)
+  spinePos = matchOnSpine
+  const r = checkMatchExprNodeIn(n, ix)
+  matchOnSpine = savedOnSpine
+  spinePos = savedSpine
+  r
+}
+
+function checkMatchExprNodeIn(n: MatchExpr, ix: i32) {
   // Three arm vocabularies, decided by the scrutinee: an integer dispatches on literals
   // (D1572), a litunion on member strings, any other union on member types.
   const mTail = retTailPos
@@ -55058,9 +55111,11 @@ function checkMatchExprNode(n: MatchExpr, ix: i32) {
       // sentinel TY_ERR (both are -1), so a void-arm `match` must not be mistaken for an error.
       if armTy < 0 { armTy = TY_VOID }
     }
-    matchTy = joinTys(matchTy, f32ArmPlainTy(body, armTy))
-    if tpEnvNames.length > 0 { matchArmTys.push(f32ArmPlainTy(body, armTy)) }
-    matchValAcc = matchArmTally(ix, body, armTy, matchValAcc)
+    if !matchArmExits(body, armTy) {
+      matchTy = joinTys(matchTy, f32ArmPlainTy(body, armTy))
+      if tpEnvNames.length > 0 { matchArmTys.push(f32ArmPlainTy(body, armTy)) }
+      matchValAcc = matchArmTally(ix, body, armTy, matchValAcc)
+    }
     ai = ai + 1
   }
   // A void-armed match leaves the join unset (-1) or void; normalize to void so the function-
@@ -55168,6 +55223,8 @@ function checkIfStmtNode(ix: i32) {
       }
     }
   }
+  const savedOnTail = ifChainOnFnTail
+  ifChainOnFnTail = spinePos
   let k = frames.length - 1
   let res = checkIfTailAt(frames[k], elseRes, false)
   while k > 0 {
@@ -55176,8 +55233,16 @@ function checkIfStmtNode(ix: i32) {
     checkNodeDone(inner.ifIx, res, savedTails[k])
     res = checkIfTailAt(frames[k], res, inner.exits)
   }
+  ifChainOnFnTail = savedOnTail
   res
 }
+
+// Whether the node being checked sits on a function body's tail spine (`exitSpineNode`), and
+// whether the `if` chain or `match` whose joins are being taken does: its arms lower as the
+// function's returns, so an exiting arm there needs no `never` tail (D3222).
+let spinePos = false
+let ifChainOnFnTail = false
+let matchOnSpine = false
 
 // The head of one link: everything up to checking its else arm.
 function checkIfHead(n: IfStmt, ix: i32): IfChk {
@@ -55589,10 +55654,19 @@ function checkIfTail(
   if daHasElse {
     const thenPlain = f32ArmPlainTy(n.ifThen, thenTy)
     const elsePlain = f32ArmPlainTy(n.ifElse, elseTy)
-    // An arm that always exits (`return`, `break`, `continue`) hands no value to the join.
+    // An arm block that always exits (`return`, `break`, `continue`) hands no value to the
+    // join; the emitter ends it with a `never` value (`exitArmBlockAt`) so every rep lowers it.
     let plainJoin = joinTys(thenPlain, elsePlain)
-    if thenExits && !daElseDiverges { plainJoin = elsePlain }
-    if daElseDiverges && !thenExits { plainJoin = thenPlain }
+    // A function's tail `if` already lowers an exiting arm as a return, so it needs no tail.
+    if thenExits && !daElseDiverges && P.nodes[n.ifThen] is Block {
+      plainJoin = elsePlain
+      if !ifChainOnFnTail { noteExitArm(n.ifThen) }
+    }
+    const elseBlk = n.ifElse >= 0 && P.nodes[n.ifElse] is Block
+    if daElseDiverges && !thenExits && elseBlk {
+      plainJoin = thenPlain
+      if !ifChainOnFnTail { noteExitArm(n.ifElse) }
+    }
     f32JoinRevert(ix)
     if tpEnvNames.length > 0 && !thenExits && !daElseDiverges {
       let elseApart = elsePlain
@@ -60776,6 +60850,25 @@ export function loopValTyOf(ix: i32): i32 {
   lpColAt(lpValTy, ix)
 }
 
+// The arm blocks of value `if`s that always exit, each once: the join left them out, and the
+// emitter ends each with a `never` value so the arm meets the join's blocktype (D3222).
+let exitArmBlocks: i32[] = []
+let exitArmSeen: i32[] = []
+
+function noteExitArm(blk: i32) {
+  if inferQuiet || lpColAt(exitArmSeen, blk) == 1 { return 0 }
+  lpColSet(exitArmSeen, blk, 1)
+  exitArmBlocks.push(blk)
+  0
+}
+
+// How many arm blocks `noteExitArm` recorded, and the `i`th.
+export function exitArmCount(): i32 { exitArmBlocks.length }
+export function exitArmBlockAt(i: i32): i32 {
+  if i < 0 || i >= exitArmBlocks.length { return -1 }
+  exitArmBlocks[i]
+}
+
 // The tail statement a labelled block at `ix` ends with as its value, or -1.
 export function loopValTailOf(ix: i32): i32 { lpColAt(lpValTail, ix) }
 
@@ -61346,7 +61439,7 @@ function discardedTailTy(ix: i32, ty: i32): i32 {
 function markValDiscard(ix: i32) {
   if ix < 0 || ix >= P.nodes.length { return 0 }
   const n = P.nodes[ix]
-  if n is IfStmt || n is Block { valDiscardAt[ix] = true }
+  if n is IfStmt || n is Block || n is MatchExpr { valDiscardAt[ix] = true }
   if lpOn && (n is WhileStmt || n is ForRange || n is ForIn) {
     valDiscardAt[ix] = true
   }
@@ -61401,7 +61494,10 @@ function checkBlockNode(n: Block, ix: i32) {
       markValDiscard(stmts[i])
     }
     crStmtEnter(stmts[i])
+    const blkSpine = spinePos
+    if i < stmts.length - 1 { spinePos = false }
     const sty = checkNode(stmts[i])
+    spinePos = blkSpine
     crStmtLeave()
     brkPrevTy = sty
     if i == stmts.length - 1 {

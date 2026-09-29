@@ -1495,6 +1495,24 @@ function parseOneArg(args: i32[], names: string[]) {
   } else {
     names.push("")
   }
+  // `f(B: { stmts })`: a named argument's value cannot be a block, so this is a labelled block
+  // written bare. Refused with the spelling that reads it as one, and parsed as that.
+  if named && peekKind() == "LBRACE" && braceOpensStmt(P.pos) {
+    const bl = names.pop() ?? ""
+    names.push("")
+    P.diags.push(
+      {
+        msg: "a labelled block as an argument needs parentheses: `f(("
+          + bl
+          + ": { … }))`, since `f("
+          + bl
+          + ": …)` names an argument",
+        at: P.pos,
+      },
+    )
+    args.push(parseLabelBlock(bl, peekTok().start))
+    return 0
+  }
   if named && peekKind() == "ELLIPSIS" {
     P.diags.push(
       {
@@ -3704,6 +3722,16 @@ function lblPop() {
   0
 }
 
+// Whether a loop, not only a labelled block, encloses the cursor in this function.
+function lblHasLoop(): boolean {
+  let i = 0
+  while i < lblIsBlk.length {
+    if !lblIsBlk[i] { return true }
+    i = i + 1
+  }
+  false
+}
+
 // The innermost enclosing label spelled `name`: 1 for a labelled block, 0 for a loop, -1 when
 // no enclosing loop or block carries it.
 function lblKindOf(name: string): i32 {
@@ -3819,6 +3847,15 @@ function parseFor(label: string) {
 function parseBreak() {
   const p0 = peekTok().start // the `break` keyword
   const kw = advance()       // "break"
+  // A function body starts the stack afresh, so a `break` in a lambda inside a loop is here too.
+  if lblNames.length == 0 {
+    P.diags.push(
+      {
+        msg: "`break` is not inside a loop or labelled block of this function",
+        at: P.pos - 1,
+      },
+    )
+  }
   const label = parseJumpLabel("break")
   let hasVal = 0
   if !stmtEndAt(P.pos) {
@@ -3833,6 +3870,11 @@ function parseBreak() {
 function parseContinue() {
   const p0 = peekTok().start // the `continue` keyword
   const kw = advance()       // "continue"
+  if !lblHasLoop() {
+    P.diags.push(
+      { msg: "`continue` is not inside a loop of this function", at: P.pos - 1 },
+    )
+  }
   const lblAt = P.pos + 1
   const label = parseJumpLabel("continue")
   if label != "" && lblKindOf(label) == 1 {
@@ -3970,6 +4012,14 @@ export function isStmtKeyword(kind: TokKind) {
     || kind == "CONTINUE"
     || kind == "TYPE"
     || kind == "FUNCTION"
+}
+
+// Whether the `{` at `bracePos` opens with a statement keyword, so it is a block and never an
+// object literal. Narrower than `looksLikeObject`, which reads a bare `{ x }` as a block too.
+function braceOpensStmt(bracePos: i32): boolean {
+  let i = bracePos + 1
+  while kindAt(i) == "NEWLINE" { i = i + 1 }
+  isStmtKeyword(kindAt(i))
 }
 
 // The keywords a statement label may precede (`name: while …`, `name: for …`).
