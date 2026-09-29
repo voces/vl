@@ -849,7 +849,7 @@ function monoNarrowedPinName(ax: i32, wide: string) {
   // reaches the membership test looking like a match on both sides, and the pin then
   // drops from the interned atom to a string ref. `tyRenderSoftensLits` is the home for
   // that hazard, and a litunion argument's pin is claimed by the litunion rungs anyway.
-  if tyRenderSoftensLits(nt) { return "" }
+  if tyRenderSoftensLits(nt) { return monoNarrowedLitPinName(nt, wide) }
   const n = tyToEmitName(nt)
   if monoNameNarrowsFrom(n, wide) || monoNicheNarrowsFrom(n, wide) {
     if monoAnnPinName(n) == n { return n }
@@ -860,10 +860,39 @@ function monoNarrowedPinName(ax: i32, wide: string) {
   // while a union carries its arms' declared names, so the test missed on the SPELLING and
   // not on the type. This is the equality the variant tables are built under (D1754).
   const nom = nominalStructNameOfTy(nt)
-  if nom == "" { return "" }
+  if nom == "" { return monoNarrowedNulRecPinName(nt, n, wide) }
   if !monoNameNarrowsFrom(nom, wide) { return "" }
   if monoAnnPinName(nom) != nom { return "" }
   nom
+}
+
+// The narrowed pin of a nullable record (`Circle | null` out of `Circle | string | null`): its
+// render `n`, when the record's nominal name and `null` are both arms of `wide`, which the
+// whole-spelling membership test above cannot see (D3099). "" otherwise.
+function monoNarrowedNulRecPinName(nt: i32, n: string, wide: string): string {
+  if nt < 0 { return "" }
+  const t = T.tys[nt]
+  if t is TyNullable {
+    const inom = nominalStructNameOfTy(t.nInner)
+    if inom == "" { return "" }
+    // `wide` already `Circle | null` is no wider: the ladder's answer stands.
+    if nullablePartOf(wide) == inom { return "" }
+    if !monoNameNarrowsFrom(inom, wide) { return "" }
+    if !monoNameNarrowsFrom("null", wide) { return "" }
+    if monoAnnPinName(n) == n { return n }
+  }
+  ""
+}
+
+// The narrowed pin of a literal-union argument: its alias, when that alias is a member of the
+// union `wide` the ladder chose, so `T` pins at the atom the checker typed the argument at,
+// not at the box that holds it (D3098). "" otherwise.
+function monoNarrowedLitPinName(nt: i32, wide: string): string {
+  const kn = litUnionAliasNameOfTy(nt)
+  if kn == "" { return "" }
+  if !monoNameNarrowsFrom(kn, wide) { return "" }
+  if monoAnnPinName(kn) != kn { return "" }
+  kn
 }
 
 // The union name a pin can carry for the node at `ix`, or "". The render, then the
@@ -952,6 +981,32 @@ function monoCapturedDestListPin(name: string, fnIx: i32): string {
       const li = parentLetOf(fn.fnBody, name)
       if li >= 0 { return monoDestListPinName(li, fx) }
       if paramIndexOf(fx, name) >= 0 { return "" }
+    }
+    steps = steps + 1
+  }
+  ""
+}
+
+// The annotation pin of the enclosing frame's PARAMETER a closure at `fnIx` captures as `name`,
+// or "" once a frame binds it as a local. A lambda lifted out of an instance reads its capture
+// at the instance's substituted annotation, as a direct call in the instance's body does (D3063).
+function monoCapturedParamPin(name: string, fnIx: i32): string {
+  let pp = fnStmtsPosOf(fnIx)
+  let steps = 0
+  while pp >= 0 && pp < fnParent.length && steps < 64 {
+    pp = fnParent[pp]
+    if pp < 0 || pp >= fnStmts.length { return "" }
+    const fx = fnStmts[pp]
+    const fn = P.nodes[fx]
+    if fn is FuncDecl {
+      if parentLetOf(fn.fnBody, name) >= 0 { return "" }
+      if paramIndexOf(fx, name) >= 0 {
+        const ptn = paramTypeNode(fx, name)
+        if ptn < 0 { return "" }
+        const pt = P.nodes[ptn]
+        if pt is TypeRef { return monoAnnPinName(pt.tyName) }
+        return ""
+      }
     }
     steps = steps + 1
   }
@@ -1222,6 +1277,8 @@ export function monoArgTyName(ix: i32, fnIx: i32) {
         if li < 0 && paramIndexOf(fnIx, argN.identName) < 0 {
           const cdp = monoCapturedDestListPin(argN.identName, fnIx)
           if cdp != "" { return cdp }
+          const cpp = monoCapturedParamPin(argN.identName, fnIx)
+          if cpp != "" { return cpp }
         }
       }
       // A struct-typed param argument (`g(v)` inside a generic body where `v: P`): same as
@@ -2897,11 +2954,16 @@ function monoLamParamPinAnn(
 }
 
 // The annotation spelling of a pinned lambda type `t`: a list by `monoListSpelling`, which names
-// a nullable record element by its row; any other type as `tyToEmitName` renders it.
+// a nullable record element by its row; a literal union by its alias, which a render softens to
+// `string` (D3098); any other type as `tyToEmitName` renders it.
 function monoPinAnnSpelling(t: i32): string {
   // A record bound apart from its row by a function field's type is still spelled by the row.
   const tw = monoFnFieldTwinRow.get(t) ?? ""
   if tw != "" { return tw }
+  if tyIsLitUnion(t) {
+    const ln = litUnionAliasNameOfTy(t)
+    if ln != "" && monoAnnPinName(ln) == ln { return ln }
+  }
   const nm = tyToEmitName(t)
   if nm != "" && t >= 0 && t < T.tys.length && T.tys[t] is TyArray {
     return monoListSpelling(nm, t)

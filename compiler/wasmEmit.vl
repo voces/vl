@@ -660,6 +660,7 @@ import {
   wULEB,
 } from "./emit_bytes"
 import {
+  NICHE_NUL_LIT,
   TY_WALK_DEPTH,
   annRowOfNode,
   annValtypeSlotOf,
@@ -885,6 +886,7 @@ import {
   letInfStrListByUseV,
   letInfersF32,
   letInitTyIsNarrowedArm,
+  letInitTyIsNarrowedNulArm,
   letIsF64,
   letIsI64,
   letIsMap,
@@ -966,6 +968,7 @@ import {
   narrowVariantFor,
   narrowedMapOf,
   narrowedMapOfPlace,
+  narrowedNulLitBoxKey,
   narrowedNulStructArm,
   narrowedRefArrayOf,
   narrowedRefArrayOfPlace,
@@ -979,6 +982,7 @@ import {
   nonNulBaseOf,
   nulFieldInnerCode,
   nulLitAtomTexts,
+  nulLitMemberTexts,
   nulMapShapeOf,
   nulNicheBoxSlot,
   nulNicheCastWiredTy,
@@ -4231,6 +4235,27 @@ function emitNarrowedNicheRead(
   fbStructGet(uBoxIdx, 0) // field 0: the tag
   fbI32Const(nullBoxTag())
   fbI32Bin(70) // 0x46 i32.eq
+  if ak == NICHE_NUL_LIT {
+    const texts = nulLitMemberTexts(nodeTyIxOf(unwrapParen(exprIx)))
+    if texts.length == 0 {
+      return emitFail(
+        "emitProgram: nullable literal-union read with no members",
+      )
+    }
+    fbIf(127) // 0x04 if, 0x7f i32 result blocktype
+    fbI32Const(0 - 1) // the null sentinel
+    fbElse()
+    const savedLU = pendingLitUnion
+    const savedNLU = pendingNulLitUnion
+    pendingLitUnion = 0
+    pendingNulLitUnion = false
+    const rc3 = emitStashedStrToAtomChain(body, st, texts, 0, fnIx)
+    pendingLitUnion = savedLU
+    pendingNulLitUnion = savedNLU
+    if rc3 < 0 { return -1 }
+    fbEnd()
+    return 0
+  }
   if ak == 1 {
     fbIf(127) // 0x04 if, 0x7f i32 result blocktype
     fbI32Const(2) // the null sentinel
@@ -5573,13 +5598,14 @@ function narrowedArmNeedsUnbox(exprIx: i32, fnIx: i32): boolean {
 // stack. A negative `heapIdx` emits nothing: a destination whose table slot never resolved has
 // no cast target, and `ref.cast -1` would put a garbage heap index in the module.
 function emitNarrowedArmUnboxTo(heapIdx: i32, exprIx: i32) {
+  emitArmUnboxCast(heapIdx, narrowedNulStructArm(exprIx))
+}
+
+// That unbox with its nullability given, for a destination that knows it is a niche.
+function emitArmUnboxCast(heapIdx: i32, nullable: boolean) {
   if heapIdx < 0 { return 0 }
   fbStructGet(uBoxIdx, 1) // 0xfb 0x02 <box ht> field 1: value (anyref)
-  if narrowedNulStructArm(exprIx) {
-    fbRefCastNull(heapIdx)
-  } else {
-    fbRefCast(heapIdx)
-  }
+  if nullable { fbRefCastNull(heapIdx) } else { fbRefCast(heapIdx) }
   0
 }
 
@@ -14925,6 +14951,13 @@ export function emitExpr(body: u8[], exprIx: i32, fnIx: i32) {
       return emitStrToAtom(body, wideIx, fnIx)
     }
   }
+  // …and a `K | null` read out of a wider box, reaching the atom niche (D3118).
+  if pendingNulLitUnion {
+    const nlk = narrowedNulLitBoxKey(exprIx, fnIx)
+    if nlk != "" {
+      return emitNarrowedNicheRead(body, exprIx, nlk, NICHE_NUL_LIT, fnIx)
+    }
+  }
   const e = P.nodes[exprIx]
   if e is NumLit { return emitNumLitNode(body, e, exprIx, fnIx) }
   if e is BoolLit {
@@ -23553,6 +23586,7 @@ function emitLetDeclStmt(body: u8[], s: LetDecl, stmtIx: i32, fnIx: i32) {
   // own question, so a cell typed at the arm cannot be reached without its unbox.
   const letArmOwed = narrowedArmNeedsUnbox(s.letInit, fnIx)
     || letInitTyIsNarrowedArm(stmtIx, fnIx)
+    || letInitTyIsNarrowedNulArm(stmtIx, fnIx)
   // An empty `[]` initializer over a ref-array annotation (`let xs: T[] = []`) needs
   // the element kind to pick the ref-list construction — record it for `emitArr`. An
   // un-annotated one takes its destination's instead (D381), and `letRefListSlot` is the
@@ -23785,6 +23819,10 @@ function emitLetDeclStmt(body: u8[], s: LetDecl, stmtIx: i32, fnIx: i32) {
         pendingLitUnion = 1
         pendingNulLitUnion = true
       }
+    } else if narrowedNulLitBoxKey(s.letInit, fnIx) != "" {
+      // The un-annotated twin: the niche cell `letNulLitUnion` gave it converts the box (D3118).
+      pendingLitUnion = 1
+      pendingNulLitUnion = true
     }
     const savedNulList = pendingNulList
     if letNulList15 { pendingNulList = true }
@@ -23842,7 +23880,12 @@ function emitLetDeclStmt(body: u8[], s: LetDecl, stmtIx: i32, fnIx: i32) {
   // moves the narrowing stack.
   if letArmOwed {
     const letArmHeap = armDestHeapOf(localIsRef[slot], localStructIdx[slot])
-    if letArmHeap >= 0 { emitNarrowedArmUnboxTo(letArmHeap, s.letInit) }
+    if letArmHeap >= 0 {
+      emitArmUnboxCast(
+        letArmHeap,
+        narrowedNulStructArm(s.letInit) || localIsRef[slot] == "nulvariant",
+      )
+    }
   }
   // the nullable-niche recover at the BINDING boundary (D1115) — `const z: i32[] = y` under
   // `if y != null`. The cell's own kind is the destination, exactly as the two widen sites
@@ -26850,6 +26893,29 @@ function emitStrToAtom(body: u8[], ix: i32, fnIx: i32) {
   const r = emitStrToAtomChain(body, ix, texts, 0, fnIx)
   pendingLitUnion = savedLU
   r
+}
+
+// The `select` tower over a box parked in `st` whose payload is the member's string: member
+// `i`'s interned id if the payload string-equals member `i`, the last member the default.
+function emitStashedStrToAtomChain(
+  body: u8[],
+  st: i32,
+  texts: string[],
+  i: i32,
+  fnIx: i32,
+) {
+  if i >= texts.length - 1 {
+    fbI32Const(internAtom(quoteLex(texts[i])))
+    return 0
+  }
+  fbI32Const(internAtom(quoteLex(texts[i])))
+  if emitStashedStrToAtomChain(body, st, texts, i + 1, fnIx) < 0 { return -1 }
+  fbLocalGet(st)
+  fbStructGet(uBoxIdx, 1) // 0xfb 0x02 <box ht> field 1: value (anyref)
+  fbRefCast(sTypeIdx)
+  if emitStrEqLit(body, mkStr(quoteLex(texts[i]), -1), fnIx) < 0 { return -1 }
+  fbSelect() // 0x1b select — val1 if cond else val2 (both i32)
+  0
 }
 
 // The `select` tower for `emitStrToAtom`: member `i`'s interned id if the value string-equals
