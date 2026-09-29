@@ -78,6 +78,7 @@ import {
   nodeHasWideStrLit,
   nodeLitMembersWithin,
   nodeNumScalarBaseName,
+  nodeTyHasTyVar,
   nodeTyIntWidth,
   nodeTyIsLitUnion,
   nodeTyIsLitUnionAlias,
@@ -730,7 +731,9 @@ import {
   coalesceDefaultNullable,
   coalesceLitUnionFits,
   coalesceNicheJoinsToBox,
+  coalesceNulAtomToStr,
   coalesceNulRefNicheOperand,
+  coalesceOperandPinNonNull,
   coalesceResultUnionName,
   criFnIsAnonLambda,
   currentNarrowSetAt,
@@ -817,6 +820,7 @@ import {
   fnAssignRetKind,
   fnEnvIdxOf,
   fnHasUnannotatedParam,
+  fnInPinnedInstance,
   fnIndexOf,
   fnIndexOfInScopeSid,
   fnIndexOfSid,
@@ -981,6 +985,7 @@ import {
   nliNameOf,
   nodeMixedUnionName,
   nonNulBaseOf,
+  nulAtomWidenTexts,
   nulFieldInnerCode,
   nulLitAtomTexts,
   nulLitMemberTexts,
@@ -5028,6 +5033,12 @@ export function emitUnionCoerce(
   // is the reservation scan, not this emit: `emitAtomToStr` stashes the id in the per-function
   // string-op scratch frame, whose reservation predicates key on `unionTakesAtomAsStr`.
   if unionTakesAtomAsStr(unionName) && exprIsLitAtom(exprIx, fnIx) {
+    // A `K | null` value's `-1` has no string to box under the string tag (D3140).
+    if nulAtomWidenTexts(exprIx).length > 0 {
+      return emitFail(
+        "emitProgram: literal-union string widening with no members",
+      )
+    }
     fbI32Const(scalarTagOfKind(2)) // the string tag — kind 2 rides the anyref directly
     if emitAtomToStr(body, exprIx, fnIx) < 0 { return -1 }
     fbStructNew(uBoxIdx) // { tag, member-string ref }
@@ -19319,6 +19330,12 @@ function emitCallRef(body: u8[], callIx: i32, fnIx: i32) {
 function emitAssign(body: u8[], binIx: i32, fnIx: i32) {
   const a = P.nodes[binIx]
   if a is BinExpr {
+    // A map cell's `null` is a miss, which no write narrows, so only other places refuse.
+    nulWidenWriteRhs = -1
+    const nwTgt = P.nodes[unwrapParen(a.binLeft)]
+    if !(nwTgt is Index) || !exprMap(nwTgt.idxArr, fnIx) {
+      nulWidenWriteRhs = unwrapParen(a.binRight)
+    }
     // the target is read through `unwrapParen`, exactly as the RHS already is (D1089):
     // `(x) = 5` is check-clean, so a `Paren` LHS matching none of the Ident/Index/Member
     // arms reached the floor with the wrong message. Peeling here is one change for all
@@ -19388,10 +19405,12 @@ function emitAssign(body: u8[], binIx: i32, fnIx: i32) {
             // are mutually exclusive over an Ident target, so neither steals the other's cell.
             if emitExprAsF32(body, a.binRight, fnIx) < 0 { return -1 }
           } else if (
-            exprString(lhsIx, fnIx)
+            (gaKind == "str" || gaKind == "nulstr")
+            && exprString(lhsIx, fnIx)
             && exprIsLitAtom(a.binRight, fnIx)
           ) {
             // A literal-union atom assigned to a `string` global widens to its member string.
+            // A cell laid out as the atom itself takes the atom as it is (D3198).
             if emitAtomToStr(body, a.binRight, fnIx) < 0 { return -1 }
           } else if gaKind == "nulnone" {
             // D1576 — the module-global twin of the local arm's `nulnone` store: a
@@ -22950,7 +22969,9 @@ function emitReturnValue(body: u8[], retArg: i32, fnIx: i32) {
   let retStrWiden = false
   let retUNm = ""
   let retVi = -1
+  let retInferred = false
   if fn is FuncDecl {
+    retInferred = fn.fnRet < 0
     // A concrete-variant return (annotated `: Cat`, or a collapsed inferred lambda).
     if retVariantFlag(fn.fnRet) == 1 {
       retVi = variantIndexOf(tyNameOf(fn.fnRet))
@@ -23131,6 +23152,14 @@ function emitReturnValue(body: u8[], retArg: i32, fnIx: i32) {
     if emitUnionBoxArg(body, retUNm, retArg, fnIx) < 0 { return -1 }
   } else if retStrWiden {
     // A literal-union atom returned from a `string`-typed function widens to its member string.
+    // A `K | null` value needs a result that holds `null`, which an inferred one does not
+    // declare here (D3198).
+    if !retNulString && retInferred && nulAtomWidenTexts(retArg).length > 0 {
+      return emitFailAt(
+        "emitProgram: an inferred return of a nullable literal union has no string result to widen into",
+        retArg,
+      )
+    }
     if emitAtomToStr(body, retArg, fnIx) < 0 { return -1 }
   } else {
     const retCtx = expCtxHere()
@@ -26825,6 +26854,10 @@ export function emitAtomToStr(body: u8[], atomIx: i32, fnIx: i32) {
   // members, the DECLARATION fallback for an operand whose recorded type is the GENERIC's,
   // then the bare one-member set. Two consumers ask the same question and both need every
   // rung — the classifier decides WHETHER to widen, this one needs the members to widen WITH.
+  const nulTexts = nulAtomWidenTexts(atomIx)
+  if nulTexts.length > 0 {
+    return emitNulAtomToStr(body, atomIx, nulTexts, fnIx)
+  }
   const texts = litAtomWidenTexts(atomIx, fnIx)
   if texts.length == 0 {
     return emitFail(
@@ -26839,6 +26872,39 @@ export function emitAtomToStr(body: u8[], atomIx: i32, fnIx: i32) {
   if emitStashAtomId(body, atomIx, fnIx) < 0 { return -1 }
   const r = emitAtomToStrChain(body, texts, 0)
   r
+}
+
+// The right-hand side of the assignment being lowered, which `emitNulAtomToStr` refuses to
+// widen when it is typed at a type parameter or lowered in an instance: the checker narrowed the
+// place to non-null after the write and folded its null tests, which a `-1` would make wrong.
+let nulWidenWriteRhs = -1
+
+// Widen a `K | null` atom to a `string | null`: `-1` is `ref.null`, any other id takes the
+// member tower. The id is evaluated once (D3198).
+function emitNulAtomToStr(body: u8[], atomIx: i32, texts: string[], fnIx: i32) {
+  if (
+    unwrapParen(atomIx) == nulWidenWriteRhs
+    && (nodeTyHasTyVar(unwrapParen(atomIx)) || fnInPinnedInstance(fnIx))
+  ) {
+    return emitFail(
+      "emitProgram: literal-union string widening with no members",
+    )
+  }
+  if !aUsed {
+    return emitFail(
+      "emitProgram: literal-union string widening but array type not collected",
+    )
+  }
+  if emitStashAtomId(body, atomIx, fnIx) < 0 { return -1 }
+  pushStrScrI(body, 0)
+  fbI32Const(-1)
+  fbI32Bin(70) // 0x46 i32.eq → null?
+  fbIfRefNul(sTypeIdx, true)
+  fbRefNull(sTypeIdx)
+  fbElse()
+  if emitAtomToStrChain(body, texts, 0) < 0 { return -1 }
+  fbEnd()
+  0
 }
 
 // Evaluate an atom-repped literal-union value once and stash its interned i32 id in the
@@ -29608,6 +29674,34 @@ function emitCoalesceNulBoolJoin(
   0
 }
 
+// `k ?? d` at a `string` result over the `K | null` atom niche: `-1` takes the default as a
+// string, any other id widens through the member tower `emitAtomToStr` uses.
+function emitCoalesceNulAtomStr(body: u8[], e: BinExpr, fnIx: i32) {
+  const texts = nulLitAtomTexts(e.binLeft, fnIx)
+  if texts.length == 0 || !aUsed {
+    return emitFail(
+      "emitProgram: `??` over a nullable literal union has no member strings",
+    )
+  }
+  const slot = widenTmpSlot(4001)
+  if emitExpr(body, e.binLeft, fnIx) < 0 { return -1 }
+  fbLocalTee(slot)
+  fbI32Const(-1)
+  fbI32Bin(70) // 0x46 i32.eq → null?
+  fbIfRef(sTypeIdx)
+  if exprIsLitAtom(e.binRight, fnIx) {
+    if emitAtomToStr(body, e.binRight, fnIx) < 0 { return -1 }
+  } else {
+    if emitExpr(body, e.binRight, fnIx) < 0 { return -1 }
+  }
+  fbElse() // present → the id's member string
+  fbLocalGet(slot)
+  setStrScrI(body, 0)
+  if emitAtomToStrChain(body, texts, 0) < 0 { return -1 }
+  fbEnd()
+  0
+}
+
 // The `br_on_non_null` core every nullable-ref-niche `??` shares, with both contexts and the
 // block's null-ness spelled out by the caller. `heapIx` is the cell's own heap type,
 // `nulBlock` whether the result may still be null, `lhsCtx` the context the one lhs evaluation
@@ -29920,6 +30014,9 @@ function emitCoalesceGo(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
     if emitNulNoneForEffect(body, lhsIx, fnIx) < 0 { return -1 }
     return emitExpr(body, e.binRight, fnIx)
   }
+  if coalesceOperandPinNonNull(exprIx, fnIx) {
+    return emitExpr(body, lhsIx, fnIx)
+  }
   // A read the narrowing pins to `null` may have been written since the test (a loop, a
   // closure, a call), so the narrowing is lifted and the box tested at run time (D2801).
   const cnKey = narrowedToNullKey(lhsIx)
@@ -30073,6 +30170,11 @@ function emitCoalesceGo(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
     }
     fbEnd() // 0x0b end
     return 0
+  }
+  // `<e> ?? d` over a `K | null` niche whose default is not a member: the result is a
+  // `string`, so the atom is evaluated once and the present arm widens it (D3198).
+  if coalesceNulAtomToStr(exprIx, fnIx) {
+    return emitCoalesceNulAtomStr(body, e, fnIx)
   }
   // `<e> ?? d` over a nullable collection niche (`i32[] | null`, `string[] | null` /
   // `f64[] | null` / `i64[] | null` / `f32[] | null`, `i32[][] | null` / `S[] | null`): the
