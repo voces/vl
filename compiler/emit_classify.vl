@@ -8833,8 +8833,9 @@ export function globalInitIsLitAtom(initIx: i32) {
   if e is Ident {
     const gli = globalLetOf(e.identName)
     if gli >= 0 {
-      const r = letIsLitUnion(gli)
-      return r
+      if letIsLitUnion(gli) { return true }
+      // A `K | null` niche global widens too, its `-1` to `null` (D3198).
+      return exprNulLitUnion(initIx, -1)
     }
   }
   // A call returning a litunion alias is the other atom form a module-global initializer can
@@ -9821,6 +9822,9 @@ export function exprHasStrOp(exprIx: i32, fnIx: i32) {
     // An assignment of a literal-union atom into a `string` target widens, which stages the
     // atom id in the string-op scratch frame.
     if assignWidensAtomToStr(exprIx, fnIx) { return true }
+    if gLitUnionUsed != 0 && e.binOp == "??" {
+      if coalesceNulAtomToStr(exprIx, fnIx) { return true }
+    }
     if exprHasStrOp(e.binLeft, fnIx) { return true }
     return exprHasStrOp(e.binRight, fnIx)
   }
@@ -16860,6 +16864,16 @@ function anonLeafArrBindingLitOf(ix: i32, fnIx: i32): i32 {
   -1
 }
 
+// Whether the callee node `fnNode` is typed as a function whose result is a nullable literal
+// union.
+function calleeRetIsNulLitUnion(fnNode: i32): boolean {
+  const ft = nodeTyIxOf(fnNode)
+  if ft < 0 || ft >= T.tys.length { return false }
+  const t = T.tys[ft]
+  if t is TyFunc { return tyIsNullableLitUnion(t.fnRet) }
+  false
+}
+
 // The callee's interned `$fnsig` KEY for a value call (`f(x)`, `(o.field)(x)`, `fs[i](x)`), or "" —
 // the param tokens drive argument coercion and the key resolves the functype the `call_ref` casts to.
 export function cloCallSigKey(callIx: i32, fnIx: i32) {
@@ -16875,11 +16889,14 @@ export function cloCallSigKey(callIx: i32, fnIx: i32) {
     if cre is Ident {
       const k = calleeCloSigKeyAt(sidOfNode(cfx), fnIx, cfx)
       if k != "" {
-        // The interned-divergence override: the syntactic resolvers are name-shaped, and a
-        // name cannot always answer what a type can — a litunion whose spelling softened keys
-        // the wrong box. Only overrides when the name key is un-interned and the arena key is
-        // interned, so every call whose historic key names a real `$fnsig` keeps it.
-        if cloSigPosOfKey(k) < 0 {
+        // The interned-divergence override: a name-shaped key cannot always answer what a type
+        // can. It fires when the name key is un-interned, or when the result is a nullable
+        // literal union, whose two-alias spelling renders `string | null` (D3208); every other
+        // call whose historic key names a real `$fnsig` keeps it.
+        if (
+          cloSigPosOfKey(k) < 0
+          || (gLitUnionUsed != 0 && calleeRetIsNulLitUnion(c.callFn))
+        ) {
           const ak = sigKeyOfTy(nodeTyIxOf(c.callFn))
           if ak != "" && ak != k {
             if cloSigPosOfKey(ak) >= 0 { return ak }
@@ -19400,6 +19417,50 @@ export function coalesceLitUnionFits(exprIx: i32, fnIx: i32) {
     return coalesceLitUnionDefaultIsAtom(e.binRight, lut, fnIx)
   }
   false
+}
+
+// True when the `??` at `exprIx` joins a `K | null` niche with a default outside `K`, so the
+// checker typed it `string` and the present atom widens to its member string. The
+// reservation scan and the emit arm both ask this (D3198).
+export function coalesceNulAtomToStr(exprIx: i32, fnIx: i32): boolean {
+  const e = P.nodes[unwrapParen(exprIx)]
+  if !(e is BinExpr) { return false }
+  if e.binOp != "??" { return false }
+  if coalesceLitUnionFits(exprIx, fnIx) { return false }
+  if !exprNulLitUnion(e.binLeft, fnIx) { return false }
+  if nulLitAtomTexts(e.binLeft, fnIx).length == 0 { return false }
+  const rt = nodeTyPinIxOf(exprIx)
+  if rt < 0 || rt >= T.tys.length { return false }
+  const r = T.tys[rt]
+  if r is TyPrim { return r.primName == "string" }
+  false
+}
+
+// True when the `??` at `exprIx` sits in a generic body whose operand this instance pins to
+// `string` or `i32` and whose default is of that same type: the `??` is its operand, as the
+// fold makes it at a direct spelling (D3206). Any other pin or default keeps its refusal,
+// since the node's own classifiers read neither the operand's rep nor the join.
+export function coalesceOperandPinNonNull(exprIx: i32, fnIx: i32): boolean {
+  const e = P.nodes[unwrapParen(exprIx)]
+  if !(e is BinExpr) { return false }
+  const d = unwrapParen(e.binRight)
+  if d < 0 { return false }
+  const pn = tyPrimNameOf(coalesceOperandPinTy(unwrapParen(e.binLeft), fnIx))
+  if pn == "string" { return exprString(d, fnIx) }
+  pn == "i32" && tyPrimNameOf(nodeTyIxOf(d)) == "i32"
+}
+
+// The type an instance pins the `??` operand `lhsIx` to, when the generic body records it at
+// a type parameter; -1 otherwise.
+function coalesceOperandPinTy(lhsIx: i32, fnIx: i32): i32 {
+  const h = holeOperandTyOf(lhsIx, fnIx)
+  if h >= 0 { return h }
+  const own = nodeTyIxOf(lhsIx)
+  if own < 0 || own >= T.tys.length { return -1 }
+  if !(T.tys[own] is TyVar) { return -1 }
+  const p = nodeTyPinIxOf(lhsIx)
+  if p == own { return -1 }
+  p
 }
 
 // The list-element rep (2/7/12/20 — see `mvListValKind`) of a bare `m[k]` or `m[k] ?? d`
@@ -28086,6 +28147,12 @@ function holeArrElemPinTyOf(arrIx: i32, fnIx: i32): i32 {
   b
 }
 
+// The member texts of `ix` when its checked type, or an instance's pin of it, is the
+// `K | null` niche: a widening to `string | null` must map `-1` to null, not to a member.
+export function nulAtomWidenTexts(ix: i32): string[] {
+  tyNulLitUnionMemberTexts(nodeTyPinIxOf(ix))
+}
+
 // The member texts to spell atom-repped node `ix` with — one home for the ladder the two
 // widen consumers each wrote out. `exprIsLitAtom` has already decided the value is an atom;
 // an empty answer here is a genuine disagreement, refused loudly. The third rung is the
@@ -28093,6 +28160,10 @@ function holeArrElemPinTyOf(arrIx: i32, fnIx: i32): i32 {
 export function litAtomWidenTexts(ix: i32, fnIx: i32) {
   const direct = nodeLitUnionMemberTexts(ix)
   if direct.length > 0 { return direct }
+  // A generic instance's node records the type parameter; its pin is the member set.
+  const pinTy = nodeTyPinIxOf(ix)
+  const pin = tyLitMemberTexts(pinTy)
+  if pin.length > 0 && !tyIsNulLitUnionNiche(pinTy) { return pin }
   if holeLitReadIsAtom(ix, fnIx, 0) {
     const hole = tyLitMemberTexts(holeOperandTyOf(ix, fnIx))
     if hole.length > 0 { return hole }
@@ -28336,6 +28407,15 @@ export function exprIsLitAtom(exprIx: i32, fnIx: i32) {
     // direct probe answers false for an array it should claim. Without it, a generic
     // returning the atom emitted a string-ref result over a body yielding the i32 atom — silent invalid wasm.
     if arrElemLitUnionTy(e.idxArr, fnIx) >= 0 { return true }
+    // A list whose element is `string` or `string | null` holds refs, whatever a write of a
+    // type parameter narrowed the read to (D3198).
+    const recvTy = nonNullTy(nodeTyPinIxOf(e.idxArr))
+    if recvTy >= 0 && recvTy < T.tys.length {
+      const recvEl = tyArrayElemIx(recvTy)
+      if recvEl >= 0 && tyPrimNameOf(nonNullTy(recvEl)) == "string" {
+        return false
+      }
+    }
     // `m[k]` over a litunion-valued map yields the atom id; without the claim a compare
     // falls to string equality with the raw i32 atom — invalid wasm. Unless the members are
     // numbers, whose values have no member id to widen — a case that needs both families in
@@ -30210,6 +30290,23 @@ function pinnedParamTyAt(exprIx: i32, fnIx: i32, depth: i32): i32 {
   -1
 }
 
+// Whether function `fnIx` is, or is lifted inside, a generic or hole instance: a body the
+// checker typed once at its parameters and the emitter lowers at a pin.
+export function fnInPinnedInstance(fnIx: i32): boolean {
+  if fnIx < 0 { return false }
+  let pos = fnStmtsPosOf(fnIx)
+  let guard = 0
+  while pos >= 0 && guard <= fnStmts.length {
+    if (monoExactSubRow.get(pos) ?? -1) >= 0 { return true }
+    if (monoPinSubRow.get(pos) ?? -1) >= 0 { return true }
+    if (monoHoleSubRow.get(pos) ?? -1) >= 0 { return true }
+    if pos >= fnParent.length { return false }
+    pos = fnParent[pos]
+    guard = guard + 1
+  }
+  false
+}
+
 // The row of `monoExactSubN`/`monoExactSubT` binding the type parameters of the instance that
 // function `fnIx` is, or is lifted inside; -1 when that instance is shared between pins.
 export function monoExactSubRowOf(fnIx: i32): i32 {
@@ -30410,7 +30507,9 @@ function holeLitReadIsAtom(exprIx: i32, fnIx: i32, depth: i32): boolean {
     if li < 0 { return false }
     const d = P.nodes[li]
     if !(d is LetDecl) { return false }
-    if d.letType >= 0 { return true }
+    // An annotation with no type parameter fixes the cell's rep, whatever a write narrowed
+    // the read to (D3198).
+    if d.letType >= 0 { return tyHasTyVar(nodeTyIxOf(d.letType)) }
     return holeLitReadIsAtom(d.letInit, fnIx, depth + 1)
   }
   !nodeIsValueJoin(ix)
@@ -44008,6 +44107,10 @@ export function exprString(exprIx: i32, fnIx: i32) {
     // recovers the non-null array ref, so `.length`/`+`/etc. on the result work.
     if e.binOp == "??" {
       if exprNullableString(e.binLeft, fnIx) { return true }
+      if coalesceNulAtomToStr(exprIx, fnIx) { return true }
+      if coalesceOperandPinNonNull(exprIx, fnIx) {
+        return exprString(e.binLeft, fnIx)
+      }
       // …and over a `null`-typed LHS the value is the default, at the default's rep (D1576).
       const cnnS = coalesceNulNoneDefaultIx(exprIx, fnIx)
       if cnnS >= 0 { return exprString(cnnS, fnIx) }
