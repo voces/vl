@@ -5379,6 +5379,12 @@ struct ModuleScan {
     /// Per type index: the concrete struct types a function type's parameters name, or
     /// `None` for a type that is not a function type.
     param_structs: Vec<Option<Vec<u32>>>,
+    /// Per type index: the concrete struct types a function type's results name, or `None`
+    /// for a type that is not a function type.
+    result_structs: Vec<Option<Vec<u32>>>,
+    /// Struct types of at most `ESCAPE_RECORD_MAX_FIELDS` fields, each a number or a reference
+    /// to a struct type: the small records a producer's result is inlined for.
+    small_records: std::collections::HashSet<u32>,
     /// Struct types that are declared as a subtype, or named by one.
     subtyped: std::collections::HashSet<u32>,
     /// Types some struct field, array element, global or table can hold.
@@ -5418,12 +5424,19 @@ impl ModuleScan {
             names: Default::default(),
             func_types: Vec::new(),
             param_structs: Vec::new(),
+            result_structs: Vec::new(),
+            small_records: Default::default(),
             subtyped: Default::default(),
             heap_held: Default::default(),
         };
         // Per type index: is it a struct type.
         let mut is_struct: Vec<bool> = Vec::new();
         let mut func_params: Vec<Option<Vec<u32>>> = Vec::new();
+        let mut func_results: Vec<Option<Vec<u32>>> = Vec::new();
+        // Per struct type: its fields as `Some(referenced type)` or `None` for a number, or
+        // no entry when some field is neither.
+        let mut record_fields: std::collections::HashMap<u32, Vec<Option<u32>>> =
+            Default::default();
         for payload in Parser::new(0).parse_all(bytes) {
             match payload.ok()? {
                 Payload::TypeSection(r) => {
@@ -5438,15 +5451,37 @@ impl ModuleScan {
                                 CompositeInnerType::Struct(st) => {
                                     is_struct.push(true);
                                     func_params.push(None);
+                                    func_results.push(None);
+                                    let mut fields = Some(Vec::new());
                                     for f in st.fields.iter() {
-                                        if let StorageType::Val(v) = f.element_type {
-                                            s.heap_held.extend(concrete(&v));
+                                        let field = match f.element_type {
+                                            StorageType::Val(v) => {
+                                                s.heap_held.extend(concrete(&v));
+                                                match v {
+                                                    ValType::I32
+                                                    | ValType::I64
+                                                    | ValType::F32
+                                                    | ValType::F64 => Some(None),
+                                                    _ => concrete(&v).map(Some),
+                                                }
+                                            }
+                                            _ => None,
+                                        };
+                                        match (field, fields.as_mut()) {
+                                            (Some(f), Some(all)) => all.push(f),
+                                            _ => fields = None,
                                         }
+                                    }
+                                    if let Some(all) =
+                                        fields.filter(|a| a.len() <= ESCAPE_RECORD_MAX_FIELDS)
+                                    {
+                                        record_fields.insert(ix, all);
                                     }
                                 }
                                 CompositeInnerType::Array(at) => {
                                     is_struct.push(false);
                                     func_params.push(None);
+                                    func_results.push(None);
                                     if let StorageType::Val(v) = at.0.element_type {
                                         s.heap_held.extend(concrete(&v));
                                     }
@@ -5456,10 +5491,14 @@ impl ModuleScan {
                                     func_params.push(Some(
                                         ft.params().iter().filter_map(concrete).collect(),
                                     ));
+                                    func_results.push(Some(
+                                        ft.results().iter().filter_map(concrete).collect(),
+                                    ));
                                 }
                                 CompositeInnerType::Cont(_) => {
                                     is_struct.push(false);
                                     func_params.push(None);
+                                    func_results.push(None);
                                 }
                             }
                         }
@@ -5584,16 +5623,27 @@ impl ModuleScan {
                 _ => {}
             }
         }
-        // Only struct types are candidates for a parameter's allocation; keep those.
-        s.param_structs = func_params
-            .into_iter()
-            .map(|p| {
-                p.map(|v| {
-                    v.into_iter()
-                        .filter(|&t| is_struct.get(t as usize) == Some(&true))
-                        .collect()
+        // Only struct types are candidates for a parameter's or a result's allocation.
+        let structs_only = |all: Vec<Option<Vec<u32>>>| -> Vec<Option<Vec<u32>>> {
+            all.into_iter()
+                .map(|p| {
+                    p.map(|v| {
+                        v.into_iter()
+                            .filter(|&t| is_struct.get(t as usize) == Some(&true))
+                            .collect()
+                    })
                 })
+                .collect()
+        };
+        s.param_structs = structs_only(func_params);
+        s.result_structs = structs_only(func_results);
+        s.small_records = record_fields
+            .iter()
+            .filter(|(_, fs)| {
+                fs.iter()
+                    .all(|r| r.is_none_or(|t| is_struct.get(t as usize) == Some(&true)))
             })
+            .map(|(&t, _)| t)
             .collect();
         Some(s)
     }
@@ -5798,6 +5848,10 @@ fn run_once_hot_callees(s: &ModuleScan) -> Vec<String> {
 /// the heap (`escape_inline_choice`). It bounds the code a call site can grow by.
 const ESCAPE_INLINE_MAX_BYTES: usize = 320;
 
+/// A record a producer's result is inlined for has at most this many fields; the owner's
+/// ruling (B) on small record results names the size.
+const ESCAPE_RECORD_MAX_FIELDS: usize = 8;
+
 /// A chosen callee's body with every chosen callee of its own inlined may be at most this
 /// many bytes, so a chain of helpers cannot multiply out.
 const ESCAPE_INLINE_EXPANDED_BYTES: usize = 4096;
@@ -5848,92 +5902,148 @@ fn rung_passes<'a>(passes: &[&'a str], names: bool) -> Vec<&'a str> {
 /// (`ESCAPE_INLINE_MAX_BYTES`), in no call cycle (inlining a cycle unrolls it and the struct
 /// stays live anyway), neither run-once code nor called from it (lane L8), and hands the
 /// struct type to no function that is not chosen (the struct would escape there anyway).
-/// Chains are bounded by `ESCAPE_INLINE_EXPANDED_BYTES` and the whole step by
-/// `ESCAPE_INLINE_GROWTH_FLOOR`. Which allocations actually stay off the heap is binaryen's
-/// escape analysis to decide; this only decides what is worth inlining for it.
-/// DECISIONS.md, "`-O` inlines the helpers a per-call struct is passed to".
+/// A callee that RETURNS such a type it allocates itself (or gets from a chosen callee) is
+/// chosen on the same bounds, so a small record result melts at a caller that only reads it,
+/// and a caller holding one counts as allocating it. Chains are bounded by
+/// `ESCAPE_INLINE_EXPANDED_BYTES` and the whole step by `ESCAPE_INLINE_GROWTH_FLOOR`. Which
+/// allocations actually stay off the heap is binaryen's escape analysis to decide; this only
+/// decides what is worth inlining for it. DECISIONS.md, "`-O` inlines the helpers a per-call
+/// struct is passed to" and "`-O` inlines a small record's producer".
 fn escape_inline_choice(s: &ModuleScan) -> Option<std::collections::HashSet<u32>> {
     let callers = s.callers();
     let once = s.run_once(&callers);
     let cyclic = s.cyclic();
     let ix = |f: u32| (f - s.n_imports) as usize;
-    // Per defined function: the per-call-state struct types its parameters take.
-    let takes: Vec<Vec<u32>> = (0..s.bodies.len())
-        .map(|i| {
-            let ty = s.func_types.get(i).copied().unwrap_or(u32::MAX);
-            s.param_structs
-                .get(ty as usize)
-                .cloned()
-                .flatten()
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|t| !s.heap_held.contains(t) && !s.subtyped.contains(t))
-                .collect()
-        })
+    // Per defined function: the per-call-state struct types its parameters take, and those
+    // its results give back.
+    let per_call = |table: &[Option<Vec<u32>>]| -> Vec<Vec<u32>> {
+        (0..s.bodies.len())
+            .map(|i| {
+                let ty = s.func_types.get(i).copied().unwrap_or(u32::MAX);
+                table
+                    .get(ty as usize)
+                    .cloned()
+                    .flatten()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|t| !s.heap_held.contains(t) && !s.subtyped.contains(t))
+                    .collect()
+            })
+            .collect()
+    };
+    let takes = per_call(&s.param_structs);
+    let gives: Vec<Vec<u32>> = per_call(&s.result_structs)
+        .into_iter()
+        .map(|g| g.into_iter().filter(|t| s.small_records.contains(t)).collect())
         .collect();
     let shares = |a: u32, b: u32| takes[ix(a)].iter().any(|t| takes[ix(b)].contains(t));
+    // A tiny loop-free leaf may go into run-once code too, as `run_once_hot_callees` allows.
+    let leaf = |f: u32| {
+        let b = s.body(f);
+        !b.has_loop && !b.calls_defined && b.size <= RUN_ONCE_INLINE_LEAF_BYTES
+    };
     let eligible = |f: u32| {
         s.defined(f)
-            && !takes[ix(f)].is_empty()
             && s.body(f).size <= ESCAPE_INLINE_MAX_BYTES
             && !cyclic.contains(&f)
-            && !once.contains(&f)
-            && callers
-                .get(&f)
-                .is_some_and(|sites| sites.iter().all(|(c, _)| !once.contains(c)))
+            && (leaf(f)
+                || (!once.contains(&f)
+                    && callers
+                        .get(&f)
+                        .is_some_and(|sites| sites.iter().all(|(c, _)| !once.contains(c)))))
     };
-    let mut chosen: std::collections::HashSet<u32> = Default::default();
-    // A fixpoint, since a chosen callee can make its own callees worth choosing.
-    loop {
-        let before = chosen.len();
-        for (&f, sites) in &callers {
-            if chosen.contains(&f) || !eligible(f) {
-                continue;
+    // Whether `c` holds a fresh `t` of its own: it allocates one, or a chosen callee that
+    // gives `t` back is inlined into it.
+    let makes = |c: u32, t: u32, chosen: &std::collections::HashSet<u32>| {
+        s.body(c).allocs.contains(&t)
+            || s.body(c)
+                .calls
+                .iter()
+                .any(|&(g, _)| chosen.contains(&g) && gives[ix(g)].contains(&t))
+    };
+    // Whether a `t` held by `c` stays in `c` once the chosen callees are inlined: `c` hands it
+    // to no function that is not chosen, and returns it only when `c` is chosen itself.
+    let stays = |c: u32, t: u32, chosen: &std::collections::HashSet<u32>| {
+        s.body(c).calls.iter().all(|&(g, _)| {
+            g == c || !s.defined(g) || chosen.contains(&g) || !takes[ix(g)].contains(&t)
+        }) && (!gives[ix(c)].contains(&t) || chosen.contains(&c))
+    };
+    // Producers found not to be worth it; the choice restarts without them until none is.
+    let mut banned: std::collections::HashSet<u32> = Default::default();
+    let chosen = loop {
+        let mut chosen: std::collections::HashSet<u32> = Default::default();
+        // A fixpoint, since a chosen callee can make its own callees, and its callers'
+        // callees, worth choosing.
+        loop {
+            let before = chosen.len();
+            for (&f, sites) in &callers {
+                if chosen.contains(&f) || !eligible(f) {
+                    continue;
+                }
+                let taker = sites.iter().any(|&(c, _)| {
+                    takes[ix(f)].iter().any(|t| makes(c, *t, &chosen))
+                        || (chosen.contains(&c) && shares(f, c))
+                });
+                let producer =
+                    !banned.contains(&f) && gives[ix(f)].iter().any(|&t| makes(f, t, &chosen));
+                if taker || producer {
+                    chosen.insert(f);
+                }
             }
-            let wanted = sites.iter().any(|&(c, _)| {
-                takes[ix(f)].iter().any(|t| s.body(c).allocs.contains(t))
-                    || (chosen.contains(&c) && shares(f, c))
-            });
-            if wanted {
-                chosen.insert(f);
+            if chosen.len() == before {
+                break;
             }
         }
-        if chosen.len() == before {
-            break;
+        // Drop, to a fixpoint, a callee that hands a type it takes to a function not chosen,
+        // and one whose chain of chosen callees inlines to more than the expanded bound.
+        loop {
+            let before = chosen.len();
+            let leaks: Vec<u32> = chosen
+                .iter()
+                .copied()
+                .filter(|&f| {
+                    s.body(f).calls.iter().any(|&(g, _)| {
+                        g != f && s.defined(g) && !chosen.contains(&g) && shares(f, g)
+                    })
+                })
+                .collect();
+            for f in leaks {
+                chosen.remove(&f);
+            }
+            let mut expanded = Default::default();
+            let too_big: Vec<u32> = chosen
+                .iter()
+                .copied()
+                .filter(|&f| {
+                    escape_expanded(f, s, &chosen, &mut expanded) > ESCAPE_INLINE_EXPANDED_BYTES
+                })
+                .collect();
+            for f in too_big {
+                chosen.remove(&f);
+            }
+            if chosen.len() == before {
+                break;
+            }
         }
-    }
-    // Drop, to a fixpoint, a callee that hands a type it takes to a function not chosen, and
-    // one whose chain of chosen callees inlines to more than the expanded bound.
-    loop {
-        let before = chosen.len();
-        let leaks: Vec<u32> = chosen
+        // A producer that takes no struct is worth inlining only where what it gives back
+        // stays in the caller; one whose every caller leaks it would only copy the allocation.
+        let futile: Vec<u32> = chosen
             .iter()
             .copied()
             .filter(|&f| {
-                s.body(f)
-                    .calls
-                    .iter()
-                    .any(|&(g, _)| g != f && s.defined(g) && !chosen.contains(&g) && shares(f, g))
+                takes[ix(f)].is_empty()
+                    && !callers.get(&f).is_some_and(|sites| {
+                        sites
+                            .iter()
+                            .any(|&(c, _)| gives[ix(f)].iter().any(|&t| stays(c, t, &chosen)))
+                    })
             })
             .collect();
-        for f in leaks {
-            chosen.remove(&f);
+        if futile.is_empty() {
+            break chosen;
         }
-        let mut expanded = Default::default();
-        let too_big: Vec<u32> = chosen
-            .iter()
-            .copied()
-            .filter(|&f| {
-                escape_expanded(f, s, &chosen, &mut expanded) > ESCAPE_INLINE_EXPANDED_BYTES
-            })
-            .collect();
-        for f in too_big {
-            chosen.remove(&f);
-        }
-        if chosen.len() == before {
-            break;
-        }
-    }
+        banned.extend(futile);
+    };
     if chosen.is_empty() {
         return None;
     }
