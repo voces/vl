@@ -38,6 +38,7 @@ import {
   TyPrim,
   TyUnion,
   TyVar,
+  assignable,
   bindGenUnionArmInto,
   bindGenWalk,
   blockHasBareReturn,
@@ -96,6 +97,7 @@ import {
   tyIsLitUnion,
   tyIsLitUnionArray,
   tyIsMap,
+  tyIsTpJoinUnion,
   tyPrimNameOf,
   tyProvesNonNull,
   tyRenderSoftensLits,
@@ -2020,9 +2022,29 @@ function monoIfChainRebuildPinned(
       // the checker's join, so a sibling can hold another type (a literal `5`).
       const raw = nodeTyIxOf(at)
       let pty = -1
-      if monoIfArmsAllTy(at, raw, bN, bT) { pty = monoPinnedTyOf(at, bN, bT) }
-      else if sink { pty = monoIfArmsPinJoin(at, raw, bN, bT) }
-      const retype = pty >= 0 && pty != raw && monoPinKeepsMembers(raw, pty)
+      // Only a binding the return reads: a sink or a tail re-joins its arms itself. Recorded,
+      // not returned: the rebuild goes on and the failure stops the build (D2915).
+      if (
+        !sink
+        && monoPinLetReaches
+        && monoHoleJoinDropsArm(at, raw, monoPinnedTyOf(at, bN, bT), bN, bT)
+      ) {
+        emitFail(
+          "emitProgram: a join of a `??` with a type parameter drops a member of that parameter at this instance",
+        )
+      }
+      // A join the checker kept apart as `T | C` is read at the pin wherever it goes (D2906).
+      const tpu = tyIsTpJoinUnion(raw)
+      if monoIfArmsAllTy(at, raw, bN, bT) {
+        pty = monoPinnedTyOf(at, bN, bT)
+        // Such a join is a union at the pin only as a box registered here.
+        if tpu { pty = monoPinUnionBoxed(pty) }
+      } else if sink || tpu {
+        pty = monoIfArmsPinJoin(at, raw, bN, bT)
+      }
+      const retype = pty >= 0
+        && pty != raw
+        && (tpu || monoPinKeepsMembers(raw, pty))
       if (
         ccs[li] == c.ifCond
         && cts[li] == c.ifThen
@@ -2081,6 +2103,42 @@ function monoIfArmsPinJoin(ix: i32, raw: i32, bN: string[], bT: i32[]): i32 {
     const name = valueUnionRetName(j)
     if name == "" || monoRegisterPinUnion(name) < 0 { return -1 }
   }
+  j
+}
+
+// Whether an `if` join the checker typed as an inference hole `raw` (a `??` result absorbing a
+// type parameter) is pinned at `pty` while its arms' own pinned types join wider: the
+// parameter's member is lost there, and building it would be invalid (D2915).
+function monoHoleJoinDropsArm(
+  at: i32,
+  raw: i32,
+  pty: i32,
+  bN: string[],
+  bT: i32[],
+): boolean {
+  if raw < 0 || raw >= T.tys.length || pty < 0 || pty >= T.tys.length {
+    return false
+  }
+  const rt = T.tys[raw]
+  if !(rt is TyVar) { return false }
+  if rt.tvName.length > 0 && rt.tvName[0] != "?"[0] { return false }
+  if !monoIfArmHasTyVar(at) { return false }
+  const ts: i32[] = []
+  if monoChainPinnedTys(at, bN, bT, ts) < 0 { return false }
+  const j = joinPinnedArmTys(ts)
+  // Only a box: a scalar pin is re-joined by the return set, and a box is built at `pty`.
+  T.tys[pty] is TyUnion
+    && j >= 0
+    && j < T.tys.length
+    && !tyHasTyVar(j)
+    && !assignable(j, pty)
+}
+
+// `j`, its value-union box registered first when it is a union whose box has a name.
+function monoPinUnionBoxed(j: i32): i32 {
+  if j < 0 || j >= T.tys.length || !(T.tys[j] is TyUnion) { return j }
+  const name = valueUnionRetName(j)
+  if name != "" { monoRegisterPinUnion(name) }
   j
 }
 
@@ -2525,6 +2583,59 @@ function monoKeepTplHole(ix: i32, nx: i32) {
   0
 }
 
+// The annotation an un-annotated binding of a join the checker kept apart (`T | i32`) takes:
+// the join at this pin, so the binding's slot is its own and not one a same-named binding
+// declared elsewhere in the body (D2906). -1 otherwise.
+function monoTpJoinBindAnn(init: i32, bN: string[], bT: i32[]): i32 {
+  if init < 0 { return -1 }
+  const t = nodeTyIxOf(unwrapParen(init))
+  if !tyIsTpJoinUnion(t) { return -1 }
+  const st = substTyDeep(t, bN, bT)
+  if st < 0 || st >= T.tys.length || tyHasTyVar(st) { return -1 }
+  const nm = monoPinUnionName(tyToEmitName(st))
+  if nm == "" { return -1 }
+  if T.tys[st] is TyUnion && monoRegisterPinUnion(nm) < 0 { return -1 }
+  synthTypeRefTy(nm, -1, st)
+}
+
+// Registers the box of list literal `ix`'s element at its pinned list type `pty` when its template
+// element is a join the checker kept apart, so the build finds the box row: 0, or -1 on failure.
+function monoTpJoinListElemBox(ix: i32, pty: i32): i32 {
+  const t = nodeTyIxOf(ix)
+  if t < 0 || t >= T.tys.length || pty < 0 || pty >= T.tys.length { return 0 }
+  const tt = T.tys[t]
+  if !(tt is TyArray) || !tyIsTpJoinUnion(tt.aElem) { return 0 }
+  const pl = T.tys[pty]
+  if !(pl is TyArray) || pl.aElem < 0 { return 0 }
+  if !(T.tys[pl.aElem] is TyUnion) || tyIsLitUnion(pl.aElem) { return 0 }
+  const en = valueUnionRetName(pl.aElem)
+  if en == "" { return 0 }
+  monoRegisterPinUnion(en)
+}
+
+// The annotation an un-annotated list literal of a join the checker kept apart (`[t, 5]` at
+// `(T | i32)[]`) takes where its element is a box at this pin: the build reads its element rep
+// off the binding (D2906). -1 otherwise.
+function monoTpJoinListLitAnn(initIx: i32, bN: string[], bT: i32[]): i32 {
+  if initIx < 0 { return -1 }
+  const ix = unwrapParen(initIx)
+  if ix < 0 || !(P.nodes[ix] is ArrayLit) { return -1 }
+  const t = nodeTyIxOf(ix)
+  if t < 0 || t >= T.tys.length { return -1 }
+  const tt = T.tys[t]
+  if !(tt is TyArray) || !tyIsTpJoinUnion(tt.aElem) { return -1 }
+  const st = substTyDeep(t, bN, bT)
+  if st < 0 || st >= T.tys.length || tyHasTyVar(st) { return -1 }
+  const sl = T.tys[st]
+  if !(sl is TyArray) || sl.aElem < 0 { return -1 }
+  if !(T.tys[sl.aElem] is TyUnion) || tyIsLitUnion(sl.aElem) { return -1 }
+  const en = valueUnionRetName(sl.aElem)
+  if en == "" || monoRegisterPinUnion(en) < 0 { return -1 }
+  const nm = monoListSpelling(tyToEmitName(st), st)
+  if nm == "" { return -1 }
+  synthTypeRefTy(nm, -1, st)
+}
+
 // The annotation an un-annotated list literal typed at the instance's holes takes, where its
 // element is a union, a nullable or a list: nothing else types such a local's build (D2898). -1
 // otherwise.
@@ -2698,6 +2809,8 @@ function monoCloneBodyRaw(
     if nt < 0 { nt = monoCloPinListAnn(n.letInit) }
     if nt < 0 { nt = monoCloPinShapeAnn(n.letInit) }
     if nt < 0 { nt = monoApartJoinAnn(n.letInit, bN, bT) }
+    if nt < 0 { nt = monoTpJoinListLitAnn(n.letInit, bN, bT) }
+    if nt < 0 { nt = monoTpJoinBindAnn(n.letInit, bN, bT) }
     if nt < 0 { nt = monoPushedListAnn(n.letInit, bN, bT) }
     let ninit = n.letInit
     if nt < 0 {
@@ -3420,17 +3533,26 @@ function monoPinBodyLambdasRaw(
     return mkForIn(n.fiVar, n.fiVar2, fi, cb, n.fiLabel, n.pos)
   }
   const ks = monoExprKids(ix)
+  // A read of a binding typed at a join the checker kept apart takes the join at this pin: the
+  // binding's name can be declared again elsewhere in the body at another type (D2906).
+  if n is Ident && tyIsTpJoinUnion(nodeTyIxOf(ix)) {
+    return monoPinRetype(ix, bN, bT)
+  }
   if ks.length == 0 { return ix }
   const nks: i32[] = []
   const inLit = monoPinInLit
   monoPinInLit = n is ArrayLit || n is ObjLit
   const kidSink = monoPinSinkKids(ix) || (sink && n is Paren)
+  const eqPin = monoEqOfTpJoin(ix)
   let ki = 0
   while ki < ks.length {
     monoPinSink = kidSink
     const kv = monoPinValueLambda(ks[ki], typarams, tvN, tvV, bN, bT)
     monoPinSink = false
-    if n is Call {
+    if eqPin && kv >= 0 && P.nodes[kv] is Ident && tyHasTyVar(nodeTyIxOf(kv)) {
+      // The compare picks the join's arm by the other side's type, which is the pin's.
+      nks.push(monoPinRetype(kv, bN, bT))
+    } else if n is Call {
       nks.push(monoPinFnValueTy(kv, ks[ki], bN, bT))
     } else if ki == 0 && (n is Member || n is Index) {
       nks.push(monoPinRecvName(monoPinRecvLit(kv, ks[ki], bN, bT), bN, bT))
@@ -3444,6 +3566,17 @@ function monoPinBodyLambdasRaw(
   if rb == ix { rb = monoPinRetype(ix, bN, bT) }
   if sink { rb = monoPinCoalJoin(ix, rb, bN, bT) }
   rb
+}
+
+// Whether `ix` is an `==` / `!=` with an operand typed at a join the checker kept apart.
+function monoEqOfTpJoin(ix: i32): boolean {
+  const n = P.nodes[ix]
+  if n is BinExpr {
+    if n.binOp != "==" && n.binOp != "!=" { return false }
+    return tyIsTpJoinUnion(nodeTyIxOf(n.binLeft))
+      || tyIsTpJoinUnion(nodeTyIxOf(n.binRight))
+  }
+  false
 }
 
 // `monoIfArmsPinJoin` for a `??` at `ix`, rebuilt as `rb`: where its sides' pinned types join
@@ -3792,7 +3925,13 @@ function monoPinBodyJoinUncovered(
       && (monoPinReachNames.get(n.letName) ?? false)
     ) {
       const init = unwrapParen(n.letInit)
-      if init >= 0 && init < P.nodes.length {
+      // A join the checker kept apart is typed at its union in the template, so every read of
+      // the binding already takes the substituted box (D2906).
+      if (
+        init >= 0
+        && init < P.nodes.length
+        && !tyIsTpJoinUnion(nodeTyIxOf(init))
+      ) {
         const j = monoJoinPinnedAt(init, bN, bT)
         if j != -1 {
           if j < -1 { return true }
@@ -3979,6 +4118,7 @@ function monoPinRetype(ix: i32, bN: string[], bT: i32[]): i32 {
   if n is ArrayLit && monoPinInLit { return ix }
   const pty = monoPinnedTyOf(ix, bN, bT)
   if pty < 0 || pty == nodeTyIxOf(ix) { return ix }
+  if n is ArrayLit && monoTpJoinListElemBox(ix, pty) < 0 { return ix }
   const nx = monoExprRemake(ix, monoExprKids(ix))
   if nx != ix { monoPinRecordTy(nx, pty) }
   nx

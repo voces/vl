@@ -734,6 +734,9 @@ let escJoinWho: string[] = []
 // The body each join escaped inside (`cstrOwnerTop`), -1 at module scope (D2805).
 let escJoinFn: i32[] = []
 
+// The operator a deferred unary negation is recorded under, both operands its argument.
+const OP_NEG = "unary -"
+
 // Deferred binary-op constraints over un-annotated-param holes: with a hole operand, `a + b` /
 // `s + "!"` / `n < 2` cannot be decided in the body, a hole being permissively assignable to
 // both string and numeric. Record `(lt, op, rt)` as arena type indices; the generic call site
@@ -15942,7 +15945,105 @@ function tyVarMemberOf(v: i32, u: i32): boolean {
     while i < ut.uMembers.length {
       const m = ut.uMembers[i]
       if m == v || (m >= 0 && sameVariantTy(m, v)) { return true }
+      if m >= 0 && m < T.tys.length && sameDeclaredTyParam(m, v) { return true }
       i = i + 1
+    }
+  }
+  false
+}
+
+// Whether `t` is a declared type parameter, not an inference hole.
+function tyIsDeclaredParam(t: i32): boolean {
+  if t < 0 || t >= T.tys.length { return false }
+  const tt = T.tys[t]
+  if tt is TyVar { return tt.tvName.length > 0 && tt.tvName[0] != "?"[0] }
+  false
+}
+
+// A union holding a declared type parameter is gradual as the bare parameter is: an operation
+// is checked in the body against its concrete members, and each pin re-checks it against the
+// whole substituted union. The concrete members' type, or `ty` when it is no such union.
+function tpGradualView(ty: i32): i32 {
+  if ty < 0 || ty >= T.tys.length { return ty }
+  const t = T.tys[ty]
+  if !(t is TyUnion) { return ty }
+  if !unionHasDeclaredParam(t.uMembers) { return ty }
+  const keep: i32[] = []
+  let tp = false
+  let hole = -1
+  for m in t.uMembers {
+    if m < 0 || m >= T.tys.length { return ty }
+    if T.tys[m] is TyVar {
+      if tyIsDeclaredParam(m) { tp = true }
+      if hole < 0 { hole = m }
+    } else {
+      if tyHasTyVar(m) { return ty }
+      keep.push(m)
+    }
+  }
+  if !tp { return ty }
+  // Every member a parameter or a hole: the union is as open as a bare one.
+  if keep.length == 0 { return hole }
+  if keep.length == 1 { return keep[0] }
+  mkUnionTy(keep)
+}
+
+// Whether a member of `ms` is a declared type parameter.
+function unionHasDeclaredParam(ms: i32[]): boolean {
+  for m in ms {
+    if tyIsDeclaredParam(m) { return true }
+  }
+  false
+}
+
+// The receiver a member or index read of `recv` is checked at: a gradual union's concrete
+// member, the read recorded for the pin to re-ask against the whole union. `recv` otherwise.
+function tpGradualRecv(recv: i32, prop: string, ix: i32): i32 {
+  const v = tpGradualView(recv)
+  if v == recv || v < 0 || T.tys[v] is TyUnion { return recv }
+  noteMemCstr(recv, prop, ix, false)
+  v
+}
+
+// The join of `a` and `b` when one is a join kept apart over a type parameter and the other a
+// union holding one too: the side holding every member of the other, or their union kept
+// apart. -1 otherwise.
+function gradualUnionJoin(a: i32, b: i32): i32 {
+  if tpJoinUnions.length == 0 { return -1 }
+  if !tpJoinUnions.has(a) && !tpJoinUnions.has(b) { return -1 }
+  if tpGradualView(a) == a || tpGradualView(b) == b { return -1 }
+  if tyMembersWithin(b, a) { return a }
+  if tyMembersWithin(a, b) { return b }
+  const tc = joinVariantTys(a, b)
+  // arena-tick exempt: a per-program mark on a fresh arena row.
+  tpJoinUnions[tc] = 1
+  tc
+}
+
+// Whether every member of `x` is a member of `u`.
+function tyMembersWithin(x: i32, u: i32): boolean {
+  const xs: i32[] = []
+  flattenVariantsInto(x, xs)
+  const us: i32[] = []
+  flattenVariantsInto(u, us)
+  for m in xs {
+    let hit = false
+    for n in us {
+      if n == m || sameVariantTy(n, m) { hit = true }
+    }
+    if !hit { return false }
+  }
+  true
+}
+
+// Whether `a` and `b` are two rows of one declared type parameter: substitution matches by name.
+function sameDeclaredTyParam(a: i32, b: i32): boolean {
+  const ta = T.tys[a]
+  const tb = T.tys[b]
+  if ta is TyVar {
+    if tb is TyVar {
+      if ta.tvName.length == 0 || ta.tvName[0] == "?"[0] { return false }
+      return ta.tvName == tb.tvName
     }
   }
   false
@@ -15959,6 +16060,22 @@ function joinTys(a: i32, b: i32) {
   constrainEmpty(b, a)
   const tpn = joinTyParamNull(a, b)
   if tpn >= 0 { return tpn }
+  // A bare declared parameter beside a concrete type is their union, re-joined at each pin:
+  // folding `5` into `T` would read it as the pin's type (D2906).
+  const aVar = T.tys[a] is TyVar
+  const bVar = T.tys[b] is TyVar
+  if (aVar || bVar) && (tyParamBesideBare(a, b) || tyParamBesideBare(b, a)) {
+    const tc = joinVariantTys(a, b)
+    // arena-tick exempt: a per-program mark on a fresh arena row.
+    tpJoinUnions[tc] = 1
+    return tc
+  }
+  // Such a union absorbs only its own members: its parameter member is assignable from
+  // anything, which would fold `T | string` beside `T | i32` to the first (D3212).
+  if tpJoinUnions.length > 0 && !aVar && !bVar {
+    const gj = gradualUnionJoin(a, b)
+    if gj >= 0 { return gj }
+  }
   // Two different declared type parameters are two types, though a type variable is
   // assignable either way inside a generic body: collapsing would type the join as one
   // side and every instance binding them apart would read the other as it (D2760).
@@ -16694,6 +16811,37 @@ function tyParamBesideConcrete(p: i32, c: i32): boolean {
   false
 }
 
+// Whether `t` is a join `joinTys` kept apart over a type parameter, re-joined at each pin.
+export function tyIsTpJoinUnion(t: i32): boolean {
+  t >= 0 && tpJoinUnions.length > 0 && tpJoinUnions.has(t)
+}
+
+// Whether `p` is a bare declared type parameter of a body being checked and `c` a concrete
+// non-null value type. Outside its body an unbound parameter is absorbed as before.
+function tyParamBesideBare(p: i32, c: i32): boolean {
+  if p < 0 || c < 0 || p >= T.tys.length || c >= T.tys.length { return false }
+  if c == TY_VOID || isNullTy(c) { return false }
+  tyParamBesideConcrete(p, c) && tyParamOfOpenBody(p)
+}
+
+// Whether type variable `p` names a type parameter of a declaration whose body is being checked.
+function tyParamOfOpenBody(p: i32): boolean {
+  const tp = T.tys[p]
+  if tp is TyVar {
+    for owner in cstrOwnerStack {
+      if owner >= 0 && owner < P.nodes.length {
+        const fd = P.nodes[owner]
+        if fd is FuncDecl {
+          for nm in fd.fnTyParams {
+            if nm == tp.tvName { return true }
+          }
+        }
+      }
+    }
+  }
+  false
+}
+
 // Whether the declared type parameter `an` and the type `b` are two differently named ones.
 function tyParamNamesPart(an: string, b: i32): boolean {
   const tb = T.tys[b]
@@ -16987,6 +17135,8 @@ function isJoinHoleUnion(tyIx: i32) {
 // argument reaches, so the codegen-support floors that reject a genuine inferred union skip it.
 function tyIsDeferredJoin(tyIx: i32) {
   if tyIx < 0 { return false }
+  // A declared parameter's join with a concrete type is a real union, not a placeholder.
+  if tpJoinUnions.length > 0 && tpJoinUnions.has(tyIx) { return false }
   const t = T.tys[tyIx]
   if t is TyNullable { return tyIsDeferredJoin(t.nInner) }
   if t is TyUnion {
@@ -17692,6 +17842,10 @@ function noteLitElemCstrs(srcExpr: i32, dstTy: i32, depth: i32) {
   0
 }
 
+// The bindings of the pin whose deferred destinations are being re-asked, empty elsewhere.
+let litPinN: string[] = []
+let litPinT: i32[] = []
+
 // D581 — the element's source type for the array-literal recursion, and the one place this function
 // reads the container instead of the element node. The element node's own recorded type is the
 // precise answer at the body's first ask, but at the pin it is stale — it still says `T`, so
@@ -17700,6 +17854,12 @@ function litElemSrcTy(elemIx: i32, srcTy: i32) {
   const nt = nodeTyIxOf(elemIx)
   if nt < 0 { return nt }
   if !tyHasHole(nt) { return nt }
+  // Under a pin's re-check the element's own type is substituted: a literal joining `T` with a
+  // concrete element is a gradual union, wider than its own `T` element (D2906).
+  if litPinN.length > 0 {
+    const pe = substTyDeep(nt, litPinN, litPinT)
+    if pe >= 0 && !tyHasHole(pe) { return pe }
+  }
   if srcTy < 0 { return nt }
   const s = T.tys[srcTy]
   if s is TyArray {
@@ -32576,6 +32736,15 @@ function tplHoleHandled(
   const t = T.tys[at]
   if t is TyErr { return false }
   if tyIsHole(at) { return false }
+  // A gradual union is checked at its concrete members, and the pin re-asks the whole union
+  // as it does a bare hole's (`argCstrFits`).
+  const gv = tpGradualView(at)
+  if gv != at {
+    if isStringTy(softenLitTy(gv)) || tyIsHole(gv) || assignable(gv, expected) {
+      noteArgCstr(at, expected, "", ACF_TPL, -1)
+      return !tyIsHole(gv) && isStringTy(softenLitTy(gv))
+    }
+  }
   if assignable(at, expected) { return false }
   tErr(
     "an interpolation hole is `string` or "
@@ -33876,6 +34045,11 @@ export function memCstrMsg(recv: i32, prop: string) {
     if isNullTy(recv) { return "" }
     return callFloorMsg(recv)
   }
+  if keyHasPrefix(prop, MC_METHOD_MARK) {
+    const name = prop.slice(MC_METHOD_MARK.length, prop.length)
+    if builtinMethodClaims(recv, name) { return "" }
+    return "no method '." + name + "' on " + tyToStr(recv)
+  }
   memberFloorMsg(recv, prop)
 }
 
@@ -33889,6 +34063,9 @@ function callFloorMsg(fnTy: i32) {
   if tyHasHole(fnTy) { return "" }
   "called value is not a function (" + tyToStr(fnTy) + ")"
 }
+
+// The `memCstrProp` of a built-in method call on a gradual union, before the method's name.
+const MC_METHOD_MARK = "()"
 
 // Records a deferred receiver-classification constraint when the receiver still carries a
 // hole, so the generic call site re-asks whether `T` is a collection under substitution.
@@ -34073,6 +34250,7 @@ function binOpDefinedFor(op: string, lt0: i32, rt0: i32) {
   const rt = softenLitTy(rt0)
   if tyHasHole(lt) || tyHasHole(rt) { return true }
   if op == "min" || op == "max" { return minMaxPinOk(lt, rt) }
+  if op == OP_NEG { return isNumeric(lt) }
   // The nominal-brand mix the BODY deferred on a hole operand (D1747). Both operands are
   // concrete here, which is the precondition that question needs; only a branded PAIR is
   // judged, since a pin has no expression node for `nomBinMixes`'s literal-adoption legs.
@@ -34087,7 +34265,17 @@ function binOpDefinedFor(op: string, lt0: i32, rt0: i32) {
     if isNullTy(lt) || isNullTy(rt) { return true }
     const eqL = nomErasedTyIx(lt)
     const eqR = nomErasedTyIx(rt)
-    if !assignable(eqL, eqR) && !assignable(eqR, eqL) { return false }
+    // The written pair too, as `checkBinary` asks it: `K | i32` beside `K` softens one side only.
+    const eqL0 = nomErasedTyIx(lt0)
+    const eqR0 = nomErasedTyIx(rt0)
+    if (
+      !assignable(eqL, eqR)
+      && !assignable(eqR, eqL)
+      && !assignable(eqL0, eqR0)
+      && !assignable(eqR0, eqL0)
+    ) {
+      return false
+    }
     // Pinned equality is held to the same two gates as the direct spelling — inside a
     // generic body `T` looks equatable (a `TyVar` is opaque) with nobody left to ask (D35).
     const pinMsgs: string[] = []
@@ -34759,6 +34947,24 @@ function retNomOnlyAtHole(wOnly: i32, ix: i32, rg: i32, rw: i32) {
   assignableExpr(ix, rg, b)
 }
 
+// `assignableExpr` with the pin's bindings staged for a literal's elements (`litElemSrcTy`).
+function litPinAssignable(
+  ix: i32,
+  src: i32,
+  dst: i32,
+  bNames: string[],
+  bTys: i32[],
+): boolean {
+  const sN = litPinN
+  const sT = litPinT
+  litPinN = bNames
+  litPinT = bTys
+  const ok = assignableExpr(ix, src, dst)
+  litPinN = sN
+  litPinT = sT
+  ok
+}
+
 // Re-validates every deferred return-type constraint this call resolves: substitutes the
 // call's bindings into the body's returned type and the declared return type, and asks the
 // mismatch question the body could only answer vacuously. Re-defers like `validateArgCstrs`
@@ -34790,7 +34996,7 @@ function validateRetCstrs(
           !tyHasHole(rw)
           && !retNomOnlyAtHole(retCstrWOnly[ci], retCstrIx[ci], rg, rw)
         ) {
-          if !assignableExpr(retCstrIx[ci], rg, rw) {
+          if !litPinAssignable(retCstrIx[ci], rg, rw, bNames, bTys) {
             let rWho = "the callee's return"
             if who != "" { rWho = "the return of `" + who + "`" }
             tErr(
@@ -34841,7 +35047,7 @@ function validateLetCstrs(
       }
       if !tyHasHole(lg) {
         if !tyHasHole(lw) {
-          if !assignableExpr(letCstrIx[ci], lg, lw) {
+          if !litPinAssignable(letCstrIx[ci], lg, lw, bNames, bTys) {
             let lWho = "the callee's body"
             if who != "" { lWho = "the body of `" + who + "`" }
             tErr(
@@ -35568,12 +35774,15 @@ function validateBinCstrs(
             const rNo = cstrArgNoOf(binCstrRt[ci], hNames, hArgNo)
             const lN = cstrArgCountOf(binCstrLt[ci], hNames)
             const rN = cstrArgCountOf(binCstrRt[ci], hNames)
-            const refusal = "operator '"
+            let refusal = "operator '"
               + binCstrOp[ci]
               + "' is not defined for "
               + tyToStr(clt)
               + " and "
               + tyToStr(crt)
+            if binCstrOp[ci] == OP_NEG {
+              refusal = "unary '-' expects a numeric type, got " + tyToStr(clt)
+            }
             let anchorNo = lNo
             if anchorNo == 0 { anchorNo = rNo }
             let msg = refusal + " (the call's argument types)"
@@ -35607,6 +35816,9 @@ function validateBinCstrs(
                     + i32ToStr(rNo)
                     + ")"
                 }
+              }
+              if binCstrOp[ci] == OP_NEG {
+                tail = " (" + bodyWho + " negates this argument)"
               }
               msg = head + refusal + tail
             }
@@ -39117,6 +39329,14 @@ function checkMemberCallNode(
   let recvTy = recvPre
   if recvPre < 0 { recvTy = checkNode(recvIx) }
   if recvTy >= 0 { recvTy = strLitRecvTy(recvTy) }
+  // A gradual union's built-in method is its concrete member's; the pin re-asks the whole union.
+  if recvTy >= 0 && recvTy < T.tys.length && T.tys[recvTy] is TyUnion {
+    const gv = tpGradualView(recvTy)
+    if gv != recvTy && gv >= 0 && builtinMethodClaims(gv, prop) {
+      noteMemCstr(recvTy, MC_METHOD_MARK + prop, ix, false)
+      recvTy = gv
+    }
+  }
   let rt = T.tys[recvTy]
   // An un-annotated hole receiving an array method (`self.map`/`.push`/…) is constrained to
   // an array — synthesizing one over a derived element hole and falling into the array-method
@@ -40185,7 +40405,14 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
     // substituted argument types — without this, `function f(x) { g(x) }` with `g(n: i32)`
     // type-checks `f("s")` clean and dies at wasm validation. Recorded on the argument's uncollapsed type, since a join's collapsed arm can later prove unreachable.
     const atCstr = inferRetTyOf(args[i], at)
-    if tyIsHole(atCstr) || tyIsDeferredJoin(atCstr) {
+    if (
+      tyIsHole(atCstr)
+      || tyIsDeferredJoin(atCstr)
+      || (atCstr >= 0
+        && atCstr < T.tys.length
+        && T.tys[atCstr] is TyUnion
+        && tpGradualView(atCstr) != atCstr)
+    ) {
       if !tyIsHole(expected) {
         let ccWho = ""
         if cfn is Ident { ccWho = cfn.identName }
@@ -53459,6 +53686,18 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
     }
     return TY_BOOL
   }
+  // A gradual union operand is checked at its concrete members; the constraint noted above
+  // re-checks the whole union at each pin.
+  if op != "&&" && op != "||" {
+    if T.tys[lt] is TyUnion {
+      const glt = tpGradualView(lt)
+      if glt >= 0 && glt < T.tys.length { lt = glt }
+    }
+    if rt >= 0 && rt < T.tys.length && T.tys[rt] is TyUnion {
+      const grt = tpGradualView(rt)
+      if grt >= 0 && grt < T.tys.length { rt = grt }
+    }
+  }
   // Operator dispatch on a struct (B13 + B14): a free `self`-function named for the operator
   // is checked first, then an operator closure field — equality/logicals/`=`/`??` already returned.
   if op != "&&" && op != "||" {
@@ -56166,6 +56405,11 @@ function checkUnaryNode(n: Unary, ix: i32) {
   if arg2 < 0 {
     const peekU = arrDefOperandElemPeek(n.unArg)
     if peekU >= 0 { arg2 = peekU }
+  }
+  // A hole operand is numeric only at a pin that says so; the pin re-asks it (`OP_NEG`).
+  if arg2 >= 0 && !(T.tys[arg2] is TyPrim) && tyHasHole(arg2) {
+    noteBinCstr(arg2, OP_NEG, arg2)
+    arg2 = tpGradualView(arg2)
   }
   if !isNumeric(arg2) {
     tErr("unary '-' expects a numeric type, got " + tyToStr(arg2), ix)
@@ -59370,10 +59614,15 @@ function checkMemberNode(n: Member, ix: i32) {
     }
     if mInv < 0 { crPathDropRead(mKey, ix) }
   }
-  const objTy = strLitRecvTy(checkNode(n.memObj))
+  const objTy0 = strLitRecvTy(checkNode(n.memObj))
   // A negative receiver type is an unpinned inference hole, not an arena index — indexing
   // `T.tys` with it would crash. Already reported elsewhere, so don't cascade.
-  if objTy < 0 { return TY_ERR }
+  if objTy0 < 0 { return TY_ERR }
+  let objTy = objTy0
+  if T.tys[objTy0] is TyUnion {
+    const gObj = tpGradualRecv(objTy0, n.memProp, ix)
+    if gObj >= 0 && gObj < T.tys.length { objTy = gObj }
+  }
   // A getter on the receiver's nominal type, when no field or built-in member shares its name.
   const gFn = getterFnFor(objTy, n.memProp)
   if gFn != "" { return getterReadTy(gFn, n, ix) }
@@ -59530,10 +59779,15 @@ function checkSpreadArrayLit(elems: i32[]) {
 
 // Extracted from `checkNodeReal`'s `Index` arm (C3: thin the dispatcher).
 function checkIndexNode(n: Index, ix: i32) {
-  const arrTy = strLitRecvTy(checkNode(n.idxArr))
+  const arrTy0 = strLitRecvTy(checkNode(n.idxArr))
   const idxTy = checkNode(n.idxIndex)
   // Guard the unpinned-hole receiver (`-1` — see the Member-arm note).
-  if arrTy < 0 { return TY_ERR }
+  if arrTy0 < 0 { return TY_ERR }
+  let arrTy = arrTy0
+  if T.tys[arrTy0] is TyUnion {
+    const gArr = tpGradualRecv(arrTy0, OP_INDEX_GET, ix)
+    if gArr >= 0 && gArr < T.tys.length { arrTy = gArr }
+  }
   // A flow-narrowed constant-index place overrides the element type within the branch — asked
   // after the receiver/subscript check (unlike the member arm) since the subscript node needs banking.
   const xKey = placeKeyOf(ix)
