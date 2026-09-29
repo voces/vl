@@ -114,6 +114,7 @@ import {
   simdRowSig,
   truncSatFromF64,
   truncSatOp,
+  tyBearsNull,
   tyIsLitUnion,
   tyIsLitUnionArray,
   tyIsLitUnionOrLit,
@@ -844,6 +845,7 @@ import {
   globalNameIsNonConst,
   globalNameIsNonConstSid,
   globalNulListCellRead,
+  holeOperandTyOf,
   identCellSlot,
   identCellVKind,
   identChainTyBoxedUnion,
@@ -15121,7 +15123,7 @@ function emitIfExprRef(
   let rc = 1
   let nul = false
   while rc == 1 {
-    nul = nul || ifLinkYieldsNull(cur)
+    nul = nul || ifLinkYieldsNull(cur, fnIx)
     rc = emitIfExprRefLink(body, cur, fnIx, kind, slot, open, nul)
     if rc == 1 {
       const link = P.nodes[unwrapParen(cur)]
@@ -15134,8 +15136,10 @@ function emitIfExprRef(
 // True if the `if` link at `ifIx` can yield `null`: its recorded join is nullable, it has no
 // else, or one of its own arms is a bare `null`. A chain's blocktype is nullable from the first
 // such link inward, so a link typed `null` alone still matches its enclosing frame (D2227).
-function ifLinkYieldsNull(ifIx: i32) {
+// In a hole instance the join's recorded type is the hole's variable, read at its pin (D3016).
+function ifLinkYieldsNull(ifIx: i32, fnIx: i32) {
   if nodeTyIsNullable(ifIx) { return true }
+  if tyBearsNull(holeOperandTyOf(ifIx, fnIx)) { return true }
   const s = P.nodes[unwrapParen(ifIx)]
   if s is IfStmt {
     if s.ifElse < 0 { return true }
@@ -15427,7 +15431,7 @@ function emitRefIfArm(
       if (
         inner >= 0
         && P.nodes[inner] is IfStmt
-        && (nulJoin || !ifLinkYieldsNull(inner))
+        && (nulJoin || !ifLinkYieldsNull(inner, fnIx))
       ) {
         if emitIfArmOpen(body, blockIx, fnIx) < 0 { return emitIfArmClose(-1) }
         return emitIfArmClose(emitIfExprRef(body, inner, fnIx, kind, slot))
@@ -21432,21 +21436,32 @@ function emitMapFilter(body: u8[], callIx: i32, fnIx: i32) {
         }
         fbArraySet(dstBack) // 0xfb 0x0e <dstBack>
       } else {
-        // if call_ref(clo, [elem(i)]): back[j] = elem(i); j++
-        if (
-          emitMfInvoke(body, cL, srcL, iL, srcWrap, srcBack, srcElemRef, sig)
-          < 0
-        ) {
+        // e = elem(i); if call_ref(clo, [e]): back[j] = e; j++. The element is read once, so
+        // the kept value is the one the callback tested, whatever it writes (D3060).
+        let eSlot = 0
+        if resK == "ref" { eSlot = dstSlot }
+        const eL = listIdxValSlot(resK, eSlot)
+        if emitMfElem(body, srcL, iL, srcWrap, srcBack, srcElemRef) < 0 {
           return -1
         }
-        fbIf(64)      // 0x04 if (void)
+        fbLocalSet(eL)
+        fbLocalGet(cL)
+        fbStructGet(cloStructIdx, 0) // env
+        fbLocalGet(eL)
+        if srcElemRef {
+          wU8(212) // 0xd4 ref.as_non_null
+        }
+        fbLocalGet(cL)
+        fbStructGet(cloStructIdx, 1) // the callee's wasm function index
+        fbCallIndirect(sig, gFnTableIdx)
+        fbIf(64)                     // 0x04 if (void)
         fbLocalGet(dstL)
         fbLocalGet(jL)
-        emitMfElem(body, srcL, iL, srcWrap, srcBack, srcElemRef)
+        fbLocalGet(eL)
         fbArraySet(dstBack)
         fbLocalGet(jL)
         fbI32Const(1)
-        fbI32Bin(106) // 0x6a i32.add
+        fbI32Bin(106)                // 0x6a i32.add
         fbLocalSet(jL)
         fbEnd()
       }
