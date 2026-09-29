@@ -14,7 +14,7 @@
 // The AST data layer (`compiler/ast.vl`): the token type, the global parser state
 // `P`, and the arena `mk*` constructors. The parser's own `advance`/`peekTok`
 // cursor primitives stay private to this module.
-import { TokKind, tplPartStrLex } from "./lexer"
+import { TokKind, keywordKind, tplPartStrLex } from "./lexer"
 import {
   arenaEpochBump,
   externAdd,
@@ -333,6 +333,105 @@ function expectClose(kind: TokKind) {
   false
 }
 
+// The keyword spellings a binding position took as a name (D3069), innermost last. The
+// declaration carries the one diagnostic; a later use of the same spelling where the keyword
+// cannot stand reads as that name. Scoped like the binding: a block, a `for` and a function
+// trim what they declared, so only a top-level name outlives its construct.
+let kwBoundNames: string[] = []
+
+// `kwBoundNames.length` before the most recent parameter list, for the function that owns it.
+let kwParamsMark = 0
+
+function kwTrimTo(n: i32) {
+  while kwBoundNames.length > n { kwBoundNames.pop() }
+  0
+}
+
+function kwBound(text: string): boolean {
+  let i = 0
+  while i < kwBoundNames.length {
+    if kwBoundNames[i] == text { return true }
+    i = i + 1
+  }
+  false
+}
+
+// The name token of a declaration of `role` ("a parameter", "a function", …), consumed: an
+// identifier's index; a hard keyword's index after one diagnostic naming it, recorded for
+// `kwUseAt`; otherwise -1 after `expect`'s diagnostic.
+function bindNameTok(role: string): i32 {
+  const t = peekTok()
+  const at = P.pos
+  if t.kind == "IDENT" {
+    advance()
+    return at
+  }
+  if keywordKind(t.text) != t.kind {
+    expect("IDENT")
+    return -1
+  }
+  P.diags.push(
+    {
+      msg: "`" + t.text + "` is a keyword and can't name " + role + " — rename it",
+      at: at,
+    },
+  )
+  kwBoundNames.push(t.text)
+  advance()
+  at
+}
+
+// Whether the keyword token at `i` is a use of a name `bindNameTok` recovered: its spelling
+// is in `kwBoundNames`, and the next token continues a value — an assignment, a member access,
+// an operator that cannot begin an expression, a call, or the end of the statement. The forms
+// that may take a `(` operand or stand alone keep those readings.
+function kwUseAt(i: i32): boolean {
+  const k = kindAt(i)
+  if k == "IDENT" || !kwBound(textAt(i)) { return false }
+  if keywordKind(textAt(i)) != k { return false }
+  const nx = kindAt(i + 1)
+  if (
+    nx == "EQUAL"
+    || isCompoundAssign(nx)
+    || nx == "DOT"
+    || nx == "QUESTION_DOT"
+  ) {
+    return true
+  }
+  if binPrec(nx) > 0 && !startsExprTok(nx) { return true }
+  const bare = k == "RETURN" || k == "BREAK" || k == "CONTINUE"
+  if bare { return false }
+  if nx == "LPAREN" {
+    // `if (c) {`, `while (c) {` and `match (x) {` are the keyword, and so is any statement a
+    // `{` ends or follows; a call is one with no `{` at all.
+    if k != "IF" && k != "WHILE" && k != "MATCH" { return true }
+    return !braceEndsStmt(i + 1)
+  }
+  isSyncKind(nx) || nx == "RPAREN" || nx == "RBRACK" || nx == "COMMA"
+}
+
+// Whether a `{` outside brackets appears between `from` and the end of its statement, or opens
+// the next line after it. Pure lookahead: the cursor stays put.
+function braceEndsStmt(from: i32): boolean {
+  let depth = 0
+  let i = from
+  while kindAt(i) != "EOF" {
+    const t = kindAt(i)
+    if t == "LPAREN" || t == "LBRACK" {
+      depth = depth + 1
+    } else if t == "RPAREN" || t == "RBRACK" {
+      depth = depth - 1
+    } else if depth <= 0 && t == "LBRACE" {
+      return true
+    } else if depth <= 0 && isSyncKind(t) {
+      while kindAt(i) == "NEWLINE" { i = i + 1 }
+      return kindAt(i) == "LBRACE"
+    }
+    i = i + 1
+  }
+  false
+}
+
 // Whether a delimited list continues past the element just parsed. A real `,` is consumed;
 // a missing one (`f(1 2)`) is diagnosed and inserted, so every element lands in the tree,
 // and `startsElem` is the caller's element-start test. The insert is same-line only, or a
@@ -486,7 +585,7 @@ function binOpAfterNewlines(): i32 {
 // statement.
 function isAfterNewlines(): i32 {
   const j = afterNewlines()
-  if kindAt(j) == "IS" { return j }
+  if kindAt(j) == "IS" && (j == P.pos || !kwUseAt(j)) { return j }
   -1
 }
 
@@ -1148,6 +1247,18 @@ function parsePrimary() {
   // before any token is consumed so it anchors at the leading token.
   const p0 = peekTok().start
   const k = peekKind()
+  // D3069 — a keyword a binding position already took as a name, read back as that name.
+  // `if`/`match` and the literals keep their meaning unless no operand can follow them.
+  if kwBound(peekTok().text) && keywordKind(peekTok().text) == k {
+    const keeps = k == "IF"
+      || k == "MATCH"
+      || k == "TRUE"
+      || k == "FALSE"
+      || k == "NULL"
+    if !keeps || kwUseAt(P.pos) {
+      return mkIdent(btValueName(advance().text), p0)
+    }
+  }
   if k == "NUMBER" { return mkNum(advance().text, p0) }
   if k == "STRING" { return mkStr(advance().text, p0) }
   if k == "TEMPLATE" || k == "TEMPLATE_HEAD" { return parseTemplate(p0) }
@@ -1985,13 +2096,10 @@ function parseLet() {
   const p0 = peekTok().start // the `let`/`const` keyword
   const kw = advance().text  // "let" or "const"
   let name = ""
-  let nameTok = -1
-  if peekKind() == "IDENT" {
-    nameTok = P.pos // the name token's index (consumed next)
-    name = advance().text
-  } else {
-    expect("IDENT")
-  }
+  let role = "a variable"
+  if kw == "const" { role = "a constant" }
+  const nameTok = bindNameTok(role)
+  if nameTok >= 0 { name = textAt(nameTok) }
   let ty = -1
   if accept("COLON") { ty = parseType() }
   let init = -1
@@ -2429,13 +2537,8 @@ function parseParam() {
   const p0 = peekTok().start // the parameter's name token, or its `...`
   const rest = accept("ELLIPSIS")
   let name = ""
-  let nameTok = -1
-  if peekKind() == "IDENT" {
-    nameTok = P.pos
-    name = advance().text
-  } else {
-    expect("IDENT")
-  }
+  const nameTok = bindNameTok("a parameter")
+  if nameTok >= 0 { name = textAt(nameTok) }
   const opt = accept("QUESTION")
   if rest {
     if opt {
@@ -2523,6 +2626,7 @@ function parseParam() {
 // a trailing comma is allowed. A rest parameter's POSITION is ruled on here, where the whole
 // list is in hand: `parseParam` reads the `...`, `restPositionCheck` places it.
 function parseParamList() {
+  const kwMark = kwBoundNames.length
   expect("LPAREN")
   skipNewlines()
   const params: i32[] = []
@@ -2546,6 +2650,7 @@ function parseParamList() {
   }
   expectClose("RPAREN")
   restPositionCheck(params)
+  kwParamsMark = kwMark
   params
 }
 
@@ -2610,6 +2715,7 @@ function parseFuncBodyAndBuild(
   // D1045 — the body's live type parameters are pushed here rather than in `parseFuncHead`,
   // because this is the one entry every body goes through and the signature is already parsed.
   const btTpSaved = btTyParams.length
+  const kwSaved = kwParamsMark
   let tpi = 0
   while tpi < typarams.length {
     btTyParams.push(typarams[tpi])
@@ -2624,6 +2730,7 @@ function parseFuncBodyAndBuild(
     const bix = mkFunc(name, typarams, params, ret, mkBlock(stmts, -1), funcPos)
     mkDeclNameTok(bix, nameTok)
     btTyParamsTrimTo(btTpSaved)
+    kwTrimTo(kwSaved)
     return bix
   }
   let scan = P.pos + 1
@@ -2647,12 +2754,14 @@ function parseFuncBodyAndBuild(
     )
     mkDeclNameTok(oix, nameTok)
     btTyParamsTrimTo(btTpSaved)
+    kwTrimTo(kwSaved)
     return oix
   }
   const body = parseBlock()
   const fix = mkFunc(name, typarams, params, ret, body, funcPos)
   mkDeclNameTok(fix, nameTok)
   btTyParamsTrimTo(btTpSaved)
+  kwTrimTo(kwSaved)
   fix
 }
 
@@ -2894,7 +3003,8 @@ function parseFuncHead(requireName: boolean) {
       )
     }
   } else if requireName {
-    expect("IDENT")
+    nameTok = bindNameTok("a function")
+    if nameTok >= 0 { name = textAt(nameTok) }
   }
   // D46 — `==` and `!=` are not overloadable, and this is the one place both spellings
   // converge, so one test covers the symbol-token arm and the quoted arm. Rejected rather
@@ -3537,26 +3647,18 @@ function parseWhile(label: string) {
 function parseFor(label: string) {
   const p0 = peekTok().start // the `for` keyword
   advance()                  // "for"
+  const kwSaved = kwBoundNames.length
   let v = ""
-  let vTok = -1
-  if peekKind() == "IDENT" {
-    vTok = P.pos
-    v = advance().text
-  } else {
-    expect("IDENT")
-  }
+  const vTok = bindNameTok("a loop variable")
+  if vTok >= 0 { v = textAt(vTok) }
   // The optional SECOND binding (`for v, i in xs`). A comma has no other meaning in a
   // for-head, so it is unambiguous here and needs no lookahead.
   let v2 = ""
   let v2Tok = -1
   if peekKind() == "COMMA" {
     advance()
-    if peekKind() == "IDENT" {
-      v2Tok = P.pos
-      v2 = advance().text
-    } else {
-      expect("IDENT")
-    }
+    v2Tok = bindNameTok("a loop variable")
+    if v2Tok >= 0 { v2 = textAt(v2Tok) }
   }
   // soft keyword `in`
   if peekKind() == "IDENT" && peekTok().text == "in" {
@@ -3598,6 +3700,7 @@ function parseFor(label: string) {
     }
     const frix = mkForRange(v, first, to, step, excl, rbody, label, p0)
     mkDeclNameTok(frix, vTok)
+    kwTrimTo(kwSaved)
     return frix
   }
   const ibody = parseBracedBody(
@@ -3605,6 +3708,7 @@ function parseFor(label: string) {
   )
   const fiix = mkForIn(v, v2, first, ibody, label, p0)
   mkDeclNameTok(fiix, vTok)
+  kwTrimTo(kwSaved)
   fiix
 }
 
@@ -3648,6 +3752,7 @@ function parseBlock() {
   // D1045: a block opens a `type` scope. The mark is taken here and trimmed at
   // the close, which is the whole of "lexically scoped to the block".
   const btSaved = btNames.length
+  const kwSaved = kwBoundNames.length
   btDepth = btDepth + 1
   // D1581 — a block holds statements, so its newlines are terminators again even
   // inside `f(() => { … })`. Without the reset, `a` NEWLINE `-b` in a lambda body
@@ -3666,6 +3771,7 @@ function parseBlock() {
   expectClose("RBRACE")
   btDepth = btDepth - 1
   btTrimTo(btSaved)
+  kwTrimTo(kwSaved)
   mkBlock(stmts, p0)
 }
 
@@ -3857,6 +3963,9 @@ export function parseStmt() {
   // malformed generic in an earlier declaration — drop it rather than let it silently close
   // some later unrelated `Box<T` annotation.
   pendingGt = 0
+  if kwUseAt(P.pos) {
+    return valueIfDrop(parseExpr()) // D3069, see `kwBoundNames`
+  }
   // `export` is a top-level visibility modifier — the back end exports every
   // top-level function by name regardless, so the AST drops the modifier and
   // parses the underlying `function`/`type`/`let`/`const` declaration.
@@ -4107,6 +4216,7 @@ export function parseProgram() {
   btIsNew = []
   btTyParams = []
   btHoisted = []
+  kwBoundNames = []
   const p0 = peekTok().start // the first token of the source
   const stmts: i32[] = []
   let going = true
@@ -4116,6 +4226,8 @@ export function parseProgram() {
       going = false
     } else if k == "NEWLINE" || k == "SEMI" {
       advance()
+    } else if kwUseAt(P.pos) {
+      stmts.push(parseStmt())
     } else if k == "IMPORT" {
       stmts.push(parseImport())
     } else if k == "EXPORT" && kindAt(P.pos + 1) == "LBRACE" {
