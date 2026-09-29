@@ -7966,6 +7966,9 @@ function objTysMayAlias(a: i32, b: i32): boolean {
 // bare name's narrowing is a shadowing `declare`, so retiring it writes the declared type back.
 function retireNarrowingsForWrite(tgtIx: i32, rt0: i32, atIx: i32) {
   let rt = rt0
+  // A re-check of the write (a hole body checked again at its pin) answers afresh: the answer
+  // an earlier check banked at the hole's own type is not this one's.
+  clearAsgNarTyIx(atIx)
   const tgtKey = placeKeyOf(tgtIx)
   retireAliasedNarrowings(tgtIx, tgtKey, rt, atIx)
   // A variable-index write names no cell and therefore may have hit any of them. `xs[i] = null`
@@ -17040,7 +17043,10 @@ function binCstrsHold(bNames: string[], bTys: i32[], calleeFn: i32) {
       const crt = substTyDeep(binCstrRt[ci], bNames, bTys)
       if !tyHasHole(clt) {
         if !tyHasHole(crt) {
-          if !binOpDefinedFor(binCstrOp[ci], clt, crt) { return false }
+          if eqLitNonMember(clt, crt) { return false }
+          if !eqLitMemberOk(clt, crt) && !eqLitMemberOk(crt, clt) {
+            if !binOpDefinedFor(binCstrOp[ci], clt, crt) { return false }
+          }
         }
       }
     }
@@ -32704,6 +32710,45 @@ function cstrOwnedBy(owner: i32, calleeFn: i32) {
   owner == calleeFn
 }
 
+// The type an equality's deferred constraint records for operand `opIx` of type `ty`: a
+// literal's own literal type, which a literal-union pin compares against as the direct spelling
+// does (`eqLitMemberOk`), else `ty`.
+function eqCstrOperandTy(op: string, opIx: i32, ty: i32): i32 {
+  if op != "==" && op != "!=" { return ty }
+  const lit = litTyOfExpr(opIx)
+  if lit < 0 { return ty }
+  lit
+}
+
+// Whether `lit` is a literal type that literal-bearing `other` admits: `x == "b"` at a pin that
+// holds `"b"` is the direct spelling's comparison, which softening the literal would refuse.
+function eqLitMemberOk(lit: i32, other: i32): boolean {
+  if lit < 0 || lit >= T.tys.length || !(T.tys[lit] is TyLit) { return false }
+  if !isLitBearing(other) { return false }
+  assignable(lit, other)
+}
+
+// Whether an equality between `a` and `b` sets a literal against a literal-bearing type that does
+// not admit it, in either order: the closed-set comparison the direct spelling refuses.
+function eqLitNonMember(a: i32, b: i32): boolean {
+  if eqLitOutside(a, b) { return true }
+  eqLitOutside(b, a)
+}
+
+// `eqLitNonMember` with the literal on the `lit` side.
+function eqLitOutside(lit: i32, other: i32): boolean {
+  if lit < 0 || lit >= T.tys.length || !(T.tys[lit] is TyLit) { return false }
+  if !isLitBearing(other) { return false }
+  !assignable(lit, other)
+}
+
+// `ty` with a bare literal type softened to its base, as a recorded equality operand is
+// compared and reported everywhere but `eqLitMemberOk`.
+function softenBareLitTy(ty: i32): i32 {
+  if ty < 0 || ty >= T.tys.length || !(T.tys[ty] is TyLit) { return ty }
+  softenLitTy(ty)
+}
+
 // Records a deferred binary-op constraint when either operand is a hole — the body can't
 // yet decide the operator's form, so the generic call site validates it under substitution.
 // Stamped with the owning declaration, since a `T` in some other generic is a different `T`
@@ -35119,8 +35164,8 @@ function validateBinCstrs(
   let ci = 0
   while ci < nOrigB {
     if cstrOwnedBy(binCstrFn[ci], calleeFn) {
-      const clt = substTyDeep(binCstrLt[ci], bNames, bTys)
-      const crt = substTyDeep(binCstrRt[ci], bNames, bTys)
+      let clt = substTyDeep(binCstrLt[ci], bNames, bTys)
+      let crt = substTyDeep(binCstrRt[ci], bNames, bTys)
       // Re-records only when the callee is named — an unnamed call cannot reassign ownership,
       // or a HOF's own element hole could adopt a sibling generic's constraint as its own.
       if calleeFn >= 0 {
@@ -35130,7 +35175,36 @@ function validateBinCstrs(
           }
         }
       }
-      if !tyHasHole(clt) {
+      let litHolds = false
+      if !tyHasHole(clt) && !tyHasHole(crt) {
+        litHolds = eqLitMemberOk(clt, crt) || eqLitMemberOk(crt, clt)
+        // A literal outside the pin's closed set is refused, as the direct spelling is (D3158).
+        if !litHolds && eqLitNonMember(clt, crt) {
+          litHolds = true
+          let lWho = "a type parameter is compared with `"
+            + binCstrOp[ci]
+            + "` here: "
+          if who != "" {
+            lWho = "`"
+              + who
+              + "` compares its type parameter with `"
+              + binCstrOp[ci]
+              + "` here: "
+          }
+          tErr(
+            lWho
+              + "cannot compare "
+              + tyToStr(clt)
+              + " with "
+              + tyToStr(crt)
+              + " — not a member of the union",
+            ix,
+          )
+        }
+        clt = softenBareLitTy(clt)
+        crt = softenBareLitTy(crt)
+      }
+      if !tyHasHole(clt) && !litHolds {
         if !tyHasHole(crt) {
           // The equality refusal (in the direct spelling's own words) replaces the generic
           // sentence here, with the attribution placed in front since it ends on a remedy clause.
@@ -48236,6 +48310,15 @@ export function asgNarTyIxOf(ix: i32) {
   }
   -1
 }
+// Forget both answers banked at assignment node `ix`, before the check that re-derives them.
+function clearAsgNarTyIx(ix: i32) {
+  if ix >= 0 && ix < asgNarTyIx.length { asgNarTyIx[ix] = -1 }
+  if asgKeepNarrow.length > 0 && (asgKeepNarrow[ix] ?? false) {
+    asgKeepNarrow[ix] = false
+  }
+  0
+}
+
 // Bank `asgNarTyIxOf`'s answer at the assignment node.
 function recordAsgNarTyIx(ix: i32, ty: i32) {
   if ix < 0 || ty < 0 { return 0 }
@@ -52516,7 +52599,15 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
   }
   // A binary op with a hole operand can't decide its form until the hole is bound at the call —
   // record the deferred constraint (skipping assignment / logical, handled by their own arms).
-  if op != "=" && op != "&&" && op != "||" { noteBinCstr(lt, op, rt) }
+  if op != "=" && op != "&&" && op != "||" {
+    if tyHasHole(lt) || tyHasHole(rt) {
+      noteBinCstr(
+        eqCstrOperandTy(op, n.binLeft, lt),
+        op,
+        eqCstrOperandTy(op, n.binRight, rt),
+      )
+    }
+  }
   // Nominal newtype (P1.5): every non-assignment binary operator's operands must carry the
   // same brand — structural rules can't see it (`sameNumeric` compares `primName`, ordering skips `assignable`).
   if op != "=" && op != "&&" && op != "||" && op != "??" {
