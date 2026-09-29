@@ -3665,6 +3665,31 @@ function letInitLoopElemKind(letIx: i32, fnIx: i32): VKind | null {
   null
 }
 
+// Whether the un-annotated binding at `letIx` in frame `fnIx` bare-copies a frame `let` that
+// holds the union box, `depth` copies down the chain: the box a classifier outside the frame's
+// emission reads through the chain's declarations rather than the live locals (D3139).
+function letInitCopiesBox(letIx: i32, fnIx: i32, depth: i32): boolean {
+  if depth <= 0 || fnIx < 0 || letIx < 0 { return false }
+  const d = P.nodes[letIx]
+  if !(d is LetDecl) { return false }
+  const ix = unwrapParen(d.letInit)
+  if ix < 0 { return false }
+  const e = P.nodes[ix]
+  if !(e is Ident) { return false }
+  const fn = P.nodes[fnIx]
+  if !(fn is FuncDecl) { return false }
+  const src = parentLetOfAt(fn.fnBody, sidOfNode(ix), ix)
+  if src < 0 || src == letIx { return false }
+  const sd = P.nodes[src]
+  if !(sd is LetDecl) { return false }
+  if sd.letType >= 0 { return letAnnIsUnion(src) }
+  if exprUnion(sd.letInit, fnIx) && !exprIsLitAtom(sd.letInit, fnIx) {
+    return true
+  }
+  if letInitLoopElemKind(src, fnIx) == "union" { return true }
+  letInitCopiesBox(src, fnIx, depth - 1)
+}
+
 // Whether node `ix` is a read typed as only a narrowing of a wider box can be: a record, a
 // nullable, or a literal union. The cheap pre-test of the narrowed-cell rungs, which a read
 // typed at the whole box never needs.
@@ -3720,7 +3745,7 @@ function readLoopElemKind(ix: i32, name: string, fnIx: i32): VKind | null {
   const lp = readLoopNodeOf(ix, name, fnIx)
   if lp < 0 { return null }
   const ln = P.nodes[lp]
-  if ln is ForIn { return forInElemKind(ln.fiIter, fnIx) }
+  if ln is ForIn { return forInElemKind(frameBlindIter(ln.fiIter, fnIx), fnIx) }
   null
 }
 
@@ -5780,7 +5805,10 @@ export function capScan(ix: i32, bound: {[string]: i32}, caps: string[]) {
     capBind(bound, n.fiVar)
     if n.fiVar2 != "" { capBind(bound, n.fiVar2) }
     const lmark = cnModLoopName.length
-    if cnRecording && cnScanFnIx < 0 { cnModLoopPush(n) }
+    // Only a body declaring a closure has a narrowing to record for it.
+    if cnRecording && cnScanFnIx < 0 && subtreeHasFuncDecl(n.fiBody) {
+      cnModLoopPush(n)
+    }
     capScan(n.fiBody, bound, caps)
     while cnModLoopName.length > lmark {
       cnModLoopName.pop()
@@ -5972,7 +6000,7 @@ export function parentBindingOf(fe: i32, name: string) {
       }
       i = i + 1
     }
-    return parentLetOf(pfn.fnBody, name)
+    return frameLetAt(pfn.fnBody, name, captureDeclAt(fe))
   }
   -1
 }
@@ -6016,8 +6044,48 @@ function captureLoopNodeOf(fe: i32, name: string): i32 {
   if par < 0 { return moduleLoopEnclosing(fe, name) }
   if par >= fnStmts.length { return -1 }
   const pfn = P.nodes[fnStmts[par]]
-  if pfn is FuncDecl { return parentLoopVarOf(pfn.fnBody, name) }
+  if pfn is FuncDecl { return frameLoopEnclosing(fe, pfn.fnBody, name) }
   -1
+}
+
+// The loop in frame body `body` binding `name` whose body holds lifted frame `fe`'s
+// declaration, the innermost first; else the frame's first loop binding it. A frame may walk
+// several loops under one name, each over its own element type (D3139).
+function frameLoopEnclosing(fe: i32, body: i32, name: string): i32 {
+  const at = captureDeclAt(fe)
+  if at >= 0 {
+    const hit = modLoopHolding(body, name, at)
+    if hit >= 0 { return hit }
+  }
+  parentLoopVarOf(body, name)
+}
+
+// The `let` in frame body `body` a capture written at `at` reads as `name`, or -1 when a loop
+// variable enclosing `at` shadows every such `let` or none binds it. A frame may bind one
+// name in several blocks and loops, each at its own type (D3139).
+function frameLetAt(body: i32, name: string, at: i32): i32 {
+  if at < 0 { return parentLetOf(body, name) }
+  const li = parentLetOfAt(body, sidOf(name), at)
+  const lp = modLoopHolding(body, name, at)
+  if lp < 0 { return li }
+  if li < 0 { return -1 }
+  // A `let` inside the loop shadows its variable; one outside it is shadowed.
+  if nodeSubtreeHas(lp, li) { return li }
+  -1
+}
+
+// The source node lifted frame `fe` is written as, its template's for an instance, or -1: the
+// position a capture's binding is resolved at.
+function captureDeclAt(fe: i32): i32 {
+  if fe < 0 || fe >= fnStmts.length { return -1 }
+  if (
+    fe < fnInstOrigin.length
+    && fnInstOrigin[fe] >= 0
+    && fnInstOrigin[fe] < fnStmts.length
+  ) {
+    return fnStmts[fnInstOrigin[fe]]
+  }
+  fnStmts[fe]
 }
 
 // Whether a captured loop variable `name` is its `for-in`'s SECOND name — a map's value or a
@@ -6048,35 +6116,55 @@ function captureLoopVarIterOf(fe: i32, name: string): i32 {
   if par >= fnStmts.length { return -1 }
   const pfn = P.nodes[fnStmts[par]]
   if pfn is FuncDecl {
-    const lv = parentLoopVarOf(pfn.fnBody, name)
+    const lv = frameLoopEnclosing(fe, pfn.fnBody, name)
     if lv < 0 { return -1 }
     const ln = P.nodes[lv]
-    if ln is ForIn {
-      const it = ln.fiIter
-      // A bare local iterable is the one storage class this position cannot read: every rung
-      // of `forInElemKind`'s Ident arm is frame-independent except `declaredKind`, which reads
-      // the live scope stack, and the type section runs with no frame's locals bound. Re-ask
-      // against the binding's initializer, widening only where the answer is the default.
-      const ek = forInElemKind(it, fnStmts[par])
-      if ek == null || ek == "i32" {
-        const itn = P.nodes[unwrapParen(it)]
-        if itn is Ident {
-          const li = parentLetOf(pfn.fnBody, itn.identName)
-          if li >= 0 {
-            const ld = P.nodes[li]
-            if ld is LetDecl {
-              if ld.letInit >= 0 {
-                const iek = forInElemKind(ld.letInit, fnStmts[par])
-                if iek != null && iek != "i32" { return ld.letInit }
-              }
-            }
-          }
-        }
-      }
-      return it
-    }
+    if ln is ForIn { return frameBlindIter(ln.fiIter, fnStmts[par]) }
   }
   -1
+}
+
+// Whether the read `ix` of the `let` at `srcIx` is typed as that `let` is (no narrowing between
+// the declaration and the read), so a copy made there has the `let`'s own cell (D3139).
+function copyReadIsUnnarrowed(ix: i32, srcIx: i32): boolean {
+  if ix < 0 || srcIx < 0 { return false }
+  const sd = P.nodes[srcIx]
+  if !(sd is LetDecl) { return false }
+  let st = -1
+  if sd.letType >= 0 {
+    st = nodeTyIxOf(sd.letType)
+  } else {
+    st = nodeTyIxOf(sd.letInit)
+  }
+  const rt = nodeTyIxOf(ix)
+  if st < 0 || rt < 0 { return false }
+  tySame(st, rt)
+}
+
+// The node to classify iterable `it` of frame `fnIx` by outside that frame's emission. A bare
+// local iterable is the one storage class this position cannot read: every rung of
+// `forInElemKind`'s Ident arm is frame-independent except `declaredKind`, which reads the live
+// scope stack, so it is re-asked of the binding's initializer where the answer is the default.
+function frameBlindIter(it: i32, fnIx: i32): i32 {
+  const ek = forInElemKind(it, fnIx)
+  if ek != null && ek != "i32" { return it }
+  if fnIx < 0 { return it }
+  const fn = P.nodes[fnIx]
+  if !(fn is FuncDecl) { return it }
+  const itx = unwrapParen(it)
+  if itx < 0 { return it }
+  const itn = P.nodes[itx]
+  if !(itn is Ident) { return it }
+  const li = parentLetOfAt(fn.fnBody, sidOfNode(itx), itx)
+  if li < 0 { return it }
+  const ld = P.nodes[li]
+  if ld is LetDecl {
+    if ld.letInit >= 0 {
+      const iek = forInElemKind(ld.letInit, fnIx)
+      if iek != null && iek != "i32" { return ld.letInit }
+    }
+  }
+  it
 }
 
 // The `for-in` variable an un-annotated captured binding `name` of lifted frame `fe` is a bare
@@ -6098,9 +6186,14 @@ function captureLoopCopySrcAt(fe: i32, name: string, depth: i32): string {
     if src is Ident {
       const sn = src.identName
       if sn == name { return "" }
-      // A copy of a copy is typed as the loop variable at the end of the chain.
-      if parentBindingOf(fe, sn) >= 0 {
-        return captureLoopCopySrcAt(fe, sn, depth + 1)
+      // A copy of a copy is typed as the loop variable at the end of the chain, and an
+      // un-narrowed copy of a `let` as that `let`, whose cell only the frame's locals know.
+      const sb = parentBindingOf(fe, sn)
+      if sb >= 0 {
+        const deeper = captureLoopCopySrcAt(fe, sn, depth + 1)
+        if deeper != "" { return deeper }
+        if copyReadIsUnnarrowed(unwrapParen(bn.letInit), sb) { return sn }
+        return ""
       }
       // A boxed element is not redirected: the closure's narrowed reads of the copy resolve
       // its union through the copy's own binding, which has no loop in scope (D2523).
@@ -21057,7 +21150,7 @@ function letInitIsNulLitBox(init: i32, fnIx: i32): boolean {
   if !nodeTyIsNulLitUnion(ix) { return false }
   const e = P.nodes[ix]
   if !(e is Ident || e is Member || e is Index) { return false }
-  exprUnion(ix, fnIx)
+  letInitIsBox(ix, fnIx)
 }
 
 // True if `name` resolves (param / local / module global) to a BOOLEAN binding:
@@ -34281,8 +34374,10 @@ export function letIsUnion(letIx: i32, fnIx: i32) {
       // A walk variable read at a type that is itself the box, asked outside the frame (D3139).
       const li = unwrapParen(d.letInit)
       if li >= 0 && P.nodes[li] is Ident && nodeTyIsUnionShaped(li) {
-        if letInitLoopElemKind(letIx, fnIx) == "union" {
-          if nodeTyIsBoxRep(li) { return true }
+        if nodeTyIsBoxRep(li) {
+          if letInitLoopElemKind(letIx, fnIx) == "union" { return true }
+          // …and a copy of a copy, whose source's box only the frame's locals record.
+          if letInitCopiesBox(letIx, fnIx, 8) { return true }
         }
       }
     }
@@ -34563,7 +34658,9 @@ function readLoopUnionName(atIx: i32, name: string, fnIx: i32): string {
   const lp = readLoopNodeOf(atIx, name, fnIx)
   if lp < 0 { return "" }
   const ln = P.nodes[lp]
-  if ln is ForIn { return forInIterUnionElemName(ln.fiIter, fnIx) }
+  if ln is ForIn {
+    return forInIterUnionElemName(frameBlindIter(ln.fiIter, fnIx), fnIx)
+  }
   ""
 }
 
