@@ -628,6 +628,7 @@ import {
   monoHoleSubT,
   monoInstFe,
   monoInstOrig,
+  monoJoinLiftedLam,
   monoOrigNode,
   monoParamPinTy,
   monoTwoListRet,
@@ -29903,6 +29904,20 @@ export function iterElemPinTy(iterIx: i32, fnIx: i32): i32 {
       if et >= 0 && !tyHasTyVar(et) { return et }
     }
   }
+  // An `if` expression holds what both its arms hold there (D3125).
+  if n is IfStmt {
+    const ta = iterElemPinTy(ifArmValueExpr(n.ifThen), fnIx)
+    let ea = -1
+    if n.ifElse >= 0 {
+      if P.nodes[n.ifElse] is IfStmt {
+        ea = iterElemPinTy(n.ifElse, fnIx)
+      } else {
+        ea = iterElemPinTy(ifArmValueExpr(n.ifElse), fnIx)
+      }
+    }
+    if ta >= 0 && ea >= 0 && tyEq(ta, ea) { return ta }
+    return -1
+  }
   // A list literal of the instance's own parameter, `[x, x]`, holds that parameter's pin.
   if n is ArrayLit {
     const ln = arrLitSameIdentName(n.arrElems)
@@ -30019,6 +30034,119 @@ export function pinReadProvesNonNull(ix: i32, fnIx: i32): boolean {
   let pt = valueReadPinTy(ix, fnIx, 0)
   if pt < 0 { pt = capturedReadPinTy(ix, fnIx) }
   pt >= 0 && tyProvesNonNull(pt)
+}
+
+// Refuses, in the instance body `blockIx` of `fnIx`, a `.map` result delivered through an
+// assignment, a return, a tail value or an `if` expression's arm when its callback builds only
+// at this pin (`mapPinLiftedValue`): those deliveries type the result from their destination,
+// which that callback's element does not match. -1 when it refuses (D3125).
+export function mapPinLiftedDeliveries(blockIx: i32, fnIx: i32): i32 {
+  if blockIx < 0 || !fnValUsed || !fnInMonoInstance(fnIx) { return 0 }
+  const b = P.nodes[blockIx]
+  if b is Block {
+    const ss = b.blkStmts
+    const li = ss.length - 1
+    if li >= 0 {
+      const tl = ss[li]
+      if stmtIsTailValue(tl, fnIx) && mapPinLiftedValue(tl, fnIx, 0) {
+        return mapPinLiftedFail(tl)
+      }
+    }
+  }
+  mapPinLiftedWalk(blockIx, fnIx)
+}
+
+// The refusal `mapPinLiftedDeliveries` names at `at`; -1.
+function mapPinLiftedFail(at: i32): i32 {
+  emitFailAt(
+    "emitProgram: a `.map` result whose callback builds only at this pin is lowered only as a local's initializer or read in place",
+    at,
+  )
+}
+
+// `mapPinLiftedDeliveries` over the statements under `ix`, a nested function's aside.
+function mapPinLiftedWalk(ix: i32, fnIx: i32): i32 {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const n = P.nodes[ix]
+  if n is FuncDecl { return 0 }
+  if n is BinExpr {
+    if n.binOp == "=" && mapPinLiftedValue(n.binRight, fnIx, 0) {
+      return mapPinLiftedFail(ix)
+    }
+  }
+  if n is RetStmt {
+    if mapPinLiftedValue(n.retArg, fnIx, 0) { return mapPinLiftedFail(ix) }
+  }
+  if n is LetDecl {
+    if n.letInit >= 0 && P.nodes[unwrapParen(n.letInit)] is IfStmt {
+      if mapPinLiftedValue(n.letInit, fnIx, 0) { return mapPinLiftedFail(ix) }
+    }
+  }
+  const kids = nodeChildren(ix)
+  let k = 0
+  while k < kids.length {
+    if mapPinLiftedWalk(kids[k], fnIx) < 0 { return -1 }
+    k = k + 1
+  }
+  0
+}
+
+// Whether `vx`, an `if` expression's arms followed, is a `.map` whose inline callback only the
+// pin of `fnIx` makes buildable: a return join its clone takes, or a null test the pin folds.
+function mapPinLiftedValue(vx: i32, fnIx: i32, depth: i32): boolean {
+  if vx < 0 || vx >= P.nodes.length { return false }
+  const x = unwrapParen(vx)
+  if x < 0 || depth > 8 { return false }
+  const n = P.nodes[x]
+  if n is IfStmt {
+    if mapPinLiftedValue(ifArmValueExpr(n.ifThen), fnIx, depth + 1) {
+      return true
+    }
+    if n.ifElse < 0 { return false }
+    if P.nodes[n.ifElse] is IfStmt {
+      return mapPinLiftedValue(n.ifElse, fnIx, depth + 1)
+    }
+    return mapPinLiftedValue(ifArmValueExpr(n.ifElse), fnIx, depth + 1)
+  }
+  if !(n is Call) { return false }
+  const callee = P.nodes[unwrapParen(n.callFn)]
+  if !(callee is Member) { return false }
+  if callee.memProp != "map" || n.callArgs.length != 1 { return false }
+  const fe = mfCallbackFe(n.callArgs[0], fnIx)
+  if fe < 0 || fe >= fnStmts.length { return false }
+  const cx = fnStmts[fe]
+  if monoJoinLiftedLam.get(cx) ?? false { return true }
+  const cf = P.nodes[cx]
+  if cf is FuncDecl { return nullTestFoldsAtPin(cf.fnBody, cx) }
+  false
+}
+
+// Whether a null test under `ix`, a nested function's aside, folds only at the pin of `fnIx`.
+function nullTestFoldsAtPin(ix: i32, fnIx: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = P.nodes[ix]
+  if n is FuncDecl { return false }
+  if n is BinExpr {
+    if n.binOp == "==" || n.binOp == "!=" {
+      const l = unwrapParen(n.binLeft)
+      const r = unwrapParen(n.binRight)
+      if l >= 0 && r >= 0 {
+        if P.nodes[r] is NullLit && pinReadProvesNonNull(l, fnIx) {
+          return true
+        }
+        if P.nodes[l] is NullLit && pinReadProvesNonNull(r, fnIx) {
+          return true
+        }
+      }
+    }
+  }
+  const kids = nodeChildren(ix)
+  let k = 0
+  while k < kids.length {
+    if nullTestFoldsAtPin(kids[k], fnIx) { return true }
+    k = k + 1
+  }
+  false
 }
 
 // `valueReadPinTy` of a name lifted frame `fnIx` captures, asked of the frame that declares
