@@ -7248,6 +7248,85 @@ flag.
   still validates every module it writes.
 * *An inline hint* (`@metadata.code.inline`): binaryen 133 still ignores it, as L8 found for 130.
 
+## `-O` inlines a small record's producer (2026-09-29) — plumb PL-057/058, owner ruling (B)
+
+**The ruling.** No tuple syntax: a SMALL record returned from a call that does not escape at the
+caller is the compiler's to lower without a `struct.new`. The ruling names wasm multi-value
+results as the lowering and asked for the cheaper route to be tried first.
+
+**The defect (D3261).** plumb's squad returns a five-field `Quat` from `slerp`, which has three
+callers and is binaryen size ~20, over the `-O` rung's always-inline 16. It stayed a call, and a
+`return` is a way out of `--heap2local`'s escape analysis, so every call allocated: 100M squads
+took 1.77–2.05 s and 270 MB under `vl run` at `-O` (1.76–1.91 s at `-O3`), against 0.57–0.70 s
+and 8 MB for plumb's module-globals workaround.
+
+**The rule.** The L4 escape step (`escape_inline_choice`) already inlined the callees a
+per-call struct is PASSED to. It now also chooses a callee that RETURNS one, on the same bounds
+(320 body bytes, no call cycle, the expanded and growth bounds), when:
+
+1. the result is a struct type no field, element, global or table can hold, that takes no part
+   in subtyping, and that has at most 8 fields (`ESCAPE_RECORD_MAX_FIELDS`), each a number or a
+   reference to a struct — a record, not a list or string wrapper;
+2. the callee allocates it, or gets it from a chosen producer (`wrap(k) = mk(k + 1)`);
+3. at some caller it stays: that caller hands it to no function that is not chosen and returns
+   it only if that caller is itself a chosen taker or a producer found useful. That is a least
+   fixpoint, computed by a worklist from callers down to callees, so a chain of producers whose
+   top leaks has no useful member and is not copied into every caller.
+
+"Held" now also covers a type some `ref.test`/`ref.cast`/`br_on_cast` targets. A union box
+stores its payload in an `anyref` field that names no struct type, so the field scan missed it,
+and a producer whose only callers box the result was inlined for no melt (+13–18% bytes, one
+module 382 → 886, in review). Getting a record back out of a box needs a cast, so the cast is
+the tell.
+
+Producers are found by a worklist up from the ones that allocate, and the choice runs in two
+rounds — the second without the producers the first found futile, which drops the takers only
+they had made worth choosing. The first version restarted the whole choice after each futile
+producer, one per restart on a chain: 20,000 chained producers built in 25 s against master's
+3.2 s. It is now 3.1 s, and 3,000 / 10,000 / 20,000-producer chains build byte-identically to
+master in the same time.
+
+A caller holding a chosen producer's record counts as allocating it, so a helper it is passed
+to (`score(r)`) is chosen by the existing rule. And any tiny loop-free callee (at most
+`RUN_ONCE_INLINE_LEAF_BYTES`, no call to a defined function) may be chosen although run-once code
+calls it — a producer or a struct-TAKING helper alike — as `run_once_hot_callees` already
+leaves such a leaf inlinable: its per-call work is too small for V8's baseline tier to matter,
+and the top-level loop is where a benchmark calls it.
+
+**Why not the multi-value ABI first.** Inlining gets plumb's shape all the way: the record
+version now beats the globals one, because the fields become locals where the workaround pays a
+`global.set`/`global.get` per field. The ABI remains the route for what inlining cannot reach —
+a producer over the bound (D3262) and a record type some other call site lets escape (D3263,
+since `--no-inline` is per callee and the escape test is per wasm type).
+
+**Measured** (100M squads, `-O`, one core, 5 interleaved rounds, load 3–5; wasmtime is `vl run`,
+V8 is node 24.11.1 instantiating the module):
+
+| build | wasmtime user s | RSS | V8 CPU s |
+| --- | --- | --- | --- |
+| record, master `-O` | 1.77–2.05 | 270–278 MB | 0.99–1.29 |
+| record, this `-O` | **0.36–0.50** | 8–17 MB | **0.46–0.48** |
+| globals `-O` (unchanged, byte-identical) | 0.57–0.70 | 8–16 MB | 0.65–0.79 |
+| record, master `-O3` | 1.76–1.91 | 270–278 MB | 0.75–0.82 |
+| record, this `-O3` | **0.36–0.37** | 8–16 MB | **0.47–0.49** |
+
+`slerp`'s `struct.new` is gone from both rungs' output (wasm-dis), and the module is 5,942 →
+5,893 bytes. A 126-program grid (1–8 fields of mixed f32/i32/f64/boolean and a nested record ×
+reads, read-then-escape, stored in a global, passed, returned on, rewritten, called from the
+top-level loop × a producer under and over the inline bound) prints the unoptimized build's
+output at both rungs, and its record allocations left fall from 206 to 161 of 252 modules: 122
+over the bound (D3262), 36 whose record type is stored somewhere (D3263), and 3 nested records'
+inner struct at `-O` only, which `-O3`'s second `--heap2local` melts. Byte-identical: all 90 `bench/` programs at both
+rungs, `plumb-shape-cost.py`'s two units, and the glob version. A second, 260-program grid from
+review (1/3/8/9 fields with and without a nested record × six producer shapes × seven uses ×
+seven ways to store the record, one or three callers, exported or not) prints the plain output
+at both rungs, with fewer allocation sites in 8 modules and more in none. The compiler at `-O` grows
++0.16% in the same time, and still self-compiles to the seed byte for byte. Without the
+field-shape bound, `std:fmt`'s `bnCopy` (an `i64[]` wrapper) was chosen and `map-string` grew
+8,395 → 12,165 bytes for no melt; the bound is what keeps a list wrapper out.
+`tests/fixtures/opt-escape/record-result.vl` in `tests/selfhost_native_release_escape_test.ts`
+pins the melt against the rung's own passes as control.
+
 ## `-O` inlines leaf helpers (2026-09-23) — plumb PL-027
 
 **The defect.** Binaryen inlines a function with several callers only when its size is at most

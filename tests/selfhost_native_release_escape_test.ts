@@ -6,7 +6,8 @@
 // function, so a state struct handed to small helpers stays on the heap unless every helper is
 // inlined first. The host now runs a step before each rung that inlines exactly those helpers.
 // Pinned here, per fixture and rung: the program's output is the unoptimized build's, and the
-// fixtures whose structs never escape carry no `struct.new` at all.
+// fixtures whose structs never escape carry no `struct.new` at all. `record-result.vl` is the
+// same for a small record RETURNED from a call and only read by the caller (plumb's squad).
 //
 // The CONTROL runs each rung's passes without the step and must find a `struct.new` left:
 // otherwise a fixture binaryen would have scalarised anyway passes whether or not the step
@@ -30,6 +31,7 @@ const DIR = `${ROOT}/tests/fixtures/opt-escape`;
 // fixture -> whether every struct it allocates stays off the heap once the step has run
 const FIXTURES: [string, boolean][] = [
   ["state-helpers", true],
+  ["record-result", true],
   ["identity-alias", true],
   ["escapes", false],
   ["cycle-helpers", false],
