@@ -3,6 +3,9 @@
 //   std/embedded.ts               the LSP bundle's + playground's module map
 //   scripts/vl-host/src/std_embedded.rs   the `vl` binary's baked-in std
 //
+// and, from the same walk, `compiler/std_receivers.vl`: std's receiver-style exports, which
+// the checker's missing-import hint names without loading the module (D3122).
+//
 // ONE GENERATOR, because a release `vl` now ships std inside it (D1573) and the
 // editor already did: two generators reading the same directory would still be
 // two things to keep fresh, and the pair going out of step is invisible — the
@@ -132,13 +135,167 @@ ${entries}
 `;
 };
 
+/** One exported `self`-function of std, as the checker's missing-import hint reads it. */
+export type StdReceiver = {
+  name: string;
+  spec: string;
+  self: string;
+  tparams: string[];
+  min: number;
+  max: number;
+};
+
+// The leaf type names a receiver spelling may use and still be nameable by a program
+// that imports nothing from the module: the checker's `builtinTyNames` minus `void`,
+// `never` and `v128`, none of which a value you call a method on can have.
+const RECV_LEAVES = new Set(["i32", "i64", "f32", "f64", "boolean", "string", "null", "u8"]);
+
+// Split `s` at the top-level occurrences of `sep` (a one-character separator), ignoring
+// any inside brackets, braces, parens or angle brackets. `=>` does not close a `<`.
+const splitTop = (s: string, sep: string): string[] => {
+  const out: string[] = [];
+  let depth = 0;
+  let start = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === "(" || c === "[" || c === "{" || c === "<") depth++;
+    else if (c === ")" || c === "]" || c === "}") depth--;
+    else if (c === ">" && s[i - 1] !== "=") depth--;
+    else if (c === sep && depth === 0) {
+      out.push(s.slice(start, i).trim());
+      start = i + 1;
+    }
+  }
+  const last = s.slice(start).trim();
+  if (last !== "") out.push(last);
+  return out;
+};
+
+/** Whether a program that imports nothing from the declaring module can hold a value of
+ * receiver spelling `self`: only builtin leaves, the function's own type parameters,
+ * `[]`, a leading `readonly` and `|`. A nominal receiver (`Buf`, `Json`) can only come
+ * from its module, which is then in the module graph and answered exactly there. */
+export const receiverIsBuiltinSpelled = (self: string, tparams: string[]): boolean => {
+  const body = self.startsWith("readonly ") ? self.slice("readonly ".length) : self;
+  return splitTop(body, "|").every((m) => {
+    let leaf = m;
+    while (leaf.endsWith("[]")) leaf = leaf.slice(0, -2);
+    return RECV_LEAVES.has(leaf) || tparams.includes(leaf);
+  });
+};
+
+/** Every exported, `.name`-callable `self`-function in `sources` whose receiver is
+ * builtin-spelled, then every re-export of one under the re-exporting module's key. */
+export const collectStdReceivers = (sources: [string, string][]): StdReceiver[] => {
+  const defs: StdReceiver[] = [];
+  const head = /^export function ([A-Za-z_][A-Za-z0-9_]*)\s*(<[^(]*>)?\s*\(/gm;
+  for (const [name, src] of sources) {
+    for (const m of src.matchAll(head)) {
+      const open = (m.index as number) + m[0].length;
+      let depth = 1;
+      let i = open;
+      while (depth > 0) {
+        const c = src[i++];
+        if (c === "(") depth++;
+        else if (c === ")") depth--;
+      }
+      const params = splitTop(src.slice(open, i - 1).replace(/\s+/g, " "), ",");
+      const selfMatch = /^self\s*:\s*(.+)$/.exec(params[0] ?? "");
+      if (!selfMatch) continue;
+      const tparams = m[2] ? splitTop(m[2].slice(1, -1), ",").map((t) => t.split(/[\s:]/)[0]) : [];
+      const self = selfMatch[1].trim();
+      if (!receiverIsBuiltinSpelled(self, tparams)) continue;
+      const rest = params.slice(1);
+      const variadic = rest.some((p) => p.startsWith("..."));
+      const required = rest.filter((p) => !p.startsWith("...") && !/=(?!>)/.test(p)).length;
+      defs.push({
+        name: m[1],
+        spec: `std:${name}`,
+        self,
+        tparams,
+        min: required,
+        max: variadic ? -1 : rest.length,
+      });
+    }
+  }
+  const reexports: StdReceiver[] = [];
+  const reexp = /^export \{([^}]*)\} from "(std:[^"]+)"/gm;
+  for (const [name, src] of sources) {
+    for (const m of src.matchAll(reexp)) {
+      for (const item of m[1].split(",").map((s) => s.trim()).filter((s) => s !== "")) {
+        const [orig, alias] = item.split(/\s+as\s+/);
+        for (const d of defs) {
+          if (d.spec === m[2] && d.name === orig) {
+            reexports.push({ ...d, name: alias ?? orig, spec: `std:${name}` });
+          }
+        }
+      }
+    }
+  }
+  return [...defs, ...reexports];
+};
+
+/** Render `compiler/std_receivers.vl`, the checker's copy of `collectStdReceivers`. */
+export const renderStdReceivers = (sources: [string, string][]): string => {
+  const rows = collectStdReceivers(sources)
+    .map((r) =>
+      `  stdRecvRow(${
+        [r.name, r.spec, r.self, r.tparams.join(",")].map((s) => JSON.stringify(s)).join(", ")
+      }, ${r.min}, ${r.max})`
+    )
+    .join("\n");
+  return `// GENERATED by \`deno task gen-std\` from \`std/*.vl\` — do not edit; tests/std_embedded_test.ts
+// gates freshness. One row per exported \`self\`-function of std whose receiver a program can
+// hold without importing the module (builtin leaves, the function's type parameters, \`[]\`,
+// \`readonly\`, \`|\`), then each re-export of one. The missing-import hint (D1230, D3122)
+// reads it for std modules the program's module graph does not contain.
+
+// Per row: the name \`.name(…)\` spells, the specifier that imports it, the \`self\` annotation
+// as written, the type parameter names \`,\`-joined, and the arguments after \`self\` — how many
+// are required and how many accepted (-1: a rest parameter).
+export let stdRecvName: string[] = []
+export let stdRecvSpec: string[] = []
+export let stdRecvSelf: string[] = []
+export let stdRecvTparams: string[] = []
+export let stdRecvMin: i32[] = []
+export let stdRecvMax: i32[] = []
+
+function stdRecvRow(
+  name: string,
+  spec: string,
+  recv: string,
+  tparams: string,
+  min: i32,
+  max: i32,
+) {
+  stdRecvName.push(name)
+  stdRecvSpec.push(spec)
+  stdRecvSelf.push(recv)
+  stdRecvTparams.push(tparams)
+  stdRecvMin.push(min)
+  stdRecvMax.push(max)
+}
+
+// Fills the rows on first call; later calls are no-ops.
+export function stdRecvLoad() {
+  if stdRecvName.length > 0 { return }
+${rows}
+}
+`;
+};
+
+const OUT_RECV = new URL("../compiler/std_receivers.vl", import.meta.url);
+
 if (import.meta.main) {
   const sources = await collectStdSources();
   const text = renderEmbedded(sources);
   await Deno.writeTextFile(OUT, text);
   const rust = renderEmbeddedRust(sources);
   await Deno.writeTextFile(OUT_RS, rust);
+  const recv = renderStdReceivers(sources);
+  await Deno.writeTextFile(OUT_RECV, recv);
   console.error(`wrote ${OUT.pathname} (${text.length} bytes)`);
   console.error(`wrote ${OUT_RS.pathname} (${rust.length} bytes)`);
+  console.error(`wrote ${OUT_RECV.pathname} (${recv.length} bytes)`);
   console.error(`std hash ${stdHash(sources)} over ${sources.length} modules`);
 }

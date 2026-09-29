@@ -691,3 +691,48 @@ Deno.test({
     `imported from the declarer; got ${JSON.stringify(edit.newText)}`,
   );
 });
+
+// D3122 (plumb PL-074): a program that imports NOTHING still gets the missing-import
+// diagnostic for a std receiver-style export, in the editor as on the CLI — the candidate
+// comes from the checker's std catalog, not from the module graph — and its quick-fix
+// writes an import that makes the file check clean.
+Deno.test({
+  name: "seed: an un-imported std array method names its module with no import in the file",
+  ignore,
+}, async () => {
+  const { checker, read } = checkerAndReader();
+  const src = "export function f(): i32 {\n  const xs = [1, 2, 3]\n  return xs.indexOf(2)\n}\n";
+  const diags = await checker.check(src, "/proj/main.vl", read);
+  const d = diags.find((x) => x.code === "ufcs-not-imported");
+  if (d === undefined) {
+    throw new Error(`expected the D1230 diagnostic; got ${JSON.stringify(diags.map((x) => x.message))}`);
+  }
+  assert(
+    d.message.startsWith("'indexOf' is not imported") &&
+      d.message.includes('add `import { indexOf } from "std:array"`'),
+    `message; got ${JSON.stringify(d.message)}`,
+  );
+  assert(
+    JSON.stringify(d.data) ===
+      JSON.stringify({ member: ["indexOf"], modules: ["std:array"], recv: ["i32[]"] }),
+    `payload; got ${JSON.stringify(d.data)}`,
+  );
+  const name = ufcsMissingImportAt(src, d);
+  assert(name === "indexOf", `the fix knows the member; got ${name}`);
+  const fixes = ufcsImportFixes(
+    src,
+    name!,
+    ufcsImportModules(d),
+    (s, key, n) => importInsertionEdit(s, key, n, (stmt) => checker.formatSrc?.(stmt)),
+  );
+  assert(fixes.length === 1, `one action; got ${JSON.stringify(fixes.map((f) => f.title))}`);
+  const edit = fixes[0].edits[0];
+  const lines = src.split("\n");
+  lines[edit.range.start.line] = lines[edit.range.start.line].slice(0, edit.range.start.character) +
+    edit.newText + lines[edit.range.end.line].slice(edit.range.end.character);
+  const after = await checker.check(lines.join("\n"), "/proj/main.vl", read);
+  assert(
+    after.length === 0,
+    `applying the fix must clear the file; got ${JSON.stringify(after.map((x) => x.message))}`,
+  );
+});
