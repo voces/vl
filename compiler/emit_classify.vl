@@ -234,7 +234,6 @@ import {
   tyNulLitUnionMemberTexts,
   tyOfMembers,
   tyPrimNameOf,
-  tyProvesNonNull,
   tyReachesUnion,
   tySame,
   tyScalarBaseIs,
@@ -628,7 +627,6 @@ import {
   monoHoleSubT,
   monoInstFe,
   monoInstOrig,
-  monoJoinLiftedLam,
   monoOrigNode,
   monoParamPinTy,
   monoTwoListRet,
@@ -29888,35 +29886,13 @@ export function iterElemPinTy(iterIx: i32, fnIx: i32): i32 {
         if li >= 0 {
           const d = P.nodes[li]
           if d is LetDecl {
-            if d.letType >= 0 {
-              et = tyStepElem(nodeTyIxOf(d.letType))
-            } else if d.letInit >= 0 {
-              et = tyStepElem(nodeTyIxOf(d.letInit))
-              // An initializer typed at a hole holds what it holds at the pin (D3125).
-              if et >= 0 && tyHasTyVar(et) && d.letInit != iterIx {
-                const it = iterElemPinTy(d.letInit, fnIx)
-                if it >= 0 { return it }
-              }
-            }
+            if d.letType >= 0 { et = tyStepElem(nodeTyIxOf(d.letType)) }
+            else if d.letInit >= 0 { et = tyStepElem(nodeTyIxOf(d.letInit)) }
           }
         }
       }
       if et >= 0 && !tyHasTyVar(et) { return et }
     }
-  }
-  // An `if` expression holds what both its arms hold there (D3125).
-  if n is IfStmt {
-    const ta = iterElemPinTy(ifArmValueExpr(n.ifThen), fnIx)
-    let ea = -1
-    if n.ifElse >= 0 {
-      if P.nodes[n.ifElse] is IfStmt {
-        ea = iterElemPinTy(n.ifElse, fnIx)
-      } else {
-        ea = iterElemPinTy(ifArmValueExpr(n.ifElse), fnIx)
-      }
-    }
-    if ta >= 0 && ea >= 0 && tyEq(ta, ea) { return ta }
-    return -1
   }
   // A list literal of the instance's own parameter, `[x, x]`, holds that parameter's pin.
   if n is ArrayLit {
@@ -29964,9 +29940,6 @@ function mapCbResultPinTy(cbIx: i32, recvIx: i32, fnIx: i32): i32 {
   if !(cb is FuncDecl) { return -1 }
   // A declared return is the result's element, which may be wider than what the body returns.
   if cb.fnRet >= 0 { return mapCbDeclRetPinTy(nodeTyIxOf(cb.fnRet), fnIx) }
-  // With two or more values handed back the checked join is the element, not the first (D3125).
-  const jt = mapCbJoinPinTy(cx, fnIx)
-  if jt >= 0 { return jt }
   const rx = unwrapParen(fnRetExprOf(cx))
   if rx < 0 { return -1 }
   const rn = identNameOrEmpty(rx)
@@ -29976,27 +29949,6 @@ function mapCbResultPinTy(cbIx: i32, recvIx: i32, fnIx: i32): i32 {
     if pi > 0 { return -1 }
   }
   valueReadPinTy(rx, fnIx, 0)
-}
-
-// The checked join of inline callback `cx`'s returned values at the pin of the instance `fnIx`,
-// by its exact bindings or its hole's; -1 for a callback handing back one value, or unresolved.
-function mapCbJoinPinTy(cx: i32, fnIx: i32): i32 {
-  const cb = P.nodes[cx]
-  if !(cb is FuncDecl) { return -1 }
-  const vals: i32[] = []
-  collectRetValues(cb.fnBody, vals)
-  if vals.length < 2 { return -1 }
-  const ft = nodeTyIxOf(cx)
-  if ft < 0 || ft >= T.tys.length { return -1 }
-  const f = T.tys[ft]
-  if !(f is TyFunc) { return -1 }
-  const et = mapCbDeclRetPinTy(f.fnRet, fnIx)
-  if et >= 0 || fnIx < 0 { return et }
-  const row = monoHoleSubRow.get(fnStmtsPosOf(fnIx)) ?? -1
-  if row < 0 || row >= monoHoleSubN.length { return -1 }
-  const st = substTyDeep(f.fnRet, monoHoleSubN[row], monoHoleSubT[row])
-  if st < 0 || tyHasTyVar(st) { return -1 }
-  st
 }
 
 // A callback's declared return `at` at the pin of the instance `fnIx`: itself when it names no
@@ -30024,245 +29976,6 @@ function arrLitReadsPinTy(elems: i32[], fnIx: i32): i32 {
     i = i + 1
   }
   t0
-}
-
-// Whether `ix`, a read whose checked type names a type parameter or hole, holds a type that
-// admits no `null` at the pin of `fnIx`, a lambda's pinned parameter included (D3126).
-export function pinReadProvesNonNull(ix: i32, fnIx: i32): boolean {
-  const ty = nodeTyIxOf(unwrapParen(ix))
-  if ty < 0 || !tyHasTyVar(ty) { return false }
-  let pt = valueReadPinTy(ix, fnIx, 0)
-  if pt < 0 { pt = capturedReadPinTy(ix, fnIx) }
-  pt >= 0 && tyProvesNonNull(pt)
-}
-
-// Refuses, in the instance body `blockIx` of `fnIx`, a `.map` result delivered through an
-// assignment, a return, a tail value or a bound `if` expression's arm that
-// `mapPinLiftedValue` finds unbuildable there. -1 when it refuses (D3125).
-export function mapPinLiftedDeliveries(blockIx: i32, fnIx: i32): i32 {
-  if blockIx < 0 || !fnValUsed || !fnInMonoInstance(fnIx) { return 0 }
-  const b = P.nodes[blockIx]
-  if b is Block {
-    const ss = b.blkStmts
-    const li = ss.length - 1
-    if li >= 0 {
-      const tl = ss[li]
-      if mapPinLiftedValue(tl, fnIx, 0, true) { return mapPinLiftedFail(tl) }
-    }
-  }
-  mapPinLiftedWalk(blockIx, fnIx)
-}
-
-// The refusal `mapPinLiftedDeliveries` names at `at`; -1.
-function mapPinLiftedFail(at: i32): i32 {
-  emitFailAt(
-    "emitProgram: a `.map` result whose callback builds only at this pin is lowered only as a local's initializer or read in place",
-    at,
-  )
-}
-
-// `mapPinLiftedDeliveries` over the statements under `ix`, a nested function's aside.
-function mapPinLiftedWalk(ix: i32, fnIx: i32): i32 {
-  if ix < 0 || ix >= P.nodes.length { return 0 }
-  const n = P.nodes[ix]
-  if n is FuncDecl { return 0 }
-  if n is BinExpr {
-    if n.binOp == "=" && mapPinLiftedValue(n.binRight, fnIx, 0, false) {
-      return mapPinLiftedFail(ix)
-    }
-  }
-  if n is RetStmt {
-    if (
-      n.retArg >= 0
-      && mapPinLiftedValue(
-        n.retArg,
-        fnIx,
-        0,
-        !(P.nodes[unwrapParen(n.retArg)] is IfStmt),
-      )
-    ) {
-      return mapPinLiftedFail(ix)
-    }
-  }
-  if n is LetDecl {
-    if n.letInit >= 0 && P.nodes[unwrapParen(n.letInit)] is IfStmt {
-      if mapPinLiftedValue(n.letInit, fnIx, 0, true) {
-        return mapPinLiftedFail(ix)
-      }
-    }
-  }
-  const kids = nodeChildren(ix)
-  let k = 0
-  while k < kids.length {
-    if mapPinLiftedWalk(kids[k], fnIx) < 0 { return -1 }
-    k = k + 1
-  }
-  0
-}
-
-// Whether `vx`, an `if` expression's arms followed, is a `.map` over a literal whose inline
-// callback builds only at the pin of `fnIx` (a join its clone takes, or a null test the pin
-// folds) and whose element the delivery cannot build: a box, record or `f64` over plain
-// elements, or with `niche`, a hole instance's nullable niche element (D3143).
-function mapPinLiftedValue(
-  vx: i32,
-  fnIx: i32,
-  depth: i32,
-  niche: boolean,
-): boolean {
-  if vx < 0 || vx >= P.nodes.length { return false }
-  const x = unwrapParen(vx)
-  if x < 0 || depth > 8 { return false }
-  const n = P.nodes[x]
-  if n is IfStmt {
-    if mapPinLiftedValue(ifArmValueExpr(n.ifThen), fnIx, depth + 1, niche) {
-      return true
-    }
-    if n.ifElse < 0 { return false }
-    if P.nodes[n.ifElse] is IfStmt {
-      return mapPinLiftedValue(n.ifElse, fnIx, depth + 1, niche)
-    }
-    return mapPinLiftedValue(ifArmValueExpr(n.ifElse), fnIx, depth + 1, niche)
-  }
-  if !(n is Call) { return false }
-  const callee = P.nodes[unwrapParen(n.callFn)]
-  if !(callee is Member) { return false }
-  if callee.memProp != "map" || n.callArgs.length != 1 { return false }
-  const fe = mfCallbackFe(n.callArgs[0], fnIx)
-  if fe < 0 || fe >= fnStmts.length { return false }
-  const cx = fnStmts[fe]
-  const cf = P.nodes[cx]
-  if !(cf is FuncDecl) { return false }
-  if (
-    !(monoJoinLiftedLam.get(cx) ?? false)
-    && !nullTestFoldsAtPin(cf.fnBody, cx)
-  ) {
-    return false
-  }
-  // The destination builds a literal receiver at the result's element (D3143); an
-  // un-annotated hole parameter's pin is the plain `i32` it is left at.
-  const recv = P.nodes[unwrapParen(callee.memObj)]
-  if !(recv is ArrayLit) { return false }
-  const re = iterElemPinTy(x, fnIx)
-  if re < 0 { return false }
-  let ce = iterElemPinTy(callee.memObj, fnIx)
-  if ce < 0 && recv.arrElems.length == 1 {
-    ce = holeOrCapturedPinTy(recv.arrElems[0], fnIx)
-  }
-  // A hole instance reads a nullable niche element it delivers as its non-null member.
-  if (
-    niche
-    && monoHoleSubRow.has(fnStmtsPosOf(fnIx))
-    && elemHasNull(re)
-    && !elemRidesBox(re)
-  ) {
-    return true
-  }
-  // A float result over integer elements is built as the integer list the literal is.
-  if tyPrimNameOf(re) == "f64" && ce >= 0 && tyPrimNameOf(ce) != "f64" {
-    return true
-  }
-  if !(elemRidesBox(re) || elemHasRecord(re)) { return false }
-  ce < 0 || !elemRidesBox(ce)
-}
-
-// The type the read `ix` holds at the pin of `fnIx`, or of the frame a captured name is
-// declared in; -1 when none answers.
-function holeOrCapturedPinTy(ix: i32, fnIx: i32): i32 {
-  const t = valueReadPinTy(ix, fnIx, 0)
-  if t >= 0 { return t }
-  const c = capturedReadPinTy(ix, fnIx)
-  if c >= 0 { return c }
-  holeOrCapturedTyOf(ix, fnIx)
-}
-
-// Whether list element `t` has a `null` member.
-function elemHasNull(t: i32): boolean {
-  const xs = flatDistinctMembers(t)
-  let i = 0
-  while i < xs.length {
-    if tyPrimNameOf(xs[i]) == "null" { return true }
-    i = i + 1
-  }
-  false
-}
-
-// Whether list element `t` rides the value box: two or more members, other than a `string`,
-// `boolean` or record with `null`, which ride their niche.
-function elemRidesBox(t: i32): boolean {
-  const xs = flatDistinctMembers(t)
-  if xs.length < 2 { return false }
-  if xs.length > 2 { return true }
-  let other = -1
-  let hasNull = false
-  let i = 0
-  while i < xs.length {
-    if tyPrimNameOf(xs[i]) == "null" { hasNull = true } else { other = xs[i] }
-    i = i + 1
-  }
-  if !hasNull || other < 0 || other >= T.tys.length { return true }
-  const ot = T.tys[other]
-  if ot is TyObj { return false }
-  const pn = tyPrimNameOf(other)
-  pn != "string" && pn != "boolean"
-}
-
-// Whether list element `t` is, or has a member that is, a record.
-function elemHasRecord(t: i32): boolean {
-  if t < 0 || t >= T.tys.length { return false }
-  if T.tys[t] is TyObj { return true }
-  const xs = flatDistinctMembers(t)
-  let i = 0
-  while i < xs.length {
-    if xs[i] >= 0 && xs[i] < T.tys.length && T.tys[xs[i]] is TyObj {
-      return true
-    }
-    i = i + 1
-  }
-  false
-}
-
-// Whether a null test under `ix`, a nested function's aside, folds only at the pin of `fnIx`.
-function nullTestFoldsAtPin(ix: i32, fnIx: i32): boolean {
-  if ix < 0 || ix >= P.nodes.length { return false }
-  const n = P.nodes[ix]
-  if n is FuncDecl { return false }
-  if n is BinExpr {
-    if n.binOp == "==" || n.binOp == "!=" {
-      const l = unwrapParen(n.binLeft)
-      const r = unwrapParen(n.binRight)
-      if l >= 0 && r >= 0 {
-        if P.nodes[r] is NullLit && pinReadProvesNonNull(l, fnIx) {
-          return true
-        }
-        if P.nodes[l] is NullLit && pinReadProvesNonNull(r, fnIx) {
-          return true
-        }
-      }
-    }
-  }
-  const kids = nodeChildren(ix)
-  let k = 0
-  while k < kids.length {
-    if nullTestFoldsAtPin(kids[k], fnIx) { return true }
-    k = k + 1
-  }
-  false
-}
-
-// `valueReadPinTy` of a name lifted frame `fnIx` captures, asked of the frame that declares
-// it; -1 when no enclosing frame answers.
-function capturedReadPinTy(ix: i32, fnIx: i32): i32 {
-  const fs = captureDeclFrames(ix, fnIx)
-  let i = 0
-  while i < fs.length {
-    let t = valueReadPinTy(ix, fs[i], 0)
-    // A hole instance leaves a parameter pinned at plain `i32` un-annotated.
-    if t < 0 { t = holeOperandTyOf(ix, fs[i]) }
-    if t >= 0 { return t }
-    i = i + 1
-  }
-  -1
 }
 
 // `holeOperandTyOf` of `ix`, or of the name it reads asked of each enclosing frame that
