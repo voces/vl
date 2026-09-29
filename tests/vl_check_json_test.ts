@@ -331,10 +331,11 @@ Deno.test({
   fn: async () => {
     await withDir(async (dir) => {
       const file = `${dir}/emit.vl`;
-      // D2641's witness: `vl check` accepts it and the emitter interns no shape for the record.
+      // A live emit-side refusal (`scripts/capability-probes/for-range-step-min-i32.vl`):
+      // `vl check` accepts it and the emitter refuses the step.
       await Deno.writeTextFile(
         file,
-        "const o: {[string]: i32} = Map()\nconst w = { f: o }\nprint(1)\n",
+        "for i in 10 to 1 step -2147483648 { print(i) }\n",
       );
       const { code, out } = await run(["check", "--codegen", file, "--json"]);
       if (code === 0) throw new Error(`expected a refusal, got exit 0: ${out}`);

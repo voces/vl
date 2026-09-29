@@ -346,11 +346,13 @@ import {
   spreadLitSrcRowName,
   structIndexByName,
   structIndexOfExpr,
+  structIndexOfTypeName,
   synthTypeRef,
   synthTypeRefFb,
   synthTypeRefTy,
   twoListValueTy,
   tyCanonKey,
+  tyHasLitDeep,
   tyNulFuncInner,
   unRowOfCanon,
   unionArmsOf,
@@ -1011,6 +1013,35 @@ function monoCapturedParamPin(name: string, fnIx: i32): string {
     steps = steps + 1
   }
   ""
+}
+
+// Whether shape spelling `sp` resolves to no row or to an anonymous one. A declared record
+// sharing its field names can claim it by the lenient field-set scan, and then the instance
+// would read the argument at that record's layout (D3123).
+function monoSpelledShapeStaysAnon(sp: string): boolean {
+  const si = structIndexOfTypeName(sp)
+  if si < 0 || si >= sNames.length { return true }
+  const nm = sNames[si]
+  nm.length >= 5 && nm.slice(0, 5) == "#anon"
+}
+
+// Whether the spelled shape of record argument `argIx`, typed `ty`, loses a literal: a literal
+// anywhere in the type, or in a field of the literal it is, whose own type may have widened one.
+function monoAnonArgSoftens(argIx: i32, ty: i32): boolean {
+  if tyHasLitDeep(ty, 8) { return true }
+  const ax = unwrapParen(argIx)
+  if ax < 0 { return false }
+  const o = P.nodes[ax]
+  if !(o is ObjLit) { return false }
+  let i = 0
+  while i < o.objFields.length {
+    const f = P.nodes[o.objFields[i]]
+    if f is FieldInit {
+      if tyHasLitDeep(nodeTyIxOf(unwrapParen(f.fiValue)), 8) { return true }
+    }
+    i = i + 1
+  }
+  false
 }
 
 // `monoArgTyName` at a monomorphization pin — the ladder's answer, narrowed to what the
@@ -8286,10 +8317,27 @@ function monoInstantiateCall(origFe: i32, callIx: i32, ctx: i32) {
                 // argument's function-type name; any other composite (`Box<T>`, `{a:T}`)
                 // from its concrete value-type name.
                 let anC = ""
+                // The argument's own `#anonN` row, kept as the parameter's pin where its spelled
+                // shape would resolve to a declared record sharing the field names.
+                let anRowPin = ""
                 if annArrowAt(ann) >= 1 {
                   anC = monoArgFnTypeName(args[i], ctx)
                 } else {
                   anC = monoArgPinName(args[i], ctx)
+                  // An anonymous row's `#anonN` has no fields to match the pattern against;
+                  // the checker's spelled shape does, unless the render softens a literal (D3123).
+                  const anTy = nodeTyIxOf(unwrapParen(args[i]))
+                  if (
+                    anC.length >= 5
+                    && anC.slice(0, 5) == "#anon"
+                    && !monoAnonArgSoftens(args[i], anTy)
+                  ) {
+                    const anSp = monoAnnPinName(tyToEmitName(anTy))
+                    if anSp != "" {
+                      if !monoSpelledShapeStaysAnon(anSp) { anRowPin = anC }
+                      anC = anSp
+                    }
+                  }
                 }
                 if anC == "" {
                   return emitFail(
@@ -8305,6 +8353,7 @@ function monoInstantiateCall(origFe: i32, callIx: i32, ctx: i32) {
                 if i < monoUnionRestPin.length && monoUnionRestPin[i] != "" {
                   pinC = monoUnionRestPin[i]
                 }
+                if anRowPin != "" && pinC != "" { pinC = anRowPin }
                 if pinC == "" {
                   return emitFail(
                     "emitProgram: monomorphize: unsupported argument type for `"
