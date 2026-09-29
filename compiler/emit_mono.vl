@@ -1481,6 +1481,32 @@ export function monoArgTyName(ix: i32, fnIx: i32) {
   "i32"
 }
 
+// `aN`/`aT` then each binding of `hN`/`hT` whose name `aN` lacks, into `outN`/`outT`.
+function monoJoinBinding(
+  aN: string[],
+  aT: i32[],
+  hN: string[],
+  hT: i32[],
+  outN: string[],
+  outT: i32[],
+) {
+  let i = 0
+  while i < aN.length && i < aT.length {
+    outN.push(aN[i])
+    outT.push(aT[i])
+    i = i + 1
+  }
+  let j = 0
+  while j < hN.length && j < hT.length {
+    if !monoStrListHas(aN, hN[j]) {
+      outN.push(hN[j])
+      outT.push(hT[j])
+    }
+    j = j + 1
+  }
+  0
+}
+
 // Build the type-level binding column (`T` ⇒ this instance's concrete type) the way the
 // checker does: `bindGenWalk` over each parameter's declared type against the type the
 // instance pinned that position at. `tyCol` is positional over `params`, -1 meaning
@@ -2140,9 +2166,61 @@ function monoPinnedTyOf(ix: i32, bN: string[], bT: i32[]): i32 {
   const ty = nodeTyIxOf(ix)
   if ty < 0 || ty >= T.tys.length { return ty }
   if !tyHasTyVar(ty) { return ty }
-  const st = substTyDeep(ty, bN, bT)
+  let st = substTyDeep(ty, bN, bT)
+  if (st < 0 || tyHasTyVar(st)) && monoPinHoleN.length > 0 {
+    // A hole instance's list literal, element read and call of a function value are typed at
+    // its holes, which `bN` does not name (D3066). A method's result is the receiver's to answer.
+    const hn = P.nodes[unwrapParen(ix)]
+    let byHole = hn is ArrayLit || hn is Index
+    if hn is Call { byHole = monoCallsFnValue(unwrapParen(ix), 0) }
+    if byHole {
+      const jN: string[] = []
+      const jT: i32[] = []
+      monoJoinBinding(bN, bT, monoPinHoleN, monoPinHoleT, jN, jT)
+      st = substTyDeep(ty, jN, jT)
+      // A record list's rows are the literal's own, which a pin re-type does not collect.
+      if monoListElemHoldsObj(st) { return ty }
+    }
+  }
   if st < 0 || tyHasTyVar(st) { return ty }
   st
+}
+
+// Whether call `ix` calls a function value: a name, or a call of one (`k()()`), typed as a
+// function. A method call is not one.
+function monoCallsFnValue(ix: i32, depth: i32): boolean {
+  if ix < 0 || depth > 8 { return false }
+  const n = P.nodes[ix]
+  if !(n is Call) { return false }
+  const cf = unwrapParen(n.callFn)
+  if cf < 0 { return false }
+  const cft = nodeTyIxOf(cf)
+  if cft < 0 || cft >= T.tys.length || !(T.tys[cft] is TyFunc) { return false }
+  if P.nodes[cf] is Ident { return true }
+  monoCallsFnValue(cf, depth + 1)
+}
+
+// Whether list type `t`'s element is a record, nullable or as a union member.
+function monoListElemHoldsObj(t: i32): boolean {
+  if t < 0 || t >= T.tys.length { return false }
+  const lt = T.tys[t]
+  if !(lt is TyArray) { return false }
+  const e = nonNullTy(lt.aElem)
+  if e < 0 || e >= T.tys.length { return false }
+  if monoTyIsObj(e) { return true }
+  const et = T.tys[e]
+  if !(et is TyUnion) { return false }
+  let i = 0
+  while i < et.uMembers.length {
+    if monoTyIsObj(et.uMembers[i]) { return true }
+    i = i + 1
+  }
+  false
+}
+
+// Whether `t` is a record type.
+function monoTyIsObj(t: i32): boolean {
+  t >= 0 && t < T.tys.length && T.tys[t] is TyObj
 }
 
 // A fresh node for expression `ix` over `kids` (parallel to `monoExprKids(ix)`), or `ix`
@@ -2758,11 +2836,21 @@ function monoLamParamPinAnn(
     if pty < 0 || !tyHasTyVar(pty) { return -1 }
     const st = substTyDeep(pty, bN, bT)
     if st < 0 || tyHasTyVar(st) { return -1 }
-    const nm = tyToEmitName(st)
+    const nm = monoPinAnnSpelling(st)
     if nm == "" { return -1 }
     return synthTypeRefTy(nm, -1, st)
   }
   -1
+}
+
+// The annotation spelling of a pinned lambda type `t`: a list by `monoListSpelling`, which names
+// a nullable record element by its row; any other type as `tyToEmitName` renders it.
+function monoPinAnnSpelling(t: i32): string {
+  const nm = tyToEmitName(t)
+  if nm != "" && t >= 0 && t < T.tys.length && T.tys[t] is TyArray {
+    return monoListSpelling(nm, t)
+  }
+  nm
 }
 
 // Clone the lifted lambda at `fnIx` with every type-param-mentioning parameter and return
@@ -2774,11 +2862,18 @@ function monoCloneLambdaSubst(
   typarams: string[],
   tvN: string[],
   tvV: string[],
-  bN: string[],
-  bT: i32[],
+  bN0: string[],
+  bT0: i32[],
 ) {
   const a = P.nodes[fnIx]
   if a is FuncDecl {
+    let bN = bN0
+    let bT = bT0
+    if monoPinHoleN.length > 0 {
+      bN = []
+      bT = []
+      monoJoinBinding(bN0, bT0, monoPinHoleN, monoPinHoleT, bN, bT)
+    }
     // A nested generic declaration carries pins of its own and is instantiated by
     // `monoInstantiate` at its own call sites; only a lambda that inherited the enclosing
     // frame's type parameters is this pass's business.
@@ -2875,7 +2970,7 @@ function monoCloneLambdaSubst(
         if monoRetReadsHoleParam(rex, fnIx) { rs = monoHoleTy(rs) }
         if rs >= 0 && rs != rty {
           if !tyHasTyVar(rs) && !(rex < 0 && monoTyHasLitMember(rs)) {
-            const rnm = tyToEmitName(rs)
+            const rnm = monoPinAnnSpelling(rs)
             if rnm != "" { nret = synthTypeRefTy(rnm, -1, rs) }
           }
         }
@@ -3567,6 +3662,10 @@ let monoPinRetBox = false
 // That box's type during the instance's body walk, else -1.
 let monoPinRetTy = -1
 
+// The hole binding of the instance whose body `monoPinBodyLambdas` walks; empty outside it.
+let monoPinHoleN: string[] = []
+let monoPinHoleT: i32[] = []
+
 // Whether unions `a` and `b` hold the same members, in any order.
 function monoTySameMembers(a: i32, b: i32): boolean {
   const ta = T.tys[a]
@@ -3955,6 +4054,33 @@ function monoLamSlotIsTyParamTemplate(fe: i32) {
   const tps: string[] = []
   monoEnclosingTyParams(fe, tps)
   monoLamNodeIsTemplate(fnStmts[fe], tps)
+}
+
+// Is the lifted slot `fe` a lambda template of a hole function: its frame declares no `<T>`
+// but has instances, and its own type names the frame's holes. Each instance clones it at
+// its pin, so a template no instance shares is dead (D3083).
+function monoLamSlotIsHoleTemplate(fe: i32) {
+  if fe < 0 || fe >= fnStmts.length || fe >= fnParent.length { return false }
+  // A lambda nested in a lambda is cloned with it, so its frame is the nearest named one.
+  let p = fnParent[fe]
+  let guard = 0
+  while (
+    p >= 0
+    && p < fnParent.length
+    && criFnIsAnonLambda(p)
+    && guard <= fnStmts.length
+  ) {
+    p = fnParent[p]
+    guard = guard + 1
+  }
+  if p < 0 || p >= monoOrigNode.length || !monoInstantiatedAny(p) {
+    return false
+  }
+  const pf = P.nodes[monoOrigNode[p]]
+  if !(pf is FuncDecl) { return false }
+  if pf.fnTyParams.length > 0 { return false }
+  const none: string[] = []
+  monoLamNodeIsTemplateCore(fnStmts[fe], none)
 }
 
 // Has any enclosing frame of lifted slot `fe` been instantiated? A template whose generic
@@ -6958,6 +7084,12 @@ function monoMakeInstance(
     monoPinNoteUnsafeBody(instBody0)
     if monoPinRetBox { monoPinRetTy = nodeTyIxOf(nret) }
     monoPinRetBox = false
+    // A hole instance's lambdas, list literals and reads are typed at its holes, which its
+    // parameters' binding does not name: they pin through the holes' binding too (D3083, D3066).
+    const svHoleN = monoPinHoleN
+    const svHoleT = monoPinHoleT
+    monoPinHoleN = instHoleN
+    monoPinHoleT = instHoleT
     const instBody0L = monoPinBodyLambdas(
       instBody0,
       fn.fnTyParams,
@@ -6966,6 +7098,8 @@ function monoMakeInstance(
       letBN,
       letBT,
     )
+    monoPinHoleN = svHoleN
+    monoPinHoleT = svHoleT
     monoPinRetTy = -1
     const lamClones = monoLamCloneSlots
     monoLamCloneSlots = []
@@ -9088,6 +9222,17 @@ export function monomorphize(stmts: i32[]) {
           // D426 — the lambda template, the `<T>` arm above one frame down. Each
           // instance mints its own copy with the pin substituted. Gate (1) is inverted
           // here, the property being decided by the annotation rather than by the slot.
+          if !prune {
+            if criFnIsAnonLambda(gp) && monoLamSlotIsHoleTemplate(gp) {
+              const hnd = fnStmts[gp]
+              if (
+                i32ListHas(monoLamPinned, hnd)
+                && !i32ListHas(monoLamShared, hnd)
+              ) {
+                prune = true
+              }
+            }
+          }
           if !prune {
             if criFnIsAnonLambda(gp) && monoLamSlotIsTyParamTemplate(gp) {
               // Two ledgers, both load-bearing: stub the template only when a clone
