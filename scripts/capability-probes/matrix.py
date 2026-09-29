@@ -306,6 +306,19 @@ def p_map_value(t, face):
     return assemble(t, pre=[m], body=["__m[\"k\"] = %s" % t.value] + read)
 
 
+@position("map_set", "the map binding")
+def p_map_set(t, face):
+    """`map_value` through `m.set(k, v)`, which is its own delivery: D3195 was red HERE with
+    the index store green."""
+    m = "const __m: { [string]: %s } = Map()" % t.ty if face == "ann" else "const __m = Map()"
+    bound = t.bind("v", "__mv", face) + "\n" + t.proof
+    if t.proof_is_null_test():
+        read = ["const __mv = __m.get(\"k\")", bound]
+    else:
+        read = ["const __mv = __m.get(\"k\")", "if __mv != null {", ind(bound, 2), "}"]
+    return assemble(t, pre=[m], body=["__m.set(\"k\", %s)" % t.value] + read)
+
+
 @position("closure_capture", "the captured binding")
 def p_closure_capture(t, face):
     body = [t.bind("__c", t.value, face),
