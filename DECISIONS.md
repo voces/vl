@@ -8617,8 +8617,8 @@ spellings build to identical wasm only if they reach binaryen identical.
 
 **The rulings.** A block takes a label as a loop does, `B: { … }`. The label is named again at the
 exit, Zig-style: `break :B`, `break :B v`, `continue :B`; the declaration stays `B:`. A bare
-`break v` leaves the innermost loop or labelled block with `v`, and a bare `break` keeps working,
-so `break x` with `x` a name now means the value `x`. Any loop may carry a value: its type is the
+`break v` leaves the innermost loop with `v`, and a bare `break` keeps working, so `break x` with
+`x` a name now means the value `x`. Any loop may carry a value: its type is the
 join of every `break` value, a block's tail joins in, a `while`/`for` that can finish without a
 `break v` adds `null` (`T | null`), and `while true` — a literal `true`, which cannot run out — is
 plain `T`. `continue :B` on a block is an error. The old `break B` / `continue B` is a parse error
@@ -8646,6 +8646,15 @@ frame with no `loop`. A loop whose value is discarded is a statement and `break 
 
 **What it costs a program without one.** Nothing: the rewrite and the formatter's fold are both
 gated on a program holding a value loop, and `break`/`continue` lower as before.
+
+**A labelled block is left only by its name (owner ruling, same day: option C, Rust's E0695).**
+The first reading let a bare `break` leave the innermost loop *or block*, which made a block
+silently capture a `break` meant for the loop around it. Now a bare `break`, `break v` or
+`continue` never targets a block: one whose way to its loop crosses a labelled block, or a bare
+`break` in a block with no loop around it, is refused at `vl check` naming both fixes
+(`break :B`, or label the loop and `break :L`). A bare `break v` with no block in between still
+leaves the innermost loop with `v`. The refusal is the parser's, which already tracks the labels
+in scope; the checker and emitter never see a bare jump that could reach a block.
 
 **One spelling needs parentheses.** A labelled block as a call argument, `f((B: { … }))`, since
 `f(B: …)` is a named argument. Choosing the named argument keeps every existing call meaning

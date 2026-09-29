@@ -19,8 +19,12 @@ outer: for i in 0 until 10 {
 
 - `break :B` leaves the loop or block labelled `B`.
 - `continue :B` starts the next iteration of the loop labelled `B`.
-- A bare `break` leaves the innermost loop **or labelled block**; a bare `continue` continues the
-  innermost **loop** (a labelled block is not one, so `continue` passes through it).
+- A bare `break` or `break v` leaves the innermost **loop**; a bare `continue` continues it.
+- A labelled block is left only by its name, `break :B`. A bare `break`, `break v` or `continue`
+  whose way to its loop crosses a labelled block is an error that names both fixes
+  (``inside labelled block `B`: write `break :B` to leave the block, or label the loop and write
+  `break :L` ``), and so is a bare `break` in a block with no loop around it. This is Rust's
+  E0695 rule: inside a block, the reader never has to guess which frame a jump leaves.
 - A label names only a loop or block the jump is written inside, in the same function; a
   `break` in a lambda does not reach the loop around the lambda.
 
@@ -43,7 +47,8 @@ B: {
 // both breaks land here
 ```
 
-`continue :B` on a labelled block is an error: there is nothing to continue.
+`continue :B` on a labelled block is an error: there is nothing to continue. Inside a block, a
+jump to an enclosing loop names that loop (`outer: for … { B: { … continue :outer … } }`).
 
 ## Values
 
