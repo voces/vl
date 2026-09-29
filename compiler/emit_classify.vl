@@ -631,6 +631,9 @@ import {
   monoInstOrig,
   monoOrigNode,
   monoParamPinTy,
+  monoPinSubN,
+  monoPinSubRow,
+  monoPinSubT,
   monoTwoListRet,
   msGen,
   msRowChain,
@@ -1643,6 +1646,7 @@ function instRecvFieldFnTy(recvIx: i32, prop: string, fnIx: i32): i32 {
       const pt = valueReadPinTy(recvIx, fnIx, 0)
       if pt >= 0 { rt = nonNullTy(pt) }
     }
+    if rt < 0 && nt >= 0 { rt = pinSubOperandTyOf(nt, fnIx) }
   }
   // A receiver a lambda captures reads the binding of the frame that declares it (D3141).
   if rt < 0 {
@@ -1658,8 +1662,14 @@ function instRecvFieldFnTy(recvIx: i32, prop: string, fnIx: i32): i32 {
       i = i + 1
     }
   }
+  // Outside an instance the checker's own type of the receiver names the closure's signature,
+  // where a declared record claiming the literal by its field names would name another (D3180).
+  if rt < 0 && !fnInMonoInstance(fnIx) {
+    const nt = nodeTyIxOf(unwrapParen(recvIx))
+    if nt >= 0 && !tyHasTyVar(nt) { rt = nonNullTy(nt) }
+  }
   if rt < 0 { return -1 }
-  const ft = tyFieldTyOf(rt, prop)
+  const ft = tyFieldTyOf(nonNullTy(rt), prop)
   if ft < 0 || ft >= T.tys.length || !(T.tys[ft] is TyFunc) { return -1 }
   ft
 }
@@ -1670,7 +1680,7 @@ function instRecvFieldFnTy(recvIx: i32, prop: string, fnIx: i32): i32 {
 // the receiver's struct shape (`fieldClosureFeOf`). -1 when neither resolves.
 export function fieldClosureFeOfRecv(recvIx: i32, prop: string, fnIx: i32) {
   const fe = fieldClosureFeOfRecvRaw(recvIx, prop, fnIx)
-  if fe < 0 || fnIx < 0 { return fe }
+  if fe < 0 { return fe }
   // Records of one row whose closures differ in signature: an instance's receiver type names
   // which one it holds, where the syntactic walk above can reach only the first (D3110).
   const want = instRecvFieldFnTy(recvIx, prop, fnIx)
@@ -11898,7 +11908,15 @@ function anonValueFitsField(vc: i32, sc: i32, valIx: i32, si: i32, mfi: i32) {
   // widens into: `i32[] | null`, `((…) => …) | null`, f64 for f32, `f64[] | null`, `i64[] | null`.
   if !anonRow { return true }
   if vc == FC_I32_LIST { return sc == FC_NUL_I32_LIST }
-  if vc == FC_CLOSURE { return sc == FC_NUL_CLOSURE }
+  if vc == FC_CLOSURE {
+    if sc != FC_NUL_CLOSURE { return false }
+    // A closure widens into a `| null` slot of its own signature only (D3182).
+    return rowFnFieldFits(
+      nodeTyIxOf(unwrapParen(valIx)),
+      si,
+      sFieldNames[sFieldStart[si] + mfi],
+    )
+  }
   if vc == FC_F32 { return sc == FC_F64 }
   if vc == FC_F64_LIST { return sc == FC_NUL_F64_LIST }
   if vc == FC_I64_LIST { return sc == FC_NUL_I64_LIST }
@@ -11971,13 +11989,61 @@ function declRowFieldKindFits(
 ): boolean {
   if si < 0 || si >= sTyIx.length { return true }
   if mfi < 0 || mfi >= sFieldCount[si] { return true }
-  const rk = fieldScalarKindOf(
-    tyFieldTyOf(sTyIx[si], sFieldNames[sFieldStart[si] + mfi]),
-  )
+  const rt = tyFieldTyOf(sTyIx[si], sFieldNames[sFieldStart[si] + mfi])
+  const lt = tyFieldTyOf(nodeRepTyIxOf(objIx), name)
+  if !fnFieldTyFits(objFieldOwnTyOf(objIx, name, lt), rt) { return false }
+  const rk = fieldScalarKindOf(rt)
   if rk == 0 { return true }
-  const lk = fieldScalarKindOf(tyFieldTyOf(nodeRepTyIxOf(objIx), name))
+  const lk = fieldScalarKindOf(lt)
   if lk == 0 { return true }
   fieldKindWidens(lk, rk)
+}
+
+// `fnFieldTyFits` against field `name` of row `si` where that row is declared; true for an
+// anonymous row, whose literals share it whatever their closures' signatures are.
+function declRowFnFieldFits(lt: i32, si: i32, name: string): boolean {
+  if sIsAnonRow(si) { return true }
+  rowFnFieldFits(lt, si, name)
+}
+
+// `fnFieldTyFits` against field `name` of row `si`'s recorded type, declared or anonymous.
+function rowFnFieldFits(lt: i32, si: i32, name: string): boolean {
+  if si < 0 || si >= sTyIx.length { return true }
+  fnFieldTyFits(lt, tyFieldTyOf(sTyIx[si], name))
+}
+
+// `declRowFnFieldFits` for a field spelled `text`, resolved only where it spells an arrow and
+// row `si` declares that field a function.
+function declRowFnSpellingFits(text: string, si: i32, name: string): boolean {
+  if si < 0 || si >= sTyIx.length || sIsAnonRow(si) { return true }
+  if !strContains(text, "=>") { return true }
+  const rt = tyFieldTyOf(sTyIx[si], name)
+  const rf = nonNullTy(rt)
+  if rf < 0 || rf >= T.tys.length || !(T.tys[rf] is TyFunc) { return true }
+  fnFieldTyFits(declTyIxOfName(text), rt)
+}
+
+// Field `name`'s type `lt` in the object literal at `objIx`, or, where that names a hole (a
+// literal handed to an un-annotated parameter), the field value's own checked type.
+function objFieldOwnTyOf(objIx: i32, name: string, lt: i32): i32 {
+  if lt >= 0 && !tyHasTyVar(lt) { return lt }
+  const fv = objFieldVal(objIx, name)
+  if fv < 0 { return lt }
+  nodeTyIxOf(unwrapParen(fv))
+}
+
+// Whether a field of function type `lt` may be stored at a declared field of type `rt`: a call
+// through the row reads its closure at the row's signature, so the two must be one signature
+// (`| null` on the row aside). Refutation only: a non-function or a type parameter agrees (D3181).
+function fnFieldTyFits(lt: i32, rt: i32): boolean {
+  if lt < 0 || rt < 0 || lt >= T.tys.length || rt >= T.tys.length {
+    return true
+  }
+  if !(T.tys[lt] is TyFunc) { return true }
+  const rf = nonNullTy(rt)
+  if rf < 0 || !(T.tys[rf] is TyFunc) { return true }
+  if tyHasTyVar(lt) || tyHasTyVar(rf) { return true }
+  tyEq(lt, rf)
 }
 
 // Whether row `si`'s field `mfi` stores field `name` of the object literal at `objIx` at the
@@ -20399,6 +20465,9 @@ function structRowOfObjFieldSetK(ty: i32, widen: boolean): i32 {
               ) {
                 ok = false
               }
+              if ok && !declRowFnFieldFits(ftys[k], si, fnames[k]) {
+                ok = false
+              }
             } else {
               // An uncoded field is lenient, matching the render path's `shapeFieldTypeCompat`
               // (refutes only proven mismatches), with its one tightening: a code-15 nested-
@@ -20508,6 +20577,8 @@ function shapeRowScanK(fnames: string[], ftypes: string[], lenient: i32): i32 {
             lenient,
           )
         ) {
+          ok = false
+        } else if !declRowFnSpellingFits(ftypes[k], si2, fnames[k]) {
           ok = false
         }
         k = k + 1
@@ -30109,6 +30180,26 @@ export function exactOperandTyOf(exprIx: i32, fnIx: i32): i32 {
   st
 }
 
+// `ty` with the type parameters the instance `fnIx` is, or is lifted inside, binds to its
+// parameters' pins substituted; -1 outside one, or where one stays unbound.
+function pinSubOperandTyOf(ty: i32, fnIx: i32): i32 {
+  if ty < 0 || monoPinSubN.length == 0 { return -1 }
+  let pos = fnStmtsPosOf(fnIx)
+  let guard = 0
+  while pos >= 0 && guard <= fnStmts.length {
+    const row = monoPinSubRow.get(pos) ?? -1
+    if row >= 0 && row < monoPinSubN.length {
+      const st = substTyDeep(ty, monoPinSubN[row], monoPinSubT[row])
+      if st < 0 || tyHasTyVar(st) { return -1 }
+      return st
+    }
+    if pos >= fnParent.length { return -1 }
+    pos = fnParent[pos]
+    guard = guard + 1
+  }
+  -1
+}
+
 // The type of `exprIx` inside the hole instance `fnIx` is: its recorded type is a hole's
 // variable, which that instance binds. A read, not a substitution, which would bank pins. -1
 // anywhere else, including a lambda lifted inside the instance, which may be shared (D2921).
@@ -30376,6 +30467,13 @@ function arrLitReadsPinTy(elems: i32[], fnIx: i32): i32 {
     i = i + 1
   }
   t0
+}
+
+// Whether `ix`, read in the hole instance `fnIx`, is bound there to a function type, which no
+// `null` inhabits: its checked type is the hole, so only the instance can say (D3182).
+export function holeBindsFunc(ix: i32, fnIx: i32): boolean {
+  const t = holeOrCapturedTyOf(ix, fnIx)
+  t >= 0 && t < T.tys.length && T.tys[t] is TyFunc
 }
 
 // `holeOperandTyOf` of `ix`, or of the name it reads asked of each enclosing frame that
