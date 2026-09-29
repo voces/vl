@@ -115,6 +115,7 @@ import {
   letNullHoleUnfilled,
   litBaseTy,
   litUnionAliasNameOfTy,
+  litUnionAliasOfLitTexts,
   luDeclPosOf,
   mapDeliveryRecorded,
   mapRetagAllRows,
@@ -369,6 +370,7 @@ import {
   parentLetOfAt,
   parentLetOwnedBy,
   parentLetOwnerOf,
+  parentLoopAt,
   parentLoopCoversAt,
   parentLoopVarOf,
   placeNarrowKeyOf,
@@ -758,6 +760,7 @@ import {
   mvSlotOfValNameTyKArm,
   mvValTyIxOfNameRow,
   nodeMapValTyIx,
+  nodeTyMapKeyIsLitUnion,
   nullValKind,
   recordMvValTyIx,
   recordSFieldElemRow,
@@ -3645,9 +3648,134 @@ export function letInitTyIsNarrowedArm(letIx: i32, fnIx: i32): boolean {
   const d = P.nodes[letIx]
   if d is LetDecl {
     if letInitTyVariantRow(letIx) < 0 { return false }
-    return exprUnion(d.letInit, fnIx)
+    return letInitIsBox(d.letInit, fnIx)
   }
   false
+}
+
+// The element kind of the walk variable a binding's initializer bare-reads, or null.
+function letInitLoopElemKind(letIx: i32, fnIx: i32): VKind | null {
+  if letIx < 0 { return null }
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    const ix = unwrapParen(d.letInit)
+    if ix < 0 { return null }
+    const e = P.nodes[ix]
+    if e is Ident { return readLoopElemKind(ix, e.identName, fnIx) }
+  }
+  null
+}
+
+// Whether the un-annotated binding at `letIx` in frame `fnIx` bare-copies a frame `let` that
+// holds the union box, `depth` copies down the chain: the box a classifier outside the frame's
+// emission reads through the chain's declarations rather than the live locals (D3139).
+function letInitCopiesBox(letIx: i32, fnIx: i32, depth: i32): boolean {
+  if depth <= 0 || fnIx < 0 || letIx < 0 { return false }
+  const d = P.nodes[letIx]
+  if !(d is LetDecl) { return false }
+  const ix = unwrapParen(d.letInit)
+  if ix < 0 { return false }
+  const e = P.nodes[ix]
+  if !(e is Ident) { return false }
+  const fn = P.nodes[fnIx]
+  if !(fn is FuncDecl) { return false }
+  const src = parentLetOfAt(fn.fnBody, sidOfNode(ix), ix)
+  if src < 0 || src == letIx { return false }
+  const sd = P.nodes[src]
+  if !(sd is LetDecl) { return false }
+  if sd.letType >= 0 { return letAnnIsUnion(src) }
+  if exprUnion(sd.letInit, fnIx) && !exprIsLitAtom(sd.letInit, fnIx) {
+    return true
+  }
+  if letInitLoopElemKind(src, fnIx) == "union" { return true }
+  letInitCopiesBox(src, fnIx, depth - 1)
+}
+
+// Whether node `ix` is a read typed as only a narrowing of a wider box can be: a record, a
+// nullable, or a literal union. The cheap pre-test of the narrowed-cell rungs, which a read
+// typed at the whole box never needs.
+function nodeTyIsNarrowedShape(ix: i32): boolean {
+  if ix < 0 { return false }
+  const n = P.nodes[ix]
+  if !(n is Ident || n is Member || n is Index) { return false }
+  const ty = nodeTyIxOf(ix)
+  if ty < 0 { return false }
+  if T.tys[ty] is TyObj { return true }
+  nodeTyIsNullable(ix) || tyIsLitUnion(ty) || tyIsNullableLitUnion(ty)
+}
+
+// Whether node `ix`'s recorded type is a `TyUnion` or a `TyNullable`: the cheap pre-test of
+// `nodeTyIsBoxRep`, on the path every un-annotated binding takes.
+function nodeTyIsUnionShaped(ix: i32): boolean {
+  if ix < 0 { return false }
+  const ty = nodeTyIxOf(ix)
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  t is TyUnion || t is TyNullable
+}
+
+// Whether node `ix`'s recorded type reps as the value-union box: a union of non-literal
+// members, or a scalar plus `null`.
+function nodeTyIsBoxRep(ix: i32): boolean {
+  if ix < 0 { return false }
+  if nodeTyIsNulScalarBox(ix) { return true }
+  tyIsValueUnionBox(nodeTyIxOf(ix)) && !nodeTyIsPureLitUnion(ix)
+}
+
+// Whether an un-annotated binding's initializer `init` is the union box: `exprUnion`, or a
+// read of a `for-in` variable over box elements, which has no declaration for a classifier
+// run outside its frame's emission (a capture's env field) to read (D3135).
+function letInitIsBox(init: i32, fnIx: i32): boolean {
+  if exprUnion(init, fnIx) { return true }
+  const ix = unwrapParen(init)
+  if ix < 0 { return false }
+  const e = P.nodes[ix]
+  if e is Ident { return readIsLoopBox(ix, e.identName, fnIx) }
+  false
+}
+
+// Whether the read `ix` of `name` in frame `fnIx` (-1 the module) is a `for-in` variable over
+// value-union-box elements.
+function readIsLoopBox(ix: i32, name: string, fnIx: i32): boolean {
+  readLoopElemKind(ix, name, fnIx) == "union"
+}
+
+// The element kind of the `for-in` loop whose variable the read `ix` of `name` in frame `fnIx`
+// (-1 the module) is, or null.
+function readLoopElemKind(ix: i32, name: string, fnIx: i32): VKind | null {
+  const lp = readLoopNodeOf(ix, name, fnIx)
+  if lp < 0 { return null }
+  const ln = P.nodes[lp]
+  if ln is ForIn { return forInElemKind(frameBlindIter(ln.fiIter, fnIx), fnIx) }
+  null
+}
+
+// The `for-in` loop whose element variable the read `ix` of `name` in frame `fnIx` (-1 the
+// module) is, found by the loop enclosing the read, or -1. Declines where the frame also binds
+// `name` with a `let`, so a shadowing binding is never mistaken for the loop's.
+export function readLoopNodeOf(ix: i32, name: string, fnIx: i32): i32 {
+  let lp = -1
+  if fnIx >= 0 {
+    const fn = P.nodes[fnIx]
+    if fn is FuncDecl {
+      if parentLoopVarOf(fn.fnBody, name) < 0 { return -1 }
+      // A live slot is the frame's own answer, which every caller has already asked.
+      if declaredSlotOf(name) >= 0 { return -1 }
+      if frameLetAt(fn.fnBody, name, ix) >= 0 { return -1 }
+      lp = frameLoopAt(fn.fnBody, name, ix)
+    }
+  } else {
+    if !moduleBindsLoopVar(emitRootIx, name) { return -1 }
+    if declaredSlotOf(name) >= 0 { return -1 }
+    if moduleLocalLetOfAt(emitRootIx, name, ix) >= 0 { return -1 }
+    lp = frameLoopAt(emitRootIx, name, ix)
+  }
+  if lp < 0 { return -1 }
+  const ln = P.nodes[lp]
+  if ln is ForIn {
+    if ln.fiVar == name { return lp }
+  }
+  -1
 }
 
 // The nullable twin of `letInitTyVariantRow`: the variant row of `X` when an un-annotated
@@ -3671,7 +3799,36 @@ export function letInitTyIsNarrowedNulArm(letIx: i32, fnIx: i32): boolean {
   const d = P.nodes[letIx]
   if d is LetDecl {
     if letInitTyNulArmRow(letIx) < 0 { return false }
-    return exprUnion(d.letInit, fnIx)
+    return letInitIsBox(d.letInit, fnIx)
+  }
+  false
+}
+
+// Whether an un-annotated binding of a value narrowed out of a wider box takes the narrowed
+// cell (the `K | null` atom niche, the arm, its nullable niche, or `string`), not the box.
+function letInitBindsNarrowedCell(letIx: i32, fnIx: i32): boolean {
+  if letInitTyIsNarrowedArm(letIx, fnIx) { return true }
+  if letInitTyIsNarrowedNulArm(letIx, fnIx) { return true }
+  if letInitTyIsNarrowedLit(letIx, fnIx) { return true }
+  if letIx < 0 { return false }
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType < 0 && d.letInit >= 0 {
+      return letInitIsNulLitBox(d.letInit, fnIx)
+    }
+  }
+  false
+}
+
+// A value narrowed to a literal union out of a wider box, as an un-annotated binding's
+// initializer: the box holds the member as its string, which the narrowed read delivers, so
+// the cell is `string`. Asked of the checker's type, so a capture agrees with the frame (D3120).
+function letInitTyIsNarrowedLit(letIx: i32, fnIx: i32): boolean {
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 || d.letInit < 0 { return false }
+    if !tyIsLitUnion(nodeTyIxOf(d.letInit)) { return false }
+    return letInitIsBox(d.letInit, fnIx)
   }
   false
 }
@@ -3745,6 +3902,7 @@ function letInitCellKind(letIx: i32, fnIx: i32): VKind {
   // the consumers all read as the arm; below the `??` join, whose result IS the box.
   if letInitTyIsNarrowedArm(letIx, fnIx) { return "variant" }
   if letInitTyIsNarrowedNulArm(letIx, fnIx) { return "nulvariant" }
+  if letInitTyIsNarrowedLit(letIx, fnIx) { return "str" }
   // A nullable map, before `letIsMap`, whose `(ref $mapStruct)` cell cannot hold null.
   if letIsNulMap(letIx, fnIx) { return "nulmap" }
   // A bare `const t = m[k]` read of a list- or nested-map-valued map binds the value's
@@ -5322,17 +5480,28 @@ function moduleLoopEnclosing(fe: i32, name: string): i32 {
   ) {
     at = fnStmts[fnInstOrigin[fe]]
   }
-  const r = P.nodes[emitRootIx]
-  if r is Program {
-    const stmts = r.progStmts
+  frameLoopAt(emitRootIx, name, at)
+}
+
+// The innermost loop of frame body `body` (a function's, or the `Program`) binding `name` whose
+// body holds node `at`, or -1. Off the cached plan's post-order ranges; a node appended past the
+// body after parsing (a rewrite's) is outside every range, so it is found by walking (D3139).
+function frameLoopAt(body: i32, name: string, at: i32): i32 {
+  if body < 0 { return -1 }
+  const lp = parentLoopAt(body, sidOf(name), at)
+  if lp >= 0 || at < body { return lp }
+  const b = P.nodes[body]
+  if b is Program {
+    const stmts = b.progStmts
     let i = 0
     while i < stmts.length {
       const hit = modLoopHolding(stmts[i], name, at)
       if hit >= 0 { return hit }
       i = i + 1
     }
+    return -1
   }
-  -1
+  modLoopHolding(body, name, at)
 }
 
 // `moduleLoopEnclosing`'s walk over one module-scope statement: the innermost loop binding
@@ -5639,7 +5808,16 @@ export function capScan(ix: i32, bound: {[string]: i32}, caps: string[]) {
     const imark = capTrailName.length
     capBind(bound, n.fiVar)
     if n.fiVar2 != "" { capBind(bound, n.fiVar2) }
+    const lmark = cnModLoopName.length
+    // Only a body declaring a closure has a narrowing to record for it.
+    if cnRecording && cnScanFnIx < 0 && subtreeHasFuncDecl(n.fiBody) {
+      cnModLoopPush(n)
+    }
     capScan(n.fiBody, bound, caps)
+    while cnModLoopName.length > lmark {
+      cnModLoopName.pop()
+      cnModLoopIter.pop()
+    }
     capTrim(bound, imark)
     return 0
   }
@@ -5826,27 +6004,20 @@ export function parentBindingOf(fe: i32, name: string) {
       }
       i = i + 1
     }
-    return parentLetOf(pfn.fnBody, name)
+    return frameLetAt(pfn.fnBody, name, captureDeclAt(fe))
   }
   -1
 }
 
-// The enclosing-frame binding a captured `name` of the lifted function `fnIx` resolves to —
-// a `Param` or `LetDecl` arena index — or -1 when `name` is not a capture of `fnIx`. The
-// capture channel for the expression classifiers, and why they cannot disagree with the env
-// struct: `captureValKind` types the env field off this very binding.
-function capturedBindingOf(fnIx: i32, name: string) {
-  if fnIx < 0 { return -1 }
-  if !fnValUsed { return -1 }
+// The `fnStmts` position of the lifted function `fnIx` when `name` is one of its captures, or
+// -1. The capture channel for the expression classifiers, which resolve the capture through
+// `parentBindingOf(fe, name)`, the binding `captureValKind` types the env field off.
+function capturedFrameOf(fnIx: i32, name: string): i32 {
+  if fnIx < 0 || !fnValUsed { return -1 }
   const fe = fnStmtsPosOf(fnIx)
   if fe < 0 { return -1 }
-  const caps = captureNamesOf(fe)
-  let ci = 0
-  while ci < caps.length {
-    if caps[ci] == name { return parentBindingOf(fe, name) }
-    ci = ci + 1
-  }
-  -1
+  if !strListHas(captureNamesOf(fe), name) { return -1 }
+  fe
 }
 
 // The arena index of the `FuncDecl` whose frame owns a captured `name`'s binding, or -1 —
@@ -5860,7 +6031,7 @@ export function parentBindingFrameArenaOf(fe: i32, name: string) {
 }
 
 // The arena index of the frame owning capturing function `fnIx`'s captured `name`, or -1.
-// `capturedBindingOf`'s companion: an un-annotated binding is classified from its
+// `capturedFrameOf`'s companion: an un-annotated binding is classified from its
 // initializer, which only resolves in the frame it is written in. Takes an arena index where
 // `parentBindingFrameArenaOf` takes a position — the same question from either side.
 function capturedBindingFrameOf(fnIx: i32, name: string) {
@@ -5877,8 +6048,49 @@ function captureLoopNodeOf(fe: i32, name: string): i32 {
   if par < 0 { return moduleLoopEnclosing(fe, name) }
   if par >= fnStmts.length { return -1 }
   const pfn = P.nodes[fnStmts[par]]
-  if pfn is FuncDecl { return parentLoopVarOf(pfn.fnBody, name) }
+  if pfn is FuncDecl { return frameLoopEnclosing(fe, pfn.fnBody, name) }
   -1
+}
+
+// The loop in frame body `body` binding `name` whose body holds lifted frame `fe`'s
+// declaration, the innermost first; else the frame's first loop binding it. A frame may walk
+// several loops under one name, each over its own element type (D3139).
+function frameLoopEnclosing(fe: i32, body: i32, name: string): i32 {
+  const at = captureDeclAt(fe)
+  if at >= 0 {
+    const hit = frameLoopAt(body, name, at)
+    if hit >= 0 { return hit }
+  }
+  parentLoopVarOf(body, name)
+}
+
+// The `let` in frame body `body` a capture written at `at` reads as `name`, or -1 when a loop
+// variable enclosing `at` shadows every such `let` or none binds it. A frame may bind one
+// name in several blocks and loops, each at its own type (D3139).
+function frameLetAt(body: i32, name: string, at: i32): i32 {
+  if at < 0 { return parentLetOf(body, name) }
+  const sid = sidOf(name)
+  const li = parentLetOfAt(body, sid, at)
+  const lp = frameLoopAt(body, name, at)
+  if lp < 0 { return li }
+  if li < 0 { return -1 }
+  // A `let` inside the loop shadows its variable; one outside it is shadowed.
+  if frameLoopAt(body, name, li) == lp { return li }
+  -1
+}
+
+// The source node lifted frame `fe` is written as, its template's for an instance, or -1: the
+// position a capture's binding is resolved at.
+function captureDeclAt(fe: i32): i32 {
+  if fe < 0 || fe >= fnStmts.length { return -1 }
+  if (
+    fe < fnInstOrigin.length
+    && fnInstOrigin[fe] >= 0
+    && fnInstOrigin[fe] < fnStmts.length
+  ) {
+    return fnStmts[fnInstOrigin[fe]]
+  }
+  fnStmts[fe]
 }
 
 // Whether a captured loop variable `name` is its `for-in`'s SECOND name — a map's value or a
@@ -5909,35 +6121,55 @@ function captureLoopVarIterOf(fe: i32, name: string): i32 {
   if par >= fnStmts.length { return -1 }
   const pfn = P.nodes[fnStmts[par]]
   if pfn is FuncDecl {
-    const lv = parentLoopVarOf(pfn.fnBody, name)
+    const lv = frameLoopEnclosing(fe, pfn.fnBody, name)
     if lv < 0 { return -1 }
     const ln = P.nodes[lv]
-    if ln is ForIn {
-      const it = ln.fiIter
-      // A bare local iterable is the one storage class this position cannot read: every rung
-      // of `forInElemKind`'s Ident arm is frame-independent except `declaredKind`, which reads
-      // the live scope stack, and the type section runs with no frame's locals bound. Re-ask
-      // against the binding's initializer, widening only where the answer is the default.
-      const ek = forInElemKind(it, fnStmts[par])
-      if ek == null || ek == "i32" {
-        const itn = P.nodes[unwrapParen(it)]
-        if itn is Ident {
-          const li = parentLetOf(pfn.fnBody, itn.identName)
-          if li >= 0 {
-            const ld = P.nodes[li]
-            if ld is LetDecl {
-              if ld.letInit >= 0 {
-                const iek = forInElemKind(ld.letInit, fnStmts[par])
-                if iek != null && iek != "i32" { return ld.letInit }
-              }
-            }
-          }
-        }
-      }
-      return it
-    }
+    if ln is ForIn { return frameBlindIter(ln.fiIter, fnStmts[par]) }
   }
   -1
+}
+
+// Whether the read `ix` of the `let` at `srcIx` is typed as that `let` is (no narrowing between
+// the declaration and the read), so a copy made there has the `let`'s own cell (D3139).
+function copyReadIsUnnarrowed(ix: i32, srcIx: i32): boolean {
+  if ix < 0 || srcIx < 0 { return false }
+  const sd = P.nodes[srcIx]
+  if !(sd is LetDecl) { return false }
+  let st = -1
+  if sd.letType >= 0 {
+    st = nodeTyIxOf(sd.letType)
+  } else {
+    st = nodeTyIxOf(sd.letInit)
+  }
+  const rt = nodeTyIxOf(ix)
+  if st < 0 || rt < 0 { return false }
+  tySame(st, rt)
+}
+
+// The node to classify iterable `it` of frame `fnIx` by outside that frame's emission. A bare
+// local iterable is the one storage class this position cannot read: every rung of
+// `forInElemKind`'s Ident arm is frame-independent except `declaredKind`, which reads the live
+// scope stack, so it is re-asked of the binding's initializer where the answer is the default.
+function frameBlindIter(it: i32, fnIx: i32): i32 {
+  const ek = forInElemKind(it, fnIx)
+  if ek != null && ek != "i32" { return it }
+  if fnIx < 0 { return it }
+  const fn = P.nodes[fnIx]
+  if !(fn is FuncDecl) { return it }
+  const itx = unwrapParen(it)
+  if itx < 0 { return it }
+  const itn = P.nodes[itx]
+  if !(itn is Ident) { return it }
+  const li = parentLetOfAt(fn.fnBody, sidOfNode(itx), itx)
+  if li < 0 { return it }
+  const ld = P.nodes[li]
+  if ld is LetDecl {
+    if ld.letInit >= 0 {
+      const iek = forInElemKind(ld.letInit, fnIx)
+      if iek != null && iek != "i32" { return ld.letInit }
+    }
+  }
+  it
 }
 
 // The `for-in` variable an un-annotated captured binding `name` of lifted frame `fe` is a bare
@@ -5959,9 +6191,14 @@ function captureLoopCopySrcAt(fe: i32, name: string, depth: i32): string {
     if src is Ident {
       const sn = src.identName
       if sn == name { return "" }
-      // A copy of a copy is typed as the loop variable at the end of the chain.
-      if parentBindingOf(fe, sn) >= 0 {
-        return captureLoopCopySrcAt(fe, sn, depth + 1)
+      // A copy of a copy is typed as the loop variable at the end of the chain, and an
+      // un-narrowed copy of a `let` as that `let`, whose cell only the frame's locals know.
+      const sb = parentBindingOf(fe, sn)
+      if sb >= 0 {
+        const deeper = captureLoopCopySrcAt(fe, sn, depth + 1)
+        if deeper != "" { return deeper }
+        if copyReadIsUnnarrowed(unwrapParen(bn.letInit), sb) { return sn }
+        return ""
       }
       // A boxed element is not redirected: the closure's narrowed reads of the copy resolve
       // its union through the copy's own binding, which has no loop in scope (D2523).
@@ -6014,6 +6251,13 @@ export function captureValKind(fe: i32, name: string): VKind {
         if nicheK != null {
           const initK = letInitCellKind(b, parentBindingFrameArenaOf(fe, name))
           if initK == nicheK { return nicheK }
+          // …and a walk variable over niche elements, whose cell only the loop knows (D3139).
+          if (
+            letInitLoopElemKind(b, parentBindingFrameArenaOf(fe, name))
+            == nicheK
+          ) {
+            return nicheK
+          }
           // The rung above reads the frame, and a MODULE-frame block binding has none, so a
           // field read's nullable slot goes unseen exactly where the ladder cannot ask. This
           // one is frame-blind: the field's storage decides it, not the scope (D1759).
@@ -6178,6 +6422,30 @@ function capNarrowRecord(fnIx: i32, ifree: string[], iglob: {[string]: i32}) {
     i = i + 1
   }
   0
+}
+
+// The module-scope `for` variables whose body the recording walk is inside, innermost last:
+// a start-function local has no slot until the start function emits, which is after every
+// closure written in the loop, so a guard over one resolves its box from here (D3136).
+const cnModLoopName: string[] = []
+const cnModLoopIter: i32[] = []
+
+// Enter module loop `n`'s body: its element variable, when that element is the value-union box.
+function cnModLoopPush(n: ForIn) {
+  if forInElemKind(n.fiIter, -1) != "union" { return 0 }
+  cnModLoopName.push(n.fiVar)
+  cnModLoopIter.push(n.fiIter)
+  0
+}
+
+// The iterable of the innermost recorded module loop binding `name` to a box, or -1.
+function cnModLoopIterOf(name: string): i32 {
+  let i = cnModLoopName.length - 1
+  while i >= 0 {
+    if cnModLoopName[i] == name { return cnModLoopIter[i] }
+    i = i - 1
+  }
+  -1
 }
 
 // Whether narrowing key `key` — a name, or its capture cell `v[0]` / `v$cb[0]` — is one of the
@@ -20887,7 +21155,7 @@ function letInitIsNulLitBox(init: i32, fnIx: i32): boolean {
   if !nodeTyIsNulLitUnion(ix) { return false }
   const e = P.nodes[ix]
   if !(e is Ident || e is Member || e is Index) { return false }
-  exprUnion(ix, fnIx)
+  letInitIsBox(ix, fnIx)
 }
 
 // True if `name` resolves (param / local / module global) to a BOOLEAN binding:
@@ -25010,6 +25278,11 @@ export function anonFieldCode(valIx: i32) {
   // reached the spellability gate, which declines a `TyUnion`, and cost the whole literal its
   // row (D1783).
   if tyIsLitUnion(nodeTyIxOf(valIx)) { return FC_STR }
+  // A `K | null` whose `K` narrowing a wider box re-minted at a fresh index, which the alias
+  // test in the niche rung below misses, is the same atom niche, named by its members (D3121).
+  if nodeTyIsNulLitUnion(valIx) {
+    if nulLitAliasNameOfTy(nodeTyIxOf(valIx)) != "" { return FC_NUL_LIT_UNION }
+  }
   // A value-union field value is the shared box, code 16 — the same code the declared twin
   // gets from `isValueUnionName`. Checked ahead of the spellability gate on purpose:
   // `nodeTyName` spells no union, so that gate would refuse the whole literal a row (D1242).
@@ -25060,6 +25333,14 @@ export function anonFieldCode(valIx: i32) {
   }
   if !anonCodeAdmitsValue(c, valIx) { return -1 }
   c
+}
+
+// The literal-union alias whose members a nullable literal union `ty` holds, in either
+// spelling (`TyNullable` or a flat union with `null`), or "" for any other type.
+function nulLitAliasNameOfTy(ty: i32): string {
+  const texts = tyNulLitUnionMemberTexts(ty)
+  if texts.length == 0 { return "" }
+  litUnionAliasOfLitTexts(texts)
 }
 
 // The inner type of node `valIx`'s recorded niche nullable, or -1 when it is not one — the
@@ -25557,7 +25838,9 @@ export function anonFieldElemName(valIx: i32, code: i32) {
   // `shapeFieldElemName`'s code-30 arm gives the declared twin — without it the atom rep and
   // its membership are unrecoverable, so the admission rule below refused the field (D1710).
   if code == FC_NUL_LIT_UNION {
-    return litUnionAliasNameOfTy(anonNulInnerTyOf(valIx))
+    const nla = litUnionAliasNameOfTy(anonNulInnerTyOf(valIx))
+    if nla != "" { return nla }
+    return nulLitAliasNameOfTy(nodeTyIxOf(valIx))
   }
   // The non-null twin of that arm, paired with the code-0 rung in `anonFieldCode`: a literal
   // union records its NAME so the atom's membership survives the mint. Self-gating, since the
@@ -27379,20 +27662,87 @@ function bindingIsNulLitUnion(bindIx: i32, ownerFnIx: i32) {
 // resolves an identifier through the reader's own locals, params, and module globals, none
 // of which a capture is. Without it a captured atom read as a string, `print` printing the raw id.
 function capturedIsLitAtom(fnIx: i32, name: string) {
-  bindingIsLitAtom(
-    capturedBindingOf(fnIx, name),
-    capturedBindingFrameOf(fnIx, name),
-  )
+  const fe = capturedFrameOf(fnIx, name)
+  if fe < 0 { return false }
+  const b = parentBindingOf(fe, name)
+  if b >= 0 {
+    if bindingIsLitAtom(b, parentBindingFrameArenaOf(fe, name)) { return true }
+  }
+  const lv = capturedLoopVarName(fe, name, b)
+  if lv == "" { return false }
+  capturedLoopVarIsLitAtom(fe, lv)
+}
+
+// The loop variable a capture `name` of lifted frame `fe` reads, whose binding is `b`: itself
+// when it has no binding, the variable a bare un-annotated copy names, or "" (D3119).
+function capturedLoopVarName(fe: i32, name: string, b: i32): string {
+  if b < 0 { return name }
+  const bn = P.nodes[b]
+  if !(bn is LetDecl) { return "" }
+  if bn.letType >= 0 || bn.letInit < 0 { return "" }
+  if !(P.nodes[unwrapParen(bn.letInit)] is Ident) { return "" }
+  captureLoopCopySrc(fe, name)
+}
+
+// Whether a `for-in` variable over `iterIx`, walked in frame `fnIx`, holds an interned atom:
+// a literal-union element or its niche, a literal-union map key, or an element that is one only
+// at the instance's pin. `ek` is the iterable's `forInElemKind`. The flag `declareForInLocals`
+// sets, and a capture's reader asks.
+export function forInVarIsLitAtom(
+  iterIx: i32,
+  fnIx: i32,
+  ek: VKind | null,
+): boolean {
+  if nodeArrayElemIsLitUnion(iterIx) || nodeArrayElemIsNulLitUnion(iterIx) {
+    return true
+  }
+  if nodeTyMapKeyIsLitUnion(iterIx) { return true }
+  if ek != "i32" { return false }
+  const hp = iterElemPinTy(iterIx, fnIx)
+  if hp >= 0 { return tyLitUnionAliasIx(hp) >= 0 || tyIsNulLitUnionNiche(hp) }
+  false
+}
+
+// The second name's twin: a map walk's literal-union value (D2656).
+export function forInPairVarIsLitAtom(iterIx: i32, fnIx: i32): boolean {
+  if !forInPairIsMapVal(iterIx, fnIx) { return false }
+  nodeTyMapValIsLitUnion(iterIx) || nodeTyMapValIsNulLitUnion(iterIx)
+}
+
+// A captured `for-in` variable `name` of lifted frame `fe`, which has no declaration node for
+// `bindingIsLitAtom` to read: asked of the loop's iterable in the frame that walks it, the loop
+// `captureValKind` types the env field from (D3119).
+function capturedLoopVarIsLitAtom(fe: i32, name: string): boolean {
+  const it = captureLoopVarIterOf(fe, name)
+  if it < 0 { return false }
+  const lvf = parentBindingFrameArenaOf(fe, name)
+  if captureLoopVarIsPair(fe, name) { return forInPairVarIsLitAtom(it, lvf) }
+  forInVarIsLitAtom(it, lvf, forInElemKind(it, lvf))
 }
 
 // The niche dual of `capturedIsLitAtom` — `exprNulLitUnion`'s capture channel. A `K | null`
 // capture rides the same i32 env field (`vtKindOfType` answers "i32" for both spellings), so
 // both classifiers need the channel or the two spellings disagree about one field.
 function capturedIsNulLitUnion(fnIx: i32, name: string) {
-  bindingIsNulLitUnion(
-    capturedBindingOf(fnIx, name),
-    capturedBindingFrameOf(fnIx, name),
-  )
+  const fe = capturedFrameOf(fnIx, name)
+  if fe < 0 { return false }
+  const b = parentBindingOf(fe, name)
+  if b >= 0 {
+    if bindingIsNulLitUnion(b, parentBindingFrameArenaOf(fe, name)) {
+      return true
+    }
+  }
+  const lv = capturedLoopVarName(fe, name, b)
+  if lv == "" { return false }
+  const it = captureLoopVarIterOf(fe, lv)
+  if it < 0 { return false }
+  if captureLoopVarIsPair(fe, lv) {
+    if !forInPairIsMapVal(it, parentBindingFrameArenaOf(fe, lv)) {
+      return false
+    }
+    return nodeTyMapValIsNulLitUnion(it)
+  }
+  nodeArrayElemIsNulLitUnion(it)
 }
 
 // ── the declaration fallback, for a body whose expressions record nothing usable ──
@@ -33863,6 +34213,7 @@ export function exprUnion(exprIx: i32, fnIx: i32) {
     if narrowedMapOf(e.identName) != "" { return false }
     if paramUnion(fnIx, e.identName) { return true }
     if declaredUnion(e.identName) { return true }
+    if fnIx < 0 && cnModLoopIterOf(e.identName) >= 0 { return true }
     // A CAPTURED union box (`const a: C | D = …; () => … a is C …`): the env field is the union
     // box (kind 4). `capturedUnionName` resolves its member set from the parent binding so `is`
     // narrows; here we only need to know it IS a union value.
@@ -34025,6 +34376,15 @@ export function letIsUnion(letIx: i32, fnIx: i32) {
       if exprUnion(d.letInit, fnIx) && !exprIsLitAtom(d.letInit, fnIx) {
         return true
       }
+      // A walk variable read at a type that is itself the box, asked outside the frame (D3139).
+      const li = unwrapParen(d.letInit)
+      if li >= 0 && P.nodes[li] is Ident && nodeTyIsUnionShaped(li) {
+        if nodeTyIsBoxRep(li) {
+          if letInitLoopElemKind(letIx, fnIx) == "union" { return true }
+          // …and a copy of a copy, whose source's box only the frame's locals record.
+          if letInitCopiesBox(letIx, fnIx, 8) { return true }
+        }
+      }
     }
     // A null-hole binding (`let x = null`, A-infer-null) is its inferred union.
     return nliNameOf(letIx) != ""
@@ -34079,6 +34439,8 @@ export function unionNameOfIdentAt(sid: i32, fnIx: i32, atIx: i32) {
       // its own, so its member set comes from the iterable's union-box element type instead.
       const flv = forInLoopVarUnionName(name, fnIx)
       if flv != "" { return flv }
+      const rlf = readLoopUnionName(atIx, name, fnIx)
+      if rlf != "" { return rlf }
     }
   }
   // A top-level `for` loop runs in the start function, which has no `FuncDecl` body, so its
@@ -34086,6 +34448,8 @@ export function unionNameOfIdentAt(sid: i32, fnIx: i32, atIx: i32) {
   if fnIx < 0 {
     const slv = forInLoopVarUnionName(name, -1)
     if slv != "" { return slv }
+    const rlm = readLoopUnionName(atIx, name, -1)
+    if rlm != "" { return rlm }
   }
   // A captured union box resolves its member set from the parent frame's binding — a
   // DIFFERENT function's coordinate space, so `atIx` (this frame's) is not passed through.
@@ -34267,6 +34631,10 @@ function startBlockLetOfAt(sid: i32, fnIx: i32, atIx: i32) {
 // Keyed by the live slot, never the name — two `for` loops in one frame can share a loop-var
 // name while binding different unions, and a name-based scan would hand one the other's type.
 function forInLoopVarUnionName(name: string, fnIx: i32) {
+  if fnIx < 0 {
+    const mli = cnModLoopIterOf(name)
+    if mli >= 0 { return forInIterUnionElemName(mli, -1) }
+  }
   if declaredKind(name) != "union" { return "" }
   const slot = declaredSlotOf(name)
   if slot < 0 || slot >= localLoopIter.length { return "" }
@@ -34285,6 +34653,20 @@ function forInPairUnionElemName(iterIx: i32, fnIx: i32) {
   if slot < 0 || slot >= rlElemKindTbl.length { return "" }
   if rlElemKindTbl[slot] != RLK_UNION { return "" }
   rlElemName[slot]
+}
+
+// The member set of the walk variable read at `atIx` as `name` in frame `fnIx`, found by the
+// loop enclosing the read: the answer a classifier typing a capture needs while no slot of the
+// walking frame is live, which `forInLoopVarUnionName` reads (D2523).
+function readLoopUnionName(atIx: i32, name: string, fnIx: i32): string {
+  if atIx < 0 { return "" }
+  const lp = readLoopNodeOf(atIx, name, fnIx)
+  if lp < 0 { return "" }
+  const ln = P.nodes[lp]
+  if ln is ForIn {
+    return forInIterUnionElemName(frameBlindIter(ln.fiIter, fnIx), fnIx)
+  }
+  ""
 }
 
 // The union NAME an ITERABLE's element carries, or "". A union-box ref array (`(C | S)[]`,
@@ -34372,7 +34754,13 @@ export function letUnionNameOf(letIx: i32, fnIx: i32) {
     if unRowOfCanon(annRowOfNode(d.letType)) >= 0 { return tyNameOf(d.letType) }
     if d.letType < 0 {
       const inf = unionNameOfExpr(d.letInit, fnIx)
-      if inf != "" { return inf }
+      if inf != "" {
+        // A narrowed read bound at its niche or arm cell is no box, whatever it reads (D3133).
+        if nodeTyIsNarrowedShape(unwrapParen(d.letInit)) {
+          if letInitBindsNarrowedCell(letIx, fnIx) { return "" }
+        }
+        return inf
+      }
       // A null-hole binding (`let x = null` filled by a later `x = e`) carries
       // its inferred `T|null` value union (A-infer-null).
       return nliNameOf(letIx)

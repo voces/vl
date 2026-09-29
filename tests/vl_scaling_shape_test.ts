@@ -956,6 +956,28 @@ axis(
   (d) => twoFiles(d, genManyCapturedSiblingBlocks(3000, true), genManyCapturedSiblingBlocks(750, true)),
 );
 
+// `n` loops walking one name, each binding a copy of its loop variable that a closure
+// captures. A capture's binding and its enclosing loop are found by position among every loop
+// of that name in the frame, so a per-capture walk over all of them is O(n) per capture and
+// O(n²) overall; round 2 of #3281 was that, and trapped the compiler at n = 300 (D3139). A
+// GROWTH pair, `n` loops against `n/4`: linear reads 4 and quadratic 16. It reads 4.9, as
+// master before the positional lookup did, and 15.1 on the regressed compiler.
+const genLoopCaptures = (n: number): string => {
+  const o = ["function run(xs: i32[]) {"];
+  for (let i = 0; i < n; i++) {
+    o.push("  for q in xs {", "    const c = q", "    const f = () => c", "    print(f())", "  }");
+  }
+  o.push("}", "run([1])");
+  return o.join("\n") + "\n";
+};
+
+axis(
+  "loops each capturing a copy of one loop variable",
+  6.2,
+  "A capture is resolving its loop or binding by scanning every loop of its name (D3139).",
+  (d) => twoFiles(d, genLoopCaptures(200), genLoopCaptures(50)),
+);
+
 // `n` closures made under a narrowing of the module global `g`, each called by name. With a
 // top-level function writing `g`, every closure is asked whether it escapes its body and every
 // call whether it reads a narrowing a writer may have ended; without it neither is asked. Both

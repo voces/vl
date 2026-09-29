@@ -59,6 +59,7 @@ tree ungraded.
 | `startBlockLetRow` (`sbl*`) | `sblEpoch`, bumped beside `startStmts` | `startStmts`, re-pointed by `dispatchRewrite` | probe |
 | `memberSetIntern` (`msSetGen`/`msGen`) | `msGen` | the member-set rows | probe |
 | `parentLetCache` (`plCacheBlock`/`plGen`, and since D2687 up to three parked plans in `plSaved*`, each with its own block and generation) | the cached BLOCK index, current or parked | the arena bodies the rewrites re-point inside that block; `plCacheBust` drops the parked plans with the current one | probe |
+| `parentLoopIndex` (`plLxIdx*`, D3139) | the SID, valid while the entry's `plGen` is the current plan's; dropped wholesale by `sidResetParentLet` | a rebuilt plan, which takes a fresh generation, so a stale entry never matches | probe |
 | `anonLeafIndex` (`anonIxSeen`) | `P.nodes.length` | its own link columns | probe |
 | `fnChildIndex` | `fnChildHead.length` vs `fnStmts.length` | `fnParent`, written in place by `monomorphize` | probe |
 | `frameBindsCache` (`fcbSidGen`/`fcbGen`, D2289) | the asked FRAME; dropped by `resetParentLetCache` | the frame chain's params, lets and loop variables, which a rewrite could re-point | probe |

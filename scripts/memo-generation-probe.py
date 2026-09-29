@@ -136,6 +136,11 @@ ROWS = [
       "  // No current plan (the first ask, or after a bust) — nothing to park, build in place.\n"
       "  if plCacheBlock < 0 {",
       "  if true {")),
+    # D3139: one sid's loop rows sorted by header, valid while the plan generation it was built
+    # under is current. Disabled, every long chain is re-indexed per query.
+    ("parentLoopIndex", ["plLxIdxGen"], "probe",
+     ("  if e >= 0 && plLxIdxGen[e] == plGen { return e }",
+      "  if false && e >= 0 && plLxIdxGen[e] == plGen { return e }")),
     ("anonLeafIndex", ["anonIxSeen", "anonIxBindHead"], "probe",
      ("  if anonIxOn && anonIxSeen == P.nodes.length { return 0 }",
       "  if false && anonIxOn && anonIxSeen == P.nodes.length { return 0 }")),
