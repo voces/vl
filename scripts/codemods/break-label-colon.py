@@ -2,7 +2,7 @@
 """Rewrite the pre-colon label spelling `break B` / `continue B` to `break :B` / `continue :B`.
 
 A label is marked at the exit since the 2026-09-29 ruling (DECISIONS.md, "Labels are marked at
-the exit"), and `break x` now breaks with the value of `x`. This rewrites a `break`/`continue`
+the exit"), and the ruling reads `break x` as breaking with the value of `x`. This rewrites a `break`/`continue`
 followed on the same line by a name, and nothing else before the statement ends, when that
 name labels a loop (`B: while`, `B: for`) the jump is lexically inside. Comments and string
 literals are left alone. Any other name is reported, not rewritten: under the new reading it is

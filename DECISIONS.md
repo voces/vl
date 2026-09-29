@@ -8617,13 +8617,18 @@ spellings build to identical wasm only if they reach binaryen identical.
 
 **The rulings.** A block takes a label as a loop does, `B: { … }`. The label is named again at the
 exit, Zig-style: `break :B`, `break :B v`, `continue :B`; the declaration stays `B:`. A bare
-`break v` leaves the innermost loop with `v`, and a bare `break` keeps working, so `break x` with
-`x` a name now means the value `x`. Any loop may carry a value: its type is the
-join of every `break` value, a block's tail joins in, a `while`/`for` that can finish without a
-`break v` adds `null` (`T | null`), and `while true` — a literal `true`, which cannot run out — is
-plain `T`. `continue :B` on a block is an error. The old `break B` / `continue B` is a parse error
-naming the fix, and `scripts/codemods/break-label-colon.py` migrates a tree (every in-tree use is
-migrated). The guide is `docs/guide/loops.md`.
+`break v` leaves the innermost loop with `v`, and a bare `break` keeps working. Any loop may carry
+a value: its type is the join of every `break` value, a block's tail joins in, a `while`/`for`
+that can finish without a `break v` adds `null` (`T | null`), and `while true` — a literal
+`true`, which cannot run out — is plain `T`. `continue :B` on a block is an error. The old
+`break B` / `continue B` is a parse error naming the fix. The guide is `docs/guide/loops.md`.
+
+**What has landed, and what is pending.** Landed: labelled blocks, `break :B` and `continue :B`
+(on blocks and value-less loops), the E0695 rule below, the old-form parse error, the in-tree
+migration and `scripts/codemods/break-label-colon.py`. Pending: every value — `break v`,
+`break :B v`, a block's tail as its value, a loop in expression position. Until that lands, a
+`break` with a value is refused at the parser, ``break values are not supported yet``, so no
+program is read with a meaning the ruling does not give it.
 
 **Why the colon at the exit.** A label and a value share the operand slot after `break`, and a
 value is the common case plumb's forward-exit blocks need. Marking the label rather than the
@@ -8636,26 +8641,18 @@ as a value. `while true` has no such path, so adding `null` would make every sea
 need an unwrap that can never fire. The literal is the test, not flow analysis: `while 1 == 1`
 runs out as far as the type is concerned.
 
-**How it lowers.** The checker types the loop (`checkBreakNode`, `lpPopResult`); the emitter's
-first pass (`loopValueRewrite`) turns a loop whose value is used into
-`if true { let $lv: T [= null]; <loop>; $lv } else { __trap__() }` with each `break v` storing
-`$lv = v` first, so every delivery position lowers the value through a binding it already
-handles. A nullable `T` starts at `null`; a non-null one is carried out of the loop's `block
-(result T)` frame by `br` and stored where the binding's read validates. A block is a `block`
-frame with no `loop`. A loop whose value is discarded is a statement and `break v` evaluates `v`.
-
-**What it costs a program without one.** Nothing: the rewrite and the formatter's fold are both
-gated on a program holding a value loop, and `break`/`continue` lower as before.
+**How a block lowers.** A labelled block is a single void wasm `block` frame with no `loop`,
+pushed on the break stack and not the continue stack, so `break :B` is a `br` to it and a
+`continue :L` inside it still finds its loop.
 
 **A labelled block is left only by its name (owner ruling, same day: option C, Rust's E0695).**
 The first reading let a bare `break` leave the innermost loop *or block*, which made a block
-silently capture a `break` meant for the loop around it. Now a bare `break`, `break v` or
-`continue` never targets a block: one whose way to its loop crosses a labelled block, or a bare
-`break` in a block with no loop around it, is refused at `vl check` naming both fixes
-(`break :B`, or label the loop and `break :L`). A bare `break v` with no block in between still
-leaves the innermost loop with `v`. The refusal is the parser's, which already tracks the labels
-in scope; the checker and emitter never see a bare jump that could reach a block.
+silently capture a `break` meant for the loop around it. Now a bare `break` or `continue` never
+targets a block: one whose way to its loop crosses a labelled block, or a bare `break` in a
+block with no loop around it, is refused at `vl check` naming both fixes (`break :B`, or label
+the loop and `break :L`). The refusal is the parser's, which already tracks the labels in scope;
+the checker and emitter never see a bare jump that could reach a block.
 
-**One spelling needs parentheses.** A labelled block as a call argument, `f((B: { … }))`, since
-`f(B: …)` is a named argument. Choosing the named argument keeps every existing call meaning
-what it meant.
+**A labelled block is not a call argument.** `f(B: …)` is a named argument, and keeping it one
+keeps every existing call meaning what it meant; `f(B: { stmts })` is refused by name. When block
+values land, the parenthesized `f((B: { … }))` is the spelling that passes one.

@@ -457,8 +457,6 @@ import {
   loopBrkLabel,
   loopContDepth,
   loopContLabel,
-  lvFrameDepth,
-  lvFrameName,
   mIntMonoArmUsed,
   mUsed,
   maFoldScratchBase,
@@ -24699,73 +24697,18 @@ function emitWhileStmtStmt(body: u8[], s: WhileStmt, stmtIx: i32, fnIx: i32) {
   emitWhileLoop(body, s, stmtIx, fnIx)
 }
 
-// A labelled block: one `block` frame a `break` leaves. It takes no `continue`, so a bare one
-// inside it still finds the loop around it. A non-null value types the frame (`lvFrameOpen`):
-// a tail assigned to the result binding falls out with it, and any other end is unreachable.
+// A labelled block: one void `block` frame a `break :B` leaves. It takes no `continue`, so a
+// `continue :L` inside it still finds its loop.
 function emitLabelBlock(body: u8[], s: WhileStmt, _stmtIx: i32, fnIx: i32) {
-  const lv = lvFrameOpen(s)
-  if lv < 0 { return -1 }
+  fbBlock(64) // 0x02 block, 0x40 void blocktype
   loopBrkDepth.push(ctrlDepth)
   loopBrkLabel.push(s.whileLabel)
   const rc = emitStmts(body, s.whileBody, fnIx)
   loopBrkDepth.pop()
   loopBrkLabel.pop()
   if rc < 0 { return -1 }
-  if lv == 1 {
-    if lvTailAssigns(s) {
-      fbLocalGet(localIndexOf(fnIx, s.whileLv))
-    } else {
-      fbUnreachable()
-    }
-  }
-  lvFrameClose(s, lv, fnIx)
-}
-
-// Opens the break frame of the `while` or labelled block `s`: typed by its result binding's
-// valtype when a non-null value leaves by `br` (1), else void (0); -1 on failure.
-function lvFrameOpen(s: WhileStmt): i32 {
-  if s.whileLv == "" {
-    fbBlock(64) // 0x02 block, 0x40 void blocktype
-    return 0
-  }
-  const slot = scopeSlotOf(s.whileLv)
-  if slot < 0 || slot >= localIsRef.length {
-    emitFail("emitProgram: a loop value's result binding has no local")
-    return -1
-  }
-  fbOpenBlock()
-  fbValtype(localIsRef[slot], localStructIdx[slot])
-  lvFrameDepth.push(ctrlDepth)
-  lvFrameName.push(s.whileLv)
-  1
-}
-
-// Closes the frame `lvFrameOpen` returned `lv` for; a typed one stores the value it carries
-// out into the result binding, which initializes that binding at the enclosing level.
-function lvFrameClose(s: WhileStmt, lv: i32, fnIx: i32) {
   fbEnd()
-  if lv == 1 {
-    lvFrameDepth.pop()
-    lvFrameName.pop()
-    fbLocalSet(localIndexOf(fnIx, s.whileLv))
-  }
   0
-}
-
-// Whether the labelled block `s` ends by assigning its tail to its result binding.
-function lvTailAssigns(s: WhileStmt): boolean {
-  const b = P.nodes[s.whileBody]
-  if b is Block {
-    const n = b.blkStmts.length
-    if n == 0 { return false }
-    const a = P.nodes[b.blkStmts[n - 1]]
-    if a is BinExpr {
-      if a.binOp != "=" { return false }
-      const t = P.nodes[a.binLeft]
-      if t is Ident { return t.identName == s.whileLv }
-    }
-  }
-  false
 }
 
 function emitWhileLoop(body: u8[], s: WhileStmt, _stmtIx: i32, fnIx: i32) {
@@ -24775,11 +24718,10 @@ function emitWhileLoop(body: u8[], s: WhileStmt, _stmtIx: i32, fnIx: i32) {
   // depth. The list-header hoists open before the block, since a loop that never iterates leaves them unread.
   const whHoist = loopHoistOpen(body, s.whileCond, s.whileBody, fnIx, "", "")
   if whHoist < 0 { return -1 }
-  const whLv = lvFrameOpen(s)
-  if whLv < 0 { return -1 }
+  fbBlock(64) // 0x02 block, 0x40 void blocktype
   loopBrkDepth.push(ctrlDepth)
   loopBrkLabel.push(s.whileLabel)
-  fbLoop(64) // 0x03 loop, 0x40 void blocktype
+  fbLoop(64)  // 0x03 loop, 0x40 void blocktype
   loopContDepth.push(ctrlDepth)
   loopContLabel.push(s.whileLabel)
   // condition + eqz: if condition is false (zero), exit block. A literal `true` never exits,
@@ -24802,9 +24744,7 @@ function emitWhileLoop(body: u8[], s: WhileStmt, _stmtIx: i32, fnIx: i32) {
   fbEnd() // 0x0b end (loop)
   loopContDepth.pop()
   loopContLabel.pop()
-  // A typed frame is left only by a `break v`, so falling out of the loop cannot happen.
-  if whLv == 1 { fbUnreachable() }
-  lvFrameClose(s, whLv, fnIx) // 0x0b end (block)
+  fbEnd() // 0x0b end (block)
   loopBrkDepth.pop()
   loopBrkLabel.pop()
   loopHoistClose(whHoist)
@@ -25963,7 +25903,12 @@ function emitForInCopies(body: u8[], s: ForIn, fnIx: i32, c: ForInCopies) {
   0
 }
 
-function emitBreakStmtStmt(_body: u8[], s: BreakStmt, _stmtIx: i32, fnIx: i32) {
+function emitBreakStmtStmt(
+  _body: u8[],
+  s: BreakStmt,
+  _stmtIx: i32,
+  _fnIx: i32,
+) {
   // `break [label]`: branch out of a loop's wrapping block, so control resumes after the
   // whole loop. Unlabelled targets the innermost; `break outer` scans the parallel label
   // stack from the top. A `break` outside any loop or to an unknown label fails loudly, not with a bad `br`.
@@ -25977,17 +25922,6 @@ function emitBreakStmtStmt(_body: u8[], s: BreakStmt, _stmtIx: i32, fnIx: i32) {
     )
   }
   const blkDepth = loopBrkDepth[brkAt]
-  // A value leaving a typed frame rides the `br`: the statement before this one stored it.
-  if s.brkHasVal == 1 {
-    let k = lvFrameDepth.length - 1
-    while k >= 0 {
-      if lvFrameDepth[k] == blkDepth {
-        fbLocalGet(localIndexOf(fnIx, lvFrameName[k]))
-        k = 0
-      }
-      k = k - 1
-    }
-  }
   fbBr(ctrlDepth - blkDepth) // 0x0c br to the loop's wrapping block
   return 0
 }

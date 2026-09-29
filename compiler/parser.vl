@@ -92,7 +92,7 @@ import {
   mkBinary,
   mkBlock,
   mkBool,
-  mkBreakVal,
+  mkBreak,
   mkCall,
   mkCallN,
   mkChar,
@@ -1300,19 +1300,6 @@ function parsePrimary() {
     // statement and expression position (like `if`).
     return valueIfAdd(parseMatch())
   }
-  // A loop or labelled block in value position carries the value its `break`s exit with.
-  if k == "WHILE" { return parseWhile("") }
-  if k == "FOR" { return parseFor("") }
-  if k == "IDENT" && kindAt(P.pos + 1) == "COLON" {
-    const lk = kindAt(P.pos + 2)
-    if lk == "WHILE" || lk == "FOR" || lk == "LBRACE" {
-      const label = advance().text
-      advance() // COLON
-      if lk == "WHILE" { return parseWhile(label) }
-      if lk == "FOR" { return parseFor(label) }
-      return parseLabelBlock(label, p0)
-    }
-  }
   if k == "IDENT" { return mkIdent(btValueName(advance().text), p0) }
   if k == "LPAREN" {
     // `(params) => body` — an arrow lambda — when `=>` follows the matching `)`;
@@ -1496,17 +1483,15 @@ function parseOneArg(args: i32[], names: string[]) {
     names.push("")
   }
   // `f(B: { stmts })`: a named argument's value cannot be a block, so this is a labelled block
-  // written bare. Refused with the spelling that reads it as one, and parsed as that.
+  // written as an argument. Refused by name, and parsed as that block to recover.
   if named && peekKind() == "LBRACE" && braceOpensStmt(P.pos) {
     const bl = names.pop() ?? ""
     names.push("")
     P.diags.push(
       {
-        msg: "a labelled block as an argument needs parentheses: `f(("
+        msg: "a labelled block is a statement, not an argument: `"
           + bl
-          + ": { … }))`, since `f("
-          + bl
-          + ": …)` names an argument",
+          + ": { … }` carries no value (block values are not supported yet)",
         at: P.pos,
       },
     )
@@ -3283,9 +3268,7 @@ function oneStmtBlock(): i32 {
   const btSaved = btNames.length
   btDepth = btDepth + 1
   const one: i32[] = []
-  const ps = parseStmt()
-  placeBrkVal(one)
-  one.push(ps)
+  one.push(parseStmt())
   btDepth = btDepth - 1
   btTrimTo(btSaved)
   mkBlock(one, -1)
@@ -3754,23 +3737,10 @@ function lblKindOf(name: string): i32 {
   -1
 }
 
-// The value of a `break v` just parsed. It stands in the statement list as the statement
-// before the break, so the list that receives the break places it there; -1 when none.
-let brkValPending = -1
-
 // Whether the token at `i` ends a statement, so no operand of `break`/`continue` follows.
 function stmtEndAt(i: i32): boolean {
   const k = kindAt(i)
   k == "NEWLINE" || k == "SEMI" || k == "RBRACE" || k == "EOF" || k == "COMMA"
-}
-
-// Places the value of the `break v` just parsed onto `stmts`, ahead of the break itself.
-function placeBrkVal(stmts: i32[]) {
-  if brkValPending >= 0 {
-    stmts.push(brkValPending)
-    brkValPending = -1
-  }
-  0
 }
 
 // `for v in <from> (to | until) <to> [step <s>] { body }` (a numeric range) or
@@ -3848,10 +3818,9 @@ function parseFor(label: string) {
   fiix
 }
 
-// `"break" [":" label] [value]` — leaves the labelled loop or block, else the innermost loop,
-// with the value when one follows on the same line. The value is parked in `brkValPending` for
-// the statement list to place before the break. An enclosing label written without the colon
-// is the old spelling, refused with its fix rather than read as a value.
+// `"break" [":" label]` — leaves the labelled loop or block, else the innermost loop. A value
+// after it (`break v`, `break :B v`) is refused as not yet supported, and an enclosing label
+// written without the colon is the old spelling, refused with its fix.
 function parseBreak() {
   const p0 = peekTok().start // the `break` keyword
   const kw = advance()       // "break"
@@ -3883,12 +3852,18 @@ function parseBreak() {
       )
     }
   }
-  let hasVal = 0
+  // The value is parsed so the statement recovers as written, and dropped with the refusal.
   if !stmtEndAt(P.pos) {
-    brkValPending = parseExpr()
-    hasVal = 1
+    const valAt = P.pos
+    parseExpr()
+    P.diags.push(
+      {
+        msg: "break values are not supported yet: a loop or labelled block does not carry a value",
+        at: valAt,
+      },
+    )
   }
-  mkBreakVal(kw.text, label, p0, hasVal)
+  mkBreak(kw.text, label, p0)
 }
 
 // `"continue" [":" label]` — continues the labelled loop, else the innermost one. A labelled
@@ -3970,20 +3945,7 @@ function parseJumpLabel(kw: string): string {
   if kw == "break" && peekKind() == "IDENT" && stmtEndAt(P.pos + 1) {
     const nm = peekTok().text
     if lblKindOf(nm) >= 0 {
-      P.diags.push(
-        {
-          msg: "labels are written `break :"
-            + nm
-            + "`; `break "
-            + nm
-            + "` would break with the value of `"
-            + nm
-            + "`, so write `break ("
-            + nm
-            + ")` for that",
-          at: P.pos,
-        },
-      )
+      P.diags.push({ msg: "labels are written `break :" + nm + "`", at: P.pos })
       advance()
       return nm
     }
@@ -4020,15 +3982,9 @@ function parseBlock() {
   let going = true
   while going {
     const k = peekKind()
-    if k == "RBRACE" || k == "EOF" {
-      going = false
-    } else if k == "NEWLINE" || k == "SEMI" {
-      advance()
-    } else {
-      const ps = parseStmt()
-      if brkValPending >= 0 { placeBrkVal(stmts) }
-      stmts.push(ps)
-    }
+    if k == "RBRACE" || k == "EOF" { going = false }
+    else if k == "NEWLINE" || k == "SEMI" { advance() }
+    else { stmts.push(parseStmt()) }
   }
   brDepth = brSavedB
   expectClose("RBRACE")
@@ -4485,10 +4441,9 @@ export function parseProgram() {
   // (malformed) parse would otherwise leave it raised and make every later
   // statement break newline-terminate at a leading operator.
   brDepth = 0
-  // The label stack and a parked `break` value are per program too.
+  // The label stack is per program too.
   lblNames = []
   lblIsBlk = []
-  brkValPending = -1
   // D1045: the block-scope machinery is per program. A mint counter only has to
   // be unique within its module — the merge renames each module's top-level
   // declarations, these included, apart — and a leaked scope row from an earlier
@@ -4513,9 +4468,7 @@ export function parseProgram() {
     } else if k == "NEWLINE" || k == "SEMI" {
       advance()
     } else if kwUseAt(P.pos) {
-      const ps = parseStmt()
-      if brkValPending >= 0 { placeBrkVal(stmts) }
-      stmts.push(ps)
+      stmts.push(parseStmt())
     } else if k == "IMPORT" {
       stmts.push(parseImport())
     } else if k == "EXPORT" && kindAt(P.pos + 1) == "LBRACE" {
@@ -4527,9 +4480,7 @@ export function parseProgram() {
       const xg = parseExtern()
       if xg >= 0 { stmts.push(xg) }
     } else {
-      const ps = parseStmt()
-      if brkValPending >= 0 { placeBrkVal(stmts) }
-      stmts.push(ps)
+      stmts.push(parseStmt())
     }
   }
   // D1045 — the hoist. A body-scoped declaration is also a top-level statement of the
