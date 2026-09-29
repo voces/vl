@@ -171,6 +171,7 @@ type PlPlan = {
   moreHead: i32[],
   lxLo: i32[],
   lxHi: i32[],
+  lxLoop: i32[],
   lxNext: i32[],
   lxHead: i32[],
   sortStart: i32[],
@@ -217,6 +218,8 @@ let plMoreHead: i32[] = []
 // then the body block's own index — the arena is post-order). Rebuilt with the rest (D2289).
 let plLxLo: i32[] = []
 let plLxHi: i32[] = []
+// The `ForRange`/`ForIn` each `plLx*` row belongs to, so a query can name the loop.
+let plLxLoop: i32[] = []
 let plLxNext: i32[] = []
 let plLxHead: i32[] = []
 // A lazily-built, ASCENDING-by-`cand` materialization of one sid's `plMore*` chain, binary
@@ -345,6 +348,7 @@ export function sidResetParentLet() {
   plMoreHead = []
   plLxLo = []
   plLxHi = []
+  plLxLoop = []
   plLxNext = []
   plLxHead = []
   plSortStart = []
@@ -357,6 +361,12 @@ export function sidResetParentLet() {
   plLoopSidGen = []
   plGen = 0
   plGenTop = 0
+  plLxIdxKey = Map()
+  plLxIdxGen = []
+  plLxIdxLo = []
+  plLxIdxHi = []
+  plLxIdxLoop = []
+  plLxIdxUp = []
   plSaved = []
   plSavedBlock = []
   plSavedGen = []
@@ -459,17 +469,17 @@ function plScanStmt(ix: i32, owner: i32) {
     let head = st.frTo
     if st.frFrom > head { head = st.frFrom }
     if st.frStep > head { head = st.frStep }
-    plRecordLoopExtent(st.frVar, head, st.frBody)
+    plRecordLoopExtent(st.frVar, head, st.frBody, ix)
     plScanStmt(st.frFrom, owner)
     plScanStmt(st.frTo, owner)
     plScanStmt(st.frStep, owner)
     plScanStmt(st.frBody, st.frBody)
   } else if st is ForIn {
     plRecordLoopVar(st.fiVar, ix)
-    plRecordLoopExtent(st.fiVar, st.fiIter, st.fiBody)
+    plRecordLoopExtent(st.fiVar, st.fiIter, st.fiBody, ix)
     if st.fiVar2 != "" {
       plRecordLoopVar(st.fiVar2, ix)
-      plRecordLoopExtent(st.fiVar2, st.fiIter, st.fiBody)
+      plRecordLoopExtent(st.fiVar2, st.fiIter, st.fiBody, ix)
     }
     plScanStmt(st.fiIter, owner)
     plScanStmt(st.fiBody, st.fiBody)
@@ -522,13 +532,14 @@ function plScanStmt(ix: i32, owner: i32) {
 }
 
 // Chains one loop variable's scope row onto its sid (`plLx*`).
-function plRecordLoopExtent(name: string, lo: i32, hi: i32) {
+function plRecordLoopExtent(name: string, lo: i32, hi: i32, loop: i32) {
   if name == "" { return 0 }
   const lsid = sidOf(name)
   plLxNext.push(sidArrGet(plLxHead, lsid))
   sidArrPut(plLxHead, lsid, plLxLo.length)
   plLxLo.push(lo)
   plLxHi.push(hi)
+  plLxLoop.push(loop)
   0
 }
 
@@ -805,6 +816,7 @@ function mllSortFind(off: i32, cnt: i32, atIx: i32): i32 {
 function plBuildLetMap(blockIx: i32) {
   plLxLo = []
   plLxHi = []
+  plLxLoop = []
   plLxNext = []
   plLxHead = []
   plMoreSid = []
@@ -835,6 +847,7 @@ function plSave(): PlPlan {
     moreHead: plMoreHead,
     lxLo: plLxLo,
     lxHi: plLxHi,
+    lxLoop: plLxLoop,
     lxNext: plLxNext,
     lxHead: plLxHead,
     sortStart: plSortStart,
@@ -862,6 +875,7 @@ function plLoad(p: PlPlan) {
   plMoreHead = p.moreHead
   plLxLo = p.lxLo
   plLxHi = p.lxHi
+  plLxLoop = p.lxLoop
   plLxNext = p.lxNext
   plLxHead = p.lxHead
   plSortStart = p.sortStart
@@ -1116,6 +1130,128 @@ export function parentLoopCoversAt(blockIx: i32, sid: i32, atIx: i32): boolean {
     i = plLxNext[i]
   }
   false
+}
+
+// The innermost `for` loop of `sid` in the body block at `blockIx` whose variable is in scope
+// at `atIx`, or -1: `parentLoopCoversAt` naming the loop, off the same rows. Innermost is the
+// highest header, the arena being post-order. A long chain is binary searched (`plLxIndexOf`).
+export function parentLoopAt(blockIx: i32, sid: i32, atIx: i32): i32 {
+  if blockIx < 0 || sid < 0 || atIx < 0 { return -1 }
+  plEnsure(blockIx)
+  let n = 0
+  let c = sidArrGet(plLxHead, sid)
+  while c >= 0 && n <= PL_LX_SCAN {
+    n = n + 1
+    c = plLxNext[c]
+  }
+  if n > PL_LX_SCAN { return plLxIndexedAt(plLxIndexOf(sid), atIx) }
+  let best = -1
+  let bestLo = -1
+  let i = sidArrGet(plLxHead, sid)
+  while i >= 0 {
+    if plLxLo[i] < atIx && atIx <= plLxHi[i] && plLxLo[i] > bestLo {
+      best = plLxLoop[i]
+      bestLo = plLxLo[i]
+    }
+    i = plLxNext[i]
+  }
+  best
+}
+
+// The chain length up to which `parentLoopAt` scans a sid's loop rows rather than indexing them.
+const PL_LX_SCAN = 8
+
+// One sid's loop rows sorted by header (`plLxIdxLo`) with each row's innermost enclosing row of
+// the same sid (`plLxIdxUp`), keyed by sid and valid while its build's `plGen` is current,
+// which names one block's plan: generations are never reissued within a program.
+let plLxIdxKey: {[i32]: i32} = Map()
+let plLxIdxGen: i32[] = []
+let plLxIdxLo: i32[][] = []
+let plLxIdxHi: i32[][] = []
+let plLxIdxLoop: i32[][] = []
+let plLxIdxUp: i32[][] = []
+
+// The index entry of `sid`'s rows in the current plan, built on first need.
+function plLxIndexOf(sid: i32): i32 {
+  let e = plLxIdxKey.get(sid) ?? -1
+  if e >= 0 && plLxIdxGen[e] == plGen { return e }
+  const rows: i32[] = []
+  let i = sidArrGet(plLxHead, sid)
+  while i >= 0 {
+    rows.push(i)
+    i = plLxNext[i]
+  }
+  // Insertion by header: the chain is pushed in scan order, which is nearly always ascending.
+  const lo: i32[] = []
+  const hi: i32[] = []
+  const lp: i32[] = []
+  let r = rows.length - 1
+  while r >= 0 {
+    const row = rows[r]
+    let at = lo.length
+    lo.push(0)
+    hi.push(0)
+    lp.push(0)
+    while at > 0 && lo[at - 1] > plLxLo[row] {
+      lo[at] = lo[at - 1]
+      hi[at] = hi[at - 1]
+      lp[at] = lp[at - 1]
+      at = at - 1
+    }
+    lo[at] = plLxLo[row]
+    hi[at] = plLxHi[row]
+    lp[at] = plLxLoop[row]
+    r = r - 1
+  }
+  // Ranges of one tree nest or are disjoint, so a stack of open ranges names each one's parent.
+  const up: i32[] = []
+  const open: i32[] = []
+  let k = 0
+  while k < lo.length {
+    while open.length > 0 && hi[open[open.length - 1]] < lo[k] { open.pop() }
+    if open.length > 0 {
+      up.push(open[open.length - 1])
+    } else {
+      up.push(0 - 1)
+    }
+    open.push(k)
+    k = k + 1
+  }
+  if e < 0 {
+    e = plLxIdxGen.length
+    plLxIdxGen.push(plGen)
+    plLxIdxLo.push(lo)
+    plLxIdxHi.push(hi)
+    plLxIdxLoop.push(lp)
+    plLxIdxUp.push(up)
+    plLxIdxKey.set(sid, e)
+    return e
+  }
+  plLxIdxGen[e] = plGen
+  plLxIdxLo[e] = lo
+  plLxIdxHi[e] = hi
+  plLxIdxLoop[e] = lp
+  plLxIdxUp[e] = up
+  e
+}
+
+// `parentLoopAt` over index entry `e`: the last header before `atIx`, then outward to the first
+// row whose body still holds it.
+function plLxIndexedAt(e: i32, atIx: i32): i32 {
+  if e < 0 || e >= plLxIdxLo.length { return -1 }
+  const lo = plLxIdxLo[e]
+  let a = 0
+  let b = lo.length
+  while a < b {
+    const m = (a + b) / 2
+    if lo[m] < atIx { a = m + 1 } else { b = m }
+  }
+  let p = a - 1
+  while p >= 0 {
+    if atIx <= plLxIdxHi[e][p] { return plLxIdxLoop[e][p] }
+    p = plLxIdxUp[e][p]
+  }
+  -1
 }
 
 // Finds the `for` loop variable named `name` anywhere in the body block at `blockIx` — the
