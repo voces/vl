@@ -12580,11 +12580,45 @@ function collectThenNarrowsRaw(condIx: i32, names: string[], tys: i32[]) {
 function holeElseRemainderOk(tIdx: i32, cur: i32): boolean {
   if tIdx < 0 { return false }
   const t = T.tys[tIdx]
-  if t is TyObj {
-    const row = hdRowOf(cur)
-    return row >= 0 && hdKind[row] == HD_FLD
-  }
+  if t is TyObj { return hdFieldRooted(cur) }
   true
+}
+
+// Whether a read at remainder `ty` sits in a dead arm at these bindings: some test in its chain
+// matches the whole pin it narrows, so no value reaches it, and the pin does not re-ask it (D3216).
+function gnotArmDeadAt(ty: i32, bNames: string[], bTys: i32[]): boolean {
+  let cur = ty
+  let guard = 0
+  while guard < 64 {
+    const row = hdRowOf(cur)
+    if row < 0 || hdKind[row] != HD_GNOT { return false }
+    const base = substTyDeep(hdBase[row], bNames, bTys)
+    if base >= 0 && !tyHasHole(base) {
+      if hdAlt[row] == TY_NULL {
+        if isNullTy(base) { return true }
+      } else if hdAlt[row] >= 0 && holeAssignOk(-1, base, hdAlt[row]) {
+        return true
+      }
+    }
+    cur = hdBase[row]
+    guard = guard + 1
+  }
+  false
+}
+
+// Whether hole `ty` is a hole's field or a chain of deferred remainders over one (D3216).
+function hdFieldRooted(ty: i32): boolean {
+  let cur = ty
+  let guard = 0
+  while guard < 64 {
+    const row = hdRowOf(cur)
+    if row < 0 { return false }
+    if hdKind[row] == HD_FLD { return true }
+    if hdKind[row] != HD_GNOT { return false }
+    cur = hdBase[row]
+    guard = guard + 1
+  }
+  false
 }
 
 // Whether a member read off derived hole `row` is re-asked at the pin: a hole's field, or the
@@ -12592,8 +12626,7 @@ function holeElseRemainderOk(tIdx: i32, cur: i32): boolean {
 function hdMemberReasked(row: i32): boolean {
   if hdKind[row] == HD_FLD { return true }
   if hdKind[row] != HD_GNOT || hdAlt[row] == TY_NULL { return false }
-  const b = hdRowOf(hdBase[row])
-  b >= 0 && hdKind[b] == HD_FLD
+  hdFieldRooted(hdBase[row])
 }
 
 // Collect the narrowings that hold when `cond` is false: `x == null` strips the null in the else
@@ -35170,6 +35203,7 @@ function validateMemCstrs(
         // check time owns a concrete receiver's write diagnostic, and a builtin-indexable pin
         // is a real array/map write. The SET operator's own site is settled just above.
         if memCstrProp[ci] == OP_INDEX_SET { skip = true }
+        if gnotArmDeadAt(memCstrTy[ci], bNames, bTys) { skip = true }
         if !skip {
           const mMsg = memCstrMsg(mr, memCstrProp[ci])
           if mMsg != "" {
