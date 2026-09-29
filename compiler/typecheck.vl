@@ -4907,6 +4907,10 @@ export function initChecker() {
   lpValTail = []
   exitArmBlocks = []
   exitArmSeen = []
+  exitFirstAt = []
+  exitFirstLets = []
+  valueArmBlk = []
+  nestedExitFirstAt = []
   lpValSeen = false
   lpLabels = []
   lpJoin = []
@@ -54050,6 +54054,48 @@ function widenLitTyGo(ty: i32, depth: i32): i32 {
 }
 
 function checkLetDeclNode(n: LetDecl, ix: i32) {
+  const r = checkLetDeclNodeIn(n, ix)
+  // Only a program holding a loop value or an exiting first arm pays for the look.
+  const anyToPin = lpOn || exitFirstAt.length > 0
+  if anyToPin && n.letType < 0 && n.letInit >= 0 && !inferQuiet {
+    let ini = n.letInit
+    while ini >= 0 && P.nodes[ini] is Paren {
+      const pn = P.nodes[ini]
+      if pn is Paren { ini = pn.parInner }
+    }
+    // A loop value's binding is read through the result binding the emitter mints, which
+    // a classifier asked at module scope or through a capture cannot see into.
+    const loopVal = lpOn && loopCarriesValue(ini)
+    const firstExits = exitFirstAt.length > 0 && exitFirstOnSpine(ini, 0)
+    if (loopVal || firstExits) && !i32ListHas(exitFirstLets, ix) {
+      exitFirstLets.push(ix)
+    }
+  }
+  r
+}
+
+// Whether `ix`, or the first-arm tail an `if` or `match` at `ix` reads through, is a value
+// construct whose first arm always exits (`noteExitFirst`).
+function exitFirstOnSpine(ix: i32, depth: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length || depth > 64 { return false }
+  if lpColAt(exitFirstAt, ix) == 1 { return true }
+  const n = P.nodes[ix]
+  let arm = -1
+  if n is IfStmt { arm = n.ifThen }
+  if n is MatchExpr {
+    if n.matchBodies.length > 0 { arm = n.matchBodies[0] }
+  }
+  if n is Paren { return exitFirstOnSpine(n.parInner, depth + 1) }
+  if arm < 0 { return false }
+  const b = P.nodes[arm]
+  if b is Block {
+    if b.blkStmts.length == 0 { return false }
+    return exitFirstOnSpine(b.blkStmts[b.blkStmts.length - 1], depth + 1)
+  }
+  exitFirstOnSpine(arm, depth + 1)
+}
+
+function checkLetDeclNodeIn(n: LetDecl, ix: i32) {
   if n.letType < 0 && n.letInit >= 0 && !inferQuiet {
     const lp = cwPeel(n.letInit)
     if lp >= 0 {
@@ -54565,6 +54611,7 @@ function checkMatchIntArms(n: MatchExpr, ix: i32, st: i32) {
       )
     }
     const body = n.matchBodies[ai]
+    if !valDiscarded(ix) { noteValueArm(body) }
     const bt = checkNode(body)
     let armTy = bt
     const bn = P.nodes[body]
@@ -54574,7 +54621,7 @@ function checkMatchIntArms(n: MatchExpr, ix: i32, st: i32) {
       // sentinel TY_ERR (both are -1), so a void-arm `match` must not be read as an error.
       if armTy < 0 { armTy = TY_VOID }
     }
-    if !matchArmExits(body, armTy) {
+    if !matchArmExits(ix, body, armTy) {
       matchTy = joinTys(matchTy, f32ArmPlainTy(body, armTy))
       if tpEnvNames.length > 0 { matchArmTys.push(f32ArmPlainTy(body, armTy)) }
       matchValAcc = matchArmTally(ix, body, armTy, matchValAcc)
@@ -54717,14 +54764,21 @@ function checkMatchBindDecls(bIx: i32) {
 
 // Whether the `match` arm `body` is a block that always exits, which hands the join nothing and
 // is noted for the emitter's `never` tail, as an `if` arm is (D3222).
-function matchArmExits(body: i32, armTy: i32): boolean {
+function matchArmExits(ix: i32, body: i32, armTy: i32): boolean {
   // An arm with a value cannot always exit, and a statement or tail `match` (`matchOnSpine`)
   // lowers its arms without one, so neither pays for the walk of the arm.
   if matchOnSpine || !isVoidTy(armTy) || !(P.nodes[body] is Block) {
     return false
   }
+  const mn = P.nodes[ix]
+  let first = false
+  if mn is MatchExpr {
+    first = mn.matchBodies.length > 0 && mn.matchBodies[0] == body
+  }
   if !stmtAlwaysExits(body) { return false }
+  if first && atValueArmTail() { lpColSet(nestedExitFirstAt, ix, 1) }
   noteExitArm(body)
+  if first { noteExitFirst(ix) }
   true
 }
 
@@ -54897,6 +54951,7 @@ function checkMatchTypeArms(n: MatchExpr, ix: i32, st: i32, uMems: i32[]) {
       checkMatchBindDecls(bindIx)
     }
     const body = n.matchBodies[bi]
+    if !valDiscarded(ix) { noteValueArm(body) }
     const bt = checkNode(body)
     let armTy = bt
     const bn = P.nodes[body]
@@ -54907,7 +54962,7 @@ function checkMatchTypeArms(n: MatchExpr, ix: i32, st: i32, uMems: i32[]) {
       if armTy < 0 { armTy = TY_VOID }
     }
     if scoped { popScope() }
-    if !matchArmExits(body, armTy) {
+    if !matchArmExits(ix, body, armTy) {
       matchTy = joinTys(matchTy, f32ArmPlainTy(body, armTy))
       if tpEnvNames.length > 0 { matchArmTys.push(f32ArmPlainTy(body, armTy)) }
       matchValAcc = matchArmTally(ix, body, armTy, matchValAcc)
@@ -54956,6 +55011,7 @@ function checkMatchExprNode(n: MatchExpr, ix: i32) {
   matchOnSpine = spinePos || valDiscarded(ix)
   spinePos = matchOnSpine
   const r = checkMatchExprNodeIn(n, ix)
+  if lpColAt(nestedExitFirstAt, ix) == 1 { refuseNestedExitFirst(ix, r) }
   matchOnSpine = savedOnSpine
   spinePos = savedSpine
   r
@@ -55102,6 +55158,7 @@ function checkMatchExprNodeIn(n: MatchExpr, ix: i32) {
     // Body value type. (Arm bodies are not checked in return-tail position; the match's joined
     // value seeds the function return once, below — avoids a per-arm void/err mis-seed.)
     const body = n.matchBodies[ai]
+    if !valDiscarded(ix) { noteValueArm(body) }
     const bt = checkNode(body)
     let armTy = bt
     const bn = P.nodes[body]
@@ -55111,7 +55168,7 @@ function checkMatchExprNodeIn(n: MatchExpr, ix: i32) {
       // sentinel TY_ERR (both are -1), so a void-arm `match` must not be mistaken for an error.
       if armTy < 0 { armTy = TY_VOID }
     }
-    if !matchArmExits(body, armTy) {
+    if !matchArmExits(ix, body, armTy) {
       matchTy = joinTys(matchTy, f32ArmPlainTy(body, armTy))
       if tpEnvNames.length > 0 { matchArmTys.push(f32ArmPlainTy(body, armTy)) }
       matchValAcc = matchArmTally(ix, body, armTy, matchValAcc)
@@ -55218,6 +55275,7 @@ function checkIfStmtNode(ix: i32) {
           savedTails.push(retTailPos)
           cur = c.ifElse
         } else {
+          if !valDiscarded(at) { noteValueArm(c.ifElse) }
           elseRes = checkNode(c.ifElse)
         }
       }
@@ -55315,7 +55373,11 @@ function checkIfHead(n: IfStmt, ix: i32): IfChk {
   // this depth runs whenever the arm does and a deeper one is conditional (D1846).
   const thenOwnDepth = T.scopes.length + 1
   const thenLo = narClobKeys.length
-  if valDiscarded(ix) { markValDiscard(n.ifThen) }
+  if valDiscarded(ix) {
+    markValDiscard(n.ifThen)
+  } else {
+    noteValueArm(n.ifThen)
+  }
   checkNode(n.ifThen)
   const thenHi = narClobKeys.length
   // The guard-clause divergence test, asked once the arm is checked so a `never` call in it is
@@ -55659,8 +55721,12 @@ function checkIfTail(
     let plainJoin = joinTys(thenPlain, elsePlain)
     // A function's tail `if` already lowers an exiting arm as a return, so it needs no tail.
     if thenExits && !daElseDiverges && P.nodes[n.ifThen] is Block {
+      if atValueArmTail() { refuseNestedExitFirst(ix, elsePlain) }
       plainJoin = elsePlain
-      if !ifChainOnFnTail { noteExitArm(n.ifThen) }
+      if !ifChainOnFnTail {
+        noteExitArm(n.ifThen)
+        noteExitFirst(ix)
+      }
     }
     const elseBlk = n.ifElse >= 0 && P.nodes[n.ifElse] is Block
     if daElseDiverges && !thenExits && elseBlk {
@@ -60860,6 +60926,57 @@ function noteExitArm(blk: i32) {
   lpColSet(exitArmSeen, blk, 1)
   exitArmBlocks.push(blk)
   0
+}
+
+// The value `if`s and `match`es whose FIRST arm always exits, and the un-annotated bindings they
+// initialize. The emitter's classifiers read a construct's first arm, so each such binding takes
+// its checked type as an annotation, the spelling the other arm order already reads (D3222).
+let exitFirstAt: i32[] = []
+let exitFirstLets: i32[] = []
+
+function noteExitFirst(ix: i32) {
+  if inferQuiet { return 0 }
+  lpColSet(exitFirstAt, ix, 1)
+  0
+}
+
+// The arm blocks of value `if`s and `match`es. A construct standing at one's tail is read
+// through its first arm by the enclosing construct's classifiers, which a first arm with no
+// value misleads, so an exit there keeps the `void` join and its check reject (D3222).
+let valueArmBlk: i32[] = []
+
+function noteValueArm(blk: i32) {
+  valueArmBlk.push(blk)
+  0
+}
+
+// Asked only at an exiting first arm, so a scan of the arms noted so far is cheap where it runs.
+function atValueArmTail(): boolean {
+  chkStmtBlk >= 0 && i32ListHas(valueArmBlk, chkStmtBlk)
+}
+
+// The one spelling of an exiting first arm the emitter cannot lower yet: a nullable-list value of
+// a construct that is itself another's arm value, whose rep is read through this first arm (D3222).
+function refuseNestedExitFirst(ix: i32, ty: i32) {
+  if ty < 0 || !tyBearsNull(ty) { return 0 }
+  const nn = nonNullTy(ty)
+  if nn < 0 || !(T.tys[nn] is TyArray) { return 0 }
+  tErr(
+    "an `if` or `match` whose first arm always exits cannot yet hold a nullable list as the value of another's arm; bind it to a name first, or put the exiting arm last",
+    ix,
+  )
+  0
+}
+
+// The `match`es whose exiting first arm stands at another construct's value arm tail, whose
+// joined type `refuseNestedExitFirst` asks once it is known.
+let nestedExitFirstAt: i32[] = []
+
+// How many bindings `exitFirstLets` holds, and the `i`th.
+export function exitFirstLetCount(): i32 { exitFirstLets.length }
+export function exitFirstLetAt(i: i32): i32 {
+  if i < 0 || i >= exitFirstLets.length { return -1 }
+  exitFirstLets[i]
 }
 
 // How many arm blocks `noteExitArm` recorded, and the `i`th.

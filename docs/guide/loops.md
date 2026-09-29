@@ -88,6 +88,6 @@ statements; `{ B: { x: 1 } }` is still an object literal holding one.
 
 ### Known limit
 
-A non-null record value of a loop or block at module scope, bound un-annotated, is refused at
-emit (D3224). Annotate the binding (`const c: Circle = while true { … }`) or move it into a
-function.
+A non-null record value of a loop or block passed straight to an un-annotated parameter at module
+scope is refused at emit (D3224); bind it first, or move the code into a function. A loop or
+block value of a function type is refused at emit too (D3256).
