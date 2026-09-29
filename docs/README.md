@@ -11,6 +11,7 @@ The language and CLI as a user mental model.
 - [`guide/soundness.md`](guide/soundness.md) — the type-safety guarantees.
 - [`guide/operators.md`](guide/operators.md) — what every operator means and on what operand types (`%` is the truncated remainder; the `as` / `as?` / `as!` / `as%` family).
 - [`guide/narrowing.md`](guide/narrowing.md) — flow narrowing (`is` / `?.` / null).
+- [`guide/loops.md`](guide/loops.md) — loops and labelled blocks, `break :B` / `continue :B`, and the E0695 rule.
 - [`guide/doc-comments.md`](guide/doc-comments.md) — `///` vs `//`, what a doc block attaches to, and what the editor shows on hover.
 - [`guide/objects.md`](guide/objects.md) — object literals and braces: when `{` is an object and when a block, what `{}` completes, and why a `{}` statement is refused.
 - [`guide/unions.md`](guide/unions.md) — union types and variant discrimination.

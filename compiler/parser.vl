@@ -1482,6 +1482,22 @@ function parseOneArg(args: i32[], names: string[]) {
   } else {
     names.push("")
   }
+  // `f(B: { stmts })`: a named argument's value cannot be a block, so this is a labelled block
+  // written as an argument. Refused by name, and parsed as that block to recover.
+  if named && peekKind() == "LBRACE" && labelBraceOpensStmt(P.pos) {
+    const bl = names.pop() ?? ""
+    names.push("")
+    P.diags.push(
+      {
+        msg: "a labelled block is a statement, not an argument: `"
+          + bl
+          + ": { … }` carries no value (block values are not supported yet)",
+        at: P.pos,
+      },
+    )
+    args.push(parseLabelBlock(bl, peekTok().start))
+    return 0
+  }
   if named && peekKind() == "ELLIPSIS" {
     P.diags.push(
       {
@@ -2710,6 +2726,25 @@ function parseFuncBodyAndBuild(
   nameTok: i32,
   funcPos: i32,
 ) {
+  // A label names a loop or block of the function it is written in, never an enclosing one.
+  const lblSaved = lblNames
+  const lblBlkSaved = lblIsBlk
+  lblNames = []
+  lblIsBlk = []
+  const fix = parseFuncBodyInner(name, typarams, params, ret, nameTok, funcPos)
+  lblNames = lblSaved
+  lblIsBlk = lblBlkSaved
+  fix
+}
+
+function parseFuncBodyInner(
+  name: string,
+  typarams: string[],
+  params: i32[],
+  ret: i32,
+  nameTok: i32,
+  funcPos: i32,
+) {
   // A bare-expression body (`function dbl(x: i32) x * 2`) is a single expression with an
   // implicit return, wrapped in a synthetic one-statement `Block`; empty braces stay a block.
   // D1045 — the body's live type parameters are pushed here rather than in `parseFuncHead`,
@@ -3634,10 +3669,78 @@ function parseWhile(label: string) {
   const p0 = peekTok().start // the `while` keyword
   advance()                  // "while"
   const cond = parseExpr()
+  lblPush(label, 0)
   const body = parseBracedBody(
     "a `while` body requires braces: `while cond { … }`",
   )
-  mkWhile(cond, body, label, p0)
+  lblPop()
+  mkWhile(cond, body, label, p0, 0)
+}
+
+// `label: { … }` — a labelled block, the cursor on its `{`. It is a `while` over a literal
+// `true` marked `whileBlk`, run once: `break :label` leaves it and `continue` passes through.
+function parseLabelBlock(label: string, p0: i32) {
+  lblPush(label, 1)
+  const body = parseBlock()
+  lblPop()
+  mkWhile(mkBool(1, p0), body, label, p0, 1)
+}
+
+// The labels of the loops and labelled blocks around the cursor, innermost last, and whether
+// each is a block. Read by `break` and `continue` to diagnose the pre-colon label spelling.
+let lblNames: string[] = []
+let lblIsBlk: boolean[] = []
+
+function lblPush(label: string, blk: i32) {
+  lblNames.push(label)
+  lblIsBlk.push(blk == 1)
+  0
+}
+
+function lblPop() {
+  if lblNames.length > 0 {
+    lblNames.pop()
+    lblIsBlk.pop()
+  }
+  0
+}
+
+// The innermost labelled block between the cursor and the innermost loop, or "" when a loop comes
+// first (or nothing encloses the cursor): what an unlabelled jump would have to cross.
+function lblBareBlock(): string {
+  const i = lblNames.length - 1
+  if i < 0 || !lblIsBlk[i] { return "" }
+  lblNames[i]
+}
+
+// Whether a loop, not only a labelled block, encloses the cursor in this function.
+function lblHasLoop(): boolean {
+  let i = 0
+  while i < lblIsBlk.length {
+    if !lblIsBlk[i] { return true }
+    i = i + 1
+  }
+  false
+}
+
+// The innermost enclosing label spelled `name`: 1 for a labelled block, 0 for a loop, -1 when
+// no enclosing loop or block carries it.
+function lblKindOf(name: string): i32 {
+  let i = lblNames.length - 1
+  while i >= 0 {
+    if lblNames[i] == name {
+      if lblIsBlk[i] { return 1 }
+      return 0
+    }
+    i = i - 1
+  }
+  -1
+}
+
+// Whether the token at `i` ends a statement, so no operand of `break`/`continue` follows.
+function stmtEndAt(i: i32): boolean {
+  const k = kindAt(i)
+  k == "NEWLINE" || k == "SEMI" || k == "RBRACE" || k == "EOF" || k == "COMMA"
 }
 
 // `for v in <from> (to | until) <to> [step <s>] { body }` (a numeric range) or
@@ -3667,6 +3770,7 @@ function parseFor(label: string) {
     P.diags.push({ msg: "expected `in` in for-loop", at: P.pos })
   }
   const first = parseExpr() // the range start, or the iterable
+  lblPush(label, 0)
   if (
     peekKind() == "IDENT"
     && (peekTok().text == "to" || peekTok().text == "until")
@@ -3682,6 +3786,7 @@ function parseFor(label: string) {
     const rbody = parseBracedBody(
       "a `for` body requires braces: `for v in … { … }`",
     )
+    lblPop()
     // A RANGE counts one value, so there is no companion for a second name to bind.
     // Anchored at that name, which is the token to delete.
     if v2 != "" {
@@ -3706,32 +3811,146 @@ function parseFor(label: string) {
   const ibody = parseBracedBody(
     "a `for` body requires braces: `for v in … { … }`",
   )
+  lblPop()
   const fiix = mkForIn(v, v2, first, ibody, label, p0)
   mkDeclNameTok(fiix, vTok)
   kwTrimTo(kwSaved)
   fiix
 }
 
-// `"break" [label]` — a loop-control statement with an optional loop label after
-// the keyword (an IDENT on the same line — a NEWLINE token stops the lookahead,
-// exactly as the host's `at("ID")` does). Mirrors the `case "BREAK"` arm in
-// `parser.ts`.
+// `"break" [":" label]` — leaves the labelled loop or block, else the innermost loop. A value
+// after it (`break v`, `break :B v`) is refused as not yet supported, and an enclosing label
+// written without the colon is the old spelling, refused with its fix.
 function parseBreak() {
   const p0 = peekTok().start // the `break` keyword
   const kw = advance()       // "break"
-  let label = ""
-  if peekKind() == "IDENT" { label = advance().text }
+  // A function body starts the stack afresh, so a `break` in a lambda inside a loop is here too.
+  if lblNames.length == 0 {
+    P.diags.push(
+      {
+        msg: "`break` is not inside a loop or labelled block of this function",
+        at: P.pos - 1,
+      },
+    )
+  }
+  const kwAt = P.pos - 1
+  const label = parseJumpLabel("break")
+  // A labelled block is left only by its name (E0695): a bare `break` never targets one, and
+  // one whose way to its loop crosses a block is refused with both spellings that mean it.
+  if label == "" {
+    const blk = lblBareBlock()
+    if blk != "" {
+      P.diags.push(
+        {
+          msg: "inside labelled block `"
+            + blk
+            + "`: write `break :"
+            + blk
+            + "` to leave the block, or label the loop and write `break :L`",
+          at: kwAt,
+        },
+      )
+    }
+  }
+  // The value is parsed so the statement recovers as written, and dropped with the refusal.
+  if !stmtEndAt(P.pos) {
+    const valAt = P.pos
+    parseExpr()
+    P.diags.push(
+      {
+        msg: "break values are not supported yet: a loop or labelled block does not carry a value",
+        at: valAt,
+      },
+    )
+  }
   mkBreak(kw.text, label, p0)
 }
 
-// `"continue" [label]` — see `parseBreak`. Mirrors the `case "CONTINUE"` arm in
-// `parser.ts`.
+// `"continue" [":" label]` — continues the labelled loop, else the innermost one. A labelled
+// block has nothing to continue, and a bare name after the keyword is the old label spelling.
 function parseContinue() {
   const p0 = peekTok().start // the `continue` keyword
   const kw = advance()       // "continue"
-  let label = ""
-  if peekKind() == "IDENT" { label = advance().text }
+  if !lblHasLoop() {
+    P.diags.push(
+      { msg: "`continue` is not inside a loop of this function", at: P.pos - 1 },
+    )
+  }
+  const lblAt = P.pos + 1
+  const kwAt = P.pos - 1
+  const label = parseJumpLabel("continue")
+  if label == "" && lblHasLoop() {
+    const blk = lblBareBlock()
+    if blk != "" {
+      P.diags.push(
+        {
+          msg: "inside labelled block `"
+            + blk
+            + "`: label the loop and write `continue :L` to continue it",
+          at: kwAt,
+        },
+      )
+    }
+  }
+  if label != "" && lblKindOf(label) == 1 {
+    P.diags.push(
+      {
+        msg: "`continue :"
+          + label
+          + "` names a labelled block, and only a loop can continue; use `break :"
+          + label
+          + "` to leave the block",
+        at: lblAt,
+      },
+    )
+  }
+  if !stmtEndAt(P.pos) && peekKind() == "IDENT" {
+    const nm = peekTok().text
+    P.diags.push(
+      {
+        msg: "labels are written `continue :" + nm + "`; `continue` takes no value",
+        at: P.pos,
+      },
+    )
+    advance()
+    return mkContinue(kw.text, nm, p0)
+  }
   mkContinue(kw.text, label, p0)
+}
+
+// The `:label` after `break`/`continue` (`kw`), or "" when none. A name after the keyword
+// that is an enclosing label and ends the statement is the pre-colon spelling: refused with
+// the fix and taken as the label, so the rest of the statement parses as written.
+function parseJumpLabel(kw: string): string {
+  if peekKind() == "COLON" {
+    advance() // ":"
+    if peekKind() == "IDENT" {
+      const lt = P.pos
+      const name = advance().text
+      if lblKindOf(name) < 0 {
+        P.diags.push(
+          {
+            msg: "`" + kw + " :" + name + "` names no enclosing loop or labelled block",
+            at: lt,
+          },
+        )
+      }
+      return name
+    }
+    P.diags.push(
+      { msg: "`" + kw + " :` needs a label name: `" + kw + " :B`", at: P.pos },
+    )
+    return ""
+  }
+  if kw == "break" && peekKind() == "IDENT" && stmtEndAt(P.pos + 1) {
+    const nm = peekTok().text
+    if lblKindOf(nm) >= 0 {
+      P.diags.push({ msg: "labels are written `break :" + nm + "`", at: P.pos })
+      advance()
+      return nm
+    }
+  }
+  ""
 }
 
 // `"return" expr?`
@@ -3791,6 +4010,27 @@ export function isStmtKeyword(kind: TokKind) {
     || kind == "FUNCTION"
 }
 
+// Whether the `{` at `bracePos`, after `name:`, plainly opens statements: a statement keyword,
+// or a name followed by anything but `:`, `,`, `}` or a method-shorthand `(`. A shorthand
+// `{ b }` or `{ b, c }` stays an object value, as it always read there.
+function labelBraceOpensStmt(bracePos: i32): boolean {
+  let i = bracePos + 1
+  while kindAt(i) == "NEWLINE" { i = i + 1 }
+  const first = kindAt(i)
+  if isStmtKeyword(first) { return true }
+  let j = i + 1
+  while kindAt(j) == "NEWLINE" { j = j + 1 }
+  const nk = kindAt(j)
+  first == "IDENT"
+    && !endsObjectKey(nk)
+    && (nk != "LPAREN" || !looksLikeObject(bracePos))
+}
+
+// Whether a token after a name ends it as an object key: `k: v`, shorthand `k,` or `k }`.
+function endsObjectKey(kind: TokKind) {
+  kind == "COLON" || kind == "COMMA" || kind == "RBRACE"
+}
+
 // The keywords a statement label may precede (`name: while …`, `name: for …`).
 function isLoopKeyword(kind: TokKind) { kind == "WHILE" || kind == "FOR" }
 
@@ -3823,6 +4063,11 @@ function looksLikeObject(bracePos: i32) {
     // exact shape `parseStmt` dispatches as one; no expression starts with a loop keyword.
     if j == i + 1 && nk == "COLON" && isLoopKeyword(kindAt(j + 1)) {
       return false
+    }
+    // `{ name: { … } }` opens with a labelled block only when the inner brace plainly holds
+    // statements; an inner object, shorthand included, keeps the outer one an object.
+    if j == i + 1 && nk == "COLON" && kindAt(j + 1) == "LBRACE" {
+      if labelBraceOpensStmt(j + 1) { return false }
     }
     // An object literal is identified by a key-value pair. A bare `{ name }` or `{ a, b }`
     // shorthand is not treated as one in the ambiguous body positions this gates: it is a
@@ -4049,6 +4294,12 @@ export function parseStmt() {
       advance() // COLON
       return parseFor(label)
     }
+    if lk == "LBRACE" {
+      const lp0 = peekTok().start
+      const label = advance().text
+      advance() // COLON
+      return parseLabelBlock(label, lp0)
+    }
   }
   valueIfDrop(parseExpr())
 }
@@ -4203,6 +4454,9 @@ export function parseProgram() {
   // (malformed) parse would otherwise leave it raised and make every later
   // statement break newline-terminate at a leading operator.
   brDepth = 0
+  // The label stack is per program too.
+  lblNames = []
+  lblIsBlk = []
   // D1045: the block-scope machinery is per program. A mint counter only has to
   // be unique within its module — the merge renames each module's top-level
   // declarations, these included, apart — and a leaked scope row from an earlier

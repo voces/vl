@@ -3305,7 +3305,7 @@ Deno.test({
       "  } else {",
       "    B: while true {",
       "      n = 2",
-      "      break B",
+      "      break :B",
       "    }",
       "  }",
       "  n",
