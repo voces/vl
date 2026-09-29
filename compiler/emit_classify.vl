@@ -29887,8 +29887,16 @@ export function iterElemPinTy(iterIx: i32, fnIx: i32): i32 {
         if li >= 0 {
           const d = P.nodes[li]
           if d is LetDecl {
-            if d.letType >= 0 { et = tyStepElem(nodeTyIxOf(d.letType)) }
-            else if d.letInit >= 0 { et = tyStepElem(nodeTyIxOf(d.letInit)) }
+            if d.letType >= 0 {
+              et = tyStepElem(nodeTyIxOf(d.letType))
+            } else if d.letInit >= 0 {
+              et = tyStepElem(nodeTyIxOf(d.letInit))
+              // An initializer typed at a hole holds what it holds at the pin (D3125).
+              if et >= 0 && tyHasTyVar(et) && d.letInit != iterIx {
+                const it = iterElemPinTy(d.letInit, fnIx)
+                if it >= 0 { return it }
+              }
+            }
           }
         }
       }
@@ -29941,6 +29949,9 @@ function mapCbResultPinTy(cbIx: i32, recvIx: i32, fnIx: i32): i32 {
   if !(cb is FuncDecl) { return -1 }
   // A declared return is the result's element, which may be wider than what the body returns.
   if cb.fnRet >= 0 { return mapCbDeclRetPinTy(nodeTyIxOf(cb.fnRet), fnIx) }
+  // With two or more values handed back the checked join is the element, not the first (D3125).
+  const jt = mapCbJoinPinTy(cx, fnIx)
+  if jt >= 0 { return jt }
   const rx = unwrapParen(fnRetExprOf(cx))
   if rx < 0 { return -1 }
   const rn = identNameOrEmpty(rx)
@@ -29950,6 +29961,27 @@ function mapCbResultPinTy(cbIx: i32, recvIx: i32, fnIx: i32): i32 {
     if pi > 0 { return -1 }
   }
   valueReadPinTy(rx, fnIx, 0)
+}
+
+// The checked join of inline callback `cx`'s returned values at the pin of the instance `fnIx`,
+// by its exact bindings or its hole's; -1 for a callback handing back one value, or unresolved.
+function mapCbJoinPinTy(cx: i32, fnIx: i32): i32 {
+  const cb = P.nodes[cx]
+  if !(cb is FuncDecl) { return -1 }
+  const vals: i32[] = []
+  collectRetValues(cb.fnBody, vals)
+  if vals.length < 2 { return -1 }
+  const ft = nodeTyIxOf(cx)
+  if ft < 0 || ft >= T.tys.length { return -1 }
+  const f = T.tys[ft]
+  if !(f is TyFunc) { return -1 }
+  const et = mapCbDeclRetPinTy(f.fnRet, fnIx)
+  if et >= 0 || fnIx < 0 { return et }
+  const row = monoHoleSubRow.get(fnStmtsPosOf(fnIx)) ?? -1
+  if row < 0 || row >= monoHoleSubN.length { return -1 }
+  const st = substTyDeep(f.fnRet, monoHoleSubN[row], monoHoleSubT[row])
+  if st < 0 || tyHasTyVar(st) { return -1 }
+  st
 }
 
 // A callback's declared return `at` at the pin of the instance `fnIx`: itself when it names no
