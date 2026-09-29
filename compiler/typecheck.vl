@@ -893,6 +893,11 @@ let memCstrProp: string[] = []
 let memCstrIx: i32[] = []
 let memCstrFn: i32[] = []
 let memCstrDem: boolean[] = []
+// The `memCstrProp` a call through a hole records: not a field name, so no member row shares it.
+const OP_CALL_PIN = "()"
+// A call under a null test of its callee: a pin of the `null` type leaves the branch dead, so
+// the call is not refused there, though the direct spelling refuses it (D3197).
+const OP_CALL_GUARDED_PIN = "?()"
 
 // D1702 — the `HD_COAL` result holes a body minted, so the pin can substitute them. Nothing
 // else asks: a `??` result is not a constraint, so no validator reaches it and `substHoleTy`
@@ -7164,6 +7169,8 @@ function keyStoresNarrowedTy(key: string): boolean {
   const nar = npTys[slot]
   const st = keyStoreTy(key)
   if nar < 0 || st < 0 { return false }
+  // Two holes both render `_`, which says nothing about whether they are one type (D3197).
+  if tyIsHole(st) || tyIsHole(nar) { return false }
   st == nar || tyToStr(st) == tyToStr(nar)
 }
 
@@ -7677,9 +7684,22 @@ function writeRetiresNarrowing(
   npTy: i32,
 ) {
   if tgtKey == "" { return false }
+  // A hole admits every write, so its narrowing is retired and re-derived from the value (D3197).
+  if key == tgtKey && tyIsHole(npTy) { return true }
   if key == tgtKey { return !assignable(rt, npTy) }
   if keyHasPrefix(key, tgtKey + ".") { return true }
   keyHasPrefix(key, tgtKey + "[")
+}
+
+// Whether the write target at `tgtIx` is a field of a receiver typed as an inference hole.
+function writesHoleField(tgtIx: i32): boolean {
+  const tn = P.nodes[tgtIx]
+  if tn is Member {
+    const on = P.nodes[tn.memObj]
+    if on is Ident { return tyIsHole(lookup(on.identName)) }
+    return tyIsHole(nodeTyOf(tn.memObj))
+  }
+  false
 }
 
 // Assignments that ended a path narrowing through another place that may name the same object.
@@ -7819,6 +7839,8 @@ function aliasWriteHitsKey(
     ) {
       if s < steps.length - 1 { return true }
       if rt < 0 || npTy < 0 || !assignable(rt, npTy) { return true }
+      // A hole admits every write, which proves nothing about the pin's value (D3197).
+      if tyIsHole(npTy) { return true }
       // A numeric value the narrowing only widens to is stored as its own member (D2609).
       if numericVariantUncovered(rt, npTy) { return true }
     }
@@ -8072,6 +8094,15 @@ function retireNarrowingsForWrite(tgtIx: i32, rt0: i32, atIx: i32) {
         pathReAsg = true
         recordAsgNarTyIx(atIx, nn)
       }
+    }
+  }
+  // A hole's field reads its non-null face after a write of a value non-null at the template, as
+  // after a null test, whatever narrowing the write retired (D3197).
+  if pathReTy < 0 && rt >= 0 && writesHoleField(tgtIx) && !tyHasHole(rt) {
+    const hst = placeStoreTy(tgtIx)
+    if hst >= 0 && tyIsHole(hst) && !tyAdmitsNull(rt) && !isNullTy(rt) {
+      const hn = nonNullNarrowTy(hst)
+      if hn >= 0 && hn != hst { pathReTy = hn }
     }
   }
   if pathReTy >= 0 {
@@ -8396,6 +8427,9 @@ function pathCallSettledSlot(key: string): i32 {
 // type. A read a call's retirement let through is remembered for the misuse note.
 function pathReadsDeclared(key: string, by: i32, ix: i32): boolean {
   if pathRetiredByAssign(by) { return true }
+  // A hole's field reads its own hole after the narrowing ends, which the pin then re-asks (D3197).
+  const hs = narrowedPathIx(key)
+  if hs >= 0 && tyIsHole(npTys[hs]) { return true }
   const slot = pathCallSettledSlot(key)
   if slot < 0 { return false }
   let r = crRetNames.length - 1
@@ -11750,11 +11784,32 @@ function placeFieldTy(baseTy: i32, prop: string, optional: boolean) {
   if core < 0 { return -1 }
   const ct = T.tys[core]
   let ft = -1
-  if ct is TyObj { ft = objFieldType(ct, prop) }
-  else if ct is TyUnion { ft = sharedUnionFieldTy(ct, prop) }
+  if ct is TyObj {
+    ft = objFieldType(ct, prop)
+  } else if ct is TyUnion {
+    ft = sharedUnionFieldTy(ct, prop)
+  } else if ct is TyVar {
+    if !wasNullable { ft = holePlaceFieldTy(core, ct, prop) }
+  }
   if ft < 0 { return -1 }
   if wasNullable { return mkNullableTy(ft) }
   ft
+}
+
+// The field a member read off a hole already derived, as `checkMemberNode` types it, so a null
+// test on `z.f` narrows the hole's field the way it narrows a declared record's (D3197). -1 when
+// the read has not been typed, or the hole reads its members from a bound.
+function holePlaceFieldTy(hole: i32, ht: TyVar, prop: string): i32 {
+  if ht.tvName.length == 0 { return -1 }
+  if ht.tvName[0] == '?' {
+    const shape = holeShapeOf(ht.tvName)
+    if shape < 0 { return -1 }
+    const st = T.tys[shape]
+    if st is TyObj { return objFieldType(st, prop) }
+    return -1
+  }
+  if tpBoundOfName(ht.tvName) >= 0 { return -1 }
+  mkDerivedHole(HD_FLD, prop, -1, -1, hole)
 }
 
 // Shared-field access over a struct union: a field present on every member is readable on the
@@ -33685,7 +33740,23 @@ function indexFloorMsg(arrTy: i32) {
 // operation: `OP_INDEX_GET` is the index form, anything else is that member name.
 export function memCstrMsg(recv: i32, prop: string) {
   if prop == OP_INDEX_GET { return indexFloorMsg(recv) }
+  if prop == OP_CALL_PIN { return callFloorMsg(recv) }
+  if prop == OP_CALL_GUARDED_PIN {
+    if isNullTy(recv) { return "" }
+    return callFloorMsg(recv)
+  }
   memberFloorMsg(recv, prop)
+}
+
+// A call's own sentence at a pin: "" when the callee resolves to a function or defers, otherwise
+// the direct spelling's `called value is not a function`, so a `| null` field is not called (D3197).
+function callFloorMsg(fnTy: i32) {
+  if fnTy < 0 { return "" }
+  const t = T.tys[fnTy]
+  if t is TyFunc { return "" }
+  if t is TyErr { return "" }
+  if tyHasHole(fnTy) { return "" }
+  "called value is not a function (" + tyToStr(fnTy) + ")"
 }
 
 // Records a deferred receiver-classification constraint when the receiver still carries a
@@ -40546,6 +40617,11 @@ function checkCallNode(n: Call, ix: i32) {
         noteArgCstr(hat, hexp, hWho, hj + 1, hargs[hj])
       }
       hj = hj + 1
+    }
+    if tyIsNonNullHoleRead(fnTy) {
+      noteMemCstr(fnTy, OP_CALL_GUARDED_PIN, ix, false)
+    } else {
+      noteMemCstr(fnTy, OP_CALL_PIN, ix, false)
     }
     return mkDerivedHole(HD_RET, "", -1, -1, fnTy)
   }
