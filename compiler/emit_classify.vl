@@ -817,6 +817,11 @@ function cloParamTok(paramIx: i32) {
   // only when the param shapes match. `paramStructIdxFinal` reads the row after the merge
   // in both phases; the phase-gated `paramStructIdxOf` would key the narrow row (D925).
   if k == "variant" { return repSigVariantTok(paramStructIdxFinal(paramIx)) }
+  if k == "nulvariant" {
+    const nvi = paramStructIdxFinal(paramIx)
+    if nvi < 0 { return "" }
+    return repSigNulVariantTok(nvi)
+  }
   if k == "struct" || k == "reflist" || k == "nulstruct" {
     return repSigSlotTokOfKind(k, paramStructIdxFinal(paramIx))
   }
@@ -1483,6 +1488,11 @@ function cloRetKeySuffix(fe: i32) {
   // index, a concrete variant by its variant index, so two callbacks share a sig only when
   // they return the same shape.
   if k == "variant" { return ">" + repSigVariantTok(cloRetValSlot(fe)) }
+  if k == "nulvariant" {
+    const nrs = cloRetValSlot(fe)
+    if nrs < 0 { return "" }
+    return ">" + repSigNulVariantTok(nrs)
+  }
   if k == "struct" || k == "nulstruct" {
     return ">" + repSigSlotTokOfKind(k, cloRetValSlot(fe))
   }
@@ -8378,7 +8388,9 @@ function callWidensAtomToStr(callIx: i32, fnIx: i32) {
       if vAtom {
         let vp = 0
         while vp < c.callArgs.length {
-          if sigParamKindAt(vkey, vp) == "str" { return true }
+          // A box parameter may hold the atom as its string arm; the key names no union, so
+          // the frame is reserved for any box parameter.
+          if sigParamTakesAtomStr(vkey, vp) { return true }
           vp = vp + 1
         }
       }
@@ -12757,6 +12769,21 @@ export function narrowedStructArmVi(exprIx: i32): i32 {
   -1
 }
 
+// True when the value at `exprIx` is narrowed to `X | null` with `X` a struct or a union arm:
+// still the box, whose null tag carries a null payload, so its unbox is a nullable cast
+// rather than `narrowedStructArmVi`'s non-null one (D3097).
+export function narrowedNulStructArm(exprIx: i32): boolean {
+  if exprIx < 0 { return false }
+  if narrowTop == 0 { return false }
+  const e = P.nodes[unwrapParen(exprIx)]
+  let key = ""
+  if e is Ident { key = e.identName } else { key = placeNarrowKeyOf(exprIx) }
+  if key == "" { return false }
+  const base = nullablePartOf(narrowVariantFor(key))
+  if base == "" { return false }
+  variantIndexOf(base) >= 0 || structIndexOfTypeName(base) >= 0
+}
+
 // The variant row a code-15 struct-field read `p.err` targets, or -1 when the field isn't
 // a nested-shape field or its target is a plain struct. A code-15 field stores a ref
 // whether or not it's nullable, and `T` may be a union arm rather than a standalone
@@ -16157,6 +16184,13 @@ export function sigParamCoerceKind(key: string, idx: i32): VKind | null {
   null
 }
 
+// Whether parameter `idx` of `$fnsig` key `key` widens a literal-union atom argument to its
+// string: a `string` parameter, or a box that may hold it as its string arm.
+function sigParamTakesAtomStr(key: string, idx: i32): boolean {
+  const k = sigParamKindAt(key, idx)
+  k == "str" || k == "union"
+}
+
 // The `VKind` of parameter `idx` in a `$fnsig` key's param-token spine — the whole answer
 // `sigParamCoerceKind` filters to its three wide-scalar rows. `null` for an out-of-range
 // index or a character outside the token vocabulary. The interlock: this token IS the
@@ -18241,7 +18275,12 @@ export function forInElemKind(iterIx: i32, fnIx: i32): VKind | null {
     if rlElemKindTbl[rslot] == RLK_STRUCT {
       // A nullable-struct element ref list (`(P | null)[]`): the loop var binds as a
       // kind-9 niche, its read staying nullable (no `ref.as_non_null`); plain `S[]` is kind 1.
-      if rlElemIsNulNiche(rslot) { return "nulstruct" }
+      // A nullable union arm (`(Circle | null)[]`) has no struct row, so it binds the
+      // `nulvariant` niche over the arm's heap, as `const e = xs[i]` does (D3096).
+      if rlElemIsNulNiche(rslot) {
+        if rlElemVariantRow(rslot) >= 0 { return "nulvariant" }
+        return "nulstruct"
+      }
       // An arm-element ref list (`Circle[]` where `Circle` is a declared union member): the
       // loop var binds as the kind-8 variant local over `uVarHeap[vi]`, since
       // `structIdxOfElemName`'s nominal floor declines an arm (D50).
@@ -18536,7 +18575,9 @@ export function forInVarStructIdx(iterIx: i32, fnIx: i32): i32 {
   if ek == "struct" || ek == "nulstruct" {
     return forInRefArrayStructIdx(iterIx, fnIx)
   }
-  if ek == "variant" { return forInRefArrayVariantIdx(iterIx, fnIx) }
+  if ek == "variant" || ek == "nulvariant" {
+    return forInRefArrayVariantIdx(iterIx, fnIx)
+  }
   if ek == "reflist" || ek == "nulreflist" {
     // A nested ref array (`S[][]`): the loop var is the inner ref list, off the outer
     // list's element slot.
@@ -28035,6 +28076,12 @@ export function repVariantSlotRep(vi: i32): i32 {
 // `s…;`, since folding trades a `trap_loads` gain for a `runs` loss at the token character.
 export function repSigVariantTok(vi: i32): string {
   repSigSlotTokOfKind("variant", repVariantSlotRep(vi))
+}
+
+// The nullable twin: a `Circle | null` param or result, keyed by the same folded slot, so
+// the two tokens select one heap and differ only in the slot's nullability.
+export function repSigNulVariantTok(vi: i32): string {
+  repSigSlotTokOfKind("nulvariant", repVariantSlotRep(vi))
 }
 
 // Populates `uVarTwin` (parallel to `uVariants`): `uVarTwin[i]` is the smallest earlier
@@ -37544,6 +37591,13 @@ export function refListElemNameOfExpr(exprIx: i32, fnIx: i32) {
       const gs18 = letAnnRefListSlot(g18)
       if gs18 >= 0 && gs18 < rlElemName.length { return rlElemName[gs18] }
     }
+    // A ref-list global reads the row its cell is declared at, which a destination may name
+    // instead of the literal's own element, as a local reads its slot's (D3093).
+    const grl = globalLetOfIn(fnIx, e.identName)
+    if grl >= 0 && globalCellKind(grl) == "reflist" {
+      const grs = letRefListSlot(grl, -1)
+      if grs >= 0 && grs < rlElemName.length { return rlElemName[grs] }
+    }
     return globalRefArrayName(fnIx, e.identName)
   }
   if e is Member {
@@ -43344,7 +43398,7 @@ function annParamKind(t: string) {
   // unrelated arity functype (D2552). A nullable closure param stays outside the ABI there.
   const uslot: i32[] = [-1]
   const uk = annUnionSigKind(t, uslot)
-  if uk == "nulstruct" { return repSigSlotTokOfKind("nulstruct", uslot[0]) }
+  if repSigTokHasSlot(uk) { return repSigSlotTokOfKind(uk, uslot[0]) }
   if uk != null && uk != "nulclosure" { return repSigTokOfKind(uk) }
   ""
 }
@@ -43400,16 +43454,15 @@ function annRetKind(t: string) {
   // member set first, so a closure returning the alias still keys the box.
   const uslot: i32[] = [-1]
   const uk = annUnionSigKind(t, uslot)
-  if uk == "nulstruct" {
-    return ">" + repSigSlotTokOfKind("nulstruct", uslot[0])
-  }
+  if repSigTokHasSlot(uk) { return ">" + repSigSlotTokOfKind(uk, uslot[0]) }
   if uk != null { return ">" + repSigTokOfKind(uk) }
   ""
 }
 
 // The value-ABI kind a union or `X | null` spelling `t` reps as in a `$fnsig`, shared by the
-// result and parameter producers: `nulstr`, `nullist`, `nulstruct` (its row in `slotOut[0]`),
-// `nulclosure`, or `union` for the box. null for a non-union and for a niche outside the ABI.
+// result and parameter producers: `nulstr`, `nullist`, `nulstruct` or `nulvariant` (its row, or
+// folded variant row, in `slotOut[0]`), `nulclosure`, or `union` for the box. null for a
+// non-union and for a niche outside the ABI.
 function annUnionSigKind(t: string, slotOut: i32[]): VKind | null {
   const parts: string[] = []
   annSplitPipe(unionMemberSetOf(t), parts)
@@ -43433,6 +43486,12 @@ function annUnionSigKind(t: string, slotOut: i32[]): VKind | null {
   if msi >= 0 {
     slotOut[0] = msi
     return "nulstruct"
+  }
+  // A nullable union arm, keyed by its variant row like `cloParamTok`'s niche arm.
+  const mvi = variantIndexOf(nonNull[0])
+  if mvi >= 0 {
+    slotOut[0] = repVariantSlotRep(mvi)
+    return "nulvariant"
   }
   // A nullable closure: the shared fat-pointer made nullable, slot-free, matching `>C`.
   if strContains(nonNull[0], "=>") { return "nulclosure" }
@@ -43514,7 +43573,13 @@ function paramTokOfTy(ty: i32) {
       if vrow >= 0 { return repSigVariantTok(vrow) }
       return ""
     }
-    TyErr | TyFunc | TyUnion | TyNullable | TyMap | TyVar | TyLit | TyNeg => {
+    TyNullable => {
+      // The nullable arm, by the same arena identity: the render softens `Circle` to its field
+      // set, which the name path keys as an inline struct the lambda never declares (D3074).
+      const nvrow = nulArmRowOfTy(t.nInner)
+      if nvrow >= 0 { return repSigNulVariantTok(nvrow) }
+    }
+    TyErr | TyFunc | TyUnion | TyMap | TyVar | TyLit | TyNeg => {
       // No parameter token of its own; the name path answers.
     }
   }
@@ -43567,11 +43632,24 @@ function retTokOfTy(ty: i32) {
       if vrow >= 0 { return ">" + repSigVariantTok(vrow) }
       return ""
     }
-    TyErr | TyFunc | TyUnion | TyNullable | TyMap | TyVar | TyLit | TyNeg => {
+    TyNullable => {
+      // The result twin of `paramTokOfTy`'s nullable-arm arm.
+      const nvrow = nulArmRowOfTy(t.nInner)
+      if nvrow >= 0 { return ">" + repSigNulVariantTok(nvrow) }
+    }
+    TyErr | TyFunc | TyUnion | TyMap | TyVar | TyLit | TyNeg => {
       // No result token of its own; the name path answers.
     }
   }
   ""
+}
+
+// The variant row of the non-null half `inner` of a `T | null`, when `T` is a union arm by
+// arena identity, else -1.
+function nulArmRowOfTy(inner: i32): i32 {
+  if inner < 0 { return -1 }
+  if !(T.tys[inner] is TyObj) { return -1 }
+  variantRowOfTy(inner)
 }
 
 // A function type's result `ty` rendered as `sigKeyOfTy` keys it: a litunion alias, bare or
