@@ -1269,12 +1269,23 @@ function scalarListKindUnlisted(fallback: i32): i32 {
   fallback
 }
 
+// `wrap`, the wrapper of a wide scalar list, where a build collected it (`used`); otherwise a
+// recorded refusal, since a read of a list no build made names a type the module lacks.
+function wideListWrap(used: boolean, wrap: i32): i32 {
+  if !used {
+    emitFail(
+      "emitProgram: a list of this element kind is read where no such list was built",
+    )
+  }
+  wrap
+}
+
 // The wrapper struct heap type for a scalar element kind.
 function scalarListWrap(elemKind: VKind) {
   if elemKind == "u8list" { return bl8TypeIdx }
-  if elemKind == "f64" { return fl64TypeIdx }
-  if elemKind == "i64" { return il64TypeIdx }
-  if elemKind == "f32" { return fl32TypeIdx }
+  if elemKind == "f64" { return wideListWrap(fa64Used, fl64TypeIdx) }
+  if elemKind == "i64" { return wideListWrap(ia64Used, il64TypeIdx) }
+  if elemKind == "f32" { return wideListWrap(fa32Used, fl32TypeIdx) }
   // The string list's wrapper is the map's keys-list type, which any `string[]` shares.
   if elemKind == "str" { return mkListIdx }
   if elemKind == "i32" { return lTypeIdx }
@@ -8039,13 +8050,13 @@ function emitArr(body: u8[], arrIx: i32, fnIx: i32) {
       isI64Lit = false
       isF32Lit = false
     }
-    // A `(K | null)[]` literal (`pendingListKind == 9`, or a probe-detected element type): its
-    // member-literal elements lower as interned i32 atom ids and a `null` as the -1 sentinel, so
-    // the i32-list path is authoritative even when the first element is a string literal, which
-    // `arrLitIsStr` would otherwise claim. The element seeds are set further below.
+    // A `(K | null)[]` literal (kind 9, or a probe-detected element type unless a union-box
+    // destination is threaded, D3174): member elements lower as atom ids and `null` as -1, so the
+    // i32-list path is authoritative over `arrLitIsStr`'s string-literal claim. The element seeds
+    // are set further below.
     if (
       pendingListKind == LBK_NUL_LIT_UNION_LIST
-      || nodeArrayElemIsNulLitUnion(arrIx)
+      || (nodeArrayElemIsNulLitUnion(arrIx) && pendingListKind != LBK_UNION)
     ) {
       isRefLit = false
       isStrLit = false
@@ -8464,7 +8475,8 @@ function emitArr(body: u8[], arrIx: i32, fnIx: i32) {
       || pendingListKind == LBK_NUL_BOOL_LIST
     const savedArrNB = pendingNulBool
     if nbArr { pendingNulBool = true }
-    const nlluArr = nodeArrayElemIsNulLitUnion(arrIx)
+    const nlluArr = (nodeArrayElemIsNulLitUnion(arrIx)
+      && pendingListKind != LBK_UNION)
       || pendingListKind == LBK_NUL_LIT_UNION_LIST
     const savedArrNLLU = pendingNulLitUnion
     if nlluArr {
@@ -21474,8 +21486,16 @@ function emitMapFilter(body: u8[], callIx: i32, fnIx: i32) {
       const cL = mfScratchBase + 3
       // src = <receiver>, evaluated ONCE. (Any nested `.map`/`.filter` in the
       // receiver chain completes — including its result wrapper — before this store,
-      // so the shared frame slots are free to reuse.)
-      if emitExpr(body, callee.memObj, fnIx) < 0 { return -1 }
+      // so the shared frame slots are free to reuse.) The receiver builds at its own type: a
+      // list seed the destination threaded is for the result, not the source (D3149).
+      const mfSvKind = pendingListKind
+      const mfSvSlot = pendingListSlot
+      pendingListKind = LBK_I32_LIST
+      pendingListSlot = 0
+      const mfRc = emitExpr(body, callee.memObj, fnIx)
+      pendingListKind = mfSvKind
+      pendingListSlot = mfSvSlot
+      if mfRc < 0 { return -1 }
       // A NARROWED nullable-list receiver keeps its nullable slot at EVERY element kind;
       // the src scratch slot is declared non-null (`fbRefRun` writes `0x64`), so recover
       // first (checker-guarded, never traps). See `nulRecvNeedsRecover`.
@@ -22706,6 +22726,28 @@ function emitForInList(
   svSyncRecv(iterIx, fnIx)
 }
 
+// Whether function `fnIx` (at `fnStmts` position `fnPos` when inferred) declares a ref-list result.
+function retResultIsRefList(fnIx: i32, fnPos: i32): boolean {
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    if fn.fnRet >= 0 { return vtKindOfType(fn.fnRet) == "reflist" }
+  }
+  fnPos >= 0 && fnPos < fRetKind.length && fRetKind[fnPos] == "reflist"
+}
+
+// Whether `retArg` is a `.map` call whose result list at function `fnIx` is not a ref list.
+function retMapBuildsOtherList(retArg: i32, fnIx: i32): boolean {
+  const rx = unwrapParen(retArg)
+  if rx < 0 { return false }
+  const c = P.nodes[rx]
+  if !(c is Call) { return false }
+  const m = P.nodes[c.callFn]
+  if !(m is Member) { return false }
+  if m.memProp != "map" { return false }
+  const rk = mfResultKindOf(rx, fnIx)
+  rk != null && rk != "ref"
+}
+
 // Lower a return-value expression `retArg` for function `fnIx`: seed the return context
 // from the function's return type, emit through the matching helper, then reset the
 // pending seeds. Does not emit `return` itself — the caller appends `fbReturn` or leaves
@@ -22723,6 +22765,16 @@ function emitReturnValue(body: u8[], retArg: i32, fnIx: i32) {
   let fnPos = -1
   if fn is FuncDecl {
     if fn.fnRet < 0 { fnPos = fnStmtsPosOf(fnIx) }
+  }
+  // A union-list result over a `.map` whose callback this pin gives a niche or scalar result
+  // builds a different list than the result declares; refused rather than mistyped.
+  if retResultIsRefList(fnIx, fnPos) {
+    if retMapBuildsOtherList(retArg, fnIx) {
+      return emitFailAt(
+        "emitProgram: a returned `.map` builds a list the function's result does not name at this instantiation",
+        retArg,
+      )
+    }
   }
   if fn is FuncDecl {
     const rsi = retStructRowIndex(fn.fnRet)
