@@ -844,6 +844,9 @@ let letCstrFn: i32[] = []
 // of type string` and can also say the object-literal-into-a-map and lossy-numeric forms; a
 // write to an already-declared place says only `cannot assign i32 to string`. `letAssignMsg` forks.
 let letCstrName: string[] = []
+// The right-hand nodes of index writes into a `u8` cell, whose refusal names the byte width
+// rather than the `i32` the cell reads as; kept by node so the pin's re-ask finds it too.
+let u8StoreRhs: i32[] = []
 
 // D582 — deferred builtin-method argument constraints, for the one reason `argCstr*` cannot
 // serve this position: that table is adjudicated against a callee it can name, and a builtin
@@ -4719,6 +4722,7 @@ export function initChecker() {
   letCstrIx = []
   letCstrFn = []
   letCstrName = []
+  u8StoreRhs = []
   bmCstrGot = []
   bmCstrWant = []
   bmCstrCtx = []
@@ -17048,9 +17052,7 @@ function refoldJoinUnion(
   res
 }
 
-// Whether the expression is a bare `true`/`false` literal (through parens) —
-// excluded from the A7 boolean→i32 value coercion (a literal in an i32 slot is
-// more likely a mistake; write `1`/`0`).
+// Whether the expression is a bare `true`/`false` literal (through parens).
 export function isBoolLitExpr(ix: i32) {
   if ix < 0 { return false }
   const e = P.nodes[ix]
@@ -18418,7 +18420,7 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
       }
     }
     const u8s = primNameOf(srcTy)
-    return u8s == "i32" || u8s == "u8" || u8s == "boolean"
+    return u8s == "i32" || u8s == "u8"
   }
   // A literal re-encodes exactly at f32, so it flows into any destination whose f32 position it
   // fits: a bare `f32`, a nullable `f32?`, or an f32 member of a union. An arbitrary f64 or i32
@@ -18433,12 +18435,6 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
   // type `i64` and would otherwise meet the lossy `i64 -> f64` refusal. D1890.
   if dstAdmitsF64(dstTy) {
     if isExactF64IntLitExpr(srcExpr) { return true }
-  }
-  // A `boolean` value flows into an i32 slot as 1/0 (A7) — a no-op in codegen, boolean riding in an
-  // i32. One-directional, and a bare `true`/`false` literal is excluded. A float-literal array into
-  // `f32[]` is the `ArrayLit` recursion in the literal-aware block below, not this arm.
-  if primNameOf(dstTy) == "i32" {
-    if primNameOf(srcTy) == "boolean" && !isBoolLitExpr(srcExpr) { return true }
   }
   // A `const` literal, or a join of them, read as `string`: a literal-typed destination takes it at
   // the literal type it is, in a list or object literal exactly as at an argument (D2157).
@@ -32577,6 +32573,7 @@ function argMismatchErr(argN: i32, expected: i32, at: i32, argIx: i32) {
     + ", got "
     + tyToStr(at)
     + charLitForStringNote(argIx, expected)
+    + boolForNumberNote(at, expected)
   if argIx >= 0 && argIx < P.nodes.length {
     const n = P.nodes[argIx]
     if n is FuncDecl {
@@ -32907,6 +32904,100 @@ function noteLetCstr(got: i32, want: i32, ix: i32, name: string) {
   0
 }
 
+// A `boolean`, or a union with a `boolean` member (a joined literal such as `[0, b]`).
+function tyIsOrHasBoolean(ty: i32): boolean {
+  if primNameOf(softenLitTy(ty)) == "boolean" { return true }
+  const t = T.tys[ty]
+  if t is TyUnion {
+    let i = 0
+    while i < t.uMembers.length {
+      if primNameOf(softenLitTy(t.uMembers[i])) == "boolean" { return true }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// The boolean-into-number note for the first field of record `g` that owes one against `w`.
+function boolForNumberFieldNote(g: TyObj, w: TyObj): string {
+  const names = w.objFieldNames
+  let i = 0
+  while i < names.length {
+    const gf = objFieldType(g, names[i])
+    if gf >= 0 {
+      const note = boolForNumberNoteOf(
+        gf,
+        w.objFieldTypes[i],
+        "field `" + names[i] + "`",
+      )
+      if note != "" { return note }
+    }
+    i = i + 1
+  }
+  ""
+}
+
+// Records `rhs` when `lhs` is an index into a list whose element is stored as `u8`.
+function noteU8StoreRhs(lhs: i32, rhs: i32) {
+  if lhs < 0 || rhs < 0 { return 0 }
+  const l = P.nodes[lhs]
+  if !(l is Index) { return 0 }
+  const at = nodeTyIxOf(l.idxArr)
+  if at < 0 { return 0 }
+  const a = T.tys[at]
+  if !(a is TyArray) { return 0 }
+  if primNameOf(a.aElem) != "u8" { return 0 }
+  if !u8StoreRhsHas(rhs) { u8StoreRhs.push(rhs) }
+  0
+}
+function u8StoreRhsHas(ix: i32): boolean {
+  let i = 0
+  while i < u8StoreRhs.length {
+    if u8StoreRhs[i] == ix { return true }
+    i = i + 1
+  }
+  false
+}
+
+// The fix a `boolean` offered where a number is wanted owes: it never converts implicitly, so
+// the note names the explicit `as` that does, at the wanted width, or "" for any other pair.
+// A list of booleans against a list of numbers is asked of its elements.
+function boolForNumberNote(got: i32, want: i32): string {
+  boolForNumberNoteOf(got, want, "it")
+}
+// `boolForNumberNote` for right-hand side `srcIx`, at the byte width when it is stored into a
+// `u8` cell.
+function boolForNumberNoteAt(srcIx: i32, got: i32, want: i32): string {
+  if srcIx >= 0 && u8StoreRhsHas(srcIx) {
+    if primNameOf(softenLitTy(got)) == "boolean" {
+      return " — a `boolean` is not a number; convert it with `b as u8`"
+    }
+  }
+  boolForNumberNoteOf(got, want, "it")
+}
+function boolForNumberNoteOf(got: i32, want: i32, what: string): string {
+  if got < 0 || want < 0 { return "" }
+  const ga = T.tys[got]
+  const wa = T.tys[want]
+  if ga is TyArray {
+    if wa is TyArray {
+      return boolForNumberNoteOf(ga.aElem, wa.aElem, "each element")
+    }
+  }
+  if ga is TyObj {
+    if wa is TyObj { return boolForNumberFieldNote(ga, wa) }
+  }
+  if !tyIsOrHasBoolean(got) { return "" }
+  const wn = primNameStr(primNameOf(want))
+  if wn != "i32" && wn != "u8" && wn != "i64" && wn != "f32" && wn != "f64" {
+    return ""
+  }
+  // A brand is named itself: `b as A1` converts into it, where `b as i32` would be refused.
+  let tn = nomNameOfTy(want)
+  if tn == "" { tn = wn }
+  " — a `boolean` is not a number; convert " + what + " with `b as " + tn + "`"
+}
+
 // The direct spelling's sentence for a value that does not fit its destination, in one home
 // because two sites have to say it and must not drift: `checkLetDeclNode`'s own gate and
 // `validateLetCstrs`' pin. `name` is the fork: a declaration can name the binding, a write
@@ -32990,6 +33081,7 @@ function letAssignMsg(srcIx: i32, got: i32, want: i32, name: string) {
       + " to "
       + tyToStr(want)
       + charLitForStringNote(srcIx, want)
+      + boolForNumberNoteAt(srcIx, got, want)
   }
   // An object literal (`{}` / `{x: 1}`) assigned to a map type is a category error, not a
   // width mismatch — point at the fix (`Map()`) rather than the opaque
@@ -33025,6 +33117,7 @@ function letAssignMsg(srcIx: i32, got: i32, want: i32, name: string) {
     + "' of type "
     + tyToStr(want)
     + charLitForStringNote(srcIx, want)
+    + boolForNumberNote(got, want)
 }
 
 // A builtin method argument's sentence, in one home because the arm and the pin
@@ -33032,10 +33125,20 @@ function letAssignMsg(srcIx: i32, got: i32, want: i32, name: string) {
 // needs that is neither side of the comparison (the receiver array; the other bound of a string `slice`).
 function bmArgMsg(form: i32, label: string, got: i32, want: i32, ctx: i32) {
   if form == BM_PUSH {
-    return label + ": cannot add " + tyToStr(got) + " to " + tyToStr(ctx)
+    return label
+      + ": cannot add "
+      + tyToStr(got)
+      + " to "
+      + tyToStr(ctx)
+      + boolForNumberNote(got, want)
   }
   if form == BM_SETVAL || form == BM_SETKEY || form == BM_ADDKEY {
-    return label + ": expected " + tyToStr(want) + ", got " + tyToStr(got)
+    return label
+      + ": expected "
+      + tyToStr(want)
+      + ", got "
+      + tyToStr(got)
+      + boolForNumberNote(got, want)
   }
   if form == BM_KEYMUST {
     return label + ": key must be " + tyToStr(want) + ", got " + tyToStr(got)
@@ -33068,7 +33171,7 @@ function bmArgMsg(form: i32, label: string, got: i32, want: i32, ctx: i32) {
 // The predicate that arm asks, in one home with a sharper consequence: the pin has to ask
 // exactly what the body asked or it disagrees with the direct spelling in one of two ways.
 // Asking the plain predicate where the arm asks the expression invents a false reject — the
-// boolean-into-i32 coercion and float-literal-into-f32 rule live at the expression seam (D551).
+// float-literal-into-f32 rule lives at the expression seam (D551).
 function bmArgPred(form: i32, got: i32, want: i32, argIx: i32) {
   if form == BM_PUSH || form == BM_SETVAL || form == BM_KEYMUST {
     return assignableExpr(argIx, got, want)
@@ -34109,8 +34212,8 @@ function scalarPrimPair(a: i32, b: i32): boolean {
 
 // Whether a scalar argument `rat` handed to a hole callee whose pinned parameter is scalar
 // `rexp` is one no spelling of the direct call admits: two unbranded primitives that differ,
-// where neither a widening, the `boolean`-into-`i32` coercion, nor a literal's adoption of
-// the parameter's width (an integer into `f32`/`f64`/`i64`, a float into `f32`) could fit it.
+// where neither a widening nor a literal's adoption of the parameter's width (an integer into
+// `f32`/`f64`/`i64`, a float into `f32`) could fit it.
 function holeArgScalarRefused(rat: i32, rexp: i32): boolean {
   if !scalarPrimPair(rat, rexp) { return false }
   const sn = primNameOf(softenLitTy(rat))
@@ -34119,10 +34222,10 @@ function holeArgScalarRefused(rat: i32, rexp: i32): boolean {
   !strListHas(HOLE_ARG_FIT_PAIRS, primNameStr(sn) + ">" + primNameStr(dn))
 }
 
-// The scalar pairs beyond the widenings some spelling of a direct call admits: the `boolean`
-// value coercion, and a literal adopting its parameter's width.
+// The scalar pairs beyond the widenings some spelling of a direct call admits: a literal
+// adopting its parameter's width.
 const HOLE_ARG_FIT_PAIRS = [
-  "boolean>i32", "i32>f32", "i32>i64", "i64>f32", "i64>f64", "f64>f32",
+  "i32>f32", "i32>i64", "i64>f32", "i64>f64", "f64>f32",
 ]
 
 // The primitives `holeArgScalarRefused` decides over; any other name defers to the emitter.
@@ -34536,6 +34639,7 @@ function argCstrErr(rat: i32, rexp: i32, ci: i32, ix: i32) {
         + tyToStr(rexp)
         + ", got "
         + tyToStr(rat)
+        + boolForNumberNote(rat, rexp)
         + " (the call of "
         + callee
         + " at the call's argument types)",
@@ -34668,6 +34772,7 @@ function validateRetCstrs(
                 + tyToStr(rw)
                 + ", got "
                 + tyToStr(rg)
+                + boolForNumberNote(rg, rw)
                 + " ("
                 + rWho
                 + " at the call's argument types)",
@@ -41046,7 +41151,15 @@ function checkTailArmsAgainst(ix: i32, ret: i32) {
     if lt >= 0 && lt != TY_ERR && lt != TY_NEVER && !isVoidTy(lt) {
       if !isStmtNode(lf) && !stmtAlwaysExits(lf) {
         if !assignableExpr(lf, lt, ret) {
-          tErrWant("expected " + tyToStr(ret) + ", got " + tyToStr(lt), lf, ret)
+          tErrWant(
+            "expected "
+              + tyToStr(ret)
+              + ", got "
+              + tyToStr(lt)
+              + boolForNumberNote(lt, ret),
+            lf,
+            ret,
+          )
         } else {
           noteRetCstr(lt, ret, lf)
         }
@@ -43302,9 +43415,9 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
       // type here — before the body scope is popped (and `inner`'s floor checked).
       if s == stmts.length - 1 {
         // Checked against the return type through `assignableExpr`, not bare `assignable`, so
-        // the same coercions a declared-type binding grants (a literal widening, boolean meeting
-        // i32) apply here too, matching an explicit `return <expr>` — the bare trailing
-        // expression, which is the implicit return, needs the identical check.
+        // the same coercions a declared-type binding grants (a literal widening) apply here too,
+        // matching an explicit `return <expr>` — the bare trailing expression, which is the
+        // implicit return, needs the identical check.
         if !inferring && tailIsReturn {
           if ret >= 0 && !isVoidTy(ret) && ret != TY_ERR {
             clearTailVerdict(stmts[s])
@@ -43319,7 +43432,11 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
               if !isVoidTy(ret) && ret != TY_NEVER {
                 if !assignableExpr(stmts[s], stTy, ret) {
                   tErrWant(
-                    "expected " + tyToStr(ret) + ", got " + tyToStr(stTy),
+                    "expected "
+                      + tyToStr(ret)
+                      + ", got "
+                      + tyToStr(stTy)
+                      + boolForNumberNote(stTy, ret),
                     stmts[s],
                     ret,
                   )
@@ -53079,6 +53196,7 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
     // argument, or typed return already does — runs before `assignableExpr` so the pin applies first.
     constrainEmptyExpr(n.binRight, rt, asgLt)
     mapStoreValPin(n.binLeft, asgLt)
+    noteU8StoreRhs(n.binLeft, n.binRight)
     nlAsgTgt = n.binLeft
     nlAsgGot = rt
     const asgFits = assignableExpr(n.binRight, rt, asgLt)
@@ -55697,7 +55815,9 @@ function castPinAdjudicate(k: i32, at: i32) {
     return 0
   }
   const sn = primNameStr(primNameOf(at))
-  // A pin at no number is never the target, so the cast fails there as a fallible one can.
+  // A pin at no number is never the target, so the cast fails there as a fallible one can. A
+  // `boolean` pin converts exactly, as the direct spelling does.
+  if sn == "boolean" { return 0 }
   const snNum = sn == "i32" || sn == "i64" || sn == "f32" || sn == "f64"
   if snNum && !numCastCanFail(sn, dom) { return 0 }
   if mode == "null" { return castPinNullLand(k, castIx, target) }
@@ -55774,9 +55894,16 @@ function wrapCastFloatRefused(argTy: i32, target: i32, ix: i32): boolean {
   true
 }
 
+// The `as%` refusal over a `boolean`, shared by the direct spelling and the pin.
+const AS_WRAP_BOOL_MSG = "`as%` wraps between integer widths, and a boolean is not one — convert it with `as`"
+
 // One parked `as%` cast, re-asked under the type its call site pinned the hole to. Reported in
 // `checkCastNode`'s own words, so the pin and the direct spelling cannot disagree.
 function castPinWrapCheck(at: i32, target: i32, castIx: i32) {
+  if primNameOf(at) == "boolean" {
+    tErr(AS_WRAP_BOOL_MSG, castIx)
+    return 0
+  }
   if !isNumeric(at) {
     tErr("`as` supports numeric conversions only", castIx)
     return 0
@@ -55915,6 +56042,15 @@ function checkCastNode(n: AsExpr, ix: i32) {
     || tn == "i64"
     || tn == "f32"
     || tn == "f64"
+  // A `boolean` converts to any numeric target as 1 or 0: exact, so it never fails and every
+  // mode answers the target. `as%` names a wrap between integer widths, which a boolean is not.
+  if targetIsScalar && arg >= 0 && primNameOf(softenLitTy(arg)) == "boolean" {
+    if n.asMode == "wrap" {
+      tErr(AS_WRAP_BOOL_MSG, ix)
+      return TY_ERR
+    }
+    return target
+  }
   if !isNumeric(arg) || !targetIsScalar {
     tErr(
       "`as` supports numeric conversions only" + emptyArrCastHint(n.asObj, target),
@@ -60969,7 +61105,8 @@ function checkRetStmtNode(n: RetStmt, ix: i32) {
         + ", got "
         + tyToStr(got)
         + bareRetVoidNote(want)
-        + charLitForStringNote(n.retArg, want),
+        + charLitForStringNote(n.retArg, want)
+        + boolForNumberNote(got, want),
       n.retArg,
       want,
     )

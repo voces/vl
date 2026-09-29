@@ -1394,7 +1394,14 @@ the interaction with early `return`, `break` out of a loop, a trap (which ends t
 so no cleanup can run), and closures that capture the resource. (a) and (b) are both
 additive syntax.
 
-### boolean-into-i32 — should a `boolean` value keep flowing into an `i32` slot as `1`/`0`? — raised 2026-09-29
+### boolean-into-i32 — should a `boolean` value keep flowing into an `i32` slot as `1`/`0`? — raised 2026-09-29 — **RULED (c), 2026-09-29**
+
+**Ruled (c) by the owner on 2026-09-29, and landed:** the A7 coercion is retired at every
+position, and `as` converts a `boolean` to every numeric target (`i32`, `u8`, `i64`, `f32`,
+`f64`) as 1 or 0, exactly, so no `as` mode can fail. The refusal names the conversion. The
+rationale, the choice of targets and the measured price (194 corpus cells on the landing's
+master) are DECISIONS.md §"A `boolean` is never a number; `as` converts it"; D3218 and D2628
+are closed by it. The question as it was put:
 
 **A language ruling, not a defect.** D3218 was filed as a soundness hole: `const aa: boolean =
 true` then `f(aa)` into `f(x: i32)` checks clean and prints `2`. That is the A7 coercion
