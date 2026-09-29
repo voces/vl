@@ -997,6 +997,11 @@ let ctnLitBindInit: i32[] = []
 let numLitBindDepth: i32[] = []
 let numLitBindName: string[] = []
 let numLitBindDecl: i32[] = []
+// The same rows for an un-annotated `let`/`const` whose initializer is a lambda with no return
+// annotation: a function-value mismatch reading the name finds the lambda through them.
+let fnLitBindDepth: i32[] = []
+let fnLitBindName: string[] = []
+let fnLitBindDecl: i32[] = []
 // Pending notes: the diagnostic's index and raw message, the note, and the declaration it names.
 let nlnDiag: i32[] = []
 let nlnMsg: string[] = []
@@ -13118,6 +13123,9 @@ function isvalReset() {
   numLitBindDepth = []
   numLitBindName = []
   numLitBindDecl = []
+  fnLitBindDepth = []
+  fnLitBindName = []
+  fnLitBindDecl = []
   nlnDiag = []
   nlnMsg = []
   nlnText = []
@@ -13288,6 +13296,11 @@ function collBindPopTo(depth: i32) {
     bindMarkPopTo(numLitBindDepth, numLitBindName, depth)
     while numLitBindDecl.length > numLitBindName.length { numLitBindDecl.pop() }
   }
+  const fl = fnLitBindDepth.length
+  if fl > 0 && fnLitBindDepth[fl - 1] >= depth {
+    bindMarkPopTo(fnLitBindDepth, fnLitBindName, depth)
+    while fnLitBindDecl.length > fnLitBindName.length { fnLitBindDecl.pop() }
+  }
 }
 
 // Is `ix` a numeric literal, possibly negated or parenthesised?
@@ -13342,15 +13355,42 @@ function markNumLitBinding(name: string, depth: i32, decl: i32) {
   0
 }
 
-// The declaration of the numeric-literal binding `name` resolves to, or -1. Paired by depth as
-// `ctnLitInitOf` is, so shadowing holds.
+// Mark the binding `name` declared by `decl` at `depth` when its initializer is a lambda with no
+// return annotation and the declaration has none either.
+function markFnLitBinding(name: string, depth: i32, decl: i32) {
+  const n = P.nodes[decl]
+  if n is LetDecl {
+    if n.letType >= 0 || n.letInit < 0 { return 0 }
+    const f = P.nodes[parenPeelIx(n.letInit)]
+    if f is FuncDecl {
+      if f.fnName == "" && f.fnRet < 0 {
+        bindMarkPush(fnLitBindDepth, fnLitBindName, name, depth)
+        fnLitBindDecl.push(decl)
+      }
+    }
+  }
+  0
+}
+
+// The declaration of the numeric-literal binding `name` resolves to, or -1.
 function numLitDeclOf(name: string): i32 {
+  bindMarkDeclOf(numLitBindDepth, numLitBindName, numLitBindDecl, name)
+}
+
+// The declaration a row of the table `depths`/`names`/`decls` records for the binding `name`
+// resolves to, or -1. Paired by depth as `ctnLitInitOf` is, so shadowing holds.
+function bindMarkDeclOf(
+  depths: i32[],
+  names: string[],
+  decls: i32[],
+  name: string,
+): i32 {
   const d = lookupDepth(name)
   if d < 0 { return -1 }
-  let i = numLitBindName.length - 1
-  while i >= 0 && numLitBindDepth[i] >= d {
-    if numLitBindDepth[i] == d && numLitBindName[i] == name {
-      if i < numLitBindDecl.length { return numLitBindDecl[i] }
+  let i = names.length - 1
+  while i >= 0 && depths[i] >= d {
+    if depths[i] == d && names[i] == name {
+      if i < decls.length { return decls[i] }
       return -1
     }
     i = i - 1
@@ -13712,6 +13752,7 @@ function numLitAsgNoteQueue(msg: string, di: i32) {
 
 // Queue the note for the diagnostic about to be pushed at index `di`, if it has one.
 function numLitNoteQueue(msg: string, at: i32, di: i32) {
+  if nlWantTy >= 0 && numLitFnNoteQueue(msg, at, di) { return 0 }
   if numLitBindName.length == 0 { return 0 }
   if nlAsgTgt >= 0 { return numLitAsgNoteQueue(msg, di) }
   const idIx = numLitReadIdent(at)
@@ -13957,6 +13998,483 @@ function numLitLeafNoteQueue(msg: string, at: i32, di: i32) {
     }
   }
   0
+}
+
+// The function a function-value note names (`numLitFnFits`): its declaration, the binding that
+// holds it (the declaration itself, or the `let` of a lambda), that binding's name, its type, the
+// return type the destination wants, and the literals it returns.
+let nlFnDecl = -1
+let nlFnBind = -1
+let nlFnName = ""
+let nlFnTy = -1
+let nlFnWant = -1
+let nlFnLits: i32[] = []
+
+// Queue the note for a mismatch at `at` whose value is, or holds in a record or list literal, a
+// function whose un-annotated return defaulted from numeric literals, when annotating that return
+// with the destination's return type fixes it. True when it queues one.
+function numLitFnNoteQueue(msg: string, at: i32, di: i32): boolean {
+  const leaf = numLitFnLeafFor(at, nlWantTy, 8)
+  if leaf < 0 { return false }
+  const ann = primNameStr(primNameOf(nlFnWant))
+  nlnDiag.push(di)
+  nlnMsg.push(msg)
+  nlnText.push(numLitFnNote(ann, at))
+  nlnDecl.push(nlFnDecl)
+  nlnUse.push(nlFnName)
+  nlnSlot.push("fn")
+  nlnWant.push(nlFnWant)
+  nlnAnn.push(ann)
+  nlnLeaf.push(leaf)
+  nlnLeafTy.push(-1)
+  true
+}
+
+// The function value within `v` that a `want`-typed destination refuses and whose return
+// annotation fixes, through record and list literals; -1 when none.
+function numLitFnLeafFor(v: i32, want: i32, depth: i32): i32 {
+  const p = parenPeelIx(v)
+  if depth <= 0 || want < 0 || want >= T.tys.length { return -1 }
+  if p < 0 || p >= P.nodes.length { return -1 }
+  const wt = T.tys[want]
+  if wt is TyFunc {
+    if numLitFnFits(p, wt) { return p }
+    return -1
+  }
+  numLitFnLeafInRecord(p, want, depth)
+}
+
+// `numLitFnLeafFor` through the fields of record literal `p` delivered to a record type `want`;
+// every other value goes on to `numLitFnLeafInList`.
+function numLitFnLeafInRecord(p: i32, want: i32, depth: i32): i32 {
+  const n = P.nodes[p]
+  if n is ObjLit {
+    const wt = T.tys[want]
+    if wt is TyObj {
+      for fi in n.objFields {
+        const f = P.nodes[fi]
+        if f is FieldInit {
+          const r = numLitFnLeafFor(
+            f.fiValue,
+            objFieldType(wt, f.fiName),
+            depth - 1,
+          )
+          if r >= 0 { return r }
+        }
+      }
+    }
+    return -1
+  }
+  numLitFnLeafInList(p, want, depth)
+}
+
+// `numLitFnLeafFor` through the elements of list literal `p` delivered to a list type `want`; -1
+// for every other value, which delivers no function this walk can name.
+function numLitFnLeafInList(p: i32, want: i32, depth: i32): i32 {
+  const n = P.nodes[p]
+  if n is ArrayLit {
+    const wt = T.tys[want]
+    if wt is TyArray {
+      for el in n.arrElems {
+        const r = numLitFnLeafFor(el, wt.aElem, depth - 1)
+        if r >= 0 { return r }
+      }
+    }
+  }
+  -1
+}
+
+// Is `p` a function name, a lambda binding or a lambda whose return has no annotation and
+// defaulted from the numeric literals it returns, and which `wt` takes once that return is
+// annotated `wt`'s? Same parameters, a return type the literals also fit, each value kept exactly.
+// Sets the `nlFn*` state on a yes.
+function numLitFnFits(p: i32, wt: TyFunc): boolean {
+  const n = P.nodes[p]
+  let fd = -1
+  let bind = -1
+  let name = ""
+  let got = -1
+  if n is Ident {
+    name = n.identName
+    got = lookup(name)
+    fd = lookupFnDeclNode(name)
+    bind = fd
+    if fd < 0 {
+      bind = bindMarkDeclOf(fnLitBindDepth, fnLitBindName, fnLitBindDecl, name)
+      if bind < 0 || bind >= P.nodes.length { return false }
+      const bn = P.nodes[bind]
+      if bn is LetDecl { fd = parenPeelIx(bn.letInit) }
+    }
+  } else if n is FuncDecl {
+    fd = p
+    bind = p
+    got = nodeTyIxOf(p)
+  }
+  if fd < 0 || fd >= P.nodes.length || got < 0 || got >= T.tys.length {
+    return false
+  }
+  const f = P.nodes[fd]
+  const gt = T.tys[got]
+  if f is FuncDecl && gt is TyFunc {
+    if f.fnRet >= 0 || f.fnTyParams.length > 0 { return false }
+    // Another module may use an exported function's result where only the old return fits.
+    if declHasExportKw(bind) { return false }
+    const np = gt.fnParamTypes.length
+    if np != wt.fnParamTypes.length || np != f.fnParams.length { return false }
+    let i = 0
+    while i < np {
+      if !tySame(gt.fnParamTypes[i], wt.fnParamTypes[i]) { return false }
+      i = i + 1
+    }
+    const wn = primNameStr(primNameOf(wt.fnRet))
+    if !numLitFitsStore(primNameStr(primNameOf(gt.fnRet)), wn, false) {
+      return false
+    }
+    const lits = numLitFnReturns(fd)
+    if lits.length == 0 { return false }
+    for l in lits {
+      if !numLitValuesFit(l, wn) { return false }
+    }
+    nlFnDecl = fd
+    nlFnBind = bind
+    nlFnName = name
+    nlFnTy = got
+    nlFnWant = wt.fnRet
+    nlFnLits = lits
+    return true
+  }
+  false
+}
+
+// The numeric literals function `fd` returns, by `return` or as a tail value, in source order;
+// empty when it returns anything else. A nested function's returns are its own.
+function numLitFnReturns(fd: i32): i32[] {
+  const out: i32[] = []
+  const f = P.nodes[fd]
+  if f is FuncDecl {
+    const leaves: i32[] = []
+    tailValueLeaves(f.fnBody, leaves)
+    const stack: i32[] = [f.fnBody]
+    while stack.length > 0 {
+      const ix = stack.pop() ?? -1
+      const rn = P.nodes[ix]
+      if rn is RetStmt {
+        if rn.retArg >= 0 { leaves.push(rn.retArg) }
+      }
+      if !(rn is FuncDecl) {
+        for c in nodeChildren(ix) {
+          if c >= 0 && c < P.nodes.length { stack.push(c) }
+        }
+      }
+    }
+    for lf in leaves {
+      if !isStmtNode(lf) {
+        if !exprIsNumLit(lf) { return [] }
+        numLitInsertBySpan(out, parenPeelIx(lf))
+      }
+    }
+  }
+  out
+}
+
+// Insert node `ix` into `out`, kept in source order, unless it is already there.
+function numLitInsertBySpan(out: i32[], ix: i32) {
+  for o in out {
+    if o == ix { return 0 }
+  }
+  const at = nodeStartOf(ix)
+  out.push(ix)
+  let k = out.length - 1
+  while k > 0 && nodeStartOf(out[k - 1]) > at {
+    out[k] = out[k - 1]
+    out[k - 1] = ix
+    k = k - 1
+  }
+  0
+}
+
+// The source offset of node `ix`'s anchor token, or -1.
+function nodeStartOf(ix: i32): i32 {
+  if ix < 0 || ix >= nodeToks.length { return -1 }
+  const tk = nodeToks[ix]
+  if tk < 0 || tk >= P.toks.length { return -1 }
+  P.toks[tk].start
+}
+
+// The note for the function `numLitFnFits` found, raised at `at`: the literals its return
+// defaulted from, and its declaration spelled with the return annotation `ann`.
+function numLitFnNote(ann: string, at: i32): string {
+  let who = "the lambda on " + rcwWhere(nlFnDecl, at)
+  if nlFnName != "" { who = "`" + demangleName(nlFnName) + "`" }
+  let lits = ""
+  let i = 0
+  while i < nlFnLits.length {
+    if i > 0 && i == nlFnLits.length - 1 { lits = lits + " and " }
+    else if i > 0 { lits = lits + ", " }
+    lits = lits
+      + "`"
+      + numLitText(nlFnLits[i])
+      + "` on "
+      + rcwWhere(nlFnLits[i], at)
+    i = i + 1
+  }
+  if nlFnLits.length == 1 {
+    lits = "the literal " + lits
+  } else {
+    lits = "only the literals " + lits
+  }
+  let got = ""
+  const gt = T.tys[nlFnTy]
+  if gt is TyFunc { got = tyToStr(gt.fnRet) }
+  " — "
+    + who
+    + " returns "
+    + lits
+    + ", so its return defaulted to `"
+    + got
+    + "`; annotate it: `"
+    + numLitFnSig(ann)
+    + "`"
+}
+
+// The declaration of the function `numLitFnFits` found, spelled with the return annotation `ann`:
+// a `function` declaration, or an arrow lambda with the binding that holds it.
+function numLitFnSig(ann: string): string {
+  const f = P.nodes[nlFnDecl]
+  const b = P.nodes[nlFnBind]
+  let sig = ""
+  if f is FuncDecl {
+    let body = " { … }"
+    if f.fnBody >= 0 && f.fnBody < P.nodes.length {
+      const blk = P.nodes[f.fnBody]
+      if blk is Block {
+        if blk.pos < 0 && blk.blkStmts.length == 1 {
+          body = " " + numLitText(blk.blkStmts[0])
+        }
+      }
+    }
+    const ps = "(" + numLitFnParams(f) + "): " + ann
+    if f.fnName != "" {
+      sig = "function " + demangleName(f.fnName) + ps + body
+    } else {
+      sig = ps + " =>" + body
+    }
+    if b is LetDecl {
+      sig = b.letKw + " " + demangleName(b.letName) + " = " + sig
+    }
+  }
+  sig
+}
+
+// Function `f`'s parameter list as the note spells it: each name with its resolved type.
+function numLitFnParams(f: FuncDecl): string {
+  const ft = T.tys[nlFnTy]
+  let out = ""
+  let i = 0
+  while i < f.fnParams.length {
+    const pn = P.nodes[f.fnParams[i]]
+    if i > 0 { out = out + ", " }
+    if pn is Param {
+      if pn.parRest == 1 { out = out + "..." }
+      out = out + pn.parName
+      let pt = -1
+      if ft is TyFunc {
+        if i < ft.fnParamTypes.length { pt = ft.fnParamTypes[i] }
+      }
+      if pn.parOpt == 1 {
+        out = out + "?"
+        if pt >= 0 && nullableInnerOrNone(pt) >= 0 {
+          pt = nullableInnerOrNone(pt)
+        }
+      }
+      if pn.parType >= 0 && pt >= 0 { out = out + ": " + tyToStr(pt) }
+      if pn.parDefault >= 0 && pn.parOpt != 1 { out = out + " = …" }
+    }
+    i = i + 1
+  }
+  out
+}
+
+// Drop each function-value note whose suggested return another use of the function would refuse:
+// every read of its name, or member call by it, within the top-level statement that declares it
+// (anywhere, for a module-level one) must be a read some note names or a call whose result
+// `numLitFnCallAccepts` keeps.
+function numLitFnNotesRefuted(drop: boolean[]) {
+  const names: {[string]: boolean} = Map()
+  const decls: {[i32]: boolean} = Map()
+  let any = false
+  let j = 0
+  while j < nlnSlot.length {
+    if nlnSlot[j] == "fn" && nlnUse[j] != "" {
+      names[nlnUse[j]] = true
+      decls[nlnDecl[j]] = true
+      any = true
+    }
+    j = j + 1
+  }
+  if !any { return 0 }
+  nlSugg = Map()
+  const par: {[i32]: i32} = Map()
+  const owner: {[i32]: i32} = Map()
+  const reads: i32[] = []
+  const readOwner: i32[] = []
+  const stack: i32[] = []
+  const owners: i32[] = []
+  for s in gRootStmts {
+    stack.push(s)
+    owners.push(s)
+  }
+  while stack.length > 0 {
+    const ix = stack[stack.length - 1]
+    const own = owners[owners.length - 1]
+    stack.pop()
+    owners.pop()
+    if decls[ix] ?? false { owner[ix] = own }
+    const n = P.nodes[ix]
+    let rn = ""
+    if n is Ident { rn = n.identName }
+    if n is Member { rn = n.memProp }
+    if rn != "" && (names[rn] ?? false) {
+      reads.push(ix)
+      readOwner.push(own)
+    }
+    for c in nodeChildren(ix) {
+      if c >= 0 && c < P.nodes.length {
+        par[c] = ix
+        stack.push(c)
+        owners.push(own)
+      }
+    }
+  }
+  let k = 0
+  while k < nlnSlot.length {
+    if nlnSlot[k] == "fn" && nlnUse[k] != "" && !drop[k] {
+      const fd = nlnDecl[k]
+      const own = owner[fd] ?? -1
+      let bind = fd
+      const fdn = P.nodes[fd]
+      if fdn is FuncDecl {
+        if fdn.fnName == "" { bind = par[fd] ?? -1 }
+      }
+      const scoped = own >= 0 && own != bind
+      let ri = 0
+      while ri < reads.length && !drop[k] {
+        const r = reads[ri]
+        const id = P.nodes[r]
+        let mine = false
+        if id is Ident { mine = id.identName == nlnUse[k] }
+        if id is Member { mine = id.memProp == nlnUse[k] }
+        if mine && (!scoped || readOwner[ri] == own) {
+          if (
+            !numLitFnReadNamed(r, nlnAnn[k])
+            && !numLitFnCallAccepts(r, nlnWant[k], par)
+          ) {
+            drop[k] = true
+          }
+        }
+        ri = ri + 1
+      }
+    }
+    k = k + 1
+  }
+  0
+}
+
+// Does a queued function-value note name the read `r` with the suggestion `ann`?
+function numLitFnReadNamed(r: i32, ann: string): boolean {
+  let m = 0
+  while m < nlnLeaf.length {
+    if nlnSlot[m] == "fn" && nlnLeaf[m] == r && nlnAnn[m] == ann { return true }
+    m = m + 1
+  }
+  false
+}
+
+// Is the read `r` the callee of a call whose result keeps its value at type `s` wherever it goes:
+// discarded as a statement, a `print` argument, an argument whose parameter takes `s`, an
+// annotated `let` that takes `s`, or the return of a function whose declared return takes `s`?
+// Anything else (a cast, an operator, an inferred return or binding) refutes the note (D3070).
+function numLitFnCallAccepts(r: i32, s: i32, par: {[i32]: i32}): boolean {
+  const p = numLitFnCallOf(r, par)
+  if p < 0 { return false }
+  const up = par[p] ?? -1
+  // A top-level statement has no parent here, and its result is discarded.
+  if up < 0 { return true }
+  const un = P.nodes[up]
+  if un is Block {
+    const n = un.blkStmts.length
+    if n > 0 && un.blkStmts[n - 1] != p { return true }
+    return numLitIsFnTail(p, up, par) && numLitFnRetTakes(up, s, par)
+  }
+  if un is LetDecl {
+    const lt = nodeTyIxOf(un.letType)
+    return un.letInit == p && un.letType >= 0 && lt >= 0 && assignable(s, lt)
+  }
+  if un is RetStmt { return numLitFnRetTakes(up, s, par) }
+  numLitFnArgTakes(up, p, s)
+}
+
+// The call whose callee is the read `r` (a name, or a member call by it), through parentheses;
+// -1 when `r` is not a callee.
+function numLitFnCallOf(r: i32, par: {[i32]: i32}): i32 {
+  let c = r
+  let p = par[c] ?? -1
+  while p >= 0 && P.nodes[p] is Paren {
+    c = p
+    p = par[p] ?? -1
+  }
+  if p < 0 { return -1 }
+  const call = P.nodes[p]
+  if call is Call {
+    if call.callFn == c { return p }
+  }
+  -1
+}
+
+// Is `c` an argument of call `p` that `print` takes, or whose non-generic parameter takes `s`?
+function numLitFnArgTakes(p: i32, c: i32, s: i32): boolean {
+  const pn = P.nodes[p]
+  if pn is Call {
+    if pn.callFn == c { return false }
+    const cf = P.nodes[parenPeelIx(pn.callFn)]
+    if cf is Ident {
+      if cf.identName == "print" && pn.callArgs.length == 1 { return true }
+    }
+    const ft = nodeTyIxOf(pn.callFn)
+    if ft < 0 || ft >= T.tys.length { return false }
+    const ftt = T.tys[ft]
+    if ftt is TyFunc {
+      let i = 0
+      while i < pn.callArgs.length && i < ftt.fnParamTypes.length {
+        if pn.callArgs[i] == c {
+          return numLitParamTakes(ftt.fnParamTypes[i], s)
+        }
+        i = i + 1
+      }
+    }
+  }
+  false
+}
+
+// Does the function the node `p` sits in declare a return type that takes `s`? An inferred return
+// follows the value, so the suggestion would change it: no.
+function numLitFnRetTakes(p: i32, s: i32, par: {[i32]: i32}): boolean {
+  let f = p
+  let k = 0
+  while f >= 0 && k < 4096 {
+    const fd = P.nodes[f]
+    if fd is FuncDecl {
+      if fd.fnRet < 0 { return false }
+      const ft = nodeTyIxOf(f)
+      if ft < 0 || ft >= T.tys.length { return false }
+      const ftt = T.tys[ft]
+      if ftt is TyFunc { return numLitParamTakes(ftt.fnRet, s) }
+      return false
+    }
+    f = par[f] ?? -1
+    k = k + 1
+  }
+  false
 }
 
 // `export ` when the top-level declaration `decl` carries the keyword, else "".
@@ -14371,6 +14889,7 @@ function numLitNotesApply() {
   const stored = numLitNamesStoredNonLit(names, lists)
   numLitAsgNotesRefuted(drop)
   numLitReadsRefuted(drop)
+  numLitFnNotesRefuted(drop)
   numLitNotesDisagree(drop)
   let i = 0
   while i < nlnDiag.length {
@@ -42759,6 +43278,7 @@ function checkProgramNode(n: Program) {
           markCtnLitBinding(sm.letName, 0, sm.letInit)
         }
         markNumLitBinding(sm.letName, 0, stmts[mi])
+        markFnLitBinding(sm.letName, 0, stmts[mi])
         moduleGlobals[sm.letName] = true
         if sm.letKw == "const" && sm.letInit >= 0 {
           const cin = P.nodes[parenPeelIx(sm.letInit)]
@@ -51402,7 +51922,7 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
       } else {
         nlAsgTgt = n.binLeft
         nlAsgGot = rt
-        tErr(letAssignMsg(n.binRight, rt, asgLt, ""), n.binRight)
+        tErrWant(letAssignMsg(n.binRight, rt, asgLt, ""), n.binRight, asgLt)
         nlAsgTgt = -1
       }
     } else {
@@ -52398,6 +52918,7 @@ function checkLetDeclNode(n: LetDecl, ix: i32) {
   if !preHoisted && numLitBindCandidateTy(bound) {
     markNumLitBinding(n.letName, T.scopes.length - 1, ix)
   }
+  if !preHoisted { markFnLitBinding(n.letName, T.scopes.length - 1, ix) }
   // D1048's second hint: marks a binding whose type came from a spelling that collapsed a
   // subsumed literal arm. A bare call initializer is the whole rung, deliberately narrow.
   if annotCollapsedHere {

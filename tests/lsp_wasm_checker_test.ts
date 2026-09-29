@@ -308,6 +308,77 @@ Deno.test({ name: "wasm-checker: a defaulted literal read inside a value names i
   }
 });
 
+// D3070 (plumb PL-070) — a function value whose un-annotated return defaulted from the numeric
+// literals it returns names the function and the return annotation. The misses pin the note's
+// ABSENCE when no single annotation fixes every use.
+Deno.test({ name: "wasm-checker: a function value's defaulted literal return names the function", ignore }, async () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  const msgs = async (src: string) =>
+    (await checker.check(src, "/tmp/x.vl", noSiblings))
+      .filter((d) => d.severity === "error")
+      .map((d) => d.message);
+  const g = "function ap(f: (i64) => i64): i64 { f(1) }\nfunction af(f: (i64) => f32): f32 { f(1) }\n" +
+    "function a32(f: (i64) => i32): i32 { f(1) }\n";
+  const mis = "argument 1: expected (i64) => i64, got (i64) => i32";
+  const hits: [string, string][] = [
+    [
+      g + "function never(x: i64) { -1 }\nprint(ap(never))\n",
+      mis + " — `never` returns the literal `-1` on line 4, so its return defaulted to `i32`; " +
+      "annotate it: `function never(x: i64): i64 { … }`",
+    ],
+    [
+      g + "const k = (x: i64) => -1\nprint(ap(k))\n",
+      mis + " — `k` returns the literal `-1` on line 4, so its return defaulted to `i32`; " +
+      "annotate it: `const k = (x: i64): i64 => -1`",
+    ],
+    // A call whose result still fits the annotated return keeps the note.
+    [
+      g + "function c(x: i64) { 5 }\nprint(ap(c))\nprint(c(2))\nc(3)\nconst y: i64 = c(4)\nprint(y)\n",
+      mis + " — `c` returns the literal `5` on line 4, so its return defaulted to `i32`; " +
+      "annotate it: `function c(x: i64): i64 { … }`",
+    ],
+  ];
+  for (const [src, want] of hits) {
+    const got = await msgs(src);
+    if (JSON.stringify(got) !== JSON.stringify([want])) {
+      throw new Error(`want ${JSON.stringify([want])}, got ${JSON.stringify(got)}`);
+    }
+  }
+  const misses: [string, string[]][] = [
+    // Another use needs the `i32` return: as a value, or as a call result.
+    [g + "function a(x: i64) { -1 }\nprint(ap(a))\nprint(a32(a))\n", [mis]],
+    [g + "function b(x: i64) { -1 }\nprint(ap(b))\nconst y: i32 = b(1)\nprint(y)\n", [mis]],
+    // Two destinations want two annotations.
+    [
+      g + "function d(x: i64) { 2 }\nprint(ap(d))\nprint(af(d))\n",
+      [mis, "argument 1: expected (i64) => f32, got (i64) => i32"],
+    ],
+    // An `f32` holds integers only up to 2^24 exactly.
+    [g + "function e(x: i64) { 16777217 }\nprint(af(e))\n", ["argument 1: expected (i64) => f32, got (i64) => i32"]],
+    // A lambda binding that is reassigned, or aliased.
+    [g + "function z(x: i64): i32 { 0 }\nlet k = (x: i64) => -1\nprint(ap(k))\nk = z\n", [mis]],
+    [g + "function h(x: i64) { 7 }\nconst al = h\nprint(ap(h))\nprint(a32(al))\n", [mis]],
+    // A return that is not a literal.
+    [g + "function m(x: i64) { 2 * 3 }\nprint(ap(m))\n", [mis]],
+    // A call result the annotation would change: cast, operator, inferred tail, member call.
+    [g + "function c1(x: i64) { 5 }\nprint(ap(c1))\nprint(c1(1) as i32)\n", [mis]],
+    [g + "function c2(x: i64) { 5 }\nprint(ap(c2))\nprint(c2(1) * 1000000000)\n", [mis]],
+    [
+      g + "function c3(x: i64) { 5 }\nprint(ap(c3))\nfunction w() { c3(1) }\nfunction t(v: i32): i32 { v }\nprint(t(w()))\n",
+      [mis],
+    ],
+    [g + "function c4(self: i64) { 5 }\nprint(ap(c4))\nconst q: i32 = (1 as i64).c4()\nprint(q)\n", [mis]],
+    // An exported function: another module may read its result at the old type.
+    [g + "export function c5(x: i64) { 5 }\nprint(ap(c5))\n", [mis]],
+  ];
+  for (const [src, want] of misses) {
+    const got = await msgs(src);
+    if (JSON.stringify(got) !== JSON.stringify(want)) {
+      throw new Error(`want ${JSON.stringify(want)} for ${JSON.stringify(src)}, got ${JSON.stringify(got)}`);
+    }
+  }
+});
+
 Deno.test({ name: "wasm-checker: an emitter-capability rejection surfaces its stable code", ignore }, async () => {
   const checker = loadWasmChecker(SEED, log)!;
   // Type-valid, but codegen cannot lower an INFERRED nullable i32-KEYED MAP return — raised
