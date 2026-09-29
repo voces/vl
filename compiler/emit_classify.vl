@@ -1638,9 +1638,24 @@ function instRecvFieldFnTy(recvIx: i32, prop: string, fnIx: i32): i32 {
     if nt >= 0 && !tyHasTyVar(nt) { rt = nt }
     // A receiver typed at a type parameter reads the instance's own binding of it; a member
     // call's receiver is past its `null` (a `Z | null` parameter narrowed, D3124).
+    if rt < 0 && nt >= 0 { rt = holeOperandTyOf(recvIx, fnIx) }
     if rt < 0 && nt >= 0 {
       const pt = valueReadPinTy(recvIx, fnIx, 0)
       if pt >= 0 { rt = nonNullTy(pt) }
+    }
+  }
+  // A receiver a lambda captures reads the binding of the frame that declares it (D3141).
+  if rt < 0 {
+    const fs = captureDeclFrames(recvIx, fnIx)
+    let i = 0
+    while rt < 0 && i < fs.length {
+      rt = exactOperandTyOf(recvIx, fs[i])
+      if rt < 0 { rt = holeOperandTyOf(recvIx, fs[i]) }
+      if rt < 0 {
+        const pt = valueReadPinTy(recvIx, fs[i], 0)
+        if pt >= 0 { rt = nonNullTy(pt) }
+      }
+      i = i + 1
     }
   }
   if rt < 0 { return -1 }
@@ -44406,9 +44421,23 @@ function sigRetTokOfTy(rty: i32): string {
 // True when value call `callIx`'s callee type has a parameter or result with no `$fnsig`
 // token and no derived i32 rep: the all-i32 arity functype would then be called at the wrong
 // type, so the caller refuses instead of falling back (D2810).
-export function cloCallArityFallbackUnsound(callIx: i32): boolean {
+export function cloCallArityFallbackUnsound(callIx: i32, fnIx: i32): boolean {
   const c = P.nodes[callIx]
   if c is Call {
+    // A hole callee bound to a function type in this instance that `cloCallSigKey` left
+    // unkeyed: the all-i32 functype is sound only where every slot rides an i32 (D3165).
+    const hft = cloCallHoleFnTyOf(callIx, fnIx)
+    if hft >= 0 {
+      const h = T.tys[hft]
+      if h is TyFunc {
+        let k = 0
+        while k < h.fnParamTypes.length {
+          if cloArityRepIsWide(h.fnParamTypes[k]) { return true }
+          k = k + 1
+        }
+        return cloArityRepIsWide(h.fnRet)
+      }
+    }
     const fty = nodeTyIxOf(c.callFn)
     if fty >= 0 {
       const t = T.tys[fty]
@@ -44427,6 +44456,19 @@ export function cloCallArityFallbackUnsound(callIx: i32): boolean {
   false
 }
 
+// The function type a value call's callee the checker left a hole is bound to in the instance
+// `fnIx`, or a capture of one; -1 when the callee has a type of its own or no such binding.
+function cloCallHoleFnTyOf(callIx: i32, fnIx: i32): i32 {
+  const c = P.nodes[callIx]
+  if c is Call {
+    const ct = nodeTyIxOf(c.callFn)
+    if ct >= 0 && T.tys[ct] is TyFunc { return -1 }
+    const hft = holeOrCapturedTyOf(c.callFn, fnIx)
+    if hft >= 0 && T.tys[hft] is TyFunc { return hft }
+  }
+  -1
+}
+
 // Whether type `ty` may be something other than the i32 valtype: only a derived `i32` or
 // `boolean | null` rep is known to ride an i32, so an underived rep answers true.
 function cloArityRepIsWide(ty: i32): boolean {
@@ -44438,9 +44480,15 @@ function cloArityRepIsWide(ty: i32): boolean {
 // Why a value call `callIx` found no `$fnsig`: the first parameter or the result of the
 // callee's function type that has no token, walked in `sigKeyOfTy`'s order, else the whole
 // signature, which then has a key that no function value of that type interned.
-export function cloCallSigRejectWhat(callIx: i32): string {
+export function cloCallSigRejectWhat(callIx: i32, fnIx: i32): string {
   const c = P.nodes[callIx]
   if c is Call {
+    const hft = cloCallHoleFnTyOf(callIx, fnIx)
+    if hft >= 0 {
+      return "the callee is an un-annotated value this instance binds to `"
+        + tyToEmitName(hft)
+        + "`, and such a call is keyed only for a scalar or string result"
+    }
     const fty = nodeTyIxOf(c.callFn)
     if fty >= 0 {
       const t = T.tys[fty]
