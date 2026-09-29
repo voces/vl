@@ -8077,6 +8077,17 @@ function retireNarrowingsForWrite(tgtIx: i32, rt0: i32, atIx: i32) {
         pathReAsg = true
         recordAsgNarTyIx(atIx, nn)
       }
+    } else if (
+      pst >= 0
+      && rt >= 0
+      && tyIsHole(pst)
+      && !tyAdmitsNull(rt)
+      && !isNullTy(rt)
+    ) {
+      // A hole's field reads its non-null face after a non-null write, as after a null test,
+      // so a call through it is not re-asked against the pin's `| null` (D3197).
+      const hn = nonNullNarrowTy(pst)
+      if hn >= 0 && hn != pst { pathReTy = hn }
     }
   }
   if pathReTy >= 0 {
@@ -12573,60 +12584,15 @@ function collectThenNarrowsRaw(condIx: i32, names: string[], tys: i32[]) {
   0
 }
 
-// May the else arm of `if <hole> is T` carry a deferred remainder (`HD_GNOT`)? Not for a
-// literal-bearing `T`, which `litElseNarrow` cannot match at the pin (D1412), nor for a shape `T`
-// over a parameter hole, whose reads no argument check sees; over a hole's field the remainder
-// re-asks them at the pin (`hdMemberReasked`, D3216).
-function holeElseRemainderOk(tIdx: i32, cur: i32): boolean {
+// May the else arm of `if <hole> is T` carry a deferred remainder (`HD_GNOT`)? Two exclusions,
+// neither a design rule. A literal-bearing `T` is the emitter's reach: `litElseNarrow` reads the
+// pin's softened spelling, so the literal matches no member and the arm reads the raw box (D1412).
+// A shape `T` would re-base the hole's field demands onto a derived hole no argument check sees.
+function holeElseRemainderOk(tIdx: i32): boolean {
   if tIdx < 0 { return false }
   const t = T.tys[tIdx]
-  if t is TyObj { return hdFieldRooted(cur) }
+  if t is TyObj { return false }
   true
-}
-
-// Whether a read at remainder `ty` sits in a dead arm at these bindings: some test in its chain
-// matches the whole pin it narrows, so no value reaches it, and the pin does not re-ask it (D3216).
-function gnotArmDeadAt(ty: i32, bNames: string[], bTys: i32[]): boolean {
-  let cur = ty
-  let guard = 0
-  while guard < 64 {
-    const row = hdRowOf(cur)
-    if row < 0 || hdKind[row] != HD_GNOT { return false }
-    const base = substTyDeep(hdBase[row], bNames, bTys)
-    if base >= 0 && !tyHasHole(base) {
-      if hdAlt[row] == TY_NULL {
-        if isNullTy(base) { return true }
-      } else if hdAlt[row] >= 0 && holeAssignOk(-1, base, hdAlt[row]) {
-        return true
-      }
-    }
-    cur = hdBase[row]
-    guard = guard + 1
-  }
-  false
-}
-
-// Whether hole `ty` is a hole's field or a chain of deferred remainders over one (D3216).
-function hdFieldRooted(ty: i32): boolean {
-  let cur = ty
-  let guard = 0
-  while guard < 64 {
-    const row = hdRowOf(cur)
-    if row < 0 { return false }
-    if hdKind[row] == HD_FLD { return true }
-    if hdKind[row] != HD_GNOT { return false }
-    cur = hdBase[row]
-    guard = guard + 1
-  }
-  false
-}
-
-// Whether a member read off derived hole `row` is re-asked at the pin: a hole's field, or the
-// else remainder of an `is` test on one (D3204, D3216).
-function hdMemberReasked(row: i32): boolean {
-  if hdKind[row] == HD_FLD { return true }
-  if hdKind[row] != HD_GNOT || hdAlt[row] == TY_NULL { return false }
-  hdFieldRooted(hdBase[row])
 }
 
 // Collect the narrowings that hold when `cond` is false: `x == null` strips the null in the else
@@ -12662,7 +12628,7 @@ function collectElseNarrowsRaw(condIx: i32, names: string[], tys: i32[]) {
         // rather than lost. Without it the `else` arm of `if a is string` over an un-annotated
         // parameter reads `a` at the full pinned union and `a * 2` refuses a program whose
         // annotated twin runs (D1243). `holeElseRemainderOk` says which types it may mint for.
-        if sub < 0 && holeElseRemainderOk(tIdx, cur) {
+        if sub < 0 && holeElseRemainderOk(tIdx) {
           sub = mkDerivedHole(HD_GNOT, "", -1, tIdx, cur)
         }
         pushNarrowFact(isPl, sub, names, tys)
@@ -35203,7 +35169,6 @@ function validateMemCstrs(
         // check time owns a concrete receiver's write diagnostic, and a builtin-indexable pin
         // is a real array/map write. The SET operator's own site is settled just above.
         if memCstrProp[ci] == OP_INDEX_SET { skip = true }
-        if gnotArmDeadAt(memCstrTy[ci], bNames, bTys) { skip = true }
         if !skip {
           const mMsg = memCstrMsg(mr, memCstrProp[ci])
           if mMsg != "" {
@@ -35958,13 +35923,7 @@ function holePinReadAt(
     return arrElemValueTy(ev)
   }
   if hdField[row].length == 0 { return -1 }
-  const fd = tyFieldTyOf(inner, hdField[row])
-  if fd >= 0 { return fd }
-  // A read the checker accepted at the pin reads a nullable record's non-null face: a declared
-  // row with a `| null` field can claim a literal whose field is present (D3205).
-  const nn = nonNullTy(inner)
-  if nn == inner || nn < 0 { return -1 }
-  tyFieldTyOf(nn, hdField[row])
+  tyFieldTyOf(inner, hdField[row])
 }
 
 // True when union `pin` has a member assignable to `alt`: an `is alt` guard over a parameter
@@ -36104,9 +36063,7 @@ function substHoleTyReal(tyIx: i32, bNames: string[], bTys: i32[]) {
   if hdField[row].length == 0 { return -1 }
   const inner2 = substHoleTy(hdBase[row], bNames, bTys)
   if inner2 >= 0 {
-    // A nullable record reads at its non-null face, as `holePinReadAt` does (D3205); the
-    // member read itself is refused at the pin by its own `memCstrTy` row.
-    const it2 = T.tys[nonNullTy(inner2)]
+    const it2 = T.tys[inner2]
     if it2 is TyObj {
       const f = objFieldType(it2, hdField[row])
       if f >= 0 { return f }
@@ -59295,11 +59252,6 @@ function checkMemberNode(n: Member, ix: i32) {
     }
     if ot.tvName.length > 0 {
       if ot.tvName[0] == '?' {
-        // A read off a hole's field re-asks at the pin, where that field may be `H | null` (D3204).
-        const fRow = hdRowOf(objTy)
-        if fRow >= 0 && hdMemberReasked(fRow) {
-          noteMemCstr(objTy, n.memProp, ix, false)
-        }
         // `.length` is the i32 length an array/string/map exposes — treat it as that (not a
         // struct field), so a collection-shaped hole infers without growing a bogus `{length}` shape.
         return symMem(ix, holeMemberTy(objTy, ot.tvName, n.memProp))
