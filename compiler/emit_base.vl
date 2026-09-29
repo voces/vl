@@ -104,6 +104,7 @@ import {
   Unary,
   WhileStmt,
   i32ToStr,
+  nodeChildren,
   nodeValueChildren,
 } from "./ast"
 import { strContains } from "./strutil"
@@ -214,8 +215,8 @@ let plMoreOwner: i32[] = []
 let plMoreNext: i32[] = []
 let plMoreHead: i32[] = []
 // Every loop variable's scope in the current build, chained per sid like `plMore*`: the
-// variable is visible at `atIx` when `plLxLo < atIx <= plLxHi` (the loop header's last node,
-// then the body block's own index — the arena is post-order). Rebuilt with the rest (D2289).
+// variable is visible at `atIx` when `plLxLo < atIx <= plLxHi` (one below the body's first-built
+// node, then the body block's own index — the arena is post-order). Rebuilt with the rest (D2289).
 let plLxLo: i32[] = []
 let plLxHi: i32[] = []
 // The `ForRange`/`ForIn` each `plLx*` row belongs to, so a query can name the loop.
@@ -469,17 +470,18 @@ function plScanStmt(ix: i32, owner: i32) {
     let head = st.frTo
     if st.frFrom > head { head = st.frFrom }
     if st.frStep > head { head = st.frStep }
-    plRecordLoopExtent(st.frVar, head, st.frBody, ix)
+    plRecordLoopExtent(st.frVar, plLoopLo(head, st.frBody), st.frBody, ix)
     plScanStmt(st.frFrom, owner)
     plScanStmt(st.frTo, owner)
     plScanStmt(st.frStep, owner)
     plScanStmt(st.frBody, st.frBody)
   } else if st is ForIn {
     plRecordLoopVar(st.fiVar, ix)
-    plRecordLoopExtent(st.fiVar, st.fiIter, st.fiBody, ix)
+    const fiLo = plLoopLo(st.fiIter, st.fiBody)
+    plRecordLoopExtent(st.fiVar, fiLo, st.fiBody, ix)
     if st.fiVar2 != "" {
       plRecordLoopVar(st.fiVar2, ix)
-      plRecordLoopExtent(st.fiVar2, st.fiIter, st.fiBody, ix)
+      plRecordLoopExtent(st.fiVar2, fiLo, st.fiBody, ix)
     }
     plScanStmt(st.fiIter, owner)
     plScanStmt(st.fiBody, st.fiBody)
@@ -529,6 +531,36 @@ function plScanStmt(ix: i32, owner: i32) {
     }
   }
   0
+}
+
+// The lower bound of a loop's post-order scope: its header's last-built node, which precedes the
+// body, unless a rewrite replaced the header by a node appended past the body.
+function plLoopLo(head: i32, body: i32): i32 {
+  if head < body { return head }
+  plBodyLo(body)
+}
+
+// The lower bound of a loop body's post-order range: one below its first-built node, found by
+// walking the body (a closure's nodes included) and ignoring nodes a rewrite appended past it.
+// Anchored on the body, not the header, since a rewrite may replace the header by an appended
+// node and leave `header > body` (D3139).
+function plBodyLo(body: i32): i32 {
+  if body < 0 || body >= P.nodes.length { return body }
+  let lo = body
+  const stack: i32[] = [body]
+  while stack.length > 0 {
+    const ix = stack.pop() ?? -1
+    if ix >= 0 && ix <= body {
+      if ix < lo { lo = ix }
+      const kids = nodeChildren(ix)
+      let k = 0
+      while k < kids.length {
+        stack.push(kids[k])
+        k = k + 1
+      }
+    }
+  }
+  lo - 1
 }
 
 // Chains one loop variable's scope row onto its sid (`plLx*`).
