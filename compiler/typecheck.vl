@@ -7169,6 +7169,8 @@ function keyStoresNarrowedTy(key: string): boolean {
   const nar = npTys[slot]
   const st = keyStoreTy(key)
   if nar < 0 || st < 0 { return false }
+  // Two holes both render `_`, which says nothing about whether they are one type (D3197).
+  if tyIsHole(st) || tyIsHole(nar) { return false }
   st == nar || tyToStr(st) == tyToStr(nar)
 }
 
@@ -7682,9 +7684,22 @@ function writeRetiresNarrowing(
   npTy: i32,
 ) {
   if tgtKey == "" { return false }
+  // A hole admits every write, so its narrowing is retired and re-derived from the value (D3197).
+  if key == tgtKey && tyIsHole(npTy) { return true }
   if key == tgtKey { return !assignable(rt, npTy) }
   if keyHasPrefix(key, tgtKey + ".") { return true }
   keyHasPrefix(key, tgtKey + "[")
+}
+
+// Whether the write target at `tgtIx` is a field of a receiver typed as an inference hole.
+function writesHoleField(tgtIx: i32): boolean {
+  const tn = P.nodes[tgtIx]
+  if tn is Member {
+    const on = P.nodes[tn.memObj]
+    if on is Ident { return tyIsHole(lookup(on.identName)) }
+    return tyIsHole(nodeTyOf(tn.memObj))
+  }
+  false
 }
 
 // Assignments that ended a path narrowing through another place that may name the same object.
@@ -7824,6 +7839,8 @@ function aliasWriteHitsKey(
     ) {
       if s < steps.length - 1 { return true }
       if rt < 0 || npTy < 0 || !assignable(rt, npTy) { return true }
+      // A hole admits every write, which proves nothing about the pin's value (D3197).
+      if tyIsHole(npTy) { return true }
       // A numeric value the narrowing only widens to is stored as its own member (D2609).
       if numericVariantUncovered(rt, npTy) { return true }
     }
@@ -8077,17 +8094,15 @@ function retireNarrowingsForWrite(tgtIx: i32, rt0: i32, atIx: i32) {
         pathReAsg = true
         recordAsgNarTyIx(atIx, nn)
       }
-    } else if (
-      pst >= 0
-      && rt >= 0
-      && tyIsHole(pst)
-      && !tyAdmitsNull(rt)
-      && !isNullTy(rt)
-    ) {
-      // A hole's field reads its non-null face after a non-null write, as after a null test,
-      // so a call through it is not re-asked against the pin's `| null` (D3197).
-      const hn = nonNullNarrowTy(pst)
-      if hn >= 0 && hn != pst { pathReTy = hn }
+    }
+  }
+  // A hole's field reads its non-null face after a write of a value non-null at the template, as
+  // after a null test, whatever narrowing the write retired (D3197).
+  if pathReTy < 0 && rt >= 0 && writesHoleField(tgtIx) && !tyHasHole(rt) {
+    const hst = placeStoreTy(tgtIx)
+    if hst >= 0 && tyIsHole(hst) && !tyAdmitsNull(rt) && !isNullTy(rt) {
+      const hn = nonNullNarrowTy(hst)
+      if hn >= 0 && hn != hst { pathReTy = hn }
     }
   }
   if pathReTy >= 0 {
@@ -8412,6 +8427,9 @@ function pathCallSettledSlot(key: string): i32 {
 // type. A read a call's retirement let through is remembered for the misuse note.
 function pathReadsDeclared(key: string, by: i32, ix: i32): boolean {
   if pathRetiredByAssign(by) { return true }
+  // A hole's field reads its own hole after the narrowing ends, which the pin then re-asks (D3197).
+  const hs = narrowedPathIx(key)
+  if hs >= 0 && tyIsHole(npTys[hs]) { return true }
   const slot = pathCallSettledSlot(key)
   if slot < 0 { return false }
   let r = crRetNames.length - 1
