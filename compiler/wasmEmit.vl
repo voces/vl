@@ -1269,12 +1269,23 @@ function scalarListKindUnlisted(fallback: i32): i32 {
   fallback
 }
 
+// `wrap`, the wrapper of a wide scalar list, where a build collected it (`used`); otherwise a
+// recorded refusal, since a read of a list no build made names a type the module lacks.
+function wideListWrap(used: boolean, wrap: i32): i32 {
+  if !used {
+    emitFail(
+      "emitProgram: a list of this element kind is read where no such list was built",
+    )
+  }
+  wrap
+}
+
 // The wrapper struct heap type for a scalar element kind.
 function scalarListWrap(elemKind: VKind) {
   if elemKind == "u8list" { return bl8TypeIdx }
-  if elemKind == "f64" { return fl64TypeIdx }
-  if elemKind == "i64" { return il64TypeIdx }
-  if elemKind == "f32" { return fl32TypeIdx }
+  if elemKind == "f64" { return wideListWrap(fa64Used, fl64TypeIdx) }
+  if elemKind == "i64" { return wideListWrap(ia64Used, il64TypeIdx) }
+  if elemKind == "f32" { return wideListWrap(fa32Used, fl32TypeIdx) }
   // The string list's wrapper is the map's keys-list type, which any `string[]` shares.
   if elemKind == "str" { return mkListIdx }
   if elemKind == "i32" { return lTypeIdx }
@@ -5005,6 +5016,32 @@ export function emitUnionCoerce(
       if mre is Index {
         return emitMapGetScalarBox(body, mre.idxArr, mre.idxIndex, mrk, fnIx)
       }
+    }
+  }
+  // The `K | null` niche entering a box with a `null` member: the sentinel takes the null tag,
+  // any other id widens to its member string, as the non-null atom below does (D3149).
+  if unionTakesAtomAsStr(unionName) && unionSetHasNull(unionName) {
+    const nlt = nulLitAtomTexts(exprIx, fnIx)
+    if nlt.length > 0 && exprNulLitUnion(exprIx, fnIx) {
+      if !aUsed {
+        return emitFail(
+          "emitProgram: literal-union string widening but array type not collected",
+        )
+      }
+      if emitStashAtomId(body, exprIx, fnIx) < 0 { return -1 }
+      pushStrScrI(body, 0)
+      fbI32Const(0 - 1)
+      fbI32Bin(70)     // 0x46 i32.eq → the null sentinel?
+      fbIfRef(uBoxIdx) // 0x04 if, (ref $uBox) blocktype
+      fbI32Const(nullBoxTag())
+      fbRefNullNone()
+      fbStructNew(uBoxIdx)
+      fbElse()
+      fbI32Const(scalarTagOfKind(2))
+      if emitAtomToStrChain(body, nlt, 0) < 0 { return -1 }
+      fbStructNew(uBoxIdx)
+      fbEnd()
+      return 0
     }
   }
   // An atom-typed value entering the box, above the value-atom ladder because the ladder
@@ -21474,8 +21511,16 @@ function emitMapFilter(body: u8[], callIx: i32, fnIx: i32) {
       const cL = mfScratchBase + 3
       // src = <receiver>, evaluated ONCE. (Any nested `.map`/`.filter` in the
       // receiver chain completes — including its result wrapper — before this store,
-      // so the shared frame slots are free to reuse.)
-      if emitExpr(body, callee.memObj, fnIx) < 0 { return -1 }
+      // so the shared frame slots are free to reuse.) The receiver builds at its own type: a
+      // list seed the destination threaded is for the result, not the source (D3149).
+      const mfSvKind = pendingListKind
+      const mfSvSlot = pendingListSlot
+      pendingListKind = LBK_I32_LIST
+      pendingListSlot = 0
+      const mfRc = emitExpr(body, callee.memObj, fnIx)
+      pendingListKind = mfSvKind
+      pendingListSlot = mfSvSlot
+      if mfRc < 0 { return -1 }
       // A NARROWED nullable-list receiver keeps its nullable slot at EVERY element kind;
       // the src scratch slot is declared non-null (`fbRefRun` writes `0x64`), so recover
       // first (checker-guarded, never traps). See `nulRecvNeedsRecover`.
@@ -22706,6 +22751,28 @@ function emitForInList(
   svSyncRecv(iterIx, fnIx)
 }
 
+// Whether function `fnIx` (at `fnStmts` position `fnPos` when inferred) declares a ref-list result.
+function retResultIsRefList(fnIx: i32, fnPos: i32): boolean {
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    if fn.fnRet >= 0 { return vtKindOfType(fn.fnRet) == "reflist" }
+  }
+  fnPos >= 0 && fnPos < fRetKind.length && fRetKind[fnPos] == "reflist"
+}
+
+// Whether `retArg` is a `.map` call whose result list at function `fnIx` is not a ref list.
+function retMapBuildsOtherList(retArg: i32, fnIx: i32): boolean {
+  const rx = unwrapParen(retArg)
+  if rx < 0 { return false }
+  const c = P.nodes[rx]
+  if !(c is Call) { return false }
+  const m = P.nodes[c.callFn]
+  if !(m is Member) { return false }
+  if m.memProp != "map" { return false }
+  const rk = mfResultKindOf(rx, fnIx)
+  rk != null && rk != "ref"
+}
+
 // Lower a return-value expression `retArg` for function `fnIx`: seed the return context
 // from the function's return type, emit through the matching helper, then reset the
 // pending seeds. Does not emit `return` itself — the caller appends `fbReturn` or leaves
@@ -22723,6 +22790,16 @@ function emitReturnValue(body: u8[], retArg: i32, fnIx: i32) {
   let fnPos = -1
   if fn is FuncDecl {
     if fn.fnRet < 0 { fnPos = fnStmtsPosOf(fnIx) }
+  }
+  // A union-list result over a `.map` whose callback this pin gives a niche or scalar result
+  // builds a different list than the result declares; refused rather than mistyped.
+  if retResultIsRefList(fnIx, fnPos) {
+    if retMapBuildsOtherList(retArg, fnIx) {
+      return emitFailAt(
+        "emitProgram: a returned `.map` builds a list the function's result does not name at this instantiation",
+        retArg,
+      )
+    }
   }
   if fn is FuncDecl {
     const rsi = retStructRowIndex(fn.fnRet)
@@ -26773,6 +26850,9 @@ export function emitAtomToStr(body: u8[], atomIx: i32, fnIx: i32) {
   // then the bare one-member set. Two consumers ask the same question and both need every
   // rung — the classifier decides WHETHER to widen, this one needs the members to widen WITH.
   const texts = litAtomWidenTexts(atomIx, fnIx)
+  if texts.length == 0 && exprNulLitUnion(atomIx, fnIx) {
+    return emitNulAtomToStr(body, atomIx, fnIx)
+  }
   if texts.length == 0 {
     return emitFail(
       "emitProgram: literal-union string widening with no members",
@@ -26786,6 +26866,33 @@ export function emitAtomToStr(body: u8[], atomIx: i32, fnIx: i32) {
   if emitStashAtomId(body, atomIx, fnIx) < 0 { return -1 }
   const r = emitAtomToStrChain(body, texts, 0)
   r
+}
+
+// Widen the `K | null` niche to the `string | null` niche: the `-1` sentinel is the null ref,
+// any other id its member string. Only a nullable destination asks, since a checked read of the
+// niche into a `string` has been narrowed to `K` first (D3140).
+function emitNulAtomToStr(body: u8[], atomIx: i32, fnIx: i32) {
+  const texts = nulLitAtomTexts(atomIx, fnIx)
+  if texts.length == 0 {
+    return emitFail(
+      "emitProgram: nullable literal-union string widening with no members",
+    )
+  }
+  if !aUsed {
+    return emitFail(
+      "emitProgram: literal-union string widening but array type not collected",
+    )
+  }
+  if emitStashAtomId(body, atomIx, fnIx) < 0 { return -1 }
+  pushStrScrI(body, 0)
+  fbI32Const(0 - 1)
+  fbI32Bin(70)               // 0x46 i32.eq → the null sentinel?
+  fbIfRefNul(sTypeIdx, true) // if (result (ref null $sTypeIdx))
+  fbRefNull(sTypeIdx)
+  fbElse()
+  if emitAtomToStrChain(body, texts, 0) < 0 { return -1 }
+  fbEnd()
+  0
 }
 
 // Evaluate an atom-repped literal-union value once and stash its interned i32 id in the

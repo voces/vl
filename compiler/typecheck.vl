@@ -691,6 +691,9 @@ const HD_COAL = 6
 // The VALUE of an indexed hole (`a[i]` read): `HD_ELEM`'s element at its value type, so a
 // `u8[]` pin reads `i32`. `HD_ELEM` itself stays the storage type, which a write checks (D2238).
 const HD_ELEMV = 7
+// Parameter `hdInner` (its index; `hdField` renders it) of calling a hole as a function: what the pinned
+// function takes there, so an argument handed to a hole callee is re-asked at the pin (D3171).
+const HD_PARAM = 8
 let hdKind: i32[] = []
 let hdField: string[] = []
 let hdInner: i32[] = []
@@ -20115,16 +20118,17 @@ function annUnionInnerTy(members: i32[], hasNull: boolean): i32 {
     if collapsed >= 0 { collapsedTy = collapsed }
     return collapsed
   }
-  if hasNull {
+  // Every member must be a literal union — a litunion member of a mixed union keeps its own
+  // arena node (`closure-result-union-composed-carrier.vl` miscompiles if flattened). Shared with
+  // the `UnionDecl` arm; the `null` wrap goes over the flattened set too, so `K | L | null` is the
+  // atom niche `KL | null` is (D3174).
+  const flat: i32[] = []
+  const flatLits = litUnionFlatMembers(members, flat)
+  if hasNull && !flatLits {
     annRegisterVariantMembers(members)
     return mkUnionTy(members)
   }
-  // Every member must be a literal union — a litunion member of a mixed union keeps its own
-  // arena node, since that mixed shape is load-bearing elsewhere
-  // (`closure-result-union-composed-carrier.vl` miscompiles if flattened). Shares
-  // `litUnionFlatMembers` with the declaration route's `UnionDecl` arm.
-  const flat: i32[] = []
-  if !litUnionFlatMembers(members, flat) {
+  if !flatLits {
     let i = 0
     while i < members.length {
       pushDistinctVariantTy(flat, members[i])
@@ -34406,9 +34410,17 @@ function validateArgCstrs(
         }
       }
     }
+    // A hole callee's parameter still unpinned here moves out to the caller's hole with its
+    // argument, whichever side this call resolved.
+    if calleeFn >= 0 && hdKindIs(rexp, HD_PARAM) {
+      if rat != argCstrAt[ci] || rexp != argCstrExp[ci] {
+        noteArgCstr(rat, rexp, argCstrWho[ci], argCstrTpl[ci])
+      }
+    }
     // A side still carrying a hole — bare, or as a deferred-join arm — is undecided at this
-    // site and defers to the call that pins it.
-    if !tyIsHole(rat) && !tyIsDeferredJoin(rat) {
+    // site and defers to the call that pins it, as is a pinned function's own type parameter.
+    const pinTp = hdKindIs(argCstrExp[ci], HD_PARAM) && tyHasTyVar(rexp)
+    if !tyIsHole(rat) && !tyIsDeferredJoin(rat) && !pinTp {
       if !tyIsHole(rexp) && !tyIsDeferredJoin(rexp) {
         if !argCstrFits(rat, rexp, argCstrTpl[ci]) {
           argCstrErr(rat, rexp, ci, ix)
@@ -35361,6 +35373,12 @@ function mkGuardedRetTy(t: i32) {
   g
 }
 
+// Whether arena type `tyIx` is a derived hole of kind `kind`.
+function hdKindIs(tyIx: i32, kind: i32): boolean {
+  const r = hdRowOf(tyIx)
+  r >= 0 && hdKind[r] == kind
+}
+
 // The derivation row of an arena type, or -1 when it is not a derived hole.
 function hdRowOf(tyIx: i32) {
   if tyIx < 0 { return -1 }
@@ -35391,6 +35409,7 @@ function hdRenderName(
   if kind == HD_RET { return "?ret." + baseName }
   if kind == HD_ELEM { return "?elem." + baseName }
   if kind == HD_ELEMV { return "?elemv." + baseName }
+  if kind == HD_PARAM { return "?arg." + field + "." + baseName }
   // The fallback type rides the name, like the guarded form's two arena indices: two sites
   // over the same hole reaching different no-dispatch answers are different holes.
   if kind == HD_BINOP {
@@ -35827,6 +35846,18 @@ function substHoleTyReal(tyIx: i32, bNames: string[], bTys: i32[]) {
     }
     return -1
   }
+  // A parameter of calling the hole: the pinned function's own, -1 past its arity.
+  if kind == HD_PARAM {
+    const innerP = substHoleTy(hdBase[row], bNames, bTys)
+    if innerP < 0 { return -1 }
+    const itP = T.tys[innerP]
+    if itP is TyFunc {
+      const pj = hdInner[row]
+      if pj >= 0 && pj < itP.fnParamTypes.length { return itP.fnParamTypes[pj] }
+      return -1
+    }
+    return rebaseDerivedHole(row, innerP)
+  }
   // A deferred binary-op result (`mkBinOpRetTy`): an object pin with a `self`-function
   // overload takes the overload's return type; every other pin keeps the body's own answer, mirroring `checkBinExprNode`'s dispatch arm exactly, including its `is TyObj` gate.
   if kind == HD_BINOP {
@@ -36201,7 +36232,7 @@ export function substTyDeep(tyIx: i32, bNames: string[], bTys: i32[]) {
       // the index dedup above cannot see a value-level duplicate like `T | "err"` at `T :=
       // string`. `out` is read unconditionally; treating it as optional would double the member list.
       const kept3: i32[] = []
-      unionDropSubsumedArms(uniq, kept3)
+      unionDropSubsumedArms(dropNullableInnerTwins(uniq), kept3)
       // A type argument can make a set and a same-rep map meet in one union (D2673); the
       // node whose check substituted reports it (`checkNodeDone`).
       const sclash = setMapUnionClashMsg(kept3, false)
@@ -36221,6 +36252,29 @@ export function substTyDeep(tyIx: i32, bNames: string[], bTys: i32[]) {
   // fresh arena index the provenance bank does not know about unless re-banked here, or the same type renders under two different names depending which door it came through.
   genAppCarry(tyIx, res, bNames, bTys)
   res
+}
+
+// `ms` without each member another member already carries as a nullable's inner: `T | string`
+// at `T := string | null` is `string | null`, the niche, not a box holding `string` twice (D3140).
+function dropNullableInnerTwins(ms: i32[]): i32[] {
+  const out: i32[] = []
+  let i = 0
+  while i < ms.length {
+    let twin = false
+    let j = 0
+    while j < ms.length {
+      if j != i && ms[j] >= 0 {
+        const mj = T.tys[ms[j]]
+        if mj is TyNullable {
+          if mj.nInner == ms[i] { twin = true }
+        }
+      }
+      j = j + 1
+    }
+    if !twin { out.push(ms[i]) }
+    i = i + 1
+  }
+  out
 }
 
 // ── free index-operator resolution (B14) ─────────────────────────────────────
@@ -40384,9 +40438,16 @@ function checkCallNode(n: Call, ix: i32) {
     // checked on their own and the call yields a fresh hole, resolved once an outer call
     // binds the generic signature (the emitter compiles each instance concretely).
     const hargs = n.callArgs
+    let hWho = ""
+    if cfn is Ident { hWho = cfn.identName }
     let hj = 0
     while hj < hargs.length {
-      checkNode(hargs[hj])
+      const hat = checkNode(hargs[hj])
+      // What the pinned function takes here, demanded of the argument at the pin (D3171).
+      const hexp = mkDerivedHole(HD_PARAM, i32ToStr(hj), hj, -1, fnTy)
+      if hat >= 0 && hexp >= 0 {
+        noteArgCstr(inferRetTyOf(hargs[hj], hat), hexp, hWho, false)
+      }
       hj = hj + 1
     }
     return mkDerivedHole(HD_RET, "", -1, -1, fnTy)
