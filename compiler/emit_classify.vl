@@ -3825,6 +3825,7 @@ function letInitBindsNarrowedCell(letIx: i32, fnIx: i32): boolean {
   if letInitTyIsNarrowedArm(letIx, fnIx) { return true }
   if letInitTyIsNarrowedNulArm(letIx, fnIx) { return true }
   if letInitTyIsNarrowedLit(letIx, fnIx) { return true }
+  if letInitTyIsNarrowedNulStr(letIx, fnIx) { return true }
   if letIx < 0 { return false }
   const d = P.nodes[letIx]
   if d is LetDecl {
@@ -3843,6 +3844,18 @@ function letInitTyIsNarrowedLit(letIx: i32, fnIx: i32): boolean {
   if d is LetDecl {
     if d.letType >= 0 || d.letInit < 0 { return false }
     if !tyIsLitUnion(nodeTyIxOf(d.letInit)) { return false }
+    return letInitIsBox(d.letInit, fnIx)
+  }
+  false
+}
+
+// The nullable-string twin: a value narrowed to `string | null` out of a wider box binds the
+// niche the narrowed read delivers, asked of the checker's type for a capture's sake (D3161).
+function letInitTyIsNarrowedNulStr(letIx: i32, fnIx: i32): boolean {
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 || d.letInit < 0 { return false }
+    if !nodeTyIsNullableString(d.letInit) { return false }
     return letInitIsBox(d.letInit, fnIx)
   }
   false
@@ -3918,6 +3931,7 @@ function letInitCellKind(letIx: i32, fnIx: i32): VKind {
   if letInitTyIsNarrowedArm(letIx, fnIx) { return "variant" }
   if letInitTyIsNarrowedNulArm(letIx, fnIx) { return "nulvariant" }
   if letInitTyIsNarrowedLit(letIx, fnIx) { return "str" }
+  if letInitTyIsNarrowedNulStr(letIx, fnIx) { return "nulstr" }
   // A nullable map, before `letIsMap`, whose `(ref $mapStruct)` cell cannot hold null.
   if letIsNulMap(letIx, fnIx) { return "nulmap" }
   // A bare `const t = m[k]` read of a list- or nested-map-valued map binds the value's
@@ -21138,6 +21152,10 @@ export function exprNulLitUnion(exprIx: i32, fnIx: i32) {
           || tyIsNulLitUnionNiche(loopVarPinTyOf(exprIx, fnIx))
       }
     }
+    // …and one asked outside its frame's emission, found by its loop (D3169).
+    if readLoopVarIsLitAtom(unwrapParen(exprIx), e.identName, fnIx) {
+      return nodeTyIsNulLitUnion(exprIx)
+    }
     return false
   }
   // A `K | null` struct field read (`a.f`, code 30) is the niche i32 with the `-1`
@@ -27718,6 +27736,19 @@ export function forInVarIsLitAtom(
   false
 }
 
+// Whether the read `ix` of `name` in frame `fnIx` is a `for-in` element variable holding an
+// atom, found by the loop enclosing the read (D3169).
+function readLoopVarIsLitAtom(ix: i32, name: string, fnIx: i32): boolean {
+  const lp = readLoopNodeOf(ix, name, fnIx)
+  if lp < 0 { return false }
+  const ln = P.nodes[lp]
+  if ln is ForIn {
+    const it = frameBlindIter(ln.fiIter, fnIx)
+    return forInVarIsLitAtom(it, fnIx, forInElemKind(it, fnIx))
+  }
+  false
+}
+
 // The second name's twin: a map walk's literal-union value (D2656).
 export function forInPairVarIsLitAtom(iterIx: i32, fnIx: i32): boolean {
   if !forInPairIsMapVal(iterIx, fnIx) { return false }
@@ -28157,6 +28188,10 @@ export function exprIsLitAtom(exprIx: i32, fnIx: i32) {
     // yet: the declaration answers what `collectLocals` will flag the slot as.
     const fli = frameLetOf(fnIx, e.identName)
     if fli >= 0 { return bindingIsLitAtom(fli, fnIx) }
+    // A walk variable asked outside its frame's emission, which has no slot to read yet.
+    if readLoopVarIsLitAtom(unwrapParen(exprIx), e.identName, fnIx) {
+      return true
+    }
   }
   if e is Index {
     // Every rung below asks a TYPE, and a literal union's type does not carry its rep: a list
