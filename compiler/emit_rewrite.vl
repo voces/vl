@@ -34,6 +34,13 @@ import {
   lambdaVoidAdoptedAt,
   letJoinCandidates,
   litUnionAliasNameOfTy,
+  loopValAny,
+  loopValTailOf,
+  loopValTyOf,
+  lvTyBool,
+  lvTyNever,
+  lvTyNull,
+  lvTyVoid,
   memSharedCalls,
   mkArrayTy,
   mkNullableTyOf,
@@ -60,6 +67,7 @@ import {
   refViewCarry,
   strLitRecvTy,
   tyArrayElemIx,
+  tyBearsNull,
   tyFieldTyOf,
   tyHasTyVar,
   tyIsLitUnion,
@@ -68,6 +76,7 @@ import {
   tyPrimNameOf,
   tySame,
   tyToEmitName,
+  tyToStr,
   voidCoerceValAt,
   voidCoerceValCount,
   voidCoerceValNameAt,
@@ -78,6 +87,7 @@ import {
   BinExpr,
   Block,
   BoolLit,
+  BreakStmt,
   Call,
   CharLit,
   ContinueStmt,
@@ -92,6 +102,7 @@ import {
   LetDecl,
   MatchExpr,
   Member,
+  Node,
   NullLit,
   NumLit,
   ObjLit,
@@ -107,6 +118,8 @@ import {
   Unary,
   UnionDecl,
   WhileStmt,
+  addNode,
+  arenaSetNode,
   callSiteLocOf,
   elseIfLink,
   externArityAt,
@@ -117,6 +130,7 @@ import {
   fnRequiredArity,
   hasNamedArgs,
   i32ToStr,
+  markCallNever,
   mkArrayLit,
   mkAsExpr,
   mkBareBlockIf,
@@ -137,12 +151,15 @@ import {
   mkParam,
   mkStr,
   mkUnary,
+  nodeChildren,
   nodeSpineChildren,
+  nodeToks,
   nodeValueSpineChildren,
   orderArgsByParamNames,
   paramDefaultIsCallsite,
   paramDefaultOf,
   ufcsAliasAtSite,
+  valueIfAdd,
 } from "./ast"
 import {
   MC_RUNG_BUILTIN,
@@ -211,6 +228,253 @@ import {
 import { paramIsClosure, paramNulClosure } from "./emit_query"
 import { sidNoteNodeName } from "./symbols"
 import { strListHas } from "./listutil"
+
+// ── loop and labelled-block values ────────────────────────────────────────────────────────────
+
+// A loop or labelled block whose value is used becomes `if true { let $lv: T [= null]; <loop>;
+// $lv } else { __trap__() }`, each `break v` storing `$lv = v` first. A nullable `T` starts
+// `null`; a non-null one has only value exits, whose frame carries the value out (`whileLv`).
+// DECISIONS.md, "Labels are marked at the exit, and any loop carries a value".
+
+// The loops are gathered in pre-order and rewritten in reverse, so a nested loop is rewritten
+// before any loop its `break`s may leave; `atStmt` records whether each stands in a statement
+// list, where the statement walks collect its locals. An explicit stack, for deep chains.
+export function loopValueRewrite(rootIx: i32) {
+  if !loopValAny() { return 0 }
+  const todo: i32[] = [rootIx]
+  const todoStmt: boolean[] = [true]
+  const loops: i32[] = []
+  const loopStmt: boolean[] = []
+  while todo.length > 0 {
+    const ix = todo.pop() ?? -1
+    const atStmt = todoStmt.pop() ?? false
+    if ix >= 0 && ix < P.nodes.length {
+      const n = P.nodes[ix]
+      if (
+        (n is WhileStmt || n is ForRange || n is ForIn)
+        && loopValTyOf(ix) >= 0
+      ) {
+        loops.push(ix)
+        loopStmt.push(atStmt)
+      }
+      const inList = n is Block || n is Program
+      const kids = nodeChildren(ix)
+      let i = 0
+      while i < kids.length {
+        todo.push(kids[i])
+        todoStmt.push(inList)
+        i = i + 1
+      }
+    }
+  }
+  let k = loops.length - 1
+  while k >= 0 {
+    lvRewriteAt(loops[k], loopValTyOf(loops[k]), loopStmt[k])
+    k = k - 1
+  }
+  capMemoNoteEdit()
+  plCacheBust()
+  0
+}
+
+// Rewrites the loop at `x`, whose used value has type `ty`, in place into the if-expression.
+function lvRewriteAt(x: i32, ty: i32, atStmt: boolean) {
+  const loop = P.nodes[x]
+  const pos = loop.pos
+  const name = "$lv" + i32ToStr(x)
+  const nullable = tyBearsNull(ty)
+  // A generic body's value names its type parameters, which each instance re-resolves.
+  let spell = tyToEmitName(ty)
+  if spell == "" && tyHasTyVar(ty) { spell = lvSpaceless(tyToStr(ty)) }
+  if spell == "" {
+    return emitFailAt("emitProgram: a loop value's type has no spelling", x)
+  }
+  // The loop moves to a fresh node, and the if-expression takes its place.
+  const y = addNode(loop)
+  if x < nodeToks.length && y < nodeToks.length { nodeToks[y] = nodeToks[x] }
+  let init = -1
+  if nullable {
+    init = mkNull("null", pos)
+    nodeTyRecord(init, lvTyNull())
+  } else {
+    // A wide scalar binding declares with a zero; the frame's value overwrites it before any read.
+    const prim = tyPrimNameOf(ty)
+    if prim != null {
+      if prim == "f64" || prim == "f32" { init = mkNum("0.0", pos) }
+      if prim == "i64" { init = mkNum("0", pos) }
+    }
+    nodeTyRecord(init, ty)
+  }
+  // A spelling naming a type parameter is resolved from its name, as each instance's own is.
+  let annTy = ty
+  if tyHasTyVar(ty) { annTy = -1 }
+  const decl = mkLet("let", name, synthTypeRefTy(spell, pos, annTy), init, pos)
+  nodeTyRecord(decl, lvTyVoid())
+  const rd = mkIdent(name, pos)
+  nodeTyRecord(rd, ty)
+  let label = ""
+  let body = -1
+  if loop is WhileStmt {
+    label = loop.whileLabel
+    body = loop.whileBody
+    if !nullable { loop.whileLv = name }
+    if loop.whileBlk == 1 { lvRewriteTail(body, loopValTailOf(x), name, ty) }
+  } else if loop is ForRange {
+    label = loop.frLabel
+    body = loop.frBody
+  } else if loop is ForIn {
+    label = loop.fiLabel
+    body = loop.fiBody
+  }
+  lvRewriteBreaks(body, label, name, ty, 0, false)
+  const thenSt: i32[] = []
+  thenSt.push(decl)
+  thenSt.push(y)
+  thenSt.push(rd)
+  const thenB = mkBlock(thenSt, pos)
+  nodeTyRecord(thenB, ty)
+  const trapFn = mkIdent("__trap__", pos)
+  const trap = mkCall(trapFn, [], pos)
+  nodeTyRecord(trap, lvTyNever())
+  markCallNever(trap)
+  const elseSt: i32[] = []
+  elseSt.push(trap)
+  const elseB = mkBlock(elseSt, pos)
+  const cond = mkBool(1, -1)
+  nodeTyRecord(cond, lvTyBool())
+  const w: Node = { ifCond: cond, ifThen: thenB, ifElse: elseB, pos: pos }
+  arenaSetNode(x, w)
+  nodeTyRecord(x, ty)
+  if !atStmt { valueIfAdd(x) }
+  0
+}
+
+// `s` without its spaces: the emitter's annotation spellings are spaceless (`T|null`).
+function lvSpaceless(s: string): string {
+  let out = ""
+  let i = 0
+  while i < s.length {
+    if s[i] != 32 { out = out + s.slice(i, i + 1) }
+    i = i + 1
+  }
+  out
+}
+
+// `name = v` for the value `v` a loop exit hands over, typed as the checker typed `v`.
+function lvAssign(name: string, v: i32, ty: i32): i32 {
+  const t = mkIdent(name, -1)
+  nodeTyRecord(t, ty)
+  const a = mkBinary("=", t, v, -1)
+  nodeTyCarry(a, v)
+  a
+}
+
+// A labelled block's value tail `tail`, the last statement of its body `body`, becomes `name = tail`.
+function lvRewriteTail(body: i32, tail: i32, name: string, ty: i32) {
+  if tail < 0 { return 0 }
+  const b = P.nodes[body]
+  if b is Block {
+    const st = b.blkStmts
+    if st.length > 0 && st[st.length - 1] == tail {
+      st[st.length - 1] = lvAssign(name, tail, ty)
+    }
+  }
+  0
+}
+
+// Rewrites each `break v` under `ix` that leaves the loop labelled `label` (`depth` 0 while no
+// loop or block lies between them) so its value statement stores into `name`. A labelled
+// `break` leaves it only while no nearer loop or block takes the same label (`shadow`).
+function lvRewriteBreaks(
+  root: i32,
+  label: string,
+  name: string,
+  ty: i32,
+  depth0: i32,
+  shadow0: boolean,
+) {
+  const todo: i32[] = [root]
+  const todoDepth: i32[] = [depth0]
+  const todoShadow: boolean[] = [shadow0]
+  while todo.length > 0 {
+    const ix = todo.pop() ?? -1
+    const depth = todoDepth.pop() ?? 0
+    const shadow = todoShadow.pop() ?? false
+    if ix >= 0 && ix < P.nodes.length && !(P.nodes[ix] is FuncDecl) {
+      lvRewriteBlockBreaks(ix, label, name, ty, depth, shadow)
+      let d = depth
+      let sh = shadow
+      const inner = lvLabelOf(ix)
+      if inner != LV_NOT_A_LOOP {
+        d = depth + 1
+        if label != "" && inner == label { sh = true }
+      }
+      const kids = nodeChildren(ix)
+      let i = 0
+      while i < kids.length {
+        todo.push(kids[i])
+        todoDepth.push(d)
+        todoShadow.push(sh)
+        i = i + 1
+      }
+    }
+  }
+  0
+}
+
+// What `lvLabelOf` answers for a node no `break` can leave: `%` spells no label.
+const LV_NOT_A_LOOP = "%"
+
+// The label of the loop or labelled block at `ix` ("" for none), else `lvNotALoop`'s answer.
+function lvLabelOf(ix: i32): string {
+  const n = P.nodes[ix]
+  if n is WhileStmt { return n.whileLabel }
+  if n is ForRange { return n.frLabel }
+  if n is ForIn { return n.fiLabel }
+  lvNotALoop(ix)
+}
+
+// Every other kind: an expression, a declaration or a statement no `break` leaves.
+function lvNotALoop(_ix: i32): string { LV_NOT_A_LOOP }
+
+// `lvRewriteBreaks` for the statement list of one block `ix`, `depth` loops inside the target.
+function lvRewriteBlockBreaks(
+  ix: i32,
+  label: string,
+  name: string,
+  ty: i32,
+  depth: i32,
+  shadow: boolean,
+) {
+  const n = P.nodes[ix]
+  if n is Block {
+    const st = n.blkStmts
+    let j = 1
+    while j < st.length {
+      if st[j] >= 0 && st[j] < P.nodes.length {
+        const b = P.nodes[st[j]]
+        if b is BreakStmt {
+          if b.brkHasVal == 1 && lvLeaves(b.brkLabel, label, depth, shadow) {
+            st[j - 1] = lvAssign(name, st[j - 1], ty)
+          }
+        }
+      }
+      j = j + 1
+    }
+  }
+  0
+}
+
+// Whether a `break` labelled `brk` leaves the loop labelled `label` from `depth` loops inside it.
+function lvLeaves(
+  brk: string,
+  label: string,
+  depth: i32,
+  shadow: boolean,
+): boolean {
+  if brk == "" { return depth == 0 }
+  brk == label && !shadow
+}
 
 // ── the build-decided `if` ───────────────────────────────────────────────────
 

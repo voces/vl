@@ -1,0 +1,92 @@
+# Loops, labels and loop values
+
+VL has three loops — `while`, the range `for v in a to b` / `a until b`, and the for-in
+`for v in xs` — and one labelled block. Any of them can carry a value.
+
+## Labels
+
+A loop or a block carries a label written before it, `B:`. The label is named again at the
+exit, after a colon:
+
+```vl
+outer: for i in 0 until 10 {
+  for j in 0 until 10 {
+    if j == 3 { continue :outer }   // next i
+    if i * j == 12 { break :outer } // leave both loops
+  }
+}
+```
+
+- `break :B` leaves the loop or block labelled `B`.
+- `continue :B` starts the next iteration of the loop labelled `B`.
+- A bare `break` leaves the innermost loop **or labelled block**; a bare `continue` continues the
+  innermost **loop** (a labelled block is not one, so `continue` passes through it).
+- A label names only a loop or block the jump is written inside, in the same function.
+
+The old spelling `break outer` is refused with the fix (`labels are written `break :outer``),
+because `break x` now means "break with the value of `x`". `scripts/codemods/break-label-colon.py`
+rewrites a file that still uses it.
+
+## Labelled blocks
+
+`B: { … }` runs its body once. `break :B` leaves it early; falling off its end leaves it too.
+This is how a forward jump is written:
+
+```vl
+B: {
+  if header.bad { break :B }
+  parse(header)
+  if !ok { break :B }
+  commit()
+}
+// both breaks land here
+```
+
+`continue :B` on a labelled block is an error: there is nothing to continue.
+
+## Values
+
+`break v` exits with a value, and the loop or block is then an expression:
+
+```vl
+const found = for x in xs {
+  if x > 10 { break x }
+}                            // i32 | null
+
+const kind = B: {
+  if n < 0 { break :B "negative" }
+  if n == 0 { break :B "zero" }
+  "positive"                 // the tail is the value when nothing breaks
+}                            // string
+```
+
+The type is the join of every `break` value that leaves it, and for a block its tail value too:
+
+- A `while` or `for` that can finish without a `break v` — its condition fails, its range or list
+  runs out, or a bare `break` leaves it — also yields `null`, so its type is `T | null`.
+- `while true { … }` (a literal `true`) cannot run out, so its type is plain `T`.
+- A block ends by its tail, which joins with its `break :B v`s; a block that can fall off its end
+  without a value is `T | null`.
+- Different value types join to a union (`break :B 1` and a tail `"s"` give `i32 | string`), which a
+  narrower destination refuses. A `break` whose value is `void` is an error.
+
+`break v` takes its value from the rest of the line, so `break` followed by a newline breaks
+with no value. A value is written after the label: `break :B v`.
+
+A loop whose value nobody reads is an ordinary statement, and `break v` still evaluates `v`.
+
+### Where the value can go
+
+A value-carrying loop or block goes anywhere an expression does — a binding, a return or
+function tail, an argument, a list element, a field, an `if` arm. One spelling needs
+parentheses: a labelled block as a **call argument**, since `f(B: { … })` reads `B:` as the
+named argument `B`. Write `f((B: { … }))`. An unlabelled loop needs none: `f(while true { break 3 })`.
+
+A labelled block as the first statement of a `{ … }` body is a block when its own braces hold
+statements; `{ B: { x: 1 } }` is still an object literal holding one.
+
+### Known limit
+
+A non-null record value of a loop or block at module scope, bound un-annotated, is refused at
+emit (D3224). Annotate the binding (`const c: Circle = while true { … }`) or move it into a
+function.

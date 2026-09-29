@@ -50,14 +50,14 @@ const gen = (ls: Level[]): string => {
       close.push("} ");
     } else if (l === "loop") {
       open.push(`L${k}: while true { acc = acc + 1; `);
-      close.push(`acc = acc + 1; break L${k} } `);
+      close.push(`acc = acc + 1; break :L${k} } `);
     } else {
       open.push("if a > 0 { acc = acc + 1; ");
       close.push("} ");
     }
   });
   const outer = ls.indexOf("loop");
-  const inner = outer >= 0 ? `if a < 0 { break L${outer} } ` : "";
+  const inner = outer >= 0 ? `if a < 0 { break :L${outer} } ` : "";
   return [
     "function f(a: i32): i32 {",
     "  let acc = 0",

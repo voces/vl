@@ -1096,7 +1096,7 @@ const genNesting = (n: number, nested: boolean): string => {
         ? `L${k}: while true { acc = acc + 1; `
         : "if a > 0 { acc = acc + 1; ",
     );
-    close.push(kind === 1 ? `acc = acc + 1; break L${k} } ` : "} ");
+    close.push(kind === 1 ? `acc = acc + 1; break :L${k} } ` : "} ");
   }
   const body = nested
     ? open.join("") + [...close].reverse().join("")

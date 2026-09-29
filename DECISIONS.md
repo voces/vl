@@ -8612,3 +8612,41 @@ as the call evaluated them; a non-constant address, a named argument, an i32 arg
 missing flag keeps the call. A rewrite after binaryen's inlining would have needed a wasm pass in
 the host and could only reach binaryen's 1 KiB, and it would not have met the target: the two
 spellings build to identical wasm only if they reach binaryen identical.
+
+## Labels are marked at the exit, and any loop carries a value (owner ruling 2026-09-29) — plumb PL-073
+
+**The rulings.** A block takes a label as a loop does, `B: { … }`. The label is named again at the
+exit, Zig-style: `break :B`, `break :B v`, `continue :B`; the declaration stays `B:`. A bare
+`break v` leaves the innermost loop or labelled block with `v`, and a bare `break` keeps working,
+so `break x` with `x` a name now means the value `x`. Any loop may carry a value: its type is the
+join of every `break` value, a block's tail joins in, a `while`/`for` that can finish without a
+`break v` adds `null` (`T | null`), and `while true` — a literal `true`, which cannot run out — is
+plain `T`. `continue :B` on a block is an error. The old `break B` / `continue B` is a parse error
+naming the fix, and `scripts/codemods/break-label-colon.py` migrates a tree (every in-tree use is
+migrated). The guide is `docs/guide/loops.md`.
+
+**Why the colon at the exit.** A label and a value share the operand slot after `break`, and a
+value is the common case plumb's forward-exit blocks need. Marking the label rather than the
+value keeps `break v` the short form and makes `break :B v` unambiguous at the parser, with no
+lookup of which names are labels. Zig reads the same way.
+
+**Why `null` for a loop that can run out and plain `T` for `while true`.** A loop whose condition
+fails has produced no value, and `null` is VL's absence, the same rule as an else-less `if` used
+as a value. `while true` has no such path, so adding `null` would make every search loop's result
+need an unwrap that can never fire. The literal is the test, not flow analysis: `while 1 == 1`
+runs out as far as the type is concerned.
+
+**How it lowers.** The checker types the loop (`checkBreakNode`, `lpPopResult`); the emitter's
+first pass (`loopValueRewrite`) turns a loop whose value is used into
+`if true { let $lv: T [= null]; <loop>; $lv } else { __trap__() }` with each `break v` storing
+`$lv = v` first, so every delivery position lowers the value through a binding it already
+handles. A nullable `T` starts at `null`; a non-null one is carried out of the loop's `block
+(result T)` frame by `br` and stored where the binding's read validates. A block is a `block`
+frame with no `loop`. A loop whose value is discarded is a statement and `break v` evaluates `v`.
+
+**What it costs a program without one.** Nothing: the rewrite and the formatter's fold are both
+gated on a program holding a value loop, and `break`/`continue` lower as before.
+
+**One spelling needs parentheses.** A labelled block as a call argument, `f((B: { … }))`, since
+`f(B: …)` is a named argument. Choosing the named argument keeps every existing call meaning
+what it meant.

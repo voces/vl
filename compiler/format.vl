@@ -64,6 +64,7 @@ import {
 // back in its source spelling, not the name it declares under.
 import { getDeclPropOf, opDeclOpOf } from "./ast"
 import { declNameTokOf } from "./ast"
+import { brkValSeen, nodeChildren } from "./ast"
 import { fnTpBoundOf } from "./ast"
 import {
   binPrecOf,
@@ -537,6 +538,8 @@ export function formatProgram(progRoot: i32) {
     // D1045 — a body-scoped `type` is filtered one scope in for the same reason: the parser
     // hoists it into `progStmts` and it stays at its lexical position as well.
     topPrevLine = emitImports()
+    fmtBrkVal = Map()
+    fmtFoldBreaks(progRoot)
     const stmts: i32[] = []
     let fi = 0
     while fi < root.progStmts.length {
@@ -554,6 +557,81 @@ export function formatProgram(progRoot: i32) {
   }
   const text = joinOut()
   alignComments(normalizeProgram(text))
+}
+
+// `break v` parses as the value's statement followed by the break (`brkHasVal`). The printer
+// reads the two as one statement, so `fmtFoldBreaks` moves each value out of its list into
+// this map, keyed by the break node.
+let fmtBrkVal: {[i32]: i32} = Map()
+
+// Folds every `break v` under node `ix`, values included, as `fmtBrkVal` describes.
+// Walked with an explicit stack, since an `else if` chain nests thousands deep (D1990).
+function fmtFoldBreaks(root: i32) {
+  if !brkValSeen { return 0 }
+  const todo: i32[] = [root]
+  while todo.length > 0 {
+    const ix = todo.pop() ?? -1
+    if ix >= 0 && ix < P.nodes.length {
+      const kids = nodeChildren(ix)
+      let i = 0
+      while i < kids.length {
+        todo.push(kids[i])
+        i = i + 1
+      }
+      fmtFoldBlock(ix)
+    }
+  }
+  0
+}
+
+// Folds the `break v`s of one statement list, when `ix` is a block.
+function fmtFoldBlock(ix: i32) {
+  const n = P.nodes[ix]
+  if n is Block {
+    const st = n.blkStmts
+    const out: i32[] = []
+    let j = 0
+    while j < st.length {
+      let folded = false
+      const b = P.nodes[fmtNodeOr(st[j])]
+      if b is BreakStmt {
+        if b.brkHasVal == 1 && out.length > 0 {
+          fmtBrkVal[st[j]] = out[out.length - 1]
+          out.pop()
+          out.push(st[j])
+          folded = true
+        }
+      }
+      if !folded { out.push(st[j]) }
+      j = j + 1
+    }
+    while st.length > 0 { st.pop() }
+    let m = 0
+    while m < out.length {
+      st.push(out[m])
+      m = m + 1
+    }
+  }
+  0
+}
+
+// `ix` where it names an arena node, else the root (never a break).
+function fmtNodeOr(ix: i32): i32 {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  ix
+}
+
+// The `break` statement's text: the keyword, its `:label` and its value.
+function breakText(ix: i32, indent: i32): string {
+  const n = P.nodes[ix]
+  if n is BreakStmt {
+    let t = n.brkKw
+    if n.brkLabel.length > 0 { t = t + " :" + n.brkLabel }
+    const v = fmtBrkVal[ix] ?? -1
+    if v >= 0 { t = t + " " + expr(v, indent, 0) }
+    return t
+  }
+  ""
 }
 
 // Format one recovered `import` or re-export spanning tokens `[kw .. pathTok]`. A braced
@@ -1055,7 +1133,7 @@ function emitStatement(ix: i32, indent: i32) {
   } else if n is ForIn {
     emitForIn(ix, n, indent)
   } else if n is BreakStmt {
-    emitBreakContinue(n.brkKw, n.brkLabel, indent, ix)
+    emitMultiline(breakText(ix, indent), indent, stopLineOf(ix))
   } else if n is ContinueStmt {
     emitBreakContinue(n.contKw, n.contLabel, indent, ix)
   } else if n is Block {
@@ -1141,7 +1219,7 @@ function emitReturn(node: RetStmt, indent: i32) {
 function emitBreakContinue(kw: string, label: string, indent: i32, ix: i32) {
   const line = stopLineOf(ix)
   if label.length > 0 {
-    emitMultiline(kw + " " + label, indent, line)
+    emitMultiline(kw + " :" + label, indent, line)
   } else {
     emitMultiline(kw, indent, line)
   }
@@ -1300,6 +1378,21 @@ function emitBlockStatement(ix: i32, node: Block, indent: i32) {
 function emitWhile(ix: i32, node: WhileStmt, indent: i32) {
   let label = ""
   if node.whileLabel.length > 0 { label = node.whileLabel + ": " }
+  // A labelled block has no `while` or condition to print.
+  if node.whileBlk == 1 {
+    const bInline = inlineBlockBody(node.whileBody, indent)
+    if (
+      bInline.length > 0
+      && indent * 2 + dispWidth(label) + dispWidth(bInline) <= fmtWidth
+    ) {
+      emitLine(indent, label + bInline)
+    } else {
+      emitLine(indent, label + "{")
+      emitBlockBody(node.whileBody, indent)
+      closingBrace(indent, stopLineOf(node.whileBody))
+    }
+    return 0
+  }
   if isBracedBlock(node.whileBody) {
     const cond = expr(node.whileCond, indent, 0)
     const inline = inlineBlockBody(node.whileBody, indent)
@@ -1732,12 +1825,9 @@ function statementInline(ix: i32, indent: i32) {
     if n.retArg < 0 { return "return" }
     return "return " + expr(n.retArg, indent, 0)
   }
-  if n is BreakStmt {
-    if n.brkLabel.length > 0 { return "break " + n.brkLabel }
-    return "break"
-  }
+  if n is BreakStmt { return breakText(ix, indent) }
   if n is ContinueStmt {
-    if n.contLabel.length > 0 { return "continue " + n.contLabel }
+    if n.contLabel.length > 0 { return "continue :" + n.contLabel }
     return "continue"
   }
   if n is LetDecl { return letInline(ix, n, indent) }
@@ -1797,7 +1887,25 @@ function expr(ix: i32, indent: i32, column: i32) {
   if n is IfStmt { return ifExpr(ix, n, indent) }
   if n is Block { return blockExpr(ix, n, indent) }
   if n is MatchExpr { return matchExprFmt(ix, n, indent) }
+  if n is WhileStmt || n is ForRange || n is ForIn {
+    return loopExpr(ix, indent)
+  }
   sliceFallback(ix)
+}
+
+// A loop or labelled block in value position: printed as its statement form, whose first
+// line continues the expression it stands in.
+function loopExpr(ix: i32, indent: i32) {
+  const saved = outBuf
+  outBuf = []
+  emitStatement(ix, indent)
+  const inner = rstripNl(joinOut())
+  outBuf = saved
+  const lead = indentStr(indent)
+  if inner.length >= lead.length && inner.slice(0, lead.length) == lead {
+    return inner.slice(lead.length, inner.length)
+  }
+  inner
 }
 
 // One match arm pattern. A string literal or the `_` wildcard render as the expression they
