@@ -1585,6 +1585,29 @@ export function cloSigRejectWhat(fe: i32): string {
 // shape carries sig-identical closures, so the first match types the call. -1 when no
 // literal of shape `si` sets a function-valued `prop`.
 function fieldClosureFeOf(si: i32, prop: string) {
+  fieldClosureFeOfWant(si, prop, -1)
+}
+
+// Whether function `fnIx` is a generic's instance or is lifted inside one.
+function fnInMonoInstance(fnIx: i32): boolean {
+  let pos = fnStmtsPosOf(fnIx)
+  let guard = 0
+  while pos >= 0 && guard <= fnStmts.length {
+    let k = 0
+    while k < monoInstFe.length {
+      if monoInstFe[k] == pos { return true }
+      k = k + 1
+    }
+    if pos >= fnParent.length { return false }
+    pos = fnParent[pos]
+    guard = guard + 1
+  }
+  false
+}
+
+// `fieldClosureFeOf` restricted, when `want` is a function type, to a closure of exactly that
+// type: literals of one row may hold closures of different signatures. -1 when none has it.
+function fieldClosureFeOfWant(si: i32, prop: string, want: i32) {
   if si < 0 { return -1 }
   let ai = 0
   while ai < P.nodes.length {
@@ -1592,7 +1615,9 @@ function fieldClosureFeOf(si: i32, prop: string) {
     if an is ObjLit {
       if structIndexOfObj(ai) == si {
         const ffe = fieldValueFeOf(objFieldVal(ai, prop))
-        if ffe >= 0 { return ffe }
+        if ffe >= 0 {
+          if want < 0 || tyEq(nodeTyIxOf(fnStmts[ffe]), want) { return ffe }
+        }
       }
     }
     ai = ai + 1
@@ -1600,11 +1625,38 @@ function fieldClosureFeOf(si: i32, prop: string) {
   -1
 }
 
+// The function type field `prop` of `recvIx`'s record has in the generic instance `fnIx` is,
+// or is lifted inside: at its pin, else as the instance recorded it. -1 anywhere else, or where
+// the field is not a function.
+function instRecvFieldFnTy(recvIx: i32, prop: string, fnIx: i32): i32 {
+  let rt = exactOperandTyOf(recvIx, fnIx)
+  if rt < 0 && fnInMonoInstance(fnIx) {
+    const nt = nodeTyIxOf(unwrapParen(recvIx))
+    if nt >= 0 && !tyHasTyVar(nt) { rt = nt }
+  }
+  if rt < 0 { return -1 }
+  const ft = tyFieldTyOf(rt, prop)
+  if ft < 0 || ft >= T.tys.length || !(T.tys[ft] is TyFunc) { return -1 }
+  ft
+}
+
 // The lifted-function position of the closure a member call `recv.prop(...)` dispatches
 // to: first by following the receiver to the literal that built it, so two same-shaped
 // receivers from different monomorphized makers each resolve their own closure, else by
 // the receiver's struct shape (`fieldClosureFeOf`). -1 when neither resolves.
 export function fieldClosureFeOfRecv(recvIx: i32, prop: string, fnIx: i32) {
+  const fe = fieldClosureFeOfRecvRaw(recvIx, prop, fnIx)
+  if fe < 0 || fnIx < 0 { return fe }
+  // Records of one row whose closures differ in signature: an instance's receiver type names
+  // which one it holds, where the syntactic walk above can reach only the first (D3110).
+  const want = instRecvFieldFnTy(recvIx, prop, fnIx)
+  if want < 0 || tyEq(nodeTyIxOf(fnStmts[fe]), want) { return fe }
+  const tfe = fieldClosureFeOfWant(structIndexOfExpr(recvIx, fnIx), prop, want)
+  if tfe >= 0 { return tfe }
+  fe
+}
+
+function fieldClosureFeOfRecvRaw(recvIx: i32, prop: string, fnIx: i32) {
   // With no function value module-wide there is no closure field: every terminal below is
   // `fieldValueFeOf(objFieldVal(…))`, which resolves only a lambda field or a bare
   // function-name field, so the flag being clear makes -1 the only answer. The gate also
@@ -29733,6 +29785,10 @@ export function iterElemPinTy(iterIx: i32, fnIx: i32): i32 {
         const rt = iterElemPinTy(cm.memObj, fnIx)
         if rt >= 0 { return rt }
       }
+      if cm.memProp == "map" && n.callArgs.length == 1 {
+        const mt = mapCbResultPinTy(n.callArgs[0], cm.memObj, fnIx)
+        if mt >= 0 { return mt }
+      }
     }
   }
   if monoHoleSubN.length == 0 { return -1 }
@@ -29743,6 +29799,25 @@ export function iterElemPinTy(iterIx: i32, fnIx: i32): i32 {
   const b = holePinReadOf(hv, monoHoleSubN[row], monoHoleSubT[row])
   if b < 0 || b >= T.tys.length || tyHasTyVar(b) { return -1 }
   b
+}
+
+// What an inline `.map` callback returns at the pin of the instance `fnIx` is: its own element
+// parameter holds the receiver's element, any other read answers as `valueReadPinTy` does. -1
+// for a callback that is not an inline lambda returning one such read.
+function mapCbResultPinTy(cbIx: i32, recvIx: i32, fnIx: i32): i32 {
+  const cx = unwrapParen(cbIx)
+  if cx < 0 { return -1 }
+  const cb = P.nodes[cx]
+  if !(cb is FuncDecl) { return -1 }
+  const rx = unwrapParen(fnRetExprOf(cx))
+  if rx < 0 { return -1 }
+  const rn = identNameOrEmpty(rx)
+  if rn != "" {
+    const pi = paramIndexOf(cx, rn)
+    if pi == 0 { return iterElemPinTy(recvIx, fnIx) }
+    if pi > 0 { return -1 }
+  }
+  valueReadPinTy(rx, fnIx, 0)
 }
 
 // The one type every element of `elems` holds at the pin of the instance `fnIx` is, each an
@@ -40592,6 +40667,12 @@ function nameIsNulStrListDeep(name: string) {
 export function exprNulStrArray(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return false }
   if nodeArrayElemIsNulStr(exprIx) { return true }
+  // A list whose recorded element is a hole's variable holds what the instance `fnIx` pins it
+  // to, and at `string | null` a read that recovers non-null traps on the null (D3089).
+  const pe = nodeArrayElemTyIx(exprIx)
+  if pe >= 0 && tyHasTyVar(pe) {
+    if tyIsNulPrim(iterElemPinTy(exprIx, fnIx), "string") { return true }
+  }
   const e = P.nodes[exprIx]
   if e is Paren { return exprNulStrArray(e.parInner, fnIx) }
   if e is Ident {
@@ -45099,12 +45180,29 @@ export function mfResultSlotOf(callIx: i32, fnIx: i32) {
         }
         // A UNION-returning `.map`: the result is a ref list of the declared union (all
         // unions share `$uBox`, so the element key is the union alias name).
-        if fe >= 0 && cloRetValKind(fe) == "union" && unNames.length > 0 {
-          return rlSlotByName(unNames[0])
+        if fe >= 0 && cloRetValKind(fe) == "union" {
+          const mur = mapUnionResultRow(callIx, fnIx)
+          if mur < 0 { return -1 }
+          return rlSlotByName(unNames[mur])
         }
       }
     }
   }
+  -1
+}
+
+// The `unNames` row of a union-returning `.map`'s result element: the call's element type at
+// the pin of the instance `fnIx` is, else its recorded one; -1 when neither names a row. Every
+// union shares one box, so the row decides only what a reader of the element believes (D3092).
+export function mapUnionResultRow(callIx: i32, fnIx: i32): i32 {
+  let et = iterElemPinTy(callIx, fnIx)
+  if et < 0 {
+    const rt = tyRefArrElemOf(nodeTyIxOf(callIx))
+    if rt >= 0 && !tyHasTyVar(rt) { et = rt }
+  }
+  if et >= 0 { return unRowOfCanon(et) }
+  // With one union registered there is no other row the element could be.
+  if unNames.length == 1 { return 0 }
   -1
 }
 

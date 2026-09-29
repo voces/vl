@@ -2899,6 +2899,9 @@ function monoLamParamPinAnn(
 // The annotation spelling of a pinned lambda type `t`: a list by `monoListSpelling`, which names
 // a nullable record element by its row; any other type as `tyToEmitName` renders it.
 function monoPinAnnSpelling(t: i32): string {
+  // A record bound apart from its row by a function field's type is still spelled by the row.
+  const tw = monoFnFieldTwinRow.get(t) ?? ""
+  if tw != "" { return tw }
   const nm = tyToEmitName(t)
   if nm != "" && t >= 0 && t < T.tys.length && T.tys[t] is TyArray {
     return monoListSpelling(nm, t)
@@ -5978,6 +5981,38 @@ function monoConcreteObjTy(ty: i32): boolean {
   T.tys[ty] is TyObj && !tyHasTyVar(ty)
 }
 
+// A record type an instance binds in place of its anonymous row's own (see
+// `monoObjDiffersInFnFieldsOnly`), to the row's handle, so a pin spelled from it names that row.
+let monoFnFieldTwinRow: {[i32]: string} = Map()
+
+// Whether concrete records `a` and `b` name the same fields in order, and every field on which
+// their types differ is a function type on both sides, with at least one such field.
+function monoObjDiffersInFnFieldsOnly(a: i32, b: i32): boolean {
+  if !monoConcreteObjTy(a) || !monoConcreteObjTy(b) || a == b { return false }
+  const ta = T.tys[a]
+  const tb = T.tys[b]
+  if !(ta is TyObj) || !(tb is TyObj) { return false }
+  const n = ta.objFieldNames.length
+  if tb.objFieldNames.length != n || ta.objFieldTypes.length != n {
+    return false
+  }
+  if tb.objFieldTypes.length != n { return false }
+  let differs = false
+  let i = 0
+  while i < n {
+    if ta.objFieldNames[i] != tb.objFieldNames[i] { return false }
+    const fa = ta.objFieldTypes[i]
+    const fb = tb.objFieldTypes[i]
+    if !tyEq(fa, fb) {
+      if fa < 0 || fb < 0 { return false }
+      if !(T.tys[fa] is TyFunc) || !(T.tys[fb] is TyFunc) { return false }
+      differs = true
+    }
+    i = i + 1
+  }
+  differs
+}
+
 // D988 — the key suffix an anonymous-shape pin needs, or "" for every other pin. A hole
 // parameter pins the argument's type name, and two object literals with the same field
 // names share one synthetic row whatever their field types are, so both key the same
@@ -6603,6 +6638,13 @@ function monoMakeInstance(
         // column is what the re-check windows declare the parameters as.
         const anonTy = anonHandleTyIx(pinned[pj])
         if anonTy >= 0 { pinTy = anonTy }
+        // The row keeps one function type per field, so a record differing only there (the
+        // instance key already tells them apart) binds its own, or every callee typed from
+        // the binding reads the row's first signature (D3110).
+        if anonTy >= 0 && monoObjDiffersInFnFieldsOnly(pinTys[pj], anonTy) {
+          pinTy = pinTys[pj]
+          monoFnFieldTwinRow.set(pinTy, pinned[pj])
+        }
         let isLit = pj < argLit.length && argLit[pj]
         const agree = anonRowKindsAgree(pinned[pj], pinTys[pj])
         if !isLit && anonTy >= 0 { isLit = agree == 1 }
@@ -9089,6 +9131,7 @@ export function monomorphize(stmts: i32[]) {
   monoInstFe = []
   monoParamPinTy = Map()
   monoAnonParamPinTy = Map()
+  monoFnFieldTwinRow = Map()
   monoExactSubRow = Map()
   monoTwoListRet = Map()
   monoExactSubN = []
