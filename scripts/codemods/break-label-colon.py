@@ -6,7 +6,9 @@ the exit"), and the ruling reads `break x` as breaking with the value of `x`. Th
 followed on the same line by a name, and nothing else before the statement ends, when that
 name labels a loop (`B: while`, `B: for`) the jump is lexically inside. Comments and string
 literals are left alone. Any other name is reported, not rewritten: under the new reading it is
-a value, and only the author knows which was meant.
+a value, and only the author knows which was meant. A jump naming a label declared elsewhere in
+the file, or any `continue NAME`, is reported for the same reason. A brace inside the loop
+header's parentheses or brackets is not taken for the body.
 
 Usage: break-label-colon.py [--check] PATH...   (a directory is walked for *.vl files)
 Exit status: 0 when nothing needed rewriting (or --check found nothing), 1 otherwise.
@@ -87,6 +89,8 @@ def rewrite(src):
     depth = 0          # open `{` in code
     active = []        # (label, depth of the loop body's `{`)
     pending = None     # a label declared, whose loop body `{` is still to come
+    parens = 0         # open `(` / `[` since the label, so a brace in the header is not the body
+    labels = set()     # every label declared in the file
     for li, line in enumerate(lines):
         runs = code_spans(line, state)
         if "".join(t for t, _ in runs) != line:
@@ -102,6 +106,8 @@ def rewrite(src):
                 m = LABEL_DECL.match(text, i)
                 if m and (i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")):
                     pending = m.group(1)
+                    labels.add(pending)
+                    parens = 0
                     out.append(m.group(0))
                     i = m.end()
                     continue
@@ -116,9 +122,13 @@ def rewrite(src):
                     i = j.end()
                     continue
                 c = text[i]
-                if c == "{":
+                if c in "([":
+                    parens += 1
+                elif c in ")]":
+                    parens -= 1
+                elif c == "{":
                     depth += 1
-                    if pending is not None:
+                    if pending is not None and parens <= 0:
                         active.append((pending, depth))
                         pending = None
                 elif c == "}":
@@ -129,6 +139,7 @@ def rewrite(src):
                 i += 1
             new.append("".join(out))
         lines[li] = "".join(new)
+    unknown = [(ln, t) for ln, t in unknown if t.split()[-1] in labels or t.startswith("continue")]
     return "\n".join(lines), changed, unknown
 
 
@@ -156,8 +167,7 @@ def main(argv):
         src = open(f, encoding="utf-8").read()
         out, n, unknown = rewrite(src)
         for ln, text in unknown:
-            if text.startswith("continue"):
-                print(f"{f}:{ln}: `{text}` names no enclosing loop label; fix it by hand")
+            print(f"{f}:{ln}: `{text}` was not rewritten: it names no loop label it sits inside; fix it by hand")
         if n:
             total += n
             print(f"{f}: {n} jump(s) {'to rewrite' if check else 'rewritten'}")
