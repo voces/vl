@@ -29545,11 +29545,16 @@ export function holeOperandTyOf(exprIx: i32, fnIx: i32): i32 {
   b
 }
 
-// `holeOperandTyOf` where that type is `string | null`, whose niche a join keeps (D3016); -1
-// otherwise.
+// `holeOperandTyOf` where that type is `string | null`, whose niche a join keeps (D3016), or a
+// join's own recorded `string | null`; -1 otherwise.
 export function holeNulStringPinTyOf(exprIx: i32, fnIx: i32): i32 {
   const t = holeOperandTyOf(exprIx, fnIx)
   if tyIsNulPrim(t, "string") { return t }
+  // A join an instance re-made at its pin records that type itself.
+  const ix = unwrapParen(exprIx)
+  if ix >= 0 && nodeIsValueJoin(ix) && tyIsNulPrim(nodeTyIxOf(ix), "string") {
+    return nodeTyIxOf(ix)
+  }
   -1
 }
 
@@ -29720,6 +29725,16 @@ export function iterElemPinTy(iterIx: i32, fnIx: i32): i32 {
     const rp = arrLitReadsPinTy(n.arrElems, fnIx)
     if rp >= 0 { return rp }
   }
+  // A `.filter` or `.slice` holds its receiver's elements.
+  if n is Call && n.callFn >= 0 {
+    const cm = P.nodes[n.callFn]
+    if cm is Member {
+      if cm.memProp == "filter" || cm.memProp == "slice" {
+        const rt = iterElemPinTy(cm.memObj, fnIx)
+        if rt >= 0 { return rt }
+      }
+    }
+  }
   if monoHoleSubN.length == 0 { return -1 }
   const hv = nodeArrayElemTyIx(iterIx)
   if hv < 0 || hv >= T.tys.length || !(T.tys[hv] is TyVar) { return -1 }
@@ -29738,15 +29753,16 @@ function arrLitReadsPinTy(elems: i32[], fnIx: i32): i32 {
   if t0 < 0 { return -1 }
   let i = 1
   while i < elems.length {
-    if valueReadPinTy(elems[i], fnIx, 0) != t0 { return -1 }
+    const ti = valueReadPinTy(elems[i], fnIx, 0)
+    if ti < 0 || (ti != t0 && !tyEq(ti, t0)) { return -1 }
     i = i + 1
   }
   t0
 }
 
 // The type the read `ix` holds at the pin of the instance `fnIx` is: an element read's list
-// element (`iterElemPinTy`), a parameter's pin, or a local's annotation or initializer. -1 for
-// any other node, or where the type still names a type parameter.
+// element (`iterElemPinTy`), a parameter's pin, a local's annotation or initializer, or a loop
+// variable's list element. -1 for any other node, or where the type still names a type parameter.
 function valueReadPinTy(ix: i32, fnIx: i32, depth: i32): i32 {
   const rx = unwrapParen(ix)
   if rx < 0 || fnIx < 0 || depth > 4 { return -1 }
@@ -29762,7 +29778,11 @@ function valueReadPinTy(ix: i32, fnIx: i32, depth: i32): i32 {
     return -1
   }
   const li = parentLetOf(fn.fnBody, n.identName)
-  if li < 0 { return -1 }
+  if li < 0 {
+    const lv = loopVarElemPinTyOf(rx, fnIx)
+    if lv >= 0 && !tyHasTyVar(lv) { return lv }
+    return -1
+  }
   const d = P.nodes[li]
   if d is LetDecl {
     if d.letType >= 0 {
