@@ -4980,7 +4980,9 @@ function retLocalCellKind(rx: i32, i: i32): VKind | null {
   if rn is Ident {
     const fn = P.nodes[fnStmts[i]]
     if fn is FuncDecl {
-      const li = parentLetOf(fn.fnBody, rn.identName)
+      // The binding in scope at the read, not the name's first binding in the body (D3236).
+      const at = unwrapParen(rx)
+      const li = parentLetOfAt(fn.fnBody, sidOfNode(at), at)
       if li < 0 { return null }
       const k = letCellKind(li, fnStmts[i])
       if (
@@ -16518,7 +16520,7 @@ export function exprIsBool(ix: i32, fnIx: i32) {
     if capturedIsBool(fnIx, e.identName) { return true }
     // A plain boolean local/param/global — recovered from the binding's annotation
     // or initializer, since a boolean local registers identically to an i32.
-    if boundBoolByName(e.identName, fnIx) { return true }
+    if boundBoolByName(e.identName, fnIx, ix) { return true }
   }
   if e is BinExpr {
     const op = e.binOp
@@ -21271,11 +21273,11 @@ function letInitIsNulLitBox(init: i32, fnIx: i32): boolean {
   letInitIsBox(ix, fnIx)
 }
 
-// True if `name` resolves (param / local / module global) to a BOOLEAN binding:
-// either a `: boolean`/`: bool` annotation, or an un-annotated `const`/`let` whose
-// initializer is itself boolean. A boolean local registers as kind 0 (== i32), so
-// bool-ness must be recovered from the binding here, not the local registry.
-function boundBoolByName(name: string, fnIx: i32) {
+// True if `name`, read at node `atIx`, resolves (param / local / module global) to a boolean
+// binding: a `: boolean` annotation, or an un-annotated `const`/`let` with a boolean
+// initializer. A boolean local registers as kind 0 (== i32), so bool-ness must be recovered
+// from the binding here, not the local registry.
+function boundBoolByName(name: string, fnIx: i32, atIx: i32) {
   if fnIx >= 0 {
     const fn = P.nodes[fnIx]
     if fn is FuncDecl {
@@ -21288,9 +21290,14 @@ function boundBoolByName(name: string, fnIx: i32) {
         }
         i = i + 1
       }
-      // `frameLetOfLive`, not `parentLetOf`: a `boolean` bound in a block this read is
-      // not inside is out of scope, and the read denotes the module global. D1597.
-      const li = frameLetOfLive(fn.fnBody, name)
+      // A `boolean` bound in a block this read is not inside is out of scope: with a scope
+      // stack `frameLetOfLive` says so (D1597), and without one the read's own position does.
+      let li = -1
+      if !blockBindingHidden() && atIx >= 0 {
+        li = parentLetOfAt(fn.fnBody, sidOfNode(atIx), atIx)
+      } else {
+        li = frameLetOfLive(fn.fnBody, name)
+      }
       if li >= 0 {
         const d = P.nodes[li]
         if d is LetDecl {
