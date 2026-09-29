@@ -844,6 +844,9 @@ let letCstrFn: i32[] = []
 // of type string` and can also say the object-literal-into-a-map and lossy-numeric forms; a
 // write to an already-declared place says only `cannot assign i32 to string`. `letAssignMsg` forks.
 let letCstrName: string[] = []
+// The right-hand nodes of index writes into a `u8` cell, whose refusal names the byte width
+// rather than the `i32` the cell reads as; kept by node so the pin's re-ask finds it too.
+let u8StoreRhs: i32[] = []
 
 // D582 — deferred builtin-method argument constraints, for the one reason `argCstr*` cannot
 // serve this position: that table is adjudicated against a callee it can name, and a builtin
@@ -4719,6 +4722,7 @@ export function initChecker() {
   letCstrIx = []
   letCstrFn = []
   letCstrName = []
+  u8StoreRhs = []
   bmCstrGot = []
   bmCstrWant = []
   bmCstrCtx = []
@@ -32898,10 +32902,75 @@ function noteLetCstr(got: i32, want: i32, ix: i32, name: string) {
   0
 }
 
+// A `boolean`, or a union with a `boolean` member (a joined literal such as `[0, b]`).
+function tyIsOrHasBoolean(ty: i32): boolean {
+  if primNameOf(softenLitTy(ty)) == "boolean" { return true }
+  const t = T.tys[ty]
+  if t is TyUnion {
+    let i = 0
+    while i < t.uMembers.length {
+      if primNameOf(softenLitTy(t.uMembers[i])) == "boolean" { return true }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// The boolean-into-number note for the first field of record `g` that owes one against `w`.
+function boolForNumberFieldNote(g: TyObj, w: TyObj): string {
+  const names = w.objFieldNames
+  let i = 0
+  while i < names.length {
+    const gf = objFieldType(g, names[i])
+    if gf >= 0 {
+      const note = boolForNumberNoteOf(
+        gf,
+        w.objFieldTypes[i],
+        "field `" + names[i] + "`",
+      )
+      if note != "" { return note }
+    }
+    i = i + 1
+  }
+  ""
+}
+
+// Records `rhs` when `lhs` is an index into a list whose element is stored as `u8`.
+function noteU8StoreRhs(lhs: i32, rhs: i32) {
+  if lhs < 0 || rhs < 0 { return 0 }
+  const l = P.nodes[lhs]
+  if !(l is Index) { return 0 }
+  const at = nodeTyIxOf(l.idxArr)
+  if at < 0 { return 0 }
+  const a = T.tys[at]
+  if !(a is TyArray) { return 0 }
+  if primNameOf(a.aElem) != "u8" { return 0 }
+  if !u8StoreRhsHas(rhs) { u8StoreRhs.push(rhs) }
+  0
+}
+function u8StoreRhsHas(ix: i32): boolean {
+  let i = 0
+  while i < u8StoreRhs.length {
+    if u8StoreRhs[i] == ix { return true }
+    i = i + 1
+  }
+  false
+}
+
 // The fix a `boolean` offered where a number is wanted owes: it never converts implicitly, so
 // the note names the explicit `as` that does, at the wanted width, or "" for any other pair.
 // A list of booleans against a list of numbers is asked of its elements.
 function boolForNumberNote(got: i32, want: i32): string {
+  boolForNumberNoteOf(got, want, "it")
+}
+// `boolForNumberNote` for right-hand side `srcIx`, at the byte width when it is stored into a
+// `u8` cell.
+function boolForNumberNoteAt(srcIx: i32, got: i32, want: i32): string {
+  if srcIx >= 0 && u8StoreRhsHas(srcIx) {
+    if primNameOf(softenLitTy(got)) == "boolean" {
+      return " — a `boolean` is not a number; convert it with `b as u8`"
+    }
+  }
   boolForNumberNoteOf(got, want, "it")
 }
 function boolForNumberNoteOf(got: i32, want: i32, what: string): string {
@@ -32913,12 +32982,18 @@ function boolForNumberNoteOf(got: i32, want: i32, what: string): string {
       return boolForNumberNoteOf(ga.aElem, wa.aElem, "each element")
     }
   }
-  if primNameOf(softenLitTy(got)) != "boolean" { return "" }
+  if ga is TyObj {
+    if wa is TyObj { return boolForNumberFieldNote(ga, wa) }
+  }
+  if !tyIsOrHasBoolean(got) { return "" }
   const wn = primNameStr(primNameOf(want))
   if wn != "i32" && wn != "u8" && wn != "i64" && wn != "f32" && wn != "f64" {
     return ""
   }
-  " — a `boolean` is not a number; convert " + what + " with `b as " + wn + "`"
+  // A brand is named itself: `b as A1` converts into it, where `b as i32` would be refused.
+  let tn = nomNameOfTy(want)
+  if tn == "" { tn = wn }
+  " — a `boolean` is not a number; convert " + what + " with `b as " + tn + "`"
 }
 
 // The direct spelling's sentence for a value that does not fit its destination, in one home
@@ -33004,7 +33079,7 @@ function letAssignMsg(srcIx: i32, got: i32, want: i32, name: string) {
       + " to "
       + tyToStr(want)
       + charLitForStringNote(srcIx, want)
-      + boolForNumberNote(got, want)
+      + boolForNumberNoteAt(srcIx, got, want)
   }
   // An object literal (`{}` / `{x: 1}`) assigned to a map type is a category error, not a
   // width mismatch — point at the fix (`Map()`) rather than the opaque
@@ -41074,7 +41149,15 @@ function checkTailArmsAgainst(ix: i32, ret: i32) {
     if lt >= 0 && lt != TY_ERR && lt != TY_NEVER && !isVoidTy(lt) {
       if !isStmtNode(lf) && !stmtAlwaysExits(lf) {
         if !assignableExpr(lf, lt, ret) {
-          tErrWant("expected " + tyToStr(ret) + ", got " + tyToStr(lt), lf, ret)
+          tErrWant(
+            "expected "
+              + tyToStr(ret)
+              + ", got "
+              + tyToStr(lt)
+              + boolForNumberNote(lt, ret),
+            lf,
+            ret,
+          )
         } else {
           noteRetCstr(lt, ret, lf)
         }
@@ -43347,7 +43430,11 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
               if !isVoidTy(ret) && ret != TY_NEVER {
                 if !assignableExpr(stmts[s], stTy, ret) {
                   tErrWant(
-                    "expected " + tyToStr(ret) + ", got " + tyToStr(stTy),
+                    "expected "
+                      + tyToStr(ret)
+                      + ", got "
+                      + tyToStr(stTy)
+                      + boolForNumberNote(stTy, ret),
                     stmts[s],
                     ret,
                   )
@@ -53112,6 +53199,7 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
     // argument, or typed return already does — runs before `assignableExpr` so the pin applies first.
     constrainEmptyExpr(n.binRight, rt, asgLt)
     mapStoreValPin(n.binLeft, asgLt)
+    noteU8StoreRhs(n.binLeft, n.binRight)
     nlAsgTgt = n.binLeft
     nlAsgGot = rt
     const asgFits = assignableExpr(n.binRight, rt, asgLt)

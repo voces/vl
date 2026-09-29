@@ -6458,7 +6458,10 @@ literal was refused. It was the one implicit crossing between the two scalar fam
 boolean that silently becomes a count is the confusion a type exists to catch — the value/literal
 asymmetry it needed is how D2628 and D3218 were filed as silently-wrong defects against a
 designed rule. Now every position refuses a `boolean` into a number, and the refusal names
-the fix: ``… got boolean — a `boolean` is not a number; convert it with `b as i32` ``.
+the fix: ``… got boolean — a `boolean` is not a number; convert it with `b as i32` `` (a brand
+destination names the brand, `b as A1`, and a `u8` cell names `u8`). Two positions that never
+checked the value against its destination at all still let a boolean through, as they let any
+mismatched scalar through: a `??` operand at a generic pin (D3252) and a spread element (D3253).
 
 **`as` from `boolean`, and the targets it takes.** `b as N` gives 1 or 0 for EVERY numeric
 target — `i32` and `u8` read the boolean's own i32 (no instruction), `i64` sign-extends,
