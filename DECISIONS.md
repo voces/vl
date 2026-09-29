@@ -180,7 +180,10 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   initializer was the EMPTY literal and the fall-through has nothing to read there. **The
   set is CLOSED at two, and that is a property of `assignableExpr`, not of this file**:
   every other element name either is `boolean` or is not a destination a boolean can reach,
-  so the initializer can never hand it a boolean to outvote.
+  so the initializer can never hand it a boolean to outvote. **Since 2026-09-29 the set is
+  EMPTY** (D3218, ruling C retired A7 and the `u8` arm's `boolean` source): no boolean
+  reaches a numeric element, and the rung stays only because a declared numeric element is
+  still the right answer for a list whose initializer reads otherwise.
 
 - **A CHECK THAT ACCEPTS A LITERAL ELEMENT-WISE MUST SAY SO ON THE LITERAL, BECAUSE THE
   EMITTER CLASSIFIES A LIST FROM THE CHECKER'S COLUMN AND NOT FROM THE REP SIDECAR**
@@ -256,7 +259,9 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
   the A7 coercion, becomes a false reject. Asking per SLOT keeps the coercion and pays a
   vaguer message. **When a reconstruction is coarser than what it reconstructs, prefer the
   finer ask and accept the weaker sentence**; the refused candidate is kept buildable and its
-  two-cell price is in `named/`.
+  two-cell price is in `named/`. (The A7 instance of this is gone since 2026-09-29 — D3218,
+  ruling C — and `[0, self]` at `g(true)` now refuses at the pin as its direct twin does; the
+  per-slot ask still decides the brand and `u8` literal adoptions the same way.)
 
 - **A DEFERRED-CONSTRAINT TABLE IS DEFINED BY WHAT ITS PIN CAN ASK, NOT BY WHAT IT RECORDS —
   WHICH IS WHY THE BUILTIN ARGUMENTS COULD NOT JOIN `argCstr`** (2026-08-29,
@@ -282,10 +287,11 @@ _(Consolidated from ROADMAP.md, 2026-06-05.)_
 
 - **A PIN THAT RE-ASKS A BODY'S QUESTION MUST CALL THE FUNCTION THE BODY CALLED, NOT AN
   EQUIVALENT ONE** (2026-08-29, silent-class-inventory D551 / #2017). `validateRetCstrs` asks
-  `assignableExpr` on the substituted pair, not `assignable`. The two differ: the A7
-  boolean-to-`i32` coercion, the f32-literal adoption, the literal-type member rule and the
-  nominal-literal brand waiver all live at the EXPRESSION seam and are deliberately absent
-  from the plain predicate. Asking `assignable` made the generic spelling REFUSE
+  `assignableExpr` on the substituted pair, not `assignable`. The two differ: the f32-literal
+  adoption, the literal-type member rule and the nominal-literal brand waiver all live at the
+  EXPRESSION seam and are deliberately absent from the plain predicate (so did the A7
+  boolean-to-`i32` coercion, the example this entry was written against, until its
+  retirement on 2026-09-29 — D3218, ruling C). Asking `assignable` made the generic spelling REFUSE
   `function g<T>(self: T): i32 { return self }` at `g(true)` while the direct spelling runs —
   a false reject invented by the fix. **The identity is the soundness argument**: parity with
   the direct spelling is structural, not a second rule that can drift the way `checkBinary`
@@ -6442,6 +6448,42 @@ the `as` keyword, and `as` is read only directly after a postfix operand — so 
 binary operator always has a left operand and a `%` that spells the cast never does. `as` stays
 a contextual keyword, so a binding may still be named `as` and take an ordinary remainder.
 `tests/cases/numerics/as-pct-precedence.vl` is the fixture that pins both readings.
+
+## A `boolean` is never a number; `as` converts it (owner ruling (C), 2026-09-29) — D3218
+
+**The A7 coercion is retired.** Since #152 a `boolean`-typed VALUE was accepted wherever the
+destination was exactly `i32` (binding, argument, return, field, element, store, push, map
+value) and, through the `u8` arm's source set, a `u8` element, as `1`/`0`; a bare `true`/`false`
+literal was refused. It was the one implicit crossing between the two scalar families, and a
+boolean that silently becomes a count is the confusion a type exists to catch — the value/literal
+asymmetry it needed is how D2628 and D3218 were filed as silently-wrong defects against a
+designed rule. Now every position refuses a `boolean` into a number, and the refusal names
+the fix: ``… got boolean — a `boolean` is not a number; convert it with `b as i32` ``.
+
+**`as` from `boolean`, and the targets it takes.** `b as N` gives 1 or 0 for EVERY numeric
+target — `i32` and `u8` read the boolean's own i32 (no instruction), `i64` sign-extends,
+`f32`/`f64` convert. That is the rule the rest of `as` already follows: the family is closed
+over the numeric scalars, and restricting a boolean source to `i32`/`u8` would make
+`b as f64` the one numeric pair a user must spell through a second cast. The conversion is
+EXACT, so under the exact-or-fail ruling it cannot fail: `as!` never traps, `as?` is the bare
+number (not `N | null`), and bare `as` propagates nothing — the same answer `i32 as? f64`
+gives. A literal converts as a value does (`true as i32` is `1`). A type parameter pinned at
+`boolean` converts at the pin exactly as the direct spelling does; before the ruling it was a
+pin "at no number" and missed (D2791), which would now disagree with its direct twin.
+
+**What stays refused.** `as%` over a `boolean` — the wrap cast names a width to keep the low
+bits of, and a boolean has none, so it refuses and names `as` (at the direct spelling and at a
+pin, in one sentence). The reverse, a number into a `boolean`, has no implicit form and no
+`as` either: which numbers are `true` is a question with more than one answer (`!= 0`, `== 1`),
+so the comparison is written out.
+
+**Price, measured.** 194 distilled-corpus cells moved `runs` → `loud check reject`, every one in
+a grid built to exercise A7 (`d591` 86, `d581` 28, `d551` 24, `d591t` 22, `d572` 16, `d532x` 8,
+`d581o` 4, `d582s` 4, `d572o` 2), each refusing in words that name `boolean` against a number;
+62 more already-refused cells gained the note. Nothing in `compiler/`, `std/` or `scripts/`
+relied on it (the fixpoint holds), nor did plumb. The fixtures that pinned A7 were migrated to
+the `as` spelling, and `tests/cases/types/boolean-to-i32-container-reject.vl` and
+`tests/cases/generics/boolean-into-number-at-pin-reject.vl` pin the refusal at every position.
 
 ## The union box's TAG is the only sound discriminator; `ref.test` is not a substitute (2026-09-07) — ROADMAP row 16, closed as DESIGN
 

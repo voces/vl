@@ -2158,8 +2158,9 @@ in-language GC knobs.
      count today and would compare the slot; `emitStructExprAsVariantBox` copies field-for-field;
      `repStructSlotsTwin` is computed twice and must agree). `flat` classes get no slot and stay
      on the scan. Acceptance: synthesis §2c's four cells + the N/4N timing probe (fail above 6×).
-  Still REMAINING from before, unchanged: `boolean`→i32 coercion when storing a comparison
-  result; SELF-HOST struct/function-value equality (guarded loudly today).
+  Still REMAINING from before, unchanged: SELF-HOST struct/function-value equality (guarded
+  loudly today). (Storing a comparison result as a number is `b as i32` — the implicit
+  `boolean`→i32 coercion was retired by the owner's ruling (C), 2026-09-29, D3218.)
 - 🟡 **A16. Literal-union types.** REMAINING: the **enum representation** (i32 tag for a closed
   literal union — see `docs/guide/unions.md`); a literal union read *inside* a body softens to base
   (coarser member-narrowing there than at the call boundary).

@@ -184,6 +184,21 @@ Storing into a `u8[]` **without** the cast still keeps the low byte and never co
 (`bytes.push(300)` stores 44) — the cast is the check the store is not. See
 [`collections-design.md`](collections-design.md) §"What you write TODAY" for the store.
 
+A **`boolean` converts to a number only through `as`**: `b as i32` is 1 for `true` and 0 for
+`false`, and so is `b as u8`, `b as i64`, `b as f32` or `b as f64`. The conversion is exact, so
+it never fails — `as!` never traps and `as?` is the plain number. A `boolean` is never accepted
+where a number is expected without it, at any position (a binding, an argument, a return, a
+field, a list element, a push, a map value); the error names the cast to write. Counting is the
+usual use:
+
+```vl
+let n = 0
+for ok in results { n = n + ok as i32 }
+```
+
+The reverse has no cast — write the comparison you mean (`n != 0`). `as%` refuses a `boolean`,
+which has no width to wrap.
+
 A cast whose operand is a UNION picks an ARM instead, with the same three suffixes and the
 same meanings; `x as u8` is not that cast, and refuses a union operand rather than silently
 skipping the range test.
