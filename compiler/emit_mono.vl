@@ -1629,6 +1629,71 @@ function monoApartJoinAnn(init: i32, bN: string[], bT: i32[]): i32 {
   synthTypeRefTy(name, -1, sj)
 }
 
+// The annotation an un-annotated binding of a list literal takes at this pin when the checker
+// typed it with a type parameter: `[x, 7]` as `(T | i32)[]` (D3079), `[]` pushed a `T` as `T[]`
+// (D3100). That list at the pin, spelled as the written annotation is; -1 otherwise.
+function monoLitJoinAnn(init: i32, bN: string[], bT: i32[]): i32 {
+  if init < 0 { return -1 }
+  const u = unwrapParen(init)
+  if u < 0 || u >= P.nodes.length { return -1 }
+  const lit = P.nodes[u]
+  if !(lit is ArrayLit) { return -1 }
+  const rt = nodeTyIxOf(u)
+  if rt < 0 || rt >= T.tys.length || !tyHasTyVar(rt) { return -1 }
+  const rl = monoListLeaf(rt)
+  if rl[1] == 0 { return -1 }
+  // Only the two literals the template builds at the wrong element: an empty one, whose element
+  // a later `push` pinned, and a join. Any other literal's elements already say what it holds.
+  if lit.arrElems.length > 0 && !(T.tys[rl[0]] is TyUnion) { return -1 }
+  const sj = substTyDeep(rt, bN, bT)
+  if sj < 0 || sj >= T.tys.length || tyHasTyVar(sj) { return -1 }
+  const sl = monoListLeaf(sj)
+  if sl[1] == 0 { return -1 }
+  if !(T.tys[sl[0]] is TyUnion) {
+    return synthTypeRefTy(monoListSpelling(tyToStr(sj), sj), -1, sj)
+  }
+  const name = tpIfJoinPinName(sl[0])
+  if name == "" || monoRegisterPinUnion(name) < 0 { return -1 }
+  let spell = "(" + name + ")"
+  let d = 0
+  while d < sl[1] {
+    spell = spell + "[]"
+    d = d + 1
+  }
+  synthTypeRefTy(spell, -1, sj)
+}
+
+// The innermost element of list type `ty` beside how many lists wrap it: `[ty, 0]` for a type
+// that is not a list, and a leaf of -1 when a list's element is still open.
+function monoListLeaf(ty: i32): i32[] {
+  let t = ty
+  let d = 0
+  let more = true
+  while more && d < 8 {
+    more = false
+    if t >= 0 && t < T.tys.length {
+      const a = T.tys[t]
+      if a is TyArray {
+        t = a.aElem
+        d = d + 1
+        more = true
+      }
+    }
+  }
+  if t < 0 || t >= T.tys.length { return [-1, 0] }
+  [t, d]
+}
+
+// Registers the leaf element union of the pinned list type `ty` for this instance, where it has
+// a name: the box a list literal of it builds.
+function monoLitElemUnionRegister(ty: i32) {
+  const l = monoListLeaf(ty)
+  if l[1] == 0 || !(T.tys[l[0]] is TyUnion) { return 0 }
+  const name = tpIfJoinPinName(l[0])
+  if name != "" { monoRegisterPinUnion(name) }
+  0
+}
+
 // The instance's closure-pinned parameters, name beside concrete type. Module state around
 // the `monoCloneBody` call, like `monoInstIsFirst`: the shared body carries the checker's
 // inference hole for such a parameter, so only the frame being cloned names the closure.
@@ -2496,6 +2561,7 @@ function monoCloneBodyRaw(
     if nt < 0 { nt = monoCloPinListAnn(n.letInit) }
     if nt < 0 { nt = monoCloPinShapeAnn(n.letInit) }
     if nt < 0 { nt = monoApartJoinAnn(n.letInit, bN, bT) }
+    if nt < 0 { nt = monoLitJoinAnn(n.letInit, bN, bT) }
     let ninit = n.letInit
     if nt < 0 {
       nt = monoHoleListLitAnn(n.letInit)
@@ -3768,6 +3834,7 @@ function monoPinRetype(ix: i32, bN: string[], bT: i32[]): i32 {
   if n is ArrayLit && monoPinInLit { return ix }
   const pty = monoPinnedTyOf(ix, bN, bT)
   if pty < 0 || pty == nodeTyIxOf(ix) { return ix }
+  if n is ArrayLit { monoLitElemUnionRegister(pty) }
   const nx = monoExprRemake(ix, monoExprKids(ix))
   if nx != ix { monoPinRecordTy(nx, pty) }
   nx

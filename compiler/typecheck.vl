@@ -3257,6 +3257,12 @@ function tyIsWidePrim(ty: i32): boolean {
 // The unions `joinTys` made of two type parameters (D2760). At a pin their members re-join as a
 // non-generic join would, so `A | B` at `i32` and `f64` is `f64`, not a box of the two.
 let tpJoinUnions: {[i32]: i32} = Map()
+// The subset of those a list literal's element join made of a type parameter and concrete
+// types (`litElemTyParamApart`).
+let litJoinUnions: {[i32]: i32} = Map()
+// Set while a binding's written type is the destination of its initializer: a literal there is
+// held to it slot by slot, as its direct spelling is, and keeps the collapsed join.
+let litDestTyped = false
 // Set while a return set joins: there a type parameter's list stays apart from a concrete list
 // (D2783); a join inside a body keeps the collapse its own reads are checked under.
 let tpApartConcrete = false
@@ -4574,6 +4580,9 @@ export function initChecker() {
   voidCoerceValNames = []
   T.tys = []
   tpJoinUnions = Map()
+  litJoinUnions = Map()
+  litDestTyped = false
+  genFnCstrBusy = false
   tpIfJoinAt = Map()
   tpIfFn = []
   tpIfJoin = []
@@ -17054,6 +17063,127 @@ function genericFnAssignable(srcTy: i32, dstTy: i32) {
   false
 }
 
+// A declared generic function delivered by name as a value to the concrete function type
+// `dstTy` is instantiated there, so the constraints its body deferred are adjudicated at the
+// bindings that type gives its parameters, as a direct call's are (D3080).
+function genFnValueCstrs(srcExpr: i32, srcTy: i32, dstTy: i32) {
+  // A validator re-delivers a recorded value through `assignableExpr`, which must not re-enter.
+  // With no generic declared, or no function type in the destination, there is nothing to bind.
+  if genFnCstrBusy || !cstrCandAny || !tyMayHoldFn(dstTy, 0) { return 0 }
+  genFnCstrBusy = true
+  genFnValueCstrsAt(srcExpr, srcTy, dstTy, 0)
+  genFnCstrBusy = false
+  0
+}
+
+let genFnCstrBusy = false
+
+// Whether a value of type `ty` can hold a function, `depth` levels into it.
+function tyMayHoldFn(ty: i32, depth: i32): boolean {
+  if ty < 0 || ty >= T.tys.length || depth > 8 { return false }
+  const t = T.tys[ty]
+  match t {
+    TyFunc => {
+      return true
+    }
+    TyArray => {
+      return tyMayHoldFn(t.aElem, depth + 1)
+    }
+    TyNullable => {
+      return tyMayHoldFn(t.nInner, depth + 1)
+    }
+    TyMap => {
+      return tyMayHoldFn(t.mVal, depth + 1)
+    }
+    TyObj => {
+      for ft in t.objFieldTypes {
+        if tyMayHoldFn(ft, depth + 1) { return true }
+      }
+      return false
+    }
+    TyUnion => {
+      for m in t.uMembers {
+        if tyMayHoldFn(m, depth + 1) { return true }
+      }
+      return false
+    }
+    TyPrim | TyErr | TyVar | TyLit | TyNeg => {
+      return false
+    }
+  }
+}
+
+// `genFnValueCstrs` at `srcExpr`, reaching through the fields of an object literal and the
+// elements of a list literal delivered to a record or list type, `depth` levels down.
+function genFnValueCstrsAt(srcExpr: i32, srcTy: i32, dstTy: i32, depth: i32) {
+  if srcExpr < 0 || dstTy < 0 || depth > 8 { return 0 }
+  const lit = P.nodes[parenPeelIx(srcExpr)]
+  if lit is ObjLit {
+    const dobj = T.tys[dstTy]
+    if dobj is TyObj {
+      for fi in lit.objFields {
+        const f = P.nodes[fi]
+        if f is FieldInit {
+          const ft = objFieldType(dobj, f.fiName)
+          if ft >= 0 {
+            genFnValueCstrsAt(f.fiValue, nodeTyOf(f.fiValue), ft, depth + 1)
+          }
+        }
+      }
+    }
+    return 0
+  }
+  if lit is ArrayLit {
+    const darr = T.tys[dstTy]
+    if darr is TyArray {
+      for el in lit.arrElems {
+        genFnValueCstrsAt(el, nodeTyOf(el), darr.aElem, depth + 1)
+      }
+    }
+    return 0
+  }
+  const e = lit
+  if !(e is Ident) { return 0 }
+  let st = srcTy
+  if st < 0 { st = lookup(e.identName) }
+  if st < 0 { return 0 }
+  const decl = fnDeclIx[e.identName] ?? CSTR_NODECL
+  if decl < 0 || decl >= P.nodes.length { return 0 }
+  const fd = P.nodes[decl]
+  if !(fd is FuncDecl) { return 0 }
+  if fd.fnTyParams.length == 0 { return 0 }
+  let dt = dstTy
+  const dn = T.tys[dt]
+  if dn is TyNullable { dt = dn.nInner }
+  if dt < 0 || tyHasTyVar(dt) { return 0 }
+  const s = T.tys[st]
+  const d = T.tys[dt]
+  if !(s is TyFunc) || !(d is TyFunc) { return 0 }
+  if s.fnParamTypes.length != d.fnParamTypes.length { return 0 }
+  const bNames: string[] = []
+  const bTys: i32[] = []
+  let i = 0
+  while i < s.fnParamTypes.length {
+    bindGenWalk(s.fnParamTypes[i], d.fnParamTypes[i], bNames, bTys)
+    i = i + 1
+  }
+  if bNames.length == 0 { return 0 }
+  const noN: string[] = []
+  const noNo: i32[] = []
+  const noNode: i32[] = []
+  const who = e.identName
+  validateBinCstrs(bNames, bTys, srcExpr, decl, who, noN, noNo, noNode)
+  validatePrintCstrs(bNames, bTys, srcExpr, decl, who)
+  validateNestCstrs(bNames, bTys, srcExpr, decl, who)
+  validateArgCstrs(bNames, bTys, srcExpr, decl)
+  validateRetCstrs(bNames, bTys, srcExpr, decl, who)
+  validateLetCstrs(bNames, bTys, srcExpr, decl, who)
+  validateBmCstrs(bNames, bTys, srcExpr, decl, who)
+  validateMemCstrs(bNames, bTys, srcExpr, decl, who, noN, noNo, noNode)
+  validateUfcsCstrs(bNames, bTys, srcExpr, decl, who)
+  0
+}
+
 // Whether a struct type is sound to box into a value union through a widening struct literal
 // (`{f: 97.5}` into `{f: f32} | {w: i32}`, where the checker adopts the arm and the emitter boxes
 // the plain struct). Restricted to structs whose fields the emitter boxes into a union today; a
@@ -18121,6 +18251,7 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
   // position flows through here. Inert unless the parameter-solve probe is running.
   noteHoleFlow(srcTy, dstTy)
   if assignable(srcTy, dstTy) {
+    if !inferQuiet && srcExpr >= 0 { genFnValueCstrs(srcExpr, srcTy, dstTy) }
     // The object-shape floor. `assignable` accepts structural subtyping between two object shapes
     // and the emitter has no adapter for it (`objShapeAdapterless`), so the pair would reach codegen
     // and fail there on a file `vl check` reports clean. It belongs at this seam, the one every
@@ -32452,6 +32583,48 @@ function tyIsHole(tyIx: i32) {
 // Depth-bounded rather than cycle-tracked, in the safe direction: a recursive named type returns false at the floor.
 function tyHasHole(tyIx: i32) { tyHasHoleAt(tyIx, 0) }
 
+// Whether `tyIx` holds an inference hole (a `?`-named variable), not only declared parameters.
+function tyHasInferHole(tyIx: i32, depth: i32): boolean {
+  if tyIx < 0 || tyIx >= T.tys.length || depth > 8 { return false }
+  const t = T.tys[tyIx]
+  match t {
+    TyVar => {
+      return t.tvName.length == 0 || t.tvName[0] == "?"[0]
+    }
+    TyArray => {
+      return tyHasInferHole(t.aElem, depth + 1)
+    }
+    TyNullable => {
+      return tyHasInferHole(t.nInner, depth + 1)
+    }
+    TyMap => {
+      return tyHasInferHole(t.mKey, depth + 1)
+        || tyHasInferHole(t.mVal, depth + 1)
+    }
+    TyObj => {
+      for ft in t.objFieldTypes {
+        if tyHasInferHole(ft, depth + 1) { return true }
+      }
+      return false
+    }
+    TyFunc => {
+      for pt in t.fnParamTypes {
+        if tyHasInferHole(pt, depth + 1) { return true }
+      }
+      return tyHasInferHole(t.fnRet, depth + 1)
+    }
+    TyUnion => {
+      for m in t.uMembers {
+        if tyHasInferHole(m, depth + 1) { return true }
+      }
+      return false
+    }
+    TyPrim | TyErr | TyLit | TyNeg => {
+      return false
+    }
+  }
+}
+
 function tyHasHoleAt(tyIx: i32, depth: i32) {
   if tyIx < 0 { return false }
   if depth > 8 { return false }
@@ -32574,6 +32747,12 @@ function noteRetCstr(got: i32, want: i32, ix: i32) {
 function noteLetCstr(got: i32, want: i32, ix: i32, name: string) {
   if tyHasHole(got) || tyHasHole(want) {
     const owner = cstrOwnerTop()
+    // Outside every generic, a type parameter can only be a generic function value's own, which
+    // its delivery binds and adjudicates (`genFnValueCstrs`); a row would be re-asked of every
+    // later generic call whose parameter shares the name (D3104).
+    if owner < 0 && tpEnvNames.length == 0 {
+      if !tyHasInferHole(got, 0) && !tyHasInferHole(want, 0) { return 0 }
+    }
     let k = 0
     while k < letCstrGot.length {
       if letCstrFn[k] == owner {
@@ -35827,7 +36006,11 @@ export function substTyDeep(tyIx: i32, bNames: string[], bTys: i32[]) {
     // checked even when nothing changed — an unresolved member is dead precisely because it did not resolve.
     if isJoinHoleUnion(tyIx) {
       res = refoldJoinUnion(tyIx, ms, out3, changed3, bNames, bTys)
-    } else if changed3 && tpJoinUnions.has(tyIx) {
+    } else if (
+      changed3
+      && tpJoinUnions.has(tyIx)
+      && !litJoinStaysOpen(tyIx, out3)
+    ) {
       // A union the return-set join kept apart re-joins under the same rule (D2784).
       const tpSaved = tpApartConcrete
       tpApartConcrete = true
@@ -35861,6 +36044,12 @@ export function substTyDeep(tyIx: i32, bNames: string[], bTys: i32[]) {
       const sclash = setMapUnionClashMsg(kept3, false)
       if sclash != "" { joinClashMsg = sclash }
       if kept3.length == 1 { res = kept3[0] } else { res = mkUnionTy(kept3) }
+      const resIsUnion = res >= 0 && res < T.tys.length && T.tys[res] is TyUnion
+      if res != tyIx && litJoinUnions.has(tyIx) && resIsUnion {
+        // arena-tick exempt: a per-program mark on a fresh arena row.
+        tpJoinUnions[res] = 1
+        litJoinUnions[res] = 1
+      }
     }
   } else if t is TyMap {
     const k2 = substTyDeep(t.mKey, bNames, bTys)
@@ -40633,6 +40822,52 @@ function cstrProbeVisit(ix: i32, order: i32[]): boolean {
   cyc
 }
 
+// Pass 1.65: types each un-annotated module global the hoist left a placeholder, by quietly
+// checking its initializer at module scope, so a body checked before pass 2 reaches the
+// declaration reads the global's real type (D3078). A lambda, or an initializer that raises a
+// diagnostic or yields a hole, `null`, `void` or `never`, keeps the placeholder for pass 2.
+function globalInitPrePass(lets: i32[]) {
+  if lets.length == 0 { return 0 }
+  const savedQuiet = inferQuiet
+  const savedSym = symEnabled
+  const savedRedun = redunName.length
+  const savedRcoal = rcoalTok.length
+  const savedIsval = isvalTok.length
+  inferQuiet = true
+  symEnabled = 0
+  for li in lets {
+    const ln = P.nodes[li]
+    // A bare lambda binding is typed where it is written: checking one early would fix its
+    // un-annotated parameters before pass 2 marks them as inference holes.
+    let lambdaInit = false
+    if ln is LetDecl {
+      const lin = P.nodes[parenPeelIx(ln.letInit)]
+      if lin is FuncDecl { lambdaInit = true }
+    }
+    if ln is LetDecl && !lambdaInit {
+      const savedDiag = T.diags.length
+      // Its own flow frame, so a read of a global still in the dead zone is neither reported
+      // nor marked assigned here; pass 2 reports it where it is written.
+      const daSaved = daEnterFrame()
+      const it = checkNode(ln.letInit)
+      daLeaveFrame(daSaved)
+      const clean = T.diags.length == savedDiag
+      while T.diags.length > savedDiag { T.diags.pop() }
+      if clean && it >= 0 && it != TY_ERR && !isVoidTy(it) && !isNullTy(it) {
+        if !isNeverTy(it) && !tyHasHole(it) {
+          declare(ln.letName, constStrLitBound(ln, it))
+        }
+      }
+    }
+  }
+  inferQuiet = savedQuiet
+  symEnabled = savedSym
+  redunTruncate(savedRedun)
+  rcoalTruncate(savedRcoal)
+  isvalTruncate(savedIsval)
+  0
+}
+
 // Pass 1.9: indexes the generic declarations whose bodies `cstrProbeBefore` will walk.
 function cstrPrePass(stmts: i32[]) {
   cstrCandIx = Map()
@@ -43467,6 +43702,7 @@ function checkProgramNode(n: Program) {
   // Initialization order still matters for straight-line top-level code — each global joins
   // the definite-assignment dead-zone here — but a function body runs at call time, so a deferred read from inside one is correctly not flagged.
   let mi = 0
+  const phLets: i32[] = []
   while mi < stmts.length {
     const sm = P.nodes[stmts[mi]]
     if sm is LetDecl {
@@ -43514,6 +43750,9 @@ function checkProgramNode(n: Program) {
           }
         }
         declare(sm.letName, mty)
+        if mty == TY_ERR && sm.letType < 0 && sm.letInit >= 0 {
+          phLets.push(stmts[mi])
+        }
         if letDeclIsUnannotObjLit(stmts[mi]) {
           markObjLitBinding(sm.letName, 0)
         }
@@ -43548,6 +43787,7 @@ function checkProgramNode(n: Program) {
     if sps is FuncDecl { solveUnannotParams(stmts[sp]) }
     sp = sp + 1
   }
+  globalInitPrePass(phLets)
   // Pass 1.7: return-inference pre-pass — resolve every un-annotated return (cycles
   // included, via the binding-group fixpoint) BEFORE checking bodies, so pass 2 sees
   // final return types and a recursive function needs no return annotation.
@@ -53108,7 +53348,10 @@ function checkLetDeclNode(n: LetDecl, ix: i32) {
   }
   if n.letInit >= 0 {
     if tpEnvNames.length > 0 { tpIfMarkOk(n.letInit) }
+    const savedLitDest = litDestTyped
+    litDestTyped = annot >= 0
     initTy = checkNode(n.letInit)
+    litDestTyped = savedLitDest
   }
   // A `void` initializer has no value to bind — reject with a source-located message,
   // poisoning `initTy`. Exempted: an if-expression init, whose false path is implicit `null`.
@@ -58485,6 +58728,8 @@ function checkArrayLitNode(n: ArrayLit, _ix: i32) {
     elemTy = joinTys(elemTy, et)
     ei = ei + 1
   }
+  const tpEl = litElemTyParamApart(ets)
+  if tpEl >= 0 { elemTy = tpEl }
   // An f32 element beside literal ones types the list `f32[]`, as it does an `if` join.
   if (
     elemTy >= 0
@@ -58497,6 +58742,45 @@ function checkArrayLitNode(n: ArrayLit, _ix: i32) {
   }
   if neverValueSlotErr(elemTy, "a list element", elems[0]) { elemTy = TY_ERR }
   return mkArrayTy(elemTy)
+}
+
+// The element of a list literal whose elements are a declared type parameter beside concrete
+// types: their union, which each pin re-joins as the concrete literal would, since the collapse
+// to the parameter builds a sibling at the parameter's type (D3079). -1 for any other literal.
+function litElemTyParamApart(ets: i32[]): i32 {
+  if tpEnvNames.length == 0 || litDestTyped { return -1 }
+  let tv = -1
+  let c = -1
+  for et in ets {
+    if et < 0 || et == TY_ERR || isNullTy(et) { return -1 }
+    const t = T.tys[et]
+    let declared = false
+    if t is TyVar {
+      if t.tvName.length == 0 || t.tvName[0] == "?"[0] { return -1 }
+      declared = true
+    }
+    if declared {
+      if tv < 0 { tv = et }
+      else if !tyEq(tv, et) { return -1 }
+    } else {
+      if tyHasTyVar(et) { return -1 }
+      if c < 0 { c = et } else { c = joinTys(c, et) }
+      if c == TY_ERR { return -1 }
+    }
+  }
+  if tv < 0 || c < 0 { return -1 }
+  const j = joinVariantTys(tv, c)
+  // arena-tick exempt: a per-program mark on a fresh arena row.
+  tpJoinUnions[j] = 1
+  litJoinUnions[j] = 1
+  j
+}
+
+// Whether the list-literal join union `u`, substituted to `ms`, still names a type parameter: it
+// stays a union until a pin binds that one too, since re-joining now would absorb the concrete
+// members into the parameter.
+function litJoinStaysOpen(u: i32, ms: i32[]): boolean {
+  litJoinUnions.has(u) && tysHaveTyVarIn(ms)
 }
 
 // `[...a, e, ...b]` — the element type joins every plain element's type with every spread
