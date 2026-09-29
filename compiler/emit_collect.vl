@@ -194,6 +194,7 @@ import {
   mapNameKeyKind,
   mapValNameOf,
   monoAnnHasTyParam,
+  monoIsGenericDecl,
   nameIsBareMap,
   nameIsClosureArrayTy,
   nameIsF32Array,
@@ -813,6 +814,7 @@ import {
   synthTypeRefTy,
   tailIfNullableIsReal,
   tyAnnRefListSlot,
+  tyHasLitDeep,
   uFieldElemKeyKindAt,
   uFieldElemTyIxRow,
   uFieldRowKeyKind,
@@ -7396,6 +7398,7 @@ function collectAnonShapes() {
   // D1090 — marks the closure-typed binding it is delivered to, the same signature one
   // holder over (`anonLeafCloBindMark`).
   anonLeafCloBindMark()
+  anonGenArgBuilt = false
   let ai = 0
   while ai < P.nodes.length {
     const an = P.nodes[ai]
@@ -9927,6 +9930,69 @@ function anonLeafRecordSupersede(narrowSi: i32, mergedSi: i32) {
   0
 }
 
+// The object literals a call to a generic function receives by name, directly or through the
+// `const` it reads; a shadowing local's call is marked too, which only declines (D3123).
+let anonGenArgLit: {[i32]: boolean} = Map()
+let anonGenArgBuilt = false
+
+// Fills `anonGenArgLit` once per program, on the first map field that could need it: most
+// programs mint no such field, and three arena walks cost them fuel for nothing (D3123).
+function anonGenArgBuild() {
+  if anonGenArgBuilt { return 0 }
+  anonGenArgBuilt = true
+  anonGenArgLit = Map()
+  const genFns: {[string]: boolean} = Map()
+  let gi = 0
+  while gi < P.nodes.length {
+    const gd = P.nodes[gi]
+    if gd is FuncDecl {
+      if monoIsGenericDecl(gi) { genFns[gd.fnName] = true }
+    }
+    gi = gi + 1
+  }
+  const genVia: {[string]: boolean} = Map()
+  gi = 0
+  while genFns.length > 0 && gi < P.nodes.length {
+    const gc = P.nodes[gi]
+    if gc is Call {
+      const gcf = P.nodes[gc.callFn]
+      if gcf is Ident {
+        if genFns[gcf.identName] ?? false {
+          anonGenArgMarkArgs(gc.callArgs, genVia)
+        }
+      }
+    }
+    gi = gi + 1
+  }
+  gi = 0
+  while genVia.length > 0 && gi < P.nodes.length {
+    const gl = P.nodes[gi]
+    if gl is LetDecl {
+      if (genVia[gl.letName] ?? false) && gl.letInit >= 0 {
+        const gli = unwrapParen(gl.letInit)
+        if gli >= 0 && P.nodes[gli] is ObjLit { anonGenArgLit[gli] = true }
+      }
+    }
+    gi = gi + 1
+  }
+  0
+}
+
+// Marks each object-literal argument, and records each name argument for its `const`.
+function anonGenArgMarkArgs(args: i32[], viaName: {[string]: boolean}) {
+  let k = 0
+  while k < args.length {
+    const ax = unwrapParen(args[k])
+    if ax >= 0 {
+      const a = P.nodes[ax]
+      if a is ObjLit { anonGenArgLit[ax] = true }
+      if a is Ident { viaName[a.identName] = true }
+    }
+    k = k + 1
+  }
+  0
+}
+
 // Mint one anonymous struct row for the object literal at `objIx`. The body of
 // `collectAnonShapes`' main loop, extracted so the pre-mint pass mints a row the same
 // way rather than through a second copy of it — two mints that disagree would put two
@@ -9964,6 +10030,15 @@ function anonMintRowFor(objIx: i32) {
       if f is FieldInit {
         let code = anonFieldCode(f.fiValue)
         if code == FC_MAP && !anonMapFieldDestAdmits(ai, f.fiName) { code = -1 }
+        // A generic call pins its argument's row at the spelled shape, which softens a
+        // literal the row keeps, so such a map field stays uncoded (D3123).
+        if (
+          code == FC_MAP
+          && tyHasLitDeep(nodeTyIxOf(unwrapParen(f.fiValue)), 8)
+        ) {
+          anonGenArgBuild()
+          if anonGenArgLit.get(ai) ?? false { code = -1 }
+        }
         // D672 — a joined owner's field is a union box, not a nested ref: where two owner literals
         // disagree at a nested field and something joins them, the code is 16 (`anonNestPolyUnionName` gates it, "" elsewhere).
         const boxU = anonNestPolyUnionName(ai, f.fiName, unwrapParen(f.fiValue))
