@@ -691,6 +691,9 @@ const HD_COAL = 6
 // The VALUE of an indexed hole (`a[i]` read): `HD_ELEM`'s element at its value type, so a
 // `u8[]` pin reads `i32`. `HD_ELEM` itself stays the storage type, which a write checks (D2238).
 const HD_ELEMV = 7
+// Parameter `hdInner` of calling a hole as a function: what the pinned function takes there, so
+// an argument handed to a hole callee is re-asked at the pin (D3225).
+const HD_PARAM = 8
 let hdKind: i32[] = []
 let hdField: string[] = []
 let hdInner: i32[] = []
@@ -764,9 +767,15 @@ let argCstrExp: i32[] = []
 let argCstrWho: string[] = []
 // The owning declaration, for the by-name `TyVar` reason `noteBinCstr` stamps one (D2424).
 let argCstrFn: i32[] = []
-// Whether the demand is a template hole meeting its renderer, which also delivers a `string`
-// without the call (`tplHoleHandled`), so its domain is `string` plus the renderer's (D2241).
-let argCstrTpl: boolean[] = []
+// What the demand is: `ACF_PLAIN`, `ACF_TPL` (a template hole meeting its renderer, which also
+// delivers a `string` without the call, D2241), or N >= 1 for argument N of a call through a hole
+// callee, which the pin holds only to the scalar rule `holeArgScalarRefused` names (D3225).
+let argCstrForm: i32[] = []
+// A hole callee's argument node inside the body, or -1: what the pin asks the direct call's
+// question of when no argument of the pinning call binds it.
+let argCstrNode: i32[] = []
+const ACF_PLAIN = 0
+const ACF_TPL = -1
 
 // D401 — deferred `print` constraints over un-annotated-param and type-parameter holes.
 // `print` takes one value of `printDomainStr()`, and the two floors that say so
@@ -4677,7 +4686,8 @@ export function initChecker() {
   argCstrExp = []
   argCstrWho = []
   argCstrFn = []
-  argCstrTpl = []
+  argCstrNode = []
+  argCstrForm = []
   printCstrTy = []
   printCstrIx = []
   printCstrFn = []
@@ -16465,7 +16475,8 @@ function cstrTablesTruncate(m: i32[]) {
     argCstrExp.pop()
     argCstrWho.pop()
     argCstrFn.pop()
-    argCstrTpl.pop()
+    argCstrNode.pop()
+    argCstrForm.pop()
   }
   while nestCstrTy.length > m[1] {
     nestCstrTy.pop()
@@ -17201,7 +17212,7 @@ function genFnValueCstrsAt(srcExpr: i32, srcTy: i32, dstTy: i32, depth: i32) {
   validateBinCstrs(bNames, bTys, srcExpr, decl, who, noN, noNo, noNode)
   validatePrintCstrs(bNames, bTys, srcExpr, decl, who)
   validateNestCstrs(bNames, bTys, srcExpr, decl, who)
-  validateArgCstrs(bNames, bTys, srcExpr, decl)
+  validateArgCstrs(bNames, bTys, srcExpr, decl, noN, noNode)
   validateRetCstrs(bNames, bTys, srcExpr, decl, who)
   validateLetCstrs(bNames, bTys, srcExpr, decl, who)
   validateBmCstrs(bNames, bTys, srcExpr, decl, who)
@@ -33937,15 +33948,19 @@ function binOpDefinedFor(op: string, lt0: i32, rt0: i32) {
 }
 
 // Records a deferred call-argument constraint: hole-typed argument `at` flowed into the
-// concrete param type `exp` of callee `who`. Idempotent per `(at, exp)`. An `exp` still
-// carrying a hole is not recorded — after substitution at the inner call it can only be one
-// of the enclosing body's own holes, which surfaces through that hole's own bindings instead.
-function noteArgCstr(at: i32, exp: i32, who: string, tpl: boolean) {
+// concrete param type `exp` of callee `who`. Idempotent per `(at, exp)` and argument node, since
+// a literal and a value of one type answer apart. A deferred-join `exp` is not recorded; it
+// surfaces through the enclosing body's own hole bindings instead.
+function noteArgCstr(at: i32, exp: i32, who: string, form: i32, node: i32) {
   if tyIsDeferredJoin(exp) { return 0 }
   const owner = cstrOwnerTop()
   let k = 0
   while k < argCstrAt.length {
-    if argCstrFn[k] == owner && argCstrTpl[k] == tpl {
+    if (
+      argCstrFn[k] == owner
+      && argCstrForm[k] == form
+      && argCstrNode[k] == node
+    ) {
       if tyEqSameHoles(argCstrAt[k], at) && tyEqSameHoles(argCstrExp[k], exp) {
         return 0
       }
@@ -33956,15 +33971,95 @@ function noteArgCstr(at: i32, exp: i32, who: string, tpl: boolean) {
   argCstrExp.push(exp)
   argCstrWho.push(who)
   argCstrFn.push(owner)
-  argCstrTpl.push(tpl)
+  argCstrNode.push(node)
+  argCstrForm.push(form)
   0
 }
 
 // Whether a resolved argument demand holds: `rat` fits `rexp`, or the demand is a template
-// hole's and `rat` is a string, which the hole delivers without its renderer.
-function argCstrFits(rat: i32, rexp: i32, tpl: boolean) {
-  if tpl && isStringTy(softenLitTy(rat)) { return true }
+// hole's and `rat` is a string, which the hole delivers without its renderer. A hole callee's
+// argument with no origin node is held to the scalar rule alone: its type cannot say literal.
+function argCstrFits(rat: i32, rexp: i32, form: i32) {
+  if form == ACF_TPL && isStringTy(softenLitTy(rat)) { return true }
+  if form > 0 { return !holeArgScalarRefused(rat, rexp) }
   assignable(rat, rexp)
+}
+
+// `argCstrFits` for demand `ci` at a pin that knows its argument nodes: a hole callee's scalar
+// argument whose origin node is known is asked the direct call's own question of that node, so
+// a literal adopts the parameter's width and a `boolean` literal is refused as it is directly.
+function argCstrFitsAt(
+  rat: i32,
+  rexp: i32,
+  ci: i32,
+  hNames: string[],
+  hArgNode: i32[],
+) {
+  const form = argCstrForm[ci]
+  if form <= 0 { return argCstrFits(rat, rexp, form) }
+  const org = holeArgOriginNode(ci, hNames, hArgNode)
+  if org < 0 || !scalarPrimPair(rat, rexp) {
+    return argCstrFits(rat, rexp, form)
+  }
+  const savedQuiet = inferQuiet
+  inferQuiet = true
+  const ok = assignableExpr(org, rat, rexp)
+  inferQuiet = savedQuiet
+  ok
+}
+
+// The node demand `ci`'s argument came from: the call's argument for a parameter hole this call
+// binds, else the argument expression the demand carries (-1 for a hole moved out to a caller).
+function holeArgOriginNode(ci: i32, hNames: string[], hArgNode: i32[]): i32 {
+  const at = argCstrAt[ci]
+  if at < 0 || at >= T.tys.length { return -1 }
+  const t = T.tys[at]
+  if t is TyVar {
+    let k = 0
+    while k < hNames.length && k < hArgNode.length {
+      if hNames[k] == t.tvName { return hArgNode[k] }
+      k = k + 1
+    }
+  }
+  if ci < 0 || ci >= argCstrNode.length { return -1 }
+  argCstrNode[ci]
+}
+
+// Whether `a` and `b` are two different unbranded primitives `holeArgScalarRefused` decides over.
+function scalarPrimPair(a: i32, b: i32): boolean {
+  const st = softenLitTy(a)
+  if nomNameOfTy(st) != "" || nomNameOfTy(b) != "" { return false }
+  const sn = primNameOf(st)
+  const dn = primNameOf(b)
+  scalarPrimName(sn) && scalarPrimName(dn) && sn != dn
+}
+
+// Whether a scalar argument `rat` handed to a hole callee whose pinned parameter is scalar
+// `rexp` is one no spelling of the direct call admits: two unbranded primitives that differ,
+// where neither a widening, the `boolean`-into-`i32` coercion, nor a literal's adoption of
+// the parameter's width (an integer into `f32`/`f64`/`i64`, a float into `f32`) could fit it.
+function holeArgScalarRefused(rat: i32, rexp: i32): boolean {
+  if !scalarPrimPair(rat, rexp) { return false }
+  const sn = primNameOf(softenLitTy(rat))
+  const dn = primNameOf(rexp)
+  if numWidensName(sn, dn) { return false }
+  !strListHas(HOLE_ARG_FIT_PAIRS, primNameStr(sn) + ">" + primNameStr(dn))
+}
+
+// The scalar pairs beyond the widenings some spelling of a direct call admits: the `boolean`
+// value coercion, and a literal adopting its parameter's width.
+const HOLE_ARG_FIT_PAIRS = [
+  "boolean>i32", "i32>f32", "i32>i64", "i64>f32", "i64>f64", "f64>f32",
+]
+
+// The primitives `holeArgScalarRefused` decides over; any other name defers to the emitter.
+function scalarPrimName(n: PrimName | null): boolean {
+  n == "i32"
+    || n == "i64"
+    || n == "f32"
+    || n == "f64"
+    || n == "boolean"
+    || n == "string"
 }
 
 // Records a deferred `print` constraint when the printed type still carries a hole, so the
@@ -34245,7 +34340,8 @@ function solveUnannotParams(fnIx: i32) {
       argCstrExp.pop()
       argCstrWho.pop()
       argCstrFn.pop()
-      argCstrTpl.pop()
+      argCstrNode.pop()
+      argCstrForm.pop()
     }
     while printCstrTy.length > savedPrintN {
       printCstrTy.pop()
@@ -34357,7 +34453,23 @@ function validateEscJoins(bNames: string[], bTys: i32[], calleeFn: i32) {
 // Raises demand `ci`'s refusal at call `ix`, in the direct spelling's words: a template
 // hole's is `tplHoleHandled`'s sentence, any other names the callee.
 function argCstrErr(rat: i32, rexp: i32, ci: i32, ix: i32) {
-  if argCstrTpl[ci] {
+  if argCstrForm[ci] > 0 {
+    let callee = "a function value"
+    if argCstrWho[ci] != "" { callee = "`" + argCstrWho[ci] + "`" }
+    return tErr(
+      "argument "
+        + i32ToStr(argCstrForm[ci])
+        + ": expected "
+        + tyToStr(rexp)
+        + ", got "
+        + tyToStr(rat)
+        + " (the call of "
+        + callee
+        + " at the call's argument types)",
+      ix,
+    )
+  }
+  if argCstrForm[ci] == ACF_TPL {
     return tErr(
       "an interpolation hole is `string` or "
         + tyToStr(rexp)
@@ -34389,6 +34501,8 @@ function validateArgCstrs(
   bTys: i32[],
   ix: i32,
   calleeFn: i32,
+  hNames: string[],
+  hArgNode: i32[],
 ) {
   const nOrig = argCstrAt.length
   let ci = 0
@@ -34402,15 +34516,24 @@ function validateArgCstrs(
     if rat != argCstrAt[ci] && calleeFn >= 0 {
       if tyIsHole(rat) || tyIsDeferredJoin(rat) {
         if !tyIsHole(rexp) {
-          noteArgCstr(rat, rexp, argCstrWho[ci], argCstrTpl[ci])
+          noteArgCstr(rat, rexp, argCstrWho[ci], argCstrForm[ci], -1)
         }
+      }
+    }
+    // A hole callee's parameter still unpinned here moves out to the caller's hole with its
+    // argument, whichever side this call resolved.
+    if calleeFn >= 0 && argCstrForm[ci] > 0 && hdKindIs(rexp, HD_PARAM) {
+      if rat != argCstrAt[ci] || rexp != argCstrExp[ci] {
+        let mvNode = -1
+        if !tyIsHole(rat) { mvNode = holeArgOriginNode(ci, hNames, hArgNode) }
+        noteArgCstr(rat, rexp, argCstrWho[ci], argCstrForm[ci], mvNode)
       }
     }
     // A side still carrying a hole — bare, or as a deferred-join arm — is undecided at this
     // site and defers to the call that pins it.
     if !tyIsHole(rat) && !tyIsDeferredJoin(rat) {
       if !tyIsHole(rexp) && !tyIsDeferredJoin(rexp) {
-        if !argCstrFits(rat, rexp, argCstrTpl[ci]) {
+        if !argCstrFitsAt(rat, rexp, ci, hNames, hArgNode) {
           argCstrErr(rat, rexp, ci, ix)
         }
       }
@@ -35067,7 +35190,7 @@ function argCstrsHold(bNames: string[], bTys: i32[]) {
     const rexp = substTyDeep(argCstrExp[ci], bNames, bTys)
     if !tyIsHole(rat) && !tyIsDeferredJoin(rat) {
       if !tyIsHole(rexp) && !tyIsDeferredJoin(rexp) {
-        if !argCstrFits(rat, rexp, argCstrTpl[ci]) { return false }
+        if !argCstrFits(rat, rexp, argCstrForm[ci]) { return false }
       }
     }
     ci = ci + 1
@@ -35361,6 +35484,12 @@ function mkGuardedRetTy(t: i32) {
   g
 }
 
+// Whether arena type `tyIx` is a derived hole of kind `kind`.
+function hdKindIs(tyIx: i32, kind: i32): boolean {
+  const r = hdRowOf(tyIx)
+  r >= 0 && hdKind[r] == kind
+}
+
 // The derivation row of an arena type, or -1 when it is not a derived hole.
 function hdRowOf(tyIx: i32) {
   if tyIx < 0 { return -1 }
@@ -35391,6 +35520,7 @@ function hdRenderName(
   if kind == HD_RET { return "?ret." + baseName }
   if kind == HD_ELEM { return "?elem." + baseName }
   if kind == HD_ELEMV { return "?elemv." + baseName }
+  if kind == HD_PARAM { return "?arg." + field + "." + baseName }
   // The fallback type rides the name, like the guarded form's two arena indices: two sites
   // over the same hole reaching different no-dispatch answers are different holes.
   if kind == HD_BINOP {
@@ -35826,6 +35956,18 @@ function substHoleTyReal(tyIx: i32, bNames: string[], bTys: i32[]) {
       return rebaseDerivedHole(row, inner)
     }
     return -1
+  }
+  // A parameter of calling the hole: the pinned function's own, -1 past its arity.
+  if kind == HD_PARAM {
+    const innerP = substHoleTy(hdBase[row], bNames, bTys)
+    if innerP < 0 { return -1 }
+    const itP = T.tys[innerP]
+    if itP is TyFunc {
+      const pj = hdInner[row]
+      if pj >= 0 && pj < itP.fnParamTypes.length { return itP.fnParamTypes[pj] }
+      return -1
+    }
+    return rebaseDerivedHole(row, innerP)
   }
   // A deferred binary-op result (`mkBinOpRetTy`): an object pin with a `self`-function
   // overload takes the overload's return type; every other pin keeps the body's own answer, mirroring `checkBinExprNode`'s dispatch arm exactly, including its `is TyObj` gate.
@@ -38369,7 +38511,14 @@ function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
         )
         // A call argument inside the body, at the UFCS half for the same symmetry: `"s".inc()`
         // and `inc("s")` must answer the same way (D2425).
-        validateArgCstrs(bNames, bTys, ix, fnDeclIx[name] ?? CSTR_NODECL)
+        validateArgCstrs(
+          bNames,
+          bTys,
+          ix,
+          fnDeclIx[name] ?? CSTR_NODECL,
+          uhNames,
+          uhArgNode,
+        )
         // The declared return, at the UFCS half for the same symmetry: `p.g()` and `g(p)`
         // must answer the same way, or the method spelling of D551's family stays silent beside a loud direct one.
         validateRetCstrs(
@@ -39836,7 +39985,9 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
       if !tyIsHole(expected) {
         let ccWho = ""
         if cfn is Ident { ccWho = cfn.identName }
-        noteArgCstr(atCstr, expected, ccWho, nodeIsTplHole(args[i]))
+        let acForm = ACF_PLAIN
+        if nodeIsTplHole(args[i]) { acForm = ACF_TPL }
+        noteArgCstr(atCstr, expected, ccWho, acForm, -1)
       }
     }
     // A hole param whose body DEMANDED fields (member access on the hole)
@@ -39937,7 +40088,7 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
     validatePrintCstrs(vNames, vTys, ix, cstrCallee, cstrWho)
     validateNestCstrs(vNames, vTys, ix, cstrCallee, cstrWho)
     validateIsCstrs(vNames, vTys, ix, cstrCallee, cstrWho)
-    validateArgCstrs(vNames, vTys, ix, cstrCallee)
+    validateArgCstrs(vNames, vTys, ix, cstrCallee, dhNames, dhArgNode)
     // The declared return rides the same pin: the body's mismatch check is vacuous under
     // a hole, and this is the first position that knows the instance (D551).
     validateRetCstrs(vNames, vTys, ix, cstrCallee, cstrWho)
@@ -40384,9 +40535,16 @@ function checkCallNode(n: Call, ix: i32) {
     // checked on their own and the call yields a fresh hole, resolved once an outer call
     // binds the generic signature (the emitter compiles each instance concretely).
     const hargs = n.callArgs
+    let hWho = ""
+    if cfn is Ident { hWho = cfn.identName }
     let hj = 0
     while hj < hargs.length {
-      checkNode(hargs[hj])
+      const hat = checkNode(hargs[hj])
+      // What the pinned function takes here, demanded of the argument at the pin (D3225).
+      const hexp = mkDerivedHole(HD_PARAM, i32ToStr(hj), hj, -1, fnTy)
+      if hat >= 0 && hexp >= 0 {
+        noteArgCstr(hat, hexp, hWho, hj + 1, hargs[hj])
+      }
       hj = hj + 1
     }
     return mkDerivedHole(HD_RET, "", -1, -1, fnTy)
