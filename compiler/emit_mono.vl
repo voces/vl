@@ -41,6 +41,7 @@ import {
   bindGenUnionArmInto,
   bindGenWalk,
   blockHasBareReturn,
+  cUserTypes,
   canonEmitName,
   collectValuedReturns,
   flatConstOfNameProp,
@@ -89,6 +90,7 @@ import {
   tyBearsNull,
   tyEq,
   tyExcludesNull,
+  tyFieldTyOf,
   tyHasTyVar,
   tyHasTyVarWasCapped,
   tyIsLitUnion,
@@ -356,6 +358,7 @@ import {
   tyCanonKey,
   tyHasLitDeep,
   tyNulFuncInner,
+  tyReachesFuncD,
   unRowOfCanon,
   unionArmsOf,
   variantIndexOf,
@@ -1037,6 +1040,44 @@ function monoSpelledShapeStaysAnon(sp: string): boolean {
   if si < 0 || si >= sNames.length { return true }
   const nm = sNames[si]
   nm.length >= 5 && nm.slice(0, 5) == "#anon"
+}
+
+// Composite annotation `ann` substituted with each `#anonN` binding spelled by its row's shape,
+// where that shape resolves back to the same row, else `pinC`. A handle inside a record spelling
+// resolves to nothing, and the field-set scan then claims a declared record (D3144).
+function monoSubstAnonShapes(
+  ann: string,
+  typarams: string[],
+  tvN: string[],
+  tvV: string[],
+  pinC: string,
+): string {
+  const vs: string[] = []
+  let changed = false
+  let i = 0
+  while i < tvV.length {
+    let v = tvV[i]
+    if v.length >= 5 && v.slice(0, 5) == "#anon" {
+      const rt = anonHandleTyIx(v)
+      if rt >= 0 && !tyHasTyVar(rt) {
+        const sp = tyToEmitName(rt)
+        if (
+          sp != ""
+          && monoSpelledShapeStaysAnon(sp)
+          && structIndexOfTypeName(sp) == structIndexOfTypeName(v)
+        ) {
+          v = sp
+          changed = true
+        }
+      }
+    }
+    vs.push(v)
+    i = i + 1
+  }
+  if !changed { return pinC }
+  const sub = monoSubstAnn(ann, typarams, tvN, vs)
+  if sub == "" { return pinC }
+  sub
 }
 
 // Whether the spelled shape of record argument `argIx`, typed `ty`, loses a literal: a literal
@@ -6096,11 +6137,16 @@ function monoConcreteObjTy(ty: i32): boolean {
 // `monoObjDiffersInFnFieldsOnly`), to the row's handle, so a pin spelled from it names that row.
 let monoFnFieldTwinRow: {[i32]: string} = Map()
 
-// Whether concrete record `a` and record `b` name the same fields in order, and every field on
-// which their types differ is a function type in `a` and a function type or a hole in `b`, with
-// at least one such field. A row a hole parameter registered first holds `_` there (D3142).
+// Whether concrete record `a` and record `b` name the same fields, in any order, and every field
+// on which their types differ is a function type in `a` against a function type or a hole in
+// `b`, a record differing so in turn, or anything against a bare hole in `b`, with at least one
+// such field reaching a function. A hole parameter's row holds `_` at each field read (D3175).
 function monoObjDiffersInFnFieldsOnly(a: i32, b: i32): boolean {
-  if !monoConcreteObjTy(a) || b < 0 || a == b { return false }
+  monoObjDiffersInFnFieldsAt(a, b, 4)
+}
+
+function monoObjDiffersInFnFieldsAt(a: i32, b: i32, depth: i32): boolean {
+  if depth <= 0 || !monoConcreteObjTy(a) || b < 0 || a == b { return false }
   const ta = T.tys[a]
   const tb = T.tys[b]
   if !(ta is TyObj) || !(tb is TyObj) { return false }
@@ -6112,14 +6158,19 @@ function monoObjDiffersInFnFieldsOnly(a: i32, b: i32): boolean {
   let differs = false
   let i = 0
   while i < n {
-    if ta.objFieldNames[i] != tb.objFieldNames[i] { return false }
     const fa = ta.objFieldTypes[i]
-    const fb = tb.objFieldTypes[i]
+    const fb = tyFieldTyOf(b, ta.objFieldNames[i])
+    if fa < 0 || fb < 0 { return false }
     if !tyEq(fa, fb) {
-      if fa < 0 || fb < 0 { return false }
-      if !(T.tys[fa] is TyFunc) { return false }
-      if !(T.tys[fb] is TyFunc) && !(T.tys[fb] is TyVar) { return false }
-      differs = true
+      if T.tys[fb] is TyVar {
+        if tyReachesFuncD(fa, 12) { differs = true }
+      } else if T.tys[fa] is TyFunc && T.tys[fb] is TyFunc {
+        differs = true
+      } else if monoObjDiffersInFnFieldsAt(fa, fb, depth - 1) {
+        differs = true
+      } else {
+        return false
+      }
     } else if tyHasTyVar(fb) {
       return false
     }
@@ -6128,12 +6179,24 @@ function monoObjDiffersInFnFieldsOnly(a: i32, b: i32): boolean {
   differs
 }
 
-// D988 — the key suffix an anonymous-shape pin needs, or "" for every other pin. A hole
-// parameter pins the argument's type name, and two object literals with the same field
-// names share one synthetic row whatever their field types are, so both key the same
+// The declared record type pin `pin` names where record `ty` differs from it only in function
+// fields, or -1. A literal claims a declared record by its field names, so an instance keyed and
+// bound by that name alone would call the declared record's closures at their types (D3177).
+function monoDeclFnFieldTwin(pin: string, ty: i32): i32 {
+  const dt = cUserTypes[pin] ?? -1
+  if dt < 0 || !monoObjDiffersInFnFieldsOnly(ty, dt) { return -1 }
+  dt
+}
+
+// D988 — the key suffix an anonymous-shape pin, or a declared-record twin, needs; "" for every
+// other pin. A hole parameter pins the argument's type name, and two object literals with the
+// same field names share one synthetic row whatever their field types are, so both key the same
 // instance. The rendering is the right grain — keying on the type index mints per site.
 function monoAnonPinDiscrim(pin: string, tyIx: i32): string {
   if tyIx < 0 { return "" }
+  if monoDeclFnFieldTwin(pin, tyIx) >= 0 {
+    return "=" + tyCanonKey(tyIx, TY_WALK_DEPTH)
+  }
   if pin.length < 5 { return "" }
   if pin[0] != "#"[0] { return "" }
   const rendered = tyToEmitName(tyIx)
@@ -6771,6 +6834,12 @@ function monoMakeInstance(
         // instance key already tells them apart) binds its own, or every callee typed from
         // the binding reads the row's first signature (D3110).
         if anonTy >= 0 && monoObjDiffersInFnFieldsOnly(pinTys[pj], anonTy) {
+          pinTy = pinTys[pj]
+          monoFnFieldTwinRow.set(pinTy, pinned[pj])
+        } else if (
+          anonTy < 0
+          && monoDeclFnFieldTwin(pinned[pj], pinTys[pj]) >= 0
+        ) {
           pinTy = pinTys[pj]
           monoFnFieldTwinRow.set(pinTy, pinned[pj])
         }
@@ -8390,6 +8459,9 @@ function monoInstantiateCall(origFe: i32, callIx: i32, ctx: i32) {
                   pinC = monoUnionRestPin[i]
                 }
                 if anRowPin != "" && pinC != "" { pinC = anRowPin }
+                if anRowPin == "" && pinC != "" {
+                  pinC = monoSubstAnonShapes(ann, fn.fnTyParams, tvN, tvV, pinC)
+                }
                 if pinC == "" {
                   return emitFail(
                     "emitProgram: monomorphize: unsupported argument type for `"
