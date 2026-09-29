@@ -691,9 +691,6 @@ const HD_COAL = 6
 // The VALUE of an indexed hole (`a[i]` read): `HD_ELEM`'s element at its value type, so a
 // `u8[]` pin reads `i32`. `HD_ELEM` itself stays the storage type, which a write checks (D2238).
 const HD_ELEMV = 7
-// Parameter `hdInner` (its index; `hdField` renders it) of calling a hole as a function: what the pinned
-// function takes there, so an argument handed to a hole callee is re-asked at the pin (D3171).
-const HD_PARAM = 8
 let hdKind: i32[] = []
 let hdField: string[] = []
 let hdInner: i32[] = []
@@ -34409,17 +34406,9 @@ function validateArgCstrs(
         }
       }
     }
-    // A hole callee's parameter still unpinned here moves out to the caller's hole with its
-    // argument, whichever side this call resolved.
-    if calleeFn >= 0 && hdKindIs(rexp, HD_PARAM) {
-      if rat != argCstrAt[ci] || rexp != argCstrExp[ci] {
-        noteArgCstr(rat, rexp, argCstrWho[ci], argCstrTpl[ci])
-      }
-    }
     // A side still carrying a hole — bare, or as a deferred-join arm — is undecided at this
-    // site and defers to the call that pins it, as is a pinned function's own type parameter.
-    const pinTp = hdKindIs(argCstrExp[ci], HD_PARAM) && tyHasTyVar(rexp)
-    if !tyIsHole(rat) && !tyIsDeferredJoin(rat) && !pinTp {
+    // site and defers to the call that pins it.
+    if !tyIsHole(rat) && !tyIsDeferredJoin(rat) {
       if !tyIsHole(rexp) && !tyIsDeferredJoin(rexp) {
         if !argCstrFits(rat, rexp, argCstrTpl[ci]) {
           argCstrErr(rat, rexp, ci, ix)
@@ -35372,92 +35361,6 @@ function mkGuardedRetTy(t: i32) {
   g
 }
 
-// The type an argument handed to a hole callee is held to at the pin: a literal written in the
-// argument keeps its literal type, as a direct call's parameter context types it (`h("a")` fits
-// `K`), and anything else its checked type — a binding is already at its base type (D3171).
-function holeCalleeArgTy(argIx: i32, checked: i32): i32 {
-  const lt = ctxLitTyOf(argIx, 0)
-  if lt >= 0 { return lt }
-  inferRetTyOf(argIx, checked)
-}
-
-// The literal type of a literal expression, a list literal or a record literal with one or more
-// literal leaves, the other leaves at their checked types; -1 when the tree holds no literal.
-function ctxLitTyOf(ix: i32, depth: i32): i32 {
-  if ix < 0 || ix >= P.nodes.length || depth > 8 { return -1 }
-  const px = parenPeelIx(ix)
-  if px < 0 || px >= P.nodes.length { return -1 }
-  const lt = litTyOfExpr(px)
-  if lt >= 0 { return lt }
-  if P.nodes[px] is NullLit { return TY_NULL }
-  const at = ctxLitListTyOf(px, depth)
-  if at >= 0 { return at }
-  ctxLitRecordTyOf(px, depth)
-}
-
-// `ctxLitTyOf` of a list literal `ix`: its elements' types joined, -1 for any other node.
-function ctxLitListTyOf(ix: i32, depth: i32): i32 {
-  const e = P.nodes[ix]
-  if !(e is ArrayLit) { return -1 }
-  const els: i32[] = []
-  let any = false
-  let i = 0
-  while i < e.arrElems.length {
-    const el = e.arrElems[i]
-    if P.nodes[el] is Spread { return -1 }
-    let t = ctxLitTyOf(el, depth + 1)
-    if t >= 0 { any = true } else { t = nodeTyIxOf(el) }
-    if t < 0 { return -1 }
-    pushDistinctVariantTy(els, t)
-    i = i + 1
-  }
-  if !any || els.length == 0 { return -1 }
-  mkArrayTy(ctxLitElemTy(els))
-}
-
-// The element type of a list literal whose element types are `els`: a `null` among them wraps
-// the others, as `[x, null]` types `X | null` in a direct call's parameter context.
-function ctxLitElemTy(els: i32[]): i32 {
-  const rest: i32[] = []
-  let sawNull = false
-  let i = 0
-  while i < els.length {
-    if els[i] == TY_NULL { sawNull = true } else { rest.push(els[i]) }
-    i = i + 1
-  }
-  if !sawNull || rest.length == 0 { return tyOfMembers(els) }
-  if rest.length == 1 { return mkNullableTy(rest[0]) }
-  mkNullableTy(mkUnionTy(rest))
-}
-
-// `ctxLitTyOf` of a record literal `ix`: its fields at their types, -1 for any other node.
-function ctxLitRecordTyOf(ix: i32, depth: i32): i32 {
-  const e = P.nodes[ix]
-  if !(e is ObjLit) { return -1 }
-  const names: string[] = []
-  const tys: i32[] = []
-  let anyF = false
-  let f = 0
-  while f < e.objFields.length {
-    const fi = P.nodes[e.objFields[f]]
-    if !(fi is FieldInit) { return -1 }
-    let ft = ctxLitTyOf(fi.fiValue, depth + 1)
-    if ft >= 0 { anyF = true } else { ft = nodeTyIxOf(fi.fiValue) }
-    if ft < 0 { return -1 }
-    names.push(fi.fiName)
-    tys.push(ft)
-    f = f + 1
-  }
-  if !anyF { return -1 }
-  mkObjTy(names, tys)
-}
-
-// Whether arena type `tyIx` is a derived hole of kind `kind`.
-function hdKindIs(tyIx: i32, kind: i32): boolean {
-  const r = hdRowOf(tyIx)
-  r >= 0 && hdKind[r] == kind
-}
-
 // The derivation row of an arena type, or -1 when it is not a derived hole.
 function hdRowOf(tyIx: i32) {
   if tyIx < 0 { return -1 }
@@ -35488,7 +35391,6 @@ function hdRenderName(
   if kind == HD_RET { return "?ret." + baseName }
   if kind == HD_ELEM { return "?elem." + baseName }
   if kind == HD_ELEMV { return "?elemv." + baseName }
-  if kind == HD_PARAM { return "?arg." + field + "." + baseName }
   // The fallback type rides the name, like the guarded form's two arena indices: two sites
   // over the same hole reaching different no-dispatch answers are different holes.
   if kind == HD_BINOP {
@@ -35924,18 +35826,6 @@ function substHoleTyReal(tyIx: i32, bNames: string[], bTys: i32[]) {
       return rebaseDerivedHole(row, inner)
     }
     return -1
-  }
-  // A parameter of calling the hole: the pinned function's own, -1 past its arity.
-  if kind == HD_PARAM {
-    const innerP = substHoleTy(hdBase[row], bNames, bTys)
-    if innerP < 0 { return -1 }
-    const itP = T.tys[innerP]
-    if itP is TyFunc {
-      const pj = hdInner[row]
-      if pj >= 0 && pj < itP.fnParamTypes.length { return itP.fnParamTypes[pj] }
-      return -1
-    }
-    return rebaseDerivedHole(row, innerP)
   }
   // A deferred binary-op result (`mkBinOpRetTy`): an object pin with a `self`-function
   // overload takes the overload's return type; every other pin keeps the body's own answer, mirroring `checkBinExprNode`'s dispatch arm exactly, including its `is TyObj` gate.
@@ -40494,16 +40384,9 @@ function checkCallNode(n: Call, ix: i32) {
     // checked on their own and the call yields a fresh hole, resolved once an outer call
     // binds the generic signature (the emitter compiles each instance concretely).
     const hargs = n.callArgs
-    let hWho = ""
-    if cfn is Ident { hWho = cfn.identName }
     let hj = 0
     while hj < hargs.length {
-      const hat = checkNode(hargs[hj])
-      // What the pinned function takes here, demanded of the argument at the pin (D3171).
-      const hexp = mkDerivedHole(HD_PARAM, i32ToStr(hj), hj, -1, fnTy)
-      if hat >= 0 && hexp >= 0 {
-        noteArgCstr(holeCalleeArgTy(hargs[hj], hat), hexp, hWho, false)
-      }
+      checkNode(hargs[hj])
       hj = hj + 1
     }
     return mkDerivedHole(HD_RET, "", -1, -1, fnTy)
