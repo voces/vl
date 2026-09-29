@@ -944,6 +944,14 @@ let paramSolveTried: {[string]: boolean} = Map()
 let holeFlowSrc: i32[] = []
 let holeFlowDst: i32[] = []
 let paramSolveProbe = false
+// Set while pass 1.9 walks a generic body only to record its deferred constraints, so the
+// walk takes no memo and patches no return (`cstrPrePass`).
+let cstrProbe = false
+// The top-level generic declarations by name, and each one's walk state (0 unprobed, 1 on the
+// walk, 2 placed); `cstrCandAny` is false when there are none (`cstrPrePass`).
+let cstrCandIx: {[string]: i32} = Map()
+let cstrCandState: {[string]: i32} = Map()
+let cstrCandAny = false
 
 // The const-binding chain, parallel to `T.scopes`: each frame records which of its names carry
 // `const` — an immutable name, not immutable data, so a field write through a const stays
@@ -4715,6 +4723,10 @@ export function initChecker() {
   holeFlowSrc = []
   holeFlowDst = []
   paramSolveProbe = false
+  cstrProbe = false
+  cstrCandIx = Map()
+  cstrCandState = Map()
+  cstrCandAny = false
   fnDeclIx = Map()
   memSharedCalls = []
   asgStoreTys = []
@@ -32516,8 +32528,13 @@ function noteRetCstr(got: i32, want: i32, ix: i32) {
     const owner = cstrOwnerTop()
     let k = 0
     while k < retCstrGot.length {
-      if retCstrGot[k] == got && retCstrWant[k] == want {
-        if retCstrFn[k] == owner { return 0 }
+      if retCstrFn[k] == owner {
+        if (
+          tyEqSameHoles(retCstrGot[k], got)
+          && tyEqSameHoles(retCstrWant[k], want)
+        ) {
+          return 0
+        }
       }
       k = k + 1
     }
@@ -32539,8 +32556,13 @@ function noteLetCstr(got: i32, want: i32, ix: i32, name: string) {
     const owner = cstrOwnerTop()
     let k = 0
     while k < letCstrGot.length {
-      if letCstrGot[k] == got && letCstrWant[k] == want {
-        if letCstrFn[k] == owner { return 0 }
+      if letCstrFn[k] == owner {
+        if (
+          tyEqSameHoles(letCstrGot[k], got)
+          && tyEqSameHoles(letCstrWant[k], want)
+        ) {
+          return 0
+        }
       }
       k = k + 1
     }
@@ -32743,8 +32765,17 @@ function noteBmCstr(
     const owner = cstrOwnerTop()
     let k = 0
     while k < bmCstrGot.length {
-      if bmCstrGot[k] == got && bmCstrWant[k] == want && bmCstrForm[k] == form {
-        if bmCstrFn[k] == owner && bmCstrLabel[k] == label { return 0 }
+      if (
+        bmCstrFn[k] == owner
+        && bmCstrForm[k] == form
+        && bmCstrLabel[k] == label
+      ) {
+        if (
+          tyEqSameHoles(bmCstrGot[k], got)
+          && tyEqSameHoles(bmCstrWant[k], want)
+        ) {
+          return 0
+        }
       }
       k = k + 1
     }
@@ -33338,8 +33369,8 @@ function noteMemCstr(recv: i32, prop: string, ix: i32, dem: boolean) {
     const owner = cstrOwnerTop()
     let k = 0
     while k < memCstrTy.length {
-      if memCstrTy[k] == recv && memCstrProp[k] == prop {
-        if memCstrFn[k] == owner { return 0 }
+      if memCstrFn[k] == owner && memCstrProp[k] == prop {
+        if tyEqSameHoles(memCstrTy[k], recv) { return 0 }
       }
       k = k + 1
     }
@@ -33362,8 +33393,12 @@ function noteUfcsCstr(recv: i32, prop: string, ix: i32, p0: i32) {
     const owner = cstrOwnerTop()
     let k = 0
     while k < ufcsCstrTy.length {
-      if ufcsCstrTy[k] == recv && ufcsCstrProp[k] == prop {
-        if ufcsCstrFn[k] == owner && ufcsCstrP0[k] == p0 {
+      if (
+        ufcsCstrFn[k] == owner
+        && ufcsCstrProp[k] == prop
+        && ufcsCstrP0[k] == p0
+      ) {
+        if tyEqSameHoles(ufcsCstrTy[k], recv) {
           if ix != ufcsCstrIx[k] && !i32ListHas(ufcsCstrMore[k], ix) {
             ufcsCstrMore[k].push(ix)
           }
@@ -33592,8 +33627,10 @@ function noteArgCstr(at: i32, exp: i32, who: string, tpl: boolean) {
   const owner = cstrOwnerTop()
   let k = 0
   while k < argCstrAt.length {
-    if argCstrAt[k] == at && argCstrExp[k] == exp && argCstrFn[k] == owner {
-      if argCstrTpl[k] == tpl { return 0 }
+    if argCstrFn[k] == owner && argCstrTpl[k] == tpl {
+      if tyEqSameHoles(argCstrAt[k], at) && tyEqSameHoles(argCstrExp[k], exp) {
+        return 0
+      }
     }
     k = k + 1
   }
@@ -33622,8 +33659,8 @@ function notePrintCstr(pt: i32, argIx: i32) {
     const owner = cstrOwnerTop()
     let k = 0
     while k < printCstrTy.length {
-      if printCstrTy[k] == pt && printCstrIx[k] == argIx {
-        if printCstrFn[k] == owner { return 0 }
+      if printCstrFn[k] == owner && printCstrIx[k] == argIx {
+        if tyEqSameHoles(printCstrTy[k], pt) { return 0 }
       }
       k = k + 1
     }
@@ -40475,6 +40512,151 @@ function inferReturnsPrePass() {
   0
 }
 
+// Every deferred-constraint row recorded so far, over all nine tables. A stable count
+// means no table moved.
+function cstrRowCount(): i32 {
+  binCstrOp.length
+    + argCstrAt.length
+    + printCstrTy.length
+    + nestCstrTy.length
+    + retCstrGot.length
+    + letCstrGot.length
+    + bmCstrGot.length
+    + memCstrTy.length
+    + ufcsCstrTy.length
+}
+
+// Whether top-level declaration `ix` can own a constraint a call site adjudicates: it
+// declares a type parameter, or the hoist left one of its parameters a hole.
+function cstrProbeCandidate(ix: i32): boolean {
+  const fd = P.nodes[ix]
+  if fd is FuncDecl {
+    if (fnDeclIx[fd.fnName] ?? -1) != ix { return false }
+    if fd.fnTyParams.length > 0 { return true }
+    const h = lookup(fd.fnName)
+    if h < 0 { return false }
+    const ht = T.tys[h]
+    if ht is TyFunc {
+      for pt in ht.fnParamTypes {
+        if pt >= 0 && tyHasHole(pt) { return true }
+      }
+    }
+  }
+  false
+}
+
+// Visits every not-yet-probed candidate the subtree at `root` names, each after the
+// candidates its own body names, appending them to `order`. A candidate's state is 1 on the
+// walk and 2 when placed; a name met at 1 is a cycle, and the result says whether it met one.
+function cstrProbeWalk(root: i32, order: i32[]): boolean {
+  let cyc = false
+  const stack: i32[] = [root]
+  while stack.length > 0 {
+    const at = stack.pop() ?? -1
+    if at >= 0 && at < P.nodes.length {
+      const an = P.nodes[at]
+      let named = ""
+      if an is Ident { named = an.identName }
+      if an is Member { named = an.memProp }
+      if named != "" {
+        const cix = cstrCandIx[named] ?? -1
+        if cix >= 0 {
+          const st = cstrCandState[named] ?? 0
+          if st == 1 { cyc = true }
+          if st == 0 {
+            if cstrProbeVisit(cix, order) { cyc = true }
+          }
+        }
+      }
+      for k in nodeChildren(at) { stack.push(k) }
+    }
+  }
+  cyc
+}
+
+// Places candidate `ix` after the candidates its body names.
+function cstrProbeVisit(ix: i32, order: i32[]): boolean {
+  const fd = P.nodes[ix]
+  let cyc = false
+  if fd is FuncDecl {
+    cstrCandState[fd.fnName] = 1
+    cyc = cstrProbeWalk(fd.fnBody, order)
+    cstrCandState[fd.fnName] = 2
+    order.push(ix)
+  }
+  cyc
+}
+
+// Pass 1.9: indexes the generic declarations whose bodies `cstrProbeBefore` will walk.
+function cstrPrePass(stmts: i32[]) {
+  cstrCandIx = Map()
+  cstrCandState = Map()
+  cstrCandAny = false
+  for si in stmts {
+    if cstrProbeCandidate(si) {
+      const fd = P.nodes[si]
+      if fd is FuncDecl {
+        cstrCandIx[fd.fnName] = si
+        cstrCandAny = true
+      }
+    }
+  }
+  0
+}
+
+// Before pass 2 checks top-level statement `stmt`, quietly records the deferred constraints of
+// every generic it reaches that no earlier statement did, callee before caller, so a call
+// adjudicates its callee whatever the source order (D3062). Run per statement so a body sees the
+// module values the statement sees; a cycle iterates while a table grows.
+function cstrProbeBefore(stmt: i32) {
+  if !cstrCandAny { return 0 }
+  const order: i32[] = []
+  let cyc = false
+  const sn = P.nodes[stmt]
+  if sn is FuncDecl {
+    if (cstrCandIx[sn.fnName] ?? -1) == stmt {
+      if (cstrCandState[sn.fnName] ?? 0) == 0 {
+        cyc = cstrProbeVisit(stmt, order)
+      }
+    } else {
+      cyc = cstrProbeWalk(sn.fnBody, order)
+    }
+  } else {
+    cyc = cstrProbeWalk(stmt, order)
+  }
+  // The statement itself is checked for real next, so outside a cycle it needs no probe.
+  if !cyc && order.length > 0 && order[order.length - 1] == stmt { order.pop() }
+  if order.length == 0 { return 0 }
+  const savedDiag = T.diags.length
+  const savedSym = symEnabled
+  const savedRedun = redunName.length
+  const savedRcoal = rcoalTok.length
+  const savedIsval = isvalTok.length
+  const savedQuiet = inferQuiet
+  symEnabled = 0
+  inferQuiet = true
+  cstrProbe = true
+  let rounds = 0
+  let growing = true
+  while growing && rounds < 4 {
+    rounds = rounds + 1
+    const before = cstrRowCount()
+    for oi in order {
+      const fd = P.nodes[oi]
+      if fd is FuncDecl { checkFuncDeclNode(fd, oi) }
+    }
+    growing = cyc && cstrRowCount() > before
+  }
+  cstrProbe = false
+  inferQuiet = savedQuiet
+  symEnabled = savedSym
+  while T.diags.length > savedDiag { T.diags.pop() }
+  redunTruncate(savedRedun)
+  rcoalTruncate(savedRcoal)
+  isvalTruncate(savedIsval)
+  0
+}
+
 function redunTruncate(n: i32) {
   while redunSLine.length > n { redunSLine.pop() }
   while redunSCol.length > n { redunSCol.pop() }
@@ -41631,7 +41813,8 @@ function finishInferredReturn(
   // (un-hoisted) named function declares fresh, and an anonymous lambda just carries its
   // type as the expression value. The parameter-solve probe observes this body and must not
   // decide the return, so patching here would deny pass 1.7 a fresh re-derivation.
-  if n.fnName != "" && !paramSolveProbe {
+  const cstrProbeTop = cstrProbe && (fnDeclIx[n.fnName] ?? -1) == fnIx
+  if n.fnName != "" && !paramSolveProbe && !cstrProbeTop {
     // A nested function has no hoisted binding: only one already declared in the enclosing
     // scope is its own, and `lookup` further out would find an outer namesake (D1966).
     const isTopDecl = (fnDeclIx[n.fnName] ?? -1) == fnIx
@@ -41998,7 +42181,7 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
       cycleBreakCount = cycleBreakCount + 1
       return TY_VOID
     }
-    if inferQuiet && !paramSolveProbe {
+    if inferQuiet && !paramSolveProbe && !cstrProbe {
       // Suppressed pre-pass: memoize a resolved return (a `-2` reset by the fixpoint
       // forces a fresh re-inference). The PARAMETER-solve probe never takes the memo:
       // it needs the body walked for the flow constraints, not the return.
@@ -43323,9 +43506,12 @@ function checkProgramNode(n: Program) {
   // included, via the binding-group fixpoint) BEFORE checking bodies, so pass 2 sees
   // final return types and a recursive function needs no return annotation.
   inferReturnsPrePass()
+  // Pass 1.9: the generic bodies pass 2 walks for their constraints (`cstrProbeBefore`).
+  cstrPrePass(stmts)
   // Pass 2: check every top-level statement (bodies included).
   let j = 0
   while j < stmts.length {
+    cstrProbeBefore(stmts[j])
     markValDiscard(stmts[j])
     crStmtEnter(stmts[j])
     checkNode(stmts[j])
@@ -44396,6 +44582,11 @@ function noteNestCstr(t: i32, ix: i32) {
   const key = i32ToStr(t) + ":" + i32ToStr(owner)
   if nestCstrSeen.has(key) { return 0 }
   nestCstrSeen.set(key, true)
+  let k = 0
+  while k < nestCstrTy.length {
+    if nestCstrFn[k] == owner && tyEqSameHoles(nestCstrTy[k], t) { return 0 }
+    k = k + 1
+  }
   nestCstrTy.push(t)
   nestCstrIx.push(ix)
   nestCstrFn.push(owner)

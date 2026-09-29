@@ -1147,6 +1147,40 @@ axis(
   (d) => twoFiles(d, genConcatChains(1, 300), genConcatChains(1, 75)),
 );
 
+// A chain of `depth` generics, each calling the next, every body carrying deferred
+// constraints over its `T`; `calleeFirst` declares the chain bottom-up.
+const genGenericChain = (depth: number, calleeFirst: boolean): string => {
+  const fns: string[] = [];
+  for (let i = 0; i < depth; i++) {
+    const body = [`function g${i}<T>(x: T) {`, "  const a: i32 = x + 1", "  takes(x * 2)", "  print(x - a)"];
+    if (i + 1 < depth) body.push(`  g${i + 1}(x)`);
+    body.push("}");
+    fns.push(body.join("\n"));
+  }
+  if (calleeFirst) fns.reverse();
+  return ["function takes(n: i32) { print(n) }", ...fns, "g0(3)"].join("\n") + "\n";
+};
+
+// D3062's ORDER pair: one chain declared callee-first against caller-first. Each order's
+// constraints are recorded once before a caller is checked; a callee-first body walked twice
+// read 2.13 here, and fuel reads 0.60 without that.
+axis(
+  "generic chain declared callee-first",
+  1.25,
+  "A generic body is walked for its constraints and then again for real (`cstrProbeBefore`, compiler/typecheck.vl).",
+  (d) => twoFiles(d, genGenericChain(60, true), genGenericChain(60, false)),
+);
+
+// D3101's GROWTH pair: the caller-first chain at depth 60 against 15, so linear reads 4 and
+// quadratic 16. Known super-linear: every call re-validates each constraint its callee
+// inherited from the rest of the chain. Fuel reads 17.7, so the bar is 1.25x that.
+axis(
+  "generic chain depth",
+  22.2,
+  "A call re-validates its callee's inherited constraints (`validate*Cstrs`, compiler/typecheck.vl); see D3101.",
+  (d) => twoFiles(d, genGenericChain(60, false), genGenericChain(15, false)),
+);
+
 // ── the one RUNTIME axis ─────────────────────────────────────────────────────
 // Every pair above grades COMPILE time, because every cost above is the compiler's. String
 // building is the exception: the cost lands in the EMITTED program, so this pair builds
