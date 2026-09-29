@@ -234,6 +234,7 @@ import {
   tyNulLitUnionMemberTexts,
   tyOfMembers,
   tyPrimNameOf,
+  tyProvesNonNull,
   tyReachesUnion,
   tySame,
   tyScalarBaseIs,
@@ -1633,6 +1634,12 @@ function instRecvFieldFnTy(recvIx: i32, prop: string, fnIx: i32): i32 {
   if rt < 0 && fnInMonoInstance(fnIx) {
     const nt = nodeTyIxOf(unwrapParen(recvIx))
     if nt >= 0 && !tyHasTyVar(nt) { rt = nt }
+    // A receiver typed at a type parameter reads the instance's own binding of it; a member
+    // call's receiver is past its `null` (a `Z | null` parameter narrowed, D3124).
+    if rt < 0 && nt >= 0 {
+      const pt = valueReadPinTy(recvIx, fnIx, 0)
+      if pt >= 0 { rt = nonNullTy(pt) }
+    }
   }
   if rt < 0 { return -1 }
   const ft = tyFieldTyOf(rt, prop)
@@ -16014,7 +16021,9 @@ export function exprIsF64(exprIx: i32, fnIx: i32) {
       )
       if target >= 0 { return repOfFnSlot(target).rdKind == "f64" }
       // A function-value (closure) callee returning f64 — its result routes as f64.
-      return calleeReturnsF64At(sidOfNode(e.callFn), fnIx, e.callFn)
+      if calleeReturnsF64At(sidOfNode(e.callFn), fnIx, e.callFn) { return true }
+      // A value the generic body shares, typed at a hole this instance pins to `f64` (D3117).
+      return tyKindOf(holeOperandTyOf(exprIx, fnIx)) == TK_F64
     }
     // A field-closure call `t.op(x)` whose field function returns f64.
     if callee is Member {
@@ -16589,6 +16598,19 @@ export function cloCallSigKey(callIx: i32, fnIx: i32) {
     // `TyFunc` spine directly, with no per-position sig producer or string spine scan.
     const ck = sigKeyOfTy(nodeTyIxOf(c.callFn))
     if ck != "" { return ck }
+    // A callee the checker left a hole (`const g = z.f` in a hole instance), or a capture of
+    // one, is keyed by the function type the instance binds it to, for a result the hole-pin
+    // classifiers read (`exprIsBool`, `exprIsF64`, `exprString`); any other stays unkeyed (D3117).
+    const hft = holeOrCapturedTyOf(c.callFn, fnIx)
+    if hft >= 0 {
+      const hf = T.tys[hft]
+      if hf is TyFunc {
+        const rp = tyPrimNameOf(hf.fnRet)
+        if rp == "i32" || rp == "boolean" || rp == "f64" || rp == "string" {
+          return sigKeyOfTy(hft)
+        }
+      }
+    }
   }
   ""
 }
@@ -29957,6 +29979,64 @@ function arrLitReadsPinTy(elems: i32[], fnIx: i32): i32 {
   t0
 }
 
+// Whether `ix`, a read whose checked type names a type parameter or hole, holds a type that
+// admits no `null` at the pin of `fnIx`, a lambda's pinned parameter included (D3126).
+export function pinReadProvesNonNull(ix: i32, fnIx: i32): boolean {
+  const ty = nodeTyIxOf(unwrapParen(ix))
+  if ty < 0 || !tyHasTyVar(ty) { return false }
+  let pt = valueReadPinTy(ix, fnIx, 0)
+  if pt < 0 { pt = capturedReadPinTy(ix, fnIx) }
+  pt >= 0 && tyProvesNonNull(pt)
+}
+
+// `valueReadPinTy` of a name lifted frame `fnIx` captures, asked of the frame that declares
+// it; -1 when no enclosing frame answers.
+function capturedReadPinTy(ix: i32, fnIx: i32): i32 {
+  const fs = captureDeclFrames(ix, fnIx)
+  let i = 0
+  while i < fs.length {
+    let t = valueReadPinTy(ix, fs[i], 0)
+    // A hole instance leaves a parameter pinned at plain `i32` un-annotated.
+    if t < 0 { t = holeOperandTyOf(ix, fs[i]) }
+    if t >= 0 { return t }
+    i = i + 1
+  }
+  -1
+}
+
+// `holeOperandTyOf` of `ix`, or of the name it reads asked of each enclosing frame that
+// name is captured from, since a lambda lifted inside a hole instance has no binding of its own.
+function holeOrCapturedTyOf(ix: i32, fnIx: i32): i32 {
+  const t = holeOperandTyOf(ix, fnIx)
+  if t >= 0 { return t }
+  const fs = captureDeclFrames(ix, fnIx)
+  let i = 0
+  while i < fs.length {
+    const ht = holeOperandTyOf(ix, fs[i])
+    if ht >= 0 { return ht }
+    i = i + 1
+  }
+  -1
+}
+
+// The enclosing frames of lifted frame `fnIx`, innermost first, that the name `ix` reads is
+// captured through, ending at the one that declares it; empty for anything but a captured name.
+function captureDeclFrames(ix: i32, fnIx: i32): i32[] {
+  const out: i32[] = []
+  const name = identNameOrEmpty(unwrapParen(ix))
+  if name == "" { return out }
+  let cur = fnIx
+  while out.length < 8 && identIsEnvCapture(cur, name) {
+    const pos = fnStmtsPosOf(cur)
+    if pos < 0 || pos >= fnParent.length { return out }
+    const pp = fnParent[pos]
+    if pp < 0 || pp >= fnStmts.length { return out }
+    cur = fnStmts[pp]
+    out.push(cur)
+  }
+  out
+}
+
 // The type the read `ix` holds at the pin of the instance `fnIx` is: an element read's list
 // element (`iterElemPinTy`), a parameter's pin, a local's annotation or initializer, or a loop
 // variable's list element. -1 for any other node, or where the type still names a type parameter.
@@ -43279,6 +43359,10 @@ export function exprString(exprIx: i32, fnIx: i32) {
       if calleeReturnsStringAt(sidOfNode(e.callFn), fnIx, e.callFn) {
         if !nodeTyIsLitUnionAlias(exprIx) { return true }
       }
+      // A value call the generic body shares, typed at a hole this instance pins (D3117).
+      if tyKindOf(holeOperandTyOf(exprIx, fnIx)) == TK_STR {
+        if sigKeyRetKind(cloCallSigKey(exprIx, fnIx)) == "str" { return true }
+      }
     }
     // A string-returning FIELD-closure call (`o.label(3)` over a `(i32) => string` field).
     if callee is Member {
@@ -45367,10 +45451,64 @@ export function mapUnionResultRow(callIx: i32, fnIx: i32): i32 {
     const rt = tyRefArrElemOf(nodeTyIxOf(callIx))
     if rt >= 0 && !tyHasTyVar(rt) { et = rt }
   }
-  if et >= 0 { return unRowOfCanon(et) }
+  if et >= 0 {
+    const r = unRowOfCanon(et)
+    if r >= 0 { return r }
+    return unRowOfFlatMembers(et)
+  }
   // With one union registered there is no other row the element could be.
   if unNames.length == 1 { return 0 }
   -1
+}
+
+// The `unNames` row a box of `ty` reads through: the one whose flattened members are exactly
+// `ty`'s without the repeats a substitution leaves (`T | i32` at `T := i32 | null`), else the
+// first holding every one of them. A box's tag names its member, so a wider row reads it
+// right. -1 when no row holds them all.
+function unRowOfFlatMembers(ty: i32): i32 {
+  const xs = flatDistinctMembers(ty)
+  if xs.length < 2 { return -1 }
+  let cover = -1
+  let u = 0
+  while u < unTyIx.length {
+    const ys: i32[] = []
+    if unTyIx[u] >= 0 { flattenVariantsInto(unTyIx[u], ys) }
+    let all = ys.length > 0
+    let k = 0
+    while k < xs.length {
+      if !tyListHasEq(ys, xs[k]) { all = false }
+      k = k + 1
+    }
+    if all && ys.length == xs.length { return u }
+    if all && cover < 0 { cover = u }
+    u = u + 1
+  }
+  cover
+}
+
+// `ty`'s flattened members with the repeats a substitution leaves dropped; empty when one is
+// unresolved.
+function flatDistinctMembers(ty: i32): i32[] {
+  const raw: i32[] = []
+  flattenVariantsInto(ty, raw)
+  const xs: i32[] = []
+  let i = 0
+  while i < raw.length {
+    if raw[i] < 0 { return [] }
+    if !tyListHasEq(xs, raw[i]) { xs.push(raw[i]) }
+    i = i + 1
+  }
+  xs
+}
+
+// Whether some member of `xs` is `tyEq` to `t`.
+function tyListHasEq(xs: i32[], t: i32): boolean {
+  let i = 0
+  while i < xs.length {
+    if xs[i] >= 0 && tyEq(xs[i], t) { return true }
+    i = i + 1
+  }
+  false
 }
 
 // Resolve a `.map`/`.filter` callback argument to its lifted-function position in `fnStmts`:
