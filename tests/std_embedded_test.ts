@@ -6,6 +6,8 @@
 //                                        the playground (docs/std-design.md D3)
 //   scripts/vl-host/src/std_embedded.rs  the `vl` binary's own std, so a pinned
 //                                        toolchain is ONE file (D1573)
+//   compiler/std_receivers.vl            std's receiver-style exports, which the
+//                                        missing-import hint names (D3122)
 //
 // One generator writes both, so staleness is one failure and the editor and the
 // CLI cannot end up disagreeing about std. This test needs no binary and no
@@ -20,6 +22,7 @@ import {
   collectStdSources,
   renderEmbedded,
   renderEmbeddedRust,
+  renderStdReceivers,
   stdHash,
 } from "../scripts/gen-std.ts";
 import { STD_SOURCES } from "../std/embedded.ts";
@@ -46,6 +49,18 @@ Deno.test("scripts/vl-host/src/std_embedded.rs is fresh (the same generator)", a
       "scripts/vl-host/src/std_embedded.rs is stale — `std/*.vl` changed without " +
         "regenerating, so a released `vl` would ship a std the tree no longer has. " +
         "Run: deno task gen-std",
+    );
+  }
+});
+
+Deno.test("compiler/std_receivers.vl is fresh (the same generator)", async () => {
+  const expected = renderStdReceivers(await collectStdSources());
+  const actual = await Deno.readTextFile(new URL("../compiler/std_receivers.vl", import.meta.url));
+  if (actual !== expected) {
+    throw new Error(
+      "compiler/std_receivers.vl is stale — `std/*.vl` changed without regenerating, so the " +
+        "checker's missing-import hint (D3122) would name exports std no longer has. " +
+        "Run: deno task gen-std, then scripts/refresh-compiler.sh",
     );
   }
 });

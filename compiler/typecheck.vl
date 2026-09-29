@@ -326,6 +326,15 @@ import { elseIfLink, nodeChildren, nodeSpineChildren } from "./ast"
 // The file a node came from, named in a record-covariance refusal that crosses modules.
 import { srcmapModOfTok, srcmapPathOf } from "./srcmap"
 import { i32ListHas, strListHas, strListIndexOf } from "./listutil"
+import {
+  stdRecvLoad,
+  stdRecvMax,
+  stdRecvMin,
+  stdRecvName,
+  stdRecvSelf,
+  stdRecvSpec,
+  stdRecvTparams,
+} from "./std_receivers"
 
 // ── type-arena variants ──────────────────────────────────────────────────────
 // One struct per type kind, prefixed field names so `is` discriminates the union (the
@@ -33245,11 +33254,11 @@ function ufcsImportEditSuffix(
   " — add `import { " + item + " } from \"" + specs + "\"`" + call
 }
 
-// The import alias D1230's sentence proposes when the caller's module already binds a
-// `self`-function `prop` (D1984): `prop` plus the receiver's type name, which an import of the
-// plain name would collide with. "" when the module binds no such name.
+// The import alias D1230's sentence proposes when the caller's module already binds `prop` in
+// any form (D1984, D3122): `prop` plus the receiver's type name, which an import of the plain
+// name would collide with. "" when the module binds no such name.
 function ufcsImportAliasAt(ix: i32, prop: string, objTy: i32): string {
-  if ufcsAliasInScope(ix, prop) == prop { return "" }
+  if ufcsFreeAliasAt(ix, prop) == prop { return "" }
   const tn = demangleMsg(tyToStr(objTy))
   let out = prop
   let i = 0
@@ -33318,6 +33327,40 @@ function ufcsNotImportedMsg(
     + "; a UFCS call resolves only names in scope, "
     + how
     + ufcsImportEditSuffix(prop, specs, alias)
+}
+
+// D1230 at member node `memIx`, else D1570 at call node `ix`, for `recv.prop(argc args)`; false
+// when neither applies. For the string and array arms, which answer before the general one, so
+// `memberFloorErr` never sees their calls. D1230 spans the property, as the quick-fix reads it.
+function ufcsMissRaise(
+  prop: string,
+  recvTy: i32,
+  argc: i32,
+  ix: i32,
+  memIx: i32,
+): boolean {
+  const specs = ufcsMissingImportSpecs(prop, recvTy, argc, ix)
+  if specs != "" {
+    tErrCodedData(
+      ufcsNotImportedMsg(prop, specs, recvTy, ufcsImportAliasAt(ix, prop, recvTy)),
+      memIx,
+      CODE_UFCS_NOT_IMPORTED,
+      ufcsNotImportedData(prop, specs, recvTy),
+    )
+    return true
+  }
+  const name = ufcsSiteFn(ix, prop)
+  const kind = ufcsNotMethodKind(name, recvTy, argc)
+  if kind != 0 {
+    tErrCodedData(
+      ufcsNotMethodMsg(prop, name, recvTy, argc, kind),
+      ix,
+      CODE_UFCS_NOT_METHOD,
+      ufcsNotMethodData(prop, name, recvTy, kind),
+    )
+    return true
+  }
+  false
 }
 
 // D1230's payload, the machine half, on the data channel `CODE_UFCS_NOT_IMPORTED` documents.
@@ -33462,6 +33505,26 @@ function ufcsNotMethodMsg(
     + "` takes `self: "
     + p0Str
     + "`"
+    + ufcsReadonlyNote(name, recvTy)
+}
+
+// D1570's receiver-type sentence's tail when a read-only list meets a growable `self` list,
+// the one refusal whose reason the two spellings do not show; "" otherwise.
+function ufcsReadonlyNote(name: string, recvTy: i32): string {
+  if recvTy < 0 { return "" }
+  const rt = T.tys[recvTy]
+  const fnTy = lookup(name)
+  if fnTy < 0 { return "" }
+  const ft = T.tys[fnTy]
+  if rt is TyArray && ft is TyFunc && ft.fnParamTypes.length > 0 {
+    const p0 = ft.fnParamTypes[0]
+    if p0 < 0 { return "" }
+    const pt = T.tys[p0]
+    if rt.aRead != 0 && pt is TyArray && pt.aRead == 0 {
+      return ", and a readonly list is not a growable one"
+    }
+  }
+  ""
 }
 
 // The rendered type of `name`'s `self` parameter — the half of the receiver-mismatch sentence
@@ -37473,6 +37536,13 @@ function ufcsWouldDispatch(mangled: string, recvTy: i32, argc: i32) {
     const uDecl = declParamsAfterSelf(mangled)
     let uRequired = params.length - 1
     if uDecl.length == params.length - 1 { uRequired = fnRequiredArity(uDecl) }
+    // `ufcsCallTy`'s storage-type refusal: a `self` whose type parameter would bind `u8`.
+    if tyIsU8ArrayTy(recvTy) {
+      const bNames: string[] = []
+      const bTys: i32[] = []
+      bindGenWalk(params[0], recvTy, bNames, bTys)
+      if tyReachesHole(substTyDeep(params[0], bNames, bTys), 8) { return false }
+    }
     // The rest arm of `ufcsCallTy`'s gate, mirrored: a variadic callee's upper bound is
     // unbounded, and this speculative twin must agree about what dispatches.
     const uRest = restParamIndex(uDecl)
@@ -37488,12 +37558,14 @@ function ufcsWouldDispatch(mangled: string, recvTy: i32, argc: i32) {
   false
 }
 
-// The comma-joined module specifiers that would make `recv.prop(argc args)` resolve, or ""
-// when no module in the graph offers one (D1230). Deduplicated, in the registry's own
-// dependency-first order. Empty is the common answer: a single-file program has no registry
-// rows at all, and a genuinely missing function keeps the direct sentence it has today.
-function ufcsMissingImportSpecs(prop: string, recvTy: i32, argc: i32) {
+// The comma-joined module specifiers that would make `recv.prop(argc args)` at call node `ix`
+// resolve, or "" (D1230): the graph registry's rows in dependency-first order, then std's
+// catalog (D3122), deduplicated. When the call's module binds `prop` as a function D1570
+// explains (`ufcsSiteKind`), a plain one yields "" and a `self`-function drops the catalog.
+function ufcsMissingImportSpecs(prop: string, recvTy: i32, argc: i32, ix: i32) {
   const specs: string[] = []
+  const siteKind = ufcsSiteKind(ix, prop, recvTy, argc)
+  if siteKind == 1 { return "" }
   let i = 0
   while i < ufcsImpName.length {
     if ufcsImpName[i] == prop {
@@ -37503,6 +37575,7 @@ function ufcsMissingImportSpecs(prop: string, recvTy: i32, argc: i32) {
     }
     i = i + 1
   }
+  if siteKind == 0 { stdRecvSpecsInto(specs, prop, recvTy, argc) }
   let out = ""
   let j = 0
   while j < specs.length {
@@ -37511,6 +37584,162 @@ function ufcsMissingImportSpecs(prop: string, recvTy: i32, argc: i32) {
     j = j + 1
   }
   out
+}
+
+// The merged name of the function call node `ix`'s module binds as `prop`: its `self`-function,
+// else its own declaration, else `prop` itself.
+function ufcsSiteFn(ix: i32, prop: string) {
+  const nm = ufcsAliasAtSite(ix, prop)
+  const m = ufcsModOfNode(ix)
+  if (fnDeclIx[nm] ?? -1) < 0 && m >= 0 { return prop + "$m" + i32ToStr(m) }
+  nm
+}
+
+// D1570's gate kind for `ufcsSiteFn`, or 0 (D3122). A plain function (1) answers ahead of
+// every candidate module, since its author meant it as the method; any kind answers ahead of a
+// std module the author never mentioned.
+function ufcsSiteKind(ix: i32, prop: string, recvTy: i32, argc: i32) {
+  ufcsNotMethodKind(ufcsSiteFn(ix, prop), recvTy, argc)
+}
+
+// Whether the graph registry holds a row for `prop` in module `spec` — in which case that
+// row's exact answer stands and the std catalog's row for the same pair is not asked.
+function ufcsRegistryHas(prop: string, spec: string) {
+  let i = 0
+  while i < ufcsImpName.length {
+    if ufcsImpName[i] == prop && ufcsImpSpec[i] == spec { return true }
+    i = i + 1
+  }
+  false
+}
+
+// D3122 — the std catalog's half of `ufcsMissingImportSpecs`: appends to `specs` each std
+// module outside the registry whose `self`-function `prop` takes `argc` arguments and whose
+// receiver annotation `recvTy` fits. Nothing of those modules is loaded, so the fit is read
+// from the annotation's spelling (`stdRecvFits`) rather than from a declaration.
+function stdRecvSpecsInto(
+  specs: string[],
+  prop: string,
+  recvTy: i32,
+  argc: i32,
+) {
+  if recvTy < 0 { return 0 }
+  const rt = T.tys[recvTy]
+  if rt is TyVar || rt is TyErr { return 0 }
+  stdRecvLoad()
+  let i = 0
+  while i < stdRecvName.length {
+    if (
+      stdRecvName[i] == prop
+      && !strListHas(specs, stdRecvSpec[i])
+      && !ufcsRegistryHas(prop, stdRecvSpec[i])
+      && argc >= stdRecvMin[i]
+      && (stdRecvMax[i] < 0 || argc <= stdRecvMax[i])
+      && stdRecvFits(stdRecvSelf[i], stdRecvTparams[i], recvTy)
+    ) {
+      specs.push(stdRecvSpec[i])
+    }
+    i = i + 1
+  }
+  0
+}
+
+// Whether a value of type `ty` is assignable to a catalog `self` annotation `spell`, whose
+// type parameters are the `,`-joined `tparams`. The spelling holds only builtin leaves, those
+// parameters, `[]`, a leading `readonly` and `|` (the generator's filter); a union annotation
+// fits when every member of `ty` fits one of its members.
+function stdRecvFits(spell: string, tparams: string, ty: i32) {
+  let body = spell
+  let ro = false
+  if body.length > 9 && body.slice(0, 9) == "readonly " {
+    ro = true
+    body = body.slice(9, body.length)
+  }
+  const tps = stdRecvSplit(tparams, ',')
+  const alts = stdRecvSplit(body, '|')
+  const t = T.tys[ty]
+  if alts.length > 1 && t is TyUnion {
+    for m in t.uMembers {
+      if !stdRecvFitsSome(alts, tps, m, ro) { return false }
+    }
+    return true
+  }
+  stdRecvFitsSome(alts, tps, ty, ro)
+}
+
+// Whether `ty` fits any one of the annotation members `alts`.
+function stdRecvFitsSome(alts: string[], tps: string[], ty: i32, ro: boolean) {
+  for a in alts {
+    if stdRecvFitsOne(a, tps, ty, ro) { return true }
+  }
+  false
+}
+
+// Whether `ty` fits one annotation member `sp`: a type parameter anything but the storage type
+// `u8`, which it never binds; `X[]` an array whose element is exactly `X` (a growable one unless
+// `ro`); and a builtin leaf by `assignable`.
+function stdRecvFitsOne(
+  sp: string,
+  tps: string[],
+  ty: i32,
+  ro: boolean,
+): boolean {
+  if ty < 0 { return false }
+  if strListHas(tps, sp) { return ty != TY_U8 }
+  if stdRecvIsList(sp) {
+    const t = T.tys[ty]
+    if t is TyArray {
+      if !ro && t.aRead != 0 { return false }
+      const inner = sp.slice(0, sp.length - 2)
+      if strListHas(tps, inner) { return t.aElem != TY_U8 }
+      if t.aElem < 0 { return false }
+      return stdRecvFitsOne(inner, tps, t.aElem, false)
+        && stdRecvLeafExact(inner, t.aElem)
+    }
+    return false
+  }
+  const lt = stdRecvLeafTy(sp)
+  if lt < 0 { return false }
+  assignable(ty, lt)
+}
+
+// An array element is invariant: `X[]` takes an element type `X` accepts and that accepts `X`.
+// A nested `X[][]` element is decided by the recursion, so only a leaf is compared here.
+function stdRecvLeafExact(sp: string, ty: i32): boolean {
+  if stdRecvIsList(sp) { return true }
+  const lt = stdRecvLeafTy(sp)
+  lt >= 0 && assignable(lt, ty)
+}
+
+// Whether annotation member `sp` spells a list, `X[]`.
+function stdRecvIsList(sp: string) {
+  sp.length > 2 && sp.slice(sp.length - 2, sp.length) == "[]"
+}
+
+// `s` split at each `sep`, every piece stripped of spaces; [] for "".
+function stdRecvSplit(s: string, sep: i32): string[] {
+  const out: string[] = []
+  let cur = ""
+  let i = 0
+  while i < s.length {
+    const c = s[i]
+    if c == sep {
+      out.push(cur)
+      cur = ""
+    } else if c != ' ' {
+      cur = cur + s.slice(i, i + 1)
+    }
+    i = i + 1
+  }
+  if cur != "" || out.length > 0 { out.push(cur) }
+  out
+}
+
+// The builtin type a catalog leaf spells, or -1 for any other name.
+function stdRecvLeafTy(sp: string): i32 {
+  if sp == "u8" { return TY_U8 }
+  if sp == "void" || sp == "v128" { return -1 }
+  primTyOfName(sp)
 }
 
 // The `,`-joined payload list, rendered for the SENTENCE: `a,b` → `"a", "b"`.
@@ -38640,6 +38869,9 @@ function checkMemberCallNode(
       memberCallRungAdd(ix, MC_RUNG_SELF_FN)
       return au
     }
+    if ufcsMissRaise(prop, recvTy, n.callArgs.length, ix, n.callFn) {
+      return TY_ERR
+    }
     tErr(
       "no method '."
         + prop
@@ -38891,36 +39123,7 @@ function checkMemberCallNode(
         memberCallRungAdd(ix, MC_RUNG_SELF_FN)
         return su
       }
-      // D1230 on a STRING receiver. This arm answers before the general one and
-      // raises its own sentence at the CALL node, so it asks and raises here
-      // rather than banking — `memberFloorErr` never sees a string method call.
-      const suSpecs = ufcsMissingImportSpecs(sp, recvTy, n.callArgs.length)
-      if suSpecs != "" {
-        tErrCodedData(
-          ufcsNotImportedMsg(
-            sp,
-            suSpecs,
-            recvTy,
-            ufcsImportAliasAt(ix, sp, recvTy),
-          ),
-          ix,
-          CODE_UFCS_NOT_IMPORTED,
-          ufcsNotImportedData(sp, suSpecs, recvTy),
-        )
-        return TY_ERR
-      }
-      // D1570 on a STRING receiver, raised here for the reason D1230's arm is: this arm
-      // answers before the general one, so `memberFloorErr` never sees a string method call
-      // and there is nothing to bank for.
-      const suName = ufcsAliasAtSite(ix, sp)
-      const suKind = ufcsNotMethodKind(suName, recvTy, n.callArgs.length)
-      if suKind != 0 {
-        tErrCodedData(
-          ufcsNotMethodMsg(sp, suName, recvTy, n.callArgs.length, suKind),
-          ix,
-          CODE_UFCS_NOT_METHOD,
-          ufcsNotMethodData(sp, suName, recvTy, suKind),
-        )
+      if ufcsMissRaise(sp, recvTy, n.callArgs.length, ix, n.callFn) {
         return TY_ERR
       }
       tErr(
@@ -39004,7 +39207,7 @@ function checkMemberCallNode(
     // the call knows the argument count, banked on the callee member node where the sentence is raised (`memberFloorErr`).
     noteUfcsMiss(
       n.callFn,
-      ufcsMissingImportSpecs(prop, recvTy, n.callArgs.length),
+      ufcsMissingImportSpecs(prop, recvTy, n.callArgs.length, ix),
     )
     // When the name is already in scope, which gate declined (D1570) — banked beside
     // D1230's answer and read after it, since `argc` is known here and raised there.
