@@ -3644,6 +3644,32 @@ export function letInitTyIsNarrowedArm(letIx: i32, fnIx: i32): boolean {
   false
 }
 
+// The nullable twin of `letInitTyVariantRow`: the variant row of `X` when an un-annotated
+// binding's initializer is typed `X | null` with `X` a union arm, else -1 (D3107).
+export function letInitTyNulArmRow(letIx: i32): i32 {
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 { return -1 }
+    if d.letInit < 0 { return -1 }
+    const t = nodeTyIxOf(d.letInit)
+    if t < 0 { return -1 }
+    const tt = T.tys[t]
+    if tt is TyNullable { return nulArmRowOfTy(tt.nInner) }
+  }
+  -1
+}
+
+// A value narrowed to `X | null` out of a wider box: the init is still the box, so the cell is
+// the `nulvariant` niche and the binding boundary unboxes into it, nullably.
+export function letInitTyIsNarrowedNulArm(letIx: i32, fnIx: i32): boolean {
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    if letInitTyNulArmRow(letIx) < 0 { return false }
+    return exprUnion(d.letInit, fnIx)
+  }
+  false
+}
+
 // The nullable twin: the initializer carries a `TyNullable` over a `TyFunc`, which a bare
 // `const t = m[k]` read of a function-valued map is and no syntactic arm claims (D1621).
 function letInitTyIsNulFunc(letIx: i32): boolean {
@@ -3712,6 +3738,7 @@ function letInitCellKind(letIx: i32, fnIx: i32): VKind {
   // Above every rung reading the init's own rep, each of which would give the cell a box that
   // the consumers all read as the arm; below the `??` join, whose result IS the box.
   if letInitTyIsNarrowedArm(letIx, fnIx) { return "variant" }
+  if letInitTyIsNarrowedNulArm(letIx, fnIx) { return "nulvariant" }
   // A nullable map, before `letIsMap`, whose `(ref $mapStruct)` cell cannot hold null.
   if letIsNulMap(letIx, fnIx) { return "nulmap" }
   // A bare `const t = m[k]` read of a list- or nested-map-valued map binds the value's
@@ -6044,6 +6071,7 @@ export function captureValStructIdx(fe: i32, name: string) {
       // without its slot is a loud reject and not a fallback: `fbValtype`'s bounds guard
       // turns a -1 on any ref kind into `ref valtype with no interned shape` (D21).
       if letInitTyIsNarrowedArm(b, pf) { return letInitTyVariantRow(b) }
+      if letInitTyIsNarrowedNulArm(b, pf) { return letInitTyNulArmRow(b) }
       if letIsNulMap(b, pf) { return nulMapShapeOf(b, pf) }
       if letNulMapReadValKind(b, pf) != null {
         return letNulMapReadSlotArg(b, pf)
@@ -16543,7 +16571,16 @@ export function cloCallSigKey(callIx: i32, fnIx: i32) {
         const efk = anonLeafArrElemSelfKey(cre.idxArr, fnIx)
         if efk != "" { return efk }
         const k = cloArrSlotSigKey(refListSlotOfExpr(cre.idxArr, fnIx))
-        if k != "" { return k }
+        if k != "" {
+          // The slot's key is rendered from the element's name, which spells a union arm by
+          // its field set; the arena key names the arm's row. Overrides only an un-interned
+          // key with an interned one, as the `Ident` resolver does (D3108).
+          if cloSigPosOfKey(k) < 0 {
+            const iak = sigKeyOfTy(nodeTyIxOf(c.callFn))
+            if iak != "" && iak != k && cloSigPosOfKey(iak) >= 0 { return iak }
+          }
+          return k
+        }
       }
     }
     // General fallback, off the hot path: derive the key from the callee's checker arena type
@@ -20814,9 +20851,22 @@ export function letNulLitUnion(letIx: i32, fnIx: i32) {
   const d = P.nodes[letIx]
   if d is LetDecl {
     if d.letType >= 0 { return nodeTyIsNulLitUnion(d.letType) }
-    return exprNulLitUnion(d.letInit, fnIx)
+    if exprNulLitUnion(d.letInit, fnIx) { return true }
+    return letInitIsNulLitBox(d.letInit, fnIx)
   }
   false
+}
+
+// A `K | null` read out of a wider box, as an un-annotated binding's initializer: the binding is
+// the niche and its store converts. Asked of the checker's type and the box, not of the live
+// narrowing, so a capture's classification agrees with the frame's (D3118).
+function letInitIsNulLitBox(init: i32, fnIx: i32): boolean {
+  const ix = unwrapParen(init)
+  if ix < 0 { return false }
+  if !nodeTyIsNulLitUnion(ix) { return false }
+  const e = P.nodes[ix]
+  if !(e is Ident || e is Member || e is Index) { return false }
+  exprUnion(ix, fnIx)
 }
 
 // True if `name` resolves (param / local / module global) to a BOOLEAN binding:
@@ -34866,6 +34916,48 @@ export function nicheReadKindAt(ix: i32, key: string): i32 {
   if nk == 1 && nodeTyIsNulBool(ix) { return 1 }
   if nk == 2 && nodeTyIsNulString(ix) { return 2 }
   -1
+}
+
+// The key of a read at `exprIx` narrowed to exactly `K | null`, `K` a literal-union alias, out of
+// a box that holds `K` as its string arm, or "". An atom-niche destination converts such a read
+// with `emitNarrowedNicheRead` (D3118); the read itself stays the box its other consumers expect.
+export function narrowedNulLitBoxKey(exprIx: i32, fnIx: i32): string {
+  const ix = unwrapParen(exprIx)
+  if ix < 0 { return "" }
+  if !nodeTyIsNulLitUnion(ix) { return "" }
+  const e = P.nodes[ix]
+  let key = ""
+  if e is Ident { key = e.identName } else { key = placeNarrowKeyOf(ix) }
+  if key == "" { return "" }
+  if !narrowedNulLitAlias(key) { return "" }
+  if !exprUnion(ix, fnIx) { return "" }
+  key
+}
+
+// Whether `name` is narrowed to exactly `K | null` with `K` a literal-union alias.
+function narrowedNulLitAlias(name: string): boolean {
+  const i = narrowSlotOf(name)
+  if i < 0 { return false }
+  const v = narrowVariants[i]
+  if v == "" { return false }
+  const atoms: string[] = []
+  splitUnionAtoms(v, atoms)
+  if atoms.length != 2 { return false }
+  if atoms[0] == "null" { return nameIsLitUnionType(atoms[1]) }
+  if atoms[1] == "null" { return nameIsLitUnionType(atoms[0]) }
+  false
+}
+
+// The niche kind of a nullable literal union read out of a box: the atom id, `-1` for null.
+export const NICHE_NUL_LIT = 3
+
+// The member texts of a nullable literal union `ty`, read through its `null`.
+export function nulLitMemberTexts(ty: i32): string[] {
+  if ty >= 0 {
+    const t = T.tys[ty]
+    if t is TyNullable { return tyLitMemberTexts(t.nInner) }
+  }
+  tyLitMemberTexts(ty)
 }
 
 // The ref-element-array arm a union binding `name` is currently narrowed to (`if x is S[]`
