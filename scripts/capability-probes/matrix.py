@@ -89,6 +89,12 @@ class Tpl:
             if not getattr(self, field):
                 raise SystemExit("%s: no @@%s@@ section (and none derivable)"
                                  % (path, field.upper()))
+        # A WANT is written into each cell's one-line header comment and compared as one line of
+        # output; a second line would spill into the program and fail every cell to parse.
+        for field in ("want", "want2"):
+            if "\n" in getattr(self, field):
+                raise SystemExit("%s: @@%s@@ must be one line — print one proving value"
+                                 % (path, field.upper()))
 
     def arr(self, ty=None):
         """`i32[]` but `(i32 | "err")[]` — a union element spelling needs its parentheses."""
