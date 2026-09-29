@@ -3257,12 +3257,6 @@ function tyIsWidePrim(ty: i32): boolean {
 // The unions `joinTys` made of two type parameters (D2760). At a pin their members re-join as a
 // non-generic join would, so `A | B` at `i32` and `f64` is `f64`, not a box of the two.
 let tpJoinUnions: {[i32]: i32} = Map()
-// The subset of those a list literal's element join made of a type parameter and concrete
-// types (`litElemTyParamApart`).
-let litJoinUnions: {[i32]: i32} = Map()
-// Set while a binding's written type is the destination of its initializer: a literal there is
-// held to it slot by slot, as its direct spelling is, and keeps the collapsed join.
-let litDestTyped = false
 // Set while a return set joins: there a type parameter's list stays apart from a concrete list
 // (D2783); a join inside a body keeps the collapse its own reads are checked under.
 let tpApartConcrete = false
@@ -4580,8 +4574,6 @@ export function initChecker() {
   voidCoerceValNames = []
   T.tys = []
   tpJoinUnions = Map()
-  litJoinUnions = Map()
-  litDestTyped = false
   genFnCstrBusy = false
   tpIfJoinAt = Map()
   tpIfFn = []
@@ -36006,11 +35998,7 @@ export function substTyDeep(tyIx: i32, bNames: string[], bTys: i32[]) {
     // checked even when nothing changed — an unresolved member is dead precisely because it did not resolve.
     if isJoinHoleUnion(tyIx) {
       res = refoldJoinUnion(tyIx, ms, out3, changed3, bNames, bTys)
-    } else if (
-      changed3
-      && tpJoinUnions.has(tyIx)
-      && !litJoinStaysOpen(tyIx, out3)
-    ) {
+    } else if changed3 && tpJoinUnions.has(tyIx) {
       // A union the return-set join kept apart re-joins under the same rule (D2784).
       const tpSaved = tpApartConcrete
       tpApartConcrete = true
@@ -36044,12 +36032,6 @@ export function substTyDeep(tyIx: i32, bNames: string[], bTys: i32[]) {
       const sclash = setMapUnionClashMsg(kept3, false)
       if sclash != "" { joinClashMsg = sclash }
       if kept3.length == 1 { res = kept3[0] } else { res = mkUnionTy(kept3) }
-      const resIsUnion = res >= 0 && res < T.tys.length && T.tys[res] is TyUnion
-      if res != tyIx && litJoinUnions.has(tyIx) && resIsUnion {
-        // arena-tick exempt: a per-program mark on a fresh arena row.
-        tpJoinUnions[res] = 1
-        litJoinUnions[res] = 1
-      }
     }
   } else if t is TyMap {
     const k2 = substTyDeep(t.mKey, bNames, bTys)
@@ -53348,10 +53330,7 @@ function checkLetDeclNode(n: LetDecl, ix: i32) {
   }
   if n.letInit >= 0 {
     if tpEnvNames.length > 0 { tpIfMarkOk(n.letInit) }
-    const savedLitDest = litDestTyped
-    litDestTyped = annot >= 0
     initTy = checkNode(n.letInit)
-    litDestTyped = savedLitDest
   }
   // A `void` initializer has no value to bind — reject with a source-located message,
   // poisoning `initTy`. Exempted: an if-expression init, whose false path is implicit `null`.
@@ -58728,8 +58707,6 @@ function checkArrayLitNode(n: ArrayLit, _ix: i32) {
     elemTy = joinTys(elemTy, et)
     ei = ei + 1
   }
-  const tpEl = litElemTyParamApart(ets)
-  if tpEl >= 0 { elemTy = tpEl }
   // An f32 element beside literal ones types the list `f32[]`, as it does an `if` join.
   if (
     elemTy >= 0
@@ -58742,45 +58719,6 @@ function checkArrayLitNode(n: ArrayLit, _ix: i32) {
   }
   if neverValueSlotErr(elemTy, "a list element", elems[0]) { elemTy = TY_ERR }
   return mkArrayTy(elemTy)
-}
-
-// The element of a list literal whose elements are a declared type parameter beside concrete
-// types: their union, which each pin re-joins as the concrete literal would, since the collapse
-// to the parameter builds a sibling at the parameter's type (D3079). -1 for any other literal.
-function litElemTyParamApart(ets: i32[]): i32 {
-  if tpEnvNames.length == 0 || litDestTyped { return -1 }
-  let tv = -1
-  let c = -1
-  for et in ets {
-    if et < 0 || et == TY_ERR || isNullTy(et) { return -1 }
-    const t = T.tys[et]
-    let declared = false
-    if t is TyVar {
-      if t.tvName.length == 0 || t.tvName[0] == "?"[0] { return -1 }
-      declared = true
-    }
-    if declared {
-      if tv < 0 { tv = et }
-      else if !tyEq(tv, et) { return -1 }
-    } else {
-      if tyHasTyVar(et) { return -1 }
-      if c < 0 { c = et } else { c = joinTys(c, et) }
-      if c == TY_ERR { return -1 }
-    }
-  }
-  if tv < 0 || c < 0 { return -1 }
-  const j = joinVariantTys(tv, c)
-  // arena-tick exempt: a per-program mark on a fresh arena row.
-  tpJoinUnions[j] = 1
-  litJoinUnions[j] = 1
-  j
-}
-
-// Whether the list-literal join union `u`, substituted to `ms`, still names a type parameter: it
-// stays a union until a pin binds that one too, since re-joining now would absorb the concrete
-// members into the parameter.
-function litJoinStaysOpen(u: i32, ms: i32[]): boolean {
-  litJoinUnions.has(u) && tysHaveTyVarIn(ms)
 }
 
 // `[...a, e, ...b]` — the element type joins every plain element's type with every spread
