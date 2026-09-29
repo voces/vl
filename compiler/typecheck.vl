@@ -20052,30 +20052,6 @@ function inferRegisterVariantMembers(ty: i32) {
   0
 }
 
-// A grouped nullable member's inner, or -1: `(K | null) | string` spells `K | null | string`,
-// whose `null` wraps the whole union rather than riding inside it as a member (D3140).
-function annNullableInner(m: i32): i32 {
-  if m < 0 || m >= T.tys.length { return -1 }
-  const t = T.tys[m]
-  if t is TyNullable {
-    if t.nInner < 0 { return -1 }
-    // A grouped union of several members keeps its box: only `X | null` hoists.
-    const it = T.tys[t.nInner]
-    if it is TyUnion {
-      if !cTyIxSetHas(cUnionTyIxSet, t.nInner) { return -1 }
-    }
-    return t.nInner
-  }
-  -1
-}
-
-// `m` with a grouped nullable's `null` hoisted out (`annNullableInner`), else `m`.
-function annNullHoisted(m: i32): i32 {
-  const inner = annNullableInner(m)
-  if inner >= 0 { return inner }
-  m
-}
-
 // The annotation routes' member dedup, and the one place that records what a dropped
 // duplicate collapsed with: `type A = {v: i32}` and `type B = {v: i32}` mint distinct arena
 // nodes that `sameVariantTy` calls one variant, so `A | B` keeps one member but both names
@@ -20142,14 +20118,14 @@ function annUnionInnerTy(members: i32[], hasNull: boolean): i32 {
     if collapsed >= 0 { collapsedTy = collapsed }
     return collapsed
   }
-  // Every member must be a literal union — a litunion member of a mixed union keeps its own
-  // arena node, since that mixed shape is load-bearing elsewhere
-  // (`closure-result-union-composed-carrier.vl` miscompiles if flattened). Shares
-  // `litUnionFlatMembers` with the declaration route's `UnionDecl` arm.
   if hasNull {
     annRegisterVariantMembers(members)
     return mkUnionTy(members)
   }
+  // Every member must be a literal union — a litunion member of a mixed union keeps its own
+  // arena node, since that mixed shape is load-bearing elsewhere
+  // (`closure-result-union-composed-carrier.vl` miscompiles if flattened). Shares
+  // `litUnionFlatMembers` with the declaration route's `UnionDecl` arm.
   const flat: i32[] = []
   if !litUnionFlatMembers(members, flat) {
     let i = 0
@@ -20265,8 +20241,7 @@ function tsToTyReal(ix: i32) {
         // renders "" for the string arm's `part.length > 0` check
         const m = tsToTy(kid)
         if m < 0 { return -1 }
-        if annNullableInner(m) >= 0 { hasNull = true }
-        annUnionPushDistinctMember(members, annNullHoisted(m))
+        annUnionPushDistinctMember(members, m)
       }
       pi = pi + 1
     }
@@ -20423,8 +20398,7 @@ function nameToTyReal(name: string) {
         // list would let `assignable` treat the negative sentinel as "accept anything".
         const m = nameToTy(part)
         if m < 0 { return -1 }
-        if annNullableInner(m) >= 0 { hasNull = true }
-        annUnionPushDistinctMember(members, annNullHoisted(m))
+        annUnionPushDistinctMember(members, m)
       }
       pi = pi + 1
     }
@@ -23918,52 +23892,9 @@ export function canonUnionKeyOfTy(ty: i32): i32 {
   canonUnionKeyOfName(text)
 }
 
-// `parts` rejoined with each grouped `X | null` member spelled ungrouped, or "" when no member
-// is such a group. A group of several members keeps its box, as `annNullableInner` does.
-function canonHoistNullGroups(parts: string[]): string {
-  // Most unions carry no grouped member and pay one character test per part.
-  let anyGroup = false
-  let g = 0
-  while g < parts.length {
-    if parts[g].length > 0 && parts[g][0] == '(' { anyGroup = true }
-    g = g + 1
-  }
-  if !anyGroup { return "" }
-  let changed = false
-  const out: string[] = []
-  let i = 0
-  while i < parts.length {
-    const p = parts[i]
-    let took = false
-    if nameIsParenSpanEnds(p) && parenEnclosesWhole(p) {
-      const inner = groupInnerOf(p)
-      if nameHasPipe(inner) && !isTopLevelFuncTypeName(inner) {
-        const sub: string[] = []
-        tyTopLevelSplit(inner, '|', false, sub)
-        if sub.length == 2 && partsHaveNull(sub) {
-          let k = 0
-          while k < sub.length {
-            out.push(sub[k])
-            k = k + 1
-          }
-          took = true
-          changed = true
-        }
-      }
-    }
-    if !took { out.push(p) }
-    i = i + 1
-  }
-  if !changed { return "" }
-  let j = out[0]
-  let q = 1
-  while q < out.length {
-    j = j + "|" + out[q]
-    q = q + 1
-  }
-  j
-}
-
+// The same rewrite, told the position the name occupies in the annotation around it, and
+// holding no tree — every recursion into a sub-spelling enters here, since a canon arm cuts
+// a substring and the parser banked a root only for the whole one.
 function canonEmitNameAt(name: string, ctx: i32) {
   canonEmitNameTs(name, ctx, -1)
 }
@@ -24040,10 +23971,6 @@ function canonEmitNameTs(name: string, ctx: i32, root: i32) {
   if nameHasPipe(name) && !isTopLevelFuncTypeName(name) {
     const parts: string[] = []
     tyTopLevelSplit(name, '|', false, parts)
-    // A grouped member holding `null` spells the same union ungrouped, as the annotation
-    // route builds it (`annNullableInner`): `(K | null) | string` is `K | null | string`.
-    const hoisted = canonHoistNullGroups(parts)
-    if hoisted != "" { return canonEmitNameTs(hoisted, ctx, -1) }
     // The subsumed-arm collapse, ahead of every other arm — the mirror of where
     // `annUnionInnerTy` puts it: `K | string | null` is `string?` exactly as `K | string`
     // is `string`, so the `| null` preserve must not claim it first. Re-enters on the
@@ -35459,8 +35386,10 @@ function holeCalleeArgTy(argIx: i32, checked: i32): i32 {
 function ctxLitTyOf(ix: i32, depth: i32): i32 {
   if ix < 0 || ix >= P.nodes.length || depth > 8 { return -1 }
   const px = parenPeelIx(ix)
+  if px < 0 || px >= P.nodes.length { return -1 }
   const lt = litTyOfExpr(px)
   if lt >= 0 { return lt }
+  if P.nodes[px] is NullLit { return TY_NULL }
   const at = ctxLitListTyOf(px, depth)
   if at >= 0 { return at }
   ctxLitRecordTyOf(px, depth)
@@ -35483,7 +35412,22 @@ function ctxLitListTyOf(ix: i32, depth: i32): i32 {
     i = i + 1
   }
   if !any || els.length == 0 { return -1 }
-  mkArrayTy(tyOfMembers(els))
+  mkArrayTy(ctxLitElemTy(els))
+}
+
+// The element type of a list literal whose element types are `els`: a `null` among them wraps
+// the others, as `[x, null]` types `X | null` in a direct call's parameter context.
+function ctxLitElemTy(els: i32[]): i32 {
+  const rest: i32[] = []
+  let sawNull = false
+  let i = 0
+  while i < els.length {
+    if els[i] == TY_NULL { sawNull = true } else { rest.push(els[i]) }
+    i = i + 1
+  }
+  if !sawNull || rest.length == 0 { return tyOfMembers(els) }
+  if rest.length == 1 { return mkNullableTy(rest[0]) }
+  mkNullableTy(mkUnionTy(rest))
 }
 
 // `ctxLitTyOf` of a record literal `ix`: its fields at their types, -1 for any other node.
@@ -36367,16 +36311,12 @@ export function substTyDeep(tyIx: i32, bNames: string[], bTys: i32[]) {
       // the index dedup above cannot see a value-level duplicate like `T | "err"` at `T :=
       // string`. `out` is read unconditionally; treating it as optional would double the member list.
       const kept3: i32[] = []
-      unionDropSubsumedArms(dropNullableInnerTwins(uniq), kept3)
+      unionDropSubsumedArms(uniq, kept3)
       // A type argument can make a set and a same-rep map meet in one union (D2673); the
       // node whose check substituted reports it (`checkNodeDone`).
       const sclash = setMapUnionClashMsg(kept3, false)
       if sclash != "" { joinClashMsg = sclash }
-      if kept3.length == 1 {
-        res = kept3[0]
-      } else {
-        res = hoistNulLitMember(kept3)
-      }
+      if kept3.length == 1 { res = kept3[0] } else { res = mkUnionTy(kept3) }
     }
   } else if t is TyMap {
     const k2 = substTyDeep(t.mKey, bNames, bTys)
@@ -36391,128 +36331,6 @@ export function substTyDeep(tyIx: i32, bNames: string[], bTys: i32[]) {
   // fresh arena index the provenance bank does not know about unless re-banked here, or the same type renders under two different names depending which door it came through.
   genAppCarry(tyIx, res, bNames, bTys)
   res
-}
-
-// The union of `ms`, with a `K | null` member's `null` wrapping the whole, as the annotation
-// route spells `K | null | i32`: a literal-union niche is no box member of its own (D3140).
-function hoistNulLitMember(ms: i32[]): i32 {
-  if !anyNullableMember(ms) { return mkUnionTy(ms) }
-  let nulAt = -1
-  let i = 0
-  while i < ms.length {
-    if ms[i] >= 0 {
-      const t = T.tys[ms[i]]
-      if t is TyNullable {
-        if tyIsLitUnion(t.nInner) && nulAt < 0 { nulAt = i }
-      }
-    }
-    i = i + 1
-  }
-  if nulAt < 0 { return mkUnionTy(ms) }
-  const inner: i32[] = []
-  i = 0
-  while i < ms.length {
-    const m = ms[i]
-    const t = T.tys[m]
-    if i == nulAt && t is TyNullable {
-      inner.push(t.nInner)
-    } else {
-      inner.push(m)
-    }
-    i = i + 1
-  }
-  mkNullableTy(mkUnionTy(inner))
-}
-
-// The base scalar a literal set's values sit in: `armLiteralBaseTy`, or for a union of
-// literal unions (`K | L`) the base every member shares; -1 otherwise.
-function nulFoldBaseTy(ty: i32): i32 {
-  const b = armLiteralBaseTy(ty)
-  if b >= 0 || ty < 0 { return b }
-  const t = T.tys[ty]
-  if !(t is TyUnion) || t.uMembers.length == 0 { return -1 }
-  let base = -1
-  let i = 0
-  while i < t.uMembers.length {
-    const mb = armLiteralBaseTy(t.uMembers[i])
-    if mb < 0 { return -1 }
-    if base < 0 { base = mb }
-    if base != mb { return -1 }
-    i = i + 1
-  }
-  base
-}
-
-// Whether some member of `ms` is a nullable.
-function anyNullableMember(ms: i32[]): boolean {
-  let i = 0
-  while i < ms.length {
-    if ms[i] >= 0 && T.tys[ms[i]] is TyNullable { return true }
-    i = i + 1
-  }
-  false
-}
-
-// `ms` with each nullable member folded against a sibling, as the annotation route builds the
-// same spelling: a sibling the nullable's inner already holds is dropped (`T | string` at `T :=
-// string | null`), and a nullable whose inner a sibling holds makes that sibling nullable (`T |
-// string` at `T := K | null` is `string | null`). Otherwise `ms` unchanged (D3140).
-function dropNullableInnerTwins(ms: i32[]): i32[] {
-  if !anyNullableMember(ms) { return ms }
-  const out: i32[] = []
-  let i = 0
-  while i < ms.length {
-    const mi = ms[i]
-    if mi < 0 { return ms }
-    const ti = T.tys[mi]
-    let keep = true
-    let wrap = false
-    let j = 0
-    while j < ms.length {
-      if j != i && ms[j] >= 0 {
-        const tj = T.tys[ms[j]]
-        if tj is TyNullable {
-          if !(ti is TyNullable) {
-            if tyLitSetHolds(tj.nInner, mi) { keep = false }
-            else if nulFoldBaseTy(tj.nInner) == mi { wrap = true }
-          }
-        } else if ti is TyNullable {
-          if (
-            !tyLitSetHolds(ti.nInner, ms[j])
-            && nulFoldBaseTy(ti.nInner) == ms[j]
-          ) {
-            keep = false
-          }
-        }
-      }
-      j = j + 1
-    }
-    if keep && wrap { out.push(mkNullableTy(mi)) }
-    else if keep { out.push(mi) }
-    i = i + 1
-  }
-  out
-}
-
-// Whether `outer` holds every value of `inner`: the same type, or two string-literal sets with
-// `inner`'s texts among `outer`'s.
-function tyLitSetHolds(outer: i32, inner: i32): boolean {
-  if outer == inner { return true }
-  const it = tyLitMemberTexts(inner)
-  if it.length == 0 { return false }
-  const ot = tyLitMemberTexts(outer)
-  let k = 0
-  while k < it.length {
-    let hit = false
-    let o = 0
-    while o < ot.length {
-      if ot[o] == it[k] { hit = true }
-      o = o + 1
-    }
-    if !hit { return false }
-    k = k + 1
-  }
-  true
 }
 
 // ── free index-operator resolution (B14) ─────────────────────────────────────
