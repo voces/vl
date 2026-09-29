@@ -893,6 +893,8 @@ let memCstrProp: string[] = []
 let memCstrIx: i32[] = []
 let memCstrFn: i32[] = []
 let memCstrDem: boolean[] = []
+// The `memCstrProp` a call through a hole records: not a field name, so no member row shares it.
+const OP_CALL_PIN = "()"
 
 // D1702 — the `HD_COAL` result holes a body minted, so the pin can substitute them. Nothing
 // else asks: a `??` result is not a constraint, so no validator reaches it and `substHoleTy`
@@ -11750,11 +11752,32 @@ function placeFieldTy(baseTy: i32, prop: string, optional: boolean) {
   if core < 0 { return -1 }
   const ct = T.tys[core]
   let ft = -1
-  if ct is TyObj { ft = objFieldType(ct, prop) }
-  else if ct is TyUnion { ft = sharedUnionFieldTy(ct, prop) }
+  if ct is TyObj {
+    ft = objFieldType(ct, prop)
+  } else if ct is TyUnion {
+    ft = sharedUnionFieldTy(ct, prop)
+  } else if ct is TyVar {
+    if !wasNullable { ft = holePlaceFieldTy(core, ct, prop) }
+  }
   if ft < 0 { return -1 }
   if wasNullable { return mkNullableTy(ft) }
   ft
+}
+
+// The field a member read off a hole already derived, as `checkMemberNode` types it, so a null
+// test on `z.f` narrows the hole's field the way it narrows a declared record's (D3197). -1 when
+// the read has not been typed, or the hole reads its members from a bound.
+function holePlaceFieldTy(hole: i32, ht: TyVar, prop: string): i32 {
+  if ht.tvName.length == 0 { return -1 }
+  if ht.tvName[0] == '?' {
+    const shape = holeShapeOf(ht.tvName)
+    if shape < 0 { return -1 }
+    const st = T.tys[shape]
+    if st is TyObj { return objFieldType(st, prop) }
+    return -1
+  }
+  if tpBoundOfName(ht.tvName) >= 0 { return -1 }
+  mkDerivedHole(HD_FLD, prop, -1, -1, hole)
 }
 
 // Shared-field access over a struct union: a field present on every member is readable on the
@@ -33685,7 +33708,19 @@ function indexFloorMsg(arrTy: i32) {
 // operation: `OP_INDEX_GET` is the index form, anything else is that member name.
 export function memCstrMsg(recv: i32, prop: string) {
   if prop == OP_INDEX_GET { return indexFloorMsg(recv) }
+  if prop == OP_CALL_PIN { return callFloorMsg(recv) }
   memberFloorMsg(recv, prop)
+}
+
+// A call's own sentence at a pin: "" when the callee resolves to a function or defers, otherwise
+// the direct spelling's `called value is not a function`, so a `| null` field is not called (D3197).
+function callFloorMsg(fnTy: i32) {
+  if fnTy < 0 { return "" }
+  const t = T.tys[fnTy]
+  if t is TyFunc { return "" }
+  if t is TyErr { return "" }
+  if tyHasHole(fnTy) { return "" }
+  "called value is not a function (" + tyToStr(fnTy) + ")"
 }
 
 // Records a deferred receiver-classification constraint when the receiver still carries a
@@ -35870,7 +35905,13 @@ function holePinReadAt(
     return arrElemValueTy(ev)
   }
   if hdField[row].length == 0 { return -1 }
-  tyFieldTyOf(inner, hdField[row])
+  const fd = tyFieldTyOf(inner, hdField[row])
+  if fd >= 0 { return fd }
+  // A read the checker accepted at the pin reads a nullable record's non-null face: a declared
+  // row with a `| null` field can claim a literal whose field is present (D3205).
+  const nn = nonNullTy(inner)
+  if nn == inner || nn < 0 { return -1 }
+  tyFieldTyOf(nn, hdField[row])
 }
 
 // True when union `pin` has a member assignable to `alt`: an `is alt` guard over a parameter
@@ -36010,7 +36051,9 @@ function substHoleTyReal(tyIx: i32, bNames: string[], bTys: i32[]) {
   if hdField[row].length == 0 { return -1 }
   const inner2 = substHoleTy(hdBase[row], bNames, bTys)
   if inner2 >= 0 {
-    const it2 = T.tys[inner2]
+    // A nullable record reads at its non-null face, as `holePinReadAt` does (D3205); the
+    // member read itself is refused at the pin by its own `memCstrTy` row.
+    const it2 = T.tys[nonNullTy(inner2)]
     if it2 is TyObj {
       const f = objFieldType(it2, hdField[row])
       if f >= 0 { return f }
@@ -40547,6 +40590,7 @@ function checkCallNode(n: Call, ix: i32) {
       }
       hj = hj + 1
     }
+    noteMemCstr(fnTy, OP_CALL_PIN, ix, false)
     return mkDerivedHole(HD_RET, "", -1, -1, fnTy)
   }
   // `v.d()` over a getter reads `v.d` and calls the result: say which getter it read.
@@ -59194,6 +59238,11 @@ function checkMemberNode(n: Member, ix: i32) {
     }
     if ot.tvName.length > 0 {
       if ot.tvName[0] == '?' {
+        // A read off a hole's field re-asks at the pin, where that field may be `H | null` (D3204).
+        const fRow = hdRowOf(objTy)
+        if fRow >= 0 && hdKind[fRow] == HD_FLD {
+          noteMemCstr(objTy, n.memProp, ix, false)
+        }
         // `.length` is the i32 length an array/string/map exposes — treat it as that (not a
         // struct field), so a collection-shaped hole infers without growing a bogus `{length}` shape.
         return symMem(ix, holeMemberTy(objTy, ot.tvName, n.memProp))
