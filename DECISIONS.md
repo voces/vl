@@ -7269,14 +7269,29 @@ per-call struct is PASSED to. It now also chooses a callee that RETURNS one, on 
    reference to a struct — a record, not a list or string wrapper;
 2. the callee allocates it, or gets it from a chosen producer (`wrap(k) = mk(k + 1)`);
 3. at some caller it stays: that caller hands it to no function that is not chosen and returns
-   it only if chosen itself. A producer with no such caller is dropped and the choice restarts
-   without it, so an allocation that escapes anyway is not copied into every caller.
+   it only if that caller is itself a chosen taker or a producer found useful. That is a least
+   fixpoint, computed by a worklist from callers down to callees, so a chain of producers whose
+   top leaks has no useful member and is not copied into every caller.
+
+"Held" now also covers a type some `ref.test`/`ref.cast`/`br_on_cast` targets. A union box
+stores its payload in an `anyref` field that names no struct type, so the field scan missed it,
+and a producer whose only callers box the result was inlined for no melt (+13–18% bytes, one
+module 382 → 886, in review). Getting a record back out of a box needs a cast, so the cast is
+the tell.
+
+Producers are found by a worklist up from the ones that allocate, and the choice runs in two
+rounds — the second without the producers the first found futile, which drops the takers only
+they had made worth choosing. The first version restarted the whole choice after each futile
+producer, one per restart on a chain: 20,000 chained producers built in 25 s against master's
+3.2 s. It is now 3.1 s, and 3,000 / 10,000 / 20,000-producer chains build byte-identically to
+master in the same time.
 
 A caller holding a chosen producer's record counts as allocating it, so a helper it is passed
-to (`score(r)`) is chosen by the existing rule. And a tiny loop-free callee (at most
+to (`score(r)`) is chosen by the existing rule. And any tiny loop-free callee (at most
 `RUN_ONCE_INLINE_LEAF_BYTES`, no call to a defined function) may be chosen although run-once code
-calls it, as `run_once_hot_callees` already leaves such a leaf inlinable: its per-call work is
-too small for V8's baseline tier to matter, and the top-level loop is where a benchmark calls it.
+calls it — a producer or a struct-TAKING helper alike — as `run_once_hot_callees` already
+leaves such a leaf inlinable: its per-call work is too small for V8's baseline tier to matter,
+and the top-level loop is where a benchmark calls it.
 
 **Why not the multi-value ABI first.** Inlining gets plumb's shape all the way: the record
 version now beats the globals one, because the fields become locals where the workaround pays a
@@ -7301,8 +7316,11 @@ reads, read-then-escape, stored in a global, passed, returned on, rewritten, cal
 top-level loop × a producer under and over the inline bound) prints the unoptimized build's
 output at both rungs, and its record allocations left fall from 206 to 161 of 252 modules: 122
 over the bound (D3262), 36 whose record type is stored somewhere (D3263), and 3 nested records'
-inner struct at `-O` only, which `-O3`'s second `--heap2local` melts. Byte-identical: all 48 `bench/` programs at both
-rungs, `plumb-shape-cost.py`'s two units, and the glob version. The compiler at `-O` grows
+inner struct at `-O` only, which `-O3`'s second `--heap2local` melts. Byte-identical: all 90 `bench/` programs at both
+rungs, `plumb-shape-cost.py`'s two units, and the glob version. A second, 260-program grid from
+review (1/3/8/9 fields with and without a nested record × six producer shapes × seven uses ×
+seven ways to store the record, one or three callers, exported or not) prints the plain output
+at both rungs, with fewer allocation sites in 8 modules and more in none. The compiler at `-O` grows
 +0.16% in the same time, and still self-compiles to the seed byte for byte. Without the
 field-shape bound, `std:fmt`'s `bnCopy` (an `i64[]` wrapper) was chosen and `map-string` grew
 8,395 → 12,165 bytes for no melt; the bound is what keeps a list wrapper out.

@@ -5387,7 +5387,8 @@ struct ModuleScan {
     small_records: std::collections::HashSet<u32>,
     /// Struct types that are declared as a subtype, or named by one.
     subtyped: std::collections::HashSet<u32>,
-    /// Types some struct field, array element, global or table can hold.
+    /// Types some struct field, array element, global or table can hold, and types a cast
+    /// targets (a union box's `anyref` payload holds them where no field type says so).
     heap_held: std::collections::HashSet<u32>,
 }
 
@@ -5409,11 +5410,12 @@ impl ModuleScan {
             CompositeInnerType, ElementItems, ExternalKind, HeapType, Name, Operator, Parser,
             Payload, StorageType, TypeRef, ValType,
         };
+        let concrete_heap = |h: HeapType| match h {
+            HeapType::Concrete(i) | HeapType::Exact(i) => i.as_module_index(),
+            _ => None,
+        };
         let concrete = |v: &ValType| match v {
-            ValType::Ref(r) => match r.heap_type() {
-                HeapType::Concrete(i) | HeapType::Exact(i) => i.as_module_index(),
-                _ => None,
-            },
+            ValType::Ref(r) => concrete_heap(r.heap_type()),
             _ => None,
         };
         let mut s = ModuleScan {
@@ -5603,6 +5605,19 @@ impl ModuleScan {
                             Operator::StructNew { struct_type_index }
                             | Operator::StructNewDefault { struct_type_index } => {
                                 b.allocs.insert(struct_type_index);
+                            }
+                            // A type cast back down from an abstract reference was stored as
+                            // one, in a union box's `anyref` payload or the like, which the
+                            // field scan cannot see: it is heap-held too.
+                            Operator::RefTestNonNull { hty }
+                            | Operator::RefTestNullable { hty }
+                            | Operator::RefCastNonNull { hty }
+                            | Operator::RefCastNullable { hty } => {
+                                s.heap_held.extend(concrete_heap(hty));
+                            }
+                            Operator::BrOnCast { to_ref_type, .. }
+                            | Operator::BrOnCastFail { to_ref_type, .. } => {
+                                s.heap_held.extend(concrete_heap(to_ref_type.heap_type()));
                             }
                             _ => {}
                         }
@@ -5900,11 +5915,13 @@ fn rung_passes<'a>(passes: &[&'a str], names: bool) -> Vec<&'a str> {
 /// no heap location can hold leaves its function only through a call or a return), a caller
 /// allocates that type or is itself chosen and takes it, and it is small
 /// (`ESCAPE_INLINE_MAX_BYTES`), in no call cycle (inlining a cycle unrolls it and the struct
-/// stays live anyway), neither run-once code nor called from it (lane L8), and hands the
+/// stays live anyway), neither run-once code nor called from it (lane L8) unless it is a tiny
+/// loop-free leaf (`RUN_ONCE_INLINE_LEAF_BYTES`, taker or producer alike), and hands the
 /// struct type to no function that is not chosen (the struct would escape there anyway).
-/// A callee that RETURNS such a type it allocates itself (or gets from a chosen callee) is
-/// chosen on the same bounds, so a small record result melts at a caller that only reads it,
-/// and a caller holding one counts as allocating it. Chains are bounded by
+/// A callee that RETURNS such a type, a record of at most `ESCAPE_RECORD_MAX_FIELDS` fields,
+/// that it allocates itself (or gets from a chosen callee) is chosen on the same bounds when
+/// some caller keeps the record; a caller holding one counts as allocating it. Producers are
+/// found and pruned by worklists, in two rounds, so a chain of them is linear. Chains are bounded by
 /// `ESCAPE_INLINE_EXPANDED_BYTES` and the whole step by `ESCAPE_INLINE_GROWTH_FLOOR`. Which
 /// allocations actually stay off the heap is binaryen's escape analysis to decide; this only
 /// decides what is worth inlining for it. DECISIONS.md, "`-O` inlines the helpers a per-call
@@ -5962,18 +5979,39 @@ fn escape_inline_choice(s: &ModuleScan) -> Option<std::collections::HashSet<u32>
                 .any(|&(g, _)| chosen.contains(&g) && gives[ix(g)].contains(&t))
     };
     // Whether a `t` held by `c` stays in `c` once the chosen callees are inlined: `c` hands it
-    // to no function that is not chosen, and returns it only when `c` is chosen itself.
-    let stays = |c: u32, t: u32, chosen: &std::collections::HashSet<u32>| {
+    // to no function that is not chosen, and returns it only when `returns_ok`.
+    let stays = |c: u32, t: u32, chosen: &std::collections::HashSet<u32>, returns_ok: bool| {
         s.body(c).calls.iter().all(|&(g, _)| {
             g == c || !s.defined(g) || chosen.contains(&g) || !takes[ix(g)].contains(&t)
-        }) && (!gives[ix(c)].contains(&t) || chosen.contains(&c))
+        }) && (!gives[ix(c)].contains(&t) || returns_ok)
     };
-    // Producers found not to be worth it; the choice restarts without them until none is.
-    let mut banned: std::collections::HashSet<u32> = Default::default();
-    let chosen = loop {
-        let mut chosen: std::collections::HashSet<u32> = Default::default();
-        // A fixpoint, since a chosen callee can make its own callees, and its callers'
-        // callees, worth choosing.
+    // The producers among `allowed`: a worklist from those that allocate what they give back
+    // up through their callers, so a chain of N producers costs O(N), not N passes.
+    let producers = |allowed: &dyn Fn(u32) -> bool| {
+        let mut found: std::collections::HashSet<u32> = Default::default();
+        let mut work: Vec<u32> = (0..s.bodies.len() as u32)
+            .map(|i| s.n_imports + i)
+            .filter(|&f| allowed(f) && gives[ix(f)].iter().any(|t| s.body(f).allocs.contains(t)))
+            .collect();
+        found.extend(work.iter().copied());
+        while let Some(g) = work.pop() {
+            for &(c, _) in callers.get(&g).map(Vec::as_slice).unwrap_or(&[]) {
+                if !found.contains(&c)
+                    && allowed(c)
+                    && gives[ix(c)].iter().any(|t| gives[ix(g)].contains(t))
+                {
+                    found.insert(c);
+                    work.push(c);
+                }
+            }
+        }
+        found
+    };
+    // One round: the given producers, the takers they and the allocating callers make worth
+    // choosing, the drops below, and then the producers left that are worth their inlining.
+    let round = |seed: std::collections::HashSet<u32>| {
+        let mut chosen = seed;
+        // A fixpoint, since a chosen callee can make its own callees worth choosing.
         loop {
             let before = chosen.len();
             for (&f, sites) in &callers {
@@ -5984,9 +6022,7 @@ fn escape_inline_choice(s: &ModuleScan) -> Option<std::collections::HashSet<u32>
                     takes[ix(f)].iter().any(|t| makes(c, *t, &chosen))
                         || (chosen.contains(&c) && shares(f, c))
                 });
-                let producer =
-                    !banned.contains(&f) && gives[ix(f)].iter().any(|&t| makes(f, t, &chosen));
-                if taker || producer {
+                if taker {
                     chosen.insert(f);
                 }
             }
@@ -6026,24 +6062,40 @@ fn escape_inline_choice(s: &ModuleScan) -> Option<std::collections::HashSet<u32>
             }
         }
         // A producer that takes no struct is worth inlining only where what it gives back
-        // stays in the caller; one whose every caller leaks it would only copy the allocation.
-        let futile: Vec<u32> = chosen
+        // stays in some caller. A least fixpoint by worklist: a caller that returns the record
+        // counts only once it is itself useful (or a chosen taker), so a chain whose top
+        // leaks has no useful member.
+        let pures: std::collections::HashSet<u32> = chosen
             .iter()
             .copied()
-            .filter(|&f| {
-                takes[ix(f)].is_empty()
-                    && !callers.get(&f).is_some_and(|sites| {
-                        sites
-                            .iter()
-                            .any(|&(c, _)| gives[ix(f)].iter().any(|&t| stays(c, t, &chosen)))
-                    })
-            })
+            .filter(|&f| takes[ix(f)].is_empty() && !gives[ix(f)].is_empty())
             .collect();
-        if futile.is_empty() {
-            break chosen;
+        let pure = |f: u32| pures.contains(&f);
+        let mut useful: std::collections::HashSet<u32> = Default::default();
+        let mut work: Vec<u32> = pures.iter().copied().collect();
+        while let Some(f) = work.pop() {
+            if useful.contains(&f) {
+                continue;
+            }
+            let kept = callers.get(&f).is_some_and(|sites| {
+                sites.iter().any(|&(c, _)| {
+                    let returns_ok = chosen.contains(&c) && (!pure(c) || useful.contains(&c));
+                    gives[ix(f)].iter().any(|&t| stays(c, t, &chosen, returns_ok))
+                })
+            });
+            if kept {
+                useful.insert(f);
+                work.extend(s.body(f).calls.iter().map(|&(g, _)| g).filter(|&g| pure(g)));
+            }
         }
-        banned.extend(futile);
+        chosen.retain(|&f| !pure(f) || useful.contains(&f));
+        (chosen, useful)
     };
+    let allowed = |f: u32| eligible(f) && !gives[ix(f)].is_empty();
+    // Two rounds, not a fixpoint: the second drops the takers only a futile producer made
+    // worth choosing, and whatever it would drop after that is a small inline, not a cliff.
+    let (_, useful) = round(producers(&allowed));
+    let (chosen, _) = round(useful);
     if chosen.is_empty() {
         return None;
     }
