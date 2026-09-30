@@ -8774,3 +8774,46 @@ resolves each annotation's alias names, so it reads a name → root map built on
 construct, not a function type, and still takes types only — D3270 asks for the same reading.
 A call through a record FIELD (`o.cb(…)`) shows the field's type bare, since the field's
 declaration is not reachable from the member's resolved structural type.
+
+## A `const` with a literal value is a `match` arm (owner ruling A, 2026-09-29) — plumb PL-062, D3271
+
+**The ruling.** `match sig { MAGIC => …, ROOT => …, _ => … }` where `MAGIC` is a `const` whose
+initializer is a literal: the arm is compared by value and treated like the literal it holds —
+duplicate arms, exhaustiveness over a literal union, and the dense-`br_table` lowering all read
+its value. A bare name in pattern position that resolves to no type and to no such constant is a
+hard error. VL has no binding patterns, so a bare name has no other meaning, and refusing it now
+closes Rust's hazard where renaming a constant silently turns its arm into a catch-all binding.
+
+**Decided in the lane, within the ruling.**
+
+* **A type wins.** A bare name that resolves as a type (`null`, a primitive, a declared type or
+  bound, a live type parameter) stays a type pattern, so no existing program changes meaning.
+  Over a value union the arms are member types, and a constant there is refused as a value.
+* **Imported constants work, renamed imports too.** They resolve through the import like any
+  value reference. VL has no qualified module access (`mod.MAGIC` does not parse anywhere), so
+  there is nothing qualified to admit.
+* **A local constant shadows a module one**, where the `match` stands, as any read does; the
+  module merge leaves a shadowed pattern name alone for that reason (`modRwMatchPat`).
+* **Typed constants work** (`const K2: K = "a"` over `K`, `const W: i64 = 3` over `i64`); the arm
+  reads the constant, so its type is the constant's and the assignability rule is the literal
+  arm's. A `const TS: string = "a"` over `K` is admitted by value, as `k == TS` is.
+* **Negative constants work** (`const N = -1`): the value is `-` over a number, exactly the
+  negative literal arm.
+* **Computed constants are refused for now** (`const B = A + 1`, `const A2 = A`). The ruling
+  admits them when the compiler already folds them, and #3262 does — but in the emitter, after
+  the checker, which needs the value for duplicates and exhaustiveness and keeps no constant
+  scope (D1588). The refusal names the fix; D3272 carries the recommendation (one checker-visible
+  constant evaluator the emitter's fold then reads).
+* **Every other name is refused as what it is.** A `let`, a parameter or a loop variable reads
+  "is a variable, not a `const`", a function "is a function", and a name bound to nothing is an
+  unknown name. The checker banks a declaration only for its constants (the per-scope `const`
+  chain it already kept), so the sentence does not tell a `let` from a parameter; a chain of
+  every binding's declaration cost measurable compiler fuel for that one word.
+* **A character or boolean constant is refused** with its own sentence: no integer or literal
+  union arm takes that literal kind today, so the constant has nothing to be compared as.
+* **An `f64` scrutinee stays unsupported**, as it is for literal arms (D1572).
+
+**How it lowers.** The pattern node is rewritten in place into a read of the constant, so the
+desugared test is the hand-written `scrut == MAGIC` and types, narrows and emits as that does;
+the constant's literal is kept beside the node, and `switchLitPair` reads it, so a dense set of
+constant arms is one `br_table` exactly as its literal spelling is.
