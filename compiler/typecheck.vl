@@ -18218,10 +18218,29 @@ function joinTys(a: i32, b: i32) {
   joinVariantTys(a, b)
 }
 
+// Whether `t` is a union holding a declared type parameter, decided per instance.
+function tyIsParamUnion(t: i32): boolean {
+  if t < 0 || t >= T.tys.length { return false }
+  const u = T.tys[t]
+  u is TyUnion && unionHasDeclaredParam(u.uMembers)
+}
+
+// How many `if`/`match` arm joins are being taken: the one place `tpOpenJoin` applies.
+let tpArmJoinDepth = 0
+
+// `joinTys` for the arms of a value `if` or `match`.
+function joinArmTys(a: i32, b: i32): i32 {
+  tpArmJoinDepth = tpArmJoinDepth + 1
+  const j = joinTys(a, b)
+  tpArmJoinDepth = tpArmJoinDepth - 1
+  j
+}
+
 // The join of `a` and `b` when every member is a declared type parameter or a null and one
 // parameter is the checked body's own: each parameter once, the null kept, re-joined at each
 // pin (D3267). -1 otherwise; a concrete member is joined by the rules above.
 function tpOpenJoin(a: i32, b: i32): i32 {
+  if tpArmJoinDepth == 0 { return -1 }
   const ms: i32[] = []
   flattenVariantsInto(a, ms)
   flattenVariantsInto(b, ms)
@@ -18280,6 +18299,8 @@ function tyParamsPart(a: i32, b: i32, depth: i32): boolean {
       // Two bare parameters part as well, in the body declaring them: collapsed, an instance
       // binding them apart stored both arms in the first one's cell (D3268).
       if depth == 0 && !tyParamOfInnermostBody(a) { return false }
+      // A hole's resolution (a lambda's deferred return) re-joins as it always has (D3358).
+      if depth == 0 && (tyIsHole(a) || tyIsHole(b)) { return false }
       return tyParamNamesPart(ta.tvName, b)
     }
     TyArray => {
@@ -18983,9 +19004,11 @@ function tyParamBesideBare(p: i32, c: i32): boolean {
   tyParamBesideConcrete(p, c) && tyParamOfOpenBody(p)
 }
 
-// Whether type variable `p` names a type parameter of the innermost declaration being checked:
-// a lambda inside a generic body is lifted apart and keeps the join it had.
+// Whether type variable `p` names a type parameter of the innermost declaration being checked,
+// whose joins keep parameters apart: not inside a lambda, and not in a body taking a list of a
+// type parameter, the two shapes whose instances do not yet build such a join (D3357, D3358).
 function tyParamOfInnermostBody(p: i32): boolean {
+  if lamCheckDepth > 0 { return false }
   const tp = T.tys[p]
   if tp is TyVar {
     const k = cstrOwnerStack.length - 1
@@ -18994,6 +19017,20 @@ function tyParamOfInnermostBody(p: i32): boolean {
     if owner >= 0 && owner < P.nodes.length {
       const fd = P.nodes[owner]
       if fd is FuncDecl {
+        for pi in fd.fnParams {
+          const pn = P.nodes[pi]
+          if pn is Param && pn.parType >= 0 {
+            const pt = nodeTyIxOf(pn.parType)
+            if (
+              pt >= 0
+              && pt < T.tys.length
+              && T.tys[pt] is TyArray
+              && tyHasTyVar(pt)
+            ) {
+              return false
+            }
+          }
+        }
         for nm in fd.fnTyParams {
           if nm == tp.tvName { return true }
         }
@@ -19395,6 +19432,8 @@ function refoldJoinUnion(
   let res = -1
   let live = 0
   let j = 0
+  // A lambda's deferred return re-joins as it always has: its instance builds no kept-apart join.
+  lamCheckDepth = lamCheckDepth + 1
   while j < orig.length {
     if !holeMemberDeadAt(orig[j], bNames, bTys) {
       res = joinRetTys(res, subst[j])
@@ -19402,6 +19441,7 @@ function refoldJoinUnion(
     }
     j = j + 1
   }
+  lamCheckDepth = lamCheckDepth - 1
   // Every arm proven dead is not a type — keep the union rather than invent one.
   if live == 0 || res < 0 { return mkUnionTy(subst) }
   res
@@ -45395,7 +45435,7 @@ function matchArmTally(ix: i32, body: i32, armTy: i32, acc: i32): i32 {
   }
   const v = f32ArmPlainTy(body, ifArmValTy(body, armTy))
   if acc < 0 { return v }
-  joinTys(acc, v)
+  joinArmTys(acc, v)
 }
 
 function matchTallyEnd(ix: i32, acc: i32) {
@@ -47072,7 +47112,8 @@ function finishInferredReturn(
       // own recorder for the emitter to seed from — so none of them floor (D1576).
       if (
         itt.nInner >= 0
-        && !tyHasTyVar(itt.nInner)
+        && !(T.tys[itt.nInner] is TyVar)
+        && !tyIsParamUnion(itt.nInner)
         && !tyIsPrimNamed(itt.nInner, "boolean")
         && !tyIsPrimNamed(itt.nInner, "string")
         && litUnionAliasNameOfTy(itt.nInner) == ""
@@ -47413,6 +47454,18 @@ function noteNestedUnannotFn(fnIx: i32, fty: i32) {
 // trailing expression (`noteInferredRet`, under a `-2` pending `curRet`), then patched into
 // the hoisted `TyFunc` in place so every caller sees it. A base-case-less cycle has nothing to latch onto and reports "cannot infer a return type".
 function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
+  if n.fnName != "" { return checkFuncDeclNodeReal(n, fnIx) }
+  lamCheckDepth = lamCheckDepth + 1
+  const r = checkFuncDeclNodeReal(n, fnIx)
+  lamCheckDepth = lamCheckDepth - 1
+  r
+}
+
+// How many lambda bodies the checker is inside, their inference probes included (D3358).
+let lamCheckDepth = 0
+
+// `checkFuncDeclNode`'s body, counted by it inside a lambda.
+function checkFuncDeclNodeReal(n: FuncDecl, fnIx: i32) {
   // A `function` (top-level OR nested) whose name the emitter dispatches on inline is a
   // definition that can never run — reject it at the definition, not at the call site
   // that silently means something else. Anchored on the decl node, so the pass-1 hoist
@@ -59169,7 +59222,7 @@ function checkMatchIntArms(n: MatchExpr, ix: i32, st: i32) {
       // sentinel TY_ERR (both are -1), so a void-arm `match` must not be read as an error.
       if armTy < 0 { armTy = TY_VOID }
     }
-    matchTy = joinTys(matchTy, f32ArmPlainTy(body, armTy))
+    matchTy = joinArmTys(matchTy, f32ArmPlainTy(body, armTy))
     if tpEnvNames.length > 0 { matchArmTys.push(f32ArmPlainTy(body, armTy)) }
     matchValAcc = matchArmTally(ix, body, armTy, matchValAcc)
     ai = ai + 1
@@ -59485,7 +59538,7 @@ function checkMatchTypeArms(n: MatchExpr, ix: i32, st: i32, uMems: i32[]) {
       if armTy < 0 { armTy = TY_VOID }
     }
     if scoped { popScope() }
-    matchTy = joinTys(matchTy, f32ArmPlainTy(body, armTy))
+    matchTy = joinArmTys(matchTy, f32ArmPlainTy(body, armTy))
     if tpEnvNames.length > 0 { matchArmTys.push(f32ArmPlainTy(body, armTy)) }
     matchValAcc = matchArmTally(ix, body, armTy, matchValAcc)
     bi = bi + 1
@@ -59837,7 +59890,7 @@ function checkMatchExprNode(n: MatchExpr, ix: i32) {
       // sentinel TY_ERR (both are -1), so a void-arm `match` must not be mistaken for an error.
       if armTy < 0 { armTy = TY_VOID }
     }
-    matchTy = joinTys(matchTy, f32ArmPlainTy(body, armTy))
+    matchTy = joinArmTys(matchTy, f32ArmPlainTy(body, armTy))
     if tpEnvNames.length > 0 { matchArmTys.push(f32ArmPlainTy(body, armTy)) }
     matchValAcc = matchArmTally(ix, body, armTy, matchValAcc)
     ai = ai + 1
@@ -60365,7 +60418,7 @@ function checkIfTail(
       // A `void` here is an else-less link's value-less fall-through, which adds nothing.
       const ev = f32ArmPlainTy(n.ifElse, ifArmValTy(n.ifElse, elseTy))
       if thenExits || valTy == TY_VOID { valTy = ev }
-      else if ev != TY_VOID { valTy = joinTys(valTy, ev) }
+      else if ev != TY_VOID { valTy = joinArmTys(valTy, ev) }
     }
     if f32Join >= 0 { valTy = f32Join }
     if bareArm { ifValTyAt[ix] = -1 } else { ifValTyAt[ix] = valTy }
@@ -60383,7 +60436,7 @@ function checkIfTail(
   if daHasElse {
     const thenPlain = f32ArmPlainTy(n.ifThen, thenTy)
     const elsePlain = f32ArmPlainTy(n.ifElse, elseTy)
-    const plainJoin = joinTys(thenPlain, elsePlain)
+    const plainJoin = joinArmTys(thenPlain, elsePlain)
     f32JoinRevert(ix)
     if tpEnvNames.length > 0 && !thenExits && !daElseDiverges {
       let elseApart = elsePlain
@@ -65986,7 +66039,7 @@ function checkRetStmtNode(n: RetStmt, ix: i32) {
 function discardedIfValTy(hasElse: boolean, thenTy: i32, elseTy: i32): i32 {
   if hasElse {
     const savedClash = joinClashMsg
-    const j = joinTys(thenTy, elseTy)
+    const j = joinArmTys(thenTy, elseTy)
     joinClashMsg = savedClash
     return j
   }
