@@ -8853,7 +8853,12 @@ parenthesised — is re-typed only by:
   expression (`y += 3000000000`), bounds it to the types that hold that literal (`y = 3000000000`
   needs a 64-bit type; `y = 0xFFFFFFFF` is `-1` at `i32` and 4294967295 at `i64`, the width the
   other uses choose);
-* a store of another literal `let`, solved jointly by a worklist.
+* a store of another literal `let` (whole, in an operand, or in an integer intrinsic's operand),
+  solved jointly by a worklist. The answer does not depend on the order the bindings are
+  declared in (D3343, plumb PL-079): the stores settle first, each binding offering only the
+  narrowest type its own rows need, and only then does a store's target bound the binding
+  stored into it — so `r9 = r10 * 2` widens `r9` to `r10`'s `i64`, never caps `r10` at a
+  default `r9` guessed first.
 
 Rules:
 

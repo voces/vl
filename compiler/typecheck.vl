@@ -14774,6 +14774,7 @@ function lbiNoteStore(tc: i32, src: i32) {
   const tys: i32[] = []
   const froms: i32[] = []
   lbiLeaves(src, cands, tys, froms)
+  lbiIntrCands(src, cands, 0)
   for c in cands {
     if c != tc && lbiAnn[c] < 0 { lbiPush(tc, LBI_EDGE, c, src) }
   }
@@ -14788,6 +14789,39 @@ function lbiNoteStore(tc: i32, src: i32) {
     if froms[i] == -2 { lbiPush(tc, LBI_FLOAT, TY_F64, src) }
     else if froms[i] != tc { lbiPush(tc, LBI_LO, tys[i], src) }
     i = i + 1
+  }
+  0
+}
+
+// Push onto `cands` the candidates read by the operands of every integer intrinsic in the tree
+// `ix` whose result is its operands' width (`divU(b, 3)`), as a store of `b * 3` would.
+function lbiIntrCands(ix: i32, cands: i32[], depth: i32) {
+  if depth > LBI_TREE_DEPTH { return 0 }
+  const leaves: i32[] = []
+  lbiTreeLeaves(ix, leaves, 0)
+  for l in leaves {
+    const n = P.nodes[l]
+    if n is Call {
+      const f = P.nodes[n.callFn]
+      if f is Ident {
+        const nm = f.identName
+        if (
+          intIntrArity(nm) > 0
+          && !intIntrIsCompare(nm)
+          && !numIntrShadowed(nm)
+        ) {
+          for a in n.callArgs {
+            const inner: i32[] = []
+            lbiTreeLeaves(a, inner, 0)
+            for il in inner {
+              const c = lbiCandAt(il)
+              if c >= 0 { cands.push(c) }
+            }
+            lbiIntrCands(a, cands, depth + 1)
+          }
+        }
+      }
+    }
   }
   0
 }
@@ -15118,7 +15152,14 @@ function lbiTakesAll(
 // The type rows `ks`/`us` give `decl`, or -1 when no type satisfies them all: the join of every
 // typed use (`f64` when only float literals are), else the meet of the destinations, else the
 // narrowest type that satisfies them all and the join widens to, else the narrowest that does.
-function lbiChoose(decl: i32, def: i32, ks: i32[], us: i32[]): i32 {
+// With `least`, the default never widens the answer: the narrowest type the rows need wins.
+function lbiChoose(
+  decl: i32,
+  def: i32,
+  ks: i32[],
+  us: i32[],
+  least: boolean,
+): i32 {
   let j = -1
   let typed = false
   let m = -1
@@ -15133,11 +15174,11 @@ function lbiChoose(decl: i32, def: i32, ks: i32[], us: i32[]): i32 {
     }
     i = i + 1
   }
-  if !typed { j = def }
+  if !typed && !least { j = def }
   // A store joins with the literal's own type: storing an `f32` into `let x = 0.5` keeps `f64`.
   let stored = false
   for k in ks {
-    if k == LBI_LO { stored = true }
+    if k == LBI_LO && !least { stored = true }
   }
   if stored && j >= 0 { j = lbiJoin(j, def) }
   if j >= 0 && lbiTakesAll(decl, def, ks, us, j) { return j }
@@ -15179,13 +15220,19 @@ function lbiSolve() {
     r = r + 1
   }
   // Only an edge reads another binding's answer, so without one the final sweep is the answer.
-  if lbiEdges > 0 { lbiSettleEdges(rowsOf, chosen) }
+  // Stores settle first and bound their targets from below; only then does a target's answer
+  // bound the value stored into it, so no provisional answer caps a source (D3343).
+  if lbiEdges > 0 {
+    const order = lbiRowOrder()
+    lbiSettleEdges(rowsOf, chosen, order, true)
+    lbiSettleEdges(rowsOf, chosen, order, false)
+  }
   c = 0
   while c < nc {
     const a = lbiAnn[c]
     let t = -1
     if !lbiIsConst[c] && rowsOf[c].length > 0 {
-      t = lbiSolveOne(c, rowsOf[c], chosen, a < 0)
+      t = lbiSolveOne(c, rowsOf[c], chosen, a < 0, false)
     }
     if a >= 0 {
       if t < 0 { t = lbiDef[c] }
@@ -15199,27 +15246,58 @@ function lbiSolve() {
   0
 }
 
-// Settle the candidates edges join: a worklist that re-solves a candidate's edge neighbours when
-// its answer moves, so a chain settles in one visit per link. The answers can fall as well as
-// rise (a meet), so the visits are capped at a few per candidate.
-function lbiSettleEdges(rowsOf: i32[][], chosen: i32[]) {
+// Every candidate a row names, in the order of its first row: the order its uses appear in,
+// which does not depend on the order the bindings are declared in.
+function lbiRowOrder(): i32[] {
+  const seen: boolean[] = []
+  for _ in lbiCands { seen.push(false) }
+  const out: i32[] = []
+  let r = 0
+  while r < lbiRowCand.length {
+    const a = lbiRowCand[r]
+    if !seen[a] {
+      seen[a] = true
+      out.push(a)
+    }
+    if lbiKind[r] == LBI_EDGE {
+      const b = lbiTy[r]
+      if !seen[b] {
+        seen[b] = true
+        out.push(b)
+      }
+    }
+    r = r + 1
+  }
+  out
+}
+
+// Settle the candidates edges join: a worklist, seeded in `order`, that re-solves a candidate's
+// edge neighbours when its answer moves, so a chain settles in one visit per link. With `fwd`,
+// only the stores' own direction is read. Answers can fall as well as rise, so visits are capped.
+function lbiSettleEdges(
+  rowsOf: i32[][],
+  chosen: i32[],
+  order: i32[],
+  fwd: boolean,
+) {
   const nc = lbiCands.length
   const queued: boolean[] = []
+  for _ in lbiCands { queued.push(false) }
   const work: i32[] = []
-  let c = 0
-  while c < nc {
-    const on = lbiAnn[c] < 0 && !lbiIsConst[c] && rowsOf[c].length > 0
-    queued.push(on)
-    if on { work.push(c) }
-    c = c + 1
+  for c0 in order {
+    if lbiAnn[c0] < 0 && !lbiIsConst[c0] && rowsOf[c0].length > 0 {
+      queued[c0] = true
+      work.push(c0)
+    }
   }
+  let c = 0
   let head = 0
   const cap = nc * 8
   while head < work.length && head < cap {
     c = work[head]
     head = head + 1
     queued[c] = false
-    const t = lbiSolveOne(c, rowsOf[c], chosen, false)
+    const t = lbiSolveOne(c, rowsOf[c], chosen, false, fwd)
     if t >= 0 && chosen[c] != t {
       chosen[c] = t
       for r0 in rowsOf[c] {
@@ -15263,8 +15341,14 @@ function lbiDeferRedundant(decl: i32, initTy: i32) {
 
 // The type for candidate `c` from its rows `rs` (an edge's far end read from `chosen`), or -1
 // when it has no typed use or no type satisfies them. With `report`, the latter records its
-// refusal.
-function lbiSolveOne(c: i32, rs: i32[], chosen: i32[], report: boolean): i32 {
+// refusal; with `fwd`, a store's target does not yet bound the value stored into it.
+function lbiSolveOne(
+  c: i32,
+  rs: i32[],
+  chosen: i32[],
+  report: boolean,
+  fwd: boolean,
+): i32 {
   if c < 0 || c >= lbiCands.length { return -1 }
   const ks: i32[] = []
   const us: i32[] = []
@@ -15284,7 +15368,7 @@ function lbiSolveOne(c: i32, rs: i32[], chosen: i32[], report: boolean): i32 {
         k = LBI_LO
         u = lbiChosenOf(chosen, lbiTy[r])
       }
-    } else {
+    } else if !fwd {
       r = -r0 - 1
       k = LBI_UP
       u = lbiChosenOf(chosen, lbiRowCand[r])
@@ -15314,7 +15398,7 @@ function lbiSolveOne(c: i32, rs: i32[], chosen: i32[], report: boolean): i32 {
   }
   if us.length == 0 { return -1 }
   const d = lbiCands[c]
-  const t = lbiChoose(d, def, ks, us)
+  const t = lbiChoose(d, def, ks, us, fwd)
   if t < 0 && report { lbiRefuse(d, def, ks, us, ats) }
   let v = 0
   while v < vks.length {
