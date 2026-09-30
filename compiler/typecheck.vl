@@ -18202,6 +18202,8 @@ function joinTys(a: i32, b: i32) {
   // parameter is assignable to either, and taking it alone drops the union's other members (D2876).
   if tyVarMemberOf(a, b) { return b }
   if tyVarMemberOf(b, a) { return a }
+  const oj = tpOpenJoin(a, b)
+  if oj >= 0 { return oj }
   // Two different records may join wider than either (`{f: i32}` into `{f: f64}`) (D2731).
   if !recordJoinMinted && a != b {
     if T.tys[a] is TyObj && T.tys[b] is TyObj { recordJoinMinted = true }
@@ -18209,6 +18211,49 @@ function joinTys(a: i32, b: i32) {
   if assignable(b, a) && !joinWidensMap(b, a) { return a }
   if assignable(a, b) && !joinWidensMap(a, b) { return b }
   joinVariantTys(a, b)
+}
+
+// The join of `a` and `b` when every member is a declared type parameter or a null and one
+// parameter is the checked body's own: each parameter once, the null kept, re-joined at each
+// pin (D3267). -1 otherwise; a concrete member is joined by the rules above.
+function tpOpenJoin(a: i32, b: i32): i32 {
+  const ms: i32[] = []
+  flattenVariantsInto(a, ms)
+  flattenVariantsInto(b, ms)
+  const kept: i32[] = []
+  let hasNull = false
+  let open = false
+  for m in ms {
+    if m < 0 || m >= T.tys.length || m == TY_ERR || m == TY_VOID { return -1 }
+    const mt = T.tys[m]
+    if isNullTy(m) {
+      hasNull = true
+    } else if mt is TyVar {
+      if !tyIsDeclaredParam(m) { return -1 }
+      if tyParamOfOpenBody(m) { open = true }
+      let dup = false
+      for k in kept {
+        if k == m || sameDeclaredTyParam(k, m) { dup = true }
+      }
+      if !dup { kept.push(m) }
+    } else {
+      // A concrete member is joined by the rules above (D2906, D3212).
+      return -1
+    }
+  }
+  if !open || kept.length == 0 { return -1 }
+  if kept.length == 1 {
+    if hasNull { return mkNullableTy(kept[0]) }
+    return -1
+  }
+  const u = mkUnionTy(kept)
+  // arena-tick exempt: a per-program mark on a fresh arena row.
+  tpJoinUnions[u] = 1
+  if !hasNull { return u }
+  const res = mkNullableTy(u)
+  // arena-tick exempt: a per-program mark on a fresh arena row.
+  tpJoinUnions[res] = 1
+  res
 }
 
 // Whether `a` and `b` hold two differently named declared type parameters at one position
@@ -18229,7 +18274,6 @@ function tyParamsPart(a: i32, b: i32, depth: i32): boolean {
     TyVar => {
       // Two bare parameters keep the collapse: each instance stores the join in the scalar or
       // ref cell of its pin, as before D2760; only under a constructor are the two storages apart.
-      if depth == 0 { return false }
       return tyParamNamesPart(ta.tvName, b)
     }
     TyArray => {
@@ -40637,7 +40681,25 @@ function rejoinMembers(ms: i32[]): i32 {
     r = joinTys(r, ms[i])
     i = i + 1
   }
-  r
+  rejoinDropSubsumed(r)
+}
+
+// `r` with each literal arm a later, wider member subsumes dropped: a left fold keeps `"a"`
+// beside a `string` joined after it, where the chain's own join absorbs it (D3266).
+function rejoinDropSubsumed(r: i32): i32 {
+  if r < 0 || r >= T.tys.length { return r }
+  let u = r
+  const rt = T.tys[r]
+  if rt is TyNullable { u = rt.nInner }
+  if u < 0 || u >= T.tys.length { return r }
+  const ut = T.tys[u]
+  if !(ut is TyUnion) { return r }
+  const kept: i32[] = []
+  if !unionDropSubsumedArms(ut.uMembers, kept) { return r }
+  let nu = kept[0]
+  if kept.length > 1 { nu = mkUnionTy(kept) }
+  if u != r { return mkNullableTy(nu) }
+  nu
 }
 
 // Deep substitution of a call's bindings into a type: a bound `TyVar` becomes its binding; a
@@ -40666,7 +40728,21 @@ export function substTyDeep(tyIx: i32, bNames: string[], bTys: i32[]) {
       if t.aRead == 1 { res = mkArrayViewTy(e2) } else { res = mkArrayTy(e2) }
     }
   } else if t is TyNullable {
-    const n2 = substTyDeep(t.nInner, bNames, bTys)
+    let n2 = substTyDeep(t.nInner, bNames, bTys)
+    if (
+      n2 != t.nInner
+      && t.nInner >= 0
+      && tpJoinUnions.has(tyIx)
+      && T.tys[t.nInner] is TyUnion
+    ) {
+      // A kept-apart join's null wraps its union: the members re-join as one set (D3267).
+      const nms: i32[] = []
+      flattenVariantsInto(n2, nms)
+      const tpSaved = tpApartConcrete
+      tpApartConcrete = true
+      n2 = rejoinMembers(nms)
+      tpApartConcrete = tpSaved
+    }
     if n2 != t.nInner { res = mkNullableTy(n2) }
   } else if t is TyObj {
     const onames = t.objFieldNames
@@ -46970,7 +47046,7 @@ function finishInferredReturn(
       // own recorder for the emitter to seed from — so none of them floor (D1576).
       if (
         itt.nInner >= 0
-        && !(T.tys[itt.nInner] is TyVar)
+        && !tyHasTyVar(itt.nInner)
         && !tyIsPrimNamed(itt.nInner, "boolean")
         && !tyIsPrimNamed(itt.nInner, "string")
         && litUnionAliasNameOfTy(itt.nInner) == ""

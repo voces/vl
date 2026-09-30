@@ -2073,13 +2073,9 @@ function monoIfChainRebuildPinned(
         if tpu { pty = monoPinUnionBoxed(pty) }
       } else if sink || tpu {
         pty = monoIfArmsPinJoin(at, raw, bN, bT)
-      }
-      // Recorded, not returned, as below: the build stops loudly rather than invalid (D3280).
-      if tpu && monoMultiParamLitNullJoin(raw, pty) {
-        emitFailAt(
-          "emitProgram: a join of several type parameters holding a literal union, a string and a null has no box at this instance",
-          at,
-        )
+      } else if monoHoleJoinPinsString(raw, at, bN, bT) {
+        // A hole join the pin makes a string is built as one, its atom arms widened (D3291).
+        pty = monoHoleJoinPinTy(at, bN, bT)
       }
       const retype = pty >= 0
         && pty != raw
@@ -2099,6 +2095,38 @@ function monoIfChainRebuildPinned(
     li = li - 1
   }
   ce
+}
+
+// Whether the `if` chain at `at`, typed at inference hole `raw`, is pinned at `string` or
+// `string | null`: the rep its arms' own atoms would otherwise leave it at is not the pin's.
+function monoHoleJoinPinsString(
+  raw: i32,
+  at: i32,
+  bN: string[],
+  bT: i32[],
+): boolean {
+  if raw < 0 || raw >= T.tys.length { return false }
+  const rt = T.tys[raw]
+  if !(rt is TyVar) { return false }
+  if rt.tvName.length > 0 && rt.tvName[0] != "?"[0] { return false }
+  const p = monoHoleJoinPinTy(at, bN, bT)
+  if p < 0 || p >= T.tys.length || tyHasTyVar(p) { return false }
+  if tyPrimNameOf(p) == "string" { return true }
+  const pt = T.tys[p]
+  pt is TyNullable && tyPrimNameOf(pt.nInner) == "string"
+}
+
+// The pinned type of join `at`, through a hole instance's own hole binding where the
+// parameters' binding leaves it open.
+function monoHoleJoinPinTy(at: i32, bN: string[], bT: i32[]): i32 {
+  const p = monoPinnedTyOf(at, bN, bT)
+  if (p >= 0 && !tyHasTyVar(p)) || monoPinHoleN.length == 0 { return p }
+  const jN: string[] = []
+  const jT: i32[] = []
+  monoJoinBinding(bN, bT, monoPinHoleN, monoPinHoleT, jN, jT)
+  const s = substTyDeep(nodeTyIxOf(at), jN, jT)
+  if s < 0 || tyHasTyVar(s) { return p }
+  s
 }
 
 // Whether `ty` names a type parameter and every arm value of the `if` chain at `ix` is typed
@@ -2138,7 +2166,7 @@ function monoIfArmsPinJoin(ix: i32, raw: i32, bN: string[], bT: i32[]): i32 {
     if !monoTySameMembers(j, monoPinRetTy) { return -1 }
     j = monoPinRetTy
   }
-  if T.tys[j] is TyUnion {
+  if monoTyIsUnionOrNulUnion(j) {
     const name = valueUnionRetName(j)
     if name == "" || monoRegisterPinUnion(name) < 0 { return -1 }
   }
@@ -2173,37 +2201,9 @@ function monoHoleJoinDropsArm(
     && !assignable(j, pty)
 }
 
-// Whether join `raw` names two or more type parameters and its pinned type `pty` holds a literal
-// union, a string and a null, the shape whose instance has no box (D3280).
-function monoMultiParamLitNullJoin(raw: i32, pty: i32): boolean {
-  if raw < 0 || raw >= T.tys.length || pty < 0 || pty >= T.tys.length {
-    return false
-  }
-  const ru = T.tys[raw]
-  if !(ru is TyUnion) { return false }
-  let params = 0
-  for m in ru.uMembers {
-    if m >= 0 && m < T.tys.length && T.tys[m] is TyVar { params = params + 1 }
-  }
-  if params < 2 { return false }
-  const ms: i32[] = []
-  flattenVariantsInto(pty, ms)
-  let lit = false
-  let str = false
-  let nul = tyBearsNull(pty)
-  for m in ms {
-    if m >= 0 && m < T.tys.length {
-      if tyIsLitUnion(m) || T.tys[m] is TyLit { lit = true }
-      if tyBearsNull(m) { nul = true }
-      if tyPrimNameOf(nonNullTy(m)) == "string" { str = true }
-    }
-  }
-  lit && nul && str
-}
-
 // `j`, its value-union box registered first when it is a union whose box has a name.
 function monoPinUnionBoxed(j: i32): i32 {
-  if j < 0 || j >= T.tys.length || !(T.tys[j] is TyUnion) { return j }
+  if j < 0 || j >= T.tys.length || !monoTyIsUnionOrNulUnion(j) { return j }
   const name = valueUnionRetName(j)
   if name != "" { monoRegisterPinUnion(name) }
   j
@@ -2661,8 +2661,23 @@ function monoTpJoinBindAnn(init: i32, bN: string[], bT: i32[]): i32 {
   if st < 0 || st >= T.tys.length || tyHasTyVar(st) { return -1 }
   const nm = monoPinUnionName(tyToEmitName(st))
   if nm == "" { return -1 }
-  if T.tys[st] is TyUnion && monoRegisterPinUnion(nm) < 0 { return -1 }
+  if monoTyIsUnionOrNulUnion(st) && monoRegisterPinUnion(nm) < 0 { return -1 }
   synthTypeRefTy(nm, -1, st)
+}
+
+// Whether `t` is a union or a nullable union, the two shapes a value-union box holds; a
+// nullable literal union is a niche, not a box.
+function monoTyIsUnionOrNulUnion(t: i32): boolean {
+  if t < 0 || t >= T.tys.length { return false }
+  const tt = T.tys[t]
+  if tt is TyNullable {
+    const inr = tt.nInner
+    return inr >= 0
+      && inr < T.tys.length
+      && T.tys[inr] is TyUnion
+      && !tyIsLitUnion(inr)
+  }
+  tt is TyUnion
 }
 
 // Registers the box of list literal `ix`'s element at its pinned list type `pty` when its template
@@ -3678,14 +3693,7 @@ function monoTyHoldsGradual(t: i32, depth: i32): boolean {
   const o = T.tys[t]
   if o is TyObj {
     for ft in o.objFieldTypes {
-      if (
-        ft >= 0
-        && ft < T.tys.length
-        && T.tys[ft] is TyUnion
-        && tyHasTyVar(ft)
-      ) {
-        return true
-      }
+      if monoTyIsUnionOrNulUnion(ft) && tyHasTyVar(ft) { return true }
       if monoTyHoldsGradual(ft, depth + 1) { return true }
     }
     return false

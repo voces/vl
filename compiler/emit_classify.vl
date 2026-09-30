@@ -10221,7 +10221,7 @@ export function exprHasStrOp(exprIx: i32, fnIx: i32) {
     if exprHasStrOp(e.ifCond, fnIx) { return true }
     // An atom arm under a `string`-typed join widens, staging the atom id in the string-op
     // frame. Mirrors the emit decision: the join type recorded by the checker, any arm.
-    if tyKindOf(nodeTyIxOf(exprIx)) == TK_STR {
+    if tyKindOf(nodeTyIxOf(exprIx)) == TK_STR || nodeTyIsNulString(exprIx) {
       if ifChainHasAtomArm(exprIx, fnIx) { return true }
     }
     // The same widening reached through the arms, where the join records one arm's type.
@@ -30960,7 +30960,51 @@ function holeLitReadIsAtom(exprIx: i32, fnIx: i32, depth: i32): boolean {
     if d.letType >= 0 { return tyHasTyVar(nodeTyIxOf(d.letType)) }
     return holeLitReadIsAtom(d.letInit, fnIx, depth + 1)
   }
-  !nodeIsValueJoin(ix)
+  if nodeIsValueJoin(ix) { return holeJoinArmsAllAtom(ix, fnIx, depth + 1) }
+  true
+}
+
+// Whether every arm value of the value join at `ix` holds the atom, so the join is the atom too;
+// one string arm makes it a string ref (D1728, D3291).
+function holeJoinArmsAllAtom(ix: i32, fnIx: i32, depth: i32): boolean {
+  if depth > 4 { return false }
+  const arms: i32[] = []
+  const n = P.nodes[ix]
+  if n is MatchExpr {
+    for b in n.matchBodies {
+      if b >= 0 && P.nodes[b] is Block {
+        arms.push(ifArmValueExpr(b))
+      } else {
+        arms.push(b)
+      }
+    }
+  } else {
+    let cur = ix
+    while cur >= 0 {
+      const c = P.nodes[cur]
+      cur = -1
+      if c is IfStmt {
+        arms.push(ifArmValueExpr(c.ifThen))
+        if c.ifElse < 0 { return false }
+        if P.nodes[c.ifElse] is IfStmt {
+          cur = c.ifElse
+        } else {
+          arms.push(ifArmValueExpr(c.ifElse))
+        }
+      }
+    }
+  }
+  if arms.length == 0 { return false }
+  for v in arms {
+    if v < 0 { return false }
+    const u = unwrapParen(v)
+    if nodeIsValueJoin(u) {
+      if !holeJoinArmsAllAtom(u, fnIx, depth + 1) { return false }
+    } else if !exprIsLitAtom(u, fnIx) {
+      return false
+    }
+  }
+  true
 }
 
 // The element type iterable `iterIx` holds at the pin of the instance `fnIx` is: the hole and
