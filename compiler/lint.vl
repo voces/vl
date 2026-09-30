@@ -60,7 +60,7 @@ import {
 } from "./ast"
 // The free index-operator declaration-name encoding.
 import { OP_INDEX_GET, OP_INDEX_SET, opDeclLabel, opDeclOpOf } from "./ast"
-import { getDeclLabel, getDeclPropOf } from "./ast"
+import { getDeclLabel, getDeclPropOf, letWasRetyped } from "./ast"
 import {
   nodeLastTok,
   nodeSpanEndTok,
@@ -1889,14 +1889,40 @@ function lintBindDecl(name: string) {
 }
 
 // Whether `name`'s innermost binding is a `const` whose initializer is a number, `-` over one,
-// or a string — the constants a `match` arm takes.
+// a string, or a copy of a numeric one — the constants a `match` arm takes.
 function lintBindIsLitConst(name: string) {
   const d = lintBindDecl(name)
   if d < 0 || d >= P.nodes.length { return false }
   const dn = P.nodes[d]
   if dn is LetDecl {
     if dn.letKw != "const" { return false }
-    return lintIsLitInit(lintUnwrapParen(dn.letInit))
+    const init = lintUnwrapParen(dn.letInit)
+    if lintIsLitInit(init) { return true }
+    return dn.letType < 0 && lintIsNumCopy(init, 0)
+  }
+  false
+}
+
+// Whether `ix` is the bare name of an un-annotated `const` holding a number, written there or
+// copied by name in turn: such a copy holds that number (D3246).
+function lintIsNumCopy(ix: i32, depth: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length || depth > 8 { return false }
+  const e = P.nodes[ix]
+  if e is Ident {
+    const d = lintBindDecl(e.identName)
+    if d < 0 || d >= P.nodes.length { return false }
+    const dn = P.nodes[d]
+    if dn is LetDecl {
+      if dn.letKw != "const" || dn.letType >= 0 { return false }
+      const init = lintUnwrapParen(dn.letInit)
+      if init >= 0 && init < P.nodes.length && P.nodes[init] is NumLit {
+        return true
+      }
+      if init >= 0 && init < P.nodes.length && lintIsNegNum(init) {
+        return true
+      }
+      return lintIsNumCopy(init, depth + 1)
+    }
   }
   false
 }
@@ -2355,6 +2381,7 @@ function preferConst() {
         && !startsUnderscore(name)
         && !declIsExported(ix)
         && externGlobalLinkOfNode(ix) < 0
+        && !letWasRetyped(ix)
       ) {
         // Used (else unused-variable owns it) and never written.
         if declUsed[i] != 0 && declWritten[i] == 0 {
@@ -3285,7 +3312,7 @@ const asTables = [
 ]
 
 // The emitter's ordered pass table (`emit_sections.vl`, `runEmitPass`) plus
-// `checkProgram`, the checker's entry. `scripts/scan-budget.py` re-derives this list
+// `checkProgramPass`, the checker's walk. `scripts/scan-budget.py` re-derives this list
 // from `runEmitPass` and fails when the two disagree, so this copy cannot go stale.
 const asPasses = [
   "collectTyParamNames", "collectU", "collectS", "collectA", "collectFns",
@@ -3298,7 +3325,7 @@ const asPasses = [
   "collectMapFilterUse", "collectFnValUse", "collectCloSigs", "scanPrintUse",
   "initGuardScan", "checkFnParams", "capCacheBuild", "capNarrowBuild",
   "synthCaptureEmptyListAnns", "synthCaptureReadAnns", "foldMemShared",
-  "auditRecordJoinLeaves", "scanExprArmLocals", "checkProgram",
+  "auditRecordJoinLeaves", "scanExprArmLocals", "checkProgramPass",
 ]
 
 // Scanners that are not pass-table rows and still run once per program. Each entry is
