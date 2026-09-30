@@ -4031,6 +4031,10 @@ trapped `cast failure` at the caller's next `q.x + 1`. **No new semantics were c
 The rule is the owner's A9 reads-only rule, already governing lists: a covariant delivery is
 legal exactly where nothing it reaches WRITES a widened slot.
 
+**Since 2026-09-29 it governs only deliveries that share a storage.** An existing record whose
+field is STORED differently at the destination is refused outright, written or not, and a fresh
+one is built there ("Record covariance: only a fresh value widens", below).
+
 * **What counts as a widened slot.** Every field path whose type differs between the delivered
   value and the destination (`.x`, `.inner.x`, `.xs[]`, a map's `[]`), including the slots of a
   union member the value can be narrowed to. A slot owned by a fresh literal is exempt — no
@@ -9020,3 +9024,84 @@ over the name's narrowing layers (`narWriteStorage`), not the join. Master's nes
 writes already read 8.2 on that walk; the emitter's narrowing stack now keeps a per-key slot
 index so a lookup or retirement costs the key's own entries rather than the whole stack, which
 took a flat run of straight-line writes from 10.5 to 3.95.
+
+## Record covariance: only a fresh value widens (owner ruling "A, with C eventually", 2026-09-29) — D2996
+
+**The ruling.** A record delivered where a record of the same field names stores a field
+differently is allowed only for a FRESH value: an object literal at the delivery, which is built
+there, or a binding that holds only a literal, which adopts the destination type. Any existing
+record — a binding, a call result, a field — is refused, and the message names both fixes:
+build the source at the wider type, or copy it with a literal `{ f: i.f }`. Records are shared
+references, so widening one in place lets a write through the wider handle break the narrower
+one's invariant; this is the array-covariance rule ("No implicit container widening") for
+records. Copy-on-delivery (B) was rejected because it silently changes aliasing. Read-only
+covariance (C: a `readonly` record type or view) is a later, additive extension: it only admits
+deliveries this rule refuses, so nothing here precludes it.
+
+**Rep, not type, decides.** The rule asks whether the two records STORE a field differently
+(`fieldStorageEq`), not whether their types differ. A list field and its `readonly` view, an
+integer literal type and `i32`, a map whose entries store alike, and two records whose fields all
+do are one storage, and the delivery is shared soundly as it always was; D2060's reads-only rule
+still governs writes through such a handle. `i32` into `i32 | null`, `i64`, `f64` or
+`i32 | string`, `O` into `O | null`, a record into a union of records, a string literal union
+into `string` and a nested record of any of these differ.
+
+**Where it is asked.** Every delivery the checker's assignment seam sees (argument, return,
+binding, assignment, field and element store, `push`, list literal element, closure argument,
+generic receiver) and every join operand (`if`/`match` arm, `??` operand, inferred return, list
+literal element) is queued and walked once the pass is over (`recRunPending`, beside D2060's
+`rcwRunPending`), when the occurrence index is complete; a pair of types no existing record could
+be refused at is dropped before anything is resolved, so a program with no such pair pays
+nothing measurable (plumb's shape units read +0.04% guest fuel).
+
+**What counts as fresh.** The walk follows a value to where it was built: through parentheses,
+un-annotated bindings (a `const`, or a `let` assigned only object literals), `if`/`match`/block
+tails, both `??` operands (an existing record on either side is refused), an element read of a
+list literal, a container built by inference (`Map()`, `Set()`, a generic call whose result names
+a type parameter and into which no existing list goes), and a generic identity call (`id(x)`, a
+bare `T` result from one `T` parameter). An object or list literal reached that way is fresh and
+judged field by field and element by element. One reading goes past the ruling's words and is
+recorded as such: **a call of a function with no declared result (a lambda bound to a name
+included) that returns only fresh records is fresh too**. The distilled corpus depends on it —
+refusing those call results cost 598 behavioural classes (17,155 census cells) of running
+programs — and it is the same fact as a binding: nothing else holds the value. A returned local
+that the function also hands to another place (an argument, a store, a literal) is shared, and is
+judged by its type (D3341).
+
+**Adoption, and where it stops.** A fresh BINDING delivered where a record of its field names
+stores a field differently takes that record as its type: the destination is written as its
+annotation and the program is checked again, the literal-binding re-check of D3246. Every later
+use then sees the destination type, which is what makes D2933's element delivery run, and two
+demands that store differently are refused naming both lines. Three limits keep every program
+that ran with the values it printed:
+
+* **No adoption across a numeric width or kind** (`i32` into `i64` or `f64`, at any depth), a
+  coordinator decision parked on [D3339](docs/internals/inventory/D3339.md): adopting would
+  change what the binding's reads compute (`e.f + 1` over `2147483647`, `c.f / 3`). The delivery
+  keeps master's behaviour; D2909, D2914, D2917, D2922, D2924, D2925, D2994, D2995 and D3200 stay
+  where master had them.
+* **No adoption of a function's result.** The first candidate wrote the destination as a
+  function's declared result, and an annotated function whose literal is built at a declared
+  record of its own fields is invalid wasm where the un-annotated call ran (D3342). A function's
+  call stays master's delivery.
+* **The re-check is undone** when it refuses anything but the adopted binding handed on whole.
+
+Where master built invalid wasm for a delivery the checker neither adopts nor refuses as
+existing, it refuses instead, with the existing-record wording: a record a function built (or an
+element of a list binding) into a bare `f32`/`f64` field it holds as an integer, which has no
+conversion (`recFloatBuiltElsewhere`); a literal built inside a function or through a generic
+identity call where a declared record of its own fields exists, which builds it at that row
+(`recBuiltAtDeclared`, D3338 — a method or generic argument declines, since `Map.set` of the same
+call runs on master, D3349-D3351); and one binding or function a kept delivery builds at another
+storage and that is handed on whole at its own type, or delivered at two storages
+(`recKeptConflicts`).
+
+**Measured before landing, against master `2b30e3674`, after the #3312 review.** The distilled
+corpus lost no runs. The review's 1,344-cell grid: 0 value changes, 0 fresh runs lost, 9 invalid
+modules to runs, 1,012 invalid or emit-refused cells to check refusals; 12 existing-record runs
+(`O` into `O | null` at a map value or closure capture) are refused as the ruling requires, and 74
+cells stay invalid or emit-refused as on master (D3339, D3349-D3351). A 540-cell width grid
+(six width pairs × six fresh spellings × five positions × three uses): all 320 running cells
+print master's values, and all 220 invalid or refused ones are now check refusals. The 936-cell
+position grid and the 88-cell adoption grid show 0 value changes and no new silent cell.
+plumb's 508 files check identically.
