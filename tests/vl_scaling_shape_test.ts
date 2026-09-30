@@ -20,12 +20,13 @@
 
 // A COMPILE BAR IS THE FAMILY DEFAULT 2.5, OR 1.25x THE AXIS'S FUEL RATIO WHERE THAT IS
 // HIGHER; an axis whose bar is deliberately tighter keeps it. A fuel ratio is the same on
-// every run, so the margin pays only for the compiler changing, not for the box. Four axes
+// every run, so the margin pays only for the compiler changing, not for the box. Five axes
 // sit above the default because they are super-linear today — `types`, `modules`, `reads
-// after many closed sibling shadows`, `list concat chain length` — and that is recorded
-// DEBT, not tolerance: lower a bar when the thing it names stops multiplying. Three are GROWTH
-// pairs, the same shape at `n` against `n/4`, so linear reads 4 rather than 1: `many
-// distinct captured sibling blocks`, `list concat chain length` and `in-function value writes`. The CPU readings quoted
+// after many closed sibling shadows`, `list concat chain length`, `if joins nested deep` —
+// and that is recorded DEBT, not tolerance: lower a bar when the thing it names stops
+// multiplying. Five are GROWTH pairs, the same shape at `n` against `n/4`, so linear reads 4
+// rather than 1: `many distinct captured sibling blocks`, `list concat chain length`,
+// `in-function value writes` and the two `if joins` pairs. The CPU readings quoted
 // beside individual pairs below predate fuel grading.
 
 import { ROOT, VL, exists } from "./support/tree.ts";
@@ -1235,11 +1236,69 @@ const genLiteralChain = (n: number): string => {
   return o.join("\n") + "\n";
 };
 
+// The flow-narrowing join at an `if` (DECISIONS.md, "Flow narrowing: per-path facts meet at
+// joins") folds the ledger rows of its own subtree once, and hands its enclosing join one
+// summary row per key. Two GROWTH pairs, `n` against `n/4`, so linear reads 4 and quadratic 16:
+// `n` sequential joins of one name in one function, and joins nested `n` deep. Sequential reads
+// 3.98. Nested reads 5.26 and is super-linear in DEPTH, not size: a write walks the name's
+// narrowing layer per enclosing block (`narWriteStorage`, `narBindDepthOf`), as a nested
+// straight-line write already did on master `296e1141d` (8.2 there, 4.6 here). The ratio keeps
+// climbing with depth (8.0 at 400 against 100), so its bar, 1.25x the reading, records DEBT.
+const genSeqJoins = (n: number): string => {
+  const o = [
+    "function nn(v: i32): i32 | null {",
+    "  if v < 0 { return null }",
+    "  return v",
+    "}",
+    "function f(k: i32): i32 {",
+    "  let acc = 0",
+    "  let x = nn(k)",
+  ];
+  for (let i = 0; i < n; i++) {
+    o.push(`  x = nn(k - ${i % 3})`, `  if x == null { x = ${i % 7} } else { x = x + 1 }`, "  acc = acc + x");
+  }
+  o.push("  acc", "}", "print(f(1))");
+  return o.join("\n") + "\n";
+};
+
+const genNestedJoins = (n: number): string => {
+  const o = [
+    "function nn(v: i32): i32 | null {",
+    "  if v < 0 { return null }",
+    "  return v",
+    "}",
+    "function f(k: i32, c: boolean): i32 {",
+    "  let acc = 0",
+    "  let x = nn(k)",
+  ];
+  for (let i = 0; i < n; i++) {
+    const pad = "  ".repeat(i + 1);
+    o.push(`${pad}x = nn(k - ${i % 3})`, `${pad}if x == null { x = ${i % 7} }`, `${pad}acc = acc + x`, `${pad}if c {`);
+  }
+  for (let i = n - 1; i >= 0; i--) o.push(`${"  ".repeat(i + 1)}}`);
+  o.push("  acc", "}", "print(f(1, true))");
+  return o.join("\n") + "\n";
+};
+
 axis(
   "literal binding store chain",
   5.0,
   "The literal-binding solve (`lbiSettleEdges`, compiler/typecheck.vl) is re-solving every binding per link.",
   (d) => twoFiles(d, genLiteralChain(400), genLiteralChain(100)),
+);
+
+axis(
+  "sequential if joins of one name",
+  5.0,
+  "An `if`'s arm join (`applyArmJoins`, compiler/typecheck.vl) is folding ledger rows outside its own subtree.",
+  (d) => twoFiles(d, genSeqJoins(1200), genSeqJoins(300)),
+);
+
+axis(
+  "if joins nested deep",
+  6.6,
+  "An enclosing `if`'s join re-folds its inner joins' rows (`narCompactIf`, compiler/typecheck.vl).",
+  (d) => twoFiles(d, genNestedJoins(120), genNestedJoins(30)),
 );
 
 // ── the one RUNTIME axis ─────────────────────────────────────────────────────

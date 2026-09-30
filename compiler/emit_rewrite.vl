@@ -31,6 +31,10 @@ import {
   inferRetRungIsStructElemList,
   inferRetTyIxByNode,
   inferRetTyIxOf,
+  joinHeadOf,
+  joinRowName,
+  joinRowNext,
+  joinRowRename,
   lambdaVoidAdoptedAt,
   letJoinCandidates,
   litUnionAliasNameOfTy,
@@ -171,6 +175,7 @@ import {
 import {
   cboxCellNames,
   cboxReadTy,
+  cboxStoreCells,
   emitRootIx,
   fRetVoid,
   fnDispNames,
@@ -2652,6 +2657,39 @@ function cboxContStoreBack(ix: i32, name: string, label: string, nest: i32) {
 // maker's own and is boxed, one opened deeper shadows the maker's name.
 let cboxDepth = 0
 
+// Point the arm-join rows banked at `ix` (an `if`, or the statement a value-position `if` is the
+// whole value of) that name a boxed binding, or a path off one, at the cell the rewritten reads
+// go through (`c[0]`, `c[0].v`), so the push after the statement lands on them.
+// The rows already renamed: a body is walked once per frame that holds it.
+let cboxRenamedRows: {[i32]: boolean} = Map()
+
+function cboxRenameJoins(ix: i32, boxed: string[]) {
+  let r = joinHeadOf(ix)
+  while r >= 0 {
+    const key = joinRowName(r)
+    if cboxRenamedRows[r] ?? false {
+      r = joinRowNext(r)
+      continue
+    }
+    let cut = 0
+    while cut < key.length && key[cut] != '.' && key[cut] != '[' {
+      cut = cut + 1
+    }
+    const root = key.slice(0, cut)
+    if (
+      strListHas(boxed, root)
+      && (cboxShadow[root] ?? 0) == 0
+      && (cboxVecCells[root] ?? 0) == 0
+    ) {
+      const cell = cboxCellOf[root] ?? root
+      joinRowRename(r, cell + "[0]" + key.slice(cut, key.length))
+      cboxRenamedRows[r] = true
+    }
+    r = joinRowNext(r)
+  }
+  0
+}
+
 // Rewrites the maker body (and its nested lambda bodies): a use of a boxed name → `c[0]`,
 // and a boxed `let c = init` → `let c = [init]`, except where a nested function's own
 // binding shadows the name. Returns the (possibly replaced) node index so parents
@@ -2677,6 +2715,7 @@ function cboxWalk(ix: i32, boxed: string[]) {
         return un
       }
       if rd >= 0 && rty >= 0 { cboxReadTy[rd] = rty }
+      if rd >= 0 && cboxStoreTarget { cboxStoreCells[rd] = 1 }
       return rd
     }
     return ix
@@ -2705,6 +2744,7 @@ function cboxWalk(ix: i32, boxed: string[]) {
     return ix
   }
   if n is LetDecl {
+    cboxRenameJoins(ix, boxed)
     n.letInit = cboxWalk(n.letInit, boxed)
     if cboxDepth > 0 {
       cboxShadowPush(n.letName)
@@ -2714,6 +2754,7 @@ function cboxWalk(ix: i32, boxed: string[]) {
     return ix
   }
   if n is BinExpr {
+    cboxRenameJoins(ix, boxed)
     const leftName = cboxTypedLeftName(n, boxed)
     cboxStoreTarget = n.binOp == "=" && P.nodes[unwrapParen(n.binLeft)] is Ident
     n.binLeft = cboxWalk(n.binLeft, boxed)
@@ -2732,6 +2773,7 @@ function cboxWalk(ix: i32, boxed: string[]) {
     return ix
   }
   if n is IfStmt {
+    cboxRenameJoins(ix, boxed)
     // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
     let cur = ix
     while cur >= 0 {
@@ -2944,6 +2986,8 @@ function cboxPick(dlets: string[], alam: string[]) {
 export function captureBoxRewrite(_stmts: i32[]) {
   cboxCellNames = Map()
   cboxReadTy = Map()
+  cboxStoreCells = Map()
+  cboxRenamedRows = Map()
   let fe = 0
   while fe < fnStmts.length {
     const fn = P.nodes[fnStmts[fe]]
@@ -3279,10 +3323,36 @@ function shrParamNeedsSeed(name: string, body: i32): boolean {
 // Respells the bindings under `ix` that `shrDeclare` decides to, and every read of one. A
 // block closes its bindings and a loop its variables; an `else if` chain is walked along its
 // spine, so its depth costs no stack.
+// The arm-join rows already respelled: a row names its binding as the checker spelled it.
+let shrJoinDone: {[i32]: boolean} = Map()
+
+// Respell the arm-join rows banked at `ix` whose root this pass gave a new spelling, as it
+// respells the reads they describe.
+function shrRespellJoins(ix: i32) {
+  let r = joinHeadOf(ix)
+  while r >= 0 {
+    if !(shrJoinDone[r] ?? false) {
+      shrJoinDone[r] = true
+      const key = joinRowName(r)
+      let cut = 0
+      while cut < key.length && key[cut] != '.' && key[cut] != '[' {
+        cut = cut + 1
+      }
+      const sp = shrCur[key.slice(0, cut)] ?? ""
+      if sp != "" && sp != key.slice(0, cut) {
+        joinRowRename(r, sp + key.slice(cut, key.length))
+      }
+    }
+    r = joinRowNext(r)
+  }
+  0
+}
+
 function shrWalk(ix: i32) {
   let cur = ix
   while cur >= 0 && cur < P.nodes.length {
     const n = P.nodes[cur]
+    if n is IfStmt || n is LetDecl || n is BinExpr { shrRespellJoins(cur) }
     if n is Ident {
       const sp = shrCur[n.identName] ?? ""
       if sp != "" && sp != n.identName {
@@ -3357,6 +3427,7 @@ function shrWalk(ix: i32) {
 // when a closure inside it reads some name. Runs before any pass that asks about captures.
 export function shadowRespell(stmts: i32[]) {
   shrGlobals = Map()
+  shrJoinDone = Map()
   let gi = 0
   while gi < stmts.length {
     const g = P.nodes[stmts[gi]]
