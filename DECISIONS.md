@@ -9157,3 +9157,35 @@ Measured against master `3291e99e1`: the distilled corpus lost no runs, the file
 the five rows this re-grades, and plumb-shape guest fuel moved +0.02% (main and tail). The
 compiler's own source has no delivery the adapter rewrites (its first self-compile was
 byte-identical to the second).
+
+## A map read off a hole is read at the map its instance pins, by the emitter only (2026-09-30) — D3130, D3155
+
+A read `m[k]` off an un-annotated parameter (or a `<T>` one) is an element derivation of the
+hole, and at a map pin it is the value or `null`. The emitter never resolved it there, so a hole
+instance read every map as a plain `i32` map: a `boolean` printed `1`, an atom printed its id, and
+a scalar miss bound the raw `0`.
+
+**The emitter resolves it; the checker does not.** `holePinReadOf` and `nodeTyPinIxOf` answer the
+derivation at a map pin (`mapPinReadTy`), and the emitter's map readers ask the receiver through
+`mapRecvTyIn`: its recorded type, else the instance's own binding (`holeOperandTyOf`, or the exact
+binding of a `<T>` instance), else the program's one banked pin. The #3282 candidate resolved it in
+`substHoleTyReal` as well and lost running cells in each of four review rounds, because every
+deferred `??` and demand re-asked at the pin changed at once. The price of leaving the checker is
+D3400: a demand on the read (a member access on the nullable result, `print` of a map) is not
+re-asked at the pin.
+
+**A `??` default that no member can hold keeps the template reading.** `atomMap[k] ?? 5` is an
+`AB | i32` join, which no spelling lowers (the direct one refuses it at check, and `x ?? 3` over a
+`K | null` binding is an emit refusal). Reading that map at its pin makes the emitter refuse it,
+which loses the twelve `d3127-coal-price` cells whose key misses and so print the default. Those
+keep master's lowering (`coalMapReadForeignDefault`); the hit that prints the id is D3127.
+
+**The binding's box comes from the one banked pin**, since a shared `LetDecl` carries one
+synthesized annotation. Two calls at two map types therefore still bind the raw scalar (D3398).
+
+Measured against master `8df60e472`: the distilled corpus lost no runs, rep-fuzz is exact, the
+filed-witness grader moved only the five rows this re-grades, and plumb-shape guest fuel moved
+-0.03%. Lane MH's map-read grid (11 value types, 9 readers, a hit and a miss, a field or a bound
+receiver, in the hole, `<T>` and direct spellings) went from 67 wrong values to none against the
+direct twin, and from 68 invalid modules or traps to 44, all of them D3399 or D3400. It lost no
+running cell with `i32` or string keys or with a second instance.
