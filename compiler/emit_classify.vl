@@ -121,6 +121,12 @@ import {
   luDeclPosOf,
   mapDeliveryRecorded,
   mapRetagAllRows,
+  mapTyValIsBool,
+  mapTyValIsLitUnion,
+  mapTyValIsNulBool,
+  mapTyValIsNulLitUnion,
+  mapTyValIsNumLitUnion,
+  mapTyValLitUnionTexts,
   mapUnboxTyOf,
   mapValIsI32Cell,
   mapValSoftBase,
@@ -176,11 +182,8 @@ import {
   nodeTyIxOf,
   nodeTyMapKeyKind,
   nodeTyMapKeyKindSpan,
-  nodeTyMapValIsBool,
   nodeTyMapValIsLitUnion,
-  nodeTyMapValIsNulBool,
   nodeTyMapValIsNulLitUnion,
-  nodeTyMapValIsNumLitUnion,
   nodeTyMapValName,
   nodeTyName,
   nodeTyPinIxOf,
@@ -19628,13 +19631,13 @@ function numLitUnionBoxKind(ty: i32): i32 {
   -1
 }
 
-// `numLitUnionBoxKind` asked of a map READ expression, from the recorded types alone — the
-// one place the numeric-litunion rule is applied, so the two twins below cannot drift.
-function mapReadNumLitBoxKind(exprIx: i32) {
+// `numLitUnionBoxKind` asked of a map READ expression inside `fnIx`, from the receiver's type
+// there (`mapRecvTyIn`) — the one place the numeric-litunion rule is applied.
+function mapReadNumLitBoxKind(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return -1 }
   const e = P.nodes[unwrapParen(exprIx)]
   if !(e is Index) { return -1 }
-  const rt = nodeTyIxOf(e.idxArr)
+  const rt = mapRecvTyIn(e.idxArr, fnIx)
   if rt < 0 { return -1 }
   const r = T.tys[rt]
   if !(r is TyMap) { return -1 }
@@ -19656,8 +19659,17 @@ export function mapReadScalarBoxKindTy(exprIx: i32) {
 // or -1 for a value with a niche of its own or no scalar rep.
 export function mapRecvScalarBoxKindTy(recvIx: i32) {
   if recvIx < 0 { return -1 }
-  const rt = nodeTyIxOf(recvIx)
-  if rt < 0 { return -1 }
+  mapTyScalarBoxKind(nodeTyPinIxOf(recvIx))
+}
+
+// `mapRecvScalarBoxKindTy` inside function `fnIx`, whose instance may pin the receiver.
+export function mapRecvScalarBoxKindIn(recvIx: i32, fnIx: i32) {
+  mapTyScalarBoxKind(mapRecvTyIn(recvIx, fnIx))
+}
+
+// `mapRecvScalarBoxKindTy` of the map type `rt` itself.
+function mapTyScalarBoxKind(rt: i32) {
+  if rt < 0 || rt >= T.tys.length { return -1 }
   const r = T.tys[rt]
   if !(r is TyMap) { return -1 }
   const v = r.mVal
@@ -19689,9 +19701,10 @@ export function mapReadScalarBoxKind(exprIx: i32, fnIx: i32) {
   // A numeric literal union value is decided first, since neither test below can see it:
   // it reps as its base scalar (#1866), so it interns an ordinary mv slot and the
   // litunion exclusions further down are string-only by construction.
-  const nlk = mapReadNumLitBoxKind(exprIx)
+  const nlk = mapReadNumLitBoxKind(exprIx, fnIx)
   if nlk >= 0 { return nlk }
-  if nodeTyMapValIsNumLitUnion(e.idxArr) { return -1 }
+  const rmt = mapRecvTyIn(e.idxArr, fnIx)
+  if mapTyValIsNumLitUnion(rmt) { return -1 }
   const sl = mapShapeOfExpr(e.idxArr, fnIx)
   if sl >= 0 {
     if mvValKind[sl] == MVK_I64 {
@@ -19706,9 +19719,8 @@ export function mapReadScalarBoxKind(exprIx: i32, fnIx: i32) {
     return -1
   }
   // The mono map (no mv slot). Only PLAIN i32 lands here without a niche of its own.
-  const rv = e.idxArr
-  if nodeTyMapValIsNulLitUnion(rv) || nodeTyMapValIsLitUnion(rv) { return -1 }
-  if nodeTyMapValIsNulBool(rv) || nodeTyMapValIsBool(rv) { return -1 }
+  if mapTyValIsNulLitUnion(rmt) || mapTyValIsLitUnion(rmt) { return -1 }
+  if mapTyValIsNulBool(rmt) || mapTyValIsBool(rmt) { return -1 }
   0 // i32
 }
 
@@ -19885,6 +19897,22 @@ function coalesceLitUnionDefaultIsAtom(defIx: i32, texts: string[], fnIx: i32) {
   exprIsLitAtom(dix, fnIx)
 }
 
+// True when `defIx`, the default of a `??` over a read off the atom-valued map `recvIx`, is a
+// value that read's atom rep cannot hold, where a hole instance reads the map at its pin. The
+// direct spelling refuses such a default at check; the instance keeps the template's reading,
+// under which the read is not an atom.
+export function coalMapReadForeignDefault(
+  recvIx: i32,
+  defIx: i32,
+  fnIx: i32,
+): boolean {
+  const rt = nodeTyIxOf(recvIx)
+  if rt >= 0 && rt < T.tys.length && T.tys[rt] is TyMap { return false }
+  const texts = mapTyValLitUnionTexts(mapRecvTyIn(recvIx, fnIx))
+  if texts.length == 0 { return false }
+  !coalesceLitUnionDefaultIsAtom(defIx, texts, fnIx)
+}
+
 // True when the `??` at `exprIx` lowers as the `K | null` atom niche: its LHS is that
 // niche and its default reps as the same i32. The default decides whether the rep
 // survives at all, not just its nullability — a non-atom default (joining to `string`)
@@ -19930,6 +19958,10 @@ export function coalesceOperandPinNonNull(exprIx: i32, fnIx: i32): boolean {
   if !(e is BinExpr) { return false }
   const d = unwrapParen(e.binRight)
   if d < 0 { return false }
+  // A read off a map keeps the fused lowering, which reads the stored value at its own rep
+  // whatever a store before it narrowed the place to.
+  const mr = fusedMapReadRecvIx(unwrapParen(e.binLeft))
+  if mr >= 0 && mapRecvTyIn(mr, fnIx) >= 0 { return false }
   const pn = tyPrimNameOf(coalesceOperandPinTy(unwrapParen(e.binLeft), fnIx))
   if pn == "string" { return exprString(d, fnIx) }
   pn == "i32" && tyPrimNameOf(nodeTyIxOf(d)) == "i32"
@@ -21621,7 +21653,12 @@ export function exprNulBool(exprIx: i32, fnIx: i32) {
   // A bare map read `m[k]` over a `boolean | null`-valued map yields the niche i32 (0/1
   // with sentinel 2), so an un-annotated `const b = m[k]` narrows with `!= null` against 2.
   if e is Index {
-    if nodeTyMapValIsNulBool(e.idxArr) { return true }
+    const nbMt = mapRecvTyIn(e.idxArr, fnIx)
+    if mapTyValIsNulBool(nbMt) { return true }
+    // A plain `boolean` map's read is `boolean | null` too, its miss the same sentinel.
+    if (mapTyValIsBool(nbMt) && !indexPlaceNonNull(unwrapParen(exprIx))) {
+      return true
+    }
     // A `(boolean | null)[]` element no recorded type covers, the capture cell's read, is the
     // niche until a narrowing excludes null (D2397).
     if (
@@ -21711,10 +21748,11 @@ export function exprNulLitUnion(exprIx: i32, fnIx: i32) {
     }
     // A bare map read `m[k]` over `{[string]: K | null}` yields the niche i32 (a member id
     // or `-1`), so `const t = m[k]` narrows with `!= null` against `-1`.
-    if nodeTyMapValIsNulLitUnion(e.idxArr) { return true }
+    const nlMt = mapRecvTyIn(e.idxArr, fnIx)
+    if mapTyValIsNulLitUnion(nlMt) { return true }
     // …and the non-nullable spelling `{[string]: K}` reads the same niche: a bare `m[k]`
     // is `K | null` there too (a missing key is null), via the same `-1` miss value.
-    if nodeTyMapValIsLitUnion(e.idxArr) { return true }
+    if mapTyValIsLitUnion(nlMt) { return true }
   }
   // A fused `m[k] ?? d` read over `{[string]: K | null}` yields the niche i32, so
   // `const t = m[k] ?? d` narrows with `!= null` — the same fused-read home `m.get(k) ?? d` shares.
@@ -21722,7 +21760,8 @@ export function exprNulLitUnion(exprIx: i32, fnIx: i32) {
     if e.binOp == "??" {
       const nblRecv = fusedMapReadRecvIx(unwrapParen(e.binLeft))
       if nblRecv >= 0 {
-        if nodeTyMapValIsNulLitUnion(nblRecv) { return true }
+        if coalMapReadForeignDefault(nblRecv, e.binRight, fnIx) { return false }
+        if mapTyValIsNulLitUnion(mapRecvTyIn(nblRecv, fnIx)) { return true }
       }
       // The non-map `p ?? d` over the same niche keeps it `K | null` exactly when the
       // default can still be null — the consumer half of `emitCoalesce`'s litunion arm.
@@ -28589,7 +28628,13 @@ function nulLitAtomTextsAt(ix: i32, fnIx: i32, depth: i32): string[] {
   if e is Index {
     const elem = tyNulLitUnionMemberTexts(holeNulLitElemTy(e.idxArr, fnIx))
     if elem.length > 0 { return elem }
+    // A read off an atom-valued map is `K | null` at either value spelling: a miss is `-1`.
+    const mv = mapTyValLitUnionTexts(mapRecvTyIn(e.idxArr, fnIx))
+    if mv.length > 0 && !indexPlaceNonNull(unwrapParen(ix)) { return mv }
   }
+  // A `??` over such a read keeps the `-1` when its default can be null.
+  const cmv = coalMapReadNulAtomTexts(ix, fnIx)
+  if cmv.length > 0 { return cmv }
   // A call of a named function, whose return annotation `exprNulLitUnion` claimed it by.
   if e is Call && e.callFn >= 0 && P.nodes[e.callFn] is Ident {
     const t = fnIndexOfSid(sidOfNode(e.callFn))
@@ -28671,9 +28716,59 @@ export function litAtomWidenTexts(ix: i32, fnIx: i32) {
   if decl.length > 0 { return decl }
   const own = tyLitMemberTexts(nodeTyIxOf(ix))
   if own.length > 0 { return own }
+  const mr = mapReadAtomTexts(ix, fnIx)
+  if mr.length > 0 { return mr }
   const clo = callResultAtomTexts(ix, fnIx)
   if clo.length > 0 { return clo }
   memberAtomFieldTexts(ix, fnIx)
+}
+
+// The member texts of a read off an atom-valued map (`m[k]`, `m.get(k)`) or of a `??` over one,
+// named by the receiver's map type; empty for any other expression. A read an instance shares
+// with its generic body records the hole, so the receiver's map is what names the set.
+function mapReadAtomTexts(ix: i32, fnIx: i32): string[] {
+  const u = unwrapParen(ix)
+  const none: string[] = []
+  if u < 0 { return none }
+  const e = P.nodes[u]
+  if e is BinExpr {
+    if e.binOp != "??" { return none }
+    const cr = fusedMapReadRecvIx(unwrapParen(e.binLeft))
+    if cr < 0 || coalMapReadForeignDefault(cr, e.binRight, fnIx) { return none }
+    // A result that can still be null is the niche, never a bare member.
+    if coalMapDefaultMayBeNull(e.binRight, fnIx) { return none }
+    return mapTyValLitUnionTexts(mapRecvTyIn(cr, fnIx))
+  }
+  const recv = fusedMapReadRecvIx(u)
+  if recv < 0 { return none }
+  mapTyValLitUnionTexts(mapRecvTyIn(recv, fnIx))
+}
+
+// The member texts of a `??` at `ix` over a read off an atom-valued map whose default can be
+// null, so the result keeps the `-1` niche; empty for any other expression.
+function coalMapReadNulAtomTexts(ix: i32, fnIx: i32): string[] {
+  const none: string[] = []
+  const u = unwrapParen(ix)
+  if u < 0 { return none }
+  const e = P.nodes[u]
+  if !(e is BinExpr) || e.binOp != "??" { return none }
+  const cr = fusedMapReadRecvIx(unwrapParen(e.binLeft))
+  if cr < 0 || !coalMapDefaultMayBeNull(e.binRight, fnIx) { return none }
+  if coalMapReadForeignDefault(cr, e.binRight, fnIx) { return none }
+  mapTyValLitUnionTexts(mapRecvTyIn(cr, fnIx))
+}
+
+// `coalesceDefaultNullable`, where a default that is itself a hole's read off a map its
+// instance pins also counts: that read is `V | null`, whatever the template recorded.
+function coalMapDefaultMayBeNull(defIx: i32, fnIx: i32): boolean {
+  if coalesceDefaultNullable(defIx, fnIx) { return true }
+  const dix = unwrapParen(defIx)
+  if dix < 0 { return false }
+  const d = P.nodes[dix]
+  if !(d is Index) || indexPlaceNonNull(dix) { return false }
+  const dt = nodeTyIxOf(dix)
+  if dt < 0 || dt >= T.tys.length || !(T.tys[dt] is TyVar) { return false }
+  mapRecvTyIn(d.idxArr, fnIx) >= 0
 }
 
 // The member texts of a call's atom result, read off the callee's function type — the texts
@@ -29057,7 +29152,10 @@ export function exprIsLitAtom(exprIx: i32, fnIx: i32) {
     // half this classifier declined and `print` printed the raw atom id.
     if e.binOp == "??" {
       const blRecv = fusedMapReadRecvIx(unwrapParen(e.binLeft))
-      if blRecv >= 0 { return nodeTyMapValIsLitUnion(blRecv) }
+      if blRecv >= 0 {
+        if coalMapReadForeignDefault(blRecv, e.binRight, fnIx) { return false }
+        return mapTyValIsLitUnion(mapRecvTyIn(blRecv, fnIx))
+      }
     }
   }
   false
@@ -30877,6 +30975,44 @@ export function holeOperandTyOf(exprIx: i32, fnIx: i32): i32 {
   const b = holePinReadOf(ty, monoHoleSubN[row], monoHoleSubT[row])
   if b < 0 || b >= T.tys.length || tyHasTyVar(b) { return -1 }
   b
+}
+
+// The map type receiver `recvIx` reads as inside function `fnIx`: its recorded type, else the
+// pin the hole or type-parameter instance `fnIx` gives it, else the one pin the program banked.
+// -1 when none is a map. The instance is asked first, since every instance shares the node.
+export function mapRecvTyIn(recvIx: i32, fnIx: i32): i32 {
+  const r = unwrapParen(recvIx)
+  if r < 0 { return -1 }
+  const own = nodeTyIxOf(r)
+  if own < 0 || own >= T.tys.length { return -1 }
+  if T.tys[own] is TyMap { return own }
+  // Only a hole's read has a pin to ask.
+  if !(T.tys[own] is TyVar) { return -1 }
+  const h = holeOperandTyOf(r, fnIx)
+  if tyIsMapAt(h) { return h }
+  const x = exactDerivedPinTyOf(r, fnIx)
+  if tyIsMapAt(x) { return x }
+  const p = nodeTyPinIxOf(r)
+  if tyIsMapAt(p) { return p }
+  -1
+}
+
+// A read `exprIx` records as a hole derived off a type parameter, at the binding of the exact
+// instance `fnIx`; -1 outside one, in a lambda lifted inside it, or where the read is unresolved.
+function exactDerivedPinTyOf(exprIx: i32, fnIx: i32): i32 {
+  if monoExactSubN.length == 0 || fnIx < 0 { return -1 }
+  const row = monoExactSubRow.get(fnStmtsPosOf(fnIx)) ?? -1
+  if row < 0 || row >= monoExactSubN.length { return -1 }
+  const ty = nodeTyIxOf(exprIx)
+  if ty < 0 || ty >= T.tys.length || !(T.tys[ty] is TyVar) { return -1 }
+  const b = holePinReadOf(ty, monoExactSubN[row], monoExactSubT[row])
+  if b < 0 || b >= T.tys.length || tyHasTyVar(b) { return -1 }
+  b
+}
+
+// Whether arena type `ty` is a map.
+function tyIsMapAt(ty: i32): boolean {
+  ty >= 0 && ty < T.tys.length && T.tys[ty] is TyMap
 }
 
 // `holeOperandTyOf` where that type is `string | null`, whose niche a join keeps (D3016), or a

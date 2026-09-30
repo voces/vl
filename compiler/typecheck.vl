@@ -1003,6 +1003,8 @@ let argPinChecking = false
 // Per hole-carrying function type: the same signature with each hole at its banked pin,
 // minted once however many classifiers ask for it (D1794).
 let pinFnTy: {[i32]: i32} = Map()
+// Per map type a hole pins to: the value or `null` a read off it yields, minted once.
+let pinMapReadTy: {[i32]: i32} = Map()
 // Declarations whose solve has been attempted, keyed by decl node index — a body is probed at
 // most once, whether or not the probe found anything to solve.
 let paramSolveTried: {[string]: boolean} = Map()
@@ -5081,6 +5083,7 @@ export function initChecker() {
   argPinDone = []
   argPinChecking = false
   pinFnTy = Map()
+  pinMapReadTy = Map()
   paramSolveTried = Map()
   holeFlowSrc = []
   holeFlowDst = []
@@ -40751,9 +40754,34 @@ function pinResolvedAtomTy(tyIx: i32): i32 {
 // monomorphized callback clone shares its nodes with the generic body (D1693).
 export function nodeTyPinIxOf(ix: i32): i32 {
   const ty = nodeTyIxOf(ix)
+  if ty < 0 || ty >= T.tys.length || !(T.tys[ty] is TyVar) { return ty }
   const p = pinnedHoleTyOf(ty)
   if p >= 0 { return p }
+  const mr = pinnedMapReadTyOf(ty)
+  if mr >= 0 { return mr }
   ty
+}
+
+// The type of a read `m[k]` off a hole whose banked pin is a map, or -1 for any other type.
+// `tyIx` is a hole.
+function pinnedMapReadTyOf(tyIx: i32): i32 {
+  const row = hdRowOf(tyIx)
+  if row < 0 || hdKind[row] != HD_ELEMV { return -1 }
+  mapPinReadTy(pinnedHoleTyOf(hdBase[row]))
+}
+
+// What an index read off map `pin` yields, as the concrete read types it: the value or `null`.
+// -1 for a set, which has no index, and for anything that is not a map.
+function mapPinReadTy(pin: i32): i32 {
+  if pin < 0 || pin >= T.tys.length { return -1 }
+  const t = T.tys[pin]
+  if !(t is TyMap) { return -1 }
+  if t.mSet == 1 || t.mVal < 0 { return -1 }
+  const memo = pinMapReadTy[pin] ?? -1
+  if memo >= 0 { return memo }
+  const r = mkNullableTy(t.mVal)
+  pinMapReadTy[pin] = r
+  r
 }
 
 // `substHoleTyReal`, banking the answer for a DERIVED hole under its own name the way the
@@ -40811,6 +40839,8 @@ function holePinReadAt(
   }
   if kind == HD_ELEM { return tyArrayElemIx(inner) }
   if kind == HD_ELEMV {
+    const mr = mapPinReadTy(inner)
+    if mr >= 0 { return mr }
     const ev = tyArrayElemIx(inner)
     if ev < 0 { return -1 }
     return arrElemValueTy(ev)
@@ -56527,46 +56557,62 @@ function tyIsNicheNulScalarElem(ty: i32): boolean {
   false
 }
 
-// Whether node `ix`'s recorded type is a map whose value is a numeric literal union
+// Whether node `ix`'s type (its pin, for a hole) is a map whose value is a numeric literal union
 // (`{[string]: 1.5 | 2.5}`). Needed separately because `tyIsLitUnion` is string-only by
 // construction, and the kind table can't answer either — a numeric litunion reps as its base
 // scalar, interning an ordinary f64/i32 slot whose nullable is the `-1` niche, not a value box.
 export function nodeTyMapValIsNumLitUnion(ix: i32) {
-  const ty = nodeTyIxOf(ix)
-  if ty < 0 { return false }
+  mapTyValIsNumLitUnion(nodeTyPinIxOf(ix))
+}
+
+// `nodeTyMapValIsNumLitUnion` over arena type `ty`, the map itself.
+export function mapTyValIsNumLitUnion(ty: i32) {
+  if ty < 0 || ty >= T.tys.length { return false }
   const t = T.tys[ty]
   if t is TyMap { return numLitUnionHasBase(t.mVal) }
   false
 }
 
-// Whether node `ix`'s recorded type is a string-keyed map whose value is a literal union — the
+// Whether node `ix`'s type (its pin, for a hole) is a map whose value is a literal union — the
 // atom-valued mono map (each value is the interned atom id, a plain i32). The map store /
 // `??`-default sites read this off the receiver to seed the atom context.
 export function nodeTyMapValIsLitUnion(ix: i32) {
-  const ty = nodeTyIxOf(ix)
-  if ty < 0 { return false }
+  mapTyValIsLitUnion(nodeTyPinIxOf(ix))
+}
+
+// `nodeTyMapValIsLitUnion` over arena type `ty`, the map itself.
+export function mapTyValIsLitUnion(ty: i32) {
+  if ty < 0 || ty >= T.tys.length { return false }
   const t = T.tys[ty]
   if t is TyMap { return tyIsLitUnion(t.mVal) }
   false
 }
 
-// Whether node `ix`'s recorded type is a string-keyed map whose value is a nullable literal
+// Whether node `ix`'s type (its pin, for a hole) is a map whose value is a nullable literal
 // union (`{[string]: K | null}`): each value is the interned atom id with the `-1` null
 // sentinel — still the mono i32 map. Admits a bare `null` alongside the member literals.
 export function nodeTyMapValIsNulLitUnion(ix: i32) {
-  const ty = nodeTyIxOf(ix)
-  if ty < 0 { return false }
+  mapTyValIsNulLitUnion(nodeTyPinIxOf(ix))
+}
+
+// `nodeTyMapValIsNulLitUnion` over arena type `ty`, the map itself.
+export function mapTyValIsNulLitUnion(ty: i32) {
+  if ty < 0 || ty >= T.tys.length { return false }
   const t = T.tys[ty]
   if t is TyMap { return tyIsNullableLitUnion(t.mVal) }
   false
 }
 
-// Whether node `ix`'s recorded type is a string-keyed map whose value is `boolean | null`:
+// Whether node `ix`'s type (its pin, for a hole) is a map whose value is `boolean | null`:
 // each value is 0/1 with the `2` null sentinel — still the mono i32 map. The `??`-default
 // emitter reads this to coalesce a stored null as well as a missing key.
 export function nodeTyMapValIsNulBool(ix: i32) {
-  const ty = nodeTyIxOf(ix)
-  if ty < 0 { return false }
+  mapTyValIsNulBool(nodeTyPinIxOf(ix))
+}
+
+// `nodeTyMapValIsNulBool` over arena type `ty`, the map itself.
+export function mapTyValIsNulBool(ty: i32) {
+  if ty < 0 || ty >= T.tys.length { return false }
   const t = T.tys[ty]
   if !(t is TyMap) { return false }
   const mv = T.tys[t.mVal]
@@ -56600,13 +56646,17 @@ export function nodeTyMapValIsNulBool(ix: i32) {
   false
 }
 
-// Whether node `ix`'s recorded type is a map whose value is a plain `boolean` — the mono i32
+// Whether node `ix`'s type (its pin, for a hole) is a map whose value is a plain `boolean`, the i32
 // map with 0/1 values and the `2` niche still spare. A bare read `m[k]` types `boolean | null`
 // (a missing key is null), so its miss arm must yield that spare sentinel — the
 // non-nullable-value dual of `nodeTyMapValIsNulBool`, read beside it.
 export function nodeTyMapValIsBool(ix: i32) {
-  const ty = nodeTyIxOf(ix)
-  if ty < 0 { return false }
+  mapTyValIsBool(nodeTyPinIxOf(ix))
+}
+
+// `nodeTyMapValIsBool` over arena type `ty`, the map itself.
+export function mapTyValIsBool(ty: i32) {
+  if ty < 0 || ty >= T.tys.length { return false }
   const t = T.tys[ty]
   if t is TyMap { return primNameOf(t.mVal) == "boolean" }
   false
@@ -56632,12 +56682,16 @@ export function fusedMapReadRecvIx(lhsIx: i32) {
 }
 
 // The member literal texts (raw lexeme, no quotes) of the value literal union of node `ix`'s
-// recorded map type — the atom-map dual of `nodeLitUnionMemberTexts`. Empty if `ix` is not an
-// atom-valued map. The `??`-default gate checks the default literal is a member.
+// map type (its pin, for a hole) — the atom-map dual of `nodeLitUnionMemberTexts`. Empty if
+// `ix` is not an atom-valued map. The `??`-default gate checks the default literal is a member.
 export function nodeTyMapValLitUnionTexts(ix: i32) {
+  mapTyValLitUnionTexts(nodeTyPinIxOf(ix))
+}
+
+// `nodeTyMapValLitUnionTexts` over arena type `ty`, the map itself.
+export function mapTyValLitUnionTexts(ty: i32) {
   const out: string[] = []
-  const ty = nodeTyIxOf(ix)
-  if ty < 0 { return out }
+  if ty < 0 || ty >= T.tys.length { return out }
   const t = T.tys[ty]
   if t is TyMap {
     if !tyIsLitUnion(t.mVal) && !tyIsNullableLitUnion(t.mVal) { return out }
@@ -56855,19 +56909,25 @@ export function tyIsMap(ty: i32) {
 // Whether node `ix` is a map whose VALUE type provably admits no `null` (`{[K]: V}`, not
 // `{[K]: V | null}`); false for a non-map or an unknown value type.
 export function nodeTyMapValExcludesNull(ix: i32) {
-  const ty = nodeTyIxOf(ix)
-  if ty < 0 { return false }
+  mapTyValExcludesNull(nodeTyPinIxOf(ix))
+}
+
+// `nodeTyMapValExcludesNull` over arena type `ty`, the map itself.
+function mapTyValExcludesNull(ty: i32) {
+  if ty < 0 || ty >= T.tys.length { return false }
   const t = T.tys[ty]
   if t is TyMap { return tyExcludesNull(t.mVal) }
   false
 }
 
-// The emitter-format value type name of node `ix`'s recorded map type (`string` for
+// The emitter-format value type name of node `ix`'s map type, its pin for a hole (`string` for
 // `{[string]: string}`), or "" if `ix` is not a map. Renders the value type, so the emitter
 // calls it only as a map-shape fallback (`mapShapeOfExpr`), never on the hot path.
-export function nodeTyMapValName(ix: i32) {
-  const ty = nodeTyIxOf(ix)
-  if ty < 0 { return "" }
+export function nodeTyMapValName(ix: i32) { mapTyValName(nodeTyPinIxOf(ix)) }
+
+// `nodeTyMapValName` over arena type `ty`, the map itself.
+function mapTyValName(ty: i32) {
+  if ty < 0 || ty >= T.tys.length { return "" }
   const t = T.tys[ty]
   if t is TyMap { return tyToEmitName(t.mVal) }
   ""
@@ -58464,7 +58524,7 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
         // value of the same litunion; the method spelling `m.get(k) ?? d` is rejected here too.
         const mgRecv = fusedMapReadRecvIx(n.binLeft)
         if mgRecv >= 0 {
-          if nodeTyMapValIsLitUnion(mgRecv) {
+          if mapTyValIsLitUnion(nodeTyIxOf(mgRecv)) {
             if !assignable(rt, innerFull) {
               tErrUnsupported(
                 "`??` over an atom-valued map needs a member-literal (or atom) default",

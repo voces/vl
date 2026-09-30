@@ -60,6 +60,11 @@ import {
   listWidenRetagRowsOf,
   mapDeliveryRecorded,
   mapRetagRowsOf,
+  mapTyValIsBool,
+  mapTyValIsLitUnion,
+  mapTyValIsNulBool,
+  mapTyValIsNulLitUnion,
+  mapTyValLitUnionTexts,
   mapUnboxTyOf,
   matchConstPatLitAt,
   matchScrutAt,
@@ -94,11 +99,7 @@ import {
   nodeTyIsUnion,
   nodeTyIsVariant,
   nodeTyIxOf,
-  nodeTyMapValIsBool,
   nodeTyMapValIsLitUnion,
-  nodeTyMapValIsNulBool,
-  nodeTyMapValIsNulLitUnion,
-  nodeTyMapValLitUnionTexts,
   nodeTyPinIxOf,
   nodeTyProvesNonNull,
   nodeTyRecord,
@@ -734,6 +735,7 @@ import {
   cloSigRejectWhat,
   cloSigTypeIdxAt,
   cloTailRefusal,
+  coalMapReadForeignDefault,
   coalesceDefaultNullable,
   coalesceLitUnionFits,
   coalesceNicheJoinsToBox,
@@ -931,7 +933,8 @@ import {
   mapReadNarrowedContainer,
   mapReadScalarBoxKind,
   mapReadScalarBoxKindTy,
-  mapRecvScalarBoxKindTy,
+  mapRecvScalarBoxKindIn,
+  mapRecvTyIn,
   mapRetExprShape,
   mapRetagTagPairs,
   mapShapeOfExpr,
@@ -9220,8 +9223,10 @@ function emitMapGetOr(
     // the value's rep and it needs no `ref.as_non_null`. A ref value (string/struct) does.
     const scalarVK = mvScalarValKind(mslot)
     if scalarVK != null && defExprNullable(defIx) {
-      const sbk = mapRecvScalarBoxKindTy(recvIx)
-      if sbk >= 0 { return emitMapGetOrScalarBox(body, sbk, defIx, fnIx) }
+      const sbk = mapRecvScalarBoxKindIn(recvIx, fnIx)
+      if sbk >= 0 && (vbHeapIdxOfKind(sbk) >= 0 || nodeTyIsMap(recvIx)) {
+        return emitMapGetOrScalarBox(body, sbk, defIx, fnIx)
+      }
     }
     // A nullable-value ref niche (value reps as `(ref null <elem>)`) stores null
     // directly in its vals slot: a missing key and a stored null both read as null, and
@@ -9274,17 +9279,21 @@ function emitMapGetOr(
   // coalesces on that — read the raw i32 and default when it equals the sentinel.
   let nulSentinel = 0
   let hasSentinel = false
-  if nodeTyMapValIsNulLitUnion(recvIx) {
+  const orMt = mapRecvTyIn(recvIx, fnIx)
+  if mapTyValIsNulLitUnion(orMt) {
     nulSentinel = 0 - 1
     hasSentinel = true
-  } else if nodeTyMapValIsNulBool(recvIx) {
+  } else if mapTyValIsNulBool(orMt) {
     nulSentinel = 2
     hasSentinel = true
   }
   if !hasSentinel {
     if defExprNullable(defIx) {
-      const mbk = mapRecvScalarBoxKindTy(recvIx)
-      if mbk >= 0 { return emitMapGetOrScalarBox(body, mbk, defIx, fnIx) }
+      // A hole's read whose pin no node registered a value box for keeps the unboxed lowering.
+      const mbk = mapRecvScalarBoxKindIn(recvIx, fnIx)
+      if mbk >= 0 && (vbHeapIdxOfKind(mbk) >= 0 || nodeTyIsMap(recvIx)) {
+        return emitMapGetOrScalarBox(body, mbk, defIx, fnIx)
+      }
     }
     // if entry != 0 { vals.backing[entry-1] } else { d }  — a value-typed if yielding i32.
     pushMapScr(body, 5)      // entry
@@ -9404,7 +9413,8 @@ function emitMapGetOrUnionBox(body: u8[], mslot: i32, defIx: i32, fnIx: i32) {
 // `null` → the `-1` sentinel), else the value's own rep (boolean / i32). A non-member / general
 // string is the wrong rep for the fused i32 result — fail loudly.
 function emitMonoMapDefault(body: u8[], recvIx: i32, defIx: i32, fnIx: i32) {
-  const atomTexts = nodeTyMapValLitUnionTexts(recvIx)
+  const mdMt = mapRecvTyIn(recvIx, fnIx)
+  const atomTexts = mapTyValLitUnionTexts(mdMt)
   let atomDef = false
   let nulAtomDef = false
   if atomTexts.length > 0 {
@@ -9414,14 +9424,14 @@ function emitMonoMapDefault(body: u8[], recvIx: i32, defIx: i32, fnIx: i32) {
     } else if du is NullLit {
       // A NULLABLE-atom value (`{[string]: K | null}`) admits a bare `null` default — lowered as
       // the `-1` niche sentinel (the `??` result stays `K | null`).
-      if nodeTyMapValIsNulLitUnion(recvIx) {
+      if mapTyValIsNulLitUnion(mdMt) {
         atomDef = true
         nulAtomDef = true
       }
     } else if exprIsLitAtom(defIx, fnIx) {
       atomDef = true
     }
-    if !atomDef {
+    if !atomDef && !coalMapReadForeignDefault(recvIx, defIx, fnIx) {
       return emitFail(
         "emitProgram: `??` over an atom-valued map needs a member-literal (or atom) default",
       )
@@ -9472,12 +9482,12 @@ function emitNarrowedMapReadTail(idxIx: i32, fnIx: i32) {
 // completeness so `m[k]` in value position is total (0 default).
 function emitMapGet(body: u8[], recvIx: i32, keyIx: i32, fnIx: i32) {
   if emitMapPrep(body, recvIx, keyIx, fnIx) < 0 { return -1 }
-  emitMapGetTail(body, recvIx)
+  emitMapGetTail(body, recvIx, fnIx)
 }
 
 // The value half of `emitMapGet`, after `emitMapPrep`: the stored value on a hit, the rep's
 // empty value on a miss. Leaves the probe's `entry` scratch slot as the probe set it.
-function emitMapGetTail(body: u8[], recvIx: i32) {
+function emitMapGetTail(body: u8[], recvIx: i32, fnIx: i32) {
   if cmSlot >= 0 {
     // REF values: yield the NULLABLE element — the (ref null <elem>) vals slot on
     // a hit, `ref.null <elem>` on a miss — via the slot's valStash (same
@@ -9517,9 +9527,10 @@ function emitMapGetTail(body: u8[], recvIx: i32) {
   // a miss as its sentinel (`-1` litunion, `2` boolean) at both the nullable and the
   // non-nullable spelling — yielding plain `0` there would collide with a real member
   // (atom id 0, or `false`) and make `m[missing] == <that value>` silently true.
-  if nodeTyMapValIsNulLitUnion(recvIx) || nodeTyMapValIsLitUnion(recvIx) {
+  const gtMt = mapRecvTyIn(recvIx, fnIx)
+  if mapTyValIsNulLitUnion(gtMt) || mapTyValIsLitUnion(gtMt) {
     fbI32Const(0 - 1)
-  } else if nodeTyMapValIsNulBool(recvIx) || nodeTyMapValIsBool(recvIx) {
+  } else if mapTyValIsNulBool(gtMt) || mapTyValIsBool(gtMt) {
     fbI32Const(2)
   } else {
     fbI32Const(0) // i32.const 0
@@ -9741,7 +9752,7 @@ function emitScalarMapReadPairEq(
       fbIf(127)           // i32 result
       pushMapScalarHit(body)
       if emitMapPrep(body, r.idxArr, r.idxIndex, fnIx) < 0 { return -1 }
-      if emitMapGetTail(body, r.idxArr) < 0 { return -1 }
+      if emitMapGetTail(body, r.idxArr, fnIx) < 0 { return -1 }
       fbI32Bin(atomEqOpcodeOfKind(k))
       pushMapHitFlag(body)
       fbI32Bin(113)       // 0x71 i32.and
@@ -9791,7 +9802,7 @@ function emitScalarMapReadOtherEq(
     if readLeft {
       if emitMapPrep(body, rd.idxArr, rd.idxIndex, fnIx) < 0 { return -1 }
       pushMapHitFlag(body)
-      if emitMapGetTail(body, rd.idxArr) < 0 { return -1 }
+      if emitMapGetTail(body, rd.idxArr, fnIx) < 0 { return -1 }
       if emitUnionEqOther(body, otherIx, k, fnIx) < 0 { return -1 }
       fbI32Bin(atomEqOpcodeOfKind(k))
       fbI32Bin(113) // 0x71 i32.and
@@ -9799,7 +9810,7 @@ function emitScalarMapReadOtherEq(
     }
     if emitUnionEqOther(body, otherIx, k, fnIx) < 0 { return -1 }
     if emitMapPrep(body, rd.idxArr, rd.idxIndex, fnIx) < 0 { return -1 }
-    if emitMapGetTail(body, rd.idxArr) < 0 { return -1 }
+    if emitMapGetTail(body, rd.idxArr, fnIx) < 0 { return -1 }
     fbI32Bin(atomEqOpcodeOfKind(k))
     pushMapHitFlag(body)
     fbI32Bin(113) // 0x71 i32.and
@@ -10221,7 +10232,7 @@ function emitMapSetValExpr(
     svCtx.litUnion = 1
   }
   // A `boolean | null`-valued MONO map (i32 niche) stores a bare `null` as the `2` sentinel —
-  // the store-side dual of the read's `nodeTyMapValIsNulBool` coalesce (sentinel 2). A non-null
+  // the store-side dual of the read's `mapTyValIsNulBool` coalesce (sentinel 2). A non-null
   // boolean value (true/false) falls through and emits as a plain i32.
   if nulBoolVal {
     const vnb = P.nodes[unwrapParen(valIx)]
@@ -10334,11 +10345,12 @@ function emitMapSetV(
   // value is the interned atom id (a plain i32). Its member-literal value is a StrLit
   // syntactically — it must BYPASS the mono string guard below and emit in atom context
   // (`pendingLitUnion`), so resolve the receiver's value type up front.
-  let atomVal = nodeTyMapValIsLitUnion(recvIx)
-  if nodeTyMapValIsNulLitUnion(recvIx) { atomVal = true }
+  const svMt = mapRecvTyIn(recvIx, fnIx)
+  let atomVal = mapTyValIsLitUnion(svMt)
+  if mapTyValIsNulLitUnion(svMt) { atomVal = true }
   // A `boolean | null`-valued map is the MONO i32 niche too — a bare `null` store lowers as the
-  // `2` sentinel (the store-side dual of the read's `nodeTyMapValIsNulBool` coalesce).
-  const nulBoolVal = nodeTyMapValIsNulBool(recvIx)
+  // `2` sentinel (the store-side dual of the read's `mapTyValIsNulBool` coalesce).
+  const nulBoolVal = mapTyValIsNulBool(svMt)
   // A mono (i32/boolean-valued) map cannot store a ref value — a string / struct / list
   // ref into an i32 array is invalid wasm — so fail loudly; an mv-slot map stores such
   // values through its own typed vals list, and a constant-true Set value is always a
