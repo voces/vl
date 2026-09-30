@@ -4094,9 +4094,6 @@ let luAnnTy: {[i32]: i32} = Map()
 // The delivery sites the function-value adapter rewrote, so a second delivery of one does not
 // wrap the adapter again.
 let fvaDone: {[i32]: boolean} = Map()
-// Set once a lambda is checked, a function is delivered, or a literal holds one, so a program
-// with no function values skips the adapter's walks.
-let fvaValueSeen = false
 // D951 — the `is`-test type sidecar: the arena type an `IsExpr`'s check type resolves to, keyed by
 // the `IsExpr` node, so the emitter's narrowing stack banks the answer instead of re-deriving the
 // narrowed type from the tested spelling. Sized with `nodeTyIx` and read through `isVarTyIxOf`; a
@@ -5146,7 +5143,6 @@ export function initChecker() {
   luDeclPos = Map()
   luAnnTy = Map()
   fvaDone = Map()
-  fvaValueSeen = false
   pgVoid = []
   joinHead = []
   joinName = []
@@ -47675,7 +47671,6 @@ function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
   if n.fnName != "" {
     r = checkFuncDeclNodeReal(n, fnIx)
   } else {
-    fvaValueSeen = true
     lamCheckDepth = lamCheckDepth + 1
     r = checkFuncDeclNodeReal(n, fnIx)
     lamCheckDepth = lamCheckDepth - 1
@@ -64583,10 +64578,14 @@ function luForInAt(n: ForIn, ix: i32, iterTy: i32, ms: i32[], elem: i32): i32 {
 
 // Whether slot types `a` and `b` may lower to different wasm reps. Conservative: only an equal
 // type, or a list differing only in `readonly`, is known to agree.
-function fvaSlotMayDiffer(a: i32, b: i32, depth: i32): boolean {
-  if a == b { return false }
-  if a < 0 || b < 0 || depth <= 0 { return true }
-  if tyEq(a, b) { return false }
+function fvaSlotMayDiffer(a0: i32, b0: i32, depth: i32): boolean {
+  if a0 == b0 { return false }
+  if a0 < 0 || b0 < 0 || depth <= 0 { return true }
+  // A single literal is stored as its base scalar.
+  const a = fvaLitBase(a0)
+  const b = fvaLitBase(b0)
+  if a == b || tyEq(a, b) { return false }
+  if a < 0 || a >= T.tys.length { return true }
   const ta = T.tys[a]
   match ta {
     TyArray => {
@@ -64603,10 +64602,38 @@ function fvaSlotMayDiffer(a: i32, b: i32, depth: i32): boolean {
       if !fvaIsFn(b) { return true }
       return fvaFnMayDiffer(a, b, depth - 1)
     }
-    TyPrim | TyErr | TyObj | TyUnion | TyMap | TyVar | TyLit | TyNeg => {
+    TyUnion => {
+      // A union's box keys each member by its type, so member order is not rep.
+      return !fvaSameMembers(ta.uMembers, b, depth - 1)
+    }
+    TyPrim | TyErr | TyObj | TyMap | TyVar | TyLit | TyNeg => {
       return true
     }
   }
+}
+
+// `t`'s base scalar when it is a single literal type, else `t`.
+function fvaLitBase(t: i32): i32 {
+  const n = T.tys[t]
+  if n is TyLit { return litBaseTy(n) }
+  t
+}
+
+// Whether union `b` has exactly the members `ms` has, in any order.
+function fvaSameMembers(ms: i32[], b: i32, depth: i32): boolean {
+  const u = T.tys[b]
+  if u is TyUnion {
+    if u.uMembers.length != ms.length { return false }
+    for m in ms {
+      let found = false
+      for n in u.uMembers {
+        if !found && !fvaSlotMayDiffer(m, n, depth) { found = true }
+      }
+      if !found { return false }
+    }
+    return true
+  }
+  false
 }
 
 // The element of list type `t`, or -2 when `t` is not a list.
@@ -64657,8 +64684,11 @@ function fvaFnMayDiffer(s: i32, d: i32, depth: i32): boolean {
 function fvaAnnot(ty: i32, site: i32, pos: i32): i32 {
   if ty < 0 || ty >= T.tys.length { return -1 }
   let sp = ""
-  if isVoidTy(ty) { sp = "void" } else { sp = luPipeTight(tyToStr(ty)) }
-  if sp == "" || luSpell(ty) == "" { return -1 }
+  // A single literal type is spelled by its base scalar, which it is stored as; the checker
+  // reads the literal itself from `luAnnTy`.
+  const sty = fvaLitBase(ty)
+  if isVoidTy(sty) { sp = "void" } else { sp = luPipeTight(tyToStr(sty)) }
+  if sp == "" || luSpell(sty) == "" { return -1 }
   // The display name leaves a nullable function type's arrow unparenthesised.
   const t = T.tys[ty]
   if t is TyNullable && t.nInner >= 0 {
@@ -64678,9 +64708,7 @@ function fvaAdapt(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
   if srcTy == dstTy || inferQuiet || monoRecheckDepth > 0 { return false }
   if srcExpr < 0 || srcTy < 0 || dstTy < 0 { return false }
   if srcTy >= T.tys.length || dstTy >= T.tys.length { return false }
-  if T.tys[srcTy] is TyFunc { fvaValueSeen = true }
-  // A program with no function values has nothing to adapt.
-  if !fvaValueSeen || !tyMayHoldFn(dstTy, 0) { return false }
+  if !tyMayHoldFn(dstTy, 0) { return false }
   // A literal delivers each element or field at the destination's own type, one seam down.
   const lit = P.nodes[parenPeelIx(srcExpr)]
   if lit is ArrayLit {
@@ -64905,14 +64933,6 @@ function fvaRefuseNested(at: i32, srcTy: i32, dstTy: i32) {
   0
 }
 
-// Marks the program as holding function values when a literal's element or field type is a
-// function or a nullable one.
-function fvaNoteHeld(ty: i32) {
-  if fvaValueSeen || ty < 0 || ty >= T.tys.length { return 0 }
-  if fvaIsFn(nonNullTy(ty)) { fvaValueSeen = true }
-  0
-}
-
 // Whether `n` names a generic function declaration.
 function fvaNamesGeneric(n: Node): boolean {
   if n is Ident {
@@ -65119,7 +65139,6 @@ function checkArrayLitNode(n: ArrayLit, _ix: i32) {
     if f32El >= 0 { elemTy = f32El }
   }
   if neverValueSlotErr(elemTy, "a list element", elems[0]) { elemTy = TY_ERR }
-  fvaNoteHeld(elemTy)
   return mkArrayTy(elemTy)
 }
 
@@ -65363,7 +65382,6 @@ function checkObjLitNode(n: ObjLit, ix: i32) {
         fty = TY_ERR
       }
       if neverValueSlotErr(fty, fslot, fnode.fiValue) { fty = TY_ERR }
-      fvaNoteHeld(fty)
       ftys.push(fty)
     }
     i = i + 1

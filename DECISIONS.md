@@ -9133,6 +9133,13 @@ thunk would have needed its own copy of every delivery conversion. A function de
 `const` is called directly; any other value is read once, as the argument of a lambda called in
 place, so a later store to a `let` does not reach the adapter.
 
+**"May differ" is decided on the rep, not the type.** The checker has no `$fnsig` key (the
+emitter interns those after checking), so `fvaSlotMayDiffer` mirrors what the key ignores: a single
+literal is its base scalar (`() => "ab"` is `() => string`), a union's members compare as a set
+(`Circle | Sq` is `Sq | Circle` and `Shape`), a list differs only by its element, and anything else
+unequal counts as a difference. The #3314 review's first round lost 79 running cells to a
+type-level comparison that forced adapters, and container refusals, on same-signature functions.
+
 **A function inside a container is refused, not adapted.** A list, record, map or `| null`
 holding functions taken at a wider function type would need each function rewritten on the way,
 which is a copy; the check refuses it and names the fix. A literal adapts each element or field,
