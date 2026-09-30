@@ -7770,15 +7770,20 @@ function holeFieldWriteTy(hst: i32, rt: i32): i32 {
   hn
 }
 
-// Whether the write target at `tgtIx` is a field of a receiver typed as an inference hole.
+// Whether the write target at `tgtIx` is a field or a cell of a receiver typed as an inference
+// hole, at any depth of a place (`b.a.v`, `b[0]`).
 function writesHoleField(tgtIx: i32): boolean {
   const tn = P.nodes[tgtIx]
-  if tn is Member {
-    const on = P.nodes[tn.memObj]
-    if on is Ident { return tyIsHole(lookup(on.identName)) }
-    return tyIsHole(nodeTyOf(tn.memObj))
-  }
-  false
+  let recv = -1
+  if tn is Member { recv = tn.memObj }
+  else if tn is Index { recv = tn.idxArr }
+  else { return false }
+  const on = P.nodes[recv]
+  if on is Ident { return tyIsHole(lookup(on.identName)) }
+  const noNames: string[] = []
+  const noTys: i32[] = []
+  if tyIsHole(placeCurTy(recv, noNames, noTys)) { return true }
+  tyIsHole(nodeTyOf(recv))
 }
 
 // Assignments that ended a path narrowing through another place that may name the same object.
@@ -11807,6 +11812,7 @@ function placeElemTy(baseTy: i32) {
     if primNameOf(bt.aElem) == "u8" { return -1 }
     return bt.aElem
   }
+  if bt is TyVar { return holePlaceElemTy(baseTy, bt) }
   // The other indexable container, which is its own function so this one keeps a single
   // arm: a map cell's read type is not its storage type, and the two questions differ
   // enough that a second arm here would read as one rule (D1734).
@@ -11886,6 +11892,15 @@ function holePlaceFieldTy(hole: i32, ht: TyVar, prop: string): i32 {
   }
   if tpBoundOfName(ht.tvName) >= 0 { return -1 }
   mkDerivedHole(HD_FLD, prop, -1, -1, hole)
+}
+
+// The element a read off hole `hole` derives, as `checkIndexNode` types it, so a null test on
+// `z[0]` narrows a hole's cell the way it narrows a declared list's (D3287). -1 for a hole that
+// reads its members from a bound.
+function holePlaceElemTy(hole: i32, ht: TyVar): i32 {
+  if ht.tvName.length == 0 { return -1 }
+  if ht.tvName[0] != '?' && tpBoundOfName(ht.tvName) >= 0 { return -1 }
+  mkDerivedHole(HD_ELEMV, "", -1, -1, hole)
 }
 
 // Shared-field access over a struct union: a field present on every member is readable on the
@@ -34243,6 +34258,20 @@ function noteNullReadCstr(recv: i32, prop: string, ix: i32) {
   0
 }
 
+// A hole's field, element or result passed to a parameter whose body reads its members: the
+// pin asks the argument about `null`, as `holeDemandOk` asks a concrete one (D3300).
+function noteHoleArgNullRead(name: string, at: i32, ix: i32) {
+  const shape = holeShapeOf(name)
+  if shape < 0 { return 0 }
+  const st = T.tys[shape]
+  if st is TyObj {
+    if st.objFieldNames.length > 0 {
+      noteNullReadCstr(at, st.objFieldNames[0], ix)
+    }
+  }
+  0
+}
+
 // Whether a member read off derived-hole row `row` is re-asked at the pin for a `null` member:
 // a field, element or call result of a hole, or an `is` remainder other than the non-null face.
 function hdReadNullAsked(row: i32): boolean {
@@ -40631,6 +40660,7 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
     // when the body read `o.x` (host: the grown `Infer<{x,…}>` pin).
     const pHole = T.tys[params[i]]
     if pHole is TyVar {
+      noteHoleArgNullRead(pHole.tvName, at, args[i])
       if !holeDemandOk(pHole.tvName, args[i], at) {
         holeArgDemandErr(pHole.tvName, i + 1, at, args[i])
       }
