@@ -88,6 +88,7 @@ import {
   substTyDeep,
   tpIfJoinPinName,
   tpIfJoinPinTy,
+  tyArrayElemIx,
   tyBearsNull,
   tyEq,
   tyExcludesNull,
@@ -266,7 +267,10 @@ import {
   monoExactSubRow,
   monoExactSubT,
   monoGen,
+  monoGradualAsScalar,
+  monoGradualObjList,
   monoGradualObjLits,
+  monoGradualRetPinned,
   monoHoleSubN,
   monoHoleSubRow,
   monoHoleSubT,
@@ -2045,6 +2049,13 @@ function monoIfChainRebuildPinned(
       } else if sink || tpu {
         pty = monoIfArmsPinJoin(at, raw, bN, bT)
       }
+      // Recorded, not returned, as below: the build stops loudly rather than invalid (D3269).
+      if tpu && monoMultiParamLitNullJoin(raw, pty) {
+        emitFailAt(
+          "emitProgram: a join of several type parameters holding a literal union, a string and a null has no box at this instance",
+          at,
+        )
+      }
       const retype = pty >= 0
         && pty != raw
         && (tpu || monoPinKeepsMembers(raw, pty))
@@ -2135,6 +2146,34 @@ function monoHoleJoinDropsArm(
     && j < T.tys.length
     && !tyHasTyVar(j)
     && !assignable(j, pty)
+}
+
+// Whether join `raw` names two or more type parameters and its pinned type `pty` holds a literal
+// union, a string and a null, the shape whose instance has no box (D3269).
+function monoMultiParamLitNullJoin(raw: i32, pty: i32): boolean {
+  if raw < 0 || raw >= T.tys.length || pty < 0 || pty >= T.tys.length {
+    return false
+  }
+  const ru = T.tys[raw]
+  if !(ru is TyUnion) { return false }
+  let params = 0
+  for m in ru.uMembers {
+    if m >= 0 && m < T.tys.length && T.tys[m] is TyVar { params = params + 1 }
+  }
+  if params < 2 { return false }
+  const ms: i32[] = []
+  flattenVariantsInto(pty, ms)
+  let lit = false
+  let str = false
+  let nul = tyBearsNull(pty)
+  for m in ms {
+    if m >= 0 && m < T.tys.length {
+      if tyIsLitUnion(m) || T.tys[m] is TyLit { lit = true }
+      if tyBearsNull(m) { nul = true }
+      if tyPrimNameOf(nonNullTy(m)) == "string" { str = true }
+    }
+  }
+  lit && nul && str
 }
 
 // `j`, its value-union box registered first when it is a union whose box has a name.
@@ -3570,8 +3609,29 @@ function monoPinBodyLambdasRaw(
   if rb == ix && n is ObjLit && monoObjHoldsGradual(ix) {
     rb = monoExprRemake(ix, monoExprKids(ix))
   }
-  if rb == ix { rb = monoPinRetype(ix, bN, bT) }
-  else if n is ObjLit { monoTpJoinObjTy(ix, rb, bN, bT) }
+  if rb == ix {
+    rb = monoPinRetype(ix, bN, bT)
+  } else if n is ObjLit {
+    monoTpJoinObjTy(ix, rb, bN, bT)
+  } else if n is AsExpr && tyIsGradualUnion(nodeTyIxOf(n.asObj)) {
+    // A cast re-made over a re-typed operand keeps the template's result at the pin: an `as?`
+    // is nullable at every pin, as over a bare parameter (D2754).
+    const apt = monoPinnedTyOf(ix, bN, bT)
+    if apt >= 0 { monoPinRecordTy(rb, apt) }
+    const rbn = P.nodes[rb]
+    if rbn is AsExpr {
+      const opt = nodeTyIxOf(rbn.asObj)
+      if (
+        opt >= 0
+        && opt < T.tys.length
+        && !(T.tys[opt] is TyUnion)
+        && !tyHasTyVar(opt)
+      ) {
+        // arena-tick exempt: a per-program mark the cast's lowering reads.
+        monoGradualAsScalar[rb] = true
+      }
+    }
+  }
   if sink { rb = monoPinCoalJoin(ix, rb, bN, bT) }
   rb
 }
@@ -3583,10 +3643,16 @@ function monoObjHoldsGradual(ix: i32): boolean {
   if u < 0 || !(P.nodes[u] is ObjLit) { return false }
   const t = nodeTyIxOf(u)
   if t < 0 || t >= T.tys.length { return false }
+  monoTyHoldsGradual(t, 0)
+}
+
+// Whether record or list type `t` holds, at any depth, a field or element typed at a union
+// holding a type parameter.
+function monoTyHoldsGradual(t: i32, depth: i32): boolean {
+  if t < 0 || t >= T.tys.length || depth > 8 { return false }
   const o = T.tys[t]
   if o is TyObj {
     for ft in o.objFieldTypes {
-      if tyIsGradualUnion(ft) { return true }
       if (
         ft >= 0
         && ft < T.tys.length
@@ -3595,9 +3661,12 @@ function monoObjHoldsGradual(ix: i32): boolean {
       ) {
         return true
       }
+      if monoTyHoldsGradual(ft, depth + 1) { return true }
     }
+    return false
   }
-  false
+  // A list answers for its element; any other kind has no element and answers false.
+  monoTyHoldsGradual(tyArrayElemIx(t), depth + 1)
 }
 
 // An object literal `ix` rebuilt as `rb` whose recorded type holds a field typed at a join the
@@ -3605,18 +3674,13 @@ function monoObjHoldsGradual(ix: i32): boolean {
 function monoTpJoinObjTy(ix: i32, rb: i32, bN: string[], bT: i32[]) {
   const t = nodeTyIxOf(ix)
   if t < 0 || t >= T.tys.length { return 0 }
-  const o = T.tys[t]
-  if !(o is TyObj) { return 0 }
-  let hit = false
-  for ft in o.objFieldTypes {
-    if tyIsGradualUnion(ft) { hit = true }
-  }
-  if !hit { return 0 }
+  if !(T.tys[t] is TyObj) || !monoTyHoldsGradual(t, 0) { return 0 }
   const pty = monoPinnedTyOf(ix, bN, bT)
   if pty >= 0 && pty != t {
     monoPinRecordTy(rb, pty)
     // arena-tick exempt: a per-program mark the post-monomorphization shape pass reads.
     monoGradualObjLits[rb] = true
+    monoGradualObjList.push(rb)
   }
   0
 }
@@ -7451,14 +7515,20 @@ function monoMakeInstance(
     }
     // A return typed at a union holding a type parameter is that union at the pin, as a bare
     // `T` return is the pin's own spelling (D2906).
+    const gNeed = nret < 0 && fn.fnRet < 0
     let gfx = -1
-    if nret < 0 && fn.fnRet < 0 && origFe >= 0 && origFe < monoOrigNode.length {
+    if (
+      (gNeed || !monoGradualRetPinned)
+      && origFe >= 0
+      && origFe < monoOrigNode.length
+    ) {
       gfx = nodeTyIxOf(monoOrigNode[origFe])
     }
     if gfx >= 0 && gfx < T.tys.length {
       const gft = T.tys[gfx]
-      if gft is TyFunc {
-        if tyIsGradualUnion(gft.fnRet) {
+      if gft is TyFunc && tyIsGradualUnion(gft.fnRet) {
+        monoGradualRetPinned = true
+        if gNeed {
           const grt = substTyDeep(gft.fnRet, letBN, letBT)
           if (
             grt >= 0
@@ -9587,6 +9657,9 @@ export function monomorphize(stmts: i32[]) {
   monoPinSubN = []
   monoPinSubT = []
   monoGradualObjLits = Map()
+  monoGradualObjList = []
+  monoGradualAsScalar = Map()
+  monoGradualRetPinned = false
   monoExactMemo = []
   monoActiveDepth = []
   monoExactStack = []
