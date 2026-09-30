@@ -736,6 +736,8 @@ let escJoinFn: i32[] = []
 
 // The operator a deferred unary negation is recorded under, both operands its argument.
 const OP_NEG = "unary -"
+// The operator a deferred `as` over a gradual union is recorded under, the target on the right.
+const OP_AS = "as"
 
 // Deferred binary-op constraints over un-annotated-param holes: with a hole operand, `a + b` /
 // `s + "!"` / `n < 2` cannot be decided in the body, a hole being permissively assignable to
@@ -15988,6 +15990,54 @@ function tpGradualView(ty: i32): i32 {
   mkUnionTy(keep)
 }
 
+// Whether `t` is a union holding a declared type parameter, the shape `tpGradualView` opens.
+export function tyIsGradualUnion(t: i32): boolean {
+  if t < 0 || t >= T.tys.length { return false }
+  const u = T.tys[t]
+  if u is TyUnion { return unionHasDeclaredParam(u.uMembers) }
+  false
+}
+
+// Whether `as` from `from` to `to`, deferred off a gradual union, holds at a pin: an arm of a
+// union, or a numeric conversion or the type itself.
+function asPinHolds(from: i32, to: i32): boolean {
+  if from < 0 || to < 0 || from >= T.tys.length { return true }
+  const f = T.tys[from]
+  if f is TyUnion { return unionCoversTy(f, to) }
+  // A nullable operand is a union operand, as `checkCastNode` reads it.
+  if f is TyNullable {
+    if f.nInner < 0 { return true }
+    const nu = T.tys[mkUnionTy([f.nInner, TY_NULL])]
+    if nu is TyUnion { return unionCoversTy(nu, to) }
+    return true
+  }
+  if from == to || assignable(from, to) { return true }
+  isNumeric(from) && isNumeric(to) && primNameOf(from) != "boolean"
+}
+
+// The direct spelling's sentence for an `as` `asPinHolds` refuses.
+function asPinRefusal(from: i32, to: i32): string {
+  if (
+    from >= 0
+    && from < T.tys.length
+    && (T.tys[from] is TyUnion || T.tys[from] is TyNullable)
+  ) {
+    return "`as "
+      + tyToStr(to)
+      + "` names a type that is not a member of "
+      + tyToStr(from)
+  }
+  "`as` supports numeric conversions only"
+}
+
+// The declared type parameter a union holds, or -1.
+function gradualParamOf(u: TyUnion): i32 {
+  for m in u.uMembers {
+    if tyIsDeclaredParam(m) { return m }
+  }
+  -1
+}
+
 // Whether a member of `ms` is a declared type parameter.
 function unionHasDeclaredParam(ms: i32[]): boolean {
   for m in ms {
@@ -16010,8 +16060,15 @@ function tpGradualRecv(recv: i32, prop: string, ix: i32): i32 {
 // apart. -1 otherwise.
 function gradualUnionJoin(a: i32, b: i32): i32 {
   if tpJoinUnions.length == 0 { return -1 }
-  if !tpJoinUnions.has(a) && !tpJoinUnions.has(b) { return -1 }
-  if tpGradualView(a) == a || tpGradualView(b) == b { return -1 }
+  const ta = tpJoinUnions.has(a)
+  const tb = tpJoinUnions.has(b)
+  if !ta && !tb { return -1 }
+  // A kept-apart join beside a concrete type keeps it too, unless it already holds it.
+  const concreteBeside = (ta && !tyHasTyVar(b)) || (tb && !tyHasTyVar(a))
+  if !concreteBeside && (tpGradualView(a) == a || tpGradualView(b) == b) {
+    return -1
+  }
+  if isNullTy(a) || isNullTy(b) || a == TY_VOID || b == TY_VOID { return -1 }
   if tyMembersWithin(b, a) { return a }
   if tyMembersWithin(a, b) { return b }
   const tc = joinVariantTys(a, b)
@@ -16075,6 +16132,21 @@ function joinTys(a: i32, b: i32) {
   if tpJoinUnions.length > 0 && !aVar && !bVar {
     const gj = gradualUnionJoin(a, b)
     if gj >= 0 { return gj }
+  }
+  // A declared parameter beside such a union joins into it, as a member or kept apart: the
+  // parameter is assignable to the union's own parameter, which would drop one of them.
+  if tpJoinUnions.length > 0 {
+    if (
+      (aVar && tyIsDeclaredParam(a) && tpJoinUnions.has(b))
+      || (bVar && tyIsDeclaredParam(b) && tpJoinUnions.has(a))
+    ) {
+      if aVar && tyVarMemberOf(a, b) { return b }
+      if bVar && tyVarMemberOf(b, a) { return a }
+      const tv = joinVariantTys(a, b)
+      // arena-tick exempt: a per-program mark on a fresh arena row.
+      tpJoinUnions[tv] = 1
+      return tv
+    }
   }
   // Two different declared type parameters are two types, though a type variable is
   // assignable either way inside a generic body: collapsing would type the join as one
@@ -34251,6 +34323,7 @@ function binOpDefinedFor(op: string, lt0: i32, rt0: i32) {
   if tyHasHole(lt) || tyHasHole(rt) { return true }
   if op == "min" || op == "max" { return minMaxPinOk(lt, rt) }
   if op == OP_NEG { return isNumeric(lt) }
+  if op == OP_AS { return asPinHolds(lt0, rt0) }
   // The nominal-brand mix the BODY deferred on a hole operand (D1747). Both operands are
   // concrete here, which is the precondition that question needs; only a branded PAIR is
   // judged, since a pin has no expression node for `nomBinMixes`'s literal-adoption legs.
@@ -35782,6 +35855,19 @@ function validateBinCstrs(
               + tyToStr(crt)
             if binCstrOp[ci] == OP_NEG {
               refusal = "unary '-' expects a numeric type, got " + tyToStr(clt)
+            }
+            if binCstrOp[ci] == OP_AS { refusal = asPinRefusal(clt, crt) }
+            // An ordering over a gradual union is refused in the direct spelling's words.
+            const cop = binCstrOp[ci]
+            if (
+              (cop == "<" || cop == ">" || cop == "<=" || cop == ">=")
+              && (tyIsGradualUnion(binCstrLt[ci])
+                || tyIsGradualUnion(binCstrRt[ci]))
+            ) {
+              refusal = "comparison expects numeric operands, got "
+                + tyToStr(clt)
+                + " and "
+                + tyToStr(crt)
             }
             let anchorNo = lNo
             if anchorNo == 0 { anchorNo = rNo }
@@ -56263,6 +56349,13 @@ function checkCastNode(n: AsExpr, ix: i32) {
         return TY_ERR
       }
       if !unionCoversTy(argT, target) {
+        // A gradual union's parameter may hold the target at a pin: the cast is parked on the
+        // parameter and re-asked there, as over a bare one (D2906).
+        if gradualParamOf(argT) >= 0 {
+          noteBinCstr(argU, OP_AS, target)
+          if n.asMode == "null" { return mkNullableTy(target) }
+          return target
+        }
         tErr(
           "`as "
             + n.asTy

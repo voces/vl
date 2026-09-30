@@ -94,6 +94,7 @@ import {
   tyFieldTyOf,
   tyHasTyVar,
   tyHasTyVarWasCapped,
+  tyIsGradualUnion,
   tyIsLitUnion,
   tyIsLitUnionArray,
   tyIsMap,
@@ -103,6 +104,7 @@ import {
   tyRenderSoftensLits,
   tyToEmitName,
   tyToStr,
+  tyToStructStr,
   uniqueGenericDeclNamed,
   valueUnionRetName,
 } from "./typecheck"
@@ -264,6 +266,7 @@ import {
   monoExactSubRow,
   monoExactSubT,
   monoGen,
+  monoGradualObjLits,
   monoHoleSubN,
   monoHoleSubRow,
   monoHoleSubT,
@@ -3563,9 +3566,59 @@ function monoPinBodyLambdasRaw(
   }
   monoPinInLit = inLit
   let rb = monoExprRebuild(ix, nks, bN, bT)
+  // A record literal holding a gradual join is re-made so its own row can be minted at the pin.
+  if rb == ix && n is ObjLit && monoObjHoldsGradual(ix) {
+    rb = monoExprRemake(ix, monoExprKids(ix))
+  }
   if rb == ix { rb = monoPinRetype(ix, bN, bT) }
+  else if n is ObjLit { monoTpJoinObjTy(ix, rb, bN, bT) }
   if sink { rb = monoPinCoalJoin(ix, rb, bN, bT) }
   rb
+}
+
+// Whether `ix` is an object literal with a field typed at a union holding a type parameter.
+function monoObjHoldsGradual(ix: i32): boolean {
+  if ix < 0 { return false }
+  const u = unwrapParen(ix)
+  if u < 0 || !(P.nodes[u] is ObjLit) { return false }
+  const t = nodeTyIxOf(u)
+  if t < 0 || t >= T.tys.length { return false }
+  const o = T.tys[t]
+  if o is TyObj {
+    for ft in o.objFieldTypes {
+      if tyIsGradualUnion(ft) { return true }
+      if (
+        ft >= 0
+        && ft < T.tys.length
+        && T.tys[ft] is TyUnion
+        && tyHasTyVar(ft)
+      ) {
+        return true
+      }
+    }
+  }
+  false
+}
+
+// An object literal `ix` rebuilt as `rb` whose recorded type holds a field typed at a join the
+// checker kept apart is re-typed at the pin: its row is interned from its own field types (D2906).
+function monoTpJoinObjTy(ix: i32, rb: i32, bN: string[], bT: i32[]) {
+  const t = nodeTyIxOf(ix)
+  if t < 0 || t >= T.tys.length { return 0 }
+  const o = T.tys[t]
+  if !(o is TyObj) { return 0 }
+  let hit = false
+  for ft in o.objFieldTypes {
+    if tyIsGradualUnion(ft) { hit = true }
+  }
+  if !hit { return 0 }
+  const pty = monoPinnedTyOf(ix, bN, bT)
+  if pty >= 0 && pty != t {
+    monoPinRecordTy(rb, pty)
+    // arena-tick exempt: a per-program mark the post-monomorphization shape pass reads.
+    monoGradualObjLits[rb] = true
+  }
+  0
 }
 
 // Whether `ix` is an `==` / `!=` with an operand typed at a join the checker kept apart.
@@ -7305,6 +7358,16 @@ function monoMakeInstance(
           const rrt = T.tys[reIx]
           if rrt is TyObj {
             mintName = monoRetRowName(reIx)
+            // A literal holding a join the checker kept apart has no row of its own before the
+            // pin: its shape spelling mints one (D2906).
+            if (
+              mintName == ""
+              && origFe >= 0
+              && origFe < monoOrigNode.length
+              && monoObjHoldsGradual(fnRetExprOf(monoOrigNode[origFe]))
+            ) {
+              mintName = tyToStructStr(reIx)
+            }
             if mintName == "" { mint = false }
           }
           // A list of records is spelled by the element's row name for the same reason (D2300).
@@ -7383,6 +7446,32 @@ function monoMakeInstance(
           const tpName = monoPinUnionName(tpSub)
           if monoRegisterPinUnion(tpName) < 0 { return -1 }
           nret = synthTypeRefTy(tpName, -1, -1)
+        }
+      }
+    }
+    // A return typed at a union holding a type parameter is that union at the pin, as a bare
+    // `T` return is the pin's own spelling (D2906).
+    let gfx = -1
+    if nret < 0 && fn.fnRet < 0 && origFe >= 0 && origFe < monoOrigNode.length {
+      gfx = nodeTyIxOf(monoOrigNode[origFe])
+    }
+    if gfx >= 0 && gfx < T.tys.length {
+      const gft = T.tys[gfx]
+      if gft is TyFunc {
+        if tyIsGradualUnion(gft.fnRet) {
+          const grt = substTyDeep(gft.fnRet, letBN, letBT)
+          if (
+            grt >= 0
+            && grt < T.tys.length
+            && !tyHasTyVar(grt)
+            && T.tys[grt] is TyUnion
+          ) {
+            const gnm = monoPinUnionName(tyToEmitName(grt))
+            if gnm != "" {
+              if monoRegisterPinUnion(gnm) < 0 { return -1 }
+              nret = synthTypeRefTy(gnm, -1, grt)
+            }
+          }
         }
       }
     }
@@ -9497,6 +9586,7 @@ export function monomorphize(stmts: i32[]) {
   monoPinSubRow = Map()
   monoPinSubN = []
   monoPinSubT = []
+  monoGradualObjLits = Map()
   monoExactMemo = []
   monoActiveDepth = []
   monoExactStack = []
