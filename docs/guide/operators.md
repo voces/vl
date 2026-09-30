@@ -86,6 +86,44 @@ C's `fmod` exactly: `x % 0.0` is `NaN`, `Infinity % b` is `NaN`, `a % Infinity` 
 rather than by evaluating the `a - b * trunc(a / b)` identity, which drifts by an ulp once
 the quotient passes 2^53 — so `1e308 % 3.0` is `2`, not an approximation of it.
 
+## Numeric literals in `let` and `const`
+
+A bare numeric literal is an `i32` (an integer) or an `f64` (a `.` or exponent literal) unless
+its context says otherwise, and a binding it initialises follows two rules — provisional, per
+the owner's 2026-09-29 ruling (DECISIONS.md §"A literal binding takes its type from its uses").
+
+**A `const` is its literal at every read.** Each read takes the type the literal written there
+would take, so one `const` can be an `f32` in one place and an `i64` in another:
+
+```vl
+const h = 0.5
+function lerp(a: f32): f32 { a * h + 7.0 }   // h is the f32 0.5 here
+const K = 7
+function take64(x: i64): i64 { x }
+print(take64(K) * 1000000000)                 // 7000000000 — K is an i64 7 here
+print(K * 1000000000)                         // -1589934592 — no context: an i32 7, which wraps
+```
+
+A read the literal does not fit is the literal's own error there (`const B = 3000000000` read as
+an `i32`). Annotate a `const` (`const K: i64 = 7`) to give it one type everywhere.
+
+**A `let` takes its type from what it is stored into and what is stored into it**, within its
+literal's kind — an integer becomes at most an `i64`, a float `f32` or `f64` — and keeps its
+literal's type when nothing typed reaches it:
+
+```vl
+let s = 0
+for x in xs { s += x }     // xs: i64[] → s is an i64
+let n = 0
+n = 5                      // only literals: n stays an i32
+let b = 7
+takeF64(b)                 // an f64 destination widens b there; b stays an i32
+print(b / 2)               // 3 — integer division
+```
+
+Operands never choose: `if s < n64`, `s + 0.5` or `take64(s + 1)` give `s` no type. Two
+deliveries or stores that no single type satisfies are an error naming both.
+
 ## Comparison and logic
 
 | operator | operands | result | notes |
