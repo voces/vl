@@ -1224,6 +1224,24 @@ axis(
   (d) => twoFiles(d, genGenericChain(60, false), genGenericChain(15, false)),
 );
 
+// D3246's GROWTH pair: a chain of `n` literal bindings, each stored into the next, the first from
+// an `i64`, at 400 against 100, so linear reads 4 and quadratic 16. Every link takes `i64` from
+// the one before it, so the solve must carry the answer down the whole chain. Fuel reads 3.97,
+// so the bar is 1.25x that.
+const genLiteralChain = (n: number): string => {
+  const o = ["function big() { 3000000000 }", "let a0 = 0", "a0 = big()"];
+  for (let i = 1; i < n; i++) o.push(`let a${i} = 0`, `a${i} = a${i - 1}`);
+  o.push(`print(a${n - 1} + a0)`);
+  return o.join("\n") + "\n";
+};
+
+axis(
+  "literal binding store chain",
+  5.0,
+  "The literal-binding solve (`lbiSettleEdges`, compiler/typecheck.vl) is re-solving every binding per link.",
+  (d) => twoFiles(d, genLiteralChain(400), genLiteralChain(100)),
+);
+
 // ── the one RUNTIME axis ─────────────────────────────────────────────────────
 // Every pair above grades COMPILE time, because every cost above is the compiler's. String
 // building is the exception: the cost lands in the EMITTED program, so this pair builds

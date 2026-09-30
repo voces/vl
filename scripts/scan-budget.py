@@ -160,8 +160,8 @@ def rule_lists(root=None):
 
 def current():
     tables, ok = rule_lists()
-    # The lint's copy of the pass table must still BE the pass table. `checkProgram` is
-    # the checker's entry and has no row in `runEmitPass`, so it is the one addition.
+    # The lint's copy of the pass table must still BE the pass table. `checkProgramPass` is
+    # the checker's walk and has no row in `runEmitPass`, so it is the one addition.
     passes = set(vl_list(read_source(LINT), "asPasses"))
     missing = emit_pass_names() - passes
     if missing:
