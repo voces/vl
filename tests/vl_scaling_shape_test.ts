@@ -1564,6 +1564,25 @@ axis(
   (d) => twoFiles(d, genGenericClique(16, true), genGenericClique(16, false)),
 );
 
+// #3300's review pair, and not a reshape: the SAME program with and without one parameter
+// name. A name anywhere turns on the redundant-annotation hint's look through each binding's
+// alias names, and a lookup that walked the alias table per binding cost 3,000 aliases x
+// 3,000 bindings (2.49 here). Aliases are super-linear on their own, so a many/one pair over
+// them would carry that debt; this pair holds the name's own price near 1.
+const genNamedFnAliases = (named: boolean): string => {
+  const o: string[] = [named ? "type G = (fn: i32) => i32" : "type G = (i32) => i32"];
+  for (let i = 0; i < 3000; i++) o.push(`type A${i} = i32`);
+  for (let i = 0; i < 3000; i++) o.push(`const x${i}: A${i} = ${i}`);
+  o.push("print(x0)");
+  return o.join("\n") + "\n";
+};
+axis(
+  "one function-type parameter name over 3,000 aliases",
+  1.25,
+  "An annotation's alias names are being resolved by walking the alias table (`aliasTsRootOf`, compiler/ast.vl).",
+  (d) => twoFiles(d, genNamedFnAliases(true), genNamedFnAliases(false)),
+);
+
 // ── the instrument's own control ─────────────────────────────────────────────
 // EVERY PAIR ABOVE PASSES, so nothing above can say whether the grader still reds. The
 // control is the same `grade` over a pair that must: one source, one literal different,

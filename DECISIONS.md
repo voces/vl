@@ -8757,14 +8757,18 @@ none of them`, at the list's `)`. A half-named list reads as though the unnamed 
 different kind of parameter, and "all or none" keeps the one question a reader asks — which
 argument is which — answered by the type or not at all. A name inside a parenthesized type that
 is not a function type names nothing and is refused too. Function types have no optional or rest
-parameters today, so there is nothing for a name to attach to there.
+parameters today, so there is nothing for a name to attach to there. A keyword cannot be a name,
+and one list cannot name two parameters alike — the same two rules a declared parameter list
+follows, the second of which it now enforces too (D3279).
 
 **Where the names live.** The parser keeps them on the `TS_FUNC` spelling node's text and never in
 the synthetic type name, so nothing downstream of the parser can see them; the four spellings in
 `tests/vl_fn_type_param_names_test.ts` build byte-identical modules. The editor reads them from a
 second, never-cleared column of the annotation and alias spelling roots (`annTsWrittenOf`), since
 canon drops the live root of an alias-spelled annotation. An annotation that writes names is not
-reported as a redundant annotation: inference cannot recover what it documents.
+reported as a redundant annotation: inference cannot recover what it documents. That check
+resolves each annotation's alias names, so it reads a name → root map built once per program
+(`aliasTsRootOf`), and `tests/vl_scaling_shape_test.ts` holds one name's price over 3,000 aliases.
 
 **Not covered.** A method member of a type literal (`{ area(scale: f64): f64 }`) is a sibling
 construct, not a function type, and still takes types only — D3270 asks for the same reading.

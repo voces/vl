@@ -86,6 +86,11 @@ ROWS = [
     ("declStructIndex", ["declStructStmtsLen"], "no-refined-input",
      ("  if declStructStmtsLen != stmts.length { declStructIndexBuild(stmts) }",
       "  declStructIndexBuild(stmts)")),
+    # #3300: one-member alias name -> written spelling root. `udTsNode` and `udTsWritten` are
+    # push-only; `udName` is renamed only by the module merge, which runs before the first ask.
+    ("aliasRootIndex", ["aliasRootLen"], "no-refined-input",
+     ("  if aliasRootLen != udTsNode.length { aliasRootBuild() }",
+      "  aliasRootBuild()")),
     ("buildFnMapResume", ["fmSeenFns", "fmSeenUnSets", "fmSeenUnNames", "fmSeenVariants",
                           "fmSeenSNames", "fmSeenSFields", "fmSeenUFields", "fmSeenTyParams"],
      "resume-reseeds",

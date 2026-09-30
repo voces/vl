@@ -978,7 +978,25 @@ function parseTypeIsect() {
 // so `(fn: i32) => i32` and `(i32) => i32` are one type (DECISIONS.md, "Parameter names in
 // a function type are documentation").
 function parseFnTypeParam(names: string[]) {
-  if peekKind() == "IDENT" && peek2Kind() == "COLON" {
+  const t = peekTok()
+  if (
+    peek2Kind() == "COLON"
+    && t.kind != "IDENT"
+    && keywordKind(t.text) == t.kind
+  ) {
+    // A keyword where a name goes: the same refusal a declared parameter gets, and the
+    // name still counts toward all-or-none so only one diagnostic fires.
+    P.diags.push(
+      {
+        msg: "`" + t.text + "` is a keyword and can't name a parameter — rename it",
+        at: P.pos,
+      },
+    )
+  }
+  if (
+    peek2Kind() == "COLON"
+    && (t.kind == "IDENT" || keywordKind(t.text) == t.kind)
+  ) {
     names.push(advance().text)
     advance() // ":"
   } else {
@@ -1019,7 +1037,31 @@ function fnTypeParamNamesText(names: string[], isFunc: boolean) {
     )
     return ""
   }
+  const dup = firstRepeatedName(names)
+  if dup != "" {
+    P.diags.push(
+      {
+        msg: "the parameter name `" + dup + "` appears twice in this function type",
+        at: P.pos - 1,
+      },
+    )
+    return ""
+  }
   joined
+}
+
+// The first name of `names` that an earlier entry already holds, or "" when all differ.
+function firstRepeatedName(names: string[]) {
+  let i = 1
+  while i < names.length {
+    let j = 0
+    while j < i {
+      if names[j] == names[i] { return names[i] }
+      j = j + 1
+    }
+    i = i + 1
+  }
+  ""
 }
 
 // A method member's tail, shared by the two grammars that read a `{ … }` member list. The
@@ -1098,17 +1140,21 @@ function parseTypeAtom() {
     // `&` splitters honour the grouping. The paren contents parse as a comma-separated type
     // list either way.
     advance() // "("
+    skipNewlines() // a long list may break after `(`, after each `,` and before `)`
     let inner = ""
     const pnames: string[] = []
     if peekKind() != "RPAREN" {
       inner = parseFnTypeParam(pnames)
+      skipNewlines()
       let pmore = peekKind() == "COMMA"
       while pmore {
         advance() // ","
+        skipNewlines()
         if peekKind() == "RPAREN" {
           pmore = false // tolerated trailing comma
         } else {
           inner = inner + "," + parseFnTypeParam(pnames)
+          skipNewlines()
           pmore = peekKind() == "COMMA"
         }
       }
@@ -2721,8 +2767,33 @@ function parseParamList() {
   }
   expectClose("RPAREN")
   restPositionCheck(params)
+  dupParamCheck(params)
   kwParamsMark = kwMark
   params
+}
+
+// Two parameters of one list under one name: the second is unreachable from the body and
+// from a named argument, so the list is refused (D3279). `_` may repeat; it names nothing.
+function dupParamCheck(params: i32[]) {
+  const names: string[] = []
+  let i = 0
+  while i < params.length {
+    const p = P.nodes[params[i]]
+    if p is Param {
+      if p.parName != "_" && p.parName != "" { names.push(p.parName) }
+    }
+    i = i + 1
+  }
+  const dup = firstRepeatedName(names)
+  if dup != "" {
+    P.diags.push(
+      {
+        msg: "the parameter name `" + dup + "` appears twice in this list",
+        at: P.pos - 1,
+      },
+    )
+  }
+  0
 }
 
 // A rest parameter is last and there is at most one — both refused here, where the whole
