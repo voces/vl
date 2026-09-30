@@ -8926,9 +8926,10 @@ kinds of read keep the NAME:
 * a `for` range bound or step: a range is `i32`, where a literal and its name read the same, and
   the constant-range refusals and the step floor judge a literal the author wrote.
 
-Two more are rewritten but flagged, because their checks are about a literal the author wrote: a
-shift count past the width (taken modulo, as for any computed count, not refused) and a
-newtype's brand (a named value is not brand-polymorphic).
+One more is rewritten but flagged, because its check is about a literal the author wrote: a
+newtype's brand (a named value is not brand-polymorphic). A shift count was flagged too, and
+taken modulo past the width; since the exact-constant ruling it is a constant and refused past
+the width as a written count is (D2724).
 
 **Hints.** "redundant type annotation" on a literal `let` also requires the solve to agree. On an
 annotated literal `const` it is withheld where the bare literal would read differently: an `f64`
@@ -8953,6 +8954,107 @@ self-compile does not re-check.
 respelled for the labelled-block ruling) −7.9%, its only difference each
 `i64.extend_i32_s(local.get y)` becoming `i64.const 32`. The seed grows 40 KB (+1.1%) and the
 seed-size baseline is rewritten with it.
+
+## Exact constant arithmetic (owner ruling A, 2026-09-30) — D2712, D2724, D2725, D3053, D3054
+
+**The ruling.** A `const` whose initialiser is literal arithmetic — numeric literals, other such
+`const`s, parentheses, unary minus, `~`, `+ - * / %`, `& | ^`, `<< >> >>>`, with integer and
+float literals — is computed EXACTLY, like Go's untyped constants or Zig's `comptime_int`, and
+typed at each use. A use whose destination cannot hold the exact value is a check error
+(`constant 2147483648 overflows i32`), never a silent wrap. It extends ruling C (a bare literal
+`const` is its literal at every read). A tree that reads a variable, calls a function, or names a
+`let` is untouched, and so is an annotated `const` except as below.
+
+**Where it applies.** A read of a literal `const` is already the literal written there, so a tree
+of literals written in place is the same program as a `const` holding it. The fold therefore runs
+on every such tree wherever it stands — a `const` initialiser, an argument, a shift count, a
+generic body, a join — and on nothing else. So `x << (16 + 16)` is `x << 32` (refused, D2725),
+`1 << K` is `1 << 40` (D2724), `[x, -(-0x80000000)]` holds 2^31 beside an `i64` (D3054),
+`(-(-(-0xFFFFFFFF))) as% i64` is `-4294967295` like the single negation (D3053), and
+`g<i64>(0)` over `x + (3 << 31)` adds 3 * 2^31 (D2712).
+
+**Mechanism.** The checker folds a tree the first time it checks its root (`cexTryFold`, and
+before any scope exists for a module initialiser, `cexFoldModInit`), computing it in
+`compiler/const_exact.vl`, and rewrites the root in place into the literal of the value: a
+decimal, a hex literal for a bit pattern (below), a decimal float, with a negation over it when
+negative. Every use then types that literal exactly as it types one the author wrote, so there is
+one set of rules for a literal and a constant, and the emitter never sees the tree. A name the
+tree read stays an editor reference.
+
+**The details, following Go.**
+
+* Integer division truncates toward zero and `%` takes the dividend's sign, as at run time.
+  Division or remainder by an integer zero has no value and is a check error (`division by zero
+  in a constant expression`); the run-time trap is still there for a divisor that is not a
+  constant.
+* A shift count must be a non-negative integer (`shift count -1 is negative`). `<<` is exact and
+  `>>` floors. A count too large for the destination shows as the value not fitting there, as in
+  Go: `1 << 40` at `i32` is `constant 1099511627776 overflows i32`, and at `i64` it is 2^40. A
+  constant count beside an operand that is not a constant is graded as a written count is
+  (D2710): refused at or past the operand's width, a `const` name (D2724), a tree (D2725) and a
+  radix count read at its full value (D3427).
+* Mixing an integer and a float makes a float constant (`1 + 0.5` is 1.5); an integer `/` of two
+  integers is still integer division (`7 / 2` is 3 at every destination; D2711).
+* A float constant at an integer destination — a binding, argument, return, field or list
+  element — is that integer when it is a whole number (`2.5 * 4` is `10` at `i64`); otherwise it
+  is refused as any float there is.
+* An integer constant at `f32` or `f64` is taken as an integer literal is: when that float holds
+  it exactly, and refused otherwise (D1890's rule; a VL integer literal does not round). A float
+  constant is exact until its use: `0.1 + 0.2` is the `f64` nearest 0.3 and the `f32` nearest
+  0.3, not the sum of two rounded values.
+* **Precision.** Integers are exact to 512 bits, past which the expression is a check error
+  (`constant overflows the 512-bit exact integer range`); Go's compiler uses the same bound. A
+  float constant is an exact fraction whose numerator and denominator are each held to 4096
+  bits, enough for every finite double and its reciprocal. It reaches its use as a decimal
+  literal: exact when its expansion terminates within 400 characters, otherwise to 60
+  significant digits, so it is correctly rounded except within 10^-59 of a rounding boundary.
+
+**Where VL keeps its own rules.**
+
+* **A radix literal is a bit pattern** ("Types & semantics" above), so a negation, bitwise
+  operator or shift whose operand is one stays a pattern, and fits a width by its digits as the
+  literal does: `0xFFFF0000 | 0xFF` is `-65281` at `i32` and 4294902015 at `i64`, and
+  `0xFF << 24` is `0xFF000000`. A result built from decimal literals is a number:
+  `1 << 31` at `i32` is refused where Go refuses `int32(1 << 31)` too; write `0x1 << 31` or
+  `-2147483647 - 1` for the pattern or the value. Arithmetic (`+ - * / %`) always gives a
+  number, so `0xFFFFFFFF + 1` is 2^32 and refused at `i32`.
+* **A float division by zero, and a float constant past the largest double, are not folded.**
+  VL has no spelling for infinity or NaN, so `1.0 / 0.0` and `1e308 * 10.0` stay the IEEE
+  computation they were; Go refuses both.
+* `>>>` of a negative constant depends on the width it runs at, so it is not folded either, and
+  a tree containing one keeps the literal-tree reading at its destination's width (D2709).
+* A `u8` element takes a constant as it takes the literal (past 255 refused, a negative one
+  stored truncated), since ruling C makes a constant its literal; whether a negative literal
+  should refuse there is D3428's open question.
+* An annotated `const` is a typed constant: its annotation is the tree's destination, so
+  `const x: i32 = 2147483647 + 1` is refused rather than wrapped.
+* An integer literal past the `i64` range is refused wherever no float holds it exactly
+  (D3425), where it used to keep its low 64 bits; a constant past it (`1 << 64`) is refused at
+  the use, not where it is declared, so `(1 << 70) >> 60` is 1024.
+* In a generic body, a 64-bit constant beside a type-parameter operand records a constraint
+  (`OP_LITFIT`) that a narrower pin refuses (`i32 cannot hold the 64-bit constant it meets`),
+  since the body alone cannot see the width (D2712, D3426).
+
+**Programs whose behaviour changed.** Every one computed a constant that wrapped, or a float
+constant rounded step by step, and now has the exact value or a loud refusal; the exact-constant
+grid (`scripts/capability-probes/const-exact-grid.py`, 32 initialisers x 15 uses x 2 spellings =
+960 cells, expected values from Python's exact integers and fractions) grades 960 of 960 as the
+rule says, and against master 231 cells moved, each from a wrapped or step-rounded value: 109 now
+refuse (`K` at `i32` for `K = 2147483647 + 1`), 122 print the exact value, and no cell that
+printed the exact value on master changed. The literal-binding grid (594 cells) is unchanged.
+Fixtures that pinned a wrap were rewritten, each listed in the PR. Every module initialiser that
+is a constant tree is folded before the module is checked — a `let` and an annotated `const` as
+well as a literal `const` — so each is checked as the bare spelling of its value would be (a
+`let` holding one is a literal `let`; an annotation on one is as redundant as on its literal).
+
+**Cost, against master `5e277ab52`.** The fold is one walk per arithmetic operator, stopping at
+its first leaf that is no constant: the plumb-shape units +0.19% / +0.20% guest fuel, a
+generated plumb chunk (`chunk_0`) −0.46% (its constant trees reach the emitter as literals), the
+L2 self-compile +0.53%, the seed +28 KB (+0.7%). plumb's 428 units check with byte-identical
+diagnostics; their builds differ only as constants folded earlier (identical after binaryen's
+constant folding, or after `-O2`, but for four `x86.vl` records whose initialisers became
+constant expressions). A chain of `const`s whose exact value grows each step pays for the
+growth: 200 floats each four times the last cost +65% over computing them at run time.
 
 ## Flow narrowing: per-path facts meet at joins (owner ruling 2026-09-29) — plumb PL-064, D3285
 

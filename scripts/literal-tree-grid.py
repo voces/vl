@@ -3,7 +3,10 @@
 (i32, i64, f64, f32), graded against values computed here. Run from the checkout root.
 
 Usage: scripts/literal-tree-grid.py <seed.wasm> [--show] [--json=<path>] [--float-adopt]
-Prints one row per position with `as-expected/total` per width; --show lists every miss."""
+Prints one row per position with `as-expected/total` per width; --show lists every miss.
+Its evaluator reads a tree at its destination's width, the reading before the exact-constant
+ruling (DECISIONS.md, "Exact constant arithmetic"); `capability-probes/const-exact-grid.py`
+grades the ruling."""
 import math, os, re, struct, subprocess, sys, tempfile
 from concurrent.futures import ThreadPoolExecutor
 

@@ -1,0 +1,755 @@
+// Exact constant arithmetic for the checker's constant fold (DECISIONS.md, "Exact constant
+// arithmetic"). A value is an integer or an exact fraction; magnitudes are little-endian
+// base-2^16 `i32[]` limbs, trimmed, zero written `[0]`. An integer is capped at
+// `CEX_INT_BITS` and a fraction's numerator and denominator at `CEX_FRAC_BITS`. A leaf.
+
+// One constant value. `cxErr` non-empty: the expression is a check error saying so. `cxNo`: not
+// a constant this fold computes, left to the ordinary check. `cxPat`: a radix literal, or a
+// negation, bitwise operator or shift over one, which reads as a bit pattern of its
+// destination's width as the literal does. `cxDen` is `[1]` for an integer.
+export type Cex = {
+  cxErr: string,
+  cxNo: boolean,
+  cxFloat: boolean,
+  cxPat: boolean,
+  cxNeg: boolean,
+  cxNum: i32[],
+  cxDen: i32[],
+}
+
+export const CEX_INT_BITS = 512
+export const CEX_FRAC_BITS = 4096
+// A float's exact decimal spelling longest kept, and the significant digits written otherwise.
+const CEX_DEC_MAX = 400
+const CEX_SIG = 60
+
+// ── magnitudes ──────────────────────────────────────────────────────────────
+
+function cxmOne(): i32[] { [1] }
+
+function cxmTrim(a: i32[]): i32[] {
+  while a.length > 1 && a[a.length - 1] == 0 { a.pop() }
+  if a.length == 0 { a.push(0) }
+  a
+}
+
+function cxmIsZero(a: i32[]): boolean { a.length == 1 && a[0] == 0 }
+
+function cxmIsOne(a: i32[]): boolean { a.length == 1 && a[0] == 1 }
+
+function cxmCmp(a: i32[], b: i32[]): i32 {
+  if a.length != b.length {
+    if a.length < b.length { return -1 }
+    return 1
+  }
+  let i = a.length - 1
+  while i >= 0 {
+    if a[i] != b[i] {
+      if a[i] < b[i] { return -1 }
+      return 1
+    }
+    i = i - 1
+  }
+  0
+}
+
+function cxmAdd(a: i32[], b: i32[]): i32[] {
+  const out: i32[] = []
+  let n = a.length
+  if b.length > n { n = b.length }
+  let carry = 0
+  let i = 0
+  while i < n {
+    let s = carry
+    if i < a.length { s = s + a[i] }
+    if i < b.length { s = s + b[i] }
+    out.push(s & 0xffff)
+    carry = s >>> 16
+    i = i + 1
+  }
+  if carry != 0 { out.push(carry) }
+  cxmTrim(out)
+}
+
+// `a - b`; the caller guarantees `a >= b`.
+function cxmSub(a: i32[], b: i32[]): i32[] {
+  const out: i32[] = []
+  let borrow = 0
+  let i = 0
+  while i < a.length {
+    let d = a[i] - borrow
+    if i < b.length { d = d - b[i] }
+    if d < 0 {
+      d = d + 0x10000
+      borrow = 1
+    } else {
+      borrow = 0
+    }
+    out.push(d)
+    i = i + 1
+  }
+  cxmTrim(out)
+}
+
+// Each partial sum stays below 2^32, so it is read unsigned through `&` and `>>>`.
+function cxmMul(a: i32[], b: i32[]): i32[] {
+  if cxmIsZero(a) || cxmIsZero(b) { return [0] }
+  const out: i32[] = []
+  let k = 0
+  while k < a.length + b.length {
+    out.push(0)
+    k = k + 1
+  }
+  let i = 0
+  while i < a.length {
+    let carry = 0
+    let j = 0
+    while j < b.length {
+      const t = out[i + j] + a[i] * b[j] + carry
+      out[i + j] = t & 0xffff
+      carry = t >>> 16
+      j = j + 1
+    }
+    let at = i + b.length
+    while carry != 0 {
+      const t = out[at] + carry
+      out[at] = t & 0xffff
+      carry = t >>> 16
+      at = at + 1
+    }
+    i = i + 1
+  }
+  cxmTrim(out)
+}
+
+// `a * m + add` for `m` and `add` at most 0xffff.
+function cxmMulSmallAdd(a: i32[], m: i32, add: i32): i32[] {
+  const out: i32[] = []
+  let carry = add
+  let i = 0
+  while i < a.length {
+    const t = a[i] * m + carry
+    out.push(t & 0xffff)
+    carry = t >>> 16
+    i = i + 1
+  }
+  while carry != 0 {
+    out.push(carry & 0xffff)
+    carry = carry >>> 16
+  }
+  cxmTrim(out)
+}
+
+function cxmShl(a: i32[], k: i32): i32[] {
+  if cxmIsZero(a) { return [0] }
+  const out: i32[] = []
+  let z = 0
+  while z < (k >>> 4) {
+    out.push(0)
+    z = z + 1
+  }
+  const bits = k & 15
+  let carry = 0
+  let i = 0
+  while i < a.length {
+    const v = (a[i] << bits) | carry
+    out.push(v & 0xffff)
+    carry = v >>> 16
+    i = i + 1
+  }
+  if carry != 0 { out.push(carry) }
+  cxmTrim(out)
+}
+
+function cxmShr(a: i32[], k: i32): i32[] {
+  const limbs = k >>> 4
+  const bits = k & 15
+  if limbs >= a.length { return [0] }
+  const out: i32[] = []
+  let i = limbs
+  while i < a.length {
+    let v = a[i] >>> bits
+    if bits > 0 && i + 1 < a.length {
+      v = v | ((a[i + 1] << (16 - bits)) & 0xffff)
+    }
+    out.push(v)
+    i = i + 1
+  }
+  cxmTrim(out)
+}
+
+function cxmBitLen(a: i32[]): i32 {
+  if cxmIsZero(a) { return 0 }
+  let top = a[a.length - 1]
+  let bits = (a.length - 1) * 16
+  while top != 0 {
+    bits = bits + 1
+    top = top >>> 1
+  }
+  bits
+}
+
+// Quotient and remainder of `n / d` for `d` nonzero, as `[q, r]`.
+function cxmDivmod(n: i32[], d: i32[]): i32[][] {
+  if d.length == 1 && d[0] < 0x8000 { return cxmDivmodSmall(n, d[0]) }
+  if cxmCmp(n, d) < 0 { return [[0], n] }
+  const shift = cxmBitLen(n) - cxmBitLen(d)
+  let rem = n
+  let dd = cxmShl(d, shift)
+  let q: i32[] = [0]
+  let s = shift
+  while s >= 0 {
+    q = cxmShl(q, 1)
+    if cxmCmp(rem, dd) >= 0 {
+      rem = cxmSub(rem, dd)
+      q = cxmAdd(q, cxmOne())
+    }
+    dd = cxmShr(dd, 1)
+    s = s - 1
+  }
+  [q, rem]
+}
+
+// A divisor below 2^15 keeps every running remainder times 2^16 inside the signed range.
+function cxmDivmodSmall(n: i32[], d: i32): i32[][] {
+  const q: i32[] = []
+  let k = 0
+  while k < n.length {
+    q.push(0)
+    k = k + 1
+  }
+  let rem = 0
+  let i = n.length - 1
+  while i >= 0 {
+    const cur = rem * 65536 + n[i]
+    q[i] = cur / d
+    rem = cur % d
+    i = i - 1
+  }
+  [cxmTrim(q), [rem]]
+}
+
+function cxmGcd(a: i32[], b: i32[]): i32[] {
+  let x = a
+  let y = b
+  while !cxmIsZero(y) {
+    const r = cxmDivmod(x, y)[1]
+    x = y
+    y = r
+  }
+  x
+}
+
+function cxmPow10(e: i32): i32[] {
+  let r: i32[] = [1]
+  let i = 0
+  while i + 4 <= e {
+    r = cxmMulSmallAdd(r, 10000, 0)
+    i = i + 4
+  }
+  while i < e {
+    r = cxmMulSmallAdd(r, 10, 0)
+    i = i + 1
+  }
+  r
+}
+
+function cxmToDec(a: i32[]): string {
+  if cxmIsZero(a) { return "0" }
+  const groups: i32[] = []
+  let x = a
+  while !cxmIsZero(x) {
+    const qr = cxmDivmodSmall(x, 10000)
+    groups.push(qr[1][0])
+    x = qr[0]
+  }
+  const cps: i32[] = []
+  let g = groups.length - 1
+  cxDigitsPush(cps, groups[g], false)
+  g = g - 1
+  while g >= 0 {
+    cxDigitsPush(cps, groups[g], true)
+    g = g - 1
+  }
+  fromCodePoints(cps)
+}
+
+// The decimal digits of `v` (below 10000), padded to four when `pad`.
+function cxDigitsPush(cps: i32[], v: i32, pad: boolean) {
+  const ds: i32[] = []
+  let x = v
+  while x > 0 {
+    ds.push(48 + x % 10)
+    x = x / 10
+  }
+  if pad {
+    while ds.length < 4 { ds.push(48) }
+  } else if ds.length == 0 {
+    ds.push(48)
+  }
+  let i = ds.length - 1
+  while i >= 0 {
+    cps.push(ds[i])
+    i = i - 1
+  }
+  0
+}
+
+function cxmToHex(a: i32[]): string {
+  const cps: i32[] = [48, 120]
+  let started = false
+  let i = a.length - 1
+  while i >= 0 {
+    let s = 12
+    while s >= 0 {
+      const d = (a[i] >>> s) & 15
+      if d != 0 || started || (i == 0 && s == 0) {
+        started = true
+        if d < 10 { cps.push(48 + d) } else { cps.push(87 + d) }
+      }
+      s = s - 4
+    }
+    i = i - 1
+  }
+  fromCodePoints(cps)
+}
+
+function cxI32Str(v: i32): string {
+  const cps: i32[] = []
+  let x = v
+  if x < 0 {
+    cps.push(45)
+    x = 0 - x
+  }
+  const ds: i32[] = []
+  if x == 0 { ds.push(48) }
+  while x > 0 {
+    ds.push(48 + x % 10)
+    x = x / 10
+  }
+  let i = ds.length - 1
+  while i >= 0 {
+    cps.push(ds[i])
+    i = i - 1
+  }
+  fromCodePoints(cps)
+}
+
+// ── values ──────────────────────────────────────────────────────────────────
+
+function cexMake(
+  f: boolean,
+  pat: boolean,
+  neg: boolean,
+  num: i32[],
+  den: i32[],
+): Cex {
+  {
+    cxErr: "",
+    cxNo: false,
+    cxFloat: f,
+    cxPat: pat,
+    cxNeg: neg && !cxmIsZero(num),
+    cxNum: num,
+    cxDen: den,
+  }
+}
+
+export function cexError(msg: string): Cex {
+  {
+    cxErr: msg,
+    cxNo: false,
+    cxFloat: false,
+    cxPat: false,
+    cxNeg: false,
+    cxNum: [0],
+    cxDen: [1],
+  }
+}
+
+// The one "not a constant" answer, shared since a value is never mutated.
+const CEX_NOT_CONST: Cex = {
+  cxErr: "",
+  cxNo: true,
+  cxFloat: false,
+  cxPat: false,
+  cxNeg: false,
+  cxNum: [0],
+  cxDen: [1],
+}
+
+export function cexNotConst(): Cex { CEX_NOT_CONST }
+
+// Whether `v` is a value rather than a refusal or a decline.
+export function cexOk(v: Cex): boolean { v.cxErr == "" && !v.cxNo }
+
+function cexInt(neg: boolean, mag: i32[], pat: boolean): Cex {
+  if cxmBitLen(mag) > CEX_INT_BITS {
+    return cexError(
+      "constant overflows the "
+        + cxI32Str(CEX_INT_BITS)
+        + "-bit exact integer range",
+    )
+  }
+  cexMake(false, pat, neg, mag, cxmOne())
+}
+
+// A fraction reduced to lowest terms; `den` is nonzero.
+function cexFrac(neg: boolean, num: i32[], den: i32[]): Cex {
+  let n = num
+  let d = den
+  if cxmIsZero(n) {
+    d = cxmOne()
+  } else if !cxmIsOne(d) {
+    const g = cxmGcd(n, d)
+    if !cxmIsOne(g) {
+      n = cxmDivmod(n, g)[0]
+      d = cxmDivmod(d, g)[0]
+    }
+  }
+  if cxmBitLen(n) > CEX_FRAC_BITS || cxmBitLen(d) > CEX_FRAC_BITS {
+    return cexError(
+      "constant needs more than "
+        + cxI32Str(CEX_FRAC_BITS)
+        + " bits to hold exactly",
+    )
+  }
+  cexMake(true, false, neg, n, d)
+}
+
+// The value of numeric-literal lexeme `t` (no sign): a radix or decimal integer, or a decimal
+// float. A float whose exponent is far outside every float's range is left to the literal check.
+export function cexOfLexeme(t: string): Cex {
+  let base = 10
+  let i = 0
+  if t.length >= 2 && t[0] == '0' {
+    const p = t[1]
+    if p == 'x' || p == 'X' { base = 16 }
+    else if p == 'b' || p == 'B' { base = 2 }
+    else if p == 'o' || p == 'O' { base = 8 }
+    if base != 10 { i = 2 }
+  }
+  let mag: i32[] = [0]
+  let frac = 0
+  let inFrac = false
+  let isFloat = false
+  while i < t.length {
+    const c = t[i]
+    if c == '_' {
+      i = i + 1
+    } else if base == 10 && c == '.' {
+      inFrac = true
+      isFloat = true
+      i = i + 1
+    } else if base == 10 && (c == 'e' || c == 'E') {
+      isFloat = true
+      const ex = cxParseExp(t, i + 1)
+      if ex < -1400 || ex > 1400 { return cexNotConst() }
+      return cexScale10(mag, ex - frac)
+    } else {
+      let d = 0
+      if c >= '0' && c <= '9' { d = c - '0' }
+      else if c >= 'a' && c <= 'f' { d = c - 'a' + 10 }
+      else if c >= 'A' && c <= 'F' { d = c - 'A' + 10 }
+      else { return cexNotConst() }
+      mag = cxmMulSmallAdd(mag, base, d)
+      if inFrac { frac = frac + 1 }
+      i = i + 1
+    }
+  }
+  if isFloat { return cexScale10(mag, 0 - frac) }
+  cexInt(false, mag, base != 10)
+}
+
+// The exponent written from `at` in `t` (an optional sign, then digits), clamped far out.
+function cxParseExp(t: string, at: i32): i32 {
+  let i = at
+  let neg = false
+  if i < t.length && (t[i] == '+' || t[i] == '-') {
+    neg = t[i] == '-'
+    i = i + 1
+  }
+  let v = 0
+  while i < t.length {
+    const c = t[i]
+    if c != '_' && v < 100000 { v = v * 10 + (c - '0') }
+    i = i + 1
+  }
+  if neg { return 0 - v }
+  v
+}
+
+function cexScale10(mag: i32[], e: i32): Cex {
+  if e >= 0 { return cexFrac(false, cxmMul(mag, cxmPow10(e)), cxmOne()) }
+  cexFrac(false, mag, cxmPow10(0 - e))
+}
+
+function cexToFloat(v: Cex): Cex {
+  if v.cxFloat { return v }
+  cexMake(true, false, v.cxNeg, v.cxNum, v.cxDen)
+}
+
+// Signed `(an, am) + (bn, bm)` over magnitudes, as a sign and a magnitude.
+function cxsAddNeg(an: boolean, am: i32[], bn: boolean, bm: i32[]): boolean {
+  if an == bn { return an }
+  const c = cxmCmp(am, bm)
+  if c >= 0 { return an }
+  bn
+}
+
+function cxsAddMag(an: boolean, am: i32[], bn: boolean, bm: i32[]): i32[] {
+  if an == bn { return cxmAdd(am, bm) }
+  if cxmCmp(am, bm) >= 0 { return cxmSub(am, bm) }
+  cxmSub(bm, am)
+}
+
+function cexPass(a: Cex, b: Cex): Cex {
+  if a.cxErr != "" || a.cxNo { return a }
+  b
+}
+
+function cexBad(a: Cex, b: Cex): boolean { !cexOk(a) || !cexOk(b) }
+
+export function cexNeg(a: Cex): Cex {
+  if !cexOk(a) { return a }
+  cexMake(a.cxFloat, a.cxPat, !a.cxNeg, a.cxNum, a.cxDen)
+}
+
+export function cexAdd(a: Cex, b: Cex, sub: boolean): Cex {
+  if cexBad(a, b) { return cexPass(a, b) }
+  let bneg = b.cxNeg
+  if sub { bneg = !bneg }
+  if a.cxFloat || b.cxFloat {
+    const x = cexToFloat(a)
+    const y = cexToFloat(b)
+    const l = cxmMul(x.cxNum, y.cxDen)
+    const r = cxmMul(y.cxNum, x.cxDen)
+    return cexFrac(
+      cxsAddNeg(x.cxNeg, l, bneg, r),
+      cxsAddMag(x.cxNeg, l, bneg, r),
+      cxmMul(x.cxDen, y.cxDen),
+    )
+  }
+  cexInt(
+    cxsAddNeg(a.cxNeg, a.cxNum, bneg, b.cxNum),
+    cxsAddMag(a.cxNeg, a.cxNum, bneg, b.cxNum),
+    false,
+  )
+}
+
+export function cexMul(a: Cex, b: Cex): Cex {
+  if cexBad(a, b) { return cexPass(a, b) }
+  const neg = a.cxNeg != b.cxNeg
+  if a.cxFloat || b.cxFloat {
+    return cexFrac(neg, cxmMul(a.cxNum, b.cxNum), cxmMul(a.cxDen, b.cxDen))
+  }
+  cexInt(neg, cxmMul(a.cxNum, b.cxNum), false)
+}
+
+// Integer division truncates; a float division by zero is left to IEEE at run time.
+export function cexDiv(a: Cex, b: Cex): Cex {
+  if cexBad(a, b) { return cexPass(a, b) }
+  const neg = a.cxNeg != b.cxNeg
+  if a.cxFloat || b.cxFloat {
+    if cxmIsZero(b.cxNum) { return cexNotConst() }
+    return cexFrac(neg, cxmMul(a.cxNum, b.cxDen), cxmMul(a.cxDen, b.cxNum))
+  }
+  if cxmIsZero(b.cxNum) {
+    return cexError("division by zero in a constant expression")
+  }
+  cexInt(neg, cxmDivmod(a.cxNum, b.cxNum)[0], false)
+}
+
+// The remainder takes the dividend's sign, as a truncating division leaves it.
+export function cexRem(a: Cex, b: Cex): Cex {
+  if cexBad(a, b) { return cexPass(a, b) }
+  if a.cxFloat || b.cxFloat {
+    if cxmIsZero(b.cxNum) { return cexNotConst() }
+    const q = cxmDivmod(cxmMul(a.cxNum, b.cxDen), cxmMul(a.cxDen, b.cxNum))[0]
+    const qb = cexMul(cexMake(true, false, a.cxNeg != b.cxNeg, q, cxmOne()), b)
+    return cexAdd(cexToFloat(a), qb, true)
+  }
+  if cxmIsZero(b.cxNum) {
+    return cexError("division by zero in a constant expression")
+  }
+  cexInt(a.cxNeg, cxmDivmod(a.cxNum, b.cxNum)[1], false)
+}
+
+// The low `n` limbs of `v`'s infinite two's-complement form.
+function cxTwos(v: Cex, n: i32): i32[] {
+  const out: i32[] = []
+  let i = 0
+  if !v.cxNeg {
+    while i < n {
+      if i < v.cxNum.length { out.push(v.cxNum[i]) } else { out.push(0) }
+      i = i + 1
+    }
+    return out
+  }
+  const m1 = cxmSub(v.cxNum, cxmOne())
+  while i < n {
+    let l = 0
+    if i < m1.length { l = m1[i] }
+    out.push(~l & 0xffff)
+    i = i + 1
+  }
+  out
+}
+
+// The integer whose two's-complement form is `limbs`, its top bit the sign.
+function cxFromTwos(limbs: i32[], pat: boolean): Cex {
+  const top = limbs[limbs.length - 1]
+  if (top & 0x8000) == 0 { return cexInt(false, cxmTrim(limbs), pat) }
+  const inv: i32[] = []
+  for l in limbs { inv.push(~l & 0xffff) }
+  cexInt(true, cxmAdd(cxmTrim(inv), cxmOne()), pat)
+}
+
+// `op` is one of `&`, `|`, `^`; a float operand is not a constant this fold computes.
+export function cexBitwise(a: Cex, b: Cex, op: string): Cex {
+  if cexBad(a, b) { return cexPass(a, b) }
+  if a.cxFloat || b.cxFloat { return cexNotConst() }
+  let n = a.cxNum.length
+  if b.cxNum.length > n { n = b.cxNum.length }
+  n = n + 1
+  const x = cxTwos(a, n)
+  const y = cxTwos(b, n)
+  const out: i32[] = []
+  let i = 0
+  while i < n {
+    if op == "&" { out.push(x[i] & y[i]) }
+    else if op == "|" { out.push(x[i] | y[i]) }
+    else { out.push(x[i] ^ y[i]) }
+    i = i + 1
+  }
+  cxFromTwos(out, a.cxPat || b.cxPat)
+}
+
+export function cexNot(a: Cex): Cex {
+  if !cexOk(a) { return a }
+  if a.cxFloat { return cexNotConst() }
+  const r = cexAdd(
+    cexNeg(a),
+    cexMake(false, false, false, cxmOne(), cxmOne()),
+    true,
+  )
+  if !cexOk(r) { return r }
+  cexMake(false, a.cxPat, r.cxNeg, r.cxNum, r.cxDen)
+}
+
+// `op` is `<<`, `>>` or `>>>`. The count must be a non-negative integer; `>>` floors, and `>>>`
+// of a negative value depends on the destination's width, so it is not folded.
+export function cexShift(a: Cex, b: Cex, op: string): Cex {
+  if cexBad(a, b) { return cexPass(a, b) }
+  if a.cxFloat || b.cxFloat { return cexNotConst() }
+  if b.cxNeg {
+    return cexError("shift count -" + cxmToDec(b.cxNum) + " is negative")
+  }
+  const big = cxmBitLen(b.cxNum) > 16
+  let k = 0
+  if !big { k = b.cxNum[0] }
+  if op == "<<" {
+    if cxmIsZero(a.cxNum) {
+      return cexMake(false, a.cxPat, false, [0], cxmOne())
+    }
+    if big || k > CEX_INT_BITS {
+      return cexError(
+        "constant overflows the "
+          + cxI32Str(CEX_INT_BITS)
+          + "-bit exact integer range",
+      )
+    }
+    return cexInt(a.cxNeg, cxmShl(a.cxNum, k), a.cxPat)
+  }
+  if a.cxNeg && op == ">>>" { return cexNotConst() }
+  if big || k > CEX_INT_BITS + 16 { k = CEX_INT_BITS + 16 }
+  if !a.cxNeg { return cexInt(false, cxmShr(a.cxNum, k), a.cxPat) }
+  const m = cxmAdd(cxmShr(cxmSub(a.cxNum, cxmOne()), k), cxmOne())
+  cexInt(true, m, a.cxPat)
+}
+
+// ── reading a value back ────────────────────────────────────────────────────
+
+// Whether `v`, an integer, needs at most `bits` bits as a signed number.
+export function cexFitsSigned(v: Cex, bits: i32): boolean {
+  const lim = cxmShl(cxmOne(), bits - 1)
+  const c = cxmCmp(v.cxNum, lim)
+  if c < 0 { return true }
+  c == 0 && v.cxNeg
+}
+
+// Whether the pattern `v` fits a `bits`-wide destination: its magnitude needs at most `bits`
+// bits, as a radix literal's digits do.
+export function cexPatFits(v: Cex, bits: i32): boolean {
+  cxmBitLen(v.cxNum) <= bits
+}
+
+// About log2 of `v`'s magnitude: its numerator's bit length less its denominator's, within one.
+export function cexScaleBits(v: Cex): i32 {
+  cxmBitLen(v.cxNum) - cxmBitLen(v.cxDen)
+}
+
+// Whether the fraction `v` is a whole number.
+export function cexIsWhole(v: Cex): boolean { cxmIsOne(v.cxDen) }
+
+// The decimal spelling of the whole number `v`'s magnitude.
+export function cexDecText(v: Cex): string { cxmToDec(v.cxNum) }
+
+// The literal lexeme, without its sign, that denotes `v`'s magnitude: a pattern in hex, another
+// integer in decimal, and a float in decimal, exact when it terminates within `CEX_DEC_MAX`
+// characters and otherwise to `CEX_SIG` significant digits.
+export function cexLexeme(v: Cex): string {
+  if !v.cxFloat {
+    if v.cxPat { return cxmToHex(v.cxNum) }
+    return cxmToDec(v.cxNum)
+  }
+  if cxmIsZero(v.cxNum) { return "0.0" }
+  const exact = cexFloatExact(v)
+  if exact != "" { return exact }
+  cexFloatSci(v)
+}
+
+// The terminating decimal expansion of `v`, or "" when it has none that short.
+function cexFloatExact(v: Cex): string {
+  let d = v.cxDen
+  let twos = 0
+  while (d[0] & 1) == 0 && !cxmIsZero(d) {
+    d = cxmShr(d, 1)
+    twos = twos + 1
+  }
+  let fives = 0
+  while !cxmIsOne(d) {
+    const qr = cxmDivmodSmall(d, 5)
+    if !cxmIsZero(qr[1]) { return "" }
+    d = qr[0]
+    fives = fives + 1
+    if fives > CEX_DEC_MAX { return "" }
+  }
+  if twos > CEX_DEC_MAX { return "" }
+  let k = twos
+  if fives > k { k = fives }
+  let scaled = cxmMul(v.cxNum, cxmPow10(k))
+  scaled = cxmDivmod(scaled, v.cxDen)[0]
+  let digits = cxmToDec(scaled)
+  if digits.length > CEX_DEC_MAX { return "" }
+  if k == 0 { return digits + ".0" }
+  while digits.length <= k { digits = "0" + digits }
+  const at = digits.length - k
+  digits.slice(0, at) + "." + digits.slice(at, digits.length)
+}
+
+// `v` to `CEX_SIG` significant digits, truncated, in scientific form.
+function cexFloatSci(v: Cex): string {
+  const nd = cxmToDec(v.cxNum).length
+  const dd = cxmToDec(v.cxDen).length
+  const s = CEX_SIG - (nd - dd) + 1
+  let q: i32[] = [0]
+  if s >= 0 {
+    q = cxmDivmod(cxmMul(v.cxNum, cxmPow10(s)), v.cxDen)[0]
+  } else {
+    q = cxmDivmod(v.cxNum, cxmMul(v.cxDen, cxmPow10(0 - s)))[0]
+  }
+  const digits = cxmToDec(q)
+  const e = digits.length - 1 - s
+  digits.slice(0, 1) + "." + digits.slice(1, digits.length) + "e" + cxI32Str(e)
+}

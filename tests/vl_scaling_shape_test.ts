@@ -608,7 +608,9 @@ const genConstChain = (depth: number): string => {
   const o: string[] = [];
   for (const [p, a0] of [["A", "3"], ["F", "3.0"], ["L", "3 as i64"]]) {
     o.push(`const ${p}0 = ${a0}`);
-    for (let i = 1; i <= depth; i++) o.push(`const ${p}${i} = ${p}${i - 1} * 3 + ${p}${i - 1}`);
+    // The chain holds its value: an exact constant past 64 bits is refused where it is read, and
+    // one that grows is computed at its full width, which is not what this axis measures.
+    for (let i = 1; i <= depth; i++) o.push(`const ${p}${i} = ${p}${i - 1} * 3 - ${p}${i - 1} * 2`);
   }
   o.push(`function g() { print(A${depth}) print(F${depth}) print(L${depth}) }`, "g()");
   return o.join("\n") + "\n";

@@ -321,6 +321,12 @@ Deno.test({ name: "wasm-checker: a function value's defaulted literal return nam
       mis + " — `k` returns the literal `-1` on line 4, so its return defaulted to `i32`; " +
       "annotate it: `const k = (x: i64): i64 => -1`",
     ],
+    // A tree of literals is its constant, so it is named by its value.
+    [
+      g + "function m(x: i64) { 2 * 3 }\nprint(ap(m))\n",
+      mis + " — `m` returns the literal `6` on line 4, so its return defaulted to `i32`; " +
+      "annotate it: `function m(x: i64): i64 { … }`",
+    ],
     // A call whose result still fits the annotated return keeps the note.
     [
       g + "function c(x: i64) { 5 }\nprint(ap(c))\nprint(c(2))\nc(3)\nconst y: i64 = c(4)\nprint(y)\n",
@@ -348,8 +354,8 @@ Deno.test({ name: "wasm-checker: a function value's defaulted literal return nam
     // A lambda binding that is reassigned, or aliased.
     [g + "function z(x: i64): i32 { 0 }\nlet k = (x: i64) => -1\nprint(ap(k))\nk = z\n", [mis]],
     [g + "function h(x: i64) { 7 }\nconst al = h\nprint(ap(h))\nprint(a32(al))\n", [mis]],
-    // A return that is not a literal.
-    [g + "function m(x: i64) { 2 * 3 }\nprint(ap(m))\n", [mis]],
+    // A return that is not a literal (a tree of literals is one: its constant, exact).
+    [g + "function m(x: i64) { (x as% i32) * 3 }\nprint(ap(m))\n", [mis]],
     // A call result the annotation would change: cast, operator, inferred tail, member call.
     [g + "function c1(x: i64) { 5 }\nprint(ap(c1))\nprint(c1(1) as i32)\n", [mis]],
     [g + "function c2(x: i64) { 5 }\nprint(ap(c2))\nprint(c2(1) * 1000000000)\n", [mis]],

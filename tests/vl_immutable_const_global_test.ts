@@ -35,7 +35,8 @@ const PROGRAM = [
   "export const P = 9",
   "function use() {",
   "  H = H - 1",
-  "  print(A + B + F[1] + G + H + S)",
+  // `F[1]` first: `A + B` alone is a tree of constants, which folds into one immediate.
+  "  print(F[1] + A + B + G + H + S)",
   "  print(C)",
   "  print(W)",
   "  print(D)",
