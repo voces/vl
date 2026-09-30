@@ -8851,7 +8851,8 @@ parenthesised — is re-typed only by:
 Rules:
 
 * **Operands never choose.** `s < n64`, `b + mk()` or `take64(b + 1)` give `b` no type; a read
-  inside an expression is an operand of it.
+  inside an expression is an operand of it. It still vetoes a type that would make that
+  expression wider than where it goes: `take64(b); xs[b - 6]` keeps `b` an `i32`.
 * **Within kind.** An integer literal becomes only a wider integer (`i32` → `i64`), a float one
   only `f32`/`f64`. A destination of the other kind widens at that use as it always did, and the
   binding keeps its type — `takeF64(b); print(b / 3)` stays integer division. Such a destination
@@ -8897,9 +8898,16 @@ meeting an `f32` operand, or a literal tree taking a destination's width (`take6
 
 **Programs whose behaviour changed.** Only integer widening of a `let`: `let b = 7; take64(b);
 print(b * 1000000000)` printed `-1589934592` and prints `7000000000`. The grid (594 cells) has 31
-such cells and nothing else moved; the review generator (711 paired uses) has 12, all integer
+such cells and nothing else moved; the review generator (711 paired uses) has 10, all integer
 `let`s taking `i64`, and loses no running cell. `const` reads that meet a wider context compute
 at that width, which for in-range values is the same number. In the repository: two inventory
 rows moved (D1730's `xs[i]` with `const i = 0` now keys and runs; D2443's literal-`const`
 spelling runs and the row is re-filed on its parameter spelling); fixture changes are listed in
 the PR. The compiler's `gLowMemUnused` is annotated `i32` so the self-compile does not re-check.
+
+**Cost, against master `e70102886`.** One self-compile +0.78% guest fuel; the plumb-shape units
+−8.1% / −8.7% (a `const` read is now a constant, not a global); plumb's runtime modules +0.6% to
++2.6% with no re-check; a generated chunk that builds on current master (`chunk_1`, its labels
+respelled for the labelled-block ruling) −7.9%, its only difference each
+`i64.extend_i32_s(local.get y)` becoming `i64.const 32`. The seed grows 34 KB (+0.9%) and the
+seed-size baseline is rewritten with it.

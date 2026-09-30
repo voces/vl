@@ -13555,6 +13555,8 @@ const LBI_EDGE = 3
 const LBI_FLOAT = 4
 const LBI_INT = 5
 const LBI_NOT_F32 = 6
+// A binding inside an expression delivered to `lbiTy`: a veto on any type wider than that.
+const LBI_TREE = 8
 // A numeric literal stored into it: `lbiTy` is the set of types that hold the literal
 // (`LBI_FIT_*`), and `LBI_FIT_SAME` when it has one value at every width that holds it.
 const LBI_LIT = 7
@@ -13960,7 +13962,7 @@ function lbiConstLitAt(ix: i32, name: string): i32 {
     ix == daWriteTarget
     || ix == nlCmpdTgt
     || ix == lbiWriteTgt
-    || lbiRangeBounds > 0
+    || lbiKeepName > 0
   ) {
     return -1
   }
@@ -14059,7 +14061,17 @@ function lbiNoteDelivery(src: i32, dst: i32, tgt: i32) {
   // Only a binding delivered whole (through parentheses and a negation) is typed by the
   // destination: one inside `b + 1` is an operand there, and an operand chooses nothing.
   const whole = lbiOperandCand(src)
-  if whole >= 0 { lbiPush(whole, LBI_UP, dst, src) }
+  if whole >= 0 {
+    lbiPush(whole, LBI_UP, dst, src)
+  } else {
+    // A binding inside a delivered expression chooses nothing, but must not make it wider than
+    // the destination: `xs[b - 6]` keeps `b` an `i32` whatever else `b` is delivered to.
+    const cands: i32[] = []
+    const tys: i32[] = []
+    const froms: i32[] = []
+    lbiLeaves(src, cands, tys, froms)
+    for c in cands { lbiPush(c, LBI_TREE, dst, src) }
+  }
   lbiNoteConstContext(src, dst)
   if lbiCandAt(parenPeelIx(src)) >= 0 {
     lbiNoteDirect(src, dst)
@@ -14245,8 +14257,8 @@ function lbiConstFits(ix: i32): boolean {
 let lbiConstOk = true
 // The target of the assignment being checked, which is a write even when it is compound.
 let lbiWriteTgt = -1
-// Inside a `for` range's bounds, where a `const` read stays a name.
-let lbiRangeBounds = 0
+// Inside a `for` range's bounds or a `match` arm, where a `const` read stays a name.
+let lbiKeepName = 0
 
 // The value of the constant tree `ix`, clearing `lbiConstOk` when it is not one or leaves `i32`.
 function lbiConstVal(ix: i32, depth: i32): i64 {
@@ -14387,6 +14399,7 @@ function lbiRowTakes(k: i32, u: i32, t: i32): boolean {
   if k == LBI_FLOAT { return t != TY_I64 }
   if k == LBI_INT { return t == TY_I32 || t == TY_I64 }
   if k == LBI_NOT_F32 { return t != TY_F32 }
+  if k == LBI_TREE { return lbiLe(t, u) }
   if k == LBI_LIT { return lbiFitHas(u, t) }
   if k == LBI_LO { return lbiLe(u, t) }
   lbiLe(t, u) || lbiLe(u, t)
@@ -14582,9 +14595,9 @@ function lbiSolveOne(c: i32, rs: i32[], chosen: i32[], report: boolean): i32 {
       k = LBI_UP
       u = lbiChosenOf(chosen, lbiRowCand[r])
     }
-    if k == LBI_FLOAT || k == LBI_INT || k == LBI_NOT_F32 {
+    if k == LBI_FLOAT || k == LBI_INT || k == LBI_NOT_F32 || k == LBI_TREE {
       vks.push(k)
-      vus.push(-1)
+      vus.push(u)
     } else if k == LBI_LIT {
       // A stored literal the binding's kind cannot hold is the store's own type error.
       let m = u & (LBI_FIT_F32 | LBI_FIT_F64)
@@ -55829,7 +55842,11 @@ function checkLetDeclNode(n: LetDecl, ix: i32) {
   }
   if n.letInit >= 0 {
     if tpEnvNames.length > 0 { tpIfMarkOk(n.letInit) }
+    // An un-annotated binding of a literal `const` is a copy of it, not a literal of its own.
+    const keep = annot < 0 && P.nodes[parenPeelIx(n.letInit)] is Ident
+    if keep { lbiKeepName = lbiKeepName + 1 }
     initTy = checkNode(n.letInit)
+    if keep { lbiKeepName = lbiKeepName - 1 }
   }
   // A `void` initializer has no value to bind — reject with a source-located message,
   // poisoning `initTy`. Exempted: an if-expression init, whose false path is implicit `null`.
@@ -56208,7 +56225,10 @@ function checkIntArmLit(
 ) {
   // Checked as the expression it is, so `nodeTyIx` is filled for the `==` the desugar builds
   // over it — an `i32` literal reaches an `i64` scrutinee by the widening lattice, never the reverse.
+  // A constant arm keeps its name, which the arm's diagnostics quote.
+  lbiKeepName = lbiKeepName + 1
   const pt = checkNode(patIx)
+  lbiKeepName = lbiKeepName - 1
   if !assignable(pt, st) {
     tErr(
       "match pattern type mismatch: expected "
@@ -62746,10 +62766,10 @@ function checkForRangeNode(n: ForRange, ix: i32) {
   crLoopPreRetire(ix)
   // A range over `const` bounds keeps them as names: its constant-range refusals and the emitter's
   // step floor are about bounds the author wrote as literals.
-  lbiRangeBounds = lbiRangeBounds + 1
+  lbiKeepName = lbiKeepName + 1
   const frFrom = checkNode(n.frFrom)
   const frTo = checkNode(n.frTo)
-  lbiRangeBounds = lbiRangeBounds - 1
+  lbiKeepName = lbiKeepName - 1
   lbiNoteDelivery(n.frFrom, TY_I32, -1)
   lbiNoteDelivery(n.frTo, TY_I32, -1)
   if !assignable(frFrom, TY_I32) || !assignable(frTo, TY_I32) {
@@ -62773,9 +62793,9 @@ function checkForRangeNode(n: ForRange, ix: i32) {
     }
   }
   if n.frStep >= 0 {
-    lbiRangeBounds = lbiRangeBounds + 1
+    lbiKeepName = lbiKeepName + 1
     const frStep = checkNode(n.frStep)
-    lbiRangeBounds = lbiRangeBounds - 1
+    lbiKeepName = lbiKeepName - 1
     lbiNoteDelivery(n.frStep, TY_I32, -1)
     if !assignable(frStep, TY_I32) {
       if forRangeFloatish(frStep) {
