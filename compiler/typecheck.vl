@@ -3529,6 +3529,11 @@ export function mkArrayTy(elem: i32) {
 // `ty | null`, for an emit-side rewrite that needs a box over a value with no niche (D2826).
 export function mkNullableTyOf(ty: i32) { mkNullableTy(ty) }
 
+// Whether `ty` is a record type.
+export function tyIsRecord(ty: i32): boolean {
+  ty >= 0 && ty < T.tys.length && T.tys[ty] is TyObj
+}
+
 // The read-only view over the same element (`readonly T[]`). A sibling constructor rather
 // than a flag on `mkArrayTy`, so every existing mint stays a mutable list by construction.
 export function mkArrayViewTy(elem: i32) {
@@ -18202,6 +18207,8 @@ function joinTys(a: i32, b: i32) {
   // parameter is assignable to either, and taking it alone drops the union's other members (D2876).
   if tyVarMemberOf(a, b) { return b }
   if tyVarMemberOf(b, a) { return a }
+  const oj = tpOpenJoin(a, b)
+  if oj >= 0 { return oj }
   // Two different records may join wider than either (`{f: i32}` into `{f: f64}`) (D2731).
   if !recordJoinMinted && a != b {
     if T.tys[a] is TyObj && T.tys[b] is TyObj { recordJoinMinted = true }
@@ -18211,8 +18218,70 @@ function joinTys(a: i32, b: i32) {
   joinVariantTys(a, b)
 }
 
-// Whether `a` and `b` hold two differently named declared type parameters at one position
-// under a list element or nullable wrapper; a hole (`?…`) is inference, not a type.
+// Whether `t` is a union holding a declared type parameter, decided per instance.
+function tyIsParamUnion(t: i32): boolean {
+  if t < 0 || t >= T.tys.length { return false }
+  const u = T.tys[t]
+  u is TyUnion && unionHasDeclaredParam(u.uMembers)
+}
+
+// How many `if`/`match` arm joins are being taken: the one place `tpOpenJoin` applies.
+let tpArmJoinDepth = 0
+
+// `joinTys` for the arms of a value `if` or `match`.
+function joinArmTys(a: i32, b: i32): i32 {
+  tpArmJoinDepth = tpArmJoinDepth + 1
+  const j = joinTys(a, b)
+  tpArmJoinDepth = tpArmJoinDepth - 1
+  j
+}
+
+// The join of `a` and `b` when every member is a declared type parameter or a null and one
+// parameter is the checked body's own: each parameter once, the null kept, re-joined at each
+// pin (D3267). -1 otherwise; a concrete member is joined by the rules above.
+function tpOpenJoin(a: i32, b: i32): i32 {
+  if tpArmJoinDepth == 0 { return -1 }
+  const ms: i32[] = []
+  flattenVariantsInto(a, ms)
+  flattenVariantsInto(b, ms)
+  const kept: i32[] = []
+  let hasNull = false
+  let open = false
+  for m in ms {
+    if m < 0 || m >= T.tys.length || m == TY_ERR || m == TY_VOID { return -1 }
+    const mt = T.tys[m]
+    if isNullTy(m) {
+      hasNull = true
+    } else if mt is TyVar {
+      if !tyIsDeclaredParam(m) { return -1 }
+      if tyParamOfInnermostBody(m) { open = true }
+      let dup = false
+      for k in kept {
+        if k == m || sameDeclaredTyParam(k, m) { dup = true }
+      }
+      if !dup { kept.push(m) }
+    } else {
+      // A concrete member is joined by the rules above (D2906, D3212).
+      return -1
+    }
+  }
+  if !open || kept.length == 0 { return -1 }
+  if kept.length == 1 {
+    if hasNull { return mkNullableTy(kept[0]) }
+    return -1
+  }
+  const u = mkUnionTy(kept)
+  // arena-tick exempt: a per-program mark on a fresh arena row.
+  tpJoinUnions[u] = 1
+  if !hasNull { return u }
+  const res = mkNullableTy(u)
+  // arena-tick exempt: a per-program mark on a fresh arena row.
+  tpJoinUnions[res] = 1
+  res
+}
+
+// Whether `a` and `b` hold two differently named declared type parameters at one position,
+// bare or under a list element or nullable wrapper; a hole (`?…`) is inference, not a type.
 function tyParamsPart(a: i32, b: i32, depth: i32): boolean {
   if a < 0 || b < 0 || a >= T.tys.length || b >= T.tys.length || depth > 8 {
     return false
@@ -18227,9 +18296,11 @@ function tyParamsPart(a: i32, b: i32, depth: i32): boolean {
   const ta = T.tys[a]
   match ta {
     TyVar => {
-      // Two bare parameters keep the collapse: each instance stores the join in the scalar or
-      // ref cell of its pin, as before D2760; only under a constructor are the two storages apart.
-      if depth == 0 { return false }
+      // Two bare parameters part as well, in the body declaring them: collapsed, an instance
+      // binding them apart stored both arms in the first one's cell (D3268).
+      if depth == 0 && !tyParamOfInnermostBody(a) { return false }
+      // A hole's resolution (a lambda's deferred return) re-joins as it always has (D3358).
+      if depth == 0 && (tyIsHole(a) || tyIsHole(b)) { return false }
       return tyParamNamesPart(ta.tvName, b)
     }
     TyArray => {
@@ -18420,7 +18491,7 @@ export function joinPinnedArmTys(ts: i32[]): i32 {
   }
   joinClashMsg = savedClash
   if j == TY_ERR { return -1 }
-  j
+  rejoinDropSubsumed(j)
 }
 
 // The union name an instance spells the pinned join `sj` by, as the return set's is; "" when
@@ -18933,6 +19004,42 @@ function tyParamBesideBare(p: i32, c: i32): boolean {
   tyParamBesideConcrete(p, c) && tyParamOfOpenBody(p)
 }
 
+// Whether type variable `p` names a type parameter of the innermost declaration being checked,
+// whose joins keep parameters apart: not inside a lambda, and not in a body taking a list of a
+// type parameter, the two shapes whose instances do not yet build such a join (D3357, D3358).
+function tyParamOfInnermostBody(p: i32): boolean {
+  if lamCheckDepth > 0 { return false }
+  const tp = T.tys[p]
+  if tp is TyVar {
+    const k = cstrOwnerStack.length - 1
+    if k < 0 { return false }
+    const owner = cstrOwnerStack[k]
+    if owner >= 0 && owner < P.nodes.length {
+      const fd = P.nodes[owner]
+      if fd is FuncDecl {
+        for pi in fd.fnParams {
+          const pn = P.nodes[pi]
+          if pn is Param && pn.parType >= 0 {
+            const pt = nodeTyIxOf(pn.parType)
+            if (
+              pt >= 0
+              && pt < T.tys.length
+              && T.tys[pt] is TyArray
+              && tyHasTyVar(pt)
+            ) {
+              return false
+            }
+          }
+        }
+        for nm in fd.fnTyParams {
+          if nm == tp.tvName { return true }
+        }
+      }
+    }
+  }
+  false
+}
+
 // Whether type variable `p` names a type parameter of a declaration whose body is being checked.
 function tyParamOfOpenBody(p: i32): boolean {
   const tp = T.tys[p]
@@ -19325,6 +19432,8 @@ function refoldJoinUnion(
   let res = -1
   let live = 0
   let j = 0
+  // A lambda's deferred return re-joins as it always has: its instance builds no kept-apart join.
+  lamCheckDepth = lamCheckDepth + 1
   while j < orig.length {
     if !holeMemberDeadAt(orig[j], bNames, bTys) {
       res = joinRetTys(res, subst[j])
@@ -19332,6 +19441,7 @@ function refoldJoinUnion(
     }
     j = j + 1
   }
+  lamCheckDepth = lamCheckDepth - 1
   // Every arm proven dead is not a type — keep the union rather than invent one.
   if live == 0 || res < 0 { return mkUnionTy(subst) }
   res
@@ -40637,7 +40747,25 @@ function rejoinMembers(ms: i32[]): i32 {
     r = joinTys(r, ms[i])
     i = i + 1
   }
-  r
+  rejoinDropSubsumed(r)
+}
+
+// `r` with each literal arm a later, wider member subsumes dropped: a left fold keeps `"a"`
+// beside a `string` joined after it, where the chain's own join absorbs it (D3266).
+function rejoinDropSubsumed(r: i32): i32 {
+  if r < 0 || r >= T.tys.length { return r }
+  let u = r
+  const rt = T.tys[r]
+  if rt is TyNullable { u = rt.nInner }
+  if u < 0 || u >= T.tys.length { return r }
+  const ut = T.tys[u]
+  if !(ut is TyUnion) { return r }
+  const kept: i32[] = []
+  if !unionDropSubsumedArms(ut.uMembers, kept) { return r }
+  let nu = kept[0]
+  if kept.length > 1 { nu = mkUnionTy(kept) }
+  if u != r { return mkNullableTy(nu) }
+  nu
 }
 
 // Deep substitution of a call's bindings into a type: a bound `TyVar` becomes its binding; a
@@ -40666,7 +40794,21 @@ export function substTyDeep(tyIx: i32, bNames: string[], bTys: i32[]) {
       if t.aRead == 1 { res = mkArrayViewTy(e2) } else { res = mkArrayTy(e2) }
     }
   } else if t is TyNullable {
-    const n2 = substTyDeep(t.nInner, bNames, bTys)
+    let n2 = substTyDeep(t.nInner, bNames, bTys)
+    if (
+      n2 != t.nInner
+      && t.nInner >= 0
+      && tpJoinUnions.has(tyIx)
+      && T.tys[t.nInner] is TyUnion
+    ) {
+      // A kept-apart join's null wraps its union: the members re-join as one set (D3267).
+      const nms: i32[] = []
+      flattenVariantsInto(n2, nms)
+      const tpSaved = tpApartConcrete
+      tpApartConcrete = true
+      n2 = rejoinMembers(nms)
+      tpApartConcrete = tpSaved
+    }
     if n2 != t.nInner { res = mkNullableTy(n2) }
   } else if t is TyObj {
     const onames = t.objFieldNames
@@ -45293,7 +45435,7 @@ function matchArmTally(ix: i32, body: i32, armTy: i32, acc: i32): i32 {
   }
   const v = f32ArmPlainTy(body, ifArmValTy(body, armTy))
   if acc < 0 { return v }
-  joinTys(acc, v)
+  joinArmTys(acc, v)
 }
 
 function matchTallyEnd(ix: i32, acc: i32) {
@@ -46971,6 +47113,7 @@ function finishInferredReturn(
       if (
         itt.nInner >= 0
         && !(T.tys[itt.nInner] is TyVar)
+        && !tyIsParamUnion(itt.nInner)
         && !tyIsPrimNamed(itt.nInner, "boolean")
         && !tyIsPrimNamed(itt.nInner, "string")
         && litUnionAliasNameOfTy(itt.nInner) == ""
@@ -47311,6 +47454,18 @@ function noteNestedUnannotFn(fnIx: i32, fty: i32) {
 // trailing expression (`noteInferredRet`, under a `-2` pending `curRet`), then patched into
 // the hoisted `TyFunc` in place so every caller sees it. A base-case-less cycle has nothing to latch onto and reports "cannot infer a return type".
 function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
+  if n.fnName != "" { return checkFuncDeclNodeReal(n, fnIx) }
+  lamCheckDepth = lamCheckDepth + 1
+  const r = checkFuncDeclNodeReal(n, fnIx)
+  lamCheckDepth = lamCheckDepth - 1
+  r
+}
+
+// How many lambda bodies the checker is inside, their inference probes included (D3358).
+let lamCheckDepth = 0
+
+// `checkFuncDeclNode`'s body, counted by it inside a lambda.
+function checkFuncDeclNodeReal(n: FuncDecl, fnIx: i32) {
   // A `function` (top-level OR nested) whose name the emitter dispatches on inline is a
   // definition that can never run — reject it at the definition, not at the call site
   // that silently means something else. Anchored on the decl node, so the pass-1 hoist
@@ -59067,7 +59222,7 @@ function checkMatchIntArms(n: MatchExpr, ix: i32, st: i32) {
       // sentinel TY_ERR (both are -1), so a void-arm `match` must not be read as an error.
       if armTy < 0 { armTy = TY_VOID }
     }
-    matchTy = joinTys(matchTy, f32ArmPlainTy(body, armTy))
+    matchTy = joinArmTys(matchTy, f32ArmPlainTy(body, armTy))
     if tpEnvNames.length > 0 { matchArmTys.push(f32ArmPlainTy(body, armTy)) }
     matchValAcc = matchArmTally(ix, body, armTy, matchValAcc)
     ai = ai + 1
@@ -59383,7 +59538,7 @@ function checkMatchTypeArms(n: MatchExpr, ix: i32, st: i32, uMems: i32[]) {
       if armTy < 0 { armTy = TY_VOID }
     }
     if scoped { popScope() }
-    matchTy = joinTys(matchTy, f32ArmPlainTy(body, armTy))
+    matchTy = joinArmTys(matchTy, f32ArmPlainTy(body, armTy))
     if tpEnvNames.length > 0 { matchArmTys.push(f32ArmPlainTy(body, armTy)) }
     matchValAcc = matchArmTally(ix, body, armTy, matchValAcc)
     bi = bi + 1
@@ -59735,7 +59890,7 @@ function checkMatchExprNode(n: MatchExpr, ix: i32) {
       // sentinel TY_ERR (both are -1), so a void-arm `match` must not be mistaken for an error.
       if armTy < 0 { armTy = TY_VOID }
     }
-    matchTy = joinTys(matchTy, f32ArmPlainTy(body, armTy))
+    matchTy = joinArmTys(matchTy, f32ArmPlainTy(body, armTy))
     if tpEnvNames.length > 0 { matchArmTys.push(f32ArmPlainTy(body, armTy)) }
     matchValAcc = matchArmTally(ix, body, armTy, matchValAcc)
     ai = ai + 1
@@ -60263,7 +60418,7 @@ function checkIfTail(
       // A `void` here is an else-less link's value-less fall-through, which adds nothing.
       const ev = f32ArmPlainTy(n.ifElse, ifArmValTy(n.ifElse, elseTy))
       if thenExits || valTy == TY_VOID { valTy = ev }
-      else if ev != TY_VOID { valTy = joinTys(valTy, ev) }
+      else if ev != TY_VOID { valTy = joinArmTys(valTy, ev) }
     }
     if f32Join >= 0 { valTy = f32Join }
     if bareArm { ifValTyAt[ix] = -1 } else { ifValTyAt[ix] = valTy }
@@ -60281,7 +60436,7 @@ function checkIfTail(
   if daHasElse {
     const thenPlain = f32ArmPlainTy(n.ifThen, thenTy)
     const elsePlain = f32ArmPlainTy(n.ifElse, elseTy)
-    const plainJoin = joinTys(thenPlain, elsePlain)
+    const plainJoin = joinArmTys(thenPlain, elsePlain)
     f32JoinRevert(ix)
     if tpEnvNames.length > 0 && !thenExits && !daElseDiverges {
       let elseApart = elsePlain
@@ -65884,7 +66039,7 @@ function checkRetStmtNode(n: RetStmt, ix: i32) {
 function discardedIfValTy(hasElse: boolean, thenTy: i32, elseTy: i32): i32 {
   if hasElse {
     const savedClash = joinClashMsg
-    const j = joinTys(thenTy, elseTy)
+    const j = joinArmTys(thenTy, elseTy)
     joinClashMsg = savedClash
     return j
   }

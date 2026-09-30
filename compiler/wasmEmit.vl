@@ -121,6 +121,7 @@ import {
   tyIsLitUnionOrLit,
   tyIsNulValueUnionBox,
   tyIsOneStrLit,
+  tyIsRecord,
   tyIsStructBearingUnion,
   tyLitMemberTexts,
   tyLitUnionAliasIx,
@@ -854,6 +855,7 @@ import {
   globalNameIsNonConstSid,
   globalNulListCellRead,
   holeBindsFunc,
+  holeOperandTyOf,
   identCellSlot,
   identCellVKind,
   identChainTyBoxedUnion,
@@ -1018,6 +1020,7 @@ import {
   printUnionPlan,
   pushAsgReadNarrow,
   pushPostGuardNarrow,
+  readIsCallResult,
   refArrBoxTagOf,
   refArrSlotTag,
   refElemListBuildKind,
@@ -2736,12 +2739,13 @@ function emitNulIsNullTest(
   0
 }
 
-// True when `recvIx`'s storage is the `string | null` niche and it is still nullable at
-// this read. Both halves are required: `exprNullableString` is declaration-scoped while
-// `nodeTyIsNullable` is the checker's bank for this read — their disagreement is exactly
-// the narrowing signal (a `!= null`-narrowed receiver reaches the plain compare instead).
+// True when `recvIx`'s storage is the `string | null` niche and it is still nullable here:
+// `nodeTyIsNullable` disagreeing with the declaration-scoped `exprNullableString` is the
+// `!= null` narrowing signal. A read typed at a type parameter carries no such bank, so it
+// takes the guarded compare (D3332).
 function litMemberRecvIsNulString(recvIx: i32, fnIx: i32) {
-  exprNullableString(recvIx, fnIx) && nodeTyIsNullable(recvIx)
+  exprNullableString(recvIx, fnIx)
+    && (nodeTyIsNullable(recvIx) || nodeTyHasTyVar(unwrapParen(recvIx)))
 }
 
 // `<string | null> is "<m>"` over a null receiver answers false — not an impossibility to
@@ -2892,7 +2896,15 @@ function nulNicheIsTestImpossible(recvIx: i32, ity: i32, fnIx: i32) {
     return mapNicheLacks(mapValueTyOf(recvIx, fnIx), ity)
   }
   const pTest = isTestValuePrimName(ity)
-  if pTest == "" { return false }
+  if pTest == "" {
+    // A record is never the member of a `string` or `boolean` niche, nor a literal union of a
+    // reference or `boolean` one (D3344).
+    if readIsCallResult(recvIx, fnIx) { return false }
+    const pb = nulNicheBaseClass(recvIx, fnIx)
+    if tyIsRecord(ity) { return pb == "string" || pb == "boolean" }
+    if tyIsLitUnion(ity) { return pb == "#ref" || pb == "boolean" }
+    return false
+  }
   const base = nulNicheBaseClass(recvIx, fnIx)
   if base == "" { return false }
   base != pTest
@@ -3334,6 +3346,28 @@ function emitIsTest(body: u8[], isIx: i32, fnIx: i32) {
 
   const ndv = P.nodes[isIx]
   if ndv is IsExpr {
+    // A literal union tested against a box whose string arm is a plain `string` is membership
+    // over the payload: the tag alone answers true for a non-member string (D3348).
+    const smTexts = tyLitMemberTexts(isVarTyIxOf(isIx))
+    if (
+      smTexts.length > 0
+      && tyIsLitUnion(isVarTyIxOf(isIx))
+      && exprUnion(ndv.isObj, fnIx)
+      && unionEqOperandOk(ndv.isObj)
+      && !unionCarriesLitUnionArm(unionNameOfExpr(ndv.isObj, fnIx))
+      && unionTakesAtomAsStr(unionMemberSetOf(unionNameOfExpr(ndv.isObj, fnIx)))
+      && !readIsCallResult(ndv.isObj, fnIx)
+    ) {
+      let smI = 0
+      while smI < smTexts.length {
+        if emitUnionLitIs(body, ndv.isObj, quoteLex(smTexts[smI]), fnIx) < 0 {
+          return -1
+        }
+        if smI > 0 { fbI32Bin(114) }
+        smI = smI + 1
+      }
+      return 0
+    }
     const patTy = isPatUnionArmTy(ndv.isObj, isVarTyIxOf(isIx), fnIx)
     if mapSoftTwinTagFail(ndv.isObj, patTy, fnIx, isIx) < 0 { return -1 }
     const armTag = isArmTagOfTy(patTy)
@@ -3581,6 +3615,34 @@ function emitIsTest(body: u8[], isIx: i32, fnIx: i32) {
           }
           return 0
         }
+      }
+      // A record no union of the program has as a variant is in no box, so a box's test of it
+      // is false, as a pin whose join lacks it answers (D3344).
+      // A `K | null` niche holds no value of a primitive other than `string` (D3344).
+      const nlPrim = isTestValuePrimName(isVarTyIxOf(isIx))
+      const nlNo = exprNulLitUnion(nd.isObj, fnIx)
+        && !exprUnion(nd.isObj, fnIx)
+        && nlPrim != ""
+        && nlPrim != "string"
+      // A box of value arms only holds no record.
+      const boxNm = unionNameOfExpr(nd.isObj, fnIx)
+      const boxNo = exprUnion(nd.isObj, fnIx)
+        && tyIsRecord(isVarTyIxOf(isIx))
+        && boxNm != ""
+        && (isValueUnionOfSet(msSetOfText(boxNm), boxNm)
+        || unionCarriesLitUnionArm(boxNm))
+      // Only a join the checker kept apart over declared parameters reaches here by design.
+      if (
+        (nlNo || boxNo)
+        && fnInPinnedInstance(fnIx)
+        && holeOperandTyOf(nd.isObj, fnIx) < 0
+        && !criFnIsAnonLambda(fnStmtsPosOf(fnIx))
+        && !readIsCallResult(nd.isObj, fnIx)
+      ) {
+        if emitExpr(body, nd.isObj, fnIx) < 0 { return -1 }
+        fbDrop()
+        fbI32Const(0)
+        return 0
       }
       if tyIsUnionMemberOf(nodeTyIxOf(nd.isObj), isVarTyIxOf(isIx)) {
         return emitFail(
@@ -5046,11 +5108,50 @@ export function emitUnionCoerce(
   // is the reservation scan, not this emit: `emitAtomToStr` stashes the id in the per-function
   // string-op scratch frame, whose reservation predicates key on `unionTakesAtomAsStr`.
   if unionTakesAtomAsStr(unionName) && exprIsLitAtom(exprIx, fnIx) {
-    // A `K | null` value's `-1` has no string to box under the string tag (D3140).
-    if nulAtomWidenTexts(exprIx).length > 0 {
-      return emitFail(
-        "emitProgram: literal-union string widening with no members",
-      )
+    // A `K | null` value's `-1` boxes under the null tag, any other id as its member string
+    // under the string tag; the id is read once (D3347).
+    const nlTexts = nulAtomWidenTexts(exprIx)
+    if nlTexts.length > 0 {
+      // Beside a plain `string` arm the join is `string | null`, not this box.
+      const nlAtoms: string[] = []
+      splitUnionAtoms(unionMemberSetOf(unionName), nlAtoms)
+      let nlStrArm = false
+      for na in nlAtoms {
+        if na == "string" { nlStrArm = true }
+      }
+      // Only a parameter is known to hold the atom: a binding or call typed `K | null` may hold a
+      // box its producer built (D3140).
+      const nlArg = P.nodes[unwrapParen(exprIx)]
+      let nlParam = false
+      if nlArg is Ident && fnIx >= 0 {
+        const nlFn = P.nodes[fnIx]
+        // A declared return is read by its caller at the declaration's rep, not this box.
+        if nlFn is FuncDecl && nlFn.fnRet < 0 {
+          nlParam = paramIndexOf(fnIx, nlArg.identName) >= 0
+        }
+      }
+      if !unionSetHasNull(unionName) || !aUsed || nlStrArm || !nlParam {
+        return emitFail(
+          "emitProgram: literal-union string widening with no members",
+        )
+      }
+      if emitStashAtomId(body, exprIx, fnIx) < 0 { return -1 }
+      fbI32Const(nullBoxTag())
+      fbI32Const(scalarTagOfKind(2))
+      pushStrScrI(body, 0)
+      fbI32Const(-1)
+      fbI32Bin(70) // i32.eq
+      wU8(27) // 0x1b select: the null tag if the id is -1
+      pushStrScrI(body, 0)
+      fbI32Const(-1)
+      fbI32Bin(70)
+      fbIfRefNul(sTypeIdx, true)
+      fbRefNull(sTypeIdx)
+      fbElse()
+      if emitAtomToStrChain(body, nlTexts, 0) < 0 { return -1 }
+      fbEnd()
+      fbStructNew(uBoxIdx)
+      return 0
     }
     fbI32Const(scalarTagOfKind(2)) // the string tag — kind 2 rides the anyref directly
     if emitAtomToStr(body, exprIx, fnIx) < 0 { return -1 }
@@ -6032,6 +6133,24 @@ function emitUnionConcreteEq(
       "emitProgram: union string `==` but array type not collected",
     )
   }
+  // A `K | null` operand equals the box's null when it is `-1`, and is a member string
+  // otherwise, where the widened operand is non-null (D3347).
+  const nulOther = eak == 2
+    && exprNulLitUnion(otherIx, fnIx)
+    && unionEqOperandOk(otherIx)
+    && !eqOnce
+    && unionSetHasNull(uname)
+  if nulOther {
+    if emitExpr(body, otherIx, fnIx) < 0 { return -1 }
+    fbI32Const(-1)
+    fbI32Bin(70)
+    fbIf(127)
+    if emitExpr(body, boxIx, fnIx) < 0 { return -1 }
+    fbStructGet(uBoxIdx, 0)
+    fbI32Const(nullBoxTag())
+    fbI32Bin(70)
+    fbElse()
+  }
   // tag == tagOf(atom), gating the payload compare.
   if emitExpr(body, boxIx, fnIx) < 0 { return -1 }
   if eqOnce { fbLocalTee(eqStash) }
@@ -6047,12 +6166,16 @@ function emitUnionConcreteEq(
   fbStructGet(uBoxIdx, 1) // 0xfb 0x02 <box ht> field 1: value (anyref)
   if emitUnionPayloadUnbox(body, eak) < 0 { return -1 }
   if emitUnionEqOther(body, otherIx, eak, fnIx) < 0 { return -1 }
+  if nulOther {
+    wU8(212) // ref.as_non_null: the `-1` took the other branch
+  }
   // D-EQOPCODE: the payload compare is the last projection of `eak`, which already chose
   // the box tag, the payload unbox and the widened operand emit above it.
   if emitUnionAtomPayloadEq(body, eak, fnIx) < 0 { return -1 }
   fbElse() // 0x05 else: wrong-rep arm — structurally unequal
   fbI32Const(0)
   fbEnd()  // 0x0b end
+  if nulOther { fbEnd() }
   if isNe {
     fbI32Eqz() // 0x45 i32.eqz (`!=` negates value-equality)
   }
@@ -6679,7 +6802,10 @@ function emitUnionUnionEq(
   // rather than the gate re-splitting the rendering and each consumer resolving it again.
   const lsid = msSetOfText(lname)
   const rsid = msSetOfText(rname)
-  if !isValueUnionOfSet(lsid, lname) || !isValueUnionOfSet(rsid, rname) {
+  // A literal-union arm rides a value box as its member string, so it compares as one (D3347).
+  const lVal = isValueUnionOfSet(lsid, lname) || unionCarriesLitUnionArm(lname)
+  const rVal = isValueUnionOfSet(rsid, rname) || unionCarriesLitUnionArm(rname)
+  if !lVal || !rVal {
     // A struct union compares by tag, then by the arm's fields (D973), riding the same
     // `{tag, payload}` box a value union does. Reaching here means `emitStructUnionEq` declined
     // the arm set, so the refusal names what it could not serve.
@@ -19546,7 +19672,11 @@ function emitAssign(body: u8[], binIx: i32, fnIx: i32) {
       // a union-typed local (kind 4) coerces a raw assigned value into the box (`u = 3.5`
       // over `let u: i32 | f64` boxes the f64); a union-valued RHS passes through unchanged.
       const aUNm = unionNameOfIdentAt(sidOfNode(lhsIx), fnIx, lhsIx)
-      if aUNm != "" && !nameIsLitUnionType(aUNm) {
+      // A cell holding the atom is no box, whatever union its template joined (D3268).
+      const aAtomCell = aUNm != ""
+        && declaredKind(target.identName) != "union"
+        && exprIsLitAtom(lhsIx, fnIx)
+      if aUNm != "" && !nameIsLitUnionType(aUNm) && !aAtomCell {
         // a literal-union target is an i32 atom, not a value-union box, and falls through
         // to the seed block below. A kind-4 union-box local boxes a concrete variant RHS
         // like a call arg/return; a kind-8 variant-init local keeps the raw variant rep, so
