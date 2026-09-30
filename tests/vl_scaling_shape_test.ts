@@ -20,9 +20,9 @@
 
 // A COMPILE BAR IS THE FAMILY DEFAULT 2.5, OR 1.25x THE AXIS'S FUEL RATIO WHERE THAT IS
 // HIGHER; an axis whose bar is deliberately tighter keeps it. A fuel ratio is the same on
-// every run, so the margin pays only for the compiler changing, not for the box. Five axes
-// sit above the default because they are super-linear today — `types`, `modules`, `reads
-// after many closed sibling shadows`, `list concat chain length`, `if joins nested deep` —
+// every run, so the margin pays only for the compiler changing, not for the box. Four axes
+// sit above the default because they are super-linear today — `types`, `reads after many
+// closed sibling shadows`, `list concat chain length`, `if joins nested deep` —
 // and that is recorded DEBT, not tolerance: lower a bar when the thing it names stops
 // multiplying. Five are GROWTH pairs, the same shape at `n` against `n/4`, so linear reads 4
 // rather than 1: `many distinct captured sibling blocks`, `list concat chain length`,
@@ -623,13 +623,12 @@ axis(
 axis("call sites", 2.5, "Callee resolution is scaling with the number of callees.", (d) =>
   twoFiles(d, genCallSites(6000, 1), genCallSites(6000, 20)));
 
-// A known super-linear axis: fuel reads 3.21, so the bar is 1.25x that. `modIndexOfKey` (compiler/driver.vl)
-// and `strListHas` (compiler/listutil.vl, once `capHas`) are 47% and 35% INCLUSIVE on a 400-module build,
-// both linear scans of a string-keyed table asked once per module, with `__str_eq__` under
-// them at 73% self. 800 modules against 400 is 4.45x, so a per-module arena scan would
-// roughly double this ratio and still be caught. Each function carries 30 statements so
-// the linear half is not startup-dominated; shrink that once those two stop scanning.
-axis("modules", 4.1, "The module merge is scaling with the file count.", (d) => [
+// Fuel reads 1.07, so the bar is the family default. It read 3.2 while `modIndexOfKey` and
+// `modRecomputePending` (compiler/driver.vl) scanned the module table by string compare once
+// per commit: a key is an absolute path, so that ratio also grew with the length of $TMPDIR
+// (4.15 under an 80-character one). Each function carries 30 statements so the linear half
+// is not startup-dominated.
+axis("modules", 2.5, "The module merge is scaling with the file count.", (d) => [
   writeModules(`${d}/many`, 400, 2, 30),
   writeModules(`${d}/one`, 200, 4, 30),
 ]);
