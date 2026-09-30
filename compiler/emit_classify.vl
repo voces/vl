@@ -63,6 +63,7 @@ import {
   asgNarTyIxOf,
   asgStoreTyOf,
   asgStripTyOf,
+  asgTvWriteOf,
   atomicIntrinsicIsVoid,
   bindGenWalk,
   cUserTypesVer,
@@ -211,6 +212,7 @@ import {
   recordJoinSeen,
   recordNodePin,
   substTyDeep,
+  tvWriteLandTy,
   tyArrayElemIx,
   tyArrayElemPrimName,
   tyBearsNull,
@@ -19276,6 +19278,12 @@ export function pushPostGuardNarrow(stmtIx: i32, fnIx: i32) {
       // at afterwards, or -1 when the write left its narrowing standing (D1736). Both place
       // arms below retire on it; only a bare name re-narrows, as the checker only re-narrows one.
       const asgNarTy = asgNarTyIxOf(stmtIx)
+      // A type-parameter value written into a nullable place: the reads are at its declaration,
+      // stripped of `null` only where this instance's pin of the value excludes it (D3240).
+      if tgtIsPlace && asgTvWriteOf(stmtIx) {
+        tvWriteNarrow(s.binLeft, s.binRight, asgNarTy, fnIx)
+        return 0
+      }
       if tgt is Ident {
         // `uDeclared`: with no union anywhere in the program `un` is always "" anyway, so this
         // skips `unionNameOfIdentAt`'s duplicate-chain walk on every assignment to a popular
@@ -19377,6 +19385,59 @@ export function pushPostGuardNarrow(stmtIx: i32, fnIx: i32) {
     }
   }
   0
+}
+
+// The narrowing after a type-parameter write of `rhsIx` into the place `tgtIx` declared `dcl`:
+// every narrowing of the place and below it retires, and where this instance pins the value to
+// a type without `null`, the place reads at the declaration's non-null face, as the direct
+// spelling's null strip leaves it.
+function tvWriteNarrow(tgtIx: i32, rhsIx: i32, dcl: i32, fnIx: i32) {
+  const tgt = P.nodes[tgtIx]
+  let key = ""
+  let un = ""
+  if tgt is Ident {
+    key = tgt.identName
+    if uDeclared { un = unionNameOfIdentAt(sidOfNode(tgtIx), fnIx, tgtIx) }
+  } else if tgt is Member {
+    key = memberKeyThroughIndex(tgtIx)
+    un = memberUnionFieldNameRead(tgtIx, fnIx)
+  } else if tgt is Index {
+    key = indexPathKeyOf(tgtIx)
+    un = indexElemUnionName(tgtIx, fnIx)
+  }
+  if key == "" { return 0 }
+  retireNarrowForIndexCells(key)
+  retireNarrowFor(key)
+  const pin = instanceOperandTyOf(rhsIx, fnIx)
+  if pin < 0 || dcl < 0 { return 0 }
+  const land = tvWriteLandTy(dcl, pin)
+  if land < 0 || land == dcl { return 0 }
+  if (
+    un != ""
+    && isValueUnionName(un)
+    && unionSetHasNull(un)
+    && land == nonNullTy(dcl)
+  ) {
+    const asid = msSetOfText(un)
+    if pushNarrowComplement(key, asid, "null") == "" {
+      pushNarrow(key, removeAtomFromSet(un, "null"))
+    }
+    return 0
+  }
+  if !pushNarrowWriteReNarrow(key, land, un) { pushNarrowWrittenTy(key, land) }
+  0
+}
+
+// The type the expression `exprIx` has at the pin of the instance `fnIx` is, or is lifted
+// inside, when its recorded type names a type parameter or a hole; -1 anywhere else.
+function instanceOperandTyOf(exprIx: i32, fnIx: i32): i32 {
+  const e = exactOperandTyOf(exprIx, fnIx)
+  if e >= 0 { return e }
+  const h = holeOperandTyOf(exprIx, fnIx)
+  if h >= 0 { return h }
+  const ax = unwrapParen(exprIx)
+  if ax < 0 { return -1 }
+  pinSubOperandTyOf(nodeTyIxOf(ax), fnIx)
 }
 
 // Is the value written by `rhsIx` null-bearing? Read off the checker's banked node type

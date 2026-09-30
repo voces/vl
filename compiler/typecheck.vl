@@ -717,6 +717,14 @@ const HD_PARAM = 8
 // face, the base is the default. Answered at the pin by the concrete `??` tail, so a default
 // that does not fit the face joins it rather than posing as it (D3252).
 const HD_COALD = 9
+// A place holding a written type-parameter value: `hdInner` is the place's declared type, the
+// base is the value's parameter. Answered at the pin by the member of the declaration that pin
+// lands on, so a nullable pin reads the declaration and a `K` pin the `string` it widens to.
+const HD_TVW = 10
+// A hole's place holding a written concrete value: `hdInner` is the value's type, the base the
+// place's hole. Answered at the pin by the member of the
+// pinned place the value lands on, as the direct spelling's write re-narrows it (D3233).
+const HD_HWR = 11
 let hdKind: i32[] = []
 let hdField: string[] = []
 let hdInner: i32[] = []
@@ -4131,6 +4139,9 @@ let asgNarTyIx: i32[] = []
 // target at, which the emitter needs where that name lives in a capture cell (D3288).
 let asgStripTys: i32[] = []
 let asgKeepNarrow: {[i32]: boolean} = Map()
+// Assignment nodes whose write stored a type-parameter value into a nullable place
+// (`tvPlaceWrite`): the emitter reads the place at its declaration unless the pin is non-null.
+let asgTvWrite: {[i32]: boolean} = Map()
 // The length the four sidecars above present to a bounded write: the arena as `checkProgram`
 // found it, and for `isVarTyIx` also past any row a monomorphized clone banked. The columns
 // themselves hold only up to the last row written, since almost every node reads -1 (D2319).
@@ -5152,6 +5163,7 @@ export function initChecker() {
   asgNarTyIx = []
   asgStripTys = []
   asgKeepNarrow = Map()
+  asgTvWrite = Map()
   narIfEnds = Map()
   isTyColCap = 0
   isVarTyIxCap = 0
@@ -8483,6 +8495,9 @@ function retireNarrowingsForWrite(
       if pd >= 0 && !tySame(writeNarrowAfter(pd, npTys[i], rt), npTys[i]) {
         hit = true
       }
+      if pd >= 0 && tvPlaceWrite(pd, rt) && !tyIsTvWriteOf(npTys[i], pd, rt) {
+        hit = true
+      }
     }
     // A write to a prefix of the key replaces the object the key reads through, so the key is
     // unknown after it on this path, whatever the write stored and whether or not a sibling arm
@@ -8518,6 +8533,10 @@ function retireNarrowingsForWrite(
         // A map cell reads `T | null` at its declaration, since a read may miss; the write just
         // stored the key, so the reads after it hold the stored type.
         if prn != pdcl || placeIsMapCell(tgtIx) { pathReTy = prn }
+        if tvPlaceWrite(pdcl, rt) {
+          pathReTy = tvWriteTy(pdcl, rt, -1)
+          recordAsgTvWrite(atIx, pdcl)
+        }
       }
     }
     i = i + 1
@@ -8527,7 +8546,11 @@ function retireNarrowingsForWrite(
   // it, as `x = 5` does a name (D1848, D3316). A map cell's `null` is the miss, so it is left out.
   if narrowedPathTyRaw(tgtKey) < 0 && pathReTy < 0 && !placeIsMapCell(tgtIx) {
     const pst = placeStoreTy(tgtIx)
-    if pst >= 0 && rt >= 0 && tyAdmitsNull(pst) && !tyAdmitsNull(rt) {
+    if pst >= 0 && tvPlaceWrite(pst, rt) {
+      pathReTy = tvWriteTy(pst, rt, -1)
+      pathReAsg = true
+      recordAsgTvWrite(atIx, pst)
+    } else if pst >= 0 && rt >= 0 && tyAdmitsNull(pst) && !tyAdmitsNull(rt) {
       const nn = nonNullTy(pst)
       if nn >= 0 && !tySame(nn, pst) {
         pathReTy = nn
@@ -8540,7 +8563,14 @@ function retireNarrowingsForWrite(
   // whatever narrowing the write retired (D3197).
   if pathReTy < 0 && rt >= 0 && writesHoleField(tgtIx) {
     const hst = placeStoreTy(tgtIx)
-    if hst >= 0 && tyIsHole(hst) { pathReTy = holeFieldWriteTy(hst, rt) }
+    if hst >= 0 && tyIsHole(hst) {
+      // A concrete value reads at the member of the pinned place it lands on.
+      if !tyHasHole(rt) && !tyAdmitsNull(rt) && !isNullTy(rt) {
+        pathReTy = mkDerivedHole(HD_HWR, "", rt, -1, hst)
+      } else {
+        pathReTy = holeFieldWriteTy(hst, rt)
+      }
+    }
   }
   if pathReTy >= 0 {
     npKeys.push(tgtKey)
@@ -8628,6 +8658,18 @@ function retireNarrowingsForWrite(
         // warning, not a refusal (DECISIONS.md, "A null test of a value proved non-null").
         keptEnd = rn
       }
+      // A value typed at a declared type parameter into a declaration that admits null reads as
+      // the parameter: whether it is null is its pin's question, which the body re-asks there.
+      const tvWrite = tvPlaceWrite(dcl, rt)
+      if tvWrite {
+        rn = tvWriteTy(dcl, rt, pre)
+        keptEnd = rn
+        retires = pre != rn
+        if guarded { asgKeepNarrow[atIx] = false }
+      } else if retires && !guarded && tyIsTvWriteOf(pre, dcl, -1) {
+        // A later write re-narrows from the declaration, as the first write's strip would.
+        rn = writeMemberTy(dcl, asgLitRhsTy(atIx, dcl, rt))
+      }
       if retires {
         // The RETIREMENT goes back in place, so it outlives whatever inner block holds the
         // write: a narrowing the write falsified must not resurrect at that block's `}`.
@@ -8644,6 +8686,8 @@ function retireNarrowingsForWrite(
         }
         recordAsgNarTyIx(atIx, rn)
       }
+      // The emitter reads the place at its declaration; the reads' own types carry the pin.
+      if tvWrite { recordAsgTvWrite(atIx, dcl) }
       if guarded && tyAdmitsNull(dcl) { narNoteWritten(nm) }
       // A kept write ends at the member of the declaration it stored, when that is narrower
       // than the narrowing it kept (a nullable union's inner member); else at that narrowing.
@@ -8669,6 +8713,44 @@ function retireNarrowingsForWrite(
     }
   }
   0
+}
+
+// Whether a write of `rt` into a place declared `dcl` leaves the place reading at the member
+// its pin lands on (`HD_TVW`): a value typed at a declared type parameter, into a concrete
+// declaration that admits `null` and holds no literal, whose niche keeps the template's read.
+// A declaration naming a parameter (`T | null`) strips to it exactly at every pin (D3240).
+function tvPlaceWrite(dcl: i32, rt: i32): boolean {
+  tyIsDeclaredParam(rt)
+    && tyAdmitsNull(dcl)
+    && !isLitBearing(dcl)
+    && !tyHasTyVar(dcl)
+}
+
+// The type a place declared `dcl` reads at after `tvPlaceWrite` stored `rt`: `cur` when it
+// already is that read, else a fresh `HD_TVW` hole over `rt`.
+function tvWriteTy(dcl: i32, rt: i32, cur: i32): i32 {
+  if tyIsTvWriteOf(cur, dcl, rt) { return cur }
+  mkDerivedHole(HD_TVW, "", dcl, -1, rt)
+}
+
+// Whether `ty` is a read of a place whose write the pin lands (`HD_TVW`, `HD_HWR`).
+export function tyIsWriteLandRead(ty: i32): boolean {
+  const row = hdRowOf(ty)
+  row >= 0 && (hdKind[row] == HD_TVW || hdKind[row] == HD_HWR)
+}
+
+// The member of `dcl` a place declared so reads at after a write of a value pinned at `pin`
+// (`writeMemberTy`): `dcl` itself when the pin lands on no narrower member.
+export function tvWriteLandTy(dcl: i32, pin: i32): i32 {
+  writeMemberTy(dcl, pin)
+}
+
+// Whether `ty` is the `HD_TVW` read of a write of `rt` into a place declared `dcl`; `rt` -1
+// accepts any value.
+function tyIsTvWriteOf(ty: i32, dcl: i32, rt: i32): boolean {
+  const row = hdRowOf(ty)
+  if row < 0 || hdKind[row] != HD_TVW { return false }
+  (rt < 0 || hdBase[row] == rt) && tySame(hdInner[row], dcl)
 }
 
 // The type a bare name reads at after an accepted write retired its narrowing: the sole member
@@ -11854,6 +11936,22 @@ export function recordClonedCallRetire(from: i32, to: i32) {
   if c is string { crCondDropBank[to] = c }
   const w = crCapWidenBank[from]
   if w is string { crCapWidenBank[to] = w }
+  carryAsgBanks(from, to)
+  0
+}
+
+// A clone of assignment `from` answers its write's narrowing banks (`asgNarTyIxOf`,
+// `asgStripTyOf`, `asgKeepsNarrowOf`, `asgTvWriteOf`), which are keyed by node.
+function carryAsgBanks(from: i32, to: i32) {
+  const nt = asgNarTyIxOf(from)
+  if nt >= 0 { recordAsgNarTyIx(to, nt) }
+  const st = asgStripTyOf(from)
+  if st >= 0 {
+    while asgStripTys.length <= to { asgStripTys.push(-1) }
+    asgStripTys[to] = st
+  }
+  if asgKeepsNarrowOf(from) { asgKeepNarrow[to] = true }
+  if asgTvWriteOf(from) { asgTvWrite[to] = true }
   0
 }
 
@@ -28758,6 +28856,10 @@ export function covarWriteReset() {
   rcwBdConc = []
   rcwBdCovs = []
   rcwBdCall = []
+  rcwPinSrc = []
+  rcwPinSrcTy = []
+  rcwPinDstTy = []
+  rcwPinFn = []
   cwRootNames = []
   cwRootFrames = []
   cwAnswers = []
@@ -32483,6 +32585,12 @@ let rcwBdTp: string[] = []
 let rcwBdConc: i32[] = []
 let rcwBdCovs: string[] = []
 let rcwBdCall: i32[] = []
+// Deliveries whose source is typed at a hole or type parameter, re-asked at each pin of the
+// function that owns them (`validateRcwPins`): the source, its type, the destination, the owner.
+let rcwPinSrc: i32[] = []
+let rcwPinSrcTy: i32[] = []
+let rcwPinDstTy: i32[] = []
+let rcwPinFn: i32[] = []
 
 // Record a delivery of `srcExpr` (typed `srcTy`) into `dstTy` when it widens a shared slot.
 function rcwPend(srcExpr: i32, srcTy: i32, dstTy: i32) {
@@ -32490,7 +32598,11 @@ function rcwPend(srcExpr: i32, srcTy: i32, dstTy: i32) {
   // A scalar source shares nothing; a type variable may stand for a record.
   if srcTy >= T.tys.length { return 0 }
   if !rcwIsRefTy(srcTy) && !(T.tys[srcTy] is TyVar) { return 0 }
-  const key = i32ToStr(srcExpr) + "#" + i32ToStr(dstTy)
+  // A source typed at a hole shares whatever its pin is: each pin re-asks it (D3250).
+  if T.tys[srcTy] is TyVar && rcwIsRefTy(dstTy) && cstrOwnerTop() >= 0 {
+    rcwPinNote(srcExpr, srcTy, dstTy)
+  }
+  const key = i32ToStr(srcExpr) + "#" + i32ToStr(srcTy) + "#" + i32ToStr(dstTy)
   if rcwPendSeen.has(key) { return 0 }
   rcwPendSeen[key] = true
   // The slots are computed here, inside the scope that knows a type parameter's bound.
@@ -32500,6 +32612,60 @@ function rcwPend(srcExpr: i32, srcTy: i32, dstTy: i32) {
   rcwPendSrc.push(srcExpr)
   rcwPendSrcTy.push(srcTy)
   rcwPendDstTy.push(dstTy)
+  0
+}
+
+// Record a delivery of `srcExpr`, typed at a hole `srcTy`, into `dstTy` for the pins of the
+// function whose body is being checked.
+function rcwPinNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
+  const owner = cstrOwnerTop()
+  let i = 0
+  while i < rcwPinSrc.length {
+    if (
+      rcwPinSrc[i] == srcExpr
+      && rcwPinSrcTy[i] == srcTy
+      && rcwPinDstTy[i] == dstTy
+      && rcwPinFn[i] == owner
+    ) {
+      return 0
+    }
+    i = i + 1
+  }
+  rcwPinSrc.push(srcExpr)
+  rcwPinSrcTy.push(srcTy)
+  rcwPinDstTy.push(dstTy)
+  rcwPinFn.push(owner)
+  0
+}
+
+// The deliveries `calleeFn`'s body recorded at a hole, at this call's bindings: a source the pin
+// makes concrete is asked the direct spelling's record rules, and one still open is recorded
+// for the caller's pins.
+function validateRcwPins(bNames: string[], bTys: i32[], calleeFn: i32) {
+  if inferQuiet { return 0 }
+  const n = rcwPinSrc.length
+  let i = 0
+  while i < n {
+    if cstrOwnedBy(rcwPinFn[i], calleeFn) {
+      const sub = substTyDeep(rcwPinSrcTy[i], bNames, bTys)
+      if sub >= 0 && sub != rcwPinSrcTy[i] {
+        if tyHasHole(sub) {
+          if T.tys[sub] is TyVar && cstrOwnerTop() >= 0 {
+            rcwPinNote(rcwPinSrc[i], sub, rcwPinDstTy[i])
+          }
+        } else if assignable(sub, rcwPinDstTy[i]) {
+          // The delivery seam's two record rules, in its order: a shape stored differently,
+          // then a widened field something writes.
+          if objShapeAdapterlessAt(rcwPinSrc[i], sub, rcwPinDstTy[i]) {
+            objShapeAdapterlessErr(rcwPinSrc[i], sub, rcwPinDstTy[i])
+          } else {
+            rcwPend(rcwPinSrc[i], sub, rcwPinDstTy[i])
+          }
+        }
+      }
+    }
+    i = i + 1
+  }
   0
 }
 
@@ -38651,6 +38817,21 @@ function killedNarrowingSure(place: i32): boolean {
   true
 }
 
+// Whether a write or a call ended the innermost narrowing of the place `place` in this
+// function; false when none covers it.
+function narrowingEndedAt(place: i32): boolean {
+  const key = placeKeyOf(place)
+  if key == "" { return false }
+  let s = npKeys.length - 1
+  let base = crFnNpBase()
+  if base < 0 { base = 0 }
+  while s >= base {
+    if npKeys[s] == key { return npInvBy[s] >= 0 }
+    s = s - 1
+  }
+  false
+}
+
 // Whether the call at `callIx` ends the narrowing keyed `key` by a rule that holds at every pin:
 // an opaque callee, a cell-removing method on the path's own receiver, or a callee whose
 // summary writes the path by name through an argument or a free variable.
@@ -40603,6 +40784,17 @@ function hdRowOf(tyIx: i32) {
   hdRowOfTy[tyIx]
 }
 
+// The hole a derivation chain bottoms out at: `tyIx` itself when it is not a derived hole.
+function hdRootTy(tyIx: i32): i32 {
+  let t = tyIx
+  let guard = 0
+  while hdRowOf(t) >= 0 && guard <= HOLE_REBASE_MAX {
+    t = hdBase[hdRowOf(t)]
+    guard = guard + 1
+  }
+  t
+}
+
 // How many derived-read layers a hole stacks over its base param hole — a stored count,
 // computed once per mint, used only to cap the re-basing below.
 function hdDepthOf(tyIx: i32) {
@@ -40639,6 +40831,8 @@ function hdRenderName(
   // different defaults reach different answers and are different holes.
   if kind == HD_COAL { return "?coal." + i32ToStr(inner) + "." + baseName }
   if kind == HD_COALD { return "?coald." + i32ToStr(inner) + "." + baseName }
+  if kind == HD_TVW { return "?tvw." + i32ToStr(inner) + "." + baseName }
+  if kind == HD_HWR { return "?hwr." + i32ToStr(inner) + "." + baseName }
   "?galt." + i32ToStr(inner) + "." + i32ToStr(alt) + "." + baseName
 }
 
@@ -40986,6 +41180,16 @@ function holePinReadAt(
     if nn < 0 { return -1 }
     return nonNullTy(nn)
   }
+  if kind == HD_TVW {
+    const wp = holePinReadAt(hdBase[row], bNames, bTys, depth + 1)
+    if wp < 0 { return -1 }
+    return writeMemberTy(hdInner[row], wp)
+  }
+  if kind == HD_HWR {
+    const hp = holePinReadAt(hdBase[row], bNames, bTys, depth + 1)
+    if hp < 0 { return -1 }
+    return writeMemberTy(hp, hdInner[row])
+  }
   if kind != HD_FLD && kind != HD_ELEM && kind != HD_ELEMV && kind != HD_RET {
     return -1
   }
@@ -41092,6 +41296,19 @@ function substHoleTyReal(tyIx: i32, bNames: string[], bTys: i32[]) {
     if dFace < 0 || tyHasHole(dFace) { return -1 }
     if assignable(dPin, dFace) { return dFace }
     return joinTys(dFace, dPin)
+  }
+  // A place holding a written parameter value: the member of its declaration the pin lands on.
+  if kind == HD_TVW {
+    const wPin = substHoleTy(hdBase[row], bNames, bTys)
+    if wPin < 0 { return -1 }
+    if tyIsHole(wPin) { return rebaseDerivedHole(row, wPin) }
+    return writeMemberTy(hdInner[row], wPin)
+  }
+  if kind == HD_HWR {
+    const hPin = substHoleTy(hdBase[row], bNames, bTys)
+    if hPin < 0 { return -1 }
+    if tyIsHole(hPin) { return rebaseDerivedHole(row, hPin) }
+    return writeMemberTy(hPin, hdInner[row])
   }
   if kind == HD_RET {
     const inner = substHoleTy(hdBase[row], bNames, bTys)
@@ -45335,6 +45552,7 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
       dhArgNode,
     )
     validateUfcsCstrs(vNames, vTys, ix, cstrCallee, cstrWho)
+    validateRcwPins(vNames, vTys, cstrCallee)
     // Not a validation: the `??` result holes are substituted here for their BANK, which is
     // the only route the emitter has to the type this call gave the expression (D1702).
     if bNames.length > 0 { bankCoalHoles(bNames, bTys, cstrCallee) }
@@ -52960,6 +53178,7 @@ function checkProgramPass(rootIx: i32) {
   asgNarTyIx = []
   asgStripTys = []
   asgKeepNarrow = Map()
+  asgTvWrite = Map()
   narIfEnds = Map()
   pgVoid = []
   joinHead = []
@@ -53849,6 +54068,12 @@ export function asgNarTyIxOf(ix: i32) {
   }
   -1
 }
+// Whether the assignment at node `ix` stored a type-parameter value into a nullable place: the
+// reads after it are at the declaration (`asgNarTyIxOf`) unless the pin excludes null (D3240).
+export function asgTvWriteOf(ix: i32): boolean {
+  if asgTvWrite.length == 0 { return false }
+  asgTvWrite[ix] ?? false
+}
 // The type the assignment at node `ix` null-stripped its bare-name target to, or -1.
 export function asgStripTyOf(ix: i32): i32 {
   if ix < 0 || ix >= asgStripTys.length { return -1 }
@@ -53861,6 +54086,9 @@ function clearAsgNarTyIx(ix: i32) {
   if asgKeepNarrow.length > 0 && (asgKeepNarrow[ix] ?? false) {
     asgKeepNarrow[ix] = false
   }
+  if asgTvWrite.length > 0 && (asgTvWrite[ix] ?? false) {
+    asgTvWrite[ix] = false
+  }
   0
 }
 
@@ -53869,6 +54097,12 @@ function recordAsgNarTyIx(ix: i32, ty: i32) {
   if ix < 0 || ty < 0 { return 0 }
   while asgNarTyIx.length <= ix { asgNarTyIx.push(-1) }
   asgNarTyIx[ix] = ty
+  0
+}
+// Bank a type-parameter write at assignment `ix` into a place declared `dcl` (`asgTvWriteOf`).
+function recordAsgTvWrite(ix: i32, dcl: i32) {
+  recordAsgNarTyIx(ix, dcl)
+  asgTvWrite[ix] = true
   0
 }
 // Did the post-guard residual of the `if` at node `ix` drop, because an arm wrote a
@@ -58494,9 +58728,13 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
             // Under a guard the write re-narrows from the declaration instead, below.
             if narGuardSlot(asgTgt.identName) < 0 {
               noteNarShadow(asgTgt.identName, asgCur, NAR_KIND_ASG)
-              declare(asgTgt.identName, nonNullTy(asgCur))
-              while asgStripTys.length <= ix { asgStripTys.push(-1) }
-              asgStripTys[ix] = nonNullTy(asgCur)
+              if tvPlaceWrite(asgCur, rt) {
+                declare(asgTgt.identName, tvWriteTy(asgCur, rt, -1))
+              } else {
+                declare(asgTgt.identName, nonNullTy(asgCur))
+                while asgStripTys.length <= ix { asgStripTys.push(-1) }
+                asgStripTys[ix] = nonNullTy(asgCur)
+              }
             }
           } else if asgCt.nInner < 0 && rtT is TyNullable {
             // A nullable write fills the hole from its non-null part and narrows nothing: the
@@ -65432,9 +65670,21 @@ function checkMemberNode(n: Member, ix: i32) {
       noteMemCstr(objTy, n.memProp, ix, false)
       return symMem(ix, TY_I32)
     }
+    // A place holding a written type-parameter value reads its members as the parameter does:
+    // each pin re-asks the read of the member it lands on, a nullable one included (D3240).
+    if tyIsWriteLandRead(objTy) {
+      noteMemCstr(objTy, n.memProp, ix, false)
+      const twFld = mkDerivedHole(HD_FLD, n.memProp, -1, -1, objTy)
+      if twFld >= 0 { return symMem(ix, twFld) }
+    }
     if ot.tvName.length > 0 {
       if ot.tvName[0] == '?' {
         noteNullReadCstr(objTy, n.memProp, ix, n.memObj)
+        // A read off a declared parameter's derivation after a write or call ended its
+        // narrowing is re-asked at its pin, as the direct spelling's read is (D3233).
+        if tyIsDeclaredParam(hdRootTy(objTy)) && narrowingEndedAt(n.memObj) {
+          noteMemCstr(objTy, n.memProp, ix, false)
+        }
         // `.length` is the i32 length an array/string/map exposes — treat it as that (not a
         // struct field), so a collection-shaped hole infers without growing a bogus `{length}` shape.
         return symMem(ix, holeMemberTy(objTy, ot.tvName, n.memProp))
