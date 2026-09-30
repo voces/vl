@@ -35,6 +35,18 @@ const CASES: [string, string, string[]][] = [
     "const b = 2\nconst xs = [1, 2].map((_v: i32) => { a: { b } })\nprint(xs[0].a.b)",
     ["2"],
   ],
+  ["nested shorthand inner (D3265)", "function g(b: i32) { a: { c: { b } } }\nprint(g(6).a.c.b)", ["6"]],
+  ["three-deep shorthand (D3265)", "const b = 2\nconst g = () => { a: { c: { d: { b } } } }\nprint(g().a.c.d.b)", ["2"]],
+  [
+    "multi-line nested shorthand (D3265)",
+    "function g(b: i32) {\n  a: {\n    c: { b }\n  }\n}\nprint(g(7).a.c.b)",
+    ["7"],
+  ],
+  [
+    "else body, nested shorthand (D3265)",
+    "function g(b: i32, c: boolean) {\n  if c { { a: { d: { b } } } } else { a: { d: { b } } }\n}\nprint(g(4, false).a.d.b)",
+    ["4"],
+  ],
   [
     "a labelled block still parses as one",
     "function g(n: i32) {\n  let r = 0\n  a: { r = n }\n  r\n}\nprint(g(7))",
