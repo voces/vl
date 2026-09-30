@@ -14984,6 +14984,7 @@ function cexNoRoot(): boolean { false }
 // Fold the tree at `ix` in place: 1 when it is rewritten into its value's literal, 2 when it is
 // a constant the check refuses (reported here), 0 when it is no constant tree.
 function cexTryFold(ix: i32): i32 {
+  if cexNotTree.length > 0 && (cexNotTree[ix] ?? false) { return 0 }
   if !cexRootShape(ix) || cexTreeShape(ix, 0) != 1 { return 0 }
   cexFoldAt(ix)
 }
@@ -15000,15 +15001,39 @@ function cexTryFoldBin(e: BinExpr, ix: i32): i32 {
 // Fold the tree at `ix`, whose shape is a constant tree's.
 function cexFoldAt(ix: i32): i32 {
   const v = cexEvalAt(ix, 0)
-  if v.cxNo { return 0 }
+  if v.cxNo || cexPastF64(v) {
+    cexKeepWhole(ix, 0)
+    return 0
+  }
   if v.cxErr != "" {
     tErr(v.cxErr, ix)
     return 2
   }
-  if cexPastF64(v) { return 0 }
   cexRewrite(ix, v)
   1
 }
+
+// A constant tree the fold leaves unfolded (radix arithmetic, a width-dependent shift or `~`, a
+// float past the double range) computes whole at its use's width, so no part of it folds on its
+// own: `(1 << 31) - 0x1` keeps its decimal half at the width the radix half is read at.
+function cexKeepWhole(ix: i32, depth: i32) {
+  if ix < 0 || ix >= P.nodes.length || depth > CEX_DEPTH { return 0 }
+  const e = P.nodes[ix]
+  if e is BinExpr {
+    cexNotTree[ix] = true
+    cexKeepWhole(e.binLeft, depth + 1)
+    return cexKeepWhole(e.binRight, depth + 1)
+  }
+  if e is Unary {
+    cexNotTree[ix] = true
+    return cexKeepWhole(e.unArg, depth + 1)
+  }
+  if e is Paren { return cexKeepWhole(e.parInner, depth + 1) }
+  cexKeepLeaf()
+}
+
+// A literal or a name, the other nodes a constant tree holds, has nothing below it to keep.
+function cexKeepLeaf(): i32 { 0 }
 
 // Whether the node at `ix` has a constant tree's shape, reading no digits: 1 it has, 0 it has not,
 // -1 it is deeper than `CEX_DEPTH`. The walk stops at the first leaf that is no constant.
@@ -15340,12 +15365,11 @@ function cexShown(v: Cex): string {
   t
 }
 
-// A 64-bit integer literal `lit` typed `litTy` beside the type-parameter operand typed `holeTy`
-// is computed at the parameter's width, so a narrower pin must refuse it (D2712).
-function cexNoteHoleWidth(holeTy: i32, lit: i32, litTy: i32) {
-  if litTy != TY_I64 || !tyHasHole(holeTy) || tyHasHole(litTy) { return 0 }
-  if cexLitPeel(lit) < 0 { return 0 }
-  noteBinCstr(holeTy, OP_LITFIT, litTy)
+// An operand typed `otherTy`, when `i64`, beside a type-parameter operand typed `holeTy` is
+// computed at the parameter's width, so a narrower pin must refuse it (D2712).
+function cexNoteHoleWidth(holeTy: i32, otherTy: i32) {
+  if otherTy != TY_I64 || !tyHasHole(holeTy) || tyHasHole(otherTy) { return 0 }
+  noteBinCstr(holeTy, OP_LITFIT, otherTy)
 }
 
 // The decimal spelling of the integer `v`, signed.
@@ -41417,7 +41441,7 @@ function validateBinCstrs(
             if binCstrOp[ci] == OP_AS { refusal = asPinRefusal(clt, crt) }
             if binCstrOp[ci] == OP_LITFIT {
               refusal = tyToStr(clt)
-                + " cannot hold the 64-bit constant it meets"
+                + " cannot hold the 64-bit operand it meets"
             }
             // An ordering over a gradual union is refused in the direct spelling's words.
             const cop = binCstrOp[ci]
@@ -41469,7 +41493,7 @@ function validateBinCstrs(
                 tail = " (" + bodyWho + " negates this argument)"
               }
               if binCstrOp[ci] == OP_LITFIT {
-                tail = " (" + bodyWho + " computes with it and a constant)"
+                tail = " (" + bodyWho + " computes with it and a 64-bit value)"
               }
               msg = head + refusal + tail
             }
@@ -59267,8 +59291,8 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
         op,
         eqCstrOperandTy(op, n.binRight, rt),
       )
-      cexNoteHoleWidth(lt, n.binRight, rt)
-      cexNoteHoleWidth(rt, n.binLeft, lt)
+      cexNoteHoleWidth(lt, rt)
+      cexNoteHoleWidth(rt, lt)
     }
   }
   // Nominal newtype (P1.5): every non-assignment binary operator's operands must carry the

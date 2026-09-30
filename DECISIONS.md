@@ -9025,7 +9025,10 @@ tree read stays an editor reference.
   spelled `divU`, `remU`, `ltU` or `>>>`. The width is the use's, which the fold cannot see, so a
   tree whose value depends on it is not folded and computes where it is used, as before:
   arithmetic (`+ - * / %`) over a pattern, `>>` and `~` over a pattern whose top bit is set at
-  its own width (32 or 64 bits), and a pattern shifted past 32 bits. What reads the same at
+  its own width (32 or 64 bits), any operation over a pattern wider than 32 bits (which an `i32`
+  does not hold), and a pattern shifted past 32 bits. Such a tree is left whole: no decimal part
+  of it folds on its own, so `(1 << 31) - 0x1` is 2147483647 at `i32`, as on master, rather
+  than an `i64` literal minus a pattern. What reads the same at
   every width folds, and stays a pattern that fits a width by its digits: a negation, `&`, `|`,
   `^`, `>>>`, and `<<` within 32 bits (`0xFFFF0000 | 0xFF` is -65281 at `i32` and 4294902015 at
   `i64`; `0xFF << 24` is `0xFF000000`). A decimal literal is a number: `1 << 31` at `i32` is
@@ -9043,8 +9046,8 @@ tree read stays an editor reference.
 * An integer literal past the `i64` range is refused wherever no float holds it exactly
   (D3425), where it used to keep its low 64 bits; a constant past it (`1 << 64`) is refused at
   the use, not where it is declared, so `(1 << 70) >> 60` is 1024.
-* In a generic body, a 64-bit constant beside a type-parameter operand records a constraint
-  (`OP_LITFIT`) that a narrower pin refuses (`i32 cannot hold the 64-bit constant it meets`),
+* In a generic body, an `i64` operand beside a type-parameter operand records a constraint
+  (`OP_LITFIT`) that a narrower pin refuses (`i32 cannot hold the 64-bit operand it meets`),
   since the body alone cannot see the width (D2712, D3426); an `f32` pin is still open (D3429).
 
 **Programs whose behaviour changed.** Every one computed a constant that wrapped, or a float
