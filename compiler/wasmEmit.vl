@@ -4831,7 +4831,16 @@ export function emitUnionCoerce(
   // if-expression that is already a union value hits the raw pass first and is emitted by
   // `emitExpr`, which picks the join's blocktype from the arms' scalar ladder. Only this arm
   // knows the blocktype has to be the box, so it must be asked first.
-  if bare is IfStmt { return emitUnionIfValue(body, unionName, bareIx, fnIx) }
+  if bare is IfStmt {
+    // A `null`-typed one is the null-tagged box after its arms run for effect (D3355).
+    if nodeTyIsNullType(bareIx) {
+      fbI32Const(nullBoxTag())
+      if emitNulNoneBoxPayload(body, bareIx, fnIx) < 0 { return -1 }
+      fbStructNew(uBoxIdx)
+      return 0
+    }
+    return emitUnionIfValue(body, unionName, bareIx, fnIx)
+  }
   if exprUnion(exprIx, fnIx) { return emitExpr(body, exprIx, fnIx) }
   if bare is NullLit {
     fbI32Const(nullBoxTag())
@@ -5384,8 +5393,23 @@ export function emitNulNoneBoxPayload(body: u8[], exprIx: i32, fnIx: i32) {
 function emitNulNoneLeafPayload(body: u8[], exprIx: i32, fnIx: i32) {
   const n = P.nodes[unwrapParen(exprIx)]
   if n is Call { return emitExpr(body, exprIx, fnIx) }
+  // `a ?? b` of the `null` type runs `a` for effect and is `b` (D3355).
+  const co = plainCoalesceAt(exprIx)
+  if co != null {
+    if emitNulNoneForEffect(body, co.binLeft, fnIx) < 0 { return -1 }
+    return emitNulNoneBoxPayload(body, co.binRight, fnIx)
+  }
   fbRefNullNone()
   0
+}
+
+// The `a ?? b` node at `exprIx`, parentheses peeled, or null for any other node or a `??=`.
+function plainCoalesceAt(exprIx: i32): BinExpr | null {
+  const n = P.nodes[unwrapParen(exprIx)]
+  if n is BinExpr {
+    if n.binOp == "??" && n.binCompound.length == 0 { return n }
+  }
+  null
 }
 
 // D1576 — does this `==` or `!=` compare the `null` type against a `null`? True when at least
@@ -5419,13 +5443,20 @@ function emitNulNoneForEffect(body: u8[], exprIx: i32, fnIx: i32) {
   emitNulNoneLeafForEffect(body, exprIx, fnIx)
 }
 
-// `emitNulNoneForEffect` for every node but an if-expression: only a call has an effect.
+// `emitNulNoneForEffect` for every node but an if-expression: a bare `null` and a name read have
+// no effect, and anything else is lowered and its value dropped, since a `??` or a call in it
+// may run code (D3355).
 function emitNulNoneLeafForEffect(body: u8[], exprIx: i32, fnIx: i32) {
   const n = P.nodes[unwrapParen(exprIx)]
-  if n is Call {
-    if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
-    fbDrop()
+  if n is NullLit || n is Ident { return 0 }
+  // A `null`-typed `a ?? b` has a `null`-typed left, so both sides always run.
+  const co = plainCoalesceAt(exprIx)
+  if co != null {
+    if emitNulNoneForEffect(body, co.binLeft, fnIx) < 0 { return -1 }
+    return emitNulNoneForEffect(body, co.binRight, fnIx)
   }
+  if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
+  fbDrop()
   0
 }
 
