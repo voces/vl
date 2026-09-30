@@ -8700,15 +8700,16 @@ spellings build to identical wasm only if they reach binaryen identical.
 
 ## Labels are marked at the exit, and any loop carries a value (owner ruling 2026-09-29) — plumb PL-073
 
+**The spelling below is superseded**: a label is `@B` at the declaration and at the jump since
+the 2026-09-30 ruling (next section). The semantics here stand unchanged.
+
 **The rulings.** A block takes a label as a loop does, `B: { … }`. The label is named again at the
 exit, Zig-style: `break :B`, `break :B v`, `continue :B`; the declaration stays `B:`. A bare
 `break v` leaves the innermost loop with `v`, and a bare `break` keeps working, so `break x` with
 `x` a name now means the value `x`. Any loop may carry a value: its type is the
 join of every `break` value, a block's tail joins in, a `while`/`for` that can finish without a
 `break v` adds `null` (`T | null`), and `while true` — a literal `true`, which cannot run out — is
-plain `T`. `continue :B` on a block is an error. The old `break B` / `continue B` is a parse error
-naming the fix, and `scripts/codemods/break-label-colon.py` migrates a tree (every in-tree use is
-migrated). The guide is `docs/guide/loops.md`.
+plain `T`. `continue :B` on a block is an error. The guide is `docs/guide/loops.md`.
 
 **Why the colon at the exit.** A label and a value share the operand slot after `break`, and a
 value is the common case plumb's forward-exit blocks need. Marking the label rather than the
@@ -8744,6 +8745,43 @@ in scope; the checker and emitter never see a bare jump that could reach a block
 **One spelling needs parentheses.** A labelled block as a call argument, `f((B: { … }))`, since
 `f(B: …)` is a named argument. Choosing the named argument keeps every existing call meaning
 what it meant.
+
+## A label is `@name`, and `{ name: … }` is always an object (owner ruling 2026-09-30) — D3374
+
+**The ruling.** A label is one token, `@name`, spelled the same where it is declared and where a
+jump names it: `@outer while …`, `@L for …`, `@B { … }`, `break @B`, `break @B v`,
+`continue @L`. A label goes only on `while`, `for` and `{`; `@name` anywhere else is a parse error
+saying so. The semantics of the 2026-09-29 rulings are unchanged: a labelled block is exited only
+by name (E0695), `break v` carries a value, a loop's value is `T | null` and `while true`'s is
+`T`, and loop labels stay optional.
+
+**Why a sigil.** `name:` shared its spelling with an object field, so `{ a: { b } }` needed a
+rule to say which it was, and every rule was wrong somewhere: #3293 read the inner braces, #3302
+also read the token after them, and D3374 was the same braces reading as a block in a `then` arm
+and an object in an `else` arm. `@` was unused, and `'` (Rust's `'a`) is VL's char quote. With
+the label lexically distinct, `{ name: … }` is ALWAYS an object literal — a function or lambda
+body, an `if`/`else` branch, a `match` arm — and the heuristics that existed only for labels
+(`labelBraceOpensStmt`, `labelledBraceIsBlock`, the recorded object-looking arms and their note)
+are gone. A labelled block is now a call argument as written, `f(@B { … })`, since nothing reads
+`@B` as a named argument. What stays is the shorthand rule, which has nothing to do with labels:
+a body `{ b }` is a block whose tail is `b`, and `{}` is an empty block.
+
+**One spelling costs parentheses.** `break @C { … }` names the label `C`, so a labelled block
+that is itself the value of a `break` is written `break (@C { … })`.
+
+**Migration, and how long it lasts.** The retired spellings are parse errors with the fix:
+`` `B: { … }` is no longer a label; write `@B { … }` `` (and the `while`/`for` twins, in statement
+and value position), `` `break :B` is now `break @B` ``, and, when an object literal fails to parse
+with a field `name: {` or `name: while` in it, `` `name: …` is an object field here; a label is
+written `@name { … }` ``. That last one is how an old labelled block first in a body reads now: as
+an object, so the note rides the object's own error. The detection (`oldLabelAt`,
+`oldLabelFieldNote` and the `:` arm of `parseJumpLabel` in `compiler/parser.vl`) is kept only
+while sources written before the ruling are migrated — plumb's generated units are the known
+population — and is deleted once plumb regenerates; nothing else depends on it. One old shape
+migrates silently and cannot be detected: an unused label on a loop first in a body,
+`function f() { L: while c { … } }`, is now an object holding the loop's value, which the
+checker refuses only when that value is `void`. `scripts/codemods/label-at.py` rewrites a tree,
+and rewrites that shape too.
 
 ## Parameter names in a function type are documentation (owner ruling A1, 2026-09-29) — plumb PL-060
 

@@ -1819,6 +1819,12 @@ new: the compare-frame pre-pass never recurses into a code-15 field, so a NESTED
 
 ## Parser (Track G — complete)
 
+- **A label is `@name`, and `{ name: … }` is always an object literal (owner ruling 2026-09-30;
+  D3374, D3276 closed).** `@outer while …`, `@B { … }`, `break @B v`, `continue @L`: one token at
+  the declaration and the jump, so a function body, lambda body, `if`/`else` branch or `match`
+  arm that opens `{ name: …` is the object, and a labelled block is a call argument as written.
+  `B: { … }` and `break :B` are refused with the `@` fix; `scripts/codemods/label-at.py`
+  migrates a tree. `vl fmt` prints labels as `@B` and an object arm as the object.
 - **A keyword naming a binding is one error, at the declaration (D3069, plumb PL-071).**
   `function f(type: i64) { if type == 0 { return -1 }; type + 1 }` printed four errors, one
   per later use of the name plus a location-less `A type alias requires a body`. A parameter,
