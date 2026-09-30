@@ -9115,7 +9115,7 @@ record (or list of records) member of those field names, as the annotated twin
 
 Where master built invalid wasm for a delivery the checker neither adopts nor refuses as
 existing, it refuses instead, with the existing-record wording: a record a function called at
-more than one site built into a
+more than one site built into a record (not a union) with a
 bare `f32`/`f64` field it holds as an integer, which has no conversion (`recFloatBuiltElsewhere`);
 a literal built inside a function or through a generic identity call where a record of its own
 fields is declared, by a `type` or inline in an annotation (D3430), which builds it at that row
@@ -9125,13 +9125,15 @@ and one binding or function a kept delivery builds at another
 storage and that is handed on whole at its own type, or delivered at two storages
 (`recKeptConflicts`).
 
-**Measured for lane RC3, against master `39097fdcb`.** The annotated twin is the oracle. A 312-cell
+**Measured for lane RC3, against master `028dedb33`.** The annotated twin is the oracle. A 312-cell
 grid (six field pairs, seventeen delivery positions, reads before, after and none): 0
 disagreements, 62 running cells print their twin's new value, 0 runs lost. A 216-cell
 function-result grid and a 162-cell declared-own-row grid: 0 runs lost, 168 cells from a
 refusal or invalid wasm to runs, 14 from invalid wasm to a refusal; the 48 cells still disagreeing are a function called at two
 sites or handed through a generic identity, both refused, none invalid. The distilled corpus
-moves exactly as master's does, and plumb's 214 entry files check identically.
+moves exactly as master's does, and plumb's 214 entry files check identically. A union
+destination (`R | string`, `R | null`, `R | G`) keeps master's boxed build of a fresh call at
+every site count (a 72-cell grid and the #3325 review's 720-cell grid: 0 runs lost).
 
 **Measured before landing, against master `2b30e3674`, after the #3312 review.** The distilled
 corpus lost no runs. The review's 1,344-cell grid: 0 value changes, 0 fresh runs lost, 9 invalid
