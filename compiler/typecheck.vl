@@ -2893,6 +2893,7 @@ function flushNullHoles(depth: i32) {
           } else {
             nhFilledIxs.push(nhPendIxs[i])
             nhFilledTys.push(ty)
+            noteFilledJoinLet(nhPendIxs[i])
           }
         }
       }
@@ -14076,7 +14077,7 @@ const LBI_UP = 0
 const LBI_LO = 1
 const LBI_EDGE = 3
 // A candidate read inside an integer intrinsic's operand flows into the store's target, which
-// does not flow back: the operand chooses nothing (D3343).
+// does not flow back: the operand chooses nothing (D3343, `lbiIntrEdge`).
 const LBI_EDGE_FWD = 2
 // And vetoes, which choose nothing and keep the default when the choice breaks one: a float
 // literal operand (not `i64`), a bitwise or shift operand (an integer), `==` an integer (not `f32`).
@@ -14622,6 +14623,14 @@ function lbiLeaf(ix: i32, cands: i32[], tys: i32[], froms: i32[]) {
     }
     return 0
   }
+  // A width-keeping intrinsic is typed by its operands: their typed leaves bound the target, and
+  // its own first-pass type, sized before any candidate settled, bounds nothing.
+  const args = lbiIntrArgs(ix)
+  if args.length > 0 {
+    const inner: i32[] = []
+    for a in args { lbiLeaves(a, inner, tys, froms) }
+    return 0
+  }
   const t = nodeTyOf(ix)
   if lbiNumTy(t) {
     tys.push(t)
@@ -14814,7 +14823,7 @@ function lbiNoteStore(tc: i32, src: i32) {
   const intr: i32[] = []
   lbiIntrCands(src, intr, 0)
   for c in intr {
-    if c != tc && lbiAnn[c] < 0 { lbiPush(tc, LBI_EDGE_FWD, c, src) }
+    if c != tc && lbiAnn[c] < 0 { lbiPush(tc, lbiIntrEdge(c), c, src) }
   }
   // An integer literal in the stored tree (`y += 3000000000`) bounds it as a stored literal does.
   const leaves: i32[] = []
@@ -14831,37 +14840,48 @@ function lbiNoteStore(tc: i32, src: i32) {
   0
 }
 
-// Push onto `cands` the candidates read by the operands of every integer intrinsic in the tree
-// `ix` whose result is its operands' width (`divU(b, 3)`): each bounds the store's target.
+// Push onto `cands` the candidates read by the operands of every intrinsic in the tree `ix` whose
+// result is its operands' width (`divU(b, 3)`, `abs(x)`): each bounds the store's target.
 function lbiIntrCands(ix: i32, cands: i32[], depth: i32) {
   if depth > LBI_TREE_DEPTH { return 0 }
   const leaves: i32[] = []
   lbiTreeLeaves(ix, leaves, 0)
   for l in leaves {
-    const n = P.nodes[l]
-    if n is Call {
-      const f = P.nodes[n.callFn]
-      if f is Ident {
-        const nm = f.identName
-        if (
-          intIntrArity(nm) > 0
-          && !intIntrIsCompare(nm)
-          && !numIntrShadowed(nm)
-        ) {
-          for a in n.callArgs {
-            const inner: i32[] = []
-            lbiTreeLeaves(a, inner, 0)
-            for il in inner {
-              const c = lbiCandAt(il)
-              if c >= 0 { cands.push(c) }
-            }
-            lbiIntrCands(a, cands, depth + 1)
-          }
-        }
+    for a in lbiIntrArgs(l) {
+      const inner: i32[] = []
+      lbiTreeLeaves(a, inner, 0)
+      for il in inner {
+        const c = lbiCandAt(il)
+        if c >= 0 { cands.push(c) }
       }
+      lbiIntrCands(a, cands, depth + 1)
     }
   }
   0
+}
+
+// The edge an intrinsic operand `c` gives the store's target. A float one is capped by the target
+// as a copy is, since no answer of a float binding is widened by it; an integer one only bounds
+// the target, since its width is the intrinsic's value (`clz`).
+function lbiIntrEdge(c: i32): i32 {
+  if lbiIntTy(lbiDef[c]) { return LBI_EDGE_FWD }
+  LBI_EDGE
+}
+
+// The operands of the call `ix` when it is an unshadowed intrinsic whose result is its operands'
+// width: a float one, or an integer one that is not a comparison. Empty otherwise.
+function lbiIntrArgs(ix: i32): i32[] {
+  const n = P.nodes[ix]
+  if n is Call {
+    const f = P.nodes[n.callFn]
+    if f is Ident {
+      const nm = f.identName
+      const keeps = floatIntrArity(nm) > 0
+        || (intIntrArity(nm) > 0 && !intIntrIsCompare(nm))
+      if keeps && !numIntrShadowed(nm) { return n.callArgs }
+    }
+  }
+  []
 }
 
 // The types that hold the bare numeric literal `ix` (`LBI_FIT_*`), with `LBI_FIT_SAME` when it
@@ -56718,6 +56738,10 @@ export function nodeTyIsNullable(ix: i32) {
   T.tys[ty] is TyNullable
 }
 
+// True if node `ix`'s recorded type is the `null` type itself: the value is `null` on every path
+// that yields one, whatever its arms run first (D3355).
+export function nodeTyIsNullType(ix: i32): boolean { isNullTy(nodeTyIxOf(ix)) }
+
 // Whether node `ix`'s recorded type provably admits no `null` — not `!nodeTyIsNullable(ix)`,
 // since an unrecorded node, an inference hole, or a `TyVar` all answer "not nullable" there
 // while being unknown here. Every "don't know" answers false, since the one consumer (`??`
@@ -66444,6 +66468,27 @@ let exitFirstLetSeen: i32[] = []
 function noteExitFirst(ix: i32) {
   if inferQuiet { return 0 }
   lpColSet(exitFirstAt, ix, 1)
+  0
+}
+
+// A binding initialized by a `null`-typed construct rather than a bare `null`, whose hole a later
+// write filled: the emitter reads the construct's arms, which say only `null`, so it takes the
+// filled type as an annotation too (D3355).
+function noteFilledJoinLet(ix: i32) {
+  const d = P.nodes[ix]
+  if d is LetDecl {
+    if (
+      d.letType >= 0
+      || d.letInit < 0
+      || P.nodes[cwPeel(d.letInit)] is NullLit
+    ) {
+      return 0
+    }
+    if lpColAt(exitFirstLetSeen, ix) != 1 {
+      lpColSet(exitFirstLetSeen, ix, 1)
+      exitFirstLets.push(ix)
+    }
+  }
   0
 }
 

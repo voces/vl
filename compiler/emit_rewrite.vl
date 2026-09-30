@@ -46,6 +46,8 @@ import {
   joinRowRename,
   lambdaVoidAdoptedAt,
   letJoinCandidates,
+  letNullHoleFilledTy,
+  letNullHoleUnfilled,
   litUnionAliasNameOfTy,
   loopValAny,
   loopValTailOf,
@@ -261,6 +263,7 @@ export function loopValueRewrite(rootIx: i32) {
   const todoStmt: boolean[] = [true]
   const loops: i32[] = []
   const loopStmt: boolean[] = []
+  const coalesces: i32[] = []
   while todo.length > 0 {
     const ix = todo.pop() ?? -1
     const atStmt = todoStmt.pop() ?? false
@@ -272,6 +275,11 @@ export function loopValueRewrite(rootIx: i32) {
       ) {
         loops.push(ix)
         loopStmt.push(atStmt)
+      }
+      if n is BinExpr {
+        if n.binOp == "??" && lvIsNullableLoop(unwrapParen(n.binLeft)) {
+          coalesces.push(ix)
+        }
       }
       const inList = n is Block || n is Program
       const kids = nodeChildren(ix)
@@ -288,8 +296,50 @@ export function loopValueRewrite(rootIx: i32) {
     lvRewriteAt(loops[k], loopValTyOf(loops[k]), loopStmt[k])
     k = k - 1
   }
+  for q in coalesces { lvCoalesceIntoArm(q) }
   capMemoNoteEdit()
   plCacheBust()
+  0
+}
+
+// Is `ix` a loop whose used value is nullable?
+function lvIsNullableLoop(ix: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = P.nodes[ix]
+  if !(n is WhileStmt || n is ForRange || n is ForIn) { return false }
+  const ty = loopValTyOf(ix)
+  ty >= 0 && tyBearsNull(ty)
+}
+
+// `(loop) ?? d` at `q`, its loop already rewritten, becomes the if-expression with `$lv ?? d` as
+// its value: an arm's own binding has no rep until the arm lowers, so a `??` over the whole `if`
+// found none, where one over the binding reads it as any local (D3370).
+function lvCoalesceIntoArm(q: i32) {
+  const c = P.nodes[q]
+  if c is BinExpr {
+    const s = P.nodes[unwrapParen(c.binLeft)]
+    if s is IfStmt {
+      const tb = P.nodes[s.ifThen]
+      if tb is Block {
+        const st = tb.blkStmts
+        if st.length == 0 { return 0 }
+        const ty = nodeTyIxOf(q)
+        const co = mkBinary("??", st[st.length - 1], c.binRight, c.pos)
+        nodeTyRecord(co, ty)
+        st[st.length - 1] = co
+        nodeTyRecord(s.ifThen, ty)
+        const w: Node = {
+          ifCond: s.ifCond,
+          ifThen: s.ifThen,
+          ifElse: s.ifElse,
+          pos: s.pos,
+        }
+        arenaSetNode(q, w)
+        nodeTyRecord(q, ty)
+        valueIfAdd(q)
+      }
+    }
+  }
   0
 }
 
@@ -406,7 +456,9 @@ function exitArmsEndNever() {
 }
 
 // Annotates each un-annotated binding whose initializer's first arm always exits with the type
-// the checker gave it, so the emitter classifies the binding by the arm that has a value.
+// the checker gave it, so the emitter classifies the binding by the arm that has a value. A
+// `null` value arm makes the binding a null hole, typed by what later writes filled it with; a
+// hole nothing filled is left to the rep a bare `null` binding takes (D3355).
 function exitFirstLetsAnnotate() {
   let i = 0
   while i < exitFirstLetCount() {
@@ -414,9 +466,13 @@ function exitFirstLetsAnnotate() {
     if li >= 0 && li < P.nodes.length {
       const d = P.nodes[li]
       if d is LetDecl {
-        const ty = nodeTyIxOf(d.letInit)
-        const spell = lvSpellOf(ty)
-        if d.letType < 0 && ty >= 0 && spell != "" {
+        let ty = nodeTyIxOf(d.letInit)
+        if letNullHoleUnfilled(li) { ty = -1 }
+        const filled = letNullHoleFilledTy(li)
+        if filled >= 0 { ty = filled }
+        let spell = ""
+        if ty >= 0 { spell = lvSpellOf(ty) }
+        if d.letType < 0 && spell != "" {
           let annTy = ty
           if tyHasTyVar(ty) { annTy = -1 }
           d.letType = synthTypeRefTy(spell, -1, annTy)
