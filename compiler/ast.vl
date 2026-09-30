@@ -51,6 +51,7 @@ export type BinExpr = {
   pos: i32,
   binCompound: string,
   binTpl: i32,
+  binRegion: i32, // 1 on a long arithmetic chain's root, where the classifier memo starts (D2445)
 } // a + b,  a = b,  a += b
 // A call `f(a, b)` or `f(a: 2, b: 1)`. `callArgs` are the argument value nodes in source
 // order and `callArgNames` the parallel per-argument name list ("" for a positional one);
@@ -296,6 +297,65 @@ export type Parser = {
 // The single parser instance. The harness fills `P.toks`, runs the parser, and
 // reads `P.nodes` / `P.diags` back out.
 export let P: Parser = { toks: [], nodes: [], diags: [], pos: 0 }
+
+// The operator count from which a chain's root is marked `binRegion`. A chain the mark misses
+// costs the emitter time, never an answer.
+export const ARITH_CHAIN_MIN = 16
+
+// The operators whose result width follows their operands', which an arithmetic chain joins.
+export function opIsArith(op: string) {
+  op == "+"
+    || op == "-"
+    || op == "*"
+    || op == "/"
+    || op == "%"
+    || op == "&"
+    || op == "|"
+    || op == "^"
+    || op == "<<"
+    || op == ">>"
+    || op == ">>>"
+}
+
+// Whether any node carries `binRegion`, so a program with none tests one flag, not a field.
+export let arithRegionSeen = false
+
+// Mark the root of every run of `ARITH_CHAIN_MIN` or more arithmetic operators along the left
+// spine under `root` (a loop of the precedence climber), so a chain an operator outside the
+// arithmetic tiers wraps (`a + … + a == 0`) is marked at its own root (D2445).
+export function markArithRuns(root: i32) {
+  let cur = root
+  let top = -1
+  let n = 0
+  while cur >= 0 {
+    const e = P.nodes[cur]
+    if e is BinExpr {
+      if opIsArith(e.binOp) {
+        if n == 0 { top = cur }
+        n = n + 1
+      } else {
+        if n >= ARITH_CHAIN_MIN { markArithRegion(top) }
+        n = 0
+      }
+      cur = e.binLeft
+    } else {
+      cur = -1
+    }
+  }
+  if n >= ARITH_CHAIN_MIN { markArithRegion(top) }
+  0
+}
+
+// Mark node `ix`, when it is a binary operator, as the root of a long arithmetic chain.
+export function markArithRegion(ix: i32) {
+  if ix < 0 { return 0 }
+  const n = P.nodes[ix]
+  if n is BinExpr {
+    n.binRegion = 1
+    arithRegionSeen = true
+  }
+  0
+}
 
 // The `P.diags` indices whose diagnostic came from a recovery that provably preserved the
 // program the author wrote: no token dropped, none invented. The driver lets the checker
@@ -1654,6 +1714,7 @@ export function mkBinary(op: string, left: i32, right: i32, pos: i32) {
     pos: pos,
     binCompound: "",
     binTpl: 0,
+    binRegion: 0,
   }
   addNode(n)
 }
@@ -1674,6 +1735,7 @@ export function mkTplConcat(left: i32, right: i32, pos: i32) {
     pos: pos,
     binCompound: "",
     binTpl: 1,
+    binRegion: 0,
   }
   addNode(n)
 }
@@ -1837,6 +1899,7 @@ export function mkCompoundAssign(
     pos: pos,
     binCompound: op,
     binTpl: 0,
+    binRegion: 0,
   }
   addNode(n)
 }
@@ -1856,6 +1919,7 @@ export function mkPreIncr(incr: string, target: i32, pos: i32) {
     pos: pos,
     binCompound: incr,
     binTpl: 0,
+    binRegion: 0,
   }
   addNode(n)
 }

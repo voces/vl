@@ -178,6 +178,7 @@ import {
   Unary,
   UnionDecl,
   WhileStmt,
+  arithRegionSeen,
 } from "./ast"
 // `wasmEmit.vl` — the emitter's lowering core: the statement and expression lowerers
 // (`emitStmt` / `emitExpr` and the per-node `emit*` families — calls, assignment,
@@ -429,6 +430,8 @@ import {
   gPromoOk,
   gPromoSlot,
   gSharedMemPages,
+  gStrDataIx,
+  gStrDataLen,
   gStrPoolIx,
   gStrPoolTexts,
   globalStmts,
@@ -564,6 +567,7 @@ import {
   fbArrayGet,
   fbArrayLen,
   fbArrayNew,
+  fbArrayNewData,
   fbArrayNewDefault,
   fbArrayNewFixed,
   fbArraySet,
@@ -697,6 +701,8 @@ import {
   asgReadUnwidenOp,
   assignTargetReReads,
   atomNarrowOp,
+  bcSpineEnter,
+  bcSpineLeave,
   binEqNulVariantRow,
   binEqStructRow,
   binEqVariantRow,
@@ -7631,6 +7637,18 @@ function emitStr(_body: u8[], strIx: i32, _fnIx: i32) {
       fbGlobalGet(externGlobalCount() + pi)
       return 0
     }
+    // A literal past the cap reads its data segment: a few code bytes whatever its length.
+    const di = if gStrDataLen.length > 0 { gStrDataIx[s.strText] ?? -1 } else { -1 }
+    if di >= 0 {
+      const dn = gStrDataLen[di]
+      fbI32Const(0)  // segment offset
+      fbI32Const(dn) // byte count
+      fbArrayNewData(sBackIdx, di)
+      fbI32Const(0)  // start
+      fbI32Const(dn) // len
+      fbStrNew()
+      return 0
+    }
     const cps = cpsToUtf8(decodeStr(strToCps(s.strText)))
     if cps.length > NEW_FIXED_MAX {
       // Past the engines' `array.new_fixed` operand cap — build chunked, since an unchunked
@@ -13191,7 +13209,11 @@ function emitStrEqCore(_body: u8[]) {
 function strLitLenOf(ix: i32): i32 {
   if ix < 0 || ix >= P.nodes.length { return -1 }
   const s = P.nodes[ix]
-  if s is StrLit { return cpsToUtf8(decodeStr(strToCps(s.strText))).length }
+  if s is StrLit {
+    const di = if gStrDataLen.length > 0 { gStrDataIx[s.strText] ?? -1 } else { -1 }
+    if di >= 0 { return gStrDataLen[di] }
+    return cpsToUtf8(decodeStr(strToCps(s.strText))).length
+  }
   -1
 }
 
@@ -15244,7 +15266,12 @@ export function emitExpr(body: u8[], exprIx: i32, fnIx: i32) {
   // A STANDALONE `?.` (one no enclosing `?? d` / null-test pattern consumed) yields its
   // own `F | null` value — see `emitOptMemberValue`.
   if e is OptMember { return emitOptMemberValue(body, exprIx, fnIx) }
-  if e is BinExpr { return emitBinExprNode(body, e, exprIx, fnIx) }
+  if e is BinExpr {
+    if arithRegionSeen && e.binRegion != 0 {
+      return emitBinExprInRegion(body, e, exprIx, fnIx)
+    }
+    return emitBinExprNode(body, e, exprIx, fnIx)
+  }
   if e is FuncDecl {
     // An anonymous `function(...)` literal in value position, lifted to a top-level
     // function by `collectFns` (keeping its name). Construct its closure value.
@@ -28494,6 +28521,14 @@ function emitShiftMaskFold(
   srConst(src[3] << j, w)
   fbI32Bin(srOpcode("&", w))
   0
+}
+
+// `emitBinExprNode` holding its arithmetic region's classifier answers for the whole walk (D2445).
+function emitBinExprInRegion(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
+  const opened = bcSpineEnter(exprIx, fnIx)
+  const rc = emitBinExprNode(body, e, exprIx, fnIx)
+  bcSpineLeave(opened)
+  rc
 }
 
 function emitBinExprNode(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {

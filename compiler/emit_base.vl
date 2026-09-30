@@ -2027,6 +2027,86 @@ export function strToCps(s: string) {
   for cp in s { out.push(cp) }
   out
 }
+
+// A lexeme at least this long decodes piece by piece in `litUtf8`.
+export const LIT_PIECE = 1048576
+
+// Appends the UTF-8 bytes lexeme `lex` denotes, `cpsToUtf8(decodeStr(strToCps(lex)))`, to `out`
+// as parts of its own and returns their count, decoding pieces of about `LIT_PIECE` code points so
+// no `i32[]` outgrows its size cap (D1977). A piece ends only where no escape is open: before an
+// escape's backslash, or 16 code points past the last one where the previous is not whitespace.
+export function litUtf8(lex: string, out: { b: u8[] }[]): i32 {
+  const first = out.length
+  out.push({ b: [] }) // this literal's first part, so no byte lands in an earlier one
+  let piece: i32[] = []
+  let lastBs = -1
+  let prevBs = false
+  let run = 0
+  for cp in lex {
+    if run == 1 && cp == 10 {
+      run = 2
+      piece.push(cp)
+    } else if run > 0 && (cp == 32 || cp == 9) {
+      // A line continuation's indentation, which `decodeStr` drops: left out of the piece, so
+      // a run of any length cannot keep a piece from ending.
+      run = 2
+    } else {
+      run = 0
+      const n = piece.length
+      const opens = cp == 92 && !prevBs
+      if n >= LIT_PIECE && litPieceEnds(piece, lastBs, opens) {
+        piece.push(34) // the closing delimiter `decodeStr` strips
+        litPieceFlush(piece, out)
+        piece = [34]
+        lastBs = -1
+      }
+      if prevBs && (cp == 10 || cp == 13) { run = litRunAfter(cp) }
+      if opens { lastBs = piece.length }
+      prevBs = opens
+      piece.push(cp)
+    }
+  }
+  litPieceFlush(piece, out)
+  let n = 0
+  let k = first
+  while k < out.length {
+    n = n + out[k].b.length
+    k = k + 1
+  }
+  n
+}
+
+// The continuation state after an escape's newline `cp`: 1 when a `\r` may still take one
+// `\n`, else 2, inside the indentation run.
+function litRunAfter(cp: i32): i32 {
+  if cp == 13 { return 1 }
+  2
+}
+
+// Whether a piece may end before a code point that `opens` an escape or not, given the index
+// of the piece's last escape-opening backslash (-1 for none).
+function litPieceEnds(piece: i32[], lastBs: i32, opens: boolean): boolean {
+  if opens || lastBs < 0 { return true }
+  const n = piece.length
+  if n - lastBs <= 16 { return false }
+  const p = piece[n - 1]
+  p != 32 && p != 9 && p != 10 && p != 13
+}
+
+// A literal's bytes are kept in parts of at most this many, so no one `u8[]` holds them all.
+const LIT_PART = 16777216
+
+// Decode one delimited piece and append the bytes it encodes to the parts `out`.
+function litPieceFlush(piece: i32[], out: { b: u8[] }[]) {
+  const bytes = cpsToUtf8(decodeStr(piece))
+  let i = 0
+  while i < bytes.length {
+    if out[out.length - 1].b.length >= LIT_PART { out.push({ b: [] }) }
+    out[out.length - 1].b.push(bytes[i])
+    i = i + 1
+  }
+  0
+}
 // UTF-8-encodes a code-point vector into the byte vector a Stage 2c string literal is built
 // from — the inverse of `strToCps` plus the decode `for cp in s` lowers to. A code point
 // outside [0, 0x10FFFF] or inside the UTF-16 surrogate range D800..DFFF has no UTF-8 encoding

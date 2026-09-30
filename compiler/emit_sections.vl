@@ -128,10 +128,12 @@ import {
 import { numLexFitsI32, numLexIsFloat } from "./emit_bignum"
 import { srcmapFileOfTok, srcmapPathOf } from "./srcmap"
 import {
+  LIT_PIECE,
   NEW_FIXED_MAX,
   appendAll,
   cpsToUtf8,
   decodeStr,
+  litUtf8,
   nulCloFlag,
   plCacheBust,
   quoteLex,
@@ -341,6 +343,10 @@ import {
   gPromoOk,
   gPromoSlot,
   gSharedMemPages,
+  gStrDataIx,
+  gStrDataLen,
+  gStrDataParts,
+  gStrDataStart,
   gStrPoolIx,
   gStrPoolTexts,
   genTyParamNames,
@@ -5239,12 +5245,16 @@ function emitNameSection(n: i32) {
 function collectStrPool() {
   gStrPoolTexts = []
   gStrPoolIx = Map()
+  gStrDataIx = Map()
+  gStrDataStart = []
+  gStrDataLen = []
+  gStrDataParts = []
   if !aUsed { return 0 }
   const isLexes: string[] = []
   let i = 0
   while i < P.nodes.length {
     const nd = P.nodes[i]
-    if nd is StrLit { strPoolAdd(nd.strText) }
+    if nd is StrLit { strLitCollect(nd.strText) }
     if nd is IsExpr && strPoolIsTest(nd) {
       const texts = tyLitMemberTexts(isVarTyIxOf(i))
       let k = 0
@@ -5276,10 +5286,78 @@ function strPoolIsTest(n: IsExpr): boolean {
 // Pools raw literal lexeme `lex` unless it is pooled already or past the `array.new_fixed` cap.
 function strPoolAdd(lex: string) {
   if (gStrPoolIx[lex] ?? -1) >= 0 { return 0 }
-  if cpsToUtf8(decodeStr(strToCps(lex))).length > NEW_FIXED_MAX { return 0 }
+  if (
+    lex.length >= LIT_PIECE
+    || cpsToUtf8(decodeStr(strToCps(lex))).length > NEW_FIXED_MAX
+  ) {
+    return 0
+  }
+  strPoolPut(lex)
+}
+
+// Pools a lexeme already known to be within the cap and not yet pooled.
+function strPoolPut(lex: string) {
   gStrPoolIx[lex] = gStrPoolTexts.length
   gStrPoolTexts.push(lex)
   0
+}
+
+// Files a literal's lexeme: pooled within the `array.new_fixed` cap, else a data segment, as is
+// every lexeme too long to decode whole, whatever it decodes to.
+function strLitCollect(lex: string) {
+  if (gStrPoolIx[lex] ?? -1) >= 0 || (gStrDataIx[lex] ?? -1) >= 0 { return 0 }
+  if lex.length < LIT_PIECE {
+    if cpsToUtf8(decodeStr(strToCps(lex))).length <= NEW_FIXED_MAX {
+      return strPoolPut(lex)
+    }
+  }
+  const start = gStrDataParts.length
+  const n = litUtf8(lex, gStrDataParts)
+  gStrDataIx[lex] = gStrDataLen.length
+  gStrDataStart.push(start)
+  gStrDataLen.push(n)
+  0
+}
+
+// Data count section (id 12): the segment count `array.new_data` validates against, ahead of
+// the code section; omitted with no data literal.
+function emitDataCountSection() {
+  if gStrDataLen.length == 0 { return 0 }
+  const dcPayload: u8[] = []
+  const dcPrev = wTarget(dcPayload)
+  wULEB(gStrDataLen.length)
+  wTarget(dcPrev)
+  wSection(12, dcPayload)
+}
+
+// Data section (id 11): one passive segment per data literal, its bytes framed uncopied.
+function emitDataSection() {
+  const nSeg = gStrDataLen.length
+  if nSeg == 0 { return 0 }
+  const rope: ByteRope = { chunks: [], len: 0, seekChunk: 0, seekBase: 0 }
+  const head: u8[] = []
+  const prev = wTarget(head)
+  wULEB(nSeg)
+  wTarget(prev)
+  ropePush(rope, head)
+  let k = 0
+  while k < nSeg {
+    const sh: u8[] = []
+    const sp = wTarget(sh)
+    wU8(1) // flags 0x01: passive
+    wULEB(gStrDataLen[k])
+    wTarget(sp)
+    ropePush(rope, sh)
+    let end = gStrDataParts.length
+    if k + 1 < nSeg { end = gStrDataStart[k + 1] }
+    let pi = gStrDataStart[k]
+    while pi < end {
+      ropePush(rope, gStrDataParts[pi].b)
+      pi = pi + 1
+    }
+    k = k + 1
+  }
+  wSectionRope(11, rope)
 }
 
 // Assembles the whole module: the header, then each section through its own emitter in
@@ -5583,7 +5661,9 @@ function emitModule(_stmts: i32[]) {
     }
   }
 
+  emitDataCountSection()
   if writeCodeSection(codePayload) < 0 { return -1 }
+  emitDataSection()
 
   // Custom "name" section LAST (after the code section, where it conventionally
   // lives). A no-op unless `gEmitNames` is set, so the default emit path is

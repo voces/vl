@@ -1,25 +1,23 @@
-// A MODULE LARGER THAN 8 MiB BUILDS, AND A FUNCTION BODY PAST THE ENGINE'S LIMIT IS REFUSED
-// BY THE ENGINE, NOT BY A COMPILER TRAP (D1976 — the output-side twin of D1975).
+// A MODULE LARGER THAN 8 MiB BUILDS, AND A LITERAL THAT USED TO MAKE A BODY PAST THE ENGINE'S
+// LIMIT RUNS (D1976 — the output-side twin of D1975 — and D2092).
 //
 // The compile store runs under the null collector, whose largest single allocation is
 // 64 MiB. The emitter used to hold its output as `i32[]`, one slot per byte, so `.push`'s
 // growth to 2^24 slots trapped with `allocation size too large` as soon as the module — or
 // one function body — passed 2^23 bytes. Bytes are now packed `u8[]`, each code entry is a
 // buffer of its own, and the module is a rope of those buffers that the host reads out
-// chunk by chunk (`rbyteStore`).
+// chunk by chunk (`rbyteStore`). A literal past the pool's cap is a passive data segment.
 //
-//   * THE MODULE: two functions each returning a distinct 1.6M-character literal — a 9.6 MB
-//     module. It must build, and then RUN under V8, which is what proves the rope was read
-//     out whole and in order: a chunk lost, doubled or reordered breaks the framing or the
-//     printed length.
-//   * ONE BODY: D1976's witness, a single 2.85M-character literal, makes an 8.55 MB body.
-//     Past 8 MiB it used to trap in its own buffer; now it reaches wasmtime, whose limit is
-//     7,654,321 bytes a body, and `vl build` reports the invalid-module banner naming it.
+//   * THE MODULE: two functions each returning a distinct 4.5M-character literal — a 9 MB
+//     module, nearly all of it the data section. It must build, and then RUN under V8, which
+//     is what proves the rope was read out whole and in order: a chunk lost, doubled or
+//     reordered breaks the framing or the printed length.
+//   * ONE BODY: D1976's witness, a single 2.85M-character literal, made an 8.55 MB body that
+//     trapped in its own buffer and then met wasmtime's 7,654,321-byte limit. It is a data
+//     segment now: the body is a few instructions and the module runs.
 //
 // The big functions live in an IMPORTED module so the entry stays small, and with it the
-// host's choice of collector: the trap is the null collector's. Neither module is run under
-// wasmtime, where compiling a literal this size costs minutes and tens of GB; V8's lazy
-// tiers take well under a second.
+// host's choice of collector: the trap was the null collector's. The modules run under V8.
 //
 // GATING: env-gated (`SELFHOST_NATIVE_ALIGN=1`) + needs the built binary + seed.
 //
@@ -68,12 +66,12 @@ const show = (r: Res): string =>
   `rc ${r.code}\nstdout: ${r.out.slice(0, 400)}\nstderr: ${r.err.slice(0, 2000)}`;
 
 Deno.test({
-  name: "vl-large-output: a 9.6 MB module builds and runs whole under V8 (D1976's repro)",
+  name: "vl-large-output: a 9 MB module builds and runs whole under V8 (D1976's repro)",
   ignore: !ENABLED,
   fn: async () => {
     await withDir(async (dir) => {
       const prog = `${dir}/main.vl`;
-      const n = 1_600_000;
+      const n = 4_500_000;
       await Deno.writeTextFile(
         `${dir}/m.vl`,
         `export function f0(): string { "${"a".repeat(n)}" }\n` +
@@ -96,17 +94,23 @@ Deno.test({
 });
 
 Deno.test({
-  name: "vl-large-output: a body past 8 MiB reaches the engine's body limit instead of trapping the compiler",
+  name: "vl-large-output: a literal that made a body past the engine's limit is a data segment and runs",
   ignore: !ENABLED,
   fn: async () => {
     await withDir(async (dir) => {
       const prog = `${dir}/main.vl`;
-      await Deno.writeTextFile(`${dir}/m.vl`, `export function f0(): string { "${"a".repeat(2_850_000)}" }\n`);
+      const n = 2_850_000;
+      await Deno.writeTextFile(`${dir}/m.vl`, `export function f0(): string { "${"a".repeat(n)}" }\n`);
       await Deno.writeTextFile(prog, `import { f0 } from "./m"\nprint(f0().length)\n`);
-      const r = await vl(["build", prog, "-o", `${dir}/body.wasm`]);
+      const out = `${dir}/body.wasm`;
+      const r = await vl(["build", prog, "-o", out]);
       const text = r.out + r.err;
-      if (r.code !== 70 || !text.includes(BODY_LIMIT_MSG) || text.includes("allocation size too large")) {
-        throw new Error(`vl build main.vl: want exit 70 naming the engine's body limit, got ${show(r)}`);
+      if (r.code !== 0 || text.includes(BODY_LIMIT_MSG) || text.includes("allocation size too large")) {
+        throw new Error(`vl build main.vl: want rc 0 with no body limit and no trap, got ${show(r)}`);
+      }
+      const { logs } = await runWasm(await Deno.readFile(out));
+      if (logs.join("\n") !== String(n)) {
+        throw new Error(`running body.wasm under V8: want ${n}, got ${JSON.stringify(logs)}`);
       }
     });
   },
