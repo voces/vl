@@ -8858,7 +8858,10 @@ parenthesised — is re-typed only by:
   other uses choose);
 * a store of another literal `let` (whole or in an operand), solved jointly by a worklist; one
   read in an integer intrinsic's operand (`b = divU(a, 2)`) bounds `b` from below and is never
-  widened by it, since an operand chooses nothing. The answer does not depend on the order the bindings are
+  widened by it, since an operand chooses nothing, while one in a float intrinsic's operand
+  (`y = abs(x)`) is solved as a copy is: a float binding falls below `f64` only through an
+  `f32` destination, which the target's answer can pass on but never widen, and the intrinsic's
+  own first-pass `f64` bounds nothing (D3387). The answer does not depend on the order the bindings are
   declared in (D3343, plumb PL-079): the stores settle first, each binding offering only the
   narrowest type its own rows need, and only then does a store's target bound the binding
   stored into it — so `r9 = r10 * 2` widens `r9` to `r10`'s `i64`, never caps `r10` at a
