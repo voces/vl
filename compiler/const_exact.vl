@@ -5,8 +5,8 @@
 
 // One constant value. `cxErr` non-empty: the expression is a check error saying so. `cxNo`: not
 // a constant this fold computes, left to the ordinary check. `cxPat`: a radix literal, or a
-// negation, bitwise operator or shift over one, which reads as a bit pattern of its
-// destination's width as the literal does. `cxDen` is `[1]` for an integer.
+// negation, bitwise operator or shift over one, a bit pattern of its use's width; arithmetic
+// over one is computed at that width, so it is not folded. `cxDen` is `[1]` for an integer.
 export type Cex = {
   cxErr: string,
   cxNo: boolean,
@@ -517,7 +517,7 @@ export function cexNeg(a: Cex): Cex {
 
 export function cexAdd(a: Cex, b: Cex, sub: boolean): Cex {
   if cexBad(a, b) { return cexPass(a, b) }
-  if cexAmbiguous(a) || cexAmbiguous(b) { return cexAmbiguousErr(a, b) }
+  if a.cxPat || b.cxPat { return cexNotConst() }
   let bneg = b.cxNeg
   if sub { bneg = !bneg }
   if a.cxFloat || b.cxFloat {
@@ -540,7 +540,7 @@ export function cexAdd(a: Cex, b: Cex, sub: boolean): Cex {
 
 export function cexMul(a: Cex, b: Cex): Cex {
   if cexBad(a, b) { return cexPass(a, b) }
-  if cexAmbiguous(a) || cexAmbiguous(b) { return cexAmbiguousErr(a, b) }
+  if a.cxPat || b.cxPat { return cexNotConst() }
   const neg = a.cxNeg != b.cxNeg
   if a.cxFloat || b.cxFloat {
     return cexFrac(neg, cxmMul(a.cxNum, b.cxNum), cxmMul(a.cxDen, b.cxDen))
@@ -551,7 +551,7 @@ export function cexMul(a: Cex, b: Cex): Cex {
 // Integer division truncates; a float division by zero is left to IEEE at run time.
 export function cexDiv(a: Cex, b: Cex): Cex {
   if cexBad(a, b) { return cexPass(a, b) }
-  if cexAmbiguous(a) || cexAmbiguous(b) { return cexAmbiguousErr(a, b) }
+  if a.cxPat || b.cxPat { return cexNotConst() }
   const neg = a.cxNeg != b.cxNeg
   if a.cxFloat || b.cxFloat {
     if cxmIsZero(b.cxNum) { return cexNotConst() }
@@ -566,7 +566,7 @@ export function cexDiv(a: Cex, b: Cex): Cex {
 // The remainder takes the dividend's sign, as a truncating division leaves it.
 export function cexRem(a: Cex, b: Cex): Cex {
   if cexBad(a, b) { return cexPass(a, b) }
-  if cexAmbiguous(a) || cexAmbiguous(b) { return cexAmbiguousErr(a, b) }
+  if a.cxPat || b.cxPat { return cexNotConst() }
   if a.cxFloat || b.cxFloat {
     if cxmIsZero(b.cxNum) { return cexNotConst() }
     const q = cxmDivmod(cxmMul(a.cxNum, b.cxDen), cxmMul(a.cxDen, b.cxNum))[0]
@@ -634,8 +634,9 @@ export function cexBitwise(a: Cex, b: Cex, op: string): Cex {
 export function cexNot(a: Cex): Cex {
   if !cexOk(a) { return a }
   if a.cxFloat || cexAmbiguous(a) { return cexNotConst() }
+  // `-a - 1`, computed on the number the pattern holds.
   const r = cexAdd(
-    cexNeg(a),
+    cexMake(false, false, !a.cxNeg, a.cxNum, a.cxDen),
     cexMake(false, false, false, cxmOne(), cxmOne()),
     true,
   )
@@ -665,7 +666,11 @@ export function cexShift(a: Cex, b: Cex, op: string): Cex {
           + "-bit exact integer range",
       )
     }
-    return cexInt(a.cxNeg, cxmShl(a.cxNum, k), a.cxPat)
+    const sh = cxmShl(a.cxNum, k)
+    // A pattern shifted past 32 bits is a different bit pattern at each width, so it is left to
+    // the width of its use.
+    if a.cxPat && cxmBitLen(sh) > 32 { return cexNotConst() }
+    return cexInt(a.cxNeg, sh, a.cxPat)
   }
   if a.cxNeg && op == ">>>" { return cexNotConst() }
   if op == ">>" && cexAmbiguous(a) { return cexNotConst() }
@@ -676,36 +681,11 @@ export function cexShift(a: Cex, b: Cex, op: string): Cex {
 }
 
 // Whether `v` is a pattern whose top bit is set at its own width, 32 or 64 bits: a negative number
-// at that width and a positive one at a wider, so arithmetic on it depends on where it is read.
+// at that width and a positive one at a wider, so `>>` and `~` over it depend on where it is read.
 function cexAmbiguous(v: Cex): boolean {
   if v.cxFloat || !v.cxPat || v.cxNeg { return false }
   const b = cxmBitLen(v.cxNum)
   b == 32 || b == 64
-}
-
-// The refusal for arithmetic over the ambiguous pattern among `a` and `b`, naming both readings.
-function cexAmbiguousErr(a: Cex, b: Cex): Cex {
-  let v = a
-  if !cexAmbiguous(a) { v = b }
-  const bits = cxmBitLen(v.cxNum)
-  let w = "i32"
-  if bits == 64 { w = "i64" }
-  const hex = cxmToHex(v.cxNum)
-  const low = cxmSub(cxmShl(cxmOne(), bits), v.cxNum)
-  cexError(
-    hex
-      + " is both the bit pattern -"
-      + cxmToDec(low)
-      + " at "
-      + w
-      + " and the number "
-      + cxmToDec(v.cxNum)
-      + "; write the decimal you mean, or `"
-      + hex
-      + " as% "
-      + w
-      + "`",
-  )
 }
 
 // ── reading a value back ────────────────────────────────────────────────────

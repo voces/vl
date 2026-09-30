@@ -10,7 +10,9 @@ print, argument, return, field, list element, shift count) x spelling (a `const 
 written in place). Each cell's expected output comes from Python's exact integers and fractions
 through the ruling's rules, a refusal included; the cell must print it, or be refused where the
 rule refuses. `--before` runs an older compiler too and splits the cells that moved into those
-whose old output was the exact value (a loss) and those whose old output was wrapped. Exits
+whose old output was the exact value (a loss) and those whose old output was wrapped; a cell of
+arithmetic over a radix pattern, which the ruling leaves at its use's width, must print exactly
+what the --before compiler prints. Exits
 non-zero on any cell that disagrees with its rule, or any loss.
 """
 import os, sys, subprocess, struct, json, tempfile
@@ -42,13 +44,17 @@ INITS = [
     ("shl63", "", "1 << 63", 2**63, False, False),
     ("shl64", "", "1 << 64", 2**64, False, False),
     ("hshl31", "", "0x1 << 31", 2**31, True, False),
-    ("hshl63", "", "0x1 << 63", 2**63, True, False),
+    ("hshl63", "", "0x1 << 63", None, False, False),  # a pattern shifted past 32 bits: at width
     ("negmin", "", "-(-2147483648)", 2**31, False, False),
     ("minint", "", "-2147483647 - 1", -2**31, False, False),
     ("minlong", "", "-9223372036854775807 - 1", -2**63, False, False),
-    # Arithmetic on a pattern whose top bit is set at its own width reads two ways; refused.
+    # Arithmetic over a radix pattern is the pattern at the use's width (owner, 2026-09-30):
+    # not folded, so each cell must print what the --before compiler prints.
     ("hexsum", "", "0xFFFFFFFF + 1", None, False, False),
     ("hexdiv", "", "0x80000000 / 2", None, False, False),
+    ("hexrem", "", "0xFFFFFFFF % 7", None, False, False),
+    ("hexwrap", "", "0x7FFFFFFF + 1", None, False, False),
+    ("hexshl", "", "0xFFFFFFFF << 4", None, False, False),
     ("hexor", "", "0xFFFF0000 | 0xFF", 0xFFFF00FF, True, False),
     ("hexneg3", "", "-(-(-0xFFFFFFFF))", -0xFFFFFFFF, True, False),
     ("notff", "", "~0xFF", -256, True, False),
@@ -111,9 +117,10 @@ def fmt_f(x):
     if r.endswith(".0"): return r[:-2]
     return r
 ERR = "ERR"
+AT_WIDTH = "AT_WIDTH"  # a radix-pattern arithmetic cell: graded against --before
 
 def expect(use, v, pat, isf):
-    if v is None: return ERR
+    if v is None: return AT_WIDTH
     if isf:
         whole = v.denominator == 1
         if use in ("i32", "arg32", "union"):
@@ -202,18 +209,28 @@ for name, prelude, expr, v, pat, isf in INITS:
 with ThreadPoolExecutor(max_workers=JOBS) as ex:
     got = list(ex.map(lambda c: run(SEED, c[1]), cells))
 bad = 0
-for (cid, _, want), g in zip(cells, got):
-    if g != want:
-        bad += 1
-        print("WRONG " + cid + ": rule wants " + repr(want) + ", got " + repr(g))
-print(str(len(cells)) + " cells: as the rule says " + str(len(cells) - bad) + ", disagree " + str(bad))
-
-losses = 0
+old = []
 if BEFORE:
     with ThreadPoolExecutor(max_workers=JOBS) as ex:
         old = list(ex.map(lambda c: run(BEFORE, c[1]), cells))
+width_cells = 0
+for i, ((cid, _, want), g) in enumerate(zip(cells, got)):
+    if want == AT_WIDTH:
+        width_cells += 1
+        if not old:
+            continue
+        want = old[i]
+    if g != want:
+        bad += 1
+        print("WRONG " + cid + ": rule wants " + repr(want) + ", got " + repr(g))
+graded = len(cells) - (0 if old else width_cells)
+print(str(graded) + " cells: as the rule says " + str(graded - bad) + ", disagree " + str(bad)
+      + " (" + str(width_cells) + " radix-arithmetic cells graded against --before"
+      + ("" if old else ", skipped: no --before") + ")")
+
+losses = 0
+if BEFORE:
     moved_wrap = 0
-    ambiguous = 0
     now_refused = 0
     for (cid, _, want), g, o in zip(cells, got, old):
         if o == g or o == ERR or o.startswith("FAIL"):
@@ -221,7 +238,6 @@ if BEFORE:
         name, use, _face = cid.split(".")
         v = [i for i in INITS if i[0] == name][0][3]
         if v is None:
-            ambiguous += 1
             continue
         if use == "shift":
             exact = str(wrap(1 << v, 64)) if isinstance(v, int) and 0 <= v < 64 else None
@@ -240,5 +256,5 @@ if BEFORE:
                 now_refused += 1
     print("moved from a wrapped or step-rounded value: " + str(moved_wrap)
           + " (" + str(now_refused) + " now refused, " + str(moved_wrap - now_refused) + " now exact)"
-          + "; refused as a two-reading pattern: " + str(ambiguous) + "; lost: " + str(losses))
+          + "; lost: " + str(losses))
 sys.exit(1 if bad or losses else 0)

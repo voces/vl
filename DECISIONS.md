@@ -9019,20 +9019,17 @@ tree read stays an editor reference.
 
 **Where VL keeps its own rules.**
 
-* **A radix literal is a bit pattern** ("Types & semantics" above), so a negation, bitwise
-  operator or shift whose operand is one stays a pattern, and fits a width by its digits as the
-  literal does: `0xFFFF0000 | 0xFF` is `-65281` at `i32` and 4294902015 at `i64`, and
-  `0xFF << 24` is `0xFF000000`. A result built from decimal literals is a number:
-  `1 << 31` at `i32` is refused where Go refuses `int32(1 << 31)` too; write `0x1 << 31` or
-  `-2147483647 - 1` for the pattern or the value. Arithmetic (`+ - * / %`) gives a number.
-* **A pattern whose top bit is set at its own width (32 or 64 bits) reads two ways** — a
-  negative number at that width, a positive one at a wider — so what it computes depends on
-  where it is used. Arithmetic on one is refused naming both readings (`0x80000000 is both the
-  bit pattern -2147483648 at i32 and the number 2147483648; write the decimal you mean, or
-  0x80000000 as% i32`): Go would compute the number, master computed at the use's width, and
-  the choice is the owner's. `>>` and `~` over one are not folded, so they keep computing at
-  the use's width (`0xFFFFFFFF >> 4` is `-1` at `i32` and 268435455 at `i64`; `~0xFFFFFFFF` is
-  `0` and -4294967296). `>>>`, `&`, `|`, `^` and `<<` read the same at every width, and fold.
+* **A radix literal is the bit pattern at its use's width under every operator (owner,
+  2026-09-30, ruling A on radix arithmetic).** `0x80000000 / 2` at `i32` is -1073741824 and
+  `0xFFFFFFFF % 7` at `i32` is -1, as on master and in Java and wasm; an unsigned reading is
+  spelled `divU`, `remU`, `ltU` or `>>>`. The width is the use's, which the fold cannot see, so a
+  tree whose value depends on it is not folded and computes where it is used, as before:
+  arithmetic (`+ - * / %`) over a pattern, `>>` and `~` over a pattern whose top bit is set at
+  its own width (32 or 64 bits), and a pattern shifted past 32 bits. What reads the same at
+  every width folds, and stays a pattern that fits a width by its digits: a negation, `&`, `|`,
+  `^`, `>>>`, and `<<` within 32 bits (`0xFFFF0000 | 0xFF` is -65281 at `i32` and 4294902015 at
+  `i64`; `0xFF << 24` is `0xFF000000`). A decimal literal is a number: `1 << 31` at `i32` is
+  refused as Go refuses `int32(1 << 31)`; `0x1 << 31` is the pattern.
 * **A float division by zero, and a float constant past the largest double, are not folded.**
   VL has no spelling for infinity or NaN, so `1.0 / 0.0` and `1e308 * 10.0` stay the IEEE
   computation they were; Go refuses both.
@@ -9051,17 +9048,17 @@ tree read stays an editor reference.
   since the body alone cannot see the width (D2712, D3426); an `f32` pin is still open (D3429).
 
 **Programs whose behaviour changed.** Every one computed a constant that wrapped, or a float
-constant rounded step by step, and now has the exact value or a loud refusal, or did arithmetic
-on a two-reading pattern and is now refused. One more kind is not a wrap: an operation over
+constant rounded step by step, and now has the exact value or a loud refusal. One more kind is not a wrap: an operation over
 float literals under an `f32` operation (`y * (0.5 * 3.0 + y)`), which #3324 read as an `f64`
 widening the operation above it, is now its constant, an `f32` literal beside `y`, so the
 operation stays at `f32` (`tests/cases/arith/float-literal-operation-nested-f32.vl`). The
 exact-constant grid
-(`scripts/capability-probes/const-exact-grid.py`, 33 initialisers x 15 uses x 2 spellings =
-990 cells, expected values from Python's exact integers and fractions) grades 990 of 990 as the
-rule says; against master `afb0ecc08`, 208 cells moved from a wrapped or step-rounded value (99
-now refused, as `K` at `i32` for `K = 2147483647 + 1`, and 109 now exact), 56 are refused as
-arithmetic on a two-reading pattern, and no cell that printed the exact value on master changed.
+(`scripts/capability-probes/const-exact-grid.py`, 36 initialisers x 15 uses x 2 spellings =
+1,080 cells, expected values from Python's exact integers and fractions, and for the 180 cells
+of radix-pattern arithmetic master's own output) grades 1,080 of 1,080 as the rule says; against
+master `028dedb33`, 207 cells moved from a wrapped or step-rounded value (98 now refused, as `K`
+at `i32` for `K = 2147483647 + 1`, and 109 now exact), and no cell that printed the exact value
+on master changed.
 The literal-binding grid (594 cells) still grades every cell as its rule program does; against
 master `5e277ab52`, 172 of its cells moved from master's wrapped value to the exact one (a literal `const` read into `b * 1000000000`).
 Fixtures that pinned a wrap were rewritten, each listed in the PR. Every module initialiser that
