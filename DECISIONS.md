@@ -9066,11 +9066,12 @@ is a constant tree is folded before the module is checked — a `let` and an ann
 well as a literal `const` — so each is checked as the bare spelling of its value would be (a
 `let` holding one is a literal `let`; an annotation on one is as redundant as on its literal).
 
-**Cost, against master `afb0ecc08`.** The fold is one walk per arithmetic operator, stopping at
+**Cost, against master `028dedb33`.** The fold is one walk per arithmetic operator, stopping at
 its first leaf that is no constant, with the operators a nested walk found to be none
 remembered: the plumb-shape units +0.22% / +0.23% guest fuel, a generated plumb chunk
-(`chunk_0`) −0.45% (its constant trees reach the emitter as literals), the L2 self-compile
-+0.9%, the seed +34 KB (+0.9%). plumb's 428 units check with byte-identical diagnostics; their
+(`chunk_0`) +0.20% (most of its constants are arithmetic over a hex base, which the radix
+ruling leaves at its width, so the walk is paid without the saving), the L2 self-compile
++0.8%, the seed +33 KB (+0.8%). plumb's 428 units check with byte-identical diagnostics; their
 builds differ only as constants folded earlier (identical after binaryen's constant folding, or
 after `-O2`, but for three `x86.vl` records whose initialisers became constant expressions). A
 chain of `const`s whose exact value grows each step pays for the
