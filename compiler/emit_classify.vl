@@ -2993,6 +2993,13 @@ export function letIsNulString(letIx: i32, fnIx: i32) {
   if d is LetDecl {
     if d.letType >= 0 {
       if retNulStringFlag(d.letType) == 1 { return true }
+      // A generic instance's binding carries the re-check's type, which can drop a null its
+      // `if` still yields at the pin; the cell holds what the join builds (D3290).
+      if d.letInit >= 0 && fnInPinnedInstance(fnIx) {
+        if P.nodes[unwrapParen(d.letInit)] is IfStmt {
+          return exprNullableString(d.letInit, fnIx)
+        }
+      }
     }
     if d.letType < 0 {
       // An un-annotated `const x = if c then "hi" else null` infers `string | null`, a niche
@@ -3025,6 +3032,13 @@ export function exprNullableString(exprIx: i32, fnIx: i32) {
   }
   const e = P.nodes[unwrapParen(exprIx)]
   if e is AsExpr { return nodeTyIsNulString(unwrapParen(exprIx)) }
+  // A string join any link of which can yield `null` is the `(ref null)` block `emitIfExprRef`
+  // builds, as a generic's `a ?? d` joined with a `K | null` pin is (D3281).
+  if e is IfStmt {
+    if e.ifElse < 0 { return false }
+    if !ifChainYieldsNull(unwrapParen(exprIx), fnIx) { return false }
+    return ifExprRefKind(unwrapParen(exprIx), fnIx) == "str"
+  }
   if e is Call {
     const callee = P.nodes[e.callFn]
     if callee is Ident {
@@ -15003,6 +15017,38 @@ function nulIfArmNullableValueIx(exprIx: i32) {
     }
   }
   -1
+}
+
+// True if the `if` link at `ifIx` can yield `null`: its recorded join is nullable, it has no
+// else, or one of its own arms is a bare `null`. A chain's blocktype is nullable from the first
+// such link inward, so a link typed `null` alone still matches its enclosing frame (D2227).
+// In a hole instance the join's recorded type is the hole's variable, read at its pin (D3016).
+export function ifLinkYieldsNull(ifIx: i32, fnIx: i32) {
+  if nodeTyIsNullable(ifIx) { return true }
+  if tyBearsNull(holeOperandTyOf(ifIx, fnIx)) { return true }
+  const s = P.nodes[unwrapParen(ifIx)]
+  if s is IfStmt {
+    if s.ifElse < 0 { return true }
+    if exprIsNullLike(ifArmValueExpr(s.ifThen)) { return true }
+    if P.nodes[s.ifElse] is Block {
+      return exprIsNullLike(ifArmValueExpr(s.ifElse))
+    }
+  }
+  false
+}
+
+// True if any link along the `else if` chain at `ifIx` can yield `null` (`ifLinkYieldsNull`).
+function ifChainYieldsNull(ifIx: i32, fnIx: i32): boolean {
+  let cur = ifIx
+  while cur >= 0 {
+    if ifLinkYieldsNull(cur, fnIx) { return true }
+    const s = P.nodes[unwrapParen(cur)]
+    cur = -1
+    if s is IfStmt {
+      if s.ifElse >= 0 && P.nodes[s.ifElse] is IfStmt { cur = s.ifElse }
+    }
+  }
+  false
 }
 
 // True if the expression at `exprIx` is the bare `null` literal, grouping parens peeled.
@@ -28441,6 +28487,11 @@ export function exprIsLitAtom(exprIx: i32, fnIx: i32) {
     // types `string` and widens at the string-join seam, so it does not classify here.
     if e.ifElse < 0 { return false }
     if ifJoinTypedAtom(unwrapParen(exprIx)) { return true }
+    // A join `emitIfExpr` lowers as a union box is the box, whatever its arms are alone: a
+    // generic's `a ?? 5` pinned at a literal union joins to `K | i32` (D3281).
+    if exprUnion(exprIx, fnIx) && ifJoinUnionName(unwrapParen(exprIx)) != "" {
+      return false
+    }
     const tv = ifArmValueExpr(e.ifThen)
     if tv >= 0 {
       if exprIsLitAtom(tv, fnIx) {
