@@ -67,6 +67,7 @@ import {
   nodeTyCarry,
   nodeTyIsFunc,
   nodeTyIsNullable,
+  nodeTyIsNullableStruct,
   nodeTyIsStringPrim,
   nodeTyIsUnionish,
   nodeTyIxOf,
@@ -293,6 +294,7 @@ import {
   rlElemName,
   rlElemTyIx,
   sNames,
+  sTyIx,
   uVariants,
   unNames,
 } from "./emit_state"
@@ -1128,6 +1130,15 @@ function monoArgPinName(ix: i32, fnIx: i32) {
   w
 }
 
+// Whether struct row `si` declares field `prop` nullable. A clone's `q.next` is recorded against
+// the template's gradual `q`, so only the struct row knows the field is nullable (D3301).
+function monoFieldDeclNullable(si: i32, prop: string): boolean {
+  if si < 0 || si >= sTyIx.length { return false }
+  const ft = tyFieldTyOf(sTyIx[si], prop)
+  if ft < 0 || ft >= T.tys.length { return false }
+  T.tys[ft] is TyNullable
+}
+
 // The initializer of the local an if-expression's then arm yields, when that local is declared
 // in the arm's own prelude and the join's recorded type is still a type parameter, or -1.
 function monoArmTailLocalInit(ix: i32): i32 {
@@ -1459,11 +1470,24 @@ export function monoArgTyName(ix: i32, fnIx: i32) {
   // `structIndexOfExpr(o.inner)` would default to i32, the locals table being unbuilt.
   if argN is Member {
     const recvTy = monoArgTyName(argN.memObj, fnIx)
-    const rsi = structIndexByName(recvTy)
+    let rsi = structIndexByName(recvTy)
+    // A nullable receiver is read only where it is narrowed, so its record is the base's.
+    if rsi < 0 && nullablePartOf(recvTy) != "" {
+      rsi = structIndexByName(nullablePartOf(recvTy))
+    }
     if rsi >= 0 {
       const fi = sFieldIndex(rsi, argN.memProp)
       if fi >= 0 && sFieldTypeAt(rsi, fi) == FC_STRUCT {
         const fnm = sFieldElemNameAt(rsi, fi)
+        // A nullable record field shares code 15 with a bare one; its pin keeps the `| null`
+        // the field declares, or the instance's parameter is non-null and the call casts (D3301).
+        if (
+          isSName(fnm)
+          && (nodeTyIsNullableStruct(cax)
+            || monoFieldDeclNullable(rsi, argN.memProp))
+        ) {
+          return monoAnnPinName(fnm + "|null")
+        }
         if isSName(fnm) { return fnm }
       }
     }
