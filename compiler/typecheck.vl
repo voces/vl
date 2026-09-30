@@ -17156,6 +17156,8 @@ function recordRedundantAnnot(
       if bin.objFields.length == 0 { return 0 }
     }
   }
+  // A call of a function that took this annotation as its result is typed by it, not redundant.
+  if n.letInit >= 0 && recAdAdoptedCall(n.letInit) { return 0 }
   if n.letKw == "const" && n.letInit >= 0 {
     const lin = P.nodes[n.letInit]
     if lin is StrLit { return 0 }
@@ -17602,6 +17604,13 @@ function tErrPush(
     di = di + 1
   }
   numLitNoteQueue(msg, at, T.diags.length)
+  if recAdOrigDecl.length > 0 && !recAdRaising {
+    if recAdWholeErr(at) {
+      msg = msg + recAdNoteFor(at)
+    } else {
+      recAdLoose = recAdLoose + 1
+    }
+  }
   T.diags.push(
     {
       tmsg: msg,
@@ -20665,6 +20674,12 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
       }
       if objShapeAdapterlessAt(srcExpr, srcTy, dstTy) {
         objShapeAdapterlessErr(srcExpr, srcTy, dstTy)
+      } else if srcTy != dstTy {
+        let recDst = dstTy
+        if dstTy == lwStoreDst && lwStoreVal >= 0 { recDst = lwStoreVal }
+        recPend(srcExpr, srcTy, recDst, srcExpr)
+      } else if T.tys[srcTy] is TyObj || T.tys[srcTy] is TyArray {
+        recOwnPend(srcExpr, srcTy)
       }
     }
     return true
@@ -30259,6 +30274,10 @@ function ufcsRecvPinSeam(callIx: i32, recvTy: i32, selfTy: i32, at: i32) {
     }
     if objShapeAdapterlessAt(rx, recvTy, selfTy) {
       objShapeAdapterlessErr(at, recvTy, selfTy)
+    } else if recvTy != selfTy {
+      recPend(rx, recvTy, selfTy, at)
+    } else {
+      recOwnPend(rx, recvTy)
     }
   }
   0
@@ -32172,6 +32191,7 @@ function rcwPendJoinOperand(op: i32, j: i32) {
   if t < 0 || t == j || tyEq(t, j) { return 0 }
   if !assignable(t, j) { return 0 }
   rcwPend(p, t, j)
+  recJoinCheck(p, t, j)
 }
 
 // The join leaves already refused by `listJoinWidenCheck`, so a leaf of two nested joins is
@@ -32779,6 +32799,10 @@ let shapeAdaptNulCopy = false
 let shapeAdaptNestedCopy = false
 let shapeAdaptMapShared = false
 let shapeAdaptRecField = false
+// Set beside a claimed record pair that stores a field differently (`recWidenWalk`), with the
+// first such field's name.
+let shapeAdaptRecStorage = false
+let shapeAdaptRecStorageField = ""
 
 // Claim `src` -> `dst` as the refused list pair, the way `objShapeAdapterless` claims one.
 function listWidenClaim(x: i32, src: i32, dst: i32): boolean {
@@ -32788,6 +32812,1655 @@ function listWidenClaim(x: i32, src: i32, dst: i32): boolean {
   shapeAdaptElemPair = true
   shapeAdaptWidthField = false
   true
+}
+
+// —— the record storage rule (DECISIONS.md "Record covariance: only a fresh value widens") ——
+// A record is shared, never rebuilt, so only a fresh one (an object literal, or a binding or
+// function holding only one) may be delivered where a record of its field names stores a field
+// differently; it is built there. Any other record is refused at the delivery.
+
+// How deep a field's storage is compared before the rule stops asking.
+const REC_STORE_DEPTH = 8
+
+// Where a delivered record comes from: an object or list literal it names through un-annotated
+// bindings that hold only that literal, or itself. -1 stays -1.
+function recOriginExpr(expr: i32): i32 {
+  if expr < 0 { return -1 }
+  let x = cwPeelValue(expr)
+  let hops = 0
+  while hops < 16 {
+    if x < 0 || x >= P.nodes.length { return -1 }
+    const e = P.nodes[x]
+    if e is Ident {
+      const init = recHeldLit(x)
+      if init < 0 { return x }
+      x = cwPeelValue(init)
+      hops = hops + 1
+      continue
+    }
+    const pass = recPassThroughArg(x)
+    if pass >= 0 {
+      x = cwPeelValue(pass)
+      hops = hops + 1
+      continue
+    }
+    return x
+  }
+  x
+}
+
+// The argument a call hands straight back: a generic function whose declared result is a bare
+// type parameter `T` that exactly one parameter is declared as. -1 for any other call.
+function recPassThroughArg(x: i32): i32 {
+  const c = P.nodes[x]
+  if c is Call {
+    const cn = P.nodes[c.callFn]
+    if cn is Ident {
+      const fd = recFnDeclByName(cn.identName)
+      if fd < 0 { return -1 }
+      const f = P.nodes[fd]
+      if f is FuncDecl {
+        if f.fnTyParams.length == 0 || f.fnRet < 0 { return -1 }
+        const rt = P.nodes[f.fnRet]
+        if rt is TypeRef {
+          if !strListHas(f.fnTyParams, rt.tyName) { return -1 }
+          let at = -1
+          let i = 0
+          while i < f.fnParams.length {
+            const pn = P.nodes[f.fnParams[i]]
+            if pn is Param {
+              if pn.parType >= 0 {
+                const pt = P.nodes[pn.parType]
+                if pt is TypeRef {
+                  if pt.tyName == rt.tyName {
+                    if at >= 0 { return -1 }
+                    at = i
+                  }
+                }
+              }
+            }
+            i = i + 1
+          }
+          if at >= 0 && at < c.callArgs.length { return c.callArgs[at] }
+        }
+      }
+    }
+  }
+  -1
+}
+
+// The declaration of the un-annotated `let` or `const` the read `x` names, when it holds only
+// its initializer (a `let` is assigned nothing but object literals), else -1.
+// Resolved from the occurrence index, so a walk after the check, out of scope, answers alike.
+function recHeldDecl(x: i32): i32 {
+  const e = P.nodes[x]
+  if e is Ident {
+    const d = recBindDeclOf(x, e.identName)
+    if d < 0 { return -1 }
+    const dn = P.nodes[d]
+    if dn is LetDecl {
+      if dn.letType >= 0 || dn.letInit < 0 { return -1 }
+      if dn.letKw == "const" { return d }
+      if recBindReassigned(e.identName, covarRootFrame(x)) { return -1 }
+      return d
+    }
+  }
+  -1
+}
+
+// The initializer of `recHeldDecl`'s declaration, or -1.
+function recHeldLit(x: i32): i32 {
+  const d = recHeldDecl(x)
+  if d < 0 { return -1 }
+  const dn = P.nodes[d]
+  if dn is LetDecl { return dn.letInit }
+  -1
+}
+
+// The `let`/`const` declaration of `name` the read `x` resolves to in its frame: the latest one
+// declared before it, else the first after it (a function reading a later global). -1 for none.
+function recBindDeclOf(x: i32, name: string): i32 {
+  cwIxBuild()
+  const fr = covarRootFrame(x)
+  let before = -1
+  let after = -1
+  let ixA = cwIxFrHead(name, fr)
+  let ixU = cwIxUnkHead(name, fr)
+  while ixA >= 0 || ixU >= 0 {
+    let r = ixA
+    if ixU > ixA {
+      r = ixU
+      ixU = cwIxPNext[ixU]
+    } else {
+      ixA = cwIxFrNext(ixA, fr)
+    }
+    if cwIxKind[r] == CW_OCC_BIND {
+      const b = cwIxNode[r]
+      if b < x {
+        if b > before { before = b }
+      } else if after < 0 || b < after {
+        after = b
+      }
+    }
+  }
+  let d = before
+  if d < 0 { d = after }
+  if d < 0 || !(P.nodes[d] is LetDecl) { return -1 }
+  if recLoopShadows(x, name, d) { return -1 }
+  d
+}
+
+// Does a `for` loop binding `name` enclose the read `x` without enclosing the declaration `d`?
+// Its binder is not in the occurrence index, and it shadows `d` inside the loop.
+function recLoopShadows(x: i32, name: string, d: i32): boolean {
+  let at = x
+  let steps = 0
+  while at >= 0 && at < cwIxParent.length && steps < 256 {
+    const n = P.nodes[at]
+    if recLoopBinds(n, name) { return !recEncloses(at, d) }
+    at = cwIxParent[at]
+    steps = steps + 1
+  }
+  false
+}
+
+// Does the node `n` bind `name` as a `for` loop's variable?
+function recLoopBinds(n: Node, name: string): boolean {
+  recForInBinds(n, name) || recForRangeBinds(n, name)
+}
+
+// Does `n` bind `name` as a `for … in` loop's variable?
+function recForInBinds(n: Node, name: string): boolean {
+  if n is ForIn { return n.fiVar == name || n.fiVar2 == name }
+  false
+}
+
+// Does `n` bind `name` as a range loop's variable?
+function recForRangeBinds(n: Node, name: string): boolean {
+  if n is ForRange { return n.frVar == name }
+  false
+}
+
+// Is `outer` an ancestor of `inner`?
+function recEncloses(outer: i32, inner: i32): boolean {
+  let at = inner
+  let steps = 0
+  while at >= 0 && at < cwIxParent.length && steps < 256 {
+    if at == outer { return true }
+    at = cwIxParent[at]
+    steps = steps + 1
+  }
+  false
+}
+
+// The record storage rule at a join operand: `op`, a `t`, joined into `j`.
+function recJoinCheck(op: i32, t: i32, j: i32) {
+  if !tyHoldsObj(t, 8) || !tyHoldsObj(j, 8) { return 0 }
+  if !recWidenWalk(-1, t, j, 12) { return 0 }
+  shapeAdaptRecStorage = false
+  shapeAdaptSrcTy = -1
+  shapeAdaptDstTy = -1
+  shapeAdaptSrcExpr = -1
+  if recWidenWalk(op, t, j, 12) { objShapeAdapterlessErr(op, t, j) }
+  shapeAdaptRecStorage = false
+  0
+}
+
+// Is the binding (`nm`, `fr`) the target of a whole assignment of anything but an object literal,
+// so it may hold a value other than a literal?
+function recBindReassigned(nm: string, fr: i32): boolean {
+  if nm == "" { return true }
+  cwIxBuild()
+  let ixA = cwIxFrHead(nm, fr)
+  let ixU = cwIxUnkHead(nm, fr)
+  while ixA >= 0 || ixU >= 0 {
+    let r = ixA
+    if ixU > ixA {
+      r = ixU
+      ixU = cwIxPNext[ixU]
+    } else {
+      ixA = cwIxFrNext(ixA, fr)
+    }
+    if cwIxKind[r] == CW_OCC_ASG && !recAsgStoresLit(cwIxNode[r]) {
+      return true
+    }
+  }
+  false
+}
+
+// How deep `recAsgStoresLit` has followed stores into bindings that are themselves stored into.
+let recAsgDepth = 0
+
+// Does the whole assignment at `a` store an object literal, written there or held by a binding?
+function recAsgStoresLit(a: i32): boolean {
+  if a < 0 || a >= P.nodes.length || recAsgDepth > 4 { return false }
+  const n = P.nodes[a]
+  if n is BinExpr {
+    recAsgDepth = recAsgDepth + 1
+    const o = recOriginExpr(n.binRight)
+    recAsgDepth = recAsgDepth - 1
+    return o >= 0 && P.nodes[o] is ObjLit
+  }
+  false
+}
+
+// The walk: through `| null`, unions, list elements, map entries and function types to each
+// record pair, judging every literal's parts by their own expressions.
+function recWidenWalk(expr: i32, src: i32, dst: i32, depth: i32): boolean {
+  if src < 0 || dst < 0 || depth <= 0 { return false }
+  if src >= T.tys.length || dst >= T.tys.length { return false }
+  if src == dst { return false }
+  if tyReachesHole(src, 8) || tyReachesHole(dst, 8) { return false }
+  const x = recOriginExpr(expr)
+  // A value `if`, `match` or block delivers each of its tails, each judged by its own origin.
+  if x >= 0 && recIsJoin(x) {
+    const leaves: i32[] = []
+    tailValueLeaves(x, leaves)
+    let li = 0
+    while li < leaves.length {
+      if recWidenWalk(leaves[li], nodeTyIxOf(leaves[li]), dst, depth - 1) {
+        return true
+      }
+      li = li + 1
+    }
+    return false
+  }
+  // A `Map()` or `Set()` is built at the type it flows into, as the container rule has it; a
+  // call of a function with no declared result delivers what that function returns.
+  if x >= 0 {
+    if exprIsCollCtorCall(x) { return false }
+    const fd = recInferredFnOf(x)
+    if fd >= 0 {
+      const rl = recFnValueLeaves(fd)
+      let ri = 0
+      while ri < rl.length {
+        // A local the function also hands elsewhere is shared, so it is judged by its type.
+        const lx = if recLeafEscapes(rl[ri]) { -1 } else { rl[ri] }
+        if recWidenWalk(lx, nodeTyIxOf(rl[ri]), dst, depth - 1) { return true }
+        ri = ri + 1
+      }
+      return false
+    }
+  }
+  // An element read is judged by where its container comes from, and a `??` by both operands.
+  if x >= 0 {
+    const ib = recIndexBase(x)
+    if ib >= 0 { return recElemWalk(ib, src, dst, depth - 1) }
+    const co = recCoalesceOperands(x)
+    if co.length == 2 {
+      return recWidenWalk(co[0], nodeTyIxOf(co[0]), dst, depth - 1)
+        || recWidenWalk(co[1], nodeTyIxOf(co[1]), dst, depth - 1)
+    }
+  }
+  const d = T.tys[dst]
+  const s = T.tys[src]
+  if d is TyNullable {
+    if s is TyNullable {
+      return recWidenWalk(-1, s.nInner, d.nInner, depth - 1)
+    }
+    return recWidenWalk(x, src, d.nInner, depth - 1)
+  }
+  // A `| null` source reaches a non-null place only through `??` or a narrowing: its record is
+  // the one delivered, from the same origin.
+  if s is TyNullable { return recWidenWalk(x, s.nInner, dst, depth - 1) }
+  if s is TyUnion {
+    let i = 0
+    while i < s.uMembers.length {
+      if recWidenWalk(-1, s.uMembers[i], dst, depth - 1) { return true }
+      i = i + 1
+    }
+    return false
+  }
+  if d is TyUnion {
+    // Delivered at a member that accepts it; refused only when every accepting member refuses.
+    let anyClean = false
+    let anyBad = false
+    let i = 0
+    while i < d.uMembers.length {
+      if assignable(src, d.uMembers[i]) {
+        if recWidenWalk(x, src, d.uMembers[i], depth - 1) {
+          anyBad = true
+        } else {
+          anyClean = true
+        }
+      }
+      i = i + 1
+    }
+    return anyBad && !anyClean
+  }
+  match s {
+    TyObj => {
+      return recWidenObj(x, s, src, dst, depth)
+    }
+    TyArray => {
+      return recWidenArray(x, s, dst, depth)
+    }
+    TyMap => {
+      const dm = T.tys[dst]
+      if dm is TyMap {
+        return recWidenWalk(-1, s.mKey, dm.mKey, depth - 1)
+          || recWidenWalk(-1, s.mVal, dm.mVal, depth - 1)
+      }
+      return false
+    }
+    TyFunc => {
+      return recWidenFunc(s, dst, depth)
+    }
+    // A leaf holds no record.
+    TyPrim | TyErr | TyVar | TyLit | TyNeg => {
+      return false
+    }
+  }
+}
+
+// The declaration of the function the call `x` names, when it declares no result and no type
+// parameter, so its result is built where the call delivers it; -1 otherwise.
+function recInferredFnOf(x: i32): i32 {
+  const c = P.nodes[x]
+  if c is Call {
+    const cn = P.nodes[c.callFn]
+    if cn is Ident {
+      let fd = recFnDeclByName(cn.identName)
+      if fd < 0 { fd = cwPeel(recHeldLit(c.callFn)) }
+      if fd >= 0 && fd < P.nodes.length {
+        const f = P.nodes[fd]
+        if f is FuncDecl {
+          if f.fnRet < 0 && f.fnTyParams.length == 0 { return fd }
+        }
+      }
+    }
+  }
+  -1
+}
+
+// The value expressions function `fd` returns, by `return` or as a tail value. A nested
+// function's returns are its own.
+function recFnValueLeaves(fd: i32): i32[] {
+  const out: i32[] = []
+  const f = P.nodes[fd]
+  if f is FuncDecl {
+    const leaves: i32[] = []
+    tailValueLeaves(f.fnBody, leaves)
+    const stack: i32[] = [f.fnBody]
+    while stack.length > 0 {
+      const ix = stack.pop() ?? -1
+      const rn = P.nodes[ix]
+      if rn is RetStmt {
+        if rn.retArg >= 0 { leaves.push(rn.retArg) }
+      }
+      if !(rn is FuncDecl) {
+        for c in nodeChildren(ix) {
+          if c >= 0 && c < P.nodes.length { stack.push(c) }
+        }
+      }
+    }
+    for lf in leaves {
+      if !isStmtNode(lf) { out.push(lf) }
+    }
+  }
+  out
+}
+
+// The deliveries this pass has queued for the record storage rule: the value, its type, the
+// type it is delivered as, and where a refusal is reported. Walked once the pass is over, when
+// the occurrence index is complete and built once.
+let recPendSrc: i32[] = []
+let recPendSrcTy: i32[] = []
+let recPendDstTy: i32[] = []
+let recPendAt: i32[] = []
+let recPendSeen: {[string]: boolean} = Map()
+
+// Queue one delivery, when both types hold a record.
+function recPend(srcExpr: i32, srcTy: i32, dstTy: i32, at: i32) {
+  if srcExpr < 0 || srcTy < 0 || dstTy < 0 || srcTy == dstTy { return 0 }
+  if !tyHoldsObj(srcTy, 8) || !tyHoldsObj(dstTy, 8) { return 0 }
+  const key = i32ToStr(srcExpr) + "#" + i32ToStr(dstTy)
+  if recPendSeen.has(key) { return 0 }
+  recPendSeen[key] = true
+  recPendSrc.push(srcExpr)
+  recPendSrcTy.push(srcTy)
+  recPendDstTy.push(dstTy)
+  recPendAt.push(at)
+  0
+}
+
+// Judge every queued delivery, and note the ones that adopt a binding or function.
+function recRunPending() {
+  let i = 0
+  while i < recPendSrc.length {
+    // The types alone first: a pair no existing value could be refused at needs no origin.
+    if recWidenWalk(-1, recPendSrcTy[i], recPendDstTy[i], 12) {
+      shapeAdaptRecStorage = false
+      shapeAdaptSrcTy = -1
+      shapeAdaptDstTy = -1
+      shapeAdaptSrcExpr = -1
+      lwStoreDst = -1
+      if recWidenWalk(recPendSrc[i], recPendSrcTy[i], recPendDstTy[i], 12) {
+        objShapeAdapterlessErr(recPendAt[i], recPendSrcTy[i], recPendDstTy[i])
+      }
+      shapeAdaptRecStorage = false
+      recAdoptNote(recPendSrc[i], recPendSrcTy[i], recPendDstTy[i])
+    } else {
+      recOwnPend(recPendSrc[i], recPendSrcTy[i])
+    }
+    i = i + 1
+  }
+  recKeptConflicts()
+  recPendSrc = []
+  recPendSrcTy = []
+  recPendDstTy = []
+  recPendAt = []
+  recPendSeen = Map()
+  recOwnSrc = []
+  recKeptDecl = []
+  recKeptDst = []
+  recKeptAt = []
+  0
+}
+
+// Deliveries of a binding, call or element at a record its own storage matches, kept to be
+// asked, once the pass is over, whether the value is also built elsewhere at another storage.
+let recOwnSrc: i32[] = []
+
+// Queue `srcExpr` (a `srcTy`) when it holds a record and could name a fresh binding or call.
+function recOwnPend(srcExpr: i32, srcTy: i32) {
+  if srcExpr < 0 || srcTy < 0 { return 0 }
+  if !tyHoldsObj(srcTy, 8) { return 0 }
+  const p = cwPeelValue(srcExpr)
+  if p < 0 || p >= P.nodes.length { return 0 }
+  const e = P.nodes[p]
+  if e is Ident || e is Call || e is Index { recOwnSrc.push(p) }
+  0
+}
+
+// Fresh bindings and functions not adopted (a function's result, or a numeric storage the
+// destination changes, D3339): each delivery the emitter builds at the destination's row.
+let recKeptDecl: i32[] = []
+let recKeptDst: i32[] = []
+let recKeptAt: i32[] = []
+
+// Refuse every own-storage delivery of a value a kept delivery builds at another storage: one
+// value cannot be stored both ways, and a record is shared, not copied.
+function recKeptConflicts() {
+  if recKeptDecl.length == 0 { return 0 }
+  // Two deliveries that build one kept binding at two storages.
+  let i = 0
+  while i < recKeptDecl.length {
+    let j = i + 1
+    while j < recKeptDecl.length {
+      if (
+        recKeptDecl[j] == recKeptDecl[i]
+        && P.nodes[recKeptDecl[i]] is LetDecl
+        && !fieldStorageEq(recKeptDst[i], recKeptDst[j], REC_STORE_DEPTH)
+      ) {
+        recAdRaising = true
+        tErr(
+          recKeptWhat(recKeptDecl[i])
+            + " is built as "
+            + tyToStr(recKeptDst[i])
+            + " where line "
+            + i32ToStr(nodeLineOf(recKeptAt[i]))
+            + " delivers it, and as "
+            + tyToStr(recKeptDst[j])
+            + " where line "
+            + i32ToStr(nodeLineOf(recKeptAt[j]))
+            + " does, which store a field differently; a record is shared, not copied. Annotate "
+            + "it with one of them, and copy it with an object literal for the other",
+          recKeptDecl[i],
+        )
+        recAdRaising = false
+        j = recKeptDecl.length
+      }
+      j = j + 1
+    }
+    i = i + 1
+  }
+  cwIxBuild()
+  for u in recOwnSrc {
+    const d = if recOwnIsPin(u) { -1 } else { recFreshOriginDecl(u, 6) }
+    if d >= 0 {
+      let k = recKeptDecl.length - 1
+      while k >= 0 && recKeptDecl[k] != d { k = k - 1 }
+      if k >= 0 {
+        recAdRaising = true
+        tErr(
+          recKeptWhat(d)
+            + " is built as "
+            + tyToStr(recKeptDst[k])
+            + " where line "
+            + i32ToStr(nodeLineOf(recKeptAt[k]))
+            + " delivers it, and it is handed on here at its own type, which stores a field "
+            + "differently; a record is shared, not copied, so one value cannot be both. "
+            + "Annotate it with one of the types, and copy it with an object literal for the "
+            + "other",
+          u,
+        )
+        recAdRaising = false
+      }
+    }
+  }
+  0
+}
+
+// Is `u` an argument to a parameter that takes its type from the argument: an un-annotated one,
+// or one of a generic function? Such a parameter is specialised at the value's own row.
+function recOwnIsPin(u: i32): boolean {
+  if u < 0 || u >= cwIxUp.length || cwIxUpKind[u] != CW_UP_ARG { return false }
+  const cn = P.nodes[cwIxUp[u]]
+  if cn is Call {
+    const f = P.nodes[cn.callFn]
+    if f is Ident {
+      const fd = recFnDeclByName(f.identName)
+      if fd < 0 { return true }
+      const fn = P.nodes[fd]
+      if fn is FuncDecl {
+        if fn.fnTyParams.length > 0 { return true }
+        return recNumParamAt(cwIxUp[u], cwIxUpAux[u]) >= 0
+      }
+    }
+  }
+  false
+}
+
+// How a refusal names the kept declaration `d`.
+function recKeptWhat(d: i32): string {
+  const n = P.nodes[d]
+  if n is LetDecl { return "`" + n.letName + "`, which holds only literals," }
+  "this value"
+}
+
+// The fresh binding or function that `x` reads, through un-annotated aliases, a call or an
+// element of a list literal binding; -1 for any other value.
+function recFreshOriginDecl(x: i32, depth: i32): i32 {
+  if depth <= 0 { return -1 }
+  const p = cwPeelValue(x)
+  if p < 0 || p >= P.nodes.length { return -1 }
+  const fd = recInferredFnOf(p)
+  if fd >= 0 { return fd }
+  const ib = recIndexBase(p)
+  if ib >= 0 { return recFreshOriginDecl(ib, depth - 1) }
+  const d = recHeldDecl(p)
+  if d < 0 { return -1 }
+  const init = cwPeel(recDeclInit(d))
+  if init < 0 || init >= P.nodes.length { return -1 }
+  const iv = P.nodes[init]
+  if iv is ObjLit || iv is ArrayLit { return d }
+  recFreshOriginDecl(init, depth - 1)
+}
+
+// Does `ty` hold a record anywhere: itself, a `| null`, a union member, a list element, a map
+// entry, or a function's parameter or result?
+function tyHoldsObj(ty: i32, depth: i32): boolean {
+  if ty < 0 || ty >= T.tys.length || depth <= 0 { return false }
+  const t = T.tys[ty]
+  match t {
+    TyObj => {
+      return true
+    }
+    TyNullable => {
+      return tyHoldsObj(t.nInner, depth - 1)
+    }
+    TyArray => {
+      return tyHoldsObj(t.aElem, depth - 1)
+    }
+    TyMap => {
+      return tyHoldsObj(t.mKey, depth - 1) || tyHoldsObj(t.mVal, depth - 1)
+    }
+    TyUnion => {
+      for m in t.uMembers {
+        if tyHoldsObj(m, depth - 1) { return true }
+      }
+      return false
+    }
+    TyFunc => {
+      if tyHoldsObj(t.fnRet, depth - 1) { return true }
+      for pt in t.fnParamTypes {
+        if tyHoldsObj(pt, depth - 1) { return true }
+      }
+      return false
+    }
+    // A leaf holds no record.
+    TyPrim | TyErr | TyVar | TyLit | TyNeg => {
+      return false
+    }
+  }
+}
+
+// The declaration of the function `name` names: the one in scope, else the only function of
+// that name anywhere (a walk after the pass is out of every function's scope). -1 otherwise.
+function recFnDeclByName(name: string): i32 {
+  const fd = lookupFnDeclNode(name)
+  if fd >= 0 { return fd }
+  cwIxBuild()
+  let found = -1
+  let r = cwIxChain(name)
+  while r >= 0 {
+    if cwIxKind[r] == CW_OCC_FDECL {
+      if found >= 0 && found != cwIxNode[r] { return -1 }
+      found = cwIxNode[r]
+    }
+    r = cwIxNext[r]
+  }
+  found
+}
+
+// `callResultIsInferred`, with the callee resolved by `recFnDeclByName`.
+function recCallResultInferred(ix: i32): boolean {
+  const e = P.nodes[ix]
+  if e is Call {
+    const cn = P.nodes[e.callFn]
+    if cn is Ident {
+      if cn.identName == "__array_new__" { return true }
+      const fd = recFnDeclByName(cn.identName)
+      if fd >= 0 {
+        const f = P.nodes[fd]
+        if f is FuncDecl {
+          if f.fnRet < 0 { return true }
+          if f.fnTyParams.length > 0 && fnDeclRetHasTyVar(fd) {
+            return !callPassesList(e)
+          }
+        }
+      }
+    }
+  }
+  false
+}
+
+// The container an element read `x` reads from, or -1 when `x` is no element read.
+function recIndexBase(x: i32): i32 {
+  const n = P.nodes[x]
+  if n is Index { return n.idxArr }
+  -1
+}
+
+// The two operands of `x` when it is a `??`, else none.
+function recCoalesceOperands(x: i32): i32[] {
+  const n = P.nodes[x]
+  if n is BinExpr {
+    if n.binOp == "??" { return [n.binLeft, n.binRight] }
+  }
+  []
+}
+
+// Is the returned value `lf` a binding that is also handed to another place (an argument, a
+// store, a list or object literal, another binding), so another handle shares it?
+function recLeafEscapes(lf: i32): boolean {
+  const p = cwPeelValue(lf)
+  if p < 0 || p >= P.nodes.length { return false }
+  const e = P.nodes[p]
+  if e is Ident {
+    const fr = covarRootFrame(p)
+    let r = cwIxFrHead(e.identName, fr)
+    while r >= 0 {
+      const u = cwIxNode[r]
+      if cwIxKind[r] == CW_OCC_USE && u != p && u < cwIxUpKind.length {
+        const k = cwIxUpKind[u]
+        if (
+          k == CW_UP_ARG
+          || k == CW_UP_ASG_RHS
+          || k == CW_UP_ELEM
+          || k == CW_UP_FIELD
+          || k == CW_UP_LETINIT
+          || k == CW_UP_SPREAD
+        ) {
+          return true
+        }
+      }
+      r = cwIxFrNext(r, fr)
+    }
+  }
+  false
+}
+
+// Is `x` a value `if`, `match` or block?
+function recIsJoin(x: i32): boolean {
+  const n = P.nodes[x]
+  n is IfStmt || n is MatchExpr || n is Block
+}
+
+// A function value: its result covariant, its parameters contravariant.
+function recWidenFunc(s: TyFunc, dst: i32, depth: i32): boolean {
+  const d = T.tys[dst]
+  if d is TyFunc {
+    if s.fnParamTypes.length != d.fnParamTypes.length { return false }
+    if recWidenWalk(-1, s.fnRet, d.fnRet, depth - 1) { return true }
+    let i = 0
+    while i < s.fnParamTypes.length {
+      if recWidenWalk(-1, d.fnParamTypes[i], s.fnParamTypes[i], depth - 1) {
+        return true
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// A record into a record. An object literal is built at the destination, so only its field
+// values are judged; any other record of the same field names is refused when a field's
+// storage differs. Other field-name pairs belong to the width rule.
+function recWidenObj(
+  x: i32,
+  s: TyObj,
+  src: i32,
+  dst: i32,
+  depth: i32,
+): boolean {
+  const d = T.tys[dst]
+  if d is TyObj {
+    let lit = -1
+    if x >= 0 {
+      const ol = P.nodes[x]
+      if ol is ObjLit { lit = x }
+    }
+    if lit >= 0 {
+      let i = 0
+      while i < d.objFieldNames.length {
+        const sf = objFieldType(s, d.objFieldNames[i])
+        if sf >= 0 {
+          const fx = objLitFieldExpr(lit, d.objFieldNames[i])
+          if recWidenWalk(fx, sf, d.objFieldTypes[i], depth - 1) { return true }
+        }
+        i = i + 1
+      }
+      return false
+    }
+    if !objFieldNameSetsEq(src, dst) { return false }
+    const bad = recStorageField(s, d)
+    if bad != "" {
+      shapeAdaptSrcTy = src
+      shapeAdaptDstTy = dst
+      shapeAdaptSrcExpr = x
+      shapeAdaptElemPair = false
+      shapeAdaptWidthField = false
+      shapeAdaptRecStorage = true
+      shapeAdaptRecStorageField = bad
+      return true
+    }
+  }
+  false
+}
+
+// A list into a list: a list literal's elements by their own expressions, a spread's and any
+// other list's by the element type.
+function recWidenArray(x: i32, s: TyArray, dst: i32, depth: i32): boolean {
+  const d = T.tys[dst]
+  if d is TyArray {
+    if x >= 0 {
+      const lit = P.nodes[x]
+      if lit is ArrayLit { return recWidenLitElems(lit, d.aElem, depth) }
+    }
+    return recWidenWalk(-1, s.aElem, d.aElem, depth - 1)
+  }
+  false
+}
+
+// Each element of the list literal `lit` delivered as a `de`: an element by its own expression,
+// a spread's by the element type.
+function recWidenLitElems(lit: ArrayLit, de: i32, depth: i32): boolean {
+  let i = 0
+  while i < lit.arrElems.length {
+    const ex = lit.arrElems[i]
+    const el = P.nodes[ex]
+    let et = nodeTyIxOf(ex)
+    let eo = ex
+    if el is Spread {
+      et = tyArrayElemIx(nodeTyIxOf(el.spdArg))
+      eo = -1
+    }
+    if recWidenWalk(eo, et, de, depth - 1) { return true }
+    i = i + 1
+  }
+  false
+}
+
+// An element `el` (a `src`) read out of the container `box`, delivered as a `dst`. A list
+// literal's elements are judged by their own expressions; a container built by inference (a
+// `Map()`, `Set()` or a call whose result is inferred) holds values built where they are
+// delivered; a join or another element read is followed; anything else is judged by type.
+function recElemWalk(box: i32, src: i32, dst: i32, depth: i32): boolean {
+  if depth <= 0 { return false }
+  const bx = recOriginExpr(box)
+  if bx >= 0 {
+    const b = P.nodes[bx]
+    if b is ArrayLit { return recWidenLitElems(b, dst, depth) }
+    if exprIsCollCtorCall(bx) || recCallResultInferred(bx) { return false }
+    if recIsJoin(bx) {
+      const leaves: i32[] = []
+      tailValueLeaves(bx, leaves)
+      for lf in leaves {
+        if recElemWalk(lf, src, dst, depth - 1) { return true }
+      }
+      return false
+    }
+    const co = recCoalesceOperands(bx)
+    if co.length == 2 {
+      return recElemWalk(co[0], src, dst, depth - 1)
+        || recElemWalk(co[1], src, dst, depth - 1)
+    }
+    const ib = recIndexBase(bx)
+    if ib >= 0 {
+      // A container read out of another: its elements are judged through the outer one.
+      const ob = recOriginExpr(ib)
+      if ob >= 0 {
+        if exprIsCollCtorCall(ob) || recCallResultInferred(ob) { return false }
+        const ol = P.nodes[ob]
+        if ol is ArrayLit {
+          for inner in ol.arrElems {
+            if (
+              !(P.nodes[inner] is Spread)
+              && recElemWalk(inner, src, dst, depth - 1)
+            ) {
+              return true
+            }
+          }
+          return false
+        }
+      }
+    }
+  }
+  recWidenWalk(-1, src, dst, depth - 1)
+}
+
+// The first field of `d` that `s` stores differently, or "".
+function recStorageField(s: TyObj, d: TyObj): string {
+  let i = 0
+  while i < d.objFieldNames.length {
+    const sf = objFieldType(s, d.objFieldNames[i])
+    if sf >= 0 && !fieldStorageEq(sf, d.objFieldTypes[i], REC_STORE_DEPTH) {
+      return d.objFieldNames[i]
+    }
+    i = i + 1
+  }
+  ""
+}
+
+// Do two field types share one storage? The same type does; a list and its `readonly` view do;
+// an integer literal type is stored as `i32`; two records do when every field does. What the
+// rule cannot see into (a hole, the depth bound) is taken as shared, so it never refuses.
+function fieldStorageEq(a: i32, b: i32, depth: i32): boolean {
+  if a == b { return true }
+  if a < 0 || b < 0 || a >= T.tys.length || b >= T.tys.length { return true }
+  if depth <= 0 { return true }
+  if tyReachesHole(a, 8) || tyReachesHole(b, 8) { return true }
+  if tyEq(a, b) { return true }
+  if intLitStored(a) && intLitStored(b) { return true }
+  const ta = T.tys[a]
+  match ta {
+    TyArray => {
+      const eb = tyArrayElemIx(b)
+      return eb >= 0 && fieldStorageEq(ta.aElem, eb, depth - 1)
+    }
+    TyNullable => {
+      const nb = recNulInner(b)
+      return nb >= 0 && fieldStorageEq(ta.nInner, nb, depth - 1)
+    }
+    TyMap => {
+      return recMapStorageEq(ta, b, depth)
+    }
+    TyObj => {
+      return recObjStorageEq(ta, a, b)
+    }
+    // Any other pair of types that are not one type is stored apart.
+    TyPrim | TyErr | TyFunc | TyUnion | TyVar | TyLit | TyNeg => {
+      return false
+    }
+  }
+}
+
+// The type under `ty`'s `| null`, or -1 when `ty` is not nullable.
+function recNulInner(ty: i32): i32 {
+  const t = T.tys[ty]
+  if t is TyNullable { return t.nInner }
+  -1
+}
+
+// Do the record `ta` (at `a`) and the type `b` share a storage: a record of the same field names
+// whose every field does?
+function recObjStorageEq(ta: TyObj, a: i32, b: i32): boolean {
+  const tb = T.tys[b]
+  if tb is TyObj {
+    return objFieldNameSetsEq(a, b) && recStorageField(ta, tb) == ""
+  }
+  false
+}
+
+// Do the map `ta` and the type `b` share a storage: a map whose keys and values do?
+function recMapStorageEq(ta: TyMap, b: i32, depth: i32): boolean {
+  const tb = T.tys[b]
+  if tb is TyMap {
+    return fieldStorageEq(ta.mKey, tb.mKey, depth - 1)
+      && fieldStorageEq(ta.mVal, tb.mVal, depth - 1)
+  }
+  false
+}
+
+// `recStorageField` of two records by index, or "" when either is not a record.
+function recStorageFieldOf(a: i32, b: i32): string {
+  const ta = T.tys[a]
+  const tb = T.tys[b]
+  if ta is TyObj {
+    if tb is TyObj { return recStorageField(ta, tb) }
+  }
+  ""
+}
+
+// Does the function declared at `fd` return an object literal written in its own body?
+function recHasLitLeaf(fd: i32): boolean {
+  for lf in recFnValueLeaves(fd) {
+    const o = recOriginExpr(lf)
+    if o >= 0 && P.nodes[o] is ObjLit { return true }
+  }
+  false
+}
+
+// Is `at` an argument of a generic function or a method, whose parameter the call pins?
+function recAtPinnedArg(at: i32): boolean {
+  cwIxBuild()
+  if at < 0 || at >= cwIxUp.length || cwIxUpKind[at] != CW_UP_ARG {
+    return false
+  }
+  const cn = P.nodes[cwIxUp[at]]
+  if cn is Call {
+    const f = P.nodes[cn.callFn]
+    if f is Ident {
+      const fd = recFnDeclByName(f.identName)
+      if fd < 0 { return true }
+      const fn = P.nodes[fd]
+      if fn is FuncDecl { return fn.fnTyParams.length > 0 }
+    }
+    return true
+  }
+  false
+}
+
+// A literal built inside a function, or handed through a generic call, is built at the row of a
+// declared record of its own field storage when one exists, not where the call delivers it; into
+// a record that stores a field differently it is refused as an existing record is (D3338). True
+// when it refused.
+function recBuiltAtDeclared(at: i32, srcTy: i32, dstTy: i32): boolean {
+  const own = nonNulTyOf(srcTy)
+  const dst = nonNulTyOf(dstTy)
+  if own < 0 || dst < 0 || !(T.tys[own] is TyObj) || !(T.tys[dst] is TyObj) {
+    return false
+  }
+  if recAtPinnedArg(at) { return false }
+  let found = false
+  for k in cUserTypes.keys() {
+    const ut = cUserTypes[k] ?? -1
+    if (
+      !found
+      && ut >= 0
+      && ut < T.tys.length
+      && nameIsBareIdent(demangleName(k))
+    ) {
+      if T.tys[ut] is TyObj && objFieldNameSetsEq(ut, own) {
+        if (
+          fieldStorageEq(own, ut, REC_STORE_DEPTH)
+          && !fieldStorageEq(ut, dst, REC_STORE_DEPTH)
+        ) {
+          found = true
+        }
+      }
+    }
+  }
+  if !found { return false }
+  shapeAdaptSrcTy = own
+  shapeAdaptDstTy = dst
+  shapeAdaptSrcExpr = at
+  shapeAdaptElemPair = false
+  shapeAdaptWidthField = false
+  shapeAdaptRecStorage = true
+  shapeAdaptRecStorageField = recStorageFieldOf(own, dst)
+  lwStoreDst = -1
+  objShapeAdapterlessErr(at, own, dst)
+  shapeAdaptRecStorage = false
+  true
+}
+
+// A record a function built, or an element of a list binding, delivered where a field it holds as
+// an integer is a bare float: the value is built at its own row and has no conversion, so it is
+// refused as an existing record is (D3339). True when it refused.
+function recFloatBuiltElsewhere(at: i32, srcTy: i32, dstTy: i32): boolean {
+  const own = nonNulTyOf(srcTy)
+  const dst = nonNulTyOf(dstTy)
+  if !recIntToFloat(own, dst, REC_STORE_DEPTH) { return false }
+  shapeAdaptSrcTy = own
+  shapeAdaptDstTy = dst
+  shapeAdaptSrcExpr = at
+  shapeAdaptElemPair = false
+  shapeAdaptWidthField = false
+  shapeAdaptRecStorage = true
+  shapeAdaptRecStorageField = recFloatField(own, dst)
+  lwStoreDst = -1
+  objShapeAdapterlessErr(at, own, dst)
+  shapeAdaptRecStorage = false
+  true
+}
+
+// Does the record `dst` store as a bare `f32` or `f64` a field the record `src` holds as an
+// integer, at any depth of records?
+function recIntToFloat(src: i32, dst: i32, depth: i32): boolean {
+  recFloatField(src, dst) != "" || recIntToFloatNested(src, dst, depth)
+}
+
+// The first field of `dst` that is a bare float where `src` holds an integer, or "".
+function recFloatField(src: i32, dst: i32): string {
+  if src < 0 || dst < 0 || src >= T.tys.length || dst >= T.tys.length {
+    return ""
+  }
+  const s = T.tys[src]
+  const d = T.tys[dst]
+  if s is TyObj {
+    if d is TyObj {
+      let i = 0
+      while i < d.objFieldNames.length {
+        const sf = objFieldType(s, d.objFieldNames[i])
+        const dc = recNumClass(d.objFieldTypes[i])
+        if (
+          sf >= 0
+          && recNumClass(sf) == "i32"
+          && !(T.tys[d.objFieldTypes[i]] is TyNullable)
+        ) {
+          if dc == "f64" || dc == "f32" { return d.objFieldNames[i] }
+        }
+        i = i + 1
+      }
+    }
+  }
+  ""
+}
+
+// `recIntToFloat` over the fields of `dst` that are records.
+function recIntToFloatNested(src: i32, dst: i32, depth: i32): boolean {
+  if (
+    depth <= 0
+    || src < 0
+    || dst < 0
+    || src >= T.tys.length
+    || dst >= T.tys.length
+  ) {
+    return false
+  }
+  const s = T.tys[src]
+  const d = T.tys[dst]
+  if s is TyObj {
+    if d is TyObj {
+      let i = 0
+      while i < d.objFieldNames.length {
+        const sf = objFieldType(s, d.objFieldNames[i])
+        if sf >= 0 && recIntToFloat(sf, d.objFieldTypes[i], depth - 1) {
+          return true
+        }
+        i = i + 1
+      }
+    }
+  }
+  false
+}
+
+// Does `dst` store some number `src` holds at another width or kind (`i32` into `i64` or `f64`),
+// through records, lists, maps and `| null`? Adopting such a destination would change what a read
+// of the source computes (D3339), so the record is not adopted.
+function recNumChanges(src: i32, dst: i32, depth: i32): boolean {
+  if (
+    src < 0
+    || dst < 0
+    || src >= T.tys.length
+    || dst >= T.tys.length
+    || depth <= 0
+  ) {
+    return false
+  }
+  const sc = recNumClass(src)
+  if sc != "" { return !recNumHolds(dst, sc) }
+  const s = T.tys[src]
+  match s {
+    TyObj => {
+      return recNumChangesFields(s, dst, depth)
+    }
+    TyArray => {
+      const de = tyArrayElemIx(nonNulTyOf(dst))
+      return de >= 0 && recNumChanges(s.aElem, de, depth - 1)
+    }
+    TyNullable => {
+      return recNumChanges(s.nInner, nonNulTyOf(dst), depth - 1)
+    }
+    TyMap => {
+      return recNumChangesMap(s, dst, depth)
+    }
+    // A leaf that is not a number, or a union, keeps whatever it holds.
+    TyPrim | TyErr | TyFunc | TyUnion | TyVar | TyLit | TyNeg => {
+      return false
+    }
+  }
+}
+
+// `recNumChanges` over each field the record `dst` shares with `s`.
+function recNumChangesFields(s: TyObj, dst: i32, depth: i32): boolean {
+  const d = T.tys[nonNulTyOf(dst)]
+  if d is TyObj {
+    let i = 0
+    while i < d.objFieldNames.length {
+      const sf = objFieldType(s, d.objFieldNames[i])
+      if sf >= 0 && recNumChanges(sf, d.objFieldTypes[i], depth - 1) {
+        return true
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// `recNumChanges` over a map's values.
+function recNumChangesMap(s: TyMap, dst: i32, depth: i32): boolean {
+  const d = T.tys[nonNulTyOf(dst)]
+  if d is TyMap { return recNumChanges(s.mVal, d.mVal, depth - 1) }
+  false
+}
+
+// The numeric storage `ty` has without its `| null`: "i32" (an integer literal type too),
+// "i64", "f32" or "f64", or "" for anything else.
+function recNumClass(ty: i32): string {
+  const b = nonNulTyOf(ty)
+  if b < 0 || b >= T.tys.length { return "" }
+  if intLitStored(b) { return "i32" }
+  const t = T.tys[b]
+  if t is TyPrim {
+    const n = t.primName
+    if n == "i64" || n == "f32" || n == "f64" { return n }
+  }
+  ""
+}
+
+// Does `dst`, or a member of it, store a number of class `c`?
+function recNumHolds(dst: i32, c: string): boolean {
+  if recNumClass(dst) == c { return true }
+  const b = nonNulTyOf(dst)
+  if b < 0 || b >= T.tys.length { return false }
+  const t = T.tys[b]
+  if t is TyUnion {
+    for m in t.uMembers {
+      if recNumClass(m) == c { return true }
+    }
+  }
+  false
+}
+
+// Is `ty` stored as a plain `i32`: `i32` itself, an integer literal type, or a union of them?
+function intLitStored(ty: i32): boolean {
+  const t = T.tys[ty]
+  match t {
+    TyPrim => {
+      return t.primName == "i32"
+    }
+    TyLit => {
+      return t.litKind == "int"
+    }
+    TyUnion => {
+      if t.uMembers.length < 1 { return false }
+      for m in t.uMembers {
+        if !recIsIntLit(m) { return false }
+      }
+      return true
+    }
+    // Any other type is stored as something other than one `i32`.
+    TyErr | TyObj | TyFunc | TyNullable | TyArray | TyMap | TyVar | TyNeg => {
+      return false
+    }
+  }
+}
+
+// Is `ty` an integer literal type?
+function recIsIntLit(ty: i32): boolean {
+  const t = T.tys[ty]
+  if t is TyLit { return t.litKind == "int" }
+  false
+}
+
+// —— adoption: a binding or function holding only literals takes the record it is delivered to ——
+// The destination is written as its annotation or result and the program checked again, so
+// every use sees it. A re-check that refuses anything but the adopted value handed on whole, or
+// reads a number at another width, undoes it (DECISIONS.md "Record covariance").
+
+// This pass's demands: the declaration, the record the binding (or its list's element) holds,
+// the record it is delivered as, whether it is a list's element, and the delivery.
+let recAdDecl: i32[] = []
+let recAdOwn: i32[] = []
+let recAdDst: i32[] = []
+let recAdElem: boolean[] = []
+let recAdAt: i32[] = []
+// The solve's answer: declarations to re-check with an annotation, and the refusals it owes.
+let recAdPinDecl: i32[] = []
+let recAdPinTy: string[] = []
+let recAdErrMsg: string[] = []
+let recAdErrAt: i32[] = []
+// Declarations whose adoption a re-check refused, and the nodes the pins replaced; both last
+// the whole program's check.
+let recAdNoAdopt: {[i32]: boolean} = Map()
+// The declarations an adoption currently rewrites, the types they are bound at in this pass,
+// and how many of this pass's refusals are about something other than an adopted value as a
+// whole: those are what a literal's own type served, so they undo the adoption.
+let recAdPinned: {[i32]: boolean} = Map()
+// Parallel to `recAdOrigDecl`: each rewritten declaration's name, whether it is a function, and
+// the type the adoption wrote.
+let recAdOrigName: string[] = []
+let recAdOrigFn: boolean[] = []
+let recAdOrigTy: string[] = []
+let recAdBound: i32[] = []
+let recAdLoose = 0
+let recAdRaising = false
+let recAdOrigDecl: i32[] = []
+let recAdOrigNode: Node[] = []
+
+// Drop one pass's demands; the pins and the refused set outlive it.
+function recAdPassReset() {
+  recAdBound = []
+  recAdLoose = 0
+  recAdDecl = []
+  recAdOwn = []
+  recAdDst = []
+  recAdElem = []
+  recAdAt = []
+  recAdPinDecl = []
+  recAdPinTy = []
+  recAdErrMsg = []
+  recAdErrAt = []
+  0
+}
+
+// Drop everything, before a program's first pass.
+function recAdReset() {
+  recAdPassReset()
+  recAdNoAdopt = Map()
+  recAdPinned = Map()
+  recAdOrigName = []
+  recAdOrigFn = []
+  recAdOrigTy = []
+  recAdOrigDecl = []
+  recAdOrigNode = []
+  0
+}
+
+// The declaration of the binding the read `at` names, when it holds only an object literal or
+// a list literal. -1 otherwise.
+function recFreshDeclOf(at: i32): i32 {
+  const init = recHeldLit(at)
+  if init < 0 { return -1 }
+  const iv = P.nodes[parenPeelIx(init)]
+  if iv is ObjLit || iv is ArrayLit { return recHeldDecl(at) }
+  -1
+}
+
+// The initializer of the declaration `d`, or -1.
+function recDeclInit(d: i32): i32 {
+  const n = P.nodes[d]
+  if n is LetDecl { return n.letInit }
+  -1
+}
+
+// Note a delivery of `srcExpr` (a `srcTy`) as a `dstTy`, when it hands a literal binding, or an
+// element of a literal list binding, to a record that stores a field differently.
+function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
+  if srcTy < 0 || dstTy < 0 || srcTy == dstTy { return 0 }
+  if !tyHoldsObj(srcTy, 8) || !tyHoldsObj(dstTy, 8) { return 0 }
+  const p = cwPeelValue(srcExpr)
+  if p < 0 || p >= P.nodes.length { return 0 }
+  const e = P.nodes[p]
+  if e is Ident {
+    const decl = recFreshDeclOf(p)
+    if decl < 0 { return 0 }
+    const iv = P.nodes[parenPeelIx(recDeclInit(decl))]
+    if iv is ArrayLit {
+      return recAdPushDecl(
+        decl,
+        tyArrayElemIx(srcTy),
+        tyArrayElemIx(nonNulTyOf(dstTy)),
+        true,
+        p,
+      )
+    }
+    return recAdPushDecl(decl, srcTy, nonNulTyOf(dstTy), false, p)
+  }
+  if e is Index {
+    const b = cwPeelValue(e.idxArr)
+    if b < 0 || b >= P.nodes.length { return 0 }
+    const bn = P.nodes[b]
+    if bn is Ident {
+      const decl = recFreshDeclOf(b)
+      if decl < 0 { return 0 }
+      const iv = P.nodes[parenPeelIx(recDeclInit(decl))]
+      if iv is ArrayLit {
+        if recFloatBuiltElsewhere(p, srcTy, dstTy) { return 0 }
+        return recAdPushDecl(decl, srcTy, nonNulTyOf(dstTy), true, p)
+      }
+    }
+  }
+  if e is Call {
+    const fd = recInferredFnOf(p)
+    if fd >= 0 {
+      if recFloatBuiltElsewhere(p, srcTy, dstTy) { return 0 }
+      if recHasLitLeaf(fd) && recBuiltAtDeclared(p, srcTy, dstTy) { return 0 }
+      return recAdPushDecl(fd, srcTy, nonNulTyOf(dstTy), false, p)
+    }
+    const pa = recPassThroughArg(p)
+    if pa >= 0 {
+      const po = recOriginExpr(pa)
+      if (
+        po >= 0
+        && P.nodes[po] is ObjLit
+        && recBuiltAtDeclared(p, srcTy, dstTy)
+      ) {
+        return 0
+      }
+    }
+  }
+  // A literal delivers each of its elements or fields to the matching part of the destination.
+  const d = nonNulTyOf(dstTy)
+  if d < 0 || d >= T.tys.length { return 0 }
+  if e is ArrayLit {
+    const de = tyArrayElemIx(d)
+    if de >= 0 {
+      for el in e.arrElems {
+        if !(P.nodes[el] is Spread) { recAdoptNote(el, nodeTyIxOf(el), de) }
+      }
+    }
+  } else if e is ObjLit {
+    recAdNoteFields(p, d)
+  }
+  0
+}
+
+// `recAdoptNote` for each field of the object literal `lit` delivered as the record `d`.
+function recAdNoteFields(lit: i32, d: i32) {
+  const dt = T.tys[d]
+  if dt is TyObj {
+    let i = 0
+    while i < dt.objFieldNames.length {
+      const fx = objLitFieldExpr(lit, dt.objFieldNames[i])
+      if fx >= 0 { recAdoptNote(fx, nodeTyIxOf(fx), dt.objFieldTypes[i]) }
+      i = i + 1
+    }
+  }
+  0
+}
+
+// Push one demand on the declaration `decl`: a binding, or a function with no declared result.
+function recAdPushDecl(decl: i32, own: i32, dst: i32, elem: boolean, at: i32) {
+  if own < 0 || dst < 0 || own >= T.tys.length || dst >= T.tys.length {
+    return 0
+  }
+  if !(T.tys[own] is TyObj) || !(T.tys[dst] is TyObj) { return 0 }
+  if tyReachesHole(own, 8) || tyReachesHole(dst, 8) { return 0 }
+  if !objFieldNameSetsEq(own, dst) { return 0 }
+  if fieldStorageEq(own, dst, REC_STORE_DEPTH) { return 0 }
+  if decl < 0 { return 0 }
+  if P.nodes[decl] is FuncDecl || recNumChanges(own, dst, REC_STORE_DEPTH) {
+    recKeptDecl.push(decl)
+    recKeptDst.push(dst)
+    recKeptAt.push(at)
+    return 0
+  }
+  if recAdNoAdopt.has(decl) { return 0 }
+  recAdDecl.push(decl)
+  recAdOwn.push(own)
+  recAdDst.push(dst)
+  recAdElem.push(elem)
+  recAdAt.push(at)
+  0
+}
+
+// Decide each binding's type: the one record every demand shares a storage with, or a refusal
+// naming two that disagree. A binding delivered both whole and by element takes one list type.
+function recAdSolve() {
+  let i = 0
+  while i < recAdDecl.length {
+    const decl = recAdDecl[i]
+    if !i32ListHas(recAdPinDecl, decl) && !recAdHasErr(decl) {
+      let bad = -1
+      let j = i + 1
+      while j < recAdDecl.length && bad < 0 {
+        if recAdDecl[j] == decl {
+          if !fieldStorageEq(recAdDst[i], recAdDst[j], REC_STORE_DEPTH) {
+            bad = j
+          }
+        }
+        j = j + 1
+      }
+      if bad >= 0 {
+        if P.nodes[decl] is LetDecl { recAdConflict(decl, i, bad) }
+      } else {
+        let ann = tyToStr(recAdDst[i])
+        if recAdElem[i] { ann = ann + "[]" }
+        recAdPinDecl.push(decl)
+        recAdPinTy.push(ann)
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// Has `decl` already a refusal this solve?
+function recAdHasErr(decl: i32): boolean {
+  let i = 0
+  while i < recAdErrAt.length {
+    if recAdErrAt[i] == decl { return true }
+    i = i + 1
+  }
+  false
+}
+
+// The refusal for a binding delivered as two records that store a field differently.
+function recAdConflict(decl: i32, a: i32, b: i32) {
+  const n = P.nodes[decl]
+  let nm = "this binding"
+  if n is LetDecl { nm = "`" + n.letName + "`" }
+  let what = nm
+  if recAdElem[a] { what = "the records in " + nm }
+  recAdErrMsg.push(
+    nm
+      + " holds only a literal, so it is built at the type it is delivered to, but it is "
+      + "delivered as "
+      + tyToStr(recAdDst[a])
+      + " (line "
+      + i32ToStr(nodeLineOf(recAdAt[a]))
+      + ") and as "
+      + tyToStr(recAdDst[b])
+      + " (line "
+      + i32ToStr(nodeLineOf(recAdAt[b]))
+      + "), which store a field differently, and a record is shared, not copied. Annotate "
+      + what
+      + " with one of them, and copy it with an object literal for the other",
+  )
+  recAdErrAt.push(decl)
+  0
+}
+
+// Write each adopted type as its declaration's annotation, keeping the node it replaces.
+function recAdApplyPins() {
+  let i = 0
+  while i < recAdPinDecl.length {
+    recAdPinLet(recAdPinDecl[i], recAdPinTy[i])
+    recAdPinFn(recAdPinDecl[i], recAdPinTy[i])
+    i = i + 1
+  }
+  0
+}
+
+// Remember the declaration `d` an adoption rewrites, with its name, kind and new type.
+function recAdKeep(d: i32, n: Node, name: string, isFn: boolean, ty: string) {
+  recAdOrigDecl.push(d)
+  recAdOrigNode.push(n)
+  recAdOrigName.push(name)
+  recAdOrigFn.push(isFn)
+  recAdOrigTy.push(ty)
+  0
+}
+
+// Write `ty` as the annotation of the binding declared at `d`, when it is one.
+function recAdPinLet(d: i32, ty: string) {
+  const n = P.nodes[d]
+  if n is LetDecl {
+    recAdKeep(d, n, n.letName, false, ty)
+    recAdPinned[d] = true
+    const ann = mkTypeRef(ty, n.pos)
+    P.nodes[d] = {
+      letKw: n.letKw,
+      letName: n.letName,
+      letType: ann,
+      letInit: n.letInit,
+      pos: n.pos,
+    }
+  }
+  0
+}
+
+// Write `ty` as the declared result of the function declared at `d`, when it is one.
+function recAdPinFn(d: i32, ty: string) {
+  const n = P.nodes[d]
+  if n is FuncDecl {
+    recAdKeep(d, n, n.fnName, true, ty)
+    const ann = mkTypeRef(ty, n.pos)
+    P.nodes[d] = {
+      fnName: n.fnName,
+      fnTyParams: n.fnTyParams,
+      fnParams: n.fnParams,
+      fnRet: ann,
+      fnBody: n.fnBody,
+      pos: n.pos,
+    }
+  }
+  0
+}
+
+// Restore every declaration an adoption rewrote since `mark`, and never adopt them again.
+function recAdUndo(mark: i32) {
+  while recAdOrigDecl.length > mark {
+    const d = recAdOrigDecl.pop() ?? -1
+    const n = recAdOrigNode.pop()
+    recAdOrigName.pop()
+    recAdOrigFn.pop()
+    recAdOrigTy.pop()
+    if d >= 0 && n != null {
+      P.nodes[d] = n
+      recAdNoAdopt[d] = true
+      recAdPinned[d] = false
+    }
+  }
+  0
+}
+
+// Is the refusal at `at` about an adopted value handed on whole: raised by this rule, or at a
+// node holding a record stored as an adopted binding's record is (or a list of them)?
+function recAdWholeErr(at: i32): boolean {
+  if recAdRaising { return true }
+  if at < 0 || at >= P.nodes.length { return false }
+  const t = recAdRecOf(nodeTyIxOf(at))
+  if t < 0 { return false }
+  let i = 0
+  while i < recAdBound.length {
+    const b = recAdRecOf(recAdBound[i])
+    if b >= 0 && fieldStorageEq(t, b, REC_STORE_DEPTH) { return true }
+    i = i + 1
+  }
+  const ts = tyToStr(t)
+  let k = 0
+  while k < recAdOrigTy.length {
+    if recAdOrigFn[k] && recAdOrigTy[k] == ts { return true }
+    k = k + 1
+  }
+  false
+}
+
+// The record `ty` is, or a list of, through `| null`; -1 for anything else.
+function recAdRecOf(ty: i32): i32 {
+  if ty < 0 || ty >= T.tys.length { return -1 }
+  const t = T.tys[ty]
+  match t {
+    TyNullable => {
+      return recAdRecOf(t.nInner)
+    }
+    TyArray => {
+      return recAdRecOf(t.aElem)
+    }
+    TyObj => {
+      return ty
+    }
+    // No other type is a record or a list of one.
+    TyPrim | TyErr | TyFunc | TyUnion | TyMap | TyVar | TyLit | TyNeg => {
+      return -1
+    }
+  }
+}
+
+// Does `x` read, within a few levels, a binding or call whose type an adoption wrote? An
+// annotation such a value meets is what adopted it, never redundant.
+function recAdAdoptedCall(x: i32): boolean {
+  if recAdOrigDecl.length == 0 { return false }
+  recAdMentions(x, 6)
+}
+
+// The note a refusal of an adopted value carries: which binding or function took which type.
+function recAdNoteFor(at: i32): string {
+  const t = recAdRecOf(nodeTyIxOf(at))
+  const want = if t >= 0 { tyToStr(t) } else { "" }
+  let pick = -1
+  let i = 0
+  while i < recAdOrigTy.length {
+    let base = recAdOrigTy[i]
+    while base.length > 2 && base.slice(base.length - 2, base.length) == "[]" {
+      base = base.slice(0, base.length - 2)
+    }
+    if pick < 0 || base == want { pick = i }
+    i = i + 1
+  }
+  if pick < 0 { return "" }
+  if recAdOrigFn[pick] {
+    return " (`"
+      + recAdOrigName[pick]
+      + "` returns only literals, so its result is built as the `"
+      + recAdOrigTy[pick]
+      + "` it is delivered to)"
+  }
+  " (`"
+    + recAdOrigName[pick]
+    + "` holds only a literal, so it is built as the `"
+    + recAdOrigTy[pick]
+    + "` it is delivered to; annotate it to keep its own type, and copy it for the other use)"
+}
+
+// Does an adopted declaration bind `name`? By name only: this decides a hint, not a type.
+function recAdIsAdoptedName(name: string): boolean {
+  strListHas(recAdOrigName, name)
+}
+
+function recAdMentions(x: i32, depth: i32): boolean {
+  if x < 0 || x >= P.nodes.length || depth <= 0 { return false }
+  const n = P.nodes[x]
+  if n is Ident { return recAdIsAdoptedName(n.identName) }
+  if n is Call {
+    const cn = P.nodes[n.callFn]
+    if cn is Ident {
+      if recAdIsAdoptedName(cn.identName) { return true }
+    }
+  }
+  if n is FuncDecl { return false }
+  for c in nodeChildren(x) {
+    if recAdMentions(c, depth - 1) { return true }
+  }
+  false
+}
+
+// Push the refusals the last solve owed.
+function recAdReport() {
+  recAdRaising = true
+  let i = 0
+  while i < recAdErrMsg.length {
+    tErr(recAdErrMsg[i], recAdErrAt[i])
+    i = i + 1
+  }
+  recAdRaising = false
+  0
 }
 
 // The readonly-only list rule (DECISIONS.md "No implicit container widening", D2161): a list
@@ -33867,9 +35540,13 @@ function readonlyFixOf(
   const nN = shapeAdaptNestedCopy
   const nM = shapeAdaptMapShared
   const nR = shapeAdaptRecField
+  const nS = shapeAdaptRecStorage
+  const nF = shapeAdaptRecStorageField
   const bad = covarWriteThrough(srcExpr, src, ro) != 0
     || objShapeAdapterlessAt(srcExpr, src, ro)
   shapeAdaptRecField = nR
+  shapeAdaptRecStorage = nS
+  shapeAdaptRecStorageField = nF
   shapeAdaptSrcTy = sS
   shapeAdaptDstTy = sD
   shapeAdaptSrcExpr = sX
@@ -33961,6 +35638,10 @@ function objShapeAdapterlessErr(srcExpr: i32, src: i32, dstIn: i32) {
       + " into "
       + tyToStr(dst)
       + ")"
+  }
+  if shapeAdaptRecStorage {
+    recStorageErr(srcExpr, sT, dT, sX, through)
+    return 0
   }
   // An object literal gets its own wording: "construct at the destination shape" is what
   // the author already did, but what actually happens is silent — dropping the excess
@@ -34106,6 +35787,64 @@ function objShapeAdapterlessErr(srcExpr: i32, src: i32, dstIn: i32) {
       srcExpr,
     )
   }
+}
+
+// The record storage rule's refusal: names the pair, the field stored differently, and both
+// fixes: build the source at the destination, or copy it with an object literal.
+function recStorageErr(at: i32, sT: i32, dT: i32, sX: i32, through: string) {
+  const fnm = shapeAdaptRecStorageField
+  let fieldNote = ""
+  const s = T.tys[sT]
+  const d = T.tys[dT]
+  if s is TyObj {
+    if d is TyObj {
+      const sf = objFieldType(s, fnm)
+      const df = objFieldType(d, fnm)
+      if sf >= 0 && df >= 0 {
+        fieldNote = " (`" + tyToStr(sf) + "` into `" + tyToStr(df) + "`)"
+      }
+    }
+  }
+  const root = covarRootName(sX)
+  let copy = "{ "
+  if d is TyObj {
+    let i = 0
+    while i < d.objFieldNames.length {
+      if i > 0 { copy = copy + ", " }
+      const fn = d.objFieldNames[i]
+      if root != "" {
+        copy = copy + fn + ": " + root + "." + fn
+      } else {
+        copy = copy + fn + ": …"
+      }
+      i = i + 1
+    }
+  }
+  copy = copy + " }"
+  recAdRaising = true
+  tErr(
+    tyToStr(sT)
+      + " is not "
+      + tyToStr(dT)
+      + through
+      + ": they store field `"
+      + fnm
+      + "` differently"
+      + fieldNote
+      + ", and a record is shared, not copied, so only a fresh record widens. A write through "
+      + "the "
+      + tyToStr(dT)
+      + " would break the "
+      + tyToStr(sT)
+      + ". Build the source as `"
+      + tyToStr(dT)
+      + "`, or copy it with a literal `"
+      + copy
+      + "`",
+    at,
+  )
+  recAdRaising = false
+  0
 }
 
 // Is the claimed pair's source (`shapeAdaptSrcExpr`, already peeled) an object literal?
@@ -35339,7 +37078,11 @@ function asgYieldsPlaceTy(rhs: i32, rt: i32, placeTy: i32): boolean {
   const nN = shapeAdaptNestedCopy
   const mS = shapeAdaptMapShared
   const rF = shapeAdaptRecField
+  const rS = shapeAdaptRecStorage
+  const rN = shapeAdaptRecStorageField
   const r = objShapeAdapterlessAt(-1, rt, placeTy)
+  shapeAdaptRecStorage = rS
+  shapeAdaptRecStorageField = rN
   shapeAdaptSrcTy = sT
   shapeAdaptDstTy = dT
   shapeAdaptSrcExpr = sX
@@ -50328,24 +52071,171 @@ function externGlobalSig(mut: i32, ty: string): string {
 export function checkProgram(rootIx: i32) {
   let passes = 1
   lbiReset()
+  recAdReset()
   checkProgramPass(rootIx)
   lbiSolve()
   lbiDropUnobservable()
-  while lbiPinCand.length > 0 && passes < LBI_MAX_PASSES {
+  recAdSolve()
+  while (
+    (lbiPinCand.length > 0 || recAdPinDecl.length > 0)
+    && passes < LBI_MAX_PASSES
+  ) {
     lbiApplyPins()
-    const genTok = jwGenTokStart
-    canonRestoreSpellings()
-    initChecker()
-    jwSetGenTokStart(genTok)
-    lbiReset()
-    checkProgramPass(rootIx)
-    lbiSolve()
-    lbiDropUnobservable()
+    const mark = recAdOrigDecl.length
+    recAdApplyPins()
+    if recAdOrigDecl.length > mark { recNumWatch(mark) }
+    checkProgramAgain(rootIx)
     passes = passes + 1
+    // A re-check that refuses anything other than an adopted value handed on whole, or reads a
+    // number at another width, undoes this pass's adoptions: those reads the literal's own type
+    // served, and served with the value the program means.
+    if recAdOrigDecl.length > mark && (recAdLoose > 0 || recNumMoved()) {
+      recAdUndo(mark)
+      checkProgramAgain(rootIx)
+    }
   }
   symFlushPending()
   lbiSymTypes()
   lbiReport()
+  recAdReport()
+}
+
+// The reads of the declarations an adoption rewrote since `mark`, a few levels up from each
+// use or call, with the numeric type each had before the re-check ("" for any other type).
+let recNumNodes: i32[] = []
+let recNumWas: string[] = []
+
+function recNumWatch(mark: i32) {
+  recNumNodes = []
+  recNumWas = []
+  cwIxBuild()
+  let i = mark
+  while i < recAdOrigDecl.length {
+    const d = recAdOrigDecl[i]
+    const nm = recAdOrigName[i]
+    if recAdOrigFn[i] {
+      let r = cwIxChain(nm)
+      while r >= 0 {
+        if cwIxKind[r] == CW_OCC_CALL { recNumWatchUp(cwIxNode[r]) }
+        r = cwIxNext[r]
+      }
+    } else {
+      recNumWatchName(nm, cwFrameOfDecl(d), 3)
+    }
+    i = i + 1
+  }
+  0
+}
+
+// Watch every use of the binding (`nm`, `fr`), and follow it into an un-annotated binding it
+// initializes and an un-annotated parameter it is passed to, whose reads change with it.
+function recNumWatchName(nm: string, fr: i32, depth: i32) {
+  if depth <= 0 { return 0 }
+  let r = cwIxFrHead(nm, fr)
+  while r >= 0 {
+    if cwIxKind[r] == CW_OCC_USE {
+      const u = cwIxNode[r]
+      recNumWatchUp(u)
+      recNumFollow(u, depth - 1)
+    }
+    r = cwIxFrNext(r, fr)
+  }
+  0
+}
+
+// Follow the use `u` into the un-annotated `let`/`const` it initializes or the un-annotated
+// parameter it is passed to.
+function recNumFollow(u: i32, depth: i32) {
+  if u < 0 || u >= cwIxUp.length { return 0 }
+  const at = cwIxUp[u]
+  const k = cwIxUpKind[u]
+  if k == CW_UP_LETINIT {
+    const n = P.nodes[at]
+    if n is LetDecl {
+      if n.letType < 0 { recNumWatchName(n.letName, cwFrameOfDecl(at), depth) }
+    }
+  } else if k == CW_UP_ARG {
+    const pix = recNumParamAt(at, cwIxUpAux[u])
+    if pix >= 0 {
+      const pn = P.nodes[pix]
+      if pn is Param { recNumWatchName(pn.parName, cwFrameOfDecl(pix), depth) }
+    }
+  }
+  0
+}
+
+// The un-annotated parameter at position `pos` of the function the call `c` names, or -1.
+function recNumParamAt(c: i32, pos: i32): i32 {
+  const cn = P.nodes[c]
+  if cn is Call {
+    const f = P.nodes[cn.callFn]
+    if f is Ident {
+      const fd = recFnDeclByName(f.identName)
+      if fd < 0 { return -1 }
+      const fn = P.nodes[fd]
+      if fn is FuncDecl {
+        if pos < 0 || pos >= fn.fnParams.length { return -1 }
+        const pn = P.nodes[fn.fnParams[pos]]
+        if pn is Param {
+          if pn.parType < 0 { return fn.fnParams[pos] }
+        }
+      }
+    }
+  }
+  -1
+}
+
+// Watch `u` and the nodes up to three levels above it.
+function recNumWatchUp(u: i32) {
+  let at = u
+  let k = 0
+  while k < 4 && at >= 0 && at < P.nodes.length {
+    recNumNodes.push(at)
+    recNumWas.push(recNumName(nodeTyIxOf(at)))
+    if at >= cwIxParent.length { return 0 }
+    at = cwIxParent[at]
+    k = k + 1
+  }
+  0
+}
+
+// `ty`'s name when it is a numeric primitive, else "".
+function recNumName(ty: i32): string {
+  if ty < 0 || ty >= T.tys.length { return "" }
+  const t = T.tys[ty]
+  if t is TyPrim {
+    const n = t.primName
+    if n == "i32" || n == "i64" || n == "f32" || n == "f64" { return n }
+  }
+  ""
+}
+
+// Does a watched read have another numeric type after the re-check than before it?
+function recNumMoved(): boolean {
+  let i = 0
+  while i < recNumNodes.length {
+    if recNumWas[i] != "" {
+      const now = recNumName(nodeTyIxOf(recNumNodes[i]))
+      if now != "" && now != recNumWas[i] { return true }
+    }
+    i = i + 1
+  }
+  false
+}
+
+// A fresh check of the program after a pass rewrote some declarations' annotations.
+function checkProgramAgain(rootIx: i32) {
+  const genTok = jwGenTokStart
+  canonRestoreSpellings()
+  initChecker()
+  jwSetGenTokStart(genTok)
+  lbiReset()
+  recAdPassReset()
+  checkProgramPass(rootIx)
+  lbiSolve()
+  lbiDropUnobservable()
+  recAdSolve()
+  0
 }
 
 // One walk of the program; `initChecker()` must have run first. Every module table this walk
@@ -50439,6 +52329,7 @@ function checkProgramPass(rootIx: i32) {
   recordTopScalars()
   checkShiftCounts()
   rcwRunPending()
+  recRunPending()
   checkProgramEndGetters()
   voidRetRewrite()
   numLitNotesApply()
@@ -56848,6 +58739,9 @@ function checkLetDeclNode(n: LetDecl, ix: i32) {
   // is called through the inline arm exactly like `function`, so the lambda never runs.
   checkNotEmitterIntrinsic(n.letName, ix)
   declare(n.letName, bound)
+  if recAdOrigDecl.length > 0 && (recAdPinned[ix] ?? false) {
+    recAdBound.push(bound)
+  }
   if npKeys.length > 0 { narShadowPaths(n.letName, ix) }
   crNoteSoleRef(n)
   getLetBank(ix, bound)

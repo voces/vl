@@ -23,8 +23,8 @@
 // `--wat`: a module that fails to validate is exactly the one a compiler dev needs
 // to disassemble. The exit code, not the artifact's absence, is the signal.
 //
-// FIXTURE MAINTENANCE: `INVALID_SRC` rides a LIVE hole (member variance — a `{v: i32}`
-// assigned into a `{v: i32 | null}` binding). If that hole is closed the fixture stops
+// FIXTURE MAINTENANCE: `INVALID_SRC` rides a LIVE hole (D1400 — a cast's pinned type that an
+// annotated binding copied before the pin). If that hole is closed the fixture stops
 // producing an invalid module and this pin would silently go inert — so the first
 // assertions check the PRECONDITION and fail loudly with a swap instruction rather than
 // passing vacuously. Swap in any other source that emits an invalid module; the whole
@@ -52,28 +52,23 @@ if (GATED && !ENABLED) {
   console.warn("[vl-build-validate] skipped — missing vl binary or seed wasm.");
 }
 
-// Type-checks clean, emits invalid wasm: a `{v: i32}` flowing into a `{v: i32 | null}`
-// binding. The checker accepts the assignment while the two shapes have DIFFERENT heap
-// types, so the store is `(ref $shape)` into a `(ref null $shape')` slot —
-// `type mismatch: expected (ref null $type), found (ref $type)`. This is the N5/A8/A9
-// MEMBER VARIANCE ruling in `docs/internals/open-rulings.md`, an open checker hole
-// rather than an emitter one, which is what makes the fixture stable: closing it is a
-// `vl check` reject, and a `vl check` reject is caught by the precondition assertions
-// below rather than silently blessing this pin.
+// Type-checks clean, emits invalid wasm: D1400's annotated-binding cell. `a as? i32` inside an
+// un-annotated function is re-typed when the call pins the hole, but the annotated `x` took its
+// copy of the type before the pin, so the store is `(ref $box)` into an `i32` local —
+// `type mismatch: expected i32, found (ref $type)`. Closing D1400 is a checker change the
+// precondition assertions below catch, rather than silently blessing this pin.
 //
-// The ANNOTATION on `a` is load-bearing and the hint the linter prints for it is
-// expected: without it the literal is built AT the type it flows into (`{v: i32 | null}`)
-// and the module is valid. The hole needs the source pinned to the narrower shape first.
-//
-// It REPLACES the narrowed-litunion-arm fixture — `const x: K | f64 = "aa"; if x is K {
-// const y: K = x }` — which stopped emitting an invalid module once `emitStrToAtom`
-// gave the string→atom rep boundary its conversion. That one had itself replaced a
-// `.map` callback PARAMETER spelled as the inline member union, and that one an unread
-// global binding of a generic function's nullable-closure return. The precondition
-// assertion below is what caught all three, exactly as designed.
-const INVALID_SRC = `const a: {v: i32} = {v: 1}\n` +
-  `const b: {v: i32 | null} = a\n` +
-  `print(b.v ?? 0)\n`;
+// It REPLACES the member-variance fixture — `const a: {v: i32} = {v: 1}` then `const b: {v: i32
+// | null} = a` — which the checker refuses since the record-covariance ruling (only a fresh
+// record widens). That one had itself replaced the narrowed-litunion-arm fixture, a `.map`
+// callback PARAMETER spelled as the inline member union, and an unread global binding of a
+// generic function's nullable-closure return. The precondition assertion caught all four.
+const INVALID_SRC = `const u: i32 | null = 5\n` +
+  `function take(a) {\n` +
+  `  const x: i32 = a as? i32\n` +
+  `  print(x)\n` +
+  `}\n` +
+  `take(u)\n`;
 
 // The over-rejection control: an ordinary valid program must still build clean.
 const VALID_SRC = `print(6 * 7)\n`;
