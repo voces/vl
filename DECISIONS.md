@@ -8773,8 +8773,10 @@ that is itself the value of a `break` is written `break (@C { … })`.
 `` `B: { … }` is no longer a label; write `@B { … }` `` (and the `while`/`for` twins, in statement
 and value position), `` `break :B` is now `break @B` ``, and, when an object literal fails to parse
 with a field `name: {` or `name: while` in it, `` `name: …` is an object field here; a label is
-written `@name { … }` ``. That last one is how an old labelled block first in a body reads now: as
-an object, so the note rides the object's own error. The detection (`oldLabelAt`,
+written `@name { … }` `` (`@name while …` for a loop). That note is how an old labelled block
+first in a body reads now: as an object, so the note rides the object's own error. A
+`break @C` that names no label and has a `{` after it adds that a labelled block as the value is
+written `break (@C { … })`, and `@while` is refused as a label name. The detection (`oldLabelAt`,
 `oldLabelFieldNote` and the `:` arm of `parseJumpLabel` in `compiler/parser.vl`) is kept only
 while sources written before the ruling are migrated — plumb's generated units are the known
 population — and is deleted once plumb regenerates; nothing else depends on it. One old shape

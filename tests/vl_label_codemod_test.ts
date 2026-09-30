@@ -43,6 +43,29 @@ const CASES: [string, string, string][] = [
     "const o = {\n  a: 1,\n  b: { c: 2 },\n}\nconst m: {[string]: i32} = Map()\n",
   ],
   [
+    "a field whose value is a loop is left alone (the #3326 review)",
+    "function f() { return { f: while true { break 4 } } }\n" +
+    "function g(): i32 { const o = { f: for i in 0 until 3 { if i == 2 { break i } } }\n  return o.f ?? -1 }\n" +
+    "const xs = [{ f: while true { break 1 } }]\nprint(k({ f: while true { break 8 } }))\n" +
+    "const w = { f: while true { break 4 } }\nconst u = { g: 1, f: for i in 0 until 3 { break i } }\n",
+    "function f() { return { f: while true { break 4 } } }\n" +
+    "function g(): i32 { const o = { f: for i in 0 until 3 { if i == 2 { break i } } }\n  return o.f ?? -1 }\n" +
+    "const xs = [{ f: while true { break 1 } }]\nprint(k({ f: while true { break 8 } }))\n" +
+    "const w = { f: while true { break 4 } }\nconst u = { g: 1, f: for i in 0 until 3 { break i } }\n",
+  ],
+  [
+    "a body's loop label, an empty labelled block, and a lambda body's loop label",
+    "function f() {\n  L: while true { break }\n}\nfunction g(): i32 {\n  X: { }\n  return 2\n}\n" +
+    "const h = (k: i32) => { r: while true { break k } }\n",
+    "function f() {\n  @L while true { break }\n}\nfunction g(): i32 {\n  @X { }\n  return 2\n}\n" +
+    "const h = (k: i32) => { @r while true { break k } }\n",
+  ],
+  [
+    "a block that reads like an object with a statement after it (D3273)",
+    "function h() {\nC: {}\nn = 5\n}\nfunction k() {\n  C: { n }\n  n = 5\n}\nfunction obj() { a: { b }\n}\n",
+    "function h() {\n@C {}\nn = 5\n}\nfunction k() {\n  @C { n }\n  n = 5\n}\nfunction obj() { a: { b }\n}\n",
+  ],
+  [
     "comments and strings are left alone, holes are code",
     '// B: { break :B }\nconst s = "L: while { break :L }"\nprint("\\{X: { 1 }}")\n',
     '// B: { break :B }\nconst s = "L: while { break :L }"\nprint("\\{@X { 1 }}")\n',
