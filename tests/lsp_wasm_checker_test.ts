@@ -601,6 +601,34 @@ Deno.test({ name: "wasm-symbols: hoverTypeAt renders a non-empty type", ignore }
   }
 });
 
+// A literal `const` is its literal at each read (D3246), so a read hovers as the type it takes
+// there, and every read stays a reference — including when a `let` pin re-checks the program.
+Deno.test({
+  name: "wasm-symbols: a literal const read hovers per use and stays a reference",
+  ignore,
+}, async () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  const src = "const K = 7\n" +
+    "function takeF32(x: f32): f32 { x }\n" +
+    "function takeI64(x: i64): i64 { x }\n" +
+    "print(takeF32(K))\n" +
+    "print(takeI64(K))\n" +
+    "let bb = 1\n" +
+    "bb = takeI64(K)\n";
+  const want: [number, number, string][] = [[3, 14, "f32"], [4, 14, "i64"]];
+  for (const [line, col, ty] of want) {
+    const got = await checker.hoverTypeAt(src, "/tmp/x.vl", noSiblings, line, col);
+    if (got !== ty) {
+      throw new Error(`hover at ${line}:${col}: want ${ty}, got ${JSON.stringify(got)}`);
+    }
+  }
+  const refs = await checker.referencesAt(src, "/tmp/x.vl", noSiblings, 3, 14, true);
+  const lines = refs.map((r) => r.start.line).sort((a, b) => a - b);
+  if (JSON.stringify(lines) !== "[0,3,4,6]") {
+    throw new Error(`references: want [0,3,4,6], got ${JSON.stringify(lines)}`);
+  }
+});
+
 Deno.test({
   name: "wasm-symbols: an un-annotated param hovers as everything its body demands",
   ignore,

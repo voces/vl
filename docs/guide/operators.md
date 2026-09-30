@@ -105,7 +105,9 @@ print(K * 1000000000)                         // -1589934592 — no context: an 
 ```
 
 A read the literal does not fit is the literal's own error there (`const B = 3000000000` read as
-an `i32`). Annotate a `const` (`const K: i64 = 7`) to give it one type everywhere.
+an `i32`). This holds wherever the read stands, above the declaration included, and a binding
+that copies a literal `const` (`let n = K`, `const K2 = K`) holds the literal as if it were
+written there. Annotate a `const` (`const K: i64 = 7`) to give it one type everywhere.
 
 **A `let` takes its type from what it is stored into and what is stored into it**, within its
 literal's kind — an integer becomes at most an `i64`, a float `f32` or `f64` — and keeps its
@@ -121,8 +123,11 @@ takeF64(b)                 // an f64 destination widens b there; b stays an i32
 print(b / 2)               // 3 — integer division
 ```
 
-Operands never choose: `if s < n64`, `s + 0.5` or `take64(s + 1)` give `s` no type. Two
-deliveries or stores that no single type satisfies are an error naming both.
+What it is stored into is any typed place: a parameter, a binding, a return, a field or element
+of a literal delivered to a typed record or list (`const r: R = { v: s }`), a map value. Operands
+never choose: `if s < n64`, `s + 0.5` or `take64(s + 1)` give `s` no type, and neither does an
+argument to a type parameter (`id(s)`). Two deliveries or stores that no single type satisfies
+are an error naming both.
 
 ## Comparison and logic
 

@@ -13609,6 +13609,11 @@ let lbiIsConst: boolean[] = []
 // Whether an annotated literal `const` has a read its literal would take differently: an `f64`
 // meeting an `f32` operand, or a literal tree meeting a type other than the annotation's.
 let lbiConstUnsafe: boolean[] = []
+// The literal a candidate holds: its initializer, or the literal of the module `const` it copies.
+let lbiLitNode: i32[] = []
+// Module-level un-annotated `const`s holding a numeric literal, written there or copied from
+// another such `const` by name: the name to the literal.
+let lbiModLit: {[string]: i32} = Map()
 // Every read of a candidate, and the type it widens to where it stands when it is delivered whole
 // to a scalar destination or met whole by a scalar operand (-1 otherwise).
 let lbiReadNode: i32[] = []
@@ -13631,6 +13636,13 @@ let lbiSynth: {[i32]: i32} = Map()
 // The reads that hold a literal `const`'s literal, which a check about a literal the author wrote
 // (a shift count, a constant range, a newtype's brand) does not treat as one.
 let lbiInlined: {[i32]: boolean} = Map()
+// The rewritten reads, by node: the name each stands for, which the editor still resolves.
+let lbiInlinedName: {[i32]: string} = Map()
+// Each editor occurrence recorded for a rewritten read, and its node, whose type hover shows.
+let lbiOccIx: i32[] = []
+let lbiOccNode: i32[] = []
+// The type a rewritten read meets where it stands, by node, for hover.
+let lbiUseTy: {[i32]: i32} = Map()
 // The parameter default expressions, shared by every call that omits the argument, so a read
 // in one is never rewritten.
 let lbiDefaultExpr: {[i32]: boolean} = Map()
@@ -13639,6 +13651,43 @@ let lbiDefaultExpr: {[i32]: boolean} = Map()
 export function lbiArenaReset() {
   lbiSynth = Map()
   lbiInlined = Map()
+  lbiInlinedName = Map()
+  0
+}
+
+// Record the rewritten read `ix` as an occurrence of the name it stands for, for the editor.
+function lbiSymRead(ix: i32) {
+  const nm = lbiInlinedName[ix] ?? ""
+  if nm == "" { return 0 }
+  const o = symOccTy.length
+  symUse(ix, nm, lookup(nm))
+  if symOccTy.length > o {
+    lbiOccIx.push(o)
+    lbiOccNode.push(ix)
+  }
+  0
+}
+
+// The rewritten read `ix`, when it is one, meets the scalar type `ty` where it stands.
+function lbiNoteUseTy(ix: i32, ty: i32) {
+  if symEnabled == 0 || inferQuiet || lbiInlinedName.length == 0 || ix < 0 {
+    return 0
+  }
+  const t = nonNullTy(ty)
+  if !lbiNumTy(t) { return 0 }
+  const p = parenPeelIx(ix)
+  if lbiInlinedName.has(p) { lbiUseTy[p] = t }
+  0
+}
+
+// Give each rewritten read's occurrence the type its literal took there.
+function lbiSymTypes() {
+  let i = 0
+  while i < lbiOccIx.length {
+    const t = lbiUseTy[lbiOccNode[i]] ?? nodeTyOf(lbiOccNode[i])
+    if t >= 0 && lbiOccIx[i] < symOccTy.length { symOccTy[lbiOccIx[i]] = t }
+    i = i + 1
+  }
   0
 }
 
@@ -13672,6 +13721,7 @@ function lbiReset() {
   lbiExpMod = []
   lbiIsConst = []
   lbiConstUnsafe = []
+  lbiLitNode = []
   lbiInitTy = Map()
   lbiReadNode = []
   lbiReadCand = []
@@ -13684,6 +13734,9 @@ function lbiReset() {
   lbiPinTy = []
   lbiErrMsg = []
   lbiErrAt = []
+  lbiOccIx = []
+  lbiOccNode = []
+  lbiUseTy = Map()
 }
 
 // Is `ann`, the annotation of declaration `decl`, one the solve wrote rather than the author? A
@@ -13714,7 +13767,11 @@ function lbiLitDefault(ix: i32): i32 {
 function lbiMark(name: string, depth: i32, decl: i32, ty: i32) {
   const n = P.nodes[decl]
   if n is LetDecl {
-    if n.letInit < 0 || !exprIsNumLit(n.letInit) { return 0 }
+    if n.letInit < 0 { return 0 }
+    let lit = -1
+    if exprIsNumLit(n.letInit) { lit = parenPeelIx(n.letInit) }
+    else if depth == 0 && n.letType < 0 { lit = lbiInitLit(n.letInit) }
+    if lit < 0 { return 0 }
     let ann = -1
     if n.letType >= 0 {
       if lbiIsSynth(n.letType, decl) {
@@ -13738,11 +13795,7 @@ function lbiMark(name: string, depth: i32, decl: i32, ty: i32) {
       c = lbiCands.length
       lbiCandOf[decl] = c
       lbiCands.push(decl)
-      if ann >= 0 {
-        lbiDef.push(lbiLitDefault(n.letInit))
-      } else {
-        lbiDef.push(ty)
-      }
+      if ann >= 0 { lbiDef.push(lbiLitDefault(lit)) } else { lbiDef.push(ty) }
       lbiAnn.push(ann)
       if declHasExportKw(decl) {
         lbiExpMod.push(rcwModOf(decl))
@@ -13751,6 +13804,7 @@ function lbiMark(name: string, depth: i32, decl: i32, ty: i32) {
       }
       lbiIsConst.push(ann < 0 && n.letKw == "const")
       lbiConstUnsafe.push(false)
+      lbiLitNode.push(lit)
     }
     const sid = sidOf(name)
     lbiBindPrev.push(sidArrGet(lbiBindTop, sid))
@@ -13760,6 +13814,48 @@ function lbiMark(name: string, depth: i32, decl: i32, ty: i32) {
     lbiBindCand.push(c)
   }
   0
+}
+
+// The literal the module-level initializer `init` holds: a numeric literal, or the bare name of a
+// module `const` holding one; -1 otherwise.
+function lbiInitLit(init: i32): i32 {
+  if exprIsNumLit(init) { return parenPeelIx(init) }
+  const n = P.nodes[parenPeelIx(init)]
+  if n is Ident { return lbiModLit[n.identName] ?? -1 }
+  -1
+}
+
+// Fill `lbiModLit` from the top-level statements `stmts`, following copies in any order.
+function lbiScanModLits(stmts: i32[]) {
+  lbiModLit = Map()
+  let grew = true
+  while grew {
+    grew = false
+    for st in stmts {
+      const d = P.nodes[st]
+      if d is LetDecl {
+        if (
+          d.letKw == "const"
+          && d.letType < 0
+          && d.letInit >= 0
+          && !lbiModLit.has(d.letName)
+        ) {
+          const lit = lbiInitLit(d.letInit)
+          if lit >= 0 {
+            lbiModLit[d.letName] = lit
+            grew = true
+          }
+        }
+      }
+    }
+  }
+  0
+}
+
+// The literal candidate `c` holds, or -1.
+function lbiLitOf(c: i32): i32 {
+  if c < 0 || c >= lbiLitNode.length { return -1 }
+  lbiLitNode[c]
 }
 
 // Drop the rows of the scopes at `depth` and deeper.
@@ -13842,6 +13938,33 @@ function lbiReadsPinned(ix: i32): boolean {
     const n = P.nodes[l]
     if n is Ident {
       if bindMarkHas(lbiPinnedDepth, lbiPinnedName, n.identName) { return true }
+    } else if lbiFieldsPinned(l) || lbiElemsPinned(l) {
+      return true
+    }
+  }
+  false
+}
+
+// Does a field of the record literal `ix` read a binding whose type the solve wrote?
+function lbiFieldsPinned(ix: i32): boolean {
+  const n = P.nodes[ix]
+  if n is ObjLit {
+    for f in n.objFields {
+      const fi = P.nodes[f]
+      if fi is FieldInit {
+        if lbiReadsPinned(fi.fiValue) { return true }
+      }
+    }
+  }
+  false
+}
+
+// Does an element of the list literal `ix` read a binding whose type the solve wrote?
+function lbiElemsPinned(ix: i32): boolean {
+  const n = P.nodes[ix]
+  if n is ArrayLit {
+    for e in n.arrElems {
+      if lbiReadsPinned(e) { return true }
     }
   }
   false
@@ -13967,19 +14090,15 @@ function lbiConstLitAt(ix: i32, name: string): i32 {
     return -1
   }
   if lbiDefaultExpr[ix] ?? false { return -1 }
-  // A read before the binding is assigned is refused by the ordinary read.
-  if daLive.length > 0 && daIsUnassignedSid(sidOf(name)) { return -1 }
-  if (moduleBeforeDecl[name] ?? -1) >= 0 { return -1 }
   const c = lbiCandOfName(name, sidOfNode(ix))
   if c < 0 || !lbiIsConst[c] { return -1 }
-  const d = P.nodes[lbiCands[c]]
-  if d is LetDecl { return parenPeelIx(d.letInit) }
-  -1
+  lbiLitOf(c)
 }
 
-// Rewrite the read `ix`, at `pos`, into a copy of the literal `lit` (negations kept), so each read of
-// a literal `const` is checked and lowered as the literal written there. Answers `ix`.
-function lbiInlineLit(ix: i32, lit: i32, pos: i32): i32 {
+// Rewrite the read `ix` of `name`, at `pos`, into a copy of the literal `lit` (negations kept), so
+// each read of a literal `const` is checked and lowered as the literal written there. Answers `ix`.
+function lbiInlineLit(ix: i32, lit: i32, pos: i32, name: string): i32 {
+  lbiInlinedName[ix] = name
   const neg = lbiNegArg(lit)
   if neg < 0 {
     const l = P.nodes[lit]
@@ -14049,15 +14168,22 @@ function lbiPush(c: i32, kind: i32, ty: i32, at: i32) {
 // A delivery of `src` into a destination of type `dst`; `tgt` is the assignment target when the
 // delivery is one, else -1. Called from `assignableExpr`, which every position flows through.
 function lbiNoteDelivery(src: i32, dst: i32, tgt: i32) {
+  lbiNoteUseTy(src, dst)
   if lbiPinnedName.length > 0 && !inferQuiet && lbiNumTy(dst) {
     if lbiReadsPinned(src) { lbiPinnedReads = lbiPinnedReads + 1 }
   }
-  if lbiBindName.length == 0 || inferQuiet || src < 0 { return 0 }
+  if lbiBindName.length == 0 || inferQuiet || src < 0 || lbiGenArg { return 0 }
   if tgt >= 0 {
     const tc = lbiCandAt(parenPeelIx(tgt))
     if tc >= 0 { return lbiNoteStore(tc, src) }
   }
-  if !lbiNumTy(dst) || !lbiTreeReads(src, 0) { return 0 }
+  if !lbiNumTy(dst) {
+    // A nullable number is delivered its number; a record or list literal, each part its own.
+    const inner = nonNullTy(dst)
+    if lbiNumTy(inner) { return lbiNoteDelivery(src, inner, -1) }
+    return lbiNoteParts(src, inner)
+  }
+  if !lbiTreeReads(src, 0) { return 0 }
   // Only a binding delivered whole (through parentheses and a negation) is typed by the
   // destination: one inside `b + 1` is an operand there, and an operand chooses nothing.
   const whole = lbiOperandCand(src)
@@ -14078,6 +14204,44 @@ function lbiNoteDelivery(src: i32, dst: i32, tgt: i32) {
   } else if lbiTreeReads(src, LBI_CONST_DEPTH) && lbiConstFits(src) {
     lbiMarkTree(src, LBI_WIDE_I64)
   }
+}
+
+// A record literal `src` delivered to record type `dst` delivers each field to the field's type,
+// and a list literal delivered to a list type each element to the element type.
+function lbiNoteParts(src: i32, dst: i32) {
+  if dst < 0 || dst >= T.tys.length { return 0 }
+  const t = T.tys[dst]
+  match t {
+    TyObj => lbiNoteFields(src, t)
+    TyArray => lbiNoteElems(src, t.aElem)
+    // No literal of these delivers its parts to a typed slot.
+    TyErr | TyPrim | TyFunc | TyUnion | TyMap | TyVar | TyLit | TyNeg | TyNullable => {}
+  }
+  0
+}
+
+// Each field of the record literal `src` delivered to its type in `o`.
+function lbiNoteFields(src: i32, o: TyObj) {
+  const n = P.nodes[parenPeelIx(src)]
+  if n is ObjLit {
+    for f in n.objFields {
+      const fi = P.nodes[f]
+      if fi is FieldInit {
+        const ft = objFieldType(o, fi.fiName)
+        if ft >= 0 { lbiNoteDelivery(fi.fiValue, ft, -1) }
+      }
+    }
+  }
+  0
+}
+
+// Each element of the list literal `src` delivered to the element type `elem`.
+function lbiNoteElems(src: i32, elem: i32) {
+  const n = P.nodes[parenPeelIx(src)]
+  if n is ArrayLit && elem >= 0 {
+    for e in n.arrElems { lbiNoteDelivery(e, elem, -1) }
+  }
+  0
 }
 
 // A store of `src` into candidate `tc`: its typed leaves bound `tc` from below, and a candidate
@@ -14174,6 +14338,8 @@ function lbiNoteOperands(n: BinExpr, ix: i32) {
   }
   lbiNoteConstContext(n.binLeft, nodeTyOf(parenPeelIx(n.binRight)))
   lbiNoteConstContext(n.binRight, nodeTyOf(parenPeelIx(n.binLeft)))
+  lbiNoteUseTy(n.binLeft, nodeTyOf(parenPeelIx(n.binRight)))
+  lbiNoteUseTy(n.binRight, nodeTyOf(parenPeelIx(n.binLeft)))
   const eq = cmp && (op == "==" || op == "!=")
   lbiNoteNeutral(n.binLeft, n.binRight, cmp, eq, ix)
   lbiNoteNeutral(n.binRight, n.binLeft, cmp, eq, ix)
@@ -14259,6 +14425,9 @@ let lbiConstOk = true
 let lbiWriteTgt = -1
 // Inside a `for` range's bounds or a `match` arm, where a `const` read stays a name.
 let lbiKeepName = 0
+// Inside the delivery of an argument to a parameter whose type names a type parameter, which
+// needs no one type.
+let lbiGenArg = false
 
 // The value of the constant tree `ix`, clearing `lbiConstOk` when it is not one or leaves `i32`.
 function lbiConstVal(ix: i32, depth: i32): i64 {
@@ -14294,7 +14463,7 @@ function lbiConstVal(ix: i32, depth: i32): i64 {
   if c < 0 { return lbiConstFail() }
   const d = P.nodes[lbiCands[c]]
   if d is LetDecl {
-    if d.letKw == "const" { return lbiConstVal(d.letInit, depth + 1) }
+    if d.letKw == "const" { return lbiConstVal(lbiLitOf(c), depth + 1) }
   }
   lbiConstFail()
 }
@@ -14670,7 +14839,7 @@ function lbiRefuse(d: i32, def: i32, ks: i32[], us: i32[], ats: i32[]) {
             + "` takes its type from its uses, and this one needs "
             + lbiNeeds(ks[i], us[i])
             + ", which its literal `"
-            + numLitText(n.letInit)
+            + numLitText(lbiLitOf(lbiCandOf[d] ?? -1))
             + "` does not fit — annotate `"
             + nm
             + "` or change the literal",
@@ -14793,7 +14962,7 @@ function lbiReadNeutral(w: i32, t: i32): boolean {
 function lbiSameAtI32(c: i32): boolean {
   const n = P.nodes[lbiCands[c]]
   if n is LetDecl {
-    const lex = intLitLexemeOf(n.letInit)
+    const lex = intLitLexemeOf(lbiLitOf(c))
     if lex == "" { return false }
     const bits = numLexRadixBits(lex)
     return bits < 0 || bits <= 31
@@ -41908,7 +42077,10 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
     constrainEmptyExpr(args[i], at, expected)
     const savedGenArg = widenRetagGenArg
     widenRetagGenArg = tyWideUnionMinted && tyHasTyVar(params[i])
+    const savedLbiGen = lbiGenArg
+    lbiGenArg = tyHasTyVar(params[i])
     const argOk = assignableExpr(args[i], at, expected)
+    lbiGenArg = savedLbiGen
     widenRetagGenArg = savedGenArg
     if !argOk {
       // Anchored at the offending argument (or its offending return site),
@@ -46064,6 +46236,7 @@ function checkProgramNode(n: Program) {
   // module-level value regardless of source order, making the module scope order-independent.
   // Initialization order still matters for straight-line top-level code — each global joins
   // the definite-assignment dead-zone here — but a function body runs at call time, so a deferred read from inside one is correctly not flagged.
+  lbiScanModLits(stmts)
   let mi = 0
   const phLets: i32[] = []
   while mi < stmts.length {
@@ -46125,8 +46298,9 @@ function checkProgramNode(n: Program) {
         }
         markNumLitBinding(sm.letName, 0, stmts[mi])
         let lbiTy0 = mty
-        if sm.letType < 0 && sm.letInit >= 0 && exprIsNumLit(sm.letInit) {
-          lbiTy0 = lbiLitDefault(sm.letInit)
+        if sm.letType < 0 && sm.letInit >= 0 {
+          const lit0 = lbiInitLit(sm.letInit)
+          if lit0 >= 0 { lbiTy0 = lbiLitDefault(lit0) }
         }
         lbiMark(sm.letName, 0, stmts[mi], lbiTy0)
         markFnLitBinding(sm.letName, 0, stmts[mi])
@@ -47439,6 +47613,7 @@ function tyIsOrNestsV128(t: i32, d: i32): boolean {
 // narrow `Node`. On a type error it raises a diagnostic and returns `TY_ERR` so checking continues.
 function checkNodeReal(ix: i32) {
   if ix < 0 { return TY_ERR }
+  if symEnabled != 0 && lbiInlinedName.length > 0 { lbiSymRead(ix) }
   const n = P.nodes[ix]
 
   // ── literals & identifiers ────────────────────────────────────────────────
@@ -47491,8 +47666,7 @@ function checkNodeReal(ix: i32) {
     // A literal `const` has no single type: each read is its literal, typed by where it stands.
     const lit = lbiConstLitAt(ix, n.identName)
     if lit >= 0 {
-      if symEnabled != 0 { symUse(ix, n.identName, lookup(n.identName)) }
-      lbiInlineLit(ix, lit, n.pos)
+      lbiInlineLit(ix, lit, n.pos, n.identName)
       return checkNodeReal(ix)
     }
     const ty = lookup(n.identName)
@@ -49508,6 +49682,7 @@ export function checkProgram(rootIx: i32) {
     lbiDropUnobservable()
     passes = passes + 1
   }
+  lbiSymTypes()
   lbiReport()
 }
 
@@ -55842,11 +56017,7 @@ function checkLetDeclNode(n: LetDecl, ix: i32) {
   }
   if n.letInit >= 0 {
     if tpEnvNames.length > 0 { tpIfMarkOk(n.letInit) }
-    // An un-annotated binding of a literal `const` is a copy of it, not a literal of its own.
-    const keep = annot < 0 && P.nodes[parenPeelIx(n.letInit)] is Ident
-    if keep { lbiKeepName = lbiKeepName + 1 }
     initTy = checkNode(n.letInit)
-    if keep { lbiKeepName = lbiKeepName - 1 }
   }
   // A `void` initializer has no value to bind — reject with a source-located message,
   // poisoning `initTy`. Exempted: an if-expression init, whose false path is implicit `null`.

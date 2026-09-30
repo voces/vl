@@ -8841,7 +8841,9 @@ refused, `b / 3` turning into float division), refined it to **B′ for `let` an
 parenthesised — is re-typed only by:
 
 * DELIVERIES of the binding WHOLE (through parentheses and a negation): a typed parameter, a
-  typed binding, a field, an element, an annotated return, a list index (`i32`), a map key;
+  typed binding, a field or element of a record or list literal delivered to a typed slot, a
+  map value or other stored place, a nullable number slot (its number), an annotated return, a
+  list index (`i32`), a map key;
 * STORES into it (`s = e`, `s += e`), where `e`'s type counts, joined with the literal's own type
   (so storing an `f32` into `let x = 0.5` keeps `f64`); a stored literal bounds it to the types
   that hold that literal (`y = 3000000000` needs a 64-bit type; `y = 0xFFFFFFFF` is `-1` at `i32`
@@ -8864,6 +8866,8 @@ Rules:
   (`takeI32(b); take64(b)` keeps `i32`), else the narrowest type satisfying them all. Two in-kind
   uses nothing satisfies are refused with both named ("`s` takes its type from its uses, and they
   conflict: the use on line 18 needs `i64` and the use on line 19 needs `i32`").
+* **A type parameter needs nothing.** An argument to a parameter whose type names one (`id(b)`)
+  neither chooses nor vetoes, and a refusal never names it.
 * An exported `let` is typed only by its own module's uses; an importer's use is an ordinary use
   of whatever type the module gave it.
 
@@ -8884,30 +8888,49 @@ literal that does not fit the read's type (`const B = 3000000000` read as `i32`)
 own error at that read. `const x = -1` is its negated literal, as a `let`'s is. An annotated
 `const` is unchanged.
 
+Declaration order never changes a value: a read above the declaration, at the top level or in
+a function written above it, is the literal too, so a literal `const` has no dead zone (a
+`const` computed from anything else still has one). A binding initialised by a bare read of a
+literal `const` holds that literal as if it were written there — `let bb = M` is a literal
+`let`, typed by its deliveries; `const A2 = A` is a literal `const`, and a `match` arm — at any
+depth and, at the top level, in either order.
+
 Mechanism: the checker rewrites each read into a copy of the literal the moment it resolves it,
-so the checker and the emitter see the literal. Four places keep the NAME, because what they
-check is about a literal the author wrote: a `for` range bound or step (`step zero` stays a
-computed step, not a refused `step 0`), a shift count past the width (taken modulo, as for any
-computed count, not refused as a literal count is), a newtype's brand (a named value is not
-brand-polymorphic), and a read above the declaration (still "used before it is assigned"). A
-write target and a parameter default (one node shared by every call) are never rewritten.
+so the checker and the emitter see the literal, and the editor still records the read as an
+occurrence of the name, with the type it takes there for hover. The reads kept as the NAME are
+those where the name is the point or the value cannot differ:
+
+* a write target (`K = 1`, `K += 1`, `K++`): the write needs the binding, and its refusal names it;
+* a `match` arm (`K => …`): the arm is the constant by name (D3271), and its value is the literal;
+* a `for` range bound or step: a range is `i32`, so the value is the same, and the constant-range
+  refusals and the step floor judge a literal the author wrote (`step zero` stays a computed step);
+* a parameter default: one node serves every call that omits the argument, always at the
+  parameter's type, so the value is the same.
+
+Two more are rewritten but flagged, because their checks are about a literal the author wrote: a
+shift count past the width (taken modulo, as for any computed count, not refused) and a
+newtype's brand (a named value is not brand-polymorphic).
 
 **Hints.** "redundant type annotation" on a literal `let` also requires the solve to agree. On an
 annotated literal `const` it is withheld where the bare literal would read differently: an `f64`
 meeting an `f32` operand, or a literal tree taking a destination's width (`take64(C * 1000000000)`).
 
-**Programs whose behaviour changed.** Only integer widening of a `let`: `let b = 7; take64(b);
-print(b * 1000000000)` printed `-1589934592` and prints `7000000000`. The grid (594 cells) has 31
-such cells and nothing else moved; the review generator (711 paired uses) has 10, all integer
-`let`s taking `i64`, and loses no running cell. `const` reads that meet a wider context compute
-at that width, which for in-range values is the same number. In the repository: two inventory
-rows moved (D1730's `xs[i]` with `const i = 0` now keys and runs; D2443's literal-`const`
-spelling runs and the row is re-filed on its parameter spelling); fixture changes are listed in
-the PR. The compiler's `gLowMemUnused` is annotated `i32` so the self-compile does not re-check.
+**Programs whose behaviour changed.** Two kinds, and in every graded cell the new value is the
+one the rule gives. An integer `let` widened by an `i64` delivery: `let b = 7; take64(b);
+print(b * 1000000000)` printed `-1589934592` and prints `7000000000` (the review's B′ grid, 1,155
+cells: 229 such values, each equal to its `i64`-annotated twin). And a `const` read in a context
+where its literal means something else: `const M = 0xFFFFFFFF; let a: i64 = M` printed `-1` and
+prints `4294967295` (the review's const grid, 590 cells: 135 values moved from master, each equal
+to the literal written at the read). Neither grid loses a running cell. In the repository: two
+inventory rows moved (D1730's `xs[i]` with `const i = 0` now keys and runs; D2443's
+literal-`const` spelling runs, since a copy of a literal `const` holds the literal and no alias
+of the shadowing local is formed, and the row is graded on its parameter spelling); fixture
+changes are listed in the PR. The compiler's `gLowMemUnused` is annotated `i32` so the
+self-compile does not re-check.
 
-**Cost, against master `e70102886`.** One self-compile +0.78% guest fuel; the plumb-shape units
-−8.1% / −8.7% (a `const` read is now a constant, not a global); plumb's runtime modules +0.6% to
+**Cost, against master `e70102886`.** One self-compile +0.8% guest fuel; the plumb-shape units
+−8.0% / −8.6% (a `const` read is now a constant, not a global); plumb's runtime modules +0.6% to
 +2.6% with no re-check; a generated chunk that builds on current master (`chunk_1`, its labels
 respelled for the labelled-block ruling) −7.9%, its only difference each
-`i64.extend_i32_s(local.get y)` becoming `i64.const 32`. The seed grows 34 KB (+0.9%) and the
+`i64.extend_i32_s(local.get y)` becoming `i64.const 32`. The seed grows 40 KB (+1.1%) and the
 seed-size baseline is rewritten with it.
