@@ -332,6 +332,51 @@ export function frameBindsCachePut(sid: i32, v: i32) {
   0
 }
 
+// One frame's answers to "is `sid` a parameter of frame `pshFrame` that a `let` or loop
+// variable of its body also binds", by sid: `pshSidVal` is 1 or 0 where `pshSidGen` matches
+// `pshGen`. Asking about another frame bumps the generation; a rebuilt body keeps its names.
+let pshFrame: i32 = -1
+let pshBody: i32 = -1
+let pshGen: i32 = 0
+let pshSidGen: i32[] = []
+let pshSidVal: i32[] = []
+
+// Whether `sid` names a parameter of the function node `fnIx` that some `let` or loop variable
+// of its body shadows somewhere: the only case a read of the parameter's name needs its
+// position to tell the two apart (D3293).
+export function paramShadowedInBody(fnIx: i32, sid: i32): boolean {
+  if fnIx < 0 || sid < 0 { return false }
+  if fnIx == pshFrame && sid < pshSidGen.length && pshSidGen[sid] == pshGen {
+    return pshSidVal[sid] == 1
+  }
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    if fnIx != pshFrame || fn.fnBody != pshBody {
+      pshFrame = fnIx
+      pshBody = fn.fnBody
+      pshGen = pshGen + 1
+    }
+    let v = 0
+    let i = 0
+    while i < fn.fnParams.length && v == 0 {
+      if sidOfNode(fn.fnParams[i]) == sid { v = 1 }
+      i = i + 1
+    }
+    if v == 1 {
+      if (
+        parentLetOfSid(fn.fnBody, sid) < 0
+        && parentLoopVarOfSid(fn.fnBody, sid) < 0
+      ) {
+        v = 0
+      }
+    }
+    sidArrPut(pshSidGen, sid, pshGen)
+    sidArrPut(pshSidVal, sid, v)
+    return v == 1
+  }
+  false
+}
+
 // Drops this file's sid-keyed rows. Paired with `symbols.sidReset` by the driver
 // (`emit_sections.sidKeyedTablesReset`) because the id space is re-keyed there: a generation
 // stamp defends against a stale key, never against a re-keyed universe — program N+1 would
@@ -375,6 +420,11 @@ export function sidResetParentLet() {
   fcbGen = 0
   fcbSidGen = []
   fcbSidVal = []
+  pshFrame = -1
+  pshBody = -1
+  pshGen = 0
+  pshSidGen = []
+  pshSidVal = []
   0
 }
 
@@ -1108,6 +1158,68 @@ export function parentLetOfAt(blockIx: i32, sid: i32, atIx: i32) {
   if sidArrGet(plDupGen, sid) != plGen { return first }
   if atIx < 0 { return -1 }
   plBestDupAt(sid, atIx, first, sidArrGet(plOwnerVal, sid))
+}
+
+// `parentLetReadAt`'s answer when the plan cannot place the read: a binding of `sid` lies past
+// the block's own arena index, spliced in by a pass after parsing, so no range speaks for it.
+export const PL_READ_UNPLACED = -2
+
+// The `LetDecl` a read of `sid` at node `atIx` denotes in the body block at `blockIx`, -1 when
+// the read denotes no body `let` (a parameter, a module global, a loop variable, a name bound
+// only in a block the read is outside), or `PL_READ_UNPLACED`. Unlike `parentLetOfAt`, a sole
+// binding must cover the read too, so a dead-scoped `let` never answers for an outer binding.
+export function parentLetReadAt(blockIx: i32, sid: i32, atIx: i32): i32 {
+  if blockIx < 0 || sid < 0 || atIx < 0 { return -1 }
+  if blockIx != plCacheBlock { plEnsure(blockIx) }
+  // `plSidVal` and `plOwnerVal` are written with `plSidGen`, so one bound serves all three.
+  if sid >= plSidGen.length || plSidGen[sid] != plGen { return -1 }
+  const first = plSidVal[sid]
+  if first > blockIx { return PL_READ_UNPLACED }
+  let li = -1
+  if sid >= plDupGen.length || plDupGen[sid] != plGen {
+    if first < atIx && atIx <= plOwnerVal[sid] { li = first }
+  } else {
+    if sidArrGet(plSortGen, sid) != plGen { plBuildSortedDup(sid) }
+    // The duplicates' largest index, off the slice sorted ascending once per plan.
+    const count = sidArrGet(plSortCount, sid)
+    if (
+      count > 0
+      && plSortedCand[sidArrGet(plSortStart, sid) + count - 1] > blockIx
+    ) {
+      return PL_READ_UNPLACED
+    }
+    li = plBestDupAt(sid, atIx, first, plOwnerVal[sid])
+  }
+  if li < 0 { return -1 }
+  // A loop variable between the `let` and the read shadows it.
+  if sid >= plLxHead.length || plLxHead[sid] < 0 { return li }
+  const lp = parentLoopAt(blockIx, sid, atIx)
+  if lp >= 0 && parentLoopAt(blockIx, sid, li) != lp { return -1 }
+  li
+}
+
+// The `LetDecl` of `sid` in the body block at `blockIx` written at source position `pos`, or -1:
+// the binding a rebuilt spine re-declared for its template's, which keeps the position.
+export function parentLetAtPos(blockIx: i32, sid: i32, pos: i32): i32 {
+  if blockIx < 0 || sid < 0 || pos < 0 { return -1 }
+  plEnsure(blockIx)
+  if sidArrGet(plSidGen, sid) != plGen { return -1 }
+  if plLetPosIs(sidArrGet(plSidVal, sid), pos) {
+    return sidArrGet(plSidVal, sid)
+  }
+  let i = sidArrGet(plMoreHead, sid)
+  while i >= 0 {
+    if plLetPosIs(plMoreIx[i], pos) { return plMoreIx[i] }
+    i = plMoreNext[i]
+  }
+  -1
+}
+
+function plLetPosIs(letIx: i32, pos: i32): boolean {
+  if letIx < 0 { return false }
+  const d = P.nodes[letIx]
+  if d is LetDecl { return d.pos == pos }
+  false
 }
 
 // Whether a function-scoped `LetDecl` of `sid` covers `atIx` — bounds-checks even a SOLE
