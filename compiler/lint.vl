@@ -42,6 +42,7 @@ import {
   Program,
   RetStmt,
   StrLit,
+  TypeDecl,
   TypeRef,
   Unary,
   UnionDecl,
@@ -1795,8 +1796,9 @@ function nameVisit(ix: i32) {
   0
 }
 
-// A bare-name arm pattern may read a constant (D3271), so it marks the binding it resolves to
-// used. A type pattern's name resolves to no value binding and marks nothing.
+// A bare-name arm pattern marks the binding it names used only where the checker reads it as a
+// `const` arm (D3271): the binding is a literal-valued `const`, and the name is no type this file
+// could mean, or the `match` is visibly over values (a literal arm, or an integer scrutinee).
 function matchPatNamesVisit(n: MatchExpr) {
   let i = 0
   while i < n.matchPats.length {
@@ -1804,12 +1806,169 @@ function matchPatNamesVisit(n: MatchExpr) {
     if pix >= 0 && pix < P.nodes.length {
       const p = P.nodes[pix]
       if p is IsExpr {
-        if lintIsBareName(p.isVariant) { bindMark(p.isVariant, 0) }
+        const nm = p.isVariant
+        if lintIsBareName(nm) && lintBindIsLitConst(nm) {
+          if !lintTyCapable.has(nm) || matchLooksValued(n) { bindMark(nm, 0) }
+        }
       }
     }
     i = i + 1
   }
   0
+}
+
+// The names a type pattern in this file may mean: its top-level types and its import locals.
+let lintTyCapable: {[string]: boolean} = Map()
+// Its top-level literal unions: a scrutinee annotated with one is matched on values.
+let lintLitUnions: {[string]: boolean} = Map()
+
+function lintTyCapableCollect(root: i32) {
+  lintTyCapable = Map()
+  lintLitUnions = Map()
+  if root < 0 || root >= P.nodes.length { return 0 }
+  const r = P.nodes[root]
+  if r is Program {
+    let i = 0
+    while i < r.progStmts.length {
+      lintTyCapableNote(r.progStmts[i])
+      i = i + 1
+    }
+  }
+  0
+}
+
+// `lintTyCapableCollect` for one top-level statement; a slot the checker emptied is skipped.
+function lintTyCapableNote(ix: i32) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const st = P.nodes[ix]
+  if st is TypeDecl { lintTyCapable[st.tdName] = true }
+  lintUnionNote(ix)
+  lintImportNote(ix)
+}
+
+// A top-level union's name, and whether it is a literal union.
+function lintUnionNote(ix: i32) {
+  const st = P.nodes[ix]
+  if st is UnionDecl {
+    lintTyCapable[st.udName] = true
+    if lintHasLitVariant(st.udVariants) { lintLitUnions[st.udName] = true }
+  }
+  0
+}
+
+// An import's locals, any of which may name a type.
+function lintImportNote(ix: i32) {
+  const st = P.nodes[ix]
+  if st is ImportDecl {
+    let q = 0
+    while q < st.impLocals.length {
+      lintTyCapable[st.impLocals[q]] = true
+      q = q + 1
+    }
+  }
+  0
+}
+
+// Whether a union's member spellings include a quoted literal.
+function lintHasLitVariant(vs: string[]) {
+  let i = 0
+  while i < vs.length {
+    if vs[i].length > 0 && vs[i][0] == '"' { return true }
+    i = i + 1
+  }
+  false
+}
+
+// The declaration the innermost visible binding of `name` came from, or -1.
+function lintBindDecl(name: string) {
+  const i = visHead[name] ?? -1
+  if i < 0 { return -1 }
+  const id = visIds[i]
+  if id < 0 { return -1 }
+  declNodes[id]
+}
+
+// Whether `name`'s innermost binding is a `const` whose initializer is a number, `-` over one,
+// or a string — the constants a `match` arm takes.
+function lintBindIsLitConst(name: string) {
+  const d = lintBindDecl(name)
+  if d < 0 || d >= P.nodes.length { return false }
+  const dn = P.nodes[d]
+  if dn is LetDecl {
+    if dn.letKw != "const" { return false }
+    return lintIsLitInit(lintUnwrapParen(dn.letInit))
+  }
+  false
+}
+
+// Whether `ix` is a number, a string, or `-` directly over a number.
+function lintIsLitInit(ix: i32) {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const e = P.nodes[ix]
+  if e is NumLit || e is StrLit { return true }
+  lintIsNegNum(ix)
+}
+
+// Whether `ix` is `-` directly over a number.
+function lintIsNegNum(ix: i32) {
+  const e = P.nodes[ix]
+  if e is Unary {
+    if e.unOp == "-" && e.unArg >= 0 && e.unArg < P.nodes.length {
+      return P.nodes[e.unArg] is NumLit
+    }
+  }
+  false
+}
+
+// Whether match `n` is visibly over values: a literal arm, or a scrutinee bound with `i32`,
+// `i64` or a literal union of this file.
+function matchLooksValued(n: MatchExpr) {
+  let i = 0
+  while i < n.matchPats.length {
+    const pix = n.matchPats[i]
+    if pix >= 0 && pix < P.nodes.length {
+      if lintIsLitInit(pix) { return true }
+    }
+    i = i + 1
+  }
+  lintScrutIsInt(n.matchScrut)
+}
+
+// Whether scrutinee `ix` is a name bound with an `i32`, `i64` or literal-union annotation.
+function lintScrutIsInt(ix: i32) {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const e = P.nodes[ix]
+  if e is Ident {
+    const d = lintBindDecl(e.identName)
+    if d < 0 || d >= P.nodes.length { return false }
+    return lintAnnIsInt(lintDeclAnn(d))
+  }
+  false
+}
+
+// The annotation node of parameter or binding `d`, or -1.
+function lintDeclAnn(d: i32) {
+  const dn = P.nodes[d]
+  if dn is Param { return dn.parType }
+  lintLetAnn(d)
+}
+
+// The annotation node of binding `d`, or -1 for a declaration that is no `let`/`const`.
+function lintLetAnn(d: i32) {
+  const dn = P.nodes[d]
+  if dn is LetDecl { return dn.letType }
+  -1
+}
+
+// Whether annotation node `t` spells `i32`, `i64` or one of this file's literal unions.
+function lintAnnIsInt(t: i32) {
+  if t < 0 || t >= P.nodes.length { return false }
+  const tn = P.nodes[t]
+  if tn is TypeRef {
+    const nm = tn.tyName
+    return nm == "i32" || nm == "i64" || lintLitUnions.has(nm)
+  }
+  false
 }
 
 // Whether `s` is one identifier: letters, digits and `_`, not starting with a digit.
@@ -1967,6 +2126,7 @@ function collectBindingsAndRefs(progRoot: i32) {
   visIds = []
   visHead = Map()
   visPrev = []
+  lintTyCapableCollect(progRoot)
   bindScan(progRoot)
   collectTypeNameRefs()
   0

@@ -225,6 +225,7 @@ import {
   fnHasTpBound,
   fnTpBoundOf,
   isBodyTyDecl,
+  matchPatValueName,
   tsFnParamNames,
   tsKidCount,
   tsKidStart,
@@ -54772,7 +54773,7 @@ function matchArmsAreIntLits(n: MatchExpr) {
 function intArmRejectMsg(st: i32) {
   "invalid match pattern — a pattern over "
     + tyToStr(st)
-    + " is an integer literal or the `_` wildcard"
+    + " is an integer literal, a `const` with a literal value, or the `_` wildcard"
 }
 
 // The `NumLit` an integer-literal pattern delivers — the pattern node itself, or the operand
@@ -55370,29 +55371,30 @@ function matchConstPatWhy(nm: string, patIx: i32) {
 }
 
 // Rewrites each arm pattern naming a constant into a read of it, and refuses every other bare
-// name that names no type. Asked only of the value vocabularies (an integer, a literal union, or
-// a hole the arms decide), where a bare name has no other meaning.
-function resolveMatchConstPats(n: MatchExpr) {
+// name. Asked of the value vocabularies, where no type but `null` is a pattern, so a constant the
+// name reaches wins over a type of that name. A `hole` scrutinee's arms still choose between the
+// two, so there a type stays a type and a refusal is left to the scrutinee's own error.
+function resolveMatchConstPats(n: MatchExpr, hole: boolean) {
   let i = 0
   while i < n.matchPats.length {
     const patIx = n.matchPats[i]
     const pn = P.nodes[patIx]
     if pn is IsExpr {
       const root = annTsOf(patIx)
-      if (
-        root >= 0
-        && tsKind[root] == TS_NAME
-        && !matchPatNamesType(pn.isVariant)
-      ) {
-        const nm = pn.isVariant
-        const why = matchConstPatWhy(nm, patIx)
-        if why == "" {
-          const rd: Node = { identName: nm, pos: pn.pos }
-          arenaSetNode(patIx, rd)
-          sidNoteNodeName(patIx)
-        } else {
-          matchPatRefused[patIx] = true
-          tErr(why, patIx)
+      if root >= 0 && tsKind[root] == TS_NAME && pn.isVariant != "null" {
+        const nm = matchPatValueName(patIx, pn.isVariant)
+        let isConst = false
+        if !hole { isConst = constDeclOf(nm) >= 0 }
+        if isConst || !matchPatNamesType(pn.isVariant) {
+          const why = matchConstPatWhy(nm, patIx)
+          if why == "" {
+            const rd: Node = { identName: nm, pos: pn.pos }
+            arenaSetNode(patIx, rd)
+            sidNoteNodeName(patIx)
+          } else if !hole {
+            matchPatRefused[patIx] = true
+            tErr(why, patIx)
+          }
         }
       }
     }
@@ -55455,8 +55457,10 @@ function checkMatchExprNode(n: MatchExpr, ix: i32) {
   // The scrutinee and arm bodies are NOT in return-tail position — restore the flag on every
   // exit so a `match` subexpression stays transparent to a sibling in the same statement.
   const nulLit = tyIsNullableLitUnion(st)
-  if tyIsIntMatchScrut(st) || tyIsHole(st) || tyIsLitUnion(st) || nulLit {
-    resolveMatchConstPats(n)
+  if tyIsIntMatchScrut(st) || tyIsLitUnion(st) || nulLit {
+    resolveMatchConstPats(n, false)
+  } else if tyIsHole(st) {
+    resolveMatchConstPats(n, true)
   }
   if tyIsIntMatchScrut(st) || (tyIsHole(st) && matchArmsAreIntLits(n)) {
     const ri = checkMatchIntArms(n, ix, st)
@@ -55542,7 +55546,7 @@ function checkMatchExprNode(n: MatchExpr, ix: i32) {
           tErr(
             "invalid match pattern `"
               + pn.isVariant
-              + "` — a pattern is a member string literal"
+              + "` — a pattern is a member string literal, a `const` with a literal value"
               + matchNulPatHint(nulLit)
               + " or the `_` wildcard",
             patIx,
@@ -55595,7 +55599,7 @@ function checkMatchExprNode(n: MatchExpr, ix: i32) {
         // same story — it covers nothing, so name it rather than mis-blame coverage.
         sawBadPat = true
         tErr(
-          "invalid match pattern — a pattern is a member string literal or the `_` wildcard",
+          "invalid match pattern — a pattern is a member string literal, a `const` with a literal value or the `_` wildcard",
           patIx,
         )
       }

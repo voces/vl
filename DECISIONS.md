@@ -8786,14 +8786,24 @@ closes Rust's hazard where renaming a constant silently turns its arm into a cat
 
 **Decided in the lane, within the ruling.**
 
-* **A type wins.** A bare name that resolves as a type (`null`, a primitive, a declared type or
-  bound, a live type parameter) stays a type pattern, so no existing program changes meaning.
-  Over a value union the arms are member types, and a constant there is refused as a value.
+* **Which wins, a type or a constant of the same name, depends on the scrutinee (coordinator
+  ruling, review round 2).** Over a VALUE vocabulary (an integer or a literal-union scrutinee)
+  no type but `null` is ever a valid pattern, so a lexically visible literal-valued constant
+  wins over a same-named type or type parameter. Over a union of types the arms are types, so
+  the type wins and a constant there is refused as a value. This refuses nothing that could
+  otherwise run. A hole scrutinee is decided by its arms, so there a type stays a type.
+* **The module merge keeps both spellings.** It renames a pattern as a type, as before, and
+  when a local value shadows the name it banks the value spelling beside the node
+  (`matchPatValueName`), so each vocabulary reads the name it takes. Round 1 skipped the
+  rename instead, which refused an imported type pattern that a local shadowed.
 * **Imported constants work, renamed imports too.** They resolve through the import like any
   value reference. VL has no qualified module access (`mod.MAGIC` does not parse anywhere), so
   there is nothing qualified to admit.
-* **A local constant shadows a module one**, where the `match` stands, as any read does; the
-  module merge leaves a shadowed pattern name alone for that reason (`modRwMatchPat`).
+* **A local constant shadows a module one**, where the `match` stands, as any read does.
+* **The unused-variable lint counts an arm as a use only where the checker reads a constant:**
+  a literal-valued `const` binding, with the name either no type the file could mean or the
+  `match` visibly over values (a literal arm, or an `i32`/`i64`-annotated scrutinee). The lint
+  runs without the checker, so this is the syntactic reading of the rule above.
 * **Typed constants work** (`const K2: K = "a"` over `K`, `const W: i64 = 3` over `i64`); the arm
   reads the constant, so its type is the constant's and the assignability rule is the literal
   arm's. A `const TS: string = "a"` over `K` is admitted by value, as `k == TS` is.
