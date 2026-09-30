@@ -152,7 +152,13 @@ import {
   nodeStartTok,
   tokFirstLineEndCol,
 } from "./fmt_util"
-import { sidArrGet, sidArrPut, sidLookup, sidOf } from "./symbols"
+import {
+  sidArrGet,
+  sidArrPut,
+  sidLookup,
+  sidNoteNodeName,
+  sidOf,
+} from "./symbols"
 import { arenaReplaceNode, isBinOpDecl, isBinOpFuncName } from "./ast"
 import {
   mkBool,
@@ -221,6 +227,7 @@ import {
   fnHasTpBound,
   fnTpBoundOf,
   isBodyTyDecl,
+  matchPatValueName,
   tsFnParamNames,
   tsKidCount,
   tsKidStart,
@@ -1000,7 +1007,10 @@ let cstrCandAny = false
 // `const` — an immutable name, not immutable data, so a field write through a const stays
 // legal. Kept module-level rather than a `Checker` field so the exported struct shape is
 // unchanged.
-let constScopes: {[string]: boolean}[] = []
+let constScopes: {[string]: i32}[] = []
+// Every module `const` by name, its declaration, from the hoist: the answer `constDeclOf` gives
+// for a module constant read before the checker reaches its declaration.
+let moduleConstDecl: {[string]: i32} = Map()
 
 // The scope chain inverted: for each name, the depths of the frames binding it, outermost first,
 // so the innermost binding is the last entry. `declare` and `popScope` keep it in step with
@@ -3818,6 +3828,11 @@ let intMatchHead: {[i32]: boolean} = Map()
 // The scrutinee nodes `desugarMatchAt` shared across a chain's arm tests: one node per `match`,
 // so its recorded type is the last arm's and says nothing about any one test (`matchScrutAt`).
 let matchScrutNode: {[i32]: boolean} = Map()
+// A `const` arm pattern (D3271): the pattern node, rewritten to a read of the constant, to the
+// literal node of that constant's initializer, where its value is read (`matchConstPatLitAt`).
+let matchConstPatLit: {[i32]: i32} = Map()
+// The arm patterns a `const`-pattern refusal already reported, so the vocabulary does not again.
+let matchPatRefused: {[i32]: boolean} = Map()
 // The `Index` and `Member` nodes an assignment writes through, which the list-union read
 // rewrite leaves alone.
 let luWriteTgt: {[i32]: boolean} = Map()
@@ -4854,6 +4869,8 @@ export function initChecker() {
   nodeTyIx = []
   intMatchHead = Map()
   matchScrutNode = Map()
+  matchConstPatLit = Map()
+  matchPatRefused = Map()
   chainProvenCond = []
   optCallRetIx = []
   optCallRetTy = []
@@ -5002,6 +5019,7 @@ export function initChecker() {
   T.scopes.push(Map())
   constScopes = []
   constScopes.push(Map())
+  moduleConstDecl = Map()
   fnDeclScopes = []
   fnDeclScopes.push(Map())
   fnAliasScopes = []
@@ -12793,6 +12811,8 @@ function applyNarrows(names: string[], tys: i32[]) {
       npAsg.push(0)
     } else {
       const wasConst = isConstName(names[i])
+      let wasDecl = -1
+      if wasConst { wasDecl = constDeclOf(names[i]) }
       const declTy = lookup(names[i])
       if declTy >= 0 && declTy != tys[i] {
         noteNarShadow(names[i], declTy, NAR_KIND_GUARD)
@@ -12800,7 +12820,7 @@ function applyNarrows(names: string[], tys: i32[]) {
       declare(names[i], tys[i])
       if wasConst {
         const ctop = constScopes.length - 1
-        if ctop >= 0 { constScopes[ctop][names[i]] = true }
+        if ctop >= 0 { constScopes[ctop][names[i]] = wasDecl }
       }
     }
     i = i + 1
@@ -15426,6 +15446,19 @@ function declareFnDeclNode(name: string, nodeIx: i32) {
 function lookupFnAliasNode(name: string) {
   const i = lookupDepth(name)
   if i >= 0 && i < fnAliasScopes.length { return fnAliasScopes[i][name] ?? -1 }
+  -1
+}
+
+// The `const` declaration `name` currently resolves to, or -1 when its innermost binding is not a
+// `const`. A module constant the checker has not reached yet answers from its hoist (D3271).
+function constDeclOf(name: string) {
+  const i = lookupDepth(name)
+  if i < 0 { return -1 }
+  if i < constScopes.length {
+    const d = constScopes[i][name] ?? -1
+    if d >= 0 { return d }
+  }
+  if i == 0 { return moduleConstDecl[name] ?? -1 }
   -1
 }
 
@@ -44777,6 +44810,7 @@ function checkProgramNode(n: Program) {
           }
         }
         declare(sm.letName, mty)
+        if sm.letKw == "const" { moduleConstDecl[sm.letName] = stmts[mi] }
         if mty == TY_ERR && sm.letType < 0 && sm.letInit >= 0 {
           phLets.push(stmts[mi])
         }
@@ -45213,8 +45247,7 @@ function matchElseArmOf(pats: i32[], armStart: i32[], armCount: i32[]) {
   while ai < nArms {
     let pj = 0
     while pj < armCount[ai] {
-      const p = P.nodes[pats[armStart[ai] + pj]]
-      if p is Ident { wildArm = ai }
+      if matchPatIsWild(pats[armStart[ai] + pj]) { wildArm = ai }
       pj = pj + 1
     }
     ai = ai + 1
@@ -54642,7 +54675,7 @@ function checkLetDeclNode(n: LetDecl, ix: i32) {
   if symEnabled != 0 { symDecl(n.letName, ix, bound, 0) }
   if n.letKw == "const" {
     const ctop = constScopes.length - 1
-    if ctop >= 0 { constScopes[ctop][n.letName] = true }
+    if ctop >= 0 { constScopes[ctop][n.letName] = ix }
   }
   // Definite-assignment: an uninitialized `let x` starts unassigned; a later read before a
   // write is an error. An initialized `let`/`const` is assigned from the start and never tracked.
@@ -54732,16 +54765,9 @@ function matchArmsAreIntLits(n: MatchExpr) {
   let i = 0
   while i < n.matchPats.length {
     const patIx = n.matchPats[i]
-    const num = matchPatIntNumOf(patIx)
-    if num >= 0 {
-      lits = lits + 1
-    } else {
-      // The parser mints an `Ident` pattern only for `_`.
-      let wild = false
-      const pn = P.nodes[patIx]
-      if pn is Ident { wild = true }
-      if !wild { return false }
-    }
+    const num = matchPatIntNumOf(matchPatValNode(patIx))
+    if num >= 0 { lits = lits + 1 }
+    else if !matchPatIsWild(patIx) { return false }
     i = i + 1
   }
   lits > 0
@@ -54752,7 +54778,7 @@ function matchArmsAreIntLits(n: MatchExpr) {
 function intArmRejectMsg(st: i32) {
   "invalid match pattern — a pattern over "
     + tyToStr(st)
-    + " is an integer literal or the `_` wildcard"
+    + " is an integer literal, a `const` with a literal value, or the `_` wildcard"
 }
 
 // The `NumLit` an integer-literal pattern delivers — the pattern node itself, or the operand
@@ -54778,6 +54804,13 @@ function matchNegPatNum(patIx: i32) {
     }
   }
   -1
+}
+
+// Where arm pattern `patIx` reads its value: a `const` arm's literal, else the pattern itself.
+function matchPatValNode(patIx: i32) {
+  const lit = matchConstPatLitAt(patIx)
+  if lit >= 0 { return lit }
+  patIx
 }
 
 // An integer-literal pattern's lexeme, sign included, for a diagnostic that quotes it back.
@@ -54840,14 +54873,15 @@ function checkIntArmLit(
   // A hole scrutinee can't decide the compare's form here — record the deferred `==` the
   // desugared chain emits, so the call that pins the parameter adjudicates it later.
   noteBinCstr(st, "==", pt)
+  if numIx < 0 { return true }
   const key = matchIntPatValue(numIx, neg)
   if key.length != 2 { return true }
   const k = i32ToStr(key[0]) + ":" + i32ToStr(key[1])
   if claimed.has(k) {
     tErr(
       "redundant match arm: `"
-        + matchIntPatLexeme(numIx, neg)
-        + "` is already covered",
+        + matchPatLabel(patIx, matchIntPatLexeme(numIx, neg))
+        + " is already covered",
       patIx,
     )
     return true
@@ -54879,19 +54913,24 @@ function checkMatchIntArms(n: MatchExpr, ix: i32, st: i32) {
     let pj = 0
     while pj < n.matchArmCount[ai] {
       const patIx = n.matchPats[n.matchArmStart[ai] + pj]
-      const pn = P.nodes[patIx]
-      if pn is Ident {
-        // The parser mints an `Ident` pattern only for `_`, so this arm is the wildcard.
+      const valIx = matchPatValNode(patIx)
+      if matchPatIsWild(patIx) {
         hasWild = true
         if wildArm < 0 { wildArm = ai }
+      } else if matchPatWasRefused(patIx) {
+        sawBadPat = true
       } else {
-        const numIx = matchPatIntNumOf(patIx)
-        if numIx < 0 {
+        const numIx = matchPatIntNumOf(valIx)
+        if valIx != patIx && numIx < 0 {
+          // A constant whose literal is no integer: its read is checked for the mismatch.
+          sawBadPat = true
+          checkIntArmLit(patIx, -1, false, st, claimed)
+        } else if numIx < 0 {
           // Any other pattern is another vocabulary's arm (a type pattern, a member string,
           // or a parse-recovery node) — named here rather than read as a missing member.
           sawBadPat = true
           tErr(intArmRejectMsg(st), patIx)
-        } else if (!checkIntArmLit(patIx, numIx, numIx != patIx, st, claimed)) {
+        } else if (!checkIntArmLit(patIx, numIx, numIx != valIx, st, claimed)) {
           sawBadPat = true
         }
       }
@@ -55075,15 +55114,13 @@ function checkMatchTypeArms(n: MatchExpr, ix: i32, st: i32, uMems: i32[]) {
     while pj < n.matchArmCount[ai] {
       const patIx = n.matchPats[n.matchArmStart[ai] + pj]
       const pn = P.nodes[patIx]
-      if pn is Ident {
-        // The parser mints an `Ident` pattern only for `_` (every other name is a type
-        // pattern), so this arm is the wildcard.
+      if matchPatIsWild(patIx) {
         hasWild = true
       } else if pn is IsExpr {
         const pt = isTypeTy(pn.isVariant, patIx)
         if pt < 0 {
           sawBadPat = true
-          tErr("unknown type '" + pn.isVariant + "' in match pattern", patIx)
+          tErr(matchUnknownTypeMsg(pn.isVariant, st), patIx)
         } else if tyIsCompositePat(pt) {
           sawBadPat = true
           tErr(
@@ -55271,6 +55308,147 @@ function checkMatchTypeArms(n: MatchExpr, ix: i32, st: i32, uMems: i32[]) {
   matchTy
 }
 
+// ── a `const` as a match arm (D3271) ─────────────────────────────────────────
+// A bare name in pattern position that names no type is a constant, compared by value: the
+// pattern node becomes a read of it, so the desugared test is the hand-written `scrut == K`,
+// and its literal is where the arm's value is read for duplicates, members and the jump table.
+
+// Whether the bare name `nm` resolves as a type here, so the pattern stays a type pattern.
+function matchPatNamesType(nm: string) {
+  if nm == "null" || nm == "Map" || nm == "Set" { return true }
+  if primTyOfName(nm) >= 0 || tpEnvTyOfName(nm) >= 0 { return true }
+  if cUserTypes.has(nm) || cBoundDecls.has(nm) { return true }
+  gaIndexOf(nm) >= 0
+}
+
+// The literal a constant's initializer `init` is, through parentheses: a number, `-` over one,
+// or a string. -1 for anything else, which is computed rather than written.
+function matchConstLitOf(init: i32) {
+  if init < 0 || init >= P.nodes.length { return -1 }
+  const k = parenPeelIx(init)
+  if k < 0 || k >= P.nodes.length { return -1 }
+  const e = P.nodes[k]
+  if e is NumLit || e is StrLit { return k }
+  matchNegConstLit(k)
+}
+
+// `k` when it is `-` directly over a number, the negative literal arm's own shape, else -1.
+function matchNegConstLit(k: i32) {
+  if matchNegPatNum(k) >= 0 { return k }
+  -1
+}
+
+// Whether initializer `init` is a literal no arm vocabulary takes: a character or a boolean.
+function matchConstIsOtherLit(init: i32) {
+  if init < 0 || init >= P.nodes.length { return false }
+  const e = P.nodes[parenPeelIx(init)]
+  e is CharLit || e is BoolLit
+}
+
+// Why the name `nm` at `patIx` cannot be an arm, or "" when it is a constant with a literal
+// value, whose literal `matchConstPatLit` then holds.
+function matchConstPatWhy(nm: string, patIx: i32) {
+  const lead = "a match arm needs a literal or a constant; `" + nm + "` "
+  if lookup(nm) < 0 {
+    return "unknown name `"
+      + nm
+      + "` in match pattern — an arm is a literal, a `const` with a literal value, or the `_` wildcard"
+  }
+  const d = constDeclOf(nm)
+  if d < 0 {
+    if lookupFnDeclNode(nm) >= 0 { return lead + "is a function" }
+    return lead + "is a variable, not a `const`"
+  }
+  const dn = P.nodes[d]
+  if dn is LetDecl {
+    const lit = matchConstLitOf(dn.letInit)
+    if lit < 0 && matchConstIsOtherLit(dn.letInit) {
+      return lead + "is not a number or string constant"
+    }
+    if lit < 0 {
+      return lead
+        + "has no literal value — declare it with a number or string literal, or test it with `==`"
+    }
+    matchConstPatLit[patIx] = lit
+    return ""
+  }
+  lead + "is not a `const`"
+}
+
+// Rewrites each arm pattern naming a constant into a read of it, and refuses every other bare
+// name. Asked of the value vocabularies, where no type but `null` is a pattern, so a constant the
+// name reaches wins over a type of that name. A `hole` scrutinee's arms still choose between the
+// two, so there a type stays a type and a refusal is left to the scrutinee's own error.
+function resolveMatchConstPats(n: MatchExpr, hole: boolean) {
+  let i = 0
+  while i < n.matchPats.length {
+    const patIx = n.matchPats[i]
+    const pn = P.nodes[patIx]
+    if pn is IsExpr {
+      const root = annTsOf(patIx)
+      if root >= 0 && tsKind[root] == TS_NAME && pn.isVariant != "null" {
+        const nm = matchPatValueName(patIx, pn.isVariant)
+        let isConst = false
+        if !hole { isConst = constDeclOf(nm) >= 0 }
+        if isConst || !matchPatNamesType(pn.isVariant) {
+          const why = matchConstPatWhy(nm, patIx)
+          if why == "" {
+            const rd: Node = { identName: nm, pos: pn.pos }
+            arenaSetNode(patIx, rd)
+            sidNoteNodeName(patIx)
+          } else if !hole {
+            matchPatRefused[patIx] = true
+            tErr(why, patIx)
+          }
+        }
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// The literal node a `const` arm pattern reads its value from, or -1 when `patIx` is not one.
+export function matchConstPatLitAt(patIx: i32) {
+  if patIx < 0 { return -1 }
+  matchConstPatLit[patIx] ?? -1
+}
+
+// Whether match pattern `patIx` is the `_` wildcard. A `const` arm is an `Ident` too (D3271).
+function matchPatIsWild(patIx: i32) {
+  const p = P.nodes[patIx]
+  if p is Ident { return matchConstPatLitAt(patIx) < 0 }
+  false
+}
+
+// Whether a `const`-pattern refusal already reported arm pattern `patIx`.
+function matchPatWasRefused(patIx: i32) { matchPatRefused[patIx] ?? false }
+
+// How a diagnostic quotes arm pattern `patIx`, whose literal reads `lexeme`: a constant by its
+// name and value, anything else by the lexeme. Closes the backtick the caller opened.
+function matchPatLabel(patIx: i32, lexeme: string) {
+  const p = P.nodes[patIx]
+  if p is Ident {
+    if matchConstPatLitAt(patIx) >= 0 {
+      return p.identName + "` (" + lexeme + ")"
+    }
+  }
+  lexeme + "`"
+}
+
+// A type pattern over a value union naming no type. A value there is named as one: the arms
+// of this vocabulary are member types, so a constant is not a pattern over it (D3271).
+function matchUnknownTypeMsg(nm: string, st: i32) {
+  if lookup(nm) >= 0 {
+    return "match pattern `"
+      + nm
+      + "` is a value, not a type — a pattern over "
+      + tyToStr(st)
+      + " is a member type or the `_` wildcard"
+  }
+  "unknown type '" + nm + "' in match pattern"
+}
+
 // Extracted from `checkNodeReal`'s `MatchExpr` arm (C3: thin the dispatcher).
 function checkMatchExprNode(n: MatchExpr, ix: i32) {
   // Three arm vocabularies, decided by the scrutinee: an integer dispatches on literals
@@ -55283,6 +55461,12 @@ function checkMatchExprNode(n: MatchExpr, ix: i32) {
   tpMatchOk = mTail || tpIfOkAt.has(ix)
   // The scrutinee and arm bodies are NOT in return-tail position — restore the flag on every
   // exit so a `match` subexpression stays transparent to a sibling in the same statement.
+  const nulLit = tyIsNullableLitUnion(st)
+  if tyIsIntMatchScrut(st) || tyIsLitUnion(st) || nulLit {
+    resolveMatchConstPats(n, false)
+  } else if tyIsHole(st) {
+    resolveMatchConstPats(n, true)
+  }
   if tyIsIntMatchScrut(st) || (tyIsHole(st) && matchArmsAreIntLits(n)) {
     const ri = checkMatchIntArms(n, ix, st)
     matchInRetTail = savedMatchTail
@@ -55292,7 +55476,6 @@ function checkMatchExprNode(n: MatchExpr, ix: i32) {
   // D1898 — a NULLABLE literal union takes the member-string vocabulary too, with `null` as
   // one more member: it is the same interned i32 atom as the bare set, `null` riding the spare
   // `-1`, so the desugared `k is null` / `k == "a"` chain is what already lowers.
-  const nulLit = tyIsNullableLitUnion(st)
   if !tyIsLitUnion(st) && !nulLit {
     // A third arm vocabulary (D1572): an integer scrutinee dispatches on literals, asked before
     // the union tests (which have no member set for one). A hole takes it too when arms are int literals.
@@ -55347,11 +55530,11 @@ function checkMatchExprNode(n: MatchExpr, ix: i32) {
     let pj = 0
     while pj < n.matchArmCount[ai] {
       const patIx = n.matchPats[n.matchArmStart[ai] + pj]
-      const pn = P.nodes[patIx]
-      if pn is Ident {
-        // The parser mints an `Ident` pattern only for `_` (D-MATCHTY: every other name now
-        // parses as a type pattern, handled below), so this arm is the wildcard.
+      const pn = P.nodes[matchPatValNode(patIx)]
+      if matchPatIsWild(patIx) {
         hasWild = true
+      } else if matchPatWasRefused(patIx) {
+        sawBadPat = true
       } else if pn is IsExpr {
         // D1898 — `null` is the one type pattern this vocabulary takes, and only where the
         // scrutinee carries it; on a bare set it is not a member and keeps the wording below.
@@ -55368,13 +55551,15 @@ function checkMatchExprNode(n: MatchExpr, ix: i32) {
           tErr(
             "invalid match pattern `"
               + pn.isVariant
-              + "` — a pattern is a member string literal"
+              + "` — a pattern is a member string literal, a `const` with a literal value"
               + matchNulPatHint(nulLit)
               + " or the `_` wildcard",
             patIx,
           )
         }
       } else if pn is StrLit {
+        // A constant's read is checked so the desugared `==` has its operand's type.
+        if matchConstPatLitAt(patIx) >= 0 { checkNode(patIx) }
         // The member name is the pattern's inner text (quotes stripped) — an expression
         // lexeme, not `tyname.groupInnerOf`'s home (a degenerate lexeme stays whole here).
         const raw = pn.strText
@@ -55388,23 +55573,38 @@ function checkMatchExprNode(n: MatchExpr, ix: i32) {
         }
         if found < 0 {
           tErr(
-            "match pattern \"" + inner + "\" is not a member of " + tyToStr(st),
+            "match pattern "
+              + matchStrPatLabel(patIx, inner)
+              + " is not a member of "
+              + tyToStr(st),
             patIx,
           )
         } else if covered[found] == 1 {
           tErr(
-            "redundant match arm: \"" + inner + "\" is already covered",
+            "redundant match arm: "
+              + matchStrPatLabel(patIx, inner)
+              + " is already covered",
             patIx,
           )
         } else {
           covered[found] = 1
         }
+      } else if matchConstPatLitAt(patIx) >= 0 {
+        // A constant holding a number: the read is checked for the mismatch it is.
+        sawBadPat = true
+        tErr(
+          "match pattern type mismatch: expected "
+            + tyToStr(st)
+            + ", found "
+            + tyToStr(checkNode(patIx)),
+          patIx,
+        )
       } else {
         // Any other node kind (a parse-recovered pattern, a future literal form):
         // same story — it covers nothing, so name it rather than mis-blame coverage.
         sawBadPat = true
         tErr(
-          "invalid match pattern — a pattern is a member string literal or the `_` wildcard",
+          "invalid match pattern — a pattern is a member string literal, a `const` with a literal value or the `_` wildcard",
           patIx,
         )
       }
@@ -55467,6 +55667,14 @@ function checkMatchExprNode(n: MatchExpr, ix: i32) {
   matchInRetTail = savedMatchTail
   retTailPos = mTail
   return matchTy
+}
+
+// How a litunion diagnostic quotes arm pattern `patIx` of member text `inner`: a constant by its
+// name and value, a literal by its text.
+function matchStrPatLabel(patIx: i32, inner: string) {
+  const p = P.nodes[patIx]
+  if p is Ident { return "`" + p.identName + "` (\"" + inner + "\")" }
+  "\"" + inner + "\""
 }
 
 // The `null` clause of the litunion pattern vocabulary's message: named only where the

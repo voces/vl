@@ -70,6 +70,12 @@ Phase 3 (now):
   `_`. See "An integer scrutinee" below; the ruling is DECISIONS.md §"`match` over an integer
   scrutinee".
 
+Phase 3b (now):
+- **Constant** — `MAGIC => …` where `MAGIC` is a `const` with a literal value, over any scrutinee
+  a literal arm takes: compared by value, with the literal arm's duplicate, exhaustiveness and
+  `br_table` treatment. A bare name that is neither a type nor such a constant is an error. The
+  ruling and its edges are DECISIONS.md §"A `const` with a literal value is a `match` arm".
+
 Deferred (follow-ups, captured here so we don't reinvent them):
 - **Guards** — `pat if cond => …` (`when`-style). Keep `if`-conditions OUT of the pattern grammar
   otherwise; arbitrary-condition `when` (Kotlin) would make exhaustiveness meaningless.
