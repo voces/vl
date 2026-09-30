@@ -5103,6 +5103,8 @@ export function initChecker() {
   symOccTy = []
   // Token-membership set mirroring `symOccTok` — reset in lockstep (see `symOccHasTok`).
   symOccTokSet = Map()
+  symPendNode = []
+  symPendName = []
   // Find-references' filled result column indexes `symOccTok`, so it is dropped with it.
   symRefOcc = []
   symRefCursorLine = -1
@@ -13141,7 +13143,34 @@ function symUse(useNode: i32, name: string, curTy: i32) {
   if symEnabled == 0 { return 0 }
   if symNameIsMinted(name) { return 0 }
   const decl = symResolve(name)
-  if decl < 0 { return 0 }
+  if decl < 0 {
+    symPendNode.push(useNode)
+    symPendName.push(name)
+    return 0
+  }
+  symUseDecl(useNode, name, curTy, decl)
+}
+
+// Uses whose name has no recorded binding where they stand: a read of a module binding declared
+// below it. `symFlushPending` resolves them against the module frame after the walk.
+let symPendNode: i32[] = []
+let symPendName: string[] = []
+
+function symFlushPending() {
+  if symEnabled == 0 || symDeclScope.length == 0 { return 0 }
+  let i = 0
+  while i < symPendNode.length {
+    const decl = symDeclScope[0][symPendName[i]] ?? -1
+    if decl >= 0 { symUseDecl(symPendNode[i], symPendName[i], -1, decl) }
+    i = i + 1
+  }
+  symPendNode = []
+  symPendName = []
+  0
+}
+
+// Record the use `useNode` of `name` as an occurrence of the binding declared at `decl`.
+function symUseDecl(useNode: i32, name: string, curTy: i32, decl: i32) {
   let tok = -1
   if useNode >= 0 && useNode < nodeToks.length { tok = nodeToks[useNode] }
   if symOccSkipTok(tok) { return 0 }
@@ -13636,6 +13665,9 @@ let lbiSynth: {[i32]: i32} = Map()
 // The reads that hold a literal `const`'s literal, which a check about a literal the author wrote
 // (a shift count, a constant range, a newtype's brand) does not treat as one.
 let lbiInlined: {[i32]: boolean} = Map()
+// The parameter default expressions: one node serves every call that omits the argument, so a
+// name there resolves in the module frame, never the caller's.
+let lbiDefaultExpr: {[i32]: boolean} = Map()
 // The rewritten reads, by node: the name each stands for, which the editor still resolves.
 let lbiInlinedName: {[i32]: string} = Map()
 // Each editor occurrence recorded for a rewritten read, and its node, whose type hover shows.
@@ -13643,9 +13675,6 @@ let lbiOccIx: i32[] = []
 let lbiOccNode: i32[] = []
 // The type a rewritten read meets where it stands, by node, for hover.
 let lbiUseTy: {[i32]: i32} = Map()
-// The parameter default expressions, shared by every call that omits the argument, so a read
-// in one is never rewritten.
-let lbiDefaultExpr: {[i32]: boolean} = Map()
 
 // Drop this compile's node-keyed tables; the driver calls it wherever the arena resets.
 export function lbiArenaReset() {
@@ -13660,9 +13689,19 @@ function lbiSymRead(ix: i32) {
   const nm = lbiInlinedName[ix] ?? ""
   if nm == "" { return 0 }
   const o = symOccTy.length
-  symUse(ix, nm, lookup(nm))
+  const pend = symPendNode.length
+  if (lbiDefaultExpr[ix] ?? false) && symDeclScope.length > 0 {
+    // A default's name is the module binding's, wherever the omitting call stands.
+    const d = symDeclScope[0][nm] ?? -1
+    if d >= 0 { symUseDecl(ix, nm, -1, d) }
+  } else {
+    symUse(ix, nm, lookup(nm))
+  }
   if symOccTy.length > o {
     lbiOccIx.push(o)
+    lbiOccNode.push(ix)
+  } else if symPendNode.length > pend {
+    lbiOccIx.push(-1)
     lbiOccNode.push(ix)
   }
   0
@@ -13680,12 +13719,27 @@ function lbiNoteUseTy(ix: i32, ty: i32) {
   0
 }
 
+// The occurrence recorded for node `ix`, or -1.
+function lbiOccOfNode(ix: i32): i32 {
+  if ix < 0 || ix >= nodeToks.length { return -1 }
+  const tok = nodeToks[ix]
+  let i = symOccTok.length - 1
+  while i >= 0 {
+    if symOccTok[i] == tok { return i }
+    i = i - 1
+  }
+  -1
+}
+
 // Give each rewritten read's occurrence the type its literal took there.
 function lbiSymTypes() {
   let i = 0
   while i < lbiOccIx.length {
-    const t = lbiUseTy[lbiOccNode[i]] ?? nodeTyOf(lbiOccNode[i])
-    if t >= 0 && lbiOccIx[i] < symOccTy.length { symOccTy[lbiOccIx[i]] = t }
+    const n = lbiOccNode[i]
+    let o = lbiOccIx[i]
+    if o < 0 { o = lbiOccOfNode(n) }
+    const t = lbiUseTy[n] ?? nodeTyOf(n)
+    if t >= 0 && o >= 0 && o < symOccTy.length { symOccTy[o] = t }
     i = i + 1
   }
   0
@@ -14089,7 +14143,7 @@ function lbiConstLitAt(ix: i32, name: string): i32 {
   ) {
     return -1
   }
-  if lbiDefaultExpr[ix] ?? false { return -1 }
+  if lbiDefaultExpr[ix] ?? false { return lbiModLit[name] ?? -1 }
   const c = lbiCandOfName(name, sidOfNode(ix))
   if c < 0 || !lbiIsConst[c] { return -1 }
   lbiLitOf(c)
@@ -14257,6 +14311,12 @@ function lbiNoteStore(tc: i32, src: i32) {
   lbiLeaves(src, cands, tys, froms)
   for c in cands {
     if c != tc && lbiAnn[c] < 0 { lbiPush(tc, LBI_EDGE, c, src) }
+  }
+  // An integer literal in the stored tree (`y += 3000000000`) bounds it as a stored literal does.
+  const leaves: i32[] = []
+  lbiTreeLeaves(src, leaves, 0)
+  for l in leaves {
+    if intLitLexemeOf(l) != "" { lbiPush(tc, LBI_LIT, lbiLitFits(l), l) }
   }
   let i = 0
   while i < tys.length {
@@ -39211,7 +39271,8 @@ function checkParamDefaults(n: FuncDecl, params: i32[], paramTys: i32[]) {
         } else {
           seedExpected(dIx, pt)
           const dt = checkNode(dIx)
-          if pt >= 0 && !assignable(dt, pt) {
+          // Delivered like an argument, so a literal takes the parameter's type (`x: f32 = 0.1`).
+          if pt >= 0 && !assignableExpr(dIx, dt, pt) {
             tErr(
               "parameter `"
                 + p.parName
@@ -47656,6 +47717,12 @@ function checkNodeReal(ix: i32) {
     // site that omits the argument; the second reading is why the mark exists, so a
     // caller-local binding sharing the const's name cannot capture the substituted reference.
     if isDefaultGlobalRef(ix) {
+      // A literal `const` is its literal here too, taken at the parameter's type.
+      const dlit = lbiModLit[n.identName] ?? -1
+      if dlit >= 0 {
+        lbiInlineLit(ix, dlit, n.pos, n.identName)
+        return checkNodeReal(ix)
+      }
       if T.scopes.length > 0 {
         if T.scopes[0].has(n.identName) {
           return T.scopes[0][n.identName] ?? TY_ERR
@@ -49682,6 +49749,7 @@ export function checkProgram(rootIx: i32) {
     lbiDropUnobservable()
     passes = passes + 1
   }
+  symFlushPending()
   lbiSymTypes()
   lbiReport()
 }
@@ -56396,10 +56464,7 @@ function checkIntArmLit(
 ) {
   // Checked as the expression it is, so `nodeTyIx` is filled for the `==` the desugar builds
   // over it — an `i32` literal reaches an `i64` scrutinee by the widening lattice, never the reverse.
-  // A constant arm keeps its name, which the arm's diagnostics quote.
-  lbiKeepName = lbiKeepName + 1
   const pt = checkNode(patIx)
-  lbiKeepName = lbiKeepName - 1
   if !assignable(pt, st) {
     tErr(
       "match pattern type mismatch: expected "
@@ -56967,11 +57032,11 @@ function matchPatWasRefused(patIx: i32) { matchPatRefused[patIx] ?? false }
 // How a diagnostic quotes arm pattern `patIx`, whose literal reads `lexeme`: a constant by its
 // name and value, anything else by the lexeme. Closes the backtick the caller opened.
 function matchPatLabel(patIx: i32, lexeme: string) {
-  const p = P.nodes[patIx]
-  if p is Ident {
-    if matchConstPatLitAt(patIx) >= 0 {
-      return p.identName + "` (" + lexeme + ")"
-    }
+  if matchConstPatLitAt(patIx) >= 0 {
+    const p = P.nodes[patIx]
+    let nm = lbiInlinedName[patIx] ?? ""
+    if p is Ident { nm = p.identName }
+    if nm != "" { return nm + "` (" + lexeme + ")" }
   }
   lexeme + "`"
 }

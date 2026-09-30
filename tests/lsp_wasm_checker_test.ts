@@ -629,6 +629,32 @@ Deno.test({
   }
 });
 
+// A read above its binding's declaration — a literal `const` at the top level, or any module
+// binding read in a function written above it — is still a reference, so a rename reaches it.
+Deno.test({
+  name: "wasm-symbols: a read above the declaration is a reference",
+  ignore,
+}, async () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  const src = "print(K + 1)\n" +
+    "function above(): i32 { K + N }\n" +
+    "const K = 3\n" +
+    "function one(): i32 { 1 }\n" +
+    "const N = one()\n";
+  const at = (r: { start: { line: number; character: number } }) =>
+    `${r.start.line}:${r.start.character}`;
+  const k = (await checker.referencesAt(src, "/tmp/x.vl", noSiblings, 2, 6, true)).map(at).sort();
+  if (JSON.stringify(k) !== '["0:6","1:24","2:6"]') {
+    throw new Error(`K references: want ["0:6","1:24","2:6"], got ${JSON.stringify(k)}`);
+  }
+  const n = (await checker.referencesAt(src, "/tmp/x.vl", noSiblings, 4, 6, true)).map(at).sort();
+  if (JSON.stringify(n) !== '["1:28","4:6"]') {
+    throw new Error(`N references: want ["1:28","4:6"], got ${JSON.stringify(n)}`);
+  }
+  const hover = await checker.hoverTypeAt(src, "/tmp/x.vl", noSiblings, 0, 6);
+  if (hover !== "i32") throw new Error(`hover above the declaration: want i32, got ${hover}`);
+});
+
 Deno.test({
   name: "wasm-symbols: an un-annotated param hovers as everything its body demands",
   ignore,

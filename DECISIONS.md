@@ -8845,9 +8845,10 @@ parenthesised — is re-typed only by:
   map value or other stored place, a nullable number slot (its number), an annotated return, a
   list index (`i32`), a map key;
 * STORES into it (`s = e`, `s += e`), where `e`'s type counts, joined with the literal's own type
-  (so storing an `f32` into `let x = 0.5` keeps `f64`); a stored literal bounds it to the types
-  that hold that literal (`y = 3000000000` needs a 64-bit type; `y = 0xFFFFFFFF` is `-1` at `i32`
-  and 4294967295 at `i64`, the width the other uses choose);
+  (so storing an `f32` into `let x = 0.5` keeps `f64`); a stored literal, whole or in the stored
+  expression (`y += 3000000000`), bounds it to the types that hold that literal (`y = 3000000000`
+  needs a 64-bit type; `y = 0xFFFFFFFF` is `-1` at `i32` and 4294967295 at `i64`, the width the
+  other uses choose);
 * a store of another literal `let`, solved jointly by a worklist.
 
 Rules:
@@ -8897,15 +8898,17 @@ depth and, at the top level, in either order.
 
 Mechanism: the checker rewrites each read into a copy of the literal the moment it resolves it,
 so the checker and the emitter see the literal, and the editor still records the read as an
-occurrence of the name, with the type it takes there for hover. The reads kept as the NAME are
-those where the name is the point or the value cannot differ:
+occurrence of the name (a read above the declaration included), with the type it takes there
+for hover. A parameter default and a `match` arm are rewritten like any read, so they take the
+literal at the parameter's or the scrutinee's type (`x: i64 = B` and an arm `B =>` over `i64`
+are 4294967295 for `const B = 0xFFFFFFFF`); an arm's diagnostics still quote it by name. A
+default is delivered like an argument, so `x: f32 = 0.1` is the `f32` 0.1, written or read
+through a `const`, as `let g: f32 = 0.1` already was. Two
+kinds of read keep the NAME:
 
 * a write target (`K = 1`, `K += 1`, `K++`): the write needs the binding, and its refusal names it;
-* a `match` arm (`K => …`): the arm is the constant by name (D3271), and its value is the literal;
-* a `for` range bound or step: a range is `i32`, so the value is the same, and the constant-range
-  refusals and the step floor judge a literal the author wrote (`step zero` stays a computed step);
-* a parameter default: one node serves every call that omits the argument, always at the
-  parameter's type, so the value is the same.
+* a `for` range bound or step: a range is `i32`, where a literal and its name read the same, and
+  the constant-range refusals and the step floor judge a literal the author wrote.
 
 Two more are rewritten but flagged, because their checks are about a literal the author wrote: a
 shift count past the width (taken modulo, as for any computed count, not refused) and a
