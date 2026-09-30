@@ -116,7 +116,6 @@ import {
   simdRowSig,
   truncSatFromF64,
   truncSatOp,
-  tyBearsNull,
   tyIsLitUnion,
   tyIsLitUnionArray,
   tyIsLitUnionOrLit,
@@ -853,7 +852,6 @@ import {
   globalNameIsNonConstSid,
   globalNulListCellRead,
   holeBindsFunc,
-  holeOperandTyOf,
   identCellSlot,
   identCellVKind,
   identChainTyBoxedUnion,
@@ -871,6 +869,7 @@ import {
   ifJoinNarrowsPerArm,
   ifJoinTypedAtom,
   ifJoinUnionName,
+  ifLinkYieldsNull,
   indexElemUnionName,
   indexPlaceNonNull,
   inferredRetMapSlot,
@@ -15203,6 +15202,17 @@ function emitIfExprRef(
 ) {
   // An `else if` chain is emitted along its spine, so its depth costs no stack (D1990): each
   // link leaves its frame open for the next, and the frames close innermost-first.
+  if kind == "str" && strJoinDropsNulAtom(ifIx, fnIx) {
+    // Anchored at the condition, which an instance shares with the source: a rebuilt `if`
+    // has no token of its own.
+    let at = ifIx
+    const sj = P.nodes[unwrapParen(ifIx)]
+    if sj is IfStmt { at = sj.ifCond }
+    return emitFailAt(
+      "emitProgram: a string join whose arm is a nullable literal union was typed non-null here",
+      at,
+    )
+  }
   const open: i32[] = []
   let cur = ifIx
   let rc = 1
@@ -15218,22 +15228,30 @@ function emitIfExprRef(
   closeIfChainFrames(open, rc, false)
 }
 
-// True if the `if` link at `ifIx` can yield `null`: its recorded join is nullable, it has no
-// else, or one of its own arms is a bare `null`. A chain's blocktype is nullable from the first
-// such link inward, so a link typed `null` alone still matches its enclosing frame (D2227).
-// In a hole instance the join's recorded type is the hole's variable, read at its pin (D3016).
-function ifLinkYieldsNull(ifIx: i32, fnIx: i32) {
-  if nodeTyIsNullable(ifIx) { return true }
-  if tyBearsNull(holeOperandTyOf(ifIx, fnIx)) { return true }
-  const s = P.nodes[unwrapParen(ifIx)]
-  if s is IfStmt {
-    if s.ifElse < 0 { return true }
-    if exprIsNullLike(ifArmValueExpr(s.ifThen)) { return true }
-    if P.nodes[s.ifElse] is Block {
-      return exprIsNullLike(ifArmValueExpr(s.ifElse))
+// Whether the string join at `ifIx` is non-null along its whole chain while an arm widens a
+// `K | null` atom, whose `-1` becomes `null`: the join's type dropped a null an arm still holds,
+// as a generic's `??` joined with a nullable pin's other side does (D3290).
+function strJoinDropsNulAtom(ifIx: i32, fnIx: i32): boolean {
+  let cur = ifIx
+  let widens = false
+  while cur >= 0 {
+    if ifLinkYieldsNull(cur, fnIx) { return false }
+    const s = P.nodes[unwrapParen(cur)]
+    cur = -1
+    if s is IfStmt {
+      const tv = ifArmValueExpr(s.ifThen)
+      if tv >= 0 && nulAtomWidenTexts(tv).length > 0 { widens = true }
+      if s.ifElse >= 0 {
+        if P.nodes[s.ifElse] is IfStmt {
+          cur = s.ifElse
+        } else {
+          const ev = ifArmValueExpr(s.ifElse)
+          if ev >= 0 && nulAtomWidenTexts(ev).length > 0 { widens = true }
+        }
+      }
     }
   }
-  false
+  widens
 }
 
 // One link of `emitIfExprRef`: 0 or -1 as that function returns, or 1 when the else is another `if`
