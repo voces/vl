@@ -168,6 +168,10 @@ ROWS = [
     ("frameBindsCache", ["fcbSidGen"], "probe",
      ("  if sidArrGet(fcbSidGen, sid) != fcbGen { return -1 }",
       "  if true { return -1 }")),
+    # D3293: per frame and name, whether a body `let` or loop variable shadows a parameter.
+    ("paramShadowCache", ["pshSidGen"], "probe",
+     ("  if fnIx == pshFrame && sid < pshSidGen.length && pshSidGen[sid] == pshGen {",
+      "  if false && fnIx == pshFrame && sid < pshSidGen.length && pshSidGen[sid] == pshGen {")),
     ("listRepQuery", ["lrMemoGen"], "probe",
      ("    if lrMemoGen[exprIx] == lrGen && lrMemoFn[exprIx] == fnIx {",
       "    if false && lrMemoGen[exprIx] == lrGen && lrMemoFn[exprIx] == fnIx {")),
