@@ -9084,8 +9084,11 @@ judged by its type (D3341).
 stores a field differently takes that record as its type: the destination is written as its
 annotation and the program is checked again, the literal-binding re-check of D3246. Every later
 use then sees the destination type, which is what makes D2933's element delivery run, and two
-demands that store differently are refused naming both lines. Adoption is all or nothing per
-binding, and it has these limits:
+demands that store differently are refused naming both lines. The binding is found the way
+freshness is (D3441-D3443): through an `if`, `match` or block tail, either `??` operand and a
+generic identity call, and at a union destination on the member the value lands on, its one
+record (or list of records) member of those field names, as the annotated twin
+`const q: D = …` lands. Adoption is all or nothing per binding, and it has these limits:
 
 * **Across a numeric width or kind the binding adopts fully** (owner ruling D3339 (A),
   2026-09-30): `const q = { v: 1 }` delivered as `{ v: f64 }` is that type at every read, before
@@ -9101,19 +9104,36 @@ binding, and it has these limits:
 * **No adoption of a function's result.** The first candidate wrote the destination as a
   function's declared result, and an annotated function whose literal is built at a declared
   record of its own fields is invalid wasm where the un-annotated call ran (D3342). A function's
-  call stays master's delivery.
+  call stays master's delivery, with one exception (D3444): a function called at exactly one
+  site whose every returned value is an object literal builds those literals at that call's
+  destination (their rep type, `recFnBuiltAtDst`), which lets an integer field land in a float
+  one and takes precedence over a declared row of the literal's own fields (D2437, D3349,
+  D3351, D3430). Called at two sites, such a delivery is refused as below; building both at the
+  destination would be adopting the function's result.
 * **The re-check is undone** when it refuses anything but the adopted binding handed on whole,
   for an adoption that changes no number's width or kind.
 
 Where master built invalid wasm for a delivery the checker neither adopts nor refuses as
-existing, it refuses instead, with the existing-record wording: a record a function built into a
+existing, it refuses instead, with the existing-record wording: a record a function called at
+more than one site built into a record (not a union) with a
 bare `f32`/`f64` field it holds as an integer, which has no conversion (`recFloatBuiltElsewhere`);
 a literal built inside a function or through a generic identity call where a record of its own
 fields is declared, by a `type` or inline in an annotation (D3430), which builds it at that row
 (`recBuiltAtDeclared`, D3338 — a method or generic argument declines, since `Map.set` of the same
-call runs on master, D3349-D3351); and one binding or function a kept delivery builds at another
+call runs on master; a fresh call handed through a generic identity is judged at the identity);
+and one binding or function a kept delivery builds at another
 storage and that is handed on whole at its own type, or delivered at two storages
 (`recKeptConflicts`).
+
+**Measured for lane RC3, against master `028dedb33`.** The annotated twin is the oracle. A 312-cell
+grid (six field pairs, seventeen delivery positions, reads before, after and none): 0
+disagreements, 62 running cells print their twin's new value, 0 runs lost. A 216-cell
+function-result grid and a 162-cell declared-own-row grid: 0 runs lost, 168 cells from a
+refusal or invalid wasm to runs, 14 from invalid wasm to a refusal; the 48 cells still disagreeing are a function called at two
+sites or handed through a generic identity, both refused, none invalid. The distilled corpus
+moves exactly as master's does, and plumb's 214 entry files check identically. A union
+destination (`R | string`, `R | null`, `R | G`) keeps master's boxed build of a fresh call at
+every site count (a 72-cell grid and the #3325 review's 720-cell grid: 0 runs lost).
 
 **Measured before landing, against master `2b30e3674`, after the #3312 review.** The distilled
 corpus lost no runs. The review's 1,344-cell grid: 0 value changes, 0 fresh runs lost, 9 invalid

@@ -33882,16 +33882,22 @@ function recKeptConflicts() {
       while k >= 0 && recKeptDecl[k] != d { k = k - 1 }
       if k >= 0 {
         recAdRaising = true
+        // One delivery in a generic body reaches the value at two instances' types.
+        let how = " where line "
+          + i32ToStr(nodeLineOf(recKeptAt[k]))
+          + " delivers it, and it is handed on here at its own type"
+        if recKeptAt[k] == u {
+          how = " by this delivery at one instance of the generic function around it, and "
+            + "kept at its own type at another"
+        }
         tErr(
           recKeptWhat(d)
             + " is built as "
             + tyToStr(recKeptDst[k])
-            + " where line "
-            + i32ToStr(nodeLineOf(recKeptAt[k]))
-            + " delivers it, and it is handed on here at its own type, which stores a field "
-            + "differently; a record is shared, not copied, so one value cannot be both. "
-            + "Annotate it with one of the types, and copy it with an object literal for the "
-            + "other",
+            + how
+            + ", which stores a field differently; a record is shared, not copied, so one "
+            + "value cannot be both. Annotate it with one of the types, and copy it with an "
+            + "object literal for the other",
           u,
         )
         recAdRaising = false
@@ -34420,6 +34426,53 @@ function recFloatBuiltElsewhere(at: i32, srcTy: i32, dstTy: i32): boolean {
   true
 }
 
+// A function with no declared result called only at `call`, whose every returned value is an
+// object literal: each is built at the record the call delivers it to, `dstTy`'s member it
+// lands on (D3444). True when it recorded that build.
+function recFnBuiltAtDst(fd: i32, call: i32, srcTy: i32, dstTy: i32): boolean {
+  const own = nonNulTyOf(srcTy)
+  if own < 0 || !(T.tys[own] is TyObj) { return false }
+  const dst = recAdLanding(own, nonNulTyOf(dstTy))
+  if dst < 0 || !(T.tys[dst] is TyObj) || !objFieldNameSetsEq(own, dst) {
+    return false
+  }
+  cwIxBuild()
+  const sites: i32[] = []
+  if rcwCallSites(fd, sites) >= 0 || sites.length != 1 || sites[0] != call * 2 {
+    return false
+  }
+  const leaves = recFnValueLeaves(fd)
+  if leaves.length == 0 { return false }
+  for lf in leaves {
+    if !(P.nodes[cwPeel(lf)] is ObjLit) { return false }
+  }
+  for lf in leaves { recordRepTyAdopt(cwPeel(lf), dst, 6) }
+  true
+}
+
+// Does the object literal `lit` fit the record `dst` field by field, where only an integer
+// literal may meet another number, at every depth of object literals?
+function recLitFits(lit: i32, dst: i32, depth: i32): boolean {
+  if lit < 0 || dst < 0 || depth <= 0 { return false }
+  const d = T.tys[dst]
+  const e = P.nodes[lit]
+  if !(e is ObjLit) || !(d is TyObj) { return false }
+  if !objFieldNameSetsEq(nodeTyIxOf(lit), dst) { return false }
+  let i = 0
+  while i < d.objFieldNames.length {
+    const fx = cwPeel(objLitFieldExpr(lit, d.objFieldNames[i]))
+    const df = d.objFieldTypes[i]
+    if fx < 0 { return false }
+    const fe = P.nodes[fx]
+    const ok = assignable(nodeTyIxOf(fx), df)
+      || (fe is NumLit && recNumClass(df) != "")
+      || (fe is ObjLit && recLitFits(fx, nonNulTyOf(df), depth - 1))
+    if !ok { return false }
+    i = i + 1
+  }
+  true
+}
+
 // Does the record `dst` store as a bare `f32` or `f64` a field the record `src` holds as an
 // integer, at any depth of records?
 function recIntToFloat(src: i32, dst: i32, depth: i32): boolean {
@@ -34700,6 +34753,19 @@ function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
   const p = cwPeelValue(srcExpr)
   if p < 0 || p >= P.nodes.length { return 0 }
   const e = P.nodes[p]
+  // A value `if`, `match` or block delivers each tail, and a `??` each operand (D3441).
+  if recIsJoin(p) {
+    const leaves: i32[] = []
+    tailValueLeaves(p, leaves)
+    for lf in leaves { recAdoptNote(lf, nodeTyIxOf(lf), dstTy) }
+    return 0
+  }
+  const co = recCoalesceOperands(p)
+  if co.length == 2 {
+    recAdoptNote(co[0], nodeTyIxOf(co[0]), dstTy)
+    recAdoptNote(co[1], nodeTyIxOf(co[1]), dstTy)
+    return 0
+  }
   if e is Ident {
     const decl = recFreshDeclOf(p)
     if decl < 0 { return 0 }
@@ -34708,7 +34774,7 @@ function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
       return recAdPushDecl(
         decl,
         tyArrayElemIx(srcTy),
-        tyArrayElemIx(nonNulTyOf(dstTy)),
+        tyArrayElemIx(recAdLandingList(nonNulTyOf(dstTy))),
         true,
         p,
       )
@@ -34731,12 +34797,50 @@ function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
   if e is Call {
     const fd = recInferredFnOf(p)
     if fd >= 0 {
-      if recFloatBuiltElsewhere(p, srcTy, dstTy) { return 0 }
+      if recFnBuiltAtDst(fd, p, srcTy, dstTy) {
+        return recAdPushDecl(fd, srcTy, nonNulTyOf(dstTy), false, p)
+      }
+      // A union destination keeps master's delivery, which boxes the record it builds.
+      if recFloatBuiltElsewhere(p, srcTy, nonNulTyOf(dstTy)) { return 0 }
       if recHasLitLeaf(fd) && recBuiltAtDeclared(p, srcTy, dstTy) { return 0 }
       return recAdPushDecl(fd, srcTy, nonNulTyOf(dstTy), false, p)
     }
     const pa = recPassThroughArg(p)
     if pa >= 0 {
+      // A generic identity hands its argument back, so a literal binding there adopts (D3442).
+      const pp = cwPeelValue(pa)
+      if (
+        pp >= 0
+        && ((P.nodes[pp] is Ident && recFreshDeclOf(pp) >= 0)
+          || recPassThroughArg(pp) >= 0
+          || recIsJoin(pp)
+          || recCoalesceOperands(pp).length == 2)
+      ) {
+        return recAdoptNote(pa, nodeTyIxOf(pa), dstTy)
+      }
+      // A fresh call handed through is built at its own row, as it is delivered directly.
+      const pf = if pp >= 0 { recInferredFnOf(pp) } else { -1 }
+      if pf >= 0 {
+        const pl = nonNulTyOf(dstTy)
+        if (
+          recFloatField(nonNulTyOf(srcTy), pl) != ""
+          && recFloatBuiltElsewhere(p, srcTy, pl)
+        ) {
+          return 0
+        }
+        if recHasLitLeaf(pf) && recBuiltAtDeclared(p, srcTy, dstTy) { return 0 }
+      }
+      // An object literal argument is built at the identity's own instance, which holds an
+      // integer where a flat float field waits (D3442).
+      if pp >= 0 && P.nodes[pp] is ObjLit {
+        const ol = nonNulTyOf(dstTy)
+        if (
+          recFloatField(nonNulTyOf(srcTy), ol) != ""
+          && recFloatBuiltElsewhere(p, srcTy, ol)
+        ) {
+          return 0
+        }
+      }
       const po = recOriginExpr(pa)
       if (
         po >= 0
@@ -34816,11 +34920,19 @@ function recNamesDeepEq(a: i32, b: i32, depth: i32): boolean {
 }
 
 // Push one demand on the declaration `decl`: a binding, or a function with no declared result.
-function recAdPushDecl(decl: i32, own: i32, dst: i32, elem: boolean, at: i32) {
-  if own < 0 || dst < 0 || own >= T.tys.length || dst >= T.tys.length {
+function recAdPushDecl(
+  decl: i32,
+  own: i32,
+  dstIn: i32,
+  elem: boolean,
+  at: i32,
+) {
+  if own < 0 || dstIn < 0 || own >= T.tys.length || dstIn >= T.tys.length {
     return 0
   }
-  if !(T.tys[own] is TyObj) || !(T.tys[dst] is TyObj) { return 0 }
+  if !(T.tys[own] is TyObj) { return 0 }
+  const dst = recAdLanding(own, dstIn)
+  if dst < 0 || dst >= T.tys.length || !(T.tys[dst] is TyObj) { return 0 }
   if tyReachesHole(own, 8) || tyReachesHole(dst, 8) { return 0 }
   if !objFieldNameSetsEq(own, dst) { return 0 }
   if fieldStorageEq(own, dst, REC_STORE_DEPTH) { return 0 }
@@ -34848,6 +34960,41 @@ function recAdPushDecl(decl: i32, own: i32, dst: i32, elem: boolean, at: i32) {
   0
 }
 
+// The member of the union `dst` the record `own` lands on (D3443): its one record member of the
+// same field names, unless one of them already stores it as `own` does. Otherwise `dst`.
+function recAdLanding(own: i32, dst: i32): i32 {
+  const d = T.tys[dst]
+  if !(d is TyUnion) { return dst }
+  let hit = -1
+  for m in d.uMembers {
+    const mm = nonNulTyOf(m)
+    if mm >= 0 && T.tys[mm] is TyObj && objFieldNameSetsEq(own, mm) {
+      if hit >= 0 || fieldStorageEq(own, mm, REC_STORE_DEPTH) { return dst }
+      hit = mm
+    }
+  }
+  if hit < 0 { return dst }
+  hit
+}
+
+// The list member of the union `dst` a list literal lands on: its one list of records.
+// Otherwise `dst`.
+function recAdLandingList(dst: i32): i32 {
+  if dst < 0 { return dst }
+  const d = T.tys[dst]
+  if !(d is TyUnion) { return dst }
+  let hit = -1
+  for m in d.uMembers {
+    const mm = nonNulTyOf(m)
+    if mm >= 0 && T.tys[mm] is TyArray && tyHoldsObj(mm, 8) {
+      if hit >= 0 { return dst }
+      hit = mm
+    }
+  }
+  if hit < 0 { return dst }
+  hit
+}
+
 // A delivery its own type refuses, of a literal binding (or an element or field of a literal)
 // into a record that stores one of its numbers at another width or kind (`i32` into `f32`): the
 // binding adopts the record and the re-check judges its literal there, as its annotated twin's
@@ -34859,7 +35006,20 @@ function recAdForce(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
   const p = cwPeelValue(srcExpr)
   if p < 0 || p >= P.nodes.length { return false }
   const e = P.nodes[p]
-  if !(e is Ident || e is Index || e is ArrayLit || e is ObjLit) {
+  const fd = recInferredFnOf(p)
+  if fd >= 0 {
+    const dl = recAdLanding(nonNulTyOf(srcTy), nonNulTyOf(dstTy))
+    for lf in recFnValueLeaves(fd) {
+      if !recLitFits(cwPeel(lf), dl, REC_STORE_DEPTH) { return false }
+    }
+    return recFnBuiltAtDst(fd, p, srcTy, dstTy)
+  }
+  if (
+    !(e is Ident || e is Index || e is ArrayLit || e is ObjLit)
+    && !recIsJoin(p)
+    && recCoalesceOperands(p).length != 2
+    && recPassThroughArg(p) < 0
+  ) {
     return false
   }
   const before = recAdDecl.length
@@ -35316,6 +35476,14 @@ function listWidenWalk(
   if src == dst { return false }
   const x = listOriginExpr(expr)
   if x == LW_INFERRED { return false }
+  if x >= 0 && listWidenJoin(x, dst, depth, underNul) { return true }
+  if x >= 0 && (recIsJoin(x) || recCoalesceOperands(x).length == 2) {
+    return false
+  }
+  const pa = if x >= 0 { recPassThroughArg(x) } else { -1 }
+  if pa >= 0 {
+    return listWidenWalk(pa, nodeTyIxOf(pa), dst, depth - 1, underNul)
+  }
   const d = T.tys[dst]
   if d is TyNullable {
     const sn = T.tys[src]
@@ -35333,6 +35501,28 @@ function listWidenWalk(
     return listWidenIntoUnion(x, src, d.uMembers, depth, underNul)
   }
   listWidenFromSrc(x, src, dst, depth, underNul)
+}
+
+// A value `if`, `match` or block delivers each tail, and a `??` each operand, judged by its
+// own origin (D3441). True when one of them is refused.
+function listWidenJoin(
+  x: i32,
+  dst: i32,
+  depth: i32,
+  underNul: boolean,
+): boolean {
+  const leaves: i32[] = []
+  if recIsJoin(x) {
+    tailValueLeaves(x, leaves)
+  } else {
+    for o in recCoalesceOperands(x) { leaves.push(o) }
+  }
+  for lf in leaves {
+    if listWidenWalk(lf, nodeTyIxOf(lf), dst, depth - 1, underNul) {
+      return true
+    }
+  }
+  false
 }
 
 // A union destination accepts the source at some member; the walk refuses only when every
