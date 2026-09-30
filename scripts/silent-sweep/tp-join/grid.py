@@ -5,8 +5,10 @@ D3268, D3280, D3284, D3291 and D3332 on, and filed D3333, D3334 and D3335 from.
 Axes: pins (`i32`, `boolean`, `K`, `string`, a record `P`, `null`, `i32 | null`, `K | null`) for
 every pair and 40 seeded triples; the join (`if` chain or `match`) with no extra arm or a `null`,
 `5` or `"z"` arm; the delivery (returned then bound, returned into `print`, passed to a generic
-`show<U>`, bound, a record field); the reader (`print`, `is` per member class, a `match` per
-member class); the spelling (`<T0, T1>`, un-annotated holes, the direct concrete twin). Every
+`show<U>`, bound, a record field, and the #3310 review's three: a `let` reassigned, a lambda
+returning the join, lists `T[]` joined then indexed); the reader (`print`, `is` per member
+class, a `match` per member class, `isall`: `is` of every class, member or not); the spelling
+(`<T0, T1>`, un-annotated holes, the direct concrete twin). Every
 cell's expected output is computed here, from the arm each selector picks, so a cell grades
 `right` or `WRONG` on its own, and `INVALID` / `RTRAP` / `CRASH` / `check` / `emit` otherwise.
 
@@ -45,8 +47,11 @@ CLASSES = {"i": ["i32"], "b": ["boolean"], "k": ["K"], "s": ["string"], "p": ["P
 EXTRA = {"none": None, "null": ("null", "null", "null"), "lit": ("5", "i32", "5"),
          "str": ('"z"', "string", "z")}
 JOINS = ["chain", "match"]
-DELIVS = ["ret", "retp", "arg", "bind", "field"]
-READERS = ["print", "is", "match"]
+DELIVS = ["ret", "retp", "arg", "bind", "field", "letasg", "clo", "arrj"]
+READERS = ["print", "is", "match", "isall"]
+# `isall` asks every one of these, member of the join or not; the checker refuses a non-member
+# at the direct spelling by design, so that spelling is not generated for it.
+ISALL = ["i32", "string", "boolean", "f64", "null", "K", "P"]
 SPELL = ["tp", "hole", "dir"]
 CLAUSE1 = ("INVALID", "WRONG", "RTRAP", "CRASH")
 
@@ -82,6 +87,11 @@ def cell(pins, jform, extra, deliv, reader, spell):
         return None
     if deliv == "retp" and reader != "print":
         return None
+    if reader == "isall" and spell == "dir":
+        return None
+    # The three deliveries the #3310 review added carry no literal extra arm.
+    if deliv in ("letasg", "clo", "arrj") and extra in ("lit", "str"):
+        return None
     js, narms = join_src(n, jform, extra)
     vals = [PINS[p][1][i] for i, p in enumerate(pins)]
     if extra != "none":
@@ -93,6 +103,8 @@ def cell(pins, jform, extra, deliv, reader, spell):
             want.append(printed)
         elif reader == "is":
             want += ["true" if is_true(c, m) else "false" for m in uniq]
+        elif reader == "isall":
+            want += ["true" if is_true(c, m) else "false" for m in ISALL]
         else:
             want.append(c)
 
@@ -101,6 +113,8 @@ def cell(pins, jform, extra, deliv, reader, spell):
             return [f"print({e})"]
         if reader == "is":
             return [f"print({e} is {m})" for m in uniq]
+        if reader == "isall":
+            return [f"print({e} is {m})" for m in ISALL]
         arms = "\n".join(f'    {m} => "{m}"' for m in uniq)
         return [f"print(match {e} {{\n{arms}\n  }})"]
 
@@ -111,10 +125,14 @@ def cell(pins, jform, extra, deliv, reader, spell):
         src.append("}")
 
     def ann(i):
+        sfx = "[]" if deliv == "arrj" else ""
         if spell == "tp":
-            return f": T{i}"
+            return f": T{i}{sfx}"
         if spell == "dir":
-            return f": {PINS[pins[i]][0]}"
+            base = PINS[pins[i]][0]
+            if sfx and "|" in base:
+                base = f"({base})"
+            return f": {base}{sfx}"
         return ""
 
     params = ", ".join(f"a{i}{ann(i)}" for i in range(n))
@@ -127,13 +145,23 @@ def cell(pins, jform, extra, deliv, reader, spell):
     elif deliv == "bind":
         src.append(f"  const r = {js}")
         src += ["  " + l for l in rd("r")]
+    elif deliv == "letasg":
+        src += [f"  let r = {js}", "  if k == 99 { r = a0 }"]
+        src += ["  " + l for l in rd("r")]
+    elif deliv == "clo":
+        jj = js.replace("k ==", "j ==").replace("match k", "match j")
+        src += [f"  const f = (j: i32) => {jj}", "  const e = f(k)"]
+        src += ["  " + l for l in rd("e")]
+    elif deliv == "arrj":
+        src += [f"  const r = {js}", "  const e = r[0]"]
+        src += ["  " + l for l in rd("e")]
     else:
         src.append(f"  const o = {{ v: {js} }}")
         src += ["  " + l for l in rd("o.v")]
     src.append("}")
     for i, p in enumerate(pins):
         src.append(f"const x{i}: {PINS[p][0]} = {PINS[p][1][i][0]}")
-    args = ", ".join(f"x{i}" for i in range(n))
+    args = ", ".join((f"[x{i}]" if deliv == "arrj" else f"x{i}") for i in range(n))
     for sel in range(narms):
         if deliv == "ret":
             src.append(f"const v{sel} = g({args}, {sel})")
