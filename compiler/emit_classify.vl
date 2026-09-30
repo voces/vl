@@ -19958,6 +19958,10 @@ export function coalesceOperandPinNonNull(exprIx: i32, fnIx: i32): boolean {
   if !(e is BinExpr) { return false }
   const d = unwrapParen(e.binRight)
   if d < 0 { return false }
+  // A read off a map keeps the fused lowering, which reads the stored value at its own rep
+  // whatever a store before it narrowed the place to.
+  const mr = fusedMapReadRecvIx(unwrapParen(e.binLeft))
+  if mr >= 0 && mapRecvTyIn(mr, fnIx) >= 0 { return false }
   const pn = tyPrimNameOf(coalesceOperandPinTy(unwrapParen(e.binLeft), fnIx))
   if pn == "string" { return exprString(d, fnIx) }
   pn == "i32" && tyPrimNameOf(nodeTyIxOf(d)) == "i32"
@@ -28628,6 +28632,9 @@ function nulLitAtomTextsAt(ix: i32, fnIx: i32, depth: i32): string[] {
     const mv = mapTyValLitUnionTexts(mapRecvTyIn(e.idxArr, fnIx))
     if mv.length > 0 && !indexPlaceNonNull(unwrapParen(ix)) { return mv }
   }
+  // A `??` over such a read keeps the `-1` when its default can be null.
+  const cmv = coalMapReadNulAtomTexts(ix, fnIx)
+  if cmv.length > 0 { return cmv }
   // A call of a named function, whose return annotation `exprNulLitUnion` claimed it by.
   if e is Call && e.callFn >= 0 && P.nodes[e.callFn] is Ident {
     const t = fnIndexOfSid(sidOfNode(e.callFn))
@@ -28728,11 +28735,40 @@ function mapReadAtomTexts(ix: i32, fnIx: i32): string[] {
     if e.binOp != "??" { return none }
     const cr = fusedMapReadRecvIx(unwrapParen(e.binLeft))
     if cr < 0 || coalMapReadForeignDefault(cr, e.binRight, fnIx) { return none }
+    // A result that can still be null is the niche, never a bare member.
+    if coalMapDefaultMayBeNull(e.binRight, fnIx) { return none }
     return mapTyValLitUnionTexts(mapRecvTyIn(cr, fnIx))
   }
   const recv = fusedMapReadRecvIx(u)
   if recv < 0 { return none }
   mapTyValLitUnionTexts(mapRecvTyIn(recv, fnIx))
+}
+
+// The member texts of a `??` at `ix` over a read off an atom-valued map whose default can be
+// null, so the result keeps the `-1` niche; empty for any other expression.
+function coalMapReadNulAtomTexts(ix: i32, fnIx: i32): string[] {
+  const none: string[] = []
+  const u = unwrapParen(ix)
+  if u < 0 { return none }
+  const e = P.nodes[u]
+  if !(e is BinExpr) || e.binOp != "??" { return none }
+  const cr = fusedMapReadRecvIx(unwrapParen(e.binLeft))
+  if cr < 0 || !coalMapDefaultMayBeNull(e.binRight, fnIx) { return none }
+  if coalMapReadForeignDefault(cr, e.binRight, fnIx) { return none }
+  mapTyValLitUnionTexts(mapRecvTyIn(cr, fnIx))
+}
+
+// `coalesceDefaultNullable`, where a default that is itself a hole's read off a map its
+// instance pins also counts: that read is `V | null`, whatever the template recorded.
+function coalMapDefaultMayBeNull(defIx: i32, fnIx: i32): boolean {
+  if coalesceDefaultNullable(defIx, fnIx) { return true }
+  const dix = unwrapParen(defIx)
+  if dix < 0 { return false }
+  const d = P.nodes[dix]
+  if !(d is Index) || indexPlaceNonNull(dix) { return false }
+  const dt = nodeTyIxOf(dix)
+  if dt < 0 || dt >= T.tys.length || !(T.tys[dt] is TyVar) { return false }
+  mapRecvTyIn(d.idxArr, fnIx) >= 0
 }
 
 // The member texts of a call's atom result, read off the callee's function type — the texts

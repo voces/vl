@@ -9189,3 +9189,12 @@ filed-witness grader moved only the five rows this re-grades, and plumb-shape gu
 receiver, in the hole, `<T>` and direct spellings) went from 67 wrong values to none against the
 direct twin, and from 68 invalid modules or traps to 44, all of them D3399 or D3400. It lost no
 running cell with `i32` or string keys or with a second instance.
+
+**Review round (#3318).** Two instance readers must not outrun the fused map `??`. A store
+narrows the read after it to non-null, and `coalesceOperandPinNonNull` then emitted the bare
+read, which is still the map's nullable rep (6 cells ran on master and built invalid wasm); a
+fused map read now keeps the fused lowering. And a `??` over an atom map read whose default is
+a hole's read of the same kind keeps the `-1` niche (`coalMapReadNulAtomTexts`), where `print`
+had spelled the sentinel as a member. The pin-nullable default is asked only there: widening
+`coalesceDefaultNullable` itself broke three `d3127-coal-price` chains. Two `<T>` cells moved
+from a refusal to D3398's wrong value, recorded as the named set `mh-two-instance-price`.
