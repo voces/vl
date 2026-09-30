@@ -83,6 +83,8 @@ import {
   mkUnionDecl,
   nodeIsTplHole,
   nodeValueChildren,
+  objLookBodies,
+  objLookFns,
   restParamIndex,
   spreadArgOf,
   stmtAlwaysExits,
@@ -15601,6 +15603,7 @@ function tErrPush(
     const lnote = crLostNote(msg, at)
     if lnote != "" { msg = msg + lnote }
   }
+  if objLookBodies.length > 0 { msg = msg + olNote(msg, at) }
   // An exact repeat (same message, same anchor) is noise, not information — two passes can resolve
   // the same annotation, the pass-1.5 hoist and the real pass both reporting a generic-alias arity
   // error at the same position. Drop the repeat; the diagnostic count stays small, so the scan is
@@ -53704,6 +53707,8 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
         recordDeadCoalesce(ix, lt)
       }
     }
+    // A left operand that is only ever `null` always takes the default (D2261).
+    if isNullTy(lt) { return rt }
     const lt2 = T.tys[lt]
     if lt2 is TyNullable {
       // D1589 — an open hole has no non-null part yet, so `nonNullTy` hands back the nullable
@@ -61853,4 +61858,46 @@ function checkBlockNode(n: Block, ix: i32) {
   blockTailTy = tailTy
   blockTailIx = tailIx
   return TY_VOID
+}
+
+// The note a `void` or non-object error on node `at` takes when its subject is the value of a
+// recorded arm (`objLookBodies`): the arm lies inside `at`, or `at` calls the function whose tail
+// the arm is. It cites that arm and the spelling that makes it an object (D3276).
+function olNote(msg: string, at: i32): string {
+  if msg.indexOf("void") < 0 && msg.indexOf("non-object") < 0 { return "" }
+  const s = nodeStartTok(at)
+  const e = nodeLastTok(at)
+  if s < 0 || e < s || e >= P.toks.length { return "" }
+  let i = 0
+  while i < objLookBodies.length {
+    const bt = nodeStartTok(objLookBodies[i])
+    if bt >= 0 && bt < P.toks.length {
+      if (bt >= s && bt <= e) || tokSpanCalls(s, e, objLookFns[i]) {
+        return "; the braces at "
+          + i32ToStr(P.toks[bt].line)
+          + ":"
+          + i32ToStr(P.toks[bt].col + 1)
+          + " are a block, not an object literal; parenthesize an object there: `({ … })`"
+      }
+    }
+    i = i + 1
+  }
+  ""
+}
+
+// Whether tokens `s`..`e` hold a call `fnName(`. "" names no function.
+function tokSpanCalls(s: i32, e: i32, fnName: string): boolean {
+  if fnName == "" { return false }
+  let k = s
+  while k < e {
+    if (
+      P.toks[k].kind == "IDENT"
+      && P.toks[k].text == fnName
+      && P.toks[k + 1].kind == "LPAREN"
+    ) {
+      return true
+    }
+    k = k + 1
+  }
+  false
 }
