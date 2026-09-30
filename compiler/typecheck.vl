@@ -7749,6 +7749,27 @@ function writeRetiresNarrowing(
   keyHasPrefix(key, tgtKey + "[")
 }
 
+// What a hole's field `hst` reads after a write of `rt`, or -1 for no narrowing: a hole value is
+// read as itself, since the pin re-asks its member reads and calls (`hdReadNullAsked`), and a
+// value non-null at the template reads the field's non-null face. A hole whose reads the pin
+// does not re-ask, or a union carrying one, does not narrow (D3287).
+function holeFieldWriteTy(hst: i32, rt: i32): i32 {
+  if rt < 0 || rt >= T.tys.length { return -1 }
+  if tyIsHole(rt) {
+    const row = hdRowOf(rt)
+    if row < 0 || tyIsNonNullHoleRead(rt) || hdReadNullAsked(row) { return rt }
+    return -1
+  }
+  if tyAdmitsNull(rt) || isNullTy(rt) { return -1 }
+  if tyHasHole(rt) {
+    const t = T.tys[rt]
+    if !(t is TyObj || t is TyArray || t is TyFunc || t is TyMap) { return -1 }
+  }
+  const hn = nonNullNarrowTy(hst)
+  if hn == hst { return -1 }
+  hn
+}
+
 // Whether the write target at `tgtIx` is a field of a receiver typed as an inference hole.
 function writesHoleField(tgtIx: i32): boolean {
   const tn = P.nodes[tgtIx]
@@ -8154,14 +8175,11 @@ function retireNarrowingsForWrite(tgtIx: i32, rt0: i32, atIx: i32) {
       }
     }
   }
-  // A hole's field reads its non-null face after a write of a value non-null at the template, as
-  // after a null test, whatever narrowing the write retired (D3197).
-  if pathReTy < 0 && rt >= 0 && writesHoleField(tgtIx) && !tyHasHole(rt) {
+  // A hole's field reads what a write stored in it (`holeFieldWriteTy`), as after a null test,
+  // whatever narrowing the write retired (D3197).
+  if pathReTy < 0 && rt >= 0 && writesHoleField(tgtIx) {
     const hst = placeStoreTy(tgtIx)
-    if hst >= 0 && tyIsHole(hst) && !tyAdmitsNull(rt) && !isNullTy(rt) {
-      const hn = nonNullNarrowTy(hst)
-      if hn >= 0 && hn != hst { pathReTy = hn }
-    }
+    if hst >= 0 && tyIsHole(hst) { pathReTy = holeFieldWriteTy(hst, rt) }
   }
   if pathReTy >= 0 {
     npKeys.push(tgtKey)
@@ -34182,6 +34200,13 @@ export function memCstrMsg(recv: i32, prop: string) {
     if isNullTy(recv) { return "" }
     return callFloorMsg(recv)
   }
+  if keyHasPrefix(prop, MC_NULL_READ_MARK) {
+    if !tyAdmitsNull(recv) { return "" }
+    return memberFloorMsg(
+      recv,
+      prop.slice(MC_NULL_READ_MARK.length, prop.length),
+    )
+  }
   if keyHasPrefix(prop, MC_METHOD_MARK) {
     const name = prop.slice(MC_METHOD_MARK.length, prop.length)
     if builtinMethodClaims(recv, name) { return "" }
@@ -34203,6 +34228,29 @@ function callFloorMsg(fnTy: i32) {
 
 // The `memCstrProp` of a built-in method call on a gradual union, before the method's name.
 const MC_METHOD_MARK = "()"
+// The `memCstrProp` of a member read off a derived hole (`hdReadNullAsked`), before the
+// member's name. The pin asks only whether the receiver admits `null`; any other floor stays
+// unasked, since an `is` test on such a hole does not narrow it in the body (D3216).
+const MC_NULL_READ_MARK = "?."
+
+// Records a member read off a derived hole a `null` could reach, so the pin refuses `.v` on
+// `H | null` as the direct spelling does (D3287). A null test narrows the read to the hole's
+// non-null face (`HD_GNOT`), which is not recorded, so a guarded read still runs.
+function noteNullReadCstr(recv: i32, prop: string, ix: i32) {
+  if hdReadNullAsked(hdRowOf(recv)) {
+    noteMemCstr(recv, MC_NULL_READ_MARK + prop, ix, false)
+  }
+  0
+}
+
+// Whether a member read off derived-hole row `row` is re-asked at the pin for a `null` member:
+// a field, element or call result of a hole, or an `is` remainder other than the non-null face.
+function hdReadNullAsked(row: i32): boolean {
+  if row < 0 || row >= hdKind.length { return false }
+  const k = hdKind[row]
+  if k == HD_GNOT { return hdAlt[row] != TY_NULL }
+  k == HD_FLD || k == HD_ELEM || k == HD_ELEMV || k == HD_RET
+}
 
 // Records a deferred receiver-classification constraint when the receiver still carries a
 // hole, so the generic call site re-asks whether `T` is a collection under substitution.
@@ -60033,6 +60081,7 @@ function checkMemberNode(n: Member, ix: i32) {
     }
     if ot.tvName.length > 0 {
       if ot.tvName[0] == '?' {
+        noteNullReadCstr(objTy, n.memProp, ix)
         // `.length` is the i32 length an array/string/map exposes — treat it as that (not a
         // struct field), so a collection-shaped hole infers without growing a bogus `{length}` shape.
         return symMem(ix, holeMemberTy(objTy, ot.tvName, n.memProp))
