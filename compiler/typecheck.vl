@@ -4139,8 +4139,8 @@ let asgNarTyIx: i32[] = []
 // target at, which the emitter needs where that name lives in a capture cell (D3288).
 let asgStripTys: i32[] = []
 let asgKeepNarrow: {[i32]: boolean} = Map()
-// Assignment nodes whose write stored a type-parameter value into a nullable place
-// (`tvPlaceWrite`): the emitter reads the place at its declaration unless the pin is non-null.
+// Assignment nodes whose place reads at the member its pin lands on (`HD_TVW`, `HD_HWR`): the
+// emitter retires the place's narrowing there, and a name's pin that excludes null re-narrows it.
 let asgTvWrite: {[i32]: boolean} = Map()
 // The length the four sidecars above present to a bounded write: the arena as `checkProgram`
 // found it, and for `isVarTyIx` also past any row a monomorphized clone banked. The columns
@@ -6452,6 +6452,7 @@ function narrowedPathTy(key: string) {
   if i < 0 { return -1 }
   if npInvBy[i] >= 0 { return -1 }
   if crPathCaptureLost(i, key) { return -1 }
+  if i < crFnNpBase() { return writeLandNestedTy(npTys[i]) }
   npTys[i]
 }
 
@@ -8495,7 +8496,7 @@ function retireNarrowingsForWrite(
       if pd >= 0 && !tySame(writeNarrowAfter(pd, npTys[i], rt), npTys[i]) {
         hit = true
       }
-      if pd >= 0 && tvPlaceWrite(pd, rt) && !tyIsTvWriteOf(npTys[i], pd, rt) {
+      if pd >= 0 && tvCellFree(tgtIx) && tvPlaceWrite(pd, rt) && !tyIsTvWriteOf(npTys[i], pd, rt) {
         hit = true
       }
     }
@@ -8533,8 +8534,9 @@ function retireNarrowingsForWrite(
         // A map cell reads `T | null` at its declaration, since a read may miss; the write just
         // stored the key, so the reads after it hold the stored type.
         if prn != pdcl || placeIsMapCell(tgtIx) { pathReTy = prn }
-        if tvPlaceWrite(pdcl, rt) {
+        if tvCellFree(tgtIx) && tvPlaceWrite(pdcl, rt) {
           pathReTy = tvWriteTy(pdcl, rt, -1)
+          pathReAsg = true
           recordAsgTvWrite(atIx, pdcl)
         }
       }
@@ -8546,7 +8548,7 @@ function retireNarrowingsForWrite(
   // it, as `x = 5` does a name (D1848, D3316). A map cell's `null` is the miss, so it is left out.
   if narrowedPathTyRaw(tgtKey) < 0 && pathReTy < 0 && !placeIsMapCell(tgtIx) {
     const pst = placeStoreTy(tgtIx)
-    if pst >= 0 && tvPlaceWrite(pst, rt) {
+    if pst >= 0 && tvCellFree(tgtIx) && tvPlaceWrite(pst, rt) {
       pathReTy = tvWriteTy(pst, rt, -1)
       pathReAsg = true
       recordAsgTvWrite(atIx, pst)
@@ -8567,6 +8569,7 @@ function retireNarrowingsForWrite(
       // A concrete value reads at the member of the pinned place it lands on.
       if !tyHasHole(rt) && !tyAdmitsNull(rt) && !isNullTy(rt) {
         pathReTy = mkDerivedHole(HD_HWR, "", rt, -1, hst)
+        recordAsgTvWrite(atIx, hst)
       } else {
         pathReTy = holeFieldWriteTy(hst, rt)
       }
@@ -8716,14 +8719,32 @@ function retireNarrowingsForWrite(
 }
 
 // Whether a write of `rt` into a place declared `dcl` leaves the place reading at the member
-// its pin lands on (`HD_TVW`): a value typed at a declared type parameter, into a concrete
-// declaration that admits `null` and holds no literal, whose niche keeps the template's read.
-// A declaration naming a parameter (`T | null`) strips to it exactly at every pin (D3240).
+// its pin lands on (`HD_TVW`): a value typed at a declared type parameter, into a concrete `X |
+// null` of one non-literal member. A declaration naming a parameter strips to it exactly, and a
+// union of several members keeps the template's read, whose box the pin's member unboxes (D3240).
 function tvPlaceWrite(dcl: i32, rt: i32): boolean {
-  tyIsDeclaredParam(rt)
-    && tyAdmitsNull(dcl)
-    && !isLitBearing(dcl)
-    && !tyHasTyVar(dcl)
+  if !tyIsDeclaredParam(rt) || !tyAdmitsNull(dcl) || isLitBearing(dcl) || tyHasTyVar(dcl) {
+    return false
+  }
+  const nn = nonNullTy(dcl)
+  nn >= 0 && nn < T.tys.length && !(T.tys[nn] is TyUnion)
+}
+
+// What a nested function reads a place a write left at `ty` as: the template's non-null face
+// for a pin-landed read (`HD_TVW`, `HD_HWR`), since the nested body is lowered once for every
+// instance and its reads carry no pin; `ty` otherwise.
+function writeLandNestedTy(ty: i32): i32 {
+  const row = hdRowOf(ty)
+  if row < 0 { return ty }
+  if hdKind[row] == HD_TVW { return nonNullTy(hdInner[row]) }
+  if hdKind[row] == HD_HWR { return nonNullNarrowTy(hdBase[row]) }
+  ty
+}
+
+// Whether the write target `tgtIx` is a name or a field rather than a list cell, whose pushed
+// narrowing a closure over the list would inherit; a cell keeps the template's read (D3419).
+function tvCellFree(tgtIx: i32): boolean {
+  !(P.nodes[tgtIx] is Index)
 }
 
 // The type a place declared `dcl` reads at after `tvPlaceWrite` stored `rt`: `cur` when it
@@ -11941,8 +11962,14 @@ export function recordClonedCallRetire(from: i32, to: i32) {
 }
 
 // A clone of assignment `from` answers its write's narrowing banks (`asgNarTyIxOf`,
-// `asgStripTyOf`, `asgKeepsNarrowOf`, `asgTvWriteOf`), which are keyed by node.
+// `asgStripTyOf`, `asgKeepsNarrowOf`, `asgTvWriteOf`), which are keyed by node. A list cell's
+// write keeps none, since a closure over the list would inherit the narrowing (D3419).
 function carryAsgBanks(from: i32, to: i32) {
+  if from < 0 || from >= P.nodes.length { return 0 }
+  const fn0 = P.nodes[from]
+  if fn0 is BinExpr {
+    if fn0.binLeft >= 0 && P.nodes[fn0.binLeft] is Index { return 0 }
+  }
   const nt = asgNarTyIxOf(from)
   if nt >= 0 { recordAsgNarTyIx(to, nt) }
   const st = asgStripTyOf(from)
@@ -54068,8 +54095,8 @@ export function asgNarTyIxOf(ix: i32) {
   }
   -1
 }
-// Whether the assignment at node `ix` stored a type-parameter value into a nullable place: the
-// reads after it are at the declaration (`asgNarTyIxOf`) unless the pin excludes null (D3240).
+// Whether the place the assignment at node `ix` writes reads at the member its pin lands on:
+// the reads after it carry the pin, not the template's narrowing (D3240).
 export function asgTvWriteOf(ix: i32): boolean {
   if asgTvWrite.length == 0 { return false }
   asgTvWrite[ix] ?? false
@@ -54099,7 +54126,7 @@ function recordAsgNarTyIx(ix: i32, ty: i32) {
   asgNarTyIx[ix] = ty
   0
 }
-// Bank a type-parameter write at assignment `ix` into a place declared `dcl` (`asgTvWriteOf`).
+// Bank a pin-landed write at assignment `ix` into a place declared `dcl` (`asgTvWriteOf`).
 function recordAsgTvWrite(ix: i32, dcl: i32) {
   recordAsgNarTyIx(ix, dcl)
   asgTvWrite[ix] = true
