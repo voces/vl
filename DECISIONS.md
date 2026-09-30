@@ -8937,3 +8937,86 @@ self-compile does not re-check.
 respelled for the labelled-block ruling) −7.9%, its only difference each
 `i64.extend_i32_s(local.get y)` becoming `i64.const 32`. The seed grows 40 KB (+1.1%) and the
 seed-size baseline is rewritten with it.
+
+## Flow narrowing: per-path facts meet at joins (owner ruling 2026-09-29) — plumb PL-064, D3285
+
+**The ruling.** General branch-join narrowing, built as one core plus slices, rather than a
+special case for `if x == null { x = 0 }`. D2390's "flow analysis later" is this; its call rule
+becomes the core's transfer function for calls. Slice 1 (this) is `if`/`else` joins. Slice 2 is
+early exits (a `return`/`break`/`continue` dropping a path), slice 3 `match`, `&&` and `||`,
+slice 4 loops (a fixpoint). Each slice ships at the same bar: no program that ran stops running,
+and every newly accepted program runs correctly at the direct, `<T>` and hole spellings.
+
+**The core.** Each path through an `if` carries narrowing facts, place key → type, over the place
+keys the checker already has (a name, `o.v`, `xs[0]`, their compositions). The facts that hold
+below the `if` are the meet of the surviving paths: a key reads at the join of what each path
+left it at, a diverging path contributes nothing, an absent `else` is the fall-through path. The
+state a path carries is the scope chain plus the path overlay, as before; what the core adds is
+the per-arm ledger it folds (`narClob*`, one row per transfer) and the meet at the join
+(`applyArmJoins`, `compiler/typecheck.vl`). One pass folds a subtree's rows in order, and the
+join then replaces them with one summary row per key at the `if`'s own statement depth
+(`narCompactIf`), so an enclosing join folds each inner `if` as a single transfer and the whole
+thing stays linear in the function however deep the nesting.
+
+**The transfer functions,** each the existing rule, now feeding the ledger rather than beside it:
+
+- a null test, an `is` test, a discriminant or a type-guard call sets each arm's START for the
+  keys it tests (`collectThenNarrows` / `collectElseNarrows`); a key the condition does not test
+  starts both arms at its entry type;
+- a write narrows the place to the member it stores: the straight-line null strip (`x = 5` over
+  `i32 | null`), the re-narrow under a guard (#3289), a path's twin (D1848). A non-null write to
+  an un-narrowed nullable path is now a row too;
+- a call that may write the place ends its narrowing (D2390), as a row the join cannot merge a
+  fact back over; so does a variable-index write to any cell of the receiver, and an aliased write;
+- a write inside the condition may or may not have run, so it joins into both paths.
+
+**Where the join lands.** In the block that holds the `if`, banked like the post-guard
+fall-through, which is exactly the lifetime of the emitter's push after the statement
+(`pushPostGuardNarrow`); the earlier in-place write at the binding's own depth outlived a loop
+body or an enclosing arm. An `else if` link installs nothing of its own, its parent joins it. An
+`if` in value position installs when its statement ends, and only when it is that statement's
+whole value (a `let` initializer or an assignment's right side), since nothing else guarantees it
+ran. A join row naming a name a closure writes is renamed to that name's cell (D3288).
+
+**A fact is about a binding, not a name.** A ledger row records the binding its key's root
+resolved to (`narClobDecl`, `narBindDepthOf`), so an inner block's `let x` neither feeds nor
+retires the outer `x`'s join. An inner declaration or a parameter of the root invalidates the
+outer binding's path overlays for its scope (`narShadowPaths`), and the emitter pushes a shadow
+entry that hides the outer narrowings until the block ends (`shadowNarrowFor`). The respelling
+pass that renames a captured binding renames its join rows with it. A call that may write a
+place leaves its row on its path even when a sibling arm already retired the name in place, so
+the meet sees both paths' ends.
+
+**A kill on any path survives the meet.** A call that may write a place, an alias write, a
+write to an outer binding an inner declaration hides, and a write with no key (a computed index)
+leave the place UNKNOWN on their path (`NAR_UNKNOWN` in the fold), and so does a write to any
+prefix of the key, the root included, whatever it stored (D3319: sound and deliberately
+imprecise, since `a.in = { v: 5 }` could re-narrow `a.in.v` but slice 1 does not read the
+literal's fields); only a later write at that
+arm's own depth replaces it, and the meet declines a key any surviving path leaves unknown. A
+kill row is pushed even when a sibling arm already retired the place in place, so no other
+path's re-narrow can erase it. Inside a loop, a write the body may make to the key, to a prefix
+of it, to a cell of its receiver at a computed index, or to the same field through another
+receiver ends the fact before the loop (`loopWriteMayReach`), since the reads before it run again.
+Through another receiver the write's value is judged against that place's declared storage, so a
+non-null write keeps the fact, as master did and the straight-line alias rule does.
+
+**Every path write leaves a row, and a retired entry is not a read.** A write over a
+narrowing that a sibling arm or a kill already retired in place still records what it stored
+(D3315), so no path is mistaken for untouched. After such an `if` the path narrows again on the
+next non-null write, a join installs even over a retired entry, and an assignment's target is
+never refused as a read of the retirement (D3316). A loop's literal-subscript write names its
+cell (D3317), and the else arm of a null test restates a path a live overlay already held
+(D3318), so a then arm's in-place retirement cannot leave the two halves disagreeing.
+
+**What slice 1 declines.** A key whose path types hold a type variable or a hole: inside a
+generic body `T | null` is gradually assignable to `T`, the join would read as `T`, and join rows
+are banked per node while the emitter lowers per instance (D3286, open). A condition-tested key
+where one arm diverges stays with the post-guard rule, which slice 2 routes through the core.
+
+**Cost.** Two GROWTH axes in `tests/vl_scaling_shape_test.ts`: sequential joins of one name read
+3.98 (linear), and joins nested deep 5.26, which is the depth-proportional walk a write makes
+over the name's narrowing layers (`narWriteStorage`), not the join. Master's nested straight-line
+writes already read 8.2 on that walk; the emitter's narrowing stack now keeps a per-key slot
+index so a lookup or retirement costs the key's own entries rather than the whole stack, which
+took a flat run of straight-line writes from 10.5 to 3.95.

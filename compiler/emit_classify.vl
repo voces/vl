@@ -62,6 +62,7 @@ import {
   asgKeepsNarrowOf,
   asgNarTyIxOf,
   asgStoreTyOf,
+  asgStripTyOf,
   atomicIntrinsicIsVoid,
   bindGenWalk,
   cUserTypesVer,
@@ -522,6 +523,7 @@ import {
   capNamesFlat,
   capStartTbl,
   cboxCellNames,
+  cboxStoreCells,
   cloSigBase,
   cloSigKeys,
   cloSigTagNames,
@@ -6653,6 +6655,7 @@ function capNarrowRecord(fnIx: i32, ifree: string[], iglob: {[string]: i32}) {
       (strListHas(ifree, root) || (iglob[root] ?? 0) == 1)
       && narrowRetired[i] == 0
       && !capWidened(widened, nm)
+      && narrowShadowSlot(root) < i
     ) {
       cnFe.push(fe)
       cnName.push(nm)
@@ -8159,19 +8162,115 @@ export function scalarListElemKind(exprIx: i32, fnIx: i32): VKind | null {
 // locals each stay narrowed in the inner branch. A branch saves the stack length and truncates
 // on exit; `narrowTop` is the logical depth, rewound rather than popped.
 
+// Per key, the stack slots its pushes occupy, ascending among the live ones; per key ROOT,
+// the slots of the path keys under it (`o.v`, `xs[0]`). A query costs the key's own entries, not
+// the whole stack a long block grows. An entry is stale once its slot is at or above `narrowTop`
+// or holds another key.
+let narrowIdx: {[string]: i32[]} = Map()
+let narrowPathIdx: {[string]: i32[]} = Map()
+
+// Forget both indexes, with the stack they describe.
+export function narrowIdxReset() {
+  narrowIdx = Map()
+  narrowPathIdx = Map()
+  0
+}
+
+// Whether slot `s` holds a pushed entry of `name`.
+function narrowSlotHolds(s: i32, name: string): boolean {
+  s >= 0 && s < narrowTop && narrowNames[s] == name
+}
+
+// Record slot `s` in `idx[key]`, keeping the live slots ascending (an `unmaskNarrow` re-adds
+// one below the newest).
+function narrowIdxAdd(idx: {[string]: i32[]}, key: string, s: i32) {
+  const got = idx[key]
+  if got == null { idx[key] = [] }
+  const l: i32[] = idx[key] ?? []
+  l.push(s)
+  let j = l.length - 1
+  while j > 0 && l[j - 1] > s {
+    l[j] = l[j - 1]
+    j = j - 1
+  }
+  l[j] = s
+  0
+}
+
+// Record the push now in slot `s`.
+function narrowIdxPush(name: string, s: i32) {
+  narrowIdxAdd(narrowIdx, name, s)
+  const root = narrowKeyRoot(name)
+  if root != name { narrowIdxAdd(narrowPathIdx, root, s) }
+  0
+}
+
 // The stack slot of the innermost active narrowing of `name`, or -1 when `name` is not
-// narrowed — the one scan every narrowing query shares. A retired entry is skipped rather
+// narrowed — the one query every narrowing reader shares. A retired entry is skipped rather
 // than answering, so a name whose narrowing a write falsified reads at the declared rep;
 // skipping rather than stopping lets an outer narrowing of the same name still answer.
 export function narrowSlotOf(name: string): i32 {
-  let i = narrowTop - 1
-  while i >= 0 {
-    if narrowNames[i] == name {
-      if narrowRetired[i] == 0 { return i }
+  if narrowTop == 0 { return -1 }
+  const l = narrowIdx[name]
+  if l == null { return -1 }
+  let j = l.length - 1
+  while j >= 0 {
+    const s = l[j]
+    if narrowSlotHolds(s, name) {
+      if narrowRetired[s] == 0 {
+        const root = narrowKeyRoot(name)
+        if root != name && narrowShadowSlot(root) > s { return -1 }
+        return s
+      }
+      if narrowRetired[s] == NARROW_SHADOW { return -1 }
+    } else if j == l.length - 1 {
+      l.pop()
     }
-    i = i - 1
+    j = j - 1
   }
   -1
+}
+
+// A `narrowRetired` value marking a slot as a shadow: a declaration of the name in an inner block,
+// which hides every narrowing below it until that block's `restoreNarrow` pops it (D3285).
+const NARROW_SHADOW = 2
+
+// Whether a live narrowing of a path under the root `name` stands.
+function narrowPathLive(name: string): boolean {
+  const l = narrowPathIdx[name]
+  if l == null { return false }
+  let j = 0
+  while j < l.length {
+    const s = l[j]
+    if s >= 0 && s < narrowTop && narrowRetired[s] == 0 { return true }
+    j = j + 1
+  }
+  false
+}
+
+// The slot of the innermost shadow of `name`, or -1.
+function narrowShadowSlot(name: string): i32 {
+  const l = narrowIdx[name]
+  if l == null { return -1 }
+  let j = l.length - 1
+  while j >= 0 {
+    const s = l[j]
+    if narrowSlotHolds(s, name) && narrowRetired[s] == NARROW_SHADOW {
+      return s
+    }
+    j = j - 1
+  }
+  -1
+}
+
+// A declaration of `name` in the current block: the narrowings of the outer binding it shadows
+// stop answering, and a write to the new binding cannot retire them.
+export function shadowNarrowFor(name: string) {
+  if narrowTop == 0 { return 0 }
+  if narrowSlotOf(name) < 0 && !narrowPathLive(name) { return 0 }
+  pushNarrowRep(name, "", -1, -1)
+  narrowRetired[narrowTop - 1] = NARROW_SHADOW
+  0
 }
 
 // The arena type the narrowing at stack slot `i` binds — see `narrowSlotTy`. Exported for the
@@ -8181,11 +8280,21 @@ export function narrowSlotTyOf(i: i32): i32 { narrowSlotTy(i) }
 // Retire every live narrowing of `name`. Called for a write the narrowing does not admit;
 // the entry is marked in place (see `narrowRetired`).
 function retireNarrowFor(name: string) {
-  let i = 0
-  while i < narrowTop {
-    if narrowNames[i] == name { narrowRetired[i] = 1 }
-    i = i + 1
+  if narrowTop == 0 { return 0 }
+  const l = narrowIdx[name]
+  if l == null { return 0 }
+  // Down to the innermost shadow, which stays with everything below it: those narrow another
+  // binding. A retired entry answers again only through `unmaskNarrow`, which re-adds it.
+  let j = l.length - 1
+  while j >= 0 {
+    const s = l[j]
+    if narrowSlotHolds(s, name) {
+      if narrowRetired[s] == NARROW_SHADOW { break }
+      narrowRetired[s] = 1
+    }
+    j = j - 1
   }
+  while l.length > j + 1 { l.pop() }
   0
 }
 
@@ -8194,13 +8303,19 @@ function retireNarrowFor(name: string) {
 export function maskNarrowFor(key: string): i32[] {
   const out: i32[] = []
   if key == "" { return out }
-  let i = 0
-  while i < narrowTop {
-    if narrowNames[i] == key && narrowRetired[i] == 0 {
-      narrowRetired[i] = 1
-      out.push(i)
+  const l = narrowIdx[key]
+  if l == null { return out }
+  let j = l.length - 1
+  while j >= 0 {
+    const s = l[j]
+    if narrowSlotHolds(s, key) {
+      if narrowRetired[s] == NARROW_SHADOW { break }
+      if narrowRetired[s] == 0 {
+        narrowRetired[s] = 1
+        out.push(s)
+      }
     }
-    i = i + 1
+    j = j - 1
   }
   out
 }
@@ -8210,6 +8325,17 @@ export function unmaskNarrow(slots: i32[]) {
   let i = 0
   while i < slots.length {
     narrowRetired[slots[i]] = 0
+    // A retirement between the mask and here may have dropped it from its key's list.
+    const nm = narrowNames[slots[i]]
+    const l = narrowIdx[nm]
+    if l == null || !i32ListHas(l, slots[i]) {
+      narrowIdxAdd(narrowIdx, nm, slots[i])
+    }
+    const root = narrowKeyRoot(nm)
+    const pl = narrowPathIdx[root]
+    if root != nm && (pl == null || !i32ListHas(pl, slots[i])) {
+      narrowIdxAdd(narrowPathIdx, root, slots[i])
+    }
     i = i + 1
   }
   0
@@ -8286,6 +8412,7 @@ function pushNarrowRep(name: string, variant: string, ty: i32, set: i32) {
     narrowRetired.push(0)
   }
   narrowTop = narrowTop + 1
+  narrowIdxPush(name, narrowTop - 1)
   narrowTop
 }
 
@@ -17936,15 +18063,10 @@ function pushIndexMapNullNarrow(idxIx: i32, fnIx: i32) {
 // copy of `writeRetiresNarrowing`'s prefix legs, in both separators, so a write retires the
 // same keys on both sides of the compiler.
 function keyIsBelow(k: string, tgt: string): boolean {
-  const bx = tgt + "["
-  if k.length > bx.length {
-    if k.slice(0, bx.length) == bx { return true }
-  }
-  const dt = tgt + "."
-  if k.length > dt.length {
-    if k.slice(0, dt.length) == dt { return true }
-  }
-  false
+  const n = tgt.length
+  if k.length <= n + 1 { return false }
+  if k[n] != '[' && k[n] != '.' { return false }
+  k.slice(0, n) == tgt
 }
 
 // Retire every live narrowing whose key is a place below the one keyed `root` — the
@@ -17952,12 +18074,26 @@ function keyIsBelow(k: string, tgt: string): boolean {
 // retires and re-types a write's reads at the declared rep, which for a niche cell is one
 // `print` renders fine, so the program stays check-clean while the stale emit-side entry traps.
 function retireNarrowForIndexCells(root: string) {
-  if root == "" { return 0 }
-  let i = 0
-  while i < narrowTop {
-    if keyIsBelow(narrowNames[i], root) { narrowRetired[i] = 1 }
-    i = i + 1
+  if root == "" || narrowTop == 0 { return 0 }
+  const l = narrowPathIdx[narrowKeyRoot(root)]
+  if l == null { return 0 }
+  // A path below the root's innermost shadow is the outer binding's, and stays.
+  const shadow = narrowShadowSlot(narrowKeyRoot(root))
+  // Keeps the entries this write leaves standing, so the next write does not re-read the rest.
+  const keep: i32[] = []
+  let j = 0
+  while j < l.length {
+    const s = l[j]
+    if s >= 0 && s < narrowTop && narrowRetired[s] == 0 {
+      if s > shadow && keyIsBelow(narrowNames[s], root) {
+        narrowRetired[s] = 1
+      } else {
+        keep.push(s)
+      }
+    }
+    j = j + 1
   }
+  narrowPathIdx[narrowKeyRoot(root)] = keep
   0
 }
 
@@ -17981,7 +18117,9 @@ function retireRhsWritten(opIx: i32, mark: i32) {
   if gone == "" { return 0 }
   let i = mark
   while i < narrowTop {
-    if gone.indexOf("," + narrowNames[i] + ",") >= 0 { narrowRetired[i] = 1 }
+    if narrowRetired[i] == 0 && gone.indexOf("," + narrowNames[i] + ",") >= 0 {
+      narrowRetired[i] = 1
+    }
     i = i + 1
   }
   0
@@ -18769,6 +18907,39 @@ function retireNarrowNames(names: string[]) {
 // `pushPostGuardNarrow` after.
 export function preStmtNarrow(stmtIx: i32) {
   retireNarrowNames(callRetireBeforeOf(stmtIx))
+  // A loop variable shadows its name for the loop, and `pushPostGuardNarrow` lifts it after.
+  if narrowTop > 0 {
+    forInShadow(stmtIx, true)
+    forRangeShadow(stmtIx, true)
+  }
+}
+
+// Shadow (`on`) or lift the variables of the `for … in` loop at `ix`; any other node has none.
+function forInShadow(ix: i32, on: boolean) {
+  const s = P.nodes[ix]
+  if s is ForIn {
+    if on { shadowNarrowFor(s.fiVar) } else { unshadowNarrowFor(s.fiVar) }
+    if s.fiVar2 != "" {
+      if on { shadowNarrowFor(s.fiVar2) } else { unshadowNarrowFor(s.fiVar2) }
+    }
+  }
+  0
+}
+
+// `forInShadow` for a range loop's variable.
+function forRangeShadow(ix: i32, on: boolean) {
+  const s = P.nodes[ix]
+  if s is ForRange {
+    if on { shadowNarrowFor(s.frVar) } else { unshadowNarrowFor(s.frVar) }
+  }
+  0
+}
+
+// End the loop variable's shadow of `name` once its loop is done.
+function unshadowNarrowFor(name: string) {
+  const b = narrowShadowSlot(name)
+  if b >= 0 { narrowRetired[b] = 1 }
+  0
 }
 
 // Rewind the narrowing stack depth back to `n` (drop bindings a branch pushed). The
@@ -18787,6 +18958,11 @@ export function pushPostGuardNarrow(stmtIx: i32, fnIx: i32) {
   // join or residual below re-narrows it (D2390).
   retireNarrowNames(callRetireAfterOf(stmtIx))
   const s = P.nodes[stmtIx]
+  if narrowTop > 0 {
+    if s is LetDecl { shadowNarrowFor(s.letName) }
+    forInShadow(stmtIx, false)
+    forRangeShadow(stmtIx, false)
+  }
   // The arm JOIN first: it describes the code below this `if` however the residual turns out,
   // and the checker typed those reads with it, so the rep has to follow (D1846).
   let jr = joinHeadOf(stmtIx)
@@ -18932,6 +19108,17 @@ export function pushPostGuardNarrow(stmtIx: i32, fnIx: i32) {
         const itk = indexPathKeyOf(s.binLeft)
         if itk != "" {
           retireNarrowForIndexCells(itk)
+          // A captured name's write stores through its cell, and the null strip the checker
+          // gave the name lands on the cell's read key (D3288).
+          const strip = asgStripTyOf(stmtIx)
+          if (
+            strip >= 0
+            && !rhsNullable
+            && (cboxStoreCells[s.binLeft] ?? 0) == 1
+          ) {
+            retireNarrowFor(itk)
+            pushNarrowWrittenTy(itk, strip)
+          }
           if rhsNullable || asgNarTy >= 0 {
             retireNarrowFor(itk)
             // The index twin of the member push above (D1847). A map cell names no element
