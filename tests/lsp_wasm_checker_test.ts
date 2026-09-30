@@ -145,14 +145,13 @@ Deno.test({ name: "wasm-checker: a defaulted numeric literal names its declarati
   if (JSON.stringify(hit) !== JSON.stringify(wantHit)) {
     throw new Error(`want ${JSON.stringify(wantHit)}, got ${JSON.stringify(hit)}`);
   }
-  // No note: an annotated declaration, a non-literal initializer, a `let` a non-literal write
-  // reaches (after the use, too), and a type the literal does not fit.
+  // No note: an annotated declaration, a non-literal initializer, and a list a non-literal write
+  // reaches. A scalar `let` a non-literal write reaches takes its type from its uses (D3246), and
+  // one whose read and write disagree is refused naming both, below.
   const g = "function g(a: f32): f32 { a }\nfunction src(): f64 { 3.0 }\n";
   const misses = [
     body.replace("const TABLE =", "const TABLE: f64[] ="),
     g + "const T: f64[] = [1.0]\nconst V = T[0]\nprint(g(V))\n",
-    g + "let w = 1.5\nprint(g(w))\nw = src()\n",
-    g + "let u = 1.5\nu += src()\nprint(g(u))\n",
     // A non-literal element write or push: the suggested `f32[]` would refuse it.
     g + "const A = [1.0, 0.0]\nA[1] = src()\nprint(g(A[0]))\n",
     g + "const B = [1.0, 0.0]\nB.push(src())\nprint(g(B[0]))\n",
@@ -165,9 +164,26 @@ Deno.test({ name: "wasm-checker: a defaulted numeric literal names its declarati
       throw new Error(`want the bare mismatch for ${JSON.stringify(src)}, got ${JSON.stringify(miss)}`);
     }
   }
-  const noFit = await msgs("function h(a: i32): i32 { a }\nconst F = 2.5\nprint(h(F))\n");
-  if (JSON.stringify(noFit) !== JSON.stringify(["argument 1: expected i32, got f64"])) {
-    throw new Error(`want the bare mismatch, got ${JSON.stringify(noFit)}`);
+  const conflict = (nm: string, a: number, ta: string, b: number, tb: string) =>
+    `\`${nm}\` takes its type from its uses, and they conflict: the use on line ${a} needs ` +
+    `\`${ta}\` and the use on line ${b} needs \`${tb}\` — annotate \`${nm}\``;
+  const scalars: [string, string[]][] = [
+    [
+      g + "let w = 1.5\nprint(g(w))\nw = src()\n",
+      ["argument 1: expected f32, got f64", conflict("w", 4, "f32", 5, "f64")],
+    ],
+    [
+      g + "let u = 1.5\nu += src()\nprint(g(u))\n",
+      ["argument 1: expected f32, got f64", conflict("u", 4, "f64", 5, "f32")],
+    ],
+    // A literal `const` is its literal at the read, so the mismatch is the literal's own.
+    ["function h(a: i32): i32 { a }\nconst F = 2.5\nprint(h(F))\n", ["argument 1: expected i32, got f64"]],
+  ];
+  for (const [src, want] of scalars) {
+    const got = await msgs(src);
+    if (JSON.stringify(got) !== JSON.stringify(want)) {
+      throw new Error(`want ${JSON.stringify(want)} for ${JSON.stringify(src)}, got ${JSON.stringify(got)}`);
+    }
   }
   // An exported declaration in another module, read through an import alias: the note names the
   // declaring file and keeps `export`.
@@ -198,12 +214,10 @@ Deno.test({ name: "wasm-checker: a store into a defaulted literal names its decl
   const witness = "function ld32(a: i64) { (__load_i32__(a as% i32) as% i64) & 4294967295 }\n" +
     "function sum(p: i64, n: i64) { let s = 0; let i = 0; while i < n { s += ld32(p + i * 4); i += 1 }; s }\n" +
     "print(sum(0, 0))\n";
+  // PL-054's witness now checks: `s` takes `i64` from its store (D3246).
+  const clean = await msgs(witness);
+  if (clean.length !== 0) throw new Error(`want the witness clean, got ${JSON.stringify(clean)}`);
   const hits: [string, string][] = [
-    [
-      witness,
-      "cannot assign i64 to i32 — `s` on line 2 has no annotation, so its literal defaulted to " +
-      "`i32`; annotate it: `let s: i64 = …`",
-    ],
     [
       "function fl(): f32 { 1.5 }\nconst r = { x: 0 }\nr.x += fl()\nprint(r.x)\n",
       "operator '+' mixes i32 and f32 — field `x` of `r` on line 2 has no annotation, so its " +
@@ -216,17 +230,14 @@ Deno.test({ name: "wasm-checker: a store into a defaulted literal names its decl
       throw new Error(`want ${JSON.stringify([want])}, got ${JSON.stringify(got)}`);
     }
   }
-  // No note: an annotated declaration, two stores wanting different types, and a float literal
-  // an i64 store cannot hold.
+  // No note: an annotated declaration, an integer `let` a float is stored into, a float `let` an
+  // integer is stored into (each keeps its kind, D3246), and a store to a `const`.
   const g = "function big(): i64 { 5 }\nfunction fl(): f32 { 1.5 }\n";
   const misses: [string, string[]][] = [
     [g + "let a: i32 = 0\na = big()\nprint(a)\n", ["cannot assign i64 to i32"]],
-    [
-      g + "let b = 0\nb = big()\nb = fl()\nprint(b)\n",
-      ["cannot assign i64 to i32", "cannot assign f32 to i32"],
-    ],
+    [g + "let b = 0\nb = big()\nb = fl()\nprint(b)\n", ["cannot assign f32 to i64"]],
     [g + "let c = 0.5\nc = big()\nprint(c)\n", ["cannot assign i64 to f64"]],
-    // A whole store to a `const` is refused already, so annotating it would not help.
+    // A whole store to a `const` is refused; a `const` is never re-typed by a store.
     [
       "function big(): i64 { 5000000000 }\nconst t = 0\n" +
       "function run() { const s = 0; s += big(); t = big() }\nrun()\n",
@@ -255,56 +266,35 @@ Deno.test({ name: "wasm-checker: a defaulted literal read inside a value names i
     (await checker.check(src, "/tmp/x.vl", noSiblings))
       .filter((d) => d.severity === "error")
       .map((d) => d.message);
-  const note = (nm: string, ln: number, def: string, ann: string) =>
-    ` — \`${nm}\` on line ${ln} has no annotation, so its literal defaulted to \`${def}\`; ` +
-    `annotate it: \`${ann} = …\``;
   const g = "function mul(a: f32, b: f32): f32 { a * b }\nfunction gi(a: i32): i32 { a }\n";
-  const hits: [string, string][] = [
-    [
-      g + "const x = 0.0\nfunction f(y: f32): f32 { mul(x, y) }\nprint(f(2.0))\n",
-      "argument 1: expected f32, got f64" + note("x", 3, "f64", "const x: f32"),
-    ],
-    [
-      g + "function f(y: f32): f32 {\n  const n = 3\n  n * y\n}\nprint(f(2.0))\n",
-      "operator '*' mixes i32 and f32" + note("n", 4, "i32", "const n: f32"),
-    ],
-    [
-      g + "type V = { v: f32 }\nlet fv = 1.5\nconst r: V = { v: fv }\nprint(r.v)\n",
-      "cannot assign {v: f64} to 'r' of type V" + note("fv", 4, "f64", "let fv: f32"),
-    ],
-    [
-      g + "const e = 4\nconst xs: f32[] = [e]\nprint(xs[0])\n",
-      "cannot assign i32[] to 'xs' of type f32[]" + note("e", 3, "i32", "const e: f32"),
-    ],
-  ];
-  for (const [src, want] of hits) {
-    const got = await msgs(src);
-    if (JSON.stringify(got) !== JSON.stringify([want])) {
-      throw new Error(`want ${JSON.stringify([want])}, got ${JSON.stringify(got)}`);
-    }
-  }
-  const misses = [
+  // A literal `const` is its literal at every read (D3246, owner ruling C): a first argument, an
+  // operand, a record field, a list element, and reads that want different types all check.
+  const clean = [
+    g + "const x = 0.0\nfunction f(y: f32): f32 { mul(x, y) }\nprint(f(2.0))\n",
+    g + "function f(y: f32): f32 {\n  const n = 3\n  n * y\n}\nprint(f(2.0))\n",
+    g + "type V = { v: f32 }\nlet fv = 1.5\nconst r: V = { v: fv }\nprint(r.v)\n",
+    g + "const e = 4\nconst xs: f32[] = [e]\nprint(xs[0])\n",
+    g + "const d = 7\nprint(mul(d, 1.0))\nprint(d / 2)\n",
     g + "const b = 3\nprint(mul(b, 1.0))\nprint(gi(b))\n",
     g + "const i = 1\nconst ys = [7, 8]\nprint(ys[i])\nprint(mul(i, 1.0))\n",
     g + "const m = 3\nfunction a(): f32 { mul(m, 1.0) }\nfunction c(n: i32): boolean { m < n }\nprint(a())\n",
-    // An integer `/` would become a float one, and `f32 == 3` is refused (D2980).
-    g + "const d = 7\nprint(mul(d, 1.0))\nprint(d / 2)\n",
     g + "const q = 3\nprint(mul(q, 1.0))\nprint(q == 3)\n",
-    // A type parameter hands the annotated type on, here into an `i32` operator.
     g + "function id<T>(a: T): T { a }\nconst p = 3\nprint(mul(p, 1.0))\nprint(id(p) + gi(1))\n",
-    // An `f32` holds integers only up to 2^24 exactly.
-    g + "const v = 16777217\nprint(mul(v, 1.0))\n",
   ];
-  for (const src of misses) {
+  for (const src of clean) {
     const got = await msgs(src);
-    if (JSON.stringify(got) !== JSON.stringify(["argument 1: expected f32, got i32"])) {
-      throw new Error(`want the bare mismatch for ${JSON.stringify(src)}, got ${JSON.stringify(got)}`);
-    }
+    if (got.length !== 0) throw new Error(`want ${JSON.stringify(src)} clean, got ${JSON.stringify(got)}`);
   }
-  // D2981: a store's suggestion is refused by a later read of the binding.
+  // An `f32` holds integers only up to 2^24 exactly: the literal's own refusal at the read.
+  const v = await msgs(g + "const v = 16777217\nprint(mul(v, 1.0))\n");
+  if (JSON.stringify(v) !== JSON.stringify(["argument 1: expected f32, got i32"])) {
+    throw new Error(`want the bare mismatch, got ${JSON.stringify(v)}`);
+  }
+  // D2981: a float literal stored into an integer `let` is refused; the `let` keeps its kind.
   const store = await msgs(g + "const b = 1.5\nlet w = 0\nw = b\nprint(gi(w))\n");
-  if (JSON.stringify(store) !== JSON.stringify(["cannot assign f64 to i32"])) {
-    throw new Error(`want the bare store refusal, got ${JSON.stringify(store)}`);
+  const wantStore = ["cannot assign f64 to i32"];
+  if (JSON.stringify(store) !== JSON.stringify(wantStore)) {
+    throw new Error(`want ${JSON.stringify(wantStore)}, got ${JSON.stringify(store)}`);
   }
 });
 
@@ -609,6 +599,60 @@ Deno.test({ name: "wasm-symbols: hoverTypeAt renders a non-empty type", ignore }
   if (none !== undefined && none !== "") {
     throw new Error(`expected no type off a binding, got ${JSON.stringify(none)}`);
   }
+});
+
+// A literal `const` is its literal at each read (D3246), so a read hovers as the type it takes
+// there, and every read stays a reference — including when a `let` pin re-checks the program.
+Deno.test({
+  name: "wasm-symbols: a literal const read hovers per use and stays a reference",
+  ignore,
+}, async () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  const src = "const K = 7\n" +
+    "function takeF32(x: f32): f32 { x }\n" +
+    "function takeI64(x: i64): i64 { x }\n" +
+    "print(takeF32(K))\n" +
+    "print(takeI64(K))\n" +
+    "let bb = 1\n" +
+    "bb = takeI64(K)\n";
+  const want: [number, number, string][] = [[3, 14, "f32"], [4, 14, "i64"]];
+  for (const [line, col, ty] of want) {
+    const got = await checker.hoverTypeAt(src, "/tmp/x.vl", noSiblings, line, col);
+    if (got !== ty) {
+      throw new Error(`hover at ${line}:${col}: want ${ty}, got ${JSON.stringify(got)}`);
+    }
+  }
+  const refs = await checker.referencesAt(src, "/tmp/x.vl", noSiblings, 3, 14, true);
+  const lines = refs.map((r) => r.start.line).sort((a, b) => a - b);
+  if (JSON.stringify(lines) !== "[0,3,4,6]") {
+    throw new Error(`references: want [0,3,4,6], got ${JSON.stringify(lines)}`);
+  }
+});
+
+// A read above its binding's declaration — a literal `const` at the top level, or any module
+// binding read in a function written above it — is still a reference, so a rename reaches it.
+Deno.test({
+  name: "wasm-symbols: a read above the declaration is a reference",
+  ignore,
+}, async () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  const src = "print(K + 1)\n" +
+    "function above(): i32 { K + N }\n" +
+    "const K = 3\n" +
+    "function one(): i32 { 1 }\n" +
+    "const N = one()\n";
+  const at = (r: { start: { line: number; character: number } }) =>
+    `${r.start.line}:${r.start.character}`;
+  const k = (await checker.referencesAt(src, "/tmp/x.vl", noSiblings, 2, 6, true)).map(at).sort();
+  if (JSON.stringify(k) !== '["0:6","1:24","2:6"]') {
+    throw new Error(`K references: want ["0:6","1:24","2:6"], got ${JSON.stringify(k)}`);
+  }
+  const n = (await checker.referencesAt(src, "/tmp/x.vl", noSiblings, 4, 6, true)).map(at).sort();
+  if (JSON.stringify(n) !== '["1:28","4:6"]') {
+    throw new Error(`N references: want ["1:28","4:6"], got ${JSON.stringify(n)}`);
+  }
+  const hover = await checker.hoverTypeAt(src, "/tmp/x.vl", noSiblings, 0, 6);
+  if (hover !== "i32") throw new Error(`hover above the declaration: want i32, got ${hover}`);
 });
 
 Deno.test({
