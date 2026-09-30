@@ -123,6 +123,18 @@ const genValueWrites = (n: number, inFn: boolean): string => {
   return o.join("\n") + "\n";
 };
 
+// `if` branches and `match` arms whose braces would read as an object elsewhere: empty ones,
+// which are blocks and never recorded, and a labelled shorthand one, which is (D3276).
+const genArmBodies = (n: number): string => {
+  const o: string[] = ["let t = 0"];
+  for (let i = 0; i < n; i++) {
+    o.push(`function f${i}(c: boolean) {`, "  if c {} else { t = t + 1 }", "  match t { 1 => {} _ => {} }");
+    o.push("  if c { L: { t } } else { t = t + 2 }", "}");
+  }
+  o.push("f0(false)", "print(t)");
+  return o.join("\n") + "\n";
+};
+
 const genCallSites = (n: number, k: number): string => {
   const m = Math.max(1, Math.floor(n / k));
   const o: string[] = [];
@@ -533,6 +545,15 @@ axis(
   5.0,
   "`igWalk`'s shadow lookup (compiler/emit_sections.vl) or `asvList`'s rewrite (compiler/emit_rewrite.vl) is scanning per write.",
   (d) => twoFiles(d, genValueWrites(12000, true), genValueWrites(3000, true)),
+);
+
+// D3276's GROWTH pair, 8,000 functions of arm and branch bodies against 2,000, so linear reads 4.
+// A per-block scan of the recorded arms read 9.5x master at 8,000.
+axis(
+  "object-looking arm bodies",
+  5.0,
+  "A per-block or per-function pass is scanning the recorded object-looking arms (compiler/ast.vl `objLookBodies`).",
+  (d) => twoFiles(d, genArmBodies(8000), genArmBodies(2000)),
 );
 
 // D2914's GROWTH pair, 400 re-seated lists against 100, so linear reads 4 and quadratic 16. A

@@ -56,6 +56,12 @@ const CASES: [string, string, string[]][] = [
   ["a field value on the next line (D3274)", "const b = 3\nconst v = { a:\n  { c: { b } } }\nprint(v.a.c.b)", ["3"]],
   ["a field value after a blank line (D3274)", "const b = 3\nconst w = {\n  x:\n\n    b + 1,\n}\nprint(w.x)", ["4"]],
   ["a function body's next-line field value (D3274)", "function g(b: i32) { { a:\n  { c: b } } }\nprint(g(3).a.c)", ["3"]],
+  ["a `.` line continues an inner object value (D3273)", "const g = (b: i32) => {\n  a: { x: b }\n    .x + 1\n}\nprint(g(3).a)", ["4"]],
+  ["an `==` line continues an inner object value (D3273)", "const g = (b: i32) => {\n  a: { x: b }\n    == { x: b }\n}\nprint(g(3).a)", ["true"]],
+  ["an `as` line continues an inner object value (D3273)", "const g = (b: i32) => {\n  a: { x: b }\n    .x\n    as f64\n}\nprint(g(3).a / 2.0)", ["1.5"]],
+  ["a method call line continues an inner object value (D3273)", "const g = (b: i32) => {\n  a: { f() { b } }\n    .f()\n}\nprint(g(3).a)", ["3"]],
+  ["a `-` line continues an inner object value (D3273)", "const g = (b: i32) => {\n  a: { x: b }\n    .x\n    - 1\n}\nprint(g(3).a)", ["2"]],
+  ["a second field's continued value (D3273)", "const g = (b: i32) => {\n  a: { x: b }\n  , c: { x: b }\n    .x\n}\nprint(g(3).c)", ["3"]],
   [
     "a labelled block still parses as one",
     "function g(n: i32) {\n  let r = 0\n  a: { r = n }\n  r\n}\nprint(g(7))",
@@ -68,6 +74,42 @@ for (const [name, src, want] of CASES) {
     const r = await runProgram(src, checker());
     if (!r.compiled || JSON.stringify(r.logs) !== JSON.stringify(want)) {
       throw new Error(`want ${JSON.stringify(want)}, got compiled=${r.compiled} logs=${JSON.stringify(r.logs)}`);
+    }
+  });
+}
+
+// The D3276 note names the arm whose value an error is about, and no other: exact messages.
+const DIAGS: [string, string, string[]][] = [
+  [
+    "a match arm's labelled block, bound through its function",
+    "function h(b: i32) { match b { 3 => { a: { b } }, _ => { a: { b } } } }\nconst v = h(3)",
+    [
+      "cannot bind the void result of 'v' — a void function returns no value; the braces at 1:37 are a block, " +
+      "not an object literal; parenthesize an object there: `({ … })`",
+    ],
+  ],
+  [
+    "an unrelated error after an object-looking branch takes no note",
+    "function k() {}\nfunction m(c: boolean) {\n  if c { L: { c } }\n  const x: i32 = k()\n  print(x)\n}",
+    ["cannot bind the void result of 'x' — a void function returns no value"],
+  ],
+  [
+    "an empty branch is never recorded",
+    "function k() {}\nfunction m(c: boolean) {\n  if c {}\n  const x: i32 = k()\n  print(x)\n}",
+    ["cannot bind the void result of 'x' — a void function returns no value"],
+  ],
+  [
+    "a label whose loop starts on the next line",
+    "let n = 0\nconst h = () => {\n  a:\n  while n < 5 { n = n + 1 }\n}",
+    ["a label's loop or block starts on the label's line: `a: while …`"],
+  ],
+];
+
+for (const [name, src, want] of DIAGS) {
+  Deno.test({ name: `label vs object diagnostics: ${name}`, ignore: !HAVE_SEED }, async () => {
+    const got = (await checker().check(src, "/m.vl", () => undefined)).map((d) => d.message);
+    if (JSON.stringify(got) !== JSON.stringify(want)) {
+      throw new Error(`want ${JSON.stringify(want)}, got ${JSON.stringify(got)}`);
     }
   });
 }

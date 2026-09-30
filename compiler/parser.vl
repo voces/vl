@@ -37,7 +37,7 @@ import {
   Tok,
   dgMarkLossless,
   mkDeclNameTok,
-  objLookBodies,
+  objLookMark,
   stmtBraceNodes,
   stmtBraceTails,
 } from "./ast"
@@ -600,11 +600,17 @@ function asAfterNewlines(): i32 {
   if kindAt(j) != "IDENT" { return -1 }
   if textAt(j) != "as" { return -1 }
   if j == P.pos { return j }
-  let t = j + 1
-  const suf = kindAt(t)
-  if suf == "QUESTION" || suf == "BANG" || suf == "PERCENT" { t = t + 1 }
-  if kindAt(t) == "IDENT" { return j }
+  if castTargetAt(j + 1) { return j }
   -1
+}
+
+// Whether a named cast target starts at `t`, past an `as?`, `as!` or `as%` suffix.
+function castTargetAt(t: i32): boolean {
+  const suf = kindAt(t)
+  if suf == "QUESTION" || suf == "BANG" || suf == "PERCENT" {
+    return kindAt(t + 1) == "IDENT"
+  }
+  kindAt(t) == "IDENT"
 }
 
 // The right-associative operators (assignment): their RHS parses at the same
@@ -1739,8 +1745,30 @@ function parseObjLit() {
         value = mkIdent(name, fp0)
       } else {
         expect("COLON")
+        const broke = peekKind() == "NEWLINE"
         skipNewlines() // a field needs its value, so a line break after `:` ends nothing
-        value = parseExpr()
+        const labelled = isLoopKeyword(peekKind())
+          || (peekKind() == "LBRACE" && labelBraceOpensStmt(P.pos))
+        if broke && labelled {
+          // `name:` then a loop or statements on the next line: a label whose target wandered.
+          P.diags.push(
+            {
+              msg: "a label's loop or block starts on the label's line: `"
+                + name
+                + ": "
+                + peekTok().text
+                + " …`",
+              at: P.pos,
+            },
+          )
+          const lp = peekTok().start
+          while peekKind() != "LBRACE" && peekKind() != "EOF" { advance() }
+          skipBracedRun() // the loop head and body, or the block: one diagnostic for them
+          const none: i32[] = []
+          value = mkBlock(none, lp)
+        } else {
+          value = parseExpr()
+        }
       }
       fields.push(mkFieldInit(name, value, fp0))
     }
@@ -3436,12 +3464,12 @@ function parseBracedBody(msg: string): i32 {
   parseBlock()
 }
 
-// `parseBlock`, for a body that is always a block: one whose `{` would read as an object literal
-// where a body admits one is recorded in `objLookBodies`.
+// `parseBlock`, for a body that is always a block: a non-empty one whose `{` would read as an
+// object literal where a body admits one is recorded (`objLookMark`). An empty `{}` is a block.
 function parseObjLookBlock(): i32 {
-  const olk = peekKind() == "LBRACE" && looksLikeObject(P.pos)
+  const olk = !bracesAreEmpty(P.pos) && looksLikeObject(P.pos)
   const body = parseBlock()
-  if olk { objLookBodies.push(body) }
+  if olk { objLookMark(body) }
   body
 }
 
@@ -4192,18 +4220,34 @@ function labelBraceOpensStmt(bracePos: i32): boolean {
 }
 
 // Whether the `{` at `bracePos`, after `name:`, is a labelled block: its body opens statements,
-// or a statement follows its `}` on a later line, where an object field could only be followed
-// by `,` or `}` (D3273).
+// or a statement follows its `}` on a later line (D3273). Read as an object field's value, the
+// brace is followed by `,` or `}`, or continued on the next line, which no statement then is.
 function labelledBraceIsBlock(bracePos: i32): boolean {
   if labelBraceOpensStmt(bracePos) { return true }
   let i = braceEndOf(bracePos)
   if !isStmtBreak(kindAt(i)) { return false }
-  while isStmtBreak(kindAt(i)) { i = i + 1 }
+  let semi = false
+  while isStmtBreak(kindAt(i)) {
+    if kindAt(i) == "SEMI" { semi = true }
+    i = i + 1
+  }
   const k = kindAt(i)
-  k != "RBRACE" && k != "COMMA" && k != "EOF"
+  if k == "RBRACE" || k == "COMMA" || k == "EOF" { return false }
+  // A `;` ends the value, so only a line break can be continued.
+  semi || ((startsStmt(k) || k == "LBRACE") && !continuesValueAt(i))
 }
 
 function isStmtBreak(kind: TokKind) { kind == "NEWLINE" || kind == "SEMI" }
+
+// Whether the token at `i`, first on its line inside an object literal, continues the value
+// before it: a `.` or `?.` chain, any binary operator (`-` included, as inside brackets), `is`,
+// or a cast `as T`.
+function continuesValueAt(i: i32): boolean {
+  const k = kindAt(i)
+  if k == "DOT" || k == "QUESTION_DOT" || k == "IS" { return true }
+  if binPrec(k) > 0 { return true }
+  k == "IDENT" && textAt(i) == "as" && castTargetAt(i + 1)
+}
 
 // The index just past the `}` closing the `{` at `bracePos`, or of the `EOF` when it never
 // closes. Pure lookahead: the cursor is restored.
