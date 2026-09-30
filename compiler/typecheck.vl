@@ -7749,20 +7749,51 @@ function writeRetiresNarrowing(
   keyHasPrefix(key, tgtKey + "[")
 }
 
-// Whether the write target at `tgtIx` is a field of a receiver typed as an inference hole.
+// What a hole's field `hst` reads after a write of `rt`, or -1 for no narrowing: a hole value is
+// read as itself, since the pin re-asks its member reads and calls (`hdReadNullAsked`), and a
+// value non-null at the template reads the field's non-null face. A hole whose reads the pin
+// does not re-ask, or a union carrying one, does not narrow (D3287).
+function holeFieldWriteTy(hst: i32, rt: i32): i32 {
+  if rt < 0 || rt >= T.tys.length { return -1 }
+  if tyIsHole(rt) {
+    const row = hdRowOf(rt)
+    if row < 0 || tyIsNonNullHoleRead(rt) || hdReadNullAsked(row) { return rt }
+    return -1
+  }
+  if tyAdmitsNull(rt) || isNullTy(rt) { return -1 }
+  if tyHasHole(rt) {
+    const t = T.tys[rt]
+    if !(t is TyObj || t is TyArray || t is TyFunc || t is TyMap) { return -1 }
+  }
+  const hn = nonNullNarrowTy(hst)
+  if hn == hst { return -1 }
+  hn
+}
+
+// Whether the write target at `tgtIx` is a field or a cell of a receiver typed as an inference
+// hole, at any depth of a place (`b.a.v`, `b[0]`).
 function writesHoleField(tgtIx: i32): boolean {
   const tn = P.nodes[tgtIx]
-  if tn is Member {
-    const on = P.nodes[tn.memObj]
-    if on is Ident { return tyIsHole(lookup(on.identName)) }
-    return tyIsHole(nodeTyOf(tn.memObj))
-  }
-  false
+  let recv = -1
+  if tn is Member { recv = tn.memObj }
+  else if tn is Index { recv = tn.idxArr }
+  else { return false }
+  const on = P.nodes[recv]
+  if on is Ident { return tyIsHole(lookup(on.identName)) }
+  const noNames: string[] = []
+  const noTys: i32[] = []
+  if tyIsHole(placeCurTy(recv, noNames, noTys)) { return true }
+  tyIsHole(nodeTyOf(recv))
 }
 
 // Assignments that ended a path narrowing through another place that may name the same object.
 // They settle like a call (`crPathCallRetire`), since the emitter cannot see the alias.
 let crAliasWr: {[i32]: boolean} = Map()
+// Narrowings a hole body ended by a rule that holds at every pin, keyed `<ender>|<path key>`: a
+// write to the place or a prefix of it, a variable-index write under it, or a call that writes
+// the path through an argument or a free variable by name. An alias or cell-tag verdict is decided
+// on types the hole does not have yet, so a read after it keeps master's behaviour (D3287).
+let npKillSure: {[string]: boolean} = Map()
 // Enclosing functions' path slots such a write inside a nested function ends, with the depth of
 // the function holding the write. They hold again when that body closes: its calls run the write.
 let crAliasNestSlots: i32[] = []
@@ -8071,7 +8102,10 @@ function retireNarrowingsForWrite(tgtIx: i32, rt0: i32, atIx: i32) {
     const pfx = root + "["
     let r = 0
     while r < npKeys.length {
-      if keyHasPrefix(npKeys[r], pfx) { npInvBy[r] = atIx }
+      if keyHasPrefix(npKeys[r], pfx) {
+        npInvBy[r] = atIx
+        noteKillSure(atIx, npKeys[r])
+      }
       r = r + 1
     }
     return 0
@@ -8123,6 +8157,7 @@ function retireNarrowingsForWrite(tgtIx: i32, rt0: i32, atIx: i32) {
     }
     if hit {
       npInvBy[i] = atIx
+      noteKillSure(atIx, npKeys[i])
       // The target's OWN narrowing going is what the emitter has to mirror; a path below it
       // goes through the prefix rule both sides already apply. Reads-only narrowing states one
       // rule for every receiver, so the path re-narrows to the written member exactly as a bare
@@ -8154,14 +8189,11 @@ function retireNarrowingsForWrite(tgtIx: i32, rt0: i32, atIx: i32) {
       }
     }
   }
-  // A hole's field reads its non-null face after a write of a value non-null at the template, as
-  // after a null test, whatever narrowing the write retired (D3197).
-  if pathReTy < 0 && rt >= 0 && writesHoleField(tgtIx) && !tyHasHole(rt) {
+  // A hole's field reads what a write stored in it (`holeFieldWriteTy`), as after a null test,
+  // whatever narrowing the write retired (D3197).
+  if pathReTy < 0 && rt >= 0 && writesHoleField(tgtIx) {
     const hst = placeStoreTy(tgtIx)
-    if hst >= 0 && tyIsHole(hst) && !tyAdmitsNull(rt) && !isNullTy(rt) {
-      const hn = nonNullNarrowTy(hst)
-      if hn >= 0 && hn != hst { pathReTy = hn }
-    }
+    if hst >= 0 && tyIsHole(hst) { pathReTy = holeFieldWriteTy(hst, rt) }
   }
   if pathReTy >= 0 {
     npKeys.push(tgtKey)
@@ -8363,6 +8395,7 @@ function noteCallInvalidations(callIx: i32) {
       // two arms separately and a write in one must not hide a call in the other (D1849).
       if npInvBy[i] < 0 {
         npInvBy[i] = callIx
+        if callKillSure(callIx, npKeys[i]) { noteKillSure(callIx, npKeys[i]) }
         crPathCallRetire(i, callIx)
         // Inside a nested body a call ends an enclosing narrowing for the rest of that body
         // only: the enclosing function's own call of the body ends it there, in both halves.
@@ -8874,6 +8907,7 @@ function crReset() {
   crOpOpaque = Map()
   crOpCall = Map()
   crAliasWr = Map()
+  npKillSure = Map()
   crAliasNestSlots = []
   crNestCallRet = Map()
   crAliasNestDepths = []
@@ -10871,6 +10905,7 @@ function crLoopPathPreRetire(loopIx: i32) {
       const a = crLoopLeavingPathWrite(loopIx, npKeys[s], npTys[s])
       if a >= 0 {
         npInvBy[s] = a
+        noteKillSure(a, npKeys[s])
         npSettle[s] = -1
         crAliasWr[a] = true
         crLoopMapCellPresent(npKeys[s], a)
@@ -11789,6 +11824,7 @@ function placeElemTy(baseTy: i32) {
     if primNameOf(bt.aElem) == "u8" { return -1 }
     return bt.aElem
   }
+  if bt is TyVar { return holePlaceElemTy(baseTy, bt) }
   // The other indexable container, which is its own function so this one keeps a single
   // arm: a map cell's read type is not its storage type, and the two questions differ
   // enough that a second arm here would read as one rule (D1734).
@@ -11868,6 +11904,15 @@ function holePlaceFieldTy(hole: i32, ht: TyVar, prop: string): i32 {
   }
   if tpBoundOfName(ht.tvName) >= 0 { return -1 }
   mkDerivedHole(HD_FLD, prop, -1, -1, hole)
+}
+
+// The element a read off hole `hole` derives, as `checkIndexNode` types it, so a null test on
+// `z[0]` narrows a hole's cell the way it narrows a declared list's (D3287). -1 for a hole that
+// reads its members from a bound.
+function holePlaceElemTy(hole: i32, ht: TyVar): i32 {
+  if ht.tvName.length == 0 { return -1 }
+  if ht.tvName[0] != '?' && tpBoundOfName(ht.tvName) >= 0 { return -1 }
+  mkDerivedHole(HD_ELEMV, "", -1, -1, hole)
 }
 
 // Shared-field access over a struct union: a field present on every member is readable on the
@@ -34182,6 +34227,13 @@ export function memCstrMsg(recv: i32, prop: string) {
     if isNullTy(recv) { return "" }
     return callFloorMsg(recv)
   }
+  if keyHasPrefix(prop, MC_NULL_READ_MARK) {
+    if !tyAdmitsNull(recv) { return "" }
+    return memberFloorMsg(
+      recv,
+      prop.slice(MC_NULL_READ_MARK.length, prop.length),
+    )
+  }
   if keyHasPrefix(prop, MC_METHOD_MARK) {
     const name = prop.slice(MC_METHOD_MARK.length, prop.length)
     if builtinMethodClaims(recv, name) { return "" }
@@ -34203,6 +34255,102 @@ function callFloorMsg(fnTy: i32) {
 
 // The `memCstrProp` of a built-in method call on a gradual union, before the method's name.
 const MC_METHOD_MARK = "()"
+// The `memCstrProp` of a member read off a derived hole (`hdReadNullAsked`), before the
+// member's name. The pin asks only whether the receiver admits `null`; any other floor stays
+// unasked, since an `is` test on such a hole does not narrow it in the body (D3216).
+const MC_NULL_READ_MARK = "?."
+
+// Records a member read off a derived hole a `null` could reach, so the pin refuses `.v` on
+// `H | null` as the direct spelling does (D3287). A null test narrows the read to the hole's
+// non-null face (`HD_GNOT`), which is not recorded, so a guarded read still runs.
+function noteNullReadCstr(recv: i32, prop: string, ix: i32, place: i32) {
+  if inferQuiet || !killedNarrowingSure(place) { return 0 }
+  if hdReadNullAsked(hdRowOf(recv)) {
+    noteMemCstr(recv, MC_NULL_READ_MARK + prop, ix, false)
+  }
+  0
+}
+
+// A hole's field, element or result passed to a parameter whose body reads its members: the
+// pin asks the argument about `null`, as `holeDemandOk` asks a concrete one (D3300).
+function noteHoleArgNullRead(name: string, at: i32, ix: i32) {
+  const shape = holeShapeOf(name)
+  if shape < 0 { return 0 }
+  const st = T.tys[shape]
+  if st is TyObj {
+    if st.objFieldNames.length > 0 {
+      noteNullReadCstr(at, st.objFieldNames[0], ix, ix)
+    }
+  }
+  0
+}
+
+function noteKillSure(by: i32, key: string) {
+  npKillSure[i32ToStr(by) + "|" + key] = true
+  0
+}
+
+// Whether the place at node `place` is not a narrowing this function ended by a verdict a pin
+// could overturn. A place never narrowed, or narrowed and still live, answers true.
+function killedNarrowingSure(place: i32): boolean {
+  if place < 0 || place >= P.nodes.length { return true }
+  const key = placeKeyOf(place)
+  if key == "" { return true }
+  let s = npKeys.length - 1
+  let base = crFnNpBase()
+  if base < 0 { base = 0 }
+  while s >= base {
+    if npKeys[s] == key {
+      if npInvBy[s] < 0 { return true }
+      return npKillSure[i32ToStr(npInvBy[s]) + "|" + key] ?? false
+    }
+    s = s - 1
+  }
+  true
+}
+
+// Whether the call at `callIx` ends the narrowing keyed `key` by a rule that holds at every pin:
+// an opaque callee, a cell-removing method on the path's own receiver, or a callee whose
+// summary writes the path by name through an argument or a free variable.
+function callKillSure(callIx: i32, key: string): boolean {
+  const cn = P.nodes[callIx]
+  if !(cn is Call) { return false }
+  const rmRecv = P.nodes[cn.callFn]
+  if rmRecv is Member {
+    if cellRemovingMethod(rmRecv.memProp) {
+      const rmRoot = placeKeyOf(rmRecv.memObj)
+      if rmRoot != "" && keyHasPrefix(key, rmRoot + "[") { return true }
+    }
+  }
+  const declIx = callDeclFnIx(cn, callIx)
+  if declIx == -1 { return !crCalleeUnresolved(callIx) }
+  if declIx < 0 { return false }
+  const free = fnWriteFreePaths(declIx)
+  if free == "*" || pathHitsAny(key, free, "") { return true }
+  const args = callArgPlaces(cn, callIx)
+  let i = 0
+  while i < args.length {
+    const ak = placeKeyOf(args[i])
+    if ak != "" && keyHasPrefix(key, ak + ".") {
+      const sum = fnWriteEffects(declIx, i)
+      if sum == "*" { return true }
+      if pathHitsAny(key.slice(ak.length + 1, key.length), sum, "") {
+        return true
+      }
+    }
+    i = i + 1
+  }
+  false
+}
+
+// Whether a member read off derived-hole row `row` is re-asked at the pin for a `null` member:
+// a field, element or call result of a hole, or an `is` remainder other than the non-null face.
+function hdReadNullAsked(row: i32): boolean {
+  if row < 0 || row >= hdKind.length { return false }
+  const k = hdKind[row]
+  if k == HD_GNOT { return hdAlt[row] != TY_NULL }
+  k == HD_FLD || k == HD_ELEM || k == HD_ELEMV || k == HD_RET
+}
 
 // Records a deferred receiver-classification constraint when the receiver still carries a
 // hole, so the generic call site re-asks whether `T` is a collection under substitution.
@@ -40583,6 +40731,7 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
     // when the body read `o.x` (host: the grown `Infer<{x,…}>` pin).
     const pHole = T.tys[params[i]]
     if pHole is TyVar {
+      noteHoleArgNullRead(pHole.tvName, at, args[i])
       if !holeDemandOk(pHole.tvName, args[i], at) {
         holeArgDemandErr(pHole.tvName, i + 1, at, args[i])
       }
@@ -60033,6 +60182,7 @@ function checkMemberNode(n: Member, ix: i32) {
     }
     if ot.tvName.length > 0 {
       if ot.tvName[0] == '?' {
+        noteNullReadCstr(objTy, n.memProp, ix, n.memObj)
         // `.length` is the i32 length an array/string/map exposes — treat it as that (not a
         // struct field), so a collection-shaped hole infers without growing a bogus `{length}` shape.
         return symMem(ix, holeMemberTy(objTy, ot.tvName, n.memProp))
