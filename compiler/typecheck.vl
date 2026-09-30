@@ -67,10 +67,12 @@ import {
   adoptNodeTok,
   arenaEpochBump,
   arenaSetNode,
+  brkValSeen,
   callIsNever,
   callIsRestPacked,
   hasSpreadItem,
   isBareBlockIf,
+  lblBlkSeen,
   markCallNever,
   markCallRestPacked,
   mkArrayLit,
@@ -3371,6 +3373,8 @@ function nodeIsTotalAt(ix: i32, tail: boolean) {
     return false
   }
   if n is WhileStmt {
+    // A loop carrying a value yields it in a value position.
+    if tail && loopCarriesValue(ix) { return true }
     // A labelled block is total when its body is and no `break :B` leaves it (D3259).
     if n.whileBlk == 1 {
       return nodeIsTotalAt(n.whileBody, false)
@@ -5194,6 +5198,23 @@ export function initChecker() {
   f32JoinAdoptCount = 0
   matchTailNode = -1
   valDiscardAt = Map()
+  lpValTy = []
+  lpValUsed = []
+  lpValTail = []
+  exitArmBlocks = []
+  exitArmSeen = []
+  exitFirstAt = []
+  exitFirstLets = []
+  exitFirstLetSeen = []
+  valueArmAt = -1
+  nestedExitFirstAt = []
+  lpValSeen = false
+  lpLabels = []
+  lpJoin = []
+  lpBare = []
+  lpBase = 0
+  lpOn = false
+  brkPrevTy = -1
   discardValTyAt = Map()
   inferDroppedTy = []
   // Pass 0 and pass 1's collect tables, reset here with everything else: every
@@ -45689,12 +45710,12 @@ function isStmtNode(ix: i32) {
   const nd = P.nodes[ix]
   if nd is LetDecl { return true }
   if nd is IfStmt { return true }
-  if nd is WhileStmt { return true }
+  if nd is WhileStmt { return !loopCarriesValue(ix) }
   if nd is BreakStmt { return true }
   if nd is ContinueStmt { return true }
   if nd is RetStmt { return true }
-  if nd is ForRange { return true }
-  if nd is ForIn { return true }
+  if nd is ForRange { return !loopCarriesValue(ix) }
+  if nd is ForIn { return !loopCarriesValue(ix) }
   // A body-scoped `type` is a declaration (D1045), so a block ending in one is valueless,
   // exactly as one ending in a `let` is — otherwise the trailing declaration would be read as the block's value.
   if nd is TypeDecl { return true }
@@ -46358,6 +46379,8 @@ function ucBlock(ix: i32, lastCtx: i32) {
     while i < n {
       let c = UC_DISCARD
       if i == n - 1 { c = lastCtx }
+      // A `break v`'s value is the statement before the break, and it is read.
+      if brkValSeen && breakValueAt(b.blkStmts, i) { c = UC_VALUE }
       ucWalk(b.blkStmts[i], c)
       i = i + 1
     }
@@ -46440,7 +46463,10 @@ function ucWalk(ix: i32, ctx: i32) {
       ucWalk(n.omObj, UC_VALUE)
     } else if n is WhileStmt {
       ucWalk(n.whileCond, UC_VALUE)
-      ucBlock(n.whileBody, UC_DISCARD)
+      // A labelled block's tail is its value, read as the block is.
+      let tailCtx = UC_DISCARD
+      if n.whileBlk == 1 { tailCtx = ctx }
+      ucBlock(n.whileBody, tailCtx)
     } else if n is ForRange {
       ucWalk(n.frFrom, UC_VALUE)
       ucWalk(n.frTo, UC_VALUE)
@@ -47454,10 +47480,18 @@ function noteNestedUnannotFn(fnIx: i32, fty: i32) {
 // trailing expression (`noteInferredRet`, under a `-2` pending `curRet`), then patched into
 // the hoisted `TyFunc` in place so every caller sees it. A base-case-less cycle has nothing to latch onto and reports "cannot infer a return type".
 function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
-  if n.fnName != "" { return checkFuncDeclNodeReal(n, fnIx) }
-  lamCheckDepth = lamCheckDepth + 1
-  const r = checkFuncDeclNodeReal(n, fnIx)
-  lamCheckDepth = lamCheckDepth - 1
+  // No `break` crosses a function boundary, so the body's loops start a fresh base.
+  const lpSaved = lpBase
+  lpBase = lpLabels.length
+  let r = 0
+  if n.fnName != "" {
+    r = checkFuncDeclNodeReal(n, fnIx)
+  } else {
+    lamCheckDepth = lamCheckDepth + 1
+    r = checkFuncDeclNodeReal(n, fnIx)
+    lamCheckDepth = lamCheckDepth - 1
+  }
+  lpBase = lpSaved
   r
 }
 
@@ -47833,7 +47867,11 @@ function checkFuncDeclNodeReal(n: FuncDecl, fnIx: i32) {
         tpIfMarkOk(stmts[s])
       }
       crStmtEnter(stmts[s])
+      const savedSpine = spineAt
+      spineAt = -1
+      if s == stmts.length - 1 { spineAt = stmts[s] }
       const stTy = checkNode(stmts[s])
+      spineAt = savedSpine
       crStmtLeave()
       retTailPos = savedRTPbody
       if ucVoided && tailIsReturn {
@@ -50324,16 +50362,18 @@ function checkNodeReal(ix: i32) {
     return TY_ERR
     // ── let / const ─────────────────────────────────────────────────────────────
   } else if n is LetDecl {
-    return checkLetDeclNode(n, ix)
+    const lr = checkLetDeclNodeIn(n, ix)
+    if lpOn || exitFirstAt.length > 0 { noteExitFirstLet(n, ix) }
+    return lr
   } else if n is FuncDecl {
     return checkFuncDeclNode(n, ix)
     // ── while ─────────────────────────────────────────────────────────────────
   } else if n is WhileStmt {
     return checkWhileStmtNode(n, ix)
-    // Accepted unconditionally: valid only inside a loop, but loop-nesting is
-    // not tracked yet (a misplaced `break`/`continue` is a parser concern).
+    // A `break` joins its value into the loop or block it leaves; a misplaced one is the
+    // parser's and the emitter's to report.
   } else if n is BreakStmt {
-    return TY_VOID
+    return checkBreakNode(n, ix)
   } else if n is ContinueStmt {
     return TY_VOID
     // ── for v in A to B [step S] ────────────────────────────────────────────────
@@ -52396,6 +52436,8 @@ function checkProgramAgain(rootIx: i32) {
 // One walk of the program; `initChecker()` must have run first. Every module table this walk
 // fills is emptied there, so a walk over a stale one reads another program's rows.
 function checkProgramPass(rootIx: i32) {
+  // Read here, after every module parsed: `initChecker` can run before the parse.
+  lpOn = brkValSeen || lblBlkSeen
   if !checkerArmed {
     tErr(
       "internal: checkProgram without initChecker since the previous program",
@@ -58676,7 +58718,49 @@ function widenLitTyGo(ty: i32, depth: i32): i32 {
   }
 }
 
-function checkLetDeclNode(n: LetDecl, ix: i32) {
+// Notes an un-annotated binding of a loop value or of a construct whose first arm always exits;
+// asked only in a program holding one of them.
+function noteExitFirstLet(n: LetDecl, ix: i32) {
+  if n.letType < 0 && n.letInit >= 0 && !inferQuiet {
+    let ini = n.letInit
+    while ini >= 0 && P.nodes[ini] is Paren {
+      const pn = P.nodes[ini]
+      if pn is Paren { ini = pn.parInner }
+    }
+    // A loop value's binding is read through the result binding the emitter mints, which
+    // a classifier asked at module scope or through a capture cannot see into.
+    const loopVal = lpOn && loopCarriesValue(ini)
+    const firstExits = exitFirstAt.length > 0 && exitFirstOnSpine(ini, 0)
+    if (loopVal || firstExits) && lpColAt(exitFirstLetSeen, ix) != 1 {
+      lpColSet(exitFirstLetSeen, ix, 1)
+      exitFirstLets.push(ix)
+    }
+  }
+  0
+}
+
+// Whether `ix`, or the first-arm tail an `if` or `match` at `ix` reads through, is a value
+// construct whose first arm always exits (`noteExitFirst`).
+function exitFirstOnSpine(ix: i32, depth: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length || depth > 64 { return false }
+  if lpColAt(exitFirstAt, ix) == 1 { return true }
+  const n = P.nodes[ix]
+  let arm = -1
+  if n is IfStmt { arm = n.ifThen }
+  if n is MatchExpr {
+    if n.matchBodies.length > 0 { arm = n.matchBodies[0] }
+  }
+  if n is Paren { return exitFirstOnSpine(n.parInner, depth + 1) }
+  if arm < 0 { return false }
+  const b = P.nodes[arm]
+  if b is Block {
+    if b.blkStmts.length == 0 { return false }
+    return exitFirstOnSpine(b.blkStmts[b.blkStmts.length - 1], depth + 1)
+  }
+  exitFirstOnSpine(arm, depth + 1)
+}
+
+function checkLetDeclNodeIn(n: LetDecl, ix: i32) {
   if n.letType < 0 && n.letInit >= 0 && !inferQuiet {
     const lp = cwPeel(n.letInit)
     if lp >= 0 {
@@ -59213,7 +59297,11 @@ function checkMatchIntArms(n: MatchExpr, ix: i32, st: i32) {
       )
     }
     const body = n.matchBodies[ai]
+    const svArm = valueArmAt
+    if matchValued { valueArmAt = body }
+    if matchOnSpine { spineAt = body }
     const bt = checkNode(body)
+    valueArmAt = svArm
     let armTy = bt
     const bn = P.nodes[body]
     if bn is Block {
@@ -59222,9 +59310,11 @@ function checkMatchIntArms(n: MatchExpr, ix: i32, st: i32) {
       // sentinel TY_ERR (both are -1), so a void-arm `match` must not be read as an error.
       if armTy < 0 { armTy = TY_VOID }
     }
-    matchTy = joinArmTys(matchTy, f32ArmPlainTy(body, armTy))
-    if tpEnvNames.length > 0 { matchArmTys.push(f32ArmPlainTy(body, armTy)) }
-    matchValAcc = matchArmTally(ix, body, armTy, matchValAcc)
+    if !matchArmExits(ix, body, armTy) {
+      matchTy = joinArmTys(matchTy, f32ArmPlainTy(body, armTy))
+      if tpEnvNames.length > 0 { matchArmTys.push(f32ArmPlainTy(body, armTy)) }
+      matchValAcc = matchArmTally(ix, body, armTy, matchValAcc)
+    }
     ai = ai + 1
   }
   if matchTy < 0 { matchTy = TY_VOID }
@@ -59359,6 +59449,26 @@ function checkMatchBindDecls(bIx: i32) {
     }
   }
   0
+}
+
+// Whether the `match` arm `body` is a block that always exits, which hands the join nothing and
+// is noted for the emitter's `never` tail, as an `if` arm is (D3222).
+function matchArmExits(ix: i32, body: i32, armTy: i32): boolean {
+  // An arm with a value cannot always exit, and a statement or tail `match` (`matchOnSpine`)
+  // lowers its arms without one, so neither pays for the walk of the arm.
+  if matchOnSpine || !isVoidTy(armTy) || !(P.nodes[body] is Block) {
+    return false
+  }
+  const mn = P.nodes[ix]
+  let first = false
+  if mn is MatchExpr {
+    first = mn.matchBodies.length > 0 && mn.matchBodies[0] == body
+  }
+  if !stmtAlwaysExits(body) { return false }
+  if first && atValueArmTail(ix) { lpColSet(nestedExitFirstAt, ix, 1) }
+  noteExitArm(body)
+  if first { noteExitFirst(ix) }
+  true
 }
 
 function checkMatchTypeArms(n: MatchExpr, ix: i32, st: i32, uMems: i32[]) {
@@ -59528,7 +59638,11 @@ function checkMatchTypeArms(n: MatchExpr, ix: i32, st: i32, uMems: i32[]) {
       checkMatchBindDecls(bindIx)
     }
     const body = n.matchBodies[bi]
+    const svArm = valueArmAt
+    if matchValued { valueArmAt = body }
+    if matchOnSpine { spineAt = body }
     const bt = checkNode(body)
+    valueArmAt = svArm
     let armTy = bt
     const bn = P.nodes[body]
     if bn is Block {
@@ -59538,9 +59652,11 @@ function checkMatchTypeArms(n: MatchExpr, ix: i32, st: i32, uMems: i32[]) {
       if armTy < 0 { armTy = TY_VOID }
     }
     if scoped { popScope() }
-    matchTy = joinArmTys(matchTy, f32ArmPlainTy(body, armTy))
-    if tpEnvNames.length > 0 { matchArmTys.push(f32ArmPlainTy(body, armTy)) }
-    matchValAcc = matchArmTally(ix, body, armTy, matchValAcc)
+    if !matchArmExits(ix, body, armTy) {
+      matchTy = joinArmTys(matchTy, f32ArmPlainTy(body, armTy))
+      if tpEnvNames.length > 0 { matchArmTys.push(f32ArmPlainTy(body, armTy)) }
+      matchValAcc = matchArmTally(ix, body, armTy, matchValAcc)
+    }
     bi = bi + 1
   }
   if matchTy < 0 { matchTy = TY_VOID }
@@ -59719,6 +59835,22 @@ function matchUnknownTypeMsg(nm: string, st: i32) {
 
 // Extracted from `checkNodeReal`'s `MatchExpr` arm (C3: thin the dispatcher).
 function checkMatchExprNode(n: MatchExpr, ix: i32) {
+  // A discarded `match` lowers its arms as statements, as a spine one does, and so do the
+  // blocks, `if`s and `match`es at their tails.
+  const savedOnSpine = matchOnSpine
+  const savedValued = matchValued
+  const savedSpine = spineAt
+  matchValued = !valDiscarded(ix)
+  matchOnSpine = spineAt == ix || !matchValued
+  const r = checkMatchExprNodeIn(n, ix)
+  if lpColAt(nestedExitFirstAt, ix) == 1 { refuseNestedExitFirst(ix, r) }
+  matchOnSpine = savedOnSpine
+  matchValued = savedValued
+  spineAt = savedSpine
+  r
+}
+
+function checkMatchExprNodeIn(n: MatchExpr, ix: i32) {
   // Three arm vocabularies, decided by the scrutinee: an integer dispatches on literals
   // (D1572), a litunion on member strings, any other union on member types.
   const mTail = retTailPos
@@ -59881,7 +60013,11 @@ function checkMatchExprNode(n: MatchExpr, ix: i32) {
     // Body value type. (Arm bodies are not checked in return-tail position; the match's joined
     // value seeds the function return once, below — avoids a per-arm void/err mis-seed.)
     const body = n.matchBodies[ai]
+    const svArm = valueArmAt
+    if matchValued { valueArmAt = body }
+    if matchOnSpine { spineAt = body }
     const bt = checkNode(body)
+    valueArmAt = svArm
     let armTy = bt
     const bn = P.nodes[body]
     if bn is Block {
@@ -59890,9 +60026,11 @@ function checkMatchExprNode(n: MatchExpr, ix: i32) {
       // sentinel TY_ERR (both are -1), so a void-arm `match` must not be mistaken for an error.
       if armTy < 0 { armTy = TY_VOID }
     }
-    matchTy = joinArmTys(matchTy, f32ArmPlainTy(body, armTy))
-    if tpEnvNames.length > 0 { matchArmTys.push(f32ArmPlainTy(body, armTy)) }
-    matchValAcc = matchArmTally(ix, body, armTy, matchValAcc)
+    if !matchArmExits(ix, body, armTy) {
+      matchTy = joinArmTys(matchTy, f32ArmPlainTy(body, armTy))
+      if tpEnvNames.length > 0 { matchArmTys.push(f32ArmPlainTy(body, armTy)) }
+      matchValAcc = matchArmTally(ix, body, armTy, matchValAcc)
+    }
     ai = ai + 1
   }
   // A void-armed match leaves the join unset (-1) or void; normalize to void so the function-
@@ -59988,6 +60126,8 @@ type IfChk = {
 // every tail innermost-first, with `checkNode`'s own bookkeeping for each inner link between, so
 // the chain's depth costs no stack (D1990).
 function checkIfStmtNode(ix: i32) {
+  const savedChainSpine = ifChainSpine
+  ifChainSpine = spineAt == ix
   const frames: IfChk[] = []
   const savedTails: boolean[] = []
   let cur = ix
@@ -60006,11 +60146,19 @@ function checkIfStmtNode(ix: i32) {
           savedTails.push(retTailPos)
           cur = c.ifElse
         } else {
+          const elseSpine = spineAt
+          const elseArm = valueArmAt
+          if !valDiscarded(at) { valueArmAt = c.ifElse }
+          if ifChainSpine { spineAt = c.ifElse }
           elseRes = checkNode(c.ifElse)
+          spineAt = elseSpine
+          valueArmAt = elseArm
         }
       }
     }
   }
+  const savedOnTail = ifChainOnFnTail
+  ifChainOnFnTail = ifChainSpine
   let k = frames.length - 1
   let res = checkIfTailAt(frames[k], elseRes, false)
   while k > 0 {
@@ -60019,8 +60167,21 @@ function checkIfStmtNode(ix: i32) {
     checkNodeDone(inner.ifIx, res, savedTails[k])
     res = checkIfTailAt(frames[k], res, inner.exits)
   }
+  ifChainOnFnTail = savedOnTail
+  ifChainSpine = savedChainSpine
   res
 }
+
+// The node on a function body's tail spine being checked, or -1: a block, `if` or `match` there
+// hands it to its last statement or arms, whose joins lower as the function's returns, so an
+// exiting arm there needs no `never` tail (D3222). One node, not a flag, so leaving the spine
+// costs nothing; `ifChainSpine`, `ifChainOnFnTail` and `matchOnSpine` are the constructs' own.
+let spineAt = -1
+let ifChainSpine = false
+let ifChainOnFnTail = false
+let matchOnSpine = false
+// Whether the `match` being checked is a value, so its arms are value arms (`valueArmAt`).
+let matchValued = false
 
 // The head of one link: everything up to checking its else arm.
 function checkIfHead(n: IfStmt, ix: i32): IfChk {
@@ -60097,8 +60258,17 @@ function checkIfHead(n: IfStmt, ix: i32): IfChk {
   // this depth runs whenever the arm does and a deeper one is conditional (D1846).
   const thenOwnDepth = T.scopes.length + 1
   const thenLo = narClobKeys.length
-  if valDiscarded(ix) { markValDiscard(n.ifThen) }
+  const thenArm = valueArmAt
+  if valDiscarded(ix) {
+    markValDiscard(n.ifThen)
+  } else {
+    valueArmAt = n.ifThen
+  }
+  const thenSpine = spineAt
+  if ifChainSpine { spineAt = n.ifThen }
   checkNode(n.ifThen)
+  spineAt = thenSpine
+  valueArmAt = thenArm
   const thenHi = narClobKeys.length
   // The guard-clause divergence test, asked once the arm is checked so a `never` call in it is
   // marked (D1972): the post-guard leg, the `else if` hand-up and the emitter's
@@ -60436,7 +60606,23 @@ function checkIfTail(
   if daHasElse {
     const thenPlain = f32ArmPlainTy(n.ifThen, thenTy)
     const elsePlain = f32ArmPlainTy(n.ifElse, elseTy)
-    const plainJoin = joinArmTys(thenPlain, elsePlain)
+    // An arm block that always exits (`return`, `break`, `continue`) hands no value to the
+    // join; the emitter ends it with a `never` value (`exitArmBlockAt`) so every rep lowers it.
+    let plainJoin = joinArmTys(thenPlain, elsePlain)
+    // A function's tail `if` already lowers an exiting arm as a return, so it needs no tail.
+    if thenExits && !daElseDiverges && P.nodes[n.ifThen] is Block {
+      if atValueArmTail(ix) { refuseNestedExitFirst(ix, elsePlain) }
+      plainJoin = elsePlain
+      if !ifChainOnFnTail {
+        noteExitArm(n.ifThen)
+        noteExitFirst(ix)
+      }
+    }
+    const elseBlk = n.ifElse >= 0 && P.nodes[n.ifElse] is Block
+    if daElseDiverges && !thenExits && elseBlk {
+      plainJoin = thenPlain
+      if !ifChainOnFnTail { noteExitArm(n.ifElse) }
+    }
     f32JoinRevert(ix)
     if tpEnvNames.length > 0 && !thenExits && !daElseDiverges {
       let elseApart = elsePlain
@@ -65514,13 +65700,242 @@ function checkWhileStmtNode(n: WhileStmt, ix: i32) {
     pushScope(-1)
     applyNarrows(wnNames, wnTys)
   }
-  markValDiscard(n.whileBody)
+  const blk = n.whileBlk == 1
+  // A labelled block's tail is its value, so its body is discarded only when the block is.
+  if !blk || valDiscarded(ix) { markValDiscard(n.whileBody) }
+  lpPush(n.whileLabel)
   checkNode(n.whileBody)
+  let tailTy = -1
+  let tailIx = -1
+  let runsOut = lpOn && !condLitTrue(n.whileCond)
+  if blk {
+    runsOut = false
+    if blockTailTy >= 0 && !isVoidTy(blockTailTy) && blockTailIx >= 0 {
+      tailTy = blockTailTy
+      tailIx = blockTailIx
+    } else if !stmtAlwaysExits(n.whileBody) {
+      runsOut = true
+    }
+  }
+  const res = lpPopResult(ix, tailTy, tailIx, runsOut)
   if wnNames.length > 0 { popScope() }
   popReBarrier()
   daRollbackTo(daLoopMark)
   daRelease(daLoopMark)
-  return TY_VOID
+  return res
+}
+
+// ── loop and labelled-block values ──────────────────────────────────────────
+// The loops and labelled blocks being checked, innermost last: each one's label, the join of
+// the `break` values leaving it (-1 before the first) and whether an exit leaves it with no
+// value. `lpBase` is where the entries of the function being checked start.
+let lpLabels: string[] = []
+let lpJoin: i32[] = []
+let lpBare: boolean[] = []
+let lpBase = 0
+// Whether the parse holds a `break v` or a labelled block, the only sources of a loop value;
+// every loop-value check is skipped without one, so such a program pays nothing.
+let lpOn = false
+// The type of the statement the enclosing block checked last: a `break v`'s value is the
+// statement just before the break (`BreakStmt.brkHasVal`).
+let brkPrevTy = -1
+// By loop node: the type of a loop or labelled block that carries a value, and whether that
+// value is used rather than discarded. Written by each check of the node.
+let lpValTy: i32[] = []
+let lpValUsed: i32[] = []
+// By labelled block: the tail statement whose value it ends with, where it has one.
+let lpValTail: i32[] = []
+
+function lpPush(label: string) {
+  if !lpOn { return 0 }
+  lpLabels.push(label)
+  lpJoin.push(-1)
+  lpBare.push(false)
+  0
+}
+
+// The loop entry a `break`/`continue` labelled `label` targets ("" = the innermost), or -1.
+function lpTargetOf(label: string): i32 {
+  let i = lpLabels.length - 1
+  while i >= lpBase {
+    if label == "" || lpLabels[i] == label { return i }
+    i = i - 1
+  }
+  -1
+}
+
+// Pops the innermost entry, for the loop `ix`: its value type from the `break` values, the
+// block tail `tailTy` (-1 for none) and `runsOut` (an exit with no value), else void.
+function lpPopResult(ix: i32, tailTy: i32, tailIx: i32, runsOut: boolean): i32 {
+  if !lpOn { return TY_VOID }
+  const top = lpLabels.length - 1
+  if top < 0 { return TY_VOID }
+  let t = lpJoin[top]
+  const bare = lpBare[top]
+  lpLabels.pop()
+  lpJoin.pop()
+  lpBare.pop()
+  if tailTy >= 0 { t = joinTys(t, tailTy) }
+  if t < 0 {
+    lpColSet(lpValTy, ix, -1)
+    return TY_VOID
+  }
+  if runsOut || bare { t = joinTys(t, TY_NULL) }
+  lpColSet(lpValTy, ix, t)
+  lpValSeen = true
+  let used = 1
+  if valDiscarded(ix) { used = 0 }
+  lpColSet(lpValUsed, ix, used)
+  let tl = -1
+  if tailTy >= 0 { tl = tailIx }
+  lpColSet(lpValTail, ix, tl)
+  t
+}
+
+// Writes `v` at node `ix` of a per-node column, growing it with -1 up to the index.
+function lpColSet(col: i32[], ix: i32, v: i32) {
+  if ix < 0 { return 0 }
+  while col.length <= ix { col.push(-1) }
+  col[ix] = v
+  0
+}
+
+// The per-node column `col` at `ix`, or -1 past its end.
+function lpColAt(col: i32[], ix: i32): i32 {
+  if ix < 0 || ix >= col.length { return -1 }
+  col[ix]
+}
+
+// `break [:label] [v]`: joins the value's type into the target's, or marks a value-less exit.
+function checkBreakNode(n: BreakStmt, ix: i32) {
+  if !lpOn { return TY_VOID }
+  const t = lpTargetOf(n.brkLabel)
+  if t < 0 { return TY_VOID }
+  if n.brkHasVal != 1 {
+    lpBare[t] = true
+    return TY_VOID
+  }
+  const vt = brkPrevTy
+  if vt < 0 || vt == TY_ERR { return TY_VOID }
+  if isVoidTy(vt) {
+    tErr("a `break` value must be a value, and this one has type void", ix)
+    return TY_VOID
+  }
+  lpJoin[t] = joinTys(lpJoin[t], widenLitTy(vt))
+  TY_VOID
+}
+
+// Whether the loop at `ix` carries a value: a `break v` leaves it, or it is a labelled block
+// with a value tail. Such a loop is an expression, not a statement.
+function loopCarriesValue(ix: i32): boolean {
+  lpOn && lpColAt(lpValTy, ix) >= 0
+}
+
+// The value type of the loop or labelled block at `ix` where that value is used, or -1: the
+// emitter lowers these through a result binding and every other loop as a statement.
+export function loopValTyOf(ix: i32): i32 {
+  if lpColAt(lpValUsed, ix) != 1 { return -1 }
+  lpColAt(lpValTy, ix)
+}
+
+// The arm blocks of value `if`s that always exit, each once: the join left them out, and the
+// emitter ends each with a `never` value so the arm meets the join's blocktype (D3222).
+let exitArmBlocks: i32[] = []
+let exitArmSeen: i32[] = []
+
+function noteExitArm(blk: i32) {
+  if inferQuiet || lpColAt(exitArmSeen, blk) == 1 { return 0 }
+  lpColSet(exitArmSeen, blk, 1)
+  exitArmBlocks.push(blk)
+  0
+}
+
+// The value `if`s and `match`es whose FIRST arm always exits, and the un-annotated bindings they
+// initialize. The emitter's classifiers read a construct's first arm, so each such binding takes
+// its checked type as an annotation, the spelling the other arm order already reads (D3222).
+let exitFirstAt: i32[] = []
+let exitFirstLets: i32[] = []
+let exitFirstLetSeen: i32[] = []
+
+function noteExitFirst(ix: i32) {
+  if inferQuiet { return 0 }
+  lpColSet(exitFirstAt, ix, 1)
+  0
+}
+
+// The arm block of a value `if` or `match` being checked, or -1. A construct standing at its tail
+// is read through its first arm by the enclosing construct's classifiers, which a first arm with
+// no value misleads, so an exit there keeps the `void` join and its check reject (D3222).
+let valueArmAt = -1
+
+// Whether the construct at `ix` is the tail statement of the value arm block being checked. A
+// construct elsewhere in the arm, such as a binding's initializer, is read by its own name.
+function atValueArmTail(ix: i32): boolean {
+  if chkStmtBlk < 0 || chkStmtBlk != valueArmAt { return false }
+  const b = P.nodes[chkStmtBlk]
+  if b is Block {
+    const st = b.blkStmts
+    return st.length > 0 && cwPeel(st[st.length - 1]) == ix
+  }
+  false
+}
+
+// The one spelling of an exiting first arm the emitter cannot lower yet: a nullable-list value of
+// a construct that is itself another's arm value, whose rep is read through this first arm (D3222).
+function refuseNestedExitFirst(ix: i32, ty: i32) {
+  if ty < 0 || !tyBearsNull(ty) { return 0 }
+  const nn = nonNullTy(ty)
+  if nn < 0 || !(T.tys[nn] is TyArray) { return 0 }
+  tErr(
+    "an `if` or `match` whose first arm always exits cannot yet hold a nullable list as the value of another's arm; bind it to a name first, or put the exiting arm last",
+    ix,
+  )
+  0
+}
+
+// The `match`es whose exiting first arm stands at another construct's value arm tail, whose
+// joined type `refuseNestedExitFirst` asks once it is known.
+let nestedExitFirstAt: i32[] = []
+
+// How many bindings `exitFirstLets` holds, and the `i`th.
+export function exitFirstLetCount(): i32 { exitFirstLets.length }
+export function exitFirstLetAt(i: i32): i32 {
+  if i < 0 || i >= exitFirstLets.length { return -1 }
+  exitFirstLets[i]
+}
+
+// How many arm blocks `noteExitArm` recorded, and the `i`th.
+export function exitArmCount(): i32 { exitArmBlocks.length }
+export function exitArmBlockAt(i: i32): i32 {
+  if i < 0 || i >= exitArmBlocks.length { return -1 }
+  exitArmBlocks[i]
+}
+
+// The tail statement a labelled block at `ix` ends with as its value, or -1.
+export function loopValTailOf(ix: i32): i32 { lpColAt(lpValTail, ix) }
+
+// Whether any loop or labelled block of the program carries a value, so the emitter's
+// rewrite of them costs a program without one nothing.
+export function loopValAny(): boolean { lpValSeen }
+
+// The `boolean`, `null` and `never` rows, for the nodes the loop-value rewrite synthesizes.
+export function lvTyBool(): i32 { TY_BOOL }
+export function lvTyNull(): i32 { TY_NULL }
+export function lvTyNever(): i32 { TY_NEVER }
+export function lvTyVoid(): i32 { TY_VOID }
+let lpValSeen = false
+
+// Whether the condition at `ix` is the literal `true` (through parentheses).
+function condLitTrue(ix: i32): boolean {
+  let c = ix
+  while c >= 0 && P.nodes[c] is Paren {
+    const pn = P.nodes[c]
+    if pn is Paren { c = pn.parInner }
+  }
+  if c < 0 { return false }
+  const b = P.nodes[c]
+  if b is BoolLit { return b.boolVal == 1 }
+  false
 }
 // ── for range ──────────────────────────────────────────────────────────────
 // Whether the expression at `ix` is an integer literal this pass folds — a `NumLit` fitting
@@ -65738,12 +66153,14 @@ function checkForRangeNode(n: ForRange, ix: i32) {
   // read isn't flagged when it shadows a still-uninitialized module global of the same name.
   daMarkAssigned(n.frVar)
   markValDiscard(n.frBody)
+  lpPush(n.frLabel)
   checkNode(n.frBody)
+  const res = lpPopResult(ix, -1, -1, true)
   daRollbackTo(daFrMark)
   daRelease(daFrMark)
   popScope()
   popReBarrier()
-  return TY_VOID
+  return res
 }
 // ── for v in iterable ───────────────────────────────────────────────────────
 // A for-in loop over an array: the loop variable binds to the element type.
@@ -65830,12 +66247,14 @@ function checkForInNode(n: ForIn, ix: i32) {
   daMarkAssigned(n.fiVar)
   if n.fiVar2 != "" { daMarkAssigned(n.fiVar2) }
   markValDiscard(n.fiBody)
+  lpPush(n.fiLabel)
   checkNode(n.fiBody)
+  const res = lpPopResult(ix, -1, -1, true)
   daRollbackTo(daFiMark)
   daRelease(daFiMark)
   popScope()
   popReBarrier()
-  return TY_VOID
+  return res
 }
 // ── return ─────────────────────────────────────────────────────────────────
 
@@ -66071,7 +66490,10 @@ function discardedTailTy(ix: i32, ty: i32): i32 {
 function markValDiscard(ix: i32) {
   if ix < 0 || ix >= P.nodes.length { return 0 }
   const n = P.nodes[ix]
-  if n is IfStmt || n is Block { valDiscardAt[ix] = true }
+  if n is IfStmt || n is Block || n is MatchExpr { valDiscardAt[ix] = true }
+  if lpOn && (n is WhileStmt || n is ForRange || n is ForIn) {
+    valDiscardAt[ix] = true
+  }
   if tpEnvNames.length > 0 { tpIfMarkDiscard(ix) }
   0
 }
@@ -66088,7 +66510,18 @@ function valDiscarded(ix: i32): boolean {
 }
 
 // Extracted from `checkNodeReal`'s `Block` arm (C3: thin the dispatcher).
+// Whether `stmts[i]` is the value of a `break v`: the next statement is a break carrying one.
+function breakValueAt(stmts: i32[], i: i32): boolean {
+  if i + 1 >= stmts.length { return false }
+  const bi = stmts[i + 1]
+  if bi < 0 || bi >= P.nodes.length { return false }
+  const b = P.nodes[bi]
+  if b is BreakStmt { return b.brkHasVal == 1 }
+  false
+}
+
 function checkBlockNode(n: Block, ix: i32) {
+  const blkOnSpine = spineAt == ix
   const savedStmtBlk = chkStmtBlk
   chkStmtBlk = ix
   pushScope(ix)
@@ -66106,10 +66539,23 @@ function checkBlockNode(n: Block, ix: i32) {
     } else {
       retTailPos = false
     }
-    if blkDiscard || i < stmts.length - 1 { markValDiscard(stmts[i]) }
+    if (
+      (blkDiscard || i < stmts.length - 1)
+      && !(lpOn && breakValueAt(stmts, i))
+    ) {
+      markValDiscard(stmts[i])
+    }
     crStmtEnter(stmts[i])
-    const sty = checkNode(stmts[i])
+    let sty = TY_VOID
+    if blkOnSpine && i == stmts.length - 1 {
+      spineAt = stmts[i]
+      sty = checkNode(stmts[i])
+      spineAt = ix
+    } else {
+      sty = checkNode(stmts[i])
+    }
     crStmtLeave()
+    if lpOn { brkPrevTy = sty }
     if i == stmts.length - 1 {
       // A value-producing trailing expression is the block's value; a trailing
       // statement (return / let / assignment / loop) leaves the block valueless.
