@@ -487,3 +487,85 @@ Deno.test({
     throw new Error(`want the inferred return, got ${got}`);
   }
 });
+
+Deno.test({
+  name: "signature-help(wasm): a call through a value shows the names its function TYPE wrote",
+  ignore,
+}, async () => {
+  // Owner ruling A1: names in a function type are documentation, never identity, so they
+  // reach the editor through the binding's annotation spelling (a local, a parameter, an
+  // alias of either), and an unnamed spelling of the same type still renders bare.
+  const src = [
+    "type GuestCall = (fn: i32, rcx: i64) => i32", // 0
+    "function h(a: i32, b: i64) { a }", // 1
+    "function run(hook: GuestCall, cb: (x: i32) => i32, bare: (i32) => i32) {", // 2
+    "  hook(1, 2)", // 3
+    "  cb(1)", // 4
+    "  bare(1)", // 5
+    "}", // 6
+    "const g: GuestCall = h", // 7
+    "const k: (first: i32, second: i64) => i32 = g", // 8
+    "g(1, 2)", // 9
+    "k(1, 2)", // 10
+  ].join("\n");
+  const rows: [number, number, string][] = [
+    [3, 10, "hook(fn: i32, rcx: i64) => i32 @rcx: i64"],
+    [4, 5, "cb(x: i32) => i32 @x: i32"],
+    [5, 7, "bare(i32) => i32 @i32"],
+    [9, 2, "g(fn: i32, rcx: i64) => i32 @fn: i32"],
+    [10, 5, "k(first: i32, second: i64) => i32 @second: i64"],
+  ];
+  const wrong: string[] = [];
+  for (const [line, ch, want] of rows) {
+    const got = await helpAt(src, line, ch);
+    if (got !== want) wrong.push(`line ${line}: want ${want}, got ${got}`);
+  }
+  if (wrong.length > 0) throw new Error(wrong.join("\n"));
+});
+
+Deno.test({
+  name: "hover(wasm): a function-typed binding and its alias show the written parameter names",
+  ignore,
+}, async () => {
+  const src = [
+    "type GuestCall = (fn: i32, rcx: i64) => i32",
+    "type Bare = (i32, i64) => i32",
+    "function h(a: i32, b: i64) { a }",
+    "const g: GuestCall = h",
+    "const b: Bare = g",
+  ].join("\n");
+  const checker = loadWasmChecker(SEED, log)!;
+  const got = [
+    await checker.hoverTypeAt(src, key, read, 3, 6),
+    await checker.hoverTypeAt(src, key, read, 4, 6),
+    await checker.typeAliasAt(src, key, read, 0, 6),
+    await checker.typeAliasAt(src, key, read, 1, 6),
+  ].join(" | ");
+  const want = "(fn: i32, rcx: i64) => i32 | (i32, i64) => i32 | " +
+    "(fn: i32, rcx: i64) => i32 | ((i32, i64) => i32)";
+  if (got !== want) throw new Error(`want ${want}\n got ${got}`);
+});
+
+Deno.test({
+  name: "signature-help(wasm): an IMPORTED function-type alias keeps its parameter names",
+  ignore,
+}, async () => {
+  // The merge renames the alias and every use of it alike, so the lookup meets itself.
+  const dep = "export type GuestCall = (fn: i32, rcx: i64) => i32\n";
+  const src = 'import { GuestCall } from "./guest"\n' +
+    "function run(hook: GuestCall) {\n  hook(1, 2)\n}\n";
+  const checker = loadWasmChecker(SEED, log)!;
+  const site = callSiteAt(src, 2, 10)!;
+  const sig = await checker.signatureAt(
+    src,
+    "/proj/main.vl",
+    (k: string) => (k.endsWith("guest.vl") ? dep : undefined),
+    site.callee.line,
+    site.callee.character,
+  );
+  if (sig === undefined) throw new Error("want a signature through the imported alias");
+  const { label } = signatureLabel(site.name, sig);
+  if (label !== "hook(fn: i32, rcx: i64) => i32") {
+    throw new Error(`want the alias's parameter names, got ${label}`);
+  }
+});

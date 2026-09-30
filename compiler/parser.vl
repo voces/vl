@@ -80,6 +80,7 @@ import {
   tsMark,
   tsMk,
   tsMkKids,
+  tsNoteParamNames,
   tsPop,
   tsSetText,
   tsWrap,
@@ -972,6 +973,55 @@ function parseTypeIsect() {
   name
 }
 
+// One element of a parenthesized type list: an optional parameter name `fn:`, then a type.
+// The name goes to `names` ("" for an unnamed one) and never into the returned spelling,
+// so `(fn: i32) => i32` and `(i32) => i32` are one type (DECISIONS.md, "Parameter names in
+// a function type are documentation").
+function parseFnTypeParam(names: string[]) {
+  if peekKind() == "IDENT" && peek2Kind() == "COLON" {
+    names.push(advance().text)
+    advance() // ":"
+  } else {
+    names.push("")
+  }
+  parseTypeName()
+}
+
+// The comma-joined parameter names a `TS_FUNC` node keeps as its `tsText`, or "" for an unnamed
+// list. Names are all or none, and only a function type takes them; either violation
+// is diagnosed here, at the `)` just consumed, and yields "".
+function fnTypeParamNamesText(names: string[], isFunc: boolean) {
+  let named = 0
+  let joined = ""
+  let i = 0
+  while i < names.length {
+    if names[i].length > 0 { named = named + 1 }
+    if i > 0 { joined = joined + "," }
+    joined = joined + names[i]
+    i = i + 1
+  }
+  if named == 0 { return "" }
+  if !isFunc {
+    P.diags.push(
+      {
+        msg: "a parameter name is written only in a function type `(name: T) => R`",
+        at: P.pos - 1,
+      },
+    )
+    return ""
+  }
+  if named < names.length {
+    P.diags.push(
+      {
+        msg: "name every parameter of a function type, or none of them",
+        at: P.pos - 1,
+      },
+    )
+    return ""
+  }
+  joined
+}
+
 // A method member's tail, shared by the two grammars that read a `{ … }` member list. The
 // caller has already consumed the member name and holds its spelling mark; this consumes
 // `( argument types ) : result`. The parameters are the call's arguments and the receiver is
@@ -1049,21 +1099,24 @@ function parseTypeAtom() {
     // list either way.
     advance() // "("
     let inner = ""
+    const pnames: string[] = []
     if peekKind() != "RPAREN" {
-      inner = parseTypeName()
+      inner = parseFnTypeParam(pnames)
       let pmore = peekKind() == "COMMA"
       while pmore {
         advance() // ","
         if peekKind() == "RPAREN" {
           pmore = false // tolerated trailing comma
         } else {
-          inner = inner + "," + parseTypeName()
+          inner = inner + "," + parseFnTypeParam(pnames)
           pmore = peekKind() == "COMMA"
         }
       }
     }
     expectClose("RPAREN")
-    if peekKind() == "EQUAL" && peek2Kind() == "GT" {
+    const isFunc = peekKind() == "EQUAL" && peek2Kind() == "GT"
+    const pnameText = fnTypeParamNamesText(pnames, isFunc)
+    if isFunc {
       advance() // "="
       advance() // ">"
       // The return type extends as far right as it can: `(i32) => i32 | null` is a function
@@ -1074,7 +1127,9 @@ function parseTypeAtom() {
       name = "(" + inner + ")=>" + retName
       // Kids = the parameter list in order, then the return atom last (it is the
       // one child every function spelling has; a zero-param `() => T` has only it).
-      tsMk(TS_FUNC, "", tm)
+      // Written parameter names ride `tsText` alone and never reach `name`.
+      tsMk(TS_FUNC, pnameText, tm)
+      if pnameText != "" { tsNoteParamNames() }
     } else {
       name = "(" + inner + ")"
       tsMk(TS_PAREN, "", tm)

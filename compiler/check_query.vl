@@ -8,6 +8,7 @@ import {
   CharLit,
   FuncDecl,
   Ident,
+  LetDecl,
   Member,
   NullLit,
   NumLit,
@@ -16,11 +17,14 @@ import {
   Param,
   StrLit,
   Unary,
+  aliasFnParamNames,
+  annTsWrittenOf,
   declHasExportKw,
   declNameTokOf,
   getDeclPropOf,
   nodeToks,
   paramDefaultOf,
+  tsFnParamNames,
 } from "./ast"
 import {
   SYM_MEM_METHOD,
@@ -110,6 +114,7 @@ import {
   TyNullable,
   TyObj,
   TyPrim,
+  TyUnion,
   assignable,
   cUserTypes,
   demangleName,
@@ -314,30 +319,69 @@ function bindTypeOf(binding: i32) {
 // ── named function signature (hover) ─────────────────────────────────────────
 
 // A function binding hovers with its parameter names, which `TyFunc` does not carry,
-// so this zips the binding's `FuncDecl` parameter names with the type's parameter
-// types. "" when that does not apply and the caller falls back to the bare type: not
-// `FuncDecl`-declared, not a `TyFunc`, or a parameter count the two disagree on.
+// so this zips `declParamNames` (a `FuncDecl`'s, or those its annotation wrote) with the
+// type's parameter types. "" when that does not apply and the caller falls back to the bare
+// type: no names, not a `TyFunc`, or a parameter count the two disagree on.
 function fnSigStr(declNode: i32, ty: i32) {
-  if declNode < 0 || declNode >= P.nodes.length { return "" }
-  const nd = P.nodes[declNode]
-  if !(nd is FuncDecl) { return "" }
   if ty < 0 { return "" }
   const t = T.tys[ty]
   if !(t is TyFunc) { return "" }
-  if nd.fnParams.length != t.fnParamTypes.length { return "" }
+  const names = declParamNames(declNode, t.fnParamTypes.length)
+  if names.length == 0 && !declIsFunc(declNode) { return "" }
+  namedFnStr(names, ty)
+}
+// Function type `ty` rendered with `names` beside its parameters, or "" when `ty` is not a
+// function or the two disagree on arity.
+function namedFnStr(names: string[], ty: i32) {
+  if ty < 0 { return "" }
+  const t = T.tys[ty]
+  if !(t is TyFunc) { return "" }
+  if names.length != t.fnParamTypes.length { return "" }
   let s = "("
   let i = 0
-  while i < nd.fnParams.length {
-    const pn = P.nodes[nd.fnParams[i]]
-    if !(pn is Param) { return "" }
+  while i < names.length {
     if i > 0 { s = s + ", " }
-    s = s + pn.parName + ": " + tyToStrUser(t.fnParamTypes[i])
+    s = s + names[i] + ": " + tyToStrUser(t.fnParamTypes[i])
     i = i + 1
   }
   s + ") => " + tyToStrUser(t.fnRet)
 }
+function declIsFunc(declNode: i32) {
+  if declNode < 0 || declNode >= P.nodes.length { return false }
+  P.nodes[declNode] is FuncDecl
+}
+// The parameter names of the callable `declNode` declares, when it takes exactly `arity`:
+// a `FuncDecl`'s own, or those a binding's function-type annotation wrote (`const g: (fn:
+// i32) => i32`, through an alias too). `[]` when neither applies.
+function declParamNames(declNode: i32, arity: i32): string[] {
+  const names: string[] = []
+  if declNode < 0 || declNode >= P.nodes.length { return names }
+  const nd = P.nodes[declNode]
+  if nd is FuncDecl {
+    if nd.fnParams.length != arity { return names }
+    let i = 0
+    while i < nd.fnParams.length {
+      const pn = P.nodes[nd.fnParams[i]]
+      if pn is Param { names.push(pn.parName) } else { names.push("") }
+      i = i + 1
+    }
+    return names
+  }
+  tsFnParamNames(annTsWrittenOf(bindAnnOf(declNode)), arity, 0)
+}
+// The type annotation a `Param` or `LetDecl` binding carries, or -1.
+function bindAnnOf(ix: i32) {
+  const nd = P.nodes[ix]
+  if nd is Param { return nd.parType }
+  letAnnOf(ix)
+}
+function letAnnOf(ix: i32) {
+  const nd = P.nodes[ix]
+  if nd is LetDecl { return nd.letType }
+  -1
+}
 // The rendered type string of the binding under (line, col), or "" when the cursor is
-// off any tracked binding or its type is not retained. A `FuncDecl`-declared binding
+// off any tracked binding or its type is not retained. A binding with parameter names
 // renders as its named signature (`fnSigStr`); a use under a flow narrowing renders
 // the narrowed type bare, since `fnSigStr` would zip names against a type not in force.
 export function symTypeStrAt(line: i32, col: i32) {
@@ -664,6 +708,24 @@ function tscDocOf(i: i32) {
   tscDocBuf
 }
 
+// The hover text of user type `key`, whose type is `ty`. A function alias (a one-member union
+// over a `TyFunc`) shows the parameter names its declaration wrote; anything else takes the
+// structural render, since the query asks what the name stands for (not `Pt` for `Pt`).
+function aliasHoverStr(key: string, ty: i32) {
+  let fty = ty
+  const tu = T.tys[ty]
+  if tu is TyUnion {
+    if tu.uMembers.length == 1 { fty = tu.uMembers[0] }
+  }
+  const tf = T.tys[fty]
+  if tf is TyFunc {
+    const n = tf.fnParamTypes.length
+    const named = namedFnStr(aliasFnParamNames(key, n), fty)
+    if named != "" && n > 0 { return named }
+  }
+  tyToStructStrUser(ty)
+}
+
 // Type-alias hover: the rendered type of the user type name (a `type`-declared struct
 // or union alias) whose token covers (line, col), or "" when the cursor is off one. A
 // type name is not a value-binding occurrence, so this scans the token stream and
@@ -681,10 +743,12 @@ export function symTypeAliasAt(line: i32, col: i32) {
       // A multi-module merge renames the entry's own type decls (`W` → `W$m0`), so the
       // map's key is mangled while the token still reads `W`. -1 is a clean miss.
       let ty = cUserTypes[t.text] ?? (-1)
-      if ty < 0 { ty = cUserTypes[t.text + "$m0"] ?? (-1) }
-      // The one display query that wants the structural render: it is handed the name
-      // and asks what it stands for, so a nominal render would answer `Pt` for `Pt`.
-      if ty >= 0 { return tyToStructStrUser(ty) }
+      let key = t.text
+      if ty < 0 {
+        key = t.text + "$m0"
+        ty = cUserTypes[key] ?? (-1)
+      }
+      if ty >= 0 { return aliasHoverStr(key, ty) }
     }
     i = i + 1
   }
@@ -1286,8 +1350,8 @@ function sigDefaultText(pIx: i32): string {
   }
   ""
 }
-// Fill the table from function type `ty`, naming the parameters off `declNode`'s
-// `FuncDecl` when there is one and it agrees on arity — a disagreeing pair would label
+// Fill the table from function type `ty`, naming the parameters by `declParamNames`
+// when they agree on arity — a disagreeing pair would label
 // argument k with parameter k+1's name. `skip` drops leading parameters, 1 for a UFCS
 // call. Returns the row count, or -1 when `ty` is not a function.
 function sigFill(declNode: i32, ty: i32, skip: i32) {
@@ -1296,18 +1360,16 @@ function sigFill(declNode: i32, ty: i32, skip: i32) {
   if !(t is TyFunc) { return -1 }
   const pts = t.fnParamTypes
   if skip > pts.length { return -1 }
-  const names: string[] = []
+  const names = declParamNames(declNode, pts.length)
   const dflts: string[] = []
   if declNode >= 0 && declNode < P.nodes.length {
     const nd = P.nodes[declNode]
     if nd is FuncDecl {
+      // Same arity gate as the names, and for the same reason: a
+      // disagreeing pair would attach parameter k+1's default to argument k.
       if nd.fnParams.length == pts.length {
         let i = 0
         while i < nd.fnParams.length {
-          const pn = P.nodes[nd.fnParams[i]]
-          if pn is Param { names.push(pn.parName) } else { names.push("") }
-          // Same arity gate as the names, and for the same reason: a
-          // disagreeing pair would attach parameter k+1's default to argument k.
           dflts.push(sigDefaultText(nd.fnParams[i]))
           i = i + 1
         }

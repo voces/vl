@@ -93,7 +93,7 @@ export interface CallSite {
 
 /** One parameter of a resolved signature, as the checker reports it. */
 export interface SigParam {
-  /** "" when the name is not knowable (a function-typed value carries none). */
+  /** "" when the name is not knowable (a function-typed value whose type named none). */
   name: string;
   type: string;
   /**
