@@ -80,6 +80,7 @@ import {
   tsMark,
   tsMk,
   tsMkKids,
+  tsNoteParamNames,
   tsPop,
   tsSetText,
   tsWrap,
@@ -972,6 +973,118 @@ function parseTypeIsect() {
   name
 }
 
+// One element of a parenthesized type list: an optional parameter name `fn:`, then a type.
+// The name goes to `names` ("" for an unnamed one) and never into the returned spelling,
+// so `(fn: i32) => i32` and `(i32) => i32` are one type (DECISIONS.md, "Parameter names in
+// a function type are documentation").
+function parseFnTypeParam(names: string[], nameToks: i32[]) {
+  const t = peekTok()
+  if (
+    peek2Kind() == "COLON"
+    && t.kind != "IDENT"
+    && keywordKind(t.text) == t.kind
+  ) {
+    // A keyword where a name goes: the same refusal a declared parameter gets, and the
+    // name still counts toward all-or-none so only one diagnostic fires.
+    P.diags.push(
+      {
+        msg: "`" + t.text + "` is a keyword and can't name a parameter — rename it",
+        at: P.pos,
+      },
+    )
+  }
+  if (
+    peek2Kind() == "COLON"
+    && (t.kind == "IDENT" || keywordKind(t.text) == t.kind)
+  ) {
+    nameToks.push(P.pos)
+    names.push(advance().text)
+    advance() // ":"
+  } else {
+    nameToks.push(-1)
+    names.push("")
+  }
+  parseTypeName()
+}
+
+// The comma-joined parameter names a `TS_FUNC` node keeps as its `tsText`, or "" for an unnamed
+// list. Names are all or none, and only a function type takes them; either violation
+// is diagnosed here, at the `)` just consumed, and yields "".
+function fnTypeParamNamesText(
+  names: string[],
+  nameToks: i32[],
+  isFunc: boolean,
+) {
+  let named = 0
+  let joined = ""
+  let i = 0
+  while i < names.length {
+    if names[i].length > 0 { named = named + 1 }
+    if i > 0 { joined = joined + "," }
+    joined = joined + names[i]
+    i = i + 1
+  }
+  if named == 0 { return "" }
+  if !isFunc {
+    P.diags.push(
+      {
+        msg: "a parameter name is written only in a function type `(name: T) => R`",
+        at: P.pos - 1,
+      },
+    )
+    return ""
+  }
+  if named < names.length {
+    P.diags.push(
+      {
+        msg: "name every parameter of a function type, or none of them",
+        at: P.pos - 1,
+      },
+    )
+    return ""
+  }
+  if dupNameDiag(names, nameToks, "function type") { return "" }
+  joined
+}
+
+// Refuse the first name of `names` an earlier entry already holds, at that second
+// occurrence's token (`toks[i]`), naming where the first one stands. `_` and "" name nothing
+// and may repeat. Returns whether it refused.
+function dupNameDiag(names: string[], toks: i32[], what: string): boolean {
+  let i = 1
+  while i < names.length {
+    if names[i] != "" && names[i] != "_" {
+      let j = 0
+      while j < i {
+        if names[j] == names[i] {
+          let first = ""
+          const ft = toks[j]
+          if ft >= 0 && ft < P.toks.length {
+            first = " — the first is at "
+              + i32ToStr(P.toks[ft].line)
+              + ":"
+              + i32ToStr(P.toks[ft].col + 1)
+          }
+          P.diags.push(
+            {
+              msg: "the parameter name `"
+                + names[i]
+                + "` appears twice in this "
+                + what
+                + first,
+              at: toks[i],
+            },
+          )
+          return true
+        }
+        j = j + 1
+      }
+    }
+    i = i + 1
+  }
+  false
+}
+
 // A method member's tail, shared by the two grammars that read a `{ … }` member list. The
 // caller has already consumed the member name and holds its spelling mark; this consumes
 // `( argument types ) : result`. The parameters are the call's arguments and the receiver is
@@ -1048,22 +1161,30 @@ function parseTypeAtom() {
     // `&` splitters honour the grouping. The paren contents parse as a comma-separated type
     // list either way.
     advance() // "("
+    skipNewlines() // a long list may break after `(`, after each `,` and before `)`
     let inner = ""
+    const pnames: string[] = []
+    const ptoks: i32[] = []
     if peekKind() != "RPAREN" {
-      inner = parseTypeName()
+      inner = parseFnTypeParam(pnames, ptoks)
+      skipNewlines()
       let pmore = peekKind() == "COMMA"
       while pmore {
         advance() // ","
+        skipNewlines()
         if peekKind() == "RPAREN" {
           pmore = false // tolerated trailing comma
         } else {
-          inner = inner + "," + parseTypeName()
+          inner = inner + "," + parseFnTypeParam(pnames, ptoks)
+          skipNewlines()
           pmore = peekKind() == "COMMA"
         }
       }
     }
     expectClose("RPAREN")
-    if peekKind() == "EQUAL" && peek2Kind() == "GT" {
+    const isFunc = peekKind() == "EQUAL" && peek2Kind() == "GT"
+    const pnameText = fnTypeParamNamesText(pnames, ptoks, isFunc)
+    if isFunc {
       advance() // "="
       advance() // ">"
       // The return type extends as far right as it can: `(i32) => i32 | null` is a function
@@ -1074,7 +1195,9 @@ function parseTypeAtom() {
       name = "(" + inner + ")=>" + retName
       // Kids = the parameter list in order, then the return atom last (it is the
       // one child every function spelling has; a zero-param `() => T` has only it).
-      tsMk(TS_FUNC, "", tm)
+      // Written parameter names ride `tsText` alone and never reach `name`.
+      tsMk(TS_FUNC, pnameText, tm)
+      if pnameText != "" { tsNoteParamNames() }
     } else {
       name = "(" + inner + ")"
       tsMk(TS_PAREN, "", tm)
@@ -2646,7 +2769,9 @@ function parseParamList() {
   expect("LPAREN")
   skipNewlines()
   const params: i32[] = []
+  const nameToks: i32[] = [] // each parameter's name token, past a `...`
   if peekKind() != "RPAREN" {
+    nameToks.push(paramNameTokAhead())
     params.push(parseParam())
     skipNewlines()
     // A parameter's element start is its name or its `...`, so `function f(a: i32 b: i32)`
@@ -2658,6 +2783,7 @@ function parseParamList() {
       if peekKind() == "RPAREN" {
         more = false
       } else {
+        nameToks.push(paramNameTokAhead())
         params.push(parseParam())
         skipNewlines()
         more = takeSep(peekKind() == "IDENT" || peekKind() == "ELLIPSIS")
@@ -2666,8 +2792,29 @@ function parseParamList() {
   }
   expectClose("RPAREN")
   restPositionCheck(params)
+  dupParamCheck(params, nameToks)
   kwParamsMark = kwMark
   params
+}
+
+// Two parameters of one list under one name: the second is unreachable from the body and
+// from a named argument, so the list is refused (D3279). `_` may repeat; it names nothing.
+// The token a parameter about to be parsed takes its name from: the cursor, or one past a `...`.
+function paramNameTokAhead() {
+  if peekKind() == "ELLIPSIS" { return P.pos + 1 }
+  P.pos
+}
+
+function dupParamCheck(params: i32[], nameToks: i32[]) {
+  const names: string[] = []
+  let i = 0
+  while i < params.length {
+    const p = P.nodes[params[i]]
+    if p is Param { names.push(p.parName) } else { names.push("") }
+    i = i + 1
+  }
+  dupNameDiag(names, nameToks, "list")
+  0
 }
 
 // A rest parameter is last and there is at most one — both refused here, where the whole

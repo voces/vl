@@ -68,6 +68,7 @@ tree ungraded.
 | `elemRowsCaptureWalk` (`ercGenP`/`ercStamp`) | **`emitPassGen`**, and a per-walk stamp so a new walk clears nothing | none: the table is rebuilt when the pass generation moves, and a slot is dead the moment its walk id is stale | pass-stamped |
 | `closureCaptureNames` (`capMemoGen`/`capMemoStamp`, D2017) | **`emitPassGen`**, `P.nodes.length`, a reported-edit count | none reachable: armed only inside `computeRetInference`, `computeRetInference#2` and `dispatchRewrite`; the first two write no table `capScan` reads, and every rewrite either mints a node or calls `capMemoNoteEdit` | pass-stamped |
 | `crValUseNames` (`crValUseRoot`, D2584) | the root's node INDEX; reset by `crReset` | none: the names a root uses other than as a receiver are read off the syntax tree, which the checker does not rewrite | no-refined-input |
+| `aliasRootIndex` (`aliasRootLen`, #3300) | `udTsNode.length`; reset by `tsReset` | none: `udTsNode`/`udTsWritten` are push-only, and `udName` is renamed only by the module merge, which runs before the first ask | no-refined-input |
 | `covarValueWriteState` (`cwArenaLen`, checked in `cwArenaSync`) | `P.nodes.length` | its own `cwIx*` index, dropped with it (the per-(name, frame) chains of D2688, `cwIxP*`, included); and `nodeRepTyIx`, a checker sidecar written in place | probe |
 
 ## The `probe` verdict is a measurement — one row at a time

@@ -210,6 +210,7 @@ import {
   TS_PAREN,
   TS_UNION,
   annTsOf,
+  annTsWrittenOf,
   clearAnnTs,
   clearUdTs,
   declBoundOf,
@@ -218,6 +219,7 @@ import {
   fnHasTpBound,
   fnTpBoundOf,
   isBodyTyDecl,
+  tsFnParamNames,
   tsKidCount,
   tsKidStart,
   tsKids,
@@ -225,6 +227,7 @@ import {
   tsText,
   tsToName,
   tsToNameSubst,
+  tsWritesParamNames,
   udTsRootAt,
 } from "./ast"
 import {
@@ -15176,6 +15179,8 @@ function recordRedundantAnnot(
     t = t + 1
   }
   if eqTok < 0 { return 0 }
+  // An annotation that names a function type's parameters documents them; inference cannot.
+  if tsWritesParamNames(annTsWrittenOf(n.letType), 0) { return 0 }
   // The span starts at the `:` token, always `nameTok + 1` for an annotated decl. Using the
   // colon's own position rather than `nameTok.col + name.length` is robust to the module merge
   // mangling the binding name (`local$m0`), which would otherwise push the start into the type.
@@ -33341,7 +33346,13 @@ function asgNestedRhsBuilt(x: i32): boolean {
   false
 }
 
-function letAssignMsg(srcIx: i32, got: i32, want: i32, name: string) {
+function letAssignMsg(
+  srcIx: i32,
+  got: i32,
+  want: i32,
+  name: string,
+  annIx: i32,
+) {
   if name == "" {
     return "cannot assign "
       + tyToStr(got)
@@ -33382,9 +33393,27 @@ function letAssignMsg(srcIx: i32, got: i32, want: i32, name: string) {
     + " to '"
     + name
     + "' of type "
-    + tyToStr(want)
+    + annotTyStr(want, annIx)
     + charLitForStringNote(srcIx, want)
     + boolForNumberNote(got, want)
+}
+
+// `tyToStr(want)`, except that a function type whose annotation `annIx` named its parameters
+// shows those names: the author's spelling in a sentence, never in a type's identity.
+function annotTyStr(want: i32, annIx: i32) {
+  const t = T.tys[want]
+  if !(t is TyFunc) || annIx < 0 { return tyToStr(want) }
+  const n = t.fnParamTypes.length
+  const names = tsFnParamNames(annTsWrittenOf(annIx), n, 0)
+  if names.length == 0 { return tyToStr(want) }
+  let s = "("
+  let i = 0
+  while i < n {
+    if i > 0 { s = s + ", " }
+    s = s + names[i] + ": " + tyToStr(t.fnParamTypes[i])
+    i = i + 1
+  }
+  s + ") => " + tyToStr(t.fnRet)
 }
 
 // A builtin method argument's sentence, in one home because the arm and the pin
@@ -35124,7 +35153,7 @@ function validateLetCstrs(
             let lWho = "the callee's body"
             if who != "" { lWho = "the body of `" + who + "`" }
             tErr(
-              letAssignMsg(letCstrIx[ci], lg, lw, letCstrName[ci])
+              letAssignMsg(letCstrIx[ci], lg, lw, letCstrName[ci], -1)
                 + " ("
                 + lWho
                 + " at the call's argument types)",
@@ -38875,7 +38904,10 @@ function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
     if hasNamedArgs(n.callArgNames) {
       const uNames = paramNamesOfNodes(declParamsInScope(name))
       if uNames.length != params.length {
-        tErr("named arguments require a declared function", ix)
+        tErr(
+          "named arguments work only on declared functions, not on a function value",
+          ix,
+        )
         return TY_ERR
       }
       const restNames: string[] = []
@@ -40408,7 +40440,10 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
   if hasNamedArgs(n.callArgNames) {
     const cNames = paramNamesOfNodes(dParams)
     if cNames.length != params.length {
-      tErr("named arguments require a declared function", ix)
+      tErr(
+        "named arguments work only on declared functions, not on a function value",
+        ix,
+      )
       return retTy
     }
     args = orderNamedCallArgs(cNames, args, n.callArgNames, ix, dParams)
@@ -53549,7 +53584,7 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
       } else {
         nlAsgTgt = n.binLeft
         nlAsgGot = rt
-        tErrWant(letAssignMsg(n.binRight, rt, asgLt, ""), n.binRight, asgLt)
+        tErrWant(letAssignMsg(n.binRight, rt, asgLt, "", -1), n.binRight, asgLt)
         nlAsgTgt = -1
       }
     } else {
@@ -54464,7 +54499,7 @@ function checkLetDeclNode(n: LetDecl, ix: i32) {
         // Three sentences, one home: `letAssignMsg` picks between the object-literal-into-a-map,
         // lossy-numeric and opaque forms; the pin calls the same function on the substituted pair.
         tErrWant(
-          letAssignMsg(n.letInit, initTy, annot, n.letName),
+          letAssignMsg(n.letInit, initTy, annot, n.letName, n.letType),
           n.letInit,
           annot,
         )
