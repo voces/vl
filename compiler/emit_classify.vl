@@ -293,6 +293,7 @@ import {
   Unary,
   WhileStmt,
   annTsOf,
+  arithRegionSeen,
   callIsNever,
   elseIfLink,
   externLinkOf,
@@ -303,6 +304,7 @@ import {
   mkTypeRef,
   nodeChildren,
   nodeSpineChildren,
+  opIsArith,
   spreadArgOf,
   stmtAlwaysExits,
   tsHasKind,
@@ -9021,12 +9023,16 @@ export function exprIsStrConcat(binIx: i32, fnIx: i32) {
   const e = P.nodes[binIx]
   if e is BinExpr {
     if e.binOp == "+" {
+      const m = if arithRegionSeen && (bcOpen || e.binRegion != 0) { bcGet(binIx, fnIx, BC_STR) } else { -2 }
+      if m >= 0 { return m == 1 }
       // A literal-union atom is a `string` subtype, so `"x" + k` and `k + "y"` concatenate —
       // the atom operand widens to its member string in `emitStrConcat`.
-      const lStr = exprString(e.binLeft, fnIx) || exprIsLitAtom(e.binLeft, fnIx)
-      const rStr = exprString(e.binRight, fnIx)
+      const r = exprString(e.binLeft, fnIx)
+        || exprIsLitAtom(e.binLeft, fnIx)
+        || exprString(e.binRight, fnIx)
         || exprIsLitAtom(e.binRight, fnIx)
-      return lStr || rStr
+      if m != -2 { bcPutB(m, binIx, fnIx, BC_STR, r) }
+      return r
     }
   }
   false
@@ -10162,6 +10168,9 @@ export function exprHasStrOp(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return false }
   const e = P.nodes[exprIx]
   if e is BinExpr {
+    if arithRegionSeen && e.binRegion != 0 && !bcOpen {
+      return exprHasStrOpHeld(exprIx, fnIx)
+    }
     if exprIsStrConcat(exprIx, fnIx) { return true }
     if exprIsStrEq(exprIx, fnIx) { return true }
     // A string ordering rides the same lexicographic compare loop.
@@ -10309,6 +10318,14 @@ export function exprHasStrOp(exprIx: i32, fnIx: i32) {
     return false
   }
   false
+}
+
+// `exprHasStrOp` of a long chain's root, inside a session over its region, as an emission is.
+function exprHasStrOpHeld(exprIx: i32, fnIx: i32) {
+  const opened = bcSpineEnter(exprIx, fnIx)
+  const r = exprHasStrOp(exprIx, fnIx)
+  bcSpineLeave(opened)
+  r
 }
 
 // True if any arm tail of the value if chain at `ifIx` is a literal-union atom: under a
@@ -16395,8 +16412,11 @@ export function exprIsI64(exprIx: i32, fnIx: i32) {
       || op == ">>"
       || op == ">>>"
     ) {
-      if exprIsI64(e.binLeft, fnIx) { return true }
-      return exprIsI64(e.binRight, fnIx)
+      const m = if arithRegionSeen && (bcOpen || e.binRegion != 0) { bcGet(exprIx, fnIx, BC_I64) } else { -2 }
+      if m >= 0 { return m == 1 }
+      const r = exprIsI64(e.binLeft, fnIx) || exprIsI64(e.binRight, fnIx)
+      if m != -2 { bcPutB(m, exprIx, fnIx, BC_I64, r) }
+      return r
     }
     return false
   }
@@ -16555,6 +16575,149 @@ function exprIsFloatLit(exprIx: i32) {
   false
 }
 
+// A per-node memo of the arithmetic classifiers over one long arithmetic chain, so the chain
+// classifies in time linear in its length (D2445). A session spans one classification or one
+// walk (an emission, a reservation scan) of the region the parser marked, which changes nothing
+// the classifiers read; its tables cover that region's node range alone and die with it.
+const bcStack: i32[] = []
+const bcFound: i32[] = []
+export let bcOpen = false
+let bcSessFn = -1
+let bcBase = 0
+let bcIn: i32[] = []
+let bcBits: i32[] = []
+const BC_F64 = 0
+const BC_F32 = 1
+const BC_I64 = 2
+const BC_STR = 3
+const BC_LEAF = 4
+
+function bcPush(sp: i32, ix: i32) {
+  if sp < bcStack.length { bcStack[sp] = ix } else { bcStack.push(ix) }
+}
+
+// Whether node `ix` is an operator of the open session's region.
+function bcInWindow(ix: i32) {
+  ix >= bcBase && ix - bcBase < bcIn.length && bcIn[ix - bcBase] == 1
+}
+
+// Kind `k`'s answer at node `ix`: its value (0 to 3) when filed; -1 when not yet filed; -3 when
+// not filed and this call opened a session over the region `ix` heads; -2 when `ix` is in no
+// session and heads no region. A caller given -1 or -3 files its answer with `bcPutB`, which on
+// -3 also closes the session.
+function bcGet(ix: i32, fnIx: i32, k: i32): i32 {
+  if !bcOpen {
+    if bcSpineEnter(ix, fnIx) { return -3 }
+    return -2
+  }
+  if fnIx != bcSessFn || !bcInWindow(ix) { return -2 }
+  const b = bcBits[ix - bcBase]
+  if ((b >> (3 * k)) & 1) == 0 { return -1 }
+  (b >> (3 * k + 1)) & 3
+}
+
+// File answer `v` (two bits) of kind `k` at node `ix`, when it belongs to the open session.
+function bcPut(ix: i32, fnIx: i32, k: i32, v: i32) {
+  if !bcOpen || fnIx != bcSessFn || !bcInWindow(ix) { return }
+  const at = ix - bcBase
+  bcBits[at] = bcBits[at] | (1 << (3 * k)) | (v << (3 * k + 1))
+}
+
+// `bcPut` of a boolean answer `v` for a `bcGet` answer `m`, closing the session `m` opened.
+function bcPutB(m: i32, ix: i32, fnIx: i32, k: i32, v: boolean) {
+  if m == -2 { return }
+  if v { bcPut(ix, fnIx, k, 1) } else { bcPut(ix, fnIx, k, 0) }
+  bcSpineLeave(m == -3)
+}
+
+// Push node `ix`'s children inside an arithmetic region (operators, parens, unary `-`/`~`)
+// onto `bcStack` from `sp` and return the new top, which is `sp + 2` exactly for an operator.
+function bcRegionStep(ix: i32, sp: i32): i32 {
+  if ix < 0 { return sp }
+  const e = P.nodes[ix]
+  if e is BinExpr {
+    if !opIsArith(e.binOp) { return sp }
+    bcPush(sp, e.binLeft)
+    bcPush(sp + 1, e.binRight)
+    return sp + 2
+  }
+  if e is Paren {
+    bcPush(sp, e.parInner)
+    return sp + 1
+  }
+  if e is Unary {
+    if e.unOp != "-" && e.unOp != "~" { return sp }
+    bcPush(sp, e.unArg)
+    return sp + 1
+  }
+  bcRegionLeaf(sp)
+}
+
+// Every other expression kind, as one answer: a leaf of the region, which the classifiers
+// answer without recursing, so it pushes nothing.
+function bcRegionLeaf(sp: i32): i32 { sp }
+
+// Whether `ix` is the root of a long arithmetic chain, as the parser marked it.
+function bcIsRegionHead(ix: i32) {
+  const e = P.nodes[ix]
+  if e is BinExpr { return e.binRegion != 0 }
+  false
+}
+
+// Collect the operators of the region under `root` into `bcFound`, returning their count.
+function bcCollect(root: i32): i32 {
+  bcPush(0, root)
+  let sp = 1
+  let n = 0
+  while sp > 0 {
+    sp = sp - 1
+    const ix = bcStack[sp]
+    const next = bcRegionStep(ix, sp)
+    if next == sp + 2 {
+      if n < bcFound.length { bcFound[n] = ix } else { bcFound.push(ix) }
+      n = n + 1
+    }
+    sp = next
+  }
+  n
+}
+
+// Open a session over the region `exprIx` heads, or add it to the open one when it lies inside
+// that one's node range; true when this call opened it and must close it with `bcSpineLeave`.
+export function bcSpineEnter(exprIx: i32, fnIx: i32): boolean {
+  if exprIx < 0 || !bcIsRegionHead(exprIx) { return false }
+  if bcOpen && (fnIx != bcSessFn || bcInWindow(exprIx)) { return false }
+  const n = bcCollect(exprIx)
+  let lo = exprIx
+  let hi = exprIx
+  let i = 0
+  while i < n {
+    if bcFound[i] < lo { lo = bcFound[i] }
+    if bcFound[i] > hi { hi = bcFound[i] }
+    i = i + 1
+  }
+  if bcOpen {
+    if lo < bcBase || hi - bcBase >= bcIn.length { return false }
+  } else {
+    bcBase = lo
+    bcIn = __array_new__(hi - lo + 1, 0)
+    bcBits = __array_new__(hi - lo + 1, 0)
+  }
+  i = 0
+  while i < n {
+    bcIn[bcFound[i] - bcBase] = 1
+    i = i + 1
+  }
+  if bcOpen { return false }
+  bcOpen = true
+  bcSessFn = fnIx
+  true
+}
+
+export function bcSpineLeave(opened: boolean) {
+  if opened { bcOpen = false }
+}
+
 // What kinds of leaf does the arithmetic spine at `exprIx` (parens, unary `-`, `+ - * /`)
 // carry? Bit 1 = a leaf the f32 classifier claims; bit 2 = a leaf `exprIsF64` claims that
 // isn't a bare number literal (a genuine f64) — a literal contributes neither, since it
@@ -16569,9 +16732,15 @@ function spineFloatLeafBits(exprIx: i32, fnIx: i32) {
   if e is BinExpr {
     const op = e.binOp
     if op == "+" || op == "-" || op == "*" || op == "/" {
-      const lb = spineFloatLeafBits(e.binLeft, fnIx)
-      const rb = spineFloatLeafBits(e.binRight, fnIx)
-      return lb | rb
+      const m = if arithRegionSeen && (bcOpen || e.binRegion != 0) { bcGet(exprIx, fnIx, BC_LEAF) } else { -2 }
+      if m >= 0 { return m }
+      const bits = spineFloatLeafBits(e.binLeft, fnIx)
+        | spineFloatLeafBits(e.binRight, fnIx)
+      if m != -2 {
+        bcPut(exprIx, fnIx, BC_LEAF, bits)
+        bcSpineLeave(m == -3)
+      }
+      return bits
     }
   }
   if e is NumLit { return 0 }
@@ -16653,9 +16822,12 @@ export function exprIsF32(exprIx: i32, fnIx: i32) {
     if op == "+" || op == "-" || op == "*" || op == "/" || op == "%" {
       // f32 arithmetic yields f32 only when no operand is a genuine f64 — a genuine f64 side
       // makes the op f64 (the f32 side widens). A float literal does not count.
-      if binMixHardF64(e.binLeft, e.binRight, fnIx) { return false }
-      if exprIsF32(e.binLeft, fnIx) { return true }
-      return exprIsF32(e.binRight, fnIx)
+      const m = if arithRegionSeen && (bcOpen || e.binRegion != 0) { bcGet(exprIx, fnIx, BC_F32) } else { -2 }
+      if m >= 0 { return m == 1 }
+      const r = !binMixHardF64(e.binLeft, e.binRight, fnIx)
+        && (exprIsF32(e.binLeft, fnIx) || exprIsF32(e.binRight, fnIx))
+      if m != -2 { bcPutB(m, exprIx, fnIx, BC_F32, r) }
+      return r
     }
     return false
   }
@@ -16798,8 +16970,11 @@ export function exprIsF64(exprIx: i32, fnIx: i32) {
   if e is BinExpr {
     const op = e.binOp
     if op == "+" || op == "-" || op == "*" || op == "/" || op == "%" {
-      if exprIsF64(e.binLeft, fnIx) { return true }
-      return exprIsF64(e.binRight, fnIx)
+      const m = if arithRegionSeen && (bcOpen || e.binRegion != 0) { bcGet(exprIx, fnIx, BC_F64) } else { -2 }
+      if m >= 0 { return m == 1 }
+      const r = exprIsF64(e.binLeft, fnIx) || exprIsF64(e.binRight, fnIx)
+      if m != -2 { bcPutB(m, exprIx, fnIx, BC_F64, r) }
+      return r
     }
     // `xs.get(i) ?? d` over an f64 list yields an f64 (the fused checked read);
     // the default `d` shares the element type, so classify by the right side.

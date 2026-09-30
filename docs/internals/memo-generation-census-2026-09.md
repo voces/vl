@@ -67,10 +67,11 @@ tree ungraded.
 | `fnStmtsPosIndex` (`fnPos*`) | `fnPosEpoch`, and the `fnStmts`/`monoOrigNode` prefix lengths already indexed | `fnStmts` slots overwritten by `monomorphize` — every such write calls `buildFnMapNoteFnSlotWrite`, which retires the index | probe |
 | `moduleLocalLetPlan` (`mllSort*`) | the NAME; dropped with its table by `resetParentLetCache` | none: the module block-local table is built once and reset wholesale | probe |
 | `elemRowsCaptureWalk` (`ercGenP`/`ercStamp`) | **`emitPassGen`**, and a per-walk stamp so a new walk clears nothing | none: the table is rebuilt when the pass generation moves, and a slot is dead the moment its walk id is stale | pass-stamped |
-| `closureCaptureNames` (`capMemoGen`/`capMemoStamp`, D2017) | **`emitPassGen`**, `P.nodes.length`, a reported-edit count | none reachable: armed only inside `computeRetInference`, `computeRetInference#2` and `dispatchRewrite`; the first two write no table `capScan` reads, and every rewrite either mints a node or calls `capMemoNoteEdit` | pass-stamped |
+| `closureCaptureNames` (`capMemoGen`/`capMemoStamp`, D2017) | **`emitPassGen`**, `P.nodes.length`, a reported-edit count | none reachable: armed only inside `computeRetInference`, `computeRetInference#2` and `dispatchRewrite`, and inside `monoRebuild`'s runs of `computeVoidFns` and `computeRetInference` after it reports an edit (D2771); those passes write no table `capScan` reads, and every rewrite either mints a node or calls `capMemoNoteEdit` | pass-stamped |
 | `crValUseNames` (`crValUseRoot`, D2584) | the root's node INDEX; reset by `crReset` | none: the names a root uses other than as a receiver are read off the syntax tree, which the checker does not rewrite | no-refined-input |
 | `aliasRootIndex` (`aliasRootLen`, #3300) | `udTsNode.length`; reset by `tsReset` | none: `udTsNode`/`udTsWritten` are push-only, and `udName` is renamed only by the module merge, which runs before the first ask | no-refined-input |
 | `covarValueWriteState` (`cwArenaLen`, checked in `cwArenaSync`) | `P.nodes.length` | its own `cwIx*` index, dropped with it (the per-(name, frame) chains of D2688, `cwIxP*`, included); and `nodeRepTyIx`, a checker sidecar written in place | probe |
+| `arithClassifierMemo` (`bcIn`/`bcBits`, D2445) | a SESSION: one classification, or one emission or reservation walk, of the region under a chain root the parser marked (`binRegion`); its tables cover that region's node range and are dropped when it closes | the emitter's local and narrowing state, which a walk could change between a region's first classification and a later one — the region holds only operators, parens and unary minus, whose operands are classified before any of them is emitted | probe |
 
 ## The `probe` verdict is a measurement — one row at a time
 
@@ -114,6 +115,7 @@ Readings on 2026-09-05, master `55f25c3e7`:
 | `paramShadowCache` (graded 2026-09-29 on lane SR's tree) | byte-identical | no cell changed class |
 | `covarValueWriteState` | byte-identical | no cell changed class |
 | `closureCaptureNames` (graded 2026-09-23, master `9847488c1` + D2017) | byte-identical | no cell changed class |
+| `arithClassifierMemo` (graded 2026-09-30 on lane CT's tree after the review's gating round; all `tests/cases` programs build byte-identical against the disabled seed except the 700-term chain fixture, which the disabled seed cannot compile) | byte-identical | not run against the disabled seed; the enabled seed moved no cell |
 | `fnStmtsPosIndex`, `moduleLocalLetPlan` (graded 2026-09-25, each alone and both together; also all 3,592 `tests/cases` programs built byte-identical, against the disabled seed and against master's) | byte-identical | not run |
 
 **Eighteen of twenty disable edits leave the compiler's own codegen of itself byte-identical

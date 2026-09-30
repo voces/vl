@@ -1191,6 +1191,41 @@ axis(
   (d) => twoFiles(d, genConcatChains(1, 300), genConcatChains(1, 75)),
 );
 
+// D2445's GROWTH pair: one `n`-term `+` chain per operand width (i32, f32, f64, i64, string)
+// at 2,000 against 500, so linear reads 4 and quadratic 16. Each operator's emission asked its
+// operands' width, and each answer re-walked the whole left subtree, so the long arm was cubic
+// and trapped past about 600 terms; the arithmetic classifiers now memoise per node.
+const genOperatorChains = (n: number): string => {
+  const o: string[] = [];
+  for (const [f, ty, arg] of [["i", "i32", "1"], ["g", "f32", "0.25"], ["d", "f64", "0.5"], ["l", "i64", "3"], ["s", "string", '"ab"']]) {
+    o.push(`function ${f}(a: ${ty}): ${ty} {`, `  ${Array(n).fill("a").join(" + ")}`, "}");
+    o.push(f === "s" ? `print(${f}(${arg}).length)` : `print(${f}(${arg}))`);
+  }
+  // The same chains as the operand of a comparison, a condition and a `&&`, where the parser's
+  // mark has to land on the chain's own root rather than on the operator that wraps it.
+  const c = Array(n).fill("a").join(" + ");
+  o.push(
+    `function ceq(a: i32) { ${c} == 0 }`,
+    "print(ceq(1))",
+    `function cif(a: i32, limit: i32) { if ${c} > limit { return 1 } 0 }`,
+    "print(cif(1, 3))",
+    `function cand(b: boolean, a: i32) { b && ${c} > 3 }`,
+    "print(cand(true, 1))",
+    `function clt(a: f64) { ${c} < 0.5 }`,
+    "print(clt(0.5))",
+    `function cseq(a: string) { ${c} == \"x\" }`,
+    "print(cseq(\"x\"))",
+  );
+  return o.join("\n") + "\n";
+};
+
+axis(
+  "arithmetic operator chain length",
+  5.0,
+  "An operand-width classifier re-walks its subtree per level (`exprIsF64`/`exprIsF32`/`exprIsI64`/`exprIsStrConcat`, compiler/emit_classify.vl); see D2445.",
+  (d) => twoFiles(d, genOperatorChains(2000), genOperatorChains(500)),
+);
+
 // A chain of `depth` generics, each calling the next, every body carrying deferred
 // constraints over its `T`; `calleeFirst` declares the chain bottom-up.
 const genGenericChain = (depth: number, calleeFirst: boolean): string => {

@@ -156,7 +156,8 @@ ROWS = [
      ("    if ercVal[slot] == 0 - 2 { return true }",
       "    if true { return true }")),
     # D2017: the key reads `emitPassGen` beside `P.nodes.length` and the reported-edit count,
-    # and the memo is armed only inside the passes `passKeepsCaptures` names.
+    # and the memo is armed only inside the passes `passKeepsCaptures` names and inside
+    # `monoRebuild`'s run of those two passes, which reports an edit first (D2771).
     ("closureCaptureNames", ["capMemoGen", "capMemoStamp"], "pass-stamped",
      ("  if capMemoStamp[fe] == capMemoGen {",
       "  if false && capMemoStamp[fe] == capMemoGen {")),
@@ -172,6 +173,11 @@ ROWS = [
     ("paramShadowCache", ["pshSidGen"], "probe",
      ("  if fnIx == pshFrame && sid < pshSidGen.length && pshSidGen[sid] == pshGen {",
       "  if false && fnIx == pshFrame && sid < pshSidGen.length && pshSidGen[sid] == pshGen {")),
+    # D2445: the arithmetic classifiers' per-node answers over one parser-marked region, in tables
+    # allocated when a session opens and dropped when it closes; no stamp, the tables die with it.
+    ("arithClassifierMemo", [], "probe",
+     ("  if ((b >> (3 * k)) & 1) == 0 { return -1 }",
+      "  if true || ((b >> (3 * k)) & 1) == 0 { return -1 }")),
     ("listRepQuery", ["lrMemoGen"], "probe",
      ("    if lrMemoGen[exprIx] == lrGen && lrMemoFn[exprIx] == fnIx {",
       "    if false && lrMemoGen[exprIx] == lrGen && lrMemoFn[exprIx] == fnIx {")),

@@ -198,16 +198,15 @@ Deno.test({
   ignore: !ENABLED,
   fn: async () => {
     await withDir(async (dir) => {
-      // D1977's witness: a small entry file, so the null collector, and one literal past 2^23
-      // code points, whose string-pool decode outgrows the 64 MiB object cap. About 0.3 s.
-      await Deno.writeTextFile(
-        `${dir}/m.vl`,
-        `export function f0(): string { "${"a".repeat(8_400_000)}" }\n`,
-      );
-      await Deno.writeTextFile(
-        `${dir}/main.vl`,
-        `import { f0 } from "./m"\nprint(f0().length)\n`,
-      );
+      // D2780's witness at depth 18: a small entry file, so the null collector, and a record type
+      // whose structural spelling doubles per level, which fills the heap. About 4 s. When
+      // D2780 closes, move this to the next open trap under the null collector.
+      const lines = ["type A0 = {x: i32}"];
+      for (let i = 1; i <= 18; i++) lines.push(`type A${i} = {l: A${i - 1}, r: A${i - 1}}`);
+      lines.push("function f<T>(u: T | string): boolean { u is string }", "const a0: A0 = {x: 1}");
+      for (let i = 1; i <= 18; i++) lines.push(`const a${i}: A${i} = {l: a${i - 1}, r: a${i - 1}}`);
+      lines.push("print(f<A18>(a18))");
+      await Deno.writeTextFile(`${dir}/main.vl`, lines.join("\n") + "\n");
       const r = await vl(["build", `${dir}/main.vl`, "-o", `${dir}/main.wasm`]);
       if (
         r.code !== 70 || !r.err.includes("vl: compile collector: null ") ||
