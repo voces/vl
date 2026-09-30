@@ -9114,3 +9114,43 @@ cells stay invalid or emit-refused as on master (D3339, D3349-D3351). A 540-cell
 print master's values, and all 220 invalid or refused ones are now check refusals. The 936-cell
 position grid and the 88-cell adoption grid show 0 value changes and no new silent cell.
 plumb's 508 files check identically.
+
+## A function value at another function type is adapted where it is delivered (2026-09-30) — D3073, D3112
+
+The checker admits a function value where a function type of another rep is expected (a record
+result read as a union, a record list read as a `readonly` union list, a union parameter read as
+a record one), and a function value keeps the `$fnsig` it was built at, so the call through the
+destination's type trapped. The coordinator's note on D3073 was: (A) an adapter at the delivery for
+a result a read-only view serves, (B) a check refusal for anything that needs a copy.
+
+**The adapter is a rewrite, not an emitter thunk.** `fvaAdapt` (typecheck.vl) replaces the
+delivered expression, in place, with `(p…): R => f(p…)` at the destination's type and checks it
+as written code. Each argument and the result then convert through the delivery that already
+exists for them (the D3041 view, a union box, a generic's instance), and a conversion the language
+refuses is refused by the same rule a hand-written wrapper meets: D2715's `A | B` result read as
+`B` is the record-covariance refusal, since a call's result is not provably fresh. An emitter
+thunk would have needed its own copy of every delivery conversion. A function declaration or a
+`const` is called directly; any other value is read once, as the argument of a lambda called in
+place, so a later store to a `let` does not reach the adapter.
+
+**"May differ" is decided on the rep, not the type.** The checker has no `$fnsig` key (the
+emitter interns those after checking), so `fvaSlotMayDiffer` mirrors what the key ignores: a single
+literal is its base scalar (`() => "ab"` is `() => string`), a union's members compare as a set
+(`Circle | Sq` is `Sq | Circle` and `Shape`), a list differs only by its element, and anything else
+unequal counts as a difference. The #3314 review's first round lost 79 running cells to a
+type-level comparison that forced adapters, and container refusals, on same-signature functions.
+
+**A function inside a container is refused, not adapted.** A list, record, map or `| null`
+holding functions taken at a wider function type would need each function rewritten on the way,
+which is a copy; the check refuses it and names the fix. A literal adapts each element or field,
+since that is a delivery per element. The `| null` case could be adapted behind a null test, but a
+lambda parameter of nullable function type has no representation in the function-value ABI yet.
+
+**A generic function named as a value is always adapted**, whatever type the checker gave the
+name, so its instance is built by the adapter's direct call (D3112, D3113). One held with no
+concrete function type at all is D3381, which asks for a ruling.
+
+Measured against master `3291e99e1`: the distilled corpus lost no runs, the filed-witness grader moved only
+the five rows this re-grades, and plumb-shape guest fuel moved +0.02% (main and tail). The
+compiler's own source has no delivery the adapter rewrites (its first self-compile was
+byte-identical to the second).

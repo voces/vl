@@ -64,6 +64,7 @@ import {
   Unary,
   UnionDecl,
   WhileStmt,
+  addNode,
   adoptNodeTok,
   arenaEpochBump,
   arenaSetNode,
@@ -81,6 +82,7 @@ import {
   mkIf,
   mkLet,
   mkNum,
+  mkParam,
   mkParen,
   mkUnary,
   mkUnionDecl,
@@ -4089,6 +4091,9 @@ let luWriteTgt: {[i32]: boolean} = Map()
 let luDeclPos: {[i32]: i32} = Map()
 // The type each annotation the list-union rewrite minted stands for, keyed by its `TypeRef`.
 let luAnnTy: {[i32]: i32} = Map()
+// The delivery sites the function-value adapter rewrote, so a second delivery of one does not
+// wrap the adapter again.
+let fvaDone: {[i32]: boolean} = Map()
 // D951 — the `is`-test type sidecar: the arena type an `IsExpr`'s check type resolves to, keyed by
 // the `IsExpr` node, so the emitter's narrowing stack banks the answer instead of re-deriving the
 // narrowed type from the tested spelling. Sized with `nodeTyIx` and read through `isVarTyIxOf`; a
@@ -5137,6 +5142,7 @@ export function initChecker() {
   luWriteTgt = Map()
   luDeclPos = Map()
   luAnnTy = Map()
+  fvaDone = Map()
   pgVoid = []
   joinHead = []
   joinName = []
@@ -20939,6 +20945,7 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
   noteHoleFlow(srcTy, dstTy)
   if assignable(srcTy, dstTy) {
     if !inferQuiet && srcExpr >= 0 { genFnValueCstrs(srcExpr, srcTy, dstTy) }
+    if fvaAdapt(srcExpr, srcTy, dstTy) { return true }
     // The object-shape floor. `assignable` accepts structural subtyping between two object shapes
     // and the emitter has no adapter for it (`objShapeAdapterless`), so the pair would reach codegen
     // and fail there on a file `vl check` reports clean. It belongs at this seam, the one every
@@ -21373,6 +21380,9 @@ function annotResolve(name: string, root: i32) {
 // they differ at a struct field, whose "unknown type" diagnostic anchors on the `FieldDef` so the
 // message points at the field, while the spelling is banked on the `TypeRef` child.
 function nameToTyAnn(name: string, at: i32, ann: i32) {
+  // An annotation a rewrite minted is typed as the rewrite typed it.
+  const minted = luAnnTy[ann] ?? -1
+  if minted >= 0 { return minted }
   const saved = annotDiagAt
   annotDiagAt = at
   const r = annotResolve(name, annTsOf(ann))
@@ -37600,6 +37610,8 @@ function bmArgOk(
   argIx: i32,
 ) {
   if tyHasHole(got) || tyHasHole(want) {
+    // A generic function stored as the value is instantiated there (D3112).
+    if fvaAdapt(argIx, got, want) { return true }
     noteBmCstr(form, label, got, want, ctx, argIx)
     return true
   }
@@ -40408,9 +40420,13 @@ function argPinRecheck(name: string, ty: i32) {
     if argPinDone[i] == 0 {
       const sub = substTyDeep(argPinGot[i], bN, bT)
       // Only a substitution that CHANGED the type says this pin reaches this demand, and only
-      // a fully concrete result can be compared.
+      // a fully concrete result can be compared. An argument the function-value adapter
+      // rewrote is already at the parameter's type.
       if sub >= 0 && sub != argPinGot[i] && !tyHasTyVar(sub) {
-        if !assignable(sub, argPinWant[i]) {
+        if (
+          !assignable(sub, argPinWant[i])
+          && !(fvaDone[argPinNode[i]] ?? false)
+        ) {
           argPinDone[i] = 1
           argMismatchErr(argPinNo[i], argPinWant[i], sub, argPinNode[i])
         }
@@ -45475,6 +45491,8 @@ function resolveAnnotAt(
   at: i32,
   owner: string,
 ) {
+  const minted = luAnnTy[at] ?? -1
+  if minted >= 0 { return minted }
   const saved = annotDiagAt
   annotDiagAt = at
   const r = resolveAnnotTs(name, typarams, annTsOf(at), owner)
@@ -64551,6 +64569,406 @@ function luForInAt(n: ForIn, ix: i32, iterTy: i32, ms: i32[], elem: i32): i32 {
   arenaSetNode(ix, w)
   luGrow()
   checkNode(ix)
+}
+
+// ── a function value at another function type (D3073) ──────────────────────
+// A function value keeps the `$fnsig` it carries, so a call through a function type of another
+// rep traps. The delivery is rewritten in place into `(p…): R => f(p…)` at the destination's
+// type and checked as written code; a conversion that code cannot make is refused there.
+
+// Whether slot types `a` and `b` may lower to different wasm reps. Conservative: only an equal
+// type, or a list differing only in `readonly`, is known to agree.
+function fvaSlotMayDiffer(a0: i32, b0: i32, depth: i32): boolean {
+  if a0 == b0 { return false }
+  if a0 < 0 || b0 < 0 || depth <= 0 { return true }
+  // A single literal is stored as its base scalar.
+  const a = fvaLitBase(a0)
+  const b = fvaLitBase(b0)
+  if a == b || tyEq(a, b) { return false }
+  if a < 0 || a >= T.tys.length { return true }
+  const ta = T.tys[a]
+  match ta {
+    TyArray => {
+      const be = fvaElemOf(b)
+      if be == -2 { return true }
+      return fvaSlotMayDiffer(ta.aElem, be, depth - 1)
+    }
+    TyNullable => {
+      const bi = fvaInnerOf(b)
+      if bi == -2 { return true }
+      return fvaSlotMayDiffer(ta.nInner, bi, depth - 1)
+    }
+    TyFunc => {
+      if !fvaIsFn(b) { return true }
+      return fvaFnMayDiffer(a, b, depth - 1)
+    }
+    TyUnion => {
+      // A union's box keys each member by its type, so member order is not rep.
+      return !fvaSameMembers(ta.uMembers, b, depth - 1)
+    }
+    TyPrim | TyErr | TyObj | TyMap | TyVar | TyLit | TyNeg => {
+      return true
+    }
+  }
+}
+
+// `t`'s base scalar when it is a single literal type, else `t`.
+function fvaLitBase(t: i32): i32 {
+  const n = T.tys[t]
+  if n is TyLit { return litBaseTy(n) }
+  t
+}
+
+// Whether union `b` has exactly the members `ms` has, in any order.
+function fvaSameMembers(ms: i32[], b: i32, depth: i32): boolean {
+  const u = T.tys[b]
+  if u is TyUnion {
+    if u.uMembers.length != ms.length { return false }
+    for m in ms {
+      let found = false
+      for n in u.uMembers {
+        if !found && !fvaSlotMayDiffer(m, n, depth) { found = true }
+      }
+      if !found { return false }
+    }
+    return true
+  }
+  false
+}
+
+// The element of list type `t`, or -2 when `t` is not a list.
+function fvaElemOf(t: i32): i32 {
+  const n = T.tys[t]
+  if n is TyArray { return n.aElem }
+  -2
+}
+
+// The inner type of nullable `t`, or -2 when `t` is not nullable.
+function fvaInnerOf(t: i32): i32 {
+  const n = T.tys[t]
+  if n is TyNullable { return n.nInner }
+  -2
+}
+
+// The value type of map `t`, or -2 when `t` is not a map.
+function fvaValOf(t: i32): i32 {
+  const n = T.tys[t]
+  if n is TyMap { return n.mVal }
+  -2
+}
+
+function fvaIsFn(t: i32): boolean { T.tys[t] is TyFunc }
+
+// Whether two function types may lower to different `$fnsig`s.
+function fvaFnMayDiffer(s: i32, d: i32, depth: i32): boolean {
+  const st = T.tys[s]
+  const dt = T.tys[d]
+  if st is TyFunc && dt is TyFunc {
+    if st.fnParamTypes.length != dt.fnParamTypes.length { return true }
+    if fvaSlotMayDiffer(st.fnRet, dt.fnRet, depth) { return true }
+    let i = 0
+    while i < st.fnParamTypes.length {
+      if fvaSlotMayDiffer(st.fnParamTypes[i], dt.fnParamTypes[i], depth) {
+        return true
+      }
+      i = i + 1
+    }
+    return false
+  }
+  true
+}
+
+// The annotation node naming `ty` for the adapter, or -1 when it has no spelling. The checker
+// reads the type itself; the spelling is the display name, which the emitter reads as the
+// author's own annotation, since the emit spelling renders a named record structurally.
+function fvaAnnot(ty: i32, site: i32, pos: i32): i32 {
+  if ty < 0 || ty >= T.tys.length { return -1 }
+  let sp = ""
+  // A single literal type is spelled by its base scalar, which it is stored as; the checker
+  // reads the literal itself from `luAnnTy`.
+  const sty = fvaLitBase(ty)
+  if isVoidTy(sty) { sp = "void" } else { sp = luPipeTight(tyToStr(sty)) }
+  if sp == "" || luSpell(sty) == "" { return -1 }
+  // The display name leaves a nullable function type's arrow unparenthesised.
+  const t = T.tys[ty]
+  if t is TyNullable && t.nInner >= 0 {
+    if T.tys[t.nInner] is TyFunc {
+      sp = "(" + luPipeTight(tyToStr(t.nInner)) + ")|null"
+    }
+  }
+  const tr = luAt(mkTypeRef(sp, pos), site)
+  luAnnTy.set(tr, ty)
+  tr
+}
+
+// Rewrites the function value at `srcExpr`, of type `srcTy`, into an adapter at `dstTy`'s
+// function type, when the two may differ in rep. True when the delivery is settled here,
+// rewritten or refused; false leaves it to the caller unchanged.
+function fvaAdapt(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
+  if srcTy == dstTy || inferQuiet || monoRecheckDepth > 0 { return false }
+  if srcExpr < 0 || srcTy < 0 || dstTy < 0 { return false }
+  if srcTy >= T.tys.length || dstTy >= T.tys.length { return false }
+  if !tyMayHoldFn(dstTy, 0) { return false }
+  // A literal delivers each element or field at the destination's own type, one seam down.
+  const lit = P.nodes[parenPeelIx(srcExpr)]
+  if lit is ArrayLit {
+    const da = T.tys[nonNullTy(dstTy)]
+    if da is TyArray {
+      for el in lit.arrElems {
+        if spreadArgOf(el) < 0 { fvaAdapt(el, nodeTyIxOf(el), da.aElem) }
+      }
+    }
+    return false
+  }
+  if lit is ObjLit {
+    const dob = T.tys[nonNullTy(dstTy)]
+    if dob is TyObj {
+      for fi in lit.objFields {
+        const f = P.nodes[fi]
+        if f is FieldInit {
+          const ft = objFieldType(dob, f.fiName)
+          if ft >= 0 { fvaAdapt(f.fiValue, nodeTyIxOf(f.fiValue), ft) }
+        }
+      }
+    }
+    return false
+  }
+  const dt = nonNullTy(dstTy)
+  if dt < 0 { return false }
+  const d = T.tys[dt]
+  const s = T.tys[srcTy]
+  if !(s is TyFunc) || !(d is TyFunc) {
+    // A function inside a container is not rewritten on the way, so a call through the
+    // destination's function type would reach it at another signature.
+    if fvaNestedFnDiffers(srcTy, dstTy, 0, 8) {
+      fvaRefuseNested(srcExpr, srcTy, dstTy)
+      return true
+    }
+    return false
+  }
+  if s.fnRet < 0 || d.fnRet < 0 { return false }
+  if tyHasTyVar(dt) || s.fnParamTypes.length != d.fnParamTypes.length {
+    return false
+  }
+  const site = srcExpr
+  const pe = P.nodes[parenPeelIx(site)]
+  // A generic function named as a value is instantiated by the adapter's direct call, whatever
+  // type the checker gave the name (D3112); any other type parameter in the source is an
+  // enclosing generic's, pinned per instance.
+  if fvaDone[site] ?? false { return false }
+  if tyReachesHole(dt, 8) { return false }
+  if !fvaNamesGeneric(pe) {
+    // A hole is pinned later, where the value's use decides it.
+    if fnTyHasHole(srcTy) || tyHasTyVar(srcTy) || tyReachesHole(srcTy, 8) {
+      return false
+    }
+    if !fvaFnMayDiffer(srcTy, dt, 8) { return false }
+  }
+  const pos = nodePos(site)
+  const params: i32[] = []
+  const args: i32[] = []
+  let i = 0
+  while i < d.fnParamTypes.length {
+    const pt = fvaAnnot(d.fnParamTypes[i], site, pos)
+    if pt < 0 {
+      fvaRefuse(srcExpr, srcTy, dt, "")
+      return true
+    }
+    const pn = "$fp" + i32ToStr(i)
+    params.push(luAt(mkParam(pn, pt, -1, 0, 0, pos), site))
+    args.push(luRef(pn, site, pos))
+    i = i + 1
+  }
+  const rt = fvaAnnot(d.fnRet, site, pos)
+  if rt < 0 {
+    fvaRefuse(srcExpr, srcTy, dt, "")
+    return true
+  }
+  // A function declaration or a `const` is stable; any other value is read once, as the
+  // argument of an enclosing lambda called in place, so the adapter calls the delivered value
+  // rather than what a `let` later holds.
+  const stable = fvaStableName(pe)
+  let callee = -1
+  let fvParam = -1
+  if stable {
+    if pe is Ident { callee = luRef(pe.identName, site, pos) }
+  } else {
+    const st = fvaAnnot(srcTy, site, pos)
+    if st < 0 {
+      fvaRefuse(srcExpr, srcTy, dt, "")
+      return true
+    }
+    const fv = "$fv" + i32ToStr(site)
+    fvParam = luAt(mkParam(fv, st, -1, 0, 0, pos), site)
+    callee = luRef(fv, site, pos)
+  }
+  const lam = fvaLambda(
+    params,
+    rt,
+    luAt(mkCall(callee, args, pos), site),
+    site,
+    pos,
+  )
+  fvaDone.set(site, true)
+  const mark = T.diags.length
+  if stable {
+    arenaSetNode(site, lam)
+  } else {
+    const moved = addNode(P.nodes[site])
+    adoptNodeTok(moved, site)
+    const li = luAt(addNode(lam), site)
+    const outerPs: i32[] = []
+    outerPs.push(fvParam)
+    const outer = luAt(addNode(fvaLambda(outerPs, -1, li, site, pos)), site)
+    const outerArgs: i32[] = []
+    outerArgs.push(moved)
+    const names: string[] = []
+    const c: Node = {
+      callFn: outer,
+      callArgs: outerArgs,
+      callArgNames: names,
+      pos: pos,
+    }
+    arenaSetNode(site, c)
+  }
+  luGrow()
+  const t = checkNode(site)
+  if T.diags.length > mark || !assignable(t, dstTy) {
+    let why = ""
+    if T.diags.length > mark { why = T.diags[mark].tmsg }
+    while T.diags.length > mark { T.diags.pop() }
+    fvaRefuse(site, srcTy, dt, why)
+  }
+  true
+}
+
+// The lambda `(params): ret => { tail }`, as a node not yet placed in the arena.
+function fvaLambda(
+  params: i32[],
+  ret: i32,
+  tail: i32,
+  site: i32,
+  pos: i32,
+): Node {
+  const stmts: i32[] = []
+  stmts.push(tail)
+  const noTyParams: string[] = []
+  const n: Node = {
+    fnName: "",
+    fnTyParams: noTyParams,
+    fnParams: params,
+    fnRet: ret,
+    fnBody: luAt(mkBlock(stmts, pos), site),
+    pos: pos,
+  }
+  n
+}
+
+// Whether a function held `level` containers into `s` may differ in rep from the one at the
+// same place in `d`. Only a pair of function types answers true; any other mismatch is some
+// other rule's.
+function fvaNestedFnDiffers(s: i32, d: i32, level: i32, depth: i32): boolean {
+  if s == d || s < 0 || d < 0 || depth <= 0 { return false }
+  if s >= T.tys.length || d >= T.tys.length { return false }
+  const st = T.tys[s]
+  match st {
+    TyFunc => {
+      if level == 0 || !fvaIsFn(d) { return false }
+      if tyReachesHole(s, 8) || tyReachesHole(d, 8) { return false }
+      return fvaFnMayDiffer(s, d, 8)
+    }
+    TyNullable => {
+      return fvaNestedFnDiffers(st.nInner, fvaInnerOf(d), level + 1, depth - 1)
+    }
+    TyArray => {
+      return fvaNestedFnDiffers(st.aElem, fvaElemOf(d), level + 1, depth - 1)
+    }
+    TyMap => {
+      return fvaNestedFnDiffers(st.mVal, fvaValOf(d), level + 1, depth - 1)
+    }
+    TyObj => {
+      return fvaNestedFieldDiffers(st, d, level, depth)
+    }
+    TyPrim | TyErr | TyUnion | TyVar | TyLit | TyNeg => {
+      return false
+    }
+  }
+}
+
+// `fvaNestedFnDiffers` over the fields record `d` shares with `st`.
+function fvaNestedFieldDiffers(
+  st: TyObj,
+  d: i32,
+  level: i32,
+  depth: i32,
+): boolean {
+  const dt = T.tys[d]
+  if dt is TyObj {
+    let i = 0
+    while i < dt.objFieldNames.length {
+      const sf = objFieldType(st, dt.objFieldNames[i])
+      if fvaNestedFnDiffers(sf, dt.objFieldTypes[i], level + 1, depth - 1) {
+        return true
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// The refusal for a container whose functions would need an adapter each.
+function fvaRefuseNested(at: i32, srcTy: i32, dstTy: i32) {
+  tErr(
+    "a `"
+      + tyToStr(srcTy)
+      + "` cannot be used as `"
+      + tyToStr(dstTy)
+      + "` here: a call through that type would reach a function it holds at a signature "
+      + "the function does not have, and the functions inside a value are not converted on the way. Build the "
+      + "value at `"
+      + tyToStr(dstTy)
+      + "`, or wrap each function in a lambda of the wider type where it is stored",
+    at,
+  )
+  0
+}
+
+// Whether `n` names a generic function declaration.
+function fvaNamesGeneric(n: Node): boolean {
+  if n is Ident {
+    const gd = lookupFnDeclNode(n.identName)
+    if gd < 0 { return false }
+    const gf = P.nodes[gd]
+    if gf is FuncDecl { return gf.fnTyParams.length > 0 }
+  }
+  false
+}
+
+// Whether `n` names a binding the adapter may read at call time: a function declaration or a
+// `const`, neither of which a later statement can rebind.
+function fvaStableName(n: Node): boolean {
+  if n is Ident {
+    if lookupFnDeclNode(n.identName) >= 0 { return true }
+    return isConstName(n.identName)
+  }
+  false
+}
+
+// The refusal for a function value whose adapter cannot be built: `why` is the checker's
+// reason for refusing the adapter's own call or result, "" when a slot type has no spelling.
+function fvaRefuse(at: i32, srcTy: i32, dstTy: i32, why: string) {
+  let msg = "a function of type `"
+    + tyToStr(srcTy)
+    + "` cannot be used as `"
+    + tyToStr(dstTy)
+    + "` here: calling it through that type needs its arguments or result converted, and "
+  if why == "" {
+    msg = msg + "a parameter or result type has no spelling to convert through"
+  } else {
+    msg = msg + "that conversion is refused (" + why + ")"
+  }
+  tErr(msg, at)
+  0
 }
 
 // ── member `o.field` ───────────────────────────────────────────────────────
