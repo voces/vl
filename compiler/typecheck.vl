@@ -7789,6 +7789,11 @@ function writesHoleField(tgtIx: i32): boolean {
 // Assignments that ended a path narrowing through another place that may name the same object.
 // They settle like a call (`crPathCallRetire`), since the emitter cannot see the alias.
 let crAliasWr: {[i32]: boolean} = Map()
+// Narrowings a hole body ended by a rule that holds at every pin, keyed `<ender>|<path key>`: a
+// write to the place or a prefix of it, a variable-index write under it, or a call that writes
+// the path through an argument or a free variable by name. An alias or cell-tag verdict is decided
+// on types the hole does not have yet, so a read after it keeps master's behaviour (D3287).
+let npKillSure: {[string]: boolean} = Map()
 // Enclosing functions' path slots such a write inside a nested function ends, with the depth of
 // the function holding the write. They hold again when that body closes: its calls run the write.
 let crAliasNestSlots: i32[] = []
@@ -8097,7 +8102,10 @@ function retireNarrowingsForWrite(tgtIx: i32, rt0: i32, atIx: i32) {
     const pfx = root + "["
     let r = 0
     while r < npKeys.length {
-      if keyHasPrefix(npKeys[r], pfx) { npInvBy[r] = atIx }
+      if keyHasPrefix(npKeys[r], pfx) {
+        npInvBy[r] = atIx
+        noteKillSure(atIx, npKeys[r])
+      }
       r = r + 1
     }
     return 0
@@ -8149,6 +8157,7 @@ function retireNarrowingsForWrite(tgtIx: i32, rt0: i32, atIx: i32) {
     }
     if hit {
       npInvBy[i] = atIx
+      noteKillSure(atIx, npKeys[i])
       // The target's OWN narrowing going is what the emitter has to mirror; a path below it
       // goes through the prefix rule both sides already apply. Reads-only narrowing states one
       // rule for every receiver, so the path re-narrows to the written member exactly as a bare
@@ -8386,6 +8395,7 @@ function noteCallInvalidations(callIx: i32) {
       // two arms separately and a write in one must not hide a call in the other (D1849).
       if npInvBy[i] < 0 {
         npInvBy[i] = callIx
+        if callKillSure(callIx, npKeys[i]) { noteKillSure(callIx, npKeys[i]) }
         crPathCallRetire(i, callIx)
         // Inside a nested body a call ends an enclosing narrowing for the rest of that body
         // only: the enclosing function's own call of the body ends it there, in both halves.
@@ -8897,6 +8907,7 @@ function crReset() {
   crOpOpaque = Map()
   crOpCall = Map()
   crAliasWr = Map()
+  npKillSure = Map()
   crAliasNestSlots = []
   crNestCallRet = Map()
   crAliasNestDepths = []
@@ -10894,6 +10905,7 @@ function crLoopPathPreRetire(loopIx: i32) {
       const a = crLoopLeavingPathWrite(loopIx, npKeys[s], npTys[s])
       if a >= 0 {
         npInvBy[s] = a
+        noteKillSure(a, npKeys[s])
         npSettle[s] = -1
         crAliasWr[a] = true
         crLoopMapCellPresent(npKeys[s], a)
@@ -34251,7 +34263,8 @@ const MC_NULL_READ_MARK = "?."
 // Records a member read off a derived hole a `null` could reach, so the pin refuses `.v` on
 // `H | null` as the direct spelling does (D3287). A null test narrows the read to the hole's
 // non-null face (`HD_GNOT`), which is not recorded, so a guarded read still runs.
-function noteNullReadCstr(recv: i32, prop: string, ix: i32) {
+function noteNullReadCstr(recv: i32, prop: string, ix: i32, place: i32) {
+  if inferQuiet || !killedNarrowingSure(place) { return 0 }
   if hdReadNullAsked(hdRowOf(recv)) {
     noteMemCstr(recv, MC_NULL_READ_MARK + prop, ix, false)
   }
@@ -34266,10 +34279,68 @@ function noteHoleArgNullRead(name: string, at: i32, ix: i32) {
   const st = T.tys[shape]
   if st is TyObj {
     if st.objFieldNames.length > 0 {
-      noteNullReadCstr(at, st.objFieldNames[0], ix)
+      noteNullReadCstr(at, st.objFieldNames[0], ix, ix)
     }
   }
   0
+}
+
+function noteKillSure(by: i32, key: string) {
+  npKillSure[i32ToStr(by) + "|" + key] = true
+  0
+}
+
+// Whether the place at node `place` is not a narrowing this function ended by a verdict a pin
+// could overturn. A place never narrowed, or narrowed and still live, answers true.
+function killedNarrowingSure(place: i32): boolean {
+  if place < 0 || place >= P.nodes.length { return true }
+  const key = placeKeyOf(place)
+  if key == "" { return true }
+  let s = npKeys.length - 1
+  let base = crFnNpBase()
+  if base < 0 { base = 0 }
+  while s >= base {
+    if npKeys[s] == key {
+      if npInvBy[s] < 0 { return true }
+      return npKillSure[i32ToStr(npInvBy[s]) + "|" + key] ?? false
+    }
+    s = s - 1
+  }
+  true
+}
+
+// Whether the call at `callIx` ends the narrowing keyed `key` by a rule that holds at every pin:
+// an opaque callee, a cell-removing method on the path's own receiver, or a callee whose
+// summary writes the path by name through an argument or a free variable.
+function callKillSure(callIx: i32, key: string): boolean {
+  const cn = P.nodes[callIx]
+  if !(cn is Call) { return false }
+  const rmRecv = P.nodes[cn.callFn]
+  if rmRecv is Member {
+    if cellRemovingMethod(rmRecv.memProp) {
+      const rmRoot = placeKeyOf(rmRecv.memObj)
+      if rmRoot != "" && keyHasPrefix(key, rmRoot + "[") { return true }
+    }
+  }
+  const declIx = callDeclFnIx(cn, callIx)
+  if declIx == -1 { return !crCalleeUnresolved(callIx) }
+  if declIx < 0 { return false }
+  const free = fnWriteFreePaths(declIx)
+  if free == "*" || pathHitsAny(key, free, "") { return true }
+  const args = callArgPlaces(cn, callIx)
+  let i = 0
+  while i < args.length {
+    const ak = placeKeyOf(args[i])
+    if ak != "" && keyHasPrefix(key, ak + ".") {
+      const sum = fnWriteEffects(declIx, i)
+      if sum == "*" { return true }
+      if pathHitsAny(key.slice(ak.length + 1, key.length), sum, "") {
+        return true
+      }
+    }
+    i = i + 1
+  }
+  false
 }
 
 // Whether a member read off derived-hole row `row` is re-asked at the pin for a `null` member:
@@ -60111,7 +60182,7 @@ function checkMemberNode(n: Member, ix: i32) {
     }
     if ot.tvName.length > 0 {
       if ot.tvName[0] == '?' {
-        noteNullReadCstr(objTy, n.memProp, ix)
+        noteNullReadCstr(objTy, n.memProp, ix, n.memObj)
         // `.length` is the i32 length an array/string/map exposes — treat it as that (not a
         // struct field), so a collection-shaped hole infers without growing a bogus `{length}` shape.
         return symMem(ix, holeMemberTy(objTy, ot.tvName, n.memProp))
