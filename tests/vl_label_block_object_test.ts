@@ -81,10 +81,10 @@ for (const [name, src, want] of CASES) {
 // The D3276 note names the arm whose value an error is about, and no other: exact messages.
 const DIAGS: [string, string, string[]][] = [
   [
-    "a match arm's labelled block, bound through its function",
-    "function h(b: i32) { match b { 3 => { a: { b } }, _ => { a: { b } } } }\nconst v = h(3)",
+    "a match arm's labelled block, read as an object through its function",
+    "function h(b: i32) { match b { 3 => { a: { b } }, _ => { a: { b } } } }\nprint(h(3).a)",
     [
-      "cannot bind the void result of 'v' — a void function returns no value; the braces at 1:37 are a block, " +
+      "member access '.a' on non-object i32; the braces at 1:37 are a block, " +
       "not an object literal; parenthesize an object there: `({ … })`",
     ],
   ],

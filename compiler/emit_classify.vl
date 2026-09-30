@@ -6503,6 +6503,8 @@ export function captureValKind(fe: i32, name: string): VKind {
   if bn is LetDecl {
     if bn.letType >= 0 {
       const annK = vtKindOfType(bn.letType)
+      // An uninitialized function-typed local is the nullable closure cell (`letIsNulClosure`).
+      if bn.letInit < 0 && annK == "closure" { return "nulclosure" }
       // The env field must match the LOCAL's own cell, not re-derive from the annotation:
       // a narrowed nullable initialiser keeps its niche through the binding, because the
       // narrowing is type-level and the rep is not. Reading the annotation alone declares a
@@ -9220,7 +9222,8 @@ function letWidensAtomToStr(letIx: i32, fnIx: i32) {
   if gLitUnionUsed == 0 { return false }
   const d = P.nodes[letIx]
   if d is LetDecl {
-    if d.letType >= 0 {
+    // A binding with no initializer (a loop value's result binding) widens nothing here.
+    if d.letType >= 0 && d.letInit >= 0 {
       const tn = tyNameOf(d.letType)
       if unionTakesAtomAsStr(tn) {
         if exprIsLitAtom(d.letInit, fnIx) { return true }
@@ -15254,7 +15257,9 @@ function ifThenValueIx(ifIx: i32) {
   const s = P.nodes[ifIx]
   if s is IfStmt {
     const tv = armTailValue(s.ifThen)
-    if !exprIsNullLike(tv) { return tv }
+    // A `never` tail (an arm that always exits, D3222) has no rep; the else arm speaks.
+    const thenNever = tv >= 0 && callIsNever(tv)
+    if !exprIsNullLike(tv) && !thenNever { return tv }
     const nv = ifNonNullArmValueIx(s.ifElse)
     if nv >= 0 { return nv }
     return tv
@@ -31624,6 +31629,27 @@ export function mapArmShapeOfTy(armTy: i32): i32 {
   slot
 }
 
+// The map shape of type `ty` or of its nullable inner map (`mapShapeOfExpr`'s codes), or `-3`
+// when it is neither.
+export function mapShapeOfTyPeeled(ty: i32): i32 {
+  const mt = mapTyPeel(ty)
+  if mt < 0 { return -3 }
+  mapArmShapeOfTy(mt)
+}
+
+// Whether `e`, at node `ix`, is `o ?? d` over a nullable map `o` whose result is that map type:
+// its value is `o`'s map when present, else `d`, at the operand's shape. A default of another map
+// type makes the result their union, which is not a map.
+function coalesceOfNulMapIsMap(e: BinExpr, ix: i32, fnIx: i32): boolean {
+  if e.binOp != "??" || !exprNullableMap(e.binLeft, fnIx) { return false }
+  const lm = mapTyPeel(nodeTyIxOf(e.binLeft))
+  if lm >= 0 { return nodeTyIxOf(ix) == lm }
+  // An operand typed by a hole this instance pins has no map row here: the default's own
+  // non-null map type is the result's.
+  const dt = nodeTyIxOf(e.binRight)
+  mapTyPeel(dt) >= 0 && !tyBearsNull(dt)
+}
+
 // `ty` when it is a map, or a nullable map's inner map; -1 otherwise.
 function mapTyPeel(ty: i32): i32 {
   if ty < 0 { return -1 }
@@ -43656,6 +43682,10 @@ export function exprMap(exprIx: i32, fnIx: i32) {
       const mar = asgReadNode(exprIx, fnIx)
       if mar != exprIx { return exprMap(mar, fnIx) }
     }
+    // A nullable map with a map default is the non-null map (D3257).
+    if e.binOp.length == 2 && coalesceOfNulMapIsMap(e, exprIx, fnIx) {
+      return true
+    }
   }
   if e is AsExpr {
     if asUnionMapTy(exprIx, fnIx, false) >= 0 { return true }
@@ -44219,6 +44249,11 @@ export function mapShapeOfExpr(exprIx: i32, fnIx: i32) {
     if e.binOp == "=" {
       const msr = asgReadNode(exprIx, fnIx)
       if msr != exprIx { return mapShapeOfExpr(msr, fnIx) }
+    }
+    if e.binOp.length == 2 && coalesceOfNulMapIsMap(e, exprIx, fnIx) {
+      const cls = mapShapeOfExpr(e.binLeft, fnIx)
+      if cls != -3 { return cls }
+      return mapShapeOfTyPeeled(nodeTyIxOf(e.binLeft))
     }
   }
   // A value `if`: the shape of the arm its join's rep is read off, as `ifExprRefSlot` does.

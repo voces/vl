@@ -94,7 +94,7 @@ import {
   mkBinary,
   mkBlock,
   mkBool,
-  mkBreak,
+  mkBreakVal,
   mkCall,
   mkCallN,
   mkChar,
@@ -1459,6 +1459,10 @@ function parsePrimary() {
     // a literal.)
     return parseArrayLit()
   }
+  // A loop in value position carries the value its `break`s exit with; a labelled one is
+  // taken by `parsePostfix`, where its name is already an identifier (`labelledValueAt`).
+  if k == "WHILE" { return parseWhile("") }
+  if k == "FOR" { return parseFor("") }
   if k == "ELLIPSIS" {
     // The token is legal in two positions and `parseSpreadable` has already taken it in
     // both, so reaching here means neither — say where it may appear rather than leaving
@@ -1613,15 +1617,17 @@ function parseOneArg(args: i32[], names: string[]) {
     names.push("")
   }
   // `f(B: { stmts })`: a named argument's value cannot be a block, so this is a labelled block
-  // written as an argument. Refused by name, and parsed as that block to recover.
+  // written bare. Refused with the spelling that reads it as one, and parsed as that.
   if named && peekKind() == "LBRACE" && labelBraceOpensStmt(P.pos) {
     const bl = names.pop() ?? ""
     names.push("")
     P.diags.push(
       {
-        msg: "a labelled block is a statement, not an argument: `"
+        msg: "a labelled block as an argument needs parentheses: `f(("
           + bl
-          + ": { … }` carries no value (block values are not supported yet)",
+          + ": { … }))`, since `f("
+          + bl
+          + ": …)` names an argument",
         at: P.pos,
       },
     )
@@ -1960,6 +1966,9 @@ function parsePostfix() {
       // Hence the look-before-consume, and hence NEWLINE only — a `;` ends the statement.
       const j = chainDotAfterNewlines()
       if j < 0 { going = false } else { P.pos = j }
+    } else if k == "COLON" {
+      const lv = labelledValueAt(node, p0)
+      if lv < 0 { going = false } else { node = lv }
     } else {
       going = false
     }
@@ -1999,6 +2008,21 @@ function parsePostfix() {
     }
   }
   node
+}
+
+// A labelled loop or block in value position, `name: while …`, `name: for …` or `name: { … }`,
+// whose name `parsePrimary` read as the identifier `node` with the `:` next; -1 for anything else.
+// Taken here rather than in `parsePrimary`, so an ordinary identifier pays no lookahead.
+function labelledValueAt(node: i32, p0: i32): i32 {
+  const n = P.nodes[node]
+  if !(n is Ident) || P.pos < 1 || kindAt(P.pos - 1) != "IDENT" { return -1 }
+  const lk = kindAt(P.pos + 1)
+  if lk != "WHILE" && lk != "FOR" && lk != "LBRACE" { return -1 }
+  const label = P.toks[P.pos - 1].text
+  advance() // COLON
+  if lk == "WHILE" { return parseWhile(label) }
+  if lk == "FOR" { return parseFor(label) }
+  parseLabelBlock(label, p0)
 }
 
 // Prefix `!` / `-`, else fall through to postfix, then an optional trailing type
@@ -3445,7 +3469,11 @@ function oneStmtBlock(): i32 {
   const btSaved = btNames.length
   btDepth = btDepth + 1
   const one: i32[] = []
-  one.push(parseStmt())
+  const oneSink = brkValSink
+  brkValSink = one
+  const ps = parseStmt()
+  brkValSink = oneSink
+  one.push(ps)
   btDepth = btDepth - 1
   btTrimTo(btSaved)
   mkBlock(one, -1)
@@ -3925,6 +3953,10 @@ function lblKindOf(name: string): i32 {
   -1
 }
 
+// The statement list being parsed. A `break v` stands in it as its value's statement followed
+// by the break, so the value is pushed here as the break is parsed, ahead of the break itself.
+let brkValSink: i32[] = []
+
 // Whether the token at `i` ends a statement, so no operand of `break`/`continue` follows.
 function stmtEndAt(i: i32): boolean {
   const k = kindAt(i)
@@ -4006,9 +4038,10 @@ function parseFor(label: string) {
   fiix
 }
 
-// `"break" [":" label]` — leaves the labelled loop or block, else the innermost loop. A value
-// after it (`break v`, `break :B v`) is refused as not yet supported, and an enclosing label
-// written without the colon is the old spelling, refused with its fix.
+// `"break" [":" label] [value]` — leaves the labelled loop or block, else the innermost loop,
+// with the value when one follows on the same line. The value goes onto `brkValSink`, the
+// statement list being parsed, ahead of the break. An enclosing label written without the colon
+// is the old spelling, refused with its fix rather than read as a value.
 function parseBreak() {
   const p0 = peekTok().start // the `break` keyword
   const kw = advance()       // "break"
@@ -4040,18 +4073,13 @@ function parseBreak() {
       )
     }
   }
-  // The value is parsed so the statement recovers as written, and dropped with the refusal.
+  let hasVal = 0
   if !stmtEndAt(P.pos) {
-    const valAt = P.pos
-    parseExpr()
-    P.diags.push(
-      {
-        msg: "break values are not supported yet: a loop or labelled block does not carry a value",
-        at: valAt,
-      },
-    )
+    const bv = parseExpr()
+    brkValSink.push(bv)
+    hasVal = 1
   }
-  mkBreak(kw.text, label, p0)
+  mkBreakVal(kw.text, label, p0, hasVal)
 }
 
 // `"continue" [":" label]` — continues the labelled loop, else the innermost one. A labelled
@@ -4133,7 +4161,20 @@ function parseJumpLabel(kw: string): string {
   if kw == "break" && peekKind() == "IDENT" && stmtEndAt(P.pos + 1) {
     const nm = peekTok().text
     if lblKindOf(nm) >= 0 {
-      P.diags.push({ msg: "labels are written `break :" + nm + "`", at: P.pos })
+      P.diags.push(
+        {
+          msg: "labels are written `break :"
+            + nm
+            + "`; `break "
+            + nm
+            + "` would break with the value of `"
+            + nm
+            + "`, so write `break ("
+            + nm
+            + ")` for that",
+          at: P.pos,
+        },
+      )
       advance()
       return nm
     }
@@ -4167,6 +4208,8 @@ function parseBlock() {
   const brSavedB = brDepth
   brDepth = 0
   const stmts: i32[] = []
+  const blkSink = brkValSink
+  brkValSink = stmts
   let going = true
   while going {
     const k = peekKind()
@@ -4174,6 +4217,7 @@ function parseBlock() {
     else if k == "NEWLINE" || k == "SEMI" { advance() }
     else { stmts.push(parseStmt()) }
   }
+  brkValSink = blkSink
   brDepth = brSavedB
   expectClose("RBRACE")
   btDepth = btDepth - 1
@@ -4729,9 +4773,10 @@ export function parseProgram() {
   // (malformed) parse would otherwise leave it raised and make every later
   // statement break newline-terminate at a leading operator.
   brDepth = 0
-  // The label stack is per program too.
+  // The label stack and the `break` value sink are per program too.
   lblNames = []
   lblIsBlk = []
+  brkValSink = []
   // D1045: the block-scope machinery is per program. A mint counter only has to
   // be unique within its module — the merge renames each module's top-level
   // declarations, these included, apart — and a leaked scope row from an earlier
@@ -4748,6 +4793,7 @@ export function parseProgram() {
   kwBoundNames = []
   const p0 = peekTok().start // the first token of the source
   const stmts: i32[] = []
+  brkValSink = stmts
   let going = true
   while going {
     const k = peekKind()
