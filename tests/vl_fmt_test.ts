@@ -3287,7 +3287,7 @@ Deno.test({
 // D1998 — A LABELLED LOOP OPENING A BLOCK ROUND-TRIPS, AND A MULTI-LINE `if`-EXPRESSION ARM
 // KEEPS ITS STATEMENTS.
 //
-// The parser now reads `{ B: while … }` as a block, so `vl fmt` must reproduce it byte for byte.
+// A labelled loop `@B while …` first in a block is a block, so `vl fmt` must reproduce it byte for byte.
 // An `if` expression whose arms are not one simple expression each used to go through the
 // whitespace-collapsing slice (joining an arm's statements onto one line, which re-parsed
 // `const t = 4` / `[t][0]` as an index), and an `else if` arm rendered only its FIRST
@@ -3303,9 +3303,9 @@ Deno.test({
       "  if c {",
       "    n = 1",
       "  } else {",
-      "    B: while true {",
+      "    @B while true {",
       "      n = 2",
-      "      break :B",
+      "      break @B",
       "    }",
       "  }",
       "  n",
@@ -3470,6 +3470,60 @@ Deno.test({
       },
     ];
     const dir = await Deno.makeTempDir({ prefix: "vl_fmt_d1998_" });
+    try {
+      for (const c of cases) {
+        const r = await run([], c.src);
+        if (r.code !== 0 || r.out !== c.want) {
+          throw new Error(`want:\n${c.want}\n---\ngot (rc ${r.code}):\n${r.out}${r.err}`);
+        }
+        const again = await run([], r.out);
+        if (again.code !== 0 || again.out !== r.out) {
+          throw new Error(`not idempotent (rc ${again.code}):\n${again.out}`);
+        }
+        const file = `${dir}/main.vl`;
+        await Deno.writeTextFile(file, r.out);
+        const ran = await runOn("run", file);
+        if (ran.code !== 0 || ran.out !== c.prints) {
+          throw new Error(`formatted output ran wrong (rc ${ran.code}): want ${JSON.stringify(c.prints)}, got ${JSON.stringify(ran.out)}\n${ran.err}`);
+        }
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
+
+// D3374 — A LABEL IS `@name`, AND AN OBJECT-LITERAL ARM PRINTS AS THE OBJECT.
+//
+// `vl fmt` spells a label `@B` at the declaration and the jump, and an `if`/`else` branch or a
+// `match` arm whose braces are an object literal prints as that object, with no second pair of
+// braces: the parser reads `{ name: … }` there as the object since the `@` ruling. Each output
+// must be a fixed point and must still run the same.
+Deno.test({
+  name: "vl-fmt: labels print as `@B`, and an object arm prints as the object (D3374)",
+  ignore: !ENABLED,
+  fn: async () => {
+    const cases: { src: string; want: string; prints: string }[] = [
+      {
+        src: "@outer  while true {\nfor x in [1, 0] { if x == 0 { break  @outer } }\n}\n" +
+          "const v = @B { if 2 > 1 { break @B 3 }\n 4 }\n@L for i in 0 until 2 { continue  @L }\nprint(v)\n",
+        want: "@outer while true {\n  for x in [1, 0] {\n    if x == 0 { break @outer }\n  }\n}\n" +
+          "const v = @B {\n  if 2 > 1 { break @B 3 }\n  4\n}\n@L for i in 0 until 2 { continue @L }\nprint(v)\n",
+        prints: "3\n",
+      },
+      {
+        src: "function g(c: boolean) { if c { a: 1 } else { a: 2 } }\n" +
+          "const m = (k: i32) => match k { 1 => { a: 7 }, _ => { a: 8 } }\n" +
+          "const p = if 2 > 1 { x: 1, y: 2 } else { x: 3, y: 4 }\n" +
+          "print(g(false).a + m(1).a + p.y)\n",
+        want: "function g(c: boolean) {\n  if c { a: 1 } else { a: 2 }\n}\n" +
+          "const m = (k: i32) => match k {\n  1 => { a: 7 }\n  _ => { a: 8 }\n}\n" +
+          "const p = if 2 > 1 { x: 1, y: 2 } else { x: 3, y: 4 }\n" +
+          "print(g(false).a + m(1).a + p.y)\n",
+        prints: "11\n",
+      },
+    ];
+    const dir = await Deno.makeTempDir({ prefix: "vl_fmt_label_" });
     try {
       for (const c of cases) {
         const r = await run([], c.src);

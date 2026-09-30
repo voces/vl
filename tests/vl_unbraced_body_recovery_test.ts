@@ -134,7 +134,7 @@ const ONE: OneCase[] = [
   },
   {
     name: "labelled-while",
-    src: "let i = 0\nouter: while i < 3 i = i + 1\nprint(i)\n",
+    src: "let i = 0\n@outer while i < 3 i = i + 1\nprint(i)\n",
     message: "a `while` body requires braces: `while cond { … }`",
     line: 2,
     col: 20,
