@@ -940,6 +940,10 @@ const OP_CALL_GUARDED_PIN = "?()"
 let coalHoleTy: i32[] = []
 let coalHoleFn: i32[] = []
 
+// D3252 — per `??` node whose default is a hole that fit its left's face vacuously, the
+// derived hole (`HD_COALD`) a destination's deferred constraint records in its place; -1 else.
+let coalDefHole: i32[] = []
+
 // D1005 — deferred UFCS-receiver constraints, the receiver's half of what `memCstrTy` asks.
 // `ufcsCallTy` gates dispatch on `assignable(recvTy, params[0])`, true for a `TyVar` on either
 // side, so a generic body selects by name alone. `ufcsCstrP0` banks the selected function's
@@ -5052,6 +5056,7 @@ export function initChecker() {
   memCstrFn = []
   memCstrDem = []
   coalHoleTy = []
+  coalDefHole = []
   coalHoleFn = []
   ufcsCstrTy = []
   ufcsCstrProp = []
@@ -20276,7 +20281,7 @@ function noteLitElemCstrs(srcExpr: i32, dstTy: i32, depth: i32) {
     }
     return 0
   }
-  const vt = nodeTyIxOf(srcExpr)
+  const vt = coalPinTy(srcExpr, nodeTyIxOf(srcExpr))
   if tyHasHole(vt) { noteLetCstr(vt, dtix, srcExpr, "") }
   0
 }
@@ -34607,7 +34612,7 @@ function recAdMergeRefuse(
   let them = "it"
   if elem {
     what = "the records in `" + n.letName + "` are"
-    src = "e"
+    src = "r"
     them = "each record"
   }
   let copy = "{ "
@@ -34616,6 +34621,17 @@ function recAdMergeRefuse(
     if i > 0 { copy = copy + ", " }
     copy = copy + sd.objFieldNames[i] + ": " + src + "." + sd.objFieldNames[i]
     i = i + 1
+  }
+  copy = copy + " }"
+  let fix = " there with an object literal, `" + copy + "`"
+  if elem {
+    fix = " there, `"
+      + n.letName
+      + ".map((r): "
+      + tyToStr(dst)
+      + " => "
+      + copy
+      + ")`"
   }
   recAdErrMsg.push(
     what
@@ -34635,9 +34651,7 @@ function recAdMergeRefuse(
       + them
       + " cannot also keep its own type. Copy "
       + them
-      + " there with an object literal, `"
-      + copy
-      + " }`",
+      + fix,
   )
   recAdErrAt.push(decl)
   0
@@ -37330,6 +37344,27 @@ function noteBinCstr(lt: i32, op: string, rt: i32) {
   0
 }
 
+// The type a destination's deferred constraint records for source `ix` typed `ty`: a `??` whose
+// default is a hole types as its left's face in the body, and the pin re-asks it as the concrete
+// `??` types it (`HD_COALD`), so a default the face does not hold is refused there (D3252).
+function coalPinTy(ix: i32, ty: i32): i32 {
+  if coalDefHole.length == 0 || ix < 0 || ty < 0 { return ty }
+  const p = parenPeelIx(ix)
+  if p < 0 || p >= coalDefHole.length { return ty }
+  const d = coalDefHole[p]
+  if d < 0 || !hdKindIs(d, HD_COALD) || tyHasHole(ty) { return ty }
+  d
+}
+
+// Mark the `??` at `ix` as one whose hole default `rt` fit its left's face `face` vacuously.
+function coalDefNote(ix: i32, face: i32, rt: i32) {
+  const d = mkDerivedHole(HD_COALD, "", face, -1, rt)
+  if d < 0 { return 0 }
+  while coalDefHole.length <= ix { coalDefHole.push(-1) }
+  coalDefHole[ix] = d
+  0
+}
+
 // Records a deferred return-type constraint when either side carries a hole — the body
 // cannot decide it then. The generic call site re-asks it under substitution, stamped with
 // the owning declaration for the same reason `noteBinCstr` is: an unowned list would let
@@ -39285,8 +39320,9 @@ function compArgCstrOk(at: i32, exp: i32): boolean {
   tyHasHole(at) && !tyHasHole(exp)
 }
 
-// A composite argument demand at the pin: still open, it moves out to the caller that pins it;
-// closed, its node is asked the direct call's question under the pin's bindings.
+// A composite argument demand at the pin that closes it: its node is asked the direct call's
+// question under the pin's bindings. One still open is left, not moved out to every caller,
+// so a generic chain pays for it once per pin rather than once per hop.
 function validateCompArgCstr(
   ci: i32,
   rat: i32,
@@ -39294,15 +39330,8 @@ function validateCompArgCstr(
   bNames: string[],
   bTys: i32[],
   ix: i32,
-  calleeFn: i32,
 ) {
-  if tyHasHole(rexp) { return 0 }
-  if tyHasHole(rat) {
-    if rat != argCstrAt[ci] && calleeFn >= 0 {
-      noteArgCstr(rat, rexp, argCstrWho[ci], ACF_COMP, argCstrNode[ci])
-    }
-    return 0
-  }
+  if tyHasHole(rexp) || tyHasHole(rat) { return 0 }
   const savedQuiet = inferQuiet
   inferQuiet = true
   const ok = litPinAssignable(argCstrNode[ci], rat, rexp, bNames, bTys)
@@ -39383,7 +39412,7 @@ function validateArgCstrs(
     const rat = substTyDeep(argCstrAt[ci], bNames, bTys)
     const rexp = substTyDeep(argCstrExp[ci], bNames, bTys)
     if argCstrForm[ci] == ACF_COMP {
-      validateCompArgCstr(ci, rat, rexp, bNames, bTys, ix, calleeFn)
+      validateCompArgCstr(ci, rat, rexp, bNames, bTys, ix)
       ci = ci + 1
       continue
     }
@@ -44958,7 +44987,8 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
     // recorded here and re-validated at the generic call site that pins it under the
     // substituted argument types — without this, `function f(x) { g(x) }` with `g(n: i32)`
     // type-checks `f("s")` clean and dies at wasm validation. Recorded on the argument's uncollapsed type, since a join's collapsed arm can later prove unreachable.
-    const atCstr = inferRetTyOf(args[i], at)
+    let atCstr = inferRetTyOf(args[i], at)
+    if coalDefHole.length > 0 { atCstr = coalPinTy(args[i], atCstr) }
     if (
       tyIsHole(atCstr)
       || tyIsDeferredJoin(atCstr)
@@ -45978,7 +46008,7 @@ function checkTailArmsAgainst(ix: i32, ret: i32) {
             ret,
           )
         } else {
-          noteRetCstr(lt, ret, lf)
+          noteRetCstr(coalPinTy(lf, lt), ret, lf)
         }
       }
     }
@@ -48312,7 +48342,7 @@ function checkFuncDeclNodeReal(n: FuncDecl, fnIx: i32) {
                   // explicit `return`'s is — so the implicit return records the same pair for
                   // the pin to re-ask under substitution. Without it a generic's TAIL
                   // expression loses the refusal its `return` spelling makes (D1739).
-                  noteRetCstr(stTy, ret, stmts[s])
+                  noteRetCstr(coalPinTy(stmts[s], stTy), ret, stmts[s])
                 }
               }
             } else if P.nodes[stmts[s]] is IfStmt {
@@ -58318,7 +58348,7 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
     } else {
       // The same vacuous-gate check covers three write spellings (`r = e`, `b.v = e`,
       // `xs[0] = e`) — records the pair for the pin using `asgLt`, the storage type actually asked.
-      noteLetCstr(rt, asgLt, n.binRight, "")
+      noteLetCstr(coalPinTy(n.binRight, rt), asgLt, n.binRight, "")
       // And the slots of a literal source too: an array literal whose element join dropped a
       // hole reaches this gate hole-free, so the slots (not the pair) are the real question.
       if !tyHasHole(rt) {
@@ -58444,14 +58474,7 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
           }
         }
       }
-      // A hole default fits vacuously here, so the answer waits for the pin (`HD_COALD`).
-      if tyIsHole(rt) && !tyIsHole(innerFull) {
-        const cdd = mkDerivedHole(HD_COALD, "", innerFull, -1, rt)
-        if cdd >= 0 {
-          noteCoalResultHole(cdd)
-          return cdd
-        }
-      }
+      if tyIsHole(rt) && !tyIsHole(innerFull) { coalDefNote(ix, innerFull, rt) }
       // When the default fits the non-null LHS type (with contextual coercion), the `??` result
       // IS that LHS type, not `joinTys`' LUB — which would widen a litunion field to `string`.
       if assignableExpr(n.binRight, rt, innerFull) { return innerFull }
@@ -59302,7 +59325,7 @@ function checkLetDeclNodeIn(n: LetDecl, ix: i32) {
       } else if !neverAnnot {
         // The check above is vacuous whenever a side is a hole — record the pair for the pin to
         // re-ask under substitution, only on the PASSING side (a failing one already reported, D572).
-        noteLetCstr(initTy, annot, n.letInit, n.letName)
+        noteLetCstr(coalPinTy(n.letInit, initTy), annot, n.letInit, n.letName)
         // And the slots of a literal source too, but only when the pair above carried no hole —
         // that is exactly when the literal's own element join dropped one, so nothing is recorded.
         if !tyHasHole(initTy) {
@@ -67279,7 +67302,7 @@ function checkRetStmtNode(n: RetStmt, ix: i32) {
   } else if want >= 0 {
     // The check above is vacuous whenever a side is a hole — record the pair for the pin to
     // re-ask under substitution, only on the passing side (D551 body / D561 declared side).
-    noteRetCstr(got, want, n.retArg)
+    noteRetCstr(coalPinTy(n.retArg, got), want, n.retArg)
   }
   return TY_VOID
 }
