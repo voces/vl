@@ -14044,6 +14044,9 @@ function markNumLitBinding(name: string, depth: i32, decl: i32) {
 const LBI_UP = 0
 const LBI_LO = 1
 const LBI_EDGE = 3
+// A candidate read inside an integer intrinsic's operand flows into the store's target, which
+// does not flow back: the operand chooses nothing (D3343).
+const LBI_EDGE_FWD = 2
 // And vetoes, which choose nothing and keep the default when the choice breaks one: a float
 // literal operand (not `i64`), a bitwise or shift operand (an integer), `==` an integer (not `f32`).
 const LBI_FLOAT = 4
@@ -14774,9 +14777,13 @@ function lbiNoteStore(tc: i32, src: i32) {
   const tys: i32[] = []
   const froms: i32[] = []
   lbiLeaves(src, cands, tys, froms)
-  lbiIntrCands(src, cands, 0)
   for c in cands {
     if c != tc && lbiAnn[c] < 0 { lbiPush(tc, LBI_EDGE, c, src) }
+  }
+  const intr: i32[] = []
+  lbiIntrCands(src, intr, 0)
+  for c in intr {
+    if c != tc && lbiAnn[c] < 0 { lbiPush(tc, LBI_EDGE_FWD, c, src) }
   }
   // An integer literal in the stored tree (`y += 3000000000`) bounds it as a stored literal does.
   const leaves: i32[] = []
@@ -14794,7 +14801,7 @@ function lbiNoteStore(tc: i32, src: i32) {
 }
 
 // Push onto `cands` the candidates read by the operands of every integer intrinsic in the tree
-// `ix` whose result is its operands' width (`divU(b, 3)`), as a store of `b * 3` would.
+// `ix` whose result is its operands' width (`divU(b, 3)`): each bounds the store's target.
 function lbiIntrCands(ix: i32, cands: i32[], depth: i32) {
   if depth > LBI_TREE_DEPTH { return 0 }
   const leaves: i32[] = []
@@ -15212,9 +15219,10 @@ function lbiSolve() {
   let r = 0
   while r < lbiRowCand.length {
     rowsOf[lbiRowCand[r]].push(r)
-    if lbiKind[r] == LBI_EDGE {
+    if lbiEdgeKind(lbiKind[r]) {
       lbiEdges = lbiEdges + 1
-      // The source's type bounds the target's from below, and the target's the source's above.
+      // The source's type bounds the target's from below, and the target's the source's above
+      // unless the edge is forward-only; either way the source's move re-solves the target.
       rowsOf[lbiTy[r]].push(-r - 1)
     }
     r = r + 1
@@ -15259,7 +15267,7 @@ function lbiRowOrder(): i32[] {
       seen[a] = true
       out.push(a)
     }
-    if lbiKind[r] == LBI_EDGE {
+    if lbiEdgeKind(lbiKind[r]) {
       const b = lbiTy[r]
       if !seen[b] {
         seen[b] = true
@@ -15302,7 +15310,7 @@ function lbiSettleEdges(
       chosen[c] = t
       for r0 in rowsOf[c] {
         let o = -1
-        if r0 >= 0 && lbiKind[r0] == LBI_EDGE { o = lbiTy[r0] }
+        if r0 >= 0 && lbiEdgeKind(lbiKind[r0]) { o = lbiTy[r0] }
         if r0 < 0 { o = lbiRowCand[-r0 - 1] }
         if o >= 0 && o < nc && !queued[o] && lbiAnn[o] < 0 {
           queued[o] = true
@@ -15364,11 +15372,11 @@ function lbiSolveOne(
     if r >= 0 {
       k = lbiKind[r]
       u = lbiTy[r]
-      if k == LBI_EDGE {
+      if k == LBI_EDGE || k == LBI_EDGE_FWD {
         k = LBI_LO
         u = lbiChosenOf(chosen, lbiTy[r])
       }
-    } else if !fwd {
+    } else if !fwd && lbiKind[-r0 - 1] == LBI_EDGE {
       r = -r0 - 1
       k = LBI_UP
       u = lbiChosenOf(chosen, lbiRowCand[r])
@@ -15407,6 +15415,9 @@ function lbiSolveOne(
   }
   t
 }
+
+// Is row kind `k` a store of one candidate into another?
+function lbiEdgeKind(k: i32): boolean { k == LBI_EDGE || k == LBI_EDGE_FWD }
 
 // Is `t` an integer type?
 function lbiIntTy(t: i32): boolean { t == TY_I32 || t == TY_I64 }
@@ -15527,7 +15538,7 @@ function lbiDropUnobservable() {
   let r = 0
   while r < lbiRowCand.length {
     const k = lbiKind[r]
-    if k == LBI_LO || k == LBI_EDGE || k == LBI_FLOAT {
+    if k == LBI_LO || k == LBI_EDGE || k == LBI_EDGE_FWD || k == LBI_FLOAT {
       loud[lbiRowCand[r]] = true
     } else if k == LBI_LIT && (lbiTy[r] & LBI_FIT_SAME) == 0 {
       loud[lbiRowCand[r]] = true
