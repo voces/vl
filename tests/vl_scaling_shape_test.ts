@@ -284,13 +284,15 @@ const writeModules = (dir: string, mods: number, per: number, body: number): str
 };
 
 // D2914's pair: `nl` un-annotated lists of object literals, each adopted `per` times by a
-// declared record list, beside an annotated record of the same field names, so every list is
-// built at the destination's record and its uses are checked.
+// declared record list, beside an annotated record of the same field names, so every list takes
+// the destination's record as its type (D3339) and its reads are checked at it.
 const genAdoptedLists = (nl: number, per: number): string => {
   const o = ["const i: { f: i32 } = { f: 4 }", "type I = { f: i64 | null }"];
   for (let k = 0; k < nl; k++) {
     o.push(`const il${k} = [{ f: ${k % 13} }]`);
-    for (let j = 0; j < per; j++) o.push(`const ic${k}_${j}: I[] = il${k}`, `print(il${k}[0].f + ${j % 7})`);
+    for (let j = 0; j < per; j++) {
+      o.push(`const ic${k}_${j}: I[] = il${k}`, `print((il${k}[0].f ?? 0) + ${j % 7})`);
+    }
   }
   o.push("print(i.f)");
   return o.join("\n") + "\n";
@@ -302,7 +304,7 @@ const genAdoptedListsFn = (nf: number): string => {
   const o = ["const i: { f: i32 } = { f: 4 }", "type I = { f: i64 | null }"];
   for (let k = 0; k < nf; k++) {
     o.push(`function h${k}(): i32 {`, `  const il = [{ f: ${k % 13} }]`, "  const ic: I[] = il");
-    o.push("  il[0].f + ic.length", "}");
+    o.push("  if (il[0].f ?? 0) > 5 { ic.length + 1 } else { ic.length }", "}");
   }
   o.push("let acc = 0");
   for (let k = 0; k < nf; k++) o.push(`acc = acc + h${k}()`);
