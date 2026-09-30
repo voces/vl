@@ -1225,6 +1225,27 @@ axis(
   (d) => twoFiles(d, genGenericChain(60, false), genGenericChain(15, false)),
 );
 
+// D3253's GROWTH pair: a caller-first generic chain whose every body also hands `[x]` to a
+// concrete list parameter, at depth 160 against 40, so linear reads 4. A composite argument's
+// demand re-noted to every caller up the chain read 82 here; resolved once at its pin it reads
+// 7.42, the same as master's 7.41 without the demand, so the bar is 1.25x that.
+const genCompArgChain = (depth: number): string => {
+  const o = ["function h(a: f64[]) { return a.length }"];
+  for (let i = 0; i < depth; i++) {
+    const next = i + 1 < depth ? `g${i + 1}(x) + ` : "";
+    o.push(`function g${i}<T>(x: T): i32 { return ${next}h([x]) }`);
+  }
+  o.push("print(g0(1.5))");
+  return o.join("\n") + "\n";
+};
+
+axis(
+  "generic chain with list-literal arguments",
+  9.3,
+  "A composite argument's demand (`ACF_COMP`, compiler/typecheck.vl) is being moved out to every caller instead of resolved at its pin.",
+  (d) => twoFiles(d, genCompArgChain(160), genCompArgChain(40)),
+);
+
 // D3246's GROWTH pair: a chain of `n` literal bindings, each stored into the next, the first from
 // an `i64`, at 400 against 100, so linear reads 4 and quadratic 16. Every link takes `i64` from
 // the one before it, so the solve must carry the answer down the whole chain. Fuel reads 3.97,
