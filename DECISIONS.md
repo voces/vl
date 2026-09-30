@@ -8965,9 +8965,9 @@ typed at each use. A use whose destination cannot hold the exact value is a chec
 `const` is its literal at every read). A tree that reads a variable, calls a function, or names a
 `let` is untouched, and so is an annotated `const` except as below.
 
-**Where it applies.** A read of a literal `const` is already the literal written there, so a tree
-of literals written in place is the same program as a `const` holding it. The fold therefore runs
-on every such tree wherever it stands — a `const` initialiser, an argument, a shift count, a
+**Where it applies (owner, 2026-09-30).** A read of a literal `const` is already the literal
+written there, so a tree of literals written in place is the same program as a `const` holding
+it; the owner confirmed that scope. The fold runs on every such tree wherever it stands — a `const` initialiser, an argument, a shift count, a
 generic body, a join — and on nothing else. So `x << (16 + 16)` is `x << 32` (refused, D2725),
 `1 << K` is `1 << 40` (D2724), `[x, -(-0x80000000)]` holds 2^31 beside an `i64` (D3054),
 `(-(-(-0xFFFFFFFF))) as% i64` is `-4294967295` like the single negation (D3053), and
@@ -9041,8 +9041,8 @@ tree read stays an editor reference.
 * A `u8` element takes a constant as it takes the literal (past 255 refused, a negative one
   stored truncated), since ruling C makes a constant its literal; whether a negative literal
   should refuse there is D3428's open question.
-* An annotated `const` is a typed constant: its annotation is the tree's destination, so
-  `const x: i32 = 2147483647 + 1` is refused rather than wrapped.
+* An annotated `const` is a typed constant (owner, 2026-09-30): its annotation is the tree's
+  destination, so `const x: i32 = 2147483647 + 1` is refused rather than wrapped.
 * An integer literal past the `i64` range is refused wherever no float holds it exactly
   (D3425), where it used to keep its low 64 bits; a constant past it (`1 << 64`) is refused at
   the use, not where it is declared, so `(1 << 70) >> 60` is 1024.
@@ -9052,7 +9052,11 @@ tree read stays an editor reference.
 
 **Programs whose behaviour changed.** Every one computed a constant that wrapped, or a float
 constant rounded step by step, and now has the exact value or a loud refusal, or did arithmetic
-on a two-reading pattern and is now refused. The exact-constant grid
+on a two-reading pattern and is now refused. One more kind is not a wrap: an operation over
+float literals under an `f32` operation (`y * (0.5 * 3.0 + y)`), which #3324 read as an `f64`
+widening the operation above it, is now its constant, an `f32` literal beside `y`, so the
+operation stays at `f32` (`tests/cases/arith/float-literal-operation-nested-f32.vl`). The
+exact-constant grid
 (`scripts/capability-probes/const-exact-grid.py`, 33 initialisers x 15 uses x 2 spellings =
 990 cells, expected values from Python's exact integers and fractions) grades 990 of 990 as the
 rule says; against master `afb0ecc08`, 208 cells moved from a wrapped or step-rounded value (99
