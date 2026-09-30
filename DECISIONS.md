@@ -9084,25 +9084,32 @@ judged by its type (D3341).
 stores a field differently takes that record as its type: the destination is written as its
 annotation and the program is checked again, the literal-binding re-check of D3246. Every later
 use then sees the destination type, which is what makes D2933's element delivery run, and two
-demands that store differently are refused naming both lines. Three limits keep every program
-that ran with the values it printed:
+demands that store differently are refused naming both lines. Adoption is all or nothing per
+binding, and it has these limits:
 
-* **No adoption across a numeric width or kind** (`i32` into `i64` or `f64`, at any depth), a
-  coordinator decision parked on [D3339](docs/internals/inventory/D3339.md): adopting would
-  change what the binding's reads compute (`e.f + 1` over `2147483647`, `c.f / 3`). The delivery
-  keeps master's behaviour; D2909, D2914, D2917, D2922, D2924, D2925, D2994, D2995 and D3200 stay
-  where master had them.
+* **Across a numeric width or kind the binding adopts fully** (owner ruling D3339 (A),
+  2026-09-30): `const q = { v: 1 }` delivered as `{ v: f64 }` is that type at every read, before
+  the delivery and after it, so `q.v / 3` prints `0.3333333333333333` exactly as
+  `const q: D = { v: 1 }` does. It is the literal-binding rule (B′) one level down: a literal
+  takes its type from its deliveries. A delivery the literal's own type refuses outright
+  (`i32` into `f32`) adopts too (`recAdForce`). The re-check is never undone for such a binding:
+  a read that needs the old width (`const n: i32 = q.v`) is refused, as the annotated twin's is,
+  and the refusal names the adoption. The first attempt served such reads at the literal's own
+  type one read at a time, and that leaked through lambdas, loops and identity calls and changed
+  the values running programs printed. A destination that drops a nested field is a shape the
+  literal cannot be written at, so that delivery keeps its own-type build.
 * **No adoption of a function's result.** The first candidate wrote the destination as a
   function's declared result, and an annotated function whose literal is built at a declared
   record of its own fields is invalid wasm where the un-annotated call ran (D3342). A function's
   call stays master's delivery.
-* **The re-check is undone** when it refuses anything but the adopted binding handed on whole.
+* **The re-check is undone** when it refuses anything but the adopted binding handed on whole,
+  for an adoption that changes no number's width or kind.
 
 Where master built invalid wasm for a delivery the checker neither adopts nor refuses as
-existing, it refuses instead, with the existing-record wording: a record a function built (or an
-element of a list binding) into a bare `f32`/`f64` field it holds as an integer, which has no
-conversion (`recFloatBuiltElsewhere`); a literal built inside a function or through a generic
-identity call where a declared record of its own fields exists, which builds it at that row
+existing, it refuses instead, with the existing-record wording: a record a function built into a
+bare `f32`/`f64` field it holds as an integer, which has no conversion (`recFloatBuiltElsewhere`);
+a literal built inside a function or through a generic identity call where a record of its own
+fields is declared, by a `type` or inline in an annotation (D3430), which builds it at that row
 (`recBuiltAtDeclared`, D3338 — a method or generic argument declines, since `Map.set` of the same
 call runs on master, D3349-D3351); and one binding or function a kept delivery builds at another
 storage and that is handed on whole at its own type, or delivered at two storages
@@ -9117,6 +9124,15 @@ cells stay invalid or emit-refused as on master (D3339, D3349-D3351). A 540-cell
 print master's values, and all 220 invalid or refused ones are now check refusals. The 936-cell
 position grid and the 88-cell adoption grid show 0 value changes and no new silent cell.
 plumb's 508 files check identically.
+
+**Measured for the D3339 ruling, against master `d0789e90a`.** The oracle is the annotated twin.
+A 1,920-cell grid (five field pairs, three literal shapes, eight readers, eight delivery
+positions, reads before and after the delivery) and a 324-cell grid of second demands both
+agree with their twins everywhere except nine cells of D3340's container refusal, identical on
+master. 572 running cells print a new value, each equal to its twin's. 73 running cells are now
+refused, each as its twin is: a read that needs the literal's own width after the adoption
+(`const n: i32 = q.v`, an interpolated `f64 | null` field). The distilled corpus loses no runs
+and 26 classes (3,795 census cells) move from a check refusal to runs.
 
 ## A function value at another function type is adapted where it is delivered (2026-09-30) — D3073, D3112
 

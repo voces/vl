@@ -17771,11 +17771,10 @@ function tErrPush(
   }
   numLitNoteQueue(msg, at, T.diags.length)
   if recAdOrigDecl.length > 0 && !recAdRaising {
-    if recAdWholeErr(at) {
+    if recAdWholeErr(at) || recAdMentions(at, 6) {
       msg = msg + recAdNoteFor(at)
-    } else {
-      recAdLoose = recAdLoose + 1
     }
+    if !recAdWholeErr(at) { recAdLoose = recAdLoose + 1 }
   }
   T.diags.push(
     {
@@ -21021,6 +21020,9 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
         recOwnPend(srcExpr, srcTy)
       }
     }
+    return true
+  }
+  if !inferQuiet && srcExpr >= 0 && recAdForce(srcExpr, srcTy, dstTy) {
     return true
   }
   // Nominal newtype: a syntactic literal is brand-polymorphic and adopts the destination's brand
@@ -33596,6 +33598,7 @@ function recRunPending() {
     i = i + 1
   }
   recKeptConflicts()
+  recAnnObjs = []
   recPendSrc = []
   recPendSrcTy = []
   recPendDstTy = []
@@ -33623,8 +33626,8 @@ function recOwnPend(srcExpr: i32, srcTy: i32) {
   0
 }
 
-// Fresh bindings and functions not adopted (a function's result, or a numeric storage the
-// destination changes, D3339): each delivery the emitter builds at the destination's row.
+// Fresh bindings and functions not adopted (a function's result, or a width change into a
+// record that drops a nested field): each delivery the emitter builds at the destination's row.
 let recKeptDecl: i32[] = []
 let recKeptDst: i32[] = []
 let recKeptAt: i32[] = []
@@ -33710,6 +33713,27 @@ function recOwnIsPin(u: i32): boolean {
     }
   }
   false
+}
+
+// The un-annotated parameter at position `pos` of the function the call `c` names, or -1.
+function recNumParamAt(c: i32, pos: i32): i32 {
+  const cn = P.nodes[c]
+  if cn is Call {
+    const f = P.nodes[cn.callFn]
+    if f is Ident {
+      const fd = recFnDeclByName(f.identName)
+      if fd < 0 { return -1 }
+      const fn = P.nodes[fd]
+      if fn is FuncDecl {
+        if pos < 0 || pos >= fn.fnParams.length { return -1 }
+        const pn = P.nodes[fn.fnParams[pos]]
+        if pn is Param {
+          if pn.parType < 0 { return fn.fnParams[pos] }
+        }
+      }
+    }
+  }
+  -1
 }
 
 // How a refusal names the kept declaration `d`.
@@ -34123,10 +34147,23 @@ function recAtPinnedArg(at: i32): boolean {
   false
 }
 
+// The records this pass's annotations spell inline (`{ f: i32 }`); each is a declared row too.
+let recAnnObjs: i32[] = []
+
+// Is `ut` a record of `own`'s field names and storage that `dst` stores differently?
+function recDeclaredRowOf(ut: i32, own: i32, dst: i32): boolean {
+  ut >= 0
+    && ut < T.tys.length
+    && T.tys[ut] is TyObj
+    && objFieldNameSetsEq(ut, own)
+    && fieldStorageEq(own, ut, REC_STORE_DEPTH)
+    && !fieldStorageEq(ut, dst, REC_STORE_DEPTH)
+}
+
 // A literal built inside a function, or handed through a generic call, is built at the row of a
 // declared record of its own field storage when one exists, not where the call delivers it; into
-// a record that stores a field differently it is refused as an existing record is (D3338). True
-// when it refused.
+// a record that stores a field differently it is refused as an existing record is (D3338). A
+// record spelled inline in an annotation is declared too (D3430). True when it refused.
 function recBuiltAtDeclared(at: i32, srcTy: i32, dstTy: i32): boolean {
   const own = nonNulTyOf(srcTy)
   const dst = nonNulTyOf(dstTy)
@@ -34136,22 +34173,12 @@ function recBuiltAtDeclared(at: i32, srcTy: i32, dstTy: i32): boolean {
   if recAtPinnedArg(at) { return false }
   let found = false
   for k in cUserTypes.keys() {
-    const ut = cUserTypes[k] ?? -1
-    if (
-      !found
-      && ut >= 0
-      && ut < T.tys.length
-      && nameIsBareIdent(demangleName(k))
-    ) {
-      if T.tys[ut] is TyObj && objFieldNameSetsEq(ut, own) {
-        if (
-          fieldStorageEq(own, ut, REC_STORE_DEPTH)
-          && !fieldStorageEq(ut, dst, REC_STORE_DEPTH)
-        ) {
-          found = true
-        }
-      }
+    if !found && nameIsBareIdent(demangleName(k)) {
+      found = recDeclaredRowOf(cUserTypes[k] ?? -1, own, dst)
     }
+  }
+  for ut in recAnnObjs {
+    if !found { found = recDeclaredRowOf(recAdRecOf(ut), own, dst) }
   }
   if !found { return false }
   shapeAdaptSrcTy = own
@@ -34249,8 +34276,8 @@ function recIntToFloatNested(src: i32, dst: i32, depth: i32): boolean {
 }
 
 // Does `dst` store some number `src` holds at another width or kind (`i32` into `i64` or `f64`),
-// through records, lists, maps and `| null`? Adopting such a destination would change what a read
-// of the source computes (D3339), so the record is not adopted.
+// through records, lists, maps and `| null`? Adopting such a destination changes what a read of
+// the source computes, so the adoption is never undone (D3339).
 function recNumChanges(src: i32, dst: i32, depth: i32): boolean {
   if (
     src < 0
@@ -34369,8 +34396,8 @@ function recIsIntLit(ty: i32): boolean {
 
 // —— adoption: a binding or function holding only literals takes the record it is delivered to ——
 // The destination is written as its annotation or result and the program checked again, so
-// every use sees it. A re-check that refuses anything but the adopted value handed on whole, or
-// reads a number at another width, undoes it (DECISIONS.md "Record covariance").
+// every use sees it. A re-check that refuses anything but the adopted value handed on whole
+// undoes it, unless it changed a number's width (DECISIONS.md "Record covariance").
 
 // This pass's demands: the declaration, the record the binding (or its list's element) holds,
 // the record it is delivered as, whether it is a list's element, and the delivery.
@@ -34382,6 +34409,7 @@ let recAdAt: i32[] = []
 // The solve's answer: declarations to re-check with an annotation, and the refusals it owes.
 let recAdPinDecl: i32[] = []
 let recAdPinTy: string[] = []
+let recAdPinSpell: string[] = []
 let recAdErrMsg: string[] = []
 let recAdErrAt: i32[] = []
 // Declarations whose adoption a re-check refused, and the nodes the pins replaced; both last
@@ -34391,6 +34419,12 @@ let recAdNoAdopt: {[i32]: boolean} = Map()
 // and how many of this pass's refusals are about something other than an adopted value as a
 // whole: those are what a literal's own type served, so they undo the adoption.
 let recAdPinned: {[i32]: boolean} = Map()
+// Bindings adopted at a record that stores a number at another width or kind: their reads
+// compute at the adopted type, so a re-check's refusal stands instead of undoing them (D3339).
+let recAdWidth: {[i32]: boolean} = Map()
+// This pass's deliveries accepted only because they adopt (`recAdForce`), and their bindings.
+let recAdForced: i32[] = []
+let recAdForcedDecl: i32[] = []
 // Parallel to `recAdOrigDecl`: each rewritten declaration's name, whether it is a function, and
 // the type the adoption wrote.
 let recAdOrigName: string[] = []
@@ -34406,6 +34440,8 @@ let recAdOrigNode: Node[] = []
 function recAdPassReset() {
   recAdBound = []
   recAdLoose = 0
+  recAdForced = []
+  recAdForcedDecl = []
   recAdDecl = []
   recAdOwn = []
   recAdDst = []
@@ -34413,6 +34449,7 @@ function recAdPassReset() {
   recAdAt = []
   recAdPinDecl = []
   recAdPinTy = []
+  recAdPinSpell = []
   recAdErrMsg = []
   recAdErrAt = []
   0
@@ -34423,6 +34460,7 @@ function recAdReset() {
   recAdPassReset()
   recAdNoAdopt = Map()
   recAdPinned = Map()
+  recAdWidth = Map()
   recAdOrigName = []
   recAdOrigFn = []
   recAdOrigTy = []
@@ -34480,7 +34518,6 @@ function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
       if decl < 0 { return 0 }
       const iv = P.nodes[parenPeelIx(recDeclInit(decl))]
       if iv is ArrayLit {
-        if recFloatBuiltElsewhere(p, srcTy, dstTy) { return 0 }
         return recAdPushDecl(decl, srcTy, nonNulTyOf(dstTy), true, p)
       }
     }
@@ -34534,6 +34571,44 @@ function recAdNoteFields(lit: i32, d: i32) {
   0
 }
 
+// Do the records `a` and `b` name the same fields at every depth, through lists, maps and
+// `| null`? A width adoption needs it: a destination that drops a nested field is a shape
+// its literal cannot be written at, so that delivery keeps its own-type build.
+function recNamesDeepEq(a: i32, b: i32, depth: i32): boolean {
+  if a < 0 || b < 0 || a >= T.tys.length || b >= T.tys.length || depth <= 0 {
+    return true
+  }
+  const sa = nonNulTyOf(a)
+  const sb = nonNulTyOf(b)
+  if sa < 0 || sb < 0 { return true }
+  const ta = T.tys[sa]
+  const tb = T.tys[sb]
+  match ta {
+    TyObj => {
+      if !objFieldNameSetsEq(sa, sb) { return false }
+      if !(tb is TyObj) { return false }
+      let i = 0
+      while i < ta.objFieldNames.length {
+        const bf = objFieldType(tb, ta.objFieldNames[i])
+        if !recNamesDeepEq(ta.objFieldTypes[i], bf, depth - 1) { return false }
+        i = i + 1
+      }
+      return true
+    }
+    TyArray => {
+      return recNamesDeepEq(ta.aElem, tyArrayElemIx(sb), depth - 1)
+    }
+    TyMap => {
+      if tb is TyMap { return recNamesDeepEq(ta.mVal, tb.mVal, depth - 1) }
+      return true
+    }
+    // A leaf, a union or a function names no fields of its own.
+    TyPrim | TyErr | TyFunc | TyUnion | TyVar | TyLit | TyNeg | TyNullable => {
+      return true
+    }
+  }
+}
+
 // Push one demand on the declaration `decl`: a binding, or a function with no declared result.
 function recAdPushDecl(decl: i32, own: i32, dst: i32, elem: boolean, at: i32) {
   if own < 0 || dst < 0 || own >= T.tys.length || dst >= T.tys.length {
@@ -34544,7 +34619,11 @@ function recAdPushDecl(decl: i32, own: i32, dst: i32, elem: boolean, at: i32) {
   if !objFieldNameSetsEq(own, dst) { return 0 }
   if fieldStorageEq(own, dst, REC_STORE_DEPTH) { return 0 }
   if decl < 0 { return 0 }
-  if P.nodes[decl] is FuncDecl || recNumChanges(own, dst, REC_STORE_DEPTH) {
+  const wide = recNumChanges(own, dst, REC_STORE_DEPTH)
+  if (
+    P.nodes[decl] is FuncDecl
+    || (wide && !recNamesDeepEq(own, dst, REC_STORE_DEPTH))
+  ) {
     recKeptDecl.push(decl)
     recKeptDst.push(dst)
     recKeptAt.push(at)
@@ -34554,11 +34633,65 @@ function recAdPushDecl(decl: i32, own: i32, dst: i32, elem: boolean, at: i32) {
     recAdMergeRefuse(decl, own, dst, elem, at)
     return 0
   }
+  if wide { recAdWidth[decl] = true }
   recAdDecl.push(decl)
   recAdOwn.push(own)
   recAdDst.push(dst)
   recAdElem.push(elem)
   recAdAt.push(at)
+  0
+}
+
+// A delivery its own type refuses, of a literal binding (or an element or field of a literal)
+// into a record that stores one of its numbers at another width or kind (`i32` into `f32`): the
+// binding adopts the record and the re-check judges its literal there, as its annotated twin's
+// is (D3339). True when it noted such an adoption.
+function recAdForce(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
+  if srcTy < 0 || dstTy < 0 || !tyHoldsObj(srcTy, 8) || !tyHoldsObj(dstTy, 8) {
+    return false
+  }
+  const p = cwPeelValue(srcExpr)
+  if p < 0 || p >= P.nodes.length { return false }
+  const e = P.nodes[p]
+  if !(e is Ident || e is Index || e is ArrayLit || e is ObjLit) {
+    return false
+  }
+  const before = recAdDecl.length
+  recAdoptNote(srcExpr, srcTy, dstTy)
+  let any = false
+  let i = before
+  while i < recAdDecl.length {
+    if recAdWidth.has(recAdDecl[i]) {
+      any = true
+      recAdForced.push(p)
+      recAdForcedDecl.push(recAdDecl[i])
+    }
+    i = i + 1
+  }
+  any
+}
+
+// Refuse each forced delivery whose binding the passes ran out before adopting.
+function recAdForcedReport() {
+  let i = 0
+  while i < recAdForced.length {
+    const d = recAdForcedDecl[i]
+    if !(recAdPinned[d] ?? false) && !recAdHasErr(d) {
+      const n = P.nodes[d]
+      let nm = "this binding"
+      if n is LetDecl { nm = "`" + n.letName + "`" }
+      recAdRaising = true
+      tErr(
+        nm
+          + " holds only a literal and is delivered here to a record that stores one of its "
+          + "numbers at another width or kind, but it could not be "
+          + "built at that type. Annotate it with the type this delivery needs",
+        recAdForced[i],
+      )
+      recAdRaising = false
+    }
+    i = i + 1
+  }
   0
 }
 
@@ -34583,9 +34716,14 @@ function recAdSolve() {
         if P.nodes[decl] is LetDecl { recAdConflict(decl, i, bad) }
       } else {
         let ann = tyToStr(recAdDst[i])
-        if recAdElem[i] { ann = ann + "[]" }
+        let spell = recAdSpell(recAdDst[i], ann)
+        if recAdElem[i] {
+          ann = ann + "[]"
+          spell = spell + "[]"
+        }
         recAdPinDecl.push(decl)
         recAdPinTy.push(ann)
+        recAdPinSpell.push(spell)
       }
     }
     i = i + 1
@@ -34745,12 +34883,20 @@ function recAdConflict(decl: i32, a: i32, b: i32) {
   0
 }
 
+// The annotation spelling of the adopted record `ty` (rendered `shown`): the parser's own form,
+// which the annotation resolver reads for every field type, or `shown` when it has none.
+function recAdSpell(ty: i32, shown: string): string {
+  const nm = tyToNominalName(ty)
+  if nm == "" || tyNomNameCycled() { return shown }
+  nm
+}
+
 // Write each adopted type as its declaration's annotation, keeping the node it replaces.
 function recAdApplyPins() {
   let i = 0
   while i < recAdPinDecl.length {
-    recAdPinLet(recAdPinDecl[i], recAdPinTy[i])
-    recAdPinFn(recAdPinDecl[i], recAdPinTy[i])
+    recAdPinLet(recAdPinDecl[i], recAdPinTy[i], recAdPinSpell[i])
+    recAdPinFn(recAdPinDecl[i], recAdPinTy[i], recAdPinSpell[i])
     i = i + 1
   }
   0
@@ -34766,13 +34912,13 @@ function recAdKeep(d: i32, n: Node, name: string, isFn: boolean, ty: string) {
   0
 }
 
-// Write `ty` as the annotation of the binding declared at `d`, when it is one.
-function recAdPinLet(d: i32, ty: string) {
+// Write `ty`, spelled `spell`, as the annotation of the binding declared at `d`, when it is one.
+function recAdPinLet(d: i32, ty: string, spell: string) {
   const n = P.nodes[d]
   if n is LetDecl {
     recAdKeep(d, n, n.letName, false, ty)
     recAdPinned[d] = true
-    const ann = mkTypeRef(ty, n.pos)
+    const ann = mkTypeRef(spell, n.pos)
     P.nodes[d] = {
       letKw: n.letKw,
       letName: n.letName,
@@ -34784,12 +34930,12 @@ function recAdPinLet(d: i32, ty: string) {
   0
 }
 
-// Write `ty` as the declared result of the function declared at `d`, when it is one.
-function recAdPinFn(d: i32, ty: string) {
+// Write `ty`, spelled `spell`, as the declared result of the function declared at `d`.
+function recAdPinFn(d: i32, ty: string, spell: string) {
   const n = P.nodes[d]
   if n is FuncDecl {
     recAdKeep(d, n, n.fnName, true, ty)
-    const ann = mkTypeRef(ty, n.pos)
+    const ann = mkTypeRef(spell, n.pos)
     P.nodes[d] = {
       fnName: n.fnName,
       fnTyParams: n.fnTyParams,
@@ -34802,21 +34948,37 @@ function recAdPinFn(d: i32, ty: string) {
   0
 }
 
-// Restore every declaration an adoption rewrote since `mark`, and never adopt them again.
-function recAdUndo(mark: i32) {
-  while recAdOrigDecl.length > mark {
-    const d = recAdOrigDecl.pop() ?? -1
-    const n = recAdOrigNode.pop()
+// Restore every declaration an adoption rewrote since `mark`, except one adopted across a
+// numeric width (`recAdWidth`), and never adopt them again. True when it restored any.
+function recAdUndo(mark: i32): boolean {
+  let any = false
+  let i = mark
+  let k = mark
+  while i < recAdOrigDecl.length {
+    const d = recAdOrigDecl[i]
+    if recAdWidth.has(d) {
+      recAdOrigDecl[k] = d
+      recAdOrigNode[k] = recAdOrigNode[i]
+      recAdOrigName[k] = recAdOrigName[i]
+      recAdOrigFn[k] = recAdOrigFn[i]
+      recAdOrigTy[k] = recAdOrigTy[i]
+      k = k + 1
+    } else {
+      P.nodes[d] = recAdOrigNode[i]
+      recAdNoAdopt[d] = true
+      recAdPinned[d] = false
+      any = true
+    }
+    i = i + 1
+  }
+  while recAdOrigDecl.length > k {
+    recAdOrigDecl.pop()
+    recAdOrigNode.pop()
     recAdOrigName.pop()
     recAdOrigFn.pop()
     recAdOrigTy.pop()
-    if d >= 0 && n != null {
-      P.nodes[d] = n
-      recAdNoAdopt[d] = true
-      recAdPinned[d] = false
-    }
   }
-  0
+  any
 }
 
 // Is the refusal at `at` about an adopted value handed on whole: raised by this rule, or at a
@@ -45772,6 +45934,7 @@ function resolveAnnotAt(
   annotDiagAt = at
   const r = resolveAnnotTs(name, typarams, annTsOf(at), owner)
   annotDiagAt = saved
+  if name.length > 0 && name.slice(0, 1) == "{" { recAnnObjs.push(r) }
   // D1023 at the inline spelling: pass 0d catches a union with a declaration to walk, but an
   // inline `function f(): A | B` has none, so the arm-discriminability rule is asked again
   // here, at the annotation — the checker's own route, which keeps this out of the emit
@@ -52737,144 +52900,20 @@ export function checkProgram(rootIx: i32) {
     lbiApplyPins()
     const mark = recAdOrigDecl.length
     recAdApplyPins()
-    if recAdOrigDecl.length > mark { recNumWatch(mark) }
     checkProgramAgain(rootIx)
     passes = passes + 1
-    // A re-check that refuses anything other than an adopted value handed on whole, or reads a
-    // number at another width, undoes this pass's adoptions: those reads the literal's own type
-    // served, and served with the value the program means.
-    if recAdOrigDecl.length > mark && (recAdLoose > 0 || recNumMoved()) {
-      recAdUndo(mark)
-      checkProgramAgain(rootIx)
+    // A re-check that refuses anything other than an adopted value handed on whole undoes this
+    // pass's adoptions, which the literal's own type served. One across a numeric width stays:
+    // its reads mean the adopted type, so the refusal is the program's (D3339).
+    if recAdOrigDecl.length > mark && recAdLoose > 0 {
+      if recAdUndo(mark) { checkProgramAgain(rootIx) }
     }
   }
   symFlushPending()
   lbiSymTypes()
   lbiReport()
+  recAdForcedReport()
   recAdReport()
-}
-
-// The reads of the declarations an adoption rewrote since `mark`, a few levels up from each
-// use or call, with the numeric type each had before the re-check ("" for any other type).
-let recNumNodes: i32[] = []
-let recNumWas: string[] = []
-
-function recNumWatch(mark: i32) {
-  recNumNodes = []
-  recNumWas = []
-  cwIxBuild()
-  let i = mark
-  while i < recAdOrigDecl.length {
-    const d = recAdOrigDecl[i]
-    const nm = recAdOrigName[i]
-    if recAdOrigFn[i] {
-      let r = cwIxChain(nm)
-      while r >= 0 {
-        if cwIxKind[r] == CW_OCC_CALL { recNumWatchUp(cwIxNode[r]) }
-        r = cwIxNext[r]
-      }
-    } else {
-      recNumWatchName(nm, cwFrameOfDecl(d), 3)
-    }
-    i = i + 1
-  }
-  0
-}
-
-// Watch every use of the binding (`nm`, `fr`), and follow it into an un-annotated binding it
-// initializes and an un-annotated parameter it is passed to, whose reads change with it.
-function recNumWatchName(nm: string, fr: i32, depth: i32) {
-  if depth <= 0 { return 0 }
-  let r = cwIxFrHead(nm, fr)
-  while r >= 0 {
-    if cwIxKind[r] == CW_OCC_USE {
-      const u = cwIxNode[r]
-      recNumWatchUp(u)
-      recNumFollow(u, depth - 1)
-    }
-    r = cwIxFrNext(r, fr)
-  }
-  0
-}
-
-// Follow the use `u` into the un-annotated `let`/`const` it initializes or the un-annotated
-// parameter it is passed to.
-function recNumFollow(u: i32, depth: i32) {
-  if u < 0 || u >= cwIxUp.length { return 0 }
-  const at = cwIxUp[u]
-  const k = cwIxUpKind[u]
-  if k == CW_UP_LETINIT {
-    const n = P.nodes[at]
-    if n is LetDecl {
-      if n.letType < 0 { recNumWatchName(n.letName, cwFrameOfDecl(at), depth) }
-    }
-  } else if k == CW_UP_ARG {
-    const pix = recNumParamAt(at, cwIxUpAux[u])
-    if pix >= 0 {
-      const pn = P.nodes[pix]
-      if pn is Param { recNumWatchName(pn.parName, cwFrameOfDecl(pix), depth) }
-    }
-  }
-  0
-}
-
-// The un-annotated parameter at position `pos` of the function the call `c` names, or -1.
-function recNumParamAt(c: i32, pos: i32): i32 {
-  const cn = P.nodes[c]
-  if cn is Call {
-    const f = P.nodes[cn.callFn]
-    if f is Ident {
-      const fd = recFnDeclByName(f.identName)
-      if fd < 0 { return -1 }
-      const fn = P.nodes[fd]
-      if fn is FuncDecl {
-        if pos < 0 || pos >= fn.fnParams.length { return -1 }
-        const pn = P.nodes[fn.fnParams[pos]]
-        if pn is Param {
-          if pn.parType < 0 { return fn.fnParams[pos] }
-        }
-      }
-    }
-  }
-  -1
-}
-
-// Watch `u` and the nodes up to three levels above it.
-function recNumWatchUp(u: i32) {
-  let at = u
-  let k = 0
-  while k < 4 && at >= 0 && at < P.nodes.length {
-    recNumNodes.push(at)
-    recNumWas.push(recNumName(nodeTyIxOf(at)))
-    if at >= cwIxParent.length { return 0 }
-    at = cwIxParent[at]
-    k = k + 1
-  }
-  0
-}
-
-// `ty`'s name when it is a numeric primitive, else "".
-function recNumName(ty: i32): string {
-  if ty < 0 || ty >= T.tys.length { return "" }
-  const t = T.tys[ty]
-  if t is TyPrim {
-    const n = t.primName
-    if n == "i32" || n == "i64" || n == "f32" || n == "f64" { return n }
-  }
-  ""
-}
-
-// Does a watched read have another numeric type after the re-check than before it?
-function recNumMoved(): boolean {
-  let i = 0
-  while i < recNumNodes.length {
-    if recNumWas[i] != "" {
-      const now = recNumName(nodeTyIxOf(recNumNodes[i]))
-      if now != "" && now != recNumWas[i] { return true }
-    }
-    i = i + 1
-  }
-  false
 }
 
 // A fresh check of the program after a pass rewrote some declarations' annotations.
@@ -59282,6 +59321,9 @@ function checkLetDeclNodeIn(n: LetDecl, ix: i32) {
         annot = nameToTyAt(tn.tyName, n.letType)
       }
       if annot >= 0 && annot == collapsedTy { annotCollapsedHere = true }
+      if tn.tyName.length > 0 && tn.tyName.slice(0, 1) == "{" {
+        recAnnObjs.push(annot)
+      }
       // D1023 at a binding's inline union, as `resolveAnnotAt` asks it of a parameter's.
       if annot >= 0 {
         const ldm = unionDiscrimMsg(annot)
