@@ -177,7 +177,7 @@ Deno.test({ name: "wasm-checker: a defaulted numeric literal names its declarati
       ["argument 1: expected f32, got f64", conflict("u", 4, "f64", 5, "f32")],
     ],
     // A literal `const` is its literal at the read, so the mismatch is the literal's own.
-    ["function h(a: i32): i32 { a }\nconst F = 2.5\nprint(h(F))\n", ["argument 1: expected i32, got f64"]],
+    ["function h(a: i32): i32 { a }\nconst F = 2.5\nprint(h(F))\n", ["constant 2.5 is not a whole number, so i32 cannot hold it"]],
   ];
   for (const [src, want] of scalars) {
     const got = await msgs(src);
@@ -285,14 +285,15 @@ Deno.test({ name: "wasm-checker: a defaulted literal read inside a value names i
     const got = await msgs(src);
     if (got.length !== 0) throw new Error(`want ${JSON.stringify(src)} clean, got ${JSON.stringify(got)}`);
   }
-  // An `f32` holds integers only up to 2^24 exactly: the literal's own refusal at the read.
+  // An `f32` holds integers only up to 2^24 exactly: the constant's refusal at the read.
   const v = await msgs(g + "const v = 16777217\nprint(mul(v, 1.0))\n");
-  if (JSON.stringify(v) !== JSON.stringify(["argument 1: expected f32, got i32"])) {
+  const wantV = ["constant 16777217 is not exact at f32 — write it as a float literal to round it"];
+  if (JSON.stringify(v) !== JSON.stringify(wantV)) {
     throw new Error(`want the bare mismatch, got ${JSON.stringify(v)}`);
   }
   // D2981: a float literal stored into an integer `let` is refused; the `let` keeps its kind.
   const store = await msgs(g + "const b = 1.5\nlet w = 0\nw = b\nprint(gi(w))\n");
-  const wantStore = ["cannot assign f64 to i32"];
+  const wantStore = ["constant 1.5 is not a whole number, so i32 cannot hold it"];
   if (JSON.stringify(store) !== JSON.stringify(wantStore)) {
     throw new Error(`want ${JSON.stringify(wantStore)}, got ${JSON.stringify(store)}`);
   }

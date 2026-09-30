@@ -9006,8 +9006,16 @@ tree read stays an editor reference.
   (`constant overflows the 512-bit exact integer range`); Go's compiler uses the same bound. A
   float constant is an exact fraction whose numerator and denominator are each held to 4096
   bits, enough for every finite double and its reciprocal. It reaches its use as a decimal
-  literal: exact when its expansion terminates within 400 characters, otherwise to 60
-  significant digits, so it is correctly rounded except within 10^-59 of a rounding boundary.
+  literal: exact when its expansion terminates within 400 characters, otherwise to 800
+  significant digits and a sticky last digit when anything is cut. Every rounding boundary of
+  an `f32` or `f64` has fewer significant digits than that, so the use rounds the literal as it
+  would the exact value (`1.0 + 1.0/9007199254740992.0 + 1.0/3.0/1e70` is the double above 1,
+  where 60 digits read a tie and rounded to 1). A float zero keeps its sign, as IEEE does:
+  `0.0 * -1.0` is `-0`, and `-0.0 + 0.0` is `+0`.
+* **A refusal names the constant and the destination** at an integer, float or union
+  destination: `constant 2147483648 overflows i32`, `constant 123456789000 is not exact at f32`,
+  `constant 1.5 is not a whole number, so i64 cannot hold it`, `constant 2147483648 fits no
+  member of i32 | string`. A `u8` element keeps the literal's own refusal.
 
 **Where VL keeps its own rules.**
 
@@ -9016,8 +9024,15 @@ tree read stays an editor reference.
   literal does: `0xFFFF0000 | 0xFF` is `-65281` at `i32` and 4294902015 at `i64`, and
   `0xFF << 24` is `0xFF000000`. A result built from decimal literals is a number:
   `1 << 31` at `i32` is refused where Go refuses `int32(1 << 31)` too; write `0x1 << 31` or
-  `-2147483647 - 1` for the pattern or the value. Arithmetic (`+ - * / %`) always gives a
-  number, so `0xFFFFFFFF + 1` is 2^32 and refused at `i32`.
+  `-2147483647 - 1` for the pattern or the value. Arithmetic (`+ - * / %`) gives a number.
+* **A pattern whose top bit is set at its own width (32 or 64 bits) reads two ways** — a
+  negative number at that width, a positive one at a wider — so what it computes depends on
+  where it is used. Arithmetic on one is refused naming both readings (`0x80000000 is both the
+  bit pattern -2147483648 at i32 and the number 2147483648; write the decimal you mean, or
+  0x80000000 as% i32`): Go would compute the number, master computed at the use's width, and
+  the choice is the owner's. `>>` and `~` over one are not folded, so they keep computing at
+  the use's width (`0xFFFFFFFF >> 4` is `-1` at `i32` and 268435455 at `i64`; `~0xFFFFFFFF` is
+  `0` and -4294967296). `>>>`, `&`, `|`, `^` and `<<` read the same at every width, and fold.
 * **A float division by zero, and a float constant past the largest double, are not folded.**
   VL has no spelling for infinity or NaN, so `1.0 / 0.0` and `1e308 * 10.0` stay the IEEE
   computation they were; Go refuses both.
@@ -9033,27 +9048,31 @@ tree read stays an editor reference.
   the use, not where it is declared, so `(1 << 70) >> 60` is 1024.
 * In a generic body, a 64-bit constant beside a type-parameter operand records a constraint
   (`OP_LITFIT`) that a narrower pin refuses (`i32 cannot hold the 64-bit constant it meets`),
-  since the body alone cannot see the width (D2712, D3426).
+  since the body alone cannot see the width (D2712, D3426); an `f32` pin is still open (D3429).
 
 **Programs whose behaviour changed.** Every one computed a constant that wrapped, or a float
-constant rounded step by step, and now has the exact value or a loud refusal; the exact-constant
-grid (`scripts/capability-probes/const-exact-grid.py`, 32 initialisers x 15 uses x 2 spellings =
-960 cells, expected values from Python's exact integers and fractions) grades 960 of 960 as the
-rule says, and against master 231 cells moved, each from a wrapped or step-rounded value: 109 now
-refuse (`K` at `i32` for `K = 2147483647 + 1`), 122 print the exact value, and no cell that
-printed the exact value on master changed. The literal-binding grid (594 cells) is unchanged.
+constant rounded step by step, and now has the exact value or a loud refusal, or did arithmetic
+on a two-reading pattern and is now refused. The exact-constant grid
+(`scripts/capability-probes/const-exact-grid.py`, 33 initialisers x 15 uses x 2 spellings =
+990 cells, expected values from Python's exact integers and fractions) grades 990 of 990 as the
+rule says; against master `afb0ecc08`, 208 cells moved from a wrapped or step-rounded value (99
+now refused, as `K` at `i32` for `K = 2147483647 + 1`, and 109 now exact), 56 are refused as
+arithmetic on a two-reading pattern, and no cell that printed the exact value on master changed.
+The literal-binding grid (594 cells) still grades every cell as its rule program does; against
+master `5e277ab52`, 172 of its cells moved from master's wrapped value to the exact one (a literal `const` read into `b * 1000000000`).
 Fixtures that pinned a wrap were rewritten, each listed in the PR. Every module initialiser that
 is a constant tree is folded before the module is checked — a `let` and an annotated `const` as
 well as a literal `const` — so each is checked as the bare spelling of its value would be (a
 `let` holding one is a literal `let`; an annotation on one is as redundant as on its literal).
 
-**Cost, against master `5e277ab52`.** The fold is one walk per arithmetic operator, stopping at
-its first leaf that is no constant: the plumb-shape units +0.19% / +0.20% guest fuel, a
-generated plumb chunk (`chunk_0`) −0.46% (its constant trees reach the emitter as literals), the
-L2 self-compile +0.53%, the seed +28 KB (+0.7%). plumb's 428 units check with byte-identical
-diagnostics; their builds differ only as constants folded earlier (identical after binaryen's
-constant folding, or after `-O2`, but for four `x86.vl` records whose initialisers became
-constant expressions). A chain of `const`s whose exact value grows each step pays for the
+**Cost, against master `afb0ecc08`.** The fold is one walk per arithmetic operator, stopping at
+its first leaf that is no constant, with the operators a nested walk found to be none
+remembered: the plumb-shape units +0.22% / +0.23% guest fuel, a generated plumb chunk
+(`chunk_0`) −0.45% (its constant trees reach the emitter as literals), the L2 self-compile
++0.9%, the seed +34 KB (+0.9%). plumb's 428 units check with byte-identical diagnostics; their
+builds differ only as constants folded earlier (identical after binaryen's constant folding, or
+after `-O2`, but for three `x86.vl` records whose initialisers became constant expressions). A
+chain of `const`s whose exact value grows each step pays for the
 growth: 200 floats each four times the last cost +65% over computing them at run time.
 
 ## Flow narrowing: per-path facts meet at joins (owner ruling 2026-09-29) — plumb PL-064, D3285

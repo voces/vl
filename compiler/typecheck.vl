@@ -30,6 +30,7 @@ import {
   cexDecText,
   cexDiv,
   cexFitsSigned,
+  cexIntExactAt,
   cexIsWhole,
   cexLexeme,
   cexMul,
@@ -14362,6 +14363,7 @@ export function lbiArenaReset() {
   lbiInlined = Map()
   lbiInlinedName = Map()
   cexFolded = Map()
+  cexNotTree = Map()
   0
 }
 
@@ -14894,6 +14896,8 @@ function lbiCopyLit(lit: i32, pos: i32): i32 {
 
 // The roots a fold rewrote into their value's literal.
 let cexFolded: {[i32]: boolean} = Map()
+// The operators a walk below another found to be no constant tree, so their own check pays none.
+let cexNotTree: {[i32]: boolean} = Map()
 // Set while a module initializer is folded before any scope exists: a name is read only as the
 // module literal `const` it names.
 let cexModScan = false
@@ -14986,6 +14990,7 @@ function cexTryFold(ix: i32): i32 {
 
 // `cexTryFold` for the operator `e` at `ix`, whose operator the caller has already admitted.
 function cexTryFoldBin(e: BinExpr, ix: i32): i32 {
+  if cexNotTree.length > 0 && (cexNotTree[ix] ?? false) { return 0 }
   if cexTreeShape(e.binLeft, 1) != 1 || cexTreeShape(e.binRight, 1) != 1 {
     return 0
   }
@@ -15023,9 +15028,11 @@ function cexTreeShape(ix: i32, depth: i32): i32 {
   }
   if e is BinExpr {
     if e.binCompound.length > 0 || !cexOp(e.binOp) { return 0 }
-    const r = cexTreeShape(e.binLeft, depth + 1)
-    if r != 1 { return r }
-    return cexTreeShape(e.binRight, depth + 1)
+    if cexNotTree.length > 0 && (cexNotTree[ix] ?? false) { return 0 }
+    let r = cexTreeShape(e.binLeft, depth + 1)
+    if r == 1 { r = cexTreeShape(e.binRight, depth + 1) }
+    if r == 0 { cexNotTree[ix] = true }
+    return r
   }
   cexShapeNotTree()
 }
@@ -15224,46 +15231,113 @@ function cexIsMinI64(t: string): boolean {
   cexOk(v) && cexFitsSigned(cexNeg(v), 64)
 }
 
-// A constant delivered into `dstTy`: an integer that type cannot hold is refused naming its
-// value, and a whole float constant at an integer destination becomes that integer. Answers
-// whether this decided the delivery.
+// A constant delivered into `dstTy`, a number or a union with a number member: one the type
+// cannot hold is refused naming its value and the type, and a whole float constant at an
+// integer destination becomes that integer. Answers whether this decided the delivery.
 function cexDeliver(srcExpr: i32, dstTy: i32): boolean {
-  if srcExpr < 0 || (dstTy != TY_I32 && dstTy != TY_I64) { return false }
   const lit = cexLitPeel(srcExpr)
   if lit < 0 { return false }
   const l = P.nodes[lit]
   if !(l is NumLit) { return false }
-  // Nine characters hold no integer past the i32 range, whatever the radix; a float is typed so.
-  if l.numText.length <= 9 {
-    const lt = nodeTyOf(lit)
-    if lt != TY_F64 && lt != TY_F32 { return false }
-  }
-  let bits = 32
-  let pn = "i32"
-  if dstTy == TY_I64 {
-    bits = 64
-    pn = "i64"
+  const lt = nodeTyOf(lit)
+  const isF = lt == TY_F64 || lt == TY_F32
+  // Seven characters hold an integer every number type holds exactly, whatever the radix.
+  if !isF && l.numText.length <= 7 { return false }
+  let kind = 0
+  if dstTy == TY_I32 || dstTy == TY_I64 { kind = 1 }
+  else if dstTy == TY_F32 || dstTy == TY_F64 { kind = 2 }
+  else if T.tys[dstTy] is TyUnion { kind = 3 }
+  if kind == 0 { return false }
+  // Nine hold none past the i32 range, which `i64` and `f64` hold exactly too.
+  if !isF && l.numText.length <= 9 && (kind == 1 || dstTy == TY_F64) {
+    return false
   }
   if !cexIsDerived(srcExpr) { return false }
   let v = cexOfLexeme(l.numText)
   if !cexOk(v) { return false }
   if intLitIsNegated(srcExpr) { v = cexNeg(v) }
-  // A float that is no whole number is refused as any float at an integer is.
-  if v.cxFloat && !cexIsWhole(v) { return false }
-  let fits = cexFitsSigned(v, bits)
-  if v.cxPat { fits = cexPatFits(v, bits) }
-  if !fits {
-    cexReported[lit] = true
-    tErr("constant " + cexSignedDec(v) + " overflows " + pn, srcExpr)
+  if kind == 3 { return cexDeliverUnion(v, lit, srcExpr, dstTy) }
+  if cexFitsAt(v, l.numText, dstTy) {
+    if kind == 2 || !v.cxFloat { return false }
+    if !inferQuiet {
+      arenaSetNode(lit, { numText: cexDecText(v), pos: l.pos })
+      cexRetype(srcExpr, dstTy)
+      cexConverted = true
+    }
     return true
   }
-  if !v.cxFloat { return false }
-  if !inferQuiet {
-    arenaSetNode(lit, { numText: cexDecText(v), pos: l.pos })
-    cexRetype(srcExpr, dstTy)
-    cexConverted = true
-  }
+  cexReported[lit] = true
+  tErr(cexMisfitMsg(v, tyToStr(dstTy), kind == 2), srcExpr)
   true
+}
+
+// A constant `v` delivered into the union `dstTy` is refused when no number member holds it.
+function cexDeliverUnion(v: Cex, lit: i32, srcExpr: i32, dstTy: i32): boolean {
+  const members: i32[] = []
+  flattenVariantsInto(dstTy, members)
+  let numeric = false
+  for m in members {
+    if m == TY_I32 || m == TY_I64 || m == TY_F32 || m == TY_F64 {
+      numeric = true
+      if cexFitsAt(v, cexLexeme(v), m) { return false }
+    }
+  }
+  if !numeric { return false }
+  cexReported[lit] = true
+  tErr(
+    "constant " + cexShown(v) + " fits no member of " + tyToStr(dstTy),
+    srcExpr,
+  )
+  true
+}
+
+// Whether the number type `ty` holds the constant `v`, whose literal is `lex`: an integer type
+// a whole value in range (a pattern by its digits), a float type an integer it holds exactly or
+// a float that stays finite there.
+function cexFitsAt(v: Cex, lex: string, ty: i32): boolean {
+  if ty == TY_I32 || ty == TY_I64 {
+    if v.cxFloat && !cexIsWhole(v) { return false }
+    let bits = 32
+    if ty == TY_I64 { bits = 64 }
+    if v.cxPat { return cexPatFits(v, bits) }
+    return cexFitsSigned(v, bits)
+  }
+  if !v.cxFloat {
+    if ty == TY_F32 { return cexIntExactAt(v, 24, 128) }
+    return cexIntExactAt(v, 53, 1024)
+  }
+  if ty == TY_F32 { return !f32LitOverflows(lex) }
+  true
+}
+
+// Why `v` does not fit the type named `tyName`: past its range, a fraction at an integer, or an
+// integer a float cannot hold exactly.
+function cexMisfitMsg(v: Cex, tyName: string, toFloat: boolean): string {
+  const shown = cexShown(v)
+  if toFloat && !v.cxFloat {
+    return "constant "
+      + shown
+      + " is not exact at "
+      + tyName
+      + " — write it as a float literal to round it"
+  }
+  if !toFloat && v.cxFloat && !cexIsWhole(v) {
+    return "constant "
+      + shown
+      + " is not a whole number, so "
+      + tyName
+      + " cannot hold it"
+  }
+  "constant " + shown + " overflows " + tyName
+}
+
+// `v` as a diagnostic quotes it: an integer in decimal, a float by its literal when that is short.
+function cexShown(v: Cex): string {
+  if !v.cxFloat { return cexSignedDec(v) }
+  let t = cexLexeme(v)
+  if t.length > 24 { t = t.slice(0, 20) + "…" }
+  if v.cxNeg { return "-" + t }
+  t
 }
 
 // A 64-bit integer literal `lit` typed `litTy` beside the type-parameter operand typed `holeTy`
@@ -21531,7 +21605,7 @@ function binShiftOp(op: string): boolean {
 
 export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
   lbiNoteDelivery(srcExpr, dstTy, nlAsgTgt)
-  if (dstTy == TY_I32 || dstTy == TY_I64) && srcExpr >= 0 {
+  if srcExpr >= 0 && dstTy >= 0 {
     const cse = P.nodes[srcExpr]
     if cse is NumLit || cse is Unary || cse is Paren {
       if cexDeliver(srcExpr, dstTy) { return true }

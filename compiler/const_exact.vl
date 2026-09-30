@@ -21,7 +21,7 @@ export const CEX_INT_BITS = 512
 export const CEX_FRAC_BITS = 4096
 // A float's exact decimal spelling longest kept, and the significant digits written otherwise.
 const CEX_DEC_MAX = 400
-const CEX_SIG = 60
+const CEX_SIG = 800
 
 // ── magnitudes ──────────────────────────────────────────────────────────────
 
@@ -349,7 +349,7 @@ function cexMake(
     cxNo: false,
     cxFloat: f,
     cxPat: pat,
-    cxNeg: neg && !cxmIsZero(num),
+    cxNeg: neg && (f || !cxmIsZero(num)),
     cxNum: num,
     cxDen: den,
   }
@@ -517,6 +517,7 @@ export function cexNeg(a: Cex): Cex {
 
 export function cexAdd(a: Cex, b: Cex, sub: boolean): Cex {
   if cexBad(a, b) { return cexPass(a, b) }
+  if cexAmbiguous(a) || cexAmbiguous(b) { return cexAmbiguousErr(a, b) }
   let bneg = b.cxNeg
   if sub { bneg = !bneg }
   if a.cxFloat || b.cxFloat {
@@ -524,11 +525,11 @@ export function cexAdd(a: Cex, b: Cex, sub: boolean): Cex {
     const y = cexToFloat(b)
     const l = cxmMul(x.cxNum, y.cxDen)
     const r = cxmMul(y.cxNum, x.cxDen)
-    return cexFrac(
-      cxsAddNeg(x.cxNeg, l, bneg, r),
-      cxsAddMag(x.cxNeg, l, bneg, r),
-      cxmMul(x.cxDen, y.cxDen),
-    )
+    const m = cxsAddMag(x.cxNeg, l, bneg, r)
+    // A zero sum is `-0` only when both addends are, as IEEE rounds it.
+    let neg = cxsAddNeg(x.cxNeg, l, bneg, r)
+    if cxmIsZero(m) { neg = x.cxNeg && bneg }
+    return cexFrac(neg, m, cxmMul(x.cxDen, y.cxDen))
   }
   cexInt(
     cxsAddNeg(a.cxNeg, a.cxNum, bneg, b.cxNum),
@@ -539,6 +540,7 @@ export function cexAdd(a: Cex, b: Cex, sub: boolean): Cex {
 
 export function cexMul(a: Cex, b: Cex): Cex {
   if cexBad(a, b) { return cexPass(a, b) }
+  if cexAmbiguous(a) || cexAmbiguous(b) { return cexAmbiguousErr(a, b) }
   const neg = a.cxNeg != b.cxNeg
   if a.cxFloat || b.cxFloat {
     return cexFrac(neg, cxmMul(a.cxNum, b.cxNum), cxmMul(a.cxDen, b.cxDen))
@@ -549,6 +551,7 @@ export function cexMul(a: Cex, b: Cex): Cex {
 // Integer division truncates; a float division by zero is left to IEEE at run time.
 export function cexDiv(a: Cex, b: Cex): Cex {
   if cexBad(a, b) { return cexPass(a, b) }
+  if cexAmbiguous(a) || cexAmbiguous(b) { return cexAmbiguousErr(a, b) }
   const neg = a.cxNeg != b.cxNeg
   if a.cxFloat || b.cxFloat {
     if cxmIsZero(b.cxNum) { return cexNotConst() }
@@ -563,11 +566,14 @@ export function cexDiv(a: Cex, b: Cex): Cex {
 // The remainder takes the dividend's sign, as a truncating division leaves it.
 export function cexRem(a: Cex, b: Cex): Cex {
   if cexBad(a, b) { return cexPass(a, b) }
+  if cexAmbiguous(a) || cexAmbiguous(b) { return cexAmbiguousErr(a, b) }
   if a.cxFloat || b.cxFloat {
     if cxmIsZero(b.cxNum) { return cexNotConst() }
     const q = cxmDivmod(cxmMul(a.cxNum, b.cxDen), cxmMul(a.cxDen, b.cxNum))[0]
     const qb = cexMul(cexMake(true, false, a.cxNeg != b.cxNeg, q, cxmOne()), b)
-    return cexAdd(cexToFloat(a), qb, true)
+    const r = cexAdd(cexToFloat(a), qb, true)
+    if !cexOk(r) || !cxmIsZero(r.cxNum) { return r }
+    return cexMake(true, false, a.cxNeg, r.cxNum, r.cxDen)
   }
   if cxmIsZero(b.cxNum) {
     return cexError("division by zero in a constant expression")
@@ -627,7 +633,7 @@ export function cexBitwise(a: Cex, b: Cex, op: string): Cex {
 
 export function cexNot(a: Cex): Cex {
   if !cexOk(a) { return a }
-  if a.cxFloat { return cexNotConst() }
+  if a.cxFloat || cexAmbiguous(a) { return cexNotConst() }
   const r = cexAdd(
     cexNeg(a),
     cexMake(false, false, false, cxmOne(), cxmOne()),
@@ -662,10 +668,44 @@ export function cexShift(a: Cex, b: Cex, op: string): Cex {
     return cexInt(a.cxNeg, cxmShl(a.cxNum, k), a.cxPat)
   }
   if a.cxNeg && op == ">>>" { return cexNotConst() }
+  if op == ">>" && cexAmbiguous(a) { return cexNotConst() }
   if big || k > CEX_INT_BITS + 16 { k = CEX_INT_BITS + 16 }
   if !a.cxNeg { return cexInt(false, cxmShr(a.cxNum, k), a.cxPat) }
   const m = cxmAdd(cxmShr(cxmSub(a.cxNum, cxmOne()), k), cxmOne())
   cexInt(true, m, a.cxPat)
+}
+
+// Whether `v` is a pattern whose top bit is set at its own width, 32 or 64 bits: a negative number
+// at that width and a positive one at a wider, so arithmetic on it depends on where it is read.
+function cexAmbiguous(v: Cex): boolean {
+  if v.cxFloat || !v.cxPat || v.cxNeg { return false }
+  const b = cxmBitLen(v.cxNum)
+  b == 32 || b == 64
+}
+
+// The refusal for arithmetic over the ambiguous pattern among `a` and `b`, naming both readings.
+function cexAmbiguousErr(a: Cex, b: Cex): Cex {
+  let v = a
+  if !cexAmbiguous(a) { v = b }
+  const bits = cxmBitLen(v.cxNum)
+  let w = "i32"
+  if bits == 64 { w = "i64" }
+  const hex = cxmToHex(v.cxNum)
+  const low = cxmSub(cxmShl(cxmOne(), bits), v.cxNum)
+  cexError(
+    hex
+      + " is both the bit pattern -"
+      + cxmToDec(low)
+      + " at "
+      + w
+      + " and the number "
+      + cxmToDec(v.cxNum)
+      + "; write the decimal you mean, or `"
+      + hex
+      + " as% "
+      + w
+      + "`",
+  )
 }
 
 // ── reading a value back ────────────────────────────────────────────────────
@@ -687,6 +727,16 @@ export function cexPatFits(v: Cex, bits: i32): boolean {
 // About log2 of `v`'s magnitude: its numerator's bit length less its denominator's, within one.
 export function cexScaleBits(v: Cex): i32 {
   cxmBitLen(v.cxNum) - cxmBitLen(v.cxDen)
+}
+
+// Whether the integer `v` is exact in a binary float of `sigBits` significand bits whose
+// magnitude stays below 2^`maxWidth`.
+export function cexIntExactAt(v: Cex, sigBits: i32, maxWidth: i32): boolean {
+  if cxmIsZero(v.cxNum) { return true }
+  if cxmBitLen(v.cxNum) > maxWidth { return false }
+  let m = v.cxNum
+  while (m[0] & 1) == 0 { m = cxmShr(m, 1) }
+  cxmBitLen(m) <= sigBits
 }
 
 // Whether the fraction `v` is a whole number.
@@ -738,18 +788,21 @@ function cexFloatExact(v: Cex): string {
   digits.slice(0, at) + "." + digits.slice(at, digits.length)
 }
 
-// `v` to `CEX_SIG` significant digits, truncated, in scientific form.
+// `v` to `CEX_SIG` significant digits in scientific form, truncated with a sticky last digit when
+// anything is cut, so it rounds at every float width as the exact value does.
 function cexFloatSci(v: Cex): string {
   const nd = cxmToDec(v.cxNum).length
   const dd = cxmToDec(v.cxDen).length
   const s = CEX_SIG - (nd - dd) + 1
-  let q: i32[] = [0]
+  let qr: i32[][] = []
   if s >= 0 {
-    q = cxmDivmod(cxmMul(v.cxNum, cxmPow10(s)), v.cxDen)[0]
+    qr = cxmDivmod(cxmMul(v.cxNum, cxmPow10(s)), v.cxDen)
   } else {
-    q = cxmDivmod(v.cxNum, cxmMul(v.cxDen, cxmPow10(0 - s)))[0]
+    qr = cxmDivmod(v.cxNum, cxmMul(v.cxDen, cxmPow10(0 - s)))
   }
-  const digits = cxmToDec(q)
+  let digits = cxmToDec(qr[0])
+  // A nonzero remainder is a sticky digit: the value lies strictly above the digits written.
   const e = digits.length - 1 - s
+  if !cxmIsZero(qr[1]) { digits = digits + "1" }
   digits.slice(0, 1) + "." + digits.slice(1, digits.length) + "e" + cxI32Str(e)
 }

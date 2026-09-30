@@ -46,7 +46,9 @@ INITS = [
     ("negmin", "", "-(-2147483648)", 2**31, False, False),
     ("minint", "", "-2147483647 - 1", -2**31, False, False),
     ("minlong", "", "-9223372036854775807 - 1", -2**63, False, False),
-    ("hexsum", "", "0xFFFFFFFF + 1", 2**32, False, False),
+    # Arithmetic on a pattern whose top bit is set at its own width reads two ways; refused.
+    ("hexsum", "", "0xFFFFFFFF + 1", None, False, False),
+    ("hexdiv", "", "0x80000000 / 2", None, False, False),
     ("hexor", "", "0xFFFF0000 | 0xFF", 0xFFFF00FF, True, False),
     ("hexneg3", "", "-(-(-0xFFFFFFFF))", -0xFFFFFFFF, True, False),
     ("notff", "", "~0xFF", -256, True, False),
@@ -111,6 +113,7 @@ def fmt_f(x):
 ERR = "ERR"
 
 def expect(use, v, pat, isf):
+    if v is None: return ERR
     if isf:
         whole = v.denominator == 1
         if use in ("i32", "arg32", "union"):
@@ -210,11 +213,16 @@ if BEFORE:
     with ThreadPoolExecutor(max_workers=JOBS) as ex:
         old = list(ex.map(lambda c: run(BEFORE, c[1]), cells))
     moved_wrap = 0
+    ambiguous = 0
+    now_refused = 0
     for (cid, _, want), g, o in zip(cells, got, old):
         if o == g or o == ERR or o.startswith("FAIL"):
             continue
         name, use, _face = cid.split(".")
         v = [i for i in INITS if i[0] == name][0][3]
+        if v is None:
+            ambiguous += 1
+            continue
         if use == "shift":
             exact = str(wrap(1 << v, 64)) if isinstance(v, int) and 0 <= v < 64 else None
         elif use == "f32":
@@ -228,5 +236,9 @@ if BEFORE:
             print("LOST " + cid + ": printed the exact " + repr(o) + ", now " + repr(g))
         else:
             moved_wrap += 1
-    print("moved from a wrapped or step-rounded value: " + str(moved_wrap) + "; lost: " + str(losses))
+            if g == ERR:
+                now_refused += 1
+    print("moved from a wrapped or step-rounded value: " + str(moved_wrap)
+          + " (" + str(now_refused) + " now refused, " + str(moved_wrap - now_refused) + " now exact)"
+          + "; refused as a two-reading pattern: " + str(ambiguous) + "; lost: " + str(losses))
 sys.exit(1 if bad or losses else 0)
