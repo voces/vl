@@ -621,12 +621,12 @@ function fmtNodeOr(ix: i32): i32 {
   ix
 }
 
-// The `break` statement's text: the keyword, its `:label` and its value.
+// The `break` statement's text: the keyword, its `@label` and its value.
 function breakText(ix: i32, indent: i32): string {
   const n = P.nodes[ix]
   if n is BreakStmt {
     let t = n.brkKw
-    if n.brkLabel.length > 0 { t = t + " :" + n.brkLabel }
+    if n.brkLabel.length > 0 { t = t + " @" + n.brkLabel }
     const v = fmtBrkVal[ix] ?? -1
     if v >= 0 { t = t + " " + expr(v, indent, 0) }
     return t
@@ -1219,7 +1219,7 @@ function emitReturn(node: RetStmt, indent: i32) {
 function emitBreakContinue(kw: string, label: string, indent: i32, ix: i32) {
   const line = stopLineOf(ix)
   if label.length > 0 {
-    emitMultiline(kw + " :" + label, indent, line)
+    emitMultiline(kw + " @" + label, indent, line)
   } else {
     emitMultiline(kw, indent, line)
   }
@@ -1377,7 +1377,7 @@ function emitBlockStatement(ix: i32, node: Block, indent: i32) {
 
 function emitWhile(ix: i32, node: WhileStmt, indent: i32) {
   let label = ""
-  if node.whileLabel.length > 0 { label = node.whileLabel + ": " }
+  if node.whileLabel.length > 0 { label = "@" + node.whileLabel + " " }
   // A labelled block has no `while` or condition to print.
   if node.whileBlk == 1 {
     const bInline = inlineBlockBody(node.whileBody, indent)
@@ -1449,7 +1449,7 @@ function emitBareBody(blockIx: i32, indent: i32) {
 
 function emitForRange(ix: i32, node: ForRange, indent: i32) {
   let label = ""
-  if node.frLabel.length > 0 { label = node.frLabel + ": " }
+  if node.frLabel.length > 0 { label = "@" + node.frLabel + " " }
   const from = expr(node.frFrom, indent, 0)
   const to = expr(node.frTo, indent, 0)
   let kw = " to " // the inclusive form; `until` is the half-open twin
@@ -1462,7 +1462,7 @@ function emitForRange(ix: i32, node: ForRange, indent: i32) {
 
 function emitForIn(ix: i32, node: ForIn, indent: i32) {
   let label = ""
-  if node.fiLabel.length > 0 { label = node.fiLabel + ": " }
+  if node.fiLabel.length > 0 { label = "@" + node.fiLabel + " " }
   const iter = expr(node.fiIter, indent, 0)
   let vars = node.fiVar
   if node.fiVar2 != "" { vars = vars + ", " + node.fiVar2 }
@@ -1542,9 +1542,32 @@ function collapseSingleIf(_ix: i32, node: IfStmt, indent: i32) {
   line
 }
 
+// The object literal a branch or arm is when the parser read its braces as one (`{ a: 1 }`, a
+// synthesized one-statement block): that object's text, whose braces are the arm's. "" for any
+// other body, and for `{}`, which as a body is an empty block.
+function armObjectText(blockIx: i32, indent: i32): string {
+  if blockIx < 0 || blockIx >= P.nodes.length || isBracedBlock(blockIx) {
+    return ""
+  }
+  const n = P.nodes[blockIx]
+  if n is Block {
+    if n.blkStmts.length != 1 { return "" }
+    const o = P.nodes[n.blkStmts[0]]
+    if o is ObjLit {
+      if o.objFields.length > 0 { return expr(n.blkStmts[0], indent, 0) }
+    }
+  }
+  ""
+}
+
 // Render a brace block with a single simple statement inline as `{ stmt }`, or
 // `{}` when empty. Returns "" when the body can't inline.
 function inlineBlockBody(blockIx: i32, indent: i32) {
+  const ao = armObjectText(blockIx, indent)
+  if ao != "" {
+    if hasNewline(ao) { return "" }
+    return ao
+  }
   const n = P.nodes[blockIx]
   if n is Block {
     const sl = startLineOf(blockIx)
@@ -1827,7 +1850,7 @@ function statementInline(ix: i32, indent: i32) {
   }
   if n is BreakStmt { return breakText(ix, indent) }
   if n is ContinueStmt {
-    if n.contLabel.length > 0 { return "continue :" + n.contLabel }
+    if n.contLabel.length > 0 { return "continue @" + n.contLabel }
     return "continue"
   }
   if n is LetDecl { return letInline(ix, n, indent) }
@@ -2916,8 +2939,9 @@ function ifExpr(ix: i32, node: IfStmt, indent: i32) {
   if !hasCmt && ifChainIsSimple(ix) {
     // An `else if` chain is rendered along its spine (D1990).
     const cond = expr(node.ifCond, indent, 0)
-    const thenE = bareBodyInline(node.ifThen, indent)
-    const parts: string[] = ["if " + cond + " { " + thenE + " }"]
+    const parts: string[] = [
+      "if " + cond + " " + armInline(node.ifThen, indent),
+    ]
     let nxt = node.ifElse
     while nxt >= 0 {
       const at = nxt
@@ -2925,11 +2949,10 @@ function ifExpr(ix: i32, node: IfStmt, indent: i32) {
       const e = P.nodes[at]
       if e is IfStmt {
         const ec = expr(e.ifCond, indent, 0)
-        const et = bareBodyInline(e.ifThen, indent)
-        parts.push(" else if " + ec + " { " + et + " }")
+        parts.push(" else if " + ec + " " + armInline(e.ifThen, indent))
         nxt = e.ifElse
       } else {
-        parts.push(" else { " + bareBodyInline(at, indent) + " }")
+        parts.push(" else " + armInline(at, indent))
       }
     }
     return concatParts(parts)
@@ -2940,6 +2963,13 @@ function ifExpr(ix: i32, node: IfStmt, indent: i32) {
     return ifExprBlocks(node, indent)
   }
   sliceFallback(ix)
+}
+
+// One simple `if`-expression arm on one line: `{ expr }`, or an object arm as the object.
+function armInline(blockIx: i32, indent: i32): string {
+  const ao = armObjectText(blockIx, indent)
+  if ao != "" { return ao }
+  "{ " + bareBodyInline(blockIx, indent) + " }"
 }
 
 // Whether every arm of the `if` chain at `ix` is one simple expression, so the chain can
@@ -3006,6 +3036,8 @@ function armBlock(ix: i32, indent: i32) {
 }
 
 function blockExpr(ix: i32, node: Block, indent: i32) {
+  const ao = armObjectText(ix, indent)
+  if ao != "" { return ao }
   const saved = outBuf
   outBuf = []
   emitStatements(node.blkStmts, indent + 1)

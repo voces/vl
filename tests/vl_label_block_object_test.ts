@@ -1,10 +1,10 @@
-// A BODY `{ a: { b } }` IS AN OBJECT LITERAL, NOT A LABELLED BLOCK (#3293 landing review).
+// `{ name: … }` IS ALWAYS AN OBJECT LITERAL; A LABEL IS `@name` (owner ruling 2026-09-30, D3374).
 //
-// `name: {` opens a labelled block only when the inner braces plainly hold statements. A
-// shorthand inner object (`{ b }`, `{ b, c }`) or a key after the inner `}` keeps the outer
-// braces an object literal, as on master. These shapes live here rather than in a
-// `tests/cases` fixture because `vl fmt` spells a shorthand key out, which would erase the
-// shape under test. Each program runs on the seed and prints the value it reads back.
+// A body, an `if`/`else` branch or a `match` arm whose braces open `{ name: …` is an object,
+// shorthand inner objects (`{ b }`, `{ b, c }`) included, and a labelled block is `@B { … }`
+// wherever it stands. These shapes live here rather than in a `tests/cases` fixture because
+// `vl fmt` spells a shorthand key out, which would erase the shape under test. Each program
+// runs on the seed and prints the value it reads back.
 //
 // GATING: needs the seed; registers as ignored without it.
 
@@ -47,10 +47,10 @@ const CASES: [string, string, string[]][] = [
     "function g(b: i32, c: boolean) {\n  if c { { a: { d: { b } } } } else { a: { d: { b } } }\n}\nprint(g(4, false).a.d.b)",
     ["4"],
   ],
-  ["empty labelled block, then a statement (D3273)", "let n = 0\nfunction h() {\nC: {}\nn = 5\n}\nh()\nprint(n)", ["5"]],
-  ["lone-name labelled block, then a statement (D3273)", "let n = 0\nfunction h() {\nC: { n }\nn = 5\n}\nh()\nprint(n)", ["5"]],
-  ["nested lone-name, then a statement (D3273)", "let n = 0\nfunction h() {\nB1: { C: { n }\n n = 5 }\n}\nh()\nprint(n)", ["5"]],
-  ["empty labelled block, `;` then a statement (D3273)", "let n = 0\nconst h = () => {\nC: {}; n = 5\n}\nh()\nprint(n)", ["5"]],
+  ["empty labelled block, then a statement (D3273)", "let n = 0\nfunction h() {\n@C {}\nn = 5\n}\nh()\nprint(n)", ["5"]],
+  ["lone-name labelled block, then a statement (D3273)", "let n = 0\nfunction h() {\n@C { n }\nn = 5\n}\nh()\nprint(n)", ["5"]],
+  ["nested lone-name, then a statement (D3273)", "let n = 0\nfunction h() {\n@B1 { @C { n }\n n = 5 }\n}\nh()\nprint(n)", ["5"]],
+  ["empty labelled block, `;` then a statement (D3273)", "let n = 0\nconst h = () => {\n@C {}; n = 5\n}\nh()\nprint(n)", ["5"]],
   ["inner shorthand then a line break and `}` stays an object (D3273)", "const b = 4\nconst v = { a: { b }\n}\nprint(v.a.b)", ["4"]],
   ["inner shorthand then a line break and `,` stays an object (D3273)", "const b = 4\nconst v = {\n  a: { b }\n  , x: b }\nprint(v.x)", ["4"]],
   ["a field value on the next line (D3274)", "const b = 3\nconst v = { a:\n  { c: { b } } }\nprint(v.a.c.b)", ["3"]],
@@ -64,9 +64,16 @@ const CASES: [string, string, string[]][] = [
   ["a second field's continued value (D3273)", "const g = (b: i32) => {\n  a: { x: b }\n  , c: { x: b }\n    .x\n}\nprint(g(3).c)", ["3"]],
   [
     "a labelled block still parses as one",
-    "function g(n: i32) {\n  let r = 0\n  a: { r = n }\n  r\n}\nprint(g(7))",
+    "function g(n: i32) {\n  let r = 0\n  @a { r = n }\n  r\n}\nprint(g(7))",
     ["7"],
   ],
+  ["function body (D3374)", "function f() { a: 1 }\nprint(f().a)", ["1"]],
+  ["if and else branches (D3374)", "function g(c: boolean) { if c { a: 1 } else { a: 2 } }\nprint(g(true).a)\nprint(g(false).a)", ["1", "2"]],
+  ["lambda body (D3374)", "const h = () => { a: 1 }\nprint(h().a)", ["1"]],
+  ["match arms (D3374)", "function m(k: i32) { match k { 1 => { a: 1 }, _ => { a: 3 } } }\nprint(m(1).a)\nprint(m(2).a)", ["1", "3"]],
+  ["then branch, shorthand inner (D3374)", "function h(b: i32, c: boolean) { if c { a: { b } } else { a: { b: 0 } } }\nprint(h(4, true).a.b)", ["4"]],
+  ["match arm, shorthand inner (D3276)", "function h(b: i32) { match b { 3 => { a: { b } }, _ => { a: { b } } } }\nprint(h(3).a.b)", ["3"]],
+  ["if-expression branches", "const c = 2 > 1\nconst o = if c { x: 1, y: 2 } else { x: 3, y: 4 }\nprint(o.y)", ["2"]],
 ];
 
 for (const [name, src, want] of CASES) {
@@ -78,19 +85,12 @@ for (const [name, src, want] of CASES) {
   });
 }
 
-// The D3276 note names the arm whose value an error is about, and no other: exact messages.
+// Exact messages: an error after an object branch is only that error, and a label goes before
+// `while`, `for` or `{` on its own line.
 const DIAGS: [string, string, string[]][] = [
   [
-    "a match arm's labelled block, read as an object through its function",
-    "function h(b: i32) { match b { 3 => { a: { b } }, _ => { a: { b } } } }\nprint(h(3).a)",
-    [
-      "member access '.a' on non-object i32; the braces at 1:37 are a block, " +
-      "not an object literal; parenthesize an object there: `({ … })`",
-    ],
-  ],
-  [
-    "an unrelated error after an object-looking branch takes no note",
-    "function k() {}\nfunction m(c: boolean) {\n  if c { L: { c } }\n  const x: i32 = k()\n  print(x)\n}",
+    "an unrelated error after an object branch is only that error",
+    "function k() {}\nfunction m(c: boolean) {\n  if c { a: { c } }\n  const x: i32 = k()\n  print(x)\n}",
     ["cannot bind the void result of 'x' — a void function returns no value"],
   ],
   [
@@ -99,9 +99,14 @@ const DIAGS: [string, string, string[]][] = [
     ["cannot bind the void result of 'x' — a void function returns no value"],
   ],
   [
-    "a label whose loop starts on the next line",
+    "`a:` then a loop on the next line is an object field holding the loop",
     "let n = 0\nconst h = () => {\n  a:\n  while n < 5 { n = n + 1 }\n}",
-    ["a label's loop or block starts on the label's line: `a: while …`"],
+    ["field 'a' expects a value, got void"],
+  ],
+  [
+    "a label whose loop starts on the next line",
+    "let n = 0\nconst h = () => {\n  @a\n  while n < 5 { n = n + 1 }\n}",
+    ["a label goes before `while`, `for` or `{`: `@a while …`, `@a { … }`"],
   ],
 ];
 

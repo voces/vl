@@ -124,13 +124,14 @@ const genValueWrites = (n: number, inFn: boolean): string => {
   return o.join("\n") + "\n";
 };
 
-// `if` branches and `match` arms whose braces would read as an object elsewhere: empty ones,
-// which are blocks and never recorded, and a labelled shorthand one, which is (D3276).
+// `if` branches and `match` arms: empty ones and a labelled block, which are blocks, and ones
+// whose braces are an object literal, which are the arm's value (D3276).
 const genArmBodies = (n: number): string => {
   const o: string[] = ["let t = 0"];
   for (let i = 0; i < n; i++) {
     o.push(`function f${i}(c: boolean) {`, "  if c {} else { t = t + 1 }", "  match t { 1 => {} _ => {} }");
-    o.push("  if c { L: { t } } else { t = t + 2 }", "}");
+    o.push("  if c { @L { t } } else { t = t + 2 }");
+    o.push("  const o = if c { a: t } else { a: t + 2 }", "  t = t + o.a", "}");
   }
   o.push("f0(false)", "print(t)");
   return o.join("\n") + "\n";
@@ -551,11 +552,11 @@ axis(
 );
 
 // D3276's GROWTH pair, 8,000 functions of arm and branch bodies against 2,000, so linear reads 4.
-// A per-block scan of the recorded arms read 9.5x master at 8,000.
+// A per-block scan of the object-looking arms once read 9.5x master at 8,000.
 axis(
   "object-looking arm bodies",
   5.0,
-  "A per-block or per-function pass is scanning the recorded object-looking arms (compiler/ast.vl `objLookBodies`).",
+  "A per-block or per-function pass is scanning the arm bodies (compiler/parser.vl `parseArmBody`).",
   (d) => twoFiles(d, genArmBodies(8000), genArmBodies(2000)),
 );
 
@@ -1118,10 +1119,10 @@ const genNesting = (n: number, nested: boolean): string => {
       kind === 0
         ? "{ const m = acc + 1; acc = m; "
         : kind === 1
-        ? `L${k}: while true { acc = acc + 1; `
+        ? `@L${k} while true { acc = acc + 1; `
         : "if a > 0 { acc = acc + 1; ",
     );
-    close.push(kind === 1 ? `acc = acc + 1; break :L${k} } ` : "} ");
+    close.push(kind === 1 ? `acc = acc + 1; break @L${k} } ` : "} ");
   }
   const body = nested
     ? open.join("") + [...close].reverse().join("")
