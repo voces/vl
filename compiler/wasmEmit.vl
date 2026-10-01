@@ -227,6 +227,7 @@ import {
   parseI64Pair,
 } from "./emit_bignum"
 import {
+  LIT_PART,
   NEW_FIXED_MAX,
   binOpcode,
   binOpcodeF32,
@@ -389,6 +390,7 @@ import {
   fnValUsed,
   fsIdxAt,
   gCellIdx,
+  gConstExprEmit,
   gF32PrintIdx,
   gF64PrintIdx,
   gFnTableIdx,
@@ -432,6 +434,8 @@ import {
   gSharedMemPages,
   gStrDataIx,
   gStrDataLen,
+  gStrDataParts,
+  gStrDataStart,
   gStrPoolIx,
   gStrPoolTexts,
   globalStmts,
@@ -672,6 +676,8 @@ import {
   wULEB,
 } from "./emit_bytes"
 import {
+  ALK_F64,
+  ALK_I64,
   NICHE_NUL_LIT,
   TY_WALK_DEPTH,
   annRowOfNode,
@@ -683,10 +689,9 @@ import {
   arrElemLitUnionTy,
   arrLitElemNameIn,
   arrLitIsF32,
-  arrLitIsF64,
-  arrLitIsI64,
   arrLitIsRef,
   arrLitIsStr,
+  arrLitNumKind,
   arrNewIntrKind,
   arrNewKindNamed,
   asExprHoleNumOpt,
@@ -8168,8 +8173,9 @@ function emitArr(body: u8[], arrIx: i32, fnIx: i32) {
     // binding, field or param. A threaded kind is authoritative and clears what it displaces.
     let isRefLit = arrLitIsRef(arrIx)
     let isStrLit = arrLitIsStr(arrIx, fnIx)
-    let isF64Lit = arrLitIsF64(arrIx, fnIx)
-    let isI64Lit = arrLitIsI64(arrIx, fnIx)
+    const numKind = arrLitNumKind(arrIx, fnIx)
+    let isF64Lit = numKind == ALK_F64
+    let isI64Lit = numKind == ALK_I64
     // A literal whose elements are all f32-typed values self-identifies, exactly as the f64 and
     // i64 forms above do. A bare float literal stays f64 — `arrLitIsF32` claims only `exprIsF32`
     // elements, and a `.` literal is deliberately not one — so an annotation remains the only
@@ -8286,6 +8292,9 @@ function emitArr(body: u8[], arrIx: i32, fnIx: i32) {
         )
       }
       if elems.length > NEW_FIXED_MAX {
+        const dU8 = arrLitDataBuild(body, elems, fnIx, ALD_U8, ba8TypeIdx)
+        if dU8 < 0 { return -1 }
+        if dU8 == 1 { return arrLitWrap(elems.length, bl8TypeIdx) }
         return emitFail(
           "emitProgram: u8 array literal is too long for one array.new_fixed",
         )
@@ -8313,6 +8322,9 @@ function emitArr(body: u8[], arrIx: i32, fnIx: i32) {
       let dstF32 = -1
       let coffF32 = 0
       if elems.length > NEW_FIXED_MAX {
+        const dF32 = arrLitDataBuild(body, elems, fnIx, ALD_F32, fa32TypeIdx)
+        if dF32 < 0 { return -1 }
+        if dF32 == 1 { return arrLitWrap(elems.length, fl32TypeIdx) }
         dstF32 = arrLitChunkStart("f32", 0, fa32TypeIdx, elems.length, false)
       }
       let i32f = 0
@@ -8354,6 +8366,9 @@ function emitArr(body: u8[], arrIx: i32, fnIx: i32) {
       let dstF64 = -1
       let coffF64 = 0
       if elems.length > NEW_FIXED_MAX {
+        const dF64 = arrLitDataBuild(body, elems, fnIx, ALD_F64, fa64TypeIdx)
+        if dF64 < 0 { return -1 }
+        if dF64 == 1 { return arrLitWrap(elems.length, fl64TypeIdx) }
         dstF64 = arrLitChunkStart("f64", 0, fa64TypeIdx, elems.length, false)
       }
       let i = 0
@@ -8395,6 +8410,9 @@ function emitArr(body: u8[], arrIx: i32, fnIx: i32) {
       let dstI64 = -1
       let coffI64 = 0
       if elems.length > NEW_FIXED_MAX {
+        const dI64 = arrLitDataBuild(body, elems, fnIx, ALD_I64, ia64TypeIdx)
+        if dI64 < 0 { return -1 }
+        if dI64 == 1 { return arrLitWrap(elems.length, il64TypeIdx) }
         dstI64 = arrLitChunkStart("i64", 0, ia64TypeIdx, elems.length, false)
       }
       let i = 0
@@ -8435,7 +8453,7 @@ function emitArr(body: u8[], arrIx: i32, fnIx: i32) {
       }
       let dstStr = -1
       let coffStr = 0
-      if elems.length > NEW_FIXED_MAX {
+      if elems.length > allocLitChunk() {
         dstStr = arrLitChunkStart("str", 0, mkArrIdx, elems.length, false)
       }
       // A `(string | null)[]` literal shares the string backing, but a `null` element lowers as
@@ -8458,7 +8476,14 @@ function emitArr(body: u8[], arrIx: i32, fnIx: i32) {
         if emitStrValue(body, elems[i], fnIx) < 0 { return -1 }
         i = i + 1
         if dstStr >= 0 {
-          coffStr = arrLitChunkFlush(dstStr, mkArrIdx, coffStr, i, elems.length)
+          coffStr = arrLitChunkFlushAt(
+            dstStr,
+            mkArrIdx,
+            coffStr,
+            i,
+            elems.length,
+            allocLitChunk(),
+          )
         }
       }
       pendingNulString = savedArrNS
@@ -8537,7 +8562,7 @@ function emitArr(body: u8[], arrIx: i32, fnIx: i32) {
       const elemNest = rlElemKindTbl[rslot]
       let dstRef = -1
       let coffRef = 0
-      if elems.length > NEW_FIXED_MAX {
+      if elems.length > allocLitChunk() {
         dstRef = arrLitChunkStart(
           "ref",
           rslot,
@@ -8646,12 +8671,13 @@ function emitArr(body: u8[], arrIx: i32, fnIx: i32) {
         pendingVariantIdx = -1
         i = i + 1
         if dstRef >= 0 {
-          coffRef = arrLitChunkFlush(
+          coffRef = arrLitChunkFlushAt(
             dstRef,
             rlBackIdx[rslot],
             coffRef,
             i,
             elems.length,
+            allocLitChunk(),
           )
         }
       }
@@ -8692,6 +8718,14 @@ function emitArr(body: u8[], arrIx: i32, fnIx: i32) {
     let dstI32 = -1
     let coffI32 = 0
     if elems.length > NEW_FIXED_MAX {
+      const dI32 = arrLitDataBuild(body, elems, fnIx, ALD_I32, aTypeIdx)
+      if dI32 != 0 {
+        pendingLitUnion = savedArrLU
+        pendingNulBool = savedArrNB
+        pendingNulLitUnion = savedArrNLLU
+        if dI32 < 0 { return -1 }
+        return arrLitWrap(elems.length, lTypeIdx)
+      }
       dstI32 = arrLitChunkStart("i32", 0, aTypeIdx, elems.length, false)
     }
     let i = 0
@@ -10751,6 +10785,17 @@ function pushMapScrHB(_body: u8[]) {
   0
 }
 
+// A string or ref literal longer than this builds in chunks of this many: an engine compiles one
+// `array.new_fixed` over n operands that allocate in time and memory super-linear in n (D3462).
+const ALLOC_LIT_CHUNK = 256
+
+// The chunk length of a string or ref literal here: a constant initializer has no locals to
+// chunk through, and `isConstInit` admits one only within the operand cap.
+function allocLitChunk(): i32 {
+  if gConstExprEmit { return NEW_FIXED_MAX }
+  ALLOC_LIT_CHUNK
+}
+
 // Begin a chunked long-literal build: allocate the full `n`-element backing into a fresh
 // backing-typed slot of the lazy list frame (so a nested chunked literal cannot clobber
 // this one), then open the first chunk and return the destination slot. `strBack` (not
@@ -10779,7 +10824,19 @@ function arrLitChunkStart(
 // the chunk — `array.new_fixed` the pushed elements, `array.copy` them into the
 // destination — and open the next one when elements remain. Returns the new start.
 function arrLitChunkFlush(dst: i32, backTy: i32, coff: i32, i: i32, n: i32) {
-  if i - coff < NEW_FIXED_MAX && i < n { return coff }
+  arrLitChunkFlushAt(dst, backTy, coff, i, n, NEW_FIXED_MAX)
+}
+
+// `arrLitChunkFlush` closing a chunk at `max` elements rather than at the operand cap.
+function arrLitChunkFlushAt(
+  dst: i32,
+  backTy: i32,
+  coff: i32,
+  i: i32,
+  n: i32,
+  max: i32,
+) {
+  if i - coff < max && i < n { return coff }
   fbArrayNewFixed(backTy, i - coff) // the chunk source array
   fbI32Const(0)                     // source offset
   fbI32Const(i - coff)              // element count
@@ -10789,6 +10846,146 @@ function arrLitChunkFlush(dst: i32, backTy: i32, coff: i32, i: i32, n: i32) {
     fbI32Const(i)
   }
   i
+}
+
+// The element forms of `arrLitDataBuild`: which emitter lowers an element, and so which one
+// constant instruction it must produce. `ALD_U8` is the i32 lowering stored one byte wide.
+const ALD_I32 = 0
+const ALD_I64 = 1
+const ALD_F32 = 2
+const ALD_F64 = 3
+const ALD_U8 = 4
+
+// Build the `backTy` backing of a literal past the `array.new_fixed` cap of number or boolean
+// literals as one passive data segment read by `array.new_data`, so its code is a few bytes
+// whatever its length (D3417). Returns 1 when the backing is on the stack, 0 when some element
+// is not one constant instruction (nothing emitted), -1 when an element fails to lower.
+function arrLitDataBuild(
+  body: u8[],
+  elems: i32[],
+  fnIx: i32,
+  form: i32,
+  backTy: i32,
+): i32 {
+  let i = 0
+  while i < elems.length {
+    if !arrLitElemIsConst(elems[i]) { return 0 }
+    i = i + 1
+  }
+  const parts: { b: u8[] }[] = [{ b: [] }]
+  let n = 0
+  i = 0
+  while i < elems.length {
+    const one: u8[] = []
+    const prev = wTarget(one)
+    const rc = arrLitDataElemEmit(body, elems[i], fnIx, form)
+    wTarget(prev)
+    if rc < 0 { return -1 }
+    if parts[parts.length - 1].b.length >= LIT_PART { parts.push({ b: [] }) }
+    const w = arrLitDataPut(one, form, parts[parts.length - 1].b)
+    if w < 0 { return 0 }
+    n = n + w
+    i = i + 1
+  }
+  const seg = gStrDataLen.length
+  gStrDataStart.push(gStrDataParts.length)
+  gStrDataLen.push(n)
+  let k = 0
+  while k < parts.length {
+    gStrDataParts.push(parts[k])
+    k = k + 1
+  }
+  fbI32Const(0)            // segment offset
+  fbI32Const(elems.length) // element count
+  fbArrayNewData(backTy, seg)
+  1
+}
+
+// Wrap the `n`-element backing on the stack as a full list of wrapper type `wrapTy`.
+function arrLitWrap(n: i32, wrapTy: i32): i32 {
+  fbI32Const(n) // len
+  fbI32Const(n) // cap
+  fbStructNew(wrapTy)
+  0
+}
+
+// Whether element `ix` is a number literal, a negated one, or a boolean literal, in parens or not.
+function arrLitElemIsConst(ix: i32): boolean {
+  const x = unwrapParen(ix)
+  if x < 0 || x >= P.nodes.length { return false }
+  const e = P.nodes[x]
+  if e is Unary {
+    return e.unOp == "-" && arrLitLeafIsNum(unwrapParen(e.unArg))
+  }
+  arrLitLeafIsNum(x) || arrLitLeafIsBool(x)
+}
+
+function arrLitLeafIsNum(ix: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  P.nodes[ix] is NumLit
+}
+
+function arrLitLeafIsBool(ix: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  P.nodes[ix] is BoolLit
+}
+
+// Lower element `ix` the way the literal's own element loop does for `form`.
+function arrLitDataElemEmit(body: u8[], ix: i32, fnIx: i32, form: i32): i32 {
+  if form == ALD_I64 { return emitExprAsI64(body, ix, fnIx) }
+  if form == ALD_F32 { return emitExprAsF32(body, ix, fnIx) }
+  if form == ALD_F64 { return emitExprAsF64(body, ix, fnIx) }
+  emitExpr(body, ix, fnIx)
+}
+
+// Append the little-endian element bytes the lone constant instruction `ins` denotes to `out`,
+// returning their count, or -1 when `ins` is not exactly the one constant `form` expects.
+function arrLitDataPut(ins: u8[], form: i32, out: u8[]): i32 {
+  if ins.length < 2 { return -1 }
+  const op = ins[0] as i32
+  if form == ALD_F32 || form == ALD_F64 {
+    const w = if form == ALD_F32 { 4 } else { 8 }
+    if op != 0x43 + form - ALD_F32 || ins.length != w + 1 { return -1 }
+    let j = 1
+    while j <= w {
+      out.push(ins[j])
+      j = j + 1
+    }
+    return w
+  }
+  const want = if form == ALD_I64 { 0x42 } else { 0x41 }
+  if op != want { return -1 }
+  const w = if form == ALD_I64 { 8 } else if form == ALD_U8 { 1 } else { 4 }
+  // The signed LEB128 immediate, re-packed eight bits at a time and sign-filled to `w` bytes.
+  let bits = 0
+  let nb = 0
+  let put = 0
+  let j = 1
+  let last = 0
+  while j < ins.length {
+    last = ins[j] as i32
+    if (last & 0x80) != 0 && j == ins.length - 1 { return -1 }
+    if (last & 0x80) == 0 && j != ins.length - 1 { return -1 }
+    bits = bits | ((last & 0x7f) << nb)
+    nb = nb + 7
+    while nb >= 8 && put < w {
+      out.push(bits & 0xff)
+      bits = bits >>> 8
+      nb = nb - 8
+      put = put + 1
+    }
+    j = j + 1
+  }
+  const fill = if (last & 0x40) != 0 { 0xff } else { 0 }
+  if put < w {
+    out.push((bits & ((1 << nb) - 1)) | ((fill << nb) & 0xff))
+    put = put + 1
+  }
+  while put < w {
+    out.push(fill)
+    put = put + 1
+  }
+  w
 }
 
 // Lower the `len`-bounds guard of a list `xs[i]` read/write: stack holds [wrapper,
