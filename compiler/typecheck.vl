@@ -24,6 +24,27 @@ import {
   parseI64Pair,
 } from "./emit_bignum"
 import {
+  Cex,
+  cexAdd,
+  cexBitwise,
+  cexDecText,
+  cexDiv,
+  cexFitsSigned,
+  cexIntExactAt,
+  cexIsWhole,
+  cexLexeme,
+  cexMul,
+  cexNeg,
+  cexNot,
+  cexNotConst,
+  cexOfLexeme,
+  cexOk,
+  cexPatFits,
+  cexRem,
+  cexScaleBits,
+  cexShift,
+} from "./const_exact"
+import {
   ArrayLit,
   AsExpr,
   BinExpr,
@@ -767,6 +788,9 @@ let escJoinFn: i32[] = []
 const OP_NEG = "unary -"
 // The operator a deferred `as` over a gradual union is recorded under, the target on the right.
 const OP_AS = "as"
+// The constraint an operator records when a 64-bit integer constant meets a type-parameter
+// operand: the pin refuses a type narrower than the constant (D2712).
+const OP_LITFIT = "constant width"
 
 // Deferred binary-op constraints over un-annotated-param holes: with a hole operand, `a + b` /
 // `s + "!"` / `n < 2` cannot be decided in the body, a hole being permissively assignable to
@@ -5195,6 +5219,10 @@ export function initChecker() {
   litWide64 = []
   litTreeTy = []
   shiftCountNodes = []
+  cexWideLits = []
+  cexWideFloatOk = Map()
+  cexReported = Map()
+  cexNegOperand = Map()
   extValueSeen = false
   ckCalleeIx = -1
   extFnTy = []
@@ -14332,6 +14360,8 @@ export function lbiArenaReset() {
   lbiSynth = Map()
   lbiInlined = Map()
   lbiInlinedName = Map()
+  cexFolded = Map()
+  cexNotTree = Map()
   0
 }
 
@@ -14477,6 +14507,8 @@ function lbiMark(name: string, depth: i32, decl: i32, ty: i32) {
     if exprIsNumLit(n.letInit) { lit = parenPeelIx(n.letInit) }
     else if depth == 0 && n.letType < 0 { lit = lbiInitLit(n.letInit) }
     if lit < 0 { return 0 }
+    // A literal `const` is checked at each read; its declaration alone overflows nothing.
+    if n.letType < 0 && n.letKw == "const" { cexDeclLit(lit) }
     let ann = -1
     if n.letType >= 0 {
       if lbiIsSynth(n.letType, decl) {
@@ -14545,12 +14577,25 @@ function lbiScanModLits(stmts: i32[]) {
           && d.letInit >= 0
           && !lbiModLit.has(d.letName)
         ) {
-          const lit = lbiInitLit(d.letInit)
+          let lit = lbiInitLit(d.letInit)
+          if lit < 0 && cexFoldModInit(d.letInit) {
+            lit = lbiInitLit(d.letInit)
+          }
           if lit >= 0 {
             lbiModLit[d.letName] = lit
             grew = true
           }
         }
+      }
+    }
+  }
+  // Every other module initializer that is a constant tree is its literal too, so the declaration
+  // pass sees it as the bare spelling (an annotated `const`, a `let`).
+  for st in stmts {
+    const d = P.nodes[st]
+    if d is LetDecl {
+      if d.letInit >= 0 && (d.letKw != "const" || d.letType >= 0) {
+        cexFoldModInit(d.letInit)
       }
     }
   }
@@ -14841,6 +14886,508 @@ function lbiCopyLit(lit: i32, pos: i32): i32 {
   lbiInlined[out] = true
   out
 }
+
+// ── exact constants (DECISIONS.md, "Exact constant arithmetic") ─────────────────────────────
+// A tree of numeric literals, literal `const`s and arithmetic, bitwise and shift operators is
+// computed exactly and rewritten into the literal of its value, which each use then types as it
+// would that literal written there.
+
+// The roots a fold rewrote into their value's literal.
+let cexFolded: {[i32]: boolean} = Map()
+// The operators a walk below another found to be no constant tree, so their own check pays none.
+let cexNotTree: {[i32]: boolean} = Map()
+// Set while a module initializer is folded before any scope exists: a name is read only as the
+// module literal `const` it names.
+let cexModScan = false
+// How deep a fold walks before it leaves a tree to the ordinary check.
+const CEX_DEPTH = 64
+// The integer literals past the i64 range, checked once every float destination has taken the
+// ones it holds exactly.
+let cexWideLits: i32[] = []
+let cexWideFloatOk: {[i32]: boolean} = Map()
+// The literals a constant refusal already named, which the wide-literal check skips.
+let cexReported: {[i32]: boolean} = Map()
+// The operands of negations, whose literal may be 2^63.
+let cexNegOperand: {[i32]: boolean} = Map()
+// Set when a delivery rewrote a whole float constant into its integer.
+let cexConverted = false
+
+// The value of the constant tree at `ix`, or `cxNo` when it is not one.
+function cexEvalAt(ix: i32, depth: i32): Cex {
+  if ix < 0 || ix >= P.nodes.length { return cexNotConst() }
+  if depth > CEX_DEPTH { return cexNotConst() }
+  const e = P.nodes[ix]
+  if e is NumLit { return cexOfLexeme(e.numText) }
+  if e is Paren { return cexEvalAt(e.parInner, depth + 1) }
+  if e is Unary {
+    if e.unOp == "-" { return cexNeg(cexEvalAt(e.unArg, depth + 1)) }
+    if e.unOp == "~" { return cexNot(cexEvalAt(e.unArg, depth + 1)) }
+    return cexNotConst()
+  }
+  if e is BinExpr { return cexEvalBin(e, depth) }
+  if e is Ident { return cexEvalName(ix, e.identName, depth) }
+  cexLeafNotConst()
+}
+
+// Every other node, a call, a char or a string among them, is not a constant this fold computes.
+function cexLeafNotConst(): Cex { cexNotConst() }
+
+function cexEvalBin(e: BinExpr, depth: i32): Cex {
+  if e.binCompound.length > 0 || !cexOp(e.binOp) { return cexNotConst() }
+  const l = cexEvalAt(e.binLeft, depth + 1)
+  if !cexOk(l) { return l }
+  const r = cexEvalAt(e.binRight, depth + 1)
+  if !cexOk(r) { return r }
+  const op = e.binOp
+  if op == "+" { return cexAdd(l, r, false) }
+  if op == "-" { return cexAdd(l, r, true) }
+  if op == "*" { return cexMul(l, r) }
+  if op == "/" { return cexDiv(l, r) }
+  if op == "%" { return cexRem(l, r) }
+  if op == "&" || op == "|" || op == "^" { return cexBitwise(l, r, op) }
+  cexShift(l, r, op)
+}
+
+// Whether `op` is an operator a constant tree is made of: `+ - * / % & | ^ << >> >>>`.
+function cexOp(op: string): boolean { lbiOpClass(op) == LBI_OP_ARITH }
+
+// A read of an un-annotated literal `const` is its literal's value.
+function cexEvalName(ix: i32, name: string, depth: i32): Cex {
+  let lit = -1
+  if cexModScan {
+    lit = lbiModLit[name] ?? -1
+  } else {
+    lit = lbiConstLitAt(ix, name)
+  }
+  if lit < 0 { return cexNotConst() }
+  cexEvalAt(lit, depth + 1)
+}
+
+// Whether the node at `ix` could root a tree worth folding: an operator, or a `~` or a chain of
+// negations. A single negated literal is already the literal a fold would write.
+function cexRootShape(ix: i32): boolean {
+  const e = P.nodes[ix]
+  if e is BinExpr { return true }
+  if e is Unary {
+    if e.unOp == "~" { return true }
+    if e.unOp != "-" { return false }
+    return !(P.nodes[parenPeelIx(e.unArg)] is NumLit)
+  }
+  cexNoRoot()
+}
+
+// Every other node, a literal or a name among them, roots no tree a fold would rewrite.
+function cexNoRoot(): boolean { false }
+
+// Fold the tree at `ix` in place: 1 when it is rewritten into its value's literal, 2 when it is
+// a constant the check refuses (reported here), 0 when it is no constant tree.
+function cexTryFold(ix: i32): i32 {
+  if cexNotTree.length > 0 && (cexNotTree[ix] ?? false) { return 0 }
+  if !cexRootShape(ix) || cexTreeShape(ix, 0) != 1 { return 0 }
+  cexFoldAt(ix)
+}
+
+// `cexTryFold` for the operator `e` at `ix`, whose operator the caller has already admitted.
+function cexTryFoldBin(e: BinExpr, ix: i32): i32 {
+  if cexNotTree.length > 0 && (cexNotTree[ix] ?? false) { return 0 }
+  if cexTreeShape(e.binLeft, 1) != 1 || cexTreeShape(e.binRight, 1) != 1 {
+    return 0
+  }
+  cexFoldAt(ix)
+}
+
+// Fold the tree at `ix`, whose shape is a constant tree's.
+function cexFoldAt(ix: i32): i32 {
+  const v = cexEvalAt(ix, 0)
+  if v.cxNo || cexPastF64(v) {
+    cexKeepWhole(ix, 0)
+    return 0
+  }
+  if v.cxErr != "" {
+    tErr(v.cxErr, ix)
+    return 2
+  }
+  cexRewrite(ix, v)
+  1
+}
+
+// A constant tree the fold leaves unfolded (radix arithmetic, a width-dependent shift or `~`, a
+// float past the double range) computes whole at its use's width, so no part of it folds on its
+// own: `(1 << 31) - 0x1` keeps its decimal half at the width the radix half is read at.
+function cexKeepWhole(ix: i32, depth: i32) {
+  if ix < 0 || ix >= P.nodes.length || depth > CEX_DEPTH { return 0 }
+  const e = P.nodes[ix]
+  if e is BinExpr {
+    cexNotTree[ix] = true
+    cexKeepWhole(e.binLeft, depth + 1)
+    return cexKeepWhole(e.binRight, depth + 1)
+  }
+  if e is Unary {
+    cexNotTree[ix] = true
+    return cexKeepWhole(e.unArg, depth + 1)
+  }
+  if e is Paren { return cexKeepWhole(e.parInner, depth + 1) }
+  cexKeepLeaf()
+}
+
+// A literal or a name, the other nodes a constant tree holds, has nothing below it to keep.
+function cexKeepLeaf(): i32 { 0 }
+
+// Whether the node at `ix` has a constant tree's shape, reading no digits: 1 it has, 0 it has not,
+// -1 it is deeper than `CEX_DEPTH`. The walk stops at the first leaf that is no constant.
+function cexTreeShape(ix: i32, depth: i32): i32 {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  if depth > CEX_DEPTH { return -1 }
+  const e = P.nodes[ix]
+  if e is Ident {
+    if cexNameIsLitConst(ix, e.identName) { return 1 }
+    return 0
+  }
+  if e is NumLit { return 1 }
+  if e is Paren { return cexTreeShape(e.parInner, depth + 1) }
+  if e is Unary {
+    if e.unOp != "-" && e.unOp != "~" { return 0 }
+    return cexTreeShape(e.unArg, depth + 1)
+  }
+  if e is BinExpr {
+    if e.binCompound.length > 0 || !cexOp(e.binOp) { return 0 }
+    if cexNotTree.length > 0 && (cexNotTree[ix] ?? false) { return 0 }
+    let r = cexTreeShape(e.binLeft, depth + 1)
+    if r == 1 { r = cexTreeShape(e.binRight, depth + 1) }
+    if r == 0 { cexNotTree[ix] = true }
+    return r
+  }
+  cexShapeNotTree()
+}
+
+// Every other node, a call, a char or a string among them, is no constant tree.
+function cexShapeNotTree(): i32 { 0 }
+
+// Whether the read `ix` of `name` is a literal `const`'s. A name no literal binding in scope
+// carries is answered from its interned id before the full lookup.
+function cexNameIsLitConst(ix: i32, name: string): boolean {
+  if cexModScan { return lbiModLit.has(name) }
+  if lbiBindName.length == 0 || !lbiNameSeen[lbiNameKey(name)] { return false }
+  if lbiDefaultExpr.length == 0 || !(lbiDefaultExpr[ix] ?? false) {
+    // The newest literal binding of the name is the one in scope; a `let` there is no constant.
+    const r = sidArrGet(lbiBindTop, sidOfNode(ix))
+    if r < 0 || !lbiIsConst[lbiBindCand[r]] { return false }
+  }
+  lbiConstLitAt(ix, name) >= 0
+}
+
+// A float constant past the largest double stays the IEEE computation written, since VL has
+// no spelling for the infinity it rounds to.
+function cexPastF64(v: Cex): boolean {
+  if !v.cxFloat { return false }
+  // A double's largest finite value is below 2^1024; only a value near it needs the encoder.
+  const b = cexScaleBits(v)
+  if b < 1020 { return false }
+  if b > 1026 { return true }
+  f64LitOverflows(cexLexeme(v))
+}
+
+// Fold the module initializer `init` before the module is checked, so its reads anywhere are
+// its literal; false when it is not (yet) a constant tree.
+function cexFoldModInit(init: i32): boolean {
+  const p = parenPeelIx(init)
+  if p < 0 || !cexRootShape(p) { return false }
+  cexModScan = true
+  const v = cexEvalAt(p, 0)
+  cexModScan = false
+  if !cexOk(v) || cexPastF64(v) { return false }
+  cexRewrite(p, v)
+  true
+}
+
+// Rewrite the node `ix` into the literal of `v`, a negation over it when `v` is negative. The
+// names the tree read stay references for the editor.
+function cexRewrite(ix: i32, v: Cex) {
+  if symEnabled != 0 { cexNoteNames(ix, 0) }
+  const pos = nodePosOf(ix)
+  const lex = cexLexeme(v)
+  if v.cxNeg {
+    const inner = mkNum(lex, pos)
+    while nodeTyIx.length <= inner { nodeTyIx.push(-1) }
+    cexFolded[inner] = true
+    arenaSetNode(ix, { unOp: "-", unArg: inner, pos: pos })
+  } else {
+    arenaSetNode(ix, { numText: lex, pos: pos })
+  }
+  cexFolded[ix] = true
+  0
+}
+
+// Record every name the tree at `ix` reads as an editor occurrence of the `const` it names.
+function cexNoteNames(ix: i32, depth: i32) {
+  if ix < 0 || ix >= P.nodes.length || depth > CEX_DEPTH { return 0 }
+  const e = P.nodes[ix]
+  if e is Paren { return cexNoteNames(e.parInner, depth + 1) }
+  if e is Unary { return cexNoteNames(e.unArg, depth + 1) }
+  if e is BinExpr {
+    cexNoteNames(e.binLeft, depth + 1)
+    return cexNoteNames(e.binRight, depth + 1)
+  }
+  if e is Ident {
+    lbiInlinedName[ix] = e.identName
+    lbiSymRead(ix)
+    return 0
+  }
+  cexNamesNone()
+}
+
+// A literal, the one other node a constant tree holds, names nothing.
+function cexNamesNone(): i32 { 0 }
+
+// The source position of the tree at `ix`: its leftmost leaf's.
+function nodePosOf(ix: i32): i32 {
+  const e = P.nodes[ix]
+  if e is BinExpr { return nodePosOf(e.binLeft) }
+  if e is Paren { return e.pos }
+  if e is Unary { return e.pos }
+  if e is NumLit { return e.pos }
+  if e is Ident { return e.pos }
+  cexPosNone()
+}
+
+// A constant tree holds no other node; anything else has no position to give.
+function cexPosNone(): i32 { 0 }
+
+// Whether the literal at `ix` holds a constant's value rather than digits the author wrote there.
+function cexIsDerived(ix: i32): boolean {
+  const p = parenPeelIx(ix)
+  if p < 0 { return false }
+  if cexFolded.length > 0 && (cexFolded[p] ?? false) { return true }
+  lbiInlined.length > 0 && (lbiInlined[p] ?? false)
+}
+
+// The integer literal node under parentheses and negations at `ix`, or -1.
+function cexLitPeel(ix: i32): i32 {
+  if ix < 0 { return -1 }
+  const e = P.nodes[ix]
+  if e is Paren { return cexLitPeel(e.parInner) }
+  if e is Unary {
+    if e.unOp == "-" { return cexLitPeel(e.unArg) }
+    return -1
+  }
+  if e is NumLit { return ix }
+  cexNotLit()
+}
+
+// Every other node is no integer or float literal.
+function cexNotLit(): i32 { -1 }
+
+// The integer literal at `ix` meets a float destination or operand that holds it exactly.
+function cexFloatUse(ix: i32) {
+  if cexWideLits.length == 0 { return 0 }
+  const p = cexLitPeel(ix)
+  if p >= 0 { cexWideFloatOk[p] = true }
+  0
+}
+
+// The literal of an un-annotated `const`'s declaration, when it is long enough to overflow i64:
+// the declaration alone reads it nowhere, so only its reads are graded.
+function cexDeclLit(lit: i32) {
+  const wl = cexLitPeel(lit)
+  if wl < 0 { return 0 }
+  const e = P.nodes[wl]
+  if e is NumLit {
+    if e.numText.length >= 19 { cexReported[wl] = true }
+  }
+  0
+}
+
+// The operand of a negation, when it is a literal long enough to be 2^63.
+function cexNoteNegOperand(arg: i32) {
+  const p = parenPeelIx(arg)
+  if p < 0 { return 0 }
+  const e = P.nodes[p]
+  if e is NumLit {
+    if e.numText.length >= 19 { cexNegOperand[p] = true }
+  }
+  0
+}
+
+// An integer literal past the i64 range, recorded for `cexCheckWideLits`: a decimal past 2^63 - 1,
+// or a constant's pattern past 64 bits (a written one is refused where it stands).
+function cexNoteWideLit(ix: i32, text: string) {
+  if text.length < 19 { return 0 }
+  const rb = numLexRadixBits(text)
+  if rb >= 0 {
+    if rb > 64 && cexIsDerived(ix) { cexWideLits.push(ix) }
+    return 0
+  }
+  const v = cexOfLexeme(text)
+  if !cexOk(v) || v.cxFloat || cexFitsSigned(v, 64) { return 0 }
+  cexWideLits.push(ix)
+  0
+}
+
+// An integer literal no 64-bit integer holds, which no float destination took, overflows i64.
+function cexCheckWideLits() {
+  let i = 0
+  while i < cexWideLits.length {
+    const ix = cexWideLits[i]
+    const e = P.nodes[ix]
+    if e is NumLit {
+      if !(cexWideFloatOk[ix] ?? false) && !(cexReported[ix] ?? false) {
+        cexReported[ix] = true
+        let what = "integer literal "
+        if cexIsDerived(ix) { what = "constant " }
+        let s = e.numText
+        const neg = cexNegOperand[ix] ?? false
+        if neg { s = "-" + s }
+        if !(neg && cexIsMinI64(e.numText)) {
+          tErr(what + s + " overflows i64", ix)
+        }
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// Whether the decimal lexeme `t` is 2^63, which a negation makes the least i64.
+function cexIsMinI64(t: string): boolean {
+  if numLexRadixBits(t) >= 0 { return false }
+  const v = cexOfLexeme(t)
+  cexOk(v) && cexFitsSigned(cexNeg(v), 64)
+}
+
+// A constant delivered into `dstTy`, a number or a union with a number member: one the type
+// cannot hold is refused naming its value and the type, and a whole float constant at an
+// integer destination becomes that integer. Answers whether this decided the delivery.
+function cexDeliver(srcExpr: i32, dstTy: i32): boolean {
+  const lit = cexLitPeel(srcExpr)
+  if lit < 0 { return false }
+  const l = P.nodes[lit]
+  if !(l is NumLit) { return false }
+  const lt = nodeTyOf(lit)
+  const isF = lt == TY_F64 || lt == TY_F32
+  // Seven characters hold an integer every number type holds exactly, whatever the radix.
+  if !isF && l.numText.length <= 7 { return false }
+  let kind = 0
+  if dstTy == TY_I32 || dstTy == TY_I64 { kind = 1 }
+  else if dstTy == TY_F32 || dstTy == TY_F64 { kind = 2 }
+  else if T.tys[dstTy] is TyUnion { kind = 3 }
+  if kind == 0 { return false }
+  // Nine hold none past the i32 range, which `i64` and `f64` hold exactly too.
+  if !isF && l.numText.length <= 9 && (kind == 1 || dstTy == TY_F64) {
+    return false
+  }
+  if !cexIsDerived(srcExpr) { return false }
+  let v = cexOfLexeme(l.numText)
+  if !cexOk(v) { return false }
+  if intLitIsNegated(srcExpr) { v = cexNeg(v) }
+  if kind == 3 { return cexDeliverUnion(v, lit, srcExpr, dstTy) }
+  if cexFitsAt(v, l.numText, dstTy) {
+    if kind == 2 || !v.cxFloat { return false }
+    if !inferQuiet {
+      arenaSetNode(lit, { numText: cexDecText(v), pos: l.pos })
+      cexRetype(srcExpr, dstTy)
+      cexConverted = true
+    }
+    return true
+  }
+  cexReported[lit] = true
+  tErr(cexMisfitMsg(v, tyToStr(dstTy), kind == 2), srcExpr)
+  true
+}
+
+// A constant `v` delivered into the union `dstTy` is refused when no number member holds it.
+function cexDeliverUnion(v: Cex, lit: i32, srcExpr: i32, dstTy: i32): boolean {
+  const members: i32[] = []
+  flattenVariantsInto(dstTy, members)
+  let numeric = false
+  for m in members {
+    if m == TY_I32 || m == TY_I64 || m == TY_F32 || m == TY_F64 {
+      numeric = true
+      if cexFitsAt(v, cexLexeme(v), m) { return false }
+    }
+  }
+  if !numeric { return false }
+  cexReported[lit] = true
+  tErr(
+    "constant " + cexShown(v) + " fits no member of " + tyToStr(dstTy),
+    srcExpr,
+  )
+  true
+}
+
+// Whether the number type `ty` holds the constant `v`, whose literal is `lex`: an integer type
+// a whole value in range (a pattern by its digits), a float type an integer it holds exactly or
+// a float that stays finite there.
+function cexFitsAt(v: Cex, lex: string, ty: i32): boolean {
+  if ty == TY_I32 || ty == TY_I64 {
+    if v.cxFloat && !cexIsWhole(v) { return false }
+    let bits = 32
+    if ty == TY_I64 { bits = 64 }
+    if v.cxPat { return cexPatFits(v, bits) }
+    return cexFitsSigned(v, bits)
+  }
+  if !v.cxFloat {
+    if ty == TY_F32 { return cexIntExactAt(v, 24, 128) }
+    return cexIntExactAt(v, 53, 1024)
+  }
+  if ty == TY_F32 { return !f32LitOverflows(lex) }
+  true
+}
+
+// Why `v` does not fit the type named `tyName`: past its range, a fraction at an integer, or an
+// integer a float cannot hold exactly.
+function cexMisfitMsg(v: Cex, tyName: string, toFloat: boolean): string {
+  const shown = cexShown(v)
+  if toFloat && !v.cxFloat {
+    return "constant "
+      + shown
+      + " is not exact at "
+      + tyName
+      + " — write it as a float literal to round it"
+  }
+  if !toFloat && v.cxFloat && !cexIsWhole(v) {
+    return "constant "
+      + shown
+      + " is not a whole number, so "
+      + tyName
+      + " cannot hold it"
+  }
+  "constant " + shown + " overflows " + tyName
+}
+
+// `v` as a diagnostic quotes it: an integer in decimal, a float by its literal when that is short.
+function cexShown(v: Cex): string {
+  if !v.cxFloat { return cexSignedDec(v) }
+  let t = cexLexeme(v)
+  if t.length > 24 { t = t.slice(0, 20) + "…" }
+  if v.cxNeg { return "-" + t }
+  t
+}
+
+// An operand typed `otherTy`, when `i64`, beside a type-parameter operand typed `holeTy` is
+// computed at the parameter's width, so a narrower pin must refuse it (D2712).
+function cexNoteHoleWidth(holeTy: i32, otherTy: i32) {
+  if otherTy != TY_I64 || !tyHasHole(holeTy) || tyHasHole(otherTy) { return 0 }
+  noteBinCstr(holeTy, OP_LITFIT, otherTy)
+}
+
+// The decimal spelling of the integer `v`, signed.
+function cexSignedDec(v: Cex): string {
+  if v.cxNeg { return "-" + cexDecText(v) }
+  cexDecText(v)
+}
+
+// Type every node from `ix` down to its literal as `ty`.
+function cexRetype(ix: i32, ty: i32) {
+  if ix < 0 { return 0 }
+  if ix < nodeTyIx.length { nodeTyIx[ix] = ty }
+  const e = P.nodes[ix]
+  if e is Paren { return cexRetype(e.parInner, ty) }
+  if e is Unary { return cexRetype(e.unArg, ty) }
+  cexRetypeLeaf()
+}
+
+// The literal ends the chain `cexRetype` walks, typed above.
+function cexRetypeLeaf(): i32 { 0 }
 
 // A read `ix` of the name `name`, recorded when it is a candidate's.
 function lbiNoteRead(ix: i32, name: string) {
@@ -21022,8 +21569,8 @@ function litTreeWideTy(ix: i32, dstTy: i32): i32 {
   fty
 }
 
-// Whether a literal tree adopts a float destination (`7 / 2` read as 3.5 at an `f64`). Off: it
-// changes the value of programs that run today and awaits the owner's ruling (D2711).
+// Whether a literal tree adopts a float destination (`7 / 2` read as 3.5 at an `f64`). Off: an
+// integer constant's division truncates (DECISIONS.md, "Exact constant arithmetic"; D2711).
 function litTreeFloatAdopts(): boolean { false }
 
 // Whether a destination other than a bare `i64` could still be 64 bits wide (nullable or union).
@@ -21079,6 +21626,12 @@ function binShiftOp(op: string): boolean {
 
 export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
   lbiNoteDelivery(srcExpr, dstTy, nlAsgTgt)
+  if srcExpr >= 0 && dstTy >= 0 {
+    const cse = P.nodes[srcExpr]
+    if cse is NumLit || cse is Unary || cse is Paren {
+      if cexDeliver(srcExpr, dstTy) { return true }
+    }
+  }
   // A bare `{}` completes against a record destination; a required field it omits is refused
   // here, in words, instead of as the site's generic mismatch (D2223).
   if bareBraceDeliver(srcExpr, dstTy, 8, true) { return true }
@@ -21205,14 +21758,20 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
   // value is not covered. Destination first, and that order is load-bearing for compile time: the
   // integer half folds the lexeme into a bignum, while `dstAdmitsF32` is a short arena walk.
   if dstAdmitsF32(dstTy) {
-    if isF32AdoptingLitExpr(srcExpr) { return true }
+    if isF32AdoptingLitExpr(srcExpr) {
+      cexFloatUse(srcExpr)
+      return true
+    }
     if f32LitTailsAdopt(srcExpr, dstTy) { return true }
   }
   // The same grant one width up, and only its integer half: an i32-typed literal already rides
   // the `i32 -> f64` lattice edge, so what this admits is the literals between 2^31 and 2^53 that
   // type `i64` and would otherwise meet the lossy `i64 -> f64` refusal. D1890.
   if dstAdmitsF64(dstTy) {
-    if isExactF64IntLitExpr(srcExpr) { return true }
+    if isExactF64IntLitExpr(srcExpr) {
+      cexFloatUse(srcExpr)
+      return true
+    }
   }
   // A `const` literal, or a join of them, read as `string`: a literal-typed destination takes it at
   // the literal type it is, in a list or object literal exactly as at an argument (D2157).
@@ -21335,6 +21894,8 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
       if d is TyArray {
         let i = 0
         let ok = true
+        const cexWas = cexConverted
+        cexConverted = false
         while i < e.arrElems.length {
           const sp = P.nodes[e.arrElems[i]]
           if sp is Spread {
@@ -21355,6 +21916,10 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
           }
           i = i + 1
         }
+        // A whole float constant an element became is an integer, so the list is built at the
+        // destination's element type.
+        const cexElem = cexConverted
+        cexConverted = cexWas || cexElem
         // Context adoption (atom lists): a literal array accepted by a literal-union element target
         // is that atom list (`const ks: VK[] = ["aa", "bb"]`), so the destination array type is
         // recorded on the literal node and the emitter classifies it as the i32 atom-id list. The
@@ -21364,7 +21929,8 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
           && !inferQuiet
           && (tyIsLitUnion(d.aElem)
             || tyIsNicheNulScalarElem(d.aElem)
-            || arrLitJoinUnionElem(srcExpr, dtix))
+            || arrLitJoinUnionElem(srcExpr, dtix)
+            || cexElem)
         ) {
           if srcExpr < nodeTyIx.length { nodeTyIx[srcExpr] = dtix }
         }
@@ -39287,6 +39853,7 @@ function binOpDefinedFor(op: string, lt0: i32, rt0: i32) {
   if op == "min" || op == "max" { return minMaxPinOk(lt, rt) }
   if op == OP_NEG { return isNumeric(lt) }
   if op == OP_AS { return asPinHolds(lt0, rt0) }
+  if op == OP_LITFIT { return primNameOf(lt) != "i32" }
   // The nominal-brand mix the BODY deferred on a hole operand (D1747). Both operands are
   // concrete here, which is the precondition that question needs; only a branded PAIR is
   // judged, since a pin has no expression node for `nomBinMixes`'s literal-adoption legs.
@@ -40869,6 +41436,10 @@ function validateBinCstrs(
               refusal = "unary '-' expects a numeric type, got " + tyToStr(clt)
             }
             if binCstrOp[ci] == OP_AS { refusal = asPinRefusal(clt, crt) }
+            if binCstrOp[ci] == OP_LITFIT {
+              refusal = tyToStr(clt)
+                + " cannot hold the 64-bit operand it meets"
+            }
             // An ordering over a gradual union is refused in the direct spelling's words.
             const cop = binCstrOp[ci]
             if (
@@ -40917,6 +41488,9 @@ function validateBinCstrs(
               }
               if binCstrOp[ci] == OP_NEG {
                 tail = " (" + bodyWho + " negates this argument)"
+              }
+              if binCstrOp[ci] == OP_LITFIT {
+                tail = " (" + bodyWho + " computes with it and a 64-bit value)"
               }
               msg = head + refusal + tail
             }
@@ -51289,11 +51863,12 @@ function checkNodeReal(ix: i32) {
     }
     // A radix literal that adopted a 64-bit destination keeps that width across re-checks; one
     // wider than 64 bits has no destination at all, and says so here rather than wrapping.
+    if n.numText.length >= 19 { cexNoteWideLit(ix, n.numText) }
     if litWide64Of(ix) { return TY_I64 }
     const ltt = litTreeTyOf(ix)
     if ltt >= 0 { return ltt }
     if numLexRadixBits(n.numText) > 64 {
-      tErr(radixLitTooWideMsg(n.numText, 64), ix)
+      if !cexIsDerived(ix) { tErr(radixLitTooWideMsg(n.numText, 64), ix) }
       return TY_I64
     }
     if numLexFitsI32(n.numText) { return TY_I32 }
@@ -51396,8 +51971,19 @@ function checkNodeReal(ix: i32) {
     return checkCastNode(n, ix)
     // ── unary ─────────────────────────────────────────────────────────────────
   } else if n is Unary {
+    if n.unOp == "-" || n.unOp == "~" {
+      const uf = cexTryFold(ix)
+      if uf == 1 { return checkNodeReal(ix) }
+      if uf == 2 { return TY_ERR }
+      if n.unOp == "-" { cexNoteNegOperand(n.unArg) }
+    }
     return checkUnaryNode(n, ix)
   } else if n is BinExpr {
+    if n.binCompound.length == 0 && cexOp(n.binOp) {
+      const bf = cexTryFoldBin(n, ix)
+      if bf == 1 { return checkNodeReal(ix) }
+      if bf == 2 { return TY_ERR }
+    }
     return checkBinExprNode(n, ix)
   } else if n is Call {
     const callTy = checkCallNode(n, ix)
@@ -53469,6 +54055,7 @@ function checkProgramPass(rootIx: i32) {
   checkProgramEndOpDecls()
   recordTopScalars()
   checkShiftCounts()
+  cexCheckWideLits()
   rcwRunPending()
   recRunPending()
   checkProgramEndGetters()
@@ -53492,10 +54079,10 @@ function checkShiftCounts() {
       if lt == TY_I32 { w = 32 }
       if lt == TY_I64 { w = 64 }
       const lex = intLitLexemeOf(n.binRight)
-      if w > 0 && lex != "" && !lbiIsInlined(n.binRight) {
+      if w > 0 && lex != "" {
         const neg = intLitIsNegated(n.binRight)
         if (
-          (neg || !numLexFitsI32(lex) || parseI32(lex) >= w)
+          (neg || !numLexFitsI32(lex) || !cexCountBelow(lex, w))
           && !(reported[ix] ?? false)
         ) {
           reported[ix] = true
@@ -53506,6 +54093,12 @@ function checkShiftCounts() {
     i = i + 1
   }
   0
+}
+
+// Whether the count lexeme `lex` is below the width `w`, a radix count read at its full value.
+function cexCountBelow(lex: string, w: i32): boolean {
+  if numLexRadixBits(lex) < 0 { return parseI32(lex) < w }
+  numLexRadixBits(lex) <= 6 && parseI32(lex) < w
 }
 
 // Whether the integer literal at `ix` is under an odd number of unary minuses.
@@ -53535,7 +54128,9 @@ function shiftCountMsg(op: string, lex: string, neg: boolean, w: i32): string {
     + op
     + "` would take it modulo "
     + ws
-  if w != 32 || neg || !numLexFitsI32(lex) || parseI32(lex) >= 64 { return msg }
+  if w != 32 || neg || !numLexFitsI32(lex) || !cexCountBelow(lex, 64) {
+    return msg
+  }
   msg
     + "; widen the operand (`(x as i64) "
     + op
@@ -58693,6 +59288,8 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
         op,
         eqCstrOperandTy(op, n.binRight, rt),
       )
+      cexNoteHoleWidth(lt, rt)
+      cexNoteHoleWidth(rt, lt)
     }
   }
   // Nominal newtype (P1.5): every non-assignment binary operator's operands must carry the
@@ -59317,8 +59914,14 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
   // The f64 twin, integer half only — a `.`-literal already types f64 and needs no arm. Without
   // it `fv + 9000000000` is the mixed-numeric refusal while the same literal ASSIGNED to an f64
   // is admitted, so the two faces of one grant would disagree (D1890).
-  if primNameOf(lt) == "f64" && isExactF64IntLitExpr(n.binRight) { return lt }
-  if primNameOf(rt) == "f64" && isExactF64IntLitExpr(n.binLeft) { return rt }
+  if primNameOf(lt) == "f64" && isExactF64IntLitExpr(n.binRight) {
+    cexFloatUse(n.binRight)
+    return lt
+  }
+  if primNameOf(rt) == "f64" && isExactF64IntLitExpr(n.binLeft) {
+    cexFloatUse(n.binLeft)
+    return rt
+  }
   // A mixed-numeric op widens the narrower operand to the wider one (`i32 op i64` -> i64, ...),
   // done before the same-type check so a compatible mixed pair is accepted (B2).
   if mixesNumeric(lt, rt) { return widerNumeric(lt, rt) }

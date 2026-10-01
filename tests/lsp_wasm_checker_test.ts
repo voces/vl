@@ -177,7 +177,7 @@ Deno.test({ name: "wasm-checker: a defaulted numeric literal names its declarati
       ["argument 1: expected f32, got f64", conflict("u", 4, "f64", 5, "f32")],
     ],
     // A literal `const` is its literal at the read, so the mismatch is the literal's own.
-    ["function h(a: i32): i32 { a }\nconst F = 2.5\nprint(h(F))\n", ["argument 1: expected i32, got f64"]],
+    ["function h(a: i32): i32 { a }\nconst F = 2.5\nprint(h(F))\n", ["constant 2.5 is not a whole number, so i32 cannot hold it"]],
   ];
   for (const [src, want] of scalars) {
     const got = await msgs(src);
@@ -285,14 +285,15 @@ Deno.test({ name: "wasm-checker: a defaulted literal read inside a value names i
     const got = await msgs(src);
     if (got.length !== 0) throw new Error(`want ${JSON.stringify(src)} clean, got ${JSON.stringify(got)}`);
   }
-  // An `f32` holds integers only up to 2^24 exactly: the literal's own refusal at the read.
+  // An `f32` holds integers only up to 2^24 exactly: the constant's refusal at the read.
   const v = await msgs(g + "const v = 16777217\nprint(mul(v, 1.0))\n");
-  if (JSON.stringify(v) !== JSON.stringify(["argument 1: expected f32, got i32"])) {
+  const wantV = ["constant 16777217 is not exact at f32 — write it as a float literal to round it"];
+  if (JSON.stringify(v) !== JSON.stringify(wantV)) {
     throw new Error(`want the bare mismatch, got ${JSON.stringify(v)}`);
   }
   // D2981: a float literal stored into an integer `let` is refused; the `let` keeps its kind.
   const store = await msgs(g + "const b = 1.5\nlet w = 0\nw = b\nprint(gi(w))\n");
-  const wantStore = ["cannot assign f64 to i32"];
+  const wantStore = ["constant 1.5 is not a whole number, so i32 cannot hold it"];
   if (JSON.stringify(store) !== JSON.stringify(wantStore)) {
     throw new Error(`want ${JSON.stringify(wantStore)}, got ${JSON.stringify(store)}`);
   }
@@ -321,6 +322,12 @@ Deno.test({ name: "wasm-checker: a function value's defaulted literal return nam
       mis + " — `k` returns the literal `-1` on line 4, so its return defaulted to `i32`; " +
       "annotate it: `const k = (x: i64): i64 => -1`",
     ],
+    // A tree of literals is its constant, so it is named by its value.
+    [
+      g + "function m(x: i64) { 2 * 3 }\nprint(ap(m))\n",
+      mis + " — `m` returns the literal `6` on line 4, so its return defaulted to `i32`; " +
+      "annotate it: `function m(x: i64): i64 { … }`",
+    ],
     // A call whose result still fits the annotated return keeps the note.
     [
       g + "function c(x: i64) { 5 }\nprint(ap(c))\nprint(c(2))\nc(3)\nconst y: i64 = c(4)\nprint(y)\n",
@@ -348,8 +355,8 @@ Deno.test({ name: "wasm-checker: a function value's defaulted literal return nam
     // A lambda binding that is reassigned, or aliased.
     [g + "function z(x: i64): i32 { 0 }\nlet k = (x: i64) => -1\nprint(ap(k))\nk = z\n", [mis]],
     [g + "function h(x: i64) { 7 }\nconst al = h\nprint(ap(h))\nprint(a32(al))\n", [mis]],
-    // A return that is not a literal.
-    [g + "function m(x: i64) { 2 * 3 }\nprint(ap(m))\n", [mis]],
+    // A return that is not a literal (a tree of literals is one: its constant, exact).
+    [g + "function m(x: i64) { (x as% i32) * 3 }\nprint(ap(m))\n", [mis]],
     // A call result the annotation would change: cast, operator, inferred tail, member call.
     [g + "function c1(x: i64) { 5 }\nprint(ap(c1))\nprint(c1(1) as i32)\n", [mis]],
     [g + "function c2(x: i64) { 5 }\nprint(ap(c2))\nprint(c2(1) * 1000000000)\n", [mis]],
