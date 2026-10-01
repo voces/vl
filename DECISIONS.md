@@ -9450,3 +9450,83 @@ rows, which an object has no analogue of). The SP-004 split was not a layout rul
 shorthand pushed the literal past the width. Keeping the author's line breaks was considered and
 not taken: it would make objects the one bracketed list whose layout is the author's, and a
 written break would then survive every later edit that shortened the literal.
+
+## Runtime numbers of different types join as a union, and operators dispatch per member (owner ruling, 2026-09-30) — D3345, D3363, D3449, D3450
+
+The goal is that no annotation is ever required, and a join that silently widened `i32` into
+`f64` lost the one fact an annotation would have kept: which type the value is. The ruling has four
+parts. A literal adapts, as before (`if c { 2.5 } else { 5 }` is `f64`). Two runtime values of
+different numeric types join as their union (`i32 | f64`), in any arm order, beside a `null` arm,
+and in the direct spelling, a generic pin and a hole alike. An operator over a numeric union
+computes at each member's own type and yields the union of the results (Julia's dispatch), so
+`i64 | f64` stays exact and `is` still answers after arithmetic. A numeric union delivers into a
+single numeric type only when every member converts to it exactly.
+
+**What a "join" is here.** The arms of a value `if` or `match`, and an inferred return set
+(`return` statements, a tail `if`'s arms, the implicit tail). A list literal's elements and `??`
+still widen; whether the ruling covers them is D3451's question. An arm counts as a literal when
+every value it yields is a number literal, an operator tree of them, `null` or an assignment, and
+one is not `null` (`valueIsLitOnly`): an arm of only `null` adapts to nothing, so `if a { x } else
+if b { y } else { null }` keeps `x` and `y` apart. A literal inside a union chain boxes at its own
+type when that type is a member (`if a { y } else if b { x } else { 4 }` boxes `4` as `i32`).
+
+**Where the rule lives.** `joinTys` takes `njApart` for one call; `joinArmLit` and `inferRetJoin`
+set it when neither side is a literal, and `numApartJoin` then keeps the numeric members apart
+instead of taking `assignable`'s widening. A join kept apart over type parameters is marked
+(`markTpJoinApart`) so its pin re-joins apart too (`rejoinMembers`), which is what closes D3345; the
+emitter's pin join (`joinPinnedArmLit`) reads the same literal flags off the arm nodes.
+
+**Dispatch is a lowering, not a desugaring.** `emitNumUnionBin` stashes each operand once in a
+lazy-frame slot keyed by nesting depth (codes 26 and 27), tests the box tag, and runs each member
+pair through the scalar opcode tables at the pair's type (`numPairOpTy`, the checker's own pair
+rule, so the two cannot disagree). A rewrite into an `if` chain would have needed a fresh binding
+for every operand that is not a place, which VL has no expression form for. A pair the scalar rule
+refuses (`i32 + f32`, `i64 + f64`) refuses the whole operator, naming the pair.
+
+**A program with no numeric union pays one global read per hook.** `numUnionMinted` is set the
+first time `mkUnionTy` mints a union of numbers outside a `std:` function body (a join, an
+annotation, a substitution, a narrowing's remainder), and every checker and emitter hook tests it
+first. std's own narrowings do not count: `toString`'s `i32 | i64 | boolean | f64` narrows to a
+numeric remainder in every program that interpolates, and std does no arithmetic over one. The
+classifier gates sit inside the `if`/operator arms that could misread a box, not ahead of the
+typed fast path, since even one global read there priced plumb's units at +0.1%.
+
+**The join is kept only where every caller reads it directly; elsewhere it stays master's widening
+(D3494, D3495).** The #3327 review found three loss families, and each needed a different
+mechanism to carry the union somewhere new:
+- a wrapper's template, through `validateEscJoins`;
+- a literal adapting beside kept-apart arms at a pin;
+- master's own mistyped `f32 | i32` for an `i64` arm, which the new operators trapped over where
+  master had refused them.
+
+Each lost programs that ran on master. So the lane holds those positions back instead of fixing
+them in a fourth round:
+- A function is `njFnReached` when it is named inside a generic, hole or lambda body, read as a
+  value, or names itself. Every join in it is master's, and so is its instance (`njPinGated`).
+- A return set holding a literal leaf, or a call of a held-back function, is `njFnGated`. Only
+  its return joins are master's.
+- The result of a call to a held-back function whose own inferred return is a join, and a
+  `const` bound only from such a result, is `njExprHeld`. The operators, conversions and
+  deliveries the ruling adds are refused over that expression, as master refused them. The hold
+  is on the expression, never the type: a direct join's `i32 | f64` is the same arena row, and
+  holding the row refused arithmetic on a direct union once any held call shared it (the second
+  re-review's v5).
+
+The test is per function, not per call, so a direct call of a function some generic also calls
+widens too. That is the conservative direction. On the review's 1,248-cell return-set grid every
+held cell prints or refuses as on master: eight that build invalid wasm on master still do,
+first failing at a later line. Every direct, generic and hole cell prints
+the member's own value.
+
+**`as T` over an all-numeric union converts when no member can fail** (a float target, or `i64`
+over integer members), because that is what the ruling's fix message (`write x as f64`) needs
+`as f64` over `i64 | f64` to do. Where some member's conversion can fail (`(i32 | f64) as? i32`) it
+stays the member cast it is over any union, so no running program changes meaning.
+
+Measured on the numeric-join grid (four member types in every ordered pair, with and without a
+`null` arm in three positions, at nine positions, each cell printing every operator's result
+against a Python oracle): 432 of 432 cells correct, 40 of 40 lossy deliveries refused. Before the
+lane, a probe build counted the joins whose type would change: none in plumb, none in the
+distilled corpus's if/match/return joins, one in `tests/cases` (`numerics/f32-f64-join-widens.vl`,
+whose values did not change; its `redundant annotation` hints went, since the functions now infer
+a union).
