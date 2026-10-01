@@ -5017,6 +5017,7 @@ export function initChecker() {
   holeCastArgIx = []
   holeMapNames = []
   holeMapTys = []
+  holeElseTested = Map()
   holeAltNames = []
   holeAltTys = []
   holeAltPreN = []
@@ -8279,8 +8280,12 @@ function aliasWriteHitsKey(
     ) {
       if s < steps.length - 1 { return true }
       if rt < 0 || npTy < 0 || !assignable(rt, npTy) { return true }
-      // A hole admits every write, which proves nothing about the pin's value (D3197).
-      if tyIsHole(npTy) { return true }
+      // A hole admits every write, which proves nothing about the pin's value (D3197). The
+      // else arm of `is T` on one holds the pin's remainder, which a write of no `T` lands in.
+      if tyIsHole(npTy) {
+        const te = holeElseTested[key + "|" + i32ToStr(npTy)] ?? -1
+        return te < 0 || tyMayHoldTy(rt, te)
+      }
       // A numeric value the narrowing only widens to is stored as its own member (D2609).
       if numericVariantUncovered(rt, npTy) { return true }
     }
@@ -8420,6 +8425,23 @@ function crValUseWalk(ix: i32) {
   0
 }
 
+// Per `key|hole`, the type `T` whose `is T` else arm left the hole as the path's fact.
+let holeElseTested: {[string]: i32} = Map()
+
+// Whether a value typed `rt` may be a `te`: `rt` or one of its members overlaps `te`.
+function tyMayHoldTy(rt: i32, te: i32): boolean {
+  if assignable(rt, te) || assignable(te, rt) { return true }
+  const r = T.tys[rt]
+  if r is TyUnion {
+    let i = 0
+    while i < r.uMembers.length {
+      if assignable(r.uMembers[i], te) { return true }
+      i = i + 1
+    }
+  }
+  false
+}
+
 // Whether values of types `a` and `b` may be one object; true when either is unknown.
 function objTysMayAlias(a: i32, b: i32): boolean {
   if a < 0 || b < 0 { return true }
@@ -8522,12 +8544,7 @@ function retireNarrowingsForWrite(
       if pd >= 0 && !tySame(writeNarrowAfter(pd, npTys[i], rt), npTys[i]) {
         hit = true
       }
-      if (
-        pd >= 0
-        && tvCellFree(tgtIx)
-        && tvPlaceWrite(pd, rt)
-        && !tyIsTvWriteOf(npTys[i], pd, rt)
-      ) {
+      if (pd >= 0 && tvPlaceWrite(pd, rt) && !tyIsTvWriteOf(npTys[i], pd, rt)) {
         hit = true
       }
     }
@@ -8565,7 +8582,7 @@ function retireNarrowingsForWrite(
         // A map cell reads `T | null` at its declaration, since a read may miss; the write just
         // stored the key, so the reads after it hold the stored type.
         if prn != pdcl || placeIsMapCell(tgtIx) { pathReTy = prn }
-        if tvCellFree(tgtIx) && tvPlaceWrite(pdcl, rt) {
+        if tvPlaceWrite(pdcl, rt) {
           pathReTy = tvWriteTy(pdcl, rt, -1)
           pathReAsg = true
           recordAsgTvWrite(atIx, pdcl)
@@ -8579,7 +8596,7 @@ function retireNarrowingsForWrite(
   // it, as `x = 5` does a name (D1848, D3316). A map cell's `null` is the miss, so it is left out.
   if narrowedPathTyRaw(tgtKey) < 0 && pathReTy < 0 && !placeIsMapCell(tgtIx) {
     const pst = placeStoreTy(tgtIx)
-    if pst >= 0 && tvCellFree(tgtIx) && tvPlaceWrite(pst, rt) {
+    if pst >= 0 && tvPlaceWrite(pst, rt) {
       pathReTy = tvWriteTy(pst, rt, -1)
       pathReAsg = true
       recordAsgTvWrite(atIx, pst)
@@ -8777,15 +8794,6 @@ function writeLandNestedTy(ty: i32): i32 {
   ty
 }
 
-// Whether the write target `tgtIx` is a name or a field rather than a list cell, whose pushed
-// narrowing a closure over the list would inherit; a cell keeps the template's read (D3419).
-function tvCellFree(tgtIx: i32): boolean { !isIndexPlace(tgtIx) }
-
-// Whether node `ix` is a list or map cell `a[i]`; false for -1.
-function isIndexPlace(ix: i32): boolean {
-  ix >= 0 && ix < P.nodes.length && P.nodes[ix] is Index
-}
-
 // The type a place declared `dcl` reads at after `tvPlaceWrite` stored `rt`: `cur` when it
 // already is that read, else a fresh `HD_TVW` hole over `rt`.
 function tvWriteTy(dcl: i32, rt: i32, cur: i32): i32 {
@@ -8959,8 +8967,9 @@ function crPathCallRetire(slot: i32, callIx: i32) {
   crCaptureCallCheck(slot, callIx)
   // A verdict an untyped receiver forced is the checker not knowing, not a write: it keeps the
   // refusal, so a re-check at the call's argument types decides rather than inheriting a
-  // declared-type read this body never needed.
-  if crCalleeUnresolved(callIx) || crInHoleTemplate() { return 0 }
+  // declared-type read this body never needed. A read each pin answers is that re-check (D3446).
+  if crCalleeUnresolved(callIx) { return 0 }
+  if crInHoleTemplate() && !tyIsWriteLandRead(npTys[slot]) { return 0 }
   const top = crStmtIxs.length - 1
   if top < 0 || crStmtFns[top] != crFnBases.length {
     // A monomorphization re-check opens no statement; the original check settled this call.
@@ -9095,9 +9104,13 @@ function crNoteCaptureRead(key: string) {
 // of that read gains: the function that dropped it, at the scope depth it is checked in.
 function crNoteLostRead(key: string, ix: i32) {
   const slot = narrowedPathIx(key)
-  if slot < 0 || npInvBy[slot] >= 0 || !crPathCaptureLost(slot, key) {
-    return 0
+  if slot < 0 || !crPathCaptureLost(slot, key) { return 0 }
+  // The emitter replays no narrowing of this path into the body (`capWidenOf`, D3419).
+  if crFnIxs.length > 0 && key.indexOf(",") < 0 {
+    const fnIx = crFnIxs[crFnIxs.length - 1]
+    crCapWidenBank[fnIx] = crwAddName(crCapWidenBank[fnIx] ?? ",", key)
   }
+  if npInvBy[slot] >= 0 { return 0 }
   crLostKeys.push(key)
   crLostIxs.push(ix)
   crLostFns.push(crFnIxs[crFnIxs.length - 1])
@@ -12001,14 +12014,9 @@ export function recordClonedCallRetire(from: i32, to: i32) {
 }
 
 // A clone of assignment `from` answers its write's narrowing banks (`asgNarTyIxOf`,
-// `asgStripTyOf`, `asgKeepsNarrowOf`, `asgTvWriteOf`), which are keyed by node. A list cell's
-// write keeps none, since a closure over the list would inherit the narrowing (D3419).
+// `asgStripTyOf`, `asgKeepsNarrowOf`, `asgTvWriteOf`), which are keyed by node.
 function carryAsgBanks(from: i32, to: i32) {
   if from < 0 || from >= P.nodes.length { return 0 }
-  const fn0 = P.nodes[from]
-  if fn0 is BinExpr {
-    if isIndexPlace(fn0.binLeft) { return 0 }
-  }
   const nt = asgNarTyIxOf(from)
   if nt >= 0 { recordAsgNarTyIx(to, nt) }
   const st = asgStripTyOf(from)
@@ -13383,6 +13391,15 @@ function collectElseNarrowsRaw(condIx: i32, names: string[], tys: i32[]) {
         // annotated twin runs (D1243). `holeElseRemainderOk` says which types it may mint for.
         if sub < 0 && holeElseRemainderOk(tIdx) {
           sub = mkDerivedHole(HD_GNOT, "", -1, tIdx, cur)
+        }
+        // On a hole's field, a shape `T` leaves the hole itself as the arm's fact, so a write
+        // or call that ends the remainder the instance narrows to re-asks the reads after it
+        // at the pin (D3420). A bare name keeps no fact, so it reads at its demand.
+        const hk = placeKeyOf(isPl)
+        if sub < 0 && tyIsHole(cur) && hk != "" && isPathKey(hk) {
+          holeElseTested[hk + "|" + i32ToStr(cur)] = tIdx
+          pushNarrowFact(isPl, cur, names, tys)
+          return 0
         }
         pushNarrowFact(isPl, sub, names, tys)
         // The complement, banked into the else table. `setNarrowFromCondElse` declines to
@@ -39530,10 +39547,9 @@ export function memCstrMsg(recv: i32, prop: string) {
   }
   if keyHasPrefix(prop, MC_NULL_READ_MARK) {
     if !tyAdmitsNull(recv) { return "" }
-    return memberFloorMsg(
-      recv,
-      prop.slice(MC_NULL_READ_MARK.length, prop.length),
-    )
+    const nrProp = prop.slice(MC_NULL_READ_MARK.length, prop.length)
+    if nrProp == OP_INDEX_GET { return indexFloorMsg(recv) }
+    return memberFloorMsg(recv, nrProp)
   }
   if keyHasPrefix(prop, MC_METHOD_MARK) {
     const name = prop.slice(MC_METHOD_MARK.length, prop.length)
@@ -39620,6 +39636,30 @@ function narrowingEndedAt(place: i32): boolean {
   if base < 0 { base = 0 }
   while s >= base {
     if npKeys[s] == key { return npInvBy[s] >= 0 }
+    s = s - 1
+  }
+  false
+}
+
+// Whether the innermost narrowing of the place `place` in this function is the remainder of an
+// `is` test on a hole (`holeElseTested`) that a write, a call `callKillSure` settles, or a write
+// through an alias ended; false when none covers it.
+function holeRemainderEndedSure(place: i32): boolean {
+  const key = placeKeyOf(place)
+  if key == "" { return false }
+  let s = npKeys.length - 1
+  let base = crFnNpBase()
+  if base < 0 { base = 0 }
+  while s >= base {
+    if npKeys[s] == key {
+      const by = npInvBy[s]
+      if by < 0 { return false }
+      if (holeElseTested[key + "|" + i32ToStr(npTys[s])] ?? -1) < 0 {
+        return false
+      }
+      if crAliasWr[by] ?? false { return true }
+      return npKillSure[i32ToStr(by) + "|" + key] ?? false
+    }
     s = s - 1
   }
   false
@@ -45142,6 +45182,11 @@ function checkMemberCallNode(
       const elemHole = mkDerivedHole(HD_ELEM, "", -1, -1, recvTy)
       recvTy = mkArrayTy(elemHole)
     } else if holeMapMethod(prop) {
+      // A place a type-parameter write left nullable at some pins is asked at each, unless
+      // the call is optional (D3445).
+      if recvPre < 0 && tyIsWriteLandRead(recvTy) {
+        noteMemCstr(recvTy, MC_NULL_READ_MARK + prop, ix, false)
+      }
       // The dual for a hole receiving a map/set method: becomes the hole's demanded map
       // (`{[?]: ?}`) and falls into the map-method arm below, which pins the open key/value
       // from the method's own arguments — `.add` mints the Set flavor. Without this the hole
@@ -66510,9 +66555,14 @@ function checkMemberNode(n: Member, ix: i32) {
     if ot.tvName.length > 0 {
       if ot.tvName[0] == '?' {
         noteNullReadCstr(objTy, n.memProp, ix, n.memObj)
-        // A read off a declared parameter's derivation after a write or call ended its
-        // narrowing is re-asked at its pin, as the direct spelling's read is (D3233).
-        if tyIsDeclaredParam(hdRootTy(objTy)) && narrowingEndedAt(n.memObj) {
+        // A read off a parameter's derivation after a write or call ended its narrowing is
+        // re-asked at its pin, as the direct spelling's read is (D3233); off an un-annotated
+        // parameter's, only an `is` remainder every pin sees ended (D3420).
+        if (
+          narrowingEndedAt(n.memObj)
+          && (tyIsDeclaredParam(hdRootTy(objTy))
+            || holeRemainderEndedSure(n.memObj))
+        ) {
           noteMemCstr(objTy, n.memProp, ix, false)
         }
         // `.length` is the i32 length an array/string/map exposes — treat it as that (not a
@@ -66663,6 +66713,9 @@ function checkIndexNode(n: Index, ix: i32) {
       // A non-i32 index can only be a map — constrain the hole to its demanded map and pin
       // the key from the index (the index-spelling twin of the `.set` arm's pin).
       if mapKeyTySupported(idxTy) {
+        if tyIsWriteLandRead(arrTy) {
+          noteMemCstr(arrTy, MC_NULL_READ_MARK + OP_INDEX_GET, ix, false)
+        }
         const hmi = holeMapDemandTy(at.tvName, false)
         const hmt = T.tys[hmi]
         if hmt is TyMap {
