@@ -8785,6 +8785,25 @@ migrates silently and cannot be detected: an unused label on a loop first in a b
 checker refuses only when that value is `void`. `scripts/codemods/label-at.py` rewrites a tree,
 and rewrites that shape too.
 
+## `{ name, … }` is an object too; only a lone `{ name }` is a block (2026-10-02) — D3475
+
+**The rule.** Where a body, branch or arm may be either a block or an object literal, braces whose
+first token (past newlines) is a name followed by `,` are an object literal, as `{ name: … }`
+already was: `{ id, x: x }`, `{ id, x }`, a trailing comma `{ id, }`, and each of those across
+lines. Braces holding a lone `{ name }` stay a block whose value is `name`, and `{}` stays an empty
+block. The deciding function is `looksLikeObject` in `compiler/parser.vl`, which every such
+position consults: a function or lambda body, an `if`/`else` branch, a `match` arm and a
+statement.
+
+**Why a comma, and why not a lone name.** No statement is followed by a comma, so `{ id,` could
+only ever begin an object, and before this rule it was a parse error (sunpa SP-001); taking it is
+a pure capability add that changes the meaning of no program master accepted. The trailing-comma
+form `{ id, }` follows from the same argument: a block cannot contain `id,` either, so it is a
+one-field object rather than a second rule. `{ name }` is different: it is a legal block today, an
+`if b { x } else { y }` arm reads naturally as one, and reading it as an object would silently
+retype every such program. The one-field shorthand object in a body position is written
+`({ name })` or `{ name, }`.
+
 ## Parameter names in a function type are documentation (owner ruling A1, 2026-09-29) — plumb PL-060
 
 **The ruling.** A function type may name its parameters, `type GuestCall = (fn: i32, rcx: i64,
