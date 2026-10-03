@@ -15,6 +15,7 @@ import {
   OptMember,
   P,
   Param,
+  Paren,
   StrLit,
   Unary,
   aliasFnParamNames,
@@ -61,6 +62,7 @@ import {
   redunSLine,
   redunTok,
   redunType,
+  scopeResConst,
   scopeResKind,
   scopeResName,
   scopeResRaw,
@@ -107,6 +109,7 @@ import {
 // completion detail), so it renders through the user pathway — `tyToStrUser` /
 // `tyToStructStrUser`, demangle then render — never the raw `tyToStr`, whose spelling
 // doubles as a canon and interner key and keeps its `$mN` mangles.
+import { cexDecText, cexLexeme, cexOfLexeme, cexOk } from "./const_exact"
 import { srcmapModOfTok } from "./srcmap"
 import {
   T,
@@ -119,6 +122,7 @@ import {
   cUserTypes,
   demangleName,
   inlayHole,
+  lbiExactConstLit,
   nodeTyIxOf,
   strLitRecvTy,
   tyToStrUser,
@@ -396,6 +400,56 @@ export function symTypeStrAt(line: i32, col: i32) {
   }
   tyToStrUser(ty)
 }
+
+// Exact-constant hover: "" off an un-annotated literal `const`; else `decl` or `use`, the type
+// this read took ("" at the declaration), then `cqConstFields`, one per line.
+export function symConstAt(line: i32, col: i32) {
+  const occ = symOccAt(line, col)
+  if occ < 0 || occ >= symOccDecl.length { return "" }
+  const f = cqConstFields(symOccDecl[occ])
+  if f == "" { return "" }
+  if symOccIsDecl[occ] == 1 { return "decl\n\n" + f }
+  const ty = symOccQueryTy(occ)
+  let ts = ""
+  if ty >= 0 { ts = tyToStrUser(ty) }
+  "use\n" + ts + "\n" + f
+}
+
+// The exact constant declared at `decl`, one field per line: its kind (`int`, `float` or
+// `pattern`), its value as shown (a pattern as written), and a pattern's signed magnitude in
+// decimal ("" otherwise). "" when `decl` is no exact constant.
+export function cqConstFields(decl: i32) {
+  cqConstPeel(lbiExactConstLit(decl), false)
+}
+
+// `cqConstFields` for the literal under parentheses and negations at `ix`, negated when `neg`.
+function cqConstPeel(ix: i32, neg: boolean): string {
+  if ix < 0 { return "" }
+  const n = P.nodes[ix]
+  if n is NumLit { return cqConstOfLit(n.numText, neg) }
+  if n is Paren { return cqConstPeel(n.parInner, neg) }
+  if n is Unary {
+    if n.unOp == "-" { return cqConstPeel(n.unArg, !neg) }
+    return ""
+  }
+  cqConstNone()
+}
+
+// Every other node holds no literal a constant could show.
+function cqConstNone(): string { "" }
+
+// `cqConstFields` for the literal `text`, negated when `neg`.
+function cqConstOfLit(text: string, neg: boolean) {
+  const v = cexOfLexeme(text)
+  if !cexOk(v) { return "" }
+  let sign = ""
+  if neg { sign = "-" }
+  if v.cxFloat { return "float\n" + sign + cexLexeme(v) + "\n" }
+  const dec = cexDecText(v)
+  if v.cxPat { return "pattern\n" + sign + text + "\n" + sign + dec }
+  if dec == "0" { sign = "" }
+  "int\n" + sign + dec + "\n"
+}
 function inlayPush(k: i32, occ: i32, ty: i32) {
   inlayKind.push(k)
   inlayLine.push(symOccEndLine(occ))
@@ -420,8 +474,9 @@ export function symInlayScan() {
           if t is TyFunc {
             if !inlayHole(t.fnRet) { inlayPush(1, i, t.fnRet) }
           }
-        } else {
-          if !inlayHole(ty) { inlayPush(0, i, ty) }
+        } else if !inlayHole(ty) && cqConstFields(symOccDecl[i]) == "" {
+          // An exact constant has no single type to annotate; its hover shows its value.
+          inlayPush(0, i, ty)
         }
       }
     }
@@ -873,6 +928,7 @@ export function symScopeAt(line: i32, col: i32) {
   scopeResType = []
   scopeResRaw = []
   scopeResTok = []
+  scopeResConst = []
   const resVis: i32[] = []
   const idxByName: {[string]: i32} = Map()
   let i = 0
@@ -889,12 +945,14 @@ export function symScopeAt(line: i32, col: i32) {
         scopeResType.push(symBindTypeStr(symVisNode[i]))
         scopeResRaw.push(symVisName[i])
         scopeResTok.push(visDeclTok(symVisNode[i]))
+        scopeResConst.push(cqConstFields(symVisNode[i]))
         resVis.push(i)
       } else if visTighter(i, resVis[existing]) {
         scopeResKind[existing] = symVisKind[i]
         scopeResType[existing] = symBindTypeStr(symVisNode[i])
         scopeResRaw[existing] = symVisName[i]
         scopeResTok[existing] = visDeclTok(symVisNode[i])
+        scopeResConst[existing] = cqConstFields(symVisNode[i])
         resVis[existing] = i
       }
     }
