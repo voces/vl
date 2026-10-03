@@ -19193,9 +19193,56 @@ function joinTys(a: i32, b: i32) {
   if !recordJoinMinted && a != b {
     if T.tys[a] is TyObj && T.tys[b] is TyObj { recordJoinMinted = true }
   }
+  if paramJoinDropsNull(a, b) || paramJoinDropsNull(b, a) {
+    return paramNullJoin(a, b)
+  }
   if assignable(b, a) && !joinWidensMap(b, a) { return a }
   if assignable(a, b) && !joinWidensMap(a, b) { return b }
   joinVariantTys(a, b)
+}
+
+// Whether collapsing `o` into `u` would drop a null: `u` holds a declared type parameter and no
+// null, `o` bears one. The parameter accepts null only until a pin binds it (D2533, D3487).
+function paramJoinDropsNull(u: i32, o: i32): boolean {
+  if u < 0 || o < 0 || u >= T.tys.length || o >= T.tys.length { return false }
+  if !isNullTy(o) && !tyBearsNull(o) { return false }
+  if isNullTy(u) || tyBearsNull(u) { return false }
+  const ms: i32[] = []
+  flattenVariantsInto(u, ms)
+  for m in ms {
+    if m >= 0 && m < T.tys.length && tyIsDeclaredParam(m) { return true }
+  }
+  false
+}
+
+// The join `paramJoinDropsNull` keeps: each member once, the null as a member rather than a
+// wrapper, so a pin binding a parameter to a nullable type substitutes to one flat union.
+function paramNullJoin(a: i32, b: i32): i32 {
+  const ms: i32[] = []
+  flattenVariantsInto(a, ms)
+  flattenVariantsInto(b, ms)
+  const kept: i32[] = []
+  let hasNull = false
+  for m in ms {
+    if isNullTy(m) {
+      hasNull = true
+    } else {
+      let dup = false
+      for k in kept {
+        if k == m || sameVariantTy(k, m) { dup = true }
+        if k >= 0 && m >= 0 && sameDeclaredTyParam(k, m) { dup = true }
+      }
+      if !dup { kept.push(m) }
+    }
+  }
+  if hasNull { kept.push(TY_NULL) }
+  const res = mkUnionTy(kept)
+  if tyIsTpJoinUnion(a) || tyIsTpJoinUnion(b) {
+    // arena-tick exempt: a per-program mark on a fresh arena row.
+    tpJoinUnions[res] = 1
+  }
+  if isJoinHoleUnion(a) || isJoinHoleUnion(b) { joinHoleUnions.push(res) }
+  res
 }
 
 // Whether `t` is a union holding a declared type parameter, decided per instance.
