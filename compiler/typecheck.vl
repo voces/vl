@@ -788,6 +788,8 @@ let njHeldNodes: {[i32]: boolean} = Map()
 let njFnStack: i32[] = []
 // The deferred return joins of runtime witnesses, which re-join apart wherever they collapse.
 let apartHoleJoins: {[i32]: boolean} = Map()
+// The `HD_COAL` rows whose default is a runtime value, joined apart at the pin (`coalHoleJoin`).
+let coalApartRows: {[i32]: boolean} = Map()
 
 // The uncollapsed deferred join a call site could not decide, parked under that call's node
 // index. `collapseDeferredJoin` hands the emitter-safe collapse out as the call's type — a
@@ -5113,6 +5115,7 @@ export function initChecker() {
   njFnStack = []
   njPinFn = -1
   apartHoleJoins = Map()
+  coalApartRows = Map()
   dJoinNode = []
   dJoinTy = []
   escJoinTy = []
@@ -19490,6 +19493,18 @@ export function tyIsNumericBox(t: i32): boolean {
   true
 }
 
+// Whether `t` is a numeric box with two numeric members or more, a `null` aside.
+export function tyHoldsNumbersApart(t: i32): boolean {
+  if !tyIsNumericBox(t) { return false }
+  const vs: i32[] = []
+  flattenVariantsInto(t, vs)
+  let n = 0
+  for v in vs {
+    if isNumericPrimTy(v) { n = n + 1 }
+  }
+  n >= 2
+}
+
 // Whether `lt op rt` at a pin, an operand a numeric union, has a scalar form at every member
 // pair. The pin has no operand nodes, so a literal's adoption is the instance check's to decide.
 function numUnionPinOk(op: string, lt: i32, rt: i32): boolean {
@@ -19933,6 +19948,64 @@ function joinArmLit(a: i32, aLit: boolean, b: i32, bLit: boolean): i32 {
   njApart = false
   if apart { markTpJoinApart(j) }
   j
+}
+
+// The join of a `??`'s non-null left type `l` and its default `d` (typed `dt`) when the two are
+// runtime numbers that could part, joined apart as `joinArmLit` joins the `if` the operator
+// spells; -1 when the ordinary `??` rules decide (a literal or hole default, a gated function).
+function coalJoinApart(l: i32, dt: i32, d: i32): i32 {
+  if !njMayPart(l, dt) || tyIsHole(dt) || armLit(dt, d) { return -1 }
+  if njJoinGated(l, dt, false) || njFnTyParams(njFnIx) { return -1 }
+  joinArmLit(l, false, dt, false)
+}
+
+// Whether function `fx` declares type parameters. A `??` in its body keeps master's widening at
+// every pin, since its instance lowers the result at the left operand's own rep (D2562).
+function njFnTyParams(fx: i32): boolean {
+  if fx < 0 || fx >= P.nodes.length { return false }
+  const fn = P.nodes[fx]
+  if fn is FuncDecl { return fn.fnTyParams.length > 0 }
+  false
+}
+
+// Whether function `fx` is checked again at each pin: it declares type parameters or has an
+// un-annotated parameter.
+function njFnOpen(fx: i32): boolean {
+  if njFnTyParams(fx) { return true }
+  if fx < 0 || fx >= P.nodes.length { return false }
+  const fn = P.nodes[fx]
+  if fn is FuncDecl {
+    for p in fn.fnParams {
+      const pn = P.nodes[p]
+      if pn is Param {
+        if pn.parType < 0 { return true }
+      }
+    }
+  }
+  false
+}
+
+// Whether a join of `a` and `b` could keep two numbers apart: both hold a number or a type
+// variable, and not the same numbers alone (`njJoinMayPart` without the function).
+function njMayPart(a: i32, b: i32): boolean {
+  if a == b || a < 0 || b < 0 { return false }
+  const sa = njNumSig(a, 0)
+  if sa == 0 { return false }
+  const sb = njNumSig(b, 0)
+  sb != 0 && (sa != sb || sa >= 16)
+}
+
+// The `??` result a pin resolves (`HD_COAL`) from the pin's non-null face `l` and default `d`:
+// a runtime default of another number type joins apart, as the concrete `??` does.
+function coalHoleJoin(row: i32, l: i32, d: i32): i32 {
+  if (coalApartRows.get(row) ?? false) && njMayPart(l, d) {
+    njApart = true
+    const j = joinTys(l, d)
+    njApart = false
+    return j
+  }
+  if assignable(d, l) { return l }
+  joinTys(l, d)
 }
 
 // Marks a join kept apart over a type parameter (`tpJoinUnions`), or the union inside its
@@ -43059,8 +43132,7 @@ function substHoleTyReal(tyIx: i32, bNames: string[], bTys: i32[]) {
     const cInner = nonNullTy(cPin)
     const cDft = substTyDeep(hdInner[row], bNames, bTys)
     if cDft < 0 || tyHasHole(cDft) { return cInner }
-    if assignable(cDft, cInner) { return cInner }
-    return joinTys(cInner, cDft)
+    return coalHoleJoin(row, cInner, cDft)
   }
   // The `??` result over a hole default: the concrete tail, now that the default has a type.
   if kind == HD_COALD {
@@ -60977,6 +61049,9 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
         }
       }
       if tyIsHole(rt) && !tyIsHole(innerFull) { coalDefNote(ix, innerFull, rt) }
+      // A runtime default of another number type joins apart, as the `if` it spells does.
+      const apart = coalJoinApart(innerFull, rt, n.binRight)
+      if apart >= 0 { return apart }
       // When the default fits the non-null LHS type (with contextual coercion), the `??` result
       // IS that LHS type, not `joinTys`' LUB — which would widen a litunion field to `string`.
       if assignableExpr(n.binRight, rt, innerFull) { return innerFull }
@@ -60987,6 +61062,10 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
     // floor the pin re-asks then refused a receiver whose type after `??` is non-null (D1693).
     const cd = mkDerivedHole(HD_COAL, "", rt, -1, lt)
     if cd >= 0 {
+      if !armLit(rt, n.binRight) && !njFnReached(njFnIx) {
+        // arena-tick exempt: a per-program mark on a fresh derived row.
+        coalApartRows[hdRowOfTy[cd]] = true
+      }
       noteCoalResultHole(cd)
       return cd
     }
@@ -68012,9 +68091,12 @@ function checkArrayLitNode(n: ArrayLit, _ix: i32) {
     elemTy = joinTys(elemTy, et)
     ei = ei + 1
   }
+  const apart = listJoinApart(elems, ets)
+  if apart >= 0 { elemTy = apart }
   // An f32 element beside literal ones types the list `f32[]`, as it does an `if` join.
   if (
-    elemTy >= 0
+    apart < 0
+    && elemTy >= 0
     && primNameOf(elemTy) != "f32"
     && elems.length > 1
     && f32JoinRetypesRunning()
@@ -68024,6 +68106,50 @@ function checkArrayLitNode(n: ArrayLit, _ix: i32) {
   }
   if neverValueSlotErr(elemTy, "a list element", elems[0]) { elemTy = TY_ERR }
   return mkArrayTy(elemTy)
+}
+
+// The element type of a list literal whose runtime elements `elems` (typed `ets`) hold numbers
+// of different types: they join apart, as the arms of an `if` do, and each literal element then
+// adapts to that join. -1 when no two runtime elements could part, or the function is gated.
+function listJoinApart(elems: i32[], ets: i32[]): i32 {
+  // The common list has one element type, and settles without asking any element.
+  let mixed = false
+  for et in ets {
+    if et != ets[0] { mixed = true }
+  }
+  if !mixed { return -1 }
+  const run: i32[] = []
+  const lits: i32[] = []
+  let parts = false
+  let i = 0
+  while i < ets.length {
+    const et = ets[i]
+    if et < 0 || et == TY_ERR { return -1 }
+    if armLit(et, elems[i]) {
+      lits.push(et)
+    } else {
+      // A nullable element keeps master's widening outside a body checked at each pin: a
+      // generic `==` over a list of nullable number unions does not lower (D3535).
+      if tyAdmitsNull(et) && !njFnOpen(njFnIx) { return -1 }
+      if run.length > 0 && njMayPart(run[0], et) && !tyEqSameHoles(run[0], et) {
+        if njJoinGated(run[0], et, false) { return -1 }
+        parts = true
+      }
+      run.push(et)
+    }
+    i = i + 1
+  }
+  // A literal beside parted elements in a body checked at each pin keeps master's widening: the
+  // pin's re-join cannot tell the literal from the runtime members (D3534).
+  if !parts || (lits.length > 0 && njFnOpen(njFnIx)) { return -1 }
+  let j = run[0]
+  i = 1
+  while i < run.length {
+    j = joinArmLit(j, false, run[i], false)
+    i = i + 1
+  }
+  for l in lits { j = joinArmLit(j, false, l, true) }
+  j
 }
 
 // `[...a, e, ...b]` — the element type joins every plain element's type with every spread
