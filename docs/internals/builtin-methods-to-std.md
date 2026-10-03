@@ -7,9 +7,11 @@
 **The ruling this implements (owner, 2026-10-03, A′, answering sunpa's SP-003):** compiler
 built-in methods are **storage operations only**. Everything VL can write itself moves to std
 and needs an explicit import. Auto-import, and method lookup into a type's std module, were
-declined: the owner prefers explicit imports. That also retires the "configurable prelude"
-that `docs/guide/strings-design.md` OQ-3 named as the ergonomic follow-on, because a prelude
-is an auto-import. The split today is historical: `.map`, `.filter`, `.slice` and `.push`
+declined: the owner prefers explicit imports. A prelude is an auto-import, so A′ also bears on
+the "configurable prelude" (`docs/internals/modules-design.md` §2, "No *default* prelude, but
+a *configurable* one", about line 319), which `docs/guide/strings-design.md` OQ-3 named as the
+ergonomic follow-on for the string methods. Recording that supersession is owner question
+O7. The split today is historical: `.map`, `.filter`, `.slice` and `.push`
 were built in at #258, before generics, and `std:array` (#536) never absorbed them. Strings
 have built-in `includes` and `indexOf`; lists get those from `std:array`.
 
@@ -25,7 +27,7 @@ have built-in `includes` and `indexOf`; lists get those from `std:array`.
   - strings: `length`, indexing, the `slice` view, `bytes`;
   - maps and sets: `set`, `get`, `add`, `has`, `delete`, `keys`, `values`, `length`,
     indexing.
-- **Five prerequisites block the move.** Each was found by a prototype, not by reading.
+- **Six prerequisites block the move.** Each was found by a prototype, not by reading.
   1. **Contextual lambda typing on the UFCS path (D1484, open).**
      `xs.map((v) => v + 1)` types today only because the built-in seeds `v`. The same call
      against a std generic is a check reject. **957 of the corpus's 958** `.map`/`.filter`
@@ -43,10 +45,19 @@ have built-in `includes` and `indexOf`; lists get those from `std:array`.
      `Duplicate binding`. Moving the string `indexOf`/`includes` therefore makes some call
      sites CHANGE spelling, which contradicts "call sites unchanged". `lastIndexOf` already
      has this problem today.
+  6. **An INFERRED list of anonymous records cannot reach any generic `T[]` parameter
+     (D3557, filed with this doc).** `const xs = [{ x: 1 }, { x: 2 }]` then `len(xs)` with
+     `len<T>(xs: T[])` refuses at emit: `only i32, i64, f64, f32, boolean, struct, union,
+     array, or string parameters are supported`. So do `xs.reverse()` from `std:array` and a
+     free `mapB(xs, (p) => …)`. The built-in `xs.map`/`.filter`/`.slice` take the same list,
+     so moving them without this fix loses a capability.
 - **Performance parity.** These are fuel ratios at `-O` (std ÷ built-in, per element).
   - `slice` via `__array_copy__`: **1.06×**.
   - `map`: **1.29–1.51×**.
-  - `filter`: **1.44–1.86×**.
+  - `filter`: **1.44–1.66×**.
+
+  Each range is the BEST prototype variant per element kind (§3.2). The push-based variants
+  reach 1.48–2.14×.
   - string `indexOf`: **1.22×**.
   - `cpLen`: **0.82×**. The VL version is faster.
 
@@ -57,8 +68,9 @@ have built-in `includes` and `indexOf`; lists get those from `std:array`.
   - Importing a module into a plumb-shaped 2 MB unit costs **+15% to +22% guest fuel**,
     whatever is imported. Plumb's real units already import modules, so they have already
     paid it.
-  - Separately, one anonymous lambda anywhere in that unit costs **+254%**. It is
-    unrelated to this migration, and is reported in §3.5 because it dwarfs everything here.
+  - Separately, one anonymous lambda anywhere in that unit costs **+254%**, and the built-in
+    `.map`/`.filter` called with lambdas costs **+256%**, the same cliff. It is a lambda cost,
+    not a method cost, and is reported in §3.5 because it dwarfs everything here.
 
 ---
 
@@ -67,14 +79,22 @@ have built-in `includes` and `indexOf`; lists get those from `std:array`.
 The ground truth is the checker's member-call arms, `checkMemberCallNode`
 (`compiler/typecheck.vl`). `builtinMethodClaims` reads the method-name tables `listMethodNames`
 / `strMethodNames` / `mapMethodNames`, and `memberRungOnTy` uses that answer to rank a
-built-in above a field and a `self`-function (D2517). Five other places restate the same set,
-and the removal has to update every one:
+built-in above a field and a `self`-function (D2517). Other tables are keyed by method NAME,
+and the removal has to visit every one. They do **not** restate the built-in set: several
+already mix std names in, because they answer for a name whatever resolves it. A removal
+must therefore delete a built-in's own row and keep any name a std function also answers to.
 
-- `check_query.vl`'s `memcPush`, the editor completion list (strings only);
-- `collMethodKind` and `builtinMethodEffect`, the effect tables;
-- `holeArrMethod` and `holeMapMethod`, which make an un-annotated parameter a list or a map;
-- `esMethodBuilds`, the allocation table;
+- `check_query.vl`'s `memcPush`: the editor completion list, strings only, hand-written.
+- `collMethodKind`: `includes`, `indexOf`, `join` and `keys` are `CM_READS`. The first three
+  are `std:array`/`std:str` names on a list.
+- `builtinMethodEffect`: the mutators `push`, `add`, `pop`, `clear`, `set`, `delete`.
+- `collIsListSpelling`: `push`, `pop`, `clear`, `get`, `includes`, `indexOf`, `join`, mixed
+  the same way.
+- `holeArrMethod` and `holeMapMethod`, which make an un-annotated parameter a list or a map.
+- `esMethodBuilds`: the allocation table. It also lists std names (`concat`, `join`, `split`,
+  `toString`, `toUpperAscii`, `toLowerAscii`).
 - `rcwSameElems`, which covers `filter`, `slice` and `values`.
+- `builtinMethodRunsArgs`: `map` and `filter`, the only built-ins that run a function.
 
 The emitter recognises the calls by name in `emit_collect`, `emit_mono`, `emit_classify` and
 `wasmEmit`. Those sites are listed in §5.6.
@@ -114,10 +134,10 @@ which runs straight into prerequisite 5.
 | --- | --- | --- | --- | --- |
 | `s[i]`, `.length` | a byte, a byte count | **storage** | — | — |
 | `slice(start, end)` | **2 arguments required**, unlike the list form; a VIEW: `struct.new $str(s.backing, s.start + start, len)`, O(1), no copy | **storage**. VL has no route to a header over a shared backing: `fromCodePoints` re-encodes and copies. Stays | — | — |
-| `bytes()` | `→ u8[]`, a COPY, one `array.copy` | **storage-adjacent**. VL could write it as a byte loop, but the built-in is a bulk copy between two storages (OQ-3 addendum). Recommend it stays (Q4) | — | `std:utf8.encodeUtf8` wraps it |
-| `indexOf(sub)` | `→ i32`, -1 when absent, `""` found at 0 | **writable** | `std:str` | private `findFrom`; the header says "`indexOf` and `slice` stay in the core" |
+| `bytes()` | `→ u8[]`, a COPY, one `array.copy` | **storage-adjacent**. VL could write it as a byte loop, but the built-in is a bulk copy between two storages (OQ-3 addendum). Recommend it stays (O6) | — | `std:utf8.encodeUtf8` wraps it |
+| `indexOf(sub)` | `→ i32`, -1 when absent, `""` found at 0 | **writable** | `std:str` | private `findFrom`; the header says "`contains`, `indexOf` and `slice` stay in the core" |
 | `includes(sub)` | `→ boolean` | **writable** | `std:str` | none |
-| `charCodeAt(i)` | `→ i32` — **the BYTE at `i`, identical to `s[i]`** (measured: `"aé€".charCodeAt(1)` = `s[1]` = 195) | **writable, and redundant**. The name promises a UTF-16 code unit (JavaScript) and delivers a byte | **retire**, pointing at `s[i]` (Q3) | — |
+| `charCodeAt(i)` | `→ i32` — **the BYTE at `i`, identical to `s[i]`** (measured: `"aé€".charCodeAt(1)` = `s[1]` = 195) | **writable, and redundant**. The name promises a UTF-16 code unit (JavaScript) and delivers a byte | **retire**, pointing at `s[i]` (O4) | — |
 | `cpAt(i)` | `→ i32`, the code point at byte offset `i`; U+FFFD mid-sequence; traps off the end | **writable**: a decode over `s[i]` | `std:str` (or `std:utf8`) | `std:utf8` decodes whole strings |
 | `cpLen()` | `→ i32`, O(n) | **writable** | `std:str` | none |
 | `isCharBoundary(i)` | `→ boolean`, a lead-bit test | **writable** | `std:str` | none |
@@ -127,7 +147,14 @@ core because each "needs the UTF-8 storage". By its own text, though, the storag
 through `s[i]`: "which is the byte they would have to re-derive their answer from". Under A′
 that makes the trio writable. `bytes` keeps the one argument the trio lacks, a bulk
 `array.copy` against a per-byte loop. **A′ and the OQ-3 addendum disagree about the trio,
-and that is an owner question (Q4), not this lane's call.**
+and that is an owner question (O5, O7), not this lane's call.**
+
+**What `std:str` holds today, for comparison.** OQ-3 kept 15 names in `std:str`; the module
+now also exports `backwards` (code points reversed), and every one of them is already an
+import. `compact()` (`strings-design.md` §Header: copy a small view out of a large backing)
+was deferred and exists nowhere yet. If it lands it is storage, not writable: VL has no
+route from bytes to a fresh string backing except re-encoding through `fromCodePoints`,
+which is not a byte copy for an off-boundary view.
 
 ### 1.3 Maps `{[K]: V}` and sets `Set<K>`
 
@@ -139,10 +166,23 @@ and that is an owner question (Q4), not this lane's call.**
 | `add(k)` (set only) | `→ void`. On a `boolean`-valued map it is a refusal that names `m[k] = true` | storage |
 | `has(k)`, `delete(k)` | `→ boolean` | storage |
 | `keys()` | `→ K[]` | storage: reads the table's insertion-ordered key column |
-| `values()` | `→ V[]` (set: `K[]`) | storage |
+| `values()` | `→ V[]` (set: `K[]`) | storage: reads the value column. See the cost note below |
 
-All of these read or write the hash table's own columns. VL has no way to reach those columns
-except these methods, so **nothing moves**.
+All of these read or write the hash table's own columns, so **nothing moves**.
+
+`values()` is the one a reader could call writable: `for k in m.keys() { out.push(m[k] ?? d) }`
+gives the same list in the same order. It stays storage on cost, measured: a 10,000-entry
+`{[i32]: i32}`, 50 calls, `-O`, fuel per call:
+
+| spelling | fuel per call | ratio |
+| --- | --- | --- |
+| built-in `m.values()` | 200,023 | 1.00× |
+| built-in `m.keys()` (the column read alone) | 200,023 | 1.00× |
+| VL `keys()` + one `m[k]` probe per key | 961,419 | **4.81×** |
+
+The VL spelling allocates the key list and then pays a full hash probe per entry to recover
+a value the table already holds in order. `values()` is the value column's twin of `keys()`,
+so the two stay together.
 
 ### 1.4 Not methods, listed so the inventory is complete
 
@@ -175,12 +215,12 @@ import.
 
 | method (writable) | compiler/ | std/ | silent-sweep corpus | capability-probes | tests/ | plumb src+tools+vl-probes | sunpa | glean |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| files scanned | 34 | 18 | 9,489 | 668 | 4,441 | 214 | 16 | 319 |
+| files scanned | 34 | 18 | 9,489 | 668 | 4,441 | 214 | 20 | 319 |
 | list `.map` | 0 | 0 | 778 / 522 | 10 / 9 | 185 / 94 | 1 / 1 | 0 | 0 |
 | list `.filter` | 0 | 0 | 180 / 112 | 0 | 92 / 51 | 0 | 3 / 1 | 0 |
-| `.slice` (all) | 278 / 21 | 14 / 4 | 41 / 41 | 10 / 4 | 171 / 61 | 256 / 32 | 6 / 2 | 62 / 48 |
-|   of which **list** (typed) | **1** | 0 | **21** | **8** | **72** | **20** | **8** | **0** |
-| `.get` (all) | 65 / 6 | 0 | 195 / 183 | 68 / 41 | 162 / 75 | 3 / 2 | 2 / 1 | 2 / 2 |
+| `.slice` (all) | 278 / 21 | 14 / 4 | 41 / 41 | 10 / 4 | 171 / 61 | 256 / 32 | 12 / 5 | 62 / 48 |
+|   of which **list** (typed) | **1** | 0 | **21** | **8** | **72** | **20** | **9** | **0** |
+| `.get` (all) | 65 / 6 | 0 | 195 / 183 | 68 / 41 | 162 / 75 | 3 / 2 | 3 / 2 | 2 / 2 |
 |   of which **list** (typed) | **0** | 0 | **16** | **13** | **57** | **0** | **0** | **0** |
 | `.indexOf` (all) | 36 / 4 | 0 | 20 / 20 | 0 | 53 / 25 | 63 / 13 | 0 | 0 |
 |   of which **string** (typed) | **36** | 0 | **20** | 0 | **14** | **21** | 0 | 0 |
@@ -201,15 +241,19 @@ How to read the table:
 - Every `.indexOf`/`.includes` it did not count already answers without a built-in, through
   `std:array`'s list function or a user `self`-function: in plumb, 42 `indexOf`s and all 43
   `includes`s.
-- sunpa's list `.slice` reads 8 typed against 6 textual, because the textual pattern misses
-  a call split across lines.
+- **sunpa is re-measured on one snapshot** (its working tree at 2026-10-03 16:10, 20 files;
+  it grew from 16 during the survey, which is what the first reading's 8-typed-against-6-textual
+  mismatch was). Both columns now come from the same files: 12 textual `.slice(`, of which 9
+  are list slices: 5 on `f32[]`, 2 on `f64[]`, 1 on `Intent[]` and 1 on `u8[]`. The other 3
+  are string slices. Seven of the nine need a prerequisite: the six `f32[]` and record slices
+  need prerequisite 2, and the `u8[]` slice needs the `std:bytes` twin (prerequisite 5).
 
 **Absent or partial trees:**
 
 - `~/sunsuz` holds no `.vl` source.
 - `~/veldt` is not on this machine.
 - One plumb file, `vl-probes/synth/s4000.vl` (a 46 MB synthetic probe), runs the checker out
-  of GC heap and is not in the split. It also fails without the scratch build.
+  of GC heap under the scratch checker and is not in the split.
 - **`~/plumb/out` (309 GB, 32,143 generated `.vl` files) is excluded.** A seeded sample of
   300 files (554 MB) holds 36 `.slice(`, 33 `.charCodeAt(`, 4 `.bytes(` and 3 `.indexOf(`,
   so the transliterator does not emit the moving methods in bulk.
@@ -248,7 +292,11 @@ What the census says about the migration:
 - **list `slice`** — `emitArrSlice`, 151 lines. It clamps both bounds, then emits one
   `array.new_default` of the out length and one `array.copy`. It shares the map/filter
   scratch frame (D2332).
-- **list `get`** — `emitListGetOr`/`Go`, 54 lines, a fused `xs.get(i) ?? d`.
+- **list `get`** — `emitListGetOr`/`Go`, 54 lines, a fused `xs.get(i) ?? d`. Beyond that,
+  15 emitter sites test `memProp == "get"` (8 in `emit_classify`, 4 in `wasmEmit`, 1 each in
+  `emit_collect`, `emit_mono` and `emit_rewrite`) and 5 more sit in `typecheck` outside the
+  method arms. Most serve a list `get` and a map `get` alike, so the removal splits each by
+  receiver rather than deleting it (§5.6).
 - **string `slice`** — a view header. Stays.
 - **string `indexOf` / `includes`** — `emitStrIndexOf`, 133 lines. A skip loop hoists
   `needle[0]`, and a verify loop runs inside it. `includes` is `indexOf != -1`.
@@ -337,7 +385,8 @@ length, where nothing in the loop body shrinks the receiver**, and it speeds up 
 along with std. This document does not attempt it. The precedent for accepting the interim
 cost is `toString`'s retirement (DECISIONS.md, 2026-09-01): the pure-VL renderer measured
 5.7× the built-in, the lowering was **deleted rather than kept as a hidden fast path**, and
-the cost became a library-quality item. These ratios (1.06×–1.86×) are well inside that
+the cost became a library-quality item. These ratios (1.06×–1.66× for the best variant of
+each operation) are well inside that
 precedent.
 
 **Do not keep the fast path behind the std name.** That would recreate the two-meaning problem
@@ -388,7 +437,9 @@ The same harness measured another variant: a 4-line tail holding **one anonymous
 (`const f = (v: i32) => v * 3 + 1; return f(xs[0])`).
 
 - Compile fuel went from 7.85 G to **27.81 G**, which is **+254%**.
-- The same `map` with a NAMED function instead costs +6.2%.
+- The BUILT-IN `xs.map(lambda).filter(lambda)` in the same position costs **+256%**
+  (7.85 G → 27.99 G), the same cliff, so the cost is the lambda's and not the method's.
+- The same `map` and `filter` with NAMED functions instead cost +6.2%.
 - That is not a migration matter, and it is reported here because nothing else measures it.
   The plumb-shape units hold no lambda, so the gate is blind to it.
 
@@ -410,14 +461,23 @@ any `self`-function does not, and that is D1484 (open, clause 2).
 
 D1484 must close before the first move.
 
+### 4.1a Inferred anonymous-record lists (blocking) — D3557
+
+The built-ins take any list. A generic `T[]` parameter does not take an INFERRED list of
+anonymous records: `const xs = [{ x: 1 }, { x: 2 }]` passed to `len<T>(xs: T[])` refuses at
+emit, and so do `xs.reverse()` and a free `mapB(xs, (p) => …)`. Annotating the binding, naming
+the record type, or annotating the lambda's parameter each rescues it, and the built-in
+`xs.map((p) => p.x + 1)` runs. So moving `map`, `filter`, `slice` or `get` before D3557 closes
+turns a running program into an emit refusal. The ablation is in the row.
+
 ### 4.2 `self` must be `readonly T[]`
 
 The built-in `map`, `filter` and `slice` accept a `readonly T[]` view. A `self: T[]` std
 function refuses one: ``no method 'filterP' for readonly i32[] — … a readonly list is not a
 growable one``. The prototypes pass once retyped to `self: readonly T[]`, the convention
-`std:array.concat` already follows. For the same reason, `std:array`'s
-`indexOf`/`includes`/`count`/`reduce` probably want `readonly` too. That is a separate review
-item.
+`std:array.concat` already follows. For the same reason the existing readers
+(`indexOf`, `lastIndexOf`, `includes`, `count`, `reduce`, `reverse`, `mapIndexed`, `sorted`)
+probably want `readonly` too; that changes existing signatures, so it is owner question O9.
 
 ### 4.3 The result type
 
@@ -458,7 +518,7 @@ same-name pairs:
 
 A file using both receiver kinds must alias one import and then **re-spell its call sites**
 (`s.strIndexOf(…)`). The codemod's promise that call sites stay unchanged then breaks, and the
-spelling is worse than today's. There are three ways out, and they belong in Q1:
+spelling is worse than today's. There are three ways out, and they belong in O1:
 
 - **(a) Receiver-overloaded imports:** two imports of one name are legal when both are
   `self`-functions whose `self` types are disjoint, and UFCS picks by receiver. This is a
@@ -495,10 +555,12 @@ the built-in claims it.
 4. Declare the print imports only when a reachable `__trap__` (or `print`) needs them, or
    give `std:array.filled` a message-free trap. This is what lets the compiler import
    `std:array` (§5.4).
-5. A ruling on Q1, the collisions.
+5. A ruling on O1 and O2, the collisions.
 6. Make `vl check --json` emit `code` and `data` for type-stage diagnostics. Today it emits
    them only for lint, so the `ufcs-not-imported` (D1230) payload the codemod needs is
    missing from CLI output (measured: no `code` field on the type error).
+7. Close **D3557**: an inferred list of anonymous records reaches a generic `T[]` parameter.
+   Without it, `xs.map(…)` over `[{ x: 1 }, …]` runs today and refuses at emit after Step 2.
 
 **Step 1 — `charCodeAt` (no std export).**
 
@@ -509,18 +571,19 @@ the built-in claims it.
   is not postfix-safe.
 - Do it first because it needs no prerequisite and no std review.
 
-**Step 2 — `map` and `filter` → `std:array`.** This needs Step 0 items 1 and 6. It is the
+**Step 2 — `map` and `filter` → `std:array`.** This needs Step 0 items 1, 6 and 7. It is the
 change SP-003 is about, and the one with the corpus exposure: 522 named cells.
 
 **Step 3 — list `get` and `slice` → `std:array`, plus their `u8[]` twins in `std:bytes`.**
-This needs items 2, 3 and 5. Without the `u8[]` twin, `bytes.slice(1, 3)` loses a capability.
+This needs items 2, 3, 5 and 7. Without the `u8[]` twin, `bytes.slice(1, 3)` loses a capability.
 That is a clause-2 regression, and the `runs` gate would catch it.
 
-**Step 4 — the string search pair (`indexOf`, `includes`) → `std:str`.** This needs item 5.
+**Step 4 — the string search pair (`indexOf`, `includes`) → `std:str`.** This needs item 5,
+and O1's answer.
 The compiler takes the import here: it has 43 sites, and `std:str` pulls no host import
 (measured).
 
-**Step 5 — the code-point trio → `std:str`, if Q4 says so.**
+**Step 5 — the code-point trio → `std:str`, if O5 says so.**
 
 Each step closes with the corpus gate. A cell that ran must still run, which is what forces
 the codemod over `distilled/named/` and the census generators. Re-distil only if a class
@@ -540,7 +603,7 @@ the codemod is **diagnostic-driven**:
    - add the name to an existing `import { … } from "<module>"`, or
    - insert a new import line after the leading import region.
 3. If `data` proposes an alias (D1984: the file already binds the name), or names two modules,
-   **decline and report**. Those are the Q1 cases.
+   **decline and report**. Those are the O1 cases.
 4. Re-check the file. If its diagnostics are not a subset of the pre-edit set minus the fixed
    ones, revert the file. This is `vl check --fix`'s verify-and-revert, applied file by file.
 
@@ -550,7 +613,7 @@ separate pass. It also handles generated sources: the census generators under
 `scripts/silent-sweep/` emit the import line when a template spells a moved method.
 
 **Alternative:** teach `vl check --fix` itself the `ufcs-not-imported` fixer, so consumers
-need no script. That is the better end state (Q5). The Python driver is still needed for the
+need no script. That is the better end state (plan decision P1). The Python driver is still needed for the
 tree-wide in-repo pass and for `--check`.
 
 ### 5.3 The editor quick-fix — mostly built
@@ -612,21 +675,44 @@ The order follows the standing priority: sunpa first, plumb paused.
   A consumer who ignores the notes still gets a one-line fix at every site, plus the
   quick-fix in the editor.
 - Exposure by consumer: glean is touched only by Step 1 (202 `charCodeAt`). sunpa is touched
-  by Steps 2–3 (3 filters, 8 list slices). plumb is touched by Steps 1, 3 and 4 (100, 20 and
+  by Steps 2–3 (3 filters, 9 list slices, seven of which need a prerequisite). plumb is touched by Steps 1, 3 and 4 (100, 20 and
   21 sites).
 
 ### 5.6 The removal step (per family)
 
-Delete the checker arm, and the name from each of the tables of §1. Then delete the
-emitter's recognisers:
+Delete the checker arm, and the built-in's row from each of the tables of §1, keeping any
+name a std function also answers to (`collMethodKind`, `collIsListSpelling` and
+`esMethodBuilds` already carry std names). Then remove the emitter's recognisers, family by
+family:
 
-- `callIsMapFilter`, `callIsArrSlice`;
-- the `memProp == "map"`/`"filter"` tests in `emit_collect` (`collectMapFilterUse`, `mfScan`)
-  and in `emit_mono` (two sites);
-- `emit_classify`'s `mf*` family;
-- `wasmEmit`'s `emitMapFilter`, `emitArrSlice`, `emitMfElem`, `emitMfInvoke`;
-- the scratch-frame reservation `fnUsesMapFilter`. `slice` shares it, so it goes with the
-  last of the three.
+- **`map` / `filter` / list `slice`:**
+  - `callIsMapFilter`, `callIsArrSlice`;
+  - the `memProp == "map"`/`"filter"` tests in `emit_collect` (`collectMapFilterUse`,
+    `mfScan`) and in `emit_mono` (two sites);
+  - `emit_classify`'s `mf*` family;
+  - `wasmEmit`'s `emitMapFilter`, `emitArrSlice`, `emitMfElem`, `emitMfInvoke`;
+  - the scratch-frame reservation `fnUsesMapFilter`. `slice` shares it, so it goes with the
+    last of the three.
+- **list `get`:**
+  - `emitListGetOr` / `emitListGetOrGo`;
+  - the 15 emitter sites and 5 checker sites that test `memProp == "get"` (§3.1). These are
+    **split, not deleted**: most read `get` on a list and on a map, and the map half stays.
+    The split keys on the receiver's type or on `memberCallRungOf(ix)`, which
+    `emit_rewrite.vl` already does (`!= MC_RUNG_SELF_FN`), never on the name alone. After the
+    removal, a list `get` reaches these sites as a `self`-function call.
+- **The string methods:**
+  - the string-method dispatch in `wasmEmit` (one `exprIsStrMethod` test per method,
+    beside the `slice` and `bytes` ones that stay): the `indexOf`/`includes`, `charCodeAt`,
+    `cpAt`, `cpLen` and `isCharBoundary` arms. `exprIsStrMethod` itself stays, because the
+    string `slice` (3 callers) and `bytes` still use it;
+  - `exprIsStrIndexOf` and its reservation arm in `exprHasStrOp`;
+  - `emitStrIndexOf`;
+  - the lowerings `emitStrCharCode`, `emitStrCpAt`, `emitStrCpLen` and
+    `emitStrIsCharBoundary`, and the `__utf8_cplen__` helper body (`emitUtf8CpLenFnCode`) once
+    nothing calls it. `__utf8_dec__` stays: two other lowerings call it.
+- **The name tables:** `collIsListSpelling` loses `get` (and `includes`/`indexOf` only if the
+  std functions do not need the list classification it gives them). `holeArrMethod` loses
+  `map` and `filter`, and the UFCS route must still infer the list (§4.7).
 
 Then:
 
@@ -642,60 +728,241 @@ The frozen TS compiler is not touched, under the native-only policy.
 
 ## 6. Open questions for the owner
 
-Each question carries a recommendation.
+One decision per question, a code sample per option, and a recommendation. The process
+choices that need no ruling are in §6.10.
 
-**Q1 — Same-name std exports for different receivers (`indexOf`, `includes`, `lastIndexOf`,
-`slice`, `get`).** Should a file be able to import `indexOf` from `std:array` and from
-`std:str` at once, with UFCS picking by receiver?
+### O1 — Can one file import the same name from two std modules?
 
-- *Recommendation:* **yes**. Allow two imports of one name when both are `self`-functions
-  whose `self` types are disjoint, and make a free call to such a name a refusal that asks
-  for the method spelling.
-- Without it, Steps 3–4 make mixed files alias and re-spell call sites. That is worse than
-  today, and `lastIndexOf` already shows it.
-- If declined, the fallback is (b), accept aliasing. Not (c), new names.
+`indexOf`, `includes`, `lastIndexOf`, `slice` and `get` will each be exported by more than
+one module, for different receivers (§4.6).
 
-**Q2 — May a std function carry a compiler fast path?** *Recommendation:* **no**, as with
-`toString`. Accept 1.06×–1.86× for now, and file bounds-check elimination for
-length-bounded induction loops as a perf row (§3.3). It pays off for every user loop, not
-only std.
+**(a) Yes, when both are `self`-functions over disjoint `self` types.** UFCS picks by
+receiver.
 
-**Q3 — `charCodeAt`: move it or retire it?** It returns the byte that `s[i]` returns, under a
-JavaScript name that promises a UTF-16 unit. *Recommendation:* **retire** it, with a
-targeted note naming `s[i]`. There are 330+ mechanical rewrites in total.
+```vl
+import { indexOf } from "std:array"
+import { indexOf } from "std:str"
+const i = [1, 2, 3].indexOf(2)     // std:array
+const j = "abc".indexOf("b")       // std:str
+```
 
-**Q4 — The code-point trio and `bytes`.** A′ ("everything VL can write moves") contradicts the
-OQ-3 addendum ("needs the storage → core").
+**(b) No. A file that needs both aliases one, and its call sites change spelling.**
 
-- *Recommendation:* **move `cpAt`, `cpLen` and `isCharBoundary` to `std:str`.** All three are
-  writable over `s[i]`, and `cpLen` measured faster in VL.
-- **Keep `bytes`** as storage. It is one `array.copy` between two storages, which no VL loop
-  matches.
-- Record that A′ supersedes the addendum, and supersedes OQ-3's prelude follow-on.
+```vl
+import { indexOf } from "std:array"
+import { indexOf as strIndexOf } from "std:str"
+const i = [1, 2, 3].indexOf(2)
+const j = "abc".strIndexOf("b")
+```
 
-**Q5 — Codemod delivery.** Should it be a repo script or `vl check --fix`?
-*Recommendation:* **both**. Teach `vl check --fix` the `ufcs-not-imported` fixer (single
-candidate, verify-and-revert), so a consumer runs one command. A thin
-`scripts/codemods/builtin-to-std.py` drives the in-repo pass and `--check`.
+**(c) No, and std gives the two functions different names.**
 
-**Q6 — List `get`.** It is writable, but it is one line and its `?? d` form is fused today.
-*Recommendation:* **move it** with `slice` (Step 3), so the rule has no exception. Then the
-`get` collision with `std:idtable` and `std:bytes` falls under Q1.
+```vl
+import { indexOf } from "std:array"
+import { indexOfStr } from "std:str"
+const j = "abc".indexOfStr("b")
+```
 
-**Q7 — `readonly` on `std:array`'s existing readers.** Should `indexOf`, `includes`, `count`,
-`reduce`, `reverse` and `mapIndexed` take `self: readonly T[]`? *Recommendation:* **yes**,
-in the Step 2 PR. It costs nothing and `concat` already does it. The new
-`map`/`filter`/`slice` must take it, or they lose the `readonly` receivers they accept today
-(§4.2).
+*Recommendation: (a).* With (b), every mixed file is worse than it is today, and the codemod
+cannot promise unchanged call sites; `lastIndexOf` already has this problem. (c) spends
+near-permanent std names on a namespace limitation.
 
-**Q8 — Order of Steps 2–4.** *Recommendation:* the order in §5.1. `charCodeAt` goes first
-because it is free. Then `map`/`filter`: it answers SP-003 and only needs D1484. Then
-`slice`/`get`, which need the `u8[]` twins. The string pair goes last, because it alone needs
-Q1.
+### O2 — Under O1 (a), what does a FREE call to such a name do?
+
+**(a) Refuse it, and ask for the method spelling.**
+
+```vl
+import { indexOf } from "std:array"
+import { indexOf } from "std:str"
+indexOf("abc", "b")
+// error: `indexOf` names two imported functions; call it as a method, `"abc".indexOf(…)`
+```
+
+**(b) Resolve it by the first argument's type, the same rule UFCS uses.**
+
+```vl
+indexOf("abc", "b")   // std:str's, chosen by the string first argument
+```
+
+*Recommendation: (a).* Free-call resolution stays name-only, so the overloading lives in one
+place, the method spelling. It can be widened to (b) later without breaking anything that
+compiles under (a).
+
+### O3 — May a std function keep a compiler fast path behind its name?
+
+**(a) No. The std body is the program, and its cost is a library and optimizer item.**
+
+```vl
+// std/array.vl
+export function map<T, U>(self: readonly T[], f: (T) => U): U[] {
+  // the VL loop below is what every call compiles to
+  …
+}
+```
+
+**(b) Yes. The std function is a thin wrapper over an emitter intrinsic.**
+
+```vl
+// std/array.vl
+export function map<T, U>(self: readonly T[], f: (T) => U): U[] {
+  return __list_map__(self, f)   // lowered by today's emitMapFilter
+}
+```
+
+*Recommendation: (a)*, as with `toString`. The measured cost is 1.06×–1.66× for the best
+variant of each operation (§3.2), well inside the 5.7× that ruling accepted. The fix is
+bounds-check elimination for loops bounded by the list's length (§3.3), which speeds up
+every user loop as well. (b) keeps about 1,600 lines alive in the per-element-kind shape
+whose missing arms are this compiler's most common defect.
+
+### O4 — `charCodeAt`: retire it, or move it?
+
+It returns the byte `s[i]` returns, under a JavaScript name that promises a UTF-16 unit.
+
+**(a) Retire it. The refusal names the replacement.**
+
+```vl
+const b = s[i]
+// s.charCodeAt(i) → error: `charCodeAt` is not a string method — `s[i]` is the byte at `i`
+```
+
+**(b) Move it to `std:str` unchanged.**
+
+```vl
+import { charCodeAt } from "std:str"
+const b = s.charCodeAt(i)
+```
+
+*Recommendation: (a).* (b) spends a permanent std name on a duplicate whose name misleads.
+The cost of (a) is about 350 mechanical rewrites, 302 of them in plumb and glean.
+
+### O5 — Do `cpAt`, `cpLen` and `isCharBoundary` move to `std:str`?
+
+**(a) Yes. They need an import.**
+
+```vl
+import { cpLen, cpAt } from "std:str"
+const n = s.cpLen()
+```
+
+**(b) No. They stay built in under the OQ-3 addendum's "needs the storage" rule.**
+
+```vl
+const n = s.cpLen()   // no import
+```
+
+*Recommendation: (a).* All three are writable over `s[i]`, which is the A′ test. The
+addendum's own text concedes that `s[i]` reaches the bytes, and `cpLen` measured 0.82× in
+VL. Usage is small: 20 corpus cells, 26 test sites and 2 in std, and no consumer.
+
+### O6 — Does `bytes()` stay built in?
+
+**(a) Yes, as storage: one `array.copy` between the string's backing and a `u8[]`.**
+
+```vl
+const b = s.bytes()   // no import
+```
+
+**(b) No. It moves to `std:str` as a byte loop.**
+
+```vl
+import { bytes } from "std:str"
+const b = s.bytes()   // one array.get_u and one array.set per byte
+```
+
+*Recommendation: (a).* It is the only conversion between two storages, and a bulk copy is
+what no VL loop can express. `std:utf8.encodeUtf8` already wraps it.
+
+### O7 — Does A′ supersede the OQ-3 addendum and the configurable prelude?
+
+The OQ-3 addendum is `strings-design.md`. The prelude is `modules-design.md` §2, "No
+*default* prelude, but a *configurable* one", about line 319; OQ-3 named it as the
+ergonomic answer for the string methods.
+
+**(a) Yes, both. Every std name is an explicit import, test files included.**
+
+```vl
+import { split } from "std:str"
+import { expect, toEqual } from "std:test"   // in a test file too
+```
+
+**(b) The addendum, yes. The prelude stays a future option for configured file sets.**
+
+```jsonc
+// vl.json
+{ "prelude": { "**/*_test.vl": ["std:test"] } }
+```
+
+```vl
+expect(1 + 2).toEqual(3)   // no import in a matching test file
+```
+
+*Recommendation: (a).* It matches the ruling's stated preference for explicit imports, and
+the prelude was never built, so retiring it breaks nothing. Record it in `DECISIONS.md` and
+mark both documents' sections as superseded.
+
+### O8 — Does the list `get` move?
+
+It is a one-line function, and `xs.get(i) ?? d` is fused in the emitter today.
+
+**(a) Move it to `std:array`, with a `std:bytes` twin for `u8[]`.**
+
+```vl
+import { get } from "std:array"
+const v = xs.get(i) ?? 0
+```
+
+**(b) Keep it built in, as the one writable exception.**
+
+```vl
+const v = xs.get(i) ?? 0   // no import
+```
+
+*Recommendation: (a)*, so the rule has no exception. Its collision with `std:idtable` and
+`std:bytes` is then O1's.
+
+### O9 — Do `std:array`'s EXISTING readers take `self: readonly T[]`?
+
+That covers `indexOf`, `lastIndexOf`, `includes`, `count`, `reduce`, `reverse`,
+`mapIndexed` and `sorted`. It changes eight existing signatures.
+
+**(a) Yes. A read-only view can call them.**
+
+```vl
+import { indexOf } from "std:array"
+function find(xs: readonly i32[]): i32 { return xs.indexOf(3) }   // accepted
+```
+
+**(b) No. They keep `self: T[]`.**
+
+```vl
+function find(xs: readonly i32[]): i32 { return xs.indexOf(3) }
+// error: no method 'indexOf' for readonly i32[] — … a readonly list is not a growable one
+```
+
+*Recommendation: (a)*, in the Step 2 PR. It only widens what is accepted, and `concat`
+already does it.
+
+### 6.10 Plan decisions — not owner questions
+
+These follow from the rules already in force. They are recorded here so the reviewer can
+check them.
+
+- **P1 — Codemod delivery.** Teach `vl check --fix` the `ufcs-not-imported` fixer (single
+  candidate module, verify-and-revert), so a consumer runs one command. A thin
+  `scripts/codemods/builtin-to-std.py` drives the in-repo pass and `--check` (§5.2).
+- **P2 — Step order.** As §5.1. `charCodeAt` goes first because it is free. `map`/`filter`
+  answer SP-003 and need D1484 and D3557. `slice`/`get` need the `u8[]` twins and the
+  `__array_copy__` lowering. The string pair goes last, because it alone needs O1.
+- **P3 — The new exports take `self: readonly T[]`.** `map`, `filter`, `slice` and `get`
+  must accept every receiver the built-ins accept today, read-only views included (§4.2).
+  Anything else is a capability loss, which the gate refuses.
+- **P4 — One PR per family**, adding the export and removing the built-in together, because
+  D2475 forbids the two existing at once (§5.1).
 
 ---
 
-## 7. Findings to file (none filed here — this lane was given no row-id range)
+## 7. Findings to file
 
 | finding | witness | class |
 | --- | --- | --- |
@@ -705,7 +972,9 @@ Q1.
 | One anonymous lambda in a 2 MB plumb-shaped unit: compile fuel 7.85 G → 27.81 G | `plumb/plumb2.py`, `lambda-only` | compile-cost cliff |
 | Importing any module into the same unit: +15–22% compile fuel, with nothing called | `plumb/plumb3.py`, `import-proto-unused` | compile cost |
 
-D1484 is the open row for the UFCS lambda-typing gap. It needs no new row.
+D1484 is the open row for the UFCS lambda-typing gap. **D3557** (prerequisite 6) is filed
+with this document, at the coordinator's id. The rows above are left for the coordinator to
+file, because this lane was given no id range beyond D3557.
 
 ---
 
