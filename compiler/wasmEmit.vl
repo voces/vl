@@ -3262,6 +3262,19 @@ function isNarrowMaskKey(recvIx: i32, fnIx: i32): string {
 // proved the tested shape is the sole non-null member, which monomorphization can break (D950).
 function emitIsTest(body: u8[], isIx: i32, fnIx: i32) {
   const nd0 = P.nodes[isIx]
+  // `r?.f is null` is `r?.f == null`: one test over every link and the field's own null (D3457).
+  if nd0 is IsExpr {
+    if nd0.isVariant == "null" {
+      const ion = P.nodes[unwrapParen(nd0.isObj)]
+      if ion is OptMember {
+        const ionSv = optRecvStageSave()
+        optRecvStageMark(nd0.isObj)
+        const ionRc = emitOptChainIsNull(body, nd0.isObj, fnIx)
+        optRecvStageRestore(ionSv)
+        return ionRc
+      }
+    }
+  }
   if nd0 is IsExpr {
     const imk = mapReadScalarBoxKind(nd0.isObj, fnIx)
     if imk >= 0 {
@@ -31196,10 +31209,18 @@ function emitOptCoalesceBoxLeaf(
   if rTy < 0 { rTy = tyPeelNul(nodeTyIxOf(lhsIx)) }
   const bk = valueAtomKind(tyToEmitName(rTy))
   const bVt = nulBoxScalarValtype(bk)
-  const bVb = vbHeapIdxOfKind(bk)
-  if bNm == "" && (bVt < 0 || bVb < 0) {
+  if bNm == "" && bVt < 0 {
     return emitFail(
       "emitProgram: `?.` … `??` over a nullable value-box field has no rep for its result",
+    )
+  }
+  // The box holds the FIELD's scalar; a default that widens the result (`?? 2.5` over an
+  // `i32 | null` field) converts it after the unbox.
+  const fk = valueAtomKind(tyToEmitName(tyPeelNul(nodeTyIxOf(lhsIx))))
+  const fVb = vbHeapIdxOfKind(fk)
+  if bNm == "" && (fVb < 0 || !scalarKindWidens(fk, bk)) {
+    return emitFail(
+      "emitProgram: `?.` … `??` over a nullable value-box field has no conversion to its result",
     )
   }
   if emitOptChainIsNull(body, lhsIx, fnIx) < 0 { return -1 }
@@ -31215,11 +31236,28 @@ function emitOptCoalesceBoxLeaf(
   fbStructGet(heap, fi)
   if bNm == "" {
     fbStructGet(uBoxIdx, 1) // field 1: the payload anyref
-    fbRefCast(bVb)
-    fbStructGet(bVb, 0)
+    fbRefCast(fVb)
+    fbStructGet(fVb, 0)
+    emitScalarWiden(fk, bk)
   }
   fbEnd()
   0
+}
+
+// Whether a scalar of value-atom kind `from` (0 i32, 3 i64, 4 f64, 5 f32) widens losslessly
+// to kind `to`: itself, i32 to i64 or f64, or f32 to f64.
+function scalarKindWidens(from: i32, to: i32): boolean {
+  if from == to { return true }
+  if from == 0 { return to == 3 || to == 4 }
+  from == 5 && to == 4
+}
+
+// The widening `scalarKindWidens` admits, applied to the scalar on the stack.
+function emitScalarWiden(from: i32, to: i32) {
+  if from == to { return 0 }
+  if to == 3 { return fbI64ExtendI32S() }
+  if from == 5 { return fbF64PromoteF32() }
+  fbF64ConvertI32S()
 }
 
 function emitCoalesceGo(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
