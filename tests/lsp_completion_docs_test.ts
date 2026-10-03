@@ -238,8 +238,9 @@ Deno.test({ name: "completion docs: the playground panel carries the same prose"
   initLsp(createWasmChecker(() => instance.exports as unknown as Exports));
   const cs = await completion(SRC, CURSOR);
   const doc = (label: string) => cs.find((c) => c.label === label)?.documentation;
+  // `answer` is an exact constant, so its panel leads with its value rather than one type.
   const answer = doc("answer");
-  if (answer !== "The answer.\n\n```vital\ni32\n```") {
+  if (answer !== "The answer.\n\n```vital\nconst answer = 42\n```") {
     throw new Error(`answer: ${JSON.stringify(answer)}`);
   }
   const plain = doc("plain");

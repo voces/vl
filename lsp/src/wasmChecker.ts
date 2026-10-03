@@ -206,6 +206,41 @@ export type WasmScopeBinding = {
    * old seed degrades to the type-only completion item it produced before.
    */
   doc?: string;
+  /**
+   * The binding's value when it is an exact constant (an un-annotated literal `const`,
+   * typed at each use), so completion shows `= 192` rather than one type. Undefined for
+   * any other binding, or when the seed predates the export.
+   */
+  exact?: WasmExactConst;
+};
+
+/**
+ * An exact constant's value (an un-annotated literal `const`): `kind` is `int`, `float` or
+ * `pattern` (a radix literal, a bit pattern of its use's width); `shown` is the exact value
+ * (a pattern as written, a float as its exact decimal or a long scientific form); `mag` is a
+ * pattern's signed value in decimal, "" otherwise.
+ */
+export type WasmExactConst = {
+  kind: "int" | "float" | "pattern";
+  shown: string;
+  mag: string;
+};
+
+/**
+ * An exact constant under the cursor: its value, whether the name is its declaration or a
+ * use, and the type the use took there ("" at the declaration).
+ */
+export type WasmExactConstAt = WasmExactConst & {
+  role: "decl" | "use";
+  type: string;
+};
+
+/** Parse the seed's `kind\nshown\nmag` fields, or undefined when they are not three lines. */
+export const parseExactConst = (fields: string): WasmExactConst | undefined => {
+  const [kind, shown, mag, ...rest] = fields.split("\n");
+  if (rest.length > 0 || mag === undefined || shown === "") return undefined;
+  if (kind !== "int" && kind !== "float" && kind !== "pattern") return undefined;
+  return { kind, shown, mag };
 };
 
 /**
@@ -410,6 +445,18 @@ export type WasmChecker = {
     line: number,
     character: number,
   ) => Promise<string | undefined>;
+  /**
+   * Exact-constant hover: the value of the un-annotated literal `const` under the cursor
+   * and, at a use, the type it took there. Undefined off such a name, or when the seed
+   * predates the export — the hover then falls back to `hoverTypeAt`.
+   */
+  constAt: (
+    source: string,
+    entryKey: string,
+    read: ModuleReader,
+    line: number,
+    character: number,
+  ) => Promise<WasmExactConstAt | undefined>;
   /**
    * Member hover: the rendered type string of the member access (`o.x` / `o?.y`)
    * whose PROPERTY NAME is under the cursor, or undefined when the cursor is off
@@ -1250,6 +1297,27 @@ export const createWasmChecker = (
     return readString(len, (j) => exp.typeStrCharAt(j));
   };
 
+  const constAt = async (
+    source: string,
+    entryKey: string,
+    read: ModuleReader,
+    line: number,
+    character: number,
+  ): Promise<WasmExactConstAt | undefined> => {
+    const exp = instantiate();
+    if (exp === undefined || !speaksAbi(exp) || !hasSymbols(exp) ||
+      typeof exp.constAt !== "function") {
+      return undefined;
+    }
+    await ensurePrepared(exp, source, entryKey, read);
+    const len = exp.constAt(line + 1, character);
+    if (len <= 0) return undefined;
+    const [role, type, ...fields] = readString(len, (j) => exp.constCharAt(j)).split("\n");
+    if (role !== "decl" && role !== "use") return undefined;
+    const value = parseExactConst(fields.join("\n"));
+    return value === undefined ? undefined : { ...value, role, type };
+  };
+
   const memberTypeAt = async (
     source: string,
     entryKey: string,
@@ -1495,7 +1563,12 @@ export const createWasmChecker = (
       const doc = docLen <= 0
         ? undefined
         : readString(docLen, (j) => exp.scopeDocCharAt(i, j));
-      out.push({ name, kind: exp.scopeKindAt(i), type, doc });
+      // Probed per call like the doc pair: a seed older than exact constants has no such export.
+      const constLen = typeof exp.scopeConstLen === "function" ? exp.scopeConstLen(i) : 0;
+      const exact = constLen <= 0
+        ? undefined
+        : parseExactConst(readString(constLen, (j) => exp.scopeConstCharAt(i, j)));
+      out.push({ name, kind: exp.scopeKindAt(i), type, doc, ...(exact ? { exact } : {}) });
     }
     return out;
   };
@@ -2282,6 +2355,7 @@ export const createWasmChecker = (
     referencesAt,
     referencesInEntry,
     hoverTypeAt,
+    constAt,
     memberTypeAt,
     signatureAt,
     typeAliasAt,

@@ -22,7 +22,7 @@
 // shapes.
 
 import type { BindingKind, Position } from "../../compiler/coreTypes.ts";
-import type { WasmExtent } from "./wasmChecker.ts";
+import type { WasmExactConst, WasmExactConstAt, WasmExtent } from "./wasmChecker.ts";
 import { isStdKey } from "./editorText.ts";
 
 // ---- semantic tokens (D5) ---------------------------------------------------
@@ -875,6 +875,11 @@ export type Completion = {
   /** A short type rendering for the detail column, when a type is known. */
   detail?: string;
   /**
+   * The label-row text when it is not `: <detail>` — an exact constant shows its value
+   * (` = 192`), since it has no single type.
+   */
+  labelDetail?: string;
+  /**
    * The declaration's authored `///` doc-comment (markdown), when it carries
    * one. `server.ts` renders it above the type block in the item's
    * `documentation` panel (see {@link docMarkdown}). Absent for builtins and
@@ -1059,6 +1064,135 @@ export const withEffects = (markdown: string, effects?: string): string => {
   return markdown ? `${markdown}\n\n${line}` : line;
 };
 
+// ---- exact constants ---------------------------------------------------------
+//
+// An un-annotated literal `const` has no single type: it is an exact value, typed at each
+// use as the literal written there would be. Hover shows that value — `const SIZE = 192`
+// at the declaration, `SIZE: i64 = 192` at a use — the way gopls shows Go's untyped
+// constants.
+
+/** A float's exact decimal longer than this is shown at f64 precision instead. */
+const EXACT_FLOAT_SHOWN_MAX = 24;
+
+/** A decimal literal's exact value: sign, significant digits and the power of ten under them. */
+type DecimalParts = { neg: boolean; digits: string; exp: number };
+
+const decimalParts = (text: string): DecimalParts | undefined => {
+  const m = /^(-?)(\d*)(?:\.(\d*))?(?:[eE]([+-]?\d+))?$/.exec(text.replaceAll("_", ""));
+  if (!m) return undefined;
+  const frac = m[3] ?? "";
+  const all = (m[2] + frac).replace(/^0+/, "");
+  if (all === "") return { neg: false, digits: "0", exp: 0 };
+  const digits = all.replace(/0+$/, "");
+  return { neg: m[1] === "-", digits, exp: Number(m[4] ?? 0) - frac.length + all.length - digits.length };
+};
+
+/** Whether two decimal literals denote the same number. */
+const sameDecimal = (a: string, b: string): boolean => {
+  const pa = decimalParts(a);
+  const pb = decimalParts(b);
+  return pa !== undefined && pb !== undefined && pa.neg === pb.neg &&
+    pa.digits === pb.digits && pa.exp === pb.exp;
+};
+
+/** `p` in scientific form, `1e-400` or `1.25e30`. */
+const sciText = (p: DecimalParts): string =>
+  (p.neg ? "-" : "") + p.digits[0] + (p.digits.length > 1 ? "." + p.digits.slice(1) : "") +
+  "e" + (p.exp + p.digits.length - 1);
+
+/** A JS number as a VL float literal. */
+const floatText = (x: number): string => {
+  const t = String(x).replace("e+", "e");
+  return /[.e]/.test(t) ? t : t + ".0";
+};
+
+/**
+ * The value an exact constant displays at a use typed `at` ("" for none): the exact value,
+ * written short when a short spelling is exact. A float with no short exact spelling shows
+ * by the shortest form that reads back as the same f64; at an `f32` or `f64` use, the value
+ * at that width, which is what the program computes with. `rounded` says the text is not
+ * the exact value.
+ */
+export const exactConstValue = (
+  c: WasmExactConst,
+  at = "",
+): { text: string; rounded: boolean } => {
+  if (c.kind !== "float") return { text: c.shown, rounded: false };
+  const p = decimalParts(c.shown);
+  if (at === "i32" || at === "i64") {
+    // A whole float constant delivered to an integer is that integer.
+    if (p !== undefined && p.exp >= 0) {
+      const v = BigInt(p.digits) * 10n ** BigInt(p.exp);
+      return { text: (p.neg ? "-" : "") + v.toString(), rounded: false };
+    }
+  }
+  if (at === "f32" || at === "f64") {
+    const x = Number(c.shown);
+    const text = floatText(at === "f32" ? Math.fround(x) : x);
+    return { text, rounded: !sameDecimal(text, c.shown) };
+  }
+  if (c.shown.length <= EXACT_FLOAT_SHOWN_MAX) return { text: c.shown, rounded: false };
+  if (p !== undefined && p.digits.length <= 17) return { text: sciText(p), rounded: false };
+  const x = Number(c.shown);
+  if (Number.isFinite(x) && x !== 0) return { text: floatText(x), rounded: true };
+  if (p === undefined) return { text: c.shown, rounded: false };
+  return { text: sciText({ ...p, digits: p.digits.slice(0, 17), exp: p.exp + p.digits.length - 17 }), rounded: true };
+};
+
+/** The signed value of the bit pattern `mag` read at a `bits`-wide integer, or undefined. */
+const patternAt = (mag: string, bits: number): bigint | undefined => {
+  let v: bigint;
+  try {
+    v = BigInt(mag);
+  } catch {
+    return undefined;
+  }
+  const span = 1n << BigInt(bits);
+  if (v < 0n) return v >= -(span >> 1n) ? v : undefined;
+  if (v >= span) return undefined;
+  return v >= span >> 1n ? v - span : v;
+};
+
+/**
+ * The prose under an exact constant's hover. A pattern names its reading at each integer
+ * width — or only `at`'s, when a use took one; any other constant says what kind it is.
+ */
+export const exactConstNote = (c: WasmExactConst, at?: string): string => {
+  if (c.kind === "pattern") {
+    const widths = at === "i32" || at === "i64" ? [at] : ["i32", "i64"];
+    const reads = widths
+      .map((w) => ({ w, v: patternAt(c.mag, w === "i32" ? 32 : 64) }))
+      .filter((r) => r.v !== undefined);
+    if (reads.length === 2 && reads[0].v === reads[1].v) {
+      return `bit pattern; ${reads[0].v} at i32 and i64`;
+    }
+    if (reads.length === 0) return "bit pattern";
+    return "bit pattern; " + reads.map((r) => `${r.v} at ${r.w}`).join(", ");
+  }
+  const what = c.kind === "float" ? "float constant" : "integer constant";
+  let rounded = "";
+  if (exactConstValue(c, at).rounded) {
+    rounded = at === "f32" || at === "f64" ? ` (its ${at} value here)` : " (shown at f64 precision)";
+  }
+  return `${what}${rounded}; typed at each use`;
+};
+
+/**
+ * An exact constant's hover: the code line (`const SIZE = 192`, or `SIZE: i64 = 192` at a
+ * use) and the note beneath it.
+ */
+export const exactConstHover = (
+  name: string,
+  c: WasmExactConstAt,
+): { code: string; note: string } => {
+  const value = exactConstValue(c, c.role === "use" ? c.type : "").text;
+  if (c.role === "decl") {
+    return { code: `const ${name} = ${value}`, note: exactConstNote(c) };
+  }
+  const typed = c.type === "" ? name : `${name}: ${c.type}`;
+  return { code: `${typed} = ${value}`, note: exactConstNote(c, c.type) };
+};
+
 /**
  * One in-scope binding from an EXTERNAL source (the wasm checker's `scopeAt`),
  * the native counterpart of a {@link SymbolTable} binding. `kind` is
@@ -1072,6 +1206,7 @@ export type ScopeBinding = {
   kind: number; // 0=variable 1=parameter 2=function
   type: string; // rendered type, "" when none
   doc?: string; // the declaration's `///` block, absent when it carries none
+  exact?: WasmExactConst; // the value of an exact constant, absent for any other binding
 };
 
 /** Map a 0/1/2 scope kind to its {@link CompletionKind} (variable/parameter/function). */
@@ -1095,6 +1230,19 @@ export const scopeCompletionsFromBindings = (
 ): Completion[] => {
   const byName = new Map<string, Completion>();
   for (const b of bindings) {
+    if (b.exact !== undefined) {
+      // An exact constant has no single type: the row shows its value, the panel its
+      // declaration — the same text its hover leads with.
+      const value = exactConstValue(b.exact).text;
+      byName.set(b.name, {
+        name: b.name,
+        kind: scopeBindingKind(b.kind),
+        detail: `const ${b.name} = ${value}`,
+        labelDetail: ` = ${value}`,
+        doc: b.doc,
+      });
+      continue;
+    }
     byName.set(b.name, {
       name: b.name,
       kind: scopeBindingKind(b.kind),
