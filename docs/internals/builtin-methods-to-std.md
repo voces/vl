@@ -33,13 +33,13 @@ have built-in `includes` and `indexOf`; lists get those from `std:array`.
      against a std generic is a check reject. **957 of the corpus's 958** `.map`/`.filter`
      sites pass exactly this un-annotated lambda.
   2. **`__array_copy__` lowers only i32/boolean/f64 lists.** A std `slice` built on it
-     refuses at emit on i64, f32, string and record lists.
+     refuses at emit on i64, f32, string and record lists (D3549).
   3. **`__array_new__(n, f(x))` refuses at emit** when the fill is a call through a
-     function-typed parameter. Hoisting the fill into a `const` works.
+     function-typed parameter (D3548). Hoisting the fill into a `const` works.
   4. **Any `__trap__("message")` in an imported module adds the print host imports**, even
      in a function nothing calls. `std:array`'s `filled` has one, so importing anything
      from `std:array` gives a module four host imports. The seed must load with none, so the
-     compiler cannot import `std:array` today.
+     compiler cannot import `std:array` today (D3550).
   5. **Two std modules cannot export the same `self` name to one file.**
      `import { indexOf } from "std:array"` beside `import { indexOf } from "std:str"` is
      `Duplicate binding`. Moving the string `indexOf`/`includes` therefore makes some call
@@ -66,7 +66,7 @@ have built-in `includes` and `indexOf`; lists get those from `std:array`.
   one every user loop wants (§3.3).
 - **Compile cost.**
   - Importing a module into a plumb-shaped 2 MB unit costs **+15% to +22% guest fuel**,
-    whatever is imported. Plumb's real units already import modules, so they have already
+    whatever is imported (D3551). Plumb's real units already import modules, so they have already
     paid it.
   - Separately, one anonymous lambda anywhere in that unit costs **+254%**, and the built-in
     `.map`/`.filter` called with lambdas costs **+256%**, the same cliff. It is a lambda cost,
@@ -443,8 +443,7 @@ The same harness measured another variant: a 4-line tail holding **one anonymous
 - That is not a migration matter, and it is reported here because nothing else measures it.
   The plumb-shape units hold no lambda, so the gate is blind to it.
 
-**Recommendation:** file it as its own row, using the witness in `plumb/plumb2.py`'s
-`lambda-only` variant.
+Filed as **D3551**, with the import cost of §3.4 beside it.
 
 ---
 
@@ -656,8 +655,9 @@ The measurement (`imports.py`, each a one-function module built with `vl build`)
 **So:**
 
 - The compiler can import `std:str` today.
-- It can import `std:array` once Step 0 item 4 lands. The emitter declares the print family
-  for any message-carrying `__trap__` in the merged program, whether or not it is reachable.
+- It can import `std:array` once Step 0 item 4 lands (D3550). The emitter declares the print
+  family for any message-carrying `__trap__` in the merged program, whether or not it is
+  reachable. `-O` drops the unused imports, but the seed is built without it.
 - Its own exposure is small: 1 list `slice`, 0 `map`/`filter`/list `get`, 43 string search
   sites and 7 `charCodeAt`.
 - `compiler-no-interpolation` refuses only an interpolated string, so a plain std import
@@ -962,19 +962,17 @@ check them.
 
 ---
 
-## 7. Findings to file
+## 7. Rows filed with this document
 
-| finding | witness | class |
+| row | finding | class |
 | --- | --- | --- |
-| `__array_new__(n, f(x))` with `f` a function-typed parameter: `emitProgram: __array_new__ fill names no element rep, and its destination names none either` | `function mk(xs: i32[], f: (i32) => i32): i32[] { const out = __array_new__(xs.length, f(xs[0])); out }` then `print(mk([1, 2, 3], (v: i32) => v * 2)[2])`. Hoisting `f(xs[0])` into a `const` runs | loud emit reject, clause 2 |
-| `__array_copy__` over i64, f32, string and record lists: `__array_copy__ supports i32/boolean/f64 lists natively` / `expects list (T[]) operands` | `sliceP` (§8) over `["a", "b", "c"]` or `[10 as i64, 20 as i64]` | loud emit reject, clause 2 |
-| A message-carrying `__trap__` in a function nothing calls still declares four print host imports | `function never(n: i32): i32 { if n < 0 { __trap__("x") }; n }` plus `export function f(xs: i32[]): i32 { return xs.length }` → four imports | cost and seed-blocking, not a miscompile |
-| One anonymous lambda in a 2 MB plumb-shaped unit: compile fuel 7.85 G → 27.81 G | `plumb/plumb2.py`, `lambda-only` | compile-cost cliff |
-| Importing any module into the same unit: +15–22% compile fuel, with nothing called | `plumb/plumb3.py`, `import-proto-unused` | compile cost |
+| D3548 | `__array_new__(n, f(x))` refuses when `f` is a function-typed parameter; hoisting the call into a `const` builds (prerequisite 3) | loud emit reject, clause 2 |
+| D3549 | `__array_copy__` lowers only i32, boolean and f64 lists; string, record, i64 and f32 lists refuse (prerequisite 2) | loud emit reject, clause 2 |
+| D3550 | a message-carrying `__trap__` in a function nothing calls declares four print host imports in a plain build (prerequisite 4) | runs; the cost is the import list |
+| D3551 | one anonymous lambda in a plumb-sized unit costs +254% compile fuel, and an unused import +15–22% (§3.4, §3.5) | runs; a PERF row graded by its fuel numbers |
+| D3557 | an inferred list of anonymous records cannot reach a generic `T[]` parameter (prerequisite 6) | loud emit reject, clause 2 |
 
-D1484 is the open row for the UFCS lambda-typing gap. **D3557** (prerequisite 6) is filed
-with this document, at the coordinator's id. The rows above are left for the coordinator to
-file, because this lane was given no id range beyond D3557.
+D1484, the UFCS lambda-typing gap (prerequisite 1), was already open.
 
 ---
 
