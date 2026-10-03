@@ -161,6 +161,46 @@ Deno.test({ name: "exact-const hover: an open destination shows the value with n
   await want(6, 15, "L: i64 = 7", INT, "L beside an i64", OPEN);
 });
 
+// Beside a typed operand of another KIND, or one the constant does not fit, the operator
+// computes wider than that operand, so the neighbour's type is no answer and none is shown.
+const WIDE = [
+  /*  0 */ "const K = 3000000000",
+  /*  1 */ "const F = 0.1",
+  /*  2 */ "const H = 2.5",
+  /*  3 */ "const n: i32 = 4",
+  /*  4 */ "const x: f32 = 1.5",
+  /*  5 */ "const c1 = K > n",
+  /*  6 */ "const c2 = n + K",
+  /*  7 */ "const c3 = K - n",
+  /*  8 */ "const c4 = n + F",
+  /*  9 */ "const c5 = n * H",
+  /* 10 */ "const c6 = x + K",
+  /* 11 */ "const c7 = n + 7",
+  /* 12 */ "const S = 7",
+  /* 13 */ "const c8 = n + S",
+  /* 14 */ "const c9 = x + F",
+  /* 15 */ "print(c1 && c9 > x)",
+  /* 16 */ "print(c2 + c3)",
+  /* 17 */ "print(c4 + c5)",
+  /* 18 */ "print(c6)",
+  /* 19 */ "print(c7 + c8)",
+  "",
+].join("\n");
+
+Deno.test({ name: "exact-const hover: beside an operand it does not fit, no type", ignore }, async () => {
+  const FLOAT = "float constant; typed at each use";
+  await want(5, 11, "K = 3000000000", INT, "K > n", WIDE);
+  await want(6, 15, "K = 3000000000", INT, "n + K", WIDE);
+  await want(7, 11, "K = 3000000000", INT, "K - n", WIDE);
+  await want(8, 15, "F = 0.1", FLOAT, "n + F", WIDE);
+  await want(9, 15, "H = 2.5", FLOAT, "n * H", WIDE);
+  await want(10, 15, "K = 3000000000", INT, "x + K", WIDE);
+  // An integer that fits beside an integer operand takes that operand's type.
+  await want(13, 15, "S: i32 = 7", INT, "n + S", WIDE);
+  // A float beside a float operand it fits takes that width: `f32.add` of `f32.const 0.1…`.
+  await want(14, 15, "F: f32 = 0.10000000149011612", "float constant (its f32 value here); typed at each use", "x + F", WIDE);
+});
+
 Deno.test({ name: "exact-const hover: a float at a typed use shows the value it computes with", ignore }, async () => {
   const FLOAT = "float constant; typed at each use";
   await want(8, 15, "F: f32 = 0.10000000149011612", "float constant (its f32 value here); typed at each use", "F at f32", OPEN);
