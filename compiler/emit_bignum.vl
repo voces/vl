@@ -262,26 +262,6 @@ function bigCmp(a: i32[], b: i32[]) {
   }
   0
 }
-// `a - b`, requiring a >= b (caller guarantees). Borrow-propagating limb subtract.
-function bigSub(a: i32[], b: i32[]) {
-  const out: i32[] = []
-  let borrow = 0
-  let i = 0
-  while i < a.length {
-    let bv = 0
-    if i < b.length { bv = b[i] }
-    let d = a[i] - bv - borrow
-    if d < 0 {
-      d = d + 0x10000
-      borrow = 1
-    } else {
-      borrow = 0
-    }
-    out.push(d)
-    i = i + 1
-  }
-  bigTrim(out)
-}
 // `a * 2` (left shift by one bit).
 function bigShl1(a: i32[]) {
   const out: i32[] = []
@@ -314,15 +294,76 @@ function bigShr1(a: i32[]) {
   }
   bigTrim(out)
 }
-// `a << bits` (multiply by 2^bits), applied bit-by-bit (`bits` is small here).
+// `a << bits` (multiply by 2^bits): whole limbs by prepending zeros, the rest bit by bit.
 function bigShlK(a: i32[], bits: i32) {
-  let r = a
+  if bits <= 0 || bigIsZero(a) { return a }
+  let r: i32[] = []
+  let z = 0
+  while z < (bits >>> 4) {
+    r.push(0)
+    z = z + 1
+  }
   let i = 0
-  while i < bits {
-    r = bigShl1(r)
+  while i < a.length {
+    r.push(a[i])
     i = i + 1
   }
+  let k = 0
+  while k < (bits & 15) {
+    r = bigShl1(r)
+    k = k + 1
+  }
   r
+}
+// `a >> bits` (floor divide by 2^bits) as a fresh trimmed bignum; `a` itself when `bits <= 0`
+// is copied, so the caller may mutate the result.
+function bigShrK(a: i32[], bits: i32) {
+  const sh = if bits < 0 { 0 } else { bits }
+  const ls = sh >>> 4
+  const bs = sh & 15
+  const out: i32[] = []
+  let i = ls
+  while i < a.length {
+    let v = a[i] >>> bs
+    if bs > 0 && i + 1 < a.length { v = v | (a[i + 1] << (16 - bs)) }
+    out.push(v & 0xffff)
+    i = i + 1
+  }
+  if out.length == 0 { out.push(0) }
+  bigTrim(out)
+}
+// `a * 2` in place, for a trimmed `a`, which stays trimmed.
+function bigShl1Into(a: i32[]) {
+  let carry = 0
+  let i = 0
+  while i < a.length {
+    const v = (a[i] << 1) | carry
+    a[i] = v & 0xffff
+    carry = (v >>> 16) & 1
+    i = i + 1
+  }
+  if carry != 0 { a.push(1) }
+  0
+}
+// `a - b` in place, requiring a >= b, trimmed after.
+function bigSubInto(a: i32[], b: i32[]) {
+  let borrow = 0
+  let i = 0
+  while i < a.length {
+    let bv = 0
+    if i < b.length { bv = b[i] }
+    let d = a[i] - bv - borrow
+    if d < 0 {
+      d = d + 0x10000
+      borrow = 1
+    } else {
+      borrow = 0
+    }
+    a[i] = d
+    i = i + 1
+  }
+  bigTrim(a)
+  0
 }
 // Number of significant bits in `a` (0 for zero).
 function bigBitLen(a: i32[]) {
@@ -347,15 +388,20 @@ function bigGetBit(a: i32[], idx: i32) {
 // encoder needs from the remainder, so no second array comes back.
 function bigDivmod(n: i32[], d: i32[]) {
   const nb = bigBitLen(n)
-  let rem: i32[] = []
-  rem.push(0)
+  // The remainder is shifted and reduced in place: one array for the whole division, where a
+  // fresh one per bit made a 1,000-bit literal cost megabytes of never-freed heap (D3480).
+  // Bits above `nb - bitlen(d)` can only shift into a remainder still below `d`, so the walk
+  // starts there with those bits already in the remainder, and their zero quotient bits dropped.
+  let b = nb - bigBitLen(d)
+  const rem = bigShrK(n, b + 1)
   const qbits: i32[] = []
-  let b = nb - 1
   while b >= 0 {
-    rem = bigShl1(rem)
-    if bigGetBit(n, b) == 1 { rem = bigAddSmall(rem, 1) }
+    bigShl1Into(rem)
+    if bigGetBit(n, b) == 1 {
+      rem[0] = rem[0] | 1 // bit 0 is clear after the shift
+    }
     if bigCmp(rem, d) >= 0 {
-      rem = bigSub(rem, d)
+      bigSubInto(rem, d)
       qbits.push(1)
     } else {
       qbits.push(0)
@@ -363,12 +409,11 @@ function bigDivmod(n: i32[], d: i32[]) {
     b = b - 1
   }
   // qbits are MSB-first; fold into a bignum.
-  let q: i32[] = []
-  q.push(0)
+  const q: i32[] = [0]
   let i = 0
   while i < qbits.length {
-    q = bigShl1(q)
-    if qbits[i] == 1 { q = bigAddSmall(q, 1) }
+    bigShl1Into(q)
+    if qbits[i] == 1 { q[0] = q[0] | 1 }
     i = i + 1
   }
   gDivRemNonzero = !bigIsZero(rem)
@@ -576,15 +621,26 @@ function ieeeBytes(text: string, sigBits: i32, bias: i32, nbytes: i32) {
   let den: i32[] = []
   den.push(1)
   let fk = 0
+  // Four decimal digits a step where they remain: `limb * 10^4` still fits an i32.
   if dexp < 0 {
     while fk < 0 - dexp {
-      den = bigMulSmall(den, 10)
-      fk = fk + 1
+      if fk + 4 <= 0 - dexp {
+        den = bigMulSmall(den, 10000)
+        fk = fk + 4
+      } else {
+        den = bigMulSmall(den, 10)
+        fk = fk + 1
+      }
     }
   } else {
     while fk < dexp {
-      num = bigMulSmall(num, 10)
-      fk = fk + 1
+      if fk + 4 <= dexp {
+        num = bigMulSmall(num, 10000)
+        fk = fk + 4
+      } else {
+        num = bigMulSmall(num, 10)
+        fk = fk + 1
+      }
     }
   }
   // value = `(num/den) * 2^exp`. Aligns so `floor(num/den)` has exactly `sigBits + 1`

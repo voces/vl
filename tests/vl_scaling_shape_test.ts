@@ -1230,6 +1230,28 @@ axis(
   (d) => twoFiles(d, genOperatorChains(2000), genOperatorChains(500)),
 );
 
+// D3417's GROWTH pair: one `n`-element literal per element kind (i32, f64, i64, a record) at
+// 40,000 against 10,000, so linear reads 4 and quadratic 16; it reads 2.9, the fixed cost of a
+// compile riding the short arm. A scalar literal past the operand cap is a data segment, and
+// each element is asked its width once per classification.
+const genArrayLiterals = (n: number): string => {
+  const o: string[] = [];
+  const els = (f: (i: number) => string) => Array.from({ length: n }, (_, i) => f(i)).join(", ");
+  o.push(`const a: i32[] = [${els((i) => `${(i * 7919) % 2001 - 1000}`)}]`);
+  o.push(`const b = [${els((i) => `${i % 97}.5`)}]`);
+  o.push(`const c: i64[] = [${els((i) => `${i * 3}`)}]`);
+  o.push(`function mk() {\n  return [${els((i) => `{ k: ${i % 89} }`)}]\n}`);
+  o.push("print(a[a.length - 1] + mk()[1].k)", "print(b[3])", "print(c[c.length - 1])");
+  return o.join("\n") + "\n";
+};
+
+axis(
+  "array literal length",
+  5.0,
+  "A literal's elements are re-scanned per element, or a scalar literal past the operand cap stopped lowering as a data segment (`arrLitNumKind`, `arrLitDataBuild`; D3417).",
+  (d) => twoFiles(d, genArrayLiterals(40000), genArrayLiterals(10000)),
+);
+
 // A chain of `depth` generics, each calling the next, every body carrying deferred
 // constraints over its `T`; `calleeFirst` declares the chain bottom-up.
 const genGenericChain = (depth: number, calleeFirst: boolean): string => {
