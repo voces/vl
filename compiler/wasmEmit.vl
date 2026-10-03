@@ -257,7 +257,9 @@ import {
   nulCloFlag,
   nullablePartOf,
   objFieldSrcOrder,
+  objFieldSrcPairs,
   objFieldValAt,
+  objLitDupSkew,
   objLitNeedsOrderStash,
   placeNarrowKeyOf,
   quoteLex,
@@ -824,6 +826,7 @@ import {
   exprNulBool,
   exprNulClosure,
   exprNulLitUnion,
+  exprNulNicheKind,
   exprNulScalarListKind,
   exprNulStrArray,
   exprNullableList,
@@ -1044,6 +1047,7 @@ import {
   placeNicheAtomKind,
   popUnionBoxElem,
   preStmtNarrow,
+  printPlanPinNull,
   printUnionArmsUnrenderable,
   printUnionPlan,
   pushAsgReadNarrow,
@@ -1691,17 +1695,26 @@ function emitObj(body: u8[], objIx: i32, fnIx: i32) {
     // written in another order permuted. When the permutation is observable, evaluate in
     // source order into one scratch local per field; `stash` is empty otherwise.
     const stash: i32[] = []
-    if objLitNeedsOrderStash(objIx, sFieldNames, sFieldStart[si], cnt) {
+    // A key repeated more or fewer times than this layout holds it also takes the stash: every
+    // initialiser runs once, and a slot it leaves unfilled repeats its name's last one (D3484).
+    const skew = objLitDupSkew(objIx, sFieldNames, sFieldStart[si], cnt)
+    if skew || objLitNeedsOrderStash(objIx, sFieldNames, sFieldStart[si], cnt) {
       let pi = 0
       while pi < cnt {
         stash.push(0 - 1)
         pi = pi + 1
       }
-      const ord = objFieldSrcOrder(objIx, sFieldNames, sFieldStart[si], cnt)
+      const pairs = objFieldSrcPairs(objIx, sFieldNames, sFieldStart[si], cnt)
       let oi = 0
-      while oi < ord.length {
-        const ofi = ord[oi]
-        const ovIx = objFieldValAt(objIx, sFieldNames, sFieldStart[si], ofi)
+      while oi + 1 < pairs.length {
+        const ofi = pairs[oi]
+        const ovIx = pairs[oi + 1]
+        oi = oi + 2
+        if ofi < 0 {
+          if emitExpr(body, ovIx, fnIx) < 0 { return -1 }
+          fbDrop()
+          continue
+        }
         if emitStructFieldValue(body, si, ofi, ovIx, fnIx) < 0 { return -1 }
         const oslot = objOrderStashSlot(
           sFieldTypeAt(si, ofi),
@@ -1709,13 +1722,18 @@ function emitObj(body: u8[], objIx: i32, fnIx: i32) {
         )
         stash[ofi] = oslot
         fbLocalSet(oslot)
-        oi = oi + 1
       }
     }
     let fi = 0
     while fi < cnt {
       const valIx = objFieldValAt(objIx, sFieldNames, sFieldStart[si], fi)
       const scode = sFieldTypeAt(si, fi)
+      if valIx < 0 && skew && objDupSlotRepeats(si, fi, stash) {
+        stash[fi] = stash[fi - 1]
+        fbLocalGet(stash[fi])
+        fi = fi + 1
+        continue
+      }
       if valIx < 0 {
         // An omitted field pushes a constant, so it has no source position to keep and
         // stays in the layout loop even under the stash.
@@ -1739,6 +1757,16 @@ function emitObj(body: u8[], objIx: i32, fnIx: i32) {
     return 0
   }
   emitFail("emitProgram: expected an object literal")
+}
+
+// Whether layout slot `fi` of struct row `si` can repeat the stashed value of slot `fi - 1`: the
+// same name at the same field type and storage, already filled.
+function objDupSlotRepeats(si: i32, fi: i32, stash: i32[]): boolean {
+  if fi < 1 || fi >= stash.length || stash[fi - 1] < 0 { return false }
+  const st = sFieldStart[si]
+  if sFieldNames[st + fi] != sFieldNames[st + fi - 1] { return false }
+  if sFieldTypeAt(si, fi) != sFieldTypeAt(si, fi - 1) { return false }
+  sFieldStorageSlot(si, fi) == sFieldStorageSlot(si, fi - 1)
 }
 
 // Does `name` appear as a value — any position other than the callee of a direct
@@ -18948,12 +18976,26 @@ function emitCallCore(body: u8[], callIx: i32, fnIx: i32) {
           if emitNulNoneForEffect(body, c.callArgs[0], fnIx) < 0 { return -1 }
           return emitPrintNullWord()
         }
+        // A nullable ref niche whose other arm has no printed form (a record, a list, a map, a
+        // closure) can print only as `null`, whatever narrowed it there (D3498).
+        const pnNiche = exprNulNicheKind(c.callArgs[0], fnIx)
+        if (
+          (pnNiche != "" && pnNiche != "nulstr")
+          || exprNullableMap(c.callArgs[0], fnIx)
+        ) {
+          const prMask = maskNarrowFor(narrowedToNullKey(c.callArgs[0]))
+          const prRc = emitPrintNulRefNiche(body, c.callArgs[0], fnIx)
+          unmaskNarrow(prMask)
+          return prRc
+        }
         // A read the narrowing pins to `null` is printed with the narrowing lifted, so the box's
         // own tag decides: every ladder below would unbox an arm it does not hold (D2801).
         const pnKey = narrowedToNullKey(c.callArgs[0])
         if pnKey != "" {
           const pnMask = maskNarrowFor(pnKey)
+          const pnWas = printPlanPinNull(true)
           const pnRc = emitCallCore(body, callIx, fnIx)
+          printPlanPinNull(pnWas)
           unmaskNarrow(pnMask)
           return pnRc
         }
@@ -27176,6 +27218,22 @@ function emitPrintNulString(body: u8[], argIx: i32, fnIx: i32) {
   fbBr(1) // → $out
   fbEnd()
   emitPrintNullWord()
+  fbEnd()
+  0
+}
+
+// `print(v)` over a nullable ref niche whose other arm has no printed form (D3498): the word
+// `null` after a run-time test, and a trap when the value is not null, which a checked program
+// never reaches, since no text would be right for it.
+function emitPrintNulRefNiche(body: u8[], argIx: i32, fnIx: i32) {
+  const rawCtx = expCtxHere()
+  rawCtx.rawNullRead = true
+  if emitExprExpect(body, argIx, fnIx, rawCtx) < 0 { return -1 }
+  wU8(209) // 0xd1 ref.is_null
+  fbIf(64)
+  emitPrintNullWord()
+  fbElse()
+  fbUnreachable()
   fbEnd()
   0
 }
