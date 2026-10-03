@@ -12,6 +12,7 @@ import {
   TyFunc,
   TyMap,
   TyNullable,
+  TyPrim,
   declAnnRawTyName,
   inferRetNameOf,
   isValueUnionName,
@@ -2539,6 +2540,47 @@ export function retStrArrFlag(tyIx: i32) {
 // function body it builds chunked (`array.new_default` plus per-chunk `array.new_fixed`/
 // `array.copy`), and a global initializer holding one routes through the start function instead (a wasm constant expression has no locals to chunk through).
 export const NEW_FIXED_MAX = 10000
+
+// A string or ref literal longer than this builds in chunks of this many: an engine compiles one
+// `array.new_fixed` over n operands that allocate in time and memory super-linear in n, and a
+// global's constant initializer is such a function too, so it moves to the start function (D3462).
+export const ALLOC_LIT_CHUNK = 256
+
+// Whether the array literal at `ix` builds a plain scalar backing: every element a number or
+// boolean literal, and the checker's element type a bare primitive.
+function arrLitBuildsScalar(ix: i32): boolean {
+  if !arrTyElemIsPrim(nodeTyIxOf(ix)) { return false }
+  const a = P.nodes[ix]
+  if a is ArrayLit {
+    let i = 0
+    while i < a.arrElems.length {
+      if !arrLitElemIsScalarLit(a.arrElems[i]) { return false }
+      i = i + 1
+    }
+    return true
+  }
+  false
+}
+
+// Whether arena type `ty` is an array of a bare primitive: a literal-union or nullable element
+// boxes or niches, and the checker records the destination's element on the literal.
+function arrTyElemIsPrim(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  const t = T.tys[ty]
+  if t is TyArray {
+    if t.aElem < 0 || t.aElem >= T.tys.length { return false }
+    return T.tys[t.aElem] is TyPrim
+  }
+  false
+}
+
+function arrLitElemIsScalarLit(ix: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const e = P.nodes[ix]
+  if e is NumLit { return true }
+  e is BoolLit
+}
+
 // Whether the initializer expression at `exprIx` is a valid WasmGC constant expression — the
 // forms `emitProgram` lowers inline in the global section. Const: literals, an `ArrayLit`/
 // `ObjLit` whose parts are all const, and a `Paren` wrapping one; a literal past the operand
@@ -2553,6 +2595,9 @@ export function isConstInit(exprIx: i32) {
   if e is Paren { return isConstInit(e.parInner) }
   if e is ArrayLit {
     if e.arrElems.length > NEW_FIXED_MAX { return false }
+    if e.arrElems.length > ALLOC_LIT_CHUNK && !arrLitBuildsScalar(exprIx) {
+      return false
+    }
     let i = 0
     while i < e.arrElems.length {
       if !isConstInit(e.arrElems[i]) { return false }
