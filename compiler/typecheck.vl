@@ -18990,10 +18990,7 @@ function joinTyParamNull(a: i32, b: i32) {
     // A hole's name starts with `?`; a declared parameter's is an identifier. A parameter's
     // hole in the body declaring it is one as well (D3303).
     if t.tvName.length > 0 && t.tvName[0] != "?"[0] { return mkNullableTy(tv) }
-    if (
-      tyIsNamedParamHole(tv)
-      && (tyParamOfInnermostBody(tv) || lamParamOfOpenBody(tv))
-    ) {
+    if tyIsNamedParamHole(tv) && tyParamOfInnermostBody(tv) {
       noteHoleTpJoin(tv)
       return mkNullableTy(tv)
     }
@@ -19310,7 +19307,6 @@ function paramJoinDropsNull(u: i32, o: i32): boolean {
     if m >= 0 && m < T.tys.length {
       if tyIsDeclaredParam(m) { return true }
       if tyIsNamedParamHole(m) && tyParamOfInnermostBody(m) { return true }
-      if tyIsNamedParamHole(m) && lamParamOfOpenBody(m) { return true }
     }
   }
   false
@@ -20865,26 +20861,6 @@ function tyParamOfInnermostBody(p: i32): boolean {
   false
 }
 
-// Whether `p` is a declared type parameter, or a parameter's hole, of a declaration whose body
-// is being checked.
-function gradualParamOfOpenBody(p: i32): boolean {
-  if tyIsDeclaredParam(p) { return tyParamOfOpenBody(p) }
-  if !tyIsNamedParamHole(p) { return false }
-  const tp = T.tys[p]
-  if tp is TyVar {
-    for owner in cstrOwnerStack {
-      if holeNameOfDecl(tp.tvName, owner) { return true }
-    }
-  }
-  false
-}
-
-// Whether `p` is such a parameter seen from inside a lambda in that body, where a join keeps
-// its `null` apart as the body's own does (D3506).
-function lamParamOfOpenBody(p: i32): boolean {
-  lamCheckDepth > 0 && gradualParamOfOpenBody(p)
-}
-
 // Whether type variable `p` names a type parameter of a declaration whose body is being checked.
 function tyParamOfOpenBody(p: i32): boolean {
   const tp = T.tys[p]
@@ -21148,59 +21124,6 @@ function collapseDeferredJoin(tyIx: i32) {
     if res >= 0 { return res }
   }
   tyIx
-}
-
-// Whether deferred join `tyIx` holds two or more type parameters, or parameter holes, of a body
-// being checked and no other hole: a lambda's join of them, which each instance builds at its pin.
-function deferredJoinOverOpenParams(tyIx: i32): boolean {
-  if tyIx < 0 || tyIx >= T.tys.length { return false }
-  const ms: i32[] = []
-  flattenVariantsInto(tyIx, ms)
-  const names: string[] = []
-  for m in ms {
-    if m < 0 || m >= T.tys.length { return false }
-    const mt = T.tys[m]
-    if mt is TyVar {
-      if !gradualParamOfOpenBody(m) { return false }
-      let seen = false
-      for nm in names {
-        if nm == mt.tvName { seen = true }
-      }
-      if !seen { names.push(mt.tvName) }
-    }
-  }
-  names.length >= 2
-}
-
-// Deferred join `tyIx` as the join a body declaring its parameters keeps apart: the members
-// once each, a null as the wrapper, both marked so every pin re-joins it as the lambda does.
-function openParamJoinOf(tyIx: i32): i32 {
-  const ms: i32[] = []
-  flattenVariantsInto(tyIx, ms)
-  const kept: i32[] = []
-  let hasNull = false
-  for m in ms {
-    if isNullTy(m) {
-      hasNull = true
-    } else {
-      let dup = false
-      for k in kept {
-        if k == m || sameVariantTy(k, m) || sameDeclaredTyParam(k, m) {
-          dup = true
-        }
-      }
-      if !dup { kept.push(m) }
-    }
-  }
-  // Every member is a parameter's runtime value, so numbers stay apart at the pin (D3521).
-  const u = mkUnionTy(kept)
-  // arena-tick exempt: a per-program mark on a fresh arena row.
-  tpJoinUnions[u] = 2
-  if !hasNull { return u }
-  const res = mkNullableTy(u)
-  // arena-tick exempt: a per-program mark on a fresh arena row.
-  tpJoinUnions[res] = 2
-  res
 }
 
 // Park the uncollapsed deferred join `tyIx` under call node `nodeIx`, last write winning — the
@@ -50127,15 +50050,6 @@ function finishInferredReturn(
         )
       }
     }
-  }
-  // A lambda's join of its enclosing body's type parameters is that body's kept-apart join, so
-  // the lambda's instance and every caller re-join it at the pin alike (D3520, D3521).
-  if (
-    n.fnName == ""
-    && tyIsDeferredJoin(inferred)
-    && deferredJoinOverOpenParams(inferred)
-  ) {
-    inferred = openParamJoinOf(inferred)
   }
   ret = inferred
   // Patches the hoisted `TyFunc` in place so existing references see the result; a nested
