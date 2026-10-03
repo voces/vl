@@ -1004,6 +1004,7 @@ import {
   mvValUnionHasNull,
   mvValVariantOf,
   nameIsWholeSpanShape,
+  narrowDropsNull,
   narrowExcludesNull,
   narrowSlotOf,
   narrowSlotTyOf,
@@ -16580,15 +16581,16 @@ export function emitExprAsI64(body: u8[], exprIx: i32, fnIx: i32) {
     return r
   }
   if exprIsI64(widenClassifyExpr(exprIx, fnIx), fnIx) {
-    // A join whose wide arm claims `i64` is still the box when it is the literal union (D3517).
-    if njLitBoxUnwidened(exprIx, fnIx) { return njLitBoxRefuse() }
+    // A join whose wide arm claims `i64` can still be a box of numbers (D3517).
+    if njBoxWidens(exprIx, fnIx) {
+      return emitNumUnionConvert(body, exprIx, 3, fnIx)
+    }
     return emitExprWideCleared(body, exprIx, fnIx)
   }
   // A numeric union converts at the member it holds; anything else is an i32, sign-extended.
   if njWidensOut(exprIx, fnIx) {
     return emitNumUnionConvert(body, exprIx, 3, fnIx)
   }
-  if njLitBoxUnwidened(exprIx, fnIx) { return njLitBoxRefuse() }
   if emitExprWideCleared(body, exprIx, fnIx) < 0 { return -1 }
   fbI64ExtendI32S()
   0
@@ -16610,7 +16612,9 @@ export function emitExprAsF64(body: u8[], exprIx: i32, fnIx: i32) {
     return 0
   }
   if exprIsF64(f64Cls, fnIx) || exprIsI64(f64Cls, fnIx) {
-    if njLitBoxUnwidened(exprIx, fnIx) { return njLitBoxRefuse() }
+    if njBoxWidens(exprIx, fnIx) {
+      return emitNumUnionConvert(body, exprIx, 4, fnIx)
+    }
   }
   if exprIsF64(f64Cls, fnIx) { return emitExpr(body, exprIx, fnIx) }
   // A bare int literal of any radix (optionally negated) re-encodes directly as `f64.const`
@@ -16635,7 +16639,6 @@ export function emitExprAsF64(body: u8[], exprIx: i32, fnIx: i32) {
   if njWidensOut(exprIx, fnIx) {
     return emitNumUnionConvert(body, exprIx, 4, fnIx)
   }
-  if njLitBoxUnwidened(exprIx, fnIx) { return njLitBoxRefuse() }
   // Otherwise an i32 expression (or integer literal): convert (signed) to f64.
   if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
   fbF64ConvertI32S()
@@ -16686,14 +16689,15 @@ export function emitExprAsF32(body: u8[], exprIx: i32, fnIx: i32) {
   // i64/f64 widenings do, and owns its own width (`emitExprWideCleared`) so an f32 seed
   // reaching here belongs to the position that set it, not the i32 sub-positions inside it.
   if exprIsF32(widenClassifyExpr(exprIx, fnIx), fnIx) {
-    if njLitBoxUnwidened(exprIx, fnIx) { return njLitBoxRefuse() }
+    if njBoxWidens(exprIx, fnIx) {
+      return emitNumUnionConvert(body, exprIx, 5, fnIx)
+    }
     return emitExprWideCleared(body, exprIx, fnIx)
   }
   // A numeric union converts at the member it holds; anything else is an i32, converted.
   if njWidensOut(exprIx, fnIx) {
     return emitNumUnionConvert(body, exprIx, 5, fnIx)
   }
-  if njLitBoxUnwidened(exprIx, fnIx) { return njLitBoxRefuse() }
   if emitExprWideCleared(body, exprIx, fnIx) < 0 { return -1 }
   fbF32ConvertI32S()
   0
@@ -28702,25 +28706,33 @@ export function nodeIsNumUnion(ix: i32, fnIx: i32): boolean {
 // member: a numeric union, or an integer-literal union over two bases (D3491), which mints no
 // numeric union and so is asked without that gate.
 function njWidensOut(ix: i32, fnIx: i32): boolean {
+  // Nearly every widened value is typed at one primitive, which is no box.
+  if tyIsPrimIx(nodeTyIxOf(ix)) { return false }
   if numUnionMinted && nodeIsNumUnion(ix, fnIx) { return true }
-  intLitUnionBasesOf(nodeTyIxOf(ix)).length > 0
+  njLitBasesOf(ix).length > 0
 }
 
-// Whether the value at `ix` is the box of a nullable integer-literal union over two bases that
-// no widening arm claimed: the `??` lowering's read is not yet recognised (D3517), and pushing
-// the box where a number is owed would be invalid wasm.
-function njLitBoxUnwidened(ix: i32, fnIx: i32): boolean {
+// Whether the value at `ix` lowers as a box of numbers that converts out member by member,
+// though a widening's fast path classified it at the destination's width.
+function njBoxWidens(ix: i32, fnIx: i32): boolean {
+  njWidensOut(ix, fnIx) && exprUnion(ix, fnIx)
+}
+
+// The bases of the two-base integer-literal union the value at `ix` holds (`intLitUnionBasesOf`):
+// its recorded type's, or, for a name narrowed past `null`, its nullable type's. Empty otherwise.
+function njLitBasesOf(ix: i32): i32[] {
   const t = nodeTyIxOf(ix)
-  if t < 0 { return false }
-  if intLitUnionBasesOf(nonNullTy(t)).length == 0 { return false }
-  exprUnion(ix, fnIx)
-}
-
-// The refusal `njLitBoxUnwidened` owes until D3517 is built.
-function njLitBoxRefuse() {
-  emitFail(
-    "emitProgram: a nullable integer-literal union read is not yet widened into a number type here",
-  )
+  const lb = intLitUnionBasesOf(t)
+  if lb.length > 0 || t < 0 { return lb }
+  const nn = nonNullTy(t)
+  if nn == t { return lb }
+  const nb = intLitUnionBasesOf(nn)
+  if nb.length == 0 { return nb }
+  const u = P.nodes[unwrapParen(ix)]
+  if u is Ident {
+    if narrowDropsNull(u.identName) { return nb }
+  }
+  lb
 }
 
 // The member types of the numeric union at `ix`: its recorded type's, or, where an instance
@@ -28729,7 +28741,7 @@ function njMembersOf(ix: i32, fnIx: i32): i32[] {
   const t = nodeTyIxOf(ix)
   const ms = numUnionMembersOf(t)
   if ms.length > 0 { return ms }
-  const lb = intLitUnionBasesOf(t)
+  const lb = njLitBasesOf(ix)
   if lb.length > 0 { return lb }
   const none: i32[] = []
   // Only a name can be a box its recorded type does not name; any other node is typed by it.
@@ -28737,9 +28749,7 @@ function njMembersOf(ix: i32, fnIx: i32): i32[] {
   if !(u is Ident) { return none }
   if tyIsNumericBox(t) {
     // A name narrowed past its `null` holds only the number members of its box.
-    if narrowExcludesNull(u.identName) {
-      return numUnionMembersOf(nonNullTy(t))
-    }
+    if narrowDropsNull(u.identName) { return numUnionMembersOf(nonNullTy(t)) }
     return none
   }
   // An instance's parameter can carry no recorded type at all; its box still names the members.
@@ -28819,15 +28829,24 @@ function njStash(
   fnIx: i32,
 ): i32 {
   if isUnion {
-    // A join whose arms are scalars is built as the box here, as a union destination builds it.
+    // A join whose arms are scalars is built as the box here, as a union destination builds it;
+    // the box owns its members' widths, so a widening destination's pending width is cleared.
+    const savedI64 = pendingI64
+    const savedF32 = pendingF32
+    const savedF64 = pendingF64
+    pendingI64 = false
+    pendingF32 = false
+    pendingF64 = false
+    let sr = 0
     if exprUnion(ix, fnIx) {
-      if emitExpr(body, ix, fnIx) < 0 { return -1 }
-    } else if (
-      emitUnionCoerce(body, tyToEmitName(nodeTyIxOf(ix)), ix, fnIx)
-      < 0
-    ) {
-      return -1
+      sr = emitExpr(body, ix, fnIx)
+    } else {
+      sr = emitUnionCoerce(body, tyToEmitName(nodeTyIxOf(ix)), ix, fnIx)
     }
+    pendingI64 = savedI64
+    pendingF32 = savedF32
+    pendingF64 = savedF64
+    if sr < 0 { return -1 }
     const bs = njSlot(26, "i32", key)
     fbLocalSet(bs)
     return bs
