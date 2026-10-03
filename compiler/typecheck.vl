@@ -3671,6 +3671,8 @@ let tpJoinUnions: {[i32]: i32} = Map()
 // The joins `paramNullJoin` kept a null in (D3497): re-folding one at a call keeps the null even
 // when the bound members absorb it, as a caller's own holes do.
 let paramNullJoins: {[i32]: i32} = Map()
+// The unions an annotation spelled (`annUnionTy`), apart from those a join made (D3357).
+let annUnionTys: {[i32]: boolean} = Map()
 // The parameter holes some join kept apart as an implicit type parameter (D3333): an instance
 // binding one re-joins such a join through its holes' binding.
 let holeTpJoinNames: {[string]: boolean} = Map()
@@ -5013,6 +5015,7 @@ export function initChecker() {
   T.tys = []
   tpJoinUnions = Map()
   paramNullJoins = Map()
+  annUnionTys = Map()
   holeTpJoinNames = Map()
   genFnCstrBusy = false
   tpIfJoinAt = Map()
@@ -24463,6 +24466,8 @@ function annUnionTy(members: i32[], hasNull: boolean): i32 {
   }
   const inner = annUnionInnerTy(members, hasNull)
   if inner < 0 { return -1 }
+  // arena-tick exempt: a per-program mark on an annotation's row.
+  annUnionTys[inner] = true
   if hasNull {
     const wrapped = mkNullableTy(inner)
     // Carries the collapse bank through the niche wrap: `string | "err" | null` is
@@ -43329,7 +43334,7 @@ function nullableFlatInner(u: i32): i32 {
 // nullable member or bound a parameter to `null` (`(A | null) | B`, `A | B` at `A := T | null`);
 // empty when it did not, or when a member is a literal union. A declared bare `null` member
 // keeps its shape.
-function substUnionNullFolded(ms: i32[], out: i32[]): i32[] {
+function substUnionNullFolded(tyIx: i32, ms: i32[], out: i32[]): i32[] {
   const res: i32[] = []
   let nested = false
   let i = 0
@@ -43340,6 +43345,9 @@ function substUnionNullFolded(ms: i32[], out: i32[]): i32[] {
     i = i + 1
   }
   if !nested { return res }
+  // A join of bare type parameters no annotation wrote (`T | U` over a union of their lists)
+  // keeps the nesting: its element reads are not yet built at a nullable pin (D3357).
+  if !annUnionTys.has(tyIx) && substAllTyVars(ms) { return res }
   const flat: i32[] = []
   for m in out { flattenVariantsInto(m, flat) }
   for m in flat {
@@ -43354,6 +43362,14 @@ function substUnionNullFolded(ms: i32[], out: i32[]): i32[] {
   res
 }
 
+// Whether every member of `ms` is a type variable.
+function substAllTyVars(ms: i32[]): boolean {
+  for m in ms {
+    if m < 0 || m >= T.tys.length || !(T.tys[m] is TyVar) { return false }
+  }
+  true
+}
+
 // `inner | null`: a member of `ms` that already is that nullable, so a fold that changes nothing
 // but the nesting keeps the binding's arena row, else a new one.
 function substNullableOver(ms: i32[], inner: i32): i32 {
@@ -43364,6 +43380,24 @@ function substNullableOver(ms: i32[], inner: i32): i32 {
     }
   }
   mkNullableTy(inner)
+}
+
+// Whether `ty` is a union of literal unions, literals and strings with a `null`, at least one a
+// literal union or literal: the box a `string | null` destination reads as its niche (D3382).
+export function tyIsNulStrBoxUnion(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  const ms: i32[] = []
+  flattenVariantsInto(ty, ms)
+  let lit = false
+  let nul = false
+  for m in ms {
+    if m < 0 || m >= T.tys.length { return false }
+    const mt = T.tys[m]
+    if isNullTy(m) { nul = true }
+    else if tyIsLitUnion(m) || mt is TyLit { lit = true }
+    else if !(mt is TyPrim && mt.primName == "string") { return false }
+  }
+  lit && nul
 }
 
 // Deep substitution of a call's bindings into a type: a bound `TyVar` becomes its binding; a
@@ -43469,7 +43503,7 @@ export function substTyDeep(tyIx: i32, bNames: string[], bTys: i32[]) {
     } else if changed3 {
       // A null the substitution put inside the union (`(A | null) | B`, or `A | B` at `A := T |
       // null`) folds out to one nullable wrapper over the rest, in member order (D3504, D3502).
-      const src = substUnionNullFolded(ms, out3)
+      const src = substUnionNullFolded(tyIx, ms, out3)
       const wrapNull = src.length > 0
       // Dedupes by arena-index identity only (not `sameVariantTy`) then rebuilds: substitution
       // can make two members the same type, and matching structurally here would merge members this walk must leave alone (the mixed-union arena shape is load-bearing).
