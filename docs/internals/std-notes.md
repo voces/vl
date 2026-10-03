@@ -950,6 +950,69 @@ only cross-host variance is IEEE-754 itself.
   promised bound (printing `true`) rather than pinning exact bits, so a later coefficient
   change that still meets the bound does not churn the fixture.
 
+### `sinF64`/`cosF64`/`sinF32`/`cosF32` (D3476, sunpa SP-002)
+
+- **Reduction.** `reducePio2` returns `q mod 4` and leaves `x - q·π/2` in `[-π/4, π/4]` as the
+  unevaluated sum `redHi + redLo` (two private module globals, written then read straight
+  back by the caller; no result depends on an earlier call). Below `2^20·π/2` (≈1.647e6) it
+  is Cody–Waite with π/2 in three 33-bit parts plus tails, the second and third rounds run
+  only when the first cancelled more than 16 / 49 bits (fdlibm's shape; relative error of the
+  reduced argument ≤ 2^-70 over 200k probes). Above it is an integer Payne–Hanek: the
+  53-bit significand times a 192-bit window of 2/π taken from a 21-word table (one word of
+  leading zeros, so the window may start before the binary point), product kept mod 2^192
+  in 32-bit columns of i64, top two bits the quadrant, the 190 below the fraction, rounded
+  to nearest, normalised with `clz`, turned into a double-double, and multiplied by π/2 in
+  double-double (Dekker). Accurate to ~2^-100 relative for every finite double, including
+  `6381956970095103·2^797`, the double closest to a multiple of π/2.
+- **Kernels.** Degree-6-in-`x²` minimax polynomials for `sin` (relative error 2^-57.1) and
+  `cos` (2^-62.1) on `[0, (π/4)²]`, from a Remez exchange in mpmath
+  (`scripts/std-math/trig-remez.py sin64|cos64`), fed through fdlibm's tail-carrying kernel
+  shapes so `redLo` is honoured. The f32 pair uses degree-4 kernels (2^-36.8 / 2^-33.1,
+  `sin32|cos32`) evaluated in f64 on `redHi` alone, then one f64→f32 rounding.
+- **The f32 pair evaluates in f64, a deliberate departure from std-math-design §C.4.** That
+  clause rules out "compute in f64, cast down" because a cast-down function differs from one
+  that rounds like the caller's f32 pipeline. For sin/cos there is no f32 pipeline to match
+  (WGSL's `sin` is driver-defined, and sunsuz's peer confirmed no shader twin), while f32
+  Cody–Waite cannot reach large arguments at all and f32 Horner would cost accuracy. The
+  result is one rounding from a value good to ~2^-33, which is within 0.5014 f32 ulp, and
+  wasm runs f64 arithmetic at f32 speed. The signature is f32 in and out, so no caller
+  widens; what §C.4 protects (determinism, a published bound) holds.
+- **Special values.** `|x| < 2^-26` (f64) / `2^-12` (f32) returns `x` from sin (this keeps
+  `-0.0` and subnormals exact) and `1` from cos. NaN and ±∞ return the constant quiet NaN
+  `0x7FF8000000000000` / `0x7FC00000` rather than `x - x`, because a NaN produced by
+  arithmetic has an engine-chosen sign bit in wasm, and the contract is bits.
+- **Exact-constant trap.** Under the exact-constant ruling a `const` initialised from other
+  literal-valued consts is computed exactly, so Veltkamp's split written as
+  `const c = 134217729.0 * P1; const hi = c - (c - P1)` folds to `hi = P1, lo = 0` and the
+  double-double product silently loses its low half (it cost 0.7 ulp in the Payne–Hanek
+  range before it was caught). The split halves of π/2 are therefore literals. Any rounding
+  trick on constants in this module must be precomputed the same way.
+- **Measured** (`scripts/std-math/trig-check.sh`, 2.88M points: 1M uniform in `[-1e6, 1e6]`
+  at each width, 200k random bit patterns, near-multiples of π/2 for `k ≤ 20000` and random
+  `k < 2^50` with their ±1-ulp neighbours, and specials; graded by mpmath). Max error:
+  `sinF64` 0.772 ulp, `cosF64` 0.761 ulp, `sinF32`/`cosF32` 0.5014 ulp, against a published
+  bound of 1 ulp. `scripts/std-math/trig-f32-exhaustive.vl` runs all 2,139,095,040
+  non-negative finite f32 against the f64 pair (~150 s at `-O3`): worst 0.50148 ulp for both,
+  and 396,590 (`sinF32`) / 408,475 (`cosF32`) results, ~0.02%, are not the correctly rounded
+  f32, so the f32 bound is exhaustive rather than sampled.
+- **Determinism.** The grid's transcript is byte-identical between wasmtime (`vl run`) and
+  V8 (Deno), at `-O0` and at `-O3`, on every result bit; `trig-check.sh` fails otherwise.
+  The fixtures pin exact values, so the corpus oracle (V8) and the native suites (wasmtime)
+  each re-check them.
+- **Cost.** One call, measured inside wasm at load ~20: 2.8 ns for `|x| ≤ 0.3`, 5.5–6 ns for
+  `|x| ≤ 5000` under wasmtime and 7.9–9 ns under V8, against 17.6–18.4 ns for a JS loop over
+  V8's `Math.sin`/`Math.cos`. The Payne–Hanek path is only taken above ≈1.6e6.
+- **No `sinCosF64` (std-api-review, 2026-10-02: do not add).** Both values share one
+  reduction, so a fused export would save ~2 ns of ~6, and nothing below π/4 where there is
+  no reduction. It needs a two-value return: VL has no tuples, and a `{ sin, cos }` record
+  return would make that record type permanent surface and lean on a multi-value lowering
+  not yet verified as shipped. No consumer asked. Deferred until one measures the cost of
+  the second reduction.
+- **`redHi`/`redLo` assume per-instance module globals.** Each write is read back at once by
+  the same call, so no result depends on an earlier call; a future threading model that
+  SHARED module globals across instances would make this a race, and `reducePio2` would
+  then need a real two-value return.
+
 ## `std:simd`
 
 Slice S3 of `docs/internals/simd-design.md` — the `F32x4` surface over the `__…_f32x4__` /
