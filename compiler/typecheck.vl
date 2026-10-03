@@ -43231,6 +43231,14 @@ function substListTwin(a: i32, b: i32): boolean {
   tyEq(a, b)
 }
 
+// Whether `kept` already holds the list type `m` at another arena index (D3503).
+function substListTwinIn(kept: i32[], m: i32): boolean {
+  for k in kept {
+    if substListTwin(k, m) { return true }
+  }
+  false
+}
+
 // The members of a union re-joined one at a time, as the join that made it would at these types.
 function rejoinMembers(ms: i32[]): i32 {
   const apart = njRejoinApart
@@ -43283,11 +43291,54 @@ function nullableFlatInner(u: i32): i32 {
   flattenVariantsInto(u, ms)
   const kept: i32[] = []
   for m in ms {
-    if !isNullTy(m) && !i32ListHas(kept, m) { kept.push(m) }
+    if !isNullTy(m) && !i32ListHas(kept, m) && !substListTwinIn(kept, m) {
+      kept.push(m)
+    }
   }
   if kept.length == 0 { return u }
   if kept.length == 1 { return kept[0] }
   mkUnionTy(kept)
+}
+
+// The members of a substituted union with every null folded out, when the substitution left a
+// nullable member or bound a parameter to `null` (`(A | null) | B`, `A | B` at `A := T | null`);
+// empty when it did not, or when a member is a literal union. A declared bare `null` member
+// keeps its shape.
+function substUnionNullFolded(ms: i32[], out: i32[]): i32[] {
+  const res: i32[] = []
+  let nested = false
+  let i = 0
+  while i < out.length && i < ms.length {
+    const m = out[i]
+    if m >= 0 && m < T.tys.length && T.tys[m] is TyNullable { nested = true }
+    if isNullTy(m) && !isNullTy(ms[i]) { nested = true }
+    i = i + 1
+  }
+  if !nested { return res }
+  const flat: i32[] = []
+  for m in out { flattenVariantsInto(m, flat) }
+  for m in flat {
+    // A literal-union member keeps the nesting: a declared `K | L | null` and a folded one do
+    // not share a rep yet, so the fold would let through what the emitter builds wrong (D3140).
+    if m >= 0 && m < T.tys.length && (tyIsLitUnion(m) || T.tys[m] is TyLit) {
+      const none: i32[] = []
+      return none
+    }
+    if !isNullTy(m) { res.push(m) }
+  }
+  res
+}
+
+// `inner | null`: a member of `ms` that already is that nullable, so a fold that changes nothing
+// but the nesting keeps the binding's arena row, else a new one.
+function substNullableOver(ms: i32[], inner: i32): i32 {
+  for m in ms {
+    if m >= 0 && m < T.tys.length {
+      const mt = T.tys[m]
+      if mt is TyNullable && mt.nInner == inner { return m }
+    }
+  }
+  mkNullableTy(inner)
 }
 
 // Deep substitution of a call's bindings into a type: a bound `TyVar` becomes its binding; a
@@ -43391,20 +43442,26 @@ export function substTyDeep(tyIx: i32, bNames: string[], bTys: i32[]) {
       res = rejoinMembers(out3)
       tpApartConcrete = tpSaved
     } else if changed3 {
+      // A null the substitution put inside the union (`(A | null) | B`, or `A | B` at `A := T |
+      // null`) folds out to one nullable wrapper over the rest, in member order (D3504, D3502).
+      const src = substUnionNullFolded(ms, out3)
+      const wrapNull = src.length > 0
       // Dedupes by arena-index identity only (not `sameVariantTy`) then rebuilds: substitution
       // can make two members the same type, and matching structurally here would merge members this walk must leave alone (the mixed-union arena shape is load-bearing).
+      let dms = out3
+      if wrapNull { dms = src }
       const uniq: i32[] = []
       let q = 0
-      while q < out3.length {
+      while q < dms.length {
         let seen = false
         let w = 0
         while w < uniq.length {
-          if uniq[w] == out3[q] { seen = true }
+          if uniq[w] == dms[q] { seen = true }
           // `T[] | i32[]` at `T := i32` is one list; the substituted `T[]` is a fresh index (D2818).
-          if substListTwin(uniq[w], out3[q]) { seen = true }
+          if substListTwin(uniq[w], dms[q]) { seen = true }
           w = w + 1
         }
-        if !seen { uniq.push(out3[q]) }
+        if !seen { uniq.push(dms[q]) }
         q = q + 1
       }
       // The third union-construction site needing the same subsumed-arm collapse
@@ -43418,6 +43475,7 @@ export function substTyDeep(tyIx: i32, bNames: string[], bTys: i32[]) {
       const sclash = setMapUnionClashMsg(kept3, false)
       if sclash != "" { joinClashMsg = sclash }
       if kept3.length == 1 { res = kept3[0] } else { res = mkUnionTy(kept3) }
+      if wrapNull { res = substNullableOver(out3, res) }
     }
   } else if t is TyMap {
     const k2 = substTyDeep(t.mKey, bNames, bTys)
