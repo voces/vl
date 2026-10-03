@@ -43,6 +43,13 @@ const CASES: [string, string, string][] = [
     "const o = {\n  a: 1,\n  b: { c: 2 },\n}\nconst m: {[string]: i32} = Map()\n",
   ],
   [
+    "a body opening with a shorthand field is an object, as the parser reads it (D3475)",
+    "function f(id: i32) { id, p: { x } }\nconst l = (id: i32) => {\n  id,\n  q: { y },\n}\n" +
+    "function g(b: boolean) { if b { id, p: { x } } else { id, } }\n",
+    "function f(id: i32) { id, p: { x } }\nconst l = (id: i32) => {\n  id,\n  q: { y },\n}\n" +
+    "function g(b: boolean) { if b { id, p: { x } } else { id, } }\n",
+  ],
+  [
     "a field whose value is a loop is left alone (the #3326 review)",
     "function f() { return { f: while true { break 4 } } }\n" +
     "function g(): i32 { const o = { f: for i in 0 until 3 { if i == 2 { break i } } }\n  return o.f ?? -1 }\n" +
