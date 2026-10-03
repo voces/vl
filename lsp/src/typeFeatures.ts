@@ -1074,20 +1074,69 @@ export const withEffects = (markdown: string, effects?: string): string => {
 /** A float's exact decimal longer than this is shown at f64 precision instead. */
 const EXACT_FLOAT_SHOWN_MAX = 24;
 
+/** A decimal literal's exact value: sign, significant digits and the power of ten under them. */
+type DecimalParts = { neg: boolean; digits: string; exp: number };
+
+const decimalParts = (text: string): DecimalParts | undefined => {
+  const m = /^(-?)(\d*)(?:\.(\d*))?(?:[eE]([+-]?\d+))?$/.exec(text.replaceAll("_", ""));
+  if (!m) return undefined;
+  const frac = m[3] ?? "";
+  const all = (m[2] + frac).replace(/^0+/, "");
+  if (all === "") return { neg: false, digits: "0", exp: 0 };
+  const digits = all.replace(/0+$/, "");
+  return { neg: m[1] === "-", digits, exp: Number(m[4] ?? 0) - frac.length + all.length - digits.length };
+};
+
+/** Whether two decimal literals denote the same number. */
+const sameDecimal = (a: string, b: string): boolean => {
+  const pa = decimalParts(a);
+  const pb = decimalParts(b);
+  return pa !== undefined && pb !== undefined && pa.neg === pb.neg &&
+    pa.digits === pb.digits && pa.exp === pb.exp;
+};
+
+/** `p` in scientific form, `1e-400` or `1.25e30`. */
+const sciText = (p: DecimalParts): string =>
+  (p.neg ? "-" : "") + p.digits[0] + (p.digits.length > 1 ? "." + p.digits.slice(1) : "") +
+  "e" + (p.exp + p.digits.length - 1);
+
+/** A JS number as a VL float literal. */
+const floatText = (x: number): string => {
+  const t = String(x).replace("e+", "e");
+  return /[.e]/.test(t) ? t : t + ".0";
+};
+
 /**
- * The value an exact constant displays: the exact one, except a float whose exact
- * decimal is long, shown by the shortest form that reads back as the same f64.
- * `rounded` says the text is not the exact value.
+ * The value an exact constant displays at a use typed `at` ("" for none): the exact value,
+ * written short when a short spelling is exact. A float with no short exact spelling shows
+ * by the shortest form that reads back as the same f64; at an `f32` or `f64` use, the value
+ * at that width, which is what the program computes with. `rounded` says the text is not
+ * the exact value.
  */
 export const exactConstValue = (
   c: WasmExactConst,
+  at = "",
 ): { text: string; rounded: boolean } => {
-  if (c.kind !== "float" || c.shown.length <= EXACT_FLOAT_SHOWN_MAX) {
-    return { text: c.shown, rounded: false };
+  if (c.kind !== "float") return { text: c.shown, rounded: false };
+  const p = decimalParts(c.shown);
+  if (at === "i32" || at === "i64") {
+    // A whole float constant delivered to an integer is that integer.
+    if (p !== undefined && p.exp >= 0) {
+      const v = BigInt(p.digits) * 10n ** BigInt(p.exp);
+      return { text: (p.neg ? "-" : "") + v.toString(), rounded: false };
+    }
   }
-  let text = String(Number(c.shown)).replace("e+", "e");
-  if (!/[.e]/.test(text)) text += ".0";
-  return { text, rounded: true };
+  if (at === "f32" || at === "f64") {
+    const x = Number(c.shown);
+    const text = floatText(at === "f32" ? Math.fround(x) : x);
+    return { text, rounded: !sameDecimal(text, c.shown) };
+  }
+  if (c.shown.length <= EXACT_FLOAT_SHOWN_MAX) return { text: c.shown, rounded: false };
+  if (p !== undefined && p.digits.length <= 17) return { text: sciText(p), rounded: false };
+  const x = Number(c.shown);
+  if (Number.isFinite(x) && x !== 0) return { text: floatText(x), rounded: true };
+  if (p === undefined) return { text: c.shown, rounded: false };
+  return { text: sciText({ ...p, digits: p.digits.slice(0, 17), exp: p.exp + p.digits.length - 17 }), rounded: true };
 };
 
 /** The signed value of the bit pattern `mag` read at a `bits`-wide integer, or undefined. */
@@ -1121,7 +1170,10 @@ export const exactConstNote = (c: WasmExactConst, at?: string): string => {
     return "bit pattern; " + reads.map((r) => `${r.v} at ${r.w}`).join(", ");
   }
   const what = c.kind === "float" ? "float constant" : "integer constant";
-  const rounded = exactConstValue(c).rounded ? " (shown at f64 precision)" : "";
+  let rounded = "";
+  if (exactConstValue(c, at).rounded) {
+    rounded = at === "f32" || at === "f64" ? ` (its ${at} value here)` : " (shown at f64 precision)";
+  }
   return `${what}${rounded}; typed at each use`;
 };
 
@@ -1133,7 +1185,7 @@ export const exactConstHover = (
   name: string,
   c: WasmExactConstAt,
 ): { code: string; note: string } => {
-  const value = exactConstValue(c).text;
+  const value = exactConstValue(c, c.role === "use" ? c.type : "").text;
   if (c.role === "decl") {
     return { code: `const ${name} = ${value}`, note: exactConstNote(c) };
   }

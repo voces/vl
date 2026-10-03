@@ -102,7 +102,8 @@ Deno.test({ name: "exact-const hover: a folded expression shows its exact value"
   await want(2, 6, "const K = 2147483648", INT, "K decl");
   await want(15, 62, "MASK: i64 = 1099511627776", INT, "MASK use");
   await want(14, 6, "const NEG = -7", INT, "NEG decl");
-  await want(18, 6, "NEG: i32 = -7", INT, "NEG use");
+  // An argument to the generic `print` settles no width the editor can name, so no type.
+  await want(18, 6, "NEG = -7", INT, "NEG use");
 });
 
 Deno.test({ name: "exact-const hover: a radix constant is a bit pattern", ignore }, async () => {
@@ -114,7 +115,7 @@ Deno.test({ name: "exact-const hover: a radix constant is a bit pattern", ignore
 Deno.test({ name: "exact-const hover: a float constant", ignore }, async () => {
   const FLOAT = "float constant; typed at each use";
   await want(4, 6, "const F = 0.1", FLOAT, "F decl");
-  await want(16, 6, "F: f64 = 0.1", FLOAT, "F use");
+  await want(16, 6, "F = 0.1", FLOAT, "F use");
   // 1/3 has no terminating decimal, so it shows at f64 precision and says so.
   await want(
     5,
@@ -123,6 +124,50 @@ Deno.test({ name: "exact-const hover: a float constant", ignore }, async () => {
     "float constant (shown at f64 precision); typed at each use",
     "T decl",
   );
+});
+
+// The type shown at a use is the one the read COMPILES at, or none. Each destination below
+// is un-annotated or open, which is where the checked literal's own type and the emitted
+// width disagree: `[K, L]` and `i64 | string` emit `i64.const 7`, and `K > 2` emits
+// `i64.gt_s` while the literal `2` beside it reads as `i32`.
+const OPEN = [
+  /*  0 */ "const K = 3000000000",
+  /*  1 */ "const L = 7",
+  /*  2 */ "const un: i64 | string = L",
+  /*  3 */ "const arr = [K, L]",
+  /*  4 */ "const cmp = K > 2",
+  /*  5 */ "const w: i64 = 5",
+  /*  6 */ "const up = w > L",
+  /*  7 */ "const F = 0.1",
+  /*  8 */ "const g: f32 = F",
+  /*  9 */ "const E = 1e30",
+  /* 10 */ "const Z = 1e-400",
+  /* 11 */ "const T = 1.0 / 3.0",
+  /* 12 */ "const h: f64 = T",
+  /* 13 */ "print(un)",
+  /* 14 */ "print(arr[1] + w)",
+  /* 15 */ "print(cmp && up)",
+  /* 16 */ "print(g)",
+  /* 17 */ "print(h + E + Z)",
+  "",
+].join("\n");
+
+Deno.test({ name: "exact-const hover: an open destination shows the value with no type", ignore }, async () => {
+  await want(2, 25, "L = 7", INT, "L into a union", OPEN);
+  await want(3, 13, "K = 3000000000", INT, "K in an array literal", OPEN);
+  await want(3, 16, "L = 7", INT, "L in an array literal", OPEN);
+  await want(4, 12, "K = 3000000000", INT, "K beside a literal in a comparison", OPEN);
+  // Beside a TYPED operand the width is that operand's, which is what compiles.
+  await want(6, 15, "L: i64 = 7", INT, "L beside an i64", OPEN);
+});
+
+Deno.test({ name: "exact-const hover: a float at a typed use shows the value it computes with", ignore }, async () => {
+  const FLOAT = "float constant; typed at each use";
+  await want(8, 15, "F: f32 = 0.10000000149011612", "float constant (its f32 value here); typed at each use", "F at f32", OPEN);
+  await want(12, 15, "T: f64 = 0.3333333333333333", "float constant (its f64 value here); typed at each use", "T at f64", OPEN);
+  // A long exact decimal with a short exact spelling is shown by it, and is not rounded.
+  await want(9, 6, "const E = 1e30", FLOAT, "E decl", OPEN);
+  await want(10, 6, "const Z = 1e-400", FLOAT, "Z decl", OPEN);
 });
 
 Deno.test({ name: "exact-const hover: other bindings keep their one type", ignore }, async () => {
@@ -136,6 +181,53 @@ Deno.test({ name: "exact-const hover: an exported const used from another module
   const main = 'import { SIZE } from "./util"\nconst w: i64 = SIZE\nprint(w)\n';
   const read = (key: string) => (key.endsWith("util.vl") ? util : undefined);
   await want(1, 15, "SIZE: i64 = 192", INT, "imported SIZE at i64", main, read);
+});
+
+// D3324: a position names the ENTRY document's token. `util`'s `BIG` sits at the same line and
+// column as `main`'s import specifier `BIG`; the hover there must not answer with util's value,
+// and references must not list util's occurrences as main's.
+Deno.test({ name: "exact-const hover: another module's occurrence at the same position is not this one", ignore }, async () => {
+  const util = "export const SIZE = 192\nexport const BIG = 5000000000\nexport function lf(x: i64): i64 { x + BIG }\n";
+  const main = 'import { SIZE, BIG, lf } from "./util"\nconst a: i64 = BIG\nprint(lf(a) + SIZE)\n';
+  const read = (key: string) => (key.endsWith("util.vl") ? util : undefined);
+  const got = await hoverAt(main, 0, 15, read);
+  if (got.code !== undefined) throw new Error(`import specifier BIG: got ${JSON.stringify(got)}`);
+  await want(1, 15, "BIG: i64 = 5000000000", INT, "BIG at i64", main, read);
+  await want(2, 14, "SIZE: i64 = 192", INT, "SIZE beside an i64", main, read);
+  const checker = loadWasmChecker(SEED, () => {})!;
+  const refs = await checker.referencesAt(main, "/proj/main.vl", read, 1, 15, true);
+  const at = refs.map((r) => `${r.start.line}:${r.start.character}`).sort();
+  if (JSON.stringify(at) !== JSON.stringify(["1:15"])) {
+    throw new Error(`BIG references in main: got ${JSON.stringify(at)}`);
+  }
+});
+
+// D3324's own witness: references to the imported `L` from the entry list the entry's read
+// only, never `lib.vl`'s declaration or its read inside `lf` as ranges of the entry.
+Deno.test({ name: "references: an imported name lists no other module's ranges (D3324)", ignore }, async () => {
+  const lib = "export const L = 0xFFFFFFFF\nexport function lf(x: i64): i64 { x + L }\n";
+  const entry = 'import { L, lf } from "./lib"\nprint(lf(L))\n';
+  const read = (key: string) => (key.endsWith("lib.vl") ? lib : undefined);
+  const checker = loadWasmChecker(SEED, () => {})!;
+  const refs = await checker.referencesAt(entry, "/proj/entry.vl", read, 1, 9, true);
+  const at = refs.map((r) => `${r.start.line}:${r.start.character}`).sort();
+  if (JSON.stringify(at) !== JSON.stringify(["1:9"])) {
+    throw new Error(`L references in entry: got ${JSON.stringify(at)}`);
+  }
+});
+
+// The member-access lookup had the same hole: `util`'s `p.s` sits at the line and column of
+// the entry's `rr.longname`, with a narrower span, and member hover answered `string`.
+Deno.test({ name: "member hover: another module's access at the same position is not this one", ignore }, async () => {
+  const util = "export type P = { ab: i32, s: string }\n\n\nexport function g(p: P): string { p.s }\n";
+  const col = util.split("\n")[3].indexOf("p.s") + 2;
+  const entry = 'import { g } from "./util"\nconst rr = { longname: 5 }\nprint(g({ ab: 1, s: "x" }))\n' +
+    `const zz${" ".repeat(col - 15)} = rr.longname\nprint(zz)\n`;
+  const read = (key: string) => (key.endsWith("util.vl") ? util : undefined);
+  if (entry.split("\n")[3].indexOf("longname") > col) throw new Error("fixture: longname must cover the column");
+  const checker = loadWasmChecker(SEED, () => {})!;
+  const got = await checker.memberTypeAt(entry, "/proj/main.vl", read, 3, col);
+  if (got !== "i32") throw new Error(`rr.longname member hover: want "i32", got ${JSON.stringify(got)}`);
 });
 
 Deno.test({ name: "exact-const completion: the row shows the value", ignore }, async () => {
