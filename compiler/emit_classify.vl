@@ -23227,8 +23227,9 @@ function globalKind(initIx: i32): VKind {
     // type is out of scope (a global ref-list constexpr needs the binding annotation).
     if arrLitIsRef(initIx) { return "reflist" }
     if arrLitIsStr(initIx, -1) { return "strlist" }
-    if arrLitIsF64(initIx, -1) { return "f64list" }
-    if arrLitIsI64(initIx, -1) { return "i64list" }
+    const nk = arrLitNumKind(initIx, -1)
+    if nk == ALK_F64 { return "f64list" }
+    if nk == ALK_I64 { return "i64list" }
     // An f32-element literal is the f32 list, an arm the earlier ladder lacked. After the
     // f64/i64 arms, so every literal either of them claims keeps its answer.
     if arrLitIsF32(initIx, -1) { return "f32list" }
@@ -24709,8 +24710,7 @@ export function arrLitUnionElemName(arrIx: i32): string {
   if cen == "" { return "" }
   if !isUNameAB(16, cen, nodeArrayElemTyIx(arrIx)) { return "" }
   if arrLitIsStr(arrIx, -1) { return "" }
-  if arrLitIsF64(arrIx, -1) { return "" }
-  if arrLitIsI64(arrIx, -1) { return "" }
+  if arrLitNumKind(arrIx, -1) != ALK_NONE { return "" }
   cen
 }
 
@@ -25154,37 +25154,49 @@ export function arrLitIsStr(arrIx: i32, fnIx: i32) {
   false
 }
 
-// True if the array literal at `arrIx` has f64 elements — its first element is an
-// f64-typed expression. An empty literal is not detectable here; its kind comes from the
-// binding annotation (`pendingListKind == 4`).
-export function arrLitIsF64(arrIx: i32, fnIx: i32) {
+// The scalar list the array literal at `arrIx` makes by its elements: `ALK_F64` when some
+// element is an f64 and none an i64, `ALK_I64` for the converse, else `ALK_NONE` (an empty
+// literal included, whose kind comes from its destination). Mixed float and int elements are a
+// checker-level union, so they answer `ALK_NONE`; one scan asks each element both widths.
+export function arrLitNumKind(arrIx: i32, fnIx: i32): i32 {
   const a = P.nodes[arrIx]
   if a is ArrayLit {
-    if a.arrElems.length < 1 { return false }
-    // A spread element is no f64 VALUE, so the element scan below would read `[...fs]` as
-    // the i32 default while `emitArrSpread` builds the source's rep — two heap types for
-    // one value. Both sides ask `spreadDestKind`, so they cannot disagree.
-    if hasSpreadItem(a.arrElems) { return spreadDestKind(arrIx, fnIx) == "f64" }
-    // A box-list literal with an f64 member: the checker recorded a value union, so the
-    // elements box and the f64-list build would store a string ref into an `(array (mut
-    // f64))` backing. The scan below is order-blind (any f64 member claims the list), so
-    // here the union has to win rather than the first element.
-    if arrLitBoxElem(arrIx) { return false }
-    // Any f64 element makes the literal an f64 list: first-element-only classification let
-    // `[2, 1.5]` claim the i32 list and emit `f64.const` into it — invalid wasm. An i64
-    // element keeps this false, since mixed float/int is a checker-level union.
+    if a.arrElems.length < 1 { return ALK_NONE }
+    // A spread element is no scalar VALUE, so the element scan below would read `[...fs]` as
+    // the i32 default while `emitArrSpread` builds the source's rep — two heap types for one
+    // value. Both sides ask `spreadDestKind`, so they cannot disagree.
+    if hasSpreadItem(a.arrElems) {
+      const sk = spreadDestKind(arrIx, fnIx)
+      if sk == "f64" { return ALK_F64 }
+      if sk == "i64" { return ALK_I64 }
+      return ALK_NONE
+    }
+    // A box-list literal with an f64 or i64 member: the checker recorded a value union, so the
+    // elements box, and a scalar build would store a string ref into a scalar backing. The scan
+    // below is order-blind (any member claims the list), so the union has to win here.
+    if arrLitBoxElem(arrIx) { return ALK_NONE }
     let anyF64 = false
+    let anyI64 = false
     let i = 0
-    while i < a.arrElems.length {
-      if exprIsI64(a.arrElems[i], fnIx) { return false }
-      if !anyF64 {
-        if exprIsF64(a.arrElems[i], fnIx) { anyF64 = true }
-      }
+    while i < a.arrElems.length && !(anyF64 && anyI64) {
+      if !anyI64 && exprIsI64(a.arrElems[i], fnIx) { anyI64 = true }
+      if !anyF64 && exprIsF64(a.arrElems[i], fnIx) { anyF64 = true }
       i = i + 1
     }
-    return anyF64
+    if anyF64 && !anyI64 { return ALK_F64 }
+    if anyI64 && !anyF64 { return ALK_I64 }
   }
-  false
+  ALK_NONE
+}
+
+// The `arrLitNumKind` answers.
+export const ALK_NONE = 0
+export const ALK_F64 = 1
+export const ALK_I64 = 2
+
+// True if the array literal at `arrIx` is an f64 list by its elements (`arrLitNumKind`).
+export function arrLitIsF64(arrIx: i32, fnIx: i32) {
+  arrLitNumKind(arrIx, fnIx) == ALK_F64
 }
 
 // The union variant an object-literal-element array literal boxes its elements under, or ""
@@ -25302,8 +25314,9 @@ export function arrLitElemKind(arrIx: i32) {
           }
         }
         if arrLitIsStr(e0x, -1) { return RLK_STR_LIST }
-        if arrLitIsF64(e0x, -1) { return RLK_F64_LIST }
-        if arrLitIsI64(e0x, -1) { return RLK_I64_LIST }
+        const nk = arrLitNumKind(e0x, -1)
+        if nk == ALK_F64 { return RLK_F64_LIST }
+        if nk == ALK_I64 { return RLK_I64_LIST }
         return RLK_I32_LIST
       }
       if e0 is ObjLit {
@@ -25539,8 +25552,9 @@ export function arrLitFrameLeafRow(arrIx: i32, fnIx: i32): string {
     const e0x = arrLitLeadInner(a)
     if emptyArrLitIxOf(e0x) >= 0 || arrLitIsRef(e0x) { return "" }
     if arrLitIsStr(e0x, fnIx) { return "string[]" }
-    if arrLitIsF64(e0x, fnIx) { return "f64[]" }
-    if arrLitIsI64(e0x, fnIx) { return "i64[]" }
+    const nk = arrLitNumKind(e0x, fnIx)
+    if nk == ALK_F64 { return "f64[]" }
+    if nk == ALK_I64 { return "i64[]" }
   }
   ""
 }
@@ -25578,8 +25592,9 @@ export function arrLitElemName(arrIx: i32) {
           if rin != "" { return rin }
         }
         if arrLitIsStr(e0x, -1) { return "string[]" }
-        if arrLitIsF64(e0x, -1) { return "f64[]" }
-        if arrLitIsI64(e0x, -1) { return "i64[]" }
+        const nk = arrLitNumKind(e0x, -1)
+        if nk == ALK_F64 { return "f64[]" }
+        if nk == ALK_I64 { return "i64[]" }
         return "i32[]"
       }
       if e0 is ObjLit {
@@ -42932,6 +42947,32 @@ function tyKindCodeOfTy(tyIx: i32): i32 {
   tyKindCodeOfVKind(d.rdKind)
 }
 
+// A primitive's code: the descriptor's answer for it, read off the name rather than built,
+// since every literal and scalar operand asks. `void` is the one prim the descriptor reps (as
+// `i32`) that this vocabulary never has, a void expression having no width to report.
+function tyKindCodeOfPrim(pn: PrimName): i32 {
+  match pn {
+    "i32" | "boolean" => {
+      return TK_I32
+    }
+    "i64" => {
+      return TK_I64
+    }
+    "f64" => {
+      return TK_F64
+    }
+    "f32" => {
+      return TK_F32
+    }
+    "string" => {
+      return TK_STR
+    }
+    "void" | "null" | "never" | "u8" | "v128" => {
+      return -1
+    }
+  }
+}
+
 function tyKindOf(tyIx: i32) {
   const k = tyKindOfDesc(tyIx)
   if repShadowOn {
@@ -42947,12 +42988,7 @@ function tyKindOf(tyIx: i32) {
 function tyKindOfDesc(tyIx: i32): i32 {
   if tyIx < 0 { return -1 }
   const t = T.tys[tyIx]
-  if t is TyPrim {
-    // `void` is the one prim the descriptor reps (as the ladder fallthrough `i32`) and this
-    // vocabulary never has: a void expression has no arithmetic width to report.
-    if t.primName == "void" { return -1 }
-    return tyKindCodeOfTy(tyIx)
-  }
+  if t is TyPrim { return tyKindCodeOfPrim(t.primName) }
   if t is TyArray {
     if t.aElem < 0 { return -1 }
     // A NUMERIC literal-union element reps as its base scalar's list; the descriptor declines
@@ -43635,8 +43671,9 @@ function arrLitListRep(exprIx: i32, fnIx: i32): VKind | null {
     if arrLitIsRef(exprIx) { return "reflist" }
     if arrLitIsStr(exprIx, fnIx) { return "strlist" }
     if arrLitIsF32(exprIx, fnIx) { return "f32list" }
-    if arrLitIsI64(exprIx, fnIx) { return "i64list" }
-    if arrLitIsF64(exprIx, fnIx) { return "f64list" }
+    const nk = arrLitNumKind(exprIx, fnIx)
+    if nk == ALK_I64 { return "i64list" }
+    if nk == ALK_F64 { return "f64list" }
     return "list"
   }
   null
@@ -43928,26 +43965,9 @@ function globalIsI64ArraySid(fnIx: i32, sid: i32, atIx: i32) {
   letIsI64Array(li, -1)
 }
 
+// True if the array literal at `arrIx` is an i64 list by its elements (`arrLitNumKind`).
 export function arrLitIsI64(arrIx: i32, fnIx: i32) {
-  const a = P.nodes[arrIx]
-  if a is ArrayLit {
-    if a.arrElems.length < 1 { return false }
-    if hasSpreadItem(a.arrElems) { return spreadDestKind(arrIx, fnIx) == "i64" }
-    // A box-list literal with an i64 member is the f64 arm's twin (see `arrLitBoxElem`): the
-    // scan is order-blind, so any i64 element (not just the first) makes this an i64 list.
-    if arrLitBoxElem(arrIx) { return false }
-    let anyI64 = false
-    let i = 0
-    while i < a.arrElems.length {
-      if exprIsF64(a.arrElems[i], fnIx) { return false }
-      if !anyI64 {
-        if exprIsI64(a.arrElems[i], fnIx) { anyI64 = true }
-      }
-      i = i + 1
-    }
-    return anyI64
-  }
-  false
+  arrLitNumKind(arrIx, fnIx) == ALK_I64
 }
 
 // True if `exprIx` evaluates to an `i64[]`: a projection of `exprListRep`.
