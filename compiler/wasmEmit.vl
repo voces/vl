@@ -52,13 +52,13 @@ import {
   inferRetFnKey,
   inferRetNameOf,
   inferRetTyIxOf,
-  intLitUnionBasesOf,
   intMatchHeadAt,
   isNumIntrinsicName,
   isValueUnionName,
   isVarTyIxOf,
   listWidenRetagAny,
   listWidenRetagRowsOf,
+  litNumUnionBasesOf,
   mapDeliveryRecorded,
   mapRetagRowsOf,
   mapTyValIsBool,
@@ -110,6 +110,7 @@ import {
   nonNullTy,
   numCastCanFail,
   numLitUnionBaseName,
+  numLitUnionBaseTy,
   numLitUnionHasBase,
   numPairOpTy,
   numPrimTyOfKind,
@@ -3443,7 +3444,12 @@ function emitIsTest(body: u8[], isIx: i32, fnIx: i32) {
       }
       return 0
     }
-    const patTy = isPatUnionArmTy(ndv.isObj, isVarTyIxOf(isIx), fnIx)
+    let patTy = isPatUnionArmTy(ndv.isObj, isVarTyIxOf(isIx), fnIx)
+    // `x is i32` over a literal box banks the literals it covers, held under the base's tag (D3522).
+    if !tyIsPrimIx(patTy) {
+      const plb = numLitUnionBaseTy(patTy)
+      if plb >= 0 && tyToEmitName(plb) == ndv.isVariant { patTy = plb }
+    }
     if mapSoftTwinTagFail(ndv.isObj, patTy, fnIx, isIx) < 0 { return -1 }
     const armTag = isArmTagOfTy(patTy)
     // An exact instance's union may hold the pattern's twin under one tag (a Set and its
@@ -28294,6 +28300,13 @@ function emitUnaryNode(body: u8[], e: Unary, exprIx: i32, fnIx: i32) {
     fbI32Bin(115)  // 0x73 i32.xor
     return 0
   }
+  // A two-base literal set negates at `i64`, the width its arithmetic computes at (D3512).
+  if e.unOp == "-" && !tyIsPrimIx(nodeTyIxOf(e.unArg)) && njIsLitSide(e.unArg) {
+    fbI64Const(0, 0)
+    if emitNumUnionConvert(body, e.unArg, 3, fnIx) < 0 { return -1 }
+    fbI32Bin(125) // 0x7d i64.sub
+    return 0
+  }
   if numUnionMinted && e.unOp == "-" && nodeIsNumUnion(e.unArg, fnIx) {
     return emitNumUnionNeg(body, e.unArg, fnIx)
   }
@@ -28676,6 +28689,9 @@ let njLIx = -1
 let njRIx = -1
 let njResBox = false
 let njBlockKind: VKind = "i32"
+// Whether each side is a two-base integer-literal union, whose pairs compute at `i64` (D3512).
+let njLLit = false
+let njRLit = false
 
 // The value-atom kind of numeric primitive type `t` (0 i32, 3 i64, 4 f64, 5 f32), or -1.
 function njKindOfTy(t: i32): i32 {
@@ -28718,21 +28734,33 @@ function njBoxWidens(ix: i32, fnIx: i32): boolean {
   njWidensOut(ix, fnIx) && exprUnion(ix, fnIx)
 }
 
-// The bases of the two-base integer-literal union the value at `ix` holds (`intLitUnionBasesOf`):
+// The bases of the two-base literal-number union the value at `ix` holds (`litNumUnionBasesOf`):
 // its recorded type's, or, for a name narrowed past `null`, its nullable type's. Empty otherwise.
 function njLitBasesOf(ix: i32): i32[] {
   const t = nodeTyIxOf(ix)
-  const lb = intLitUnionBasesOf(t)
+  const lb = litNumUnionBasesOf(t)
   if lb.length > 0 || t < 0 { return lb }
   const nn = nonNullTy(t)
   if nn == t { return lb }
-  const nb = intLitUnionBasesOf(nn)
+  const nb = litNumUnionBasesOf(nn)
   if nb.length == 0 { return nb }
   const u = P.nodes[unwrapParen(ix)]
   if u is Ident {
     if narrowDropsNull(u.identName) { return nb }
   }
   lb
+}
+
+// Whether the value at `ix` is a two-base integer-literal union rather than a numeric union: its
+// members are constants, so an operator over it computes at the common width `i64` (D3512).
+function njIsLitSide(ix: i32): boolean {
+  numUnionMembersOf(nodeTyIxOf(ix)).length == 0 && njLitBasesOf(ix).length > 0
+}
+
+// The type member `m` of the current dispatch's `left` or right side computes at.
+function njPairSideTy(left: boolean, m: i32): i32 {
+  if (left && njLLit) || (!left && njRLit) { return numPrimTyOfKind(3) }
+  m
 }
 
 // The member types of the numeric union at `ix`: its recorded type's, or, where an instance
@@ -28904,7 +28932,7 @@ function njPair(body: u8[], a: i32, b: i32, fnIx: i32) {
   if !(n is BinExpr) {
     return emitFail("emitProgram: numeric union dispatch lost its operator")
   }
-  const pty = numPairOpTy(n, a, b)
+  const pty = numPairOpTy(n, njPairSideTy(true, a), njPairSideTy(false, b))
   const p = njKindOfTy(pty)
   if pty < 0 || p < 0 {
     return emitFail(
@@ -29014,6 +29042,8 @@ function emitNumUnionBin(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
   njOp = e.binOp
   njLUnion = lMs.length > 0
   njRUnion = rMs.length > 0
+  njLLit = njLUnion && njIsLitSide(e.binLeft)
+  njRLit = njRUnion && njIsLitSide(e.binRight)
   njLTys = lMs
   if !njLUnion { njLTys = [njScalarTy(e.binLeft, fnIx)] }
   njRTys = rMs
@@ -29059,7 +29089,9 @@ function njResultKinds(e: BinExpr): i32[] {
   const none: i32[] = []
   for a in njLTys {
     for b in njRTys {
-      const k = njKindOfTy(numPairOpTy(e, a, b))
+      const k = njKindOfTy(
+        numPairOpTy(e, njPairSideTy(true, a), njPairSideTy(false, b)),
+      )
       if k < 0 { return none }
       let seen = false
       for q in out {
