@@ -129,6 +129,21 @@ never choose: `if s < n64`, `s + 0.5` or `take64(s + 1)` give `s` no type, and n
 argument to a type parameter (`id(s)`). Two deliveries or stores that no single type satisfies
 are an error naming both.
 
+## Porting numeric code from JS/TS
+
+A float literal adapts to the other operand, so beside an `f32` it is an `f32` and the whole
+operation runs in `f32` (this is deliberate: `x * 0.5` in `f32` code stays `f32`). JS reads a
+`Float32Array` element as an `f64`, so a literal port changes results without a warning:
+
+```vl
+const a: f32[] = [0.1]
+print(a[0] + 1e-3)          // 0.10100000351667404 — the sum is f32
+print(a[0] as f64 + 1e-3)   // 0.10100000149011612 — what JS/TS computes
+```
+
+To store as `f32` and compute as `f64`, write `grid[k] as f64` at each read, or keep the grid an
+`f64[]`. Every operand that meets other arithmetic needs the cast, not just the first.
+
 ## Comparison and logic
 
 | operator | operands | result | notes |

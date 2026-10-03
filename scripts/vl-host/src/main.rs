@@ -535,7 +535,8 @@ program verbatim — the only way to pass one that starts with `-`.
                       `(p + C) as% i32` fold C into the access's offset when
                       C plus that offset is below <bytes>. An address whose add
                       would wrap past 4 GiB then traps instead of reading low memory
-  {c}--names{r}             Embed the wasm \"name\" section (legible trap backtraces);
+  {c}--names{r}             Embed the wasm \"name\" section (legible trap backtraces, and
+                      function names in profilers instead of `wasm-function[N]`);
                       kept through -O/-O3, at the cost of the section's bytes
   {c}--import-memory{r}     Import the linear memory as `env.memory` instead of
                       defining and exporting it, so separately built units can
