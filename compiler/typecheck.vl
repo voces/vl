@@ -3668,6 +3668,9 @@ function tyIsWidePrim(ty: i32): boolean {
 // The unions `joinTys` made of two type parameters (D2760). At a pin their members re-join as a
 // non-generic join would, so `A | B` at `i32` and `f64` is `f64`, not a box of the two.
 let tpJoinUnions: {[i32]: i32} = Map()
+// The joins `paramNullJoin` kept a null in (D3497): re-folding one at a call keeps the null even
+// when the bound members absorb it, as a caller's own holes do.
+let paramNullJoins: {[i32]: i32} = Map()
 // The parameter holes some join kept apart as an implicit type parameter (D3333): an instance
 // binding one re-joins such a join through its holes' binding.
 let holeTpJoinNames: {[string]: boolean} = Map()
@@ -5009,6 +5012,7 @@ export function initChecker() {
   voidCoerceValNames = []
   T.tys = []
   tpJoinUnions = Map()
+  paramNullJoins = Map()
   holeTpJoinNames = Map()
   genFnCstrBusy = false
   tpIfJoinAt = Map()
@@ -19266,8 +19270,9 @@ function joinTys(a: i32, b: i32) {
   joinVariantTys(a, b)
 }
 
-// Whether collapsing `o` into `u` would drop a null: `u` holds a declared type parameter and no
-// null, `o` bears one. The parameter accepts null only until a pin binds it (D2533, D3487).
+// Whether collapsing `o` into `u` would drop a null: `u` holds a declared type parameter, or a
+// parameter's hole in its own body, and no null, `o` bears one. The parameter accepts null only
+// until a pin binds it (D2533, D3487, D3497).
 function paramJoinDropsNull(u: i32, o: i32): boolean {
   if u < 0 || o < 0 || u >= T.tys.length || o >= T.tys.length { return false }
   if !isNullTy(o) && !tyBearsNull(o) { return false }
@@ -19275,7 +19280,10 @@ function paramJoinDropsNull(u: i32, o: i32): boolean {
   const ms: i32[] = []
   flattenVariantsInto(u, ms)
   for m in ms {
-    if m >= 0 && m < T.tys.length && tyIsDeclaredParam(m) { return true }
+    if m >= 0 && m < T.tys.length {
+      if tyIsDeclaredParam(m) { return true }
+      if tyIsNamedParamHole(m) && tyParamOfInnermostBody(m) { return true }
+    }
   }
   false
 }
@@ -19307,6 +19315,9 @@ function paramNullJoin(a: i32, b: i32): i32 {
     tpJoinUnions[res] = 1
   }
   if isJoinHoleUnion(a) || isJoinHoleUnion(b) { joinHoleUnions.push(res) }
+  noteHoleTpJoin(res)
+  // arena-tick exempt: a per-program mark on a fresh arena row.
+  paramNullJoins[res] = 1
   res
 }
 
@@ -21144,6 +21155,13 @@ function refoldJoinUnion(
   lamCheckDepth = lamCheckDepth - 1
   // Every arm proven dead is not a type — keep the union rather than invent one.
   if live == 0 || res < 0 { return mkUnionTy(subst) }
+  // The null `paramNullJoin` kept stays: re-joined here, outside the body that declared the
+  // holes, the caller's holes would absorb it (D3497).
+  if paramNullJoins.has(tyIx) && !isNullTy(res) && !tyBearsNull(res) {
+    for m in subst {
+      if isNullTy(m) { return mkNullableTy(res) }
+    }
+  }
   res
 }
 
@@ -43247,6 +43265,31 @@ function rejoinDropSubsumed(r: i32): i32 {
   nu
 }
 
+// The inner a substituted `(...) | null` wraps: `u` itself, or, when a bound parameter put a null
+// inside it (`A | B` at `A := string | null`), its members once each with the nulls folded into the
+// wrapper — one type alone, else their union (D3499).
+function nullableFlatInner(u: i32): i32 {
+  if u < 0 || u >= T.tys.length { return u }
+  const ut = T.tys[u]
+  if !(ut is TyUnion) { return u }
+  let nested = false
+  for m in ut.uMembers {
+    if m >= 0 && m < T.tys.length && (isNullTy(m) || T.tys[m] is TyNullable) {
+      nested = true
+    }
+  }
+  if !nested { return u }
+  const ms: i32[] = []
+  flattenVariantsInto(u, ms)
+  const kept: i32[] = []
+  for m in ms {
+    if !isNullTy(m) && !i32ListHas(kept, m) { kept.push(m) }
+  }
+  if kept.length == 0 { return u }
+  if kept.length == 1 { return kept[0] }
+  mkUnionTy(kept)
+}
+
 // Deep substitution of a call's bindings into a type: a bound `TyVar` becomes its binding; a
 // derived return hole collapses to the pinned function's return. Composites rebuild only when
 // a child actually changed, so a concrete type keeps its arena identity (and the in-place
@@ -43289,7 +43332,7 @@ export function substTyDeep(tyIx: i32, bNames: string[], bTys: i32[]) {
       n2 = rejoinMembers(nms)
       tpApartConcrete = tpSaved
     }
-    if n2 != t.nInner { res = mkNullableTy(n2) }
+    if n2 != t.nInner { res = mkNullableTy(nullableFlatInner(n2)) }
   } else if t is TyObj {
     const onames = t.objFieldNames
     const otys = t.objFieldTypes

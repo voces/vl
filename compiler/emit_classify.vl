@@ -38144,15 +38144,41 @@ function printNarrowKeepsBox(key: string): boolean {
 export function printUnionRecvIsBox(exprIx: i32, fnIx: i32): boolean {
   if exprIx < 0 { return false }
   if !exprUnion(exprIx, fnIx) { return false }
+  const key = printNarrowKey(exprIx)
+  if key == "" { return true }
+  printNarrowKeepsBox(key)
+}
+
+// The narrowing key of a print argument: a name, a member path or an index path, else "".
+function printNarrowKey(exprIx: i32): string {
   const pe = P.nodes[unwrapParen(exprIx)]
-  if pe is Ident { return printNarrowKeepsBox(pe.identName) }
-  if pe is Member {
-    return printNarrowKeepsBox(memberPathKeyOf(unwrapParen(exprIx)))
-  }
-  if pe is Index {
-    return printNarrowKeepsBox(indexPathKeyOf(unwrapParen(exprIx)))
-  }
-  true
+  if pe is Ident { return pe.identName }
+  if pe is Member { return memberPathKeyOf(unwrapParen(exprIx)) }
+  if pe is Index { return indexPathKeyOf(unwrapParen(exprIx)) }
+  ""
+}
+
+// The members a narrowing to two or more of them leaves a print argument's box holding, into
+// `live`; nothing when it is not so narrowed. A box with a record arm the narrowing excluded
+// prints from these alone (D3231).
+function printNarrowLiveAtoms(exprIx: i32, live: string[]) {
+  const key = printNarrowKey(exprIx)
+  if key == "" { return 0 }
+  const nv = narrowVariantFor(key)
+  if nv == "" || unionMemberCount(nv) < 2 { return 0 }
+  splitUnionAtoms(nv, live)
+  0
+}
+
+// Set while a read the narrowing pins to `null` is planned with that narrowing lifted: the plan
+// then skips a record arm rather than decline the box, since the narrowing ruled it out (D3231).
+let printPlanNullPinned = false
+
+// Sets whether the print plan reads a `null`-pinned box; the previous setting, to restore.
+export function printPlanPinNull(on: boolean): boolean {
+  const was = printPlanNullPinned
+  printPlanNullPinned = on
+  was
 }
 
 function printUnionPlanCode(exprIx: i32, fnIx: i32, out: i32[]): i32 {
@@ -38161,7 +38187,9 @@ function printUnionPlanCode(exprIx: i32, fnIx: i32, out: i32[]): i32 {
   const nnKey = narrowedToNullKey(exprIx)
   if nnKey != "" {
     const nnMask = maskNarrowFor(nnKey)
+    const nnWas = printPlanPinNull(true)
     const nnRc = printUnionPlanCode(exprIx, fnIx, out)
+    printPlanPinNull(nnWas)
     unmaskNarrow(nnMask)
     return nnRc
   }
@@ -38200,12 +38228,23 @@ function printUnionPlanCode(exprIx: i32, fnIx: i32, out: i32[]): i32 {
   let solo = -1
   let bad = false
   const seen: i32[] = []
+  const live: string[] = []
+  printNarrowLiveAtoms(exprIx, live)
   let i = 0
   while i < kinds.length {
     let k = kinds[i]
+    // A member the narrowing excluded is no arm of this read.
+    if live.length > 0 && !strListHas(live, atoms[i]) {
+      i = i + 1
+      continue
+    }
     // A literal-union arm (`K0 | i64`) is not a value atom but boxes as one under the string
     // tag (`emitUnionCoerce`'s `unionTakesAtomAsStr`), so it prints as the string arm here.
     if k < 0 && nameIsLitUnionType(atoms[i]) { k = 2 }
+    if k < 0 && printPlanNullPinned {
+      i = i + 1
+      continue
+    }
     // A member the box ABI does not classify (a struct arm, an inline shape) means this
     // isn't the boxed value union — decline the shape rather than call it a failure.
     if k < 0 { return 0 }
