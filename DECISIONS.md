@@ -6672,6 +6672,33 @@ Atomics are a separate lane; wrappers over the raw intrinsics are queued in `ROA
 through the std review. Pinned by `tests/vl_shared_memory_test.ts`, which runs one module in two
 Workers over one `WebAssembly.Memory({ shared: true })`.
 
+## A memory's size is a build flag: `--initial-memory=<size>`, `--max-memory=<size>` (owner, 2026-10-03) — sunpa SP-011
+
+**The ask:** a `Buffer()` that grows the memory mid-frame detaches every typed-array view a JS
+host holds of it, so sunpa's draw list read `undefined` after a culling pass allocated. The
+owner chose the answer every other wasm toolchain gives (Emscripten `-sINITIAL_MEMORY`,
+Rust/Zig `--initial-memory`, AssemblyScript `--initialMemory`) over a `std:buffer` API
+(`reserve`, `memoryEpoch`): a build flag, plus a cost-guide note (D3560).
+
+- **Sizes are bytes or `KiB`/`MiB`/`GiB`, a whole number of 64 KiB pages, refused rather than
+  rounded.** Every other layout flag is parsed strictly and exits 2 on a value it cannot take,
+  and a silently rounded size would be a different contract from the one the build line names.
+  The refusal names the next page multiple. Zero and anything past 4 GiB (65536 pages; VL
+  emits no memory64) are refused.
+- **`--max-memory` and `--shared-memory` conflict, they do not alias.** Both declare the max,
+  and `--shared-memory` takes pages where `--max-memory` takes bytes, so accepting both would
+  mean ruling which wins. A shared build keeps `--shared-memory=<pages>` as its one max;
+  `--initial-memory` combines with it, and with `--max-memory`, as long as it is at most the
+  max.
+- **The flags shape the declaration only.** Imported (`--import-memory`) or defined, the
+  limits carry the same min and max; a module that touches no linear memory has none and the
+  flags change nothing. `std:buffer` needs no change: it grows only when an allocation passes
+  `memory.size`, so a memory that starts large enough never grows. `--max-memory` caps growth
+  the way `--shared-memory` does, and a `Buffer()` past it traps.
+- **`vl run` takes both**, like `--shared-memory`, because they change the memory's type and not
+  who supplies it. Pinned by `tests/vl_initial_memory_test.ts`, whose control shows the default
+  one-page memory detaching a view under V8.
+
 ## std:buffer's allocator over a shared memory (owner direction, 2026-09-24) — every instance allocates, none overlap
 
 **The ask:** the first std-level lane over the raw shared-memory and atomics layer. Several
