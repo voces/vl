@@ -1170,6 +1170,7 @@ import {
   unionRefArrayArmSlotForElem,
   unionRefArrayArmSlotForMapElem,
   unionRefArrayArmSlotForNestedElem,
+  unionRowOf,
   unionSetArmTys,
   unionSetHasAtom,
   unionSetHasNull,
@@ -4935,6 +4936,20 @@ function emitCoalesceMapJoin(
   emitNulMapArmBox(body, tag, e.binLeft, un, e.binRight, fnIx)
 }
 
+// Whether `unionName` is a box-represented union (a non-null value atom beside another
+// member) that has no registry row, so no arm of it can be tagged.
+function unionBoxHasNoRow(unionName: string): boolean {
+  if unionName == "" || unionRowOf(unionName) >= 0 { return false }
+  const atoms: string[] = []
+  splitUnionAtoms(unionName, atoms)
+  if atoms.length < 2 { return false }
+  for a in atoms {
+    const k = valueAtomKind(a)
+    if k >= 0 && k != 6 { return true }
+  }
+  false
+}
+
 export function emitUnionCoerce(
   body: u8[],
   unionNameIn: string,
@@ -5039,7 +5054,16 @@ export function emitUnionCoerce(
       }
     }
   }
-  if exprStruct(exprIx, fnIx) { return emitExpr(body, exprIx, fnIx) }
+  if exprStruct(exprIx, fnIx) {
+    // With no row the record arm has no tag, and a raw record ref is no box (D3519).
+    if unionBoxHasNoRow(unionName) {
+      return emitFailAt(
+        "emitProgram: a record value delivered into a union box this program never registered has no tag",
+        exprIx,
+      )
+    }
+    return emitExpr(body, exprIx, fnIx)
+  }
   // A bare variant value (a kind-8 local, param or call, its binding classified concrete by
   // `letIsVariant`) passes through: the binding's slot is the raw variant ref. Without this a
   // union carrying a value atom drops the variant ref into the scalar atom ladder and widens
@@ -27999,6 +28023,38 @@ function emitCharLitNode(_body: u8[], e: CharLit, _exprIx: i32, _fnIx: i32) {
   return 0
 }
 
+// The recovery a read of module global `isid` owes after its `global.get`, shared by an
+// identifier read and a substituted parameter default. A kind-16 `string | null` cell is
+// always a nullable ref; a non-const ref cell is start-initialised, so it is nullable in
+// wasm and recovered unless its kind legitimately holds null or is not a ref at all.
+function emitGlobalReadRecover(isid: i32) {
+  const gck0 = globalCellKind(globalLetOfSid(isid))
+  if gck0 == "nulstr" {
+    if !nulStrReadStaysRaw() {
+      wU8(212) // 0xd4 ref.as_non_null
+    }
+    return 0
+  }
+  if !globalNameIsNonConstSid(isid) { return 0 }
+  if (
+    gck0 != "i32"
+    && gck0 != "nulstruct"
+    && gck0 != "nulvariant"
+    && gck0 != "i64"
+    && gck0 != "f64"
+    && gck0 != "f32"
+    && gck0 != "v128"
+    && gck0 != "nullist"
+    && gck0 != "nulreflist"
+    && gck0 != "nulclosure"
+    && gck0 != "nulmap"
+    && !isNulScalarListKind(gck0)
+  ) {
+    wU8(212) // 0xd4 ref.as_non_null
+  }
+  0
+}
+
 // the densest single-identifier site in the compiler: one identifier read resolves
 // through seven name-keyed lookups here, each otherwise a hash plus a string probe. The
 // arena index `_exprIx`, already threaded in and unused, turns the id lookup and the
@@ -28020,14 +28076,8 @@ function emitIdentNode(body: u8[], e: Ident, exprIx: i32, fnIx: i32) {
     const dgIdx = globalIndexOfSid(isid)
     if dgIdx >= 0 {
       if emitUserGlobalGet(dgIdx) < 0 { return -1 }
-      // the `string | null` read rule, the one cell kind whose nullability survives
-      // `const`: every other const-cell recovery is gated on `globalNameIsNonConst`,
-      // which a module `const` is not, so there is nothing else to mirror.
-      if globalCellKind(globalLetOfSid(isid)) == "nulstr" {
-        if !nulStrReadStaysRaw() {
-          wU8(212) // 0xd4 ref.as_non_null
-        }
-      }
+      // the same recovery the argument spelling of this read gets (D3510)
+      emitGlobalReadRecover(isid)
       return 0
     }
   }
@@ -28137,45 +28187,7 @@ function emitIdentNode(body: u8[], e: Ident, exprIx: i32, fnIx: i32) {
     const gIdx = globalIndexOfSid(isid)
     if gIdx >= 0 {
       if emitUserGlobalGet(gIdx) < 0 { return -1 }
-      const gck0 = globalCellKind(globalLetOfSid(isid))
-      // the `string | null` read rule (stated at `emitMem`'s field read) applies here
-      // independently of const-ness: a kind-16 slot is always a nullable ref, since a
-      // const can still be initialized to `null`.
-      if gck0 == "nulstr" {
-        if !nulStrReadStaysRaw() {
-          wU8(212) // 0xd4 ref.as_non_null
-        }
-        return 0
-      }
-      // a non-const ref global rides in a nullable cell (start-fn initialized with
-      // `ref.null`); recover the non-null value type codegen expects with
-      // `ref.as_non_null` — the cast never traps, since the cell is always initialized
-      // first. A const global keeps its non-null cell, so no cast.
-      if globalNameIsNonConstSid(isid) {
-        // a nullable-struct, nullable-list or nullable-closure cell legitimately holds
-        // null, so its reads stay nullable (recovering non-null at the use site
-        // instead); a scalar numeric cell is not a ref, so it needs no cast either.
-        if (
-          gck0 != "i32"
-          && gck0 != "nulstruct"
-          && gck0 != "nulvariant"
-          && gck0 != "i64"
-          && gck0 != "f64"
-          && gck0 != "f32"
-          && gck0 != "v128"
-          && gck0 != "nullist"
-          && gck0 != "nulreflist"
-          && gck0 != "nulclosure"
-          && gck0 != "nulmap"
-          && !isNulScalarListKind(gck0)
-        ) {
-          // a nullable-variant or nullable-map cell legitimately holds null too, so an
-          // eager recover here would trap `gn != null` on the exact value the test
-          // exists to detect; the field read recovers at its own use site instead. The
-          // kind-18 nullable ref-array cell joins this exclusion set for the same reason.
-          wU8(212) // 0xd4 ref.as_non_null
-        }
-      }
+      emitGlobalReadRecover(isid)
       return 0
     }
     return emitFail(
