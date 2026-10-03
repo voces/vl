@@ -3044,9 +3044,10 @@ Deno.test({
 
 // D3478 (sunpa SP-004) — a FIELD shorthand prints as written and a written `seq: seq` stays
 // written; a literal that fits is one line, however it was wrapped. Covers sunpa's two lines,
-// a one-field shorthand in body position (parenthesised, returned, an arrow body), nesting, a
-// comment inside the braces (the verbatim path) and a trailing comma. The round trip is graded
-// three ways: the exact text, a fixed point, and byte-identical wasm for input and output.
+// a one-field shorthand in body position (parenthesised, returned, an arrow body), a
+// several-field one and a lone `{ id, }` as a body and a `match` arm (D3475), nesting, a
+// comment inside the braces (the verbatim path) and a trailing comma. The round trip is
+// graded three ways: the exact text, a fixed point, and byte-identical wasm for both.
 Deno.test({
   name: "vl-fmt: a field written as shorthand stays shorthand, and the two spellings agree (D3478)",
   ignore: !ENABLED,
@@ -3055,6 +3056,7 @@ Deno.test({
       "type Intent = { seq: i32, moveX: i32, moveY: i32, aimX: i32, attack: boolean }",
       "type P = { id: i32 }",
       "type Q = { p: P, n: i32 }",
+      "type R = { id: i32, n: i32 }",
       "function intents(seq: i32, moveX: i32, moveY: i32, aimX: i32) {",
       "  const attack = true",
       "  const pending: Intent[] = []",
@@ -3078,9 +3080,20 @@ Deno.test({
       "function returned(id: i32): P { return { id } }",
       "const lambda = (id: i32): P => ({ id })",
       "function block(id: i32): i32 { id }",
+      "function pair(id: i32, n: i32): Q { { p: { id }, n } }",
+      "function bare(id: i32, n: i32): R { { id, n } }",
+      "function lone(id: i32): P { { id, } }",
+      "function arm(k: i32, id: i32, n: i32): R {",
+      "  match k {",
+      "    0 => { id, n }",
+      "    _ => { id: n, n }",
+      "  }",
+      "}",
       "print(intents(1, 2, 3, 4))",
       "const q = nested(6, 7)",
       "print(q.p.id + q.n + wrapped(8).id + returned(9).id + lambda(10).id + block(11))",
+      "print(pair(1, 2).n + bare(3, 4).id + arm(0, 5, 6).id + arm(1, 7, 8).id)",
+      "print(lone(9).id)",
       "",
     ];
     const input = [
@@ -3123,9 +3136,9 @@ Deno.test({
       await Deno.writeTextFile(b, r.out);
       const ra = await runOn("run", a);
       const rb = await runOn("run", b);
-      if (ra.code !== 0 || rb.code !== 0 || ra.out !== "10\n51\n" || rb.out !== ra.out) {
+      if (ra.code !== 0 || rb.code !== 0 || ra.out !== "10\n51\n18\n9\n" || rb.out !== ra.out) {
         throw new Error(
-          `want 10 and 51 from both, got rc ${ra.code}/${rb.code}:\n${ra.out}${ra.err}---\n${rb.out}${rb.err}`,
+          `want 10, 51, 18 and 9 from both, got rc ${ra.code}/${rb.code}:\n${ra.out}${ra.err}---\n${rb.out}${rb.err}`,
         );
       }
       const bytesOf = async (file: string): Promise<Uint8Array> => {

@@ -9430,13 +9430,16 @@ formatter's own standing rule, "never re-spell what the author wrote". Method sh
 `{ f() { … } }` is a separate, older decision and still canonicalises to the arrow field
 (`docs/internals/format-notes.md`).
 
-**Meaning cannot move, because the printer adds no braces and keeps an object's parens.** A
-one-field `{ id }` in a body position is a block, so an object there is written `({ id })`, and
-the `Paren` node keeps those parens. A shorthand object the parser read in a body position
-(`{ id, n }`, once #3332's rule is in) prints the same tokens, which re-parse the same way. The
-printer recognises a shorthand by its value sharing the key's source position, which a written
-`seq: seq` cannot. The fmt test proves the round trip by building the input and the output to
-byte-identical wasm.
+**Meaning cannot move: the printer adds no braces, keeps an object's parens, and keeps the
+comma on a lone shorthand field.** A one-field `{ id }` in a body position is a block, so an
+object there is written `({ id })` or `{ id, }` (D3475). The `Paren` node keeps the parens, and
+a single shorthand field written with a comma after it prints as `{ id, }`, the one place the
+one-line form keeps a trailing comma: dropping it, as every other one-line list does, turned
+`{ id, }` into the block `{ id }` (found by D3475's own round trip). Several fields (`{ id, n }`)
+print the same tokens and re-parse the same way. The printer recognises a shorthand by its
+value sharing the key's source position, which a written `seq: seq` cannot. The fmt tests prove
+the round trip by running both spellings, and the D3478 one by building them to byte-identical
+wasm.
 
 **Layout: one line whenever it fits.** An object literal takes the same `wrapList` rule as a
 call's arguments and a non-scalar array: one line if it fits in 80 columns from where it starts,

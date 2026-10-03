@@ -392,7 +392,9 @@ Unlike the method shorthand above, a field `{ seq }` is not canonicalised: it pr
 and a written `seq: seq` prints as `seq: seq`. The parser desugars both to a `FieldInit` whose
 value is an `Ident`; the shorthand's `Ident` carries the KEY's position (`parseObjLit` mints it
 at `fp0`), which a written value after a `:` never can, so `fieldIsShorthand` reads the spelling
-off that and nothing is added to the arena. Until D3478 the printer expanded every shorthand,
+off that and nothing is added to the arena. A lone shorthand field written with a
+comma keeps it (`{ id, }`, `loneShorthandComma`): in a body position the comma is what makes
+it an object (D3475). Until D3478 the printer expanded every shorthand,
 which is why the tree held none: the whole-tree A/B of this change moved zero files. The
 rationale and the one-line-when-it-fits layout are in `DECISIONS.md`; the round trip (shorthand
 in a body position, nested, beside a comment, with a trailing comma) is pinned in

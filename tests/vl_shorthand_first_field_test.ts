@@ -2,10 +2,10 @@
 // a function body, statements then a tail, an `if`/`else` branch, a `match` arm and a lambda body,
 // with a keyed second field, all shorthand, a trailing comma, across lines and nested.
 //
-// `vl fmt` re-spells a shorthand field `name: name`, so a fixture under `tests/cases/` cannot keep
-// these spellings; only a raw source read here exercises the parser's `{ name ,` rule. The keyed
-// form the formatter produces must be a fixed point and print the same. The guards that a lone
-// `{ name }` stays a block live in `tests/cases/parser/shorthand-lone-name-*.vl`.
+// `vl fmt` keeps a shorthand field as written (D3478), including the comma that makes a lone
+// `{ id, }` an object rather than a block; the formatted source must be a fixed point and print
+// the same. The guards that a lone `{ name }` stays a block live in
+// `tests/cases/parser/shorthand-lone-name-*.vl`.
 //
 // No assertion library, per CLAUDE.md.
 
@@ -116,7 +116,7 @@ const vl = async (
 };
 
 Deno.test({
-  name: "D3475: a body opening with a shorthand field is an object, and its keyed form agrees",
+  name: "D3475: a body opening with a shorthand field is an object, and its formatted form agrees",
   ignore: !ENABLED,
   fn: async () => {
     const dir = await Deno.makeTempDir({ prefix: "vl_shorthand_first_" });
@@ -132,19 +132,19 @@ Deno.test({
       }
       const f = await vl(["fmt"], SRC);
       if (f.code !== 0) throw new Error(`vl fmt rejected it (rc ${f.code}):\n${f.err}`);
-      for (const keyed of ["{ id: id, x: x }", "{ id: id }", "{ id: id, p: { id: id, x: x } }"]) {
-        if (!f.out.includes(keyed)) {
-          throw new Error(`want the formatted source to hold \`${keyed}\`, got:\n${f.out}`);
+      for (const kept of ["{ id, x: x }", "{ { id, } }", "{ { id, p: { id, x } } }", "=> { id, x }"]) {
+        if (!f.out.includes(kept)) {
+          throw new Error(`want the formatted source to hold \`${kept}\`, got:\n${f.out}`);
         }
       }
       const again = await vl(["fmt"], f.out);
-      if (again.out !== f.out) throw new Error(`the keyed form is not a fixed point:\n${again.out}`);
+      if (again.out !== f.out) throw new Error(`the formatted form is not a fixed point:\n${again.out}`);
       const b = `${dir}/b.vl`;
       await Deno.writeTextFile(b, f.out);
       const rb = await vl(["run", b]);
       if (rb.code !== 0 || rb.out !== WANT) {
         throw new Error(
-          `the keyed spelling: want rc 0 and ${JSON.stringify(WANT)}, got rc ${rb.code} and ` +
+          `the formatted spelling: want rc 0 and ${JSON.stringify(WANT)}, got rc ${rb.code} and ` +
             `${JSON.stringify(rb.out)}\n${rb.err}`,
         );
       }
