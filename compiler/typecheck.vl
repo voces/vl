@@ -3671,6 +3671,8 @@ let tpJoinUnions: {[i32]: i32} = Map()
 // The joins `paramNullJoin` kept a null in (D3497): re-folding one at a call keeps the null even
 // when the bound members absorb it, as a caller's own holes do.
 let paramNullJoins: {[i32]: i32} = Map()
+// The unions an annotation spelled (`annUnionTy`), apart from those a join made (D3357).
+let annUnionTys: {[i32]: boolean} = Map()
 // The parameter holes some join kept apart as an implicit type parameter (D3333): an instance
 // binding one re-joins such a join through its holes' binding.
 let holeTpJoinNames: {[string]: boolean} = Map()
@@ -5013,6 +5015,7 @@ export function initChecker() {
   T.tys = []
   tpJoinUnions = Map()
   paramNullJoins = Map()
+  annUnionTys = Map()
   holeTpJoinNames = Map()
   genFnCstrBusy = false
   tpIfJoinAt = Map()
@@ -24463,6 +24466,8 @@ function annUnionTy(members: i32[], hasNull: boolean): i32 {
   }
   const inner = annUnionInnerTy(members, hasNull)
   if inner < 0 { return -1 }
+  // arena-tick exempt: a per-program mark on an annotation's row.
+  annUnionTys[inner] = true
   if hasNull {
     const wrapped = mkNullableTy(inner)
     // Carries the collapse bank through the niche wrap: `string | "err" | null` is
@@ -43256,6 +43261,41 @@ function substListTwin(a: i32, b: i32): boolean {
   tyEq(a, b)
 }
 
+// Whether `kept` already holds the list type `m` at another arena index (D3503).
+function substListTwinIn(kept: i32[], m: i32): boolean {
+  for k in kept {
+    if substListTwinNominal(k, m) { return true }
+  }
+  false
+}
+
+// `substListTwin` that never merges two declared types of one shape: the elements are one
+// arena row, one primitive, or twins themselves, so `Rec[]` and `Rec2[]` stay two lists.
+function substListTwinNominal(a: i32, b: i32): boolean {
+  if a < 0 || b < 0 || a >= T.tys.length || b >= T.tys.length { return false }
+  const ta = T.tys[a]
+  const tb = T.tys[b]
+  if ta is TyArray && tb is TyArray {
+    return substElemNominal(ta.aElem, tb.aElem)
+  }
+  false
+}
+
+// Whether two element types are one type by identity, seeing through lists and nullables.
+function substElemNominal(a: i32, b: i32): boolean {
+  if a == b { return true }
+  if a < 0 || b < 0 || a >= T.tys.length || b >= T.tys.length { return false }
+  const ta = T.tys[a]
+  const tb = T.tys[b]
+  match ta {
+    TyPrim => tb is TyPrim && ta.primName == tb.primName
+    TyNullable => tb is TyNullable && substElemNominal(ta.nInner, tb.nInner)
+    TyArray => tb is TyArray && substElemNominal(ta.aElem, tb.aElem)
+    // A declared or composite type is one type only at one arena row, asked above.
+    TyErr | TyObj | TyFunc | TyUnion | TyMap | TyVar | TyLit | TyNeg => false
+  }
+}
+
 // The members of a union re-joined one at a time, as the join that made it would at these types.
 function rejoinMembers(ms: i32[]): i32 {
   const apart = njRejoinApart
@@ -43308,11 +43348,187 @@ function nullableFlatInner(u: i32): i32 {
   flattenVariantsInto(u, ms)
   const kept: i32[] = []
   for m in ms {
-    if !isNullTy(m) && !i32ListHas(kept, m) { kept.push(m) }
+    if !isNullTy(m) && !i32ListHas(kept, m) && !substListTwinIn(kept, m) {
+      kept.push(m)
+    }
   }
   if kept.length == 0 { return u }
   if kept.length == 1 { return kept[0] }
   mkUnionTy(kept)
+}
+
+// The members of a substituted union with every null folded out, when the substitution left a
+// nullable member or bound a parameter to `null` (`(A | null) | B`, `A | B` at `A := T | null`);
+// empty when it did not, or when a member is a literal union. A declared bare `null` member
+// keeps its shape.
+function substUnionNullFolded(tyIx: i32, ms: i32[], out: i32[]): i32[] {
+  const res: i32[] = []
+  if substNullFoldOff { return res }
+  let nested = false
+  let i = 0
+  while i < out.length && i < ms.length {
+    const m = out[i]
+    if m >= 0 && m < T.tys.length && T.tys[m] is TyNullable { nested = true }
+    if isNullTy(m) && !isNullTy(ms[i]) { nested = true }
+    i = i + 1
+  }
+  if !nested { return res }
+  // A join of bare type parameters no annotation wrote (`T | U` over a union of their lists)
+  // keeps the nesting: its element reads are not yet built at a nullable pin (D3357).
+  if !annUnionTys.has(tyIx) && substAllTyVars(ms) { return res }
+  const flat: i32[] = []
+  for m in out {
+    // A `K | L | null` box binding is the `string | null` an instance pins it at, so the
+    // call and the instance fold it alike (D3382 converts the box at the argument).
+    if tyIsNulStrBoxUnion(m) {
+      flat.push(TY_STR)
+      flat.push(TY_NULL)
+    } else {
+      flattenVariantsInto(m, flat)
+    }
+  }
+  for m in flat {
+    // A literal-union member keeps the nesting: a declared `K | L | null` and a folded one do
+    // not share a rep yet, so the fold would let through what the emitter builds wrong (D3140).
+    if m >= 0 && m < T.tys.length && (tyIsLitUnion(m) || T.tys[m] is TyLit) {
+      const none: i32[] = []
+      return none
+    }
+    if !isNullTy(m) { res.push(m) }
+  }
+  // Two distinct lists, one of records, keep the nesting: that nullable union is not yet built
+  // at every reader (its flat spelling fails there too), and the nested one runs at some.
+  if substFoldListCount(res) > 1 && substFoldHasRecordList(res) {
+    const none2: i32[] = []
+    return none2
+  }
+  res
+}
+
+// Set while an instance is built for a pin spelled `K | (L | null)`: its softened pin drops the
+// nested null, so the instance keeps the call's unfolded union rather than fold alone.
+let substNullFoldOff = false
+
+// Sets `substNullFoldOff` when a pin is that spelling; the previous setting, to restore.
+export function substNullFoldOffFor(pins: i32[]): boolean {
+  const was = substNullFoldOff
+  let off = false
+  for p in pins {
+    if substLitBoxNested(p) { off = true }
+  }
+  substNullFoldOff = off
+  was
+}
+
+// Restores `substNullFoldOff` to `was`.
+export function substNullFoldRestore(was: boolean) {
+  substNullFoldOff = was
+  0
+}
+
+// `K | (L | null)`: literal unions with a null nested in a member rather than wrapping them.
+function substLitBoxNested(m: i32): boolean {
+  if m < 0 || m >= T.tys.length { return false }
+  const t = T.tys[m]
+  if !(t is TyUnion) { return false }
+  let nested = false
+  for x in t.uMembers {
+    if x < 0 || x >= T.tys.length { return false }
+    if isNullTy(x) || T.tys[x] is TyNullable { nested = true }
+  }
+  if !nested { return false }
+  const ms: i32[] = []
+  flattenVariantsInto(m, ms)
+  for x in ms {
+    if x >= 0 && x < T.tys.length && (T.tys[x] is TyLit || tyIsLitUnion(x)) {
+      return true
+    }
+  }
+  false
+}
+
+// Whether every member of `ms` is a type variable.
+function substAllTyVars(ms: i32[]): boolean {
+  for m in ms {
+    if m < 0 || m >= T.tys.length || !(T.tys[m] is TyVar) { return false }
+  }
+  true
+}
+
+// Whether a member of `ms` is a list whose element, through lists and nullables, is not a primitive.
+function substFoldHasRecordList(ms: i32[]): boolean {
+  for m in ms {
+    if m >= 0 && m < T.tys.length && T.tys[m] is TyArray {
+      if !substLeafIsPrim(m, 16) { return true }
+    }
+  }
+  false
+}
+
+// Whether `ty`, seen through lists and nullables, is a primitive.
+function substLeafIsPrim(ty: i32, depth: i32): boolean {
+  if ty < 0 || ty >= T.tys.length || depth <= 0 { return false }
+  const t = T.tys[ty]
+  match t {
+    TyPrim => true
+    TyArray => substLeafIsPrim(t.aElem, depth - 1)
+    TyNullable => substLeafIsPrim(t.nInner, depth - 1)
+    // A record, union or any other leaf is not one primitive.
+    TyErr | TyObj | TyFunc | TyUnion | TyMap | TyVar | TyLit | TyNeg => false
+  }
+}
+
+// The number of distinct list types among `ms`, compared nominally.
+function substFoldListCount(ms: i32[]): i32 {
+  const lists: i32[] = []
+  for m in ms {
+    if m >= 0 && m < T.tys.length && T.tys[m] is TyArray {
+      if !i32ListHas(lists, m) && !substListTwinIn(lists, m) { lists.push(m) }
+    }
+  }
+  lists.length
+}
+
+// `inner | null`: a member of `ms` that already is that nullable, so a fold that changes nothing
+// but the nesting keeps the binding's arena row, else a new one.
+function substNullableOver(ms: i32[], inner: i32): i32 {
+  for m in ms {
+    if m >= 0 && m < T.tys.length {
+      const mt = T.tys[m]
+      if mt is TyNullable && mt.nInner == inner { return m }
+    }
+  }
+  mkNullableTy(inner)
+}
+
+// Whether `ty` is a union of literal unions, literals and strings with a `null`, at least one a
+// literal union or literal, and not itself one literal union: the box `K | L | null` that a
+// `string | null` destination reads as its niche (D3382).
+export function tyIsNulStrBoxUnion(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  // `K | null` and `"a" | null` are the atom niche, not the box.
+  const tt = T.tys[ty]
+  if tt is TyNullable {
+    const inner = tt.nInner
+    if inner < 0 || inner >= T.tys.length { return false }
+    if !(T.tys[inner] is TyUnion) || tyIsLitUnion(inner) { return false }
+  } else {
+    // Only the `(K | L) | null` wrapper is that box; a nested `K | (L | null)` is another rep.
+    return false
+  }
+  if tyIsLitUnion(nonNullTy(ty)) { return false }
+  const ms: i32[] = []
+  flattenVariantsInto(ty, ms)
+  let lit = false
+  let nul = false
+  for m in ms {
+    if m < 0 || m >= T.tys.length { return false }
+    const mt = T.tys[m]
+    if isNullTy(m) { nul = true }
+    else if tyIsLitUnion(m) || mt is TyLit { lit = true }
+    else if !(mt is TyPrim && mt.primName == "string") { return false }
+  }
+  lit && nul
 }
 
 // Deep substitution of a call's bindings into a type: a bound `TyVar` becomes its binding; a
@@ -43416,20 +43632,27 @@ export function substTyDeep(tyIx: i32, bNames: string[], bTys: i32[]) {
       res = rejoinMembers(out3)
       tpApartConcrete = tpSaved
     } else if changed3 {
+      // A null the substitution put inside the union (`(A | null) | B`, or `A | B` at `A := T |
+      // null`) folds out to one nullable wrapper over the rest, in member order (D3504, D3502).
+      const src = substUnionNullFolded(tyIx, ms, out3)
+      const wrapNull = src.length > 0
       // Dedupes by arena-index identity only (not `sameVariantTy`) then rebuilds: substitution
       // can make two members the same type, and matching structurally here would merge members this walk must leave alone (the mixed-union arena shape is load-bearing).
+      let dms = out3
+      if wrapNull { dms = src }
       const uniq: i32[] = []
       let q = 0
-      while q < out3.length {
+      while q < dms.length {
         let seen = false
         let w = 0
         while w < uniq.length {
-          if uniq[w] == out3[q] { seen = true }
+          if uniq[w] == dms[q] { seen = true }
           // `T[] | i32[]` at `T := i32` is one list; the substituted `T[]` is a fresh index (D2818).
-          if substListTwin(uniq[w], out3[q]) { seen = true }
+          if !wrapNull && substListTwin(uniq[w], dms[q]) { seen = true }
+          if wrapNull && substListTwinNominal(uniq[w], dms[q]) { seen = true }
           w = w + 1
         }
-        if !seen { uniq.push(out3[q]) }
+        if !seen { uniq.push(dms[q]) }
         q = q + 1
       }
       // The third union-construction site needing the same subsumed-arm collapse
@@ -43443,6 +43666,7 @@ export function substTyDeep(tyIx: i32, bNames: string[], bTys: i32[]) {
       const sclash = setMapUnionClashMsg(kept3, false)
       if sclash != "" { joinClashMsg = sclash }
       if kept3.length == 1 { res = kept3[0] } else { res = mkUnionTy(kept3) }
+      if wrapNull { res = substNullableOver(out3, res) }
     }
   } else if t is TyMap {
     const k2 = substTyDeep(t.mKey, bNames, bTys)
