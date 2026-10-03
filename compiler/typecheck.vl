@@ -12971,6 +12971,21 @@ function softenLitTy(ty: i32) {
   ty
 }
 
+// `softenLitTy` for an arithmetic or ordering operand: an integer-literal union over two bases
+// also softens, to the common width `i64`, because its members are constants that adapt.
+function softenLitOpTy(ty: i32): i32 {
+  // Nearly every operand is a primitive, which no softening reaches.
+  if ty < 0 || T.tys[ty] is TyPrim { return ty }
+  const soft = softenLitTy(ty)
+  if soft != ty || !(T.tys[ty] is TyUnion) { return soft }
+  if intLitUnionBasesOf(ty).length > 0 {
+    // Its box is then an operand the emitter's numeric-union dispatch converts out of.
+    numUnionMinted = true
+    return TY_I64
+  }
+  ty
+}
+
 // Does `ty` concatenate as a string? The `+` gate's operand test, in one home because the
 // checker and its pin mirror must not drift about it (D1732). A literal union of strings is a
 // SET of strings, so it concatenates and the result is `string` — never the union (D1739).
@@ -19369,6 +19384,37 @@ export function intLitUnionBasesOf(t: i32): i32[] {
   out
 }
 
+// The distinct base scalars of a union of integer literals and numbers, a literal among them,
+// whose members span two bases (`1 | 9000000000 | i32`), else an empty list: the box it lowers as
+// holds each member at its base, as `intLitUnionBasesOf`'s does.
+export function litNumUnionBasesOf(t: i32): i32[] {
+  const none: i32[] = []
+  if t < 0 || t >= T.tys.length || !(T.tys[t] is TyUnion) { return none }
+  const vs: i32[] = []
+  flattenVariantsInto(t, vs)
+  const out: i32[] = []
+  let lits = 0
+  for v in vs {
+    if v < 0 { return none }
+    const vt = T.tys[v]
+    let b = v
+    if vt is TyLit {
+      if vt.litKind != "int" { return none }
+      b = litBaseTy(vt)
+      lits = lits + 1
+    } else if !isNumericPrimTy(v) {
+      return none
+    }
+    let seen = false
+    for o in out {
+      if o == b { seen = true }
+    }
+    if !seen { out.push(b) }
+  }
+  if lits == 0 || out.length < 2 { return none }
+  out
+}
+
 // Whether a numeric union `src` delivers into the numeric primitive `dst0`, or its nullable:
 // every member is it or widens to it exactly, so the value converts at the member it holds.
 export function numUnionConverts(src: i32, dst0: i32): boolean {
@@ -19383,6 +19429,39 @@ export function numUnionConverts(src: i32, dst0: i32): boolean {
     if !sameNumeric(m, dst) && !numWidens(m, dst) { return false }
   }
   true
+}
+
+// Whether a union of integer literals and numbers `src`, a literal among them, delivers into the
+// numeric primitive `dst`: it holds each literal exactly and each number widens to it, so the box
+// converts at the member it holds (D3523).
+export function litNumUnionConverts(src: i32, dst: i32): boolean {
+  if src < 0 || src >= T.tys.length || !(T.tys[src] is TyUnion) { return false }
+  if !isNumericPrimTy(dst) { return false }
+  const vs: i32[] = []
+  flattenVariantsInto(src, vs)
+  let lits = 0
+  for v in vs {
+    if v < 0 { return false }
+    const vt = T.tys[v]
+    if vt is TyLit {
+      if vt.litKind != "int" || !intLexHeldBy(vt.litText, dst) { return false }
+      lits = lits + 1
+    } else if !isNumericPrimTy(v) {
+      return false
+    } else if !sameNumeric(v, dst) && !numWidens(v, dst) {
+      return false
+    }
+  }
+  lits > 0 && vs.length > 1
+}
+
+// Whether the numeric primitive `dst` holds the integer literal spelled `text` exactly: any
+// integer literal fits `i64`; the narrower and the float widths ask the lexeme.
+function intLexHeldBy(text: string, dst: i32): boolean {
+  if sameNumeric(dst, TY_I64) { return true }
+  if sameNumeric(dst, TY_I32) { return numLexFitsI32(text) }
+  if sameNumeric(dst, TY_F64) { return intLexemeIsExactF64(text) }
+  sameNumeric(dst, TY_F32) && intLexemeIsExactF32(text)
 }
 
 // Whether `x as dst` over the numeric union `src` is a conversion no member can fail: `dst` is
@@ -22470,6 +22549,10 @@ function binShiftOp(op: string): boolean {
 export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
   lbiNoteDelivery(srcExpr, dstTy, nlAsgTgt)
   if numUnionMinted && numUnionConverts(srcTy, dstTy) && !njExprHeld(srcExpr) {
+    return true
+  }
+  if litNumUnionConverts(srcTy, dstTy) && !njExprHeld(srcExpr) {
+    numUnionMinted = true
     return true
   }
   if srcExpr >= 0 && dstTy >= 0 {
@@ -40719,6 +40802,7 @@ function minMaxPinOk(lt: i32, rt: i32): boolean {
 // still-unresolved operand defers (true — the outer call validates it). Mirrors
 // `checkBinary`'s accepted forms and its arm order; operators not modelled here return true.
 function binOpDefinedFor(op: string, lt0: i32, rt0: i32) {
+  // A two-width literal set is not softened at a pin: its `i64` result is no `T` (D3524).
   const lt = softenLitTy(lt0)
   const rt = softenLitTy(rt0)
   if tyHasHole(lt) || tyHasHole(rt) { return true }
@@ -53720,8 +53804,31 @@ export function valueUnionRetName(er: i32) {
 function litUnionArmValueUnionRetName(er: i32) {
   if !tyHasLitLeaf(er, 8) { return "" }
   const nm = tyToEmitName(er)
+  // Literals of two bases or more, beside plain scalars, are the value box every annotated
+  // position lowers (`1 | 9000000000`, `1 | "s"`, D3512).
+  if litScalarBoxLeaves(er) && isValueUnionName(nm) { return irRendered(nm) }
   if !nameIsLitUnionArmValueUnion(nm) { return "" }
   irRendered(nm)
+}
+
+// Whether every variant of union `er` is a literal or a plain scalar, over two bases or more.
+function litScalarBoxLeaves(er: i32): boolean {
+  const vs: i32[] = []
+  flattenVariantsInto(er, vs)
+  const bases: i32[] = []
+  for v in vs {
+    if v < 0 { return false }
+    const vt = T.tys[v]
+    let b = v
+    if vt is TyLit { b = litBaseTy(vt) }
+    else if !isNumericPrimTy(v) && !isStringTy(v) { return false }
+    let seen = false
+    for o in bases {
+      if o == b { seen = true }
+    }
+    if !seen { bases.push(b) }
+  }
+  bases.length > 1
 }
 
 // Whether a leaf of the union or nullable `er` is a literal, within `depth` levels.
@@ -56396,8 +56503,16 @@ function recordWidenRetag(srcExpr: i32, srcTy: i32, dm: i32[]) {
 // pushed onto `from` beside the member each widens to on `to`; nothing when `srcTy` is no box.
 function widenMemberPairs(srcTy: i32, dm: i32[], from: i32[], to: i32[]) {
   if srcTy < 0 || srcTy >= T.tys.length { return 0 }
+  const leaves: i32[] = []
+  unionLeavesInto(srcTy, leaves, 8)
+  // A box holds a literal member under its base's tag (D3491), so the base is what widens.
   const sm: i32[] = []
-  unionLeavesInto(srcTy, sm, 8)
+  for l in leaves {
+    let b = l
+    const lt = T.tys[l]
+    if lt is TyLit { b = litBaseTy(lt) }
+    if !tyAmong(b, sm) { sm.push(b) }
+  }
   // A box is a union of two non-null members, or `i32 | null`; any other nullable is a niche.
   if sm.length == 0 { return 0 }
   if sm.length == 1 && !(tyPrimNameIs(sm[0], "i32") && tyHasNullMember(srcTy)) {
@@ -61014,8 +61129,8 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
   // Ordering comparison: result bool, requires matching numeric types. A literal/litunion
   // operand is its base scalar here (`0 | 1 | 2` compares as i32).
   if op == "<" || op == ">" || op == "<=" || op == ">=" {
-    const olt = softenLitTy(lt)
-    const ort = softenLitTy(rt)
+    const olt = softenLitOpTy(lt)
+    const ort = softenLitOpTy(rt)
     // String ordering: a lexicographic compare of two strings yields a bool.
     if isStringTy(olt) && isStringTy(ort) { return TY_BOOL }
     // One concrete string against a hole defers rather than forcing numeric — `noteBinCstr`
@@ -61083,8 +61198,8 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
   // and a message naming the base leaves a member set looking like a contradiction (D1739).
   const ltWrote = lt
   const rtWrote = rt
-  lt = softenLitTy(lt)
-  rt = softenLitTy(rt)
+  lt = softenLitOpTy(lt)
+  rt = softenLitOpTy(rt)
   // A hole operand reaching arithmetic is used numerically — record the demand so the call-arg
   // check enforces a numeric (or operator-overloaded) argument (`isNumeric(TyVar)` passes below).
   if !isNumeric(lt) || !isNumeric(rt) {
@@ -64128,6 +64243,10 @@ function checkUnaryNode(n: Unary, ix: i32) {
     && !njExprHeld(n.unArg)
   ) {
     return arg2
+  }
+  // A literal set negates at its base, as `x - 1` computes over it.
+  if n.unOp == "-" && !isNumeric(arg2) && isNumeric(softenLitOpTy(arg2)) {
+    arg2 = softenLitOpTy(arg2)
   }
   if !isNumeric(arg2) {
     tErr("unary '-' expects a numeric type, got " + tyToStr(arg2), ix)
@@ -68610,6 +68729,31 @@ function litSetMeetTy(obj: i32, chk: i32): i32 {
   res
 }
 
+// The members of the literal-bearing union `obj` (or its nullable) whose base scalar is the
+// primitive `chk`, as one type: what `x is string` narrows `1 | "s"` to (D3522). -1 when `chk` is
+// no primitive, when it is already a variant, or when no literal member has it as its base.
+function litBaseMeetTy(obj: i32, chk: i32): i32 {
+  if obj < 0 || chk < 0 || !(T.tys[chk] is TyPrim) { return -1 }
+  let base = obj
+  const ot = T.tys[obj]
+  if ot is TyNullable { base = ot.nInner }
+  if base < 0 || !(T.tys[base] is TyUnion || T.tys[base] is TyLit) { return -1 }
+  const vs: i32[] = []
+  flattenVariantsInto(base, vs)
+  const keep: i32[] = []
+  for v in vs {
+    if v >= 0 {
+      const vt = T.tys[v]
+      if vt is TyLit {
+        if tySame(litBaseTy(vt), chk) { keep.push(v) }
+      }
+    }
+  }
+  if keep.length == 0 || assignable(chk, base) { return -1 }
+  if keep.length == 1 { return keep[0] }
+  mkUnionTy(keep)
+}
+
 // Whether a string literal of `ty` (through unions) is spelled with an escape.
 function litSetHasEscape(ty: i32): boolean {
   const lits: i32[] = []
@@ -68727,8 +68871,10 @@ function checkIsExprNode(n: IsExpr, ix: i32) {
   crIsObj = savedIsObj
   const chkTy = isTypeTy(n.isVariant, ix)
   const chkClash = if chkTy < 0 { unkTyClash } else { "" }
-  // A literal set that only overlaps the operand's tests as the overlap (D2205).
-  const meet = litSetMeetTy(objTy, chkTy)
+  // A literal set that only overlaps the operand's tests as the overlap (D2205), and a base
+  // scalar tests the literal members it is the base of (D3522).
+  let meet = litSetMeetTy(objTy, chkTy)
+  if meet == -1 && n.isVariant != "null" { meet = litBaseMeetTy(objTy, chkTy) }
   // A `const` literal tests as the compare does: against a literal it never equals the
   // test is refused, and against anything else it is the `string` it is (D2198).
   if chkTy >= 0 && isWideLitJoin(objTy) {

@@ -4,7 +4,7 @@
 // from a single template. An instrument nobody validates measures nothing (CLAUDE.md: never
 // trust a probe until a control you KNOW should trigger it does), so this suite runs it on
 // four templates whose answers are already known: D1042's generic-pinned union, where every
-// position runs but the INFERRED return (D1194); D1197's narrowed nullable ref, all nine
+// position runs, the INFERRED return too since D1194 closed; D1197's narrowed nullable ref, all nine
 // delivery positions running since that row closed; and D1244's module-scope block at two
 // reps, where the STRUCT capture is a loud refusal and the `i32[]` one is silent.
 //
@@ -169,7 +169,7 @@ Deno.test({
 });
 
 Deno.test({
-  name: "matrix: D1042's template runs everywhere but the INFERRED return (D1194)",
+  name: "matrix: D1042's template runs everywhere, the INFERRED return too (D1194)",
   ignore: !ENABLED,
   fn: async () => {
     const { code, cells } = await runMatrix("orerr-generic-pin.matrix.vl");
@@ -178,7 +178,7 @@ Deno.test({
       wantVerdict(cells, "array_push", face, "RUNS", "D1042 closed 2026-09-02");
       wantVerdict(cells, "global_assign", face, "RUNS", "D965's missed position");
       wantVerdict(cells, "two_instances", face, "RUNS", "two pins of one generic in a module");
-      wantVerdict(cells, "return_inferred", face, "check refuses", "D1194, still open");
+      wantVerdict(cells, "return_inferred", face, "RUNS", "D1194 closed 2026-10-03");
       // THE BLOCK FAMILY REACHES THIS TEMPLATE TOO, and that is the point of adding it: the
       // generic-pinned box is check-clean invalid wasm when captured out of a module-scope
       // block, which nothing graded before the positions existed. D1244's mechanism, this
