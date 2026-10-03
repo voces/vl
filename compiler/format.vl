@@ -2213,7 +2213,24 @@ function renderBinary(ix: i32, node: BinExpr, indent: i32, column: i32) {
     if raw.length > 0 { return raw }
   }
   if node.binOp == "=" { return renderAssign(ix, node, indent, column) }
+  // A comment after an operator has no printer in the chain, so the expression keeps its
+  // source text, as an object literal's gaps do (D3514).
+  if commentInOperatorGaps(ix) { return sliceFallback(ix) }
   binaryChain(ix, node, indent, column)
+}
+
+// Whether a pending comment starts between an operand and the next one, anywhere along the
+// operator chain rooted at `ix` (template and assignment nodes print themselves).
+function commentInOperatorGaps(ix: i32) {
+  const n = P.nodes[ix]
+  if n is BinExpr {
+    if n.binTpl == 1 || n.binOp == "=" { return false }
+    if commentInCharSpan(nodeEndOf(n.binLeft), nodePos(n.binRight)) {
+      return true
+    }
+    return commentInOperatorGaps(n.binLeft) || commentInOperatorGaps(n.binRight)
+  }
+  false
 }
 
 // Emit possibly-multiline `text` with only its first line indented (continuation
@@ -2747,7 +2764,11 @@ function objectLiteral(ix: i32, node: ObjLit, indent: i32, column: i32) {
   if node.objFields.length == 0 { return "{}" }
   // A comment between the fields is the list literal's case at the other bracket: it falls
   // through to the statement printer, one construct later than the row it annotates (D1777).
-  if commentInListGaps(nodePos(ix), nodeEndOf(ix), node.objFields) {
+  // A comment between a key and its value has no printer either, so it anchors the same way (D3492).
+  if (
+    commentInListGaps(nodePos(ix), nodeEndOf(ix), node.objFields)
+    || commentInFieldKeyGaps(node.objFields)
+  ) {
     return sliceFallback(ix)
   }
   if loneShorthandComma(node.objFields) {
@@ -2760,6 +2781,22 @@ function objectLiteral(ix: i32, node: ObjLit, indent: i32, column: i32) {
     i = i + 1
   }
   wrapList("{ ", items, " }", indent, column)
+}
+
+// Whether a pending comment starts between some field's key and its value. A shorthand's
+// value shares the key's position, so its span is empty.
+function commentInFieldKeyGaps(fields: i32[]) {
+  let i = 0
+  while i < fields.length {
+    const f = P.nodes[fields[i]]
+    if f is FieldInit {
+      if commentInCharSpan(nodePos(fields[i]), nodePos(f.fiValue)) {
+        return true
+      }
+    }
+    i = i + 1
+  }
+  false
 }
 
 // Whether the literal is one shorthand field written with a comma after it. In a body
@@ -2905,8 +2942,16 @@ function arrayLiteral(ix: i32, node: ArrayLit, indent: i32, column: i32) {
 }
 
 // A parenthesised expression `( inner )`. The self-host keeps explicit parens.
-function parenExpr(_ix: i32, node: Paren, indent: i32, column: i32) {
-  "(" + expr(node.parInner, indent, column + 1) + ")"
+// A comment between a bracket and the inner expression keeps the source text (D3514).
+function parenExpr(ix: i32, node: Paren, indent: i32, column: i32) {
+  const inner = node.parInner
+  if (
+    commentInCharSpan(nodePos(ix), nodePos(inner))
+    || commentInCharSpan(nodeEndOf(inner), nodeEndOf(ix))
+  ) {
+    return sliceFallback(ix)
+  }
+  "(" + expr(inner, indent, column + 1) + ")"
 }
 
 // An anonymous function value in expression position is always an arrow lambda
