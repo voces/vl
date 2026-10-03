@@ -9419,3 +9419,34 @@ a hole's read of the same kind keeps the `-1` niche (`coalMapReadNulAtomTexts`),
 had spelled the sentinel as a member. The pin-nullable default is asked only there: widening
 `coalesceDefaultNullable` itself broke three `d3127-coal-price` chains. Two `<T>` cells moved
 from a refusal to D3398's wrong value, recorded as the named set `mh-two-instance-price`.
+
+## `vl fmt` keeps a field written as shorthand, and an object literal is one line when it fits (2026-10-03) — D3478, sunpa SP-004
+
+**A field prints the way it was written.** `{ seq }` stays `seq` and `{ seq: seq }` stays
+`seq: seq`; the formatter converts neither way. Shorthand is a supported spelling, and a
+formatter that rewrites it means a file only ever holds the long form, and that every format
+moves text under the author's next scripted edit (sunpa lost two fields that way). It is the
+formatter's own standing rule, "never re-spell what the author wrote". Method shorthand
+`{ f() { … } }` is a separate, older decision and still canonicalises to the arrow field
+(`docs/internals/format-notes.md`).
+
+**Meaning cannot move: the printer adds no braces, keeps an object's parens, and keeps the
+comma on a lone shorthand field.** A one-field `{ id }` in a body position is a block, so an
+object there is written `({ id })` or `{ id, }` (D3475). The `Paren` node keeps the parens, and
+a single shorthand field written with a comma after it prints as `{ id, }`, the one place the
+one-line form keeps a trailing comma: dropping it, as every other one-line list does, turned
+`{ id, }` into the block `{ id }` (found by D3475's own round trip). Several fields (`{ id, n }`)
+print the same tokens and re-parse the same way. The printer recognises a shorthand by its
+value sharing the key's source position, which a written `seq: seq` cannot. The fmt tests prove
+the round trip by running both spellings, and the D3478 one by building them to byte-identical
+wasm.
+
+**Layout: one line whenever it fits.** An object literal takes the same `wrapList` rule as a
+call's arguments and a non-scalar array: one line if it fits in 80 columns from where it starts,
+else one field per line with a trailing comma. How the author wrapped it is not consulted, so a
+literal written over several lines that fits is joined, and one that does not is split. That is
+the rule calls and arrays already follow (an array of scalar literals keeps the author's uniform
+rows, which an object has no analogue of). The SP-004 split was not a layout rule: expanding the
+shorthand pushed the literal past the width. Keeping the author's line breaks was considered and
+not taken: it would make objects the one bracketed list whose layout is the author's, and a
+written break would then survive every later edit that shortened the literal.
