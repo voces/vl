@@ -3871,10 +3871,42 @@ function emitOptRecvBase(body: u8[], exprIx: i32, fnIx: i32, asRef: boolean) {
   0
 }
 
+// How a struct field of storage code `code` encodes `null`, in `rdNul`'s vocabulary: 0 never
+// null, 1 a null ref, 2 the boolean sentinel `2`, 3 the literal-union sentinel `-1`, 4 the
+// box's null tag. A non-nullable struct field (code 15) answers 1: its slot is a nullable ref.
+function optChainLeafNulDisc(code: i32): i32 {
+  if code == FC_STRUCT || code == FC_NUL_STR || code == FC_NUL_CLOSURE {
+    return 1
+  }
+  if code == FC_NUL_I32_LIST || code == FC_NUL_REF_LIST || code == FC_NUL_MAP {
+    return 1
+  }
+  if nulScalarListFieldWrapHeap(code) >= 0 { return 1 }
+  if code == FC_NUL_BOOL { return 2 }
+  if code == FC_NUL_LIT_UNION { return 3 }
+  if code == FC_UNION { return 4 }
+  0
+}
+
+// Consume a field value of storage code `code` and push 1 when it is that field's `null`.
+// Only called for a code `optChainLeafNulDisc` answers non-zero for.
+function emitOptChainLeafNulTest(code: i32) {
+  const disc = optChainLeafNulDisc(code)
+  if disc == 1 {
+    return wU8(209) // 0xd1 ref.is_null
+  }
+  if disc == 4 {
+    fbStructGet(uBoxIdx, 0) // field 0: the tag
+    fbI32Const(nullBoxTag())
+    return fbI32Bin(70) // 0x46 i32.eq
+  }
+  if disc == 2 { fbI32Const(2) } else { fbI32Const(0 - 1) }
+  fbI32Bin(70) // 0x46 i32.eq
+}
+
 // Push 1 if the optional-chain value at `exprIx` is null — any null link folds `null`
-// through — else 0. A code-15 leaf tests its own ref; a code-16 value-union box leaf
-// compares the box tag against the global null tag (the box ref itself is never null);
-// any other leaf is never null once every link held.
+// through — else 0. A leaf whose field can hold `null` tests that field's own encoding of
+// it (`optChainLeafNulDisc`); any other leaf is never null once every link held.
 function emitOptChainIsNull(body: u8[], exprIx: i32, fnIx: i32) {
   const e = P.nodes[unwrapParen(exprIx)]
   if e is OptMember {
@@ -3891,18 +3923,12 @@ function emitOptChainIsNull(body: u8[], exprIx: i32, fnIx: i32) {
     fbI32Const(1)
     fbElse()
     const pfc = sFieldTypeAt(psi, pfi)
-    if pfc == FC_STRUCT {
-      if emitOptChainValue(body, e.omObj, fnIx) < 0 { return -1 }
-      fbStructGet(sHeapIdx[psi], pfi)
-      wU8(209)
-    } else if pfc == FC_UNION {
-      if emitOptChainValue(body, e.omObj, fnIx) < 0 { return -1 }
-      fbStructGet(sHeapIdx[psi], pfi)
-      fbStructGet(uBoxIdx, 0)
-      fbI32Const(nullBoxTag())
-      fbI32Bin(70)
-    } else {
+    if optChainLeafNulDisc(pfc) == 0 {
       fbI32Const(0)
+    } else {
+      if emitOptChainValue(body, e.omObj, fnIx) < 0 { return -1 }
+      fbStructGet(sHeapIdx[psi], pfi)
+      emitOptChainLeafNulTest(pfc)
     }
     fbEnd()
     return 0
@@ -4141,6 +4167,8 @@ function emitOptMemberValueGo(body: u8[], exprIx: i32, fnIx: i32) {
       && oCode != FC_STR
       && oCode != FC_NUL_STR
       && oCode != FC_UNION
+      && oCode != FC_NUL_BOOL
+      && oCode != FC_NUL_LIT_UNION
       && optChainLeafBoxKind(oCode) < 0
       && oRefHeap < 0
     ) {
@@ -4153,10 +4181,11 @@ function emitOptMemberValueGo(body: u8[], exprIx: i32, fnIx: i32) {
 
     // `boolean | null` shares one unconditional i32 blocktype: the sentinel 2 (`null`) and
     // the live 0/1 result are the same valtype, so the two arms below need no cast to join.
-    if ord.rdKind == "i32" && ord.rdNul == 2 {
+    // `K | null` is the same shape over the literal union's atom, `-1` its null.
+    if ord.rdKind == "i32" && (ord.rdNul == 2 || ord.rdNul == 3) {
       if emitOptChainIsNull(body, exprIx, fnIx) < 0 { return -1 }
       fbIf(127)
-      fbI32Const(2)
+      if ord.rdNul == 2 { fbI32Const(2) } else { fbI32Const(0 - 1) }
       fbElse()
       if emitOptChainValue(body, e.omObj, fnIx) < 0 { return -1 }
       fbStructGet(sHeapIdx[osi], ofi)
@@ -7168,9 +7197,7 @@ function sharedFieldCodeDispatchable(code: i32): boolean {
 function optChainFieldCodeOk(code: i32): boolean {
   // A string leaf (code 3 or 20) does not reach here: `exprNullableString` calls a `?.` over a
   // string field `string | null`, so `emitCoalesce`'s string-niche arm claims the spelling first
-  // (D802). A value-union field (code 16) is admitted — `exprUnion` and `unionNameOfExpr` both
-  // answer for a code-16 chain leaf, so the blocktype and the binding's cell agree.
-  if code == FC_UNION { return true }
+  // (D802). A value-union field (code 16) does not either: `emitOptCoalesceBoxLeaf` takes it.
   sharedFieldCodeDispatchable(code)
 }
 
@@ -7178,17 +7205,7 @@ function optChainFieldCodeOk(code: i32): boolean {
 // default WIDENED to it — `?? 1` against an `i64` field is an `i32.const` unless somebody
 // says otherwise, and the `if`'s blocktype is `i64`: invalid wasm. Same three coercions
 // `emitUnionCoerce`'s ladder performs for the same reason, and for the same three codes.
-function emitOptChainDefault(
-  body: u8[],
-  dIx: i32,
-  code: i32,
-  unionName: string,
-  fnIx: i32,
-) {
-  // A value-union field: the block type is the BOX, so the default has to arrive as one —
-  // `emitUnionCoerce` is the same ladder every other `??`-into-a-box arm uses, and it passes
-  // a value that already IS the box through unchanged. D803.
-  if code == FC_UNION { return emitUnionCoerce(body, unionName, dIx, fnIx) }
+function emitOptChainDefault(body: u8[], dIx: i32, code: i32, fnIx: i32) {
   if code == FC_F64 { return emitExprAsF64(body, dIx, fnIx) }
   if code == FC_I64 { return emitExprAsI64(body, dIx, fnIx) }
   if code == FC_F32 {
@@ -7204,13 +7221,6 @@ function emitOptChainDefault(
 // Emit the `if` whose result is the shared field's rep. Only called for a code
 // `sharedFieldCodeDispatchable` admitted, so it has no failure arm of its own.
 function fbIfForSharedField(code: i32) {
-  // The value-union BOX. `sharedFieldCodeDispatchable` still declines code 16, so the
-  // shared-union-field dispatch never asks for this spelling; the `?.` … `??` arm does
-  // (`optChainFieldCodeOk` admits it), and putting the blocktype here rather than at that
-  // site keeps ONE speller for "the `if` result is this field's rep".
-  if code == FC_UNION {
-    return fbIfRef(uBoxIdx) // (ref $uBox)
-  }
   if code == FC_F64 {
     return fbIf(124) // f64
   }
@@ -31165,6 +31175,53 @@ function emitCoalesceBoxRuntime(
   0
 }
 
+// `r?.f ?? d` over a value-box field, which can itself hold `null`: one test covers a null
+// link and a null field, and the present arm reads the box at the `??`'s own rep — the
+// unboxed scalar, or the box of a union result (D3457).
+function emitOptCoalesceBoxLeaf(
+  body: u8[],
+  e: BinExpr,
+  lhs: OptMember,
+  heap: i32,
+  fi: i32,
+  exprIx: i32,
+  fnIx: i32,
+) {
+  const lhsIx = unwrapParen(e.binLeft)
+  let bNm = ""
+  if exprUnion(exprIx, fnIx) { bNm = unionNameOfExpr(exprIx, fnIx) }
+  // A link `emitCoalesceGo` re-associated out of a chain carries no type of its own; its
+  // result is then the leaf's `T | null` with the null removed.
+  let rTy = nodeTyIxOf(exprIx)
+  if rTy < 0 { rTy = tyPeelNul(nodeTyIxOf(lhsIx)) }
+  const bk = valueAtomKind(tyToEmitName(rTy))
+  const bVt = nulBoxScalarValtype(bk)
+  const bVb = vbHeapIdxOfKind(bk)
+  if bNm == "" && (bVt < 0 || bVb < 0) {
+    return emitFail(
+      "emitProgram: `?.` … `??` over a nullable value-box field has no rep for its result",
+    )
+  }
+  if emitOptChainIsNull(body, lhsIx, fnIx) < 0 { return -1 }
+  if bNm == "" {
+    fbIf(bVt)
+    if emitCoalesceScalarDefault(body, e.binRight, bk, fnIx) < 0 { return -1 }
+  } else {
+    fbIfRef(uBoxIdx)
+    if emitUnionBoxArg(body, bNm, e.binRight, fnIx) < 0 { return -1 }
+  }
+  fbElse()
+  if emitOptChainValue(body, lhs.omObj, fnIx) < 0 { return -1 }
+  fbStructGet(heap, fi)
+  if bNm == "" {
+    fbStructGet(uBoxIdx, 1) // field 1: the payload anyref
+    fbRefCast(bVb)
+    fbStructGet(bVb, 0)
+  }
+  fbEnd()
+  0
+}
+
 function emitCoalesceGo(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
   // Unwrap a parenthesized lhs so `(m[k]) ?? d` / `(m.get(k)) ?? d` take the same fused
   // map-get path as the bare forms — parens must not change `??` semantics. `lhsIx` is the
@@ -31955,30 +32012,30 @@ function emitCoalesceGo(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
           fbEnd()
           return 0
         }
+        if nfCode == FC_UNION {
+          return emitOptCoalesceBoxLeaf(
+            body,
+            e,
+            lhs,
+            sHeapIdx[nsi],
+            nfi,
+            exprIx,
+            fnIx,
+          )
+        }
         if !optChainFieldCodeOk(nfCode) {
           return emitFail(
             "emitProgram: `?.` over a nullable struct has no `if` blocktype for this field's rep",
           )
         }
         if emitOptRecvBase(body, lhs.omObj, fnIx, false) < 0 { return -1 }
-        wU8(209) // 0xd1 ref.is_null
+        wU8(209)                   // 0xd1 ref.is_null
         fbIfForSharedField(nfCode) // if (result <the field's own rep>)
-        if (
-          emitOptChainDefault(
-            body,
-            e.binRight,
-            nfCode,
-            sFieldElemNameAt(nsi, nfi),
-            fnIx,
-          )
-          < 0
-        ) {
-          return -1
-        }
-        fbElse() // 0x05 else — present → the field
+        if emitOptChainDefault(body, e.binRight, nfCode, fnIx) < 0 { return -1 }
+        fbElse()                   // 0x05 else — present → the field
         if emitOptRecvBase(body, lhs.omObj, fnIx, true) < 0 { return -1 }
         fbStructGet(sHeapIdx[nsi], nfi)
-        fbEnd()  // 0x0b end
+        fbEnd()                    // 0x0b end
         return 0
       }
     }
