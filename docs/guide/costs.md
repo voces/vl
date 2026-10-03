@@ -175,10 +175,12 @@ enough that one slot per id wastes memory, or when you need insertion order.
 
 ## Running a whole program as one call
 
-V8 compiles wasm per function and tiers up per function: a call that is already running stays
-in the baseline tier (Liftoff). A program shaped as one big export (a bake, a build tool) runs
-its first long call there. A consumer measured the first call of one hot function at 1.3 s
-against 0.48 s afterwards, and 0.52 s with `--v8-flags=--no-liftoff`, which is the workaround.
+When a VL module runs under a V8 embedder (Deno, Node or a browser; the `vl` host itself uses
+wasmtime and is not affected), V8 compiles wasm per function and tiers up per function: a call
+that is already running stays in the baseline tier (Liftoff). A program shaped as one big export
+(a bake, a build tool) runs its first long call there. A consumer measured the first call of one
+hot function at 1.3 s against 0.48 s afterwards, and 0.52 s with V8's `--no-liftoff` (Deno:
+`--v8-flags=--no-liftoff`), which is one workaround.
 Most programs call their hot functions many times and barely notice.
 
 ## Memory across passes
