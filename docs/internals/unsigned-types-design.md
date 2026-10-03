@@ -55,6 +55,10 @@ still lie, because its i32 rep has values outside 0..65535.
 | `ltU` `gtU` `leU` `geU` | compiler intrinsic | `lt_u` 0x49 … `ge_u` 0x4f | 0x54 … 0x5a |
 | `a >>> b` | operator | `i32.shr_u` 0x76 | `i64.shr_u` 0x88 |
 | `__trunc_sat_f64_u_i32__` and the three siblings | raw-floor intrinsic | `i32.trunc_sat_f64_u` | `i64.trunc_sat_*_u` |
+| `__load_u8__`, `__load_u16__` | raw-floor memory intrinsic | `i32.load8_u`, `i32.load16_u` (zero-extending) | — |
+| `__load_u8_i64__`, `__load_u16_i64__`, `__load_u32_i64__` | raw-floor memory intrinsic | — | `i64.load8_u`, `i64.load16_u`, `i64.load32_u` (a u32 in memory read straight into an `i64`) |
+| `__extend_low_i32x4_u__` | SIMD intrinsic (`v128`) | — | `i64x2.extend_low_i32x4_u` (u32 → i64, two lanes) |
+| `__convert_i32x4_u__`, `__convert_low_i32x4_u__` | SIMD intrinsic (`v128`) | `f32x4.convert_i32x4_u` (u32 → f32) | `f64x2.convert_low_i32x4_u` (u32 → f64) |
 
 The intrinsics are not in `std/`. They are bare-name, shadowable compiler intrinsics: the
 checker's arm is `numIntrCallTy` in `typecheck.vl`, and the opcode tables are
@@ -65,8 +69,14 @@ from the operands (`i64` when either operand is `i64`) and return the operand wi
 `rem_s`, `<` is `lt_s`, `>>` is `shr_s`, `as f64` is `convert_*_s`, and `i32 → i64` widening is
 `extend_i32_s`.
 
-No unsigned conversion is reachable from source except through the dunder `trunc_sat`
-intrinsics. There is no `f64.convert_i32_u`, no `i64.extend_i32_u` and no unsigned print.
+So unsigned *conversions* do exist, but only at the raw floor: a zero-extending load from
+linear memory, a saturating float truncation, or a SIMD lane operation over a `v128`. What a
+SCALAR value in a local cannot reach is any of `i64.extend_i32_u`, `f64.convert_i32_u`,
+`f32.convert_i32_u` or `f64.convert_i64_u`, and there is no unsigned print. A program holding a
+u32 in an `i32` local therefore widens it with `(x as i64) & 0xFFFFFFFF` (1.3), or stores it and
+reloads it with `__load_u32_i64__`. The load and SIMD routes were probed during review of this document; this revision re-ran three
+loads on the 2026-10-03 seed: after `__store_i32__(64, -1)`, `__load_u32_i64__(64)` prints
+4294967295, `__load_u16_i64__(64)` prints 65535 and `__load_u8__(64)` prints 255.
 
 ### 1.3 How a program spells an unsigned quantity today
 
@@ -80,7 +90,7 @@ print(remU(a, 7))                 // 3
 print(a >>> 28)                   // 15
 let x = -1
 print((x as i64) & 0xFFFFFFFF)    // 4294967295   — widen first, then mask
-print(x as f64)                   // -1           — no unsigned convert exists
+print(x as f64)                   // -1           — no scalar unsigned convert
 const big: i64 = 0xFFFFFFFFFFFFFFFF
 print(big)                        // -1, and no spelling prints 18446744073709551615
 print(divU(big, 10))              // 1844674407370955161
@@ -99,7 +109,13 @@ does not need to carry."* Two things have changed since it was written:
 
 1. **The radix ruling (2026-09-30) moved signedness into the use.** A hex literal is a bit pattern
    at its use's width under every operator, so `0xFFFFFFFF % 7` is `-1`. The unsigned reading
-   must be spelled `remU`. The bit pattern is the same, but the program now has to choose the
+   must be spelled `remU`. `DECISIONS.md` §"Exact constant arithmetic" (around line 9082) records
+   it as *"an unsigned reading is spelled `divU`, `remU`, `ltU` or `>>>`"*, and the owner's ruling
+   gave the reason as *"mirroring Wasm's `_s`/`_u` instruction pairs (Wasm has no u32/u64
+   types)"*. **This proposal amends that sentence rather than contradicting it:** it stays true
+   for every `i32`/`i64` use, and gains a second clause — at a `u32`/`u64` use, the plain
+   operators are the unsigned reading. If adopted, the DECISIONS.md entry is edited to say so in
+   the same PR as the type. The bit pattern is the same, but the program now has to choose the
    instruction at every operation instead of once, at the declaration. Section 4 counts how
    often consumers make that choice.
 2. **"Every rep table" is mostly avoidable.** If `u32` shares `i32`'s valtype and rep, the rep
@@ -115,10 +131,10 @@ keeps `divU` and its siblings.
 | | Rust | Go | Zig | C# | Swift | Kotlin | AssemblyScript |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | unsigned types | `u8`…`u128`, `usize` | `uint8`…`uint64`, `uint` | `u0`…`u65535` | `byte` `ushort` `uint` `ulong` | `UInt8`…`UInt64`, `UInt` | `UByte` `UShort` `UInt` `ULong` (value classes over the signed ones) | `u8` `u16` `u32` `u64` `usize` |
-| implicit conversions | none, not even widening | none | lossless widening only (`u32 → i64` yes, `i32 → u32` no) | lossless widening (`uint → long`/`ulong`; `int → uint` no) | none | none | where *"the full range … can be represented in the target"* (`u32 → i64/u64` yes) |
+| implicit conversions | none, not even widening | none | lossless widening only (`u32 → i64` yes, `i32 → u32` no) | lossless widening (`uint → long`/`ulong`; `int → uint` no) | none | none *"where the full range of possible values can be represented in the target type, regardless of interpretation/signedness"*: so `i32 ↔ u32` and `i64 ↔ u64` are implicit (a reinterpretation), as are `i32/u32 → f32` and `i64/u64 → f64`, which round |
 | explicit conversion | `as` wraps or truncates; `TryFrom` checks | `T(x)` wraps or truncates | `@intCast` checks, `@truncate`, `@bitCast` | cast; checked or unchecked context | `UInt32(x)` traps; `truncatingIfNeeded:`, `bitPattern:` | `.toUInt()` reinterprets | `<u32>x` |
 | literal typing | inferred from context; out of range is a deny-by-default error | untyped constant, exact; error if it does not fit | `comptime_int` coerces if it fits | first of `int`, `uint`, `long`, `ulong` that fits; `0xFFFFFFFF` is `uint` | inferred from context; error if it does not fit | needs a `u` suffix (`42u`, `0xFFFFFFFFu`) | contextual |
-| mixed `int` + `uint` | error | error | error (no peer type) | promoted to `long`; `ulong` + signed is an error | error | error (no operator) | arithmetic not documented; a relational compare needs the same signedness |
+| mixed `int` + `uint` | error | error | error (no peer type) | promoted to `long`; `ulong` + signed is an error | error | error (no operator) follows from the assignability rule: the same-width operand converts implicitly, so it compiles (the types page documents no separate rule for arithmetic); a relational compare is the exception and needs the same signedness, while `==`/`!=` need not |
 | overflow | panics in debug, wraps in release; `wrapping_*`, `checked_*` | wraps | illegal behaviour (panics in safe modes); `+%` wraps | wraps unless in a `checked` context | traps; `&+` wraps | wraps | wraps |
 | shift count | any integer type | any integer type, panics if negative | log2-width unsigned type | `int` | any `BinaryInteger` | `Int` | operand type |
 
@@ -132,9 +148,12 @@ Two shapes emerge:
 
 VL already sits in Zig's position. `numWidensName` allows only lossless edges (`i32 → i64`,
 `i32 → f64`, `f32 → f64`), and a mixed operator pair is legal only when one side widens to the
-other (`mixesNumeric`). AssemblyScript is the only one on VL's substrate. It confirms that the
-signedness-on-the-type, valtype-shared rep is how a wasm-native language does this, and its
-compare rule needs the same signedness, for the reason section 2.7 gives.
+other (`mixesNumeric`). AssemblyScript is the only one on VL's substrate. Its rep is the same
+one proposed here (signedness on the type, valtype shared), but its conversion rule is the
+opposite of VL's: "the full range … regardless of interpretation/signedness" counts BITS, not
+values, so `-1` passes into a `u32` as 4294967295 and an `i64` into an `f64` rounds, both with no
+cast. That is the option section 2.1 rejects as (c). Its one signedness-strict rule is the
+relational compare, for the reason section 2.7 gives.
 
 ---
 
@@ -144,7 +163,8 @@ Each decision lists its alternatives and a recommendation. The question form is 
 
 ### 2.1 Conversions: implicit only where lossless, `as` otherwise
 
-Add four edges to the widening lattice, each exact:
+Add three edges to the widening lattice, each exact, plus one adaptation rule for `u8` reads
+(2.9), which is not a lattice edge because a `u8` is never a value:
 
 | from | to | instruction |
 | --- | --- | --- |
@@ -161,8 +181,9 @@ Every other pair is an explicit `as`, under the existing family:
   it keeps the low 32 bits.
 
 **Alternatives.** (b) Rust/Swift: no implicit conversions at all. That would contradict VL's
-existing `i32 → i64` edge. (c) AssemblyScript-style implicit conversion between same-width types
-(`i32 ↔ u32`). That silently reinterprets, which is the kind of conversion the owner's
+existing `i32 → i64` edge. (c) AssemblyScript's rule: any conversion whose target has as many bits, "regardless of
+interpretation/signedness", is implicit. That makes `i32 ↔ u32` a silent reinterpretation and
+`i32 → f32` / `i64 → f64` a silent rounding, which are the kinds of conversion the owner's
 "no silent loss" rulings reject.
 
 **Recommendation: (a).** It is the existing lattice extended by its own rule.
@@ -296,7 +317,7 @@ example `unsigned-compare-zero`, would catch them, as rustc's `unused_comparison
   `i32.trunc_f64_u`. `as%` from a float stays refused (owner ruling: `as%` is integers only). The
   existing `__trunc_sat_*_u_*__` intrinsics already cover saturation, and their results could be
   typed `u32`/`u64` instead of `i32`/`i64`. That is a signature change, and it is left to the
-  owner (section 5, U8).
+  owner (section 5, U10).
 
 ### 2.9 Widening into `i64`/`u64`, and `u8` elements
 
@@ -348,7 +369,7 @@ break every caller.
 | module | change | why |
 | --- | --- | --- |
 | `std:fmt` | `toString` domain gains `u32 \| u64`; new `parseU32` and `parseU64` | 2.6 |
-| `std:bytes` | new `u32le`, `u32be`, `u64le`, `u64be` | the guide's "why there is no `u32le`" answer stops being true; glean's 216 widen-then-mask sites (section 4) are this function |
+| `std:bytes` | new `u32le`, `u32be`, `u64le`, `u64be` | the guide's "why there is no `u32le`" answer stops being true; glean's 231 widen-then-mask sites (section 4) are this function |
 | `std:buffer` | possibly `loadU32` and `loadU64` | `loadU8`/`loadU16` already exist and return `i32`; the reviewer should weigh whether a `U32` twin is duplication |
 | `std:math` | none now; the filed checked and saturating helpers grow unsigned forms | 2.5 |
 
@@ -418,7 +439,7 @@ the caller picks between the twins using the operand's signedness.
 
 | function | callers | change |
 | --- | ---: | --- |
-| `numWidensName` (the lattice) | 4 | three new edges (2.1) |
+| `numWidensName` (the lattice) | 4 | three new edges (2.1); the `u8` read adaptation (2.9) lives at the element read, not here |
 | `numWidens` | 10 | none; it reads the lattice |
 | `mixesNumeric` / `widerNumeric` / `sameNumeric` | 6 / 4 / — | none; 2.3 falls out |
 | `isNumeric` (`i32 i64 f32 f64` hard-listed) | 18 | add two names |
@@ -502,18 +523,24 @@ refusal is a clause-2 debt, recorded as such, and is not to be left as a silent 
 
 These are counts of `.vl` source on 2026-10-03, read-only, from a throwaway regex counter (not
 committed): `\bdivU\s*\(`, `\bremU\s*\(`, `\b(ltU|leU|gtU|geU)\s*\(`, `>>>` not followed by `=`,
-`&\s*0x[fF]{8}\b`, and `as\s+i64\s*\)\s*&\s*0x[fF]{8}\b`. Comments are not excluded. `& 0xFFFFFFFF` is any 32-bit all-ones
-mask, in either case. "Widen-then-mask" is `(… as i64) & 0xFFFFFFFF`.
+`&\s*0x[fF]{8}\b` (a hex 32-bit all-ones mask), `&\s*4294967295\b` (the same mask in decimal),
+and for widen-then-mask, `as\s+i64\s*\)\s*&\s*<mask>` with either spelling of the mask.
+Comments are not excluded.
 
-| consumer | files | lines | `divU` | `remU` | `ltU`/`leU`/`gtU`/`geU` | `>>>` | `& 0xFFFFFFFF` | widen-then-mask |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| glean (`~/glean`) | 319 | 22,927 | 0 | 0 | 0 | 242 | 297 | **216** (119 lines, 102 files) |
-| plumb `src/` (hand-written) | 79 | 43,246 | 4 | 4 | 15 | 319 | 14 | 1 |
-| plumb `tools/` | 80 | 24,794 | 0 | 2 | 0 | 301 | 1 | 1 |
-| plumb `vl-probes/synth/s1.vl` (one generated unit) | 1 | — | — | — | 809 | — | 822 | — |
-| sunpa (`~/sunpa`) | 15 | 4,741 | 0 | 0 | 0 | 15 | 0 | 0 |
-| veldt `spike/` | 2 | 201 | 0 | 0 | 0 | 0 | 0 | 0 |
-| sunsuz, webcraft `docs`/`backlog` | 0 `.vl` | | | | | | | |
+| consumer | files | lines | `divU` | `remU` | `ltU`/`leU`/`gtU`/`geU` | `>>>` | hex mask | decimal mask | widen-then-mask (hex + decimal) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| glean (`~/glean`) | 319 | 22,927 | 0 | 0 | 0 | 242 | 297 | 17 | **231** (216 + 15) |
+| plumb `src/` (hand-written) | 79 | 43,246 | 4 | 4 | 15 | 319 | 14 | **152** | 1 + 0 |
+| plumb `tools/` | 80 | 24,794 | 0 | 2 | 0 | 301 | 1 | 3 | 1 + 0 |
+| plumb `vl-probes/synth/s1.vl` (one generated unit) | 1 | — | — | — | 809 | — | 822 | — | — |
+| sunpa (`~/sunpa`) | 15 | 4,741 | 0 | 0 | 0 | 15 | 0 | 1 | 0 + 1 (`unsigned`, below) |
+| veldt `spike/` | 2 | 201 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| sunsuz, webcraft `docs`/`backlog` | 0 `.vl` | | | | | | | | |
+
+glean's other 2 decimal masks are the same idiom without parentheses
+(`nextU32(r) as i64 & 4294967295`, in `src/rng.vl:138` and `tools/sloc-solve.vl:44`), so every
+decimal mask in glean is a widen-then-mask. Note also the helper's name: `nextU32` returns an
+`i32`.
 
 The plumb `vl-probes/synth/` scaling probes (s200, s1000, s4000) are replicated copies of the
 generator's output: 209,481 `ltU` and 208,811 masks in total. The table quotes one unit, because
@@ -521,8 +548,8 @@ the replicas measure size, not usage.
 
 What the counts show:
 
-* **glean has the strongest case for `u32`.** 216 widen-then-mask sites. Most are one helper,
-  copied between tools:
+* **glean has the strongest case for `u32`.** 231 parenthesised widen-then-mask sites (233 with
+  the two unparenthesised ones). Most are one helper, copied between tools:
   `function le64(b, o) { ((le32(b,o) as i64) & 0xffffffff) | (((le32(b,o+4) as i64) & 0xffffffff) << 32) }`.
   Getting the order wrong is the silent bug that `bytes.md` describes. With `u32` and a
   `u32le`, the helper becomes `(b.u32le(o) as u64) | ((b.u32le(o + 4) as u64) << 32)`, with
@@ -531,13 +558,20 @@ What the counts show:
   (`src/pdb.vl`, `src/dxbc.vl`, `src/avi.vl`, `tools/dxbc-survey.vl`, `tools/pdb-dump.vl`), all
   returning `i32`, with 203 `u32(` call sites. Its 304 `u32` mentions in `src/` are mostly field
   comments (`// u32: nonzero = …`). The *generated* code uses `ltU`/`leU` for 64-bit x86 carry
-  and compare (`emit.vl:2680`: `if s == 8 { "ltU(" … }`), and masks `& 0xffffffff` to model
-  32-bit sub-register writes into `i64` slots. A `u32` type would not remove those masks. They
-  are x86 semantics, not a VL workaround, and they are the reason 2.10 keeps the intrinsics.
-* **sunpa writes hashes and a CRC.** All 15 `>>>` uses are in hash mixing (`v ^ (v >>> 15)`) and a
-  CRC-32 table, which spells its polynomial `0xEDB88320` as the decimal `-306674912`. Under the
-  radix ruling it can already write the hex. A `u32` hash would also make `(h >>> 8) as f64` a
-  plain `h as f64`.
+  and compare (`emit.vl:2680`: `if s == 8 { "ltU(" … }`), and masks with `& 0xffffffff` and
+  `& 4294967295` to model 32-bit sub-register writes into `i64` slots. A `u32` type would not
+  remove those masks. They are x86 semantics, not a VL workaround, and they are the reason 2.10
+  keeps the intrinsics.
+* **sunpa has written the `u32 → f64` edge by hand.** `src/worldgen/noise.vl:14`:
+  `function unsigned(x: i32): f64 { ((x as i64) & 4294967295) as f64 }` — "an i32's bits read as
+  an unsigned 32-bit integer" — which its mulberry32 `rand()` divides by 2^32. That function is
+  exactly the implicit `u32 → f64` edge of 2.1 (`f64.convert_i32_u`), spelled as a widen, a mask
+  and a convert. Its 15 `>>>` sites split three ways: 9 are hash mixing (`world.vl:35-36,41`,
+  `decor.vl:18-20`, `noise.vl:19-21`), 3 are the CRC-32 table and update (`png.vl:13` twice,
+  `png.vl:22`, whose polynomial `0xEDB88320` is spelled as the decimal `-306674912`), and 3 are
+  big-endian byte stores (`png.vl:73-75`, `store8(b, off, v >>> 24)` and so on), where `>>` would
+  do equally well because `store8` keeps the low byte. `world.vl:41`'s `(hash2(…) >>> 8) as f64`
+  is the same unsigned-to-float conversion in another form.
 * **No consumer has filed an ask for a `u32` type.** Searching the issue logs (glean's and
   plumb's `vl-issues.md`, sunpa's docs, veldt's `vl-notes.md`) for "unsigned", `u32` and `u64`
   finds only field descriptions. The demand is in the idioms, not in the asks.
@@ -551,7 +585,9 @@ intrinsic calls. None of it would have to change.
 ## 5. Open questions for the owner
 
 One question per decision, in the order to ask them. Each has a sample per option and a
-recommendation. U1 is the gate: if the answer is "no type", the rest do not arise.
+recommendation. U1 is the gate: if the answer is "no type", the rest do not arise. Mapping to
+section 2: U2 is 2.1, U3 is 2.2, U4 is 2.3, U5 is 2.4, U6 and U7 are 2.5, U8 is 2.6, U9 is 2.7,
+U10 is 2.8, U11 is 2.9, U12 is 2.10, U13 is 2.11 and U14 is 2.12.
 
 ### U1. Add `u32` and `u64` as value types?
 
@@ -566,8 +602,8 @@ print(divU(n, 2))       // 2147483647
 ```
 
 **Recommendation: (a).** u32/u64 do not break the 2026-08-22 "no small value types" rule
-(1.1). glean's 216 widen-then-mask sites are the bug class this removes, and (b) stays
-available alongside it (U10).
+(1.1). glean's 231 widen-then-mask sites are the bug class this removes, and (b) stays
+available alongside it (U12).
 
 ### U2. Implicit conversions: only the lossless ones?
 
@@ -579,11 +615,13 @@ function g(i: i32): u32 { i }          // error — write `i as u32` or `i as% u
 // (b) nothing implicit (Rust / Swift)
 function f(u: u32): i64 { u as i64 }   // required
 
-// (c) same-width implicit (AssemblyScript-style)
+// (c) AssemblyScript: any target with as many bits, "regardless of interpretation/signedness"
 function g(i: i32): u32 { i }          // ok — -1 becomes 4294967295 silently
+function h(x: i64): f64 { x }          // ok — rounds silently
 ```
 
-**Recommendation: (a).** It is the existing `i32 → i64` rule with three more edges.
+**Recommendation: (a).** It is the existing lattice with three more edges (`u32 → i64`,
+`u32 → u64`, `u32 → f64`).
 
 ### U3. With no context, what is `0xDEADBEEF`?
 
@@ -618,45 +656,68 @@ lattice.
 ### U5. Does `u32` join numeric unions like every other number?
 
 ```vl
+// (a) a union, as the numeric-join ruling does for i32 and f64
 function pick(c: boolean, u: u32, i: i32) { if c { u } else { i } }
-const r = pick(true, 7, 9)
+const r = pick(true, 7, 9)             // r: i32 | u32
+print(r is u32)                        // true
+const w: i64 = r                       // ok — every member widens to i64 exactly
 
-// (a) r: i32 | u32 — `r is u32` works; into i64 converts exactly
-// (b) r: i64 — the widest exact type; `r is i32` and `r is u32` both false
+// (b) join to the widest exact type
+function pick(c: boolean, u: u32, i: i32) { if c { u } else { i } }
+const r = pick(true, 7, 9)             // r: i64
+print(r is u32)                        // error — r is not a union
+const w: i64 = r                       // ok
 ```
 
 **Recommendation: (a).** This is the numeric-join ruling with two more members. It needs new box
 tags (3.3).
 
-### U6. Overflow, and unary minus?
+### U6. Overflow?
 
 ```vl
 const u: u32 = 0
-// (a) wrap; unary minus refused
+// (a) wrap, as i32 and i64 do
 print(u - 1)       // 4294967295
--u                 // error — write `0 - u`
-// (b) wrap; unary minus allowed (Go)
--u                 // 0
-// (c) trap on overflow (Swift)
+// (b) trap (Swift)
 print(u - 1)       // trap
+// (c) trap in a debug build, wrap in release (Rust)
+print(u - 1)       // trap under a debug build, 4294967295 under -O
 ```
 
 **Recommendation: (a).** Wrap matches the standing ruling for `i32`/`i64`.
 
-### U7. How does `print` render a `u64`?
+### U7. Unary minus on an unsigned operand?
+
+```vl
+const u: u32 = 5
+// (a) refused (Rust)
+print(-u)          // error — write `0 - u`, which wraps
+// (b) allowed, wrapping (Go)
+print(-u)          // 4294967291
+```
+
+**Recommendation: (a).** A negated unsigned value is nearly always a mistake, and the deliberate
+spelling is one token longer.
+
+### U8. How does `print` render a `u64`?
 
 ```vl
 const m: u64 = 0xFFFFFFFFFFFFFFFF
-print(m)           // all three print 18446744073709551615
-// (a) a new host import __print_u64__ (native host, JS runtime and playground change)
-// (b) an emitted digit-split helper over the existing imports
-// (c) lowered to print(toString(m)) through std:fmt
+print(m)           // every option prints 18446744073709551615; they differ in the lowering
+
+// (a) a new host import — the emitted call:
+//       __print_u64__(m)            (the native host, JS runtime and playground each add it)
+// (b) an emitted helper over the existing imports — the emitted shape:
+//       if m >= 0 as i64 { __print_i64__(m) }
+//       else { /* divU(m, 10) then the last digit, through the print stream */ }
+// (c) lowered through std:fmt — the emitted shape:
+//       print(toString(m))          (toString's domain gains u32 | u64, see U14)
 ```
 
 **Recommendation: (c).** It needs no host ABI change and reuses one rendering path. `u32`
 needs none of this: it extends into `__print_i64__`.
 
-### U8. Unsigned comparisons, and the saturating intrinsics' types?
+### U9. Comparisons between signed and unsigned operands?
 
 ```vl
 // (a) same signedness or a literal; u < 0 gets a warning lint
@@ -668,13 +729,24 @@ u >= 0             // warning: always true
 u < i              // compares as i64: false when i is negative
 ```
 
-Sub-question: should `__trunc_sat_f64_u_i32__` and its siblings return `u32`/`u64` instead of
-`i32`/`i64`? That changes an existing intrinsic's signature.
+**Recommendation: (a), with the lint.** It is U4's rule, and AssemblyScript's for relational
+compares.
 
-**Recommendation: (a), and leave the intrinsic signatures alone.** A `u32` result can be had with
-`as% u32`.
+### U10. Should the saturating truncations return unsigned types?
 
-### U9. May a `u8[]` element deliver into `u32` without a cast?
+```vl
+const f = 3.0e9
+// (a) unchanged: the _u intrinsics keep their i32/i64 results
+const a = __trunc_sat_f64_u_i32__(f)   // a: i32, prints -1294967296
+const b = a as% u32                    // 3000000000
+// (b) retyped: the _u intrinsics return u32/u64
+const a = __trunc_sat_f64_u_i32__(f)   // a: u32, prints 3000000000
+```
+
+**Recommendation: (a).** (b) changes an existing intrinsic's signature, and any current caller
+that combines the result with an `i32` would then be refused under U4.
+
+### U11. May a `u8[]` element deliver into `u32` without a cast?
 
 ```vl
 const b: u8[] = [200]
@@ -686,20 +758,26 @@ let w: u32 = b[0] as u32
 
 **Recommendation: (a).** The value is 0..255 by construction.
 
-### U10. What happens to `divU`, `remU`, `ltU`/`leU`/`gtU`/`geU`?
+### U12. What happens to `divU`, `remU`, `ltU`/`leU`/`gtU`/`geU`?
 
 ```vl
 // (a) keep them; on an unsigned operand an info lint suggests the operator
 divU(i, 3)          // i: i32 — unchanged
 divU(u, 3)          // u: u32 — hint: this is `u / 3`
-// (b) deprecate them — plumb's generator emits ~800 per unit
-// (c) retype them to take or return u32/u64 — breaks every current call
+
+// (b) deprecate them
+divU(i, 3)          // warning: deprecated — write `(i as% u32) / 3`
+                    // plumb's generator emits ~800 such calls per unit
+
+// (c) retype them over the unsigned types
+divU(i, 3)          // error: divU takes u32 — every current call breaks
+divU(u, 3)          // ok
 ```
 
 **Recommendation: (a).** They are the right tool for an `i64` that carries both readings, which
 is plumb's register model.
 
-### U11. `u16`, `i8` and `i16`?
+### U13. `u16`, `i8` and `i16`?
 
 ```vl
 // (a) out of scope: still flat-field widths only
@@ -712,16 +790,19 @@ let x: u16 = 5                 // the rep would hold 70000 after `x * 14000`
 **Recommendation: (a).** (b) is exactly the "lying" value type the 2026-08-22 ruling refused.
 Packed `u16[]`/`i16[]` arrays are a separate storage-only proposal.
 
-### U12. Which std additions, through std-api-review?
+### U14. Which std additions, through std-api-review?
 
 ```vl
+// (a) add them in phase 3, each through std-api-review
 import { u32le, u64le } from "std:bytes"     // new
 import { parseU32, parseU64 } from "std:fmt" // new
 print("\{u}")                                // toString's domain gains u32 | u64
+
+// (b) leave std untouched until a consumer files an ask
+const w = (b.i32le(0) as i64) & 0xFFFFFFFF   // the glean idiom stays the spelling
+print("\{u}")                                // error: toString takes i32 | i64 | boolean | f64
 ```
 
-Option (b) is to leave std untouched until a consumer files an ask.
-
-**Recommendation: `std:fmt` in phase 3 (interpolation needs it), and `std:bytes` with it.** This
-is the glean helper, and its absence is currently a documented rule. `std:buffer`'s `loadU32` is
-the reviewer's call, given that `loadU16` already returns an `i32`.
+**Recommendation: (a), `std:fmt` and `std:bytes` together.** Interpolation needs `std:fmt`, and
+`std:bytes` is the glean helper, whose absence is currently a documented rule. `std:buffer`'s
+`loadU32` is the reviewer's call, given that `loadU16` already returns an `i32`.
