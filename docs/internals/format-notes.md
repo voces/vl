@@ -385,3 +385,15 @@ the corpus and `tests/cases/objects/method-shorthand.vl` and `-equiv.vl` have ca
 arrow spelling — with comments still describing a shorthand — ever since. So the shorthand is
 pinned where a formatter cannot reach it: `tests/vl_fmt_test.ts` reads its text, asserts the
 canonicalisation, and proves the two spellings agree on output and on bytes.
+
+## object FIELD shorthand is kept as written (D3478)
+
+Unlike the method shorthand above, a field `{ seq }` is not canonicalised: it prints as `seq`,
+and a written `seq: seq` prints as `seq: seq`. The parser desugars both to a `FieldInit` whose
+value is an `Ident`; the shorthand's `Ident` carries the KEY's position (`parseObjLit` mints it
+at `fp0`), which a written value after a `:` never can, so `fieldIsShorthand` reads the spelling
+off that and nothing is added to the arena. Until D3478 the printer expanded every shorthand,
+which is why the tree held none: the whole-tree A/B of this change moved zero files. The
+rationale and the one-line-when-it-fits layout are in `DECISIONS.md`; the round trip (shorthand
+in a body position, nested, beside a comment, with a trailing comma) is pinned in
+`tests/vl_fmt_test.ts` and `tests/cases/objects/field-shorthand-kept.vl`.

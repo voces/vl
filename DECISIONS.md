@@ -9419,3 +9419,31 @@ a hole's read of the same kind keeps the `-1` niche (`coalMapReadNulAtomTexts`),
 had spelled the sentinel as a member. The pin-nullable default is asked only there: widening
 `coalesceDefaultNullable` itself broke three `d3127-coal-price` chains. Two `<T>` cells moved
 from a refusal to D3398's wrong value, recorded as the named set `mh-two-instance-price`.
+
+## `vl fmt` keeps a field written as shorthand, and an object literal is one line when it fits (2026-10-03) — D3478, sunpa SP-004
+
+**A field prints the way it was written.** `{ seq }` stays `seq` and `{ seq: seq }` stays
+`seq: seq`; the formatter converts neither way. Shorthand is a supported spelling, and a
+formatter that rewrites it means a file only ever holds the long form, and that every format
+moves text under the author's next scripted edit (sunpa lost two fields that way). It is the
+formatter's own standing rule, "never re-spell what the author wrote". Method shorthand
+`{ f() { … } }` is a separate, older decision and still canonicalises to the arrow field
+(`docs/internals/format-notes.md`).
+
+**Meaning cannot move, because the printer adds no braces and keeps an object's parens.** A
+one-field `{ id }` in a body position is a block, so an object there is written `({ id })`, and
+the `Paren` node keeps those parens. A shorthand object the parser read in a body position
+(`{ id, n }`, once #3332's rule is in) prints the same tokens, which re-parse the same way. The
+printer recognises a shorthand by its value sharing the key's source position, which a written
+`seq: seq` cannot. The fmt test proves the round trip by building the input and the output to
+byte-identical wasm.
+
+**Layout: one line whenever it fits.** An object literal takes the same `wrapList` rule as a
+call's arguments and a non-scalar array: one line if it fits in 80 columns from where it starts,
+else one field per line with a trailing comma. How the author wrapped it is not consulted, so a
+literal written over several lines that fits is joined, and one that does not is split. That is
+the rule calls and arrays already follow (an array of scalar literals keeps the author's uniform
+rows, which an object has no analogue of). The SP-004 split was not a layout rule: expanding the
+shorthand pushed the literal past the width. Keeping the author's line breaks was considered and
+not taken: it would make objects the one bracketed list whose layout is the author's, and a
+written break would then survive every later edit that shortened the literal.
