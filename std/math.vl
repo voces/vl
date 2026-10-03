@@ -1,13 +1,13 @@
 // `std:math` — deterministic angle and length math, computed in VL, equal on every host.
 //
-//     import { hypotF64, atan2F64, PI } from "std:math"
+//     import { sinF64, atan2F64, PI } from "std:math"
 //
 // Every result is a pure function of IEEE-754 arithmetic on the input bits (no host `Math`),
-// so the same `.wasm` prints the same number on Chrome, Node and wasmtime. f32 and f64 are
-// separate native functions, not one width cast to the other. Free functions, not methods:
-// neither coordinate is a receiver, so call `hypotF64(x, y)` directly. This slice covers
-// length and bearing only; `hypot` is the naive form and overflows inside the float range;
-// nothing beyond finite inputs is promised. Trig, exp and pow are later slices.
+// so the same `.wasm` prints the same bits on Chrome, Node and wasmtime. Each width has its
+// own function and its own bound, not the other width's result cast. Free functions like the
+// `sqrt` and `abs` they sit beside, not methods: call `sinF64(x)`. `hypot` is the naive form
+// and overflows inside the float range; `hypot` and `atan2` promise nothing for non-finite
+// inputs. exp and pow are later slices.
 
 // The nearest f64 to π, for angle math alongside `atan2F64`.
 export const PI: f64 = 3.141592653589793
@@ -86,4 +86,292 @@ export function atan2F32(y: f32, x: f32): f32 {
   if x < 0.0 { a = 3.141592653589793 - a }
   if y < 0.0 { a = -a }
   return a
+}
+
+// The bits of 2/π after the binary point, 64 per word, behind one word of zeros.
+const TWO_OVER_PI_BITS: i64[] = [
+  0x0000000000000000, 0xA2F9836E4E441529, 0xFC2757D1F534DDC0,
+  0xDB6295993C439041, 0xFE5163ABDEBBC561, 0xB7246E3A424DD2E0,
+  0x06492EEA09D1921C, 0xFE1DEB1CB129A73E, 0xE88235F52EBB4484,
+  0xE99C7026B45F7E41, 0x3991D639835339F4, 0x9C845F8BBDF9283B,
+  0x1FF897FFDE05980F, 0xEF2F118B5A0A6D1F, 0x6D367ECF27CB09B7,
+  0x4F463F669E5FEA2D, 0x7527BAC7EBE5F17B, 0x3D0739F78A5292EA,
+  0x6BFB5FB11F8D5D08, 0x56033046FC7B6BAB, 0xF0CFBC209AF4361D,
+]
+
+// The last `reducePio2` result, as the unevaluated sum redHi + redLo.
+let redHi: f64 = 0.0
+let redLo: f64 = 0.0
+
+// 64 bits of the 2/π table starting at bit `j` (0 = the first bit of word 0).
+function twoOverPiAt(j: i64): i64 {
+  const w = (j >>> 6) as! i32
+  const sh = j & 63
+  return (TWO_OVER_PI_BITS[w] << sh)
+    | ((TWO_OVER_PI_BITS[w + 1] >>> 1) >>> (63 - sh))
+}
+
+// 2^e for -1022 <= e <= 1023, exactly.
+function pow2F64(e: i64): f64 { return f64fromBits((e + 1023) << 52) }
+
+// Payne–Hanek: writes ax - q*π/2 to redHi/redLo for a finite ax >= 2^20*π/2; returns q mod 4.
+function reducePio2Large(ax: f64): i64 {
+  const M32: i64 = 0xFFFFFFFF
+  const bits = f64bits(ax)
+  const e = (bits >>> 52) - 1075
+  const m = (bits & 0xFFFFFFFFFFFFF) | 0x10000000000000
+  const j = e + 62
+  const w0 = twoOverPiAt(j)
+  const w1 = twoOverPiAt(j + 64)
+  const w2 = twoOverPiAt(j + 128)
+  const a5 = w0 >>> 32
+  const a4 = w0 & M32
+  const a3 = w1 >>> 32
+  const a2 = w1 & M32
+  const a1 = w2 >>> 32
+  const a0 = w2 & M32
+  const b1 = m >>> 32
+  const b0 = m & M32
+  const p00 = b0 * a0
+  const p01 = b0 * a1
+  const p02 = b0 * a2
+  const p03 = b0 * a3
+  const p04 = b0 * a4
+  const p05 = b0 * a5
+  const p10 = b1 * a0
+  const p11 = b1 * a1
+  const p12 = b1 * a2
+  const p13 = b1 * a3
+  const p14 = b1 * a4
+  // The low 192 bits of the product, one 32-bit column at a time.
+  const c0 = p00 & M32
+  const c1 = (p00 >>> 32) + (p01 & M32) + (p10 & M32)
+  const c2 = (p01 >>> 32)
+    + (p02 & M32)
+    + (p10 >>> 32)
+    + (p11 & M32)
+    + (c1 >>> 32)
+  const c3 = (p02 >>> 32)
+    + (p03 & M32)
+    + (p11 >>> 32)
+    + (p12 & M32)
+    + (c2 >>> 32)
+  const c4 = (p03 >>> 32)
+    + (p04 & M32)
+    + (p12 >>> 32)
+    + (p13 & M32)
+    + (c3 >>> 32)
+  const c5 = (p04 >>> 32)
+    + (p05 & M32)
+    + (p13 >>> 32)
+    + (p14 & M32)
+    + (c4 >>> 32)
+  // The top two bits are the quadrant; the 190 below them the fraction, kept << 2.
+  let hi = ((c5 & M32) << 32) | (c4 & M32)
+  let mid = ((c3 & M32) << 32) | (c2 & M32)
+  let lo = ((c1 & M32) << 32) | c0
+  let q = hi >>> 62
+  hi = (hi << 2) | (mid >>> 62)
+  mid = (mid << 2) | (lo >>> 62)
+  lo = lo << 2
+  // A fraction of a half or more rounds the quadrant up and leaves a negative remainder.
+  let neg = false
+  if hi < 0 {
+    neg = true
+    q = q + 1
+    lo = 0 - lo
+    let borrow: i64 = 1
+    if lo == 0 { borrow = 0 }
+    mid = (0 - mid) - borrow
+    if mid != 0 || borrow == 1 { borrow = 1 } else { borrow = 0 }
+    hi = (0 - hi) - borrow
+  }
+  // Normalise so the fraction's leading one is bit 63 of `hi`.
+  let scale: i64 = 0
+  if hi == 0 {
+    hi = mid
+    mid = lo
+    lo = 0
+    scale = 64
+  }
+  const k = clz(hi)
+  hi = (hi << k) | ((mid >>> 1) >>> (63 - k))
+  mid = (mid << k) | ((lo >>> 1) >>> (63 - k))
+  scale = scale + k
+  const top = ((hi >>> 11) as f64) * pow2F64(-53 - scale)
+  const rest = ((((hi & 0x7FF) << 52) | (mid >>> 12)) as f64)
+    * pow2F64(-116 - scale)
+  const fh = top + rest
+  const fl = rest - (fh - top)
+  // (fh + fl) * π/2 in double-double: π/2 = P1 + P2, P1 = bh + bl split in half, and
+  // the head product's rounding error recovered exactly by Dekker's method.
+  const P1 = 1.5707963267948966
+  const P2 = 6.123233995736766e-17
+  // Typed literals: a const built from other consts is computed exactly, erasing the split.
+  const bh = 1.5707963407039642
+  const bl = -1.3909067675399456e-8
+  const ca = 134217729.0 * fh
+  const ah = ca - (ca - fh)
+  const al = fh - ah
+  const p = fh * P1
+  const err = ((ah * bh - p) + ah * bl + al * bh) + al * bl
+  const t = err + (fh * P2 + fl * P1)
+  const rh = p + t
+  const rl = t - (rh - p)
+  if neg {
+    redHi = -rh
+    redLo = -rl
+  } else {
+    redHi = rh
+    redLo = rl
+  }
+  return q & 3
+}
+
+// Writes x - q*π/2 in [-π/4, π/4] to redHi/redLo for a finite x; returns q mod 4.
+function reducePio2(x: f64): i64 {
+  const ax = abs(x)
+  if ax >= 1647099.0 {
+    const q = reducePio2Large(ax)
+    if x < 0.0 {
+      redHi = -redHi
+      redLo = -redLo
+      return (4 - q) & 3
+    }
+    return q
+  }
+  const PIO2_1 = 1.5707963267341256
+  const PIO2_1T = 6.077100506506192e-11
+  const PIO2_2 = 6.077100506303966e-11
+  const PIO2_2T = 2.0222662487959506e-21
+  const PIO2_3 = 2.0222662487111665e-21
+  const PIO2_3T = 8.4784276603689e-32
+  const TOINT = 6755399441055744.0
+  const tq = x * 0.6366197723675814 + TOINT
+  const fn = tq - TOINT
+  let r = x - fn * PIO2_1
+  let w = fn * PIO2_1T
+  let y = r - w
+  const ex = (f64bits(x) >>> 52) & 0x7FF
+  if ex - ((f64bits(y) >>> 52) & 0x7FF) > 16 {
+    let t = r
+    w = fn * PIO2_2
+    r = t - w
+    w = fn * PIO2_2T - ((t - r) - w)
+    y = r - w
+    if ex - ((f64bits(y) >>> 52) & 0x7FF) > 49 {
+      t = r
+      w = fn * PIO2_3
+      r = t - w
+      w = fn * PIO2_3T - ((t - r) - w)
+      y = r - w
+    }
+  }
+  redHi = y
+  redLo = (r - y) - w
+  return f64bits(tq) & 3
+}
+
+// sin(x + y) for |x + y| <= π/4, y a tail below half an ulp of x; minimax in x*x.
+function sinKernelF64(x: f64, y: f64): f64 {
+  const z = x * x
+  const w = z * z
+  const a = -0.00019841269830153272 + z * 2.7557313655187267e-6
+  const b = -2.505073511868829e-8 + z * 1.5894743283863398e-10
+  const r = 0.008333333333323673 + z * a + z * w * b
+  const v = z * x
+  return x - ((z * (0.5 * y - v * r) - y) - v * -0.16666666666666644)
+}
+
+// cos(x + y) for |x + y| <= π/4, y a tail below half an ulp of x; minimax in x*x.
+function cosKernelF64(x: f64, y: f64): f64 {
+  const z = x * x
+  const w = z * z
+  const a = -0.0013888888888882846 + z * 2.480158729463356e-5
+  const b = 2.0875898081312824e-9 + z * -1.1368002341468553e-11
+  const r = z * (0.04166666666666665 + z * a)
+    + w * w * (-2.7557315740699307e-7 + z * b)
+  const hz = 0.5 * z
+  const h = 1.0 - hz
+  return h + (((1.0 - h) - hz) + (z * r - x * y))
+}
+
+// Sine of `x` radians, within 1 ulp of the exact value (so within 1.2e-16 absolute) for
+// every finite `x`, however large. `sinF64(-0.0)` is `-0.0`; NaN and ±infinity give NaN.
+export function sinF64(x: f64): f64 {
+  const ax = abs(x)
+  if ax < 1.4901161193847656e-8 { return x }
+  if ax <= 0.7853981633974483 { return sinKernelF64(x, 0.0) }
+  if !(ax <= 1.7976931348623157e308) { return f64fromBits(0x7FF8000000000000) }
+  const q = reducePio2(x)
+  if q == 0 { return sinKernelF64(redHi, redLo) }
+  if q == 1 { return cosKernelF64(redHi, redLo) }
+  if q == 2 { return -sinKernelF64(redHi, redLo) }
+  return -cosKernelF64(redHi, redLo)
+}
+
+// Cosine of `x` radians, within 1 ulp of the exact value (so within 1.2e-16 absolute) for
+// every finite `x`, however large. NaN and ±infinity give NaN.
+export function cosF64(x: f64): f64 {
+  const ax = abs(x)
+  if ax < 7.450580596923828e-9 { return 1.0 }
+  if ax <= 0.7853981633974483 { return cosKernelF64(x, 0.0) }
+  if !(ax <= 1.7976931348623157e308) { return f64fromBits(0x7FF8000000000000) }
+  const q = reducePio2(x)
+  if q == 0 { return cosKernelF64(redHi, redLo) }
+  if q == 1 { return -sinKernelF64(redHi, redLo) }
+  if q == 2 { return -cosKernelF64(redHi, redLo) }
+  return sinKernelF64(redHi, redLo)
+}
+
+// sin(r) at f32 accuracy for |r| <= π/4, evaluated in f64.
+function sinKernelF32(r: f64): f64 {
+  const z = r * r
+  let p: f64 = 2.7173494641199704e-6
+  p = p * z - 0.0001983926155350774
+  p = p * z + 0.008333329329101974
+  p = p * z - 0.1666666664422011
+  return r + r * z * p
+}
+
+// cos(r) at f32 accuracy for |r| <= π/4, evaluated in f64.
+function cosKernelF32(r: f64): f64 {
+  const z = r * r
+  let p: f64 = 2.4379880313551e-5
+  p = p * z - 0.0013886683227594943
+  p = p * z + 0.041666622696411464
+  p = p * z - 0.4999999975353173
+  return 1.0 + z * p
+}
+
+// Sine of `x` radians at f32, computed in f64 and rounded once: within 1 f32 ulp of the exact
+// value (so within 6e-8 absolute) for every finite `x`, however large. `sinF32(-0.0)` is
+// `-0.0`; NaN and ±infinity give NaN.
+export function sinF32(x: f32): f32 {
+  const ax = abs(x)
+  if ax < 0.000244140625 { return x }
+  if !(ax <= 3.4028234663852886e38) { return f32fromBits(0x7FC00000) }
+  const xd = x as f64
+  if ax <= 0.7853981633974483 { return sinKernelF32(xd) as f32 }
+  const q = reducePio2(xd)
+  if q == 0 { return sinKernelF32(redHi) as f32 }
+  if q == 1 { return cosKernelF32(redHi) as f32 }
+  if q == 2 { return (-sinKernelF32(redHi)) as f32 }
+  return (-cosKernelF32(redHi)) as f32
+}
+
+// Cosine of `x` radians at f32, computed in f64 and rounded once: within 1 f32 ulp of the
+// exact value (so within 6e-8 absolute) for every finite `x`, however large. NaN and
+// ±infinity give NaN.
+export function cosF32(x: f32): f32 {
+  const ax = abs(x)
+  if ax < 0.000244140625 { return 1.0 }
+  if !(ax <= 3.4028234663852886e38) { return f32fromBits(0x7FC00000) }
+  const xd = x as f64
+  if ax <= 0.7853981633974483 { return cosKernelF32(xd) as f32 }
+  const q = reducePio2(xd)
+  if q == 0 { return cosKernelF32(redHi) as f32 }
+  if q == 1 { return (-sinKernelF32(redHi)) as f32 }
+  if q == 2 { return (-cosKernelF32(redHi)) as f32 }
+  return sinKernelF32(redHi) as f32
 }
