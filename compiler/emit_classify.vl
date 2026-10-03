@@ -202,6 +202,8 @@ import {
   numLitUnionBaseName,
   numLitUnionBaseTy,
   numLitUnionHasBase,
+  numUnionMembersOf,
+  numUnionMinted,
   pgResidualVoidOf,
   pinnedHoleTyOf,
   primNameOf,
@@ -230,6 +232,8 @@ import {
   tyIsNulLitUnionNiche,
   tyIsNulValueUnionBox,
   tyIsNullableLitUnion,
+  tyIsNumUnion,
+  tyIsNumericBox,
   tyIsU8ArrayTy,
   tyIsValueUnionBox,
   tyIxIsVariantMember,
@@ -16335,6 +16339,14 @@ function coalesceAtomKind(exprIx: i32, fnIx: i32) {
   -1
 }
 
+// Whether node `ix` is a numeric union box: a numeric union, or a value `if` joining numbers
+// with `null`, whose arms alone would each read as one width.
+function numBoxExpr(ix: i32, t: i32): boolean {
+  if t < 0 || t >= T.tys.length || T.tys[t] is TyPrim { return false }
+  if tyIsNumUnion(t) { return true }
+  P.nodes[ix] is IfStmt && tyIsNumericBox(t)
+}
+
 // True if evaluating the expression at `exprIx` yields an i64 — a reference to an
 // i64 param/local/global, or a parenthesized such. Drives the `print` import choice
 // (`__print_i64__`, import 4). Arithmetic/calls returning i64 are Slice 2; here only
@@ -16401,6 +16413,8 @@ export function exprIsI64(exprIx: i32, fnIx: i32) {
   // widens). Comparisons and logical connectives produce an i32 bool even over i64
   // operands, so they are not i64.
   if e is BinExpr {
+    // A numeric union is a box whatever its members, never one scalar width.
+    if numUnionMinted && numBoxExpr(exprIx, nodeTyIxOf(exprIx)) { return false }
     const op = e.binOp
     if (
       op == "+"
@@ -16426,6 +16440,8 @@ export function exprIsI64(exprIx: i32, fnIx: i32) {
   // Unary negation `-x` / bitwise NOT `~x` preserve the operand's i64-ness (`!` is a bool,
   // never i64; `p+`/`p-` ride their operand but are statement-level).
   if e is Unary {
+    // A numeric union is a box whatever its members, never one scalar width.
+    if numUnionMinted && numBoxExpr(exprIx, nodeTyIxOf(exprIx)) { return false }
     if e.unOp == "-" || e.unOp == "~" {
       // Except `-2147483648`: the host folds the sign into the literal before defaulting,
       // so a negated magnitude-2^31 literal is i32 (at I32_MIN) even though the bare
@@ -16470,7 +16486,11 @@ export function exprIsI64(exprIx: i32, fnIx: i32) {
     return false
   }
   // A value-position if-expression is i64 when either arm's value is i64.
-  if e is IfStmt { return ifExprArmIsKind(exprIx, fnIx, "i64") }
+  if e is IfStmt {
+    // A numeric union is a box whatever its members, never one scalar width.
+    if numUnionMinted && numBoxExpr(exprIx, nodeTyIxOf(exprIx)) { return false }
+    return ifExprArmIsKind(exprIx, fnIx, "i64")
+  }
   false
 }
 
@@ -16822,6 +16842,8 @@ export function exprIsF32(exprIx: i32, fnIx: i32) {
   // produce an i32 bool even over f32 operands, so they are not f32. `%` is here for the
   // reason `exprIsF64`'s arm gives (D1586).
   if e is BinExpr {
+    // A numeric union is a box whatever its members, never one scalar width.
+    if numUnionMinted && numBoxExpr(exprIx, nodeTyIxOf(exprIx)) { return false }
     const op = e.binOp
     if op == "+" || op == "-" || op == "*" || op == "/" || op == "%" {
       // f32 arithmetic yields f32 only when no operand is a genuine f64 — a genuine f64 side
@@ -16836,6 +16858,8 @@ export function exprIsF32(exprIx: i32, fnIx: i32) {
     return false
   }
   if e is Unary {
+    // A numeric union is a box whatever its members, never one scalar width.
+    if numUnionMinted && numBoxExpr(exprIx, nodeTyIxOf(exprIx)) { return false }
     if e.unOp == "-" { return exprIsF32(e.unArg, fnIx) }
     return false
   }
@@ -16871,6 +16895,8 @@ export function exprIsF32(exprIx: i32, fnIx: i32) {
   // A value-position if-expression is f32 when either arm's value is f32, unless the checker
   // joined it at f64, which the f32 arm widens to (D2773).
   if e is IfStmt {
+    // A numeric union is a box whatever its members, never one scalar width.
+    if numUnionMinted && numBoxExpr(exprIx, nodeTyIxOf(exprIx)) { return false }
     if tyKindOf(nodeTyIxOf(exprIx)) == TK_F64 { return false }
     return ifExprArmIsKind(exprIx, fnIx, "f32")
   }
@@ -16972,6 +16998,8 @@ export function exprIsF64(exprIx: i32, fnIx: i32) {
   // produce an i32 bool even over f64 operands, so they are not f64. `%` is here because
   // float remainder has a form (D1586) and its result is the dividend's width.
   if e is BinExpr {
+    // A numeric union is a box whatever its members, never one scalar width.
+    if numUnionMinted && numBoxExpr(exprIx, nodeTyIxOf(exprIx)) { return false }
     const op = e.binOp
     if op == "+" || op == "-" || op == "*" || op == "/" || op == "%" {
       const m = if arithRegionSeen && (bcOpen || e.binRegion != 0) { bcGet(exprIx, fnIx, BC_F64) } else { -2 }
@@ -16998,6 +17026,8 @@ export function exprIsF64(exprIx: i32, fnIx: i32) {
   }
   // Unary negation `-x` preserves f64-ness (`~` is integer-only; `!` is bool).
   if e is Unary {
+    // A numeric union is a box whatever its members, never one scalar width.
+    if numUnionMinted && numBoxExpr(exprIx, nodeTyIxOf(exprIx)) { return false }
     if e.unOp == "-" { return exprIsF64(e.unArg, fnIx) }
     return false
   }
@@ -17036,6 +17066,8 @@ export function exprIsF64(exprIx: i32, fnIx: i32) {
   // widens to f64); an `else if` chain recurses through the else slot. A join the checker typed
   // `f32` is one whose float literal arms adopted an f32 destination, and stays f32 (D2619).
   if e is IfStmt {
+    // A numeric union is a box whatever its members, never one scalar width.
+    if numUnionMinted && numBoxExpr(exprIx, nodeTyIxOf(exprIx)) { return false }
     if tyKindOf(nodeTyIxOf(exprIx)) == TK_F32 { return false }
     return ifExprArmIsKind(exprIx, fnIx, "f64")
   }
@@ -35607,6 +35639,15 @@ export function exprUnion(exprIx: i32, fnIx: i32) {
       return mvValKind[mri] == MVK_UNION
     }
   }
+  // An operator over a numeric union whose member results differ yields their union's box.
+  if numUnionMinted && tyIsNumUnion(nodeTyIxOf(exprIx)) {
+    if e is Unary {
+      if e.unOp == "-" { return true }
+    }
+    if e is BinExpr {
+      if e.binOp != "=" && e.binOp != "??" { return true }
+    }
+  }
   // `m[k] ?? d` over a UNION-valued map yields the value union box — EXCEPT a `scalar | null`
   // value, which `??` peels to the raw unboxed scalar (classified by `exprIsI64`/`exprIsF64`/… ).
   if e is BinExpr {
@@ -36375,6 +36416,17 @@ export function unionNameOfExpr(exprIx: i32, fnIx: i32) {
   // An if-expression names its union from its own recorded type, like the `AsExpr` arm: only
   // a desugared `??` (`nodeTyCarry`) puts a type on an `if` — a source-written one has none. D969.
   if e is IfStmt { return ifJoinUnionName(unwrapParen(exprIx)) }
+  // An operator over a numeric union names the union of its member results.
+  if numUnionMinted && (e is BinExpr || e is Unary) {
+    const nuTy = nodeTyIxOf(unwrapParen(exprIx))
+    if (
+      tyIsNumUnion(nuTy)
+      && !(e is BinExpr && (e.binOp == "=" || e.binOp == "??"))
+    ) {
+      const nun = tyToEmitName(nuTy)
+      if isValueUnionName(nun) { return nun }
+    }
+  }
   // A `??`'s desugared call-operand form still needs a name here: it drives the default's
   // coercion and makes `exprUnion` true, so a consumer boxes the result exactly once. D960.
   if e is BinExpr {
@@ -42836,7 +42888,12 @@ export function binRemFloatNeed(ix: i32): i32 {
   const k = tyKindOf(nodeTyIxOf(ix))
   if k == TK_F64 || k == TK_F32 { return 1 }
   if k == TK_I32 || k == TK_I64 { return 0 }
-  -1
+  if !numUnionMinted || !tyIsNumUnion(nodeTyIxOf(ix)) { return -1 }
+  for m in numUnionMembersOf(nodeTyIxOf(ix)) {
+    const mk = tyKindOf(m)
+    if mk == TK_F64 || mk == TK_F32 { return 1 }
+  }
+  0
 }
 
 // The ladder↔descriptor agreement oracle: per (family, ladder answer, descriptor answer)

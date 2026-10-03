@@ -106,9 +106,14 @@ import {
   nodeUnwidenedTyOf,
   nodeWideStrLitText,
   nominalStructNameOfTy,
+  nonNullTy,
   numCastCanFail,
   numLitUnionBaseName,
   numLitUnionHasBase,
+  numPairOpTy,
+  numPrimTyOfKind,
+  numUnionMembersOf,
+  numUnionMinted,
   primNameOf,
   primNameStr,
   refViewReadonlyAt,
@@ -118,11 +123,15 @@ import {
   simdRowSig,
   truncSatFromF64,
   truncSatOp,
+  tyHasTyVar,
   tyIsLitUnion,
   tyIsLitUnionArray,
   tyIsLitUnionOrLit,
   tyIsNulValueUnionBox,
+  tyIsNumUnion,
+  tyIsNumericBox,
   tyIsOneStrLit,
+  tyIsPrimIx,
   tyIsRecord,
   tyIsStructBearingUnion,
   tyLitMemberTexts,
@@ -4855,6 +4864,10 @@ export function emitUnionCoerce(
       return 0
     }
     return emitUnionIfValue(body, unionName, bareIx, fnIx)
+  }
+  if numUnionMinted {
+    const nuRb = emitNumUnionRebox(body, exprIx, unionName, fnIx)
+    if nuRb != 0 { return nuRb }
   }
   if exprUnion(exprIx, fnIx) { return emitExpr(body, exprIx, fnIx) }
   if bare is NullLit {
@@ -16460,7 +16473,10 @@ export function emitExprAsI64(body: u8[], exprIx: i32, fnIx: i32) {
   if exprIsI64(widenClassifyExpr(exprIx, fnIx), fnIx) {
     return emitExprWideCleared(body, exprIx, fnIx)
   }
-  // Non-literal i32: evaluate, then sign-extend to i64.
+  // A numeric union converts at the member it holds; anything else is an i32, sign-extended.
+  if numUnionMinted && nodeIsNumUnion(exprIx, fnIx) {
+    return emitNumUnionConvert(body, exprIx, 3, fnIx)
+  }
   if emitExprWideCleared(body, exprIx, fnIx) < 0 { return -1 }
   fbI64ExtendI32S()
   0
@@ -16499,6 +16515,10 @@ export function emitExprAsF64(body: u8[], exprIx: i32, fnIx: i32) {
     if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
     fbF64ConvertI64S()
     return 0
+  }
+  // A numeric union converts at the member it holds.
+  if numUnionMinted && nodeIsNumUnion(exprIx, fnIx) {
+    return emitNumUnionConvert(body, exprIx, 4, fnIx)
   }
   // Otherwise an i32 expression (or integer literal): convert (signed) to f64.
   if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
@@ -16552,7 +16572,10 @@ export function emitExprAsF32(body: u8[], exprIx: i32, fnIx: i32) {
   if exprIsF32(widenClassifyExpr(exprIx, fnIx), fnIx) {
     return emitExprWideCleared(body, exprIx, fnIx)
   }
-  // Non-literal i32: evaluate, then convert to f32.
+  // A numeric union converts at the member it holds; anything else is an i32, converted.
+  if numUnionMinted && nodeIsNumUnion(exprIx, fnIx) {
+    return emitNumUnionConvert(body, exprIx, 5, fnIx)
+  }
   if emitExprWideCleared(body, exprIx, fnIx) < 0 { return -1 }
   fbF32ConvertI32S()
   0
@@ -16910,6 +16933,13 @@ function emitAsCast(body: u8[], e: AsExpr, _exprIx: i32, fnIx: i32) {
   // A boxed `v128 | null` or union operand takes the union arm below instead.
   if tgt == "v128" && !exprUnion(obj, fnIx) { return emitExpr(body, obj, fnIx) }
   if e.asMode == "wrap" { return emitNumWrapCast(body, e, _exprIx, fnIx) }
+  // A numeric union converts at whichever member it holds when no member's conversion fails.
+  if numUnionMinted && nodeIsNumUnion(obj, fnIx) {
+    const nuTo = njKindOfTy(nodeTyIxOf(_exprIx))
+    if nuTo >= 0 && njAsConverts(njMembersOf(obj, fnIx), nuTo) {
+      return emitNumUnionConvert(body, obj, nuTo, fnIx)
+    }
+  }
   // union-operand `as` is the propagating cast (`error-handling-design.md` §Trio): evaluate
   // the box once into `$unionAs`, compare its tag against T's, and on a miss `return` the
   // box unchanged — one box struct and a global tag registry make it already a value of
@@ -28096,6 +28126,9 @@ function emitUnaryNode(body: u8[], e: Unary, exprIx: i32, fnIx: i32) {
     fbI32Bin(115)  // 0x73 i32.xor
     return 0
   }
+  if numUnionMinted && e.unOp == "-" && nodeIsNumUnion(e.unArg, fnIx) {
+    return emitNumUnionNeg(body, e.unArg, fnIx)
+  }
   // Integer negation: `-x` == `0 - x`, so push 0, the operand, then sub. For an
   // i64 operand the zero and the subtract are i64 (Slice 2).
   if e.unOp != "-" {
@@ -28453,6 +28486,558 @@ function emitMemberNode(body: u8[], e: Member, exprIx: i32, fnIx: i32) {
   return emitMem(body, exprIx, fnIx)
 }
 
+// ── numeric-union dispatch ─────────────────────────────────────────────────────
+// An operator over a union of numeric primitives computes at each member's own type: each
+// operand is evaluated once into a lazy-frame stash, a tag test picks the member, and every
+// member pair takes the scalar rule (`numPairOpTy`). A union result re-boxes each pair's value.
+
+// How deeply the operands being stashed are nested, so an inner dispatch stashes apart.
+let njDepth = 0
+// The dispatch being lowered: its operator node, its two operands' member types (a scalar
+// operand is its one type), their stash slots (-2 for a literal emitted per arm), and the
+// result's shape. Set once per dispatch; the arms read them and run no user code.
+let njBin = -1
+let njOp = ""
+let njLTys: i32[] = []
+let njRTys: i32[] = []
+let njLUnion = false
+let njRUnion = false
+let njLSlot = -1
+let njRSlot = -1
+let njLIx = -1
+let njRIx = -1
+let njResBox = false
+let njBlockKind: VKind = "i32"
+
+// The value-atom kind of numeric primitive type `t` (0 i32, 3 i64, 4 f64, 5 f32), or -1.
+function njKindOfTy(t: i32): i32 {
+  const p = tyPrimNameOf(t)
+  if p == null { return -1 }
+  const k = valueAtomKind(primNameStr(p))
+  if k == 0 || k == 3 || k == 4 || k == 5 { return k }
+  -1
+}
+
+// The valtype kind of value-atom kind `k`.
+function njVKind(k: i32): VKind {
+  if k == 3 { return "i64" }
+  if k == 4 { return "f64" }
+  if k == 5 { return "f32" }
+  "i32"
+}
+
+// Whether the value at `ix` is a union of numeric primitives (`njMembersOf`).
+export function nodeIsNumUnion(ix: i32, fnIx: i32): boolean {
+  if ix < 0 { return false }
+  // Nearly every operand is typed at one primitive, which answers without a walk.
+  if tyIsPrimIx(nodeTyIxOf(ix)) { return false }
+  njMembersOf(ix, fnIx).length > 0
+}
+
+// The member types of the numeric union at `ix`: its recorded type's, or, where an instance
+// left that a type parameter, the members of the union its box is lowered as. Empty otherwise.
+function njMembersOf(ix: i32, fnIx: i32): i32[] {
+  const t = nodeTyIxOf(ix)
+  const ms = numUnionMembersOf(t)
+  if ms.length > 0 { return ms }
+  const none: i32[] = []
+  // Only a name can be a box its recorded type does not name; any other node is typed by it.
+  const u = P.nodes[unwrapParen(ix)]
+  if !(u is Ident) { return none }
+  if tyIsNumericBox(t) {
+    // A name narrowed past its `null` holds only the number members of its box.
+    if narrowExcludesNull(u.identName) {
+      return numUnionMembersOf(nonNullTy(t))
+    }
+    return none
+  }
+  if !tyHasTyVar(t) { return none }
+  if !exprUnion(ix, fnIx) { return none }
+  let name = unionNameOfExpr(ix, fnIx)
+  // A name an instance narrowed (`!= null`) holds the members its narrowing names.
+  if u is Ident {
+    const nv = narrowVariantFor(u.identName)
+    if nv != "" && nv != "null" { name = nv }
+  }
+  if name == "" { return none }
+  const out: i32[] = []
+  for k in njKindsOfUnionName(name) {
+    if k == 6 {
+      // Skipped: an operator reaches a type parameter's box only past a check that excluded
+      // `null` (the template's narrowing), whatever member set the instance's name spells.
+    } else if k != 0 && k != 3 && k != 4 && k != 5 {
+      return none
+    } else {
+      out.push(numPrimTyOfKind(k))
+    }
+  }
+  if out.length < 2 { return none }
+  out
+}
+
+// A lazy-frame slot for dispatch depth and side `key`: code 26 a `(ref null $uBox)`, code 27 a
+// scalar of `kind`. Deduped on all three, so siblings at one depth share it.
+function njSlot(code: i32, kind: MfKind, key: i32): i32 {
+  let k = 0
+  while k < liKinds.length {
+    if liBack[k] == code && liSlots[k] == key && liKinds[k] == kind {
+      return listIdxScratchBase + 1 + k
+    }
+    k = k + 1
+  }
+  liKinds.push(kind)
+  liSlots.push(key)
+  liBack.push(code)
+  listIdxScratchBase + liKinds.length
+}
+
+// The scalar-stash kind of value-atom kind `k`.
+function njMfKind(k: i32): MfKind {
+  if k == 3 { return "i64" }
+  if k == 4 { return "f64" }
+  if k == 5 { return "f32" }
+  "i32"
+}
+
+// Converts the numeric value on the stack from kind `from` to kind `to`: the exact widenings a
+// pair performs and the conversions an infallible `as` names.
+function njConvert(from: i32, to: i32) {
+  if from == to { return 0 }
+  if to == 4 {
+    if from == 0 { return fbF64ConvertI32S() }
+    if from == 3 { return fbF64ConvertI64S() }
+    if from == 5 { return fbF64PromoteF32() }
+  }
+  if to == 5 {
+    if from == 0 { return fbF32ConvertI32S() }
+    if from == 3 { return fbF32ConvertI64S() }
+    if from == 4 { return fbF32DemoteF64() }
+  }
+  if to == 3 && from == 0 { return fbI64ExtendI32S() }
+  emitFail("emitProgram: a numeric union member has no conversion to this type")
+}
+
+// Evaluates operand `ix` once: a numeric union's box into slot code 26, a scalar into code 27.
+// A bare numeric literal is left to each arm, at the pair's type (-2). -1 on failure.
+function njStash(
+  body: u8[],
+  ix: i32,
+  isUnion: boolean,
+  key: i32,
+  fnIx: i32,
+): i32 {
+  if isUnion {
+    // A join whose arms are scalars is built as the box here, as a union destination builds it.
+    if exprUnion(ix, fnIx) {
+      if emitExpr(body, ix, fnIx) < 0 { return -1 }
+    } else if (
+      emitUnionCoerce(body, tyToEmitName(nodeTyIxOf(ix)), ix, fnIx)
+      < 0
+    ) {
+      return -1
+    }
+    const bs = njSlot(26, "i32", key)
+    fbLocalSet(bs)
+    return bs
+  }
+  if signedNumLitText(ix) != "" { return -2 }
+  const k = njKindOfExpr(ix, fnIx)
+  if emitExprAsKind(body, ix, k, fnIx) < 0 { return -1 }
+  const ss = njSlot(27, njMfKind(k), key)
+  fbLocalSet(ss)
+  ss
+}
+
+// The kind of scalar operand `ix`: its recorded type's, or, where an instance left that open,
+// the width its lowering reads it at.
+function njKindOfExpr(ix: i32, fnIx: i32): i32 {
+  const k = njKindOfTy(nodeTyIxOf(ix))
+  if k >= 0 { return k }
+  if exprIsF64(ix, fnIx) { return 4 }
+  if exprIsF32(ix, fnIx) { return 5 }
+  if exprIsI64(ix, fnIx) { return 3 }
+  0
+}
+
+// Pushes one side of the current dispatch at kind `p`, the side holding member type `m`.
+function njPushSide(body: u8[], left: boolean, m: i32, p: i32, fnIx: i32) {
+  let slot = njRSlot
+  let isU = njRUnion
+  let ix = njRIx
+  if left {
+    slot = njLSlot
+    isU = njLUnion
+    ix = njLIx
+  }
+  if slot == -2 { return emitExprAsKind(body, ix, p, fnIx) }
+  fbLocalGet(slot)
+  const mk = njKindOfTy(m)
+  if isU {
+    if emitUnionUnboxTail(mk) < 0 { return -1 }
+  }
+  njConvert(mk, p)
+}
+
+// The tag test `box.tag == tag(kind k)` over the box in `slot`.
+function njTagTest(slot: i32, k: i32) {
+  fbLocalGet(slot)
+  fbStructGet(uBoxIdx, 0)
+  fbI32Const(scalarTagOfKind(k))
+  fbI32Bin(70) // 0x46 i32.eq
+}
+
+// One member pair of the current binary dispatch: both sides at the pair's type, the operator,
+// and the pair's value boxed when the result is a union.
+function njPair(body: u8[], a: i32, b: i32, fnIx: i32) {
+  const n = P.nodes[njBin]
+  if !(n is BinExpr) {
+    return emitFail("emitProgram: numeric union dispatch lost its operator")
+  }
+  const pty = numPairOpTy(n, a, b)
+  const p = njKindOfTy(pty)
+  if pty < 0 || p < 0 {
+    return emitFail(
+      "emitProgram: a numeric union member pair has no operator type",
+    )
+  }
+  if njResBox { fbI32Const(scalarTagOfKind(p)) }
+  const fRem = njOp == "%" && (p == 4 || p == 5)
+  if fRem && gHelpF64Rem < 0 {
+    return emitFail(
+      "emitProgram: a float '%' reached the emitter with no __f64_rem__ helper reserved",
+    )
+  }
+  if njPushSide(body, true, a, p, fnIx) < 0 { return -1 }
+  if fRem && p == 5 { fbF64PromoteF32() }
+  if njPushSide(body, false, b, p, fnIx) < 0 { return -1 }
+  if fRem {
+    if p == 5 { fbF64PromoteF32() }
+    fbCall(gHelpF64Rem)
+    if p == 5 { fbF32DemoteF64() }
+  } else {
+    let opc = binOpcode(njOp)
+    if p == 3 { opc = binOpcodeI64(njOp) }
+    if p == 4 { opc = binOpcodeF64(njOp) }
+    if p == 5 { opc = binOpcodeF32(njOp) }
+    if opc < 0 {
+      return emitFail(
+        "emitProgram: operator '"
+          + njOp
+          + "' has no form at a numeric union member",
+      )
+    }
+    fbI32Bin(opc)
+  }
+  if njResBox {
+    fbStructNew(vbHeapIdxOfKind(p))
+    fbStructNew(uBoxIdx)
+  }
+  0
+}
+
+// The right side's dispatch under left member `a`, from right member `j` on.
+function njArmR(body: u8[], a: i32, j: i32, fnIx: i32) {
+  if !njRUnion || j == njRTys.length - 1 {
+    return njPair(body, a, njRTys[j], fnIx)
+  }
+  njTagTest(njRSlot, njKindOfTy(njRTys[j]))
+  fbOpenIf()
+  fbValtype(njBlockKind, -1)
+  if njPair(body, a, njRTys[j], fnIx) < 0 { return -1 }
+  fbElse()
+  if njArmR(body, a, j + 1, fnIx) < 0 { return -1 }
+  fbEnd()
+  0
+}
+
+// The left side's dispatch from left member `i` on; the last member is the bare `else`.
+function njArmL(body: u8[], i: i32, fnIx: i32) {
+  if !njLUnion || i == njLTys.length - 1 {
+    return njArmR(body, njLTys[i], 0, fnIx)
+  }
+  njTagTest(njLSlot, njKindOfTy(njLTys[i]))
+  fbOpenIf()
+  fbValtype(njBlockKind, -1)
+  if njArmR(body, njLTys[i], 0, fnIx) < 0 { return -1 }
+  fbElse()
+  if njArmL(body, i + 1, fnIx) < 0 { return -1 }
+  fbEnd()
+  0
+}
+
+// The numeric type scalar operand `ix` is dispatched at: its recorded type when that is a
+// number, else the primitive of the width it lowers at.
+function njScalarTy(ix: i32, fnIx: i32): i32 {
+  const t = nodeTyIxOf(ix)
+  if njKindOfTy(t) >= 0 { return t }
+  numPrimTyOfKind(njKindOfExpr(ix, fnIx))
+}
+
+// Whether `e` is an operator over a numeric union and a number: not a `null` test, an
+// assignment or a short-circuit.
+function njDispatches(e: BinExpr, fnIx: i32): boolean {
+  // Two primitive operands, nearly every operator, answer without a call each.
+  if tyIsPrimIx(nodeTyIxOf(e.binLeft)) && tyIsPrimIx(nodeTyIxOf(e.binRight)) {
+    return false
+  }
+  if !nodeIsNumUnion(e.binLeft, fnIx) && !nodeIsNumUnion(e.binRight, fnIx) {
+    return false
+  }
+  if P.nodes[unwrapParen(e.binLeft)] is NullLit { return false }
+  if P.nodes[unwrapParen(e.binRight)] is NullLit { return false }
+  e.binOp != "=" && e.binOp != "&&" && e.binOp != "||" && e.binOp != "??"
+}
+
+// `a op b` where an operand is a numeric union.
+function emitNumUnionBin(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
+  const lMs = njMembersOf(e.binLeft, fnIx)
+  const rMs = njMembersOf(e.binRight, fnIx)
+  const key = njDepth * 2
+  njDepth = njDepth + 1
+  const ls = njStash(body, e.binLeft, lMs.length > 0, key, fnIx)
+  let rs = -1
+  if ls != -1 { rs = njStash(body, e.binRight, rMs.length > 0, key + 1, fnIx) }
+  njDepth = njDepth - 1
+  if ls == -1 || rs == -1 { return -1 }
+  njBin = exprIx
+  njOp = e.binOp
+  njLUnion = lMs.length > 0
+  njRUnion = rMs.length > 0
+  njLTys = lMs
+  if !njLUnion { njLTys = [njScalarTy(e.binLeft, fnIx)] }
+  njRTys = rMs
+  if !njRUnion { njRTys = [njScalarTy(e.binRight, fnIx)] }
+  njLSlot = ls
+  njRSlot = rs
+  njLIx = e.binLeft
+  njRIx = e.binRight
+  // The result's shape from the pairs themselves, as the checker's `numUnionResultTy` builds it.
+  const rks = njResultKinds(e)
+  if rks.length == 0 {
+    return emitFail(
+      "emitProgram: a numeric union member pair has no operator type",
+    )
+  }
+  njResBox = rks.length > 1 && !njCmpOp(e.binOp)
+  njBlockKind = "i32"
+  if njResBox { njBlockKind = "union" }
+  else if !njCmpOp(e.binOp) { njBlockKind = njVKind(rks[0]) }
+  // The node's consumers read its recorded type, so a result shape it does not name is refused
+  // loudly rather than handed on in a rep they do not expect (D3453).
+  if !njCmpOp(e.binOp) {
+    const recTy = nodeTyIxOf(exprIx)
+    const recBox = tyIsNumUnion(recTy)
+    if recBox != njResBox || (!njResBox && njKindOfTy(recTy) != rks[0]) {
+      return emitFail(
+        "emitProgram: an operator over a numeric union has no recorded result type at this instance",
+      )
+    }
+  }
+  njArmL(body, 0, fnIx)
+}
+
+// Whether `op` is a comparison, which answers an `i32` boolean at every pair.
+function njCmpOp(op: string): boolean {
+  op == "<" || op == ">" || op == "<=" || op == ">=" || op == "==" || op == "!="
+}
+
+// The distinct kinds the member pairs of the current dispatch compute at, in first-seen order;
+// empty when a pair has none.
+function njResultKinds(e: BinExpr): i32[] {
+  const out: i32[] = []
+  const none: i32[] = []
+  for a in njLTys {
+    for b in njRTys {
+      const k = njKindOfTy(numPairOpTy(e, a, b))
+      if k < 0 { return none }
+      let seen = false
+      for q in out {
+        if q == k { seen = true }
+      }
+      if !seen { out.push(k) }
+    }
+  }
+  out
+}
+
+// Whether `as` to kind `to` over the members `ms` can fail at none of them (`numUnionAsConverts`).
+function njAsConverts(ms: i32[], to: i32): boolean {
+  const tn = primNameStr(tyPrimNameOf(numPrimTyOfKind(to)))
+  for m in ms {
+    if numCastCanFail(primNameStr(tyPrimNameOf(m)), tn) { return false }
+  }
+  true
+}
+
+// Converts the numeric union at `ix` to kind `to` at whichever member it holds: an infallible
+// `as`, and a delivery into a numeric primitive every member widens to exactly.
+function emitNumUnionConvert(body: u8[], ix: i32, to: i32, fnIx: i32) {
+  const ms = njMembersOf(ix, fnIx)
+  const key = njDepth * 2
+  njDepth = njDepth + 1
+  const bs = njStash(body, ix, true, key, fnIx)
+  njDepth = njDepth - 1
+  if bs < 0 { return -1 }
+  njConvertArm(ms, 0, bs, to)
+}
+
+// The conversion dispatch from member `i` on; the last member is the bare `else`.
+function njConvertArm(ms: i32[], i: i32, bs: i32, to: i32) {
+  const mk = njKindOfTy(ms[i])
+  if i == ms.length - 1 {
+    fbLocalGet(bs)
+    if emitUnionUnboxTail(mk) < 0 { return -1 }
+    return njConvert(mk, to)
+  }
+  njTagTest(bs, mk)
+  fbOpenIf()
+  fbValtype(njVKind(to), -1)
+  fbLocalGet(bs)
+  if emitUnionUnboxTail(mk) < 0 { return -1 }
+  if njConvert(mk, to) < 0 { return -1 }
+  fbElse()
+  if njConvertArm(ms, i + 1, bs, to) < 0 { return -1 }
+  fbEnd()
+  0
+}
+
+// The value-atom kinds of the members of union name `unionName`, spaces trimmed.
+function njKindsOfUnionName(unionName: string): i32[] {
+  const atoms: string[] = []
+  splitUnionAtoms(unionName, atoms)
+  const out: i32[] = []
+  for a in atoms {
+    let lo = 0
+    let hi = a.length
+    while lo < hi && a[lo] == ' ' { lo = lo + 1 }
+    while hi > lo && a[hi - 1] == ' ' { hi = hi - 1 }
+    out.push(valueAtomKind(a.slice(lo, hi)))
+  }
+  out
+}
+
+// The destination kind a numeric member of kind `k` is stored at in a union of kinds `dk`: its
+// own, else the one it widens to exactly (`i64` then `f64` for `i32`, `f64` for `f32`); -1 none.
+function njStoreKind(k: i32, dk: i32[]): i32 {
+  for d in dk {
+    if d == k { return k }
+  }
+  let w: i32[] = []
+  if k == 0 { w = [3, 4] }
+  if k == 5 { w = [4] }
+  for c in w {
+    for d in dk {
+      if d == c { return c }
+    }
+  }
+  -1
+}
+
+// A numeric union at `ix` delivered to the union `unionName` that lacks one of its members but
+// holds a member it widens to: re-boxed member by member. 1 done, 0 not this shape, -1 failure.
+function emitNumUnionRebox(
+  body: u8[],
+  ix: i32,
+  unionName: string,
+  fnIx: i32,
+): i32 {
+  if unionName == "" || !nodeIsNumUnion(ix, fnIx) { return 0 }
+  // A delivery the checker recorded a re-tag for is re-tagged as it is emitted.
+  if mapDeliveryRecorded && deliveryRetagHas(ix) { return 0 }
+  const ms = njMembersOf(ix, fnIx)
+  const dk = njKindsOfUnionName(unionName)
+  let needs = false
+  for m in ms {
+    const k = njKindOfTy(m)
+    const sk = njStoreKind(k, dk)
+    if sk < 0 { return 0 }
+    if sk != k { needs = true }
+  }
+  if !needs { return 0 }
+  const key = njDepth * 2
+  njDepth = njDepth + 1
+  const bs = njStash(body, ix, true, key, fnIx)
+  njDepth = njDepth - 1
+  if bs < 0 { return -1 }
+  if njReboxArm(ms, 0, bs, dk) < 0 { return -1 }
+  1
+}
+
+// The re-box dispatch from member `i` on; the last member is the bare `else`.
+function njReboxArm(ms: i32[], i: i32, bs: i32, dk: i32[]) {
+  const mk = njKindOfTy(ms[i])
+  const sk = njStoreKind(mk, dk)
+  const last = i == ms.length - 1
+  if !last {
+    njTagTest(bs, mk)
+    fbOpenIf()
+    fbValtype("union", -1)
+  }
+  if sk == mk {
+    fbLocalGet(bs)
+    wU8(212) // ref.as_non_null
+  } else {
+    fbI32Const(scalarTagOfKind(sk))
+    fbLocalGet(bs)
+    if emitUnionUnboxTail(mk) < 0 { return -1 }
+    if njConvert(mk, sk) < 0 { return -1 }
+    fbStructNew(vbHeapIdxOfKind(sk))
+    fbStructNew(uBoxIdx)
+  }
+  if !last {
+    fbElse()
+    if njReboxArm(ms, i + 1, bs, dk) < 0 { return -1 }
+    fbEnd()
+  }
+  0
+}
+
+// `-x` over the numeric union at `ix`: each member negates at its own type, re-boxed.
+function emitNumUnionNeg(body: u8[], ix: i32, fnIx: i32) {
+  const ms = njMembersOf(ix, fnIx)
+  const key = njDepth * 2
+  njDepth = njDepth + 1
+  const bs = njStash(body, ix, true, key, fnIx)
+  njDepth = njDepth - 1
+  if bs < 0 { return -1 }
+  njNegArm(ms, 0, bs)
+}
+
+// The negation dispatch from member `i` on; the last member is the bare `else`.
+function njNegArm(ms: i32[], i: i32, bs: i32) {
+  const mk = njKindOfTy(ms[i])
+  if i < ms.length - 1 {
+    njTagTest(bs, mk)
+    fbOpenIf()
+    fbValtype("union", -1)
+  }
+  fbI32Const(scalarTagOfKind(mk))
+  if mk == 0 { fbI32Const(0) }
+  if mk == 3 { fbI64Const(0, 0) }
+  fbLocalGet(bs)
+  if emitUnionUnboxTail(mk) < 0 { return -1 }
+  if mk == 0 {
+    fbI32Bin(107) // 0x6b i32.sub
+  }
+  if mk == 3 {
+    fbI32Bin(125) // 0x7d i64.sub
+  }
+  if mk == 4 {
+    wU8(154) // 0x9a f64.neg
+  }
+  if mk == 5 {
+    wU8(140) // 0x8c f32.neg
+  }
+  fbStructNew(vbHeapIdxOfKind(mk))
+  fbStructNew(uBoxIdx)
+  if i < ms.length - 1 {
+    fbElse()
+    if njNegArm(ms, i + 1, bs) < 0 { return -1 }
+    fbEnd()
+  }
+  0
+}
+
 // The `%` lowering over two float operands: both at f64, then a call into the shared
 // `__f64_rem__` helper (D1586). `atF32` re-encodes at f32 first so a literal like `0.1`
 // uses f32's value, then promotes and demotes the exact result. The reservation is load-
@@ -28762,6 +29347,11 @@ function emitBinExprNode(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
   // `k`, push `vals[hit]` on a hit else the default `d`. The self-host checker reads
   // every scope map through `?? -1`. The LHS must be a map index in this slice.
   if e.binOp == "??" { return emitCoalesce(body, e, exprIx, fnIx) }
+  // A numeric union beside a number compares per member, ahead of the box's tag compare; a
+  // `null` test of one keeps the box's own test.
+  if numUnionMinted && (e.binOp == "==" || e.binOp == "!=") {
+    if njDispatches(e, fnIx) { return emitNumUnionBin(body, e, exprIx, fnIx) }
+  }
   // A null test of a value the checker proved non-null is dead: its answer is a constant.
   if e.binOp == "==" || e.binOp == "!=" {
     const dnIx = deadNullTestOperand(e, fnIx)
@@ -29106,6 +29696,10 @@ function emitBinExprNode(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
       }
       return 0
     }
+  }
+  // Every other operator over a numeric union dispatches per member.
+  if numUnionMinted && njDispatches(e, fnIx) {
+    return emitNumUnionBin(body, e, exprIx, fnIx)
   }
   // Wide-scalar slices (f32, then f64, then i64 — one shape, three widths): if either operand
   // is of the width, emit that width's instruction and coerce the other first

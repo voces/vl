@@ -766,6 +766,27 @@ let guardAltStack: i32[] = []
 // re-joined, and one still unresolved is dropped once some member did, naming a branch the
 // pinned argument can never reach. Without the re-fold `A | B` surfaces where one arm is live.
 let joinHoleUnions: i32[] = []
+// The function whose body is being checked, re-checked at a pin or instantiated (`njFnGated`).
+export let njFnIx = -1
+// The generic whose instance the emitter is building, -1 outside one (`joinPinnedArmLit`).
+let njPinFn = -1
+export function njSetPinFn(fx: i32): i32 {
+  const was = njPinFn
+  njPinFn = fx
+  was
+}
+// Names a call can reach other than directly from a concrete context (`njGateScan`), once per program.
+let njGateNames: {[string]: boolean} = Map()
+let njGateScanned = false
+// The arena prefix `njGateScan` has read.
+let njGateSeen = 0
+let njGateMemo: {[i32]: boolean} = Map()
+// The held-back call nodes `njExprHeld` answers for.
+let njHeldNodes: {[i32]: boolean} = Map()
+// `njFnIx` saved across each `monoRecheckBegin`/`monoRecheckEnd` pair.
+let njFnStack: i32[] = []
+// The deferred return joins of runtime witnesses, which re-join apart wherever they collapse.
+let apartHoleJoins: {[i32]: boolean} = Map()
 
 // The uncollapsed deferred join a call site could not decide, parked under that call's node
 // index. `collapseDeferredJoin` hands the emitter-safe collapse out as the call's type — a
@@ -3553,6 +3574,7 @@ function mkUnionTy(members: i32[]) {
     if tyIsWidePrim(members[i]) { tyWideUnionMinted = true }
     i = i + 1
   }
+  if !numUnionMinted { noteNumUnionMint(members) }
   const t: Ty = { uMembers: members }
   addTy(t)
 }
@@ -3604,6 +3626,32 @@ let tyMapMinted = false
 // Whether any union or `| null` with an `i64` or `f64` member has been minted: the same kind of
 // gate for a delivery a narrower member widens into (`recordWidenRetag`).
 let tyWideUnionMinted = false
+// Set once a union every member of which is a number (or another union) is minted: the gate
+// every numeric-union hook tests first, so a program with none pays one read per site.
+export let numUnionMinted = false
+
+// Whether declaration `fnIx` sits in a `std:` module.
+function fnDeclInStd(fnIx: i32): boolean {
+  const key = srcmapPathOf(rcwModOf(fnIx))
+  key.length > 4 && key.slice(0, 4) == "std:"
+}
+
+// Sets `numUnionMinted` when `members` may be a union of numbers.
+function noteNumUnionMint(members: i32[]) {
+  if members.length < 2 { return 0 }
+  // A std body's own narrowings (`toString` over `i32 | i64 | boolean | f64`) do not count: std
+  // does no arithmetic over a numeric union, and its signatures are resolved outside its bodies.
+  if curFnDeclIx >= 0 && fnDeclInStd(curFnDeclIx) { return 0 }
+  for m in members {
+    if m < 0 || m >= T.tys.length { return 0 }
+    const mt = T.tys[m]
+    if !isNumericPrimTy(m) && !(mt is TyUnion) && !(mt is TyNullable) {
+      return 0
+    }
+  }
+  numUnionMinted = true
+  0
+}
 
 // Whether the delivery being checked is an argument to a parameter whose declared type names a
 // type parameter: an instance shared across pins holds the member unwidened, so no retag.
@@ -3873,6 +3921,12 @@ let inferSawErr = false
 // rows from its mark, so its arms' values leave the inferred return (`dropTailIfSeeds`).
 let inferRetLogTy: i32[] = []
 let inferRetLogSeed: boolean[] = []
+// Per row of that log, whether the witness is a literal; and whether every witness joined into
+// `inferObserved` so far is one, so a runtime witness beside it joins apart (`joinArmLit`).
+let inferRetLogLit: boolean[] = []
+let inferObservedLit = true
+// Whether the witness `noteInferredRet` is handed next is a literal, set by its caller.
+let inferRetNextLit = false
 // The `return <void expr>` statements of the functions being inferred, per inference frame, and
 // the block each sits in: a void return, refused if its function returns a value (D2635).
 let inferVoidRetSites: i32[] = []
@@ -3887,6 +3941,7 @@ let inferRetSeeding = false
 // The seeds `dropTailIfSeeds` removed, per inference frame: re-joined when the function turns
 // out to return a value anyway, since then the tail's value arms return (`clearTailVerdict`).
 let inferDroppedTy: i32[] = []
+let inferDroppedLit: boolean[] = []
 // True while an explicit `return`'s argument is checked: an `if` there is a value slot, so its
 // verdict never rewinds the inferred return (the slot's own void check refuses it instead).
 let inRetArg = false
@@ -5035,6 +5090,15 @@ export function initChecker() {
   hdRowOfTy = []
   guardAltStack = []
   joinHoleUnions = []
+  njGateNames = Map()
+  njGateScanned = false
+  njGateSeen = 0
+  njGateMemo = Map()
+  njHeldNodes = Map()
+  njFnIx = -1
+  njFnStack = []
+  njPinFn = -1
+  apartHoleJoins = Map()
   dJoinNode = []
   dJoinTy = []
   escJoinTy = []
@@ -5248,9 +5312,11 @@ export function initChecker() {
   daWriteTarget = -1
   inferStack = []
   inferObserved = -1
+  inferObservedLit = true
   inferSawErr = false
   inferRetLogTy = []
   inferRetLogSeed = []
+  inferRetLogLit = []
   inferVoidRetSites = []
   inferVoidRetBlks = []
   chkStmtBlk = -1
@@ -5282,6 +5348,7 @@ export function initChecker() {
   brkPrevTy = -1
   discardValTyAt = Map()
   inferDroppedTy = []
+  inferDroppedLit = []
   // Pass 0 and pass 1's collect tables, reset here with everything else: every
   // `checkProgram` reaches its walk through a caller that ran `initChecker` first
   // (`compileSrc`, `checkSrc`, `checkSrcSym`, `jwSecondPass`), so this is the one
@@ -19049,14 +19116,6 @@ function asPinRefusal(from: i32, to: i32): string {
   "`as` supports numeric conversions only"
 }
 
-// The declared type parameter a union holds, or -1.
-function gradualParamOf(u: TyUnion): i32 {
-  for m in u.uMembers {
-    if tyIsDeclaredParam(m) { return m }
-  }
-  -1
-}
-
 // Whether a member of `ms` is a declared type parameter or a parameter hole.
 function unionHasDeclaredParam(ms: i32[]): boolean {
   for m in ms {
@@ -19129,6 +19188,8 @@ function sameDeclaredTyParam(a: i32, b: i32): boolean {
 // The least upper bound used by `??` (host: `flatten(Union(nonNull(l), r))`):
 // mutually-assignable types collapse to the wider; otherwise a two-member union.
 function joinTys(a: i32, b: i32) {
+  const apart = njApart
+  njApart = false
   if a < 0 { return b }
   if b < 0 { return a }
   // A join is a destination for both sides: an empty `[]` / `Map()` arm takes its sibling's
@@ -19189,6 +19250,10 @@ function joinTys(a: i32, b: i32) {
   if tyVarMemberOf(b, a) { return a }
   const oj = tpOpenJoin(a, b)
   if oj >= 0 { return oj }
+  if apart {
+    const nj = numApartJoin(a, b)
+    if nj >= 0 { return nj }
+  }
   // Two different records may join wider than either (`{f: i32}` into `{f: f64}`) (D2731).
   if !recordJoinMinted && a != b {
     if T.tys[a] is TyObj && T.tys[b] is TyObj { recordJoinMinted = true }
@@ -19245,6 +19310,243 @@ function paramNullJoin(a: i32, b: i32): i32 {
   res
 }
 
+// The members of `t` when it is a union of two or more numeric primitives and nothing else,
+// else an empty list: the operand an operator dispatches over, member by member.
+export function numUnionMembersOf(t: i32): i32[] {
+  const none: i32[] = []
+  if t < 0 || t >= T.tys.length || !(T.tys[t] is TyUnion) { return none }
+  const vs: i32[] = []
+  flattenVariantsInto(t, vs)
+  if vs.length < 2 { return none }
+  for v in vs {
+    if !isNumericPrimTy(v) { return none }
+  }
+  vs
+}
+
+// Whether a numeric union `src` delivers into the numeric primitive `dst0`, or its nullable:
+// every member is it or widens to it exactly, so the value converts at the member it holds.
+export function numUnionConverts(src: i32, dst0: i32): boolean {
+  // A nullable number takes the union the way its number does: the box re-tags each member.
+  let dst = dst0
+  if dst >= 0 && dst < T.tys.length {
+    const dt = T.tys[dst]
+    if dt is TyNullable { dst = dt.nInner }
+  }
+  if !tyIsNumUnion(src) || !isNumericPrimTy(dst) { return false }
+  for m in numUnionMembersOf(src) {
+    if !sameNumeric(m, dst) && !numWidens(m, dst) { return false }
+  }
+  true
+}
+
+// Whether `x as dst` over the numeric union `src` is a conversion no member can fail: `dst` is
+// a float, or `i64` over integer members.
+export function numUnionAsConverts(src: i32, dst: i32): boolean {
+  if !isNumericPrimTy(dst) { return false }
+  const ms = numUnionMembersOf(src)
+  if ms.length == 0 { return false }
+  const dn = primNameStr(primNameOf(dst))
+  for m in ms {
+    if numCastCanFail(primNameStr(primNameOf(m)), dn) { return false }
+  }
+  true
+}
+
+// Whether `t` is a box of numbers: two or more variants, each a numeric primitive or `null`.
+export function tyIsNumericBox(t: i32): boolean {
+  if t < 0 || t >= T.tys.length { return false }
+  const vs: i32[] = []
+  flattenVariantsInto(t, vs)
+  if vs.length < 2 { return false }
+  for v in vs {
+    if !isNumericPrimTy(v) && !isNullTy(v) { return false }
+  }
+  true
+}
+
+// Whether `lt op rt` at a pin, an operand a numeric union, has a scalar form at every member
+// pair. The pin has no operand nodes, so a literal's adoption is the instance check's to decide.
+function numUnionPinOk(op: string, lt: i32, rt: i32): boolean {
+  let ls = numUnionMembersOf(lt)
+  if ls.length == 0 { ls = [lt] }
+  let rs = numUnionMembersOf(rt)
+  if rs.length == 0 { rs = [rt] }
+  for a in ls {
+    for b in rs {
+      if !isNumeric(a) || !isNumeric(b) { return false }
+      if binIntOnlyOp(op) && binFloatOperandPair(a, b) { return false }
+    }
+  }
+  true
+}
+
+// Whether every value the `if`, `match` or block at `ix` yields is a literal (`valueIsLitOnly`).
+export function joinArmIsLit(ix: i32): boolean { valueIsLitOnly(ix) }
+
+// The numeric primitive type of value-atom kind `k` (0 i32, 3 i64, 4 f64, 5 f32), or -1.
+export function numPrimTyOfKind(k: i32): i32 {
+  if k == 0 { return TY_I32 }
+  if k == 3 { return TY_I64 }
+  if k == 4 { return TY_F64 }
+  if k == 5 { return TY_F32 }
+  -1
+}
+
+// The fix a numeric union delivered into a numeric primitive it does not convert to exactly
+// owes: an explicit `as`. Empty for every other pair.
+function numUnionLossNote(got: i32, want: i32): string {
+  if !tyIsNumUnion(got) || !isNumericPrimTy(want) { return "" }
+  " — a member does not convert to "
+    + tyToStr(want)
+    + " exactly; write `x as "
+    + tyToStr(want)
+    + "`"
+}
+
+// Whether `t` is a union of numeric primitives only: `numUnionMembersOf` without the list, for
+// the hot paths that ask it of every operand.
+export function tyIsNumUnion(t: i32): boolean {
+  if !numUnionMinted || t < 0 || t >= T.tys.length || !(T.tys[t] is TyUnion) {
+    return false
+  }
+  numUnionMembersOf(t).length > 0
+}
+
+// Whether `t` is a primitive type, which no union box is.
+export function tyIsPrimIx(t: i32): boolean {
+  t >= 0 && t < T.tys.length && T.tys[t] is TyPrim
+}
+
+// Whether binary operator `op` dispatches over a numeric union operand.
+function numUnionOp(op: string): boolean {
+  op == "+"
+    || op == "-"
+    || op == "*"
+    || op == "/"
+    || op == "%"
+    || op == "<"
+    || op == ">"
+    || op == "<="
+    || op == ">="
+    || op == "=="
+    || op == "!="
+    || binIntOnlyOp(op)
+}
+
+// Whether `op` is a comparison, which answers boolean for every member pair.
+function numCmpOp(op: string): boolean {
+  op == "<" || op == ">" || op == "<=" || op == ">=" || op == "==" || op == "!="
+}
+
+// The type of `a op b` at one member pair, by the rule a scalar pair takes, or -1 when that
+// rule refuses the pair. `n` supplies the operand nodes, so a literal adapts as it does alone.
+function numPairTy(n: BinExpr, a: i32, b: i32): i32 {
+  const t = numPairOpTy(n, a, b)
+  if t < 0 || !numCmpOp(n.binOp) { return t }
+  TY_BOOL
+}
+
+// The type both operands of `a op b` are brought to at one member pair, which is the result
+// for arithmetic, or -1 when the scalar rule refuses the pair.
+export function numPairOpTy(n: BinExpr, a: i32, b: i32): i32 {
+  const op = n.binOp
+  if numCmpOp(op) {
+    if sameNumeric(a, b) { return a }
+    if mixesNumeric(a, b) { return widerNumeric(a, b) }
+    if !cmpF32LitAdopts(n, a, b) { return -1 }
+    if primNameOf(a) == "f32" || primNameOf(a) == "f64" { return a }
+    return b
+  }
+  if binIntOnlyOp(op) && binFloatOperandPair(a, b) { return -1 }
+  if primNameOf(a) == "f32" && f32AdoptingOperand(n.binRight, a) { return a }
+  if primNameOf(b) == "f32" && f32AdoptingOperand(n.binLeft, b) { return b }
+  if primNameOf(a) == "f64" && isExactF64IntLitExpr(n.binRight) { return a }
+  if primNameOf(b) == "f64" && isExactF64IntLitExpr(n.binLeft) { return b }
+  if mixesNumeric(a, b) { return widerNumeric(a, b) }
+  if sameNumeric(a, b) { return a }
+  -1
+}
+
+// The type of `a op b` at operand types `lt`/`rt`, one a numeric union, as `numUnionBinTy`
+// computes it, or -1 when a member pair has no scalar form. Reports nothing.
+export function numUnionResultTy(n: BinExpr, lt: i32, rt: i32): i32 {
+  let ls = numUnionMembersOf(lt)
+  if ls.length == 0 { ls = [lt] }
+  let rs = numUnionMembersOf(rt)
+  if rs.length == 0 { rs = [rt] }
+  const res: i32[] = []
+  for a in ls {
+    for b in rs {
+      if !isNumericPrimTy(a) || !isNumericPrimTy(b) { return -1 }
+      const p = numPairTy(n, a, b)
+      if p < 0 { return -1 }
+      let seen = false
+      for r in res {
+        if r == p || tySame(r, p) { seen = true }
+      }
+      if !seen { res.push(p) }
+    }
+  }
+  if res.length == 1 { return res[0] }
+  mkUnionTy(res)
+}
+
+// `a op b` where an operand is a numeric union: each member pair takes the scalar rule, and
+// the result is the union of the pair results in first-seen order (a comparison is boolean).
+function numUnionBinTy(n: BinExpr, ix: i32, lt: i32, rt: i32): i32 {
+  let ls = numUnionMembersOf(lt)
+  if ls.length == 0 { ls = [lt] }
+  let rs = numUnionMembersOf(rt)
+  if rs.length == 0 { rs = [rt] }
+  const cmp = numCmpOp(n.binOp)
+  const res: i32[] = []
+  for a in ls {
+    for b in rs {
+      if !isNumericPrimTy(a) || !isNumericPrimTy(b) {
+        tErr(
+          "operator '"
+            + n.binOp
+            + "' is not defined for "
+            + tyToStr(lt)
+            + " and "
+            + tyToStr(rt),
+          ix,
+        )
+        if cmp { return TY_BOOL }
+        return TY_ERR
+      }
+      const p = numPairTy(n, a, b)
+      if p < 0 {
+        tErr(
+          "operator '"
+            + n.binOp
+            + "' over "
+            + tyToStr(lt)
+            + " and "
+            + tyToStr(rt)
+            + " mixes the members "
+            + tyToStr(a)
+            + " and "
+            + tyToStr(b)
+            + "; narrow with `is` or convert with `as` first",
+          ix,
+        )
+        if cmp { return TY_BOOL }
+        return TY_ERR
+      }
+      let seen = false
+      for r in res {
+        if r == p || tySame(r, p) { seen = true }
+      }
+      if !seen { res.push(p) }
+    }
+  }
+  if cmp { return TY_BOOL }
+  if res.length == 1 { return res[0] }
+  mkUnionTy(res)
+}
+
 // Whether `t` is a union holding a declared type parameter, decided per instance.
 function tyIsParamUnion(t: i32): boolean {
   if t < 0 || t >= T.tys.length { return false }
@@ -19261,6 +19563,342 @@ function joinArmTys(a: i32, b: i32): i32 {
   const j = joinTys(a, b)
   tpArmJoinDepth = tpArmJoinDepth - 1
   j
+}
+
+// Whether the next `joinTys` keeps two runtime numeric types apart (`numApartJoin`); read and
+// cleared at its entry, so a join nested inside it (a record's fields) is not affected.
+let njApart = false
+// `njApart` for a return-inference join (`inferRetJoin`).
+let njApartRet = false
+
+// Whether function `fx` joins its returns as master did, by widening: its return set holds a
+// literal arm or a held-back call, or `njFnReached`. The rule's joins are kept only where every
+// caller sees them; the rest are D3494 and D3495.
+export function njFnGated(fx: i32): boolean {
+  if fx < 0 || fx >= P.nodes.length { return false }
+  const memo = njGateMemo.get(fx)
+  if memo != null { return memo }
+  let g = false
+  // Provisional, so a cycle of returned calls reads the members not yet decided as direct.
+  njGateMemo[fx] = false
+  const fn = P.nodes[fx]
+  if fn is FuncDecl {
+    g = njFnReached(fx) || (fn.fnRet < 0 && njRetSetHeld(fn.fnBody))
+  }
+  njGateMemo[fx] = g
+  g
+}
+
+// Whether every join in function `fx` is master's: it is reached other than by a direct call
+// from a concrete context (from a generic, hole or lambda body, by value, or recursively).
+export function njFnReached(fx: i32): boolean {
+  if fx < 0 || fx >= P.nodes.length { return false }
+  const fn = P.nodes[fx]
+  if !(fn is FuncDecl) { return false }
+  if fn.fnName == "" { return true }
+  if !njGateScanned { njGateScan() }
+  njGateNames.get(fn.fnName) ?? false
+}
+
+// Whether expression `ix` is the result of a call `njFnGated` holds back, or a name bound
+// only from one: its members are master's widening, so an operator, conversion or delivery the
+// rule adds is refused over it, as there. A union a direct join produced is never held.
+export function njExprHeld(ix: i32): boolean {
+  if njHeldNodes.length == 0 { return false }
+  njExprHeldAt(ix, 0)
+}
+
+function njExprHeldAt(ix: i32, depth: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length || depth > 4 { return false }
+  const e = cwPeel(ix)
+  if e < 0 || e >= P.nodes.length { return false }
+  if njHeldNodes.get(e) ?? false { return true }
+  const id = P.nodes[e]
+  if !(id is Ident) { return false }
+  // The name's declarations in the body being checked: held only when every one is.
+  let root = -1
+  if njFnIx >= 0 && njFnIx < P.nodes.length {
+    const fn = P.nodes[njFnIx]
+    if fn is FuncDecl { root = fn.fnBody }
+  }
+  const todo: i32[] = []
+  if root >= 0 {
+    todo.push(root)
+  } else {
+    for r in gRootStmts { todo.push(r) }
+  }
+  let held = false
+  while todo.length > 0 {
+    const at = todo.pop() ?? -1
+    if at >= 0 && at < P.nodes.length {
+      const n = P.nodes[at]
+      if n is LetDecl {
+        if n.letName == id.identName {
+          if n.letKw != "const" || n.letInit < 0 { return false }
+          if !njExprHeldAt(n.letInit, depth + 1) { return false }
+          held = true
+        }
+      }
+      for k in nodeChildren(at) {
+        if k >= 0 { todo.push(k) }
+      }
+    }
+  }
+  held
+}
+
+// Notes call `ix` as one `njExprHeld` refuses when its callee is held back.
+function njNoteHeldCall(n: Call, ix: i32, t: i32) {
+  if t < 0 || t >= T.tys.length { return 0 }
+  const cf = P.nodes[n.callFn]
+  if !(cf is Ident) { return 0 }
+  const d = fnDeclIx.get(cf.identName) ?? -1
+  if d < 0 { return 0 }
+  // A declared return is the union the author wrote, not a join.
+  const dn = P.nodes[d]
+  if !(dn is FuncDecl) || dn.fnRet >= 0 || !njFnGated(d) { return 0 }
+  if !tyIsNumUnion(nonNullTy(t)) { return 0 }
+  // Only a callee whose inferred return is itself a join can have mis-joined its members; one
+  // that hands back an argument (`rec<T>(v: T) { … v }`) returns that argument's own type.
+  const ft = nodeTyIxOf(d)
+  if ft < 0 || ft >= T.tys.length { return 0 }
+  const fnt = T.tys[ft]
+  if !(fnt is TyFunc) { return 0 }
+  const rt = nonNullTy(fnt.fnRet)
+  if rt < 0 || rt >= T.tys.length || !(T.tys[rt] is TyUnion) { return 0 }
+  njHeldNodes[ix] = true
+  0
+}
+
+// Whether a join of `a` and `b` in the body being checked is held back: by `njFnGated` for a
+// return set (`ret`), by `njFnReached` for any other.
+function njJoinGated(a: i32, b: i32, ret: boolean): boolean {
+  if !njJoinMayPart(njFnIx, a, b) { return false }
+  if ret { return njFnGated(njFnIx) }
+  njFnReached(njFnIx)
+}
+
+// Whether a join of `a` and `b` in function `fx` could keep two numbers apart at all: both
+// hold a number or a type variable, and not the same numbers alone.
+function njJoinMayPart(fx: i32, a: i32, b: i32): boolean {
+  if fx < 0 || a == b { return false }
+  const sa = njNumSig(a, 0)
+  if sa == 0 { return false }
+  const sb = njNumSig(b, 0)
+  if sb == 0 { return false }
+  sa != sb || sa >= 16
+}
+
+// The number types `t` holds as bits (`njNumNames` order from 1), plus 16 for a type
+// variable, through unions and nullables; 0 for none.
+function njNumSig(t: i32, depth: i32): i32 {
+  if t < 0 || t >= T.tys.length || depth > 8 { return 0 }
+  const x = nonNullTy(t)
+  if x < 0 || x >= T.tys.length { return 0 }
+  const u = T.tys[x]
+  if u is TyUnion {
+    let r = 0
+    for m in u.uMembers { r = r | njNumSig(m, depth + 1) }
+    return r
+  }
+  if tyIsHole(x) { return 16 }
+  const pn = primNameStr(primNameOf(x))
+  let bit = 1
+  for nm in njNumNames {
+    if nm == pn { return bit }
+    bit = bit * 2
+  }
+  0
+}
+
+// The number types, in `njNumSig`'s bit order; every other primitive holds no number.
+const njNumNames: string[] = ["i32", "i64", "f32", "f64"]
+
+// Whether any value the function body at `body` returns has a literal arm, or is a call of a
+// function `njFnGated` holds back.
+function njRetSetHeld(body: i32): boolean {
+  const rets: i32[] = []
+  collectRetValues(body, rets)
+  for r in rets {
+    const leaves: i32[] = []
+    tailValueLeaves(r, leaves)
+    for l in leaves {
+      if valueIsLitOnly(l) { return true }
+      const c = P.nodes[cwPeel(l)]
+      if c is Call {
+        const cf = P.nodes[c.callFn]
+        if cf is Ident {
+          const d = fnDeclIx.get(cf.identName) ?? -1
+          if d >= 0 && njFnGated(d) { return true }
+        }
+      }
+    }
+  }
+  false
+}
+
+// Records every name mentioned in a generic, hole or lambda body, every name read other than as
+// a call's callee or as a member, and every function that mentions itself.
+function njGateScan() {
+  njGateScanned = true
+  const callee: {[i32]: boolean} = Map()
+  const reads: i32[] = []
+  let i = njGateSeen
+  while i < P.nodes.length {
+    const n = P.nodes[i]
+    if n is Call {
+      callee[n.callFn] = true
+    } else if n is Ident {
+      reads.push(i)
+    } else if n is Member {
+      njGateNames[n.memProp] = true
+    } else if n is FuncDecl {
+      let open = n.fnName == "" || n.fnTyParams.length > 0
+      for pi in n.fnParams {
+        const pn = P.nodes[pi]
+        if pn is Param {
+          if pn.parType < 0 { open = true }
+        }
+      }
+      njGateBody(n.fnBody, open, n.fnName)
+    }
+    i = i + 1
+  }
+  njGateSeen = P.nodes.length
+  for r in reads {
+    if !(callee.get(r) ?? false) {
+      const rn = P.nodes[r]
+      if rn is Ident { njGateNames[rn.identName] = true }
+    }
+  }
+  0
+}
+
+// Walks body `ix`: every name it mentions when `open`, else only `self`.
+function njGateBody(ix: i32, open: boolean, self: string) {
+  const todo: i32[] = [ix]
+  while todo.length > 0 {
+    const at = todo.pop() ?? -1
+    if at >= 0 && at < P.nodes.length {
+      const n = P.nodes[at]
+      if n is Ident {
+        if open || n.identName == self { njGateNames[n.identName] = true }
+      }
+      for k in nodeChildren(at) {
+        if k >= 0 { todo.push(k) }
+      }
+    }
+  }
+  0
+}
+
+// `joinArmTys` of an arm typed `a` beside one typed `b`, where `aLit`/`bLit` say an arm's every
+// value is a literal. Two runtime values of different numeric types join as their union; a
+// literal adapts to its sibling as before.
+function joinArmLit(a: i32, aLit: boolean, b: i32, bLit: boolean): i32 {
+  if a == b { return joinArmTys(a, b) }
+  const apart = !aLit && !bLit && !njJoinGated(a, b, false)
+  njApart = apart
+  const j = joinArmTys(a, b)
+  njApart = false
+  if apart { markTpJoinApart(j) }
+  j
+}
+
+// Marks a join kept apart over a type parameter (`tpJoinUnions`), or the union inside its
+// nullable, as one of runtime arms: a pin re-joins its members apart too (`rejoinMembers`).
+function markTpJoinApart(j: i32) {
+  if j < 0 || j >= T.tys.length || tpJoinUnions.length == 0 { return 0 }
+  // arena-tick exempt: a per-program mark on an existing arena row.
+  if tpJoinUnions.has(j) { tpJoinUnions[j] = 2 }
+  const jt = T.tys[j]
+  if jt is TyNullable {
+    // arena-tick exempt: a per-program mark on an existing arena row.
+    if tpJoinUnions.has(jt.nInner) { tpJoinUnions[jt.nInner] = 2 }
+  }
+  0
+}
+
+// Set for one `rejoinMembers` call whose members are runtime values, joined apart.
+let njRejoinApart = false
+
+// The union of `a` and `b` when each holds a numeric primitive and their numeric members differ,
+// else -1: runtime values of different numeric types join apart, never widened.
+function numApartJoin(a: i32, b: i32): i32 {
+  if a == b || a < 0 || b < 0 { return -1 }
+  if !tyHoldsNumericPrim(a) || !tyHoldsNumericPrim(b) { return -1 }
+  if tyHasTyVar(a) || tyHasTyVar(b) { return -1 }
+  if !numericVariantUncovered(a, b) && !numericVariantUncovered(b, a) {
+    return -1
+  }
+  joinVariantTys(a, b)
+}
+
+// Whether a variant of `t` is a numeric primitive.
+function tyHoldsNumericPrim(t: i32): boolean {
+  const vs: i32[] = []
+  flattenVariantsInto(t, vs)
+  for v in vs {
+    if isNumericPrimTy(v) { return true }
+  }
+  false
+}
+
+// Whether every value the `if`, `match` or block at `ix` yields is a literal: a number, a
+// negated or parenthesised one, an operator tree of them, or `null`, and one is not `null`.
+// Such a value adapts to the type beside it in a join.
+function valueIsLitOnly(ix: i32): boolean {
+  if ix < 0 { return false }
+  let adapts = false
+  const todo: i32[] = [ix]
+  while todo.length > 0 {
+    const at = cwPeel(todo.pop() ?? -1)
+    if at >= 0 && at < P.nodes.length {
+      if !tailPushIfArms(at, todo) && !tailPushMatchArms(at, todo) {
+        if !tailPushBlockTail(at, todo) {
+          // The first value that does not adapt settles it, so a chain costs one leaf.
+          if !leafIsLit(at, 8) { return false }
+          // A `null` leaf adapts to nothing: an arm of only `null` leaves a sibling apart.
+          if !(P.nodes[parenPeelIx(at)] is NullLit) { adapts = true }
+        }
+      }
+    }
+  }
+  adapts
+}
+
+// `valueIsLitOnly(ix)` for an arm typed `ty`, asked only where it can decide a join: an arm
+// holding no number and no type parameter answers false without a walk.
+function armLit(ty: i32, ix: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  // The common arm, one number or a non-number, settles without flattening anything.
+  const t = T.tys[ty]
+  if t is TyPrim {
+    if !isNumericPrimTy(ty) { return false }
+  } else if !tyHoldsNumericPrim(ty) && !tyHasTyVar(ty) {
+    return false
+  }
+  valueIsLitOnly(ix)
+}
+
+// Whether `ix` reads a literal `const`, which is typed at each use as its literal is.
+function readsLitConst(ix: i32): boolean {
+  const n = P.nodes[ix]
+  if n is Ident { return cexNameIsLitConst(ix, n.identName) }
+  false
+}
+
+// Whether the expression at `ix` adapts in a join: a number or `null` literal, an operator tree
+// of numbers, a literal `const`, or an assignment, whose arm yields no value to join.
+function leafIsLit(ix: i32, depth: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const x = parenPeelIx(ix)
+  if x < 0 || x >= P.nodes.length { return false }
+  if litTreeOps(x, depth) >= 0 || isFloatLitExpr(x) || crIsPlainAssign(x) {
+    return true
+  }
+  if readsLitConst(x) { return true }
+  P.nodes[x] is NullLit
 }
 
 // The join of `a` and `b` when every member is a declared type parameter or a null and one
@@ -19511,11 +20149,29 @@ export function tpIfJoinPinTy(ix: i32, bNames: string[], bTys: i32[]): i32 {
 // The join of the concrete arm types `ts`, as the body re-checked at a pin joins them, or -1
 // when they clash. An instance reads it where the template's join named a type parameter.
 export function joinPinnedArmTys(ts: i32[]): i32 {
+  const lits: boolean[] = []
+  joinPinnedArmLit(ts, lits)
+}
+
+// `joinPinnedArmTys` where `lits[i]` says arm `i` is a literal: two runtime arms of different
+// numeric types join apart, as the direct spelling's arms do. A missing flag reads as literal.
+export function joinPinnedArmLit(ts: i32[], lits: boolean[]): i32 {
   const savedClash = joinClashMsg
   let j = -1
+  let accLit = true
   let i = 0
   while i < ts.length {
-    if ts[i] >= 0 { j = joinTys(j, ts[i]) }
+    if ts[i] >= 0 {
+      const lit = i >= lits.length || lits[i]
+      if j >= 0 {
+        njApart = !accLit
+          && !lit
+          && !(njJoinMayPart(njPinFn, j, ts[i]) && njFnReached(njPinFn))
+      }
+      j = joinTys(j, ts[i])
+      njApart = false
+      accLit = accLit && lit
+    }
     i = i + 1
   }
   joinClashMsg = savedClash
@@ -19730,6 +20386,8 @@ function tpIfRecheck(
   // witnesses of whatever function is being inferred around this call.
   if want >= 0 { T.curRet = want } else { T.curRet = TY_ERR }
   curFnDeclIx = fn
+  const savedNjFn = njFnIx
+  njFnIx = fn
   cstrOwnerStack.push(fn)
   tpIfCmpNames = bNames
   tpIfCmpTys = bTys
@@ -19763,6 +20421,7 @@ function tpIfRecheck(
   if msg == "" { msg = tpIfCmpBad }
   cstrOwnerStack.pop()
   curFnDeclIx = savedFn
+  njFnIx = savedNjFn
   T.curRet = savedRet
   retNatural = savedNat
   retNaturalErr = savedNatErr
@@ -20289,6 +20948,7 @@ function joinRetTys(a: i32, b: i32) {
   if !tyIsHole(a) && !tyIsHole(b) {
     const saved = tpApartConcrete
     tpApartConcrete = true
+    njApart = njApartRet
     const j = joinTys(a, b)
     tpApartConcrete = saved
     return j
@@ -20311,6 +20971,7 @@ function joinRetTys(a: i32, b: i32) {
   if uniq.length == 1 { return uniq[0] }
   const res = mkUnionTy(uniq)
   joinHoleUnions.push(res)
+  if njApartRet { apartHoleJoins[res] = true }
   res
 }
 
@@ -20322,10 +20983,13 @@ function collapseDeferredJoin(tyIx: i32) {
   if !tyIsDeferredJoin(tyIx) { return tyIx }
   const t = T.tys[tyIx]
   if t is TyUnion {
+    const apart = apartHoleJoins.get(tyIx) ?? false
     let res = -1
     let i = 0
     while i < t.uMembers.length {
+      if res >= 0 { njApart = apart }
       res = joinTys(res, t.uMembers[i])
+      njApart = false
       i = i + 1
     }
     if res >= 0 { return res }
@@ -20467,9 +21131,12 @@ function refoldJoinUnion(
   let j = 0
   // A lambda's deferred return re-joins as it always has: its instance builds no kept-apart join.
   lamCheckDepth = lamCheckDepth + 1
+  const apart = apartHoleJoins.get(tyIx) ?? false
   while j < orig.length {
     if !holeMemberDeadAt(orig[j], bNames, bTys) {
+      njApartRet = apart
       res = joinRetTys(res, subst[j])
+      njApartRet = false
       live = live + 1
     }
     j = j + 1
@@ -21750,6 +22417,9 @@ function binShiftOp(op: string): boolean {
 
 export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
   lbiNoteDelivery(srcExpr, dstTy, nlAsgTgt)
+  if numUnionMinted && numUnionConverts(srcTy, dstTy) && !njExprHeld(srcExpr) {
+    return true
+  }
   if srcExpr >= 0 && dstTy >= 0 {
     const cse = P.nodes[srcExpr]
     if cse is NumLit || cse is Unary || cse is Paren {
@@ -38325,6 +38995,7 @@ function argMismatchErr(argN: i32, expected: i32, at: i32, argIx: i32) {
     + tyToStr(at)
     + charLitForStringNote(argIx, expected)
     + boolForNumberNote(at, expected)
+    + numUnionLossNote(at, expected)
   if argIx >= 0 && argIx < P.nodes.length {
     const n = P.nodes[argIx]
     if n is FuncDecl {
@@ -38883,7 +39554,7 @@ function letAssignMsg(
   // Both sides numeric but not assignable ⇒ a lossy/narrowing edge the lossless-only
   // implicit-widening rule won't take silently. Explain the lossiness rather than
   // the opaque "cannot assign i32 to f32".
-  if isNumeric(got) && isNumeric(want) {
+  if (isNumeric(got) || tyIsNumUnion(got)) && isNumeric(want) {
     return tyToStr(got)
       + " doesn't fit in "
       + tyToStr(want)
@@ -39998,9 +40669,13 @@ function binOpDefinedFor(op: string, lt0: i32, rt0: i32) {
   const rt = softenLitTy(rt0)
   if tyHasHole(lt) || tyHasHole(rt) { return true }
   if op == "min" || op == "max" { return minMaxPinOk(lt, rt) }
-  if op == OP_NEG { return isNumeric(lt) }
-  if op == OP_AS { return asPinHolds(lt0, rt0) }
+  if op == OP_NEG { return isNumeric(lt) || tyIsNumUnion(lt) }
+  if op == OP_AS { return asPinHolds(lt0, rt0) || numUnionAsConverts(lt0, rt0) }
   if op == OP_LITFIT { return primNameOf(lt) != "i32" }
+  // A numeric union operand dispatches per member, each pair a scalar one (`numUnionBinTy`).
+  if (numUnionOp(op) && (tyIsNumUnion(lt) || tyIsNumUnion(rt))) {
+    return numUnionPinOk(op, lt, rt)
+  }
   // The nominal-brand mix the BODY deferred on a hole operand (D1747). Both operands are
   // concrete here, which is the precondition that question needs; only a branded PAIR is
   // judged, since a pin has no expression node for `nomBinMixes`'s literal-adoption legs.
@@ -42540,11 +43215,15 @@ function substListTwin(a: i32, b: i32): boolean {
 
 // The members of a union re-joined one at a time, as the join that made it would at these types.
 function rejoinMembers(ms: i32[]): i32 {
+  const apart = njRejoinApart
+  njRejoinApart = false
   if ms.length == 0 { return -1 }
   let r = ms[0]
   let i = 1
   while i < ms.length {
+    njApart = apart
     r = joinTys(r, ms[i])
+    njApart = false
     i = i + 1
   }
   rejoinDropSubsumed(r)
@@ -42606,6 +43285,7 @@ export function substTyDeep(tyIx: i32, bNames: string[], bTys: i32[]) {
       flattenVariantsInto(n2, nms)
       const tpSaved = tpApartConcrete
       tpApartConcrete = true
+      njRejoinApart = (tpJoinUnions.get(tyIx) ?? 0) == 2
       n2 = rejoinMembers(nms)
       tpApartConcrete = tpSaved
     }
@@ -42664,6 +43344,7 @@ export function substTyDeep(tyIx: i32, bNames: string[], bTys: i32[]) {
       // A union the return-set join kept apart re-joins under the same rule (D2784).
       const tpSaved = tpApartConcrete
       tpApartConcrete = true
+      njRejoinApart = (tpJoinUnions.get(tyIx) ?? 0) == 2
       res = rejoinMembers(out3)
       tpApartConcrete = tpSaved
     } else if changed3 {
@@ -47152,19 +47833,36 @@ function noteInferredRet(t: i32) {
   // sees the true type — first-wins alone silently dropped later branches. A return reached
   // only through an `is`-guard over a hole param contributes a guarded member instead (`mkGuardedRetTy`).
   const g = mkGuardedRetTy(t)
+  const lit = inferRetNextLit
+  inferRetNextLit = false
   inferRetLogTy.push(g)
   inferRetLogSeed.push(inferRetSeeding)
+  inferRetLogLit.push(lit)
+  inferRetJoin(g, lit)
+  0
+}
+
+// Joins the return witness `g` into `inferObserved`; `lit` says it is a literal.
+function inferRetJoin(g: i32, lit: boolean) {
+  // A witness holding no number (a `null`, a string) neither adapts nor keeps a join apart.
+  const neutral = !tyHoldsNumericPrim(g) && !tyHasTyVar(g)
   if inferObserved < 0 {
     inferObserved = g
-  } else {
-    inferObserved = joinRetTys(inferObserved, g)
+    inferObservedLit = neutral || lit
+    return 0
   }
+  njApartRet = !inferObservedLit && !lit && !njJoinGated(inferObserved, g, true)
+  inferObserved = joinRetTys(inferObserved, g)
+  if njApartRet { markTpJoinApart(inferObserved) }
+  njApartRet = false
+  if !neutral { inferObservedLit = inferObservedLit && lit }
   0
 }
 
 // A tail `if` arm's value, noted as a seed so `dropTailIfSeeds` can take it back.
-function noteInferredSeed(t: i32) {
+function noteInferredSeed(t: i32, lit: boolean) {
   inferRetSeeding = true
+  inferRetNextLit = lit
   noteInferredRet(t)
   inferRetSeeding = false
   0
@@ -47172,32 +47870,34 @@ function noteInferredSeed(t: i32) {
 
 // Rewinds the inferred return to `obsMark`, the value it had at log row `logMark`, and re-joins
 // only the non-seed rows since: the `return`s stay, every tail-arm value below the mark leaves.
-function dropTailIfSeeds(logMark: i32, obsMark: i32) {
+function dropTailIfSeeds(logMark: i32, obsMark: i32, obsLit: boolean) {
   if logMark > inferRetLogTy.length { return 0 }
   const keepTy: i32[] = []
+  const keepLit: boolean[] = []
   let i = logMark
   while i < inferRetLogTy.length {
     if inferRetLogSeed[i] {
       inferDroppedTy.push(inferRetLogTy[i])
+      inferDroppedLit.push(inferRetLogLit[i])
     } else {
       keepTy.push(inferRetLogTy[i])
+      keepLit.push(inferRetLogLit[i])
     }
     i = i + 1
   }
   while inferRetLogTy.length > logMark {
     inferRetLogTy.pop()
     inferRetLogSeed.pop()
+    inferRetLogLit.pop()
   }
   inferObserved = obsMark
+  inferObservedLit = obsLit
   let k = 0
   while k < keepTy.length {
     inferRetLogTy.push(keepTy[k])
     inferRetLogSeed.push(false)
-    if inferObserved < 0 {
-      inferObserved = keepTy[k]
-    } else {
-      inferObserved = joinRetTys(inferObserved, keepTy[k])
-    }
+    inferRetLogLit.push(keepLit[k])
+    inferRetJoin(keepTy[k], keepLit[k])
     k = k + 1
   }
   0
@@ -47241,7 +47941,14 @@ function matchTallyBegin(ix: i32): i32 {
   -1
 }
 
-function matchArmTally(ix: i32, body: i32, armTy: i32, acc: i32): i32 {
+function matchArmTally(
+  ix: i32,
+  body: i32,
+  armTy: i32,
+  acc: i32,
+  accLit: boolean,
+  lit: boolean,
+): i32 {
   if ix < 0 || stmtAlwaysExits(body) { return acc }
   if ifArmGivesNoValue(body, armTy) {
     ifNoValueAt[ix] = true
@@ -47249,7 +47956,7 @@ function matchArmTally(ix: i32, body: i32, armTy: i32, acc: i32): i32 {
   }
   const v = f32ArmPlainTy(body, ifArmValTy(body, armTy))
   if acc < 0 { return v }
-  joinArmTys(acc, v)
+  joinArmLit(acc, accLit, v, lit)
 }
 
 function matchTallyEnd(ix: i32, acc: i32) {
@@ -47280,7 +47987,7 @@ function clearTailVerdict(ix: i32) {
 }
 
 // The last statement of the block at `ix`, or -1 for an empty block or a non-block node.
-function blockLastStmt(ix: i32): i32 {
+export function blockLastStmt(ix: i32): i32 {
   if ix < 0 { return -1 }
   const b = P.nodes[ix]
   if !(b is Block) { return -1 }
@@ -47367,7 +48074,8 @@ function checkTailArmsAgainst(ix: i32, ret: i32) {
               + tyToStr(ret)
               + ", got "
               + tyToStr(lt)
-              + boolForNumberNote(lt, ret),
+              + boolForNumberNote(lt, ret)
+              + numUnionLossNote(lt, ret),
             lf,
             ret,
           )
@@ -49499,6 +50207,7 @@ function checkFuncDeclNodeReal(n: FuncDecl, fnIx: i32) {
   // Save the inference accumulators (a demand-inference can nest inside another
   // function's body check) and the enclosing return type.
   const savedObserved = inferObserved
+  const savedObservedLit = inferObservedLit
   const savedSawErr = inferSawErr
   const savedRetLogLen = inferRetLogTy.length
   const savedVoidRetLen = inferVoidRetSites.length
@@ -49514,6 +50223,7 @@ function checkFuncDeclNodeReal(n: FuncDecl, fnIx: i32) {
   if inferring {
     inferStack.push(inferKey)
     inferObserved = -1
+    inferObservedLit = true
     inferSawErr = false
     fnSawValueRet = false
   }
@@ -49597,6 +50307,8 @@ function checkFuncDeclNodeReal(n: FuncDecl, fnIx: i32) {
   if n.fnName != "" { curFnEscName = n.fnName }
   const savedFnDeclIx = curFnDeclIx
   curFnDeclIx = fnIx
+  const savedNjFn = njFnIx
+  njFnIx = fnIx
   // Why this body's return type is void, for the return that disagrees with it: nobody wrote
   // `: void`, so the mismatch has to name the bare `return` that decided it.
   const savedBareRetVoid = curFnBareRetVoid
@@ -49697,7 +50409,8 @@ function checkFuncDeclNodeReal(n: FuncDecl, fnIx: i32) {
                       + tyToStr(ret)
                       + ", got "
                       + tyToStr(stTy)
-                      + boolForNumberNote(stTy, ret),
+                      + boolForNumberNote(stTy, ret)
+                      + numUnionLossNote(stTy, ret),
                     stmts[s],
                     ret,
                   )
@@ -49730,6 +50443,7 @@ function checkFuncDeclNodeReal(n: FuncDecl, fnIx: i32) {
           // A tail `if` with a value-less arm is a statement, so the body has no tail value.
           if !ifYieldsNoValue(stmts[s]) {
             noteInferRetWitness(stmts[s], stTy)
+            inferRetNextLit = armLit(stTy, stmts[s])
             noteInferredRet(
               ifTailValTyOf(stmts[s], inferRetTyOf(stmts[s], stTy)),
             )
@@ -49786,6 +50500,7 @@ function checkFuncDeclNodeReal(n: FuncDecl, fnIx: i32) {
   inRetArg = savedInRetArg
   curFnEscName = savedEscName
   curFnDeclIx = savedFnDeclIx
+  njFnIx = savedNjFn
   curFnBareRetVoid = savedBareRetVoid
   daLeaveFrame(daSavedUnassigned)
   let tpPop = 0
@@ -49819,11 +50534,14 @@ function checkFuncDeclNodeReal(n: FuncDecl, fnIx: i32) {
   if inferring && inferObserved >= 0 {
     let dk = savedDroppedLen
     while dk < inferDroppedTy.length {
-      inferObserved = joinRetTys(inferObserved, inferDroppedTy[dk])
+      inferRetJoin(inferDroppedTy[dk], inferDroppedLit[dk])
       dk = dk + 1
     }
   }
-  while inferDroppedTy.length > savedDroppedLen { inferDroppedTy.pop() }
+  while inferDroppedTy.length > savedDroppedLen {
+    inferDroppedTy.pop()
+    inferDroppedLit.pop()
+  }
   inferObserved = inferRetF32Join(inferring, inferObserved)
   if inferring {
     ret = finishInferredReturn(
@@ -49837,6 +50555,7 @@ function checkFuncDeclNodeReal(n: FuncDecl, fnIx: i32) {
       savedValueRet,
       bodyTotalForRet,
     )
+    inferObservedLit = savedObservedLit
     // Inferred non-void after all: the tail's value arms return (`clearTailVerdict`).
     if ret >= 0 && !isVoidTy(ret) && ret != TY_ERR {
       clearTailVerdict(blockLastStmt(n.fnBody))
@@ -49847,6 +50566,7 @@ function checkFuncDeclNodeReal(n: FuncDecl, fnIx: i32) {
   while inferRetLogTy.length > savedRetLogLen {
     inferRetLogTy.pop()
     inferRetLogSeed.pop()
+    inferRetLogLit.pop()
   }
   // Soundness — missing return: a function whose body can fall off the end without yielding a
   // value on some path implicitly produces `null`, sound only when `null` is part of the
@@ -52139,6 +52859,7 @@ function checkNodeReal(ix: i32) {
     return checkBinExprNode(n, ix)
   } else if n is Call {
     const callTy = checkCallNode(n, ix)
+    if numUnionMinted { njNoteHeldCall(n, ix, callTy) }
     // A call is where a path narrowing can be falsified by a write the guarded
     // scope never spells. Asked after the arguments are checked so the call's own
     // operands still read under the narrowing that holds at their own evaluation.
@@ -58505,6 +59226,8 @@ function monoRecheckBegin(
   sv.push(isvalTok.length)
   inferQuiet = true
   symEnabled = 0
+  njFnStack.push(njFnIx)
+  njFnIx = declIx
   // Binds the type parameters too, not only the value ones: `checkFuncDecl` keeps them in
   // scope as an opaque hole, so a body annotation naming one would otherwise stay a hole forever.
   let tpb = 0
@@ -58548,6 +59271,7 @@ function monoRecheckBegin(
 // stream — so the global checker state the emitter still reads matches its original values.
 function monoRecheckEnd(sv: i32[]) {
   monoRecheckDepth = monoRecheckDepth - 1
+  njFnIx = njFnStack.pop() ?? -1
   popScope()
   crFnLeave()
   while tpEnvNames.length > sv[17] {
@@ -58673,6 +59397,11 @@ export function monoInferRetExprTy(
         retName = tyToEmitName(rt)
         if retName != "" { outTy.push(rt) }
       }
+      // Nor is a union of numbers, the box an operator over a join of the pins yields.
+      if tyIsNumUnion(rt) {
+        retName = valueUnionRetName(rt)
+        if retName != "" { outTy.push(rt) }
+      }
     }
   }
   monoRecheckEnd(sv)
@@ -58700,12 +59429,23 @@ export function monoInferRetSetUnionName(
   if !monoRecheckBegin(declIx, paramTyIxs, tpNames, tpTys, sv) { return "" }
   let joined = -1
   let ok = true
+  // Runtime returns join apart at the pin as they do in the body (`inferRetJoin`).
+  let accLit = true
   let i = 0
   while i < rets.length {
     const rt = checkNode(rets[i])
-    if rt < 0 || rt == TY_VOID || rt == TY_ERR || tyHasHole(rt) { ok = false }
-    else if joined < 0 { joined = rt }
-    else { joined = joinTys(joined, rt) }
+    if rt < 0 || rt == TY_VOID || rt == TY_ERR || tyHasHole(rt) {
+      ok = false
+    } else if joined < 0 {
+      joined = rt
+      accLit = armLit(rt, rets[i])
+    } else {
+      const lit = armLit(rt, rets[i])
+      njApart = !accLit && !lit && !njFnGated(declIx)
+      joined = joinTys(joined, rt)
+      njApart = false
+      accLit = accLit && lit
+    }
     i = i + 1
   }
   let name = ""
@@ -59466,6 +60206,24 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
         ix,
       )
       return TY_ERR
+    }
+  }
+  if (
+    numUnionMinted
+    && (tyIsNumUnion(lt) || tyIsNumUnion(rt))
+    && numUnionOp(op)
+    && !njExprHeld(n.binLeft)
+    && !njExprHeld(n.binRight)
+  ) {
+    if !(op == "+" && (concatsAsStr(lt) || concatsAsStr(rt))) {
+      // Beside a type parameter the pairs are the pin's to check (`numUnionPinOk`).
+      if tyHasTyVar(lt) || tyHasTyVar(rt) {
+        noteBinCstr(lt, op, rt)
+        if numCmpOp(op) { return TY_BOOL }
+        if tyIsNumUnion(lt) { return lt }
+        return rt
+      }
+      return numUnionBinTy(n, ix, lt, rt)
     }
   }
   // Assignment: RHS must be assignable to the LHS's (already-bound) type.
@@ -61015,6 +61773,7 @@ function checkMatchIntArms(n: MatchExpr, ix: i32, st: i32) {
   let matchTy = -1
   const matchArmTys: i32[] = []
   let matchValAcc = matchTallyBegin(ix)
+  let mArmsLit = true
   const nArms = n.matchArmStart.length
   let ai = 0
   while ai < nArms {
@@ -61067,9 +61826,23 @@ function checkMatchIntArms(n: MatchExpr, ix: i32, st: i32) {
       if armTy < 0 { armTy = TY_VOID }
     }
     if !matchArmExits(ix, body, armTy) {
-      matchTy = joinArmTys(matchTy, f32ArmPlainTy(body, armTy))
+      const bodyLit = armLit(armTy, body)
+      matchTy = joinArmLit(
+        matchTy,
+        mArmsLit,
+        f32ArmPlainTy(body, armTy),
+        bodyLit,
+      )
       if tpEnvNames.length > 0 { matchArmTys.push(f32ArmPlainTy(body, armTy)) }
-      matchValAcc = matchArmTally(ix, body, armTy, matchValAcc)
+      matchValAcc = matchArmTally(
+        ix,
+        body,
+        armTy,
+        matchValAcc,
+        mArmsLit,
+        bodyLit,
+      )
+      mArmsLit = mArmsLit && bodyLit
     }
     ai = ai + 1
   }
@@ -61367,6 +62140,7 @@ function checkMatchTypeArms(n: MatchExpr, ix: i32, st: i32, uMems: i32[]) {
   let matchTy = -1
   const matchArmTys: i32[] = []
   let matchValAcc = matchTallyBegin(ix)
+  let mArmsLit = true
   let bi = 0
   while bi < nArms {
     const nmz: string[] = []
@@ -61409,9 +62183,23 @@ function checkMatchTypeArms(n: MatchExpr, ix: i32, st: i32, uMems: i32[]) {
     }
     if scoped { popScope() }
     if !matchArmExits(ix, body, armTy) {
-      matchTy = joinArmTys(matchTy, f32ArmPlainTy(body, armTy))
+      const bodyLit = armLit(armTy, body)
+      matchTy = joinArmLit(
+        matchTy,
+        mArmsLit,
+        f32ArmPlainTy(body, armTy),
+        bodyLit,
+      )
       if tpEnvNames.length > 0 { matchArmTys.push(f32ArmPlainTy(body, armTy)) }
-      matchValAcc = matchArmTally(ix, body, armTy, matchValAcc)
+      matchValAcc = matchArmTally(
+        ix,
+        body,
+        armTy,
+        matchValAcc,
+        mArmsLit,
+        bodyLit,
+      )
+      mArmsLit = mArmsLit && bodyLit
     }
     bi = bi + 1
   }
@@ -61680,6 +62468,7 @@ function checkMatchExprNodeIn(n: MatchExpr, ix: i32) {
   let matchTy = -1
   const matchArmTys: i32[] = []
   let matchValAcc = matchTallyBegin(ix)
+  let mArmsLit = true
   let ai = 0
   while ai < n.matchArmStart.length {
     // Patterns of arm `ai`.
@@ -61783,9 +62572,23 @@ function checkMatchExprNodeIn(n: MatchExpr, ix: i32) {
       if armTy < 0 { armTy = TY_VOID }
     }
     if !matchArmExits(ix, body, armTy) {
-      matchTy = joinArmTys(matchTy, f32ArmPlainTy(body, armTy))
+      const bodyLit = armLit(armTy, body)
+      matchTy = joinArmLit(
+        matchTy,
+        mArmsLit,
+        f32ArmPlainTy(body, armTy),
+        bodyLit,
+      )
       if tpEnvNames.length > 0 { matchArmTys.push(f32ArmPlainTy(body, armTy)) }
-      matchValAcc = matchArmTally(ix, body, armTy, matchValAcc)
+      matchValAcc = matchArmTally(
+        ix,
+        body,
+        armTy,
+        matchValAcc,
+        mArmsLit,
+        bodyLit,
+      )
+      mArmsLit = mArmsLit && bodyLit
     }
     ai = ai + 1
   }
@@ -61857,6 +62660,7 @@ type IfChk = {
   ifInRetArg: boolean,
   seedLogMark: i32,
   seedObsMark: i32,
+  seedObsLit: boolean,
   thenExits: boolean,
   tnNames: string[],
   tnTys: i32[],
@@ -61956,6 +62760,7 @@ function checkIfHead(n: IfStmt, ix: i32): IfChk {
   // Where the inferred return stood before this `if`'s arms seeded it (`dropTailIfSeeds`).
   const seedLogMark = inferRetLogTy.length
   const seedObsMark = inferObserved
+  const seedObsLit = inferObservedLit
   const condTy = checkNode(n.ifCond)
   if !assignable(condTy, TY_BOOL) {
     tErr("if-condition must be boolean, got " + tyToStr(condTy), n.ifCond)
@@ -62045,7 +62850,8 @@ function checkIfHead(n: IfStmt, ix: i32): IfChk {
       // The arm, not the arms' join: a tail `if`/`else` whose one arm is an open `[]` needs
       // the sibling arm's shape, and the join is a third arena row (D1591).
       noteInferRetWitness(thenIx, thenTy)
-      noteInferredSeed(ifArmValTy(n.ifThen, thenTy))
+      const seedThen = ifArmValTy(n.ifThen, thenTy)
+      noteInferredSeed(seedThen, armLit(seedThen, n.ifThen))
       if guardedRet { guardAltStack.pop() }
     }
   }
@@ -62087,6 +62893,7 @@ function checkIfHead(n: IfStmt, ix: i32): IfChk {
     ifInRetArg: ifInRetArg,
     seedLogMark: seedLogMark,
     seedObsMark: seedObsMark,
+    seedObsLit: seedObsLit,
     thenExits: thenExits,
     tnNames: tnNames,
     tnTys: tnTys,
@@ -62139,6 +62946,7 @@ function checkIfTail(
   const ifInRetArg = f.ifInRetArg
   const seedLogMark = f.seedLogMark
   const seedObsMark = f.seedObsMark
+  const seedObsLit = f.seedObsLit
   const thenExits = f.thenExits
   const enNames = f.enNames
   const enTys = f.enTys
@@ -62177,7 +62985,8 @@ function checkIfTail(
         // A chain link's value is the inner `if` itself.
         if elseIsLink { noteInferRetValue(n.ifElse, elseTy) }
         noteInferRetWitness(elseIx, elseTy)
-        noteInferredSeed(ifArmValTy(n.ifElse, elseTy))
+        const seedElse = ifArmValTy(n.ifElse, elseTy)
+        noteInferredSeed(seedElse, armLit(seedElse, n.ifElse))
       }
     }
     const daElseSid: i32[] = []
@@ -62322,7 +63131,7 @@ function checkIfTail(
     if noValue { ifNoValueAt[ix] = true } else { ifNoValueClear(ix) }
   }
   if noValue && ifTail && !ifInRetArg && daHasElse {
-    dropTailIfSeeds(seedLogMark, seedObsMark)
+    dropTailIfSeeds(seedLogMark, seedObsMark, seedObsLit)
   }
   // An f32 arm beside literal arms types the join f32, as it does an operator (PL-049). A return
   // tail's arms seed the inferred return one by one, which keeps its reading (D2774).
@@ -62335,16 +63144,33 @@ function checkIfTail(
   ) {
     if joinMayAdoptF32(thenTy, elseTy) { f32Join = joinF32LitTails(ix) }
   }
+  // Two runtime arms join apart, so an arm an inner join typed `f32` keeps that type rather
+  // than the `f64` a widening sibling would read it at.
+  const f32Keep = daHasElse
+    && f32JoinAdoptCount > 0
+    && !valueIsLitOnly(n.ifThen)
+    && !valueIsLitOnly(n.ifElse)
+    && !njFnReached(njFnIx)
   if daHasElse && ix >= 0 {
     let valTy = TY_VOID
     if !thenExits {
-      valTy = f32ArmPlainTy(n.ifThen, ifArmValTy(n.ifThen, thenTy))
+      valTy = ifArmValTy(n.ifThen, thenTy)
+      if !f32Keep { valTy = f32ArmPlainTy(n.ifThen, valTy) }
     }
     if !daElseDiverges {
       // A `void` here is an else-less link's value-less fall-through, which adds nothing.
-      const ev = f32ArmPlainTy(n.ifElse, ifArmValTy(n.ifElse, elseTy))
-      if thenExits || valTy == TY_VOID { valTy = ev }
-      else if ev != TY_VOID { valTy = joinArmTys(valTy, ev) }
+      let ev = ifArmValTy(n.ifElse, elseTy)
+      if !f32Keep { ev = f32ArmPlainTy(n.ifElse, ev) }
+      if thenExits || valTy == TY_VOID {
+        valTy = ev
+      } else if ev != TY_VOID {
+        valTy = joinArmLit(
+          valTy,
+          armLit(valTy, n.ifThen),
+          ev,
+          armLit(ev, n.ifElse),
+        )
+      }
     }
     if f32Join >= 0 { valTy = f32Join }
     if bareArm { ifValTyAt[ix] = -1 } else { ifValTyAt[ix] = valTy }
@@ -62360,11 +63186,20 @@ function checkIfTail(
   // values.
   if f32Join >= 0 { return f32Join }
   if daHasElse {
-    const thenPlain = f32ArmPlainTy(n.ifThen, thenTy)
-    const elsePlain = f32ArmPlainTy(n.ifElse, elseTy)
+    let thenPlain = thenTy
+    let elsePlain = elseTy
+    if !f32Keep {
+      thenPlain = f32ArmPlainTy(n.ifThen, thenTy)
+      elsePlain = f32ArmPlainTy(n.ifElse, elseTy)
+    }
     // An arm block that always exits (`return`, `break`, `continue`) hands no value to the
     // join; the emitter ends it with a `never` value (`exitArmBlockAt`) so every rep lowers it.
-    let plainJoin = joinArmTys(thenPlain, elsePlain)
+    let plainJoin = joinArmLit(
+      thenPlain,
+      armLit(thenPlain, n.ifThen),
+      elsePlain,
+      armLit(elsePlain, n.ifElse),
+    )
     // A function's tail `if` already lowers an exiting arm as a return, so it needs no tail.
     if thenExits && !daElseDiverges && P.nodes[n.ifThen] is Block {
       if atValueArmTail(ix) { refuseNestedExitFirst(ix, elsePlain) }
@@ -62379,7 +63214,7 @@ function checkIfTail(
       plainJoin = thenPlain
       if !ifChainOnFnTail { noteExitArm(n.ifElse) }
     }
-    f32JoinRevert(ix)
+    if !f32Keep { f32JoinRevert(ix) }
     if tpEnvNames.length > 0 && !thenExits && !daElseDiverges {
       let elseApart = elsePlain
       if elseIsLink { elseApart = tpIfJoinAt.get(n.ifElse) ?? elsePlain }
@@ -62612,6 +63447,8 @@ function castPinAdjudicate(k: i32, at: i32) {
   const argT = T.tys[argU]
   const dom = numCastDomainName(holeCastTgtName[k], target)
   if argT is TyUnion {
+    // A numeric union converts at the member it holds where no member can fail, as there.
+    if numUnionAsConverts(argU, target) { return 0 }
     // `as u8` over a union, refused at the pin in `checkCastNode`'s own words (D1587) — the
     // hole is where the operand's union first becomes visible; declining silently would diverge.
     if dom == "u8" {
@@ -62813,10 +63650,15 @@ function checkCastNode(n: AsExpr, ix: i32) {
         )
         return TY_ERR
       }
+      // A numeric union converts at whichever member it holds when no member's conversion
+      // can fail, as each member alone would.
+      if numUnionAsConverts(argU, target) && !njExprHeld(n.asObj) {
+        return target
+      }
       if !unionCoversTy(argT, target) {
         // A gradual union's parameter may hold the target at a pin: the cast is parked on the
         // parameter and re-asked there, as over a bare one (D2906).
-        if gradualParamOf(argT) >= 0 {
+        if unionHasDeclaredParam(argT.uMembers) {
           noteBinCstr(argU, OP_AS, target)
           if n.asMode == "null" { return mkNullableTy(target) }
           return target
@@ -62951,6 +63793,15 @@ function checkUnaryNode(n: Unary, ix: i32) {
   // Postfix `x++`/`x--`: `unArg` is the `x = x +- 1` assignment, already fully checked
   // above (const-reassign, arithmetic, assignability). The postfix type is the operand's.
   if n.unOp == "p+" || n.unOp == "p-" {
+    if numUnionMinted && tyIsNumUnion(arg) {
+      tErr(
+        "'++'/'--' over the numeric union "
+          + tyToStr(arg)
+          + " is not supported; write `x += 1`",
+        ix,
+      )
+      return TY_ERR
+    }
     if !isNumeric(arg) {
       tErr("'++'/'--' expects a numeric variable, got " + tyToStr(arg), ix)
       return TY_ERR
@@ -62968,6 +63819,15 @@ function checkUnaryNode(n: Unary, ix: i32) {
   if arg2 >= 0 && !(T.tys[arg2] is TyPrim) && tyHasHole(arg2) {
     noteBinCstr(arg2, OP_NEG, arg2)
     arg2 = tpGradualView(arg2)
+  }
+  // A numeric union negates at each member's own type.
+  if (
+    numUnionMinted
+    && n.unOp == "-"
+    && tyIsNumUnion(arg2)
+    && !njExprHeld(n.unArg)
+  ) {
+    return arg2
   }
   if !isNumeric(arg2) {
     tErr("unary '-' expects a numeric type, got " + tyToStr(arg2), ix)
@@ -68604,6 +69464,7 @@ function checkRetStmtNode(n: RetStmt, ix: i32) {
     // An empty-collection hole returned here has a destination not final until the body ends
     // — the pin is deferred to `flushInferRetHoles` rather than skipped (D1591).
     noteInferRetWitness(n.retArg, rArgTy)
+    inferRetNextLit = armLit(rArgTy, n.retArg)
     noteInferredRet(inferRetTyOf(n.retArg, rArgTy))
     return TY_VOID
   }

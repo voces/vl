@@ -42,6 +42,7 @@ import {
   bindGenUnionArmInto,
   bindGenWalk,
   blockHasBareReturn,
+  blockLastStmt,
   cUserTypes,
   canonEmitName,
   collectValuedReturns,
@@ -54,6 +55,8 @@ import {
   inferRetFnKey,
   inferRetNameOf,
   isVarTyIxOf,
+  joinArmIsLit,
+  joinPinnedArmLit,
   joinPinnedArmTys,
   litUnionAliasNameOfTy,
   memberRungOnTy,
@@ -63,6 +66,7 @@ import {
   monoInferRetSetListTy,
   monoInferRetSetUnionName,
   nameIsLitUnionType,
+  njSetPinFn,
   nodeTyArrayElemIsBoolPrim,
   nodeTyArrayElemIsNullable,
   nodeTyCarry,
@@ -82,6 +86,8 @@ import {
   nulNumScalarUnionName,
   nulRecListNominalName,
   numLitUnionBaseName,
+  numUnionMinted,
+  numUnionResultTy,
   opSelfFnNameForRecv,
   recordClonedCallRetire,
   recordClonedIsVarTy,
@@ -101,6 +107,8 @@ import {
   tyIsLitUnion,
   tyIsLitUnionArray,
   tyIsMap,
+  tyIsNumUnion,
+  tyIsNumericBox,
   tyIsTpJoinUnion,
   tyIsWriteLandRead,
   tyPrimNameOf,
@@ -2082,8 +2090,9 @@ function monoIfChainRebuildPinned(
         // A hole join the pin makes a string is built as one, its atom arms widened (D3291).
         pty = monoHoleJoinPinTy(at, bN, bT)
       }
-      if tpu && monoNulJoinMixesNumbers(raw, bN, bT) {
-        // Recorded, not returned: the build stops loudly, as it did before the join parted.
+      if tpu && links[0] == monoTailIf && monoNulJoinMixesNumbers(raw, bN, bT) {
+        // A join that leaves the body (a tail) is read by its caller without its `null` at these
+        // pins, so the box this instance would build has nothing to land in; recorded, not returned.
         emitFailAt(
           "emitProgram: a join of type parameters pinned at two number types beside a null has no box at this instance",
           at,
@@ -2226,9 +2235,10 @@ function monoIfArmsPinJoin(ix: i32, raw: i32, bN: string[], bT: i32[]): i32 {
   // A concrete join (`5` first) is re-asked only where an arm's own type names a parameter.
   if !(T.tys[raw] is TyVar) && !monoIfArmHasTyVar(ix) { return -1 }
   const ts: i32[] = []
+  monoPinArmLits = []
   const got = monoChainPinnedTys(ix, bN, bT, ts)
   if got < 0 { return -1 }
-  let j = joinPinnedArmTys(ts)
+  let j = joinPinnedArmLit(ts, monoPinArmLits)
   if j < 0 || j >= T.tys.length || tyHasTyVar(j) { return -1 }
   // A nested arm joins into its enclosing box, which only a union join builds.
   if got == 1 && !(T.tys[j] is TyUnion) { return -1 }
@@ -2262,8 +2272,9 @@ function monoHoleJoinDropsArm(
   if rt.tvName.length > 0 && rt.tvName[0] != "?"[0] { return false }
   if !monoIfArmHasTyVar(at) { return false }
   const ts: i32[] = []
+  monoPinArmLits = []
   if monoChainPinnedTys(at, bN, bT, ts) < 0 { return false }
-  const j = joinPinnedArmTys(ts)
+  const j = joinPinnedArmLit(ts, monoPinArmLits)
   // Only a box: a scalar pin is re-joined by the return set, and a box is built at `pty`.
   T.tys[pty] is TyUnion
     && j >= 0
@@ -2358,8 +2369,13 @@ function monoArmPinnedTy(
   const pv = monoPinArmSubst(vt, bN, bT)
   if pv < 0 { return -1 }
   out.push(pv)
+  monoPinArmLits.push(joinArmIsLit(v))
   0
 }
+
+// Per type `monoChainPinnedTys` appends, whether that arm's value is a literal; reset by the
+// caller with its list, so the pinned join adapts a literal arm and keeps runtime ones apart.
+let monoPinArmLits: boolean[] = []
 
 // `ty` at the binding `bN`/`bT` widened by the parameters' union-arm bindings, a member no
 // argument bound dropped; -1 when a type parameter remains.
@@ -3822,7 +3838,170 @@ function monoPinBodyLambdasRaw(
     }
   }
   if sink { rb = monoPinCoalJoin(ix, rb, bN, bT) }
+  if numUnionMinted { rb = monoNumUnionOpPin(ix, rb, bN, bT) }
   rb
+}
+
+// An operator operand's type at the pin: its pinned type, or, for a name typed at a hole the
+// parameters' binding leaves open, the hole instance's own binding of it. A derived hole is
+// left as pinned.
+function monoNumOperandPinTy(ix: i32, bN: string[], bT: i32[]): i32 {
+  const p = monoPinnedTyOf(ix, bN, bT)
+  if p < 0 || p >= T.tys.length || !tyHasTyVar(p) { return p }
+  const id = P.nodes[unwrapParen(ix)]
+  if !(id is Ident) { return p }
+  const t = T.tys[p]
+  if !(t is TyVar) { return p }
+  if t.tvName.length > 1 && t.tvName[1] == "#"[0] { return p }
+  // The binding read directly, not substituted: re-joining a pinned union mints rows.
+  const b = monoHoleBindingOf(t.tvName)
+  // An operator reaches a nullable number only past the check that excluded its `null`.
+  if b >= 0 && tyIsNumericBox(b) { return nonNullTy(b) }
+  if b >= 0 { return b }
+  // A parameter read past its `null` test is typed at the narrowing's own hole: the
+  // parameter's hole answers for it, and for an un-annotated local it initialises.
+  const pb = monoHoleBindingOf(
+    monoParamHoleName(monoAliasedParam(id.identName)),
+  )
+  if pb >= 0 && tyIsNumericBox(pb) && tyBearsNull(pb) { return nonNullTy(pb) }
+  p
+}
+
+// The hole binding of the instance being built for hole `name`, -1 for none.
+function monoHoleBindingOf(name: string): i32 {
+  if name == "" { return -1 }
+  let i = 0
+  while i < monoPinHoleN.length && i < monoPinHoleT.length {
+    if monoPinHoleN[i] == name { return monoPinHoleT[i] }
+    i = i + 1
+  }
+  -1
+}
+
+// The name an un-annotated local `name` of the instance being built is initialised from, when
+// that initialiser is a bare name, followed to a name no such local declares; `name` otherwise.
+function monoAliasedParam(name: string): string {
+  let cur = name
+  let hops = 0
+  while hops < 4 {
+    const nx = monoLocalInitName(monoInstBody, cur)
+    if nx == "" { return cur }
+    cur = nx
+    hops = hops + 1
+  }
+  cur
+}
+
+// The bare name the un-annotated `let`/`const` `name` under `ix` is initialised from, or "".
+function monoLocalInitName(ix: i32, name: string): string {
+  const todo: i32[] = [ix]
+  while todo.length > 0 {
+    const at = todo.pop() ?? -1
+    if at >= 0 && at < P.nodes.length {
+      const n = P.nodes[at]
+      if n is LetDecl {
+        if n.letName == name && n.letType < 0 && n.letInit >= 0 {
+          const iv = P.nodes[unwrapParen(n.letInit)]
+          if iv is Ident { return iv.identName }
+          return ""
+        }
+      }
+      for k in nodeChildren(at) {
+        if k >= 0 { todo.push(k) }
+      }
+    }
+  }
+  ""
+}
+
+// The hole an un-annotated parameter `name` of the instance being built is typed at, or "".
+function monoParamHoleName(name: string): string {
+  let i = 0
+  while i < monoInstParams.length {
+    const pn = P.nodes[monoInstParams[i]]
+    if pn is Param {
+      if pn.parName == name {
+        if pn.parType >= 0 { return "" }
+        const pt = nodeTyIxOf(monoInstParams[i])
+        if pt < 0 || pt >= T.tys.length { return "" }
+        const ptv = T.tys[pt]
+        if ptv is TyVar { return ptv.tvName }
+        return ""
+      }
+    }
+    i = i + 1
+  }
+  ""
+}
+
+// `monoNumUnionOpPin` for a compound assignment `rb` rebuilt from `ix`: its operator node.
+function monoNumUnionCompoundPin(
+  ix: i32,
+  rb: i32,
+  bN: string[],
+  bT: i32[],
+): i32 {
+  const n = P.nodes[rb]
+  if !(n is BinExpr) { return rb }
+  const inner = P.nodes[n.binRight]
+  if !(inner is BinExpr) { return rb }
+  const lt = monoNumOperandPinTy(inner.binLeft, bN, bT)
+  const rt = monoNumOperandPinTy(inner.binRight, bN, bT)
+  if !tyIsNumUnion(lt) && !tyIsNumUnion(rt) { return rb }
+  const nu = numUnionResultTy(inner, lt, rt)
+  if nu < 0 || nu == nodeTyIxOf(n.binRight) { return rb }
+  let nx = rb
+  if nx == ix { nx = monoExprRemake(ix, monoExprKids(ix)) }
+  const nn = P.nodes[nx]
+  if !(nn is BinExpr) { return rb }
+  monoPinRecordTy(nn.binRight, nu)
+  if tyIsNumUnion(nu) {
+    const vn = valueUnionRetName(nu)
+    if vn != "" { monoRegisterPinUnion(vn) }
+  }
+  nx
+}
+
+// An operator whose operand this instance types as a numeric union answers the union of its
+// member results (`numUnionResultTy`), which the template, typed at a parameter, cannot name.
+function monoNumUnionOpPin(ix: i32, rb: i32, bN: string[], bT: i32[]): i32 {
+  if rb < 0 || rb >= P.nodes.length { return rb }
+  const n = P.nodes[rb]
+  let nu = -1
+  if n is BinExpr {
+    // A compound assignment's operator node is not a kid: it is re-typed inside the rebuild.
+    if (
+      n.binOp == "="
+      && n.binCompound != ""
+      && n.binCompound != "++"
+      && n.binCompound != "--"
+    ) {
+      return monoNumUnionCompoundPin(ix, rb, bN, bT)
+    }
+    if n.binOp == "=" || n.binOp == "??" || n.binOp == "&&" || n.binOp == "||" {
+      return rb
+    }
+    const lt = monoNumOperandPinTy(n.binLeft, bN, bT)
+    const rt = monoNumOperandPinTy(n.binRight, bN, bT)
+    if !tyIsNumUnion(lt) && !tyIsNumUnion(rt) { return rb }
+    nu = numUnionResultTy(n, lt, rt)
+  } else if n is Unary {
+    if n.unOp != "-" { return rb }
+    const at = monoNumOperandPinTy(n.unArg, bN, bT)
+    if !tyIsNumUnion(at) { return rb }
+    nu = at
+  } else {
+    return rb
+  }
+  if nu < 0 || nu == nodeTyIxOf(rb) { return rb }
+  let nx = rb
+  if nx == ix { nx = monoExprRemake(ix, monoExprKids(ix)) }
+  monoPinRecordTy(nx, nu)
+  if tyIsNumUnion(nu) {
+    const vn = valueUnionRetName(nu)
+    if vn != "" { monoRegisterPinUnion(vn) }
+  }
+  nx
 }
 
 // Whether `ix` is an object literal with a field typed at a union holding a type parameter.
@@ -4266,6 +4445,7 @@ function monoJoinPinnedAt(ix: i32, bN: string[], bT: i32[]): i32 {
   if ix < 0 || ix >= P.nodes.length { return -1 }
   const n = P.nodes[ix]
   const ts: i32[] = []
+  monoPinArmLits = []
   if n is IfStmt {
     if monoChainPinnedTys(ix, bN, bT, ts) < 0 { return -2 }
   } else if monoIsCoalesce(ix) {
@@ -4280,7 +4460,8 @@ function monoJoinPinnedAt(ix: i32, bN: string[], bT: i32[]): i32 {
   } else {
     return monoMatchPinnedAt(ix)
   }
-  const j = joinPinnedArmTys(ts)
+  let j = joinPinnedArmTys(ts)
+  if P.nodes[ix] is IfStmt { j = joinPinnedArmLit(ts, monoPinArmLits) }
   const pj = monoPinnedTyOf(ix, bN, bT)
   if j < 0 || pj < 0 || tyHasTyVar(pj) { return -2 }
   if j == pj || tyEq(j, pj) || monoTySameMembers(j, pj) { return -1 }
@@ -4307,12 +4488,18 @@ function monoMatchPinnedAt(ix: i32): i32 {
 // Whether the instance being walked returns an annotated union box, so a binding its body
 // returns by name is delivered as that union too (D2912).
 let monoPinRetBox = false
+// The last statement of the generic being instantiated, whose value its caller reads.
+let monoTailIf = -1
 
 // That box's type during the instance's body walk, else -1.
 let monoPinRetTy = -1
 
 // The hole binding of the instance whose body `monoPinBodyLambdas` walks; empty outside it.
 let monoPinHoleN: string[] = []
+// The parameters of the instance being built (`monoParamHoleName`).
+let monoInstParams: i32[] = []
+// The template body of the instance being built (`monoAliasedParam`).
+let monoInstBody = -1
 let monoPinHoleT: i32[] = []
 
 // Whether unions `a` and `b` hold the same members, in any order.
@@ -7834,6 +8021,8 @@ function monoMakeInstance(
       bodyBT = []
       monoJoinBinding(letBN, letBT, instHoleN, instHoleT, bodyBN, bodyBT)
     }
+    monoTailIf = blockLastStmt(fn.fnBody)
+    const svPinFn = njSetPinFn(monoOrigNode[origFe])
     const instBody0 = monoCloneBody(
       fn.fnBody,
       fn.fnTyParams,
@@ -7879,6 +8068,10 @@ function monoMakeInstance(
     const svHoleT = monoPinHoleT
     monoPinHoleN = instHoleN
     monoPinHoleT = instHoleT
+    const svParams = monoInstParams
+    monoInstParams = params
+    const svBody = monoInstBody
+    monoInstBody = fn.fnBody
     const instBody0L = monoPinBodyLambdas(
       instBody0,
       fn.fnTyParams,
@@ -7888,6 +8081,9 @@ function monoMakeInstance(
       bodyBT,
     )
     monoPinHoleN = svHoleN
+    monoInstParams = svParams
+    monoInstBody = svBody
+    njSetPinFn(svPinFn)
     monoPinHoleT = svHoleT
     monoPinRetTy = -1
     const lamClones = monoLamCloneSlots
