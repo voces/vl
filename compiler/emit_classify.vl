@@ -75,6 +75,7 @@ import {
   canonUnionKeyOfName,
   canonUnionKeyOfTy,
   capWidenOf,
+  coalLhsParts,
   collectRetValues,
   condNarrowDropOf,
   condRhsRetiredOf,
@@ -16325,7 +16326,16 @@ function coalesceAtomKind(exprIx: i32, fnIx: i32) {
       // The RESULT's own atom, asked first: a wider default widens the whole expression, so
       // the operand's residual below is right for the common case and not for that one. A
       // union result is not an atom and falls through, which is the box arm's (D1699/D1702).
-      const crn = tyToEmitName(nodeTyPinIxOf(unwrapParen(exprIx)))
+      const crt = nodeTyPinIxOf(unwrapParen(exprIx))
+      // A default of another number type joins apart: the result is the box, never an atom.
+      if (
+        numUnionMinted
+        && numBoxExpr(unwrapParen(exprIx), crt)
+        && coalLhsParts(e.binLeft)
+      ) {
+        return -1
+      }
+      const crn = tyToEmitName(crt)
       if crn != "" {
         const crk = valueAtomKind(crn)
         if crk >= 0 && crk != 6 { return crk }
@@ -26730,6 +26740,20 @@ function anonArithFieldCode(valIx: i32) {
   FC_I32
 }
 
+// Whether the number list literal at `ix`, coded `lc` from its literals alone, has a list type of
+// another number type or of a union of numbers: a runtime element the literal scan skips widens it.
+function anonListWiderThanLits(ix: i32, lc: i32): boolean {
+  const t = nodeTyIxOf(ix)
+  if t < 0 || t >= T.tys.length { return false }
+  const at = T.tys[t]
+  if !(at is TyArray) || at.aElem < 0 { return false }
+  if tyIsNumericBox(at.aElem) { return true }
+  const k = tyKindOf(at.aElem)
+  if k == TK_I64 { return lc != FC_I64_LIST }
+  if k == TK_F64 { return lc != FC_F64_LIST }
+  k == TK_F32
+}
+
 // The syntax half of `anonFieldCode` — the field value's own literal form. Kept separate
 // so the recorded-type fallback above cannot shadow a context-adopted literal rep: every
 // arm here is a fact about the literal the checker's recorded type either does not carry
@@ -26797,23 +26821,28 @@ function anonFieldCodeSyn(valIx: i32) {
       if ae0 is NumLit {
         let anyFloat = false
         let anyI64 = false
+        let anyRuntime = false
         let i = 0
         while i < e.arrElems.length {
           const ae = P.nodes[e.arrElems[i]]
           if ae is NumLit {
             if numLexIsFloat(ae.numText) { anyFloat = true }
             else if !numLexFitsI32(ae.numText) { anyI64 = true }
+          } else {
+            anyRuntime = true
           }
-          // A non-literal element (a param read) stays unexamined, as before —
-          // only the literal elements steer the leaf split.
           i = i + 1
         }
         // Mixed float and i64-magnitude literals join as a checker-level union, not a
         // scalar list — unclassifiable here (-1), the loud path.
         if anyFloat && anyI64 { return -1 }
-        if anyFloat { return FC_F64_LIST }
-        if anyI64 { return FC_I64_LIST }
-        return FC_I32_LIST
+        let lc = FC_I32_LIST
+        if anyFloat { lc = FC_F64_LIST }
+        else if anyI64 { lc = FC_I64_LIST }
+        // A runtime element can make the list wider than its literals, or a list of a number
+        // union: the arena rung codes the list the checker typed.
+        if anyRuntime && anonListWiderThanLits(valIx, lc) { return -1 }
+        return lc
       }
       // A list-of-anonymous-struct field is the struct ref list, code 5: the parser
       // interns children before parents, so each element literal already has its own row.
