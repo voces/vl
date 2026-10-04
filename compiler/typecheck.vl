@@ -811,6 +811,8 @@ let escJoinFn: i32[] = []
 
 // The operator a deferred unary negation is recorded under, both operands its argument.
 const OP_NEG = "unary -"
+// The same for a deferred bitwise not `~`, which also refuses a float.
+const OP_BNOT = "unary ~"
 // The operator a deferred `as` over a gradual union is recorded under, the target on the right.
 const OP_AS = "as"
 // The constraint an operator records when a 64-bit integer constant meets a type-parameter
@@ -41421,6 +41423,7 @@ function binOpDefinedFor(op: string, lt0: i32, rt0: i32) {
   if tyHasHole(lt) || tyHasHole(rt) { return true }
   if op == "min" || op == "max" || op == "abs" { return minMaxPinOk(lt, rt) }
   if op == OP_NEG { return isNumeric(lt) || tyIsNumUnion(lt) }
+  if op == OP_BNOT { return isNumeric(lt) && !binFloatOperandPair(lt, lt) }
   if op == OP_AS { return asPinHolds(lt0, rt0) || numUnionAsConverts(lt0, rt0) }
   if op == OP_LITFIT { return primNameOf(lt) != "i32" }
   // A numeric union operand dispatches per member, each pair a scalar one (`numUnionBinTy`).
@@ -43020,6 +43023,12 @@ function validateBinCstrs(
             if binCstrOp[ci] == OP_NEG {
               refusal = "unary '-' expects a numeric type, got " + tyToStr(clt)
             }
+            if binCstrOp[ci] == OP_BNOT {
+              refusal = "unary '~' expects a numeric type, got " + tyToStr(clt)
+              if isNumeric(clt) {
+                refusal = "operator '~' is integer-only, got " + tyToStr(clt)
+              }
+            }
             if binCstrOp[ci] == OP_AS { refusal = asPinRefusal(clt, crt) }
             if binCstrOp[ci] == OP_LITFIT {
               refusal = tyToStr(clt)
@@ -43073,6 +43082,9 @@ function validateBinCstrs(
               }
               if binCstrOp[ci] == OP_NEG {
                 tail = " (" + bodyWho + " negates this argument)"
+              }
+              if binCstrOp[ci] == OP_BNOT {
+                tail = " (" + bodyWho + " flips this argument's bits)"
               }
               if binCstrOp[ci] == OP_LITFIT {
                 tail = " (" + bodyWho + " computes with it and a 64-bit value)"
@@ -65473,9 +65485,12 @@ function checkUnaryNode(n: Unary, ix: i32) {
     const peekU = arrDefOperandElemPeek(n.unArg)
     if peekU >= 0 { arg2 = peekU }
   }
-  // A hole operand is numeric only at a pin that says so; the pin re-asks it (`OP_NEG`).
+  // A hole operand is numeric only at a pin that says so; the pin re-asks it (`OP_NEG`, or
+  // `OP_BNOT` for `~`, which a float pin cannot satisfy).
   if arg2 >= 0 && !(T.tys[arg2] is TyPrim) && tyHasHole(arg2) {
-    noteBinCstr(arg2, OP_NEG, arg2)
+    let unCstr = OP_NEG
+    if n.unOp == "~" { unCstr = OP_BNOT }
+    noteBinCstr(arg2, unCstr, arg2)
     arg2 = tpGradualView(arg2)
   }
   // A numeric union negates at each member's own type.
@@ -65492,7 +65507,15 @@ function checkUnaryNode(n: Unary, ix: i32) {
     arg2 = softenLitOpTy(arg2)
   }
   if !isNumeric(arg2) {
-    tErr("unary '-' expects a numeric type, got " + tyToStr(arg2), ix)
+    tErr(
+      "unary '" + n.unOp + "' expects a numeric type, got " + tyToStr(arg2),
+      ix,
+    )
+    return TY_ERR
+  }
+  // `~` flips bits and a float has none, the binary bitwise family's rule (D3629).
+  if n.unOp == "~" && binFloatOperandPair(arg2, arg2) {
+    tErr("operator '~' is integer-only, got " + tyToStr(arg2), ix)
     return TY_ERR
   }
   // Host parity: the host folds `-lit` into a signed literal before defaulting, so

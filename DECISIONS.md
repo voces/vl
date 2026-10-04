@@ -9772,3 +9772,32 @@ holds and which the region never indexes, so the hoist may keep other lists' hea
 across it; and it is inline code, so it may unroll, weighing `UNROLL_PUSH_NODES` (16) extra
 nodes for its growing append. Measured on SP-036 (ms, medians): master 168, reserve only 158,
 + locals 150, + hoist 141, + unroll 137; `filled` + index 115.
+
+## Prefix operators bind tighter than `as` (owner ruling A, 2026-10-04) — D3629
+
+**Every prefix operator — `-`, `!`, `~`, `++`, `--` — binds tighter than `as` / `as?` / `as!` /
+`as%`, as in Rust, and `as` stays tighter than every binary operator.** `-x as T` is `(-x) as
+T`, and `-x as T + y` is `((-x) as T) + y`. Before this, the parser read `-x as T` as `-(x as
+T)`, while the guide already said unary operators bound tighter; the guide was the intended
+rule and the parser was brought to it.
+
+**Why Rust's order.** The cast then sees the value the source spells. `-1 as u8` is the constant
+-1, which no byte holds, so it is a check error under the constant rule (§"Exact constant
+arithmetic"); `-2147483648 as i32` is `i32`'s minimum rather than a refusal of 2147483648; and
+`-0.5 as i32` names -0.5. The other order made `-1 as u8` a negated byte, -1 as an `i32`, which
+is not a `u8` at all. The cost is at one edge: with `m: i32` holding INT_MIN, `-m as i64` is now
+-2147483648 (the `i32` negation wraps first) where it was 2147483648. That is the reading a
+Rust or C programmer expects, and `-(m as i64)` spells the other one.
+
+**`!` and `~` follow `-`.** Under the old grouping `!x as i32` was `!(x as i32)`, a type error
+for every operand, and `~x as f64` was `~(x as f64)`, which compiled to invalid wasm; both now
+mean what they say.
+
+**A type guard is not part of the rule.** `!x is T` stays `!(x is T)`, the narrowing idiom, and
+`x as T is U` stays `(x as T) is U`. The guard binds to a prefixed operand's own postfix
+expression, and to a whole cast chain.
+
+**Census before landing.** Twelve `-<literal> as T` uses in `tests/`, none in `compiler/`,
+`std/` or `scripts/`, and two in consumers (plumb `~255 as% i64`, sunpa `-2.45 as f32`); each
+means the same value under both groupings. `vl fmt` output is byte-identical under both parsers
+over all 15,413 `.vl` files in the tree; the printer had always emitted `-x as T` bare.
