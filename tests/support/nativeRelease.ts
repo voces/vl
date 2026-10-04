@@ -535,7 +535,9 @@ export const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3:
     // loop's code is unchanged, yet reads ~1.6x under the default collector: master's garbage
     // forced one copying collection that compacted the keys, the new build's did not. Under
     // `VL_GC=none` (no compaction in either) the whole run is 3.30 -> 3.10 s at 300 passes.
-    O: { bytes: 8049, fns: 16, allocs: 95, indirect: 0, refEq: 2 },
+    // D3565: `std:fmt` gained `toFixed`, which `-O` carries unused, and binaryen's `-O` now
+    // inlines `std:fmt`'s `bnLen` leaf instead of keeping it: fns 16 -> 15, the rest held.
+    O: { bytes: 8049, fns: 15, allocs: 95, indirect: 0, refEq: 2 },
     O3: { bytes: 2637, fns: 6, allocs: 46, indirect: 0, refEq: 2 },
   },
   // MAP PROBE WITHOUT THE STRING COST. i32 keys, so this isolates the bucket walk and the
@@ -597,7 +599,8 @@ export const SHAPE_TABLE: Array<{ bench: string; axis: string; O: ShapePins; O3:
     // binding proof declined it; both appends now take the site-cached lowering, and
     // `std:fmt`'s digit loop a third: `allocs` 98 -> 104 and 49 -> 54, `refEq` 1 -> 4, bytes
     // +477 / +467. Timed interleaved, 0.77 -> 0.80 s (unchanged within the box's noise).
-    O: { bytes: 9179, fns: 16, allocs: 104, indirect: 0, refEq: 4 },
+    // D3565: `-O` fns 16 -> 15, the same `bnLen` inlining as on `collections/map-string`.
+    O: { bytes: 9179, fns: 15, allocs: 104, indirect: 0, refEq: 4 },
     O3: { bytes: 3745, fns: 6, allocs: 54, indirect: 0, refEq: 4 },
   },
   // ARRAY ELEMENT WRITE + READ, 400M of each, with the allocation hoisted out of the steady
