@@ -2947,9 +2947,12 @@ fn parse_memory_size(flag: &str, raw: &str) -> std::result::Result<i32, String> 
         .flatten()
         .and_then(|n| n.checked_mul(unit));
     let Some(bytes) = bytes else {
+        let lower = raw.to_ascii_lowercase();
+        let case = ["kib", "mib", "gib"].iter().any(|s| lower.ends_with(s));
         return Err(format!(
             "`{flag}={raw}` — expected a size in bytes, or with a KiB, MiB or GiB suffix \
-             (`{flag}=8MiB`)"
+             (`{flag}=8MiB`){}",
+            if case { "; the suffix is case-sensitive" } else { "" }
         ));
     };
     if bytes > SHARED_PAGES_MAX * WASM_PAGE_BYTES {
@@ -2984,12 +2987,20 @@ fn memory_sizes_error(link: &LinkOpts) -> Option<String> {
                 .to_string(),
         );
     }
-    let (Some(initial), Some((max, flag))) = (
-        link.initial_pages,
-        link.max_pages
-            .map(|m| (m, "--max-memory="))
-            .or(link.shared_pages.map(|m| (m, "--shared-memory="))),
-    ) else {
+    let max = link.max_pages
+        .map(|m| (m, "--max-memory="))
+        .or(link.shared_pages.map(|m| (m, "--shared-memory=")));
+    // A heap that starts at or past the max cannot hand out a single `Buf`.
+    if let (Some((base, _)), Some((max, flag))) = (link.heap, max) {
+        if base as i64 >= max as i64 * WASM_PAGE_BYTES {
+            return Some(format!(
+                "`--heap-base={base:#x}` lies at or past the memory's maximum ({flag}, {max} \
+                 pages = {:#x} bytes) — every Buffer() would trap; lower the base or raise the max",
+                max as i64 * WASM_PAGE_BYTES
+            ));
+        }
+    }
+    let (Some(initial), Some((max, flag))) = (link.initial_pages, max) else {
         return None;
     };
     (initial > max).then(|| {
@@ -6692,7 +6703,8 @@ fn arg_error(msg: &str, token: Option<&str>) -> ! {
     }
     eprintln!(
         "note: `vl run` itself takes -e <source>, --compiler <wasm>, --batch, \
---color=<when>, {EXTERN_FLAG} NAME=VALUE, -O/-O3, --names, --wat, --no-validate."
+--color=<when>, {EXTERN_FLAG} NAME=VALUE, --shared-memory=<pages>, --initial-memory=<size>, \
+--max-memory=<size>, -O/-O3, --names, --wat, --no-validate."
     );
     eprintln!("note: `vl help run` shows the full flag list.");
     std::process::exit(2);

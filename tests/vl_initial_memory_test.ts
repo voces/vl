@@ -207,8 +207,19 @@ Deno.test({
       [["--shared-memory=16", "--initial-memory=2MiB"], "cannot start larger than its maximum"],
       [["--shared-memory=16", "--max-memory=1MiB"], "both declare the memory's maximum"],
       [["--initial-memory=1MiB", "--initial-memory=2MiB"], "given twice"],
+      [["--initial-memory=8mib"], "the suffix is case-sensitive"],
       [["--initial-mem=1MiB"], "unknown layout flag"],
     ];
+    // A heap that starts at or past the max: build-only, since `vl run` takes no heap window.
+    for (const flags of [["--max-memory=1MiB", "--heap-base=0x100000"], ["--shared-memory=16", "--heap-base=0x100000"]]) {
+      const r = await withSrc("build", ALLOC, flags);
+      eq(r.code, 2, `build ${flags.join(" ")} exit (${r.err.trim()})`);
+      if (!r.err.includes("lies at or past the memory's maximum")) {
+        throw new Error(`build ${flags.join(" ")}: wrong refusal\n${r.err}`);
+      }
+    }
+    // Just below the max still builds.
+    await build(ALLOC, ["--max-memory=1MiB", "--heap-base=0xfff00"]);
     for (const [flags, want] of rows) {
       for (const cmd of ["build", "run"] as const) {
         if (cmd === "run" && flags[0] === "--initial-mem=1MiB") continue; // run: unknown flag

@@ -205,9 +205,10 @@ Two patterns avoid it:
 A memory built with `--shared-memory` never detaches: it is backed by a `SharedArrayBuffer`,
 which grows in place, but a view taken before a growth still covers only the old length.
 
-The WebAssembly JS API specification also defines `memory.toResizableBuffer()`, whose buffer
-grows in place instead of detaching. It is an emerging platform option; check support in the
-engines you target before relying on it.
+`memory.toResizableBuffer()` returns a buffer that grows in place instead of detaching. It is a
+JS API extension, shipping in V8; check support in the engines you target. It requires the memory
+to declare a maximum (V8 throws "Memory must have a maximum" otherwise), so build with
+`--max-memory=<size>`, or `--shared-memory=<pages>` for a shared memory.
 
 ## Memory across passes
 

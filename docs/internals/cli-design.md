@@ -701,7 +701,8 @@ Cranelift compile is cached".
 The layout flags are parsed strictly: a misspelled `--heap-*`/`--import*`/`--shared*`/`--initial*`/
 `--max-mem*` flag, the space-separated `--heap-base 0x10000`, `--import-memory=<anything>`, a bare
 `--shared-memory` or one outside 1..65536, a size that is not a whole number of pages, an initial
-size above the max, `--max-memory` beside `--shared-memory`, or a repeated layout flag
+size above the max, `--max-memory` beside `--shared-memory`, a `--heap-base` at or past the max,
+or a repeated layout flag
 exits 2 instead of quietly building the default layout. A unit that allocates from
 `std:buffer` under `--import-memory` with no `--heap-base` builds, with a warning: its heap
 starts at 1024, like every other such unit. With `--shared-memory` there is no warning: shared
