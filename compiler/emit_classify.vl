@@ -238,6 +238,7 @@ import {
   tyIsNullableLitUnion,
   tyIsNumUnion,
   tyIsNumericBox,
+  tyIsTpJoinUnion,
   tyIsU8ArrayTy,
   tyIsValueUnionBox,
   tyIxIsVariantMember,
@@ -656,7 +657,6 @@ import {
   monoInstOrig,
   monoOrigNode,
   monoParamPinTy,
-  monoPinSubLam,
   monoPinSubN,
   monoPinSubRow,
   monoPinSubT,
@@ -16361,7 +16361,7 @@ export function ifExprValtype(ifIx: i32, fnIx: i32) {
   // literal arm adapts to it (D3528).
   const pjt = nodeTyIxOf(ifIx)
   if pjt >= 0 && tyHasTyVar(pjt) {
-    const pjn = tyPrimNameOf(pinSubJoinTyOf(pjt, fnIx))
+    const pjn = tyPrimNameOf(pinSubOperandTyOf(pjt, fnIx))
     if pjn == "f64" { return 124 }
     if pjn == "f32" { return 125 }
     if pjn == "i64" { return 126 }
@@ -17261,6 +17261,14 @@ export function exprIsBool(ix: i32, fnIx: i32) {
     // A captured boolean (a closure returning its maker's `x: boolean` param) — the
     // closure's inferred return kind (`fRetBool`) sees the bool-ness through the env.
     if capturedIsBool(fnIx, e.identName) { return true }
+    // A capture typed at a type parameter this lambda's instance pins to `boolean`: an
+    // un-annotated copy of a parameter has no annotation to recover it from (D3520).
+    if capturedKindOf(fnIx, e.identName) != null {
+      if tyPrimNameOf(pinSubOperandTyOf(nodeTyIxOf(ix), fnIx)) == "boolean" {
+        return true
+      }
+      if tyPrimNameOf(holeCaptureTyOf(ix, fnIx)) == "boolean" { return true }
+    }
     // A plain boolean local/param/global — recovered from the binding's annotation
     // or initializer, since a boolean local registers identically to an i32.
     if boundBoolByName(e.identName, fnIx, ix) { return true }
@@ -31430,22 +31438,22 @@ export function pinSubOperandTyOf(ty: i32, fnIx: i32): i32 {
   -1
 }
 
-// `pinSubOperandTyOf` for a join's own type, declined in an instance whose body holds a
-// function: a lambda's join of the parameters is not built apart at its call, so the pin
-// would name members its value does not carry (D3520).
-export function pinSubJoinTyOf(ty: i32, fnIx: i32): i32 {
-  const st = pinSubOperandTyOf(ty, fnIx)
-  if st < 0 { return -1 }
+// `holeOperandTyOf` for a capture read in lambda `fnIx`, read at the hole instance it is
+// lifted inside; -1 where no enclosing function is one.
+function holeCaptureTyOf(exprIx: i32, fnIx: i32): i32 {
+  if monoHoleSubN.length == 0 || fnIx < 0 { return -1 }
+  const ty = nodeTyIxOf(unwrapParen(exprIx))
+  if ty < 0 || ty >= T.tys.length || !(T.tys[ty] is TyVar) { return -1 }
   let pos = fnStmtsPosOf(fnIx)
   let guard = 0
-  while pos >= 0 && guard <= fnStmts.length {
-    const row = monoPinSubRow.get(pos) ?? -1
-    if row >= 0 && row < monoPinSubLam.length {
-      if monoPinSubLam[row] { return -1 }
-      return st
-    }
-    if pos >= fnParent.length { return -1 }
+  while pos >= 0 && pos < fnParent.length && guard <= fnStmts.length {
     pos = fnParent[pos]
+    const row = monoHoleSubRow.get(pos) ?? -1
+    if row >= 0 && row < monoHoleSubN.length {
+      const b = holePinReadOf(ty, monoHoleSubN[row], monoHoleSubT[row])
+      if b < 0 || b >= T.tys.length || tyHasTyVar(b) { return -1 }
+      return b
+    }
     guard = guard + 1
   }
   -1
@@ -31460,9 +31468,21 @@ export function holeOperandTyOf(exprIx: i32, fnIx: i32): i32 {
   if ax < 0 { return -1 }
   const ty = nodeTyIxOf(ax)
   if ty < 0 || ty >= T.tys.length { return -1 }
-  if !(T.tys[ty] is TyVar) { return -1 }
   const row = monoHoleSubRow.get(fnStmtsPosOf(fnIx)) ?? -1
   if row < 0 || row >= monoHoleSubN.length { return -1 }
+  const tu = T.tys[ty]
+  // A join of holes the checker kept apart reads as their one pin when every hole has it (D3520).
+  if tu is TyUnion && tyIsTpJoinUnion(ty) {
+    let one = -1
+    for m in tu.uMembers {
+      const mb = holePinReadOf(m, monoHoleSubN[row], monoHoleSubT[row])
+      if mb < 0 || mb >= T.tys.length || tyHasTyVar(mb) { return -1 }
+      if one >= 0 && mb != one && !tySame(mb, one) { return -1 }
+      one = mb
+    }
+    return one
+  }
+  if !(tu is TyVar) { return -1 }
   const b = holePinReadOf(ty, monoHoleSubN[row], monoHoleSubT[row])
   if b < 0 || b >= T.tys.length || tyHasTyVar(b) { return -1 }
   b
@@ -35904,7 +35924,7 @@ export function exprUnion(exprIx: i32, fnIx: i32) {
     // Inside an instance a join over its type parameters is read at the pin, where it can be
     // the one primitive both bind (D3528).
     if ijp >= 0 && tyHasTyVar(ijp) {
-      const ijs = pinSubJoinTyOf(ijp, fnIx)
+      const ijs = pinSubOperandTyOf(ijp, fnIx)
       if ijs >= 0 { ijp = ijs }
     }
     if ijp >= 0 && ijp < T.tys.length {
@@ -36634,7 +36654,7 @@ export function ifJoinUnionNameIn(ifIx: i32, fnIx: i32): string {
   if own != "" { return own }
   const t = nodeTyPinIxOf(ifIx)
   if t < 0 || !tyHasTyVar(t) { return "" }
-  const ps = pinSubJoinTyOf(t, fnIx)
+  const ps = pinSubOperandTyOf(t, fnIx)
   if ps < 0 { return "" }
   const nm = tyToEmitName(ps)
   if nm != "" && isValueUnionName(nm) { return nm }
@@ -45544,7 +45564,7 @@ export function exprString(exprIx: i32, fnIx: i32) {
     // Inside an instance a join over its type parameters is read at the pin (D3528).
     const sjt = nodeTyIxOf(exprIx)
     if sjt >= 0 && tyHasTyVar(sjt) {
-      const sjs = pinSubJoinTyOf(sjt, fnIx)
+      const sjs = pinSubOperandTyOf(sjt, fnIx)
       if sjs >= 0 { return tyKindOf(sjs) == TK_STR }
     }
     // A join the checker kept as a value union is that union's box, whatever its then arm

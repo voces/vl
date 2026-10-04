@@ -2898,6 +2898,19 @@ function unionStrArmCountOf(nm: string) {
   unionStrArmCount(unionMemberSetOf(nm))
 }
 
+// Whether `recvIx` is a value-union box with no string or literal-union arm, so no string
+// literal (`texts`, from `tyLitMemberTexts`) can be its value.
+function litStrMembersOutsideBox(
+  recvIx: i32,
+  texts: string[],
+  fnIx: i32,
+): boolean {
+  if texts.length == 0 || !exprUnion(recvIx, fnIx) { return false }
+  const nm = unionNameOfExpr(recvIx, fnIx)
+  if nm == "" || !isValueUnionOfSet(msSetOfText(nm), nm) { return false }
+  unionStrArmCountOf(nm) == 0 && !unionCarriesLitUnionArm(nm)
+}
+
 // True when `recvIx` is a receiver `emitLitMemberEq` can be applied to repeatedly: a
 // value-union box, a string-repped litunion, a plain `string`, or the `string | null`
 // niche (whose compare answers false for null).
@@ -3421,6 +3434,13 @@ function emitIsTest(body: u8[], isIx: i32, fnIx: i32) {
         }
         let lsOk = lsTexts.length == 1
         if unionEqOperandOk(nd0.isObj) { lsOk = true }
+        // A box with no string arm holds no string member: false, after the receiver once.
+        if !lsOk && litStrMembersOutsideBox(nd0.isObj, lsTexts, fnIx) {
+          if emitExpr(body, nd0.isObj, fnIx) < 0 { return -1 }
+          fbDrop()
+          fbI32Const(0)
+          return 0
+        }
         if !lsOk { return emitFailNoMembershipRecv() }
         let lsI = 0
         while lsI < lsTexts.length {
@@ -5358,6 +5378,8 @@ export function emitUnionCoerce(
         if nlFn is FuncDecl && nlFn.fnRet < 0 {
           nlParam = paramIndexOf(fnIx, nlArg.identName) >= 0
         }
+        // A capture whose env field holds the atom is the atom, as a parameter is (D3358).
+        if capturedKindOf(fnIx, nlArg.identName) == "i32" { nlParam = true }
       }
       if !unionSetHasNull(unionName) || !aUsed || nlStrArm || !nlParam {
         return emitFail(
@@ -29347,7 +29369,32 @@ function njDispatches(e: BinExpr, fnIx: i32): boolean {
   }
   if P.nodes[unwrapParen(e.binLeft)] is NullLit { return false }
   if P.nodes[unwrapParen(e.binRight)] is NullLit { return false }
+  // An equality can meet the `null` an instance's box holds, which the dispatch skips; the
+  // union equality tests the tag first (D3520).
+  if (
+    (e.binOp == "==" || e.binOp == "!=")
+    && (njBoxHoldsNull(e.binLeft, fnIx) || njBoxHoldsNull(e.binRight, fnIx))
+  ) {
+    return false
+  }
   e.binOp != "=" && e.binOp != "&&" && e.binOp != "||" && e.binOp != "??"
+}
+
+// Whether the name at `ix` is an instance's box whose member set holds a `null` it has not
+// been narrowed past: the member `njMembersOf` skips.
+function njBoxHoldsNull(ix: i32, fnIx: i32): boolean {
+  const u = P.nodes[unwrapParen(ix)]
+  if !(u is Ident) { return false }
+  const t = nodeTyIxOf(ix)
+  if t < 0 || !tyHasTyVar(t) || !exprUnion(ix, fnIx) { return false }
+  const nv = narrowVariantFor(u.identName)
+  if nv != "" && nv != "null" { return false }
+  const name = unionNameOfExpr(ix, fnIx)
+  if name == "" { return false }
+  for k in njKindsOfUnionName(name) {
+    if k == 6 { return true }
+  }
+  false
 }
 
 // `a op b` where an operand is a numeric union.

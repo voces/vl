@@ -299,7 +299,6 @@ import {
   monoLamShared,
   monoOrigNode,
   monoParamPinTy,
-  monoPinSubLam,
   monoPinSubN,
   monoPinSubRow,
   monoPinSubT,
@@ -2103,12 +2102,16 @@ function monoIfChainRebuildPinned(
       if monoIfArmsAllTy(at, raw, bN, bT) {
         pty = monoPinnedTyOf(at, bN, bT)
         // Such a join is a union at the pin only as a box registered here.
-        if tpu { pty = monoPinUnionBoxed(pty) }
+        if tpu { pty = monoPinUnionBoxed(pty, false) }
       } else if sink || tpu {
         pty = monoIfArmsPinJoin(at, raw, bN, bT)
       } else if monoHoleJoinPinsString(raw, at, bN, bT) {
         // A hole join the pin makes a string is built as one, its atom arms widened (D3291).
         pty = monoHoleJoinPinTy(at, bN, bT)
+      }
+      // Arms with no pinned join of their own (a record arm) read the recorded union (D3520).
+      if pty < 0 && (tpu || monoTyIsUnionOrNulUnion(raw)) {
+        pty = monoPinUnionBoxed(monoPinnedTyOf(at, bN, bT), true)
       }
       if tpu && links[0] == monoTailIf && monoNulJoinMixesNumbers(raw, bN, bT) {
         // A join that leaves the body (a tail) is read by its caller without its `null` at these
@@ -2303,10 +2306,15 @@ function monoHoleJoinDropsArm(
     && !assignable(j, pty)
 }
 
-// `j`, its value-union box registered first when it is a union whose box has a name.
-function monoPinUnionBoxed(j: i32): i32 {
+// `j`, its value-union box registered first when it is a union whose box has a name; a union
+// with a record arm is named only when `refArm` (an `if` whose arms have no pinned join).
+function monoPinUnionBoxed(j: i32, refArm: boolean): i32 {
   if j < 0 || j >= T.tys.length || !monoTyIsUnionOrNulUnion(j) { return j }
-  const name = valueUnionRetName(j)
+  let name = valueUnionRetName(j)
+  // Such a union is named as a binding of it is (`monoTpJoinBindAnn`).
+  if name == "" && refArm && monoTyHoldsRefArm(j) {
+    name = monoPinUnionName(tyToEmitName(j))
+  }
   if name != "" { monoRegisterPinUnion(name) }
   j
 }
@@ -2369,21 +2377,6 @@ function monoChainPinnedTys(ix: i32, bN: string[], bT: i32[], out: i32[]): i32 {
     }
   }
   nested
-}
-
-// Whether body `ix` holds a function literal or a nested function declaration.
-function monoBodyHoldsFn(ix: i32): boolean {
-  const todo: i32[] = [ix]
-  while todo.length > 0 {
-    const at = todo.pop() ?? -1
-    if at >= 0 && at < P.nodes.length {
-      if P.nodes[at] is FuncDecl { return true }
-      for k in nodeChildren(at) {
-        if k >= 0 { todo.push(k) }
-      }
-    }
-  }
-  false
 }
 
 // Whether the link `cond`/`thenIx` is a desugared `??` whose operand is a join kept apart.
@@ -2805,13 +2798,14 @@ function monoKeepTplHole(ix: i32, nx: i32) {
 // declared elsewhere in the body (D2906). -1 otherwise.
 function monoTpJoinBindAnn(init: i32, bN: string[], bT: i32[]): i32 {
   if init < 0 { return -1 }
-  // A call's result is its callee's rep: a lambda's join is not built as a box (D3358).
-  if P.nodes[unwrapParen(init)] is Call { return -1 }
+  // A call's result is its callee's rep (D3358), whose box is registered below all the same.
+  const isCall = P.nodes[unwrapParen(init)] is Call
   const t = nodeTyIxOf(unwrapParen(init))
   if !tyIsTpJoinUnion(t) { return -1 }
   const st = substTyDeep(t, bN, bT)
   if st < 0 || st >= T.tys.length || tyHasTyVar(st) { return -1 }
   if T.tys[st] is TyUnion && monoListsLitMixed(st) {
+    if isCall { return -1 }
     // A literal union's list shares a list rep with another member's, so the box's tags could
     // not tell the two lists apart (D2760).
     emitFailAt(
@@ -2825,6 +2819,7 @@ function monoTpJoinBindAnn(init: i32, bN: string[], bT: i32[]): i32 {
   if tyIsLitUnion(nonNullTy(st)) { nm = monoI32AtomPinName(st) }
   if nm == "" { return -1 }
   if monoTyIsUnionOrNulUnion(st) && monoRegisterPinUnion(nm) < 0 { return -1 }
+  if isCall { return -1 }
   synthTypeRefTy(nm, -1, st)
 }
 
@@ -3592,12 +3587,28 @@ function monoCloneLambdaSubst(
       // A tail `if` or `match` is no return expression: the template's checked signature
       // holds its join, as the named clone's does.
       if rex < 0 { rty = monoLamCheckedRet(fnIx) }
+      // A join the checker kept apart over the body's parameters is the signature, whatever
+      // its last arm's own type: callers re-join it at the pin the same way (D3520).
+      const kept = monoLamCheckedRet(fnIx)
+      if kept >= 0 && tyIsTpJoinUnion(kept) { rty = kept }
       if rty >= 0 && tyHasTyVar(rty) {
         let rs = substTyDeep(rty, bN, bT)
         if monoRetReadsHoleParam(rex, fnIx) { rs = monoHoleTy(rs) }
         if rs >= 0 && rs != rty {
-          if !tyHasTyVar(rs) && !(rex < 0 && monoTyHasLitMember(rs)) {
+          const litGate = rex < 0
+            && monoTyHasLitMember(rs)
+            && !tyIsTpJoinUnion(rty)
+          if !tyHasTyVar(rs) && !litGate {
             const rnm = monoPinAnnSpelling(rs)
+            // The box a kept-apart join returns is registered here, as an instance return's is.
+            if (
+              rnm != ""
+              && tyIsTpJoinUnion(rty)
+              && monoTyIsUnionOrNulUnion(rs)
+              && !monoTyHoldsRefArm(rs)
+            ) {
+              if monoRegisterPinUnion(rnm) < 0 { return -1 }
+            }
             if rnm != "" { nret = synthTypeRefTy(rnm, -1, rs) }
           }
         }
@@ -7310,7 +7321,6 @@ export function monoSubTablesReset() {
   monoPinSubRow = Map()
   monoPinSubN = []
   monoPinSubT = []
-  monoPinSubLam = []
   0
 }
 
@@ -8354,7 +8364,6 @@ function monoMakeInstanceGo(
       monoPinSubRow.set(instFe, monoPinSubN.length)
       monoPinSubN.push(letBN)
       monoPinSubT.push(letBT)
-      monoPinSubLam.push(monoBodyHoldsFn(fn.fnBody))
     }
     if instHoleN.length > 0 {
       monoHoleSubRow.set(instFe, monoHoleSubN.length)
