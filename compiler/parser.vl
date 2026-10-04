@@ -1137,6 +1137,8 @@ function parseTypeAtom() {
   // which pushes `TS_ERR` for the `""` name it returns.
   const tm = tsMark()
   let name = ""
+  const inAs = asTargetCtx
+  asTargetCtx = false
   // `readonly T[]` — the read-only list view. A CONTEXTUAL keyword: only an identifier
   // spelled `readonly` and followed by a token a type can start with reads as the marker,
   // so a declared type named `readonly` still resolves.
@@ -1301,7 +1303,8 @@ function parseTypeAtom() {
       capt = btArgs[btRow]
     }
     const head = name // the identifier alone — the name grows a `<…>` below
-    if peekKind() == "LT" {
+    if peekKind() == "LT" && (!inAs || asTargetTakesTypeArgs(head)) {
+      const gtDiag = P.diags.length
       // A generic-alias application `Box<i32>` — in type position the `<` is unambiguous,
       // since no comparison can appear here. The arguments join into the synthetic name.
       // One trailing comma before the `>` is tolerated, and `>>`/`>>>` close nested
@@ -1320,6 +1323,17 @@ function parseTypeAtom() {
         }
       }
       expectTypeGt() // ">"
+      // In a cast the `<` may have been meant as a comparison; say how to write that.
+      if inAs && P.diags.length > gtDiag {
+        const gd = P.diags[gtDiag]
+        P.diags[gtDiag] = {
+          msg: gd.msg
+            + " — if `<` compares the cast, parenthesize it: `(x as "
+            + head
+            + ") < y`",
+          at: gd.at,
+        }
+      }
       // A body-scoped generic alias that also captured the enclosing function's
       // type parameters takes them as trailing arguments, after its own.
       if capt != "" {
@@ -2148,9 +2162,37 @@ function parseIsType() {
 // `a as i32 | b` is `(a as i32) | b`. The spelling is kept and banked on the `AsExpr` node by
 // the caller, because a cast target may be a user alias whose declaration the merge renames.
 function parseAsType() {
+  asTargetCtx = true
   const nm = parseTypeAtom()
   lastTyTsRoot = tsPop()
   nm
+}
+
+// Set by `parseAsType` for the one `parseTypeAtom` call it makes, and read and cleared at that
+// atom's entry, so a type nested inside the target never sees it.
+let asTargetCtx = false
+
+// Whether a cast target named `head` takes a `<…>` argument list (SP-018). A primitive never
+// does, nor does a type this module declares without parameters, so after either a `<` is a
+// comparison: `y as f64 < h`. A generic declaration, or a name declared elsewhere, keeps it.
+function asTargetTakesTypeArgs(head: string): boolean {
+  if asPrimTypeName(head) { return false }
+  let plain = false
+  let i = 0
+  while i + 2 < P.toks.length {
+    if P.toks[i].kind == "TYPE" && P.toks[i + 1].text == head {
+      if P.toks[i + 2].kind == "LT" { return true }
+      plain = true
+    }
+    i = i + 1
+  }
+  !plain
+}
+
+// The primitive type names, which take no type arguments.
+function asPrimTypeName(n: string): boolean {
+  if n == "i32" || n == "i64" || n == "f32" || n == "f64" { return true }
+  n == "u8" || n == "boolean" || n == "string" || n == "v128"
 }
 
 // One `type N = A | B` variant, and one `type AB = { … } & { … }` operand. A

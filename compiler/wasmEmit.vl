@@ -568,8 +568,10 @@ import {
   uDeclared,
   uFieldCount,
   uFieldElemName,
+  uFieldLitTyIx,
   uFieldNames,
   uFieldStart,
+  uFieldTyText,
   uFieldTypes,
   uSinkFired,
   uTags,
@@ -679,6 +681,7 @@ import {
   mvValsBackOf,
   nulScalarListFieldWrapHeap,
   nulScalarListWrapHeap,
+  pushFieldStorage,
   rpRow,
   rpVar,
   urBase,
@@ -1107,6 +1110,7 @@ import {
   scopeUnbind,
   setNarrowFromCond,
   setNarrowFromCondElse,
+  sharedFieldArmAtomKind,
   sharedFieldRecvSlot,
   sharedUnionFieldPlan,
   sigKeyPinPayload,
@@ -7360,6 +7364,173 @@ function fbIfForSharedField(code: i32) {
   fbIf(127) // i32 / boolean
 }
 
+// True when the shared-field dispatch can spell its `if` result for the plan `vis`/`fis`: a
+// scalar or string code, or a reference field every member stores at ONE storage type — the
+// same table `pushFieldStorage` writes into the type section, so the blocktype is that valtype.
+// A value-union field must also box against one atom set, the box's tags being positional.
+function sharedFieldPlanDispatchable(
+  code: i32,
+  vis: i32[],
+  fis: i32[],
+): boolean {
+  if sharedFieldCodeDispatchable(code) { return true }
+  if (
+    code == FC_STR
+    || code == FC_I32
+    || code == FC_NUL_LIT_UNION
+    || code == FC_NUL_BOOL
+  ) {
+    return false
+  }
+  if vis.length < 1 || fis.length != vis.length { return false }
+  if sharedFieldReadBoxes(code, vis[0], fis[0]) {
+    let b = 0
+    while b < vis.length {
+      const bk = sharedFieldArmAtomKind(vis[b], fis[b])
+      if bk == 14 { return false }
+      if atomKindNeedsValueBox(bk) && vbHeapIdxOfKind(bk) < 0 { return false }
+      b = b + 1
+    }
+    return true
+  }
+  const slot0 = uFieldStorageSlot(vis[0], fis[0])
+  const elem0 = variantFieldElemName(vis[0], fis[0])
+  let i = 1
+  while i < vis.length {
+    if uFieldStorageSlot(vis[i], fis[i]) != slot0 { return false }
+    if code == FC_UNION && variantFieldElemName(vis[i], fis[i]) != elem0 {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+// Whether the plan `code` boxes each member's field rather than reading one shared rep: the
+// members store the field at different value atoms (`sharedFieldArmsBoxable`).
+function sharedFieldReadBoxes(code: i32, vi0: i32, fi0: i32): boolean {
+  code == FC_UNION && variantFieldTypeAt(vi0, fi0) != FC_UNION
+}
+
+// Whether value atom `k` is boxed in its own scalar value struct, rather than riding the box's
+// `anyref` payload as the ref it already is.
+function atomKindNeedsValueBox(k: i32): boolean {
+  k == 0 || k == 1 || k == 3 || k == 4 || k == 5
+}
+
+// One member's arm of the shared-field dispatch: the receiver box, cast to member `vi`, read at
+// field `fi` — boxed under the field's atom tag when the plan boxes (`sharedFieldReadBoxes`).
+function emitSharedFieldArm(
+  body: u8[],
+  code: i32,
+  vi: i32,
+  fi: i32,
+  recvIx: i32,
+  fnIx: i32,
+  slot: i32,
+) {
+  if vi < 0 || vi >= uVarHeap.length {
+    return emitFail("emitProgram: a shared field read names no member row")
+  }
+  const boxes = sharedFieldReadBoxes(code, vi, fi)
+  const bk = sharedFieldArmAtomKind(vi, fi)
+  if boxes { fbI32Const(scalarTagOfKind(bk)) }
+  if emitSharedFieldRecv(body, recvIx, fnIx, slot) < 0 { return -1 }
+  fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
+  fbRefCast(uVarHeap[vi])
+  fbStructGet(uVarHeap[vi], fi)
+  if boxes {
+    if atomKindNeedsValueBox(bk) { fbStructNew(vbHeapIdxOfKind(bk)) }
+    fbStructNew(uBoxIdx)
+  }
+  0
+}
+
+// A field write through an un-narrowed struct union (`(A | B).n = v`): the value is evaluated
+// once into a slot of the field's storage type, then each member's arm stores it at that
+// member's own index. 1 when lowered, 0 when the write is not such a read's twin (the members
+// must store the field at one rep), -1 on failure.
+function emitSharedFieldAssign(body: u8[], memIx: i32, valIx: i32, fnIx: i32) {
+  const m = P.nodes[memIx]
+  if m is Member {
+    const vis: i32[] = []
+    const fis: i32[] = []
+    const code = sharedUnionFieldPlan(m.memObj, m.memProp, fnIx, vis, fis)
+    if code < 0 || !sharedFieldPlanDispatchable(code, vis, fis) { return 0 }
+    if sharedFieldReadBoxes(code, vis[0], fis[0]) { return 0 }
+    if !sharedFieldTysIdentical(vis, fis) { return 0 }
+    let rslot = -1
+    if !(P.nodes[unwrapParen(m.memObj)] is Ident) {
+      rslot = sharedFieldRecvSlot()
+      if emitExpr(body, m.memObj, fnIx) < 0 { return -1 }
+      fbLocalSet(rslot)
+    }
+    if seedFieldListBuild(code, variantFieldRefSlot(vis[0], fis[0])) < 0 {
+      return -1
+    }
+    if emitScalarFieldStoreVal(body, valIx, fnIx, code) < 0 { return -1 }
+    pendingListKind = LBK_I32_LIST
+    pendingListSlot = 0
+    const vslot = objOrderStashSlot(code, uFieldStorageSlot(vis[0], fis[0]))
+    fbLocalSet(vslot)
+    let i = 0
+    while i < vis.length {
+      const last = i == vis.length - 1
+      if !last {
+        if emitSharedFieldRecv(body, m.memObj, fnIx, rslot) < 0 { return -1 }
+        fbStructGet(uBoxIdx, 0) // field 0: tag
+        fbI32Const(uTags[vis[i]])
+        fbI32Bin(70)            // 0x46 i32.eq
+        fbIf(64)                // 0x40 void
+      }
+      if emitSharedFieldRecv(body, m.memObj, fnIx, rslot) < 0 { return -1 }
+      fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
+      fbRefCast(uVarHeap[vis[i]])
+      fbLocalGet(vslot)
+      fbStructSet(uVarHeap[vis[i]], fis[i])
+      if !last { fbElse() }
+      i = i + 1
+    }
+    let e = 0
+    while e < vis.length - 1 {
+      fbEnd()
+      e = e + 1
+    }
+    return 1
+  }
+  0
+}
+
+// Whether every member declares the field at one type, with no literal set among them — the
+// only case a store through the union is the same store into each member.
+function sharedFieldTysIdentical(vis: i32[], fis: i32[]): boolean {
+  if vis.length < 1 || fis.length != vis.length { return false }
+  const at0 = uFieldStart[vis[0]] + fis[0]
+  let i = 0
+  while i < vis.length {
+    const at = uFieldStart[vis[i]] + fis[i]
+    if at < 0 || at >= uFieldTyText.length || at >= uFieldLitTyIx.length {
+      return false
+    }
+    if at0 < 0 || at0 >= uFieldTyText.length { return false }
+    if uFieldTyText[at] != uFieldTyText[at0] || uFieldLitTyIx[at] >= 0 {
+      return false
+    }
+    if variantFieldIsLitUnion(vis[i], fis[i]) { return false }
+    if variantFieldIsLitUnionArray(vis[i], fis[i]) { return false }
+    i = i + 1
+  }
+  true
+}
+
+// `fbIfForSharedField` for a plan `sharedFieldPlanDispatchable` admitted: a reference field's
+// blocktype is its member's storage valtype, written by `pushFieldStorage`.
+function fbIfForSharedPlan(code: i32, vi: i32, fi: i32) {
+  if sharedFieldCodeDispatchable(code) { return fbIfForSharedField(code) }
+  fbOpenIf()
+  pushFieldStorage(code, uFieldStorageSlot(vi, fi))
+}
+
 // Push the shared-field dispatch's receiver box: the value stashed in `slot` when the receiver
 // is evaluated once (`slot >= 0`), else a fresh emission of the place — an ident, effect-free.
 // One function so the tag test and the payload read cannot pick different halves.
@@ -7677,7 +7848,7 @@ function emitMem(body: u8[], memIx: i32, fnIx: i32) {
       shVis,
       shFis,
     )
-    if shCode >= 0 && sharedFieldCodeDispatchable(shCode) {
+    if shCode >= 0 && sharedFieldPlanDispatchable(shCode, shVis, shFis) {
       // The receiver is evaluated once unless re-emitting it is free. The arms below read it
       // twice each — the tag test, then the payload cast — which is why an ident receiver, whose
       // `local.get` re-emits for nothing, needs no slot. A call does not: `g(true).v` would call
@@ -7697,26 +7868,43 @@ function emitMem(body: u8[], memIx: i32, fnIx: i32) {
       let si2 = 0
       while si2 < shVis.length - 1 {
         if emitSharedFieldRecv(body, mS.memObj, fnIx, shSlot) < 0 { return -1 }
-        fbStructGet(uBoxIdx, 0)    // field 0: tag
+        fbStructGet(uBoxIdx, 0)                       // field 0: tag
         fbI32Const(uTags[shVis[si2]])
-        fbI32Bin(70)               // 0x46 i32.eq
-        fbIfForSharedField(shCode) // if (result <the field's own rep>)
-        if emitSharedFieldRecv(body, mS.memObj, fnIx, shSlot) < 0 { return -1 }
-        fbStructGet(uBoxIdx, 1)    // field 1: value (anyref)
-        fbRefCast(uVarHeap[shVis[si2]])
-        fbStructGet(uVarHeap[shVis[si2]], shFis[si2])
+        fbI32Bin(70)                                  // 0x46 i32.eq
+        fbIfForSharedPlan(shCode, shVis[0], shFis[0]) // if (result <the field's own rep>)
+        const shArm = emitSharedFieldArm(
+          body,
+          shCode,
+          shVis[si2],
+          shFis[si2],
+          mS.memObj,
+          fnIx,
+          shSlot,
+        )
+        if shArm < 0 { return -1 }
         fbElse()
         si2 = si2 + 1
       }
       const shLast = shVis.length - 1
-      if emitSharedFieldRecv(body, mS.memObj, fnIx, shSlot) < 0 { return -1 }
-      fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
-      fbRefCast(uVarHeap[shVis[shLast]])
-      fbStructGet(uVarHeap[shVis[shLast]], shFis[shLast])
+      const shLastArm = emitSharedFieldArm(
+        body,
+        shCode,
+        shVis[shLast],
+        shFis[shLast],
+        mS.memObj,
+        fnIx,
+        shSlot,
+      )
+      if shLastArm < 0 { return -1 }
       let se = 0
       while se < shVis.length - 1 {
         fbEnd()
         se = se + 1
+      }
+      // A boxed read whose path is narrowed to one atom delivers that atom, as a code-16
+      // field's does.
+      if sharedFieldReadBoxes(shCode, shVis[0], shFis[0]) {
+        return emitUnionFieldNarrowUnbox(memIx, fnIx)
       }
       return 0
     }
@@ -17790,6 +17978,7 @@ function emitFloatIntr(body: u8[], callIx: i32, fnIx: i32, name: string) {
   if opF32 < 0 { return NUM_INTR_NONE }
   const mmk = minMaxKind(callIx, fnIx)
   if mmk == "i32" || mmk == "i64" {
+    if name == "abs" { return emitIntAbs(body, callIx, fnIx, mmk == "i64") }
     return emitIntMinMax(body, callIx, fnIx, name, mmk == "i64")
   }
   const c = P.nodes[callIx]
@@ -17859,6 +18048,35 @@ function emitIntMinMax(
   fbLocalGet(s0 + 1)
   fbNumOp(cmp)
   wU8(27) // 0x1b select → the first operand when the compare holds
+  0
+}
+
+// Lower an integer `abs`, which has no wasm instruction: `0 - x` when `x` is negative, else
+// `x`, through `select`. Wraps as the subtraction does, so `abs(i32.MIN)` is `i32.MIN`.
+// Stages the operand in the min/max frame's first slot of its width.
+function emitIntAbs(body: u8[], callIx: i32, fnIx: i32, wide: boolean) {
+  const c = P.nodes[callIx]
+  if !(c is Call) {
+    return emitFail("emitProgram: expected an integer abs call")
+  }
+  let k = 0
+  let s0 = intMinMaxSlot
+  if wide {
+    k = 3
+    s0 = intMinMaxSlot + 2
+  }
+  if emitNumIntrArg(body, c.callArgs[0], k, fnIx) < 0 { return -1 }
+  fbLocalSet(s0)
+  if wide { fbI64Const(0, 0) } else { fbI32Const(0) }
+  fbLocalGet(s0)
+  // i32.sub 0x6b · i64.sub 0x7d
+  if wide { fbNumOp(0x7d) } else { fbNumOp(0x6b) }
+  fbLocalGet(s0)
+  fbLocalGet(s0)
+  if wide { fbI64Const(0, 0) } else { fbI32Const(0) }
+  // i32.lt_s 0x48 · i64.lt_s 0x53
+  if wide { fbNumOp(0x53) } else { fbNumOp(0x48) }
+  wU8(27) // 0x1b select → the negation when the operand is negative
   0
 }
 
@@ -20640,6 +20858,9 @@ function emitAssign(body: u8[], binIx: i32, fnIx: i32) {
         fbStructSet(uVarHeap[nwvi], nwfi)
         return 0
       }
+      const shw = emitSharedFieldAssign(body, lhsIx, a.binRight, fnIx)
+      if shw < 0 { return -1 }
+      if shw == 1 { return 0 }
       // field write `recv.field = v` → `struct.set $0 <fieldidx>`; the single declared
       // struct lives at WasmGC type index 0. Operand order is load-bearing: struct ref
       // first, then the value.
