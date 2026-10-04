@@ -20012,9 +20012,7 @@ function emitCallRef(body: u8[], callIx: i32, fnIx: i32) {
       // its own row by field set, the pre-merge row wherever the callee's parameter row
       // moved. The seed is the key's, so it agrees with the functype by construction.
       const pkk = sigParamKindAt(ckey, i)
-      if pkk == "struct" || pkk == "nulstruct" {
-        pendingStructIdx = sigParamSlotAt(ckey, i)
-      }
+      seedValueArgShape(pkk, sigParamSlotAt(ckey, i))
       const pck = sigParamCoerceKind(ckey, i)
       if pck == "i64" {
         if emitExprAsI64(body, args[i], fnIx) < 0 { return -1 }
@@ -20162,6 +20160,8 @@ function emitCallRef(body: u8[], callIx: i32, fnIx: i32) {
     pendingI64 = savedArgI64
     pendingLitUnion = savedArgLU
     pendingNulLitUnion = savedArgNulLU
+    // Left neutral, as the direct call leaves them.
+    seedValueArgShape(null, -1)
     callRefDepth = crDepth
     // id = closure.id (field 1) — the callee's wasm function index, `call_indirect`'d at
     // the concrete `$fnsig` (the engine signature-checks the callee against it).
@@ -27515,6 +27515,44 @@ export function expCtxHere(): ExpCtx {
   return c
 }
 
+// Seeds the container shape a value call's argument builds from its parameter's `$fnsig`
+// kind and slot, replacing the enclosing position's: a list literal argument of a closure
+// called into a `Clip[]` field is the parameter's `i32[]`, not the field's list (D3605).
+function seedValueArgShape(pk: VKind | null, slot: i32) {
+  pendingStructIdx = -1
+  pendingListKind = listBuildKindOfVKind(pk, slot)
+  pendingListSlot = 0
+  pendingMapSlot = -1
+  pendingI64 = false
+  match pk {
+    "struct" | "nulstruct" => {
+      pendingStructIdx = slot
+    }
+    "reflist" => {
+      if slot >= 0 { pendingListSlot = slot }
+    }
+    "map" => {
+      pendingMapSlot = slot
+    }
+    "strlist" | "f64list" | "i64list" | "f32list" | "u8list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "list" | "nullist" | "nulreflist" | "i32" | "str" | "union" | "variant" | "nulvariant" | "i64" | "f64" | "f32" | "v128" | "closure" | "nulstr" | "nulbool" | "nulclosure" | "nulmap" | "nulnone" | null => {
+      // No other kind carries a container slot a literal argument builds at.
+    }
+  }
+  0
+}
+
+// The same seeds from a declared parameter, its list build read off the annotation as the
+// direct call reads it.
+function seedParamArgShape(paramIx: i32) {
+  seedValueArgShape(vtKindOfParam(paramIx), paramStructIdxOf(paramIx))
+  const p = P.nodes[paramIx]
+  if p is Param {
+    pendingListKind = tyAnnRefListKind(p.parType)
+    pendingListSlot = tyAnnRefListSlot(p.parType)
+  }
+  0
+}
+
 // Write a context into the pending seeds (the transport the consumers read).
 export function expCtxApply(c: ExpCtx) {
   pendingListKind = c.listKind
@@ -30698,7 +30736,9 @@ function emitCapturedCall(body: u8[], callIx: i32, fnIx: i32, target: i32) {
     let cuNm = ""
     let cpKind: VKind = "i32"
     let cpLit = false
+    seedValueArgShape(null, -1)
     if cai < cps.length {
+      seedParamArgShape(cps[cai])
       cpKind = vtKindOfParam(cps[cai])
       const cpn = P.nodes[cps[cai]]
       if cpn is Param {
@@ -30740,6 +30780,7 @@ function emitCapturedCall(body: u8[], callIx: i32, fnIx: i32, target: i32) {
   }
   pendingLitUnion = savedCapLU
   pendingNulLitUnion = savedCapNulLU
+  seedValueArgShape(null, -1)
   callRefDepth = crDepth
   // The target's own interned `$fnsig` — the functype it is actually declared with — so the
   // `call_indirect` below passes the engine's signature check and returns the target's real
