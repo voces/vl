@@ -656,6 +656,7 @@ import {
   monoInstOrig,
   monoOrigNode,
   monoParamPinTy,
+  monoPinSubLam,
   monoPinSubN,
   monoPinSubRow,
   monoPinSubT,
@@ -29424,7 +29425,10 @@ export function exprIsLitAtom(exprIx: i32, fnIx: i32) {
     if ifJoinTypedAtom(unwrapParen(exprIx)) { return true }
     // A join `emitIfExpr` lowers as a union box is the box, whatever its arms are alone: a
     // generic's `a ?? 5` pinned at a literal union joins to `K | i32` (D3281).
-    if exprUnion(exprIx, fnIx) && ifJoinUnionName(unwrapParen(exprIx)) != "" {
+    if (
+      exprUnion(exprIx, fnIx)
+      && ifJoinUnionNameIn(unwrapParen(exprIx), fnIx) != ""
+    ) {
       return false
     }
     const tv = ifArmValueExpr(e.ifThen)
@@ -31342,6 +31346,27 @@ export function pinSubOperandTyOf(ty: i32, fnIx: i32): i32 {
     if row >= 0 && row < monoPinSubN.length {
       const st = substTyDeep(ty, monoPinSubN[row], monoPinSubT[row])
       if st < 0 || tyHasTyVar(st) { return -1 }
+      return st
+    }
+    if pos >= fnParent.length { return -1 }
+    pos = fnParent[pos]
+    guard = guard + 1
+  }
+  -1
+}
+
+// `pinSubOperandTyOf` for a join's own type, declined in an instance whose body holds a
+// function: a lambda's join of the parameters is not built apart at its call, so the pin
+// would name members its value does not carry (D3520).
+export function pinSubJoinTyOf(ty: i32, fnIx: i32): i32 {
+  const st = pinSubOperandTyOf(ty, fnIx)
+  if st < 0 { return -1 }
+  let pos = fnStmtsPosOf(fnIx)
+  let guard = 0
+  while pos >= 0 && guard <= fnStmts.length {
+    const row = monoPinSubRow.get(pos) ?? -1
+    if row >= 0 && row < monoPinSubLam.length {
+      if monoPinSubLam[row] { return -1 }
       return st
     }
     if pos >= fnParent.length { return -1 }
@@ -35764,7 +35789,13 @@ export function exprUnion(exprIx: i32, fnIx: i32) {
     // where no narrow is active, while `emitIfExpr` lowers the join as the member (D2264). Not
     // in a generic body, whose narrowed list arm is typed at the parameter and lowers as the box.
     const iuTv = ifThenValueIx(exprIx)
-    const ijp = nodeTyPinIxOf(exprIx)
+    let ijp = nodeTyPinIxOf(exprIx)
+    // Inside an instance a join over its type parameters is read at the pin, where it can be
+    // the one primitive both bind (D3528).
+    if ijp >= 0 && tyHasTyVar(ijp) {
+      const ijs = pinSubJoinTyOf(ijp, fnIx)
+      if ijs >= 0 { ijp = ijs }
+    }
     if ijp >= 0 && ijp < T.tys.length {
       const ijt = T.tys[ijp]
       if ijt is TyPrim { return false }
@@ -36485,6 +36516,21 @@ export function tyIsUnionShaped(t: i32): boolean {
   tt is TyUnion
 }
 
+// `ifJoinUnionName` inside function `fnIx`, where a join over an instance's type parameters
+// is named at the pin (D3528).
+export function ifJoinUnionNameIn(ifIx: i32, fnIx: i32): string {
+  const own = ifJoinUnionName(ifIx)
+  if own != "" { return own }
+  const t = nodeTyPinIxOf(ifIx)
+  if t < 0 || !tyHasTyVar(t) { return "" }
+  const ps = pinSubJoinTyOf(t, fnIx)
+  if ps < 0 { return "" }
+  const nm = tyToEmitName(ps)
+  if nm != "" && isValueUnionName(nm) { return nm }
+  if tyIsNulValueUnionBox(ps) { return nm }
+  ""
+}
+
 // The union NAME the expression at `exprIx` produces (the name-typed mirror of the
 // boolean `exprUnion`): a union-returning call's return annotation, a union-typed
 // ident, a parenthesized union. "" when the expression is not union-valued.
@@ -36503,7 +36549,7 @@ export function unionNameOfExpr(exprIx: i32, fnIx: i32) {
   }
   // An if-expression names its union from its own recorded type, like the `AsExpr` arm: only
   // a desugared `??` (`nodeTyCarry`) puts a type on an `if` — a source-written one has none. D969.
-  if e is IfStmt { return ifJoinUnionName(unwrapParen(exprIx)) }
+  if e is IfStmt { return ifJoinUnionNameIn(unwrapParen(exprIx), fnIx) }
   // An operator over a numeric union names the union of its member results.
   if numUnionMinted && (e is BinExpr || e is Unary) {
     const nuTy = nodeTyIxOf(unwrapParen(exprIx))
@@ -45324,6 +45370,12 @@ export function exprString(exprIx: i32, fnIx: i32) {
     // The join's checked type is arm-order-independent: a `string`-typed join may lead with
     // an atom arm, which widens at `emitRefIfArm` — so the value is still a string.
     if tyKindOf(nodeTyIxOf(exprIx)) == TK_STR { return true }
+    // Inside an instance a join over its type parameters is read at the pin (D3528).
+    const sjt = nodeTyIxOf(exprIx)
+    if sjt >= 0 && tyHasTyVar(sjt) {
+      const sjs = pinSubJoinTyOf(sjt, fnIx)
+      if sjs >= 0 { return tyKindOf(sjs) == TK_STR }
+    }
     // A join the checker kept as a value union is that union's box, whatever its then arm
     // is, so a string then arm does not make the `if` a string (D2839).
     if tyIsValueUnionBox(nodeTyIxOf(exprIx)) { return false }

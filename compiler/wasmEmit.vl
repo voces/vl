@@ -907,7 +907,7 @@ import {
   ifExprValtype,
   ifJoinNarrowsPerArm,
   ifJoinTypedAtom,
-  ifJoinUnionName,
+  ifJoinUnionNameIn,
   ifLinkYieldsNull,
   indexElemUnionName,
   indexPlaceNonNull,
@@ -2488,6 +2488,17 @@ function monoStaticIsResult(isIx: i32, fnIx: i32) {
     }
 
     if nodeTyIsNullable(nd.isObj) { return -1 }
+    // A join the instance re-typed at its pin answers only for its own type; the name cascade
+    // below reads its arms' reps instead (D3568).
+    const jo = unwrapParen(nd.isObj)
+    if jo >= 0 && P.nodes[jo] is IfStmt {
+      const jt = nodeTyIxOf(jo)
+      if jt >= 0 && !tyHasTyVar(jt) {
+        const ept = isVarTyIxOf(isIx)
+        if ept >= 0 && tySameSet(jt, ept, TY_WALK_DEPTH) { return 1 }
+        return -1
+      }
+    }
     const sk = monoArgTyName(nd.isObj, fnIx)
     if sk == "" { return -1 }
 
@@ -2610,6 +2621,14 @@ function emitNumLitEq(body: u8[], recvIx: i32, lv: string, fnIx: i32) {
   fbI32Const(parseI32(lv))
   fbI32Bin(70)
   return 0
+}
+
+// Whether every numeric literal text in `texts` is an integer that fits an `i32`.
+function numLitTextsFitI32(texts: string[]): boolean {
+  for t in texts {
+    if numLexIsFloat(t) || !numLexFitsI32(t) { return false }
+  }
+  true
 }
 
 // The base numeric scalar an `is` receiver reps as in this instance — `"i32"`/`"i64"`/
@@ -2957,7 +2976,8 @@ function nulNicheIsTestImpossible(recvIx: i32, ity: i32, fnIx: i32) {
     const pb = nulNicheBaseClass(recvIx, fnIx)
     if tyIsRecord(ity) { return pb == "string" || pb == "boolean" }
     if tyIsLitUnion(ity) { return pb == "#ref" || pb == "boolean" }
-    return false
+    // …nor a literal union of numbers the member of any of them (D3546).
+    return pb != "" && numLitUnionBaseName(ity) != ""
   }
   const base = nulNicheBaseClass(recvIx, fnIx)
   if base == "" { return false }
@@ -3590,6 +3610,24 @@ function emitIsTest(body: u8[], isIx: i32, fnIx: i32) {
             }
             if nlI > 0 { fbI32Bin(114) }
             nlI = nlI + 1
+          }
+          return 0
+        }
+        // An `i32` receiver that cannot be re-read is read once into a slot; the name fold
+        // below answers by spelling and would say false for a member (D3570).
+        if nlTexts.length > 0 && nlBase == "i32" && numLitTextsFitI32(nlTexts) {
+          if emitExpr(body, nd0.isObj, fnIx) < 0 { return -1 }
+          const nlSlot = strI32Slot()
+          fbLocalSet(nlSlot)
+          let nsI = 0
+          while nsI < nlTexts.length {
+            fbLocalGet(nlSlot)
+            fbI32Const(parseI32(nlTexts[nsI]))
+            fbI32Bin(70) // 0x46 i32.eq
+            if nsI > 0 {
+              fbI32Bin(114) // 0x72 i32.or
+            }
+            nsI = nsI + 1
           }
           return 0
         }
@@ -15655,7 +15693,7 @@ function emitIfExpr(body: u8[], ifIx: i32, fnIx: i32) {
   } else {
     // A union-valued join is the box whatever reads it, so it takes the box blocktype here and
     // not only at a union destination: an inline `(if c { a } else { b }) != null` reads it (D2250).
-    if exprUnion(ifIx, fnIx) { iun = ifJoinUnionName(ifIx) }
+    if exprUnion(ifIx, fnIx) { iun = ifJoinUnionNameIn(ifIx, fnIx) }
     if iun != "" {
       how = 3
     } else {
