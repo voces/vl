@@ -784,6 +784,42 @@ Deno.test({
   }
 });
 
+// Flow facts reach hover too: a binding filled on the `null` arm of an `if` is its non-null type
+// below it (D3556), and the first `pop()` under a `.length` test is the element (D3558).
+Deno.test({
+  name: "wasm-symbols: hover after a fill-on-null join and under a `.length` test",
+  ignore,
+}, async () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  const src = "type S = { n: i32 }\n" +
+    "function get(m: Map<i32, S>, k: i32): S {\n" +
+    "  let s = m.get(k)\n" +
+    "  if s == null { s = { n: k } }\n" +
+    "  const t = s\n" +
+    "  t\n" +
+    "}\n" +
+    "const stack = [1, 2]\n" +
+    "while stack.length > 0 {\n" +
+    "  const k = stack.pop()\n" +
+    "  print(k + 1)\n" +
+    "}\n" +
+    "const after = stack.pop()\n" +
+    "print(after ?? 0)\n";
+  const cases: [number, number, string][] = [
+    [2, 6, "S | null"], // `let s` — the declaration keeps its declared type
+    [4, 12, "S"], // `s` below the join
+    [4, 8, "S"], // `t`
+    [9, 8, "i32"], // `k` from the first pop under the test
+    [12, 6, "i32 | null"], // `after`, outside the test
+  ];
+  for (const [line, col, want] of cases) {
+    const got = await checker.hoverTypeAt(src, "/tmp/x.vl", noSiblings, line, col);
+    if (got !== want) {
+      throw new Error(`${line}:${col}: want ${want}, got ${JSON.stringify(got)}`);
+    }
+  }
+});
+
 Deno.test({ name: "wasm-symbols: typeAliasAt renders a user type name (decl + use)", ignore }, async () => {
   const checker = loadWasmChecker(SEED, log)!;
   // `type Pt = { x: i32 }` on line 0 (name at col 5); `let p: Pt = …` on line 1

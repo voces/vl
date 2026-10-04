@@ -9253,6 +9253,17 @@ writes already read 8.2 on that walk; the emitter's narrowing stack now keeps a 
 index so a lookup or retirement costs the key's own entries rather than the whole stack, which
 took a flat run of straight-line writes from 10.5 to 3.95.
 
+**A `.length` test proves the next pop (owner ruling A on sunpa SP-008, D3558).** Inside `if` /
+`while k.length > 0` (also `!= 0`, `>= 1`, `0 < k.length`), the first `k.pop()` is the element,
+not `T | null`. This is a fact about a list place rather than a type, so it is kept beside the
+narrowing core (`neEnter`/`nePopTakes`, `compiler/typecheck.vl`) and not in the ledger: it is
+consumed by the pop rather than joined. It is ended, in checking order, by anything that may
+shrink or rebind the list or re-run the pop: any call or operator that may dispatch (which is how
+an alias's pop, a closure's and a callee's are caught), a write to the key's root name, any
+write to a field or element (another name may reach the same list), a declaration of its name, a loop, and a call with named arguments, whose arguments run in
+parameter order. A `push` ends it too, as the ruling says, though it cannot make the list empty.
+The emitter reads such a pop unchecked; there is no postfix `!` (declined; D3555 names it).
+
 ## Record covariance: only a fresh value widens (owner ruling "A, with C eventually", 2026-09-29) — D2996
 
 **The ruling.** A record delivered where a record of the same field names stores a field
