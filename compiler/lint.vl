@@ -54,6 +54,7 @@ import {
   declNameTokOf,
   elseIfLink,
   externGlobalLinkOfNode,
+  i32ToStr,
   nodeSpineChildren,
   nodeToks,
   stmtAlwaysExits,
@@ -1683,14 +1684,28 @@ let visIds: i32[] = []
 // as deep as the module has bindings (B6a, `docs/internals/perf-opportunities-2026-09.md`).
 let visHead: {[string]: i32} = Map()
 let visPrev: i32[] = []
+// The name token that declares each entry (-1 when the source holds none), and the
+// `visReadSeq` stamp of the last read that resolved to it.
+let visToks: i32[] = []
+let visLastRead: i32[] = []
+// 1 when the entry belongs to a chain `shadowedLocal` reported, so a deeper binding of
+// the same name joins that chain instead of reporting again.
+let visShadowed: i32[] = []
+let visReadSeq = 0
+// The stack depth at which the innermost enclosing function's entries begin, or -1
+// outside any function. An entry at or above it belongs to that function.
+let visFnMark = -1
 
 // Push one scope entry: `id` is its `declNodes` index, or -1 for a shadowing-only
 // entry. The single writer of the stack and its chain, so the two cannot disagree.
-function visPush(name: string, id: i32) {
+function visPush(name: string, id: i32, tok: i32) {
   visPrev.push(visHead[name] ?? -1)
   visHead[name] = visNames.length
   visNames.push(name)
   visIds.push(id)
+  visToks.push(tok)
+  visLastRead.push(0)
+  visShadowed.push(0)
   0
 }
 
@@ -1705,7 +1720,9 @@ function bindPush(name: string, ix: i32, kind: i32, tok: i32) {
   declToks.push(tok)
   declUsed.push(0)
   declWritten.push(0)
-  visPush(name, declNodes.length - 1)
+  let at = tok
+  if at < 0 { at = declNameTokOf(ix) }
+  visPush(name, declNodes.length - 1, at)
   0
 }
 
@@ -1718,6 +1735,9 @@ function bindTrim(mark: i32) {
     visNames.pop()
     visIds.pop()
     visPrev.pop()
+    visToks.pop()
+    visLastRead.pop()
+    visShadowed.pop()
   }
   0
 }
@@ -1728,6 +1748,10 @@ function bindTrim(mark: i32) {
 function bindMark(name: string, flag: i32) {
   const i = visHead[name] ?? -1
   if i < 0 { return 0 }
+  if flag == 0 {
+    visReadSeq = visReadSeq + 1
+    visLastRead[i] = visReadSeq
+  }
   const id = visIds[i]
   if id >= 0 {
     if flag == 0 { declUsed[id] = 1 } else { declWritten[id] = 1 }
@@ -2018,6 +2042,35 @@ function lintIsBareName(s: string) {
   true
 }
 
+// shadowed-local: warns when binding `name` (token `tok`) hides one of the same function,
+// and returns 1 when it joins a reported chain. Skips module names, an outer function's or
+// lambda's bindings, and a rebinding whose initialiser read the outer one after `readMark`
+// (`const x = x as f64`; -1 for a loop variable).
+function shadowedLocal(name: string, tok: i32, readMark: i32): i32 {
+  if visFnMark < 0 || tok < 0 { return 0 }
+  const i = visHead[name] ?? -1
+  if i < visFnMark { return 0 }
+  const outer = visToks[i]
+  if outer < 0 { return 0 }
+  if visShadowed[i] == 1 { return 1 }
+  if readMark >= 0 && visLastRead[i] > readMark { return 0 }
+  lintEmitAtTok(
+    "shadowed-local",
+    "`"
+      + name
+      + "` shadows the `"
+      + name
+      + "` declared at "
+      + i32ToStr(lintTokLine(outer))
+      + ":"
+      + i32ToStr(lintTokCol(outer) + 1)
+      + " in this function; rename one if they are different values",
+    "warning",
+    tok,
+  )
+  1
+}
+
 // Scan the initializer (and inert type slot) of the `LetDecl` at `six` without binding
 // its name — the `Program` arm hoists top-level bindings up front, and the sequential
 // arms bind after the initializer, so `let x = x` reads the outer `x`.
@@ -2080,14 +2133,19 @@ function bindScan(ix: i32) {
   } else if n is LetDecl {
     // Initializer first (reads the OUTER binding on a same-name init), then the
     // binding — visible until the enclosing scope's trim.
+    const readMark = visReadSeq
     bindScanLetInit(ix)
+    const shadowed = shadowedLocal(n.letName, declNameTokOf(ix), readMark)
     bindPush(n.letName, ix, 0, -1)
+    visShadowed[visNames.length - 1] = shadowed
   } else if n is FuncDecl {
     // A function scope: parameter defaults, then parameters, then the body. The defaults
     // are scanned before the parameters bind, because a default's names resolve at the
     // declaration in the enclosing scope — scanning them after would attribute
     // `function f(K: i32, b: i32 = K)`'s use to the parameter, which the checker refuses.
     const mark = visNames.length
+    const fnMarkSaved = visFnMark
+    visFnMark = mark
     let pd = 0
     while pd < n.fnParams.length {
       const dix = n.fnParams[pd]
@@ -2110,19 +2168,32 @@ function bindScan(ix: i32) {
     }
     bindScan(n.fnBody)
     bindTrim(mark)
+    visFnMark = fnMarkSaved
   } else if n is ForRange {
     bindScan(n.frFrom)
     bindScan(n.frTo)
     bindScan(n.frStep)
     const mark = visNames.length
-    visPush(n.frVar, -1)
+    const vTok = declNameTokOf(ix)
+    const shadowed = shadowedLocal(n.frVar, vTok, -1)
+    visPush(n.frVar, -1, vTok)
+    visShadowed[visNames.length - 1] = shadowed
     bindScan(n.frBody)
     bindTrim(mark)
   } else if n is ForIn {
     bindScan(n.fiIter)
     const mark = visNames.length
-    visPush(n.fiVar, -1)
-    if n.fiVar2 != "" { visPush(n.fiVar2, -1) }
+    const vTok = declNameTokOf(ix)
+    const shadowed = shadowedLocal(n.fiVar, vTok, -1)
+    visPush(n.fiVar, -1, vTok)
+    visShadowed[visNames.length - 1] = shadowed
+    if n.fiVar2 != "" {
+      let v2Tok = -1
+      if vTok >= 0 { v2Tok = vTok + 2 }
+      const shadowed2 = shadowedLocal(n.fiVar2, v2Tok, -1)
+      visPush(n.fiVar2, -1, v2Tok)
+      visShadowed[visNames.length - 1] = shadowed2
+    }
     bindScan(n.fiBody)
     bindTrim(mark)
   } else {
@@ -2159,6 +2230,11 @@ function collectBindingsAndRefs(progRoot: i32) {
   visIds = []
   visHead = Map()
   visPrev = []
+  visToks = []
+  visLastRead = []
+  visShadowed = []
+  visReadSeq = 0
+  visFnMark = -1
   lintTyCapableCollect(progRoot)
   bindScan(progRoot)
   collectTypeNameRefs()

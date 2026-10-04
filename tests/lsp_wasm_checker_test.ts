@@ -784,6 +784,42 @@ Deno.test({
   }
 });
 
+// Flow facts reach hover too: a binding filled on the `null` arm of an `if` is its non-null type
+// below it (D3556), and the first `pop()` under a `.length` test is the element (D3558).
+Deno.test({
+  name: "wasm-symbols: hover after a fill-on-null join and under a `.length` test",
+  ignore,
+}, async () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  const src = "type S = { n: i32 }\n" +
+    "function get(m: Map<i32, S>, k: i32): S {\n" +
+    "  let s = m.get(k)\n" +
+    "  if s == null { s = { n: k } }\n" +
+    "  const t = s\n" +
+    "  t\n" +
+    "}\n" +
+    "const stack = [1, 2]\n" +
+    "while stack.length > 0 {\n" +
+    "  const k = stack.pop()\n" +
+    "  print(k + 1)\n" +
+    "}\n" +
+    "const after = stack.pop()\n" +
+    "print(after ?? 0)\n";
+  const cases: [number, number, string][] = [
+    [2, 6, "S | null"], // `let s` — the declaration keeps its declared type
+    [4, 12, "S"], // `s` below the join
+    [4, 8, "S"], // `t`
+    [9, 8, "i32"], // `k` from the first pop under the test
+    [12, 6, "i32 | null"], // `after`, outside the test
+  ];
+  for (const [line, col, want] of cases) {
+    const got = await checker.hoverTypeAt(src, "/tmp/x.vl", noSiblings, line, col);
+    if (got !== want) {
+      throw new Error(`${line}:${col}: want ${want}, got ${JSON.stringify(got)}`);
+    }
+  }
+});
+
 Deno.test({ name: "wasm-symbols: typeAliasAt renders a user type name (decl + use)", ignore }, async () => {
   const checker = loadWasmChecker(SEED, log)!;
   // `type Pt = { x: i32 }` on line 0 (name at col 5); `let p: Pt = …` on line 1
@@ -1040,6 +1076,34 @@ Deno.test({ name: "wasm-checker: a lint range covers what the message names", ig
   if (rangeText(src, pc.range) !== "let") {
     throw new Error(`prefer-const: want the range over "let", got ${JSON.stringify(rangeText(src, pc.range))}`);
   }
+});
+
+Deno.test({ name: "wasm-checker: shadowed-local warns on the inner binding's name (D3579)", ignore }, () => {
+  const checker = loadWasmChecker(SEED, log)!;
+  // sunpa SP-021: the loop's scalar `sheet` hides the function's array `sheet`.
+  const src = "function f() {\n" +
+    "  const sheet = [1.0, 2.0]\n" +
+    "  let s = 0.0\n" +
+    "  for k in 0 until 2 { const sheet = 10.0 * k as f64; s += sheet }\n" +
+    "  s + sheet[0]\n" +
+    "}\n" +
+    "print(f())\n";
+  const diags = checker.lint(src).filter((x) => x.code === "shadowed-local");
+  if (diags.length !== 1) throw new Error(`want one shadowed-local, got ${JSON.stringify(diags)}`);
+  const d = diags[0];
+  const want = "`sheet` shadows the `sheet` declared at 2:9 in this function; " +
+    "rename one if they are different values";
+  if (d.severity !== "warning" || d.message !== want) {
+    throw new Error(`want a warning ${JSON.stringify(want)}, got ${d.severity} ${JSON.stringify(d.message)}`);
+  }
+  const innerCol = src.split("\n")[3].indexOf("sheet");
+  if (d.range.start.line !== 3 || d.range.start.character !== innerCol || rangeText(src, d.range) !== "sheet") {
+    throw new Error(`want the range over the inner \`sheet\` at 3:${innerCol}, got ${JSON.stringify(d.range)}`);
+  }
+  // The control: a lambda's own binding is not the enclosing function's.
+  const lam = "function g() {\n  const n = 1\n  const h = (k: i32) => { const n = k; n }\n  h(n)\n}\nprint(g())\n";
+  const quiet = checker.lint(lam).filter((x) => x.code === "shadowed-local");
+  if (quiet.length !== 0) throw new Error(`a lambda binding fired: ${JSON.stringify(quiet)}`);
 });
 
 Deno.test({ name: "wasm-checker: a sentinel-index range covers the whole read", ignore }, () => {

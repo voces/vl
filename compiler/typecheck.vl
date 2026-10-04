@@ -6518,6 +6518,138 @@ function subscriptKeyTextOf(ix: i32) {
   ""
 }
 
+// ── non-empty list facts (D3558) ─────────────────────────────────────────────
+
+// The list places a `.length` test proved non-empty, innermost last: the key, the function whose
+// body tested it, whether it still holds, and the `.pop()` that consumed it (-1 before). The first
+// pop of a live key yields the element itself; anything that may shrink or rebind the list, run
+// again, or reorder evaluation ends every fact of the current function first.
+const neKeys: string[] = []
+const neFns: i32[] = []
+const neLive: boolean[] = []
+const neUsedBy: i32[] = []
+
+// The list place condition `cond` proves non-empty — `k.length > 0`, `!= 0`, `>= 1`, or the same
+// with the operands swapped — or "".
+function neCondKey(cond: i32): string {
+  const n = P.nodes[crUnParen(cond)]
+  if n is BinExpr {
+    const op = n.binOp
+    const lk = neLenKey(n.binLeft)
+    if lk != "" {
+      if (op == ">" || op == "!=") && neIntLit(n.binRight, "0") { return lk }
+      if op == ">=" && neIntLit(n.binRight, "1") { return lk }
+      return ""
+    }
+    const rk = neLenKey(n.binRight)
+    if rk != "" {
+      if (op == "<" || op == "!=") && neIntLit(n.binLeft, "0") { return rk }
+      if op == "<=" && neIntLit(n.binLeft, "1") { return rk }
+    }
+  }
+  ""
+}
+
+// The place key of `k` in a read `k.length`, or "".
+function neLenKey(ix: i32): string {
+  const n = P.nodes[crUnParen(ix)]
+  if n is Member {
+    if n.memProp == "length" { return placeKeyOf(n.memObj) }
+  }
+  ""
+}
+
+function neIntLit(ix: i32, text: string): boolean {
+  const n = P.nodes[crUnParen(ix)]
+  if n is NumLit { return n.numText == text }
+  false
+}
+
+// Opens the fact `cond` proves for the arm about to be checked; hands back the mark `neLeave` takes.
+// A key through an element (`a[0]`) opens none: the emitter pops only a local's or a field's list.
+function neEnter(cond: i32): i32 {
+  const mark = neKeys.length
+  const k = neCondKey(cond)
+  if k != "" && k.indexOf("[") < 0 {
+    neKeys.push(k)
+    neFns.push(curFnDeclIx)
+    neLive.push(true)
+    neUsedBy.push(-1)
+  }
+  mark
+}
+
+function neLeave(mark: i32) {
+  while neKeys.length > mark {
+    neKeys.pop()
+    neFns.pop()
+    neLive.pop()
+    neUsedBy.pop()
+  }
+}
+
+// Ends every fact of the current function whose key is rooted at `root`, or every one for "".
+function neKill(root: string) {
+  let i = 0
+  while i < neKeys.length {
+    if neFns[i] == curFnDeclIx && (root == "" || neKeyRoot(neKeys[i]) == root) {
+      neLive[i] = false
+    }
+    i = i + 1
+  }
+}
+
+function neKeyRoot(k: string): string {
+  let i = 0
+  while i < k.length && k[i] != 46 && k[i] != 91 { i = i + 1 }
+  k.slice(0, i)
+}
+
+// Whether the `.pop()` at `callIx` over receiver `recvIx` takes a live fact (or took it on an
+// earlier pass), so it yields the element rather than `T | null`.
+function nePopTakes(callIx: i32, recvIx: i32): boolean {
+  if neKeys.length == 0 { return false }
+  const key = placeKeyOf(recvIx)
+  if key == "" { return false }
+  let i = 0
+  while i < neKeys.length {
+    if neKeys[i] == key && neFns[i] == curFnDeclIx {
+      if neUsedBy[i] == callIx { return true }
+      if neLive[i] {
+        neUsedBy[i] = callIx
+        return true
+      }
+    }
+    i = i + 1
+  }
+  false
+}
+
+// An assignment to a bare name ends the facts rooted at it or subscripted by it; any other
+// target may be reached through an alias (`p.xs = []` with `p` the same record as `o`), so it
+// ends every fact.
+function neAssigned(n: BinExpr) {
+  const t = P.nodes[crUnParen(n.binLeft)]
+  if t is Ident {
+    neKill(t.identName)
+    neKillSubscript(t.identName)
+  } else {
+    neKill("")
+  }
+}
+
+// Ends every fact of the current function whose key subscripts with the name `nm` (`a[nm]`).
+function neKillSubscript(nm: string) {
+  const sub = "[" + nm + "]"
+  let i = 0
+  while i < neKeys.length {
+    if neFns[i] == curFnDeclIx && neKeys[i].indexOf(sub) >= 0 {
+      neLive[i] = false
+    }
+    i = i + 1
+  }
+}
+
 // The narrowing key of the receiver an index place is taken from — `"xs"` for `xs[i]`, `"o.xs"`
 // for `o.xs[i]` — or `""` when the node is not an index or the receiver is not itself a place. It
 // answers for a variable subscript too, which is the point: the write side needs to know which
@@ -8996,6 +9128,7 @@ function unionMemberOfWrite(dcl: i32, ms: i32[], rt: i32): i32 {
 // are checked, so `f(o.v.length, o)` still reads `o.v` under the narrowing in force as that
 // argument is evaluated.
 function noteCallInvalidations(callIx: i32) {
+  if neKeys.length > 0 { neKill("") }
   if !(P.nodes[callIx] is Call) { crOpCall[callIx] = true }
   crCapRecCheck(callIx)
   crNoteCallBare(callIx)
@@ -46585,7 +46718,13 @@ function checkMemberCallNode(
       if margs.length != 0 {
         tErr("pop expects 0 arguments, got " + i32ToStr(margs.length), ix)
       }
-      return mkNullableTy(arrElemValueTy(rt.aElem))
+      // The first pop under a `.length` test of this same list yields the element (D3558); an
+      // element type over a type variable or hole lowers per instance, so it stays nullable.
+      const popEl = arrElemValueTy(rt.aElem)
+      if margs.length == 0 && !tyHasHole(popEl) && nePopTakes(ix, recvIx) {
+        return popEl
+      }
+      return mkNullableTy(popEl)
     }
     if prop == "get" {
       if margs.length != 1 {
@@ -53330,8 +53469,12 @@ function checkNodeReal(ix: i32) {
       if bf == 1 { return checkNodeReal(ix) }
       if bf == 2 { return TY_ERR }
     }
-    return checkBinExprNode(n, ix)
+    const bt = checkBinExprNode(n, ix)
+    if neKeys.length > 0 && n.binOp == "=" { neAssigned(n) }
+    return bt
   } else if n is Call {
+    // Named arguments run in parameter order, so no fact may reach a pop among them (D3558).
+    if neKeys.length > 0 && crIsNamedCall(ix) { neKill("") }
     const callTy = checkCallNode(n, ix)
     if numUnionMinted { njNoteHeldCall(n, ix, callTy) }
     // A call is where a path narrowing can be falsified by a write the guarded
@@ -53363,12 +53506,15 @@ function checkNodeReal(ix: i32) {
     // ── let / const ─────────────────────────────────────────────────────────────
   } else if n is LetDecl {
     const lr = checkLetDeclNodeIn(n, ix)
+    if neKeys.length > 0 { neKill(n.letName) }
     if lpOn || exitFirstAt.length > 0 { noteExitFirstLet(n, ix) }
     return lr
   } else if n is FuncDecl {
     return checkFuncDeclNode(n, ix)
     // ── while ─────────────────────────────────────────────────────────────────
   } else if n is WhileStmt {
+    // A loop re-runs what a fact proved once (D3558), and so does a for loop below.
+    if neKeys.length > 0 { neKill("") }
     return checkWhileStmtNode(n, ix)
     // A `break` joins its value into the loop or block it leaves; a misplaced one is the
     // parser's and the emitter's to report.
@@ -53380,8 +53526,10 @@ function checkNodeReal(ix: i32) {
     // A numeric range loop: the bounds (and step, if present) must be i32; the loop
     // variable is i32 in the body's scope.
   } else if n is ForRange {
+    if neKeys.length > 0 { neKill("") }
     return checkForRangeNode(n, ix)
   } else if n is ForIn {
+    if neKeys.length > 0 { neKill("") }
     return checkForInNode(n, ix)
   } else if n is MatchExpr {
     return checkMatchExprNode(n, ix)
@@ -63339,7 +63487,9 @@ function checkIfHead(n: IfStmt, ix: i32): IfChk {
   }
   const thenSpine = spineAt
   if ifChainSpine { spineAt = n.ifThen }
+  const neMark = neEnter(n.ifCond)
   checkNode(n.ifThen)
+  neLeave(neMark)
   spineAt = thenSpine
   valueArmAt = thenArm
   const thenHi = narClobKeys.length
@@ -68026,6 +68176,29 @@ function fvaRefuse(at: i32, srcTy: i32, dstTy: i32, why: string) {
 
 // ── member `o.field` ───────────────────────────────────────────────────────
 
+// Refuses a write to the built-in `.length` of a list, map, set or string at member node `ix`
+// (D3586): it is read-only, and the emitter has no store for it. `kind` 0 is a list, 1 a map
+// or set, 2 a string. Returns true when it refused; a record's own `length` field never asks.
+function lengthWriteRefused(n: Member, ix: i32, kind: i32): boolean {
+  if ix != getWriteTarget || n.memProp != "length" { return false }
+  let recv = "xs"
+  const o = P.nodes[n.memObj]
+  if o is Ident { recv = o.identName }
+  let msg = "`length` is read-only"
+  if kind == 0 {
+    msg = msg
+      + "; to empty a list use `"
+      + recv
+      + ".clear()` or `"
+      + recv
+      + " = []`"
+  } else if kind == 1 {
+    msg = msg + "; to empty a map or set use `" + recv + ".clear()`"
+  }
+  tErr(msg, ix)
+  true
+}
+
 // Extracted from `checkNodeReal`'s `Member` arm (C3: thin the dispatcher).
 function checkMemberNode(n: Member, ix: i32) {
   // Flat layout constant (webcraft P1.2): answered before the receiver is checked, since the
@@ -68095,6 +68268,7 @@ function checkMemberNode(n: Member, ix: i32) {
   }
   // `.length` on an array, a map, or a string is an i32.
   if ot is TyArray {
+    if lengthWriteRefused(n, ix, 0) { return TY_ERR }
     if n.memProp == "length" { return symMem(ix, TY_I32) }
     memberFloorErr(objTy, n.memProp, ix)
     return TY_ERR
@@ -68102,12 +68276,14 @@ function checkMemberNode(n: Member, ix: i32) {
   if ot is TyMap {
     // `.length` is the live-entry count (an i32), the one name every collection answers;
     // `.size` is refused with a redirect to it (`lengthSpellNote`).
+    if lengthWriteRefused(n, ix, 1) { return TY_ERR }
     if n.memProp == "length" { return symMem(ix, TY_I32) }
     memberFloorErr(objTy, n.memProp, ix)
     return TY_ERR
   }
   if ot is TyPrim {
     if ot.primName == "string" {
+      if lengthWriteRefused(n, ix, 2) { return TY_ERR }
       if n.memProp == "length" { return symMem(ix, TY_I32) }
       memberFloorErr(objTy, n.memProp, ix)
       return TY_ERR
@@ -69544,7 +69720,10 @@ function checkWhileStmtNode(n: WhileStmt, ix: i32) {
   // A labelled block's tail is its value, so its body is discarded only when the block is.
   if !blk || valDiscarded(ix) { markValDiscard(n.whileBody) }
   lpPush(n.whileLabel)
+  let neMark = neKeys.length
+  if !blk { neMark = neEnter(n.whileCond) }
   checkNode(n.whileBody)
+  neLeave(neMark)
   let tailTy = -1
   let tailIx = -1
   let runsOut = lpOn && !condLitTrue(n.whileCond)
