@@ -191,7 +191,7 @@ const PROGRAMS: Program[] = [
       "function pick(b: boolean): i32 | string {\n  if b { return 1 }\n  return \"s\"\n}\n" +
       "const u = pick(false)\nconst s = u as? string\n" +
       'if s != null { print(s) } else { print("none") }\n' +
-      "const d = 2.5\nconst n = d as? i32\nif n != null { print(n) } else { print(0) }\n",
+      "let d = 2.5\nconst n = d as? i32\nif n != null { print(n) } else { print(0) }\n",
   },
   // ── maps: `mUsed`/`mStructIdx`, `mI32Used`/`mStructI32Idx` ──
   { id: "map-nullable-value", family: "mUsed", path: "maps/nullable-value-map.vl" },

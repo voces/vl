@@ -64241,6 +64241,9 @@ function checkCastNode(n: AsExpr, ix: i32) {
     if wrapCastFloatRefused(arg, target, ix) { return TY_ERR }
     return target
   }
+  const constCast = castConstDecide(n, ix, arg, target)
+  if constCast == 1 { return target }
+  if constCast == 2 { return TY_ERR }
   // The numeric arm honours the trio too: a cast that can fail owes the same three answers
   // the union arm gives, from the same words — the suffix went unchecked and silently ignored (D1041).
   const castDom = numCastDomainName(n.asTy, target)
@@ -64254,6 +64257,108 @@ function checkCastNode(n: AsExpr, ix: i32) {
     if !castPropagationFits(TY_NULL, n.asTy, ix, T.curRet) { return TY_ERR }
   }
   target
+}
+
+// A cast over a constant tree is decided at its exact value (D3588): a value the domain holds
+// converts exactly in every mode, a value it does not hold is a check error. 0 when the operand
+// is no constant, 1 when it holds, 2 when refused. A radix pattern whose top bit is set at its
+// own width stays the width-dependent reading the ordinary cast takes.
+function castConstDecide(n: AsExpr, ix: i32, arg: i32, target: i32): i32 {
+  const p = parenPeelIx(n.asObj)
+  if p < 0 || cexTreeShape(p, 0) != 1 { return 0 }
+  const v = cexEvalAt(p, 0)
+  if !cexOk(v) { return 0 }
+  if v.cxPat {
+    let bits = 32
+    if arg == TY_I64 { bits = 64 }
+    if v.cxNeg || !cexFitsSigned(v, bits) { return 0 }
+  }
+  const dom = numCastDomainName(n.asTy, target)
+  const why = castConstMisfit(v, dom, p)
+  if why != "" {
+    tErr(why + castConstModeTail(n.asMode, dom, v), ix)
+    return 2
+  }
+  castConstSettle(n, ix, v, arg, dom)
+  1
+}
+
+// Why the domain `dom` cannot hold the constant `v`, or "" when it holds it exactly. A float
+// domain rounds, so only a value past its finite range misfits there.
+function castConstMisfit(v: Cex, dom: string, p: i32): string {
+  const shown = castConstShown(v, p)
+  if dom == "f32" || dom == "f64" {
+    if dom == "f64" && !cexPastF64(v) { return "" }
+    let lex = cexDecText(v) + ".0"
+    if v.cxFloat { lex = cexLexeme(v) }
+    if dom == "f32" && !f32LitOverflows(lex) { return "" }
+    return "constant "
+      + shown
+      + " does not fit `"
+      + dom
+      + "`: it is past the largest finite "
+      + dom
+  }
+  if v.cxFloat && !cexIsWhole(v) {
+    return "constant "
+      + shown
+      + " is not a whole number, so `"
+      + dom
+      + "` cannot hold it"
+  }
+  let fits = false
+  let range = ""
+  if dom == "u8" {
+    fits = (!v.cxNeg || cexDecText(v) == "0") && cexFitsSigned(v, 9)
+    range = "0..=255"
+  } else if dom == "i32" {
+    fits = cexFitsSigned(v, 32)
+    range = "-2147483648..=2147483647"
+  } else {
+    fits = cexFitsSigned(v, 64)
+    range = "-9223372036854775808..=9223372036854775807"
+  }
+  if fits { return "" }
+  "constant " + shown + " does not fit `" + dom + "` (" + range + ")"
+}
+
+// The constant `v` at `p` as the refusal quotes it: a literal by its own spelling, a tree by value.
+function castConstShown(v: Cex, p: i32): string {
+  const e = P.nodes[p]
+  if e is NumLit { return e.numText }
+  if e is Unary {
+    const a = P.nodes[parenPeelIx(e.unArg)]
+    if e.unOp == "-" && a is NumLit { return "-" + a.numText }
+  }
+  cexShown(v)
+}
+
+// The refusal's tail, by cast mode: at an integer domain the trapping and nullable forms over a
+// misfit are a trap or a null on every run, and an integer that misfits may want the wrap.
+function castConstModeTail(mode: string, dom: string, v: Cex): string {
+  if dom == "f32" || dom == "f64" { return "" }
+  if mode == "trap" { return " — `as!` on it would trap on every run" }
+  if mode == "null" { return " — `as?` on it would be null on every run" }
+  if v.cxFloat { return "" }
+  " — write `as%` to keep its low bits"
+}
+
+// Make the cast over the constant `v`, which `dom` holds, one with no runtime test: a fallible
+// `u8` or `i32` cast becomes the `i32` literal of `v`, and a fallible `i64` cast's operand the
+// integer literal it converts exactly. A float domain rounds and never fails.
+function castConstSettle(n: AsExpr, ix: i32, v: Cex, arg: i32, dom: string) {
+  if dom == "f32" || dom == "f64" { return 0 }
+  if !numCastCanFail(primNameStr(primNameOf(arg)), dom) { return 0 }
+  let iv = cexOfLexeme(cexDecText(v))
+  if v.cxNeg { iv = cexNeg(iv) }
+  if dom != "i64" {
+    cexRewrite(ix, iv)
+    return cexRetype(ix, TY_I32)
+  }
+  cexRewrite(parenPeelIx(n.asObj), iv)
+  let lt = TY_I64
+  if cexFitsSigned(iv, 32) { lt = TY_I32 }
+  cexRetype(n.asObj, lt)
 }
 
 // Whether `ty` is one of the union's members, by arena identity or by `tySame` — the same two
