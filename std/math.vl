@@ -1,13 +1,13 @@
-// `std:math` — deterministic angle and length math, computed in VL, equal on every host.
+// `std:math` — deterministic trig, length, exp, log and pow, computed in VL, equal on every host.
 //
-//     import { sinF64, atan2F64, PI } from "std:math"
+//     import { sinF64, expF64, PI } from "std:math"
 //
 // Every result is a pure function of IEEE-754 arithmetic on the input bits (no host `Math`),
 // so the same `.wasm` prints the same bits on Chrome, Node and wasmtime. Each width has its
 // own function and its own bound, not the other width's result cast. Free functions like the
-// `sqrt` and `abs` they sit beside, not methods: call `sinF64(x)`. `hypot` is the naive form
-// and overflows inside the float range; `hypot` and `atan2` promise nothing for non-finite
-// inputs. exp and pow are later slices.
+// `sqrt` and `abs` they sit beside, not methods: call `sinF64(x)`. Every function is within
+// 1 ulp, and every NaN it returns is the one quiet NaN. There is no `tan`, no hyperbolic
+// function, and no `log2`, `log10`, `exp2`, `expm1` or `log1p` at either width.
 
 // The nearest f64 to π, for angle math alongside `atan2F64`.
 export const PI: f64 = 3.141592653589793
@@ -15,77 +15,350 @@ export const PI: f64 = 3.141592653589793
 // The nearest f32 to π, the f32 twin of `PI`.
 export const PI_F32: f32 = 3.141592653589793
 
-// Euclidean length `sqrt(x*x + y*y)` of the vector `(x, y)`, each step correctly rounded.
-// Naive: `x*x` overflows to infinity once `|x|` or `|y|` passes ~1.3e154 — far inside f64's
-// ~1.8e308 range — giving a wrong infinity there. Below that the result is exact to a few ULP.
-export function hypotF64(x: f64, y: f64): f64 { return sqrt(x * x + y * y) }
-
-// Euclidean length `sqrt(x*x + y*y)` of `(x, y)` at f32, the same naive form as `hypotF64`.
-// Overflows to infinity once `|x|` or `|y|` passes ~1.8e19, well inside f32's ~3.4e38 range.
-export function hypotF32(x: f32, y: f32): f32 { return sqrt(x * x + y * y) }
-
-// atan(r) for r in [0, 1] as r times a minimax polynomial in r*r; the core both atan2 folds share.
-function atanUnitF64(r: f64): f64 {
-  const u = r * r
-  let p: f64 = 0.002903555985292844
-  p = p * u - 0.016283021682318297
-  p = p * u + 0.04303938975867342
-  p = p * u - 0.07533677876722608
-  p = p * u + 0.10654678222945746
-  p = p * u - 0.14207133858656099
-  p = p * u + 0.19993054130934312
-  p = p * u - 0.3333309395828124
-  p = p * u + 0.9999999863667995
-  return r * p
+// Euclidean length `sqrt(x*x + y*y)` of `(x, y)`, within 1 ulp of the exact value, with no
+// overflow or underflow on the way: it is infinity only when the length itself is. Either
+// argument infinite gives infinity, even beside a NaN; otherwise a NaN gives NaN. Where neither
+// argument passes ~1e150, `sqrt(x*x + y*y)` is a cheaper and slightly less accurate length.
+export function hypotF64(x: f64, y: f64): f64 {
+  const inf = f64fromBits(0x7FF0000000000000)
+  let a = abs(x)
+  let b = abs(y)
+  if a == inf || b == inf { return inf }
+  if a != a || b != b { return f64fromBits(0x7FF8000000000000) }
+  let big = max(a, b)
+  if big == 0.0 { return 0.0 }
+  // Outside [1e-135, 1e135], scale by powers of 2 so the larger lies in [1, 4): exact, and then
+  // no square or split overflows, nor loses bits that could reach the result.
+  let tiny = false
+  let e: i64 = 0
+  if big < 1e-135 || big > 1e135 {
+    if big < 1e-270 {
+      a = a * 4.149515568880993e180
+      b = b * 4.149515568880993e180
+      big = big * 4.149515568880993e180
+      tiny = true
+    }
+    e = (f64bits(big) >>> 52) - 1023
+    if e > 1022 { e = 1022 }
+    a = a * pow2F64(0 - e)
+    b = b * pow2F64(0 - e)
+  }
+  // a*a + b*b as a double-double, each square exact by Dekker's method.
+  const ca = 134217729.0 * a
+  const ah = ca - (ca - a)
+  const al = a - ah
+  const pa = a * a
+  const ea = ((ah * ah - pa) + 2.0 * ah * al) + al * al
+  const cb = 134217729.0 * b
+  const bh = cb - (cb - b)
+  const bl = b - bh
+  const pb = b * b
+  const eb = ((bh * bh - pb) + 2.0 * bh * bl) + bl * bl
+  const sh = pa + pb
+  const sb = sh - pa
+  const sl = ((pa - (sh - sb)) + (pb - sb)) + (ea + eb)
+  // One Newton step from the rounded root, with r*r exact.
+  const r = sqrt(sh)
+  const cr = 134217729.0 * r
+  const rh = cr - (cr - r)
+  const rl = r - rh
+  const rr = r * r
+  const er = ((rh * rh - rr) + 2.0 * rh * rl) + rl * rl
+  const len = r + (((sh - rr) - er) + sl) / (2.0 * r)
+  if e == 0 { return len }
+  if tiny { return (len * pow2F64(e)) * 2.409919865102884e-181 }
+  return len * pow2F64(e)
 }
 
-// Angle in radians of the vector `(x, y)`, in `(-PI, PI]`, with argument order `(y, x)`.
-// `atan2F64(0.0, 0.0)` is defined as `0.0`. Absolute error ≤ 1e-7 over all finite inputs.
-export function atan2F64(y: f64, x: f64): f64 {
-  if x == 0.0 && y == 0.0 { return 0.0 }
+// Euclidean length `sqrt(x*x + y*y)` of `(x, y)` at f32, computed in f64 and rounded once:
+// within 1 f32 ulp, and never overflows before the length does. Infinities and NaNs as
+// `hypotF64`.
+export function hypotF32(x: f32, y: f32): f32 {
+  const a = abs(x as f64)
+  const b = abs(y as f64)
+  const inf = f64fromBits(0x7FF0000000000000)
+  if a == inf || b == inf { return f32fromBits(0x7F800000) }
+  if a != a || b != b { return f32fromBits(0x7FC00000) }
+  return sqrt(a * a + b * b) as f32
+}
+
+// The last `divParts`/`atanParts`/`arcParts` result, as the unevaluated sum atHi + atLo.
+let atHi: f64 = 0.0
+let atLo: f64 = 0.0
+
+// Writes (n + nl) / (d + dl) to atHi/atLo, the quotient's rounding error recovered by Dekker's
+// method; |n| <= 4|d|, and both far from overflow.
+function divParts(n: f64, nl: f64, d: f64, dl: f64) {
+  const q = n / d
+  const cq = 134217729.0 * q
+  const qh = cq - (cq - q)
+  const ql = q - qh
+  const cd = 134217729.0 * d
+  const dh = cd - (cd - d)
+  const dlo = d - dh
+  const p = q * d
+  const pe = ((qh * dh - p) + qh * dlo + ql * dh) + ql * dlo
+  atHi = q
+  atLo = ((((n - p) - pe) + nl) - q * dl) / d
+}
+
+// Writes atan(t + tl) for t in [0, 1] to atHi/atLo, to ~2^-56 relative: t is moved to
+// |u| <= 7/16 by atan(t) = atan(c) + atan((t - c) / (1 + c*t)) with c = 1/2 or 1.
+function atanParts(t: f64, tl: f64) {
+  let bh = 0.0
+  let bl = 0.0
+  let u = t
+  let ul = tl
+  if t >= 0.4375 {
+    if t < 0.6875 {
+      const d = 2.0 + t
+      divParts(2.0 * t - 1.0, 2.0 * tl, d, ((2.0 - d) + t) + tl)
+      bh = 0.4636476090008061
+      bl = 2.2698777452961687e-17
+    } else {
+      const d = t + 1.0
+      divParts(t - 1.0, tl, d, ((1.0 - d) + t) + tl)
+      bh = 0.7853981633974483
+      bl = 3.061616997868383e-17
+    }
+    u = atHi
+    ul = atLo
+  }
+  const z = u * u
+  let p: f64 = -0.016188470318405573
+  p = p * z + 0.03645718379888444
+  p = p * z - 0.049748998079827196
+  p = p * z + 0.058334593210804406
+  p = p * z - 0.06661125476131212
+  p = p * z + 0.0769188949755495
+  p = p * z - 0.09090888583179975
+  p = p * z + 0.11111110490635884
+  p = p * z - 0.1428571427518881
+  p = p * z + 0.1999999999991683
+  p = p * z - 0.33333333333333137
+  const s = bh + u
+  const lo = (((bh - s) + u) + bl) + ((ul - ul * z) + u * z * p)
+  atHi = s + lo
+  atLo = (s - atHi) + lo
+}
+
+// Writes ch + sg*(atHi + atLo) to atHi/atLo, for sg = 1 or -1 and |ch| >= |atHi|.
+function offsetParts(ch: f64, cl: f64, sg: f64) {
+  const h = sg * atHi
+  const s = ch + h
+  const lo = ((ch - s) + h) + (cl + sg * atLo)
+  atHi = s + lo
+  atLo = (s - atHi) + lo
+}
+
+// Writes the angle of the vector (d + dl, n + nl) in [0, π] to atHi/atLo, for n >= 0, both
+// parts finite, not both zero, and within a factor 2^62 of each other or zero.
+function arcParts(n: f64, nl: f64, d: f64, dl: f64) {
+  const ad = abs(d)
+  let adl = dl
+  if d < 0.0 { adl = 0.0 - dl }
+  if n <= ad {
+    divParts(n, nl, ad, adl)
+    atanParts(atHi, atLo)
+    if d < 0.0 { offsetParts(3.141592653589793, 1.2246467991473532e-16, -1.0) }
+  } else {
+    divParts(ad, adl, n, nl)
+    atanParts(atHi, atLo)
+    if d < 0.0 {
+      offsetParts(1.5707963267948966, 6.123233995736766e-17, 1.0)
+    } else {
+      offsetParts(1.5707963267948966, 6.123233995736766e-17, -1.0)
+    }
+  }
+}
+
+// atan(t) for t in [0, 1], to ~2^-38 relative: enough for one rounding to f32.
+function atanKernelF32(t: f64): f64 {
+  let b = 0.0
+  let u = t
+  if t >= 0.4375 {
+    if t < 0.6875 {
+      b = 0.4636476090008061
+      u = (2.0 * t - 1.0) / (2.0 + t)
+    } else {
+      b = 0.7853981633974483
+      u = (t - 1.0) / (t + 1.0)
+    }
+  }
+  const z = u * u
+  let p: f64 = -0.035444703743825745
+  p = p * z + 0.06850518155087862
+  p = p * z - 0.08966336211039096
+  p = p * z + 0.11100869085112045
+  p = p * z - 0.1428527112645991
+  p = p * z + 0.19999991359800737
+  p = p * z - 0.3333333328347543
+  return b + (u + u * z * p)
+}
+
+// The angle of the vector (d, n) in [0, π] for n >= 0, to f32 accuracy, evaluated in f64.
+function arcKernelF32(n: f64, d: f64): f64 {
+  const ad = abs(d)
+  if n <= ad {
+    const a = atanKernelF32(n / ad)
+    if d < 0.0 { return 3.141592653589793 - a }
+    return a
+  }
+  const a = atanKernelF32(ad / n)
+  if d < 0.0 { return 1.5707963267948966 + a }
+  return 1.5707963267948966 - a
+}
+
+// atan2(y, x), IEEE 754 edge cases first; `wide` picks the f64 kernel, else the f32 one.
+function atan2With(y: f64, x: f64, wide: boolean): f64 {
+  if x != x || y != y { return f64fromBits(0x7FF8000000000000) }
+  const inf = f64fromBits(0x7FF0000000000000)
   const ax = abs(x)
   const ay = abs(y)
-  let a: f64 = 0.0
-  if ax >= ay {
-    a = atanUnitF64(ay / ax)
+  let r = 1.5707963267948966
+  if ax == inf {
+    if ay == inf {
+      r = 0.7853981633974483
+      if x < 0.0 { r = 2.356194490192345 }
+    } else {
+      r = 0.0
+      if x < 0.0 { r = 3.141592653589793 }
+    }
+  } else if ay == 0.0 {
+    r = 0.0
+    if f64bits(x) < 0 { r = 3.141592653589793 }
+  } else if ay == inf || ax == 0.0 {
+    r = 1.5707963267948966
+  } else if !wide {
+    r = arcKernelF32(ay, x)
   } else {
-    a = 1.5707963267948966 - atanUnitF64(ax / ay)
+    const ey = (f64bits(ay) >>> 52) as! i32
+    const ex = (f64bits(ax) >>> 52) as! i32
+    if ey < ex - 60 {
+      // So small an angle is the quotient itself, or π less it, which rounds to π.
+      r = 3.141592653589793
+      if x > 0.0 { r = ay / ax }
+    } else if ey - 60 <= ex {
+      // Scale both by one power of 2 so the larger lies in [1, 4): exact.
+      let n = ay
+      let d = x
+      if max(ax, ay) < 1e-270 {
+        n = n * 4.149515568880993e180
+        d = d * 4.149515568880993e180
+      }
+      let e = (f64bits(max(abs(d), n)) >>> 52) - 1023
+      if e > 1022 { e = 1022 }
+      arcParts(n * pow2F64(0 - e), 0.0, d * pow2F64(0 - e), 0.0)
+      r = atHi
+    }
   }
-  if x < 0.0 { a = 3.141592653589793 - a }
-  if y < 0.0 { a = -a }
-  return a
+  return copysign(r, y)
 }
 
-// atan(r) for r in [0, 1] at f32; the f32 twin of `atanUnitF64`, same coefficients.
-function atanUnitF32(r: f32): f32 {
-  const u = r * r
-  let p: f32 = 0.002903555985292844
-  p = p * u - 0.016283021682318297
-  p = p * u + 0.04303938975867342
-  p = p * u - 0.07533677876722608
-  p = p * u + 0.10654678222945746
-  p = p * u - 0.14207133858656099
-  p = p * u + 0.19993054130934312
-  p = p * u - 0.3333309395828124
-  p = p * u + 0.9999999863667995
-  return r * p
-}
+// Angle in radians of the vector `(x, y)`, in `[-PI, PI]`, argument order `(y, x)`; within 1
+// ulp of the exact value. Edge cases are IEEE 754 `atan2`'s: the sign of a zero `y` is kept,
+// `atan2F64(0.0, -0.0)` is `PI`, and two infinities give an odd multiple of `PI / 4`.
+export function atan2F64(y: f64, x: f64): f64 { return atan2With(y, x, true) }
 
-// Angle in radians of the vector `(x, y)` at f32, in `(-PI, PI]`, with argument order `(y, x)`.
-// `atan2F32(0.0, 0.0)` is defined as `0.0`. Absolute error ≤ 1e-6 over all finite inputs.
+// Angle in radians of the vector `(x, y)` at f32, computed in f64 and rounded once: within 1
+// f32 ulp. Argument order and edge cases are `atan2F64`'s.
 export function atan2F32(y: f32, x: f32): f32 {
-  if x == 0.0 && y == 0.0 { return 0.0 }
-  const ax = abs(x)
-  const ay = abs(y)
-  let a: f32 = 0.0
-  if ax >= ay {
-    a = atanUnitF32(ay / ax)
+  const r = atan2With(y as f64, x as f64, false)
+  if r != r { return f32fromBits(0x7FC00000) }
+  return r as f32
+}
+
+// Arctangent of `x`, in `[-PI / 2, PI / 2]`, within 1 ulp of the exact value. `atanF64(-0.0)`
+// is `-0.0`, ±infinity gives ±`PI / 2`, and NaN gives NaN.
+export function atanF64(x: f64): f64 {
+  if x != x { return f64fromBits(0x7FF8000000000000) }
+  const a = abs(x)
+  if a < 7.450580596923828e-9 { return x }
+  if a > 1152921504606846976.0 { return copysign(1.5707963267948966, x) }
+  if a <= 1.0 {
+    atanParts(a, 0.0)
   } else {
-    a = 1.5707963267948966 - atanUnitF32(ax / ay)
+    divParts(1.0, 0.0, a, 0.0)
+    atanParts(atHi, atLo)
+    offsetParts(1.5707963267948966, 6.123233995736766e-17, -1.0)
   }
-  if x < 0.0 { a = 3.141592653589793 - a }
-  if y < 0.0 { a = -a }
-  return a
+  return copysign(atHi, x)
+}
+
+// Arctangent of `x` at f32, computed in f64 and rounded once: within 1 f32 ulp. Edge cases
+// are `atanF64`'s.
+export function atanF32(x: f32): f32 {
+  const xd = x as f64
+  if xd != xd { return f32fromBits(0x7FC00000) }
+  const a = abs(xd)
+  let r = 0.0
+  if a <= 1.0 {
+    r = atanKernelF32(a)
+  } else {
+    r = 1.5707963267948966 - atanKernelF32(1.0 / a)
+  }
+  return copysign(r, xd) as f32
+}
+
+// Writes sqrt(1 - a*a) for a in [0, 1] to atHi/atLo, a*a exact by Dekker's method.
+function cosOfSinParts(a: f64) {
+  const c = 134217729.0 * a
+  const ah = c - (c - a)
+  const al = a - ah
+  const p = a * a
+  const pe = ((ah * ah - p) + 2.0 * ah * al) + al * al
+  const wh = 1.0 - p
+  const wl = ((1.0 - wh) - p) - pe
+  const s = sqrt(wh)
+  const cs = 134217729.0 * s
+  const sh = cs - (cs - s)
+  const sl = s - sh
+  const ss = s * s
+  const se = ((sh * sh - ss) + 2.0 * sh * sl) + sl * sl
+  atHi = s
+  atLo = (((wh - ss) - se) + wl) / (2.0 * s)
+}
+
+// Arcsine of `x`, in `[-PI / 2, PI / 2]`, within 1 ulp of the exact value. `asinF64(-0.0)`
+// is `-0.0`; an `x` outside `[-1, 1]`, or NaN, gives NaN.
+export function asinF64(x: f64): f64 {
+  const a = abs(x)
+  if !(a <= 1.0) { return f64fromBits(0x7FF8000000000000) }
+  if a < 1.4901161193847656e-8 { return x }
+  if a == 1.0 { return copysign(1.5707963267948966, x) }
+  cosOfSinParts(a)
+  arcParts(a, 0.0, atHi, atLo)
+  return copysign(atHi, x)
+}
+
+// Arcsine of `x` at f32, computed in f64 and rounded once: within 1 f32 ulp. Edge cases are
+// `asinF64`'s.
+export function asinF32(x: f32): f32 {
+  const xd = x as f64
+  const a = abs(xd)
+  if !(a <= 1.0) { return f32fromBits(0x7FC00000) }
+  return copysign(arcKernelF32(a, sqrt(1.0 - a * a)), xd) as f32
+}
+
+// Arccosine of `x`, in `[0, PI]`, within 1 ulp of the exact value. `acosF64(1.0)` is `0.0`;
+// an `x` outside `[-1, 1]`, or NaN, gives NaN.
+export function acosF64(x: f64): f64 {
+  const a = abs(x)
+  if !(a <= 1.0) { return f64fromBits(0x7FF8000000000000) }
+  if a < 6.938893903907228e-18 { return 1.5707963267948966 }
+  if x == 1.0 { return 0.0 }
+  if x == -1.0 { return 3.141592653589793 }
+  cosOfSinParts(a)
+  arcParts(atHi, atLo, x, 0.0)
+  return atHi
+}
+
+// Arccosine of `x` at f32, computed in f64 and rounded once: within 1 f32 ulp. Edge cases are
+// `acosF64`'s.
+export function acosF32(x: f32): f32 {
+  const xd = x as f64
+  if !(abs(xd) <= 1.0) { return f32fromBits(0x7FC00000) }
+  return arcKernelF32(sqrt(1.0 - xd * xd), xd) as f32
 }
 
 // The bits of 2/π after the binary point, 64 per word, behind one word of zeros.
@@ -374,4 +647,292 @@ export function cosF32(x: f32): f32 {
   if q == 1 { return (-sinKernelF32(redHi)) as f32 }
   if q == 2 { return (-cosKernelF32(redHi)) as f32 }
   return sinKernelF32(redHi) as f32
+}
+
+// 2^(j/32) for j in 0..31 as the unevaluated sum EXP2_HI[j] + EXP2_LO[j].
+const EXP2_HI: f64[] = [
+  1.0, 1.0218971486541166, 1.0442737824274138, 1.0671404006768237,
+  1.0905077326652577, 1.1143867425958924, 1.1387886347566916,
+  1.1637248587775775, 1.189207115002721, 1.215247359980469, 1.241857812073484,
+  1.2690509571917332, 1.2968395546510096, 1.3252366431597413,
+  1.3542555469368927, 1.383909881963832, 1.4142135623730951, 1.4451808069770467,
+  1.4768261459394993, 1.5091644275934228, 1.5422108254079407,
+  1.5759808451078865, 1.6104903319492543, 1.645755478153965, 1.681792830507429,
+  1.718619298122478, 1.7562521603732995, 1.7947090750031072, 1.8340080864093424,
+  1.8741676341103, 1.9152065613971474, 1.9571441241754002,
+]
+const EXP2_LO: f64[] = [
+  0.0, 5.109225028973444e-17, 8.551889705537965e-17, -7.899853966841582e-17,
+  -3.046782079812471e-17, 1.0410278456845571e-16, 8.912812676025408e-17,
+  3.8292048369240935e-17, 3.982015231465646e-17, -7.712630692681488e-17,
+  4.658027591836937e-17, 2.667932131342186e-18, 2.5382502794888315e-17,
+  -2.8587312100388614e-17, 7.70094837980299e-17, -6.770511658794786e-17,
+  -9.667293313452913e-17, -3.0237581349939873e-17, -3.483994556892796e-17,
+  -1.016455327754295e-16, 7.949834809697621e-17, -1.0136916471278304e-17,
+  2.4707192569797888e-17, -1.0125679913674773e-16, 8.199010020581497e-17,
+  -1.851380418263111e-17, 2.960140695448873e-17, 1.8227458427912087e-17,
+  3.283107224245627e-17, -6.122763413004143e-17, -1.0619946056195963e-16,
+  8.960767791036668e-17,
+]
+
+// e^(zh + zl) for |zh| <= 746 and |zl| below an ulp of zh, rounded once, subnormals included.
+function expCore(zh: f64, zl: f64): f64 {
+  const kf = nearest(zh * 46.16624130844683)
+  const r = (zh - kf * 0.021660849392446835) + (zl - kf * 5.145609244655338e-14)
+  const k = kf as! i64
+  const e = k >> 5
+  const j = (k & 31) as! i32
+  const th = EXP2_HI[j]
+  let q: f64 = 0.0013888949693641806
+  q = q * r + 0.008333368427237815
+  q = q * r + 0.04166666666621707
+  q = q * r + 0.1666666666652247
+  q = q * r + 0.5
+  const small = EXP2_LO[j] + th * (r + r * r * q)
+  if e > 1023 { return ((th + small) * 8.98846567431158e307) * 2.0 }
+  if e > -1022 { return (th + small) * pow2F64(e) }
+  // A subnormal result: add 1 so the one rounding lands on the subnormal grid.
+  const sc = pow2F64(e + 1022)
+  const wh = sc * th
+  const wl = sc * small
+  const w = wh + wl
+  if w >= 1.0 { return w * 2.2250738585072014e-308 }
+  const h = 1.0 + w
+  const lo = ((1.0 - h) + w) + ((wh - w) + wl)
+  return ((h + lo) - 1.0) * 2.2250738585072014e-308
+}
+
+// e raised to `x`, within 1 ulp of the exact value for every `x` (relative error below
+// 2.3e-16 wherever the result is a normal number). Above ~709.78 it overflows to infinity;
+// below ~-745.13 it underflows, through the subnormals, to `0.0`. `expF64(-infinity)` is
+// `0.0`; NaN gives NaN.
+export function expF64(x: f64): f64 {
+  if !(x <= 709.8) {
+    if x != x { return f64fromBits(0x7FF8000000000000) }
+    return f64fromBits(0x7FF0000000000000)
+  }
+  if x < -745.2 { return 0.0 }
+  return expCore(x, 0.0)
+}
+
+// e^x for |x| <= 104, to ~2^-41 relative: enough for one rounding to f32.
+function expKernelF32(x: f64): f64 {
+  const kf = nearest(x * 46.16624130844683)
+  const r = (x - kf * 0.021660849392446835) - kf * 5.145609244655338e-14
+  const k = kf as! i64
+  const th = EXP2_HI[(k & 31) as! i32]
+  let q: f64 = 0.04166691772935459
+  q = q * r + 0.16666752714561503
+  q = q * r + 0.49999999998977657
+  return (th + th * (r + r * r * q)) * pow2F64(k >> 5)
+}
+
+// e raised to `x` at f32, computed in f64 and rounded once: within 1 f32 ulp for every `x`.
+// Above ~88.72 it overflows to infinity; below ~-103.97 it underflows to `0.0`.
+// `expF32(-infinity)` is `0.0`; NaN gives NaN.
+export function expF32(x: f32): f32 {
+  const xd = x as f64
+  if !(xd <= 88.8) {
+    if xd != xd { return f32fromBits(0x7FC00000) }
+    return f32fromBits(0x7F800000)
+  }
+  if xd < -104.0 { return 0.0 }
+  return expKernelF32(xd) as f32
+}
+
+// The log buckets: z in bucket i is near 1/INV_C[i], which has 21 significant bits so that
+// z*INV_C[i] - 1 is exact in two parts; -ln(INV_C[i]) = LOGC_HI[i] + LOGC_LO[i].
+const INV_C: f64[] = [
+  1.3913040161132812, 1.3617019653320312, 1.3333330154418945,
+  1.3061227798461914, 1.2799997329711914, 1.2549018859863281, 1.230769157409668,
+  1.2075471878051758, 1.185185432434082, 1.1636362075805664, 1.142857551574707,
+  1.1228065490722656, 1.1034479141235352, 1.0847454071044922, 1.066666603088379,
+  1.049180030822754, 1.0322580337524414, 1.0158729553222656, 1.0,
+  0.9696969985961914, 0.9411764144897461, 0.9142856597900391,
+  0.8888888359069824, 0.8648648262023926, 0.8421053886413574,
+  0.8205127716064453, 0.8000001907348633, 0.7804880142211914,
+  0.7619047164916992, 0.7441859245300293, 0.7272725105285645,
+  0.7111110687255859,
+]
+const LOGC_HI: f64[] = [
+  -0.33024144845196934, -0.30873536244031663, -0.2876818340331734,
+  -0.26706303856875346, -0.2468598693152473, -0.22705739103069952,
+  -0.20763930517359794, -0.1885911847087111, -0.16989924541163243,
+  -0.1515497640167412, -0.13353175025232733, -0.11583139829252123,
+  -0.09843974498765252, -0.0813453116283524, -0.06453846153292463,
+  -0.048008936064257844, -0.031748668512257466, -0.015748297363492616, 0.0,
+  0.030771628864431744, 0.06062468142108139, 0.08961221829433369,
+  0.11778309526103001, 0.14518205454798247, 0.1718501079150584,
+  0.19782580293456642, 0.22314331289565909, 0.24783589568371575,
+  0.2719337750882883, 0.29546437680662246, 0.3184540291418029,
+  0.34092664657523974,
+]
+const LOGC_LO: f64[] = [
+  1.0832839147343675e-17, 1.6199750773830093e-17, -2.606708865456582e-17,
+  7.32349674388368e-18, -1.3614407338875705e-17, -9.551345176656395e-18,
+  -1.2053172630604037e-17, 7.432163116289455e-18, 4.837744987829601e-19,
+  -5.166155348825287e-18, 3.649211074698961e-18, -4.3142733371561876e-18,
+  4.450753395445851e-18, -5.065332594160455e-18, 6.470557247775027e-18,
+  -1.4315254906942215e-18, -3.0382174852080215e-18, -1.0020872769708041e-18,
+  0.0, 1.0431643796409267e-18, 2.6424731799547865e-18, -5.4267423475826205e-18,
+  -1.1970979886772745e-18, 8.242448561525526e-18, -6.023556728371515e-18,
+  1.2821264959062234e-17, -9.095788105569027e-18, -1.2438641733851806e-17,
+  7.833902237795353e-19, -2.1644640634019027e-17, 2.7123602629165622e-17,
+  1.746720702962684e-17,
+]
+
+// The last `logParts` result, as the unevaluated sum lgHi + lgLo.
+let lgHi: f64 = 0.0
+let lgLo: f64 = 0.0
+
+// Writes ln(x) for a finite x > 0 to lgHi/lgLo, to ~2^-68 relative.
+function logParts(x: f64) {
+  let ix = f64bits(x)
+  let sub: i64 = 0
+  if ix < 0x10000000000000 {
+    ix = f64bits(x * 4503599627370496.0)
+    sub = 52
+  }
+  // x = 2^k * z with z in [0.7109375, 1.421875); bucket 18 is centred on 1.0.
+  const tmp = ix - 0x3FE6C00000000000
+  const i = ((tmp >>> 47) & 31) as! i32
+  const kf = ((tmp >> 52) - sub) as f64
+  const z = f64fromBits(ix - ((tmp >> 52) << 52))
+  const zh = f64fromBits((f64bits(z) >>> 32) << 32)
+  const ic = INV_C[i]
+  const rh = zh * ic - 1.0
+  const rl = (z - zh) * ic
+  // r + er is z*ic - 1 exactly, and rs*rs is exact.
+  const r = rh + rl
+  const rb = r - rh
+  const er = (rh - (r - rb)) + (rl - rb)
+  const rs = f64fromBits((f64bits(r) >>> 32) << 32)
+  const q = -0.5 * rs * rs
+  // k*ln2 + ln(c) + r - rs*rs/2, summed with every rounding error kept.
+  const a = kf * 0.6931471805598903
+  const b = LOGC_HI[i]
+  const t1 = a + b
+  const b1 = t1 - a
+  const e1 = (a - (t1 - b1)) + (b - b1)
+  const t2 = t1 + r
+  const b2 = t2 - t1
+  const e2 = (t1 - (t2 - b2)) + (r - b2)
+  const t3 = t2 + q
+  const b3 = t3 - t2
+  const e3 = (t2 - (t3 - b3)) + (q - b3)
+  let p: f64 = -0.09987700229140832
+  p = p * r + 0.11116475556163297
+  p = p * r - 0.125000066482191
+  p = p * r + 0.14285713208668438
+  p = p * r - 0.16666666665718485
+  p = p * r + 0.2000000000008238
+  p = p * r - 0.2500000000000004
+  p = p * r + 0.3333333333333333
+  const sq = er - r * er + r * r * er - 0.5 * (r - rs) * (r + rs)
+  const tail = kf * 5.497923018708371e-14 + LOGC_LO[i] + (sq + r * r * r * p)
+  const lo = ((e1 + e2) + e3) + tail
+  lgHi = t3 + lo
+  lgLo = (t3 - lgHi) + lo
+}
+
+// Natural logarithm of `x`, within 1 ulp of the exact value for every `x > 0`, subnormals
+// included. `logF64(1.0)` is `0.0`, `logF64(0.0)` and `logF64(-0.0)` are -infinity,
+// `logF64(infinity)` is infinity, and a negative `x` or NaN gives NaN.
+export function logF64(x: f64): f64 {
+  if !(x > 0.0) {
+    if x == 0.0 { return -f64fromBits(0x7FF0000000000000) }
+    return f64fromBits(0x7FF8000000000000)
+  }
+  if x == f64fromBits(0x7FF0000000000000) { return x }
+  logParts(x)
+  return lgHi
+}
+
+// Natural logarithm of `x` at f32, computed in f64 and rounded once: within 1 f32 ulp for
+// every `x > 0`. `logF32(1.0)` is `0.0`, `logF32(0.0)` and `logF32(-0.0)` are -infinity,
+// `logF32(infinity)` is infinity, and a negative `x` or NaN gives NaN.
+export function logF32(x: f32): f32 {
+  if !(x > 0.0) {
+    if x == 0.0 { return -f32fromBits(0x7F800000) }
+    return f32fromBits(0x7FC00000)
+  }
+  if x == f32fromBits(0x7F800000) { return x }
+  return logKernelF32(x as f64) as f32
+}
+
+// ln(x) for an x > 0 that is a finite f32, to ~2^-43 relative: enough for one rounding to f32.
+function logKernelF32(x: f64): f64 {
+  const ix = f64bits(x)
+  const tmp = ix - 0x3FE6C00000000000
+  const i = ((tmp >>> 47) & 31) as! i32
+  const z = f64fromBits(ix - ((tmp >> 52) << 52))
+  const r = z * INV_C[i] - 1.0
+  let p: f64 = -0.16657571570690277
+  p = p * r + 0.20005067035630977
+  p = p * r - 0.2500000205177421
+  p = p * r + 0.3333333293362934
+  const lc = ((tmp >> 52) as f64) * 0.6931471805599453 + LOGC_HI[i]
+  return lc + (r + r * r * (-0.5 + r * p))
+}
+
+// x^y, IEEE 754 edge cases first; `wide` picks the f64 kernel, else the f32 one.
+function powWith(x: f64, y: f64, wide: boolean): f64 {
+  const inf = f64fromBits(0x7FF0000000000000)
+  if y == 0.0 || x == 1.0 { return 1.0 }
+  if x != x || y != y { return f64fromBits(0x7FF8000000000000) }
+  const ax = abs(x)
+  if abs(y) == inf {
+    if ax == 1.0 { return 1.0 }
+    if (ax > 1.0) == (y > 0.0) { return inf }
+    return 0.0
+  }
+  const yInt = trunc(y) == y
+  let yOdd = false
+  if yInt && abs(y) < 9007199254740992.0 { yOdd = ((y as! i64) & 1) != 0 }
+  const flip = yOdd && f64bits(x) < 0
+  let m = 0.0
+  if ax == 0.0 || ax == inf {
+    // A zero x is the reciprocal of an infinite one, and y < 0 swaps them.
+    if (ax == inf) == (y > 0.0) { m = inf }
+  } else if x < 0.0 && !yInt {
+    return f64fromBits(0x7FF8000000000000)
+  } else if ax == 1.0 {
+    m = 1.0
+  } else if wide {
+    logParts(ax)
+    const zh = y * lgHi
+    if !(zh <= 709.8) {
+      m = inf
+    } else if zh >= -745.2 {
+      // zh + zl = y * (lgHi + lgLo), the product's rounding error recovered by Dekker's method.
+      const cy = 134217729.0 * y
+      const yh = cy - (cy - y)
+      const yl = y - yh
+      const cl = 134217729.0 * lgHi
+      const lh = cl - (cl - lgHi)
+      const ll = lgHi - lh
+      const zl = (((yh * lh - zh) + yh * ll + yl * lh) + yl * ll) + y * lgLo
+      m = expCore(zh, zl)
+    }
+  } else {
+    const z = y * logKernelF32(ax)
+    if z > 88.8 { m = inf }
+    else if z >= -104.0 { m = expKernelF32(z) }
+  }
+  if flip { return -m }
+  return m
+}
+
+// `x` raised to `y`, within 1 ulp of the exact value for every finite pair, and exact when
+// the exact result is a double. A negative finite `x` needs an integer `y`, else NaN. Edge
+// cases are IEEE 754 `pow`'s: `powF64(x, 0.0)`, `powF64(1.0, y)` and `powF64(-1.0, infinity)`
+// are `1.0` even where JS gives NaN; `powF64(-0.0, -1.0)` is -infinity.
+export function powF64(x: f64, y: f64): f64 { return powWith(x, y, true) }
+
+// `x` raised to `y` at f32, computed in f64 and rounded once: within 1 f32 ulp for every
+// finite pair, and exact when the exact result is an f32. The edge cases are `powF64`'s.
+export function powF32(x: f32, y: f32): f32 {
+  const m = powWith(x as f64, y as f64, false)
+  if m != m { return f32fromBits(0x7FC00000) }
+  return m as f32
 }

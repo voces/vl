@@ -1835,11 +1835,14 @@ it worked.
   (`>>>`). A `u32` would touch the type arena, every rep table, every widening
   rule and every emitter kind code to express something the operand need not
   carry.
-- **No transcendentals, ever, as a language or std primitive.** No wasm opcode
-  computes `sin`/`pow`/`exp`, so any implementation is a library whose last bit
-  is a policy choice. A program that must match another implementation exactly
-  has to own that choice; shipping one would give it a trap to avoid rather than
-  work to save. (`docs/internals/numeric-intrinsics.md`)
+- **No transcendental as a compiler intrinsic; they live in `std:math`.** No wasm
+  opcode computes `sin`/`pow`/`exp`, so any implementation is a library whose last
+  bit is a policy choice, and that library is not the compiler's. This entry first
+  said "no transcendentals, ever, as a language or std primitive"; the std half was
+  superseded by `docs/internals/std-math-design.md`, which owns the choice in
+  `std:math` (pure VL, the same bits on every host, a published ulp bound). A
+  program that must match some other implementation exactly still owns that choice
+  itself. (`docs/internals/numeric-intrinsics.md`)
 
 - **A classifier's "no answer" sentinel is NOT neutral when the caller has a
   default — so a DECLINE LIST is a set of testable claims, and each entry must be
